@@ -4477,6 +4477,27 @@ private Q_SLOTS:
         QVERIFY(!panel.m_watch_release_pending);
         QCOMPARE(probe.watches.load(), int(B3FlowMeshWatch::Policy::NOT_WAITED_LIMIT)); QCOMPARE(probe.writes.load(), 0);
     }
+    void tickCatchupKeepsLiveModeAndRearmsAtOnce()
+    {
+        // A tick-less read moved the head: the client reads the missing
+        // clearing ticks once instead of watching (ticks_catchup, waited).
+        FundingReadProbe probe; probe.live_ms = 2000; probe.watch_object = WatchObject("ticks_catchup", false, true);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        Live(panel, probe);
+        panel.m_watch.mode = B3FlowMeshWatch::Mode::Live; panel.m_watch.last_ok_at = panel.m_watch_clock.elapsed();
+        probe.hold_watch = true;
+        panel.armWatch(); QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+        probe.watch_release.release(); // Only this read returns; the next one is held.
+        // Re-armed by the result itself (the timer is stopped here), not a
+        // tick later, and still live with no strike.
+        QTRY_COMPARE_WITH_TIMEOUT(probe.watches.load(), 2, 2000);
+        QCOMPARE(panel.m_watch.last, B3FlowMeshWatch::Outcome::Refreshed);
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Live);
+        QCOMPARE(panel.m_watch.not_waited, 0U);
+        QVERIFY(!panel.m_watch_release_pending);
+        panel.m_watch.Disable(); probe.hold_watch = false; probe.watch_release.release(); AwaitWatchWorker(panel);
+        QCOMPARE(probe.watches.load(), 2); QCOMPARE(probe.writes.load(), 0);
+    }
     void liveModeSkipsMarketPollingButKeepsAuxiliaryCycleAndStatus()
     {
         FundingReadProbe probe; probe.live_ms = 2000; probe.checkpoint = true;

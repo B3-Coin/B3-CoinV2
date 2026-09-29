@@ -1193,6 +1193,25 @@ private Q_SLOTS:
         QVERIFY(p.MayArm(2000)); p.Armed(2000); p.Finished(2000, WOutcome::Failed, 0.0);
         QCOMPARE(p.mode, Mode::Backoff); QVERIFY(!p.SuppliesMarketRead(2000));
     }
+    void watchTickCatchupIsNeitherALiveReplyNorAStrike()
+    {
+        using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using B3FlowMeshWatch::Classify; using WOutcome = B3FlowMeshWatch::Outcome;
+        QCOMPARE(Classify(false, "ticks_catchup", false, true, true, 2000), WOutcome::Refreshed);
+        QCOMPARE(Classify(false, "ticks_catchup", false, true, false, 2000), WOutcome::Refreshed);
+        QCOMPARE(Classify(true, "ticks_catchup", false, true, false, 2000), WOutcome::Failed);
+        // Probing: still probing, no strike, re-armed at once.
+        Policy p; p.Enable(0, true);
+        QVERIFY(p.MayArm(0)); p.Armed(0); p.Finished(100, WOutcome::NotWaited, 0.0);
+        QVERIFY(p.MayArm(100 + Policy::TICK_MS)); p.Armed(100 + Policy::TICK_MS);
+        p.Finished(700, WOutcome::Refreshed, 0.0);
+        QCOMPARE(p.mode, Mode::Probing); QCOMPARE(p.not_waited, 1U); QCOMPARE(p.RetryInMs(700), int64_t{0});
+        QVERIFY(p.MayArm(1100)); p.Armed(1100);
+        // Live: stays live without renewing the watchdog.
+        p.Finished(1200, WOutcome::Quiet, 0.0);
+        QCOMPARE(p.mode, Mode::Live); QCOMPARE(p.last_ok_at, int64_t{1200});
+        QVERIFY(p.MayArm(1600)); p.Armed(1600); p.Finished(1700, WOutcome::Refreshed, 0.0);
+        QCOMPARE(p.mode, Mode::Live); QCOMPARE(p.last_ok_at, int64_t{1200}); QCOMPARE(p.RetryInMs(1700), int64_t{0});
+    }
     void watchQuietRepliesRearmImmediately()
     {
         using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using B3FlowMeshWatch::Classify; using WOutcome = B3FlowMeshWatch::Outcome;

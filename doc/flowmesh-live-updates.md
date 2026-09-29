@@ -147,7 +147,8 @@ The connection line shows the mode: "live updates", "polling every 0.5 s
 (endpoint offers no live updates)", "polling (live-update capacity full,
 retry in N s)", "live updates reconnecting in N s" or "No live update for
 15 s · reconnecting". Replies answered without waiting are never re-sent at
-once; three in a row fall back to polling for 10 s, busy for 10 s, an
+once (a `ticks_catchup` read is re-armed at once and counts as neither a live
+reply nor a strike); three in a row fall back to polling for 10 s, busy for 10 s, an
 endpoint without the capability for 60 s, failures back off 1-30 s, and the
 panel never sends more than two watch reads per second. When replies the
 client keeps its connection for (`superseded`, `revalidate`, `lane_busy`)

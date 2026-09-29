@@ -31,6 +31,10 @@ enum class Outcome {
     Busy,        //!< The endpoint's watch slots are full.
     Unsupported, //!< The watched endpoint offers no watch (or withdrew it).
     Failed,      //!< The read failed (transport, verification or RPC error).
+    //! An ordinary read the client took once per head instead of an eligible
+    //! watch (ticks_catchup): fresh data but no evidence about the watch, so
+    //! neither a live reply nor a strike; watch again at once.
+    Refreshed,
 };
 
 //! One finished read's classification from its watch object.

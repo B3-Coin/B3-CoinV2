@@ -11,6 +11,7 @@ Outcome Classify(const bool rpc_error, const std::string_view status, const bool
                  const bool head_moved, const uint32_t endpoint_live_ms)
 {
     if (rpc_error) return Outcome::Failed;
+    if (status == "ticks_catchup") return Outcome::Refreshed;
     if (status == "unsupported") return Outcome::Unsupported;
     if (status == "busy") return Outcome::Busy;
     // Live mode is keyed on the endpoint the watch was for: one that
@@ -102,6 +103,11 @@ void Policy::Finished(const int64_t now, const Outcome outcome, const double jit
         mode = Mode::Polling;
         not_waited = 0;
         retry_at = now + UNSUPPORTED_RETRY_MS;
+        return;
+    case Outcome::Refreshed:
+        // The mode, strikes and watchdog are unchanged; the next watch at
+        // this head is sent (still at most two reads per second).
+        retry_at = now;
         return;
     case Outcome::Failed: {
         failures = std::min(failures + 1, 16U);

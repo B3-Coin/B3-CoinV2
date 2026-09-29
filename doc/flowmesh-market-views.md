@@ -90,7 +90,8 @@ unavailable, and its advertisement is ignored for ten minutes. A live-update
 read whose held ticks stop short of the verified head (a signing preflight's
 snapshot asks for none) gives up its watch once per head so that an ordinary
 read fetches them. Its watch status is `ticks_catchup` with `waited` true:
-the watch connection is kept and the caller may watch again at once.
+the watch connection is kept and the caller may watch again at once. Qt
+counts it as neither a live reply nor a strike and re-arms at once.
 
 ## 2. Indicative next clearing
 
