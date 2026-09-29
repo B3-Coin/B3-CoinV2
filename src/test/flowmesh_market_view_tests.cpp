@@ -8,6 +8,7 @@
 
 #include <flowmesh/market_view.h>
 
+#include <flowmesh/microblock.h>
 #include <flowmesh/state.h>
 #include <random.h>
 #include <test/util/asset.h>
@@ -21,6 +22,7 @@
 #include <deque>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -298,6 +300,190 @@ BOOST_AUTO_TEST_CASE(clearing_tick_pages_are_bounded_ascending_and_report_evicti
     }
     const auto empty{flowmesh::PageClearingTicks({}, {})};
     BOOST_CHECK(empty.available && empty.ticks.empty() && !empty.oldest_retained_sequence);
+}
+
+BOOST_AUTO_TEST_CASE(indicative_clearing_matches_clearslot_on_a_state_copy)
+{
+    FastRandomContext rng{uint256{43}};
+    size_t cleared{0}, rationed_drafts{0};
+    for (int iteration{0}; iteration < 400; ++iteration) {
+        auto state{EmptyState()};
+        const uint8_t accounts{static_cast<uint8_t>(2 + rng.randrange(10))};
+        // One more funded account that never has a standing curve.
+        for (uint8_t i{0}; i <= accounts; ++i) Fund(state, Account(i));
+        const auto submit = [&] {
+            for (uint8_t i{0}; i < accounts; ++i) {
+                for (const Side side : {Side::BID, Side::ASK}) {
+                    if (rng.randrange(3) == 0) continue;
+                    BOOST_REQUIRE(state.SubmitCurve(Account(i), side, RandomCurve(rng, side)));
+                }
+            }
+        };
+        submit();
+        BOOST_REQUIRE(state.ClearSlot());
+        if (rng.randbool()) submit();
+        const auto curves{state.ReadCurves(std::numeric_limits<size_t>::max()).curves};
+        const auto root{state.Root()};
+
+        flowmesh::IndicativeQuery query;
+        const int mode{static_cast<int>(rng.randrange(4))};
+        // Without a known account the draft is a new curve: the oracle signs
+        // it with the account that has none.
+        const flowmesh::AccountId signer{Account(mode == 3 ? accounts : static_cast<uint8_t>(rng.randrange(accounts + 1)))};
+        if (mode > 0) {
+            flowmesh::IndicativeDraft draft;
+            draft.side = rng.randbool() ? Side::BID : Side::ASK;
+            draft.price = 1 + static_cast<CAmount>(rng.randrange(40));
+            draft.quantity = 1 + static_cast<CAmount>(rng.randrange(1000));
+            if (mode != 3) draft.account = signer;
+            query.draft = draft;
+        }
+        const auto indicative{flowmesh::ComputeIndicative(curves, query)};
+        BOOST_REQUIRE(indicative.available);
+        BOOST_CHECK(state.Root() == root);
+
+        // Oracle: the engine itself, on a copy with the draft submitted.
+        auto copy{state};
+        if (query.draft) {
+            const auto& draft{*query.draft};
+            const auto points{draft.side == Side::BID ? flowmesh::MakeLimitBidCurve(draft.price, draft.quantity)
+                                                      : flowmesh::MakeLimitAskCurve(draft.price, draft.quantity)};
+            const bool replaces{!copy.AccountCurves(signer).empty() &&
+                                std::any_of(curves.begin(), curves.end(), [&](const auto& curve) {
+                                    return curve.account_id == signer && curve.side == draft.side;
+                                })};
+            BOOST_CHECK_EQUAL(indicative.draft_replaces_curve, draft.account.has_value() && replaces);
+            BOOST_REQUIRE(copy.SubmitCurve(signer, draft.side, *points));
+        }
+        const auto clearing{copy.ClearSlot()};
+        BOOST_REQUIRE(clearing);
+        BOOST_REQUIRE_EQUAL(indicative.cleared, clearing->cleared);
+        if (!clearing->cleared) {
+            BOOST_CHECK(indicative.imbalance_side == ImbalanceSide::NONE);
+            if (query.draft) BOOST_CHECK_EQUAL(*indicative.draft_fill_max, 0);
+            continue;
+        }
+        ++cleared;
+        BOOST_CHECK_EQUAL(indicative.price, clearing->price);
+        BOOST_CHECK_EQUAL(indicative.volume, clearing->volume);
+        BOOST_CHECK_EQUAL(indicative.imbalance, clearing->imbalance);
+        BOOST_CHECK(indicative.imbalance_side == flowmesh::ObserveImbalanceSide(*clearing, copy));
+        if (!query.draft) continue;
+        const auto& fills{query.draft->side == Side::BID ? clearing->bid_fill : clearing->ask_fill};
+        const auto fill{fills.contains(signer) ? fills.at(signer) : CAmount{0}};
+        BOOST_REQUIRE(indicative.draft_fill_min && indicative.draft_fill_max);
+        BOOST_CHECK(*indicative.draft_fill_min <= fill && fill <= *indicative.draft_fill_max);
+        if (query.draft->account) BOOST_CHECK_EQUAL(*indicative.draft_fill_min, *indicative.draft_fill_max);
+        BOOST_CHECK(*indicative.draft_fill_max - *indicative.draft_fill_min <= 1);
+        rationed_drafts += (query.draft->side == Side::BID ? indicative.imbalance_side == ImbalanceSide::BID
+                                                           : indicative.imbalance_side == ImbalanceSide::ASK) && fill > 0;
+    }
+    BOOST_CHECK(cleared > 100 && rationed_drafts > 10);
+}
+
+BOOST_AUTO_TEST_CASE(indicative_best_prices_match_a_brute_force_scan)
+{
+    FastRandomContext rng{uint256{47}};
+    for (int iteration{0}; iteration < 200; ++iteration) {
+        auto state{EmptyState()};
+        const uint8_t accounts{static_cast<uint8_t>(1 + rng.randrange(8))};
+        for (uint8_t i{0}; i < accounts; ++i) {
+            Fund(state, Account(i));
+            for (const Side side : {Side::BID, Side::ASK}) {
+                if (rng.randbool()) BOOST_REQUIRE(state.SubmitCurve(Account(i), side, RandomCurve(rng, side)));
+            }
+        }
+        if (rng.randbool()) BOOST_REQUIRE(state.ClearSlot());
+        const auto indicative{flowmesh::ComputeIndicative(state.ReadCurves(std::numeric_limits<size_t>::max()).curves, {})};
+        BOOST_REQUIRE(indicative.available);
+        std::optional<CAmount> best_bid, best_ask;
+        for (CAmount price{0}; price < 200; ++price) {
+            if (SideTotal(state, Side::BID, price) > 0) best_bid = price;
+            if (!best_ask && SideTotal(state, Side::ASK, price) > 0) best_ask = price;
+        }
+        BOOST_CHECK(indicative.best_bid == best_bid);
+        BOOST_CHECK(indicative.best_ask == best_ask);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(indicative_draft_replaces_its_accounts_curve_and_reports_its_fill)
+{
+    auto state{EmptyState()};
+    for (uint8_t i{0}; i < 3; ++i) Fund(state, Account(i));
+    BOOST_REQUIRE(state.SubmitCurve(Account(0), Side::BID, *flowmesh::MakeLimitBidCurve(6, 10)));
+    BOOST_REQUIRE(state.SubmitCurve(Account(1), Side::ASK, *flowmesh::MakeLimitAskCurve(6, 5)));
+    // The standing book crosses: 5 at 6, bids rationed.
+    const auto curves{state.ReadCurves(8).curves};
+    const auto standing{flowmesh::ComputeIndicative(curves, {})};
+    BOOST_REQUIRE(standing.available && standing.cleared);
+    BOOST_CHECK_EQUAL(standing.price, 6);
+    BOOST_CHECK_EQUAL(standing.volume, 5);
+    BOOST_CHECK(standing.imbalance_side == ImbalanceSide::BID);
+    BOOST_CHECK(!standing.draft && !standing.draft_fill_min);
+    BOOST_CHECK(standing.best_bid == CAmount{6} && standing.best_ask == CAmount{6});
+
+    // Account 0's own bid of 3 at 7 replaces its 10 at 6: asks are long.
+    flowmesh::IndicativeQuery replace;
+    replace.draft = flowmesh::IndicativeDraft{Side::BID, 7, 3, Account(0)};
+    const auto replaced{flowmesh::ComputeIndicative(curves, replace)};
+    BOOST_REQUIRE(replaced.available && replaced.cleared);
+    BOOST_CHECK(replaced.draft_replaces_curve);
+    BOOST_CHECK(replaced.draft == replace.draft);
+    BOOST_CHECK_EQUAL(replaced.price, 6);
+    BOOST_CHECK_EQUAL(replaced.volume, 3);
+    BOOST_CHECK_EQUAL(replaced.imbalance, 2);
+    BOOST_CHECK(replaced.imbalance_side == ImbalanceSide::ASK);
+    BOOST_CHECK(replaced.draft_fill_min == CAmount{3} && replaced.draft_fill_max == CAmount{3});
+    // The best prices stay those of the verified book.
+    BOOST_CHECK(replaced.best_bid == CAmount{6});
+
+    // Another account's same draft joins the rationed bids: 13 wanted, 5
+    // traded; largest remainders give it 1.
+    flowmesh::IndicativeQuery join;
+    join.draft = flowmesh::IndicativeDraft{Side::BID, 7, 3, Account(2)};
+    const auto joined{flowmesh::ComputeIndicative(curves, join)};
+    BOOST_REQUIRE(joined.available && joined.cleared);
+    BOOST_CHECK(!joined.draft_replaces_curve);
+    BOOST_CHECK_EQUAL(joined.volume, 5);
+    BOOST_CHECK_EQUAL(joined.imbalance, 8);
+    BOOST_CHECK(joined.draft_fill_min == CAmount{1} && joined.draft_fill_max == CAmount{1});
+    // Without the signing account its place in account order is unknown.
+    join.draft->account.reset();
+    const auto unknown{flowmesh::ComputeIndicative(curves, join)};
+    BOOST_CHECK(unknown.draft_fill_min == CAmount{1} && unknown.draft_fill_max == CAmount{2});
+}
+
+BOOST_AUTO_TEST_CASE(indicative_fails_closed_on_budget_malformed_curves_and_invalid_drafts)
+{
+    auto state{EmptyState()};
+    for (uint8_t i{0}; i < 2; ++i) Fund(state, Account(i));
+    BOOST_REQUIRE(state.SubmitCurve(Account(0), Side::BID, {{1, 50}, {5, 30}, {9, 0}}));
+    BOOST_REQUIRE(state.SubmitCurve(Account(1), Side::ASK, {{2, 0}, {3, 10}, {8, 40}}));
+    const auto curves{state.ReadCurves(8).curves};
+    BOOST_CHECK(flowmesh::ComputeIndicative(curves, {}).available);
+    for (const size_t budget : {size_t{0}, size_t{4}, size_t{9}}) {
+        const auto starved{flowmesh::ComputeIndicative(curves, {}, budget)};
+        BOOST_CHECK(!starved.available && !starved.cleared);
+        BOOST_CHECK_EQUAL(starved.unavailable_reason, "work_budget");
+    }
+
+    auto malformed{curves};
+    std::swap(malformed.front().points.front(), malformed.front().points.back());
+    const auto refused{flowmesh::ComputeIndicative(malformed, {})};
+    BOOST_CHECK(!refused.available);
+    BOOST_CHECK_EQUAL(refused.unavailable_reason, "malformed_curve");
+
+    for (const auto& [price, quantity] : std::vector<std::pair<CAmount, CAmount>>{{-1, 5}, {5, 0}, {MAX_MONEY, 1}, {5, MAX_MONEY + 1}}) {
+        flowmesh::IndicativeQuery query;
+        query.draft = flowmesh::IndicativeDraft{Side::BID, price, quantity, Account(0)};
+        const auto invalid{flowmesh::ComputeIndicative(curves, query)};
+        BOOST_CHECK(!invalid.available);
+        BOOST_CHECK_EQUAL(invalid.unavailable_reason, "invalid_draft");
+        BOOST_CHECK(invalid.draft == query.draft);
+    }
+    // An empty book: available, nothing to clear.
+    const auto empty{flowmesh::ComputeIndicative({}, {})};
+    BOOST_CHECK(empty.available && !empty.cleared && !empty.best_bid && !empty.best_ask);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
