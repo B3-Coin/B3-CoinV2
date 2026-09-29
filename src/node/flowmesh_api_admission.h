@@ -69,11 +69,13 @@ public:
                  const Clock::time_point now)
     {
         std::lock_guard lock{m_mutex};
-        Counts* peer{nullptr};
-        if (const auto result{Find(remote_address, now, peer)}; result != Result::ADMITTED) return result;
+        // The global window first: a request it refuses takes no identity slot.
+        Roll(m_global, now);
         if (!Room(m_global, request_class, m_limits.global_total, m_limits.global_write, m_limits.global_read)) {
             return Result::GLOBAL;
         }
+        Counts* peer{nullptr};
+        if (const auto result{Find(remote_address, now, peer)}; result != Result::ADMITTED) return result;
         if (!Room(*peer, request_class, m_limits.peer_total, m_limits.peer_write, m_limits.peer_read)) {
             return Result::PEER;
         }
@@ -95,9 +97,11 @@ public:
     bool ChargeOrder(const std::string& remote_address, const Clock::time_point now)
     {
         std::lock_guard lock{m_mutex};
+        Roll(m_global, now);
+        if (m_global.order >= m_limits.global_order) return false;
         Counts* peer{nullptr};
         if (Find(remote_address, now, peer) != Result::ADMITTED) return false;
-        if (m_global.order >= m_limits.global_order || peer->order >= m_limits.peer_order) return false;
+        if (peer->order >= m_limits.peer_order) return false;
         ++m_global.order;
         ++peer->order;
         return true;
@@ -129,8 +133,9 @@ private:
         ++(request_class == FlowMeshApiRequestClass::TRADE_WRITE ? counts.write : counts.read);
     }
 
-    //! Caller holds m_mutex. Rolls both windows and finds (or makes room
-    //! for) the identity; refuses only when the identity map is full.
+    //! Caller holds m_mutex, after checking the global window. Rolls both
+    //! windows and finds (or makes room for) the identity; refuses only when
+    //! the identity map is full.
     Result Find(const std::string& remote_address, const Clock::time_point now, Counts*& peer)
     {
         Roll(m_global, now);

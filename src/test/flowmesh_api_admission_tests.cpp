@@ -137,6 +137,26 @@ BOOST_AUTO_TEST_CASE(api_admission_refusal_charges_nothing)
     BOOST_CHECK_EQUAL(charged, 48U);
 }
 
+BOOST_AUTO_TEST_CASE(api_admission_global_refusal_takes_no_identity_slot)
+{
+    const auto now{Clock::now()};
+    node::FlowMeshApiAdmissionLimits limits;
+    limits.identities = 2;
+    limits.global_total = 1;
+    limits.global_order = 1;
+    FlowMeshApiAdmission admission{limits};
+    BOOST_CHECK(admission.Admit("192.0.2.1", READ, now) == FlowMeshApiAdmission::Result::ADMITTED);
+    // Refused by the global window: neither address keeps an identity slot.
+    BOOST_CHECK(admission.Admit("192.0.2.2", READ, now) == FlowMeshApiAdmission::Result::GLOBAL);
+    BOOST_CHECK(admission.ChargeOrder("192.0.2.1", now));
+    BOOST_CHECK(!admission.ChargeOrder("192.0.2.3", now));
+    // Next window: the second slot is still free for a new identity.
+    const auto later{now + std::chrono::seconds{1}};
+    BOOST_CHECK(admission.Admit("192.0.2.4", READ, later) == FlowMeshApiAdmission::Result::ADMITTED);
+    BOOST_CHECK(admission.Admit("192.0.2.5", READ, later + std::chrono::seconds{1}) ==
+                FlowMeshApiAdmission::Result::IDENTITIES);
+}
+
 BOOST_AUTO_TEST_CASE(api_admission_classifies_exact_submit_prefix_only)
 {
     BOOST_CHECK(node::ClassifyFlowMeshApiRequest(R"({"method":"submit","params":{}})") == WRITE);
