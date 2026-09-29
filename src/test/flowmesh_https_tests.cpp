@@ -50,6 +50,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2689,6 +2690,170 @@ BOOST_AUTO_TEST_CASE(lane_needs_a_delivery_acknowledged_in_this_process)
     BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 1, 1, 1}));
     client.reset();
     server->Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+//! One public API call; (HTTP status, parsed body).
+std::pair<int, UniValue> ApiCall(const node::HttpsEndpoint& endpoint, const std::string& method, const std::string& params)
+{
+    const auto reply{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
+        "{\"method\":\"" + method + "\",\"params\":" + params + "}", std::chrono::seconds{5}, 1 << 24)};
+    BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+    UniValue value;
+    BOOST_REQUIRE(value.read(reply.body));
+    return {reply.status, value};
+}
+
+std::set<std::string> KeySet(const UniValue& object)
+{
+    const auto keys{object.getKeys()};
+    return {keys.begin(), keys.end()};
+}
+
+//! The status object keys an f8a3432 server sends with health disabled.
+std::set<std::string> PreviousStatusKeys(const UniValue& status)
+{
+    std::set<std::string> out{"market_id", "domain", "base_asset_id", "vault_id", "execution_config_id", "quote_asset",
+                              "available", "running", "paused", "pending_handoff", "halt", "error",
+                              "next_microblock_sequence", "last_microblock_hash", "epoch", "round", "pending_actions",
+                              "checkpoint_pending"};
+    if (status["checkpoint_pending"].get_bool()) {
+        out.insert({"pending_checkpoint_id", "pending_checkpoint_sequence", "pending_checkpoint_effect_count"});
+    }
+    return out;
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_health_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(api_health_disabled_keeps_the_previous_contract)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-health-disabled"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    // The factory default is disabled: exactly the previous contract.
+    auto api{node::MakeFlowMeshTradingApi(service, Options())};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    const auto [status, refused]{ApiCall(endpoint, "health", "{}")};
+    BOOST_CHECK_EQUAL(status, 400);
+    BOOST_CHECK_EQUAL(refused["error"].get_str(), "This method is not exposed by the public trading API");
+    const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+    BOOST_REQUIRE_EQUAL(markets_status, 200);
+    BOOST_REQUIRE_EQUAL(markets["result"].size(), 1U);
+    const auto& row{markets["result"][0]};
+    BOOST_CHECK(KeySet(row) == PreviousStatusKeys(row));
+    const auto [updates_status, updates]{ApiCall(endpoint, "updates", "{\"market_id\":\"" + market.GetHex() + "\"}")};
+    BOOST_REQUIRE_MESSAGE(updates_status == 200, updates.write());
+    auto keys{PreviousStatusKeys(updates["result"]["status"])};
+    keys.insert("chain_reconciling");
+    BOOST_CHECK(KeySet(updates["result"]["status"]) == keys);
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(api_health_contract_capability_and_parameters)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-health-enabled"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {}, {true})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    const std::string one_market{"{\"market_id\":\"" + market.GetHex() + "\"}"};
+
+    const auto [status, reply]{ApiCall(endpoint, "health", "{}")};
+    BOOST_REQUIRE_EQUAL(status, 200);
+    const auto& health{reply["result"]};
+    BOOST_CHECK_EQUAL(health["health_version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(health["observation"].get_str(), "local-node");
+    BOOST_CHECK_EQUAL(health["service"]["state"].get_str(), "running");
+    // No operator detail on the public path.
+    BOOST_CHECK(!health["service"].exists("flowmesh_peers"));
+    BOOST_REQUIRE_EQUAL(health["markets"].size(), 1U);
+    const auto& row{health["markets"][0]};
+    BOOST_CHECK_EQUAL(row["market_id"].get_str(), market.GetHex());
+    BOOST_CHECK(!row.exists("error"));
+    BOOST_CHECK(!row.exists("proposal_wait_reason"));
+    BOOST_CHECK(!row["catchup"].exists("peers_hinting_ahead"));
+
+    const auto [single_status, single]{ApiCall(endpoint, "health", one_market)};
+    BOOST_CHECK_EQUAL(single_status, 200);
+    BOOST_CHECK_EQUAL(single["result"]["markets"].size(), 1U);
+    const auto [unknown_status, unknown]{ApiCall(endpoint, "health", "{\"market_id\":\"" + uint256::ONE.GetHex() + "\"}")};
+    BOOST_CHECK_EQUAL(unknown_status, 400);
+    BOOST_CHECK_EQUAL(unknown["error"].get_str(), "Unknown market");
+    const auto [invalid_status, invalid]{ApiCall(endpoint, "health", "{\"market_id\":\"zz\"}")};
+    BOOST_CHECK_EQUAL(invalid_status, 400);
+    BOOST_CHECK_EQUAL(invalid["error"].get_str(), "Invalid identifier: market_id");
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100}); // Refill the per-client health budget.
+    const auto [field_status, field]{ApiCall(endpoint, "health", "{\"verbose\":true}")};
+    BOOST_CHECK_EQUAL(field_status, 400);
+    BOOST_CHECK_EQUAL(field["error"].get_str(), "Unknown or duplicate client API field");
+
+    // Every status object advertises the capability and this endpoint's
+    // readiness for the market, as the health row reports it.
+    const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+    BOOST_REQUIRE_EQUAL(markets_status, 200);
+    BOOST_REQUIRE_EQUAL(markets["result"].size(), 1U);
+    const auto [updates_status, updates]{ApiCall(endpoint, "updates", one_market)};
+    BOOST_REQUIRE_EQUAL(updates_status, 200);
+    for (const auto* object : {&markets["result"][0], &updates["result"]["status"]}) {
+        auto keys{PreviousStatusKeys(*object)};
+        keys.insert({"health_api_version", "endpoint_ready", "endpoint_not_ready"});
+        if (object == &updates["result"]["status"]) keys.insert("chain_reconciling");
+        BOOST_CHECK(KeySet(*object) == keys);
+        BOOST_CHECK_EQUAL((*object)["health_api_version"].getInt<int>(), 1);
+        BOOST_CHECK_EQUAL((*object)["endpoint_ready"].get_bool(), row["ready"].get_bool());
+        BOOST_CHECK_EQUAL((*object)["endpoint_not_ready"].write(), row["not_ready"].write());
+    }
+    api->Stop();
+    service.Stop();
+    // A stopped service's endpoint reports itself not ready.
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto [stopped_status, stopped]{ApiCall(Endpoint(api->Port()), "health", one_market)};
+    BOOST_REQUIRE_EQUAL(stopped_status, 200);
+    BOOST_CHECK_EQUAL(stopped["result"]["service"]["state"].get_str(), "stopped");
+    BOOST_CHECK_EQUAL(stopped["result"]["markets"][0]["not_ready"].write(), "[\"service_stopped\",\"market_not_installed\"]");
+    api->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(api_health_is_cached_and_rate_limited_per_client)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-health-budget"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {}, {true})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    // Within the cache interval the all-markets reply is the same object,
+    // local ages included.
+    const auto start{std::chrono::steady_clock::now()};
+    const auto [first_status, first]{ApiCall(endpoint, "health", "{}")};
+    const auto [second_status, second]{ApiCall(endpoint, "health", "{}")};
+    if (std::chrono::steady_clock::now() - start < node::FLOWMESH_API_HEALTH_CACHE) {
+        BOOST_CHECK_EQUAL(first["result"].write(), second["result"].write());
+    }
+    BOOST_CHECK_EQUAL(first_status, 200);
+    BOOST_CHECK_EQUAL(second_status, 200);
+    // Four per second per client, then 429; single-market reads count too.
+    BOOST_CHECK_EQUAL(ApiCall(endpoint, "health", "{\"market_id\":\"" + market.GetHex() + "\"}").first, 200);
+    BOOST_CHECK_EQUAL(ApiCall(endpoint, "health", "{}").first, 200);
+    const auto [spent_status, spent]{ApiCall(endpoint, "health", "{}")};
+    if (std::chrono::steady_clock::now() - start < std::chrono::seconds{1}) {
+        BOOST_CHECK_EQUAL(spent_status, 429);
+        BOOST_CHECK_EQUAL(spent["error"].get_str(), node::FLOWMESH_API_HEALTH_BUDGET_ERROR);
+    }
+    // The ordinary admission budget is separate and unchanged.
+    BOOST_CHECK_EQUAL(ApiCall(endpoint, "markets", "{}").first, 200);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    BOOST_CHECK_EQUAL(ApiCall(endpoint, "health", "{}").first, 200);
+    api->Stop();
+    service.Stop();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

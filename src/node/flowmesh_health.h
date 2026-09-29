@@ -251,6 +251,9 @@ enum class FlowMeshServiceState : uint8_t {
 };
 const char* FlowMeshServiceStateName(FlowMeshServiceState state);
 
+//! Upper bound of the regtest-only -flowmeshhealthtestgracems.
+inline constexpr std::chrono::milliseconds FLOWMESH_TEST_HEALTH_GRACE_MAX{60'000};
+
 //! At most this many market rows are evaluated and reported.
 inline constexpr size_t FLOWMESH_HEALTH_MAX_MARKETS{256};
 

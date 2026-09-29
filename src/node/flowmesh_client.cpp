@@ -8,6 +8,7 @@
 #include <node/flowmesh_client_poll.h>
 #include <node/flowmesh_client_work.h>
 #include <node/flowmesh_client_settlement.h>
+#include <node/flowmesh_health.h>
 
 #include <chain.h>
 #include <consensus/flowmesh_params.h>
@@ -66,6 +67,10 @@ static_assert(CLIENT_ACTION_WAIT_MAX_REPLY <= CLIENT_MAX_REPLY);
 constexpr auto API_WAIT_REPLY_RESERVE{std::chrono::milliseconds{1000}};
 
 [[noreturn]] void Fail(const std::string& reason) { throw std::runtime_error(reason); }
+//! A spent public 'health' budget: HTTP 429, like the admission budget.
+struct HealthBudgetExhausted : std::runtime_error {
+    HealthBudgetExhausted() : std::runtime_error{FLOWMESH_API_HEALTH_BUDGET_ERROR} {}
+};
 void Keys(const UniValue& value, std::initializer_list<const char*> allowed)
 {
     if (!value.isObject()) Fail("Expected a bounded object");
@@ -313,7 +318,43 @@ class TradingApi {
     std::map<std::string, Bucket> m_clients;
     unsigned m_global_count{0};
     std::chrono::steady_clock::time_point m_global_time{};
-    UniValue MarketResponse(const MarketStatus& status) const
+    // Public 'health' method; disabled keeps the exact previous contract.
+    const bool m_health;
+    std::mutex m_health_mutex;
+    //! Per PeerKey, at most 1,024 identities; guarded by m_health_mutex.
+    std::map<std::string, Bucket> m_health_clients;
+    //! Guarded by m_health_mutex.
+    std::optional<std::pair<std::chrono::steady_clock::time_point, UniValue>> m_health_cache;
+    //! Caller holds m_health_mutex. Charged after Admit, per client address.
+    bool ChargeHealth(const std::string& remote_address)
+    {
+        const auto now{std::chrono::steady_clock::now()};
+        auto key{FlowMeshActionWaitSlots::PeerKey(remote_address)};
+        if (!m_health_clients.contains(key) && m_health_clients.size() >= 1024) {
+            std::erase_if(m_health_clients, [&](const auto& pair) { return now - pair.second.time > std::chrono::minutes{1}; });
+            if (m_health_clients.size() >= 1024) return false;
+        }
+        auto& bucket{m_health_clients[std::move(key)]};
+        if (now - bucket.time >= std::chrono::seconds{1}) { bucket.time = now; bucket.count = 0; }
+        return ++bucket.count <= FLOWMESH_API_HEALTH_PER_CLIENT_PER_SECOND;
+    }
+    //! Advisory routing hint in a status object, never evidence (the same
+    //! class as action_wait_ms_max). Absent when health is disabled.
+    void AddReadiness(UniValue& out, const uint256& market, const FlowMeshServiceHealth* health) const
+    {
+        if (!m_health) return;
+        std::optional<FlowMeshServiceHealth> own;
+        if (!health) health = &own.emplace(m_service.Health(market));
+        const auto* row{health->Find(market)};
+        const auto readiness{row ? row->readiness
+            : EvaluateFlowMeshMarketReadiness(health->service_not_ready, nullptr, health->now, health->policy)};
+        UniValue reasons{UniValue::VARR};
+        for (const auto reason : readiness.not_ready) reasons.push_back(FlowMeshNotReadyName(reason));
+        out.pushKV("health_api_version", FLOWMESH_HEALTH_VERSION);
+        out.pushKV("endpoint_ready", readiness.ready);
+        out.pushKV("endpoint_not_ready", std::move(reasons));
+    }
+    UniValue MarketResponse(const MarketStatus& status, const FlowMeshServiceHealth* health = nullptr) const
     {
         auto out{MarketJson(status)};
         if (const auto metadata{m_local.Metadata(status.base_asset)}) {
@@ -322,6 +363,7 @@ class TradingApi {
         // Latency capability, never evidence: clients send wait_ms only to an
         // endpoint that advertises it, since older servers reject the field.
         if (m_wait_max.count()) out.pushKV("action_wait_ms_max", uint64_t(m_wait_max.count()));
+        AddReadiness(out, status.market_id, health);
         return out;
     }
     UniValue MarketResponse(const flowmesh::MarketData& data) const
@@ -406,11 +448,13 @@ class TradingApi {
         return flowmesh::ClientWaitResultName(result.result);
     }
 public:
-    explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait)
+    explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
+                        const FlowMeshTradingApiHealth health)
         : m_service(service), m_local(service, std::move(metadata)),
           m_wait_max{wait.waiters == 0 ? std::chrono::milliseconds{0}
                                        : std::clamp(wait.max, std::chrono::milliseconds{0}, FLOWMESH_API_ACTION_WAIT_MAX)},
-          m_waits{m_wait_max.count() ? std::min(wait.waiters, FLOWMESH_API_ACTION_WAITERS_MAX) : 0} {}
+          m_waits{m_wait_max.count() ? std::min(wait.waiters, FLOWMESH_API_ACTION_WAITERS_MAX) : 0},
+          m_health{health.enabled} {}
     size_t WaitSlots() const { return m_waits.Capacity(); }
     //! Server stop hook: refuse new waits and end every current one.
     void Interrupt()
@@ -431,8 +475,10 @@ public:
             if (timing.Enabled() && params[key].isStr()) timing.Field(key, params[key].get_str());
         if (method == "markets") {
             Keys(params, {});
+            // One health observation for every row.
+            const auto health{m_health ? std::optional{m_service.Health()} : std::nullopt};
             UniValue out{UniValue::VARR};
-            for (const auto& value : m_local.Markets(std::nullopt)) out.push_back(MarketResponse(value));
+            for (const auto& value : m_local.Markets(std::nullopt)) out.push_back(MarketResponse(value, health ? &*health : nullptr));
             return out;
         }
         if (method == "snapshot") {
@@ -556,6 +602,25 @@ public:
             if (!value) Fail(error.empty() ? "No connected unconsumed effect" : error);
             return VaultJson(*value);
         }
+        if (method == "health" && m_health) {
+            // A local, advisory observation, never evidence. Cheap: leaf
+            // mutexes only, never cs_main, a market lock, the store, a wait
+            // slot or a suspend.
+            Keys(params, {"market_id"});
+            const std::optional<uint256> market{params.exists("market_id") ? std::optional{Id(params, "market_id")} : std::nullopt};
+            std::lock_guard lock{m_health_mutex};
+            if (!ChargeHealth(http.remote_address)) throw HealthBudgetExhausted{};
+            if (market) {
+                const auto health{m_service.Health(*market)};
+                if (!health.Find(*market)) Fail("Unknown market");
+                return FlowMeshServiceHealthJson(health, /*operator_detail=*/false);
+            }
+            const auto now{std::chrono::steady_clock::now()};
+            if (!m_health_cache || now - m_health_cache->first >= FLOWMESH_API_HEALTH_CACHE) {
+                m_health_cache.emplace(now, FlowMeshServiceHealthJson(m_service.Health(), /*operator_detail=*/false));
+            }
+            return m_health_cache->second;
+        }
         Fail("This method is not exposed by the public trading API");
     }
     FlowMeshHttpsServer::Response Handle(const FlowMeshHttpsServer::Request& request)
@@ -569,6 +634,9 @@ public:
             auto body{out.write()};
             if (body.size() > CLIENT_MAX_REPLY) Fail("Public trading response exceeds snapshot bound");
             return {200, std::move(body)};
+        } catch (const HealthBudgetExhausted& e) {
+            UniValue out{UniValue::VOBJ}; out.pushKV("ok", false); out.pushKV("error", e.what());
+            return {429, out.write()};
         } catch (const std::exception& e) {
             UniValue out{UniValue::VOBJ}; out.pushKV("ok", false); out.pushKV("error", std::string(e.what()).substr(0, 1024));
             return {400, out.write()};
@@ -2077,10 +2145,11 @@ std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
     catch (const std::exception& e) { error = e.what(); return {}; }
 }
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(FlowMeshService& service, FlowMeshHttpsServer::Options options,
-                                                        FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait)
+                                                        FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
+                                                        const FlowMeshTradingApiHealth health)
 {
     options.max_reply_bytes = CLIENT_MAX_REPLY;
-    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait)};
+    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait, health)};
     // Handshake, read, handler and write concurrency stays at the two workers
     // the API always had. Each wait slot adds a worker that only sleeps in a
     // suspended wait. Disabled waits leave exactly two workers and permits.

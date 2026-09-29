@@ -88,10 +88,26 @@ inline constexpr size_t FLOWMESH_API_ACTION_WAITERS_MAX{12};
 //! waits existed; each wait slot adds a worker that only sleeps in a wait.
 inline constexpr size_t FLOWMESH_API_ACTIVE_PERMITS{2};
 
+//! Node-local policy for the restricted API's public 'health' method and the
+//! advisory readiness keys (health_api_version, endpoint_ready,
+//! endpoint_not_ready) in its status objects; never consensus or evidence.
+//! Disabled keeps the exact previous request and reply contract: 'health'
+//! is not exposed and status objects carry no readiness keys.
+struct FlowMeshTradingApiHealth {
+    bool enabled{false};
+};
+//! Per client IPv4 address or IPv6 /64, charged after the API's ordinary
+//! admission budget; tighter than it.
+inline constexpr unsigned FLOWMESH_API_HEALTH_PER_CLIENT_PER_SECOND{4};
+//! The all-markets 'health' reply is rebuilt at most this often.
+inline constexpr std::chrono::milliseconds FLOWMESH_API_HEALTH_CACHE{250};
+inline constexpr const char* FLOWMESH_API_HEALTH_BUDGET_ERROR{"Public health request budget exhausted"};
+
 //! Restricted HTTPS adapter. It holds no wallet and never invokes the RPC table.
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(
     FlowMeshService& service, FlowMeshHttpsServer::Options options,
-    FlowMeshAssetMetadataCatalog metadata = {}, FlowMeshTradingApiWait wait = {});
+    FlowMeshAssetMetadataCatalog metadata = {}, FlowMeshTradingApiWait wait = {},
+    FlowMeshTradingApiHealth health = {});
 
 //! Shared public projection used by the wallet RPC and restricted endpoint.
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);
