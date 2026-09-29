@@ -390,9 +390,35 @@ static WalletActionContext GetWalletActionContext(CWallet& wallet,
     return {std::move(secret), account, *status};
 }
 
+//! The optional trailing wait_ms of the signed-action RPCs.
+static RPCArg SubmitWaitArg()
+{
+    return {"wait_ms", RPCArg::Type::NUM, RPCArg::Default{0},
+            strprintf("Remote client only: before returning, wait at most this many milliseconds (0-%d) for this "
+                      "new action's certified inclusion, verified under local B3 authority: inside the submission "
+                      "itself where the endpoint offers it (one request), else by one waited status read of the "
+                      "delivered action. Never signs again or resends to wait; a receipt that is not verified in "
+                      "time is returned exactly as without a wait. 0, the local engine and older endpoints return "
+                      "at once.",
+                      node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count())};
+}
+
+//! Parsed before anything is signed.
+static std::chrono::milliseconds ParseSubmitWait(const UniValue& value)
+{
+    if (value.isNull()) return {};
+    const auto wait{value.getInt<int64_t>()};
+    if (wait < 0 || wait > node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           strprintf("wait_ms must be between 0 and %d", node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count()));
+    }
+    return std::chrono::milliseconds{wait};
+}
+
 static UniValue SubmitSignedAction(CWallet& wallet,
                                    WalletActionContext& context,
-                                   flowmesh::Action action)
+                                   flowmesh::Action action,
+                                   const std::chrono::milliseconds wait = std::chrono::milliseconds{0})
 {
     if (!flowmesh::SignAction(context.secret, context.market.domain,
                               context.market.execution_config_id, action) ||
@@ -400,8 +426,11 @@ static UniValue SubmitSignedAction(CWallet& wallet,
         throw JSONRPCError(RPC_INTERNAL_ERROR,
                            "Unable to sign the canonical FlowMesh action");
     }
+    // The signing key is not needed past this point: never keep a copy
+    // alive across the submission and its bounded wait.
+    context.secret = CKey{};
     auto receipt{BoundActionReceipt(
-        wallet.chain().submitFlowMeshActionReceipt(context.market.market_id, action), action.Id())};
+        wallet.chain().submitFlowMeshActionReceipt(context.market.market_id, action, wait), action.Id())};
     receipt.account_id = context.account;
     const bool remote{wallet.chain().flowMeshClientStatus().backend == "remote"};
     StageReceipt(receipt, remote && receipt.state != "rejected", remote);
@@ -1382,6 +1411,7 @@ RPCHelpMan submitflowmeshorder()
              "Exact integer base-asset quantity"},
             {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
              "Account sequence (default: current certified next sequence)"},
+            SubmitWaitArg(),
         },
         AcceptedActionResult("Signed order submission receipt", {
             {RPCResult::Type::STR, "side", "bid or ask"},
@@ -1389,7 +1419,8 @@ RPCHelpMan submitflowmeshorder()
             {RPCResult::Type::NUM, "quantity", "Exact base-asset quantity"},
         }),
         RPCExamples{HelpExampleCli(
-            "submitflowmeshorder", "\"<market_id>\" bid 10000 500")},
+            "submitflowmeshorder", "\"<market_id>\" bid 10000 500") +
+                    HelpExampleCli("submitflowmeshorder", "\"<market_id>\" bid 10000 500 7 2000")},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
             const std::shared_ptr<CWallet> wallet{
                 GetWalletForJSONRPCRequest(request)};
@@ -1399,6 +1430,7 @@ RPCHelpMan submitflowmeshorder()
             const CAmount price{ExactPositiveAmount(request.params[2], "price")};
             const CAmount quantity{
                 ExactPositiveAmount(request.params[3], "quantity")};
+            const auto wait{ParseSubmitWait(request.params[5])};
             WalletActionContext context{
                 GetWalletActionContext(*wallet, market_id)};
             flowmesh::Action action;
@@ -1412,7 +1444,7 @@ RPCHelpMan submitflowmeshorder()
                                     : flowmesh::ActionType::SPOT_TO_FUTURES);
             action.curve = LimitCurve(side, price, quantity);
             UniValue out{SubmitSignedAction(*wallet, context,
-                                             std::move(action))};
+                                             std::move(action), wait)};
             out.pushKV("side", side);
             out.pushKV("price", price);
             out.pushKV("quantity", quantity);
@@ -1433,6 +1465,7 @@ RPCHelpMan cancelflowmeshorder()
              "'bid' or 'ask'"},
             {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
              "Account sequence (default: current certified next sequence)"},
+            SubmitWaitArg(),
         },
         AcceptedActionResult("Signed cancellation submission receipt", {
             {RPCResult::Type::STR, "side", "bid or ask"},
@@ -1449,6 +1482,7 @@ RPCHelpMan cancelflowmeshorder()
                 throw JSONRPCError(RPC_INVALID_PARAMETER,
                                    "side must be 'bid' or 'ask'");
             }
+            const auto wait{ParseSubmitWait(request.params[3])};
             WalletActionContext context{
                 GetWalletActionContext(*wallet, market_id)};
             flowmesh::Action action;
@@ -1459,7 +1493,7 @@ RPCHelpMan cancelflowmeshorder()
                 side == "bid" ? flowmesh::ActionType::CANCEL_BID
                               : flowmesh::ActionType::CANCEL_ASK);
             UniValue out{SubmitSignedAction(*wallet, context,
-                                             std::move(action))};
+                                             std::move(action), wait)};
             out.pushKV("side", side);
             return out;
         }};
@@ -1482,6 +1516,7 @@ RPCHelpMan requestflowmeshwithdrawal()
              "Owner address for the eventual payout"},
             {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
              "Account sequence (default: current certified next sequence)"},
+            SubmitWaitArg(),
         },
         AcceptedActionResult("Signed withdrawal submission receipt", {
             {RPCResult::Type::STR, "asset", "B3 or the colored-asset id"},
@@ -1515,6 +1550,7 @@ RPCHelpMan requestflowmeshwithdrawal()
             }
             const CScript destination_script{
                 GetScriptForDestination(destination)};
+            const auto wait{ParseSubmitWait(request.params[5])};
             WalletActionContext context{
                 GetWalletActionContext(*wallet, market_id)};
             if (asset != modern::NativeAsset() &&
@@ -1533,7 +1569,7 @@ RPCHelpMan requestflowmeshwithdrawal()
             action.destination =
                 modern::AssetOwnerCommitment(destination_script);
             UniValue out{SubmitSignedAction(*wallet, context,
-                                             std::move(action))};
+                                             std::move(action), wait)};
             out.pushKV("asset", asset == modern::NativeAsset()
                                     ? "B3"
                                     : asset.GetHex());
