@@ -53,6 +53,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -2895,6 +2896,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         const std::string wait_status{result.isObject() && result["wait_status"].isStr() ? result["wait_status"].get_str() : ""};
         if (!wait_status.empty()) timing.Field("wait_status", wait_status);
 
+        // Test only: an unwind here must still release the flight (above).
+        if (m_lane_submission_fault_for_test) m_lane_submission_fault_for_test();
         timing.Mark("apply_lock_requested_us");
         WorkLock lock{*this};
         timing.Mark("apply_lock_acquired_us");
@@ -3204,7 +3207,12 @@ public:
         return it == m_metadata.end() ? std::nullopt : std::optional{it->second};
     }
     uint64_t MetadataGeneration() const override { return m_metadata_generation.load(std::memory_order_acquire); }
+    //! See SetFlowMeshLaneSubmissionFaultForTest. Set before the calls it covers.
+    void SetLaneSubmissionFaultForTest(std::function<void()> fault) { m_lane_submission_fault_for_test = std::move(fault); }
 private:
+    //! Test only (never set by the node): called by a lane submission after
+    //! its request, before it takes m_work to apply the reply.
+    std::function<void()> m_lane_submission_fault_for_test;
     UniValue ReadMarkets()
     {
         UniValue params{UniValue::VOBJ};
@@ -3851,6 +3859,13 @@ std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
 {
     try { return std::make_unique<RemoteBackend>(chainman, std::move(endpoints), client_datadir, join_windows); }
     catch (const std::exception& e) { error = e.what(); return {}; }
+}
+bool SetFlowMeshLaneSubmissionFaultForTest(FlowMeshTradingBackend& backend, std::function<void()> fault)
+{
+    auto* const remote{dynamic_cast<RemoteBackend*>(&backend)};
+    if (!remote) return false;
+    remote->SetLaneSubmissionFaultForTest(std::move(fault));
+    return true;
 }
 UniValue FlowMeshClientUpdatesPageJson(const flowmesh::ClientEventPage& page)
 {

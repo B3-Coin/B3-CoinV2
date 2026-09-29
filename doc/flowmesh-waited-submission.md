@@ -113,6 +113,13 @@ the lane, and nothing is ever signed again.
   including an exception (a guard takes `m_work`): the row is published
   again, the carried connection handed back and the lane unlocked. An
   exception escaping the application becomes `unknown`, never a refusal.
+  A unit test injects an unwind after the request (a test-only hook that
+  nothing in the node sets) and checks both: the row is back in the saved
+  view as possibly sent, a different action for its sequence is refused, its
+  status and exact retry work, and a later waited read takes the lane. The
+  guard starts once the request is prepared; an unwind between marking the
+  row in flight and that point needs two failed allocations in a row and is
+  not covered.
 - **Applied by the existing rules.** The acknowledgement is applied as the
   ordinary submission applies it: an inclusion label becomes `unknown`; a
   refusal of this first and only delivery is definite, unless a concurrent

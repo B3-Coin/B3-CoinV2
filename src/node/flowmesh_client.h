@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -95,6 +96,11 @@ std::unique_ptr<FlowMeshTradingBackend> MakeLocalFlowMeshBackend(
 std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
     ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints,
     const fs::path& client_datadir, std::string& error, const FlowMeshJoinWindows& join_windows = {});
+//! Test only; nothing in the node calls it. A remote backend's waited
+//! submission then calls `fault` after its lane request and before it takes
+//! the work gate to apply the reply, so a throw from `fault` models an unwind
+//! between the two. Empty clears it. False for a backend that is not remote.
+bool SetFlowMeshLaneSubmissionFaultForTest(FlowMeshTradingBackend& backend, std::function<void()> fault);
 
 //! Node-local latency policy for the restricted API's bounded 'action' wait,
 //! never consensus. A zero max or zero waiters disables it: no capability is

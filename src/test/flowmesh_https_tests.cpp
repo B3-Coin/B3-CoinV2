@@ -3475,6 +3475,90 @@ BOOST_AUTO_TEST_CASE(waited_submit_without_a_reply_resends_the_exact_bytes_only_
     other_server->Stop();
 }
 
+BOOST_AUTO_TEST_CASE(waited_submit_unwinding_after_its_request_releases_the_flight_and_stays_unknown)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}, std::chrono::milliseconds{1000}));
+    // The endpoint certifies it at once, but the reply is never applied.
+    validator.waited_submit = WaitedSubmitReply(action, "queued", CertifiedReceipt(action), "terminal");
+    validator.plain = Receipt(action, "queued");
+    validator.submit = Receipt(action, "admitted");
+    validator.waited = CertifiedReceipt(action);
+    validator.waited.pushKV("wait_status", "terminal");
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // An unwind after the request (as a failed allocation there would) and
+    // before the reply is applied under the work gate.
+    unsigned faults{0};
+    BOOST_REQUIRE(node::SetFlowMeshLaneSubmissionFaultForTest(*client, [&] {
+        ++faults;
+        throw std::runtime_error{"Injected unwind after the waited submission's request"};
+    }));
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(faults, 1U);
+    // Possibly delivered: unknown, never refused, and never the unapplied
+    // certification.
+    BOOST_CHECK_EQUAL(receipt.state, "unknown");
+    BOOST_CHECK(!receipt.certificate_verified);
+    BOOST_CHECK(receipt.action_id == action.Id());
+    BOOST_CHECK(receipt.reason.find("Injected unwind") != std::string::npos);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 0, 1}));
+    BOOST_REQUIRE(node::SetFlowMeshLaneSubmissionFaultForTest(*client, {}));
+    // The flight was released: the row is back in the saved view, possibly
+    // delivered, and durable as such.
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].may_have_been_sent);
+    BOOST_CHECK_EQUAL(saved[0].receipt.state, "unknown");
+    BOOST_CHECK(!saved[0].receipt.certificate_verified);
+    // A different instruction for the same account sequence is still refused.
+    auto other{action};
+    other.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_ASK);
+    {
+        CKey key;
+        std::array<unsigned char, 32> secret{};
+        secret.back() = 0x5a;
+        key.Set(secret.begin(), secret.end(), true);
+        BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, other));
+    }
+    BOOST_REQUIRE(other.Id() != action.Id());
+    const auto blocked{client->Submit(market, other, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(blocked.state, "rejected");
+    BOOST_CHECK(blocked.reason.find("A different retained action already uses this account sequence") != std::string::npos);
+    // Its status reads, and an exact retry resends the retained bytes
+    // (never "in flight").
+    BOOST_CHECK_EQUAL(client->ActionStatus(market, action.Id(), false).state, "queued");
+    const auto retried{client->ActionStatus(market, action.Id(), true)};
+    BOOST_CHECK_EQUAL(retried.state, "admitted");
+    BOOST_CHECK(retried.reason.find("in flight") == std::string::npos);
+    {
+        std::lock_guard lock{validator.mutex};
+        BOOST_CHECK_EQUAL(validator.waited_submits, 1U);
+        BOOST_REQUIRE_EQUAL(validator.submits, 1U);
+        BOOST_REQUIRE_EQUAL(validator.submitted.size(), 2U);
+        BOOST_CHECK(!validator.submitted[1].exists("wait_ms"));
+        BOOST_CHECK_EQUAL(validator.submitted[1]["action_hex"].get_str(), validator.submitted[0]["action_hex"].get_str());
+    }
+    // The wait lane was unlocked: a waited read takes it and verifies the
+    // inclusion (after the automatic status budget refills).
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    const auto certified{client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(certified.certificate_verified);
+    BOOST_CHECK_EQUAL(certified.state, "certified_inclusion");
+    {
+        std::lock_guard lock{validator.mutex};
+        BOOST_CHECK_EQUAL(validator.waited_reads, 1U);
+    }
+    client.reset();
+    server->Stop();
+    BOOST_CHECK(DurableRow(path, action)["may_have_been_sent"].get_bool());
+}
+
 BOOST_AUTO_TEST_CASE(waited_submit_row_is_absent_from_the_saved_view_and_never_resent_until_submit_returns)
 {
     const fs::path path{m_path_root / "client"};
