@@ -192,7 +192,8 @@ trading (production contract, section 9). Publish a checkpoint.
 |---|---|---|
 | HTTP 429 "Public trading request budget exhausted before admission" | The API's admission budget, by design. | Add observer API nodes. |
 | HTTP 429 "Public health request budget exhausted" | More than four `health` calls per second from one address. | Slow the poller; monitoring should use local RPC. |
-| `wait_status` `busy` | All bounded action-wait slots are taken. | Add waiters (`-flowmeshapiactionwaiters`) or API nodes. |
+| `wait_status` `busy` | All bounded action-wait slots are taken (waited `action` reads and waited submissions share them). Clients fall back to one waited status read or the passive cycle. | Add waiters (`-flowmeshapiactionwaiters`) or API nodes. |
+| Waited submissions suspected (for example after an upgrade) | `-flowmeshapisubmitwait=0` stops offering them; clients withdraw the capability on the next status object and use a plain submission plus one waited read. | See [waited submission](flowmesh-waited-submission.md). |
 | `watch_status` `busy`; Qt shows "live-update capacity full" | All bounded `updates` watch slots are taken (at most 10 per node, 2 per address). Clients poll every 0.5 s meanwhile; nothing else is delayed. | Add API nodes; see [live updates](flowmesh-live-updates.md). |
 | Qt shows "No live update for 15 s · reconnecting" | No verified live update for 15 s; the panel polls again. | Check the endpoint's health and the client's connection line. |
 | TLS or certificate-pin errors | Client trust configuration. | Check the CA bundle and `-flowmeshendpointpin`. |

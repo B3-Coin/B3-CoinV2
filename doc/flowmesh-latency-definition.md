@@ -14,13 +14,14 @@ to carry.
 | | |
 |---|---|
 | Start, t0 | Client-host monotonic time immediately before the order RPC (`submitflowmeshorder` or `cancelflowmeshorder`) is invoked. It is taken once per instruction. An explicit refusal before admission that retained nothing ("FlowMesh service is reconciling the B3 tip", "FlowMesh market is paused (at least four active seats are required)") does not reset it. |
-| End, t1 | Client-host monotonic time when a `getflowmeshactionstatus` read, waited or not, first returns `receipt_state` `certified_inclusion` with `certificate_verified` true for the same ActionId. The client has then verified the BLS certificate under its local B3 authority and anchor. |
+| End, t1 | Client-host monotonic time when a `getflowmeshactionstatus` read, waited or not, or the order RPC itself when it was given `wait_ms` ([waited submission](flowmesh-waited-submission.md)), first returns `receipt_state` `certified_inclusion` with `certificate_verified` true for the same ActionId. The client has then verified the BLS certificate under its local B3 authority and anchor. |
 | M1 | t1 - t0. This is the harness's `client_certified_ms`: `summary.client_certified` in `feature_flowmesh_persistent_trades.py`, `client_certified_ms` in `feature_flowmesh_latency.py`. |
 
 M1 includes the wallet's signing preflight (a market refresh, or joining one
 in flight), signing, the client outbox save, the HTTPS submit, admission,
 relay, proposal, attestation and certificate, the durable append, the event
-log, the status read or wait, and client verification.
+log, the status read or wait (or the submission's own wait), and client
+verification.
 
 M1 excludes the execution outcome and fill (M2), the B3 checkpoint, and Qt
 rendering.
@@ -66,7 +67,7 @@ Every published number carries all of these:
 | Durability barrier (fsync mode) | `environment.fsync_mode` (see below) |
 | Topology and regions | `environment.client_region`, `environment.server_region`, `environment.topology` |
 | Round-trip time | Measured by hand, see below |
-| Transport arm and wait arm | `arm`, `status_wait` |
+| Transport arm and wait arms | `arm`, `status_wait`, `submit_wait` |
 | Whether B3 advanced during each sample | `summary.b3_during_bid`, per-sample `b3` |
 | Logging mode and load | The harness runs with `-debug=0` and a sequential load |
 
