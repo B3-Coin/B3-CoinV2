@@ -182,6 +182,9 @@ public:
     bool MarkAgreementBootstrapComplete(const uint256& identity, std::string& error);
 
     bool ReadMarker(std::optional<Marker>& out, std::string& error);
+    /** ReadMarker, and under the same lock whether the store has completed
+     * startup replay (the condition every checkpoint read requires). */
+    bool ReadMarkerAndReadiness(std::optional<Marker>& out, bool& ready, std::string& error);
 
     /**
      * Validate marker and every production namespace without writing. A

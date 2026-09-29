@@ -81,6 +81,14 @@ struct FlowMeshPendingCheckpoint {
     uint32_t effect_count{0};
 };
 
+/** The status fields of the pending type-8 checkpoint, as status objects
+ * report them. Never the publication payload. */
+struct FlowMeshPendingCheckpointStatus {
+    modern::FlowMeshCheckpointId checkpoint_id;
+    uint64_t sequence{0};
+    uint32_t effect_count{0};
+};
+
 /** Test observation of the service's per-market memos since construction.
  * Local counters only; never a protocol, durable or public status fact. */
 struct FlowMeshServiceMemoCounts {
@@ -89,6 +97,9 @@ struct FlowMeshServiceMemoCounts {
     uint64_t head_entry_lookups{0}, head_entry_reads{0};
     //! Settlement-requirement lookups, and the misses that derived a plan.
     uint64_t settlement_lookups{0}, settlement_plans{0};
+    //! Pending-checkpoint status lookups, and the misses that scanned the
+    //! store for the candidate and built its record.
+    uint64_t pending_checkpoint_lookups{0}, pending_checkpoint_scans{0};
 };
 
 /** One exact live keyless input selected for a type-9 vault operation. */
@@ -262,8 +273,19 @@ public:
                         const std::optional<uint256>& expected_fingerprint,
                         FlowMeshSeatKeyStatus* result = nullptr);
 
-    /** Earliest unconnected effect-bearing entry, fully encoded for MPA. */
+    /** Earliest unconnected effect-bearing entry, fully encoded for MPA.
+     * Always derived afresh: publication never uses a retained answer. */
     std::optional<FlowMeshPendingCheckpoint> NextCheckpointMpa(
+        const flowmesh::MarketId& market_id, std::string& error) const;
+    /** The id, sequence and effect count of the checkpoint NextCheckpointMpa
+     * would build now, behind the same gates and with the same errors;
+     * nullopt with an empty error when none is pending. The answer ("none
+     * pending" included) is retained per market for one exact durable store
+     * marker (FlowMeshPendingCheckpointKey), so repeated status reads at one
+     * head skip the store scan. An error, a store that has not completed
+     * replay, or a marker or reconciled tip that moved while the answer was
+     * derived is never retained. For status objects only. */
+    std::optional<FlowMeshPendingCheckpointStatus> PendingCheckpointStatus(
         const flowmesh::MarketId& market_id, std::string& error) const;
 
     /** Resolve one connected, unconsumed effect into its exact type-9 proof. */

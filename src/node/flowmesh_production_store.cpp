@@ -1426,8 +1426,17 @@ FlowMeshProductionStore::FlowMeshProductionStore(DBParams db_params, const bool 
 bool FlowMeshProductionStore::ReadMarker(std::optional<Marker>& out,
                                          std::string& error)
 {
+    bool ready{false};
+    return ReadMarkerAndReadiness(out, ready, error);
+}
+
+bool FlowMeshProductionStore::ReadMarkerAndReadiness(std::optional<Marker>& out,
+                                                     bool& ready,
+                                                     std::string& error)
+{
     const std::lock_guard<std::mutex> guard{m_mutex};
     out.reset();
+    ready = m_open && m_ready;
     Marker marker;
     switch (ReadMarkerStrict(m_db, marker, m_preagreement)) {
     case ReadResult::NOT_FOUND: return true;

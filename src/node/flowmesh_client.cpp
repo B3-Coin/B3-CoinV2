@@ -291,7 +291,7 @@ public:
             out.certificate_verified = runtime->next_sequence != 0;
         }
         std::string error;
-        if (const auto checkpoint{m_service.NextCheckpointMpa(id, error)}) {
+        if (const auto checkpoint{m_service.PendingCheckpointStatus(id, error)}) {
             out.checkpoint_pending = true; out.pending_checkpoint_id = checkpoint->checkpoint_id;
             out.pending_checkpoint_sequence = checkpoint->sequence;
             out.pending_checkpoint_effect_count = checkpoint->effect_count;
@@ -533,7 +533,7 @@ class TradingApi {
         // Pending checkpoint is a separate service observation, never used
         // as a substitute for this exact certified snapshot.
         std::string error;
-        if (const auto checkpoint{m_service.NextCheckpointMpa(data.market_id, error)}) {
+        if (const auto checkpoint{m_service.PendingCheckpointStatus(data.market_id, error)}) {
             status.checkpoint_pending = true; status.pending_checkpoint_id = checkpoint->checkpoint_id;
             status.pending_checkpoint_sequence = checkpoint->sequence;
             status.pending_checkpoint_effect_count = checkpoint->effect_count;

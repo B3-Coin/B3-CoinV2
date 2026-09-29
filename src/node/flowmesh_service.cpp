@@ -275,6 +275,50 @@ bool AppendLiveVaultInput(Chainstate& chainstate,
     return true;
 }
 
+//! A retained pending-checkpoint status; an empty checkpoint is "none pending".
+struct FlowMeshPendingCheckpointAnswer {
+    std::optional<FlowMeshPendingCheckpointStatus> checkpoint;
+};
+
+//! The store's earliest unconnected checkpoint candidate, fully encoded.
+//! nullopt with an empty error when none is pending.
+std::optional<FlowMeshPendingCheckpoint> BuildPendingCheckpoint(
+    FlowMeshProductionStore& store, const flowmesh::ActiveFnBlsSeatSet& seats,
+    std::string& error)
+{
+    std::optional<ProductionCheckpointCandidate> candidate;
+    if (!store.NextCheckpointCandidate(seats, candidate, error) || !candidate) {
+        return std::nullopt;
+    }
+    const auto checkpoint{flowmesh::BuildProductionCheckpointRecord(
+        candidate->stored.entry, candidate->stored.certificate, seats,
+        candidate->previous_checkpoint_id)};
+    const auto checkpoint_id{
+        checkpoint ? modern::FlowMeshCheckpointIdV1(checkpoint->core)
+                   : std::nullopt};
+    const auto payload{
+        checkpoint ? modern::EncodeFlowMeshCheckpointRecordV1(
+                         *checkpoint, seats.Size())
+                   : std::nullopt};
+    if (!checkpoint || !checkpoint_id || !payload) {
+        error = "FlowMesh checkpoint cannot be encoded";
+        return std::nullopt;
+    }
+    return FlowMeshPendingCheckpoint{
+        CMpaRecord{modern::MPA_TYPE_FLOWMESH_CHECKPOINT,
+                   modern::MPA_VERSION_V1, *payload},
+        *checkpoint_id, checkpoint->core.sequence,
+        checkpoint->core.effect_count};
+}
+
+FlowMeshPendingCheckpointKey PendingCheckpointKey(
+    const flowmesh::MarketId& market_id, const FlowMeshProductionStore::Marker& marker)
+{
+    return {market_id, marker.domain, marker.next_sequence,
+            marker.last_microblock_hash, marker.last_b3_checkpoint,
+            marker.current_epoch, marker.current_seat_set_hash};
+}
+
 } // namespace
 
 struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
@@ -396,9 +440,60 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     mutable FlowMeshMarketMemo<FlowMeshHeadEntryKey,
                                std::shared_ptr<const StoredProductionEntry>>
         head_entries;
+    // Status objects report the pending checkpoint on every market read,
+    // and deriving it scans the store from the last connected checkpoint to
+    // the head under the store mutex. The answer, "none pending" included,
+    // is retained for one exact durable marker per market; the publication
+    // payload (NextCheckpointMpa) is always derived afresh.
+    mutable FlowMeshMarketMemo<FlowMeshPendingCheckpointKey, FlowMeshPendingCheckpointAnswer>
+        pending_checkpoints;
     // Test observation only (MemoCountsForTest); relaxed, never a gate.
     mutable std::atomic<uint64_t> head_entry_lookups{0}, head_entry_reads{0};
     mutable std::atomic<uint64_t> settlement_lookups{0}, settlement_plans{0};
+    mutable std::atomic<uint64_t> pending_checkpoint_lookups{0}, pending_checkpoint_scans{0};
+
+    //! NextCheckpointMpa's inputs, behind its gates in its order: the
+    //! reconciled tip, the running market's store, its marker (with the
+    //! store's readiness) and the marker's seat set.
+    struct CheckpointScope {
+        FlowMeshProductionStore* store{nullptr};
+        FlowMeshProductionStore::Marker marker;
+        bool ready{false};
+        flowmesh::ActiveFnBlsSeatSet seats;
+    };
+    std::optional<CheckpointScope> CheckpointScopeFor(const flowmesh::MarketId& market_id,
+                                                      std::string& error) const
+    {
+        if (!ReconciledAtTip()) {
+            error = "FlowMesh service is not active at the current B3 tip";
+            return std::nullopt;
+        }
+        CheckpointScope out;
+        {
+            std::lock_guard<std::mutex> lock{mutex};
+            const auto it{markets.find(market_id)};
+            if (!running || stopping || it == markets.end() || !it->second->ready ||
+                !it->second->store) {
+                error = "FlowMesh market is not running";
+                return std::nullopt;
+            }
+            out.store = it->second->store.get();
+        }
+        std::optional<FlowMeshProductionStore::Marker> marker;
+        if (!out.store->ReadMarkerAndReadiness(marker, out.ready, error) || !marker) {
+            if (error.empty()) error = "FlowMesh store marker is unavailable";
+            return std::nullopt;
+        }
+        out.marker = *marker;
+        const auto seats{SeatSet(marker->domain, marker->market_id, marker->current_epoch,
+                                 marker->current_seat_set_hash)};
+        if (!seats) {
+            error = "FlowMesh checkpoint seat set is unavailable";
+            return std::nullopt;
+        }
+        out.seats = *seats;
+        return out;
+    }
 
     // `marker` must be the caller's freshly read marker, and next_sequence
     // must be non-zero. The seat set is resolved live on every call and is
@@ -2358,7 +2453,9 @@ FlowMeshServiceMemoCounts FlowMeshService::MemoCountsForTest() const
     return {s.head_entry_lookups.load(std::memory_order_relaxed),
             s.head_entry_reads.load(std::memory_order_relaxed),
             s.settlement_lookups.load(std::memory_order_relaxed),
-            s.settlement_plans.load(std::memory_order_relaxed)};
+            s.settlement_plans.load(std::memory_order_relaxed),
+            s.pending_checkpoint_lookups.load(std::memory_order_relaxed),
+            s.pending_checkpoint_scans.load(std::memory_order_relaxed)};
 }
 
 bool FlowMeshService::ArmSeatKeys(std::vector<bls::SecretKey> keys,
@@ -2448,58 +2545,52 @@ bool FlowMeshService::DisarmSeatKeys(
 std::optional<FlowMeshPendingCheckpoint> FlowMeshService::NextCheckpointMpa(
     const flowmesh::MarketId& market_id, std::string& error) const
 {
-    if (!m_impl->ReconciledAtTip()) {
-        error = "FlowMesh service is not active at the current B3 tip";
+    const auto scope{m_impl->CheckpointScopeFor(market_id, error)};
+    if (!scope) return std::nullopt;
+    return BuildPendingCheckpoint(*scope->store, scope->seats, error);
+}
+
+std::optional<FlowMeshPendingCheckpointStatus> FlowMeshService::PendingCheckpointStatus(
+    const flowmesh::MarketId& market_id, std::string& error) const
+{
+    const auto scope{m_impl->CheckpointScopeFor(market_id, error)};
+    if (!scope) return std::nullopt;
+    // NextCheckpointCandidate refuses a store that has not completed replay;
+    // a retained answer never outlives that refusal.
+    if (!scope->ready) {
+        error = "FlowMesh v3 store has not completed startup replay";
         return std::nullopt;
     }
-    FlowMeshProductionStore* store{nullptr};
-    {
-        std::lock_guard<std::mutex> lock{m_impl->mutex};
-        const auto it{m_impl->markets.find(market_id)};
-        if (!m_impl->running || m_impl->stopping ||
-            it == m_impl->markets.end() || !it->second->ready ||
-            !it->second->store) {
-            error = "FlowMesh market is not running";
-            return std::nullopt;
-        }
-        store = it->second->store.get();
-    }
-    std::optional<FlowMeshProductionStore::Marker> marker;
-    if (!store->ReadMarker(marker, error) || !marker) {
-        if (error.empty()) error = "FlowMesh store marker is unavailable";
+    const auto key{PendingCheckpointKey(market_id, scope->marker)};
+    m_impl->pending_checkpoint_lookups.fetch_add(1, std::memory_order_relaxed);
+    std::string scan_error;
+    const auto answer{m_impl->pending_checkpoints.Get(
+        key,
+        [&]() -> std::optional<FlowMeshPendingCheckpointAnswer> {
+            m_impl->pending_checkpoint_scans.fetch_add(1, std::memory_order_relaxed);
+            const auto pending{BuildPendingCheckpoint(*scope->store, scope->seats, scan_error)};
+            if (!pending && !scan_error.empty()) return std::nullopt;
+            FlowMeshPendingCheckpointAnswer out;
+            if (pending) {
+                out.checkpoint = FlowMeshPendingCheckpointStatus{
+                    pending->checkpoint_id, pending->sequence, pending->effect_count};
+            }
+            return out;
+        },
+        [&] {
+            // Only while the marker it was derived from is still the store's,
+            // the store is still ready and the tip is still reconciled.
+            std::optional<FlowMeshProductionStore::Marker> again;
+            bool ready{false};
+            std::string ignored;
+            return scope->store->ReadMarkerAndReadiness(again, ready, ignored) && again && ready &&
+                   PendingCheckpointKey(market_id, *again) == key && m_impl->ReconciledAtTip();
+        })};
+    if (!answer) {
+        error = scan_error;
         return std::nullopt;
     }
-    const auto seats{m_impl->SeatSet(marker->domain, marker->market_id,
-                                     marker->current_epoch,
-                                     marker->current_seat_set_hash)};
-    if (!seats) {
-        error = "FlowMesh checkpoint seat set is unavailable";
-        return std::nullopt;
-    }
-    std::optional<ProductionCheckpointCandidate> candidate;
-    if (!store->NextCheckpointCandidate(*seats, candidate, error) ||
-        !candidate) {
-        return std::nullopt;
-    }
-    const auto checkpoint{flowmesh::BuildProductionCheckpointRecord(
-        candidate->stored.entry, candidate->stored.certificate, *seats,
-        candidate->previous_checkpoint_id)};
-    const auto checkpoint_id{
-        checkpoint ? modern::FlowMeshCheckpointIdV1(checkpoint->core)
-                   : std::nullopt};
-    const auto payload{
-        checkpoint ? modern::EncodeFlowMeshCheckpointRecordV1(
-                         *checkpoint, seats->Size())
-                   : std::nullopt};
-    if (!checkpoint || !checkpoint_id || !payload) {
-        error = "FlowMesh checkpoint cannot be encoded";
-        return std::nullopt;
-    }
-    return FlowMeshPendingCheckpoint{
-        CMpaRecord{modern::MPA_TYPE_FLOWMESH_CHECKPOINT,
-                   modern::MPA_VERSION_V1, *payload},
-        *checkpoint_id, checkpoint->core.sequence,
-        checkpoint->core.effect_count};
+    return answer->checkpoint;
 }
 
 std::optional<FlowMeshVaultOperation> FlowMeshService::VaultOperation(

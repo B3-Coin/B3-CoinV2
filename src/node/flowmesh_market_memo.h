@@ -42,6 +42,24 @@ struct FlowMeshHeadEntryKey {
     bool operator==(const FlowMeshHeadEntryKey&) const = default;
 };
 
+/** Everything the pending-checkpoint status depends on, all read from one
+ * durable store marker. The candidate scan covers the append-only entries
+ * after the last connected checkpoint up to the head, which (next_sequence,
+ * last_microblock_hash) names; the connected checkpoints are named by
+ * last_b3_checkpoint, which every connection and disconnection rewrites in
+ * the same batch; and the seat set is named by (current_epoch,
+ * current_seat_set_hash). */
+struct FlowMeshPendingCheckpointKey {
+    flowmesh::MarketId market_id;
+    uint256 domain;
+    uint64_t next_sequence{0};
+    uint256 last_microblock_hash;
+    uint256 last_b3_checkpoint;
+    uint64_t current_epoch{0};
+    uint256 current_seat_set_hash;
+    bool operator==(const FlowMeshPendingCheckpointKey&) const = default;
+};
+
 /** One retained answer per market for one exact observation key.
  *
  * Local scheduling state only, never a protocol or durable fact. A lookup

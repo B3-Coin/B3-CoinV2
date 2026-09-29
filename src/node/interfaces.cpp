@@ -1246,7 +1246,7 @@ public:
             out.error = runtime->error;
         }
         std::string checkpoint_error;
-        if (const auto checkpoint{m_node.flowmesh->NextCheckpointMpa(
+        if (const auto checkpoint{m_node.flowmesh->PendingCheckpointStatus(
                 market_id, checkpoint_error)}) {
             out.checkpoint_pending = true;
             out.pending_checkpoint_id = checkpoint->checkpoint_id;

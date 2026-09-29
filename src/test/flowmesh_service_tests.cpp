@@ -653,6 +653,62 @@ BOOST_FIXTURE_TEST_CASE(head_entry_memo_requires_same_head_and_seat_set, BasicTe
     BOOST_CHECK_EQUAL(memo.Size(), 1U);
 }
 
+BOOST_FIXTURE_TEST_CASE(pending_checkpoint_memo_requires_the_exact_marker_and_never_retains_errors, BasicTestingSetup)
+{
+    using Key = node::FlowMeshPendingCheckpointKey;
+    // An empty answer is "none pending", which is retained like any other.
+    using Answer = std::optional<uint64_t>;
+    node::FlowMeshMarketMemo<Key, Answer> memo;
+    size_t scans{0};
+    const auto status = [&](const Key& key, const bool scan_ok, const bool still_current) {
+        return memo.Get(key, [&]() -> std::optional<Answer> {
+            ++scans;
+            if (!scan_ok) return std::nullopt;
+            return key.next_sequence % 2 ? Answer{key.next_sequence - 1} : Answer{};
+        }, [&] { return still_current; });
+    };
+    const auto filled = [](const unsigned char value) {
+        uint256 out;
+        std::fill(out.begin(), out.end(), value);
+        return out;
+    };
+    const Key base{filled(0x11), filled(0x22), 5, filled(0x33), filled(0x44), 2, filled(0x55)};
+
+    // A store error, or a marker or tip that moved while scanning, is never retained.
+    BOOST_CHECK(!status(base, false, true));
+    BOOST_REQUIRE(status(base, true, false));
+    BOOST_CHECK_EQUAL(scans, 2U);
+    BOOST_CHECK_EQUAL(memo.Size(), 0U);
+    // One exact marker: one scan.
+    BOOST_CHECK(*status(base, true, true) == Answer{4});
+    BOOST_CHECK(*status(base, true, true) == Answer{4});
+    BOOST_CHECK_EQUAL(scans, 3U);
+    // "None pending" is an answer too.
+    Key none{base};
+    none.next_sequence = 6;
+    BOOST_CHECK(*status(none, true, true) == Answer{});
+    BOOST_CHECK(*status(none, true, true) == Answer{});
+    BOOST_CHECK_EQUAL(scans, 4U);
+
+    // Every marker field names the answer: an append, a rollback, a B3
+    // connection or disconnection, and an epoch handoff each recompute.
+    std::vector<Key> changed(6, base);
+    changed[0].domain = filled(0x23);
+    changed[1].next_sequence = 7;
+    changed[2].last_microblock_hash = filled(0x34);
+    changed[3].last_b3_checkpoint = filled(0x45);
+    changed[4].current_epoch = 3;
+    changed[5].current_seat_set_hash = filled(0x56);
+    for (const Key& key : changed) {
+        const size_t before{scans};
+        BOOST_REQUIRE(status(key, true, true));
+        BOOST_CHECK_EQUAL(scans, before + 1);
+        BOOST_REQUIRE(status(base, true, true));
+        BOOST_CHECK_EQUAL(scans, before + 2);
+    }
+    BOOST_CHECK_EQUAL(memo.Size(), 1U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_transport_policy_tests, FlowMeshServiceSetup)
@@ -927,6 +983,95 @@ BOOST_AUTO_TEST_CASE(seat_transition_verifies_each_durable_head_once_and_replans
     BOOST_CHECK_EQUAL(counts().head_entry_reads, moved.head_entry_reads);
     BOOST_CHECK_EQUAL(counts().settlement_plans, moved.settlement_plans);
     BOOST_CHECK(service.MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
+}
+
+// Status objects report the pending checkpoint on every market read. The
+// service retains that answer for one exact durable marker, while the B3
+// publication payload is always derived afresh.
+BOOST_AUTO_TEST_CASE(pending_checkpoint_status_is_retained_per_marker_and_never_the_payload)
+{
+    const auto genesis{Genesis()};
+    Retain(genesis);
+    std::string error;
+    node::FlowMeshService service{*m_node.chainman, ServicePath()};
+    auto& signals{*m_node.validation_signals};
+    signals.RegisterValidationInterface(&service);
+    const struct Registration {
+        ValidationSignals& signals;
+        node::FlowMeshService& service;
+        ~Registration()
+        {
+            signals.UnregisterValidationInterface(&service);
+            signals.SyncWithValidationInterfaceQueue();
+        }
+    } registration{signals, service};
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE_MESSAGE(service.ArmSeatKeys(secrets, error), error);
+    BOOST_REQUIRE(WaitUntil([&] {
+        const auto status{service.MarketStatus(market)};
+        return status && status->next_sequence == 1 && status->halt == node::FlowMeshRuntimeHalt::NONE;
+    }));
+    const auto counts = [&] { return service.MemoCountsForTest(); };
+    // The retained status always equals a fresh derivation, errors included.
+    const auto matches_fresh = [&] {
+        std::string fresh_error, status_error;
+        const auto fresh{service.NextCheckpointMpa(market, fresh_error)};
+        const auto status{service.PendingCheckpointStatus(market, status_error)};
+        BOOST_CHECK_EQUAL(status_error, fresh_error);
+        BOOST_CHECK_EQUAL(status.has_value(), fresh.has_value());
+        if (status && fresh) {
+            BOOST_CHECK(status->checkpoint_id == fresh->checkpoint_id);
+            BOOST_CHECK_EQUAL(status->sequence, fresh->sequence);
+            BOOST_CHECK_EQUAL(status->effect_count, fresh->effect_count);
+        }
+        return status;
+    };
+
+    // Publication never consults the memo.
+    const auto start{counts()};
+    for (int i{0}; i < 3; ++i) BOOST_REQUIRE_MESSAGE(service.NextCheckpointMpa(market, error), error);
+    BOOST_CHECK_EQUAL(counts().pending_checkpoint_lookups, start.pending_checkpoint_lookups);
+    BOOST_CHECK_EQUAL(counts().pending_checkpoint_scans, start.pending_checkpoint_scans);
+
+    // One durable head: many status reads, one scan.
+    const auto genesis_status{matches_fresh()};
+    BOOST_REQUIRE(genesis_status);
+    BOOST_CHECK_EQUAL(genesis_status->sequence, 0U);
+    for (int i{0}; i < 5; ++i) BOOST_CHECK(matches_fresh());
+    BOOST_CHECK_EQUAL(counts().pending_checkpoint_lookups, start.pending_checkpoint_lookups + 6);
+    BOOST_CHECK_EQUAL(counts().pending_checkpoint_scans, start.pending_checkpoint_scans + 1);
+
+    // Connecting the checkpoint on B3 rewrites the marker: none is pending
+    // now, and that answer is retained too.
+    const auto checkpoint{service.NextCheckpointMpa(market, error)};
+    BOOST_REQUIRE_MESSAGE(checkpoint, error);
+    ConnectMpaBlock({checkpoint->record});
+    const CBlockIndex* tip{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip())};
+    signals.UpdatedBlockTip(tip, nullptr, /*fInitialDownload=*/false);
+    signals.SyncWithValidationInterfaceQueue();
+    BOOST_REQUIRE(WaitUntil([&] {
+        std::string status_error;
+        return !service.PendingCheckpointStatus(market, status_error) && status_error.empty();
+    }));
+    BOOST_CHECK(!matches_fresh());
+    const auto connected{counts()};
+    for (int i{0}; i < 5; ++i) BOOST_CHECK(!matches_fresh());
+    BOOST_CHECK_EQUAL(counts().pending_checkpoint_scans, connected.pending_checkpoint_scans);
+
+    // A new durable head is scanned exactly once more.
+    BOOST_REQUIRE_MESSAGE(service.ArmSeatKeys(secrets, error), error);
+    flowmesh::Action deposit;
+    deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
+    deposit.outpoint = deposit_outpoint;
+    BOOST_REQUIRE_MESSAGE(service.SubmitLocalAction(market, deposit, error), error);
+    BOOST_REQUIRE(WaitUntil([&] {
+        const auto status{service.MarketStatus(market)};
+        return status && status->next_sequence == 2;
+    }));
+    const auto appended{counts()};
+    matches_fresh();
+    matches_fresh();
+    BOOST_CHECK_EQUAL(counts().pending_checkpoint_scans, appended.pending_checkpoint_scans + 1);
 }
 
 BOOST_AUTO_TEST_CASE(health_reports_an_installed_market_head_and_pause_reason)
