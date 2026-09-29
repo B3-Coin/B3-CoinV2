@@ -220,6 +220,36 @@ BOOST_AUTO_TEST_CASE(restored_evidence_is_not_api_origin)
     BOOST_CHECK_EQUAL(h.pool.UnreportedDrops(), 1U);
 }
 
+BOOST_AUTO_TEST_CASE(prune_tells_its_observer_every_dropped_action)
+{
+    PoolFixture f;
+    const auto api{f.Signed(0, 0)};
+    const auto restored{f.Signed(1, 0)};
+    const auto remote{f.Signed(0, 1)};
+    const auto open{f.Signed(1, 7)};
+    BOOST_REQUIRE(f.pool.Add(api, node::FLOWMESH_LOCAL_ACTION_PEER, f.now, {.api_origin = true}) ==
+                  flowmesh::ActionReasonCode::ADMITTED);
+    BOOST_REQUIRE(f.pool.Add(restored, node::FLOWMESH_LOCAL_ACTION_PEER, f.now, {}) ==
+                  flowmesh::ActionReasonCode::ADMITTED);
+    BOOST_REQUIRE(f.pool.Add(remote, 5, f.now) == flowmesh::ActionReasonCode::ADMITTED);
+    BOOST_REQUIRE(f.pool.Add(open, 5, f.now) == flowmesh::ActionReasonCode::ADMITTED);
+    BOOST_CHECK(f.pool.Contains(api.Id()));
+    flowmesh::test_only::StateFunding::SetNextSequence(f.state, f.Account(0), 5);
+    flowmesh::test_only::StateFunding::SetNextSequence(f.state, f.Account(1), 5);
+    // Every dropped action is observed, whatever its origin and whether or
+    // not the bounded report names it; a kept one is not.
+    std::vector<uint256> observed;
+    const auto reported{f.pool.Prune(f.state, 0, [&](const uint256& id) { observed.push_back(id); })};
+    BOOST_CHECK(reported.empty());
+    std::sort(observed.begin(), observed.end());
+    std::vector<uint256> expected{api.Id(), restored.Id(), remote.Id()};
+    std::sort(expected.begin(), expected.end());
+    BOOST_CHECK(observed == expected);
+    BOOST_CHECK_EQUAL(f.pool.Size(), 1U);
+    BOOST_CHECK(f.pool.Contains(open.Id()));
+    BOOST_CHECK(!f.pool.Contains(api.Id()));
+}
+
 namespace {
 node::FlowMeshActionPoolLimits SmallLimits()
 {

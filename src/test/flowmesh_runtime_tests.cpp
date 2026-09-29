@@ -9997,10 +9997,9 @@ BOOST_AUTO_TEST_CASE(public_notice_flood_from_other_identities_keeps_a_remote_cl
     BOOST_REQUIRE(submitted.queued && *submitted.queued == flowmesh::QueueResult::ACCEPTED);
     f.Drain();
     BOOST_REQUIRE_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 1U);
-    // Another identity then submits more open-sequence actions than this
-    // node remembers submitters for (1,024 per market). Each is noted before
-    // it is queued, whatever the local queue's budget then answers; the
-    // identity replaces only its own.
+    // Another identity then submits 1,200 open-sequence actions. Those the
+    // local queue takes are pooled, and their submitter is remembered while
+    // they stay pooled; the rest are forgotten when the queue refuses them.
     const std::string churner{"203.0.113.9"};
     for (int k{0}; k < 20; ++k) {
         CKey churn_key;
@@ -10067,6 +10066,108 @@ BOOST_AUTO_TEST_CASE(public_notice_flood_from_other_identities_keeps_a_remote_cl
         BOOST_REQUIRE(kept->consumed_by);
         BOOST_CHECK(kept->consumed_by->action_id == consumer.Id());
     }
+}
+
+BOOST_AUTO_TEST_CASE(public_submitters_are_remembered_only_while_the_action_is_live)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "notice_submitter_lifetime"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true;
+    // The slot's proposer certifies X; node L holds only the client's A.
+    const uint32_t proposer_seat{flowmesh::ProductionProposerSeatIndex(1, 0, f.seats.seats.Size())};
+    size_t proposer{0};
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        if (f.seats.secrets[i].GetPublicKey() == f.seats.seats.members[proposer_seat].key.Key()) proposer = i;
+    }
+    const size_t local{(proposer + 1) % f.runtimes.size()};
+    f.network.SetFilter([&](size_t from, size_t, const flowmesh::WireMessage& wire) {
+        if (from == local && wire.kind == flowmesh::WireMessageKind::ACTION) return false;
+        return f.Observe(wire);
+    });
+    auto& runtime{*f.runtimes[local]};
+    using Origin = flowmesh::ClientNoticeOrigin;
+    const std::string client{"198.51.100.7"};
+    CKey key;
+    key.MakeNewKey(true);
+    const auto config{f.initial.ConfigId()};
+    const auto queued{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_BID)};
+    const auto consumer{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_ASK)};
+    // A remote client queues A through this node's public API; the same
+    // bytes from another identity later keep A the client's.
+    for (const auto& who : {client, std::string{"203.0.113.50"}}) {
+        const auto submitted{runtime.SubmitLocalActionChecked(f.market, queued, Origin::PUBLIC, who)};
+        BOOST_REQUIRE(submitted.queued && *submitted.queued == flowmesh::QueueResult::ACCEPTED);
+        f.Drain();
+        BOOST_REQUIRE_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 1U);
+        BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 1U);
+    }
+
+    // A peer's action holds another signer's sequence 0 in this pool.
+    CKey holder_key;
+    holder_key.MakeNewKey(true);
+    const auto holder{SignedAction(holder_key, f.domain, config, 0, flowmesh::ActionType::CANCEL_ASK)};
+    const flowmesh::WireHeader header{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1};
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(3, {flowmesh::WireMessageKind::ACTION, header,
+        *flowmesh::EncodeProductionActionPayload(holder)}) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_REQUIRE_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 2U);
+    // 20 identities (more than PUBLIC_SUBMITTER_ACTIONS / 64 = 16 of the
+    // earlier bound) each submit more than their share of different
+    // withdrawals at that sequence. Each is open when submitted, so each is
+    // counted; then its life here ends. The first ones the local queue takes
+    // and the worker's pool refuses (the sequence is held); past the queue's
+    // burst, the queue refuses them.
+    uint64_t amount{0};
+    const auto withdrawal = [&] {
+        flowmesh::Action action;
+        action.signer = holder.signer;
+        action.sequence = 0;
+        action.type = static_cast<uint8_t>(flowmesh::ActionType::WITHDRAW);
+        action.asset = modern::NativeAsset();
+        action.amount = ++amount;
+        action.destination = Filled(0xd9);
+        BOOST_REQUIRE(flowmesh::SignAction(holder_key, f.domain, config, action));
+        return action;
+    };
+    size_t queued_frames{0};
+    for (int identity{0}; identity < 20; ++identity) {
+        const auto who{strprintf("ipv6/64:20010db8%08x", identity)};
+        for (size_t n{0}; n < flowmesh::CLIENT_NOTICE_PER_SUBMITTER + 8; ++n) {
+            const auto submitted{runtime.SubmitLocalActionChecked(f.market, withdrawal(), Origin::PUBLIC, who)};
+            BOOST_REQUIRE(submitted.admission.kind == node::FlowMeshLocalAdmission::Kind::ENQUEUE);
+            queued_frames += submitted.queued && *submitted.queued == flowmesh::QueueResult::ACCEPTED;
+        }
+    }
+    f.Drain();
+    // Both paths ran: some reached the worker, some the queue refused.
+    BOOST_CHECK_GT(queued_frames, 0U);
+    BOOST_CHECK_LT(queued_frames, 20 * (flowmesh::CLIENT_NOTICE_PER_SUBMITTER + 8));
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 2U);
+    // Only the live action is remembered.
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 1U);
+    // A made-up public deposit is refused before it is queued; nothing stays.
+    BOOST_CHECK(runtime.SubmitLocalActionChecked(f.market, Deposit(COutPoint{f.outpoint.hash, 4242}), Origin::PUBLIC,
+                                                 "203.0.113.10").admission.code ==
+                flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 1U);
+
+    BOOST_REQUIRE(f.runtimes[proposer]->SubmitLocalAction(f.market, consumer) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    f.block_commits = false;
+    BOOST_REQUIRE(Settle(f, [&] { return f.AllAt(2); }));
+    f.Drain();
+    // A's pool-drop notice still names the client that queued it, and the
+    // drop ends A's life here.
+    const auto dropped{runtime.NewestClientNotice(f.market, queued.Id())};
+    BOOST_REQUIRE(dropped);
+    BOOST_CHECK(dropped->code == flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED);
+    BOOST_CHECK(dropped->origin == Origin::PUBLIC);
+    BOOST_CHECK_EQUAL(dropped->submitter, client);
+    BOOST_REQUIRE(dropped->consumed_by);
+    BOOST_CHECK(dropped->consumed_by->action_id == consumer.Id());
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
 }
 
 BOOST_AUTO_TEST_CASE(public_submission_notices_never_evict_node_notices)

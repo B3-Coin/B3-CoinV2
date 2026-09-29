@@ -72,6 +72,9 @@ class FlowMeshActionPool
 public:
     using Verifier = std::function<bool(const flowmesh::Action&)>;
     using AddContext = FlowMeshPoolAddContext;
+    //! Told the id of each action Prune drops, after dropping it. It must
+    //! not call back into the pool.
+    using DropObserver = std::function<void(const uint256&)>;
 
     FlowMeshActionPool() = default;
     explicit FlowMeshActionPool(const FlowMeshActionPoolLimits& limits) : m_limits{limits} {}
@@ -218,6 +221,9 @@ public:
 
     size_t Size() const { return m_actions.size(); }
 
+    //! Whether an action with this ActionId (whatever its credential) is held.
+    bool Contains(const uint256& id) const { return m_actions.count(id) != 0; }
+
     bool ContainsExact(const flowmesh::Action& action) const
     {
         const auto it{m_actions.find(action.Id())};
@@ -317,8 +323,10 @@ public:
 
     /** Drops every consumed deposit and every stale sequence, as always.
      * Returns up to `report_max` dropped API-origin SIGNED actions, in drop
-     * order; further such drops are only counted (UnreportedDrops). */
-    std::vector<flowmesh::Action> Prune(const flowmesh::FlowMeshState& state, const size_t report_max = 0)
+     * order; further such drops are only counted (UnreportedDrops).
+     * `dropped`, when set, is told every dropped action's id. */
+    std::vector<flowmesh::Action> Prune(const flowmesh::FlowMeshState& state, const size_t report_max = 0,
+                                        const DropObserver& dropped = {})
     {
         std::vector<flowmesh::Action> reported;
         for (auto it{m_deposits.begin()}; it != m_deposits.end();) {
@@ -326,8 +334,10 @@ public:
                 ++it;
                 continue;
             }
-            Drop(it->second);
+            const uint256 id{it->second};
+            Drop(id);
             it = m_deposits.erase(it);
+            if (dropped) dropped(id);
         }
         for (auto it{m_signed.begin()}; it != m_signed.end();) {
             if (it->first.second >= state.NextSequence(it->first.first)) {
@@ -342,8 +352,10 @@ public:
                     ++m_unreported_drops;
                 }
             }
-            Drop(it->second);
+            const uint256 id{it->second};
+            Drop(id);
             it = m_signed.erase(it);
+            if (dropped) dropped(id);
         }
         return reported;
     }

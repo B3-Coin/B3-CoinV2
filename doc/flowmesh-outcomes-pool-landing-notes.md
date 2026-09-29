@@ -152,18 +152,30 @@ Notices whose identity is unknown count as one identity.
 
 The identity is the client that first queued the action, so the worker's
 recheck and pool-drop notices count against it too. The runtime remembers it
-for at most 1,024 public ActionIds per market and 64 per identity; an
-identity at 64 replaces its own oldest, so one identity cannot push
-another's out either. A forgotten action's notices use the unknown share.
+only while the action is live on this node, that is queued for the worker
+or held in its pool. It forgets the identity:
+
+- when the worker has handled the action's last queued frame, or the queue
+  refused it, and the pool does not hold the action;
+- when the pool drops the action, because it was certified or pruned.
+
+At most 2,048 live public actions per market are remembered, under the same
+rule as the ring: the 64-action share applies only once 2,048 are held. A
+client whose live actions are within its share therefore keeps their
+attribution unless at least 32 other identities hold live actions here at
+once. Actions whose lives have ended no longer count. A forgotten action's
+notices count as of unknown identity. The record costs under 1 MB per
+market.
 
 A public deposit refused because its outpoint has no anchored facts appends
 no notice: it carries no credential, and the refusal is already in the
 submit reply.
 
-One identity therefore cannot turn the public ring over. An identity that
-holds at most 64 notices loses one to other identities only once every
-identity holds at most 64, which takes at least 32 other identities
-flooding at once. Under that pressure, clients sharing one identity also
+One identity therefore cannot turn the public ring over, and that holds
+for the drop and recheck notices as well as the submit-time ones. An
+identity that holds at most 64 notices loses one to other identities only
+once every identity holds at most 64, which takes at least 32 other
+identities flooding at once. Under that pressure, clients sharing one identity also
 share its 64: a busy NAT address, /64 or load balancer then keeps only its
 newest 64 notices. A remote client's evicted proof reads "unknown", which
 is safe. An already-included resubmission appends no notice at all.

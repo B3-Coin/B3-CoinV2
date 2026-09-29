@@ -253,46 +253,72 @@ struct FlowMeshRuntime::Market {
         return node_origin.contains(id) ? flowmesh::ClientNoticeOrigin::NODE : flowmesh::ClientNoticeOrigin::PUBLIC;
     }
     //! The requesting identity that first queued each PUBLIC-origin action
-    //! (see ClientActionNotice::submitter), at most PUBLIC_SUBMITTER_ACTIONS
-    //! in all and CLIENT_NOTICE_PER_SUBMITTER per identity: an identity at
-    //! its share replaces its own oldest, otherwise the oldest overall goes,
-    //! so one identity never evicts another's. A later submission of the
-    //! same bytes never moves an action. The action's worker-recheck and
-    //! pool-drop notices count against that identity's share of the PUBLIC
-    //! ring; once evicted here, against the shared share of unknown
-    //! identities.
-    static constexpr size_t PUBLIC_SUBMITTER_ACTIONS{1024};
+    //! (see ClientActionNotice::submitter), only while the action is live
+    //! here: a frame of it is queued for the worker, or the pool holds it. A
+    //! later submission of the same bytes never moves it. It is forgotten
+    //! once the action's last queued frame is handled (or refused by the
+    //! queue) while the pool does not hold it, and when the pool drops it
+    //! (certified or pruned), so only live actions count against the bound
+    //! below. The action's worker-recheck and pool-drop notices count against
+    //! that identity's share of the PUBLIC ring.
+    //! At most PUBLIC_SUBMITTER_ACTIONS live actions are remembered; past
+    //! that, IdentityShares picks the one forgotten (its notices then count
+    //! as of unknown identity). An identity within its share
+    //! (CLIENT_NOTICE_PER_SUBMITTER) keeps its attributions unless more than
+    //! PUBLIC_SUBMITTER_ACTIONS / CLIENT_NOTICE_PER_SUBMITTER identities hold
+    //! live actions, as for the ring itself.
+    static constexpr size_t PUBLIC_SUBMITTER_ACTIONS{flowmesh::CLIENT_NOTICE_CAPACITY};
     struct PublicSubmission {
-        uint256 action_id;
-        std::string submitter;
+        uint64_t serial{0};
+        //! Frames of the action counted as queued and not yet handled.
+        uint32_t frames{0};
     };
     uint64_t public_submission_serial{0};
-    std::map<uint64_t, PublicSubmission> public_submissions; // oldest first
-    std::map<uint256, uint64_t> public_submission_serials;
-    std::map<std::string, std::deque<uint64_t>> public_submissions_by_submitter;
-    void NotePublicSubmitter(const uint256& id, const std::string& submitter)
+    std::map<uint256, PublicSubmission> public_submissions;
+    std::map<uint64_t, uint256> public_submission_ids;
+    flowmesh::IdentityShares public_submitters{PUBLIC_SUBMITTER_ACTIONS, flowmesh::CLIENT_NOTICE_PER_SUBMITTER};
+    /** A PUBLIC frame of `id` from `submitter` is about to be queued. True
+     * when it was counted: the caller then settles it with PublicFrameDone
+     * if the queue refuses it; the worker settles every frame it takes. */
+    bool NotePublicFrame(const uint256& id, const std::string& submitter)
     {
-        if (submitter.empty() || public_submission_serials.contains(id)) return;
-        auto& own{public_submissions_by_submitter[submitter]};
-        if (own.size() >= flowmesh::CLIENT_NOTICE_PER_SUBMITTER) {
-            const auto oldest{public_submissions.find(own.front())};
-            public_submission_serials.erase(oldest->second.action_id);
-            public_submissions.erase(oldest);
-            own.pop_front();
+        auto it{public_submissions.find(id)};
+        if (it == public_submissions.end()) {
+            if (submitter.empty()) return false;
+            const uint64_t serial{++public_submission_serial};
+            const auto dropped{public_submitters.Insert(serial, submitter)};
+            it = public_submissions.emplace(id, PublicSubmission{.serial = serial}).first;
+            public_submission_ids.emplace(serial, id);
+            if (dropped) {
+                // Never the entry just added (IdentityShares::Insert).
+                const auto gone{public_submission_ids.find(*dropped)};
+                public_submissions.erase(gone->second);
+                public_submission_ids.erase(gone);
+            }
         }
-        const uint64_t serial{++public_submission_serial};
-        own.push_back(serial);
-        public_submissions.emplace(serial, PublicSubmission{id, submitter});
-        public_submission_serials.emplace(id, serial);
-        if (public_submissions.size() > PUBLIC_SUBMITTER_ACTIONS) {
-            // The oldest overall is its submitter's oldest.
-            const auto oldest{public_submissions.begin()};
-            const auto owner{public_submissions_by_submitter.find(oldest->second.submitter)};
-            owner->second.pop_front();
-            if (owner->second.empty()) public_submissions_by_submitter.erase(owner);
-            public_submission_serials.erase(oldest->second.action_id);
-            public_submissions.erase(oldest);
-        }
+        if (it->second.frames < std::numeric_limits<uint32_t>::max()) ++it->second.frames;
+        return true;
+    }
+    //! One local frame of `id` left the queue: handled by the worker, or
+    //! refused by the queue.
+    void PublicFrameDone(const uint256& id)
+    {
+        const auto it{public_submissions.find(id)};
+        if (it == public_submissions.end()) return;
+        if (it->second.frames > 0) --it->second.frames;
+        if (it->second.frames == 0 && !pool.Contains(id)) ForgetPublicSubmitter(it);
+    }
+    //! The pool dropped `id` (certified or pruned).
+    void PublicActionDropped(const uint256& id)
+    {
+        const auto it{public_submissions.find(id)};
+        if (it != public_submissions.end() && it->second.frames == 0) ForgetPublicSubmitter(it);
+    }
+    void ForgetPublicSubmitter(const std::map<uint256, PublicSubmission>::iterator it)
+    {
+        public_submitters.Erase(it->second.serial);
+        public_submission_ids.erase(it->second.serial);
+        public_submissions.erase(it);
     }
     //! A queued action's notice: its ring and, for PUBLIC, its submitter.
     void TagNotice(flowmesh::ClientActionNotice& notice) const
@@ -300,8 +326,8 @@ struct FlowMeshRuntime::Market {
         notice.origin = NoticeOrigin(notice.action_id);
         notice.submitter.clear();
         if (notice.origin != flowmesh::ClientNoticeOrigin::PUBLIC) return;
-        if (const auto it{public_submission_serials.find(notice.action_id)}; it != public_submission_serials.end()) {
-            notice.submitter = public_submissions.at(it->second).submitter;
+        if (const auto it{public_submissions.find(notice.action_id)}; it != public_submissions.end()) {
+            if (const auto* identity{public_submitters.Identity(it->second.serial)}) notice.submitter = *identity;
         }
     }
     bool ready{true};
@@ -1773,6 +1799,9 @@ bool CommitCertified(Market& market,
                               certified.entry.anchor.hash}] =
         certified.entry.sequence;
     market.pool.DropCertified(certified.entry.actions);
+    if (!market.public_submissions.empty()) {
+        for (const auto& action : certified.entry.actions) market.PublicActionDropped(action.Id());
+    }
     // Local drop notices: a queued API-origin action whose sequence this
     // entry consumed. The consumer is in this very entry: such an action was
     // admitted while its sequence was open, and every commit prunes. Deposits
@@ -1781,7 +1810,16 @@ bool CommitCertified(Market& market,
     std::vector<flowmesh::ClientActionNotice> drops;
     const auto* committed_item{market.recent.Find(certified.entry.sequence)};
     if (committed_item && committed_item->hash != market.last_hash) committed_item = nullptr;
-    for (const auto& dropped : market.pool.Prune(market.state, MAX_LOCAL_DROP_NOTICES)) {
+    // Pruned public actions forget their submitters once their notices are
+    // tagged (at most PUBLIC_SUBMITTER_ACTIONS ids).
+    std::vector<uint256> pruned_public;
+    FlowMeshActionPool::DropObserver pruned;
+    if (!market.public_submissions.empty()) {
+        pruned = [&](const uint256& id) {
+            if (market.public_submissions.contains(id)) pruned_public.push_back(id);
+        };
+    }
+    for (const auto& dropped : market.pool.Prune(market.state, MAX_LOCAL_DROP_NOTICES, pruned)) {
         flowmesh::ClientActionNotice& notice{drops.emplace_back()};
         notice.market_id = market.market_id;
         notice.action_id = dropped.Id();
@@ -1800,6 +1838,7 @@ bool CommitCertified(Market& market,
             }
         }
     }
+    for (const auto& id : pruned_public) market.PublicActionDropped(id);
     // After this commit's events, in one append.
     if (!drops.empty()) market.client_events.AppendNotices(std::move(drops));
     market.candidates.clear();
@@ -2434,6 +2473,13 @@ uint64_t FlowMeshRuntime::AdmissionHashCountForTest() const
 {
     std::lock_guard<std::mutex> lock{m_queue_mutex};
     return m_admission_hashes;
+}
+
+size_t FlowMeshRuntime::PublicSubmittersForTest(const flowmesh::MarketId& market_id) const
+{
+    std::lock_guard<std::mutex> lock{m_market_mutex};
+    const auto it{m_markets.find(market_id)};
+    return it == m_markets.end() ? 0 : it->second->public_submissions.size();
 }
 
 FlowMeshSeatEvidenceWork FlowMeshRuntime::SeatEvidenceWorkForTest() const
@@ -3507,6 +3553,8 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
     uint256 domain, config_id;
     const flowmesh::DepositVerifier* deposits{nullptr};
     bool pooled{false};
+    // A queued frame counted towards its public submitter (NotePublicFrame).
+    bool counted{false};
     {
         FlowMeshTimingSpan timing_lock_3034{__func__};
         timing_lock_3034.Field("lock_name", std::string{"market_mutex"});
@@ -3554,11 +3602,11 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
                 tag(*notice);
             }
             // Its later worker and drop notices keep this origin's ring and,
-            // for PUBLIC, the submitter's share of it.
+            // for PUBLIC, the submitter's share of it while it is live here.
             if (origin == flowmesh::ClientNoticeOrigin::NODE) {
                 it->second->NoteNodeOrigin(action.Id());
             } else {
-                it->second->NotePublicSubmitter(action.Id(), submitter);
+                counted = it->second->NotePublicFrame(action.Id(), submitter);
             }
         }
     }
@@ -3578,6 +3626,17 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
             if (notice) {
                 notice->code = out.admission.code;
                 m_client_events.AppendNotices({std::move(*notice)});
+            }
+            if (counted) {
+                // Never queued: settle the frame this attempt counted.
+                FlowMeshTimingSpan timing_lock{__func__};
+                timing_lock.Field("lock_name", std::string{"market_mutex"});
+                timing_lock.Mark("lock_requested_us");
+                std::lock_guard<std::mutex> lock{m_market_mutex};
+                timing_lock.Mark("lock_acquired_us");
+                if (const auto it{m_markets.find(market_id)}; it != m_markets.end()) {
+                    it->second->PublicFrameDone(action.Id());
+                }
             }
             return out;
         }
@@ -3621,6 +3680,10 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
             // submission does not hold the market lock across enqueue.
             ClientActionEvent(*it->second, flowmesh::ClientEventKind::QUEUE_ADMITTED,
                               action, "bounded runtime queue only; pool admission is pending");
+        }
+        // A refused frame never reaches the worker: settle it here.
+        if (it != m_markets.end() && counted && result != flowmesh::QueueResult::ACCEPTED) {
+            it->second->PublicFrameDone(action.Id());
         }
     }
     return out;
@@ -4281,6 +4344,21 @@ void FlowMeshRuntime::ProcessMessage(
     const auto it{m_markets.find(queued.message.header.market_id)};
     if (it == m_markets.end()) return;
     Market& market{*it->second};
+    // A local action frame leaves the queue here however it is answered,
+    // including by every early return below. Its public submitter is
+    // settled on the way out, after any notice about it was tagged.
+    struct LocalFrameSettle {
+        Market& market;
+        std::optional<uint256> id;
+        ~LocalFrameSettle()
+        {
+            if (id) market.PublicFrameDone(*id);
+        }
+    } settle{market, std::nullopt};
+    if (queued.peer == LOCAL_ACTION_PEER && queued.message.kind == flowmesh::WireMessageKind::ACTION &&
+        !market.public_submissions.empty()) {
+        if (const auto action{flowmesh::DecodeProductionActionPayload(queued.message.payload)}) settle.id = action->Id();
+    }
     if (!market.ready) return;
     BenchSpan processing{market, "message_processing_completed", queued.message.kind,
                          uint256{}, queued.message.header.sequence};

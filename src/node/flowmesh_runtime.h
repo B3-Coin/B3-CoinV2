@@ -666,6 +666,8 @@ public:
     uint64_t AdmissionHashCountForTest() const;
     /** Test-only: the seat-misbehaviour recorder's work, summed over markets. */
     FlowMeshSeatEvidenceWork SeatEvidenceWorkForTest() const;
+    /** Test-only: public actions whose submitter the market remembers. */
+    size_t PublicSubmittersForTest(const flowmesh::MarketId& market_id) const;
 
 private:
     struct Market;
