@@ -3684,6 +3684,21 @@ std::pair<int, UniValue> ApiCall(const node::HttpsEndpoint& endpoint, const std:
     return {reply.status, value};
 }
 
+/** Runs `burst` at the start of a fresh one-second budget window of this
+ * identity, up to five times, until one run finishes within 900 ms; its
+ * result, or nullopt when none fitted (the caller fails). */
+template <typename Fn>
+auto FittedBurst(Fn&& burst) -> std::optional<decltype(burst())>
+{
+    for (int attempt{0}; attempt < 5; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1100}); // every earlier window has ended
+        const auto start{std::chrono::steady_clock::now()};
+        auto result{burst()};
+        if (std::chrono::steady_clock::now() - start < std::chrono::milliseconds{900}) return result;
+    }
+    return std::nullopt;
+}
+
 std::set<std::string> KeySet(const UniValue& object)
 {
     const auto keys{object.getKeys()};
@@ -3916,40 +3931,48 @@ BOOST_AUTO_TEST_CASE(order_budget_refuses_orders_not_cancels_before_authenticati
     };
     const std::string authentication{"Action authentication failed for this chain/domain/market configuration"};
     const std::string exhausted{"Public trading order budget exhausted; cancels and withdrawals are still accepted"};
-    const auto start{std::chrono::steady_clock::now()};
-    std::vector<std::pair<int, std::string>> orders;
-    for (uint64_t n{0}; n < 12; ++n) {
-        const auto [status, reply]{ApiCall(endpoint, "submit", params(action(flowmesh::ActionType::SUBMIT_BID, n)))};
-        orders.emplace_back(status, reply["error"].get_str());
-    }
-    // non_compact_submit_still_order_budgeted: the 13th order, sent with a
-    // body the pre-parse classifier counts as a read, still hits the
-    // post-parse order budget.
-    const auto non_compact{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
-        "{ \"method\":\"submit\",\"params\":" + params(action(flowmesh::ActionType::SUBMIT_BID, 12)) + "}",
-        std::chrono::seconds{5}, 1 << 20)};
-    const auto [cancel_status, cancel]{ApiCall(endpoint, "submit", params(action(flowmesh::ActionType::CANCEL_BID, 13)))};
     flowmesh::Action deposit;
     deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
     deposit.outpoint = COutPoint{Txid::FromUint256(uint256{uint8_t{0x78}}), 0};
-    const auto [deposit_status, deposit_reply]{ApiCall(endpoint, "submit", params(deposit))};
-    if (std::chrono::steady_clock::now() - start < std::chrono::milliseconds{900}) {
-        for (const auto& [status, text] : orders) {
-            BOOST_CHECK_EQUAL(status, 400);
-            BOOST_CHECK_EQUAL(text, authentication);
+    struct Burst {
+        std::vector<std::pair<int, std::string>> orders;
+        node::HttpsRequestResult non_compact;
+        std::pair<int, UniValue> cancel, deposit;
+    };
+    // The budgets use one-second windows: a burst that does not fit in one
+    // is repeated, never passed unchecked.
+    const auto burst{FittedBurst([&] {
+        Burst out;
+        for (uint64_t n{0}; n < 12; ++n) {
+            const auto [status, reply]{ApiCall(endpoint, "submit", params(action(flowmesh::ActionType::SUBMIT_BID, n)))};
+            out.orders.emplace_back(status, reply["error"].get_str());
         }
-        BOOST_REQUIRE(non_compact.response_received);
-        BOOST_CHECK_EQUAL(non_compact.status, 400);
-        UniValue refused;
-        BOOST_REQUIRE(refused.read(non_compact.body));
-        BOOST_CHECK_EQUAL(refused["error"].get_str(), exhausted);
-        // order_budget_refuses_orders_not_cancels: the cancel is not charged
-        // (it reaches authentication), a deposit shares the order budget.
-        BOOST_CHECK_EQUAL(cancel_status, 400);
-        BOOST_CHECK_EQUAL(cancel["error"].get_str(), authentication);
-        BOOST_CHECK_EQUAL(deposit_status, 400);
-        BOOST_CHECK_EQUAL(deposit_reply["error"].get_str(), exhausted);
+        // non_compact_submit_still_order_budgeted: the 13th order, sent with
+        // a body the pre-parse classifier counts as a read, still hits the
+        // post-parse order budget.
+        out.non_compact = node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
+            "{ \"method\":\"submit\",\"params\":" + params(action(flowmesh::ActionType::SUBMIT_BID, 12)) + "}",
+            std::chrono::seconds{5}, 1 << 20);
+        out.cancel = ApiCall(endpoint, "submit", params(action(flowmesh::ActionType::CANCEL_BID, 13)));
+        out.deposit = ApiCall(endpoint, "submit", params(deposit));
+        return out;
+    })};
+    BOOST_REQUIRE_MESSAGE(burst, "no burst fitted in one budget window");
+    for (const auto& [status, text] : burst->orders) {
+        BOOST_CHECK_EQUAL(status, 400);
+        BOOST_CHECK_EQUAL(text, authentication);
     }
+    BOOST_REQUIRE(burst->non_compact.response_received);
+    BOOST_CHECK_EQUAL(burst->non_compact.status, 400);
+    UniValue refused;
+    BOOST_REQUIRE(refused.read(burst->non_compact.body));
+    BOOST_CHECK_EQUAL(refused["error"].get_str(), exhausted);
+    // order_budget_refuses_orders_not_cancels: the cancel is not charged (it
+    // reaches authentication), a deposit shares the order budget.
+    BOOST_CHECK_EQUAL(burst->cancel.first, 400);
+    BOOST_CHECK_EQUAL(burst->cancel.second["error"].get_str(), authentication);
+    BOOST_CHECK_EQUAL(burst->deposit.first, 400);
+    BOOST_CHECK_EQUAL(burst->deposit.second["error"].get_str(), exhausted);
     api->Stop();
     service.Stop();
 }
@@ -4027,15 +4050,16 @@ BOOST_AUTO_TEST_CASE(api_outcome_contract_advert_and_opt_in_only)
         BOOST_CHECK_EQUAL(unknown_status, 400);
         BOOST_CHECK_EQUAL(unknown["error"].get_str(), "Invalid text: microblock_hash");
         // api_outcome_extra_parts_charge_tokens: the method costs one more
-        // read token; refused, it is the documented budget error.
-        std::this_thread::sleep_for(std::chrono::milliseconds{1100});
-        const auto start{std::chrono::steady_clock::now()};
-        for (int i{0}; i < 27; ++i) ApiCall(endpoint, "markets", "{}");
-        const auto [spent_status, spent]{ApiCall(endpoint, "outcome_evidence", evidence_params)};
-        if (std::chrono::steady_clock::now() - start < std::chrono::milliseconds{900}) {
-            BOOST_CHECK_EQUAL(spent_status, 400);
-            BOOST_CHECK_EQUAL(spent["error"].get_str(), node::FLOWMESH_API_OUTCOME_BUDGET_ERROR);
-        }
+        // read token; refused, it is the documented budget error. The budget
+        // uses one-second windows: a burst that does not fit in one is
+        // repeated, never passed unchecked.
+        const auto fitted{FittedBurst([&] {
+            for (int i{0}; i < 27; ++i) ApiCall(endpoint, "markets", "{}");
+            return ApiCall(endpoint, "outcome_evidence", evidence_params);
+        })};
+        BOOST_REQUIRE_MESSAGE(fitted, "no burst fitted in one budget window");
+        BOOST_CHECK_EQUAL(fitted->first, 400);
+        BOOST_CHECK_EQUAL(fitted->second["error"].get_str(), node::FLOWMESH_API_OUTCOME_BUDGET_ERROR);
         api->Stop();
     }
     service.Stop();
