@@ -1118,6 +1118,9 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     if (result->passive || foreground_read) {
         result->refresh_phase = phase; result->refresh_epoch = m_refresh_epoch;
     }
+    // Same read set and count: the override only replaces this job's phase.
+    result->reconcile_first = result->passive && phase == RefreshPhase::Receipt && scheduledPassivePhase() != RefreshPhase::Receipt;
+    m_last_job_was_reconcile = result->reconcile_first;
     // Live updates supply the selected market's read: a passive job then runs
     // only its auxiliary phase. Foreground, review and action reads always read.
     result->live = result->passive && m_watch.mode == B3FlowMeshWatch::Mode::Live && !m_read_failed && !m_watch_watchdog &&
@@ -1355,6 +1358,12 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
 void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& result)
 {
     if (!m_wallet || m_cancel->load()) { m_deferred_review.reset(); restoreLock(); m_busy = false; updateControls(); return; }
+    // A completed status read of the tracked request (the override's or the
+    // regular Receipt phase's) completes a pending reconcile. A failed status
+    // read in a job whose market read also failed does not; it is tried again,
+    // never in consecutive jobs, until one completes.
+    if (result->refresh_phase == RefreshPhase::Receipt && !result->receipt_action_id.isEmpty() &&
+        (result->receipt || (!result->receipt_error.isEmpty() && result->error.isEmpty()))) m_reconcile_pending = false;
     if (result->refresh_yielded) {
         if (result->refresh_epoch == m_refresh_epoch && m_refresh_yields < MAX_REFRESH_YIELDS) ++m_refresh_yields;
         // No partial catalog/snapshot is published or stamped fresh. Preserve
@@ -1373,7 +1382,8 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
         }
         return; // finishJob drains a captured explicit status next, if any.
     }
-    if (!result->foreground_read && result->refresh_phase && result->refresh_epoch == m_refresh_epoch) {
+    // A reconcile override replaced a phase: the scheduled one still runs next.
+    if (!result->foreground_read && result->refresh_phase && result->refresh_epoch == m_refresh_epoch && !result->reconcile_first) {
         m_refresh_yields = 0;
         switch (*result->refresh_phase) {
         case RefreshPhase::Catalog: m_refresh_phase = RefreshPhase::Status; break;
@@ -1428,6 +1438,14 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
             (m_deferred_review->operation == Operation::Deposit || m_deferred_review->operation == Operation::Withdraw)};
         if (!open_funding_draft) m_deferred_review.reset();
         if (!result->action) {
+            // Like a yielded read, a completed and correctly attributed status
+            // observation is kept although the market read failed: it neither
+            // renews the market nor authorizes an action.
+            if (result->receipt) { applyReceipt(*result->receipt); applyReceiptError(*result, {}); }
+            if (!result->receipt_error.isEmpty()) applyReceiptError(*result, result->receipt_error);
+            // The first lost market read of an episode: reconcile the tracked
+            // request before the next market read.
+            if (!m_read_failed && !result->snapshot && !result->live && !result->receipt) m_reconcile_pending = true;
             if (result->catalog) applyMarketCatalog(*result);
             const auto selected{market()};
             if (!result->read_market.isEmpty() && (!selected || result->read_market != selected->id)) {
@@ -1561,7 +1579,22 @@ void B3FlowMeshTradingPanel::DeriveRowFromSnapshot(Market& row, const B3FlowMesh
     }
 }
 
+bool B3FlowMeshTradingPanel::reconcileDue() const
+{
+    // Never before discovery ran since a reset (a Connect always reaches its
+    // Catalog phase first), never in consecutive jobs, and only for a tracked
+    // request whose outcome is not yet settled.
+    return m_reconcile_pending && !m_last_job_was_reconcile && m_catalog_age.isValid() && !m_route_pending && !m_market_data.empty() &&
+        m_receipt && receiptWalletSelected() && !m_receipt->Included() && !m_receipt->no_resubmit && !m_receipt->NotExecuted();
+}
+
 auto B3FlowMeshTradingPanel::nextPassivePhase() const -> RefreshPhase
+{
+    const auto scheduled{scheduledPassivePhase()};
+    return scheduled != RefreshPhase::Receipt && reconcileDue() ? RefreshPhase::Receipt : scheduled;
+}
+
+auto B3FlowMeshTradingPanel::scheduledPassivePhase() const -> RefreshPhase
 {
     const bool tracked{m_receipt && receiptWalletSelected()};
     const bool catalog_due{!m_catalog_age.isValid() || m_catalog_age.elapsed() >= 5000 || (m_snapshot && m_snapshot->chain_reconciling)};
@@ -1615,7 +1648,7 @@ void B3FlowMeshTradingPanel::updateWatchState()
         // No verified live update for 15 s: poll as before and reconcile.
         m_watch_watchdog = true;
         m_watch.Watchdog(now);
-        m_link_lost = true;
+        m_reconcile_pending = true;
     }
 }
 
@@ -1705,7 +1738,7 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
     if (!result->snapshot || wrong_identity) {
         // Reads poll again (with failover) while the watch backs off.
         m_watch.Finished(now, Outcome::Failed, jitter);
-        m_link_lost = true;
+        m_reconcile_pending = true;
     } else {
         const auto& s{*result->snapshot};
         const uint64_t displayed{m_snapshot->next_sequence ? m_snapshot->next_sequence - 1 : 0};
@@ -1724,17 +1757,14 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
             m_watch_release_pending = true;
         }
         if (result->gap) {
-            m_link_lost = true;
+            m_reconcile_pending = true;
             addGapMarker(scope.market, displayed, !s.unchanged && s.next_sequence ? s.next_sequence - 1 : displayed);
             updateDataViews();
         }
     }
-    if (m_link_lost) {
-        // Reconcile first: the tracked request's status is read before
-        // anything else, so a missed event cannot hide its outcome.
-        if (m_receipt && receiptWalletSelected()) m_refresh_phase = RefreshPhase::Receipt;
-        m_link_lost = false;
-    }
+    // A failure or gap leaves m_reconcile_pending set: the next passive job
+    // reads the tracked request's status first, so a missed event cannot
+    // hide its outcome, without discarding the scheduled phase.
     updateMarketText();
     armWatch();
 }
@@ -1909,7 +1939,8 @@ void B3FlowMeshTradingPanel::cancelAndWait()
     // A wallet switch never waits for an outstanding live-update read: its
     // result is dropped by generation. Only closing the panel joins it.
     stopWatchWorker(m_closing);
-    m_watch.Disable(); m_watch_key.clear(); m_watch_watchdog = false; m_watch_release_pending = false; m_link_lost = false;
+    m_watch.Disable(); m_watch_key.clear(); m_watch_watchdog = false; m_watch_release_pending = false;
+    m_reconcile_pending = false; m_last_job_was_reconcile = false;
     m_polling_since.invalidate();
     m_gap_markers.clear();
     // Draining a running write does not prove it was cancelled. Preserve its

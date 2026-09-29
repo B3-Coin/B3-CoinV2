@@ -245,6 +245,8 @@ struct ConnectionProbe {
 struct FundingReadProbe {
     UniValue data{RemoteData()};
     UniValue saved_response;
+    // A status reply for getflowmeshactionstatus; none: the read fails.
+    UniValue receipt_response;
     bool fail{false}, hold{false}, effects_misc_error{false}, discovery_unproven{false}, checkpoint{false};
     std::string failed_method, held_method;
     std::vector<std::string> methods;
@@ -342,7 +344,11 @@ struct FundingReadProbe {
             if (effects_misc_error) { UniValue error{UniValue::VOBJ}; error.pushKV("code", -1); error.pushKV("message", "Synthetic reconciliation race"); throw error; }
             return UniValue{UniValue::VARR};
         });
-        add("getflowmeshactionstatus", [this]() -> UniValue { ++receipts; throw std::runtime_error{"Synthetic saved status unavailable"}; });
+        add("getflowmeshactionstatus", [this]() -> UniValue {
+            ++receipts;
+            if (receipt_response.isObject()) return receipt_response;
+            throw std::runtime_error{"Synthetic saved status unavailable"};
+        });
         for (const auto* method : {"flowmeshdeposit", "submitflowmeshdeposit", "submitflowmeshorder", "cancelflowmeshorder", "requestflowmeshwithdrawal", "sendrawtransaction", "createflowmeshaccount", "retryflowmeshaction"})
             add(method, [this]() -> UniValue { ++writes; throw std::runtime_error{"Unexpected mutation in draft test"}; });
     }
@@ -454,6 +460,32 @@ class B3FlowMeshWorkspaceTests : public QObject
     static void AwaitWatchWorker(B3FlowMeshTradingPanel& panel)
     {
         QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread, 5000);
+    }
+
+    //! Tracks an unresolved request of the observed account, as after a submission.
+    static void TrackUnknown(B3FlowMeshTradingPanel& panel, unsigned char id = 42)
+    {
+        B3FlowMeshTrading::Receipt receipt; receipt.action_id = QString::fromStdString(H(id).GetHex()); receipt.state = QStringLiteral("unknown");
+        receipt.market = panel.m_snapshot->market; receipt.account = panel.m_snapshot->account;
+        panel.m_receipt = receipt; panel.m_receipt_wallet = panel.m_wallet;
+        panel.m_pending_market = panel.m_snapshot->market; panel.m_pending_account = panel.m_snapshot->account;
+    }
+    //! A verified certified-inclusion status of that request.
+    static UniValue CertifiedStatus(const QString& market, unsigned char id = 42)
+    {
+        UniValue r{UniValue::VOBJ};
+        r.pushKV("market_id", market.toStdString()); r.pushKV("action_id", H(id).GetHex());
+        r.pushKV("accepted", true); r.pushKV("receipt_state", "certified_inclusion"); r.pushKV("reason", "Canonical action inclusion verified");
+        r.pushKV("endpoint", "https://operator.invalid:18443"); r.pushKV("certificate_verified", true); r.pushKV("outcome_verified", false);
+        r.pushKV("microblock_hash", H(97).GetHex()); r.pushKV("microblock_sequence", 5); r.pushKV("stage", "certified");
+        return r;
+    }
+    //! The probe's reads that reach the market endpoint, in order.
+    static std::vector<std::string> Remote(const FundingReadProbe& probe)
+    {
+        std::vector<std::string> remote;
+        for (const auto& method : probe.methods) if (method != "getflowmeshclientinfo" && method != "listflowmeshactions") remote.push_back(method);
+        return remote;
     }
 
     static void Observe(B3FlowMeshTradingPanel& panel, const Snapshot& snapshot, bool inverse = false)
@@ -4132,14 +4164,17 @@ private Q_SLOTS:
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         panel.m_receipt = B3FlowMeshTrading::Receipt{}; panel.m_receipt->action_id = QString::fromStdString(H(42).GetHex());
         panel.m_receipt_wallet = panel.m_wallet; panel.m_pending_market = panel.m_snapshot->market; panel.m_pending_account = panel.m_snapshot->account;
-        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Catalog;
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Status; panel.m_catalog_age.start();
         Live(panel, probe);
         panel.armWatch(); AwaitWatchWorker(panel);
         QCOMPARE(probe.watches.load(), 1);
         QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Backoff);
         QVERIFY(panel.m_watch.PollEveryTick());
         QVERIFY(panel.liveUpdateText().contains(QStringLiteral("reconnecting")));
-        QCOMPARE(panel.m_refresh_phase, B3FlowMeshTradingPanel::RefreshPhase::Receipt);
+        // The tracked request is read first, and the scheduled phase is kept.
+        QVERIFY(panel.m_reconcile_pending);
+        QCOMPARE(panel.nextPassivePhase(), B3FlowMeshTradingPanel::RefreshPhase::Receipt);
+        QCOMPARE(panel.m_refresh_phase, B3FlowMeshTradingPanel::RefreshPhase::Status);
         // The display itself is untouched by a failed live update.
         QVERIFY(!panel.m_read_failed);
         // No new watch before its backoff.
@@ -4169,7 +4204,7 @@ private Q_SLOTS:
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         panel.m_receipt = B3FlowMeshTrading::Receipt{}; panel.m_receipt->action_id = QString::fromStdString(H(42).GetHex());
         panel.m_receipt_wallet = panel.m_wallet; panel.m_pending_market = panel.m_snapshot->market; panel.m_pending_account = panel.m_snapshot->account;
-        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Catalog;
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Status; panel.m_catalog_age.start();
         Live(panel, probe);
         const auto before{panel.m_history_view->rowCount()};
         panel.m_watch.mode = B3FlowMeshWatch::Mode::Live;
@@ -4189,7 +4224,9 @@ private Q_SLOTS:
         QVERIFY(!panel.m_history_view->item(1, 0)->toolTip().isEmpty());
         QCOMPARE(panel.m_history_view->item(2, 0)->text(), QStringLiteral("#2"));
         QVERIFY(panel.m_history_view->item(2, 0)->toolTip().isEmpty());
-        QCOMPARE(panel.m_refresh_phase, B3FlowMeshTradingPanel::RefreshPhase::Receipt);
+        QVERIFY(panel.m_reconcile_pending);
+        QCOMPARE(panel.nextPassivePhase(), B3FlowMeshTradingPanel::RefreshPhase::Receipt);
+        QCOMPARE(panel.m_refresh_phase, B3FlowMeshTradingPanel::RefreshPhase::Status);
         QVERIFY(panel.liveUpdateText().contains(QStringLiteral("event gap")));
         panel.m_watch.Disable(); probe.hold_watch = false; probe.watch_release.release(); AwaitWatchWorker(panel);
         // Per market: another market's view never shows them, and a market
@@ -4198,6 +4235,65 @@ private Q_SLOTS:
         QVERIFY(panel.m_gap_markers.empty());
         QVERIFY(!panel.liveUpdateText().contains(QStringLiteral("event gap")));
         QCOMPARE(probe.writes.load(), 0);
+    }
+    void lostSnapshotReadReconcilesTrackedActionBeforeSnapshot()
+    {
+        using Phase = B3FlowMeshTradingPanel::RefreshPhase;
+        FundingReadProbe probe;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        TrackUnknown(panel); panel.m_catalog_age.start(); panel.m_refresh_phase = Phase::Status;
+        probe.fail = true; // The selected-market read itself fails.
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QVERIFY(panel.m_read_failed); QVERIFY(panel.m_reconcile_pending); QCOMPARE(panel.m_refresh_phase, Phase::Effects);
+        // The next passive job reads the tracked request before its market
+        // read, replacing (not advancing) the scheduled phase: same read count.
+        probe.fail = false; probe.receipt_response = CertifiedStatus(panel.m_snapshot->market); probe.methods.clear();
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(Remote(probe), (std::vector<std::string>{"getflowmeshactionstatus", "getflowmeshmarketdata"}));
+        QVERIFY(!panel.m_read_failed); QVERIFY(!panel.m_reconcile_pending);
+        QVERIFY(panel.m_receipt->Included()); QCOMPARE(panel.m_refresh_phase, Phase::Effects);
+        // The scheduled phase runs next, and no second override follows.
+        probe.methods.clear(); panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(Remote(probe).front(), std::string{"listflowmeshvaultoperations"});
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void auxiliaryFailureDoesNotTriggerReconcileFirst()
+    {
+        using Phase = B3FlowMeshTradingPanel::RefreshPhase;
+        FundingReadProbe probe; probe.failed_method = "getflowmeshbalance";
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        TrackUnknown(panel); panel.m_catalog_age.start(); panel.m_refresh_phase = Phase::Status;
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        // The market read itself succeeded: nothing was lost.
+        QVERIFY(panel.m_read_failed); QCOMPARE(probe.snapshots.load(), 1);
+        QVERIFY(!panel.m_reconcile_pending); QCOMPARE(panel.nextPassivePhase(), Phase::Effects);
+        QCOMPARE(probe.writes.load(), 0);
+    }
+    void reconcileFirstIsOneShotAndNeverStarvesCatalog()
+    {
+        using Phase = B3FlowMeshTradingPanel::RefreshPhase;
+        FundingReadProbe probe; probe.fail = true; // A persistent market-read failure; status reads fail too.
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        TrackUnknown(panel); panel.m_catalog_age.start(); panel.m_refresh_phase = Phase::Status;
+        std::vector<std::string> first;
+        const auto run = [&] {
+            probe.methods.clear(); panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            const auto remote{Remote(probe)}; first.push_back(remote.empty() ? std::string{} : remote.front());
+        };
+        run(); QVERIFY(panel.m_reconcile_pending);
+        // A Connect completes: the schedule resets and discovery is due. It
+        // runs at once, before any reconcile, however long the failure lasts.
+        panel.resetRefreshSchedule(); panel.m_catalog_age.invalidate();
+        for (int i{0}; i < 5; ++i) run();
+        QCOMPARE(first, (std::vector<std::string>{"getflowmeshbalance", "listflowmeshmarkets", "getflowmeshactionstatus",
+                                                  "getflowmeshbalance", "getflowmeshactionstatus", "listflowmeshvaultoperations"}));
+        QVERIFY(panel.m_reconcile_pending); QVERIFY(panel.m_read_failed);
+        // A status read that completes ends it, although the market read
+        // still fails, and its verified inclusion is kept.
+        probe.receipt_response = CertifiedStatus(panel.m_snapshot->market);
+        run(); QCOMPARE(first.back(), std::string{"getflowmeshactionstatus"});
+        QVERIFY(!panel.m_reconcile_pending); QVERIFY(panel.m_receipt->Included()); QVERIFY(panel.m_read_failed);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void connectionBannerShowsLiveReconnectingAndCheckingState()
     {

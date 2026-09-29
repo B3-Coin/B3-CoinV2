@@ -77,6 +77,9 @@ private:
         // A passive job while live updates supply the market read: only its
         // auxiliary phase runs, never the final selected-market read.
         bool live{false};
+        // This passive job's Receipt phase replaced its scheduled phase to
+        // reconcile the tracked request first; the schedule does not advance.
+        bool reconcile_first{false};
         std::optional<RefreshPhase> refresh_phase;
         uint64_t refresh_epoch{0};
         QElapsedTimer snapshot_age;
@@ -175,8 +178,13 @@ private:
     void finishJob(const std::shared_ptr<Result>& result);
     void applyJobResult(const std::shared_ptr<Result>& result);
     void applyMarketCatalog(const Result& result);
-    //! The passive phase the next refresh would run (None: market read only).
+    //! The passive phase the next refresh would run (None: market read only),
+    //! including a due reconcile-first override.
     RefreshPhase nextPassivePhase() const;
+    //! The phase of the bounded passive cycle, without any override.
+    RefreshPhase scheduledPassivePhase() const;
+    //! A pending reconcile may replace the next passive job's phase now.
+    bool reconcileDue() const;
     //! Live updates supply the selected market's read, so a passive refresh
     //! without an auxiliary phase is skipped.
     bool liveSkipsPoll() const;
@@ -247,8 +255,15 @@ private:
     // Wallet generation, market and watched endpoint the policy is keyed on.
     QString m_watch_key;
     bool m_watch_advertised{false}, m_watch_watchdog{false}, m_watch_release_pending{false};
-    // A live-update failure or gap: reconcile the tracked request first.
-    bool m_link_lost{false};
+    // Reconcile-first, one shot per loss: after a lost market read (its
+    // first failure), a failed live update, a watchdog trip or an event gap,
+    // the next passive job reads the tracked request's status before its
+    // market read. It replaces that job's phase without advancing the
+    // schedule, never runs in consecutive jobs, and waits for discovery after
+    // a reset, so it can delay the Catalog, Status or Effects phases by at
+    // most one job and never freeze them. Cleared once a status read of the
+    // tracked request completes.
+    bool m_reconcile_pending{false}, m_last_job_was_reconcile{false};
     // Display only, per market, cleared on a market or wallet switch.
     struct GapMarker {
         QString market;
