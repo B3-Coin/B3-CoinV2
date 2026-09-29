@@ -53,6 +53,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -256,6 +257,15 @@ struct FundingReadProbe {
     QSemaphore auxiliary_entered, auxiliary_release;
     QSemaphore entered, release;
     std::atomic_int snapshots{0}, catalogs{0}, balances{0}, effects{0}, receipts{0}, writes{0};
+    // Live-update reads (getflowmeshmarketdata with watch_ms): their reply
+    // data and watch object, how many arrived, an optional hold, and what
+    // getflowmeshclientinfo advertises for the data's endpoint.
+    UniValue watch_data{RemoteData()};
+    UniValue watch_object{UniValue::VOBJ};
+    std::atomic_int watches{0}, releases{0};
+    std::atomic_bool hold_watch{false}, fail_watch{false};
+    QSemaphore watch_entered, watch_release;
+    int live_ms{0};
     std::vector<std::unique_ptr<CRPCCommand>> commands;
     FundingReadProbe()
     {
@@ -283,7 +293,13 @@ struct FundingReadProbe {
             auto account{data["account"]}; account.pushKV("b3_available", FormatAmount(s.b3_available, 9).toStdString()); account.pushKV("b3_reserved", FormatAmount(s.b3_reserved, 9).toStdString()); row.pushKV("account", account);
             return row;
         };
-        add("getflowmeshclientinfo", [] { return ConnectionInfo(); });
+        add("getflowmeshclientinfo", [this] {
+            auto info{ConnectionInfo("https://operator.invalid:18443")};
+            UniValue rows{UniValue::VARR};
+            for (auto row : info["endpoints"].getValues()) { row.pushKV("live_updates_ms", live_ms); rows.push_back(row); }
+            info.pushKV("endpoints", rows);
+            return info;
+        });
         add("listflowmeshactions", [this] {
             if (saved_response.isObject()) return saved_response;
             UniValue saved{UniValue::VOBJ}; saved.pushKV("source", "local-retained-outbox"); saved.pushKV("actions", UniValue{UniValue::VARR}); return saved;
@@ -297,12 +313,30 @@ struct FundingReadProbe {
             UniValue rows{UniValue::VARR}; rows.push_back(row); return rows;
         });
         add("getflowmeshbalance", [this, market] { ++balances; return market(); });
-        add("getflowmeshmarketdata", [this] {
-            ++snapshots; entered.release();
-            if (hold && !release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic funding read exceeded its test bound"};
-            if (fail) throw std::runtime_error{"Synthetic funding refresh unavailable"};
-            return data;
-        });
+        {
+            auto command{std::make_unique<CRPCCommand>("hidden", "getflowmeshmarketdata",
+                [this](const JSONRPCRequest& request, UniValue& result, bool) {
+                    const auto& options{request.params[1]};
+                    if (options.isObject() && options.exists("watch_ms")) {
+                        if (options["watch_ms"].getInt<int>() == 0) { ++releases; result = data; result.pushKV("watch", watch_object); return true; }
+                        ++watches; watch_entered.release();
+                        if (hold_watch && !watch_release.tryAcquire(1, 3000)) throw std::runtime_error{"Synthetic watch exceeded its test bound"};
+                        if (fail_watch) throw std::runtime_error{"Synthetic live update unavailable"};
+                        result = watch_data; result.pushKV("watch", watch_object); return true;
+                    }
+                    methods.emplace_back("getflowmeshmarketdata");
+                    priorities.emplace_back("getflowmeshmarketdata", node::FlowMeshClientWorkScope::Current());
+                    if (node::FlowMeshClientWorkScope::LingersAfterRelease()) ++lingering_calls;
+                    if (held_method == "getflowmeshmarketdata") { auxiliary_entered.release(); if (!auxiliary_release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic auxiliary exceeded its test bound"}; }
+                    if (failed_method == "getflowmeshmarketdata") throw std::runtime_error{"Synthetic auxiliary failed"};
+                    ++snapshots; entered.release();
+                    if (hold && !release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic funding read exceeded its test bound"};
+                    if (fail) throw std::runtime_error{"Synthetic funding refresh unavailable"};
+                    result = data; return true;
+                },
+                std::vector<std::pair<std::string, bool>>{}, 998900 + commands.size())};
+            tableRPC.appendCommand(command->name, command.get()); commands.push_back(std::move(command));
+        }
         add("listflowmeshvaultoperations", [this] {
             ++effects;
             if (effects_misc_error) { UniValue error{UniValue::VOBJ}; error.pushKV("code", -1); error.pushKV("message", "Synthetic reconciliation race"); throw error; }
@@ -390,6 +424,36 @@ class B3FlowMeshWorkspaceTests : public QObject
         action.receipt.state = QStringLiteral("unknown"); action.receipt.no_resubmit = true;
         saved.actions = {action}; panel.restoreSavedActions(saved);
         return saved;
+    }
+
+    //! A newer certified head than Data(): the reply a live update brings.
+    static UniValue NewerRemoteData()
+    {
+        auto data{RemoteData()}; auto snapshot{data["snapshot"]};
+        snapshot.pushKV("next_microblock_sequence", 4); snapshot.pushKV("last_microblock_hash", H(10).GetHex()); data.pushKV("snapshot", snapshot);
+        auto account{data["account"]}; account.pushKV("next_sequence", 9); data.pushKV("account", account);
+        return data;
+    }
+    static UniValue WatchObject(const char* status, bool supported, bool waited, int live_ms = 2000, bool gap = false)
+    {
+        UniValue watch{UniValue::VOBJ}; watch.pushKV("status", status); watch.pushKV("supported", supported); watch.pushKV("waited", waited);
+        watch.pushKV("gap", gap); watch.pushKV("endpoint", "https://operator.invalid:18443"); watch.pushKV("endpoint_live_ms", live_ms);
+        return watch;
+    }
+    //! The remote panel as the timer leaves it once the client info is read.
+    static void Live(B3FlowMeshTradingPanel& panel, FundingReadProbe& probe)
+    {
+        panel.show(); QCoreApplication::processEvents();
+        auto info{ConnectionInfo("https://operator.invalid:18443")};
+        UniValue rows{UniValue::VARR};
+        for (auto row : info["endpoints"].getValues()) { row.pushKV("live_updates_ms", probe.live_ms); rows.push_back(row); }
+        info.pushKV("endpoints", rows);
+        panel.m_client_info = info;
+        panel.updateWatchState();
+    }
+    static void AwaitWatchWorker(B3FlowMeshTradingPanel& panel)
+    {
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread, 5000);
     }
 
     static void Observe(B3FlowMeshTradingPanel& panel, const Snapshot& snapshot, bool inverse = false)
@@ -3934,6 +3998,154 @@ private Q_SLOTS:
         result.basis_sequence = 4; result.markets[0].sequence = 12;
         panel.applyMarketCatalog(result);
         QCOMPARE(panel.market()->sequence, uint64_t{12});
+    }
+    void pollingModeIsTodaysBehaviourAgainstOldEndpoints()
+    {
+        FundingReadProbe probe; probe.live_ms = 0;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        Live(panel, probe);
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Polling);
+        for (int i{0}; i < 5; ++i) { panel.updateWatchState(); panel.armWatch(); QVERIFY(!panel.m_watch_thread); QVERIFY(!panel.liveSkipsPoll()); }
+        QCOMPARE(probe.watches.load(), 0);
+        QVERIFY(panel.liveUpdateText().contains(QStringLiteral("offers no live updates")));
+        // Today's passive job still ends with the market read.
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.watches.load(), 0); QCOMPARE(probe.writes.load(), 0);
+    }
+    void liveWatchAppliesAChangedHeadAndStaysLive()
+    {
+        FundingReadProbe probe; probe.live_ms = 2000;
+        probe.watch_data = NewerRemoteData(); probe.watch_object = WatchObject("ready", true, true);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        Live(panel, probe);
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Probing);
+        panel.m_response_age.invalidate();
+        probe.hold_watch = true;
+        panel.armWatch(); QVERIFY(panel.m_watch_thread);
+        QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+        // The next read will be quiet: the head it names is now current.
+        probe.watch_data = NewerRemoteData(); probe.watch_object = WatchObject("timeout", true, true);
+        probe.hold_watch = false; probe.watch_release.release();
+        QTRY_COMPARE_WITH_TIMEOUT(panel.m_snapshot->head, QString::fromStdString(H(10).GetHex()), 3000);
+        QCOMPARE(panel.m_snapshot->next_sequence, uint64_t{4});
+        QCOMPARE(panel.market()->sequence, uint64_t{9});
+        QVERIFY(panel.m_response_age.isValid() && panel.m_response_age.elapsed() < 3000);
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Live);
+        QVERIFY(panel.liveUpdateText().contains(QStringLiteral("live updates")));
+        QVERIFY(!panel.m_read_failed);
+        // Live: a passive refresh without an auxiliary phase is skipped.
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
+        QVERIFY(panel.liveSkipsPoll());
+        panel.m_watch.Disable(); AwaitWatchWorker(panel);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void liveModeSkipsMarketPollingButKeepsAuxiliaryCycleAndStatus()
+    {
+        FundingReadProbe probe; probe.live_ms = 2000; probe.checkpoint = true;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        Live(panel, probe);
+        panel.m_watch.mode = B3FlowMeshWatch::Mode::Live; panel.m_watch.last_ok_at = panel.m_watch_clock.elapsed();
+        // Catalog, Status, Effects and Receipt still run, without the market read.
+        panel.m_receipt = B3FlowMeshTrading::Receipt{}; panel.m_receipt->action_id = QString::fromStdString(H(42).GetHex());
+        panel.m_receipt_wallet = panel.m_wallet; panel.m_pending_market = panel.m_snapshot->market; panel.m_pending_account = panel.m_snapshot->account;
+        for (int phase{0}; phase < 4; ++phase) {
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        }
+        QCOMPARE(probe.catalogs.load(), 1); QCOMPARE(probe.balances.load(), 1); QCOMPARE(probe.effects.load(), 1); QCOMPARE(probe.receipts.load(), 1);
+        QCOMPARE(probe.snapshots.load(), 0);
+        // The Status phase still refreshes checkpoint eligibility while live.
+        QVERIFY(panel.market()->checkpoint_pending);
+        QCOMPARE(panel.market()->checkpoint, QString::fromStdString(H(80).GetHex()));
+        QCOMPARE(probe.writes.load(), 0);
+    }
+    void watchResultAgainstOtherHeadMarketOrWalletIsDroppedSilently()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        const auto head{panel.m_snapshot->head};
+        for (int condition{0}; condition < 5; ++condition) {
+            auto result{std::make_shared<B3FlowMeshTradingPanel::WatchResult>()};
+            result->scope = {panel.m_wallet, panel.m_generation, panel.m_watch_generation, panel.m_snapshot->market, panel.m_snapshot->account, head};
+            result->snapshot = Parse(NewerRemoteData()); result->status = QStringLiteral("ready"); result->supported = result->waited = true; result->endpoint_live_ms = 2000;
+            switch (condition) {
+            case 0: result->scope.known_head = QString::fromStdString(H(77).GetHex()); break;
+            case 1: result->scope.market = QString::fromStdString(H(78).GetHex()); break;
+            case 2: ++result->scope.generation; break;
+            case 3: ++result->scope.watch_generation; break;
+            case 4: panel.m_busy = true; break; // Never applied while an operation runs.
+            }
+            panel.m_watch.outstanding = true;
+            panel.finishWatch(result);
+            QCOMPARE(panel.m_snapshot->head, head);
+            QVERIFY(!panel.m_read_failed);
+            QVERIFY(!panel.m_watch.outstanding);
+            panel.m_busy = false;
+        }
+    }
+    void hiddenPanelArmsNoWatch()
+    {
+        FundingReadProbe probe; probe.live_ms = 2000; probe.watch_object = WatchObject("timeout", true, true);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_client_info = UniValue{UniValue::VOBJ}; // Parsed below by updateWatchState.
+        Live(panel, probe); panel.hide();
+        for (int i{0}; i < 3; ++i) { panel.armWatch(); QVERIFY(!panel.m_watch_thread); }
+        QCOMPARE(probe.watches.load(), 0);
+    }
+    void walletSwitchDoesNotBlockOnOutstandingWatch()
+    {
+        FundingReadProbe probe; probe.live_ms = 2000; probe.watch_object = WatchObject("timeout", true, true); probe.hold_watch = true;
+        auto panel{std::make_unique<B3FlowMeshTradingPanel>()}; AttachOfflineWallet(*panel); Observe(*panel, Parse(RemoteData()));
+        Live(*panel, probe);
+        panel->armWatch(); QVERIFY(panel->m_watch_thread);
+        QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+        // A wallet switch returns at once; the outstanding read is dropped later.
+        QElapsedTimer switching; switching.start();
+        panel->cancelAndWait();
+        QVERIFY(switching.elapsed() < 1000);
+        QVERIFY(panel->m_watch_thread);
+        probe.watch_release.release();
+        AwaitWatchWorker(*panel);
+        QVERIFY(!panel->m_wallet);
+        // Closing the panel joins an outstanding read (bounded by that read).
+        AttachOfflineWallet(*panel); Observe(*panel, Parse(RemoteData())); Live(*panel, probe);
+        panel->armWatch(); QVERIFY(panel->m_watch_thread);
+        QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+        std::thread release{[&] { std::this_thread::sleep_for(std::chrono::milliseconds{300}); probe.watch_release.release(); }};
+        QElapsedTimer closing; closing.start();
+        panel.reset();
+        QVERIFY(closing.elapsed() >= 250);
+        release.join();
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void watchFailureBacksOffAndReconcilesTheTrackedRequestFirst()
+    {
+        FundingReadProbe probe; probe.live_ms = 2000; probe.fail_watch = true; probe.watch_object = WatchObject("timeout", true, true);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_receipt = B3FlowMeshTrading::Receipt{}; panel.m_receipt->action_id = QString::fromStdString(H(42).GetHex());
+        panel.m_receipt_wallet = panel.m_wallet; panel.m_pending_market = panel.m_snapshot->market; panel.m_pending_account = panel.m_snapshot->account;
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Catalog;
+        Live(panel, probe);
+        panel.armWatch(); AwaitWatchWorker(panel);
+        QCOMPARE(probe.watches.load(), 1);
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Backoff);
+        QVERIFY(panel.m_watch.PollEveryTick());
+        QVERIFY(panel.liveUpdateText().contains(QStringLiteral("reconnecting")));
+        QCOMPARE(panel.m_refresh_phase, B3FlowMeshTradingPanel::RefreshPhase::Receipt);
+        // The display itself is untouched by a failed live update.
+        QVERIFY(!panel.m_read_failed);
+        // No new watch before its backoff.
+        panel.armWatch(); QVERIFY(!panel.m_watch_thread); QCOMPARE(probe.watches.load(), 1);
+    }
+    void busyEndpointPollsAndNamesItsCapacity()
+    {
+        FundingReadProbe probe; probe.live_ms = 2000; probe.watch_object = WatchObject("busy", true, false);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        Live(panel, probe);
+        panel.armWatch(); AwaitWatchWorker(panel);
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Polling);
+        QVERIFY(panel.liveUpdateText().contains(QStringLiteral("capacity full")));
+        QVERIFY(!panel.liveSkipsPoll());
+        // The busy reply was still fresh verified data.
+        QVERIFY(panel.m_response_age.isValid() && panel.m_response_age.elapsed() < 3000);
     }
     void exportOptInSyntheticVisualFixtures()
     {

@@ -52,6 +52,8 @@ struct Policy {
     static constexpr int64_t ARM_REFILL_MS{500};
 
     Mode mode{Mode::Off};
+    //! The last finished read's outcome (for display only).
+    Outcome last{Outcome::Quiet};
     bool outstanding{false};
     unsigned failures{0}, not_waited{0};
     int tokens{ARM_BURST};

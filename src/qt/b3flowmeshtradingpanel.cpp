@@ -25,6 +25,7 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QRandomGenerator>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSplitter>
@@ -245,7 +246,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
             m_snapshot.reset(); m_response_age.invalidate(); m_certificate_age.invalidate(); m_queue_age.invalidate();
             m_loading = selected.has_value(); updateDataViews();
         }
-        updateMarketText(); if (!m_busy) refresh();
+        updateMarketText(); updateWatchState(); if (!m_busy) refresh();
     });
     connect(m_order, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::requestOrderReview);
     connect(m_cancel_order, &QPushButton::clicked, this, [this] { begin(Operation::Cancel); });
@@ -260,12 +261,35 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     connect(m_price, &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateTicket); connect(m_quantity, &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateTicket);
     connect(m_buy, &QPushButton::clicked, this, [this] { m_side->setCurrentIndex(0); updateTicket(); }); connect(m_sell, &QPushButton::clicked, this, [this] { m_side->setCurrentIndex(1); updateTicket(); });
     m_timer = new QTimer{this}; m_timer->setInterval(500);
-    connect(m_timer, &QTimer::timeout, this, [this] { if (isVisible()) { updateMarketText(); refresh(); } });
-    connect(qApp, &QCoreApplication::aboutToQuit, this, &B3FlowMeshTradingPanel::cancelAndWait);
+    m_watch_clock.start();
+    connect(m_timer, &QTimer::timeout, this, [this, was_visible = false]() mutable {
+        const bool visible{isVisible()};
+        const bool became_hidden{was_visible && !visible};
+        was_visible = visible;
+        if (!visible) {
+            // Hidden: no polls or watches. A live-update connection is closed
+            // once instead of lingering until the endpoint's idle timeout.
+            if (became_hidden && (m_watch.mode == B3FlowMeshWatch::Mode::Live || m_watch.mode == B3FlowMeshWatch::Mode::Probing)) m_watch_release_pending = true;
+            if (m_watch_release_pending) armWatch(/*release=*/true);
+            return;
+        }
+        updateMarketText();
+        updateWatchState();
+        // While live updates arrive, the 500 ms tick keeps display ageing and
+        // the auxiliary cycle; the watch supplies the market read.
+        if (!liveSkipsPoll()) refresh();
+        armWatch();
+        if (m_watch_release_pending && m_watch.mode != B3FlowMeshWatch::Mode::Live && m_watch.mode != B3FlowMeshWatch::Mode::Probing) armWatch(/*release=*/true);
+    });
+    connect(qApp, &QCoreApplication::aboutToQuit, this, [this] { m_closing = true; cancelAndWait(); });
     updateControls();
 }
 
-B3FlowMeshTradingPanel::~B3FlowMeshTradingPanel() { cancelAndWait(); }
+B3FlowMeshTradingPanel::~B3FlowMeshTradingPanel()
+{
+    m_closing = true;
+    cancelAndWait();
+}
 
 void B3FlowMeshTradingPanel::setWalletModel(WalletModel* wallet)
 {
@@ -734,6 +758,10 @@ void B3FlowMeshTradingPanel::updateConnectionState()
             }
         }
     }
+    if (m_wallet && m_client_info) {
+        // How the selected market's data arrives; never a readiness claim.
+        if (const auto live{liveUpdateText()}; !live.isEmpty()) status += tr(" · %1").arg(live);
+    }
     if (!m_connection_error.isEmpty()) status += tr("\nConnection check: %1").arg(m_connection_error);
     if (!m_connect_error.isEmpty()) status += tr("\nConnect failed: %1").arg(m_connect_error);
     if (m_deferred_connect) status += tr("\nConnect queued after the current read: %1").arg(m_deferred_connect->url);
@@ -1046,16 +1074,15 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     auto* node{&m_wallet->node()}; const auto backend{m_backend}; const auto cancel{m_cancel}; const auto yield_refresh{m_yield_refresh};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
     const auto selected{market()}; const QString selected_id{selected ? selected->id : QString{}};
-    const bool catalog_due{!m_catalog_age.isValid() || m_catalog_age.elapsed() >= 5000 || (m_snapshot && m_snapshot->chain_reconciling)};
-    // Complete the bounded cycle before considering an overdue catalog again.
-    // Receipt gets its own slot so a slow cycle cannot starve saved requests.
-    const auto phase{m_route_pending || m_market_data.empty() || (foreground_read && !m_catalog_age.isValid()) ? RefreshPhase::Catalog :
-        foreground_read ? RefreshPhase::None :
-        m_refresh_phase != RefreshPhase::None ? m_refresh_phase : catalog_due ? RefreshPhase::Catalog :
-        tracked ? RefreshPhase::Receipt : RefreshPhase::None};
+    const auto phase{foreground_read ? (m_route_pending || m_market_data.empty() || !m_catalog_age.isValid() ? RefreshPhase::Catalog : RefreshPhase::None)
+                                     : nextPassivePhase()};
     if (result->passive || foreground_read) {
         result->refresh_phase = phase; result->refresh_epoch = m_refresh_epoch;
     }
+    // Live updates supply the selected market's read: a passive job then runs
+    // only its auxiliary phase. Foreground, review and action reads always read.
+    result->live = result->passive && m_watch.mode == B3FlowMeshWatch::Mode::Live && !m_read_failed && !m_watch_watchdog &&
+        selected && m_snapshot && m_snapshot->market == selected->id;
     const auto refresh_basis{m_snapshot};
     result->markets = m_market_data; result->effects = m_effect_data;
     if (m_snapshot && m_snapshot->market == selected_id) result->basis_sequence = m_snapshot->next_sequence;
@@ -1217,17 +1244,19 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                             result->effects = ReadEffectsForRefresh(snapshot_rpc, selected->id, basis);
                         }
                     });
-                    UniValue params{UniValue::VARR}; params.push_back(selected->id.toStdString()); UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
-                    if (!known_head.isEmpty() && selected->id == selected_id && !result->catalog) {
-                        options.pushKV("known_head", known_head.toStdString());
-                        result->basis_head = known_head;
+                    if (!result->live || selected->id != selected_id) {
+                        UniValue params{UniValue::VARR}; params.push_back(selected->id.toStdString()); UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
+                        if (!known_head.isEmpty() && selected->id == selected_id && !result->catalog) {
+                            options.pushKV("known_head", known_head.toStdString());
+                            result->basis_head = known_head;
+                        }
+                        params.push_back(options); result->snapshot = B3FlowMeshMarketData::Parse(snapshot_rpc("getflowmeshmarketdata", params));
+                        const auto& s{*result->snapshot};
+                        if (s.market != selected->id || s.base != selected->base || s.domain != selected->domain || s.config != selected->config) throw std::runtime_error{"Certified data does not match the selected market identity."};
+                        if (!s.unchanged && selected->has_account && selected->account != s.account) throw std::runtime_error{"Certified data belongs to another wallet account."};
+                        if (s.chain_reconciling) result->effects.clear();
+                        DeriveRowFromSnapshot(*selected, s);
                     }
-                    params.push_back(options); result->snapshot = B3FlowMeshMarketData::Parse(snapshot_rpc("getflowmeshmarketdata", params));
-                    const auto& s{*result->snapshot};
-                    if (s.market != selected->id || s.base != selected->base || s.domain != selected->domain || s.config != selected->config) throw std::runtime_error{"Certified data does not match the selected market identity."};
-                    if (!s.unchanged && selected->has_account && selected->account != s.account) throw std::runtime_error{"Certified data belongs to another wallet account."};
-                    if (s.chain_reconciling) result->effects.clear();
-                    DeriveRowFromSnapshot(*selected, s);
                 }
                 if (auxiliary_error) std::rethrow_exception(auxiliary_error); // Conservative failure; no new display freshness.
                 read_client_info(); // Include observations from this market read.
@@ -1490,6 +1519,208 @@ void B3FlowMeshTradingPanel::DeriveRowFromSnapshot(Market& row, const B3FlowMesh
     }
 }
 
+auto B3FlowMeshTradingPanel::nextPassivePhase() const -> RefreshPhase
+{
+    const bool tracked{m_receipt && receiptWalletSelected()};
+    const bool catalog_due{!m_catalog_age.isValid() || m_catalog_age.elapsed() >= 5000 || (m_snapshot && m_snapshot->chain_reconciling)};
+    // Complete the bounded cycle before considering an overdue catalog again.
+    // Receipt gets its own slot so a slow cycle cannot starve saved requests.
+    return m_route_pending || m_market_data.empty() ? RefreshPhase::Catalog :
+        m_refresh_phase != RefreshPhase::None ? m_refresh_phase : catalog_due ? RefreshPhase::Catalog :
+        tracked ? RefreshPhase::Receipt : RefreshPhase::None;
+}
+
+bool B3FlowMeshTradingPanel::liveSkipsPoll() const
+{
+    const auto selected{market()};
+    return m_watch.mode == B3FlowMeshWatch::Mode::Live && !m_read_failed && !m_watch_watchdog && selected && m_snapshot &&
+        m_snapshot->market == selected->id && !m_deferred_connect && !m_deferred_status && nextPassivePhase() == RefreshPhase::None;
+}
+
+void B3FlowMeshTradingPanel::updateWatchState()
+{
+    const auto now{m_watch_clock.elapsed()};
+    const auto text = [](const UniValue& value, const char* field) {
+        const auto& item{value.find_value(field)}; return item.isStr() ? QString::fromStdString(item.get_str()).left(2048) : QString{};
+    };
+    const auto selected{market()};
+    const bool local{m_client_info && (text(*m_client_info, "backend") == QStringLiteral("local") ||
+                                       (m_client_info->find_value("engine_enabled").isBool() && m_client_info->find_value("engine_enabled").get_bool()))};
+    // Keyed on the endpoint the displayed data came from, which is the one a
+    // remote watch is sent to, never merely the selected endpoint.
+    const QString endpoint{selected && m_snapshot && m_snapshot->market == selected->id ? m_snapshot->endpoint : QString{}};
+    uint32_t live{0};
+    if (!local && m_client_info && !endpoint.isEmpty()) {
+        const auto& rows{m_client_info->find_value("endpoints")};
+        if (rows.isArray()) for (const auto& row : rows.getValues()) {
+            const auto& advertised{row.find_value("live_updates_ms")};
+            if (text(row, "url") == endpoint && advertised.isNum()) live = static_cast<uint32_t>(std::clamp<int64_t>(advertised.getInt<int64_t>(), 0, 60'000));
+        }
+    }
+    const bool eligible{m_wallet && m_backend && selected && m_security_warning.isEmpty() && m_client_info.has_value()};
+    const QString key{eligible ? QStringLiteral("%1/%2/%3").arg(m_generation).arg(selected->id, local ? QStringLiteral("local") : endpoint) : QString{}};
+    const bool advertised{local || live > 0};
+    if (key != m_watch_key) {
+        m_watch_key = key; ++m_watch_generation; m_watch_watchdog = false;
+        if (key.isEmpty()) m_watch.Disable();
+        else m_watch.Enable(now, advertised);
+    } else if (!key.isEmpty() && advertised && !m_watch_advertised && m_watch.mode == B3FlowMeshWatch::Mode::Polling) {
+        // The endpoint (again) advertises live updates: try at once.
+        m_watch.Enable(now, true);
+    }
+    m_watch_advertised = advertised;
+    if (!m_watch_watchdog && m_watch.WatchdogTripped(now)) {
+        // No verified live update for 15 s: poll as before and reconcile.
+        m_watch_watchdog = true;
+        m_watch.Watchdog(now);
+        m_link_lost = true;
+    }
+}
+
+void B3FlowMeshTradingPanel::armWatch(const bool release)
+{
+    if (!m_wallet || !m_backend || m_watch_thread || m_cancel->load() || m_closing) return;
+    const auto selected{market()};
+    if (!selected || !m_snapshot || m_snapshot->market != selected->id) {
+        if (release) m_watch_release_pending = false;
+        return;
+    }
+    if (!release) {
+        if (m_busy || !isVisible() || !m_security_warning.isEmpty() || m_read_failed || !m_watch.MayArm(m_watch_clock.elapsed())) return;
+        m_watch.Armed(m_watch_clock.elapsed());
+    }
+    auto result{std::make_shared<WatchResult>()};
+    result->scope = {m_wallet, m_generation, m_watch_generation, selected->id, selected->account, m_snapshot->head};
+    result->release = release;
+    auto* node{&m_wallet->node()};
+    const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())};
+    const auto cancel{m_cancel};
+    // Captures values only: no panel, wallet object or backend. The RPC holds
+    // the wallet for at most the watch plus 5 s.
+    m_watch_thread = QThread::create([node, uri, cancel, result] {
+        const node::FlowMeshClientWorkScope priority{node::FlowMeshClientWorkPriority::PASSIVE, node::FlowMeshClientWorkLinger::NONE};
+        if (cancel->load() || node->shutdownRequested()) { result->error = QStringLiteral("Live update cancelled."); return; }
+        try {
+            UniValue params{UniValue::VARR}; params.push_back(result->scope.market.toStdString());
+            UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
+            options.pushKV("known_head", result->scope.known_head.toStdString());
+            options.pushKV("watch_ms", result->release ? int64_t{0} : B3FlowMeshWatch::Policy::WATCH_MS);
+            params.push_back(options);
+            const auto response{node->executeRpc("getflowmeshmarketdata", params, uri)};
+            result->snapshot_age.restart();
+            result->snapshot = B3FlowMeshMarketData::Parse(response);
+            const auto& watch{response.find_value("watch")};
+            if (!watch.isObject()) throw std::runtime_error{"Live update reply has no watch status."};
+            const auto& status{watch.find_value("status")}; const auto& endpoint{watch.find_value("endpoint")};
+            const auto& supported{watch.find_value("supported")}; const auto& waited{watch.find_value("waited")};
+            const auto& gap{watch.find_value("gap")}; const auto& live{watch.find_value("endpoint_live_ms")};
+            if (!status.isStr() || !endpoint.isStr() || !supported.isBool() || !waited.isBool() || !gap.isBool() || !live.isNum()) {
+                throw std::runtime_error{"Live update reply has a malformed watch status."};
+            }
+            result->status = QString::fromStdString(status.get_str()).left(32);
+            result->endpoint = QString::fromStdString(endpoint.get_str()).left(2048);
+            result->supported = supported.get_bool(); result->waited = waited.get_bool(); result->gap = gap.get_bool();
+            result->endpoint_live_ms = static_cast<uint32_t>(std::clamp<int64_t>(live.getInt<int64_t>(), 0, 60'000));
+        } catch (const UniValue& error) { result->error = RpcError(error); result->snapshot.reset(); }
+        catch (const std::exception& error) { result->error = QString::fromUtf8(error.what()).left(500); result->snapshot.reset(); }
+        catch (...) { result->error = QStringLiteral("Live update failed."); result->snapshot.reset(); }
+    });
+    m_watch_thread->setParent(this);
+    connect(m_watch_thread, &QThread::finished, this, [this, result] { finishWatch(result); });
+    m_watch_thread->start();
+}
+
+void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& result)
+{
+    if (m_watch_thread) {
+        m_watch_thread->wait(); // Already finished: this is its finished signal.
+        m_watch_thread->deleteLater();
+        m_watch_thread = nullptr;
+    }
+    if (result->release) {
+        m_watch_release_pending = false;
+        return;
+    }
+    using Outcome = B3FlowMeshWatch::Outcome;
+    const auto now{m_watch_clock.elapsed()};
+    const auto& scope{result->scope};
+    const auto selected{market()};
+    // Applied only on top of exactly the display it was armed against, for
+    // the same wallet, market and account, and never while an operation is
+    // in progress. Anything else is dropped silently: never a failure, and
+    // never renewed freshness.
+    if (!m_wallet || scope.wallet != m_wallet || scope.generation != m_generation || scope.watch_generation != m_watch_generation ||
+        m_cancel->load() || m_busy || !selected || selected->id != scope.market || selected->account != scope.account ||
+        !m_snapshot || m_snapshot->market != scope.market || m_snapshot->head != scope.known_head) {
+        m_watch.Dropped();
+        return;
+    }
+    const double jitter{QRandomGenerator::global()->generateDouble() * 0.4 - 0.2};
+    const auto before{m_watch.mode};
+    const bool wrong_identity{result->snapshot && (result->snapshot->market != selected->id || result->snapshot->base != selected->base ||
+        result->snapshot->domain != selected->domain || result->snapshot->config != selected->config ||
+        (!result->snapshot->unchanged && selected->has_account && selected->account != result->snapshot->account))};
+    if (!result->snapshot || wrong_identity) {
+        // Reads poll again (with failover) while the watch backs off.
+        m_watch.Finished(now, Outcome::Failed, jitter);
+        m_link_lost = true;
+    } else {
+        const auto& s{*result->snapshot};
+        const bool head_moved{!s.unchanged && s.head != scope.known_head};
+        const auto outcome{B3FlowMeshWatch::Classify(false, result->status.toStdString(), result->supported, result->waited,
+                                                     head_moved, result->endpoint_live_ms)};
+        if (applySelectedSnapshot(s, result->snapshot_age, scope.known_head) == SnapshotApply::APPLIED) {
+            const auto index{m_market->currentIndex()};
+            if (index >= 0 && static_cast<size_t>(index) < m_market_data.size()) DeriveRowFromSnapshot(m_market_data[index], s);
+            m_read_failed = false; m_read_failures = 0; m_read_error.clear(); m_loading = false;
+        }
+        m_watch.Finished(now, outcome, jitter);
+        if (outcome == Outcome::Changed || outcome == Outcome::Quiet) m_watch_watchdog = false;
+        // Left live updates without the client closing their connection.
+        if (before == B3FlowMeshWatch::Mode::Live && m_watch.mode == B3FlowMeshWatch::Mode::Polling && outcome == Outcome::NotWaited) {
+            m_watch_release_pending = true;
+        }
+        if (result->gap) m_link_lost = true;
+    }
+    if (m_link_lost) {
+        // Reconcile first: the tracked request's status is read before
+        // anything else, so a missed event cannot hide its outcome.
+        if (m_receipt && receiptWalletSelected()) m_refresh_phase = RefreshPhase::Receipt;
+        m_link_lost = false;
+    }
+    updateMarketText();
+    armWatch();
+}
+
+void B3FlowMeshTradingPanel::stopWatchWorker(const bool join)
+{
+    ++m_watch_generation;
+    m_watch.Dropped();
+    if (!m_watch_thread || !join) return;
+    disconnect(m_watch_thread, nullptr, this, nullptr);
+    m_watch_thread->wait();
+    delete m_watch_thread;
+    m_watch_thread = nullptr;
+}
+
+QString B3FlowMeshTradingPanel::liveUpdateText() const
+{
+    using Mode = B3FlowMeshWatch::Mode;
+    const auto seconds{(m_watch.RetryInMs(m_watch_clock.elapsed()) + 999) / 1000};
+    if (m_watch_watchdog) return tr("No live update for 15 s · reconnecting");
+    switch (m_watch.mode) {
+    case Mode::Off: return {};
+    case Mode::Live: return tr("live updates");
+    case Mode::Probing: return tr("starting live updates");
+    case Mode::Backoff: return tr("live updates reconnecting in %1 s").arg(seconds);
+    case Mode::Polling:
+        if (!m_watch_advertised) return tr("polling every 0.5 s (endpoint offers no live updates)");
+        if (m_watch.last == B3FlowMeshWatch::Outcome::Busy) return tr("polling (live-update capacity full, retry in %1 s)").arg(seconds);
+        return tr("polling (live updates unavailable, retry in %1 s)").arg(seconds);
+    }
+    return {};
+}
+
 void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
 {
     const auto previous_market{market()};
@@ -1553,6 +1784,10 @@ void B3FlowMeshTradingPanel::cancelAndWait()
     if (m_confirmation) m_confirmation->reject();
     if (m_funding_dialog) m_funding_dialog->reject();
     stopWorker();
+    // A wallet switch never waits for an outstanding live-update read: its
+    // result is dropped by generation. Only closing the panel joins it.
+    stopWatchWorker(m_closing);
+    m_watch.Disable(); m_watch_key.clear(); m_watch_watchdog = false; m_watch_release_pending = false; m_link_lost = false;
     // Draining a running write does not prove it was cancelled. Preserve its
     // public identity even if a wallet switch disconnects the completion slot.
     if (m_active_result && m_active_result->write_attempted) {

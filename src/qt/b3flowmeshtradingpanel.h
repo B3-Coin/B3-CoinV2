@@ -6,6 +6,7 @@
 #include <qt/b3flowmeshtrading.h>
 #include <qt/b3flowmeshmarketdata.h>
 #include <qt/b3flowmeshorderbook.h>
+#include <qt/b3flowmeshwatch.h>
 #include <qt/walletmodel.h>
 #include <QElapsedTimer>
 #include <QPointer>
@@ -71,6 +72,9 @@ private:
         // signed action was sent, waiting briefly for certified inclusion.
         bool receipt_wait{false};
         bool passive{false}, foreground_read{false}, refresh_yielded{false};
+        // A passive job while live updates supply the market read: only its
+        // auxiliary phase runs, never the final selected-market read.
+        bool live{false};
         std::optional<RefreshPhase> refresh_phase;
         uint64_t refresh_epoch{0};
         QElapsedTimer snapshot_age;
@@ -82,6 +86,22 @@ private:
     };
     //! How a verified selected-market read was applied.
     enum class SnapshotApply { APPLIED, SUPERSEDED, MISMATCH };
+    //! What one live-update read was armed against. Attribution only: the
+    //! watch worker owns no wallet, backend or panel state.
+    struct WatchScope {
+        QPointer<WalletModel> wallet;
+        uint64_t generation{0}, watch_generation{0};
+        QString market, account, known_head;
+    };
+    struct WatchResult {
+        WatchResult() { snapshot_age.start(); }
+        WatchScope scope;
+        std::optional<B3FlowMeshMarketData::Snapshot> snapshot;
+        QString error, status, endpoint;
+        bool supported{false}, waited{false}, gap{false}, release{false};
+        uint32_t endpoint_live_ms{0};
+        QElapsedTimer snapshot_age;
+    };
     struct DeferredReview {
         B3FlowMeshTrading::Operation operation;
         bool funding;
@@ -153,6 +173,24 @@ private:
     void finishJob(const std::shared_ptr<Result>& result);
     void applyJobResult(const std::shared_ptr<Result>& result);
     void applyMarketCatalog(const Result& result);
+    //! The passive phase the next refresh would run (None: market read only).
+    RefreshPhase nextPassivePhase() const;
+    //! Live updates supply the selected market's read, so a passive refresh
+    //! without an auxiliary phase is skipped.
+    bool liveSkipsPoll() const;
+    //! Re-keys the live-update policy on wallet, market and the endpoint the
+    //! displayed data came from; runs the watchdog.
+    void updateWatchState();
+    //! Starts one bounded live-update read on the watch worker when allowed.
+    //! `release` sends watch_ms 0: an ordinary read that closes the remote
+    //! client's live-update connection.
+    void armWatch(bool release = false);
+    void finishWatch(const std::shared_ptr<WatchResult>& result);
+    //! Drops any outstanding live-update result; joins its worker only when
+    //! the panel closes (a wallet or market switch never blocks on it).
+    void stopWatchWorker(bool join);
+    //! The label suffix for the current live-update mode.
+    QString liveUpdateText() const;
     //! Applies one verified read of the selected market, never moving the
     //! display backwards: a reply against a head the display has left, or an
     //! older full snapshot, is superseded (dropped, not a failure).
@@ -190,6 +228,20 @@ private:
     QPointer<QDialog> m_funding_dialog;
     QThread* m_thread{nullptr};
     QTimer* m_timer{nullptr};
+    // Live updates: a second worker keeps at most one bounded watch read
+    // outstanding for the selected market (see B3FlowMeshWatch::Policy).
+    QThread* m_watch_thread{nullptr};
+    B3FlowMeshWatch::Policy m_watch;
+    QElapsedTimer m_watch_clock;
+    // Bumped whenever an outstanding watch result must be dropped.
+    uint64_t m_watch_generation{0};
+    // Wallet generation, market and watched endpoint the policy is keyed on.
+    QString m_watch_key;
+    bool m_watch_advertised{false}, m_watch_watchdog{false}, m_watch_release_pending{false};
+    // A live-update failure or gap: reconcile the tracked request first.
+    bool m_link_lost{false};
+    // Set while the panel closes: only then is the watch worker joined.
+    bool m_closing{false};
     bool m_busy{false}, m_restore_locked{false}, m_uncertain{false};
     bool m_uncertain_refreshed{false};
     bool m_route_pending{false}, m_requested_withdrawal{false};

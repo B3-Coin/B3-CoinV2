@@ -72,6 +72,7 @@ void Policy::Finished(const int64_t now, const Outcome outcome, const double jit
 {
     outstanding = false;
     if (mode == Mode::Off) return;
+    last = outcome;
     switch (outcome) {
     case Outcome::Changed:
     case Outcome::Quiet:
