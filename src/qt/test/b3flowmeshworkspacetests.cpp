@@ -4023,10 +4023,11 @@ private Q_SLOTS:
         probe.hold_watch = true;
         panel.armWatch(); QVERIFY(panel.m_watch_thread);
         QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
-        // The next read will be quiet: the head it names is now current.
-        probe.watch_data = NewerRemoteData(); probe.watch_object = WatchObject("timeout", true, true);
-        probe.hold_watch = false; probe.watch_release.release();
+        probe.watch_release.release(); // Only this read returns; the next one is held.
         QTRY_COMPARE_WITH_TIMEOUT(panel.m_snapshot->head, QString::fromStdString(H(10).GetHex()), 3000);
+        QCOMPARE(panel.m_watch.last, B3FlowMeshWatch::Outcome::Changed);
+        // Live: the next watch was armed at once against the new head.
+        QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
         QCOMPARE(panel.m_snapshot->next_sequence, uint64_t{4});
         QCOMPARE(panel.market()->sequence, uint64_t{9});
         QVERIFY(panel.m_response_age.isValid() && panel.m_response_age.elapsed() < 3000);
@@ -4036,7 +4037,7 @@ private Q_SLOTS:
         // Live: a passive refresh without an auxiliary phase is skipped.
         panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
         QVERIFY(panel.liveSkipsPoll());
-        panel.m_watch.Disable(); AwaitWatchWorker(panel);
+        panel.m_watch.Disable(); probe.hold_watch = false; probe.watch_release.release(); AwaitWatchWorker(panel);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void liveModeSkipsMarketPollingButKeepsAuxiliaryCycleAndStatus()
@@ -4146,6 +4147,48 @@ private Q_SLOTS:
         QVERIFY(!panel.liveSkipsPoll());
         // The busy reply was still fresh verified data.
         QVERIFY(panel.m_response_age.isValid() && panel.m_response_age.elapsed() < 3000);
+    }
+    void gapMarkerAddsHistorySeparatorLogLineAndReconcileFirst()
+    {
+        FundingReadProbe probe; probe.live_ms = 2000;
+        // A newer head whose history has a trade after the gap.
+        auto newer{NewerRemoteData()};
+        auto history{newer["history"]}; auto entries{history["entries"]};
+        UniValue trade{entries[0]}; trade.pushKV("sequence", 3); trade.pushKV("microblock_hash", H(10).GetHex()); entries.push_back(trade);
+        history.pushKV("entries", entries); newer.pushKV("history", history);
+        probe.watch_data = newer; probe.watch_object = WatchObject("gap", true, true, 2000, /*gap=*/true);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_receipt = B3FlowMeshTrading::Receipt{}; panel.m_receipt->action_id = QString::fromStdString(H(42).GetHex());
+        panel.m_receipt_wallet = panel.m_wallet; panel.m_pending_market = panel.m_snapshot->market; panel.m_pending_account = panel.m_snapshot->account;
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Catalog;
+        Live(panel, probe);
+        const auto before{panel.m_history_view->rowCount()};
+        panel.m_watch.mode = B3FlowMeshWatch::Mode::Live;
+        probe.hold_watch = true;
+        panel.armWatch(); QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+        probe.watch_release.release(); // Only the first read returns; the next one is held.
+        QTRY_COMPARE_WITH_TIMEOUT(panel.m_gap_markers.size(), size_t{1}, 3000);
+        QCOMPARE(panel.m_gap_markers.front().from_sequence, uint64_t{2});
+        QCOMPARE(panel.m_gap_markers.front().to_sequence, uint64_t{3});
+        // A log line, a separator between the trades before and after, and
+        // the tracked request is reconciled before anything else.
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("missed events between microblock #2 and #3")));
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("No request was resent")));
+        QCOMPARE(panel.m_history_view->rowCount(), before + 2);
+        QCOMPARE(panel.m_history_view->item(0, 0)->text(), QStringLiteral("#3"));
+        QVERIFY(panel.m_history_view->item(1, 0)->text().contains(QStringLiteral("events missed between #2 and #3")));
+        QVERIFY(!panel.m_history_view->item(1, 0)->toolTip().isEmpty());
+        QCOMPARE(panel.m_history_view->item(2, 0)->text(), QStringLiteral("#2"));
+        QVERIFY(panel.m_history_view->item(2, 0)->toolTip().isEmpty());
+        QCOMPARE(panel.m_refresh_phase, B3FlowMeshTradingPanel::RefreshPhase::Receipt);
+        QVERIFY(panel.liveUpdateText().contains(QStringLiteral("event gap")));
+        panel.m_watch.Disable(); probe.hold_watch = false; probe.watch_release.release(); AwaitWatchWorker(panel);
+        // Per market: another market's view never shows them, and a market
+        // switch clears them.
+        panel.m_market->currentIndexChanged(0);
+        QVERIFY(panel.m_gap_markers.empty());
+        QVERIFY(!panel.liveUpdateText().contains(QStringLiteral("event gap")));
+        QCOMPARE(probe.writes.load(), 0);
     }
     void exportOptInSyntheticVisualFixtures()
     {

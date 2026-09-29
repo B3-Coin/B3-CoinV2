@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <exception>
 #include <limits>
+#include <set>
 #include <stdexcept>
 
 using B3FlowMeshTrading::Action;
@@ -240,6 +241,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         // A failed read/backoff belongs to its selected market. Another listed
         // market may already have a certified head and can be read immediately.
         m_read_error.clear(); m_read_failed = false; m_read_failures = 0; m_attempt_age.invalidate();
+        m_gap_markers.clear();
         const auto selected{market()};
         if (!selected || !m_snapshot || selected->id != m_snapshot->market) {
             m_amount->clear(); m_withdrawal_draft_amount.clear(); m_destination->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
@@ -443,12 +445,29 @@ void B3FlowMeshTradingPanel::updateDataViews()
     m_history_view->horizontalHeaderItem(5)->setToolTip(tr("Whole-auction B3 fee, not your individual allocation. Endpoint-reported history remains unverified when indicated below."));
     m_own_view->setHorizontalHeaderLabels({tr("Side"), tr("Price"), tr("Remaining (%1)").arg(u.ticker), tr("Reserved")});
     QString last_price{tr("Last price  —")};
+    std::vector<uint64_t> history_sequences;
     for (auto it{s.history.rbegin()}; it != s.history.rend(); ++it) {
         if (!it->cleared || it->quantity == 0) continue;
         if (history.empty()) last_price = FormatDisplayPrice(it->price, u.decimals, inverse) + QLatin1Char(' ') + price_units;
         history.push_back({QStringLiteral("#%1").arg(it->sequence), FormatDisplayPrice(it->price, u.decimals, inverse), FormatDepthQuantity(it->price, it->quantity, u.decimals, inverse),
             it->own_fills_known ? FormatDepthQuantity(it->price, inverse ? it->own_sell : it->own_buy, u.decimals, inverse) : QStringLiteral("—"),
             it->own_fills_known ? FormatDepthQuantity(it->price, inverse ? it->own_buy : it->own_sell, u.decimals, inverse) : QStringLiteral("—"), FormatAmount(it->fee, 9)});
+        history_sequences.push_back(it->sequence);
+    }
+    // A live update that missed events: a separator where they would be,
+    // between the trades before and after it (newest first). Display only.
+    std::set<int> separators;
+    for (const auto& marker : m_gap_markers) {
+        if (marker.market != s.market) continue;
+        const auto at{std::find_if(history_sequences.begin(), history_sequences.end(), [&](uint64_t sequence) { return sequence <= marker.from_sequence; }) - history_sequences.begin()};
+        const QString text{marker.to_sequence > marker.from_sequence ? tr("— events missed between #%1 and #%2 —").arg(marker.from_sequence).arg(marker.to_sequence)
+                                                                     : tr("— events missed at #%1 —").arg(marker.to_sequence)};
+        history.insert(history.begin() + at, QStringList{text, QString{}, QString{}, QString{}, QString{}, QString{}});
+        history_sequences.insert(history_sequences.begin() + at, marker.to_sequence);
+        std::set<int> shifted;
+        for (const int row : separators) shifted.insert(row >= at ? row + 1 : row);
+        separators = std::move(shifted);
+        separators.insert(static_cast<int>(at));
     }
     for (const auto& c : s.own_curves) {
         QString description;
@@ -460,6 +479,15 @@ void B3FlowMeshTradingPanel::updateDataViews()
             FormatAmount(c.reserved, c.side == QStringLiteral("bid") ? 9 : u.decimals) + (c.side == QStringLiteral("bid") ? QStringLiteral(" B3") : QLatin1Char(' ') + u.ticker)});
     }
     SetRows(m_depth_view, depth); SetRows(m_history_view, history); SetRows(m_own_view, own);
+    for (int row{0}; row < m_history_view->rowCount(); ++row) {
+        auto* item{m_history_view->item(row, 0)};
+        if (!item) continue;
+        const bool separator{separators.contains(row)};
+        const QString tip{separator ? tr("Live updates missed events here. Balances and orders were re-verified from a certified snapshot; missing trades may not be listed.") : QString{}};
+        if (item->toolTip() != tip) item->setToolTip(tip);
+        const QBrush brush{separator ? palette().brush(QPalette::PlaceholderText) : QBrush{}};
+        if (item->foreground() != brush) item->setForeground(brush);
+    }
     for (int i{0}; i < m_depth_view->rowCount(); ++i) {
         const QString tooltip{inverse ? tr("Exact inverse price: %1").arg(ExactInversePrice(s.depth[s.depth.size() - 1 - i].price, u.decimals)) : QString{}};
         m_depth_view->item(i, 0)->setToolTip(tooltip);
@@ -1666,6 +1694,7 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
         m_link_lost = true;
     } else {
         const auto& s{*result->snapshot};
+        const uint64_t displayed{m_snapshot->next_sequence ? m_snapshot->next_sequence - 1 : 0};
         const bool head_moved{!s.unchanged && s.head != scope.known_head};
         const auto outcome{B3FlowMeshWatch::Classify(false, result->status.toStdString(), result->supported, result->waited,
                                                      head_moved, result->endpoint_live_ms)};
@@ -1680,7 +1709,11 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
         if (before == B3FlowMeshWatch::Mode::Live && m_watch.mode == B3FlowMeshWatch::Mode::Polling && outcome == Outcome::NotWaited) {
             m_watch_release_pending = true;
         }
-        if (result->gap) m_link_lost = true;
+        if (result->gap) {
+            m_link_lost = true;
+            addGapMarker(scope.market, displayed, !s.unchanged && s.next_sequence ? s.next_sequence - 1 : displayed);
+            updateDataViews();
+        }
     }
     if (m_link_lost) {
         // Reconcile first: the tracked request's status is read before
@@ -1707,18 +1740,36 @@ QString B3FlowMeshTradingPanel::liveUpdateText() const
 {
     using Mode = B3FlowMeshWatch::Mode;
     const auto seconds{(m_watch.RetryInMs(m_watch_clock.elapsed()) + 999) / 1000};
-    if (m_watch_watchdog) return tr("No live update for 15 s · reconnecting");
-    switch (m_watch.mode) {
-    case Mode::Off: return {};
-    case Mode::Live: return tr("live updates");
-    case Mode::Probing: return tr("starting live updates");
-    case Mode::Backoff: return tr("live updates reconnecting in %1 s").arg(seconds);
+    QString text;
+    if (m_watch_watchdog) text = tr("No live update for 15 s · reconnecting");
+    else switch (m_watch.mode) {
+    case Mode::Off: break;
+    case Mode::Live: text = tr("live updates"); break;
+    case Mode::Probing: text = tr("starting live updates"); break;
+    case Mode::Backoff: text = tr("live updates reconnecting in %1 s").arg(seconds); break;
     case Mode::Polling:
-        if (!m_watch_advertised) return tr("polling every 0.5 s (endpoint offers no live updates)");
-        if (m_watch.last == B3FlowMeshWatch::Outcome::Busy) return tr("polling (live-update capacity full, retry in %1 s)").arg(seconds);
-        return tr("polling (live updates unavailable, retry in %1 s)").arg(seconds);
+        if (!m_watch_advertised) text = tr("polling every 0.5 s (endpoint offers no live updates)");
+        else if (m_watch.last == B3FlowMeshWatch::Outcome::Busy) text = tr("polling (live-update capacity full, retry in %1 s)").arg(seconds);
+        else text = tr("polling (live updates unavailable, retry in %1 s)").arg(seconds);
+        break;
     }
-    return {};
+    const auto selected{market()};
+    const bool recent_gap{selected && std::any_of(m_gap_markers.begin(), m_gap_markers.end(), [&](const auto& marker) {
+        return marker.market == selected->id && marker.age.isValid() && marker.age.elapsed() < GAP_SUFFIX_MS;
+    })};
+    if (recent_gap) text += text.isEmpty() ? tr("event gap") : tr(" · event gap");
+    return text;
+}
+
+void B3FlowMeshTradingPanel::addGapMarker(const QString& market, const uint64_t from_sequence, const uint64_t to_sequence)
+{
+    GapMarker marker{market, from_sequence, std::max(from_sequence, to_sequence), {}};
+    marker.age.start();
+    m_gap_markers.push_back(std::move(marker));
+    while (m_gap_markers.size() > MAX_GAP_MARKERS) m_gap_markers.pop_front();
+    notice(to_sequence > from_sequence
+        ? tr("Live updates missed events between microblock #%1 and #%2; balances and orders were re-verified from a certified snapshot; your pending requests are being re-checked. No request was resent.").arg(from_sequence).arg(to_sequence)
+        : tr("Live updates missed events at microblock #%1; balances and orders were re-verified from a certified snapshot; your pending requests are being re-checked. No request was resent.").arg(to_sequence));
 }
 
 void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
@@ -1788,6 +1839,7 @@ void B3FlowMeshTradingPanel::cancelAndWait()
     // result is dropped by generation. Only closing the panel joins it.
     stopWatchWorker(m_closing);
     m_watch.Disable(); m_watch_key.clear(); m_watch_watchdog = false; m_watch_release_pending = false; m_link_lost = false;
+    m_gap_markers.clear();
     // Draining a running write does not prove it was cancelled. Preserve its
     // public identity even if a wallet switch disconnects the completion slot.
     if (m_active_result && m_active_result->write_attempted) {

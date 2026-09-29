@@ -12,6 +12,7 @@
 #include <QPointer>
 #include <QWidget>
 #include <atomic>
+#include <deque>
 #include <memory>
 #include <optional>
 
@@ -191,6 +192,8 @@ private:
     void stopWatchWorker(bool join);
     //! The label suffix for the current live-update mode.
     QString liveUpdateText() const;
+    //! A live update reported that events were missed between two heads.
+    void addGapMarker(const QString& market, uint64_t from_sequence, uint64_t to_sequence);
     //! Applies one verified read of the selected market, never moving the
     //! display backwards: a reply against a head the display has left, or an
     //! older full snapshot, is superseded (dropped, not a failure).
@@ -240,6 +243,15 @@ private:
     bool m_watch_advertised{false}, m_watch_watchdog{false}, m_watch_release_pending{false};
     // A live-update failure or gap: reconcile the tracked request first.
     bool m_link_lost{false};
+    // Display only, per market, cleared on a market or wallet switch.
+    struct GapMarker {
+        QString market;
+        uint64_t from_sequence{0}, to_sequence{0};
+        QElapsedTimer age;
+    };
+    static constexpr size_t MAX_GAP_MARKERS{16};
+    static constexpr int64_t GAP_SUFFIX_MS{30'000};
+    std::deque<GapMarker> m_gap_markers;
     // Set while the panel closes: only then is the watch worker joined.
     bool m_closing{false};
     bool m_busy{false}, m_restore_locked{false}, m_uncertain{false};
