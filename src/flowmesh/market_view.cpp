@@ -7,6 +7,9 @@
 #include <flowmesh/state.h>
 #include <util/int128.h>
 
+#include <algorithm>
+#include <limits>
+
 namespace flowmesh {
 
 ImbalanceSide ObserveImbalanceSide(const ClearingEngine::ClearingResult& clearing, const FlowMeshState& post)
@@ -29,6 +32,32 @@ ImbalanceSide ObserveImbalanceSide(const ClearingEngine::ClearingResult& clearin
     const bool consistent{clearing.imbalance < MAX_MONEY ? residual == committed : residual >= committed};
     if (!consistent) return ImbalanceSide::UNKNOWN;
     return bid > 0 ? ImbalanceSide::BID : ImbalanceSide::ASK;
+}
+
+ClearingTickPage PageClearingTicks(const std::deque<MarketHistoryEntry>& history, const ClearingTickQuery& query)
+{
+    ClearingTickPage out;
+    if (query.limit == 0 || query.limit > MARKET_DATA_MAX_TICKS) {
+        out.unavailable_reason = "invalid_limit";
+        return out;
+    }
+    out.available = true;
+    if (history.empty()) return out;
+    out.oldest_retained_sequence = history.front().sequence;
+    auto first{history.end() - std::min(query.limit, history.size())};
+    if (query.after_sequence) {
+        const uint64_t after{*query.after_sequence};
+        first = std::find_if(history.begin(), history.end(), [&](const auto& entry) { return entry.sequence > after; });
+        out.gap = after < std::numeric_limits<uint64_t>::max() && after + 1 < *out.oldest_retained_sequence;
+    }
+    for (auto it{first}; it != history.end(); ++it) {
+        if (out.ticks.size() == query.limit) {
+            out.more = true;
+            break;
+        }
+        out.ticks.push_back(MakeClearingTick(*it));
+    }
+    return out;
 }
 
 } // namespace flowmesh

@@ -21,6 +21,16 @@ inline constexpr size_t MARKET_DATA_MAX_CURVES{128};
 inline constexpr size_t MARKET_DATA_MAX_HISTORY{100};
 inline constexpr size_t MARKET_DATA_HISTORY_CAPACITY{256};
 inline constexpr size_t MARKET_DATA_MAX_FILL_ACCOUNTS{128};
+//! A clearing-tick page holds at most every retained history entry.
+inline constexpr size_t MARKET_DATA_MAX_TICKS{MARKET_DATA_HISTORY_CAPACITY};
+inline constexpr size_t MARKET_DATA_DEFAULT_TICKS{64};
+
+//! A bounded page of clearing ticks, oldest first.
+struct ClearingTickQuery {
+    //! Ticks after this microblock sequence; absent: the newest `limit`.
+    std::optional<uint64_t> after_sequence;
+    size_t limit{MARKET_DATA_DEFAULT_TICKS};
+};
 
 struct MarketDataQuery {
     size_t limit{50};
@@ -32,6 +42,8 @@ struct MarketDataQuery {
     //! Head and runtime status only: no curves, account or history are read.
     //! A local read option, never part of any codec or reply format.
     bool status_only{false};
+    //! Clearing ticks, also read for a light known_head poll.
+    std::optional<ClearingTickQuery> ticks;
 };
 
 struct MarketAccountFill {
@@ -82,6 +94,54 @@ struct MarketHistoryEntry {
     //! MAX_MONEY exactly as ClearingResult::imbalance; zero without a clearing.
     CAmount imbalance{0};
     ImbalanceSide imbalance_side{ImbalanceSide::NONE};
+};
+
+/** One certified microblock of the bounded history as an auction tick: the
+ * uniform price and volume of its clearing and the side left unfilled.
+ * Sequence identity only: microblocks carry no execution time. */
+struct ClearingTick {
+    enum class Kind : uint8_t { EXECUTION, SETTLEMENT, HANDOFF };
+    uint64_t sequence{0};
+    uint256 microblock_hash;
+    Kind kind{Kind::EXECUTION};
+    bool cleared{false};
+    CAmount price{0};
+    CAmount volume{0};
+    CAmount imbalance{0};
+    ImbalanceSide imbalance_side{ImbalanceSide::NONE};
+    bool operator==(const ClearingTick&) const = default;
+};
+
+inline const char* ClearingTickKindName(const ClearingTick::Kind kind)
+{
+    switch (kind) {
+    case ClearingTick::Kind::EXECUTION: return "execution";
+    case ClearingTick::Kind::SETTLEMENT: return "settlement";
+    case ClearingTick::Kind::HANDOFF: return "handoff";
+    }
+    return "execution";
+}
+
+inline ClearingTick MakeClearingTick(const MarketHistoryEntry& entry)
+{
+    return {entry.sequence, entry.microblock_hash,
+            entry.handoff ? ClearingTick::Kind::HANDOFF : entry.settlement ? ClearingTick::Kind::SETTLEMENT
+                                                                           : ClearingTick::Kind::EXECUTION,
+            entry.cleared, entry.price, entry.quantity, entry.imbalance, entry.imbalance_side};
+}
+
+struct ClearingTickPage {
+    bool available{false};
+    //! Why ticks are unavailable; empty when available.
+    std::string unavailable_reason;
+    //! Ascending, consecutive microblock sequences.
+    std::vector<ClearingTick> ticks;
+    std::optional<uint64_t> oldest_retained_sequence;
+    //! Ticks after after_sequence were evicted before this page's first one:
+    //! a gap in the record, never a period without trading.
+    bool gap{false};
+    //! Retained ticks follow this page: continue after its last sequence.
+    bool more{false};
 };
 
 struct MarketHistoryPage {
@@ -160,6 +220,8 @@ struct MarketData {
     ClearingEngine::CurvePage liquidity;
     std::optional<MarketAccountData> account;
     MarketHistoryPage history;
+    //! Present only when the query asked for clearing ticks.
+    std::optional<ClearingTickPage> ticks;
     //! Public-client verification observations; never serialized into state roots.
     bool remote{false};
     bool certificate_verified{false};

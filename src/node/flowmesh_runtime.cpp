@@ -3395,7 +3395,8 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
         query.curve_limit == 0 || query.curve_limit > flowmesh::MARKET_DATA_MAX_CURVES ||
         (query.curve_cursor && !query.expected_head) ||
         (query.known_head && (query.curve_cursor || query.before_sequence)) ||
-        (query.status_only && (query.curve_cursor || query.before_sequence || query.expected_head))) {
+        (query.status_only && (query.curve_cursor || query.before_sequence || query.expected_head || query.ticks)) ||
+        (query.ticks && (query.ticks->limit == 0 || query.ticks->limit > flowmesh::MARKET_DATA_MAX_TICKS))) {
         error = "Invalid bounded market-data query or pagination snapshot";
         return std::nullopt;
     }
@@ -3447,6 +3448,19 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
         snapshot.runtime.active_catchup_requests += key.second == market_id;
     }
     out.unchanged = query.known_head && *query.known_head == market.last_hash;
+    // Read with the head above, and also for an unchanged head: a light
+    // known_head poll still receives the ticks after its own position.
+    if (query.ticks) {
+        if (market.store) {
+            out.ticks = market.store->ReadClearingTicks(*query.ticks);
+            // Never a tick beyond the head this reply reports.
+            if (std::erase_if(out.ticks->ticks, [&](const auto& tick) { return tick.sequence >= market.next_sequence; })) {
+                out.ticks->more = false;
+            }
+        } else {
+            out.ticks.emplace().unavailable_reason = "history_not_ready";
+        }
+    }
     if (out.unchanged || query.status_only || !snapshot.certified) return out;
 
     out.liquidity = market.state.ReadCurves(query.curve_limit, query.curve_cursor);

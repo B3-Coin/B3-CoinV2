@@ -29,6 +29,34 @@ static UniValue MarketCurvesJson(const std::vector<flowmesh::ClearingEngine::Cur
     }
     return out;
 }
+//! Present only when requested, so every earlier reply is unchanged. Remote
+//! ticks are endpoint-reported; the client checked only the tick at its
+//! verified head against that head's hash.
+static UniValue ClearingTicksJson(const flowmesh::ClearingTickPage& page, const bool remote)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("available", page.available);
+    if (!page.available) out.pushKV("unavailable_reason", page.unavailable_reason);
+    out.pushKV("source", remote ? "endpoint_reported" : "local_engine");
+    if (page.oldest_retained_sequence) out.pushKV("oldest_retained_sequence", *page.oldest_retained_sequence);
+    out.pushKV("gap", page.gap);
+    out.pushKV("more", page.more);
+    UniValue ticks{UniValue::VARR};
+    for (const auto& tick : page.ticks) {
+        UniValue row{UniValue::VOBJ};
+        row.pushKV("sequence", tick.sequence);
+        row.pushKV("microblock_hash", tick.microblock_hash.GetHex());
+        row.pushKV("kind", flowmesh::ClearingTickKindName(tick.kind));
+        row.pushKV("cleared", tick.cleared);
+        row.pushKV("price", tick.price);
+        row.pushKV("volume", tick.volume);
+        row.pushKV("imbalance", tick.imbalance);
+        row.pushKV("imbalance_side", flowmesh::ImbalanceSideName(tick.imbalance_side));
+        ticks.push_back(std::move(row));
+    }
+    out.pushKV("ticks", std::move(ticks));
+    return out;
+}
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data)
 {
     UniValue out{UniValue::VOBJ};
@@ -88,6 +116,7 @@ UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data)
     verification.pushKV("event_gap", data.event_gap);
     verification.pushKV("freshest_network_head_proven", false);
     out.pushKV("verification", std::move(verification));
+    if (data.ticks) out.pushKV("clearing_ticks", ClearingTicksJson(*data.ticks, data.remote));
     if (data.unchanged) return out;
 
     UniValue liquidity{UniValue::VOBJ};

@@ -18,7 +18,9 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <deque>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -230,6 +232,72 @@ BOOST_AUTO_TEST_CASE(imbalance_side_is_none_without_a_clearing_or_for_an_exact_m
     BOOST_CHECK_EQUAL(matched->imbalance, 0);
     BOOST_CHECK(flowmesh::ObserveImbalanceSide(*matched, state) == ImbalanceSide::NONE);
     BOOST_CHECK(state.ReadCurves(8).curves.empty());
+}
+
+BOOST_AUTO_TEST_CASE(clearing_tick_pages_are_bounded_ascending_and_report_eviction_gaps)
+{
+    // A full cache after eviction: sequences 300..555.
+    std::deque<flowmesh::MarketHistoryEntry> history;
+    for (uint64_t sequence{300}; sequence < 300 + flowmesh::MARKET_DATA_HISTORY_CAPACITY; ++sequence) {
+        flowmesh::MarketHistoryEntry entry;
+        entry.sequence = sequence;
+        *entry.microblock_hash.begin() = static_cast<uint8_t>(sequence);
+        entry.cleared = sequence % 3 == 0;
+        entry.price = entry.cleared ? 1'000 + static_cast<CAmount>(sequence) : 0;
+        entry.quantity = entry.cleared ? 7 : 0;
+        entry.imbalance = entry.cleared ? 2 : 0;
+        entry.imbalance_side = entry.cleared ? ImbalanceSide::ASK : ImbalanceSide::NONE;
+        entry.handoff = sequence == 400;
+        entry.settlement = sequence == 401;
+        history.push_back(entry);
+    }
+    const auto page = [&](std::optional<uint64_t> after, size_t limit) {
+        return flowmesh::PageClearingTicks(history, {after, limit});
+    };
+    const auto sequences = [](const flowmesh::ClearingTickPage& value) {
+        std::vector<uint64_t> out;
+        for (const auto& tick : value.ticks) out.push_back(tick.sequence);
+        return out;
+    };
+
+    const auto newest{page(std::nullopt, 3)};
+    BOOST_REQUIRE(newest.available);
+    BOOST_CHECK((sequences(newest) == std::vector<uint64_t>{553, 554, 555}));
+    BOOST_CHECK(!newest.more && !newest.gap);
+    BOOST_CHECK_EQUAL(*newest.oldest_retained_sequence, 300U);
+    BOOST_CHECK_EQUAL(page(std::nullopt, flowmesh::MARKET_DATA_MAX_TICKS).ticks.size(), flowmesh::MARKET_DATA_HISTORY_CAPACITY);
+
+    // Resuming: the first ticks after a position, then the rest.
+    const auto resumed{page(398, 2)};
+    BOOST_CHECK((sequences(resumed) == std::vector<uint64_t>{399, 400}));
+    BOOST_CHECK(resumed.more && !resumed.gap);
+    BOOST_REQUIRE_EQUAL(resumed.ticks.size(), 2U);
+    BOOST_CHECK(resumed.ticks[0].cleared);
+    BOOST_CHECK_EQUAL(resumed.ticks[0].price, 1'399);
+    BOOST_CHECK_EQUAL(resumed.ticks[0].volume, 7);
+    BOOST_CHECK_EQUAL(resumed.ticks[0].imbalance, 2);
+    BOOST_CHECK(resumed.ticks[0].imbalance_side == ImbalanceSide::ASK);
+    BOOST_CHECK(resumed.ticks[1].kind == flowmesh::ClearingTick::Kind::HANDOFF);
+    BOOST_CHECK(resumed.ticks[1].imbalance_side == ImbalanceSide::NONE);
+    BOOST_CHECK(page(400, 1).ticks.front().kind == flowmesh::ClearingTick::Kind::SETTLEMENT);
+    const auto caught_up{page(555, 64)};
+    BOOST_CHECK(caught_up.available && caught_up.ticks.empty() && !caught_up.more && !caught_up.gap);
+    BOOST_CHECK(page(std::numeric_limits<uint64_t>::max(), 64).ticks.empty());
+
+    // A position whose next tick was evicted is a gap, not a quiet market.
+    const auto evicted{page(100, 2)};
+    BOOST_CHECK(evicted.gap && evicted.more);
+    BOOST_CHECK((sequences(evicted) == std::vector<uint64_t>{300, 301}));
+    BOOST_CHECK(!page(299, 1).gap);
+    BOOST_CHECK(page(298, 1).gap);
+
+    for (const size_t limit : {size_t{0}, flowmesh::MARKET_DATA_MAX_TICKS + 1}) {
+        const auto refused{page(std::nullopt, limit)};
+        BOOST_CHECK(!refused.available && refused.ticks.empty());
+        BOOST_CHECK_EQUAL(refused.unavailable_reason, "invalid_limit");
+    }
+    const auto empty{flowmesh::PageClearingTicks({}, {})};
+    BOOST_CHECK(empty.available && empty.ticks.empty() && !empty.oldest_retained_sequence);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -2649,6 +2649,64 @@ BOOST_AUTO_TEST_CASE(catchup_timeout_reduces_page_count_without_relaxing_deadlin
     check_request(64, 1); // disconnect clears the local adaptive profile
 }
 
+BOOST_AUTO_TEST_CASE(market_data_reads_clearing_ticks_on_an_unchanged_head)
+{
+    DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_ticks_unchanged_head",
+                             node::FlowMeshDeliveryAdmission::FULL, false};
+    f.keys.m_keys.clear(); // An observer applies the certified entry below.
+    const auto peer{DeliveryRuntimeFixture::PEER};
+    flowmesh::ProductionEpochGate gate{f.domain, f.market, f.seats.seats};
+    flowmesh::ProductionEntryCheck check;
+    const auto genesis{flowmesh::BuildProductionExecutionEntry(
+        f.initial, f.domain, f.market, f.seats.seats, gate, 0, 0, {},
+        {100, Filled(0x71)}, {f.chain.TipHeight(), std::nullopt, &f.chain},
+        Filled(0x6b), {}, nullptr, check)};
+    BOOST_REQUIRE(genesis);
+    const auto certified{flowmesh::EncodeProductionCertifiedPayload(
+        {genesis->entry, Certify(genesis->entry, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(certified);
+    BOOST_REQUIRE(f.runtime->RequestCatchup(peer, f.market));
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    const std::vector<std::vector<unsigned char>> entries{*certified};
+    const auto payload{flowmesh::EncodeCatchupEntries(entries)};
+    BOOST_REQUIRE(payload);
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(peer,
+        {flowmesh::WireMessageKind::ENTRIES,
+         {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 0}, *payload}) ==
+        flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_REQUIRE_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 1U);
+
+    std::string error;
+    // Without the option nothing is read.
+    const auto plain{f.runtime->MarketData(f.market, std::nullopt, {}, error)};
+    BOOST_REQUIRE(plain);
+    BOOST_CHECK(!plain->ticks);
+    // A light known_head poll omits the heavy data but still reads ticks.
+    flowmesh::MarketDataQuery query;
+    query.known_head = genesis->entry.GetHash();
+    query.ticks = flowmesh::ClearingTickQuery{};
+    const auto light{f.runtime->MarketData(f.market, std::nullopt, query, error)};
+    BOOST_REQUIRE(light);
+    BOOST_CHECK(light->unchanged);
+    BOOST_CHECK(light->history.entries.empty() && light->liquidity.curves.empty());
+    BOOST_REQUIRE(light->ticks && light->ticks->available);
+    BOOST_REQUIRE_EQUAL(light->ticks->ticks.size(), 1U);
+    BOOST_CHECK_EQUAL(light->ticks->ticks[0].sequence, 0U);
+    BOOST_CHECK(light->ticks->ticks[0].microblock_hash == genesis->entry.GetHash());
+    BOOST_CHECK(light->ticks->ticks[0].kind == flowmesh::ClearingTick::Kind::EXECUTION);
+    BOOST_CHECK(!light->ticks->ticks[0].cleared);
+    query.ticks->after_sequence = 0;
+    const auto current{f.runtime->MarketData(f.market, std::nullopt, query, error)};
+    BOOST_REQUIRE(current && current->ticks);
+    BOOST_CHECK(current->ticks->available && current->ticks->ticks.empty());
+    // Bounds are the local read API's: refused, never clamped.
+    for (const size_t limit : {size_t{0}, flowmesh::MARKET_DATA_MAX_TICKS + 1}) {
+        query.ticks->limit = limit;
+        BOOST_CHECK(!f.runtime->MarketData(f.market, std::nullopt, query, error));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(evidence_retry_budget_bounds_count_bytes_and_clock)
 {
     node::FlowMeshEvidenceRetryBudget budget;

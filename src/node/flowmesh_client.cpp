@@ -2077,6 +2077,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 checkpoint->core.state_root == out->snapshot.state_root;
         }
         if (!out->unchanged) ReportedHistory(*out, cache.reported);
+        // Not yet requested from endpoints: say so rather than omit them.
+        if (query.ticks) out->ticks.emplace().unavailable_reason = "remote_client_does_not_request_clearing_ticks";
         return std::move(*out);
     }
     flowmesh::ClientEvidencePins RecheckActionAuthority(Pending& p)

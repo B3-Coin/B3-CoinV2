@@ -2379,6 +2379,17 @@ flowmesh::MarketHistoryPage FlowMeshProductionStore::ReadMarketHistory(
     return out;
 }
 
+flowmesh::ClearingTickPage FlowMeshProductionStore::ReadClearingTicks(const flowmesh::ClearingTickQuery& query)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    if (!m_open || !m_ready) {
+        flowmesh::ClearingTickPage out;
+        out.unavailable_reason = "history_not_ready";
+        return out;
+    }
+    return flowmesh::PageClearingTicks(m_market_history, query);
+}
+
 flowmesh::ProductionLockResult FlowMeshProductionStore::LockCandidate(
     const flowmesh::ProductionEntryCore& entry,
     const std::span<const flowmesh::Action> authenticated_evidence)

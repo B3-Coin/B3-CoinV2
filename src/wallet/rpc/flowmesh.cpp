@@ -118,12 +118,13 @@ static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
     if (options.isNull()) return query;
     if (!options.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "options must be an object");
     const std::set<std::string> allowed{
-        "limit", "curve_limit", "before_sequence", "curve_cursor", "expected_head", "known_head"};
+        "limit", "curve_limit", "before_sequence", "curve_cursor", "expected_head", "known_head", "ticks"};
     for (const auto& key : options.getKeys()) {
         if (!allowed.contains(key)) throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown option '" + key + "'");
     }
-    const auto integer = [&](const std::string& name, const uint64_t minimum, const uint64_t maximum) {
-        const UniValue& value{options[name]};
+    const auto integer = [&](const std::string& name, const uint64_t minimum, const uint64_t maximum,
+                             const UniValue* object = nullptr) {
+        const UniValue& value{(object ? *object : options)[name]};
         if (!value.isNum()) throw JSONRPCError(RPC_TYPE_ERROR, name + " must be an integer");
         uint64_t number;
         try {
@@ -159,6 +160,18 @@ static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
     }
     if (query.known_head && (query.curve_cursor || query.before_sequence)) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "known_head cannot be combined with pagination cursors");
+    }
+    if (options.exists("ticks")) {
+        const UniValue& ticks{options["ticks"]};
+        if (!ticks.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "ticks must be an object");
+        for (const auto& key : ticks.getKeys()) {
+            if (key != "after_sequence" && key != "limit") throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown ticks option '" + key + "'");
+        }
+        auto& tick_query{query.ticks.emplace()};
+        if (ticks.exists("after_sequence")) {
+            tick_query.after_sequence = integer("after_sequence", 0, std::numeric_limits<uint64_t>::max(), &ticks);
+        }
+        if (ticks.exists("limit")) tick_query.limit = integer("limit", 1, flowmesh::MARKET_DATA_MAX_TICKS, &ticks);
     }
     return query;
 }
@@ -1050,6 +1063,10 @@ RPCHelpMan getflowmeshmarketdata()
                 {"expected_head", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Reject if the certified head has changed"},
                 {"known_head", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Omit heavy data when the head matches; cannot be combined with pagination cursors"},
                 {"watch_ms", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Live update: wait up to this many milliseconds (0-2000, at most 1500 used) for a change before reading; cannot be combined with before_sequence, curve_cursor or expected_head"},
+                {"ticks", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Clearing ticks, oldest first, also returned with an unchanged known_head", {
+                    {"after_sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Ticks after this microblock sequence; omit for the newest"},
+                    {"limit", RPCArg::Type::NUM, RPCArg::Default{64}, "Ticks, 1-256"},
+                }},
             }},
         },
         RPCResult{T::OBJ, "", "Bounded certified market snapshot", {
@@ -1072,6 +1089,26 @@ RPCHelpMan getflowmeshmarketdata()
                 {T::BOOL, "history_endpoint_reported", "History is endpoint-reported rather than independently execution-verified"},
                 {T::BOOL, "event_gap", "Sticky: the client's event cursor for this market was lost at least once (endpoint-reported gap, other endpoint or restarted endpoint, restart of this client, or a wallet/authority change), so events in between may never have been seen; balances and orders still come only from verified snapshots"},
                 {T::BOOL, "freshest_network_head_proven", "False: a valid response does not prove the freshest network head"},
+            }},
+            {T::OBJ, "clearing_ticks", /*optional=*/true, "Present only when ticks was given: one tick per certified microblock of the bounded history, including on unchanged responses", {
+                {T::BOOL, "available", "Ticks are available through this backend"},
+                {T::STR, "unavailable_reason", /*optional=*/true, "Why they are not"},
+                {T::STR, "source", "local_engine (replayed by this node), or endpoint_reported (only the tick at the verified head is checked, against that head's hash)"},
+                {T::NUM, "oldest_retained_sequence", /*optional=*/true, "Oldest retained tick"},
+                {T::BOOL, "gap", "Ticks after after_sequence were evicted before the first returned one: missing record, not a period without trading"},
+                {T::BOOL, "more", "More retained ticks follow; continue after the last sequence"},
+                {T::ARR, "ticks", "Consecutive microblocks, oldest first; no execution timestamp", {
+                    {T::OBJ, "", "One certified microblock", {
+                        {T::NUM, "sequence", "Global microblock sequence"},
+                        {T::STR_HEX, "microblock_hash", "Certified microblock id"},
+                        {T::STR, "kind", "execution, settlement or handoff"},
+                        {T::BOOL, "cleared", "An actual nonzero match occurred"},
+                        {T::NUM, "price", "Uniform clearing price in B3 atoms per base unit; zero when not cleared"},
+                        {T::NUM, "volume", "Matched base units"},
+                        {T::NUM, "imbalance", "Committed |demand - supply| at the clearing price, saturated at the monetary maximum"},
+                        {T::STR, "imbalance_side", "Side left unfilled at the price: bid, ask, none, or unknown when it was not observed"},
+                    }},
+                }},
             }},
             {T::OBJ, "watch", /*optional=*/true, "Present only when watch_ms was given: this read's local latency observation, never evidence", {
                 {T::STR, "status", "none, no_cursor, head_changed, ready, gap, timeout, interrupted, restarted, busy, deadline (endpoint), or not_eligible, lane_busy, superseded, unsupported, failed, revalidate, invalid, other (this client)"},

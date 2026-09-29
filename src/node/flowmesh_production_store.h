@@ -301,6 +301,10 @@ public:
     flowmesh::MarketHistoryPage ReadMarketHistory(uint64_t before_sequence,
                                                 size_t limit);
 
+    /** The same bounded cache as clearing ticks, oldest first. Unavailable
+     * before startup replay completes or for a limit outside 1..MAX_TICKS. */
+    flowmesh::ClearingTickPage ReadClearingTicks(const flowmesh::ClearingTickQuery& query);
+
     /**
      * Return the earliest entry after the last connected type-8 that must be
      * published: sequence-zero market genesis, every handoff, or the first

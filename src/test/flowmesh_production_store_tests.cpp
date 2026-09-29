@@ -820,6 +820,27 @@ BOOST_AUTO_TEST_CASE(market_history_records_the_rationed_side_across_handoff_and
                                   next, error),
                               error);
         check_sides(store.ReadMarketHistory(3, 50));
+        // The same cache as consecutive clearing ticks, oldest first.
+        const auto ticks{store.ReadClearingTicks({})};
+        BOOST_REQUIRE(ticks.available);
+        BOOST_REQUIRE_EQUAL(ticks.ticks.size(), 3U);
+        BOOST_CHECK(ticks.ticks[0].kind == flowmesh::ClearingTick::Kind::EXECUTION);
+        BOOST_CHECK(ticks.ticks[0].microblock_hash == scenario.execution0.entry.GetHash());
+        BOOST_CHECK(ticks.ticks[0].cleared);
+        BOOST_CHECK_EQUAL(ticks.ticks[0].price, 100);
+        BOOST_CHECK_EQUAL(ticks.ticks[0].volume, 200);
+        BOOST_CHECK_EQUAL(ticks.ticks[0].imbalance, 100);
+        BOOST_CHECK(ticks.ticks[0].imbalance_side == flowmesh::ImbalanceSide::BID);
+        BOOST_CHECK(ticks.ticks[1].kind == flowmesh::ClearingTick::Kind::HANDOFF);
+        BOOST_CHECK(ticks.ticks[1].microblock_hash == scenario.handoff1.GetHash());
+        BOOST_CHECK(ticks.ticks[1].imbalance_side == flowmesh::ImbalanceSide::NONE);
+        BOOST_CHECK(ticks.ticks[2].kind == flowmesh::ClearingTick::Kind::EXECUTION);
+        BOOST_CHECK(!ticks.ticks[2].cleared);
+        BOOST_CHECK(ticks.ticks[2].imbalance_side == flowmesh::ImbalanceSide::NONE);
+        const auto after{store.ReadClearingTicks({1, 64})};
+        BOOST_REQUIRE_EQUAL(after.ticks.size(), 1U);
+        BOOST_CHECK_EQUAL(after.ticks[0].sequence, 2U);
+        BOOST_CHECK(!store.ReadClearingTicks({std::nullopt, 0}).available);
     }
 
     // Startup replay observes the same sides on the replayed states.
@@ -829,6 +850,10 @@ BOOST_AUTO_TEST_CASE(market_history_records_the_rationed_side_across_handoff_and
                               scenario.domain, scenario.market,
                               scenario.seats0.seats, initial_root, error),
                           error);
+    // Nothing before the replay that rebuilds the cache.
+    const auto early{reopened.ReadClearingTicks({})};
+    BOOST_CHECK(!early.available);
+    BOOST_CHECK_EQUAL(early.unavailable_reason, "history_not_ready");
     SeatSource source;
     source.m_domain = scenario.domain;
     source.m_market = scenario.market;
@@ -843,6 +868,7 @@ BOOST_AUTO_TEST_CASE(market_history_records_the_rationed_side_across_handoff_and
                               scenario.treasury, &scenario.chain_facts, error),
                           error);
     check_sides(reopened.ReadMarketHistory(3, 50));
+    BOOST_CHECK_EQUAL(reopened.ReadClearingTicks({}).ticks.size(), 3U);
 }
 
 BOOST_AUTO_TEST_CASE(genesis_and_ordinary_checkpoint_reorgs_republish_and_restart)

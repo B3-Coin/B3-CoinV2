@@ -8,6 +8,8 @@
 #include <flowmesh/clearing.h>
 #include <flowmesh/market_data.h>
 
+#include <deque>
+
 namespace flowmesh {
 
 class FlowMeshState;
@@ -28,6 +30,13 @@ class FlowMeshState;
  * side's residual sums to the committed imbalance. Any other observation is
  * UNKNOWN, never a guess. NONE for no clearing or an exact match. */
 ImbalanceSide ObserveImbalanceSide(const ClearingEngine::ClearingResult& clearing, const FlowMeshState& post);
+
+/** A clearing-tick page of `history` (ascending sequences, as the bounded
+ * market-history cache holds them). Without after_sequence: the newest
+ * `limit` ticks; with it: the first `limit` ticks after it, and `gap` when
+ * the tick right after it was already evicted. Unavailable for a limit
+ * outside 1..MARKET_DATA_MAX_TICKS. */
+ClearingTickPage PageClearingTicks(const std::deque<MarketHistoryEntry>& history, const ClearingTickQuery& query);
 
 } // namespace flowmesh
 
