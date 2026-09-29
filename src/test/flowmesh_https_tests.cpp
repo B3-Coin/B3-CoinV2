@@ -488,6 +488,108 @@ BOOST_AUTO_TEST_CASE(https_client_reuses_verified_connection_and_exact_request_b
     BOOST_CHECK(reset.tls_handshake_performed);
 }
 
+BOOST_AUTO_TEST_CASE(https_client_warm_matches_only_a_reusable_connection_to_the_same_origin)
+{
+    node::FlowMeshHttpsServer server{Options(), [](const auto&) {
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    node::FlowMeshHttpsServer other{Options(), [](const auto&) {
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    BOOST_REQUIRE_MESSAGE(other.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    node::FlowMeshHttpsClient client;
+    BOOST_CHECK(!client.Warm(endpoint)); // Nothing retained yet.
+    BOOST_REQUIRE(client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024).response_received);
+    BOOST_CHECK(client.Warm(endpoint));
+    // The same origin spelled differently is the same connection.
+    auto spelled{endpoint};
+    spelled.url += "/flowmesh/v1";
+    BOOST_CHECK(client.Warm(spelled));
+    // Another origin, another pin, no pin, another CA file or a malformed
+    // endpoint never match; the check changes nothing.
+    BOOST_CHECK(!client.Warm(Endpoint(other)));
+    auto wrong_pin{endpoint};
+    wrong_pin.certificate_sha256 = std::string(64, '0');
+    BOOST_CHECK(!client.Warm(wrong_pin));
+    auto no_pin{endpoint};
+    no_pin.certificate_sha256.clear();
+    BOOST_CHECK(!client.Warm(no_pin));
+    auto other_ca{endpoint};
+    other_ca.ca_file = m_path_root / "other-ca.pem";
+    BOOST_CHECK(!client.Warm(other_ca));
+    auto malformed{endpoint};
+    malformed.url = "http://127.0.0.1";
+    BOOST_CHECK(!client.Warm(malformed));
+    BOOST_CHECK(client.Warm(endpoint));
+    const auto reused{client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(reused.response_received, reused.error);
+    BOOST_CHECK(reused.connection_reused);
+    client.Reset();
+    BOOST_CHECK(!client.Warm(endpoint));
+    // A connection the server closed is never reported warm.
+    BOOST_REQUIRE(client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024).response_received);
+    BOOST_REQUIRE(client.Warm(endpoint));
+    server.Stop();
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{2}};
+    while (client.Warm(endpoint) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    BOOST_CHECK(!client.Warm(endpoint));
+    other.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_client_swap_carries_a_verified_connection_without_a_new_handshake)
+{
+    ConnectionObservation connections;
+    node::FlowMeshHttpsServer server{Options(), [](const auto& request) {
+        return node::FlowMeshHttpsServer::Response{200, request.body};
+    }};
+    BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(server,
+        [&](bool tcp_nodelay) { connections.Record(tcp_nodelay); }));
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    node::FlowMeshHttpsClient ordinary, lane;
+    const auto first{ordinary.Request(endpoint, "/flowmesh/v1", "{\"first\":1}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(first.response_received, first.error);
+    BOOST_CHECK(first.tls_handshake_performed);
+    BOOST_REQUIRE(ordinary.Warm(endpoint));
+    BOOST_REQUIRE(!lane.Warm(endpoint));
+    BOOST_CHECK(lane.Swap(ordinary));
+    BOOST_CHECK(lane.Warm(endpoint));
+    BOOST_CHECK(!ordinary.Warm(endpoint));
+    // The carried connection serves the other session without a handshake.
+    const auto carried{lane.Request(endpoint, "/flowmesh/v1", "{\"carried\":1}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(carried.response_received, carried.error);
+    BOOST_CHECK_EQUAL(carried.body, "{\"carried\":1}");
+    BOOST_CHECK(carried.connection_reused);
+    BOOST_CHECK(!carried.tls_handshake_performed);
+    BOOST_CHECK(carried.request_may_have_been_sent);
+    // Handed back, it serves the first session again: still one connection.
+    BOOST_CHECK(ordinary.Swap(lane));
+    const auto back{ordinary.Request(endpoint, "/flowmesh/v1", "{\"back\":1}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(back.response_received, back.error);
+    BOOST_CHECK(back.connection_reused);
+    BOOST_CHECK(!back.tls_handshake_performed);
+    const auto samples{connections.Await(1)};
+    BOOST_REQUIRE(samples);
+    // The session left with the empty state opens its own connection.
+    const auto own{lane.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(own.response_received, own.error);
+    BOOST_CHECK(!own.connection_reused);
+    BOOST_CHECK(own.tls_handshake_performed);
+    BOOST_REQUIRE(connections.Await(2));
+    // Sessions with different keep-alive policies never exchange state.
+    node::FlowMeshHttpsClient one_shot{false};
+    BOOST_CHECK(!one_shot.Swap(ordinary));
+    BOOST_CHECK(ordinary.Warm(endpoint));
+    server.Stop();
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+}
+
 BOOST_AUTO_TEST_CASE(https_warm_response_loss_is_unknown_without_hidden_replay)
 {
     std::mutex mutex;

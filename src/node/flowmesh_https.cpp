@@ -738,6 +738,34 @@ FlowMeshHttpsClient::FlowMeshHttpsClient(bool keep_alive) : m_impl{std::make_uni
 FlowMeshHttpsClient::~FlowMeshHttpsClient() = default;
 void FlowMeshHttpsClient::Reset() { m_impl->Reset(); }
 
+bool FlowMeshHttpsClient::Warm(const HttpsEndpoint& endpoint)
+{
+    try {
+        auto& state{*m_impl};
+        if (!state.connection) return false;
+        HttpsEndpoint normalized{endpoint};
+        std::string error;
+        if (!NormalizeFlowMeshHttpsEndpoint(normalized, error)) return false;
+        std::optional<std::array<unsigned char, 32>> pin;
+        if (!endpoint.certificate_sha256.empty() && !(pin = ParsePin(endpoint.certificate_sha256))) return false;
+        // The same identity checks Request makes before it reuses a
+        // connection, except the CA-file content, which Request re-reads.
+        return state.endpoint.url == normalized.url && state.endpoint.ca_file == normalized.ca_file &&
+               state.session.pin == pin && state.Reusable();
+    } catch (...) {
+        return false;
+    }
+}
+
+bool FlowMeshHttpsClient::Swap(FlowMeshHttpsClient& other) noexcept
+{
+    // TLS ex_data and the close callback point into the Impl (its session),
+    // never at this wrapper, so moving the owning pointers keeps them valid.
+    if (m_impl->keep_alive != other.m_impl->keep_alive) return false;
+    m_impl.swap(other.m_impl);
+    return true;
+}
+
 HttpsRequestResult FlowMeshHttpsClient::Request(const HttpsEndpoint& endpoint, const std::string& path,
                                                const std::string& body, Milliseconds timeout, size_t max_reply_bytes)
 {
