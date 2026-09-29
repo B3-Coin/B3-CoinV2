@@ -1373,8 +1373,10 @@ void ClientActionEvent(Market& market, const flowmesh::ClientEventKind kind,
 template <typename Market>
 FlowMeshLocalAdmission DecideLocal(const Market& market, const flowmesh::Action& action)
 {
+    // The ring is scanned only when the decision needs it (a used sequence
+    // or deposit), never on the common open-sequence path.
     return FlowMeshDecideLocalAdmission(market.state, market.recent,
-                                        market.client_events.ActionStatus(market.market_id, action.Id()), action);
+        [&] { return market.client_events.ActionStatus(market.market_id, action.Id()); }, action);
 }
 
 template <typename Market>

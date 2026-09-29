@@ -13,6 +13,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -53,24 +54,27 @@ struct FlowMeshLocalAdmission {
 };
 
 /**
- * Pure decision. `ring_status` is the event ring's current ActionStatus for
- * this ActionId. Inclusion is looked up before any stale test, so an
- * already-executed resubmission is answered with its inclusion. A signed
- * action at or above the next sequence is queued without an inclusion
- * check: an included-but-not-executed action whose sequence is still open
- * may be delivered again, as before.
+ * Pure decision. `ring_status` returns the event ring's current ActionStatus
+ * for this ActionId; it is called at most once, and only when the sequence
+ * or deposit is already used, so the common path (an open sequence) is one
+ * NextSequence lookup and never scans the ring. Inclusion is looked up
+ * before any stale test, so an already-executed resubmission is answered
+ * with its inclusion. A signed action at or above the next sequence is
+ * queued without an inclusion check: an included-but-not-executed action
+ * whose sequence is still open may be delivered again, as before.
  */
 inline FlowMeshLocalAdmission FlowMeshDecideLocalAdmission(
     const flowmesh::FlowMeshState& state, const FlowMeshRecentCertifiedWindow& recent,
-    const std::optional<flowmesh::ClientEvent>& ring_status, const flowmesh::Action& action)
+    const std::function<std::optional<flowmesh::ClientEvent>()>& ring_status, const flowmesh::Action& action)
 {
     using Kind = FlowMeshLocalAdmission::Kind;
     using Code = flowmesh::ActionReasonCode;
     FlowMeshLocalAdmission out;
     const auto included = [&]() -> std::optional<std::pair<uint64_t, uint256>> {
         if (auto found{recent.Inclusion(action.Id())}) return found;
-        if (ring_status && ring_status->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED) {
-            return std::pair{ring_status->microblock_sequence, ring_status->microblock_hash};
+        const auto ring{ring_status ? ring_status() : std::nullopt};
+        if (ring && ring->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED) {
+            return std::pair{ring->microblock_sequence, ring->microblock_hash};
         }
         return std::nullopt;
     };
@@ -110,6 +114,14 @@ inline FlowMeshLocalAdmission FlowMeshDecideLocalAdmission(
     out.kind = Kind::UNKNOWN_OUTCOME;
     out.code = Code::STALE_SEQUENCE_UNATTRIBUTED;
     return out;
+}
+
+//! The same decision from an already read ring status.
+inline FlowMeshLocalAdmission FlowMeshDecideLocalAdmission(
+    const flowmesh::FlowMeshState& state, const FlowMeshRecentCertifiedWindow& recent,
+    const std::optional<flowmesh::ClientEvent>& ring_status, const flowmesh::Action& action)
+{
+    return FlowMeshDecideLocalAdmission(state, recent, [&] { return ring_status; }, action);
 }
 
 //! The receipt text of a non-ENQUEUE decision for this node's API caller.

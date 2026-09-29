@@ -195,4 +195,21 @@ BOOST_AUTO_TEST_CASE(open_sequence_is_queued_even_when_included_without_executio
     BOOST_CHECK(f.Decide(action).kind == Kind::ENQUEUE);
 }
 
+BOOST_AUTO_TEST_CASE(ring_is_read_only_for_a_used_sequence_or_deposit)
+{
+    AdmissionFixture f;
+    flowmesh::test_only::StateFunding::SetNextSequence(f.state, f.signer, 10);
+    unsigned reads{0};
+    const auto ring = [&]() -> std::optional<flowmesh::ClientEvent> { ++reads; return std::nullopt; };
+    // The common path, an open sequence (or one too far ahead) or an unused
+    // deposit, never scans the ring.
+    BOOST_CHECK(node::FlowMeshDecideLocalAdmission(f.state, f.recent, ring, f.Signed(10)).kind == Kind::ENQUEUE);
+    BOOST_CHECK(node::FlowMeshDecideLocalAdmission(f.state, f.recent, ring, f.Signed(75)).kind == Kind::REFUSE);
+    BOOST_CHECK(node::FlowMeshDecideLocalAdmission(f.state, f.recent, ring, AdmissionFixture::Deposit(3)).kind == Kind::ENQUEUE);
+    BOOST_CHECK_EQUAL(reads, 0U);
+    // A used sequence consults it once.
+    BOOST_CHECK(node::FlowMeshDecideLocalAdmission(f.state, f.recent, ring, f.Signed(9)).kind == Kind::UNKNOWN_OUTCOME);
+    BOOST_CHECK_EQUAL(reads, 1U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
