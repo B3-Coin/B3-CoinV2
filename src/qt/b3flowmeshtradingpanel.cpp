@@ -2303,27 +2303,40 @@ void B3FlowMeshTradingPanel::observeRequests()
             m_request_order.push_back(key);
             while (m_request_order.size() > MAX_REQUEST_KEYS) { m_request_seen.erase(m_request_order.front()); m_request_order.pop_front(); }
         }
-        const auto kind{key == m_tracked_title_key ? m_tracked_kind : saved ? KindOf(*saved) : RequestKind::Other};
-        const auto [decimals, ticker]{requestUnits(receipt.market)};
-        const auto market_row{std::find_if(m_market_data.begin(), m_market_data.end(), [&](const auto& m) { return m.id == receipt.market; })};
-        const auto view{DescribeStage(receipt, market_row != m_market_data.end() && !market_row->remote, kind, decimals, ticker)};
-        // Only the historical facts are kept: never Certified or an outcome.
-        seen->second.high = std::max(seen->second.high, std::min(view.reached, Stage::Admitted));
-        if (view.settled && !seen->second.settled) {
+        // Settled history (most saved rows) needs no stage text: its events
+        // follow from the receipt's verified facts, as in DescribeStage.
+        const bool outcome{receipt.Included() && receipt.outcome_verified && receipt.outcome};
+        const bool settled{receipt.Included() || receipt.no_resubmit || receipt.NotExecuted() || outcome};
+        std::optional<StageView> view;
+        const auto describe = [&]() -> const StageView& {
+            if (!view) {
+                const auto kind{key == m_tracked_title_key ? m_tracked_kind : saved ? KindOf(*saved) : RequestKind::Other};
+                const auto [decimals, ticker]{requestUnits(receipt.market)};
+                const auto market_row{std::find_if(m_market_data.begin(), m_market_data.end(), [&](const auto& m) { return m.id == receipt.market; })};
+                view = DescribeStage(receipt, market_row != m_market_data.end() && !market_row->remote, kind, decimals, ticker);
+            }
+            return *view;
+        };
+        unsigned now{(receipt.Included() ? CERTIFIED : 0U) |
+                     (outcome && receipt.outcome->status == QStringLiteral("applied") ? EXECUTED : 0U) |
+                     (receipt.NotExecuted() || (outcome && receipt.outcome->status != QStringLiteral("applied")) ? NOT_EXECUTED : 0U)};
+        if (!settled) {
+            // Only the historical facts are kept: never Certified or an outcome.
+            seen->second.high = std::max(seen->second.high, std::min(describe().reached, Stage::Admitted));
+            now |= (describe().flag == StageFlag::Uncertain ? UNCERTAIN : 0U) | (describe().flag == StageFlag::Refused ? REFUSED : 0U);
+        } else if (!seen->second.settled) {
             seen->second.settled = true;
             if (!seed) { seen->second.settled_age.start(); m_last_settled.start(); }
         }
-        const unsigned now{(receipt.Included() ? CERTIFIED : 0U) | (view.reached == Stage::OutcomeVerified && view.flag == StageFlag::None ? EXECUTED : 0U) |
-                           (view.flag == StageFlag::NotExecuted ? NOT_EXECUTED : 0U) | (view.flag == StageFlag::Uncertain ? UNCERTAIN : 0U) |
-                           (view.flag == StageFlag::Refused ? REFUSED : 0U)};
         const unsigned fresh{now & ~seen->second.events};
         seen->second.events |= now;
         if (!announce || !fresh) return;
         const QString title{requestTitle(key, saved, receipt.action_id)};
+        const auto& shown{describe()};
         using Kind = B3FlowMeshToasts::Kind;
         using std::chrono::seconds;
-        if (fresh & EXECUTED) toast(key + QStringLiteral(":executed"), Kind::Success, tr("Executed: %1 · %2").arg(title, view.outcome.mid(2)), seconds{8});
-        else if (fresh & NOT_EXECUTED) toast(key + QStringLiteral(":not-executed"), Kind::Warning, tr("%1 · %2").arg(title, view.status), seconds{20});
+        if (fresh & EXECUTED) toast(key + QStringLiteral(":executed"), Kind::Success, tr("Executed: %1 · %2").arg(title, shown.outcome.mid(2)), seconds{8});
+        else if (fresh & NOT_EXECUTED) toast(key + QStringLiteral(":not-executed"), Kind::Warning, tr("%1 · %2").arg(title, shown.status), seconds{20});
         else if (fresh & CERTIFIED) toast(key + QStringLiteral(":certified"), Kind::Info, tr("Certified: %1 · included in batch #%2").arg(title).arg(receipt.microblock_sequence), seconds{8});
         if (fresh & UNCERTAIN) toast(key + QStringLiteral(":uncertain"), Kind::Warning, tr("Outcome unknown: %1 · review before trading; it is never re-signed.").arg(title), seconds{20});
         if (fresh & REFUSED) toast(key + QStringLiteral(":refused"), Kind::Warning, tr("Refusal reported: %1 · treated as unknown until reviewed.").arg(title), seconds{20});
