@@ -175,6 +175,12 @@ UniValue FlowMeshClientStatusJson(const interfaces::FlowMeshClientStatus& status
         row.pushKV("last_attempt_ms", endpoint.last_attempt_ms);
         row.pushKV("retry_after_ms", endpoint.retry_after_ms);
         row.pushKV("consecutive_failures", endpoint.consecutive_failures);
+        row.pushKV("readiness", endpoint.readiness);
+        row.pushKV("readiness_market", endpoint.readiness_market);
+        UniValue not_ready{UniValue::VARR};
+        for (const auto& code : endpoint.not_ready) not_ready.push_back(code);
+        row.pushKV("not_ready", std::move(not_ready));
+        row.pushKV("readiness_observed_ms", endpoint.readiness_observed_ms);
         endpoints.push_back(std::move(row));
     }
     out.pushKV("endpoints", std::move(endpoints));

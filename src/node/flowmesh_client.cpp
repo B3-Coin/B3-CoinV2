@@ -6,6 +6,7 @@
 #include <node/flowmesh_client_action_wait.h>
 #include <node/flowmesh_client_join.h>
 #include <node/flowmesh_client_poll.h>
+#include <node/flowmesh_client_readiness.h>
 #include <node/flowmesh_client_work.h>
 #include <node/flowmesh_client_settlement.h>
 #include <node/flowmesh_health.h>
@@ -850,6 +851,23 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     {
         m_action_wait.at(endpoint) = FlowMeshAdvertisedActionWait(status);
     }
+    // Display only, never evidence and never an input to endpoint selection:
+    // what the endpoint last advertised about its own readiness.
+    void LearnReadiness(FlowMeshAdvertisedReadiness readiness, size_t endpoint, const uint256& market)
+    {
+        std::lock_guard lock{m_status_mutex};
+        auto& row{m_status.endpoints.at(endpoint)};
+        row.readiness = FlowMeshAdvertisedReadinessName(readiness.state);
+        if (readiness.state == FlowMeshAdvertisedReadiness::State::UNKNOWN) {
+            row.readiness_market.clear();
+            row.not_ready.clear();
+            row.readiness_observed_ms = 0;
+            return;
+        }
+        row.readiness_market = market.GetHex();
+        row.not_ready = std::move(readiness.not_ready);
+        row.readiness_observed_ms = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());
+    }
 
     void SyncIndexes() EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
     {
@@ -1253,6 +1271,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             SaveRestartState();
             LearnMetadata(value["status"], pins, endpoint);
             LearnActionWait(value["status"], endpoint);
+            LearnReadiness(FlowMeshAdvertisedReadinessOf(value["status"]), endpoint, id);
         });
     }
     enum class CacheCheck { CURRENT, SCOPE, CHECKPOINT, AUTHORITY, ANCHOR };
@@ -1342,6 +1361,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             (void)Flag(value, "more");
             LearnMetadata(value["status"], cache.pins, endpoint);
             LearnActionWait(value["status"], endpoint);
+            LearnReadiness(FlowMeshAdvertisedReadinessOf(value["status"]), endpoint, id);
         });
         if (snapshot_needed) Snapshot(id, account);
         return done();
@@ -1790,11 +1810,18 @@ private:
         return Call("markets", params, [&](const UniValue& value, size_t endpoint) {
             if (!value.isArray() || value.size() > CLIENT_MAX_MARKETS) Fail("Market discovery exceeds bound");
             std::set<uint256> seen;
+            // One row per endpoint is shown: the first market it reports not
+            // ready, otherwise the last one.
+            std::optional<std::pair<FlowMeshAdvertisedReadiness, uint256>> shown;
             for (const auto& row : value.getValues()) {
                 const auto id{Id(row, "market_id")}; if (!seen.insert(id).second) Fail("Duplicate market identity");
                 CheckStatus(row, Pins(id));
                 LearnActionWait(row, endpoint);
+                if (!shown || shown->first.state != FlowMeshAdvertisedReadiness::State::NOT_READY) {
+                    shown.emplace(FlowMeshAdvertisedReadinessOf(row), id);
+                }
             }
+            if (shown) LearnReadiness(std::move(shown->first), endpoint, shown->second);
         });
     }
 public:

@@ -2728,6 +2728,59 @@ std::set<std::string> PreviousStatusKeys(const UniValue& status)
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_api_health_tests, ClientLaneFixture)
 
+BOOST_AUTO_TEST_CASE(client_shows_advertised_readiness_without_changing_endpoints)
+{
+    const auto path{m_path_root / "readiness-client"};
+    ScriptedEndpoint behind, older;
+    auto row{MarketRow(std::chrono::milliseconds{0})};
+    row.pushKV("health_api_version", 1);
+    row.pushKV("endpoint_ready", false);
+    UniValue codes{UniValue::VARR};
+    codes.push_back("catching_up");
+    row.pushKV("endpoint_not_ready", codes);
+    behind.markets.push_back(row);
+    older.markets.push_back(MarketRow(std::chrono::milliseconds{0}));
+    auto first{Serve(behind)};
+    auto second{Serve(older)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(first->Port()), Endpoint(second->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    auto status{client->Status()};
+    BOOST_REQUIRE_EQUAL(status.endpoints.size(), 2U);
+    BOOST_CHECK_EQUAL(status.endpoints[0].readiness, "not_ready");
+    BOOST_CHECK_EQUAL(status.endpoints[0].readiness_market, market.GetHex());
+    BOOST_CHECK((status.endpoints[0].not_ready == std::vector<std::string>{"catching_up"}));
+    BOOST_CHECK_GT(status.endpoints[0].readiness_observed_ms, 0);
+    BOOST_CHECK_EQUAL(status.endpoints[1].readiness, "unknown");
+    // Display only: the endpoint that reports itself not ready still serves
+    // the reads, exactly as before.
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_CHECK_EQUAL(behind.Counts()[3], 2U);
+    BOOST_CHECK_EQUAL(older.Counts()[3], 0U);
+    // A malformed hint is unknown and never fails the read.
+    {
+        std::lock_guard lock{behind.mutex};
+        auto malformed{MarketRow(std::chrono::milliseconds{0})};
+        malformed.pushKV("health_api_version", 1);
+        malformed.pushKV("endpoint_ready", "no");
+        malformed.pushKV("endpoint_not_ready", codes);
+        behind.markets = UniValue{UniValue::VARR};
+        behind.markets.push_back(malformed);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    status = client->Status();
+    BOOST_CHECK_EQUAL(status.endpoints[0].readiness, "unknown");
+    BOOST_CHECK(status.endpoints[0].readiness_market.empty());
+    BOOST_CHECK(status.endpoints[0].not_ready.empty());
+    BOOST_CHECK_EQUAL(status.endpoints[0].readiness_observed_ms, 0);
+    client.reset();
+    first->Stop();
+    second->Stop();
+}
+
 BOOST_AUTO_TEST_CASE(api_health_disabled_keeps_the_previous_contract)
 {
     node::FlowMeshService service{*m_node.chainman, m_path_root / "api-health-disabled"};

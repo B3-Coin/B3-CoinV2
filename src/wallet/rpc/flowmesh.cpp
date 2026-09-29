@@ -663,6 +663,12 @@ RPCResult ClientStatusResult()
                     {RPCResult::Type::NUM, "last_attempt_ms", "Unix time in milliseconds of last completed attempt, or zero"},
                     {RPCResult::Type::NUM, "retry_after_ms", "Unix time in milliseconds before another automatic read attempt, or zero"},
                     {RPCResult::Type::NUM, "consecutive_failures", "Consecutive transport failures; API or market errors do not impose a transport cooldown"},
+                    {RPCResult::Type::STR, "readiness", "What the endpoint last advertised about its own readiness: unknown (not advertised), ready or not_ready. Display only; never evidence and never used to choose an endpoint"},
+                    {RPCResult::Type::STR, "readiness_market", "Market that readiness was reported for, or empty"},
+                    {RPCResult::Type::ARR, "not_ready", "The endpoint's advertised not-ready codes; a code you do not know still means not ready", {
+                        {RPCResult::Type::STR, "", "Not-ready code"},
+                    }},
+                    {RPCResult::Type::NUM, "readiness_observed_ms", "Unix time in milliseconds of that observation, or zero"},
                 }},
             }},
         }};

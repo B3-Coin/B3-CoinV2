@@ -327,6 +327,14 @@ struct FlowMeshClientEndpointStatus {
     int64_t last_attempt_ms{0};
     int64_t retry_after_ms{0};
     uint32_t consecutive_failures{0};
+    //! What the endpoint last advertised about its own readiness in a status
+    //! object: "unknown" (not advertised), "ready" or "not_ready", for which
+    //! market, with its codes and when (Unix ms, or zero). Display only: never
+    //! evidence and never an input to endpoint selection or retries.
+    std::string readiness{"unknown"};
+    std::string readiness_market;
+    std::vector<std::string> not_ready;
+    int64_t readiness_observed_ms{0};
 };
 struct FlowMeshClientStatus {
     std::string backend{"local"};
