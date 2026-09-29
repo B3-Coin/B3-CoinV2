@@ -34,7 +34,8 @@ struct PoolFixture {
     std::vector<CKey> keys;
     const flowmesh::WireClock::time_point now{};
 
-    explicit PoolFixture(size_t accounts = 2)
+    explicit PoolFixture(size_t accounts = 2, const node::FlowMeshActionPoolLimits& limits = {})
+        : pool{limits}
     {
         for (size_t i{0}; i < accounts; ++i) keys.emplace_back().MakeNewKey(true);
         pool.SetVerifier([this](const flowmesh::Action& action) {
@@ -53,6 +54,11 @@ struct PoolFixture {
         action.type = static_cast<uint8_t>(type);
         if (type == flowmesh::ActionType::SUBMIT_BID || type == flowmesh::ActionType::SUBMIT_ASK) {
             action.curve = {{10, static_cast<CAmount>(sequence + 1)}};
+        }
+        if (type == flowmesh::ActionType::WITHDRAW) {
+            action.asset = modern::NativeAsset();
+            action.amount = 1;
+            action.destination = Filled(0x55);
         }
         BOOST_REQUIRE(flowmesh::SignAction(keys[account], domain, state.ConfigId(), action));
         return action;
@@ -212,6 +218,97 @@ BOOST_AUTO_TEST_CASE(restored_evidence_is_not_api_origin)
     flowmesh::test_only::StateFunding::SetNextSequence(h.state, h.Account(0), 1);
     BOOST_CHECK(h.pool.Prune(h.state).empty());
     BOOST_CHECK_EQUAL(h.pool.UnreportedDrops(), 1U);
+}
+
+namespace {
+node::FlowMeshActionPoolLimits SmallLimits()
+{
+    node::FlowMeshActionPoolLimits limits;
+    limits.market_count = 10;
+    limits.local_submit_reserve_count = 3;
+    return limits;
+}
+constexpr node::FlowMeshPoolAddContext LOCAL_ORDER{.api_origin = true, .priority_eligible = false};
+constexpr node::FlowMeshPoolAddContext LOCAL_HEAD_CANCEL{.api_origin = true, .priority_eligible = true};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(local_order_refused_when_only_reserve_left)
+{
+    using Code = flowmesh::ActionReasonCode;
+    PoolFixture f{1, SmallLimits()};
+    for (uint64_t n{0}; n < 7; ++n) {
+        BOOST_REQUIRE(f.pool.Add(f.Signed(0, n, flowmesh::ActionType::SUBMIT_BID), node::FLOWMESH_LOCAL_ACTION_PEER,
+                                 f.now, LOCAL_ORDER) == Code::ADMITTED);
+    }
+    // Only the reserve is left: local orders and local deposits stop.
+    BOOST_CHECK(f.pool.Add(f.Signed(0, 7, flowmesh::ActionType::SUBMIT_ASK), node::FLOWMESH_LOCAL_ACTION_PEER,
+                           f.now, LOCAL_ORDER) == Code::SUBMIT_LANE_FULL);
+    BOOST_CHECK(f.pool.Add(PoolFixture::Deposit(1), node::FLOWMESH_LOCAL_ACTION_PEER, f.now, LOCAL_ORDER) ==
+                Code::SUBMIT_LANE_FULL);
+    // local_cancel_and_withdraw_use_reserve: head cancels and withdrawals
+    // fill the reserve; then the pool is full for everyone.
+    PoolFixture g{3, SmallLimits()};
+    for (uint64_t n{0}; n < 7; ++n) {
+        BOOST_REQUIRE(g.pool.Add(g.Signed(0, n, flowmesh::ActionType::SUBMIT_BID), node::FLOWMESH_LOCAL_ACTION_PEER,
+                                 g.now, LOCAL_ORDER) == Code::ADMITTED);
+    }
+    BOOST_CHECK(g.pool.Add(g.Signed(1, 0, flowmesh::ActionType::CANCEL_BID), node::FLOWMESH_LOCAL_ACTION_PEER,
+                           g.now, LOCAL_HEAD_CANCEL) == Code::ADMITTED);
+    BOOST_CHECK(g.pool.Add(g.Signed(1, 1, flowmesh::ActionType::WITHDRAW), node::FLOWMESH_LOCAL_ACTION_PEER,
+                           g.now, LOCAL_HEAD_CANCEL) == Code::ADMITTED);
+    BOOST_CHECK(g.pool.Add(g.Signed(2, 0, flowmesh::ActionType::CANCEL_ASK), node::FLOWMESH_LOCAL_ACTION_PEER,
+                           g.now, LOCAL_HEAD_CANCEL) == Code::ADMITTED);
+    BOOST_CHECK_EQUAL(g.pool.Size(), 10U);
+    BOOST_CHECK(g.pool.Add(g.Signed(2, 1, flowmesh::ActionType::CANCEL_BID), node::FLOWMESH_LOCAL_ACTION_PEER,
+                           g.now, LOCAL_HEAD_CANCEL) == Code::POOL_FULL);
+}
+
+BOOST_AUTO_TEST_CASE(far_head_priority_action_cannot_use_reserve)
+{
+    PoolFixture f{2, SmallLimits()};
+    for (uint64_t n{0}; n < 7; ++n) {
+        BOOST_REQUIRE(f.pool.Add(f.Signed(0, n, flowmesh::ActionType::SUBMIT_BID), node::FLOWMESH_LOCAL_ACTION_PEER,
+                                 f.now, LOCAL_ORDER) == flowmesh::ActionReasonCode::ADMITTED);
+    }
+    // A cancel that is not at the head of its account is not priority.
+    BOOST_CHECK(f.pool.Add(f.Signed(1, 20, flowmesh::ActionType::CANCEL_BID), node::FLOWMESH_LOCAL_ACTION_PEER, f.now,
+                           LOCAL_ORDER) == flowmesh::ActionReasonCode::SUBMIT_LANE_FULL);
+    BOOST_CHECK_EQUAL(node::FLOWMESH_POOL_PRIORITY_SEQUENCE_AHEAD, 16U);
+}
+
+BOOST_AUTO_TEST_CASE(remote_and_retained_evidence_use_full_capacity)
+{
+    PoolFixture f{1, SmallLimits()};
+    for (uint64_t n{0}; n < 5; ++n) {
+        BOOST_REQUIRE(f.pool.Add(f.Signed(0, n, flowmesh::ActionType::SUBMIT_BID), 7, f.now) ==
+                      flowmesh::ActionReasonCode::ADMITTED);
+    }
+    for (uint64_t n{5}; n < 10; ++n) {
+        BOOST_REQUIRE(f.pool.Add(f.Signed(0, n, flowmesh::ActionType::SUBMIT_ASK), node::FLOWMESH_LOCAL_ACTION_PEER,
+                                 f.now, {}) == flowmesh::ActionReasonCode::ADMITTED);
+    }
+    BOOST_CHECK_EQUAL(f.pool.Size(), 10U);
+    // The byte reserve binds the same way as the count reserve.
+    node::FlowMeshActionPoolLimits bytes;
+    bytes.local_submit_reserve_count = 0;
+    const auto probe{f.Signed(0, 0, flowmesh::ActionType::SUBMIT_BID)};
+    const size_t one{static_cast<size_t>(::GetSerializeSize(probe))};
+    bytes.market_bytes = 4 * one;
+    bytes.local_submit_reserve_bytes = 2 * one;
+    PoolFixture g{1, bytes};
+    for (uint64_t n{0}; n < 2; ++n) {
+        BOOST_REQUIRE(g.pool.Add(g.Signed(0, n, flowmesh::ActionType::SUBMIT_BID), node::FLOWMESH_LOCAL_ACTION_PEER,
+                                 g.now, LOCAL_ORDER) == flowmesh::ActionReasonCode::ADMITTED);
+    }
+    BOOST_CHECK(g.pool.Add(g.Signed(0, 2, flowmesh::ActionType::SUBMIT_BID), node::FLOWMESH_LOCAL_ACTION_PEER, g.now,
+                           LOCAL_ORDER) == flowmesh::ActionReasonCode::SUBMIT_LANE_FULL);
+    BOOST_CHECK(g.pool.Add(g.Signed(0, 2, flowmesh::ActionType::SUBMIT_BID), 9, g.now) ==
+                flowmesh::ActionReasonCode::ADMITTED);
+    // peer_quota_unchanged_256: production defaults keep the per-peer bound.
+    const node::FlowMeshActionPoolLimits production;
+    BOOST_CHECK_EQUAL(production.peer_count, 256U);
+    BOOST_CHECK_EQUAL(production.market_count, 65'536U);
+    BOOST_CHECK_EQUAL(production.local_submit_reserve_count, 4096U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

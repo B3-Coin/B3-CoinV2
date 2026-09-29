@@ -15,6 +15,7 @@
 #include <serialize.h>
 #include <uint256.h>
 
+#include <algorithm>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -33,10 +34,31 @@ inline constexpr flowmesh::WirePeerId FLOWMESH_LOCAL_ACTION_PEER{
     std::numeric_limits<flowmesh::WirePeerId>::min()};
 
 /** Pool admission context. Only this node's own API/RPC submissions are
- * api_origin; retained candidate evidence restored at start is not. */
+ * api_origin; retained candidate evidence restored at start is not.
+ * priority_eligible: an API-origin cancel, withdrawal or reward claim within
+ * FLOWMESH_POOL_PRIORITY_SEQUENCE_AHEAD of its signer's next sequence. */
 struct FlowMeshPoolAddContext {
     bool api_origin{false};
     bool priority_eligible{false};
+};
+
+//! A local cancel/withdrawal/claim this close to its signer's certified next
+//! sequence may use the reserved pool capacity.
+inline constexpr uint64_t FLOWMESH_POOL_PRIORITY_SEQUENCE_AHEAD{16};
+
+/** Pool bounds. The defaults are the production values (flowmesh/p2p.h);
+ * tests may inject smaller ones. */
+struct FlowMeshActionPoolLimits {
+    size_t market_count{flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_COUNT};
+    size_t market_bytes{flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_BYTES};
+    size_t peer_count{flowmesh::FLOWMESH_ACTION_POOL_PER_PEER_MARKET_COUNT};
+    size_t peer_bytes{flowmesh::FLOWMESH_ACTION_POOL_PER_PEER_MARKET_BYTES};
+    //! The last part of the market capacity is kept for this node's own
+    //! priority-eligible cancels, withdrawals and claims: its other API
+    //! submissions (orders, deposits, far-ahead actions) cannot use it.
+    //! Remote frames and restored evidence always have full capacity.
+    size_t local_submit_reserve_count{4096};
+    size_t local_submit_reserve_bytes{1U << 20};
 };
 
 /**
@@ -49,8 +71,10 @@ class FlowMeshActionPool
 {
 public:
     using Verifier = std::function<bool(const flowmesh::Action&)>;
-
     using AddContext = FlowMeshPoolAddContext;
+
+    FlowMeshActionPool() = default;
+    explicit FlowMeshActionPool(const FlowMeshActionPoolLimits& limits) : m_limits{limits} {}
 
     void SetVerifier(Verifier verifier) { m_verifier = std::move(verifier); }
 
@@ -67,19 +91,23 @@ public:
         const uint256 id{action.Id()};
         if (m_actions.count(id) != 0) return Code::DUPLICATE_PENDING;
         const size_t bytes{static_cast<size_t>(::GetSerializeSize(action))};
-        if (m_actions.size() >= flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_COUNT ||
-            bytes > flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_BYTES ||
-            m_bytes > flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_BYTES - bytes) {
+        if (m_actions.size() >= m_limits.market_count || bytes > m_limits.market_bytes ||
+            m_bytes > m_limits.market_bytes - bytes) {
             return Code::POOL_FULL;
+        }
+        // This node's own non-priority submissions stop short of the reserve,
+        // which stays available to its head cancels and withdrawals.
+        if (context.api_origin && !context.priority_eligible) {
+            const size_t count_cap{m_limits.market_count - std::min(m_limits.market_count, m_limits.local_submit_reserve_count)};
+            const size_t byte_cap{m_limits.market_bytes - std::min(m_limits.market_bytes, m_limits.local_submit_reserve_bytes)};
+            if (m_actions.size() >= count_cap || bytes > byte_cap || m_bytes > byte_cap - bytes) {
+                return Code::SUBMIT_LANE_FULL;
+            }
         }
         if (origin != FLOWMESH_LOCAL_ACTION_PEER) {
             const Usage& usage{m_peer_usage[origin]};
-            if (usage.count >=
-                    flowmesh::FLOWMESH_ACTION_POOL_PER_PEER_MARKET_COUNT ||
-                bytes > flowmesh::FLOWMESH_ACTION_POOL_PER_PEER_MARKET_BYTES ||
-                usage.bytes >
-                    flowmesh::FLOWMESH_ACTION_POOL_PER_PEER_MARKET_BYTES -
-                        bytes) {
+            if (usage.count >= m_limits.peer_count || bytes > m_limits.peer_bytes ||
+                usage.bytes > m_limits.peer_bytes - bytes) {
                 return Code::PEER_QUOTA;
             }
         }
@@ -422,6 +450,7 @@ private:
         size_t bytes{0};
     };
 
+    FlowMeshActionPoolLimits m_limits{};
     Verifier m_verifier;
     std::map<uint256, StoredAction> m_actions;
     std::list<uint256> m_pending_forwards; // one ID, no payload, per stored action

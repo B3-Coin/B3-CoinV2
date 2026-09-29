@@ -4581,7 +4581,16 @@ void FlowMeshRuntime::HandleAction(
             return;
         }
     }
-    const auto added{market.pool.Add(*action, peer, market.clock->Now(), {.api_origin = local})};
+    // A local head cancel/withdrawal/claim may use the reserved capacity;
+    // every other local submission stops short of it.
+    const auto type{static_cast<flowmesh::ActionType>(action->type)};
+    const bool priority_eligible{local && !action->IsDeposit() &&
+        (type == flowmesh::ActionType::CANCEL_BID || type == flowmesh::ActionType::CANCEL_ASK ||
+         type == flowmesh::ActionType::WITHDRAW || type == flowmesh::ActionType::CLAIM_SEAT_REWARD) &&
+        action->sequence >= market.state.NextSequence(action->signer) &&
+        action->sequence - market.state.NextSequence(action->signer) < FLOWMESH_POOL_PRIORITY_SEQUENCE_AHEAD};
+    const auto added{market.pool.Add(*action, peer, market.clock->Now(),
+                                      {.api_origin = local, .priority_eligible = priority_eligible})};
     if (added != flowmesh::ActionReasonCode::ADMITTED) {
         const bool already_admitted{market.pool.ContainsExact(*action)};
         // Existing texts, byte-identical; only the memory-only code is new.
@@ -4591,7 +4600,9 @@ void FlowMeshRuntime::HandleAction(
         ClientActionEvent(market, already_admitted ? flowmesh::ClientEventKind::POOL_ADMITTED
                                                    : flowmesh::ClientEventKind::POOL_REFUSED,
                           *action, already_admitted ? "exact signed action already present in pool"
-                              : "pool refused this attempt (authentication, conflicting sequence or capacity); not an execution result",
+                              : code == flowmesh::ActionReasonCode::SUBMIT_LANE_FULL
+                                  ? "pool capacity reserved for cancels and withdrawals; this order was not admitted"
+                                  : "pool refused this attempt (authentication, conflicting sequence or capacity); not an execution result",
                           nullptr, code);
         if (peer != LOCAL_ACTION_PEER) {
             market.pool.QueueDuplicateForward(*action, message, peer,
