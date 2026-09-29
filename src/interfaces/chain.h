@@ -286,6 +286,50 @@ struct FlowMeshMarketStatus {
     std::string endpoint;
 };
 
+//! A per-action execution outcome this client VERIFIED: recomputed from data
+//! that hashes to the quorum-certified result root of the including entry
+//! (or taken from the local engine's own re-execution), or proven impossible
+//! because a different certified action consumed its sequence.
+struct FlowMeshActionOutcome {
+    //! applied | rejected | included_not_executed | not_executed
+    std::string status;
+    //! The outcome can never change (applied, rejected by state, malformed,
+    //! not_executed). BAD_SEQUENCE/EQUIVOCATION inclusions and an uncredited
+    //! deposit are not final: the same bytes may still execute later.
+    bool final{false};
+    //! flowmesh::ActionReasonCode name.
+    std::string reason_code;
+    //! certified_result_preimage | local_engine_execution | certified_sequence_consumer
+    std::string evidence;
+    uint64_t microblock_sequence{0};
+    uint256 microblock_hash;
+    struct Fill {
+        std::string side;
+        bool cleared{false}, superseded_in_entry{false};
+        CAmount quantity{0}, price{0}, quote_atoms{0}, fee_atoms{0}, net_quote_atoms{0};
+    };
+    std::optional<Fill> fill;
+    struct Withdrawal {
+        uint256 receipt_id;
+        uint256 asset;
+        CAmount amount{0};
+    };
+    std::optional<Withdrawal> withdrawal;
+    struct Deposit {
+        COutPoint outpoint;
+        uint256 asset;
+        CAmount amount{0};
+    };
+    std::optional<Deposit> deposit;
+    struct ConsumedBy {
+        uint256 action_id;
+        uint64_t microblock_sequence{0};
+        uint256 microblock_hash;
+    };
+    //! not_executed only: the certified action that consumed the sequence.
+    std::optional<ConsumedBy> consumed_by;
+};
+
 //! Never equate local queue admission, a network write, or an endpoint reply
 //! with pool admission, certified inclusion, or a successfully executed action.
 struct FlowMeshActionReceipt {
@@ -302,6 +346,10 @@ struct FlowMeshActionReceipt {
     //! flowmesh::ActionReasonCode name of the observation or outcome this
     //! receipt reports, or empty. Never evidence by itself.
     std::string reason_code;
+    //! Display stage, computed only by node::FlowMeshReceiptStage.
+    std::string stage;
+    //! Present exactly when outcome_verified.
+    std::optional<FlowMeshActionOutcome> outcome;
     bool Admitted() const { return state == "queued" || state == "admitted" || state == "certified_inclusion"; }
 };
 

@@ -1,6 +1,9 @@
 // Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see COPYING.
 #include <node/flowmesh_client.h>
+
+#include <flowmesh/action_reason.h>
+
 #include <algorithm>
 namespace node {
 static UniValue MarketCurvesJson(const std::vector<flowmesh::ClearingEngine::CurveView>& curves)
@@ -157,6 +160,56 @@ UniValue FlowMeshClientReceiptJson(const interfaces::FlowMeshActionReceipt& rece
     }
     if (scope != FlowMeshReceiptJsonScope::PUBLIC_V1 && !receipt.reason_code.empty()) {
         out.pushKV("reason_code", receipt.reason_code);
+    }
+    if (scope != FlowMeshReceiptJsonScope::LOCAL_RPC) return out;
+    if (!receipt.stage.empty()) out.pushKV("stage", receipt.stage);
+    if (receipt.outcome && receipt.outcome_verified) out.pushKV("outcome", FlowMeshActionOutcomeJson(*receipt.outcome));
+    return out;
+}
+UniValue FlowMeshActionOutcomeJson(const interfaces::FlowMeshActionOutcome& outcome)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("status", outcome.status);
+    out.pushKV("final", outcome.final);
+    out.pushKV("reason_code", outcome.reason_code);
+    const auto* info{flowmesh::ActionReasonLookup(outcome.reason_code)};
+    out.pushKV("reason_text", info ? std::string{info->ui_text} : std::string{"Unrecognised reason; outcome unchanged."});
+    out.pushKV("evidence", outcome.evidence);
+    out.pushKV("microblock_sequence", outcome.microblock_sequence);
+    out.pushKV("microblock_hash", outcome.microblock_hash.GetHex());
+    if (outcome.fill) {
+        UniValue fill{UniValue::VOBJ};
+        fill.pushKV("side", outcome.fill->side);
+        fill.pushKV("cleared", outcome.fill->cleared);
+        fill.pushKV("superseded_in_entry", outcome.fill->superseded_in_entry);
+        fill.pushKV("quantity", outcome.fill->quantity);
+        fill.pushKV("price", outcome.fill->price);
+        fill.pushKV("quote_atoms", outcome.fill->quote_atoms);
+        fill.pushKV("fee_atoms", outcome.fill->fee_atoms);
+        fill.pushKV("net_quote_atoms", outcome.fill->net_quote_atoms);
+        out.pushKV("fill", std::move(fill));
+    }
+    if (outcome.withdrawal) {
+        UniValue withdrawal{UniValue::VOBJ};
+        withdrawal.pushKV("receipt_id", outcome.withdrawal->receipt_id.GetHex());
+        withdrawal.pushKV("asset", outcome.withdrawal->asset.GetHex());
+        withdrawal.pushKV("amount", outcome.withdrawal->amount);
+        out.pushKV("withdrawal", std::move(withdrawal));
+    }
+    if (outcome.deposit) {
+        UniValue deposit{UniValue::VOBJ};
+        deposit.pushKV("txid", outcome.deposit->outpoint.hash.GetHex());
+        deposit.pushKV("vout", outcome.deposit->outpoint.n);
+        deposit.pushKV("asset", outcome.deposit->asset.GetHex());
+        deposit.pushKV("amount", outcome.deposit->amount);
+        out.pushKV("deposit", std::move(deposit));
+    }
+    if (outcome.consumed_by) {
+        UniValue consumer{UniValue::VOBJ};
+        consumer.pushKV("action_id", outcome.consumed_by->action_id.GetHex());
+        consumer.pushKV("microblock_sequence", outcome.consumed_by->microblock_sequence);
+        consumer.pushKV("microblock_hash", outcome.consumed_by->microblock_hash.GetHex());
+        out.pushKV("consumed_by", std::move(consumer));
     }
     return out;
 }

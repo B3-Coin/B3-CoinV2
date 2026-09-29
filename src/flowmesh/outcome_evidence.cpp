@@ -461,11 +461,20 @@ bool ProvesSequenceConsumedByOther(const ProductionEntryCore& entry,
                                    const ExecutionOutcomeEvidenceV1& evidence,
                                    const Action& action, const uint256& consumer_id)
 {
-    if (action.IsDeposit() || consumer_id == action.Id()) return false;
+    if (action.IsDeposit()) return false;
+    return ProvesSequenceConsumedByOther(entry, evidence, action.Id(), action.signer, action.sequence, consumer_id);
+}
+
+bool ProvesSequenceConsumedByOther(const ProductionEntryCore& entry,
+                                   const ExecutionOutcomeEvidenceV1& evidence,
+                                   const uint256& action_id, const AccountId& signer, const uint64_t sequence,
+                                   const uint256& consumer_id)
+{
+    if (consumer_id == action_id || signer.IsNull()) return false;
     const auto consumer{std::find_if(entry.actions.begin(), entry.actions.end(),
                                      [&](const Action& item) { return item.Id() == consumer_id; })};
     if (consumer == entry.actions.end() || consumer->IsDeposit() ||
-        consumer->signer != action.signer || consumer->sequence != action.sequence) {
+        consumer->signer != signer || consumer->sequence != sequence) {
         return false;
     }
     const auto& p{evidence.preimage};

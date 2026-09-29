@@ -6,6 +6,7 @@
 #include <node/flowmesh_api_admission.h>
 #include <node/flowmesh_client_action_wait.h>
 #include <node/flowmesh_client_join.h>
+#include <node/flowmesh_client_outcome.h>
 #include <node/flowmesh_client_poll.h>
 #include <node/flowmesh_client_readiness.h>
 #include <node/flowmesh_client_work.h>
@@ -159,6 +160,89 @@ Receipt LocalActionReceipt(const std::optional<flowmesh::ClientEvent>& status, c
 class LocalBackend final : public FlowMeshTradingBackend {
     FlowMeshService& m_service;
     const FlowMeshAssetMetadataCatalog m_metadata;
+    // Derived local outcomes, FIFO-bounded: a status poll never derives the
+    // same outcome twice and never reads the store.
+    static constexpr size_t OUTCOME_CACHE_ENTRIES{1024};
+    std::mutex m_outcome_mutex;
+    std::map<std::pair<uint256, uint256>, interfaces::FlowMeshActionOutcome> m_outcomes;
+    std::deque<std::pair<uint256, uint256>> m_outcome_order;
+
+    static void ApplyOutcome(Receipt& receipt, const interfaces::FlowMeshActionOutcome& outcome)
+    {
+        receipt.outcome = outcome;
+        receipt.outcome_verified = true;
+        receipt.reason_code = outcome.reason_code;
+        if (outcome.status == "not_executed") {
+            receipt.state = "rejected";
+            receipt.certificate_verified = false;
+            receipt.microblock_hash.SetNull();
+            receipt.microblock_sequence = 0;
+            receipt.reason = "Never executes: its account sequence was used by another certified action in microblock #" +
+                             std::to_string(outcome.microblock_sequence);
+        }
+    }
+
+    //! Verified outcome from this engine's own retained re-execution: for a
+    //! certified inclusion, the derivation over its entry; otherwise, when a
+    //! newer local notice names a consumer, the proof that the action never
+    //! executes. Memory only; encodes and verifies outside runtime locks.
+    void AttachOutcome(const uint256& market, Receipt& receipt)
+    {
+        const std::pair key{market, receipt.action_id};
+        const bool included{receipt.state == "certified_inclusion" && receipt.certificate_verified};
+        {
+            std::lock_guard lock{m_outcome_mutex};
+            if (const auto it{m_outcomes.find(key)}; it != m_outcomes.end()) {
+                const bool usable{it->second.status == "not_executed"
+                    ? !included : included && it->second.microblock_hash == receipt.microblock_hash};
+                if (usable) {
+                    ApplyOutcome(receipt, it->second);
+                    return;
+                }
+            }
+        }
+        std::optional<interfaces::FlowMeshActionOutcome> derived;
+        if (included) {
+            const auto parts{m_service.ClientOutcomeParts(market, receipt.microblock_sequence, receipt.microblock_hash, true)};
+            if (!parts.found || !parts.envelope || !parts.outcome || parts.outcome->too_large) return;
+            const auto& entry{parts.envelope->entry};
+            const auto action{std::find_if(entry.actions.begin(), entry.actions.end(),
+                                           [&](const auto& item) { return item.Id() == receipt.action_id; })};
+            if (action == entry.actions.end()) return;
+            const auto evidence{FlowMeshRecordEvidence(*parts.outcome)};
+            if (flowmesh::VerifyExecutionOutcomeEvidence(entry, evidence) != flowmesh::OutcomeEvidenceCheck::OK) return;
+            const auto outcome{flowmesh::DeriveActionOutcome(entry, evidence, *action)};
+            if (!outcome) return;
+            derived = FlowMeshReceiptOutcome(*outcome, receipt.microblock_sequence, receipt.microblock_hash,
+                                             "local_engine_execution");
+        } else {
+            const auto notice{m_service.NewestClientNoticeIfNewer(market, receipt.action_id)};
+            if (!notice || !notice->consumed_by ||
+                (notice->code != flowmesh::ActionReasonCode::STALE_SEQUENCE &&
+                 notice->code != flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED)) return;
+            const auto& consumer{*notice->consumed_by};
+            const auto parts{m_service.ClientOutcomeParts(market, consumer.microblock_sequence, consumer.microblock_hash, true)};
+            if (!parts.found || !parts.envelope || !parts.outcome || parts.outcome->too_large) return;
+            const auto evidence{FlowMeshRecordEvidence(*parts.outcome)};
+            if (flowmesh::VerifyExecutionOutcomeEvidence(parts.envelope->entry, evidence) != flowmesh::OutcomeEvidenceCheck::OK ||
+                !flowmesh::ProvesSequenceConsumedByOther(parts.envelope->entry, evidence, receipt.action_id,
+                                                         notice->account_id, notice->account_sequence, consumer.action_id)) {
+                return;
+            }
+            derived = FlowMeshNotExecutedOutcome(consumer.action_id, consumer.microblock_sequence, consumer.microblock_hash);
+        }
+        {
+            std::lock_guard lock{m_outcome_mutex};
+            if (m_outcomes.insert_or_assign(key, *derived).second) {
+                m_outcome_order.push_back(key);
+                if (m_outcome_order.size() > OUTCOME_CACHE_ENTRIES) {
+                    m_outcomes.erase(m_outcome_order.front());
+                    m_outcome_order.pop_front();
+                }
+            }
+        }
+        ApplyOutcome(receipt, *derived);
+    }
 public:
     explicit LocalBackend(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata = {})
         : m_service(service), m_metadata(std::move(metadata)) {}
@@ -239,6 +323,7 @@ public:
             out.microblock_hash = submitted.admission.included->second;
             out.certificate_verified = true;
             out.reason = FlowMeshLocalAdmissionText(submitted.admission);
+            AttachOutcome(id, out);
             return out;
         case FlowMeshLocalAdmission::Kind::REFUSE:
             out.state = "rejected";
@@ -266,6 +351,7 @@ public:
             if (status->kind != flowmesh::ClientEventKind::POOL_REFUSED || this_attempt) out = EventReceipt(*status);
         }
         if (out.state == "certified_inclusion") out.certificate_verified = true;
+        AttachOutcome(id, out);
         return out;
     }
     // The local engine's status is already current: there is no transport to
@@ -274,6 +360,19 @@ public:
                          std::chrono::milliseconds wait = std::chrono::milliseconds{0}) override
     {
         auto out{LocalActionReceipt(m_service.ClientActionStatus(id, action), action)};
+        if (out.state != "certified_inclusion") {
+            // This engine's own recent certified window still knows an
+            // inclusion whose event left the ring.
+            if (const auto included{m_service.ClientRecentInclusion(id, action)}) {
+                out = LocalActionReceipt(std::nullopt, action);
+                out.state = "certified_inclusion";
+                out.microblock_sequence = included->first;
+                out.microblock_hash = included->second;
+                out.certificate_verified = true;
+                out.reason = "certified inclusion retained by this engine";
+            }
+        }
+        AttachOutcome(id, out);
         if (retry) out.reason += "; local retry requires the retained original signed action";
         return out;
     }
@@ -644,7 +743,12 @@ public:
             if (!market) Fail("Unknown market");
             if (!action->IsDeposit() && !flowmesh::SchnorrActionAuthenticator(market->domain, market->execution_config_id).Authenticate(*action))
                 Fail("Action authentication failed for this chain/domain/market configuration");
-            return FlowMeshClientReceiptJson(m_local.Submit(id, *action));
+            auto receipt{m_local.Submit(id, *action)};
+            // The public submit reply keeps its v1 meaning: an endpoint never
+            // states a verified outcome there (clients ignore endpoint booleans).
+            receipt.outcome.reset();
+            receipt.outcome_verified = false;
+            return FlowMeshClientReceiptJson(receipt);
         }
         if (method == "action") {
             // Disabled, the contract is exactly the previous one, in which

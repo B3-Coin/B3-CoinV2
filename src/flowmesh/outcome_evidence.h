@@ -157,6 +157,12 @@ std::optional<DerivedActionOutcome> DeriveActionOutcome(const ProductionEntryCor
 bool ProvesSequenceConsumedByOther(const ProductionEntryCore& entry,
                                    const ExecutionOutcomeEvidenceV1& evidence,
                                    const Action& action, const uint256& consumer_id);
+//! The same proof for a signed action known only by its id, signer and
+//! account sequence.
+bool ProvesSequenceConsumedByOther(const ProductionEntryCore& entry,
+                                   const ExecutionOutcomeEvidenceV1& evidence,
+                                   const uint256& action_id, const AccountId& signer, uint64_t sequence,
+                                   const uint256& consumer_id);
 
 } // namespace flowmesh
 

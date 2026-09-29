@@ -124,10 +124,13 @@ std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);
 //! PUBLIC_V1 writes exactly the previous receipt keys (updates, submit, a v1
 //! 'action' reply, the outbox row). PUBLIC_OUTCOME_V1 (an opt-in 'action'
-//! reply) adds reason_code when known; LOCAL_RPC adds it too.
+//! reply) adds reason_code when known; LOCAL_RPC adds it, the display stage
+//! and the verified outcome.
 enum class FlowMeshReceiptJsonScope : uint8_t { PUBLIC_V1, PUBLIC_OUTCOME_V1, LOCAL_RPC };
 UniValue FlowMeshClientReceiptJson(const interfaces::FlowMeshActionReceipt& receipt,
                                    FlowMeshReceiptJsonScope scope = FlowMeshReceiptJsonScope::PUBLIC_V1);
+//! The verified outcome object of a LOCAL_RPC receipt.
+UniValue FlowMeshActionOutcomeJson(const interfaces::FlowMeshActionOutcome& outcome);
 UniValue FlowMeshClientStatusJson(const interfaces::FlowMeshClientStatus& status);
 } // namespace node
 #endif
