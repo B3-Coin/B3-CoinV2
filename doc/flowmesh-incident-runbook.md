@@ -41,6 +41,15 @@ because of it.
   says "v1 opens no separate port". Both ports are separate listeners.
 - `-flowmeshapihealth=1` (the default) serves `health` and the readiness keys.
   With `=0` the API keeps its previous contract exactly.
+- Why the default is on: the three readiness keys (`health_api_version`,
+  `endpoint_ready`, `endpoint_not_ready`) are additive, like
+  `action_wait_ms_max` before them. c10c952 and f8a3432 clients read status
+  objects only by named field and never reject or copy an unknown status
+  key, so they take the same values and do the same things with the keys
+  present (unit test
+  `previous_clients_take_the_same_from_status_objects_with_added_keys`).
+  Their reply bytes are identical only with `=0`; set it on an API node that
+  must serve byte-identical replies.
 
 ## 3. Monitoring and the status page
 

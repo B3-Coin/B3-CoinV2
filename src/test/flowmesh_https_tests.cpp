@@ -28,6 +28,7 @@
 #include <node/flowmesh_vault_index.h>
 #include <node/fn_seat_index.h>
 #include <primitives/block.h>
+#include <test/util/common.h>
 #include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
@@ -3801,6 +3802,110 @@ std::set<std::string> PreviousStatusKeys(const UniValue& status)
     }
     return out;
 }
+
+// The field readers of the c10c952 and f8a3432 remote clients
+// (src/node/flowmesh_client.cpp at both revisions; identical there), copied
+// verbatim apart from their names.
+[[noreturn]] void PreviousFail(const std::string& reason) { throw std::runtime_error(reason); }
+std::string PreviousText(const UniValue& object, const char* key, size_t maximum = 1024)
+{
+    const auto& value{object[key]};
+    if (!value.isStr() || value.get_str().size() > maximum) PreviousFail(std::string{"Invalid text: "} + key);
+    return value.get_str();
+}
+uint256 PreviousId(const UniValue& object, const char* key, bool zero = false)
+{
+    const auto text{PreviousText(object, key, 64)};
+    const auto hash{uint256::FromHex(text)};
+    if (text.size() != 64 || !hash || (!zero && hash->IsNull())) PreviousFail(std::string{"Invalid identifier: "} + key);
+    return *hash;
+}
+uint64_t PreviousNumber(const UniValue& object, const char* key, uint64_t maximum = INT64_MAX)
+{
+    if (!object[key].isNum()) PreviousFail(std::string{"Expected integer: "} + key);
+    const auto value{object[key].getInt<uint64_t>()};
+    if (value > maximum) PreviousFail(std::string{"Integer exceeds client bound: "} + key);
+    return value;
+}
+bool PreviousFlag(const UniValue& object, const char* key)
+{
+    if (!object[key].isBool()) PreviousFail(std::string{"Expected boolean: "} + key);
+    return object[key].get_bool();
+}
+
+/** Everything a c10c952 or f8a3432 remote client takes from one status
+ * object. Their RemoteBackend reads status objects only by named field:
+ * CheckStatus (market rows and every snapshot and updates reply), the
+ * reported head in Refresh, Project, Market, LearnMetadata's presence check
+ * and, in f8a3432 only, FlowMeshAdvertisedActionWait. Their strict Keys()
+ * check covers only their own requests, the {ok, result, error} envelope,
+ * cursor rows and the endpoint file, never a status object; and neither
+ * copies a status object into anything it returns. So a status key these
+ * readers do not name cannot change what either client does. */
+struct PreviousClientStatusRead {
+    uint256 domain, market_id, base_asset_id, vault_id, execution_config_id;
+    std::string quote_asset;
+    bool running{false}, paused{false}, pending_handoff{false}, chain_reconciling{false};
+    std::string halt, error;
+    uint64_t next_microblock_sequence{0};
+    uint256 last_microblock_hash;
+    uint64_t round{0}, pending_actions{0};
+    bool checkpoint_pending{false};
+    uint256 pending_checkpoint_id;
+    uint64_t pending_checkpoint_sequence{0}, pending_checkpoint_effect_count{0};
+    bool asset_display{false};
+    //! f8a3432 only; c10c952 has no action wait.
+    int64_t action_wait_ms{0};
+
+    friend bool operator==(const PreviousClientStatusRead&, const PreviousClientStatusRead&) = default;
+};
+
+//! f8a3432's FlowMeshAdvertisedActionWait, verbatim.
+std::chrono::milliseconds PreviousAdvertisedActionWait(const UniValue& status) noexcept
+{
+    try {
+        if (!status.isObject()) return {};
+        const auto& value{status.find_value("action_wait_ms_max")};
+        if (!value.isNum()) return {};
+        return std::chrono::milliseconds{std::min<uint64_t>(value.getInt<uint64_t>(), node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count())};
+    } catch (...) {
+        return {};
+    }
+}
+
+//! Every read in the order those clients make them; throws where they fail.
+PreviousClientStatusRead ReadAsPreviousClients(const UniValue& value)
+{
+    PreviousClientStatusRead out;
+    // CheckStatus (the pins are compared by the caller).
+    out.domain = PreviousId(value, "domain");
+    out.market_id = PreviousId(value, "market_id");
+    out.base_asset_id = PreviousId(value, "base_asset_id");
+    out.vault_id = PreviousId(value, "vault_id");
+    out.execution_config_id = PreviousId(value, "execution_config_id");
+    out.quote_asset = PreviousText(value, "quote_asset");
+    out.running = PreviousFlag(value, "running");
+    out.paused = PreviousFlag(value, "paused");
+    out.pending_handoff = PreviousFlag(value, "pending_handoff");
+    if (value.exists("chain_reconciling")) out.chain_reconciling = PreviousFlag(value, "chain_reconciling");
+    out.halt = PreviousText(value, "halt");
+    out.error = PreviousText(value, "error");
+    out.next_microblock_sequence = PreviousNumber(value, "next_microblock_sequence");
+    out.last_microblock_hash = PreviousId(value, "last_microblock_hash", true);
+    // Project and Market.
+    out.round = PreviousNumber(value, "round", UINT32_MAX);
+    out.pending_actions = PreviousNumber(value, "pending_actions", 65536);
+    out.checkpoint_pending = PreviousFlag(value, "checkpoint_pending");
+    if (out.checkpoint_pending) {
+        out.pending_checkpoint_id = PreviousId(value, "pending_checkpoint_id");
+        out.pending_checkpoint_sequence = PreviousNumber(value, "pending_checkpoint_sequence");
+        out.pending_checkpoint_effect_count = PreviousNumber(value, "pending_checkpoint_effect_count", UINT32_MAX);
+    }
+    // LearnMetadata parses only this one named object, when present.
+    out.asset_display = value.exists("asset_display");
+    out.action_wait_ms = PreviousAdvertisedActionWait(value).count();
+    return out;
+}
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_api_health_tests, ClientLaneFixture)
@@ -3881,6 +3986,74 @@ BOOST_AUTO_TEST_CASE(api_health_disabled_keeps_the_previous_contract)
     auto keys{PreviousStatusKeys(updates["result"]["status"])};
     keys.insert("chain_reconciling");
     BOOST_CHECK(KeySet(updates["result"]["status"]) == keys);
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(previous_clients_take_the_same_from_status_objects_with_added_keys)
+{
+    // -flowmeshapihealth defaults to 1, like the other additive status
+    // adverts, so the status objects c10c952 and f8a3432 clients read carry
+    // keys they never name. The replies are not byte-identical; what those
+    // clients take from them, and so what they do, is.
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-status-previous-clients"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    // Every additive status capability of this revision on, as init enables
+    // them by default (and the default-off watch too).
+    auto api{node::MakeFlowMeshTradingApi(
+        service, Options(), {},
+        {node::FLOWMESH_API_ACTION_WAIT_DEFAULT, node::FLOWMESH_API_ACTION_WAITERS_DEFAULT, true},
+        {true}, {true}, {std::chrono::milliseconds{2000}, 2}, {node::FLOWMESH_API_CLEARING_TICKS_DEFAULT})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    const std::string one_market{"{\"market_id\":\"" + market.GetHex() + "\"}"};
+    const std::set<std::string> added{"health_api_version", "endpoint_ready", "endpoint_not_ready",
+                                      "submit_wait_ms_max", "updates_watch_ms_max", "action_outcome_v1",
+                                      "clearing_ticks_max"};
+
+    const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+    BOOST_REQUIRE_EQUAL(markets_status, 200);
+    BOOST_REQUIRE_EQUAL(markets["result"].size(), 1U);
+    const auto [updates_status, updates]{ApiCall(endpoint, "updates", one_market)};
+    BOOST_REQUIRE_MESSAGE(updates_status == 200, updates.write());
+    for (const UniValue* object : {&markets["result"][0], &updates["result"]["status"]}) {
+        // What an f8a3432 server sends: the keys it names and no others.
+        auto previous_keys{PreviousStatusKeys(*object)};
+        previous_keys.insert("action_wait_ms_max");
+        if (object == &updates["result"]["status"]) previous_keys.insert("chain_reconciling");
+        auto expected{previous_keys};
+        expected.insert(added.begin(), added.end());
+        BOOST_REQUIRE(KeySet(*object) == expected);
+        UniValue previous{UniValue::VOBJ};
+        for (size_t i{0}; i < object->size(); ++i) {
+            if (previous_keys.contains(object->getKeys()[i])) previous.pushKV(object->getKeys()[i], object->getValues()[i]);
+        }
+        BOOST_REQUIRE(KeySet(previous) == previous_keys);
+
+        // Both previous clients take exactly the same from the object this
+        // revision sends as from the f8a3432 one with the same values.
+        const auto read{ReadAsPreviousClients(*object)};
+        BOOST_CHECK(read == ReadAsPreviousClients(previous));
+        BOOST_CHECK(read.market_id == market);
+        BOOST_CHECK_EQUAL(read.action_wait_ms, node::FLOWMESH_API_ACTION_WAIT_DEFAULT.count());
+        // The same holds for any further key, of any type or position.
+        UniValue further{*object};
+        UniValue nested{UniValue::VOBJ};
+        nested.pushKV("running", false);
+        further.pushKV("zz_later_capability", nested);
+        further.pushKV("aa_later_list", UniValue{UniValue::VARR});
+        BOOST_CHECK(ReadAsPreviousClients(further) == read);
+    }
+    // The readers are faithful: a status object without a field they name
+    // fails them, as it failed those clients.
+    UniValue missing{markets["result"][0]};
+    UniValue without{UniValue::VOBJ};
+    for (size_t i{0}; i < missing.size(); ++i) {
+        if (missing.getKeys()[i] != "round") without.pushKV(missing.getKeys()[i], missing.getValues()[i]);
+    }
+    BOOST_CHECK_EXCEPTION(ReadAsPreviousClients(without), std::runtime_error, HasReason{"Expected integer: round"});
     api->Stop();
     service.Stop();
 }
