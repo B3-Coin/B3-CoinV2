@@ -531,9 +531,11 @@ void B3FlowMeshTradingPanel::updateDataViews()
             FormatAmount(c.reserved, c.side == QStringLiteral("bid") ? 9 : u.decimals) + (c.side == QStringLiteral("bid") ? QStringLiteral(" B3") : QLatin1Char(' ') + u.ticker)});
     }
     SetRows(m_depth_view, depth); SetRows(m_history_view, history); SetRows(m_own_view, own);
+    // A selection whose order changed (or whose row now shows the other
+    // side) is dropped: selecting it again binds the order now shown.
     if (const auto rows{m_own_view->selectionModel()->selectedRows()}; !rows.isEmpty()) {
         const auto row{static_cast<size_t>(rows.front().row())};
-        if (row >= s.own_curves.size() || s.own_curves[row].side != m_edit_side) m_own_view->clearSelection();
+        if (row >= s.own_curves.size() || s.own_curves[row].side != m_edit_side || s.own_curves[row].points != m_edit_points) m_own_view->clearSelection();
     }
     for (int row{0}; row < m_history_view->rowCount(); ++row) {
         auto* item{m_history_view->item(row, 0)};

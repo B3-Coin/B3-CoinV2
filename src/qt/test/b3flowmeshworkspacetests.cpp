@@ -4736,10 +4736,13 @@ private Q_SLOTS:
         // The certified bid changes while selected: the edit refuses.
         auto moved{*panel.m_snapshot}; moved.own_curves[0].points = {{1005, 1'000'000}, {1006, 0}};
         panel.m_snapshot = moved; panel.updateDataViews(); panel.updateControls();
-        QVERIFY(!panel.m_edit_order->isEnabled());
+        QVERIFY(!panel.m_edit_order->isEnabled()); QVERIFY(panel.m_own_view->selectionModel()->selectedRows().isEmpty());
         panel.editOrder();
         QCOMPARE(panel.m_price->text(), QStringLiteral("0.7")); QCOMPARE(panel.m_quantity->text(), QStringLiteral("2"));
         QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Nothing was prefilled, signed or sent")));
+        // Selecting it again binds the order now shown.
+        panel.m_own_view->selectRow(0); QVERIFY(panel.m_edit_order->isEnabled());
+        panel.editOrder(); QCOMPARE(panel.m_price->text(), QStringLiteral("1.005")); QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.75"));
         // The same row now showing the other side is never edited as it.
         auto ask{Parse(RemoteData())}; ask.own_curves = {LimitCurve("ask", 5, 1200, 400'000)};
         panel.m_snapshot = ask; panel.updateDataViews(); panel.updateControls();
