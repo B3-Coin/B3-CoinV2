@@ -132,7 +132,7 @@ applied since that node started). It cannot confirm a freeze:
 | Severity | Examples |
 |---|---|
 | SEV1: integrity or security | `certificate-conflict`; `anchor-invalidated`; `store-failure` whose error is "durable execution result disagrees with independent execution"; any bridge incident. |
-| SEV2 | A market halted, or not ready on every API node, for more than 10 minutes. |
+| SEV2 | A market halted, or not ready on every API node, for more than 10 minutes; a new `attestation_equivocation` record (security, no user impact while the market continues). |
 | SEV3 | One API node not ready while others are ready. |
 | SEV4 | Expected pauses: `genesis_checkpoint_pending`, `settlement_checkpoint_pending`, planned handoffs. |
 
@@ -149,7 +149,8 @@ owner's sign-off before they are published as a commitment.**
 
 Collect, for the incident's UTC interval:
 
-- `getflowmeshhealth`; `getflowmeshdeliveryinfo <market_id>`;
+- `getflowmeshhealth` (local RPC: it lists every retained seat-evidence
+  record); `getflowmeshdeliveryinfo <market_id>`;
   `getflowmeshnetworkinfo`; `getblockchaininfo`; `getchaintips`;
   `listflowmeshmarkets`;
 - the FlowMesh lines of `debug.log`;
@@ -208,7 +209,7 @@ start); then escalate.
 |---|---|---|
 | `store-failure` | SEV2; SEV1 when the error is "durable execution result disagrees with independent execution" | Check disk and I/O. Stop the node, take a read-only copy of the FlowMesh datadir, fix the cause and restart. For the SEV1 variant, compare `state_root` at the same sequence across operators and notify the owner. |
 | `signing-conflict` | SEV2 | Disarm with `stopflowmeshvalidator` (safe). Verify that only one signer uses the key. Never clear it by deleting history. The market continues while quorum remains. Escalate. |
-| `certificate-conflict` | SEV1 | Possible equivocation by at least a third of the seats. Preserve all evidence, change nothing, notify the owner immediately. |
+| `certificate-conflict` | SEV1 | Possible equivocation by at least a third of the seats. Preserve all evidence, change nothing, notify the owner immediately. The halt is held in memory only: a restart clears it and resumes the market while the conflict still stands, so do not restart to clear it. When the error is "two valid FlowMesh certificates conflict at one sequence", the market's `seat_evidence` holds the record (see below). |
 | `anchor-invalidated` | SEV1 | A reorg removed a committed anchor. Check `getchaintips` and finality. Owner-approved procedure only. |
 | `invalid-config` | reserved | Never emitted in this revision. |
 
@@ -225,6 +226,60 @@ start); then escalate.
 
 The 4,096-effect checkpoint backlog pauses deposits and withdrawals, not
 trading (production contract, section 9). Publish a checkpoint.
+
+### Seat-misbehaviour evidence (`seat_evidence`)
+
+Each installed market's row in `getflowmeshhealth` carries `seat_evidence`: `recorded`
+(records ever kept), `retained` (records the store still holds), `latest`
+(newest first; every retained record over local RPC, at most 4 on the
+public `health` method) and, over local RPC only, `unrecorded`. It is
+information only. It is never a readiness input, never consensus and never
+a penalty, and nothing on the node acts on it.
+
+A record is kept when this node itself detects one of these:
+
+| `kind` | Meaning | Effect on the market |
+|---|---|---|
+| `attestation_equivocation` | One seat (`first.seat_index`, key `seat_public_key`) signed two different microblocks at one epoch and sequence. The second vote is refused, as before. | None: the market continues. |
+| `certificate_conflict` | Two valid threshold certificates for two different microblocks at one durable sequence. Under one seat set, `double_signers` lists the seats in both signer bitmaps; each signed both. | The existing `certificate-conflict` halt. |
+
+Each record carries every signed field (`domain`, `market_id`, and for each
+statement the seat epoch, seat set hash, sequence, microblock hash, and the
+seat index or signer bitmap with the BLS signature), so anyone can check it
+against the anchored seat set their own B3 node derives. The reference check
+is `flowmesh::CheckSeatEvidence` (`src/flowmesh/seat_evidence.h`). Each
+statement's signature covers the `B3/FLOWMESH/CERT/V1` tagged SHA-256 of
+domain, market id, seat epoch (8 bytes, big-endian), seat set hash,
+sequence (8 bytes, big-endian) and microblock hash; hashes enter in internal
+byte order, the reverse of their hex display. A record is kept only after
+this node has checked it against its own chain.
+
+Retention: the market's store (`<flowmesh datadir>/<market_id>`) keeps the
+newest 64 records, deduplicated, and they survive restarts. It writes at
+most 8 records per market per minute. Detections beyond that, detections
+this node cannot verify and failed writes only increase `unrecorded`; a
+failed write also logs a warning in `debug.log`.
+
+When `recorded` increases:
+
+1. Save `getflowmeshhealth <market_id>` from local RPC at once. Only the
+   newest 64 records are kept.
+2. `attestation_equivocation`: SEV2 (section 4). Compare `seat_public_key`
+   with the wallet and armed keys in `getflowmeshvalidatorinfo` on every node
+   you run. If it is yours, two signers are using one key: disarm one with
+   `stopflowmeshvalidator` now and keep it disarmed. Either way, notify the
+   owner with the saved records.
+3. `certificate_conflict`: SEV1, as the halt code above. Hand the records to
+   the owner and change nothing.
+4. Do not penalise, eject, disarm or block any other operator's seat because
+   of a record, and do not delete or edit the store. Any response is the
+   owner's decision.
+
+Not recorded by this revision: a `certificate-conflict` halt whose error is
+"valid V1 certificate contradicts the durable agreement decision" (its proof
+is the agreement commit certificate, kept in the market's agreement journal
+at `<flowmesh datadir>/<market_id>/agreement`; preserve that directory), and
+equivocation inside pre-agreement voting.
 
 ### Public API
 
