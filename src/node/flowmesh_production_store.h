@@ -9,6 +9,7 @@
 #include <flowmesh/production_engine.h>
 #include <flowmesh/market_data.h>
 #include <flowmesh/outcome_evidence.h>
+#include <flowmesh/seat_evidence.h>
 #include <modern/flowmesh_checkpoint.h>
 
 #include <cstdint>
@@ -103,6 +104,25 @@ void RetainOutcomeTail(std::deque<std::shared_ptr<const ProductionOutcomeRecord>
                        std::shared_ptr<const ProductionOutcomeRecord> record,
                        size_t max_entries = OUTCOME_REPLAY_TAIL_ENTRIES,
                        size_t max_bytes = OUTCOME_REPLAY_TAIL_BYTES);
+
+//! Seat-misbehaviour evidence records a store retains, newest kept.
+inline constexpr size_t SEAT_EVIDENCE_MAX_RECORDS{64};
+
+struct StoredSeatEvidence {
+    //! Store-local insertion order.
+    uint64_t index{0};
+    flowmesh::SeatEvidence evidence;
+};
+
+/** The seat-misbehaviour evidence a store holds. Information only. */
+struct SeatEvidenceLog {
+    //! Records ever inserted into this store, evicted ones included.
+    uint64_t recorded{0};
+    //! Newest first, at most SEAT_EVIDENCE_MAX_RECORDS.
+    std::vector<StoredSeatEvidence> retained;
+    //! Retained records that no longer decode: skipped, never fatal.
+    uint64_t unreadable{0};
+};
 
 /** Exact B3 block that connected one durable type-8 checkpoint. */
 struct ProductionB3Connection {
@@ -362,6 +382,22 @@ public:
 
     /** Moves out the last complete replay's outcome tail (oldest first). */
     std::vector<std::shared_ptr<const ProductionOutcomeRecord>> TakeReplayOutcomes();
+
+    /**
+     * Seat-misbehaviour evidence (flowmesh/seat_evidence.h). Information
+     * only: replay, appends, locks, signing and every market decision ignore
+     * it, and a failure here never halts or blocks a market. Its own
+     * namespace is written synchronously, holds at most
+     * SEAT_EVIDENCE_MAX_RECORDS (the oldest record is evicted) and is
+     * deduplicated by evidence id. Older binaries ignore that namespace: it
+     * is not safety data, so a downgrade must not fail closed on it.
+     *
+     * Record inserts `evidence` into an open store unless a retained record
+     * has its id (`inserted` is then false). The caller has checked it with
+     * CheckSeatEvidence; the store checks only its canonical encoding.
+     */
+    bool RecordSeatEvidence(const flowmesh::SeatEvidence& evidence, bool& inserted, std::string& error);
+    bool ReadSeatEvidence(SeatEvidenceLog& out, std::string& error);
 
 private:
     CDBWrapper m_db;

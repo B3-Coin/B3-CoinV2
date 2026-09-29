@@ -199,6 +199,10 @@ constexpr uint8_t KEY_CONNECTION{'c'};
 constexpr uint8_t KEY_LOCK{'l'};
 constexpr uint8_t KEY_LOCKED_CANDIDATE{'p'};
 constexpr uint8_t KEY_LEGACY_SNAPSHOT{'s'};
+// Seat-misbehaviour evidence, information only. Unknown to older binaries,
+// whose scans skip prefixes they do not name.
+constexpr uint8_t KEY_SEAT_EVIDENCE{'x'};
+constexpr uint8_t KEY_SEAT_EVIDENCE_META{'y'};
 
 constexpr size_t MAX_DISK_ENTRY_BYTES{
     flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES +
@@ -277,6 +281,15 @@ LockKeyType LockedCandidateKey(
 {
     return {KEY_LOCKED_CANDIDATE, position.epoch, position.sequence};
 }
+
+struct SeatEvidenceMeta {
+    uint8_t version{1};
+    //! Records ever inserted, evicted ones included.
+    uint64_t recorded{0};
+    uint64_t next_index{0};
+
+    SERIALIZE_METHODS(SeatEvidenceMeta, obj) { READWRITE(obj.version, obj.recorded, obj.next_index); }
+};
 
 bool SameSemanticAction(const flowmesh::Action& semantic,
                         const flowmesh::Action& evidence)
@@ -2559,6 +2572,118 @@ bool FlowMeshProductionStore::ReadLockedCandidate(
     }
     out = *candidate;
     return true;
+}
+
+namespace {
+//! Every retained evidence key, oldest first, with the records that decode.
+bool ReadSeatEvidenceNamespace(CDBWrapper& db, SeatEvidenceMeta& meta, std::vector<uint64_t>& keys,
+                               SeatEvidenceLog& log, std::string& error)
+{
+    meta = {};
+    keys.clear();
+    log = {};
+    switch (ReadStrict(db, KEY_SEAT_EVIDENCE_META, meta)) {
+    case ReadResult::FOUND:
+        if (meta.version != 1) {
+            error = "FlowMesh seat evidence has an unknown format";
+            return false;
+        }
+        break;
+    case ReadResult::NOT_FOUND: break;
+    case ReadResult::ERROR:
+        error = "FlowMesh seat evidence counters are unreadable";
+        return false;
+    }
+    std::unique_ptr<CDBIterator> it{db.NewIterator()};
+    for (it->Seek(SequenceKeyType{KEY_SEAT_EVIDENCE, 0}); it->Valid(); it->Next()) {
+        uint8_t prefix{0};
+        if (!it->GetKey(prefix) || prefix != KEY_SEAT_EVIDENCE) break;
+        SequenceKeyType key;
+        if (!it->GetKeyExact(key)) {
+            ++log.unreadable;
+            continue;
+        }
+        keys.push_back(key.sequence);
+        std::vector<unsigned char> bytes;
+        const auto evidence{it->GetValueExact(bytes) ? flowmesh::DecodeSeatEvidence(bytes) : std::nullopt};
+        if (!evidence) {
+            ++log.unreadable;
+            continue;
+        }
+        log.retained.push_back({key.sequence, *evidence});
+    }
+    if (!it->StatusOK()) {
+        error = "FlowMesh seat evidence scan failed";
+        return false;
+    }
+    std::reverse(log.retained.begin(), log.retained.end());
+    // Counters written by this format never lag their records; repair a
+    // missing meta record rather than reuse an index.
+    if (!keys.empty()) meta.next_index = std::max(meta.next_index, keys.back() + 1);
+    meta.recorded = std::max<uint64_t>(meta.recorded, keys.size());
+    log.recorded = meta.recorded;
+    return true;
+}
+} // namespace
+
+bool FlowMeshProductionStore::RecordSeatEvidence(const flowmesh::SeatEvidence& evidence, bool& inserted,
+                                                 std::string& error)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    inserted = false;
+    if (!m_open) {
+        error = "FlowMesh store is not open";
+        return false;
+    }
+    const auto bytes{flowmesh::EncodeSeatEvidence(evidence)};
+    if (!bytes) {
+        error = "FlowMesh seat evidence is not canonical";
+        return false;
+    }
+    try {
+        SeatEvidenceMeta meta;
+        std::vector<uint64_t> keys;
+        SeatEvidenceLog log;
+        if (!ReadSeatEvidenceNamespace(m_db, meta, keys, log, error)) return false;
+        const uint256 id{evidence.Id()};
+        if (std::any_of(log.retained.begin(), log.retained.end(),
+                        [&](const StoredSeatEvidence& item) { return item.evidence.Id() == id; })) {
+            return true;
+        }
+        if (meta.next_index == std::numeric_limits<uint64_t>::max()) {
+            error = "FlowMesh seat evidence index is exhausted";
+            return false;
+        }
+        CDBBatch batch{m_db};
+        batch.Write(SequenceKeyType{KEY_SEAT_EVIDENCE, meta.next_index}, *bytes);
+        // Oldest first, until the new record fits the bound.
+        for (size_t i{0}; i + SEAT_EVIDENCE_MAX_RECORDS < keys.size() + 1; ++i) {
+            batch.Erase(SequenceKeyType{KEY_SEAT_EVIDENCE, keys[i]});
+        }
+        ++meta.next_index;
+        if (meta.recorded != std::numeric_limits<uint64_t>::max()) ++meta.recorded;
+        batch.Write(KEY_SEAT_EVIDENCE_META, meta);
+        m_db.WriteBatch(batch, /*fSync=*/true);
+    } catch (const std::exception& e) {
+        error = std::string{"FlowMesh seat evidence write failed: "} + e.what();
+        return false;
+    }
+    inserted = true;
+    return true;
+}
+
+bool FlowMeshProductionStore::ReadSeatEvidence(SeatEvidenceLog& out, std::string& error)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    SeatEvidenceMeta meta;
+    std::vector<uint64_t> keys;
+    try {
+        return ReadSeatEvidenceNamespace(m_db, meta, keys, out, error);
+    } catch (const std::exception& e) {
+        out = {};
+        error = std::string{"FlowMesh seat evidence read failed: "} + e.what();
+        return false;
+    }
 }
 
 bool FlowMeshProductionStore::ReadLock(

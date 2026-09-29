@@ -384,6 +384,36 @@ struct TestLockKey {
     }
 };
 
+struct TestSequenceKey {
+    uint8_t prefix{0};
+    uint64_t sequence{0};
+    SERIALIZE_METHODS(TestSequenceKey, obj)
+    {
+        READWRITE(obj.prefix, Using<BigEndianFormatter<8>>(obj.sequence));
+    }
+};
+
+//! Canonically shaped seat evidence. The store checks only the encoding: its
+//! caller verifies the signatures first (CheckSeatEvidence).
+flowmesh::SeatEvidence ShapeOnlySeatEvidence(const Scenario& scenario, const uint64_t sequence)
+{
+    flowmesh::SeatEvidence out;
+    out.kind = flowmesh::SeatEvidenceKind::ATTESTATION_EQUIVOCATION;
+    out.domain = scenario.domain;
+    out.market_id = scenario.market;
+    for (auto* statement : {&out.first, &out.second}) {
+        statement->seat_epoch = scenario.seats0.seats.epoch;
+        statement->seat_set_hash = scenario.seats0.seats.set_hash;
+        statement->sequence = sequence;
+        statement->seat_index = 2;
+    }
+    out.first.microblock_hash = Filled(0xa1);
+    out.second.microblock_hash = Filled(0xb2);
+    out.first.signature.fill(0x01);
+    out.second.signature.fill(0x02);
+    return out;
+}
+
 // Exact pre-upgrade marker shape: neither an extension nor a new namespace
 // may be silently consumed by the old reader.
 struct LegacyV3Marker {
@@ -1885,6 +1915,101 @@ BOOST_AUTO_TEST_CASE(replay_retains_only_bounded_tail_and_clears_first)
     BOOST_REQUIRE_MESSAGE(replay(scenario.anchors), error);
     BOOST_CHECK(!replay(reorged));
     BOOST_CHECK(reopened.TakeReplayOutcomes().empty());
+}
+
+BOOST_AUTO_TEST_CASE(seat_evidence_is_bounded_deduplicated_and_survives_restart)
+{
+    Scenario scenario;
+    const fs::path path{m_args.GetDataDirBase() / "flowmesh_production_seat_evidence"};
+    std::string error;
+    const auto first{ShapeOnlySeatEvidence(scenario, 0)};
+    const auto newest{node::SEAT_EVIDENCE_MAX_RECORDS + 5};
+    {
+        node::FlowMeshProductionStore store{DBParams{
+            .path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        bool inserted{true};
+        // Only a store bound to its market records.
+        BOOST_CHECK(!store.RecordSeatEvidence(first, inserted, error));
+        BOOST_CHECK(!inserted);
+        BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market, scenario.seats0.seats,
+                                          scenario.state0.Root(), error));
+        node::SeatEvidenceLog log;
+        BOOST_REQUIRE(store.ReadSeatEvidence(log, error));
+        BOOST_CHECK_EQUAL(log.recorded, 0U);
+        BOOST_CHECK(log.retained.empty());
+        BOOST_REQUIRE_MESSAGE(store.RecordSeatEvidence(first, inserted, error), error);
+        BOOST_CHECK(inserted);
+        // The same evidence, in either statement order, is a duplicate.
+        BOOST_REQUIRE(store.RecordSeatEvidence(first, inserted, error));
+        BOOST_CHECK(!inserted);
+        auto swapped{first};
+        std::swap(swapped.first, swapped.second);
+        BOOST_REQUIRE(store.RecordSeatEvidence(swapped, inserted, error));
+        BOOST_CHECK(!inserted);
+        auto malformed{first};
+        malformed.first.signer_bitmap = {0x01};
+        BOOST_CHECK(!store.RecordSeatEvidence(malformed, inserted, error));
+        BOOST_CHECK(!inserted);
+        // Bounded: only the newest records are retained.
+        for (uint64_t sequence{1}; sequence <= newest; ++sequence) {
+            BOOST_REQUIRE_MESSAGE(store.RecordSeatEvidence(ShapeOnlySeatEvidence(scenario, sequence), inserted, error),
+                                  error);
+            BOOST_CHECK(inserted);
+        }
+        BOOST_REQUIRE(store.ReadSeatEvidence(log, error));
+        BOOST_CHECK_EQUAL(log.recorded, newest + 1);
+        BOOST_REQUIRE_EQUAL(log.retained.size(), node::SEAT_EVIDENCE_MAX_RECORDS);
+        BOOST_CHECK_EQUAL(log.retained.front().evidence.first.sequence, newest);
+        BOOST_CHECK_EQUAL(log.retained.front().index, newest);
+        BOOST_CHECK_EQUAL(log.retained.back().evidence.first.sequence, newest + 1 - node::SEAT_EVIDENCE_MAX_RECORDS);
+        BOOST_CHECK_EQUAL(log.unreadable, 0U);
+    }
+    // It survives a restart and changes nothing the market reads: the store
+    // validates, opens and appends as before.
+    {
+        node::FlowMeshProductionStore reopened{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        node::SeatEvidenceLog log;
+        BOOST_REQUIRE(reopened.ReadSeatEvidence(log, error));
+        BOOST_CHECK_EQUAL(log.recorded, newest + 1);
+        BOOST_REQUIRE_EQUAL(log.retained.size(), node::SEAT_EVIDENCE_MAX_RECORDS);
+        BOOST_CHECK(log.retained.front().evidence == ShapeOnlySeatEvidence(scenario, newest));
+        bool fresh{true};
+        BOOST_REQUIRE_MESSAGE(reopened.CheckForMarket(scenario.domain, scenario.market, fresh, error), error);
+        BOOST_CHECK(!fresh);
+        BOOST_REQUIRE_MESSAGE(reopened.OpenForMarket(scenario.domain, scenario.market, scenario.seats0.seats,
+                                                     scenario.state0.Root(), error),
+                              error);
+        flowmesh::FlowMeshState committed{scenario.state0};
+        BOOST_REQUIRE_MESSAGE(reopened.AppendExecution(
+                                  scenario.execution0.entry, scenario.certificate0, scenario.seats0.seats,
+                                  scenario.state0, {300, flowmesh::AnchorRef{190, Filled(0x73)}, &scenario.anchors},
+                                  scenario.treasury, &scenario.chain_facts, committed, error),
+                              error);
+    }
+    // A record that no longer decodes is skipped and never blocks the market.
+    {
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        raw.Write(TestSequenceKey{'x', 1000}, std::vector<unsigned char>{0x01, 0x02}, /*fSync=*/true);
+    }
+    node::FlowMeshProductionStore reopened{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+    bool fresh{true};
+    BOOST_REQUIRE_MESSAGE(reopened.CheckForMarket(scenario.domain, scenario.market, fresh, error), error);
+    BOOST_REQUIRE_MESSAGE(reopened.OpenForMarket(scenario.domain, scenario.market, scenario.seats0.seats,
+                                                 scenario.state0.Root(), error),
+                          error);
+    node::SeatEvidenceLog log;
+    BOOST_REQUIRE(reopened.ReadSeatEvidence(log, error));
+    BOOST_CHECK_EQUAL(log.unreadable, 1U);
+    BOOST_CHECK_EQUAL(log.retained.size(), node::SEAT_EVIDENCE_MAX_RECORDS);
+    // New records go after it, and the bound still holds counting it.
+    bool inserted{false};
+    BOOST_REQUIRE_MESSAGE(reopened.RecordSeatEvidence(ShapeOnlySeatEvidence(scenario, 9999), inserted, error), error);
+    BOOST_CHECK(inserted);
+    BOOST_REQUIRE(reopened.ReadSeatEvidence(log, error));
+    BOOST_CHECK_EQUAL(log.unreadable, 1U);
+    BOOST_CHECK_EQUAL(log.retained.size() + log.unreadable, node::SEAT_EVIDENCE_MAX_RECORDS);
+    BOOST_CHECK_EQUAL(log.retained.front().index, 1001U);
+    BOOST_CHECK_EQUAL(log.recorded, newest + 2);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
