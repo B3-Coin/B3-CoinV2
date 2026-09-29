@@ -29,6 +29,46 @@
 
 namespace node {
 
+std::shared_ptr<const ProductionOutcomeRecord> MakeProductionOutcomeRecord(
+    const uint64_t sequence, const uint256& entry_hash, flowmesh::BatchResult&& result,
+    std::vector<modern::FlowMeshEffectV1>&& effects)
+{
+    auto record{std::make_shared<ProductionOutcomeRecord>()};
+    record->sequence = sequence;
+    record->entry_hash = entry_hash;
+    record->preimage = flowmesh::MakeExecutionOutcomePreimageV1(std::move(result));
+    record->effects = std::move(effects);
+    const auto& p{record->preimage};
+    // Upper bound of the evidence encoding, and of the memory it occupies.
+    const size_t fills{p.bid_fill.size() + p.ask_fill.size()};
+    const size_t encoded{128 + 32 * p.applied.size() + 33 * p.rejected.size() + 40 * fills +
+                         56 * p.seller_fees.size() + 40 * p.seat_rewards.size() + 228 * record->effects.size()};
+    if (encoded > OUTCOME_RECORD_MAX_BYTES) {
+        record->too_large = true;
+        record->preimage = {};
+        record->effects.clear();
+        record->charged_bytes = 256;
+    } else {
+        record->charged_bytes = 256 + 32 * p.applied.size() + 40 * p.rejected.size() + 48 * fills +
+                                56 * p.seller_fees.size() + 40 * p.seat_rewards.size() +
+                                240 * record->effects.size();
+    }
+    return record;
+}
+
+void RetainOutcomeTail(std::deque<std::shared_ptr<const ProductionOutcomeRecord>>& tail, size_t& tail_bytes,
+                       std::shared_ptr<const ProductionOutcomeRecord> record, const size_t max_entries,
+                       const size_t max_bytes)
+{
+    if (!record) return;
+    tail_bytes += record->charged_bytes;
+    tail.push_back(std::move(record));
+    while (!tail.empty() && (tail.size() > max_entries || tail_bytes > max_bytes)) {
+        tail_bytes -= tail.front()->charged_bytes;
+        tail.pop_front();
+    }
+}
+
 bool FlowMeshHandoffConnectionMature(
     const ProductionB3Connection& connection,
     const int32_t canonical_tip_height)
@@ -1670,10 +1710,12 @@ bool FlowMeshProductionStore::AppendExecution(
     const uint256& treasury_owner_commitment,
     const flowmesh::DepositVerifier* deposits,
     flowmesh::FlowMeshState& next_state_out, std::string& error,
-    std::optional<flowmesh::ProductionEntryCheck>* validation_failure)
+    std::optional<flowmesh::ProductionEntryCheck>* validation_failure,
+    std::shared_ptr<const ProductionOutcomeRecord>* outcome_out)
 {
     StoreTrace trace{"append_execution", entry};
     if (validation_failure) validation_failure->reset();
+    if (outcome_out) outcome_out->reset();
     trace.Mark(trace.lock_requested_us);
     const std::lock_guard<std::mutex> guard{m_mutex};
     trace.Mark(trace.lock_acquired_us);
@@ -1713,7 +1755,7 @@ bool FlowMeshProductionStore::AppendExecution(
                                        active_seats};
     flowmesh::ProductionEntryCheck check;
     trace.Mark(trace.execution_started_us);
-    const auto executed{flowmesh::ExecuteProductionEntry(
+    auto executed{flowmesh::ExecuteProductionEntry(
         current_state, entry, marker.domain, marker.market_id, active_seats,
         gate, marker.next_sequence, marker.next_effect_index,
         marker.last_microblock_hash,
@@ -1763,6 +1805,12 @@ bool FlowMeshProductionStore::AppendExecution(
     }
     CacheMarketHistory(m_market_history, entry, &executed->result);
     next_state_out = executed->next_state;
+    // After the durable write and after MakeDiskEntry consumed the effects:
+    // hand the caller this exact re-execution by move. Nothing is encoded.
+    if (outcome_out && executed->settlements.empty()) {
+        *outcome_out = MakeProductionOutcomeRecord(entry.sequence, next.last_microblock_hash,
+                                                   std::move(executed->result), std::move(executed->effects));
+    }
     return true;
 }
 
@@ -2099,7 +2147,10 @@ bool FlowMeshProductionStore::Replay(
     // leaves the store fail-closed until a complete replay succeeds.
     m_ready = false;
     m_market_history.clear();
+    m_replay_outcomes.clear();
     std::deque<flowmesh::MarketHistoryEntry> history;
+    std::deque<std::shared_ptr<const ProductionOutcomeRecord>> outcomes;
+    size_t outcome_bytes{0};
     Marker marker;
     if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !ValidateStorage(m_db, marker, error)) {
@@ -2148,7 +2199,7 @@ bool FlowMeshProductionStore::Replay(
         if (stored->entry.kind == static_cast<uint8_t>(
                                       flowmesh::ProductionEntryKind::EXECUTION)) {
             flowmesh::ProductionEntryCheck check;
-            const auto executed{flowmesh::ExecuteProductionEntry(
+            auto executed{flowmesh::ExecuteProductionEntry(
                 working, stored->entry, marker.domain, marker.market_id,
                 *active_seats, gate, sequence, next_effect_index,
                 running_hash, anchors,
@@ -2165,6 +2216,15 @@ bool FlowMeshProductionStore::Replay(
             }
             CacheMarketHistory(history, stored->entry, &executed->result);
             working = executed->next_state;
+            // Only the newest entries can survive the tail's count bound;
+            // older ones cost no record at all.
+            if (executed->settlements.empty() &&
+                marker.next_sequence - sequence <= OUTCOME_REPLAY_TAIL_ENTRIES) {
+                RetainOutcomeTail(outcomes, outcome_bytes,
+                                  MakeProductionOutcomeRecord(sequence, stored->entry.GetHash(),
+                                                              std::move(executed->result),
+                                                              std::move(executed->effects)));
+            }
         } else {
             const auto next_seats{seat_sets.GetSeatSet(
                 marker.domain, marker.market_id, stored->entry.next_epoch,
@@ -2262,8 +2322,18 @@ bool FlowMeshProductionStore::Replay(
     state = std::move(working);
     last_hash = running_hash;
     m_market_history = std::move(history);
+    m_replay_outcomes = std::move(outcomes);
     m_ready = !m_preagreement || marker.agreement_bootstrap_complete;
     return true;
+}
+
+std::vector<std::shared_ptr<const ProductionOutcomeRecord>> FlowMeshProductionStore::TakeReplayOutcomes()
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    std::vector<std::shared_ptr<const ProductionOutcomeRecord>> out{
+        std::make_move_iterator(m_replay_outcomes.begin()), std::make_move_iterator(m_replay_outcomes.end())};
+    m_replay_outcomes.clear();
+    return out;
 }
 
 flowmesh::MarketHistoryPage FlowMeshProductionStore::ReadMarketHistory(

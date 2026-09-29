@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <variant>
@@ -1259,14 +1261,17 @@ BOOST_AUTO_TEST_CASE(settlement_only_execution_is_durable_mandatory_and_replayab
                                   error),
                               error);
         flowmesh::FlowMeshState request_state{scenario.state0};
+        std::shared_ptr<const node::ProductionOutcomeRecord> request_outcome;
         BOOST_REQUIRE_MESSAGE(store.AppendExecution(
                                   scenario.execution0.entry,
                                   scenario.certificate0, scenario.seats0.seats,
                                   scenario.state0,
                                   {300, request_previous, &scenario.anchors},
                                   scenario.treasury, &facts, request_state,
-                                  error),
+                                  error, nullptr, &request_outcome),
                               error);
+        BOOST_REQUIRE(request_outcome);
+        BOOST_CHECK_EQUAL(request_outcome->sequence, 0U);
         BOOST_REQUIRE_MESSAGE(store.MarkExecutionCheckpointConnected(
                                   request_checkpoint, scenario.seats0.seats,
                                   {240, Filled(0xa0)},
@@ -1274,13 +1279,17 @@ BOOST_AUTO_TEST_CASE(settlement_only_execution_is_durable_mandatory_and_replayab
                               error);
 
         flowmesh::FlowMeshState settled_state{request_state};
+        // A settlement-only entry hashes settlement-result/v1, not
+        // execresult/v1: it has no outcome record.
+        std::shared_ptr<const node::ProductionOutcomeRecord> settlement_outcome{request_outcome};
         BOOST_REQUIRE_MESSAGE(store.AppendExecution(
                                   settlement->entry, settlement_certificate,
                                   scenario.seats0.seats, request_state,
                                   {300, request_anchor, &scenario.anchors},
                                   scenario.treasury, &facts, settled_state,
-                                  error),
+                                  error, nullptr, &settlement_outcome),
                               error);
+        BOOST_CHECK(!settlement_outcome);
         BOOST_CHECK(settled_state.Root() == settlement->next_state.Root());
 
         std::optional<node::ProductionCheckpointCandidate> candidate;
@@ -1323,6 +1332,9 @@ BOOST_AUTO_TEST_CASE(settlement_only_execution_is_durable_mandatory_and_replayab
                           error);
     BOOST_CHECK(replayed.Root() == settlement->next_state.Root());
     BOOST_CHECK(last_hash == settlement->entry.GetHash());
+    const auto tail{reopened.TakeReplayOutcomes()};
+    BOOST_REQUIRE_EQUAL(tail.size(), 1U);
+    BOOST_CHECK_EQUAL(tail.front()->sequence, 0U);
     std::optional<node::ProductionCheckpointCandidate> candidate;
     BOOST_REQUIRE_MESSAGE(reopened.NextCheckpointCandidate(
                               scenario.seats0.seats, candidate, error),
@@ -1575,6 +1587,170 @@ BOOST_AUTO_TEST_CASE(malformed_lock_namespace_blocks_reopen_and_signing)
         scenario.state0.Root(), error));
     BOOST_CHECK(reopened.LockOnce({7, 0}, Filled(0xd1)) ==
                 flowmesh::ProductionLockResult::STORAGE_FAILURE);
+}
+
+BOOST_AUTO_TEST_CASE(append_returns_outcome_record_from_its_own_reexecution)
+{
+    Scenario scenario;
+    const fs::path path{m_args.GetDataDirBase() / "flowmesh_production_outcome_record"};
+    std::string error;
+    node::FlowMeshProductionStore store{DBParams{
+        .path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+    BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market, scenario.seats0.seats,
+                                      scenario.state0.Root(), error));
+    const flowmesh::ProductionAnchorContext anchors{300, flowmesh::AnchorRef{190, Filled(0x73)}, &scenario.anchors};
+    flowmesh::FlowMeshState output{scenario.state0};
+    auto bad_certificate{scenario.certificate0};
+    bad_certificate.aggregate_signature[0] ^= 1;
+    auto outcome{node::MakeProductionOutcomeRecord(9, Filled(1), {}, {})};
+    BOOST_CHECK(!store.AppendExecution(scenario.execution0.entry, bad_certificate, scenario.seats0.seats,
+                                       scenario.state0, anchors, scenario.treasury, &scenario.chain_facts,
+                                       output, error, nullptr, &outcome));
+    BOOST_CHECK(!outcome); // reset on entry, never set by a refused append
+    BOOST_REQUIRE_MESSAGE(store.AppendExecution(scenario.execution0.entry, scenario.certificate0,
+                                                scenario.seats0.seats, scenario.state0, anchors,
+                                                scenario.treasury, &scenario.chain_facts, output, error,
+                                                nullptr, &outcome),
+                          error);
+    BOOST_CHECK(output.Root() == scenario.execution0.next_state.Root());
+    BOOST_REQUIRE(outcome);
+    BOOST_CHECK_EQUAL(outcome->sequence, 0U);
+    BOOST_CHECK(outcome->entry_hash == scenario.execution0.entry.GetHash());
+    BOOST_CHECK(!outcome->too_large);
+    BOOST_CHECK(outcome->preimage == flowmesh::MakeExecutionOutcomePreimageV1(scenario.execution0.result));
+    BOOST_CHECK(outcome->effects == scenario.execution0.effects);
+    BOOST_CHECK_GT(outcome->charged_bytes, 0U);
+    const flowmesh::ExecutionOutcomeEvidenceV1 evidence{outcome->sequence, outcome->entry_hash,
+                                                        outcome->preimage, outcome->effects};
+    BOOST_CHECK(flowmesh::VerifyExecutionOutcomeEvidence(scenario.execution0.entry, evidence) ==
+                flowmesh::OutcomeEvidenceCheck::OK);
+    // No replay happened in this process: there is no tail to take.
+    BOOST_CHECK(store.TakeReplayOutcomes().empty());
+}
+
+BOOST_AUTO_TEST_CASE(oversize_outcome_record_is_marker_only)
+{
+    flowmesh::BatchResult wide;
+    for (uint32_t i{0}; i < 30'000; ++i) {
+        uint256 account;
+        account.data()[0] = static_cast<unsigned char>(i >> 16);
+        account.data()[1] = static_cast<unsigned char>(i >> 8);
+        account.data()[2] = static_cast<unsigned char>(i);
+        wide.clearing.bid_fill.emplace(account, 1);
+    }
+    const auto marker{node::MakeProductionOutcomeRecord(4, Filled(2), std::move(wide), {})};
+    BOOST_REQUIRE(marker);
+    BOOST_CHECK(marker->too_large);
+    BOOST_CHECK(marker->preimage == flowmesh::ExecutionOutcomePreimageV1{});
+    BOOST_CHECK(marker->effects.empty());
+    BOOST_CHECK_LE(marker->charged_bytes, 1024U);
+    BOOST_CHECK_EQUAL(marker->sequence, 4U);
+    flowmesh::BatchResult small;
+    small.applied = {Filled(3)};
+    const auto record{node::MakeProductionOutcomeRecord(5, Filled(4), std::move(small), {})};
+    BOOST_CHECK(!record->too_large);
+    BOOST_CHECK_EQUAL(record->preimage.applied.size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(replay_retains_only_bounded_tail_and_clears_first)
+{
+    // The bound itself: by count, then by charged bytes, oldest out first.
+    std::deque<std::shared_ptr<const node::ProductionOutcomeRecord>> tail;
+    size_t bytes{0};
+    for (uint64_t n{0}; n < 6; ++n) {
+        node::RetainOutcomeTail(tail, bytes, node::MakeProductionOutcomeRecord(n, Filled(5), {}, {}), 4, 1'000'000);
+    }
+    BOOST_REQUIRE_EQUAL(tail.size(), 4U);
+    BOOST_CHECK_EQUAL(tail.front()->sequence, 2U);
+    BOOST_CHECK_EQUAL(tail.back()->sequence, 5U);
+    size_t sum{0};
+    for (const auto& record : tail) sum += record->charged_bytes;
+    BOOST_CHECK_EQUAL(bytes, sum);
+    const size_t one{tail.back()->charged_bytes};
+    node::RetainOutcomeTail(tail, bytes, node::MakeProductionOutcomeRecord(6, Filled(5), {}, {}), 4, 2 * one);
+    BOOST_REQUIRE_EQUAL(tail.size(), 2U);
+    BOOST_CHECK_EQUAL(tail.front()->sequence, 5U);
+    BOOST_CHECK_EQUAL(bytes, 2 * one);
+
+    // A real replay publishes each execution entry's record once.
+    Scenario scenario;
+    const fs::path path{m_args.GetDataDirBase() / "flowmesh_production_outcome_replay"};
+    flowmesh::ProductionEpochGate gate{scenario.domain, scenario.market, scenario.seats0.seats};
+    const std::vector<flowmesh::Action> no_actions;
+    flowmesh::ProductionEntryCheck check;
+    const auto first{flowmesh::BuildProductionExecutionEntry(
+        scenario.state0, scenario.domain, scenario.market, scenario.seats0.seats, gate, 0, 0, uint256{},
+        {200, Filled(0x74)}, {300, flowmesh::AnchorRef{190, Filled(0x73)}, &scenario.anchors},
+        scenario.treasury, no_actions, &scenario.chain_facts, check)};
+    BOOST_REQUIRE(first);
+    const auto first_certificate{Certify(first->entry, scenario.seats0)};
+    std::string error;
+    {
+        node::FlowMeshProductionStore store{DBParams{
+            .path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market, scenario.seats0.seats,
+                                          scenario.state0.Root(), error));
+        flowmesh::FlowMeshState state1{scenario.state0};
+        BOOST_REQUIRE_MESSAGE(store.AppendExecution(first->entry, first_certificate, scenario.seats0.seats,
+                                                    scenario.state0,
+                                                    {300, flowmesh::AnchorRef{190, Filled(0x73)}, &scenario.anchors},
+                                                    scenario.treasury, &scenario.chain_facts, state1, error),
+                              error);
+        BOOST_REQUIRE_MESSAGE(store.MarkExecutionCheckpointConnected(
+                                  Checkpoint(first->entry, first_certificate, scenario.seats0.seats, {}),
+                                  scenario.seats0.seats, {240, Filled(0xa0)}, error),
+                              error);
+        const auto second{flowmesh::BuildProductionExecutionEntry(
+            state1, scenario.domain, scenario.market, scenario.seats0.seats, gate, 1, 0, first->entry.GetHash(),
+            {210, Filled(0x75)}, {300, flowmesh::AnchorRef{200, Filled(0x74)}, &scenario.anchors},
+            scenario.treasury, no_actions, &scenario.chain_facts, check)};
+        BOOST_REQUIRE(second);
+        flowmesh::FlowMeshState state2{state1};
+        BOOST_REQUIRE_MESSAGE(store.AppendExecution(second->entry, Certify(second->entry, scenario.seats0),
+                                                    scenario.seats0.seats, state1,
+                                                    {300, flowmesh::AnchorRef{200, Filled(0x74)}, &scenario.anchors},
+                                                    scenario.treasury, &scenario.chain_facts, state2, error),
+                              error);
+    }
+    node::FlowMeshProductionStore reopened{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+    BOOST_REQUIRE(reopened.OpenForMarket(scenario.domain, scenario.market, scenario.seats0.seats,
+                                         scenario.state0.Root(), error));
+    SeatSource source;
+    source.m_domain = scenario.domain;
+    source.m_market = scenario.market;
+    source.Add(scenario.seats0.seats);
+    const auto replay = [&](const flowmesh::AnchorPolicy& policy) {
+        flowmesh::FlowMeshState replayed{scenario.state0};
+        uint256 last_hash;
+        return reopened.Replay(replayed, last_hash, source,
+                               {300, flowmesh::AnchorRef{190, Filled(0x73)}, &policy}, scenario.treasury,
+                               &scenario.chain_facts, error);
+    };
+    BOOST_REQUIRE_MESSAGE(replay(scenario.anchors), error);
+    // A second complete replay clears the untaken tail instead of adding to it.
+    BOOST_REQUIRE_MESSAGE(replay(scenario.anchors), error);
+    auto outcomes{reopened.TakeReplayOutcomes()};
+    BOOST_REQUIRE_EQUAL(outcomes.size(), 2U);
+    BOOST_CHECK_EQUAL(outcomes[0]->sequence, 0U);
+    BOOST_CHECK_EQUAL(outcomes[1]->sequence, 1U);
+    BOOST_CHECK(outcomes[0]->entry_hash == first->entry.GetHash());
+    BOOST_CHECK(flowmesh::VerifyExecutionOutcomeEvidence(
+                    first->entry, {0, outcomes[0]->entry_hash, outcomes[0]->preimage, outcomes[0]->effects}) ==
+                flowmesh::OutcomeEvidenceCheck::OK);
+    BOOST_CHECK(reopened.TakeReplayOutcomes().empty()); // moved out once
+
+    // failed_replay_publishes_no_tail: a complete replay's untaken tail is
+    // cleared by the next replay, and a failed one publishes nothing.
+    // The second entry's anchor is no longer canonical: replay fails after
+    // it already re-executed the first entry.
+    TestAnchorPolicy reorged{300};
+    for (const auto& anchor : {flowmesh::AnchorRef{100, Filled(0x71)}, flowmesh::AnchorRef{190, Filled(0x73)},
+                               flowmesh::AnchorRef{200, Filled(0x74)}}) {
+        reorged.Add(anchor);
+    }
+    BOOST_REQUIRE_MESSAGE(replay(scenario.anchors), error);
+    BOOST_CHECK(!replay(reorged));
+    BOOST_CHECK(reopened.TakeReplayOutcomes().empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
