@@ -32,6 +32,8 @@
 
 namespace node {
 
+class FlowMeshTimingSpan;
+
 /** Immutable historical identity used to authorize a seat-reward claim. */
 struct FlowMeshHistoricalRewardSeat {
     flowmesh::ActiveFnBlsSeatSet seats;
@@ -593,6 +595,11 @@ public:
         bool want_payload) const;
     /** Test-only: ClientCertifiedEntry calls that read the store. */
     uint64_t ClientEntryStoreReadsForTest() const;
+    //! A display view's curve copy unused for this long is dropped by the
+    //! next market-data read.
+    static constexpr std::chrono::seconds BOOK_CAPTURE_IDLE{30};
+    /** Test-only: display-view curve copies retained (one per market at most). */
+    size_t BookCapturesForTest() const;
     flowmesh::ClientEventPage ClientEvents(
         const std::optional<flowmesh::ClientEventCursor>& after,
         const std::optional<flowmesh::MarketId>& market,
@@ -738,11 +745,29 @@ private:
     //! Caller holds m_market_mutex: the other markets' counted recent-window
     //! payload and outcome bytes (their global caps' remaining room).
     std::pair<size_t, size_t> RecentWindowOthers(const Market& self) const;
+    //! A display view's copy of one market's standing curves (see BookCopy).
+    struct BookCapture {
+        std::shared_ptr<const flowmesh::BookCurves> book;
+        flowmesh::WireClock::time_point used;
+    };
     //! Guarded by m_market_mutex. Per market, the standing curves copied once
     //! for the certified head a display view (indicative clearing) last asked
     //! about, so repeated reads at one head copy nothing. Views are computed
-    //! from it outside every lock.
-    mutable std::map<flowmesh::MarketId, std::shared_ptr<const flowmesh::BookCurves>> m_book_captures;
+    //! from it outside every lock. Every market-data read drops (freeing
+    //! them after the lock) captures of a head that is no longer current and
+    //! captures unused for BOOK_CAPTURE_IDLE.
+    mutable std::map<flowmesh::MarketId, BookCapture> m_book_captures;
+    //! Caller holds m_market_mutex: moves stale captures into `dropped`.
+    void PruneBookCaptures(std::vector<std::shared_ptr<const flowmesh::BookCurves>>& dropped) const;
+    /** The standing curves of `head` for display views: the retained capture,
+     * or a copy taken one bounded page (MARKET_DATA_MAX_CURVES curves) per
+     * m_market_mutex hold (flowmesh::CopyBookCurves), as a curve-paging read
+     * takes it, so no hold copies the whole book. Takes the lock itself; the
+     * caller must not hold it. A book over MARKET_VIEW_MAX_BOOK_CURVES is not
+     * copied ("work_budget"), and a head that moves between holds ends the
+     * copy ("head_changed"). */
+    std::shared_ptr<const flowmesh::BookCurves> BookCopy(const flowmesh::MarketId& market_id, const uint256& head,
+                                                         FlowMeshTimingSpan& timing) const;
     std::map<flowmesh::MarketId, std::unique_ptr<Market>> m_markets;
     //! ClientCertifiedEntry store reads (test observation only).
     mutable std::atomic<uint64_t> m_client_entry_store_reads{0};

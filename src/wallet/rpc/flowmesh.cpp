@@ -1145,7 +1145,7 @@ RPCHelpMan getflowmeshmarketdata()
             }},
             {T::OBJ, "indicative", /*optional=*/true, "Present only when indicative was given. NOT certified: what the next clearing would be if the verified standing curves (and the draft) were cleared now; actions not yet certified are excluded", {
                 {T::BOOL, "available", "Computed within its bounded work"},
-                {T::STR, "unavailable_reason", /*optional=*/true, "work_budget, malformed_curve, invalid_draft, overflow or no_certified_state"},
+                {T::STR, "unavailable_reason", /*optional=*/true, "work_budget (also: a book over 16384 standing curves), malformed_curve, invalid_draft, overflow, no_certified_state or head_changed (the head moved while this node copied the curves; read again)"},
                 {T::BOOL, "certified", "Always false"},
                 {T::BOOL, "excludes_pending_actions", "Always true: queued and uncertified actions are not included"},
                 {T::STR, "basis", "verified_standing_curves or verified_standing_curves_with_draft"},

@@ -9,6 +9,8 @@
 #include <flowmesh/market_data.h>
 
 #include <deque>
+#include <functional>
+#include <optional>
 #include <span>
 
 namespace flowmesh {
@@ -44,6 +46,11 @@ ClearingTickPage PageClearingTicks(const std::deque<ClearingTick>& ticks, const 
 //! Work one indicative computation may spend: a unit per breakpoint read and
 //! per curve evaluation. Beyond it the view is unavailable, never truncated.
 inline constexpr size_t MARKET_VIEW_WORK_BUDGET{size_t{1} << 20};
+//! Most standing curves a display view copies: a larger book is not copied
+//! and its views are unavailable ("work_budget"), as the computation would
+//! exhaust MARKET_VIEW_WORK_BUDGET on such a book in any case. It bounds the
+//! copy's time and memory (a few MiB) wherever it runs.
+inline constexpr size_t MARKET_VIEW_MAX_BOOK_CURVES{size_t{1} << 14};
 
 /** Exactly ClearSlot's price selection (maximum volume, then minimum
  * imbalance, then lowest price over every breakpoint price) and
@@ -53,9 +60,26 @@ inline constexpr size_t MARKET_VIEW_WORK_BUDGET{size_t{1} << 20};
 IndicativeClearing ComputeIndicative(std::span<const ClearingEngine::CurveView> curves, const IndicativeQuery& query,
                                      size_t budget = MARKET_VIEW_WORK_BUDGET);
 
+//! One page of at most `limit` standing curves after `after`, exactly as
+//! ClearingEngine::ReadCurves returns it at the head the caller pins, or
+//! nullopt when that head is no longer current.
+using BookPageReader = std::function<std::optional<ClearingEngine::CurvePage>(
+    const std::optional<ClearingEngine::CurveKey>& after, size_t limit)>;
+
+/** The standing curves of `head` for display views, read through `read` one
+ * page of at most MARKET_DATA_MAX_CURVES curves per call, so a caller can
+ * hold its lock for one page at a time instead of copying the whole book in
+ * one hold. Nothing more is copied for a book over `max_curves` (unavailable
+ * "work_budget", after its first page) or once `read` reports the head moved
+ * ("head_changed"). `pages` counts the calls to `read`. */
+BookCurves CopyBookCurves(const uint256& head, const BookPageReader& read, size_t& pages,
+                          size_t max_curves = MARKET_VIEW_MAX_BOOK_CURVES);
+
 /** Fills data.indicative from data.book when the query asks for it, and
- * drops data.book. For callers that hold no node lock: the local engine's
- * reads and the remote client after it releases its work gate. */
+ * drops data.book. A book that was not copied (unavailable_reason) makes the
+ * view unavailable for that reason. For callers that hold no node lock: the
+ * local engine's reads and the remote client after it releases its work
+ * gate. */
 void ComputeMarketViews(MarketData& data, const MarketDataQuery& query);
 
 } // namespace flowmesh

@@ -1431,9 +1431,14 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     static std::shared_ptr<const flowmesh::BookCurves> CachedBook(Cache& cache)
     {
         if (!cache.book) {
-            cache.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{
-                cache.verified.certified.entry.GetHash(),
-                cache.verified.state.ReadCurves(std::numeric_limits<size_t>::max()).curves});
+            const auto head{cache.verified.certified.entry.GetHash()};
+            // A book over the views' bound is never copied (under m_work).
+            if (cache.verified.state.ReadCurves(0).total_curves > flowmesh::MARKET_VIEW_MAX_BOOK_CURVES) {
+                cache.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{head, {}, "work_budget"});
+            } else {
+                cache.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{
+                    head, cache.verified.state.ReadCurves(flowmesh::MARKET_VIEW_MAX_BOOK_CURVES).curves, {}});
+            }
         }
         return cache.book;
     }

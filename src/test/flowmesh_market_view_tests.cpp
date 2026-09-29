@@ -255,6 +255,92 @@ BOOST_AUTO_TEST_CASE(imbalance_side_observation_is_cheap_for_a_large_rationed_cl
     BOOST_CHECK(elapsed < std::chrono::milliseconds{50});
 }
 
+BOOST_AUTO_TEST_CASE(book_copy_takes_one_bounded_page_per_read_of_a_large_book)
+{
+    // 10,000 standing curves: a display view's copy never reads more than one
+    // curve-paging page per call (per hold of the caller's lock).
+    constexpr uint16_t CURVES{10'000};
+    auto state{EmptyState()};
+    const auto account = [](const uint16_t index) {
+        uint256 out;
+        *out.begin() = static_cast<uint8_t>(index & 0xff);
+        *(out.begin() + 1) = static_cast<uint8_t>(index >> 8);
+        *(out.begin() + 2) = 2;
+        return out;
+    };
+    for (uint16_t i{0}; i < CURVES; ++i) {
+        Fund(state, account(i), 1'000'000);
+        const auto side{i % 2 ? Side::ASK : Side::BID};
+        const CAmount price{static_cast<CAmount>(1 + i % 40)};
+        BOOST_REQUIRE(state.SubmitCurve(account(i), side, side == Side::BID ? *flowmesh::MakeLimitBidCurve(price, 1 + i % 7)
+                                                                             : *flowmesh::MakeLimitAskCurve(price, 1 + i % 7)));
+    }
+    const uint256 head{uint256::ONE};
+    size_t calls{0}, largest{0};
+    const flowmesh::BookPageReader read = [&](const auto& after, const size_t limit) -> std::optional<flowmesh::ClearingEngine::CurvePage> {
+        ++calls;
+        BOOST_CHECK(limit <= flowmesh::MARKET_DATA_MAX_CURVES);
+        auto page{state.ReadCurves(limit, after)};
+        largest = std::max(largest, page.curves.size());
+        return page;
+    };
+    size_t pages{0};
+    const auto book{flowmesh::CopyBookCurves(head, read, pages)};
+    BOOST_CHECK(book.unavailable_reason.empty());
+    BOOST_CHECK(book.head == head);
+    BOOST_CHECK_EQUAL(pages, calls);
+    BOOST_CHECK_EQUAL(pages, (size_t{CURVES} + flowmesh::MARKET_DATA_MAX_CURVES - 1) / flowmesh::MARKET_DATA_MAX_CURVES);
+    BOOST_CHECK_EQUAL(largest, flowmesh::MARKET_DATA_MAX_CURVES);
+    // Exactly the whole book, in the book's order.
+    const auto whole{state.ReadCurves(std::numeric_limits<size_t>::max()).curves};
+    BOOST_REQUIRE_EQUAL(book.curves.size(), whole.size());
+    for (size_t i{0}; i < whole.size(); ++i) {
+        BOOST_CHECK(book.curves[i].account_id == whole[i].account_id);
+        BOOST_CHECK(book.curves[i].side == whole[i].side);
+        BOOST_CHECK(book.curves[i].filled_quantity == whole[i].filled_quantity);
+        BOOST_CHECK_EQUAL(book.curves[i].points.size(), whole[i].points.size());
+    }
+    // The same indicative as over the whole book at once.
+    const auto paged{flowmesh::ComputeIndicative(book.curves, {})};
+    const auto direct{flowmesh::ComputeIndicative(whole, {})};
+    BOOST_CHECK_EQUAL(paged.available, direct.available);
+    BOOST_CHECK_EQUAL(paged.price, direct.price);
+    BOOST_CHECK_EQUAL(paged.volume, direct.volume);
+
+    // A book over the bound: one page is read, nothing more is copied.
+    calls = 0;
+    pages = 0;
+    const auto over{flowmesh::CopyBookCurves(head, read, pages, CURVES - 1)};
+    BOOST_CHECK_EQUAL(over.unavailable_reason, "work_budget");
+    BOOST_CHECK(over.curves.empty());
+    BOOST_CHECK_EQUAL(pages, 1U);
+    // A head that moves between reads ends the copy.
+    calls = 0;
+    pages = 0;
+    const flowmesh::BookPageReader moving = [&](const auto& after, const size_t limit) -> std::optional<flowmesh::ClearingEngine::CurvePage> {
+        if (++calls == 3) return std::nullopt;
+        return state.ReadCurves(limit, after);
+    };
+    const auto moved{flowmesh::CopyBookCurves(head, moving, pages)};
+    BOOST_CHECK_EQUAL(moved.unavailable_reason, "head_changed");
+    BOOST_CHECK(moved.curves.empty());
+    BOOST_CHECK_EQUAL(pages, 3U);
+
+    // A book that was not copied makes the view unavailable for its reason.
+    for (const char* reason : {"work_budget", "head_changed"}) {
+        flowmesh::MarketData data;
+        data.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{head, {}, reason});
+        flowmesh::MarketDataQuery query;
+        query.indicative = flowmesh::IndicativeQuery{};
+        flowmesh::ComputeMarketViews(data, query);
+        BOOST_CHECK(!data.book);
+        BOOST_REQUIRE(data.indicative);
+        BOOST_CHECK(!data.indicative->available);
+        BOOST_CHECK_EQUAL(data.indicative->unavailable_reason, reason);
+        BOOST_CHECK(data.indicative->head == head);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(imbalance_side_is_none_without_a_clearing_or_for_an_exact_match)
 {
     auto state{EmptyState()};

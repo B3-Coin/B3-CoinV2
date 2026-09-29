@@ -8,6 +8,7 @@
 #include <node/flowmesh_recent_window.h>
 
 #include <crypto/common.h>
+#include <flowmesh/market_view.h>
 #include <hash.h>
 #include <random.h>
 #include <serialize.h>
@@ -3420,10 +3421,86 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketData(
 {
     FlowMeshTimingSpan timing_lock_3102{__func__};
     timing_lock_3102.Field("lock_name", std::string{"market_mutex"});
-    timing_lock_3102.Mark("lock_requested_us");
-    std::lock_guard<std::mutex> lock{m_market_mutex};
-    timing_lock_3102.Mark("lock_acquired_us");
-    return MarketDataLocked(market_id, account, query, error);
+    // Freed after every lock below.
+    std::vector<std::shared_ptr<const flowmesh::BookCurves>> dropped;
+    std::optional<flowmesh::MarketData> out;
+    {
+        timing_lock_3102.Mark("lock_requested_us");
+        std::lock_guard<std::mutex> lock{m_market_mutex};
+        timing_lock_3102.Mark("lock_acquired_us");
+        PruneBookCaptures(dropped);
+        out = MarketDataLocked(market_id, account, query, error);
+        timing_lock_3102.Mark("lock_released_us");
+    }
+    // Display views only: the curves are copied page by page, never in one
+    // hold of the market lock, and the view is computed by the caller.
+    if (out && query.indicative && out->snapshot.certified) {
+        out->book = BookCopy(market_id, out->snapshot.last_microblock_hash, timing_lock_3102);
+    }
+    return out;
+}
+
+void FlowMeshRuntime::PruneBookCaptures(std::vector<std::shared_ptr<const flowmesh::BookCurves>>& dropped) const
+{
+    if (m_book_captures.empty()) return;
+    const auto now{m_config.clock->Now()};
+    for (auto it{m_book_captures.begin()}; it != m_book_captures.end();) {
+        const auto market{m_markets.find(it->first)};
+        if (market == m_markets.end() || market->second->last_hash != it->second.book->head ||
+            now - it->second.used >= BOOK_CAPTURE_IDLE) {
+            dropped.push_back(std::move(it->second.book));
+            it = m_book_captures.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::shared_ptr<const flowmesh::BookCurves> FlowMeshRuntime::BookCopy(
+    const flowmesh::MarketId& market_id, const uint256& head, FlowMeshTimingSpan& timing) const
+{
+    // Declared before every lock: freed after it.
+    std::vector<std::shared_ptr<const flowmesh::BookCurves>> dropped;
+    {
+        std::lock_guard<std::mutex> lock{m_market_mutex};
+        if (const auto held{m_book_captures.find(market_id)};
+            held != m_book_captures.end() && held->second.book->head == head) {
+            held->second.used = m_config.clock->Now();
+            timing.Field("book_copy", std::string{"reused"});
+            return held->second.book;
+        }
+    }
+    size_t pages{0};
+    std::chrono::steady_clock::duration longest{0};
+    auto book{std::make_shared<const flowmesh::BookCurves>(flowmesh::CopyBookCurves(
+        head,
+        [&](const std::optional<flowmesh::ClearingEngine::CurveKey>& after, const size_t limit)
+            -> std::optional<flowmesh::ClearingEngine::CurvePage> {
+            // One page per hold, exactly a curve-paging read's work.
+            std::lock_guard<std::mutex> lock{m_market_mutex};
+            const auto started{timing.Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
+            const auto it{m_markets.find(market_id)};
+            if (it == m_markets.end() || it->second->last_hash != head) return std::nullopt;
+            auto page{it->second->state.ReadCurves(limit, after)};
+            if (timing.Enabled()) longest = std::max(longest, std::chrono::steady_clock::now() - started);
+            return page;
+        },
+        pages))};
+    timing.Field("book_copy", book->unavailable_reason.empty() ? std::string{"copied"} : book->unavailable_reason);
+    timing.Field("book_copy_holds", uint64_t(pages));
+    timing.Field("book_copy_curves", uint64_t(book->curves.size()));
+    timing.Field("book_copy_longest_hold_us", uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(longest).count()));
+    if (book->unavailable_reason != "head_changed") {
+        // Retained for later reads at this head while it is current.
+        std::lock_guard<std::mutex> lock{m_market_mutex};
+        const auto it{m_markets.find(market_id)};
+        if (it != m_markets.end() && it->second->last_hash == head) {
+            auto& slot{m_book_captures[market_id]};
+            if (slot.book) dropped.push_back(std::move(slot.book));
+            slot = {book, m_config.clock->Now()};
+        }
+    }
+    return book;
 }
 
 std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
@@ -3502,16 +3579,8 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
             out.ticks.emplace().unavailable_reason = "history_not_ready";
         }
     }
-    // Only a copy is taken here, once per head; the view is computed outside
-    // this lock (FlowMeshService::MarketData).
-    if (query.indicative && snapshot.certified) {
-        auto& capture{m_book_captures[market_id]};
-        if (!capture || capture->head != market.last_hash) {
-            capture = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{
-                market.last_hash, market.state.ReadCurves(std::numeric_limits<size_t>::max()).curves});
-        }
-        out.book = capture;
-    }
+    // The curves a display view needs are copied by MarketData after this
+    // lock (BookCopy), and the view is computed outside every runtime lock.
     if (out.unchanged || query.status_only || !snapshot.certified) return out;
 
     out.liquidity = market.state.ReadCurves(query.curve_limit, query.curve_cursor);
@@ -3656,6 +3725,12 @@ FlowMeshClientOutcomeParts FlowMeshRuntime::ClientOutcomeParts(
 uint64_t FlowMeshRuntime::ClientEntryStoreReadsForTest() const
 {
     return m_client_entry_store_reads.load(std::memory_order_relaxed);
+}
+
+size_t FlowMeshRuntime::BookCapturesForTest() const
+{
+    std::lock_guard<std::mutex> lock{m_market_mutex};
+    return m_book_captures.size();
 }
 
 std::pair<size_t, size_t> FlowMeshRuntime::RecentWindowOthers(const Market& self) const

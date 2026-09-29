@@ -74,7 +74,8 @@ struct IndicativeQuery {
  * admitted (its balance and reservation are not checked). */
 struct IndicativeClearing {
     bool available{false};
-    //! "work_budget", "malformed_curve", "invalid_draft" or "overflow".
+    //! "work_budget", "malformed_curve", "invalid_draft", "overflow",
+    //! "no_certified_state" or "head_changed".
     std::string unavailable_reason;
     //! Certified head of the curves, set by the caller.
     uint256 head;
@@ -198,6 +199,10 @@ struct ClearingTickPage {
 struct BookCurves {
     uint256 head;
     std::vector<ClearingEngine::CurveView> curves;
+    //! Set when the curves were not copied ("work_budget": more than
+    //! MARKET_VIEW_MAX_BOOK_CURVES; "head_changed": the head moved during a
+    //! paged copy): the views are then unavailable for this reason.
+    std::string unavailable_reason;
 };
 
 struct MarketHistoryPage {

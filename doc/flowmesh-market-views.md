@@ -120,12 +120,23 @@ reason, never truncated.
 
 Where it runs:
 
-- local engine: the standing curves are copied under the market lock at most
-  once per certified head, and only when asked; the view is computed outside
-  every runtime lock;
+- local engine: the standing curves are copied at most once per certified
+  head, and only when asked, one curve-paging page (128 curves) per hold of
+  the market lock, exactly as a paged liquidity read takes it; no hold copies
+  the whole book. A head that moves between holds ends the copy (unavailable,
+  `head_changed`; the next read copies the new head). The copy is kept only
+  while its head is current and a view used it in the last 30 s; any
+  market-data read drops (and frees, after the lock) older ones. The view is
+  computed outside every runtime lock. On a validator whose wallet shows the
+  indicative this still adds one page's copy per hold to the market lock the
+  commit path also takes (the timing span records `book_copy_holds`,
+  `book_copy_curves` and `book_copy_longest_hold_us`);
 - remote client: from its BLS-verified whole state, copied once per cached
-  head under the work gate, computed after the gate is released, so no
-  signing preflight or action waits for it;
+  head under the work gate (a signing preflight or action poll behind it
+  waits for that copy, at most 16384 curves), computed after the gate is
+  released;
+- a book over 16384 standing curves is never copied: the view is unavailable
+  (`work_budget`, as the computation would exceed its budget on such a book);
 - the public API neither accepts nor serves it.
 
 ## 3. Qt
@@ -168,9 +179,11 @@ Wallet RPC callers that pass neither option get byte-identical replies.
 
 Unit: `flowmesh_market_view_tests` (rationed side against brute-force
 demand/supply, saturation, tick pages, indicative against ClearSlot, best
-prices against a scan, budgets), `flowmesh_production_store_tests` (sides
-across a handoff and replay), `flowmesh_runtime_tests` (ticks and the curve
-copy on an unchanged head), `flowmesh_client_ticks_tests` (page checks and
+prices against a scan, budgets, a 10,000-curve book copied one 128-curve
+page per read, over-bound and moved-head copies),
+`flowmesh_production_store_tests` (sides across a handoff and replay),
+`flowmesh_runtime_tests` (ticks, the curve copy on an unchanged head, and
+dropping copies of an old head or unused for 30 s), `flowmesh_client_ticks_tests` (page checks and
 merging), `flowmesh_client_market_view_tests` (public contract on and off,
 incremental remote ticks bound to the verified head, stale advertisement,
 contradicting page, live-update catch-up, indicative on both backends).

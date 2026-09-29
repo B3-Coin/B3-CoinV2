@@ -2707,9 +2707,10 @@ BOOST_AUTO_TEST_CASE(market_data_reads_ticks_and_copies_curves_on_an_unchanged_h
         BOOST_CHECK(!f.runtime->MarketData(f.market, std::nullopt, query, error));
     }
 
-    // Display views: the standing curves are copied under the market lock
-    // once per head, also for a light poll; nothing is computed there.
+    // Display views: the standing curves are copied once per head (a page
+    // per market-lock hold), also for a light poll; nothing is computed there.
     BOOST_CHECK(!plain->book && !light->book);
+    BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 0U);
     flowmesh::MarketDataQuery views;
     views.known_head = genesis->entry.GetHash();
     views.indicative = flowmesh::IndicativeQuery{};
@@ -2721,6 +2722,7 @@ BOOST_AUTO_TEST_CASE(market_data_reads_ticks_and_copies_curves_on_an_unchanged_h
     const auto again{f.runtime->MarketData(f.market, std::nullopt, views, error)};
     BOOST_REQUIRE(again);
     BOOST_CHECK(again->book == first->book);
+    BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 1U);
     auto computed{*again};
     flowmesh::ComputeMarketViews(computed, views);
     BOOST_CHECK(!computed.book);
@@ -2747,11 +2749,24 @@ BOOST_AUTO_TEST_CASE(market_data_reads_ticks_and_copies_curves_on_an_unchanged_h
         flowmesh::QueueResult::ACCEPTED);
     BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
     BOOST_REQUIRE_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 2U);
+    // Any read drops the copy of a head that is no longer current.
+    BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 1U);
+    BOOST_REQUIRE(f.runtime->MarketData(f.market, std::nullopt, {}, error));
+    BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 0U);
     const auto moved{f.runtime->MarketData(f.market, std::nullopt, views, error)};
     BOOST_REQUIRE(moved && moved->book);
     BOOST_CHECK(!moved->unchanged);
     BOOST_CHECK(moved->book != first->book);
     BOOST_CHECK(moved->book->head == next->entry.GetHash());
+    BOOST_CHECK(moved->book->unavailable_reason.empty());
+    BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 1U);
+    // ... and one no view has used for BOOK_CAPTURE_IDLE.
+    f.Tick(node::FlowMeshRuntime::BOOK_CAPTURE_IDLE - std::chrono::seconds{1});
+    BOOST_REQUIRE(f.runtime->MarketData(f.market, std::nullopt, {}, error));
+    BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 1U);
+    f.Tick(std::chrono::seconds{1});
+    BOOST_REQUIRE(f.runtime->MarketData(f.market, std::nullopt, {}, error));
+    BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 0U);
 }
 
 BOOST_AUTO_TEST_CASE(evidence_retry_budget_bounds_count_bytes_and_clock)

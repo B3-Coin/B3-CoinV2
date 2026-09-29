@@ -335,6 +335,27 @@ IndicativeClearing ComputeIndicative(const std::span<const ClearingEngine::Curve
     return out;
 }
 
+BookCurves CopyBookCurves(const uint256& head, const BookPageReader& read, size_t& pages, const size_t max_curves)
+{
+    BookCurves out{head, {}, {}};
+    const auto unavailable = [&](const char* reason) { return BookCurves{head, {}, reason}; };
+    std::optional<ClearingEngine::CurveKey> after;
+    for (;;) {
+        auto page{read(after, MARKET_DATA_MAX_CURVES)};
+        ++pages;
+        if (!page) return unavailable("head_changed");
+        if (page->total_curves > max_curves || page->curves.size() > max_curves - out.curves.size() ||
+            (page->next_cursor && page->curves.empty())) {
+            return unavailable("work_budget");
+        }
+        // Allocated by the caller of `read`, outside any lock it takes.
+        if (out.curves.capacity() < page->total_curves) out.curves.reserve(page->total_curves);
+        for (auto& curve : page->curves) out.curves.push_back(std::move(curve));
+        if (!page->next_cursor) return out;
+        after = page->next_cursor;
+    }
+}
+
 void ComputeMarketViews(MarketData& data, const MarketDataQuery& query)
 {
     const auto book{std::move(data.book)};
@@ -344,6 +365,13 @@ void ComputeMarketViews(MarketData& data, const MarketDataQuery& query)
         auto& unavailable{data.indicative.emplace()};
         unavailable.draft = query.indicative->draft;
         unavailable.unavailable_reason = "no_certified_state";
+        return;
+    }
+    if (!book->unavailable_reason.empty()) {
+        auto& unavailable{data.indicative.emplace()};
+        unavailable.draft = query.indicative->draft;
+        unavailable.unavailable_reason = book->unavailable_reason;
+        unavailable.head = book->head;
         return;
     }
     data.indicative = ComputeIndicative(book->curves, *query.indicative);
