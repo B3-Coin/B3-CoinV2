@@ -16,6 +16,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -27,12 +29,60 @@ inline constexpr size_t CLIENT_EVENT_CAPACITY{2048};
 inline constexpr size_t CLIENT_EVENT_PAGE_MAX{256};
 //! Per notice origin (ClientNoticeOrigin): each origin has its own ring.
 inline constexpr size_t CLIENT_NOTICE_CAPACITY{2048};
-//! PUBLIC ring only: at most this many notices per requesting identity
-//! (ClientActionNotice::submitter; notices whose identity is unknown share
-//! one such share). An identity's own oldest notice makes room for its next,
-//! so turning the ring over takes CLIENT_NOTICE_CAPACITY /
-//! CLIENT_NOTICE_PER_SUBMITTER identities, never one.
+//! PUBLIC ring only: one requesting identity's share once the ring is full
+//! (ClientActionNotice::submitter, applied by IdentityShares; notices whose
+//! identity is unknown count as one identity). While there is room every
+//! notice is kept, so one identity alone can use the whole ring. Once full,
+//! an identity holding this many or more replaces its own oldest notice, and
+//! an identity within its share loses one to others only when more than
+//! CLIENT_NOTICE_CAPACITY / CLIENT_NOTICE_PER_SUBMITTER identities hold
+//! notices, never through one identity's traffic.
 inline constexpr size_t CLIENT_NOTICE_PER_SUBMITTER{64};
+
+/**
+ * Which entry a bounded, oldest-first collection drops once one entry too
+ * many is held, when each entry belongs to one requesting identity (the
+ * empty string is one identity too). Entries are named by serials that only
+ * increase. Every entry is kept while at most `capacity` are held, so one
+ * identity alone can use the whole capacity. Past it, Insert names one entry
+ * to drop:
+ * - the inserting identity's own oldest, when it already held `share` or
+ *   more;
+ * - otherwise the oldest entry of an identity holding more than `share`;
+ * - otherwise the oldest entry overall.
+ * Once full, an identity at its share therefore only replaces its own
+ * entries, an identity over its share loses its oldest first, and an
+ * identity within its share loses an entry only when every identity is
+ * within its share, which takes more than capacity / share identities.
+ * Every operation is logarithmic in the entries held.
+ */
+class IdentityShares
+{
+public:
+    IdentityShares(size_t capacity, size_t share);
+    /** Records `serial`, above every serial recorded before, for `identity`.
+     * Returns the serial to drop when this makes one entry too many; it is
+     * never `serial` itself and is already forgotten here. */
+    std::optional<uint64_t> Insert(uint64_t serial, const std::string& identity);
+    //! Forgets `serial`, if recorded.
+    void Erase(uint64_t serial);
+    //! The identity `serial` was recorded for, if it is recorded.
+    const std::string* Identity(uint64_t serial) const;
+    size_t Size() const { return m_identity.size(); }
+    void Clear();
+
+private:
+    using Serials = std::map<std::string, std::set<uint64_t>>;
+    // An identity over its share has its oldest serial in m_over_share.
+    void Unindex(const Serials::iterator& owner);
+    void Index(const Serials::iterator& owner);
+
+    size_t m_capacity;
+    size_t m_share;
+    std::map<uint64_t, std::string> m_identity; // oldest first
+    Serials m_serials;
+    std::set<uint64_t> m_over_share;
+};
 //! Concurrent event watches (ClientEventLog::WaitEvents) per log. Defence in
 //! depth only: every caller bounds its own watchers far below this.
 inline constexpr size_t CLIENT_EVENT_MAX_WATCHERS{64};
@@ -157,9 +207,9 @@ struct ClientActionNotice {
     //! The ring it is kept in.
     ClientNoticeOrigin origin{ClientNoticeOrigin::PUBLIC};
     //! PUBLIC only: the requesting client identity whose attempt caused it
-    //! (an IPv4 address, or an IPv6 /64), empty when unknown. Picks the
-    //! notice's share of the PUBLIC ring (CLIENT_NOTICE_PER_SUBMITTER);
-    //! memory-only and never in any reply.
+    //! (an IPv4 address, or an IPv6 /64), empty when unknown. Names whose
+    //! share of the full PUBLIC ring it counts against
+    //! (CLIENT_NOTICE_PER_SUBMITTER); memory-only and never in any reply.
     std::string submitter;
     //! Append order across both rings, set by AppendNotices.
     uint64_t serial{0};
@@ -265,9 +315,9 @@ public:
     /** Appends local notices in order under one lock, with at most one
      * wakeup and only while an include_notices wait exists. Each goes to the
      * bounded ring of its origin (CLIENT_NOTICE_CAPACITY each), so notices of
-     * one origin never evict the other's; in the PUBLIC ring, a submitter at
-     * its share (CLIENT_NOTICE_PER_SUBMITTER) evicts its own oldest notice,
-     * never another's. Never touches the v1 events. */
+     * one origin never evict the other's. The PUBLIC ring keeps every notice
+     * while it has room; once full, IdentityShares picks the notice that goes
+     * (CLIENT_NOTICE_PER_SUBMITTER). Never touches the v1 events. */
     void AppendNotices(std::vector<ClientActionNotice> notices);
     std::optional<ClientActionNotice> NewestNotice(const MarketId& market, const uint256& action_id) const;
     //! The newest notice only while it is newer than every retained event of
@@ -326,11 +376,12 @@ private:
     std::deque<ClientEvent> m_events;
     // Notices: one separate ring per origin, their own change counter and
     // waiter count. m_notice_serial orders appends across both rings. The
-    // PUBLIC ring is keyed by serial (oldest first), with each submitter's
-    // retained serials, oldest first; both hold at most CLIENT_NOTICE_CAPACITY.
+    // PUBLIC ring is keyed by serial (oldest first), and m_public_shares
+    // holds the same serials by submitter; both hold at most
+    // CLIENT_NOTICE_CAPACITY.
     std::deque<ClientActionNotice> m_notices;
     std::map<uint64_t, ClientActionNotice> m_public_notices;
-    std::map<std::string, std::deque<uint64_t>> m_public_by_submitter;
+    IdentityShares m_public_shares{CLIENT_NOTICE_CAPACITY, CLIENT_NOTICE_PER_SUBMITTER};
     uint64_t m_notice_serial{0};
     uint64_t m_notice_changes{0};
     mutable size_t m_notice_waiters{0};

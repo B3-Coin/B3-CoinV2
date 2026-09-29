@@ -206,6 +206,66 @@ const char* ClientWatchResultName(const ClientWatchResult result)
 
 ClientEventLog::ClientEventLog(const uint256& instance_id) : m_instance_id{instance_id} {}
 
+IdentityShares::IdentityShares(const size_t capacity, const size_t share)
+    : m_capacity{std::max<size_t>(capacity, 1)}, m_share{std::max<size_t>(share, 1)} {}
+
+void IdentityShares::Unindex(const Serials::iterator& owner)
+{
+    if (owner->second.size() > m_share) m_over_share.erase(*owner->second.begin());
+}
+
+void IdentityShares::Index(const Serials::iterator& owner)
+{
+    if (owner->second.size() > m_share) m_over_share.insert(*owner->second.begin());
+}
+
+std::optional<uint64_t> IdentityShares::Insert(const uint64_t serial, const std::string& identity)
+{
+    const auto owner{m_serials.try_emplace(identity).first};
+    const size_t held{owner->second.size()};
+    Unindex(owner);
+    owner->second.insert(serial);
+    Index(owner);
+    m_identity.emplace(serial, identity);
+    if (m_identity.size() <= m_capacity) return std::nullopt;
+    // `serial` is the newest entry: at `share` or more the identity has an
+    // older one, within its share it is not over it, and past the capacity
+    // (at least one) the oldest overall is another entry.
+    const uint64_t drop{held >= m_share ? *owner->second.begin()
+                        : !m_over_share.empty() ? *m_over_share.begin()
+                        : m_identity.begin()->first};
+    Erase(drop);
+    return drop;
+}
+
+void IdentityShares::Erase(const uint64_t serial)
+{
+    const auto it{m_identity.find(serial)};
+    if (it == m_identity.end()) return;
+    const auto owner{m_serials.find(it->second)};
+    Unindex(owner);
+    owner->second.erase(serial);
+    if (owner->second.empty()) {
+        m_serials.erase(owner);
+    } else {
+        Index(owner);
+    }
+    m_identity.erase(it);
+}
+
+const std::string* IdentityShares::Identity(const uint64_t serial) const
+{
+    const auto it{m_identity.find(serial)};
+    return it == m_identity.end() ? nullptr : &it->second;
+}
+
+void IdentityShares::Clear()
+{
+    m_identity.clear();
+    m_serials.clear();
+    m_over_share.clear();
+}
+
 bool ClientNoticeEndsWait(const ActionReasonCode code)
 {
     return code == ActionReasonCode::STALE_SEQUENCE || code == ActionReasonCode::DROPPED_SEQUENCE_CONSUMED ||
@@ -223,7 +283,7 @@ void ClientEventLog::Reset(const uint256& instance_id)
         m_events.clear();
         m_notices.clear();
         m_public_notices.clear();
-        m_public_by_submitter.clear();
+        m_public_shares.Clear();
         ++m_notice_changes;
         SignalWatchersLocked(std::nullopt, signalled);
     }
@@ -270,22 +330,11 @@ void ClientEventLog::AppendNotices(std::vector<ClientActionNotice> notices)
                 if (m_notices.size() > CLIENT_NOTICE_CAPACITY) m_notices.pop_front();
                 continue;
             }
-            // A submitter at its share makes room from its own notices.
-            auto& own{m_public_by_submitter[notice.submitter]};
-            if (own.size() >= CLIENT_NOTICE_PER_SUBMITTER) {
-                m_public_notices.erase(own.front());
-                own.pop_front();
-            }
-            own.push_back(notice.serial);
+            // Kept while the ring has room; once full, the identities'
+            // shares pick the notice that goes.
+            const auto dropped{m_public_shares.Insert(notice.serial, notice.submitter)};
             m_public_notices.emplace(notice.serial, std::move(notice));
-            if (m_public_notices.size() > CLIENT_NOTICE_CAPACITY) {
-                // The ring's oldest is its submitter's oldest.
-                const auto oldest{m_public_notices.begin()};
-                const auto owner{m_public_by_submitter.find(oldest->second.submitter)};
-                owner->second.pop_front();
-                if (owner->second.empty()) m_public_by_submitter.erase(owner);
-                m_public_notices.erase(oldest);
-            }
+            if (dropped) m_public_notices.erase(*dropped);
         }
         ++m_notice_changes;
         notify = m_notice_waiters != 0;

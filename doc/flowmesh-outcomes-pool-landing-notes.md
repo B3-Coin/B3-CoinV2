@@ -138,9 +138,17 @@ Public traffic can no longer evict the notices this node's own not-executed
 proofs need.
 
 Inside the public ring, each requesting identity (an IPv4 address, or an
-IPv6 /64, as the API admission budgets count them) holds at most 64
-notices. At that share its own oldest notice makes room for its next, never
-another identity's. Notices whose identity is unknown share one such share.
+IPv6 /64, as the API admission budgets count them) has a share of 64
+notices, which applies only once the ring is full. Until then every notice
+is kept, so one client, or every client behind one NAT address, /64 or
+TLS-passthrough load balancer, can hold all 2,048. Once the ring is full,
+each new notice evicts one:
+
+- the submitting identity's own oldest, if it already holds 64 or more;
+- otherwise the oldest notice of any identity that holds more than 64;
+- otherwise the oldest notice overall.
+
+Notices whose identity is unknown count as one identity.
 
 The identity is the client that first queued the action, so the worker's
 recheck and pool-drop notices count against it too. The runtime remembers it
@@ -152,10 +160,13 @@ A public deposit refused because its outpoint has no anchored facts appends
 no notice: it carries no credential, and the refusal is already in the
 submit reply.
 
-One identity therefore cannot turn the public ring over; that takes at
-least 32 identities flooding at once. A remote client's proof then reads
-"unknown", which is safe. An already-included resubmission appends no
-notice at all.
+One identity therefore cannot turn the public ring over. An identity that
+holds at most 64 notices loses one to other identities only once every
+identity holds at most 64, which takes at least 32 other identities
+flooding at once. Under that pressure, clients sharing one identity also
+share its 64: a busy NAT address, /64 or load balancer then keeps only its
+newest 64 notices. A remote client's evicted proof reads "unknown", which
+is safe. An already-included resubmission appends no notice at all.
 
 ## Foreground latency of outcome re-proofs
 
