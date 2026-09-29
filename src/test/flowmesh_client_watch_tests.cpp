@@ -29,7 +29,7 @@ Eligibility Eligible(std::chrono::milliseconds requested = 1500ms)
 }
 } // namespace
 
-BOOST_AUTO_TEST_SUITE(flowmesh_client_watch_tests_pure)
+BOOST_AUTO_TEST_SUITE(flowmesh_client_watch_tests)
 
 BOOST_AUTO_TEST_CASE(advertised_updates_watch_is_capped_and_malformed_hints_disable_it)
 {

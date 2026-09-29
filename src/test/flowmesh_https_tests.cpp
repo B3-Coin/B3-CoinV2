@@ -4095,7 +4095,7 @@ flowmesh::MarketDataQuery Page()
 }
 } // namespace
 
-BOOST_FIXTURE_TEST_SUITE(flowmesh_client_watch_tests, ClientLaneFixture)
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_watch_lane_tests, ClientLaneFixture)
 
 BOOST_AUTO_TEST_CASE(event_gap_is_raised_only_when_a_snapshot_skips_events)
 {
