@@ -57,6 +57,38 @@ static UniValue ClearingTicksJson(const flowmesh::ClearingTickPage& page, const 
     out.pushKV("ticks", std::move(ticks));
     return out;
 }
+//! Present only when requested. Never certified: computed by this node from
+//! the verified standing curves it holds, without any pending action.
+static UniValue IndicativeJson(const flowmesh::IndicativeClearing& value)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("available", value.available);
+    if (!value.available) out.pushKV("unavailable_reason", value.unavailable_reason);
+    out.pushKV("certified", false);
+    out.pushKV("excludes_pending_actions", true);
+    out.pushKV("basis", value.draft ? "verified_standing_curves_with_draft" : "verified_standing_curves");
+    out.pushKV("head", value.head.GetHex());
+    if (value.draft) {
+        UniValue draft{UniValue::VOBJ};
+        draft.pushKV("side", value.draft->side == flowmesh::ClearingEngine::Side::BID ? "bid" : "ask");
+        draft.pushKV("price", value.draft->price);
+        draft.pushKV("quantity", value.draft->quantity);
+        draft.pushKV("account_known", value.draft->account.has_value());
+        draft.pushKV("replaces_standing_curve", value.draft_replaces_curve);
+        draft.pushKV("assumes_admission", true);
+        out.pushKV("draft", std::move(draft));
+    }
+    out.pushKV("cleared", value.cleared);
+    out.pushKV("price", value.price);
+    out.pushKV("volume", value.volume);
+    out.pushKV("imbalance", value.imbalance);
+    out.pushKV("imbalance_side", flowmesh::ImbalanceSideName(value.imbalance_side));
+    if (value.best_bid) out.pushKV("best_bid", *value.best_bid);
+    if (value.best_ask) out.pushKV("best_ask", *value.best_ask);
+    if (value.draft_fill_min) out.pushKV("draft_fill_min", *value.draft_fill_min);
+    if (value.draft_fill_max) out.pushKV("draft_fill_max", *value.draft_fill_max);
+    return out;
+}
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data)
 {
     UniValue out{UniValue::VOBJ};
@@ -117,6 +149,7 @@ UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data)
     verification.pushKV("freshest_network_head_proven", false);
     out.pushKV("verification", std::move(verification));
     if (data.ticks) out.pushKV("clearing_ticks", ClearingTicksJson(*data.ticks, data.remote));
+    if (data.indicative) out.pushKV("indicative", IndicativeJson(*data.indicative));
     if (data.unchanged) return out;
 
     UniValue liquidity{UniValue::VOBJ};

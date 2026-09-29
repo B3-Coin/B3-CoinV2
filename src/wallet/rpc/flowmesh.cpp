@@ -112,13 +112,15 @@ static void StageReceipt(interfaces::FlowMeshActionReceipt& receipt, const bool 
     receipt.stage = node::FlowMeshReceiptStage(receipt, may_have_been_sent, retained);
 }
 
+static CAmount ExactPositiveAmount(const UniValue& value, const std::string& name);
+
 static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
 {
     flowmesh::MarketDataQuery query;
     if (options.isNull()) return query;
     if (!options.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "options must be an object");
     const std::set<std::string> allowed{
-        "limit", "curve_limit", "before_sequence", "curve_cursor", "expected_head", "known_head", "ticks"};
+        "limit", "curve_limit", "before_sequence", "curve_cursor", "expected_head", "known_head", "ticks", "indicative"};
     for (const auto& key : options.getKeys()) {
         if (!allowed.contains(key)) throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown option '" + key + "'");
     }
@@ -172,6 +174,30 @@ static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
             tick_query.after_sequence = integer("after_sequence", 0, std::numeric_limits<uint64_t>::max(), &ticks);
         }
         if (ticks.exists("limit")) tick_query.limit = integer("limit", 1, flowmesh::MARKET_DATA_MAX_TICKS, &ticks);
+    }
+    if (options.exists("indicative")) {
+        const UniValue& indicative{options["indicative"]};
+        if (!indicative.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "indicative must be an object");
+        for (const auto& key : indicative.getKeys()) {
+            if (key != "draft") throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown indicative option '" + key + "'");
+        }
+        auto& indicative_query{query.indicative.emplace()};
+        if (indicative.exists("draft")) {
+            const UniValue& draft{indicative["draft"]};
+            if (!draft.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "indicative draft must be an object");
+            for (const auto& key : draft.getKeys()) {
+                if (key != "side" && key != "price" && key != "quantity") {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown indicative draft option '" + key + "'");
+                }
+            }
+            if (!draft["side"].isStr() || (draft["side"].get_str() != "bid" && draft["side"].get_str() != "ask")) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "indicative draft side must be bid or ask");
+            }
+            // The signing account is the caller's: added by the RPC itself.
+            indicative_query.draft = flowmesh::IndicativeDraft{
+                draft["side"].get_str() == "bid" ? flowmesh::ClearingEngine::Side::BID : flowmesh::ClearingEngine::Side::ASK,
+                ExactPositiveAmount(draft["price"], "price"), ExactPositiveAmount(draft["quantity"], "quantity"), std::nullopt};
+        }
     }
     return query;
 }
@@ -1067,6 +1093,13 @@ RPCHelpMan getflowmeshmarketdata()
                     {"after_sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Ticks after this microblock sequence; omit for the newest"},
                     {"limit", RPCArg::Type::NUM, RPCArg::Default{64}, "Ticks, 1-256"},
                 }},
+                {"indicative", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Indicative next clearing of the verified standing curves, also returned with an unchanged known_head; never certified", {
+                    {"draft", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "A prospective limit order of this wallet's account, replacing its standing curve on that side", {
+                        {"side", RPCArg::Type::STR, RPCArg::Optional::NO, "bid or ask"},
+                        {"price", RPCArg::Type::NUM, RPCArg::Optional::NO, "Limit price in B3 atomic units per base unit"},
+                        {"quantity", RPCArg::Type::NUM, RPCArg::Optional::NO, "Exact integer base-asset quantity"},
+                    }},
+                }},
             }},
         },
         RPCResult{T::OBJ, "", "Bounded certified market snapshot", {
@@ -1109,6 +1142,31 @@ RPCHelpMan getflowmeshmarketdata()
                         {T::STR, "imbalance_side", "Side left unfilled at the price: bid, ask, none, or unknown when it was not observed"},
                     }},
                 }},
+            }},
+            {T::OBJ, "indicative", /*optional=*/true, "Present only when indicative was given. NOT certified: what the next clearing would be if the verified standing curves (and the draft) were cleared now; actions not yet certified are excluded", {
+                {T::BOOL, "available", "Computed within its bounded work"},
+                {T::STR, "unavailable_reason", /*optional=*/true, "work_budget, malformed_curve, invalid_draft, overflow or no_certified_state"},
+                {T::BOOL, "certified", "Always false"},
+                {T::BOOL, "excludes_pending_actions", "Always true: queued and uncertified actions are not included"},
+                {T::STR, "basis", "verified_standing_curves or verified_standing_curves_with_draft"},
+                {T::STR_HEX, "head", "Certified head whose curves were used; compare with snapshot.last_microblock_hash"},
+                {T::OBJ, "draft", /*optional=*/true, "The draft as evaluated", {
+                    {T::STR, "side", "bid or ask"},
+                    {T::NUM, "price", "Limit price in B3 atoms per base unit"},
+                    {T::NUM, "quantity", "Base units"},
+                    {T::BOOL, "account_known", "This wallet's account is known, so its rationed fill is exact"},
+                    {T::BOOL, "replaces_standing_curve", "The draft replaces this account's standing curve on that side"},
+                    {T::BOOL, "assumes_admission", "Always true: balance and reservation are not checked"},
+                }},
+                {T::BOOL, "cleared", "A nonzero match would occur"},
+                {T::NUM, "price", "Uniform price it would clear at; zero when not cleared"},
+                {T::NUM, "volume", "Base units it would match"},
+                {T::NUM, "imbalance", "|demand - supply| at that price, saturated at the monetary maximum"},
+                {T::STR, "imbalance_side", "Side that would be left unfilled: bid, ask or none"},
+                {T::NUM, "best_bid", /*optional=*/true, "Highest price with standing bid quantity, over every verified curve (never the draft)"},
+                {T::NUM, "best_ask", /*optional=*/true, "Lowest price with standing ask quantity, over every verified curve (never the draft)"},
+                {T::NUM, "draft_fill_min", /*optional=*/true, "The draft's fill at that price (exact when equal to draft_fill_max)"},
+                {T::NUM, "draft_fill_max", /*optional=*/true, "Upper bound of the draft's fill"},
             }},
             {T::OBJ, "watch", /*optional=*/true, "Present only when watch_ms was given: this read's local latency observation, never evidence", {
                 {T::STR, "status", "none, no_cursor, head_changed, ready, gap, timeout, interrupted, restarted, busy, deadline (endpoint), or not_eligible, lane_busy, superseded, unsupported, failed, revalidate, invalid, other (this client)"},
@@ -1227,11 +1285,13 @@ RPCHelpMan getflowmeshmarketdata()
                 }
                 options = std::move(rest);
             }
-            const auto query{ParseMarketDataQuery(options)};
+            auto query{ParseMarketDataQuery(options)};
             if (watch_ms && (query.before_sequence || query.curve_cursor || query.expected_head)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "watch_ms cannot be combined with before_sequence, curve_cursor or expected_head");
             }
             const auto account{ExistingWalletAccount(*wallet)};
+            // A draft is this wallet's own prospective order.
+            if (query.indicative && query.indicative->draft) query.indicative->draft->account = account;
             std::string error;
             interfaces::FlowMeshMarketWatch watch;
             const auto data{watch_ms ? wallet->chain().flowMeshWatchMarketData(market_id, account, query, *watch_ms, watch, error)

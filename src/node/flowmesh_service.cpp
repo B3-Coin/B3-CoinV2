@@ -8,6 +8,7 @@
 #include <chain.h>
 #include <consensus/era.h>
 #include <flowmesh/fee_allocation.h>
+#include <flowmesh/market_view.h>
 #include <hash.h>
 #include <logging.h>
 #include <modern/asset_output.h>
@@ -2181,6 +2182,8 @@ std::optional<flowmesh::MarketData> FlowMeshService::MarketData(
         return std::nullopt;
     }
     auto out{runtime->MarketData(market_id, account, query, error)};
+    // Display views of the copied curves, outside every runtime lock.
+    if (out) flowmesh::ComputeMarketViews(*out, query);
     if (out) {
         out->snapshot.running = running;
         const bool rules_active{m_impl->RulesActiveAtTip()};

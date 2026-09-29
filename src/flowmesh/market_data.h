@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,33 +25,6 @@ inline constexpr size_t MARKET_DATA_MAX_FILL_ACCOUNTS{128};
 //! A clearing-tick page holds at most every retained history entry.
 inline constexpr size_t MARKET_DATA_MAX_TICKS{MARKET_DATA_HISTORY_CAPACITY};
 inline constexpr size_t MARKET_DATA_DEFAULT_TICKS{64};
-
-//! A bounded page of clearing ticks, oldest first.
-struct ClearingTickQuery {
-    //! Ticks after this microblock sequence; absent: the newest `limit`.
-    std::optional<uint64_t> after_sequence;
-    size_t limit{MARKET_DATA_DEFAULT_TICKS};
-};
-
-struct MarketDataQuery {
-    size_t limit{50};
-    size_t curve_limit{128};
-    std::optional<uint64_t> before_sequence;
-    std::optional<ClearingEngine::CurveKey> curve_cursor;
-    std::optional<uint256> expected_head;
-    std::optional<uint256> known_head;
-    //! Head and runtime status only: no curves, account or history are read.
-    //! A local read option, never part of any codec or reply format.
-    bool status_only{false};
-    //! Clearing ticks, also read for a light known_head poll.
-    std::optional<ClearingTickQuery> ticks;
-};
-
-struct MarketAccountFill {
-    AccountId account_id;
-    CAmount bid_quantity{0};
-    CAmount ask_quantity{0};
-};
 
 /** Which side a clearing left unfilled at its uniform price: BID when buy
  * interest remained, ASK when sell interest did. NONE for an exact match, an
@@ -69,6 +43,81 @@ inline const char* ImbalanceSideName(const ImbalanceSide side)
     }
     return "unknown";
 }
+
+//! A bounded page of clearing ticks, oldest first.
+struct ClearingTickQuery {
+    //! Ticks after this microblock sequence; absent: the newest `limit`.
+    std::optional<uint64_t> after_sequence;
+    size_t limit{MARKET_DATA_DEFAULT_TICKS};
+};
+
+/** A prospective limit order exactly as the wallet would build it
+ * (MakeLimitBidCurve / MakeLimitAskCurve). Submitted, it would replace the
+ * signing account's standing curve on the same side. */
+struct IndicativeDraft {
+    ClearingEngine::Side side{ClearingEngine::Side::BID};
+    CAmount price{0};
+    CAmount quantity{0};
+    //! The account that would sign it. Absent (no account yet): a new curve,
+    //! and the draft's fill under rationing is reported as bounds.
+    std::optional<AccountId> account;
+    bool operator==(const IndicativeDraft&) const = default;
+};
+
+struct IndicativeQuery {
+    std::optional<IndicativeDraft> draft;
+};
+
+/** What the next clearing would be if the verified standing curves (plus
+ * the draft, if any) were cleared as they are. NOT certified: every action
+ * not yet in the verified state is excluded, and the draft is assumed to be
+ * admitted (its balance and reservation are not checked). */
+struct IndicativeClearing {
+    bool available{false};
+    //! "work_budget", "malformed_curve", "invalid_draft" or "overflow".
+    std::string unavailable_reason;
+    //! Certified head of the curves, set by the caller.
+    uint256 head;
+    std::optional<IndicativeDraft> draft;
+    //! The draft replaces its account's standing curve on that side.
+    bool draft_replaces_curve{false};
+    bool cleared{false};
+    CAmount price{0};
+    CAmount volume{0};
+    //! |demand - supply| at the price, saturated at MAX_MONEY as committed.
+    CAmount imbalance{0};
+    ImbalanceSide imbalance_side{ImbalanceSide::NONE};
+    //! Highest price with standing bid quantity and lowest with standing ask
+    //! quantity, over every verified curve (never the draft).
+    std::optional<CAmount> best_bid;
+    std::optional<CAmount> best_ask;
+    //! The draft's fill at the price: exact largest-remainder rationing when
+    //! its account is known (min == max), otherwise its bounds.
+    std::optional<CAmount> draft_fill_min;
+    std::optional<CAmount> draft_fill_max;
+};
+
+struct MarketDataQuery {
+    size_t limit{50};
+    size_t curve_limit{128};
+    std::optional<uint64_t> before_sequence;
+    std::optional<ClearingEngine::CurveKey> curve_cursor;
+    std::optional<uint256> expected_head;
+    std::optional<uint256> known_head;
+    //! Head and runtime status only: no curves, account or history are read.
+    //! A local read option, never part of any codec or reply format.
+    bool status_only{false};
+    //! Clearing ticks, also read for a light known_head poll.
+    std::optional<ClearingTickQuery> ticks;
+    //! Indicative next clearing, also computed for a light known_head poll.
+    std::optional<IndicativeQuery> indicative;
+};
+
+struct MarketAccountFill {
+    AccountId account_id;
+    CAmount bid_quantity{0};
+    CAmount ask_quantity{0};
+};
 
 /** Derived only from fully verified execution results, after durable commit.
  * There is deliberately no fabricated execution timestamp or candle. */
@@ -142,6 +191,13 @@ struct ClearingTickPage {
     bool gap{false};
     //! Retained ticks follow this page: continue after its last sequence.
     bool more{false};
+};
+
+//! The standing curves of one certified head, copied once for display
+//! views. Transient: never projected, serialized or read for signing.
+struct BookCurves {
+    uint256 head;
+    std::vector<ClearingEngine::CurveView> curves;
 };
 
 struct MarketHistoryPage {
@@ -222,6 +278,10 @@ struct MarketData {
     MarketHistoryPage history;
     //! Present only when the query asked for clearing ticks.
     std::optional<ClearingTickPage> ticks;
+    //! Present only when the query asked for it; never certified.
+    std::optional<IndicativeClearing> indicative;
+    //! Transient input of ComputeMarketViews; never projected or serialized.
+    std::shared_ptr<const BookCurves> book;
     //! Public-client verification observations; never serialized into state roots.
     bool remote{false};
     bool certificate_verified{false};

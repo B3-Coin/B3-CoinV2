@@ -5555,3 +5555,63 @@ BOOST_AUTO_TEST_CASE(local_backend_watch_wakes_on_commit_and_needs_known_head)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_market_view_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(indicative_clearing_comes_from_verified_state_on_both_backends)
+{
+    LiveMarket live{*this, m_path_root / "views-service"};
+    std::string error;
+    auto remote{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "views-client", error)};
+    BOOST_REQUIRE_MESSAGE(remote, error);
+    auto local{node::MakeLocalFlowMeshBackend(*live.service)};
+    const uint256 account{uint8_t{0x41}};
+    auto query{Page()};
+    query.indicative = flowmesh::IndicativeQuery{flowmesh::IndicativeDraft{flowmesh::ClearingEngine::Side::ASK, 5, 1, account}};
+    for (auto* backend : {remote.get(), local.get()}) {
+        BOOST_TEST_CONTEXT((backend == remote.get() ? "remote" : "local")) {
+            const auto data{backend->Data(market, account, query, error)};
+            BOOST_REQUIRE_MESSAGE(data, error);
+            BOOST_CHECK(!data->book); // The transient copy never leaves the backend.
+            BOOST_REQUIRE(data->indicative);
+            const auto& view{*data->indicative};
+            BOOST_CHECK(view.available);
+            BOOST_CHECK(view.head == data->snapshot.last_microblock_hash);
+            BOOST_CHECK(view.draft == query.indicative->draft);
+            // The verified book is empty: nothing would clear.
+            BOOST_CHECK(!view.cleared && !view.draft_replaces_curve && !view.best_bid && !view.best_ask);
+            BOOST_CHECK(view.draft_fill_min == CAmount{0} && view.draft_fill_max == CAmount{0});
+            const auto json{node::FlowMeshClientMarketDataJson(*data)};
+            BOOST_CHECK(!json["indicative"]["certified"].get_bool());
+            BOOST_CHECK(json["indicative"]["excludes_pending_actions"].get_bool());
+            BOOST_CHECK_EQUAL(json["indicative"]["basis"].get_str(), "verified_standing_curves_with_draft");
+            BOOST_CHECK(json["indicative"]["draft"]["assumes_admission"].get_bool());
+            BOOST_CHECK(json["indicative"]["draft"]["account_known"].get_bool());
+            // A light poll at the same head still answers.
+            auto light{query};
+            light.known_head = data->snapshot.last_microblock_hash;
+            const auto unchanged{backend->Data(market, account, light, error)};
+            BOOST_REQUIRE_MESSAGE(unchanged, error);
+            BOOST_CHECK(unchanged->unchanged);
+            BOOST_REQUIRE(unchanged->indicative);
+            BOOST_CHECK(unchanged->indicative->available);
+            BOOST_CHECK(unchanged->indicative->head == data->snapshot.last_microblock_hash);
+            BOOST_CHECK(node::FlowMeshClientMarketDataJson(*unchanged).exists("indicative"));
+            // Not asked for: absent, and the reply is unchanged.
+            const auto plain{backend->Data(market, account, Page(), error)};
+            BOOST_REQUIRE_MESSAGE(plain, error);
+            BOOST_CHECK(!plain->indicative && !plain->ticks);
+            BOOST_CHECK(!node::FlowMeshClientMarketDataJson(*plain).exists("indicative"));
+        }
+    }
+    // A new certified head: the remote view follows the newly verified state.
+    live.Deposit();
+    const auto moved{remote->Data(market, account, query, error)};
+    BOOST_REQUIRE_MESSAGE(moved, error);
+    BOOST_REQUIRE(moved->indicative);
+    BOOST_CHECK_EQUAL(moved->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(moved->indicative->head == moved->snapshot.last_microblock_hash);
+    remote.reset();
+}
+
+BOOST_AUTO_TEST_SUITE_END()

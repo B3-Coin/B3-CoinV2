@@ -6,6 +6,7 @@
 
 #include <flowmesh/auth.h>
 #include <flowmesh/agreement_wire.h>
+#include <flowmesh/market_view.h>
 #include <flowmesh/outcome_evidence.h>
 #include <hash.h>
 #include <logging.h>
@@ -2649,7 +2650,7 @@ BOOST_AUTO_TEST_CASE(catchup_timeout_reduces_page_count_without_relaxing_deadlin
     check_request(64, 1); // disconnect clears the local adaptive profile
 }
 
-BOOST_AUTO_TEST_CASE(market_data_reads_clearing_ticks_on_an_unchanged_head)
+BOOST_AUTO_TEST_CASE(market_data_reads_ticks_and_copies_curves_on_an_unchanged_head)
 {
     DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_ticks_unchanged_head",
                              node::FlowMeshDeliveryAdmission::FULL, false};
@@ -2705,6 +2706,52 @@ BOOST_AUTO_TEST_CASE(market_data_reads_clearing_ticks_on_an_unchanged_head)
         query.ticks->limit = limit;
         BOOST_CHECK(!f.runtime->MarketData(f.market, std::nullopt, query, error));
     }
+
+    // Display views: the standing curves are copied under the market lock
+    // once per head, also for a light poll; nothing is computed there.
+    BOOST_CHECK(!plain->book && !light->book);
+    flowmesh::MarketDataQuery views;
+    views.known_head = genesis->entry.GetHash();
+    views.indicative = flowmesh::IndicativeQuery{};
+    const auto first{f.runtime->MarketData(f.market, std::nullopt, views, error)};
+    BOOST_REQUIRE(first && first->book);
+    BOOST_CHECK(first->unchanged && !first->indicative);
+    BOOST_CHECK(first->book->head == genesis->entry.GetHash());
+    BOOST_CHECK(first->book->curves.empty());
+    const auto again{f.runtime->MarketData(f.market, std::nullopt, views, error)};
+    BOOST_REQUIRE(again);
+    BOOST_CHECK(again->book == first->book);
+    auto computed{*again};
+    flowmesh::ComputeMarketViews(computed, views);
+    BOOST_CHECK(!computed.book);
+    BOOST_REQUIRE(computed.indicative);
+    BOOST_CHECK(computed.indicative->available && !computed.indicative->cleared);
+    BOOST_CHECK(computed.indicative->head == genesis->entry.GetHash());
+
+    // A new certified head replaces the copy.
+    const auto next{flowmesh::BuildProductionExecutionEntry(
+        genesis->next_state, f.domain, f.market, f.seats.seats, gate,
+        1, genesis->entry.effect_count, genesis->entry.GetHash(), f.chain.Current(),
+        {f.chain.TipHeight(), genesis->entry.anchor, &f.chain}, Filled(0x6b), {}, nullptr, check)};
+    BOOST_REQUIRE(next);
+    const auto next_payload{flowmesh::EncodeProductionCertifiedPayload(
+        {next->entry, Certify(next->entry, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(next_payload);
+    f.Tick(std::chrono::seconds{16});
+    BOOST_REQUIRE(f.runtime->RequestCatchup(peer, f.market));
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    const auto next_page{flowmesh::EncodeCatchupEntries(std::vector<std::vector<unsigned char>>{*next_payload})};
+    BOOST_REQUIRE(next_page);
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(peer,
+        {flowmesh::WireMessageKind::ENTRIES, f.Requests().back().message.header, *next_page}) ==
+        flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_REQUIRE_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 2U);
+    const auto moved{f.runtime->MarketData(f.market, std::nullopt, views, error)};
+    BOOST_REQUIRE(moved && moved->book);
+    BOOST_CHECK(!moved->unchanged);
+    BOOST_CHECK(moved->book != first->book);
+    BOOST_CHECK(moved->book->head == next->entry.GetHash());
 }
 
 BOOST_AUTO_TEST_CASE(evidence_retry_budget_bounds_count_bytes_and_clock)

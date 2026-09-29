@@ -322,4 +322,19 @@ IndicativeClearing ComputeIndicative(const std::span<const ClearingEngine::Curve
     return out;
 }
 
+void ComputeMarketViews(MarketData& data, const MarketDataQuery& query)
+{
+    const auto book{std::move(data.book)};
+    data.book.reset();
+    if (!query.indicative) return;
+    if (!book) {
+        auto& unavailable{data.indicative.emplace()};
+        unavailable.draft = query.indicative->draft;
+        unavailable.unavailable_reason = "no_certified_state";
+        return;
+    }
+    data.indicative = ComputeIndicative(book->curves, *query.indicative);
+    data.indicative->head = book->head;
+}
+
 } // namespace flowmesh

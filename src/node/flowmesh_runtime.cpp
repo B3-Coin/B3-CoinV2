@@ -3395,7 +3395,8 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
         query.curve_limit == 0 || query.curve_limit > flowmesh::MARKET_DATA_MAX_CURVES ||
         (query.curve_cursor && !query.expected_head) ||
         (query.known_head && (query.curve_cursor || query.before_sequence)) ||
-        (query.status_only && (query.curve_cursor || query.before_sequence || query.expected_head || query.ticks)) ||
+        (query.status_only && (query.curve_cursor || query.before_sequence || query.expected_head || query.ticks ||
+                               query.indicative)) ||
         (query.ticks && (query.ticks->limit == 0 || query.ticks->limit > flowmesh::MARKET_DATA_MAX_TICKS))) {
         error = "Invalid bounded market-data query or pagination snapshot";
         return std::nullopt;
@@ -3460,6 +3461,16 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
         } else {
             out.ticks.emplace().unavailable_reason = "history_not_ready";
         }
+    }
+    // Only a copy is taken here, once per head; the view is computed outside
+    // this lock (FlowMeshService::MarketData).
+    if (query.indicative && snapshot.certified) {
+        auto& capture{m_book_captures[market_id]};
+        if (!capture || capture->head != market.last_hash) {
+            capture = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{
+                market.last_hash, market.state.ReadCurves(std::numeric_limits<size_t>::max()).curves});
+        }
+        out.book = capture;
     }
     if (out.unchanged || query.status_only || !snapshot.certified) return out;
 

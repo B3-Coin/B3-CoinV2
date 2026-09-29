@@ -9,9 +9,7 @@
 #include <flowmesh/market_data.h>
 
 #include <deque>
-#include <optional>
 #include <span>
-#include <string>
 
 namespace flowmesh {
 
@@ -45,52 +43,6 @@ ClearingTickPage PageClearingTicks(const std::deque<MarketHistoryEntry>& history
 //! per curve evaluation. Beyond it the view is unavailable, never truncated.
 inline constexpr size_t MARKET_VIEW_WORK_BUDGET{size_t{1} << 20};
 
-/** A prospective limit order exactly as the wallet would build it
- * (MakeLimitBidCurve / MakeLimitAskCurve). Submitted, it would replace the
- * signing account's standing curve on the same side. */
-struct IndicativeDraft {
-    ClearingEngine::Side side{ClearingEngine::Side::BID};
-    CAmount price{0};
-    CAmount quantity{0};
-    //! The account that would sign it. Absent (no account yet): a new curve,
-    //! and the draft's fill under rationing is reported as bounds.
-    std::optional<AccountId> account;
-    bool operator==(const IndicativeDraft&) const = default;
-};
-
-struct IndicativeQuery {
-    std::optional<IndicativeDraft> draft;
-};
-
-/** What the next clearing would be if the verified standing curves (plus
- * the draft, if any) were cleared as they are. NOT certified: every action
- * not yet in the verified state is excluded, and the draft is assumed to be
- * admitted (its balance and reservation are not checked). */
-struct IndicativeClearing {
-    bool available{false};
-    //! "work_budget", "malformed_curve", "invalid_draft" or "overflow".
-    std::string unavailable_reason;
-    //! Certified head of the curves, set by the caller.
-    uint256 head;
-    std::optional<IndicativeDraft> draft;
-    //! The draft replaces its account's standing curve on that side.
-    bool draft_replaces_curve{false};
-    bool cleared{false};
-    CAmount price{0};
-    CAmount volume{0};
-    //! |demand - supply| at the price, saturated at MAX_MONEY as committed.
-    CAmount imbalance{0};
-    ImbalanceSide imbalance_side{ImbalanceSide::NONE};
-    //! Highest price with standing bid quantity and lowest with standing ask
-    //! quantity, over every verified curve (never the draft).
-    std::optional<CAmount> best_bid;
-    std::optional<CAmount> best_ask;
-    //! The draft's fill at the price: exact largest-remainder rationing when
-    //! its account is known (min == max), otherwise its bounds.
-    std::optional<CAmount> draft_fill_min;
-    std::optional<CAmount> draft_fill_max;
-};
-
 /** Exactly ClearSlot's price selection (maximum volume, then minimum
  * imbalance, then lowest price over every breakpoint price) and
  * Allocate's rationing, over `curves` as the book holds them, with the
@@ -98,6 +50,11 @@ struct IndicativeClearing {
  * fails closed (available=false) over `budget` or on a malformed curve. */
 IndicativeClearing ComputeIndicative(std::span<const ClearingEngine::CurveView> curves, const IndicativeQuery& query,
                                      size_t budget = MARKET_VIEW_WORK_BUDGET);
+
+/** Fills data.indicative from data.book when the query asks for it, and
+ * drops data.book. For callers that hold no node lock: the local engine's
+ * reads and the remote client after it releases its work gate. */
+void ComputeMarketViews(MarketData& data, const MarketDataQuery& query);
 
 } // namespace flowmesh
 

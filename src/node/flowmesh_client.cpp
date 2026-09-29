@@ -22,6 +22,7 @@
 #include <flowmesh/auth.h>
 #include <flowmesh/action_reason.h>
 #include <flowmesh/client_evidence.h>
+#include <flowmesh/market_view.h>
 #include <flowmesh/outcome_evidence.h>
 #include <flowmesh/production_wire.h>
 #include <hash.h>
@@ -1277,8 +1278,22 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // False only between an applied page that asked for a snapshot and
         // that snapshot, which rebuilds the cache: no watch meanwhile.
         bool watch_ready{true};
+        // The verified state's standing curves, copied at most once for this
+        // cache (and so for its head) when a display view asks; see CachedBook.
+        std::shared_ptr<const flowmesh::BookCurves> book{};
     };
     std::map<uint256, Cache> m_cache;
+    //! Under m_work: the cache's verified curves for display views, which are
+    //! computed from this copy only after m_work is released.
+    static std::shared_ptr<const flowmesh::BookCurves> CachedBook(Cache& cache)
+    {
+        if (!cache.book) {
+            cache.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{
+                cache.verified.certified.entry.GetHash(),
+                cache.verified.state.ReadCurves(std::numeric_limits<size_t>::max()).curves});
+        }
+        return cache.book;
+    }
     // Microblock high-water of verified own inclusions per market. Survives
     // eviction of certified actions from m_pending; only restricts joins.
     FlowMeshOwnCertifiedThrough m_own_certified_through{CLIENT_MAX_MARKETS};
@@ -3086,10 +3101,23 @@ public:
         FlowMeshTimingSpan timing_lock_1245{__func__};
         timing_lock_1245.Field("lock_name", std::string{"client_work"});
         timing_lock_1245.Mark("lock_requested_us");
-        WorkLock lock{*this};
-        MarkWorkAcquired(timing_lock_1245);
-        try { return Project(Refresh(id, account, query), account, query); }
-        catch (const std::exception& e) { error = e.what(); return std::nullopt; }
+        std::optional<flowmesh::MarketData> out;
+        {
+            WorkLock lock{*this};
+            MarkWorkAcquired(timing_lock_1245);
+            try {
+                auto& cache{Refresh(id, account, query)};
+                out = Project(cache, account, query);
+                if (query.indicative) out->book = CachedBook(cache);
+            } catch (const std::exception& e) {
+                error = e.what();
+                return std::nullopt;
+            }
+        }
+        // Display views of the verified curves: after the work gate is
+        // released, so no signing preflight or action waits for them.
+        flowmesh::ComputeMarketViews(*out, query);
+        return out;
     }
     std::optional<flowmesh::MarketData> Watch(const uint256& id, const std::optional<uint256>& account,
                                              const flowmesh::MarketDataQuery& query, const std::chrono::milliseconds requested,
@@ -3266,6 +3294,7 @@ public:
                             watch.endpoint_live_ms = static_cast<uint32_t>(m_updates_watch.at(endpoint).count());
                             label(server_status);
                             applied = Project(now, account, query);
+                            if (query.indicative) applied->book = CachedBook(now);
                         } catch (const std::exception& e) {
                             label("invalid");
                             timing.Field("error", std::string{e.what()});
@@ -3277,7 +3306,11 @@ public:
                 }
             }
         }
-        if (applied) return applied;
+        if (applied) {
+            // As Data(): outside the work gate.
+            flowmesh::ComputeMarketViews(*applied, query);
+            return applied;
+        }
         return ordinary(fallback);
     }
     Receipt Submit(const uint256& market, const flowmesh::Action& action,

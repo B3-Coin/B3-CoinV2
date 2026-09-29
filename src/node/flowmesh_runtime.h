@@ -732,6 +732,11 @@ private:
     //! Caller holds m_market_mutex: the other markets' counted recent-window
     //! payload and outcome bytes (their global caps' remaining room).
     std::pair<size_t, size_t> RecentWindowOthers(const Market& self) const;
+    //! Guarded by m_market_mutex. Per market, the standing curves copied once
+    //! for the certified head a display view (indicative clearing) last asked
+    //! about, so repeated reads at one head copy nothing. Views are computed
+    //! from it outside every lock.
+    mutable std::map<flowmesh::MarketId, std::shared_ptr<const flowmesh::BookCurves>> m_book_captures;
     std::map<flowmesh::MarketId, std::unique_ptr<Market>> m_markets;
     //! ClientCertifiedEntry store reads (test observation only).
     mutable std::atomic<uint64_t> m_client_entry_store_reads{0};
