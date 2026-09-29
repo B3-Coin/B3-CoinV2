@@ -3,6 +3,7 @@
 
 #include <node/context.h>
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_health.h>
 #include <node/flowmesh_service.h>
 #include <node/flowmesh_timing.h>
 #include <chainparams.h>
@@ -439,6 +440,89 @@ static RPCHelpMan getflowmeshdeliveryinfo()
         }};
 }
 
+static RPCResult HealthResult()
+{
+    using Type = RPCResult::Type;
+    const RPCResult codes{Type::STR, "", "Not-ready code; treat any code you do not know as not ready"};
+    return {Type::OBJ, "", "Local, advisory health observation", {
+        {Type::NUM, "health_version", "Health object version, currently 1"},
+        {Type::STR, "observation", "Always local-node: what this node observed, never certified evidence or a proof of the network's freshest head"},
+        {Type::BOOL, "ready", "service_ready and every listed market ready; a label only, market rows decide per-market routing"},
+        {Type::BOOL, "service_ready", "No service-level not-ready code"},
+        {Type::ARR, "not_ready", "Service-level codes: service_stopped, initial_block_download, below_activation, reconciling_prolonged, worker_stalled, no_flowmesh_peers", {codes}},
+        {Type::OBJ, "service", "", {
+            {Type::STR, "state", "running, stopped or dormant (the A2/A3 schedule is incomplete)"},
+            {Type::STR, "chain_gate", /*optional=*/true, "B3 reconciliation gate while running: open or closed"},
+            {Type::STR, "chain_gate_reason", /*optional=*/true, "open, starting, initial_block_download, below_activation, reconciling, idle_wait_timeout, store_reconciliation_failed, market_refresh_failed, checkpoint_reconciliation_failed or tip_changed"},
+            {Type::NUM, "chain_gate_closed_ms", /*optional=*/true, "Local milliseconds the gate has been continuously closed"},
+            {Type::NUM, "worker_observation_age_ms", /*optional=*/true, "Local milliseconds since the runtime worker last published an observation; grows while the worker is stalled"},
+            {Type::NUM, "flowmesh_peers", /*optional=*/true, "Connected FlowMesh peers (operator detail)"},
+            {Type::NUM, "no_peers_ms", /*optional=*/true, "Local milliseconds without any FlowMesh peer (operator detail)"},
+        }},
+        {Type::OBJ, "policy", "Node-local thresholds, never consensus", {
+            {Type::NUM, "reconcile_grace_ms", "Continuous gate closure before reconciling_prolonged"},
+            {Type::NUM, "lag_grace_ms", "Catch-up duration before catching_up"},
+            {Type::NUM, "worker_stall_ms", "Observation age before worker_stalled"},
+            {Type::NUM, "no_peers_grace_ms", "Time without FlowMesh peers before no_flowmesh_peers"},
+            {Type::NUM, "stall_grace_ms", "No head advance with eligible pooled work before stalled_with_pending_work"},
+            {Type::NUM, "live_window_ms", "Label only: a head applied within this window is live, otherwise idle"},
+        }},
+        {Type::ARR, "markets", "At most 256 markets, in market id order", {
+            {Type::OBJ, "", "", {
+                {Type::STR_HEX, "market_id", "Market identity"},
+                {Type::BOOL, "ready", "No not-ready code for this market"},
+                {Type::ARR, "not_ready", "Service codes plus market_not_installed, market_halted, catching_up or stalled_with_pending_work", {codes}},
+                {Type::STR, "state", "One label: stopped, not_installed, halted, inactive, reconciling, worker_stalled, isolated, insufficient_seats, handoff_pending, paused, stalled, catching_up, live or idle"},
+                {Type::STR, "halt", /*optional=*/true, "Runtime halt code, or none"},
+                {Type::BOOL, "paused", /*optional=*/true, "Runtime pause"},
+                {Type::STR, "pause_reason", /*optional=*/true, "Fixed pause reason, or empty; b3_reconciliation_pending is the normal per-block pause"},
+                {Type::BOOL, "pending_handoff", /*optional=*/true, "A committee handoff waits for its anchor depth"},
+                {Type::NUM, "epoch", /*optional=*/true, "Current seat epoch"},
+                {Type::NUM, "active_seats", /*optional=*/true, "Active seat count"},
+                {Type::NUM, "quorum_required", /*optional=*/true, "Signatures a certificate needs"},
+                {Type::NUM, "pending_actions", /*optional=*/true, "Actions held in this node's pool"},
+                {Type::NUM, "next_microblock_sequence", /*optional=*/true, "Next sequence this node will apply"},
+                {Type::STR_HEX, "last_microblock_hash", /*optional=*/true, "Hash of this node's certified head, or zero"},
+                {Type::NUM, "head_age_ms", /*optional=*/true, "Local milliseconds since this process applied its head; idle markets age legitimately"},
+                {Type::NUM, "head_local_observed_unix", /*optional=*/true, "Local wall-clock seconds when this node applied its head; an observation, not certified time"},
+                {Type::OBJ, "catchup", /*optional=*/true, "Catch-up observation", {
+                    {Type::BOOL, "behind", "Proven or speculative lag"},
+                    {Type::NUM, "behind_ms", /*optional=*/true, "Local milliseconds continuously behind"},
+                    {Type::NUM, "proven_target", /*optional=*/true, "One past the highest BLS-verified certificate this node has not applied yet; cannot be hidden"},
+                    {Type::BOOL, "speculative", "A verified catch-up page arrived without tail slack; not a proof"},
+                    {Type::NUM, "peer_hint_next_sequence", /*optional=*/true, "Highest unverified peer head announcement (operator detail)"},
+                    {Type::NUM, "peers_hinting_ahead", /*optional=*/true, "Peers announcing a head ahead of ours, unverified (operator detail)"},
+                }},
+                {Type::STR, "error", /*optional=*/true, "Bounded runtime error text (operator detail)"},
+                {Type::STR, "proposal_wait_reason", /*optional=*/true, "Why the next slot's proposal waits (operator detail)"},
+            }},
+        }},
+        {Type::BOOL, "markets_truncated", "More markets exist than listed"},
+    }};
+}
+
+static RPCHelpMan getflowmeshhealth()
+{
+    return RPCHelpMan{
+        "getflowmeshhealth",
+        "Read this node's local FlowMesh health without a wallet: per-market certified head, local head age, halt and pause state, "
+        "seat counts, catch-up lag and advisory endpoint readiness, with operator detail. The public HTTPS 'health' method serves "
+        "the same object without operator detail. A local observation, never certified evidence, a proof of the network's freshest "
+        "head, or an input to admission, relay, signing or verification.\n",
+        {{"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Limit to one market; otherwise all markets"}},
+        HealthResult(),
+        RPCExamples{HelpExampleCli("getflowmeshhealth", "") + HelpExampleCli("getflowmeshhealth", "\"<market_id>\"")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto& service{EnsureAnyNodeContext(request.context).flowmesh};
+            if (!service) throw JSONRPCError(RPC_MISC_ERROR, "FlowMesh engine is not enabled on this node; see getflowmeshclientinfo");
+            std::optional<flowmesh::MarketId> market;
+            if (!request.params[0].isNull()) market = ParseHashV(request.params[0], "market_id");
+            const auto health{service->Health(market)};
+            if (market && !health.Find(*market)) throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown FlowMesh market");
+            return node::FlowMeshServiceHealthJson(health, /*operator_detail=*/true);
+        }};
+}
+
 static RPCHelpMan flowmeshtiming()
 {
     return RPCHelpMan{
@@ -462,6 +546,7 @@ void RegisterFlowMeshNetworkRPCCommands(CRPCTable& table)
         {"flowmesh", &flowmeshconnect},
         {"flowmesh", &getflowmeshnetworkinfo},
         {"flowmesh", &getflowmeshdeliveryinfo},
+        {"flowmesh", &getflowmeshhealth},
     };
     for (const auto& command : commands) table.appendCommand(command.name, &command);
 #ifdef ENABLE_FLOWMESH_P2FV_BOOTSTRAP_TEST
