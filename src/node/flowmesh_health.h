@@ -65,6 +65,9 @@ enum class FlowMeshNotReady : uint8_t {
     MARKET_NOT_INSTALLED,
     MARKET_HALTED,
     CATCHING_UP,
+    //! Reserved: eligible pooled work with no head advance. This revision
+    //! never reports it (a bounded pool probe is left for after the pool's
+    //! admission rework).
     STALLED_WITH_PENDING_WORK,
 };
 const char* FlowMeshNotReadyName(FlowMeshNotReady reason);
@@ -81,8 +84,6 @@ struct FlowMeshHealthPolicy {
     //! Twenty 250 ms service ticks without a worker observation.
     std::chrono::milliseconds worker_stall{5'000};
     std::chrono::milliseconds no_peers_grace{30'000};
-    //! Eligible pooled work with no head advance for this long.
-    std::chrono::milliseconds stall_grace{30'000};
     //! Label only: a head applied within this window is "live", else "idle".
     std::chrono::milliseconds live_window{60'000};
 
@@ -90,7 +91,7 @@ struct FlowMeshHealthPolicy {
     static FlowMeshHealthPolicy WithGrace(std::chrono::milliseconds grace)
     {
         FlowMeshHealthPolicy out;
-        out.reconcile_grace = out.lag_grace = out.no_peers_grace = out.stall_grace = grace;
+        out.reconcile_grace = out.lag_grace = out.no_peers_grace = grace;
         return out;
     }
 };

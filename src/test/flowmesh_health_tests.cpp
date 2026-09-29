@@ -442,7 +442,7 @@ BOOST_AUTO_TEST_CASE(health_json_is_versioned_omits_absent_values_and_operator_t
     BOOST_CHECK_EQUAL(service["chain_gate_closed_ms"].getInt<int64_t>(), 1500);
     BOOST_CHECK_EQUAL(service["worker_observation_age_ms"].getInt<int64_t>(), 120);
     BOOST_CHECK(Keys(json["policy"]) == (std::set<std::string>{"reconcile_grace_ms", "lag_grace_ms", "worker_stall_ms",
-                                                               "no_peers_grace_ms", "stall_grace_ms", "live_window_ms"}));
+                                                               "no_peers_grace_ms", "live_window_ms"}));
     const auto& markets{json["markets"].getValues()};
     BOOST_REQUIRE_EQUAL(markets.size(), 3U);
     const std::set<std::string> row_keys{"market_id", "ready", "not_ready", "state", "halt", "paused", "pause_reason",

@@ -464,14 +464,13 @@ static RPCResult HealthResult()
             {Type::NUM, "lag_grace_ms", "Catch-up duration before catching_up"},
             {Type::NUM, "worker_stall_ms", "Observation age before worker_stalled"},
             {Type::NUM, "no_peers_grace_ms", "Time without FlowMesh peers before no_flowmesh_peers"},
-            {Type::NUM, "stall_grace_ms", "No head advance with eligible pooled work before stalled_with_pending_work"},
             {Type::NUM, "live_window_ms", "Label only: a head applied within this window is live, otherwise idle"},
         }},
         {Type::ARR, "markets", "At most 256 markets, in market id order", {
             {Type::OBJ, "", "", {
                 {Type::STR_HEX, "market_id", "Market identity"},
                 {Type::BOOL, "ready", "No not-ready code for this market"},
-                {Type::ARR, "not_ready", "Service codes plus market_not_installed, market_halted, catching_up or stalled_with_pending_work", {codes}},
+                {Type::ARR, "not_ready", "Service codes plus market_not_installed, market_halted or catching_up (stalled_with_pending_work is reserved)", {codes}},
                 {Type::STR, "state", "One label: stopped, not_installed, halted, inactive, reconciling, worker_stalled, isolated, insufficient_seats, handoff_pending, paused, stalled, catching_up, live or idle"},
                 {Type::STR, "halt", /*optional=*/true, "Runtime halt code, or none"},
                 {Type::BOOL, "paused", /*optional=*/true, "Runtime pause"},

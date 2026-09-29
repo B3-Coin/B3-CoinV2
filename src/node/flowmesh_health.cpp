@@ -368,7 +368,6 @@ UniValue FlowMeshServiceHealthJson(const FlowMeshServiceHealth& health, const bo
     policy.pushKV("lag_grace_ms", static_cast<int64_t>(p.lag_grace.count()));
     policy.pushKV("worker_stall_ms", static_cast<int64_t>(p.worker_stall.count()));
     policy.pushKV("no_peers_grace_ms", static_cast<int64_t>(p.no_peers_grace.count()));
-    policy.pushKV("stall_grace_ms", static_cast<int64_t>(p.stall_grace.count()));
     policy.pushKV("live_window_ms", static_cast<int64_t>(p.live_window.count()));
     out.pushKV("policy", std::move(policy));
 
