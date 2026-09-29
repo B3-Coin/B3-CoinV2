@@ -34,6 +34,8 @@
 #include <node/fn_seat_index.h>
 #include <streams.h>
 #include <sync.h>
+#include <tinyformat.h>
+#include <util/check.h>
 #include <util/strencodings.h>
 #include <util/time.h>
 #include <util/int128.h>
@@ -455,6 +457,10 @@ class TradingApi {
     // Zero when the bounded 'action' wait is disabled.
     const std::chrono::milliseconds m_wait_max;
     FlowMeshActionWaitSlots m_waits;
+    // Zero when the bounded 'updates' watch is disabled. A separate slot
+    // pool: a crowd of watchers never takes an action wait's slot.
+    const std::chrono::milliseconds m_watch_max;
+    FlowMeshActionWaitSlots m_watches;
     //! Pre-parse trade-write and read budgets (see flowmesh_api_admission.h).
     FlowMeshApiAdmission m_admission;
     struct Bucket { std::chrono::steady_clock::time_point time{}; unsigned count{0}; };
@@ -505,6 +511,8 @@ class TradingApi {
         // Latency capability, never evidence: clients send wait_ms only to an
         // endpoint that advertises it, since older servers reject the field.
         if (m_wait_max.count()) out.pushKV("action_wait_ms_max", uint64_t(m_wait_max.count()));
+        // The same for watch_ms on 'updates'.
+        if (m_watch_max.count()) out.pushKV("updates_watch_ms_max", uint64_t(m_watch_max.count()));
         // Capability, never evidence: clients send "outcome" only here.
         if (m_outcome) out.pushKV("action_outcome_v1", true);
         AddReadiness(out, status.market_id, health);
@@ -574,6 +582,69 @@ class TradingApi {
         timing.Mark("wait_completed_us");
         receipt = LocalActionReceipt(result.status, action_id);
         return flowmesh::ClientWaitResultName(result.result);
+    }
+    //! Bounded wait until the page after `after` would hold an event for this
+    //! filter (or a gap). Returns the watch_status label. An already
+    //! answerable watch never takes a slot or sleeps.
+    std::string WaitForUpdates(const FlowMeshHttpsServer::Request& http, const uint256& market,
+                               const std::optional<uint256>& account, const flowmesh::ClientEventCursor& after,
+                               const std::chrono::milliseconds wait, FlowMeshTimingSpan& timing)
+    {
+        if (const auto now{m_service.ClientEventsPending(after, market, account)}; now != flowmesh::ClientWatchResult::TIMEOUT) {
+            return flowmesh::ClientWatchResultName(now);
+        }
+        const auto start{std::chrono::steady_clock::now()};
+        const auto until{std::min(start + wait, http.deadline - API_WAIT_REPLY_RESERVE)};
+        if (until <= start) return "deadline";
+        auto slot{m_watches.TryAcquire(http.remote_address)};
+        if (!slot) return "busy";
+        timing.Mark("watch_started_us");
+        // Asleep, this request holds no HTTPS permit and no market, store or
+        // event-log lock; the server also resumes a handler that leaves by
+        // an exception.
+        if (http.suspend) http.suspend();
+        const auto result{m_service.WaitClientEvents(after, market, account, until,
+            [&] { return m_watches.Interrupted(*slot); })};
+        if (http.resume) http.resume();
+        timing.Mark("watch_completed_us");
+        return flowmesh::ClientWatchResultName(result);
+    }
+    //! A live page, never history paging: the ordinary event page and status
+    //! object, read after the wait in the unwaited order, plus the
+    //! watch_status latency hint. It carries no reported_data.
+    UniValue WatchedUpdates(const FlowMeshHttpsServer::Request& http, const UniValue& params, const uint256& id,
+                            const std::optional<uint256>& account,
+                            const std::optional<flowmesh::ClientEventCursor>& after, FlowMeshTimingSpan& timing)
+    {
+        if (params.exists("before_sequence") || params.exists("limit")) Fail("watch_ms cannot be combined with history paging");
+        // Any unsigned integer is clamped to the advertised maximum.
+        const std::chrono::milliseconds wait{
+            std::min<uint64_t>(Number(params, "watch_ms", std::numeric_limits<uint64_t>::max()), m_watch_max.count())};
+        const std::optional<uint256> known{params.exists("known_head") ? std::optional{Id(params, "known_head", true)} : std::nullopt};
+        flowmesh::MarketDataQuery status_only;
+        status_only.status_only = true;
+        std::string error;
+        std::string watch_status{"none"};
+        if (wait.count() > 0) {
+            if (!after) {
+                // No position: the page is the whole retained log, at once.
+                watch_status = "no_cursor";
+            } else {
+                // Also refuses an unknown market before any slot is taken.
+                const auto current{m_local.Data(id, account, status_only, error)};
+                if (!current) Fail(error.empty() ? "No market-data view is available" : error);
+                watch_status = known && *known != current->snapshot.last_microblock_hash
+                    ? "head_changed" : WaitForUpdates(http, id, account, *after, wait, timing);
+            }
+        }
+        const auto page{m_service.ClientEvents(after, id, account, flowmesh::CLIENT_EVENT_PAGE_MAX)};
+        const auto data{m_local.Data(id, account, status_only, error)};
+        if (!data) Fail(error.empty() ? "No market-data view is available" : error);
+        UniValue out{FlowMeshClientUpdatesPageJson(page)};
+        out.pushKV("status", MarketResponse(*data));
+        out.pushKV("watch_status", watch_status);
+        timing.Field("watch_status", watch_status);
+        return out;
     }
     //! Encodes one retained record outside every runtime lock.
     static std::optional<std::string> EvidenceHex(const ProductionOutcomeRecord& record)
@@ -645,21 +716,35 @@ class TradingApi {
     }
 public:
     explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
-                        const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome)
+                        const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome,
+                        const FlowMeshTradingApiWatch watch)
         : m_service(service), m_local(service, std::move(metadata)),
           m_wait_max{wait.waiters == 0 ? std::chrono::milliseconds{0}
                                        : std::clamp(wait.max, std::chrono::milliseconds{0}, FLOWMESH_API_ACTION_WAIT_MAX)},
           m_waits{m_wait_max.count() ? std::min(wait.waiters, FLOWMESH_API_ACTION_WAITERS_MAX) : 0},
+          // Whatever the caller asks, both pools together never exceed the
+          // sleeping workers the HTTPS server's bound leaves.
+          m_watch_max{std::min({watch.watchers, FLOWMESH_API_UPDATES_WATCHERS_MAX, FLOWMESH_API_MAX_WAIT_SLOTS - m_waits.Capacity()}) == 0
+                          ? std::chrono::milliseconds{0}
+                          : std::clamp(watch.max, std::chrono::milliseconds{0}, FLOWMESH_API_UPDATES_WATCH_MAX)},
+          m_watches{m_watch_max.count() ? std::min({watch.watchers, FLOWMESH_API_UPDATES_WATCHERS_MAX,
+                                                    FLOWMESH_API_MAX_WAIT_SLOTS - m_waits.Capacity()}) : 0},
           m_health{health.enabled}, m_outcome{outcome.enabled} {}
     size_t WaitSlots() const { return m_waits.Capacity(); }
-    //! Server stop hook: refuse new waits and end every current one.
+    size_t WatchSlots() const { return m_watches.Capacity(); }
+    //! Server stop hook: refuse new waits and watches and end every current one.
     void Interrupt()
     {
         m_waits.Close();
+        m_watches.Close();
         m_service.WakeClientWaiters();
     }
     //! Server start hook.
-    void Reopen() { m_waits.Open(); }
+    void Reopen()
+    {
+        m_waits.Open();
+        m_watches.Open();
+    }
     UniValue Call(const UniValue& request, const FlowMeshHttpsServer::Request& http)
     {
         FlowMeshTimingSpan timing{"https_server_api"};
@@ -696,24 +781,16 @@ public:
             return out;
         }
         if (method == "updates") {
-            Keys(params, {"market_id", "account_id", "cursor", "known_head", "before_sequence", "limit"});
+            // Disabled, the contract is exactly the previous one, in which
+            // watch_ms is an unknown field.
+            if (m_watch_max.count() == 0) Keys(params, {"market_id", "account_id", "cursor", "known_head", "before_sequence", "limit"});
+            else Keys(params, {"market_id", "account_id", "cursor", "known_head", "before_sequence", "limit", "watch_ms"});
             const auto id{Id(params, "market_id")};
             const std::optional<uint256> account{params.exists("account_id") ? std::optional{Id(params, "account_id")} : std::nullopt};
             const std::optional<flowmesh::ClientEventCursor> after{params.exists("cursor") ? std::optional{ParseCursor(params["cursor"])} : std::nullopt};
+            if (params.exists("watch_ms")) return WatchedUpdates(http, params, id, account, after, timing);
             const auto page{m_service.ClientEvents(after, id, account, flowmesh::CLIENT_EVENT_PAGE_MAX)};
-            UniValue out{UniValue::VOBJ};
-            out.pushKV("cursor", CursorJson(page.cursor));
-            out.pushKV("gap", page.gap); out.pushKV("more", page.more);
-            out.pushKV("oldest_event_id", page.oldest_event_id); out.pushKV("latest_event_id", page.latest_event_id);
-            UniValue events{UniValue::VARR};
-            for (const auto& event : page.events) {
-                UniValue item{FlowMeshClientReceiptJson(EventReceipt(event))};
-                item.pushKV("event_id", event.event_id); item.pushKV("kind", flowmesh::ClientEventKindName(event.kind));
-                item.pushKV("market_id", event.market_id.GetHex());
-                item.pushKV("signed_action_hash", event.signed_action_hash.GetHex());
-                events.push_back(std::move(item));
-            }
-            out.pushKV("events", std::move(events));
+            UniValue out{FlowMeshClientUpdatesPageJson(page)};
             flowmesh::MarketDataQuery query;
             if (params.exists("known_head")) query.known_head = Id(params, "known_head", true);
             if (params.exists("before_sequence")) { query.before_sequence = Number(params, "before_sequence"); query.known_head.reset(); }
@@ -898,6 +975,11 @@ public:
             out.pushKV("ok", true); out.pushKV("result", Call(parsed, request));
             auto body{out.write()};
             if (body.size() > CLIENT_MAX_REPLY) Fail("Public trading response exceeds snapshot bound");
+            // A watched page is small by construction; never send more.
+            if (body.size() > FLOWMESH_API_WATCH_MAX_REPLY && parsed["method"].isStr() &&
+                parsed["method"].get_str() == "updates" && parsed["params"].exists("watch_ms")) {
+                Fail("Public trading watch response exceeds its bound");
+            }
             return {200, std::move(body)};
         } catch (const HealthBudgetExhausted& e) {
             UniValue out{UniValue::VOBJ}; out.pushKV("ok", false); out.pushKV("error", e.what());
@@ -2798,17 +2880,56 @@ std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
     try { return std::make_unique<RemoteBackend>(chainman, std::move(endpoints), client_datadir, join_windows); }
     catch (const std::exception& e) { error = e.what(); return {}; }
 }
+UniValue FlowMeshClientUpdatesPageJson(const flowmesh::ClientEventPage& page)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("cursor", CursorJson(page.cursor));
+    out.pushKV("gap", page.gap); out.pushKV("more", page.more);
+    out.pushKV("oldest_event_id", page.oldest_event_id); out.pushKV("latest_event_id", page.latest_event_id);
+    UniValue events{UniValue::VARR};
+    for (const auto& event : page.events) {
+        UniValue item{FlowMeshClientReceiptJson(EventReceipt(event))};
+        item.pushKV("event_id", event.event_id); item.pushKV("kind", flowmesh::ClientEventKindName(event.kind));
+        item.pushKV("market_id", event.market_id.GetHex());
+        item.pushKV("signed_action_hash", event.signed_action_hash.GetHex());
+        events.push_back(std::move(item));
+    }
+    out.pushKV("events", std::move(events));
+    return out;
+}
+
+std::optional<size_t> FlowMeshApiWatchSlots(const size_t action_slots, const bool watch_enabled,
+                                            const std::optional<int64_t> requested, std::string& error)
+{
+    const size_t room{action_slots >= FLOWMESH_API_MAX_WAIT_SLOTS ? 0 : FLOWMESH_API_MAX_WAIT_SLOTS - action_slots};
+    if (!requested) return std::min(FLOWMESH_API_UPDATES_WATCHERS_DEFAULT, room);
+    if (*requested < 0 || *requested > int64_t(FLOWMESH_API_UPDATES_WATCHERS_MAX)) {
+        error = strprintf("-flowmeshapiwatchers must be between 0 and %d", FLOWMESH_API_UPDATES_WATCHERS_MAX);
+        return std::nullopt;
+    }
+    if (watch_enabled && size_t(*requested) > room) {
+        error = strprintf("-flowmeshapiwatchers=%d with %d action-wait slots exceeds %d wait slots in total "
+                          "(each takes a worker thread); lower -flowmeshapiwatchers or -flowmeshapiactionwaiters",
+                          *requested, action_slots, FLOWMESH_API_MAX_WAIT_SLOTS);
+        return std::nullopt;
+    }
+    return size_t(*requested);
+}
+
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(FlowMeshService& service, FlowMeshHttpsServer::Options options,
                                                         FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
-                                                        const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome)
+                                                        const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome,
+                                                        const FlowMeshTradingApiWatch watch)
 {
     options.max_reply_bytes = CLIENT_MAX_REPLY;
-    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait, health, outcome)};
+    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait, health, outcome, watch)};
     // Handshake, read, handler and write concurrency stays at the two workers
-    // the API always had. Each wait slot adds a worker that only sleeps in a
-    // suspended wait. Disabled waits leave exactly two workers and permits.
+    // the API always had. Each wait or watch slot adds a worker that only
+    // sleeps in a suspended wait. Disabled waits and watches leave exactly
+    // two workers and permits; the server's worker bound is never raised.
     options.active_permits = FLOWMESH_API_ACTIVE_PERMITS;
-    options.worker_threads = FLOWMESH_API_ACTIVE_PERMITS + api->WaitSlots();
+    options.worker_threads = FLOWMESH_API_ACTIVE_PERMITS + api->WaitSlots() + api->WatchSlots();
+    Assert(options.worker_threads <= FLOWMESH_HTTPS_MAX_WORKER_THREADS);
     options.on_start = [api] { api->Reopen(); };
     options.on_stop = [api] { api->Interrupt(); };
     return std::make_unique<FlowMeshHttpsServer>(std::move(options), [api](const auto& request) { return api->Handle(request); });

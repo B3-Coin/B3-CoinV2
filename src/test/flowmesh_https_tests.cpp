@@ -3649,3 +3649,303 @@ BOOST_AUTO_TEST_CASE(restart_marker_blocks_resend_and_counts_unresolved)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+//! A long request deadline, so a watch is bounded by its own wait.
+node::FlowMeshHttpsServer::Options WatchOptions(const ClientLaneFixture& fixture)
+{
+    auto options{fixture.Options()};
+    options.request_timeout = std::chrono::seconds{10};
+    return options;
+}
+std::string UpdatesParams(const uint256& market, const std::string& extra = {})
+{
+    return "{\"market_id\":\"" + market.GetHex() + "\"" + (extra.empty() ? "" : "," + extra) + "}";
+}
+std::string CursorParam(const UniValue& cursor)
+{
+    return "\"cursor\":" + cursor.write();
+}
+uint64_t Elapsed(const std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+}
+//! The key set of a watched reply: the page, the status and the hint only.
+const std::set<std::string> WATCHED_REPLY_KEYS{"cursor", "gap", "more", "oldest_event_id", "latest_event_id",
+                                               "events", "status", "watch_status"};
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_watch_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(api_watch_slots_leave_room_for_action_waits)
+{
+    std::string error;
+    // Without an explicit count, every configuration that started before
+    // watches existed still starts: the default shrinks to the room left.
+    for (const size_t action_slots : {size_t{0}, size_t{4}, size_t{6}, size_t{7}, size_t{12}}) {
+        const auto slots{node::FlowMeshApiWatchSlots(action_slots, true, std::nullopt, error)};
+        BOOST_REQUIRE(slots);
+        BOOST_CHECK_EQUAL(*slots, std::min<size_t>(8, 14 - action_slots));
+    }
+    BOOST_CHECK_EQUAL(*node::FlowMeshApiWatchSlots(12, true, std::nullopt, error), 2U);
+    // An explicit count is kept when it fits, refused when it does not.
+    BOOST_CHECK_EQUAL(*node::FlowMeshApiWatchSlots(4, true, 10, error), 10U);
+    BOOST_CHECK_EQUAL(*node::FlowMeshApiWatchSlots(12, true, 2, error), 2U);
+    BOOST_CHECK_EQUAL(*node::FlowMeshApiWatchSlots(12, true, 0, error), 0U);
+    error.clear();
+    BOOST_CHECK(!node::FlowMeshApiWatchSlots(5, true, 10, error));
+    BOOST_CHECK(error.find("-flowmeshapiwatchers=10") != std::string::npos);
+    // ... unless watches are off, when no watch slot exists at all.
+    BOOST_CHECK_EQUAL(*node::FlowMeshApiWatchSlots(12, false, 10, error), 10U);
+    for (const int64_t bad : {int64_t{-1}, int64_t{11}, int64_t{1'000'000}}) {
+        error.clear();
+        BOOST_CHECK(!node::FlowMeshApiWatchSlots(0, true, bad, error));
+        BOOST_CHECK(!error.empty());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_updates_watch_disabled_keeps_exact_contract)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-watch-disabled"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    // The factory default is disabled, and so are zero watchers.
+    for (const node::FlowMeshTradingApiWatch watch : {node::FlowMeshTradingApiWatch{},
+                                                       node::FlowMeshTradingApiWatch{std::chrono::milliseconds{2000}, 0}}) {
+        auto api{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {}, watch)};
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        const auto endpoint{Endpoint(api->Port())};
+        const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+        BOOST_REQUIRE_EQUAL(markets_status, 200);
+        BOOST_REQUIRE_EQUAL(markets["result"].size(), 1U);
+        BOOST_CHECK(KeySet(markets["result"][0]) == PreviousStatusKeys(markets["result"][0]));
+        const auto [updates_status, updates]{ApiCall(endpoint, "updates", UpdatesParams(market))};
+        BOOST_REQUIRE_EQUAL(updates_status, 200);
+        auto keys{PreviousStatusKeys(updates["result"]["status"])};
+        keys.insert("chain_reconciling");
+        BOOST_CHECK(KeySet(updates["result"]["status"]) == keys);
+        BOOST_CHECK(updates["result"].exists("reported_data"));
+        BOOST_CHECK(!updates["result"].exists("watch_status"));
+        const auto [refused, rejection]{ApiCall(endpoint, "updates", UpdatesParams(market, "\"watch_ms\":500"))};
+        BOOST_CHECK_EQUAL(refused, 400);
+        BOOST_CHECK_EQUAL(rejection["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+        api->Stop();
+    }
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_updates_watch_contract)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-watch-contract"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    auto api{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {},
+                                          {std::chrono::milliseconds{2000}, 8})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+
+    // Every status object advertises the capability, and nothing else changes.
+    const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+    BOOST_REQUIRE_EQUAL(markets_status, 200);
+    const auto& row{markets["result"][0]};
+    BOOST_CHECK_EQUAL(row["updates_watch_ms_max"].getInt<int>(), 2000);
+    auto row_keys{PreviousStatusKeys(row)};
+    row_keys.insert("updates_watch_ms_max");
+    BOOST_CHECK(KeySet(row) == row_keys);
+    const auto [plain_status, plain]{ApiCall(endpoint, "updates", UpdatesParams(market))};
+    BOOST_REQUIRE_EQUAL(plain_status, 200);
+    BOOST_CHECK_EQUAL(plain["result"]["status"]["updates_watch_ms_max"].getInt<int>(), 2000);
+    BOOST_CHECK(plain["result"].exists("reported_data"));
+    BOOST_CHECK(!plain["result"].exists("watch_status"));
+    const auto cursor{plain["result"]["cursor"]};
+    const auto head{plain["result"]["status"]["last_microblock_hash"].get_str()};
+
+    const auto watched = [&](const std::string& extra, const char* expected, const uint64_t at_least_ms, const uint64_t below_ms) {
+        const auto start{std::chrono::steady_clock::now()};
+        const auto [status, reply]{ApiCall(endpoint, "updates", UpdatesParams(market, extra))};
+        const auto elapsed{Elapsed(start)};
+        BOOST_TEST_CONTEXT(extra) {
+            BOOST_REQUIRE_MESSAGE(status == 200, reply.write());
+            BOOST_CHECK_EQUAL(reply["result"]["watch_status"].get_str(), expected);
+            BOOST_CHECK(KeySet(reply["result"]) == WATCHED_REPLY_KEYS);
+            BOOST_CHECK_EQUAL(reply["result"]["status"]["updates_watch_ms_max"].getInt<int>(), 2000);
+            BOOST_CHECK_GE(elapsed, at_least_ms);
+            BOOST_CHECK_LT(elapsed, below_ms);
+        }
+        return reply["result"];
+    };
+    // Answered at once, without a slot: zero, no cursor, a gap, a changed head.
+    watched("\"watch_ms\":0," + CursorParam(cursor), "none", 0, 1000);
+    watched("\"watch_ms\":2000", "no_cursor", 0, 1000);
+    UniValue foreign{UniValue::VOBJ};
+    foreign.pushKV("instance_id", uint256::ONE.GetHex());
+    foreign.pushKV("event_id", 0);
+    const auto gap{watched("\"watch_ms\":2000," + CursorParam(foreign), "gap", 0, 1000)};
+    BOOST_CHECK(gap["gap"].get_bool());
+    UniValue future{cursor};
+    future.pushKV("event_id", cursor["event_id"].getInt<uint64_t>() + 5);
+    watched("\"watch_ms\":2000," + CursorParam(future), "gap", 0, 1000);
+    watched("\"watch_ms\":2000," + CursorParam(cursor) + ",\"known_head\":\"" + uint256::ONE.GetHex() + "\"", "head_changed", 0, 1000);
+    // Nothing new for this cursor and head: it waits, then times out.
+    const auto quiet{watched("\"watch_ms\":300," + CursorParam(cursor) + ",\"known_head\":\"" + head + "\"", "timeout", 280, 1500)};
+    BOOST_CHECK(quiet["events"].empty());
+    BOOST_CHECK_EQUAL(quiet["cursor"].write(), cursor.write());
+    // Unknown markets and paging are refused before any slot or wait.
+    for (const auto& [params, message] : std::vector<std::pair<std::string, std::string>>{
+             {"{\"market_id\":\"" + uint256::ONE.GetHex() + "\",\"watch_ms\":2000," + CursorParam(cursor) + "}", "Unknown FlowMesh market"},
+             {UpdatesParams(market, "\"watch_ms\":2000,\"limit\":10," + CursorParam(cursor)), "watch_ms cannot be combined with history paging"},
+             {UpdatesParams(market, "\"watch_ms\":2000,\"before_sequence\":1," + CursorParam(cursor)), "watch_ms cannot be combined with history paging"}}) {
+        const auto start{std::chrono::steady_clock::now()};
+        const auto [status, reply]{ApiCall(endpoint, "updates", params)};
+        BOOST_CHECK_EQUAL(status, 400);
+        BOOST_CHECK_EQUAL(reply["error"].get_str(), message);
+        BOOST_CHECK_LT(Elapsed(start), 1000U);
+    }
+    for (const std::string bad : {"-1", "1.5", "\"500\"", "true", "18446744073709551616", "1,\"watch_ms\":2"}) {
+        BOOST_TEST_CONTEXT("watch_ms=" << bad) {
+            const auto [status, reply]{ApiCall(endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":" + bad))};
+            BOOST_CHECK_EQUAL(status, 400);
+            BOOST_CHECK(!reply["ok"].get_bool());
+        }
+    }
+    api->Stop();
+
+    // Any unsigned integer is clamped to the advertised maximum, not refused.
+    auto brief{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {},
+                                            {std::chrono::milliseconds{400}, 8})};
+    BOOST_REQUIRE_MESSAGE(brief->Start(error), error);
+    for (const std::string wait : {"60000", "18446744073709551615"}) {
+        const auto start{std::chrono::steady_clock::now()};
+        const auto [status, reply]{ApiCall(Endpoint(brief->Port()), "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":" + wait))};
+        BOOST_REQUIRE_EQUAL(status, 200);
+        BOOST_CHECK_EQUAL(reply["result"]["watch_status"].get_str(), "timeout");
+        BOOST_CHECK_GE(Elapsed(start), 380U);
+        BOOST_CHECK_LT(Elapsed(start), 1500U);
+    }
+    brief->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_updates_watchers_are_bounded_and_hold_no_permit)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-watch-busy"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    // No action waits: two permits plus the watch slots are all the workers.
+    auto api{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {},
+                                          {std::chrono::milliseconds{1500}, 8})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    const auto cursor{ApiCall(endpoint, "updates", UpdatesParams(market)).second["result"]["cursor"]};
+    const auto watch = [&] {
+        const auto start{std::chrono::steady_clock::now()};
+        const auto [status, reply]{ApiCall(endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500"))};
+        BOOST_REQUIRE_EQUAL(status, 200);
+        return std::pair{reply["result"]["watch_status"].get_str(), Elapsed(start)};
+    };
+    auto first{std::async(std::launch::async, watch)};
+    auto second{std::async(std::launch::async, watch)};
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    // A third watcher from this address gets the immediate reply.
+    const auto [third, third_ms]{watch()};
+    BOOST_CHECK_EQUAL(third, "busy");
+    BOOST_CHECK_LT(third_ms, 1000U);
+    // The sleepers hold no HTTPS permit: ordinary reads keep both permits.
+    for (int i{0}; i < 4; ++i) {
+        const auto start{std::chrono::steady_clock::now()};
+        BOOST_CHECK_EQUAL(ApiCall(endpoint, "markets", "{}").first, 200);
+        BOOST_CHECK_LT(Elapsed(start), 1000U);
+    }
+    for (auto* waiter : {&first, &second}) {
+        const auto [label, elapsed]{waiter->get()};
+        BOOST_CHECK_EQUAL(label, "timeout");
+        BOOST_CHECK_GE(elapsed, 1400U);
+    }
+    api->Stop();
+
+    // Capacity: one slot means the second watcher is refused at once.
+    auto single{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {},
+                                             {std::chrono::milliseconds{1500}, 1})};
+    BOOST_REQUIRE_MESSAGE(single->Start(error), error);
+    const auto single_endpoint{Endpoint(single->Port())};
+    auto sleeping{std::async(std::launch::async, [&] {
+        return ApiCall(single_endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500")).second;
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    const auto [status, refused]{ApiCall(single_endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500"))};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK_EQUAL(refused["result"]["watch_status"].get_str(), "busy");
+    BOOST_CHECK_EQUAL(sleeping.get()["result"]["watch_status"].get_str(), "timeout");
+    single->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_updates_watch_wakes_on_commit_and_ends_on_stop)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-watch-commit"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    auto api{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {},
+                                          {std::chrono::milliseconds{2500}, 8})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    const auto plain{ApiCall(endpoint, "updates", UpdatesParams(market)).second["result"]};
+    BOOST_REQUIRE_EQUAL(plain["status"]["next_microblock_sequence"].getInt<int>(), 0);
+    const std::string watch_params{UpdatesParams(market, CursorParam(plain["cursor"]) + ",\"known_head\":\"" +
+                                                 plain["status"]["last_microblock_hash"].get_str() + "\",\"watch_ms\":2500")};
+    const auto start{std::chrono::steady_clock::now()};
+    auto watcher{std::async(std::launch::async, [&] { return ApiCall(endpoint, "updates", watch_params).second["result"]; })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    // Arming the seats certifies the market genesis: the commit's head event
+    // ends the watch early.
+    BOOST_REQUIRE_MESSAGE(service.ArmSeatKeys(secrets, error), error);
+    const auto woken{watcher.get()};
+    BOOST_CHECK_EQUAL(woken["watch_status"].get_str(), "ready");
+    BOOST_CHECK_LT(Elapsed(start), 2400U);
+    BOOST_REQUIRE(!woken["events"].empty());
+    BOOST_CHECK_EQUAL(woken["events"][0]["kind"].get_str(), "certified_head");
+    BOOST_CHECK_EQUAL(woken["status"]["next_microblock_sequence"].getInt<int>(), 1);
+    BOOST_CHECK(!woken.exists("reported_data"));
+
+    // Stopping the API ends a sleeping watch at once, not after its wait.
+    const std::string next_params{UpdatesParams(market, CursorParam(woken["cursor"]) + ",\"known_head\":\"" +
+                                                woken["status"]["last_microblock_hash"].get_str() + "\",\"watch_ms\":2500")};
+    auto pending{std::async(std::launch::async, [&] {
+        const auto reply{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
+            "{\"method\":\"updates\",\"params\":" + next_params + "}", std::chrono::seconds{5}, 1 << 20)};
+        return std::chrono::steady_clock::now();
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    const auto stop_start{std::chrono::steady_clock::now()};
+    api->Stop();
+    BOOST_CHECK_LT(std::chrono::duration_cast<std::chrono::milliseconds>(pending.get() - stop_start).count(), 1200);
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(updates_watch_page_fits_its_reply_bound)
+{
+    // The largest page: CLIENT_EVENT_PAGE_MAX events, every optional field
+    // present, and reasons at their bound made of characters JSON escapes
+    // six times over. The status object is well below the headroom kept.
+    flowmesh::ClientEventPage page;
+    page.cursor = {uint256::ONE, std::numeric_limits<uint64_t>::max()};
+    page.oldest_event_id = page.latest_event_id = std::numeric_limits<uint64_t>::max();
+    page.more = true;
+    for (size_t i{0}; i < flowmesh::CLIENT_EVENT_PAGE_MAX; ++i) {
+        flowmesh::ClientEvent event;
+        event.event_id = std::numeric_limits<uint64_t>::max() - i;
+        event.market_id = event.action_id = event.account_id = event.signed_action_hash = event.microblock_hash = uint256::ONE;
+        event.kind = flowmesh::ClientEventKind::CERTIFIED_INCLUDED;
+        event.microblock_sequence = std::numeric_limits<uint64_t>::max();
+        event.account_sequence = std::numeric_limits<uint64_t>::max();
+        event.reason = std::string(160, '\x01');
+        page.events.push_back(event);
+    }
+    const auto size{node::FlowMeshClientUpdatesPageJson(page).write().size()};
+    BOOST_TEST_MESSAGE("worst-case watched page: " << size << " bytes");
+    BOOST_CHECK_LT(size + 64 * 1024, node::FLOWMESH_API_WATCH_MAX_REPLY);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

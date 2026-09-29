@@ -22,6 +22,8 @@ namespace node {
 inline constexpr std::chrono::seconds FLOWMESH_HTTPS_DEFAULT_REQUEST_TIMEOUT{10};
 inline constexpr std::chrono::seconds FLOWMESH_HTTPS_DEFAULT_IDLE_TIMEOUT{30};
 inline constexpr std::chrono::minutes FLOWMESH_HTTPS_DEFAULT_CONNECTION_LIFETIME{5};
+//! FlowMeshHttpsServer::Options::worker_threads bound.
+inline constexpr size_t FLOWMESH_HTTPS_MAX_WORKER_THREADS{16};
 
 struct HttpsEndpoint {
     /** An HTTPS origin, optionally ending in /flowmesh/v1. No userinfo,

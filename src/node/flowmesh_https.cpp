@@ -1237,7 +1237,7 @@ bool FlowMeshHttpsServer::Start(std::string& error)
         options.max_request_bytes == 0 || options.max_request_bytes > MAX_REQUEST ||
         options.max_reply_bytes < 64 || options.max_reply_bytes > MAX_REPLY ||
         options.max_connections == 0 || options.max_connections > 256 ||
-        options.worker_threads == 0 || options.worker_threads > 16 ||
+        options.worker_threads == 0 || options.worker_threads > FLOWMESH_HTTPS_MAX_WORKER_THREADS ||
         options.active_permits > options.worker_threads ||
         options.max_queue == 0 || options.max_queue > 256 ||
         options.request_timeout <= Milliseconds{0} || options.request_timeout > MAX_TIMEOUT ||

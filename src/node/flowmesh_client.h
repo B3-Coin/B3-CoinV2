@@ -17,6 +17,9 @@
 #include <vector>
 
 class ChainstateManager;
+namespace flowmesh {
+struct ClientEventPage;
+} // namespace flowmesh
 namespace node {
 class FlowMeshService;
 
@@ -87,6 +90,39 @@ inline constexpr size_t FLOWMESH_API_ACTION_WAITERS_MAX{12};
 //! Connections doing HTTPS work at once, as with the API's two workers before
 //! waits existed; each wait slot adds a worker that only sleeps in a wait.
 inline constexpr size_t FLOWMESH_API_ACTIVE_PERMITS{2};
+//! Action-wait and watch slots together: each adds a sleeping worker, and the
+//! HTTPS server's worker bound is never raised for them.
+inline constexpr size_t FLOWMESH_API_MAX_WAIT_SLOTS{FLOWMESH_HTTPS_MAX_WORKER_THREADS - FLOWMESH_API_ACTIVE_PERMITS};
+static_assert(FLOWMESH_API_ACTION_WAITERS_MAX <= FLOWMESH_API_MAX_WAIT_SLOTS);
+
+//! Node-local latency policy for the restricted API's bounded 'updates' watch,
+//! never consensus. A zero max or zero watchers disables it: no capability is
+//! advertised and 'updates' keeps its exact previous request and reply
+//! contract. A watched 'updates' read waits, holding a separate slot and no
+//! HTTPS permit, until an event after the client's cursor exists for its
+//! market and account filter, the head differs from its known head, or its
+//! deadline; its reply is the ordinary event page and status object with no
+//! reported_data.
+struct FlowMeshTradingApiWatch {
+    std::chrono::milliseconds max{0};
+    size_t watchers{0};
+};
+inline constexpr std::chrono::milliseconds FLOWMESH_API_UPDATES_WATCH_MAX{2500};
+//! Off until the pending-checkpoint memo has been reviewed and the cost of
+//! concurrent watchers measured; 2000 ms is the intended enabled value.
+inline constexpr std::chrono::milliseconds FLOWMESH_API_UPDATES_WATCH_DEFAULT{0};
+inline constexpr size_t FLOWMESH_API_UPDATES_WATCHERS_DEFAULT{8};
+inline constexpr size_t FLOWMESH_API_UPDATES_WATCHERS_MAX{10};
+//! A watched 'updates' reply: at most CLIENT_EVENT_PAGE_MAX events and one
+//! status object, never reported_data. The server refuses a larger one.
+inline constexpr size_t FLOWMESH_API_WATCH_MAX_REPLY{512 * 1024};
+/** Watch slots for `action_slots` action-wait slots: an explicitly requested
+ * count (0..FLOWMESH_API_UPDATES_WATCHERS_MAX), refused when watches are
+ * enabled and it exceeds the room the action waits leave; otherwise the
+ * default, reduced to that room, so a configuration valid before watches
+ * existed never fails to start. nullopt and `error` when refused. */
+std::optional<size_t> FlowMeshApiWatchSlots(size_t action_slots, bool watch_enabled,
+                                            std::optional<int64_t> requested, std::string& error);
 
 //! Node-local policy for the restricted API's public 'health' method and the
 //! advisory readiness keys (health_api_version, endpoint_ready,
@@ -118,10 +154,14 @@ inline constexpr const char* FLOWMESH_API_OUTCOME_BUDGET_ERROR{
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(
     FlowMeshService& service, FlowMeshHttpsServer::Options options,
     FlowMeshAssetMetadataCatalog metadata = {}, FlowMeshTradingApiWait wait = {},
-    FlowMeshTradingApiHealth health = {}, FlowMeshTradingApiOutcome outcome = {});
+    FlowMeshTradingApiHealth health = {}, FlowMeshTradingApiOutcome outcome = {},
+    FlowMeshTradingApiWatch watch = {});
 
 //! Shared public projection used by the wallet RPC and restricted endpoint.
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);
+//! The event page part of an 'updates' reply (cursor, gap, more, event ids
+//! and events), ordinary or watched.
+UniValue FlowMeshClientUpdatesPageJson(const flowmesh::ClientEventPage& page);
 //! PUBLIC_V1 writes exactly the previous receipt keys (updates, submit, a v1
 //! 'action' reply, the outbox row). PUBLIC_OUTCOME_V1 (an opt-in 'action'
 //! reply) adds reason_code when known; LOCAL_RPC adds it, the display stage
