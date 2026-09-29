@@ -159,6 +159,11 @@ or held in its pool. It forgets the identity:
   refused it, and the pool does not hold the action;
 - when the pool drops the action, because it was certified or pruned.
 
+One case is not covered: a queued local frame that the runtime queue
+evicts under global pressure, for higher-priority committee traffic, never
+reaches the worker. Its attribution then stays until the rule below drops
+it. That is bounded, and it only uses the submitting identity's own share.
+
 At most 2,048 live public actions per market are remembered, under the same
 rule as the ring: the 64-action share applies only once 2,048 are held. A
 client whose live actions are within its share therefore keeps their
@@ -178,10 +183,11 @@ One identity therefore cannot turn the public ring over, and that holds
 for the drop and recheck notices as well as the submit-time ones. An
 identity that holds at most 64 notices loses one to other identities only
 once every identity holds at most 64, which takes at least 32 other
-identities flooding at once. Under that pressure, clients sharing one identity also
-share its 64: a busy NAT address, /64 or load balancer then keeps only its
-newest 64 notices. A remote client's evicted proof reads "unknown", which
-is safe. An already-included resubmission appends no notice at all.
+identities flooding at once. Under that pressure, clients sharing one
+identity also share its 64: a busy NAT address, /64 or load balancer then
+keeps only its newest 64 notices. A remote client's evicted proof reads
+"unknown", which is safe. An already-included resubmission appends no
+notice at all.
 
 ## Foreground latency of outcome re-proofs
 
