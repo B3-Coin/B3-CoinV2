@@ -207,6 +207,24 @@ struct FlowMeshRuntimeEvent {
  * Admission includes legacy queue acceptance, which has no socket completion.
  * catchup_completed counts applied pages with local tail slack, not a tip ACK.
  * event_queue_overflows is node-global and repeated in each market snapshot. */
+/** ACTION frame header policy observations (local relay policy, never
+ * consensus). A frame's header only claims its sender's certified head. */
+struct FlowMeshRuntimeActionAdmission {
+    //! Remote frames for another version, market or epoch.
+    uint64_t header_refused_identity{0};
+    //! Remote frames more than two slots ahead or behind this node's head.
+    uint64_t header_refused_far{0};
+    //! Remote frames behind this head whose interval this node could not
+    //! prove excludes the action (not retained, epoch change, included, or
+    //! no longer pending).
+    uint64_t header_refused_unproven{0};
+    //! Frames admitted from a sender one or two slots ahead (a lagging node).
+    uint64_t header_accepted_ahead{0};
+    //! Frames admitted from a sender one or two slots behind, relayed with
+    //! this node's head (the payload is never touched).
+    uint64_t header_restamped_behind{0};
+};
+
 struct FlowMeshRuntimeDeliverySnapshot {
     flowmesh::MarketId market_id;
     uint64_t created{0}, admitted{0}, refused{0}, retried{0};
@@ -246,6 +264,7 @@ struct FlowMeshRuntimeDeliverySnapshot {
     uint64_t trace_global_bytes{0}, trace_global_events_dropped{0};
     // At most 128 events. Clocks are monotonic and local to this process.
     std::vector<FlowMeshRuntimeEvent> events;
+    FlowMeshRuntimeActionAdmission action_admission;
 };
 
 struct FlowMeshRuntimeMarketConfig {

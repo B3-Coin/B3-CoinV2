@@ -8539,10 +8539,10 @@ BOOST_AUTO_TEST_CASE(preagreement_local_queued_action_survives_certified_head_ad
         BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash == head);
     }
 
-    // A fresh, valid instruction has no known terminal disposition. Its old
-    // wrapper spans TWO durable heads, so the retained last body is not a
-    // complete inclusion history. Refuse explicitly instead of guessing or
-    // scanning storage; the caller must use existing exact-action recovery.
+    // A fresh, valid instruction has no known terminal disposition. A
+    // wrapper more than two durable heads old is beyond the relay window:
+    // refuse explicitly instead of guessing or scanning storage; the caller
+    // must use existing exact-action recovery.
     f.block_commits = true;
     auto older_tail{tail};
     older_tail.sequence = 1;
@@ -8551,8 +8551,10 @@ BOOST_AUTO_TEST_CASE(preagreement_local_queued_action_survives_certified_head_ad
     BOOST_REQUIRE(flowmesh::SignAction(account_key, f.domain, f.initial.ConfigId(), older_tail));
     const auto older_payload{flowmesh::EncodeProductionActionPayload(older_tail)};
     BOOST_REQUIRE(older_payload);
+    auto three_behind{queued.header};
+    three_behind.sequence = 0;
     BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(local_peer,
-        {flowmesh::WireMessageKind::ACTION, queued.header, *older_payload}) == flowmesh::QueueResult::ACCEPTED);
+        {flowmesh::WireMessageKind::ACTION, three_behind, *older_payload}) == flowmesh::QueueResult::ACCEPTED);
     f.Drain();
     const auto older_events{f.runtimes[0]->ClientEvents(std::nullopt, f.market, account).events};
     BOOST_CHECK(std::none_of(older_events.begin(), older_events.end(), [&](const auto& event) {
@@ -8564,6 +8566,17 @@ BOOST_AUTO_TEST_CASE(preagreement_local_queued_action_survives_certified_head_ad
     }));
     BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 0U);
     BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash == head);
+
+    // Its wrapper TWO durable heads old is proven over the recent window
+    // (both retained bodies exclude it, it is still pending) and relayed with
+    // this node's head; the signed payload is unchanged.
+    const auto restamped_before{f.runtimes[0]->DeliverySnapshots(f.market).front().action_admission.header_restamped_behind};
+    BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(local_peer,
+        {flowmesh::WireMessageKind::ACTION, queued.header, *older_payload}) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 1U);
+    BOOST_CHECK_EQUAL(f.runtimes[0]->DeliverySnapshots(f.market).front().action_admission.header_restamped_behind,
+                      restamped_before + 1);
 }
 
 BOOST_AUTO_TEST_CASE(preagreement_queued_certified_but_rejected_deposit_is_terminal)
@@ -8714,7 +8727,17 @@ BOOST_AUTO_TEST_CASE(preagreement_stale_local_action_revalidation_preserves_remo
             return event.kind == flowmesh::ClientEventKind::POOL_REFUSED && event.action_id == decoded->Id();
         }));
     };
-    refuse(2, {flowmesh::WireMessageKind::ACTION, stale, *payload}, false); // remote old wrapper stays rejected
+    // Remote frames outside the two-slot relay window stay refused and are
+    // only counted (no client event).
+    auto remote_wrong_epoch{stale};
+    ++remote_wrong_epoch.epoch;
+    refuse(2, {flowmesh::WireMessageKind::ACTION, remote_wrong_epoch, *payload}, false);
+    auto remote_far{stale};
+    remote_far.sequence = 1 + 3;
+    refuse(2, {flowmesh::WireMessageKind::ACTION, remote_far, *payload}, false);
+    const auto remote_counters{f.runtimes[0]->DeliverySnapshots(f.market).front().action_admission};
+    BOOST_CHECK_EQUAL(remote_counters.header_refused_identity, 1U);
+    BOOST_CHECK_EQUAL(remote_counters.header_refused_far, 1U);
     auto wrong_epoch{stale};
     ++wrong_epoch.epoch;
     refuse(local_peer, {flowmesh::WireMessageKind::ACTION, wrong_epoch, *payload}, true);
@@ -8734,6 +8757,15 @@ BOOST_AUTO_TEST_CASE(preagreement_stale_local_action_revalidation_preserves_remo
     f.chains[0].SetReconciled(true);
     f.chains[0].SetTransition(f.market, node::FlowMeshSeatTransitionKind::PAUSED);
     refuse(local_peer, {flowmesh::WireMessageKind::ACTION, stale, *payload}, true);
+
+    // A remote sender one slot behind is admitted once the retained interval
+    // proves it: remote frames never had the authority gate (an equal-header
+    // remote frame is admitted while paused too), and add no chain call.
+    BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(2, {flowmesh::WireMessageKind::ACTION, stale, *payload}) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 1U);
+    BOOST_CHECK_EQUAL(f.runtimes[0]->DeliverySnapshots(f.market).front().action_admission.header_restamped_behind, 1U);
 
     // Local identity does not bypass the existing bounded wire admission.
     flowmesh::BoundedWireQueue queue;
@@ -9526,6 +9558,87 @@ BOOST_AUTO_TEST_CASE(local_factless_deposit_refused_not_relayed_but_remote_still
         *flowmesh::EncodeProductionActionPayload(factless)}) == flowmesh::QueueResult::ACCEPTED);
     f.Drain();
     BOOST_CHECK_EQUAL(f.runtimes[1]->MarketStatus(f.market)->pending_actions, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(action_relay_window_accepts_two_slots_with_proof_and_restamps)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "action_relay_window", std::chrono::seconds{10}, 2};
+    f.block_commits = false;
+    f.Reach(1);
+    // Entry 1 includes a deposit that is NOT credited (no anchored facts),
+    // so its outpoint stays open: "still pending" alone would re-admit it.
+    const auto uncredited{Deposit(COutPoint{f.outpoint.hash, 55})};
+    {
+        const auto head{f.runtimes[1]->MarketStatus(f.market)};
+        BOOST_REQUIRE(f.runtimes[1]->EnqueueWireMessage(99, {flowmesh::WireMessageKind::ACTION,
+            {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, head->epoch, head->next_sequence},
+            *flowmesh::EncodeProductionActionPayload(uncredited)}) == flowmesh::QueueResult::ACCEPTED);
+    }
+    BOOST_REQUIRE(Settle(f, [&] { return f.AllAt(2); }));
+    f.Drain();
+    f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    BOOST_REQUIRE(runtime.ClientRecentInclusion(f.market, uncredited.Id()));
+    BOOST_REQUIRE(!runtime.StateSnapshot(f.market)->DepositConsumed(uncredited.outpoint));
+    std::vector<flowmesh::WireMessage> relayed;
+    std::mutex relayed_mutex;
+    f.network.SetFilter([&](size_t from, size_t, const flowmesh::WireMessage& wire) {
+        if (from == 0 && wire.kind == flowmesh::WireMessageKind::ACTION) {
+            std::lock_guard lock{relayed_mutex};
+            relayed.push_back(wire);
+        }
+        return f.Observe(wire);
+    });
+    const auto send = [&](const flowmesh::Action& action, uint64_t sequence) {
+        BOOST_REQUIRE(runtime.EnqueueWireMessage(7, {flowmesh::WireMessageKind::ACTION,
+            {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, sequence},
+            *flowmesh::EncodeProductionActionPayload(action)}) == flowmesh::QueueResult::ACCEPTED);
+        f.Drain();
+    };
+    const auto counters = [&] { return runtime.DeliverySnapshots(f.market).front().action_admission; };
+    // action_relay_window_refuses_action_in_retained_interval: the retained
+    // entry since the sender's head included it: refused, counted only.
+    send(uncredited, 1);
+    BOOST_CHECK_EQUAL(counters().header_refused_unproven, 1U);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+    // A fresh deposit one slot behind is proven and restamped.
+    const auto fresh{Deposit(COutPoint{f.outpoint.hash, 1})};
+    send(fresh, 1);
+    BOOST_CHECK_EQUAL(counters().header_restamped_behind, 1U);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 1U);
+    // action_relay_window_accepts_ahead_on_lagging_seat: a sender two slots
+    // ahead is accepted; three ahead is refused.
+    const auto ahead{Deposit(COutPoint{f.outpoint.hash, 2})};
+    send(ahead, 4);
+    BOOST_CHECK_EQUAL(counters().header_accepted_ahead, 1U);
+    send(Deposit(COutPoint{f.outpoint.hash, 3}), 5);
+    BOOST_CHECK_EQUAL(counters().header_refused_far, 1U);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 2U);
+    // Relays and duplicate forwards always carry this node's own head; the
+    // payload is untouched.
+    {
+        std::lock_guard lock{relayed_mutex};
+        BOOST_REQUIRE_GE(relayed.size(), 2U);
+        for (const auto& wire : relayed) BOOST_CHECK_EQUAL(wire.header.sequence, 2U);
+        BOOST_CHECK(relayed.front().payload == *flowmesh::EncodeProductionActionPayload(fresh));
+    }
+
+    // action_relay_window_fails_closed_after_eviction: with a one-entry
+    // window the interval two slots back is no longer retained.
+    f.recent_window.payload_entries = 1;
+    f.StopNode(0);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.StartNode(0, f.AgreementPath(0), std::nullopt, error), error);
+    f.Drain();
+    auto& restarted{*f.runtimes[0]};
+    const auto pending{restarted.MarketStatus(f.market)->pending_actions};
+    BOOST_REQUIRE(restarted.EnqueueWireMessage(7, {flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 0},
+        *flowmesh::EncodeProductionActionPayload(Deposit(COutPoint{f.outpoint.hash, 8}))}) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(restarted.DeliverySnapshots(f.market).front().action_admission.header_refused_unproven, 1U);
+    BOOST_CHECK_EQUAL(restarted.MarketStatus(f.market)->pending_actions, pending);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

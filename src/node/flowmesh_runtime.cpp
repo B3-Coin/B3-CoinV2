@@ -31,6 +31,11 @@ constexpr flowmesh::WirePeerId LOCAL_ACTION_PEER{FLOWMESH_LOCAL_ACTION_PEER};
 constexpr size_t MAX_RUNTIME_CANDIDATES_PER_SEQUENCE{8};
 // Local drop notices per commit; further drops are only counted by the pool.
 constexpr size_t MAX_LOCAL_DROP_NOTICES{256};
+// Local relay policy, never consensus: an ACTION frame may carry a sender
+// head up to this many slots ahead of or behind this node's head. Behind
+// needs a proof from this node's recent certified window.
+constexpr uint64_t ACTION_HEADER_AHEAD{2};
+constexpr uint64_t ACTION_HEADER_BEHIND{2};
 constexpr size_t MAX_PENDING_MARKET_ADDITIONS{1'024};
 constexpr size_t MAX_CATCHUP_COMMANDS{64};
 constexpr size_t MAX_ACTIVE_CATCHUPS{16};
@@ -4480,20 +4485,51 @@ void FlowMeshRuntime::HandleAction(
     const flowmesh::WireMessage& message)
 {
     const bool local{peer == LOCAL_ACTION_PEER};
-    if (message.header.version != flowmesh::FLOWMESH_WIRE_VERSION_V1 ||
-        message.header.market_id != market.market_id ||
-        message.header.epoch != market.seats.epoch ||
-        message.header.sequence > market.next_sequence ||
-        (!local && message.header.sequence != market.next_sequence)) {
+    auto& counters{market.delivery.action_admission};
+    const auto& header{message.header};
+    const uint64_t next{market.next_sequence};
+    const auto refuse_decoded = [&](const char* reason, const flowmesh::ActionReasonCode code) {
+        if (const auto action{flowmesh::DecodeProductionActionPayload(message.payload)}) {
+            ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason, nullptr, code);
+        }
+    };
+    // 1. Identity. Remote refusals are counted only: they create no event.
+    if (header.version != flowmesh::FLOWMESH_WIRE_VERSION_V1 ||
+        header.market_id != market.market_id || header.epoch != market.seats.epoch) {
         if (local) {
-            if (const auto action{flowmesh::DecodeProductionActionPayload(message.payload)}) {
-                ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action,
-                                  "local queued action header is not current authority; this attempt was not admitted",
-                                  nullptr, flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
-            }
+            refuse_decoded("local queued action header is not current authority; this attempt was not admitted",
+                           flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
+        } else {
+            CountObservation(counters.header_refused_identity);
         }
         return;
     }
+    // 2. Ahead: only a remote sender, at most two slots. Its header claims
+    // only its own head, and any peer may already stamp this node's head on
+    // any frame, so accepting it grants nothing new; it helps a lagging
+    // validator gather the evidence it needs once it catches up.
+    const bool ahead{header.sequence > next};
+    if (ahead && (local || header.sequence - next > ACTION_HEADER_AHEAD)) {
+        if (local) {
+            refuse_decoded("local queued action header is not current authority; this attempt was not admitted",
+                           flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
+        } else {
+            CountObservation(counters.header_refused_far);
+        }
+        return;
+    }
+    // 3. Behind: at most two slots, and only with the proof below.
+    const bool behind{header.sequence < next};
+    if (behind && next - header.sequence > ACTION_HEADER_BEHIND) {
+        if (local) {
+            refuse_decoded("local queued action lacks a complete retained certified-head interval; check exact-action status before retry",
+                           flowmesh::ActionReasonCode::HEAD_INTERVAL_UNAVAILABLE);
+        } else {
+            CountObservation(counters.header_refused_far);
+        }
+        return;
+    }
+    // 4. Decode.
     const auto action{flowmesh::DecodeProductionActionPayload(message.payload)};
     if (!action) return;
     if (local) {
@@ -4506,8 +4542,8 @@ void FlowMeshRuntime::HandleAction(
         }
         // Authoritative recheck of the submit-time decision: state may have
         // advanced while this frame was queued. It runs before the header
-        // prologue's inclusion and pending-state refusals, so a frame whose
-        // own attempt was certified while it waited is never refused.
+        // proof's inclusion and pending-state refusals, so a frame whose own
+        // attempt was certified while it waited is never refused.
         const auto admission{DecideLocal(market, *action)};
         if (admission.kind == FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED) return; // its inclusion event exists
         if (admission.kind != FlowMeshLocalAdmission::Kind::ENQUEUE && AuthenticateAction(market, *action)) {
@@ -4527,60 +4563,65 @@ void FlowMeshRuntime::HandleAction(
         // An unauthenticated attempt earns no event of its own here: Add
         // below refuses it with the existing text.
     }
-    const bool refresh_local_header{local && message.header.sequence < market.next_sequence};
-    if (refresh_local_header) {
-        // SubmitLocalAction captures its wrapper before taking the bounded
-        // queue lock. A certificate can overtake it there. As with an already
-        // admitted local retry, only its routing sequence may advance: first
-        // recheck pending state, current authority and anchored deposit facts.
-        // Add below still authenticates the original shape/credential and
-        // enforces all pool/conflicting-sequence limits. No remote envelope
-        // receives this treatment, and no action payload is rewritten.
+    // 5. Proof for a header behind this head. A local wrapper can be
+    // overtaken by a certificate while queued; a remote sender can lag this
+    // node by a slot or two. Only the routing header may then advance, and
+    // only after proving over the WHOLE interval since that head that no
+    // certified entry this node retains disposed of this action: StillPending
+    // alone does not exclude a certified action whose execution was rejected
+    // without consuming its sequence or deposit. It fails closed after a
+    // restart gap, an epoch change or window eviction. Add below still
+    // authenticates the original bytes; the payload is never rewritten.
+    if (behind) {
         const auto refuse = [&](const char* reason, const flowmesh::ActionReasonCode code) {
-            ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason, nullptr, code);
+            if (local) {
+                ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason, nullptr, code);
+            } else {
+                CountObservation(counters.header_refused_unproven);
+            }
         };
-        // Only the immediately preceding durable body is retained here with
-        // authenticated authority. It must cover the ENTIRE interval since
-        // this wrapper was captured: StillPending alone does not exclude a
-        // certified action whose execution was rejected without consuming its
-        // deposit or account sequence. Older/missing evidence needs existing
-        // exact-action status/recovery, not an unbounded history scan or an
-        // observational client-event-ring inference. This deliberately does
-        // not promise autonomous progress across multiple head advances.
-        if (!market.client_head || message.header.sequence != market.next_sequence - 1 ||
-            market.client_head->entry.sequence != message.header.sequence ||
-            market.client_head->entry.epoch != message.header.epoch ||
-            market.client_head->entry.market_id != market.market_id) {
-            refuse("local queued action lacks a complete retained certified-head interval; check exact-action status before retry",
-                   flowmesh::ActionReasonCode::HEAD_INTERVAL_UNAVAILABLE);
-            return;
-        }
-        const auto id{action->Id()};
-        if (std::any_of(market.client_head->entry.actions.begin(), market.client_head->entry.actions.end(),
-                        [&](const auto& included) { return included.Id() == id; })) {
-            refuse("local queued action was already certified; inclusion is terminal regardless of execution outcome",
-                   flowmesh::ActionReasonCode::ALREADY_INCLUDED);
-            return;
+        const uint256 id{action->Id()};
+        for (uint64_t sequence{header.sequence}; sequence < next; ++sequence) {
+            const auto* item{market.recent.Find(sequence)};
+            if (!item || !item->envelope || item->epoch != header.epoch) {
+                refuse("local queued action lacks a complete retained certified-head interval; check exact-action status before retry",
+                       flowmesh::ActionReasonCode::HEAD_INTERVAL_UNAVAILABLE);
+                return;
+            }
+            if (FlowMeshRecentCertifiedWindow::BodyIndex(*item, id)) {
+                refuse("local queued action was already certified; inclusion is terminal regardless of execution outcome",
+                       flowmesh::ActionReasonCode::ALREADY_INCLUDED);
+                return;
+            }
         }
         if (!FlowMeshActionPool::StillPending(*action, market.state)) {
             refuse("local queued action is no longer pending in current state; prior certified inclusion is not undone",
                    flowmesh::ActionReasonCode::STALE_SEQUENCE_UNATTRIBUTED);
             return;
         }
-        const auto transition{CurrentSeatTransition(market)};
-        const auto anchor{market.chain->Current()};
-        if (market.pending_handoff || market.pending_candidate_restore || !transition ||
-            transition->kind != FlowMeshSeatTransitionKind::CONTINUE || !market.chain->Acceptable(anchor)) {
-            refuse("local queued action cannot refresh its header while current authority is unavailable; retry exact instruction",
-                   flowmesh::ActionReasonCode::AUTHORITY_UNAVAILABLE);
-            return;
-        }
-        if (action->IsDeposit() && (market.deposits == nullptr || !market.deposits->GetDeposit(action->outpoint, anchor))) {
-            refuse("local queued deposit has no current anchored facts; this attempt was not admitted",
-                   flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
-            return;
+        // Local frames also recheck current authority and anchored deposit
+        // facts, as before. Remote frames get neither: an equal-header remote
+        // frame never had them, and remote traffic must not add chain calls
+        // to the worker.
+        if (local) {
+            const auto transition{CurrentSeatTransition(market)};
+            const auto anchor{market.chain->Current()};
+            if (market.pending_handoff || market.pending_candidate_restore || !transition ||
+                transition->kind != FlowMeshSeatTransitionKind::CONTINUE || !market.chain->Acceptable(anchor)) {
+                refuse("local queued action cannot refresh its header while current authority is unavailable; retry exact instruction",
+                       flowmesh::ActionReasonCode::AUTHORITY_UNAVAILABLE);
+                return;
+            }
+            if (action->IsDeposit() && (market.deposits == nullptr || !market.deposits->GetDeposit(action->outpoint, anchor))) {
+                refuse("local queued deposit has no current anchored facts; this attempt was not admitted",
+                       flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+                return;
+            }
         }
     }
+    // Relays and duplicate forwards carry this node's own head.
+    auto routed{message};
+    routed.header.sequence = next;
     // A local head cancel/withdrawal/claim may use the reserved capacity;
     // every other local submission stops short of it.
     const auto type{static_cast<flowmesh::ActionType>(action->type)};
@@ -4605,11 +4646,13 @@ void FlowMeshRuntime::HandleAction(
                                   : "pool refused this attempt (authentication, conflicting sequence or capacity); not an execution result",
                           nullptr, code);
         if (peer != LOCAL_ACTION_PEER) {
-            market.pool.QueueDuplicateForward(*action, message, peer,
+            market.pool.QueueDuplicateForward(*action, routed, peer,
                                                market.state, market.clock->Now());
         }
         return;
     }
+    if (ahead) CountObservation(counters.header_accepted_ahead);
+    if (behind) CountObservation(counters.header_restamped_behind);
     CountObservation(market.delivery.verified);
     ClientActionEvent(market, flowmesh::ClientEventKind::POOL_ADMITTED, *action,
                       "authenticated action added to pool; not yet certified", nullptr,
@@ -4619,8 +4662,6 @@ void FlowMeshRuntime::HandleAction(
     DeliveryEvent(market, "action_round_observed", flowmesh::WireMessageKind::ACTION,
                   action->Id(), market.next_sequence, peer,
                   "pool_admission" + RoundTiming(market), SchedulingContext(market));
-    auto routed{message};
-    if (refresh_local_header) routed.header.sequence = market.next_sequence;
     RelayMessage(market, std::move(routed), std::nullopt,
                  local
                      ? std::nullopt

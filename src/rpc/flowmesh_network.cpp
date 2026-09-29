@@ -336,6 +336,13 @@ static RPCHelpMan getflowmeshdeliveryinfo()
                     {RPCResult::Type::NUM, "settled_frames_rate_limited", "Frames of the two kinds above refused because their sender exceeded a separate budget for consumed frames (256 burst and 64 per second per peer and market, 512 burst and 128 per second per peer across all markets). A peer is one connection identity (legacy NodeId or FMN2 session id); a reconnect or dual carriage gets a fresh budget. In steady state the per-peer budget binds when one sender's summed sustained rate of such frames exceeds 128 per second, about 11 markets at the 12 per second average measured with four validators; a non-zero value means a budget binds"},
                     {RPCResult::Type::NUM, "deferred_objects", "Currently retained critical incoming objects"},
                     {RPCResult::Type::NUM, "deferred_bytes", "Bytes charged to retained critical incoming objects"},
+                    {RPCResult::Type::OBJ, "action_admission", "ACTION frame header policy (local relay policy, never consensus). A frame's header only claims its sender's certified head", {
+                        {RPCResult::Type::NUM, "header_refused_identity", "Remote frames for another version, market or epoch"},
+                        {RPCResult::Type::NUM, "header_refused_far", "Remote frames more than two slots ahead of or behind this node's head"},
+                        {RPCResult::Type::NUM, "header_refused_unproven", "Remote frames behind this head whose interval this node could not prove excludes the action"},
+                        {RPCResult::Type::NUM, "header_accepted_ahead", "Frames admitted from a sender one or two slots ahead of this node"},
+                        {RPCResult::Type::NUM, "header_restamped_behind", "Frames admitted from a sender one or two slots behind, relayed with this node's head"},
+                    }},
                     {RPCResult::Type::STR, "current_reason", "Most recent delivery/refusal/retry reason"},
                     {RPCResult::Type::STR_HEX, "last_target_hash", "Last recorded target object"},
                     {RPCResult::Type::ARR, "events", "At most 128 recent events, not a complete audit journal", {
@@ -408,6 +415,13 @@ static RPCHelpMan getflowmeshdeliveryinfo()
                 item.pushKV("settled_frames_rate_limited", snapshot.settled_frames_rate_limited);
                 item.pushKV("deferred_objects", uint64_t{snapshot.deferred_objects});
                 item.pushKV("deferred_bytes", uint64_t{snapshot.deferred_bytes});
+                UniValue action_admission{UniValue::VOBJ};
+                action_admission.pushKV("header_refused_identity", snapshot.action_admission.header_refused_identity);
+                action_admission.pushKV("header_refused_far", snapshot.action_admission.header_refused_far);
+                action_admission.pushKV("header_refused_unproven", snapshot.action_admission.header_refused_unproven);
+                action_admission.pushKV("header_accepted_ahead", snapshot.action_admission.header_accepted_ahead);
+                action_admission.pushKV("header_restamped_behind", snapshot.action_admission.header_restamped_behind);
+                item.pushKV("action_admission", std::move(action_admission));
                 item.pushKV("current_reason", snapshot.current_reason);
                 item.pushKV("last_target_hash", snapshot.last_target_hash.GetHex());
                 UniValue events{UniValue::VARR};
