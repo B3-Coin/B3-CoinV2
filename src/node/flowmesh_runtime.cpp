@@ -3250,6 +3250,7 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
     std::optional<flowmesh::ClientActionNotice> notice;
     uint256 domain, config_id;
     const flowmesh::DepositVerifier* deposits{nullptr};
+    bool pooled{false};
     {
         FlowMeshTimingSpan timing_lock_3034{__func__};
         timing_lock_3034.Field("lock_name", std::string{"market_mutex"});
@@ -3263,8 +3264,13 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
             return out;
         }
         // Decided in the existing first lock scope, before anything is
-        // queued: no extra lock and no Schnorr work under this mutex.
-        out.admission = DecideLocal(*it->second, action);
+        // queued: no extra lock and no Schnorr work under this mutex. Exact
+        // bytes this node already pools (for example relayed by a peer, which
+        // has neither the local sequence window nor the deposit facts check)
+        // are queued as before and keep the worker's duplicate answer: a
+        // pooled action may still execute, so it is never refused here.
+        pooled = it->second->pool.ContainsExact(action);
+        if (!pooled) out.admission = DecideLocal(*it->second, action);
         if (out.admission.kind != FlowMeshLocalAdmission::Kind::ENQUEUE) {
             notice = LocalNotice(*it->second, action, out.admission, *payload);
             domain = it->second->domain;
@@ -3279,10 +3285,10 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
             trace.seat_set_hash = it->second->seats.set_hash;
             deposits = it->second->deposits;
             // Kept for a facts refusal's notice (built outside the lock).
-            if (action.IsDeposit()) notice = LocalNotice(*it->second, action, out.admission, *payload);
+            if (action.IsDeposit() && !pooled) notice = LocalNotice(*it->second, action, out.admission, *payload);
         }
     }
-    if (out.admission.kind == FlowMeshLocalAdmission::Kind::ENQUEUE && action.IsDeposit()) {
+    if (out.admission.kind == FlowMeshLocalAdmission::Kind::ENQUEUE && action.IsDeposit() && !pooled) {
         // A deposit is admitted only with anchored facts. Checked here, on the
         // submitting thread and outside the market lock (this takes cs_main),
         // never on the consensus worker: the public API cannot put chain

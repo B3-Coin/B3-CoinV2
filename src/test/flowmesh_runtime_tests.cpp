@@ -9733,6 +9733,59 @@ BOOST_AUTO_TEST_CASE(local_factless_deposit_refused_not_relayed_but_remote_still
     BOOST_CHECK_EQUAL(f.runtimes[1]->MarketStatus(f.market)->pending_actions, 2U);
 }
 
+BOOST_AUTO_TEST_CASE(local_submit_of_pooled_bytes_keeps_duplicate_answer_before_local_refusals)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_submit_pooled"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    CKey key;
+    key.MakeNewKey(true);
+    // Relayed by a peer, which has neither the local sequence window nor the
+    // deposit facts check: both are pooled here.
+    const auto far{SignedAction(key, f.domain, f.initial.ConfigId(), 1023, flowmesh::ActionType::CANCEL_ASK)};
+    const auto factless{Deposit(COutPoint{f.outpoint.hash, 91})};
+    const flowmesh::WireHeader header{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1};
+    for (const auto& action : {far, factless}) {
+        BOOST_REQUIRE(runtime.EnqueueWireMessage(3, {flowmesh::WireMessageKind::ACTION, header,
+            *flowmesh::EncodeProductionActionPayload(action)}) == flowmesh::QueueResult::ACCEPTED);
+    }
+    f.Drain();
+    BOOST_REQUIRE_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 2U);
+    // The same exact bytes through this node's API: a pooled action may still
+    // execute, so neither the sequence window nor the facts check refuses it
+    // (either would read "rejected"); it is queued and gets today's answer.
+    for (const auto& action : {far, factless}) {
+        const auto before{runtime.ClientEventCursor()};
+        const auto submitted{runtime.SubmitLocalActionChecked(f.market, action)};
+        BOOST_CHECK(submitted.admission.kind == node::FlowMeshLocalAdmission::Kind::ENQUEUE);
+        BOOST_REQUIRE(submitted.queued);
+        BOOST_CHECK(*submitted.queued == flowmesh::QueueResult::ACCEPTED);
+        f.Drain();
+        const auto events{runtime.ClientEvents(before, f.market, std::nullopt).events};
+        BOOST_REQUIRE(!events.empty());
+        for (const auto& event : events) {
+            BOOST_CHECK(event.action_id == action.Id());
+            BOOST_CHECK(event.kind != flowmesh::ClientEventKind::POOL_REFUSED);
+        }
+        // The queue observation may follow the worker's answer.
+        BOOST_CHECK(std::any_of(events.begin(), events.end(), [](const auto& event) {
+            return event.kind == flowmesh::ClientEventKind::POOL_ADMITTED &&
+                   event.reason == "exact signed action already present in pool";
+        }));
+        BOOST_CHECK(!runtime.NewestClientNotice(f.market, action.Id()));
+    }
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 2U);
+    // Not pooled, the local refusals still apply.
+    const auto other{SignedAction(key, f.domain, f.initial.ConfigId(), 1024, flowmesh::ActionType::CANCEL_ASK)};
+    BOOST_CHECK(runtime.SubmitLocalActionChecked(f.market, other).admission.code ==
+                flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE);
+    BOOST_CHECK(runtime.SubmitLocalActionChecked(f.market, Deposit(COutPoint{f.outpoint.hash, 92})).admission.code ==
+                flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+}
+
 BOOST_AUTO_TEST_CASE(action_relay_window_accepts_two_slots_with_proof_and_restamps)
 {
     PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "action_relay_window", std::chrono::seconds{10}, 2};
