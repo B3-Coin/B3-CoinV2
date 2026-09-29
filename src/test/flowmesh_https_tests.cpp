@@ -3500,6 +3500,127 @@ BOOST_AUTO_TEST_CASE(api_outcome_contract_advert_and_opt_in_only)
 
 BOOST_AUTO_TEST_SUITE_END()
 
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_submit_wait_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(trading_api_submit_keeps_the_previous_contract_unless_submit_waits_are_offered)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-submit-wait"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    // A correctly signed cancel under this market's pins. This service has
+    // no certified genesis yet, so it refuses the submission before queueing.
+    CKey key;
+    std::array<unsigned char, 32> secret{};
+    secret.back() = 9;
+    key.Set(secret.begin(), secret.end(), true);
+    flowmesh::Action action;
+    action.signer = flowmesh::AccountForKey(XOnlyPubKey{key.GetPubKey()});
+    action.sequence = 4;
+    action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+    BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, action));
+    const std::string submission{"{\"market_id\":\"" + market.GetHex() + "\",\"action_id\":\"" + action.Id().GetHex() +
+                                 "\",\"action_hex\":\"" + HexStr(*flowmesh::EncodeProductionActionPayload(action)) + "\""};
+    std::string previous_reply;
+    for (const auto& [name, policy] : std::vector<std::pair<std::string, node::FlowMeshTradingApiWait>>{
+             {"waits disabled", {}},
+             {"waits not offered on submit", {std::chrono::milliseconds{2000}, 4}},
+             {"submit waits without action waits", {std::chrono::milliseconds{0}, 4, true}}}) {
+        BOOST_TEST_CONTEXT(name) {
+            auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, policy)};
+            BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+            const auto endpoint{Endpoint(api->Port())};
+            const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+            BOOST_REQUIRE_EQUAL(markets_status, 200);
+            BOOST_CHECK(!markets["result"][0].exists("submit_wait_ms_max"));
+            // Exactly the previous contract: wait_ms is an unknown field,
+            // refused before anything is decoded or admitted.
+            const auto [refused_status, refused]{ApiCall(endpoint, "submit", submission + ",\"wait_ms\":500}")};
+            BOOST_CHECK_EQUAL(refused_status, 400);
+            BOOST_CHECK_EQUAL(refused["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+            const auto [status, reply]{ApiCall(endpoint, "submit", submission + "}")};
+            BOOST_REQUIRE_EQUAL(status, 200);
+            BOOST_CHECK_EQUAL(reply["result"]["receipt_state"].get_str(), "rejected");
+            if (previous_reply.empty()) previous_reply = reply["result"].write();
+            BOOST_CHECK_EQUAL(reply["result"].write(), previous_reply);
+            api->Stop();
+        }
+    }
+    auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {std::chrono::milliseconds{2000}, 4, true})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    // Offered: advertised next to the action wait, with the same maximum.
+    const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+    BOOST_REQUIRE_EQUAL(markets_status, 200);
+    const auto& row{markets["result"][0]};
+    BOOST_CHECK_EQUAL(row["submit_wait_ms_max"].getInt<int64_t>(), 2000);
+    auto keys{PreviousStatusKeys(row)};
+    keys.insert({"action_wait_ms_max", "submit_wait_ms_max"});
+    BOOST_CHECK(KeySet(row) == keys);
+    // Without wait_ms, the reply is the previous one, byte for byte.
+    const auto [plain_status, plain]{ApiCall(endpoint, "submit", submission + "}")};
+    BOOST_REQUIRE_EQUAL(plain_status, 200);
+    BOOST_CHECK_EQUAL(plain["result"].write(), previous_reply);
+    // A refused submission never waits: the same receipt, "none", and no
+    // embedded action reply, at once.
+    const auto start{std::chrono::steady_clock::now()};
+    const auto [waited_status, waited]{ApiCall(endpoint, "submit", submission + ",\"wait_ms\":2000}")};
+    BOOST_CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{1});
+    BOOST_REQUIRE_EQUAL(waited_status, 200);
+    BOOST_CHECK_EQUAL(waited["result"]["receipt_state"].get_str(), "rejected");
+    BOOST_CHECK_EQUAL(waited["result"]["wait_status"].get_str(), "none");
+    BOOST_CHECK(!waited["result"].exists("action"));
+    UniValue without_wait{UniValue::VOBJ};
+    for (const auto& key_name : waited["result"].getKeys()) {
+        if (key_name != "wait_status") without_wait.pushKV(key_name, waited["result"][key_name]);
+    }
+    BOOST_CHECK_EQUAL(without_wait.write(), previous_reply);
+    // Outcome evidence is not offered by this endpoint: an unknown field.
+    const auto [outcome_status, outcome]{ApiCall(endpoint, "submit", submission + ",\"wait_ms\":2000,\"outcome\":true}")};
+    BOOST_CHECK_EQUAL(outcome_status, 400);
+    BOOST_CHECK_EQUAL(outcome["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_submit_refuses_a_malformed_wait_before_decoding_the_action)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-submit-wait-malformed"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {std::chrono::milliseconds{2000}, 4, true}, {}, {true})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    // An undecodable action: any error that names wait_ms or outcome was
+    // raised before the action was decoded, so nothing was admitted.
+    const std::string invalid{"{\"market_id\":\"" + market.GetHex() + "\",\"action_id\":\"" + uint256{uint8_t{2}}.GetHex() +
+                              "\",\"action_hex\":\"zz\""};
+    for (const auto& [wait, expected] : std::vector<std::pair<std::string, std::string>>{
+             {"\"500\"", "Expected integer: wait_ms"}, {"true", "Expected integer: wait_ms"},
+             {"1.5", ""}, {"-1", ""}, {"18446744073709551616", ""}}) {
+        BOOST_TEST_CONTEXT("wait_ms=" << wait) {
+            const auto [status, reply]{ApiCall(endpoint, "submit", invalid + ",\"wait_ms\":" + wait + "}")};
+            BOOST_CHECK_EQUAL(status, 400);
+            BOOST_CHECK(reply["error"].get_str() != "Invalid bounded bytes: action_hex");
+            if (!expected.empty()) BOOST_CHECK_EQUAL(reply["error"].get_str(), expected);
+        }
+    }
+    const auto [bad_outcome_status, bad_outcome]{ApiCall(endpoint, "submit", invalid + ",\"wait_ms\":5,\"outcome\":1}")};
+    BOOST_CHECK_EQUAL(bad_outcome_status, 400);
+    BOOST_CHECK_EQUAL(bad_outcome["error"].get_str(), "Expected boolean: outcome");
+    const auto [lone_status, lone]{ApiCall(endpoint, "submit", invalid + ",\"outcome\":true}")};
+    BOOST_CHECK_EQUAL(lone_status, 400);
+    BOOST_CHECK_EQUAL(lone["error"].get_str(), "outcome on 'submit' applies only with wait_ms");
+    // A valid wait reaches the action's own checks.
+    const auto [decoded_status, decoded]{ApiCall(endpoint, "submit", invalid + ",\"wait_ms\":500}")};
+    BOOST_CHECK_EQUAL(decoded_status, 400);
+    BOOST_CHECK_EQUAL(decoded["error"].get_str(), "Invalid bounded bytes: action_hex");
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
 namespace {
 //! The same reply without the opt-in evidence (as a v1 endpoint sends it).
 UniValue WithoutEvidence(const UniValue& reply)

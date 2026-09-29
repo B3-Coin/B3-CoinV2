@@ -91,9 +91,14 @@ std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
 //! Node-local latency policy for the restricted API's bounded 'action' wait,
 //! never consensus. A zero max or zero waiters disables it: no capability is
 //! advertised and 'action' keeps its exact previous request contract.
+//! `submit` also offers the same wait, in the same slots, on 'submit' (the
+//! submit_wait_ms_max advert): a waited submission's reply adds the 'action'
+//! reply for the admitted action after the wait. Off, or with waits
+//! disabled, 'submit' keeps its exact previous request and reply contract.
 struct FlowMeshTradingApiWait {
     std::chrono::milliseconds max{0};
     size_t waiters{0};
+    bool submit{false};
 };
 inline constexpr std::chrono::milliseconds FLOWMESH_API_ACTION_WAIT_MAX{2500};
 inline constexpr std::chrono::milliseconds FLOWMESH_API_ACTION_WAIT_DEFAULT{2000};

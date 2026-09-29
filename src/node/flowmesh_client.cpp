@@ -501,6 +501,8 @@ class TradingApi {
     LocalBackend m_local;
     // Zero when the bounded 'action' wait is disabled.
     const std::chrono::milliseconds m_wait_max;
+    // Zero unless that wait is also offered on 'submit'.
+    const std::chrono::milliseconds m_submit_wait_max;
     FlowMeshActionWaitSlots m_waits;
     // Zero when the bounded 'updates' watch is disabled. A separate slot
     // pool: a crowd of watchers never takes an action wait's slot.
@@ -556,6 +558,8 @@ class TradingApi {
         // Latency capability, never evidence: clients send wait_ms only to an
         // endpoint that advertises it, since older servers reject the field.
         if (m_wait_max.count()) out.pushKV("action_wait_ms_max", uint64_t(m_wait_max.count()));
+        // The same for wait_ms on 'submit'.
+        if (m_submit_wait_max.count()) out.pushKV("submit_wait_ms_max", uint64_t(m_submit_wait_max.count()));
         // The same for watch_ms on 'updates'.
         if (m_watch_max.count()) out.pushKV("updates_watch_ms_max", uint64_t(m_watch_max.count()));
         // Capability, never evidence: clients send "outcome" only here.
@@ -807,6 +811,39 @@ class TradingApi {
         }
         return out;
     }
+    //! A waited 'submit', after its submission receipt was built: adds the
+    //! 'action' reply for the same ActionId after the same bounded wait, in
+    //! the same slots ("action"), and "wait_status" (a latency hint, never
+    //! evidence: none for a refused submission, budget, failed, or the
+    //! embedded reply's). A refused submission never waits. The embedded
+    //! read costs one more request token, like the separate 'action' read
+    //! it replaces; a spent budget omits it. Never fails the request and
+    //! never changes the submission receipt, so a client always learns what
+    //! this request admitted.
+    void SubmitWait(const FlowMeshHttpsServer::Request& http, const uint256& id, const uint256& action_id,
+                    const Receipt& submitted, const std::chrono::milliseconds wait, const bool outcome,
+                    FlowMeshTimingSpan& timing, UniValue& out)
+    {
+        std::string wait_status{"none"};
+        if (submitted.state == "rejected") {
+            // Nothing admitted to wait for.
+        } else if (!m_admission.ChargeExtra(http.remote_address, FlowMeshApiRequestClass::READ, std::chrono::steady_clock::now())) {
+            wait_status = "budget";
+        } else {
+            try {
+                auto action{ActionReply(http, id, action_id, wait, outcome, timing)};
+                wait_status = action["wait_status"].get_str();
+                out.pushKV("action", std::move(action));
+            } catch (const std::exception&) {
+                // Never build more of the reply without the permit a wait
+                // released; resuming is idempotent.
+                if (http.resume) http.resume();
+                wait_status = "failed";
+            }
+        }
+        out.pushKV("wait_status", wait_status);
+        timing.Field("submit_wait_status", wait_status);
+    }
 public:
     explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
                         const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome,
@@ -814,6 +851,7 @@ public:
         : m_service(service), m_local(service, std::move(metadata)),
           m_wait_max{wait.waiters == 0 ? std::chrono::milliseconds{0}
                                        : std::clamp(wait.max, std::chrono::milliseconds{0}, FLOWMESH_API_ACTION_WAIT_MAX)},
+          m_submit_wait_max{wait.submit ? m_wait_max : std::chrono::milliseconds{0}},
           m_waits{m_wait_max.count() ? std::min(wait.waiters, FLOWMESH_API_ACTION_WAITERS_MAX) : 0},
           // Whatever the caller asks, both pools together never exceed the
           // sleeping workers the HTTPS server's bound leaves.
@@ -896,9 +934,32 @@ public:
             return out;
         }
         if (method == "submit") {
-            Keys(params, {"market_id", "action_id", "action_hex"});
+            // Not offered: exactly the previous contract, in which wait_ms and
+            // outcome are unknown fields.
+            if (m_submit_wait_max.count() == 0) Keys(params, {"market_id", "action_id", "action_hex"});
+            else if (!m_outcome) Keys(params, {"market_id", "action_id", "action_hex", "wait_ms"});
+            else Keys(params, {"market_id", "action_id", "action_hex", "wait_ms", "outcome"});
+            // Parsed before the action, like every other check: an error
+            // reply always means this request admitted nothing.
+            const bool outcome{params.exists("outcome") && Flag(params, "outcome")};
+            if (params.exists("outcome") && !params.exists("wait_ms")) Fail("outcome on 'submit' applies only with wait_ms");
+            // Any unsigned integer is clamped to the advertised maximum.
+            const std::optional<std::chrono::milliseconds> wait{params.exists("wait_ms")
+                ? std::optional{std::chrono::milliseconds{
+                      std::min<uint64_t>(Number(params, "wait_ms", std::numeric_limits<uint64_t>::max()), m_submit_wait_max.count())}}
+                : std::nullopt};
             const auto id{Id(params, "market_id")};
             const auto action_id{Id(params, "action_id")};
+            // The public submit reply keeps its v1 meaning: an endpoint never
+            // states a verified outcome there (clients ignore endpoint
+            // booleans). Without wait_ms it is exactly the previous reply.
+            const auto reply = [&](Receipt receipt) {
+                receipt.outcome.reset();
+                receipt.outcome_verified = false;
+                UniValue out{FlowMeshClientReceiptJson(receipt)};
+                if (wait) SubmitWait(http, id, action_id, receipt, *wait, outcome, timing, out);
+                return out;
+            };
             const auto payload{Bytes(params, "action_hex", flowmesh::FLOWMESH_ACTION_MAX_BYTES)};
             const auto action{flowmesh::DecodeProductionActionPayload(payload)};
             if (!action || action->Id() != action_id) Fail("Invalid exact signed action or ActionId");
@@ -913,7 +974,7 @@ public:
                 // gets its certified inclusion rather than the budget error.
                 const auto status{m_service.ClientActionStatus(id, action_id)};
                 if (status && status->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED) {
-                    return FlowMeshClientReceiptJson(LocalActionReceipt(status, action_id));
+                    return reply(LocalActionReceipt(status, action_id));
                 }
                 Fail("Public trading order budget exhausted; cancels and withdrawals are still accepted");
             }
@@ -921,12 +982,7 @@ public:
             if (!market) Fail("Unknown market");
             if (!action->IsDeposit() && !flowmesh::SchnorrActionAuthenticator(market->domain, market->execution_config_id).Authenticate(*action))
                 Fail("Action authentication failed for this chain/domain/market configuration");
-            auto receipt{m_local.Submit(id, *action)};
-            // The public submit reply keeps its v1 meaning: an endpoint never
-            // states a verified outcome there (clients ignore endpoint booleans).
-            receipt.outcome.reset();
-            receipt.outcome_verified = false;
-            return FlowMeshClientReceiptJson(receipt);
+            return reply(m_local.Submit(id, *action));
         }
         if (method == "action") {
             // Disabled, the contract is exactly the previous one, in which
