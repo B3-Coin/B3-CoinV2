@@ -201,6 +201,15 @@ class FlowMeshActionOutcomeTest(FlowMeshLatencyTest):
             evidence = self.ok("outcome_evidence", {"market_id": market, "microblock_sequence": raw["microblock_sequence"],
                                                     "microblock_hash": raw["microblock_hash"]}, 0)
             assert_equal(evidence["outcome_evidence"], raw["outcome_evidence"])
+            # Validator 1 applies the bid's certificate on its own schedule,
+            # possibly after the client verified it through validator 0: wait
+            # (bounded) until it reports the inclusion before comparing the
+            # two validators' v1 replies.
+            def validator1_included():
+                self.pump_b3()
+                reply = self.ok("action", {"market_id": market, "action_id": bid_id}, 1)
+                return reply["receipt_state"] == "certified_inclusion"
+            self.wait_until(validator1_included, timeout=60, check_interval=.2)
             v1_keys = set(self.ok("action", {"market_id": market, "action_id": bid_id}, 1))
             assert_equal(set(self.ok("action", {"market_id": market, "action_id": bid_id}, 0)), v1_keys)
             self.outcome_report["applied"] = {"action_id": bid_id, "microblock_sequence": status["microblock_sequence"]}
