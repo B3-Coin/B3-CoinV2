@@ -22,7 +22,11 @@ to the pump on the same 0.5 s cadence as the 5 ms poll loop and both arms
 see the same B3 workload. Every order records the validators' B3 heights
 just before its RPC and just after certification, outside the timed span,
 and the pump ticks inside its window, so results can be stratified by
-whether B3 advanced during the measurement. Either option, or
+whether B3 advanced during the measurement. --submit-wait-ms=MS passes MS
+as the order RPCs' trailing wait_ms when the client binary lists it, so an
+endpoint offering waited submissions returns the verified inclusion from the
+submission itself (one request); like a waited read, it is cut to end when
+the next mock-time tick is due. Any of these options, or
 --record-reconnects, records every sample's HTTPS reuse/handshake flags
 instead of asserting the warm arm's reuse per sample, so a connection
 rollover or reset stays in the distribution rather than aborting the run.
@@ -67,6 +71,10 @@ B3_ATOMS = 1_000_000_000  # Native atomic units per B3.
 # per match. More matches would evict certified orders the final checks read.
 MAX_SAMPLES = (512 - 2) // 2
 STATUS_WAIT_MAX_MS = 2500  # getflowmeshactionstatus wait_ms bound.
+SUBMIT_WAIT_MAX_MS = 2500  # submitflowmeshorder wait_ms bound.
+# A waited submission that fell back to the ordinary delivery path, which
+# then records its own 'submit' client_call.
+LANE_FALLBACK_RESULTS = ("unsupported", "refused_failover", "unanswered_failover")
 # A waited status read ends when the next B3 pump tick is due; returning
 # later than this after the due time means the pump cadence was not kept.
 PUMP_OVERDUE_BOUND_MS = 100
@@ -96,6 +104,8 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                           help=f"Measured matches, cycling the fixed price schedule (1-{MAX_SAMPLES}, default {len(PRICES)})")
         parser.add_argument("--status-wait-ms", type=bounded_int("--status-wait-ms", 0, STATUS_WAIT_MAX_MS), default=0,
                             help=f"getflowmeshactionstatus wait_ms, used only if the client binary lists it (0-{STATUS_WAIT_MAX_MS}, default 0: immediate reads)")
+        parser.add_argument("--submit-wait-ms", type=bounded_int("--submit-wait-ms", 0, SUBMIT_WAIT_MAX_MS), default=0,
+                            help=f"submitflowmeshorder wait_ms, used only if the client binary lists it (0-{SUBMIT_WAIT_MAX_MS}, default 0: no waited submission)")
         parser.add_argument("--record-reconnects", action="store_true",
                             help=f"Record per-sample HTTPS reuse/handshake flags and validator trace-cap markers instead of asserting them (implied by --samples other than {len(PRICES)} or --status-wait-ms)")
         parser.add_argument("--fsync-mode", choices=("auto", *FSYNC_MODES), default="auto",
@@ -112,11 +122,13 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                        tuple(PRICES[number % len(PRICES)] for number in range(self.options.samples)))
         # Without the new options every sample keeps its original assertions.
         self.strict_samples = not (self.options.record_reconnects or self.options.status_wait_ms or
-                                   self.options.samples != len(PRICES))
+                                   self.options.submit_wait_ms or self.options.samples != len(PRICES))
         # The wait_ms passed when the client binary accepts it (0: immediate
         # reads), set once the client is known. Endpoints may still answer at
         # once; the summary counts which status requests were waited.
         self.status_wait_ms = 0
+        # The same for the orders' own wait_ms.
+        self.submit_wait_ms = 0
         self.pump_ticks = deque(maxlen=256)  # Host time at the start of recent B3 pump ticks.
         self.capture_clock = None
         self.trade_report = {"format_version": 1, "arm": self.options.transport_arm,
@@ -125,6 +137,8 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             "sample_assertions": "per_sample" if self.strict_samples else "recorded_only",
             "status_wait": {"requested_ms": self.options.status_wait_ms, "client_accepts_wait_ms": 0, "effective_ms": 0,
                             "measured_reads_end_by_next_b3_tick": True},
+            "submit_wait": {"requested_ms": self.options.submit_wait_ms, "client_accepts_wait_ms": 0,
+                            "measured_waits_end_by_next_b3_tick": True},
             "trace_limits_reached": [],
             "scope": {"operators": 4, "engine_off_clients": 1, "client_wallets": 2,
                 "HTTPS": "direct native TLS listeners; no relay", "B3_advancing": True,
@@ -218,6 +232,11 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             # effective_ms: deprecated alias kept for readers of earlier reports.
             self.trade_report["status_wait"].update(client_supports_wait_ms=supported, client_accepts_wait_ms=self.status_wait_ms,
                                                     effective_ms=self.status_wait_ms)
+        if self.options.submit_wait_ms:
+            # Asked once; an older binary submits without a wait.
+            supported = re.search(r"^6\. wait_ms\b", self.client.help("submitflowmeshorder"), re.M) is not None
+            self.submit_wait_ms = self.options.submit_wait_ms if supported else 0
+            self.trade_report["submit_wait"].update(client_supports_wait_ms=supported, client_accepts_wait_ms=self.submit_wait_ms)
 
     def assert_engine_off(self):
         # Client/validator status are wallet RPCs too; the inherited helper
@@ -354,7 +373,15 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                         # Read before the timed span opens.
                         sample["b3"] = {"heights_before": self.b3_heights()}
                     sample["started_host_us"] = host_us()
-                response = rpc.submitflowmeshorder(market, side, price, 1, sequence)
+                if self.submit_wait_ms:
+                    # As a waited read: end when the next B3 tick is due.
+                    wait_ms = self.submit_wait_ms
+                    if self.clock_indices is not None:
+                        wait_ms = min(wait_ms, max(1, math.ceil((self.next_clock_tick - time.monotonic()) * 1000)))
+                    sample["submit_wait_ms"] = wait_ms
+                    response = rpc.submitflowmeshorder(market, side, price, 1, sequence, wait_ms)
+                else:
+                    response = rpc.submitflowmeshorder(market, side, price, 1, sequence)
                 break
             except JSONRPCException as error:
                 if error.error.get("code") != -1 or error.error.get("message") not in PRE_ADMISSION_REJECTIONS:
@@ -463,7 +490,7 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             return row
         def measured(row):
             root = outermost(row)
-            return (root["stage"] in ("Market", "Submit", "ActionStatus", "client_action_wait") and
+            return (root["stage"] in ("Market", "Submit", "ActionStatus", "client_action_wait", "client_submit_wait") and
                     root.get("action_id", bid["action_id"]) == bid["action_id"] and
                     root["started_us"] + low <= bid["certified_host_us"] and
                     root["monotonic_us"] + high >= bid["started_host_us"])
@@ -542,13 +569,18 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             requests = [row for row in events if row.get("stage") == "https_request"]
             submissions = Counter(row["action_id"] for row in events
                 if row.get("stage") == "client_call" and row.get("method") == "submit")
+            # Waited submissions travel on the wait lane, not through a
+            # client_call; one that fell back also recorded that call.
+            lane_submissions = Counter(row["action_id"] for row in events if row.get("stage") == "client_submit_wait")
+            lane_fallbacks = Counter(row["action_id"] for row in events if row.get("stage") == "client_submit_wait" and
+                                     row.get("result") in LANE_FALLBACK_RESULTS)
             sample["HTTPS"] = {"requests": len(requests),
                 "handshakes": sum("tls_handshake_done_us" in row for row in requests),
                 "reused": sum(row.get("connection_reused", 0) for row in requests),
-                "submit_calls_by_action": dict(submissions)}
+                "submit_calls_by_action": dict(submissions), "waited_submissions_by_action": dict(lane_submissions)}
             if "bid" in sample:
-                submit_spans = {row["span_id"] for row in events if row.get("stage") == "client_call" and
-                    row.get("method") == "submit" and row.get("action_id") == sample["bid"]["action_id"]}
+                submit_spans = {row["span_id"] for row in events if row.get("action_id") == sample["bid"]["action_id"] and
+                    ((row.get("stage") == "client_call" and row.get("method") == "submit") or row.get("stage") == "client_submit_wait")}
                 bid_requests = sorted((row for row in requests if row["parent_span_id"] in submit_spans),
                                       key=lambda row: row["started_us"])
                 sample["HTTPS"]["measured_bid_submit"] = [{"span_id": row["span_id"],
@@ -559,7 +591,8 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             for key in ("ask", "bid"):
                 if key in sample:
                     action = sample[key]
-                    assert_equal(submissions[action["action_id"]], 1 + len(action["exact_action_retries"]))
+                    assert_equal(submissions[action["action_id"]] + lane_submissions[action["action_id"]] -
+                                 lane_fallbacks[action["action_id"]], 1 + len(action["exact_action_retries"]))
             if sample["complete"]:
                 assert requests
             if sample["complete"] and self.options.transport_arm == "baseline":
@@ -644,6 +677,8 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                     # Waited-lane versus ordinary status requests inside the
                     # bid windows: a waited run that fell back reads 'action'.
                     "measured_window_status_requests": {name: callers[name] for name in ("client_action_wait", "action")},
+                    # Waited submissions inside the bid windows (one request each).
+                    "measured_window_waited_submissions": callers["client_submit_wait"],
                     "client_certified_without_handshake": distribution([row["bid"]["client_certified_ms"]
                         for row, paid in zip(samples, reconnected) if not paid], 200),
                     "client_certified_with_handshake": distribution([row["bid"]["client_certified_ms"]
