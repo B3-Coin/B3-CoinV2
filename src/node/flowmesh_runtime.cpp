@@ -287,14 +287,27 @@ struct FlowMeshRuntime::Market {
         if (it == public_submissions.end()) {
             if (submitter.empty()) return false;
             const uint64_t serial{++public_submission_serial};
-            const auto dropped{public_submitters.Insert(serial, submitter)};
+            // Both maps first and IdentityShares last, which either records
+            // the serial or changes nothing: if anything here throws, this
+            // entry is removed again, so every serial IdentityShares holds
+            // keeps its entries in both maps.
             it = public_submissions.emplace(id, PublicSubmission{.serial = serial}).first;
-            public_submission_ids.emplace(serial, id);
+            std::optional<uint64_t> dropped;
+            try {
+                public_submission_ids.emplace(serial, id);
+                dropped = public_submitters.Insert(serial, submitter);
+            } catch (...) {
+                public_submission_ids.erase(serial);
+                public_submissions.erase(it);
+                throw;
+            }
+            // Never the entry just added (IdentityShares::Insert); a serial
+            // without entries is only forgotten.
             if (dropped) {
-                // Never the entry just added (IdentityShares::Insert).
-                const auto gone{public_submission_ids.find(*dropped)};
-                public_submissions.erase(gone->second);
-                public_submission_ids.erase(gone);
+                if (const auto gone{public_submission_ids.find(*dropped)}; gone != public_submission_ids.end()) {
+                    public_submissions.erase(gone->second);
+                    public_submission_ids.erase(gone);
+                }
             }
         }
         if (it->second.frames < std::numeric_limits<uint32_t>::max()) ++it->second.frames;
