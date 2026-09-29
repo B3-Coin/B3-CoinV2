@@ -5,6 +5,7 @@
 #ifndef B3COIN_NODE_FLOWMESH_ACTION_POOL_H
 #define B3COIN_NODE_FLOWMESH_ACTION_POOL_H
 
+#include <flowmesh/action_reason.h>
 #include <flowmesh/batch.h>
 #include <flowmesh/deposit.h>
 #include <flowmesh/p2p.h>
@@ -31,6 +32,13 @@ namespace node {
 inline constexpr flowmesh::WirePeerId FLOWMESH_LOCAL_ACTION_PEER{
     std::numeric_limits<flowmesh::WirePeerId>::min()};
 
+/** Pool admission context. Only this node's own API/RPC submissions are
+ * api_origin; retained candidate evidence restored at start is not. */
+struct FlowMeshPoolAddContext {
+    bool api_origin{false};
+    bool priority_eligible{false};
+};
+
 /**
  * Per-market pending-action pool of the production runtime. Worker-owned:
  * the runtime calls it only under its market mutex. Admission authenticates
@@ -42,22 +50,27 @@ class FlowMeshActionPool
 public:
     using Verifier = std::function<bool(const flowmesh::Action&)>;
 
+    using AddContext = FlowMeshPoolAddContext;
+
     void SetVerifier(Verifier verifier) { m_verifier = std::move(verifier); }
 
-    bool Add(const flowmesh::Action& action,
-             const flowmesh::WirePeerId origin,
-             const flowmesh::WireClock::time_point now)
+    /** Same checks in the same order as ever; the result names the first one
+     * that refused (ADMITTED on success). */
+    flowmesh::ActionReasonCode Add(const flowmesh::Action& action,
+                                   const flowmesh::WirePeerId origin,
+                                   const flowmesh::WireClock::time_point now,
+                                   const AddContext context = {})
     {
-        if (!action.ShapeIsCanonical() || !m_verifier || !m_verifier(action)) {
-            return false;
-        }
+        using Code = flowmesh::ActionReasonCode;
+        if (!action.ShapeIsCanonical()) return Code::MALFORMED_SHAPE;
+        if (!m_verifier || !m_verifier(action)) return Code::UNAUTHENTICATED;
         const uint256 id{action.Id()};
-        if (m_actions.count(id) != 0) return false;
+        if (m_actions.count(id) != 0) return Code::DUPLICATE_PENDING;
         const size_t bytes{static_cast<size_t>(::GetSerializeSize(action))};
         if (m_actions.size() >= flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_COUNT ||
             bytes > flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_BYTES ||
             m_bytes > flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_BYTES - bytes) {
-            return false;
+            return Code::POOL_FULL;
         }
         if (origin != FLOWMESH_LOCAL_ACTION_PEER) {
             const Usage& usage{m_peer_usage[origin]};
@@ -67,15 +80,16 @@ public:
                 usage.bytes >
                     flowmesh::FLOWMESH_ACTION_POOL_PER_PEER_MARKET_BYTES -
                         bytes) {
-                return false;
+                return Code::PEER_QUOTA;
             }
         }
         if (action.IsDeposit()) {
-            if (m_deposits.count(action.outpoint) != 0) return false;
+            if (m_deposits.count(action.outpoint) != 0) return Code::DEPOSIT_CONFLICT;
         } else if (m_signed.count({action.signer, action.sequence}) != 0) {
-            return false;
+            return Code::SEQUENCE_CONFLICT;
         }
         m_actions.emplace(id, StoredAction{action});
+        m_actions.at(id).api_origin = context.api_origin;
         m_origins.emplace(id, origin);
         m_bytes += bytes;
         if (origin != FLOWMESH_LOCAL_ACTION_PEER) {
@@ -94,7 +108,7 @@ public:
                 now + FlowMeshLocalActionRelayBudget::REPEAT_DELAY,
                 std::prev(m_local_retries.end())};
         }
-        return true;
+        return Code::ADMITTED;
     }
 
     // Only local admission creates a retry obligation. The list owns IDs,
@@ -273,8 +287,12 @@ public:
         }
     }
 
-    void Prune(const flowmesh::FlowMeshState& state)
+    /** Drops every consumed deposit and every stale sequence, as always.
+     * Returns up to `report_max` dropped API-origin SIGNED actions, in drop
+     * order; further such drops are only counted (UnreportedDrops). */
+    std::vector<flowmesh::Action> Prune(const flowmesh::FlowMeshState& state, const size_t report_max = 0)
     {
+        std::vector<flowmesh::Action> reported;
         for (auto it{m_deposits.begin()}; it != m_deposits.end();) {
             if (!state.DepositConsumed(it->first)) {
                 ++it;
@@ -288,10 +306,22 @@ public:
                 ++it;
                 continue;
             }
+            if (const auto found{m_actions.find(it->second)};
+                found != m_actions.end() && found->second.api_origin) {
+                if (reported.size() < report_max) {
+                    reported.push_back(found->second.action);
+                } else if (m_unreported_drops != std::numeric_limits<uint64_t>::max()) {
+                    ++m_unreported_drops;
+                }
+            }
             Drop(it->second);
             it = m_signed.erase(it);
         }
+        return reported;
     }
+
+    //! API-origin drops beyond a Prune report bound (observation only).
+    uint64_t UnreportedDrops() const { return m_unreported_drops; }
 
     /**
      * A certified execution is a terminal disposition for every action in
@@ -343,6 +373,8 @@ private:
     };
     struct StoredAction {
         flowmesh::Action action;
+        //! Admitted from this node's own API/RPC (AddContext::api_origin).
+        bool api_origin{false};
         std::optional<flowmesh::WireClock::time_point> last_forward_attempt{};
         std::optional<PendingForward> forward{};
         std::optional<LocalRetry> local_retry{};
@@ -399,6 +431,7 @@ private:
     std::map<COutPoint, uint256> m_deposits;
     std::map<std::pair<flowmesh::AccountId, uint64_t>, uint256> m_signed;
     size_t m_bytes{0};
+    uint64_t m_unreported_drops{0};
 };
 
 } // namespace node

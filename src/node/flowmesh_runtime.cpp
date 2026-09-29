@@ -1310,7 +1310,8 @@ bool RetainCandidateBeforeSigning(Market& market,
 template <typename Market>
 flowmesh::ClientEvent MakeClientActionEvent(Market& market, const flowmesh::ClientEventKind kind,
                                            const flowmesh::Action& action, std::string reason,
-                                           const flowmesh::ProductionEntryCore* certified)
+                                           const flowmesh::ProductionEntryCore* certified,
+                                           const flowmesh::ActionReasonCode code = flowmesh::ActionReasonCode::NONE)
 {
     flowmesh::ClientEvent event;
     event.market_id = market.market_id;
@@ -1326,15 +1327,17 @@ flowmesh::ClientEvent MakeClientActionEvent(Market& market, const flowmesh::Clie
         event.signed_action_hash = Hash(*bytes);
     }
     event.reason = std::move(reason);
+    event.reason_code = code;
     return event;
 }
 
 template <typename Market>
 void ClientActionEvent(Market& market, const flowmesh::ClientEventKind kind,
                        const flowmesh::Action& action, std::string reason = {},
-                       const flowmesh::ProductionEntryCore* certified = nullptr)
+                       const flowmesh::ProductionEntryCore* certified = nullptr,
+                       const flowmesh::ActionReasonCode code = flowmesh::ActionReasonCode::NONE)
 {
-    market.client_events.Append(MakeClientActionEvent(market, kind, action, std::move(reason), certified));
+    market.client_events.Append(MakeClientActionEvent(market, kind, action, std::move(reason), certified, code));
 }
 
 template <typename Market>
@@ -2383,7 +2386,9 @@ bool FlowMeshRuntime::InitializeMarket(
     }
     if (retained) {
         for (const flowmesh::Action& action : retained->evidence) {
-            if (!market->pool.Add(action, LOCAL_ACTION_PEER, market->clock->Now())) {
+            // Restored evidence is not an API submission: no notices.
+            if (market->pool.Add(action, LOCAL_ACTION_PEER, market->clock->Now(), {}) !=
+                flowmesh::ActionReasonCode::ADMITTED) {
                 error = "FlowMesh runtime retained action evidence no longer authenticates";
                 return false;
             }
@@ -4355,7 +4360,8 @@ void FlowMeshRuntime::HandleAction(
         if (local) {
             if (const auto action{flowmesh::DecodeProductionActionPayload(message.payload)}) {
                 ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action,
-                                  "local queued action header is not current authority; this attempt was not admitted");
+                                  "local queued action header is not current authority; this attempt was not admitted",
+                                  nullptr, flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
             }
         }
         return;
@@ -4371,8 +4377,8 @@ void FlowMeshRuntime::HandleAction(
         // Add below still authenticates the original shape/credential and
         // enforces all pool/conflicting-sequence limits. No remote envelope
         // receives this treatment, and no action payload is rewritten.
-        const auto refuse = [&](const char* reason) {
-            ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason);
+        const auto refuse = [&](const char* reason, const flowmesh::ActionReasonCode code) {
+            ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason, nullptr, code);
         };
         // Only the immediately preceding durable body is retained here with
         // authenticated authority. It must cover the ENTIRE interval since
@@ -4386,37 +4392,48 @@ void FlowMeshRuntime::HandleAction(
             market.client_head->entry.sequence != message.header.sequence ||
             market.client_head->entry.epoch != message.header.epoch ||
             market.client_head->entry.market_id != market.market_id) {
-            refuse("local queued action lacks a complete retained certified-head interval; check exact-action status before retry");
+            refuse("local queued action lacks a complete retained certified-head interval; check exact-action status before retry",
+                   flowmesh::ActionReasonCode::HEAD_INTERVAL_UNAVAILABLE);
             return;
         }
         const auto id{action->Id()};
         if (std::any_of(market.client_head->entry.actions.begin(), market.client_head->entry.actions.end(),
                         [&](const auto& included) { return included.Id() == id; })) {
-            refuse("local queued action was already certified; inclusion is terminal regardless of execution outcome");
+            refuse("local queued action was already certified; inclusion is terminal regardless of execution outcome",
+                   flowmesh::ActionReasonCode::ALREADY_INCLUDED);
             return;
         }
         if (!FlowMeshActionPool::StillPending(*action, market.state)) {
-            refuse("local queued action is no longer pending in current state; prior certified inclusion is not undone");
+            refuse("local queued action is no longer pending in current state; prior certified inclusion is not undone",
+                   flowmesh::ActionReasonCode::STALE_SEQUENCE_UNATTRIBUTED);
             return;
         }
         const auto transition{CurrentSeatTransition(market)};
         const auto anchor{market.chain->Current()};
         if (market.pending_handoff || market.pending_candidate_restore || !transition ||
             transition->kind != FlowMeshSeatTransitionKind::CONTINUE || !market.chain->Acceptable(anchor)) {
-            refuse("local queued action cannot refresh its header while current authority is unavailable; retry exact instruction");
+            refuse("local queued action cannot refresh its header while current authority is unavailable; retry exact instruction",
+                   flowmesh::ActionReasonCode::AUTHORITY_UNAVAILABLE);
             return;
         }
         if (action->IsDeposit() && (market.deposits == nullptr || !market.deposits->GetDeposit(action->outpoint, anchor))) {
-            refuse("local queued deposit has no current anchored facts; this attempt was not admitted");
+            refuse("local queued deposit has no current anchored facts; this attempt was not admitted",
+                   flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
             return;
         }
     }
-    if (!market.pool.Add(*action, peer, market.clock->Now())) {
+    const auto added{market.pool.Add(*action, peer, market.clock->Now(), {.api_origin = local})};
+    if (added != flowmesh::ActionReasonCode::ADMITTED) {
         const bool already_admitted{market.pool.ContainsExact(*action)};
+        // Existing texts, byte-identical; only the memory-only code is new.
+        const auto code{already_admitted ? flowmesh::ActionReasonCode::DUPLICATE_PENDING
+                        : added == flowmesh::ActionReasonCode::DUPLICATE_PENDING
+                            ? flowmesh::ActionReasonCode::DUPLICATE_ID_OTHER_CREDENTIAL : added};
         ClientActionEvent(market, already_admitted ? flowmesh::ClientEventKind::POOL_ADMITTED
                                                    : flowmesh::ClientEventKind::POOL_REFUSED,
                           *action, already_admitted ? "exact signed action already present in pool"
-                              : "pool refused this attempt (authentication, conflicting sequence or capacity); not an execution result");
+                              : "pool refused this attempt (authentication, conflicting sequence or capacity); not an execution result",
+                          nullptr, code);
         if (peer != LOCAL_ACTION_PEER) {
             market.pool.QueueDuplicateForward(*action, message, peer,
                                                market.state, market.clock->Now());
@@ -4425,7 +4442,8 @@ void FlowMeshRuntime::HandleAction(
     }
     CountObservation(market.delivery.verified);
     ClientActionEvent(market, flowmesh::ClientEventKind::POOL_ADMITTED, *action,
-                      "authenticated action added to pool; not yet certified");
+                      "authenticated action added to pool; not yet certified", nullptr,
+                      flowmesh::ActionReasonCode::ADMITTED);
     DeliveryEvent(market, "action_verified", flowmesh::WireMessageKind::ACTION,
                   action->Id(), market.next_sequence, peer);
     DeliveryEvent(market, "action_round_observed", flowmesh::WireMessageKind::ACTION,

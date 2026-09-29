@@ -9139,4 +9139,48 @@ BOOST_AUTO_TEST_CASE(recent_window_rebuilt_after_restart_with_replay_outcomes)
     BOOST_CHECK_EQUAL(f.runtimes[0]->ClientEntryStoreReadsForTest(), reads_before);
 }
 
+BOOST_AUTO_TEST_CASE(pool_events_carry_memory_only_reason_codes_with_unchanged_texts)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "pool_event_reason_codes"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true; // nothing below may certify
+    CKey key;
+    key.MakeNewKey(true);
+    flowmesh::Action action;
+    action.signer = flowmesh::AccountForKey(XOnlyPubKey{key.GetPubKey()});
+    action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_ASK);
+    BOOST_REQUIRE(flowmesh::SignAction(key, f.domain, f.initial.ConfigId(), action));
+    auto forged{action};
+    forged.sequence = 1;
+    BOOST_REQUIRE(flowmesh::SignAction(key, f.domain, f.initial.ConfigId(), forged));
+    forged.credential.back() ^= 1;
+    const auto before{f.runtimes[0]->ClientEvents(std::nullopt, f.market, std::nullopt).cursor};
+    BOOST_REQUIRE(f.runtimes[0]->SubmitLocalAction(f.market, action) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtimes[0]->SubmitLocalAction(f.market, action) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtimes[0]->SubmitLocalAction(f.market, forged) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    const auto events{f.runtimes[0]->ClientEvents(before, f.market, std::nullopt).events};
+    const auto find = [&](const uint256& id, flowmesh::ClientEventKind kind, const std::string& text) {
+        return std::find_if(events.begin(), events.end(), [&](const auto& event) {
+            return event.action_id == id && event.kind == kind && event.reason == text;
+        });
+    };
+    const auto admitted{find(action.Id(), flowmesh::ClientEventKind::POOL_ADMITTED,
+                             "authenticated action added to pool; not yet certified")};
+    BOOST_REQUIRE(admitted != events.end());
+    BOOST_CHECK(admitted->reason_code == flowmesh::ActionReasonCode::ADMITTED);
+    const auto duplicate{find(action.Id(), flowmesh::ClientEventKind::POOL_ADMITTED,
+                              "exact signed action already present in pool")};
+    BOOST_REQUIRE(duplicate != events.end());
+    BOOST_CHECK(duplicate->reason_code == flowmesh::ActionReasonCode::DUPLICATE_PENDING);
+    const auto refused{find(forged.Id(), flowmesh::ClientEventKind::POOL_REFUSED,
+        "pool refused this attempt (authentication, conflicting sequence or capacity); not an execution result")};
+    BOOST_REQUIRE(refused != events.end());
+    BOOST_CHECK(refused->reason_code == flowmesh::ActionReasonCode::UNAUTHENTICATED);
+    // Only the one valid action is pooled.
+    BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 1U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
