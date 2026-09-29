@@ -553,8 +553,8 @@ public:
      * picks the notice ring of this submission's notices, including the
      * worker's recheck and pool-drop notices for it: NODE only for this
      * node's own wallet RPC and GUI, never for public API traffic. A PUBLIC
-     * deposit refused for missing facts gets no notice (it has no
-     * credential). `submitter`, for PUBLIC only, is the requesting client's
+     * deposit gets no notice from this call, whether refused for missing
+     * facts or answered as already credited (it has no credential). `submitter`, for PUBLIC only, is the requesting client's
      * identity (IPv4, or IPv6 /64): its notices count against that
      * identity's share of the PUBLIC ring (CLIENT_NOTICE_PER_SUBMITTER).
      */

@@ -3645,12 +3645,16 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
     if (notice) {
         // Answered from certified state: nothing is queued, relayed or
         // pooled, and no v1 event is appended (queue refusals append none
-        // either). Only an authenticated attempt earns a notice; a deposit's
-        // own outpoint fact is the observation. An inclusion earns none: the
-        // retained window and ring already answer it, and a replay of any
-        // public certified action must not churn the notice ring.
+        // either). Only an authenticated attempt earns a notice. A deposit
+        // has no credential and credited outpoints are public, so anyone
+        // could replay one: as for a missing-facts refusal, only this node's
+        // own deposit earns a notice, and a public one's answer is bound to
+        // the submit reply. An inclusion earns none: the retained window and
+        // ring already answer it, and a replay of any public certified
+        // action must not churn the notice ring.
         if (out.admission.kind != FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED &&
-            (action.IsDeposit() || flowmesh::CheckProductionActionCredential(action, domain, config_id, market_id))) {
+            (action.IsDeposit() ? origin == flowmesh::ClientNoticeOrigin::NODE
+                                : flowmesh::CheckProductionActionCredential(action, domain, config_id, market_id))) {
             m_client_events.AppendNotices({std::move(*notice)});
         }
         return out;

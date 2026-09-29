@@ -169,7 +169,10 @@ market.
 
 A public deposit refused because its outpoint has no anchored facts appends
 no notice: it carries no credential, and the refusal is already in the
-submit reply.
+submit reply. The same holds for a public deposit answered from certified
+state as already credited, with its outcome unknown here: credited
+outpoints are public, so anyone could replay one. This node's own deposits
+keep both notices.
 
 One identity therefore cannot turn the public ring over, and that holds
 for the drop and recheck notices as well as the submit-time ones. An

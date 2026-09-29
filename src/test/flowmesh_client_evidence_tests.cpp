@@ -1324,6 +1324,51 @@ BOOST_AUTO_TEST_CASE(runtime_certified_action_status_recovers_after_restart_with
     BOOST_CHECK_EQUAL(signing_relays.load(), signing_relays_before);
 }
 
+BOOST_AUTO_TEST_CASE(runtime_public_already_credited_deposit_is_answered_in_the_reply_only)
+{
+    EvidenceFixture f;
+    // An outpoint credited before any entry this node retains: which action
+    // credited it is unknown here.
+    const COutPoint credited{Txid::FromUint256(Filled(0x44)), 3};
+    BOOST_REQUIRE(flowmesh::test_only::StateFunding::CreditDeposit(f.state, credited, f.account, f.pins.base_asset, 5));
+    EvidenceChain chain{f};
+    NoSeatKeys keys;
+    node::SteadyFlowMeshRuntimeClock clock;
+    node::FlowMeshProductionStore store{DBParams{.path = m_path_root / "credited-deposit", .cache_bytes = 1 << 20}};
+    std::string error;
+    BOOST_REQUIRE(store.OpenForMarket(f.pins.domain, f.pins.market_id, f.seats, f.state.Root(), error));
+    node::FlowMeshRuntimeConfig config;
+    config.chain = &chain;
+    config.keys = &keys;
+    config.clock = &clock;
+    config.relay = [](node::FlowMeshRuntimeRelay) { return node::FlowMeshRelayResult{}; };
+    node::FlowMeshRuntimeMarketConfig market{.domain = f.pins.domain, .market_id = f.pins.market_id,
+                                             .treasury_owner_commitment = Filled(9), .active_seats = f.seats,
+                                             .state = f.state};
+    market.store = &store;
+    node::FlowMeshRuntime runtime{config, {market}};
+    BOOST_REQUIRE_MESSAGE(runtime.Start(error), error);
+    flowmesh::Action deposit;
+    deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
+    deposit.outpoint = credited;
+    // A public deposit carries no credential and credited outpoints are
+    // public, so anyone could replay this one: the answer is bound to the
+    // submit reply, as for a deposit refused for missing facts.
+    const auto replayed{runtime.SubmitLocalActionChecked(f.pins.market_id, deposit)};
+    BOOST_CHECK(!replayed.queued);
+    BOOST_CHECK(replayed.admission.kind == node::FlowMeshLocalAdmission::Kind::UNKNOWN_OUTCOME);
+    BOOST_CHECK(replayed.admission.code == flowmesh::ActionReasonCode::DEPOSIT_ALREADY_CREDITED);
+    BOOST_CHECK(!runtime.NewestClientNotice(f.pins.market_id, deposit.Id()));
+    // This node's own deposit still gets its notice.
+    const auto own{runtime.SubmitLocalActionChecked(f.pins.market_id, deposit, flowmesh::ClientNoticeOrigin::NODE)};
+    BOOST_CHECK(own.admission.code == flowmesh::ActionReasonCode::DEPOSIT_ALREADY_CREDITED);
+    const auto notice{runtime.NewestClientNotice(f.pins.market_id, deposit.Id())};
+    BOOST_REQUIRE(notice);
+    BOOST_CHECK(notice->code == flowmesh::ActionReasonCode::DEPOSIT_ALREADY_CREDITED);
+    BOOST_CHECK(notice->origin == flowmesh::ClientNoticeOrigin::NODE);
+    runtime.Stop();
+}
+
 BOOST_AUTO_TEST_CASE(runtime_wait_client_action_status_wakes_on_commit)
 {
     EvidenceFixture f;
