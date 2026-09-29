@@ -422,6 +422,17 @@ public:
         : FlowMeshCommitteeRelayBudget{messages, bytes} {}
 };
 
+/** Shared, immutable parts of one retained recent certified entry. Encoding
+ * happens outside every runtime lock. */
+struct FlowMeshClientOutcomeParts {
+    //! The exact (sequence, hash) is retained in the recent window.
+    bool found{false};
+    std::shared_ptr<const flowmesh::ProductionCertifiedEnvelope> envelope;
+    size_t seat_count{0};
+    //! The store's own re-execution record, when retained.
+    std::shared_ptr<const ProductionOutcomeRecord> outcome;
+};
+
 /** Certificate, state, status and reported history captured at one head. */
 struct FlowMeshClientSnapshotView {
     flowmesh::ClientStateEvidence evidence;
@@ -506,8 +517,22 @@ public:
     std::optional<FlowMeshClientSnapshotView> ClientSnapshotView(
         const flowmesh::MarketId& market_id,
         const std::optional<flowmesh::AccountId>& account, std::string& error) const;
+    /** One certified entry as a client payload. Entries in the recent window
+     * (the head included) are encoded from memory outside the market lock;
+     * only older sequences read the store. */
     std::optional<std::vector<unsigned char>> ClientCertifiedEntry(
         const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error) const;
+    /** Memory-only: the retained certified entry that includes this exact
+     * action (a decisive disposition first, else the newest), if any. */
+    std::optional<std::pair<uint64_t, uint256>> ClientRecentInclusion(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
+    /** Memory-only: shared parts of one retained (sequence, hash). Never
+     * reads the store, encodes or verifies under the lock. */
+    FlowMeshClientOutcomeParts ClientOutcomeParts(
+        const flowmesh::MarketId& market_id, uint64_t sequence, const uint256& hash,
+        bool want_payload) const;
+    /** Test-only: ClientCertifiedEntry calls that read the store. */
+    uint64_t ClientEntryStoreReadsForTest() const;
     flowmesh::ClientEventPage ClientEvents(
         const std::optional<flowmesh::ClientEventCursor>& after,
         const std::optional<flowmesh::MarketId>& market,
@@ -636,7 +661,12 @@ private:
         const flowmesh::MarketDataQuery& query, std::string& error) const;
     std::optional<flowmesh::ClientStateEvidence> ClientSnapshotLocked(
         const flowmesh::MarketId& market_id, std::string& error) const;
+    //! Caller holds m_market_mutex: the other markets' counted recent-window
+    //! payload and outcome bytes (their global caps' remaining room).
+    std::pair<size_t, size_t> RecentWindowOthers(const Market& self) const;
     std::map<flowmesh::MarketId, std::unique_ptr<Market>> m_markets;
+    //! ClientCertifiedEntry store reads (test observation only).
+    mutable std::atomic<uint64_t> m_client_entry_store_reads{0};
 
     mutable std::mutex m_queue_mutex;
     std::condition_variable m_work_cv;

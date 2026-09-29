@@ -6,6 +6,7 @@
 
 #include <flowmesh/auth.h>
 #include <flowmesh/agreement_wire.h>
+#include <flowmesh/outcome_evidence.h>
 #include <hash.h>
 #include <logging.h>
 #include <test/util/flowmesh.h>
@@ -20,6 +21,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
@@ -9029,6 +9031,112 @@ BOOST_AUTO_TEST_CASE(preagreement_certified_slot_with_queued_work_proposes_witho
             BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 500);
         }
     }
+}
+
+BOOST_AUTO_TEST_CASE(recent_window_published_before_inclusion_events)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "recent_window_published"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    const auto deposit{Deposit(f.outpoint)};
+    std::promise<flowmesh::ClientActionWait> woken;
+    auto result{woken.get_future()};
+    // The waiter reads the window the moment CERTIFIED_INCLUDED wakes it.
+    std::thread waiter{[&] {
+        auto wait{f.runtimes[0]->WaitClientActionStatus(f.market, deposit.Id(),
+            std::chrono::steady_clock::now() + std::chrono::seconds{20}, {})};
+        woken.set_value(std::move(wait));
+    }};
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, deposit) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    waiter.join();
+    const auto wait{result.get()};
+    BOOST_REQUIRE(wait.result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_REQUIRE(wait.status && wait.status->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED);
+    const auto inclusion{f.runtimes[0]->ClientRecentInclusion(f.market, deposit.Id())};
+    BOOST_REQUIRE(inclusion);
+    BOOST_CHECK_EQUAL(inclusion->first, wait.status->microblock_sequence);
+    BOOST_CHECK(inclusion->second == wait.status->microblock_hash);
+    const auto parts{f.runtimes[0]->ClientOutcomeParts(f.market, inclusion->first, inclusion->second, true)};
+    BOOST_REQUIRE(parts.found);
+    BOOST_REQUIRE(parts.envelope);
+    BOOST_REQUIRE(parts.outcome);
+    BOOST_CHECK(!parts.outcome->too_large);
+    const flowmesh::ExecutionOutcomeEvidenceV1 evidence{parts.outcome->sequence, parts.outcome->entry_hash,
+                                                        parts.outcome->preimage, parts.outcome->effects};
+    BOOST_REQUIRE(flowmesh::VerifyExecutionOutcomeEvidence(parts.envelope->entry, evidence) ==
+                  flowmesh::OutcomeEvidenceCheck::OK);
+    const auto outcome{flowmesh::DeriveActionOutcome(parts.envelope->entry, evidence, deposit)};
+    BOOST_REQUIRE(outcome);
+    BOOST_CHECK(outcome->status == flowmesh::ActionOutcomeStatus::APPLIED);
+    BOOST_REQUIRE(outcome->deposit);
+    BOOST_CHECK(outcome->deposit->deposit_outpoint == f.outpoint);
+    // A wrong hash or an unknown sequence finds nothing.
+    BOOST_CHECK(!f.runtimes[0]->ClientOutcomeParts(f.market, inclusion->first, uint256{}, true).found);
+    BOOST_CHECK(!f.runtimes[0]->ClientOutcomeParts(f.market, 99, inclusion->second, true).found);
+    // Without a payload request only the record is shared.
+    const auto record_only{f.runtimes[0]->ClientOutcomeParts(f.market, inclusion->first, inclusion->second, false)};
+    BOOST_CHECK(record_only.found && record_only.outcome && !record_only.envelope);
+}
+
+BOOST_AUTO_TEST_CASE(certified_entry_from_window_is_byte_identical_to_store_path)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "recent_window_entry_bytes"};
+    f.block_commits = false;
+    f.Reach(1);
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain();
+    std::string error;
+    const auto reads_before{f.runtimes[0]->ClientEntryStoreReadsForTest()};
+    for (uint64_t sequence{0}; sequence < 2; ++sequence) {
+        const auto served{f.runtimes[0]->ClientCertifiedEntry(f.market, sequence, error)};
+        BOOST_REQUIRE_MESSAGE(served, error);
+        std::optional<node::StoredProductionEntry> stored;
+        BOOST_REQUIRE(f.stores[0]->ReadEntry(sequence, f.seats.seats, stored, error));
+        BOOST_REQUIRE(stored);
+        const auto expected{flowmesh::EncodeProductionCertifiedPayload({stored->entry, stored->certificate},
+                                                                       f.seats.seats.Size())};
+        BOOST_REQUIRE(expected);
+        BOOST_CHECK(*served == *expected);
+    }
+    // certified_entry_window_reads_never_touch_store: both sequences (the
+    // head and one older entry) were served from memory.
+    BOOST_CHECK_EQUAL(f.runtimes[0]->ClientEntryStoreReadsForTest(), reads_before);
+    BOOST_CHECK(!f.runtimes[0]->ClientCertifiedEntry(f.market, 2, error));
+}
+
+BOOST_AUTO_TEST_CASE(recent_window_rebuilt_after_restart_with_replay_outcomes)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "recent_window_restart"};
+    f.block_commits = false;
+    f.Reach(1);
+    const auto deposit{Deposit(f.outpoint)};
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, deposit) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain();
+    const auto before{f.runtimes[0]->ClientRecentInclusion(f.market, deposit.Id())};
+    BOOST_REQUIRE(before);
+    f.StopNode(0);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.StartNode(0, f.AgreementPath(0), std::nullopt, error), error);
+    f.Drain();
+    const auto after{f.runtimes[0]->ClientRecentInclusion(f.market, deposit.Id())};
+    BOOST_REQUIRE(after);
+    BOOST_CHECK(*after == *before);
+    const auto parts{f.runtimes[0]->ClientOutcomeParts(f.market, after->first, after->second, true)};
+    BOOST_REQUIRE(parts.found && parts.envelope && parts.outcome);
+    const flowmesh::ExecutionOutcomeEvidenceV1 evidence{parts.outcome->sequence, parts.outcome->entry_hash,
+                                                        parts.outcome->preimage, parts.outcome->effects};
+    BOOST_CHECK(flowmesh::VerifyExecutionOutcomeEvidence(parts.envelope->entry, evidence) ==
+                flowmesh::OutcomeEvidenceCheck::OK);
+    // The genesis entry is retained too, with its own record.
+    const auto genesis{f.runtimes[0]->ClientOutcomeParts(f.market, 0, parts.envelope->entry.parent_hash, false)};
+    BOOST_CHECK(genesis.found && genesis.outcome);
+    const auto reads_before{f.runtimes[0]->ClientEntryStoreReadsForTest()};
+    BOOST_CHECK(f.runtimes[0]->ClientCertifiedEntry(f.market, 0, error));
+    BOOST_CHECK_EQUAL(f.runtimes[0]->ClientEntryStoreReadsForTest(), reads_before);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

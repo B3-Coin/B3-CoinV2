@@ -5,6 +5,7 @@
 #include <node/flowmesh_timing.h>
 #include <node/flowmesh_runtime.h>
 #include <node/flowmesh_action_pool.h>
+#include <node/flowmesh_recent_window.h>
 
 #include <crypto/common.h>
 #include <hash.h>
@@ -182,8 +183,12 @@ struct FlowMeshRuntime::Market {
     static constexpr size_t RECENT_DURABLE_ENTRIES{8};
     std::deque<std::pair<uint64_t, uint256>> recent_durable;
     uint256 certified_state_root;
-    std::optional<flowmesh::ProductionCertifiedEnvelope> client_head;
+    //! Shared with the newest item of `recent`: one copy, counted once.
+    std::shared_ptr<const flowmesh::ProductionCertifiedEnvelope> client_head;
     size_t client_head_seat_count{0};
+    //! This runtime's own most recent certified entries and re-execution
+    //! records (memory only; see FlowMeshRecentCertifiedWindow).
+    FlowMeshRecentCertifiedWindow recent;
     flowmesh::ClientEventLog& client_events;
     std::optional<int64_t> local_observed_at;
     FlowMeshProductionStore* store{nullptr};
@@ -1376,6 +1381,7 @@ template <typename Market>
 bool CommitCertified(Market& market,
                      const flowmesh::ProductionCertifiedEnvelope& certified,
                      typename Market::Candidate& candidate,
+                     const std::pair<size_t, size_t> recent_others,
                      bool* reconciliation_deferred = nullptr)
 {
     if (reconciliation_deferred) *reconciliation_deferred = false;
@@ -1397,6 +1403,7 @@ bool CommitCertified(Market& market,
     }
     std::string error;
     std::optional<flowmesh::ProductionEntryCheck> validation_failure;
+    std::shared_ptr<const ProductionOutcomeRecord> outcome;
     DeliveryEvent(market, "publication_started", flowmesh::WireMessageKind::CERTIFICATE,
                   certified.entry.GetHash(), certified.entry.sequence, std::nullopt, {}, EntryTrace(certified.entry));
     if (certified.entry.kind == static_cast<uint8_t>(
@@ -1406,7 +1413,7 @@ bool CommitCertified(Market& market,
                 certified.entry, certified.certificate, market.seats,
                 market.state, AnchorContext(market),
                 market.treasury_owner_commitment, market.deposits, persisted,
-                error, &validation_failure) ||
+                error, &validation_failure, &outcome) ||
             persisted.Root() != candidate.next_state.Root()) {
             if (DeferCertifiedAnchorRejection(market, certified.entry,
                                               validation_failure, delivery_generation)) {
@@ -1451,7 +1458,7 @@ bool CommitCertified(Market& market,
                   market.last_hash, certified.entry.sequence, std::nullopt, {}, EntryTrace(certified.entry));
     TraceActions(market, "action_certified", certified.entry);
     market.certified_state_root = certified.entry.state_root;
-    market.client_head = certified;
+    market.client_head = std::make_shared<const flowmesh::ProductionCertifiedEnvelope>(certified);
     market.client_head_seat_count = market.seats.Size();
     // One append and one wakeup for the head and its inclusion events. A
     // woken client-action waiter still reads the payload through
@@ -1463,12 +1470,30 @@ bool CommitCertified(Market& market,
     head_event.kind = flowmesh::ClientEventKind::CERTIFIED_HEAD;
     head_event.microblock_sequence = certified.entry.sequence;
     head_event.microblock_hash = market.last_hash;
+    std::vector<std::pair<uint256, uint32_t>> ids;
+    ids.reserve(certified.entry.actions.size());
     for (const auto& action : certified.entry.actions) {
         committed_events.push_back(MakeClientActionEvent(
             market, flowmesh::ClientEventKind::CERTIFIED_INCLUDED, action,
             "semantic inclusion only; execution outcome not established by this event",
             &certified.entry));
+        ids.emplace_back(committed_events.back().action_id, static_cast<uint32_t>(ids.size()));
     }
+    // Publish the window item before the inclusion events: a waiter woken by
+    // CERTIFIED_INCLUDED always finds this entry and its record. A handoff
+    // has a payload and no record.
+    FlowMeshRecentCertifiedWindow::Item recent_item;
+    recent_item.sequence = certified.entry.sequence;
+    recent_item.epoch = certified.entry.epoch;
+    recent_item.hash = market.last_hash;
+    recent_item.envelope = market.client_head;
+    recent_item.seat_count = market.client_head_seat_count;
+    recent_item.payload_bytes = FlowMeshRecentCertifiedWindow::EstimatePayloadBytes(certified);
+    recent_item.ids = FlowMeshRecentCertifiedWindow::IndexIds(std::move(ids));
+    if (outcome && outcome->sequence == certified.entry.sequence && outcome->entry_hash == market.last_hash) {
+        recent_item.outcome = std::move(outcome);
+    }
+    market.recent.Push(std::move(recent_item), {}, recent_others.first, recent_others.second);
     market.client_events.Append(std::move(committed_events));
     market.local_observed_at = GetTime();
     ++market.next_sequence;
@@ -2257,6 +2282,12 @@ bool FlowMeshRuntime::InitializeMarket(
     // Publish after the WHOLE market validates: AddMarket may run on a live
     // service, and a failed initialization must not leak partial lookup events.
     std::deque<flowmesh::ClientEvent> restored_client_actions;
+    // The store's replayed re-execution records attach to the rebuilt recent
+    // window by exact (sequence, hash); a mismatch attaches nothing. Items
+    // are pushed as they are read, so the window's bounds apply throughout.
+    const auto replay_outcomes{config.store->TakeReplayOutcomes()};
+    auto replay_outcome{replay_outcomes.begin()};
+    const auto recent_others{RecentWindowOthers(*market)};
     uint256 previous_hash;
     uint64_t expected_effect_start{0};
     for (uint64_t sequence{0}; sequence < config.next_sequence; ++sequence) {
@@ -2288,9 +2319,38 @@ bool FlowMeshRuntime::InitializeMarket(
                 "restored semantic inclusion only; execution outcome not established by this event", &stored->entry));
         }
         if (sequence + 1 == config.next_sequence) {
-            market->client_head = flowmesh::ProductionCertifiedEnvelope{
-                stored->entry, stored->certificate};
+            market->client_head = std::make_shared<const flowmesh::ProductionCertifiedEnvelope>(
+                flowmesh::ProductionCertifiedEnvelope{stored->entry, stored->certificate});
             market->client_head_seat_count = historical_seats->Size();
+        }
+        // Rebuild the recent window from the reads this loop already makes:
+        // envelopes for the newest entries, bare items for the outcome tail.
+        const FlowMeshRecentWindowLimits limits;
+        if (config.next_sequence - sequence <= std::max(limits.payload_entries, limits.outcome_entries)) {
+            FlowMeshRecentCertifiedWindow::Item item;
+            item.sequence = sequence;
+            item.epoch = stored->entry.epoch;
+            item.hash = previous_hash;
+            if (config.next_sequence - sequence <= limits.payload_entries) {
+                item.envelope = sequence + 1 == config.next_sequence
+                    ? market->client_head
+                    : std::make_shared<const flowmesh::ProductionCertifiedEnvelope>(
+                          flowmesh::ProductionCertifiedEnvelope{stored->entry, stored->certificate});
+                item.seat_count = historical_seats->Size();
+                item.payload_bytes = FlowMeshRecentCertifiedWindow::EstimatePayloadBytes(*item.envelope);
+                std::vector<std::pair<uint256, uint32_t>> ids;
+                ids.reserve(stored->entry.actions.size());
+                for (const auto& action : stored->entry.actions) {
+                    ids.emplace_back(action.Id(), static_cast<uint32_t>(ids.size()));
+                }
+                item.ids = FlowMeshRecentCertifiedWindow::IndexIds(std::move(ids));
+            }
+            while (replay_outcome != replay_outcomes.end() && (*replay_outcome)->sequence < sequence) ++replay_outcome;
+            if (replay_outcome != replay_outcomes.end() && (*replay_outcome)->sequence == sequence &&
+                (*replay_outcome)->entry_hash == item.hash) {
+                item.outcome = *replay_outcome;
+            }
+            market->recent.Push(std::move(item), limits, recent_others.first, recent_others.second);
         }
         if (sequence + 1 == config.next_sequence &&
             stored->entry.kind == static_cast<uint8_t>(
@@ -3320,7 +3380,7 @@ std::optional<std::vector<unsigned char>> FlowMeshRuntime::ClientCertifiedEntry(
     FlowMeshTimingSpan timing_lock_3233{__func__};
     timing_lock_3233.Field("lock_name", std::string{"market_mutex"});
     timing_lock_3233.Mark("lock_requested_us");
-    std::lock_guard lock{m_market_mutex};
+    std::unique_lock lock{m_market_mutex};
     timing_lock_3233.Mark("lock_acquired_us");
     const auto it{m_markets.find(market_id)};
     if (it == m_markets.end() || !it->second->store || sequence >= it->second->next_sequence) {
@@ -3328,16 +3388,73 @@ std::optional<std::vector<unsigned char>> FlowMeshRuntime::ClientCertifiedEntry(
         return std::nullopt;
     }
     const auto& market{*it->second};
-    if (market.client_head && market.client_head->entry.sequence == sequence) {
-        return flowmesh::EncodeProductionCertifiedPayload(*market.client_head, market.client_head_seat_count);
+    // Retained recent entries (the head included) are encoded from memory,
+    // outside this lock; only older sequences read the store.
+    std::shared_ptr<const flowmesh::ProductionCertifiedEnvelope> envelope;
+    size_t seat_count{0};
+    if (const auto* item{market.recent.Find(sequence)}; item && item->envelope) {
+        envelope = item->envelope;
+        seat_count = item->seat_count;
+    } else if (market.client_head && market.client_head->entry.sequence == sequence) {
+        envelope = market.client_head;
+        seat_count = market.client_head_seat_count;
+    }
+    if (envelope) {
+        lock.unlock();
+        return flowmesh::EncodeProductionCertifiedPayload(*envelope, seat_count);
     }
     const auto seats{market.chain->SeatSetForSequence(market.domain, market_id, sequence)};
     std::optional<StoredProductionEntry> stored;
+    CountObservation(m_client_entry_store_reads);
     if (!seats || !market.store->ReadEntry(sequence, *seats, stored, error) || !stored) {
         if (error.empty()) error = "FlowMesh certified entry authority is unavailable";
         return std::nullopt;
     }
     return flowmesh::EncodeProductionCertifiedPayload({stored->entry, stored->certificate}, seats->Size());
+}
+
+std::optional<std::pair<uint64_t, uint256>> FlowMeshRuntime::ClientRecentInclusion(
+    const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    std::lock_guard lock{m_market_mutex};
+    const auto it{m_markets.find(market_id)};
+    if (it == m_markets.end()) return std::nullopt;
+    return it->second->recent.Inclusion(action_id);
+}
+
+FlowMeshClientOutcomeParts FlowMeshRuntime::ClientOutcomeParts(
+    const flowmesh::MarketId& market_id, const uint64_t sequence, const uint256& hash,
+    const bool want_payload) const
+{
+    FlowMeshClientOutcomeParts out;
+    std::lock_guard lock{m_market_mutex};
+    const auto it{m_markets.find(market_id)};
+    if (it == m_markets.end()) return out;
+    const auto* item{it->second->recent.Find(sequence)};
+    if (!item || item->hash != hash) return out;
+    out.found = true;
+    if (want_payload && item->envelope) {
+        out.envelope = item->envelope;
+        out.seat_count = item->seat_count;
+    }
+    out.outcome = item->outcome;
+    return out;
+}
+
+uint64_t FlowMeshRuntime::ClientEntryStoreReadsForTest() const
+{
+    return m_client_entry_store_reads.load(std::memory_order_relaxed);
+}
+
+std::pair<size_t, size_t> FlowMeshRuntime::RecentWindowOthers(const Market& self) const
+{
+    std::pair<size_t, size_t> out;
+    for (const auto& [id, market] : m_markets) {
+        if (market.get() == &self) continue;
+        out.first += market->recent.PayloadExtraBytes();
+        out.second += market->recent.OutcomeBytes();
+    }
+    return out;
 }
 
 flowmesh::ClientEventPage FlowMeshRuntime::ClientEvents(
@@ -5147,7 +5264,8 @@ void FlowMeshRuntime::HandleCertificate(
         candidate_it = market.candidates.emplace(hash,
                                                   std::move(*candidate)).first;
     }
-    if (!CommitCertified(market, *certified, candidate_it->second, reconciliation_deferred)) return;
+    if (!CommitCertified(market, *certified, candidate_it->second, RecentWindowOthers(market),
+                         reconciliation_deferred)) return;
     // The next slot is proposed from the maintenance tick. When this node
     // holds the next slot's proposer seat and the market still holds admitted
     // work, it must not wait up to a full tick interval, so reuse the existing
