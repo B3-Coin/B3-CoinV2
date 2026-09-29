@@ -19,6 +19,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <limits>
 #include <optional>
@@ -217,6 +218,41 @@ BOOST_AUTO_TEST_CASE(imbalance_side_accepts_only_a_residual_consistent_with_satu
     BOOST_CHECK_EQUAL(clearing->price, 0);
     BOOST_CHECK_EQUAL(clearing->imbalance, MAX_MONEY);
     BOOST_CHECK(flowmesh::ObserveImbalanceSide(*clearing, state) == ImbalanceSide::BID);
+}
+
+BOOST_AUTO_TEST_CASE(imbalance_side_observation_is_cheap_for_a_large_rationed_clearing)
+{
+    // 4,096 one-unit bids against 2,048 units: every bid is listed in the
+    // fill map, half of them with nothing. The observation costs one lookup
+    // per listed curve, after the commit's own allocation over the same set.
+    constexpr uint16_t BIDS{4096};
+    auto state{EmptyState()};
+    const auto account = [](const uint16_t index) {
+        uint256 out;
+        *out.begin() = static_cast<uint8_t>(index & 0xff);
+        *(out.begin() + 1) = static_cast<uint8_t>(index >> 8);
+        *(out.begin() + 2) = 1;
+        return out;
+    };
+    const flowmesh::AccountId seller{Account(0)};
+    Fund(state, seller);
+    BOOST_REQUIRE(state.SubmitCurve(seller, Side::ASK, *flowmesh::MakeLimitAskCurve(10, BIDS / 2)));
+    for (uint16_t i{0}; i < BIDS; ++i) {
+        Fund(state, account(i), 1'000);
+        BOOST_REQUIRE(state.SubmitCurve(account(i), Side::BID, *flowmesh::MakeLimitBidCurve(10, 1)));
+    }
+    const auto clearing{state.ClearSlot()};
+    BOOST_REQUIRE(clearing && clearing->cleared);
+    BOOST_CHECK_EQUAL(clearing->bid_fill.size(), size_t{BIDS});
+    BOOST_CHECK_EQUAL(clearing->imbalance, BIDS / 2);
+    const auto start{std::chrono::steady_clock::now()};
+    const auto side{flowmesh::ObserveImbalanceSide(*clearing, state)};
+    const auto elapsed{std::chrono::steady_clock::now() - start};
+    BOOST_CHECK(side == ImbalanceSide::BID);
+    BOOST_TEST_MESSAGE("ObserveImbalanceSide over " << BIDS << " fills: "
+                       << std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() << " us");
+    // Generous for loaded test machines; it is a few hundred microseconds.
+    BOOST_CHECK(elapsed < std::chrono::milliseconds{50});
 }
 
 BOOST_AUTO_TEST_CASE(imbalance_side_is_none_without_a_clearing_or_for_an_exact_match)
