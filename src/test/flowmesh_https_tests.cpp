@@ -5961,6 +5961,58 @@ BOOST_AUTO_TEST_CASE(remote_client_drops_a_contradicting_tick_page_but_not_the_r
     client.reset();
 }
 
+BOOST_AUTO_TEST_CASE(remote_client_far_behind_asks_for_the_newest_ticks)
+{
+    // An operator's two-tick pages.
+    LiveMarket live{*this, m_path_root / "far-ticks-service", {}, {2}};
+    TickProxy proxy{live.Endpoint()};
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "far-ticks-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, TickPage(), error), error);
+    const auto held{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(held, error);
+    BOOST_REQUIRE(held->ticks && held->ticks->available);
+    // Four heads verified by reads that ask for no ticks (as a signing
+    // preflight's): the held ticks are now more than a page behind.
+    for (unsigned char signer{0}; signer < 4; ++signer) {
+        CKey key;
+        std::array<unsigned char, 32> secret{};
+        secret.back() = static_cast<unsigned char>(0x60 + signer);
+        key.Set(secret.begin(), secret.end(), true);
+        flowmesh::Action cancel;
+        cancel.signer = flowmesh::AccountForKey(XOnlyPubKey{key.GetPubKey()});
+        cancel.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+        BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, cancel));
+        live.Certify(cancel);
+        BOOST_REQUIRE(client->Market(market, std::nullopt));
+    }
+    const auto before{proxy.TickParams().size()};
+    const auto caught_up{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(caught_up, error);
+    BOOST_CHECK_EQUAL(caught_up->snapshot.next_microblock_sequence, 5U);
+    // One read reaches the head: the newest page, not the one after the ring.
+    BOOST_REQUIRE(caught_up->ticks && caught_up->ticks->available);
+    BOOST_CHECK(caught_up->ticks->ticks.back().microblock_hash == caught_up->snapshot.last_microblock_hash);
+    const auto sent{proxy.TickParams()};
+    BOOST_REQUIRE_GT(sent.size(), before);
+    for (size_t i{before}; i < sent.size(); ++i) {
+        BOOST_CHECK(!sent[i].second.exists("after_sequence"));
+        BOOST_CHECK_EQUAL(sent[i].second["limit"].getInt<int>(), 2);
+    }
+    // Current again: the next read asks only for the ticks after the ring.
+    live.Deposit();
+    const auto next{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(next, error);
+    BOOST_REQUIRE(next->ticks && next->ticks->available);
+    BOOST_CHECK(next->ticks->ticks.back().microblock_hash == next->snapshot.last_microblock_hash);
+    const auto later{proxy.TickParams()};
+    BOOST_REQUIRE_GT(later.size(), sent.size());
+    BOOST_CHECK_EQUAL(later.back().second["after_sequence"].getInt<int>(), 4);
+    client.reset();
+}
+
 BOOST_AUTO_TEST_CASE(live_update_reads_fetch_missing_ticks_once_with_an_ordinary_read)
 {
     LiveMarket live{*this, m_path_root / "watch-ticks-service", {std::chrono::milliseconds{2000}, 4}, {256}};

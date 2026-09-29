@@ -1347,6 +1347,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     //! make one: a signing preflight never sends "ticks".
     struct TickRequest {
         std::optional<uint64_t> after;
+        //! The verified head's sequence when the request was made, if cached.
+        std::optional<uint64_t> head;
         //! Endpoint (and page limit) of the attempt that carries "ticks".
         std::optional<size_t> sent;
         size_t limit{0};
@@ -1360,6 +1362,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (const auto it{m_ticks.find(id)}; it != m_ticks.end() && !it->second.ticks.empty()) {
             out.after = it->second.ticks.back().sequence;
         }
+        if (const auto it{m_cache.find(id)}; it != m_cache.end()) out.head = it->second.verified.certified.entry.sequence;
         return out;
     }
     //! Adds "ticks" for an endpoint that advertises them.
@@ -1370,6 +1373,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             ticks->sent.reset();
             const size_t advertised{m_clearing_ticks.at(endpoint)};
             if (advertised == 0) return;
+            // Held ticks more than a page behind the verified head could only
+            // creep forward one page per read: the newest page replaces them.
+            if (ticks->after && ticks->head && *ticks->head > *ticks->after && *ticks->head - *ticks->after > advertised) {
+                ticks->after.reset();
+            }
             UniValue value{UniValue::VOBJ};
             if (ticks->after) value.pushKV("after_sequence", *ticks->after);
             value.pushKV("limit", uint64_t{advertised});
