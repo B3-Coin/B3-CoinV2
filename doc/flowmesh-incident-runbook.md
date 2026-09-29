@@ -71,6 +71,34 @@ The public method allows four calls per second per client address (IPv6 per
   not raise an alert. A gate that stays closed is reported as
   `reconciling_prolonged`.
 
+**Blind spot: a frozen market.** Health v1 cannot tell a market that is
+frozen with work pending (quorum loss, a proposer or pre-agreement stall)
+from an idle one. Every API node stays ready, with `state` `live` for 60 s
+and `idle` after that. The code that would report it,
+`stalled_with_pending_work`, is reserved and never reported by this revision.
+Until it is, apply the interim rule below and also watch order flow outside
+the health object.
+
+**Interim rule: possible freeze (a heuristic).** A market is a possible
+freeze when, on every API node that reports it, its row shows
+`pending_actions` above 0 and `head_age_ms` above 30,000 (or absent: no head
+applied since that node started). It cannot confirm a freeze:
+
+- `pending_actions` counts every pooled action, including actions that cannot
+  execute yet: a gap in the signer's sequence, a far-future sequence, or a
+  deposit waiting for its B3 facts. Such an action can keep the count above 0
+  on an idle market indefinitely, and anyone with a signing key can create
+  one. The rule can therefore mark an idle market Degraded.
+- On-call confirms or clears it: over local RPC on a seat, check
+  `proposal_wait_reason` in `getflowmeshhealth` and the latest `proposer_wait`
+  and `round_entered` events in `getflowmeshdeliveryinfo <market_id>`, and
+  compare the head across seats. A head that stays unchanged across seats
+  while the proposer keeps waiting, or while rounds keep advancing, is a
+  freeze.
+- External order-flow monitoring (for example alerting when users' orders
+  are accepted but none reaches certified inclusion) is still required. The
+  health object alone never proves that trading is flowing.
+
 **Poller rules.**
 
 - HTTP 429, timeouts, TLS or connection errors are UNKNOWN, never not ready.
@@ -79,13 +107,16 @@ The public method allows four calls per second per client address (IPv6 per
 
 | Component | Condition |
 |---|---|
-| Operational | At least one API node (target: two) reports the market ready with `state` `live` or `idle`. |
-| Degraded | Any API node reports the market not ready, or `state` is `paused`, `handoff_pending` or `catching_up` on every reporting node. |
+| Operational | At least one API node (target: two) reports the market ready with `state` `live` or `idle`, and the possible-freeze rule does not hold. |
+| Degraded | Any API node reports the market not ready; or on every reporting node `state` is neither `live` nor `idle` (for example `paused`, `handoff_pending`, `catching_up` or `insufficient_seats`, and any state this runbook does not list); or the possible-freeze rule holds. A market that has never had four seats is listed as "not yet active" instead. |
 | Major outage | `halted` on a majority of API nodes, or no API node has reported the market ready for more than 2 minutes. UNKNOWN polls never count here. |
 | Maintenance | An announced window. |
 
-- Change the component automatically on detection. A trading freeze is never
-  recorded as "no impact".
+- Change the component automatically on detection. A freeze these rules
+  detect (a halt, not-ready rows, the possible-freeze rule) is never recorded
+  as "no impact". The rules alone can miss a network-wide freeze (see the
+  blind spot above); once order-flow monitoring or on-call confirms one, it
+  is recorded as Degraded or worse.
 
 ## 4. Severity and clock
 
@@ -156,11 +187,11 @@ start); then escalate.
 | `market_halted`, state `halted` | The market halted on this node; see `halt` below. | Per halt code. |
 | `catching_up` | This node has been provably behind for `lag_grace_ms` (10 s): it holds a BLS-verified certificate for a sequence it has not applied (`catchup.proven_target`, `catchup.proven_behind_ms`). A peer cannot fake this lag, but its absence proves nothing: a node that no certificate from ahead has reached (an idle market, or an isolated node) is never reported `catching_up`. | Normal after a restart. Escalate if it lasts more than 10 minutes. |
 | state `catching_up` | Proven or speculative catch-up is under way. `catchup.speculative` means a verified page arrived without tail slack; it is not a proof and never makes the market not ready. | none unless `catching_up` is reported |
-| state `insufficient_seats` | Fewer than four anchor-final seats (`PAUSED_INSUFFICIENT_SEATS`). | Expected until seats bind; B3 continues. |
+| state `insufficient_seats` | Fewer than four anchor-final seats (`PAUSED_INSUFFICIENT_SEATS`). The row stays `ready` (no not-ready code), but nothing trades. | Expected until seats bind; B3 continues. The status page shows Degraded, or "not yet active" for a market that has never had four seats (section 3). |
 | state `handoff_pending` | A committee handoff waits for its checkpoint to be 30 blocks deep. | ETA: max(0, 30 - (tip height - handoff checkpoint inclusion height)) x the observed B3 block interval. Publish the checkpoint first if it is not yet included. |
 | state `paused` | Paused for `pause_reason`; see below. | Per pause reason. |
 | states `live`, `idle` | Ready; `idle` only means no head in the last 60 s. | none |
-| `stalled_with_pending_work`, state `stalled` | Reserved. This revision never reports them. | none |
+| `stalled_with_pending_work`, state `stalled` | Reserved. This revision never reports them, so a frozen market looks `live` or `idle` (section 3, blind spot). | Apply the possible-freeze rule (section 3). |
 
 ### Halts (`halt`)
 
