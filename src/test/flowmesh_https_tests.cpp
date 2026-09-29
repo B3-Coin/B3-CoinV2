@@ -2910,3 +2910,70 @@ BOOST_AUTO_TEST_CASE(api_health_is_cached_and_rate_limited_per_client)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_budget_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(order_budget_refuses_orders_not_cancels_before_authentication)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-order-budget"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    auto api{node::MakeFlowMeshTradingApi(service, Options())};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    // Unsigned actions: each order is charged to the order sub-budget before
+    // authentication refuses it, which is what makes junk orders cost budget.
+    const auto action = [&](flowmesh::ActionType type, uint64_t sequence) {
+        flowmesh::Action out;
+        out.signer = uint256{uint8_t{0x77}};
+        out.sequence = sequence;
+        out.type = static_cast<uint8_t>(type);
+        if (type == flowmesh::ActionType::SUBMIT_BID) out.curve = {{5, 1}};
+        return out;
+    };
+    const auto params = [&](const flowmesh::Action& value) {
+        return "{\"market_id\":\"" + market.GetHex() + "\",\"action_id\":\"" + value.Id().GetHex() +
+               "\",\"action_hex\":\"" + HexStr(*flowmesh::EncodeProductionActionPayload(value)) + "\"}";
+    };
+    const std::string authentication{"Action authentication failed for this chain/domain/market configuration"};
+    const std::string exhausted{"Public trading order budget exhausted; cancels and withdrawals are still accepted"};
+    const auto start{std::chrono::steady_clock::now()};
+    std::vector<std::pair<int, std::string>> orders;
+    for (uint64_t n{0}; n < 12; ++n) {
+        const auto [status, reply]{ApiCall(endpoint, "submit", params(action(flowmesh::ActionType::SUBMIT_BID, n)))};
+        orders.emplace_back(status, reply["error"].get_str());
+    }
+    // non_compact_submit_still_order_budgeted: the 13th order, sent with a
+    // body the pre-parse classifier counts as a read, still hits the
+    // post-parse order budget.
+    const auto non_compact{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
+        "{ \"method\":\"submit\",\"params\":" + params(action(flowmesh::ActionType::SUBMIT_BID, 12)) + "}",
+        std::chrono::seconds{5}, 1 << 20)};
+    const auto [cancel_status, cancel]{ApiCall(endpoint, "submit", params(action(flowmesh::ActionType::CANCEL_BID, 13)))};
+    flowmesh::Action deposit;
+    deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
+    deposit.outpoint = COutPoint{Txid::FromUint256(uint256{uint8_t{0x78}}), 0};
+    const auto [deposit_status, deposit_reply]{ApiCall(endpoint, "submit", params(deposit))};
+    if (std::chrono::steady_clock::now() - start < std::chrono::milliseconds{900}) {
+        for (const auto& [status, text] : orders) {
+            BOOST_CHECK_EQUAL(status, 400);
+            BOOST_CHECK_EQUAL(text, authentication);
+        }
+        BOOST_REQUIRE(non_compact.response_received);
+        BOOST_CHECK_EQUAL(non_compact.status, 400);
+        UniValue refused;
+        BOOST_REQUIRE(refused.read(non_compact.body));
+        BOOST_CHECK_EQUAL(refused["error"].get_str(), exhausted);
+        // order_budget_refuses_orders_not_cancels: the cancel is not charged
+        // (it reaches authentication), a deposit shares the order budget.
+        BOOST_CHECK_EQUAL(cancel_status, 400);
+        BOOST_CHECK_EQUAL(cancel["error"].get_str(), authentication);
+        BOOST_CHECK_EQUAL(deposit_status, 400);
+        BOOST_CHECK_EQUAL(deposit_reply["error"].get_str(), exhausted);
+    }
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()

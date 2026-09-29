@@ -547,6 +547,20 @@ public:
             const auto action{flowmesh::DecodeProductionActionPayload(payload)};
             if (!action || action->Id() != action_id) Fail("Invalid exact signed action or ActionId");
             if (action->type == static_cast<uint8_t>(flowmesh::ActionType::CLAIM_SEAT_REWARD)) Fail("Operator reward claims are not a public trading operation");
+            // Orders and (unauthenticated, chain-authorized) deposits spend a
+            // sub-budget of the write class, before any Schnorr work, so an
+            // order flood leaves room for cancels and withdrawals.
+            const auto type{static_cast<flowmesh::ActionType>(action->type)};
+            if ((type == flowmesh::ActionType::SUBMIT_BID || type == flowmesh::ActionType::SUBMIT_ASK || action->IsDeposit()) &&
+                !m_admission.ChargeOrder(http.remote_address, std::chrono::steady_clock::now())) {
+                // A lost-reply resend of an already-certified action still
+                // gets its certified inclusion rather than the budget error.
+                const auto status{m_service.ClientActionStatus(id, action_id)};
+                if (status && status->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED) {
+                    return FlowMeshClientReceiptJson(LocalActionReceipt(status, action_id));
+                }
+                Fail("Public trading order budget exhausted; cancels and withdrawals are still accepted");
+            }
             const auto market{m_service.Market(id)};
             if (!market) Fail("Unknown market");
             if (!action->IsDeposit() && !flowmesh::SchnorrActionAuthenticator(market->domain, market->execution_config_id).Authenticate(*action))
