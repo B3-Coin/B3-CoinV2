@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <string>
@@ -70,14 +71,10 @@ const flowmesh::ActiveFnBlsSeatSet* EvidenceSeats(Market& market, const flowmesh
     return storage ? &*storage : nullptr;
 }
 
-//! Keeps `evidence` in the market's store when this node's own chain
-//! verifies it; never a record that others could not check. The caller
-//! names which statement signatures it has itself just verified over
-//! exactly the context each statement signs (see SeatEvidencePrechecked);
-//! those are not verified again.
+//! RecordSeatEvidence's steps; may throw (allocation, the chain or store).
 template <typename Market>
-void RecordSeatEvidence(Market& market, const flowmesh::SeatEvidence& evidence,
-                        const bool first_signature_verified, const bool second_signature_verified)
+void RecordSeatEvidenceOrThrow(Market& market, const flowmesh::SeatEvidence& evidence,
+                               const bool first_signature_verified, const bool second_signature_verified)
 {
     if (market.store == nullptr || market.seat_evidence_ids.contains(evidence.Id())) return;
     // The pace first: past it, a detection costs no seat-set read, set
@@ -132,6 +129,26 @@ void RecordSeatEvidence(Market& market, const flowmesh::SeatEvidence& evidence,
                "information only, see getflowmeshhealth\n",
                market.market_id.GetHex(), evidence.Id().GetHex(),
                flowmesh::SeatEvidenceKindName(evidence.kind), evidence.first.sequence);
+}
+
+//! Keeps `evidence` in the market's store when this node's own chain
+//! verifies it; never a record that others could not check. The caller
+//! names which statement signatures it has itself just verified over
+//! exactly the context each statement signs (see SeatEvidencePrechecked);
+//! those are not verified again. Information only: an exception from any
+//! step counts as unrecorded (with a warning) and never reaches the caller,
+//! so it never keeps the caller from what it does next.
+template <typename Market>
+void RecordSeatEvidence(Market& market, const flowmesh::SeatEvidence& evidence,
+                        const bool first_signature_verified, const bool second_signature_verified)
+{
+    try {
+        RecordSeatEvidenceOrThrow(market, evidence, first_signature_verified, second_signature_verified);
+    } catch (const std::exception& e) {
+        ++market.seat_evidence_unrecorded;
+        LogWarning("FlowMesh market %s could not record seat-misbehaviour evidence: %s\n",
+                   market.market_id.GetHex(), e.what());
+    }
 }
 
 //! `seat` attested `first_hash` at this slot and now `second_hash`, whose

@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -138,8 +139,11 @@ struct RecorderMarket {
     struct Store {
         std::vector<flowmesh::SeatEvidence> records; // newest first
         size_t writes{0};
+        //! Every write throws, as an allocation failure would.
+        bool throws{false};
         bool RecordSeatEvidence(const flowmesh::SeatEvidence& evidence, bool& inserted, std::string&)
         {
+            if (throws) throw std::bad_alloc{};
             ++writes;
             inserted = std::none_of(records.begin(), records.end(),
                                     [&](const auto& record) { return record.Id() == evidence.Id(); });
@@ -498,6 +502,24 @@ BOOST_AUTO_TEST_CASE(recorder_keeps_a_check_each_minute_for_a_certificate_confli
     BOOST_CHECK_EQUAL(market.seat_evidence_work.checks, node::SEAT_EVIDENCE_CHECKS_PER_MINUTE);
     BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, 3U);
     BOOST_CHECK_EQUAL(market.store_impl.writes, equivocations + 1);
+}
+
+BOOST_AUTO_TEST_CASE(recorder_failure_never_reaches_its_caller)
+{
+    EvidenceFixture f;
+    RecorderMarket market{f};
+    // HandleCertificate halts the market around recording a conflict; no
+    // failure while recording, an exception included, may reach it.
+    market.store_impl.throws = true;
+    BOOST_CHECK_NO_THROW(node::RecordSeatEvidence(market, f.Conflict(), false, false));
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.checks, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_recorded, 0U);
+    // Nothing is left half done: once the store works, it is recorded.
+    market.store_impl.throws = false;
+    node::RecordSeatEvidence(market, f.Conflict(), false, false);
+    BOOST_CHECK_EQUAL(market.seat_evidence_recorded, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, 1U);
 }
 
 BOOST_AUTO_TEST_CASE(encoding_is_canonical_and_strict)

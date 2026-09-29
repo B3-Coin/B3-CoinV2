@@ -5803,6 +5803,9 @@ void FlowMeshRuntime::HandleCertificate(
             return;
         }
         if (stored->entry.GetHash() != certified->entry.GetHash()) {
+            // Halt first: recording is information only and never decides it.
+            HaltMarket(market, FlowMeshRuntimeHalt::CERTIFICATE_CONFLICT,
+                       "two valid FlowMesh certificates conflict at one sequence");
             // The received certificate verified just above, over its entry's
             // context; the stored one is checked again (never trusted from disk).
             RecordSeatEvidence(market, flowmesh::SeatEvidence{
@@ -5811,8 +5814,6 @@ void FlowMeshRuntime::HandleCertificate(
                 flowmesh::SeatCertificateStatement(certified->certificate, certified->entry.seat_set_hash),
                 std::nullopt},
                 /*first_signature_verified=*/false, /*second_signature_verified=*/true);
-            HaltMarket(market, FlowMeshRuntimeHalt::CERTIFICATE_CONFLICT,
-                       "two valid FlowMesh certificates conflict at one sequence");
         }
         return;
     }
