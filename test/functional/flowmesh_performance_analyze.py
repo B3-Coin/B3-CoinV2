@@ -57,7 +57,7 @@ def stats(values):
     values = sorted(value for value in values if numeric(value))
     result = {"availability": "measured" if values else "unknown", "count": len(values)}
     result.update({key: values[math.ceil(len(values) * fraction) - 1] if values else None
-                   for key, fraction in (("p50_ms", .5), ("p95_ms", .95), ("p99_ms", .99))})
+                   for key, fraction in (("p50_ms", .5), ("p90_ms", .9), ("p95_ms", .95), ("p99_ms", .99))})
     result.update(min_ms=values[0] if values else None, max_ms=values[-1] if values else None,
                   mean_ms=sum(values) / len(values) if values else None,
                   sum_ms=sum(values) if values else None)

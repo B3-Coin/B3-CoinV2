@@ -39,7 +39,9 @@ import argparse
 import hashlib
 import json
 import math
+import platform
 import re
+import subprocess
 import sys
 import time
 from collections import Counter, deque
@@ -51,6 +53,7 @@ from feature_flowmesh_release import B3_ARGS, TRADE_PRICE
 from test_framework.authproxy import JSONRPCException
 from test_framework.test_node import TestNode
 from test_framework.util import assert_equal, get_datadir_path, initialize_datadir, p2p_port
+from os import cpu_count as os_cpu_count
 
 
 PRICES = (TRADE_PRICE // 2, TRADE_PRICE, TRADE_PRICE * 3 // 2,
@@ -67,6 +70,10 @@ STATUS_WAIT_MAX_MS = 2500  # getflowmeshactionstatus wait_ms bound.
 # A waited status read ends when the next B3 pump tick is due; returning
 # later than this after the due time means the pump cadence was not kept.
 PUMP_OVERDUE_BOUND_MS = 100
+LATENCY_DEFINITION = ("flowmesh-latency-v1 (doc/flowmesh-latency-definition.md): M1 = summary.client_certified, "
+                      "order RPC start to client-verified certified inclusion; M2 = account_state_verified")
+# How the FlowMesh store's LevelDB makes a write durable, by build flags.
+FSYNC_MODES = ("full_fsync", "fdatasync", "fsync", "fsync_without_drive_flush")
 
 
 def bounded_int(name, low, high):
@@ -91,6 +98,12 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                             help=f"getflowmeshactionstatus wait_ms, used only if the client binary lists it (0-{STATUS_WAIT_MAX_MS}, default 0: immediate reads)")
         parser.add_argument("--record-reconnects", action="store_true",
                             help=f"Record per-sample HTTPS reuse/handshake flags and validator trace-cap markers instead of asserting them (implied by --samples other than {len(PRICES)} or --status-wait-ms)")
+        parser.add_argument("--fsync-mode", choices=("auto", *FSYNC_MODES), default="auto",
+                            help="Durability barrier label for the report. auto reads HAVE_FULLFSYNC/HAVE_FDATASYNC from the "
+                                 "configured build's CMakeCache.txt; pass it explicitly for binaries from another build. "
+                                 "A run whose barrier is unknown is not performance-qualified")
+        parser.add_argument("--client-region", default="co-located", help="Label: where the client host runs")
+        parser.add_argument("--server-region", default="co-located", help="Label: where the validator/API hosts run")
 
     def set_test_params(self):
         self.options.latency_production_logging = True
@@ -119,6 +132,63 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                 "measurement": "original buyer order RPC start to locally verified inclusion, then authenticated buyer/maker state and four native histories; offered wall-clock timestamps are host observations, not certified time",
                 "not_qualified": ["Qt", "WAN", "high concurrency", "crash durability", "200ms guarantee"]}}
         self.capture_nodes = []
+        self.trade_report["definition"] = LATENCY_DEFINITION
+        self.trade_report["environment"] = self.environment()
+
+    def build_fsync_mode(self):
+        """The LevelDB barrier of the configured build, from its CMake cache."""
+        cache = Path(self.config["environment"]["BUILDDIR"], "CMakeCache.txt")
+        try:
+            text = cache.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            return "unknown", f"{cache} unreadable: {type(error).__name__}"
+
+        def flag(name):
+            match = re.search(rf"^{name}:[A-Z]+=(.*)$", text, re.M)
+            return None if match is None else match.group(1).strip().upper() in {"1", "ON", "TRUE", "YES"}
+        full, data = flag("HAVE_FULLFSYNC"), flag("HAVE_FDATASYNC")
+        source = f"{cache}: HAVE_FULLFSYNC={full}, HAVE_FDATASYNC={data}"
+        if full is None and data is None:
+            return "unknown", source
+        if full:
+            return "full_fsync", source
+        if data:
+            return "fdatasync", source
+        # macOS fsync() does not flush the drive cache: the experimental
+        # no-barrier arm, never comparable with an F_FULLFSYNC run.
+        return ("fsync_without_drive_flush" if sys.platform == "darwin" else "fsync"), source
+
+    def environment(self):
+        """Report metadata the latency definition requires; read-only probes."""
+        if self.options.fsync_mode == "auto":
+            fsync_mode, fsync_source = self.build_fsync_mode()
+        else:
+            fsync_mode, fsync_source = self.options.fsync_mode, "operator --fsync-mode"
+        cpu = platform.processor() or "unknown"
+        try:
+            if sys.platform == "darwin":
+                cpu = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True,
+                                     text=True, timeout=5, check=True).stdout.strip() or cpu
+            elif Path("/proc/cpuinfo").exists():
+                cpu = next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines()
+                            if line.startswith("model name")), cpu)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        commit = "unknown"
+        try:
+            commit = subprocess.run(["git", "-C", self.config["environment"]["SRCDIR"], "rev-parse", "HEAD"],
+                                    capture_output=True, text=True, timeout=5, check=True).stdout.strip()
+        except (OSError, subprocess.SubprocessError, KeyError):
+            pass
+        clock = time.get_clock_info("monotonic")
+        return {"platform": sys.platform, "os_release": platform.release(), "machine": platform.machine(),
+                "cpu": cpu, "cpu_count": os_cpu_count(), "python": platform.python_version(),
+                "monotonic_clock": {"implementation": clock.implementation, "resolution_s": clock.resolution},
+                "fsync_mode": fsync_mode, "fsync_mode_source": fsync_source,
+                "client_region": self.options.client_region, "server_region": self.options.server_region,
+                "topology": "four validators and one engine-off client on one host, loopback TLS"
+                            if self.options.client_region == self.options.server_region == "co-located" else "labelled regions",
+                "source_commit": commit}
 
     def start_ordinary_client(self):
         initialize_datadir(self.options.tmpdir, 4, self.chain, self.disable_autoconnect)
@@ -600,7 +670,10 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             self.trade_report["summary"]["status_read_overdue_bound_ms"] = PUMP_OVERDUE_BOUND_MS
             self.trade_report["summary"]["status_read_overdue_exceeded"] = overdue >= PUMP_OVERDUE_BOUND_MS
             self.trade_report["correctness_pass"] = True
-            self.trade_report["performance_measurement_qualified"] = not self.options.harness_smoke
+            # A result with an unknown durability barrier cannot be compared
+            # with any other run; label the build or pass --fsync-mode.
+            self.trade_report["performance_measurement_qualified"] = (
+                not self.options.harness_smoke and self.trade_report["environment"]["fsync_mode"] != "unknown")
         except Exception as error:
             self.trade_report["error"] = f"{type(error).__name__}: {error}"
             raise

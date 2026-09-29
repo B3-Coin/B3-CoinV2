@@ -54,12 +54,18 @@ def host_us():
     return time.monotonic_ns() // 1000
 
 
+# doc/flowmesh-latency-definition.md: nearest-rank percentiles; p99 is not
+# estimable from fewer than 100 samples.
+P99_MIN_SAMPLES = 100
+
+
 def distribution(values, target_ms):
     ordered = sorted(values)
     result = {"count": len(ordered), "over_target_count": sum(value > target_ms for value in ordered)}
-    for name, fraction in (("p50_ms", .50), ("p95_ms", .95), ("p99_ms", .99)):
+    for name, fraction in (("p50_ms", .50), ("p90_ms", .90), ("p95_ms", .95), ("p99_ms", .99)):
         result[name] = ordered[math.ceil(len(ordered) * fraction) - 1] if ordered else None
     result["max_ms"] = ordered[-1] if ordered else None
+    result["p99_estimable"] = len(ordered) >= P99_MIN_SAMPLES
     return result
 
 
@@ -453,8 +459,8 @@ class FlowMeshLatencyTest(FlowMeshPreagreementTest):
             # No observation is not a zero-millisecond event or a passing
             # durable-timestamp sample. Keep unknown metrics explicit.
             unknown = {"availability": "unknown", "reason": "BENCH disabled; exact trace timestamps not reconstructed",
-                       "count": 0, "over_target_count": None, "p50_ms": None,
-                       "p95_ms": None, "p99_ms": None, "max_ms": None}
+                       "count": 0, "over_target_count": None, "p50_ms": None, "p90_ms": None,
+                       "p95_ms": None, "p99_ms": None, "max_ms": None, "p99_estimable": False}
             for phase in ("warmup", "measured"):
                 for metric in ("first_operator_admission_upper_ms", "every_replica_durable_upper_ms"):
                     report["summary"][phase]["metrics"][metric] = dict(unknown)
