@@ -27,6 +27,7 @@
 #include <node/flowmesh_vault_index.h>
 #include <node/fn_seat_index.h>
 #include <primitives/block.h>
+#include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
 #include <util/sock.h>
@@ -49,6 +50,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -2217,6 +2219,10 @@ struct ScriptedEndpoint {
     std::string evidence_error;
     //! Answer "outcome" with the unknown-field error (a downgraded endpoint).
     bool reject_outcome_field{false};
+    //! Unwaited 'action' replies for specific ActionIds (instead of `plain`),
+    //! and how often each was read.
+    std::map<std::string, UniValue> by_action;
+    std::map<std::string, unsigned> by_action_reads;
 
     node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
     {
@@ -2246,6 +2252,11 @@ struct ScriptedEndpoint {
         } else if (method == "action" && json["params"].exists("wait_ms")) {
             ++waited_reads;
             out.pushKV("result", waited);
+        } else if (method == "action" && json["params"]["action_id"].isStr() &&
+                   by_action.contains(json["params"]["action_id"].get_str())) {
+            const auto& id{json["params"]["action_id"].get_str()};
+            ++by_action_reads[id];
+            out.pushKV("result", by_action.at(id));
         } else if (method == "action") {
             ++plain_reads;
             out.pushKV("result", plain);
@@ -2460,7 +2471,7 @@ struct ClientLaneFixture : TestingSetup {
     /** An opt-in 'action' reply for a microblock whose body really executes
      * `action`: its certified payload plus the outcome evidence that hashes
      * to the entry's result root. Also returns the evidence hex alone. */
-    std::pair<UniValue, std::string> OutcomeReceipt(const flowmesh::Action& action) const
+    std::pair<UniValue, std::string> OutcomeReceipt(const flowmesh::Action& action, const uint64_t next_sequence = 0) const
     {
         const auto& params{m_node.chainman->GetConsensus()};
         const CScript treasury{params.modern_pos->treasury_script.begin(), params.modern_pos->treasury_script.end()};
@@ -2473,7 +2484,10 @@ struct ClientLaneFixture : TestingSetup {
             const auto* index{m_node.chainman->ActiveChain()[static_cast<int>(seats.anchor_height)]};
             anchor = {index->nHeight, index->GetBlockHash()};
         }
-        const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+        flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+        // The signer's next account sequence before this entry: an action at
+        // exactly that sequence consumes it.
+        if (next_sequence > 0) flowmesh::test_only::StateFunding::SetNextSequence(initial, action.signer, next_sequence);
         flowmesh::ProductionEpochGate gate{domain, market, seats};
         flowmesh::ProductionEntryCheck check;
         const std::vector<flowmesh::Action> body{action};
@@ -3352,6 +3366,286 @@ BOOST_AUTO_TEST_CASE(unknown_field_error_clears_both_capabilities)
     BOOST_CHECK_EQUAL(validator.outcome_flags, 1U);
     client.reset();
     server->Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+//! A different signed action of the same account at the same sequence.
+flowmesh::Action SameSequenceConsumer(const flowmesh::Action& action)
+{
+    auto consumer{action};
+    consumer.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_ASK);
+    consumer.credential = {4, 5, 6};
+    return consumer;
+}
+
+/** An opt-in 'action' reply for `action` whose pool notice names
+ * `consumer_id` in the microblock of `consumer_reply` (an OutcomeReceipt)
+ * and carries that entry and its outcome evidence. */
+UniValue ConsumerNoticeReply(const flowmesh::Action& action, const UniValue& consumer_reply, const uint256& consumer_id)
+{
+    UniValue reply{UniValue::VOBJ};
+    reply.pushKV("action_id", action.Id().GetHex());
+    reply.pushKV("receipt_state", "rejected");
+    reply.pushKV("reason", "FlowMesh action account sequence was already used by another certified action");
+    UniValue named{UniValue::VOBJ};
+    named.pushKV("action_id", consumer_id.GetHex());
+    named.pushKV("microblock_sequence", consumer_reply["microblock_sequence"]);
+    named.pushKV("microblock_hash", consumer_reply["microblock_hash"]);
+    UniValue notice{UniValue::VOBJ};
+    notice.pushKV("reason_code", "STALE_SEQUENCE");
+    notice.pushKV("account_sequence", action.sequence);
+    notice.pushKV("next_account_sequence", action.sequence + 1);
+    notice.pushKV("consumed_by", std::move(named));
+    reply.pushKV("pool_notice", std::move(notice));
+    reply.pushKV("consumer_certified_payload", consumer_reply["certified_payload"]);
+    reply.pushKV("consumer_outcome_evidence", consumer_reply["outcome_evidence"]);
+    return reply;
+}
+
+UniValue AdvertisingRow(UniValue row)
+{
+    row.pushKV("action_outcome_v1", true);
+    return row;
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_not_executed_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(not_executed_requires_verified_other_consumer)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    const auto consumer{SameSequenceConsumer(action)};
+    // The consumer is at the account's next sequence: it uses sequence 3.
+    const auto consumed{OutcomeReceipt(consumer, action.sequence).first};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+    validator.plain = ConsumerNoticeReply(action, consumed, consumer.Id());
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK_EQUAL(receipt.state, "rejected");
+    BOOST_CHECK(!receipt.certificate_verified);
+    BOOST_REQUIRE(receipt.outcome_verified);
+    BOOST_REQUIRE(receipt.outcome);
+    BOOST_CHECK_EQUAL(receipt.outcome->status, "not_executed");
+    BOOST_CHECK(receipt.outcome->final);
+    BOOST_CHECK_EQUAL(receipt.outcome->reason_code, "NOT_EXECUTED_SEQUENCE_CONSUMED");
+    BOOST_CHECK_EQUAL(receipt.outcome->evidence, "certified_sequence_consumer");
+    BOOST_REQUIRE(receipt.outcome->consumed_by);
+    BOOST_CHECK(receipt.outcome->consumed_by->action_id == consumer.Id());
+    BOOST_CHECK_EQUAL(receipt.outcome->consumed_by->microblock_hash.GetHex(), consumed["microblock_hash"].get_str());
+    BOOST_CHECK_EQUAL(receipt.reason_code, "NOT_EXECUTED_SEQUENCE_CONSUMED");
+    BOOST_CHECK(receipt.reason.find("can never execute") != std::string::npos);
+    BOOST_CHECK_EQUAL(client->Status().pending_actions, 0U);
+    // Final: no further status read, and a retry never sends it again.
+    const auto again{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(again.outcome_verified);
+    const auto retried{client->ActionStatus(market, action.Id(), true)};
+    BOOST_CHECK(retried.outcome_verified);
+    BOOST_CHECK_EQUAL(retried.state, "rejected");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 0, 0, 1}));
+    client.reset();
+    server->Stop();
+    const auto durable{DurableRow(path, action)};
+    BOOST_REQUIRE(durable["not_executed_consumer"].isObject());
+    BOOST_CHECK_EQUAL(durable["not_executed_consumer"]["action_id"].get_str(), consumer.Id().GetHex());
+    BOOST_CHECK_EQUAL(durable["not_executed_consumer"]["microblock_hash"].get_str(), consumed["microblock_hash"].get_str());
+
+    // Anything short of that proof leaves the possibly delivered action
+    // unknown and marks nothing.
+    const auto run = [&](const std::string& name, const UniValue& reply) {
+        const fs::path other{m_path_root / fs::PathFromString(name)};
+        const auto seeded{Seed(other, owner)};
+        BOOST_REQUIRE(seeded.Id() == action.Id());
+        ScriptedEndpoint endpoint;
+        endpoint.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+        endpoint.plain = reply;
+        auto other_server{Serve(endpoint)};
+        auto other_client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(other_server->Port())}, other, error)};
+        BOOST_REQUIRE_MESSAGE(other_client, error);
+        BOOST_REQUIRE_EQUAL(other_client->Markets(std::nullopt).size(), 1U);
+        const auto observed{other_client->ActionStatus(market, action.Id(), false)};
+        BOOST_CHECK_MESSAGE(observed.state == "unknown", name);
+        BOOST_CHECK_MESSAGE(!observed.outcome_verified && !observed.outcome, name);
+        BOOST_CHECK_MESSAGE(observed.reason_code.empty(), name);
+        other_client.reset();
+        other_server->Stop();
+        BOOST_CHECK_MESSAGE(!DurableRow(other, action).exists("not_executed_consumer"), name);
+    };
+    // The named consumer did not use the sequence (BAD_SEQUENCE there).
+    run("not-consumed", ConsumerNoticeReply(action, OutcomeReceipt(consumer).first, consumer.Id()));
+    // The "consumer" is this very action: that is execution, not a proof.
+    run("self", ConsumerNoticeReply(action, OutcomeReceipt(action, action.sequence).first, action.Id()));
+    // Another account's action at the same number proves nothing.
+    auto stranger{consumer};
+    stranger.signer = *uint256::FromHex(std::string(64, '5'));
+    run("other-signer", ConsumerNoticeReply(action, OutcomeReceipt(stranger, action.sequence).first, stranger.Id()));
+    // Evidence that does not hash to the certified result root.
+    auto tampered{ConsumerNoticeReply(action, consumed, consumer.Id())};
+    auto hex{tampered["consumer_outcome_evidence"].get_str()};
+    hex[hex.size() - 1] = hex.back() == '0' ? '1' : '0';
+    tampered.pushKV("consumer_outcome_evidence", hex);
+    run("tampered", tampered);
+    // The notice names a different microblock than the certified entry.
+    auto misnamed{ConsumerNoticeReply(action, consumed, consumer.Id())};
+    UniValue named{misnamed["pool_notice"]["consumed_by"]};
+    named.pushKV("microblock_hash", uint256{uint8_t{7}}.GetHex());
+    UniValue notice{misnamed["pool_notice"]};
+    notice.pushKV("consumed_by", named);
+    misnamed.pushKV("pool_notice", notice);
+    run("misnamed", misnamed);
+    // A certificate that does not verify under local B3 authority.
+    auto forged{ConsumerNoticeReply(action, consumed, consumer.Id())};
+    auto payload{forged["consumer_certified_payload"].get_str()};
+    payload[payload.size() - 3] = payload[payload.size() - 3] == 'a' ? 'b' : 'a';
+    forged.pushKV("consumer_certified_payload", payload);
+    run("forged", forged);
+}
+
+BOOST_AUTO_TEST_CASE(not_executed_marker_saved_before_label_and_withdrawn_on_save_failure)
+{
+#ifdef WIN32
+    BOOST_TEST_MESSAGE("Needs RLIMIT_FSIZE to fail the outbox write");
+#else
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    const auto consumer{SameSequenceConsumer(action)};
+    const auto consumed{OutcomeReceipt(consumer, action.sequence).first};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+    validator.plain = ConsumerNoticeReply(action, consumed, consumer.Id());
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    interfaces::FlowMeshActionReceipt failed;
+    {
+        ScopedFailedFileWrites full_disk;
+        failed = client->ActionStatus(market, action.Id(), false);
+    }
+    // Never a verified outcome that is not durable.
+    BOOST_CHECK_EQUAL(failed.state, "unknown");
+    BOOST_CHECK(!failed.outcome_verified && !failed.outcome);
+    BOOST_CHECK(failed.reason_code.empty());
+    const auto retained{client->SavedActions(owner, market)};
+    BOOST_REQUIRE_EQUAL(retained.size(), 1U);
+    BOOST_CHECK(!retained[0].receipt.outcome_verified);
+    BOOST_CHECK_EQUAL(retained[0].receipt.state, "unknown");
+    // With writes working, the same reply proves it again, durably.
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    const auto proved{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK_EQUAL(proved.state, "rejected");
+    BOOST_CHECK(proved.outcome_verified);
+    client.reset();
+    server->Stop();
+    BOOST_CHECK(DurableRow(path, action)["not_executed_consumer"].isObject());
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(restart_marker_blocks_resend_and_counts_unresolved)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    const auto consumer{SameSequenceConsumer(action)};
+    const auto consumed{OutcomeReceipt(consumer, action.sequence).first};
+    std::string error;
+    {
+        ScriptedEndpoint validator;
+        validator.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+        validator.plain = ConsumerNoticeReply(action, consumed, consumer.Id());
+        auto server{Serve(validator)};
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        BOOST_REQUIRE(client->ActionStatus(market, action.Id(), false).outcome_verified);
+        client.reset();
+        server->Stop();
+    }
+    // Restarted against an endpoint that offers no outcomes: the marker is
+    // not a verified outcome, the action counts as unresolved, and a retry
+    // never sends it.
+    {
+        ScriptedEndpoint old;
+        old.markets.push_back(MarketRow(std::chrono::milliseconds{0}));
+        old.plain = ClientLaneFixture::Receipt(action, "rejected");
+        old.submit = ClientLaneFixture::Receipt(action, "queued");
+        auto server{Serve(old)};
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_CHECK_EQUAL(client->Status().pending_actions, 1U);
+        BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        const auto retried{client->ActionStatus(market, action.Id(), true)};
+        BOOST_CHECK_EQUAL(retried.state, "unknown");
+        BOOST_CHECK(!retried.outcome_verified && !retried.outcome);
+        BOOST_CHECK(retried.reason.find("Previously proven not executed") != std::string::npos);
+        BOOST_CHECK(retried.reason.find("will not be resubmitted") != std::string::npos);
+        BOOST_CHECK_EQUAL(old.Counts()[2], 0U); // never sent
+        BOOST_CHECK_EQUAL(old.outcome_flags, 0U);
+        BOOST_CHECK_EQUAL(client->Status().pending_actions, 1U);
+        client.reset();
+        server->Stop();
+        BOOST_CHECK(DurableRow(path, action)["not_executed_consumer"].isObject());
+    }
+    // An endpoint that offers outcomes but no longer has the consumer's
+    // evidence: one re-proof attempt per process, then nothing more.
+    {
+        ScriptedEndpoint expired;
+        expired.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+        expired.plain = ClientLaneFixture::Receipt(action, "unknown");
+        expired.by_action.emplace(consumer.Id().GetHex(), WithoutEvidence(consumed));
+        auto server{Serve(expired)};
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        const auto first{client->ActionStatus(market, action.Id(), false)};
+        BOOST_CHECK_EQUAL(first.state, "unknown");
+        BOOST_CHECK(!first.outcome_verified);
+        std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+        (void)client->ActionStatus(market, action.Id(), false);
+        {
+            std::lock_guard lock{expired.mutex};
+            BOOST_CHECK_EQUAL(expired.by_action_reads[consumer.Id().GetHex()], 1U);
+        }
+        BOOST_CHECK_EQUAL(expired.Counts()[2], 0U);
+        client.reset();
+        server->Stop();
+    }
+    // The consumer's certified inclusion and evidence renew the proof.
+    {
+        ScriptedEndpoint validator;
+        validator.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+        validator.plain = ClientLaneFixture::Receipt(action, "unknown");
+        validator.by_action.emplace(consumer.Id().GetHex(), consumed);
+        auto server{Serve(validator)};
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        const auto renewed{client->ActionStatus(market, action.Id(), false)};
+        BOOST_CHECK_EQUAL(renewed.state, "rejected");
+        BOOST_REQUIRE(renewed.outcome_verified && renewed.outcome);
+        BOOST_CHECK_EQUAL(renewed.outcome->status, "not_executed");
+        BOOST_CHECK_EQUAL(client->Status().pending_actions, 0U);
+        const auto again{client->ActionStatus(market, action.Id(), false)};
+        BOOST_CHECK(again.outcome_verified);
+        {
+            std::lock_guard lock{validator.mutex};
+            BOOST_CHECK_EQUAL(validator.by_action_reads[consumer.Id().GetHex()], 1U);
+        }
+        BOOST_CHECK_EQUAL(validator.Counts()[0], 0U); // A itself was never read
+        BOOST_CHECK_EQUAL(validator.Counts()[2], 0U);
+        client.reset();
+        server->Stop();
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

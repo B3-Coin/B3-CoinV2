@@ -10,6 +10,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <optional>
 #include <string>
 
 namespace {
@@ -137,6 +138,44 @@ BOOST_AUTO_TEST_CASE(receipt_json_scopes)
     receipt.outcome->reason_code = "SOMETHING_NEW";
     const auto unknown{node::FlowMeshClientReceiptJson(receipt, node::FlowMeshReceiptJsonScope::LOCAL_RPC)};
     BOOST_CHECK_EQUAL(unknown["outcome"]["reason_text"].get_str(), "Unrecognised reason; outcome unchanged.");
+}
+
+BOOST_AUTO_TEST_CASE(join_kinds_for_not_executed)
+{
+    using Kind = node::FlowMeshJoinOwnAction::Kind;
+    const flowmesh::ClientConsumerRef marker{uint256{uint8_t{2}}, 5, uint256{uint8_t{9}}};
+    const auto join = [](const interfaces::FlowMeshActionReceipt& receipt, bool previously_certified,
+                         const std::optional<flowmesh::ClientConsumerRef>& not_executed) {
+        return node::FlowMeshJoinOwnActionFor(receipt, previously_certified, not_executed, 3);
+    };
+    auto proven{Receipt("rejected")};
+    proven.outcome = Outcome("not_executed");
+    proven.outcome_verified = true;
+    BOOST_CHECK(node::FlowMeshProvenNotExecuted(proven, marker));
+    // A proven non-execution joins once the cached state reaches its consumer.
+    const auto proven_kind{join(proven, false, marker)};
+    BOOST_CHECK(proven_kind.kind == Kind::CERTIFIED);
+    BOOST_CHECK(proven_kind.microblock_sequence == 5U);
+    BOOST_CHECK_EQUAL(proven_kind.sequence, 3U);
+    // A restored marker is never a definite refusal: its sequence was consumed.
+    for (const auto* state : {"unknown", "rejected"}) {
+        const auto marker_only{join(Receipt(state), false, marker)};
+        BOOST_CHECK(marker_only.kind == Kind::CERTIFIED);
+        BOOST_CHECK(!marker_only.microblock_sequence);
+    }
+    // An outcome naming another consumer is not this marker's proof.
+    const flowmesh::ClientConsumerRef other{uint256{uint8_t{3}}, 5, uint256{uint8_t{9}}};
+    BOOST_CHECK(!node::FlowMeshProvenNotExecuted(proven, other));
+    BOOST_CHECK(!node::FlowMeshProvenNotExecuted(proven, std::nullopt));
+    BOOST_CHECK(!join(proven, false, other).microblock_sequence);
+    // Unchanged kinds.
+    const auto certified{join(Receipt("certified_inclusion", true), false, std::nullopt)};
+    BOOST_CHECK(certified.kind == Kind::CERTIFIED && certified.microblock_sequence == 5U);
+    const auto restored{join(Receipt("unknown"), true, std::nullopt)};
+    BOOST_CHECK(restored.kind == Kind::CERTIFIED && !restored.microblock_sequence);
+    BOOST_CHECK(join(Receipt("rejected"), false, std::nullopt).kind == Kind::DEFINITE_REJECTED);
+    BOOST_CHECK(join(Receipt("unknown"), false, std::nullopt).kind == Kind::UNRESOLVED);
+    BOOST_CHECK(join(Receipt("certified_inclusion", false), false, std::nullopt).kind == Kind::UNRESOLVED);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

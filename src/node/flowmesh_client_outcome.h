@@ -6,13 +6,17 @@
 #define B3COIN_NODE_FLOWMESH_CLIENT_OUTCOME_H
 
 #include <flowmesh/action_reason.h>
+#include <flowmesh/client_evidence.h>
 #include <flowmesh/outcome_evidence.h>
 #include <interfaces/chain.h>
+#include <node/flowmesh_client_join.h>
 #include <node/flowmesh_production_store.h>
 
 #include <univalue.h>
 
+#include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -97,6 +101,65 @@ inline void FlowMeshStripInconsistentOutcome(interfaces::FlowMeshActionReceipt& 
 inline flowmesh::ExecutionOutcomeEvidenceV1 FlowMeshRecordEvidence(const ProductionOutcomeRecord& record)
 {
     return {record.sequence, record.entry_hash, record.preimage, record.effects};
+}
+
+/** Whether `evidence` (endpoint bytes) proves that `action` can never
+ * execute because `consumer` names a DIFFERENT certified action that used
+ * its account sequence. `entry` must be the consumer's entry whose
+ * certificate the caller already verified under local B3 authority. True
+ * only when the entry is exactly the named microblock, the evidence decodes
+ * and hashes to its result root, and ProvesSequenceConsumedByOther holds.
+ * Never throws; any doubt is false. */
+inline bool FlowMeshProvesNotExecuted(const flowmesh::ProductionEntryCore& entry, std::span<const unsigned char> evidence,
+                                      const flowmesh::Action& action, const flowmesh::ClientConsumerRef& consumer) noexcept
+{
+    try {
+        if (action.IsDeposit() || entry.sequence != consumer.microblock_sequence ||
+            entry.GetHash() != consumer.microblock_hash) return false;
+        const auto decoded{flowmesh::DecodeExecutionOutcomeEvidenceV1(evidence)};
+        return decoded && flowmesh::VerifyExecutionOutcomeEvidence(entry, *decoded) == flowmesh::OutcomeEvidenceCheck::OK &&
+               flowmesh::ProvesSequenceConsumedByOther(entry, *decoded, action, consumer.action_id);
+    } catch (...) {
+        return false;
+    }
+}
+
+//! A retained action whose non-execution this process has proven: its
+//! durable marker and a verified not_executed outcome naming that consumer.
+inline bool FlowMeshProvenNotExecuted(const interfaces::FlowMeshActionReceipt& receipt,
+                                      const std::optional<flowmesh::ClientConsumerRef>& marker)
+{
+    return marker && receipt.state == "rejected" && receipt.outcome_verified && receipt.outcome &&
+           receipt.outcome->status == "not_executed" && receipt.outcome->consumed_by &&
+           receipt.outcome->consumed_by->action_id == marker->action_id &&
+           receipt.outcome->consumed_by->microblock_sequence == marker->microblock_sequence &&
+           receipt.outcome->consumed_by->microblock_hash == marker->microblock_hash;
+}
+
+/** How a retained own signed action counts for a signing preflight's join.
+ * A proven non-execution is reflected in any state at or after its
+ * consumer's microblock; a retained marker whose proof is not renewed yet
+ * joins only once the cached state consumed its sequence. Both come before a
+ * "rejected" receipt: a proven non-execution reads "rejected", yet unlike a
+ * first-attempt refusal its sequence WAS consumed (by the consumer). */
+inline FlowMeshJoinOwnAction FlowMeshJoinOwnActionFor(const interfaces::FlowMeshActionReceipt& receipt,
+                                                      const bool previously_certified,
+                                                      const std::optional<flowmesh::ClientConsumerRef>& not_executed,
+                                                      const uint64_t sequence)
+{
+    using Kind = FlowMeshJoinOwnAction::Kind;
+    if (receipt.certificate_verified && receipt.state == "certified_inclusion") {
+        return {Kind::CERTIFIED, receipt.microblock_sequence, sequence};
+    }
+    if (FlowMeshProvenNotExecuted(receipt, not_executed)) return {Kind::CERTIFIED, not_executed->microblock_sequence, sequence};
+    // Certified before a restart, or its proof is being renewed: where it
+    // was included is not known here. It may join only if the cached state
+    // already consumed its sequence.
+    if (previously_certified || not_executed) return {Kind::CERTIFIED, std::nullopt, sequence};
+    // Send and QueryAction keep a refusal after any possible earlier delivery
+    // as unknown, so this is definite.
+    if (receipt.state == "rejected") return {Kind::DEFINITE_REJECTED, std::nullopt, sequence};
+    return {Kind::UNRESOLVED, std::nullopt, sequence};
 }
 
 } // namespace node

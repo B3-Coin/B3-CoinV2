@@ -72,6 +72,9 @@ constexpr size_t CLIENT_ACTION_OUTCOME_MAX_REPLY{2 * CLIENT_ACTION_WAIT_MAX_REPL
                                                  4 * flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES + 64 * 1024};
 static_assert(CLIENT_ACTION_OUTCOME_MAX_REPLY <= CLIENT_MAX_REPLY);
 constexpr size_t CLIENT_OUTCOME_EVIDENCE_MAX_REPLY{2 * flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES + 4096};
+// A retained not-executed marker whose proof this process has not renewed.
+constexpr const char* CLIENT_NOT_EXECUTED_RETAINED{
+    "Previously proven not executed; fresh proof required, and this action will not be resubmitted"};
 // A waited 'action' read ends at least this long before its HTTPS deadline,
 // leaving time to fetch the certified payload and write the reply.
 constexpr auto API_WAIT_REPLY_RESERVE{std::chrono::milliseconds{1000}};
@@ -965,13 +968,15 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     size_t m_preferred{0};
     std::unique_ptr<CDBWrapper> m_db;
     //! Withdraws every verified label together: an unverified inclusion
-    //! never keeps an outcome.
+    //! never keeps an outcome, nor a reason code this client derived from
+    //! verifying it (a remote receipt has no other reason code).
     static void WithdrawVerifiedLabels(Receipt& receipt)
     {
         receipt.certificate_verified = false;
         receipt.state = "unknown";
         receipt.outcome.reset();
         receipt.outcome_verified = false;
+        receipt.reason_code.clear();
     }
     struct Pending {
         uint256 market, domain, config;
@@ -996,8 +1001,19 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // Volatile: endpoints already asked for this inclusion's outcome
         // evidence by the outcome-only upgrade (at most once each).
         std::set<size_t> outcome_upgrade_asked{};
+        // Durable: a DIFFERENT certified action used this action's account
+        // sequence, proven once under local B3 authority, so this action can
+        // never execute. Like previously_certified it forbids resending the
+        // instruction after a restart; fresh proof renews only the label.
+        std::optional<flowmesh::ClientConsumerRef> not_executed{};
+        // Volatile, re-fetchable: the consumer's certified payload, re-verified
+        // by RecheckActionAuthority and evictable like an inclusion proof.
+        std::vector<unsigned char> consumer_proof{};
+        // Volatile: the marker's one re-proof per process was attempted.
+        bool not_executed_reproof_asked{false};
     };
     std::map<std::pair<uint256, uint256>, Pending> m_pending;
+    static bool ProvenNotExecuted(const Pending& p) { return FlowMeshProvenNotExecuted(p.receipt, p.not_executed); }
     FlowMeshClientPollScheduler m_action_polls;
     std::map<uint256, std::pair<uint64_t, uint256>> m_highwater;
     // RestartDigest() of the last successful synchronous outbox write. Empty
@@ -1393,6 +1409,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             hasher << p.market << p.domain << p.config
                    << (p.signed_bytes_sha256.empty() ? BytesSha256Hex(p.bytes) : p.signed_bytes_sha256)
                    << p.initial_submission_ms << p.may_have_been_sent << p.previously_certified << p.owner_account;
+            hasher << p.not_executed.has_value();
+            if (p.not_executed) {
+                hasher << p.not_executed->action_id << p.not_executed->microblock_sequence << p.not_executed->microblock_hash;
+            }
         }
         return hasher.GetSHA256();
     }
@@ -1429,6 +1449,16 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             row.pushKV("initial_submission_ms", p.initial_submission_ms); row.pushKV("may_have_been_sent", p.may_have_been_sent);
             row.pushKV("previously_certified", p.previously_certified);
             row.pushKV("owner_account", p.owner_account.GetHex());
+            if (p.not_executed) {
+                // Additive: older binaries restore rows by named keys and
+                // ignore it (they may then resend an action that can never
+                // execute, which is harmless).
+                UniValue consumer{UniValue::VOBJ};
+                consumer.pushKV("action_id", p.not_executed->action_id.GetHex());
+                consumer.pushKV("microblock_sequence", p.not_executed->microblock_sequence);
+                consumer.pushKV("microblock_hash", p.not_executed->microblock_hash.GetHex());
+                row.pushKV("not_executed_consumer", std::move(consumer));
+            }
             row.pushKV("receipt", FlowMeshClientReceiptJson(p.receipt)); actions.push_back(std::move(row));
         }
         for (const auto& [market, head] : m_highwater) {
@@ -1487,12 +1517,36 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             // Restart requires fresh evidence, never trusts a saved endpoint's
             // certification claim. It also never changes the signed bytes.
             p.receipt.reason = "Retained original action; fresh status evidence required after restart";
+            if (row.exists("not_executed_consumer")) {
+                const auto& consumer{row["not_executed_consumer"]};
+                p.not_executed = flowmesh::ClientConsumerRef{Id(consumer, "action_id"), Number(consumer, "microblock_sequence"),
+                                                             Id(consumer, "microblock_hash")};
+                if (action->IsDeposit() || p.not_executed->action_id == action->Id()) Fail("Invalid retained not-executed marker");
+                p.receipt.reason = CLIENT_NOT_EXECUTED_RETAINED;
+            }
             if (!m_pending.emplace(std::pair{p.market, action->Id()}, std::move(p)).second) Fail("Duplicate retained action");
         }
 #ifdef FLOWMESH_CLIENT_CRASH_TEST_HOOKS
         test::ClientCrashRecord(m_path, "journal_restore_completed", root);
 #endif
         std::lock_guard lock{m_status_mutex}; m_status.pending_actions = m_pending.size();
+    }
+    //! Keeps one re-fetchable proof copy of p (its inclusion or consumer
+    //! proof, `slot`) within the 8 MiB budget of all retained proof copies.
+    void RetainProof(Pending& p, std::vector<unsigned char>& slot, const std::vector<unsigned char>& proof)
+    {
+        size_t retained_bytes{proof.size()};
+        for (const auto& [key, item] : m_pending) retained_bytes += item.inclusion_proof.size() + item.consumer_proof.size();
+        retained_bytes -= slot.size();
+        if (retained_bytes > 8 * 1024 * 1024) {
+            // Only evict re-fetchable proof copies. The durable no-replay
+            // markers and the exact signed instructions remain intact.
+            for (auto& [key, item] : m_pending) if (&item != &p) {
+                item.inclusion_proof.clear(); item.inclusion_proof.shrink_to_fit();
+                item.consumer_proof.clear(); item.consumer_proof.shrink_to_fit();
+            }
+        }
+        slot = proof;
     }
     void Inclusion(Pending& p, const flowmesh::ProductionCertifiedEnvelope& certified, size_t endpoint,
                    const std::vector<unsigned char>& proof)
@@ -1505,16 +1559,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         p.receipt.certificate_verified = true; p.receipt.endpoint = m_endpoints[endpoint].url;
         p.previously_certified = true;
         m_action_polls.Remove({p.market, p.action.Id()});
-        size_t retained_bytes{proof.size()};
-        for (const auto& [key, item] : m_pending) if (&item != &p) retained_bytes += item.inclusion_proof.size();
-        if (retained_bytes > 8 * 1024 * 1024) {
-            // Only evict re-fetchable proof copies. The durable no-replay
-            // marker and the exact signed instruction remain intact.
-            for (auto& [key, item] : m_pending) if (&item != &p) {
-                item.inclusion_proof.clear(); item.inclusion_proof.shrink_to_fit();
-            }
-        }
-        p.inclusion_proof = proof;
+        RetainProof(p, p.inclusion_proof, proof);
         if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
         p.receipt.reason = "Canonical action inclusion verified; execution outcome is not proved by inclusion alone";
         m_own_certified_through.Record(p.market, entry.sequence);
@@ -1683,22 +1728,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             std::vector<FlowMeshJoinOwnAction> own;
             for (const auto& [key, p] : m_pending) {
                 if (p.market != id || p.action.IsDeposit() || p.action.signer != *account) continue;
-                using Kind = FlowMeshJoinOwnAction::Kind;
-                if (p.receipt.certificate_verified && p.receipt.state == "certified_inclusion") {
-                    own.push_back({Kind::CERTIFIED, p.receipt.microblock_sequence, p.action.sequence});
-                } else if (p.previously_certified) {
-                    // Certified before a restart, or its proof is being
-                    // renewed: where it was included is not known here. It
-                    // may join only if the cached state already consumed its
-                    // sequence.
-                    own.push_back({Kind::CERTIFIED, std::nullopt, p.action.sequence});
-                } else if (p.receipt.state == "rejected") {
-                    // Send and QueryAction keep a refusal after any possible
-                    // earlier delivery as unknown, so this is definite.
-                    own.push_back({Kind::DEFINITE_REJECTED, std::nullopt, p.action.sequence});
-                } else {
-                    own.push_back({Kind::UNRESOLVED, std::nullopt, p.action.sequence});
-                }
+                own.push_back(FlowMeshJoinOwnActionFor(p.receipt, p.previously_certified, p.not_executed, p.action.sequence));
             }
             const auto next_account_sequence{cache.verified.state.NextSequence(*account)};
             const auto allowed = [&] {
@@ -1780,6 +1810,27 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     {
         const auto pins{Pins(p.market)};
         if (pins.domain != p.domain || pins.execution_config_id != p.config) Fail("Retained action domain/config differs from current local market");
+        if (ProvenNotExecuted(p)) {
+            // The consumer's certificate must still verify under current
+            // authority. On failure only the label is withdrawn; the durable
+            // marker stays, so the action is still never resent.
+            std::string failure;
+            if (p.consumer_proof.empty()) {
+                failure = "Previously proven not executed; fresh authority evidence required, and this action will not be resubmitted";
+            } else {
+                try {
+                    if (VerifyEntry(pins, p.consumer_proof).entry.GetHash() != p.not_executed->microblock_hash) {
+                        failure = "Prior not-executed proof no longer matches its consumer";
+                    }
+                } catch (const std::exception& e) {
+                    failure = std::string{"Prior not-executed proof no longer verified: "} + e.what();
+                }
+            }
+            if (!failure.empty()) {
+                WithdrawVerifiedLabels(p.receipt);
+                p.receipt.reason = failure;
+            }
+        }
         if (p.receipt.certificate_verified && !p.inclusion_proof.empty()) {
             try { (void)VerifyEntry(pins, p.inclusion_proof); return pins; }
             catch (const std::exception& e) {
@@ -1817,6 +1868,118 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             p.receipt = std::move(receipt);
         }
         if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
+        if (!p.receipt.certificate_verified) TryProveNotExecuted(p, pins, value, endpoint);
+    }
+    /** An opt-in 'action' reply may name the certified action X that used
+     * this action's account sequence (pool_notice.consumed_by {X, M, hash})
+     * and carry X's certified entry and its outcome evidence. The client
+     * accepts "not executed" only from its own checks: the entry's
+     * certificate under local B3 authority, exactly (M, hash), evidence that
+     * hashes to its result root, and ProvesSequenceConsumedByOther. Anything
+     * else leaves the receipt as it was; the endpoint's words are only an
+     * observation. Never throws. Actions certified before (their inclusion
+     * answers them) and deposits (no sequence) are never marked. */
+    void TryProveNotExecuted(Pending& p, const flowmesh::ClientEvidencePins& pins, const UniValue& value,
+                             const size_t endpoint) noexcept
+    {
+        if (p.previously_certified || p.action.IsDeposit() || ProvenNotExecuted(p)) return;
+        try {
+            if (!value.isObject() || !value["pool_notice"].isObject() || !value["pool_notice"].exists("consumed_by") ||
+                !value.exists("consumer_certified_payload") || !value.exists("consumer_outcome_evidence")) return;
+            const auto& named{value["pool_notice"]["consumed_by"]};
+            const flowmesh::ClientConsumerRef consumer{Id(named, "action_id"), Number(named, "microblock_sequence"),
+                                                       Id(named, "microblock_hash")};
+            // A different marker, restored or proven, is never replaced.
+            if (p.not_executed && !(*p.not_executed == consumer)) return;
+            auto payload{Bytes(value, "consumer_certified_payload", flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES + 1024)};
+            const auto evidence{Bytes(value, "consumer_outcome_evidence", flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES)};
+            const auto proof{VerifyEntry(pins, payload)};
+            if (!FlowMeshProvesNotExecuted(proof.entry, evidence, p.action, consumer)) return;
+            MarkNotExecuted(p, consumer, std::move(payload), endpoint);
+        } catch (...) {
+        }
+    }
+    /** Records a proof just checked by TryProveNotExecuted or
+     * ReproveNotExecuted, then makes its marker durable with a synchronous
+     * outbox write. If that write fails, every label is withdrawn and a
+     * marker this call added is dropped (the action is then only unknown, as
+     * before; resending it is harmless because it can never execute). */
+    void MarkNotExecuted(Pending& p, const flowmesh::ClientConsumerRef& consumer, std::vector<unsigned char> payload,
+                         const size_t endpoint)
+    {
+        const bool had_marker{p.not_executed.has_value()};
+        p.receipt = {};
+        p.receipt.action_id = p.action.Id();
+        p.receipt.state = "rejected";
+        p.receipt.endpoint = m_endpoints.at(endpoint).url;
+        p.receipt.outcome = FlowMeshNotExecutedOutcome(consumer.action_id, consumer.microblock_sequence, consumer.microblock_hash);
+        p.receipt.outcome_verified = true;
+        p.receipt.reason_code = p.receipt.outcome->reason_code;
+        p.receipt.reason = "Proven not executed: certified action " + consumer.action_id.GetHex() +
+                           " used this account sequence in microblock #" + std::to_string(consumer.microblock_sequence) +
+                           "; this action can never execute and will not be resubmitted";
+        if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
+        p.not_executed = consumer;
+        RetainProof(p, p.consumer_proof, payload);
+        m_action_polls.Remove({p.market, p.action.Id()});
+        // The consumer changed this account at M: a join needs state at M.
+        m_own_certified_through.Record(p.market, consumer.microblock_sequence);
+        if (const auto cache{m_cache.find(p.market)}; cache != m_cache.end() &&
+            consumer.microblock_sequence > cache->second.verified.certified.entry.sequence) cache->second.fresh.reset();
+        try {
+            Save();
+        } catch (const std::exception& e) {
+            WithdrawVerifiedLabels(p.receipt);
+            if (!had_marker) {
+                p.not_executed.reset();
+                p.consumer_proof.clear();
+            }
+            p.receipt.reason = std::string{"Not-executed proof could not be saved; outcome unknown: "} + e.what();
+        }
+    }
+    /** After a restart a retained marker forbids resending but is not a
+     * verified outcome. At most one re-proof per process: one bounded opt-in
+     * 'action' read of the consumer X from one endpoint that advertises
+     * outcomes, charged to the automatic status budget, never failed over.
+     * X's certified inclusion at exactly (M, hash) plus its outcome evidence
+     * proves again that X used this action's sequence. */
+    void ReproveNotExecuted(Pending& p, const flowmesh::ClientEvidencePins& pins)
+    {
+        if (!p.not_executed || ProvenNotExecuted(p) || p.not_executed_reproof_asked || m_endpoints.empty()) return;
+        const auto now{std::chrono::steady_clock::now()};
+        std::optional<size_t> endpoint;
+        for (size_t attempt{0}; attempt < m_endpoints.size() && !endpoint; ++attempt) {
+            const size_t candidate{(m_selected + attempt) % m_endpoints.size()};
+            if (m_action_outcome.at(candidate) && now >= m_retry_after.at(candidate)) endpoint = candidate;
+        }
+        if (!endpoint || !m_action_polls.TryChargeAttempt(now)) return;
+        p.not_executed_reproof_asked = true;
+        const auto consumer{*p.not_executed};
+        try {
+            UniValue params{UniValue::VOBJ};
+            params.pushKV("market_id", p.market.GetHex());
+            params.pushKV("action_id", consumer.action_id.GetHex());
+            params.pushKV("outcome", true);
+            UniValue request{UniValue::VOBJ};
+            request.pushKV("method", "action");
+            request.pushKV("params", std::move(params));
+            const auto reply{m_https.Request(m_endpoints[*endpoint], "/flowmesh/v1", request.write(), CLIENT_REQUEST_TIMEOUT,
+                                             CLIENT_ACTION_OUTCOME_MAX_REPLY)};
+            if (!reply.response_received || reply.status != 200) return;
+            UniValue parsed;
+            if (!parsed.read(reply.body) || !parsed.isObject() || !parsed["ok"].isTrue()) return;
+            const auto& result{parsed["result"]};
+            if (Id(result, "action_id") != consumer.action_id || Text(result, "receipt_state", 32) != "certified_inclusion" ||
+                Id(result, "microblock_hash") != consumer.microblock_hash ||
+                Number(result, "microblock_sequence") != consumer.microblock_sequence) return;
+            auto payload{Bytes(result, "certified_payload", flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES + 1024)};
+            const auto evidence{Bytes(result, "outcome_evidence", flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES)};
+            const auto proof{VerifyEntry(pins, payload)};
+            if (!FlowMeshProvesNotExecuted(proof.entry, evidence, p.action, consumer)) return;
+            MarkNotExecuted(p, consumer, std::move(payload), *endpoint);
+        } catch (const std::exception&) {
+            // The marker stays; the receipt stays unknown.
+        }
     }
     //! Verifies an endpoint's outcome evidence against an entry whose
     //! certificate was just verified under local B3 authority, and derives
@@ -1914,7 +2077,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     Receipt QueryAction(Pending& p, bool automatic = false)
     {
         const auto pins{RecheckActionAuthority(p)};
-        if (p.receipt.certificate_verified) return p.receipt;
+        if (p.receipt.certificate_verified || ProvenNotExecuted(p)) return p.receipt;
+        if (p.not_executed) {
+            ReproveNotExecuted(p, pins);
+            if (ProvenNotExecuted(p)) return p.receipt;
+        }
         if (!automatic) p.automatic_endpoint.reset();
         UniValue params{UniValue::VOBJ}; params.pushKV("market_id", p.market.GetHex()); params.pushKV("action_id", p.action.Id().GetHex());
         Call("action", params, [&](const UniValue& value, size_t endpoint) {
@@ -1923,6 +2090,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             // Only an endpoint that advertised it receives "outcome".
             if (m_action_outcome.at(endpoint)) endpoint_params.pushKV("outcome", true);
         });
+        // A proof saved its own marker (or withdrew it) in MarkNotExecuted.
+        if (ProvenNotExecuted(p)) return p.receipt;
+        if (p.not_executed && !p.receipt.certificate_verified) {
+            p.receipt.reason = std::string{CLIENT_NOT_EXECUTED_RETAINED} + ". " + p.receipt.reason;
+        }
         if (!p.receipt.certificate_verified) m_action_polls.MarkObserved({p.market, p.action.Id()});
         // A non-certifying observation changes only the receipt, which
         // restart never reads.
@@ -1938,6 +2110,16 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 WithdrawVerifiedLabels(p.receipt); p.receipt.reason = e.what();
             }
             if (!p.receipt.certificate_verified) p.receipt.reason = "Previously verified inclusion is retained; fresh proof required for current authority, and this action will not be resubmitted";
+            return p.receipt;
+        }
+        if (p.not_executed) {
+            // Proven never to execute: never resent, exactly like a
+            // previously certified action.
+            try { QueryAction(p); }
+            catch (const std::exception& e) {
+                if (!ProvenNotExecuted(p)) p.receipt.reason = e.what();
+            }
+            if (!ProvenNotExecuted(p) && !p.receipt.certificate_verified) p.receipt.reason = CLIENT_NOT_EXECUTED_RETAINED;
             return p.receipt;
         }
         const auto pins{Pins(p.market)};
@@ -2086,7 +2268,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         const auto it{m_pending.find(key)};
         if (it == m_pending.end()) { outcome("not_retained"); return std::nullopt; }
         auto& p{it->second};
-        const bool verified_before{p.receipt.certificate_verified};
+        const bool verified_before{p.receipt.certificate_verified || ProvenNotExecuted(p)};
         bool applied{false};
         try {
             const auto pins{RecheckActionAuthority(p)};
@@ -2108,11 +2290,19 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 outcome("already_verified");
                 return p.receipt;
             }
+            if (ProvenNotExecuted(p)) {
+                // Proven not executed meanwhile: final, never replaced.
+                m_action_polls.Remove(key);
+                outcome("already_verified");
+                return p.receipt;
+            }
             ApplyActionResult(p, pins, result, endpoint);
             applied = true;
             EndpointResult(endpoint, true, {}, /*names_active=*/false);
             if (p.receipt.certificate_verified) {
                 Save();
+            } else if (ProvenNotExecuted(p)) {
+                // MarkNotExecuted already wrote its marker synchronously.
             } else {
                 m_action_polls.MarkObserved(key);
                 // A non-certifying observation changes only the receipt.
@@ -2131,7 +2321,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             // previously_certified stays set in memory, so this action is still
             // never resent.
             p.receipt.reason = e.what();
-            if (p.previously_certified || p.receipt.certificate_verified) WithdrawVerifiedLabels(p.receipt);
+            if (p.previously_certified || p.receipt.certificate_verified || p.not_executed) WithdrawVerifiedLabels(p.receipt);
             outcome(applied ? "save_failed" : "authority_failed");
             return p.receipt;
         }
@@ -2334,7 +2524,11 @@ public:
                     Fail("A different retained action already uses this account sequence; resolve its outcome before signing another instruction");
             }
             if (m_pending.size() >= CLIENT_MAX_ACTIONS) {
-                const auto completed{std::find_if(m_pending.begin(), m_pending.end(), [](const auto& value) { return value.second.receipt.certificate_verified; })};
+                // Evictable: a verified inclusion, or an action proven never to
+                // execute (its marker needs no row once nothing can resend it).
+                const auto completed{std::find_if(m_pending.begin(), m_pending.end(), [](const auto& value) {
+                    return value.second.receipt.certificate_verified || value.second.not_executed.has_value();
+                })};
                 if (completed == m_pending.end()) Fail("Pending action limit reached; unresolved signed objects are not evicted");
                 m_action_polls.Remove(completed->first);
                 m_pending.erase(completed);
@@ -2386,20 +2580,28 @@ public:
                 UpgradeOutcome(it->second);
                 return it->second.receipt;
             }
+            if (ProvenNotExecuted(it->second)) {
+                m_action_polls.Remove(it->first);
+                return it->second.receipt;
+            }
             auto refresh = [&](Pending& pending, bool automatic) {
                 try { QueryAction(pending, automatic); } catch (const std::exception& e) {
                     pending.receipt.reason = e.what();
-                    if (pending.previously_certified) WithdrawVerifiedLabels(pending.receipt);
+                    if (pending.previously_certified || pending.not_executed) WithdrawVerifiedLabels(pending.receipt);
                 }
             };
             if (retry) {
                 refresh(it->second, false);
                 // A fresh status lookup already occurred. Do not repeat it in
-                // Send's no-resubmit path for a previously certified action.
-                if (!it->second.receipt.certificate_verified && !it->second.previously_certified) return Send(it->second);
-                if (!it->second.receipt.certificate_verified && it->second.previously_certified)
-                    it->second.receipt.reason = "Previously verified inclusion is retained; fresh proof required for current authority, and this action will not be resubmitted";
-                return it->second.receipt;
+                // Send's no-resubmit path for a previously certified or
+                // not-executed action.
+                auto& p{it->second};
+                if (!p.receipt.certificate_verified && !p.previously_certified && !p.not_executed) return Send(p);
+                if (!p.receipt.certificate_verified && p.previously_certified)
+                    p.receipt.reason = "Previously verified inclusion is retained; fresh proof required for current authority, and this action will not be resubmitted";
+                else if (!p.receipt.certificate_verified && p.not_executed && !ProvenNotExecuted(p))
+                    p.receipt.reason = CLIENT_NOT_EXECUTED_RETAINED;
+                return p.receipt;
             }
             if (!m_action_polls.Demand(it->first)) Fail("Automatic status demand bound reached; retained instruction preserved");
             bool own_refresh{false};
@@ -2410,17 +2612,18 @@ public:
                 if (work != m_pending.end()) {
                     own_refresh = *key == it->first;
                     refresh(work->second, true);
-                    if (work->second.receipt.certificate_verified) m_action_polls.Remove(*key);
+                    if (work->second.receipt.certificate_verified || ProvenNotExecuted(work->second)) m_action_polls.Remove(*key);
                 } else m_action_polls.Remove(*key);
             }
             auto receipt{it->second.receipt};
-            if (!receipt.certificate_verified && !m_action_polls.HasObservation(it->first))
+            const bool settled{receipt.certificate_verified || ProvenNotExecuted(it->second)};
+            if (!settled && !m_action_polls.HasObservation(it->first))
                 receipt.reason = "Status read pending/coalesced; retained submission observation only. " + receipt.reason;
-            else if (!receipt.certificate_verified && !own_refresh)
+            else if (!settled && !own_refresh)
                 receipt.reason = "Status read coalesced; retained endpoint observation, not a fresh response. " + receipt.reason;
             return receipt;
         } catch (const std::exception& e) {
-            if (it->second.previously_certified) WithdrawVerifiedLabels(it->second.receipt);
+            if (it->second.previously_certified || it->second.not_executed) WithdrawVerifiedLabels(it->second.receipt);
             it->second.receipt.reason = e.what();
             out.reason = e.what(); return out;
         }
