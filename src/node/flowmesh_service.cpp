@@ -2402,7 +2402,8 @@ std::optional<flowmesh::ClientEventCursor> FlowMeshService::ClientEventCursor() 
 
 FlowMeshLocalSubmit FlowMeshService::SubmitLocalActionChecked(const flowmesh::MarketId& market_id,
                                                               const flowmesh::Action& action,
-                                                              const flowmesh::ClientNoticeOrigin origin)
+                                                              const flowmesh::ClientNoticeOrigin origin,
+                                                              const std::string& submitter)
 {
     FlowMeshLocalSubmit out;
     const auto refuse = [&](std::string error) {
@@ -2428,7 +2429,7 @@ FlowMeshLocalSubmit FlowMeshService::SubmitLocalActionChecked(const flowmesh::Ma
         m_impl->GenesisCheckpointPending(market_id)) {
         return refuse("FlowMesh genesis checkpoint is not yet certified and connected");
     }
-    const auto submitted{runtime->SubmitLocalActionChecked(market_id, action, origin)};
+    const auto submitted{runtime->SubmitLocalActionChecked(market_id, action, origin, submitter)};
     out.admission = submitted.admission;
     out.cursor_before = submitted.cursor_before;
     if (!submitted.queued || *submitted.queued == flowmesh::QueueResult::ACCEPTED) return out;

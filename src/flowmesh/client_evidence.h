@@ -13,8 +13,10 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace flowmesh {
@@ -25,6 +27,12 @@ inline constexpr size_t CLIENT_EVENT_CAPACITY{2048};
 inline constexpr size_t CLIENT_EVENT_PAGE_MAX{256};
 //! Per notice origin (ClientNoticeOrigin): each origin has its own ring.
 inline constexpr size_t CLIENT_NOTICE_CAPACITY{2048};
+//! PUBLIC ring only: at most this many notices per requesting identity
+//! (ClientActionNotice::submitter; notices whose identity is unknown share
+//! one such share). An identity's own oldest notice makes room for its next,
+//! so turning the ring over takes CLIENT_NOTICE_CAPACITY /
+//! CLIENT_NOTICE_PER_SUBMITTER identities, never one.
+inline constexpr size_t CLIENT_NOTICE_PER_SUBMITTER{64};
 //! Concurrent event watches (ClientEventLog::WaitEvents) per log. Defence in
 //! depth only: every caller bounds its own watchers far below this.
 inline constexpr size_t CLIENT_EVENT_MAX_WATCHERS{64};
@@ -148,6 +156,11 @@ struct ClientActionNotice {
     std::optional<ClientConsumerRef> consumed_by;
     //! The ring it is kept in.
     ClientNoticeOrigin origin{ClientNoticeOrigin::PUBLIC};
+    //! PUBLIC only: the requesting client identity whose attempt caused it
+    //! (an IPv4 address, or an IPv6 /64), empty when unknown. Picks the
+    //! notice's share of the PUBLIC ring (CLIENT_NOTICE_PER_SUBMITTER);
+    //! memory-only and never in any reply.
+    std::string submitter;
     //! Append order across both rings, set by AppendNotices.
     uint64_t serial{0};
 };
@@ -252,7 +265,9 @@ public:
     /** Appends local notices in order under one lock, with at most one
      * wakeup and only while an include_notices wait exists. Each goes to the
      * bounded ring of its origin (CLIENT_NOTICE_CAPACITY each), so notices of
-     * one origin never evict the other's; never touches the v1 events. */
+     * one origin never evict the other's; in the PUBLIC ring, a submitter at
+     * its share (CLIENT_NOTICE_PER_SUBMITTER) evicts its own oldest notice,
+     * never another's. Never touches the v1 events. */
     void AppendNotices(std::vector<ClientActionNotice> notices);
     std::optional<ClientActionNotice> NewestNotice(const MarketId& market, const uint256& action_id) const;
     //! The newest notice only while it is newer than every retained event of
@@ -310,9 +325,12 @@ private:
     mutable size_t m_waiters{0};
     std::deque<ClientEvent> m_events;
     // Notices: one separate ring per origin, their own change counter and
-    // waiter count. m_notice_serial orders appends across both rings.
+    // waiter count. m_notice_serial orders appends across both rings. The
+    // PUBLIC ring is keyed by serial (oldest first), with each submitter's
+    // retained serials, oldest first; both hold at most CLIENT_NOTICE_CAPACITY.
     std::deque<ClientActionNotice> m_notices;
-    std::deque<ClientActionNotice> m_public_notices;
+    std::map<uint64_t, ClientActionNotice> m_public_notices;
+    std::map<std::string, std::deque<uint64_t>> m_public_by_submitter;
     uint64_t m_notice_serial{0};
     uint64_t m_notice_changes{0};
     mutable size_t m_notice_waiters{0};

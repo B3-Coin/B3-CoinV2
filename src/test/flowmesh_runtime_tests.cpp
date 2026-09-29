@@ -9967,6 +9967,108 @@ BOOST_AUTO_TEST_CASE(prune_publishes_local_drop_notice_with_consumer_from_same_e
     }
 }
 
+BOOST_AUTO_TEST_CASE(public_notice_flood_from_other_identities_keeps_a_remote_clients_proofs)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "notice_submitter_share"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true;
+    // The slot's proposer certifies X; node L holds only the client's A.
+    const uint32_t proposer_seat{flowmesh::ProductionProposerSeatIndex(1, 0, f.seats.seats.Size())};
+    size_t proposer{0};
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        if (f.seats.secrets[i].GetPublicKey() == f.seats.seats.members[proposer_seat].key.Key()) proposer = i;
+    }
+    const size_t local{(proposer + 1) % f.runtimes.size()};
+    f.network.SetFilter([&](size_t from, size_t, const flowmesh::WireMessage& wire) {
+        if (from == local && wire.kind == flowmesh::WireMessageKind::ACTION) return false;
+        return f.Observe(wire);
+    });
+    auto& runtime{*f.runtimes[local]};
+    const std::string client{"198.51.100.7"};
+    CKey key;
+    key.MakeNewKey(true);
+    const auto config{f.initial.ConfigId()};
+    const auto queued{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_BID)};
+    const auto consumer{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_ASK)};
+    // A remote client queues A through this node's public API.
+    const auto submitted{runtime.SubmitLocalActionChecked(f.market, queued, flowmesh::ClientNoticeOrigin::PUBLIC, client)};
+    BOOST_REQUIRE(submitted.queued && *submitted.queued == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_REQUIRE_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 1U);
+    // Another identity then submits more open-sequence actions than this
+    // node remembers submitters for (1,024 per market). Each is noted before
+    // it is queued, whatever the local queue's budget then answers; the
+    // identity replaces only its own.
+    const std::string churner{"203.0.113.9"};
+    for (int k{0}; k < 20; ++k) {
+        CKey churn_key;
+        churn_key.MakeNewKey(true);
+        for (uint64_t n{0}; n < 60; ++n) {
+            const auto churn{SignedAction(churn_key, f.domain, config, n, flowmesh::ActionType::CANCEL_ASK)};
+            BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, churn, flowmesh::ClientNoticeOrigin::PUBLIC, churner)
+                              .admission.kind == node::FlowMeshLocalAdmission::Kind::ENQUEUE);
+        }
+    }
+    f.Drain();
+    BOOST_REQUIRE(f.runtimes[proposer]->SubmitLocalAction(f.market, consumer) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    f.block_commits = false;
+    BOOST_REQUIRE(Settle(f, [&] { return f.AllAt(2); }));
+    f.Drain();
+    // A's pool-drop notice is kept for the client that queued it.
+    const auto dropped{runtime.NewestClientNotice(f.market, queued.Id())};
+    BOOST_REQUIRE(dropped);
+    BOOST_CHECK(dropped->code == flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED);
+    BOOST_CHECK(dropped->origin == flowmesh::ClientNoticeOrigin::PUBLIC);
+    BOOST_CHECK_EQUAL(dropped->submitter, client);
+    BOOST_REQUIRE(dropped->consumed_by);
+    // The same client's late attempt at the used sequence.
+    const auto late{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::WITHDRAW)};
+    BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, late, flowmesh::ClientNoticeOrigin::PUBLIC, client)
+                      .admission.code == flowmesh::ActionReasonCode::STALE_SEQUENCE);
+
+    // Other identities flood: the same one sends more than a whole ring of
+    // authenticated attempts far ahead, from a fresh key; 24 IPv6 /64s send
+    // 96 each; a third sends made-up public deposits, which earn no notice.
+    CKey flood;
+    flood.MakeNewKey(true);
+    uint64_t sequence{1000};
+    const auto attempt = [&](const std::string& who) {
+        const auto far{SignedAction(flood, f.domain, config, sequence++, flowmesh::ActionType::CANCEL_ASK)};
+        BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, far, flowmesh::ClientNoticeOrigin::PUBLIC, who)
+                          .admission.code == flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE);
+    };
+    for (size_t n{0}; n < flowmesh::CLIENT_NOTICE_CAPACITY + 64; ++n) attempt("203.0.113.9");
+    for (int prefix{0}; prefix < 24; ++prefix) {
+        for (int n{0}; n < 96; ++n) attempt(strprintf("ipv6/64:20010db8%08x", prefix));
+    }
+    for (uint32_t n{0}; n < 256; ++n) {
+        const auto made_up{Deposit(COutPoint{f.outpoint.hash, 5000 + n})};
+        BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, made_up, flowmesh::ClientNoticeOrigin::PUBLIC,
+                                                       "203.0.113.10").admission.code ==
+                      flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+        BOOST_CHECK(!runtime.NewestClientNotice(f.market, made_up.Id()));
+    }
+    // Each flooding identity keeps only its newest share.
+    BOOST_CHECK(!runtime.NewestClientNotice(
+        f.market, SignedAction(flood, f.domain, config, 1000, flowmesh::ActionType::CANCEL_ASK).Id()));
+    BOOST_CHECK(runtime.NewestClientNotice(
+        f.market, SignedAction(flood, f.domain, config, sequence - 1, flowmesh::ActionType::CANCEL_ASK).Id()));
+    // Both of the client's proofs survive, and the opt-in 'action' reply's
+    // lookup still finds them.
+    for (const auto& [action, code] : {std::pair{queued.Id(), flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED},
+                                       std::pair{late.Id(), flowmesh::ActionReasonCode::STALE_SEQUENCE}}) {
+        const auto kept{runtime.NewestClientNoticeIfNewer(f.market, action)};
+        BOOST_REQUIRE(kept);
+        BOOST_CHECK(kept->code == code);
+        BOOST_CHECK_EQUAL(kept->submitter, client);
+        BOOST_REQUIRE(kept->consumed_by);
+        BOOST_CHECK(kept->consumed_by->action_id == consumer.Id());
+    }
+}
+
 BOOST_AUTO_TEST_CASE(public_submission_notices_never_evict_node_notices)
 {
     PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "notice_origin"};
@@ -9985,13 +10087,17 @@ BOOST_AUTO_TEST_CASE(public_submission_notices_never_evict_node_notices)
     const auto loser{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_BID)};
     BOOST_CHECK(runtime.SubmitLocalActionChecked(f.market, loser, flowmesh::ClientNoticeOrigin::NODE).admission.code ==
                 flowmesh::ActionReasonCode::STALE_SEQUENCE);
-    // Unauthenticated public deposits for made-up outpoints, each refused
-    // with a notice, more than a whole ring of them.
+    // More than a whole ring of public notices: authenticated attempts far
+    // ahead of the certified sequence, from fresh keys.
+    CKey flood;
+    flood.MakeNewKey(true);
     for (uint32_t n{0}; n < flowmesh::CLIENT_NOTICE_CAPACITY + 64; ++n) {
-        const auto refused{runtime.SubmitLocalActionChecked(f.market, Deposit(COutPoint{f.outpoint.hash, 1000 + n}))};
-        BOOST_REQUIRE(refused.admission.code == flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+        const auto far{SignedAction(flood, f.domain, config, 1000 + n, flowmesh::ActionType::CANCEL_ASK)};
+        BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, far).admission.code ==
+                      flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE);
     }
-    BOOST_CHECK(!runtime.NewestClientNotice(f.market, Deposit(COutPoint{f.outpoint.hash, 1000}).Id())); // evicted
+    BOOST_CHECK(!runtime.NewestClientNotice(
+        f.market, SignedAction(flood, f.domain, config, 1000, flowmesh::ActionType::CANCEL_ASK).Id())); // evicted
     const auto kept{runtime.NewestClientNotice(f.market, loser.Id())};
     BOOST_REQUIRE(kept);
     BOOST_CHECK(kept->code == flowmesh::ActionReasonCode::STALE_SEQUENCE);
@@ -10018,12 +10124,17 @@ BOOST_AUTO_TEST_CASE(local_factless_deposit_refused_not_relayed_but_remote_still
                       "FlowMesh deposit has no anchored facts at the current B3 anchor; this attempt was not queued");
     f.Drain();
     // Bound to the reply: no v1 event another attempt could inherit, no pool
-    // entry, no relay; the notice records the observation.
+    // entry, no relay. A public deposit carries no credential, so its
+    // refusal earns no notice either; this node's own deposit's does.
     BOOST_CHECK(runtime.ClientEvents(before, f.market, std::nullopt).events.empty());
     for (const auto& node : f.runtimes) BOOST_CHECK_EQUAL(node->MarketStatus(f.market)->pending_actions, 0U);
+    BOOST_CHECK(!runtime.NewestClientNotice(f.market, factless.Id()));
+    const auto own{runtime.SubmitLocalActionChecked(f.market, factless, flowmesh::ClientNoticeOrigin::NODE)};
+    BOOST_CHECK(own.admission.code == flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
     const auto notice{runtime.NewestClientNotice(f.market, factless.Id())};
     BOOST_REQUIRE(notice);
     BOOST_CHECK(notice->code == flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+    BOOST_CHECK(notice->origin == flowmesh::ClientNoticeOrigin::NODE);
     // A deposit with anchored facts is queued as before.
     const auto with_facts{runtime.SubmitLocalActionChecked(f.market, Deposit(f.outpoint))};
     BOOST_CHECK(with_facts.queued && *with_facts.queued == flowmesh::QueueResult::ACCEPTED);

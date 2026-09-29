@@ -137,9 +137,25 @@ origin has its own ring of 2,048.
 Public traffic can no longer evict the notices this node's own not-executed
 proofs need.
 
-Public API clients' notices share the public ring, which public traffic can
-still turn over. Their proofs then read "unknown", which is safe. An
-already-included resubmission appends no notice at all.
+Inside the public ring, each requesting identity (an IPv4 address, or an
+IPv6 /64, as the API admission budgets count them) holds at most 64
+notices. At that share its own oldest notice makes room for its next, never
+another identity's. Notices whose identity is unknown share one such share.
+
+The identity is the client that first queued the action, so the worker's
+recheck and pool-drop notices count against it too. The runtime remembers it
+for at most 1,024 public ActionIds per market and 64 per identity; an
+identity at 64 replaces its own oldest, so one identity cannot push
+another's out either. A forgotten action's notices use the unknown share.
+
+A public deposit refused because its outpoint has no anchored facts appends
+no notice: it carries no credential, and the refusal is already in the
+submit reply.
+
+One identity therefore cannot turn the public ring over; that takes at
+least 32 identities flooding at once. A remote client's proof then reads
+"unknown", which is safe. An already-included resubmission appends no
+notice at all.
 
 ## Foreground latency of outcome re-proofs
 

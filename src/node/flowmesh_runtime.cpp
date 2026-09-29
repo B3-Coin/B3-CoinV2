@@ -252,6 +252,58 @@ struct FlowMeshRuntime::Market {
     {
         return node_origin.contains(id) ? flowmesh::ClientNoticeOrigin::NODE : flowmesh::ClientNoticeOrigin::PUBLIC;
     }
+    //! The requesting identity that first queued each PUBLIC-origin action
+    //! (see ClientActionNotice::submitter), at most PUBLIC_SUBMITTER_ACTIONS
+    //! in all and CLIENT_NOTICE_PER_SUBMITTER per identity: an identity at
+    //! its share replaces its own oldest, otherwise the oldest overall goes,
+    //! so one identity never evicts another's. A later submission of the
+    //! same bytes never moves an action. The action's worker-recheck and
+    //! pool-drop notices count against that identity's share of the PUBLIC
+    //! ring; once evicted here, against the shared share of unknown
+    //! identities.
+    static constexpr size_t PUBLIC_SUBMITTER_ACTIONS{1024};
+    struct PublicSubmission {
+        uint256 action_id;
+        std::string submitter;
+    };
+    uint64_t public_submission_serial{0};
+    std::map<uint64_t, PublicSubmission> public_submissions; // oldest first
+    std::map<uint256, uint64_t> public_submission_serials;
+    std::map<std::string, std::deque<uint64_t>> public_submissions_by_submitter;
+    void NotePublicSubmitter(const uint256& id, const std::string& submitter)
+    {
+        if (submitter.empty() || public_submission_serials.contains(id)) return;
+        auto& own{public_submissions_by_submitter[submitter]};
+        if (own.size() >= flowmesh::CLIENT_NOTICE_PER_SUBMITTER) {
+            const auto oldest{public_submissions.find(own.front())};
+            public_submission_serials.erase(oldest->second.action_id);
+            public_submissions.erase(oldest);
+            own.pop_front();
+        }
+        const uint64_t serial{++public_submission_serial};
+        own.push_back(serial);
+        public_submissions.emplace(serial, PublicSubmission{id, submitter});
+        public_submission_serials.emplace(id, serial);
+        if (public_submissions.size() > PUBLIC_SUBMITTER_ACTIONS) {
+            // The oldest overall is its submitter's oldest.
+            const auto oldest{public_submissions.begin()};
+            const auto owner{public_submissions_by_submitter.find(oldest->second.submitter)};
+            owner->second.pop_front();
+            if (owner->second.empty()) public_submissions_by_submitter.erase(owner);
+            public_submission_serials.erase(oldest->second.action_id);
+            public_submissions.erase(oldest);
+        }
+    }
+    //! A queued action's notice: its ring and, for PUBLIC, its submitter.
+    void TagNotice(flowmesh::ClientActionNotice& notice) const
+    {
+        notice.origin = NoticeOrigin(notice.action_id);
+        notice.submitter.clear();
+        if (notice.origin != flowmesh::ClientNoticeOrigin::PUBLIC) return;
+        if (const auto it{public_submission_serials.find(notice.action_id)}; it != public_submission_serials.end()) {
+            notice.submitter = public_submissions.at(it->second).submitter;
+        }
+    }
     bool ready{true};
     bool paused{false};
     uint32_t round{0};
@@ -1739,7 +1791,7 @@ bool CommitCertified(Market& market,
         if (const auto bytes{flowmesh::EncodeProductionActionPayload(dropped)}) notice.signed_action_hash = Hash(*bytes);
         notice.code = flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED;
         notice.next_account_sequence = market.state.NextSequence(dropped.signer);
-        notice.origin = market.NoticeOrigin(notice.action_id);
+        market.TagNotice(notice);
         if (committed_item) {
             if (const auto consumer{FlowMeshRecentCertifiedWindow::ConsumerIn(*committed_item, dropped.signer,
                                                                                dropped.sequence)}) {
@@ -3441,7 +3493,7 @@ std::optional<flowmesh::ClientActionNotice> FlowMeshRuntime::NewestClientNoticeI
 
 FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
     const flowmesh::MarketId& market_id, const flowmesh::Action& action,
-    const flowmesh::ClientNoticeOrigin origin)
+    const flowmesh::ClientNoticeOrigin origin, const std::string& submitter)
 {
     FlowMeshLocalSubmitResult out;
     const auto payload{flowmesh::EncodeProductionActionPayload(action)};
@@ -3475,9 +3527,13 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
         // pooled action may still execute, so it is never refused here.
         pooled = it->second->pool.ContainsExact(action);
         if (!pooled) out.admission = DecideLocal(*it->second, action);
+        const auto tag = [&](flowmesh::ClientActionNotice& value) {
+            value.origin = origin;
+            if (origin == flowmesh::ClientNoticeOrigin::PUBLIC) value.submitter = submitter;
+        };
         if (out.admission.kind != FlowMeshLocalAdmission::Kind::ENQUEUE) {
             notice = LocalNotice(*it->second, action, out.admission, *payload);
-            notice->origin = origin;
+            tag(*notice);
             domain = it->second->domain;
             config_id = it->second->state.ConfigId();
         } else {
@@ -3490,12 +3546,20 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
             trace.seat_set_hash = it->second->seats.set_hash;
             deposits = it->second->deposits;
             // Kept for a facts refusal's notice (built outside the lock).
-            if (action.IsDeposit() && !pooled) {
+            // Only this node's own deposits earn one: a public deposit has no
+            // credential, so its outpoint could be made up by anyone, and the
+            // refusal is already bound to the submit reply.
+            if (action.IsDeposit() && !pooled && origin == flowmesh::ClientNoticeOrigin::NODE) {
                 notice = LocalNotice(*it->second, action, out.admission, *payload);
-                notice->origin = origin;
+                tag(*notice);
             }
-            // Its later worker and drop notices keep this origin's ring.
-            if (origin == flowmesh::ClientNoticeOrigin::NODE) it->second->NoteNodeOrigin(action.Id());
+            // Its later worker and drop notices keep this origin's ring and,
+            // for PUBLIC, the submitter's share of it.
+            if (origin == flowmesh::ClientNoticeOrigin::NODE) {
+                it->second->NoteNodeOrigin(action.Id());
+            } else {
+                it->second->NotePublicSubmitter(action.Id(), submitter);
+            }
         }
     }
     if (out.admission.kind == FlowMeshLocalAdmission::Kind::ENQUEUE && action.IsDeposit() && !pooled) {
@@ -3508,10 +3572,13 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
         if (!facts) {
             out.admission.kind = FlowMeshLocalAdmission::Kind::REFUSE;
             out.admission.code = flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE;
-            notice->code = out.admission.code;
-            // Bound to this reply and a notice only: no v1 event, which any
-            // later attempt for the same outpoint could otherwise inherit.
-            m_client_events.AppendNotices({std::move(*notice)});
+            // Bound to this reply (and, for this node's own deposit, a
+            // notice) only: no v1 event, which any later attempt for the same
+            // outpoint could otherwise inherit.
+            if (notice) {
+                notice->code = out.admission.code;
+                m_client_events.AppendNotices({std::move(*notice)});
+            }
             return out;
         }
         notice.reset();
@@ -4872,7 +4939,7 @@ void FlowMeshRuntime::HandleAction(
             }
             // The refusal event (if any) first, so the notice is newer.
             auto notice{LocalNotice(market, *action, admission, message.payload)};
-            notice.origin = market.NoticeOrigin(notice.action_id);
+            market.TagNotice(notice);
             market.client_events.AppendNotices({std::move(notice)});
             return;
         }

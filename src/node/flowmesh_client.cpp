@@ -378,10 +378,18 @@ public:
     Receipt Submit(const uint256& id, const flowmesh::Action& action,
                    std::chrono::milliseconds wait = std::chrono::milliseconds{0}) override
     {
+        return SubmitFrom(id, action, {});
+    }
+    /** Submit on behalf of `submitter`, the public request's client identity
+     * (FlowMeshActionWaitSlots::PeerKey), which bounds that client's share
+     * of the public notice ring; unused for this node's own submissions. */
+    Receipt SubmitFrom(const uint256& id, const flowmesh::Action& action, const std::string& submitter)
+    {
         Receipt out; out.action_id = action.Id();
         // Public API traffic only ever fills the public notice ring.
-        const auto submitted{m_service.SubmitLocalActionChecked(
-            id, action, m_public_api ? flowmesh::ClientNoticeOrigin::PUBLIC : flowmesh::ClientNoticeOrigin::NODE)};
+        const auto submitted{m_public_api
+            ? m_service.SubmitLocalActionChecked(id, action, flowmesh::ClientNoticeOrigin::PUBLIC, submitter)
+            : m_service.SubmitLocalActionChecked(id, action, flowmesh::ClientNoticeOrigin::NODE)};
         if (submitted.refused) { out.state = "rejected"; out.reason = submitted.error; return out; }
         switch (submitted.admission.kind) {
         case FlowMeshLocalAdmission::Kind::ENQUEUE: break;
@@ -1028,7 +1036,8 @@ public:
             if (!market) Fail("Unknown market");
             if (!action->IsDeposit() && !flowmesh::SchnorrActionAuthenticator(market->domain, market->execution_config_id).Authenticate(*action))
                 Fail("Action authentication failed for this chain/domain/market configuration");
-            return reply(m_local.Submit(id, *action));
+            // The client's identity bounds its share of the public notices.
+            return reply(m_local.SubmitFrom(id, *action, FlowMeshActionWaitSlots::PeerKey(http.remote_address)));
         }
         if (method == "action") {
             // Disabled, the contract is exactly the previous one, in which

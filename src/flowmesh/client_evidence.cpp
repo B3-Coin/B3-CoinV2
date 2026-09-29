@@ -223,6 +223,7 @@ void ClientEventLog::Reset(const uint256& instance_id)
         m_events.clear();
         m_notices.clear();
         m_public_notices.clear();
+        m_public_by_submitter.clear();
         ++m_notice_changes;
         SignalWatchersLocked(std::nullopt, signalled);
     }
@@ -263,9 +264,28 @@ void ClientEventLog::AppendNotices(std::vector<ClientActionNotice> notices)
         for (auto& notice : notices) {
             notice.after_event_id = m_last_event_id;
             notice.serial = ++m_notice_serial;
-            auto& ring{notice.origin == ClientNoticeOrigin::NODE ? m_notices : m_public_notices};
-            ring.push_back(std::move(notice));
-            if (ring.size() > CLIENT_NOTICE_CAPACITY) ring.pop_front();
+            if (notice.origin == ClientNoticeOrigin::NODE) {
+                notice.submitter.clear();
+                m_notices.push_back(std::move(notice));
+                if (m_notices.size() > CLIENT_NOTICE_CAPACITY) m_notices.pop_front();
+                continue;
+            }
+            // A submitter at its share makes room from its own notices.
+            auto& own{m_public_by_submitter[notice.submitter]};
+            if (own.size() >= CLIENT_NOTICE_PER_SUBMITTER) {
+                m_public_notices.erase(own.front());
+                own.pop_front();
+            }
+            own.push_back(notice.serial);
+            m_public_notices.emplace(notice.serial, std::move(notice));
+            if (m_public_notices.size() > CLIENT_NOTICE_CAPACITY) {
+                // The ring's oldest is its submitter's oldest.
+                const auto oldest{m_public_notices.begin()};
+                const auto owner{m_public_by_submitter.find(oldest->second.submitter)};
+                owner->second.pop_front();
+                if (owner->second.empty()) m_public_by_submitter.erase(owner);
+                m_public_notices.erase(oldest);
+            }
         }
         ++m_notice_changes;
         notify = m_notice_waiters != 0;
@@ -296,13 +316,14 @@ std::optional<ClientActionNotice> ClientEventLog::NewestNoticeLocked(const Marke
                                                                      const uint256& action_id) const
 {
     const ClientActionNotice* newest{nullptr};
-    for (const auto* ring : {&m_notices, &m_public_notices}) {
-        for (auto it{ring->rbegin()}; it != ring->rend(); ++it) {
-            if (it->market_id != market || it->action_id != action_id) continue;
-            if (!newest || it->serial > newest->serial) newest = &*it;
-            break;
-        }
-    }
+    // Each ring newest first; the first match is that ring's newest.
+    const auto newer = [&](const ClientActionNotice& notice) {
+        if (notice.market_id != market || notice.action_id != action_id) return false;
+        if (!newest || notice.serial > newest->serial) newest = &notice;
+        return true;
+    };
+    for (auto it{m_notices.rbegin()}; it != m_notices.rend() && !newer(*it); ++it) {}
+    for (auto it{m_public_notices.rbegin()}; it != m_public_notices.rend() && !newer(it->second); ++it) {}
     return newest ? std::optional{*newest} : std::nullopt;
 }
 

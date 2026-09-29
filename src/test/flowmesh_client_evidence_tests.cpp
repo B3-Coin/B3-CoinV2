@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <thread>
@@ -660,6 +661,74 @@ BOOST_AUTO_TEST_CASE(public_notices_never_evict_node_notices)
     BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(9)));
     BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(250)));
     BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(4)));
+}
+
+BOOST_AUTO_TEST_CASE(one_identity_never_turns_over_the_public_notice_ring)
+{
+    using Code = flowmesh::ActionReasonCode;
+    constexpr size_t CAPACITY{flowmesh::CLIENT_NOTICE_CAPACITY};
+    constexpr size_t SHARE{flowmesh::CLIENT_NOTICE_PER_SUBMITTER};
+    flowmesh::ClientEventLog log{Filled(1)};
+    const auto id = [](const uint32_t n) {
+        uint256 out{Filled(0xee)};
+        std::memcpy(out.begin(), &n, sizeof(n));
+        return out;
+    };
+    uint32_t next{0};
+    const auto flood = [&](const std::string& submitter, const size_t count) {
+        std::vector<flowmesh::ClientActionNotice> notices;
+        for (size_t i{0}; i < count; ++i) {
+            notices.push_back(Notice(2, 0, Code::FAR_FUTURE_SEQUENCE));
+            notices.back().action_id = id(next++);
+            notices.back().submitter = submitter;
+        }
+        log.AppendNotices(std::move(notices));
+    };
+    const auto kept = [&](const uint32_t n) { return log.NewestNotice(Filled(2), id(n)).has_value(); };
+    // A remote client's not-executed proof.
+    auto proof{Notice(2, 3, Code::DROPPED_SEQUENCE_CONSUMED)};
+    proof.submitter = "198.51.100.7";
+    log.AppendNotices({proof});
+
+    // One identity sends three whole rings: it keeps only its newest share,
+    // its own oldest making room, and never evicts anyone else's.
+    flood("203.0.113.9", 3 * CAPACITY);
+    BOOST_CHECK(log.NewestNotice(Filled(2), Filled(3)));
+    BOOST_CHECK(!kept(0));
+    BOOST_CHECK(!kept(3 * CAPACITY - SHARE - 1));
+    BOOST_CHECK(kept(3 * CAPACITY - SHARE));
+    BOOST_CHECK(kept(3 * CAPACITY - 1));
+    // Notices of unknown identity share one share; so does each IPv6 /64.
+    flood("", CAPACITY);
+    const uint32_t first_ipv6{next};
+    for (int prefix{0}; prefix < 29; ++prefix) flood(strprintf("ipv6/64:20010db8%08x", prefix), 2 * SHARE);
+    // 31 flooding identities fill all but 63 slots; the proof is still there.
+    BOOST_REQUIRE_EQUAL(31 * SHARE + 1, CAPACITY - 63);
+    const auto still{log.NewestNotice(Filled(2), Filled(3))};
+    BOOST_REQUIRE(still);
+    BOOST_CHECK(still->code == Code::DROPPED_SEQUENCE_CONSUMED);
+    BOOST_CHECK_EQUAL(still->submitter, "198.51.100.7");
+    BOOST_CHECK(!kept(first_ipv6));
+    BOOST_CHECK(kept(first_ipv6 + SHARE));
+
+    // The ring stays bounded: enough identities do turn it over, oldest
+    // first. A client at its own share makes room from its own notices.
+    const uint32_t before_more{next};
+    for (int prefix{0}; prefix < 2; ++prefix) flood(strprintf("ipv6/64:20010db9%08x", prefix), SHARE);
+    BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(3)));
+    BOOST_CHECK(kept(before_more));
+    BOOST_CHECK(kept(next - 1));
+    log.AppendNotices({proof});
+    flood("198.51.100.7", SHARE - 1);
+    BOOST_CHECK(log.NewestNotice(Filled(2), Filled(3)));
+    flood("198.51.100.7", 1);
+    BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(3)));
+    // A new instance clears the ring and every share.
+    log.Reset(Filled(8));
+    BOOST_CHECK(!kept(next - 1));
+    log.AppendNotices({proof});
+    flood("198.51.100.7", SHARE - 1);
+    BOOST_CHECK(log.NewestNotice(Filled(2), Filled(3)));
 }
 
 BOOST_AUTO_TEST_CASE(action_wait_interrupt_and_reset_wake_waiters)

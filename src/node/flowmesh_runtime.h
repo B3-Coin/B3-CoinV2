@@ -552,11 +552,16 @@ public:
      * applied to remote frames, proposals or certified entries. `origin`
      * picks the notice ring of this submission's notices, including the
      * worker's recheck and pool-drop notices for it: NODE only for this
-     * node's own wallet RPC and GUI, never for public API traffic.
+     * node's own wallet RPC and GUI, never for public API traffic. A PUBLIC
+     * deposit refused for missing facts gets no notice (it has no
+     * credential). `submitter`, for PUBLIC only, is the requesting client's
+     * identity (IPv4, or IPv6 /64): its notices count against that
+     * identity's share of the PUBLIC ring (CLIENT_NOTICE_PER_SUBMITTER).
      */
     FlowMeshLocalSubmitResult SubmitLocalActionChecked(
         const flowmesh::MarketId& market_id, const flowmesh::Action& action,
-        flowmesh::ClientNoticeOrigin origin = flowmesh::ClientNoticeOrigin::PUBLIC);
+        flowmesh::ClientNoticeOrigin origin = flowmesh::ClientNoticeOrigin::PUBLIC,
+        const std::string& submitter = {});
     //! Current position of the client event log (a cheap leaf-lock read).
     flowmesh::ClientEventCursor ClientEventCursor() const;
     //! The newest local notice for this exact action, if retained.
