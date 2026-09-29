@@ -3876,6 +3876,65 @@ private Q_SLOTS:
         QVERIFY(panel.m_status->text().contains(QStringLiteral("unbacked")));
         QVERIFY(!panel.m_order->isEnabled());
     }
+    void unchangedReplySupersededByNewerSnapshotIsNotAFailure()
+    {
+        using Apply = B3FlowMeshTradingPanel::SnapshotApply;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        const auto old_head{panel.m_snapshot->head};
+        // A newer head is displayed (as a live update would apply it).
+        auto newer{*panel.m_snapshot}; newer.head = QString::fromStdString(H(9).GetHex()); newer.next_sequence = 4;
+        panel.m_snapshot = newer;
+        auto unchanged{Parse(RemoteData())}; unchanged.unchanged = true;
+        QElapsedTimer age; age.start();
+        const auto responded{panel.m_response_age.msecsSinceReference()};
+        // The reply only says the old head was still current: superseded.
+        QCOMPARE(panel.applySelectedSnapshot(unchanged, age, old_head), Apply::SUPERSEDED);
+        QVERIFY(!panel.m_read_failed);
+        QCOMPARE(panel.m_snapshot->head, newer.head);
+        QCOMPARE(panel.m_response_age.msecsSinceReference(), responded);
+        // Against the displayed head, the same mismatch is a real failure.
+        QCOMPARE(panel.applySelectedSnapshot(unchanged, age, newer.head), Apply::MISMATCH);
+        QVERIFY(panel.m_read_failed);
+    }
+    void olderFullSnapshotNeverReplacesNewerHead()
+    {
+        using Apply = B3FlowMeshTradingPanel::SnapshotApply;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        auto newer{*panel.m_snapshot}; newer.head = QString::fromStdString(H(9).GetHex()); newer.next_sequence = 5;
+        panel.m_snapshot = newer;
+        QElapsedTimer age; age.start();
+        auto older{Parse(RemoteData())};
+        QCOMPARE(older.next_sequence, uint64_t{3});
+        QCOMPARE(panel.applySelectedSnapshot(older, age, {}), Apply::SUPERSEDED);
+        QCOMPARE(panel.m_snapshot->next_sequence, uint64_t{5});
+        QVERIFY(!panel.m_read_failed);
+        // The same or a newer head still applies.
+        auto same{newer}; same.pending_actions = 1;
+        QCOMPARE(panel.applySelectedSnapshot(same, age, {}), Apply::APPLIED);
+        QCOMPARE(panel.m_snapshot->pending_actions, uint64_t{1});
+    }
+    void olderAuxJobNeverRevertsWatchDerivedRow()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        // A job started against sequence 3 and captured the catalog rows then.
+        B3FlowMeshTradingPanel::Result result;
+        result.markets = panel.m_market_data; result.basis_sequence = panel.m_snapshot->next_sequence; result.catalog = true;
+        // A newer head was displayed meanwhile, with a newer account state.
+        auto newer{*panel.m_snapshot}; newer.head = QString::fromStdString(H(9).GetHex()); newer.next_sequence = 4;
+        newer.account_sequence = 9; newer.b3_available = 1'000'000'000;
+        panel.m_snapshot = newer;
+        panel.DeriveRowFromSnapshot(panel.m_market_data[0], newer);
+        QCOMPARE(panel.market()->sequence, uint64_t{9});
+        // The older job's catalog does not roll the selected row back.
+        panel.applyMarketCatalog(result);
+        QCOMPARE(panel.market()->sequence, uint64_t{9});
+        QCOMPARE(panel.market()->b3_available, CAmount{1'000'000'000});
+        QCOMPARE(panel.m_snapshot->head, newer.head);
+        // Without a newer display, the job's rows are applied as before.
+        result.basis_sequence = 4; result.markets[0].sequence = 12;
+        panel.applyMarketCatalog(result);
+        QCOMPARE(panel.market()->sequence, uint64_t{12});
+    }
     void exportOptInSyntheticVisualFixtures()
     {
         const QString directory{qEnvironmentVariable("FLOWMESH_UI_SNAPSHOT_DIR")};

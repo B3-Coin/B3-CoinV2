@@ -74,7 +74,14 @@ private:
         std::optional<RefreshPhase> refresh_phase;
         uint64_t refresh_epoch{0};
         QElapsedTimer snapshot_age;
+        // What the selected-market read was requested against: the head
+        // sent as known_head (empty: none), and the displayed snapshot's
+        // next sequence for that market when the job started (0: none).
+        QString basis_head;
+        uint64_t basis_sequence{0};
     };
+    //! How a verified selected-market read was applied.
+    enum class SnapshotApply { APPLIED, SUPERSEDED, MISMATCH };
     struct DeferredReview {
         B3FlowMeshTrading::Operation operation;
         bool funding;
@@ -146,6 +153,12 @@ private:
     void finishJob(const std::shared_ptr<Result>& result);
     void applyJobResult(const std::shared_ptr<Result>& result);
     void applyMarketCatalog(const Result& result);
+    //! Applies one verified read of the selected market, never moving the
+    //! display backwards: a reply against a head the display has left, or an
+    //! older full snapshot, is superseded (dropped, not a failure).
+    SnapshotApply applySelectedSnapshot(B3FlowMeshMarketData::Snapshot fresh, const QElapsedTimer& age, const QString& basis_head);
+    //! The selected catalog row's fields a verified market read determines.
+    static void DeriveRowFromSnapshot(B3FlowMeshTrading::Market& row, const B3FlowMeshMarketData::Snapshot& s);
     void stopWorker();
     bool restoreLock();
     void notice(const QString& text);

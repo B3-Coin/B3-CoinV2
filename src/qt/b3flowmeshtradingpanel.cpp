@@ -1058,6 +1058,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     }
     const auto refresh_basis{m_snapshot};
     result->markets = m_market_data; result->effects = m_effect_data;
+    if (m_snapshot && m_snapshot->market == selected_id) result->basis_sequence = m_snapshot->next_sequence;
     const QString known_head{m_snapshot && m_snapshot->market == selected_id ? m_snapshot->head : QString{}};
     const QString route_base{m_route_pending ? m_requested_base : QString{}};
     const QString receipt_market{status_read ? status_read->market : tracked ? m_pending_market : QString{}},
@@ -1217,20 +1218,16 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                         }
                     });
                     UniValue params{UniValue::VARR}; params.push_back(selected->id.toStdString()); UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
-                    if (!known_head.isEmpty() && selected->id == selected_id && !result->catalog) options.pushKV("known_head", known_head.toStdString());
+                    if (!known_head.isEmpty() && selected->id == selected_id && !result->catalog) {
+                        options.pushKV("known_head", known_head.toStdString());
+                        result->basis_head = known_head;
+                    }
                     params.push_back(options); result->snapshot = B3FlowMeshMarketData::Parse(snapshot_rpc("getflowmeshmarketdata", params));
                     const auto& s{*result->snapshot};
                     if (s.market != selected->id || s.base != selected->base || s.domain != selected->domain || s.config != selected->config) throw std::runtime_error{"Certified data does not match the selected market identity."};
                     if (!s.unchanged && selected->has_account && selected->account != s.account) throw std::runtime_error{"Certified data belongs to another wallet account."};
                     if (s.chain_reconciling) result->effects.clear();
-                    selected->publish_ready = (s.remote ? s.certificate_verified && s.account_state_verified : selected->publish_ready) && s.running && !s.chain_reconciling;
-                    selected->remote = s.remote;
-                    selected->ready = s.remote ? B3FlowMeshMarketData::AdmissionReady(s, 0, -1) : selected->publish_ready && !s.paused && !s.handoff && s.halt == QStringLiteral("none") && s.error.isEmpty();
-                    if (!s.unchanged) {
-                        if (selected->has_account && selected->account != s.account) throw std::runtime_error{"Certified data belongs to another wallet account."};
-                        selected->has_account = !s.account.isEmpty(); selected->account = s.account; selected->sequence = s.account_sequence;
-                        selected->base_available = s.base_available; selected->base_reserved = s.base_reserved; selected->b3_available = s.b3_available; selected->b3_reserved = s.b3_reserved;
-                    }
+                    DeriveRowFromSnapshot(*selected, s);
                 }
                 if (auxiliary_error) std::rethrow_exception(auxiliary_error); // Conservative failure; no new display freshness.
                 read_client_info(); // Include observations from this market read.
@@ -1403,28 +1400,7 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
         }
         const auto selected_now{market()};
         if (result->snapshot && selected_now && result->snapshot->market == selected_now->id) {
-            auto fresh{*result->snapshot};
-            if (m_snapshot && fresh.units.known && fresh.units != m_snapshot->units) { m_amount->clear(); m_withdrawal_draft_amount.clear(); }
-            const bool new_head{!m_snapshot || m_snapshot->market != fresh.market || m_snapshot->head != fresh.head};
-            if (fresh.unchanged) {
-                if (!m_snapshot || m_snapshot->market != fresh.market || m_snapshot->head != fresh.head || m_snapshot->state_root != fresh.state_root || m_snapshot->remote != fresh.remote || m_snapshot->execution_result_verified != fresh.execution_result_verified) { m_read_failed = true; notice(tr("Unchanged snapshot did not match the retained certificate and provenance; data was not reused.")); m_catalog_age.invalidate(); }
-                else {
-                    auto retained{*m_snapshot}; retained.running = fresh.running; retained.paused = fresh.paused; retained.chain_reconciling = fresh.chain_reconciling; retained.handoff = fresh.handoff; retained.observer = fresh.observer; retained.halt = fresh.halt; retained.error = fresh.error; retained.pending_actions = fresh.pending_actions; retained.active_seats = fresh.active_seats; retained.quorum_required = fresh.quorum_required;
-                    retained.remote = fresh.remote; retained.endpoint = fresh.endpoint; retained.certificate_verified = fresh.certificate_verified; retained.account_state_verified = fresh.account_state_verified; retained.execution_result_verified = fresh.execution_result_verified; retained.b3_checkpoint_confirmed = fresh.b3_checkpoint_confirmed; retained.event_gap = fresh.event_gap;
-                    // Cosmetic discovery can advance without a new certified
-                    // microblock. Keep the exact account/book and user inputs;
-                    // only accept units for this same canonical asset.
-                    if (fresh.units.known && fresh.units.asset == retained.base) retained.units = fresh.units;
-                    m_snapshot = std::move(retained); m_response_age = result->snapshot_age; updateDataViews();
-                }
-            } else {
-                if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age = result->snapshot_age;
-                m_snapshot = std::move(fresh); m_response_age = result->snapshot_age; updateDataViews();
-            }
-            if (!m_read_failed && m_snapshot) {
-                if (m_snapshot->pending_actions == 0) m_queue_age.invalidate();
-                else if (new_head || !m_queue_age.isValid()) m_queue_age = result->snapshot_age;
-            }
+            applySelectedSnapshot(*result->snapshot, result->snapshot_age, result->basis_head);
         } else if (!selected_now || !m_snapshot || selected_now->id != m_snapshot->market) { m_snapshot.reset(); m_response_age.invalidate(); m_queue_age.invalidate(); updateDataViews(); }
         const bool changed_selection{selected_now && (selected_now->id != previous || (!result->read_market.isEmpty() && selected_now->id != result->read_market))};
         const bool open_routed_funding{m_route_pending && selected_now && m_snapshot && m_snapshot->market == selected_now->id};
@@ -1470,6 +1446,50 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
     refresh();
 }
 
+auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapshot fresh, const QElapsedTimer& age, const QString& basis_head) -> SnapshotApply
+{
+    // Reads can complete out of order. Each is compared with the head it was
+    // requested against, never only with whatever is displayed now.
+    if (m_snapshot && m_snapshot->market == fresh.market) {
+        if (fresh.unchanged && !basis_head.isEmpty() && basis_head != m_snapshot->head) return SnapshotApply::SUPERSEDED;
+        if (!fresh.unchanged && fresh.next_sequence < m_snapshot->next_sequence) return SnapshotApply::SUPERSEDED;
+    }
+    if (m_snapshot && fresh.units.known && fresh.units != m_snapshot->units) { m_amount->clear(); m_withdrawal_draft_amount.clear(); }
+    const bool new_head{!m_snapshot || m_snapshot->market != fresh.market || m_snapshot->head != fresh.head};
+    if (fresh.unchanged) {
+        if (!m_snapshot || m_snapshot->market != fresh.market || m_snapshot->head != fresh.head || m_snapshot->state_root != fresh.state_root || m_snapshot->remote != fresh.remote || m_snapshot->execution_result_verified != fresh.execution_result_verified) {
+            m_read_failed = true; notice(tr("Unchanged snapshot did not match the retained certificate and provenance; data was not reused.")); m_catalog_age.invalidate();
+            return SnapshotApply::MISMATCH;
+        }
+        auto retained{*m_snapshot}; retained.running = fresh.running; retained.paused = fresh.paused; retained.chain_reconciling = fresh.chain_reconciling; retained.handoff = fresh.handoff; retained.observer = fresh.observer; retained.halt = fresh.halt; retained.error = fresh.error; retained.pending_actions = fresh.pending_actions; retained.active_seats = fresh.active_seats; retained.quorum_required = fresh.quorum_required;
+        retained.remote = fresh.remote; retained.endpoint = fresh.endpoint; retained.certificate_verified = fresh.certificate_verified; retained.account_state_verified = fresh.account_state_verified; retained.execution_result_verified = fresh.execution_result_verified; retained.b3_checkpoint_confirmed = fresh.b3_checkpoint_confirmed; retained.event_gap = fresh.event_gap;
+        // Cosmetic discovery can advance without a new certified
+        // microblock. Keep the exact account/book and user inputs;
+        // only accept units for this same canonical asset.
+        if (fresh.units.known && fresh.units.asset == retained.base) retained.units = fresh.units;
+        m_snapshot = std::move(retained); m_response_age = age; updateDataViews();
+    } else {
+        if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age = age;
+        m_snapshot = std::move(fresh); m_response_age = age; updateDataViews();
+    }
+    if (!m_read_failed && m_snapshot) {
+        if (m_snapshot->pending_actions == 0) m_queue_age.invalidate();
+        else if (new_head || !m_queue_age.isValid()) m_queue_age = age;
+    }
+    return SnapshotApply::APPLIED;
+}
+
+void B3FlowMeshTradingPanel::DeriveRowFromSnapshot(Market& row, const B3FlowMeshMarketData::Snapshot& s)
+{
+    row.publish_ready = (s.remote ? s.certificate_verified && s.account_state_verified : row.publish_ready) && s.running && !s.chain_reconciling;
+    row.remote = s.remote;
+    row.ready = s.remote ? B3FlowMeshMarketData::AdmissionReady(s, 0, -1) : row.publish_ready && !s.paused && !s.handoff && s.halt == QStringLiteral("none") && s.error.isEmpty();
+    if (!s.unchanged) {
+        row.has_account = !s.account.isEmpty(); row.account = s.account; row.sequence = s.account_sequence;
+        row.base_available = s.base_available; row.base_reserved = s.base_reserved; row.b3_available = s.b3_available; row.b3_reserved = s.b3_reserved;
+    }
+}
+
 void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
 {
     const auto previous_market{market()};
@@ -1508,6 +1528,15 @@ void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
     if (m_snapshot && (!selected || selected->id != m_snapshot->market || selected->base != m_snapshot->base ||
         selected->domain != m_snapshot->domain || selected->config != m_snapshot->config || selected->remote != m_snapshot->remote)) {
         m_snapshot.reset(); m_response_age.invalidate(); m_certificate_age.invalidate(); m_queue_age.invalidate();
+    }
+    // The job's rows were captured when it started. When a newer head was
+    // displayed meanwhile, its selected row must not roll back to them.
+    const auto index{m_market->currentIndex()};
+    const uint64_t basis{result.snapshot && selected && result.snapshot->market == selected->id ? result.snapshot->next_sequence : result.basis_sequence};
+    if (m_snapshot && selected && m_snapshot->market == selected->id && m_snapshot->next_sequence > basis &&
+        index >= 0 && static_cast<size_t>(index) < m_market_data.size() &&
+        (!m_market_data[index].has_account || m_market_data[index].account == m_snapshot->account)) {
+        DeriveRowFromSnapshot(m_market_data[index], *m_snapshot);
     }
 }
 
