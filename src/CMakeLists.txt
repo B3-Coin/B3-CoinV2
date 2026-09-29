@@ -119,6 +119,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   external_signer.cpp
   flowmesh/bls_certificate.cpp
   flowmesh/p2p.cpp
+  flowmesh/outcome_evidence.cpp
   flowmesh/production_engine.cpp
   flowmesh/production_wire.cpp
   init/common.cpp

@@ -70,6 +70,7 @@ add_executable(test_bitcoin
   feefrac_tests.cpp
   feerounder_tests.cpp
   flatfile_tests.cpp
+  flowmesh_action_pool_tests.cpp
   flowmesh_action_reason_tests.cpp
   flowmesh_asset_metadata_tests.cpp
   public_asset_metadata_tests.cpp
@@ -95,6 +96,7 @@ add_executable(test_bitcoin
   flowmesh_action_wait_tests.cpp
   flowmesh_client_action_wait_tests.cpp
   flowmesh_client_readiness_tests.cpp
+  flowmesh_outcome_evidence_tests.cpp
   flowmesh_client_work_tests.cpp
   flowmesh_timing_tests.cpp
   flowmesh_transport_compat_tests.cpp
