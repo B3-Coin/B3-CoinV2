@@ -10,6 +10,7 @@
 #include <flowmesh/production_wire.h>
 #include <node/flowmesh_delivery.h>
 #include <node/flowmesh_agreement.h>
+#include <node/flowmesh_health.h>
 #include <node/flowmesh_production_store.h>
 
 #include <atomic>
@@ -532,6 +533,13 @@ public:
     std::vector<FlowMeshRuntimeDeliverySnapshot> DeliverySnapshots(
         std::optional<flowmesh::MarketId> market = std::nullopt) const;
 
+    /** Latest worker-published health observation: published once by Start
+     * and at most every 250 ms from the worker's tick. Takes only a leaf
+     * mutex (never the market or queue mutex, cs_main or the store), so it
+     * answers while the worker is busy or wedged; the snapshot's age is then
+     * itself the signal. Null before the first Start. Never evidence. */
+    std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> HealthSnapshot() const;
+
     /** Test-only: how many frames' bytes admission has hashed so far. */
     uint64_t AdmissionHashCountForTest() const;
 
@@ -576,6 +584,10 @@ private:
     void ProcessCatchupCommand(const CatchupCommand& command);
     void ProcessAddMarketCommand(AddMarketCommand command);
     void RemovePeerOnWorker(flowmesh::WirePeerId peer);
+    //! Caller holds m_market_mutex. Copies values the worker already owns;
+    //! never reads the store, signs, executes or calls LocalSeatKeys.
+    void PublishHealth(flowmesh::WireClock::time_point now, size_t connected_peers,
+                       std::optional<flowmesh::WireClock::time_point> no_peers_since, bool force);
 
     void HandleAction(Market& market, flowmesh::WirePeerId peer,
                       const flowmesh::WireMessage& message);
@@ -676,6 +688,12 @@ private:
                                 uint64_t next_sequence);
     //! Negotiated connections only, capped independently of incoming hints.
     std::set<flowmesh::WirePeerId> m_discovery_peers;
+    //! Health observation only, never a discovery or relay input: the
+    //! currently connected FlowMesh peers (uncapped by the discovery bound;
+    //! bounded by the transports' own connection limits) and since when there
+    //! have been none. Guarded by m_queue_mutex.
+    std::set<flowmesh::WirePeerId> m_connected_peers;
+    std::optional<flowmesh::WireClock::time_point> m_no_peers_since;
     std::deque<flowmesh::WirePeerId> m_removed_peers;
     std::deque<CatchupCommand> m_catchup_commands;
     std::deque<AddMarketCommand> m_add_market_commands;
@@ -691,6 +709,11 @@ private:
     //! Diagnostic state only, guarded by m_queue_mutex; never a wake predicate.
     bool m_worker_waiting{false};
     std::thread m_worker;
+    //! Leaf: acquired after m_market_mutex, never before it.
+    mutable std::mutex m_health_mutex;
+    std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> m_health;
+    //! Worker-owned (under m_market_mutex): the next tick that publishes.
+    flowmesh::WireClock::time_point m_next_health_publish{};
 
     // Exact signed critical objects: <=8192 / 64 MiB globally, <=16 MiB per
     // market. Retry at >=1s, or at once when a pause cancelled the admitted

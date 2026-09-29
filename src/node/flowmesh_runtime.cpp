@@ -34,6 +34,10 @@ constexpr size_t MAX_ACTIVE_CATCHUPS{16};
 constexpr size_t MAX_CATCHUP_COOLDOWNS{256};
 constexpr size_t MAX_CATCHUP_PROFILES{256};
 constexpr size_t MAX_DISCOVERY_PEERS{256};
+// Health observation only: at most one runtime health snapshot per interval
+// from the worker's tick, and the tracked connected-peer set's safety bound.
+constexpr auto HEALTH_PUBLISH_INTERVAL{std::chrono::milliseconds{250}};
+constexpr size_t MAX_HEALTH_CONNECTED_PEERS{4096};
 // At the service's 250 ms tick, leave half of the 16/s control budget
 // available for catch-up requests/responses rather than starving them.
 constexpr size_t MAX_ANNOUNCEMENTS_PER_TICK{2};
@@ -587,6 +591,12 @@ struct FlowMeshRuntime::Market {
     bool pending_handoff{false};
     FlowMeshRuntimeHalt halt{FlowMeshRuntimeHalt::NONE};
     std::string error;
+    // Health observation only; nothing reads these to decide anything. The
+    // last seat-transition pause reason (a fixed diagnostic literal), when
+    // this process last applied a head, and verified catch-up lag.
+    std::string pause_reason;
+    std::optional<flowmesh::WireClock::time_point> head_advanced_at;
+    FlowMeshLagTracker lag;
     std::optional<flowmesh::AnchorRef> previous_anchor;
     std::map<std::pair<int32_t, uint256>, uint64_t> committed_anchors;
     std::map<uint256, Candidate> candidates;
@@ -626,7 +636,8 @@ struct FlowMeshRuntime::Market {
           agreement_timeout_remaining{runtime_config.round_timeout},
           ready{config.readiness == FlowMeshRuntimeMarketReadiness::READY},
           paused{!ready},
-          round_started{runtime_config.clock->Now()}
+          round_started{runtime_config.clock->Now()},
+          lag{config.next_sequence}
     {
         delivery.market_id = market_id;
     }
@@ -1137,10 +1148,13 @@ std::optional<FlowMeshSeatTransition> CurrentSeatTransition(Market& market)
     case FlowMeshSeatTransitionKind::CONTINUE:
         if (transition.next_seats) break;
         market.paused = false;
+        market.pause_reason.clear();
         return transition;
     case FlowMeshSeatTransitionKind::PAUSED:
         if (transition.next_seats) break;
         market.paused = true;
+        market.pause_reason = transition.pause_reason.empty()
+            ? std::string{"seat_transition_paused"} : transition.pause_reason.substr(0, 64);
         return transition;
     case FlowMeshSeatTransitionKind::HANDOFF:
         if (transition.next_seats &&
@@ -1152,6 +1166,7 @@ std::optional<FlowMeshSeatTransition> CurrentSeatTransition(Market& market)
             transition.next_seats->epoch == market.seats.epoch + 1 &&
             !SameSeatIdentity(*transition.next_seats, market.seats)) {
             market.paused = false;
+            market.pause_reason.clear();
             return transition;
         }
         break;
@@ -1588,6 +1603,7 @@ bool RestoreRetainedCandidate(Market& market)
     if (!market.pending_candidate_restore) return true;
     if (market.halt != FlowMeshRuntimeHalt::NONE) return false;
     market.paused = true;
+    market.pause_reason = "retained_candidate_restore";
     // Do not evaluate a saved candidate through the live production gate
     // until checkpoint/index reconciliation has finished. This also prevents
     // messages queued during startup from signing ahead of restoration.
@@ -1820,6 +1836,10 @@ bool CommitCertified(Market& market,
     market.client_events.Append(std::move(committed_events));
     market.local_observed_at = GetTime();
     ++market.next_sequence;
+    // Health observation only. Advancing the local head is the only way a
+    // proven lag ends; a commit never ends a lag episode by itself.
+    market.head_advanced_at = market.clock->Now();
+    market.lag.LocalAdvanced(market.next_sequence, *market.head_advanced_at);
     market.pool.ClearDuplicateForwards(); // never rewrite a queued retry to the new head
     market.next_effect_index += certified.entry.effect_count;
     market.previous_anchor = certified.entry.anchor;
@@ -3019,6 +3039,11 @@ bool FlowMeshRuntime::Start(std::string& error)
                 m_probe_markets.push_back(market_id);
             }
         }
+        // A health observation exists from Start on, so a missing or aging
+        // one always means a worker that has not ticked.
+        m_connected_peers.clear();
+        m_no_peers_since = m_config.clock->Now();
+        PublishHealth(*m_no_peers_since, 0, m_no_peers_since, /*force=*/true);
     }
     m_stopping = false;
     m_started = true;
@@ -3315,6 +3340,8 @@ void FlowMeshRuntime::FlowMeshPeerConnected(const flowmesh::WirePeerId peer)
     if (m_discovery_peers.size() < MAX_DISCOVERY_PEERS) {
         m_discovery_peers.insert(peer);
     }
+    if (m_connected_peers.size() < MAX_HEALTH_CONNECTED_PEERS) m_connected_peers.insert(peer);
+    if (!m_connected_peers.empty()) m_no_peers_since.reset();
     // Coalesce concurrent handshakes. Announcements are still rate-limited
     // on the worker, so connection churn cannot create an unbounded queue.
     m_discovery_refresh = true;
@@ -3329,6 +3356,9 @@ void FlowMeshRuntime::FlowMeshPeerDisconnected(
     std::lock_guard<std::mutex> lock{m_queue_mutex};
     m_queue.RemovePeer(peer);
     m_discovery_peers.erase(peer);
+    if (m_connected_peers.erase(peer) != 0 && m_connected_peers.empty()) {
+        m_no_peers_since = m_config.clock->Now();
+    }
     std::erase_if(m_catchup_commands, [&](const CatchupCommand& command) {
         return command.peer == peer;
     });
@@ -3904,6 +3934,10 @@ void FlowMeshRuntime::RemovePeerOnWorker(const flowmesh::WirePeerId peer)
         it = m_deferred_messages.erase(it);
     }
     std::erase_if(m_receive_recovery, [&](const auto& item) { return item.first == peer; });
+    for (auto& [id, market] : m_markets) {
+        (void)id;
+        market->lag.RemovePeer(peer);
+    }
     m_peer_probe_cursors.erase(peer);
     m_catchup_tracker.RemovePeer(peer);
     std::erase_if(m_catchup_profiles, [&](const auto& item) { return item.first.first == peer; });
@@ -4029,10 +4063,14 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
     }
     bool refresh{false};
     std::vector<flowmesh::WirePeerId> peers;
+    size_t connected_peers{0};
+    std::optional<flowmesh::WireClock::time_point> no_peers_since;
     {
         std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
         refresh = std::exchange(m_discovery_refresh, false);
         peers.assign(m_discovery_peers.begin(), m_discovery_peers.end());
+        connected_peers = m_connected_peers.size();
+        no_peers_since = m_no_peers_since;
     }
     const auto now{m_config.clock->Now()};
     for (auto it{m_pending_catchup.begin()}; it != m_pending_catchup.end();) {
@@ -4122,6 +4160,60 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
     RetryRetainedEvidence();
     RetryLocalActions();
     ForwardPendingDuplicateActions();
+    {
+        FlowMeshTimingSpan timing{"tick_publish_health"};
+        PublishHealth(m_config.clock->Now(), connected_peers, no_peers_since, /*force=*/false);
+    }
+}
+
+void FlowMeshRuntime::PublishHealth(const flowmesh::WireClock::time_point now, const size_t connected_peers,
+                                    const std::optional<flowmesh::WireClock::time_point> no_peers_since,
+                                    const bool force)
+{
+    // Ticks also come from HELLO, peer connections, commits and B3 tips, so
+    // pace the copy: every reader waits for this worker's market lock.
+    if (!force && now < m_next_health_publish) return;
+    m_next_health_publish = now + HEALTH_PUBLISH_INTERVAL;
+    auto out{std::make_shared<FlowMeshRuntimeHealthSnapshot>()};
+    out->published_at = now;
+    out->connected_peers = connected_peers;
+    out->no_peers_since = connected_peers == 0 ? no_peers_since : std::nullopt;
+    out->markets.reserve(m_markets.size());
+    for (auto& [id, market_ptr] : m_markets) {
+        Market& market{*market_ptr};
+        market.lag.Expire(now);
+        auto& row{out->markets.emplace_back()};
+        row.market_id = id;
+        row.installed = market.ready;
+        row.epoch = market.seats.epoch;
+        row.next_sequence = market.next_sequence;
+        row.last_hash = market.last_hash;
+        row.active_seats = market.seats.Size();
+        row.quorum_required = row.active_seats == 0 ? 0 : flowmesh::FlowMeshBlsThreshold(row.active_seats);
+        row.pending_actions = market.pool.Size();
+        row.paused = market.paused;
+        row.pending_handoff = market.pending_handoff;
+        row.pause_reason = market.ready ? market.pause_reason : std::string{"insufficient_seats"};
+        row.halted = market.halt != FlowMeshRuntimeHalt::NONE;
+        row.halt = FlowMeshRuntimeHaltName(market.halt);
+        row.error = market.error.substr(0, 1024);
+        if (market.proposal_wait_sequence == market.next_sequence) row.proposal_wait_reason = market.proposal_wait_reason;
+        row.head_advanced_at = market.head_advanced_at;
+        row.local_observed_at = market.local_observed_at;
+        row.lag = market.lag.Summary();
+    }
+    std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> previous;
+    {
+        std::lock_guard<std::mutex> lock{m_health_mutex};
+        previous = std::exchange(m_health, std::move(out));
+    }
+    // The previous snapshot is released after the unlock.
+}
+
+std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> FlowMeshRuntime::HealthSnapshot() const
+{
+    std::lock_guard<std::mutex> lock{m_health_mutex};
+    return m_health;
 }
 
 void FlowMeshRuntime::RetryLocalActions()
@@ -4470,6 +4562,8 @@ void FlowMeshRuntime::HandleHello(
     // A hint neither changes the active committee nor establishes finality.
     // Only the existing certificate-verification/re-execution path can move
     // our state. Do not pause signing or report a trusted remote tip here.
+    // Health shows the hint as unverified and never starts a lag from it.
+    market.lag.Hello(peer, message.header.sequence, market.clock->Now());
     if (message.header.sequence > market.next_sequence) {
         RequestCatchup(peer, market.market_id);
     } else if (message.header.sequence < market.next_sequence) {
@@ -5349,6 +5443,9 @@ void FlowMeshRuntime::HandleCertificate(
         return;
     }
     if (certified->entry.sequence > market.next_sequence) {
+        // BLS-verified above: this node is provably behind, whichever path
+        // delivered the certificate. Observation only.
+        market.lag.Proven(certified->entry.sequence, market.clock->Now());
         if (!from_catchup && peer != LOCAL_ACTION_PEER) {
             RequestCatchup(peer, market.market_id);
         }
@@ -5616,8 +5713,11 @@ void FlowMeshRuntime::HandleEntries(
                 request.max_entries, request.max_bytes, entries->size(),
                 message.payload.size(), applied)};
         if (!tail_slack) {
+            // Health: this peer may hold more; speculative, not a tip proof.
+            market.lag.Speculative(peer, finished);
             RequestCatchup(peer, market.market_id);
         } else {
+            market.lag.SpeculativeEnd(finished);
             CountObservation(market.delivery.catchup_completed);
             DeliveryEvent(market, "catchup_page_applied_with_tail_slack", flowmesh::WireMessageKind::ENTRIES,
                           market.last_hash, market.next_sequence, peer, apply_details);

@@ -236,6 +236,12 @@ public:
         m_transitions[market] = {kind, std::nullopt};
     }
 
+    void SetPausedTransition(const flowmesh::MarketId& market, std::string reason)
+    {
+        std::lock_guard<std::mutex> lock{m_mutex};
+        m_transitions[market] = {node::FlowMeshSeatTransitionKind::PAUSED, std::nullopt, std::move(reason)};
+    }
+
     void PauseAfterTransitionChecks(const size_t checks)
     {
         std::lock_guard<std::mutex> lock{m_mutex};
@@ -6747,6 +6753,310 @@ BOOST_AUTO_TEST_CASE(discovery_hints_are_untrusted_and_failed_catchup_is_bounded
     BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
     BOOST_CHECK_EQUAL(count(flowmesh::WireMessageKind::GET), 4); // failure cooldown unchanged
     runtime.Stop();
+}
+
+/** One observer runtime and a peer that serves verified certificates. Every
+ * health check advances the fixed clock past the 250 ms publish interval. */
+class HealthRuntimeFixture
+{
+public:
+    explicit HealthRuntimeFixture(const fs::path& path)
+        : store{DBParams{.path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}}
+    {
+        chain.m_domain = domain;
+        chain.Add(seats.seats);
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(store.OpenForMarket(domain, market, seats.seats, initial.Root(), error), error);
+        node::FlowMeshRuntimeConfig config;
+        config.chain = &chain;
+        config.keys = &keys;
+        config.clock = &clock;
+        config.relay = [this](node::FlowMeshRuntimeRelay relay) {
+            std::unique_lock<std::mutex> lock{relay_mutex};
+            if (relay.message.kind == flowmesh::WireMessageKind::GET) {
+                gets.push_back(relay);
+                if (block_gets) {
+                    relay_blocked = true;
+                    relay_cv.notify_all();
+                    relay_cv.wait(lock, [&] { return !block_gets; });
+                }
+            }
+            return LegacyRelayResult();
+        };
+        runtime = std::make_unique<node::FlowMeshRuntime>(config, std::vector<node::FlowMeshRuntimeMarketConfig>{
+            MarketConfig(domain, market, treasury, seats.seats, initial, store, nullptr)});
+        flowmesh::ProductionEpochGate gate{domain, market, seats.seats};
+        flowmesh::ProductionEntryCheck check;
+        std::optional<flowmesh::FlowMeshState> state{initial};
+        uint256 parent;
+        std::optional<flowmesh::AnchorRef> previous;
+        for (uint64_t sequence{0}; sequence < 3; ++sequence) {
+            const auto built{flowmesh::BuildProductionExecutionEntry(
+                *state, domain, market, seats.seats, gate, sequence, 0, parent, {100, Filled(0x71)},
+                {chain.TipHeight(), previous, &chain}, treasury, {}, nullptr, check)};
+            BOOST_REQUIRE_MESSAGE(built, flowmesh::ProductionEntryCheckName(check));
+            entries.push_back(built->entry);
+            const auto payload{flowmesh::EncodeProductionCertifiedPayload(
+                {built->entry, Certify(built->entry, seats)}, seats.seats.Size())};
+            BOOST_REQUIRE(payload);
+            payloads.push_back(*payload);
+            state = built->next_state;
+            parent = built->entry.GetHash();
+            previous = built->entry.anchor;
+        }
+    }
+    ~HealthRuntimeFixture()
+    {
+        {
+            std::lock_guard<std::mutex> lock{relay_mutex};
+            block_gets = false;
+        }
+        relay_cv.notify_all();
+        runtime->Stop();
+    }
+
+    //! Settle the worker, then publish a fresh observation.
+    std::shared_ptr<const node::FlowMeshRuntimeHealthSnapshot> Health()
+    {
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+        clock.m_now += std::chrono::milliseconds{250};
+        runtime->NotifyTick();
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+        const auto health{runtime->HealthSnapshot()};
+        BOOST_REQUIRE(health);
+        BOOST_REQUIRE(health->published_at == clock.m_now);
+        BOOST_REQUIRE_EQUAL(health->markets.size(), 1U);
+        return health;
+    }
+    const node::FlowMeshLagSummary& Lag(const std::shared_ptr<const node::FlowMeshRuntimeHealthSnapshot>& health)
+    {
+        return health->markets.front().lag;
+    }
+    void Send(const flowmesh::WirePeerId peer, flowmesh::WireMessage message)
+    {
+        BOOST_REQUIRE(runtime->EnqueueWireMessage(peer, std::move(message)) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+    }
+    void Hello(const flowmesh::WirePeerId peer, const uint64_t next)
+    {
+        Send(peer, {flowmesh::WireMessageKind::HELLO, {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, next},
+                    flowmesh::EncodeMarketHello({domain, next == 0 ? uint256{} : Filled(0x7a)})});
+    }
+    void Certificate(const flowmesh::WirePeerId peer, const uint64_t sequence)
+    {
+        Send(peer, {flowmesh::WireMessageKind::CERTIFICATE,
+                    {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, sequence}, payloads.at(sequence)});
+    }
+    //! A catch-up reply to the pending request from `from`.
+    void Entries(const flowmesh::WirePeerId peer, const uint64_t from, std::vector<std::vector<unsigned char>> page)
+    {
+        const auto encoded{flowmesh::EncodeCatchupEntries(page)};
+        BOOST_REQUIRE(encoded);
+        Send(peer, {flowmesh::WireMessageKind::ENTRIES, {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, from},
+                    *encoded});
+    }
+    size_t Gets(const flowmesh::WirePeerId peer)
+    {
+        std::lock_guard<std::mutex> lock{relay_mutex};
+        return std::count_if(gets.begin(), gets.end(), [&](const auto& relay) { return relay.peer == peer; });
+    }
+
+    const uint256 domain{Filled(0x1c)};
+    const modern::AssetId asset{Filled(0x3c)};
+    const flowmesh::MarketId market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+    const flowmesh::VaultId vault{*flowmesh::ComputeFlowMeshVaultId(domain, market)};
+    const uint256 treasury{Filled(0x5c)};
+    const SeatFixture seats{Seats(domain, market, 4, 7, 100, Filled(0x71), 140)};
+    const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    RuntimeChain chain;
+    RuntimeKeys keys; // Observer.
+    FixedClock clock;
+    node::FlowMeshProductionStore store;
+    std::vector<flowmesh::ProductionEntryCore> entries;
+    std::vector<std::vector<unsigned char>> payloads;
+    std::mutex relay_mutex;
+    std::condition_variable relay_cv;
+    bool block_gets{false}, relay_blocked{false};
+    std::vector<node::FlowMeshRuntimeRelay> gets;
+    std::unique_ptr<node::FlowMeshRuntime> runtime;
+};
+
+BOOST_AUTO_TEST_CASE(health_snapshot_publishes_head_pause_reason_peers_and_halt)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_health_snapshot"};
+    BOOST_CHECK(!f.runtime->HealthSnapshot());
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    // Start publishes at once: a missing observation always means no Start.
+    const auto started{f.runtime->HealthSnapshot()};
+    BOOST_REQUIRE(started);
+    BOOST_CHECK(started->published_at == f.clock.m_now);
+    BOOST_CHECK_EQUAL(started->connected_peers, 0U);
+    BOOST_CHECK(started->no_peers_since == f.clock.m_now);
+    BOOST_REQUIRE_EQUAL(started->markets.size(), 1U);
+    const auto& row{started->markets.front()};
+    BOOST_CHECK(row.market_id == f.market);
+    BOOST_CHECK(row.installed);
+    BOOST_CHECK_EQUAL(row.epoch, 7U);
+    BOOST_CHECK_EQUAL(row.next_sequence, 0U);
+    BOOST_CHECK_EQUAL(row.active_seats, 4U);
+    BOOST_CHECK_EQUAL(row.quorum_required, 3U);
+    BOOST_CHECK(!row.halted);
+    BOOST_CHECK_EQUAL(row.halt, "none");
+    BOOST_CHECK(!row.head_advanced_at);
+    BOOST_CHECK(!row.lag.behind_since);
+
+    // Ticks inside the publish interval do not copy the rows again.
+    for (int i{0}; i < 10; ++i) f.runtime->NotifyTick();
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK(f.runtime->HealthSnapshot() == started);
+
+    f.chain.SetPausedTransition(f.market, "handoff_checkpoints_pending");
+    auto health{f.Health()};
+    BOOST_CHECK(health->markets.front().paused);
+    BOOST_CHECK_EQUAL(health->markets.front().pause_reason, "handoff_checkpoints_pending");
+    f.chain.SetTransition(f.market, node::FlowMeshSeatTransitionKind::CONTINUE);
+    health = f.Health();
+    BOOST_CHECK(!health->markets.front().paused);
+    BOOST_CHECK_EQUAL(health->markets.front().pause_reason, "");
+
+    f.runtime->FlowMeshPeerConnected(5);
+    health = f.Health();
+    BOOST_CHECK_EQUAL(health->connected_peers, 1U);
+    BOOST_CHECK(!health->no_peers_since);
+    f.runtime->FlowMeshPeerDisconnected(5);
+    const auto disconnected{f.clock.m_now};
+    health = f.Health();
+    BOOST_CHECK_EQUAL(health->connected_peers, 0U);
+    BOOST_CHECK(health->no_peers_since == disconnected);
+
+    // A verified certificate committed at our next sequence advances the
+    // head, observed on the local steady clock.
+    f.Certificate(9, 0);
+    health = f.Health();
+    BOOST_CHECK_EQUAL(health->markets.front().next_sequence, 1U);
+    BOOST_CHECK(health->markets.front().last_hash == f.entries[0].GetHash());
+    BOOST_CHECK(health->markets.front().head_advanced_at == f.clock.m_now - std::chrono::milliseconds{250});
+    BOOST_CHECK(health->markets.front().local_observed_at);
+
+    // A conflicting, validly certified entry at a durable sequence halts.
+    auto conflicting{f.entries[0]};
+    conflicting.state_root = Filled(0x99);
+    const auto conflict{flowmesh::EncodeProductionCertifiedPayload(
+        {conflicting, Certify(conflicting, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(conflict);
+    f.Send(9, {flowmesh::WireMessageKind::CERTIFICATE,
+               {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 0}, *conflict});
+    health = f.Health();
+    BOOST_CHECK(health->markets.front().halted);
+    BOOST_CHECK_EQUAL(health->markets.front().halt, "certificate-conflict");
+    BOOST_CHECK(!health->markets.front().error.empty());
+}
+
+BOOST_AUTO_TEST_CASE(health_lag_is_proven_only_by_verified_certificates_and_speculative_pages)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_health_lag"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+
+    // An unverified HELLO far ahead is shown as a hint only, and the catch-up
+    // it triggers is unchanged (one GET).
+    f.Hello(8, 999);
+    auto health{f.Health()};
+    BOOST_CHECK(!f.Lag(health).behind_since);
+    BOOST_CHECK(!f.Lag(health).proven_target);
+    BOOST_CHECK(!f.Lag(health).speculative);
+    BOOST_CHECK_EQUAL(f.Lag(health).peers_hinting_ahead, 1U);
+    BOOST_CHECK_EQUAL(*f.Lag(health).peer_hint_next_sequence, 999U);
+    BOOST_CHECK_EQUAL(f.Gets(8), 1U);
+
+    // A BLS-verified certificate for sequence 1 while we are at 0 proves lag.
+    f.Certificate(9, 1);
+    health = f.Health();
+    const auto behind_since{f.clock.m_now - std::chrono::milliseconds{250}};
+    BOOST_CHECK(f.Lag(health).behind_since == behind_since);
+    BOOST_CHECK_EQUAL(*f.Lag(health).proven_target, 2U);
+    BOOST_CHECK_EQUAL(f.Gets(9), 1U);
+    // A catch-up page of one entry with tail slack advances the head but not
+    // past the proven target; the episode keeps its start.
+    f.Entries(9, 0, {f.payloads[0]});
+    health = f.Health();
+    BOOST_CHECK_EQUAL(health->markets.front().next_sequence, 1U);
+    BOOST_CHECK(f.Lag(health).behind_since == behind_since);
+    BOOST_CHECK_EQUAL(*f.Lag(health).proven_target, 2U);
+    BOOST_CHECK(!f.Lag(health).speculative);
+    // No announcement at or below our head, from any peer, clears it.
+    f.Hello(9, 1);
+    f.Hello(8, 1);
+    health = f.Health();
+    BOOST_CHECK(f.Lag(health).behind_since == behind_since);
+    // Committing the proven sequence ends it.
+    f.Certificate(9, 1);
+    health = f.Health();
+    BOOST_CHECK_EQUAL(health->markets.front().next_sequence, 2U);
+    BOOST_CHECK(!f.Lag(health).behind_since);
+    BOOST_CHECK(!f.Lag(health).proven_target);
+
+    // A page whose valid prefix is followed by an invalid entry has no tail
+    // slack: speculative lag, which only its serving peer's announcement at
+    // or below our head (or a timeout) ends.
+    f.Hello(10, 5);
+    BOOST_REQUIRE_EQUAL(f.Gets(10), 1U);
+    f.Entries(10, 2, {f.payloads[2], {0x42}});
+    health = f.Health();
+    BOOST_CHECK_EQUAL(health->markets.front().next_sequence, 3U);
+    BOOST_CHECK(f.Lag(health).speculative);
+    BOOST_CHECK(f.Lag(health).behind_since);
+    BOOST_CHECK(!f.Lag(health).proven_target);
+    f.clock.m_now += std::chrono::seconds{1}; // Refill the control budget.
+    f.Hello(11, 3);
+    health = f.Health();
+    BOOST_CHECK(f.Lag(health).speculative);
+    f.Hello(10, 3);
+    health = f.Health();
+    BOOST_CHECK(!f.Lag(health).speculative);
+    BOOST_CHECK(!f.Lag(health).behind_since);
+    // Peer 8's hint ended with its announcement at our head. A new hint
+    // expires when it is not repeated.
+    BOOST_CHECK_EQUAL(f.Lag(health).peers_hinting_ahead, 0U);
+    f.Hello(12, 50);
+    BOOST_CHECK_EQUAL(f.Lag(f.Health()).peers_hinting_ahead, 1U);
+    f.clock.m_now += node::FlowMeshLagTracker::HINT_TTL;
+    BOOST_CHECK_EQUAL(f.Lag(f.Health()).peers_hinting_ahead, 0U);
+    BOOST_CHECK(!f.Lag(f.Health()).behind_since);
+}
+
+BOOST_AUTO_TEST_CASE(health_snapshot_is_readable_while_the_worker_is_blocked)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_health_blocked"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    const auto before{f.Health()};
+    {
+        std::lock_guard<std::mutex> lock{f.relay_mutex};
+        f.block_gets = true;
+    }
+    // The HELLO's catch-up request blocks the worker inside the relay
+    // callback, holding the market lock every ordinary read waits for.
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(8, {flowmesh::WireMessageKind::HELLO,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 4},
+        flowmesh::EncodeMarketHello({f.domain, Filled(0x7a)})}) == flowmesh::QueueResult::ACCEPTED);
+    {
+        std::unique_lock<std::mutex> lock{f.relay_mutex};
+        BOOST_REQUIRE(f.relay_cv.wait_for(lock, std::chrono::seconds{5}, [&] { return f.relay_blocked; }));
+    }
+    const auto start{std::chrono::steady_clock::now()};
+    const auto health{f.runtime->HealthSnapshot()};
+    BOOST_CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds{100});
+    BOOST_REQUIRE(health);
+    // The observation's age, not a blocked read, reports the stalled worker.
+    BOOST_CHECK(health->published_at == before->published_at);
+    {
+        std::lock_guard<std::mutex> lock{f.relay_mutex};
+        f.block_gets = false;
+    }
+    f.relay_cv.notify_all();
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
 }
 
 BOOST_AUTO_TEST_CASE(preagreement_runtime_commit_gate_genesis_deposit_and_exact_restart)
