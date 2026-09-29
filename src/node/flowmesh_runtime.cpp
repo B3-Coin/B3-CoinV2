@@ -3238,6 +3238,7 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
     TraceContext trace;
     std::optional<flowmesh::ClientActionNotice> notice;
     uint256 domain, config_id;
+    const flowmesh::DepositVerifier* deposits{nullptr};
     {
         FlowMeshTimingSpan timing_lock_3034{__func__};
         timing_lock_3034.Field("lock_name", std::string{"market_mutex"});
@@ -3265,7 +3266,28 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
             message.payload = *payload;
             trace.epoch = message.header.epoch;
             trace.seat_set_hash = it->second->seats.set_hash;
+            deposits = it->second->deposits;
+            // Kept for a facts refusal's notice (built outside the lock).
+            if (action.IsDeposit()) notice = LocalNotice(*it->second, action, out.admission, *payload);
         }
+    }
+    if (out.admission.kind == FlowMeshLocalAdmission::Kind::ENQUEUE && action.IsDeposit()) {
+        // A deposit is admitted only with anchored facts. Checked here, on the
+        // submitting thread and outside the market lock (this takes cs_main),
+        // never on the consensus worker: the public API cannot put chain
+        // calls on the worker, nor fill the pool with fact-less deposits.
+        // Remote deposits are unchanged, so mixed committees are unaffected.
+        const bool facts{deposits != nullptr && deposits->GetDeposit(action.outpoint, m_config.chain->Current())};
+        if (!facts) {
+            out.admission.kind = FlowMeshLocalAdmission::Kind::REFUSE;
+            out.admission.code = flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE;
+            notice->code = out.admission.code;
+            // Bound to this reply and a notice only: no v1 event, which any
+            // later attempt for the same outpoint could otherwise inherit.
+            m_client_events.AppendNotices({std::move(*notice)});
+            return out;
+        }
+        notice.reset();
     }
     if (notice) {
         // Answered from certified state: nothing is queued, relayed or

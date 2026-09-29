@@ -37,6 +37,8 @@ inline constexpr uint64_t FLOWMESH_LOCAL_MAX_SEQUENCE_AHEAD{64};
  * - UNKNOWN_OUTCOME: the sequence or deposit is already used in certified
  *   state but this node no longer knows by which action: "unknown", never
  *   "rejected", and never queued again.
+ * The runtime can also REFUSE a local deposit that the decision would queue
+ * when its anchored facts are unavailable (DEPOSIT_FACTS_UNAVAILABLE).
  */
 struct FlowMeshLocalAdmission {
     enum class Kind : uint8_t { ENQUEUE, ALREADY_INCLUDED, REFUSE, UNKNOWN_OUTCOME };
@@ -127,6 +129,8 @@ inline std::string FlowMeshLocalAdmissionText(const FlowMeshLocalAdmission& admi
                "action used it; outcome unknown; not queued again";
     case Code::DEPOSIT_ALREADY_CREDITED:
         return "FlowMesh deposit is already credited in certified state; its batch is no longer retained here; not queued again";
+    case Code::DEPOSIT_FACTS_UNAVAILABLE:
+        return "FlowMesh deposit has no anchored facts at the current B3 anchor; this attempt was not queued";
     default:
         return {};
     }

@@ -4539,9 +4539,16 @@ BOOST_AUTO_TEST_CASE(four_node_commit_pause_dynamic_catchup_and_isolated_halt)
     // A certified rejection is terminal for that exact action. In
     // particular, an unknown deposit must leave the pool after one slot or
     // it could generate an unbounded stream of zero-effect certificates.
-    BOOST_REQUIRE(runtimes[0]->SubmitLocalAction(
-                      market_a, Deposit(rejected_deposit)) ==
-                  flowmesh::QueueResult::ACCEPTED);
+    // This node's own API refuses a deposit without anchored facts, so the
+    // unknown deposit arrives the way it still can: relayed by a peer.
+    {
+        const auto head{runtimes[0]->MarketStatus(market_a)};
+        BOOST_REQUIRE(head);
+        BOOST_REQUIRE(runtimes[0]->EnqueueWireMessage(99, {flowmesh::WireMessageKind::ACTION,
+            {flowmesh::FLOWMESH_WIRE_VERSION_V1, market_a, head->epoch, head->next_sequence},
+            *flowmesh::EncodeProductionActionPayload(Deposit(rejected_deposit))}) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
     BOOST_REQUIRE(WaitUntil([&] {
         for (size_t i{0}; i < 3; ++i) {
             const auto status{runtimes[i]->MarketStatus(market_a)};
@@ -6201,10 +6208,15 @@ BOOST_AUTO_TEST_CASE(incoming_committee_waits_for_mature_handoff_publication)
     // All incoming keys are armed, and work may queue, but a first-connect
     // publication remains owned by the outgoing marker and creates no signing
     // lock for the incoming epoch.
-    BOOST_REQUIRE(runtime.SubmitLocalAction(
-                      market,
-                      Deposit(COutPoint{Txid::FromUint256(Filled(0x91)), 0})) ==
-                  flowmesh::QueueResult::ACCEPTED);
+    // (A relayed deposit: this node's own API refuses fact-less deposits.)
+    {
+        const auto head{runtime.MarketStatus(market)};
+        BOOST_REQUIRE(head);
+        BOOST_REQUIRE(runtime.EnqueueWireMessage(99, {flowmesh::WireMessageKind::ACTION,
+            {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, head->epoch, head->next_sequence},
+            *flowmesh::EncodeProductionActionPayload(Deposit(COutPoint{Txid::FromUint256(Filled(0x91)), 0}))}) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
     const node::ProductionB3Connection shallow{261, Filled(0xc1)};
     chain.SetTipHeight(261);
     chain.ConnectHandoff(
@@ -9476,6 +9488,44 @@ BOOST_AUTO_TEST_CASE(prune_publishes_local_drop_notice_with_consumer_from_same_e
         BOOST_CHECK(!f.runtimes[i]->NewestClientNotice(f.market, queued.Id()));
         BOOST_CHECK(!f.runtimes[i]->NewestClientNotice(f.market, remote_only.Id()));
     }
+}
+
+BOOST_AUTO_TEST_CASE(local_factless_deposit_refused_not_relayed_but_remote_still_admitted)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_factless_deposit"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    const auto factless{Deposit(COutPoint{f.outpoint.hash, 77})};
+    const auto before{runtime.ClientEventCursor()};
+    const auto refused{runtime.SubmitLocalActionChecked(f.market, factless)};
+    BOOST_CHECK(!refused.queued);
+    BOOST_CHECK(refused.admission.kind == node::FlowMeshLocalAdmission::Kind::REFUSE);
+    BOOST_CHECK(refused.admission.code == flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+    BOOST_CHECK_EQUAL(node::FlowMeshLocalAdmissionText(refused.admission),
+                      "FlowMesh deposit has no anchored facts at the current B3 anchor; this attempt was not queued");
+    f.Drain();
+    // Bound to the reply: no v1 event another attempt could inherit, no pool
+    // entry, no relay; the notice records the observation.
+    BOOST_CHECK(runtime.ClientEvents(before, f.market, std::nullopt).events.empty());
+    for (const auto& node : f.runtimes) BOOST_CHECK_EQUAL(node->MarketStatus(f.market)->pending_actions, 0U);
+    const auto notice{runtime.NewestClientNotice(f.market, factless.Id())};
+    BOOST_REQUIRE(notice);
+    BOOST_CHECK(notice->code == flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+    // A deposit with anchored facts is queued as before.
+    const auto with_facts{runtime.SubmitLocalActionChecked(f.market, Deposit(f.outpoint))};
+    BOOST_CHECK(with_facts.queued && *with_facts.queued == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 1U);
+    // remote_factless_deposit_still_admitted_for_old_proposer: a relayed
+    // fact-less deposit is pooled exactly as before.
+    const flowmesh::WireHeader header{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1};
+    BOOST_REQUIRE(f.runtimes[1]->EnqueueWireMessage(3, {flowmesh::WireMessageKind::ACTION, header,
+        *flowmesh::EncodeProductionActionPayload(factless)}) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(f.runtimes[1]->MarketStatus(f.market)->pending_actions, 2U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
