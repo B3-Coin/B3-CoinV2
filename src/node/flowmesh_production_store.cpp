@@ -7,6 +7,7 @@
 
 #include <consensus/flowmesh_params.h>
 #include <crypto/common.h>
+#include <flowmesh/market_view.h>
 #include <flowmesh/production_wire.h>
 #include <logging.h>
 #include <random.h>
@@ -139,9 +140,12 @@ struct StoreTrace {
     }
 };
 
+//! `post` is the state right after `result`'s execution, or null when it is
+//! not at hand; a clearing's rationed side is then UNKNOWN, never guessed.
 void CacheMarketHistory(std::deque<flowmesh::MarketHistoryEntry>& history,
                         const flowmesh::ProductionEntryCore& entry,
-                        const flowmesh::BatchResult* result)
+                        const flowmesh::BatchResult* result,
+                        const flowmesh::FlowMeshState* post)
 {
     flowmesh::MarketHistoryEntry item;
     item.sequence = entry.sequence;
@@ -179,6 +183,11 @@ void CacheMarketHistory(std::deque<flowmesh::MarketHistoryEntry>& history,
             item.account_fills.push_back(fill);
         }
         item.account_fills_complete = bid == clearing.bid_fill.end() && ask == clearing.ask_fill.end();
+        item.settlement = !result->settled_withdrawals.empty();
+        item.imbalance = clearing.imbalance;
+        item.imbalance_side = !clearing.cleared ? flowmesh::ImbalanceSide::NONE
+                              : post ? flowmesh::ObserveImbalanceSide(clearing, *post)
+                                     : flowmesh::ImbalanceSide::UNKNOWN;
     }
     history.push_back(std::move(item));
     if (history.size() > flowmesh::MARKET_DATA_HISTORY_CAPACITY) history.pop_front();
@@ -1812,7 +1821,7 @@ bool FlowMeshProductionStore::AppendExecution(
         error = std::string{"FlowMesh v3 execution append failed: "} + e.what();
         return false;
     }
-    CacheMarketHistory(m_market_history, entry, &executed->result);
+    CacheMarketHistory(m_market_history, entry, &executed->result, &executed->next_state);
     next_state_out = executed->next_state;
     // After the durable write and after MakeDiskEntry consumed the effects:
     // hand the caller this exact re-execution by move. Nothing is encoded.
@@ -1917,7 +1926,7 @@ bool FlowMeshProductionStore::AppendHandoff(
         error = std::string{"FlowMesh v3 handoff append failed: "} + e.what();
         return false;
     }
-    CacheMarketHistory(m_market_history, handoff, nullptr);
+    CacheMarketHistory(m_market_history, handoff, nullptr, nullptr);
     return true;
 }
 
@@ -2223,7 +2232,11 @@ bool FlowMeshProductionStore::Replay(
                 error = "FlowMesh v3 replay effects/settlements differ from deterministic execution";
                 return false;
             }
-            CacheMarketHistory(history, stored->entry, &executed->result);
+            // Only entries the bounded cache can retain pay for observing
+            // the rationed side on their post-execution book.
+            const bool retained{marker.next_sequence - sequence <= flowmesh::MARKET_DATA_HISTORY_CAPACITY};
+            CacheMarketHistory(history, stored->entry, &executed->result,
+                               retained ? &executed->next_state : nullptr);
             working = executed->next_state;
             // Only the newest entries can survive the tail's count bound;
             // older ones cost no record at all.
@@ -2252,7 +2265,7 @@ bool FlowMeshProductionStore::Replay(
                 return false;
             }
 
-            CacheMarketHistory(history, stored->entry, nullptr);
+            CacheMarketHistory(history, stored->entry, nullptr, nullptr);
 
             DiskConnection connection;
             const ReadResult connected{

@@ -40,6 +40,24 @@ struct MarketAccountFill {
     CAmount ask_quantity{0};
 };
 
+/** Which side a clearing left unfilled at its uniform price: BID when buy
+ * interest remained, ASK when sell interest did. NONE for an exact match, an
+ * execution without a clearing, a settlement or a handoff. UNKNOWN only for a
+ * clearing whose post-execution book was not observed or disagreed with the
+ * committed imbalance. A display observation, never certified or committed. */
+enum class ImbalanceSide : uint8_t { NONE, BID, ASK, UNKNOWN };
+
+inline const char* ImbalanceSideName(const ImbalanceSide side)
+{
+    switch (side) {
+    case ImbalanceSide::NONE: return "none";
+    case ImbalanceSide::BID: return "bid";
+    case ImbalanceSide::ASK: return "ask";
+    case ImbalanceSide::UNKNOWN: return "unknown";
+    }
+    return "unknown";
+}
+
 /** Derived only from fully verified execution results, after durable commit.
  * There is deliberately no fabricated execution timestamp or candle. */
 struct MarketHistoryEntry {
@@ -56,6 +74,14 @@ struct MarketHistoryEntry {
     CAmount fee_atoms{0};
     std::vector<MarketAccountFill> account_fills;
     bool account_fills_complete{true};
+    // Display observations of the same verified execution; never part of a
+    // root, certificate, commitment or any reply that predates them.
+    //! A dedicated withdrawal-settlement execution (it never clears).
+    bool settlement{false};
+    //! The committed |demand - supply| at the clearing price, saturated at
+    //! MAX_MONEY exactly as ClearingResult::imbalance; zero without a clearing.
+    CAmount imbalance{0};
+    ImbalanceSide imbalance_side{ImbalanceSide::NONE};
 };
 
 struct MarketHistoryPage {

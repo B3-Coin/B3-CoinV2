@@ -1,0 +1,235 @@
+// Copyright (c) 2026 The B3Coin Core developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or https://opensource.org/license/mit/.
+
+//! Display derivations of verified FlowMesh state: the rationed side of a
+//! clearing. Checked against brute-force demand and supply on the book
+//! before the clearing, which the derivation never sees.
+
+#include <flowmesh/market_view.h>
+
+#include <flowmesh/state.h>
+#include <random.h>
+#include <test/util/asset.h>
+#include <test/util/flowmesh.h>
+#include <test/util/setup_common.h>
+#include <util/int128.h>
+
+#include <boost/test/unit_test.hpp>
+
+#include <algorithm>
+#include <limits>
+#include <vector>
+
+namespace {
+
+using Side = flowmesh::ClearingEngine::Side;
+using Breakpoint = flowmesh::ClearingEngine::Breakpoint;
+using flowmesh::ImbalanceSide;
+
+const uint256 VAULT{uint256{"00000000000000000000000000000000000000000000000000000000000000f1"}};
+
+modern::AssetId Base()
+{
+    return modern::test_only::SyntheticAssetId(COutPoint{
+        Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}), 0});
+}
+
+flowmesh::AccountId Account(const uint8_t index)
+{
+    uint256 out;
+    *out.begin() = index + 1;
+    return out;
+}
+
+flowmesh::FlowMeshState EmptyState()
+{
+    return flowmesh::FlowMeshState{VAULT, Base(), modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+}
+
+void Fund(flowmesh::FlowMeshState& state, const flowmesh::AccountId& account, const CAmount amount = 1'000'000'000'000)
+{
+    BOOST_REQUIRE(flowmesh::test_only::StateFunding::Fund(state, account, modern::NativeAsset(), amount));
+    BOOST_REQUIRE(flowmesh::test_only::StateFunding::Fund(state, account, Base(), amount));
+}
+
+//! A valid random curve: a limit shape or a general monotone curve.
+std::vector<Breakpoint> RandomCurve(FastRandomContext& rng, const Side side)
+{
+    const bool limit{rng.randbool()};
+    const CAmount price{static_cast<CAmount>(1 + rng.randrange(40))};
+    const CAmount quantity{static_cast<CAmount>(1 + rng.randrange(1000))};
+    if (limit) {
+        return side == Side::BID ? *flowmesh::MakeLimitBidCurve(price, quantity)
+                                 : *flowmesh::MakeLimitAskCurve(price, quantity);
+    }
+    const size_t points{2 + rng.randrange(flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS - 1)};
+    std::vector<CAmount> prices;
+    CAmount p{static_cast<CAmount>(rng.randrange(20))};
+    for (size_t i{0}; i < points; ++i) {
+        prices.push_back(p);
+        p += 1 + static_cast<CAmount>(rng.randrange(8));
+    }
+    std::vector<CAmount> quantities;
+    for (size_t i{0}; i < points; ++i) quantities.push_back(static_cast<CAmount>(rng.randrange(1000)));
+    std::sort(quantities.begin(), quantities.end());
+    if (side == Side::BID) {
+        std::reverse(quantities.begin(), quantities.end());
+        quantities.back() = 0;
+        if (quantities.front() == 0) quantities.front() = 1 + static_cast<CAmount>(rng.randrange(1000));
+    } else if (quantities.back() == 0) {
+        quantities.back() = 1 + static_cast<CAmount>(rng.randrange(1000));
+    }
+    std::vector<Breakpoint> out;
+    for (size_t i{0}; i < points; ++i) out.push_back({prices[i], quantities[i]});
+    return out;
+}
+
+//! Demand or supply at `price` on the book, straight from the curves.
+util::Signed128 SideTotal(const flowmesh::FlowMeshState& state, const Side side, const CAmount price)
+{
+    util::Signed128 total{0};
+    for (const auto& curve : state.ReadCurves(std::numeric_limits<size_t>::max()).curves) {
+        if (curve.side != side) continue;
+        total += std::max<CAmount>(0, flowmesh::ClearingEngine::EvaluateCurve(curve.points, price) - curve.filled_quantity);
+    }
+    return total;
+}
+
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_market_view_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(imbalance_side_matches_brute_force_demand_and_supply)
+{
+    FastRandomContext rng{uint256{41}};
+    size_t bids_long{0}, asks_long{0}, exact{0}, unmatched{0};
+    for (int iteration{0}; iteration < 400; ++iteration) {
+        auto state{EmptyState()};
+        const uint8_t accounts{static_cast<uint8_t>(2 + rng.randrange(10))};
+        for (uint8_t i{0}; i < accounts; ++i) Fund(state, Account(i));
+        const auto submit = [&] {
+            for (uint8_t i{0}; i < accounts; ++i) {
+                for (const Side side : {Side::BID, Side::ASK}) {
+                    if (rng.randrange(3) == 0) continue;
+                    const auto curve{RandomCurve(rng, side)};
+                    BOOST_REQUIRE(state.CurveIsValid(side, curve));
+                    BOOST_REQUIRE(state.SubmitCurve(Account(i), side, curve));
+                }
+            }
+        };
+        // A first clearing leaves partially filled standing curves behind.
+        submit();
+        BOOST_REQUIRE(state.ClearSlot());
+        if (rng.randbool()) submit();
+
+        const auto pre{state};
+        const auto clearing{state.ClearSlot()};
+        BOOST_REQUIRE(clearing);
+        const auto side{flowmesh::ObserveImbalanceSide(*clearing, state)};
+        if (!clearing->cleared) {
+            BOOST_CHECK(side == ImbalanceSide::NONE);
+            ++unmatched;
+            continue;
+        }
+        const auto demand{SideTotal(pre, Side::BID, clearing->price)};
+        const auto supply{SideTotal(pre, Side::ASK, clearing->price)};
+        const auto expected{demand > supply ? ImbalanceSide::BID : demand < supply ? ImbalanceSide::ASK : ImbalanceSide::NONE};
+        BOOST_CHECK(side == expected);
+        // The observed long-side residual is exactly the committed imbalance.
+        const util::Signed128 residual{expected == ImbalanceSide::BID ? SideTotal(state, Side::BID, clearing->price)
+                                                                     : SideTotal(state, Side::ASK, clearing->price)};
+        BOOST_CHECK(residual == static_cast<util::Signed128>(clearing->imbalance));
+        bids_long += expected == ImbalanceSide::BID;
+        asks_long += expected == ImbalanceSide::ASK;
+        exact += expected == ImbalanceSide::NONE;
+    }
+    // The sample covers every outcome.
+    BOOST_CHECK(bids_long > 20 && asks_long > 20 && exact > 0 && unmatched > 0);
+}
+
+BOOST_AUTO_TEST_CASE(imbalance_side_counts_long_curves_that_received_nothing)
+{
+    // Three one-unit bids against one unit: largest-remainder rationing
+    // gives the first account the unit and the other two nothing.
+    auto bids{EmptyState()};
+    for (uint8_t i{0}; i < 4; ++i) Fund(bids, Account(i));
+    for (uint8_t i{0}; i < 3; ++i) BOOST_REQUIRE(bids.SubmitCurve(Account(i), Side::BID, *flowmesh::MakeLimitBidCurve(10, 1)));
+    BOOST_REQUIRE(bids.SubmitCurve(Account(3), Side::ASK, *flowmesh::MakeLimitAskCurve(10, 1)));
+    const auto rationed{bids.ClearSlot()};
+    BOOST_REQUIRE(rationed && rationed->cleared);
+    BOOST_CHECK_EQUAL(rationed->volume, 1);
+    BOOST_CHECK_EQUAL(rationed->imbalance, 2);
+    BOOST_CHECK_EQUAL(rationed->bid_fill.size(), 3U);
+    BOOST_CHECK_EQUAL(rationed->bid_fill.at(Account(1)), 0);
+    BOOST_CHECK(flowmesh::ObserveImbalanceSide(*rationed, bids) == ImbalanceSide::BID);
+
+    // The mirror image rations the asks.
+    auto asks{EmptyState()};
+    for (uint8_t i{0}; i < 4; ++i) Fund(asks, Account(i));
+    for (uint8_t i{0}; i < 3; ++i) BOOST_REQUIRE(asks.SubmitCurve(Account(i), Side::ASK, *flowmesh::MakeLimitAskCurve(10, 1)));
+    BOOST_REQUIRE(asks.SubmitCurve(Account(3), Side::BID, *flowmesh::MakeLimitBidCurve(10, 1)));
+    const auto sellers{asks.ClearSlot()};
+    BOOST_REQUIRE(sellers && sellers->cleared);
+    BOOST_CHECK_EQUAL(sellers->imbalance, 2);
+    BOOST_CHECK(flowmesh::ObserveImbalanceSide(*sellers, asks) == ImbalanceSide::ASK);
+}
+
+BOOST_AUTO_TEST_CASE(imbalance_side_is_unknown_when_the_book_disagrees)
+{
+    auto state{EmptyState()};
+    for (uint8_t i{0}; i < 2; ++i) Fund(state, Account(i));
+    BOOST_REQUIRE(state.SubmitCurve(Account(0), Side::BID, *flowmesh::MakeLimitBidCurve(10, 5)));
+    BOOST_REQUIRE(state.SubmitCurve(Account(1), Side::ASK, *flowmesh::MakeLimitAskCurve(10, 3)));
+    const auto pre{state};
+    const auto clearing{state.ClearSlot()};
+    BOOST_REQUIRE(clearing && clearing->cleared);
+    BOOST_CHECK(flowmesh::ObserveImbalanceSide(*clearing, state) == ImbalanceSide::BID);
+    // The book before the clearing still has quantity on both sides.
+    BOOST_CHECK(flowmesh::ObserveImbalanceSide(*clearing, pre) == ImbalanceSide::UNKNOWN);
+    // A residual that is not the committed imbalance.
+    auto altered{*clearing};
+    altered.imbalance = 1;
+    BOOST_CHECK(flowmesh::ObserveImbalanceSide(altered, state) == ImbalanceSide::UNKNOWN);
+    altered.imbalance = MAX_MONEY;
+    BOOST_CHECK(flowmesh::ObserveImbalanceSide(altered, state) == ImbalanceSide::UNKNOWN);
+    // No residual, but a nonzero imbalance.
+    auto empty{EmptyState()};
+    altered.imbalance = 2;
+    BOOST_CHECK(flowmesh::ObserveImbalanceSide(altered, empty) == ImbalanceSide::UNKNOWN);
+}
+
+BOOST_AUTO_TEST_CASE(imbalance_side_accepts_only_a_residual_consistent_with_saturation)
+{
+    // Two zero-price bids of MAX_MONEY reserve nothing; one unit of supply
+    // leaves 2*MAX_MONEY - 1 of demand, committed as MAX_MONEY.
+    auto state{EmptyState()};
+    for (uint8_t i{0}; i < 3; ++i) Fund(state, Account(i));
+    BOOST_REQUIRE(state.SubmitCurve(Account(0), Side::BID, *flowmesh::MakeLimitBidCurve(0, MAX_MONEY)));
+    BOOST_REQUIRE(state.SubmitCurve(Account(1), Side::BID, *flowmesh::MakeLimitBidCurve(0, MAX_MONEY)));
+    BOOST_REQUIRE(state.SubmitCurve(Account(2), Side::ASK, *flowmesh::MakeLimitAskCurve(0, 1)));
+    const auto clearing{state.ClearSlot()};
+    BOOST_REQUIRE(clearing && clearing->cleared);
+    BOOST_CHECK_EQUAL(clearing->price, 0);
+    BOOST_CHECK_EQUAL(clearing->imbalance, MAX_MONEY);
+    BOOST_CHECK(flowmesh::ObserveImbalanceSide(*clearing, state) == ImbalanceSide::BID);
+}
+
+BOOST_AUTO_TEST_CASE(imbalance_side_is_none_without_a_clearing_or_for_an_exact_match)
+{
+    auto state{EmptyState()};
+    for (uint8_t i{0}; i < 2; ++i) Fund(state, Account(i));
+    BOOST_REQUIRE(state.SubmitCurve(Account(0), Side::BID, *flowmesh::MakeLimitBidCurve(9, 5)));
+    BOOST_REQUIRE(state.SubmitCurve(Account(1), Side::ASK, *flowmesh::MakeLimitAskCurve(10, 5)));
+    const auto uncrossed{state.ClearSlot()};
+    BOOST_REQUIRE(uncrossed && !uncrossed->cleared);
+    BOOST_CHECK(flowmesh::ObserveImbalanceSide(*uncrossed, state) == ImbalanceSide::NONE);
+    BOOST_REQUIRE(state.SubmitCurve(Account(0), Side::BID, *flowmesh::MakeLimitBidCurve(10, 5)));
+    const auto matched{state.ClearSlot()};
+    BOOST_REQUIRE(matched && matched->cleared);
+    BOOST_CHECK_EQUAL(matched->imbalance, 0);
+    BOOST_CHECK(flowmesh::ObserveImbalanceSide(*matched, state) == ImbalanceSide::NONE);
+    BOOST_CHECK(state.ReadCurves(8).curves.empty());
+}
+
+BOOST_AUTO_TEST_SUITE_END()

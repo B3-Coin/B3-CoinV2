@@ -292,6 +292,9 @@ struct Scenario {
     EmptyChainFacts chain_facts;
     flowmesh::FlowMeshState state0{vault, asset, modern::NativeAsset(),
                                    flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    //! The first entry's bid at price 100 against a 200-unit ask; above 200
+    //! the bid side is rationed and keeps the excess standing.
+    CAmount bid_quantity;
     flowmesh::BuiltProductionExecution execution0;
     flowmesh::ProductionEntryCore handoff1;
     flowmesh::BuiltProductionExecution execution2;
@@ -299,8 +302,8 @@ struct Scenario {
     flowmesh::BlsMicroblockCertificate certificate1;
     flowmesh::BlsMicroblockCertificate certificate2;
 
-    Scenario()
-        : execution0{BuildFirst()}, handoff1{BuildHandoff()},
+    explicit Scenario(const CAmount bid = 200)
+        : bid_quantity{bid}, execution0{BuildFirst()}, handoff1{BuildHandoff()},
           execution2{BuildNext()}
     {
         certificate0 = Certify(execution0.entry, seats0);
@@ -321,13 +324,13 @@ private:
             anchors.Add(anchor);
         }
         BOOST_REQUIRE(flowmesh::test_only::StateFunding::Fund(
-            state0, buyer, modern::NativeAsset(), 20'000));
+            state0, buyer, modern::NativeAsset(), 100 * bid_quantity));
         BOOST_REQUIRE(flowmesh::test_only::StateFunding::Fund(
             state0, seller, asset, 200));
         BOOST_REQUIRE(flowmesh::test_only::StateFunding::Fund(
             state0, withdrawer, asset, 50));
         const std::vector<flowmesh::Action> actions{
-            Ask(seller, 0, 100, 200), Bid(buyer, 0, 100, 200),
+            Ask(seller, 0, 100, 200), Bid(buyer, 0, 100, bid_quantity),
             Withdraw(withdrawer, 0, asset, 25, Filled(0x64))};
         flowmesh::ProductionEpochGate gate{domain, market, seats0.seats};
         flowmesh::ProductionEntryCheck check;
@@ -735,6 +738,111 @@ BOOST_AUTO_TEST_CASE(atomic_execution_handoff_connection_and_epoch_replay)
     BOOST_CHECK_EQUAL(replayed_history.entries.back().fee_atoms, 2);
     BOOST_CHECK(reopened.LockOnce({8, 3}, Filled(0xee)) ==
                 flowmesh::ProductionLockResult::STORAGE_FAILURE);
+}
+
+BOOST_AUTO_TEST_CASE(market_history_records_the_rationed_side_across_handoff_and_replay)
+{
+    // A 300-unit bid meets a 200-unit ask at 100: the bid side is rationed
+    // and keeps 100 standing. The handoff and the next, matchless execution
+    // clear nothing.
+    Scenario scenario{300};
+    const fs::path path{m_args.GetDataDirBase() / "flowmesh_production_rationed"};
+    std::string error;
+    const uint256 initial_root{scenario.state0.Root()};
+    const auto execution_checkpoint{
+        Checkpoint(scenario.execution0.entry, scenario.certificate0,
+                   scenario.seats0.seats, {})};
+    const auto execution_checkpoint_id{
+        modern::FlowMeshCheckpointIdV1(execution_checkpoint.core)};
+    BOOST_REQUIRE(execution_checkpoint_id.has_value());
+    const auto handoff_checkpoint{Checkpoint(
+        scenario.handoff1, scenario.certificate1, scenario.seats0.seats,
+        *execution_checkpoint_id)};
+    const auto check_sides = [&](const flowmesh::MarketHistoryPage& page) {
+        BOOST_REQUIRE(page.available);
+        BOOST_REQUIRE_EQUAL(page.entries.size(), 3U);
+        const auto& matchless{page.entries[0]};
+        const auto& handoff{page.entries[1]};
+        const auto& trade{page.entries[2]};
+        BOOST_CHECK(trade.cleared && !trade.handoff && !trade.settlement);
+        BOOST_CHECK_EQUAL(trade.quantity, 200);
+        BOOST_CHECK_EQUAL(trade.imbalance, 100);
+        BOOST_CHECK(trade.imbalance_side == flowmesh::ImbalanceSide::BID);
+        BOOST_CHECK(handoff.handoff && !handoff.cleared);
+        BOOST_CHECK_EQUAL(handoff.imbalance, 0);
+        BOOST_CHECK(handoff.imbalance_side == flowmesh::ImbalanceSide::NONE);
+        BOOST_CHECK(!matchless.cleared && !matchless.handoff);
+        BOOST_CHECK_EQUAL(matchless.imbalance, 0);
+        BOOST_CHECK(matchless.imbalance_side == flowmesh::ImbalanceSide::NONE);
+    };
+    {
+        node::FlowMeshProductionStore store{DBParams{
+            .path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        BOOST_REQUIRE_MESSAGE(store.OpenForMarket(
+                                  scenario.domain, scenario.market,
+                                  scenario.seats0.seats, initial_root, error),
+                              error);
+        flowmesh::FlowMeshState committed{scenario.state0};
+        BOOST_REQUIRE_MESSAGE(store.AppendExecution(
+                                  scenario.execution0.entry,
+                                  scenario.certificate0, scenario.seats0.seats,
+                                  scenario.state0,
+                                  {300, flowmesh::AnchorRef{190, Filled(0x73)},
+                                   &scenario.anchors},
+                                  scenario.treasury, &scenario.chain_facts,
+                                  committed, error),
+                              error);
+        BOOST_REQUIRE_MESSAGE(store.MarkExecutionCheckpointConnected(
+                                  execution_checkpoint, scenario.seats0.seats,
+                                  {240, Filled(0xa0)}, error),
+                              error);
+        BOOST_REQUIRE_MESSAGE(store.AppendHandoff(
+                                  scenario.handoff1, scenario.certificate1,
+                                  scenario.seats0.seats, scenario.seats1.seats,
+                                  committed,
+                                  {300, flowmesh::AnchorRef{200, Filled(0x74)},
+                                   &scenario.anchors},
+                                  error),
+                              error);
+        BOOST_REQUIRE_MESSAGE(store.MarkHandoffCheckpointConnected(
+                                  handoff_checkpoint, scenario.seats0.seats,
+                                  scenario.seats1.seats,
+                                  {241, Filled(0xa1)}, 300, error),
+                              error);
+        flowmesh::FlowMeshState next{committed};
+        BOOST_REQUIRE_MESSAGE(store.AppendExecution(
+                                  scenario.execution2.entry,
+                                  scenario.certificate2, scenario.seats1.seats,
+                                  committed,
+                                  {300, flowmesh::AnchorRef{210, Filled(0x75)},
+                                   &scenario.anchors},
+                                  scenario.treasury, &scenario.chain_facts,
+                                  next, error),
+                              error);
+        check_sides(store.ReadMarketHistory(3, 50));
+    }
+
+    // Startup replay observes the same sides on the replayed states.
+    node::FlowMeshProductionStore reopened{
+        DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+    BOOST_REQUIRE_MESSAGE(reopened.OpenForMarket(
+                              scenario.domain, scenario.market,
+                              scenario.seats0.seats, initial_root, error),
+                          error);
+    SeatSource source;
+    source.m_domain = scenario.domain;
+    source.m_market = scenario.market;
+    source.Add(scenario.seats0.seats);
+    source.Add(scenario.seats1.seats);
+    flowmesh::FlowMeshState replayed{scenario.state0};
+    uint256 last_hash;
+    BOOST_REQUIRE_MESSAGE(reopened.Replay(
+                              replayed, last_hash, source,
+                              {300, flowmesh::AnchorRef{190, Filled(0x73)},
+                               &scenario.anchors},
+                              scenario.treasury, &scenario.chain_facts, error),
+                          error);
+    check_sides(reopened.ReadMarketHistory(3, 50));
 }
 
 BOOST_AUTO_TEST_CASE(genesis_and_ordinary_checkpoint_reorgs_republish_and_restart)
