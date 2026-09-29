@@ -35,7 +35,8 @@ bool Shape(const SeatEvidence& evidence)
 {
     return KnownKind(static_cast<uint8_t>(evidence.kind)) && !evidence.domain.IsNull() &&
            !evidence.market_id.IsNull() && StatementShape(evidence.kind, evidence.first) &&
-           StatementShape(evidence.kind, evidence.second);
+           StatementShape(evidence.kind, evidence.second) &&
+           evidence.seat_public_key.has_value() == (evidence.kind == SeatEvidenceKind::ATTESTATION_EQUIVOCATION);
 }
 
 template <typename Stream>
@@ -117,6 +118,7 @@ const char* SeatEvidenceCheckName(const SeatEvidenceCheck check)
     case SeatEvidenceCheck::MALFORMED: return "malformed";
     case SeatEvidenceCheck::NOT_CONFLICTING: return "not_conflicting";
     case SeatEvidenceCheck::WRONG_SEAT_SET: return "wrong_seat_set";
+    case SeatEvidenceCheck::WRONG_SEAT_KEY: return "wrong_seat_key";
     case SeatEvidenceCheck::BAD_FIRST_SIGNATURE: return "bad_first_signature";
     case SeatEvidenceCheck::BAD_SECOND_SIGNATURE: return "bad_second_signature";
     }
@@ -146,6 +148,7 @@ std::optional<std::vector<unsigned char>> EncodeSeatEvidence(const SeatEvidence&
     s << SEAT_EVIDENCE_VERSION << static_cast<uint8_t>(evidence.kind) << evidence.domain << evidence.market_id;
     WriteStatement(s, evidence.first);
     WriteStatement(s, evidence.second);
+    if (evidence.seat_public_key) s << *evidence.seat_public_key;
     if (s.size() > SEAT_EVIDENCE_MAX_BYTES) return std::nullopt;
     return std::vector<unsigned char>{UCharCast(s.data()), UCharCast(s.data()) + s.size()};
 }
@@ -164,6 +167,10 @@ std::optional<SeatEvidence> DecodeSeatEvidence(const std::span<const unsigned ch
         s >> out.domain >> out.market_id;
         ReadStatement(s, out.first);
         ReadStatement(s, out.second);
+        if (out.kind == SeatEvidenceKind::ATTESTATION_EQUIVOCATION) {
+            out.seat_public_key.emplace();
+            s >> *out.seat_public_key;
+        }
         if (!s.empty() || !Shape(out)) return std::nullopt;
         // Canonical: the bytes re-encode exactly (CompactSize included).
         const auto again{EncodeSeatEvidence(out)};
@@ -187,6 +194,11 @@ SeatEvidenceCheck CheckSeatEvidence(const SeatEvidence& evidence, const ActiveFn
     }
     if (!SeatSetMatches(evidence, a, first_seats) || !SeatSetMatches(evidence, b, second_seats)) {
         return SeatEvidenceCheck::WRONG_SEAT_SET;
+    }
+    if (evidence.kind == SeatEvidenceKind::ATTESTATION_EQUIVOCATION &&
+        (a.seat_index >= first_seats.Size() ||
+         *evidence.seat_public_key != first_seats.members[a.seat_index].key.Key().Compressed())) {
+        return SeatEvidenceCheck::WRONG_SEAT_KEY;
     }
     if (!StatementSignatureValid(evidence, a, first_seats)) return SeatEvidenceCheck::BAD_FIRST_SIGNATURE;
     if (!StatementSignatureValid(evidence, b, second_seats)) return SeatEvidenceCheck::BAD_SECOND_SIGNATURE;

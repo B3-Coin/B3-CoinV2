@@ -411,6 +411,7 @@ flowmesh::SeatEvidence ShapeOnlySeatEvidence(const Scenario& scenario, const uin
     out.second.microblock_hash = Filled(0xb2);
     out.first.signature.fill(0x01);
     out.second.signature.fill(0x02);
+    out.seat_public_key = scenario.seats0.seats.members[2].key.Key().Compressed();
     return out;
 }
 

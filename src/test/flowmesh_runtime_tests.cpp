@@ -7287,6 +7287,7 @@ BOOST_AUTO_TEST_CASE(seat_misbehaviour_evidence_is_recorded_restored_and_changes
         const auto& evidence{row.seat_evidence->front()};
         BOOST_CHECK(evidence.kind == flowmesh::SeatEvidenceKind::ATTESTATION_EQUIVOCATION);
         BOOST_CHECK_EQUAL(evidence.first.seat_index, 2U);
+        BOOST_CHECK(evidence.seat_public_key == f.seats.seats.members[2].key.Key().Compressed());
         BOOST_CHECK(evidence.first.microblock_hash == f.entries[0].GetHash());
         BOOST_CHECK(evidence.second.microblock_hash == other->entry.GetHash());
         BOOST_CHECK(flowmesh::CheckSeatEvidence(evidence, f.seats.seats, f.seats.seats) ==

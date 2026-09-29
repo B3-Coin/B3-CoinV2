@@ -96,7 +96,8 @@ struct EvidenceFixture {
         const auto b{Context(Filled(0xb2))};
         return {flowmesh::SeatEvidenceKind::ATTESTATION_EQUIVOCATION, domain, market,
                 flowmesh::SeatAttestationStatement(a, seat, Sign(seat, a)),
-                flowmesh::SeatAttestationStatement(b, seat, Sign(seat, b))};
+                flowmesh::SeatAttestationStatement(b, seat, Sign(seat, b)),
+                seats.seats.members[seat].key.Key().Compressed()};
     }
     flowmesh::BlsMicroblockCertificate Certify(const flowmesh::BlsCertificateContext& context,
                                                const std::vector<uint32_t>& signers) const
@@ -166,12 +167,21 @@ BOOST_AUTO_TEST_CASE(attestation_equivocation_is_self_verifiable)
     BOOST_CHECK(f.Check(forged_second) == flowmesh::SeatEvidenceCheck::BAD_SECOND_SIGNATURE);
     auto out_of_range{evidence};
     out_of_range.first.seat_index = out_of_range.second.seat_index = 4;
-    BOOST_CHECK(f.Check(out_of_range) == flowmesh::SeatEvidenceCheck::BAD_FIRST_SIGNATURE);
-    // An attestation carries no bitmap.
+    BOOST_CHECK(f.Check(out_of_range) == flowmesh::SeatEvidenceCheck::WRONG_SEAT_KEY);
+    // The named key must be the named seat's.
+    auto other_key{evidence};
+    other_key.seat_public_key = f.seats.seats.members[1].key.Key().Compressed();
+    BOOST_CHECK(f.Check(other_key) == flowmesh::SeatEvidenceCheck::WRONG_SEAT_KEY);
+    BOOST_CHECK(other_key.Id() == evidence.Id());
+    // An attestation carries no bitmap and always names its key.
     auto shaped{evidence};
     shaped.first.signer_bitmap = {0x07};
     BOOST_CHECK(f.Check(shaped) == flowmesh::SeatEvidenceCheck::MALFORMED);
     BOOST_CHECK(!flowmesh::EncodeSeatEvidence(shaped));
+    auto keyless{evidence};
+    keyless.seat_public_key.reset();
+    BOOST_CHECK(f.Check(keyless) == flowmesh::SeatEvidenceCheck::MALFORMED);
+    BOOST_CHECK(!flowmesh::EncodeSeatEvidence(keyless));
 }
 
 BOOST_AUTO_TEST_CASE(certificate_conflict_is_self_verifiable_and_names_double_signers)
@@ -198,6 +208,10 @@ BOOST_AUTO_TEST_CASE(certificate_conflict_is_self_verifiable_and_names_double_si
     auto empty{evidence};
     empty.second.signer_bitmap.clear();
     BOOST_CHECK(f.Check(empty) == flowmesh::SeatEvidenceCheck::MALFORMED);
+    // Nor a single key.
+    auto keyed{evidence};
+    keyed.seat_public_key = f.seats.seats.members[1].key.Key().Compressed();
+    BOOST_CHECK(f.Check(keyed) == flowmesh::SeatEvidenceCheck::MALFORMED);
 }
 
 BOOST_AUTO_TEST_CASE(encoding_is_canonical_and_strict)

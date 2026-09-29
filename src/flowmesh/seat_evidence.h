@@ -66,6 +66,11 @@ struct SeatEvidence {
     SeatEvidenceStatement first;
     //! The conflicting statement it received afterwards.
     SeatEvidenceStatement second;
+    //! ATTESTATION_EQUIVOCATION only (and then required): the BLS public key
+    //! of the seat at seat_index in the named set, so an operator can match
+    //! it against its own keys. Not signed; CheckSeatEvidence requires it to
+    //! be that seat's key. Not part of Id().
+    std::optional<std::array<unsigned char, bls::PUBKEY_SIZE>> seat_public_key;
 
     //! The exact context `statement` signs under this record's domain/market.
     BlsCertificateContext Context(const SeatEvidenceStatement& statement) const;
@@ -80,7 +85,8 @@ struct SeatEvidence {
 inline constexpr uint8_t SEAT_EVIDENCE_VERSION{1};
 //! No record can encode larger: two statements at the largest seat set.
 inline constexpr size_t SEAT_EVIDENCE_MAX_BYTES{
-    2 + 32 + 32 + 2 * (8 + 32 + 8 + 32 + 4 + 3 + FLOWMESH_MAX_SIGNER_BITMAP_BYTES + FLOWMESH_BLS_SIGNATURE_SIZE)};
+    2 + 32 + 32 + 2 * (8 + 32 + 8 + 32 + 4 + 3 + FLOWMESH_MAX_SIGNER_BITMAP_BYTES + FLOWMESH_BLS_SIGNATURE_SIZE) +
+    bls::PUBKEY_SIZE};
 
 //! Canonical bytes; nullopt for a record whose shape is not canonical.
 std::optional<std::vector<unsigned char>> EncodeSeatEvidence(const SeatEvidence& evidence);
@@ -95,6 +101,8 @@ enum class SeatEvidenceCheck : uint8_t {
     NOT_CONFLICTING,
     //! A supplied seat set is not the anchored set the statement names.
     WRONG_SEAT_SET,
+    //! seat_public_key is not the key of the named seat.
+    WRONG_SEAT_KEY,
     BAD_FIRST_SIGNATURE,
     BAD_SECOND_SIGNATURE,
 };

@@ -366,6 +366,7 @@ UniValue FlowMeshSeatEvidenceJson(const flowmesh::SeatEvidence& evidence)
     out.pushKV("market_id", evidence.market_id.GetHex());
     out.pushKV("first", statement(evidence.first));
     out.pushKV("second", statement(evidence.second));
+    if (evidence.seat_public_key) out.pushKV("seat_public_key", HexStr(*evidence.seat_public_key));
     if (evidence.kind == flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT) {
         const auto signers{flowmesh::SeatEvidenceDoubleSigners(evidence)};
         if (!signers.empty()) {

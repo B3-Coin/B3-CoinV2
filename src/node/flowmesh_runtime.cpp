@@ -830,12 +830,18 @@ void RecordAttestationEquivocation(Market& market, const uint32_t seat, const ui
         votes == market.attestations.end()) return;
     const auto vote{votes->second.find(seat)};
     if (vote == votes->second.end()) return;
+    const auto first_context{flowmesh::ProductionCertificateContext(first->second.entry)};
+    const auto seats{EvidenceSeats(market, first_context.seat_epoch, first_context.seat_set_hash)};
+    if (!seats || seat >= seats->Size()) {
+        ++market.seat_evidence_unrecorded;
+        return;
+    }
     RecordSeatEvidence(market, flowmesh::SeatEvidence{
         flowmesh::SeatEvidenceKind::ATTESTATION_EQUIVOCATION, market.domain, market.market_id,
-        flowmesh::SeatAttestationStatement(flowmesh::ProductionCertificateContext(first->second.entry), seat,
-                                           vote->second.signature),
+        flowmesh::SeatAttestationStatement(first_context, seat, vote->second.signature),
         flowmesh::SeatAttestationStatement(flowmesh::ProductionCertificateContext(second->second.entry), seat,
-                                           second_signature)});
+                                           second_signature),
+        seats->members[seat].key.Key().Compressed()});
 }
 
 template <typename Market>

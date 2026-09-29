@@ -527,6 +527,9 @@ BOOST_AUTO_TEST_CASE(health_json_lists_seat_evidence_as_information_only)
         if (kind == flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT) {
             out.first.signer_bitmap = {0x07};
             out.second.signer_bitmap = {0x0e};
+        } else {
+            out.seat_public_key.emplace();
+            out.seat_public_key->fill(0xcd);
         }
         out.first.microblock_hash = Id(0xa1);
         out.second.microblock_hash = Id(0xb2);
@@ -572,6 +575,11 @@ BOOST_AUTO_TEST_CASE(health_json_lists_seat_evidence_as_information_only)
     const auto& equivocation{public_evidence["latest"][1]};
     BOOST_CHECK_EQUAL(equivocation["kind"].get_str(), "attestation_equivocation");
     BOOST_CHECK(!equivocation.exists("double_signers"));
+    BOOST_CHECK(Keys(equivocation) == (std::set<std::string>{"evidence_id", "kind", "domain", "market_id", "first",
+                                                             "second", "seat_public_key"}));
+    std::string key_hex;
+    for (int i{0}; i < 48; ++i) key_hex += "cd";
+    BOOST_CHECK_EQUAL(equivocation["seat_public_key"].get_str(), key_hex);
     BOOST_CHECK(Keys(equivocation["second"]) == (std::set<std::string>{"seat_epoch", "seat_set_hash", "sequence",
                                                                        "microblock_hash", "seat_index", "signature"}));
     BOOST_CHECK_EQUAL(equivocation["second"]["seat_index"].getInt<int>(), 2);

@@ -535,6 +535,7 @@ static RPCResult HealthResult()
                             {Type::STR_HEX, "market_id", "Market every statement signs"},
                             {Type::OBJ, "first", "The statement this node held first (its earlier vote or durable entry)", SeatEvidenceStatementResult()},
                             {Type::OBJ, "second", "The conflicting statement it received", SeatEvidenceStatementResult()},
+                            {Type::STR_HEX, "seat_public_key", /*optional=*/true, "attestation_equivocation: BLS public key of the seat at seat_index in the named set; compare with your own keys (getflowmeshvalidatorinfo)"},
                             {Type::ARR, "double_signers", /*optional=*/true, "certificate_conflict under one seat set: the seats in both signer bitmaps, each of which signed both", {
                                 {Type::NUM, "", "Seat index"},
                             }},
