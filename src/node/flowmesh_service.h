@@ -248,6 +248,8 @@ public:
         const flowmesh::MarketId& market_id, const uint256& action_id) const;
     FlowMeshClientOutcomeParts ClientOutcomeParts(
         const flowmesh::MarketId& market_id, uint64_t sequence, const uint256& hash, bool want_payload) const;
+    //! For tests: ClientOutcomeParts calls since this service was created.
+    uint64_t ClientOutcomeReadsForTest() const;
     std::optional<flowmesh::ClientActionNotice> NewestClientNoticeIfNewer(
         const flowmesh::MarketId& market_id, const uint256& action_id) const;
 

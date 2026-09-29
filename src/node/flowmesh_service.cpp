@@ -452,6 +452,8 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     mutable std::atomic<uint64_t> head_entry_lookups{0}, head_entry_reads{0};
     mutable std::atomic<uint64_t> settlement_lookups{0}, settlement_plans{0};
     mutable std::atomic<uint64_t> pending_checkpoint_lookups{0}, pending_checkpoint_scans{0};
+    // Test observation only (ClientOutcomeReadsForTest); relaxed, never a gate.
+    mutable std::atomic<uint64_t> client_outcome_reads{0};
 
     //! NextCheckpointMpa's inputs, behind its gates in its order: the
     //! reconciled tip, the running market's store, its marker (with the
@@ -2306,6 +2308,7 @@ std::optional<std::pair<uint64_t, uint256>> FlowMeshService::ClientRecentInclusi
 FlowMeshClientOutcomeParts FlowMeshService::ClientOutcomeParts(
     const flowmesh::MarketId& market_id, const uint64_t sequence, const uint256& hash, const bool want_payload) const
 {
+    m_impl->client_outcome_reads.fetch_add(1, std::memory_order_relaxed);
     std::shared_ptr<FlowMeshRuntime> runtime;
     {
         std::lock_guard lock{m_impl->mutex};
@@ -2449,6 +2452,11 @@ FlowMeshSeatKeyStatus FlowMeshService::SeatKeyStatus() const
 {
     std::lock_guard<std::mutex> lock{m_impl->mutex};
     return m_impl->SeatKeyStatusLocked();
+}
+
+uint64_t FlowMeshService::ClientOutcomeReadsForTest() const
+{
+    return m_impl->client_outcome_reads.load(std::memory_order_relaxed);
 }
 
 FlowMeshServiceMemoCounts FlowMeshService::MemoCountsForTest() const

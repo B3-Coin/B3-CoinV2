@@ -176,6 +176,10 @@ Receipt LocalActionReceipt(const std::optional<flowmesh::ClientEvent>& status, c
 class LocalBackend final : public FlowMeshTradingBackend {
     FlowMeshService& m_service;
     const FlowMeshAssetMetadataCatalog m_metadata;
+    //! The public trading API's backend: its 'submit' reply never states an
+    //! outcome, so none is derived for it (anyone may replay public certified
+    //! actions, and a derivation hashes a whole retained entry).
+    const bool m_public_api;
     // Local RPC callers never take every event-log watch registration.
     static constexpr size_t LOCAL_WATCHERS_MAX{4};
     std::atomic<size_t> m_local_watchers{0};
@@ -263,8 +267,8 @@ class LocalBackend final : public FlowMeshTradingBackend {
         ApplyOutcome(receipt, *derived);
     }
 public:
-    explicit LocalBackend(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata = {})
-        : m_service(service), m_metadata(std::move(metadata)) {}
+    explicit LocalBackend(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata = {}, const bool public_api = false)
+        : m_service(service), m_metadata(std::move(metadata)), m_public_api{public_api} {}
     std::optional<modern::AssetDisplayMetadata> Metadata(const uint256& asset) const override
     {
         const auto it{m_metadata.find(asset)};
@@ -386,7 +390,7 @@ public:
             out.microblock_hash = submitted.admission.included->second;
             out.certificate_verified = true;
             out.reason = FlowMeshLocalAdmissionText(submitted.admission);
-            AttachOutcome(id, out);
+            if (!m_public_api) AttachOutcome(id, out);
             return out;
         case FlowMeshLocalAdmission::Kind::REFUSE:
             out.state = "rejected";
@@ -414,7 +418,7 @@ public:
             if (status->kind != flowmesh::ClientEventKind::POOL_REFUSED || this_attempt) out = EventReceipt(*status);
         }
         if (out.state == "certified_inclusion") out.certificate_verified = true;
-        AttachOutcome(id, out);
+        if (!m_public_api) AttachOutcome(id, out);
         return out;
     }
     // The local engine's status is already current: there is no transport to
@@ -872,7 +876,7 @@ public:
     explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
                         const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome,
                         const FlowMeshTradingApiWatch watch, const FlowMeshTradingApiTicks ticks)
-        : m_service(service), m_local(service, std::move(metadata)),
+        : m_service(service), m_local(service, std::move(metadata), /*public_api=*/true),
           m_wait_max{wait.waiters == 0 ? std::chrono::milliseconds{0}
                                        : std::clamp(wait.max, std::chrono::milliseconds{0}, FLOWMESH_API_ACTION_WAIT_MAX)},
           m_submit_wait_max{wait.submit ? m_wait_max : std::chrono::milliseconds{0}},
@@ -990,7 +994,8 @@ public:
             const auto action_id{Id(params, "action_id")};
             // The public submit reply keeps its v1 meaning: an endpoint never
             // states a verified outcome there (clients ignore endpoint
-            // booleans). Without wait_ms it is exactly the previous reply.
+            // booleans), and m_local derives none for it. Without wait_ms it
+            // is exactly the previous reply.
             const auto reply = [&](Receipt receipt) {
                 receipt.outcome.reset();
                 receipt.outcome_verified = false;

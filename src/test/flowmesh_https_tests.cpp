@@ -4979,14 +4979,15 @@ struct LiveMarket {
     const fs::path path;
     const node::FlowMeshTradingApiWatch watch;
     const node::FlowMeshTradingApiTicks ticks;
+    const node::FlowMeshTradingApiOutcome outcome;
     std::unique_ptr<node::FlowMeshService> service;
     std::unique_ptr<node::FlowMeshHttpsServer> api;
     uint16_t port{0};
     //! Told of every connection the API admits (set before Start).
     std::function<void(bool)> connection_observer;
     LiveMarket(ClientLaneFixture& f, fs::path p, const node::FlowMeshTradingApiWatch w = {},
-               const node::FlowMeshTradingApiTicks t = {})
-        : fixture{f}, path{std::move(p)}, watch{w}, ticks{t}
+               const node::FlowMeshTradingApiTicks t = {}, const node::FlowMeshTradingApiOutcome o = {})
+        : fixture{f}, path{std::move(p)}, watch{w}, ticks{t}, outcome{o}
     {
         // Certify the market genesis, publish its checkpoint on B3, and start
         // again: the market then admits actions.
@@ -5007,7 +5008,7 @@ struct LiveMarket {
         BOOST_REQUIRE_MESSAGE(service->ArmSeatKeys(fixture.secrets, error), error);
         auto options{fixture.Options(port)};
         options.request_timeout = std::chrono::seconds{10};
-        api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, {}, watch, ticks);
+        api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, outcome, watch, ticks);
         if (connection_observer) {
             BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(*api, [this](bool nodelay) {
                 if (connection_observer) connection_observer(nodelay);
@@ -5053,20 +5054,25 @@ struct LiveMarket {
         }
         return false;
     }
-    //! Certifies one more entry: the fixture's bootstrap user deposit.
-    void Deposit()
+    //! Certifies one more entry holding `action`.
+    void Certify(const flowmesh::Action& action)
     {
         const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{10}};
         while (service->MarketStatus(fixture.market)->paused && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds{10});
         }
         const auto next{service->MarketStatus(fixture.market)->next_sequence};
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(service->SubmitLocalAction(fixture.market, action, error), error);
+        BOOST_REQUIRE(WaitSequence(next + 1));
+    }
+    //! Certifies one more entry: the fixture's bootstrap user deposit.
+    void Deposit()
+    {
         flowmesh::Action deposit;
         deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
         deposit.outpoint = fixture.deposit_outpoint;
-        std::string error;
-        BOOST_REQUIRE_MESSAGE(service->SubmitLocalAction(fixture.market, deposit, error), error);
-        BOOST_REQUIRE(WaitSequence(next + 1));
+        Certify(deposit);
     }
     node::HttpsEndpoint Endpoint() const { return fixture.Endpoint(port); }
 };
@@ -5934,6 +5940,39 @@ BOOST_AUTO_TEST_CASE(indicative_clearing_comes_from_verified_state_on_both_backe
     BOOST_CHECK_EQUAL(moved->snapshot.next_microblock_sequence, 2U);
     BOOST_CHECK(moved->indicative->head == moved->snapshot.last_microblock_hash);
     remote.reset();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_submit_outcome_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(public_submit_derives_no_outcome_it_would_discard)
+{
+    LiveMarket live{*this, m_path_root / "submit-outcome-service", {}, {}, {true}};
+    const auto action{SignedCancel(0)};
+    live.Certify(action);
+    BOOST_REQUIRE(live.service->ClientRecentInclusion(market, action.Id()));
+    // Anyone may replay a public certified action. The public reply never
+    // states an outcome, so none is derived for it: no outcome-part read.
+    const std::string params{"{\"market_id\":\"" + market.GetHex() + "\",\"action_id\":\"" + action.Id().GetHex() +
+                             "\",\"action_hex\":\"" + HexStr(*flowmesh::EncodeProductionActionPayload(action)) + "\"}"};
+    const auto reads{live.service->ClientOutcomeReadsForTest()};
+    for (int i{0}; i < 3; ++i) {
+        const auto [status, reply]{ApiCall(live.Endpoint(), "submit", params)};
+        BOOST_REQUIRE_EQUAL(status, 200);
+        BOOST_CHECK_EQUAL(reply["result"]["receipt_state"].get_str(), "certified_inclusion");
+        BOOST_CHECK(!reply["result"]["outcome_verified"].get_bool());
+        BOOST_CHECK(!reply["result"].exists("outcome"));
+    }
+    BOOST_CHECK_EQUAL(live.service->ClientOutcomeReadsForTest(), reads);
+    // The node's own backend (wallet RPC and Qt) still verifies it.
+    const auto local{node::MakeLocalFlowMeshBackend(*live.service)};
+    const auto receipt{local->Submit(market, action)};
+    BOOST_CHECK_EQUAL(receipt.state, "certified_inclusion");
+    BOOST_CHECK(receipt.outcome_verified);
+    BOOST_REQUIRE(receipt.outcome);
+    BOOST_CHECK_EQUAL(receipt.outcome->status, "rejected"); // nothing to cancel
+    BOOST_CHECK_GT(live.service->ClientOutcomeReadsForTest(), reads);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
