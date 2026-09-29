@@ -5,6 +5,7 @@
 
 #include <qt/b3flowmeshtrading.h>
 #include <qt/b3flowmeshmarketdata.h>
+#include <qt/b3flowmeshnotices.h>
 #include <qt/b3flowmeshorderbook.h>
 #include <qt/b3flowmeshwatch.h>
 #include <qt/walletmodel.h>
@@ -13,10 +14,12 @@
 #include <QWidget>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <map>
 #include <memory>
 #include <optional>
+#include <utility>
 
 class QComboBox;
 class QDialog;
@@ -182,6 +185,17 @@ private:
     //! action ID, the tracked request and this market's unsettled saved
     //! requests, plus requests that settled in the last minute. Display only.
     void updatePendingView();
+    //! A request's short title: the reviewed action's own title when this
+    //! panel signed it, else its saved instruction, else its ID.
+    QString requestTitle(const QString& key, const B3FlowMeshTrading::SavedAction* saved, const QString& action_id) const;
+    //! Exact display units, only for the selected market's verified asset.
+    std::pair<std::optional<int>, QString> requestUnits(const QString& market) const;
+    //! Shows a toast once per key and mirrors it to the Activity log; never
+    //! while the panel is tearing down or switching wallets.
+    void toast(const QString& key, B3FlowMeshToasts::Kind kind, const QString& text, std::chrono::milliseconds ttl);
+    //! A lost (false) or restored (true) market read; at most one lost
+    //! notice per 30 s, and a restored one only after a shown lost one.
+    void linkToast(bool restored);
     //! ActionId is semantic and excludes market, domain and config.
     static QString RequestKey(const QString& market, const QString& account, const QString& action_id)
     {
@@ -332,6 +346,7 @@ private:
     struct RequestSeen {
         B3FlowMeshTrading::Stage high{B3FlowMeshTrading::Stage::Signing};
         bool settled{false};
+        unsigned events{0}; // Toast events already observed (see observeRequests).
         QElapsedTimer settled_age; // Invalid when it had settled before this session saw it.
     };
     static constexpr size_t MAX_REQUEST_KEYS{1024}, MAX_REQUEST_ROWS{8};
@@ -373,6 +388,10 @@ private:
         *m_history_note{nullptr}, *m_own_note{nullptr}, *m_identity_detail{nullptr};
     B3FlowMeshChart* m_chart{nullptr};
     QTableWidget *m_depth_view{nullptr}, *m_history_view{nullptr}, *m_own_view{nullptr}, *m_pending_view{nullptr};
+    B3FlowMeshToasts* m_toasts{nullptr};
+    QElapsedTimer m_link_toast_age;
+    bool m_link_toast_down{false};
+    uint64_t m_link_toast_episode{0};
     B3FlowMeshOrderBook* m_order_book{nullptr};
     QTabWidget* m_activity{nullptr};
     QWidget* m_advanced{nullptr};

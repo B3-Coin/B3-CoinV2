@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see COPYING.
 #include <qt/b3flowmeshmarketdata.h>
 #include <qt/b3flowmeshchart.h>
+#include <qt/b3flowmeshnotices.h>
 #include <qt/b3flowmeshorderbook.h>
 #include <qt/b3flowmeshtradingpanel.h>
 #include <qt/b3theme.h>
@@ -19,6 +20,7 @@
 #include <wallet/context.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
+#include <QAbstractButton>
 #include <QApplication>
 #include <QComboBox>
 #include <QDeadlineTimer>
@@ -4392,6 +4394,101 @@ private Q_SLOTS:
         QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
         QVERIFY(panel.m_inflight_title.isEmpty()); QVERIFY(view->isHidden());
         QVERIFY(!panel.m_uncertain); QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void toastsAreDeduplicatedBoundedAndExpire()
+    {
+        using Kind = B3FlowMeshToasts::Kind;
+        using std::chrono::milliseconds;
+        QWidget host; auto* toasts{new B3FlowMeshToasts{&host}};
+        host.show(); QCoreApplication::processEvents();
+        QVERIFY(toasts->isHidden());
+        QVERIFY(toasts->push(QStringLiteral("a"), Kind::Info, QStringLiteral("first"), milliseconds{60'000}));
+        QVERIFY(!toasts->push(QStringLiteral("a"), Kind::Info, QStringLiteral("again"), milliseconds{60'000})); // Once per key.
+        QVERIFY(toasts->push(QStringLiteral("b"), Kind::Success, QStringLiteral("second"), milliseconds{60'000}));
+        QVERIFY(toasts->push(QStringLiteral("c"), Kind::Warning, QStringLiteral("third"), milliseconds{60'000}));
+        QVERIFY(toasts->push(QStringLiteral("d"), Kind::Error, QStringLiteral("fourth"), milliseconds{60'000}));
+        QCOMPARE(toasts->texts(), (QStringList{QStringLiteral("second"), QStringLiteral("third"), QStringLiteral("fourth")})); // At most three.
+        QVERIFY(!toasts->isHidden());
+        // Each expires on its own; a dismissed or expired one never returns.
+        QVERIFY(toasts->push(QStringLiteral("e"), Kind::Info, QStringLiteral("brief"), milliseconds{20}));
+        QTRY_VERIFY_WITH_TIMEOUT(!toasts->texts().contains(QStringLiteral("brief")), 2000);
+        auto* dismiss{toasts->findChild<QAbstractButton*>()}; QVERIFY(dismiss); dismiss->click();
+        QTRY_COMPARE_WITH_TIMEOUT(toasts->texts().size(), 1, 2000);
+        toasts->clear(); QVERIFY(toasts->texts().isEmpty()); QVERIFY(toasts->isHidden());
+        QVERIFY(toasts->push(QStringLiteral("a"), Kind::Info, QStringLiteral("after a wallet switch"), milliseconds{60'000}));
+        // Keys are FIFO-bounded.
+        for (size_t i{0}; i < B3FlowMeshToasts::MAX_KEYS; ++i) toasts->push(QStringLiteral("k%1").arg(i), Kind::Info, QStringLiteral("n"), milliseconds{60'000});
+        QVERIFY(toasts->push(QStringLiteral("a"), Kind::Info, QStringLiteral("evicted key"), milliseconds{60'000}));
+    }
+    void terminalToastsFireOncePerActionAndNotForHistoricalRows()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.show(); QCoreApplication::processEvents();
+        // History at attach is only seeded: settled, uncertain or refused.
+        auto earlier{SavedBid(panel, 70, "certified_inclusion", "certified", 100)}; Certify(earlier.receipt); earlier.receipt.no_resubmit = true;
+        auto refused{SavedBid(panel, 72, "rejected", "refused", 90)};
+        B3FlowMeshTrading::SavedActions saved; saved.account = panel.m_snapshot->account; saved.actions = {earlier, refused};
+        panel.restoreSavedActions(saved);
+        QVERIFY(panel.m_toasts->texts().isEmpty());
+        // A new request certifies: one notice, however often it is read.
+        saved.actions.insert(saved.actions.begin(), SavedBid(panel, 74, "queued", "queued", 300));
+        panel.restoreSavedActions(saved);
+        QVERIFY(panel.m_toasts->texts().isEmpty());
+        auto receipt{saved.actions[0].receipt}; Certify(receipt, 9);
+        for (int i{0}; i < 3; ++i) panel.applyReceipt(receipt);
+        QCOMPARE(panel.m_toasts->texts(), (QStringList{QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in batch #9")}));
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD")));
+        // A verified outcome of the same request is announced once more.
+        B3FlowMeshTrading::Outcome outcome; outcome.status = QStringLiteral("applied"); outcome.final = true; outcome.reason_code = QStringLiteral("APPLIED");
+        outcome.microblock_sequence = 9; outcome.microblock_hash = receipt.microblock_hash;
+        outcome.fill = B3FlowMeshTrading::Outcome::Fill{QStringLiteral("bid"), true, false, 250'000, 1000, 250'000'000, 25'000, 249'975'000};
+        receipt.outcome = outcome; receipt.outcome_verified = true; receipt.stage = QStringLiteral("outcome_verified");
+        panel.applyReceipt(receipt); panel.applyReceipt(receipt);
+        QCOMPARE(panel.m_toasts->texts().size(), 2);
+        QCOMPARE(panel.m_toasts->texts().back(), QStringLiteral("Executed: Buy 1 tUSD @ 1 B3/tUSD · filled 0.25 tUSD"));
+        // An unknown outcome is a warning that says it is never re-signed.
+        saved.actions[0].receipt = receipt; saved.actions[0].receipt.no_resubmit = true; // The outbox now retains its certification.
+        saved.actions.insert(saved.actions.begin(), SavedBid(panel, 76, "unknown", "sent", 400));
+        panel.restoreSavedActions(saved);
+        QCOMPARE(panel.m_toasts->texts().size(), 3);
+        QVERIFY(panel.m_toasts->texts().back().startsWith(QStringLiteral("Outcome unknown: Buy 1 tUSD @ 1 B3/tUSD")));
+        QVERIFY(panel.m_toasts->texts().back().contains(QStringLiteral("never re-signed")));
+        QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
+    }
+    void noToastsDuringTeardownOrWalletSwitch()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        B3FlowMeshTrading::SavedActions saved; saved.account = panel.m_snapshot->account; saved.actions = {SavedBid(panel, 80, "queued", "queued")};
+        panel.restoreSavedActions(saved);
+        // A certified receipt delivered while the panel tears down is kept
+        // (as today) but never announced.
+        auto receipt{saved.actions[0].receipt}; Certify(receipt);
+        panel.m_cancel->store(true);
+        panel.applyReceipt(receipt);
+        QVERIFY(panel.m_toasts->texts().isEmpty()); QVERIFY(panel.m_receipt->Included());
+        // A wallet switch clears notices and seeds the next wallet again.
+        panel.m_cancel->store(false);
+        panel.m_toasts->push(QStringLiteral("old"), B3FlowMeshToasts::Kind::Info, QStringLiteral("old wallet"), std::chrono::milliseconds{60'000});
+        panel.setWalletModel(nullptr);
+        QVERIFY(panel.m_toasts->texts().isEmpty()); QVERIFY(!panel.m_requests_seeded); QVERIFY(panel.m_request_seen.empty());
+        QVERIFY(m_wallet->IsLocked());
+    }
+    void linkToastsFollowLostAndRestoredReadsAtMostOncePer30Seconds()
+    {
+        FundingReadProbe probe;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_catalog_age.start(); panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None;
+        const auto run = [&] { panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); };
+        probe.fail = true; run(); run();
+        QCOMPARE(panel.m_toasts->texts().size(), 1);
+        QVERIFY(panel.m_toasts->texts().front().startsWith(QStringLiteral("Connection lost")));
+        probe.fail = false; run();
+        QCOMPARE(panel.m_toasts->texts().size(), 2);
+        QVERIFY(panel.m_toasts->texts().back().startsWith(QStringLiteral("Connection restored")));
+        // A second loss within 30 s is not announced again, nor its recovery.
+        probe.fail = true; run(); probe.fail = false; run();
+        QCOMPARE(panel.m_toasts->texts().size(), 2);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void connectionBannerShowsLiveReconnectingAndCheckingState()
     {

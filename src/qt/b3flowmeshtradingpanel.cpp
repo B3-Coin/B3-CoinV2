@@ -111,6 +111,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     auto* scroll{new QScrollArea{this}}; scroll->setWidgetResizable(true);
     auto* content{new QWidget{scroll}}; auto* layout{new QVBoxLayout{content}};
     layout->setContentsMargins(12, 10, 12, 12); layout->setSpacing(8);
+    m_toasts = new B3FlowMeshToasts{content}; layout->addWidget(m_toasts);
     auto* connection_row{new QHBoxLayout};
     m_endpoint = new QLineEdit{content}; m_endpoint->setObjectName(QStringLiteral("flowMeshEndpoint"));
     m_endpoint->setMaxLength(2048); m_endpoint->setPlaceholderText(tr("https://trading.example.org"));
@@ -311,8 +312,9 @@ void B3FlowMeshTradingPanel::setWalletModel(WalletModel* wallet)
     cancelAndWait();
     m_wallet = wallet; m_backend.reset(); m_market_data.clear(); m_effect_data.clear(); m_snapshot.reset();
     m_saved_actions = {}; m_saved_actions_ready = false;
-    // Request rows are per wallet; the next attach seeds them again.
+    // Request rows and notices are per wallet; the next attach seeds them again.
     m_request_seen.clear(); m_request_order.clear(); m_requests_seeded = false; m_last_settled.invalidate();
+    m_toasts->clear(); m_link_toast_down = false; m_link_toast_age.invalidate();
     m_amount->clear(); m_withdrawal_draft_amount.clear(); m_destination->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
     m_client_info.reset(); m_connection_error.clear(); m_connect_error.clear();
     { QSignalBlocker blocker{m_saved_selector}; m_saved_selector->clear(); }
@@ -1467,7 +1469,10 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
                 // but never attach that old market's error to the new choice.
                 m_loading = false; m_busy = false; updateDataViews(); updateMarketText(); refresh(); return;
             }
-            if (!m_read_failed) notice(tr("Market refresh failed: %1. Last certified data is retained; new actions are disabled until a successful refresh.").arg(result->error));
+            if (!m_read_failed) {
+                notice(tr("Market refresh failed: %1. Last certified data is retained; new actions are disabled until a successful refresh.").arg(result->error));
+                linkToast(false);
+            }
             m_read_failed = true; m_read_error = result->error; m_read_failures = std::min(5U, m_read_failures + 1); m_loading = false; m_uncertain_refreshed = false; m_busy = false;
             m_link_attempts = std::min(9999U, m_link_attempts + 1);
             updateDataViews(); updateMarketText();
@@ -1485,6 +1490,7 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
     }
     if (!result->action) {
         m_loading = false; m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_read_error.clear();
+        linkToast(true);
         if (!result->refresh_phase || *result->refresh_phase == RefreshPhase::Receipt) applyReceiptError(*result, result->receipt_error);
         if (result->receipt) applyReceipt(*result->receipt);
         if (m_uncertain && (uncertainWalletSelected() || !m_uncertain_wallet)) m_uncertain_refreshed = true;
@@ -1765,6 +1771,7 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
             const auto index{m_market->currentIndex()};
             if (index >= 0 && static_cast<size_t>(index) < m_market_data.size()) DeriveRowFromSnapshot(m_market_data[index], s);
             m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_read_error.clear(); m_loading = false;
+            linkToast(true);
         }
         m_watch.Finished(now, outcome, jitter);
         if (outcome == Outcome::Changed || outcome == Outcome::Quiet) m_watch_watchdog = false;
@@ -2149,37 +2156,103 @@ void B3FlowMeshTradingPanel::updateReceiptCard()
 
 void B3FlowMeshTradingPanel::observeRequests()
 {
+    using namespace B3FlowMeshTrading;
     if (!m_wallet) return;
     const bool seed{!m_requests_seeded};
-    const auto observe = [&](const QString& key, const B3FlowMeshTrading::Receipt& receipt) {
+    // Teardown and wallet switches record, never announce.
+    const bool announce{!seed && !m_cancel->load()};
+    enum : unsigned { CERTIFIED = 1, EXECUTED = 2, NOT_EXECUTED = 4, UNCERTAIN = 8, REFUSED = 16 };
+    const auto observe = [&](const QString& key, const Receipt& receipt, const SavedAction* saved) {
         auto seen{m_request_seen.find(key)};
         if (seen == m_request_seen.end()) {
             seen = m_request_seen.emplace(key, RequestSeen{}).first;
             m_request_order.push_back(key);
             while (m_request_order.size() > MAX_REQUEST_KEYS) { m_request_seen.erase(m_request_order.front()); m_request_order.pop_front(); }
         }
-        const auto view{B3FlowMeshTrading::DescribeStage(receipt, false, B3FlowMeshTrading::RequestKind::Other)};
+        const auto kind{key == m_tracked_title_key ? m_tracked_kind : saved ? KindOf(*saved) : RequestKind::Other};
+        const auto [decimals, ticker]{requestUnits(receipt.market)};
+        const auto market_row{std::find_if(m_market_data.begin(), m_market_data.end(), [&](const auto& m) { return m.id == receipt.market; })};
+        const auto view{DescribeStage(receipt, market_row != m_market_data.end() && !market_row->remote, kind, decimals, ticker)};
         // Only the historical facts are kept: never Certified or an outcome.
-        seen->second.high = std::max(seen->second.high, std::min(view.reached, B3FlowMeshTrading::Stage::Admitted));
+        seen->second.high = std::max(seen->second.high, std::min(view.reached, Stage::Admitted));
         if (view.settled && !seen->second.settled) {
             seen->second.settled = true;
             if (!seed) { seen->second.settled_age.start(); m_last_settled.start(); }
         }
+        const unsigned now{(receipt.Included() ? CERTIFIED : 0U) | (view.reached == Stage::OutcomeVerified && view.flag == StageFlag::None ? EXECUTED : 0U) |
+                           (view.flag == StageFlag::NotExecuted ? NOT_EXECUTED : 0U) | (view.flag == StageFlag::Uncertain ? UNCERTAIN : 0U) |
+                           (view.flag == StageFlag::Refused ? REFUSED : 0U)};
+        const unsigned fresh{now & ~seen->second.events};
+        seen->second.events |= now;
+        if (!announce || !fresh) return;
+        const QString title{requestTitle(key, saved, receipt.action_id)};
+        using Kind = B3FlowMeshToasts::Kind;
+        using std::chrono::seconds;
+        if (fresh & EXECUTED) toast(key + QStringLiteral(":executed"), Kind::Success, tr("Executed: %1 · %2").arg(title, view.outcome.mid(2)), seconds{8});
+        else if (fresh & NOT_EXECUTED) toast(key + QStringLiteral(":not-executed"), Kind::Warning, tr("%1 · %2").arg(title, view.status), seconds{20});
+        else if (fresh & CERTIFIED) toast(key + QStringLiteral(":certified"), Kind::Info, tr("Certified: %1 · included in batch #%2").arg(title).arg(receipt.microblock_sequence), seconds{8});
+        if (fresh & UNCERTAIN) toast(key + QStringLiteral(":uncertain"), Kind::Warning, tr("Outcome unknown: %1 · review before trading; it is never re-signed.").arg(title), seconds{20});
+        if (fresh & REFUSED) toast(key + QStringLiteral(":refused"), Kind::Warning, tr("Refusal reported: %1 · treated as unknown until reviewed.").arg(title), seconds{20});
     };
-    if (m_receipt && receiptWalletSelected()) observe(RequestKey(m_receipt->market, m_receipt->account, m_receipt->action_id), *m_receipt);
-    for (const auto& action : m_saved_actions.actions) observe(RequestKey(action.market, action.account, action.receipt.action_id), action.receipt);
+    if (m_receipt && receiptWalletSelected()) {
+        const auto saved{std::find_if(m_saved_actions.actions.begin(), m_saved_actions.actions.end(), [&](const auto& a) {
+            return a.market == m_receipt->market && a.account == m_receipt->account && a.receipt.action_id == m_receipt->action_id;
+        })};
+        observe(RequestKey(m_receipt->market, m_receipt->account, m_receipt->action_id), *m_receipt, saved == m_saved_actions.actions.end() ? nullptr : &*saved);
+    }
+    for (const auto& action : m_saved_actions.actions) {
+        // The tracked receipt is fresher than its outbox row.
+        if (m_receipt && receiptWalletSelected() && action.market == m_receipt->market && action.account == m_receipt->account && action.receipt.action_id == m_receipt->action_id) continue;
+        observe(RequestKey(action.market, action.account, action.receipt.action_id), action.receipt, &action);
+    }
     if (m_saved_actions_ready) m_requests_seeded = true;
     updatePendingView();
+}
+
+QString B3FlowMeshTradingPanel::requestTitle(const QString& key, const B3FlowMeshTrading::SavedAction* saved, const QString& action_id) const
+{
+    if (key == m_tracked_title_key && !m_tracked_title.isEmpty()) return m_tracked_title;
+    if (saved) {
+        const auto [decimals, ticker]{requestUnits(saved->market)};
+        return B3FlowMeshTrading::ShortTitle(*saved, decimals, ticker, inverted());
+    }
+    return tr("Request %1…").arg(action_id.left(12));
+}
+
+std::pair<std::optional<int>, QString> B3FlowMeshTradingPanel::requestUnits(const QString& market) const
+{
+    const auto selected{this->market()};
+    if (!selected || selected->id != market || !m_snapshot || m_snapshot->market != market || !m_snapshot->units.known || m_snapshot->units.asset != selected->base) return {std::nullopt, {}};
+    return {m_snapshot->units.decimals, m_snapshot->units.ticker};
+}
+
+void B3FlowMeshTradingPanel::toast(const QString& key, const B3FlowMeshToasts::Kind kind, const QString& text, const std::chrono::milliseconds ttl)
+{
+    if (!m_wallet || m_cancel->load()) return;
+    if (m_toasts->push(key, kind, text, ttl)) notice(text);
+}
+
+void B3FlowMeshTradingPanel::linkToast(const bool restored)
+{
+    using std::chrono::seconds;
+    if (restored) {
+        if (!m_link_toast_down) return;
+        m_link_toast_down = false;
+        toast(QStringLiteral("link:restored:%1").arg(m_link_toast_episode), B3FlowMeshToasts::Kind::Success, tr("Connection restored · verified market data is current again."), seconds{8});
+        return;
+    }
+    if (m_link_toast_down || (m_link_toast_age.isValid() && m_link_toast_age.elapsed() < 30'000)) return;
+    m_link_toast_down = true; m_link_toast_age.start();
+    toast(QStringLiteral("link:lost:%1").arg(++m_link_toast_episode), B3FlowMeshToasts::Kind::Warning,
+          tr("Connection lost · last verified data is shown and new orders are paused. Your requests are re-checked first when it returns."), seconds{20});
 }
 
 void B3FlowMeshTradingPanel::updatePendingView()
 {
     using namespace B3FlowMeshTrading;
     const auto selected{market()};
-    const bool matched{selected && m_snapshot && m_snapshot->market == selected->id};
-    const std::optional<int> decimals{matched && m_snapshot->units.known && m_snapshot->units.asset == selected->base ? std::optional<int>{m_snapshot->units.decimals} : std::nullopt};
-    const QString ticker{decimals ? m_snapshot->units.ticker : QString{}};
-    const bool inverse{inverted()}, local{selected && !selected->remote};
+    const auto [decimals, ticker]{requestUnits(selected ? selected->id : QString{})};
+    const bool local{selected && !selected->remote};
     struct Row { QStringList cells, access; QString request_tip, status_tip; QColor color; };
     std::vector<Row> rows;
     std::set<QString> shown;
@@ -2226,11 +2299,6 @@ void B3FlowMeshTradingPanel::updatePendingView()
               {tr("Signed: unknown"), {}, {}, {}, {}, {}}, {}, m_uncertain_details, B3Theme::kAccent});
     }
     if (m_wallet && selected) {
-        const auto title_of = [&](const QString& key, const SavedAction* saved, const QString& action_id) {
-            if (key == m_tracked_title_key && !m_tracked_title.isEmpty()) return m_tracked_title;
-            if (saved) return ShortTitle(*saved, decimals, ticker, inverse);
-            return tr("Request %1…").arg(action_id.left(12));
-        };
         if (m_receipt && receiptWalletSelected() && m_pending_market == selected->id) {
             const QString key{RequestKey(m_receipt->market, m_receipt->account, m_receipt->action_id)};
             if (!settled(*m_receipt) || settled_recently(key)) {
@@ -2238,7 +2306,7 @@ void B3FlowMeshTradingPanel::updatePendingView()
                     return a.market == m_receipt->market && a.account == m_receipt->account && a.receipt.action_id == m_receipt->action_id;
                 })};
                 const SavedAction* saved{found == m_saved_actions.actions.end() ? nullptr : &*found};
-                receipt_row(key, title_of(key, saved, m_receipt->action_id), *m_receipt,
+                receipt_row(key, requestTitle(key, saved, m_receipt->action_id), *m_receipt,
                             key == m_tracked_title_key ? m_tracked_kind : saved ? KindOf(*saved) : RequestKind::Other);
             }
         }
@@ -2246,7 +2314,7 @@ void B3FlowMeshTradingPanel::updatePendingView()
             if (action.market != selected->id || (settled(action.receipt) && !lingering)) continue;
             const QString key{RequestKey(action.market, action.account, action.receipt.action_id)};
             if (shown.contains(key) || (settled(action.receipt) && !settled_recently(key))) continue;
-            receipt_row(key, title_of(key, &action, action.receipt.action_id), action.receipt, KindOf(action));
+            receipt_row(key, requestTitle(key, &action, action.receipt.action_id), action.receipt, KindOf(action));
         }
     }
     std::vector<QStringList> cells;
