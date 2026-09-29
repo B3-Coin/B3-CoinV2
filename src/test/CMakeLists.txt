@@ -104,6 +104,7 @@ add_executable(test_bitcoin
   flowmesh_market_view_tests.cpp
   flowmesh_outcome_evidence_tests.cpp
   flowmesh_recent_window_tests.cpp
+  flowmesh_seat_evidence_tests.cpp
   flowmesh_client_work_tests.cpp
   flowmesh_timing_tests.cpp
   flowmesh_transport_compat_tests.cpp

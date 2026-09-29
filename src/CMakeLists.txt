@@ -122,6 +122,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   flowmesh/outcome_evidence.cpp
   flowmesh/production_engine.cpp
   flowmesh/production_wire.cpp
+  flowmesh/seat_evidence.cpp
   init/common.cpp
   kernel/chainparams.cpp
   legacy/checkpoints.cpp
