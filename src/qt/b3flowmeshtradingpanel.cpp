@@ -786,8 +786,10 @@ std::optional<B3FlowMeshMarketData::Curve> B3FlowMeshTradingPanel::editCurve() c
 bool B3FlowMeshTradingPanel::editAvailable() const
 {
     // Nothing pending or uncertain: an edit never re-signs a request whose
-    // outcome is unknown, and never races one in flight.
-    if (!orderReviewAvailable() || m_deferred_review || m_thread) return false;
+    // outcome is unknown, and never races one in flight (m_busy, the pending
+    // gate and m_deferred_review). Like the ticket, it stays available while
+    // a read runs: it only prefills the ticket and signs nothing.
+    if (!orderReviewAvailable() || m_deferred_review) return false;
     const auto curve{editCurve()};
     const auto price{curve ? B3FlowMeshMarketData::LimitPriceOf(*curve) : std::nullopt};
     return price && *price > 0 && curve->remaining > 0;

@@ -4969,6 +4969,37 @@ private Q_SLOTS:
         QVERIFY(!panel.m_edit_order->isEnabled());
         QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
     }
+    void editStaysAvailableWhilePassiveReadsRun()
+    {
+        FundingReadProbe probe; probe.hold = true;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        struct Cleanup { FundingReadProbe& probe; B3FlowMeshTradingPanel& panel; ~Cleanup() { probe.release.release(8); panel.cancelAndWait(); } } cleanup{probe, panel};
+        // After a first order its certified request stays tracked, so every
+        // passive job reads it before the market read.
+        TrackUnknown(panel); Certify(*panel.m_receipt); panel.m_receipt->no_resubmit = true;
+        probe.receipt_response = CertifiedStatus(panel.m_snapshot->market);
+        panel.m_catalog_age.start(); panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None;
+        panel.m_price->setText(QStringLiteral("0.7")); panel.m_quantity->setText(QStringLiteral("2"));
+        panel.m_own_view->selectRow(0); panel.updateControls(); QVERIFY(panel.m_edit_order->isEnabled());
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        // A passive read is in flight: Edit stays enabled and a click prefills.
+        panel.startJob(); QVERIFY(probe.entered.tryAcquire(1, 2000));
+        QVERIFY(panel.m_thread); QVERIFY(panel.m_active_result && panel.m_active_result->passive);
+        QVERIFY(panel.m_edit_order->isEnabled());
+        panel.m_edit_order->click();
+        QCOMPARE(panel.m_price->text(), QStringLiteral("1")); QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.75"));
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Nothing was signed or sent")));
+        QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_busy);
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(Remote(probe), (std::vector<std::string>{"getflowmeshactionstatus", "getflowmeshmarketdata"}));
+        // The read keeps the prefilled replacement and the selection.
+        QCOMPARE(panel.m_price->text(), QStringLiteral("1")); QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.75"));
+        QVERIFY(panel.m_edit_order->isEnabled());
+        // Work that may sign still excludes it.
+        panel.m_busy = true; panel.updateControls(); QVERIFY(!panel.m_edit_order->isEnabled());
+        panel.m_busy = false; panel.updateControls(); QVERIFY(panel.m_edit_order->isEnabled());
+        QCOMPARE(unlock.count(), 0); QCOMPARE(probe.writes.load(), 0); QVERIFY(!panel.m_unlock); QVERIFY(m_wallet->IsLocked());
+    }
     void submissionNoticeNamesNoRpcAndDetailsKeepTheCommand()
     {
         FundingReadProbe probe;
