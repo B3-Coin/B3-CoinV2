@@ -4540,51 +4540,16 @@ void FlowMeshRuntime::HandleAction(
     auto& counters{market.delivery.action_admission};
     const auto& header{message.header};
     const uint64_t next{market.next_sequence};
-    const auto refuse_decoded = [&](const char* reason, const flowmesh::ActionReasonCode code) {
-        if (const auto action{flowmesh::DecodeProductionActionPayload(message.payload)}) {
-            ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason, nullptr, code);
-        }
-    };
-    // 1. Identity. Remote refusals are counted only: they create no event.
-    if (header.version != flowmesh::FLOWMESH_WIRE_VERSION_V1 ||
-        header.market_id != market.market_id || header.epoch != market.seats.epoch) {
-        if (local) {
-            refuse_decoded("local queued action header is not current authority; this attempt was not admitted",
-                           flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
-        } else {
-            CountObservation(counters.header_refused_identity);
-        }
-        return;
-    }
-    // 2. Ahead: only a remote sender, at most two slots. Its header claims
-    // only its own head, and any peer may already stamp this node's head on
-    // any frame, so accepting it grants nothing new; it helps a lagging
-    // validator gather the evidence it needs once it catches up.
-    const bool ahead{header.sequence > next};
-    if (ahead && (local || header.sequence - next > ACTION_HEADER_AHEAD)) {
-        if (local) {
-            refuse_decoded("local queued action header is not current authority; this attempt was not admitted",
-                           flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
-        } else {
-            CountObservation(counters.header_refused_far);
-        }
-        return;
-    }
-    // 3. Behind: at most two slots, and only with the proof below.
-    const bool behind{header.sequence < next};
-    if (behind && next - header.sequence > ACTION_HEADER_BEHIND) {
-        if (local) {
-            refuse_decoded("local queued action lacks a complete retained certified-head interval; check exact-action status before retry",
-                           flowmesh::ActionReasonCode::HEAD_INTERVAL_UNAVAILABLE);
-        } else {
-            CountObservation(counters.header_refused_far);
-        }
-        return;
-    }
-    // 4. Decode.
-    const auto action{flowmesh::DecodeProductionActionPayload(message.payload)};
-    if (!action) return;
+    // 0. A local frame is answered from this node's pool and certified state
+    // before its header is checked. Its header was stamped at submission and
+    // goes stale when the head or the epoch moves while it is queued; an
+    // action that is pooled here or already certified must then not read
+    // "rejected". Only a frame that would still be queued meets the header
+    // checks below, with their existing texts.
+    std::optional<flowmesh::Action> action;
     if (local) {
+        action = flowmesh::DecodeProductionActionPayload(message.payload);
+        if (!action) return;
         // An exact duplicate keeps today's answer, whatever its header.
         if (market.pool.ContainsExact(*action)) {
             ClientActionEvent(market, flowmesh::ClientEventKind::POOL_ADMITTED, *action,
@@ -4594,10 +4559,11 @@ void FlowMeshRuntime::HandleAction(
         }
         // Authoritative recheck of the submit-time decision: state may have
         // advanced while this frame was queued. It runs before the header
-        // proof's inclusion and pending-state refusals, so a frame whose own
-        // attempt was certified while it waited is never refused.
+        // checks and the header proof's inclusion and pending-state refusals,
+        // so a frame whose own attempt was certified while it waited is never
+        // refused.
         const auto admission{DecideLocal(market, *action)};
-        if (admission.kind == FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED) return; // its inclusion event exists
+        if (admission.kind == FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED) return; // its inclusion is retained
         if (admission.kind != FlowMeshLocalAdmission::Kind::ENQUEUE && AuthenticateAction(market, *action)) {
             if (admission.kind == FlowMeshLocalAdmission::Kind::REFUSE) {
                 auto event{MakeClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action,
@@ -4614,6 +4580,50 @@ void FlowMeshRuntime::HandleAction(
         }
         // An unauthenticated attempt earns no event of its own here: Add
         // below refuses it with the existing text.
+    }
+    const auto refuse_local = [&](const char* reason, const flowmesh::ActionReasonCode code) {
+        ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason, nullptr, code);
+    };
+    // 1. Identity. Remote refusals are counted only: they create no event.
+    if (header.version != flowmesh::FLOWMESH_WIRE_VERSION_V1 ||
+        header.market_id != market.market_id || header.epoch != market.seats.epoch) {
+        if (local) {
+            refuse_local("local queued action header is not current authority; this attempt was not admitted",
+                         flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
+        } else {
+            CountObservation(counters.header_refused_identity);
+        }
+        return;
+    }
+    // 2. Ahead: only a remote sender, at most two slots. Its header claims
+    // only its own head, and any peer may already stamp this node's head on
+    // any frame, so accepting it grants nothing new; it helps a lagging
+    // validator gather the evidence it needs once it catches up.
+    const bool ahead{header.sequence > next};
+    if (ahead && (local || header.sequence - next > ACTION_HEADER_AHEAD)) {
+        if (local) {
+            refuse_local("local queued action header is not current authority; this attempt was not admitted",
+                         flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
+        } else {
+            CountObservation(counters.header_refused_far);
+        }
+        return;
+    }
+    // 3. Behind: at most two slots, and only with the proof below.
+    const bool behind{header.sequence < next};
+    if (behind && next - header.sequence > ACTION_HEADER_BEHIND) {
+        if (local) {
+            refuse_local("local queued action lacks a complete retained certified-head interval; check exact-action status before retry",
+                         flowmesh::ActionReasonCode::HEAD_INTERVAL_UNAVAILABLE);
+        } else {
+            CountObservation(counters.header_refused_far);
+        }
+        return;
+    }
+    // 4. Decode (a local frame already is).
+    if (!local) {
+        action = flowmesh::DecodeProductionActionPayload(message.payload);
+        if (!action) return;
     }
     // 5. Proof for a header behind this head. A local wrapper can be
     // overtaken by a certificate while queued; a remote sender can lag this

@@ -9480,6 +9480,74 @@ BOOST_AUTO_TEST_CASE(local_queued_stale_frame_refused_by_worker_with_consumer_th
     BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
 }
 
+BOOST_AUTO_TEST_CASE(local_frame_with_stale_header_answers_pool_and_inclusion_before_refusing)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_stale_header"};
+    f.block_commits = false;
+    f.Reach(1);
+    CKey key;
+    key.MakeNewKey(true);
+    const auto config{f.initial.ConfigId()};
+    // Three certified entries: the first one's local frame below is then more
+    // than two slots behind as well as in another epoch.
+    const auto certified{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_ASK)};
+    for (uint64_t sequence{0}; sequence < 3; ++sequence) {
+        const auto action{sequence == 0 ? certified : SignedAction(key, f.domain, config, sequence, flowmesh::ActionType::CANCEL_ASK)};
+        BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, action) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(Settle(f, [&] { return f.AllAt(2 + sequence); }));
+    }
+    f.Drain();
+    f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    const auto head{runtime.MarketStatus(f.market)};
+    BOOST_REQUIRE_EQUAL(head->next_sequence, 4U);
+    BOOST_REQUIRE(runtime.ClientRecentInclusion(f.market, certified.Id()));
+    // Relayed by a peer and pooled here.
+    const auto pooled{SignedAction(key, f.domain, config, 5, flowmesh::ActionType::CANCEL_BID)};
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(3, {flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, head->epoch, head->next_sequence},
+        *flowmesh::EncodeProductionActionPayload(pooled)}) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_REQUIRE_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 1U);
+    const auto fresh{SignedAction(key, f.domain, config, 6, flowmesh::ActionType::CANCEL_BID)};
+    // Local frames whose headers went stale while they were queued.
+    const auto local_peer{std::numeric_limits<flowmesh::WirePeerId>::min()};
+    const auto send = [&](const flowmesh::Action& action, const flowmesh::WireHeader& header) {
+        const auto cursor{runtime.ClientEventCursor()};
+        BOOST_REQUIRE(runtime.EnqueueWireMessage(local_peer, {flowmesh::WireMessageKind::ACTION, header,
+            *flowmesh::EncodeProductionActionPayload(action)}) == flowmesh::QueueResult::ACCEPTED);
+        f.Drain();
+        return runtime.ClientEvents(cursor, f.market, std::nullopt).events;
+    };
+    const flowmesh::WireHeader other_epoch{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, head->epoch + 1, head->next_sequence};
+    const flowmesh::WireHeader far_behind{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, head->epoch, 1};
+    for (const auto& header : {other_epoch, far_behind}) {
+        // An already certified action is answered by its retained inclusion:
+        // nothing is appended, never a refusal that would read "rejected".
+        BOOST_CHECK(send(certified, header).empty());
+        // Exact pooled bytes keep the duplicate answer, whatever the header.
+        const auto duplicate{send(pooled, header)};
+        BOOST_REQUIRE_EQUAL(duplicate.size(), 1U);
+        BOOST_CHECK(duplicate.front().action_id == pooled.Id());
+        BOOST_CHECK(duplicate.front().kind == flowmesh::ClientEventKind::POOL_ADMITTED);
+        BOOST_CHECK_EQUAL(duplicate.front().reason, "exact signed action already present in pool");
+        BOOST_CHECK(duplicate.front().reason_code == flowmesh::ActionReasonCode::DUPLICATE_PENDING);
+    }
+    // A frame that would still be queued meets the header checks, with their
+    // existing texts.
+    const auto refused{send(fresh, other_epoch)};
+    BOOST_REQUIRE_EQUAL(refused.size(), 1U);
+    BOOST_CHECK(refused.front().kind == flowmesh::ClientEventKind::POOL_REFUSED);
+    BOOST_CHECK_EQUAL(refused.front().reason, "local queued action header is not current authority; this attempt was not admitted");
+    BOOST_CHECK(refused.front().reason_code == flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
+    const auto behind{send(fresh, far_behind)};
+    BOOST_REQUIRE_EQUAL(behind.size(), 1U);
+    BOOST_CHECK(behind.front().kind == flowmesh::ClientEventKind::POOL_REFUSED);
+    BOOST_CHECK_EQUAL(behind.front().reason, "local queued action lacks a complete retained certified-head interval; check exact-action status before retry");
+    BOOST_CHECK(behind.front().reason_code == flowmesh::ActionReasonCode::HEAD_INTERVAL_UNAVAILABLE);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 1U);
+}
+
 BOOST_AUTO_TEST_CASE(local_stale_without_retained_consumer_is_unknown_not_rejected)
 {
     PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_stale_unattributed", std::chrono::seconds{10}, 3};
