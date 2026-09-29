@@ -75,6 +75,9 @@ constexpr size_t CLIENT_ACTION_OUTCOME_MAX_REPLY{2 * CLIENT_ACTION_WAIT_MAX_REPL
                                                  4 * flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES + 64 * 1024};
 static_assert(CLIENT_ACTION_OUTCOME_MAX_REPLY <= CLIENT_MAX_REPLY);
 constexpr size_t CLIENT_OUTCOME_EVIDENCE_MAX_REPLY{2 * flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES + 4096};
+// A waited submission's reply: its acknowledgement plus one (opt-in) 'action' reply.
+constexpr size_t CLIENT_SUBMIT_WAIT_MAX_REPLY{CLIENT_ACTION_OUTCOME_MAX_REPLY + 64 * 1024};
+static_assert(CLIENT_SUBMIT_WAIT_MAX_REPLY <= CLIENT_MAX_REPLY);
 // A retained not-executed marker whose proof this process has not renewed.
 constexpr const char* CLIENT_NOT_EXECUTED_RETAINED{
     "Previously proven not executed; fresh proof required, and this action will not be resubmitted"};
@@ -1233,6 +1236,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         std::vector<unsigned char> consumer_proof{};
         // Volatile: the marker's one re-proof per process was attempted.
         bool not_executed_reproof_asked{false};
+        // Volatile, under m_work: this new action's waited submission is on
+        // the wait lane without m_work. Never evicted or resent meanwhile,
+        // and absent from the saved view until that Submit returns, so the
+        // view still shows only completed methods.
+        bool lane_in_flight{false};
     };
     std::map<std::pair<uint256, uint256>, Pending> m_pending;
     static bool ProvenNotExecuted(const Pending& p) { return FlowMeshProvenNotExecuted(p.receipt, p.not_executed); }
@@ -1329,7 +1337,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     {
         std::vector<interfaces::FlowMeshSavedAction> out;
         for (const auto& [key, p] : m_pending) {
-            if (p.owner_account == account && (!market || p.market == *market)) out.push_back(SavedRow(p));
+            if (!p.lane_in_flight && p.owner_account == account && (!market || p.market == *market)) out.push_back(SavedRow(p));
         }
         return out;
     }
@@ -1341,7 +1349,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         try {
             auto rows{std::make_shared<std::vector<interfaces::FlowMeshSavedAction>>()};
             rows->reserve(m_pending.size());
-            for (const auto& [key, p] : m_pending) rows->push_back(SavedRow(p));
+            for (const auto& [key, p] : m_pending) if (!p.lane_in_flight) rows->push_back(SavedRow(p));
             view = std::move(rows);
         } catch (...) {
             // Null makes readers fall back to m_work, never to stale rows.
@@ -1512,7 +1520,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                   const std::function<void(const UniValue&, size_t)>& validate,
                   bool* possibly_sent = nullptr, bool* earlier_possible = nullptr,
                   size_t* attempted_endpoints = nullptr, Pending* automatic_action = nullptr,
-                  const std::function<void(UniValue&, size_t)>& decorate = {})
+                  const std::function<void(UniValue&, size_t)>& decorate = {},
+                  const std::optional<size_t> skip = std::nullopt)
     {
         FlowMeshTimingSpan timing{"client_call"};
         timing.Field("method", method);
@@ -1529,6 +1538,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             (automatic_read ? m_preferred : m_selected)};
         for (size_t attempt{0}; attempt < m_endpoints.size(); ++attempt) {
             const size_t endpoint{(first + attempt) % m_endpoints.size()};
+            if (skip && endpoint == *skip) continue;
             if (automatic_read && std::chrono::steady_clock::now() < m_retry_after[endpoint]) continue;
             if (automatic_action && !m_action_polls.TryChargeAttempt(std::chrono::steady_clock::now())) {
                 automatic_action->automatic_endpoint = endpoint;
@@ -2369,8 +2379,17 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         else SaveRestartState();
         return p.receipt;
     }
-    Receipt Send(Pending& p)
+    //! `skip`, when set, is an endpoint this delivery must not use (a lane
+    //! submission already tried it).
+    Receipt Send(Pending& p, const std::optional<size_t> skip = std::nullopt)
     {
+        if (p.lane_in_flight) {
+            // Another call's waited submission of these exact bytes is in
+            // flight: nothing is sent again until its outcome is applied.
+            Receipt out{p.receipt};
+            out.reason = "A waited submission of this exact action is in flight; its outcome is not known yet";
+            return out;
+        }
         if (p.previously_certified) {
             try { QueryAction(p); }
             catch (const std::exception& e) {
@@ -2410,7 +2429,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 p.receipt = std::move(receipt);
                 if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
                 p.delivery_endpoint = endpoint;
-            }, &possible, &earlier_possible);
+            }, &possible, &earlier_possible, nullptr, nullptr, {}, skip);
         } catch (const std::exception& e) {
             p.receipt.state = "unknown"; p.receipt.reason = e.what();
         }
@@ -2514,6 +2533,250 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         }
         label = p.receipt.certificate_verified ? "certified" : "observed";
         return p.receipt;
+    }
+    static bool Settled(const Pending& p) { return p.receipt.certificate_verified || ProvenNotExecuted(p); }
+    //! A new exact signed action's submission on the wait lane: its first
+    //! delivery, with a bounded wait at the endpoint for its inclusion.
+    struct LaneSubmission {
+        std::pair<uint256, uint256> key;
+        HttpsEndpoint target;
+        size_t endpoint{0};
+        std::chrono::milliseconds wait{0};
+        bool with_outcome{false};
+        bool borrowed{false};
+        std::string body;
+    };
+    //! The answer of a lane submission, and whether the endpoint did not wait
+    //! (so one waited status read may still follow in the same call).
+    struct LaneSubmissionResult {
+        Receipt receipt;
+        bool chain{false};
+    };
+    /** Under m_work while holding the wait lane, for an exact signed action
+     * this Submit call just retained (its row Saved) and never delivered:
+     * when the ordinary submission endpoint offers a waited submission and
+     * one automatic status attempt is available, makes the delivery record
+     * durable before any byte can leave, exactly as Send's write-ahead does,
+     * carries a warm ordinary connection if the lane's is cold, and marks the
+     * row in flight. nullopt, having changed nothing, when Send must deliver
+     * it instead. It throws only up to its write-ahead Save (the row is then
+     * simply retained, as when Send throws there), never after it. */
+    std::optional<LaneSubmission> PrepareLaneSubmission(Pending& p, const std::chrono::milliseconds requested)
+    {
+        if (m_endpoints.empty() || p.lane_in_flight || p.previously_certified || p.not_executed) return std::nullopt;
+        const size_t endpoint{m_selected};
+        const auto now{std::chrono::steady_clock::now()};
+        const auto wait{FlowMeshSubmitWaitFor({.requested = requested, .new_instruction = !p.may_have_been_sent,
+            .advertised = m_submit_wait.at(endpoint), .endpoint_cooling = now < m_retry_after.at(endpoint),
+            .endpoint_unanswered = m_wait_unanswered.at(endpoint)})};
+        if (wait.count() == 0) return std::nullopt;
+        // Send's local authority check, before any network use.
+        const auto pins{Pins(p.market)};
+        if (pins.domain != p.domain || pins.execution_config_id != p.config) Fail("Cannot retry retained action under different domain/config");
+        // The embedded status read is charged like the waited read it replaces.
+        if (!m_action_polls.TryChargeAttempt(now)) return std::nullopt;
+        LaneSubmission s;
+        s.key = {p.market, p.action.Id()};
+        s.target = m_endpoints.at(endpoint);
+        s.endpoint = endpoint;
+        s.wait = wait;
+        s.with_outcome = m_action_outcome.at(endpoint);
+        UniValue params{UniValue::VOBJ};
+        params.pushKV("market_id", p.market.GetHex());
+        params.pushKV("action_id", p.action.Id().GetHex());
+        params.pushKV("action_hex", HexStr(p.bytes));
+        params.pushKV("wait_ms", uint64_t(wait.count()));
+        // Only an endpoint that advertised verifiable outcomes receives "outcome".
+        if (s.with_outcome) params.pushKV("outcome", true);
+        UniValue request{UniValue::VOBJ};
+        request.pushKV("method", "submit");
+        request.pushKV("params", std::move(params));
+        s.body = request.write();
+        // Write-ahead uncertainty, exactly Send's, covers a crash immediately
+        // after the first socket write. No signature is generated here.
+        p.may_have_been_sent = true; p.receipt.state = "unknown"; Save();
+        // Nothing below throws: an in-flight mark is never left behind here.
+        s.borrowed = BorrowForLane(s.target);
+        p.lane_in_flight = true;
+        return s;
+    }
+    /** The network half of a lane submission, then its application under
+     * m_work. The flight is released under m_work on every path, including
+     * an unwind: the row is published again, a carried connection handed
+     * back and the lane unlocked. Only the retained exact bytes are ever
+     * resent, and only where Send would send them: without wait_ms to the
+     * same endpoint after it refused the field, or to the other endpoints
+     * after it did not answer usably. A reply that cannot be used leaves the
+     * action unknown, never rejected; a verified or proven receipt (from a
+     * concurrent read) is never replaced; an acknowledgement never downgrades
+     * a queued or admitted observation. Worst case on a single silent
+     * endpoint: wait + CLIENT_REQUEST_TIMEOUT, then unknown with no resend. */
+    LaneSubmissionResult FinishLaneSubmission(const LaneSubmission& s, std::unique_lock<std::mutex>& lane)
+    {
+        FlowMeshTimingSpan timing{"client_submit_wait"};
+        timing.Field("market_id", s.key.first);
+        if (timing.Enabled()) timing.Field("action_id", s.key.second);
+        timing.Field("wait_ms", uint64_t(s.wait.count()));
+        timing.Field("endpoint", s.target.url);
+        timing.Field("borrowed", uint64_t{s.borrowed});
+        const auto outcome = [&](const char* result) { timing.Field("result", std::string{result}); };
+        struct Flight {
+            RemoteBackend& backend;
+            const LaneSubmission& s;
+            std::unique_lock<std::mutex>& lane;
+            FlowMeshTimingSpan& timing;
+            bool open{true};
+            //! The caller holds m_work.
+            void Release() noexcept
+            {
+                if (!open) return;
+                open = false;
+                if (const auto it{backend.m_pending.find(s.key)}; it != backend.m_pending.end()) it->second.lane_in_flight = false;
+                bool handed_back{false};
+                try {
+                    handed_back = backend.ReturnLaneBorrow(s.borrowed, s.target);
+                } catch (...) {
+                }
+                timing.Field("handed_back", uint64_t{handed_back});
+                if (lane.owns_lock()) lane.unlock();
+            }
+            ~Flight()
+            {
+                if (!open) return;
+                try {
+                    WorkLock lock{backend};
+                    Release();
+                } catch (...) {
+                }
+            }
+        } flight{*this, s, lane, timing};
+
+        timing.Mark("request_started_us");
+        HttpsRequestResult reply;
+        try {
+            // The endpoint answers before its own wait ends; the transport
+            // bound is the ordinary one on top of the wait.
+            reply = m_wait_https.Request(s.target, "/flowmesh/v1", s.body, s.wait + CLIENT_REQUEST_TIMEOUT,
+                                         CLIENT_SUBMIT_WAIT_MAX_REPLY);
+        } catch (const std::exception& e) {
+            // The exact bytes may have left: an unanswered request.
+            reply = {};
+            reply.request_may_have_been_sent = true;
+            reply.error = e.what();
+        }
+        timing.Mark("request_completed_us");
+        timing.Field("connection_reused", uint64_t{reply.connection_reused});
+        timing.Field("tls_handshake_performed", uint64_t{reply.tls_handshake_performed});
+        UniValue result;
+        std::string error;
+        bool unsupported{false};
+        try {
+            if (!reply.response_received) {
+                Fail(reply.error.empty() ? "No HTTPS response to the waited submission; outcome unknown" : reply.error);
+            }
+            UniValue parsed;
+            if (!parsed.read(reply.body)) Fail("Malformed endpoint JSON response");
+            Keys(parsed, {"ok", "result", "error"});
+            if (!Flag(parsed, "ok")) {
+                const auto text{Text(parsed, "error")};
+                unsupported = text == FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR;
+                Fail(text);
+            }
+            if (reply.status != 200) Fail("Unexpected HTTPS response status");
+            result = parsed["result"];
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        // A latency hint only; never evidence.
+        const std::string wait_status{result.isObject() && result["wait_status"].isStr() ? result["wait_status"].get_str() : ""};
+        if (!wait_status.empty()) timing.Field("wait_status", wait_status);
+
+        timing.Mark("apply_lock_requested_us");
+        WorkLock lock{*this};
+        timing.Mark("apply_lock_acquired_us");
+        flight.Release();
+        // Pinned while in flight: eviction skips it and nothing else erases.
+        auto& p{m_pending.at(s.key)};
+        if (unsupported) {
+            // A downgraded endpoint (or a stale advertisement) refused the
+            // field before admission. Withdrawn until it advertises again;
+            // the exact bytes go by the ordinary path, where any refusal now
+            // stays unknown because this delivery was possible.
+            m_submit_wait.at(s.endpoint) = {};
+            if (s.with_outcome) m_action_outcome.at(s.endpoint) = false;
+            outcome("unsupported");
+            return {Send(p), true};
+        }
+        std::optional<Receipt> acknowledged;
+        if (error.empty()) {
+            try {
+                acknowledged = ParseReceipt(result, p.action.Id(), s.endpoint);
+            } catch (const std::exception& e) {
+                error = e.what();
+            }
+        }
+        if (!acknowledged) {
+            timing.Field("error", error);
+            if (!reply.response_received) {
+                // A lane request left unanswered: no transport cooldown, and
+                // the lane skips this endpoint until it answers again.
+                m_wait_unanswered.at(s.endpoint) = true;
+            } else {
+                EndpointResult(s.endpoint, true, error);
+            }
+            if (m_endpoints.size() > 1) {
+                // Exactly the ordinary failover: the same bytes to the other
+                // endpoints; a refusal there stays unknown.
+                outcome(reply.response_received ? "refused_failover" : "unanswered_failover");
+                return {Send(p, s.endpoint), true};
+            }
+            outcome(reply.response_received ? "refused" : "unanswered");
+            if (!Settled(p)) {
+                // As Send after a failed delivery: retained, possibly
+                // delivered, never rejected on this evidence.
+                if (p.receipt.state != "queued" && p.receipt.state != "admitted") p.receipt.state = "unknown";
+                p.receipt.reason = error;
+                SaveRestartState();
+            }
+            return {p.receipt, false};
+        }
+        auto receipt{std::move(*acknowledged)};
+        if (receipt.state == "certified_inclusion") {
+            // A submission acknowledgement itself carries no inclusion proof.
+            receipt.state = "unknown"; receipt.reason = "Endpoint reports inclusion; canonical certificate must still be retrieved";
+        }
+        EndpointResult(s.endpoint, true, {}, /*names_active=*/s.endpoint == m_selected);
+        p.delivery_endpoint = s.endpoint;
+        if (!Settled(p)) {
+            if ((p.receipt.state == "queued" || p.receipt.state == "admitted") &&
+                (receipt.state == "rejected" || receipt.state == "unknown")) {
+                // A concurrent read already observed this action queued or
+                // admitted; one acknowledgement never undoes that.
+                p.receipt.reason = "No verified inclusion yet; endpoint observation: " + receipt.state + ": " + receipt.reason;
+            } else {
+                // Otherwise this first and only delivery's answer, applied as
+                // Send applies it: a refusal of it is definite.
+                p.receipt = std::move(receipt);
+                if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
+            }
+        }
+        // The endpoint did not wait (no slot, deadline, budget or failure):
+        // one waited read of the acknowledged delivery may still follow.
+        const bool not_waited{wait_status == "busy" || wait_status == "deadline" || wait_status == "budget" ||
+                              wait_status == "failed"};
+        if (result["action"].isObject()) {
+            m_action_polls.RecordExtraCost(std::chrono::steady_clock::now(), OutcomeExtraCost(result["action"]));
+            std::string label;
+            if (auto applied{ApplyLaneResult(p, result["action"], s.endpoint, timing, label)}) {
+                outcome(label.c_str());
+                return {std::move(*applied), not_waited};
+            }
+            timing.Field("action_error", label);
+        }
+        // Only the receipt changed: the delivery record is already durable.
+        SaveRestartState();
+        outcome("acknowledged");
+        return {p.receipt, not_waited};
     }
     // One waited 'action' read of an action this process delivered, sent on
     // the lane connection to the endpoint that acknowledged the delivery and
@@ -3023,11 +3286,36 @@ public:
         if (timing_lock_1251.Enabled()) timing_lock_1251.Field("action_id", action.Id());
         timing_lock_1251.Field("lock_name", std::string{"client_work"});
         timing_lock_1251.Mark("lock_requested_us");
-        Receipt out{SubmitOrdinary(market, action, timing_lock_1251)};
+        // A waited submission of a new action may travel on the wait lane,
+        // taken before m_work exactly as a waited read takes it: only ever
+        // try-locked, never while holding m_work. A busy lane means the
+        // ordinary submission.
+        std::unique_lock lane{m_wait_lane, std::defer_lock};
+        if (wait.count() > 0) (void)lane.try_lock();
+        std::optional<LaneSubmission> flight;
+        Receipt out{SubmitOrdinary(market, action, timing_lock_1251, lane.owns_lock() ? wait : std::chrono::milliseconds{0}, flight)};
+        bool chain{wait.count() > 0};
+        if (!flight) {
+            if (lane.owns_lock()) lane.unlock();
+        } else {
+            try {
+                auto finished{FinishLaneSubmission(*flight, lane)};
+                out = std::move(finished.receipt);
+                chain = chain && finished.chain;
+            } catch (const std::exception& e) {
+                // The flight was released; the exact retained action may have
+                // been delivered, so its outcome is unknown, never refused.
+                out = {};
+                out.action_id = action.Id();
+                out.state = "unknown";
+                out.reason = e.what();
+                chain = false;
+            }
+        }
         // At most one bounded waited read of the action just delivered: what
         // a caller's getflowmeshactionstatus(wait_ms) right after this call
         // would send, without that caller's turnaround. It never resends.
-        if (wait.count() > 0 && out.state != "rejected" && !out.certificate_verified) {
+        if (chain && out.state != "rejected" && !out.certificate_verified) {
             if (auto waited{WaitedActionStatus(market, action.Id(), wait)}) return std::move(*waited);
         }
         return out;
@@ -3035,7 +3323,11 @@ public:
 private:
     //! Retains a new exact signed action (Save before its first send) and
     //! delivers it, or redelivers a retained one, by Send; all under m_work.
-    Receipt SubmitOrdinary(const uint256& market, const flowmesh::Action& action, FlowMeshTimingSpan& timing_lock_1251)
+    //! With a nonzero lane_wait (the caller holds the wait lane), a new
+    //! action whose endpoint offers a waited submission is instead prepared
+    //! for it into `flight`, which the caller must finish.
+    Receipt SubmitOrdinary(const uint256& market, const flowmesh::Action& action, FlowMeshTimingSpan& timing_lock_1251,
+                           const std::chrono::milliseconds lane_wait, std::optional<LaneSubmission>& flight)
     {
         WorkLock lock{*this};
         MarkWorkAcquired(timing_lock_1251);
@@ -3055,9 +3347,11 @@ private:
             }
             if (m_pending.size() >= CLIENT_MAX_ACTIONS) {
                 // Evictable: a verified inclusion, or an action proven never to
-                // execute (its marker needs no row once nothing can resend it).
+                // execute (its marker needs no row once nothing can resend it),
+                // but never one whose waited submission is still in flight.
                 const auto completed{std::find_if(m_pending.begin(), m_pending.end(), [](const auto& value) {
-                    return value.second.receipt.certificate_verified || value.second.not_executed.has_value();
+                    return !value.second.lane_in_flight &&
+                           (value.second.receipt.certificate_verified || value.second.not_executed.has_value());
                 })};
                 if (completed == m_pending.end()) Fail("Pending action limit reached; unresolved signed objects are not evicted");
                 m_action_polls.Remove(completed->first);
@@ -3078,6 +3372,7 @@ private:
 #ifdef FLOWMESH_CLIENT_CRASH_TEST_HOOKS
             test::ClientCrashBeforeFirstSend(m_path, action.Id(), action.IsDeposit());
 #endif
+            if (lane_wait.count() > 0 && (flight = PrepareLaneSubmission(it->second, lane_wait))) return it->second.receipt;
             return Send(it->second);
         } catch (const std::exception& e) {
             out.state = m_pending.contains({market, action.Id()}) ? "unknown" : "rejected"; out.reason = e.what(); return out;
