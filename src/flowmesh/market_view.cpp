@@ -132,8 +132,8 @@ ImbalanceSide ObserveImbalanceSide(const ClearingEngine::ClearingResult& clearin
 }
 
 namespace {
-template <typename Item, typename ToTick>
-ClearingTickPage Page(const std::deque<Item>& items, const ClearingTickQuery& query, ToTick to_tick)
+template <typename Entry, typename ToTick>
+ClearingTickPage Page(const std::deque<Entry>& items, const ClearingTickQuery& query, ToTick to_tick)
 {
     ClearingTickPage out;
     if (query.limit == 0 || query.limit > MARKET_DATA_MAX_TICKS) {
