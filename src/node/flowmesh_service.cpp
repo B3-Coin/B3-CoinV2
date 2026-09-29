@@ -2226,6 +2226,33 @@ std::optional<flowmesh::ClientActionNotice> FlowMeshService::NewestClientNoticeI
     return runtime ? runtime->NewestClientNoticeIfNewer(market_id, action_id) : std::nullopt;
 }
 
+flowmesh::ClientWatchResult FlowMeshService::ClientEventsPending(
+    const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+    const std::optional<flowmesh::AccountId>& account) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    return runtime ? runtime->ClientEventsPending(after, market, account) : flowmesh::ClientWatchResult::GAP;
+}
+
+flowmesh::ClientWatchResult FlowMeshService::WaitClientEvents(
+    const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+    const std::optional<flowmesh::AccountId>& account,
+    const std::chrono::steady_clock::time_point deadline,
+    const std::function<bool()>& interrupted) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (!runtime) return flowmesh::ClientWatchResult::INTERRUPTED;
+    return runtime->WaitClientEvents(after, market, account, deadline, interrupted);
+}
+
 void FlowMeshService::WakeClientWaiters() const
 {
     std::shared_ptr<FlowMeshRuntime> runtime;

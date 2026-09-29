@@ -1195,4 +1195,116 @@ BOOST_AUTO_TEST_CASE(runtime_wait_client_action_status_wakes_on_commit)
     BOOST_CHECK(WaitClock::now() - stop_start < 2s);
 }
 
+BOOST_AUTO_TEST_CASE(runtime_wait_client_events_wakes_on_commit_and_stop)
+{
+    using Watch = flowmesh::ClientWatchResult;
+    EvidenceFixture f;
+    EvidenceChain chain{f};
+    NoSeatKeys keys;
+    node::SteadyFlowMeshRuntimeClock clock;
+    node::FlowMeshProductionStore store{DBParams{.path = m_path_root / "client-watch", .cache_bytes = 1 << 20}};
+    std::string error;
+    BOOST_REQUIRE(store.OpenForMarket(f.pins.domain, f.pins.market_id, f.seats, f.state.Root(), error));
+    node::FlowMeshRuntimeConfig config;
+    config.chain = &chain;
+    config.keys = &keys;
+    config.clock = &clock;
+    config.relay = [](node::FlowMeshRuntimeRelay) { return node::FlowMeshRelayResult{}; };
+    node::FlowMeshRuntimeMarketConfig market{.domain = f.pins.domain, .market_id = f.pins.market_id,
+        .treasury_owner_commitment = Filled(9), .active_seats = f.seats, .state = f.state, .store = &store};
+    node::FlowMeshRuntime runtime{config, {market}};
+    // Before Start, a watch that would sleep is interrupted at once.
+    const auto start{WaitClock::now()};
+    BOOST_CHECK(runtime.WaitClientEvents(runtime.ClientEventCursor(), f.pins.market_id, std::nullopt,
+                                         start + 5s, {}) == Watch::INTERRUPTED);
+    BOOST_CHECK(WaitClock::now() - start < 1s);
+    BOOST_REQUIRE_MESSAGE(runtime.Start(error), error);
+    flowmesh::Action action;
+    action.signer = f.account;
+    action.sequence = 7;
+    action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+    BOOST_REQUIRE(flowmesh::SignAction(f.account_key, f.pins.domain, f.pins.execution_config_id, action));
+    BOOST_REQUIRE(runtime.SubmitLocalAction(f.pins.market_id, action) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{5}));
+    const auto cursor{runtime.ClientEventCursor()};
+    BOOST_CHECK(runtime.ClientEventsPending(cursor, f.pins.market_id, f.account) == Watch::TIMEOUT);
+    BOOST_CHECK(runtime.ClientEventsPending({cursor.instance_id, 0}, f.pins.market_id, f.account) == Watch::READY);
+    BOOST_CHECK(runtime.ClientEventsPending({Filled(77), 0}, f.pins.market_id, f.account) == Watch::GAP);
+
+    flowmesh::ProductionEntryCheck check;
+    flowmesh::ProductionEpochGate gate{f.pins.domain, f.pins.market_id, f.seats};
+    const std::array<flowmesh::Action, 1> actions{action};
+    const auto built{flowmesh::BuildProductionExecutionEntry(f.state, f.pins.domain, f.pins.market_id,
+        f.seats, gate, 0, 0, {}, f.anchor, {130, {}, &chain}, Filled(9), actions, nullptr, check)};
+    BOOST_REQUIRE(built);
+    const flowmesh::ProductionCertifiedEnvelope certified{built->entry, f.Certify(built->entry)};
+    const auto payload{flowmesh::EncodeProductionCertifiedPayload(certified, 4)};
+    BOOST_REQUIRE(payload);
+
+    // A watch of another market is never woken by this commit.
+    auto other{std::async(std::launch::async, [&] {
+        return runtime.WaitClientEvents(cursor, Filled(55), std::nullopt, WaitClock::now() + 400ms, {});
+    })};
+    WaitProbe probe;
+    auto watcher{std::async(std::launch::async, [&] {
+        return runtime.WaitClientEvents(cursor, f.pins.market_id, f.account, WaitClock::now() + 5s, probe.Predicate());
+    })};
+    probe.AwaitEvaluations(1);
+    const auto committed{WaitClock::now()};
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(7, {flowmesh::WireMessageKind::CERTIFICATE,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.pins.market_id, 0, 0}, *payload}) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_CHECK(watcher.get() == Watch::READY);
+    BOOST_CHECK(WaitClock::now() - committed < 4s);
+    BOOST_CHECK(other.get() == Watch::TIMEOUT);
+    // The page it reads next begins with the commit's certified head.
+    const auto page{runtime.ClientEvents(cursor, f.pins.market_id, f.account)};
+    BOOST_REQUIRE(!page.gap && !page.events.empty());
+    BOOST_CHECK(page.events.front().kind == flowmesh::ClientEventKind::CERTIFIED_HEAD);
+    BOOST_CHECK(page.events.front().microblock_hash == built->entry.GetHash());
+
+    // A status-only read has the same head and runtime status, and nothing else.
+    const auto full{runtime.MarketData(f.pins.market_id, f.account, {}, error)};
+    flowmesh::MarketDataQuery status;
+    status.status_only = true;
+    const auto brief{runtime.MarketData(f.pins.market_id, f.account, status, error)};
+    BOOST_REQUIRE(full && brief);
+    BOOST_CHECK(full->snapshot.certified && brief->snapshot.certified);
+    BOOST_CHECK_EQUAL(brief->snapshot.next_microblock_sequence, full->snapshot.next_microblock_sequence);
+    BOOST_CHECK(brief->snapshot.last_microblock_hash == full->snapshot.last_microblock_hash);
+    BOOST_CHECK(brief->snapshot.state_root == full->snapshot.state_root);
+    BOOST_CHECK_EQUAL(brief->snapshot.epoch, full->snapshot.epoch);
+    BOOST_CHECK_EQUAL(brief->snapshot.paused, full->snapshot.paused);
+    BOOST_CHECK_EQUAL(brief->snapshot.halt, full->snapshot.halt);
+    BOOST_CHECK_EQUAL(brief->snapshot.pending_actions, full->snapshot.pending_actions);
+    BOOST_CHECK(!brief->unchanged);
+    BOOST_CHECK(full->account && full->history.available && !full->history.entries.empty());
+    BOOST_CHECK(brief->liquidity.curves.empty());
+    BOOST_CHECK(!brief->account);
+    BOOST_CHECK(!brief->history.available && brief->history.entries.empty());
+    // It is never combined with pagination.
+    for (int shape{0}; shape < 3; ++shape) {
+        auto paged{status};
+        if (shape == 0) paged.before_sequence = 1;
+        if (shape == 1) paged.expected_head = full->snapshot.last_microblock_hash;
+        if (shape == 2) { paged.expected_head = full->snapshot.last_microblock_hash; paged.curve_cursor = flowmesh::ClearingEngine::CurveKey{flowmesh::ClearingEngine::Side::BID, f.account}; }
+        error.clear();
+        BOOST_CHECK(!runtime.MarketData(f.pins.market_id, f.account, paged, error));
+        BOOST_CHECK(!error.empty());
+    }
+
+    // Stop interrupts a current watch promptly, and every later one at once.
+    WaitProbe pending;
+    const auto stop_start{WaitClock::now()};
+    const auto head_cursor{runtime.ClientEventCursor()};
+    auto stopped{std::async(std::launch::async, [&] {
+        return runtime.WaitClientEvents(head_cursor, f.pins.market_id, std::nullopt, stop_start + 5s, pending.Predicate());
+    })};
+    pending.AwaitEvaluations(1);
+    runtime.Stop();
+    BOOST_CHECK(stopped.get() == Watch::INTERRUPTED);
+    BOOST_CHECK(runtime.WaitClientEvents(head_cursor, f.pins.market_id, std::nullopt, WaitClock::now() + 5s, {}) ==
+                Watch::INTERRUPTED);
+    BOOST_CHECK(WaitClock::now() - stop_start < 2s);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

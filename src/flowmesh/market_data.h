@@ -29,6 +29,9 @@ struct MarketDataQuery {
     std::optional<ClearingEngine::CurveKey> curve_cursor;
     std::optional<uint256> expected_head;
     std::optional<uint256> known_head;
+    //! Head and runtime status only: no curves, account or history are read.
+    //! A local read option, never part of any codec or reply format.
+    bool status_only{false};
 };
 
 struct MarketAccountFill {

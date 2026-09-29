@@ -601,8 +601,22 @@ public:
         const flowmesh::MarketId& market_id, const uint256& action_id,
         std::chrono::steady_clock::time_point deadline,
         const std::function<bool()>& interrupted, bool include_notices = false) const;
-    /** Ends every current client-action wait (shutdown, never a result). */
+    /** Ends every current client-action wait and event watch (shutdown,
+     * never a result). */
     void WakeClientWaiters() const;
+    //! Nonblocking: would ClientEvents(after, market, account) now return an
+    //! event (READY) or report a gap (GAP)? Otherwise TIMEOUT.
+    flowmesh::ClientWatchResult ClientEventsPending(
+        const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+        const std::optional<flowmesh::AccountId>& account) const;
+    /** Bounded watch on the client event log (see ClientEventLog::WaitEvents).
+     * Holds no queue or market lock while it sleeps. Before Start and from
+     * Stop on, every current and later watch that would sleep is INTERRUPTED. */
+    flowmesh::ClientWatchResult WaitClientEvents(
+        const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+        const std::optional<flowmesh::AccountId>& account,
+        std::chrono::steady_clock::time_point deadline,
+        const std::function<bool()>& interrupted) const;
 
     /** Test/shutdown aid: waits only for this runtime's current work queue. */
     bool WaitForIdle(std::chrono::milliseconds timeout);

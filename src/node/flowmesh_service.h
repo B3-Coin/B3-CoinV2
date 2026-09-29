@@ -217,6 +217,19 @@ public:
         std::chrono::steady_clock::time_point deadline,
         const std::function<bool()>& interrupted, bool include_notices = false) const;
     void WakeClientWaiters() const;
+    //! The runtime's ClientEventsPending; GAP without a runtime, as
+    //! ClientEvents then reports a gap.
+    flowmesh::ClientWatchResult ClientEventsPending(
+        const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+        const std::optional<flowmesh::AccountId>& account) const;
+    /** Bounded event watch on the current runtime; INTERRUPTED at once
+     * without one. The service mutex is released before it blocks, and
+     * stopping the runtime interrupts it. */
+    flowmesh::ClientWatchResult WaitClientEvents(
+        const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+        const std::optional<flowmesh::AccountId>& account,
+        std::chrono::steady_clock::time_point deadline,
+        const std::function<bool()>& interrupted) const;
     //! Memory-only reads of the runtime's recent certified window and local
     //! notices (see FlowMeshRuntime); empty without a runtime.
     std::optional<std::pair<uint64_t, uint256>> ClientRecentInclusion(

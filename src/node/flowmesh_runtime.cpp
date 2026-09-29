@@ -3394,7 +3394,8 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
     if (query.limit == 0 || query.limit > flowmesh::MARKET_DATA_MAX_HISTORY ||
         query.curve_limit == 0 || query.curve_limit > flowmesh::MARKET_DATA_MAX_CURVES ||
         (query.curve_cursor && !query.expected_head) ||
-        (query.known_head && (query.curve_cursor || query.before_sequence))) {
+        (query.known_head && (query.curve_cursor || query.before_sequence)) ||
+        (query.status_only && (query.curve_cursor || query.before_sequence || query.expected_head))) {
         error = "Invalid bounded market-data query or pagination snapshot";
         return std::nullopt;
     }
@@ -3446,7 +3447,7 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
         snapshot.runtime.active_catchup_requests += key.second == market_id;
     }
     out.unchanged = query.known_head && *query.known_head == market.last_hash;
-    if (out.unchanged || !snapshot.certified) return out;
+    if (out.unchanged || query.status_only || !snapshot.certified) return out;
 
     out.liquidity = market.state.ReadCurves(query.curve_limit, query.curve_cursor);
     if (account) {
@@ -3624,6 +3625,24 @@ flowmesh::ClientActionWait FlowMeshRuntime::WaitClientActionStatus(
     return m_client_events.WaitActionStatus(market_id, action_id, deadline, [&] {
         return m_client_waits_closed.load() || (interrupted && interrupted());
     }, include_notices);
+}
+
+flowmesh::ClientWatchResult FlowMeshRuntime::ClientEventsPending(
+    const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+    const std::optional<flowmesh::AccountId>& account) const
+{
+    return m_client_events.EventsPending(after, market, account);
+}
+
+flowmesh::ClientWatchResult FlowMeshRuntime::WaitClientEvents(
+    const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+    const std::optional<flowmesh::AccountId>& account,
+    const std::chrono::steady_clock::time_point deadline,
+    const std::function<bool()>& interrupted) const
+{
+    return m_client_events.WaitEvents(after, market, account, deadline, [&] {
+        return m_client_waits_closed.load() || (interrupted && interrupted());
+    });
 }
 
 void FlowMeshRuntime::WakeClientWaiters() const
