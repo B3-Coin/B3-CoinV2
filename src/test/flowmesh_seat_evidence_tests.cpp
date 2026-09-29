@@ -5,15 +5,25 @@
 #include <flowmesh/seat_evidence.h>
 
 #include <flowmesh/bls_certificate.h>
+#include <flowmesh/p2p.h>
+#include <flowmesh/production_engine.h>
 #include <flowmesh/seat_id.h>
+#include <node/flowmesh_runtime.h>
+#include <node/flowmesh_seat_evidence_recorder.h>
 #include <test/util/setup_common.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -118,6 +128,102 @@ struct EvidenceFixture {
     flowmesh::SeatEvidenceCheck Check(const flowmesh::SeatEvidence& evidence) const
     {
         return flowmesh::CheckSeatEvidence(evidence, seats.seats, seats.seats);
+    }
+};
+
+//! The members of the runtime's market that the seat-evidence recorder
+//! (node/flowmesh_seat_evidence_recorder.h) uses, with an in-memory store,
+//! chain and clock.
+struct RecorderMarket {
+    struct Store {
+        std::vector<flowmesh::SeatEvidence> records; // newest first
+        size_t writes{0};
+        bool RecordSeatEvidence(const flowmesh::SeatEvidence& evidence, bool& inserted, std::string&)
+        {
+            ++writes;
+            inserted = std::none_of(records.begin(), records.end(),
+                                    [&](const auto& record) { return record.Id() == evidence.Id(); });
+            if (inserted) records.insert(records.begin(), evidence);
+            return true;
+        }
+        bool ReadSeatEvidence(node::SeatEvidenceLog& log, std::string&) const
+        {
+            log.recorded = records.size();
+            log.retained.clear();
+            for (const auto& record : records) log.retained.push_back({0, record});
+            return true;
+        }
+    };
+    struct Chain {
+        std::optional<flowmesh::ActiveFnBlsSeatSet> known;
+        std::optional<flowmesh::ActiveFnBlsSeatSet> SeatSet(const uint256&, const flowmesh::MarketId&,
+                                                            const uint64_t epoch, const uint256& set_hash) const
+        {
+            if (known && known->epoch == epoch && known->set_hash == set_hash) return known;
+            return std::nullopt;
+        }
+    };
+    struct Clock {
+        flowmesh::WireClock::time_point now{};
+        flowmesh::WireClock::time_point Now() const { return now; }
+    };
+    struct Candidate {
+        flowmesh::ProductionEntryCore entry;
+    };
+
+    explicit RecorderMarket(const EvidenceFixture& f) : domain{f.domain}, market_id{f.market}, seats{f.seats.seats} {}
+
+    uint256 domain;
+    flowmesh::MarketId market_id;
+    flowmesh::ActiveFnBlsSeatSet seats;
+    Store store_impl;
+    Chain chain_impl;
+    Clock clock_impl;
+    Store* store{&store_impl};
+    const Chain* chain{&chain_impl};
+    const Clock* clock{&clock_impl};
+    uint64_t seat_evidence_recorded{0};
+    std::shared_ptr<const std::vector<flowmesh::SeatEvidence>> seat_evidence;
+    std::set<uint256> seat_evidence_ids;
+    uint64_t seat_evidence_unrecorded{0};
+    std::set<uint32_t> seat_evidence_slot_seats;
+    flowmesh::WireClock::time_point seat_evidence_window{};
+    size_t seat_evidence_window_checks{0};
+    node::FlowMeshSeatEvidenceWork seat_evidence_work;
+    std::map<uint256, Candidate> candidates;
+    std::map<uint256, std::map<uint32_t, flowmesh::IndexedBlsSignature>> attestations;
+
+    //! A candidate entry at `sequence` naming `epoch` and `set_hash`, told
+    //! apart by `salt`; returns its hash.
+    uint256 AddCandidate(const uint64_t sequence, const uint64_t epoch, const uint256& set_hash,
+                         const unsigned char salt)
+    {
+        flowmesh::ProductionEntryCore entry;
+        entry.domain = domain;
+        entry.market_id = market_id;
+        entry.epoch = epoch;
+        entry.seat_set_hash = set_hash;
+        entry.sequence = sequence;
+        entry.parent_hash = Filled(0x61);
+        entry.anchor = {100, Filled(0x71)};
+        entry.previous_state_root = Filled(0x62);
+        entry.actions_root = Filled(0x63);
+        entry.result_root = Filled(0x64);
+        entry.effect_root = Filled(0x65);
+        entry.state_root = Filled(salt);
+        const uint256 hash{entry.GetHash()};
+        BOOST_REQUIRE(!hash.IsNull());
+        BOOST_REQUIRE(candidates.emplace(hash, Candidate{entry}).second);
+        return hash;
+    }
+    //! `seat`'s vote for candidate `hash`, as HandleAttestation keeps it: over
+    //! the candidate's context when that names the fixture's set, otherwise
+    //! over the same hash and sequence in that set's context.
+    bls::Signature Vote(const EvidenceFixture& f, const uint32_t seat, const uint256& hash)
+    {
+        const auto signature{f.Sign(seat, f.Context(hash, candidates.at(hash).entry.sequence))};
+        attestations[hash].insert_or_assign(seat, flowmesh::IndexedBlsSignature{seat, signature});
+        return signature;
     }
 };
 
@@ -266,6 +372,92 @@ BOOST_AUTO_TEST_CASE(prechecked_steps_are_skipped_and_everything_else_still_chec
     // Without a work sink the result is the same.
     BOOST_CHECK(flowmesh::CheckSeatEvidence(conflict, f.seats.seats, f.seats.seats, all) ==
                 flowmesh::SeatEvidenceCheck::OK);
+}
+
+BOOST_AUTO_TEST_CASE(recorder_records_nothing_for_candidates_naming_another_epoch_or_set)
+{
+    EvidenceFixture f;
+    RecorderMarket market{f};
+    const auto& own{f.seats.seats};
+    const auto& other{f.other_seats.seats};
+    const uint256 first{market.AddCandidate(5, own.epoch, own.set_hash, 0xa1)};
+    // Votes the recorder takes as verified are recorded only when both
+    // candidate contexts name this market's installed set; otherwise the
+    // detection is unrecorded before any check, and spends no pace.
+    const uint256 other_epoch{market.AddCandidate(5, other.epoch, own.set_hash, 0xb2)};
+    const uint256 other_set{market.AddCandidate(5, own.epoch, other.set_hash, 0xb3)};
+    const uint256 other_both{market.AddCandidate(5, other.epoch, other.set_hash, 0xb4)};
+    uint32_t seat{0};
+    for (const uint256& second : {other_epoch, other_set, other_both}) {
+        market.Vote(f, seat, first);
+        const auto signature{market.Vote(f, seat, second)};
+        node::RecordAttestationEquivocation(market, seat, first, second, signature);
+        ++seat;
+    }
+    // The guard runs whichever candidate the seat voted for first.
+    market.Vote(f, seat, other_set);
+    node::RecordAttestationEquivocation(market, seat, other_set, first, market.Vote(f, seat, first));
+    BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, 4U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.checks, 0U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.chain_lookups, 0U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_window_checks, 0U);
+    BOOST_CHECK_EQUAL(market.store_impl.writes, 0U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_recorded, 0U);
+
+    // Both contexts naming the installed set: checked once, without
+    // verifying either vote again, and recorded.
+    market.seat_evidence_slot_seats.clear();
+    const uint256 second{market.AddCandidate(5, own.epoch, own.set_hash, 0xb5)};
+    market.Vote(f, 1, first);
+    node::RecordAttestationEquivocation(market, 1, first, second, market.Vote(f, 1, second));
+    BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, 4U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.checks, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.signature_checks, 0U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.seat_set_checks, 0U);
+    BOOST_CHECK_EQUAL(market.store_impl.writes, 1U);
+    BOOST_REQUIRE_EQUAL(market.seat_evidence_recorded, 1U);
+    BOOST_CHECK(f.Check(market.seat_evidence->front()) == flowmesh::SeatEvidenceCheck::OK);
+}
+
+BOOST_AUTO_TEST_CASE(recorder_spends_the_pace_on_a_detection_that_fails_its_check)
+{
+    EvidenceFixture f;
+    RecorderMarket market{f};
+    // A stored certificate whose signature does not verify (corrupt on
+    // disk, say): the detection is checked and fails.
+    auto bad{f.Conflict()};
+    bad.first.signature = bad.second.signature;
+    BOOST_REQUIRE(f.Check(bad) == flowmesh::SeatEvidenceCheck::BAD_FIRST_SIGNATURE);
+    node::RecordSeatEvidence(market, bad, /*first_signature_verified=*/false, /*second_signature_verified=*/true);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.checks, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.signature_checks, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_window_checks, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, 1U);
+    BOOST_CHECK_EQUAL(market.store_impl.writes, 0U);
+    // One naming a seat set this node's chain does not have fails too, after
+    // one chain lookup and no signature check.
+    auto unknown{f.Conflict()};
+    unknown.second.seat_set_hash = f.other_seats.seats.set_hash;
+    node::RecordSeatEvidence(market, unknown, false, true);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.checks, 2U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.chain_lookups, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.signature_checks, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, 2U);
+    // Failed checks are not remembered, so repeats spend the pace until it
+    // is gone; then a valid detection costs nothing and is not recorded.
+    for (size_t n{2}; n < node::SEAT_EVIDENCE_CHECKS_PER_MINUTE; ++n) node::RecordSeatEvidence(market, bad, false, true);
+    BOOST_CHECK_EQUAL(market.seat_evidence_window_checks, node::SEAT_EVIDENCE_CHECKS_PER_MINUTE);
+    const auto good{f.Conflict()};
+    node::RecordSeatEvidence(market, good, false, true);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.checks, node::SEAT_EVIDENCE_CHECKS_PER_MINUTE);
+    BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, node::SEAT_EVIDENCE_CHECKS_PER_MINUTE + 1);
+    BOOST_CHECK_EQUAL(market.store_impl.writes, 0U);
+    // The next minute checks it and records it.
+    market.clock_impl.now += std::chrono::minutes{1};
+    node::RecordSeatEvidence(market, good, false, true);
+    BOOST_CHECK_EQUAL(market.store_impl.writes, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_recorded, 1U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, node::SEAT_EVIDENCE_CHECKS_PER_MINUTE + 1);
 }
 
 BOOST_AUTO_TEST_CASE(encoding_is_canonical_and_strict)
