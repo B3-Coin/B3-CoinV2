@@ -131,7 +131,9 @@ ImbalanceSide ObserveImbalanceSide(const ClearingEngine::ClearingResult& clearin
     return bid > 0 ? ImbalanceSide::BID : ImbalanceSide::ASK;
 }
 
-ClearingTickPage PageClearingTicks(const std::deque<MarketHistoryEntry>& history, const ClearingTickQuery& query)
+namespace {
+template <typename Item, typename ToTick>
+ClearingTickPage Page(const std::deque<Item>& items, const ClearingTickQuery& query, ToTick to_tick)
 {
     ClearingTickPage out;
     if (query.limit == 0 || query.limit > MARKET_DATA_MAX_TICKS) {
@@ -139,22 +141,33 @@ ClearingTickPage PageClearingTicks(const std::deque<MarketHistoryEntry>& history
         return out;
     }
     out.available = true;
-    if (history.empty()) return out;
-    out.oldest_retained_sequence = history.front().sequence;
-    auto first{history.end() - std::min(query.limit, history.size())};
+    if (items.empty()) return out;
+    out.oldest_retained_sequence = to_tick(items.front()).sequence;
+    auto first{items.end() - std::min(query.limit, items.size())};
     if (query.after_sequence) {
         const uint64_t after{*query.after_sequence};
-        first = std::find_if(history.begin(), history.end(), [&](const auto& entry) { return entry.sequence > after; });
+        first = std::find_if(items.begin(), items.end(), [&](const auto& item) { return to_tick(item).sequence > after; });
         out.gap = after < std::numeric_limits<uint64_t>::max() && after + 1 < *out.oldest_retained_sequence;
     }
-    for (auto it{first}; it != history.end(); ++it) {
+    for (auto it{first}; it != items.end(); ++it) {
         if (out.ticks.size() == query.limit) {
             out.more = true;
             break;
         }
-        out.ticks.push_back(MakeClearingTick(*it));
+        out.ticks.push_back(to_tick(*it));
     }
     return out;
+}
+} // namespace
+
+ClearingTickPage PageClearingTicks(const std::deque<MarketHistoryEntry>& history, const ClearingTickQuery& query)
+{
+    return Page(history, query, [](const MarketHistoryEntry& entry) { return MakeClearingTick(entry); });
+}
+
+ClearingTickPage PageClearingTicks(const std::deque<ClearingTick>& ticks, const ClearingTickQuery& query)
+{
+    return Page(ticks, query, [](const ClearingTick& tick) -> const ClearingTick& { return tick; });
 }
 
 IndicativeClearing ComputeIndicative(const std::span<const ClearingEngine::CurveView> curves, const IndicativeQuery& query,

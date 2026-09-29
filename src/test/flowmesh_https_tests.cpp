@@ -5636,6 +5636,250 @@ BOOST_AUTO_TEST_CASE(trading_api_serves_clearing_ticks_when_enabled)
     BOOST_CHECK_EQUAL(watched["error"].get_str(), "ticks cannot be combined with watch_ms");
 }
 
+namespace {
+//! Forwards public API requests to a live endpoint and records each request's
+//! method and params. It can add a clearing_ticks_max advertisement to every
+//! status object and replace the hash of the last tick of every reply.
+struct TickProxy {
+    node::HttpsEndpoint upstream;
+    std::mutex mutex;
+    std::optional<uint64_t> advert;
+    bool tamper{false};
+    std::vector<std::pair<std::string, UniValue>> requests;
+
+    node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
+    {
+        UniValue json;
+        if (!json.read(request.body) || !json["method"].isStr()) return {400, R"({"ok":false,"error":"proxy"})"};
+        const auto method{json["method"].get_str()};
+        std::optional<uint64_t> inject;
+        bool corrupt;
+        {
+            std::lock_guard lock{mutex};
+            requests.emplace_back(method, json["params"]);
+            inject = advert;
+            corrupt = tamper;
+        }
+        const auto reply{node::FlowMeshHttpsRequest(upstream, "/flowmesh/v1", request.body, std::chrono::seconds{10}, 32 << 20)};
+        if (!reply.response_received) return {502, R"({"ok":false,"error":"proxy upstream failed"})"};
+        UniValue parsed;
+        if ((!inject && !corrupt) || !parsed.read(reply.body) || !parsed["ok"].isTrue()) return {reply.status, reply.body};
+        UniValue result{parsed["result"]};
+        if (inject && method == "markets") {
+            UniValue rows{UniValue::VARR};
+            for (auto row : result.getValues()) {
+                row.pushKV("clearing_ticks_max", *inject);
+                rows.push_back(row);
+            }
+            result = rows;
+        } else if (inject && result["status"].isObject()) {
+            UniValue status{result["status"]};
+            status.pushKV("clearing_ticks_max", *inject);
+            result.pushKV("status", status);
+        }
+        if (corrupt && result["reported_data"]["clearing_ticks"]["ticks"].isArray() &&
+            !result["reported_data"]["clearing_ticks"]["ticks"].empty()) {
+            UniValue reported{result["reported_data"]};
+            UniValue page{reported["clearing_ticks"]};
+            const auto& ticks{page["ticks"].getValues()};
+            UniValue rows{UniValue::VARR};
+            for (size_t i{0}; i < ticks.size(); ++i) {
+                UniValue row{ticks[i]};
+                if (i + 1 == ticks.size()) row.pushKV("microblock_hash", uint256::ONE.GetHex());
+                rows.push_back(row);
+            }
+            page.pushKV("ticks", rows);
+            reported.pushKV("clearing_ticks", page);
+            result.pushKV("reported_data", reported);
+        }
+        parsed.pushKV("result", result);
+        return {reply.status, parsed.write()};
+    }
+    //! The "ticks" parameter of each recorded request that carried one.
+    std::vector<std::pair<std::string, UniValue>> TickParams()
+    {
+        std::lock_guard lock{mutex};
+        std::vector<std::pair<std::string, UniValue>> out;
+        for (const auto& [method, params] : requests) {
+            if (params.exists("ticks")) out.emplace_back(method, params["ticks"]);
+        }
+        return out;
+    }
+    size_t Requests()
+    {
+        std::lock_guard lock{mutex};
+        return requests.size();
+    }
+};
+
+std::unique_ptr<node::FlowMeshHttpsServer> TickProxyServer(const ClientLaneFixture& fixture, TickProxy& proxy)
+{
+    auto options{fixture.Options()};
+    options.request_timeout = std::chrono::seconds{10};
+    auto server{std::make_unique<node::FlowMeshHttpsServer>(options, [&proxy](const auto& request) { return proxy.Handle(request); })};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server->Start(error), error);
+    return server;
+}
+
+flowmesh::MarketDataQuery TickPage()
+{
+    auto query{Page()};
+    query.ticks = flowmesh::ClearingTickQuery{};
+    return query;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(remote_client_holds_endpoint_ticks_bound_to_its_verified_head)
+{
+    LiveMarket live{*this, m_path_root / "remote-ticks-service", {}, {256}};
+    TickProxy proxy{live.Endpoint()};
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "remote-ticks-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    // The first read learns the advertisement from its snapshot's status.
+    const auto first{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(first, error);
+    BOOST_REQUIRE(first->ticks);
+    BOOST_CHECK(!first->ticks->available);
+    BOOST_CHECK_EQUAL(first->ticks->unavailable_reason, "clearing_ticks_not_yet_received");
+    BOOST_CHECK(proxy.TickParams().empty());
+    // The next one asks for the newest ticks, bound to the verified head.
+    const auto held{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(held, error);
+    BOOST_REQUIRE(held->ticks && held->ticks->available);
+    BOOST_REQUIRE_EQUAL(held->ticks->ticks.size(), 1U);
+    BOOST_CHECK(held->ticks->ticks.back().microblock_hash == held->snapshot.last_microblock_hash);
+    BOOST_CHECK_EQUAL(node::FlowMeshClientMarketDataJson(*held)["clearing_ticks"]["source"].get_str(), "endpoint_reported");
+    auto sent{proxy.TickParams()};
+    BOOST_REQUIRE_EQUAL(sent.size(), 1U);
+    BOOST_CHECK_EQUAL(sent[0].first, "updates");
+    BOOST_CHECK(!sent[0].second.exists("after_sequence"));
+    BOOST_CHECK_EQUAL(sent[0].second["limit"].getInt<int>(), 256);
+    // A new head: only the ticks after the last one held are asked for,
+    // with the updates page and with the snapshot that verifies the head.
+    live.Deposit();
+    const auto moved{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(moved, error);
+    BOOST_CHECK_EQUAL(moved->snapshot.next_microblock_sequence, 2U);
+    BOOST_REQUIRE(moved->ticks && moved->ticks->available);
+    BOOST_REQUIRE_EQUAL(moved->ticks->ticks.size(), 2U);
+    BOOST_CHECK(moved->ticks->ticks.back().microblock_hash == moved->snapshot.last_microblock_hash);
+    sent = proxy.TickParams();
+    BOOST_REQUIRE_EQUAL(sent.size(), 3U);
+    for (size_t i : {1, 2}) {
+        BOOST_CHECK_EQUAL(sent[i].first, i == 1 ? "updates" : "snapshot");
+        BOOST_CHECK_EQUAL(sent[i].second["after_sequence"].getInt<int>(), 0);
+    }
+    // The caller's own page of what is held.
+    auto after{TickPage()};
+    after.ticks->after_sequence = 0;
+    const auto newest{client->Data(market, std::nullopt, after, error)};
+    BOOST_REQUIRE_MESSAGE(newest, error);
+    BOOST_REQUIRE(newest->ticks && newest->ticks->available);
+    BOOST_REQUIRE_EQUAL(newest->ticks->ticks.size(), 1U);
+    BOOST_CHECK_EQUAL(newest->ticks->ticks[0].sequence, 1U);
+    // Reads without ticks, and the status read a signing preflight uses,
+    // never carry them.
+    const auto carried{proxy.TickParams().size()};
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    const auto status{client->Market(market, std::nullopt)};
+    BOOST_REQUIRE(status);
+    BOOST_CHECK(status->error.empty());
+    BOOST_CHECK_EQUAL(proxy.TickParams().size(), carried);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_withdraws_a_stale_ticks_advertisement)
+{
+    // The endpoint serves no ticks; the proxy advertises them anyway.
+    LiveMarket live{*this, m_path_root / "stale-ticks-service"};
+    TickProxy proxy{live.Endpoint()};
+    proxy.advert = 256;
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "stale-ticks-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // Refused as an unknown field: the same endpoint is read again without
+    // them, and the read succeeds.
+    const auto requests{proxy.Requests()};
+    const auto data{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(data, error);
+    BOOST_CHECK_EQUAL(proxy.Requests(), requests + 2);
+    BOOST_REQUIRE_EQUAL(proxy.TickParams().size(), 1U);
+    BOOST_REQUIRE(data->ticks);
+    BOOST_CHECK(!data->ticks->available);
+    BOOST_CHECK(client->Status().endpoints.at(0).available);
+    BOOST_CHECK(client->Status().endpoints.at(0).last_error.empty());
+    // Advertised again, but withdrawn for a while: never sent again.
+    for (int read{0}; read < 3; ++read) BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, TickPage(), error), error);
+    BOOST_CHECK_EQUAL(proxy.TickParams().size(), 1U);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_drops_a_contradicting_tick_page_but_not_the_read)
+{
+    LiveMarket live{*this, m_path_root / "tampered-ticks-service", {}, {256}};
+    TickProxy proxy{live.Endpoint()};
+    proxy.tamper = true;
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "tampered-ticks-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // The tick at the verified head names another hash: only the ticks go.
+    const auto data{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(data, error);
+    BOOST_CHECK(data->certificate_verified && data->account_state_verified);
+    BOOST_REQUIRE(data->ticks);
+    BOOST_CHECK(!data->ticks->available && data->ticks->ticks.empty());
+    BOOST_CHECK(data->ticks->unavailable_reason.starts_with("endpoint_clearing_ticks_rejected"));
+    {
+        std::lock_guard lock{proxy.mutex};
+        proxy.tamper = false;
+    }
+    const auto fixed{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(fixed, error);
+    BOOST_REQUIRE(fixed->ticks && fixed->ticks->available);
+    BOOST_CHECK(fixed->ticks->ticks.back().microblock_hash == fixed->snapshot.last_microblock_hash);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(live_update_reads_fetch_missing_ticks_once_with_an_ordinary_read)
+{
+    LiveMarket live{*this, m_path_root / "watch-ticks-service", {std::chrono::milliseconds{2000}, 4}, {256}};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "watch-ticks-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto held{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(held, error);
+    BOOST_REQUIRE(held->ticks && held->ticks->available);
+    // A new head verified by a read that asks for no ticks (as a signing
+    // preflight's): the held ticks now stop short of it.
+    live.Deposit();
+    BOOST_REQUIRE(client->Market(market, std::nullopt));
+    auto query{TickPage()};
+    const auto watch_read = [&] {
+        interfaces::FlowMeshMarketWatch watch;
+        auto data{client->Watch(market, std::nullopt, query, std::chrono::milliseconds{300}, watch, error)};
+        BOOST_REQUIRE_MESSAGE(data, error);
+        return std::pair{std::move(*data), watch};
+    };
+    const auto [caught_up, first]{watch_read()};
+    BOOST_CHECK_EQUAL(first.status, "not_eligible");
+    BOOST_REQUIRE(caught_up.ticks && caught_up.ticks->available);
+    BOOST_CHECK(caught_up.ticks->ticks.back().microblock_hash == caught_up.snapshot.last_microblock_hash);
+    // Current again: the next read watches.
+    query.known_head = caught_up.snapshot.last_microblock_hash;
+    const auto [quiet, second]{watch_read()};
+    BOOST_CHECK(second.supported);
+    BOOST_REQUIRE(quiet.ticks && quiet.ticks->available);
+    client.reset();
+}
+
 BOOST_AUTO_TEST_CASE(indicative_clearing_comes_from_verified_state_on_both_backends)
 {
     LiveMarket live{*this, m_path_root / "views-service"};

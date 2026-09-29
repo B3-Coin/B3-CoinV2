@@ -38,6 +38,8 @@ ImbalanceSide ObserveImbalanceSide(const ClearingEngine::ClearingResult& clearin
  * the tick right after it was already evicted. Unavailable for a limit
  * outside 1..MARKET_DATA_MAX_TICKS. */
 ClearingTickPage PageClearingTicks(const std::deque<MarketHistoryEntry>& history, const ClearingTickQuery& query);
+//! The same page of ticks already held, consecutive and oldest first.
+ClearingTickPage PageClearingTicks(const std::deque<ClearingTick>& ticks, const ClearingTickQuery& query);
 
 //! Work one indicative computation may spend: a unit per breakpoint read and
 //! per curve evaluation. Beyond it the view is unavailable, never truncated.

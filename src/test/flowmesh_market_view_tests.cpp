@@ -298,7 +298,7 @@ BOOST_AUTO_TEST_CASE(clearing_tick_pages_are_bounded_ascending_and_report_evicti
         BOOST_CHECK(!refused.available && refused.ticks.empty());
         BOOST_CHECK_EQUAL(refused.unavailable_reason, "invalid_limit");
     }
-    const auto empty{flowmesh::PageClearingTicks({}, {})};
+    const auto empty{flowmesh::PageClearingTicks(std::deque<flowmesh::MarketHistoryEntry>{}, {})};
     BOOST_CHECK(empty.available && empty.ticks.empty() && !empty.oldest_retained_sequence);
 }
 
