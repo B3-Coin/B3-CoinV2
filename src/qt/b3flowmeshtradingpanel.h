@@ -168,6 +168,17 @@ private:
     //! is the caller's gate.
     std::optional<B3FlowMeshMarketData::MarketableLimit> marketableLimit(QString* error) const;
     void requestOrderReview();
+    //! The certified own curve an Edit is bound to: the selected row's
+    //! canonical side at selection time, and only while its points are
+    //! unchanged since then.
+    std::optional<B3FlowMeshMarketData::Curve> editCurve() const;
+    //! Edit is available for a certified, simple-limit, not exhausted own
+    //! order while nothing is pending, uncertain or under review.
+    bool editAvailable() const;
+    //! Prefills the ticket with a replacement of the selected own order: its
+    //! side, exact limit and remaining quantity. Signs and sends nothing; the
+    //! replacement is the ordinary reviewed order (a native per-side replace).
+    void editOrder();
     void begin(B3FlowMeshTrading::Operation operation);
     bool confirm(const QString& text, bool final_transaction);
     void startJob(std::optional<B3FlowMeshTrading::Action> action = std::nullopt,
@@ -379,6 +390,9 @@ private:
     QComboBox* m_asset{nullptr};
     QComboBox* m_effect{nullptr};
     QLineEdit* m_price{nullptr};
+    // The own order an Edit is bound to (see editCurve).
+    QString m_edit_side;
+    std::vector<B3FlowMeshMarketData::Point> m_edit_points;
     QCheckBox* m_marketable{nullptr};
     QLineEdit* m_slippage{nullptr};
     QLabel* m_marketable_note{nullptr};
@@ -409,7 +423,7 @@ private:
     QWidget* m_advanced{nullptr};
     QPushButton *m_buy{nullptr}, *m_sell{nullptr};
     QPlainTextEdit* m_log{nullptr};
-    QPushButton *m_refresh{nullptr}, *m_order{nullptr}, *m_cancel_order{nullptr},
+    QPushButton *m_refresh{nullptr}, *m_order{nullptr}, *m_cancel_order{nullptr}, *m_edit_order{nullptr},
         *m_deposit{nullptr}, *m_admit{nullptr}, *m_withdraw{nullptr},
         *m_checkpoint{nullptr}, *m_publish{nullptr}, *m_review_uncertain{nullptr}, *m_retry_receipt{nullptr}, *m_check_receipt{nullptr};
 };

@@ -233,6 +233,28 @@ UniValue DispatchApproved(const Action& a, bool approved, const std::function<bo
 }
 
 namespace {
+QString BaseAmount(CAmount amount, std::optional<int> decimals, const QString& ticker)
+{
+    if (!decimals) return QStringLiteral("%1 raw units").arg(amount);
+    return B3FlowMeshMarketData::FormatAmount(amount, *decimals) + QLatin1Char(' ') + (ticker.isEmpty() ? QStringLiteral("token") : ticker);
+}
+QString SideTitle(bool bid, bool inverse)
+{
+    // Inverse view: a canonical bid spends B3 (Sell B3), an ask receives it.
+    if (inverse) return bid ? QStringLiteral("Sell B3") : QStringLiteral("Buy B3");
+    return bid ? QStringLiteral("Buy") : QStringLiteral("Sell");
+}
+QString OrderTitle(bool bid, CAmount price, CAmount quantity, std::optional<int> decimals, const QString& ticker, bool inverse)
+{
+    const QString side{SideTitle(bid, inverse && decimals)};
+    if (!decimals) return QStringLiteral("%1 %2 @ %3 B3 atoms per raw unit").arg(side, BaseAmount(quantity, decimals, ticker)).arg(price);
+    const QString token{ticker.isEmpty() ? QStringLiteral("token") : ticker};
+    if (inverse) {
+        return QStringLiteral("%1 · %2 %3 · limit %4 %5/B3").arg(side, bid ? QStringLiteral("receive up to") : QStringLiteral("spend up to"),
+            BaseAmount(quantity, decimals, ticker), B3FlowMeshMarketData::ExactInversePrice(price, *decimals), token);
+    }
+    return QStringLiteral("%1 %2 @ %3 B3/%4").arg(side, BaseAmount(quantity, decimals, ticker), B3FlowMeshMarketData::FormatPrice(price, *decimals), token);
+}
 //! The marketable-limit disclosure, in the review's own orientation and units.
 QString MarketableDisclosure(const Action& a)
 {
@@ -246,6 +268,17 @@ QString MarketableDisclosure(const Action& a)
                           "The auction clears at one uniform price, never worse than the limit above. Certified opposite depth at or better than that limit: %4 "
                           "(visible depth, not a fill estimate). Any unfilled part stays as a standing order until you cancel it: FlowMesh has no market or immediate-or-cancel orders.")
         .arg(m.reference_display, units, B3FlowMeshMarketData::FormatSlippage(m.slippage_bps), depth);
+}
+//! What a new order replaces on its side, in the review's orientation.
+QString ReplacesDisclosure(const Action& a)
+{
+    if (!a.replaces) return {};
+    const auto& r{*a.replaces};
+    const QString side{SideTitle(a.side == QStringLiteral("bid"), a.inverse_display)};
+    const auto amount = [&](CAmount n) { return BaseAmount(n, a.display_decimals, a.display_ticker); };
+    const QString current{r.limit ? QStringLiteral("%1 order (%2 left; %3 already filled)").arg(side, amount(r.remaining), amount(r.filled))
+                                  : QStringLiteral("%1 curve of %2 points (%3 left)").arg(side).arg(r.points).arg(amount(r.remaining))};
+    return QStringLiteral("\nReplaces your current %1. The new quantity counts from zero; the reservation is adjusted by the difference.").arg(current);
 }
 } // namespace
 
@@ -274,11 +307,11 @@ QString Describe(const Action& a)
                      a.side, QString::number(a.market.sequence))};
             review += QStringLiteral("\nExact canonical limit: %1 B3 atoms per token atom; quantity cap: %2 token atoms.").arg(a.price).arg(a.amount);
             if (a.display_limit_adjusted) review += QStringLiteral("\nYour entered limit was %1 %2 / B3. It was adjusted only in your favor to the executable limit %3 %2 / B3 shown above; that exact canonical limit is what will be signed.").arg(a.entered_display_limit, a.display_ticker, executable);
-            return review + MarketableDisclosure(a);
+            return review + ReplacesDisclosure(a) + MarketableDisclosure(a);
         }
         QString price = QString::number(a.price) + QStringLiteral(" B3 atoms per raw base unit");
         if (a.display_decimals) price = B3FlowMeshMarketData::FormatPrice(a.price, *a.display_decimals) + QStringLiteral(" B3 / ") + a.display_ticker;
-        return prefix + QStringLiteral("Limit %1: %2 at %3.\nExact limit notional: %4 B3\nAccount sequence: %5\nOne uniform-price curve auction, not price-time priority. Accepted is not filled. Protocol fee is 0.01% of matched notional deducted from seller proceeds; actual allocation depends on certified fills. No network fee for this request.").arg(a.side == QStringLiteral("bid") ? QStringLiteral("Buy") : QStringLiteral("Sell"), base_amount, price, QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence)) + MarketableDisclosure(a);
+        return prefix + QStringLiteral("Limit %1: %2 at %3.\nExact limit notional: %4 B3\nAccount sequence: %5\nOne uniform-price curve auction, not price-time priority. Accepted is not filled. Protocol fee is 0.01% of matched notional deducted from seller proceeds; actual allocation depends on certified fills. No network fee for this request.").arg(a.side == QStringLiteral("bid") ? QStringLiteral("Buy") : QStringLiteral("Sell"), base_amount, price, QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence)) + ReplacesDisclosure(a) + MarketableDisclosure(a);
     }
     case Operation::Cancel: return prefix + QStringLiteral("Cancel this account's standing %1 (%2); sequence %3. Cancellation is not certified until processed.").arg(
         a.inverse_display ? (B3FlowMeshMarketData::DisplayBuy(a.side, true) ? QStringLiteral("Buy B3") : QStringLiteral("Sell B3")) : a.side,
@@ -413,30 +446,6 @@ QString DescribeReceipt(const Receipt& r)
     return text;
 }
 
-namespace {
-QString BaseAmount(CAmount amount, std::optional<int> decimals, const QString& ticker)
-{
-    if (!decimals) return QStringLiteral("%1 raw units").arg(amount);
-    return B3FlowMeshMarketData::FormatAmount(amount, *decimals) + QLatin1Char(' ') + (ticker.isEmpty() ? QStringLiteral("token") : ticker);
-}
-QString SideTitle(bool bid, bool inverse)
-{
-    // Inverse view: a canonical bid spends B3 (Sell B3), an ask receives it.
-    if (inverse) return bid ? QStringLiteral("Sell B3") : QStringLiteral("Buy B3");
-    return bid ? QStringLiteral("Buy") : QStringLiteral("Sell");
-}
-QString OrderTitle(bool bid, CAmount price, CAmount quantity, std::optional<int> decimals, const QString& ticker, bool inverse)
-{
-    const QString side{SideTitle(bid, inverse && decimals)};
-    if (!decimals) return QStringLiteral("%1 %2 @ %3 B3 atoms per raw unit").arg(side, BaseAmount(quantity, decimals, ticker)).arg(price);
-    const QString token{ticker.isEmpty() ? QStringLiteral("token") : ticker};
-    if (inverse) {
-        return QStringLiteral("%1 · %2 %3 · limit %4 %5/B3").arg(side, bid ? QStringLiteral("receive up to") : QStringLiteral("spend up to"),
-            BaseAmount(quantity, decimals, ticker), B3FlowMeshMarketData::ExactInversePrice(price, *decimals), token);
-    }
-    return QStringLiteral("%1 %2 @ %3 B3/%4").arg(side, BaseAmount(quantity, decimals, ticker), B3FlowMeshMarketData::FormatPrice(price, *decimals), token);
-}
-} // namespace
 
 StageView DescribeStage(const Receipt& r, bool local, RequestKind kind, std::optional<int> decimals, const QString& ticker)
 {

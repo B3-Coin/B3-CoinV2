@@ -21,6 +21,7 @@
 #include <QGridLayout>
 #include <QLabel>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPlainTextEdit>
@@ -204,7 +205,14 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_pending_view->horizontalHeaderItem(5)->setToolTip(tr("A verified per-action outcome: a fill, a cancellation, or not executed. \"not reported\" means inclusion is verified but this server reported no verified outcome."));
     m_pending_view->setMaximumHeight(28 + 26 * static_cast<int>(MAX_REQUEST_ROWS + 1)); m_pending_view->hide(); own_layout->addWidget(m_pending_view);
     m_own_note = Label(tr("No open orders"), own); own_layout->addWidget(m_own_note); m_own_view = table(own, {tr("Side"), tr("Price"), tr("Remaining"), tr("Reserved")}, "flowMeshOwnCurves"); own_layout->addWidget(m_own_view);
-    m_balances = Label(tr("Certified balances will appear here."), own); own_layout->addWidget(m_balances); m_cancel_order = new QPushButton{tr("Cancel selected Buy / Sell side…"), own}; own_layout->addWidget(m_cancel_order); m_activity->addTab(own, tr("Your orders"));
+    // An own order can be selected for Edit; the other tables stay unselectable.
+    m_own_view->setSelectionMode(QAbstractItemView::SingleSelection); m_own_view->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_balances = Label(tr("Certified balances will appear here."), own); own_layout->addWidget(m_balances);
+    auto* own_actions{new QHBoxLayout};
+    m_edit_order = new QPushButton{tr("Edit selected order…"), own}; m_edit_order->setObjectName(QStringLiteral("flowMeshEditOrder"));
+    m_edit_order->setToolTip(tr("Fills the ticket with a replacement of the selected order: same side, its exact limit and its remaining quantity. Nothing is signed: review the replacement to send it. A new order on a side replaces that side's order at once; there is no gap and no second request."));
+    m_cancel_order = new QPushButton{tr("Cancel selected Buy / Sell side…"), own};
+    own_actions->addWidget(m_edit_order); own_actions->addWidget(m_cancel_order); own_layout->addLayout(own_actions); m_activity->addTab(own, tr("Your orders"));
     auto* history_page{new QWidget{m_activity}}; auto* history_layout{new QVBoxLayout{history_page}}; m_history_note = Label(tr("No trades yet"), history_page); history_layout->addWidget(m_history_note); m_history_view = table(history_page, {tr("Trade batch"), tr("Price (B3)"), tr("Amount"), tr("Your buy"), tr("Your sell")}, "flowMeshCertifiedFills"); history_layout->addWidget(m_history_view); m_activity->addTab(history_page, tr("Trade history"));
     m_log = new QPlainTextEdit{m_activity}; m_log->setObjectName(QStringLiteral("flowMeshOperationLog")); m_log->setReadOnly(true); m_log->setMaximumBlockCount(100); m_activity->addTab(m_log, tr("Activity")); layout->addWidget(m_activity);
     auto* saved_page{new QWidget{m_activity}}; auto* saved_layout{new QVBoxLayout{saved_page}};
@@ -274,6 +282,17 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     });
     connect(m_order, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::requestOrderReview);
     connect(m_cancel_order, &QPushButton::clicked, this, [this] { begin(Operation::Cancel); });
+    connect(m_edit_order, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::editOrder);
+    connect(m_own_view->selectionModel(), &QItemSelectionModel::selectionChanged, this, [this] {
+        // Bind to the canonical side and exact points shown when selected:
+        // rows keep their index while the certified data behind them changes.
+        const auto rows{m_own_view->selectionModel()->selectedRows()};
+        const int row{rows.isEmpty() ? -1 : rows.front().row()};
+        const bool shown{row >= 0 && m_snapshot && static_cast<size_t>(row) < m_snapshot->own_curves.size()};
+        m_edit_side = shown ? m_snapshot->own_curves[row].side : QString{};
+        m_edit_points = shown ? m_snapshot->own_curves[row].points : std::vector<B3FlowMeshMarketData::Point>{};
+        updateControls();
+    });
     connect(m_deposit, &QPushButton::clicked, this, [this] { openFunding(false); });
     connect(m_admit, &QPushButton::clicked, this, [this] { begin(Operation::Admit); });
     connect(m_withdraw, &QPushButton::clicked, this, [this] { openFunding(true); });
@@ -445,6 +464,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
     m_order_book->setSnapshot(matched ? m_snapshot : std::nullopt, inverse);
     if (!matched || !m_snapshot->units.known) {
         for (auto* table : {m_depth_view, m_history_view, m_own_view}) SetRows(table, {});
+        m_own_view->clearSelection();
         if (auto* title{m_depth_view->parentWidget()->findChild<QLabel*>(QStringLiteral("flowMeshLiquidityTitle"))}) title->setText(tr("Liquidity"));
         m_history_note->setText(tr("Trade history unavailable")); m_own_note->setText(tr("Orders unavailable"));
         m_last_price->setText(tr("Last price  —")); m_liquidity_note->setText(matched ? tr("Asset precision unavailable") : m_loading ? tr("Loading liquidity…") : selected ? tr("Market data unavailable") : tr("Select a market")); return;
@@ -508,6 +528,10 @@ void B3FlowMeshTradingPanel::updateDataViews()
             FormatAmount(c.reserved, c.side == QStringLiteral("bid") ? 9 : u.decimals) + (c.side == QStringLiteral("bid") ? QStringLiteral(" B3") : QLatin1Char(' ') + u.ticker)});
     }
     SetRows(m_depth_view, depth); SetRows(m_history_view, history); SetRows(m_own_view, own);
+    if (const auto rows{m_own_view->selectionModel()->selectedRows()}; !rows.isEmpty()) {
+        const auto row{static_cast<size_t>(rows.front().row())};
+        if (row >= s.own_curves.size() || s.own_curves[row].side != m_edit_side) m_own_view->clearSelection();
+    }
     for (int row{0}; row < m_history_view->rowCount(); ++row) {
         auto* item{m_history_view->item(row, 0)};
         if (!item) continue;
@@ -657,6 +681,46 @@ bool B3FlowMeshTradingPanel::orderReady() const
     return orderReviewAvailable() && depositReady();
 }
 
+std::optional<B3FlowMeshMarketData::Curve> B3FlowMeshTradingPanel::editCurve() const
+{
+    const auto selected{market()};
+    if (m_edit_side.isEmpty() || !selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->certified) return std::nullopt;
+    for (const auto& own : m_snapshot->own_curves) {
+        if (own.side == m_edit_side) return own.points == m_edit_points ? std::optional{own} : std::nullopt;
+    }
+    return std::nullopt;
+}
+
+bool B3FlowMeshTradingPanel::editAvailable() const
+{
+    // Nothing pending or uncertain: an edit never re-signs a request whose
+    // outcome is unknown, and never races one in flight.
+    if (!orderReviewAvailable() || m_deferred_review || m_thread) return false;
+    const auto curve{editCurve()};
+    const auto price{curve ? B3FlowMeshMarketData::LimitPriceOf(*curve) : std::nullopt};
+    return price && *price > 0 && curve->remaining > 0;
+}
+
+void B3FlowMeshTradingPanel::editOrder()
+{
+    if (!editAvailable()) {
+        notice(tr("The selected order changed or cannot be edited now. Nothing was prefilled, signed or sent; select it again."));
+        return;
+    }
+    const auto curve{*editCurve()};
+    const auto& units{m_snapshot->units};
+    const bool inverse{inverted()}, buy{B3FlowMeshMarketData::DisplayBuy(curve.side, inverse)};
+    const CAmount price{*B3FlowMeshMarketData::LimitPriceOf(curve)};
+    m_marketable->setChecked(false);
+    m_side->setCurrentIndex(buy ? 0 : 1); (buy ? m_buy : m_sell)->setChecked(true);
+    m_price->setText(inverse ? B3FlowMeshMarketData::ExactInversePrice(price, units.decimals) : B3FlowMeshMarketData::FormatPrice(price, units.decimals));
+    m_quantity->setText(B3FlowMeshMarketData::FormatAmount(curve.remaining, units.decimals));
+    updateTicket();
+    m_price->setFocus();
+    notice(tr("Edit prefilled a replacement for your %1 order: %2 %3 at its current limit. Nothing was signed or sent. Change the price or quantity, then review it: the new order replaces that side's order and its quantity counts from zero.")
+               .arg(inverse ? (buy ? tr("Buy B3") : tr("Sell B3")) : (buy ? tr("Buy") : tr("Sell")), m_quantity->text(), units.ticker));
+}
+
 std::optional<B3FlowMeshMarketData::MarketableLimit> B3FlowMeshTradingPanel::marketableLimit(QString* error) const
 {
     const auto selected{market()};
@@ -748,6 +812,7 @@ void B3FlowMeshTradingPanel::updateControls()
     m_buy->setEnabled(idle); m_sell->setEnabled(idle);
     m_marketable->setEnabled(idle); m_slippage->setEnabled(idle);
     m_order->setEnabled(orderReviewAvailable()); m_cancel_order->setEnabled(ready && selected->has_account && !pending);
+    m_edit_order->setEnabled(editAvailable());
     m_order->setToolTip(tr("Review first checks fresh market readiness and your certified balance. This button does not mean trading is ready. A failed or paused check signs and sends nothing; there is no automatic retry."));
     m_withdraw->setEnabled(withdrawalDraftAvailable()); m_deposit->setEnabled(depositDraftAvailable());
     m_admit->setEnabled(ready && selected->has_account);
@@ -922,6 +987,11 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
             if (marketable) {
                 if (limit->price != marketable->price || limit->adjusted) throw std::runtime_error{"The marketable limit did not round-trip exactly. Nothing was signed."};
                 a.marketable = Action::Marketable{marketable->reference, marketable->visible, marketable->slippage_bps, marketable->reference_display};
+            }
+            // A SUBMIT atomically replaces this side's certified order: say so
+            // in both orientations, with what it replaces.
+            for (const auto& own : m_snapshot->own_curves) {
+                if (own.side == a.side) a.replaces = Action::Replaces{own.remaining, own.filled, B3FlowMeshMarketData::LimitPriceOf(own), own.points.size()};
             }
         } else if (operation == Operation::Deposit || operation == Operation::Withdraw) {
             const auto text{operation == Operation::Withdraw ? m_withdrawal_draft_amount : m_amount->text()};

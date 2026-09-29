@@ -356,7 +356,7 @@ private Q_SLOTS:
             QVERIFY(!title.contains(QStringLiteral("flowmesh"), Qt::CaseInsensitive));
         }
     }
-    void marketableReviewDisclosesReferenceSlippageAndRestingRemainder()
+    void marketableAndReplaceDisclosuresArePresentationOnly()
     {
         for (const bool inverse : {false, true}) {
             auto a{Order()}; a.display_decimals = 6; a.display_ticker = QStringLiteral("tUSD"); a.inverse_display = inverse;
@@ -372,6 +372,12 @@ private Q_SLOTS:
             QVERIFY(text.contains(QStringLiteral("no market or immediate-or-cancel orders")));
             a.marketable.reset();
             QVERIFY(!Describe(a).contains(QStringLiteral("Marketable")));
+            // What a new order replaces is presentation only as well.
+            a.replaces = Action::Replaces{750'000, 250'000, CAmount{1000}, 2};
+            QCOMPARE(Parameters(a).params.write(), plain.params.write());
+            QVERIFY(Describe(a).contains(QStringLiteral("Replaces your current %1 order (0.75 tUSD left; 0.25 tUSD already filled)").arg(inverse ? QStringLiteral("Sell B3") : QStringLiteral("Buy"))));
+            a.replaces->limit.reset(); a.replaces->points = 3;
+            QVERIFY(Describe(a).contains(QStringLiteral("curve of 3 points (0.75 tUSD left)")));
         }
     }
     void exactReceiptRetryHasNoSigningOrEconomicArguments()

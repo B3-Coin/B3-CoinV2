@@ -4675,6 +4675,78 @@ private Q_SLOTS:
         QCOMPARE(panel.m_price->text(), QStringLiteral("1.111"));
         QCOMPARE(unlock.count(), 0); QCOMPARE(probe.writes.load(), 0); QVERIFY(!panel.m_unlock); QVERIFY(m_wallet->IsLocked());
     }
+    void editPrefillsRemainingOfCertifiedCurveAndReviewSaysReplaces_data()
+    {
+        QTest::addColumn<bool>("inverse");
+        QTest::newRow("canonical") << false;
+        QTest::newRow("inverse") << true;
+    }
+    void editPrefillsRemainingOfCertifiedCurveAndReviewSaysReplaces()
+    {
+        QFETCH(bool, inverse);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()), inverse);
+        auto* edit{panel.findChild<QPushButton*>(QStringLiteral("flowMeshEditOrder"))};
+        QVERIFY(edit); QVERIFY(!edit->isEnabled()); // Nothing selected.
+        panel.m_marketable->setChecked(true); panel.m_sell->click(); panel.m_quantity->setText(QStringLiteral("3"));
+        // The certified own bid: 1 B3/tUSD, 0.25 filled, 0.75 remaining.
+        panel.m_own_view->selectRow(0);
+        QCOMPARE(panel.m_edit_side, QStringLiteral("bid")); QVERIFY(edit->isEnabled());
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        edit->click();
+        QVERIFY(!panel.m_marketable->isChecked()); QVERIFY(!panel.m_price->isReadOnly());
+        // A canonical bid is Buy, or Sell B3 in the inverse view.
+        QCOMPARE(panel.m_side->currentIndex(), inverse ? 1 : 0);
+        QCOMPARE(panel.m_price->text(), QStringLiteral("1")); QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.75"));
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Nothing was signed or sent")));
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QCOMPARE(unlock.count(), 0);
+        // The ordinary review names what the new order replaces.
+        QString review;
+        QTimer::singleShot(0, &panel, [&] { if (panel.m_confirmation) { review = panel.m_confirmation->text(); panel.m_confirmation->done(QMessageBox::Cancel); } });
+        panel.begin(B3FlowMeshTrading::Operation::Order);
+        QVERIFY2(review.contains(QStringLiteral("Replaces your current %1 order (0.75 tUSD left; 0.25 tUSD already filled)").arg(inverse ? QStringLiteral("Sell B3") : QStringLiteral("Buy"))), qPrintable(review));
+        QVERIFY(review.contains(QStringLiteral("counts from zero")));
+        QCOMPARE(unlock.count(), 0); QVERIFY(!panel.m_unlock); QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
+    }
+    void editUnavailableForGeneralExhaustedPendingOrUncertainCurves()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        const auto select = [&] { panel.m_own_view->clearSelection(); panel.m_own_view->selectRow(0); panel.updateControls(); return panel.m_edit_order->isEnabled(); };
+        QVERIFY(select());
+        // Not a simple limit.
+        auto general{*panel.m_snapshot}; general.own_curves[0].points = {{900, 1'000'000}, {1000, 500'000}, {1001, 0}};
+        panel.m_snapshot = general; panel.updateDataViews(); QVERIFY(!select());
+        // Exhausted: nothing remains to replace.
+        auto exhausted{Parse(RemoteData())}; exhausted.own_curves[0].filled = 1'000'000; exhausted.own_curves[0].remaining = 0;
+        panel.m_snapshot = exhausted; panel.updateDataViews(); QVERIFY(!select());
+        panel.m_snapshot = Parse(RemoteData()); panel.updateDataViews(); QVERIFY(select());
+        // An unresolved request of this account, or an uncertain one.
+        TrackUnknown(panel); panel.m_pending_sequence = panel.m_snapshot->account_sequence;
+        panel.updateControls(); QVERIFY(!panel.m_edit_order->isEnabled());
+        panel.m_receipt.reset(); panel.m_pending_sequence.reset(); panel.updateControls(); QVERIFY(panel.m_edit_order->isEnabled());
+        panel.m_uncertain = true; panel.updateControls(); QVERIFY(!panel.m_edit_order->isEnabled());
+        panel.m_uncertain = false; panel.m_busy = true; panel.updateControls(); QVERIFY(!panel.m_edit_order->isEnabled());
+        panel.m_busy = false; panel.updateControls(); QVERIFY(panel.m_edit_order->isEnabled());
+        QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
+    }
+    void editBindsBySideAndRefusesChangedCurve()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_own_view->selectRow(0); QCOMPARE(panel.m_edit_side, QStringLiteral("bid"));
+        panel.m_price->setText(QStringLiteral("0.7")); panel.m_quantity->setText(QStringLiteral("2"));
+        // The certified bid changes while selected: the edit refuses.
+        auto moved{*panel.m_snapshot}; moved.own_curves[0].points = {{1005, 1'000'000}, {1006, 0}};
+        panel.m_snapshot = moved; panel.updateDataViews(); panel.updateControls();
+        QVERIFY(!panel.m_edit_order->isEnabled());
+        panel.editOrder();
+        QCOMPARE(panel.m_price->text(), QStringLiteral("0.7")); QCOMPARE(panel.m_quantity->text(), QStringLiteral("2"));
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Nothing was prefilled, signed or sent")));
+        // The same row now showing the other side is never edited as it.
+        auto ask{Parse(RemoteData())}; ask.own_curves = {LimitCurve("ask", 5, 1200, 400'000)};
+        panel.m_snapshot = ask; panel.updateDataViews(); panel.updateControls();
+        QVERIFY(panel.m_own_view->selectionModel()->selectedRows().isEmpty()); QVERIFY(panel.m_edit_side.isEmpty());
+        QVERIFY(!panel.m_edit_order->isEnabled());
+        QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
+    }
     void connectionBannerShowsLiveReconnectingAndCheckingState()
     {
         using Apply = B3FlowMeshTradingPanel::SnapshotApply;
