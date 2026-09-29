@@ -2290,7 +2290,7 @@ flowmesh::ClientActionWait FlowMeshService::WaitClientActionStatus(
         std::lock_guard lock{m_impl->mutex};
         runtime = m_impl->runtime;
     }
-    if (!runtime) return {std::nullopt, flowmesh::ClientWaitResult::INTERRUPTED};
+    if (!runtime) return {.status = std::nullopt, .result = flowmesh::ClientWaitResult::INTERRUPTED};
     return runtime->WaitClientActionStatus(market_id, action_id, deadline, interrupted, include_notices);
 }
 

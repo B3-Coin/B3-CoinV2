@@ -3169,7 +3169,7 @@ public:
         m_watch_unanswered.resize(m_endpoints.size());
         m_clearing_ticks.resize(m_endpoints.size());
         m_clearing_ticks_withdrawn.resize(m_endpoints.size());
-        for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({endpoint.url, false, {}});
+        for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({.url = endpoint.url, .available = false, .last_error = {}});
         if (!m_endpoints.empty()) m_status.selected_endpoint = m_endpoints[m_selected].url;
         PublishSavedView();
     }
@@ -3212,7 +3212,7 @@ public:
             m_watch_reset = true;
             {
                 std::lock_guard status_lock{m_status_mutex};
-                if (added) m_status.endpoints.push_back({endpoint.url, false, {}});
+                if (added) m_status.endpoints.push_back({.url = endpoint.url, .available = false, .last_error = {}});
                 m_status.selected_endpoint = endpoint.url;
                 m_status.endpoints[selected].retry_after_ms = 0;
             }

@@ -111,9 +111,9 @@ struct EvidenceFixture {
     }
     flowmesh::SeatEvidence Conflict() const
     {
-        return {flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT, domain, market,
-                flowmesh::SeatCertificateStatement(Certify(Context(Filled(0xa1)), {0, 1, 2}), seats.seats.set_hash),
-                flowmesh::SeatCertificateStatement(Certify(Context(Filled(0xb2)), {1, 2, 3}), seats.seats.set_hash)};
+        return {.kind = flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT, .domain = domain, .market_id = market,
+                .first = flowmesh::SeatCertificateStatement(Certify(Context(Filled(0xa1)), {0, 1, 2}), seats.seats.set_hash),
+                .second = flowmesh::SeatCertificateStatement(Certify(Context(Filled(0xb2)), {1, 2, 3}), seats.seats.set_hash)};
     }
     flowmesh::SeatEvidenceCheck Check(const flowmesh::SeatEvidence& evidence) const
     {

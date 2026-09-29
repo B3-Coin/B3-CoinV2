@@ -1046,7 +1046,9 @@ BOOST_AUTO_TEST_CASE(runtime_certified_action_status_recovers_after_restart_with
             relay.message.kind == flowmesh::WireMessageKind::ATTESTATION) ++signing_relays;
         return node::FlowMeshRelayResult{};
     };
-    node::FlowMeshRuntimeMarketConfig market{f.pins.domain, f.pins.market_id, Filled(9), f.seats, f.state};
+    node::FlowMeshRuntimeMarketConfig market{.domain = f.pins.domain, .market_id = f.pins.market_id,
+                                             .treasury_owner_commitment = Filled(9), .active_seats = f.seats,
+                                             .state = f.state};
     market.store = &store;
     node::FlowMeshRuntime runtime{config, {market}};
     BOOST_REQUIRE_MESSAGE(runtime.Start(error), error);

@@ -6020,7 +6020,7 @@ flowmesh::MarketDataQuery TickPage()
 BOOST_AUTO_TEST_CASE(remote_client_holds_endpoint_ticks_bound_to_its_verified_head)
 {
     LiveMarket live{*this, m_path_root / "remote-ticks-service", {}, {256}};
-    TickProxy proxy{live.Endpoint()};
+    TickProxy proxy{.upstream = live.Endpoint()};
     auto server{TickProxyServer(*this, proxy)};
     std::string error;
     auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "remote-ticks-client", error)};
@@ -6082,7 +6082,7 @@ BOOST_AUTO_TEST_CASE(remote_client_withdraws_a_stale_ticks_advertisement)
 {
     // The endpoint serves no ticks; the proxy advertises them anyway.
     LiveMarket live{*this, m_path_root / "stale-ticks-service"};
-    TickProxy proxy{live.Endpoint()};
+    TickProxy proxy{.upstream = live.Endpoint()};
     proxy.advert = 256;
     auto server{TickProxyServer(*this, proxy)};
     std::string error;
@@ -6109,7 +6109,7 @@ BOOST_AUTO_TEST_CASE(remote_client_withdraws_a_stale_ticks_advertisement)
 BOOST_AUTO_TEST_CASE(remote_client_drops_a_contradicting_tick_page_but_not_the_read)
 {
     LiveMarket live{*this, m_path_root / "tampered-ticks-service", {}, {256}};
-    TickProxy proxy{live.Endpoint()};
+    TickProxy proxy{.upstream = live.Endpoint()};
     proxy.tamper = true;
     auto server{TickProxyServer(*this, proxy)};
     std::string error;
@@ -6138,7 +6138,7 @@ BOOST_AUTO_TEST_CASE(remote_client_far_behind_asks_for_the_newest_ticks)
 {
     // An operator's two-tick pages.
     LiveMarket live{*this, m_path_root / "far-ticks-service", {}, {2}};
-    TickProxy proxy{live.Endpoint()};
+    TickProxy proxy{.upstream = live.Endpoint()};
     auto server{TickProxyServer(*this, proxy)};
     std::string error;
     auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "far-ticks-client", error)};

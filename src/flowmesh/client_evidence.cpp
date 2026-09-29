@@ -438,7 +438,7 @@ ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const 
     std::unique_lock lock{m_mutex};
     ClientEventKind newest{ClientEventKind::QUEUE_ADMITTED};
     uint64_t newest_id{0};
-    ClientActionWait out{ActionStatusLocked(market, action_id, &newest, &newest_id)};
+    ClientActionWait out{.status = ActionStatusLocked(market, action_id, &newest, &newest_id)};
     const auto read_notice = [&] {
         if (include_notices) out.notice = NewestNoticeLocked(market, action_id);
     };
