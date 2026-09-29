@@ -1983,6 +1983,16 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         const auto& entry{certified.entry};
         if (std::none_of(entry.actions.begin(), entry.actions.end(), [&](const auto& action) { return action.Id() == p.action.Id(); }))
             Fail("Certified entry does not include the requested semantic action");
+        // An outcome this client already verified for this exact inclusion is
+        // kept: verifying the same certified entry again (a later snapshot of
+        // that head, or another reply's proof) never discards it. The outcome
+        // is a pure function of that entry, and a withdrawn inclusion label
+        // has already withdrawn it (WithdrawVerifiedLabels).
+        std::optional<interfaces::FlowMeshActionOutcome> verified_outcome;
+        if (p.receipt.certificate_verified && p.receipt.outcome_verified && p.receipt.outcome &&
+            p.receipt.state == "certified_inclusion" && p.receipt.microblock_hash == entry.GetHash()) {
+            verified_outcome = std::move(p.receipt.outcome);
+        }
         p.receipt = {}; p.receipt.action_id = p.action.Id(); p.receipt.state = "certified_inclusion";
         p.receipt.microblock_hash = entry.GetHash(); p.receipt.microblock_sequence = entry.sequence;
         p.receipt.certificate_verified = true; p.receipt.endpoint = m_endpoints[endpoint].url;
@@ -1991,6 +2001,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         RetainProof(p, p.inclusion_proof, proof);
         if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
         p.receipt.reason = "Canonical action inclusion verified; execution outcome is not proved by inclusion alone";
+        if (verified_outcome) {
+            p.receipt.reason_code = verified_outcome->reason_code;
+            p.receipt.outcome = std::move(verified_outcome);
+            p.receipt.outcome_verified = true;
+        }
         m_own_certified_through.Record(p.market, entry.sequence);
         // A cached state older than this inclusion must not feed a join.
         if (const auto cache{m_cache.find(p.market)}; cache != m_cache.end() &&
@@ -2454,6 +2469,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         try {
             if (!p.receipt.certificate_verified || p.receipt.state != "certified_inclusion" ||
                 entry.GetHash() != p.receipt.microblock_hash) return;
+            // Already verified for this inclusion (kept by Inclusion): a later
+            // reply's missing or unusable evidence never withdraws it.
+            if (p.receipt.outcome_verified) return;
             if (!value.isObject() || !value.exists("outcome_evidence")) {
                 const std::string error{value.isObject() && value["outcome_evidence_error"].isStr()
                                             ? value["outcome_evidence_error"].get_str() : std::string{}};

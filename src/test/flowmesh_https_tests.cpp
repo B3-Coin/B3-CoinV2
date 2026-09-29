@@ -5976,3 +5976,48 @@ BOOST_AUTO_TEST_CASE(public_submit_derives_no_outcome_it_would_discard)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_snapshot_outcome_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(snapshot_of_the_inclusion_head_keeps_its_verified_outcome)
+{
+    LiveMarket live{*this, m_path_root / "snapshot-outcome-service", {}, {}, {true}};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "snapshot-outcome-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto before{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(before, error);
+    const auto action{SignedCancel(0)};
+    const auto submitted{client->Submit(market, action)};
+    BOOST_REQUIRE_MESSAGE(submitted.state != "rejected", submitted.reason);
+    // The opt-in status read verifies the inclusion and its outcome.
+    interfaces::FlowMeshActionReceipt receipt;
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{20}};
+    while (std::chrono::steady_clock::now() < deadline) {
+        receipt = client->ActionStatus(market, action.Id(), false);
+        if (receipt.certificate_verified && receipt.outcome_verified) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    BOOST_REQUIRE(receipt.certificate_verified);
+    BOOST_REQUIRE(receipt.outcome_verified);
+    BOOST_REQUIRE(receipt.outcome);
+    BOOST_CHECK_EQUAL(receipt.outcome->status, "rejected"); // nothing to cancel
+    // The next read moves the client to the head holding the action through
+    // a snapshot, which verifies that inclusion again. The outcome stays
+    // verified without any further request.
+    const auto moved{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(moved, error);
+    BOOST_REQUIRE(moved->snapshot.last_microblock_hash == receipt.microblock_hash);
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].receipt.certificate_verified);
+    BOOST_CHECK(saved[0].receipt.microblock_hash == receipt.microblock_hash);
+    BOOST_CHECK(saved[0].receipt.outcome_verified);
+    BOOST_REQUIRE(saved[0].receipt.outcome);
+    BOOST_CHECK_EQUAL(saved[0].receipt.outcome->status, "rejected");
+    BOOST_CHECK_EQUAL(saved[0].receipt.reason_code, receipt.reason_code);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
