@@ -629,7 +629,9 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             status_observed = self.observed_rpc_return_us()
         certified = status_observed
         assert_equal(status["certificate_verified"], True)
-        assert_equal(status["outcome_verified"], False)
+        # A verified outcome, when present, is the including entry's own.
+        assert_equal(status["outcome_verified"], "outcome" in status)
+        assert "outcome" not in status or status["outcome"]["microblock_hash"] == status.get("microblock_hash"), status
         sample.update(certified_status=status, client_certified_host_us=certified,
                       client_certified_ms=(certified - started) / 1000,
                       client_certified_from_offer_ms=(certified - sample["scheduled_host_us"]) / 1000)

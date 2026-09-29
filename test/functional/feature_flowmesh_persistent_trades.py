@@ -332,7 +332,9 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                 last_pump_tick_before_start_ms=(start - earlier[-1]) / 1000 if earlier else None,
                 status_read_max_overdue_ms=overdue_ms)
         assert_equal(status["certificate_verified"], True)
-        assert_equal(status["outcome_verified"], False)
+        # A verified outcome, when present, is the including entry's own.
+        assert_equal(status["outcome_verified"], "outcome" in status)
+        assert "outcome" not in status or status["outcome"]["microblock_hash"] == status.get("microblock_hash"), status
         after = self.saved_actions(rpc, market)[action_id]
         assert_equal({key: after[key] for key in original}, original)
         assert_equal(after["previously_certified"], True)

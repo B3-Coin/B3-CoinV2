@@ -186,7 +186,9 @@ class FlowMeshClientPollTest(FlowMeshLatencyTest):
             self.pump_b3()
             status = self.client.getflowmeshactionstatus(market, action_id)
             assert_equal(status["action_id"], action_id)
-            assert_equal(status["outcome_verified"], False)
+            # A verified outcome, when present, is the including entry's own.
+            assert_equal(status["outcome_verified"], "outcome" in status)
+            assert "outcome" not in status or status["outcome"]["microblock_hash"] == status.get("microblock_hash"), status
             if status["certificate_verified"]:
                 assert_equal(status["receipt_state"], "certified_inclusion")
                 return status
@@ -224,7 +226,9 @@ class FlowMeshClientPollTest(FlowMeshLatencyTest):
         status = self.client.getflowmeshactionstatus(market, action_id, WAIT_MAX_MS)
         elapsed_ms = (time.monotonic() - started) * 1000
         assert_equal(status["action_id"], action_id)
-        assert_equal(status["outcome_verified"], False)
+        # A verified outcome, when present, is the including entry's own.
+        assert_equal(status["outcome_verified"], "outcome" in status)
+        assert "outcome" not in status or status["outcome"]["microblock_hash"] == status.get("microblock_hash"), status
         return status, self.requests_since(marks), elapsed_ms
 
     def waited_until_certified(self, market, action_id, endpoint):

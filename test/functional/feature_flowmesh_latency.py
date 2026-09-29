@@ -321,7 +321,9 @@ class FlowMeshLatencyTest(FlowMeshPreagreementTest):
             assert state != "rejected" or retryable, status
             if state == "certified_inclusion" and target is None:
                 assert_equal(status["certificate_verified"], True)
-                assert_equal(status["outcome_verified"], False)
+                # A verified outcome, when present, is the including entry's own.
+                assert_equal(status["outcome_verified"], "outcome" in status)
+                assert "outcome" not in status or status["outcome"]["microblock_hash"] == status.get("microblock_hash"), status
                 target = (status["microblock_sequence"], status["microblock_hash"])
                 sample.update(certified_status=status, client_certified_host_us=status_observed,
                               client_certified_ms=(status_observed - start) / 1000)

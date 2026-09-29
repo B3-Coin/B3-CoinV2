@@ -300,7 +300,9 @@ class FlowMeshRemoteClientTest(FlowMeshIndependentTest):
             if state != "certified_inclusion":
                 return False
             assert_equal(status["certificate_verified"], True)
-            assert_equal(status["outcome_verified"], False)
+            # A verified outcome, when present, is the including entry's own.
+            assert_equal(status["outcome_verified"], "outcome" in status)
+            assert "outcome" not in status or status["outcome"]["microblock_hash"] == status.get("microblock_hash"), status
             observed["certified_inclusion_observed_ms"] = (time.monotonic() - started) * 1000
             observed["status"] = status
             return True
