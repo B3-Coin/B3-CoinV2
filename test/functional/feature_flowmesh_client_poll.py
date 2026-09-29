@@ -73,7 +73,10 @@ def rewrite_status(method, body, change):
 
 def strip_action_wait(method, body):
     """Present a c10c952 endpoint: status objects carry no wait capability."""
-    return rewrite_status(method, body, lambda row: row.pop("action_wait_ms_max", None))
+    def strip(row):
+        row.pop("action_wait_ms_max", None)
+        row.pop("submit_wait_ms_max", None)
+    return rewrite_status(method, body, strip)
 
 
 def advertise_action_wait(method, body):
@@ -269,6 +272,8 @@ class FlowMeshClientPollTest(FlowMeshLatencyTest):
         bid_id = self.new_instruction("submitflowmeshorder", market, "bid", TRADE_PRICE // 2, 1,
                                       account["next_sequence"])["action_id"]
         assert_equal(self.submitted_via(marks, bid_id), 0)
+        # The previous phase's polling can still fill the rolling window.
+        self.drain_status_budget()
         marks = self.marks()
         rpc = get_rpc_proxy(self.client.url, 4, timeout=90)
         with ThreadPoolExecutor(max_workers=1) as pool:
