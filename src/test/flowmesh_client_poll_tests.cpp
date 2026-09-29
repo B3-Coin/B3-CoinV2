@@ -5,9 +5,11 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <vector>
 
 namespace {
 using Poll = node::FlowMeshClientPollScheduler;
@@ -113,6 +115,37 @@ BOOST_AUTO_TEST_CASE(smooth_refill_still_obeys_rolling_sixteen_attempt_cap)
     BOOST_CHECK(poll.TryChargeAttempt(start + Poll::WINDOW));
     BOOST_CHECK(!poll.TryChargeAttempt(start + Poll::WINDOW));
     BOOST_CHECK_EQUAL(poll.AttemptsInWindow(start + Poll::WINDOW), 16U);
+}
+
+BOOST_AUTO_TEST_CASE(opt_in_extra_endpoint_tokens_share_the_rolling_cap)
+{
+    // Polling an action whose reply always carries outcome evidence (two
+    // endpoint tokens each) at the fastest schedule: the endpoint sees at
+    // most sixteen automatic tokens plus the last reply's extras in any
+    // rolling second, far below its 28-read per-client budget.
+    Poll poll;
+    const Poll::TimePoint start{};
+    std::vector<Poll::TimePoint> tokens;
+    for (auto now{start}; now < start + 5s; now += 1ms) {
+        if (!poll.TryChargeAttempt(now)) continue;
+        tokens.push_back(now);
+        poll.RecordExtraCost(now, 1);
+        tokens.push_back(now);
+    }
+    size_t peak{0};
+    for (size_t first{0}; first < tokens.size(); ++first) {
+        size_t in_window{0};
+        for (size_t other{first}; other < tokens.size() && tokens[other] - tokens[first] < Poll::WINDOW; ++other) ++in_window;
+        peak = std::max(peak, in_window);
+    }
+    BOOST_CHECK_LE(peak, 18U);
+    BOOST_CHECK_GE(tokens.size(), 2 * 8 * 4U); // still about eight polls per second
+    // Extra cost never refunds and is bounded even when recorded unasked.
+    Poll bounded;
+    bounded.RecordExtraCost(start, 1000);
+    BOOST_CHECK_EQUAL(bounded.AttemptsInWindow(start), 2 * Poll::AUTOMATIC_ATTEMPTS_PER_SECOND);
+    BOOST_CHECK(!bounded.TryChargeAttempt(start + Poll::WINDOW - 1us));
+    BOOST_CHECK(bounded.TryChargeAttempt(start + Poll::WINDOW));
 }
 
 BOOST_AUTO_TEST_CASE(removal_does_not_refund_attempts_or_keep_a_cached_observation)

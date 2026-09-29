@@ -1014,6 +1014,15 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     };
     std::map<std::pair<uint256, uint256>, Pending> m_pending;
     static bool ProvenNotExecuted(const Pending& p) { return FlowMeshProvenNotExecuted(p.receipt, p.not_executed); }
+    //! Endpoint admission tokens an opt-in 'action' reply cost beyond the
+    //! request itself: TradingApi charges one per evidence part it adds (or
+    //! tried to add), so the automatic status budget is charged for them too.
+    static size_t OutcomeExtraCost(const UniValue& value)
+    {
+        if (!value.isObject()) return 0;
+        return size_t{value.exists("outcome_evidence") || value.exists("outcome_evidence_error")} +
+               size_t{value.exists("consumer_certified_payload") || value.exists("consumer_evidence_error")};
+    }
     FlowMeshClientPollScheduler m_action_polls;
     std::map<uint256, std::pair<uint64_t, uint256>> m_highwater;
     // RestartDigest() of the last successful synchronous outbox write. Empty
@@ -1969,6 +1978,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             UniValue parsed;
             if (!parsed.read(reply.body) || !parsed.isObject() || !parsed["ok"].isTrue()) return;
             const auto& result{parsed["result"]};
+            m_action_polls.RecordExtraCost(std::chrono::steady_clock::now(), OutcomeExtraCost(result));
             if (Id(result, "action_id") != consumer.action_id || Text(result, "receipt_state", 32) != "certified_inclusion" ||
                 Id(result, "microblock_hash") != consumer.microblock_hash ||
                 Number(result, "microblock_sequence") != consumer.microblock_sequence) return;
@@ -2055,6 +2065,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             const auto reply{m_https.Request(m_endpoints[endpoint], "/flowmesh/v1", request.write(), CLIENT_REQUEST_TIMEOUT,
                                              CLIENT_OUTCOME_EVIDENCE_MAX_REPLY)};
             if (!reply.response_received) return;
+            // The method spends one extra endpoint token for the evidence.
+            m_action_polls.RecordExtraCost(std::chrono::steady_clock::now(), 1);
             UniValue parsed;
             if (!parsed.read(reply.body) || !parsed.isObject() || !parsed["ok"].isBool()) return;
             if (!parsed["ok"].get_bool()) {
@@ -2085,6 +2097,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (!automatic) p.automatic_endpoint.reset();
         UniValue params{UniValue::VOBJ}; params.pushKV("market_id", p.market.GetHex()); params.pushKV("action_id", p.action.Id().GetHex());
         Call("action", params, [&](const UniValue& value, size_t endpoint) {
+            m_action_polls.RecordExtraCost(std::chrono::steady_clock::now(), OutcomeExtraCost(value));
             ApplyActionResult(p, pins, value, endpoint);
         }, nullptr, nullptr, nullptr, automatic ? &p : nullptr, [&](UniValue& endpoint_params, size_t endpoint) {
             // Only an endpoint that advertised it receives "outcome".
@@ -2251,6 +2264,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         WorkLock lock{*this};
         timing.Mark("apply_lock_acquired_us");
         if (!reply.response_received) m_wait_unanswered.at(endpoint) = true;
+        m_action_polls.RecordExtraCost(std::chrono::steady_clock::now(), OutcomeExtraCost(result));
         if (unsupported) {
             // The endpoint no longer offers the wait (for example after a
             // downgrade). Nothing was applied or resent; wait_ms (and
