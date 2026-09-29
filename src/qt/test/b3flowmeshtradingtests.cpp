@@ -7,6 +7,7 @@
 #include <key_io.h>
 #include <qt/b3flowmeshtrading.h>
 #include <qt/b3flowmeshmarketdata.h>
+#include <qt/b3flowmeshwatch.h>
 #include <core_io.h>
 #include <rpc/util.h>
 #include <streams.h>
@@ -16,6 +17,7 @@
 #include <QTest>
 #include <array>
 #include <stdexcept>
+#include <vector>
 
 const TranslateFn G_TRANSLATION_FUN{nullptr};
 using namespace B3FlowMeshTrading;
@@ -817,6 +819,122 @@ private Q_SLOTS:
         UniValue chain{UniValue::VOBJ}; chain.pushKV("initialblockdownload", false); chain.pushKV("headers", 2); chain.pushKV("blocks", 1);
         QVERIFY(Rejected([&] { CheckSynced(chain); })); chain.pushKV("blocks", 2); CheckSynced(chain);
         chain.pushKV("initialblockdownload", true); QVERIFY(Rejected([&] { CheckSynced(chain); }));
+    }
+    void watchBackoffDoublesFromOneToThirtySecondsWithJitter()
+    {
+        using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using B3FlowMeshWatch::Classify; using WOutcome = B3FlowMeshWatch::Outcome;
+        Policy p; p.Enable(0, true);
+        const std::array<int64_t, 7> expected{1000, 2000, 4000, 8000, 16000, 30000, 30000};
+        int64_t now{0};
+        for (const auto backoff : expected) {
+            QVERIFY(p.MayArm(now)); p.Armed(now);
+            p.Finished(now, WOutcome::Failed, 0.0);
+            QCOMPARE(p.mode, Mode::Backoff); QCOMPARE(p.BackoffMs(), backoff);
+            QCOMPARE(p.RetryInMs(now), backoff);
+            QVERIFY(!p.MayArm(now + backoff - 1)); QVERIFY(p.PollEveryTick());
+            now += backoff;
+        }
+        // Jitter spreads a retry by at most a fifth either way.
+        Policy low; low.Enable(0, true); QVERIFY(low.MayArm(0)); low.Armed(0); low.Finished(0, WOutcome::Failed, -0.2);
+        QCOMPARE(low.retry_at, int64_t{800});
+        Policy high; high.Enable(0, true); QVERIFY(high.MayArm(0)); high.Armed(0); high.Finished(0, WOutcome::Failed, 0.9);
+        QCOMPARE(high.retry_at, int64_t{1200});
+        // A waited reply clears the failures.
+        QVERIFY(p.MayArm(now)); p.Armed(now); p.Finished(now, WOutcome::Quiet, 0.0);
+        QCOMPARE(p.mode, Mode::Live); QCOMPARE(p.failures, 0U); QVERIFY(!p.PollEveryTick());
+    }
+    void watchUnsupportedAndBusyFallBackToPollingAndRetry()
+    {
+        using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using B3FlowMeshWatch::Classify; using WOutcome = B3FlowMeshWatch::Outcome;
+        for (const auto& [outcome, retry] : {std::pair{WOutcome::Busy, Policy::BUSY_RETRY_MS}, std::pair{WOutcome::Unsupported, Policy::UNSUPPORTED_RETRY_MS}}) {
+            Policy p; p.Enable(0, true); QVERIFY(p.MayArm(0)); p.Armed(0);
+            p.Finished(100, outcome, 0.0);
+            QCOMPARE(p.mode, Mode::Polling); QVERIFY(p.PollEveryTick());
+            QVERIFY(!p.MayArm(100 + retry - 1));
+            QVERIFY(p.MayArm(100 + retry)); QCOMPARE(p.mode, Mode::Probing);
+        }
+        // An endpoint that advertises nothing starts in Polling.
+        Policy none; none.Enable(0, false);
+        QCOMPARE(none.mode, Mode::Polling); QVERIFY(!none.MayArm(1000));
+        // The watch object decides, keyed on the endpoint the watch was for.
+        QCOMPARE(Classify(false, "not_eligible", false, false, false, 0), WOutcome::Unsupported);
+        QCOMPARE(Classify(false, "not_eligible", false, false, false, 2000), WOutcome::NotWaited);
+        QCOMPARE(Classify(false, "unsupported", false, false, false, 2000), WOutcome::Unsupported);
+        QCOMPARE(Classify(false, "busy", true, false, false, 2000), WOutcome::Busy);
+        QCOMPARE(Classify(true, "", false, false, false, 2000), WOutcome::Failed);
+        QCOMPARE(Classify(false, "timeout", true, true, false, 2000), WOutcome::Quiet);
+        QCOMPARE(Classify(false, "ready", true, true, true, 2000), WOutcome::Changed);
+        QCOMPARE(Classify(false, "ready", true, true, false, 2000), WOutcome::Quiet);
+        for (const char* label : {"lane_busy", "superseded", "deadline", "interrupted", "revalidate", "other"}) {
+            QCOMPARE(Classify(false, label, false, false, false, 2000), WOutcome::NotWaited);
+        }
+    }
+    void watchNonWaitedOutcomesArePaced()
+    {
+        using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using B3FlowMeshWatch::Classify; using WOutcome = B3FlowMeshWatch::Outcome;
+        Policy p; p.Enable(0, true);
+        int64_t now{0};
+        unsigned arms{0};
+        // Answered at once, again and again: never re-armed at once, and
+        // three in a row fall back to polling for ten seconds.
+        for (int i{0}; i < 3; ++i) {
+            while (!p.MayArm(now)) now += 10;
+            p.Armed(now); ++arms;
+            p.Finished(now, WOutcome::NotWaited, 0.0);
+            if (i < 2) { QVERIFY(!p.MayArm(now)); QVERIFY(!p.MayArm(now + Policy::TICK_MS - 1)); }
+        }
+        QCOMPARE(p.mode, Mode::Polling);
+        QCOMPARE(p.RetryInMs(now), Policy::NOT_WAITED_RETRY_MS);
+        QCOMPARE(arms, 3U);
+        QVERIFY(now >= 2 * Policy::TICK_MS);
+    }
+    void watchChangedRepliesArePacedTwoPerSecond()
+    {
+        using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using B3FlowMeshWatch::Classify; using WOutcome = B3FlowMeshWatch::Outcome;
+        Policy p; p.Enable(0, true);
+        // A busy market: every read returns a changed head 10 ms later.
+        std::vector<int64_t> arms;
+        for (int64_t now{0}; now < 10'000; now += 10) {
+            if (p.outstanding) { p.Finished(now, WOutcome::Changed, 0.0); continue; }
+            if (p.MayArm(now)) { p.Armed(now); arms.push_back(now); }
+        }
+        // At most the burst plus two per second, whatever the outcome.
+        QVERIFY(arms.size() <= size_t{2 + 2 * 10});
+        QVERIFY(arms.size() >= size_t{2 * 10});
+        for (size_t i{2}; i < arms.size(); ++i) QVERIFY(arms[i] - arms[i - 2] >= Policy::ARM_REFILL_MS);
+        QCOMPARE(p.mode, Mode::Live); QVERIFY(!p.PollEveryTick());
+    }
+    void watchQuietRepliesRearmImmediately()
+    {
+        using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using B3FlowMeshWatch::Classify; using WOutcome = B3FlowMeshWatch::Outcome;
+        Policy p; p.Enable(0, true);
+        QVERIFY(p.MayArm(0)); p.Armed(0);
+        p.Finished(1500, WOutcome::Quiet, 0.0);
+        QCOMPARE(p.mode, Mode::Live);
+        QVERIFY(p.MayArm(1500)); p.Armed(1500);
+        QVERIFY(!p.MayArm(1500)); // One outstanding at a time.
+        p.Finished(3000, WOutcome::Quiet, 0.0);
+        QVERIFY(p.MayArm(3000));
+        // A discarded result records nothing but frees the slot.
+        p.Armed(3000); p.Dropped(); QVERIFY(!p.outstanding); QCOMPARE(p.mode, Mode::Live);
+        p.Disable(); QCOMPARE(p.mode, Mode::Off); QVERIFY(!p.MayArm(4000));
+    }
+    void watchdogTripsAfterFifteenSecondsOfSilence()
+    {
+        using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using B3FlowMeshWatch::Classify; using WOutcome = B3FlowMeshWatch::Outcome;
+        Policy p; p.Enable(0, true);
+        QVERIFY(p.MayArm(0)); p.Armed(0);
+        QVERIFY(!p.WatchdogTripped(Policy::WATCHDOG_MS - 1));
+        QVERIFY(p.WatchdogTripped(Policy::WATCHDOG_MS));
+        p.Watchdog(Policy::WATCHDOG_MS);
+        QCOMPARE(p.mode, Mode::Backoff); QVERIFY(p.PollEveryTick());
+        p.Watchdog(Policy::WATCHDOG_MS + 500); QCOMPARE(p.failures, 1U); // Once per episode.
+        QVERIFY(!p.MayArm(Policy::WATCHDOG_MS + 5000)); // Still outstanding.
+        p.Finished(Policy::WATCHDOG_MS + 6000, WOutcome::Quiet, 0.0);
+        QCOMPARE(p.mode, Mode::Live); QVERIFY(!p.WatchdogTripped(Policy::WATCHDOG_MS + 6000));
+        // Live without a waited reply for fifteen seconds trips it too.
+        p.Finished(Policy::WATCHDOG_MS + 6000, WOutcome::NotWaited, 0.0);
+        QVERIFY(p.WatchdogTripped(2 * Policy::WATCHDOG_MS + 6000));
     }
 };
 QTEST_GUILESS_MAIN(B3FlowMeshTradingTests)

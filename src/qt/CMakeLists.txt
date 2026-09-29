@@ -209,6 +209,8 @@ if(ENABLE_WALLET)
       b3flowmeshtradingpanel.h
       b3flowmeshmarketdata.cpp
       b3flowmeshmarketdata.h
+      b3flowmeshwatch.cpp
+      b3flowmeshwatch.h
       b3flowmeshchart.cpp
       b3flowmeshchart.h
       b3flowmeshorderbook.cpp
