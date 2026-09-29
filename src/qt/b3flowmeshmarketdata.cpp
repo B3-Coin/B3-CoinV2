@@ -362,25 +362,12 @@ LimitBook ProjectLimitBook(const Snapshot& snapshot, bool inverse)
         }
         // These are precisely the integer step shapes emitted by the native
         // limit helpers. Sloped or merely equivalent curves are not orders.
-        CAmount price{0};
-        bool limit{false};
-        if (bid && curve.points.size() == 2) {
-            const auto& first{curve.points.front()};
-            const auto& last{curve.points.back()};
-            limit = first.price < MAX_MONEY && last.price == first.price + 1 && last.quantity == 0;
-            price = first.price;
-        } else if (!bid && curve.points.size() == 1) {
-            limit = curve.points.front().price == 0;
-        } else if (!bid && curve.points.size() == 2) {
-            const auto& first{curve.points.front()};
-            const auto& last{curve.points.back()};
-            limit = last.price > 0 && first.price == last.price - 1 && first.quantity == 0;
-            price = last.price;
-        }
+        const auto limit{LimitPriceOf(curve)};
         if (!limit) {
             ++out.general_curves;
             continue;
         }
+        const CAmount price{*limit};
         const Wide notional{Wide{static_cast<uint64_t>(price)} * static_cast<uint64_t>(curve.remaining)};
         if (notional > static_cast<uint64_t>(MAX_MONEY)) {
             ++out.invalid_curves;
@@ -427,6 +414,92 @@ LimitBook ProjectLimitBook(const Snapshot& snapshot, bool inverse)
         out.spread = LimitSpread(*out.canonical_best_bid, *out.canonical_best_ask, snapshot.units.decimals, inverse);
     }
     return out;
+}
+
+std::optional<CAmount> LimitPriceOf(const Curve& curve)
+{
+    const auto& p{curve.points};
+    if (curve.side == QStringLiteral("bid") && p.size() == 2) {
+        if (p[0].price < MAX_MONEY && p[1].price == p[0].price + 1 && p[1].quantity == 0) return p[0].price;
+    } else if (curve.side == QStringLiteral("ask") && p.size() == 1) {
+        if (p[0].price == 0) return CAmount{0};
+    } else if (curve.side == QStringLiteral("ask") && p.size() == 2) {
+        if (p[1].price > 0 && p[0].price == p[1].price - 1 && p[0].quantity == 0) return p[1].price;
+    }
+    return std::nullopt;
+}
+
+std::optional<MarketableLimit> ComputeMarketableLimit(const Snapshot& s, bool display_buy, bool inverse, int bps,
+                                                      std::optional<CAmount> quantity, QString* error)
+{
+    const auto fail = [&](const QString& text) -> std::optional<MarketableLimit> {
+        if (error) *error = text;
+        return std::nullopt;
+    };
+    if (bps < 1 || bps > MAX_SLIPPAGE_BPS) return fail(QStringLiteral("Maximum slippage must be from 0.01% to 10%."));
+    if (!s.certified) return fail(QStringLiteral("A certified book is required; enter a limit price."));
+    const bool bid{CanonicalSide(display_buy, inverse) == QStringLiteral("bid")};
+    // Price only against other accounts: this account's own curves are neither
+    // liquidity for it nor a reference price.
+    Snapshot others{s};
+    others.own_curves.clear();
+    if (!s.account.isEmpty()) {
+        others.curves.erase(std::remove_if(others.curves.begin(), others.curves.end(), [&](const Curve& c) {
+            return c.account.compare(s.account, Qt::CaseInsensitive) == 0;
+        }), others.curves.end());
+    }
+    const auto book{ProjectLimitBook(others, /*inverse=*/false)};
+    if (!book.units_known) return fail(QStringLiteral("Verified asset precision is required; enter a limit price."));
+    if (!book.complete) return fail(QStringLiteral("Only part of the certified book is visible, or it holds curves that are not simple limits; enter a limit price."));
+    const auto reference{bid ? book.canonical_best_ask : book.canonical_best_bid};
+    if (!reference) return fail(bid ? QStringLiteral("No certified sell orders to price against; enter a limit price.")
+                                    : QStringLiteral("No certified buy orders to price against; enter a limit price."));
+    if (*reference <= 0) return fail(bid ? QStringLiteral("The best sell order is a zero-price curve; enter a limit price.")
+                                         : QStringLiteral("The best buy order has a zero price; enter a limit price."));
+    // Never beyond the slippage bound: a bid floors, an ask ceils.
+    const Wide scaled{Wide{static_cast<uint64_t>(*reference)} * static_cast<uint64_t>(bid ? 10'000 + bps : 10'000 - bps)};
+    Wide limit{bid ? scaled / 10'000 : (scaled + 9'999) / 10'000};
+    const uint64_t step{static_cast<uint64_t>(s.units.price_step)};
+    limit = bid ? limit / step * step : (limit + step - 1) / step * step;
+    if (bid && limit < static_cast<uint64_t>(*reference)) limit = static_cast<uint64_t>(*reference);
+    if (!bid && limit > static_cast<uint64_t>(*reference)) limit = static_cast<uint64_t>(*reference);
+    // A limit bid needs its (price + 1, 0) endpoint: the highest bid is
+    // MAX_MONEY - 1, still at or above the reference or refused.
+    const uint64_t highest{static_cast<uint64_t>(MAX_MONEY - (bid ? 1 : 0))};
+    if (bid && limit > highest && highest >= static_cast<uint64_t>(*reference)) limit = highest;
+    if (limit == 0 || limit > highest) return fail(QStringLiteral("The slippage limit is outside the supported price range; enter a limit price."));
+    MarketableLimit out;
+    out.reference = *reference; out.price = static_cast<CAmount>(limit); out.slippage_bps = bps;
+    out.display = inverse ? ExactInversePrice(out.price, s.units.decimals) : FormatPrice(out.price, s.units.decimals);
+    out.reference_display = inverse ? ExactInversePrice(out.reference, s.units.decimals) : FormatPrice(out.reference, s.units.decimals);
+    // The ticket signs what its parser reads back: it must be exactly this.
+    const auto parsed{ParseDisplayLimit(out.display, s.units, inverse, display_buy)};
+    if (!parsed || parsed->price != out.price || parsed->adjusted) return fail(QStringLiteral("This limit cannot be entered exactly; enter a limit price."));
+    Wide visible{0};
+    for (const auto& level : bid ? book.asks : book.bids) {
+        if (bid ? level.canonical_price <= out.price : level.canonical_price >= out.price) visible += static_cast<uint64_t>(level.remaining);
+    }
+    out.visible = visible > static_cast<uint64_t>(MAX_MONEY) ? MAX_MONEY : static_cast<CAmount>(visible);
+    out.covers_quantity = quantity && *quantity > 0 && out.visible >= *quantity;
+    // Never cross this account's own opposite order.
+    for (const auto& own : s.own_curves) {
+        if (own.side == (bid ? QStringLiteral("bid") : QStringLiteral("ask")) || own.remaining == 0) continue;
+        const auto price{LimitPriceOf(own)};
+        if (!price) return fail(QStringLiteral("Your own opposite order is not a simple limit; cancel it or enter a limit price."));
+        if (bid ? *price <= out.price : *price >= out.price) return fail(QStringLiteral("This limit would cross your own opposite order; cancel or edit it first, or enter a limit price."));
+    }
+    return out;
+}
+
+std::optional<int> ParseSlippageBps(const QString& text, QString* error)
+{
+    QString parse_error;
+    const auto hundredths{B3AssetTransfer::ParseAmount(text.trimmed(), 2, &parse_error)};
+    if (!hundredths || *hundredths < 1 || *hundredths > MAX_SLIPPAGE_BPS) {
+        if (error) *error = QStringLiteral("Enter a maximum slippage from 0.01 to 10 percent.");
+        return std::nullopt;
+    }
+    return static_cast<int>(*hundredths);
 }
 
 std::vector<Depth> Aggregate(const std::vector<Curve>& curves)

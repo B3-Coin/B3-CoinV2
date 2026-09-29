@@ -745,6 +745,50 @@ private Q_SLOTS:
         QVERIFY(Wide{2'000'000} * KILO_COIN * 9999 ==
                 Wide{1'000'000} * (KILO_COIN - *FeeExample(KILO_COIN)) * 20000);
     }
+    void marketableLimitClearsAgainstTheBookItWasPricedFrom()
+    {
+        using namespace B3FlowMeshMarketData;
+        using Side = flowmesh::ClearingEngine::Side;
+        using flowmesh::test_only::StateFunding;
+        const auto base{H(2)}, user{H(10)};
+        const auto& b3{modern::NativeAsset()};
+        const auto fees{FeeContext()};
+        struct Resting { unsigned char owner; bool bid; CAmount price, quantity; };
+        const std::vector<Resting> resting{{20, true, 1000, 100'000}, {21, true, 998, 120'000}, {22, true, 960, 500'000},
+                                           {80, false, 1010, 150'000}, {81, false, 1012, 170'000}, {82, false, 1050, 400'000}};
+        for (const bool buy : {true, false}) {
+            flowmesh::FlowMeshState state{H(1), base, b3};
+            // The certified book the helper sees is exactly the executing state.
+            B3FlowMeshMarketData::Snapshot s; s.certified = true; s.curves_complete = true; s.base = QString::fromStdString(base.GetHex()); s.units = TokenUnits();
+            for (const auto& r : resting) {
+                const auto account{H(r.owner)};
+                QVERIFY(StateFunding::Fund(state, account, r.bid ? b3 : base, r.bid ? r.price * r.quantity : r.quantity));
+                const auto points{r.bid ? flowmesh::MakeLimitBidCurve(r.price, r.quantity) : flowmesh::MakeLimitAskCurve(r.price, r.quantity)};
+                QVERIFY(points && state.SubmitCurve(account, r.bid ? Side::BID : Side::ASK, *points));
+                Curve curve; curve.account = QString::fromStdString(account.GetHex()); curve.side = r.bid ? QStringLiteral("bid") : QStringLiteral("ask");
+                for (const auto& point : *points) curve.points.push_back({point.price, point.qty});
+                curve.remaining = r.quantity;
+                s.curves.push_back(curve);
+            }
+            const CAmount quantity{200'000};
+            QString error;
+            const auto limit{ComputeMarketableLimit(s, buy, false, 100, quantity, &error)};
+            QVERIFY2(limit, qPrintable(error));
+            QCOMPARE(limit->price, buy ? CAmount{1020} : CAmount{990});
+            QVERIFY(StateFunding::Fund(state, user, buy ? b3 : base, buy ? limit->price * quantity : quantity));
+            const auto own{buy ? flowmesh::MakeLimitBidCurve(limit->price, quantity) : flowmesh::MakeLimitAskCurve(limit->price, quantity)};
+            QVERIFY(own && state.SubmitCurve(user, buy ? Side::BID : Side::ASK, *own));
+            const auto result{state.ClearSlot(&fees)};
+            QVERIFY(result && result->cleared);
+            // Only inequalities: tie-breaking, rationing and other demand in
+            // the same batch decide the exact fill.
+            QVERIFY(buy ? result->price <= limit->price : result->price >= limit->price);
+            const auto& fills{buy ? result->bid_fill : result->ask_fill};
+            const CAmount filled{fills.contains(user) ? fills.at(user) : 0};
+            QVERIFY(filled <= std::min(quantity, limit->visible));
+            QVERIFY(filled > 0);
+        }
+    }
     void inverseSellPartialBetterFillKeepsSavingsUntilCancel()
     {
         using namespace B3FlowMeshMarketData;

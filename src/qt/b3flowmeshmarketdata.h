@@ -106,6 +106,38 @@ struct LimitBook {
 //! Invalid curves and overflowing entire price groups are omitted fail-closed;
 //! general curves remain in Aggregate(), not misrepresented as limit orders.
 LimitBook ProjectLimitBook(const Snapshot& snapshot, bool inverse);
+//! The exact limit price of a native limit-shaped curve (the shapes
+//! MakeLimitBidCurve / MakeLimitAskCurve emit); nullopt for any other curve.
+//! It does not validate the curve itself.
+std::optional<CAmount> LimitPriceOf(const Curve& curve);
+
+//! A client-side "marketable limit": the best verified opposite price
+//! moved by at most the given slippage. It is an ordinary limit order, not a
+//! market or immediate-or-cancel order: any unfilled part rests.
+inline constexpr int DEFAULT_SLIPPAGE_BPS{100}, MAX_SLIPPAGE_BPS{1000};
+struct MarketableLimit {
+    //! Canonical prices (B3 atoms per base atom).
+    CAmount reference{0}, price{0};
+    //! Other accounts' certified remaining quantity at or better than the
+    //! limit, in base atoms (saturating): visible depth, not a fill estimate.
+    CAmount visible{0};
+    int slippage_bps{0};
+    bool covers_quantity{false};
+    //! Exact display prices in the requested orientation.
+    QString display, reference_display;
+};
+//! Fails closed with a reason unless the certified book is complete, holds
+//! only limit-shaped curves, has verified units and a positive opposite
+//! best price. Prices only against other accounts' curves, applies the
+//! slippage in exact integer arithmetic (a bid floors and never goes below
+//! the reference, an ask ceils and never goes above it), must round-trip
+//! exactly through ParseDisplayLimit, and refuses to cross this account's
+//! own opposite order.
+std::optional<MarketableLimit> ComputeMarketableLimit(const Snapshot& snapshot, bool display_buy, bool inverse, int slippage_bps,
+                                                      std::optional<CAmount> quantity, QString* error = nullptr);
+//! A maximum slippage in percent with at most two decimals ("1.00"), as
+//! basis points from 1 (0.01%) to MAX_SLIPPAGE_BPS (10%).
+std::optional<int> ParseSlippageBps(const QString& text, QString* error = nullptr);
 //! Fail closed; no JSON display values are financial sources of truth.
 Snapshot Parse(const UniValue& value);
 std::vector<Depth> Aggregate(const std::vector<Curve>& curves);

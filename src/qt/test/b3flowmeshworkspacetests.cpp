@@ -17,6 +17,7 @@
 #include <flowmesh/market.h>
 #include <flowmesh/microblock.h>
 #include <test/util/setup_common.h>
+#include <util/int128.h>
 #include <wallet/context.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
@@ -759,6 +760,124 @@ private Q_SLOTS:
         QCOMPARE(book.spread, QStringLiteral("1/438508839999999998013400000000000002000000000"));
         QCOMPARE(ParseDisplayPrice(book.asks[0].price, snapshot.units, true).value(), MAX_MONEY - 2);
         QCOMPARE(ParseDisplayPrice(book.bids[0].price, snapshot.units, true).value(), MAX_MONEY - 1);
+    }
+    void limitPriceOfMatchesBookProjectionShapes()
+    {
+        QCOMPARE(LimitPriceOf(LimitCurve("bid", 5, 1000, 10)), std::optional<CAmount>{1000});
+        QCOMPARE(LimitPriceOf(LimitCurve("ask", 5, 1000, 10)), std::optional<CAmount>{1000});
+        QCOMPARE(LimitPriceOf(LimitCurve("ask", 5, 0, 10)), std::optional<CAmount>{0});
+        auto sloped{LimitCurve("bid", 5, 1000, 10)}; sloped.points.back().price += 1;
+        QVERIFY(!LimitPriceOf(sloped));
+        auto relabelled{LimitCurve("bid", 5, 1000, 10)}; relabelled.side = QStringLiteral("ask");
+        QVERIFY(!LimitPriceOf(relabelled));
+        // Exactly the curves the book projects as limit levels.
+        auto snapshot{SyntheticLimitBook(2)}; snapshot.curves.push_back(sloped);
+        const auto book{ProjectLimitBook(snapshot, false)};
+        QCOMPARE(book.general_curves, size_t{1}); QCOMPARE(book.projected_curves, size_t{4});
+    }
+    void marketableLimitUsesVerifiedBestAndIntegerSlippage_data()
+    {
+        QTest::addColumn<bool>("buy");
+        QTest::addColumn<bool>("inverse");
+        QTest::addColumn<int>("bps");
+        QTest::addColumn<qint64>("reference");
+        QTest::addColumn<qint64>("price");
+        QTest::addColumn<qint64>("visible");
+        QTest::addColumn<QString>("display");
+        // Best others' bid 1000 and ask 1010 (SyntheticLimitBook).
+        QTest::newRow("buy 1%") << true << false << 100 << qint64{1010} << qint64{1020} << qint64{1'245'000} << QStringLiteral("1.02");
+        QTest::newRow("sell 1%") << false << false << 100 << qint64{1000} << qint64{990} << qint64{945'000} << QStringLiteral("0.99");
+        QTest::newRow("buy 0.01% floors to the best ask") << true << false << 1 << qint64{1010} << qint64{1010} << qint64{150'000} << QStringLiteral("1.01");
+        QTest::newRow("sell 0.01% ceils to the best bid") << false << false << 1 << qint64{1000} << qint64{1000} << qint64{100'000} << QStringLiteral("1");
+        QTest::newRow("buy 10%") << true << false << 1000 << qint64{1010} << qint64{1111} << qint64{1'865'000} << QStringLiteral("1.111");
+        // Inverse: Buy B3 is a canonical ask (sell tokens) against the best bid.
+        QTest::newRow("buy B3 1%") << true << true << 100 << qint64{1000} << qint64{990} << qint64{945'000} << QStringLiteral("100/99");
+        QTest::newRow("sell B3 1%") << false << true << 100 << qint64{1010} << qint64{1020} << qint64{1'245'000} << QStringLiteral("50/51");
+    }
+    void marketableLimitUsesVerifiedBestAndIntegerSlippage()
+    {
+        QFETCH(bool, buy); QFETCH(bool, inverse); QFETCH(int, bps); QFETCH(qint64, reference); QFETCH(qint64, price); QFETCH(qint64, visible); QFETCH(QString, display);
+        auto snapshot{SyntheticLimitBook()};
+        QString error;
+        const auto limit{ComputeMarketableLimit(snapshot, buy, inverse, bps, CAmount{1'000'000}, &error)};
+        QVERIFY2(limit, qPrintable(error));
+        QCOMPARE(limit->reference, reference); QCOMPARE(limit->price, price); QCOMPARE(limit->visible, visible);
+        QCOMPARE(limit->display, display); QCOMPARE(limit->slippage_bps, bps);
+        QCOMPARE(limit->covers_quantity, visible >= 1'000'000);
+        // Exact integer slippage: never beyond the bound, never past the reference.
+        const bool bid{CanonicalSide(buy, inverse) == QStringLiteral("bid")};
+        using Wide = util::Unsigned128;
+        if (bid) { QVERIFY(Wide{static_cast<uint64_t>(price)} * 10'000 <= Wide{static_cast<uint64_t>(reference)} * (10'000 + bps)); QVERIFY(price >= reference); }
+        else { QVERIFY(Wide{static_cast<uint64_t>(price)} * 10'000 >= Wide{static_cast<uint64_t>(reference)} * (10'000 - bps)); QVERIFY(price <= reference); }
+        // What the ticket parser reads back is exactly the signed limit.
+        const auto parsed{ParseDisplayLimit(limit->display, snapshot.units, inverse, buy)};
+        QVERIFY(parsed); QCOMPARE(parsed->price, limit->price); QVERIFY(!parsed->adjusted);
+    }
+    void marketableLimitRefusesIncompleteStaleOneSidedOrUnknownBooks()
+    {
+        QString error;
+        const auto refuses = [&](const Snapshot& s, bool buy, const QString& reason) {
+            error.clear();
+            const bool refused{!ComputeMarketableLimit(s, buy, false, 100, std::nullopt, &error)};
+            return refused && error.contains(reason);
+        };
+        auto partial{SyntheticLimitBook()}; partial.curves_complete = false;
+        QVERIFY(refuses(partial, true, QStringLiteral("Only part of the certified book")));
+        auto general{SyntheticLimitBook()}; general.curves.back().points.back().price += 5;
+        QVERIFY(refuses(general, true, QStringLiteral("not simple limits")));
+        auto uncertified{SyntheticLimitBook()}; uncertified.certified = false;
+        QVERIFY(refuses(uncertified, true, QStringLiteral("certified book")));
+        auto unknown{SyntheticLimitBook()}; unknown.units.known = false;
+        QVERIFY(refuses(unknown, true, QStringLiteral("precision")));
+        auto bids_only{SyntheticLimitBook()};
+        std::erase_if(bids_only.curves, [](const Curve& c) { return c.side == QStringLiteral("ask"); });
+        QVERIFY(refuses(bids_only, true, QStringLiteral("No certified sell orders")));
+        QVERIFY(ComputeMarketableLimit(bids_only, false, false, 100, std::nullopt, &error));
+        // A zero-price best ask is named as such, not as a missing book.
+        auto zero{SyntheticLimitBook()}; zero.curves.push_back(LimitCurve("ask", 99, 0, 1000));
+        QVERIFY(refuses(zero, true, QStringLiteral("zero-price")));
+        QVERIFY(!ComputeMarketableLimit(SyntheticLimitBook(), true, false, 0, std::nullopt, &error));
+        QVERIFY(!ComputeMarketableLimit(SyntheticLimitBook(), true, false, MAX_SLIPPAGE_BPS + 1, std::nullopt, &error));
+    }
+    void marketableLimitNeverCrossesOwnOppositeOrder()
+    {
+        QString error;
+        auto snapshot{SyntheticLimitBook()}; snapshot.account = QString::fromStdString(H(5).GetHex());
+        // The account's own cheaper ask is neither the reference nor depth…
+        const auto own_ask{LimitCurve("ask", 5, 1005, 50'000)};
+        snapshot.curves.push_back(own_ask); snapshot.own_curves = {own_ask};
+        QVERIFY(!ComputeMarketableLimit(snapshot, true, false, 100, std::nullopt, &error));
+        // …and a buy that would reach it would cross it.
+        QVERIFY(error.contains(QStringLiteral("cross your own")));
+        // An own ask above the limit does not cross.
+        snapshot.curves.back() = LimitCurve("ask", 5, 1030, 50'000); snapshot.own_curves = {snapshot.curves.back()};
+        const auto limit{ComputeMarketableLimit(snapshot, true, false, 100, std::nullopt, &error)};
+        QVERIFY2(limit, qPrintable(error)); QCOMPARE(limit->reference, CAmount{1010}); QCOMPARE(limit->visible, CAmount{1'245'000});
+        // An exhausted own opposite curve is not an order; a general one refuses.
+        snapshot.own_curves.back().filled = snapshot.own_curves.back().remaining + snapshot.own_curves.back().filled; snapshot.own_curves.back().remaining = 0;
+        QVERIFY(ComputeMarketableLimit(snapshot, true, false, 100, std::nullopt, &error));
+        auto general{LimitCurve("ask", 5, 1030, 50'000)}; general.points.back().price += 3; general.points.front().price += 1;
+        snapshot.own_curves = {general};
+        QVERIFY(!ComputeMarketableLimit(snapshot, true, false, 100, std::nullopt, &error)); QVERIFY(error.contains(QStringLiteral("not a simple limit")));
+        // The own bid side never matters to a buy.
+        snapshot.own_curves = {LimitCurve("bid", 5, 1005, 10)};
+        QVERIFY(ComputeMarketableLimit(snapshot, true, false, 100, std::nullopt, &error));
+    }
+    void marketableLimitClampsSlippageAndPriceRange()
+    {
+        QCOMPARE(ParseSlippageBps(QStringLiteral("1.00")), std::optional<int>{100});
+        QCOMPARE(ParseSlippageBps(QStringLiteral("0.01")), std::optional<int>{1});
+        QCOMPARE(ParseSlippageBps(QStringLiteral("10")), std::optional<int>{1000});
+        for (const auto* text : {"0", "0.005", "10.01", "-1", "1e2", "", "abc"}) QVERIFY2(!ParseSlippageBps(QString::fromLatin1(text)), text);
+        // A reference at the top of the range cannot be exceeded.
+        auto snapshot{SyntheticLimitBook(1)};
+        snapshot.curves = {LimitCurve("bid", 20, 1000, 10), LimitCurve("ask", 80, MAX_MONEY - 1, 1)};
+        QString error;
+        const auto top{ComputeMarketableLimit(snapshot, true, false, 1000, std::nullopt, &error)};
+        QVERIFY2(top, qPrintable(error)); QCOMPARE(top->price, MAX_MONEY - 1);
+        // A best ask at MAX_MONEY cannot be reached by any limit bid.
+        snapshot.curves.back() = LimitCurve("ask", 80, MAX_MONEY, 1);
+        QVERIFY(!ComputeMarketableLimit(snapshot, true, false, 1000, std::nullopt, &error)); QVERIFY(error.contains(QStringLiteral("outside the supported price range")));
     }
     void limitBookWidgetShowsNearestLevelsWithoutRefreshChurn_data()
     {
