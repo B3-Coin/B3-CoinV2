@@ -1761,46 +1761,54 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         params.pushKV("limit", static_cast<uint64_t>(query.limit));
         if (query.before_sequence) params.pushKV("before_sequence", *query.before_sequence);
         Call("updates", params, [&](const UniValue& value, size_t endpoint) {
-            CheckStatus(value["status"], cache.pins);
-            const auto cursor{ParseCursor(value["cursor"])};
-            const bool gap{Flag(value, "gap")};
-            const bool changed_instance{cursor.instance_id != cache.cursor.instance_id};
-            if (changed_instance && !gap) Fail("Endpoint changed cursor instance without reporting an event gap");
-            if (!changed_instance && cursor.event_id < cache.cursor.event_id) Fail("Out-of-order event cursor");
-            if (!value["events"].isArray() || value["events"].size() > flowmesh::CLIENT_EVENT_PAGE_MAX) Fail("Event page exceeds bound");
-            uint64_t last{changed_instance ? 0 : cache.cursor.event_id};
-            for (const auto& event : value["events"].getValues()) {
-                const auto position{Number(event, "event_id")};
-                if (position <= last || position > cursor.event_id || Id(event, "market_id") != id) Fail("Invalid event order or market");
-                last = position;
-                // Events are hints only. A separate canonical entry request
-                // establishes inclusion, never an endpoint's receipt boolean.
-            }
-            if (gap) { cache.event_gap = true; std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps; }
-            const auto reported_sequence{Number(value["status"], "next_microblock_sequence")};
-            const auto reported_head{Id(value["status"], "last_microblock_hash", true)};
-            if (reported_sequence < cache.verified.certified.entry.sequence + 1) Fail("Endpoint reported a stale microblock head");
-            if (reported_sequence == cache.verified.certified.entry.sequence + 1 && reported_head != cache.verified.certified.entry.GetHash())
-                Fail("Endpoint reported a conflicting equal-height head");
-            snapshot_needed = gap || reported_head != cache.verified.certified.entry.GetHash();
-            if (snapshot_needed && !gap) {
-                // The atomically exported snapshot can advance past events
-                // produced after this page. Explicit resynchronization is
-                // reported instead of silently treating those events as seen.
-                cache.event_gap = true;
-                std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps;
-            }
-            cache.cursor = cursor; cache.endpoint = endpoint; cache.status = value["status"];
-            if (value.exists("reported_data") && !value["reported_data"]["unchanged"].isTrue()) cache.reported = value["reported_data"];
-            // A 'more' page is not skipped: cursor remains at the returned
-            // page boundary, and the next refresh resumes there.
-            (void)Flag(value, "more");
-            LearnMetadata(value["status"], cache.pins, endpoint);
-            LearnActionWait(value["status"], endpoint);
-            LearnReadiness(FlowMeshAdvertisedReadinessOf(value["status"]), endpoint, id);
+            snapshot_needed = ApplyUpdatesPage(cache, id, value, endpoint);
         });
         if (snapshot_needed) Snapshot(id, account);
         return done();
+    }
+    //! Verifies one 'updates' page against the cache and applies its cursor
+    //! and status; true when a snapshot is needed. Throws before the cursor
+    //! moves. reported_data, absent from a watched page, is optional.
+    bool ApplyUpdatesPage(Cache& cache, const uint256& id, const UniValue& value, size_t endpoint)
+    {
+        CheckStatus(value["status"], cache.pins);
+        const auto cursor{ParseCursor(value["cursor"])};
+        const bool gap{Flag(value, "gap")};
+        const bool changed_instance{cursor.instance_id != cache.cursor.instance_id};
+        if (changed_instance && !gap) Fail("Endpoint changed cursor instance without reporting an event gap");
+        if (!changed_instance && cursor.event_id < cache.cursor.event_id) Fail("Out-of-order event cursor");
+        if (!value["events"].isArray() || value["events"].size() > flowmesh::CLIENT_EVENT_PAGE_MAX) Fail("Event page exceeds bound");
+        uint64_t last{changed_instance ? 0 : cache.cursor.event_id};
+        for (const auto& event : value["events"].getValues()) {
+            const auto position{Number(event, "event_id")};
+            if (position <= last || position > cursor.event_id || Id(event, "market_id") != id) Fail("Invalid event order or market");
+            last = position;
+            // Events are hints only. A separate canonical entry request
+            // establishes inclusion, never an endpoint's receipt boolean.
+        }
+        if (gap) { cache.event_gap = true; std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps; }
+        const auto reported_sequence{Number(value["status"], "next_microblock_sequence")};
+        const auto reported_head{Id(value["status"], "last_microblock_hash", true)};
+        if (reported_sequence < cache.verified.certified.entry.sequence + 1) Fail("Endpoint reported a stale microblock head");
+        if (reported_sequence == cache.verified.certified.entry.sequence + 1 && reported_head != cache.verified.certified.entry.GetHash())
+            Fail("Endpoint reported a conflicting equal-height head");
+        const bool snapshot_needed{gap || reported_head != cache.verified.certified.entry.GetHash()};
+        if (snapshot_needed && !gap) {
+            // The atomically exported snapshot can advance past events
+            // produced after this page. Explicit resynchronization is
+            // reported instead of silently treating those events as seen.
+            cache.event_gap = true;
+            std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps;
+        }
+        cache.cursor = cursor; cache.endpoint = endpoint; cache.status = value["status"];
+        if (value.exists("reported_data") && !value["reported_data"]["unchanged"].isTrue()) cache.reported = value["reported_data"];
+        // A 'more' page is not skipped: cursor remains at the returned
+        // page boundary, and the next refresh resumes there.
+        (void)Flag(value, "more");
+        LearnMetadata(value["status"], cache.pins, endpoint);
+        LearnActionWait(value["status"], endpoint);
+        LearnReadiness(FlowMeshAdvertisedReadinessOf(value["status"]), endpoint, id);
+        return snapshot_needed;
     }
     // A foreground wallet signing preflight may reuse the refresh that
     // completed just before it (typically the refresh it queued behind, or
