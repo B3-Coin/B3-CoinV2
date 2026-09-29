@@ -2427,17 +2427,23 @@ struct RequestGate {
 };
 
 //! Records this process's FlowMesh timing spans (default off, as in
-//! production) for one test; Stop returns the events of one stage.
+//! production) for one test; Stop returns the events of one stage. The
+//! process-wide capture is left stopped and empty, as other suites expect.
 struct TimingCapture {
     bool active{true};
     TimingCapture() { node::FlowMeshTimingControl("start"); }
     ~TimingCapture()
     {
-        if (!active) return;
         try {
-            node::FlowMeshTimingControl("stop");
+            if (active) node::FlowMeshTimingControl("stop");
+            Clear();
         } catch (...) {
         }
+    }
+    static void Clear()
+    {
+        node::FlowMeshTimingControl("start");
+        node::FlowMeshTimingControl("stop");
     }
     std::vector<UniValue> Stop(const std::string& stage)
     {
