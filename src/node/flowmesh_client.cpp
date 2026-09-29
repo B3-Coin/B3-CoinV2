@@ -1145,6 +1145,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // Per endpoint (index-stable, like m_retry_after), under m_work: the bounded
     // 'action' wait each endpoint last advertised. Zero never sends wait_ms.
     std::vector<std::chrono::milliseconds> m_action_wait;
+    // Per endpoint (index-stable), under m_work: the same wait on 'submit'
+    // each endpoint last advertised. Zero never sends wait_ms (or "outcome")
+    // with a submission.
+    std::vector<std::chrono::milliseconds> m_submit_wait;
     // Per endpoint (index-stable), under m_work: it advertised verifiable
     // outcomes ("action_outcome_v1": true). False never sends "outcome".
     std::vector<bool> m_action_outcome;
@@ -1369,6 +1373,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     void LearnActionWait(const UniValue& status, size_t endpoint)
     {
         m_action_wait.at(endpoint) = FlowMeshAdvertisedActionWait(status);
+        m_submit_wait.at(endpoint) = FlowMeshAdvertisedSubmitWait(status);
         m_action_outcome.at(endpoint) = FlowMeshAdvertisedActionOutcome(status);
         LearnUpdatesWatch(FlowMeshAdvertisedUpdatesWatch(status), endpoint);
     }
@@ -2662,6 +2667,7 @@ public:
         m_preferred = m_selected;
         m_retry_after.resize(m_endpoints.size());
         m_action_wait.resize(m_endpoints.size());
+        m_submit_wait.resize(m_endpoints.size());
         m_action_outcome.resize(m_endpoints.size());
         m_wait_unanswered.resize(m_endpoints.size());
         m_updates_watch.resize(m_endpoints.size());
@@ -2695,6 +2701,7 @@ public:
                 m_endpoints.push_back(endpoint); m_saved_endpoints = std::move(saved);
                 m_retry_after.emplace_back();
                 m_action_wait.emplace_back();
+                m_submit_wait.emplace_back();
                 m_action_outcome.emplace_back(false);
                 m_wait_unanswered.push_back(false);
                 m_updates_watch.emplace_back();
