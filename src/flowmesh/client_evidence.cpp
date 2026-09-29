@@ -222,6 +222,7 @@ void ClientEventLog::Reset(const uint256& instance_id)
         m_last_event_id = 0;
         m_events.clear();
         m_notices.clear();
+        m_public_notices.clear();
         ++m_notice_changes;
         SignalWatchersLocked(std::nullopt, signalled);
     }
@@ -261,8 +262,10 @@ void ClientEventLog::AppendNotices(std::vector<ClientActionNotice> notices)
         std::lock_guard lock{m_mutex};
         for (auto& notice : notices) {
             notice.after_event_id = m_last_event_id;
-            m_notices.push_back(std::move(notice));
-            if (m_notices.size() > CLIENT_NOTICE_CAPACITY) m_notices.pop_front();
+            notice.serial = ++m_notice_serial;
+            auto& ring{notice.origin == ClientNoticeOrigin::NODE ? m_notices : m_public_notices};
+            ring.push_back(std::move(notice));
+            if (ring.size() > CLIENT_NOTICE_CAPACITY) ring.pop_front();
         }
         ++m_notice_changes;
         notify = m_notice_waiters != 0;
@@ -292,10 +295,15 @@ std::optional<ClientActionNotice> ClientEventLog::NewestNoticeIfNewer(const Mark
 std::optional<ClientActionNotice> ClientEventLog::NewestNoticeLocked(const MarketId& market,
                                                                      const uint256& action_id) const
 {
-    for (auto it{m_notices.rbegin()}; it != m_notices.rend(); ++it) {
-        if (it->market_id == market && it->action_id == action_id) return *it;
+    const ClientActionNotice* newest{nullptr};
+    for (const auto* ring : {&m_notices, &m_public_notices}) {
+        for (auto it{ring->rbegin()}; it != ring->rend(); ++it) {
+            if (it->market_id != market || it->action_id != action_id) continue;
+            if (!newest || it->serial > newest->serial) newest = &*it;
+            break;
+        }
     }
-    return std::nullopt;
+    return newest ? std::optional{*newest} : std::nullopt;
 }
 
 bool ClientEventLog::AppendLocked(ClientEvent&& event)

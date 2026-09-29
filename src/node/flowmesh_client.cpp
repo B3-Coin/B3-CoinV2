@@ -378,7 +378,9 @@ public:
                    std::chrono::milliseconds wait = std::chrono::milliseconds{0}) override
     {
         Receipt out; out.action_id = action.Id();
-        const auto submitted{m_service.SubmitLocalActionChecked(id, action)};
+        // Public API traffic only ever fills the public notice ring.
+        const auto submitted{m_service.SubmitLocalActionChecked(
+            id, action, m_public_api ? flowmesh::ClientNoticeOrigin::PUBLIC : flowmesh::ClientNoticeOrigin::NODE)};
         if (submitted.refused) { out.state = "rejected"; out.reason = submitted.error; return out; }
         switch (submitted.admission.kind) {
         case FlowMeshLocalAdmission::Kind::ENQUEUE: break;

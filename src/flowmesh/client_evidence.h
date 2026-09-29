@@ -23,6 +23,7 @@ namespace flowmesh {
 inline constexpr size_t CLIENT_STATE_MAX_BYTES{8 * 1024 * 1024};
 inline constexpr size_t CLIENT_EVENT_CAPACITY{2048};
 inline constexpr size_t CLIENT_EVENT_PAGE_MAX{256};
+//! Per notice origin (ClientNoticeOrigin): each origin has its own ring.
 inline constexpr size_t CLIENT_NOTICE_CAPACITY{2048};
 //! Concurrent event watches (ClientEventLog::WaitEvents) per log. Defence in
 //! depth only: every caller bounds its own watchers far below this.
@@ -115,6 +116,15 @@ struct ClientEvent {
 };
 
 /**
+ * Who submitted the action a notice is about, which picks its ring. NODE is
+ * this node's own wallet RPC and GUI; PUBLIC is everything else that reaches
+ * the local submission path (the public trading API, whose traffic anyone
+ * can generate), and the default. Public traffic can then only ever evict
+ * public notices, never the ones this node's own not-executed proofs need.
+ */
+enum class ClientNoticeOrigin : uint8_t { PUBLIC, NODE };
+
+/**
  * A local observation about one API-origin action, kept beside (never inside)
  * the v1 event ring: notices take no event id, no ring capacity and never
  * appear in a v1 page, status or gap. They name what this node decided about
@@ -136,6 +146,10 @@ struct ClientActionNotice {
     //! Certified NextSequence(signer) this node's decision used.
     uint64_t next_account_sequence{0};
     std::optional<ClientConsumerRef> consumed_by;
+    //! The ring it is kept in.
+    ClientNoticeOrigin origin{ClientNoticeOrigin::PUBLIC};
+    //! Append order across both rings, set by AppendNotices.
+    uint64_t serial{0};
 };
 
 //! Notice codes that end an opt-in wait: this node will not admit the
@@ -236,8 +250,9 @@ public:
     //! Test observation: current event watches.
     size_t WatchersForTest() const;
     /** Appends local notices in order under one lock, with at most one
-     * wakeup and only while an include_notices wait exists. Bounded ring of
-     * CLIENT_NOTICE_CAPACITY; never touches the v1 events. */
+     * wakeup and only while an include_notices wait exists. Each goes to the
+     * bounded ring of its origin (CLIENT_NOTICE_CAPACITY each), so notices of
+     * one origin never evict the other's; never touches the v1 events. */
     void AppendNotices(std::vector<ClientActionNotice> notices);
     std::optional<ClientActionNotice> NewestNotice(const MarketId& market, const uint256& action_id) const;
     //! The newest notice only while it is newer than every retained event of
@@ -294,8 +309,11 @@ private:
     // Current waiters; appends skip the notification when there are none.
     mutable size_t m_waiters{0};
     std::deque<ClientEvent> m_events;
-    // Notices: a separate ring, their own change counter and waiter count.
+    // Notices: one separate ring per origin, their own change counter and
+    // waiter count. m_notice_serial orders appends across both rings.
     std::deque<ClientActionNotice> m_notices;
+    std::deque<ClientActionNotice> m_public_notices;
+    uint64_t m_notice_serial{0};
     uint64_t m_notice_changes{0};
     mutable size_t m_notice_waiters{0};
     // Current event watches; guarded by m_mutex, at most CLIENT_EVENT_MAX_WATCHERS.

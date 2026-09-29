@@ -9663,7 +9663,9 @@ BOOST_AUTO_TEST_CASE(prune_publishes_local_drop_notice_with_consumer_from_same_e
     const auto queued{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_BID)};
     const auto consumer{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_ASK)};
     const auto remote_only{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::WITHDRAW)};
-    BOOST_REQUIRE(f.runtimes[local]->SubmitLocalAction(f.market, queued) == flowmesh::QueueResult::ACCEPTED);
+    // Submitted by this node's own wallet: its drop notice keeps that origin.
+    const auto submitted{f.runtimes[local]->SubmitLocalActionChecked(f.market, queued, flowmesh::ClientNoticeOrigin::NODE)};
+    BOOST_REQUIRE(submitted.queued && *submitted.queued == flowmesh::QueueResult::ACCEPTED);
     f.Drain();
     BOOST_REQUIRE_EQUAL(f.runtimes[local]->MarketStatus(f.market)->pending_actions, 1U);
     BOOST_REQUIRE(f.runtimes[proposer]->SubmitLocalAction(f.market, consumer) == flowmesh::QueueResult::ACCEPTED);
@@ -9679,6 +9681,7 @@ BOOST_AUTO_TEST_CASE(prune_publishes_local_drop_notice_with_consumer_from_same_e
     const auto notice{f.runtimes[local]->NewestClientNotice(f.market, queued.Id())};
     BOOST_REQUIRE(notice);
     BOOST_CHECK(notice->code == flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED);
+    BOOST_CHECK(notice->origin == flowmesh::ClientNoticeOrigin::NODE);
     BOOST_CHECK_EQUAL(notice->account_sequence, 0U);
     BOOST_CHECK_EQUAL(notice->next_account_sequence, 1U);
     BOOST_CHECK(notice->signed_action_hash == Hash(*flowmesh::EncodeProductionActionPayload(queued)));
@@ -9697,6 +9700,39 @@ BOOST_AUTO_TEST_CASE(prune_publishes_local_drop_notice_with_consumer_from_same_e
         BOOST_CHECK(!f.runtimes[i]->NewestClientNotice(f.market, queued.Id()));
         BOOST_CHECK(!f.runtimes[i]->NewestClientNotice(f.market, remote_only.Id()));
     }
+}
+
+BOOST_AUTO_TEST_CASE(public_submission_notices_never_evict_node_notices)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "notice_origin"};
+    f.block_commits = false;
+    f.Reach(1);
+    CKey key;
+    key.MakeNewKey(true);
+    const auto config{f.initial.ConfigId()};
+    const auto consumer{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_ASK)};
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, consumer) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain();
+    f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    // This node's wallet learns its action can never execute.
+    const auto loser{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_BID)};
+    BOOST_CHECK(runtime.SubmitLocalActionChecked(f.market, loser, flowmesh::ClientNoticeOrigin::NODE).admission.code ==
+                flowmesh::ActionReasonCode::STALE_SEQUENCE);
+    // Unauthenticated public deposits for made-up outpoints, each refused
+    // with a notice, more than a whole ring of them.
+    for (uint32_t n{0}; n < flowmesh::CLIENT_NOTICE_CAPACITY + 64; ++n) {
+        const auto refused{runtime.SubmitLocalActionChecked(f.market, Deposit(COutPoint{f.outpoint.hash, 1000 + n}))};
+        BOOST_REQUIRE(refused.admission.code == flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+    }
+    BOOST_CHECK(!runtime.NewestClientNotice(f.market, Deposit(COutPoint{f.outpoint.hash, 1000}).Id())); // evicted
+    const auto kept{runtime.NewestClientNotice(f.market, loser.Id())};
+    BOOST_REQUIRE(kept);
+    BOOST_CHECK(kept->code == flowmesh::ActionReasonCode::STALE_SEQUENCE);
+    BOOST_CHECK(kept->origin == flowmesh::ClientNoticeOrigin::NODE);
+    BOOST_REQUIRE(kept->consumed_by);
+    BOOST_CHECK(kept->consumed_by->action_id == consumer.Id());
 }
 
 BOOST_AUTO_TEST_CASE(local_factless_deposit_refused_not_relayed_but_remote_still_admitted)

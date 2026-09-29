@@ -536,10 +536,14 @@ public:
      * ENQUEUE decision reaches the queue. Any other decision appends no v1
      * event; an authenticated attempt (pure Schnorr, outside the market
      * lock; a deposit is its outpoint fact) gets a local notice. Never
-     * applied to remote frames, proposals or certified entries.
+     * applied to remote frames, proposals or certified entries. `origin`
+     * picks the notice ring of this submission's notices, including the
+     * worker's recheck and pool-drop notices for it: NODE only for this
+     * node's own wallet RPC and GUI, never for public API traffic.
      */
     FlowMeshLocalSubmitResult SubmitLocalActionChecked(
-        const flowmesh::MarketId& market_id, const flowmesh::Action& action);
+        const flowmesh::MarketId& market_id, const flowmesh::Action& action,
+        flowmesh::ClientNoticeOrigin origin = flowmesh::ClientNoticeOrigin::PUBLIC);
     //! Current position of the client event log (a cheap leaf-lock read).
     flowmesh::ClientEventCursor ClientEventCursor() const;
     //! The newest local notice for this exact action, if retained.

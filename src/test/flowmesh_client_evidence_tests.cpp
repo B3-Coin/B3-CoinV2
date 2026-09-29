@@ -616,6 +616,52 @@ BOOST_AUTO_TEST_CASE(notice_ring_bounded_and_reset_with_instance)
     BOOST_CHECK(!flowmesh::ClientNoticeEndsWait(flowmesh::ActionReasonCode::SUBMIT_LANE_FULL));
 }
 
+BOOST_AUTO_TEST_CASE(public_notices_never_evict_node_notices)
+{
+    using Code = flowmesh::ActionReasonCode;
+    using Origin = flowmesh::ClientNoticeOrigin;
+    flowmesh::ClientEventLog log{Filled(1)};
+    auto node{Notice(2, 3, Code::DROPPED_SEQUENCE_CONSUMED)};
+    node.origin = Origin::NODE;
+    log.AppendNotices({node});
+    // Public traffic fills and turns over its own ring several times.
+    for (int round{0}; round < 3; ++round) {
+        std::vector<flowmesh::ClientActionNotice> flood;
+        for (size_t i{0}; i < flowmesh::CLIENT_NOTICE_CAPACITY; ++i) {
+            flood.push_back(Notice(2, static_cast<unsigned char>(4 + i % 200), Code::DEPOSIT_FACTS_UNAVAILABLE));
+        }
+        log.AppendNotices(std::move(flood));
+    }
+    const auto kept{log.NewestNotice(Filled(2), Filled(3))};
+    BOOST_REQUIRE(kept);
+    BOOST_CHECK(kept->code == Code::DROPPED_SEQUENCE_CONSUMED);
+    BOOST_CHECK(kept->origin == Origin::NODE);
+    // The node ring is bounded on its own, oldest first.
+    std::vector<flowmesh::ClientActionNotice> own;
+    for (size_t i{0}; i < flowmesh::CLIENT_NOTICE_CAPACITY; ++i) {
+        own.push_back(Notice(2, 250, Code::STALE_SEQUENCE));
+        own.back().origin = Origin::NODE;
+    }
+    log.AppendNotices(std::move(own));
+    BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(3)));
+    // The newest notice of an action is the last appended, whichever ring
+    // holds it.
+    auto first{Notice(2, 9, Code::STALE_SEQUENCE)};
+    first.origin = Origin::NODE;
+    log.AppendNotices({first, Notice(2, 9, Code::FAR_FUTURE_SEQUENCE)});
+    BOOST_CHECK(log.NewestNotice(Filled(2), Filled(9))->code == Code::FAR_FUTURE_SEQUENCE);
+    auto last{Notice(2, 9, Code::DROPPED_SEQUENCE_CONSUMED)};
+    last.origin = Origin::NODE;
+    log.AppendNotices({last});
+    BOOST_CHECK(log.NewestNotice(Filled(2), Filled(9))->code == Code::DROPPED_SEQUENCE_CONSUMED);
+    BOOST_CHECK(log.NewestNoticeIfNewer(Filled(2), Filled(9))->code == Code::DROPPED_SEQUENCE_CONSUMED);
+    // A new instance clears both rings.
+    log.Reset(Filled(8));
+    BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(9)));
+    BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(250)));
+    BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(4)));
+}
+
 BOOST_AUTO_TEST_CASE(action_wait_interrupt_and_reset_wake_waiters)
 {
     using Kind = flowmesh::ClientEventKind;

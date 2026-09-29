@@ -229,6 +229,27 @@ struct FlowMeshRuntime::Market {
     std::map<uint256, AgreementForward> agreement_forwarded;
 
     FlowMeshActionPool pool;
+    //! ActionIds this node's own wallet RPC or GUI queued (NODE origin), at
+    //! most NODE_ORIGIN_ACTIONS, oldest evicted first. Their worker-recheck
+    //! and pool-drop notices go to the NODE notice ring; every other queued
+    //! local action's go to the PUBLIC ring. Only NODE-origin submissions
+    //! add here, so public API traffic can never fill it.
+    static constexpr size_t NODE_ORIGIN_ACTIONS{1024};
+    std::deque<uint256> node_origin_order;
+    std::set<uint256> node_origin;
+    void NoteNodeOrigin(const uint256& id)
+    {
+        if (!node_origin.insert(id).second) return;
+        node_origin_order.push_back(id);
+        if (node_origin_order.size() > NODE_ORIGIN_ACTIONS) {
+            node_origin.erase(node_origin_order.front());
+            node_origin_order.pop_front();
+        }
+    }
+    flowmesh::ClientNoticeOrigin NoticeOrigin(const uint256& id) const
+    {
+        return node_origin.contains(id) ? flowmesh::ClientNoticeOrigin::NODE : flowmesh::ClientNoticeOrigin::PUBLIC;
+    }
     bool ready{true};
     bool paused{false};
     uint32_t round{0};
@@ -1563,6 +1584,7 @@ bool CommitCertified(Market& market,
         if (const auto bytes{flowmesh::EncodeProductionActionPayload(dropped)}) notice.signed_action_hash = Hash(*bytes);
         notice.code = flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED;
         notice.next_account_sequence = market.state.NextSequence(dropped.signer);
+        notice.origin = market.NoticeOrigin(notice.action_id);
         if (committed_item) {
             if (const auto consumer{FlowMeshRecentCertifiedWindow::ConsumerIn(*committed_item, dropped.signer,
                                                                                dropped.sequence)}) {
@@ -3237,7 +3259,8 @@ std::optional<flowmesh::ClientActionNotice> FlowMeshRuntime::NewestClientNoticeI
 }
 
 FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
-    const flowmesh::MarketId& market_id, const flowmesh::Action& action)
+    const flowmesh::MarketId& market_id, const flowmesh::Action& action,
+    const flowmesh::ClientNoticeOrigin origin)
 {
     FlowMeshLocalSubmitResult out;
     const auto payload{flowmesh::EncodeProductionActionPayload(action)};
@@ -3273,6 +3296,7 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
         if (!pooled) out.admission = DecideLocal(*it->second, action);
         if (out.admission.kind != FlowMeshLocalAdmission::Kind::ENQUEUE) {
             notice = LocalNotice(*it->second, action, out.admission, *payload);
+            notice->origin = origin;
             domain = it->second->domain;
             config_id = it->second->state.ConfigId();
         } else {
@@ -3285,7 +3309,12 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
             trace.seat_set_hash = it->second->seats.set_hash;
             deposits = it->second->deposits;
             // Kept for a facts refusal's notice (built outside the lock).
-            if (action.IsDeposit() && !pooled) notice = LocalNotice(*it->second, action, out.admission, *payload);
+            if (action.IsDeposit() && !pooled) {
+                notice = LocalNotice(*it->second, action, out.admission, *payload);
+                notice->origin = origin;
+            }
+            // Its later worker and drop notices keep this origin's ring.
+            if (origin == flowmesh::ClientNoticeOrigin::NODE) it->second->NoteNodeOrigin(action.Id());
         }
     }
     if (out.admission.kind == FlowMeshLocalAdmission::Kind::ENQUEUE && action.IsDeposit() && !pooled) {
@@ -4584,7 +4613,9 @@ void FlowMeshRuntime::HandleAction(
                 market.client_events.Append(std::move(event));
             }
             // The refusal event (if any) first, so the notice is newer.
-            market.client_events.AppendNotices({LocalNotice(market, *action, admission, message.payload)});
+            auto notice{LocalNotice(market, *action, admission, message.payload)};
+            notice.origin = market.NoticeOrigin(notice.action_id);
+            market.client_events.AppendNotices({std::move(notice)});
             return;
         }
         // An unauthenticated attempt earns no event of its own here: Add

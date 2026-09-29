@@ -259,9 +259,11 @@ public:
                            const flowmesh::Action& action,
                            std::string& error);
     /** The checked submission (FlowMeshRuntime::SubmitLocalActionChecked)
-     * behind the service's own availability gates. */
+     * behind the service's own availability gates. `origin` is NODE only for
+     * this node's own wallet RPC and GUI (see flowmesh::ClientNoticeOrigin). */
     FlowMeshLocalSubmit SubmitLocalActionChecked(const flowmesh::MarketId& market_id,
-                                                 const flowmesh::Action& action);
+                                                 const flowmesh::Action& action,
+                                                 flowmesh::ClientNoticeOrigin origin = flowmesh::ClientNoticeOrigin::PUBLIC);
     //! Current client event log position; nullopt without a runtime.
     std::optional<flowmesh::ClientEventCursor> ClientEventCursor() const;
     FlowMeshSeatKeyStatus SeatKeyStatus() const;
