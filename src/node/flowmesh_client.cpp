@@ -222,14 +222,40 @@ public:
     Receipt Submit(const uint256& id, const flowmesh::Action& action) override
     {
         Receipt out; out.action_id = action.Id();
-        if (!m_service.SubmitLocalAction(id, action, out.reason)) { out.state = "rejected"; return out; }
+        const auto submitted{m_service.SubmitLocalActionChecked(id, action)};
+        if (submitted.refused) { out.state = "rejected"; out.reason = submitted.error; return out; }
+        switch (submitted.admission.kind) {
+        case FlowMeshLocalAdmission::Kind::ENQUEUE: break;
+        case FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED:
+            // Answered from this engine's certified data: never "rejected".
+            out.state = "certified_inclusion";
+            out.microblock_sequence = submitted.admission.included->first;
+            out.microblock_hash = submitted.admission.included->second;
+            out.certificate_verified = true;
+            out.reason = FlowMeshLocalAdmissionText(submitted.admission);
+            return out;
+        case FlowMeshLocalAdmission::Kind::REFUSE:
+            out.state = "rejected";
+            out.reason = FlowMeshLocalAdmissionText(submitted.admission);
+            return out;
+        case FlowMeshLocalAdmission::Kind::UNKNOWN_OUTCOME:
+            out.state = "unknown";
+            out.reason = FlowMeshLocalAdmissionText(submitted.admission);
+            return out;
+        }
         out.state = "queued";
         if (const auto status{m_service.ClientActionStatus(id, action.Id())}) {
             const auto exact{flowmesh::EncodeProductionActionPayload(action)};
-            // A refusal belongs to one exact credential-bearing attempt.
-            // Do not attribute an older attempt's refusal to a new queue item.
-            if (status->kind != flowmesh::ClientEventKind::POOL_REFUSED ||
-                (exact && status->signed_action_hash == Hash(*exact))) out = EventReceipt(*status);
+            // A refusal belongs to one exact credential-bearing attempt, and
+            // to one appended after this attempt was queued: an older
+            // attempt's refusal (or anyone's for the same credential-free
+            // deposit) is never attributed to this queue item.
+            const auto& before{submitted.cursor_before};
+            const auto now{m_service.ClientEventCursor()};
+            const bool this_attempt{exact && status->signed_action_hash == Hash(*exact) && before && now &&
+                                    now->instance_id == before->instance_id &&
+                                    status->event_id > before->event_id};
+            if (status->kind != flowmesh::ClientEventKind::POOL_REFUSED || this_attempt) out = EventReceipt(*status);
         }
         if (out.state == "certified_inclusion") out.certificate_verified = true;
         return out;

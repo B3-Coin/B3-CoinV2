@@ -2207,61 +2207,83 @@ bool FlowMeshService::SubmitLocalAction(const flowmesh::MarketId& market_id,
                                         const flowmesh::Action& action,
                                         std::string& error)
 {
-    if (!m_impl->RulesActiveAtTip()) {
-        error = "FlowMesh service is below its activation height";
+    const auto submitted{SubmitLocalActionChecked(market_id, action)};
+    if (submitted.refused) {
+        error = submitted.error;
         return false;
     }
-    if (!m_impl->ReconciledAtTip()) {
-        error = "FlowMesh service is reconciling the B3 tip";
+    switch (submitted.admission.kind) {
+    case FlowMeshLocalAdmission::Kind::ENQUEUE:
+        return true;
+    case FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED:
+        error = FlowMeshLocalAdmissionText(submitted.admission);
+        return true;
+    case FlowMeshLocalAdmission::Kind::REFUSE:
+    case FlowMeshLocalAdmission::Kind::UNKNOWN_OUTCOME:
+        error = FlowMeshLocalAdmissionText(submitted.admission);
         return false;
     }
+    return false;
+}
+
+std::optional<flowmesh::ClientEventCursor> FlowMeshService::ClientEventCursor() const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (!runtime) return std::nullopt;
+    return runtime->ClientEventCursor();
+}
+
+FlowMeshLocalSubmit FlowMeshService::SubmitLocalActionChecked(const flowmesh::MarketId& market_id,
+                                                              const flowmesh::Action& action)
+{
+    FlowMeshLocalSubmit out;
+    const auto refuse = [&](std::string error) {
+        out.refused = true;
+        out.error = std::move(error);
+        return out;
+    };
+    if (!m_impl->RulesActiveAtTip()) return refuse("FlowMesh service is below its activation height");
+    if (!m_impl->ReconciledAtTip()) return refuse("FlowMesh service is reconciling the B3 tip");
     std::shared_ptr<FlowMeshRuntime> runtime;
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
         if (!m_impl->running || m_impl->stopping || !m_impl->runtime ||
             m_impl->chain_reconciling.load(std::memory_order_acquire)) {
-            error = "FlowMesh service is not running";
-            return false;
+            return refuse("FlowMesh service is not running");
         }
         const auto it{m_impl->markets.find(market_id)};
-        if (it == m_impl->markets.end() || !it->second->ready) {
-            error = "FlowMesh market is not ready";
-            return false;
-        }
+        if (it == m_impl->markets.end() || !it->second->ready) return refuse("FlowMesh market is not ready");
         runtime = m_impl->runtime;
     }
     const auto status{runtime->MarketStatus(market_id)};
     if (!status || m_impl->GenesisNotProduced(market_id) ||
         m_impl->GenesisCheckpointPending(market_id)) {
-        error = "FlowMesh genesis checkpoint is not yet certified and connected";
-        return false;
+        return refuse("FlowMesh genesis checkpoint is not yet certified and connected");
     }
-    const flowmesh::QueueResult result{
-        runtime->SubmitLocalAction(market_id, action)};
-    if (result != flowmesh::QueueResult::ACCEPTED) {
-        switch (result) {
-        case flowmesh::QueueResult::MALFORMED:
-            error = "FlowMesh action is malformed";
-            break;
-        case flowmesh::QueueResult::RATE_LIMITED:
-            error = "FlowMesh action is rate limited";
-            break;
-        case flowmesh::QueueResult::PEER_LIMIT:
-        case flowmesh::QueueResult::MARKET_LIMIT:
-        case flowmesh::QueueResult::GLOBAL_LIMIT:
-            error = "FlowMesh action queue is full or unavailable";
-            break;
-        case flowmesh::QueueResult::RECONCILING:
-            error = "FlowMesh action admission is waiting for B3 reconciliation";
-            break;
-        case flowmesh::QueueResult::STOPPED:
-            error = "FlowMesh service is stopped";
-            break;
-        case flowmesh::QueueResult::ACCEPTED: break;
-        }
-        return false;
+    const auto submitted{runtime->SubmitLocalActionChecked(market_id, action)};
+    out.admission = submitted.admission;
+    out.cursor_before = submitted.cursor_before;
+    if (!submitted.queued || *submitted.queued == flowmesh::QueueResult::ACCEPTED) return out;
+    switch (*submitted.queued) {
+    case flowmesh::QueueResult::MALFORMED:
+        return refuse("FlowMesh action is malformed");
+    case flowmesh::QueueResult::RATE_LIMITED:
+        return refuse("FlowMesh action is rate limited");
+    case flowmesh::QueueResult::PEER_LIMIT:
+    case flowmesh::QueueResult::MARKET_LIMIT:
+    case flowmesh::QueueResult::GLOBAL_LIMIT:
+        return refuse("FlowMesh action queue is full or unavailable");
+    case flowmesh::QueueResult::RECONCILING:
+        return refuse("FlowMesh action admission is waiting for B3 reconciliation");
+    case flowmesh::QueueResult::STOPPED:
+        return refuse("FlowMesh service is stopped");
+    case flowmesh::QueueResult::ACCEPTED: break;
     }
-    return true;
+    return out;
 }
 
 FlowMeshSeatKeyStatus FlowMeshService::SeatKeyStatus() const

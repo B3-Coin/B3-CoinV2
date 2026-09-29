@@ -119,6 +119,18 @@ struct FlowMeshServiceTransport {
     bool IndependentEnabled() const { return mode == "independent" || mode == "dual"; }
 };
 
+/** Result of one local submission through the service. */
+struct FlowMeshLocalSubmit {
+    //! Refused before a decision or by the queue (not running, reconciling,
+    //! rate limited, full): `error` says why; nothing was admitted.
+    bool refused{false};
+    std::string error;
+    //! Meaningful when !refused.
+    FlowMeshLocalAdmission admission;
+    //! Event log position just before the enqueue (ENQUEUE only).
+    std::optional<flowmesh::ClientEventCursor> cursor_before;
+};
+
 /**
  * One production FlowMesh service owns execution and durable signing history.
  * It remains dormant unless the complete A2/A3 schedule is pinned. Legacy B3
@@ -206,9 +218,17 @@ public:
         const std::function<bool()>& interrupted) const;
     void WakeClientWaiters() const;
 
+    /** Bool fallback: true only when the action was queued or is already
+     * included in a certified microblock; `error` explains anything else. */
     bool SubmitLocalAction(const flowmesh::MarketId& market_id,
                            const flowmesh::Action& action,
                            std::string& error);
+    /** The checked submission (FlowMeshRuntime::SubmitLocalActionChecked)
+     * behind the service's own availability gates. */
+    FlowMeshLocalSubmit SubmitLocalActionChecked(const flowmesh::MarketId& market_id,
+                                                 const flowmesh::Action& action);
+    //! Current client event log position; nullopt without a runtime.
+    std::optional<flowmesh::ClientEventCursor> ClientEventCursor() const;
     FlowMeshSeatKeyStatus SeatKeyStatus() const;
     //! For tests: how often the seat transition's memos were consulted and
     //! how often they had to recompute.

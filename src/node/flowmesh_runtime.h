@@ -11,6 +11,7 @@
 #include <node/flowmesh_delivery.h>
 #include <node/flowmesh_agreement.h>
 #include <node/flowmesh_health.h>
+#include <node/flowmesh_local_admission.h>
 #include <node/flowmesh_production_store.h>
 
 #include <atomic>
@@ -283,6 +284,9 @@ struct FlowMeshRuntimeConfig {
     //! At least one minute; global probe pacing remains one request per second.
     std::chrono::milliseconds legacy_probe_interval{std::chrono::seconds{60}};
     std::function<void(uint64_t)> cancel_delivery;
+    //! Memory-only retention of recent certified entries per market. The
+    //! defaults are the production bounds; tests may only lower them.
+    FlowMeshRecentWindowLimits recent_window{};
 };
 
 struct FlowMeshRuntimeMarketStatus {
@@ -433,6 +437,16 @@ struct FlowMeshClientOutcomeParts {
     std::shared_ptr<const ProductionOutcomeRecord> outcome;
 };
 
+/** One local API/RPC submission: the certified-state decision and, only when
+ * that decision is ENQUEUE, the bounded queue's verdict. */
+struct FlowMeshLocalSubmitResult {
+    std::optional<flowmesh::QueueResult> queued;
+    FlowMeshLocalAdmission admission;
+    //! The client event log position just before the enqueue. A refusal
+    //! event at or before it belongs to an earlier attempt, not this one.
+    std::optional<flowmesh::ClientEventCursor> cursor_before;
+};
+
 /** Certificate, state, status and reported history captured at one head. */
 struct FlowMeshClientSnapshotView {
     flowmesh::ClientStateEvidence evidence;
@@ -495,6 +509,21 @@ public:
      */
     flowmesh::QueueResult SubmitLocalAction(
         const flowmesh::MarketId& market_id, const flowmesh::Action& action);
+    /**
+     * The same admission, first decided against this node's certified state
+     * in the same market-lock scope (FlowMeshDecideLocalAdmission). Only an
+     * ENQUEUE decision reaches the queue. Any other decision appends no v1
+     * event; an authenticated attempt (pure Schnorr, outside the market
+     * lock; a deposit is its outpoint fact) gets a local notice. Never
+     * applied to remote frames, proposals or certified entries.
+     */
+    FlowMeshLocalSubmitResult SubmitLocalActionChecked(
+        const flowmesh::MarketId& market_id, const flowmesh::Action& action);
+    //! Current position of the client event log (a cheap leaf-lock read).
+    flowmesh::ClientEventCursor ClientEventCursor() const;
+    //! The newest local notice for this exact action, if retained.
+    std::optional<flowmesh::ClientActionNotice> NewestClientNotice(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
     std::optional<FlowMeshRuntimeMarketStatus> MarketStatus(
         const flowmesh::MarketId& market_id) const;

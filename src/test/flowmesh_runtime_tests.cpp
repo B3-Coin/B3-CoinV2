@@ -835,6 +835,7 @@ public:
         config.keys = &keys[i];
         config.clock = &clocks[i];
         config.round_timeout = round_timeout;
+        config.recent_window = recent_window;
         config.relay = [this, i](node::FlowMeshRuntimeRelay relay) {
             if (block_commits && (relay.message.kind == flowmesh::WireMessageKind::ATTESTATION ||
                                  relay.message.kind == flowmesh::WireMessageKind::PROPOSAL)) ++premature_v1;
@@ -930,6 +931,8 @@ public:
     // Optional observer run while every worker is idle, e.g. to read each
     // bounded delivery-event ring before it can wrap.
     std::function<void()> after_drain;
+    // Applied by StartNode; tests restart a node to lower it.
+    node::FlowMeshRecentWindowLimits recent_window{};
     Fmn2LinkModel links{Count};
     const uint256 domain{Filled(0x2e)};
     const modern::AssetId asset{Filled(0x4e)};
@@ -8506,11 +8509,16 @@ BOOST_AUTO_TEST_CASE(preagreement_local_queued_action_survives_certified_head_ad
                 *flowmesh::EncodeProductionActionPayload(Deposit(f.outpoint))}}) {
         const auto action{flowmesh::DecodeProductionActionPayload(replay.payload)};
         BOOST_REQUIRE(action);
+        const auto before{f.runtimes[0]->ClientEventCursor()};
         BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(local_peer, replay) == flowmesh::QueueResult::ACCEPTED);
         f.Drain();
-        const auto attempts{f.runtimes[0]->ClientEvents(std::nullopt, f.market, std::nullopt).events};
-        BOOST_CHECK(std::any_of(attempts.begin(), attempts.end(), [&](const auto& event) {
-            return event.kind == flowmesh::ClientEventKind::POOL_REFUSED && event.action_id == action->Id();
+        // A local resend of an already-executed action is answered by its
+        // certified inclusion: no refusal event that could later read as
+        // "rejected" once the inclusion event leaves the ring, no admission.
+        const auto attempts{f.runtimes[0]->ClientEvents(before, f.market, std::nullopt).events};
+        BOOST_CHECK(std::none_of(attempts.begin(), attempts.end(), [&](const auto& event) {
+            return event.action_id == action->Id() && (event.kind == flowmesh::ClientEventKind::POOL_REFUSED ||
+                                                       event.kind == flowmesh::ClientEventKind::POOL_ADMITTED);
         }));
         const auto status{f.runtimes[0]->ClientActionStatus(f.market, action->Id())};
         BOOST_REQUIRE(status);
@@ -9181,6 +9189,233 @@ BOOST_AUTO_TEST_CASE(pool_events_carry_memory_only_reason_codes_with_unchanged_t
     BOOST_CHECK(refused->reason_code == flowmesh::ActionReasonCode::UNAUTHENTICATED);
     // Only the one valid action is pooled.
     BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 1U);
+}
+
+namespace {
+//! Tick the harness until `done` holds (bounded).
+template <typename Harness>
+bool Settle(Harness& f, const std::function<bool()>& done)
+{
+    for (size_t attempt{0}; attempt < 16 && !done(); ++attempt) f.Tick(std::chrono::seconds{2});
+    return done();
+}
+
+flowmesh::Action SignedAction(const CKey& key, const uint256& domain, const uint256& config, uint64_t sequence,
+                              flowmesh::ActionType type)
+{
+    flowmesh::Action action;
+    action.signer = flowmesh::AccountForKey(XOnlyPubKey{key.GetPubKey()});
+    action.sequence = sequence;
+    action.type = static_cast<uint8_t>(type);
+    if (type == flowmesh::ActionType::WITHDRAW) {
+        action.asset = modern::NativeAsset();
+        action.amount = 1;
+        action.destination = Filled(0xd9);
+    }
+    BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, action));
+    return action;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(local_submit_answers_from_certified_state_and_notices_only_authenticated)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_submit_certified_state"};
+    f.block_commits = false;
+    f.Reach(1);
+    CKey key;
+    key.MakeNewKey(true);
+    const auto config{f.initial.ConfigId()};
+    const auto consumer{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_ASK)};
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, consumer) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(Settle(f, [&] {
+        const auto state{f.runtimes[0]->StateSnapshot(f.market)};
+        return state && state->DepositConsumed(f.outpoint) && state->NextSequence(consumer.signer) == 1;
+    }));
+    f.Drain();
+    f.block_commits = true; // nothing below may certify
+    auto& runtime{*f.runtimes[0]};
+    const auto inclusion{runtime.ClientRecentInclusion(f.market, consumer.Id())};
+    BOOST_REQUIRE(inclusion);
+    const auto events_before{runtime.ClientEventCursor()};
+    const auto pending_before{runtime.MarketStatus(f.market)->pending_actions};
+
+    // Resubmitting the executed action answers with its certified inclusion.
+    const auto again{runtime.SubmitLocalActionChecked(f.market, consumer)};
+    BOOST_CHECK(!again.queued);
+    BOOST_CHECK(again.admission.kind == node::FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED);
+    BOOST_REQUIRE(again.admission.included);
+    BOOST_CHECK(*again.admission.included == *inclusion);
+    BOOST_CHECK(runtime.SubmitLocalAction(f.market, consumer) == flowmesh::QueueResult::ACCEPTED);
+    const auto deposit_again{runtime.SubmitLocalActionChecked(f.market, Deposit(f.outpoint))};
+    BOOST_CHECK(deposit_again.admission.kind == node::FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED);
+
+    // A different action for the consumed sequence is refused, naming X.
+    const auto loser{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_BID)};
+    const auto refused{runtime.SubmitLocalActionChecked(f.market, loser)};
+    BOOST_CHECK(!refused.queued);
+    BOOST_CHECK(refused.admission.kind == node::FlowMeshLocalAdmission::Kind::REFUSE);
+    BOOST_CHECK(refused.admission.code == flowmesh::ActionReasonCode::STALE_SEQUENCE);
+    BOOST_REQUIRE(refused.admission.consumer);
+    BOOST_CHECK(refused.admission.consumer->action_id == consumer.Id());
+    BOOST_CHECK_EQUAL(refused.admission.consumer->microblock_sequence, inclusion->first);
+    BOOST_CHECK(refused.admission.consumer->microblock_hash == inclusion->second);
+    const auto notice{runtime.NewestClientNotice(f.market, loser.Id())};
+    BOOST_REQUIRE(notice);
+    BOOST_CHECK(notice->code == flowmesh::ActionReasonCode::STALE_SEQUENCE);
+    BOOST_REQUIRE(notice->consumed_by);
+    BOOST_CHECK(notice->consumed_by->action_id == consumer.Id());
+    BOOST_CHECK_EQUAL(notice->next_account_sequence, 1U);
+
+    // notice_only_for_authenticated_attempts: a forged stale attempt gets
+    // the same decision but no notice.
+    auto forged{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::WITHDRAW)};
+    forged.credential.back() ^= 1;
+    BOOST_CHECK(runtime.SubmitLocalActionChecked(f.market, forged).admission.kind ==
+                node::FlowMeshLocalAdmission::Kind::REFUSE);
+    BOOST_CHECK(!runtime.NewestClientNotice(f.market, forged.Id()));
+
+    // The local window: next+64 queues, next+65 is refused.
+    const auto edge{SignedAction(key, f.domain, config, 1 + 64, flowmesh::ActionType::CANCEL_ASK)};
+    const auto edge_result{runtime.SubmitLocalActionChecked(f.market, edge)};
+    BOOST_CHECK(edge_result.queued && *edge_result.queued == flowmesh::QueueResult::ACCEPTED);
+    const auto far{SignedAction(key, f.domain, config, 1 + 65, flowmesh::ActionType::CANCEL_ASK)};
+    const auto far_result{runtime.SubmitLocalActionChecked(f.market, far)};
+    BOOST_CHECK(!far_result.queued);
+    BOOST_CHECK(far_result.admission.code == flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE);
+    f.Drain();
+
+    // None of the answered attempts appended a v1 event or reached the pool;
+    // only the queued next+64 action did.
+    const auto events{runtime.ClientEvents(events_before, f.market, std::nullopt).events};
+    for (const auto& event : events) {
+        BOOST_CHECK(event.action_id == edge.Id());
+    }
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, pending_before + 1);
+}
+
+BOOST_AUTO_TEST_CASE(local_queued_stale_frame_refused_by_worker_with_consumer_then_notice)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_worker_recheck"};
+    f.block_commits = false;
+    f.Reach(1);
+    CKey key;
+    key.MakeNewKey(true);
+    const auto config{f.initial.ConfigId()};
+    const auto consumer{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_ASK)};
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, consumer) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain();
+    f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    // A local frame queued before the consumer certified reaches the worker
+    // after it: the worker's authoritative recheck refuses it by name.
+    const auto loser{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_BID)};
+    const auto payload{flowmesh::EncodeProductionActionPayload(loser)};
+    const auto local_peer{std::numeric_limits<flowmesh::WirePeerId>::min()};
+    const auto before{runtime.ClientEventCursor()};
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(local_peer, {flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *payload}) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    const auto events{runtime.ClientEvents(before, f.market, std::nullopt).events};
+    BOOST_REQUIRE_EQUAL(events.size(), 1U);
+    BOOST_CHECK(events.front().kind == flowmesh::ClientEventKind::POOL_REFUSED);
+    BOOST_CHECK_EQUAL(events.front().reason, "account sequence already used by another certified action; this attempt was not admitted");
+    BOOST_CHECK(events.front().reason_code == flowmesh::ActionReasonCode::STALE_SEQUENCE);
+    BOOST_REQUIRE(events.front().consumed_by);
+    BOOST_CHECK(events.front().consumed_by->action_id == consumer.Id());
+    const auto notice{runtime.NewestClientNotice(f.market, loser.Id())};
+    BOOST_REQUIRE(notice);
+    BOOST_CHECK_GE(notice->after_event_id, events.front().event_id); // the event first, then the notice
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(local_stale_without_retained_consumer_is_unknown_not_rejected)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_stale_unattributed", std::chrono::seconds{10}, 3};
+    f.block_commits = false;
+    f.recent_window.payload_entries = 1;
+    f.recent_window.outcome_entries = 1;
+    f.StopNode(0);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.StartNode(0, f.AgreementPath(0), std::nullopt, error), error);
+    f.Reach(1);
+    CKey key;
+    key.MakeNewKey(true);
+    const auto config{f.initial.ConfigId()};
+    const auto consumer{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_ASK)};
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, consumer) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    // Two later entries push the consumer out of node zero's small window.
+    for (uint32_t n{1}; n <= 2; ++n) {
+        BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(COutPoint{f.outpoint.hash, n})) ==
+                      flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(Settle(f, [&] { return f.AllAt(2 + n); }));
+    }
+    f.Drain();
+    f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    BOOST_CHECK(!runtime.ClientRecentInclusion(f.market, consumer.Id()));
+    const auto loser{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_BID)};
+    const auto before{runtime.ClientEventCursor()};
+    const auto decision{runtime.SubmitLocalActionChecked(f.market, loser)};
+    BOOST_CHECK(!decision.queued);
+    BOOST_CHECK(decision.admission.kind == node::FlowMeshLocalAdmission::Kind::UNKNOWN_OUTCOME);
+    BOOST_CHECK(decision.admission.code == flowmesh::ActionReasonCode::STALE_SEQUENCE_UNATTRIBUTED);
+    BOOST_CHECK(runtime.ClientEvents(before, f.market, std::nullopt).events.empty()); // no v1 event
+    BOOST_REQUIRE(runtime.NewestClientNotice(f.market, loser.Id()));
+    // The executed action itself is still answered from the event ring.
+    BOOST_CHECK(runtime.SubmitLocalActionChecked(f.market, consumer).admission.kind ==
+                node::FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED);
+}
+
+BOOST_AUTO_TEST_CASE(remote_frames_have_no_local_sequence_window)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "remote_no_local_window"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true;
+    CKey key;
+    key.MakeNewKey(true);
+    const auto config{f.initial.ConfigId()};
+    // remote_frame_at_next_plus_1023_still_admitted: a relayed action far
+    // beyond the local window is pooled exactly as before.
+    const auto far{SignedAction(key, f.domain, config, 1023, flowmesh::ActionType::CANCEL_ASK)};
+    const flowmesh::WireHeader header{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1};
+    BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(2, {flowmesh::WireMessageKind::ACTION, header,
+        *flowmesh::EncodeProductionActionPayload(far)}) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 1U);
+    BOOST_CHECK(!f.runtimes[0]->NewestClientNotice(f.market, far.Id()));
+
+    // A contiguous run far beyond 64, relayed to every node, is proposed,
+    // validated by followers and certified: proposal evidence has no window.
+    // Commits stay blocked while the run is relayed at one head.
+    constexpr uint64_t RUN{100};
+    for (uint64_t n{0}; n < RUN; ++n) {
+        const auto action{SignedAction(key, f.domain, config, n, flowmesh::ActionType::CANCEL_ASK)};
+        const auto payload{flowmesh::EncodeProductionActionPayload(action)};
+        for (size_t i{0}; i < f.runtimes.size(); ++i) {
+            const auto status{f.runtimes[i]->MarketStatus(f.market)};
+            BOOST_REQUIRE(f.runtimes[i]->EnqueueWireMessage(static_cast<flowmesh::WirePeerId>(10 + n % 8), {
+                flowmesh::WireMessageKind::ACTION,
+                {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, status->next_sequence},
+                *payload}) == flowmesh::QueueResult::ACCEPTED);
+        }
+    }
+    f.Drain();
+    for (const auto& runtime : f.runtimes) BOOST_CHECK_EQUAL(runtime->MarketStatus(f.market)->pending_actions, RUN + 1);
+    f.block_commits = false;
+    const bool settled{Settle(f, [&] {
+        for (const auto& runtime : f.runtimes) {
+            const auto state{runtime->StateSnapshot(f.market)};
+            if (!state || state->NextSequence(far.signer) != RUN) return false;
+        }
+        return true;
+    })};
+    BOOST_REQUIRE(settled);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

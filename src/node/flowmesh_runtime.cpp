@@ -189,6 +189,7 @@ struct FlowMeshRuntime::Market {
     //! This runtime's own most recent certified entries and re-execution
     //! records (memory only; see FlowMeshRecentCertifiedWindow).
     FlowMeshRecentCertifiedWindow recent;
+    FlowMeshRecentWindowLimits recent_limits;
     flowmesh::ClientEventLog& client_events;
     std::optional<int64_t> local_observed_at;
     FlowMeshProductionStore* store{nullptr};
@@ -269,7 +270,8 @@ struct FlowMeshRuntime::Market {
           next_sequence{config.next_sequence},
           next_effect_index{config.next_effect_index},
           last_hash{config.last_microblock_hash},
-          certified_state_root{config.state.Root()}, client_events{events}, store{config.store},
+          certified_state_root{config.state.Root()}, recent_limits{runtime_config.recent_window},
+          client_events{events}, store{config.store},
           deposits{config.deposits}, chain{runtime_config.chain},
           keys{runtime_config.keys}, clock{runtime_config.clock},
           relay{&runtime_config.relay},
@@ -1341,6 +1343,31 @@ void ClientActionEvent(Market& market, const flowmesh::ClientEventKind kind,
 }
 
 template <typename Market>
+FlowMeshLocalAdmission DecideLocal(const Market& market, const flowmesh::Action& action)
+{
+    return FlowMeshDecideLocalAdmission(market.state, market.recent,
+                                        market.client_events.ActionStatus(market.market_id, action.Id()), action);
+}
+
+template <typename Market>
+flowmesh::ClientActionNotice LocalNotice(const Market& market, const flowmesh::Action& action,
+                                         const FlowMeshLocalAdmission& admission,
+                                         const std::span<const unsigned char> payload)
+{
+    flowmesh::ClientActionNotice notice;
+    notice.market_id = market.market_id;
+    notice.action_id = action.Id();
+    notice.account_id = action.signer;
+    notice.account_sequence = action.sequence;
+    notice.action_type = action.type;
+    notice.signed_action_hash = Hash(payload);
+    notice.code = admission.code;
+    notice.next_account_sequence = admission.next_account_sequence;
+    notice.consumed_by = admission.consumer;
+    return notice;
+}
+
+template <typename Market>
 bool CertifiedAnchorReconciliationInterrupted(
     Market& market, const flowmesh::ProductionEntryCore& entry,
     const uint64_t delivery_generation)
@@ -1496,7 +1523,7 @@ bool CommitCertified(Market& market,
     if (outcome && outcome->sequence == certified.entry.sequence && outcome->entry_hash == market.last_hash) {
         recent_item.outcome = std::move(outcome);
     }
-    market.recent.Push(std::move(recent_item), {}, recent_others.first, recent_others.second);
+    market.recent.Push(std::move(recent_item), market.recent_limits, recent_others.first, recent_others.second);
     market.client_events.Append(std::move(committed_events));
     market.local_observed_at = GetTime();
     ++market.next_sequence;
@@ -2328,7 +2355,7 @@ bool FlowMeshRuntime::InitializeMarket(
         }
         // Rebuild the recent window from the reads this loop already makes:
         // envelopes for the newest entries, bare items for the outcome tail.
-        const FlowMeshRecentWindowLimits limits;
+        const FlowMeshRecentWindowLimits& limits{market->recent_limits};
         if (config.next_sequence - sequence <= std::max(limits.payload_entries, limits.outcome_entries)) {
             FlowMeshRecentCertifiedWindow::Item item;
             item.sequence = sequence;
@@ -3150,10 +3177,38 @@ std::vector<flowmesh::MarketId> FlowMeshRuntime::MarketIds() const
 flowmesh::QueueResult FlowMeshRuntime::SubmitLocalAction(
     const flowmesh::MarketId& market_id, const flowmesh::Action& action)
 {
+    const auto result{SubmitLocalActionChecked(market_id, action)};
+    if (result.queued) return *result.queued;
+    // Answered from certified state without queueing: an exact inclusion is
+    // an accepted submission; a refusal or unknown outcome is not.
+    return result.admission.kind == FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED
+               ? flowmesh::QueueResult::ACCEPTED : flowmesh::QueueResult::MARKET_LIMIT;
+}
+
+flowmesh::ClientEventCursor FlowMeshRuntime::ClientEventCursor() const
+{
+    return m_client_events.Cursor();
+}
+
+std::optional<flowmesh::ClientActionNotice> FlowMeshRuntime::NewestClientNotice(
+    const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    return m_client_events.NewestNotice(market_id, action_id);
+}
+
+FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
+    const flowmesh::MarketId& market_id, const flowmesh::Action& action)
+{
+    FlowMeshLocalSubmitResult out;
     const auto payload{flowmesh::EncodeProductionActionPayload(action)};
-    if (!payload) return flowmesh::QueueResult::MALFORMED;
+    if (!payload) {
+        out.queued = flowmesh::QueueResult::MALFORMED;
+        return out;
+    }
     flowmesh::WireMessage message;
     TraceContext trace;
+    std::optional<flowmesh::ClientActionNotice> notice;
+    uint256 domain, config_id;
     {
         FlowMeshTimingSpan timing_lock_3034{__func__};
         timing_lock_3034.Field("lock_name", std::string{"market_mutex"});
@@ -3163,19 +3218,41 @@ flowmesh::QueueResult FlowMeshRuntime::SubmitLocalAction(
         const auto it{m_markets.find(market_id)};
         if (it == m_markets.end() || !it->second->ready ||
             it->second->halt != FlowMeshRuntimeHalt::NONE) {
-            return flowmesh::QueueResult::MARKET_LIMIT;
+            out.queued = flowmesh::QueueResult::MARKET_LIMIT;
+            return out;
         }
-        message.kind = flowmesh::WireMessageKind::ACTION;
-        message.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market_id,
-                          it->second->seats.epoch,
-                          it->second->next_sequence};
-        message.payload = *payload;
-        trace.epoch = message.header.epoch;
-        trace.seat_set_hash = it->second->seats.set_hash;
+        // Decided in the existing first lock scope, before anything is
+        // queued: no extra lock and no Schnorr work under this mutex.
+        out.admission = DecideLocal(*it->second, action);
+        if (out.admission.kind != FlowMeshLocalAdmission::Kind::ENQUEUE) {
+            notice = LocalNotice(*it->second, action, out.admission, *payload);
+            domain = it->second->domain;
+            config_id = it->second->state.ConfigId();
+        } else {
+            message.kind = flowmesh::WireMessageKind::ACTION;
+            message.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market_id,
+                              it->second->seats.epoch,
+                              it->second->next_sequence};
+            message.payload = *payload;
+            trace.epoch = message.header.epoch;
+            trace.seat_set_hash = it->second->seats.set_hash;
+        }
+    }
+    if (notice) {
+        // Answered from certified state: nothing is queued, relayed or
+        // pooled, and no v1 event is appended (queue refusals append none
+        // either). Only an authenticated attempt earns a notice; a deposit's
+        // own outpoint fact is the observation.
+        if (action.IsDeposit() || flowmesh::CheckProductionActionCredential(action, domain, config_id, market_id)) {
+            m_client_events.AppendNotices({std::move(*notice)});
+        }
+        return out;
     }
     trace.wire_hash = WireTrace(message).wire_hash;
     const uint64_t sequence{message.header.sequence};
+    out.cursor_before = m_client_events.Cursor();
     const auto result{EnqueueWireMessage(LOCAL_ACTION_PEER, std::move(message))};
+    out.queued = result;
     trace.observed_monotonic_us = TraceNow(*m_config.clock);
     // Preserve submission's original lock scope. This is the observed push
     // result, not an atomic queue timestamp: worker events may precede this
@@ -3198,7 +3275,7 @@ flowmesh::QueueResult FlowMeshRuntime::SubmitLocalAction(
                               action, "bounded runtime queue only; pool admission is pending");
         }
     }
-    return result;
+    return out;
 }
 
 std::optional<FlowMeshRuntimeMarketStatus> FlowMeshRuntime::MarketStatus(
@@ -4368,6 +4445,37 @@ void FlowMeshRuntime::HandleAction(
     }
     const auto action{flowmesh::DecodeProductionActionPayload(message.payload)};
     if (!action) return;
+    if (local) {
+        // An exact duplicate keeps today's answer, whatever its header.
+        if (market.pool.ContainsExact(*action)) {
+            ClientActionEvent(market, flowmesh::ClientEventKind::POOL_ADMITTED, *action,
+                              "exact signed action already present in pool", nullptr,
+                              flowmesh::ActionReasonCode::DUPLICATE_PENDING);
+            return;
+        }
+        // Authoritative recheck of the submit-time decision: state may have
+        // advanced while this frame was queued. It runs before the header
+        // prologue's inclusion and pending-state refusals, so a frame whose
+        // own attempt was certified while it waited is never refused.
+        const auto admission{DecideLocal(market, *action)};
+        if (admission.kind == FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED) return; // its inclusion event exists
+        if (admission.kind != FlowMeshLocalAdmission::Kind::ENQUEUE && AuthenticateAction(market, *action)) {
+            if (admission.kind == FlowMeshLocalAdmission::Kind::REFUSE) {
+                auto event{MakeClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action,
+                    admission.code == flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE
+                        ? "account sequence is more than 64 beyond the certified next sequence; this attempt was not admitted"
+                        : "account sequence already used by another certified action; this attempt was not admitted",
+                    nullptr, admission.code)};
+                event.consumed_by = admission.consumer;
+                market.client_events.Append(std::move(event));
+            }
+            // The refusal event (if any) first, so the notice is newer.
+            market.client_events.AppendNotices({LocalNotice(market, *action, admission, message.payload)});
+            return;
+        }
+        // An unauthenticated attempt earns no event of its own here: Add
+        // below refuses it with the existing text.
+    }
     const bool refresh_local_header{local && message.header.sequence < market.next_sequence};
     if (refresh_local_header) {
         // SubmitLocalAction captures its wrapper before taking the bounded

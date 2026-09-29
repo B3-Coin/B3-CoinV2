@@ -32,6 +32,11 @@ struct StateFunding {
     {
         state.AdvanceSequence(signer, next);
     }
+    static bool CreditDeposit(FlowMeshState& state, const COutPoint& outpoint, const AccountId& account,
+                              const AssetId& asset, const CAmount amount)
+    {
+        return state.CreditDeposit(outpoint, account, asset, amount);
+    }
 };
 
 struct SigningBridge {
