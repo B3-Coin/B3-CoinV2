@@ -7,6 +7,7 @@
 #include <univalue.h>
 #include <QString>
 #include <functional>
+#include <optional>
 #include <vector>
 
 namespace B3FlowMeshTrading {
@@ -34,13 +35,39 @@ struct Action {
     UniValue effect;
 };
 struct Request { std::string method; UniValue params{UniValue::VARR}; };
+//! A verified per-action outcome as the local RPC reports it (never an
+//! endpoint claim: the node strips any outcome it did not verify).
+struct Outcome {
+    //! applied | rejected | included_not_executed | not_executed
+    QString status, reason_code, reason_text, evidence, microblock_hash;
+    bool final{false};
+    uint64_t microblock_sequence{0};
+    struct Fill {
+        QString side;
+        bool cleared{false}, superseded_in_entry{false};
+        CAmount quantity{0}, price{0}, quote_atoms{0}, fee_atoms{0}, net_quote_atoms{0};
+    };
+    std::optional<Fill> fill;
+    std::optional<CAmount> withdrawal_amount, deposit_amount;
+    QString consumed_by;
+    uint64_t consumed_in_sequence{0};
+};
 struct Receipt {
     QString action_id, state, reason, endpoint, microblock_hash, market, account;
+    //! Display only: a reason name (unknown names are shown as unrecognised
+    //! and never treated as terminal) and the backend's stage label.
+    QString reason_code, stage;
     bool certificate_verified{false}, outcome_verified{false};
     //! Sticky local history, distinct from fresh certificate verification.
     bool no_resubmit{false};
     uint64_t microblock_sequence{0};
+    //! Present exactly when outcome_verified.
+    std::optional<Outcome> outcome;
     bool Included() const { return state == QStringLiteral("certified_inclusion") && certificate_verified; }
+    //! A verified outcome that can never change.
+    bool Terminal() const { return outcome_verified && outcome && outcome->final; }
+    //! Proven never to execute: a different certified action used its sequence.
+    bool NotExecuted() const { return outcome_verified && outcome && outcome->status == QStringLiteral("not_executed"); }
 };
 struct SavedAction {
     struct Point { CAmount price{0}, quantity{0}; bool operator==(const Point&) const = default; };
@@ -76,6 +103,9 @@ B3AssetTransfer::Prepared ParsePrepared(const UniValue& value, const Action& act
 void CheckActionResult(const UniValue& value, const Action& action);
 Receipt ParseReceipt(const UniValue& value, const QString& market, const QString& expected_action = {});
 QString DescribeReceipt(const Receipt& receipt);
+//! Strict parse of a verified outcome object (fails closed).
+Outcome ParseOutcome(const UniValue& value);
+QString DescribeOutcome(const Outcome& outcome);
 SavedActions ParseSavedActions(const UniValue& value);
 //! Metadata enrichment is optional and must be bound to the exact market by
 //! the caller. The canonical side and raw points remain independently visible.

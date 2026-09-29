@@ -122,6 +122,96 @@ private Q_SLOTS:
         v.pushKV("accepted", false); QVERIFY(Rejected([&] { ParseReceipt(v, a.market.id); }));
         v.pushKV("accepted", true); v.pushKV("receipt_state", "filled"); QVERIFY(Rejected([&] { ParseReceipt(v, a.market.id); }));
     }
+    void parseReceiptOutcomeStrict()
+    {
+        const auto a{Order()};
+        UniValue v{UniValue::VOBJ};
+        v.pushKV("market_id", a.market.id.toStdString()); v.pushKV("action_id", H(8).GetHex());
+        v.pushKV("accepted", true); v.pushKV("receipt_state", "certified_inclusion"); v.pushKV("reason", "");
+        v.pushKV("endpoint", ""); v.pushKV("certificate_verified", true); v.pushKV("outcome_verified", true);
+        v.pushKV("microblock_hash", H(9).GetHex()); v.pushKV("microblock_sequence", 3);
+        v.pushKV("reason_code", "APPLIED"); v.pushKV("stage", "outcome_verified");
+        UniValue outcome{UniValue::VOBJ};
+        outcome.pushKV("status", "applied"); outcome.pushKV("final", true); outcome.pushKV("reason_code", "APPLIED");
+        outcome.pushKV("reason_text", "Executed in a certified batch."); outcome.pushKV("evidence", "certified_result_preimage");
+        outcome.pushKV("microblock_sequence", 3); outcome.pushKV("microblock_hash", H(9).GetHex());
+        UniValue fill{UniValue::VOBJ};
+        fill.pushKV("side", "bid"); fill.pushKV("cleared", true); fill.pushKV("superseded_in_entry", false);
+        fill.pushKV("quantity", 5); fill.pushKV("price", 1230); fill.pushKV("quote_atoms", 6150); fill.pushKV("fee_atoms", 0);
+        fill.pushKV("net_quote_atoms", 6150);
+        outcome.pushKV("fill", fill);
+        v.pushKV("outcome", outcome);
+        const auto r{ParseReceipt(v, a.market.id)};
+        QVERIFY(r.Included()); QVERIFY(r.outcome); QVERIFY(r.Terminal()); QVERIFY(!r.NotExecuted());
+        QCOMPARE(r.stage, QStringLiteral("outcome_verified")); QCOMPARE(r.reason_code, QStringLiteral("APPLIED"));
+        QCOMPARE(r.outcome->fill->quantity, CAmount{5});
+        // The flag and the object must agree, and the outcome must belong to
+        // the verified including entry.
+        auto flagless{v}; flagless.pushKV("outcome_verified", false); QVERIFY(Rejected([&] { ParseReceipt(flagless, a.market.id); }));
+        auto objectless{v}; objectless.pushKV("outcome", UniValue{}); QVERIFY(Rejected([&] { ParseReceipt(objectless, a.market.id); }));
+        auto other{v}; auto moved{outcome}; moved.pushKV("microblock_hash", H(10).GetHex()); other.pushKV("outcome", moved);
+        QVERIFY(Rejected([&] { ParseReceipt(other, a.market.id); }));
+        auto admitted{v}; admitted.pushKV("receipt_state", "admitted"); admitted.pushKV("certificate_verified", false);
+        QVERIFY(Rejected([&] { ParseReceipt(admitted, a.market.id); }));
+        auto status{v}; auto unknown_status{outcome}; unknown_status.pushKV("status", "filled"); status.pushKV("outcome", unknown_status);
+        QVERIFY(Rejected([&] { ParseReceipt(status, a.market.id); }));
+        auto quoted{v}; auto quoted_fill{fill}; quoted_fill.pushKV("quantity", "5"); auto quoted_outcome{outcome};
+        quoted_outcome.pushKV("fill", quoted_fill); quoted.pushKV("outcome", quoted_outcome);
+        QVERIFY(Rejected([&] { ParseReceipt(quoted, a.market.id); }));
+        // An unknown reason name is shown as unrecognised and never final.
+        auto novel{v}; auto novel_outcome{outcome}; novel_outcome.pushKV("reason_code", "SOMETHING_NEW"); novel.pushKV("outcome", novel_outcome);
+        const auto unrecognised{ParseReceipt(novel, a.market.id)};
+        QVERIFY(!unrecognised.Terminal());
+        QVERIFY(unrecognised.outcome->reason_text.contains(QStringLiteral("Unrecognised reason")));
+    }
+    void notExecutedRequiresRejectedAndConsumer()
+    {
+        const auto a{Order()};
+        UniValue v{UniValue::VOBJ};
+        v.pushKV("market_id", a.market.id.toStdString()); v.pushKV("action_id", H(8).GetHex());
+        v.pushKV("accepted", false); v.pushKV("receipt_state", "rejected"); v.pushKV("reason", "never executes");
+        v.pushKV("endpoint", ""); v.pushKV("certificate_verified", false); v.pushKV("outcome_verified", true);
+        UniValue outcome{UniValue::VOBJ};
+        outcome.pushKV("status", "not_executed"); outcome.pushKV("final", true);
+        outcome.pushKV("reason_code", "NOT_EXECUTED_SEQUENCE_CONSUMED"); outcome.pushKV("reason_text", "Never executes.");
+        outcome.pushKV("evidence", "certified_sequence_consumer");
+        outcome.pushKV("microblock_sequence", 4); outcome.pushKV("microblock_hash", H(11).GetHex());
+        UniValue consumer{UniValue::VOBJ};
+        consumer.pushKV("action_id", H(12).GetHex()); consumer.pushKV("microblock_sequence", 4); consumer.pushKV("microblock_hash", H(11).GetHex());
+        outcome.pushKV("consumed_by", consumer);
+        v.pushKV("outcome", outcome);
+        const auto r{ParseReceipt(v, a.market.id)};
+        QVERIFY(r.NotExecuted()); QVERIFY(r.Terminal()); QVERIFY(!r.Included());
+        QVERIFY(DescribeReceipt(r).contains(QStringLiteral("Never executes")));
+        auto queued{v}; queued.pushKV("receipt_state", "unknown");
+        QVERIFY(Rejected([&] { ParseReceipt(queued, a.market.id); }));
+        auto anonymous{v}; auto missing{outcome}; missing.pushKV("consumed_by", UniValue{}); anonymous.pushKV("outcome", missing);
+        QVERIFY(Rejected([&] { ParseReceipt(anonymous, a.market.id); }));
+    }
+    void describeReceiptOutcomeTexts()
+    {
+        Receipt r;
+        r.action_id = QString::fromStdString(H(8).GetHex());
+        r.state = QStringLiteral("certified_inclusion"); r.certificate_verified = true;
+        r.microblock_hash = QString::fromStdString(H(9).GetHex()); r.microblock_sequence = 812;
+        Outcome o; o.status = QStringLiteral("applied"); o.final = true; o.microblock_sequence = 812;
+        o.microblock_hash = r.microblock_hash; o.reason_code = QStringLiteral("APPLIED");
+        o.fill = Outcome::Fill{QStringLiteral("bid"), true, false, 5, 1230, 6150, 0, 6150};
+        r.outcome = o; r.outcome_verified = true;
+        auto text{DescribeReceipt(r)};
+        QVERIFY(text.contains(QStringLiteral("Executed in certified batch #812"))); QVERIFY(text.contains(QStringLiteral("Filled 5 at 1230")));
+        QVERIFY(!text.contains(QStringLiteral("Execution outcome is unknown")));
+        r.outcome->status = QStringLiteral("rejected"); r.outcome->fill.reset(); r.outcome->reason_text = QStringLiteral("Nothing to cancel on that side; sequence used.");
+        QVERIFY(DescribeReceipt(r).contains(QStringLiteral("Nothing to cancel on that side")));
+        // includedNotExecutedShowsWarning: not final is always said.
+        r.outcome->status = QStringLiteral("included_not_executed"); r.outcome->final = false;
+        r.outcome->reason_text = QStringLiteral("Included but not executed: its sequence was not next.");
+        text = DescribeReceipt(r);
+        QVERIFY(text.contains(QStringLiteral("not executed"))); QVERIFY(text.contains(QStringLiteral("Not final.")));
+        QVERIFY(!r.Terminal());
+        r.outcome.reset(); r.outcome_verified = false;
+        QVERIFY(DescribeReceipt(r).contains(QStringLiteral("Execution outcome is unknown")));
+    }
     void exactReceiptRetryHasNoSigningOrEconomicArguments()
     {
         const auto market{Order().market.id}, id{QString::fromStdString(H(8).GetHex())};

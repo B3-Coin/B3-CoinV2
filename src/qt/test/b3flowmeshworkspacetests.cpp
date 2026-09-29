@@ -921,6 +921,56 @@ private Q_SLOTS:
         Observe(panel, Parse(Data())); QVERIFY(!panel.m_history_note->text().contains(QStringLiteral("Endpoint-reported")));
         B3FlowMeshChart chart; chart.setSnapshot(Parse(RemoteData(false))); QVERIFY(chart.emptyMessage().contains(QStringLiteral("not independently verified")));
     }
+    void verifiedOutcomesResolveOnlyWhenProvenAndHideRetry()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        const auto unknown = [&](const QString& action) {
+            B3FlowMeshTrading::Receipt receipt; receipt.action_id = action; receipt.state = QStringLiteral("unknown");
+            panel.m_receipt.reset(); // a new request, as after a fresh submission
+            panel.m_pending_market = panel.m_snapshot->market; panel.m_pending_account = panel.m_snapshot->account;
+            panel.m_pending_sequence = panel.m_snapshot->account_sequence - 1; panel.m_receipt_wallet = panel.m_wallet;
+            panel.applyReceipt(receipt); panel.updateMarketText();
+            return receipt;
+        };
+        // notExecutedHidesRetry / finalOutcomeClearsUncertaintyAndPending: a
+        // proven non-execution resolves the uncertainty, re-enables new
+        // actions and never offers a resend of the exact bytes.
+        auto receipt{unknown(QString::fromStdString(H(30).GetHex()))};
+        QVERIFY(panel.m_uncertain); QVERIFY(panel.m_retry_receipt->isEnabled());
+        receipt.state = QStringLiteral("rejected"); receipt.outcome_verified = true;
+        B3FlowMeshTrading::Outcome proof; proof.status = QStringLiteral("not_executed"); proof.final = true;
+        proof.reason_code = QStringLiteral("NOT_EXECUTED_SEQUENCE_CONSUMED"); proof.consumed_by = QString::fromStdString(H(31).GetHex());
+        proof.consumed_in_sequence = 5; proof.microblock_sequence = 5; proof.microblock_hash = QString::fromStdString(H(32).GetHex());
+        receipt.outcome = proof;
+        panel.applyReceipt(receipt); panel.updateMarketText(); panel.updateControls();
+        QVERIFY(!panel.m_uncertain); QVERIFY(!panel.m_pending_sequence); QVERIFY(panel.m_order->isEnabled());
+        QVERIFY(panel.m_receipt->no_resubmit); QVERIFY(!panel.m_retry_receipt->isEnabled());
+        QVERIFY(panel.m_progress->text().contains(QStringLiteral("Never executes")));
+        // remoteDepositCreditedClaimNeverResolves: an endpoint's claim that a
+        // deposit was credited is only an observation.
+        auto claim{unknown(QString::fromStdString(H(33).GetHex()))};
+        QVERIFY(panel.m_uncertain);
+        claim.endpoint = QStringLiteral("https://operator.invalid:18443"); claim.reason_code = QStringLiteral("DEPOSIT_ALREADY_CREDITED");
+        panel.applyReceipt(claim); panel.updateMarketText();
+        QVERIFY(panel.m_uncertain); QVERIFY(panel.m_retry_receipt->isEnabled());
+        // The local engine's own answer is certified-state truth and resolves it.
+        claim.endpoint.clear();
+        panel.applyReceipt(claim); panel.updateMarketText();
+        QVERIFY(!panel.m_uncertain);
+        // A verified but non-final outcome keeps the inclusion's resolution and
+        // says so; it is not terminal.
+        auto included{unknown(QString::fromStdString(H(34).GetHex()))};
+        QVERIFY(panel.m_uncertain);
+        included.state = QStringLiteral("certified_inclusion"); included.certificate_verified = true;
+        included.microblock_hash = QString::fromStdString(H(35).GetHex()); included.microblock_sequence = 6;
+        B3FlowMeshTrading::Outcome open; open.status = QStringLiteral("included_not_executed"); open.final = false;
+        open.reason_code = QStringLiteral("INCLUDED_BAD_SEQUENCE"); open.reason_text = QStringLiteral("Included but not executed.");
+        open.microblock_sequence = 6; open.microblock_hash = included.microblock_hash;
+        included.outcome = open; included.outcome_verified = true;
+        panel.applyReceipt(included); panel.updateMarketText();
+        QVERIFY(!panel.m_uncertain); QVERIFY(!panel.m_receipt->Terminal());
+        QVERIFY(panel.m_progress->text().contains(QStringLiteral("Not final.")));
+    }
     void reverseRemoteHistoryPreservesProvenanceAndGrossFeeWarning()
     {
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);

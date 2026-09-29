@@ -1571,7 +1571,7 @@ void B3FlowMeshTradingPanel::applyReceipt(const B3FlowMeshTrading::Receipt& rece
         for (auto& saved : m_saved_actions.actions) {
             if (saved.market == received.market && saved.account == received.account && saved.receipt.action_id == received.action_id) {
                 const bool protected_before{saved.receipt.no_resubmit};
-                saved.receipt = received; saved.receipt.no_resubmit |= protected_before || received.Included();
+                saved.receipt = received; saved.receipt.no_resubmit |= protected_before || received.Included() || received.NotExecuted();
             }
         }
         updateReceiptCard(); return;
@@ -1580,9 +1580,14 @@ void B3FlowMeshTradingPanel::applyReceipt(const B3FlowMeshTrading::Receipt& rece
     // replay protection and uncertainty attached to the full local scope.
     const bool protected_before{m_receipt && m_receipt->action_id == received.action_id && m_receipt->market == received.market &&
         m_receipt->account == received.account && receiptWalletSelected() && m_receipt->no_resubmit};
-    m_receipt = received; m_receipt->no_resubmit |= protected_before || receipt.Included(); m_receipt_error.clear();
+    // A proven non-execution never resubmits either: the exact bytes can
+    // never execute, so "Retry exact saved action" is hidden too.
+    m_receipt = received; m_receipt->no_resubmit |= protected_before || receipt.Included() || receipt.NotExecuted(); m_receipt_error.clear();
     const bool same_uncertain{m_uncertain_action_id == received.action_id && m_uncertain_market == received.market && m_uncertain_account == received.account && uncertainWalletSelected()};
-    if (m_receipt->Included() || m_receipt->no_resubmit) {
+    // Only the local engine's own answer about a credited deposit resolves
+    // it; a remote endpoint's claim never resolves anything.
+    const bool local_deposit_credited{receipt.endpoint.isEmpty() && receipt.reason_code == QStringLiteral("DEPOSIT_ALREADY_CREDITED")};
+    if (m_receipt->Included() || m_receipt->no_resubmit || m_receipt->Terminal() || m_receipt->NotExecuted() || local_deposit_credited) {
         m_pending_sequence.reset();
         // An old action's proof cannot resolve an unrelated transaction whose
         // submission outcome became unknown later in the same wallet.

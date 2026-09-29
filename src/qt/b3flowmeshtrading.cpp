@@ -290,15 +290,89 @@ Receipt ParseReceipt(const UniValue& value, const QString& market, const QString
         r.microblock_hash = Id(Field(value, "microblock_hash")); r.microblock_sequence = Integer(Field(value, "microblock_sequence"));
     }
     if (r.state == QStringLiteral("certified_inclusion") && (!r.certificate_verified || r.microblock_hash.isEmpty())) Fail("Action inclusion lacks verified certificate evidence.");
-    if (r.outcome_verified && !r.Included()) Fail("An execution outcome cannot precede verified action inclusion.");
+    if (!Field(value, "reason_code").isNull()) r.reason_code = Text(Field(value, "reason_code"));
+    if (!Field(value, "stage").isNull()) r.stage = Text(Field(value, "stage"));
+    if (!Field(value, "outcome").isNull()) r.outcome = ParseOutcome(Field(value, "outcome"));
+    if (r.outcome_verified != r.outcome.has_value()) Fail("A verified outcome flag and its outcome disagree.");
+    if (r.outcome) {
+        if (r.outcome->status == QStringLiteral("not_executed")) {
+            // Proven never to execute: a rejection naming the consumer.
+            if (r.state != QStringLiteral("rejected") || r.outcome->consumed_by.isEmpty()) Fail("A not-executed outcome lacks its consuming action.");
+        } else if (!r.Included() || r.outcome->microblock_hash != r.microblock_hash) {
+            Fail("An execution outcome cannot precede verified action inclusion.");
+        }
+    }
     return r;
+}
+
+Outcome ParseOutcome(const UniValue& value)
+{
+    Outcome o;
+    o.status = Text(Field(value, "status"));
+    if (o.status != QStringLiteral("applied") && o.status != QStringLiteral("rejected") &&
+        o.status != QStringLiteral("included_not_executed") && o.status != QStringLiteral("not_executed")) Fail("Unknown verified outcome status.");
+    o.final = Flag(Field(value, "final"));
+    o.reason_code = Text(Field(value, "reason_code"));
+    o.reason_text = Text(Field(value, "reason_text"));
+    o.evidence = Text(Field(value, "evidence"));
+    o.microblock_sequence = Integer(Field(value, "microblock_sequence"));
+    o.microblock_hash = Id(Field(value, "microblock_hash"));
+    if (!Field(value, "fill").isNull()) {
+        const auto& fill{Field(value, "fill")};
+        Outcome::Fill f;
+        f.side = Text(Field(fill, "side"));
+        if (f.side != QStringLiteral("bid") && f.side != QStringLiteral("ask")) Fail("Unknown verified fill side.");
+        f.cleared = Flag(Field(fill, "cleared")); f.superseded_in_entry = Flag(Field(fill, "superseded_in_entry"));
+        f.quantity = Money(Field(fill, "quantity"), false); f.price = Money(Field(fill, "price"), false);
+        f.quote_atoms = Money(Field(fill, "quote_atoms"), false); f.fee_atoms = Money(Field(fill, "fee_atoms"), false);
+        f.net_quote_atoms = Money(Field(fill, "net_quote_atoms"), false);
+        o.fill = f;
+    }
+    if (!Field(value, "withdrawal").isNull()) o.withdrawal_amount = Money(Field(Field(value, "withdrawal"), "amount"), false);
+    if (!Field(value, "deposit").isNull()) o.deposit_amount = Money(Field(Field(value, "deposit"), "amount"), false);
+    if (!Field(value, "consumed_by").isNull()) {
+        o.consumed_by = Id(Field(Field(value, "consumed_by"), "action_id"));
+        o.consumed_in_sequence = Integer(Field(Field(value, "consumed_by"), "microblock_sequence"));
+    }
+    // An unrecognised reason is displayed as such and never changes finality.
+    static const std::set<QString> known{QStringLiteral("APPLIED"), QStringLiteral("REJECTED_BY_STATE"),
+        QStringLiteral("INCLUDED_BAD_SEQUENCE"), QStringLiteral("INCLUDED_EQUIVOCATION"), QStringLiteral("INCLUDED_MALFORMED"),
+        QStringLiteral("DEPOSIT_NOT_CREDITED"), QStringLiteral("NOT_EXECUTED_SEQUENCE_CONSUMED")};
+    if (!known.contains(o.reason_code)) {
+        o.final = false;
+        o.reason_text = QStringLiteral("Unrecognised reason; outcome unchanged.");
+    }
+    return o;
+}
+
+QString DescribeOutcome(const Outcome& o)
+{
+    if (o.status == QStringLiteral("not_executed")) {
+        return QStringLiteral("Never executes: its account sequence was used by another certified request (%1…) in batch #%2.")
+            .arg(o.consumed_by.left(16)).arg(o.consumed_in_sequence);
+    }
+    QString text;
+    if (o.status == QStringLiteral("applied")) text = QStringLiteral("Executed in certified batch #%1.").arg(o.microblock_sequence);
+    else if (o.status == QStringLiteral("rejected")) text = QStringLiteral("Not executed in certified batch #%1: %2").arg(o.microblock_sequence).arg(o.reason_text);
+    else text = QStringLiteral("Included in certified batch #%1 but not executed: %2").arg(o.microblock_sequence).arg(o.reason_text);
+    if (o.fill) {
+        if (o.fill->superseded_in_entry) text += QStringLiteral(" Replaced before clearing in the same batch; no fill.");
+        else if (o.fill->quantity == 0) text += QStringLiteral(" No fill in that batch; the order rests on the book.");
+        else text += QStringLiteral(" Filled %1 at %2 (quote %3, fee %4). Any remainder rests on the book.")
+            .arg(o.fill->quantity).arg(o.fill->price).arg(o.fill->quote_atoms).arg(o.fill->fee_atoms);
+    }
+    if (o.withdrawal_amount) text += QStringLiteral(" Withdrawal of %1 requested; a certified checkpoint and a vault transaction must follow.").arg(*o.withdrawal_amount);
+    if (o.deposit_amount) text += QStringLiteral(" Deposit of %1 credited.").arg(*o.deposit_amount);
+    if (!o.final) text += QStringLiteral(" Not final.");
+    return text;
 }
 
 QString DescribeReceipt(const Receipt& r)
 {
     QString text;
-    if (r.Included()) text = QStringLiteral("Exact action inclusion verified in certified microblock #%1. %2")
-        .arg(r.microblock_sequence).arg(r.outcome_verified ? QStringLiteral("Execution evidence verified; inspect the reported outcome separately.") : QStringLiteral("Execution outcome is unknown: inclusion alone does not prove a fill, successful withdrawal or B3 payout."));
+    if (r.NotExecuted()) text = DescribeOutcome(*r.outcome);
+    else if (r.Included()) text = QStringLiteral("Exact action inclusion verified in certified microblock #%1. %2")
+        .arg(r.microblock_sequence).arg(r.outcome ? DescribeOutcome(*r.outcome) : QStringLiteral("Execution outcome is unknown: inclusion alone does not prove a fill, successful withdrawal or B3 payout."));
     else if (r.no_resubmit) text = QStringLiteral("Previously certified; fresh proof currently unavailable. The retained verified record prevents resubmission; this is not a never-established submission outcome.");
     else if (r.state == QStringLiteral("admitted")) text = QStringLiteral("Endpoint reports pool admission; not certified inclusion or execution.");
     else if (r.state == QStringLiteral("queued")) text = QStringLiteral("Request queued; pool admission, certified inclusion and execution are not yet proven.");
