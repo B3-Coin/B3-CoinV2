@@ -732,6 +732,7 @@ RPCResult ClientStatusResult()
                         {RPCResult::Type::STR, "", "Not-ready code"},
                     }},
                     {RPCResult::Type::NUM, "readiness_observed_ms", "Unix time in milliseconds of that observation, or zero"},
+                    {RPCResult::Type::NUM, "live_updates_ms", "Longest bounded live-update watch this endpoint last advertised (updates_watch_ms_max), or zero when it offers none; a latency capability, never evidence"},
                 }},
             }},
         }};

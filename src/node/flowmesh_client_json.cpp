@@ -238,6 +238,7 @@ UniValue FlowMeshClientStatusJson(const interfaces::FlowMeshClientStatus& status
         for (const auto& code : endpoint.not_ready) not_ready.push_back(code);
         row.pushKV("not_ready", std::move(not_ready));
         row.pushKV("readiness_observed_ms", endpoint.readiness_observed_ms);
+        row.pushKV("live_updates_ms", uint64_t{endpoint.live_updates_ms});
         endpoints.push_back(std::move(row));
     }
     out.pushKV("endpoints", std::move(endpoints));

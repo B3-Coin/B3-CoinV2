@@ -1281,6 +1281,15 @@ public:
         }
         return m_node.flowmesh->MarketData(market_id, account_id, query, error);
     }
+    std::optional<flowmesh::MarketData> flowMeshWatchMarketData(
+        const uint256& market_id, const std::optional<uint256>& account_id,
+        const flowmesh::MarketDataQuery& query, std::chrono::milliseconds wait,
+        interfaces::FlowMeshMarketWatch& watch, std::string& error) override
+    {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Watch(market_id, account_id, query, wait, watch, error);
+        if (m_node.flowmesh) return node::MakeLocalFlowMeshBackend(*m_node.flowmesh)->Watch(market_id, account_id, query, wait, watch, error);
+        return interfaces::Chain::flowMeshWatchMarketData(market_id, account_id, query, wait, watch, error);
+    }
     bool flowMeshMarketEstablished(const uint256& market_id) override
     {
         LOCK(::cs_main);

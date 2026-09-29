@@ -386,6 +386,26 @@ struct FlowMeshClientEndpointStatus {
     std::string readiness_market;
     std::vector<std::string> not_ready;
     int64_t readiness_observed_ms{0};
+    //! The bounded 'updates' watch (live updates) this endpoint last
+    //! advertised, in milliseconds; zero when it offers none. A latency
+    //! capability, never evidence.
+    uint32_t live_updates_ms{0};
+};
+//! One live-update market read's local observation (see
+//! Chain::flowMeshWatchMarketData); never evidence.
+struct FlowMeshMarketWatch {
+    //! Closed set: node::FLOWMESH_CLIENT_WATCH_LABELS.
+    std::string status{"none"};
+    //! An endpoint (or the local engine) served the watch.
+    bool supported{false};
+    //! It waited, or reported a change or gap: the caller may watch again at
+    //! once. Otherwise the caller paces itself.
+    bool waited{false};
+    //! This read found an event gap (events may have been missed).
+    bool gap{false};
+    //! The endpoint the watch was for, and its advertised watch maximum.
+    std::string endpoint;
+    uint32_t endpoint_live_ms{0};
 };
 struct FlowMeshClientStatus {
     std::string backend{"local"};
@@ -825,6 +845,18 @@ public:
     virtual std::optional<flowmesh::MarketData> flowMeshMarketData(
         const uint256& market_id, const std::optional<uint256>& account_id,
         const flowmesh::MarketDataQuery& query, std::string& error) = 0;
+    //! One bounded live-update read: waits up to `wait` for a change the
+    //! endpoint (or the local engine) can report, then returns the same
+    //! verified data flowMeshMarketData would. Never signs or sends an action.
+    virtual std::optional<flowmesh::MarketData> flowMeshWatchMarketData(
+        const uint256& market_id, const std::optional<uint256>& account_id,
+        const flowmesh::MarketDataQuery& query, std::chrono::milliseconds wait,
+        FlowMeshMarketWatch& watch, std::string& error)
+    {
+        watch = {};
+        watch.status = "unsupported";
+        return flowMeshMarketData(market_id, account_id, query, error);
+    }
     //! Current active-chain registry fact (not the 30-deep runtime view).
     virtual bool flowMeshMarketEstablished(const uint256& market_id) = 0;
     virtual bool submitFlowMeshAction(const uint256& market_id,

@@ -3999,6 +3999,8 @@ struct LiveMarket {
     std::unique_ptr<node::FlowMeshService> service;
     std::unique_ptr<node::FlowMeshHttpsServer> api;
     uint16_t port{0};
+    //! Told of every connection the API admits (set before Start).
+    std::function<void(bool)> connection_observer;
     LiveMarket(ClientLaneFixture& f, fs::path p, const node::FlowMeshTradingApiWatch w = {})
         : fixture{f}, path{std::move(p)}, watch{w}
     {
@@ -4022,9 +4024,26 @@ struct LiveMarket {
         auto options{fixture.Options(port)};
         options.request_timeout = std::chrono::seconds{10};
         api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, {}, watch);
+        if (connection_observer) {
+            BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(*api, [this](bool nodelay) {
+                if (connection_observer) connection_observer(nodelay);
+            }));
+        }
         BOOST_REQUIRE_MESSAGE(api->Start(error), error);
         port = api->Port();
         BOOST_REQUIRE(WaitSequence(1));
+    }
+    //! Starts the API again (same port), now telling `observer` of each connection.
+    void ObserveConnections(std::function<void(bool)> observer)
+    {
+        api->Stop();
+        connection_observer = std::move(observer);
+        BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(*api, [this](bool nodelay) {
+            if (connection_observer) connection_observer(nodelay);
+        }));
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        BOOST_REQUIRE_EQUAL(api->Port(), port);
     }
     void Stop()
     {
@@ -4107,6 +4126,450 @@ BOOST_AUTO_TEST_CASE(event_gap_is_raised_only_when_a_snapshot_skips_events)
     BOOST_CHECK(restarted->event_gap);
     BOOST_CHECK_EQUAL(client->Status().event_gaps, 1U);
     client.reset();
+}
+
+namespace {
+//! Forwards public API requests to a live endpoint. It can hold watched
+//! 'updates' replies, drop them (never written: the reply outlives the
+//! request deadline), corrupt 'snapshot' state bytes, and inject a stale
+//! updates_watch_ms_max into 'markets' and 'snapshot' status objects.
+struct WatchProxy {
+    node::HttpsEndpoint upstream;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool hold{false}, drop{false}, corrupt_snapshot{false}, inject_advert{false};
+    unsigned watched{0}, held{0};
+    std::vector<std::string> methods;
+
+    void Hold(const bool value)
+    {
+        {
+            std::lock_guard lock{mutex};
+            hold = value;
+        }
+        changed.notify_all();
+    }
+    bool AwaitHeld(const unsigned count)
+    {
+        std::unique_lock lock{mutex};
+        return changed.wait_for(lock, std::chrono::seconds{5}, [&] { return held >= count; });
+    }
+    node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
+    {
+        UniValue json;
+        if (!json.read(request.body) || !json["method"].isStr()) return {400, R"({"ok":false,"error":"proxy"})"};
+        const auto method{json["method"].get_str()};
+        const bool is_watch{method == "updates" && json["params"].exists("watch_ms")};
+        {
+            std::lock_guard lock{mutex};
+            methods.push_back(method);
+            watched += is_watch;
+        }
+        const auto reply{node::FlowMeshHttpsRequest(upstream, "/flowmesh/v1", request.body, std::chrono::seconds{10}, 32 << 20)};
+        if (!reply.response_received) return {502, R"({"ok":false,"error":"proxy upstream failed"})"};
+        std::string body{reply.body};
+        if (is_watch) {
+            std::unique_lock lock{mutex};
+            ++held;
+            changed.notify_all();
+            changed.wait_for(lock, std::chrono::seconds{5}, [&] { return !hold; });
+            if (drop) {
+                lock.unlock();
+                std::this_thread::sleep_until(request.deadline + std::chrono::milliseconds{200});
+            }
+        }
+        UniValue parsed;
+        if ((corrupt_snapshot || inject_advert) && parsed.read(body) && parsed["ok"].isTrue()) {
+            UniValue result{parsed["result"]};
+            if (corrupt_snapshot && method == "snapshot") {
+                auto state{result["state_bytes"].get_str()};
+                state[state.size() - 2] = state[state.size() - 2] == '0' ? '1' : '0';
+                result.pushKV("state_bytes", state);
+            }
+            if (inject_advert && method == "snapshot") {
+                UniValue status{result["status"]};
+                status.pushKV("updates_watch_ms_max", 2000);
+                result.pushKV("status", status);
+            }
+            if (inject_advert && method == "markets") {
+                UniValue rows{UniValue::VARR};
+                for (auto row : result.getValues()) {
+                    row.pushKV("updates_watch_ms_max", 2000);
+                    rows.push_back(row);
+                }
+                result = rows;
+            }
+            parsed.pushKV("result", result);
+            body = parsed.write();
+        }
+        return {reply.status, body};
+    }
+    unsigned Watched()
+    {
+        std::lock_guard lock{mutex};
+        return watched;
+    }
+};
+
+std::unique_ptr<node::FlowMeshHttpsServer> Proxy(const ClientLaneFixture& fixture, WatchProxy& proxy,
+                                                 std::chrono::milliseconds request_timeout = std::chrono::seconds{10})
+{
+    auto options{fixture.Options()};
+    options.request_timeout = request_timeout;
+    auto server{std::make_unique<node::FlowMeshHttpsServer>(options, [&proxy](const auto& request) { return proxy.Handle(request); })};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server->Start(error), error);
+    return server;
+}
+
+using Watched = std::pair<std::optional<flowmesh::MarketData>, interfaces::FlowMeshMarketWatch>;
+Watched WatchRead(node::FlowMeshTradingBackend& client, const uint256& market, std::chrono::milliseconds wait, std::string& error)
+{
+    interfaces::FlowMeshMarketWatch watch;
+    auto data{client.Watch(market, std::nullopt, Page(), wait, watch, error)};
+    return {std::move(data), watch};
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(watch_applies_a_commit_through_the_verified_snapshot)
+{
+    LiveMarket live{*this, m_path_root / "watch-commit-service", {std::chrono::milliseconds{2000}, 8}};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "watch-commit-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 2000U);
+    const auto start{std::chrono::steady_clock::now()};
+    auto pending{std::async(std::launch::async, [&] {
+        std::string watch_error;
+        auto result{WatchRead(*client, market, std::chrono::milliseconds{1500}, watch_error)};
+        BOOST_CHECK_MESSAGE(result.first, watch_error);
+        return result;
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    live.Deposit();
+    // The deposit's admission events wake the (unfiltered) watch first; the
+    // caller watches again at once until the commit's head arrives.
+    auto [data, watch]{pending.get()};
+    for (int follow{0}; data && watch.waited && data->snapshot.next_microblock_sequence < 2 && follow < 5; ++follow) {
+        std::tie(data, watch) = WatchRead(*client, market, std::chrono::milliseconds{1500}, error);
+    }
+    BOOST_REQUIRE(data);
+    BOOST_CHECK(watch.status == "ready" || watch.status == "head_changed");
+    BOOST_CHECK(watch.supported && watch.waited && !watch.gap);
+    BOOST_CHECK_EQUAL(watch.endpoint, live.Endpoint().url);
+    BOOST_CHECK_EQUAL(watch.endpoint_live_ms, 2000U);
+    BOOST_CHECK_LT(Elapsed(start), 1400U);
+    // The new head is the verified snapshot's, never the page's claim.
+    BOOST_CHECK_EQUAL(data->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(data->certificate_verified && data->account_state_verified && data->remote);
+    BOOST_CHECK(!data->event_gap);
+    const auto ordinary{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE(ordinary);
+    BOOST_CHECK(ordinary->snapshot.last_microblock_hash == data->snapshot.last_microblock_hash);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(watch_lane_leaves_work_gate_free_and_times_out_quietly)
+{
+    LiveMarket live{*this, m_path_root / "watch-quiet-service", {std::chrono::milliseconds{2000}, 8}};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "watch-quiet-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto before{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(before, error);
+    const auto start{std::chrono::steady_clock::now()};
+    auto pending{std::async(std::launch::async, [&] {
+        std::string watch_error;
+        return WatchRead(*client, market, std::chrono::milliseconds{1200}, watch_error);
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    // The work gate is free while the watch sleeps on its lane.
+    for (int i{0}; i < 3; ++i) {
+        const auto read_start{std::chrono::steady_clock::now()};
+        BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        BOOST_CHECK(client->Data(market, std::nullopt, Page(), error));
+        BOOST_CHECK(client->SavedActions(uint256::ONE, market).empty());
+        BOOST_CHECK_LT(Elapsed(read_start), 800U);
+    }
+    // A second watch while the lane is busy reads ordinarily at once.
+    const auto second_start{std::chrono::steady_clock::now()};
+    std::string second_error;
+    const auto [second, second_watch]{WatchRead(*client, market, std::chrono::milliseconds{1200}, second_error)};
+    BOOST_CHECK(second);
+    BOOST_CHECK_EQUAL(second_watch.status, "lane_busy");
+    BOOST_CHECK(!second_watch.supported && !second_watch.waited);
+    BOOST_CHECK_LT(Elapsed(second_start), 800U);
+    const auto [data, watch]{pending.get()};
+    BOOST_REQUIRE(data);
+    BOOST_CHECK_EQUAL(watch.status, "timeout");
+    BOOST_CHECK(watch.supported && watch.waited && !watch.gap);
+    BOOST_CHECK_GE(Elapsed(start), 1150U);
+    BOOST_CHECK(data->snapshot.last_microblock_hash == before->snapshot.last_microblock_hash);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(watch_never_sends_watch_ms_to_an_endpoint_without_advertisement)
+{
+    LiveMarket live{*this, m_path_root / "watch-off-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-off-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    // Before any snapshot, and after one: never a watched request.
+    for (int i{0}; i < 3; ++i) {
+        const auto start{std::chrono::steady_clock::now()};
+        const auto [data, watch]{WatchRead(*client, market, std::chrono::milliseconds{1500}, error)};
+        BOOST_REQUIRE_MESSAGE(data, error);
+        BOOST_CHECK_EQUAL(watch.status, "not_eligible");
+        BOOST_CHECK(!watch.supported && !watch.waited);
+        BOOST_CHECK_LT(Elapsed(start), 1000U);
+    }
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 0U);
+    BOOST_CHECK_EQUAL(proxy.Watched(), 0U);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_unknown_field_withdraws_capability_and_reads_ordinarily)
+{
+    // A stale advertisement: the endpoint rejects watch_ms.
+    LiveMarket live{*this, m_path_root / "watch-stale-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    proxy.inject_advert = true;
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-stale-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error); // A snapshot learns the advert.
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 2000U);
+    const auto [data, watch]{WatchRead(*client, market, std::chrono::milliseconds{1500}, error)};
+    BOOST_REQUIRE_MESSAGE(data, error); // The same call read ordinarily.
+    BOOST_CHECK_EQUAL(watch.status, "unsupported");
+    BOOST_CHECK(!watch.supported && !watch.waited);
+    BOOST_CHECK_EQUAL(proxy.Watched(), 1U);
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 0U);
+    // Withdrawn until the endpoint advertises it again.
+    const auto [again, again_watch]{WatchRead(*client, market, std::chrono::milliseconds{1500}, error)};
+    BOOST_CHECK(again);
+    BOOST_CHECK_EQUAL(again_watch.status, "not_eligible");
+    BOOST_CHECK_EQUAL(proxy.Watched(), 1U);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_superseded_cursor_is_not_applied)
+{
+    LiveMarket live{*this, m_path_root / "watch-superseded-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-superseded-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    proxy.Hold(true);
+    auto pending{std::async(std::launch::async, [&] {
+        std::string watch_error;
+        return WatchRead(*client, market, std::chrono::milliseconds{1500}, watch_error);
+    })};
+    // The commit wakes the watch; its reply is held while an ordinary read
+    // advances the cache past the watched cursor.
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    live.Deposit();
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    const auto ordinary{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(ordinary, error);
+    BOOST_CHECK_EQUAL(ordinary->snapshot.next_microblock_sequence, 2U);
+    proxy.Hold(false);
+    const auto [data, watch]{pending.get()};
+    BOOST_REQUIRE(data);
+    BOOST_CHECK_EQUAL(watch.status, "superseded");
+    BOOST_CHECK(!watch.supported && !watch.waited);
+    BOOST_CHECK(data->snapshot.last_microblock_hash == ordinary->snapshot.last_microblock_hash);
+    BOOST_CHECK(!data->event_gap);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_transport_loss_marks_endpoint_unanswered_without_cooldown)
+{
+    LiveMarket live{*this, m_path_root / "watch-loss-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    proxy.drop = true;
+    auto front{Proxy(*this, proxy, std::chrono::milliseconds{1000})};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-loss-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    const auto [lost, lost_watch]{WatchRead(*client, market, std::chrono::milliseconds{300}, error)};
+    BOOST_CHECK(!lost);
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK_EQUAL(lost_watch.status, "failed");
+    const auto status{client->Status()};
+    BOOST_CHECK_EQUAL(status.endpoints.at(0).retry_after_ms, 0);
+    BOOST_CHECK_EQUAL(status.endpoints.at(0).consecutive_failures, 0U);
+    // Unanswered: the next call reads ordinarily (which answers), and only
+    // then may the endpoint be watched again.
+    proxy.drop = false;
+    error.clear();
+    const auto [ordinary, ordinary_watch]{WatchRead(*client, market, std::chrono::milliseconds{300}, error)};
+    BOOST_REQUIRE_MESSAGE(ordinary, error);
+    BOOST_CHECK_EQUAL(ordinary_watch.status, "not_eligible");
+    BOOST_CHECK_EQUAL(proxy.Watched(), 1U);
+    const auto [again, again_watch]{WatchRead(*client, market, std::chrono::milliseconds{300}, error)};
+    BOOST_CHECK(again);
+    BOOST_CHECK_EQUAL(again_watch.status, "timeout");
+    BOOST_CHECK_EQUAL(proxy.Watched(), 2U);
+    // A watch never sends or resends an action.
+    for (const auto& method : proxy.methods) BOOST_CHECK(method == "updates" || method == "snapshot" || method == "markets");
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_head_change_verifies_snapshot_before_exposing_state)
+{
+    LiveMarket live{*this, m_path_root / "watch-forged-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-forged-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto before{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(before, error);
+    live.Deposit();
+    // The watched page reports the new head; the snapshot's state is forged.
+    proxy.corrupt_snapshot = true;
+    const auto [forged, watch]{WatchRead(*client, market, std::chrono::milliseconds{1500}, error)};
+    BOOST_CHECK(!forged);
+    BOOST_CHECK_EQUAL(watch.status, "invalid");
+    BOOST_CHECK(!error.empty());
+    // Nothing from the forged reply was exposed: an honest read verifies anew.
+    proxy.corrupt_snapshot = false;
+    error.clear();
+    const auto honest{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(honest, error);
+    BOOST_CHECK_EQUAL(honest->snapshot.next_microblock_sequence, 2U);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_rechecks_local_authority_after_its_wait)
+{
+    LiveMarket live{*this, m_path_root / "watch-authority-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-authority-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    proxy.Hold(true);
+    auto pending{std::async(std::launch::async, [&] {
+        std::string watch_error;
+        return WatchRead(*client, market, std::chrono::milliseconds{1500}, watch_error);
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    live.Deposit();
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    // While the reply is held, B3 connects a checkpoint past the cached head:
+    // the cached state no longer applies under local authority.
+    const auto checkpoint{live.service->NextCheckpointMpa(market, error)};
+    BOOST_REQUIRE_MESSAGE(checkpoint, error);
+    BOOST_REQUIRE_EQUAL(checkpoint->sequence, 1U);
+    ConnectMpaBlock({checkpoint->record});
+    proxy.Hold(false);
+    const auto [data, watch]{pending.get()};
+    BOOST_REQUIRE(data);
+    BOOST_CHECK_EQUAL(watch.status, "revalidate");
+    BOOST_CHECK(!watch.supported);
+    // The ordinary read re-verified, reported the gap and moved past the checkpoint.
+    BOOST_CHECK_EQUAL(data->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(data->event_gap);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_lane_connection_released_after_busy)
+{
+    LiveMarket live{*this, m_path_root / "watch-busy-service", {std::chrono::milliseconds{2000}, 8}};
+    std::atomic<unsigned> connections{0};
+    live.ObserveConnections([&](bool) { ++connections; });
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "watch-busy-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto data{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(data, error);
+    // A kept-alive lane: two quiet watches, one connection.
+    BOOST_CHECK_EQUAL(WatchRead(*client, market, std::chrono::milliseconds{300}, error).second.status, "timeout");
+    const auto lane{connections.load()};
+    BOOST_CHECK_EQUAL(WatchRead(*client, market, std::chrono::milliseconds{300}, error).second.status, "timeout");
+    BOOST_CHECK_EQUAL(connections.load(), lane);
+    // Both watch slots of this address are taken: 'busy', and the lane lets
+    // its connection go.
+    const auto cursor{ApiCall(live.Endpoint(), "updates", UpdatesParams(market)).second["result"]["cursor"]};
+    const std::string held{UpdatesParams(market, CursorParam(cursor) + ",\"known_head\":\"" + data->snapshot.last_microblock_hash.GetHex() + "\",\"watch_ms\":1500")};
+    auto first{std::async(std::launch::async, [&] { return ApiCall(live.Endpoint(), "updates", held); })};
+    auto second{std::async(std::launch::async, [&] { return ApiCall(live.Endpoint(), "updates", held); })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    const auto [busy_data, busy]{WatchRead(*client, market, std::chrono::milliseconds{300}, error)};
+    BOOST_CHECK(busy_data);
+    BOOST_CHECK_EQUAL(busy.status, "busy");
+    BOOST_CHECK(busy.supported && !busy.waited);
+    first.get();
+    second.get();
+    const auto before{connections.load()};
+    BOOST_CHECK_EQUAL(WatchRead(*client, market, std::chrono::milliseconds{300}, error).second.status, "timeout");
+    BOOST_CHECK_EQUAL(connections.load(), before + 1);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(local_backend_watch_wakes_on_commit_and_needs_known_head)
+{
+    LiveMarket live{*this, m_path_root / "watch-local-service"};
+    auto local{node::MakeLocalFlowMeshBackend(*live.service)};
+    std::string error;
+    const auto current{local->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(current, error);
+    // Without the head it holds, a caller is answered at once.
+    const auto start{std::chrono::steady_clock::now()};
+    const auto [plain, plain_watch]{WatchRead(*local, market, std::chrono::milliseconds{1500}, error)};
+    BOOST_CHECK(plain);
+    BOOST_CHECK_EQUAL(plain_watch.status, "not_eligible");
+    BOOST_CHECK(!plain_watch.supported);
+    BOOST_CHECK_LT(Elapsed(start), 800U);
+    auto query{Page()};
+    query.known_head = current->snapshot.last_microblock_hash;
+    const auto watch_read = [&] {
+        interfaces::FlowMeshMarketWatch watch;
+        std::string watch_error;
+        auto data{local->Watch(market, std::nullopt, query, std::chrono::milliseconds{1500}, watch, watch_error)};
+        return std::pair{std::move(data), watch};
+    };
+    const auto quiet_start{std::chrono::steady_clock::now()};
+    const auto [quiet, quiet_watch]{watch_read()};
+    BOOST_REQUIRE(quiet);
+    BOOST_CHECK(quiet->unchanged);
+    BOOST_CHECK_EQUAL(quiet_watch.status, "timeout");
+    BOOST_CHECK(quiet_watch.supported && quiet_watch.waited);
+    BOOST_CHECK_GE(Elapsed(quiet_start), 1450U);
+    const auto wake_start{std::chrono::steady_clock::now()};
+    auto pending{std::async(std::launch::async, watch_read)};
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    live.Deposit();
+    // Its admission events wake the watch first; the commit's head follows.
+    auto [woken, woken_watch]{pending.get()};
+    for (int follow{0}; woken && woken->unchanged && woken_watch.waited && follow < 5; ++follow) {
+        std::tie(woken, woken_watch) = watch_read();
+    }
+    BOOST_REQUIRE(woken);
+    BOOST_CHECK(woken_watch.status == "ready" || woken_watch.status == "head_changed");
+    BOOST_CHECK(!woken->unchanged);
+    BOOST_CHECK_EQUAL(woken->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK_LT(Elapsed(wake_start), 1400U);
+    // A caller behind the head is answered at once.
+    const auto [behind, behind_watch]{watch_read()};
+    BOOST_CHECK(behind);
+    BOOST_CHECK_EQUAL(behind_watch.status, "head_changed");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

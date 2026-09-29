@@ -11,6 +11,7 @@
 #include <node/flowmesh_client_readiness.h>
 #include <node/flowmesh_client_work.h>
 #include <node/flowmesh_client_settlement.h>
+#include <node/flowmesh_client_watch.h>
 #include <node/flowmesh_health.h>
 
 #include <chain.h>
@@ -170,6 +171,9 @@ Receipt LocalActionReceipt(const std::optional<flowmesh::ClientEvent>& status, c
 class LocalBackend final : public FlowMeshTradingBackend {
     FlowMeshService& m_service;
     const FlowMeshAssetMetadataCatalog m_metadata;
+    // Local RPC callers never take every event-log watch registration.
+    static constexpr size_t LOCAL_WATCHERS_MAX{4};
+    std::atomic<size_t> m_local_watchers{0};
     // Derived local outcomes, FIFO-bounded: a status poll never derives the
     // same outcome twice and never reads the store.
     static constexpr size_t OUTCOME_CACHE_ENTRIES{1024};
@@ -317,6 +321,47 @@ public:
         auto out{m_service.MarketData(id, account, query, error)};
         if (out) { out->certificate_verified = out->snapshot.certified; out->account_state_verified = out->snapshot.certified; out->execution_result_verified = out->snapshot.certified; }
         return out;
+    }
+    //! The local engine's own event log: no network. Each call holds its
+    //! caller (an RPC worker) for at most the wait.
+    std::optional<flowmesh::MarketData> Watch(const uint256& id, const std::optional<uint256>& account,
+                                             const flowmesh::MarketDataQuery& query, const std::chrono::milliseconds requested,
+                                             interfaces::FlowMeshMarketWatch& watch, std::string& error) override
+    {
+        watch = {};
+        const auto wait{std::clamp(requested, std::chrono::milliseconds{0}, FLOWMESH_CLIENT_UPDATES_WATCH_MAX)};
+        // The position is captured before the head is read, so a commit
+        // after that read appends its head event after this position.
+        const auto cursor{m_service.ClientEventCursor()};
+        auto out{Data(id, account, query, error)};
+        if (!out) {
+            watch.status = "failed";
+            return out;
+        }
+        // Only a caller that names the head it holds can be told when it
+        // changes; anything else answers at once, so a script cannot spin.
+        if (!cursor || wait.count() == 0 || !query.known_head || query.before_sequence || query.curve_cursor ||
+            query.expected_head) {
+            watch.status = "not_eligible";
+            return out;
+        }
+        watch.supported = true;
+        if (!out->unchanged) {
+            watch.status = "head_changed";
+            watch.waited = true;
+            return out;
+        }
+        if (m_local_watchers.fetch_add(1) >= LOCAL_WATCHERS_MAX) {
+            --m_local_watchers;
+            watch.status = "busy";
+            return out;
+        }
+        const auto result{m_service.WaitClientEvents(*cursor, id, account, std::chrono::steady_clock::now() + wait, {})};
+        --m_local_watchers;
+        watch.status = flowmesh::ClientWatchResultName(result);
+        watch.waited = FlowMeshWatchWaited(watch.status);
+        watch.gap = result == flowmesh::ClientWatchResult::GAP || result == flowmesh::ClientWatchResult::RESTARTED;
+        return Data(id, account, query, error);
     }
     Receipt Submit(const uint256& id, const flowmesh::Action& action) override
     {
@@ -1038,6 +1083,24 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // from it (an ordinary read or probe), so a silent endpoint costs a
     // waited call its lane time once, not on every call.
     std::vector<bool> m_wait_unanswered;
+    // Live-update lane: its own TLS connection, so m_work is never held across
+    // a server-side watch. Only try-locked, and never while holding m_work
+    // (lane, then m_work, as for m_wait_lane); a busy lane means an ordinary
+    // read.
+    std::mutex m_watch_lane;
+    FlowMeshHttpsClient m_watch_https;
+    // Set where m_https is reset or a watched reply failed verification: the
+    // lane drops its connection before its next request.
+    std::atomic<bool> m_watch_reset{false};
+    // Per endpoint (index-stable), under m_work: the 'updates' watch each
+    // endpoint last advertised. Zero never sends watch_ms.
+    std::vector<std::chrono::milliseconds> m_updates_watch;
+    // Per endpoint, under m_work: a watch to it got no HTTP response. Cleared
+    // like m_wait_unanswered, by a successful response from that endpoint.
+    std::vector<bool> m_watch_unanswered;
+    // Under m_work: smoothed time a quiet watch spent outside the endpoint's
+    // wait (transport and both ends' work), which the next wait leaves room for.
+    std::chrono::milliseconds m_watch_overhead{0};
     // Never acquire m_work from a wallet metadata lookup: it covers HTTPS.
     mutable std::mutex m_metadata_mutex;
     FlowMeshAssetMetadataCatalog m_metadata;
@@ -1126,6 +1189,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // inclusion newer than this entry is verified. Only a signing
         // preflight's join reads it.
         std::optional<std::pair<std::chrono::steady_clock::time_point, std::chrono::steady_clock::time_point>> fresh{};
+        // False only between an applied page that asked for a snapshot and
+        // that snapshot, which rebuilds the cache: no watch meanwhile.
+        bool watch_ready{true};
     };
     std::map<uint256, Cache> m_cache;
     // Microblock high-water of verified own inclusions per market. Survives
@@ -1234,6 +1300,13 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     {
         m_action_wait.at(endpoint) = FlowMeshAdvertisedActionWait(status);
         m_action_outcome.at(endpoint) = FlowMeshAdvertisedActionOutcome(status);
+        LearnUpdatesWatch(FlowMeshAdvertisedUpdatesWatch(status), endpoint);
+    }
+    void LearnUpdatesWatch(const std::chrono::milliseconds advertised, size_t endpoint)
+    {
+        m_updates_watch.at(endpoint) = advertised;
+        std::lock_guard lock{m_status_mutex};
+        m_status.endpoints.at(endpoint).live_updates_ms = static_cast<uint32_t>(advertised.count());
     }
     // Display only, never evidence and never an input to endpoint selection:
     // what the endpoint last advertised about its own readiness.
@@ -1340,6 +1413,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (error.empty()) {
             if (names_active) m_status.active_endpoint = row.url;
             m_wait_unanswered.at(endpoint) = false;
+            m_watch_unanswered.at(endpoint) = false;
         }
     }
     // Called by the m_work owner right after acquisition. Diagnostics only:
@@ -1811,6 +1885,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // The snapshot this asks for resumes from this page's cursor, so the
         // events after it are still delivered (see Snapshot).
         const bool snapshot_needed{gap || reported_head != cache.verified.certified.entry.GetHash()};
+        cache.watch_ready = !snapshot_needed;
         cache.cursor = cursor; cache.endpoint = endpoint; cache.status = value["status"];
         if (value.exists("reported_data") && !value["reported_data"]["unchanged"].isTrue()) cache.reported = value["reported_data"];
         // A 'more' page is not skipped: cursor remains at the returned
@@ -2468,6 +2543,8 @@ public:
         m_action_wait.resize(m_endpoints.size());
         m_action_outcome.resize(m_endpoints.size());
         m_wait_unanswered.resize(m_endpoints.size());
+        m_updates_watch.resize(m_endpoints.size());
+        m_watch_unanswered.resize(m_endpoints.size());
         for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({endpoint.url, false, {}});
         if (!m_endpoints.empty()) m_status.selected_endpoint = m_endpoints[m_selected].url;
         PublishSavedView();
@@ -2499,10 +2576,13 @@ public:
                 m_action_wait.emplace_back();
                 m_action_outcome.emplace_back(false);
                 m_wait_unanswered.push_back(false);
+                m_updates_watch.emplace_back();
+                m_watch_unanswered.push_back(false);
             }
             m_selected = selected; m_preferred = selected; m_retry_after[selected] = {};
             m_https.Reset(); // Explicit connect revalidates existing trust.
             m_wait_reset = true;
+            m_watch_reset = true;
             {
                 std::lock_guard status_lock{m_status_mutex};
                 if (added) m_status.endpoints.push_back({endpoint.url, false, {}});
@@ -2614,6 +2694,195 @@ public:
         MarkWorkAcquired(timing_lock_1245);
         try { return Project(Refresh(id, account, query), account, query); }
         catch (const std::exception& e) { error = e.what(); return std::nullopt; }
+    }
+    std::optional<flowmesh::MarketData> Watch(const uint256& id, const std::optional<uint256>& account,
+                                             const flowmesh::MarketDataQuery& query, const std::chrono::milliseconds requested,
+                                             interfaces::FlowMeshMarketWatch& watch, std::string& error) override
+    {
+        FlowMeshTimingSpan timing{"client_market_watch"};
+        timing.Field("market_id", id);
+        watch = {};
+        const auto label = [&](const std::string_view status) {
+            watch.status = std::string{status};
+            timing.Field("watch_status", watch.status);
+        };
+        // A fresh, bounded, non-waiting read, exactly Data().
+        const auto ordinary = [&](const std::string_view status) {
+            label(status);
+            return Data(id, account, query, error);
+        };
+        std::unique_lock lane{m_watch_lane, std::try_to_lock};
+        if (!lane.owns_lock()) return ordinary("lane_busy");
+        HttpsEndpoint target;
+        size_t endpoint{0};
+        std::chrono::milliseconds wait{0};
+        flowmesh::ClientEventCursor sent_cursor;
+        std::string body;
+        timing.Mark("select_lock_requested_us");
+        {
+            // Phase 1, under m_work without network: the cache's endpoint and
+            // position, and whether a watch may be sent there at all.
+            WorkLock lock{*this};
+            timing.Mark("select_lock_acquired_us");
+            const auto it{m_cache.find(id)};
+            if (it != m_cache.end()) {
+                auto& cache{it->second};
+                endpoint = cache.endpoint;
+                watch.endpoint = m_endpoints.at(endpoint).url;
+                watch.endpoint_live_ms = static_cast<uint32_t>(m_updates_watch.at(endpoint).count());
+                bool current{false};
+                try {
+                    current = CheckCache(id, cache, account) == CacheCheck::CURRENT;
+                } catch (const std::exception&) {
+                }
+                // As Refresh: the cached reported data belongs to this account.
+                const bool same_reported_account{!account || (cache.reported["account"].isObject() &&
+                    cache.reported["account"]["account_id"].isStr() && cache.reported["account"]["account_id"].get_str() == account->GetHex())};
+                wait = FlowMeshUpdatesWatchFor({.requested = requested, .advertised = m_updates_watch.at(endpoint),
+                    .lane_overhead = m_watch_overhead, .cache_current = current, .watch_ready = cache.watch_ready,
+                    .scope_matches = cache.account_scope == account && same_reported_account,
+                    .cooldown = std::chrono::steady_clock::now() < m_retry_after.at(endpoint),
+                    .unanswered = m_watch_unanswered.at(endpoint),
+                    .paging = query.before_sequence || query.curve_cursor || query.expected_head});
+                if (wait.count()) {
+                    UniValue params{UniValue::VOBJ};
+                    params.pushKV("market_id", id.GetHex());
+                    if (account) params.pushKV("account_id", account->GetHex());
+                    params.pushKV("cursor", CursorJson(cache.cursor));
+                    params.pushKV("known_head", cache.verified.certified.entry.GetHash().GetHex());
+                    params.pushKV("watch_ms", uint64_t(wait.count()));
+                    UniValue request{UniValue::VOBJ};
+                    request.pushKV("method", "updates");
+                    request.pushKV("params", std::move(params));
+                    body = request.write();
+                    sent_cursor = cache.cursor;
+                    target = m_endpoints.at(endpoint);
+                }
+            }
+        }
+        if (!wait.count()) {
+            // Not watching now: the lane's kept-alive connection would only
+            // count against the endpoint's connection limit.
+            m_watch_https.Reset();
+            lane.unlock();
+            return ordinary("not_eligible");
+        }
+        timing.Field("wait_ms", uint64_t(wait.count()));
+        timing.Field("endpoint", target.url);
+        if (m_watch_reset.exchange(false)) m_watch_https.Reset();
+        // Phase 2, lane only: a read-only request, never an action.
+        const auto sent{std::chrono::steady_clock::now()};
+        timing.Mark("request_started_us");
+        const auto reply{m_watch_https.Request(target, "/flowmesh/v1", body, wait + CLIENT_REQUEST_TIMEOUT,
+                                               FLOWMESH_CLIENT_WATCH_MAX_REPLY)};
+        const auto received{std::chrono::steady_clock::now()};
+        timing.Mark("request_completed_us");
+        timing.Field("connection_reused", uint64_t{reply.connection_reused});
+        UniValue result;
+        std::string failure;
+        bool unsupported{false};
+        std::string_view server_status;
+        try {
+            if (!reply.response_received) Fail(reply.error.empty() ? "No HTTPS response" : reply.error);
+            UniValue parsed;
+            if (!parsed.read(reply.body)) Fail("Malformed endpoint JSON response");
+            Keys(parsed, {"ok", "result", "error"});
+            if (!Flag(parsed, "ok")) {
+                const auto text{Text(parsed, "error")};
+                unsupported = text == FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR;
+                Fail(text);
+            }
+            if (reply.status != 200) Fail("Unexpected HTTPS response status");
+            result = parsed["result"];
+            if (!result.isObject() || !result["watch_status"].isStr()) Fail("Watched page has no watch status");
+            server_status = FlowMeshWatchStatusLabel(result["watch_status"].get_str());
+        } catch (const std::exception& e) {
+            failure = e.what();
+        }
+        // Release the endpoint's connection after an outcome that ends this
+        // lane's use for a while.
+        if (!failure.empty() || FlowMeshWatchReleasesLane(server_status)) m_watch_https.Reset();
+        lane.unlock();
+
+        std::optional<flowmesh::MarketData> applied;
+        std::string_view fallback;
+        {
+            // Phase 3, under m_work: the same checks and state as a Refresh.
+            timing.Mark("apply_lock_requested_us");
+            WorkLock lock{*this};
+            timing.Mark("apply_lock_acquired_us");
+            // No transport cooldown, as for the wait lane; only a successful
+            // response from this endpoint clears 'unanswered'.
+            if (!reply.response_received) m_watch_unanswered.at(endpoint) = true;
+            if (unsupported) {
+                // Downgraded, or a stale advertisement: withdrawn until the
+                // endpoint advertises it again. The same call reads ordinarily.
+                LearnUpdatesWatch({}, endpoint);
+                fallback = "unsupported";
+            } else if (!failure.empty()) {
+                // Never an automatic failover walk: the caller's ordinary
+                // reads own endpoint failover.
+                label("failed");
+                timing.Field("error", failure);
+                error = failure;
+                return std::nullopt;
+            } else {
+                if (server_status == "timeout") {
+                    const auto outside{std::chrono::duration_cast<std::chrono::milliseconds>(received - sent) - wait};
+                    m_watch_overhead = (3 * m_watch_overhead + std::max(outside, std::chrono::milliseconds{0})) / 4;
+                }
+                const auto it{m_cache.find(id)};
+                if (it == m_cache.end() || it->second.cursor.instance_id != sent_cursor.instance_id ||
+                    it->second.cursor.event_id != sent_cursor.event_id || it->second.account_scope != account) {
+                    // Another read moved this cache meanwhile: an older page
+                    // is never applied on top.
+                    fallback = "superseded";
+                } else {
+                    auto& cache{it->second};
+                    bool current{false};
+                    try {
+                        current = CheckCache(id, cache, account) == CacheCheck::CURRENT;
+                    } catch (const std::exception&) {
+                    }
+                    if (!current) {
+                        // Local B3 authority moved while the watch slept: the
+                        // ordinary read raises the gap and re-verifies.
+                        fallback = "revalidate";
+                    } else {
+                        try {
+                            const auto event_gaps = [&] {
+                                std::lock_guard status{m_status_mutex};
+                                return m_status.event_gaps;
+                            };
+                            const auto gaps{event_gaps()};
+                            cache.fresh.reset();
+                            if (ApplyUpdatesPage(cache, id, result, endpoint)) {
+                                Snapshot(id, account, flowmesh::ClientEventCursor{cache.cursor});
+                            }
+                            auto& now{m_cache.at(id)};
+                            // Observed from the send: never more permissive
+                            // than a Refresh started at the same moment.
+                            now.fresh = std::pair{sent, std::chrono::steady_clock::now()};
+                            EndpointResult(endpoint, true, {}, /*names_active=*/false);
+                            watch.supported = true;
+                            watch.waited = FlowMeshWatchWaited(server_status);
+                            watch.gap = event_gaps() > gaps;
+                            watch.endpoint_live_ms = static_cast<uint32_t>(m_updates_watch.at(endpoint).count());
+                            label(server_status);
+                            applied = Project(now, account, query);
+                        } catch (const std::exception& e) {
+                            label("invalid");
+                            timing.Field("error", std::string{e.what()});
+                            error = e.what();
+                            m_watch_reset = true;
+                            return std::nullopt;
+                        }
+                    }
+                }
+            }
+        }
+        if (applied) return applied;
+        return ordinary(fallback);
     }
     Receipt Submit(const uint256& market, const flowmesh::Action& action) override
     {
@@ -2792,6 +3061,7 @@ public:
             // bounded failover policy. This is availability, not certification.
             m_https.Reset();
             m_wait_reset = true;
+            m_watch_reset = true;
             // Do not call Markets/Refresh/QueryAction/Send: a connection probe
             // must not touch market caches, account cursors or durable history.
             Call("markets", UniValue{UniValue::VOBJ}, [&](const UniValue& value, size_t) {

@@ -43,6 +43,18 @@ public:
     virtual std::optional<interfaces::FlowMeshMarketStatus> Market(const uint256& market, const std::optional<uint256>& account) = 0;
     virtual std::optional<flowmesh::MarketData> Data(const uint256& market, const std::optional<uint256>& account,
                                                    const flowmesh::MarketDataQuery& query, std::string& error) = 0;
+    //! One bounded live-update read of a market: at most `wait` spent waiting
+    //! for a change the endpoint can report, then the same verified data
+    //! Data() returns. Never signs, sends or resends an action. A zero wait
+    //! is an ordinary read that also releases a remote client's watch lane.
+    virtual std::optional<flowmesh::MarketData> Watch(const uint256& market, const std::optional<uint256>& account,
+                                                    const flowmesh::MarketDataQuery& query, std::chrono::milliseconds wait,
+                                                    interfaces::FlowMeshMarketWatch& watch, std::string& error)
+    {
+        watch = {};
+        watch.status = "unsupported";
+        return Data(market, account, query, error);
+    }
     virtual interfaces::FlowMeshActionReceipt Submit(const uint256& market, const flowmesh::Action& action) = 0;
     //! A nonzero wait (only without retry) lets a remote backend hold one read
     //! of an action it just delivered open at the endpoint, bounded, until the
