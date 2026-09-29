@@ -15,10 +15,12 @@
 #include <modern/mpa.h>
 #include <node/flowmesh_anchor.h>
 #include <node/flowmesh_checkpoint_index.h>
+#include <node/flowmesh_health.h>
 #include <node/flowmesh_market_memo.h>
 #include <node/fn_seat_index.h>
 #include <primitives/block.h>
 #include <test/util/setup_common.h>
+#include <univalue.h>
 #include <validation.h>
 #include <validationinterface.h>
 
@@ -31,6 +33,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -43,6 +46,13 @@ bls::SecretKey SeatKey(const unsigned char tag)
     const auto key{bls::SecretKey::FromIKM(ikm)};
     BOOST_REQUIRE(key);
     return *key;
+}
+
+std::vector<std::string> NotReadyNames(const std::vector<node::FlowMeshNotReady>& reasons)
+{
+    std::vector<std::string> out;
+    for (const auto reason : reasons) out.emplace_back(node::FlowMeshNotReadyName(reason));
+    return out;
 }
 
 struct FlowMeshServiceSetup : TestingSetup {
@@ -450,6 +460,77 @@ BOOST_AUTO_TEST_CASE(client_action_wait_is_interrupted_by_wake_and_by_stop)
     service.WakeClientWaiters(); // No runtime: a no-op.
 }
 
+BOOST_AUTO_TEST_CASE(health_follows_gate_reasons_and_never_waits_for_cs_main)
+{
+    using namespace std::chrono_literals;
+    using Names = std::vector<std::string>;
+    // Started at genesis, below activation: reported at once, no grace.
+    auto health{service.Health()};
+    BOOST_CHECK(health.state == node::FlowMeshServiceState::RUNNING);
+    BOOST_CHECK(health.gate.closed);
+    BOOST_CHECK(health.gate.reason == node::FlowMeshGateReason::BELOW_ACTIVATION);
+    BOOST_REQUIRE(health.gate.closed_since);
+    const auto closed_since{*health.gate.closed_since};
+    BOOST_CHECK(NotReadyNames(health.service_not_ready) == Names{"below_activation"});
+    BOOST_CHECK(health.rows.empty());
+    BOOST_REQUIRE(health.snapshot); // Published by the runtime's Start.
+
+    // Each B3 tip notification records why the gate stays closed. The gate
+    // never opened, so its closure is still the same continuous one.
+    auto& signals{*m_node.validation_signals};
+    signals.RegisterValidationInterface(&service);
+    const CBlockIndex* tip{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip())};
+    signals.UpdatedBlockTip(tip, nullptr, /*fInitialDownload=*/true);
+    signals.SyncWithValidationInterfaceQueue();
+    health = service.Health();
+    BOOST_CHECK(health.gate.reason == node::FlowMeshGateReason::INITIAL_BLOCK_DOWNLOAD);
+    BOOST_CHECK(NotReadyNames(health.service_not_ready) == Names{"initial_block_download"});
+    signals.UpdatedBlockTip(tip, nullptr, /*fInitialDownload=*/false);
+    signals.SyncWithValidationInterfaceQueue();
+    health = service.Health();
+    BOOST_CHECK(health.gate.reason == node::FlowMeshGateReason::BELOW_ACTIVATION);
+    BOOST_CHECK(health.gate.closed_since == closed_since);
+    signals.UnregisterValidationInterface(&service);
+    signals.SyncWithValidationInterfaceQueue();
+
+    // A health read takes no chain lock.
+    std::future<node::FlowMeshServiceHealth> pending;
+    bool answered{false};
+    {
+        LOCK(::cs_main);
+        pending = std::async(std::launch::async, [&] { return service.Health(); });
+        answered = pending.wait_for(1s) == std::future_status::ready;
+    }
+    BOOST_CHECK(answered);
+    BOOST_CHECK(pending.get().state == node::FlowMeshServiceState::RUNNING);
+
+    service.Stop();
+    health = service.Health();
+    BOOST_CHECK(health.state == node::FlowMeshServiceState::STOPPED);
+    BOOST_CHECK(!health.snapshot);
+    BOOST_CHECK(NotReadyNames(health.service_not_ready) == Names{"service_stopped"});
+}
+
+BOOST_FIXTURE_TEST_CASE(health_of_an_unstarted_or_dormant_service_is_not_ready, RegTestingSetup)
+{
+    using Names = std::vector<std::string>;
+    node::FlowMeshService dormant{*m_node.chainman, m_args.GetDataDirNet() / "dormant-health"};
+    auto health{dormant.Health()};
+    BOOST_CHECK(health.state == node::FlowMeshServiceState::STOPPED);
+    BOOST_CHECK(NotReadyNames(health.service_not_ready) == Names{"service_stopped"});
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(dormant.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(!dormant.Enabled()); // The default regtest has no A2/A3 schedule.
+    health = dormant.Health();
+    BOOST_CHECK(health.state == node::FlowMeshServiceState::DORMANT);
+    // Dormant is a service state, never a closed chain gate.
+    BOOST_CHECK(!health.gate.closed);
+    BOOST_CHECK(NotReadyNames(health.service_not_ready) == Names{"service_stopped"});
+    const auto json{node::FlowMeshServiceHealthJson(health, /*operator_detail=*/true)};
+    BOOST_CHECK_EQUAL(json["service"]["state"].get_str(), "dormant");
+    BOOST_CHECK(!json["service"].exists("chain_gate"));
+}
+
 BOOST_FIXTURE_TEST_CASE(settlement_requirement_memo_requires_same_head_anchor_and_generation,
                         BasicTestingSetup)
 {
@@ -846,6 +927,49 @@ BOOST_AUTO_TEST_CASE(seat_transition_verifies_each_durable_head_once_and_replans
     BOOST_CHECK_EQUAL(counts().head_entry_reads, moved.head_entry_reads);
     BOOST_CHECK_EQUAL(counts().settlement_plans, moved.settlement_plans);
     BOOST_CHECK(service.MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
+}
+
+BOOST_AUTO_TEST_CASE(health_reports_an_installed_market_head_and_pause_reason)
+{
+    const auto genesis{Genesis()};
+    Retain(genesis);
+    std::string error;
+    node::FlowMeshService service{*m_node.chainman, ServicePath()};
+    service.SetHealthPolicy(node::FlowMeshHealthPolicy::WithGrace(std::chrono::minutes{1}));
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE_MESSAGE(service.ArmSeatKeys(secrets, error), error);
+    // Until B3 anchors the market genesis, the market pauses for it.
+    BOOST_REQUIRE(WaitUntil([&] {
+        const auto health{service.Health(market)};
+        const auto* row{health.Find(market)};
+        return row && row->observation && row->observation->next_sequence == 1 &&
+               row->observation->pause_reason == "genesis_checkpoint_pending";
+    }));
+    const auto health{service.Health(market)};
+    BOOST_CHECK(health.state == node::FlowMeshServiceState::RUNNING);
+    BOOST_CHECK(!health.gate.closed);
+    BOOST_CHECK(health.ServiceReady());
+    BOOST_CHECK_EQUAL(health.policy.lag_grace.count(), 60'000);
+    BOOST_REQUIRE_EQUAL(health.rows.size(), 1U);
+    const auto& row{health.rows.front()};
+    BOOST_REQUIRE(row.observation);
+    BOOST_CHECK(row.observation->installed);
+    BOOST_CHECK_EQUAL(row.observation->epoch, 0U);
+    BOOST_CHECK_EQUAL(row.observation->active_seats, 4U);
+    BOOST_CHECK_EQUAL(row.observation->quorum_required, 3U);
+    BOOST_CHECK(row.observation->last_hash == genesis.GetHash());
+    BOOST_CHECK(row.observation->head_advanced_at);
+    BOOST_CHECK(row.observation->paused);
+    BOOST_CHECK(!row.observation->halted);
+    BOOST_CHECK(row.readiness.ready);
+    BOOST_CHECK_EQUAL(row.readiness.state, "paused");
+    BOOST_CHECK_EQUAL(service.Health().rows.size(), 1U);
+    BOOST_CHECK(service.Health(uint256::ONE).rows.empty());
+    const auto json{node::FlowMeshServiceHealthJson(health, /*operator_detail=*/false)};
+    BOOST_CHECK_EQUAL(json["markets"][0]["pause_reason"].get_str(), "genesis_checkpoint_pending");
+    BOOST_CHECK_EQUAL(json["service"]["chain_gate"].get_str(), "open");
+    service.Stop();
+    BOOST_CHECK(service.Health(market).rows.front().readiness.state == std::string{"stopped"});
 }
 
 BOOST_AUTO_TEST_CASE(dual_ingress_shares_vote_state_and_one_retained_signing_history)

@@ -326,9 +326,57 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     bool enabled{false};
     bool running{false};
     bool stopping{false};
+    bool start_attempted{false};
     std::atomic<bool> chain_reconciling{false};
     std::atomic<uint64_t> delivery_generation{0};
     uint256 reconciled_tip;
+
+    // Health observation only: no gate predicate, admission or runtime
+    // decision reads anything below. The atomic chain_reconciling stays the
+    // one authority; each observation re-reads it under gate_mutex (a leaf)
+    // together with how often the gate has opened, so concurrent writers
+    // converge to the real gate.
+    std::atomic<uint64_t> gate_opens{0};
+    mutable std::mutex gate_mutex;
+    mutable FlowMeshGateObserver gate_observer;
+    // What Health() needs, copied under `mutex` wherever it changes, so a
+    // health read never waits for `mutex` (held across cs_main when a market
+    // is first installed). health_mutex is a leaf.
+    struct HealthView {
+        FlowMeshServiceState state{FlowMeshServiceState::STOPPED};
+        std::shared_ptr<FlowMeshRuntime> runtime;
+        std::set<flowmesh::MarketId> markets;
+        FlowMeshHealthPolicy policy;
+    };
+    mutable std::mutex health_mutex;
+    HealthView health_view;
+
+    // Caller holds `mutex`.
+    void PublishHealthViewLocked()
+    {
+        const FlowMeshServiceState state{
+            running && !stopping ? FlowMeshServiceState::RUNNING
+            : start_attempted && !enabled ? FlowMeshServiceState::DORMANT
+                                          : FlowMeshServiceState::STOPPED};
+        std::set<flowmesh::MarketId> ids;
+        for (const auto& [id, resources] : markets) {
+            (void)resources;
+            ids.insert(id);
+        }
+        std::lock_guard<std::mutex> lock{health_mutex};
+        health_view.state = state;
+        health_view.runtime = state == FlowMeshServiceState::RUNNING ? runtime : nullptr;
+        health_view.markets = std::move(ids);
+    }
+
+    // `reason` refines the observation while the gate is closed.
+    void NoteGate(const std::optional<FlowMeshGateReason> reason = std::nullopt) const
+    {
+        std::lock_guard<std::mutex> lock{gate_mutex};
+        const bool closed{chain_reconciling.load(std::memory_order_acquire)};
+        const uint64_t opens{gate_opens.load(std::memory_order_acquire)};
+        gate_observer.Observe(closed, opens, clock.Now(), reason);
+    }
 
     // Repeat answers for one unchanged durable head and one unchanged chain
     // observation, one per market so that markets never evict each other.
@@ -464,11 +512,15 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         return delivery_generation.load(std::memory_order_acquire);
     }
 
-    void SetChainReconciling(bool value)
+    void SetChainReconciling(bool value,
+                             FlowMeshGateReason reason = FlowMeshGateReason::RECONCILING)
     {
         delivery_generation.fetch_add(1, std::memory_order_acq_rel);
         chain_reconciling.store(value, std::memory_order_release);
         delivery_generation.fetch_add(1, std::memory_order_release);
+        // Observation only, after the gate's own stores.
+        if (!value) gate_opens.fetch_add(1, std::memory_order_acq_rel);
+        NoteGate(value ? std::optional{reason} : std::nullopt);
         ReconciliationTrace(value ? "gate_closed" : "gate_opened", DeliveryGeneration());
     }
 
@@ -1343,6 +1395,7 @@ bool FlowMeshService::Impl::InstallMarket(
             record.market_id, std::make_unique<MarketResources>())};
         resources = it->second.get();
         if (inserted) {
+            PublishHealthViewLocked();
             resources->metadata = metadata;
             resources->chain_record = record;
             Chainstate* active_chainstate{nullptr};
@@ -1739,16 +1792,18 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
         if (m_impl->running) return true;
+        m_impl->start_attempted = true;
         m_impl->enabled =
             Consensus::FlowMeshSeatBindingScheduleConfigured(
                 m_impl->chainman.GetConsensus());
         if (!m_impl->enabled) {
+            m_impl->PublishHealthViewLocked();
             LogInfo("FlowMesh service dormant: A2/A3 schedule is not complete\n");
             return true;
         }
         m_impl->peerman = &peerman;
         m_impl->stopping = false;
-        m_impl->SetChainReconciling(true);
+        m_impl->SetChainReconciling(true, FlowMeshGateReason::STARTING);
     }
 
     FlowMeshRuntimeConfig config;
@@ -1772,6 +1827,7 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
         std::lock_guard<std::mutex> lock{m_impl->mutex};
         m_impl->runtime = runtime;
         m_impl->running = true;
+        m_impl->PublishHealthViewLocked();
         m_impl->ticker =
             std::thread{&FlowMeshService::Impl::TickerLoop, m_impl.get()};
     }
@@ -1810,17 +1866,19 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
     }
     if (!m_impl->RulesActiveAtTip()) {
         error.clear();
+        m_impl->NoteGate(FlowMeshGateReason::BELOW_ACTIVATION);
         LogInfo("FlowMesh production service waiting for its A3 activation height\n");
         return true;
     }
     if (!m_impl->ReconciledTipMatches(market_tip)) {
         error.clear();
+        m_impl->NoteGate(FlowMeshGateReason::TIP_CHANGED);
         LogInfo("FlowMesh production service waiting for a stable reconciled B3 tip\n");
         return true;
     }
     m_impl->SetChainReconciling(false);
     if (!m_impl->ReconciledAtTip()) {
-        m_impl->SetChainReconciling(true);
+        m_impl->SetChainReconciling(true, FlowMeshGateReason::TIP_CHANGED);
         LogInfo("FlowMesh production service waiting: B3 tip changed before startup completed\n");
         return true;
     }
@@ -1838,6 +1896,7 @@ void FlowMeshService::Stop()
         std::lock_guard<std::mutex> lock{m_impl->mutex};
         if (!m_impl->running && !m_impl->runtime) return;
         m_impl->stopping = true;
+        m_impl->PublishHealthViewLocked();
         m_impl->ticker_cv.notify_all();
         runtime = m_impl->runtime;
         network = m_impl->network;
@@ -1851,6 +1910,7 @@ void FlowMeshService::Stop()
         m_impl->network.reset();
         m_impl->running = false;
         m_impl->peerman = nullptr;
+        m_impl->PublishHealthViewLocked();
     }
 }
 
@@ -1916,6 +1976,44 @@ std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshService::DeliverySnapshots(
     }
     return runtime ? runtime->DeliverySnapshots(market_id)
                    : std::vector<FlowMeshRuntimeDeliverySnapshot>{};
+}
+
+FlowMeshServiceHealth FlowMeshService::Health(
+    const std::optional<flowmesh::MarketId>& market) const
+{
+    FlowMeshServiceState state;
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    std::set<flowmesh::MarketId> markets;
+    FlowMeshHealthPolicy policy;
+    {
+        std::lock_guard<std::mutex> lock{m_impl->health_mutex};
+        const auto& view{m_impl->health_view};
+        state = view.state;
+        runtime = view.runtime;
+        policy = view.policy;
+        if (!market) {
+            markets = view.markets;
+        } else if (view.markets.contains(*market)) {
+            markets.insert(*market);
+        }
+    }
+    // Refresh the observation from the gate itself, so a transition this
+    // observer missed can never be reported as the gate's current state.
+    m_impl->NoteGate();
+    FlowMeshGateObservation gate;
+    {
+        std::lock_guard<std::mutex> lock{m_impl->gate_mutex};
+        gate = m_impl->gate_observer.Get();
+    }
+    const auto now{m_impl->clock.Now()};
+    auto snapshot{runtime ? runtime->HealthSnapshot() : nullptr};
+    return BuildFlowMeshServiceHealth(state, gate, policy, now, std::move(snapshot), markets, market);
+}
+
+void FlowMeshService::SetHealthPolicy(const FlowMeshHealthPolicy& policy)
+{
+    std::lock_guard<std::mutex> lock{m_impl->health_mutex};
+    m_impl->health_view.policy = policy;
 }
 
 std::vector<FlowMeshServiceMarket> FlowMeshService::Markets() const
@@ -2685,7 +2783,7 @@ void FlowMeshService::BlockDisconnected(
     // This callback precedes UpdatedBlockTip on the validation-interface
     // queue. Stop admitting/ticking production at the earliest available
     // disconnect signal; UpdatedBlockTip performs the exact durable rollback.
-    m_impl->SetChainReconciling(true);
+    m_impl->SetChainReconciling(true, FlowMeshGateReason::RECONCILING);
 }
 
 void FlowMeshService::ReconcileAfterInitialBlockDownload()
@@ -2709,10 +2807,14 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
                                       const bool initial_download)
 {
     if (!Running()) return;
-    m_impl->SetChainReconciling(true);
+    // Each early return below leaves the gate closed until the next tip; the
+    // observation records why (never read by any gate predicate).
+    m_impl->SetChainReconciling(true, initial_download ? FlowMeshGateReason::INITIAL_BLOCK_DOWNLOAD
+                                                       : FlowMeshGateReason::RECONCILING);
     if (initial_download) return;
     const uint256 callback_tip{new_tip ? new_tip->GetBlockHash() : uint256{}};
     if (!m_impl->RulesActiveAtTip()) {
+        m_impl->NoteGate(FlowMeshGateReason::BELOW_ACTIVATION);
         LogInfo("FlowMesh remains paused below its A3 activation height\n");
         return;
     }
@@ -2725,6 +2827,7 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
     ReconciliationTrace("idle_wait_started", m_impl->DeliveryGeneration(), callback_tip);
     if (runtime && !runtime->WaitForIdle(std::chrono::seconds{5})) {
         ReconciliationTrace("idle_wait_timeout", m_impl->DeliveryGeneration(), callback_tip);
+        m_impl->NoteGate(FlowMeshGateReason::IDLE_WAIT_TIMEOUT);
         LogWarning("FlowMesh remains paused: runtime did not quiesce for B3 checkpoint reconciliation\n");
         return;
     }
@@ -2733,6 +2836,7 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
     std::string error;
     if (!m_impl->ReconcileAllStoreConnections(error)) {
         ReconciliationTrace("store_reconciliation_failed", m_impl->DeliveryGeneration(), callback_tip);
+        m_impl->NoteGate(FlowMeshGateReason::STORE_RECONCILIATION_FAILED);
         LogWarning("FlowMesh remains paused: durable checkpoint reconciliation failed: %s\n",
                    error);
         return;
@@ -2742,6 +2846,7 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
     uint256 market_tip;
     if (!m_impl->RefreshMarkets(market_tip, error)) {
         ReconciliationTrace("market_refresh_failed", m_impl->DeliveryGeneration(), callback_tip);
+        m_impl->NoteGate(FlowMeshGateReason::MARKET_REFRESH_FAILED);
         LogWarning("FlowMesh market refresh failed: %s\n", error);
         return;
     }
@@ -2749,6 +2854,7 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
     error.clear();
     if (!m_impl->ReconcileConnectedCheckpoints(error)) {
         ReconciliationTrace("checkpoint_reconciliation_failed", m_impl->DeliveryGeneration(), callback_tip);
+        m_impl->NoteGate(FlowMeshGateReason::CHECKPOINT_RECONCILIATION_FAILED);
         LogWarning("FlowMesh remains paused: connected checkpoint reconciliation failed: %s\n",
                    error);
         return;
@@ -2757,6 +2863,7 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
     error.clear();
     if (!m_impl->ReconcileAllStoreConnections(error)) {
         ReconciliationTrace("final_store_reconciliation_failed", m_impl->DeliveryGeneration(), callback_tip);
+        m_impl->NoteGate(FlowMeshGateReason::STORE_RECONCILIATION_FAILED);
         LogWarning("FlowMesh remains paused: B3 tip changed after checkpoint connection: %s\n",
                    error);
         return;
@@ -2764,12 +2871,13 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
     ReconciliationTrace("final_store_reconciled", m_impl->DeliveryGeneration(), callback_tip);
     if (market_tip != callback_tip ||
         !m_impl->ReconciledTipMatches(callback_tip)) {
+        m_impl->NoteGate(FlowMeshGateReason::TIP_CHANGED);
         LogInfo("FlowMesh remains paused: B3 tip changed during reconciliation\n");
         return;
     }
     m_impl->SetChainReconciling(false);
     if (!m_impl->ReconciledAtTip()) {
-        m_impl->SetChainReconciling(true);
+        m_impl->SetChainReconciling(true, FlowMeshGateReason::TIP_CHANGED);
         LogInfo("FlowMesh remains paused: B3 tip changed before reconciliation completed\n");
         return;
     }

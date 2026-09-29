@@ -161,6 +161,16 @@ public:
     FlowMeshNetConnectResult AddNetworkPeer(const std::string& peer);
     std::vector<FlowMeshRuntimeDeliverySnapshot> DeliverySnapshots(
         std::optional<flowmesh::MarketId> market_id = std::nullopt) const;
+    /** Local, advisory health of this service and its markets (see
+     * node/flowmesh_health.h): what this node has observed, never evidence
+     * or an input to admission, relay, signing or verification. Takes only
+     * leaf mutexes and a shared snapshot: never cs_main, the service or
+     * market mutex, the store or the network, so it answers while the chain
+     * or the runtime worker is busy. `market` limits the rows to one market. */
+    FlowMeshServiceHealth Health(
+        const std::optional<flowmesh::MarketId>& market = std::nullopt) const;
+    /** Node-local health thresholds; call before Start. */
+    void SetHealthPolicy(const FlowMeshHealthPolicy& policy);
 
     std::vector<FlowMeshServiceMarket> Markets() const;
     std::optional<FlowMeshServiceMarket> Market(
