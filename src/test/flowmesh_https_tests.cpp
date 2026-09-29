@@ -5,6 +5,7 @@
 #include <node/flowmesh_https.h>
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_client_action_wait.h>
+#include <node/flowmesh_client_outcome.h>
 #include <node/flowmesh_service.h>
 #include <chain.h>
 #include <consensus/era.h>
@@ -12,6 +13,7 @@
 #include <crypto/sha256.h>
 #include <dbwrapper.h>
 #include <flowmesh/bls_certificate.h>
+#include <flowmesh/outcome_evidence.h>
 #include <flowmesh/production_engine.h>
 #include <flowmesh/production_wire.h>
 #include <modern/asset_output.h>
@@ -2208,6 +2210,13 @@ struct ScriptedEndpoint {
     UniValue markets{UniValue::VARR};
     UniValue plain{UniValue::VOBJ}, waited{UniValue::VOBJ}, submit{UniValue::VOBJ};
     unsigned plain_reads{0}, waited_reads{0}, submits{0}, market_reads{0};
+    //! Opt-in outcome requests: 'action' reads carrying "outcome": true, and
+    //! 'outcome_evidence' reads (answered with `evidence`, or `evidence_error`).
+    unsigned outcome_flags{0}, evidence_reads{0};
+    UniValue evidence{UniValue::VOBJ};
+    std::string evidence_error;
+    //! Answer "outcome" with the unknown-field error (a downgraded endpoint).
+    bool reject_outcome_field{false};
 
     node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
     {
@@ -2217,6 +2226,17 @@ struct ScriptedEndpoint {
         std::lock_guard lock{mutex};
         UniValue out{UniValue::VOBJ};
         out.pushKV("ok", true);
+        if (method == "action" && json["params"].exists("outcome")) {
+            ++outcome_flags;
+            if (reject_outcome_field) return {400, R"({"ok":false,"error":"Unknown or duplicate client API field"})"};
+        }
+        if (method == "outcome_evidence") {
+            ++evidence_reads;
+            if (!evidence_error.empty()) return {400, R"({"ok":false,"error":")" + evidence_error + R"("})"};
+            out.pushKV("result", evidence);
+            out.pushKV("error", "");
+            return {200, out.write()};
+        }
         if (method == "markets") {
             ++market_reads;
             out.pushKV("result", markets);
@@ -2436,6 +2456,51 @@ struct ClientLaneFixture : TestingSetup {
         receipt.pushKV("microblock_sequence", entry.sequence);
         receipt.pushKV("certified_payload", HexStr(*payload));
         return receipt;
+    }
+    /** An opt-in 'action' reply for a microblock whose body really executes
+     * `action`: its certified payload plus the outcome evidence that hashes
+     * to the entry's result root. Also returns the evidence hex alone. */
+    std::pair<UniValue, std::string> OutcomeReceipt(const flowmesh::Action& action) const
+    {
+        const auto& params{m_node.chainman->GetConsensus()};
+        const CScript treasury{params.modern_pos->treasury_script.begin(), params.modern_pos->treasury_script.end()};
+        node::ChainAnchorPolicy anchors{*m_node.chainman, Consensus::FLOWMESH_ANCHOR_DEPTH};
+        flowmesh::AnchorRef anchor;
+        int height;
+        {
+            LOCK(::cs_main);
+            height = m_node.chainman->ActiveChain().Height();
+            const auto* index{m_node.chainman->ActiveChain()[static_cast<int>(seats.anchor_height)]};
+            anchor = {index->nHeight, index->GetBlockHash()};
+        }
+        const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+        flowmesh::ProductionEpochGate gate{domain, market, seats};
+        flowmesh::ProductionEntryCheck check;
+        const std::vector<flowmesh::Action> body{action};
+        const auto built{flowmesh::BuildProductionExecutionEntry(initial, domain, market, seats, gate, 0, 0, {}, anchor,
+            {height, std::nullopt, &anchors}, modern::AssetOwnerCommitment(treasury), body, nullptr, check)};
+        BOOST_REQUIRE_MESSAGE(built, flowmesh::ProductionEntryCheckName(check));
+        std::vector<flowmesh::IndexedBlsSignature> signatures;
+        const auto context{flowmesh::ProductionCertificateContext(built->entry)};
+        for (uint32_t i{0}; i < flowmesh::FlowMeshBlsThreshold(seats.Size()); ++i) {
+            const auto signature{flowmesh::SignBlsMicroblockCertificate(secrets[i], context, seats)};
+            BOOST_REQUIRE(signature);
+            signatures.push_back({i, *signature});
+        }
+        flowmesh::BlsMicroblockCertificate certificate;
+        BOOST_REQUIRE(flowmesh::AssembleProductionEntryCertificate(built->entry, seats, signatures, certificate) ==
+                      flowmesh::BlsCertificateAssemblyCheck::OK);
+        const auto payload{flowmesh::EncodeProductionCertifiedPayload({built->entry, certificate}, seats.Size())};
+        BOOST_REQUIRE(payload);
+        const auto evidence{flowmesh::EncodeExecutionOutcomeEvidenceV1(built->entry.sequence, built->entry.GetHash(),
+            flowmesh::MakeExecutionOutcomePreimageV1(built->result), built->effects)};
+        BOOST_REQUIRE(evidence);
+        auto receipt{Receipt(action, "certified_inclusion")};
+        receipt.pushKV("microblock_hash", built->entry.GetHash().GetHex());
+        receipt.pushKV("microblock_sequence", built->entry.sequence);
+        receipt.pushKV("certified_payload", HexStr(*payload));
+        receipt.pushKV("outcome_evidence", HexStr(*evidence));
+        return {receipt, HexStr(*evidence)};
     }
     //! The outbox row Restore reads back for `action`, from a closed journal.
     static UniValue DurableRow(const fs::path& path, const flowmesh::Action& action)
@@ -3061,6 +3126,232 @@ BOOST_AUTO_TEST_CASE(api_outcome_contract_advert_and_opt_in_only)
         api->Stop();
     }
     service.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+//! The same reply without the opt-in evidence (as a v1 endpoint sends it).
+UniValue WithoutEvidence(const UniValue& reply)
+{
+    UniValue out{UniValue::VOBJ};
+    for (const auto& key : reply.getKeys()) if (key != "outcome_evidence") out.pushKV(key, reply[key]);
+    return out;
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_outcome_evidence_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(advertised_action_outcome_parses_only_true)
+{
+    UniValue status{UniValue::VOBJ};
+    BOOST_CHECK(!node::FlowMeshAdvertisedActionOutcome(status));
+    for (const char* value : {"1", "\"true\"", "false", "null"}) {
+        UniValue row{UniValue::VOBJ};
+        UniValue parsed;
+        BOOST_REQUIRE(parsed.read(std::string{"["} + value + "]"));
+        row.pushKV("action_outcome_v1", parsed[0]);
+        BOOST_CHECK(!node::FlowMeshAdvertisedActionOutcome(row));
+    }
+    status.pushKV("action_outcome_v1", true);
+    BOOST_CHECK(node::FlowMeshAdvertisedActionOutcome(status));
+    BOOST_CHECK(!node::FlowMeshAdvertisedActionOutcome(UniValue{}));
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_verifies_outcome_evidence_only_on_advertising_endpoints)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    auto row{MarketRow(std::chrono::milliseconds{0})};
+    row.pushKV("action_outcome_v1", true);
+    validator.markets.push_back(row);
+    validator.plain = OutcomeReceipt(action).first;
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK_EQUAL(receipt.state, "certified_inclusion");
+    BOOST_CHECK(receipt.certificate_verified);
+    BOOST_REQUIRE(receipt.outcome_verified);
+    BOOST_REQUIRE(receipt.outcome);
+    // The seeded cancel is at sequence 3 of a fresh account: included, not
+    // executed, and not final (the same bytes could still execute).
+    BOOST_CHECK_EQUAL(receipt.outcome->status, "included_not_executed");
+    BOOST_CHECK(!receipt.outcome->final);
+    BOOST_CHECK_EQUAL(receipt.outcome->reason_code, "INCLUDED_BAD_SEQUENCE");
+    BOOST_CHECK_EQUAL(receipt.outcome->evidence, "certified_result_preimage");
+    BOOST_CHECK(receipt.outcome->microblock_hash == receipt.microblock_hash);
+    BOOST_CHECK_EQUAL(receipt.reason_code, "INCLUDED_BAD_SEQUENCE");
+    BOOST_CHECK_EQUAL(validator.outcome_flags, 1U);
+    // Verified once, it is returned without another request.
+    const auto again{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(again.outcome_verified);
+    BOOST_CHECK_EQUAL(validator.Counts()[0], 1U);
+    client.reset();
+    server->Stop();
+
+    // An endpoint that does not advertise it never receives "outcome", and
+    // the verified inclusion says why there is no outcome.
+    const fs::path other{m_path_root / "client-old"};
+    const auto seeded{Seed(other, owner)};
+    ScriptedEndpoint old;
+    old.markets.push_back(MarketRow(std::chrono::milliseconds{0}));
+    old.plain = WithoutEvidence(OutcomeReceipt(seeded).first); // a v1 reply
+    auto old_server{Serve(old)};
+    auto old_client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(old_server->Port())}, other, error)};
+    BOOST_REQUIRE_MESSAGE(old_client, error);
+    BOOST_REQUIRE_EQUAL(old_client->Markets(std::nullopt).size(), 1U);
+    const auto unoffered{old_client->ActionStatus(market, seeded.Id(), false)};
+    BOOST_CHECK(unoffered.certificate_verified);
+    BOOST_CHECK(!unoffered.outcome_verified);
+    BOOST_CHECK(!unoffered.outcome);
+    BOOST_CHECK_EQUAL(unoffered.reason_code, "OUTCOME_NOT_OFFERED");
+    BOOST_CHECK_EQUAL(old.outcome_flags, 0U);
+    old_client.reset();
+    old_server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(evidence_failure_never_downgrades_inclusion)
+{
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto run = [&](const std::string& name, const std::function<void(UniValue&)>& mutate) {
+        const fs::path path{m_path_root / fs::PathFromString(name)};
+        const auto action{Seed(path, owner)};
+        ScriptedEndpoint validator;
+        auto row{MarketRow(std::chrono::milliseconds{0})};
+        row.pushKV("action_outcome_v1", true);
+        validator.markets.push_back(row);
+        auto reply{OutcomeReceipt(action).first};
+        mutate(reply);
+        validator.plain = reply;
+        auto server{Serve(validator)};
+        std::string error;
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        auto receipt{client->ActionStatus(market, action.Id(), false)};
+        client.reset();
+        server->Stop();
+        return receipt;
+    };
+    // Tampered evidence: the result root no longer matches.
+    const auto tampered{run("tampered", [](UniValue& reply) {
+        auto hex{reply["outcome_evidence"].get_str()};
+        hex[hex.size() - 1] = hex.back() == '0' ? '1' : '0';
+        reply.pushKV("outcome_evidence", hex);
+    })};
+    BOOST_CHECK(tampered.certificate_verified);
+    BOOST_CHECK_EQUAL(tampered.state, "certified_inclusion");
+    BOOST_CHECK(!tampered.outcome_verified && !tampered.outcome);
+    BOOST_CHECK_EQUAL(tampered.reason_code, "OUTCOME_EVIDENCE_INVALID");
+    const auto malformed{run("malformed", [](UniValue& reply) { reply.pushKV("outcome_evidence", "zz"); })};
+    BOOST_CHECK(malformed.certificate_verified && !malformed.outcome_verified);
+    BOOST_CHECK_EQUAL(malformed.reason_code, "OUTCOME_EVIDENCE_INVALID");
+    for (const std::string code : {"EXPIRED", "TOO_LARGE", "BUDGET"}) {
+        const auto missing{run("missing-" + code, [&](UniValue& reply) {
+            UniValue without{UniValue::VOBJ};
+            for (const auto& key : reply.getKeys()) if (key != "outcome_evidence") without.pushKV(key, reply[key]);
+            without.pushKV("outcome_evidence_error", code);
+            reply = without;
+        })};
+        BOOST_CHECK(missing.certificate_verified && !missing.outcome_verified);
+        BOOST_CHECK_EQUAL(missing.reason_code, (code == "EXPIRED" ? "OUTCOME_EVIDENCE_EXPIRED"
+                                                : code == "TOO_LARGE" ? "OUTCOME_EVIDENCE_TOO_LARGE"
+                                                                      : "OUTCOME_EVIDENCE_BUDGET"));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(outcome_upgrade_at_most_once_per_endpoint)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    auto row{MarketRow(std::chrono::milliseconds{0})};
+    row.pushKV("action_outcome_v1", true);
+    validator.markets.push_back(row);
+    auto [reply, evidence]{OutcomeReceipt(action)};
+    UniValue without{UniValue::VOBJ};
+    for (const auto& key : reply.getKeys()) if (key != "outcome_evidence") without.pushKV(key, reply[key]);
+    without.pushKV("outcome_evidence_error", "BUDGET");
+    validator.plain = without;
+    validator.evidence_error = "FlowMesh outcome evidence is unavailable: EXPIRED";
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto first{client->ActionStatus(market, action.Id(), false)};
+    BOOST_REQUIRE(first.certificate_verified);
+    BOOST_CHECK(!first.outcome_verified);
+    BOOST_CHECK_EQUAL(first.reason_code, "OUTCOME_EVIDENCE_BUDGET");
+    BOOST_CHECK_EQUAL(validator.evidence_reads, 0U);
+    // The verified inclusion asks its endpoint once for the evidence; an
+    // unavailable answer is recorded and never retried against it.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100}); // leave the status budget's window
+    const auto expired{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(expired.certificate_verified && !expired.outcome_verified);
+    BOOST_CHECK_EQUAL(expired.reason_code, "OUTCOME_EVIDENCE_EXPIRED");
+    BOOST_CHECK_EQUAL(validator.evidence_reads, 1U);
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.evidence_error.clear();
+        validator.evidence.pushKV("outcome_evidence", evidence);
+    }
+    const auto still{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(!still.outcome_verified);
+    BOOST_CHECK_EQUAL(validator.evidence_reads, 1U);
+    BOOST_CHECK_EQUAL(validator.Counts()[0], 1U); // inclusion is never re-read
+    client.reset();
+
+    // A fresh process asks again and verifies from the evidence method.
+    auto restarted{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(restarted, error);
+    BOOST_REQUIRE_EQUAL(restarted->Markets(std::nullopt).size(), 1U);
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.plain = reply; // an ordinary proof, with evidence
+    }
+    const auto proved{restarted->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(proved.certificate_verified);
+    BOOST_CHECK(proved.outcome_verified);
+    restarted.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(unknown_field_error_clears_both_capabilities)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    auto row{MarketRow(std::chrono::milliseconds{1000})};
+    row.pushKV("action_outcome_v1", true);
+    validator.markets.push_back(row);
+    validator.plain = WithoutEvidence(OutcomeReceipt(action).first); // its v1 reply
+    validator.reject_outcome_field = true;
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // The downgraded endpoint refuses the field: nothing is applied, and both
+    // advertised capabilities are withdrawn until it advertises them again.
+    const auto refused{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(!refused.certificate_verified);
+    BOOST_CHECK_EQUAL(validator.outcome_flags, 1U);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    const auto plain{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(plain.certificate_verified);
+    BOOST_CHECK(!plain.outcome_verified);
+    BOOST_CHECK_EQUAL(plain.reason_code, "OUTCOME_NOT_OFFERED");
+    BOOST_CHECK_EQUAL(validator.outcome_flags, 1U);
+    client.reset();
+    server->Stop();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

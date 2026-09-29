@@ -67,6 +67,11 @@ constexpr auto CLIENT_REQUEST_TIMEOUT{std::chrono::seconds{5}};
 // A waited 'action' reply carries at most one hex certified entry.
 constexpr size_t CLIENT_ACTION_WAIT_MAX_REPLY{2 * (flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES + 1024) + 64 * 1024};
 static_assert(CLIENT_ACTION_WAIT_MAX_REPLY <= CLIENT_MAX_REPLY);
+// An opt-in reply adds at most the consumer's hex entry and two hex evidences.
+constexpr size_t CLIENT_ACTION_OUTCOME_MAX_REPLY{2 * CLIENT_ACTION_WAIT_MAX_REPLY +
+                                                 4 * flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES + 64 * 1024};
+static_assert(CLIENT_ACTION_OUTCOME_MAX_REPLY <= CLIENT_MAX_REPLY);
+constexpr size_t CLIENT_OUTCOME_EVIDENCE_MAX_REPLY{2 * flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES + 4096};
 // A waited 'action' read ends at least this long before its HTTPS deadline,
 // leaving time to fetch the certified payload and write the reply.
 constexpr auto API_WAIT_REPLY_RESERVE{std::chrono::milliseconds{1000}};
@@ -940,6 +945,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // Per endpoint (index-stable, like m_retry_after), under m_work: the bounded
     // 'action' wait each endpoint last advertised. Zero never sends wait_ms.
     std::vector<std::chrono::milliseconds> m_action_wait;
+    // Per endpoint (index-stable), under m_work: it advertised verifiable
+    // outcomes ("action_outcome_v1": true). False never sends "outcome".
+    std::vector<bool> m_action_outcome;
     // Per endpoint, under m_work: a lane request to it got no HTTP response.
     // The lane skips it until EndpointResult records a successful response
     // from it (an ordinary read or probe), so a silent endpoint costs a
@@ -956,6 +964,15 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // service is tried again after its transport cooldown expires.
     size_t m_preferred{0};
     std::unique_ptr<CDBWrapper> m_db;
+    //! Withdraws every verified label together: an unverified inclusion
+    //! never keeps an outcome.
+    static void WithdrawVerifiedLabels(Receipt& receipt)
+    {
+        receipt.certificate_verified = false;
+        receipt.state = "unknown";
+        receipt.outcome.reset();
+        receipt.outcome_verified = false;
+    }
     struct Pending {
         uint256 market, domain, config;
         flowmesh::Action action;
@@ -976,6 +993,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // Volatile: endpoint that acknowledged this process's latest delivery.
         // Only a waited status read uses it; lost on restart.
         std::optional<size_t> delivery_endpoint{};
+        // Volatile: endpoints already asked for this inclusion's outcome
+        // evidence by the outcome-only upgrade (at most once each).
+        std::set<size_t> outcome_upgrade_asked{};
     };
     std::map<std::pair<uint256, uint256>, Pending> m_pending;
     FlowMeshClientPollScheduler m_action_polls;
@@ -1106,6 +1126,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     void LearnActionWait(const UniValue& status, size_t endpoint)
     {
         m_action_wait.at(endpoint) = FlowMeshAdvertisedActionWait(status);
+        m_action_outcome.at(endpoint) = FlowMeshAdvertisedActionOutcome(status);
     }
     // Display only, never evidence and never an input to endpoint selection:
     // what the endpoint last advertised about its own readiness.
@@ -1231,7 +1252,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     UniValue Call(const std::string& method, const UniValue& params,
                   const std::function<void(const UniValue&, size_t)>& validate,
                   bool* possibly_sent = nullptr, bool* earlier_possible = nullptr,
-                  size_t* attempted_endpoints = nullptr, Pending* automatic_action = nullptr)
+                  size_t* attempted_endpoints = nullptr, Pending* automatic_action = nullptr,
+                  const std::function<void(UniValue&, size_t)>& decorate = {})
     {
         FlowMeshTimingSpan timing{"client_call"};
         timing.Field("method", method);
@@ -1258,14 +1280,36 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             try {
                 if (attempted_endpoints) ++*attempted_endpoints;
                 if (earlier_possible && possibly_sent) *earlier_possible = *possibly_sent;
-                const auto reply{m_https.Request(m_endpoints[endpoint], "/flowmesh/v1", body, CLIENT_REQUEST_TIMEOUT, CLIENT_MAX_REPLY)};
+                // An optional per-endpoint parameter (a capability only that
+                // endpoint advertised) rebuilds the body; "method" stays first.
+                std::string decorated;
+                if (decorate) {
+                    UniValue endpoint_params{params};
+                    decorate(endpoint_params, endpoint);
+                    UniValue endpoint_request{UniValue::VOBJ};
+                    endpoint_request.pushKV("method", method);
+                    endpoint_request.pushKV("params", std::move(endpoint_params));
+                    decorated = endpoint_request.write();
+                }
+                const auto reply{m_https.Request(m_endpoints[endpoint], "/flowmesh/v1", decorate ? decorated : body,
+                                                 CLIENT_REQUEST_TIMEOUT, CLIENT_MAX_REPLY)};
                 if (possibly_sent && reply.request_may_have_been_sent) *possibly_sent = true;
                 if (!reply.response_received) Fail(reply.error.empty() ? "No HTTPS response; outcome unknown" : reply.error);
                 transport_available = true;
                 UniValue parsed;
                 if (!parsed.read(reply.body)) Fail("Malformed endpoint JSON response");
                 Keys(parsed, {"ok", "result", "error"});
-                if (!Flag(parsed, "ok")) Fail(Text(parsed, "error"));
+                if (!Flag(parsed, "ok")) {
+                    const auto text{Text(parsed, "error")};
+                    // A decorated request to an endpoint that no longer takes
+                    // the field: both advertised capabilities are relearned
+                    // from its next status object.
+                    if (decorate && text == FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR) {
+                        m_action_wait.at(endpoint) = {};
+                        m_action_outcome.at(endpoint) = false;
+                    }
+                    Fail(text);
+                }
                 if (reply.status != 200) Fail("Unexpected HTTPS response status");
                 {
                     FlowMeshTimingSpan verification{"client_verify_response"};
@@ -1739,12 +1783,12 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (p.receipt.certificate_verified && !p.inclusion_proof.empty()) {
             try { (void)VerifyEntry(pins, p.inclusion_proof); return pins; }
             catch (const std::exception& e) {
-                p.receipt.certificate_verified = false; p.receipt.state = "unknown";
+                WithdrawVerifiedLabels(p.receipt);
                 p.receipt.reason = std::string{"Prior inclusion authority no longer verified: "} + e.what();
             }
         }
         if (p.receipt.certificate_verified && p.inclusion_proof.empty()) {
-            p.receipt.certificate_verified = false; p.receipt.state = "unknown";
+            WithdrawVerifiedLabels(p.receipt);
             p.receipt.reason = "Previously verified inclusion retained; fresh authority evidence required";
         }
         return pins;
@@ -1763,6 +1807,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             if (proof.entry.GetHash() != receipt.microblock_hash || proof.entry.sequence != receipt.microblock_sequence)
                 Fail("Action receipt and its certificate disagree");
             Inclusion(p, proof, endpoint, payload);
+            ApplyOutcomeEvidence(p, proof.entry, value, endpoint);
         } else if ((receipt.state == "rejected" || receipt.state == "unknown") && p.may_have_been_sent) {
             // One node's rejection/absence cannot undo an earlier possible
             // delivery. Preserve uncertainty, not a fresh nonce/order.
@@ -1773,6 +1818,99 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         }
         if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
     }
+    //! Verifies an endpoint's outcome evidence against an entry whose
+    //! certificate was just verified under local B3 authority, and derives
+    //! this action's outcome from it. Never throws and never touches the
+    //! inclusion fields: any failure sets only an evidence reason code, and
+    //! the evidence bytes are never retained.
+    void ApplyOutcomeEvidence(Pending& p, const flowmesh::ProductionEntryCore& entry, const UniValue& value,
+                              const size_t endpoint) noexcept
+    {
+        using Code = flowmesh::ActionReasonCode;
+        const auto code = [&](Code c) { p.receipt.reason_code = std::string{flowmesh::ActionReasonName(c)}; };
+        try {
+            if (!p.receipt.certificate_verified || p.receipt.state != "certified_inclusion" ||
+                entry.GetHash() != p.receipt.microblock_hash) return;
+            if (!value.isObject() || !value.exists("outcome_evidence")) {
+                const std::string error{value.isObject() && value["outcome_evidence_error"].isStr()
+                                            ? value["outcome_evidence_error"].get_str() : std::string{}};
+                code(error == "EXPIRED" ? Code::OUTCOME_EVIDENCE_EXPIRED
+                     : error == "TOO_LARGE" ? Code::OUTCOME_EVIDENCE_TOO_LARGE
+                     : error == "BUDGET" ? Code::OUTCOME_EVIDENCE_BUDGET
+                     : m_action_outcome.at(endpoint) ? Code::OUTCOME_EVIDENCE_INVALID : Code::OUTCOME_NOT_OFFERED);
+                return;
+            }
+            const auto bytes{Bytes(value, "outcome_evidence", flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES)};
+            const auto evidence{flowmesh::DecodeExecutionOutcomeEvidenceV1(bytes)};
+            const auto derived{evidence && flowmesh::VerifyExecutionOutcomeEvidence(entry, *evidence) == flowmesh::OutcomeEvidenceCheck::OK
+                                   ? flowmesh::DeriveActionOutcome(entry, *evidence, p.action) : std::nullopt};
+            if (!derived) {
+                code(Code::OUTCOME_EVIDENCE_INVALID);
+                return;
+            }
+            p.receipt.outcome = FlowMeshReceiptOutcome(*derived, entry.sequence, p.receipt.microblock_hash,
+                                                       "certified_result_preimage");
+            p.receipt.outcome_verified = true;
+            p.receipt.reason_code = p.receipt.outcome->reason_code;
+        } catch (...) {
+            code(Code::OUTCOME_EVIDENCE_INVALID);
+        }
+    }
+    //! Outcome-only upgrade of a verified inclusion learned without evidence
+    //! (for example from a snapshot): at most one 'outcome_evidence' request
+    //! per (action, endpoint) per process, only to the advertising endpoint
+    //! that served the inclusion, charged to the automatic status budget.
+    //! One endpoint and one bounded request: no failover loop. The entry is
+    //! the retained proof RecheckActionAuthority just re-verified.
+    void UpgradeOutcome(Pending& p)
+    {
+        if (!p.receipt.certificate_verified || p.receipt.outcome_verified || p.inclusion_proof.empty()) return;
+        const auto found{std::find_if(m_endpoints.begin(), m_endpoints.end(),
+                                      [&](const auto& endpoint) { return endpoint.url == p.receipt.endpoint; })};
+        if (found == m_endpoints.end()) return;
+        const size_t endpoint{static_cast<size_t>(std::distance(m_endpoints.begin(), found))};
+        if (!m_action_outcome.at(endpoint)) {
+            if (p.receipt.reason_code.empty()) {
+                p.receipt.reason_code = std::string{flowmesh::ActionReasonName(flowmesh::ActionReasonCode::OUTCOME_NOT_OFFERED)};
+            }
+            return;
+        }
+        if (p.outcome_upgrade_asked.contains(endpoint) ||
+            std::chrono::steady_clock::now() < m_retry_after.at(endpoint) ||
+            !m_action_polls.TryChargeAttempt(std::chrono::steady_clock::now())) return;
+        p.outcome_upgrade_asked.insert(endpoint);
+        try {
+            const auto entry{EntryPrefix(p.inclusion_proof)};
+            if (entry.GetHash() != p.receipt.microblock_hash) return;
+            UniValue params{UniValue::VOBJ};
+            params.pushKV("market_id", p.market.GetHex());
+            params.pushKV("microblock_sequence", entry.sequence);
+            params.pushKV("microblock_hash", entry.GetHash().GetHex());
+            UniValue request{UniValue::VOBJ};
+            request.pushKV("method", "outcome_evidence");
+            request.pushKV("params", std::move(params));
+            const auto reply{m_https.Request(m_endpoints[endpoint], "/flowmesh/v1", request.write(), CLIENT_REQUEST_TIMEOUT,
+                                             CLIENT_OUTCOME_EVIDENCE_MAX_REPLY)};
+            if (!reply.response_received) return;
+            UniValue parsed;
+            if (!parsed.read(reply.body) || !parsed.isObject() || !parsed["ok"].isBool()) return;
+            if (!parsed["ok"].get_bool()) {
+                // Availability only; the inclusion stays verified.
+                using Code = flowmesh::ActionReasonCode;
+                const std::string text{parsed["error"].isStr() ? parsed["error"].get_str() : std::string{}};
+                std::optional<Code> code;
+                if (text == "FlowMesh outcome evidence is unavailable: EXPIRED") code = Code::OUTCOME_EVIDENCE_EXPIRED;
+                if (text == "FlowMesh outcome evidence is unavailable: TOO_LARGE") code = Code::OUTCOME_EVIDENCE_TOO_LARGE;
+                if (text == "FlowMesh outcome evidence is unavailable: HASH_MISMATCH") code = Code::OUTCOME_EVIDENCE_INVALID;
+                if (text == FLOWMESH_API_OUTCOME_BUDGET_ERROR) code = Code::OUTCOME_EVIDENCE_BUDGET;
+                if (code) p.receipt.reason_code = std::string{flowmesh::ActionReasonName(*code)};
+                return;
+            }
+            ApplyOutcomeEvidence(p, entry, parsed["result"], endpoint);
+        } catch (const std::exception&) {
+            // Inclusion stays verified; the outcome stays unverified.
+        }
+    }
     Receipt QueryAction(Pending& p, bool automatic = false)
     {
         const auto pins{RecheckActionAuthority(p)};
@@ -1781,7 +1919,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         UniValue params{UniValue::VOBJ}; params.pushKV("market_id", p.market.GetHex()); params.pushKV("action_id", p.action.Id().GetHex());
         Call("action", params, [&](const UniValue& value, size_t endpoint) {
             ApplyActionResult(p, pins, value, endpoint);
-        }, nullptr, nullptr, nullptr, automatic ? &p : nullptr);
+        }, nullptr, nullptr, nullptr, automatic ? &p : nullptr, [&](UniValue& endpoint_params, size_t endpoint) {
+            // Only an endpoint that advertised it receives "outcome".
+            if (m_action_outcome.at(endpoint)) endpoint_params.pushKV("outcome", true);
+        });
         if (!p.receipt.certificate_verified) m_action_polls.MarkObserved({p.market, p.action.Id()});
         // A non-certifying observation changes only the receipt, which
         // restart never reads.
@@ -1794,7 +1935,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (p.previously_certified) {
             try { QueryAction(p); }
             catch (const std::exception& e) {
-                p.receipt.certificate_verified = false; p.receipt.state = "unknown"; p.receipt.reason = e.what();
+                WithdrawVerifiedLabels(p.receipt); p.receipt.reason = e.what();
             }
             if (!p.receipt.certificate_verified) p.receipt.reason = "Previously verified inclusion is retained; fresh proof required for current authority, and this action will not be resubmitted";
             return p.receipt;
@@ -1859,6 +2000,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         HttpsEndpoint target;
         size_t endpoint{0};
         std::chrono::milliseconds wait{0};
+        bool with_outcome{false};
         timing.Mark("select_lock_requested_us");
         {
             WorkLock lock{*this};
@@ -1884,6 +2026,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             // Exactly one automatic attempt, charged before transport starts.
             if (!m_action_polls.TryChargeAttempt(std::chrono::steady_clock::now())) { outcome("coalesced"); return std::nullopt; }
             target = m_endpoints.at(endpoint);
+            with_outcome = m_action_outcome.at(endpoint);
         }
         timing.Field("wait_ms", uint64_t(wait.count()));
         timing.Field("endpoint", target.url);
@@ -1891,12 +2034,13 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         UniValue params{UniValue::VOBJ};
         params.pushKV("market_id", market.GetHex()); params.pushKV("action_id", action.GetHex());
         params.pushKV("wait_ms", uint64_t(wait.count()));
+        if (with_outcome) params.pushKV("outcome", true);
         UniValue request{UniValue::VOBJ}; request.pushKV("method", "action"); request.pushKV("params", std::move(params));
         timing.Mark("request_started_us");
         // The endpoint answers before its own wait ends; the transport bound
         // is the ordinary one on top of the wait.
         const auto reply{m_wait_https.Request(target, "/flowmesh/v1", request.write(), wait + CLIENT_REQUEST_TIMEOUT,
-                                              CLIENT_ACTION_WAIT_MAX_REPLY)};
+                                              with_outcome ? CLIENT_ACTION_OUTCOME_MAX_REPLY : CLIENT_ACTION_WAIT_MAX_REPLY)};
         timing.Mark("request_completed_us");
         lane.unlock();
         timing.Field("connection_reused", uint64_t{reply.connection_reused});
@@ -1927,9 +2071,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (!reply.response_received) m_wait_unanswered.at(endpoint) = true;
         if (unsupported) {
             // The endpoint no longer offers the wait (for example after a
-            // downgrade). Nothing was applied or resent; wait_ms is sent there
-            // again only after it advertises the capability again.
+            // downgrade). Nothing was applied or resent; wait_ms (and
+            // "outcome") are sent there again only after it advertises the
+            // capabilities again.
             m_action_wait.at(endpoint) = {};
+            m_action_outcome.at(endpoint) = false;
             outcome("unsupported");
             return std::nullopt;
         }
@@ -1946,7 +2092,19 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             const auto pins{RecheckActionAuthority(p)};
             if (p.receipt.certificate_verified) {
                 // Proved by another read meanwhile: never replaced by this one.
+                // Evidence in this reply for the same entry may still verify
+                // its outcome; the inclusion fields are never touched.
                 m_action_polls.Remove(key);
+                if (!p.receipt.outcome_verified && result.isObject() && result["certified_payload"].isStr() &&
+                    !p.inclusion_proof.empty()) {
+                    try {
+                        const auto entry{EntryPrefix(p.inclusion_proof)};
+                        if (entry.GetHash() == p.receipt.microblock_hash &&
+                            Id(result, "microblock_hash") == p.receipt.microblock_hash) {
+                            ApplyOutcomeEvidence(p, entry, result, endpoint);
+                        }
+                    } catch (const std::exception&) {}
+                }
                 outcome("already_verified");
                 return p.receipt;
             }
@@ -1973,9 +2131,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             // previously_certified stays set in memory, so this action is still
             // never resent.
             p.receipt.reason = e.what();
-            if (p.previously_certified || p.receipt.certificate_verified) {
-                p.receipt.certificate_verified = false; p.receipt.state = "unknown";
-            }
+            if (p.previously_certified || p.receipt.certificate_verified) WithdrawVerifiedLabels(p.receipt);
             outcome(applied ? "save_failed" : "authority_failed");
             return p.receipt;
         }
@@ -2005,6 +2161,7 @@ public:
         m_preferred = m_selected;
         m_retry_after.resize(m_endpoints.size());
         m_action_wait.resize(m_endpoints.size());
+        m_action_outcome.resize(m_endpoints.size());
         m_wait_unanswered.resize(m_endpoints.size());
         for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({endpoint.url, false, {}});
         if (!m_endpoints.empty()) m_status.selected_endpoint = m_endpoints[m_selected].url;
@@ -2035,6 +2192,7 @@ public:
                 m_endpoints.push_back(endpoint); m_saved_endpoints = std::move(saved);
                 m_retry_after.emplace_back();
                 m_action_wait.emplace_back();
+                m_action_outcome.emplace_back(false);
                 m_wait_unanswered.push_back(false);
             }
             m_selected = selected; m_preferred = selected; m_retry_after[selected] = {};
@@ -2225,14 +2383,13 @@ public:
             (void)RecheckActionAuthority(it->second);
             if (it->second.receipt.certificate_verified) {
                 m_action_polls.Remove(it->first);
+                UpgradeOutcome(it->second);
                 return it->second.receipt;
             }
             auto refresh = [&](Pending& pending, bool automatic) {
                 try { QueryAction(pending, automatic); } catch (const std::exception& e) {
                     pending.receipt.reason = e.what();
-                    if (pending.previously_certified) {
-                        pending.receipt.certificate_verified = false; pending.receipt.state = "unknown";
-                    }
+                    if (pending.previously_certified) WithdrawVerifiedLabels(pending.receipt);
                 }
             };
             if (retry) {
@@ -2263,10 +2420,7 @@ public:
                 receipt.reason = "Status read coalesced; retained endpoint observation, not a fresh response. " + receipt.reason;
             return receipt;
         } catch (const std::exception& e) {
-            if (it->second.previously_certified) {
-                it->second.receipt.certificate_verified = false;
-                it->second.receipt.state = "unknown";
-            }
+            if (it->second.previously_certified) WithdrawVerifiedLabels(it->second.receipt);
             it->second.receipt.reason = e.what();
             out.reason = e.what(); return out;
         }

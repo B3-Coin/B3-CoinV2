@@ -10,11 +10,20 @@
 #include <interfaces/chain.h>
 #include <node/flowmesh_production_store.h>
 
+#include <univalue.h>
+
 #include <optional>
 #include <string>
 #include <utility>
 
 namespace node {
+
+//! Latency and outcome capabilities are hints from a status object, never
+//! evidence: only a JSON true advertises verifiable outcomes.
+inline bool FlowMeshAdvertisedActionOutcome(const UniValue& status)
+{
+    return status.isObject() && status.exists("action_outcome_v1") && status["action_outcome_v1"].isTrue();
+}
 
 //! Receipt form of a verified derivation over certified entry (M, hash).
 inline interfaces::FlowMeshActionOutcome FlowMeshReceiptOutcome(const flowmesh::DerivedActionOutcome& derived,
