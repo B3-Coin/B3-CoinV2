@@ -426,6 +426,7 @@ NON_SCRIPTS = [
     "feature_flowmesh_pool_admission.py",
     "feature_flowmesh_updates_watch.py",
     "feature_flowmesh_client_watch.py",
+    "feature_flowmesh_market_views.py",
 ]
 
 def main():
