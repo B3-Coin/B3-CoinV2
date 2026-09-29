@@ -880,6 +880,10 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
         if (!self || !wallet || generation != m_generation) return;
         if (!unlock->isValid() || m_backend->isLocked()) { unlock.reset(); restoreLock(); m_busy = false; notice(tr("Wallet remains locked. Nothing was submitted.")); updateControls(); return; }
         m_unlock = std::move(unlock);
+        // A wallet the panel had to unlock is relocked when this job ends,
+        // so only an already unlocked wallet waits inside the submission.
+        // Anything not verified then still gets one waited status read.
+        a.submit_wait_ms = B3FlowMeshTrading::SubmissionWaitMs(operation, a.market.remote, !was_locked, POST_SUBMIT_RECEIPT_WAIT_MS);
     }
     startJob(a);
 }

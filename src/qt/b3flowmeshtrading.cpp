@@ -178,16 +178,22 @@ Request Parameters(const Action& a)
         const auto budget{B3FlowMeshMarketData::ReplacementBudget(bid ? a.market.b3_available : a.market.base_available,
                                                                  bid ? a.market.b3_reserved : a.market.base_reserved)};
         if (!budget || (bid ? a.price >= MAX_MONEY || a.price * a.amount > *budget : a.amount > *budget)) Fail("The replacement exceeds this side's available plus already reserved certified balance or price range.");
-        r.method = "submitflowmeshorder"; r.params.push_back(a.side.toStdString()); r.params.push_back(a.price); r.params.push_back(a.amount); r.params.push_back(a.market.sequence); break;
+        r.method = "submitflowmeshorder"; r.params.push_back(a.side.toStdString()); r.params.push_back(a.price); r.params.push_back(a.amount); r.params.push_back(a.market.sequence);
+        if (a.submit_wait_ms > 0) r.params.push_back(a.submit_wait_ms);
+        break;
     }
     case Operation::Cancel:
         if (a.side != QStringLiteral("bid") && a.side != QStringLiteral("ask")) Fail("Choose bid or ask.");
-        r.method = "cancelflowmeshorder"; r.params.push_back(a.side.toStdString()); r.params.push_back(a.market.sequence); break;
+        r.method = "cancelflowmeshorder"; r.params.push_back(a.side.toStdString()); r.params.push_back(a.market.sequence);
+        if (a.submit_wait_ms > 0) r.params.push_back(a.submit_wait_ms);
+        break;
     case Operation::Withdraw:
         Positive(a.amount); Address(a.destination);
         if (a.amount > (a.native ? a.market.b3_available : a.market.base_available)) Fail("The withdrawal exceeds the available certified balance.");
         r.method = "requestflowmeshwithdrawal"; r.params.push_back(a.native ? "B3" : a.market.base.toStdString());
-        r.params.push_back(a.native ? ValueFromAmount(a.amount) : UniValue{a.amount}); r.params.push_back(a.destination.toStdString()); r.params.push_back(a.market.sequence); break;
+        r.params.push_back(a.native ? ValueFromAmount(a.amount) : UniValue{a.amount}); r.params.push_back(a.destination.toStdString()); r.params.push_back(a.market.sequence);
+        if (a.submit_wait_ms > 0) r.params.push_back(a.submit_wait_ms);
+        break;
     case Operation::Deposit:
         Positive(a.amount); r.method = "flowmeshdeposit"; r.params.clear(); r.params.setArray(); r.params.push_back(a.market.base.toStdString());
         r.params.push_back(a.native ? "B3" : a.market.base.toStdString()); r.params.push_back(a.native ? ValueFromAmount(a.amount) : UniValue{a.amount});
@@ -208,6 +214,11 @@ Request Parameters(const Action& a)
         r.params.push_back(options); break;
     }
     return r;
+}
+
+int SubmissionWaitMs(const Operation operation, const bool remote, const bool wallet_was_unlocked, const int wait_ms)
+{
+    return remote && wallet_was_unlocked && Sequenced(operation) && wait_ms > 0 ? wait_ms : 0;
 }
 
 UniValue DispatchApproved(const Action& a, bool approved, const std::function<bool()>& cancelled, const RpcCall& rpc)

@@ -102,6 +102,36 @@ private Q_SLOTS:
         a.price = MAX_MONEY; QVERIFY(Rejected([&] { Parameters(a); }));
         a.price = 1; a.amount = -1; QVERIFY(Rejected([&] { Parameters(a); }));
     }
+    void submissionWaitIsATrailingArgumentOfRemoteSignedActionsOnly() {
+        auto order{Order()}; order.submit_wait_ms = 2000;
+        const auto r{Parameters(order)};
+        QCOMPARE(r.method, std::string{"submitflowmeshorder"}); QCOMPARE(r.params.size(), size_t{6});
+        QCOMPARE(r.params[4].getInt<int64_t>(), int64_t{7}); QCOMPARE(r.params[5].getInt<int>(), 2000);
+        order.submit_wait_ms = 0; QCOMPARE(Parameters(order).params.size(), size_t{5});
+        auto cancel{Order()}; cancel.operation = Operation::Cancel; cancel.submit_wait_ms = 2000;
+        const auto c{Parameters(cancel)};
+        QCOMPARE(c.method, std::string{"cancelflowmeshorder"}); QCOMPARE(c.params.size(), size_t{4});
+        QCOMPARE(c.params[2].getInt<int64_t>(), int64_t{7}); QCOMPARE(c.params[3].getInt<int>(), 2000);
+        auto withdrawal{Order()}; withdrawal.operation = Operation::Withdraw; withdrawal.native = true;
+        withdrawal.amount = 1'000'001; withdrawal.destination = Address(); withdrawal.submit_wait_ms = 2000;
+        const auto w{Parameters(withdrawal)};
+        QCOMPARE(w.method, std::string{"requestflowmeshwithdrawal"}); QCOMPARE(w.params.size(), size_t{6});
+        QCOMPARE(w.params[4].getInt<int>(), 7); QCOMPARE(w.params[5].getInt<int>(), 2000);
+        // Prepared transactions never carry it.
+        auto deposit{Order()}; deposit.operation = Operation::Deposit; deposit.submit_wait_ms = 2000;
+        QCOMPARE(Parameters(deposit).params.size(), size_t{4});
+        // Only a remote signed action of a wallet that was already unlocked
+        // waits inside the submission.
+        QCOMPARE(SubmissionWaitMs(Operation::Order, true, true, 2000), 2000);
+        QCOMPARE(SubmissionWaitMs(Operation::Cancel, true, true, 2000), 2000);
+        QCOMPARE(SubmissionWaitMs(Operation::Withdraw, true, true, 2000), 2000);
+        QCOMPARE(SubmissionWaitMs(Operation::Order, true, false, 2000), 0);
+        QCOMPARE(SubmissionWaitMs(Operation::Order, false, true, 2000), 0);
+        QCOMPARE(SubmissionWaitMs(Operation::Order, true, true, 0), 0);
+        for (const auto operation : {Operation::Deposit, Operation::Admit, Operation::Checkpoint, Operation::Vault}) {
+            QCOMPARE(SubmissionWaitMs(operation, true, true, 2000), 0);
+        }
+    }
     void receiptsSeparateQueueAdmissionInclusionAndExecution()
     {
         const auto a{Order()}; UniValue v{UniValue::VOBJ};

@@ -33,6 +33,11 @@ struct Action {
     QString display_ticker;
     uint32_t vout{0};
     UniValue effect;
+    //! A positive bounded wait (milliseconds) for the new signed action's
+    //! certified inclusion, passed as the RPC's trailing wait_ms: an order,
+    //! cancel or withdrawal then returns verified in the same call when the
+    //! remote endpoint answers in time. Latency only; never reviewed economics.
+    int submit_wait_ms{0};
 };
 struct Request { std::string method; UniValue params{UniValue::VARR}; };
 //! A verified per-action outcome as the local RPC reports it (never an
@@ -93,6 +98,10 @@ Market ReadMarket(const QString& id, const RpcCall& rpc);
 void CheckSameMarket(const Market& reviewed, const Market& fresh, bool sequence, bool settlement = false);
 void CheckSynced(const UniValue& chain);
 Request Parameters(const Action& action);
+//! The wait a submission may carry: `wait_ms` only for a remote order, cancel
+//! or withdrawal of a wallet that was already unlocked, so waiting never
+//! extends how long the panel keeps a wallet it unlocked for the request open.
+int SubmissionWaitMs(Operation operation, bool remote, bool wallet_was_unlocked, int wait_ms);
 //! No calls at all without approval; cancellation is checked before the write.
 UniValue DispatchApproved(const Action& action, bool approved,
                          const std::function<bool()>& cancelled, const RpcCall& rpc);

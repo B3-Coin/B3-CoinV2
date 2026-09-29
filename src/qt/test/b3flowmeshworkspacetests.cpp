@@ -2964,7 +2964,7 @@ private Q_SLOTS:
     void signedActionWaitsOnceForItsReceiptAndFailureStaysCertain_data()
     {
         QTest::addColumn<QString>("mode");
-        for (const auto* mode : {"certified", "failure", "rejected", "local"}) QTest::newRow(mode) << QString::fromLatin1(mode);
+        for (const auto* mode : {"certified", "failure", "rejected", "local", "verified_in_submission"}) QTest::newRow(mode) << QString::fromLatin1(mode);
     }
     void signedActionWaitsOnceForItsReceiptAndFailureStaysCertain()
     {
@@ -2984,11 +2984,20 @@ private Q_SLOTS:
         result->action = action; result->wallet = panel.m_wallet_name; result->write_attempted = true;
         B3FlowMeshTrading::Receipt receipt; receipt.action_id = QString::fromStdString(H(98).GetHex()); receipt.market = action.market.id;
         receipt.state = mode == QStringLiteral("rejected") ? QStringLiteral("rejected") : QStringLiteral("queued");
+        if (mode == QStringLiteral("verified_in_submission")) {
+            // A waited submission (an already unlocked wallet) returned the
+            // inclusion, verified by the client in the same call.
+            action.submit_wait_ms = B3FlowMeshTradingPanel::POST_SUBMIT_RECEIPT_WAIT_MS; result->action = action;
+            receipt.state = QStringLiteral("certified_inclusion"); receipt.certificate_verified = true;
+            receipt.microblock_hash = QString::fromStdString(H(97).GetHex()); receipt.microblock_sequence = 5;
+        }
         result->receipt = receipt;
         panel.m_busy = true;
         panel.finishJob(result);
-        if (mode == QStringLiteral("rejected") || mode == QStringLiteral("local")) {
-            // Terminal, or no transport to wait on: only the ordinary refresh.
+        if (mode == QStringLiteral("verified_in_submission")) QVERIFY(panel.m_receipt && panel.m_receipt->Included());
+        if (mode == QStringLiteral("rejected") || mode == QStringLiteral("local") || mode == QStringLiteral("verified_in_submission")) {
+            // Terminal, verified already, or no transport to wait on: only
+            // the ordinary refresh, and no second request for the receipt.
             QVERIFY(!panel.m_active_result || !panel.m_active_result->receipt_wait);
             QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
             QCOMPARE(probe.count.load(), 0);
