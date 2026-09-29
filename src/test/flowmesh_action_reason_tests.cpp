@@ -63,6 +63,12 @@ BOOST_AUTO_TEST_CASE(every_code_has_bounded_ui_text_and_class)
     for (const auto& info : flowmesh::ACTION_REASONS) {
         BOOST_CHECK(!info.ui_text.empty());
         BOOST_CHECK_LE(info.ui_text.size(), 160U);
+        // An outcome text never asks for a resend: no client path offers
+        // one for an included action (G5, an exact resend, is not built).
+        if (info.cls == flowmesh::ActionReasonClass::OUTCOME_FINAL ||
+            info.cls == flowmesh::ActionReasonClass::OUTCOME_NOT_FINAL) {
+            BOOST_CHECK_MESSAGE(info.ui_text.find("resend") == std::string_view::npos, info.name);
+        }
         BOOST_CHECK_LE(info.name.size(), 40U);
         for (const char c : info.name) BOOST_CHECK((c >= 'A' && c <= 'Z') || c == '_');
         const auto number{static_cast<unsigned>(info.code)};

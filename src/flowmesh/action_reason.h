@@ -116,7 +116,7 @@ inline constexpr ActionReasonInfo ACTION_REASONS[]{
     {ActionReasonCode::DROPPED_SEQUENCE_CONSUMED, "DROPPED_SEQUENCE_CONSUMED", "Removed from the queue: its account sequence was used by another certified request.", ActionReasonClass::DROP},
     {ActionReasonCode::APPLIED, "APPLIED", "Executed in a certified batch.", ActionReasonClass::OUTCOME_FINAL},
     {ActionReasonCode::REJECTED_BY_STATE, "REJECTED_BY_STATE", "Refused by certified state; the account sequence was used.", ActionReasonClass::OUTCOME_FINAL},
-    {ActionReasonCode::INCLUDED_BAD_SEQUENCE, "INCLUDED_BAD_SEQUENCE", "Included but not executed: its sequence was not next. It may still execute; resend only these exact bytes.", ActionReasonClass::OUTCOME_NOT_FINAL},
+    {ActionReasonCode::INCLUDED_BAD_SEQUENCE, "INCLUDED_BAD_SEQUENCE", "Included but not executed: its sequence was not next. Not final: these exact bytes may still execute later, so a new order could execute twice.", ActionReasonClass::OUTCOME_NOT_FINAL},
     {ActionReasonCode::INCLUDED_EQUIVOCATION, "INCLUDED_EQUIVOCATION", "Included but not executed: two requests used this sequence in one batch. Not final.", ActionReasonClass::OUTCOME_NOT_FINAL},
     {ActionReasonCode::INCLUDED_MALFORMED, "INCLUDED_MALFORMED", "Included but invalid; it can never execute.", ActionReasonClass::OUTCOME_FINAL},
     {ActionReasonCode::DEPOSIT_NOT_CREDITED, "DEPOSIT_NOT_CREDITED", "Deposit not credited in this batch; it may be credited later.", ActionReasonClass::OUTCOME_NOT_FINAL},
