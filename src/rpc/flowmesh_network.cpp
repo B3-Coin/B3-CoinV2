@@ -526,7 +526,7 @@ static RPCResult HealthResult()
                     "the anchored seat set each statement names", {
                     {Type::NUM, "recorded", "Records ever kept in this market's store, evicted ones included"},
                     {Type::NUM, "retained", "Records the store still holds, at most 64"},
-                    {Type::NUM, "unrecorded", /*optional=*/true, "Detections this process could not record: not verifiable against this node's chain, over the write pace, or a failed write (operator detail)"},
+                    {Type::NUM, "unrecorded", /*optional=*/true, "Detections this process could not record: not verifiable against this node's chain, over the per-minute check pace (applied before any verification), or a failed write (operator detail)"},
                     {Type::ARR, "latest", "Newest first: every retained record with operator detail, otherwise at most 4", {
                         {Type::OBJ, "", "", {
                             {Type::STR_HEX, "evidence_id", "Order-independent record identity"},

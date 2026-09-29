@@ -367,7 +367,7 @@ struct FlowMeshRuntime::Market {
     uint64_t seat_evidence_unrecorded{0};
     std::set<uint32_t> seat_evidence_slot_seats;
     flowmesh::WireClock::time_point seat_evidence_window{};
-    size_t seat_evidence_window_writes{0};
+    size_t seat_evidence_window_checks{0};
     FlowMeshSeatEvidenceWork seat_evidence_work;
     std::optional<flowmesh::WireClock::time_point> last_announcement;
     flowmesh::WireClock::time_point next_announcement{};
@@ -827,10 +827,11 @@ void HaltMarket(Market& market, const FlowMeshRuntimeHalt halt,
 // decision, and a failure here never blocks the market.
 
 //! Detection needs a misbehaving seat. Per market and minute, at most this
-//! many detections are checked and written (one synced store batch each).
-//! The pace is spent before any verification, so a detection beyond it
-//! costs only its id and is counted as unrecorded.
-constexpr size_t SEAT_EVIDENCE_WRITES_PER_MINUTE{8};
+//! many detections are checked, recorded or not; only one that verifies is
+//! written (one synced store batch each). The pace is spent before any
+//! verification, so a detection beyond it costs only its id and is counted
+//! as unrecorded.
+constexpr size_t SEAT_EVIDENCE_CHECKS_PER_MINUTE{8};
 
 template <typename Market>
 void SetSeatEvidence(Market& market, const SeatEvidenceLog& log)
@@ -876,14 +877,14 @@ void RecordSeatEvidence(Market& market, const flowmesh::SeatEvidence& evidence,
     const auto now{market.clock->Now()};
     if (now < market.seat_evidence_window || now - market.seat_evidence_window >= std::chrono::minutes{1}) {
         market.seat_evidence_window = now;
-        market.seat_evidence_window_writes = 0;
+        market.seat_evidence_window_checks = 0;
     }
-    if (market.seat_evidence_window_writes >= SEAT_EVIDENCE_WRITES_PER_MINUTE) {
+    if (market.seat_evidence_window_checks >= SEAT_EVIDENCE_CHECKS_PER_MINUTE) {
         ++market.seat_evidence_unrecorded;
         return;
     }
     // Spent by every checked detection, recorded or not.
-    ++market.seat_evidence_window_writes;
+    ++market.seat_evidence_window_checks;
     ++market.seat_evidence_work.checks;
     flowmesh::SeatEvidencePrechecked prechecked;
     prechecked.first_signature = first_signature_verified;

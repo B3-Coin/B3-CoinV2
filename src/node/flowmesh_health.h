@@ -243,7 +243,8 @@ struct FlowMeshMarketHealthObservation {
     uint64_t seat_evidence_recorded{0};
     std::shared_ptr<const std::vector<flowmesh::SeatEvidence>> seat_evidence;
     //! Detections this process could not record: not verifiable against the
-    //! local chain's seat sets, over the write pace, or a failed write.
+    //! local chain's seat sets, over the per-minute check pace (applied
+    //! before any verification), or a failed write.
     uint64_t seat_evidence_unrecorded{0};
 };
 
