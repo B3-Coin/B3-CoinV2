@@ -454,6 +454,20 @@ static RPCHelpMan getflowmeshdeliveryinfo()
         }};
 }
 
+static std::vector<RPCResult> SeatEvidenceStatementResult()
+{
+    using Type = RPCResult::Type;
+    return {
+        {Type::NUM, "seat_epoch", "Seat epoch of the signed certificate context"},
+        {Type::STR_HEX, "seat_set_hash", "Anchored seat set of that epoch"},
+        {Type::NUM, "sequence", "Microblock sequence"},
+        {Type::STR_HEX, "microblock_hash", "Signed microblock hash"},
+        {Type::NUM, "seat_index", /*optional=*/true, "attestation_equivocation: the signing seat's index in the set"},
+        {Type::STR_HEX, "signer_bitmap", /*optional=*/true, "certificate_conflict: LSB-first signer bitmap"},
+        {Type::STR_HEX, "signature", "BLS signature (one seat's, or the certificate's aggregate) over the B3/FLOWMESH/CERT/V1 digest of domain, market_id, seat_epoch, seat_set_hash, sequence and microblock_hash"},
+    };
+}
+
 static RPCResult HealthResult()
 {
     using Type = RPCResult::Type;
@@ -506,6 +520,26 @@ static RPCResult HealthResult()
                     {Type::BOOL, "speculative", "A verified catch-up page arrived without tail slack; not a proof and never a readiness input"},
                     {Type::NUM, "peer_hint_next_sequence", /*optional=*/true, "Highest unverified peer head announcement (operator detail)"},
                     {Type::NUM, "peers_hinting_ahead", /*optional=*/true, "Peers announcing a head ahead of ours, unverified (operator detail)"},
+                }},
+                {Type::OBJ, "seat_evidence", /*optional=*/true, "Seat-misbehaviour evidence this node recorded for the market. Information only: "
+                    "never a readiness input, never a penalty, never consensus. Each record carries every signed field and is checkable against "
+                    "the anchored seat set each statement names", {
+                    {Type::NUM, "recorded", "Records ever kept in this market's store, evicted ones included"},
+                    {Type::NUM, "retained", "Records the store still holds, at most 64"},
+                    {Type::NUM, "unrecorded", /*optional=*/true, "Detections this process could not record: not verifiable against this node's chain, over the write pace, or a failed write (operator detail)"},
+                    {Type::ARR, "latest", "Newest first: every retained record with operator detail, otherwise at most 4", {
+                        {Type::OBJ, "", "", {
+                            {Type::STR_HEX, "evidence_id", "Order-independent record identity"},
+                            {Type::STR, "kind", "attestation_equivocation (one seat signed two microblocks at one epoch and sequence) or certificate_conflict (two valid threshold certificates for two microblocks at one sequence)"},
+                            {Type::STR_HEX, "domain", "Chain domain every statement signs"},
+                            {Type::STR_HEX, "market_id", "Market every statement signs"},
+                            {Type::OBJ, "first", "The statement this node held first (its earlier vote or durable entry)", SeatEvidenceStatementResult()},
+                            {Type::OBJ, "second", "The conflicting statement it received", SeatEvidenceStatementResult()},
+                            {Type::ARR, "double_signers", /*optional=*/true, "certificate_conflict under one seat set: the seats in both signer bitmaps, each of which signed both", {
+                                {Type::NUM, "", "Seat index"},
+                            }},
+                        }},
+                    }},
                 }},
                 {Type::STR, "error", /*optional=*/true, "Bounded runtime error text (operator detail)"},
                 {Type::STR, "proposal_wait_reason", /*optional=*/true, "Why the next slot's proposal waits (operator detail)"},

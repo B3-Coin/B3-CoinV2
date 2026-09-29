@@ -464,7 +464,7 @@ BOOST_AUTO_TEST_CASE(health_json_is_versioned_omits_absent_values_and_operator_t
     BOOST_REQUIRE_EQUAL(markets.size(), 3U);
     const std::set<std::string> row_keys{"market_id", "ready", "not_ready", "state", "halt", "paused", "pause_reason",
                                          "pending_handoff", "epoch", "active_seats", "quorum_required", "pending_actions",
-                                         "next_microblock_sequence", "last_microblock_hash", "catchup"};
+                                         "next_microblock_sequence", "last_microblock_hash", "catchup", "seat_evidence"};
     auto live_keys{row_keys};
     live_keys.insert({"head_age_ms", "head_local_observed_unix"});
     BOOST_CHECK(Keys(markets[0]) == live_keys);
@@ -505,6 +505,85 @@ BOOST_AUTO_TEST_CASE(health_json_is_versioned_omits_absent_values_and_operator_t
     BOOST_CHECK_EQUAL(stopped["service"]["state"].get_str(), "dormant");
     BOOST_CHECK(Names(stopped["not_ready"]) == std::vector<std::string>{"service_stopped"});
     BOOST_CHECK(stopped["markets"].empty());
+}
+
+BOOST_AUTO_TEST_CASE(health_json_lists_seat_evidence_as_information_only)
+{
+    // Shape only: the runtime keeps a record only after checking it.
+    const auto evidence = [](const flowmesh::SeatEvidenceKind kind, const uint8_t sequence) {
+        flowmesh::SeatEvidence out;
+        out.kind = kind;
+        out.domain = Id(0x11);
+        out.market_id = Id(1);
+        for (auto* statement : {&out.first, &out.second}) {
+            statement->seat_epoch = 3;
+            statement->seat_set_hash = Id(0x33);
+            statement->sequence = sequence;
+            if (kind == flowmesh::SeatEvidenceKind::ATTESTATION_EQUIVOCATION) {
+                statement->seat_index = 2;
+            }
+            statement->signature.fill(0xab);
+        }
+        if (kind == flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT) {
+            out.first.signer_bitmap = {0x07};
+            out.second.signer_bitmap = {0x0e};
+        }
+        out.first.microblock_hash = Id(0xa1);
+        out.second.microblock_hash = Id(0xb2);
+        return out;
+    };
+    auto retained{std::make_shared<std::vector<flowmesh::SeatEvidence>>()};
+    retained->push_back(evidence(flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT, 9));
+    for (uint8_t sequence{8}; sequence >= 4; --sequence) {
+        retained->push_back(evidence(flowmesh::SeatEvidenceKind::ATTESTATION_EQUIVOCATION, sequence));
+    }
+    auto snapshot{Snapshot()};
+    auto row{Market(1)};
+    row.seat_evidence_recorded = 70;
+    row.seat_evidence = retained;
+    row.seat_evidence_unrecorded = 2;
+    snapshot->markets = {row};
+    const auto health{node::BuildFlowMeshServiceHealth(node::FlowMeshServiceState::RUNNING, Open(),
+                                                       node::FlowMeshHealthPolicy{}, T0, snapshot, {Id(1)})};
+
+    const auto json{node::FlowMeshServiceHealthJson(health, /*operator_detail=*/false)};
+    CheckNoNull(json);
+    // Recorded evidence never changes readiness.
+    BOOST_CHECK(json["markets"][0]["ready"].get_bool());
+    const auto& public_evidence{json["markets"][0]["seat_evidence"]};
+    BOOST_CHECK(Keys(public_evidence) == (std::set<std::string>{"recorded", "retained", "latest"}));
+    BOOST_CHECK_EQUAL(public_evidence["recorded"].getInt<uint64_t>(), 70U);
+    BOOST_CHECK_EQUAL(public_evidence["retained"].getInt<uint64_t>(), 6U);
+    BOOST_REQUIRE_EQUAL(public_evidence["latest"].size(), node::FLOWMESH_HEALTH_PUBLIC_SEAT_EVIDENCE);
+    const auto& conflict{public_evidence["latest"][0]};
+    BOOST_CHECK(Keys(conflict) == (std::set<std::string>{"evidence_id", "kind", "domain", "market_id", "first", "second",
+                                                         "double_signers"}));
+    BOOST_CHECK_EQUAL(conflict["kind"].get_str(), "certificate_conflict");
+    BOOST_CHECK_EQUAL(conflict["evidence_id"].get_str(), retained->front().Id().GetHex());
+    BOOST_CHECK_EQUAL(conflict["domain"].get_str(), Id(0x11).GetHex());
+    BOOST_CHECK(Keys(conflict["first"]) == (std::set<std::string>{"seat_epoch", "seat_set_hash", "sequence",
+                                                                  "microblock_hash", "signer_bitmap", "signature"}));
+    BOOST_CHECK_EQUAL(conflict["first"]["signer_bitmap"].get_str(), "07");
+    BOOST_CHECK_EQUAL(conflict["second"]["microblock_hash"].get_str(), Id(0xb2).GetHex());
+    std::string signature_hex;
+    for (int i{0}; i < 96; ++i) signature_hex += "ab";
+    BOOST_CHECK_EQUAL(conflict["second"]["signature"].get_str(), signature_hex);
+    BOOST_CHECK_EQUAL(conflict["double_signers"].write(), "[1,2]");
+    const auto& equivocation{public_evidence["latest"][1]};
+    BOOST_CHECK_EQUAL(equivocation["kind"].get_str(), "attestation_equivocation");
+    BOOST_CHECK(!equivocation.exists("double_signers"));
+    BOOST_CHECK(Keys(equivocation["second"]) == (std::set<std::string>{"seat_epoch", "seat_set_hash", "sequence",
+                                                                       "microblock_hash", "seat_index", "signature"}));
+    BOOST_CHECK_EQUAL(equivocation["second"]["seat_index"].getInt<int>(), 2);
+    BOOST_CHECK_EQUAL(equivocation["first"]["sequence"].getInt<int>(), 8);
+
+    // Operator detail lists every retained record and what was not recorded.
+    const auto detail{node::FlowMeshServiceHealthJson(health, /*operator_detail=*/true)};
+    CheckNoNull(detail);
+    const auto& operator_evidence{detail["markets"][0]["seat_evidence"]};
+    BOOST_CHECK_EQUAL(operator_evidence["unrecorded"].getInt<uint64_t>(), 2U);
+    BOOST_CHECK_EQUAL(operator_evidence["latest"].size(), 6U);
+    BOOST_CHECK_EQUAL(operator_evidence["latest"][5]["first"]["sequence"].getInt<int>(), 4);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

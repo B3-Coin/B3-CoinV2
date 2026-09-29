@@ -5,6 +5,7 @@
 #include <node/flowmesh_health.h>
 
 #include <univalue.h>
+#include <util/strencodings.h>
 
 #include <algorithm>
 #include <limits>
@@ -342,6 +343,40 @@ FlowMeshServiceHealth BuildFlowMeshServiceHealth(
     return out;
 }
 
+UniValue FlowMeshSeatEvidenceJson(const flowmesh::SeatEvidence& evidence)
+{
+    const auto statement = [&](const flowmesh::SeatEvidenceStatement& signed_statement) {
+        UniValue out{UniValue::VOBJ};
+        out.pushKV("seat_epoch", signed_statement.seat_epoch);
+        out.pushKV("seat_set_hash", signed_statement.seat_set_hash.GetHex());
+        out.pushKV("sequence", signed_statement.sequence);
+        out.pushKV("microblock_hash", signed_statement.microblock_hash.GetHex());
+        if (evidence.kind == flowmesh::SeatEvidenceKind::ATTESTATION_EQUIVOCATION) {
+            out.pushKV("seat_index", uint64_t{signed_statement.seat_index});
+        } else {
+            out.pushKV("signer_bitmap", HexStr(signed_statement.signer_bitmap));
+        }
+        out.pushKV("signature", HexStr(signed_statement.signature));
+        return out;
+    };
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("evidence_id", evidence.Id().GetHex());
+    out.pushKV("kind", flowmesh::SeatEvidenceKindName(evidence.kind));
+    out.pushKV("domain", evidence.domain.GetHex());
+    out.pushKV("market_id", evidence.market_id.GetHex());
+    out.pushKV("first", statement(evidence.first));
+    out.pushKV("second", statement(evidence.second));
+    if (evidence.kind == flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT) {
+        const auto signers{flowmesh::SeatEvidenceDoubleSigners(evidence)};
+        if (!signers.empty()) {
+            UniValue seats{UniValue::VARR};
+            for (const auto seat : signers) seats.push_back(uint64_t{seat});
+            out.pushKV("double_signers", std::move(seats));
+        }
+    }
+    return out;
+}
+
 UniValue FlowMeshServiceHealthJson(const FlowMeshServiceHealth& health, const bool operator_detail)
 {
     const auto now{health.now};
@@ -415,6 +450,17 @@ UniValue FlowMeshServiceHealthJson(const FlowMeshServiceHealth& health, const bo
                 catchup.pushKV("peers_hinting_ahead", uint64_t{market->lag.peers_hinting_ahead});
             }
             item.pushKV("catchup", std::move(catchup));
+            // Information only: never a readiness input or a penalty.
+            UniValue evidence{UniValue::VOBJ};
+            const size_t retained{market->seat_evidence ? market->seat_evidence->size() : 0};
+            evidence.pushKV("recorded", market->seat_evidence_recorded);
+            evidence.pushKV("retained", uint64_t{retained});
+            if (operator_detail) evidence.pushKV("unrecorded", market->seat_evidence_unrecorded);
+            UniValue latest{UniValue::VARR};
+            const size_t shown{operator_detail ? retained : std::min(retained, FLOWMESH_HEALTH_PUBLIC_SEAT_EVIDENCE)};
+            for (size_t i{0}; i < shown; ++i) latest.push_back(FlowMeshSeatEvidenceJson((*market->seat_evidence)[i]));
+            evidence.pushKV("latest", std::move(latest));
+            item.pushKV("seat_evidence", std::move(evidence));
             if (operator_detail) {
                 item.pushKV("error", market->error);
                 item.pushKV("proposal_wait_reason", market->proposal_wait_reason);

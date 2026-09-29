@@ -274,6 +274,9 @@ inline constexpr std::chrono::milliseconds FLOWMESH_TEST_HEALTH_GRACE_MAX{60'000
 
 //! At most this many market rows are evaluated and reported.
 inline constexpr size_t FLOWMESH_HEALTH_MAX_MARKETS{256};
+//! Seat-evidence records per market in the public object (newest first);
+//! operator detail lists every retained record.
+inline constexpr size_t FLOWMESH_HEALTH_PUBLIC_SEAT_EVIDENCE{4};
 
 /** One evaluated health observation of a service and its markets. */
 struct FlowMeshServiceHealth {
@@ -323,8 +326,12 @@ FlowMeshServiceHealth BuildFlowMeshServiceHealth(
 /** The versioned health object. Absent values are omitted, never null. The
  * public object carries no free text, key material or path; operator detail
  * (local RPC only) adds bounded error text, the proposer wait reason, peer
- * counts and unverified peer head hints. */
+ * counts, unverified peer head hints, every retained seat-evidence record
+ * and the count of detections not recorded. */
 UniValue FlowMeshServiceHealthJson(const FlowMeshServiceHealth& health, bool operator_detail);
+
+//! One seat-evidence record with every field needed to check it.
+UniValue FlowMeshSeatEvidenceJson(const flowmesh::SeatEvidence& evidence);
 
 } // namespace node
 

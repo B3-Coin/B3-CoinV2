@@ -37,6 +37,7 @@ READINESS_KEYS = {"health_api_version", "endpoint_ready", "endpoint_not_ready"}
 OPERATOR_SERVICE_KEYS = {"flowmesh_peers", "no_peers_ms"}
 OPERATOR_MARKET_KEYS = {"error", "proposal_wait_reason"}
 OPERATOR_CATCHUP_KEYS = {"peer_hint_next_sequence", "peers_hinting_ahead"}
+OPERATOR_EVIDENCE_KEYS = {"unrecorded"}
 
 
 def without_time_and_operator_fields(health):
@@ -50,6 +51,9 @@ def without_time_and_operator_fields(health):
         if "catchup" in row:
             for key in ["behind_ms", *OPERATOR_CATCHUP_KEYS]:
                 row["catchup"].pop(key, None)
+        if "seat_evidence" in row:
+            for key in OPERATOR_EVIDENCE_KEYS:
+                row["seat_evidence"].pop(key, None)
     return out
 
 
@@ -146,6 +150,8 @@ class FlowMeshHealthTest(FlowMeshLatencyTest):
         assert row["head_age_ms"] < 60000, row
         assert_equal(row["state"], "live")
         assert_equal(row["catchup"]["behind"], False)
+        # Honest seats: no seat-misbehaviour evidence, and nothing failed to record.
+        assert_equal(row["seat_evidence"], {"recorded": 0, "retained": 0, "unrecorded": 0, "latest": []})
         assert health["service"]["flowmesh_peers"] >= 3, health["service"]
         self.health_report["head"] = {"certified_sequence": certified, "row": row}
 
@@ -158,6 +164,7 @@ class FlowMeshHealthTest(FlowMeshLatencyTest):
             assert not OPERATOR_SERVICE_KEYS.intersection(public["service"]), public
             assert not OPERATOR_MARKET_KEYS.intersection(public["markets"][0]), public
             assert not OPERATOR_CATCHUP_KEYS.intersection(public["markets"][0]["catchup"]), public
+            assert not OPERATOR_EVIDENCE_KEYS.intersection(public["markets"][0]["seat_evidence"]), public
             rpc = self.nodes[0].getflowmeshhealth(market)
             return without_time_and_operator_fields(public) == without_time_and_operator_fields(rpc)
         self.wait_until(parity, timeout=10, check_interval=.3)
