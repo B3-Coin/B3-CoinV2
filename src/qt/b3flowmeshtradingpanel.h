@@ -21,6 +21,7 @@
 #include <optional>
 #include <utility>
 
+class QCheckBox;
 class QComboBox;
 class QDialog;
 class QTableWidget;
@@ -131,6 +132,10 @@ private:
             QString price, quantity;
             int side;
             bool inverse, needs_market_read;
+            // A marketable-limit ticket re-prices from the fresh read, so its
+            // shown price may change; its slippage and mode may not.
+            bool marketable{false};
+            QString slippage;
         };
         std::optional<OrderContext> order_context;
     };
@@ -158,6 +163,10 @@ private:
     bool withdrawalReady() const;
     bool orderReviewAvailable() const;
     bool orderReady() const;
+    //! The marketable-limit price for the ticket's side, orientation,
+    //! slippage and quantity from the displayed certified snapshot. Freshness
+    //! is the caller's gate.
+    std::optional<B3FlowMeshMarketData::MarketableLimit> marketableLimit(QString* error) const;
     void requestOrderReview();
     void begin(B3FlowMeshTrading::Operation operation);
     bool confirm(const QString& text, bool final_transaction);
@@ -370,6 +379,9 @@ private:
     QComboBox* m_asset{nullptr};
     QComboBox* m_effect{nullptr};
     QLineEdit* m_price{nullptr};
+    QCheckBox* m_marketable{nullptr};
+    QLineEdit* m_slippage{nullptr};
+    QLabel* m_marketable_note{nullptr};
     QLineEdit* m_endpoint{nullptr};
     QPushButton* m_connect{nullptr};
     QLabel* m_connection_status{nullptr};

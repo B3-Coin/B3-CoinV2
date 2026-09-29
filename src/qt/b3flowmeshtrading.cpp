@@ -232,6 +232,23 @@ UniValue DispatchApproved(const Action& a, bool approved, const std::function<bo
     return rpc(request.method, request.params);
 }
 
+namespace {
+//! The marketable-limit disclosure, in the review's own orientation and units.
+QString MarketableDisclosure(const Action& a)
+{
+    if (!a.marketable) return {};
+    const auto& m{*a.marketable};
+    const QString token{a.display_ticker.isEmpty() ? QStringLiteral("token") : a.display_ticker};
+    const QString units{a.inverse_display ? QStringLiteral("%1 / B3").arg(token) : QStringLiteral("B3 / %1").arg(token)};
+    const QString depth{a.display_decimals ? QString{B3FlowMeshMarketData::FormatAmount(m.visible, *a.display_decimals) + QLatin1Char(' ') + token}
+                                           : QString{QString::number(m.visible) + QStringLiteral(" raw base-asset units")}};
+    return QStringLiteral("\nMarketable limit, not a market order: priced from the best certified opposite order at %1 %2 with at most %3% slippage. "
+                          "The auction clears at one uniform price, never worse than the limit above. Certified opposite depth at or better than that limit: %4 "
+                          "(visible depth, not a fill estimate). Any unfilled part stays as a standing order until you cancel it: FlowMesh has no market or immediate-or-cancel orders.")
+        .arg(m.reference_display, units, B3FlowMeshMarketData::FormatSlippage(m.slippage_bps), depth);
+}
+} // namespace
+
 QString Describe(const Action& a)
 {
     const QString prefix{QStringLiteral("Market: %1\nFull base asset ID: %2\nWallet account: %3\n").arg(a.market.id, a.market.base, a.market.has_account ? a.market.account : QStringLiteral("created during deposit preparation"))};
@@ -257,11 +274,11 @@ QString Describe(const Action& a)
                      a.side, QString::number(a.market.sequence))};
             review += QStringLiteral("\nExact canonical limit: %1 B3 atoms per token atom; quantity cap: %2 token atoms.").arg(a.price).arg(a.amount);
             if (a.display_limit_adjusted) review += QStringLiteral("\nYour entered limit was %1 %2 / B3. It was adjusted only in your favor to the executable limit %3 %2 / B3 shown above; that exact canonical limit is what will be signed.").arg(a.entered_display_limit, a.display_ticker, executable);
-            return review;
+            return review + MarketableDisclosure(a);
         }
         QString price = QString::number(a.price) + QStringLiteral(" B3 atoms per raw base unit");
         if (a.display_decimals) price = B3FlowMeshMarketData::FormatPrice(a.price, *a.display_decimals) + QStringLiteral(" B3 / ") + a.display_ticker;
-        return prefix + QStringLiteral("Limit %1: %2 at %3.\nExact limit notional: %4 B3\nAccount sequence: %5\nOne uniform-price curve auction, not price-time priority. Accepted is not filled. Protocol fee is 0.01% of matched notional deducted from seller proceeds; actual allocation depends on certified fills. No network fee for this request.").arg(a.side == QStringLiteral("bid") ? QStringLiteral("Buy") : QStringLiteral("Sell"), base_amount, price, QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence));
+        return prefix + QStringLiteral("Limit %1: %2 at %3.\nExact limit notional: %4 B3\nAccount sequence: %5\nOne uniform-price curve auction, not price-time priority. Accepted is not filled. Protocol fee is 0.01% of matched notional deducted from seller proceeds; actual allocation depends on certified fills. No network fee for this request.").arg(a.side == QStringLiteral("bid") ? QStringLiteral("Buy") : QStringLiteral("Sell"), base_amount, price, QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence)) + MarketableDisclosure(a);
     }
     case Operation::Cancel: return prefix + QStringLiteral("Cancel this account's standing %1 (%2); sequence %3. Cancellation is not certified until processed.").arg(
         a.inverse_display ? (B3FlowMeshMarketData::DisplayBuy(a.side, true) ? QStringLiteral("Buy B3") : QStringLiteral("Sell B3")) : a.side,

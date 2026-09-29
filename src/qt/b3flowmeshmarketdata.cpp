@@ -502,6 +502,12 @@ std::optional<int> ParseSlippageBps(const QString& text, QString* error)
     return static_cast<int>(*hundredths);
 }
 
+QString FormatSlippage(int bps)
+{
+    if (bps < 0) return QStringLiteral("—");
+    return QStringLiteral("%1.%2").arg(bps / 100).arg(bps % 100, 2, 10, QLatin1Char('0'));
+}
+
 std::vector<Depth> Aggregate(const std::vector<Curve>& curves)
 {
     if (curves.size() > 128) Fail("Oversized curve page.");

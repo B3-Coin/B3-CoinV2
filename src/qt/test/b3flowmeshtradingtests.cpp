@@ -356,6 +356,24 @@ private Q_SLOTS:
             QVERIFY(!title.contains(QStringLiteral("flowmesh"), Qt::CaseInsensitive));
         }
     }
+    void marketableReviewDisclosesReferenceSlippageAndRestingRemainder()
+    {
+        for (const bool inverse : {false, true}) {
+            auto a{Order()}; a.display_decimals = 6; a.display_ticker = QStringLiteral("tUSD"); a.inverse_display = inverse;
+            a.price = 1020; a.amount = 500'000;
+            const auto plain{Parameters(a)};
+            a.marketable = Action::Marketable{1010, 320'000, 100, inverse ? QStringLiteral("100000/101") : QStringLiteral("1.01")};
+            // Presentation only: the signed request is byte-identical.
+            QCOMPARE(Parameters(a).params.write(), plain.params.write()); QCOMPARE(Parameters(a).method, plain.method);
+            const auto text{Describe(a)};
+            QVERIFY2(text.contains(inverse ? QStringLiteral("at 100000/101 tUSD / B3 with at most 1.00% slippage") : QStringLiteral("at 1.01 B3 / tUSD with at most 1.00% slippage")), qPrintable(text));
+            QVERIFY(text.contains(QStringLiteral("0.32 tUSD (visible depth, not a fill estimate)")));
+            QVERIFY(text.contains(QStringLiteral("stays as a standing order until you cancel it")));
+            QVERIFY(text.contains(QStringLiteral("no market or immediate-or-cancel orders")));
+            a.marketable.reset();
+            QVERIFY(!Describe(a).contains(QStringLiteral("Marketable")));
+        }
+    }
     void exactReceiptRetryHasNoSigningOrEconomicArguments()
     {
         const auto market{Order().market.id}, id{QString::fromStdString(H(8).GetHex())};

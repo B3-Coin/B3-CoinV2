@@ -176,7 +176,17 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     const auto entry = [&](const char* name, int length) {
         auto* field{new QLineEdit{this}}; field->setObjectName(QLatin1String(name)); field->setMaxLength(length); return field;
     };
+    auto* marketable_row{new QHBoxLayout};
+    m_marketable = new QCheckBox{tr("Marketable limit"), ticket_card}; m_marketable->setObjectName(QStringLiteral("flowMeshMarketable"));
+    m_marketable->setToolTip(tr("Not a market order: FlowMesh has no market or immediate-or-cancel orders. This prices an ordinary limit order at the best certified opposite price moved by at most the maximum slippage. Any unfilled part stays as a standing order until you cancel it."));
+    m_slippage = entry("flowMeshMaxSlippage", 6); m_slippage->setText(B3FlowMeshMarketData::FormatSlippage(B3FlowMeshMarketData::DEFAULT_SLIPPAGE_BPS));
+    m_slippage->setAccessibleName(tr("Maximum slippage in percent")); m_slippage->setMaximumWidth(64);
+    m_slippage->setToolTip(tr("Maximum slippage from the best certified opposite price, 0.01% to 10%."));
+    marketable_row->addWidget(m_marketable); marketable_row->addStretch(); marketable_row->addWidget(m_slippage); marketable_row->addWidget(Label(tr("% max"), ticket_card));
+    ticket->addLayout(marketable_row);
     m_price_label = Label(tr("Limit price · B3 / token"), ticket_card); ticket->addWidget(m_price_label); m_price = entry("flowMeshPriceAtoms", 64); m_price->setPlaceholderText(tr("Enter price")); ticket->addWidget(m_price);
+    m_marketable_note = Label(QString{}, ticket_card); m_marketable_note->setObjectName(QStringLiteral("flowMeshMarketableNote"));
+    B3Theme::markTextRole(m_marketable_note, QStringLiteral("secondary")); m_marketable_note->hide(); ticket->addWidget(m_marketable_note);
     m_quantity_label = Label(tr("Quantity · token"), ticket_card); ticket->addWidget(m_quantity_label); m_quantity = entry("flowMeshRawQuantity", 64); m_quantity->setPlaceholderText(tr("Enter quantity")); ticket->addWidget(m_quantity);
     m_grid_note = Label(tr("Token units will be verified from asset metadata."), ticket_card); B3Theme::markTextRole(m_grid_note, QStringLiteral("secondary"));
     m_ticket_available = Label(tr("Available  —"), ticket_card); ticket->addWidget(m_ticket_available); m_ticket_total = Label(tr("Limit notional  —"), ticket_card); ticket->addWidget(m_ticket_total);
@@ -273,6 +283,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     connect(m_retry_receipt, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::retryReceipt);
     connect(m_effect, &QComboBox::currentIndexChanged, this, &B3FlowMeshTradingPanel::updateControls);
     connect(m_price, &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateTicket); connect(m_quantity, &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateTicket);
+    connect(m_marketable, &QCheckBox::toggled, this, &B3FlowMeshTradingPanel::updateTicket); connect(m_slippage, &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateTicket);
     connect(m_buy, &QPushButton::clicked, this, [this] { m_side->setCurrentIndex(0); updateTicket(); }); connect(m_sell, &QPushButton::clicked, this, [this] { m_side->setCurrentIndex(1); updateTicket(); });
     m_timer = new QTimer{this}; m_timer->setInterval(500);
     m_watch_clock.start();
@@ -558,6 +569,27 @@ void B3FlowMeshTradingPanel::updateTicket()
         m_ticket_available->setToolTip(available_tooltip);
         m_ticket_total->setToolTip(total_tooltip);
     };
+    // Marketable limit: the price field shows the helper's exact limit from
+    // fresh certified data. Frozen while a review is pending or open; the
+    // review itself re-prices from its own fresh read.
+    const bool marketable{m_marketable->isChecked()};
+    m_price->setReadOnly(marketable);
+    if (marketable && !m_busy && !m_deferred_review) {
+        const bool fresh{selected && m_snapshot && m_snapshot->market == selected->id && !m_read_failed &&
+            AdmissionReady(*m_snapshot, m_response_age.isValid() ? m_response_age.elapsed() : -1, -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1)};
+        QString error;
+        const auto limit{fresh ? marketableLimit(&error) : std::nullopt};
+        if (!fresh) error = tr("Waiting for fresh certified market data.");
+        if (m_price->text() != (limit ? limit->display : QString{})) { const QSignalBlocker block{m_price}; m_price->setText(limit ? limit->display : QString{}); }
+        QString note{error};
+        if (limit) {
+            const QString price_units{inverse ? tr("%1 / B3").arg(ticker) : tr("B3 / %1").arg(ticker)};
+            note = tr("Limit %1 %2 · best opposite %3 · at most %4% slippage\nVisible certified depth at or better: %5 %6 (not a fill estimate). Any unfilled part rests until you cancel it.")
+                       .arg(limit->display, price_units, limit->reference_display, FormatSlippage(limit->slippage_bps), FormatAmount(limit->visible, m_snapshot->units.decimals), ticker);
+        }
+        if (m_marketable_note->text() != note) m_marketable_note->setText(note);
+    }
+    m_marketable_note->setVisible(marketable);
     if (!units_known) { m_grid_note->setText(tr("Verified asset precision required; no raw-unit guessing.")); m_grid_note->setToolTip(QString{}); m_ticket_available->setText(tr("Available  —")); m_ticket_total->setText(tr("Order value  —")); apply_tooltips(); return; }
     const auto& u{m_snapshot->units}; m_grid_note->setText(inverse ? tr("Exact %1 quantity cap · no guaranteed B3 fill").arg(ticker) : tr("Steps: %1 %2 · %3 B3").arg(FormatAmount(u.quantity_step, u.decimals), ticker, FormatPrice(u.price_step, u.decimals)));
     m_grid_note->setToolTip(tr("Quantity step %1 %2; canonical price step %3 B3 per %2. Quantity is exact and never rounded.").arg(FormatAmount(u.quantity_step, u.decimals), ticker, FormatPrice(u.price_step, u.decimals)) +
@@ -623,6 +655,19 @@ bool B3FlowMeshTradingPanel::orderReviewAvailable() const
 bool B3FlowMeshTradingPanel::orderReady() const
 {
     return orderReviewAvailable() && depositReady();
+}
+
+std::optional<B3FlowMeshMarketData::MarketableLimit> B3FlowMeshTradingPanel::marketableLimit(QString* error) const
+{
+    const auto selected{market()};
+    if (!selected || !m_snapshot || m_snapshot->market != selected->id || m_snapshot->units.asset != selected->base) {
+        if (error) *error = tr("Certified market data is required.");
+        return std::nullopt;
+    }
+    const auto bps{B3FlowMeshMarketData::ParseSlippageBps(m_slippage->text(), error)};
+    if (!bps) return std::nullopt;
+    const auto quantity{B3FlowMeshMarketData::ParseQuantity(m_quantity->text(), m_snapshot->units)};
+    return B3FlowMeshMarketData::ComputeMarketableLimit(*m_snapshot, m_side->currentIndex() == 0, inverted(), *bps, quantity, error);
 }
 
 void B3FlowMeshTradingPanel::requestOrderReview()
@@ -701,6 +746,7 @@ void B3FlowMeshTradingPanel::updateControls()
     for (auto* field : {m_price, m_quantity, m_amount, m_destination, m_deposit_txid, m_deposit_vout}) field->setEnabled(idle);
     m_side->setEnabled(idle); m_asset->setEnabled(idle); m_effect->setEnabled(idle);
     m_buy->setEnabled(idle); m_sell->setEnabled(idle);
+    m_marketable->setEnabled(idle); m_slippage->setEnabled(idle);
     m_order->setEnabled(orderReviewAvailable()); m_cancel_order->setEnabled(ready && selected->has_account && !pending);
     m_order->setToolTip(tr("Review first checks fresh market readiness and your certified balance. This button does not mean trading is ready. A failed or paused check signs and sends nothing; there is no automatic retry."));
     m_withdraw->setEnabled(withdrawalDraftAvailable()); m_deposit->setEnabled(depositDraftAvailable());
@@ -861,10 +907,22 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
             m_snapshot && m_snapshot->pending_actions > 0 && m_queue_age.isValid() && m_queue_age.elapsed() >= 30'000) throw std::runtime_error{"Queued requests have not certified for 30 seconds. Refresh and inspect the market before submitting. Existing requests were not canceled."};
         if (operation == Operation::Order) {
             if (m_snapshot->units.asset != selected->base) throw std::runtime_error{"Asset precision belongs to a different configured AssetId. Nothing was signed."};
+            // A marketable limit is priced here, from this fresh snapshot; the
+            // review shows and signs exactly that limit.
+            std::optional<B3FlowMeshMarketData::MarketableLimit> marketable;
+            if (m_marketable->isChecked()) {
+                marketable = marketableLimit(&error);
+                if (!marketable) throw std::runtime_error{tr("Marketable limit unavailable: %1 Nothing was signed or submitted.").arg(error).toStdString()};
+                const QSignalBlocker block{m_price}; m_price->setText(marketable->display);
+            }
             const auto limit{B3FlowMeshMarketData::ParseDisplayLimit(m_price->text(), m_snapshot->units, a.inverse_display, m_side->currentIndex() == 0, &error)};
             const auto quantity{B3FlowMeshMarketData::ParseQuantity(m_quantity->text(), m_snapshot->units, &error)};
             if (!limit || !quantity) throw std::runtime_error{error.toStdString()}; a.price = limit->price; a.amount = *quantity;
             a.display_limit_adjusted = limit->adjusted; a.entered_display_limit = m_price->text();
+            if (marketable) {
+                if (limit->price != marketable->price || limit->adjusted) throw std::runtime_error{"The marketable limit did not round-trip exactly. Nothing was signed."};
+                a.marketable = Action::Marketable{marketable->reference, marketable->visible, marketable->slippage_bps, marketable->reference_display};
+            }
         } else if (operation == Operation::Deposit || operation == Operation::Withdraw) {
             const auto text{operation == Operation::Withdraw ? m_withdrawal_draft_amount : m_amount->text()};
             const auto amount{a.native ? B3AssetTransfer::ParseAmount(text, 9, &error) : B3FlowMeshMarketData::ParseQuantity(text, m_snapshot->units, &error)};
@@ -918,7 +976,8 @@ bool B3FlowMeshTradingPanel::deferReview(Operation operation, bool funding)
     m_deferred_review = DeferredReview{operation, funding, m_generation, selected->id, m_effect->currentData(Qt::UserRole + 1).toString(), std::nullopt, std::nullopt};
     if (operation == Operation::Order)
         m_deferred_review->order_context = DeferredReview::OrderContext{m_wallet, *selected, m_snapshot->units,
-            m_price->text(), m_quantity->text(), m_side->currentIndex(), inverted(), m_active_result && m_active_result->receipt_only};
+            m_price->text(), m_quantity->text(), m_side->currentIndex(), inverted(), m_active_result && m_active_result->receipt_only,
+            m_marketable->isChecked(), m_slippage->text()};
     if (m_active_result && m_active_result->passive && m_refresh_yields < MAX_REFRESH_YIELDS) m_yield_refresh->store(true);
     m_busy = true; updateControls(); return true;
 }
@@ -941,8 +1000,9 @@ void B3FlowMeshTradingPanel::resumeReview()
             context.market.base != selected->base || context.market.vault != selected->vault ||
             context.market.domain != selected->domain || context.market.config != selected->config ||
             context.market.account != selected->account || context.market.remote != selected->remote ||
-            context.units != m_snapshot->units || context.price != m_price->text() || context.quantity != m_quantity->text() ||
-            context.side != m_side->currentIndex() || context.inverse != inverted()) {
+            context.units != m_snapshot->units || (!context.marketable && context.price != m_price->text()) || context.quantity != m_quantity->text() ||
+            context.side != m_side->currentIndex() || context.inverse != inverted() ||
+            context.marketable != m_marketable->isChecked() || context.slippage != m_slippage->text()) {
             notice(tr("The order inputs, asset units or wallet/market binding changed. Review the order again; nothing was signed or submitted.")); return;
         }
         if (needs_market_read) {

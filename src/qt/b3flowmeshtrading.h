@@ -39,6 +39,14 @@ struct Action {
     //! cancel or withdrawal then returns verified in the same call when the
     //! remote endpoint answers in time. Latency only; never reviewed economics.
     int submit_wait_ms{0};
+    //! Presentation only: how a marketable-limit ticket priced this order.
+    //! Never serialized or included in Parameters; price is the commitment.
+    struct Marketable {
+        CAmount reference{0}, visible{0};
+        int slippage_bps{0};
+        QString reference_display;
+    };
+    std::optional<Marketable> marketable;
 };
 struct Request { std::string method; UniValue params{UniValue::VARR}; };
 //! A verified per-action outcome as the local RPC reports it (never an

@@ -138,6 +138,8 @@ std::optional<MarketableLimit> ComputeMarketableLimit(const Snapshot& snapshot, 
 //! A maximum slippage in percent with at most two decimals ("1.00"), as
 //! basis points from 1 (0.01%) to MAX_SLIPPAGE_BPS (10%).
 std::optional<int> ParseSlippageBps(const QString& text, QString* error = nullptr);
+//! Basis points as an exact percent with two decimals ("1.00").
+QString FormatSlippage(int bps);
 //! Fail closed; no JSON display values are financial sources of truth.
 Snapshot Parse(const UniValue& value);
 std::vector<Depth> Aggregate(const std::vector<Curve>& curves);

@@ -23,6 +23,7 @@
 #include <wallet/wallet.h>
 #include <QAbstractButton>
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDeadlineTimer>
 #include <QDir>
@@ -4608,6 +4609,71 @@ private Q_SLOTS:
         probe.fail = true; run(); probe.fail = false; run();
         QCOMPARE(panel.m_toasts->texts().size(), 2);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void marketableModeFillsExactPriceButNeverSignsOrUnlocks()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        auto* marketable{panel.findChild<QCheckBox*>(QStringLiteral("flowMeshMarketable"))};
+        auto* slippage{panel.findChild<QLineEdit*>(QStringLiteral("flowMeshMaxSlippage"))};
+        auto* note{panel.findChild<QLabel*>(QStringLiteral("flowMeshMarketableNote"))};
+        QVERIFY(marketable && slippage && note); QVERIFY(!marketable->isChecked()); QCOMPARE(slippage->text(), QStringLiteral("1.00"));
+        panel.m_price->setText(QStringLiteral("0.5"));
+        // Buy against the other account's best ask of 1 B3/tUSD: at most 1% above.
+        marketable->setChecked(true);
+        QCOMPARE(panel.m_price->text(), QStringLiteral("1.01")); QVERIFY(panel.m_price->isReadOnly());
+        QVERIFY(note->text().contains(QStringLiteral("not a fill estimate"))); QVERIFY(note->text().contains(QStringLiteral("rests")));
+        slippage->setText(QStringLiteral("10")); QCOMPARE(panel.m_price->text(), QStringLiteral("1.1"));
+        slippage->setText(QStringLiteral("11")); QVERIFY(panel.m_price->text().isEmpty()); QVERIFY(note->text().contains(QStringLiteral("0.01 to 10 percent")));
+        slippage->setText(QStringLiteral("1.00"));
+        // The only bid is this account's own: nothing to sell into.
+        panel.m_sell->click(); QVERIFY(panel.m_price->text().isEmpty()); QVERIFY(note->text().contains(QStringLiteral("No certified buy orders")));
+        panel.m_buy->click(); QCOMPARE(panel.m_price->text(), QStringLiteral("1.01"));
+        // Stale data never prices.
+        panel.m_read_failed = true; panel.updateTicket(); QVERIFY(panel.m_price->text().isEmpty()); QVERIFY(note->text().contains(QStringLiteral("fresh certified")));
+        panel.m_read_failed = false; panel.updateTicket(); QCOMPARE(panel.m_price->text(), QStringLiteral("1.01"));
+        marketable->setChecked(false); QVERIFY(!panel.m_price->isReadOnly()); QVERIFY(note->isHidden());
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void marketableReviewSurvivesBookMoveDuringForegroundRead()
+    {
+        FundingReadProbe probe; probe.hold = true;
+        // The book moves during the review's foreground read: the best ask
+        // becomes 1.1 B3/tUSD.
+        auto liquidity{probe.data["liquidity"]}; UniValue curves{UniValue::VARR};
+        for (const auto& curve : liquidity["curves"].getValues()) {
+            auto moved{curve};
+            if (curve["side"].get_str() == "ask") {
+                UniValue points{UniValue::VARR};
+                for (const auto [price, quantity] : {std::pair{1099, 0}, std::pair{1100, 1'000'000}}) { UniValue p{UniValue::VOBJ}; p.pushKV("price", price); p.pushKV("quantity", quantity); points.push_back(p); }
+                moved.pushKV("points", points);
+            }
+            curves.push_back(moved);
+        }
+        liquidity.pushKV("curves", curves); probe.data.pushKV("liquidity", liquidity);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_catalog_age.start(); panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None;
+        panel.m_quantity->setText(QStringLiteral("0.5"));
+        panel.m_marketable->setChecked(true); QCOMPARE(panel.m_price->text(), QStringLiteral("1.01"));
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        QString review; QTimer review_guard;
+        connect(&review_guard, &QTimer::timeout, &panel, [&] {
+            if (!panel.m_confirmation) return;
+            review = panel.m_confirmation->text(); panel.m_confirmation->done(QMessageBox::Cancel);
+        });
+        review_guard.start(1);
+        panel.m_order->click(); QVERIFY(panel.m_deferred_review && panel.m_deferred_review->order_context->marketable);
+        QVERIFY(probe.entered.tryAcquire(1, 2000)); probe.release.release();
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); QTRY_VERIFY_WITH_TIMEOUT(!review.isEmpty(), 2000); review_guard.stop();
+        // Re-priced from the fresh read, never refused as changed input.
+        QVERIFY2(review.contains(QStringLiteral("at 1.111 B3 / tUSD")), qPrintable(review));
+        QVERIFY(review.contains(QStringLiteral("best certified opposite order at 1.1 B3 / tUSD with at most 1.00% slippage")));
+        QVERIFY(review.contains(QStringLiteral("0.75 tUSD (visible depth, not a fill estimate)")));
+        QVERIFY(review.contains(QStringLiteral("stays as a standing order until you cancel it")));
+        QVERIFY(review.contains(QStringLiteral("not a market order")));
+        QVERIFY(!panel.m_log->toPlainText().contains(QStringLiteral("order inputs")));
+        QCOMPARE(panel.m_price->text(), QStringLiteral("1.111"));
+        QCOMPARE(unlock.count(), 0); QCOMPARE(probe.writes.load(), 0); QVERIFY(!panel.m_unlock); QVERIFY(m_wallet->IsLocked());
     }
     void connectionBannerShowsLiveReconnectingAndCheckingState()
     {
