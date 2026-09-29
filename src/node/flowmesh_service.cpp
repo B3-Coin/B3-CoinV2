@@ -2211,7 +2211,8 @@ std::optional<flowmesh::ClientStateEvidence> FlowMeshService::ClientSnapshot(
 
 std::optional<FlowMeshClientSnapshotView> FlowMeshService::ClientSnapshotView(
     const flowmesh::MarketId& market_id,
-    const std::optional<flowmesh::AccountId>& account, std::string& error) const
+    const std::optional<flowmesh::AccountId>& account, std::string& error,
+    const flowmesh::MarketDataQuery& reported_query) const
 {
     std::shared_ptr<FlowMeshRuntime> runtime;
     bool running{false};
@@ -2221,7 +2222,7 @@ std::optional<FlowMeshClientSnapshotView> FlowMeshService::ClientSnapshotView(
         running = m_impl->running && !m_impl->stopping;
     }
     if (!runtime) { error = "FlowMesh runtime is unavailable"; return std::nullopt; }
-    auto out{runtime->ClientSnapshotView(market_id, account, error)};
+    auto out{runtime->ClientSnapshotView(market_id, account, error, reported_query)};
     if (out) {
         // Availability is a local observation, not an authenticated state
         // claim. Never replace the head/history captured together below it.

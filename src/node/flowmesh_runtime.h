@@ -567,10 +567,12 @@ public:
     std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
         const flowmesh::MarketId& market_id, std::string& error) const;
     /** Certificate/state and bounded reported history captured under ONE market
-     * lock. A later publication cannot mix two heads into this response. */
+     * lock. A later publication cannot mix two heads into this response.
+     * `reported_query` shapes only the reported (unauthenticated) part. */
     std::optional<FlowMeshClientSnapshotView> ClientSnapshotView(
         const flowmesh::MarketId& market_id,
-        const std::optional<flowmesh::AccountId>& account, std::string& error) const;
+        const std::optional<flowmesh::AccountId>& account, std::string& error,
+        const flowmesh::MarketDataQuery& reported_query = {}) const;
     /** One certified entry as a client payload. Entries in the recent window
      * (the head included) are encoded from memory outside the market lock;
      * only older sequences read the store. */

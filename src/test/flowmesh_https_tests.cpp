@@ -4978,13 +4978,15 @@ struct LiveMarket {
     ClientLaneFixture& fixture;
     const fs::path path;
     const node::FlowMeshTradingApiWatch watch;
+    const node::FlowMeshTradingApiTicks ticks;
     std::unique_ptr<node::FlowMeshService> service;
     std::unique_ptr<node::FlowMeshHttpsServer> api;
     uint16_t port{0};
     //! Told of every connection the API admits (set before Start).
     std::function<void(bool)> connection_observer;
-    LiveMarket(ClientLaneFixture& f, fs::path p, const node::FlowMeshTradingApiWatch w = {})
-        : fixture{f}, path{std::move(p)}, watch{w}
+    LiveMarket(ClientLaneFixture& f, fs::path p, const node::FlowMeshTradingApiWatch w = {},
+               const node::FlowMeshTradingApiTicks t = {})
+        : fixture{f}, path{std::move(p)}, watch{w}, ticks{t}
     {
         // Certify the market genesis, publish its checkpoint on B3, and start
         // again: the market then admits actions.
@@ -5005,7 +5007,7 @@ struct LiveMarket {
         BOOST_REQUIRE_MESSAGE(service->ArmSeatKeys(fixture.secrets, error), error);
         auto options{fixture.Options(port)};
         options.request_timeout = std::chrono::seconds{10};
-        api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, {}, watch);
+        api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, {}, watch, ticks);
         if (connection_observer) {
             BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(*api, [this](bool nodelay) {
                 if (connection_observer) connection_observer(nodelay);
@@ -5557,6 +5559,82 @@ BOOST_AUTO_TEST_CASE(local_backend_watch_wakes_on_commit_and_needs_known_head)
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_client_market_view_tests, ClientLaneFixture)
+
+namespace {
+std::pair<int, UniValue> ApiCall(const node::HttpsEndpoint& endpoint, const std::string& method, const std::string& params)
+{
+    const auto reply{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
+        "{\"method\":\"" + method + "\",\"params\":{" + params + "}}", std::chrono::seconds{10}, 32 << 20)};
+    BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+    UniValue value;
+    BOOST_REQUIRE(value.read(reply.body));
+    return {reply.status, value};
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(trading_api_without_clearing_ticks_keeps_the_previous_contract)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket off{*this, m_path_root / "ticks-off"};
+    const auto [status, snapshot]{ApiCall(off.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK(!snapshot["result"]["status"].exists("clearing_ticks_max"));
+    BOOST_CHECK(!snapshot["result"]["reported_data"].exists("clearing_ticks"));
+    const auto [markets_status, markets]{ApiCall(off.Endpoint(), "markets", "")};
+    BOOST_CHECK_EQUAL(markets_status, 200);
+    BOOST_CHECK(!markets["result"][0].exists("clearing_ticks_max"));
+    for (const char* method : {"snapshot", "updates"}) {
+        const auto [refused, rejection]{ApiCall(off.Endpoint(), method, id + ",\"ticks\":{}")};
+        BOOST_CHECK_EQUAL(refused, 400);
+        BOOST_CHECK_EQUAL(rejection["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_serves_clearing_ticks_when_enabled)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket on{*this, m_path_root / "ticks-on", {std::chrono::milliseconds{2000}, 2}, {16}};
+    on.Deposit();
+    const auto [status, plain]{ApiCall(on.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK_EQUAL(plain["result"]["status"]["clearing_ticks_max"].getInt<int>(), 16);
+    // Not asked for: reported_data is unchanged.
+    BOOST_CHECK(!plain["result"]["reported_data"].exists("clearing_ticks"));
+    const auto [ticked_status, ticked]{ApiCall(on.Endpoint(), "snapshot", id + ",\"ticks\":{}")};
+    BOOST_CHECK_EQUAL(ticked_status, 200);
+    const auto head{ticked["result"]["status"]["last_microblock_hash"].get_str()};
+    const auto& ticks{ticked["result"]["reported_data"]["clearing_ticks"]};
+    BOOST_CHECK(ticks["available"].get_bool());
+    BOOST_REQUIRE_EQUAL(ticks["ticks"].size(), 2U);
+    BOOST_CHECK_EQUAL(ticks["ticks"][0]["sequence"].getInt<int>(), 0);
+    BOOST_CHECK_EQUAL(ticks["ticks"][1]["microblock_hash"].get_str(), head);
+    BOOST_CHECK_EQUAL(ticks["ticks"][1]["kind"].get_str(), "execution");
+    BOOST_CHECK_EQUAL(ticks["ticks"][1]["imbalance_side"].get_str(), "none");
+
+    // A light poll: unchanged heavy data, still the ticks after a position.
+    const auto [light_status, light]{ApiCall(on.Endpoint(), "updates",
+        id + ",\"known_head\":\"" + head + "\",\"ticks\":{\"after_sequence\":0}")};
+    BOOST_CHECK_EQUAL(light_status, 200);
+    BOOST_CHECK(light["result"]["reported_data"]["unchanged"].get_bool());
+    BOOST_REQUIRE_EQUAL(light["result"]["reported_data"]["clearing_ticks"]["ticks"].size(), 1U);
+    BOOST_CHECK_EQUAL(light["result"]["reported_data"]["clearing_ticks"]["ticks"][0]["microblock_hash"].get_str(), head);
+    // A larger limit is clamped to the advertised maximum, never refused.
+    const auto [clamped_status, clamped]{ApiCall(on.Endpoint(), "updates", id + ",\"ticks\":{\"limit\":18446744073709551615}")};
+    BOOST_CHECK_EQUAL(clamped_status, 200);
+    BOOST_CHECK_EQUAL(clamped["result"]["reported_data"]["clearing_ticks"]["ticks"].size(), 2U);
+    // Malformed parameters are refused before any read.
+    for (const std::string bad : {"{\"limit\":0}", "{\"limit\":-1}", "{\"after\":1}", "[]", "{\"after_sequence\":\"1\"}"}) {
+        BOOST_TEST_CONTEXT("ticks=" << bad) {
+            const auto [refused, rejection]{ApiCall(on.Endpoint(), "snapshot", id + ",\"ticks\":" + bad)};
+            BOOST_CHECK_EQUAL(refused, 400);
+            BOOST_CHECK(!rejection["ok"].get_bool());
+        }
+    }
+    // A watched page carries no reported_data, so no ticks either.
+    const auto [watched_status, watched]{ApiCall(on.Endpoint(), "updates", id + ",\"watch_ms\":500,\"ticks\":{}")};
+    BOOST_CHECK_EQUAL(watched_status, 400);
+    BOOST_CHECK_EQUAL(watched["error"].get_str(), "ticks cannot be combined with watch_ms");
+}
 
 BOOST_AUTO_TEST_CASE(indicative_clearing_comes_from_verified_state_on_both_backends)
 {

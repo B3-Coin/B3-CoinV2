@@ -175,12 +175,23 @@ struct FlowMeshTradingApiOutcome {
 inline constexpr const char* FLOWMESH_API_OUTCOME_BUDGET_ERROR{
     "Public trading request budget exhausted before outcome evidence"};
 
+//! Node-local policy for clearing ticks on the restricted API's 'snapshot' and
+//! unwatched 'updates' reads: the "clearing_ticks_max" advert in status
+//! objects and an optional "ticks" parameter {after_sequence, limit}, whose
+//! page (limit clamped to max) rides in reported_data. Endpoint-reported
+//! display data from the bounded in-memory history, never evidence. Zero keeps
+//! the exact previous request and reply contract.
+struct FlowMeshTradingApiTicks {
+    size_t max{0};
+};
+inline constexpr size_t FLOWMESH_API_CLEARING_TICKS_DEFAULT{flowmesh::MARKET_DATA_MAX_TICKS};
+
 //! Restricted HTTPS adapter. It holds no wallet and never invokes the RPC table.
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(
     FlowMeshService& service, FlowMeshHttpsServer::Options options,
     FlowMeshAssetMetadataCatalog metadata = {}, FlowMeshTradingApiWait wait = {},
     FlowMeshTradingApiHealth health = {}, FlowMeshTradingApiOutcome outcome = {},
-    FlowMeshTradingApiWatch watch = {});
+    FlowMeshTradingApiWatch watch = {}, FlowMeshTradingApiTicks ticks = {});
 
 //! Shared public projection used by the wallet RPC and restricted endpoint.
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);

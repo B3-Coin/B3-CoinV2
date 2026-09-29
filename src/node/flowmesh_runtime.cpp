@@ -3506,7 +3506,8 @@ std::optional<flowmesh::ClientStateEvidence> FlowMeshRuntime::ClientSnapshot(
 
 std::optional<FlowMeshClientSnapshotView> FlowMeshRuntime::ClientSnapshotView(
     const flowmesh::MarketId& market_id,
-    const std::optional<flowmesh::AccountId>& account, std::string& error) const
+    const std::optional<flowmesh::AccountId>& account, std::string& error,
+    const flowmesh::MarketDataQuery& reported_query) const
 {
     FlowMeshTimingSpan timing_lock_3198{__func__};
     timing_lock_3198.Field("lock_name", std::string{"market_mutex"});
@@ -3515,7 +3516,7 @@ std::optional<FlowMeshClientSnapshotView> FlowMeshRuntime::ClientSnapshotView(
     timing_lock_3198.Mark("lock_acquired_us");
     auto evidence{ClientSnapshotLocked(market_id, error)};
     if (!evidence) return std::nullopt;
-    auto reported{MarketDataLocked(market_id, account, {}, error)};
+    auto reported{MarketDataLocked(market_id, account, reported_query, error)};
     if (!reported) return std::nullopt;
     return FlowMeshClientSnapshotView{std::move(*evidence), std::move(*reported)};
 }
