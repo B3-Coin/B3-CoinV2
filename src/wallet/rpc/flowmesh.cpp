@@ -1005,7 +1005,12 @@ RPCHelpMan getflowmeshmarketdata()
         "An old head on an idle market does not prove quorum failure. Standing curve identity is account and side; the v1 state does not retain submission ids or original submission sequences. "
         "Use expected_head when continuing curve pages; a changed head rejects pagination. "
         "known_head returns current lightweight status with unchanged=true when immutable data is unchanged. "
-        "Checkpoint status remains available through listflowmeshmarkets; this bounded query does not scan the checkpoint backlog.\n",
+        "Checkpoint status remains available through listflowmeshmarkets; this bounded query does not scan the checkpoint backlog. "
+        "watch_ms makes this a live-update read: it first waits, at most that long and at most 1500 ms, until the endpoint (or the local engine) can report a new event, "
+        "gap or head for this market and wallet, then returns the same verified data and a watch object. A remote client watches only an endpoint that advertises "
+        "live updates (getflowmeshclientinfo live_updates_ms) and otherwise reads at once; the wallet is held for at most watch_ms plus 5 seconds. "
+        "When watch.supported or watch.waited is false, callers must pace repeated reads themselves (at least 500 ms apart). watch_ms 0 is an ordinary read "
+        "that also closes the remote client's live-update connection. A watch never signs, submits or resends an action.\n",
         {
             {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Market id"},
             {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Bounded query options", {
@@ -1015,6 +1020,7 @@ RPCHelpMan getflowmeshmarketdata()
                 {"curve_cursor", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Exclusive bid:<account_id> or ask:<account_id> cursor; requires expected_head"},
                 {"expected_head", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Reject if the certified head has changed"},
                 {"known_head", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Omit heavy data when the head matches; cannot be combined with pagination cursors"},
+                {"watch_ms", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Live update: wait up to this many milliseconds (0-2000, at most 1500 used) for a change before reading; cannot be combined with before_sequence, curve_cursor or expected_head"},
             }},
         },
         RPCResult{T::OBJ, "", "Bounded certified market snapshot", {
@@ -1037,6 +1043,14 @@ RPCHelpMan getflowmeshmarketdata()
                 {T::BOOL, "history_endpoint_reported", "History is endpoint-reported rather than independently execution-verified"},
                 {T::BOOL, "event_gap", "Sticky: the client's event cursor for this market was lost at least once (endpoint-reported gap, other endpoint or restarted endpoint, restart of this client, or a wallet/authority change), so events in between may never have been seen; balances and orders still come only from verified snapshots"},
                 {T::BOOL, "freshest_network_head_proven", "False: a valid response does not prove the freshest network head"},
+            }},
+            {T::OBJ, "watch", /*optional=*/true, "Present only when watch_ms was given: this read's local latency observation, never evidence", {
+                {T::STR, "status", "none, no_cursor, head_changed, ready, gap, timeout, interrupted, restarted, busy, deadline (endpoint), or not_eligible, lane_busy, superseded, unsupported, failed, revalidate, invalid, other (this client)"},
+                {T::BOOL, "supported", "The endpoint (or the local engine) served the watch"},
+                {T::BOOL, "waited", "It waited or reported a change or gap; otherwise pace the next read"},
+                {T::BOOL, "gap", "This read found an event gap"},
+                {T::STR, "endpoint", "Endpoint the watch was for, or empty"},
+                {T::NUM, "endpoint_live_ms", "That endpoint's advertised live-update maximum, or zero"},
             }},
             {T::OBJ, "base_metadata", /*optional=*/true, "Verified display precision and sourced cosmetic labels, including on unchanged responses; does not certify backing", {
                 {T::BOOL, "known", "Immutable display precision is verified"},
@@ -1126,12 +1140,48 @@ RPCHelpMan getflowmeshmarketdata()
             const auto wallet{GetWalletForJSONRPCRequest(request)};
             if (!wallet) return UniValue::VNULL;
             const uint256 market_id{ParseMarketId(request.params[0])};
-            const auto query{ParseMarketDataQuery(request.params[1])};
+            // watch_ms is taken out before the shared, strict query parser.
+            UniValue options{request.params[1]};
+            std::optional<std::chrono::milliseconds> watch_ms;
+            if (options.isObject() && options.exists("watch_ms")) {
+                const auto& value{options["watch_ms"]};
+                uint64_t wait{0};
+                try {
+                    if (!value.isNum()) throw UniValue::type_error{"watch_ms"};
+                    wait = value.getInt<uint64_t>();
+                } catch (const std::runtime_error&) {
+                    // Not a number, negative, fractional or beyond 64 bits.
+                    throw JSONRPCError(RPC_TYPE_ERROR, "watch_ms must be a nonnegative integer");
+                }
+                if (wait > 2000) throw JSONRPCError(RPC_INVALID_PARAMETER, "watch_ms is outside its supported range");
+                watch_ms = std::chrono::milliseconds{wait};
+                UniValue rest{UniValue::VOBJ};
+                for (const auto& key : options.getKeys()) {
+                    if (key != "watch_ms") rest.pushKV(key, options[key]);
+                }
+                options = std::move(rest);
+            }
+            const auto query{ParseMarketDataQuery(options)};
+            if (watch_ms && (query.before_sequence || query.curve_cursor || query.expected_head)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "watch_ms cannot be combined with before_sequence, curve_cursor or expected_head");
+            }
             const auto account{ExistingWalletAccount(*wallet)};
             std::string error;
-            const auto data{wallet->chain().flowMeshMarketData(market_id, account, query, error)};
+            interfaces::FlowMeshMarketWatch watch;
+            const auto data{watch_ms ? wallet->chain().flowMeshWatchMarketData(market_id, account, query, *watch_ms, watch, error)
+                                     : wallet->chain().flowMeshMarketData(market_id, account, query, error)};
             if (!data) throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "FlowMesh market data is unavailable" : error);
             UniValue out{CertifiedMarketDataJson(*data)};
+            if (watch_ms) {
+                UniValue observed{UniValue::VOBJ};
+                observed.pushKV("status", watch.status);
+                observed.pushKV("supported", watch.supported);
+                observed.pushKV("waited", watch.waited);
+                observed.pushKV("gap", watch.gap);
+                observed.pushKV("endpoint", watch.endpoint);
+                observed.pushKV("endpoint_live_ms", uint64_t{watch.endpoint_live_ms});
+                out.pushKV("watch", std::move(observed));
+            }
             UniValue metadata{UniValue::VOBJ};
             {
                 LOCK(wallet->cs_wallet);
