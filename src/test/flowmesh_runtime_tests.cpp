@@ -9398,6 +9398,10 @@ BOOST_AUTO_TEST_CASE(local_submit_answers_from_certified_state_and_notices_only_
     BOOST_CHECK(runtime.SubmitLocalAction(f.market, consumer) == flowmesh::QueueResult::ACCEPTED);
     const auto deposit_again{runtime.SubmitLocalActionChecked(f.market, Deposit(f.outpoint))};
     BOOST_CHECK(deposit_again.admission.kind == node::FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED);
+    // An inclusion is answered from retained certified data: no notice, so a
+    // replay of public certified bytes never churns the notice ring.
+    BOOST_CHECK(!runtime.NewestClientNotice(f.market, consumer.Id()));
+    BOOST_CHECK(!runtime.NewestClientNotice(f.market, Deposit(f.outpoint).Id()));
 
     // A different action for the consumed sequence is refused, naming X.
     const auto loser{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_BID)};
