@@ -29,6 +29,8 @@ namespace {
 
 constexpr flowmesh::WirePeerId LOCAL_ACTION_PEER{FLOWMESH_LOCAL_ACTION_PEER};
 constexpr size_t MAX_RUNTIME_CANDIDATES_PER_SEQUENCE{8};
+// Local drop notices per commit; further drops are only counted by the pool.
+constexpr size_t MAX_LOCAL_DROP_NOTICES{256};
 constexpr size_t MAX_PENDING_MARKET_ADDITIONS{1'024};
 constexpr size_t MAX_CATCHUP_COMMANDS{64};
 constexpr size_t MAX_ACTIVE_CATCHUPS{16};
@@ -1538,7 +1540,34 @@ bool CommitCertified(Market& market,
                               certified.entry.anchor.hash}] =
         certified.entry.sequence;
     market.pool.DropCertified(certified.entry.actions);
-    market.pool.Prune(market.state);
+    // Local drop notices: a queued API-origin action whose sequence this
+    // entry consumed. The consumer is in this very entry: such an action was
+    // admitted while its sequence was open, and every commit prunes. Deposits
+    // are never reported: only the deposit itself can consume its outpoint,
+    // and DropCertified already removed it by id.
+    std::vector<flowmesh::ClientActionNotice> drops;
+    const auto* committed_item{market.recent.Find(certified.entry.sequence)};
+    if (committed_item && committed_item->hash != market.last_hash) committed_item = nullptr;
+    for (const auto& dropped : market.pool.Prune(market.state, MAX_LOCAL_DROP_NOTICES)) {
+        flowmesh::ClientActionNotice& notice{drops.emplace_back()};
+        notice.market_id = market.market_id;
+        notice.action_id = dropped.Id();
+        notice.account_id = dropped.signer;
+        notice.account_sequence = dropped.sequence;
+        notice.action_type = dropped.type;
+        if (const auto bytes{flowmesh::EncodeProductionActionPayload(dropped)}) notice.signed_action_hash = Hash(*bytes);
+        notice.code = flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED;
+        notice.next_account_sequence = market.state.NextSequence(dropped.signer);
+        if (committed_item) {
+            if (const auto consumer{FlowMeshRecentCertifiedWindow::ConsumerIn(*committed_item, dropped.signer,
+                                                                               dropped.sequence)}) {
+                notice.consumed_by = flowmesh::ClientConsumerRef{consumer->action_id, consumer->microblock_sequence,
+                                                                 consumer->microblock_hash};
+            }
+        }
+    }
+    // After this commit's events, in one append.
+    if (!drops.empty()) market.client_events.AppendNotices(std::move(drops));
     market.candidates.clear();
     market.attestations.clear();
     market.attested_hash_by_seat.clear();
@@ -3556,11 +3585,11 @@ std::optional<flowmesh::ClientEvent> FlowMeshRuntime::ClientActionStatus(
 flowmesh::ClientActionWait FlowMeshRuntime::WaitClientActionStatus(
     const flowmesh::MarketId& market_id, const uint256& action_id,
     const std::chrono::steady_clock::time_point deadline,
-    const std::function<bool()>& interrupted) const
+    const std::function<bool()>& interrupted, const bool include_notices) const
 {
     return m_client_events.WaitActionStatus(market_id, action_id, deadline, [&] {
         return m_client_waits_closed.load() || (interrupted && interrupted());
-    });
+    }, include_notices);
 }
 
 void FlowMeshRuntime::WakeClientWaiters() const

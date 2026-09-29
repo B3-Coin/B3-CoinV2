@@ -575,7 +575,7 @@ public:
     flowmesh::ClientActionWait WaitClientActionStatus(
         const flowmesh::MarketId& market_id, const uint256& action_id,
         std::chrono::steady_clock::time_point deadline,
-        const std::function<bool()>& interrupted) const;
+        const std::function<bool()>& interrupted, bool include_notices = false) const;
     /** Ends every current client-action wait (shutdown, never a result). */
     void WakeClientWaiters() const;
 

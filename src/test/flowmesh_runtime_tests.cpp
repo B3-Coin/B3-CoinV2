@@ -9418,4 +9418,64 @@ BOOST_AUTO_TEST_CASE(remote_frames_have_no_local_sequence_window)
     BOOST_REQUIRE(settled);
 }
 
+BOOST_AUTO_TEST_CASE(prune_publishes_local_drop_notice_with_consumer_from_same_entry)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_drop_notice"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true;
+    // The slot's proposer P certifies X; node L holds only its own A.
+    const uint32_t proposer_seat{flowmesh::ProductionProposerSeatIndex(1, 0, f.seats.seats.Size())};
+    size_t proposer{0};
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        if (f.seats.secrets[i].GetPublicKey() == f.seats.seats.members[proposer_seat].key.Key()) proposer = i;
+    }
+    const size_t local{(proposer + 1) % f.runtimes.size()};
+    f.network.SetFilter([&](size_t from, size_t, const flowmesh::WireMessage& wire) {
+        if (from == local && wire.kind == flowmesh::WireMessageKind::ACTION) return false;
+        return f.Observe(wire);
+    });
+    CKey key;
+    key.MakeNewKey(true);
+    const auto config{f.initial.ConfigId()};
+    const auto queued{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_BID)};
+    const auto consumer{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::CANCEL_ASK)};
+    const auto remote_only{SignedAction(key, f.domain, config, 0, flowmesh::ActionType::WITHDRAW)};
+    BOOST_REQUIRE(f.runtimes[local]->SubmitLocalAction(f.market, queued) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_REQUIRE_EQUAL(f.runtimes[local]->MarketStatus(f.market)->pending_actions, 1U);
+    BOOST_REQUIRE(f.runtimes[proposer]->SubmitLocalAction(f.market, consumer) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    f.block_commits = false;
+    BOOST_REQUIRE(Settle(f, [&] { return f.AllAt(2); }));
+    f.Drain();
+    const auto state{f.runtimes[local]->StateSnapshot(f.market)};
+    BOOST_REQUIRE_EQUAL(state->NextSequence(consumer.signer), 1U);
+    BOOST_CHECK_EQUAL(f.runtimes[local]->MarketStatus(f.market)->pending_actions, 0U);
+    const auto inclusion{f.runtimes[local]->ClientRecentInclusion(f.market, consumer.Id())};
+    BOOST_REQUIRE(inclusion);
+    const auto notice{f.runtimes[local]->NewestClientNotice(f.market, queued.Id())};
+    BOOST_REQUIRE(notice);
+    BOOST_CHECK(notice->code == flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED);
+    BOOST_CHECK_EQUAL(notice->account_sequence, 0U);
+    BOOST_CHECK_EQUAL(notice->next_account_sequence, 1U);
+    BOOST_CHECK(notice->signed_action_hash == Hash(*flowmesh::EncodeProductionActionPayload(queued)));
+    BOOST_REQUIRE(notice->consumed_by);
+    BOOST_CHECK(notice->consumed_by->action_id == consumer.Id());
+    BOOST_CHECK_EQUAL(notice->consumed_by->microblock_sequence, inclusion->first);
+    BOOST_CHECK(notice->consumed_by->microblock_hash == inclusion->second);
+    // The notice is newer than every v1 event of the queued action, so an
+    // opt-in wait ends on it; a v1 wait does not.
+    const auto opt_in{f.runtimes[local]->WaitClientActionStatus(f.market, queued.Id(),
+        std::chrono::steady_clock::now() + std::chrono::seconds{5}, {}, true)};
+    BOOST_CHECK(opt_in.result == flowmesh::ClientWaitResult::TERMINAL);
+    // remote_origin_prune_emits_nothing: no other node reports anything.
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        if (i == local) continue;
+        BOOST_CHECK(!f.runtimes[i]->NewestClientNotice(f.market, queued.Id()));
+        BOOST_CHECK(!f.runtimes[i]->NewestClientNotice(f.market, remote_only.Id()));
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

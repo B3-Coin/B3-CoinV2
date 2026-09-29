@@ -178,18 +178,26 @@ public:
     std::optional<FlowMeshRecentConsumer> FindConsumer(const flowmesh::AccountId& signer, const uint64_t sequence) const
     {
         for (auto it{m_items.rbegin()}; it != m_items.rend(); ++it) {
-            if (!it->envelope || !it->outcome || it->outcome->too_large) continue;
-            const auto& actions{it->envelope->entry.actions};
-            const auto first{std::lower_bound(actions.begin(), actions.end(), std::pair{signer, sequence},
-                [](const flowmesh::Action& action, const std::pair<flowmesh::AccountId, uint64_t>& key) {
-                    if (action.IsDeposit()) return true;
-                    return action.signer < key.first || (action.signer == key.first && action.sequence < key.second);
-                })};
-            for (auto candidate{first}; candidate != actions.end() && !candidate->IsDeposit() &&
-                                        candidate->signer == signer && candidate->sequence == sequence; ++candidate) {
-                const uint256 id{candidate->Id()};
-                if (Decisive(*it, id, false)) return FlowMeshRecentConsumer{id, it->sequence, it->hash};
-            }
+            if (auto found{ConsumerIn(*it, signer, sequence)}) return found;
+        }
+        return std::nullopt;
+    }
+
+    //! FindConsumer restricted to one retained item.
+    static std::optional<FlowMeshRecentConsumer> ConsumerIn(const Item& item, const flowmesh::AccountId& signer,
+                                                            const uint64_t sequence)
+    {
+        if (!item.envelope || !item.outcome || item.outcome->too_large) return std::nullopt;
+        const auto& actions{item.envelope->entry.actions};
+        const auto first{std::lower_bound(actions.begin(), actions.end(), std::pair{signer, sequence},
+            [](const flowmesh::Action& action, const std::pair<flowmesh::AccountId, uint64_t>& key) {
+                if (action.IsDeposit()) return true;
+                return action.signer < key.first || (action.signer == key.first && action.sequence < key.second);
+            })};
+        for (auto candidate{first}; candidate != actions.end() && !candidate->IsDeposit() &&
+                                    candidate->signer == signer && candidate->sequence == sequence; ++candidate) {
+            const uint256 id{candidate->Id()};
+            if (Decisive(item, id, false)) return FlowMeshRecentConsumer{id, item.sequence, item.hash};
         }
         return std::nullopt;
     }
