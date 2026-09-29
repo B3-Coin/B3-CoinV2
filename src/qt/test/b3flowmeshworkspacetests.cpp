@@ -480,6 +480,31 @@ class B3FlowMeshWorkspaceTests : public QObject
         r.pushKV("microblock_hash", H(97).GetHex()); r.pushKV("microblock_sequence", 5); r.pushKV("stage", "certified");
         return r;
     }
+    //! A retained limit bid of the observed account at 1 B3/tUSD for 1 tUSD.
+    static B3FlowMeshTrading::SavedAction SavedBid(const B3FlowMeshTradingPanel& panel, unsigned char id, const char* state, const char* stage, uint64_t submitted_ms = 200)
+    {
+        B3FlowMeshTrading::SavedAction action;
+        action.market = panel.m_snapshot->market; action.domain = panel.m_snapshot->domain;
+        action.config = panel.m_snapshot->config; action.account = panel.m_snapshot->account;
+        action.sequence = 8; action.type = 0; action.signed_bytes_size = 279; action.initial_submission_ms = submitted_ms;
+        action.may_have_been_sent = true; action.signed_bytes_sha256 = QString::fromStdString(H(static_cast<unsigned char>(id + 1)).GetHex());
+        action.canonical_side = QStringLiteral("bid"); action.canonical_points = {{1000, 1'000'000}, {1001, 0}};
+        action.receipt.action_id = QString::fromStdString(H(id).GetHex());
+        action.receipt.market = action.market; action.receipt.account = action.account;
+        action.receipt.state = QString::fromLatin1(state); action.receipt.stage = QString::fromLatin1(stage);
+        return action;
+    }
+    static void Certify(B3FlowMeshTrading::Receipt& receipt, uint64_t sequence = 5)
+    {
+        receipt.state = QStringLiteral("certified_inclusion"); receipt.stage = QStringLiteral("certified"); receipt.certificate_verified = true;
+        receipt.microblock_hash = QString::fromStdString(H(97).GetHex()); receipt.microblock_sequence = sequence;
+    }
+    static QStringList RowText(const QTableWidget* view, int row)
+    {
+        QStringList cells;
+        for (int c{0}; c < view->columnCount(); ++c) cells << (view->item(row, c) ? view->item(row, c)->text() : QString{});
+        return cells;
+    }
     //! The probe's reads that reach the market endpoint, in order.
     static std::vector<std::string> Remote(const FundingReadProbe& probe)
     {
@@ -4294,6 +4319,79 @@ private Q_SLOTS:
         run(); QCOMPARE(first.back(), std::string{"getflowmeshactionstatus"});
         QVERIFY(!panel.m_reconcile_pending); QVERIFY(panel.m_receipt->Included()); QVERIFY(panel.m_read_failed);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void pendingRowsShowStagesWithoutChurn()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        auto* view{panel.findChild<QTableWidget*>(QStringLiteral("flowMeshPendingActions"))};
+        QVERIFY(view); panel.updateControls(); QVERIFY(view->isHidden());
+        // History already settled before this session saw it never appears.
+        auto earlier{SavedBid(panel, 60, "certified_inclusion", "certified", 100)}; Certify(earlier.receipt); earlier.receipt.no_resubmit = true;
+        B3FlowMeshTrading::SavedActions saved; saved.account = panel.m_snapshot->account;
+        saved.actions = {SavedBid(panel, 61, "unknown", "sent"), earlier};
+        panel.restoreSavedActions(saved);
+        QVERIFY(!view->isHidden()); QCOMPARE(view->rowCount(), 1);
+        QCOMPARE(RowText(view, 0), (QStringList{QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD"), QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("!"), QString{}, QString{},
+                                                 QStringLiteral("Delivery unconfirmed · outcome unknown · never re-signed")}));
+        QCOMPARE(view->item(0, 2)->data(Qt::AccessibleTextRole).toString(), QStringLiteral("Sent: done"));
+        QCOMPARE(view->item(0, 3)->data(Qt::AccessibleTextRole).toString(), QStringLiteral("Admitted: unknown"));
+        QVERIFY(view->item(0, 0)->toolTip().contains(saved.actions[0].receipt.action_id));
+        // Identical updates keep the model and its items.
+        QSignalSpy reset{view->model(), &QAbstractItemModel::modelReset};
+        const auto* first{view->item(0, 0)};
+        for (int i{0}; i < 3; ++i) { panel.updateControls(); panel.observeRequests(); }
+        QCOMPARE(view->item(0, 0), first); QCOMPARE(reset.count(), 0); QCOMPARE(view->rowCount(), 1);
+        // Verified inclusion certifies it; the row lingers once it settles.
+        auto certified{saved.actions[0].receipt}; Certify(certified);
+        panel.applyReceipt(certified);
+        QCOMPARE(RowText(view, 0).mid(1, 4), (QStringList{QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("✓")}));
+        QCOMPARE(view->item(0, 5)->text(), QStringLiteral("not reported"));
+        QVERIFY(view->item(0, 6)->text().contains(QStringLiteral("applied or rejected is not reported")));
+        QCOMPARE(view->item(0, 6)->foreground().color(), B3Theme::kPositive);
+        QCOMPARE(view->item(0, 0), first);
+        // After the linger interval it leaves the view (Saved requests keeps it).
+        for (auto& [key, seen] : panel.m_request_seen) seen.settled_age.invalidate();
+        panel.updateControls(); QVERIFY(view->isHidden()); QCOMPARE(view->rowCount(), 0);
+        QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
+    }
+    void pendingRowsKeepHighWaterButNeverCertifyWithoutProof()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        auto* view{panel.findChild<QTableWidget*>(QStringLiteral("flowMeshPendingActions"))};
+        B3FlowMeshTrading::SavedActions saved; saved.account = panel.m_snapshot->account;
+        saved.actions = {SavedBid(panel, 62, "admitted", "admitted")};
+        panel.restoreSavedActions(saved);
+        QCOMPARE(RowText(view, 0).mid(1, 5), (QStringList{QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("…"), QString{}}));
+        QVERIFY(view->item(0, 6)->text().contains(QStringLiteral("unverified")));
+        // A later status read that cannot confirm it keeps "was sent and
+        // admitted", shows the unknown, and never claims certification.
+        auto later{saved.actions[0].receipt}; later.state = QStringLiteral("unknown"); later.stage = QStringLiteral("certified");
+        panel.applyReceipt(later);
+        QCOMPARE(RowText(view, 0).mid(1, 5), (QStringList{QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("!"), QString{}}));
+        QVERIFY(view->item(0, 6)->text().contains(QStringLiteral("outcome unknown")));
+        QCOMPARE(view->item(0, 6)->foreground().color(), B3Theme::kAccent);
+        // A reported refusal is never terminal and never "not executed".
+        later.state = QStringLiteral("rejected"); later.stage = QStringLiteral("refused");
+        panel.applyReceipt(later);
+        QVERIFY(view->item(0, 6)->text().startsWith(QStringLiteral("Refusal reported")));
+        QVERIFY(!view->item(0, 5)->text().contains(QStringLiteral("not executed")));
+        QCOMPARE(view->rowCount(), 1); QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
+    }
+    void pendingRowsShowTheInFlightRequestFromTheGuiThreadOnly()
+    {
+        FundingReadProbe probe;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        auto* view{panel.findChild<QTableWidget*>(QStringLiteral("flowMeshPendingActions"))};
+        B3FlowMeshTrading::Action action; action.operation = B3FlowMeshTrading::Operation::Order; action.market = panel.m_market_data.front();
+        action.side = QStringLiteral("bid"); action.price = 1000; action.amount = 1'000'000;
+        action.display_decimals = 6; action.display_ticker = QStringLiteral("tUSD");
+        // The regtest sync check fails this job before any write.
+        panel.startJob(action); QVERIFY(panel.m_thread);
+        QCOMPARE(RowText(view, 0).first(), QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD"));
+        QCOMPARE(view->item(0, 6)->text(), QStringLiteral("Checking, signing and sending…"));
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QVERIFY(panel.m_inflight_title.isEmpty()); QVERIFY(view->isHidden());
+        QVERIFY(!panel.m_uncertain); QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void connectionBannerShowsLiveReconnectingAndCheckingState()
     {

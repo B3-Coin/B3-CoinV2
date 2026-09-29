@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <deque>
+#include <map>
 #include <memory>
 #include <optional>
 
@@ -172,6 +173,20 @@ private:
     void restoreSavedActions(const B3FlowMeshTrading::SavedActions& saved);
     void selectSavedAction();
     void updateReceiptCard();
+    //! Records each request's display stage where receipts arrive (never from
+    //! updateControls): the Signed/Sent/Admitted high-water mark and when it
+    //! first settled. The first observation after a wallet attach only
+    //! seeds, so earlier history never appears as new.
+    void observeRequests();
+    //! Request rows: the in-flight signed job, an uncertain write without an
+    //! action ID, the tracked request and this market's unsettled saved
+    //! requests, plus requests that settled in the last minute. Display only.
+    void updatePendingView();
+    //! ActionId is semantic and excludes market, domain and config.
+    static QString RequestKey(const QString& market, const QString& account, const QString& action_id)
+    {
+        return market + QLatin1Char(':') + account + QLatin1Char(':') + action_id;
+    }
     static std::vector<UniValue> ReadEffectsForRefresh(
         const B3FlowMeshTrading::RpcCall& rpc, const QString& market_id,
         B3FlowMeshMarketData::Snapshot& snapshot);
@@ -311,6 +326,27 @@ private:
     QString m_pending_market, m_pending_account;
     std::optional<B3FlowMeshTrading::Receipt> m_receipt;
     QString m_receipt_error;
+    // Request rows (display only). Keys are market:account:action_id; the
+    // map is FIFO-bounded. Signed, Sent and Admitted are historical facts, so
+    // a later "unknown" read never erases "was sent"; Certified is never kept.
+    struct RequestSeen {
+        B3FlowMeshTrading::Stage high{B3FlowMeshTrading::Stage::Signing};
+        bool settled{false};
+        QElapsedTimer settled_age; // Invalid when it had settled before this session saw it.
+    };
+    static constexpr size_t MAX_REQUEST_KEYS{1024}, MAX_REQUEST_ROWS{8};
+    static constexpr int64_t REQUEST_LINGER_MS{60'000};
+    std::map<QString, RequestSeen> m_request_seen;
+    std::deque<QString> m_request_order;
+    bool m_requests_seeded{false};
+    QElapsedTimer m_last_settled; // When any request last settled in view.
+    // Captured on the GUI thread when a signed job starts: the in-flight row
+    // never reads worker-owned Result fields.
+    QString m_inflight_title, m_inflight_market;
+    // Titles of the request this panel signed (by key) and of an uncertain
+    // write that returned no action ID.
+    QString m_tracked_title, m_tracked_title_key, m_uncertain_title;
+    B3FlowMeshTrading::RequestKind m_tracked_kind{B3FlowMeshTrading::RequestKind::Other};
     std::optional<uint64_t> m_pending_sequence;
     QComboBox* m_market{nullptr};
     QComboBox* m_saved_selector{nullptr};
@@ -336,7 +372,7 @@ private:
         *m_quantity_label{nullptr}, *m_price_label{nullptr}, *m_ticket_total{nullptr}, *m_ticket_fee{nullptr}, *m_ticket_available{nullptr}, *m_grid_note{nullptr},
         *m_history_note{nullptr}, *m_own_note{nullptr}, *m_identity_detail{nullptr};
     B3FlowMeshChart* m_chart{nullptr};
-    QTableWidget *m_depth_view{nullptr}, *m_history_view{nullptr}, *m_own_view{nullptr};
+    QTableWidget *m_depth_view{nullptr}, *m_history_view{nullptr}, *m_own_view{nullptr}, *m_pending_view{nullptr};
     B3FlowMeshOrderBook* m_order_book{nullptr};
     QTabWidget* m_activity{nullptr};
     QWidget* m_advanced{nullptr};
