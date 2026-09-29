@@ -62,6 +62,21 @@ bool NoSpendingRequired(const std::string& method) {
         method == "getflowmeshclientinfo" || method == "flowmeshclientconnect" ||
         method == "getflowmeshmarketdata" || method == "getflowmeshactionstatus" || method == "listflowmeshactions" || method == "listflowmeshvaultoperations" || method == "testmempoolaccept";
 }
+//! Display sections of a selected-market read: the clearing ticks after the
+//! last one held (the newest otherwise) and, only while the ticket holds an
+//! order that parses, the indicative next clearing for it (a node copies the
+//! standing curves once per head for it). Display only; nothing is signed.
+void AddMarketViews(UniValue& options, const std::optional<uint64_t>& after, const UniValue& draft)
+{
+    UniValue ticks{UniValue::VOBJ};
+    if (after) ticks.pushKV("after_sequence", *after);
+    ticks.pushKV("limit", static_cast<uint64_t>(B3FlowMeshMarketData::MAX_HELD_TICKS));
+    options.pushKV("ticks", std::move(ticks));
+    if (!draft.isObject()) return;
+    UniValue indicative{UniValue::VOBJ};
+    indicative.pushKV("draft", draft);
+    options.pushKV("indicative", std::move(indicative));
+}
 QString RpcError(const UniValue& error) {
     const auto& message{error.find_value("message")};
     return error.isObject() && message.isStr() ? QString::fromStdString(message.get_str()).left(500) : QStringLiteral("FlowMesh RPC failed.");
@@ -152,6 +167,10 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         connect(button, &QPushButton::clicked, this, [this, mode, candle_interval] { m_chart->setMode(mode.second); candle_interval->setEnabled(mode.second == B3FlowMeshChart::Mode::Prices); });
     }
     chart_modes->addStretch(); chart_modes->addWidget(candle_interval); chart_layout->addLayout(chart_modes); m_chart = new B3FlowMeshChart{chart_card}; chart_layout->addWidget(m_chart, 1);
+    m_clearing_strip = Label(QString{}, chart_card); m_clearing_strip->setObjectName(QStringLiteral("flowMeshClearingStrip"));
+    m_clearing_strip->setAccessibleName(tr("Latest auction")); B3Theme::markTextRole(m_clearing_strip, QStringLiteral("secondary"));
+    m_clearing_strip->setToolTip(tr("The latest certified auction: its uniform price, matched quantity and the side whose orders were left partly unfilled at that price. Microblocks carry no timestamp."));
+    m_clearing_strip->hide(); chart_layout->addWidget(m_clearing_strip);
     connect(candle_interval, &QComboBox::currentIndexChanged, this, [this, candle_interval] { m_chart->setCandleInterval(candle_interval->currentData().toULongLong()); });
     m_chart->setToolTip(tr("Candles show open, high, low and close from actual clearings, grouped by microblock sequence. Hover to inspect a candle and its volume. Idle intervals are not filled in. Depth lines show evaluated demand and supply, not historical trades."));
     const auto table = [](QWidget* parent, const QStringList& headers, const char* name) {
@@ -192,6 +211,10 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_grid_note = Label(tr("Token units will be verified from asset metadata."), ticket_card); B3Theme::markTextRole(m_grid_note, QStringLiteral("secondary"));
     m_ticket_available = Label(tr("Available  —"), ticket_card); ticket->addWidget(m_ticket_available); m_ticket_total = Label(tr("Limit notional  —"), ticket_card); ticket->addWidget(m_ticket_total);
     m_ticket_fee = Label(tr("Spot fee 0.01% · seller-paid"), ticket_card); B3Theme::markTextRole(m_ticket_fee, QStringLiteral("secondary")); ticket->addWidget(m_ticket_fee);
+    m_indicative = Label(QString{}, ticket_card); m_indicative->setObjectName(QStringLiteral("flowMeshIndicative"));
+    m_indicative->setAccessibleName(tr("Indicative next clearing")); B3Theme::markTextRole(m_indicative, QStringLiteral("secondary"));
+    m_indicative->setToolTip(tr("Computed by this node from the verified standing orders, as if the next auction cleared them now with this order added. Not certified: orders not yet certified are excluded, and your order's admission (balance and reservation) is assumed. It never affects what you sign."));
+    m_indicative->hide(); ticket->addWidget(m_indicative);
     m_order = new QPushButton{tr("Review buy order…"), ticket_card}; m_order->setObjectName(QStringLiteral("flowMeshSubmitOrder")); m_order->setProperty("b3variant", QStringLiteral("primary")); ticket->addWidget(m_order);
     m_order->setToolTip(tr("One order per side. A new order replaces that side. Orders clear together at one auction price; an accepted request is not a fill.")); ticket->addStretch();
     center->addWidget(chart_card); center->addWidget(liquidity_card); center->addWidget(ticket_card); center->setStretchFactor(0, 6); center->setStretchFactor(1, 3); center->setStretchFactor(2, 3); center->setSizes({600, 290, 300}); layout->addWidget(center, 1);
@@ -463,7 +486,26 @@ void B3FlowMeshTradingPanel::updateDataViews()
     using namespace B3FlowMeshMarketData;
     const auto selected{market()}; const bool matched{selected && m_snapshot && selected->id == m_snapshot->market};
     const bool inverse{inverted()};
-    m_chart->setInverted(inverse); m_chart->setSnapshot(matched ? m_snapshot : std::nullopt); m_chart->setLoading(m_loading);
+    // Held ticks that reach the displayed head give the chart its longer
+    // window of the same actual clearings (endpoint-reported for a remote
+    // client, as its history is).
+    const bool ticks_current{matched && !m_ticks.empty() && m_ticks_market == m_snapshot->market && m_ticks.back().hash == m_snapshot->head};
+    std::optional<Snapshot> chart_snapshot{matched ? m_snapshot : std::nullopt};
+    if (ticks_current) {
+        chart_snapshot->history = TicksAsTrades(m_ticks); chart_snapshot->history_available = true;
+        chart_snapshot->history_page_partial = false; chart_snapshot->history_truncated = m_ticks.front().sequence > 0;
+    }
+    m_chart->setInverted(inverse); m_chart->setSnapshot(chart_snapshot); m_chart->setLoading(m_loading);
+    QString strip;
+    if (ticks_current) {
+        const auto last_match{std::find_if(m_ticks.rbegin(), m_ticks.rend(), [](const auto& tick) { return tick.cleared; })};
+        strip = ClearingTickText(last_match != m_ticks.rend() ? *last_match : m_ticks.back(), m_snapshot->units, inverse, m_snapshot->remote);
+        if (last_match != m_ticks.rend() && last_match != m_ticks.rbegin()) strip += tr(" · latest microblock #%1").arg(m_ticks.back().sequence);
+    } else if (matched && m_snapshot->ticks && !m_snapshot->ticks->available) {
+        strip = tr("Auction ticks unavailable (%1)").arg(m_snapshot->ticks->reason);
+    }
+    if (m_clearing_strip->text() != strip) m_clearing_strip->setText(strip);
+    m_clearing_strip->setVisible(!strip.isEmpty());
     m_order_book->setSnapshot(matched ? m_snapshot : std::nullopt, inverse);
     if (!matched || !m_snapshot->units.known) {
         for (auto* table : {m_depth_view, m_history_view, m_own_view}) SetRows(table, {});
@@ -619,6 +661,19 @@ void B3FlowMeshTradingPanel::updateTicket()
         if (m_marketable_note->text() != note) m_marketable_note->setText(note);
     }
     m_marketable_note->setVisible(marketable);
+    {
+        // Only a view computed for exactly this ticket's order is shown.
+        QString line;
+        const auto draft{units_known ? indicativeDraft() : UniValue{}};
+        if (draft.isObject()) {
+            const auto& view{m_snapshot->indicative};
+            const bool same{view && view->has_draft && view->draft_side == QString::fromStdString(draft["side"].get_str()) &&
+                            view->draft_price == draft["price"].getInt<CAmount>() && view->draft_quantity == draft["quantity"].getInt<CAmount>()};
+            line = same ? IndicativeText(*view, m_snapshot->units, inverse) : tr("Indicative price: updating for this order…");
+        }
+        if (m_indicative->text() != line) m_indicative->setText(line);
+        m_indicative->setVisible(!line.isEmpty());
+    }
     if (!units_known) { m_grid_note->setText(tr("Verified asset precision required; no raw-unit guessing.")); m_grid_note->setToolTip(QString{}); m_ticket_available->setText(tr("Available  —")); m_ticket_total->setText(tr("Order value  —")); apply_tooltips(); return; }
     const auto& u{m_snapshot->units}; m_grid_note->setText(inverse ? tr("Exact %1 quantity cap · no guaranteed B3 fill").arg(ticker) : tr("Steps: %1 %2 · %3 B3").arg(FormatAmount(u.quantity_step, u.decimals), ticker, FormatPrice(u.price_step, u.decimals)));
     m_grid_note->setToolTip(tr("Quantity step %1 %2; canonical price step %3 B3 per %2. Quantity is exact and never rounded.").arg(FormatAmount(u.quantity_step, u.decimals), ticker, FormatPrice(u.price_step, u.decimals)) +
@@ -653,6 +708,38 @@ bool B3FlowMeshTradingPanel::depositDraftAvailable() const
         s.config == selected->config && s.remote == selected->remote &&
         (!selected->has_account || s.account == selected->account) &&
         (!s.remote || (s.certificate_verified && s.account_state_verified));
+}
+
+UniValue B3FlowMeshTradingPanel::indicativeDraft() const
+{
+    using namespace B3FlowMeshMarketData;
+    const auto selected{market()};
+    if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->units.known || m_snapshot->units.asset != selected->base) return {};
+    const bool buy{m_side->currentIndex() == 0}, inverse{inverted()};
+    const auto limit{ParseDisplayLimit(m_price->text(), m_snapshot->units, inverse, buy)};
+    const auto quantity{ParseQuantity(m_quantity->text(), m_snapshot->units)};
+    if (!limit || !quantity || limit->price <= 0 || *quantity <= 0) return {};
+    UniValue draft{UniValue::VOBJ};
+    draft.pushKV("side", CanonicalSide(buy, inverse).toStdString());
+    draft.pushKV("price", limit->price);
+    draft.pushKV("quantity", *quantity);
+    return draft;
+}
+
+std::optional<uint64_t> B3FlowMeshTradingPanel::ticksAfter(const QString& market) const
+{
+    if (m_ticks.empty() || m_ticks_market != market) return std::nullopt;
+    return m_ticks.back().sequence;
+}
+
+void B3FlowMeshTradingPanel::mergeHeldTicks()
+{
+    if (!m_snapshot) return;
+    if (m_ticks_market != m_snapshot->market) {
+        m_ticks.clear();
+        m_ticks_market = m_snapshot->market;
+    }
+    if (m_snapshot->ticks) B3FlowMeshMarketData::MergeHeldTicks(m_ticks, *m_snapshot->ticks);
 }
 
 bool B3FlowMeshTradingPanel::depositReady() const
@@ -1264,6 +1351,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     auto* node{&m_wallet->node()}; const auto backend{m_backend}; const auto cancel{m_cancel}; const auto yield_refresh{m_yield_refresh};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
     const auto selected{market()}; const QString selected_id{selected ? selected->id : QString{}};
+    result->views_market = selected_id; result->ticks_after = ticksAfter(selected_id); result->draft = indicativeDraft();
     const auto phase{foreground_read ? (m_route_pending || m_market_data.empty() || !m_catalog_age.isValid() ? RefreshPhase::Catalog : RefreshPhase::None)
                                      : nextPassivePhase()};
     if (result->passive || foreground_read) {
@@ -1439,6 +1527,9 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                     });
                     if (!result->live || selected->id != selected_id) {
                         UniValue params{UniValue::VARR}; params.push_back(selected->id.toStdString()); UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
+                        // The held ticks and the ticket belong to the displayed market only.
+                        AddMarketViews(options, selected->id == result->views_market ? result->ticks_after : std::nullopt,
+                                       selected->id == result->views_market ? result->draft : UniValue{});
                         if (!known_head.isEmpty() && selected->id == selected_id && !result->catalog) {
                             options.pushKV("known_head", known_head.toStdString());
                             result->basis_head = known_head;
@@ -1712,10 +1803,12 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
         // microblock. Keep the exact account/book and user inputs;
         // only accept units for this same canonical asset.
         if (fresh.units.known && fresh.units.asset == retained.base) retained.units = fresh.units;
-        m_snapshot = std::move(retained); m_response_age = age; updateDataViews();
+        // Read at this same head: they replace the retained ones.
+        retained.ticks = std::move(fresh.ticks); retained.indicative = std::move(fresh.indicative);
+        m_snapshot = std::move(retained); m_response_age = age; mergeHeldTicks(); updateDataViews();
     } else {
         if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age = age;
-        m_snapshot = std::move(fresh); m_response_age = age; updateDataViews();
+        m_snapshot = std::move(fresh); m_response_age = age; mergeHeldTicks(); updateDataViews();
     }
     // Display only (the banner's "since" time); every gate uses m_response_age.
     m_last_live_wall_ms = QDateTime::currentMSecsSinceEpoch() - age.elapsed(); m_last_live_market = m_snapshot->market;
@@ -1825,6 +1918,7 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
     auto result{std::make_shared<WatchResult>()};
     result->scope = {m_wallet, m_generation, m_watch_generation, selected->id, selected->account, m_snapshot->head};
     result->release = release;
+    result->ticks_after = ticksAfter(selected->id); result->draft = indicativeDraft();
     auto* node{&m_wallet->node()};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())};
     const auto cancel{m_cancel};
@@ -1838,6 +1932,7 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
             UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
             options.pushKV("known_head", result->scope.known_head.toStdString());
             options.pushKV("watch_ms", result->release ? int64_t{0} : B3FlowMeshWatch::Policy::WATCH_MS);
+            AddMarketViews(options, result->ticks_after, result->draft);
             params.push_back(options);
             const auto response{node->executeRpc("getflowmeshmarketdata", params, uri)};
             result->snapshot_age.restart();

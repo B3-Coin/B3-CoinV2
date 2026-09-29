@@ -307,6 +307,8 @@ struct FundingReadProbe {
     std::atomic_bool hold_watch{false}, fail_watch{false};
     QSemaphore watch_entered, watch_release;
     int live_ms{0};
+    //! Every getflowmeshmarketdata options object, in order.
+    std::vector<UniValue> market_options;
     std::vector<std::unique_ptr<CRPCCommand>> commands;
     FundingReadProbe()
     {
@@ -358,6 +360,7 @@ struct FundingReadProbe {
             auto command{std::make_unique<CRPCCommand>("hidden", "getflowmeshmarketdata",
                 [this](const JSONRPCRequest& request, UniValue& result, bool) {
                     const auto& options{request.params[1]};
+                    market_options.push_back(options);
                     if (options.isObject() && options.exists("watch_ms")) {
                         if (options["watch_ms"].getInt<int>() == 0) { ++releases; result = data; result.pushKV("watch", watch_object); return true; }
                         ++watches; watch_entered.release();
@@ -1820,6 +1823,44 @@ private Q_SLOTS:
         QVERIFY(IndicativeText(bounds, s.units, false).contains(QStringLiteral("filling 0.1875 to 0.187501 of 1 tUSD")));
         Indicative unavailable; unavailable.reason = QStringLiteral("work_budget");
         QCOMPARE(IndicativeText(unavailable, s.units, false), QStringLiteral("Indicative price unavailable (work_budget)"));
+    }
+    void marketReadsAskForHeldTicksAndTheTicketDraft()
+    {
+        FundingReadProbe probe; probe.live_ms = 0; probe.data = RemoteDataWithViews();
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        // Nothing held yet; the ticket's order awaits its first read.
+        QVERIFY(panel.m_clearing_strip->isHidden());
+        QVERIFY(panel.m_indicative->text().contains(QStringLiteral("updating")));
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.market_options.size(), size_t{1});
+        const auto first{probe.market_options[0]};
+        QVERIFY(first["ticks"].isObject() && !first["ticks"].exists("after_sequence"));
+        QCOMPARE(first["ticks"]["limit"].getInt<int>(), 256);
+        // The offline ticket buys 1 tUSD at 1 B3: canonical raw units.
+        QCOMPARE(first["indicative"]["draft"]["side"].get_str(), std::string{"bid"});
+        QCOMPARE(first["indicative"]["draft"]["price"].getInt<int64_t>(), int64_t{1000});
+        QCOMPARE(first["indicative"]["draft"]["quantity"].getInt<int64_t>(), int64_t{1'000'000});
+        QCOMPARE(panel.m_ticks.size(), size_t{2});
+        QVERIFY(!panel.m_clearing_strip->isHidden());
+        QVERIFY(panel.m_clearing_strip->text().startsWith(QStringLiteral("Auction #2 · 0.25 tUSD at 1 B3 / tUSD")));
+        QVERIFY(!panel.m_indicative->isHidden());
+        QVERIFY(panel.m_indicative->text().contains(QStringLiteral("would clear at 1 B3 / tUSD")));
+        // The chart draws the held ticks.
+        QCOMPARE(panel.m_chart->candles().size(), size_t{1});
+        // The next read asks only for the ticks after the last one held.
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.market_options.size(), size_t{2});
+        QCOMPARE(probe.market_options[1]["ticks"]["after_sequence"].getInt<int>(), 2);
+        // Another order in the ticket: its what-if is not claimed until read.
+        panel.m_quantity->setText(QStringLiteral("2")); panel.updateTicket();
+        QVERIFY(panel.m_indicative->text().contains(QStringLiteral("updating")));
+        // Without an order nothing is shown, and reads ask for no indicative.
+        panel.m_price->clear(); panel.updateTicket();
+        QVERIFY(panel.m_indicative->isHidden());
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.market_options.size(), size_t{3});
+        QVERIFY(!probe.market_options[2].exists("indicative")); QVERIFY(probe.market_options[2].exists("ticks"));
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void catalogSurvivesUncertifiedFirstMarket()
     {

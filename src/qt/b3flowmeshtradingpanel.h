@@ -93,6 +93,12 @@ private:
         // next sequence for that market when the job started (0: none).
         QString basis_head;
         uint64_t basis_sequence{0};
+        //! Display sections the selected-market read asks for, captured on
+        //! the GUI thread: the ticks after the last one held for `views_market`
+        //! and the ticket's draft for the indicative clearing (null: none).
+        QString views_market;
+        std::optional<uint64_t> ticks_after;
+        UniValue draft;
     };
     //! How a verified selected-market read was applied.
     enum class SnapshotApply { APPLIED, SUPERSEDED, MISMATCH };
@@ -111,6 +117,9 @@ private:
         bool supported{false}, waited{false}, gap{false}, release{false};
         uint32_t endpoint_live_ms{0};
         QElapsedTimer snapshot_age;
+        //! As Result's, for the watched market.
+        std::optional<uint64_t> ticks_after;
+        UniValue draft;
     };
     struct DeferredReview {
         B3FlowMeshTrading::Operation operation;
@@ -167,6 +176,13 @@ private:
     //! slippage and quantity from the displayed certified snapshot. Freshness
     //! is the caller's gate.
     std::optional<B3FlowMeshMarketData::MarketableLimit> marketableLimit(QString* error) const;
+    //! The ticket's order as the indicative draft {side, price, quantity} in
+    //! canonical units; null when it does not parse.
+    UniValue indicativeDraft() const;
+    //! The last held tick of `market`, when the held ticks are that market's.
+    std::optional<uint64_t> ticksAfter(const QString& market) const;
+    //! Extends the held ticks from the displayed snapshot's page.
+    void mergeHeldTicks();
     void requestOrderReview();
     //! The certified own curve an Edit is bound to: the selected row's
     //! canonical side at selection time, and only while its points are
@@ -413,6 +429,10 @@ private:
         *m_quantity_label{nullptr}, *m_price_label{nullptr}, *m_ticket_total{nullptr}, *m_ticket_fee{nullptr}, *m_ticket_available{nullptr}, *m_grid_note{nullptr},
         *m_history_note{nullptr}, *m_own_note{nullptr}, *m_identity_detail{nullptr};
     B3FlowMeshChart* m_chart{nullptr};
+    //! Clearing ticks held for m_ticks_market (see MergeHeldTicks); display only.
+    std::deque<B3FlowMeshMarketData::Tick> m_ticks;
+    QString m_ticks_market;
+    QLabel *m_clearing_strip{nullptr}, *m_indicative{nullptr};
     QTableWidget *m_depth_view{nullptr}, *m_history_view{nullptr}, *m_own_view{nullptr}, *m_pending_view{nullptr};
     B3FlowMeshToasts* m_toasts{nullptr};
     QElapsedTimer m_link_toast_age;
