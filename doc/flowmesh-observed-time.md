@@ -67,24 +67,43 @@ auction existed between them; anything else is a gap.
 ### Storage and the FlowMesh critical path
 
 - `Record` is memory only, O(1) (a 4096-stamp ring, the six rollups, a bounded
-  queue of rows to persist) and `noexcept`; its mutex is a leaf taken inside the
-  market lock. A failure costs a gap, never the commit (tested with a clock that
-  throws).
+  queue of rows to persist whose oldest is dropped in O(1)) and `noexcept`; its
+  mutex is a leaf taken inside the market lock. A failure costs a gap, never
+  the commit (tested with a clock that throws).
 - One separate LevelDB, `<flowmeshdatadir>/observed_time`, market-prefixed keys,
   outside every production store (its fail-closed checks can never be affected;
   older binaries never open it).
-- **Only its own thread (`flowmesh-obstime`) writes it**: at most once a
-  second, unsynced, one batch per market with rows and candles together, and
-  once synced at shutdown after the runtime stopped. It never runs on the
-  FlowMesh tick or worker thread, so a stalled disk delays only the flush
-  (tested with a flush held inside its write while commits and reads go on).
+- **Only its own thread (`flowmesh-obstime`) opens, loads, erases, wipes
+  and writes it**: it opens the database when it starts; it writes at most
+  once a second, unsynced, one batch per market with rows and candles
+  together, and once synced at shutdown after the runtime stopped. It never
+  runs on the FlowMesh tick or worker thread, on the service start or on a
+  market start (both hold the B3 reconciliation gate closed for every
+  market), so a stalled disk delays only the flush (tested with a flush held
+  inside its write while commits, reads, a market attach and a whole service
+  start go on). The store's mutex is never held across disk work: a candles
+  read pages the database without it. Shutdown joins the thread, so a hung
+  write there delays shutdown (after the runtime stopped), never trading.
 - More than 8192 unflushed rows: the oldest are dropped from persistence only (a
   gap after a restart). A crash loses at most the unflushed second (a gap).
-- At start, after the production store replays: rows at or after its next
-  sequence are erased, a row whose hash contradicts the store's retained hashes
-  (or another domain) clears the market's times, and the newest rows and each
-  interval's memory window are reloaded. An unreadable database is wiped and
-  recreated; if even that fails, times stay in memory.
+- At start, after the production store replays, the market **queues** its
+  history and goes on at once. The thread then loads it, before it writes any
+  row of that market: rows at or after the store's next sequence are erased, a
+  row whose hash contradicts the store's retained hashes (or another domain)
+  clears the market's times, and the newest rows and each interval's memory
+  window are reloaded. An unreadable database is wiped and recreated; if even
+  that fails, times stay in memory.
+- Entries committed while the history loads keep only their clock readings
+  and are stamped once it has loaded, exactly as if it had loaded first
+  (the same clamps, steps, untimed entries and continued candles; a stored
+  bucket is continued, never replaced). At most 4096 wait; beyond that the
+  oldest are a gap, counted as not persisted. Until the load finishes the
+  market's `observed_time` section and candles are unavailable with
+  `observed_time_loading` and its disk candles are not served: never a
+  partial answer, which a chart would hold as its whole window. The load
+  itself is replayed off the recorder's mutex. Normally this lasts a few
+  milliseconds after a start; only a slow or stalled disk makes it longer,
+  and then only the display waits.
 - Retention: 262,144 rows per market; candles 1m 14 days, 5m 60 days, 15m 180
   days, 1h 2 years, 4h 5 years, 1d 10 years (swept at most once a minute, a
   bounded number of erases per sweep). Memory windows: 1m one day, 5m three
@@ -95,7 +114,9 @@ auction existed between them; anything else is a gap.
 `getflowmeshmarketdata <market> {"observed_time": true, ...}` adds an
 `observed_time` section (present only when requested, also on an unchanged
 `known_head` poll, refused with a status-only read): `available`,
-`unavailable_reason`, `source` (`this_node`), `source_kind`
+`unavailable_reason` (`not_recorded_by_this_node`, or `observed_time_loading`
+while this node's history of the market still loads after a start: retry),
+`source` (`this_node`), `source_kind`
 (`operator_observed`), `certified` (always false), `clock_suspect`,
 `recorded_since_sequence`, and `rows` for the head and exactly the reply's
 history and tick entries whose hash matches: `sequence`, `microblock_hash`,
@@ -111,7 +132,11 @@ placed entries: `open_ms`, `first_sequence`, `last_sequence`, `entries`,
 `clearings`, `open/high/low/close` (with a clearing), `base_volume` and
 `quote_volume` as exact decimal strings, `flags`, plus `more` and
 `endpoint_reported`. The local engine pages its database beyond the memory
-window; a remote client asks its endpoint.
+window; a remote client asks its endpoint. While the market's history loads
+the page is unavailable with `observed_time_loading` (the public `candles`
+method answers the same, and a remote client reports it as
+`endpoint_unavailable: observed_time_loading`); Qt reads candles only once
+the market-data section is available.
 
 Every observed time and candle open is before 10000-01-01T00:00:00Z
 (`OBSERVED_MS_LIMIT`, 253402300800000 ms), a display bound only. A larger
@@ -315,7 +340,14 @@ proof, liveness matrix including a level peer, warm-up tolerance, paging,
 retention, client extension), `flowmesh_observed_time_log_tests` (clock clamp,
 step, untimed, restart; persistence and reload; lost tail is a gap; corrupt
 database; rows past the store head; hash mismatch; pending overflow; flush
-failure; a stalled flush never blocks Record or reads; candle JSON),
+failure; a stalled flush never blocks Record, reads or a market attach; a
+history loaded after entries equals one loaded first, at the log and at the
+store whenever the queued load runs, with more than 4096 waiting entries,
+a clock an hour behind, and a load racing new entries; reads while loading
+are unavailable; a contradicted queued history is never served; the store
+thread opens the database; concurrent attach, record, read and flush;
+candle JSON), `flowmesh_service_tests` (a market start and the service
+start never wait for observed-time storage),
 `flowmesh_runtime_tests` (recorded after commit with its liveness, catch-up and
 deferral late, level peer live, throwing clock, the market-data section),
 `flowmesh_client_ticks_tests` (adverts, row binding and plausibility, candle
