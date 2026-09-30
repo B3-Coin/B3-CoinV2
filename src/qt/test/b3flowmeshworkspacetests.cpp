@@ -3029,7 +3029,11 @@ private Q_SLOTS:
         auto certified{ObservedJson({})}; certified.pushKV("certified", true);
         for (const auto& section : {certified, ObservedJson({StampJson(2, H(4), "live", 5), StampJson(1, H(12), "live", 6)}),
                                     ObservedJson({StampJson(3, H(4), "live", 5)}), ObservedJson({StampJson(2, H(4), "sometimes", 5)}),
-                                    ObservedJson({StampJson(2, H(4), "delayed", -1)})}) {
+                                    ObservedJson({StampJson(2, H(4), "delayed", -1)}),
+                                    // Times at or past 10000-01-01 (the display bound).
+                                    ObservedJson({StampJson(2, H(4), "live", std::numeric_limits<int64_t>::max() - 1)}),
+                                    ObservedJson({StampJson(2, H(4), "live", flowmesh::OBSERVED_MS_LIMIT)}),
+                                    ObservedJson({StampJson(2, H(4), "delayed", flowmesh::OBSERVED_MS_LIMIT)})}) {
             const auto parsed{broken(section)};
             QVERIFY(parsed.observed && !parsed.observed->available);
             QCOMPARE(parsed.observed->reason, QStringLiteral("malformed"));
@@ -3051,6 +3055,20 @@ private Q_SLOTS:
             const auto parsed{ParseCandles(bad, flowmesh::CandleInterval::M1)};
             QVERIFY(!parsed.available); QCOMPARE(parsed.reason, QStringLiteral("malformed"));
         }
+        // The display bound: the page that froze the chart (a candle at the
+        // last 1m bucket start below INT64_MAX) and a window ending past
+        // 10000-01-01 are malformed; the last bucket before it is a time.
+        constexpr int64_t MAX{std::numeric_limits<int64_t>::max()}, LIMIT{flowmesh::OBSERVED_MS_LIMIT};
+        for (const auto& bad : {CandlesJson("1m", 60'000, MAX, 10, {CandleJson(MAX - MAX % 60'000, 1, 1, 10, 10, 10, 10, 3)}),
+                                CandlesJson("1m", 60'000, LIMIT + 60'000, 10, {CandleJson(LIMIT, 1, 1, 10, 10, 10, 10, 3)}),
+                                CandlesJson("1m", 60'000, LIMIT + 60'000, 10, {})}) {
+            const auto parsed{ParseCandles(bad, flowmesh::CandleInterval::M1)};
+            QVERIFY(!parsed.available); QCOMPARE(parsed.reason, QStringLiteral("malformed")); QVERIFY(parsed.candles.empty());
+        }
+        const auto edge{ParseCandles(CandlesJson("1m", 60'000, LIMIT, 10, {CandleJson(LIMIT - 60'000, 1, 1, 10, 10, 10, 10, 3)}), flowmesh::CandleInterval::M1)};
+        QVERIFY(edge.available); QCOMPARE(edge.before_ms, LIMIT); QCOMPARE(edge.candles.size(), size_t{1}); QCOMPARE(edge.candles[0].open_ms, LIMIT - 60'000);
+        const auto last_ms{broken(ObservedJson({StampJson(2, H(4), "live", LIMIT - 1)}))};
+        QVERIFY(last_ms.observed && last_ms.observed->available); QCOMPARE(last_ms.observed->rows[0].ms, LIMIT - 1);
     }
     void heldTimesFollowHeldTicksAndOneSource()
     {

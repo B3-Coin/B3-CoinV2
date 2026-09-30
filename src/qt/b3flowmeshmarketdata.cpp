@@ -311,11 +311,19 @@ uint8_t ObservedFlags(const UniValue& v)
     }
     return out;
 }
+//! A window end or interval length: at most OBSERVED_MS_LIMIT.
 int64_t Millis(const UniValue& v)
 {
     const auto n{Count(v)};
-    if (n > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) Fail("Invalid observed time.");
+    if (n > static_cast<uint64_t>(flowmesh::OBSERVED_MS_LIMIT)) Fail("Invalid observed time.");
     return static_cast<int64_t>(n);
+}
+//! An observed time or bucket start: below OBSERVED_MS_LIMIT (10000-01-01).
+int64_t ObservedMs(const UniValue& v)
+{
+    const auto n{Millis(v)};
+    if (!flowmesh::ObservedTimeInRange(n)) Fail("Invalid observed time.");
+    return n;
 }
 ObservedTimes ObservedOf(const UniValue& v, const Snapshot& s)
 {
@@ -337,8 +345,8 @@ ObservedTimes ObservedOf(const UniValue& v, const Snapshot& s)
             stamp.hash = *uint256::FromHex(Id(F(row, "microblock_hash")).toStdString());
             if (stamp.sequence >= s.next_sequence || (!out.rows.empty() && stamp.sequence <= out.rows.back().sequence)) Fail("Observed times out of order.");
             const auto mode{Text(F(row, "mode"))};
-            if (mode == QStringLiteral("live")) { stamp.mode = flowmesh::ObservedMode::LIVE; stamp.ms = Millis(F(row, "observed_ms")); }
-            else if (mode == QStringLiteral("delayed")) { stamp.mode = flowmesh::ObservedMode::DELAYED; stamp.ms = Millis(F(row, "applied_here_ms")); }
+            if (mode == QStringLiteral("live")) { stamp.mode = flowmesh::ObservedMode::LIVE; stamp.ms = ObservedMs(F(row, "observed_ms")); }
+            else if (mode == QStringLiteral("delayed")) { stamp.mode = flowmesh::ObservedMode::DELAYED; stamp.ms = ObservedMs(F(row, "applied_here_ms")); }
             else if (mode == QStringLiteral("untimed")) stamp.mode = flowmesh::ObservedMode::UNTIMED;
             else Fail("Unknown observed-time mode.");
             stamp.flags = ObservedFlags(F(row, "flags"));
@@ -555,7 +563,7 @@ CandlePage ParseCandles(const UniValue& value, const flowmesh::CandleInterval re
         if (!rows.isArray() || rows.size() > 500) Fail("Oversized candle page.");
         for (const auto& row : rows.getValues()) {
             flowmesh::ObservedCandle c;
-            c.open_ms = Millis(F(row, "open_ms"));
+            c.open_ms = ObservedMs(F(row, "open_ms"));
             if (c.open_ms % step != 0 || c.open_ms < page.from_ms || c.open_ms >= page.before_ms ||
                 (!page.candles.empty() && c.open_ms <= page.candles.back().open_ms)) Fail("Misaligned or unordered candle.");
             c.first_sequence = Count(F(row, "first_sequence")); c.last_sequence = Count(F(row, "last_sequence"));
