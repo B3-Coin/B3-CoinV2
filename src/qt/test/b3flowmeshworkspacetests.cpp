@@ -2115,6 +2115,19 @@ private Q_SLOTS:
         QImage image{chart.size(), QImage::Format_ARGB32}; chart.render(&image);
         series.candles.clear(); chart.setTimeSeries(series); chart.render(&image);
     }
+    void unchangedRepliesKeepTheirObservedTimes()
+    {
+        B3FlowMeshTradingPanel panel;
+        const auto full{Parse(RemoteDataWithViews())};
+        Observe(panel, full); panel.mergeHeldTicks();
+        QVERIFY(panel.m_tick_times.empty());
+        // A light poll at the same head: its ticks' times replace the old section.
+        auto light{RemoteDataWithTimes()}; light.pushKV("unchanged", true);
+        QElapsedTimer age; age.start();
+        QCOMPARE(panel.applySelectedSnapshot(Parse(light), age, full.head), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QVERIFY(panel.m_snapshot->observed && panel.m_snapshot->observed->available);
+        QCOMPARE(panel.m_tick_times.size(), size_t{2});
+    }
     void tradeTapeShowsLiveTimesOnlyAndColoursByPriceChange()
     {
         const auto tick = [](uint64_t sequence, CAmount price, bool cleared = true) {

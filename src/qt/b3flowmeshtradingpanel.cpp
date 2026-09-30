@@ -2034,6 +2034,7 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
         if (fresh.units.known && fresh.units.asset == retained.base) retained.units = fresh.units;
         // Read at this same head: they replace the retained ones.
         retained.ticks = std::move(fresh.ticks); retained.indicative = std::move(fresh.indicative);
+        retained.observed = std::move(fresh.observed);
         m_snapshot = std::move(retained); m_response_age = age; mergeHeldTicks(); updateDataViews();
     } else {
         if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age = age;
