@@ -71,7 +71,7 @@ QString B3FlowMeshTradeTape::TimeText(const Row& row, const QString& source, con
         tip = tr("No trade time: %1's clock stood behind an earlier stamp when it applied this auction.").arg(who);
     } else if (row.received_ms) {
         text = QDateTime::fromMSecsSinceEpoch(*row.received_ms).toLocalTime().toString(QStringLiteral("HH:mm:ss"));
-        tip = tr("Received by this app at %1 (this computer's clock): this server reports no times. The auction was certified at or before then; not a certified or observed trade time.").arg(Utc(*row.received_ms));
+        tip = tr("Received by this app at %1 (this computer's clock) in a live update the server sent as the auction arrived: this server reports no times. The auction was certified at or before then; not a certified or observed trade time.").arg(Utc(*row.received_ms));
     } else {
         tip = source.isEmpty() ? tr("No trade time: this source does not report observed times.")
                                : tr("No trade time: %1 has no observed time for this auction (earlier history, or not observed live).").arg(who);
@@ -160,7 +160,7 @@ void B3FlowMeshTradeTape::setRows(const std::vector<Row>& rows, const B3FlowMesh
     if (!known) note = tr("Verified asset precision required");
     else if (rows.empty()) note = tr("No matched auctions held yet");
     else if (!source.isEmpty()) note = tr("Times observed by %1 · not certified · local time").arg(Who(source, remote));
-    else if (std::any_of(rows.begin(), rows.end(), [](const auto& row) { return row.received_ms.has_value(); })) note = tr("This server reports no times · times received by this app, live only");
+    else if (std::any_of(rows.begin(), rows.end(), [](const auto& row) { return row.received_ms.has_value(); })) note = tr("This server reports no times · times received by this app, live updates only");
     else note = reason == QStringLiteral("endpoint_does_not_advertise_observed_time") ? tr("This server does not report times (older version)")
                                                                                    : tr("No observed times");
     if (remote && known && !rows.empty()) note += tr(" · endpoint-reported");

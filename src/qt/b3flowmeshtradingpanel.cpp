@@ -2251,7 +2251,21 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
     refresh();
 }
 
-auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapshot fresh, const QElapsedTimer& age, const QString& basis_head) -> SnapshotApply
+bool B3FlowMeshTradingPanel::endpointNotReady(const QString& endpoint) const
+{
+    if (endpoint.isEmpty() || !m_client_info || !m_client_info->isObject()) return false;
+    const auto& rows{m_client_info->find_value("endpoints")};
+    if (!rows.isArray()) return false;
+    for (const auto& row : rows.getValues()) {
+        const auto& url{row.find_value("url")};
+        const auto& readiness{row.find_value("readiness")};
+        if (url.isStr() && QString::fromStdString(url.get_str()) == endpoint && readiness.isStr() && readiness.get_str() == "not_ready") return true;
+    }
+    return false;
+}
+
+auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapshot fresh, const QElapsedTimer& age, const QString& basis_head,
+                                                   const bool live_head_change) -> SnapshotApply
 {
     // Reads can complete out of order. Each is compared with the head it was
     // requested against, never only with whatever is displayed now.
@@ -2283,12 +2297,16 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
         if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age = age;
         // Tape only: a server without observed times, one new auction since
         // the displayed head, received while the link was Live and without
-        // an event gap: when this app received it. Nothing older, never a
-        // chart input.
+        // an event gap: when this app received it. Only from a live update
+        // whose endpoint waited and saw the head move (head_changed): an
+        // endpoint or node replaying old entries in consecutive replies, a
+        // poll or a catch-up never stamps one, nor an endpoint advertising
+        // that it is not ready. Nothing older, never a chart input.
         const bool one_new{m_snapshot && m_snapshot->market == fresh.market && fresh.next_sequence == m_snapshot->next_sequence + 1};
         const bool was_live{!m_read_failed && m_response_age.isValid() && m_response_age.elapsed() <= B3FlowMeshMarketData::LINK_FRESH_MS};
         const bool untimed{!fresh.observed || !fresh.observed->available};
-        const bool receipt{one_new && was_live && untimed && !fresh.event_gap && fresh.certified};
+        const bool receipt{live_head_change && one_new && was_live && untimed && !fresh.event_gap && fresh.certified &&
+                           !endpointNotReady(fresh.endpoint)};
         const uint64_t head_sequence{fresh.next_sequence ? fresh.next_sequence - 1 : 0};
         const QString head_hash{fresh.head};
         m_snapshot = std::move(fresh); m_response_age = age; mergeHeldTicks();
@@ -2494,7 +2512,8 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
         const bool head_moved{!s.unchanged && s.head != scope.known_head};
         const auto outcome{B3FlowMeshWatch::Classify(false, result->status.toStdString(), result->supported, result->waited,
                                                      head_moved, result->endpoint_live_ms)};
-        if (applySelectedSnapshot(s, result->snapshot_age, scope.known_head) == SnapshotApply::APPLIED) {
+        const bool live_head_change{result->supported && !result->gap && result->status == QStringLiteral("head_changed")};
+        if (applySelectedSnapshot(s, result->snapshot_age, scope.known_head, live_head_change) == SnapshotApply::APPLIED) {
             const auto index{m_market->currentIndex()};
             if (index >= 0 && static_cast<size_t>(index) < m_market_data.size()) DeriveRowFromSnapshot(m_market_data[index], s);
             m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_read_error.clear(); m_loading = false;

@@ -332,7 +332,14 @@ private:
     //! Applies one verified read of the selected market, never moving the
     //! display backwards: a reply against a head the display has left, or an
     //! older full snapshot, is superseded (dropped, not a failure).
-    SnapshotApply applySelectedSnapshot(B3FlowMeshMarketData::Snapshot fresh, const QElapsedTimer& age, const QString& basis_head);
+    //! `live_head_change`: the reply is a live update whose endpoint waited
+    //! and saw the head move (watch status head_changed, no gap), the only
+    //! reply that may stamp a receipt time in the tape (review B2).
+    SnapshotApply applySelectedSnapshot(B3FlowMeshMarketData::Snapshot fresh, const QElapsedTimer& age, const QString& basis_head,
+                                        bool live_head_change = false);
+    //! The displayed data's endpoint advertises that it is not ready (an
+    //! advisory it may be lagging); false when unknown or local.
+    bool endpointNotReady(const QString& endpoint) const;
     //! The selected catalog row's fields a verified market read determines.
     static void DeriveRowFromSnapshot(B3FlowMeshTrading::Market& row, const B3FlowMeshMarketData::Snapshot& s);
     void stopWorker();
@@ -509,9 +516,11 @@ private:
     std::map<uint64_t, flowmesh::ObservedStamp> m_tick_times;
     QString m_tick_times_source;
     //! Tape only, for a source that reports no observed times: when this app
-    //! received a held tick live, one new auction per reply while the link
-    //! was Live (never older rows, a catch-up or a reconnect). Never a chart
-    //! input; dropped with the held tick, and when times become available.
+    //! received a held tick live, from a live update whose endpoint saw the
+    //! head move while it waited, with exactly one new auction while the link
+    //! was Live and the endpoint not advertising that it lags (never older
+    //! rows, a poll, a catch-up or a reconnect). Never a chart input; dropped
+    //! with the held tick, and when times become available.
     std::map<uint64_t, int64_t> m_received_times;
     //! Observed-time candles of m_candles_market at m_candle_interval, as the
     //! source served them (never recomputed here), and when they were read.

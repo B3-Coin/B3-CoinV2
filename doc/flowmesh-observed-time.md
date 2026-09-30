@@ -178,10 +178,14 @@ times are the endpoint's claims.
   live observation; late, untimed or unrecorded auctions show "—" (catch-up
   imports stay without a time); tooltips give the observer, UTC to the
   millisecond (or the late upper bound), flags and the auction number.
-- **Older servers.** The tape may show when this app received an auction, only
-  for a reply that brought exactly one new auction while the link was Live and
-  without an event gap; labelled "received by this app", never a chart input,
-  dropped as soon as the source reports times.
+- **Servers without observed time.** The tape may show when this app received
+  an auction, only for a live update whose endpoint waited and saw the head
+  move (watch status `head_changed`, no gap) that brought exactly one new
+  auction while the link was Live, from an endpoint not advertising that it is
+  not ready; a poll, a catch-up or an endpoint replaying older entries in
+  consecutive replies never stamps one. Labelled "received by this app", never
+  a chart input, dropped as soon as the source reports times. An endpoint that
+  offers no live updates (c10c952, f8a3432) therefore gets no receipt times.
 - **Wording.** The clearing strip ("Last auction 12:34:56 · …"), the trade
   history's Time column, the progress line, toasts and gap notes no longer show
   microblock numbers; each keeps the auction number in its tooltip.
