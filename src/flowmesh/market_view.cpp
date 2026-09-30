@@ -661,6 +661,47 @@ std::string LevelGroupingError(const LevelGrouping& grouping)
     return {};
 }
 
+std::optional<std::pair<CAmount, CAmount>> LevelBucketRange(const LevelGrouping& grouping, const bool bid, const U128 index,
+                                                            const bool zero_price)
+{
+    if (!LevelGroupingError(grouping).empty()) return std::nullopt;
+    const bool inverse{!grouping.exact && grouping.inverse};
+    if (zero_price) return inverse ? std::optional{std::pair<CAmount, CAmount>{0, 0}} : std::nullopt;
+    // No valid bucket index exceeds 10^36 (the largest inverse scale); the
+    // bound keeps every product below within 128 bits.
+    if (index > Pow10(37)) return std::nullopt;
+    const U128 money{static_cast<U128>(MAX_MONEY)};
+    U128 low, high;
+    if (grouping.exact) {
+        if (index > money) return std::nullopt;
+        low = high = index;
+    } else if (!inverse) {
+        const U128 ticks{grouping.mantissa * Pow10(grouping.exponent + 9 - grouping.decimals)};
+        if (bid) {
+            low = index * ticks;
+            high = low + ticks - 1;
+        } else {
+            high = index * ticks;
+            low = index == 0 ? 0 : high - ticks + 1;
+        }
+    } else {
+        const U128 scale{Pow10(9 - grouping.decimals - grouping.exponent)}, mantissa{grouping.mantissa};
+        const auto ceil = [](const U128 a, const U128 b) { return a / b + (a % b != 0 ? 1 : 0); };
+        if (bid) {
+            if (index == 0) return std::nullopt;
+            low = ceil(scale, mantissa * index);
+            high = index >= 2 ? ceil(scale, mantissa * (index - 1)) - 1 : money;
+        } else {
+            low = scale / (mantissa * (index + 1)) + 1;
+            high = index >= 1 ? scale / (mantissa * index) : money;
+        }
+        if (low == 0) low = 1; // Price zero is its own bucket.
+    }
+    if (high > money) high = money;
+    if (low > high) return std::nullopt;
+    return std::pair<CAmount, CAmount>{static_cast<CAmount>(low), static_cast<CAmount>(high)};
+}
+
 bool LevelsQueryValid(const BookLevelsQuery& query)
 {
     return query.depth >= 1 && query.depth <= MARKET_DATA_MAX_LEVELS && LevelGroupingError(query.grouping).empty();

@@ -12,6 +12,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <utility>
 
 namespace flowmesh {
 
@@ -77,6 +78,15 @@ inline constexpr size_t MARKET_VIEW_LEVEL_NOTIONAL_PRICES{16};
 std::string LevelGroupingError(const LevelGrouping& grouping);
 //! A valid levels query: depth 1..MARKET_DATA_MAX_LEVELS and a valid grouping.
 bool LevelsQueryValid(const BookLevelsQuery& query);
+
+/** The inclusive canonical price range of bucket `index` of a side (canonical
+ * bids when `bid`) in a valid grouping, exactly as ComputeBookLevels reports
+ * it (an unbounded end is MAX_MONEY), or nullopt when no canonical price
+ * falls in that bucket. `zero_price` is the inverse view's price-zero
+ * bucket. For a client to check a reported level against its bucket and to
+ * label it; display only. */
+std::optional<std::pair<CAmount, CAmount>> LevelBucketRange(const LevelGrouping& grouping, bool bid, util::Unsigned128 index,
+                                                            bool zero_price);
 
 /** The top `query.depth` price levels per side of `curves` as the book holds
  * them, best first, in the query's grouping; the standing clearing (no

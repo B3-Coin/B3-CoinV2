@@ -822,6 +822,11 @@ BOOST_AUTO_TEST_CASE(book_levels_match_an_integer_scan_in_every_grouping)
                     if (level.notional) BOOST_CHECK(*level.notional == brute.notional);
                     notionals += walked;
                     BOOST_CHECK(level.low <= brute.any_price && brute.any_price <= level.high);
+                    // A client can check each level against its bucket.
+                    const auto range{flowmesh::LevelBucketRange(grouping, side == Side::BID, level.bucket, level.zero_price)};
+                    BOOST_REQUIRE(range);
+                    BOOST_CHECK_EQUAL(range->first, level.low);
+                    BOOST_CHECK_EQUAL(range->second, level.high);
                     // Cumulative is the side's total at the level's far edge.
                     const CAmount edge{side == Side::BID ? level.low : level.high};
                     BOOST_CHECK(static_cast<util::Signed128>(level.cumulative) == SideTotal(state, side, edge));
@@ -948,6 +953,9 @@ BOOST_AUTO_TEST_CASE(book_levels_inverse_partition_is_exact_contiguous_and_conse
                     if (side == Side::BID) BOOST_CHECK(level.bucket * unit >= scale);
                     else BOOST_CHECK(level.bucket * unit <= scale);
                 }
+                const auto range{flowmesh::LevelBucketRange(grouping, side == Side::BID, level.bucket, false)};
+                BOOST_REQUIRE(range);
+                BOOST_CHECK(range->first == level.low && range->second == level.high);
                 // Just outside the range, the bucket differs.
                 if (level.low > 1) BOOST_CHECK(BruteBucket(side, level.low - 1, grouping).first != level.bucket);
                 if (level.high < top) BOOST_CHECK(BruteBucket(side, level.high + 1, grouping).first != level.bucket);
@@ -1246,6 +1254,28 @@ BOOST_AUTO_TEST_CASE(market_views_compute_levels_once_per_copy_and_only_when_wan
     BOOST_REQUIRE(none.levels);
     BOOST_CHECK(!none.levels->available);
     BOOST_CHECK_EQUAL(none.levels->unavailable_reason, "no_certified_state");
+}
+
+BOOST_AUTO_TEST_CASE(book_level_bucket_ranges_refuse_empty_and_out_of_range_buckets)
+{
+    const auto exact{flowmesh::LevelGrouping{}};
+    BOOST_CHECK((flowmesh::LevelBucketRange(exact, true, 7, false) == std::pair<CAmount, CAmount>(7, 7)));
+    BOOST_CHECK(!flowmesh::LevelBucketRange(exact, true, static_cast<U128>(MAX_MONEY) + 1, false));
+    BOOST_CHECK(!flowmesh::LevelBucketRange(exact, false, 0, true)); // zero_price is inverse-only
+    const auto tens{Grouping(false, 1, -2, 6)}; // 10 ticks
+    BOOST_CHECK((flowmesh::LevelBucketRange(tens, true, 123, false) == std::pair<CAmount, CAmount>(1230, 1239)));
+    BOOST_CHECK((flowmesh::LevelBucketRange(tens, false, 125, false) == std::pair<CAmount, CAmount>(1241, 1250)));
+    BOOST_CHECK((flowmesh::LevelBucketRange(tens, false, 0, false) == std::pair<CAmount, CAmount>(0, 0)));
+    const auto inverse{Grouping(true, 2, 1, 6)}; // u = 50 / P
+    BOOST_CHECK((flowmesh::LevelBucketRange(inverse, true, 1, false) == std::pair<CAmount, CAmount>(50, MAX_MONEY)));
+    BOOST_CHECK((flowmesh::LevelBucketRange(inverse, false, 0, false) == std::pair<CAmount, CAmount>(51, MAX_MONEY)));
+    BOOST_CHECK((flowmesh::LevelBucketRange(inverse, false, 0, true) == std::pair<CAmount, CAmount>(0, 0)));
+    BOOST_CHECK(!flowmesh::LevelBucketRange(inverse, true, 0, false));
+    // u = 50 / P never lies in (26, 50) for an integer P: bucket 30 is empty.
+    BOOST_CHECK(!flowmesh::LevelBucketRange(inverse, true, 30, false));
+    BOOST_CHECK(!flowmesh::LevelBucketRange(inverse, true, ~U128{0}, false));
+    // An invalid grouping has no buckets.
+    BOOST_CHECK(!flowmesh::LevelBucketRange(Grouping(false, 3, 0, 9), true, 1, false));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
