@@ -4005,13 +4005,13 @@ BOOST_AUTO_TEST_CASE(previous_clients_take_the_same_from_status_objects_with_add
     auto api{node::MakeFlowMeshTradingApi(
         service, Options(), {},
         {node::FLOWMESH_API_ACTION_WAIT_DEFAULT, node::FLOWMESH_API_ACTION_WAITERS_DEFAULT, true},
-        {true}, {true}, {std::chrono::milliseconds{2000}, 2}, {node::FLOWMESH_API_CLEARING_TICKS_DEFAULT})};
+        {true}, {true}, {std::chrono::milliseconds{2000}, 2}, {node::FLOWMESH_API_CLEARING_TICKS_DEFAULT}, {true})};
     BOOST_REQUIRE_MESSAGE(api->Start(error), error);
     const auto endpoint{Endpoint(api->Port())};
     const std::string one_market{"{\"market_id\":\"" + market.GetHex() + "\"}"};
     const std::set<std::string> added{"health_api_version", "endpoint_ready", "endpoint_not_ready",
                                       "submit_wait_ms_max", "updates_watch_ms_max", "action_outcome_v1",
-                                      "clearing_ticks_max"};
+                                      "clearing_ticks_max", "observed_time_v1"};
 
     const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
     BOOST_REQUIRE_EQUAL(markets_status, 200);
@@ -5261,14 +5261,16 @@ struct LiveMarket {
     const node::FlowMeshTradingApiWatch watch;
     const node::FlowMeshTradingApiTicks ticks;
     const node::FlowMeshTradingApiOutcome outcome;
+    const node::FlowMeshTradingApiObservedTime observed;
     std::unique_ptr<node::FlowMeshService> service;
     std::unique_ptr<node::FlowMeshHttpsServer> api;
     uint16_t port{0};
     //! Told of every connection the API admits (set before Start).
     std::function<void(bool)> connection_observer;
     LiveMarket(ClientLaneFixture& f, fs::path p, const node::FlowMeshTradingApiWatch w = {},
-               const node::FlowMeshTradingApiTicks t = {}, const node::FlowMeshTradingApiOutcome o = {})
-        : fixture{f}, path{std::move(p)}, watch{w}, ticks{t}, outcome{o}
+               const node::FlowMeshTradingApiTicks t = {}, const node::FlowMeshTradingApiOutcome o = {},
+               const node::FlowMeshTradingApiObservedTime obs = {})
+        : fixture{f}, path{std::move(p)}, watch{w}, ticks{t}, outcome{o}, observed{obs}
     {
         // Certify the market genesis, publish its checkpoint on B3, and start
         // again: the market then admits actions.
@@ -5289,7 +5291,7 @@ struct LiveMarket {
         BOOST_REQUIRE_MESSAGE(service->ArmSeatKeys(fixture.secrets, error), error);
         auto options{fixture.Options(port)};
         options.request_timeout = std::chrono::seconds{10};
-        api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, outcome, watch, ticks);
+        api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, outcome, watch, ticks, observed);
         if (connection_observer) {
             BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(*api, [this](bool nodelay) {
                 if (connection_observer) connection_observer(nodelay);
@@ -5921,6 +5923,63 @@ BOOST_AUTO_TEST_CASE(trading_api_serves_clearing_ticks_when_enabled)
     const auto [watched_status, watched]{ApiCall(on.Endpoint(), "updates", id + ",\"watch_ms\":500,\"ticks\":{}")};
     BOOST_CHECK_EQUAL(watched_status, 400);
     BOOST_CHECK_EQUAL(watched["error"].get_str(), "ticks cannot be combined with watch_ms");
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_without_observed_time_keeps_the_previous_contract)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket off{*this, m_path_root / "observed-off", {}, {16}};
+    const auto [status, snapshot]{ApiCall(off.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK(!snapshot["result"]["status"].exists("observed_time_v1"));
+    for (const char* method : {"snapshot", "updates"}) {
+        const auto [refused, rejection]{ApiCall(off.Endpoint(), method, id + ",\"observed_time\":true")};
+        BOOST_CHECK_EQUAL(refused, 400);
+        BOOST_CHECK_EQUAL(rejection["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_observed_time_only_when_requested)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket on{*this, m_path_root / "observed-on", {std::chrono::milliseconds{2000}, 2}, {16}, {}, {true}};
+    on.Deposit();
+    const auto [status, plain]{ApiCall(on.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK(plain["result"]["status"]["observed_time_v1"].get_bool());
+    // Not asked for: reported_data is unchanged.
+    BOOST_CHECK(!plain["result"]["reported_data"].exists("observed_time"));
+    for (const char* method : {"snapshot", "updates"}) {
+        BOOST_TEST_CONTEXT(method) {
+            const auto [timed_status, timed]{ApiCall(on.Endpoint(), method, id + ",\"ticks\":{},\"observed_time\":true")};
+            BOOST_REQUIRE_EQUAL(timed_status, 200);
+            const auto& section{timed["result"]["reported_data"]["observed_time"]};
+            BOOST_CHECK(section["available"].get_bool());
+            BOOST_CHECK_EQUAL(section["source"].get_str(), "endpoint_operator");
+            BOOST_CHECK_EQUAL(section["source_kind"].get_str(), "operator_observed");
+            BOOST_CHECK(!section["certified"].get_bool());
+            const auto& ticks{timed["result"]["reported_data"]["clearing_ticks"]["ticks"]};
+            BOOST_REQUIRE_EQUAL(section["rows"].size(), ticks.size());
+            for (size_t i{0}; i < ticks.size(); ++i) {
+                const auto& row{section["rows"][i]};
+                BOOST_CHECK_EQUAL(row["sequence"].getInt<int>(), ticks[i]["sequence"].getInt<int>());
+                BOOST_CHECK_EQUAL(row["microblock_hash"].get_str(), ticks[i]["microblock_hash"].get_str());
+                // Public rows never say why an entry was late.
+                BOOST_CHECK(!row.exists("delay_reason"));
+                for (const auto& flag : row["flags"].getValues()) {
+                    BOOST_CHECK(flag.get_str() == "clock_clamped" || flag.get_str() == "clock_step" ||
+                                flag.get_str() == "clock_suspect" || flag.get_str() == "restart");
+                }
+                BOOST_CHECK(row.exists("observed_ms") != row.exists("applied_here_ms") || row["mode"].get_str() == "untimed");
+            }
+        }
+    }
+    // Refused with a watch, whose page has no reported_data.
+    const auto [watched_status, watched]{ApiCall(on.Endpoint(), "updates", id + ",\"watch_ms\":500,\"observed_time\":true")};
+    BOOST_CHECK_EQUAL(watched_status, 400);
+    BOOST_CHECK_EQUAL(watched["error"].get_str(), "observed_time cannot be combined with watch_ms");
+    const auto [bad_status, bad]{ApiCall(on.Endpoint(), "snapshot", id + ",\"observed_time\":1")};
+    BOOST_CHECK_EQUAL(bad_status, 400);
 }
 
 namespace {

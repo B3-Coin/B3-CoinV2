@@ -102,6 +102,15 @@ void Keys(const UniValue& value, std::initializer_list<const char*> allowed)
             Fail("Unknown or duplicate client API field");
     }
 }
+void Keys(const UniValue& value, const std::vector<const char*>& allowed)
+{
+    if (!value.isObject()) Fail("Expected a bounded object");
+    std::set<std::string> seen;
+    for (const auto& key : value.getKeys()) {
+        if (!seen.insert(key).second || std::none_of(allowed.begin(), allowed.end(), [&](const char* name) { return key == name; }))
+            Fail("Unknown or duplicate client API field");
+    }
+}
 std::string Text(const UniValue& object, const char* key, size_t maximum = 1024)
 {
     const auto& value{object[key]};
@@ -548,6 +557,19 @@ class TradingApi {
     const bool m_outcome;
     // Largest clearing-tick page; zero keeps the exact previous contract.
     const size_t m_ticks_max;
+    // Operator-observed time; disabled keeps the exact previous contract.
+    const bool m_observed_time;
+    //! A public reply's observed times: labelled as this endpoint's, with
+    //! only the clock flags (never a delay reason or anything seat-related).
+    static void PublicObservedTimes(flowmesh::MarketData& data)
+    {
+        if (!data.observed) return;
+        data.observed->source = "endpoint_operator";
+        for (auto& row : data.observed->rows) {
+            row.flags &= flowmesh::OBSERVED_PUBLIC_FLAGS;
+            row.delay = flowmesh::ObservedDelay::NONE;
+        }
+    }
     //! A "ticks" parameter: its limit is clamped to the advertised maximum.
     flowmesh::ClearingTickQuery ParseTicks(const UniValue& value) const
     {
@@ -611,6 +633,8 @@ class TradingApi {
         if (m_outcome) out.pushKV("action_outcome_v1", true);
         // The same for "ticks" on 'snapshot' and unwatched 'updates'.
         if (m_ticks_max) out.pushKV("clearing_ticks_max", uint64_t{m_ticks_max});
+        // And for "observed_time" on the same reads.
+        if (m_observed_time) out.pushKV("observed_time_v1", true);
         AddReadiness(out, status.market_id, health);
         return out;
     }
@@ -894,7 +918,8 @@ class TradingApi {
 public:
     explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
                         const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome,
-                        const FlowMeshTradingApiWatch watch, const FlowMeshTradingApiTicks ticks)
+                        const FlowMeshTradingApiWatch watch, const FlowMeshTradingApiTicks ticks,
+                        const FlowMeshTradingApiObservedTime observed)
         : m_service(service), m_local(service, std::move(metadata), /*public_api=*/true),
           m_wait_max{wait.waiters == 0 ? std::chrono::milliseconds{0}
                                        : std::clamp(wait.max, std::chrono::milliseconds{0}, FLOWMESH_API_ACTION_WAIT_MAX)},
@@ -908,7 +933,7 @@ public:
           m_watches{m_watch_max.count() ? std::min({watch.watchers, FLOWMESH_API_UPDATES_WATCHERS_MAX,
                                                     FLOWMESH_API_MAX_WAIT_SLOTS - m_waits.Capacity()}) : 0},
           m_health{health.enabled}, m_outcome{outcome.enabled},
-          m_ticks_max{std::min(ticks.max, flowmesh::MARKET_DATA_MAX_TICKS)} {}
+          m_ticks_max{std::min(ticks.max, flowmesh::MARKET_DATA_MAX_TICKS)}, m_observed_time{observed.enabled} {}
     size_t WaitSlots() const { return m_waits.Capacity(); }
     size_t WatchSlots() const { return m_watches.Capacity(); }
     //! Server stop hook: refuse new waits and watches and end every current one.
@@ -943,16 +968,20 @@ public:
         }
         if (method == "snapshot") {
             // Disabled, the contract is exactly the previous one, in which
-            // ticks is an unknown field.
-            if (m_ticks_max == 0) Keys(params, {"market_id", "account_id"});
-            else Keys(params, {"market_id", "account_id", "ticks"});
+            // ticks (or observed_time) is an unknown field.
+            std::vector<const char*> allowed{"market_id", "account_id"};
+            if (m_ticks_max) allowed.push_back("ticks");
+            if (m_observed_time) allowed.push_back("observed_time");
+            Keys(params, allowed);
             const auto id{Id(params, "market_id")};
             const std::optional<uint256> account{params.exists("account_id") ? std::optional{Id(params, "account_id")} : std::nullopt};
             flowmesh::MarketDataQuery reported;
             if (params.exists("ticks")) reported.ticks = ParseTicks(params["ticks"]);
+            if (params.exists("observed_time")) reported.observed_time = Flag(params, "observed_time");
             std::string error;
-            const auto view{m_service.ClientSnapshotView(id, account, error, reported)};
+            auto view{m_service.ClientSnapshotView(id, account, error, reported)};
             if (!view) Fail(error.empty() ? "No certified state snapshot is available" : error);
+            PublicObservedTimes(view->reported);
             const auto& evidence{view->evidence};
             UniValue out{UniValue::VOBJ};
             out.pushKV("status", MarketResponse(view->reported));
@@ -968,16 +997,19 @@ public:
             // Disabled, the contract is exactly the previous one, in which
             // watch_ms is an unknown field.
             // Likewise ticks.
-            if (m_watch_max.count() == 0 && m_ticks_max == 0) Keys(params, {"market_id", "account_id", "cursor", "known_head", "before_sequence", "limit"});
-            else if (m_ticks_max == 0) Keys(params, {"market_id", "account_id", "cursor", "known_head", "before_sequence", "limit", "watch_ms"});
-            else if (m_watch_max.count() == 0) Keys(params, {"market_id", "account_id", "cursor", "known_head", "before_sequence", "limit", "ticks"});
-            else Keys(params, {"market_id", "account_id", "cursor", "known_head", "before_sequence", "limit", "watch_ms", "ticks"});
+            // Likewise observed_time.
+            std::vector<const char*> allowed{"market_id", "account_id", "cursor", "known_head", "before_sequence", "limit"};
+            if (m_watch_max.count()) allowed.push_back("watch_ms");
+            if (m_ticks_max) allowed.push_back("ticks");
+            if (m_observed_time) allowed.push_back("observed_time");
+            Keys(params, allowed);
             const auto id{Id(params, "market_id")};
             const std::optional<uint256> account{params.exists("account_id") ? std::optional{Id(params, "account_id")} : std::nullopt};
             const std::optional<flowmesh::ClientEventCursor> after{params.exists("cursor") ? std::optional{ParseCursor(params["cursor"])} : std::nullopt};
             if (params.exists("watch_ms")) {
                 // A watched page has no reported_data to carry them.
                 if (params.exists("ticks")) Fail("ticks cannot be combined with watch_ms");
+                if (params.exists("observed_time")) Fail("observed_time cannot be combined with watch_ms");
                 return WatchedUpdates(http, params, id, account, after, timing);
             }
             const auto page{m_service.ClientEvents(after, id, account, flowmesh::CLIENT_EVENT_PAGE_MAX)};
@@ -987,9 +1019,11 @@ public:
             if (params.exists("before_sequence")) { query.before_sequence = Number(params, "before_sequence"); query.known_head.reset(); }
             if (params.exists("limit")) query.limit = Number(params, "limit", flowmesh::MARKET_DATA_MAX_HISTORY);
             if (params.exists("ticks")) query.ticks = ParseTicks(params["ticks"]);
+            if (params.exists("observed_time")) query.observed_time = Flag(params, "observed_time");
             std::string error;
-            const auto data{m_local.Data(id, account, query, error)};
+            auto data{m_local.Data(id, account, query, error)};
             if (!data) Fail(error.empty() ? "No market-data view is available" : error);
+            PublicObservedTimes(*data);
             out.pushKV("status", MarketResponse(*data));
             out.pushKV("reported_data", FlowMeshClientMarketDataJson(*data));
             return out;
@@ -3947,10 +3981,11 @@ std::optional<size_t> FlowMeshApiWatchSlots(const size_t action_slots, const boo
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(FlowMeshService& service, FlowMeshHttpsServer::Options options,
                                                         FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
                                                         const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome,
-                                                        const FlowMeshTradingApiWatch watch, const FlowMeshTradingApiTicks ticks)
+                                                        const FlowMeshTradingApiWatch watch, const FlowMeshTradingApiTicks ticks,
+                                                        const FlowMeshTradingApiObservedTime observed)
 {
     options.max_reply_bytes = CLIENT_MAX_REPLY;
-    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait, health, outcome, watch, ticks)};
+    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait, health, outcome, watch, ticks, observed)};
     // Handshake, read, handler and write concurrency stays at the two workers
     // the API always had. Each wait or watch slot adds a worker that only
     // sleeps in a suspended wait. Disabled waits and watches leave exactly

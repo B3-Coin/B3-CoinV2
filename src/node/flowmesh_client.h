@@ -204,12 +204,25 @@ struct FlowMeshTradingApiTicks {
 };
 inline constexpr size_t FLOWMESH_API_CLEARING_TICKS_DEFAULT{flowmesh::MARKET_DATA_MAX_TICKS};
 
+//! Node-local policy for operator-observed time on the restricted API's
+//! 'snapshot' and unwatched 'updates' reads: the "observed_time_v1" advert in
+//! status objects and an optional "observed_time": true parameter, whose
+//! section (this endpoint's stamps of the reply's head, history and ticks)
+//! rides in reported_data. Endpoint-reported display data: never certified,
+//! never evidence; public rows carry only the clock flags and never why an
+//! entry was late or anything about seats. Disabled keeps the exact
+//! previous request and reply contract.
+struct FlowMeshTradingApiObservedTime {
+    bool enabled{false};
+};
+
 //! Restricted HTTPS adapter. It holds no wallet and never invokes the RPC table.
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(
     FlowMeshService& service, FlowMeshHttpsServer::Options options,
     FlowMeshAssetMetadataCatalog metadata = {}, FlowMeshTradingApiWait wait = {},
     FlowMeshTradingApiHealth health = {}, FlowMeshTradingApiOutcome outcome = {},
-    FlowMeshTradingApiWatch watch = {}, FlowMeshTradingApiTicks ticks = {});
+    FlowMeshTradingApiWatch watch = {}, FlowMeshTradingApiTicks ticks = {},
+    FlowMeshTradingApiObservedTime observed = {});
 
 //! Shared public projection used by the wallet RPC and restricted endpoint.
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);
