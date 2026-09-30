@@ -2272,7 +2272,9 @@ std::optional<flowmesh::ObservedCandlePage> FlowMeshService::ObservedCandles(
     }
     auto page{log->Candles(interval, before_ms, limit)};
     page.source = "this_node";
-    if (!allow_disk) return page;
+    // Unavailable while the market's history loads: never disk candles
+    // under a page that lacks the memory window.
+    if (!page.available || !allow_disk) return page;
     // The window reaches before the memory window: the database holds the
     // older candles (the memory window is always the newest).
     const auto oldest{log->OldestMemoryOpen(interval)};

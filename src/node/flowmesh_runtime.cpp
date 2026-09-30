@@ -3805,6 +3805,13 @@ void FillObservedTimes(flowmesh::MarketData& out, const FlowMeshObservedTimeLog*
         section.unavailable_reason = "not_recorded_by_this_node";
         return;
     }
+    const auto summary{log->GetSummary()};
+    if (summary.loading) {
+        // The retained history is still being read (a market start): no
+        // rows rather than a part of them, and no false recorded_since.
+        section.unavailable_reason = FlowMeshObservedTimeLog::LOADING_REASON;
+        return;
+    }
     // The head and exactly the reply's history and tick entries, by hash.
     std::vector<std::pair<uint64_t, uint256>> entries;
     if (out.snapshot.certified && out.snapshot.next_microblock_sequence > 0) {
@@ -3814,7 +3821,6 @@ void FillObservedTimes(flowmesh::MarketData& out, const FlowMeshObservedTimeLog*
     if (out.ticks) {
         for (const auto& tick : out.ticks->ticks) entries.emplace_back(tick.sequence, tick.microblock_hash);
     }
-    const auto summary{log->GetSummary()};
     section.available = true;
     section.source = "this_node";
     section.clock_suspect = summary.clock_suspect;

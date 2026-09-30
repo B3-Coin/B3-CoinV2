@@ -6,6 +6,7 @@
 #include <node/flowmesh_observed_time_log.h>
 
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_runtime.h>
 
 #include <dbwrapper.h>
 #include <serialize.h>
@@ -267,6 +268,78 @@ struct History {
     FakeClocks clocks;
 };
 
+//! `count` entries `step_ms` apart from the clocks' time, loaded and
+//! flushed through a store at `path` and stopped cleanly.
+void Populate(const fs::path& path, FakeClocks& clocks, const uint64_t count, const int64_t step_ms)
+{
+    FlowMeshObservedTimeStore store{Options(path)};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 0, {});
+    store.FlushNow(false);
+    for (uint64_t i{0}; i < count; ++i) {
+        log->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i, 100 + static_cast<CAmount>(i)));
+        clocks.Advance(step_ms);
+    }
+    store.Stop();
+}
+
+//! What a store run leaves: the log's stamps, recorded_since and memory
+//! candles, the stored candles, and what a restart reloads.
+struct StoreRun {
+    std::vector<flowmesh::ObservedStamp> rows;
+    std::optional<uint64_t> recorded_since;
+    std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> memory, disk, reloaded;
+    std::vector<flowmesh::ObservedStamp> reloaded_rows;
+};
+
+//! 40 stored entries, a restart with the wall clock `back_ms` behind, then
+//! Script(85) with the queued load run before step `load_at` (never:
+//! loaded first, the reference; past the end: after every entry).
+StoreRun RunWithLoadAt(const fs::path& path, const std::optional<size_t> load_at, const int64_t back_ms)
+{
+    FakeClocks clocks;
+    Populate(path, clocks, 40, 7'000);
+    clocks.wall -= back_ms;
+    StoreRun out;
+    uint64_t sequence{40};
+    std::string error;
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        store.Attach(log, 40, Known(0, 40));
+        if (!load_at) store.FlushNow(false);
+        const auto script{Script(85)};
+        for (size_t i{0}; i < script.size(); ++i) {
+            if (load_at && *load_at == i) store.FlushNow(false);
+            (void)Play(*log, clocks, {script[i]}, sequence);
+        }
+        store.FlushNow(false);
+        out.rows = log->Lookup(Known(0, sequence));
+        out.recorded_since = log->GetSummary().recorded_since;
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            out.memory[static_cast<size_t>(interval)] = log->Candles(interval, std::nullopt, flowmesh::OBSERVED_CANDLE_PAGE_MAX).candles;
+        }
+        store.Stop();
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            out.disk[static_cast<size_t>(interval)] = store.ReadCandles(MARKET, interval, 0, T0 + 10 * 86'400'000LL, flowmesh::OBSERVED_CANDLE_PAGE_MAX);
+        }
+    }
+    FlowMeshObservedTimeStore store{Options(path)};
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, sequence, Known(0, sequence));
+    store.FlushNow(false);
+    out.reloaded_rows = log->Lookup(Known(0, sequence));
+    for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+        out.reloaded[static_cast<size_t>(interval)] = log->Candles(interval, std::nullopt, flowmesh::OBSERVED_CANDLE_PAGE_MAX).candles;
+    }
+    store.Stop();
+    return out;
+}
+
 void MakeHistory(History& out)
 {
     const auto source{MakeLog(out.clocks)};
@@ -368,6 +441,8 @@ BOOST_AUTO_TEST_CASE(persist_restart_reload_rows_and_candles)
     BOOST_REQUIRE(store.Open(error));
     const auto log{MakeLog(clocks)};
     store.Attach(log, 30, Known(0, 30));
+    // The load is queued: run it (the flush thread's pass) before reading.
+    store.FlushNow(false);
     BOOST_CHECK_EQUAL(log->GetSummary().recorded_since.value_or(99), 0U);
     const auto rows{log->Lookup(Known(0, 30))};
     BOOST_CHECK_EQUAL(rows.size(), 30U);
@@ -415,6 +490,7 @@ BOOST_AUTO_TEST_CASE(unflushed_tail_is_a_gap_not_an_error)
     BOOST_REQUIRE(store.Open(error));
     const auto log{MakeLog(clocks)};
     store.Attach(log, 15, Known(0, 15));
+    store.FlushNow(false);
     BOOST_CHECK_EQUAL(log->Lookup(Known(0, 15)).size(), 10U);
     clocks.Advance(120'000);
     log->Record(15, EntryHash(15), ObservedDelay::NONE, Tick(15));
@@ -468,6 +544,7 @@ BOOST_AUTO_TEST_CASE(rows_beyond_store_head_dropped_and_mismatch_wipes)
         BOOST_REQUIRE(store.Open(error));
         const auto log{MakeLog(clocks)};
         store.Attach(log, 12, Known(0, 12));
+        store.FlushNow(false);
         BOOST_CHECK_EQUAL(log->Lookup(Known(0, 20)).size(), 12U);
         for (const auto& candle : log->Candles(CandleInterval::H1, std::nullopt, 10).candles) BOOST_CHECK_LT(candle.last_sequence, 12U);
         store.Stop();
@@ -479,6 +556,8 @@ BOOST_AUTO_TEST_CASE(rows_beyond_store_head_dropped_and_mismatch_wipes)
     auto known{Known(0, 12)};
     known[5].second = EntryHash(5, 7);
     store.Attach(log, 12, known);
+    // Without the load, the checks below would pass without testing it.
+    store.FlushNow(false);
     BOOST_CHECK(log->Lookup(Known(0, 12)).empty());
     BOOST_CHECK(log->Candles(CandleInterval::M1, std::nullopt, 10).candles.empty());
     BOOST_CHECK(!log->GetSummary().recorded_since);
@@ -642,6 +721,7 @@ BOOST_AUTO_TEST_CASE(stored_times_past_the_display_bound_are_never_loaded)
     BOOST_REQUIRE(store.Open(error));
     const auto log{MakeLog(clocks)};
     store.Attach(log, 3, Known(0, 3));
+    store.FlushNow(false);
     // The row at the bound is not read back, and none of those candles is.
     BOOST_CHECK_EQUAL(log->Lookup(Known(0, 3)).size(), 2U);
     const auto page{log->Candles(CandleInterval::M1, std::nullopt, 500)};
@@ -674,6 +754,326 @@ BOOST_AUTO_TEST_CASE(stored_keys_past_the_display_bound_end_the_disk_scan)
     older = true;
     BOOST_CHECK(store.ReadCandles(OTHER_MARKET, CandleInterval::M1, 0, flowmesh::OBSERVED_MS_LIMIT, 500, &older).empty());
     BOOST_CHECK(!older);
+}
+
+// A market start only queues its history: Attach never waits for the flush
+// thread, even while that thread is stuck inside its disk write, and a
+// candles read meanwhile answers at once. The queued market then records,
+// is persisted and reloads.
+BOOST_AUTO_TEST_CASE(attach_never_waits_for_a_stalled_flush)
+{
+    const auto path{m_path_root / "observed_attach_stall"};
+    FakeClocks clocks;
+    std::string error;
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        BOOST_REQUIRE(store.Open(error));
+        const auto busy{MakeLog(clocks)};
+        store.Attach(busy, 0, {});
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool entered{false}, release{false};
+        store.SetFlushHookForTest([&] {
+            std::unique_lock lock{mutex};
+            entered = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release; });
+        });
+        busy->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0));
+        store.Start();
+        {
+            std::unique_lock lock{mutex};
+            BOOST_REQUIRE(cv.wait_for(lock, std::chrono::seconds{10}, [&] { return entered; }));
+        }
+        // The flush thread holds its pass inside the disk write.
+        const auto starting{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, OTHER_MARKET, clocks.Get())};
+        auto attach{std::async(std::launch::async, [&] { store.Attach(starting, 0, {}); })};
+        const bool attached{attach.wait_for(std::chrono::seconds{2}) == std::future_status::ready};
+        // A candles read of either market (the queued one's load waits for
+        // that stalled disk) answers at once too.
+        auto read{std::async(std::launch::async, [&] {
+            (void)store.ReadCandles(OTHER_MARKET, CandleInterval::M1, 0, T0 + 3'600'000, 10);
+            return store.ReadCandles(MARKET, CandleInterval::M1, 0, T0 + 3'600'000, 10);
+        })};
+        const bool read_done{read.wait_for(std::chrono::seconds{2}) == std::future_status::ready};
+        {
+            std::lock_guard lock{mutex};
+            release = true;
+        }
+        cv.notify_all();
+        attach.get();
+        (void)read.get();
+        BOOST_CHECK_MESSAGE(attached, "Attach waited for the flush thread's disk write");
+        BOOST_CHECK_MESSAGE(read_done, "a candles read waited for the flush thread's disk write");
+        // Stamps are final once the queued load ran (serialized with the
+        // flush thread's passes).
+        store.FlushNow(false);
+        BOOST_CHECK(starting->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0)).mode == ObservedMode::LIVE);
+        store.SetFlushHookForTest({});
+        store.Stop();
+        BOOST_CHECK(starting->GetSummary().persisted);
+    }
+    FlowMeshObservedTimeStore reopened{Options(path)};
+    BOOST_REQUIRE(reopened.Open(error));
+    const auto reloaded{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, OTHER_MARKET, clocks.Get())};
+    reopened.Attach(reloaded, 1, {{0, EntryHash(0)}});
+    reopened.FlushNow(false);
+    BOOST_CHECK_EQUAL(reloaded->Lookup({{0, EntryHash(0)}}).size(), 1U);
+    reopened.Stop();
+}
+
+// Whenever the queued load runs (before the first new entry, after one, a
+// few, or all of them), the store ends exactly as when the history loaded
+// first: the same stamps, recorded_since, memory candles, stored candles
+// and reloaded stamps and candles. With the clock an hour behind the
+// stored stamps, new entries stay untimed until it passes them, as before.
+BOOST_AUTO_TEST_CASE(a_queued_load_equals_the_synchronous_load_whenever_it_runs)
+{
+    for (const int64_t back : {int64_t{0}, int64_t{3'600'000}}) {
+        const auto reference{RunWithLoadAt(m_path_root / fs::PathFromString("observed_equiv_ref_" + std::to_string(back)), std::nullopt, back)};
+        BOOST_REQUIRE_EQUAL(reference.rows.size(), 40U + 85U);
+        for (const size_t at : {size_t{0}, size_t{1}, size_t{7}, size_t{13}, size_t{85}}) {
+            const auto name{"back " + std::to_string(back) + ", load at " + std::to_string(at)};
+            const auto run{RunWithLoadAt(m_path_root / fs::PathFromString("observed_equiv_" + std::to_string(back) + "_" + std::to_string(at)), at, back)};
+            BOOST_CHECK_MESSAGE(run.rows == reference.rows, name << ": stamps differ (" << run.rows.size() << " vs " << reference.rows.size() << ")");
+            BOOST_CHECK_MESSAGE(run.recorded_since == reference.recorded_since, name << ": recorded_since differs");
+            BOOST_CHECK_MESSAGE(run.memory == reference.memory, name << ": memory candles differ");
+            BOOST_CHECK_MESSAGE(run.disk == reference.disk, name << ": stored candles differ");
+            BOOST_CHECK_MESSAGE(run.reloaded_rows == reference.reloaded_rows, name << ": reloaded stamps differ");
+            BOOST_CHECK_MESSAGE(run.reloaded == reference.reloaded, name << ": reloaded candles differ");
+        }
+    }
+}
+
+// More than RING entries commit before a slow load runs (the slow-disk case
+// the queue exists for). The oldest is a gap, counted as not persisted, and
+// the stored day and hour buckets keep the reloaded entries: they are
+// continued, never replaced by a candle of new entries only.
+BOOST_AUTO_TEST_CASE(more_entries_than_the_ring_before_a_load_never_replace_a_stored_bucket)
+{
+    const auto path{m_path_root / "observed_ring_overflow"};
+    FakeClocks clocks;
+    Populate(path, clocks, 28, 10'000);
+    const uint64_t extra{FlowMeshObservedTimeLog::RING + 1};
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        store.Attach(log, 28, Known(0, 28));
+        for (uint64_t i{28}; i < 28 + extra; ++i) {
+            clocks.Advance(10);
+            log->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i, 200));
+        }
+        store.FlushNow(false);
+        clocks.Advance(10);
+        log->Record(28 + extra, EntryHash(28 + extra), ObservedDelay::NONE, Tick(28 + extra, 200));
+        BOOST_CHECK(log->Lookup(Known(28, 29)).empty());
+        BOOST_CHECK_GE(log->GetSummary().rows_not_persisted, 1U);
+        for (const auto interval : {CandleInterval::D1, CandleInterval::H1}) {
+            const auto memory{log->Candles(interval, std::nullopt, 10).candles};
+            BOOST_REQUIRE(!memory.empty());
+            BOOST_CHECK_MESSAGE(memory.back().first_sequence == 0, "memory " << flowmesh::CandleIntervalName(interval)
+                                                                             << " candle lost the reloaded entries: first_sequence="
+                                                                             << memory.back().first_sequence);
+        }
+        store.Stop();
+        for (const auto interval : {CandleInterval::D1, CandleInterval::H1}) {
+            const auto disk{store.ReadCandles(MARKET, interval, 0, T0 + 86'400'000, 10)};
+            BOOST_REQUIRE(!disk.empty());
+            BOOST_CHECK_MESSAGE(disk.back().first_sequence == 0, "stored " << flowmesh::CandleIntervalName(interval)
+                                                                           << " candle replaced by new entries only: first_sequence="
+                                                                           << disk.back().first_sequence << " entries=" << disk.back().entries);
+        }
+    }
+    // The dropped entry is a gap on disk; the next one is stored.
+    CDBWrapper db{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+    BOOST_CHECK(db.Exists(RawRowKey{'r', MARKET, 27}));
+    BOOST_CHECK(!db.Exists(RawRowKey{'r', MARKET, 28}));
+    BOOST_CHECK(db.Exists(RawRowKey{'r', MARKET, 29}));
+}
+
+// Until the queued load ran, every read of the market is unavailable, never
+// an available page lacking the history (a reader would hold it as the
+// whole window): the log says why, and the store serves no disk candle.
+BOOST_AUTO_TEST_CASE(reads_while_the_history_loads_are_unavailable_never_partial)
+{
+    const auto path{m_path_root / "observed_loading_reads"};
+    FakeClocks clocks;
+    Populate(path, clocks, 30, 10'000);
+    FlowMeshObservedTimeStore store{Options(path)};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 30, Known(0, 30));
+    clocks.Advance(5'000);
+    log->Record(30, EntryHash(30), ObservedDelay::NONE, Tick(30));
+    const auto summary{log->GetSummary()};
+    BOOST_CHECK(summary.loading);
+    BOOST_CHECK(!summary.recorded_since);
+    const auto page{log->Candles(CandleInterval::M1, std::nullopt, 300)};
+    BOOST_CHECK(!page.available);
+    BOOST_CHECK_EQUAL(page.unavailable_reason, FlowMeshObservedTimeLog::LOADING_REASON);
+    BOOST_CHECK(page.candles.empty());
+    BOOST_CHECK(log->Lookup(Known(0, 31)).empty());
+    bool older{true};
+    BOOST_CHECK(store.ReadCandles(MARKET, CandleInterval::M1, 0, T0 + 3'600'000, 100, &older).empty());
+    BOOST_CHECK(!older);
+    // The market-data section (RPC, HTTPS and the client snapshot) says so.
+    flowmesh::MarketData data;
+    data.history.entries.push_back({});
+    data.history.entries.back().sequence = 3;
+    data.history.entries.back().microblock_hash = EntryHash(3);
+    node::FillObservedTimes(data, log.get());
+    BOOST_REQUIRE(data.observed);
+    BOOST_CHECK(!data.observed->available);
+    BOOST_CHECK_EQUAL(data.observed->unavailable_reason, FlowMeshObservedTimeLog::LOADING_REASON);
+    BOOST_CHECK(!data.observed->recorded_since_sequence);
+    BOOST_CHECK(data.observed->rows.empty());
+    store.FlushNow(false);
+    BOOST_CHECK(!log->GetSummary().loading);
+    data.observed.reset();
+    node::FillObservedTimes(data, log.get());
+    BOOST_REQUIRE(data.observed);
+    BOOST_CHECK(data.observed->available);
+    BOOST_CHECK_EQUAL(data.observed->recorded_since_sequence.value_or(99), 0U);
+    BOOST_REQUIRE_EQUAL(data.observed->rows.size(), 1U);
+    BOOST_CHECK_EQUAL(data.observed->rows.front().sequence, 3U);
+    BOOST_CHECK_EQUAL(log->Lookup(Known(0, 31)).size(), 31U);
+    BOOST_CHECK_EQUAL(log->GetSummary().recorded_since.value_or(99), 0U);
+    const auto loaded{log->Candles(CandleInterval::M1, std::nullopt, 300)};
+    BOOST_REQUIRE(loaded.available);
+    BOOST_REQUIRE(!loaded.candles.empty());
+    BOOST_CHECK_EQUAL(loaded.candles.front().first_sequence, 0U);
+    BOOST_CHECK_EQUAL(loaded.candles.back().last_sequence, 30U);
+    BOOST_CHECK(!store.ReadCandles(MARKET, CandleInterval::M1, 0, T0 + 3'600'000, 100).empty());
+    store.Stop();
+}
+
+// The wall clock stands an hour behind the stored stamps after a restart and
+// entries commit before the queued load runs. They stay untimed until the
+// clock passes the reloaded stamps, as if loaded first: after the next
+// restart no LIVE stamp precedes an older one (remote clients would flag it
+// implausible).
+BOOST_AUTO_TEST_CASE(a_backward_clock_across_a_restart_keeps_stamps_monotonic_whenever_the_load_runs)
+{
+    const auto path{m_path_root / "observed_backward_restart"};
+    FakeClocks clocks;
+    Populate(path, clocks, 30, 10'000);
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        store.Attach(log, 30, Known(0, 30));
+        clocks.wall -= 3'600'000;
+        for (uint64_t i{30}; i < 32; ++i) {
+            clocks.Advance(1'000);
+            log->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i));
+        }
+        store.FlushNow(false);
+        for (const auto& row : log->Lookup(Known(30, 32))) BOOST_CHECK(row.mode == ObservedMode::UNTIMED);
+        store.Stop();
+    }
+    FlowMeshObservedTimeStore store{Options(path)};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 32, Known(0, 32));
+    store.FlushNow(false);
+    const auto rows{log->Lookup(Known(0, 32))};
+    BOOST_CHECK_EQUAL(rows.size(), 32U);
+    std::optional<int64_t> live;
+    bool monotonic{true};
+    for (const auto& row : rows) {
+        if (row.mode != ObservedMode::LIVE) continue;
+        if (live && row.ms < *live) monotonic = false;
+        live = row.ms;
+    }
+    BOOST_CHECK_MESSAGE(monotonic, "a LIVE stamp precedes an older one after the restart");
+    store.Stop();
+}
+
+// A queued history that contradicts the production store is wiped by its
+// load: none of it is served before (the load may still wipe it) or after.
+BOOST_AUTO_TEST_CASE(a_queued_contradicted_history_is_never_served_then_wiped)
+{
+    const auto path{m_path_root / "observed_queued_wipe"};
+    FakeClocks clocks;
+    Populate(path, clocks, 30, 10'000);
+    FlowMeshObservedTimeStore store{Options(path)};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    auto known{Known(0, 30)};
+    known[3].second = EntryHash(3, 9);
+    store.Attach(log, 30, known);
+    BOOST_CHECK(store.ReadCandles(MARKET, CandleInterval::M1, 0, T0 + 3'600'000, 100).empty());
+    BOOST_CHECK(!log->Candles(CandleInterval::M1, std::nullopt, 100).available);
+    store.FlushNow(false);
+    BOOST_CHECK(store.ReadCandles(MARKET, CandleInterval::M1, 0, T0 + 3'600'000, 100).empty());
+    BOOST_CHECK(log->Lookup(Known(0, 30)).empty());
+    BOOST_CHECK(log->Candles(CandleInterval::M1, std::nullopt, 100).candles.empty());
+    BOOST_CHECK(!log->GetSummary().recorded_since);
+    store.Stop();
+}
+
+// Markets attached from several threads while entries are recorded, disk
+// candles read and the flush thread runs every millisecond: every market
+// loads, records every entry and is persisted.
+BOOST_AUTO_TEST_CASE(concurrent_attach_record_read_and_flush_stress)
+{
+    FakeClocks clocks;
+    FlowMeshObservedTimeStore::Options options{Options(m_path_root / "observed_stress")};
+    options.flush_interval = std::chrono::milliseconds{1};
+    FlowMeshObservedTimeStore store{options};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    store.Start();
+    std::vector<std::shared_ptr<FlowMeshObservedTimeLog>> logs(32);
+    std::atomic<size_t> attached{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> attachers;
+    for (size_t t{0}; t < 4; ++t) {
+        attachers.emplace_back([&, t] {
+            for (size_t i{t}; i < logs.size(); i += 4) {
+                uint256 id;
+                id.data()[0] = static_cast<unsigned char>(0x80 + i);
+                logs[i] = std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, id, clocks.Get());
+                store.Attach(logs[i], 0, {});
+                ++attached;
+                // Paces the attachers only; every check follows Stop.
+                std::this_thread::sleep_for(std::chrono::microseconds{300});
+            }
+        });
+    }
+    std::thread reader{[&] {
+        while (!stop) {
+            for (unsigned char b{0x80}; b < 0xa0; ++b) {
+                uint256 id;
+                id.data()[0] = b;
+                (void)store.ReadCandles(id, CandleInterval::M1, 0, T0 + 86'400'000, 50);
+            }
+        }
+    }};
+    for (auto& t : attachers) t.join();
+    for (uint64_t sequence{0}; sequence < 300; ++sequence) {
+        clocks.Advance(1'000);
+        for (auto& log : logs) log->Record(sequence, EntryHash(sequence), ObservedDelay::NONE, Tick(sequence));
+    }
+    stop = true;
+    reader.join();
+    store.Stop();
+    BOOST_CHECK_EQUAL(attached.load(), logs.size());
+    for (auto& log : logs) {
+        const auto summary{log->GetSummary()};
+        BOOST_CHECK(!summary.loading);
+        BOOST_CHECK(summary.persisted);
+        BOOST_CHECK_EQUAL(log->Lookup(Known(0, 300)).size(), 300U);
+    }
+    uint256 first;
+    first.data()[0] = 0x80;
+    BOOST_CHECK(!store.ReadCandles(first, CandleInterval::M1, 0, T0 + 86'400'000, 50).empty());
 }
 
 // A log given its history after entries were recorded ends exactly as one

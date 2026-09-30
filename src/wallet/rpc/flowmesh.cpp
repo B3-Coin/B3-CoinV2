@@ -1292,7 +1292,7 @@ RPCHelpMan getflowmeshmarketdata()
             {T::OBJ, "book_levels", /*optional=*/true, "Present only when levels was given and the head changed (or include_unchanged). NOT certified: price levels this node aggregated from every verified standing curve; actions not yet certified are excluded. Not a price-time order book: each level is the quantity of standing curves whose own limit lies in its price range", BookLevelsResultFields()},
             {T::OBJ, "observed_time", /*optional=*/true, "Present only when observed_time was true: operator-observed time, when the source applied each entry by its own clock; never certified execution time", {
                 {T::BOOL, "available", "The source records observed times"},
-                {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, endpoint_does_not_advertise_observed_time, observed_time_withdrawn or malformed"},
+                {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, observed_time_loading (the market's history is still loading after a start; retry), endpoint_does_not_advertise_observed_time, observed_time_withdrawn or malformed"},
                 {T::STR, "source", "this_node, or the endpoint URL that reported them"},
                 {T::STR, "source_kind", "operator_observed"},
                 {T::BOOL, "certified", "Always false"},
@@ -1494,7 +1494,7 @@ RPCHelpMan getflowmeshcandles()
                               "this client verified are held back (it is never refreshed for this page) and before_ms then ends before them; the "
                               "newest bucket shown may be this client's earlier view of the first one held back. A market-data read moves that head", {
             {T::BOOL, "available", "The source records observed time"},
-            {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, endpoint_does_not_advertise_candles, or why the endpoint's page was refused"},
+            {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, observed_time_loading (the market's history is still loading after a start; retry), endpoint_does_not_advertise_candles, or why the endpoint's page was refused"},
             {T::STR, "source", "this_node, or the endpoint URL that reported them"},
             {T::STR, "source_kind", "operator_observed"},
             {T::BOOL, "certified", "Always false"},

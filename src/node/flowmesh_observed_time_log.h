@@ -191,6 +191,11 @@ private:
  * <flowmeshdatadir>/observed_time, outside every production store (whose
  * fail-closed checks it can never affect). Keys are market-prefixed.
  *
+ * Nothing on a caller's thread waits for its disk: Attach only queues a
+ * market, and the flush thread loads (reads, erases, wipes) each queued
+ * market before it writes any row of it. Its mutex is held only for
+ * in-memory bookkeeping, never across disk work.
+ *
  * Only its own flush thread writes it: at most once per interval, unsynced,
  * one batch per market (rows and candles together, so a crash loses a
  * consistent tail), and synced once at Stop. It is never written by the
@@ -220,11 +225,15 @@ public:
     //! memory-only logs) only when even that fails. Never throws.
     bool Open(std::string& error);
     bool IsOpen() const;
-    /** Loads `log`'s retained rows and candles and flushes it from now on.
-     * Rows at or after `store_next_sequence` (never certified here) are
+    /** Queues `log` (a fresh one) and returns at once: no disk access and
+     * no wait for a flush. The flush thread then loads its retained rows
+     * and candles before it writes any row of it, and flushes it from then
+     * on. Rows at or after `store_next_sequence` (never certified here) are
      * erased; a row whose hash differs from `known` (sequence, hash) of the
      * production store wipes the market's times; so does a meta record of
-     * another domain. Never throws. */
+     * another domain. Until the load ends, the log's reads are unavailable
+     * (FlowMeshObservedTimeLog::LOADING_REASON) and ReadCandles serves none
+     * of the market's disk candles. Never throws. */
     void Attach(const std::shared_ptr<FlowMeshObservedTimeLog>& log, uint64_t store_next_sequence,
                 const std::vector<std::pair<uint64_t, uint256>>& known) noexcept;
     void Start();
@@ -234,19 +243,34 @@ public:
     void FlushNow(bool sync) noexcept;
     //! Disk candles of one market with open in [from_ms, before_ms), at most
     //! `limit`, ascending; `older` is set when one exists before from_ms.
-    //! Never holds the store mutex across the read.
+    //! None while that market's load is queued. Never holds the store mutex
+    //! across the read.
     std::vector<flowmesh::ObservedCandle> ReadCandles(const flowmesh::MarketId& market, flowmesh::CandleInterval interval,
                                                       int64_t from_ms, int64_t before_ms, size_t limit, bool* older = nullptr) const;
     //! Tests only: runs inside every flush, before its batch is written.
     void SetFlushHookForTest(std::function<void()> hook);
 
 private:
+    //! What Attach queues for the flush thread.
+    struct LoadJob {
+        uint64_t store_next_sequence{0};
+        std::vector<std::pair<uint64_t, uint256>> known;
+    };
     struct Attached {
         std::shared_ptr<FlowMeshObservedTimeLog> log;
+        //! These three belong to the holder of m_flush_mutex once the item
+        //! is published.
         std::optional<uint64_t> oldest_row;
         std::chrono::steady_clock::time_point next_sweep{};
+        std::optional<LoadJob> load;
+        //! Under m_mutex: set until the load's disk work is done, and no
+        //! disk candle of the market is served meanwhile.
+        bool loading{false};
     };
     void FlushLoop();
+    //! One queued load (the body Attach ran before queueing). Caller holds
+    //! m_flush_mutex.
+    void RunLoad(Attached& item, CDBWrapper* db) noexcept;
     //! Caller holds m_flush_mutex.
     static void WipeMarket(CDBWrapper& db, const flowmesh::MarketId& market);
 
@@ -255,10 +279,14 @@ private:
     //! only with the store, so a reader may use it after dropping m_mutex.
     std::unique_ptr<CDBWrapper> m_db;
     mutable std::mutex m_mutex;
-    //! A list: a flush pass keeps pointers to its items across the pass.
+    //! A list: a flush pass keeps pointers to its items across the pass
+    //! while Attach appends.
     std::list<Attached> m_attached;
     std::function<void()> m_hook;
-    //! Serializes Open and flush passes (the thread's and Stop's).
+    //! A load is queued (wakes the flush thread).
+    bool m_load_requested{false};
+    //! Serializes Open, loads and flush passes (the thread's and Stop's).
+    //! Never taken by Attach or ReadCandles.
     std::mutex m_flush_mutex;
     std::condition_variable m_cv;
     bool m_stopping{false};

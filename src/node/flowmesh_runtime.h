@@ -296,7 +296,9 @@ struct FlowMeshRuntimeMarketConfig {
 
 /** Sets `out.observed` from `log` (null: not recorded by this node): the
  * stamps of the head and of exactly the reply's history and tick entries
- * whose hash matches. Display only; call outside the runtime's locks. */
+ * whose hash matches; unavailable while the log's history loads
+ * (FlowMeshObservedTimeLog::LOADING_REASON). Display only; call outside the
+ * runtime's locks. */
 void FillObservedTimes(flowmesh::MarketData& out, const FlowMeshObservedTimeLog* log);
 
 struct FlowMeshRuntimeConfig {

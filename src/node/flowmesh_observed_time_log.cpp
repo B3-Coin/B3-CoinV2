@@ -488,25 +488,59 @@ void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTim
 {
     if (!log) return;
     try {
-        std::lock_guard flush{m_flush_mutex};
-        std::lock_guard lock{m_mutex};
-        Attached attached{log, std::nullopt, {}};
-        if (!m_db) {
-            log->SetPersisted(false);
-            m_attached.push_back(std::move(attached));
+        // Queued only: the caller (a market start inside the B3
+        // reconciliation gate) never waits for this database or a flush.
+        log->BeginLoad();
+        {
+            std::lock_guard lock{m_mutex};
+            m_attached.push_back(Attached{log, std::nullopt, {}, LoadJob{store_next_sequence, known}, true});
+            m_load_requested = true;
+        }
+        m_cv.notify_all();
+    } catch (...) {
+        log->FinishLoad({}, {}, std::nullopt);
+        log->SetPersisted(false);
+    }
+}
+
+void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db) noexcept
+{
+    // Caller holds m_flush_mutex.
+    auto& log{*item.log};
+    // Set once the disk holds only what may be served (the erasures and
+    // wipes below are done), before the log serves its history: a reader
+    // that finds the log loaded never finds its disk candles withheld.
+    const auto disk_settled = [&]() noexcept {
+        try {
+            std::lock_guard lock{m_mutex};
+            item.loading = false;
+        } catch (...) {
+        }
+    };
+    bool finished{false};
+    try {
+        const LoadJob job{std::move(*item.load)};
+        item.load.reset();
+        const uint64_t store_next_sequence{job.store_next_sequence};
+        const auto& known{job.known};
+        if (!db) {
+            disk_settled();
+            finished = true;
+            log.FinishLoad({}, {}, std::nullopt);
+            log.SetPersisted(false);
             return;
         }
-        const uint256 market{log->MarketId()};
+        const uint256 market{log.MarketId()};
         try {
             MetaValue meta;
-            const bool has_meta{m_db->Read(MetaKey{KEY_META, market}, meta)};
-            if (has_meta && (meta.version != META_VERSION || meta.domain != log->Domain())) {
-                WipeMarket(*m_db, market);
+            const bool has_meta{db->Read(MetaKey{KEY_META, market}, meta)};
+            if (has_meta && (meta.version != META_VERSION || meta.domain != log.Domain())) {
+                WipeMarket(*db, market);
             }
-            m_db->Write(MetaKey{KEY_META, market}, MetaValue{META_VERSION, log->Domain()}, true);
+            db->Write(MetaKey{KEY_META, market}, MetaValue{META_VERSION, log.Domain()}, true);
             // Rows the production store never certified here are erased.
-            std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
-            CDBBatch erase{*m_db};
+            std::unique_ptr<CDBIterator> it{db->NewIterator()};
+            CDBBatch erase{*db};
             bool erased{false};
             for (it->Seek(RowKey{KEY_ROW, market, store_next_sequence}); it->Valid(); it->Next()) {
                 RowKey key;
@@ -514,7 +548,7 @@ void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTim
                 erase.Erase(key);
                 erased = true;
             }
-            if (erased) m_db->WriteBatch(erase, true);
+            if (erased) db->WriteBatch(erase, true);
             // The newest retained rows; a hash the store contradicts wipes.
             const uint64_t from{store_next_sequence > FlowMeshObservedTimeLog::RING ? store_next_sequence - FlowMeshObservedTimeLog::RING : 0};
             std::vector<flowmesh::ObservedStamp> rows;
@@ -534,13 +568,13 @@ void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTim
                 rows.push_back(*stamp);
             }
             if (mismatch) {
-                WipeMarket(*m_db, market);
+                WipeMarket(*db, market);
                 rows.clear();
             }
             it->Seek(RowKey{KEY_ROW, market, 0});
             if (it->Valid()) {
                 RowKey key;
-                if (it->GetKey(key) && key.prefix == KEY_ROW && key.market == market) attached.oldest_row = key.sequence;
+                if (it->GetKey(key) && key.prefix == KEY_ROW && key.market == market) item.oldest_row = key.sequence;
             }
             // The memory window of every interval, ending at the newest time.
             std::optional<int64_t> newest;
@@ -566,19 +600,26 @@ void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTim
                     out.push_back(*candle);
                 }
             }
-            const auto recorded_since{mismatch ? std::nullopt : attached.oldest_row};
-            if (mismatch) attached.oldest_row.reset();
-            log->Load(std::move(rows), std::move(candles), recorded_since);
-            log->SetPersisted(true);
+            const auto recorded_since{mismatch ? std::nullopt : item.oldest_row};
+            if (mismatch) item.oldest_row.reset();
+            it.reset();
+            disk_settled();
+            finished = true;
+            log.FinishLoad(std::move(rows), std::move(candles), recorded_since);
+            log.SetPersisted(true);
         } catch (const std::exception& e) {
             LogWarning("FlowMesh market %s: observed times could not be read (%s); recording starts empty\n",
                        market.GetHex(), e.what());
-            log->Load({}, {}, std::nullopt);
-            log->SetPersisted(false);
+            disk_settled();
+            finished = true;
+            log.FinishLoad({}, {}, std::nullopt);
+            log.SetPersisted(false);
         }
-        m_attached.push_back(std::move(attached));
     } catch (...) {
-        log->SetPersisted(false);
+        item.load.reset();
+        disk_settled();
+        if (!finished) log.FinishLoad({}, {}, std::nullopt);
+        log.SetPersisted(false);
     }
 }
 
@@ -598,7 +639,8 @@ void FlowMeshObservedTimeStore::Stop()
     }
     m_cv.notify_all();
     if (m_thread.joinable()) m_thread.join();
-    // Every runtime writer has stopped before the service calls this.
+    // Every runtime writer has stopped before the service calls this. A
+    // market still queued is loaded (and erased) before its rows are written.
     FlushNow(/*sync=*/true);
 }
 
@@ -607,7 +649,8 @@ void FlowMeshObservedTimeStore::FlushLoop()
     util::ThreadRename("flowmesh-obstime");
     std::unique_lock lock{m_mutex};
     while (!m_stopping) {
-        m_cv.wait_for(lock, m_options.flush_interval, [&] { return m_stopping; });
+        // A queued market is loaded at once, not after the interval.
+        m_cv.wait_for(lock, m_options.flush_interval, [&] { return m_stopping || m_load_requested; });
         if (m_stopping) break;
         lock.unlock();
         FlushNow(/*sync=*/false);
@@ -627,6 +670,12 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
             for (auto& item : m_attached) attached.push_back(&item);
             hook = m_hook;
             db = m_db.get();
+            m_load_requested = false;
+        }
+        // Queued markets first, on this thread: a market's erasures and
+        // wipes always reach the disk before any of its new rows.
+        for (auto* item : attached) {
+            if (item->load) RunLoad(*item, db);
         }
         const auto now{std::chrono::steady_clock::now()};
         for (auto* item : attached) {
@@ -703,6 +752,11 @@ std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(con
         CDBWrapper* db{nullptr};
         {
             std::lock_guard lock{m_mutex};
+            // A queued market's disk may still hold rows and candles its
+            // load will erase or wipe: none is served until then (a gap).
+            for (const auto& item : m_attached) {
+                if (item.loading && item.log->MarketId() == market) return out;
+            }
             db = m_db.get();
         }
         // Read without m_mutex: the database outlives every reader (it is
