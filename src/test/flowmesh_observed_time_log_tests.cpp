@@ -280,6 +280,17 @@ BOOST_AUTO_TEST_CASE(rows_beyond_store_head_dropped_and_mismatch_wipes)
         store.Attach(log, 12, Known(0, 12));
         BOOST_CHECK_EQUAL(log->Lookup(Known(0, 20)).size(), 12U);
         for (const auto& candle : log->Candles(CandleInterval::H1, std::nullopt, 10).candles) BOOST_CHECK_LT(candle.last_sequence, 12U);
+        // Memory filtering alone is insufficient: the persisted bucket
+        // originally held sequence 19, and older-page reads use the DB.
+        bool older{true};
+        const auto disk{store.ReadCandles(MARKET, CandleInterval::H1, T0, T0 + 3'600'000, 10, &older)};
+        BOOST_CHECK(disk.empty());
+        BOOST_CHECK(!older);
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            for (const auto& candle : store.ReadCandles(MARKET, interval, 0, T0 + 86'400'000, 100)) {
+                BOOST_CHECK_LT(candle.last_sequence, 12U);
+            }
+        }
         store.Stop();
     }
     FlowMeshObservedTimeStore store{Options(path)};
@@ -332,6 +343,29 @@ BOOST_AUTO_TEST_CASE(flush_failure_sets_persisted_false)
     BOOST_CHECK(log->GetSummary().persisted);
 }
 
+BOOST_AUTO_TEST_CASE(stop_syncs_an_already_flushed_tail)
+{
+    FakeClocks clocks;
+    FlowMeshObservedTimeStore store{Options(m_path_root / "observed_final_sync")};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 0, {});
+    log->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0));
+    store.FlushNow(false);
+    BOOST_CHECK(log->TakePending().Empty());
+    unsigned writes{0};
+    store.SetFlushHookForTest([&] { ++writes; });
+    store.Stop();
+    BOOST_CHECK_EQUAL(writes, 1U);
+    BOOST_CHECK(log->GetSummary().persisted);
+    // A failure of that final sync is visible even with no new rows.
+    store.SetFlushHookForTest([] { throw std::runtime_error{"sync"}; });
+    store.Stop();
+    BOOST_CHECK(!log->GetSummary().persisted);
+    store.SetFlushHookForTest({});
+}
+
 BOOST_AUTO_TEST_CASE(blocked_flush_never_blocks_record_or_reads)
 {
     FakeClocks clocks;
@@ -372,6 +406,99 @@ BOOST_AUTO_TEST_CASE(blocked_flush_never_blocks_record_or_reads)
     store.SetFlushHookForTest({});
     store.Stop();
     BOOST_CHECK(log->GetSummary().persisted);
+}
+
+BOOST_AUTO_TEST_CASE(async_attach_during_blocked_flush_preserves_new_rows)
+{
+    const auto path{m_path_root / "observed_async_attach"};
+    const flowmesh::MarketId second_market{uint256{"00000000000000000000000000000000000000000000000000000000000000e2"}};
+    FakeClocks clocks;
+    // A previous process retained one historical row for the new market.
+    {
+        FlowMeshObservedTimeStore seed{Options(path)};
+        std::string error;
+        BOOST_REQUIRE(seed.Open(error));
+        const auto history{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, second_market, clocks.Get())};
+        seed.Attach(history, 0, {});
+        history->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0));
+        seed.Stop();
+    }
+    FlowMeshObservedTimeStore store{Options(path)};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 0, {});
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered{false}, release{false};
+    store.SetFlushHookForTest([&] {
+        std::unique_lock lock{mutex};
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+    });
+    log->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0));
+    store.Start();
+    {
+        std::unique_lock lock{mutex};
+        BOOST_REQUIRE(cv.wait_for(lock, std::chrono::seconds{10}, [&] { return entered; }));
+    }
+    const auto fresh{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, second_market, clocks.Get())};
+    auto registration{std::async(std::launch::async, [&] { store.AttachAsync(fresh, 1, Known(0, 1)); })};
+    const bool registered{registration.wait_for(std::chrono::seconds{1}) == std::future_status::ready};
+    BOOST_CHECK(registered);
+    // A stalled old-market flush cannot prevent the new runtime recording.
+    clocks.Advance(61'000);
+    fresh->Record(1, EntryHash(1), ObservedDelay::NONE, Tick(1));
+    BOOST_CHECK_EQUAL(fresh->Lookup(Known(0, 2)).size(), 1U);
+    if (registered) {
+        BOOST_CHECK(!fresh->GetSummary().persisted);
+        BOOST_CHECK(store.ReadCandles(second_market, CandleInterval::M1, 0, T0 + 120'000, 100).empty());
+    }
+    {
+        std::lock_guard lock{mutex};
+        release = true;
+    }
+    cv.notify_all();
+    registration.get();
+    store.SetFlushHookForTest({});
+    // Stop also drains an attachment not yet serviced by the worker.
+    store.Stop();
+    const auto rows{fresh->Lookup(Known(0, 2))};
+    BOOST_REQUIRE_EQUAL(rows.size(), 1U);
+    BOOST_CHECK_EQUAL(rows.front().sequence, 1U);
+    BOOST_CHECK(fresh->GetSummary().persisted);
+    BOOST_CHECK(fresh->TakePending().Empty());
+    const auto disk{store.ReadCandles(second_market, CandleInterval::M1, T0, T0 + 120'000, 100)};
+    BOOST_REQUIRE_EQUAL(disk.size(), 2U);
+    BOOST_CHECK_EQUAL(disk.front().last_sequence, 0U);
+    BOOST_CHECK_EQUAL(disk.back().last_sequence, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(async_attachments_coalesce_per_market)
+{
+    FakeClocks clocks;
+    FlowMeshObservedTimeStore store{Options(m_path_root / "observed_async_coalesce")};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    std::vector<std::shared_ptr<FlowMeshObservedTimeLog>> logs;
+    for (CAmount price{10}; price < 20; ++price) {
+        const auto log{MakeLog(clocks)};
+        store.AttachAsync(log, 0, {});
+        log->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0, price));
+        logs.push_back(log);
+    }
+    unsigned writes{0};
+    store.SetFlushHookForTest([&] { ++writes; });
+    store.FlushNow(false);
+    // Ten queued replacements retain only the latest handle for this market.
+    BOOST_CHECK_EQUAL(writes, 1U);
+    const auto disk{store.ReadCandles(MARKET, CandleInterval::M1, T0, T0 + 60'000, 10)};
+    BOOST_REQUIRE_EQUAL(disk.size(), 1U);
+    BOOST_CHECK_EQUAL(disk.front().close, 19);
+    BOOST_CHECK(logs.back()->TakePending().Empty());
+    BOOST_CHECK(!logs.front()->TakePending().Empty());
+    store.SetFlushHookForTest({});
 }
 
 BOOST_AUTO_TEST_CASE(candle_page_json_exact_volumes_and_labels)

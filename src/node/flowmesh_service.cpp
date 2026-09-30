@@ -1644,9 +1644,9 @@ bool FlowMeshService::Impl::InstallMarket(
         return false;
     }
 
-    // Display-only observed times, loaded once the store has replayed: rows
-    // the store never certified are erased and a contradiction with its
-    // retained hashes clears them (never the store).
+    // Optional display history is registered in memory once replay finishes.
+    // Its own flush worker checks and loads disk history; market installation
+    // and the global reconciliation gate never wait for that database.
     std::shared_ptr<FlowMeshObservedTimeLog> observed;
     {
         std::lock_guard<std::mutex> lock{mutex};
@@ -1657,7 +1657,7 @@ bool FlowMeshService::Impl::InstallMarket(
         std::vector<std::pair<uint64_t, uint256>> known;
         const auto retained{store->ReadClearingTicks({std::nullopt, flowmesh::MARKET_DATA_MAX_TICKS})};
         for (const auto& tick : retained.ticks) known.emplace_back(tick.sequence, tick.microblock_hash);
-        observed_store->Attach(observed, marker->next_sequence, known);
+        observed_store->AttachAsync(observed, marker->next_sequence, std::move(known));
         std::lock_guard<std::mutex> lock{mutex};
         resources->observed = observed;
     }

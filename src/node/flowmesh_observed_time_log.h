@@ -99,10 +99,12 @@ public:
     Pending TakePending();
     void SetPersisted(bool persisted) noexcept { m_persisted.store(persisted, std::memory_order_relaxed); }
     //! Replaces memory with reloaded data. `rows` ascending (the newest are
-    //! kept), `candles` ascending per interval.
+    //! kept), `candles` ascending per interval. With preserve_recorded, a
+    //! background restore leaves every newly recorded row and pending write
+    //! intact; that process then starts its memory history at its first row.
     void Load(std::vector<flowmesh::ObservedStamp> rows,
               std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
-              std::optional<uint64_t> recorded_since);
+              std::optional<uint64_t> recorded_since, bool preserve_recorded = false);
 
 private:
     const uint256 m_domain;
@@ -159,13 +161,24 @@ public:
     bool IsOpen() const;
     /** Loads `log`'s retained rows and candles and flushes it from now on.
      * Rows at or after `store_next_sequence` (never certified here) are
-     * erased; a row whose hash differs from `known` (sequence, hash) of the
-     * production store wipes the market's times; so does a meta record of
-     * another domain. Never throws. */
+     * erased, together with every candle holding any such row; a row whose
+     * hash differs from `known` (sequence, hash) of the production store
+     * wipes the market's times; so does a meta record of another domain.
+     * Never throws. */
     void Attach(const std::shared_ptr<FlowMeshObservedTimeLog>& log, uint64_t store_next_sequence,
                 const std::vector<std::pair<uint64_t, uint256>>& known) noexcept;
+    //! Queues Attach's disk work on the existing optional flush worker.
+    //! Memory registration never waits for disk or a flush lock. A runtime
+    //! may record immediately; a delayed restore never overwrites those
+    //! rows. Registrations coalesce to the latest log per market, bounding
+    //! queued work by the attached market count. Disk pages stay unavailable
+    //! until the retained data is checked. Stop attempts each queued restore
+    //! once and drains pending writes; failed restores leave optional gaps.
+    void AttachAsync(const std::shared_ptr<FlowMeshObservedTimeLog>& log, uint64_t store_next_sequence,
+                     std::vector<std::pair<uint64_t, uint256>> known) noexcept;
     void Start();
-    //! Stops the flush thread, then flushes every log once, synced.
+    //! Stops the flush thread, writes every pending log, then syncs the
+    //! database even when previous unsynced passes left no pending rows.
     void Stop();
     //! One flush pass on the calling thread (the flush thread's body).
     void FlushNow(bool sync) noexcept;
@@ -177,23 +190,35 @@ public:
     void SetFlushHookForTest(std::function<void()> hook);
 
 private:
+    struct RestoreRequest {
+        uint64_t next_sequence{0};
+        std::vector<std::pair<uint64_t, uint256>> known;
+    };
     struct Attached {
         std::shared_ptr<FlowMeshObservedTimeLog> log;
         std::optional<uint64_t> oldest_row;
         std::chrono::steady_clock::time_point next_sweep{};
+        std::optional<RestoreRequest> restore;
+        std::chrono::steady_clock::time_point retry_restore{};
+        std::atomic<bool> restored{false};
     };
     void FlushLoop();
     void WipeMarket(const flowmesh::MarketId& market);
+    bool RestoreAttached(Attached& attached, bool preserve_recorded) noexcept;
+    //! Caller holds m_mutex; replacing a handle cannot invalidate a flush.
+    void RegisterAttached(std::shared_ptr<Attached> attached);
 
     const Options m_options;
     std::unique_ptr<CDBWrapper> m_db;
     mutable std::mutex m_mutex;
-    std::vector<Attached> m_attached;
+    //! Shared handles stay valid when a market is registered during disk I/O.
+    std::vector<std::shared_ptr<Attached>> m_attached;
     std::function<void()> m_hook;
     //! Serializes flush passes (the thread's and Stop's).
     std::mutex m_flush_mutex;
     std::condition_variable m_cv;
     bool m_stopping{false};
+    bool m_restore_queued{false};
     std::thread m_thread;
 };
 

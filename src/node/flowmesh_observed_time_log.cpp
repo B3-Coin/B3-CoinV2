@@ -266,11 +266,12 @@ FlowMeshObservedTimeLog::Pending FlowMeshObservedTimeLog::TakePending()
 
 void FlowMeshObservedTimeLog::Load(std::vector<flowmesh::ObservedStamp> rows,
                                    std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
-                                   const std::optional<uint64_t> recorded_since)
+                                   const std::optional<uint64_t> recorded_since, const bool preserve_recorded)
 {
     std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.sequence < b.sequence; });
     if (rows.size() > RING) rows.erase(rows.begin(), rows.end() - RING);
     std::lock_guard lock{m_mutex};
+    if (preserve_recorded && (!m_ring.empty() || !m_pending.Empty())) return;
     m_ring.assign(rows.begin(), rows.end());
     m_rollup = flowmesh::ObservedRollup{};
     for (const auto interval : flowmesh::CANDLE_INTERVALS) m_rollup.Restore(interval, std::move(candles[static_cast<size_t>(interval)]));
@@ -299,8 +300,10 @@ FlowMeshObservedTimeStore::~FlowMeshObservedTimeStore() { Stop(); }
 bool FlowMeshObservedTimeStore::Open(std::string& error)
 {
     std::lock_guard flush{m_flush_mutex};
-    std::lock_guard lock{m_mutex};
-    if (m_db) return true;
+    {
+        std::lock_guard lock{m_mutex};
+        if (m_db) return true;
+    }
     DBParams params{.path = m_options.path, .cache_bytes = m_options.cache_bytes, .memory_only = m_options.memory_only};
     for (const bool wipe : {false, true}) {
         try {
@@ -311,7 +314,10 @@ bool FlowMeshObservedTimeStore::Open(std::string& error)
             std::unique_ptr<CDBIterator> it{db->NewIterator()};
             it->SeekToFirst();
             if (!it->StatusOK()) throw dbwrapper_error{"unreadable observed-time database"};
-            m_db = std::move(db);
+            {
+                std::lock_guard lock{m_mutex};
+                m_db = std::move(db);
+            }
             if (wipe) LogWarning("FlowMesh observed-time database was unreadable and has been recreated empty\n");
             return true;
         } catch (const std::exception& e) {
@@ -330,7 +336,7 @@ bool FlowMeshObservedTimeStore::IsOpen() const
 
 void FlowMeshObservedTimeStore::WipeMarket(const flowmesh::MarketId& market)
 {
-    // Caller holds m_mutex and m_flush_mutex.
+    // Caller holds m_flush_mutex; never the registration mutex during I/O.
     CDBBatch batch{*m_db};
     size_t erased{0};
     std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
@@ -357,98 +363,152 @@ void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTim
 {
     if (!log) return;
     try {
+        auto attached{std::make_shared<Attached>()};
+        attached->log = log;
+        attached->restore = RestoreRequest{store_next_sequence, known};
         std::lock_guard flush{m_flush_mutex};
+        if (RestoreAttached(*attached, /*preserve_recorded=*/false)) attached->restore.reset();
         std::lock_guard lock{m_mutex};
-        Attached attached{log, std::nullopt, {}};
-        if (!m_db) {
-            log->SetPersisted(false);
-            m_attached.push_back(std::move(attached));
-            return;
-        }
-        const uint256 market{log->MarketId()};
-        try {
-            MetaValue meta;
-            const bool has_meta{m_db->Read(MetaKey{KEY_META, market}, meta)};
-            if (has_meta && (meta.version != META_VERSION || meta.domain != log->Domain())) {
-                WipeMarket(market);
-            }
-            m_db->Write(MetaKey{KEY_META, market}, MetaValue{META_VERSION, log->Domain()}, true);
-            // Rows the production store never certified here are erased.
-            std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
-            CDBBatch erase{*m_db};
-            bool erased{false};
-            for (it->Seek(RowKey{KEY_ROW, market, store_next_sequence}); it->Valid(); it->Next()) {
-                RowKey key;
-                if (!it->GetKey(key) || key.prefix != KEY_ROW || key.market != market) break;
-                erase.Erase(key);
-                erased = true;
-            }
-            if (erased) m_db->WriteBatch(erase, true);
-            // The newest retained rows; a hash the store contradicts wipes.
-            const uint64_t from{store_next_sequence > FlowMeshObservedTimeLog::RING ? store_next_sequence - FlowMeshObservedTimeLog::RING : 0};
-            std::vector<flowmesh::ObservedStamp> rows;
-            std::map<uint64_t, uint256> expected{known.begin(), known.end()};
-            bool mismatch{false};
-            for (it->Seek(RowKey{KEY_ROW, market, from}); it->Valid(); it->Next()) {
-                RowKey key;
-                if (!it->GetKey(key) || key.prefix != KEY_ROW || key.market != market || key.sequence >= store_next_sequence) break;
-                RowValue value;
-                if (!it->GetValue(value)) continue;
-                const auto stamp{FromRow(key.sequence, value)};
-                if (!stamp) continue;
-                if (const auto want{expected.find(key.sequence)}; want != expected.end() && want->second != stamp->hash) {
-                    mismatch = true;
-                    break;
-                }
-                rows.push_back(*stamp);
-            }
-            if (mismatch) {
-                WipeMarket(market);
-                rows.clear();
-            }
-            it->Seek(RowKey{KEY_ROW, market, 0});
-            if (it->Valid()) {
-                RowKey key;
-                if (it->GetKey(key) && key.prefix == KEY_ROW && key.market == market) attached.oldest_row = key.sequence;
-            }
-            // The memory window of every interval, ending at the newest time.
-            std::optional<int64_t> newest;
-            for (auto row{rows.rbegin()}; row != rows.rend() && !newest; ++row) {
-                if (row->mode != flowmesh::ObservedMode::UNTIMED) newest = row->ms;
-            }
-            std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles;
-            for (const auto interval : flowmesh::CANDLE_INTERVALS) {
-                if (!newest || mismatch) break;
-                const int64_t step{flowmesh::CandleIntervalMs(interval)};
-                const int64_t window{static_cast<int64_t>(flowmesh::CandleMemoryWindow(interval)) * step};
-                const int64_t start{std::max<int64_t>(0, flowmesh::CandleOpenMs(*newest, interval) - window)};
-                auto& out{candles[static_cast<size_t>(interval)]};
-                for (it->Seek(CandleKey{KEY_CANDLE, market, static_cast<uint8_t>(interval), static_cast<uint64_t>(start)}); it->Valid(); it->Next()) {
-                    CandleKey key;
-                    if (!it->GetKey(key) || key.prefix != KEY_CANDLE || key.market != market ||
-                        key.interval != static_cast<uint8_t>(interval)) break;
-                    CandleValue value;
-                    if (!it->GetValue(value)) continue;
-                    auto candle{FromValue(static_cast<int64_t>(key.open_ms), value)};
-                    // Never a candle holding an entry the store does not have.
-                    if (!candle || candle->last_sequence >= store_next_sequence) continue;
-                    out.push_back(*candle);
-                }
-            }
-            const auto recorded_since{mismatch ? std::nullopt : attached.oldest_row};
-            if (mismatch) attached.oldest_row.reset();
-            log->Load(std::move(rows), std::move(candles), recorded_since);
-            log->SetPersisted(true);
-        } catch (const std::exception& e) {
-            LogWarning("FlowMesh market %s: observed times could not be read (%s); recording starts empty\n",
-                       market.GetHex(), e.what());
-            log->Load({}, {}, std::nullopt);
-            log->SetPersisted(false);
-        }
-        m_attached.push_back(std::move(attached));
+        RegisterAttached(std::move(attached));
     } catch (...) {
         log->SetPersisted(false);
     }
+}
+
+void FlowMeshObservedTimeStore::AttachAsync(const std::shared_ptr<FlowMeshObservedTimeLog>& log, const uint64_t store_next_sequence,
+                                            std::vector<std::pair<uint64_t, uint256>> known) noexcept
+{
+    if (!log) return;
+    log->SetPersisted(false);
+    try {
+        auto attached{std::make_shared<Attached>()};
+        attached->log = log;
+        attached->restore = RestoreRequest{store_next_sequence, std::move(known)};
+        {
+            std::lock_guard lock{m_mutex};
+            RegisterAttached(std::move(attached));
+            m_restore_queued = true;
+        }
+        m_cv.notify_all();
+    } catch (...) {
+        log->SetPersisted(false);
+    }
+}
+
+void FlowMeshObservedTimeStore::RegisterAttached(std::shared_ptr<Attached> attached)
+{
+    const auto previous{std::find_if(m_attached.begin(), m_attached.end(), [&](const auto& item) {
+        return item->log->MarketId() == attached->log->MarketId();
+    })};
+    if (previous == m_attached.end()) m_attached.push_back(std::move(attached));
+    else *previous = std::move(attached);
+}
+
+bool FlowMeshObservedTimeStore::RestoreAttached(Attached& attached, const bool preserve_recorded) noexcept
+{
+    const auto& log{attached.log};
+    const uint256 market{log->MarketId()};
+    try {
+        const uint64_t store_next_sequence{attached.restore->next_sequence};
+        const auto& known{attached.restore->known};
+        if (!m_db) {
+            log->SetPersisted(false);
+            return false;
+        }
+        MetaValue meta;
+        const bool has_meta{m_db->Read(MetaKey{KEY_META, market}, meta)};
+        if (has_meta && (meta.version != META_VERSION || meta.domain != log->Domain())) {
+            WipeMarket(market);
+        }
+        m_db->Write(MetaKey{KEY_META, market}, MetaValue{META_VERSION, log->Domain()}, true);
+        // Rows the production store never certified here are erased.
+        std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
+        CDBBatch erase{*m_db};
+        bool erased{false};
+        for (it->Seek(RowKey{KEY_ROW, market, store_next_sequence}); it->Valid(); it->Next()) {
+            RowKey key;
+            if (!it->GetKey(key) || key.prefix != KEY_ROW || key.market != market) break;
+            erase.Erase(key);
+            erased = true;
+        }
+        // A candle cannot be truncated without the original clearings.
+        // Drop the whole optional bucket when it contains an entry
+        // beyond the accepted head, including older intervals that a
+        // later disk page could otherwise return after this reload.
+        for (it->Seek(CandleKey{KEY_CANDLE, market, 0, 0}); it->Valid(); it->Next()) {
+            CandleKey key;
+            if (!it->GetKey(key) || key.prefix != KEY_CANDLE || key.market != market) break;
+            CandleValue value;
+            if (!it->GetValue(value) || value.last_sequence >= store_next_sequence) {
+                erase.Erase(key);
+                erased = true;
+            }
+        }
+        if (erased) m_db->WriteBatch(erase, true);
+        // The newest retained rows; a hash the store contradicts wipes.
+        const uint64_t from{store_next_sequence > FlowMeshObservedTimeLog::RING ? store_next_sequence - FlowMeshObservedTimeLog::RING : 0};
+        std::vector<flowmesh::ObservedStamp> rows;
+        std::map<uint64_t, uint256> expected{known.begin(), known.end()};
+        bool mismatch{false};
+        for (it->Seek(RowKey{KEY_ROW, market, from}); it->Valid(); it->Next()) {
+            RowKey key;
+            if (!it->GetKey(key) || key.prefix != KEY_ROW || key.market != market || key.sequence >= store_next_sequence) break;
+            RowValue value;
+            if (!it->GetValue(value)) continue;
+            const auto stamp{FromRow(key.sequence, value)};
+            if (!stamp) continue;
+            if (const auto want{expected.find(key.sequence)}; want != expected.end() && want->second != stamp->hash) {
+                mismatch = true;
+                break;
+            }
+            rows.push_back(*stamp);
+        }
+        if (mismatch) {
+            WipeMarket(market);
+            rows.clear();
+        }
+        it->Seek(RowKey{KEY_ROW, market, 0});
+        if (it->Valid()) {
+            RowKey key;
+            if (it->GetKey(key) && key.prefix == KEY_ROW && key.market == market) attached.oldest_row = key.sequence;
+        }
+        // The memory window of every interval, ending at the newest time.
+        std::optional<int64_t> newest;
+        for (auto row{rows.rbegin()}; row != rows.rend() && !newest; ++row) {
+            if (row->mode != flowmesh::ObservedMode::UNTIMED) newest = row->ms;
+        }
+        std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles;
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            if (!newest || mismatch) break;
+            const int64_t step{flowmesh::CandleIntervalMs(interval)};
+            const int64_t window{static_cast<int64_t>(flowmesh::CandleMemoryWindow(interval)) * step};
+            const int64_t start{std::max<int64_t>(0, flowmesh::CandleOpenMs(*newest, interval) - window)};
+            auto& out{candles[static_cast<size_t>(interval)]};
+            for (it->Seek(CandleKey{KEY_CANDLE, market, static_cast<uint8_t>(interval), static_cast<uint64_t>(start)}); it->Valid(); it->Next()) {
+                CandleKey key;
+                if (!it->GetKey(key) || key.prefix != KEY_CANDLE || key.market != market ||
+                    key.interval != static_cast<uint8_t>(interval)) break;
+                CandleValue value;
+                if (!it->GetValue(value)) continue;
+                auto candle{FromValue(static_cast<int64_t>(key.open_ms), value)};
+                // Never a candle holding an entry the store does not have.
+                if (!candle || candle->last_sequence >= store_next_sequence) continue;
+                out.push_back(*candle);
+            }
+        }
+        const auto recorded_since{mismatch ? std::nullopt : attached.oldest_row};
+        if (mismatch) attached.oldest_row.reset();
+        log->Load(std::move(rows), std::move(candles), recorded_since, preserve_recorded);
+        log->SetPersisted(true);
+        attached.restored.store(true, std::memory_order_release);
+        return true;
+    } catch (const std::exception& e) {
+        LogWarning("FlowMesh market %s: observed times could not be read (%s); recording continues in memory\n",
+                   market.GetHex(), e.what());
+    } catch (...) {
+    }
+    log->SetPersisted(false);
+    return false;
 }
 
 void FlowMeshObservedTimeStore::Start()
@@ -476,8 +536,9 @@ void FlowMeshObservedTimeStore::FlushLoop()
     util::ThreadRename("flowmesh-obstime");
     std::unique_lock lock{m_mutex};
     while (!m_stopping) {
-        m_cv.wait_for(lock, m_options.flush_interval, [&] { return m_stopping; });
+        m_cv.wait_for(lock, m_options.flush_interval, [&] { return m_stopping || m_restore_queued; });
         if (m_stopping) break;
+        m_restore_queued = false;
         lock.unlock();
         FlushNow(/*sync=*/false);
         lock.lock();
@@ -488,15 +549,25 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
 {
     try {
         std::lock_guard flush{m_flush_mutex};
-        std::vector<Attached*> attached;
+        std::vector<std::shared_ptr<Attached>> attached;
         std::function<void()> hook;
         {
             std::lock_guard lock{m_mutex};
-            for (auto& item : m_attached) attached.push_back(&item);
+            attached = m_attached;
             hook = m_hook;
         }
         const auto now{std::chrono::steady_clock::now()};
-        for (auto* item : attached) {
+        for (const auto& item : attached) {
+            if (item->restore) {
+                if (!sync && now < item->retry_restore) continue;
+                if (!RestoreAttached(*item, /*preserve_recorded=*/true)) {
+                    // Optional restore failures retry at a bounded cadence;
+                    // recording continues in its bounded memory queue.
+                    item->retry_restore = now + std::chrono::seconds{5};
+                    continue;
+                }
+                item->restore.reset();
+            }
             auto& log{*item->log};
             auto pending{log.TakePending()};
             if (pending.Empty() && now < item->next_sweep) continue;
@@ -546,13 +617,25 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
                     }
                 }
                 if (hook) hook();
-                m_db->WriteBatch(batch, sync);
+                // One final synced batch below covers these writes and
+                // every previous unsynced pass, even with no pending rows.
+                m_db->WriteBatch(batch, false);
                 log.SetPersisted(true);
             } catch (const std::exception& e) {
                 // Lost rows become a gap after a restart; the market is
                 // never affected.
                 LogDebug(BCLog::NET, "FlowMesh observed-time flush failed for market %s: %s\n", log.MarketId().GetHex(), e.what());
                 log.SetPersisted(false);
+            }
+        }
+        if (sync && m_db) {
+            try {
+                CDBBatch final_sync{*m_db};
+                if (hook) hook();
+                m_db->WriteBatch(final_sync, true);
+            } catch (const std::exception& e) {
+                LogDebug(BCLog::NET, "FlowMesh observed-time final sync failed: %s\n", e.what());
+                for (const auto& item : attached) item->log->SetPersisted(false);
             }
         }
     } catch (...) {
@@ -567,9 +650,17 @@ std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(con
     if (older) *older = false;
     std::vector<flowmesh::ObservedCandle> out;
     try {
-        std::lock_guard lock{m_mutex};
-        if (!m_db || before_ms <= from_ms) return out;
-        std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
+        CDBWrapper* db{nullptr};
+        {
+            std::lock_guard lock{m_mutex};
+            const bool restored{std::any_of(m_attached.begin(), m_attached.end(), [&](const auto& item) {
+                return item->log->MarketId() == market && item->restored.load(std::memory_order_acquire);
+            })};
+            if (!restored) return out;
+            db = m_db.get();
+        }
+        if (!db || before_ms <= from_ms) return out;
+        std::unique_ptr<CDBIterator> it{db->NewIterator()};
         const auto matches = [&](const CandleKey& key) {
             return key.prefix == KEY_CANDLE && key.market == market && key.interval == static_cast<uint8_t>(interval);
         };
