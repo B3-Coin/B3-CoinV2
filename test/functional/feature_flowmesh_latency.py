@@ -18,12 +18,27 @@ it never relaxes certificate, account-state, or signed-byte checks.
 That mode uses client/all-replica observed upper bounds and explicitly leaves
 debug-trace admission/durable timestamps unknown. The full BENCH trace mode
 remains the default and retains its additional durable-event assertions.
+
+--latency-local-reader-hz=N (the Qt local live-update A/B): during the
+measured phase, operator 0 also serves a trading panel's local-engine live
+updates as its watch worker sends them (getflowmeshmarketdata with known_head,
+watch_ms 1500, the held-tick page, observed times and 50 book levels a side),
+paced by the panel's token bucket: a burst of two, then one read per 1000/N
+ms. 2 is today's pacing, 10 the proposed local pacing. The reader is read-only.
+With --latency-local-reader-busy every read is an ordinary full read that
+waits for nothing, as on a market whose head moves faster than the reader:
+an upper bound of the reader's market-mutex load at that rate.
+--latency-lock-capture records operator 0's market-mutex waits (flowmeshtiming)
+during the measured phase: the reader's own MarketData holds and every other
+holder's wait for the mutex (the runtime worker's certified commits among
+them), so both arms can be compared.
 """
 
 import argparse
 import hashlib
 import json
 import math
+import threading
 import time
 from collections import Counter
 from decimal import Decimal
@@ -34,7 +49,7 @@ from feature_flowmesh_release import A2, A3, B3_ARGS, CORRIDOR_END, TEST_ASSET_D
 from test_framework.authproxy import JSONRPCException
 from test_framework.flowmesh_client_tls import FlowMeshTLSFaultRelay
 from test_framework.test_node import TestNode
-from test_framework.util import assert_equal, get_datadir_path, initialize_datadir, p2p_port
+from test_framework.util import assert_equal, get_datadir_path, get_rpc_proxy, initialize_datadir, p2p_port
 
 
 PRE_ADMISSION_REJECTIONS = {
@@ -69,6 +84,104 @@ def distribution(values, target_ms):
     return result
 
 
+class LocalMarketReader(threading.Thread):
+    """A trading panel's local-engine live updates (read-only), as its watch
+    worker sends them, paced by the panel's token bucket: a burst of two,
+    then one read per 1000/hz ms. A reply that saw the head move re-arms at
+    once (within the bucket), as the panel does."""
+
+    def __init__(self, url, market_id, hz, busy=False):
+        super().__init__(daemon=True)
+        self.busy = busy
+        self.rpc = get_rpc_proxy(url, 0, timeout=60)
+        self.market_id = market_id
+        self.refill_ms = 1000.0 / hz
+        self.stop_event = threading.Event()
+        self.durations_ms = []
+        self.statuses = Counter()
+        self.changed = 0
+        self.error = None
+        self.started_s = self.stopped_s = None
+
+    def run(self):
+        tokens, refill_at = 2, time.monotonic() * 1000
+        known, after = None, None
+        self.started_s = time.monotonic()
+        try:
+            while not self.stop_event.is_set():
+                now = time.monotonic() * 1000
+                if tokens >= 2:
+                    refill_at = now
+                else:
+                    earned = int((now - refill_at) // self.refill_ms)
+                    if earned > 0:
+                        tokens = min(2, tokens + earned)
+                        refill_at = now if tokens >= 2 else refill_at + earned * self.refill_ms
+                if tokens == 0:
+                    self.stop_event.wait(max(0.001, (refill_at + self.refill_ms - now) / 1000))
+                    continue
+                tokens -= 1
+                ticks = {"limit": 256}
+                if after is not None:
+                    ticks["after_sequence"] = after
+                options = {"limit": 100, "curve_limit": 128, "ticks": ticks, "observed_time": True, "levels": {"depth": 50}}
+                if known is not None and not self.busy:
+                    options.update(known_head=known, watch_ms=1500)
+                started = time.monotonic()
+                reply = self.rpc.getflowmeshmarketdata(self.market_id, options)
+                self.durations_ms.append((time.monotonic() - started) * 1000)
+                self.statuses[reply.get("watch", {}).get("status", "ordinary")] += 1
+                if not reply["unchanged"]:
+                    if known is not None and reply["snapshot"]["last_microblock_hash"] != known:
+                        self.changed += 1
+                    known = reply["snapshot"]["last_microblock_hash"]
+                rows = reply.get("clearing_ticks", {}).get("ticks", [])
+                if rows:
+                    after = rows[-1]["sequence"]
+        except Exception as error:  # Reported, never swallowed: the run fails.
+            self.error = f"{type(error).__name__}: {error}"
+        finally:
+            self.stopped_s = time.monotonic()
+
+    def stop(self):
+        self.stop_event.set()
+        self.join(timeout=10)
+        assert not self.is_alive(), "local reader did not stop"
+        assert self.error is None, f"local reader failed: {self.error}"
+
+    def summary(self, target_ms):
+        seconds = (self.stopped_s or time.monotonic()) - self.started_s
+        return {"hz": round(1000.0 / self.refill_ms, 3), "busy": self.busy, "reads": len(self.durations_ms), "seconds": round(seconds, 3),
+                "reads_per_second": round(len(self.durations_ms) / seconds, 3) if seconds > 0 else None,
+                "head_changes_seen": self.changed, "watch_statuses": dict(self.statuses),
+                "read_ms": distribution(self.durations_ms, target_ms)}
+
+
+def market_mutex_waits(captures, target_ms):
+    """Market-mutex waits (lock_acquired - lock_requested) by holder, in ms,
+    and the MarketData reads' own holds and longest book-copy page hold, over
+    one capture per measured pair (each within the capture's event bound)."""
+    waits, reader_holds, book_holds = {}, [], []
+    events = [row for capture in captures for row in capture["events"]]
+    for row in events:
+        event = row["event"]
+        if row["stream"] != "FlowMeshNativeSpan" or event.get("lock_name") != "market_mutex":
+            continue
+        if "lock_requested_us" in event and "lock_acquired_us" in event:
+            name = "reader:MarketData" if event["stage"] == "MarketData" else "other:" + event["stage"]
+            waits.setdefault(name, []).append((event["lock_acquired_us"] - event["lock_requested_us"]) / 1000)
+        if event["stage"] == "MarketData" and "lock_released_us" in event:
+            reader_holds.append((event["lock_released_us"] - event["lock_acquired_us"]) / 1000)
+        if "book_copy_longest_hold_us" in event:
+            book_holds.append(event["book_copy_longest_hold_us"] / 1000)
+    others = [value for name, rows in waits.items() if name.startswith("other:") for value in rows]
+    return {"captures": len(captures), "dropped": sum(capture["dropped"] for capture in captures), "events": len(events),
+            "other_holders_wait_ms": distribution(others, target_ms),
+            "by_holder_wait_ms": {name: distribution(rows, target_ms) for name, rows in sorted(waits.items())},
+            "reader_marketdata_hold_ms": distribution(reader_holds, target_ms),
+            "reader_book_copy_longest_page_hold_ms": distribution(book_holds, target_ms)}
+
+
 class FlowMeshLatencyTest(FlowMeshPreagreementTest):
     def add_options(self, parser):
         super().add_options(parser)
@@ -79,6 +192,12 @@ class FlowMeshLatencyTest(FlowMeshPreagreementTest):
         parser.add_argument("--latency-observe-only", action="store_true")
         parser.add_argument("--latency-production-logging", action="store_true",
                             help="Disable all daemon debug categories; require verified client/all-replica history observation without reconstructing BENCH timestamps")
+        parser.add_argument("--latency-local-reader-hz", type=float, default=0,
+                            help="During the measured phase, serve a trading panel's local live updates on operator 0 at up to this many reads a second (0: none)")
+        parser.add_argument("--latency-local-reader-busy", action="store_true",
+                            help="The local reader never waits: every read is an ordinary full read (an upper bound of its load)")
+        parser.add_argument("--latency-lock-capture", action="store_true",
+                            help="Record operator 0's market-mutex waits during the measured phase (flowmeshtiming)")
 
     def set_test_params(self):
         super().set_test_params()
@@ -479,11 +598,16 @@ class FlowMeshLatencyTest(FlowMeshPreagreementTest):
         assert warm >= 0 and measured >= 1 and warm + measured <= 200, "require 0 <= warmup, 1 <= measured, total <= 200 pairs"
         assert self.options.latency_poll_ms <= 100, "poll interval must be <= 100 ms"
         assert_equal(self.options.qt_review_hold_seconds, 0)
+        # A capture records runtime traces, which production logging forbids.
+        assert not (self.options.latency_lock_capture and self.options.latency_production_logging), \
+            "--latency-lock-capture records traces; use it without --latency-production-logging"
+        assert self.options.latency_local_reader_hz >= 0
         report_path = Path(self.options.tmpdir) / "flowmesh-latency.json"
         self.latency_report = {"fixture": "healthy_local_four_operator_https_preagreement", "format_version": 1,
             "operators": 4, "ordinary_clients": 1, "target_ms": self.options.latency_target_ms,
             "warmup_pairs": warm, "measured_pairs": measured, "poll_interval_ms": self.options.latency_poll_ms,
             "observe_only": self.options.latency_observe_only, "correctness_pass": False, "performance_pass": False,
+            "local_reader_hz": self.options.latency_local_reader_hz, "local_reader_busy": self.options.latency_local_reader_busy,
             "logging_mode": "production_debug_disabled" if self.options.latency_production_logging else "detailed_bench",
             "logging_checks": [],
             "summary": {}, "clock_offsets": {}, "samples": self.latency_samples,
@@ -513,8 +637,17 @@ class FlowMeshLatencyTest(FlowMeshPreagreementTest):
                     self.calibrate_clocks(market_id, phase + "_before")
                 self.begin_b3_workload(range(4))
                 heights_before = [node.getblockcount() for node in self.nodes]
+                reader = None
+                if phase == "measured" and self.options.latency_local_reader_hz > 0:
+                    reader = LocalMarketReader(self.nodes[0].url, market_id, self.options.latency_local_reader_hz,
+                                               self.options.latency_local_reader_busy)
+                    reader.start()
+                captures, capturing = [], False
                 try:
                     for pair in range(pairs):
+                        if phase == "measured" and self.options.latency_lock_capture:
+                            self.nodes[0].flowmeshtiming("start")
+                            capturing = True
                         for kind in ("bid", "cancel"):
                             self.timed_action(market_id, phase, pair, kind, account["next_sequence"])
                             previous_sequence = account["next_sequence"]
@@ -525,12 +658,22 @@ class FlowMeshLatencyTest(FlowMeshPreagreementTest):
                             assert_equal(account["b3_reserved"], reserved)
                             assert_equal(account["b3_available"], Decimal("1") - reserved)
                             self.latency_samples[-1]["certified_account_state_checked"] = True
+                        if capturing:
+                            captures.append(self.nodes[0].flowmeshtiming("stop"))
+                            capturing = False
                         self.log.info("FlowMesh latency %s pair %d/%d complete", phase, pair + 1, pairs)
                     heights_after = [node.getblockcount() for node in self.nodes]
                     self.latency_report[phase + "_b3_heights"] = {"before": heights_before, "after": heights_after}
                     if phase == "measured":
                         assert all(after > before for before, after in zip(heights_before, heights_after)), "B3 must advance during the measured workload"
                 finally:
+                    if phase == "measured" and self.options.latency_lock_capture:
+                        if capturing:
+                            captures.append(self.nodes[0].flowmeshtiming("stop"))
+                        self.latency_report["operator0_market_mutex"] = market_mutex_waits(captures, self.options.latency_target_ms)
+                    if reader is not None:
+                        reader.stop()
+                        self.latency_report["local_reader"] = reader.summary(self.options.latency_target_ms)
                     self.end_b3_workload()
                 if self.options.latency_production_logging:
                     self.verify_production_logging(market_id, phase + "_after")
