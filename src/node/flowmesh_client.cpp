@@ -3582,13 +3582,16 @@ public:
     }
     /** The endpoint serving this market's data, asked for one page of its
      * observed-time candles, only when it advertises them. Endpoint-reported
-     * display data: only the page's structure and that no candle goes past
-     * a head this client verified are checked. Display work: the work gate
-     * is taken only for a brief passive read, without I/O, of the endpoint
-     * and the verified head before the request, never across it (the request
-     * has its own lane and connection; a busy lane fails at once), and
-     * nothing here refreshes, verifies or writes state. So an order never
-     * waits for a candles page beyond that read.
+     * display data: only the page's structure is checked (a malformed page
+     * is refused), and the page is bounded to a head this client verified:
+     * candles ending past it are held back, never refused (below). Display
+     * work: the work gate is taken only briefly and passively, without I/O,
+     * to read the endpoint and the verified head before the request and to
+     * withdraw a stale candles advertisement after it, never across the
+     * request (it has its own lane and connection; a busy lane fails at
+     * once). Nothing here refreshes the head, verifies certificates or
+     * writes durable state. So an order never waits for a candles page
+     * beyond those reads.
      *
      * The endpoint's forming candle ends at its own head, which on an active
      * market is nearly always past the head this client verified before the
