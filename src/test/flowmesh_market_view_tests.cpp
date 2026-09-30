@@ -1188,6 +1188,20 @@ BOOST_AUTO_TEST_CASE(book_levels_of_a_full_limit_book_fit_the_budget)
     BOOST_CHECK(levels.bids.truncated_reason.empty() && levels.asks.truncated_reason.empty());
     BOOST_CHECK(levels.best_bid == CAmount{1000} && levels.best_ask == CAmount{1001});
     BOOST_TEST_MESSAGE("book levels of 16384 limit curves: " << std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() << " us");
+
+    // The remote client copies the curves of its verified state once per
+    // head, under its work gate (review S2): the same copy of a full state,
+    // measured here (logged, not a timing claim).
+    auto state{EmptyState()};
+    for (const auto& curve : curves) {
+        BOOST_REQUIRE(flowmesh::test_only::StateFunding::Fund(state, curve.account_id, curve.side == Side::BID ? modern::NativeAsset() : Base(), 1'000'000));
+        BOOST_REQUIRE(state.SubmitCurve(curve.account_id, curve.side, curve.points));
+    }
+    const auto copy_started{std::chrono::steady_clock::now()};
+    const auto copied{state.ReadCurves(flowmesh::MARKET_VIEW_MAX_BOOK_CURVES)};
+    const auto copy_elapsed{std::chrono::steady_clock::now() - copy_started};
+    BOOST_CHECK_EQUAL(copied.curves.size(), flowmesh::MARKET_VIEW_MAX_BOOK_CURVES);
+    BOOST_TEST_MESSAGE("copy of 16384 standing curves from a state: " << std::chrono::duration_cast<std::chrono::microseconds>(copy_elapsed).count() << " us");
 }
 
 BOOST_AUTO_TEST_CASE(market_views_compute_levels_once_per_copy_and_only_when_wanted)
