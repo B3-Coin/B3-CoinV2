@@ -253,6 +253,60 @@ TickPage Ticks(const UniValue& v, const Snapshot& s)
     }
     return page;
 }
+uint8_t ObservedFlags(const UniValue& v)
+{
+    if (!v.isArray() || v.size() > 16) Fail("Invalid observed-time flags.");
+    uint8_t out{0};
+    for (const auto& flag : v.getValues()) {
+        const auto name{Text(flag)};
+        if (name == QStringLiteral("clock_clamped")) out |= flowmesh::OBSERVED_CLOCK_CLAMPED;
+        else if (name == QStringLiteral("clock_step")) out |= flowmesh::OBSERVED_CLOCK_STEP;
+        else if (name == QStringLiteral("clock_suspect")) out |= flowmesh::OBSERVED_CLOCK_SUSPECT;
+        else if (name == QStringLiteral("restart")) out |= flowmesh::OBSERVED_RESTART;
+        else if (name == QStringLiteral("no_clearing_data")) out |= flowmesh::OBSERVED_NO_CLEARING;
+        else if (name == QStringLiteral("implausible")) out |= flowmesh::OBSERVED_IMPLAUSIBLE;
+    }
+    return out;
+}
+int64_t Millis(const UniValue& v)
+{
+    const auto n{Count(v)};
+    if (n > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) Fail("Invalid observed time.");
+    return static_cast<int64_t>(n);
+}
+ObservedTimes ObservedOf(const UniValue& v, const Snapshot& s)
+{
+    ObservedTimes out;
+    try {
+        if (Text(F(v, "source_kind")) != QStringLiteral("operator_observed") || Flag(F(v, "certified"))) Fail("Observed time is never certified.");
+        out.available = Flag(F(v, "available"));
+        out.source = Text(F(v, "source")).left(256);
+        if (!out.available) {
+            out.reason = Text(F(v, "unavailable_reason")).left(160);
+            return out;
+        }
+        out.clock_suspect = Flag(F(v, "clock_suspect"));
+        const auto& rows{F(v, "rows")};
+        if (!rows.isArray() || rows.size() > MAX_HELD_TICKS + 101) Fail("Oversized observed-time page.");
+        for (const auto& row : rows.getValues()) {
+            flowmesh::ObservedStamp stamp;
+            stamp.sequence = Count(F(row, "sequence"));
+            stamp.hash = *uint256::FromHex(Id(F(row, "microblock_hash")).toStdString());
+            if (stamp.sequence >= s.next_sequence || (!out.rows.empty() && stamp.sequence <= out.rows.back().sequence)) Fail("Observed times out of order.");
+            const auto mode{Text(F(row, "mode"))};
+            if (mode == QStringLiteral("live")) { stamp.mode = flowmesh::ObservedMode::LIVE; stamp.ms = Millis(F(row, "observed_ms")); }
+            else if (mode == QStringLiteral("delayed")) { stamp.mode = flowmesh::ObservedMode::DELAYED; stamp.ms = Millis(F(row, "applied_here_ms")); }
+            else if (mode == QStringLiteral("untimed")) stamp.mode = flowmesh::ObservedMode::UNTIMED;
+            else Fail("Unknown observed-time mode.");
+            stamp.flags = ObservedFlags(F(row, "flags"));
+            out.rows.push_back(stamp);
+        }
+    } catch (const std::exception&) {
+        out = {};
+        out.reason = QStringLiteral("malformed");
+    }
+    return out;
+}
 Indicative IndicativeOf(const UniValue& v, const Snapshot& s)
 {
     Indicative out;
@@ -293,6 +347,85 @@ Indicative IndicativeOf(const UniValue& v, const Snapshot& s)
     }
     return out;
 }
+}
+
+void MergeHeldTimes(std::map<uint64_t, flowmesh::ObservedStamp>& held, const std::deque<Tick>& ticks, const ObservedTimes* page)
+{
+    const auto tick_at = [&](const uint64_t sequence) -> const Tick* {
+        if (ticks.empty() || sequence < ticks.front().sequence || sequence > ticks.back().sequence) return nullptr;
+        return &ticks[sequence - ticks.front().sequence];
+    };
+    if (page && page->available) {
+        for (const auto& row : page->rows) {
+            const auto* tick{tick_at(row.sequence)};
+            if (tick && tick->hash == QString::fromStdString(row.hash.GetHex())) held[row.sequence] = row;
+        }
+    }
+    std::erase_if(held, [&](const auto& item) {
+        const auto* tick{tick_at(item.first)};
+        return !tick || tick->hash != QString::fromStdString(item.second.hash.GetHex());
+    });
+}
+
+CandlePage ParseCandles(const UniValue& value, const flowmesh::CandleInterval requested)
+{
+    CandlePage page;
+    page.interval = requested;
+    try {
+        if (Text(F(value, "source_kind")) != QStringLiteral("operator_observed") || Flag(F(value, "certified"))) Fail("Candles are never certified.");
+        page.available = Flag(F(value, "available"));
+        page.source = Text(F(value, "source")).left(256);
+        if (!F(value, "endpoint_reported").isNull()) page.remote = Flag(F(value, "endpoint_reported"));
+        if (!page.available) {
+            page.reason = Text(F(value, "unavailable_reason")).left(160);
+            return page;
+        }
+        if (Text(F(value, "interval")) != QString::fromLatin1(flowmesh::CandleIntervalName(requested))) Fail("Another candle interval.");
+        const int64_t step{flowmesh::CandleIntervalMs(requested)};
+        if (Millis(F(value, "interval_ms")) != step) Fail("Another candle interval length.");
+        page.from_ms = Millis(F(value, "from_ms")); page.before_ms = Millis(F(value, "before_ms"));
+        if (page.before_ms < page.from_ms || (page.before_ms - page.from_ms) % step != 0 || page.before_ms - page.from_ms > 500 * step) Fail("Invalid candle window.");
+        page.more = Flag(F(value, "more"));
+        const auto& rows{F(value, "candles")};
+        if (!rows.isArray() || rows.size() > 500) Fail("Oversized candle page.");
+        for (const auto& row : rows.getValues()) {
+            flowmesh::ObservedCandle c;
+            c.open_ms = Millis(F(row, "open_ms"));
+            if (c.open_ms % step != 0 || c.open_ms < page.from_ms || c.open_ms >= page.before_ms ||
+                (!page.candles.empty() && c.open_ms <= page.candles.back().open_ms)) Fail("Misaligned or unordered candle.");
+            c.first_sequence = Count(F(row, "first_sequence")); c.last_sequence = Count(F(row, "last_sequence"));
+            if (c.last_sequence < c.first_sequence || (!page.candles.empty() && c.first_sequence <= page.candles.back().last_sequence)) Fail("Overlapping candle sequences.");
+            const auto entries{Count(F(row, "entries"))}, clearings{Count(F(row, "clearings"))};
+            if (entries == 0 || clearings > entries || entries - 1 > c.last_sequence - c.first_sequence) Fail("Invalid candle counts.");
+            c.entries = static_cast<uint32_t>(entries); c.clearings = static_cast<uint32_t>(clearings);
+            // Exact decimal sums; zero only as "0" (a clearing at price zero).
+            const auto wide = [](const QString& text) { return text == QStringLiteral("0") ? std::optional<Wide>{0} : PositiveInteger(text); };
+            const auto base{wide(Text(F(row, "base_volume")))}, quote{wide(Text(F(row, "quote_volume")))};
+            if (c.clearings > 0) {
+                c.open = Amount(F(row, "open")); c.high = Amount(F(row, "high")); c.low = Amount(F(row, "low")); c.close = Amount(F(row, "close"));
+                if (!base || !quote || *base == 0 || c.low > c.high || c.open < c.low || c.open > c.high || c.close < c.low || c.close > c.high) Fail("Inconsistent candle prices.");
+                c.base_volume = *base; c.quote_volume = *quote;
+            } else if (Text(F(row, "base_volume")) != QStringLiteral("0") || Text(F(row, "quote_volume")) != QStringLiteral("0") || !F(row, "open").isNull()) {
+                Fail("Candle values without a clearing.");
+            }
+            const auto& flags{F(row, "flags")};
+            if (!flags.isArray() || flags.size() > 8) Fail("Invalid candle flags.");
+            for (const auto& flag : flags.getValues()) {
+                const auto name{Text(flag)};
+                if (name == QStringLiteral("partial")) c.flags |= flowmesh::CANDLE_PARTIAL;
+                else if (name == QStringLiteral("late")) c.flags |= flowmesh::CANDLE_LATE;
+                else if (name == QStringLiteral("seam_before")) c.flags |= flowmesh::CANDLE_SEAM_BEFORE;
+                else if (name == QStringLiteral("clock")) c.flags |= flowmesh::CANDLE_CLOCK;
+            }
+            page.candles.push_back(c);
+        }
+    } catch (const std::exception&) {
+        const auto interval{page.interval};
+        page = {};
+        page.interval = interval;
+        page.reason = QStringLiteral("malformed");
+    }
+    return page;
 }
 
 bool MergeHeldTicks(std::deque<Tick>& held, const TickPage& page)
@@ -831,6 +964,7 @@ Snapshot Parse(const UniValue& value)
     // failing closed on its own.
     if (!F(value, "clearing_ticks").isNull()) s.ticks = Ticks(F(value, "clearing_ticks"), s);
     if (!F(value, "indicative").isNull()) s.indicative = IndicativeOf(F(value, "indicative"), s);
+    if (!F(value, "observed_time").isNull()) s.observed = ObservedOf(F(value, "observed_time"), s);
     if (s.unchanged) return s;
     const auto& liquidity{F(value, "liquidity")}; s.curves_complete = Flag(F(liquidity, "complete")); s.curves = Curves(F(liquidity, "curves"), 128); s.depth = Aggregate(s.curves);
     if (s.curves_complete && Count(F(liquidity, "total_curves")) != s.curves.size()) Fail("Complete liquidity count does not match its curves.");

@@ -4,11 +4,13 @@
 #define BITCOIN_QT_B3FLOWMESHMARKETDATA_H
 
 #include <consensus/amount.h>
+#include <flowmesh/market_data.h>
 #include <QString>
 #include <univalue.h>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -106,6 +108,34 @@ struct TickPage {
     std::vector<Tick> ticks;
     bool operator==(const TickPage&) const = default;
 };
+//! Operator-observed times of a reply ("observed_time"): when the source
+//! (this node, or the endpoint that reported them) applied each entry, by
+//! its own clock. Never certified and never a trade time for a delayed or
+//! untimed row. A malformed section is only unavailable ("malformed"); it
+//! never fails the read or is shown as data.
+struct ObservedTimes {
+    bool available{false}, clock_suspect{false};
+    QString reason, source;
+    //! Ascending sequences.
+    std::vector<flowmesh::ObservedStamp> rows;
+    bool operator==(const ObservedTimes&) const = default;
+};
+//! One page of getflowmeshcandles, checked fail closed: a malformed page is
+//! only unavailable ("malformed").
+struct CandlePage {
+    bool available{false}, remote{false}, more{false};
+    QString reason, source;
+    flowmesh::CandleInterval interval{flowmesh::CandleInterval::M1};
+    int64_t from_ms{0}, before_ms{0};
+    std::vector<flowmesh::ObservedCandle> candles;
+    bool operator==(const CandlePage&) const = default;
+};
+//! `requested` is the interval asked for; any other is malformed.
+CandlePage ParseCandles(const UniValue& value, flowmesh::CandleInterval requested);
+//! Keeps the stamps of held ticks only: `page`'s rows whose tick is held with
+//! the same hash are added, and every stamp whose tick left `ticks` goes.
+void MergeHeldTimes(std::map<uint64_t, flowmesh::ObservedStamp>& held, const std::deque<Tick>& ticks,
+                    const ObservedTimes* page);
 //! The node's indicative next clearing ("indicative"): never certified.
 struct Indicative {
     bool available{false}, cleared{false};
@@ -136,6 +166,7 @@ struct Snapshot {
     //! Optional display sections, also on unchanged replies.
     std::optional<TickPage> ticks;
     std::optional<Indicative> indicative;
+    std::optional<ObservedTimes> observed;
     bool operator==(const Snapshot&) const = default;
 };
 //! Ticks the panel holds for one market: consecutive, oldest first, at most

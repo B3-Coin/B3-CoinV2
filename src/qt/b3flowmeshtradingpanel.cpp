@@ -60,7 +60,7 @@ bool SignedAction(Operation op) { return op == Operation::Order || op == Operati
 bool NoSpendingRequired(const std::string& method) {
     return method == "listflowmeshmarkets" || method == "getflowmeshbalance" || method == "getblockchaininfo" ||
         method == "getflowmeshclientinfo" || method == "flowmeshclientconnect" ||
-        method == "getflowmeshmarketdata" || method == "getflowmeshactionstatus" || method == "listflowmeshactions" || method == "listflowmeshvaultoperations" || method == "testmempoolaccept";
+        method == "getflowmeshmarketdata" || method == "getflowmeshcandles" || method == "getflowmeshactionstatus" || method == "listflowmeshactions" || method == "listflowmeshvaultoperations" || method == "testmempoolaccept";
 }
 //! Display sections of a selected-market read: the clearing ticks after the
 //! last one held (the newest otherwise) and, only while the ticket holds an
@@ -72,6 +72,8 @@ void AddMarketViews(UniValue& options, const std::optional<uint64_t>& after, con
     if (after) ticks.pushKV("after_sequence", *after);
     ticks.pushKV("limit", static_cast<uint64_t>(B3FlowMeshMarketData::MAX_HELD_TICKS));
     options.pushKV("ticks", std::move(ticks));
+    // Operator-observed times of the head, history and ticks; display only.
+    options.pushKV("observed_time", true);
     if (!draft.isObject()) return;
     UniValue indicative{UniValue::VOBJ};
     indicative.pushKV("draft", draft);
@@ -769,9 +771,53 @@ void B3FlowMeshTradingPanel::mergeHeldTicks()
     if (!m_snapshot) return;
     if (m_ticks_market != m_snapshot->market) {
         m_ticks.clear();
+        m_tick_times.clear();
         m_ticks_market = m_snapshot->market;
     }
-    if (m_snapshot->ticks) B3FlowMeshMarketData::MergeHeldTicks(m_ticks, *m_snapshot->ticks);
+    if (m_snapshot->ticks && m_snapshot->ticks->available && !B3FlowMeshMarketData::MergeHeldTicks(m_ticks, *m_snapshot->ticks)) {
+        // Replaced ticks start their times again.
+        m_tick_times.clear();
+    }
+    const auto* observed{m_snapshot->observed && m_snapshot->observed->available ? &*m_snapshot->observed : nullptr};
+    if (observed && observed->source != m_tick_times_source) {
+        // One source's series only: another endpoint's clock is never mixed in.
+        m_tick_times.clear();
+        m_tick_times_source = observed->source;
+    }
+    B3FlowMeshMarketData::MergeHeldTimes(m_tick_times, m_ticks, observed);
+}
+
+std::optional<std::pair<flowmesh::CandleInterval, size_t>> B3FlowMeshTradingPanel::candlesDue() const
+{
+    const auto selected{market()};
+    if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->observed || !m_snapshot->observed->available) return std::nullopt;
+    constexpr size_t WINDOW{300}, NEWEST{3};
+    if (!m_candles || m_candles_market != m_snapshot->market || m_candles->interval != m_candle_interval ||
+        m_candles->source != m_snapshot->observed->source || !m_candles_age.isValid() || m_candles_refetch) {
+        return std::pair{m_candle_interval, WINDOW};
+    }
+    if (m_candles_age.elapsed() >= 10'000) return std::pair{m_candle_interval, NEWEST};
+    return std::nullopt;
+}
+
+void B3FlowMeshTradingPanel::applyCandles(const B3FlowMeshMarketData::CandlePage& page, const size_t limit)
+{
+    if (!m_snapshot) return;
+    const bool same{m_candles && m_candles_market == m_snapshot->market && m_candles->interval == page.interval &&
+                    m_candles->source == page.source && m_candles->available && page.available};
+    if (same && limit < 300) {
+        // The newest intervals only: they replace what the window held there.
+        auto merged{*m_candles};
+        std::erase_if(merged.candles, [&](const auto& candle) { return candle.open_ms >= page.from_ms; });
+        merged.candles.insert(merged.candles.end(), page.candles.begin(), page.candles.end());
+        merged.before_ms = std::max(merged.before_ms, page.before_ms);
+        m_candles = std::move(merged);
+    } else {
+        m_candles = page;
+    }
+    m_candles_market = m_snapshot->market;
+    m_candles_age.start();
+    m_candles_refetch = false;
 }
 
 bool B3FlowMeshTradingPanel::depositReady() const
@@ -1386,6 +1432,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
     const auto selected{market()}; const QString selected_id{selected ? selected->id : QString{}};
     result->views_market = selected_id; result->ticks_after = ticksAfter(selected_id); result->draft = indicativeDraft();
+    if (const auto due{candlesDue()}) { result->candles_interval = due->first; result->candles_limit = due->second; }
     const auto phase{foreground_read ? (m_route_pending || m_market_data.empty() || !m_catalog_age.isValid() ? RefreshPhase::Catalog : RefreshPhase::None)
                                      : nextPassivePhase()};
     if (result->passive || foreground_read) {
@@ -1573,6 +1620,21 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                         if (!s.unchanged && selected->has_account && selected->account != s.account) throw std::runtime_error{"Certified data belongs to another wallet account."};
                         if (s.chain_reconciling) result->effects.clear();
                         DeriveRowFromSnapshot(*selected, s);
+                    }
+                    // Observed-time candles, when due: display only, and a
+                    // failure here never fails this job.
+                    if (result->candles_interval && selected->id == result->views_market) {
+                        try {
+                            UniValue params{UniValue::VARR}; params.push_back(selected->id.toStdString());
+                            UniValue options{UniValue::VOBJ};
+                            options.pushKV("interval", flowmesh::CandleIntervalName(*result->candles_interval));
+                            options.pushKV("limit", static_cast<uint64_t>(result->candles_limit));
+                            params.push_back(options);
+                            result->candles = B3FlowMeshMarketData::ParseCandles(rpc("getflowmeshcandles", params), *result->candles_interval);
+                        } catch (const PassiveRefreshYield&) { throw; }
+                        catch (const UniValue& error) { result->candles_error = RpcError(error); }
+                        catch (const std::exception& error) { result->candles_error = QString::fromUtf8(error.what()).left(500); }
+                        catch (...) { result->candles_error = QStringLiteral("Candles unavailable."); }
                     }
                 }
                 if (auxiliary_error) std::rethrow_exception(auxiliary_error); // Conservative failure; no new display freshness.
@@ -1768,6 +1830,11 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
         if (result->snapshot && selected_now && result->snapshot->market == selected_now->id) {
             applySelectedSnapshot(*result->snapshot, result->snapshot_age, result->basis_head);
         } else if (!selected_now || !m_snapshot || selected_now->id != m_snapshot->market) { m_snapshot.reset(); m_response_age.invalidate(); m_queue_age.invalidate(); updateDataViews(); }
+        if (result->candles && selected_now && m_snapshot && m_snapshot->market == selected_now->id && result->views_market == selected_now->id &&
+            result->candles->interval == m_candle_interval) {
+            applyCandles(*result->candles, result->candles_limit);
+            updateDataViews();
+        }
         const bool changed_selection{selected_now && (selected_now->id != previous || (!result->read_market.isEmpty() && selected_now->id != result->read_market))};
         const bool open_routed_funding{m_route_pending && selected_now && m_snapshot && m_snapshot->market == selected_now->id};
         if (open_routed_funding) { m_asset->setCurrentIndex(m_requested_base.isEmpty() ? 1 : 0); m_route_pending = false; }
@@ -1898,7 +1965,7 @@ bool B3FlowMeshTradingPanel::watchSuppliesRead() const
 
 bool B3FlowMeshTradingPanel::liveSkipsPoll() const
 {
-    return watchSuppliesRead() && !m_deferred_connect && !m_deferred_status && nextPassivePhase() == RefreshPhase::None;
+    return watchSuppliesRead() && !m_deferred_connect && !m_deferred_status && nextPassivePhase() == RefreshPhase::None && !candlesDue();
 }
 
 void B3FlowMeshTradingPanel::updateWatchState()

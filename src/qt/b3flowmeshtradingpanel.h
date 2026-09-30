@@ -99,6 +99,13 @@ private:
         QString views_market;
         std::optional<uint64_t> ticks_after;
         UniValue draft;
+        //! Observed-time candles this job reads for `views_market`, when due
+        //! (captured on the GUI thread), and what it read. A failed candles
+        //! read never fails the job: it only leaves `candles_error`.
+        std::optional<flowmesh::CandleInterval> candles_interval;
+        size_t candles_limit{0};
+        std::optional<B3FlowMeshMarketData::CandlePage> candles;
+        QString candles_error;
     };
     //! How a verified selected-market read was applied.
     enum class SnapshotApply { APPLIED, SUPERSEDED, MISMATCH };
@@ -181,8 +188,17 @@ private:
     UniValue indicativeDraft() const;
     //! The last held tick of `market`, when the held ticks are that market's.
     std::optional<uint64_t> ticksAfter(const QString& market) const;
-    //! Extends the held ticks from the displayed snapshot's page.
+    //! Extends the held ticks (and their observed times) from the displayed
+    //! snapshot's page.
     void mergeHeldTicks();
+    //! The candles page the next job should read for the displayed market
+    //! ({interval, limit}), or nothing: a whole window after a market,
+    //! interval or source change (or when the forming candle could not be
+    //! extended from the held ticks), else the newest few intervals about
+    //! every 10 s. Only while the displayed data carries observed times.
+    std::optional<std::pair<flowmesh::CandleInterval, size_t>> candlesDue() const;
+    //! Applies a candles page read by a job for the displayed market.
+    void applyCandles(const B3FlowMeshMarketData::CandlePage& page, size_t limit);
     void requestOrderReview();
     //! The certified own curve an Edit is bound to: the selected row's
     //! canonical side at selection time, and only while its points are
@@ -434,6 +450,19 @@ private:
     //! Clearing ticks held for m_ticks_market (see MergeHeldTicks); display only.
     std::deque<B3FlowMeshMarketData::Tick> m_ticks;
     QString m_ticks_market;
+    //! Observed times of held ticks from one source (m_tick_times_source),
+    //! never part of tick equality; cleared when the held ticks are replaced
+    //! or the source changes. Display only.
+    std::map<uint64_t, flowmesh::ObservedStamp> m_tick_times;
+    QString m_tick_times_source;
+    //! Observed-time candles of m_candles_market at m_candle_interval, as the
+    //! source served them (never recomputed here), and when they were read.
+    std::optional<B3FlowMeshMarketData::CandlePage> m_candles;
+    QString m_candles_market;
+    flowmesh::CandleInterval m_candle_interval{flowmesh::CandleInterval::M1};
+    QElapsedTimer m_candles_age;
+    //! The forming candle could not be extended from the held ticks.
+    bool m_candles_refetch{false};
     QLabel *m_clearing_strip{nullptr}, *m_indicative{nullptr};
     QTableWidget *m_depth_view{nullptr}, *m_history_view{nullptr}, *m_own_view{nullptr}, *m_pending_view{nullptr};
     B3FlowMeshToasts* m_toasts{nullptr};

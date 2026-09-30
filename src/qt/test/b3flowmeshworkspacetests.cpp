@@ -133,6 +133,50 @@ UniValue RemoteDataWithViews()
     v.pushKV("indicative", IndicativeJson());
     return v;
 }
+// 2026-09-30T12:00:00Z
+constexpr int64_t OBSERVED_T0{1790769600000};
+UniValue StampJson(uint64_t sequence, const uint256& hash, const char* mode, int64_t ms, const std::vector<std::string>& flags = {})
+{
+    UniValue row{UniValue::VOBJ}; row.pushKV("sequence", sequence); row.pushKV("microblock_hash", hash.GetHex()); row.pushKV("mode", mode);
+    if (std::string{mode} == "live") row.pushKV("observed_ms", ms);
+    if (std::string{mode} == "delayed") row.pushKV("applied_here_ms", ms);
+    UniValue names{UniValue::VARR}; for (const auto& flag : flags) names.push_back(flag); row.pushKV("flags", names);
+    return row;
+}
+UniValue ObservedJson(const std::vector<UniValue>& rows, const std::string& source = "https://operator.invalid:18443")
+{
+    UniValue v{UniValue::VOBJ}; v.pushKV("available", true); v.pushKV("source", source); v.pushKV("source_kind", "operator_observed");
+    v.pushKV("certified", false); v.pushKV("clock_suspect", false); v.pushKV("recorded_since_sequence", 0);
+    UniValue array{UniValue::VARR}; for (const auto& row : rows) array.push_back(row); v.pushKV("rows", array);
+    return v;
+}
+//! RemoteDataWithViews with the endpoint's times of both ticks.
+UniValue RemoteDataWithTimes()
+{
+    auto v{RemoteDataWithViews()};
+    v.pushKV("observed_time", ObservedJson({StampJson(1, H(12), "live", OBSERVED_T0 + 1500), StampJson(2, H(4), "live", OBSERVED_T0 + 61'000)}));
+    return v;
+}
+UniValue CandleJson(int64_t open_ms, uint64_t first, uint64_t last, CAmount open, CAmount high, CAmount low, CAmount close, uint64_t volume,
+                    const std::vector<std::string>& flags = {})
+{
+    UniValue c{UniValue::VOBJ}; c.pushKV("open_ms", open_ms); c.pushKV("first_sequence", first); c.pushKV("last_sequence", last);
+    c.pushKV("entries", last - first + 1); c.pushKV("clearings", volume ? last - first + 1 : 0);
+    if (volume) { c.pushKV("open", open); c.pushKV("high", high); c.pushKV("low", low); c.pushKV("close", close); }
+    c.pushKV("base_volume", std::to_string(volume)); c.pushKV("quote_volume", std::to_string(volume * static_cast<uint64_t>(close)));
+    UniValue names{UniValue::VARR}; for (const auto& flag : flags) names.push_back(flag); c.pushKV("flags", names);
+    return c;
+}
+UniValue CandlesJson(const char* interval, int64_t interval_ms, int64_t before_ms, int64_t span, const std::vector<UniValue>& candles,
+                     const std::string& source = "https://operator.invalid:18443", bool remote = true)
+{
+    UniValue v{UniValue::VOBJ}; v.pushKV("available", true); v.pushKV("source", source); v.pushKV("source_kind", "operator_observed");
+    v.pushKV("certified", false); v.pushKV("interval", interval); v.pushKV("interval_ms", interval_ms);
+    v.pushKV("from_ms", before_ms - span * interval_ms); v.pushKV("before_ms", before_ms); v.pushKV("more", false);
+    UniValue array{UniValue::VARR}; for (const auto& c : candles) array.push_back(c); v.pushKV("candles", array);
+    v.pushKV("endpoint_reported", remote);
+    return v;
+}
 
 Curve LimitCurve(const char* side, unsigned char owner, CAmount price, CAmount quantity, CAmount filled = 0)
 {
@@ -320,6 +364,9 @@ struct FundingReadProbe {
     int live_ms{0};
     //! Every getflowmeshmarketdata options object, in order.
     std::vector<UniValue> market_options;
+    //! getflowmeshcandles: its reply and every options object, in order.
+    UniValue candles_response;
+    std::vector<UniValue> candle_options;
     std::vector<std::unique_ptr<CRPCCommand>> commands;
     FundingReadProbe()
     {
@@ -393,6 +440,17 @@ struct FundingReadProbe {
                     if (hold && !release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic funding read exceeded its test bound"};
                     if (fail) throw std::runtime_error{"Synthetic funding refresh unavailable"};
                     result = data; return true;
+                },
+                std::vector<std::pair<std::string, bool>>{}, 998900 + commands.size())};
+            tableRPC.appendCommand(command->name, command.get()); commands.push_back(std::move(command));
+        }
+        {
+            auto command{std::make_unique<CRPCCommand>("hidden", "getflowmeshcandles",
+                [this](const JSONRPCRequest& request, UniValue& result, bool) {
+                    methods.emplace_back("getflowmeshcandles");
+                    candle_options.push_back(request.params[1]);
+                    if (!candles_response.isObject()) throw std::runtime_error{"Synthetic candles unavailable"};
+                    result = candles_response; return true;
                 },
                 std::vector<std::pair<std::string, bool>>{}, 998900 + commands.size())};
             tableRPC.appendCommand(command->name, command.get()); commands.push_back(std::move(command));
@@ -1803,6 +1861,112 @@ private Q_SLOTS:
         UniValue off{UniValue::VOBJ}; off.pushKV("available", false); off.pushKV("unavailable_reason", "endpoint_does_not_advertise_clearing_ticks");
         off.pushKV("source", "endpoint_reported"); off.pushKV("gap", false); off.pushKV("more", false); off.pushKV("ticks", UniValue{UniValue::VARR});
         QCOMPARE(broken("clearing_ticks", off).ticks->reason, QStringLiteral("endpoint_does_not_advertise_clearing_ticks"));
+    }
+    void observedTimesAndCandlePagesParseFailClosed()
+    {
+        const auto s{Parse(RemoteDataWithTimes())};
+        QVERIFY(s.observed && s.observed->available);
+        QCOMPARE(s.observed->source, QStringLiteral("https://operator.invalid:18443"));
+        QCOMPARE(s.observed->rows.size(), size_t{2});
+        QCOMPARE(s.observed->rows[1].ms, OBSERVED_T0 + 61'000);
+        QVERIFY(s.observed->rows[1].hash == H(4));
+        QVERIFY(s.observed->rows[0].mode == flowmesh::ObservedMode::LIVE);
+        // A malformed section is only unavailable; the rest of the reply is not.
+        const auto broken = [](const UniValue& section) { auto bad{RemoteDataWithViews()}; bad.pushKV("observed_time", section); return Parse(bad); };
+        auto certified{ObservedJson({})}; certified.pushKV("certified", true);
+        for (const auto& section : {certified, ObservedJson({StampJson(2, H(4), "live", 5), StampJson(1, H(12), "live", 6)}),
+                                    ObservedJson({StampJson(3, H(4), "live", 5)}), ObservedJson({StampJson(2, H(4), "sometimes", 5)}),
+                                    ObservedJson({StampJson(2, H(4), "delayed", -1)})}) {
+            const auto parsed{broken(section)};
+            QVERIFY(parsed.observed && !parsed.observed->available);
+            QCOMPARE(parsed.observed->reason, QStringLiteral("malformed"));
+            QVERIFY(parsed.ticks->available); QCOMPARE(parsed.history.size(), size_t{1});
+        }
+        UniValue off{UniValue::VOBJ}; off.pushKV("available", false); off.pushKV("unavailable_reason", "endpoint_does_not_advertise_observed_time");
+        off.pushKV("source", "https://old.invalid"); off.pushKV("source_kind", "operator_observed"); off.pushKV("certified", false);
+        QCOMPARE(broken(off).observed->reason, QStringLiteral("endpoint_does_not_advertise_observed_time"));
+        // Candle pages: exact, and refused when misaligned, overlapping or of another interval.
+        const auto page{ParseCandles(CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 5,
+            {CandleJson(OBSERVED_T0, 1, 1, 10, 10, 10, 10, 3), CandleJson(OBSERVED_T0 + 60'000, 2, 3, 12, 14, 9, 13, 5, {"partial"})}),
+            flowmesh::CandleInterval::M1)};
+        QVERIFY(page.available && page.remote); QCOMPARE(page.candles.size(), size_t{2});
+        QCOMPARE(page.candles[1].high, CAmount{14}); QVERIFY(page.candles[1].quote_volume == 65); QCOMPARE(page.candles[1].flags, uint8_t{flowmesh::CANDLE_PARTIAL});
+        for (const auto& bad : {CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 5, {CandleJson(OBSERVED_T0 + 1, 1, 1, 10, 10, 10, 10, 3)}),
+                                CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 5, {CandleJson(OBSERVED_T0, 1, 2, 10, 10, 10, 10, 3), CandleJson(OBSERVED_T0 + 60'000, 2, 3, 10, 10, 10, 10, 3)}),
+                                CandlesJson("5m", 300'000, OBSERVED_T0 + 300'000, 5, {}),
+                                CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 5, {CandleJson(OBSERVED_T0, 1, 1, 10, 11, 12, 10, 3)})}) {
+            const auto parsed{ParseCandles(bad, flowmesh::CandleInterval::M1)};
+            QVERIFY(!parsed.available); QCOMPARE(parsed.reason, QStringLiteral("malformed"));
+        }
+    }
+    void heldTimesFollowHeldTicksAndOneSource()
+    {
+        B3FlowMeshTradingPanel panel;
+        auto s{Parse(RemoteDataWithTimes())};
+        panel.m_snapshot = s; panel.mergeHeldTicks();
+        QCOMPARE(panel.m_ticks.size(), size_t{2}); QCOMPARE(panel.m_tick_times.size(), size_t{2});
+        QCOMPARE(panel.m_tick_times_source, QStringLiteral("https://operator.invalid:18443"));
+        // A row for a tick not held, or with another hash, is never kept.
+        std::map<uint64_t, flowmesh::ObservedStamp> held;
+        ObservedTimes other; other.available = true; other.rows = s.observed->rows;
+        other.rows[1].hash = H(99); other.rows.push_back(other.rows[0]); other.rows.back().sequence = 7;
+        MergeHeldTimes(held, panel.m_ticks, &other);
+        QCOMPARE(held.size(), size_t{1}); QVERIFY(held.contains(1));
+        // Another source starts its own series.
+        s.observed->source = QStringLiteral("https://other.invalid"); s.observed->rows.pop_back();
+        panel.m_snapshot = s; panel.mergeHeldTicks();
+        QCOMPARE(panel.m_tick_times.size(), size_t{1}); QCOMPARE(panel.m_tick_times_source, QStringLiteral("https://other.invalid"));
+        // Replaced ticks drop every time.
+        TickPage replaced; replaced.available = true; replaced.gap = true;
+        Tick nine; nine.sequence = 9; nine.hash = QString::fromStdString(H(40).GetHex()); nine.kind = QStringLiteral("execution"); nine.side = QStringLiteral("none");
+        replaced.ticks = {nine}; s.ticks = replaced; s.observed->rows.clear(); s.next_sequence = 10;
+        panel.m_snapshot = s; panel.mergeHeldTicks();
+        QCOMPARE(panel.m_ticks.size(), size_t{1}); QVERIFY(panel.m_tick_times.empty());
+    }
+    void marketReadsAskForObservedTimeAndCandlesWhenDue()
+    {
+        FundingReadProbe probe; probe.live_ms = 0; probe.data = RemoteDataWithTimes();
+        probe.candles_response = CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 300,
+            {CandleJson(OBSERVED_T0, 1, 1, 1000, 1000, 1000, 1000, 250'000), CandleJson(OBSERVED_T0 + 60'000, 2, 2, 1000, 1000, 1000, 1000, 250'000)});
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.market_options.size(), size_t{1});
+        QVERIFY(probe.market_options[0]["observed_time"].isTrue());
+        // Nothing observed was displayed before that read: no candles yet.
+        QVERIFY(probe.candle_options.empty());
+        QVERIFY(panel.m_snapshot->observed && panel.m_snapshot->observed->available);
+        QCOMPARE(panel.m_tick_times.size(), size_t{2});
+        // The next job reads a whole window.
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.candle_options.size(), size_t{1});
+        QCOMPARE(probe.candle_options[0]["interval"].get_str(), std::string{"1m"});
+        QCOMPARE(probe.candle_options[0]["limit"].getInt<int>(), 300);
+        QVERIFY(panel.m_candles && panel.m_candles->available); QCOMPARE(panel.m_candles->candles.size(), size_t{2});
+        // Within ten seconds nothing more; afterwards only the newest few.
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.candle_options.size(), size_t{1});
+        QVERIFY(!panel.candlesDue());
+        // A page of the newest intervals replaces only what the window held there.
+        panel.applyCandles(ParseCandles(CandlesJson("1m", 60'000, OBSERVED_T0 + 180'000, 2,
+            {CandleJson(OBSERVED_T0 + 60'000, 2, 3, 1000, 1004, 998, 1002, 500'000), CandleJson(OBSERVED_T0 + 120'000, 4, 4, 1003, 1003, 1003, 1003, 1)}),
+            flowmesh::CandleInterval::M1), 3);
+        QCOMPARE(panel.m_candles->candles.size(), size_t{3});
+        QCOMPARE(panel.m_candles->candles[0].first_sequence, uint64_t{1});
+        QCOMPARE(panel.m_candles->candles[1].high, CAmount{1004});
+        QCOMPARE(panel.m_candles->before_ms, OBSERVED_T0 + 180'000);
+        // The forming candle that the held ticks could not extend is fetched again.
+        panel.m_candles_refetch = true;
+        QVERIFY(panel.candlesDue()); QCOMPARE(panel.candlesDue()->second, size_t{300});
+        panel.m_candles_refetch = false;
+        // Another interval (or source) is a whole window again.
+        panel.m_candle_interval = flowmesh::CandleInterval::M5;
+        const auto due{panel.candlesDue()};
+        QVERIFY(due); QCOMPARE(due->second, size_t{300});
+        // A failed candles read never fails the job or the market read.
+        probe.candles_response = UniValue{};
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QVERIFY(!panel.m_read_failed);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void heldTicksExtendOnlyConsecutiveAgreeingPages()
     {
