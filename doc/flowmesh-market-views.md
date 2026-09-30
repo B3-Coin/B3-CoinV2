@@ -141,6 +141,13 @@ Where it runs:
   (`work_budget`, as the computation would exceed its budget on such a book);
 - the public API neither accepts nor serves it.
 
+## 2b. Book levels
+
+The exact price levels of every verified standing curve, with the standing
+clearing (the indicative without a draft), are a separate local-only option
+(`levels`); see doc/flowmesh-order-book.md. The book never uses the ticket's
+draft indicative.
+
 ## 3. Qt
 
 Every selected-market read (refresh and live update) asks for the ticks after

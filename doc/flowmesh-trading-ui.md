@@ -37,7 +37,11 @@ matched B3 notional, deducted from seller proceeds. An order request itself
 has no on-chain network fee.
 
 There is **one order per side per account**. A new Buy replaces that account's
-Buy curve; a new Sell replaces its Sell curve. FlowMesh matches persistent
+Buy curve; a new Sell replaces its Sell curve. To place several prices on one
+side, tick **Ladder · up to 4 prices**: the price and quantity fields are its
+first price and up to three more rows follow. A ladder is still one order: it
+replaces that side, a price cannot be cancelled alone, and a buy reserves
+exactly the sum of quantity x price. FlowMesh matches persistent
 demand/supply curves at one uniform price per certified auction, not by
 price-time order-book priority. **Your orders** shows certified remaining and
 reserved amounts. Choose Buy or Sell in the order form, then use the matching
@@ -59,10 +63,16 @@ the old one or proves it failed.
 ## Read the graph and liquidity
 
 Price points are actual certified clearings, indexed by **microblock sequence**,
-not timestamps or invented candles. Liquidity shows demand and supply evaluated
-at each price—not cumulative CLOB levels. Curve lines are a display guide, not
-an executable quote. Partial curve pages and bounded recent history are labeled;
-a dash in your fill column means unknown, not zero.
+not timestamps or invented candles. The **Order book** shows the exact levels of
+every verified standing order (all accounts, ladder prices included): sells
+above the spread, buys below, Total cumulative from the best price, your own
+orders marked, an optional price grouping, and a click puts a level's exact
+price into the ticket without signing anything. A crossed book can stand after
+a rationed auction; the spread row then shows the indicative next auction.
+**Curve depth** shows demand and supply evaluated at each price. Curve lines are
+a display guide, not an executable quote. Partial curve pages and bounded recent
+history are labeled; a dash in your fill column means unknown, not zero. See
+doc/flowmesh-order-book.md.
 
 An idle market may produce no new microblocks. An old chart point alone does not
 prove loss of quorum. Stale reads, paused markets and validator handoffs can
