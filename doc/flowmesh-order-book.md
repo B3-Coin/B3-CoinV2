@@ -113,7 +113,7 @@ any of those servers already serves.
   the step's places when grouped (`1.00` at 0.01, `0.9900` at 0.0001). In
   the B3 view with one level per canonical price, token-per-B3 prices do not
   end, so the view has ONE rounding rule (`ViewPricePlaces`, second review
-  of 2026-09-30): every price of a level or an order is rounded to the
+  of 2026-09-30): every price of a level, an order or a trade is rounded to the
   nearest value (half up), never by side, at the fewest places at which the
   market's best prices and their neighbouring ticks have three different
   values (the B3 view's tick precision at the market's price, even when a
@@ -132,9 +132,15 @@ any of those servers already serves.
   same rule. `ViewPricePlaces`, `ViewPrice`, `ViewSpread`,
   `NearestDisplayPrice`, `PadDecimals` and `NeededDecimals`
   (qt/b3flowmeshmarketdata.h) do the formatting; display only, never parsed
-  into an action. Trade displays (last price, trade history, the trades
-  tape, the chart, the clearing strip) keep `DisplayPrice`'s significant
-  digits for now.
+  into an action. Every other price the panel shows for the market uses the
+  same places too: the last price in the header and above the book, trade
+  history, the trades tape, the chart's labels and axis, the clearing
+  strip, the Liquidity table, the indicative line and the marketable-limit
+  note (a trade at 1003 atoms is `≈0.997` everywhere, not `≈0.99701` beside
+  a book row `0.997`). Without best prices the market's last trade sets the
+  places; with neither, each price keeps `DisplayPrice`'s own significant
+  digits. The review, the ticket's executable limit and saved-request
+  titles keep their exact forms.
 - Depth bars on ONE scale shared by both sides; the viewer's own orders
   marked; tooltips with order count, grouped range, average price.
 - Spread row: `Spread <difference> · <pct>%`. The difference is that of the

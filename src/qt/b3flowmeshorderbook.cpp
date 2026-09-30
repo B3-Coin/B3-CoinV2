@@ -544,16 +544,8 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
     const auto& u{s.units};
     const int decimals{u.decimals};
     m_head = s.head;
-    {
-        QString last{tr("Last trade  —")}, tip{last_tip};
-        for (auto it{s.history.rbegin()}; it != s.history.rend(); ++it) if (it->cleared && it->quantity > 0) {
-            const auto price{DisplayPrice(it->price, u, inverse)};
-            last = (s.remote && !s.execution_result_verified ? tr("Reported last  %1 %2") : tr("Last trade  %1 %2")).arg(price.text, quote);
-            if (price.approximate) tip += tr("\nExact price: %1 %2").arg(price.exact, quote);
-            break;
-        }
-        m_last->setText(last); m_last->setToolTip(tip);
-    }
+    const Trade* last_trade{nullptr};
+    for (auto it{s.history.rbegin()}; it != s.history.rend() && !last_trade; ++it) if (it->cleared && it->quantity > 0) last_trade = &*it;
     const QString price_units{inverse ? tr("%1 / B3").arg(token) : tr("B3 / %1").arg(token)};
     const auto* levels{s.levels ? &*s.levels : nullptr};
     const bool usable{levels && levels->available && levels->head == s.head && levels->grouping == grouping &&
@@ -572,8 +564,10 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
     // with the step's places.
     std::optional<int> places;
     const auto view_places = [&](const std::optional<CAmount> bid, const std::optional<CAmount> ask) {
+        // The market's price: its best prices, else its last trade.
         std::vector<CAmount> references;
         for (const auto& price : {bid, ask}) if (price) references.push_back(*price);
+        if (references.empty() && last_trade) references.push_back(last_trade->price);
         return ViewPricePlaces(u, inverse, references);
     };
     const auto label = [&](const CAmount price, Entry& entry) {
@@ -691,6 +685,16 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
         note_tip += tr("\nShown without the node's book levels: only the limit and ladder orders of the first 128-curve page are grouped by price; general curves are not turned into limit orders.");
     }
     m_price_places = places;
+    {
+        // The last trade at the view's places too: the price its row shows.
+        QString last{tr("Last trade  —")}, tip{last_tip};
+        if (last_trade) {
+            const auto price{ViewPrice(last_trade->price, u, inverse, places)};
+            last = (s.remote && !s.execution_result_verified ? tr("Reported last  %1 %2") : tr("Last trade  %1 %2")).arg(price.text, quote);
+            if (price.approximate) tip += tr("\nExact price: %1 %2").arg(price.exact, quote);
+        }
+        m_last->setText(last); m_last->setToolTip(tip);
+    }
     const auto ask_runs{Runs(std::move(ask_entries))}, bid_runs{Runs(std::move(bid_entries))};
     // Size and Total share one count: the places the rows need.
     int size_places{0};

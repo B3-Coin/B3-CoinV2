@@ -679,19 +679,6 @@ void B3FlowMeshTradingPanel::updateDataViews()
         m_chart->setTimeSeries(std::move(series));
         m_chart->setNowMs(QDateTime::currentMSecsSinceEpoch());
     }
-    QString strip, strip_exact;
-    if (ticks_current) {
-        const auto last_match{std::find_if(m_ticks.rbegin(), m_ticks.rend(), [](const auto& tick) { return tick.cleared; })};
-        const auto& shown{last_match != m_ticks.rend() ? *last_match : m_ticks.back()};
-        strip = ClearingTickText(shown, view->units, inverse, view->remote, &strip_exact, observedClock(shown.sequence, shown.hash));
-        if (last_match != m_ticks.rend() && last_match != m_ticks.rbegin()) strip += tr(" · later auctions had no match");
-        strip_exact = tr("Auction #%1").arg(shown.sequence) + (strip_exact.isEmpty() ? QString{} : QLatin1Char('\n') + strip_exact);
-    } else if (matched && view->ticks && !view->ticks->available) {
-        strip = tr("Auction ticks unavailable (%1)").arg(view->ticks->reason);
-    }
-    if (m_clearing_strip->text() != strip) m_clearing_strip->setText(strip);
-    if (const QString tip{ClearingStripTip() + (strip_exact.isEmpty() ? QString{} : QStringLiteral("\n") + strip_exact)}; m_clearing_strip->toolTip() != tip) m_clearing_strip->setToolTip(tip);
-    m_clearing_strip->setVisible(!strip.isEmpty());
     {
         // The grouping of this market and orientation (another one's never
         // carries over), and the choices around the displayed price.
@@ -701,6 +688,24 @@ void B3FlowMeshTradingPanel::updateDataViews()
         m_order_book->setGroupingChoices(BookGroupingChoices(best_bid, best_ask, matched ? view->units : Units{}, inverse), grouping);
         m_order_book->setSnapshot(matched ? view : std::nullopt, inverse, grouping);
     }
+    // Every price in this view at the order book's places (the view's one
+    // rounding rule): trades, the chart and the clearing strip read the
+    // same as the book's rows and Your orders.
+    const auto view_places{m_order_book->pricePlaces()};
+    m_chart->setPricePlaces(view_places);
+    QString strip, strip_exact;
+    if (ticks_current) {
+        const auto last_match{std::find_if(m_ticks.rbegin(), m_ticks.rend(), [](const auto& tick) { return tick.cleared; })};
+        const auto& shown{last_match != m_ticks.rend() ? *last_match : m_ticks.back()};
+        strip = ClearingTickText(shown, view->units, inverse, view->remote, &strip_exact, observedClock(shown.sequence, shown.hash), view_places);
+        if (last_match != m_ticks.rend() && last_match != m_ticks.rbegin()) strip += tr(" · later auctions had no match");
+        strip_exact = tr("Auction #%1").arg(shown.sequence) + (strip_exact.isEmpty() ? QString{} : QLatin1Char('\n') + strip_exact);
+    } else if (matched && view->ticks && !view->ticks->available) {
+        strip = tr("Auction ticks unavailable (%1)").arg(view->ticks->reason);
+    }
+    if (m_clearing_strip->text() != strip) m_clearing_strip->setText(strip);
+    if (const QString tip{ClearingStripTip() + (strip_exact.isEmpty() ? QString{} : QStringLiteral("\n") + strip_exact)}; m_clearing_strip->toolTip() != tip) m_clearing_strip->setToolTip(tip);
+    m_clearing_strip->setVisible(!strip.isEmpty());
     {
         const bool timed{matched && view->observed && view->observed->available};
         const auto rows{matched && m_ticks_market == view->market ? B3FlowMeshTradeTape::BuildRows(m_ticks, m_tick_times, m_received_times)
@@ -710,7 +715,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
                               matched && view->observed ? view->observed->reason : QString{},
                               // As the trade history: a remote client's ticks
                               // are the endpoint's claims (critique B5).
-                              matched && view->remote && !view->execution_result_verified);
+                              matched && view->remote && !view->execution_result_verified, view_places);
     }
     if (!matched || !view->units.known) {
         for (auto* table : {m_depth_view, m_history_view, m_own_view}) SetRows(table, {});
@@ -724,7 +729,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
     m_own_note->setToolTip(tr("Orders are persistent certified curves. Replacing a side changes that entire curve; there is no price-time priority queue."));
     std::vector<QStringList> depth, history, own;
     const auto add_depth = [&](const Depth& d) {
-        depth.push_back({FormatDisplayPrice(d.price, u, inverse),
+        depth.push_back({ViewPrice(d.price, u, inverse, view_places).text,
             FormatDepthQuantity(d.price, inverse ? d.supply : d.demand, u.decimals, inverse),
             FormatDepthQuantity(d.price, inverse ? d.demand : d.supply, u.decimals, inverse)});
     };
@@ -752,7 +757,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
     std::vector<QString> history_times;
     for (auto it{s.history.rbegin()}; it != s.history.rend(); ++it) {
         if (!it->cleared || it->quantity == 0) continue;
-        const auto price{DisplayPrice(it->price, u, inverse)};
+        const auto price{ViewPrice(it->price, u, inverse, view_places)};
         if (history.empty()) {
             last_price = price.text + QLatin1Char(' ') + price_units;
             if (price.approximate) last_price_tip = tr("Exact last trade price: %1 %2").arg(price.exact, price_units);
@@ -785,9 +790,8 @@ void B3FlowMeshTradingPanel::updateDataViews()
         separators = std::move(shifted);
         separators.insert(static_cast<int>(at));
     }
-    // Your orders' prices as the order book shows them: the view's one
-    // rounding rule, so an order reads the same in its row and here.
-    const auto& view_places{m_order_book->pricePlaces()};
+    // Your orders' prices as the order book shows them (view_places), so
+    // an order reads the same in its row and here.
     for (const auto& c : s.own_curves) {
         QString description;
         const auto ladder{LadderStepsOf(c)};
@@ -902,7 +906,9 @@ void B3FlowMeshTradingPanel::updateTicket()
         if (limit) {
             // The price field above holds the exact limit; this note only reads it.
             const QString price_units{inverse ? tr("%1 / B3").arg(ticker) : tr("B3 / %1").arg(ticker)};
-            const auto shown{DisplayPrice(limit->price, m_snapshot->units, inverse)}, reference{DisplayPrice(limit->reference, m_snapshot->units, inverse)};
+            // Read as the order book shows them (the best opposite is its row beside the spread).
+            const auto& places{m_order_book->pricePlaces()};
+            const auto shown{ViewPrice(limit->price, m_snapshot->units, inverse, places)}, reference{ViewPrice(limit->reference, m_snapshot->units, inverse, places)};
             note = tr("Limit %1 %2 · best opposite %3 · at most %4% slippage\nVisible certified depth at or better: %5 %6 (not a fill estimate). Any unfilled part rests until you cancel it.")
                        .arg(shown.text, price_units, reference.text, FormatSlippage(limit->slippage_bps), FormatAmount(limit->visible, m_snapshot->units.decimals), ticker);
             if (shown.approximate || reference.approximate) note_tip = tr("Exact limit: %1 %3\nExact best opposite: %2 %3").arg(limit->display, limit->reference_display, price_units);
@@ -919,7 +925,7 @@ void B3FlowMeshTradingPanel::updateTicket()
             const auto& view{m_snapshot->indicative};
             const bool same{view && view->has_draft && view->draft_side == QString::fromStdString(draft["side"].get_str()) &&
                             view->draft_price == draft["price"].getInt<CAmount>() && view->draft_quantity == draft["quantity"].getInt<CAmount>()};
-            line = same ? IndicativeText(*view, m_snapshot->units, inverse, &exact) : tr("Indicative price: updating for this order…");
+            line = same ? IndicativeText(*view, m_snapshot->units, inverse, &exact, m_order_book->pricePlaces()) : tr("Indicative price: updating for this order…");
         }
         if (m_indicative->text() != line) m_indicative->setText(line);
         if (const QString tip{IndicativeTip() + (exact.isEmpty() ? QString{} : QStringLiteral("\n") + exact)}; m_indicative->toolTip() != tip) m_indicative->setToolTip(tip);

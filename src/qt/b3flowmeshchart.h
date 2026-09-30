@@ -74,6 +74,10 @@ public:
     void setSnapshot(const std::optional<B3FlowMeshMarketData::Snapshot>& snapshot);
     void setMode(Mode mode);
     void setInverted(bool inverted);
+    //! The view's price places (ViewPricePlaces; nullopt: DisplayPrice):
+    //! every price label, as the order book shows it.
+    void setPricePlaces(std::optional<int> places);
+    const std::optional<int>& pricePlaces() const { return m_price_places; }
     void setLoading(bool loading);
     void setStale(bool stale);
     void setCandleInterval(uint64_t microblocks);
@@ -123,6 +127,7 @@ private:
     Mode m_mode{Mode::Prices};
     bool m_loading{false}, m_stale{false};
     bool m_inverted{false};
+    std::optional<int> m_price_places;
     QPointF m_pointer{-1, -1};
     QString m_exact_prices;
     std::function<void()> m_paint_observer;

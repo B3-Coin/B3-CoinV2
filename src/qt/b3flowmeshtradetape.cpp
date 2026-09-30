@@ -111,7 +111,8 @@ QString B3FlowMeshTradeTape::ReportedLabel()
 }
 
 void B3FlowMeshTradeTape::setRows(const std::vector<Row>& rows, const B3FlowMeshMarketData::Units& units, const bool inverse,
-                                  const QString& source, const bool remote, const QString& reason, const bool reported)
+                                  const QString& source, const bool remote, const QString& reason, const bool reported,
+                                  const std::optional<int> places)
 {
     using namespace B3FlowMeshMarketData;
     const bool known{units.known && units.decimals >= 0 && units.decimals <= 18};
@@ -134,7 +135,7 @@ void B3FlowMeshTradeTape::setRows(const std::vector<Row>& rows, const B3FlowMesh
     if (m_table->rowCount() != count) m_table->setRowCount(count);
     for (int r{0}; r < count; ++r) {
         const auto& row{rows[static_cast<size_t>(r)]};
-        const auto price{DisplayPrice(row.price, units, inverse)};
+        const auto price{ViewPrice(row.price, units, inverse, places)};
         QString time_tip;
         const QString time{TimeText(row, source, remote, &time_tip)};
         const QStringList values{inverse && row.price == 0 ? QStringLiteral("—") : price.text,

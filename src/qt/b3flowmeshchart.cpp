@@ -146,6 +146,7 @@ QString B3FlowMeshChart::AuctionOrderLabel(const uint64_t auctions)
     return auctions == 1 ? tr("Every auction") : tr("Every %1 auctions").arg(auctions);
 }
 void B3FlowMeshChart::setInverted(bool inverted) { if (m_inverted == inverted) return; m_inverted = inverted; rebuildCandles(); update(); }
+void B3FlowMeshChart::setPricePlaces(const std::optional<int> places) { if (m_price_places == places) return; m_price_places = places; update(); }
 void B3FlowMeshChart::setLoading(bool loading) { if (m_loading == loading) return; m_loading = loading; update(); }
 void B3FlowMeshChart::setStale(bool stale) { if (m_stale == stale) return; m_stale = stale; update(); }
 void B3FlowMeshChart::setCandleInterval(uint64_t microblocks)
@@ -293,7 +294,7 @@ void B3FlowMeshChart::paintEvent(QPaintEvent*)
     m_exact_prices.clear();
     int axis_width{88};
     if (m_snapshot && m_mode == Mode::Prices) for (const auto& candle : m_candles) for (const auto price : {candle.low, candle.high}) {
-        axis_width = std::max(axis_width, p.fontMetrics().horizontalAdvance(FormatDisplayPrice(price, m_snapshot->units, m_inverted)) + 12);
+        axis_width = std::max(axis_width, p.fontMetrics().horizontalAdvance(ViewPrice(price, m_snapshot->units, m_inverted, m_price_places).text) + 12);
     }
     axis_width = std::min(axis_width, std::max(88, width() / 3));
     const QRectF plot{12, m_mode == Mode::Prices ? 70.0 : 26.0, static_cast<qreal>(std::max(20, width() - axis_width - 16)), static_cast<qreal>(std::max(20, height() - (m_mode == Mode::Prices ? 130 : 66)))};
@@ -323,7 +324,7 @@ void B3FlowMeshChart::paintEvent(QPaintEvent*)
     // listed exactly for the hover tooltip.
     QStringList exact;
     const auto label = [&](const QString& name, CAmount price) {
-        const auto shown{DisplayPrice(price, units, m_inverted)};
+        const auto shown{ViewPrice(price, units, m_inverted, m_price_places)};
         if (shown.approximate) exact << name + QLatin1Char(' ') + shown.exact;
         return shown.text;
     };
@@ -433,7 +434,7 @@ void B3FlowMeshChart::paintTime(QPainter& p, const QRectF& plot, const int axis_
     const QRectF price_plot{plot.left(), plot.top() + 8, plot.width(), plot.height() * 0.74 - 16};
     const QString price_units{(m_inverted ? QStringLiteral("%1 / B3") : QStringLiteral("B3 / %1")).arg(units.ticker)};
     const auto label = [&](const QString& name, CAmount price) {
-        const auto shown{DisplayPrice(price, units, m_inverted)};
+        const auto shown{ViewPrice(price, units, m_inverted, m_price_places)};
         if (shown.approximate) exact << name + QLatin1Char(' ') + shown.exact;
         return shown.text;
     };

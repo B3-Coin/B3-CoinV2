@@ -1594,6 +1594,39 @@ private Q_SLOTS:
         }
         QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_wallet);
     }
+    void aTradeReadsTheSameAsTheBooksRowForItsPrice()
+    {
+        // Every price in a view follows its one rule: the last trade (1003
+        // atoms here) read ≈0.99701 in the header, above the book, in the
+        // trade history, the tape and the clearing strip, beside the book's
+        // row 0.997 for the same price.
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); panel.m_timer->stop();
+        ShowSyntheticTimeMarket(panel, SyntheticSource::LOCAL);
+        const auto places{panel.m_order_book->pricePlaces()};
+        QCOMPARE(places, std::optional<int>{3});
+        const auto& units{panel.m_snapshot->units};
+        const auto& trade{panel.m_snapshot->history.back()};
+        QVERIFY(trade.cleared);
+        QCOMPARE(trade.price, CAmount{1003});
+        const QString shown{NearestDisplayPrice(trade.price, units.decimals, true, *places)};
+        QCOMPARE(shown, QStringLiteral("0.997"));
+        // The book's row for that price.
+        bool row_found{false};
+        for (const auto& row : panel.m_order_book->model()->rows()) {
+            if (row.click_canonical == trade.price) { QCOMPARE(row.price, shown); row_found = true; }
+        }
+        QVERIFY(row_found);
+        QCOMPARE(panel.m_last_price->text(), QStringLiteral("≈%1 tUSD / B3").arg(shown));
+        QCOMPARE(panel.findChild<QLabel*>(QStringLiteral("flowMeshBookLast"))->text(), QStringLiteral("Last trade  ≈%1 tUSD").arg(shown));
+        QCOMPARE(panel.m_history_view->item(0, 1)->text(), QStringLiteral("≈%1").arg(shown));
+        QCOMPARE(panel.m_trade_tape->table()->item(0, 0)->text(), QStringLiteral("≈%1").arg(shown));
+        QVERIFY2(panel.m_clearing_strip->text().contains(QStringLiteral(" at ≈%1 tUSD / B3").arg(shown)), qPrintable(panel.m_clearing_strip->text()));
+        // Each keeps the exact price on hover.
+        QVERIFY(panel.m_last_price->toolTip().contains(ExactInversePrice(1003, 6)));
+        QVERIFY(panel.m_trade_tape->table()->item(0, 0)->toolTip().contains(ExactInversePrice(1003, 6)));
+        // The chart's labels and axis too.
+        QCOMPARE(panel.m_chart->pricePlaces(), places);
+    }
     void levelsWhosePricesRoundToOneValueShareARow()
     {
         // Far from the market two canonical ticks can round to one value at
@@ -3678,10 +3711,11 @@ private Q_SLOTS:
         QCOMPARE(first["indicative"]["draft"]["quantity"].getInt<int64_t>(), int64_t{1'000'000});
         QCOMPARE(panel.m_ticks.size(), size_t{2});
         QVERIFY(!panel.m_clearing_strip->isHidden());
-        QVERIFY(panel.m_clearing_strip->text().startsWith(QStringLiteral("Last auction · 0.25 tUSD at 1 B3 / tUSD")));
+        // At the view's places, as the order book shows prices (the tick's three).
+        QVERIFY2(panel.m_clearing_strip->text().startsWith(QStringLiteral("Last auction · 0.25 tUSD at 1.000 B3 / tUSD")), qPrintable(panel.m_clearing_strip->text()));
         QVERIFY(panel.m_clearing_strip->toolTip().contains(QStringLiteral("Auction #2")));
         QVERIFY(!panel.m_indicative->isHidden());
-        QVERIFY(panel.m_indicative->text().contains(QStringLiteral("would clear at 1 B3 / tUSD")));
+        QVERIFY2(panel.m_indicative->text().contains(QStringLiteral("would clear at 1.000 B3 / tUSD")), qPrintable(panel.m_indicative->text()));
         // The chart draws the held ticks.
         QCOMPARE(panel.m_chart->candles().size(), size_t{1});
         // The next read asks only for the ticks after the last one held.
@@ -7495,16 +7529,18 @@ private Q_SLOTS:
         B3FlowMeshTradingPanel panel; panel.resize(1320, 940); panel.m_timer->stop();
         ShowSyntheticClearings(panel);
         QVERIFY(panel.inverted());
-        // The latest clearing, 1009 B3 atoms per tUSD atom, is 1000/1009 tUSD per B3.
-        QCOMPARE(panel.m_last_price->text(), QStringLiteral("≈0.99108 tUSD / B3"));
+        // The latest clearing, 1009 B3 atoms per tUSD atom, is 1000/1009 tUSD
+        // per B3: at the view's three places, as the order book shows prices.
+        QCOMPARE(panel.m_order_book->pricePlaces(), std::optional<int>{3});
+        QCOMPARE(panel.m_last_price->text(), QStringLiteral("≈0.991 tUSD / B3"));
         QCOMPARE(panel.m_last_price->toolTip(), QStringLiteral("Exact last trade price: 1000/1009 tUSD / B3"));
-        QCOMPARE(panel.m_history_view->item(0, 1)->text(), QStringLiteral("≈0.99108"));
+        QCOMPARE(panel.m_history_view->item(0, 1)->text(), QStringLiteral("≈0.991"));
         QVERIFY(panel.m_history_view->item(0, 1)->toolTip().contains(QStringLiteral("1000/1009")));
         const int oldest{panel.m_history_view->rowCount() - 1};
-        QCOMPARE(panel.m_history_view->item(oldest, 1)->text(), QStringLiteral("1")); // 1000: exact
+        QCOMPARE(panel.m_history_view->item(oldest, 1)->text(), QStringLiteral("1.000")); // 1000: exact
         QVERIFY(panel.m_history_view->item(oldest, 1)->toolTip().isEmpty());
         auto* last{panel.findChild<QLabel*>(QStringLiteral("flowMeshBookLast"))};
-        QCOMPARE(last->text(), QStringLiteral("Last trade  ≈0.99108 tUSD"));
+        QCOMPARE(last->text(), QStringLiteral("Last trade  ≈0.991 tUSD"));
         QVERIFY(last->toolTip().contains(QStringLiteral("Exact price: 1000/1009 tUSD")));
         // Candles: OHLC and axis labels, their exact forms on hover.
         panel.m_chart->grab();

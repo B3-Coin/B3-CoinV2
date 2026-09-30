@@ -62,15 +62,16 @@ QString ExactInversePrice(CAmount raw_price, int base_decimals);
 QString FixedDisplayPrice(CAmount raw_price, int base_decimals, bool inverse, int places, bool up, bool* exact = nullptr);
 //! As FixedDisplayPrice, rounded to the nearest value (half up) instead.
 QString NearestDisplayPrice(CAmount raw_price, int base_decimals, bool inverse, int places, bool* exact = nullptr);
-//! One view's price places: the one rounding rule of every price of a level
-//! or an order that view shows (the order book's rows, the spread beside
-//! them, your orders, a clicked level in the ticket), so the same canonical
+//! One view's price places: the one rounding rule of every price that view
+//! shows (the order book's rows, the spread beside them, your orders, a
+//! clicked level in the ticket, trades, the chart), so the same canonical
 //! price reads the same everywhere in it. B3 per token: the market tick's
 //! places, where every on-grid price is exact. Token per B3: the fewest
-//! places at which each reference price (the market's best prices) and its
-//! neighbouring canonical ticks have three different nearest values, none of
-//! them zero: the view resolves one tick at the market's price. Prices far
-//! from it may share a value (the order book shows them as one row).
+//! places at which each reference price (the market's best prices, or its
+//! last trade without any) and its neighbouring canonical ticks have three
+//! different nearest values, none of them zero: the view resolves one tick
+//! at the market's price. Prices far from it may share a value (the order
+//! book shows them as one row).
 //! nullopt without valid units or, in the B3 view, a positive reference, or
 //! when 18 places do not resolve it: callers then use DisplayPrice.
 std::optional<int> ViewPricePlaces(const Units& units, bool inverse, const std::vector<CAmount>& references);
@@ -275,11 +276,14 @@ std::vector<Trade> TicksAsTrades(const std::deque<Tick>& held);
 //! orientation; `when` is its observed local time ("": none shown). The
 //! auction's number belongs in the tooltip. `exact_prices`, when given,
 //! receives the exact form of every price the text shows rounded (empty
-//! when none was), for a tooltip.
+//! when none was), for a tooltip. Prices at the view's `places`
+//! (ViewPrice; nullopt: DisplayPrice).
 QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices = nullptr,
-                         const QString& when = {});
+                         const QString& when = {}, std::optional<int> places = std::nullopt);
 //! The indicative line for the ticket; empty when there is nothing to say.
-QString IndicativeText(const Indicative& view, const Units& units, bool inverse, QString* exact_prices = nullptr);
+//! Prices at the view's `places` (ViewPrice; nullopt: DisplayPrice).
+QString IndicativeText(const Indicative& view, const Units& units, bool inverse, QString* exact_prices = nullptr,
+                       std::optional<int> places = std::nullopt);
 //! A price-grouped projection of exact limit-shaped curves, not FIFO orders.
 //! Raw fields always retain canonical units: base raw quantity and B3 atoms.
 //! Inverse amount is gross B3 at this limit, not a promised execution amount.

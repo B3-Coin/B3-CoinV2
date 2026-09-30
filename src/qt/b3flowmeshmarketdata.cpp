@@ -643,7 +643,7 @@ std::vector<Trade> TicksAsTrades(const std::deque<Tick>& held)
     return out;
 }
 
-QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices, const QString& when)
+QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices, const QString& when, const std::optional<int> places)
 {
     if (exact_prices) exact_prices->clear();
     QString text;
@@ -654,7 +654,7 @@ QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, boo
     else if (!ValidUnits(units)) text = QObject::tr("Last auction%1 · matched (asset precision unavailable)").arg(at);
     else {
         const QString price_units{inverse ? QObject::tr("%1 / B3").arg(units.ticker) : QObject::tr("B3 / %1").arg(units.ticker)};
-        const auto price{DisplayPrice(tick.price, units, inverse)};
+        const auto price{ViewPrice(tick.price, units, inverse, places)};
         if (exact_prices && price.approximate) *exact_prices = QObject::tr("Exact price: %1 %2").arg(price.exact, price_units);
         text = QObject::tr("Last auction%1 · %2 %3 at %4 %5").arg(at).arg(FormatAmount(tick.volume, units.decimals), units.ticker,
                                                                    inverse && tick.price == 0 ? QObject::tr("zero") : price.text, price_units);
@@ -670,7 +670,7 @@ QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, boo
     return text;
 }
 
-QString IndicativeText(const Indicative& view, const Units& units, bool inverse, QString* exact_prices)
+QString IndicativeText(const Indicative& view, const Units& units, bool inverse, QString* exact_prices, const std::optional<int> places)
 {
     if (exact_prices) exact_prices->clear();
     if (!view.available) return view.reason.isEmpty() ? QString{} : QObject::tr("Indicative price unavailable (%1)").arg(view.reason);
@@ -679,7 +679,7 @@ QString IndicativeText(const Indicative& view, const Units& units, bool inverse,
     QStringList exact;
     const auto price = [&](CAmount raw) {
         if (inverse && raw == 0) return QObject::tr("zero");
-        const auto shown{DisplayPrice(raw, units, inverse)};
+        const auto shown{ViewPrice(raw, units, inverse, places)};
         if (shown.approximate && !exact.contains(shown.exact)) exact << shown.exact;
         return shown.text;
     };
