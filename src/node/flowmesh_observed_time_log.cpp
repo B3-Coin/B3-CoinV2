@@ -364,7 +364,7 @@ void FlowMeshObservedTimeLog::BeginLoad() noexcept
     m_loading = true;
 }
 
-void FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> rows,
+bool FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> rows,
                                          std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
                                          const std::optional<uint64_t> recorded_since) noexcept
 {
@@ -400,6 +400,7 @@ void FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> ro
             m_loading = false;
         }
         m_generation.fetch_add(1, std::memory_order_acq_rel);
+        return true;
     } catch (...) {
         try {
             std::lock_guard lock{m_mutex};
@@ -413,6 +414,7 @@ void FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> ro
         }
         m_record_failures.fetch_add(1, std::memory_order_relaxed);
         m_generation.fetch_add(1, std::memory_order_acq_rel);
+        return false;
     }
 }
 
@@ -605,8 +607,10 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db) no
             it.reset();
             disk_settled();
             finished = true;
-            log.FinishLoad(std::move(rows), std::move(candles), recorded_since);
-            log.SetPersisted(true);
+            // A history FinishLoad failed to install (it then leaves the log
+            // empty) is not what the disk holds: not persisted, as before
+            // the load moved to this thread.
+            log.SetPersisted(log.FinishLoad(std::move(rows), std::move(candles), recorded_since));
         } catch (const std::exception& e) {
             LogWarning("FlowMesh market %s: observed times could not be read (%s); recording starts empty\n",
                        market.GetHex(), e.what());
