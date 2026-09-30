@@ -1691,6 +1691,42 @@ private Q_SLOTS:
         panel.m_inflight_action.reset(); panel.m_inflight_market.clear();
         QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QVERIFY(m_wallet->IsLocked());
     }
+    void aLadderInYourOrdersKeepsEachExactPriceOnHover()
+    {
+        // Review of 2026-09-30 (nit): under the view's one rule, ladder
+        // steps far from the market read the same in Your orders (≈0.700 for
+        // 1428 and 1429 atoms), and a ladder had no exact price on hover.
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); panel.m_timer->stop();
+        ShowSyntheticTimeMarket(panel, SyntheticSource::LOCAL);
+        QCOMPARE(panel.m_order_book->pricePlaces(), std::optional<int>{3});
+        const auto decimals{panel.m_snapshot->units.decimals};
+        // The viewer's ask ladder far above the market (Buy B3 in this view).
+        panel.m_snapshot->own_curves = {LadderCurve("ask", 5, {{1428, 100'000}, {1429, 100'000}, {1001, 100'000}})};
+        panel.updateDataViews();
+        QCOMPARE(panel.m_own_view->item(0, 0)->text(), QStringLiteral("Buy B3"));
+        // Best first (the lowest canonical ask): 1001, 1428, 1429.
+        QCOMPARE(panel.m_own_view->item(0, 1)->text(), QStringLiteral("Ladder · ≈0.999 / ≈0.700 / ≈0.700"));
+        const auto tip{panel.m_own_view->item(0, 1)->toolTip()};
+        QVERIFY2(tip.startsWith(QStringLiteral("Exact prices, best first: %1 / %2 / %3 tUSD / B3")
+                                    .arg(ExactInversePrice(1001, decimals), ExactInversePrice(1428, decimals), ExactInversePrice(1429, decimals))), qPrintable(tip));
+        QVERIFY(tip.contains(QStringLiteral("round to one value")));
+        // Distinct labels: the exact prices without that note.
+        panel.m_snapshot->own_curves = {LadderCurve("ask", 5, {{1003, 100'000}, {1005, 100'000}})};
+        panel.updateDataViews();
+        QCOMPARE(panel.m_own_view->item(0, 1)->text(), QStringLiteral("Ladder · ≈0.997 / ≈0.995"));
+        QCOMPARE(panel.m_own_view->item(0, 1)->toolTip(),
+                 QStringLiteral("Exact prices, best first: %1 / %2 tUSD / B3").arg(ExactInversePrice(1003, decimals), ExactInversePrice(1005, decimals)));
+        // A limit order keeps its exact inverse limit.
+        panel.m_snapshot->own_curves = {LimitCurve("bid", 5, 997, 250'000, 50'000)};
+        panel.updateDataViews();
+        QCOMPARE(panel.m_own_view->item(0, 1)->toolTip(), QStringLiteral("Exact inverse limit: %1").arg(ExactInversePrice(997, decimals)));
+        // The canonical view shows every on-grid price exactly: nothing to add.
+        panel.m_snapshot->own_curves = {LadderCurve("ask", 5, {{1428, 100'000}, {1429, 100'000}})};
+        panel.m_orientation->setCurrentIndex(0); QCoreApplication::processEvents();
+        QCOMPARE(panel.m_own_view->item(0, 1)->text(), QStringLiteral("Ladder · 1.428 / 1.429"));
+        QVERIFY(panel.m_own_view->item(0, 1)->toolTip().isEmpty());
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_wallet);
+    }
     void levelsWhosePricesRoundToOneValueShareARow()
     {
         // Far from the market two canonical ticks can round to one value at

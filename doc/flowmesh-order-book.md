@@ -200,7 +200,11 @@ any of those servers already serves.
 - Qt: "Ladder · up to 4 prices" in the ticket (the price and quantity fields
   are the first price); the review lists every price best first with the
   exact reservation; Edit prefills what remains at each price; Your orders
-  and saved requests name ladders.
+  and saved requests name ladders. Your orders lists each price with
+  quantity left at the view's places; when any is rounded, its tooltip
+  lists every exact price best first and says when two round to one value
+  (steps far from the market, e.g. 1428 and 1429 atoms are both `≈0.700`
+  in the B3 view).
 - What users must be told (review S9): a ladder replaces the account's order
   on that side and its quantity counts from zero; a price cannot be cancelled
   or edited alone; clients before this version (c10c952, f8a3432) show a

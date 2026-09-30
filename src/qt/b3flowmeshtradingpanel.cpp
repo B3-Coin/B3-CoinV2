@@ -793,20 +793,39 @@ void B3FlowMeshTradingPanel::updateDataViews()
         separators.insert(static_cast<int>(at));
     }
     // Your orders' prices as the order book shows them (view_places), so
-    // an order reads the same in its row and here.
+    // an order reads the same in its row and here; each price cell's
+    // tooltip keeps the exact prices the row rounds.
+    std::vector<QString> own_tips;
     for (const auto& c : s.own_curves) {
-        QString description;
+        QString description, tip;
         const auto ladder{LadderStepsOf(c)};
-        if (c.points.size() == 2 && c.points[1].price == c.points[0].price + 1) description = ViewPrice(c.side == QStringLiteral("bid") ? c.points[0].price : c.points[1].price, u, inverse, view_places).text + QLatin1Char(' ') + (inverse ? price_units : QStringLiteral("B3"));
-        else if (ladder && ladder->size() > 1) {
+        if (c.points.size() == 2 && c.points[1].price == c.points[0].price + 1) {
+            const CAmount limit{c.side == QStringLiteral("bid") ? c.points[0].price : c.points[1].price};
+            description = ViewPrice(limit, u, inverse, view_places).text + QLatin1Char(' ') + (inverse ? price_units : QStringLiteral("B3"));
+            if (inverse) tip = tr("Exact inverse limit: %1").arg(ExactInversePrice(limit, u.decimals));
+        } else if (ladder && ladder->size() > 1) {
             // Best first, each price with quantity left.
             auto steps{*ladder};
             const bool bid{c.side == QStringLiteral("bid")};
             std::sort(steps.begin(), steps.end(), [&](const auto& a, const auto& b) { return bid ? a.price > b.price : a.price < b.price; });
-            QStringList prices;
-            for (const auto& step : steps) if (step.remaining > 0) prices << ViewPrice(step.price, u, inverse, view_places).text;
+            QStringList prices, exact;
+            bool rounded{false};
+            for (const auto& step : steps) {
+                if (step.remaining <= 0) continue;
+                const auto shown{ViewPrice(step.price, u, inverse, view_places)};
+                prices << shown.text; exact << shown.exact; rounded |= shown.approximate;
+            }
             description = tr("Ladder · %1").arg(prices.join(QStringLiteral(" / ")));
+            // Far from the market two steps can round to one label: every
+            // exact price, in the row's order, on hover.
+            if (rounded) {
+                tip = tr("Exact prices, best first: %1 %2").arg(exact.join(QStringLiteral(" / ")), inverse ? price_units : QStringLiteral("B3"));
+                if (std::set<QString>(prices.begin(), prices.end()).size() < static_cast<size_t>(prices.size())) {
+                    tip += tr("\nSome of them round to one value at this view's places; each is still its own price of this one order.");
+                }
+            }
         } else description = tr("%1-point curve").arg(c.points.size());
+        own_tips.push_back(tip);
         const bool buy{DisplayBuy(c.side, inverse)};
         own.push_back({inverse ? (buy ? tr("Buy B3") : tr("Sell B3")) : (buy ? tr("Buy") : tr("Sell")), description,
             (inverse ? (buy ? tr("Spend up to ") : tr("Receive up to ")) : QString{}) + FormatAmount(c.remaining, u.decimals),
@@ -843,12 +862,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
         if (m_depth_view->item(i, 1)->foreground().color() != B3Theme::kPositive) m_depth_view->item(i, 1)->setForeground(B3Theme::kPositive);
         if (m_depth_view->item(i, 2)->foreground().color() != B3Theme::kNegative) m_depth_view->item(i, 2)->setForeground(B3Theme::kNegative);
     }
-    for (int i{0}; i < static_cast<int>(s.own_curves.size()); ++i) {
-        const auto& c{s.own_curves[i]};
-        const bool limit_curve{c.points.size() == 2 && c.points[1].price == c.points[0].price + 1};
-        const QString tooltip{inverse && limit_curve ? tr("Exact inverse limit: %1").arg(ExactInversePrice(c.side == QStringLiteral("bid") ? c.points[0].price : c.points[1].price, u.decimals)) : QString{}};
-        m_own_view->item(i, 1)->setToolTip(tooltip);
-    }
+    for (int i{0}; i < static_cast<int>(own_tips.size()); ++i) m_own_view->item(i, 1)->setToolTip(own_tips[i]);
     for (int i{0}; i < static_cast<int>(s.own_curves.size()); ++i) { const auto& c{s.own_curves[i]}; m_own_view->item(i, 0)->setToolTip(tr("Certified account %1\nFilled: %2 %3\nCancellation targets this account's whole selected side.").arg(c.account, FormatAmount(c.filled, u.decimals), u.ticker)); }
     QString history_note{!s.history_available ? tr("History unavailable on this node") : history.empty() ? tr("No trades in recent history") : s.history_truncated || s.history_page_partial ? tr("Recent trades · partial history") : tr("Confirmed trades")};
     if (inverse && !history.empty()) history_note += tr(" · gross B3 before fees");
