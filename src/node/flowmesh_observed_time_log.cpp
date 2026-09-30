@@ -156,71 +156,101 @@ FlowMeshObservedTimeLog::FlowMeshObservedTimeLog(uint256 domain, flowmesh::Marke
 {
 }
 
+flowmesh::ObservedStamp FlowMeshObservedTimeLog::Apply(State& state, const Raw& raw)
+{
+    flowmesh::ObservedStamp stamp;
+    stamp.sequence = raw.sequence;
+    stamp.hash = raw.hash;
+    stamp.delay = raw.delay;
+    stamp.mode = raw.delay == flowmesh::ObservedDelay::NONE ? flowmesh::ObservedMode::LIVE : flowmesh::ObservedMode::DELAYED;
+    stamp.flags = raw.flags;
+    const int64_t wall{raw.wall};
+    const auto steady{raw.steady};
+    if (state.ring.empty() || state.ring.back().sequence < raw.sequence) {
+        if (!state.previous) {
+            stamp.flags |= flowmesh::OBSERVED_RESTART;
+        } else {
+            const int64_t wall_delta{wall - state.previous->first};
+            const int64_t steady_delta{std::chrono::duration_cast<std::chrono::milliseconds>(steady - state.previous->second).count()};
+            if (wall_delta - steady_delta > flowmesh::OBSERVED_CLOCK_SLEW_MS ||
+                steady_delta - wall_delta > flowmesh::OBSERVED_CLOCK_SLEW_MS) stamp.flags |= flowmesh::OBSERVED_CLOCK_STEP;
+        }
+        state.previous = std::pair{wall, steady};
+        if (wall >= flowmesh::OBSERVED_MS_LIMIT) {
+            // A clock at or past the display bound (10000-01-01) is
+            // broken, not a time: untimed, flagged suspect and never the
+            // monotonic floor, so later stamps are timed again as soon
+            // as it is back below the bound. CLOCK_BACK is reused
+            // deliberately: the delay vocabulary stays unchanged for a
+            // state no working clock reaches.
+            stamp.mode = flowmesh::ObservedMode::UNTIMED;
+            stamp.delay = flowmesh::ObservedDelay::CLOCK_BACK;
+            stamp.ms = 0;
+            stamp.flags |= flowmesh::OBSERVED_CLOCK_SUSPECT;
+        } else if (state.last_ms && wall < *state.last_ms) {
+            if (*state.last_ms - wall <= flowmesh::OBSERVED_CLOCK_SLEW_MS) {
+                stamp.ms = *state.last_ms;
+                stamp.flags |= flowmesh::OBSERVED_CLOCK_CLAMPED;
+            } else {
+                // Never pinned at the old value: no time until the clock
+                // passes it again.
+                stamp.mode = flowmesh::ObservedMode::UNTIMED;
+                stamp.delay = flowmesh::ObservedDelay::CLOCK_BACK;
+                stamp.ms = 0;
+                stamp.flags |= flowmesh::OBSERVED_CLOCK_STEP;
+            }
+        } else {
+            stamp.ms = std::max<int64_t>(wall, 1);
+        }
+        if (stamp.mode != flowmesh::ObservedMode::UNTIMED) state.last_ms = stamp.ms;
+        flowmesh::ObservedRollup::Changes changes;
+        state.rollup.Add(stamp, raw.tick, &changes);
+        state.ring.push_back(stamp);
+        if (state.ring.size() > RING) state.ring.pop_front();
+        if (!state.recorded_since) state.recorded_since = raw.sequence;
+        state.pending.rows.push_back(stamp);
+        if (state.pending.rows.size() > PENDING_ROWS_MAX) {
+            state.pending.rows.pop_front();
+            ++state.rows_not_persisted;
+        }
+        for (const auto& [interval, candle] : changes) {
+            state.pending.candles[{static_cast<uint8_t>(interval), candle.open_ms}] = candle;
+        }
+    }
+    return stamp;
+}
+
 flowmesh::ObservedStamp FlowMeshObservedTimeLog::Record(const uint64_t sequence, const uint256& hash,
                                                         const flowmesh::ObservedDelay delay,
                                                         const std::optional<flowmesh::ClearingTick>& tick) noexcept
 {
     try {
+        Raw raw;
+        raw.sequence = sequence;
+        raw.hash = hash;
+        raw.delay = delay;
+        raw.tick = tick;
+        // Clamped so the step check cannot overflow on any clock value.
+        raw.wall = std::clamp<int64_t>(m_clocks.wall_ms(), -flowmesh::OBSERVED_MS_LIMIT, flowmesh::OBSERVED_MS_LIMIT);
+        raw.steady = m_clocks.steady();
+        if (m_clock_suspect.load(std::memory_order_relaxed)) raw.flags |= flowmesh::OBSERVED_CLOCK_SUSPECT;
+        if (!tick || tick->sequence != sequence || tick->microblock_hash != hash) raw.flags |= flowmesh::OBSERVED_NO_CLEARING;
         flowmesh::ObservedStamp stamp;
-        stamp.sequence = sequence;
-        stamp.hash = hash;
-        stamp.delay = delay;
-        stamp.mode = delay == flowmesh::ObservedDelay::NONE ? flowmesh::ObservedMode::LIVE : flowmesh::ObservedMode::DELAYED;
-        // Clamped so the step check below cannot overflow on any clock value.
-        const int64_t wall{std::clamp<int64_t>(m_clocks.wall_ms(), -flowmesh::OBSERVED_MS_LIMIT, flowmesh::OBSERVED_MS_LIMIT)};
-        const auto steady{m_clocks.steady()};
-        if (m_clock_suspect.load(std::memory_order_relaxed)) stamp.flags |= flowmesh::OBSERVED_CLOCK_SUSPECT;
-        if (!tick || tick->sequence != sequence || tick->microblock_hash != hash) stamp.flags |= flowmesh::OBSERVED_NO_CLEARING;
-        std::lock_guard lock{m_mutex};
-        if (m_ring.empty() || m_ring.back().sequence < sequence) {
-            if (!m_previous) {
-                stamp.flags |= flowmesh::OBSERVED_RESTART;
-            } else {
-                const int64_t wall_delta{wall - m_previous->first};
-                const int64_t steady_delta{std::chrono::duration_cast<std::chrono::milliseconds>(steady - m_previous->second).count()};
-                if (wall_delta - steady_delta > flowmesh::OBSERVED_CLOCK_SLEW_MS ||
-                    steady_delta - wall_delta > flowmesh::OBSERVED_CLOCK_SLEW_MS) stamp.flags |= flowmesh::OBSERVED_CLOCK_STEP;
-            }
-            m_previous = std::pair{wall, steady};
-            if (wall >= flowmesh::OBSERVED_MS_LIMIT) {
-                // A clock at or past the display bound (10000-01-01) is
-                // broken, not a time: untimed, flagged suspect and never the
-                // monotonic floor, so later stamps are timed again as soon
-                // as it is back below the bound. CLOCK_BACK is reused
-                // deliberately: the delay vocabulary stays unchanged for a
-                // state no working clock reaches.
-                stamp.mode = flowmesh::ObservedMode::UNTIMED;
-                stamp.delay = flowmesh::ObservedDelay::CLOCK_BACK;
-                stamp.ms = 0;
-                stamp.flags |= flowmesh::OBSERVED_CLOCK_SUSPECT;
-            } else if (m_last_ms && wall < *m_last_ms) {
-                if (*m_last_ms - wall <= flowmesh::OBSERVED_CLOCK_SLEW_MS) {
-                    stamp.ms = *m_last_ms;
-                    stamp.flags |= flowmesh::OBSERVED_CLOCK_CLAMPED;
-                } else {
-                    // Never pinned at the old value: no time until the clock
-                    // passes it again.
-                    stamp.mode = flowmesh::ObservedMode::UNTIMED;
-                    stamp.delay = flowmesh::ObservedDelay::CLOCK_BACK;
-                    stamp.ms = 0;
-                    stamp.flags |= flowmesh::OBSERVED_CLOCK_STEP;
+        {
+            std::lock_guard lock{m_mutex};
+            if (m_loading) {
+                // Stamped by FinishLoad, as if the history had loaded first.
+                if (m_early.size() >= RING) {
+                    m_early.pop_front();
+                    ++m_early_dropped;
                 }
+                m_early.push_back(std::move(raw));
+                stamp.sequence = sequence;
+                stamp.hash = hash;
+                stamp.mode = flowmesh::ObservedMode::UNTIMED;
+                stamp.delay = delay;
             } else {
-                stamp.ms = std::max<int64_t>(wall, 1);
-            }
-            if (stamp.mode != flowmesh::ObservedMode::UNTIMED) m_last_ms = stamp.ms;
-            flowmesh::ObservedRollup::Changes changes;
-            m_rollup.Add(stamp, tick, &changes);
-            m_ring.push_back(stamp);
-            if (m_ring.size() > RING) m_ring.pop_front();
-            if (!m_recorded_since) m_recorded_since = sequence;
-            m_pending.rows.push_back(stamp);
-            if (m_pending.rows.size() > PENDING_ROWS_MAX) {
-                m_pending.rows.pop_front();
-                ++m_rows_not_persisted;
-            }
-            for (const auto& [interval, candle] : changes) {
-                m_pending.candles[{static_cast<uint8_t>(interval), candle.open_ms}] = candle;
+                stamp = Apply(m_state, raw);
             }
         }
         m_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -235,10 +265,13 @@ std::vector<flowmesh::ObservedStamp> FlowMeshObservedTimeLog::Lookup(const std::
 {
     std::vector<flowmesh::ObservedStamp> out;
     std::lock_guard lock{m_mutex};
+    // While loading, the retained history is unknown: none, never a part.
+    if (m_loading) return out;
+    const auto& ring{m_state.ring};
     for (const auto& [sequence, hash] : entries) {
-        const auto it{std::lower_bound(m_ring.begin(), m_ring.end(), sequence,
+        const auto it{std::lower_bound(ring.begin(), ring.end(), sequence,
                                        [](const auto& stamp, const uint64_t value) { return stamp.sequence < value; })};
-        if (it != m_ring.end() && it->sequence == sequence && it->hash == hash) out.push_back(*it);
+        if (it != ring.end() && it->sequence == sequence && it->hash == hash) out.push_back(*it);
     }
     std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.sequence < b.sequence; });
     out.erase(std::unique(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.sequence == b.sequence; }), out.end());
@@ -249,13 +282,22 @@ flowmesh::ObservedCandlePage FlowMeshObservedTimeLog::Candles(const flowmesh::Ca
                                                               const std::optional<int64_t> before_ms, const size_t limit) const
 {
     std::lock_guard lock{m_mutex};
-    return m_rollup.Page(interval, before_ms, limit);
+    if (m_loading) {
+        // Never an available page without the history: a reader would hold
+        // it as the whole window.
+        flowmesh::ObservedCandlePage out;
+        out.interval = interval;
+        out.unavailable_reason = LOADING_REASON;
+        return out;
+    }
+    return m_state.rollup.Page(interval, before_ms, limit);
 }
 
 std::optional<int64_t> FlowMeshObservedTimeLog::OldestMemoryOpen(const flowmesh::CandleInterval interval) const
 {
     std::lock_guard lock{m_mutex};
-    const auto& candles{m_rollup.Candles(interval)};
+    if (m_loading) return std::nullopt;
+    const auto& candles{m_state.rollup.Candles(interval)};
     return candles.empty() ? std::nullopt : std::optional{candles.front().open_ms};
 }
 
@@ -264,8 +306,9 @@ FlowMeshObservedTimeLog::Summary FlowMeshObservedTimeLog::GetSummary() const
     Summary out;
     {
         std::lock_guard lock{m_mutex};
-        out.recorded_since = m_recorded_since;
-        out.rows_not_persisted = m_rows_not_persisted;
+        out.loading = m_loading;
+        if (!m_loading) out.recorded_since = m_state.recorded_since;
+        out.rows_not_persisted = m_state.rows_not_persisted + m_early_dropped;
     }
     out.persisted = m_persisted.load(std::memory_order_relaxed);
     out.clock_suspect = m_clock_suspect.load(std::memory_order_relaxed);
@@ -277,7 +320,33 @@ FlowMeshObservedTimeLog::Pending FlowMeshObservedTimeLog::TakePending()
 {
     Pending out;
     std::lock_guard lock{m_mutex};
-    std::swap(out, m_pending);
+    std::swap(out, m_state.pending);
+    return out;
+}
+
+FlowMeshObservedTimeLog::State FlowMeshObservedTimeLog::Reloaded(
+    std::vector<flowmesh::ObservedStamp> rows,
+    std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
+    const std::optional<uint64_t> recorded_since)
+{
+    State out;
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.sequence < b.sequence; });
+    if (rows.size() > RING) rows.erase(rows.begin(), rows.end() - RING);
+    out.ring.assign(rows.begin(), rows.end());
+    for (const auto interval : flowmesh::CANDLE_INTERVALS) out.rollup.Restore(interval, std::move(candles[static_cast<size_t>(interval)]));
+    std::optional<int64_t> last_live;
+    for (auto it{out.ring.rbegin()}; it != out.ring.rend(); ++it) {
+        if (!out.last_ms && it->mode != flowmesh::ObservedMode::UNTIMED) out.last_ms = it->ms;
+        if (it->mode == flowmesh::ObservedMode::LIVE) {
+            // Only a run of consecutive sequences ending at the newest row
+            // bounds what follows.
+            const bool contiguous{it->sequence + static_cast<uint64_t>(std::distance(out.ring.rbegin(), it)) == out.ring.back().sequence};
+            if (contiguous) last_live = it->ms;
+            break;
+        }
+    }
+    out.rollup.RestoreLast(out.ring.empty() ? std::nullopt : std::optional{out.ring.back().sequence}, last_live);
+    out.recorded_since = recorded_since ? recorded_since : out.ring.empty() ? std::nullopt : std::optional{out.ring.front().sequence};
     return out;
 }
 
@@ -285,28 +354,66 @@ void FlowMeshObservedTimeLog::Load(std::vector<flowmesh::ObservedStamp> rows,
                                    std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
                                    const std::optional<uint64_t> recorded_since)
 {
-    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.sequence < b.sequence; });
-    if (rows.size() > RING) rows.erase(rows.begin(), rows.end() - RING);
+    BeginLoad();
+    FinishLoad(std::move(rows), std::move(candles), recorded_since);
+}
+
+void FlowMeshObservedTimeLog::BeginLoad() noexcept
+{
     std::lock_guard lock{m_mutex};
-    m_ring.assign(rows.begin(), rows.end());
-    m_rollup = flowmesh::ObservedRollup{};
-    for (const auto interval : flowmesh::CANDLE_INTERVALS) m_rollup.Restore(interval, std::move(candles[static_cast<size_t>(interval)]));
-    m_last_ms.reset();
-    std::optional<int64_t> last_live;
-    for (auto it{m_ring.rbegin()}; it != m_ring.rend(); ++it) {
-        if (!m_last_ms && it->mode != flowmesh::ObservedMode::UNTIMED) m_last_ms = it->ms;
-        if (it->mode == flowmesh::ObservedMode::LIVE) {
-            // Only a run of consecutive sequences ending at the newest row
-            // bounds what follows.
-            const bool contiguous{it->sequence + static_cast<uint64_t>(std::distance(m_ring.rbegin(), it)) == m_ring.back().sequence};
-            if (contiguous) last_live = it->ms;
-            break;
+    m_loading = true;
+}
+
+void FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> rows,
+                                         std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
+                                         const std::optional<uint64_t> recorded_since) noexcept
+{
+    // Entries taken out of m_early and not yet installed (lost on failure).
+    uint64_t taken{0};
+    try {
+        State state{Reloaded(std::move(rows), std::move(candles), recorded_since)};
+        // Replayed off the mutex, so Record (the runtime worker, under its
+        // market lock) never waits for this work. Each round swaps the
+        // buffer out in O(1); rounds repeat while entries keep arriving, so
+        // what is left for the mutex is a handful (RING at most).
+        constexpr size_t UNDER_LOCK_MAX{64};
+        constexpr int ROUNDS{8};
+        for (int round{0}; round < ROUNDS; ++round) {
+            std::deque<Raw> batch;
+            {
+                std::lock_guard lock{m_mutex};
+                if (round > 0 && m_early.size() <= UNDER_LOCK_MAX) break;
+                batch.swap(m_early);
+            }
+            taken += batch.size();
+            for (const auto& raw : batch) (void)Apply(state, raw);
         }
+        {
+            std::lock_guard lock{m_mutex};
+            // Only what was recorded during the replay above.
+            for (const auto& raw : m_early) (void)Apply(state, raw);
+            state.rows_not_persisted += m_state.rows_not_persisted + m_early_dropped;
+            // The replaced state is freed below, after the mutex.
+            std::swap(m_state, state);
+            m_early.clear();
+            m_early_dropped = 0;
+            m_loading = false;
+        }
+        m_generation.fetch_add(1, std::memory_order_acq_rel);
+    } catch (...) {
+        try {
+            std::lock_guard lock{m_mutex};
+            State fresh;
+            fresh.rows_not_persisted = m_state.rows_not_persisted + m_early_dropped + taken + m_early.size();
+            std::swap(m_state, fresh);
+            m_early.clear();
+            m_early_dropped = 0;
+            m_loading = false;
+        } catch (...) {
+        }
+        m_record_failures.fetch_add(1, std::memory_order_relaxed);
+        m_generation.fetch_add(1, std::memory_order_acq_rel);
     }
-    m_rollup.RestoreLast(m_ring.empty() ? std::nullopt : std::optional{m_ring.back().sequence}, last_live);
-    m_recorded_since = recorded_since ? recorded_since : m_ring.empty() ? std::nullopt : std::optional{m_ring.front().sequence};
-    m_pending = {};
-    m_previous.reset();
 }
 
 FlowMeshObservedTimeStore::FlowMeshObservedTimeStore(Options options) : m_options{std::move(options)} {}

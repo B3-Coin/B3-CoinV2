@@ -14,14 +14,18 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 
 namespace {
@@ -160,6 +164,120 @@ void WriteOutOfBoundTimes(const fs::path& path, FakeClocks& clocks)
     batch.Write(RawCandleKey{'c', OTHER_MARKET, 0, uint64_t{1} << 63}, value);
     batch.Write(RawRowKey{'r', MARKET, 2}, RawRowValue{EntryHash(2), static_cast<uint8_t>(ObservedMode::LIVE), flowmesh::OBSERVED_MS_LIMIT, 0, 0});
     db.WriteBatch(batch, true);
+}
+
+//! One Record: its clock change first, then its inputs.
+struct ScriptStep {
+    int64_t wall{1'000}, steady{1'000};
+    ObservedDelay delay{ObservedDelay::NONE};
+    bool priced{true};
+    bool suspect{false};
+    //! Sequences left out before this entry.
+    uint64_t skip{0};
+};
+
+//! `count` entries: a delayed one, a clamp inside the slew, an unpriced one,
+//! missing sequences, an hour back (untimed), suspect, a forward step, then
+//! ordinary entries a second apart.
+std::vector<ScriptStep> Script(const size_t count)
+{
+    std::vector<ScriptStep> out{
+        {1'000, 1'000},
+        {2'000, 2'000, ObservedDelay::CATCHUP},
+        {-400, 100},
+        {5'000, 5'000, ObservedDelay::NONE, false},
+        {5'000, 5'000, ObservedDelay::NONE, true, false, 3},
+        {-3'600'000, 100},
+        {1'000, 1'000, ObservedDelay::NONE, true, true},
+        {3'700'000, 1'000},
+    };
+    out.resize(count);
+    return out;
+}
+
+//! Plays `script` from `sequence`; the first `unrecorded` steps move the
+//! clocks without a Record. Returns the last stamp Record returned.
+std::optional<flowmesh::ObservedStamp> Play(FlowMeshObservedTimeLog& log, FakeClocks& clocks, const std::vector<ScriptStep>& script,
+                                            uint64_t& sequence, const size_t unrecorded = 0)
+{
+    std::optional<flowmesh::ObservedStamp> last;
+    for (size_t i{0}; i < script.size(); ++i) {
+        const auto& step{script[i]};
+        clocks.wall += step.wall;
+        clocks.steady_ms += step.steady;
+        log.SetClockSuspect(step.suspect);
+        sequence += step.skip;
+        if (i >= unrecorded) {
+            last = log.Record(sequence, EntryHash(sequence), step.delay,
+                              step.priced ? std::optional{Tick(sequence, 150 + static_cast<CAmount>(sequence % 7))} : std::nullopt);
+        }
+        ++sequence;
+    }
+    return last;
+}
+
+//! Everything a reader or the flush can take from a log.
+struct LogView {
+    std::vector<flowmesh::ObservedStamp> rows;
+    std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles;
+    std::array<std::optional<int64_t>, flowmesh::CANDLE_INTERVALS.size()> oldest;
+    std::optional<uint64_t> recorded_since;
+    uint64_t rows_not_persisted{0};
+    std::deque<flowmesh::ObservedStamp> pending_rows;
+    std::map<std::pair<uint8_t, int64_t>, flowmesh::ObservedCandle> pending_candles;
+};
+
+LogView View(FlowMeshObservedTimeLog& log, const uint64_t end)
+{
+    LogView out;
+    out.rows = log.Lookup(Known(0, end));
+    for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+        const auto page{log.Candles(interval, std::nullopt, flowmesh::OBSERVED_CANDLE_PAGE_MAX)};
+        BOOST_CHECK(page.available);
+        out.candles[static_cast<size_t>(interval)] = page.candles;
+        out.oldest[static_cast<size_t>(interval)] = log.OldestMemoryOpen(interval);
+    }
+    const auto summary{log.GetSummary()};
+    BOOST_CHECK(!summary.loading);
+    out.recorded_since = summary.recorded_since;
+    out.rows_not_persisted = summary.rows_not_persisted;
+    auto pending{log.TakePending()};
+    out.pending_rows = std::move(pending.rows);
+    out.pending_candles = std::move(pending.candles);
+    return out;
+}
+
+void CheckSameView(const LogView& got, const LogView& want, const std::string& name, const uint64_t extra_not_persisted = 0)
+{
+    BOOST_CHECK_MESSAGE(got.rows == want.rows, name << ": stamps differ (" << got.rows.size() << " vs " << want.rows.size() << ")");
+    BOOST_CHECK_MESSAGE(got.candles == want.candles, name << ": candles differ");
+    BOOST_CHECK_MESSAGE(got.oldest == want.oldest, name << ": oldest memory candles differ");
+    BOOST_CHECK_MESSAGE(got.recorded_since == want.recorded_since, name << ": recorded_since differs");
+    BOOST_CHECK_MESSAGE(got.rows_not_persisted == want.rows_not_persisted + extra_not_persisted,
+                        name << ": rows_not_persisted " << got.rows_not_persisted << " vs " << want.rows_not_persisted);
+    BOOST_CHECK_MESSAGE(got.pending_rows == want.pending_rows, name << ": pending rows differ");
+    BOOST_CHECK_MESSAGE(got.pending_candles == want.pending_candles, name << ": pending candles differ");
+}
+
+//! A market's retained history, as the store reads it: 40 entries seven
+//! seconds apart from T0, then the clocks at its end.
+struct History {
+    std::vector<flowmesh::ObservedStamp> rows;
+    std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles;
+    FakeClocks clocks;
+};
+
+void MakeHistory(History& out)
+{
+    const auto source{MakeLog(out.clocks)};
+    for (uint64_t i{0}; i < 40; ++i) {
+        source->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i, 100 + static_cast<CAmount>(i)));
+        out.clocks.Advance(7'000);
+    }
+    out.rows = source->Lookup(Known(0, 40));
+    for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+        out.candles[static_cast<size_t>(interval)] = source->Candles(interval, std::nullopt, flowmesh::OBSERVED_CANDLE_PAGE_MAX).candles;
+    }
 }
 
 } // namespace
@@ -556,6 +674,93 @@ BOOST_AUTO_TEST_CASE(stored_keys_past_the_display_bound_end_the_disk_scan)
     older = true;
     BOOST_CHECK(store.ReadCandles(OTHER_MARKET, CandleInterval::M1, 0, flowmesh::OBSERVED_MS_LIMIT, 500, &older).empty());
     BOOST_CHECK(!older);
+}
+
+// A log given its history after entries were recorded ends exactly as one
+// loaded before them with the same clock readings (the same stamps, memory
+// candles, candles and rows to persist, recorded_since), whether the clock
+// ran on or stood an hour behind the reloaded stamps. Beyond RING waiting
+// entries the oldest are a gap, counted as not persisted. Until then every
+// read is unavailable, never partial.
+BOOST_AUTO_TEST_CASE(a_log_loaded_after_its_entries_equals_one_loaded_before_them)
+{
+    History history;
+    MakeHistory(history);
+    for (const int64_t restart : {int64_t{0}, int64_t{-3'600'000}}) {
+        for (const size_t count : {size_t{0}, size_t{1}, size_t{13}, FlowMeshObservedTimeLog::RING, FlowMeshObservedTimeLog::RING + 1}) {
+            const auto name{"restart " + std::to_string(restart) + ", " + std::to_string(count) + " entries"};
+            const auto script{Script(count)};
+            const size_t dropped{count > FlowMeshObservedTimeLog::RING ? count - FlowMeshObservedTimeLog::RING : 0};
+
+            // Reference: loaded first, then the entries (those that will be
+            // dropped move the clocks only).
+            FakeClocks reference_clocks;
+            reference_clocks.wall = history.clocks.wall + restart;
+            reference_clocks.steady_ms = history.clocks.steady_ms.load();
+            const auto reference{MakeLog(reference_clocks)};
+            reference->Load(history.rows, history.candles, std::nullopt);
+            uint64_t reference_sequence{40};
+            Play(*reference, reference_clocks, script, reference_sequence, dropped);
+
+            FakeClocks clocks;
+            clocks.wall = history.clocks.wall + restart;
+            clocks.steady_ms = history.clocks.steady_ms.load();
+            const auto log{MakeLog(clocks)};
+            log->BeginLoad();
+            uint64_t sequence{40};
+            // Stamped later: what Record returns meanwhile is provisional.
+            const auto provisional{Play(*log, clocks, script, sequence)};
+            BOOST_CHECK(!provisional || provisional->mode == ObservedMode::UNTIMED);
+            const auto summary{log->GetSummary()};
+            BOOST_CHECK(summary.loading);
+            BOOST_CHECK(!summary.recorded_since);
+            BOOST_CHECK(log->Lookup(Known(0, sequence)).empty());
+            const auto page{log->Candles(CandleInterval::M1, std::nullopt, 300)};
+            BOOST_CHECK(!page.available);
+            BOOST_CHECK_EQUAL(page.unavailable_reason, FlowMeshObservedTimeLog::LOADING_REASON);
+            BOOST_CHECK(page.candles.empty());
+            BOOST_CHECK(!log->OldestMemoryOpen(CandleInterval::M1));
+            BOOST_CHECK(log->TakePending().Empty());
+            log->FinishLoad(history.rows, history.candles, std::nullopt);
+
+            BOOST_CHECK_EQUAL(sequence, reference_sequence);
+            CheckSameView(View(*log, sequence), View(*reference, reference_sequence), name, dropped);
+        }
+    }
+}
+
+// FinishLoad replays the waiting entries off the mutex while more arrive:
+// the result is still exactly the load followed by every entry in order.
+BOOST_AUTO_TEST_CASE(a_load_finishing_while_entries_arrive_equals_one_loaded_before_them)
+{
+    History history;
+    MakeHistory(history);
+    const auto script{Script(3'000)};
+    FakeClocks reference_clocks;
+    reference_clocks.wall = history.clocks.wall.load();
+    reference_clocks.steady_ms = history.clocks.steady_ms.load();
+    const auto reference{MakeLog(reference_clocks)};
+    reference->Load(history.rows, history.candles, std::nullopt);
+    uint64_t reference_sequence{40};
+    Play(*reference, reference_clocks, script, reference_sequence);
+    const auto want{View(*reference, reference_sequence)};
+
+    for (int run{0}; run < 5; ++run) {
+        FakeClocks clocks;
+        clocks.wall = history.clocks.wall.load();
+        clocks.steady_ms = history.clocks.steady_ms.load();
+        const auto log{MakeLog(clocks)};
+        log->BeginLoad();
+        uint64_t sequence{40};
+        // Fewer than RING entries in all, so none is dropped however the
+        // two threads interleave.
+        std::thread recorder{[&] { Play(*log, clocks, script, sequence); }};
+        std::this_thread::sleep_for(std::chrono::microseconds{200 * run});
+        log->FinishLoad(history.rows, history.candles, std::nullopt);
+        recorder.join();
+        BOOST_CHECK_EQUAL(sequence, reference_sequence);
+        CheckSameView(View(*log, sequence), want, "run " + std::to_string(run));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

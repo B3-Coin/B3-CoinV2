@@ -44,7 +44,13 @@ namespace node {
  * the previous stamp and flagged clamped; a larger one records entries
  * UNTIMED until the wall clock passes the previous stamp again, so no time
  * is ever pinned or invented. Wall and steady clocks disagreeing by more
- * than the slew since the previous stamp flags a clock step. */
+ * than the slew since the previous stamp flags a clock step.
+ *
+ * History: between BeginLoad and FinishLoad (the store reading this
+ * market's retained history on its own thread) Record keeps each entry's
+ * clock readings only, and every read is unavailable (LOADING_REASON),
+ * never partial. FinishLoad then stamps those entries exactly as if the
+ * history had loaded before them. */
 class FlowMeshObservedTimeLog
 {
 public:
@@ -59,6 +65,8 @@ public:
     //! Unflushed rows. Beyond it the oldest are dropped from persistence
     //! only (a gap after a restart), never from memory.
     static constexpr size_t PENDING_ROWS_MAX{8192};
+    //! Why every read is unavailable while the history loads.
+    static constexpr const char* LOADING_REASON{"observed_time_loading"};
 
     FlowMeshObservedTimeLog(uint256 domain, flowmesh::MarketId market, Clocks clocks = {});
 
@@ -67,28 +75,38 @@ public:
 
     /** One durable commit, in sequence order. `delay` NONE records it LIVE.
      * `tick` is the entry's clearing; one of another entry is ignored and
-     * the entry counts without a price. Memory only; never throws. */
+     * the entry counts without a price. Memory only, O(1); never throws.
+     * While the history loads it keeps only this call's clock readings (at
+     * most RING entries; beyond that the oldest are dropped, a gap) and
+     * returns a provisional UNTIMED stamp; FinishLoad stamps the entry. */
     flowmesh::ObservedStamp Record(uint64_t sequence, const uint256& hash, flowmesh::ObservedDelay delay,
                                    const std::optional<flowmesh::ClearingTick>& tick) noexcept;
 
     //! The stamps of exactly these entries whose hash matches, ascending.
+    //! None while the history loads.
     std::vector<flowmesh::ObservedStamp> Lookup(const std::vector<std::pair<uint64_t, uint256>>& entries) const;
-    //! A page of the memory window (ObservedRollup::Page).
+    //! A page of the memory window (ObservedRollup::Page). Unavailable
+    //! (LOADING_REASON) while the history loads.
     flowmesh::ObservedCandlePage Candles(flowmesh::CandleInterval interval, std::optional<int64_t> before_ms, size_t limit) const;
-    //! The oldest candle held in memory for `interval`, if any.
+    //! The oldest candle held in memory for `interval`, if any. None while
+    //! the history loads.
     std::optional<int64_t> OldestMemoryOpen(flowmesh::CandleInterval interval) const;
 
     struct Summary {
+        //! Unset while the history loads.
         std::optional<uint64_t> recorded_since;
         bool persisted{true};
         bool clock_suspect{false};
         uint64_t rows_not_persisted{0};
         uint64_t record_failures{0};
+        //! Internal (never serialized): the history is loading, so every
+        //! read is unavailable with LOADING_REASON.
+        bool loading{false};
     };
     Summary GetSummary() const;
     //! Set from outside (the B3 tip's time); flags later stamps.
     void SetClockSuspect(bool suspect) noexcept { m_clock_suspect.store(suspect, std::memory_order_relaxed); }
-    //! Increases with every Record.
+    //! Increases with every Record and when FinishLoad installs the history.
     uint64_t Generation() const noexcept { return m_generation.load(std::memory_order_acquire); }
 
     //! Persistence plumbing for FlowMeshObservedTimeStore.
@@ -101,25 +119,68 @@ public:
     Pending TakePending();
     void SetPersisted(bool persisted) noexcept { m_persisted.store(persisted, std::memory_order_relaxed); }
     //! Replaces memory with reloaded data. `rows` ascending (the newest are
-    //! kept), `candles` ascending per interval.
+    //! kept), `candles` ascending per interval. BeginLoad then FinishLoad.
     void Load(std::vector<flowmesh::ObservedStamp> rows,
               std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
               std::optional<uint64_t> recorded_since);
+    /** The history is being read: from now until FinishLoad, Record keeps
+     * clock readings only and every read is unavailable. For a fresh log
+     * (FlowMeshObservedTimeStore::Attach is always given one). */
+    void BeginLoad() noexcept;
+    /** Replaces memory with the reloaded data (as Load), then applies every
+     * Record since BeginLoad in order with its own clock readings: the
+     * result is exactly the synchronous Load followed by those Records,
+     * except that entries dropped beyond RING are a gap. The work is done
+     * off the mutex (Record never waits for it); under it only the entries
+     * recorded meanwhile are applied and the state is swapped in. Never
+     * throws: a failure leaves the log empty and recording. */
+    void FinishLoad(std::vector<flowmesh::ObservedStamp> rows,
+                    std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
+                    std::optional<uint64_t> recorded_since) noexcept;
 
 private:
+    //! One Record's inputs and clock readings.
+    struct Raw {
+        uint64_t sequence{0};
+        uint256 hash;
+        flowmesh::ObservedDelay delay{flowmesh::ObservedDelay::NONE};
+        std::optional<flowmesh::ClearingTick> tick;
+        //! Clamped to +-OBSERVED_MS_LIMIT.
+        int64_t wall{0};
+        std::chrono::steady_clock::time_point steady{};
+        //! OBSERVED_CLOCK_SUSPECT and OBSERVED_NO_CLEARING, read at Record.
+        uint8_t flags{0};
+    };
+    //! Everything Record changes.
+    struct State {
+        std::deque<flowmesh::ObservedStamp> ring;
+        flowmesh::ObservedRollup rollup;
+        Pending pending;
+        std::optional<uint64_t> recorded_since;
+        //! The newest timed stamp (LIVE or DELAYED), kept monotonic.
+        std::optional<int64_t> last_ms;
+        //! This process's previous Record: raw wall and steady readings.
+        std::optional<std::pair<int64_t, std::chrono::steady_clock::time_point>> previous;
+        uint64_t rows_not_persisted{0};
+    };
+    //! The body of Record, on the live state or on one being reloaded.
+    static flowmesh::ObservedStamp Apply(State& state, const Raw& raw);
+    //! The state Load installs, before any Record.
+    static State Reloaded(std::vector<flowmesh::ObservedStamp> rows,
+                          std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
+                          std::optional<uint64_t> recorded_since);
+
     const uint256 m_domain;
     const flowmesh::MarketId m_market;
     const Clocks m_clocks;
     mutable std::mutex m_mutex;
-    std::deque<flowmesh::ObservedStamp> m_ring;
-    flowmesh::ObservedRollup m_rollup;
-    Pending m_pending;
-    std::optional<uint64_t> m_recorded_since;
-    //! The newest timed stamp (LIVE or DELAYED), kept monotonic.
-    std::optional<int64_t> m_last_ms;
-    //! This process's previous Record: raw wall and steady readings.
-    std::optional<std::pair<int64_t, std::chrono::steady_clock::time_point>> m_previous;
-    uint64_t m_rows_not_persisted{0};
+    State m_state;
+    //! Between BeginLoad and FinishLoad.
+    bool m_loading{false};
+    //! Records while loading, oldest first, at most RING.
+    std::deque<Raw> m_early;
+    //! Records dropped from m_early (a gap), counted as not persisted.
+    uint64_t m_early_dropped{0};
     std::atomic<uint64_t> m_record_failures{0};
     std::atomic<bool> m_persisted{true};
     std::atomic<bool> m_clock_suspect{false};
