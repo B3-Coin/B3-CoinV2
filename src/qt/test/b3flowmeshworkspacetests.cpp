@@ -7826,22 +7826,41 @@ private Q_SLOTS:
             QTest::qWait(B3FlowMeshOrderBook::FLASH_MS / 2);
             QVERIFY(render(live, QStringLiteral("synthetic-flowmesh-responsive-live-book.png")));
             // The book, the UTC candles and the tape side by side, as they
-            // stand after the stream (display only; nothing is signed).
+            // stand after the stream (display only; nothing is signed). One
+            // price rule, as in the panel: the chart and the tape take the
+            // book's places.
             QWidget side;
             auto* row{new QHBoxLayout{&side}};
             auto* chart{new B3FlowMeshChart{&side}};
-            chart->setInverted(true); chart->setSnapshot(*live.m_snapshot); chart->setTimeSeries(live.m_chart->timeSeries());
-            chart->setNowMs(OBSERVED_T0 + 90'000); row->addWidget(chart, 1);
             auto* book{new B3FlowMeshOrderBook{&side}}; book->setFixedWidth(430);
-            book->setSnapshot(live.m_snapshot, true); row->addWidget(book);
+            book->setSnapshot(live.m_snapshot, true);
+            const auto places{book->pricePlaces()};
+            QCOMPARE(places, live.m_order_book->pricePlaces());
+            QCOMPARE(places, std::optional<int>{3});
+            chart->setInverted(true); chart->setPricePlaces(places); chart->setSnapshot(*live.m_snapshot); chart->setTimeSeries(live.m_chart->timeSeries());
+            chart->setNowMs(OBSERVED_T0 + 90'000); row->addWidget(chart, 1);
+            row->addWidget(book);
             auto* tape{new B3FlowMeshTradeTape{&side}}; tape->setFixedWidth(360);
-            tape->setRows(B3FlowMeshTradeTape::BuildRows(live.m_ticks, live.m_tick_times), live.m_snapshot->units, true,
-                          QStringLiteral("this_node"), false, {});
+            const auto tape_rows{B3FlowMeshTradeTape::BuildRows(live.m_ticks, live.m_tick_times)};
+            tape->setRows(tape_rows, live.m_snapshot->units, true, QStringLiteral("this_node"), false, {}, false, places);
             row->addWidget(tape);
             side.resize(1760, 900); side.show(); QCoreApplication::processEvents(); QCoreApplication::processEvents();
             QVERIFY(chart->timeMode());
+            QCOMPARE(chart->pricePlaces(), places);
             QVERIFY(book->rowsPerSide() >= 10);
             QVERIFY(tape->table()->rowCount() >= 40);
+            // Every trade reads as the book reads its price (≈0.997 for 1003
+            // atoms, 1.000 for 1000), never DisplayPrice's own digits.
+            std::map<CAmount, QString> book_labels;
+            for (const auto& level : book->model()->rows()) if (level.click_canonical > 0) book_labels[level.click_canonical] = level.price;
+            size_t matched{0};
+            for (int r{0}; r < tape->table()->rowCount(); ++r) {
+                const auto price{tape_rows[static_cast<size_t>(r)].price};
+                const auto text{tape->table()->item(r, 0)->text()};
+                QCOMPARE(text, ViewPrice(price, live.m_snapshot->units, true, places).text);
+                if (const auto label{book_labels.find(price)}; label != book_labels.end()) { QCOMPARE(Bare(text), label->second); ++matched; }
+            }
+            QVERIFY(matched > 10);
             QVERIFY(render(side, QStringLiteral("synthetic-flowmesh-responsive-book-chart-tape.png")));
             // An order review open with the local engine: the book keeps
             // following live updates (display only); the ticket, balances
