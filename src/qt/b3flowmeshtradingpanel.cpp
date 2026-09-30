@@ -585,7 +585,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
     if (m_clearing_strip->text() != strip) m_clearing_strip->setText(strip);
     if (const QString tip{ClearingStripTip() + (strip_exact.isEmpty() ? QString{} : QStringLiteral("\n") + strip_exact)}; m_clearing_strip->toolTip() != tip) m_clearing_strip->setToolTip(tip);
     m_clearing_strip->setVisible(!strip.isEmpty());
-    m_order_book->setSnapshot(matched ? m_snapshot : std::nullopt, inverse);
+    m_order_book->setSnapshot(matched ? m_snapshot : std::nullopt, inverse, bookGrouping());
     {
         const bool timed{matched && m_snapshot->observed && m_snapshot->observed->available};
         const auto rows{matched && m_ticks_market == m_snapshot->market ? B3FlowMeshTradeTape::BuildRows(m_ticks, m_tick_times, m_received_times)

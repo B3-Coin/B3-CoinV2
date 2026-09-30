@@ -1154,139 +1154,194 @@ private Q_SLOTS:
         snapshot.curves.back() = LimitCurve("ask", 80, MAX_MONEY, 1);
         QVERIFY(!ComputeMarketableLimit(snapshot, true, false, 1000, std::nullopt, &error)); QVERIFY(error.contains(QStringLiteral("outside the supported price range")));
     }
-    void limitBookWidgetShowsNearestLevelsWithoutRefreshChurn_data()
+    static QString SpreadText(const B3FlowMeshOrderBook& book)
+    {
+        const int row{book.model()->spreadRow()};
+        return row < 0 ? QString{} : book.model()->row(row).price;
+    }
+    static Snapshot WithLevels(Snapshot snapshot, const flowmesh::LevelGrouping& grouping = {}, const std::optional<uint256>& own = std::nullopt)
+    {
+        auto data{Data()};
+        data.pushKV("book_levels", LevelsJson(snapshot.curves, *uint256::FromHex(snapshot.head.toStdString()), grouping, own));
+        snapshot.levels = Parse(data).levels;
+        return snapshot;
+    }
+    void orderBookLadderShowsVerifiedLevelsBesideTheSpreadWithoutChurn_data()
     {
         QTest::addColumn<bool>("inverse");
         QTest::newRow("canonical") << false;
         QTest::newRow("inverse") << true;
     }
-    void limitBookWidgetShowsNearestLevelsWithoutRefreshChurn()
+    void orderBookLadderShowsVerifiedLevelsBesideTheSpreadWithoutChurn()
     {
         QFETCH(bool, inverse);
-        const auto snapshot{SyntheticLimitBook(16)};
-        const auto projection{ProjectLimitBook(snapshot, inverse)};
+        QApplication::setEffectEnabled(Qt::UI_General, true);
+        B3FlowMeshOrderBook::SetAnimationSetting(true);
+        // Sixteen levels per side from 32 accounts; the viewer holds the best bid.
+        const auto snapshot{WithLevels(SyntheticLimitBook(16), {}, H(20))};
+        QVERIFY(snapshot.levels && snapshot.levels->available);
         B3FlowMeshOrderBook book; book.resize(420, 440); book.setSnapshot(snapshot, inverse);
-        auto* asks{book.findChild<QTableWidget*>(QStringLiteral("flowMeshBookAsks"))};
-        auto* bids{book.findChild<QTableWidget*>(QStringLiteral("flowMeshBookBids"))};
-        auto* note{book.findChild<QLabel*>(QStringLiteral("flowMeshBookNote"))};
-        QVERIFY(asks); QVERIFY(bids); QVERIFY(note);
-        asks->setFixedHeight(140); bids->setFixedHeight(140);
         book.show(); QCoreApplication::processEvents(); QCoreApplication::processEvents();
-        QCOMPARE(asks->rowCount(), 12); QCOMPARE(bids->rowCount(), 12);
-        QCOMPARE(asks->item(0, 0)->text(), FormatDisplayPrice(projection.asks[4].canonical_price, snapshot.units.decimals, inverse));
-        QCOMPARE(asks->item(11, 0)->text(), FormatDisplayPrice(projection.asks.back().canonical_price, snapshot.units.decimals, inverse));
-        QCOMPARE(bids->item(0, 0)->text(), FormatDisplayPrice(projection.bids.front().canonical_price, snapshot.units.decimals, inverse));
-        QCOMPARE(bids->item(11, 0)->text(), FormatDisplayPrice(projection.bids[11].canonical_price, snapshot.units.decimals, inverse));
-        QCOMPARE(asks->item(11, 1)->text(), projection.asks.back().amount);
-        QCOMPARE(bids->item(0, 2)->text(), projection.bids.front().total);
-        QCOMPARE(asks->item(0, 0)->foreground().color(), B3Theme::kNegative);
-        QCOMPARE(bids->item(0, 0)->foreground().color(), B3Theme::kPositive);
-        QVERIFY(note->text().contains(QStringLiteral("Nearest 12")));
-        QVERIFY(note->toolTip().contains(QStringLiteral("no price-time priority")));
-        if (inverse) {
-            QVERIFY(note->text().contains(QStringLiteral("gross")));
-            QVERIFY(bids->item(0, 0)->toolTip().contains(ExactInversePrice(projection.bids.front().canonical_price, snapshot.units.decimals)));
+        QVERIFY(book.showsVerifiedLevels());
+        auto* model{book.model()};
+        const int per_side{book.rowsPerSide()};
+        QVERIFY(per_side >= 5 && per_side < 16);
+        QCOMPARE(model->rowCount(), 2 * per_side + 1);
+        QCOMPARE(model->spreadRow(), per_side);
+        // The best displayed ask sits right above the spread, the best bid
+        // right below it; the book's best canonical bid is the B3 view's ask.
+        const auto& levels{*snapshot.levels};
+        const auto& shown_asks{inverse ? levels.bids.levels : levels.asks.levels};
+        const auto& shown_bids{inverse ? levels.asks.levels : levels.bids.levels};
+        const auto label = [&](const BookLevel& level) { return DisplayPrice(level.low, snapshot.units, inverse).text; };
+        QCOMPARE(model->row(per_side - 1).price, label(shown_asks[0]));
+        QCOMPARE(model->row(per_side + 1).price, label(shown_bids[0]));
+        QCOMPARE(model->row(0).price, label(shown_asks[static_cast<size_t>(per_side) - 1]));
+        QVERIFY(model->row(per_side - 1).kind == B3FlowMeshLadderModel::Row::Kind::Ask);
+        QVERIFY(model->row(per_side + 1).kind == B3FlowMeshLadderModel::Row::Kind::Bid);
+        QCOMPARE(model->data(model->index(per_side - 1, 0), Qt::ForegroundRole).value<QColor>(), B3Theme::kNegative);
+        QCOMPARE(model->data(model->index(per_side + 1, 0), Qt::ForegroundRole).value<QColor>(), B3Theme::kPositive);
+        // Total is cumulative from the best level.
+        if (!inverse) {
+            QCOMPARE(model->row(per_side + 1).total, FormatAmount(shown_bids[0].size, 6));
+            QCOMPARE(model->row(per_side + 2).total, FormatAmount(shown_bids[0].size + shown_bids[1].size, 6));
+            QCOMPARE(model->row(per_side + 2).size, FormatAmount(shown_bids[1].size, 6));
+        } else {
+            QCOMPARE(model->row(per_side + 1).size, FormatAmount(static_cast<CAmount>(*shown_bids[0].notional), 9));
         }
-        // A short view must initially show the nearest ask beside the spread.
-        auto* scroll{asks->verticalScrollBar()};
-        QVERIFY(scroll->maximum() > 0); QCOMPARE(scroll->value(), scroll->maximum());
-        QVERIFY(asks->viewport()->rect().contains(asks->visualItemRect(asks->item(11, 0)).center()));
-        asks->setFixedHeight(110); book.resize(430, 400);
-        QCoreApplication::processEvents(); QCoreApplication::processEvents();
-        QCOMPARE(scroll->value(), scroll->maximum());
-        QVERIFY(asks->viewport()->rect().contains(asks->visualItemRect(asks->item(11, 0)).center()));
-        // Cumulative shading grows outward from the best displayed levels.
-        QCOMPARE(asks->item(0, 0)->data(Qt::UserRole + 1).toDouble(), 1.0);
-        QCOMPARE(bids->item(11, 0)->data(Qt::UserRole + 1).toDouble(), 1.0);
-        QVERIFY(asks->item(11, 0)->data(Qt::UserRole + 1).toDouble() > 0);
-        QVERIFY(asks->item(11, 0)->data(Qt::UserRole + 1).toDouble() < 1);
-        QVERIFY(bids->item(0, 0)->data(Qt::UserRole + 1).toDouble() < 1);
-        // The production book deliberately has NoSelection. To exercise
-        // retained row selection, opt this test into BOTH SingleSelection and
-        // SelectRows; selectRow() does not establish a row selection with the
-        // table's default SelectItems/SingleSelection combination.
-        QCOMPARE(asks->selectionMode(), QAbstractItemView::NoSelection);
-        asks->setSelectionMode(QAbstractItemView::SingleSelection);
-        asks->setSelectionBehavior(QAbstractItemView::SelectRows);
-        asks->setFocus(); QCoreApplication::processEvents();
-        asks->selectRow(5);
-        asks->selectionModel()->setCurrentIndex(asks->model()->index(5, 0), QItemSelectionModel::NoUpdate);
-        scroll->setValue(scroll->maximum() / 2);
-        QCoreApplication::processEvents(); QVERIFY(asks->hasFocus());
-        const int position{scroll->value()}; QVERIFY(position < scroll->maximum());
-        const auto selected{asks->selectionModel()->selectedIndexes()}; QCOMPARE(selected.size(), qsizetype{3});
-        for (const auto& index : selected) QCOMPARE(index.row(), 5);
-        const QPersistentModelIndex current{asks->currentIndex()}; QCOMPARE(QModelIndex{current}, asks->model()->index(5, 0));
-        const auto* ask_cell{asks->item(5, 0)}; const auto* bid_cell{bids->item(0, 0)};
-        QSignalSpy asks_changed{asks->model(), &QAbstractItemModel::dataChanged};
-        QSignalSpy bids_changed{bids->model(), &QAbstractItemModel::dataChanged};
-        QSignalSpy asks_reset{asks->model(), &QAbstractItemModel::modelReset};
-        QSignalSpy bids_reset{bids->model(), &QAbstractItemModel::modelReset};
-        QSignalSpy removed{asks->model(), &QAbstractItemModel::rowsRemoved};
-        QSignalSpy inserted{asks->model(), &QAbstractItemModel::rowsInserted};
+        // One depth scale for both sides: the deeper side's last visible row is 1.
+        const double ask_depth{model->row(0).depth}, bid_depth{model->row(2 * per_side).depth};
+        QCOMPARE(std::max(ask_depth, bid_depth), 1.0);
+        QVERIFY(std::min(ask_depth, bid_depth) > 0 && std::min(ask_depth, bid_depth) < 1);
+        QVERIFY(model->row(per_side + 1).depth < model->row(per_side + 2).depth);
+        // The viewer's own order is marked, with the count of orders.
+        const int own_row{inverse ? per_side - 1 : per_side + 1};
+        QVERIFY(model->data(model->index(own_row, 0), B3FlowMeshLadderModel::OwnRole).toBool());
+        QVERIFY(model->row(own_row).tooltip.contains(QStringLiteral("Your order")));
+        QVERIFY(model->row(own_row).tooltip.contains(QStringLiteral("1 standing order")));
+        QVERIFY(model->data(model->index(own_row, 0), Qt::AccessibleTextRole).toString().contains(QStringLiteral("includes yours")));
+        QVERIFY(!model->data(model->index(per_side + 2, 0), B3FlowMeshLadderModel::OwnRole).toBool() || inverse);
+        // Rows fill the height: a taller view holds more, a new layout once.
+        {
+            QSignalSpy reset{model, &QAbstractItemModel::modelReset};
+            book.resize(420, 640); QCoreApplication::processEvents(); QCoreApplication::processEvents();
+            QVERIFY(book.rowsPerSide() > per_side);
+            QCOMPARE(reset.count(), 1);
+            book.resize(420, 440); QCoreApplication::processEvents(); QCoreApplication::processEvents();
+            QCOMPARE(book.rowsPerSide(), per_side);
+        }
+        // Identical data: no reset, no row churn, no changed cell, no flash.
+        QSignalSpy changed{model, &QAbstractItemModel::dataChanged};
+        QSignalSpy reset{model, &QAbstractItemModel::modelReset};
+        QSignalSpy removed{model, &QAbstractItemModel::rowsRemoved};
+        QSignalSpy inserted{model, &QAbstractItemModel::rowsInserted};
         for (int i{0}; i < 5; ++i) { book.setSnapshot(Snapshot{snapshot}, inverse); book.setStale(false); }
-        QCoreApplication::processEvents();
-        QCOMPARE(asks->item(5, 0), ask_cell); QCOMPARE(bids->item(0, 0), bid_cell);
-        QCOMPARE(asks->selectionModel()->selectedIndexes(), selected); QCOMPARE(scroll->value(), position);
-        QVERIFY(current.isValid()); QCOMPARE(asks->currentIndex(), QModelIndex{current});
-        QVERIFY(asks->hasFocus());
-        QCOMPARE(asks_changed.count(), 0); QCOMPARE(bids_changed.count(), 0);
-        QCOMPARE(asks_reset.count(), 0); QCOMPARE(bids_reset.count(), 0);
-        QCOMPARE(removed.count(), 0); QCOMPARE(inserted.count(), 0);
-        // Genuine changed liquidity still appears without rebuilding the view.
-        auto changed{snapshot}; ++changed.curves.front().filled; --changed.curves.front().remaining;
-        changed.curves.front().reserved = *Notional(changed.curves.front().points.front().price, changed.curves.front().remaining);
-        const auto changed_book{ProjectLimitBook(changed, inverse)};
-        book.setSnapshot(changed, inverse); QCoreApplication::processEvents();
-        QVERIFY(asks_changed.count() + bids_changed.count() > 0);
-        QCOMPARE(asks->item(11, 1)->text(), changed_book.asks.back().amount);
-        QCOMPARE(bids->item(0, 1)->text(), changed_book.bids.front().amount);
-        QCOMPARE(asks->item(5, 0), ask_cell); QCOMPARE(bids->item(0, 0), bid_cell);
-        QCOMPARE(asks->selectionModel()->selectedIndexes(), selected); QCOMPARE(scroll->value(), position);
-        QVERIFY(asks->hasFocus()); QVERIFY(current.isValid());
-        QCOMPARE(asks_reset.count(), 0); QCOMPARE(bids_reset.count(), 0);
-        QCOMPARE(removed.count(), 0); QCOMPARE(inserted.count(), 0);
+        QCOMPARE(changed.count(), 0); QCOMPARE(reset.count(), 0); QCOMPARE(removed.count(), 0); QCOMPARE(inserted.count(), 0);
+        QVERIFY(!book.flashing());
+        // A size change updates cells in place and does not flash.
+        auto resized{snapshot}; resized.curves.front().filled += 1'000; resized.curves.front().remaining -= 1'000;
+        book.setSnapshot(WithLevels(resized, {}, H(20)), inverse);
+        QVERIFY(changed.count() > 0); QCOMPARE(reset.count(), 0);
+        QVERIFY(!book.flashing());
+        // A new price flashes once; the timer stops after the flash.
+        auto moved{resized}; moved.curves.push_back(LimitCurve("bid", 60, 999, 70'000));
+        book.setSnapshot(WithLevels(moved, {}, H(20)), inverse);
+        QVERIFY(book.flashing());
+        const int new_row{inverse ? per_side - 2 : per_side + 2};
+        QCOMPARE(model->row(new_row).price, DisplayPrice(999, snapshot.units, inverse).text);
+        QTRY_VERIFY_WITH_TIMEOUT(book.flashIntensity(new_row) > 0, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(!book.flashing(), 3000);
+        QCOMPARE(book.flashIntensity(new_row), 0.0);
+        // With animation off, nothing flashes.
+        B3FlowMeshOrderBook::SetAnimationSetting(false);
+        auto again{moved}; again.curves.push_back(LimitCurve("ask", 61, 1013, 70'000));
+        book.setSnapshot(WithLevels(again, {}, H(20)), inverse);
+        QVERIFY(!book.flashing());
+        B3FlowMeshOrderBook::SetAnimationSetting(true);
+        QCOMPARE(reset.count(), 0); QCOMPARE(removed.count(), 0); QCOMPARE(inserted.count(), 0);
     }
-    void limitBookWidgetRequiresVerifiedOrderStateAndDisclosesSubsets()
+    void orderBookLadderFallsBackLabelledAndRequiresVerifiedState()
     {
         const auto original{Parse(RemoteData())};
-        B3FlowMeshOrderBook book; book.setSnapshot(original, false);
-        auto* asks{book.findChild<QTableWidget*>(QStringLiteral("flowMeshBookAsks"))};
-        auto* bids{book.findChild<QTableWidget*>(QStringLiteral("flowMeshBookBids"))};
+        B3FlowMeshOrderBook book; book.resize(420, 400); book.show(); QCoreApplication::processEvents();
+        book.setSnapshot(original, false);
         auto* last{book.findChild<QLabel*>(QStringLiteral("flowMeshBookLast"))};
         auto* note{book.findChild<QLabel*>(QStringLiteral("flowMeshBookNote"))};
-        auto* spread{book.findChild<QLabel*>(QStringLiteral("flowMeshBookSpread"))};
-        QVERIFY(asks); QVERIFY(bids); QVERIFY(last); QVERIFY(note); QVERIFY(spread);
-        QCOMPARE(asks->rowCount(), 1); QCOMPARE(bids->rowCount(), 1);
+        QVERIFY(last); QVERIFY(note);
+        const auto levels = [&] {
+            size_t count{0};
+            for (const auto& row : book.model()->rows()) count += row.kind == B3FlowMeshLadderModel::Row::Kind::Ask || row.kind == B3FlowMeshLadderModel::Row::Kind::Bid;
+            return count;
+        };
+        // Without the node's levels: the first page's limit orders, labelled.
+        QVERIFY(!book.showsVerifiedLevels());
+        QCOMPARE(levels(), size_t{2});
+        QVERIFY(note->text().contains(QStringLiteral("first curve page")));
         QVERIFY(last->text().startsWith(QStringLiteral("Reported last")));
         for (const int fault : {0, 1, 2, 3, 4}) {
-            auto snapshot{original};
+            auto snapshot{WithLevels(original)};
             if (fault == 0) snapshot.units.known = false;
             if (fault == 1) snapshot.units.asset = QString::fromStdString(H(99).GetHex());
             if (fault == 2) snapshot.certificate_verified = false;
             if (fault == 3) snapshot.account_state_verified = false;
             if (fault == 4) snapshot.certified = false;
             book.setSnapshot(snapshot, false);
-            QCOMPARE(asks->rowCount(), 0); QCOMPARE(bids->rowCount(), 0);
-            QVERIFY(last->text().contains(QStringLiteral("—"))); QVERIFY(spread->text().contains(QStringLiteral("—")));
+            QCOMPARE(levels(), size_t{0});
+            QVERIFY(last->text().contains(QStringLiteral("—"))); QVERIFY(SpreadText(book).contains(QStringLiteral("—")));
         }
         book.setSnapshot(std::nullopt, false);
-        QCOMPARE(asks->rowCount(), 0); QCOMPARE(bids->rowCount(), 0);
+        QCOMPARE(levels(), size_t{0});
+        // Levels of another grouping (a read still under way) are not shown.
+        book.setSnapshot(WithLevels(original, Grouping(false, 1, -2, 6)), false);
+        QVERIFY(!book.showsVerifiedLevels()); QVERIFY(note->text().contains(QStringLiteral("Updating levels")));
+        book.setSnapshot(WithLevels(original, Grouping(false, 1, -2, 6)), false, Grouping(false, 1, -2, 6));
+        QVERIFY(book.showsVerifiedLevels());
+        // Levels the node could not compute: the reason, and the fallback.
+        auto unavailable{WithLevels(original)}; unavailable.levels->available = false; unavailable.levels->reason = QStringLiteral("work_budget");
+        book.setSnapshot(unavailable, false);
+        QVERIFY(!book.showsVerifiedLevels()); QVERIFY(note->text().contains(QStringLiteral("unavailable (work_budget)")));
         auto partial{original}; partial.curves_complete = false;
         book.setSnapshot(partial, true);
-        QCOMPARE(asks->rowCount(), 1); QCOMPARE(bids->rowCount(), 1);
+        QCOMPARE(levels(), size_t{2});
         QVERIFY(note->text().contains(QStringLiteral("Partial"))); QVERIFY(note->text().contains(QStringLiteral("gross")));
-        QVERIFY(spread->text().contains(QStringLiteral("partial")));
+        QVERIFY(SpreadText(book).contains(QStringLiteral("partial")));
         auto general{original}; auto slope{LimitCurve("bid", 12, 100, 10)};
         slope.points = {{99, 10}, {101, 0}}; general.curves.push_back(slope);
         book.setSnapshot(general, false);
-        QVERIFY(note->text().contains(QStringLiteral("non-limit"))); QVERIFY(spread->text().contains(QStringLiteral("partial")));
-        auto crossed{original}; crossed.curves = {LimitCurve("bid", 1, 111, 1), LimitCurve("ask", 2, 110, 1)};
-        book.setSnapshot(crossed, false);
-        QVERIFY(spread->text().contains(QStringLiteral("Crossed"))); QVERIFY(!spread->text().contains(QStringLiteral("two sides required")));
+        QVERIFY(note->text().contains(QStringLiteral("non-limit"))); QVERIFY(SpreadText(book).contains(QStringLiteral("partial")));
+        // With the node's levels the same general curve is exact.
+        book.setSnapshot(WithLevels(general), false);
+        QVERIFY(book.showsVerifiedLevels()); QVERIFY(!note->text().contains(QStringLiteral("non-limit")));
+        QCOMPARE(levels(), size_t{4}); // 99, 100 (the slope) and the limit bid and ask
         book.setSnapshot(original, false); book.setStale(true);
         auto* stale{book.findChild<QLabel*>(QStringLiteral("flowMeshBookStale"))}; QVERIFY(stale); QVERIFY(!stale->isHidden());
-        QCOMPARE(asks->rowCount(), 1); QCOMPARE(bids->rowCount(), 1); // Retained, not silently emptied.
+        QCOMPARE(levels(), size_t{2}); // Retained, not silently emptied.
+    }
+    void orderBookSpreadRowIsExactCrossedOrOneSided()
+    {
+        B3FlowMeshOrderBook book; book.resize(420, 400); book.show(); QCoreApplication::processEvents();
+        // 1000 and 1010 atoms per atom of a 6-decimal token: 0.01 B3, and
+        // 200 x 10 / 2010 = 0.995% of the midpoint (the same in both views).
+        book.setSnapshot(WithLevels(SyntheticLimitBook()), false);
+        QCOMPARE(SpreadText(book), QStringLiteral("Spread  0.01 B3 · 0.995%"));
+        book.setSnapshot(WithLevels(SyntheticLimitBook()), true);
+        QCOMPARE(SpreadText(book), QStringLiteral("Spread  ≈0.0099 tUSD · 0.995%"));
+        QVERIFY(book.model()->row(book.model()->spreadRow()).tooltip.contains(QStringLiteral("Exact spread: 1/101 tUSD / B3")));
+        // Crossed after a rationed auction: never a negative spread; the
+        // standing clearing, labelled indicative.
+        auto crossed{SyntheticLimitBook(1)};
+        crossed.curves = {LimitCurve("bid", 30, 1012, 5'000), LimitCurve("ask", 31, 1011, 3'000)};
+        book.setSnapshot(WithLevels(crossed), false);
+        QVERIFY(SpreadText(book).startsWith(QStringLiteral("Crossed · next auction ≈1.011 for 0.003 tUSD")));
+        QVERIFY(SpreadText(book).endsWith(QStringLiteral("(indicative)")));
+        QVERIFY(book.model()->row(book.model()->spreadRow()).tooltip.contains(QStringLiteral("not certified")));
+        // One side, or none.
+        auto bids{SyntheticLimitBook(3)}; std::erase_if(bids.curves, [](const Curve& c) { return c.side == QStringLiteral("ask"); });
+        book.setSnapshot(WithLevels(bids), false);
+        QCOMPARE(SpreadText(book), QStringLiteral("One side only"));
+        auto empty{SyntheticLimitBook(1)}; empty.curves.clear();
+        book.setSnapshot(WithLevels(empty), false);
+        QCOMPARE(SpreadText(book), QStringLiteral("No standing orders"));
     }
     void switchingBookAndCurveViewsPreservesUnsubmittedInput()
     {
@@ -5917,11 +5972,11 @@ private Q_SLOTS:
         QToolTip::hideText();
         // A spread between rounded prices is rounded to their places too.
         B3FlowMeshOrderBook book; book.setSnapshot(SyntheticLimitBook(), true);
-        auto* spread{book.findChild<QLabel*>(QStringLiteral("flowMeshBookSpread"))};
-        QCOMPARE(spread->text(), QStringLiteral("Spread  ≈0.0099 tUSD"));
-        QCOMPARE(spread->toolTip(), QStringLiteral("Exact spread: 1/101 tUSD"));
+        QCOMPARE(SpreadText(book), QStringLiteral("Spread  ≈0.0099 tUSD · 0.995%"));
+        QVERIFY(book.model()->row(book.model()->spreadRow()).tooltip.endsWith(QStringLiteral("Exact spread: 1/101 tUSD / B3")));
         book.setSnapshot(SyntheticLimitBook(), false);
-        QCOMPARE(spread->text(), QStringLiteral("Spread  0.01 B3")); QVERIFY(spread->toolTip().isEmpty());
+        QCOMPARE(SpreadText(book), QStringLiteral("Spread  0.01 B3 · 0.995%"));
+        QVERIFY(!book.model()->row(book.model()->spreadRow()).tooltip.contains(QStringLiteral("Exact spread")));
         // Clearing strip and indicative line list what they rounded.
         auto s{Parse(RemoteDataWithViews())};
         auto tick{s.ticks->ticks[1]}; tick.price = 1009; QString exact;

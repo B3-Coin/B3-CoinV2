@@ -679,6 +679,10 @@ PriceText DisplayPrice(CAmount raw, const Units& units, bool inverse)
 }
 QString FormatDisplayPrice(CAmount raw, int decimals, bool inverse) { return DisplayPrice(raw, decimals, inverse).text; }
 QString FormatDisplayPrice(CAmount raw, const Units& units, bool inverse) { return DisplayPrice(raw, units, inverse).text; }
+PriceText DisplaySpread(CAmount bid, CAmount ask, const Units& units, bool inverse)
+{
+    return LimitSpread(bid, ask, units.decimals, ValidUnits(units) ? units.price_step : 0, inverse);
+}
 QString ExactInversePrice(CAmount raw, int decimals)
 {
     const auto ratio{InverseRatio(raw, decimals)};

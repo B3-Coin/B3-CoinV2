@@ -54,6 +54,10 @@ PriceText DisplayPrice(CAmount raw_price, const Units& units, bool inverse);
 QString FormatDisplayPrice(CAmount raw_price, int base_decimals, bool inverse = false);
 QString FormatDisplayPrice(CAmount raw_price, const Units& units, bool inverse);
 QString ExactInversePrice(CAmount raw_price, int base_decimals);
+//! The exact spread between two canonical best prices in the displayed
+//! orientation, rounded to the places its prices show (with `exact`); empty
+//! when ask < bid or, in the B3 view, a price is zero. Display only.
+PriceText DisplaySpread(CAmount bid, CAmount ask, const Units& units, bool inverse);
 //! Exact sampled gross B3 when inverted; not a fixed-B3 order quantity.
 QString FormatDepthQuantity(CAmount raw_price, CAmount base_quantity, int base_decimals, bool inverse);
 std::optional<CAmount> ParseDisplayPrice(const QString& text, const Units& units, bool inverse, QString* error = nullptr);
