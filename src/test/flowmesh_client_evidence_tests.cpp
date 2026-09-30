@@ -665,6 +665,45 @@ BOOST_AUTO_TEST_CASE(notice_wait_terminal_only_when_newer_than_events)
                 flowmesh::ClientWaitResult::TIMEOUT);
 }
 
+BOOST_AUTO_TEST_CASE(notice_wait_rechecks_when_its_actions_events_are_evicted)
+{
+    using Kind = flowmesh::ClientEventKind;
+    using Code = flowmesh::ActionReasonCode;
+    flowmesh::ClientEventLog log{Filled(1)};
+    // A refusal notice, then an exact retry's admission that becomes the
+    // oldest event of the full ring. The notice is older than that event,
+    // so the opt-in wait keeps waiting.
+    log.AppendNotices({Notice(2, 3, Code::STALE_SEQUENCE)});
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+    for (size_t i{1}; i < flowmesh::CLIENT_EVENT_CAPACITY; ++i) {
+        log.Append(ActionEvent(2, 4, Kind::CERTIFIED_INCLUDED));
+    }
+    BOOST_REQUIRE(log.ActionStatus(Filled(2), Filled(3)));
+    BOOST_REQUIRE(!log.NewestNoticeIfNewer(Filled(2), Filled(3)));
+
+    WaitProbe probe;
+    auto waiter{std::async(std::launch::async, [&] {
+        return log.WaitActionStatus(Filled(2), Filled(3), WaitClock::now() + 5s, probe.Predicate(), true);
+    })};
+    probe.AwaitEvaluations(1);
+    BOOST_REQUIRE(waiter.wait_for(0ms) == std::future_status::timeout);
+    // One unrelated append evicts the action's only event. It leaves no gap
+    // after the waiter's cursor and changes no notice. The action now has
+    // no status, so the retained notice is newer than every event, as
+    // NewestNoticeIfNewer reports, and the wait must end on it.
+    log.Append(ActionEvent(2, 4, Kind::CERTIFIED_INCLUDED));
+    BOOST_CHECK(!log.ActionStatus(Filled(2), Filled(3)));
+    const auto current{log.NewestNoticeIfNewer(Filled(2), Filled(3))};
+    BOOST_REQUIRE(current);
+    BOOST_CHECK(waiter.wait_for(1s) == std::future_status::ready);
+    const auto result{waiter.get()};
+    BOOST_CHECK(result.result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_CHECK(!result.status);
+    BOOST_REQUIRE(result.notice);
+    BOOST_CHECK(result.notice->code == Code::STALE_SEQUENCE);
+    BOOST_CHECK_EQUAL(result.notice->serial, current->serial);
+}
+
 BOOST_AUTO_TEST_CASE(newest_notice_if_newer_than_every_event)
 {
     using Kind = flowmesh::ClientEventKind;
