@@ -3201,6 +3201,93 @@ BOOST_AUTO_TEST_CASE(lane_hands_back_no_connection_that_an_explicit_reconnect_re
     server->Stop();
 }
 
+BOOST_AUTO_TEST_CASE(lane_yields_to_queued_status_demand_until_the_queue_is_empty)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    // Two retained actions of one account: `hot` is read with a wait again
+    // and again; `other` is read without one and must still be served.
+    const auto hot{Seed(path, owner)};
+    auto other{hot};
+    ++other.sequence;
+    {
+        const auto bytes{flowmesh::EncodeProductionActionPayload(other)};
+        BOOST_REQUIRE(bytes);
+        CDBWrapper db{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        std::string json;
+        BOOST_REQUIRE(db.Read(std::string{"public-client-v1"}, json));
+        UniValue root;
+        BOOST_REQUIRE(root.read(json));
+        UniValue row{root["actions"][0]};
+        row.pushKV("action_hex", HexStr(*bytes));
+        row.pushKV("action_id", other.Id().GetHex());
+        UniValue actions{UniValue::VARR};
+        actions.push_back(root["actions"][0]);
+        actions.push_back(std::move(row));
+        root.pushKV("actions", std::move(actions));
+        db.Write(std::string{"public-client-v1"}, root.write(), true);
+    }
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.plain = validator.submit = validator.waited = Receipt(hot, "admitted");
+    validator.waited.pushKV("wait_status", "timeout");
+    validator.by_action.emplace(other.Id().GetHex(), Receipt(other, "admitted"));
+    const auto other_reads = [&] {
+        std::lock_guard lock{validator.mutex};
+        return validator.by_action_reads[other.Id().GetHex()];
+    };
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // `hot`'s delivery is acknowledged here, so its waited reads may take the lane.
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, hot.Id(), true).state, "admitted");
+    BOOST_REQUIRE((validator.Counts() == std::array<unsigned, 4>{1, 0, 1, 1}));
+
+    // Unwaited reads of `other`, back to back, until the automatic budget
+    // refuses one: its demand then stays queued, unserved. The rolling
+    // 16-per-second cap bounds this loop.
+    bool queued{false};
+    for (int i{0}; i < 64 && !queued; ++i) {
+        const auto before{other_reads()};
+        BOOST_REQUIRE_EQUAL(client->ActionStatus(market, other.Id(), false).state, "admitted");
+        queued = other_reads() == before;
+    }
+    BOOST_REQUIRE(queued);
+    const auto served{other_reads()};
+    // Past the rolling window and with a full burst, so the budget itself
+    // never stops the lane below; only the queued demand may.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+
+    TimingCapture timing;
+    // The lane yields: this call serves `other`, the oldest demand, queues
+    // `hot` behind it and sends no waited read.
+    const auto first{client->ActionStatus(market, hot.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(first.state, "admitted");
+    BOOST_CHECK_EQUAL(other_reads(), served + 1);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 0, 1, 1}));
+    // Next, `hot`'s own queued demand is served by an ordinary read, still
+    // with no waited read.
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    const auto second{client->ActionStatus(market, hot.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(second.state, "admitted");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 0, 1, 1}));
+    // With nothing queued, the next waited call takes the lane again.
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    const auto third{client->ActionStatus(market, hot.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(third.state, "admitted");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 1, 1, 1}));
+    BOOST_CHECK_EQUAL(other_reads(), served + 1);
+    const auto spans{timing.Stop("client_action_wait")};
+    BOOST_REQUIRE_EQUAL(spans.size(), 3U);
+    BOOST_CHECK_EQUAL(spans[0]["result"].get_str(), "coalesced");
+    BOOST_CHECK_EQUAL(spans[1]["result"].get_str(), "coalesced");
+    BOOST_CHECK_EQUAL(spans[2]["result"].get_str(), "observed");
+    client.reset();
+    server->Stop();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_client_submit_wait_tests, ClientLaneFixture)
