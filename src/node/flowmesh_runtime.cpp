@@ -4595,7 +4595,11 @@ void FlowMeshRuntime::ObserveTimeMaintenance(const size_t connected_peers)
         if (gate_open) market.observed_anchor_height = anchor.height;
         const auto lag{market.lag.Summary()};
         const uint64_t next{market.next_sequence};
-        const bool caught_up{market.ready && market.halt == FlowMeshRuntimeHalt::NONE && gate_open && connected_peers > 0 &&
+        // Without a peer only a node that certifies alone (a local quorum,
+        // regtest) can be applying entries as they are certified.
+        const bool reachable{connected_peers > 0 ||
+                             (market.ready && LocalSeatKeys(market).size() >= flowmesh::FlowMeshBlsThreshold(market.seats.Size()))};
+        const bool caught_up{market.ready && market.halt == FlowMeshRuntimeHalt::NONE && gate_open && reachable &&
                              !lag.proven_target &&
                              !(lag.peer_hint_next_sequence && next < std::numeric_limits<uint64_t>::max() &&
                                *lag.peer_hint_next_sequence > next + 1)};
