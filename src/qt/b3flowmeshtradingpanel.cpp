@@ -404,7 +404,8 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     connect(m_endpoint, &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateConnectionState);
     connect(m_orientation, &QComboBox::currentIndexChanged, this, [this] {
         // Never reinterpret a typed price or a deferred click in another unit.
-        m_price->clear(); m_deferred_review.reset();
+        m_deferred_review.reset(); m_price->clear();
+        for (auto* price : m_ladder_prices) price->clear();
         updateMarketText(); updateDataViews();
     });
     connect(m_market, &QComboBox::currentIndexChanged, this, [this] {
@@ -1188,7 +1189,7 @@ void B3FlowMeshTradingPanel::mergeHeldTicks()
         m_tick_times.clear();
         m_received_times.clear();
     }
-    const auto* observed{shown->observed && shown->observed->available ? &*shown->observed : nullptr};
+    const auto* observed{shown->observed ? &*shown->observed : nullptr};
     if (observed && observed->source != m_tick_times_source) {
         // One source's series only: another endpoint's clock is never mixed in.
         m_tick_times.clear();
@@ -1196,7 +1197,7 @@ void B3FlowMeshTradingPanel::mergeHeldTicks()
     }
     B3FlowMeshMarketData::MergeHeldTimes(m_tick_times, m_ticks, observed);
     // Receipt times only while no observed times exist, and only for held ticks.
-    if (observed || m_ticks.empty()) m_received_times.clear();
+    if ((observed && observed->available) || m_ticks.empty()) m_received_times.clear();
     else std::erase_if(m_received_times, [&](const auto& item) { return item.first < m_ticks.front().sequence || item.first > m_ticks.back().sequence; });
 }
 

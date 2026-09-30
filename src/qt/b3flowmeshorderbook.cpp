@@ -769,7 +769,10 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
                 const auto average{DisplayPrice(static_cast<CAmount>(*last.cumulative_notional / static_cast<uint64_t>(last.cumulative)), u, inverse)};
                 tip << tr("Average price to here ≈%1 %2").arg(Bare(average.text), price_units);
             }
-            if (m_verified) tip << (curves == 1 ? tr("1 standing order (one per account and side)") : tr("%1 standing orders (one per account and side)").arg(curves));
+            // One ladder may contribute at several exact prices in a rounded
+            // display row. Adding level counts is not a distinct-order count.
+            if (merged) tip << tr("%1 price-level contributions; one ladder order may contribute more than once.").arg(curves);
+            else if (m_verified) tip << (curves == 1 ? tr("1 standing order (one per account and side)") : tr("%1 standing orders (one per account and side)").arg(curves));
             else tip << tr("%1 limit or ladder order(s) at this level").arg(curves);
             if (own > 0) tip << tr("Your order: %1 %2 at this level").arg(FormatAmount(own, decimals), token);
             if (!row.click_price.isEmpty()) {
@@ -783,7 +786,8 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
             }
             row.tooltip = tip.join(QLatin1Char('\n'));
             const bool exact{!merged && first.exact.isEmpty()};
-            row.accessible = tr("%1 %2, size %3, total %4, %5 order(s)").arg(displayed_ask ? tr("Sell") : tr("Buy"),
+            row.accessible = (merged ? tr("%1 %2, size %3, total %4, %5 price-level contributions")
+                                     : tr("%1 %2, size %3, total %4, %5 order(s)")).arg(displayed_ask ? tr("Sell") : tr("Buy"),
                                                                            exact ? row.price : tr("about %1").arg(row.price), row.size, row.total).arg(curves) +
                              (row.own ? tr(", includes yours") : QString{});
             out.push_back(std::move(row));
@@ -792,9 +796,8 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
     format(ask_runs, /*displayed_ask=*/true, m_asks);
     format(bid_runs, /*displayed_ask=*/false, m_bids);
     headers(rounded, places);
-    // The spread row, from the exact best prices whatever the grouping, as
-    // the difference of the two prices beside it at the view's places.
-    m_spread_tip = tr("The difference between the best sell and best buy price, as they are shown beside it, and its share of their midpoint. "
+    // Grouped display rows may show bucket edges instead of the exact best.
+    m_spread_tip = tr("The difference between the exact best sell and best buy price, and its share of their midpoint. Grouped or rounded row labels may differ from those exact prices. "
                       "FlowMesh clears at one uniform price per auction; a crossed book (a buy above a sell) can stand after a rationed auction until the next certified one.");
     if (m_asks.empty() && m_bids.empty()) {
         m_spread = tr("No standing orders");

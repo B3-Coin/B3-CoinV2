@@ -19,6 +19,7 @@
 #include <flowmesh/market.h>
 #include <flowmesh/market_view.h>
 #include <flowmesh/microblock.h>
+#include <flowmesh/observed_time.h>
 #include <test/util/setup_common.h>
 #include <util/int128.h>
 #include <wallet/context.h>
@@ -3101,6 +3102,38 @@ private Q_SLOTS:
         panel.m_snapshot = s; panel.mergeHeldTicks();
         QCOMPARE(panel.m_ticks.size(), size_t{1}); QVERIFY(panel.m_tick_times.empty());
     }
+    void heldTimesClearWhenAnUnavailableSourceChanges()
+    {
+        B3FlowMeshTradingPanel panel;
+        const auto first{Parse(RemoteDataWithTimes())};
+        Observe(panel, first); panel.mergeHeldTicks();
+        const auto held{panel.m_tick_times};
+        QCOMPARE(held.size(), size_t{2});
+        const auto unavailable = [](const std::string& source) {
+            auto reply{RemoteDataWithTimes()};
+            auto observed{ObservedJson({}, source)};
+            observed.pushKV("available", false); observed.pushKV("unavailable_reason", "temporarily_unavailable");
+            reply.pushKV("observed_time", observed); reply.pushKV("unchanged", true);
+            return Parse(reply);
+        };
+        QElapsedTimer age; age.start();
+        // A same-head outage of this source keeps the times already held.
+        QCOMPARE(panel.applySelectedSnapshot(unavailable(first.observed->source.toStdString()), age, first.head), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QCOMPARE(panel.m_tick_times, held);
+        QCOMPARE(panel.m_tick_times_source, first.observed->source);
+        // Failover identifies another clock even before it supplies any rows.
+        QCOMPARE(panel.applySelectedSnapshot(unavailable("https://other.invalid"), age, first.head), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QVERIFY(panel.m_tick_times.empty());
+        QCOMPARE(panel.m_tick_times_source, QStringLiteral("https://other.invalid"));
+        QVERIFY(!panel.observedStamp(2, first.head));
+        QCOMPARE(panel.m_ticks.size(), size_t{2});
+        auto recovered{RemoteDataWithTimes()};
+        recovered.pushKV("observed_time", ObservedJson({StampJson(2, H(4), "live", OBSERVED_T0 + 90'000)}, "https://other.invalid"));
+        recovered.pushKV("unchanged", true);
+        QCOMPARE(panel.applySelectedSnapshot(Parse(recovered), age, first.head), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QCOMPARE(panel.m_tick_times.size(), size_t{1});
+        QCOMPARE(panel.m_tick_times.at(2).ms, OBSERVED_T0 + 90'000);
+    }
     void marketReadsAskForObservedTimeAndCandlesWhenDue()
     {
         FundingReadProbe probe; probe.live_ms = 0; probe.data = RemoteDataWithTimes();
@@ -3418,6 +3451,44 @@ private Q_SLOTS:
         // Painting is bounded to the window and never throws on edges.
         QImage image{chart.size(), QImage::Format_ARGB32}; chart.render(&image);
         series.candles.clear(); chart.setTimeSeries(series); chart.render(&image);
+    }
+    void timeChartBoundsExtremeObservedTime()
+    {
+        constexpr auto interval{flowmesh::CandleInterval::M1};
+        const int64_t step{flowmesh::CandleIntervalMs(interval)};
+        const int64_t maximum{flowmesh::CandleOpenMs(std::numeric_limits<int64_t>::max(), interval)};
+        // This endpoint page is aligned and representable, so it passes the
+        // parser. Its axis must never advance beyond the integer range.
+        const auto page{ParseCandles(CandlesJson("1m", step, maximum, 2,
+            {CandleJson(maximum - step, 2, 2, 1000, 1000, 1000, 1000, 1)}), interval)};
+        QVERIFY(page.available); QCOMPARE(page.candles.size(), size_t{1});
+        B3FlowMeshChart chart; chart.resize(700, 400); chart.setSnapshot(Parse(RemoteData()));
+        B3FlowMeshChart::TimeSeries series;
+        series.available = true; series.remote = true; series.source = page.source;
+        series.interval = interval; series.candles = page.candles;
+        chart.setTimeSeries(series); chart.setNowMs(std::numeric_limits<int64_t>::max());
+        QCOMPARE(chart.timeWindow().second, maximum);
+        QImage image{chart.size(), QImage::Format_ARGB32};
+        int paints{0}; chart.setPaintObserver([&] { ++paints; });
+        chart.render(&image); QCOMPARE(paints, 1);
+        chart.zoomTime(0.5, 0.0);
+        QCOMPARE(chart.timeSlots(), 120.0); QCOMPARE(chart.timeWindow().second, maximum);
+        chart.panTime(500); QCOMPARE(chart.timeWindow().second, maximum - 500 * step);
+        chart.panTime(-1000); QVERIFY(chart.followsTail());
+        chart.panTime(std::numeric_limits<double>::max());
+        QCOMPARE(chart.timeWindow(), (std::pair<int64_t, int64_t>{0, 0}));
+        chart.panTime(-std::numeric_limits<double>::max()); QVERIFY(chart.followsTail());
+        chart.zoomTime(std::numeric_limits<double>::quiet_NaN());
+        chart.zoomTime(2.0, std::numeric_limits<double>::quiet_NaN());
+        chart.panTime(std::numeric_limits<double>::infinity());
+        QCOMPARE(chart.timeSlots(), 120.0); QCOMPARE(chart.timeWindow().second, maximum);
+        chart.render(&image); QCOMPARE(paints, 2);
+        // Normal timestamps still draw and retain the expected visible span.
+        series.candles.front().open_ms = OBSERVED_T0;
+        chart.setTimeSeries(series); chart.setNowMs(OBSERVED_T0); chart.resetTimeView();
+        QCOMPARE(chart.timeWindow().second, OBSERVED_T0);
+        QCOMPARE(chart.timeWindow().second - chart.timeWindow().first, 59 * step);
+        chart.render(&image); QCOMPARE(paints, 3);
     }
     void unchangedRepliesKeepTheirObservedTimes()
     {
@@ -4396,8 +4467,18 @@ private Q_SLOTS:
         const auto original{panel.m_market_data.front()};
         panel.m_price->setText(QStringLiteral("0.5"));
         panel.m_quantity->setText(QStringLiteral("1"));
+        for (size_t i{0}; i < panel.m_ladder_prices.size(); ++i) {
+            panel.m_ladder_prices[i]->setText(QStringLiteral("0.5"));
+            panel.m_ladder_quantities[i]->setText(QStringLiteral("1"));
+        }
+        panel.m_deferred_review.emplace();
         orientation->setCurrentIndex(1);
         QVERIFY(panel.m_price->text().isEmpty()); // Never reinterpret an old limit.
+        for (size_t i{0}; i < panel.m_ladder_prices.size(); ++i) {
+            QVERIFY(panel.m_ladder_prices[i]->text().isEmpty());
+            QCOMPARE(panel.m_ladder_quantities[i]->text(), QStringLiteral("1"));
+        }
+        QVERIFY(!panel.m_deferred_review);
         QCOMPARE(panel.m_quantity->text(), QStringLiteral("1"));
         QVERIFY(panel.m_snapshot && *panel.m_snapshot == snapshot);
         QCOMPARE(panel.m_market_data.front().id, original.id);
@@ -4432,8 +4513,12 @@ private Q_SLOTS:
         QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("0.5 B3")));
         QVERIFY(!panel.m_order->isEnabled()); // This display fixture has no wallet.
         QVERIFY(!panel.m_thread);
+        for (auto* price : panel.m_ladder_prices) price->setText(QStringLiteral("2"));
+        panel.m_deferred_review.emplace();
         orientation->setCurrentIndex(0);
         QVERIFY(panel.m_price->text().isEmpty());
+        for (auto* price : panel.m_ladder_prices) QVERIFY(price->text().isEmpty());
+        QVERIFY(!panel.m_deferred_review);
         QVERIFY(panel.m_snapshot && *panel.m_snapshot == snapshot);
         QCOMPARE(panel.m_own_view->item(0, 0)->text(), QStringLiteral("Buy"));
         QCOMPARE(panel.m_depth_view->item(0, 0)->text(),
