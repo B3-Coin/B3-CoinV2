@@ -5,11 +5,13 @@
 #include <node/flowmesh_timing.h>
 #include <node/flowmesh_runtime.h>
 #include <node/flowmesh_action_pool.h>
+#include <node/flowmesh_observed_time_log.h>
 #include <node/flowmesh_recent_window.h>
 #include <node/flowmesh_seat_evidence_recorder.h>
 
 #include <crypto/common.h>
 #include <flowmesh/market_view.h>
+#include <flowmesh/observed_time.h>
 #include <hash.h>
 #include <logging.h>
 #include <random.h>
@@ -202,6 +204,14 @@ struct FlowMeshRuntime::Market {
     FlowMeshRecentWindowLimits recent_limits;
     flowmesh::ClientEventLog& client_events;
     std::optional<int64_t> local_observed_at;
+    // Operator-observed time, display only: nothing here decides anything.
+    // The log, the caught-up observation behind its warm-up, the highest
+    // slot that waited for B3 reconciliation, and the current acceptable
+    // anchor height as the maintenance tick last sampled it.
+    std::shared_ptr<FlowMeshObservedTimeLog> observed;
+    flowmesh::ObservedWarmup observed_warmup;
+    std::optional<uint64_t> observed_deferred_watermark;
+    std::optional<int32_t> observed_anchor_height;
     FlowMeshProductionStore* store{nullptr};
     const flowmesh::DepositVerifier* deposits{nullptr};
     FlowMeshRuntimeChain* chain{nullptr};
@@ -408,7 +418,7 @@ struct FlowMeshRuntime::Market {
           next_effect_index{config.next_effect_index},
           last_hash{config.last_microblock_hash},
           certified_state_root{config.state.Root()}, recent_limits{runtime_config.recent_window},
-          client_events{events}, store{config.store},
+          client_events{events}, observed{config.observed}, store{config.store},
           deposits{config.deposits}, chain{runtime_config.chain},
           keys{runtime_config.keys}, clock{runtime_config.clock},
           relay{&runtime_config.relay},
@@ -1506,6 +1516,61 @@ flowmesh::ClientActionNotice LocalNotice(const Market& market, const flowmesh::A
     return notice;
 }
 
+//! Operator-observed time, display only (flowmesh_observed_time_log.h).
+//! How far past the local head an unverified deferred frame can move the
+//! deferral watermark.
+constexpr uint64_t OBSERVED_DEFERRAL_REACH{16};
+//! An entry anchored more than this many blocks behind the current
+//! acceptable anchor was proposed well before it was applied here.
+constexpr int32_t OBSERVED_ANCHOR_MARGIN{2};
+
+//! A slot at `sequence` waited for B3 reconciliation: its entry, when
+//! applied, is recorded as applied late. Never read by any decision.
+template <typename Market>
+void NoteObservedDeferral(Market& market, const uint64_t sequence)
+{
+    if (!market.observed) return;
+    const uint64_t reach{market.next_sequence > std::numeric_limits<uint64_t>::max() - OBSERVED_DEFERRAL_REACH
+                             ? std::numeric_limits<uint64_t>::max()
+                             : market.next_sequence + OBSERVED_DEFERRAL_REACH};
+    market.observed_deferred_watermark = std::max(market.observed_deferred_watermark.value_or(0), std::min(sequence, reach));
+}
+
+/** Records when this node applied the entry it just appended durably.
+ * Display only: it reads only observations (lag, the warm-up, the tick the
+ * append cached), never changes the market and never throws, so a failure
+ * here costs a gap in the times and nothing else. The tick is the store's
+ * newest cached one, an O(1) read under the store's own mutex. */
+template <typename Market>
+void RecordObservedTime(Market& market, const flowmesh::ProductionEntryCore& entry, const bool from_catchup) noexcept
+{
+    if (!market.observed) return;
+    try {
+        FlowMeshTimingSpan timing{"observed_time_record"};
+        const auto lag{market.lag.Summary()};
+        flowmesh::ObservedLivenessInputs inputs;
+        inputs.sequence = entry.sequence;
+        inputs.from_catchup = from_catchup;
+        inputs.deferred_watermark = market.observed_deferred_watermark;
+        inputs.proven_target = lag.proven_target;
+        inputs.hint_next = lag.peer_hint_next_sequence;
+        inputs.anchor_stale = entry.sequence > 0 && market.observed_anchor_height &&
+                              entry.anchor.height < *market.observed_anchor_height - OBSERVED_ANCHOR_MARGIN;
+        inputs.warm = market.observed_warmup.Warm(market.clock->Now(), flowmesh::ObservedWarmupFor(market.round_timeout));
+        std::optional<flowmesh::ClearingTick> tick;
+        if (market.store) {
+            const auto page{market.store->ReadClearingTicks({std::nullopt, 1})};
+            if (page.available && !page.ticks.empty()) tick = page.ticks.back();
+        }
+        const auto stamp{market.observed->Record(entry.sequence, market.last_hash,
+                                                 flowmesh::ClassifyObservedLiveness(inputs), tick)};
+        timing.Field("sequence", entry.sequence);
+        timing.Field("mode", std::string{flowmesh::ObservedModeName(stamp.mode)});
+        timing.Field("delay", std::string{flowmesh::ObservedDelayName(stamp.delay)});
+    } catch (...) {
+    }
+}
+
 template <typename Market>
 bool CertifiedAnchorReconciliationInterrupted(
     Market& market, const flowmesh::ProductionEntryCore& entry,
@@ -1543,6 +1608,7 @@ bool DeferCertifiedAnchorRejection(
     DeliveryEvent(market, "publication_deferred", flowmesh::WireMessageKind::CERTIFICATE,
                   entry.GetHash(), entry.sequence, std::nullopt,
                   "anchor validation interrupted by chain reconciliation", EntryTrace(entry));
+    NoteObservedDeferral(market, entry.sequence);
     return true;
 }
 
@@ -1551,7 +1617,8 @@ bool CommitCertified(Market& market,
                      const flowmesh::ProductionCertifiedEnvelope& certified,
                      typename Market::Candidate& candidate,
                      const std::pair<size_t, size_t> recent_others,
-                     bool* reconciliation_deferred = nullptr)
+                     bool* reconciliation_deferred = nullptr,
+                     const bool from_catchup = false)
 {
     if (reconciliation_deferred) *reconciliation_deferred = false;
     const uint64_t delivery_generation{market.chain->DeliveryGeneration()};
@@ -1567,6 +1634,7 @@ bool CommitCertified(Market& market,
             DeliveryEvent(market, "certificate_validation_deferred", flowmesh::WireMessageKind::CERTIFICATE,
                           certified.entry.GetHash(), certified.entry.sequence, std::nullopt,
                           "verified certificate interrupted before append", EntryTrace(certified.entry));
+            NoteObservedDeferral(market, certified.entry.sequence);
         }
         return false;
     }
@@ -1665,6 +1733,8 @@ bool CommitCertified(Market& market,
     market.recent.Push(std::move(recent_item), market.recent_limits, recent_others.first, recent_others.second);
     market.client_events.Append(std::move(committed_events));
     market.local_observed_at = GetTime();
+    // Display only, after the durable append; changes nothing below.
+    RecordObservedTime(market, certified.entry, from_catchup);
     ++market.next_sequence;
     // Health observation only. Advancing the local head is the only way a
     // proven lag ends; a commit never ends a lag episode by itself.
@@ -2149,6 +2219,12 @@ void FlowMeshRuntime::DeferMessage(Market& market, const flowmesh::QueuedWireMes
     }
     m_deferred_messages.emplace(key, queued);
     m_deferred_deadlines.emplace(key, m_config.clock->Now() + std::chrono::seconds{60});
+    if (queued.message.kind == flowmesh::WireMessageKind::PROPOSAL ||
+        queued.message.kind == flowmesh::WireMessageKind::ATTESTATION ||
+        queued.message.kind == flowmesh::WireMessageKind::AGREEMENT ||
+        queued.message.kind == flowmesh::WireMessageKind::CERTIFICATE) {
+        NoteObservedDeferral(market, queued.message.header.sequence);
+    }
     m_deferred_bytes += bytes;
     market.delivery.deferred_bytes += bytes;
     ++market.delivery.deferred_objects;
@@ -4378,6 +4454,7 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
         if (now >= it->second) it = m_catchup_cooldowns.erase(it);
         else ++it;
     }
+    ObserveTimeMaintenance(connected_peers);
     { FlowMeshTimingSpan timing{"tick_retry_deferred"}; RetryDeferredMessages(); }
     { FlowMeshTimingSpan timing{"tick_retry_deliveries"}; RetryDeliveries(); }
     { FlowMeshTimingSpan timing{"tick_regenerate"}; RegenerateDeliveries(); }
@@ -4455,6 +4532,33 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
     {
         FlowMeshTimingSpan timing{"tick_publish_health"};
         PublishHealth(m_config.clock->Now(), connected_peers, no_peers_since, /*force=*/false);
+    }
+}
+
+void FlowMeshRuntime::ObserveTimeMaintenance(const size_t connected_peers)
+{
+    // Operator-observed time, display only: whether each market is caught
+    // up (for the warm-up that keeps old relayed certificates from being
+    // stamped live after a start or an interruption) and the current
+    // acceptable anchor height (for the stale-anchor check). Sampled here,
+    // so a commit takes no chain lock for either.
+    if (std::none_of(m_markets.begin(), m_markets.end(), [](const auto& item) { return item.second->observed != nullptr; })) return;
+    const auto anchor{m_config.chain->Current()};
+    const bool gate_open{m_config.chain->Acceptable(anchor)};
+    const auto now{m_config.clock->Now()};
+    for (auto& [id, market_ptr] : m_markets) {
+        (void)id;
+        Market& market{*market_ptr};
+        if (!market.observed) continue;
+        if (gate_open) market.observed_anchor_height = anchor.height;
+        const auto lag{market.lag.Summary()};
+        const uint64_t next{market.next_sequence};
+        const bool caught_up{market.ready && market.halt == FlowMeshRuntimeHalt::NONE && gate_open && connected_peers > 0 &&
+                             !lag.proven_target &&
+                             !(lag.peer_hint_next_sequence && next < std::numeric_limits<uint64_t>::max() &&
+                               *lag.peer_hint_next_sequence > next + 1)};
+        // A lag or gate closure shorter than one round does not restart it.
+        market.observed_warmup.Observe(caught_up, now, market.round_timeout);
     }
 }
 
@@ -5879,6 +5983,7 @@ void FlowMeshRuntime::HandleCertificate(
             DeliveryEvent(market, "certificate_validation_deferred", flowmesh::WireMessageKind::CERTIFICATE,
                           certified->entry.GetHash(), certified->entry.sequence, peer,
                           "verified certificate awaits execution after reconciliation", EntryTrace(certified->entry));
+            NoteObservedDeferral(market, certified->entry.sequence);
         }
     };
     const uint256 hash{certified->entry.GetHash()};
@@ -5911,7 +6016,7 @@ void FlowMeshRuntime::HandleCertificate(
                                                   std::move(*candidate)).first;
     }
     if (!CommitCertified(market, *certified, candidate_it->second, RecentWindowOthers(market),
-                         reconciliation_deferred)) return;
+                         reconciliation_deferred, from_catchup)) return;
     // The next slot is proposed from the maintenance tick. When this node
     // holds the next slot's proposer seat and the market still holds admitted
     // work, it must not wait up to a full tick interval, so reuse the existing

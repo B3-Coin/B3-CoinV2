@@ -11,6 +11,7 @@
 #include <hash.h>
 #include <logging.h>
 #include <node/flowmesh_action_pool.h>
+#include <node/flowmesh_observed_time_log.h>
 #include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
 
@@ -6903,7 +6904,9 @@ BOOST_AUTO_TEST_CASE(discovery_hints_are_untrusted_and_failed_catchup_is_bounded
 class HealthRuntimeFixture
 {
 public:
-    explicit HealthRuntimeFixture(const fs::path& path)
+    explicit HealthRuntimeFixture(const fs::path& path,
+                                  std::shared_ptr<node::FlowMeshObservedTimeLog> observed = nullptr,
+                                  const size_t entry_count = 3)
         : store{DBParams{.path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}}
     {
         chain.m_domain = domain;
@@ -6926,14 +6929,16 @@ public:
             }
             return LegacyRelayResult();
         };
+        auto market_config{MarketConfig(domain, market, treasury, seats.seats, initial, store, nullptr)};
+        market_config.observed = std::move(observed);
         runtime = std::make_unique<node::FlowMeshRuntime>(config, std::vector<node::FlowMeshRuntimeMarketConfig>{
-            MarketConfig(domain, market, treasury, seats.seats, initial, store, nullptr)});
+            std::move(market_config)});
         flowmesh::ProductionEpochGate gate{domain, market, seats.seats};
         flowmesh::ProductionEntryCheck check;
         std::optional<flowmesh::FlowMeshState> state{initial};
         uint256 parent;
         std::optional<flowmesh::AnchorRef> previous;
-        for (uint64_t sequence{0}; sequence < 3; ++sequence) {
+        for (uint64_t sequence{0}; sequence < entry_count; ++sequence) {
             const auto built{flowmesh::BuildProductionExecutionEntry(
                 *state, domain, market, seats.seats, gate, sequence, 0, parent, {100, Filled(0x71)},
                 {chain.TipHeight(), previous, &chain}, treasury, {}, nullptr, check)};
@@ -7169,6 +7174,136 @@ BOOST_AUTO_TEST_CASE(health_lag_is_proven_only_by_verified_certificates_and_spec
     f.clock.m_now += node::FlowMeshLagTracker::HINT_TTL;
     BOOST_CHECK_EQUAL(f.Lag(f.Health()).peers_hinting_ahead, 0U);
     BOOST_CHECK(!f.Lag(f.Health()).behind_since);
+}
+
+//! Hand-driven wall and steady clocks for an observed-time log.
+struct ObservedTestClock {
+    std::atomic<int64_t> wall_ms{1790769600000};
+    std::atomic<int64_t> steady_ms{1'000'000};
+    node::FlowMeshObservedTimeLog::Clocks Get()
+    {
+        return {[this] { return wall_ms.load(); },
+                [this] { return std::chrono::steady_clock::time_point{} + std::chrono::milliseconds{steady_ms.load()}; }};
+    }
+};
+
+std::shared_ptr<node::FlowMeshObservedTimeLog> ObservedLogFor(ObservedTestClock& clock)
+{
+    const uint256 domain{Filled(0x1c)};
+    return std::make_shared<node::FlowMeshObservedTimeLog>(
+        domain, *flowmesh::ComputeFlowMeshMarketId(domain, modern::AssetId{Filled(0x3c)}), clock.Get());
+}
+
+//! Health() ticks until the observed-time warm-up (4 s at the default 2 s
+//! round timeout) has passed with a connected peer.
+void WarmObservedTime(HealthRuntimeFixture& f, ObservedTestClock& clock)
+{
+    f.runtime->FlowMeshPeerConnected(5);
+    for (int i{0}; i < 18; ++i) {
+        f.Health();
+        clock.wall_ms += 250;
+        clock.steady_ms += 250;
+    }
+}
+
+flowmesh::ObservedStamp ObservedAt(const node::FlowMeshObservedTimeLog& log, const HealthRuntimeFixture& f, const uint64_t sequence)
+{
+    const auto rows{log.Lookup({{sequence, f.entries.at(sequence).GetHash()}})};
+    BOOST_REQUIRE_EQUAL(rows.size(), 1U);
+    return rows.front();
+}
+
+BOOST_AUTO_TEST_CASE(observed_time_is_recorded_after_commit_with_its_liveness)
+{
+    ObservedTestClock clock;
+    const auto log{ObservedLogFor(clock)};
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_observed_live", log, 5};
+    // The entries' own anchor is the current acceptable one.
+    f.chain.m_current = f.entries.front().anchor;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+
+    // Right after start nothing is warm: an old certificate relayed now must
+    // not be stamped live. It is recorded, with only an upper bound.
+    f.Certificate(9, 0);
+    auto stamp{ObservedAt(*log, f, 0)};
+    BOOST_CHECK(stamp.mode == flowmesh::ObservedMode::DELAYED);
+    BOOST_CHECK(stamp.delay == flowmesh::ObservedDelay::WARMUP);
+    BOOST_CHECK(stamp.flags & flowmesh::OBSERVED_RESTART);
+    BOOST_CHECK(f.Health()->markets.front().local_observed_at);
+
+    // Caught up with a peer for the warm-up: live, at this node's clock.
+    WarmObservedTime(f, clock);
+    const int64_t applied{clock.wall_ms.load()};
+    f.Certificate(9, 1);
+    stamp = ObservedAt(*log, f, 1);
+    BOOST_CHECK(stamp.mode == flowmesh::ObservedMode::LIVE);
+    BOOST_CHECK_EQUAL(stamp.ms, applied);
+    // The stamp carries the entry's own clearing (none here).
+    BOOST_CHECK(!(stamp.flags & flowmesh::OBSERVED_NO_CLEARING));
+
+    // A verified certificate for a later sequence proves this node behind;
+    // the catch-up page that follows is recorded late.
+    f.Certificate(9, 3);
+    BOOST_REQUIRE_GE(f.Gets(9), 1U);
+    f.Entries(9, 2, {f.payloads[2]});
+    stamp = ObservedAt(*log, f, 2);
+    BOOST_CHECK(stamp.mode == flowmesh::ObservedMode::DELAYED);
+    BOOST_CHECK(stamp.delay == flowmesh::ObservedDelay::CATCHUP);
+    // The held certificate is for the very next entry: committing it, this
+    // node is level again, and a lag shorter than a round kept the warm-up.
+    f.Certificate(9, 3);
+    BOOST_CHECK(ObservedAt(*log, f, 3).mode == flowmesh::ObservedMode::LIVE);
+    // A peer level with the entry being committed is not ahead of it.
+    f.Hello(8, 5);
+    f.Certificate(9, 4);
+    BOOST_CHECK(ObservedAt(*log, f, 4).mode == flowmesh::ObservedMode::LIVE);
+    // Candles hold only what was applied live (or late inside one bucket).
+    const auto page{log->Candles(flowmesh::CandleInterval::H1, std::nullopt, 10)};
+    BOOST_REQUIRE_EQUAL(page.candles.size(), 1U);
+    BOOST_CHECK_GE(page.candles.front().entries, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(observed_time_marks_a_reconciliation_deferred_certificate_late)
+{
+    ObservedTestClock clock;
+    const auto log{ObservedLogFor(clock)};
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_observed_deferred", log, 3};
+    f.chain.m_current = f.entries.front().anchor;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    WarmObservedTime(f, clock);
+
+    // The certificate waits for B3 reconciliation, then commits: late.
+    f.chain.SetReconciled(false);
+    f.Certificate(9, 0);
+    BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
+    f.chain.SetReconciled(true);
+    f.Health();
+    f.Health();
+    BOOST_REQUIRE_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 1U);
+    const auto stamp{ObservedAt(*log, f, 0)};
+    BOOST_CHECK(stamp.mode == flowmesh::ObservedMode::DELAYED);
+    BOOST_CHECK(stamp.delay == flowmesh::ObservedDelay::DEFERRED);
+    // A brief closure does not restart the warm-up: the next one is live.
+    f.Certificate(9, 1);
+    BOOST_CHECK(ObservedAt(*log, f, 1).mode == flowmesh::ObservedMode::LIVE);
+}
+
+BOOST_AUTO_TEST_CASE(observed_time_throwing_clock_never_affects_the_commit)
+{
+    auto log{std::make_shared<node::FlowMeshObservedTimeLog>(
+        Filled(0x1c), *flowmesh::ComputeFlowMeshMarketId(Filled(0x1c), modern::AssetId{Filled(0x3c)}),
+        node::FlowMeshObservedTimeLog::Clocks{[]() -> int64_t { throw std::runtime_error{"clock"}; }, {}})};
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_observed_throw", log, 3};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    f.Certificate(9, 0);
+    f.Certificate(9, 1);
+    BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 2U);
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    BOOST_CHECK_EQUAL(log->GetSummary().record_failures, 2U);
+    BOOST_CHECK(f.Health()->markets.front().local_observed_at);
 }
 
 BOOST_AUTO_TEST_CASE(health_snapshot_includes_an_added_market_before_add_returns)

@@ -18,6 +18,7 @@
 #include <node/flowmesh_anchor.h>
 #include <node/flowmesh_checkpoint_index.h>
 #include <node/flowmesh_market_memo.h>
+#include <node/flowmesh_observed_time_log.h>
 #include <node/flowmesh_production_store.h>
 #include <node/flowmesh_vault_index.h>
 #include <node/fn_seat_index.h>
@@ -330,6 +331,8 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         FlowMeshMarketRecord chain_record;
         std::unique_ptr<ChainDepositVerifier> deposits;
         std::unique_ptr<FlowMeshProductionStore> store;
+        //! Display-only operator-observed time; see observed_store.
+        std::shared_ptr<FlowMeshObservedTimeLog> observed;
         bool installed{false};
         bool ready{false};
     };
@@ -343,7 +346,9 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         : chainman{chainman_in}, datadir{std::move(datadir_in)},
           transport{std::move(transport_in)},
           preagreement_markets{std::move(preagreement_markets_in)},
-          anchors{chainman, FLOWMESH_ANCHOR_DEPTH}
+          anchors{chainman, FLOWMESH_ANCHOR_DEPTH},
+          observed_store{std::make_unique<FlowMeshObservedTimeStore>(
+              FlowMeshObservedTimeStore::Options{.path = datadir / "observed_time"})}
     {
     }
 
@@ -353,6 +358,9 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     const std::set<flowmesh::MarketId> preagreement_markets;
     std::shared_ptr<FlowMeshNetService> network;
     ChainAnchorPolicy anchors;
+    //! One display-only database for every market's observed time, at
+    //! <flowmeshdatadir>/observed_time and written only by its own thread.
+    const std::unique_ptr<FlowMeshObservedTimeStore> observed_store;
     SteadyFlowMeshRuntimeClock clock;
 
     mutable std::mutex mutex;
@@ -1636,6 +1644,24 @@ bool FlowMeshService::Impl::InstallMarket(
         return false;
     }
 
+    // Display-only observed times, loaded once the store has replayed: rows
+    // the store never certified are erased and a contradiction with its
+    // retained hashes clears them (never the store).
+    std::shared_ptr<FlowMeshObservedTimeLog> observed;
+    {
+        std::lock_guard<std::mutex> lock{mutex};
+        observed = resources->observed;
+    }
+    if (!observed) {
+        observed = std::make_shared<FlowMeshObservedTimeLog>(*domain, record.market_id);
+        std::vector<std::pair<uint64_t, uint256>> known;
+        const auto retained{store->ReadClearingTicks({std::nullopt, flowmesh::MARKET_DATA_MAX_TICKS})};
+        for (const auto& tick : retained.ticks) known.emplace_back(tick.sequence, tick.microblock_hash);
+        observed_store->Attach(observed, marker->next_sequence, known);
+        std::lock_guard<std::mutex> lock{mutex};
+        resources->observed = observed;
+    }
+
     FlowMeshRuntimeMarketConfig config{
         .domain = *domain,
         .market_id = record.market_id,
@@ -1650,7 +1676,8 @@ bool FlowMeshService::Impl::InstallMarket(
         .preagreement = preagreement,
         .agreement_path = datadir / fs::PathFromString(record.market_id.GetHex()) / "agreement",
         .agreement_identity = marker->agreement_identity,
-        .agreement_allow_create = preagreement && !marker->agreement_bootstrap_complete};
+        .agreement_allow_create = preagreement && !marker->agreement_bootstrap_complete,
+        .observed = observed};
 
     std::shared_ptr<FlowMeshRuntime> active;
     {
@@ -1686,6 +1713,7 @@ bool FlowMeshService::Impl::RefreshMarkets(uint256& sampled_tip,
 
     flowmesh::AnchorRef discovery_anchor;
     std::vector<FlowMeshMarketRecord> discovered;
+    std::optional<int64_t> tip_time;
     {
         FlowMeshTimingSpan timing_lock_1389{__func__};
         timing_lock_1389.Field("lock_name", std::string{"cs_main"});
@@ -1699,6 +1727,7 @@ bool FlowMeshService::Impl::RefreshMarkets(uint256& sampled_tip,
             return true;
         }
         sampled_tip = tip->GetBlockHash();
+        tip_time = tip->GetBlockTime();
         if (!SyncIndexesLocked(chainstate, *tip, error)) return false;
         const int anchor_height{tip->nHeight - FLOWMESH_ANCHOR_DEPTH};
         const CBlockIndex* anchor{
@@ -1725,6 +1754,18 @@ bool FlowMeshService::Impl::RefreshMarkets(uint256& sampled_tip,
     }
     for (const FlowMeshMarketRecord& record : discovered) {
         if (!InstallMarket(record, error)) return false;
+    }
+    if (tip_time) {
+        // Display only: a B3 tip whose time is more than the block future
+        // bound (120 s) plus a minute ahead of this clock says this clock
+        // is behind; later observed stamps carry clock_suspect.
+        const int64_t now_ms{TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now())};
+        const bool suspect{*tip_time * 1000 > now_ms + 180'000};
+        std::lock_guard<std::mutex> lock{mutex};
+        for (const auto& [id, resources] : markets) {
+            (void)id;
+            if (resources->observed) resources->observed->SetClockSuspect(suspect);
+        }
     }
     {
         FlowMeshTimingSpan timing_lock_1425{__func__};
@@ -1914,6 +1955,12 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
     config.cancel_delivery = [impl = m_impl.get()](uint64_t delivery_id) {
         impl->CancelDelivery(delivery_id);
     };
+    {
+        // Display only: an unusable database leaves observed time in memory.
+        std::string observed_error;
+        m_impl->observed_store->Open(observed_error);
+        m_impl->observed_store->Start();
+    }
     auto runtime{std::make_shared<FlowMeshRuntime>(
         std::move(config), std::vector<FlowMeshRuntimeMarketConfig>{})};
     if (!runtime->Start(error)) {
@@ -2002,6 +2049,8 @@ void FlowMeshService::Stop()
     if (network) network->Stop();
     if (m_impl->ticker.joinable()) m_impl->ticker.join();
     if (runtime) runtime->Stop();
+    // After every writer stopped: one final synced flush of observed time.
+    m_impl->observed_store->Stop();
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
         m_impl->runtime.reset();

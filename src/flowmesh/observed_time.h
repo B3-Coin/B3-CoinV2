@@ -72,15 +72,23 @@ struct ObservedLivenessInputs {
 ObservedDelay ClassifyObservedLiveness(const ObservedLivenessInputs& inputs) noexcept;
 
 /** Since when the market has been caught up, continuously. Observed by the
- * runtime's maintenance tick; restarts on any interruption. */
+ * runtime's maintenance tick; restarts after an interruption longer than
+ * the tolerance (so a proven lag that resolves within a round, or a brief B3
+ * reconciliation, does not turn the next entries into a gap). */
 class ObservedWarmup
 {
 public:
     using Clock = std::chrono::steady_clock;
-    void Observe(bool caught_up, Clock::time_point now) noexcept
+    void Observe(bool caught_up, Clock::time_point now,
+                 std::chrono::milliseconds tolerance = std::chrono::milliseconds{0}) noexcept
     {
-        if (!caught_up) m_since.reset();
-        else if (!m_since) m_since = now;
+        if (caught_up) {
+            m_interrupted.reset();
+            if (!m_since) m_since = now;
+            return;
+        }
+        if (!m_interrupted) m_interrupted = now;
+        if (now - *m_interrupted >= tolerance) m_since.reset();
     }
     bool Warm(Clock::time_point now, std::chrono::milliseconds warmup) const noexcept
     {
@@ -88,7 +96,7 @@ public:
     }
 
 private:
-    std::optional<Clock::time_point> m_since;
+    std::optional<Clock::time_point> m_since, m_interrupted;
 };
 
 //! max(2 s, 2 x round_timeout): an old certificate relayed through the live

@@ -33,6 +33,7 @@
 namespace node {
 
 class FlowMeshTimingSpan;
+class FlowMeshObservedTimeLog;
 
 /** Immutable historical identity used to authorize a seat-reward claim. */
 struct FlowMeshHistoricalRewardSeat {
@@ -288,6 +289,9 @@ struct FlowMeshRuntimeMarketConfig {
     /** A discovered live market may exist before a valid k>=4 set exists. */
     FlowMeshRuntimeMarketReadiness readiness{
         FlowMeshRuntimeMarketReadiness::READY};
+    //! Display-only operator-observed time (flowmesh_observed_time_log.h),
+    //! recorded after each durable commit. Nothing in the runtime reads it.
+    std::shared_ptr<FlowMeshObservedTimeLog> observed{};
 };
 
 struct FlowMeshRuntimeConfig {
@@ -715,6 +719,9 @@ private:
     void ProcessCatchupCommand(const CatchupCommand& command);
     void ProcessAddMarketCommand(AddMarketCommand command);
     void RemovePeerOnWorker(flowmesh::WirePeerId peer);
+    //! Caller holds m_market_mutex. Display-only observed-time upkeep of
+    //! every market that records it; decides nothing.
+    void ObserveTimeMaintenance(size_t connected_peers);
     //! Caller holds m_market_mutex. Copies values the worker already owns;
     //! never reads the store, signs, executes or calls LocalSeatKeys.
     void PublishHealth(flowmesh::WireClock::time_point now, size_t connected_peers,

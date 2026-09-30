@@ -267,6 +267,18 @@ BOOST_AUTO_TEST_CASE(liveness_classifier_matrix)
     warmup.Observe(true, start + std::chrono::seconds{6});
     BOOST_CHECK(!warmup.Warm(start + std::chrono::seconds{9}, period));
     BOOST_CHECK(warmup.Warm(start + std::chrono::seconds{10}, period));
+    // An interruption within the tolerance keeps the warm-up; a longer one
+    // restarts it.
+    const std::chrono::milliseconds tolerance{2000};
+    warmup.Observe(false, start + std::chrono::seconds{11}, tolerance);
+    warmup.Observe(false, start + std::chrono::milliseconds{12500}, tolerance);
+    warmup.Observe(true, start + std::chrono::seconds{13}, tolerance);
+    BOOST_CHECK(warmup.Warm(start + std::chrono::seconds{13}, period));
+    warmup.Observe(false, start + std::chrono::seconds{14}, tolerance);
+    warmup.Observe(false, start + std::chrono::seconds{16}, tolerance);
+    warmup.Observe(true, start + std::chrono::seconds{17}, tolerance);
+    BOOST_CHECK(!warmup.Warm(start + std::chrono::seconds{20}, period));
+    BOOST_CHECK(warmup.Warm(start + std::chrono::seconds{21}, period));
 }
 
 BOOST_AUTO_TEST_CASE(page_before_ms_limit_more)
