@@ -466,7 +466,7 @@ BOOST_AUTO_TEST_CASE(book_copy_takes_one_bounded_page_per_read_of_a_large_book)
     // A book that was not copied makes the view unavailable for its reason.
     for (const char* reason : {"work_budget", "head_changed"}) {
         flowmesh::MarketData data;
-        data.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{head, {}, reason});
+        data.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{.head = head, .curves = {}, .unavailable_reason = reason});
         flowmesh::MarketDataQuery query;
         query.indicative = flowmesh::IndicativeQuery{};
         flowmesh::ComputeMarketViews(data, query);
@@ -1180,6 +1180,72 @@ BOOST_AUTO_TEST_CASE(book_levels_of_a_full_limit_book_fit_the_budget)
     BOOST_CHECK(levels.bids.truncated_reason.empty() && levels.asks.truncated_reason.empty());
     BOOST_CHECK(levels.best_bid == CAmount{1000} && levels.best_ask == CAmount{1001});
     BOOST_TEST_MESSAGE("book levels of 16384 limit curves: " << std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() << " us");
+}
+
+BOOST_AUTO_TEST_CASE(market_views_compute_levels_once_per_copy_and_only_when_wanted)
+{
+    // A copy of 300 standing curves, as the local engine's paged copy or the
+    // remote client's verified state gives it: every curve counts, not only
+    // the first 128-curve page.
+    auto state{EmptyState()};
+    std::vector<flowmesh::AccountId> accounts;
+    for (uint16_t i{0}; i < 300; ++i) {
+        uint256 account;
+        *account.begin() = static_cast<uint8_t>(i & 0xff);
+        *(account.begin() + 1) = static_cast<uint8_t>(i >> 8);
+        *(account.begin() + 2) = 7;
+        Fund(state, account);
+        const bool bid{i < 150};
+        BOOST_REQUIRE(state.SubmitCurve(account, bid ? Side::BID : Side::ASK,
+                                        bid ? *flowmesh::MakeLimitBidCurve(1000 - i % 25, 1 + i % 4) : *flowmesh::MakeLimitAskCurve(1001 + i % 25, 2)));
+    }
+    const uint256 head{uint256::ONE};
+    auto book{std::make_shared<flowmesh::BookCurves>(flowmesh::BookCurves{.head = head, .curves = state.ReadCurves(1000).curves})};
+    BOOST_REQUIRE_EQUAL(book->curves.size(), 300U);
+    flowmesh::MarketDataQuery query;
+    query.levels = flowmesh::BookLevelsQuery{};
+    query.levels->depth = flowmesh::MARKET_DATA_MAX_LEVELS;
+    const auto compute = [&](const bool unchanged) {
+        flowmesh::MarketData data;
+        data.unchanged = unchanged;
+        data.book = book;
+        flowmesh::ComputeMarketViews(data, query);
+        BOOST_CHECK(!data.book);
+        return data;
+    };
+    const auto first{compute(false)};
+    BOOST_REQUIRE(first.levels && first.levels->available);
+    BOOST_CHECK(first.levels->head == head);
+    BOOST_CHECK_EQUAL(first.levels->total_curves, 300U);
+    BOOST_CHECK_EQUAL(first.levels->bids.levels.size(), 25U);
+    BOOST_CHECK_EQUAL(first.levels->asks.levels.size(), 25U);
+    BOOST_CHECK_EQUAL(first.levels->bids.levels.back().cumulative, 373); // sum of 1 + i % 4 over 150 bids
+    BOOST_CHECK_EQUAL(first.levels->asks.levels.back().cumulative, 300);
+    auto expected{flowmesh::ComputeBookLevels(book->curves, *query.levels)};
+    expected.head = head;
+    expected.standing.head = head;
+    BOOST_CHECK(*first.levels == expected);
+    BOOST_CHECK_EQUAL(book->memo->levels.size(), 1U);
+    // The same query at the same copy reuses the computation.
+    BOOST_CHECK(*compute(false).levels == expected);
+    BOOST_CHECK_EQUAL(book->memo->levels.size(), 1U);
+    // An unchanged reply carries them only when asked.
+    BOOST_CHECK(!compute(true).levels);
+    query.levels->include_unchanged = true;
+    BOOST_CHECK(compute(true).levels);
+    BOOST_CHECK_EQUAL(book->memo->levels.size(), 2U);
+    // Another grouping or account is another entry, within the memo bound.
+    for (uint8_t i{0}; i < 12; ++i) {
+        query.levels->account = Account(i);
+        BOOST_CHECK(compute(false).levels->available);
+    }
+    BOOST_CHECK_EQUAL(book->memo->levels.size(), flowmesh::BookViewMemo::MAX_ENTRIES);
+    // No copy: unavailable, with the reason.
+    flowmesh::MarketData none;
+    flowmesh::ComputeMarketViews(none, query);
+    BOOST_REQUIRE(none.levels);
+    BOOST_CHECK(!none.levels->available);
+    BOOST_CHECK_EQUAL(none.levels->unavailable_reason, "no_certified_state");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

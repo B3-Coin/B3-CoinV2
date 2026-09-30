@@ -2719,6 +2719,52 @@ BOOST_AUTO_TEST_CASE(market_data_reads_ticks_and_copies_curves_on_an_unchanged_h
     // per market-lock hold), also for a light poll; nothing is computed there.
     BOOST_CHECK(!plain->book && !light->book);
     BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 0U);
+    // Book levels copy the curves only for a changed head, or when asked for
+    // an unchanged one: a light poll that only wants them copies nothing.
+    {
+        flowmesh::MarketDataQuery levels;
+        levels.known_head = genesis->entry.GetHash();
+        levels.levels = flowmesh::BookLevelsQuery{};
+        const auto quiet{f.runtime->MarketData(f.market, std::nullopt, levels, error)};
+        BOOST_REQUIRE(quiet && quiet->unchanged);
+        BOOST_CHECK(!quiet->book);
+        BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 0U);
+        auto none{*quiet};
+        flowmesh::ComputeMarketViews(none, levels);
+        BOOST_CHECK(!none.levels);
+        levels.levels->include_unchanged = true;
+        const auto asked{f.runtime->MarketData(f.market, std::nullopt, levels, error)};
+        BOOST_REQUIRE(asked && asked->book);
+        auto computed_levels{*asked};
+        flowmesh::ComputeMarketViews(computed_levels, levels);
+        BOOST_REQUIRE(computed_levels.levels);
+        BOOST_CHECK(computed_levels.levels->available);
+        BOOST_CHECK(computed_levels.levels->head == genesis->entry.GetHash());
+        BOOST_CHECK(computed_levels.levels->standing.head == genesis->entry.GetHash());
+        BOOST_CHECK(computed_levels.levels->bids.levels.empty() && computed_levels.levels->asks.levels.empty());
+        // A changed head (no known_head) always carries them.
+        levels.known_head.reset();
+        levels.levels->include_unchanged = false;
+        const auto full{f.runtime->MarketData(f.market, std::nullopt, levels, error)};
+        BOOST_REQUIRE(full && full->book);
+        BOOST_CHECK(full->book == asked->book); // One copy per head.
+        // Refused, never clamped: status_only, depth and grouping bounds.
+        levels.status_only = true;
+        BOOST_CHECK(!f.runtime->MarketData(f.market, std::nullopt, levels, error));
+        levels.status_only = false;
+        for (const size_t depth : {size_t{0}, flowmesh::MARKET_DATA_MAX_LEVELS + 1}) {
+            levels.levels->depth = depth;
+            BOOST_CHECK(!f.runtime->MarketData(f.market, std::nullopt, levels, error));
+        }
+        levels.levels->depth = 1;
+        levels.levels->grouping.exact = false;
+        levels.levels->grouping.mantissa = 3;
+        BOOST_CHECK(!f.runtime->MarketData(f.market, std::nullopt, levels, error));
+        // Drop this head's copy again for the checks below.
+        f.Tick(node::FlowMeshRuntime::BOOK_CAPTURE_IDLE);
+        BOOST_REQUIRE(f.runtime->MarketData(f.market, std::nullopt, {}, error));
+        BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 0U);
+    }
     flowmesh::MarketDataQuery views;
     views.known_head = genesis->entry.GetHash();
     views.indicative = flowmesh::IndicativeQuery{};

@@ -1635,19 +1635,28 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         return view;
     }
     //! Under m_work: the cache's verified curves for display views, which are
-    //! computed from this copy only after m_work is released.
-    static std::shared_ptr<const flowmesh::BookCurves> CachedBook(Cache& cache)
+    //! computed from this copy only after m_work is released. The copy is
+    //! made at most once per cache (so per verified head), from the state
+    //! verified against the certified root, never from reported data; its
+    //! time under m_work is recorded as book_copy_us.
+    static std::shared_ptr<const flowmesh::BookCurves> CachedBook(Cache& cache, FlowMeshTimingSpan& timing)
     {
-        if (!cache.book) {
-            const auto head{cache.verified.certified.entry.GetHash()};
-            // A book over the views' bound is never copied (under m_work).
-            if (cache.verified.state.ReadCurves(0).total_curves > flowmesh::MARKET_VIEW_MAX_BOOK_CURVES) {
-                cache.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{head, {}, "work_budget"});
-            } else {
-                cache.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{
-                    head, cache.verified.state.ReadCurves(flowmesh::MARKET_VIEW_MAX_BOOK_CURVES).curves, {}});
-            }
+        if (cache.book) {
+            timing.Field("book_copy", std::string{"reused"});
+            return cache.book;
         }
+        const auto started{std::chrono::steady_clock::now()};
+        const auto head{cache.verified.certified.entry.GetHash()};
+        // A book over the views' bound is never copied (under m_work).
+        if (cache.verified.state.ReadCurves(0).total_curves > flowmesh::MARKET_VIEW_MAX_BOOK_CURVES) {
+            cache.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{.head = head, .curves = {}, .unavailable_reason = "work_budget"});
+        } else {
+            cache.book = std::make_shared<const flowmesh::BookCurves>(flowmesh::BookCurves{
+                .head = head, .curves = cache.verified.state.ReadCurves(flowmesh::MARKET_VIEW_MAX_BOOK_CURVES).curves});
+        }
+        timing.Field("book_copy", cache.book->unavailable_reason.empty() ? std::string{"copied"} : cache.book->unavailable_reason);
+        timing.Field("book_copy_curves", uint64_t(cache.book->curves.size()));
+        timing.Field("book_copy_us", uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()));
         return cache.book;
     }
     // Microblock high-water of verified own inclusions per market. Survives
@@ -3542,7 +3551,7 @@ public:
                 auto& cache{Refresh(id, account, query, query.ticks ? &ticks : nullptr)};
                 if (query.ticks) MergeTicks(id, cache, ticks);
                 out = Project(cache, account, query);
-                if (query.indicative) out->book = CachedBook(cache);
+                if (query.indicative || flowmesh::LevelsWanted(*out, query)) out->book = CachedBook(cache, timing_lock_1245);
             } catch (const std::exception& e) {
                 error = e.what();
                 return std::nullopt;
@@ -3831,7 +3840,7 @@ public:
                             watch.endpoint_live_ms = static_cast<uint32_t>(m_updates_watch.at(endpoint).count());
                             label(server_status);
                             applied = Project(now, account, query);
-                            if (query.indicative) applied->book = CachedBook(now);
+                            if (query.indicative || flowmesh::LevelsWanted(*applied, query)) applied->book = CachedBook(now, timing);
                         } catch (const std::exception& e) {
                             label("invalid");
                             timing.Field("error", std::string{e.what()});

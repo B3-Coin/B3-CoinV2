@@ -246,6 +246,11 @@ UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);
 //! restricted API's 'candles'): volumes are exact decimal strings.
 UniValue FlowMeshObservedCandlePageJson(const flowmesh::ObservedCandlePage& page);
 std::string FlowMeshUnsigned128Text(util::Unsigned128 value);
+//! The local RPC's "book_levels" section (getflowmeshmarketdata levels):
+//! bucket and notional are exact decimal strings. A public reply never
+//! carries it (its queries never ask for levels).
+UniValue FlowMeshBookLevelsJson(const flowmesh::BookLevels& value);
+UniValue FlowMeshLevelGroupingJson(const flowmesh::LevelGrouping& grouping);
 //! The event page part of an 'updates' reply (cursor, gap, more, event ids
 //! and events), ordinary or watched.
 UniValue FlowMeshClientUpdatesPageJson(const flowmesh::ClientEventPage& page);

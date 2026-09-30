@@ -4,6 +4,8 @@
 
 #include <flowmesh/client_evidence.h>
 
+#include <flowmesh/market_view.h>
+
 #include <streams.h>
 #include <util/check.h>
 
@@ -137,6 +139,7 @@ std::optional<MarketData> ClientMarketData(
         query.curve_limit == 0 || query.curve_limit > MARKET_DATA_MAX_CURVES ||
         (query.curve_cursor && !query.expected_head) ||
         (query.known_head && (query.curve_cursor || query.before_sequence)) ||
+        (query.levels && !LevelsQueryValid(*query.levels)) ||
         (query.expected_head && *query.expected_head != entry.GetHash())) {
         error = "FlowMesh client snapshot/query context is invalid";
         return std::nullopt;

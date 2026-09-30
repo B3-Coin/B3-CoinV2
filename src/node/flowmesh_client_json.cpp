@@ -132,6 +132,64 @@ std::string FlowMeshUnsigned128Text(util::Unsigned128 value)
     } while (value != 0);
     return out;
 }
+UniValue FlowMeshLevelGroupingJson(const flowmesh::LevelGrouping& grouping)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("exact", grouping.exact);
+    if (grouping.exact) return out;
+    out.pushKV("orientation", grouping.inverse ? "inverse" : "canonical");
+    out.pushKV("mantissa", grouping.mantissa);
+    out.pushKV("exponent", grouping.exponent);
+    out.pushKV("decimals", grouping.decimals);
+    return out;
+}
+static UniValue BookLevelsSideJson(const flowmesh::BookLevelsSide& side)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("available", side.available);
+    if (!side.available) out.pushKV("unavailable_reason", side.unavailable_reason);
+    out.pushKV("more", side.more);
+    if (!side.truncated_reason.empty()) out.pushKV("truncated_reason", side.truncated_reason);
+    UniValue levels{UniValue::VARR};
+    for (const auto& level : side.levels) {
+        UniValue row{UniValue::VOBJ};
+        row.pushKV("bucket", FlowMeshUnsigned128Text(level.bucket));
+        row.pushKV("zero_price", level.zero_price);
+        row.pushKV("low", level.low);
+        row.pushKV("high", level.high);
+        row.pushKV("size", level.size);
+        row.pushKV("cumulative", level.cumulative);
+        if (level.notional) row.pushKV("notional", FlowMeshUnsigned128Text(*level.notional));
+        row.pushKV("curves", uint64_t{level.curves});
+        row.pushKV("own", level.own);
+        levels.push_back(std::move(row));
+    }
+    out.pushKV("levels", std::move(levels));
+    return out;
+}
+//! Present only when requested and computed. Never certified: aggregated by
+//! this node from the verified standing curves it holds, without any
+//! pending action; public replies never carry it.
+UniValue FlowMeshBookLevelsJson(const flowmesh::BookLevels& value)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("available", value.available);
+    if (!value.available) out.pushKV("unavailable_reason", value.unavailable_reason);
+    out.pushKV("certified", false);
+    out.pushKV("excludes_pending_actions", true);
+    out.pushKV("basis", "verified_standing_curves");
+    out.pushKV("head", value.head.GetHex());
+    out.pushKV("depth", static_cast<uint64_t>(value.depth));
+    out.pushKV("grouping", FlowMeshLevelGroupingJson(value.grouping));
+    if (!value.available) return out;
+    out.pushKV("total_curves", static_cast<uint64_t>(value.total_curves));
+    if (value.best_bid) out.pushKV("best_bid", *value.best_bid);
+    if (value.best_ask) out.pushKV("best_ask", *value.best_ask);
+    out.pushKV("bids", BookLevelsSideJson(value.bids));
+    out.pushKV("asks", BookLevelsSideJson(value.asks));
+    out.pushKV("standing", IndicativeJson(value.standing));
+    return out;
+}
 UniValue FlowMeshObservedCandlePageJson(const flowmesh::ObservedCandlePage& page)
 {
     UniValue out{UniValue::VOBJ};
@@ -231,6 +289,7 @@ UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data)
     if (data.ticks) out.pushKV("clearing_ticks", ClearingTicksJson(*data.ticks, data.remote));
     if (data.indicative) out.pushKV("indicative", IndicativeJson(*data.indicative));
     if (data.observed) out.pushKV("observed_time", ObservedTimesJson(*data.observed));
+    if (data.levels) out.pushKV("book_levels", FlowMeshBookLevelsJson(*data.levels));
     if (data.unchanged) return out;
 
     UniValue liquidity{UniValue::VOBJ};

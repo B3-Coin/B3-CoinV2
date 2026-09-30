@@ -707,8 +707,8 @@ BookLevels ComputeBookLevels(const std::span<const ClearingEngine::CurveView> cu
 
 BookCurves CopyBookCurves(const uint256& head, const BookPageReader& read, size_t& pages, const size_t max_curves)
 {
-    BookCurves out{head, {}, {}};
-    const auto unavailable = [&](const char* reason) { return BookCurves{head, {}, reason}; };
+    BookCurves out{.head = head, .curves = {}, .unavailable_reason = {}};
+    const auto unavailable = [&](const char* reason) { return BookCurves{.head = head, .curves = {}, .unavailable_reason = reason}; };
     std::optional<ClearingEngine::CurveKey> after;
     for (;;) {
         auto page{read(after, MARKET_DATA_MAX_CURVES)};
@@ -726,10 +726,49 @@ BookCurves CopyBookCurves(const uint256& head, const BookPageReader& read, size_
     }
 }
 
+bool LevelsWanted(const MarketData& data, const MarketDataQuery& query)
+{
+    return query.levels && (!data.unchanged || query.levels->include_unchanged);
+}
+
+namespace {
+BookLevels Levels(const BookCurves* book, const BookLevelsQuery& query)
+{
+    const auto unavailable = [&](const std::string& reason) {
+        BookLevels out;
+        out.depth = query.depth;
+        out.grouping = query.grouping;
+        out.unavailable_reason = reason;
+        if (book) out.head = book->head;
+        return out;
+    };
+    if (!book) return unavailable("no_certified_state");
+    if (!book->unavailable_reason.empty()) return unavailable(book->unavailable_reason);
+    // Computed once per copy of the curves (so per head) and query.
+    if (book->memo) {
+        std::lock_guard<std::mutex> lock{book->memo->mutex};
+        for (const auto& [key, levels] : book->memo->levels) {
+            if (key == query) return *levels;
+        }
+    }
+    auto levels{std::make_shared<BookLevels>(ComputeBookLevels(book->curves, query))};
+    levels->head = book->head;
+    levels->standing.head = book->head;
+    if (book->memo) {
+        std::lock_guard<std::mutex> lock{book->memo->mutex};
+        auto& memo{book->memo->levels};
+        if (memo.size() >= BookViewMemo::MAX_ENTRIES) memo.erase(memo.begin());
+        memo.emplace_back(query, levels);
+    }
+    return *levels;
+}
+} // namespace
+
 void ComputeMarketViews(MarketData& data, const MarketDataQuery& query)
 {
     const auto book{std::move(data.book)};
     data.book.reset();
+    if (LevelsWanted(data, query)) data.levels = Levels(book.get(), *query.levels);
     if (!query.indicative) return;
     if (!book) {
         auto& unavailable{data.indicative.emplace()};

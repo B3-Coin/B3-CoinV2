@@ -3721,8 +3721,10 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketData(
     // reply was recorded before that lock was released.
     if (out && query.observed_time) FillObservedTimes(*out, observed.get());
     // Display views only: the curves are copied page by page, never in one
-    // hold of the market lock, and the view is computed by the caller.
-    if (out && query.indicative && out->snapshot.certified) {
+    // hold of the market lock, and the view is computed by the caller. Book
+    // levels need them only for a changed head (or when asked for an
+    // unchanged one), so a light known_head poll copies nothing for them.
+    if (out && (query.indicative || flowmesh::LevelsWanted(*out, query)) && out->snapshot.certified) {
         out->book = BookCopy(market_id, out->snapshot.last_microblock_hash, timing_lock_3102);
     }
     return out;
@@ -3831,8 +3833,9 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
         (query.curve_cursor && !query.expected_head) ||
         (query.known_head && (query.curve_cursor || query.before_sequence)) ||
         (query.status_only && (query.curve_cursor || query.before_sequence || query.expected_head || query.ticks ||
-                               query.indicative || query.observed_time)) ||
-        (query.ticks && (query.ticks->limit == 0 || query.ticks->limit > flowmesh::MARKET_DATA_MAX_TICKS))) {
+                               query.indicative || query.observed_time || query.levels)) ||
+        (query.ticks && (query.ticks->limit == 0 || query.ticks->limit > flowmesh::MARKET_DATA_MAX_TICKS)) ||
+        (query.levels && !flowmesh::LevelsQueryValid(*query.levels))) {
         error = "Invalid bounded market-data query or pagination snapshot";
         return std::nullopt;
     }

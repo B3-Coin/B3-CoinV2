@@ -6,6 +6,7 @@
 #include <core_io.h>
 #include <flowmesh/auth.h>
 #include <flowmesh/market.h>
+#include <flowmesh/market_view.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
 #include <modern/asset_output.h>
@@ -121,7 +122,7 @@ static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
     if (!options.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "options must be an object");
     const std::set<std::string> allowed{
         "limit", "curve_limit", "before_sequence", "curve_cursor", "expected_head", "known_head", "ticks", "indicative",
-        "observed_time"};
+        "observed_time", "levels"};
     for (const auto& key : options.getKeys()) {
         if (!allowed.contains(key)) throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown option '" + key + "'");
     }
@@ -179,6 +180,50 @@ static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
     if (options.exists("observed_time")) {
         if (!options["observed_time"].isBool()) throw JSONRPCError(RPC_TYPE_ERROR, "observed_time must be a boolean");
         query.observed_time = options["observed_time"].get_bool();
+    }
+    if (options.exists("levels")) {
+        const UniValue& levels{options["levels"]};
+        if (!levels.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "levels must be an object");
+        for (const auto& key : levels.getKeys()) {
+            if (key != "depth" && key != "group" && key != "include_unchanged") {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown levels option '" + key + "'");
+            }
+        }
+        auto& levels_query{query.levels.emplace()};
+        if (levels.exists("depth")) levels_query.depth = integer("depth", 1, flowmesh::MARKET_DATA_MAX_LEVELS, &levels);
+        if (levels.exists("include_unchanged")) {
+            if (!levels["include_unchanged"].isBool()) throw JSONRPCError(RPC_TYPE_ERROR, "include_unchanged must be a boolean");
+            levels_query.include_unchanged = levels["include_unchanged"].get_bool();
+        }
+        if (levels.exists("group")) {
+            const UniValue& group{levels["group"]};
+            if (!group.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "levels group must be an object");
+            for (const auto& key : group.getKeys()) {
+                if (key != "orientation" && key != "mantissa" && key != "exponent" && key != "decimals") {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown levels group option '" + key + "'");
+                }
+            }
+            if (!group["orientation"].isStr() || (group["orientation"].get_str() != "canonical" && group["orientation"].get_str() != "inverse")) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "levels group orientation must be canonical or inverse");
+            }
+            if (!group["exponent"].isNum()) throw JSONRPCError(RPC_TYPE_ERROR, "exponent must be an integer");
+            int64_t exponent;
+            try {
+                exponent = group["exponent"].getInt<int64_t>();
+            } catch (const std::runtime_error&) {
+                throw JSONRPCError(RPC_TYPE_ERROR, "exponent must be an integer");
+            }
+            if (exponent < -64 || exponent > 64) throw JSONRPCError(RPC_INVALID_PARAMETER, "exponent is outside its supported range");
+            auto& grouping{levels_query.grouping};
+            grouping.exact = false;
+            grouping.inverse = group["orientation"].get_str() == "inverse";
+            grouping.mantissa = static_cast<uint8_t>(integer("mantissa", 1, 5, &group));
+            grouping.exponent = static_cast<int32_t>(exponent);
+            grouping.decimals = static_cast<uint8_t>(integer("decimals", 0, 18, &group));
+            if (const auto error{flowmesh::LevelGroupingError(grouping)}; !error.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "levels group: " + error);
+            }
+        }
     }
     if (options.exists("indicative")) {
         const UniValue& indicative{options["indicative"]};
@@ -1062,6 +1107,87 @@ RPCHelpMan listflowmeshmarkets()
         }};
 }
 
+static std::vector<RPCResult> IndicativeResultFields()
+{
+    using T = RPCResult::Type;
+    return {
+        {T::BOOL, "available", "Computed within its bounded work"},
+        {T::STR, "unavailable_reason", /*optional=*/true, "work_budget (also: a book over 16384 standing curves), malformed_curve, invalid_draft, overflow, no_certified_state or head_changed (the head moved while this node copied the curves; read again)"},
+        {T::BOOL, "certified", "Always false"},
+        {T::BOOL, "excludes_pending_actions", "Always true: queued and uncertified actions are not included"},
+        {T::STR, "basis", "verified_standing_curves or verified_standing_curves_with_draft"},
+        {T::STR_HEX, "head", "Certified head whose curves were used; compare with snapshot.last_microblock_hash"},
+        {T::OBJ, "draft", /*optional=*/true, "The draft as evaluated", {
+            {T::STR, "side", "bid or ask"},
+            {T::NUM, "price", "Limit price in B3 atoms per base unit"},
+            {T::NUM, "quantity", "Base units"},
+            {T::BOOL, "account_known", "This wallet's account is known, so its rationed fill is exact"},
+            {T::BOOL, "replaces_standing_curve", "The draft replaces this account's standing curve on that side"},
+            {T::BOOL, "assumes_admission", "Always true: balance and reservation are not checked"},
+        }},
+        {T::BOOL, "cleared", "A nonzero match would occur"},
+        {T::NUM, "price", "Uniform price it would clear at; zero when not cleared"},
+        {T::NUM, "volume", "Base units it would match"},
+        {T::NUM, "imbalance", "|demand - supply| at that price, saturated at the monetary maximum"},
+        {T::STR, "imbalance_side", "Side that would be left unfilled: bid, ask or none"},
+        {T::NUM, "best_bid", /*optional=*/true, "Highest price with standing bid quantity, over every verified curve (never the draft)"},
+        {T::NUM, "best_ask", /*optional=*/true, "Lowest price with standing ask quantity, over every verified curve (never the draft)"},
+        {T::NUM, "draft_fill_min", /*optional=*/true, "The draft's fill at that price (exact when equal to draft_fill_max)"},
+        {T::NUM, "draft_fill_max", /*optional=*/true, "Upper bound of the draft's fill"},
+    };
+}
+
+static std::vector<RPCResult> BookLevelsSideResult()
+{
+    using T = RPCResult::Type;
+    return {
+        {T::BOOL, "available", "The side was aggregated within the bounded work"},
+        {T::STR, "unavailable_reason", /*optional=*/true, "work_budget or overflow (a level over the monetary maximum)"},
+        {T::BOOL, "more", "More levels follow the last one returned"},
+        {T::STR, "truncated_reason", /*optional=*/true, "The levels stopped early (work_budget or overflow): those returned are an exact prefix"},
+        {T::ARR, "levels", "Best first: bids by descending, asks by ascending canonical price", {
+            {T::OBJ, "", "One price level", {
+                {T::STR, "bucket", "Display bucket index as an exact decimal: the canonical price (exact), floor(price / step) of a bid or ceil of an ask (canonical), ceil(u) of a bid or floor(u) of an ask with u = 10^(9 - decimals - exponent) / (mantissa x price) (inverse)"},
+                {T::BOOL, "zero_price", "Canonical price zero in the inverse view: no finite token-per-B3 price"},
+                {T::NUM, "low", "Lowest canonical price in the level (B3 atoms per base unit)"},
+                {T::NUM, "high", "Highest canonical price in the level; the monetary maximum for an unbounded end"},
+                {T::NUM, "size", "Remaining base units whose own limit lies in the level"},
+                {T::NUM, "cumulative", "Base units from the best level through this one"},
+                {T::STR, "notional", /*optional=*/true, "Exact B3 atoms at each lot's own price, as a decimal; omitted when a curve has more prices in the level than the bounded computation reads"},
+                {T::NUM, "curves", "Standing curves with quantity in the level (one per account and side)"},
+                {T::NUM, "own", "This wallet's account's part of size"},
+            }},
+        }},
+    };
+}
+
+static std::vector<RPCResult> BookLevelsResultFields()
+{
+    using T = RPCResult::Type;
+    return {
+        {T::BOOL, "available", "Computed within its bounded work"},
+        {T::STR, "unavailable_reason", /*optional=*/true, "no_certified_state, head_changed (the head moved while this node copied the curves; read again), work_budget (also a book over 16384 standing curves) or malformed_curve"},
+        {T::BOOL, "certified", "Always false"},
+        {T::BOOL, "excludes_pending_actions", "Always true: queued and uncertified actions are not included"},
+        {T::STR, "basis", "verified_standing_curves"},
+        {T::STR_HEX, "head", "Certified head whose curves were used; compare with snapshot.last_microblock_hash"},
+        {T::NUM, "depth", "Levels per side asked for"},
+        {T::OBJ, "grouping", "The grouping used, as asked for", {
+            {T::BOOL, "exact", "One level per canonical price"},
+            {T::STR, "orientation", /*optional=*/true, "canonical or inverse"},
+            {T::NUM, "mantissa", /*optional=*/true, "1, 2 or 5"},
+            {T::NUM, "exponent", /*optional=*/true, "Power of ten of the display step"},
+            {T::NUM, "decimals", /*optional=*/true, "Base asset decimals the step is for"},
+        }},
+        {T::NUM, "total_curves", /*optional=*/true, "Standing curves aggregated"},
+        {T::NUM, "best_bid", /*optional=*/true, "Exact highest price with standing bid quantity"},
+        {T::NUM, "best_ask", /*optional=*/true, "Exact lowest price with standing ask quantity; zero for an ask that sells at any price"},
+        {T::OBJ, "bids", /*optional=*/true, "Canonical bids", BookLevelsSideResult()},
+        {T::OBJ, "asks", /*optional=*/true, "Canonical asks", BookLevelsSideResult()},
+        {T::OBJ, "standing", /*optional=*/true, "What the next clearing would be if the verified standing curves were cleared as they are, without any draft (a crossed book after a rationed clearing clears at the next certified execution); NOT certified", IndicativeResultFields()},
+    };
+}
+
 RPCHelpMan getflowmeshmarketdata()
 {
     using T = RPCResult::Type;
@@ -1101,6 +1227,16 @@ RPCHelpMan getflowmeshmarketdata()
                     {"limit", RPCArg::Type::NUM, RPCArg::Default{64}, "Ticks, 1-256"},
                 }},
                 {"observed_time", RPCArg::Type::BOOL, RPCArg::Default{false}, "Operator-observed times of the head and of the returned history and ticks, also returned with an unchanged known_head; never certified"},
+                {"levels", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Price levels of all verified standing curves (not only the curve page), computed by this node when the head changed; never certified", {
+                    {"depth", RPCArg::Type::NUM, RPCArg::Default{20}, "Levels per side, 1-50"},
+                    {"group", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Group prices into display buckets of mantissa x 10^exponent; omit for one level per canonical price", {
+                        {"orientation", RPCArg::Type::STR, RPCArg::Optional::NO, "canonical (B3 per token) or inverse (token per B3)"},
+                        {"mantissa", RPCArg::Type::NUM, RPCArg::Optional::NO, "1, 2 or 5"},
+                        {"exponent", RPCArg::Type::NUM, RPCArg::Optional::NO, "Power of ten of the display step. Canonical: the step is mantissa x 10^(exponent + 9 - decimals) price ticks, so exponent + 9 - decimals must be 0-18 (within the monetary maximum); inverse: 9 - decimals - exponent must be 0-36"},
+                        {"decimals", RPCArg::Type::NUM, RPCArg::Optional::NO, "The base asset's display decimals, 0-18"},
+                    }},
+                    {"include_unchanged", RPCArg::Type::BOOL, RPCArg::Default{false}, "Also compute them for an unchanged known_head (after a grouping change)"},
+                }},
                 {"indicative", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Indicative next clearing of the verified standing curves, also returned with an unchanged known_head; never certified", {
                     {"draft", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "A prospective limit order of this wallet's account, replacing its standing curve on that side", {
                         {"side", RPCArg::Type::STR, RPCArg::Optional::NO, "bid or ask"},
@@ -1151,31 +1287,8 @@ RPCHelpMan getflowmeshmarketdata()
                     }},
                 }},
             }},
-            {T::OBJ, "indicative", /*optional=*/true, "Present only when indicative was given. NOT certified: what the next clearing would be if the verified standing curves (and the draft) were cleared now; actions not yet certified are excluded", {
-                {T::BOOL, "available", "Computed within its bounded work"},
-                {T::STR, "unavailable_reason", /*optional=*/true, "work_budget (also: a book over 16384 standing curves), malformed_curve, invalid_draft, overflow, no_certified_state or head_changed (the head moved while this node copied the curves; read again)"},
-                {T::BOOL, "certified", "Always false"},
-                {T::BOOL, "excludes_pending_actions", "Always true: queued and uncertified actions are not included"},
-                {T::STR, "basis", "verified_standing_curves or verified_standing_curves_with_draft"},
-                {T::STR_HEX, "head", "Certified head whose curves were used; compare with snapshot.last_microblock_hash"},
-                {T::OBJ, "draft", /*optional=*/true, "The draft as evaluated", {
-                    {T::STR, "side", "bid or ask"},
-                    {T::NUM, "price", "Limit price in B3 atoms per base unit"},
-                    {T::NUM, "quantity", "Base units"},
-                    {T::BOOL, "account_known", "This wallet's account is known, so its rationed fill is exact"},
-                    {T::BOOL, "replaces_standing_curve", "The draft replaces this account's standing curve on that side"},
-                    {T::BOOL, "assumes_admission", "Always true: balance and reservation are not checked"},
-                }},
-                {T::BOOL, "cleared", "A nonzero match would occur"},
-                {T::NUM, "price", "Uniform price it would clear at; zero when not cleared"},
-                {T::NUM, "volume", "Base units it would match"},
-                {T::NUM, "imbalance", "|demand - supply| at that price, saturated at the monetary maximum"},
-                {T::STR, "imbalance_side", "Side that would be left unfilled: bid, ask or none"},
-                {T::NUM, "best_bid", /*optional=*/true, "Highest price with standing bid quantity, over every verified curve (never the draft)"},
-                {T::NUM, "best_ask", /*optional=*/true, "Lowest price with standing ask quantity, over every verified curve (never the draft)"},
-                {T::NUM, "draft_fill_min", /*optional=*/true, "The draft's fill at that price (exact when equal to draft_fill_max)"},
-                {T::NUM, "draft_fill_max", /*optional=*/true, "Upper bound of the draft's fill"},
-            }},
+            {T::OBJ, "indicative", /*optional=*/true, "Present only when indicative was given. NOT certified: what the next clearing would be if the verified standing curves (and the draft) were cleared now; actions not yet certified are excluded", IndicativeResultFields()},
+            {T::OBJ, "book_levels", /*optional=*/true, "Present only when levels was given and the head changed (or include_unchanged). NOT certified: price levels this node aggregated from every verified standing curve; actions not yet certified are excluded. Not a price-time order book: each level is the quantity of standing curves whose own limit lies in its price range", BookLevelsResultFields()},
             {T::OBJ, "observed_time", /*optional=*/true, "Present only when observed_time was true: operator-observed time, when the source applied each entry by its own clock; never certified execution time", {
                 {T::BOOL, "available", "The source records observed times"},
                 {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, endpoint_does_not_advertise_observed_time, observed_time_withdrawn or malformed"},
@@ -1322,6 +1435,8 @@ RPCHelpMan getflowmeshmarketdata()
             const auto account{ExistingWalletAccount(*wallet)};
             // A draft is this wallet's own prospective order.
             if (query.indicative && query.indicative->draft) query.indicative->draft->account = account;
+            // Each level's own share is this wallet's.
+            if (query.levels) query.levels->account = account;
             std::string error;
             interfaces::FlowMeshMarketWatch watch;
             const auto data{watch_ms ? wallet->chain().flowMeshWatchMarketData(market_id, account, query, *watch_ms, watch, error)

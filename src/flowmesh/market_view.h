@@ -109,11 +109,18 @@ using BookPageReader = std::function<std::optional<ClearingEngine::CurvePage>(
 BookCurves CopyBookCurves(const uint256& head, const BookPageReader& read, size_t& pages,
                           size_t max_curves = MARKET_VIEW_MAX_BOOK_CURVES);
 
-/** Fills data.indicative from data.book when the query asks for it, and
- * drops data.book. A book that was not copied (unavailable_reason) makes the
- * view unavailable for that reason. For callers that hold no node lock: the
- * local engine's reads and the remote client after it releases its work
- * gate. */
+//! The query asks for book levels and this reply carries them: its head
+//! changed, or the query asked for them also for an unchanged head. The
+//! caller copies the curves (data.book) only then or for the indicative.
+bool LevelsWanted(const MarketData& data, const MarketDataQuery& query);
+
+/** Fills data.indicative and data.levels from data.book when the query asks
+ * for them (levels only when LevelsWanted), and drops data.book. A book that
+ * was not copied (unavailable_reason) makes the views unavailable for that
+ * reason. Levels are computed once per copy of the curves and query, and
+ * reused while the caller keeps that copy (the head's). For callers that
+ * hold no node lock: the local engine's reads and the remote client after
+ * it releases its work gate. */
 void ComputeMarketViews(MarketData& data, const MarketDataQuery& query);
 
 } // namespace flowmesh

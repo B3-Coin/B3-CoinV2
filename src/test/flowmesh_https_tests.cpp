@@ -5927,6 +5927,84 @@ BOOST_AUTO_TEST_CASE(trading_api_serves_clearing_ticks_when_enabled)
     BOOST_CHECK_EQUAL(watched["error"].get_str(), "ticks cannot be combined with watch_ms");
 }
 
+BOOST_AUTO_TEST_CASE(book_levels_are_local_views_of_verified_state_only)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket live{*this, m_path_root / "levels-service", {std::chrono::milliseconds{2000}, 2}, {16}};
+    // The public API has no levels: an unknown field, and its replies are
+    // exactly as before (no book_levels anywhere).
+    for (const char* method : {"snapshot", "updates"}) {
+        const auto [refused, rejection]{ApiCall(live.Endpoint(), method, id + ",\"levels\":{}")};
+        BOOST_CHECK_EQUAL(refused, 400);
+        BOOST_CHECK_EQUAL(rejection["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+        const auto [status, plain]{ApiCall(live.Endpoint(), method, id)};
+        BOOST_CHECK_EQUAL(status, 200);
+        BOOST_CHECK(plain.write().find("book_levels") == std::string::npos);
+    }
+    std::string error;
+    auto remote{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "levels-client", error)};
+    BOOST_REQUIRE_MESSAGE(remote, error);
+    auto local{node::MakeLocalFlowMeshBackend(*live.service)};
+    const uint256 account{uint8_t{0x41}};
+    auto query{Page()};
+    query.levels = flowmesh::BookLevelsQuery{};
+    query.levels->depth = 5;
+    query.levels->account = account;
+    for (auto* backend : {remote.get(), local.get()}) {
+        BOOST_TEST_CONTEXT((backend == remote.get() ? "remote" : "local")) {
+            const auto data{backend->Data(market, account, query, error)};
+            BOOST_REQUIRE_MESSAGE(data, error);
+            BOOST_CHECK(!data->book);
+            BOOST_REQUIRE(data->levels);
+            const auto& levels{*data->levels};
+            BOOST_CHECK(levels.available);
+            BOOST_CHECK(levels.head == data->snapshot.last_microblock_hash);
+            BOOST_CHECK_EQUAL(levels.depth, 5U);
+            // The verified book is empty.
+            BOOST_CHECK_EQUAL(levels.total_curves, 0U);
+            BOOST_CHECK(levels.bids.available && levels.bids.levels.empty() && !levels.bids.more);
+            BOOST_CHECK(!levels.best_bid && !levels.best_ask);
+            BOOST_CHECK(levels.standing.available && !levels.standing.cleared && !levels.standing.draft);
+            const auto json{node::FlowMeshClientMarketDataJson(*data)};
+            BOOST_REQUIRE(json.exists("book_levels"));
+            BOOST_CHECK(!json["book_levels"]["certified"].get_bool());
+            BOOST_CHECK(json["book_levels"]["excludes_pending_actions"].get_bool());
+            BOOST_CHECK_EQUAL(json["book_levels"]["basis"].get_str(), "verified_standing_curves");
+            BOOST_CHECK(json["book_levels"]["grouping"]["exact"].get_bool());
+            // A light poll at the same head carries none unless asked.
+            auto light{query};
+            light.known_head = data->snapshot.last_microblock_hash;
+            const auto unchanged{backend->Data(market, account, light, error)};
+            BOOST_REQUIRE_MESSAGE(unchanged, error);
+            BOOST_CHECK(unchanged->unchanged && !unchanged->levels);
+            BOOST_CHECK(!node::FlowMeshClientMarketDataJson(*unchanged).exists("book_levels"));
+            light.levels->include_unchanged = true;
+            const auto asked{backend->Data(market, account, light, error)};
+            BOOST_REQUIRE_MESSAGE(asked, error);
+            BOOST_REQUIRE(asked->unchanged && asked->levels);
+            BOOST_CHECK(*asked->levels == levels);
+            BOOST_CHECK(node::FlowMeshClientMarketDataJson(*asked).exists("book_levels"));
+            // Not asked for: absent.
+            const auto plain{backend->Data(market, account, Page(), error)};
+            BOOST_REQUIRE_MESSAGE(plain, error);
+            BOOST_CHECK(!plain->levels);
+            BOOST_CHECK(!node::FlowMeshClientMarketDataJson(*plain).exists("book_levels"));
+            // Invalid levels are refused by both backends.
+            auto bad{query};
+            bad.levels->depth = 0;
+            BOOST_CHECK(!backend->Data(market, account, bad, error));
+        }
+    }
+    // A new certified head: the remote levels follow the newly verified state.
+    live.Deposit();
+    const auto moved{remote->Data(market, account, query, error)};
+    BOOST_REQUIRE_MESSAGE(moved, error);
+    BOOST_REQUIRE(moved->levels);
+    BOOST_CHECK_EQUAL(moved->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(moved->levels->head == moved->snapshot.last_microblock_hash);
+    remote.reset();
+}
+
 BOOST_AUTO_TEST_CASE(trading_api_without_observed_time_keeps_the_previous_contract)
 {
     const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};

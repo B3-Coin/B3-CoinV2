@@ -14,8 +14,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace flowmesh {
@@ -220,6 +222,10 @@ struct MarketDataQuery {
     //! tick entries, also for a light known_head poll; never with
     //! status_only. Display data only.
     bool observed_time{false};
+    //! Price levels of the verified standing curves, for a changed head
+    //! (and an unchanged one when asked); never with status_only. A local
+    //! read option only: never part of a public request or reply.
+    std::optional<BookLevelsQuery> levels;
 };
 
 struct MarketAccountFill {
@@ -492,6 +498,14 @@ struct ObservedCandlePage {
     bool more{false};
 };
 
+//! Book levels already computed from one copy of the curves, by query:
+//! reused while that copy (and so its head) is current. Bounded.
+struct BookViewMemo {
+    static constexpr size_t MAX_ENTRIES{8};
+    std::mutex mutex;
+    std::vector<std::pair<BookLevelsQuery, std::shared_ptr<const BookLevels>>> levels;
+};
+
 //! The standing curves of one certified head, copied once for display
 //! views. Transient: never projected, serialized or read for signing.
 struct BookCurves {
@@ -501,6 +515,8 @@ struct BookCurves {
     //! MARKET_VIEW_MAX_BOOK_CURVES; "head_changed": the head moved during a
     //! paged copy): the views are then unavailable for this reason.
     std::string unavailable_reason;
+    //! Views computed from exactly these curves (see ComputeMarketViews).
+    std::shared_ptr<BookViewMemo> memo{std::make_shared<BookViewMemo>()};
 };
 
 struct MarketHistoryPage {
@@ -585,6 +601,9 @@ struct MarketData {
     std::optional<IndicativeClearing> indicative;
     //! Present only when the query asked for observed_time; never certified.
     std::optional<ObservedTimes> observed;
+    //! Present only when the query asked for levels and they were computed
+    //! (a changed head, or include_unchanged); never certified.
+    std::optional<BookLevels> levels;
     //! Transient input of ComputeMarketViews; never projected or serialized.
     std::shared_ptr<const BookCurves> book;
     //! Public-client verification observations; never serialized into state roots.
