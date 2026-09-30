@@ -336,6 +336,9 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     connect(m_order, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::requestOrderReview);
     connect(m_cancel_order, &QPushButton::clicked, this, [this] { begin(Operation::Cancel); });
     connect(m_edit_order, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::editOrder);
+    connect(m_order_book, &B3FlowMeshOrderBook::levelClicked, this, [this](const QString& price, qint64 cumulative, const QString& head) {
+        fillFromBook(price, static_cast<CAmount>(cumulative), head);
+    });
     connect(m_own_view->selectionModel(), &QItemSelectionModel::selectionChanged, this, [this] {
         // Bind to the canonical side and exact points shown when selected:
         // rows keep their index while the certified data behind them changes.
@@ -845,7 +848,9 @@ UniValue B3FlowMeshTradingPanel::indicativeDraft() const
 
 flowmesh::LevelGrouping B3FlowMeshTradingPanel::bookGrouping() const
 {
-    return {};
+    // Only a grouping for the displayed orientation applies.
+    if (!m_book_grouping || m_book_grouping->inverse != inverted()) return {};
+    return *m_book_grouping;
 }
 
 UniValue B3FlowMeshTradingPanel::levelsRequest() const
@@ -1059,6 +1064,36 @@ void B3FlowMeshTradingPanel::editOrder()
     m_price->setFocus();
     notice(tr("Edit prefilled a replacement for your %1 order: %2 %3 at its current limit. Nothing was signed or sent. Change the price or quantity, then review it: the new order replaces that side's order and its quantity counts from zero.")
                .arg(inverse ? (buy ? tr("Buy B3") : tr("Sell B3")) : (buy ? tr("Buy") : tr("Sell")), m_quantity->text(), units.ticker));
+}
+
+void B3FlowMeshTradingPanel::fillFromBook(const QString& price, const CAmount cumulative, const QString& head)
+{
+    using namespace B3FlowMeshMarketData;
+    const auto selected{market()};
+    // The ticket's fields are frozen while an operation or a review waits.
+    if (m_busy || m_deferred_review || !selected || !m_snapshot || m_snapshot->market != selected->id || m_snapshot->head != head ||
+        !m_snapshot->units.known || m_snapshot->units.asset != selected->base) return;
+    const auto& units{m_snapshot->units};
+    const bool buy{m_side->currentIndex() == 0}, inverse{inverted()};
+    // Only a price the ticket reads back exactly, never adjusted.
+    const auto limit{ParseDisplayLimit(price, units, inverse, buy)};
+    if (!limit || limit->adjusted) {
+        notice(tr("That book level's price cannot be entered exactly for this side. Nothing was changed, signed or sent."));
+        return;
+    }
+    m_marketable->setChecked(false);
+    m_price->setText(price);
+    if (B3FlowMeshOrderBook::SizeOnClick() && cumulative > 0) {
+        // Within the verified available balance, including this side's
+        // reservation (a new order replaces it).
+        const bool bid{CanonicalSide(buy, inverse) == QStringLiteral("bid")};
+        const auto budget{ReplacementBudget(bid ? selected->b3_available : selected->base_available, bid ? selected->b3_reserved : selected->base_reserved)};
+        CAmount quantity{cumulative};
+        if (budget) quantity = std::min(quantity, bid ? (limit->price > 0 ? *budget / limit->price : 0) : *budget);
+        quantity -= quantity % std::max<CAmount>(1, units.quantity_step);
+        if (quantity > 0) m_quantity->setText(FormatAmount(quantity, units.decimals));
+    }
+    updateTicket();
 }
 
 std::optional<B3FlowMeshMarketData::MarketableLimit> B3FlowMeshTradingPanel::marketableLimit(QString* error) const

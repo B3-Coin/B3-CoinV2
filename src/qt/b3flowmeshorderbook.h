@@ -95,6 +95,11 @@ public:
     //! platform's UI effects (QApplication::isEffectEnabled(Qt::UI_General)).
     static bool AnimationEnabled();
     static void SetAnimationSetting(bool enabled);
+    //! "Set size on click" (default off): a click also offers the level's
+    //! cumulative size. Hyperliquid's default is on; B3's is off because a
+    //! cumulative size can be large (it is still reviewed before signing).
+    static bool SizeOnClick();
+    static void SetSizeOnClick(bool enabled);
     B3FlowMeshLadderModel* model() const { return m_model; }
     QTableView* view() const { return m_view; }
     //! Level rows per side the view's height holds.

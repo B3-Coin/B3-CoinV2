@@ -193,6 +193,9 @@ private:
     std::optional<uint64_t> ticksAfter(const QString& market) const;
     //! The book grouping the order book displays (exact: none).
     flowmesh::LevelGrouping bookGrouping() const;
+    //! The chosen grouping of the displayed market and orientation; none:
+    //! exact levels.
+    std::optional<flowmesh::LevelGrouping> m_book_grouping;
     //! The "levels" option of a selected-market read: the deepest levels in
     //! bookGrouping(), and include_unchanged while the displayed levels are
     //! missing or of another grouping, so a grouping change applies at the
@@ -221,6 +224,14 @@ private:
     //! side, exact limit and remaining quantity. Signs and sends nothing; the
     //! replacement is the ordinary reviewed order (a native per-side replace).
     void editOrder();
+    //! A click on an order-book level: its exact price text (and, with "Set
+    //! size on click", its cumulative size within the available balance)
+    //! goes into the ticket, as typing would. Keeps the ticket's side,
+    //! unchecks the marketable limit, and never opens a review, signs or
+    //! sends anything. Ignored while an operation or a review is pending,
+    //! for data of another head, or for a price that does not round-trip
+    //! exactly through the ticket's parser.
+    void fillFromBook(const QString& price, CAmount cumulative, const QString& head);
     void begin(B3FlowMeshTrading::Operation operation);
     bool confirm(const QString& text, bool final_transaction);
     void startJob(std::optional<B3FlowMeshTrading::Action> action = std::nullopt,

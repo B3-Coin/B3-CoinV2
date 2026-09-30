@@ -23,6 +23,7 @@ using Kind = B3FlowMeshLadderModel::Row::Kind;
 namespace {
 using Wide = util::Unsigned128;
 constexpr const char* ANIMATE_SETTING{"flowmesh/animateOrderBook"};
+constexpr const char* SIZE_ON_CLICK_SETTING{"flowmesh/orderBookClickSetsSize"};
 
 QString WideText(Wide n)
 {
@@ -249,6 +250,11 @@ B3FlowMeshOrderBook::B3FlowMeshOrderBook(QWidget* parent) : QWidget{parent}
         animate->setChecked(QSettings{}.value(QLatin1String(ANIMATE_SETTING), true).toBool());
         animate->setToolTip(tr("Briefly highlights a price that newly appears. Also off when the system turns interface animations off."));
         connect(animate, &QAction::toggled, this, [](bool on) { SetAnimationSetting(on); });
+        auto* size{menu.addAction(tr("Set size on click"))};
+        size->setCheckable(true);
+        size->setChecked(SizeOnClick());
+        size->setToolTip(tr("A click on a level also sets the order quantity to the total up to that level, within your available balance. Off by default; the order is still reviewed before anything is signed."));
+        connect(size, &QAction::toggled, this, [](bool on) { SetSizeOnClick(on); });
         menu.exec(m_view->viewport()->mapToGlobal(at));
     });
     layout->addWidget(m_view, 1);
@@ -273,6 +279,16 @@ bool B3FlowMeshOrderBook::AnimationEnabled()
 void B3FlowMeshOrderBook::SetAnimationSetting(const bool enabled)
 {
     QSettings{}.setValue(QLatin1String(ANIMATE_SETTING), enabled);
+}
+
+bool B3FlowMeshOrderBook::SizeOnClick()
+{
+    return QSettings{}.value(QLatin1String(SIZE_ON_CLICK_SETTING), false).toBool();
+}
+
+void B3FlowMeshOrderBook::SetSizeOnClick(const bool enabled)
+{
+    QSettings{}.setValue(QLatin1String(SIZE_ON_CLICK_SETTING), enabled);
 }
 
 bool B3FlowMeshOrderBook::flashing() const { return m_flash_timer->isActive(); }

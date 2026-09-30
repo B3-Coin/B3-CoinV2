@@ -1317,6 +1317,77 @@ private Q_SLOTS:
         auto* stale{book.findChild<QLabel*>(QStringLiteral("flowMeshBookStale"))}; QVERIFY(stale); QVERIFY(!stale->isHidden());
         QCOMPARE(levels(), size_t{2}); // Retained, not silently emptied.
     }
+    void clickingABookLevelFillsTheTicketPriceAndSignsNothing_data()
+    {
+        QTest::addColumn<bool>("inverse");
+        QTest::addColumn<bool>("grouped");
+        QTest::newRow("canonical exact") << false << false;
+        QTest::newRow("canonical grouped") << false << true;
+        QTest::newRow("inverse exact") << true << false;
+        QTest::newRow("inverse grouped") << true << true;
+    }
+    void clickingABookLevelFillsTheTicketPriceAndSignsNothing()
+    {
+        QFETCH(bool, inverse);
+        QFETCH(bool, grouped);
+        FundingReadProbe probe;
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); AttachOfflineWallet(panel);
+        auto snapshot{SyntheticLimitBook(10)};
+        // 0.01 B3 per token (10 ticks), or 0.0001 token per B3 (s = 7).
+        const auto grouping{grouped ? (inverse ? Grouping(true, 1, -4, 6) : Grouping(false, 1, -2, 6)) : flowmesh::LevelGrouping{}};
+        snapshot = WithLevels(snapshot, grouping);
+        Observe(panel, snapshot, inverse);
+        panel.m_book_grouping = grouped ? std::optional{grouping} : std::nullopt;
+        panel.updateDataViews();
+        panel.show(); QCoreApplication::processEvents();
+        QVERIFY(panel.m_order_book->showsVerifiedLevels());
+        auto* model{panel.m_order_book->model()};
+        const int spread{model->spreadRow()};
+        for (const bool buy : {true, false}) {
+            (buy ? panel.m_buy : panel.m_sell)->click();
+            for (const int row : {spread - 1, spread + 1, spread + 3}) {
+                panel.m_marketable->setChecked(true);
+                const auto clicked{model->row(row).click_price};
+                QVERIFY2(!clicked.isEmpty(), qPrintable(model->row(row).price));
+                QVERIFY(panel.m_order_book->activateRow(row));
+                // The exact on-grid price, read back unadjusted; same side.
+                QCOMPARE(panel.m_price->text(), clicked);
+                const auto parsed{ParseDisplayLimit(panel.m_price->text(), panel.m_snapshot->units, inverse, buy)};
+                QVERIFY(parsed); QVERIFY(!parsed->adjusted);
+                QCOMPARE(panel.m_side->currentIndex(), buy ? 0 : 1);
+                QVERIFY(!panel.m_marketable->isChecked());
+                // Grouped labels are an edge every order of the level accepts.
+                const bool ask_row{row < spread};
+                const auto& level{ask_row ? (inverse ? panel.m_snapshot->levels->bids.levels : panel.m_snapshot->levels->asks.levels)[static_cast<size_t>(spread - 1 - row)]
+                                          : (inverse ? panel.m_snapshot->levels->asks.levels : panel.m_snapshot->levels->bids.levels)[static_cast<size_t>(row - spread - 1)]};
+                const bool canonical_bid{ask_row == inverse};
+                QCOMPARE(parsed->price, canonical_bid ? level.low : level.high);
+            }
+        }
+        // Nothing opens a review, signs or reads for it.
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_deferred_review);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+        // Ignored while busy, while a review waits, or for another head.
+        const auto before{panel.m_price->text()};
+        const int other{spread + 2};
+        panel.m_busy = true; QVERIFY(panel.m_order_book->activateRow(other)); QCOMPARE(panel.m_price->text(), before); panel.m_busy = false;
+        panel.fillFromBook(model->row(other).click_price, 1, QString::fromStdString(H(77).GetHex()));
+        QCOMPARE(panel.m_price->text(), before);
+        // The spread row and padding are not clickable.
+        QVERIFY(!panel.m_order_book->activateRow(spread));
+        // Size on click (off by default): the cumulative size, within the balance.
+        QVERIFY(!B3FlowMeshOrderBook::SizeOnClick());
+        panel.m_quantity->setText(QStringLiteral("1"));
+        panel.m_order_book->activateRow(spread + 1);
+        QCOMPARE(panel.m_quantity->text(), QStringLiteral("1"));
+        B3FlowMeshOrderBook::SetSizeOnClick(true);
+        panel.m_sell->click(); // An ask: the base balance (2 tUSD) caps it.
+        panel.m_order_book->activateRow(spread + 3);
+        const auto cumulative{model->row(spread + 3).click_cumulative};
+        QCOMPARE(panel.m_quantity->text(), FormatAmount(std::min<CAmount>(cumulative, inverse ? cumulative : 2'000'000), 6));
+        B3FlowMeshOrderBook::SetSizeOnClick(false);
+        QVERIFY(!panel.m_thread); QCOMPARE(probe.writes.load(), 0);
+    }
     void groupedBookLevelsAreLabelledWithAnEdgeEveryOrderAccepts()
     {
         B3FlowMeshOrderBook book; book.resize(420, 400); book.show(); QCoreApplication::processEvents();
