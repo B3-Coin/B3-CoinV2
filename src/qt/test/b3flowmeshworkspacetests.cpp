@@ -674,50 +674,121 @@ class B3FlowMeshWorkspaceTests : public QObject
         panel.m_price->setText(QStringLiteral("1.009")); panel.m_quantity->setText(QStringLiteral("0.25")); panel.updateDataViews(); panel.updateMarketText(); panel.show(); QCoreApplication::processEvents();
     }
 
-    //! A synthetic observed-time market for the visual QA export: ninety
-    //! minutes of 1m candles served by the node (a quiet stretch, a hatched
-    //! gap of late auctions and a restart seam), held ticks with their times
-    //! and the newest minute continued from them.
-    void ShowSyntheticTimeChart(B3FlowMeshTradingPanel& panel)
+    //! How the synthetic observed-time market's source reports times.
+    enum class SyntheticSource { LOCAL, REMOTE, OLDER_SERVER };
+    //! A realistic, explicitly synthetic observed-time market for the visual
+    //! QA export (no node, wallet or public feed): a multi-account book of 12
+    //! limit levels per side from 24 accounts plus a four-price ladder order
+    //! per side, the viewer's own bid, 60 held auctions with their observed
+    //! times (two applied late, shown without a time), and 90 minutes of 1m
+    //! candles as a node serves them (a proven quiet stretch, a gap of late
+    //! auctions and a restart seam). An older server has neither times nor
+    //! candles: its last live auctions carry receipt times instead.
+    void ShowSyntheticTimeMarket(B3FlowMeshTradingPanel& panel, SyntheticSource source)
     {
-        const int64_t start{OBSERVED_T0 - 90 * 60'000};
-        UniValue candles{UniValue::VARR};
-        uint64_t sequence{1000};
-        CAmount price{1'000};
-        std::vector<UniValue> rows;
-        for (int minute{0}; minute < 90; ++minute) {
-            if (minute >= 20 && minute < 26) continue; // quiet: no auction existed
-            if (minute == 40) { sequence += 7; continue; } // 7 auctions applied late
-            const bool seam{minute == 60};
-            const uint64_t first{sequence};
-            const int entries{3 + (minute * 7) % 9};
-            CAmount open{price}, high{price}, low{price};
-            uint64_t volume{0}, quote{0};
-            for (int i{0}; i < entries; ++i) {
-                price = std::max<CAmount>(900, price + ((minute * 13 + i * 5) % 7) - 3);
-                high = std::max(high, price); low = std::min(low, price);
-                const uint64_t lot{static_cast<uint64_t>(40'000 + ((minute + i) % 5) * 15'000)};
-                volume += lot; quote += lot * static_cast<uint64_t>(price);
-                ++sequence;
-            }
-            UniValue c{CandleJson(start + minute * 60'000, first, sequence - 1, open, high, low, price, volume, seam ? std::vector<std::string>{"seam_before"} : std::vector<std::string>{})};
-            c.pushKV("quote_volume", std::to_string(quote));
-            candles.push_back(c);
+        auto s{Parse(Data())};
+        s.curves.clear(); s.own_curves.clear(); s.history.clear();
+        for (int i{0}; i < 12; ++i) {
+            const CAmount quantity{60'000 + static_cast<CAmount>((i * 37) % 9) * 45'000};
+            const CAmount filled{i % 4 == 1 ? 15'000 : 0};
+            s.curves.push_back(LimitCurve("bid", static_cast<unsigned char>(20 + i), 999 - i, quantity, filled));
+            s.curves.push_back(LimitCurve("ask", static_cast<unsigned char>(80 + i), 1001 + i, quantity + 30'000));
         }
-        auto page{CandlesJson("1m", 60'000, OBSERVED_T0, 90, {}, "this_node", false)};
-        page.pushKV("candles", candles);
-        auto data{Data()};
-        data.pushKV("clearing_ticks", TickPageJson({TickJson(sequence, H(4), true, "bid")}, false));
-        UniValue snapshot{data["snapshot"]}; snapshot.pushKV("next_microblock_sequence", sequence + 1); data.pushKV("snapshot", snapshot);
-        data.pushKV("observed_time", ObservedJson({StampJson(sequence, H(4), "live", OBSERVED_T0 + 20'000)}, "this_node"));
-        auto s{Parse(data)};
+        // Ladder orders: one curve per side, four prices (eight breakpoints).
+        Curve ladder_bid; ladder_bid.account = QString::fromStdString(H(40).GetHex()); ladder_bid.side = QStringLiteral("bid");
+        ladder_bid.points = {{985, 400'000}, {986, 300'000}, {988, 300'000}, {989, 200'000}, {991, 200'000}, {992, 100'000}, {994, 100'000}, {995, 0}};
+        ladder_bid.remaining = 400'000; ladder_bid.reserved = 390'700'000;
+        Curve ladder_ask; ladder_ask.account = QString::fromStdString(H(41).GetHex()); ladder_ask.side = QStringLiteral("ask");
+        ladder_ask.points = {{1005, 0}, {1006, 150'000}, {1008, 150'000}, {1009, 300'000}, {1011, 300'000}, {1012, 450'000}, {1014, 450'000}, {1015, 600'000}};
+        ladder_ask.remaining = 600'000; ladder_ask.reserved = 600'000;
+        s.curves.push_back(ladder_bid); s.curves.push_back(ladder_ask);
+        auto own{LimitCurve("bid", 5, 997, 250'000, 50'000)};
+        s.curves.push_back(own); s.own_curves = {own};
+        s.curves_complete = true;
+        s.depth = Aggregate(s.curves);
+        // Sixty held auctions after 1590 served ones, ending at the head.
+        constexpr uint64_t FIRST_TICK{1591}, HEAD{1650};
+        s.next_sequence = HEAD + 1; s.head = QString::fromStdString(H(250).GetHex());
+        TickPage page; page.available = true; page.remote = source != SyntheticSource::LOCAL;
+        ObservedTimes times; times.available = source != SyntheticSource::OLDER_SERVER;
+        const QString endpoint{QStringLiteral("https://trade.example.org:18443")};
+        times.source = source == SyntheticSource::LOCAL ? QStringLiteral("this_node") : endpoint;
+        CAmount price{1000};
+        int64_t at{OBSERVED_T0 - 7 * 60'000};
+        for (uint64_t sequence{FIRST_TICK}; sequence <= HEAD; ++sequence) {
+            Tick t; t.sequence = sequence; t.kind = QStringLiteral("execution");
+            uint256 hash; hash.begin()[0] = static_cast<unsigned char>(sequence & 0xff); hash.begin()[1] = static_cast<unsigned char>(sequence >> 8); hash.begin()[2] = 0xa5;
+            if (sequence == HEAD) hash = H(250);
+            t.hash = QString::fromStdString(hash.GetHex());
+            const bool cleared{sequence % 5 != 3};
+            t.cleared = cleared; t.side = QStringLiteral("none");
+            if (cleared) {
+                price = std::clamp<CAmount>(price + static_cast<CAmount>((sequence * 7919) % 7) - 3, 992, 1008);
+                t.price = price; t.volume = 20'000 + static_cast<CAmount>((sequence * 104729) % 9) * 22'500;
+                if (sequence % 3 == 0) { t.side = QStringLiteral("bid"); t.imbalance = 10'000; }
+            }
+            page.ticks.push_back(t);
+            at += 5'000 + static_cast<int64_t>((sequence * 31) % 5) * 1'000;
+            flowmesh::ObservedStamp stamp; stamp.sequence = sequence; stamp.hash = hash; stamp.ms = at;
+            stamp.mode = sequence == 1620 || sequence == 1621 ? flowmesh::ObservedMode::DELAYED : flowmesh::ObservedMode::LIVE;
+            times.rows.push_back(stamp);
+            if (cleared && sequence + 20 > HEAD) {
+                Trade trade; trade.sequence = sequence; trade.hash = t.hash; trade.anchor_height = 50; trade.cleared = true;
+                trade.price = t.price; trade.quantity = t.volume; trade.notional = t.price * t.volume; trade.fee = *FeeExample(trade.notional);
+                trade.own_fills_known = true; trade.own_buy = sequence % 4 == 0 ? t.volume / 4 : 0; s.history.push_back(trade);
+            }
+        }
+        s.ticks = page;
+        s.remote = source != SyntheticSource::LOCAL;
+        if (s.remote) { s.endpoint = endpoint; s.certificate_verified = s.account_state_verified = true; }
+        if (source == SyntheticSource::OLDER_SERVER) times.reason = QStringLiteral("endpoint_does_not_advertise_observed_time");
+        s.observed = times;
+        // Ninety minutes of served 1m candles, their last sequence right before the held ticks.
+        B3FlowMeshMarketData::CandlePage candles;
+        candles.available = true; candles.remote = s.remote; candles.source = times.source;
+        candles.interval = flowmesh::CandleInterval::M1;
+        candles.before_ms = OBSERVED_T0 - 7 * 60'000; candles.from_ms = candles.before_ms - 300 * 60'000;
+        std::vector<flowmesh::ObservedCandle> reversed;
+        uint64_t last{FIRST_TICK - 1};
+        CAmount close{1000};
+        for (int minute{89}; minute >= 0; --minute) {
+            const int64_t open_ms{candles.before_ms - 90 * 60'000 + minute * 60'000};
+            if (minute >= 20 && minute < 27) continue;          // quiet: no auction existed
+            if (minute == 46) { last -= 5; continue; }           // five auctions applied late: a gap
+            flowmesh::ObservedCandle c; c.open_ms = open_ms;
+            c.entries = static_cast<uint32_t>(4 + (minute * 7) % 8);
+            c.last_sequence = last; c.first_sequence = last - c.entries + 1; last = c.first_sequence - 1;
+            c.clearings = c.entries - (minute % 3 == 0 ? 1 : 0);
+            const CAmount swing{static_cast<CAmount>((minute * 13) % 9) - 4};
+            c.close = close; c.open = std::clamp<CAmount>(close - swing, 985, 1015);
+            c.high = std::max(c.open, c.close) + static_cast<CAmount>(minute % 4); c.low = std::min(c.open, c.close) - static_cast<CAmount>((minute + 1) % 3);
+            close = c.open;
+            c.base_volume = static_cast<uint64_t>(c.clearings) * (40'000 + static_cast<uint64_t>(minute % 6) * 17'500);
+            c.quote_volume = c.base_volume * static_cast<uint64_t>(c.close);
+            if (minute == 60) c.flags |= flowmesh::CANDLE_SEAM_BEFORE;
+            if (minute == 45 || minute == 47) c.flags |= flowmesh::CANDLE_PARTIAL;
+            reversed.push_back(c);
+        }
+        candles.candles.assign(reversed.rbegin(), reversed.rend());
         panel.m_candle_interval = flowmesh::CandleInterval::M1;
         Observe(panel, s, true);
+        B3FlowMeshTrading::Market& row{panel.m_market_data[0]};
+        row.remote = s.remote;
+        panel.m_wallet_name = QStringLiteral("SYNTHETIC QA · no wallet / no signing");
+        panel.m_certificate_age.start();
         panel.mergeHeldTicks();
-        panel.applyCandles(ParseCandles(page, flowmesh::CandleInterval::M1), 300);
-        panel.updateDataViews();
-        panel.m_chart->setNowMs(OBSERVED_T0 + 30'000);
+        if (source == SyntheticSource::OLDER_SERVER) {
+            // Receipt times, live single auctions only: the newest three.
+            for (uint64_t sequence{HEAD - 2}; sequence <= HEAD; ++sequence) panel.m_received_times[sequence] = OBSERVED_T0 + static_cast<int64_t>(sequence - HEAD) * 6'000;
+        } else {
+            panel.applyCandles(candles, 300);
+        }
+        panel.m_price->setText(QStringLiteral("1.003")); panel.m_quantity->setText(QStringLiteral("0.25"));
+        panel.updateDataViews(); panel.updateMarketText();
+        panel.m_chart->setNowMs(OBSERVED_T0 + 20'000);
+        panel.show(); QCoreApplication::processEvents();
     }
+
 private Q_SLOTS:
     void initTestCase()
     {
@@ -5746,14 +5817,49 @@ private Q_SLOTS:
         panel.m_snapshot->paused = true; panel.m_market_data[0].ready = false; panel.m_market_data[0].checkpoint_pending = true; panel.m_market_data[0].checkpoint = QString::fromStdString(H(80).GetHex()); panel.updateMarketText();
         QVERIFY(save(QStringLiteral("synthetic-flowmesh-paused.png")));
         panel.m_read_failed = true; panel.updateMarketText(); QVERIFY(save(QStringLiteral("synthetic-flowmesh-stale.png")));
+        // Observed time: a realistic multi-account book with ladder orders,
+        // UTC candles and the trades tape, locally and through an endpoint,
+        // and an older server's auction-order fallback.
+        const auto render = [&](QWidget& widget, const QString& name) {
+            QImage image{widget.size(), QImage::Format_ARGB32}; image.fill(Qt::transparent); widget.render(&image);
+            return image.save(output.filePath(name));
+        };
         {
             B3FlowMeshTradingPanel timed; timed.resize(1320, 940); timed.m_timer->stop();
-            ShowSyntheticTimeChart(timed); timed.show(); QCoreApplication::processEvents();
+            ShowSyntheticTimeMarket(timed, SyntheticSource::LOCAL);
             QVERIFY(timed.m_chart->timeMode());
-            QImage image{timed.size(), QImage::Format_ARGB32}; image.fill(Qt::transparent); timed.render(&image);
-            QVERIFY(image.save(output.filePath(QStringLiteral("synthetic-flowmesh-time-candles.png"))));
-            QImage chart{timed.m_chart->size(), QImage::Format_ARGB32}; chart.fill(Qt::transparent); timed.m_chart->render(&chart);
-            QVERIFY(chart.save(output.filePath(QStringLiteral("synthetic-flowmesh-time-chart.png"))));
+            QVERIFY(timed.m_chart->timeSeries().candles.size() > 70);
+            QVERIFY(render(timed, QStringLiteral("synthetic-flowmesh-time-candles.png")));
+            QVERIFY(render(*timed.m_chart, QStringLiteral("synthetic-flowmesh-time-chart.png")));
+            auto* mode{timed.findChild<QComboBox*>(QStringLiteral("flowMeshLiquidityMode"))};
+            QVERIFY(mode); mode->setCurrentIndex(2); QCoreApplication::processEvents();
+            QCOMPARE(timed.m_trade_tape->table()->rowCount(), 48);
+            QVERIFY(render(timed, QStringLiteral("synthetic-flowmesh-time-tape.png")));
+            mode->setCurrentIndex(1); QCoreApplication::processEvents();
+            QVERIFY(render(timed, QStringLiteral("synthetic-flowmesh-time-curve-depth.png")));
+            mode->setCurrentIndex(0);
+            timed.m_activity->setCurrentIndex(1); QCoreApplication::processEvents();
+            QVERIFY(render(timed, QStringLiteral("synthetic-flowmesh-time-history.png")));
+            auto* interval{timed.findChild<QComboBox*>(QStringLiteral("flowMeshCandleInterval"))};
+            timed.m_chart->zoomTime(0.5); QCoreApplication::processEvents();
+            QVERIFY(render(*timed.m_chart, QStringLiteral("synthetic-flowmesh-time-chart-zoomed-out.png")));
+            QVERIFY(interval && interval->count() == 6);
+        }
+        {
+            B3FlowMeshTradingPanel remote; remote.resize(1320, 940); remote.m_timer->stop();
+            ShowSyntheticTimeMarket(remote, SyntheticSource::REMOTE);
+            QVERIFY(remote.m_chart->timeMode()); QVERIFY(remote.m_chart->timeSeries().remote);
+            auto* mode{remote.findChild<QComboBox*>(QStringLiteral("flowMeshLiquidityMode"))};
+            QVERIFY(mode); mode->setCurrentIndex(2); QCoreApplication::processEvents();
+            QVERIFY(render(remote, QStringLiteral("synthetic-flowmesh-time-remote.png")));
+        }
+        {
+            B3FlowMeshTradingPanel older; older.resize(1320, 940); older.m_timer->stop();
+            ShowSyntheticTimeMarket(older, SyntheticSource::OLDER_SERVER);
+            QVERIFY(!older.m_chart->timeMode());
+            auto* mode{older.findChild<QComboBox*>(QStringLiteral("flowMeshLiquidityMode"))};
+            QVERIFY(mode); mode->setCurrentIndex(2); QCoreApplication::processEvents();
+            QVERIFY(render(older, QStringLiteral("synthetic-flowmesh-auction-order-fallback.png")));
         }
         panel.hide(); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_wallet); // Fixture cannot submit.
     }
