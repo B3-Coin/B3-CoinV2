@@ -105,17 +105,25 @@ B3FlowMeshTradeTape::B3FlowMeshTradeTape(QWidget* parent) : QWidget{parent}
     setRows({}, {}, false, {}, false, {});
 }
 
+QString B3FlowMeshTradeTape::ReportedLabel()
+{
+    return tr("Endpoint-reported · execution not independently verified");
+}
+
 void B3FlowMeshTradeTape::setRows(const std::vector<Row>& rows, const B3FlowMeshMarketData::Units& units, const bool inverse,
-                                  const QString& source, const bool remote, const QString& reason)
+                                  const QString& source, const bool remote, const QString& reason, const bool reported)
 {
     using namespace B3FlowMeshMarketData;
     const bool known{units.known && units.decimals >= 0 && units.decimals <= 18};
     const QString token{known ? units.ticker : tr("token")};
     const QString quote{inverse ? token : QStringLiteral("B3")}, base{inverse ? QStringLiteral("B3") : token};
     const QStringList labels{tr("Price (%1)").arg(quote), tr("Size (%1)").arg(base), tr("Time")};
-    const QStringList tips{tr("Uniform clearing price of the auction; coloured by its change from the previous auction (there is no taker side)"),
-                           inverse ? tr("Matched quantity as gross B3 at the clearing price") : tr("Matched quantity"),
+    const QString provenance{reported ? QStringLiteral("\n") + ReportedLabel() : QString{}};
+    const QStringList tips{tr("Uniform clearing price of the auction; coloured by its change from the previous auction (there is no taker side)") + provenance,
+                           (inverse ? tr("Matched quantity as gross B3 at the clearing price") : tr("Matched quantity")) + provenance,
                            tr("Local time the source observed the auction (operator-observed, not certified)")};
+    const QString accessible{reported ? tr("Recent auctions, newest first · %1").arg(ReportedLabel()) : tr("Recent auctions, newest first")};
+    if (m_table->accessibleName() != accessible) m_table->setAccessibleName(accessible);
     for (int c{0}; c < 3; ++c) {
         if (!m_table->horizontalHeaderItem(c)) m_table->setHorizontalHeaderItem(c, new QTableWidgetItem{labels[c]});
         else if (m_table->horizontalHeaderItem(c)->text() != labels[c]) m_table->horizontalHeaderItem(c)->setText(labels[c]);
@@ -132,7 +140,7 @@ void B3FlowMeshTradeTape::setRows(const std::vector<Row>& rows, const B3FlowMesh
         const QStringList values{inverse && row.price == 0 ? QStringLiteral("—") : price.text,
                                  FormatDepthQuantity(row.price, row.volume, units.decimals, inverse), time};
         const QString price_tip{(price.approximate ? tr("Exact price: %1 %2\n").arg(price.exact, quote) : QString{}) +
-                                tr("Auction #%1 · uniform price, no taker side").arg(row.sequence)};
+                                tr("Auction #%1 · uniform price, no taker side").arg(row.sequence) + provenance};
         // In the B3 view a higher canonical price is a lower displayed one.
         const int shown{inverse ? -row.direction : row.direction};
         const QColor price_color{shown > 0 ? B3Theme::kPositive : shown < 0 ? B3Theme::kNegative : B3Theme::kTextPrimary};
@@ -163,6 +171,7 @@ void B3FlowMeshTradeTape::setRows(const std::vector<Row>& rows, const B3FlowMesh
     else if (std::any_of(rows.begin(), rows.end(), [](const auto& row) { return row.received_ms.has_value(); })) note = tr("This server reports no times · times received by this app, live updates only");
     else note = reason == QStringLiteral("endpoint_does_not_advertise_observed_time") ? tr("This server does not report times (older version)")
                                                                                    : tr("No observed times");
-    if (remote && known && !rows.empty()) note += tr(" · endpoint-reported");
+    if (reported && known && !rows.empty()) note += tr(" · %1").arg(ReportedLabel());
+    else if (remote && known && !rows.empty()) note += tr(" · endpoint-reported");
     if (m_note->text() != note) m_note->setText(note);
 }

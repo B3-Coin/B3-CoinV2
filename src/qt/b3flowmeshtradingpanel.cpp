@@ -690,7 +690,10 @@ void B3FlowMeshTradingPanel::updateDataViews()
                                                                          : std::vector<B3FlowMeshTradeTape::Row>{}};
         m_trade_tape->setRows(rows, matched ? m_snapshot->units : Units{}, inverse, timed ? m_tick_times_source : QString{},
                               matched && m_snapshot->remote,
-                              matched && m_snapshot->observed ? m_snapshot->observed->reason : QString{});
+                              matched && m_snapshot->observed ? m_snapshot->observed->reason : QString{},
+                              // As the trade history: a remote client's ticks
+                              // are the endpoint's claims (critique B5).
+                              matched && m_snapshot->remote && !m_snapshot->execution_result_verified);
     }
     if (!matched || !m_snapshot->units.known) {
         for (auto* table : {m_depth_view, m_history_view, m_own_view}) SetRows(table, {});

@@ -2688,6 +2688,34 @@ private Q_SLOTS:
         tape.setRows({}, units, false, {}, true, QStringLiteral("endpoint_does_not_advertise_observed_time"));
         QVERIFY(tape.findChild<QLabel*>(QStringLiteral("flowMeshTradeTapeNote"))->text().contains(QStringLiteral("No matched auctions")));
     }
+    void remoteTapeIsLabelledReported()
+    {
+        // A remote client's ticks are the endpoint's claims, as its trade
+        // history: the tape's note, header and every row say so.
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        Observe(panel, Parse(RemoteDataWithTimes()), true);
+        panel.mergeHeldTicks(); panel.updateDataViews();
+        auto* table{panel.m_trade_tape->table()};
+        QVERIFY(table->rowCount() > 0);
+        const QString label{QStringLiteral("Endpoint-reported · execution not independently verified")};
+        QCOMPARE(B3FlowMeshTradeTape::ReportedLabel(), label);
+        QVERIFY(panel.m_trade_tape->findChild<QLabel*>(QStringLiteral("flowMeshTradeTapeNote"))->text().contains(label));
+        QVERIFY(table->horizontalHeaderItem(0)->toolTip().contains(label));
+        QVERIFY(table->horizontalHeaderItem(1)->toolTip().contains(label));
+        QVERIFY(table->accessibleName().contains(label));
+        for (int row{0}; row < table->rowCount(); ++row) QVERIFY(table->item(row, 0)->toolTip().contains(label));
+        QVERIFY(panel.m_history_note->text().contains(QStringLiteral("execution results not independently verified")));
+        // The local engine's own execution: no such label.
+        Observe(panel, Parse(Data()), true);
+        auto page{TickPage{}}; page.available = true;
+        Tick tick; tick.sequence = 2; tick.hash = QString::fromStdString(H(4).GetHex()); tick.kind = QStringLiteral("execution"); tick.side = QStringLiteral("none");
+        tick.cleared = true; tick.price = 1000; tick.volume = 250'000; page.ticks = {tick};
+        panel.m_snapshot->ticks = page; panel.mergeHeldTicks(); panel.updateDataViews();
+        QCOMPARE(table->rowCount(), 1);
+        QVERIFY(!table->item(0, 0)->toolTip().contains(label));
+        QVERIFY(!panel.m_trade_tape->findChild<QLabel*>(QStringLiteral("flowMeshTradeTapeNote"))->text().contains(label));
+        QVERIFY(!table->horizontalHeaderItem(0)->toolTip().contains(label));
+    }
     void olderServersGetReceiptTimesForLiveSingleAuctionsOnly()
     {
         B3FlowMeshTradingPanel panel;

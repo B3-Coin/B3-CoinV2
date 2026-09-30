@@ -52,9 +52,13 @@ public:
 
     explicit B3FlowMeshTradeTape(QWidget* parent = nullptr);
     //! `source` observed the times (empty: none); `reason` says why there
-    //! are none when that is known.
+    //! are none when that is known. `reported`: the prices and sizes are an
+    //! endpoint's claims, not execution this client verified (a remote
+    //! client's ticks): the note, the header and every row say so.
     void setRows(const std::vector<Row>& rows, const B3FlowMeshMarketData::Units& units, bool inverse, const QString& source,
-                 bool remote, const QString& reason);
+                 bool remote, const QString& reason, bool reported = false);
+    //! The provenance label of endpoint-reported rows.
+    static QString ReportedLabel();
     QTableWidget* table() const { return m_table; }
 
 private:
