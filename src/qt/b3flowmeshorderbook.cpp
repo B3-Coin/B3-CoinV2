@@ -410,7 +410,9 @@ void B3FlowMeshOrderBook::layoutRows()
     std::set<QString> shown;
     for (const auto& row : previous) if (row.kind == Kind::Ask || row.kind == Kind::Bid) shown.insert(QString::number(static_cast<int>(row.kind)) + row.price);
     m_model->setRows(rows);
-    if (m_view->rowSpan(per_side, 0) != 3) {
+    // The spread row spans the three columns. Setting it again repaints the
+    // whole ladder, so only a new layout does.
+    if (m_view->columnSpan(per_side, 0) != 3) {
         m_view->clearSpans();
         m_view->setSpan(per_side, 0, 1, 3);
     }

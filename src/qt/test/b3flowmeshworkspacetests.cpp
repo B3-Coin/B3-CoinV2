@@ -1269,6 +1269,24 @@ private Q_SLOTS:
         B3FlowMeshOrderBook::SetAnimationSetting(true);
         QCOMPARE(reset.count(), 0); QCOMPARE(removed.count(), 0); QCOMPARE(inserted.count(), 0);
     }
+    void identicalBookUpdatesDoNotRepaintTheLadder()
+    {
+        // In-place updates: data that did not change never repaints the
+        // ladder (a repaint of its whole area on every read otherwise).
+        const auto snapshot{WithLevels(SyntheticLimitBook(16), {}, H(20))};
+        B3FlowMeshOrderBook book; book.resize(420, 440); book.setSnapshot(snapshot, true);
+        book.show(); for (int i{0}; i < 3; ++i) QCoreApplication::processEvents();
+        QCOMPARE(book.view()->columnSpan(book.rowsPerSide(), 0), 3);
+        int paints{0};
+        book.setPaintObserver([&](const QString& head) { QCOMPARE(head, snapshot.head); ++paints; });
+        for (int i{0}; i < 5; ++i) { book.setSnapshot(Snapshot{snapshot}, true); QCoreApplication::processEvents(); }
+        QCOMPARE(paints, 0);
+        // A real change still repaints.
+        auto moved{snapshot}; moved.curves.front().filled += 1'000; moved.curves.front().remaining -= 1'000;
+        book.setSnapshot(WithLevels(moved, {}, H(20)), true); QCoreApplication::processEvents();
+        QVERIFY(paints > 0);
+        QCOMPARE(book.view()->columnSpan(book.rowsPerSide(), 0), 3);
+    }
     void orderBookLadderFallsBackLabelledAndRequiresVerifiedState()
     {
         const auto original{Parse(RemoteData())};
