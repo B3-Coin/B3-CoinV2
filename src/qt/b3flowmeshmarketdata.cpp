@@ -467,6 +467,30 @@ void MergeHeldTimes(std::map<uint64_t, flowmesh::ObservedStamp>& held, const std
     });
 }
 
+bool MergeSameHeadObserved(std::optional<ObservedTimes>& retained, std::optional<ObservedTimes> fresh)
+{
+    const bool same_section{retained && fresh && retained->available && fresh->available && retained->source == fresh->source &&
+                            retained->clock_suspect == fresh->clock_suspect && retained->reason == fresh->reason};
+    if (!same_section) {
+        const bool changed{retained != fresh};
+        retained = std::move(fresh);
+        return changed;
+    }
+    bool changed{false};
+    auto& rows{retained->rows};
+    for (auto& row : fresh->rows) {
+        const auto at{std::lower_bound(rows.begin(), rows.end(), row.sequence, [](const auto& held, uint64_t sequence) { return held.sequence < sequence; })};
+        if (at != rows.end() && at->sequence == row.sequence) {
+            if (*at == row) continue;
+            *at = std::move(row);
+        } else {
+            rows.insert(at, std::move(row));
+        }
+        changed = true;
+    }
+    return changed;
+}
+
 CandlePage ParseCandles(const UniValue& value, const flowmesh::CandleInterval requested)
 {
     CandlePage page;

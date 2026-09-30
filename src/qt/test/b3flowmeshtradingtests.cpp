@@ -1523,6 +1523,46 @@ private Q_SLOTS:
         // Live is exactly the trading gate's freshness condition.
         QCOMPARE(expected == LinkState::Live, wallet && polling >= 0 && !failed && response >= 0 && response <= B3FlowMeshMarketData::LINK_FRESH_MS);
     }
+    void sameHeadObservedTimesMergeWithoutChange()
+    {
+        using B3FlowMeshMarketData::ObservedTimes;
+        const auto stamp = [](uint64_t sequence, int64_t ms) {
+            flowmesh::ObservedStamp row; row.sequence = sequence; row.hash = uint256{static_cast<uint8_t>(sequence)};
+            row.mode = flowmesh::ObservedMode::LIVE; row.ms = ms; return row;
+        };
+        ObservedTimes head_reply; head_reply.available = true; head_reply.source = QStringLiteral("https://operator.invalid:18443");
+        head_reply.rows = {stamp(5, 1000), stamp(6, 1400), stamp(7, 1900)};
+        // A same-head reply: the head's row only (a subset). Nothing changes.
+        std::optional<ObservedTimes> retained{head_reply};
+        auto head_only{head_reply}; head_only.rows = {stamp(7, 1900)};
+        QVERIFY(!B3FlowMeshMarketData::MergeSameHeadObserved(retained, head_only));
+        QCOMPARE(*retained, head_reply);
+        // A row it changes (a flag the source added) or adds, in order.
+        auto flagged{head_only}; flagged.rows[0].flags = 1;
+        QVERIFY(B3FlowMeshMarketData::MergeSameHeadObserved(retained, flagged));
+        QCOMPARE(retained->rows.size(), size_t{3}); QCOMPARE(retained->rows[2].flags, uint8_t{1});
+        auto added{head_only}; added.rows = {stamp(4, 800)};
+        QVERIFY(B3FlowMeshMarketData::MergeSameHeadObserved(retained, added));
+        QCOMPARE(retained->rows.size(), size_t{4}); QCOMPARE(retained->rows.front().sequence, uint64_t{4});
+        QVERIFY(std::is_sorted(retained->rows.begin(), retained->rows.end(), [](const auto& a, const auto& b) { return a.sequence < b.sequence; }));
+        // Another section replaces the rows: another source, the clock flag,
+        // an unavailable section, or none at all.
+        auto other{head_only}; other.source = QStringLiteral("https://other.invalid:18443");
+        QVERIFY(B3FlowMeshMarketData::MergeSameHeadObserved(retained, other));
+        QCOMPARE(*retained, other);
+        retained = head_reply;
+        auto suspect{head_only}; suspect.clock_suspect = true;
+        QVERIFY(B3FlowMeshMarketData::MergeSameHeadObserved(retained, suspect));
+        QCOMPARE(*retained, suspect);
+        ObservedTimes unavailable; unavailable.reason = QStringLiteral("observed_time_not_yet_received");
+        QVERIFY(B3FlowMeshMarketData::MergeSameHeadObserved(retained, unavailable));
+        QCOMPARE(*retained, unavailable);
+        QVERIFY(!B3FlowMeshMarketData::MergeSameHeadObserved(retained, unavailable));
+        QVERIFY(B3FlowMeshMarketData::MergeSameHeadObserved(retained, std::nullopt));
+        QVERIFY(!retained);
+        QVERIFY(B3FlowMeshMarketData::MergeSameHeadObserved(retained, head_reply));
+        QCOMPARE(*retained, head_reply);
+    }
 };
 QTEST_GUILESS_MAIN(B3FlowMeshTradingTests)
 #include "b3flowmeshtradingtests.moc"

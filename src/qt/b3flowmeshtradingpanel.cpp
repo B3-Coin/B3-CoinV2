@@ -2481,7 +2481,7 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
         // Only what the data views draw asks for them again; status alone
         // is the caller's updateMarketText (ticket, gates and banners).
         bool display{retained.certificate_verified != fresh.certificate_verified || retained.account_state_verified != fresh.account_state_verified ||
-                     retained.event_gap != fresh.event_gap || retained.endpoint != fresh.endpoint || retained.observed != fresh.observed ||
+                     retained.event_gap != fresh.event_gap || retained.endpoint != fresh.endpoint ||
                      (fresh.levels && retained.levels != fresh.levels)};
         retained.running = fresh.running; retained.paused = fresh.paused; retained.chain_reconciling = fresh.chain_reconciling; retained.handoff = fresh.handoff; retained.observer = fresh.observer; retained.halt = std::move(fresh.halt); retained.error = std::move(fresh.error); retained.pending_actions = fresh.pending_actions; retained.active_seats = fresh.active_seats; retained.quorum_required = fresh.quorum_required;
         retained.remote = fresh.remote; retained.endpoint = std::move(fresh.endpoint); retained.certificate_verified = fresh.certificate_verified; retained.account_state_verified = fresh.account_state_verified; retained.execution_result_verified = fresh.execution_result_verified; retained.b3_checkpoint_confirmed = fresh.b3_checkpoint_confirmed; retained.event_gap = fresh.event_gap;
@@ -2491,7 +2491,10 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
         if (fresh.units.known && fresh.units.asset == retained.base && fresh.units != retained.units) { retained.units = std::move(fresh.units); display = true; }
         // Read at this same head: they replace the retained ones.
         retained.ticks = std::move(fresh.ticks); retained.indicative = std::move(fresh.indicative);
-        retained.observed = std::move(fresh.observed);
+        // Only the head's row (and any new tick's): the rows of the head's
+        // history and ticks stay, so the first same-head reply after a new
+        // head neither rebuilds the views nor drops those times.
+        if (B3FlowMeshMarketData::MergeSameHeadObserved(retained.observed, std::move(fresh.observed))) display = true;
         // Levels come with a changed head, or when this read asked for them
         // again (another grouping): take them, else keep the head's own.
         if (fresh.levels) retained.levels = std::move(fresh.levels);

@@ -6002,11 +6002,18 @@ private Q_SLOTS:
         QCOMPARE(panel.m_snapshot->pending_actions, uint64_t{3}); QVERIFY(panel.m_snapshot->paused);
         QCOMPARE(panel.m_snapshot->curves, curves); QVERIFY(panel.m_snapshot->levels == shown.levels);
         QVERIFY(!panel.m_snapshot->unchanged);
+        // The head's row alone (a same-head reply's observed times): the
+        // rows of its history and ticks stay, and nothing is drawn again.
+        const auto observed{panel.m_snapshot->observed};
+        QVERIFY(observed && observed->rows.size() >= 2);
+        auto head_only{reply()}; head_only.observed->rows.erase(head_only.observed->rows.begin());
+        apply(head_only); QCOMPARE(panel.m_view_builds, builds);
+        QCOMPARE(panel.m_snapshot->observed, observed);
         // Something drawn: an event gap, other observed times, other units.
         auto gap{reply()}; gap.event_gap = true;
         apply(gap); QCOMPARE(panel.m_view_builds, builds + 1);
         apply(gap); QCOMPARE(panel.m_view_builds, builds + 1);
-        auto times{gap}; times.observed->rows.pop_back();
+        auto times{gap}; times.observed->rows.back().ms += 1000;
         apply(times); QCOMPARE(panel.m_view_builds, builds + 2);
         auto units{times}; units.units.ticker = QStringLiteral("tUSD2");
         apply(units); QCOMPARE(panel.m_view_builds, builds + 3);
@@ -6383,6 +6390,112 @@ private Q_SLOTS:
         panel.armWatch(); QVERIFY(!panel.m_watch_thread);
         QCOMPARE(probe.watches.load(), 0);
         panel.m_busy = false;
+    }
+    //! NewerLocalData() as a remote endpoint serves it (head H(10), sequence
+    //! 3, a new bid at 998), with its tick and the endpoint's times of its
+    //! history and tick. `unchanged`: the reply to a read that already held
+    //! that head, as the remote client builds it: status, and the endpoint's
+    //! time of the head only (no new tick, no book).
+    static UniValue NewerRemoteBook(bool unchanged = false)
+    {
+        auto data{NewerLocalData()}; data.pushKV("verification", RemoteData()["verification"]);
+        std::vector<UniValue> ticks, rows;
+        if (!unchanged) { ticks.push_back(TickJson(3, H(10), true, "bid")); rows.push_back(StampJson(2, H(4), "live", OBSERVED_T0 + 61'000)); }
+        rows.push_back(StampJson(3, H(10), "live", OBSERVED_T0 + 62'000));
+        data.pushKV("clearing_ticks", TickPageJson(ticks));
+        data.pushKV("observed_time", ObservedJson(rows));
+        if (unchanged) data.pushKV("unchanged", true);
+        return data;
+    }
+    void remotePollingSameHeadRepliesKeepTheViews()
+    {
+        // The owner's remote setup against an endpoint without live updates
+        // (-flowmeshapiwatch is off by default): the panel polls every 0.5 s,
+        // and a same-head poll is answered unchanged, with the endpoint's time
+        // of the head only. After the head's own reply those replies neither
+        // rebuild the views nor repaint the book, and every time stays shown.
+        FundingReadProbe probe; probe.live_ms = 0; probe.data = RemoteDataWithTimes();
+        probe.candles_response = CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 300,
+            {CandleJson(OBSERVED_T0, 1, 1, 1000, 1000, 1000, 1000, 250'000), CandleJson(OBSERVED_T0 + 60'000, 2, 2, 1000, 1000, 1000, 1000, 250'000)});
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_candle_interval = flowmesh::CandleInterval::M1;
+        Live(panel, probe);
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Polling);
+        // The head's own reply, then (next job) the candles window.
+        for (int i{0}; i < 2; ++i) { panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 5000); }
+        QVERIFY(panel.m_candles && panel.m_candles->available);
+        const auto observed{panel.m_snapshot->observed};
+        QVERIFY(observed && observed->rows.size() == 2);
+        auto unchanged{RemoteDataWithTimes()}; unchanged.pushKV("unchanged", true);
+        unchanged.pushKV("clearing_ticks", TickPageJson({}));
+        unchanged.pushKV("observed_time", ObservedJson({StampJson(2, H(4), "live", OBSERVED_T0 + 61'000)}));
+        probe.data = unchanged;
+        QCoreApplication::processEvents();
+        int book_calls{0};
+        panel.m_order_book->setViewObserver([&](const QString&, bool) { ++book_calls; });
+        const auto builds{panel.m_view_builds};
+        const auto candle_reads{probe.candle_options.size()};
+        const int reads{probe.snapshots.load()};
+        for (int i{0}; i < 3; ++i) { panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 5000); QCoreApplication::processEvents(); }
+        QCOMPARE(probe.snapshots.load(), reads + 3);
+        QCOMPARE(probe.candle_options.size(), candle_reads);
+        QVERIFY(!panel.m_read_failed);
+        QCOMPARE(panel.m_view_builds, builds);
+        QCOMPARE(book_calls, 0); // Neither installed nor painted.
+        QCOMPARE(panel.m_snapshot->observed, observed);
+        QVERIFY(panel.m_response_age.isValid() && panel.m_response_age.elapsed() < 3000);
+        QCOMPARE(probe.writes.load(), 0);
+    }
+    void remoteLiveUpdateRepaintsTheBookAndQuietRepliesDoNot()
+    {
+        // A remote endpoint with live updates (-flowmeshapiwatch on): a new
+        // head that arrives on the watch is installed and painted by the book
+        // at once, with no tick or poll; the quiet timeouts that follow (the
+        // endpoint's unchanged replies, with the head's time only) neither
+        // rebuild the views nor install or paint the book.
+        B3FlowMeshOrderBook::SetAnimationSetting(false); // No flash frames in the counts.
+        struct RestoreAnimation { ~RestoreAnimation() { B3FlowMeshOrderBook::SetAnimationSetting(true); } } restore;
+        FundingReadProbe probe; probe.live_ms = 2000;
+        probe.watch_data = NewerRemoteBook(); probe.watch_object = WatchObject("ready", true, true); probe.hold_watch = true;
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); AttachOfflineWallet(panel); Observe(panel, Parse(RemoteDataWithTimes()));
+        Live(panel, probe);
+        panel.m_watch.mode = B3FlowMeshWatch::Mode::Live; panel.m_watch.last_ok_at = panel.m_watch_clock.elapsed();
+        QVERIFY(!panel.m_timer->isActive());
+        QCoreApplication::processEvents();
+        const QString new_head{QString::fromStdString(H(10).GetHex())};
+        std::vector<std::pair<QString, bool>> calls;
+        panel.m_order_book->setViewObserver([&](const QString& head, bool painted) { calls.emplace_back(head, painted); });
+        panel.armWatch(); QVERIFY(panel.m_watch_thread);
+        QVERIFY(probe.watch_entered.tryAcquire(1, 5000));
+        probe.watch_release.release();
+        QTRY_COMPARE_WITH_TIMEOUT(panel.m_snapshot->head, new_head, 5000);
+        QCOMPARE(panel.m_order_book->head(), new_head);
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(calls.begin(), calls.end(), [&](const auto& call) { return call.first == new_head && call.second; }), 5000);
+        // The next watch was armed at once against the new head.
+        QVERIFY(probe.watch_entered.tryAcquire(1, 5000));
+        QCOMPARE(QString::fromStdString(probe.market_options.back()["known_head"].get_str()), new_head);
+        probe.watch_data = NewerRemoteBook(/*unchanged=*/true); probe.watch_object = WatchObject("timeout", true, true);
+        QCoreApplication::processEvents();
+        calls.clear();
+        const auto builds{panel.m_view_builds};
+        const auto observed{panel.m_snapshot->observed};
+        QVERIFY(observed && observed->rows.size() == 2);
+        // That one and the next (after the pacing's refill, on the GUI
+        // thread's precise re-arm) are quiet.
+        probe.watch_release.release();
+        bool entered{false}; // QTRY evaluates its expression once more at the end.
+        QTRY_VERIFY_WITH_TIMEOUT(entered || (entered = probe.watch_entered.tryAcquire(1)), 5000);
+        probe.hold_watch = false; probe.watch_release.release();
+        QTRY_VERIFY_WITH_TIMEOUT(probe.watches.load() >= 4, 5000);
+        panel.m_watch.Disable(); AwaitWatchWorker(panel);
+        QCoreApplication::processEvents();
+        QCOMPARE(panel.m_watch.last, B3FlowMeshWatch::Outcome::Quiet);
+        QCOMPARE(panel.m_view_builds, builds);
+        QVERIFY(calls.empty());
+        QCOMPARE(panel.m_snapshot->head, new_head);
+        QCOMPARE(panel.m_snapshot->observed, observed);
+        QVERIFY(!panel.m_read_failed);
+        QCOMPARE(probe.snapshots.load(), 0); QCOMPARE(probe.writes.load(), 0);
     }
     void ownOrderSelectionBindsToTheRowShown()
     {

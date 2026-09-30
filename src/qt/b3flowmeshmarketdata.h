@@ -151,6 +151,15 @@ CandlePage ParseCandles(const UniValue& value, flowmesh::CandleInterval requeste
 //! the same hash are added, and every stamp whose tick left `ticks` goes.
 void MergeHeldTimes(std::map<uint64_t, flowmesh::ObservedStamp>& held, const std::deque<Tick>& ticks,
                     const ObservedTimes* page);
+//! An unchanged reply's observed times, merged into those retained for the
+//! same verified head. Such a reply carries the head's row and those of the
+//! ticks after the held position: a subset of what the head's own reply
+//! brought (its history and ticks too), not a change. For the same section
+//! (both available, same source, clock flag and reason) the retained rows
+//! stay and each row the reply adds or changes is taken, in sequence order;
+//! any other section replaces the retained one. True when the result differs
+//! from what was retained (display only).
+bool MergeSameHeadObserved(std::optional<ObservedTimes>& retained, std::optional<ObservedTimes> fresh);
 //! The node's indicative next clearing ("indicative"): never certified.
 struct Indicative {
     bool available{false}, cleared{false};
