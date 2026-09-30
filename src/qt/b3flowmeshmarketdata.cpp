@@ -922,6 +922,40 @@ LimitBook ProjectLimitBook(const Snapshot& snapshot, bool inverse)
     return out;
 }
 
+std::vector<flowmesh::LevelGrouping> BookGroupingChoices(const std::optional<CAmount> best_bid, const std::optional<CAmount> best_ask,
+                                                         const Units& units, const bool inverse)
+{
+    std::vector<flowmesh::LevelGrouping> out{flowmesh::LevelGrouping{}};
+    const auto reference{best_bid && *best_bid > 0 ? best_bid : best_ask};
+    if (!ValidUnits(units) || !reference || *reference <= 0) return out;
+    // floor(log10) of the displayed price: P x 10^(d - 9) B3 per token, or
+    // 10^(9 - d) / P token per B3, from P's digit count alone.
+    const QString digits{QString::number(*reference)};
+    const bool power_of_ten{digits.count(QLatin1Char('0')) == digits.size() - 1 && digits.startsWith(QLatin1Char('1'))};
+    const int magnitude{inverse ? 9 - units.decimals - static_cast<int>(digits.size()) + (power_of_ten ? 1 : 0)
+                                : static_cast<int>(digits.size()) - 1 + units.decimals - 9};
+    const auto add = [&](const uint8_t mantissa, const int exponent) {
+        flowmesh::LevelGrouping grouping;
+        grouping.exact = false; grouping.inverse = inverse; grouping.mantissa = mantissa;
+        grouping.exponent = exponent; grouping.decimals = static_cast<uint8_t>(units.decimals);
+        if (flowmesh::LevelGroupingError(grouping).empty()) out.push_back(grouping);
+    };
+    for (const uint8_t mantissa : {1, 2, 5}) add(mantissa, magnitude - 4);
+    for (const int step : {3, 2, 1}) add(1, magnitude - step);
+    return out;
+}
+
+QString GroupingLabel(const flowmesh::LevelGrouping& grouping)
+{
+    if (grouping.exact) return QObject::tr("Exact");
+    const QString mantissa{QString::number(grouping.mantissa)};
+    if (grouping.exponent >= 0) return mantissa + QString(grouping.exponent, QLatin1Char('0'));
+    const int places{-grouping.exponent};
+    QString text{mantissa.rightJustified(places + 1, QLatin1Char('0'))};
+    text.insert(text.size() - places, QLatin1Char('.'));
+    return text;
+}
+
 std::optional<CAmount> LimitPriceOf(const Curve& curve)
 {
     const auto& p{curve.points};

@@ -339,6 +339,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     connect(m_order_book, &B3FlowMeshOrderBook::levelClicked, this, [this](const QString& price, qint64 cumulative, const QString& head) {
         fillFromBook(price, static_cast<CAmount>(cumulative), head);
     });
+    connect(m_order_book, &B3FlowMeshOrderBook::groupingSelected, this, &B3FlowMeshTradingPanel::selectBookGrouping);
     connect(m_own_view->selectionModel(), &QItemSelectionModel::selectionChanged, this, [this] {
         // Bind to the canonical side and exact points shown when selected:
         // rows keep their index while the certified data behind them changes.
@@ -588,7 +589,15 @@ void B3FlowMeshTradingPanel::updateDataViews()
     if (m_clearing_strip->text() != strip) m_clearing_strip->setText(strip);
     if (const QString tip{ClearingStripTip() + (strip_exact.isEmpty() ? QString{} : QStringLiteral("\n") + strip_exact)}; m_clearing_strip->toolTip() != tip) m_clearing_strip->setToolTip(tip);
     m_clearing_strip->setVisible(!strip.isEmpty());
-    m_order_book->setSnapshot(matched ? m_snapshot : std::nullopt, inverse, bookGrouping());
+    {
+        // The grouping of this market and orientation (another one's never
+        // carries over), and the choices around the displayed price.
+        const auto grouping{bookGrouping()};
+        std::optional<CAmount> best_bid, best_ask;
+        if (matched && m_snapshot->levels && m_snapshot->levels->available) { best_bid = m_snapshot->levels->best_bid; best_ask = m_snapshot->levels->best_ask; }
+        m_order_book->setGroupingChoices(BookGroupingChoices(best_bid, best_ask, matched ? m_snapshot->units : Units{}, inverse), grouping);
+        m_order_book->setSnapshot(matched ? m_snapshot : std::nullopt, inverse, grouping);
+    }
     {
         const bool timed{matched && m_snapshot->observed && m_snapshot->observed->available};
         const auto rows{matched && m_ticks_market == m_snapshot->market ? B3FlowMeshTradeTape::BuildRows(m_ticks, m_tick_times, m_received_times)
@@ -848,9 +857,21 @@ UniValue B3FlowMeshTradingPanel::indicativeDraft() const
 
 flowmesh::LevelGrouping B3FlowMeshTradingPanel::bookGrouping() const
 {
-    // Only a grouping for the displayed orientation applies.
-    if (!m_book_grouping || m_book_grouping->inverse != inverted()) return {};
-    return *m_book_grouping;
+    // Only a grouping for the displayed market and orientation applies.
+    const auto selected{market()};
+    if (!selected) return {};
+    const auto it{m_book_groupings.find({selected->id, inverted()})};
+    return it == m_book_groupings.end() ? flowmesh::LevelGrouping{} : it->second;
+}
+
+void B3FlowMeshTradingPanel::selectBookGrouping(const flowmesh::LevelGrouping& grouping)
+{
+    const auto selected{market()};
+    if (!selected || (!grouping.exact && grouping.inverse != inverted())) return;
+    m_book_groupings[{selected->id, inverted()}] = grouping;
+    updateDataViews();
+    // Read now: the node answers in this grouping even at the same head.
+    if (!m_busy) refresh();
 }
 
 UniValue B3FlowMeshTradingPanel::levelsRequest() const

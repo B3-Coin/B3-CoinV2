@@ -1337,7 +1337,7 @@ private Q_SLOTS:
         const auto grouping{grouped ? (inverse ? Grouping(true, 1, -4, 6) : Grouping(false, 1, -2, 6)) : flowmesh::LevelGrouping{}};
         snapshot = WithLevels(snapshot, grouping);
         Observe(panel, snapshot, inverse);
-        panel.m_book_grouping = grouped ? std::optional{grouping} : std::nullopt;
+        if (grouped) panel.m_book_groupings[{panel.m_snapshot->market, inverse}] = grouping;
         panel.updateDataViews();
         panel.show(); QCoreApplication::processEvents();
         QVERIFY(panel.m_order_book->showsVerifiedLevels());
@@ -1417,6 +1417,70 @@ private Q_SLOTS:
         QVERIFY(model->row(spread + 1).tooltip.startsWith(QStringLiteral("Buy ")));
         QCOMPARE(model->row(spread + 1).price, QStringLiteral("0.99"));   // 1010 atoms: 1000/1010 floored to the step
         QCOMPARE(model->row(spread + 1).click_price, ExactInversePrice(1010, 6));
+    }
+    void bookGroupingChoicesFollowThePriceMagnitude()
+    {
+        const auto labels = [](const std::vector<flowmesh::LevelGrouping>& choices) {
+            QStringList out; for (const auto& grouping : choices) out << GroupingLabel(grouping); return out;
+        };
+        const auto units{Parse(Data()).units}; // 6 decimals
+        // 1000 atoms per atom: 1 B3 per token; a canonical step below one
+        // tick (0.001 B3) is never offered.
+        QCOMPARE(labels(BookGroupingChoices(1000, 1010, units, false)), (QStringList{"Exact", "0.001", "0.01", "0.1"}));
+        // ... and 1 token per B3 in the B3 view, where finer steps exist.
+        QCOMPARE(labels(BookGroupingChoices(1000, 1010, units, true)), (QStringList{"Exact", "0.0001", "0.0002", "0.0005", "0.001", "0.01", "0.1"}));
+        for (const auto& grouping : BookGroupingChoices(1000, 1010, units, true)) QVERIFY(flowmesh::LevelGroupingError(grouping).empty());
+        // 40,000,000 atoms per atom of a 9-decimal token: 4 x 10^7 B3 per
+        // token (k = 7), or 2.5 x 10^-8 token per B3 (k = -8).
+        auto nine{units}; nine.decimals = 9;
+        QCOMPARE(labels(BookGroupingChoices(40'000'000, std::nullopt, nine, false)), (QStringList{"Exact", "1000", "2000", "5000", "10000", "100000", "1000000"}));
+        QCOMPARE(labels(BookGroupingChoices(std::nullopt, 40'000'000, nine, true)).mid(0, 2), (QStringList{"Exact", "0.000000000001"}));
+        // A power of ten: 10^6 atoms per atom of a 6-decimal token is 1000
+        // B3 per token and exactly 0.001 token per B3 (k = -3).
+        QCOMPARE(labels(BookGroupingChoices(1'000'000, std::nullopt, units, true)).at(1), QStringLiteral("0.0000001"));
+        // Nothing to group by without units or a price.
+        auto unknown{units}; unknown.known = false;
+        QCOMPARE(labels(BookGroupingChoices(1000, 1010, unknown, false)), QStringList{"Exact"});
+        QCOMPARE(labels(BookGroupingChoices(std::nullopt, std::nullopt, units, false)), QStringList{"Exact"});
+    }
+    void choosingABookGroupingReadsItAtOnceAndShowsItOnlyWhenEchoed()
+    {
+        FundingReadProbe probe; probe.live_ms = 0;
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); AttachOfflineWallet(panel);
+        auto exact{RemoteData()}; exact.pushKV("book_levels", LevelsJson(Parse(RemoteData()).curves, H(4)));
+        probe.data = exact;
+        Observe(panel, Parse(exact));
+        panel.show(); QCoreApplication::processEvents();
+        auto* combo{panel.m_order_book->groupingSelector()};
+        QVERIFY(combo); QCOMPARE(combo->currentText(), QStringLiteral("Exact"));
+        QVERIFY(panel.m_order_book->showsVerifiedLevels());
+        const int step{combo->findText(QStringLiteral("0.01"))};
+        QVERIFY(step > 0);
+        const auto grouping{Grouping(false, 1, -2, 6)};
+        // The node answers the next read in the chosen grouping.
+        auto grouped{RemoteData()}; grouped.pushKV("unchanged", true); grouped.pushKV("book_levels", LevelsJson(Parse(RemoteData()).curves, H(4), grouping));
+        probe.data = grouped;
+        Q_EMIT combo->activated(step);
+        // Until then the other grouping's levels are not shown as these.
+        QVERIFY(!panel.m_order_book->showsVerifiedLevels());
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QVERIFY(!probe.market_options.empty());
+        const auto asked{probe.market_options.back()["levels"]};
+        QCOMPARE(asked["group"]["orientation"].get_str(), std::string{"canonical"});
+        QCOMPARE(asked["group"]["mantissa"].getInt<int>(), 1);
+        QCOMPARE(asked["group"]["exponent"].getInt<int>(), -2);
+        QCOMPARE(asked["group"]["decimals"].getInt<int>(), 6);
+        QVERIFY(asked["include_unchanged"].isTrue());
+        QVERIFY(panel.m_snapshot->levels && panel.m_snapshot->levels->grouping == grouping);
+        QVERIFY(panel.m_order_book->showsVerifiedLevels());
+        QCOMPARE(combo->currentText(), QStringLiteral("0.01"));
+        // The B3 view keeps its own grouping (exact until chosen).
+        panel.m_orientation->setCurrentIndex(1); QCoreApplication::processEvents();
+        QCOMPARE(combo->currentText(), QStringLiteral("Exact"));
+        QVERIFY(!panel.levelsRequest().exists("group") || panel.levelsRequest()["group"]["orientation"].get_str() == "inverse");
+        panel.m_orientation->setCurrentIndex(0); QCoreApplication::processEvents();
+        QCOMPARE(combo->currentText(), QStringLiteral("0.01"));
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void orderBookSpreadRowIsExactCrossedOrOneSided()
     {

@@ -10,6 +10,7 @@
 #include <optional>
 #include <vector>
 
+class QComboBox;
 class QLabel;
 class QTimer;
 
@@ -114,8 +115,14 @@ public:
     int hoverRow() const { return m_hover_row; }
     //! Offers row `row`'s exact price to the ticket (as a click does).
     bool activateRow(int row);
+    //! The price-grouping selector's choices (BookGroupingChoices) and the
+    //! current one; a selection only emits groupingSelected.
+    void setGroupingChoices(const std::vector<flowmesh::LevelGrouping>& choices, const flowmesh::LevelGrouping& selected);
+    QComboBox* groupingSelector() const { return m_grouping; }
 
 Q_SIGNALS:
+    //! The viewer chose another price grouping for the displayed orientation.
+    void groupingSelected(const flowmesh::LevelGrouping& grouping);
     //! A level was clicked: its exact ticket price text, its cumulative
     //! token quantity (base atoms) from the best level, and the head of the
     //! data it was shown from. Never a signing or review request.
@@ -135,6 +142,8 @@ private:
     void viewResized();
     void setHoverRow(int row);
     QLabel *m_last, *m_note, *m_stale;
+    QComboBox* m_grouping;
+    std::vector<flowmesh::LevelGrouping> m_grouping_choices;
     QTableView* m_view;
     B3FlowMeshLadderModel* m_model;
     QTimer* m_flash_timer;

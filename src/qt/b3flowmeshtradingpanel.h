@@ -193,9 +193,12 @@ private:
     std::optional<uint64_t> ticksAfter(const QString& market) const;
     //! The book grouping the order book displays (exact: none).
     flowmesh::LevelGrouping bookGrouping() const;
-    //! The chosen grouping of the displayed market and orientation; none:
-    //! exact levels.
-    std::optional<flowmesh::LevelGrouping> m_book_grouping;
+    //! Groupings chosen per market and orientation this session (display
+    //! only, never persisted); exact levels where none was chosen.
+    std::map<std::pair<QString, bool>, flowmesh::LevelGrouping> m_book_groupings;
+    //! A grouping was chosen in the book: remember it and read at once, so
+    //! the node's levels in it (include_unchanged) replace the shown ones.
+    void selectBookGrouping(const flowmesh::LevelGrouping& grouping);
     //! The "levels" option of a selected-market read: the deepest levels in
     //! bookGrouping(), and include_unchanged while the displayed levels are
     //! missing or of another grouping, so a grouping change applies at the

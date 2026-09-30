@@ -5,12 +5,15 @@
 #include <flowmesh/market_view.h>
 #include <util/int128.h>
 #include <QApplication>
+#include <QComboBox>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QStyledItemDelegate>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -219,7 +222,17 @@ B3FlowMeshOrderBook::B3FlowMeshOrderBook(QWidget* parent) : QWidget{parent}
     setObjectName(QStringLiteral("flowMeshOrderBook"));
     m_clock.start();
     auto* layout{new QVBoxLayout{this}}; layout->setContentsMargins(0, 0, 0, 0); layout->setSpacing(4);
-    m_last = Text(this, "flowMeshBookLast"); B3Theme::markTextRole(m_last, QStringLiteral("secondary")); layout->addWidget(m_last);
+    auto* header{new QHBoxLayout}; header->setContentsMargins(0, 0, 0, 0);
+    m_last = Text(this, "flowMeshBookLast"); B3Theme::markTextRole(m_last, QStringLiteral("secondary")); header->addWidget(m_last, 1);
+    m_grouping = new QComboBox{this}; m_grouping->setObjectName(QStringLiteral("flowMeshBookGrouping"));
+    m_grouping->setAccessibleName(tr("Order book price grouping"));
+    m_grouping->setToolTip(tr("Groups the book's prices into steps of this size. A buy level shows its lowest price and a sell level its highest, so every order in it accepts the price shown."));
+    m_grouping->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    connect(m_grouping, &QComboBox::activated, this, [this](int index) {
+        if (index >= 0 && static_cast<size_t>(index) < m_grouping_choices.size()) Q_EMIT groupingSelected(m_grouping_choices[static_cast<size_t>(index)]);
+    });
+    header->addWidget(m_grouping);
+    layout->addLayout(header);
     m_stale = Text(this, "flowMeshBookStale"); m_stale->setText(tr("Stale snapshot · last known orders"));
     B3Theme::markTextRole(m_stale, QStringLiteral("secondary")); m_stale->hide(); layout->addWidget(m_stale);
     m_model = new B3FlowMeshLadderModel{this};
@@ -313,6 +326,28 @@ void B3FlowMeshOrderBook::setHoverRow(const int row)
     if (row == m_hover_row) return;
     m_hover_row = row;
     m_view->viewport()->update();
+}
+
+void B3FlowMeshOrderBook::setGroupingChoices(const std::vector<flowmesh::LevelGrouping>& choices, const flowmesh::LevelGrouping& selected)
+{
+    int current{-1};
+    for (size_t i{0}; i < choices.size(); ++i) if (choices[i] == selected) current = static_cast<int>(i);
+    auto shown{choices};
+    // A choice made at another price stays selectable while it is valid.
+    if (current < 0) { shown.push_back(selected); current = static_cast<int>(shown.size()) - 1; }
+    if (shown == m_grouping_choices && m_grouping->currentIndex() == current) return;
+    const QSignalBlocker block{m_grouping};
+    m_grouping_choices = shown;
+    while (m_grouping->count() > static_cast<int>(shown.size())) m_grouping->removeItem(m_grouping->count() - 1);
+    for (size_t i{0}; i < shown.size(); ++i) {
+        const auto label{GroupingLabel(shown[i])};
+        if (static_cast<int>(i) < m_grouping->count()) {
+            if (m_grouping->itemText(static_cast<int>(i)) != label) m_grouping->setItemText(static_cast<int>(i), label);
+        } else {
+            m_grouping->addItem(label);
+        }
+    }
+    m_grouping->setCurrentIndex(current);
 }
 
 bool B3FlowMeshOrderBook::activateRow(const int row)

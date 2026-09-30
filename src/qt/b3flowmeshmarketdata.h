@@ -261,6 +261,17 @@ struct LimitBook {
     QString spread_display;
     bool operator==(const LimitBook&) const = default;
 };
+//! The order book's grouping choices: exact, then display steps m x 10^j
+//! around the magnitude k of the reference price (the best bid, else the
+//! best ask) in the displayed orientation - 1, 2 and 5 x 10^(k-4), then
+//! 10^(k-3), 10^(k-2) and 10^(k-1) - each kept only when valid for the
+//! orientation (LevelGroupingError: a whole number of canonical ticks, or
+//! an inverse scale in range). Integer digit counts only. Exact alone
+//! without verified units or a positive reference price.
+std::vector<flowmesh::LevelGrouping> BookGroupingChoices(std::optional<CAmount> best_bid, std::optional<CAmount> best_ask,
+                                                         const Units& units, bool inverse);
+//! A grouping's display step ("0.01"), or "Exact".
+QString GroupingLabel(const flowmesh::LevelGrouping& grouping);
 //! Only exact MakeLimitBidCurve / MakeLimitAskCurve shapes are projected.
 //! Invalid curves and overflowing entire price groups are omitted fail-closed;
 //! general curves remain in Aggregate(), not misrepresented as limit orders.
