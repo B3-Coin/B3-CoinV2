@@ -699,12 +699,20 @@ BOOST_AUTO_TEST_CASE(rejected_ingress_is_retained_and_retried_once_per_admission
         BOOST_CHECK(!waiting.peers[0].last_ingress_retry.empty());
         BOOST_CHECK_EQUAL(waiting.ingress_discarded_messages, 0U);
         sink.Admit(Kind::PROPOSAL, Result::ACCEPTED);
-        BOOST_REQUIRE(Wait([&] { return sink.Messages().size() == 2 && server.Snapshot().pending_ingress_bytes == 0; }));
+        // The sink callback and end-of-pass public snapshot are separate
+        // publications. Wait for both; the previous snapshot can already
+        // have no pending ingress while still counting only the first frame.
+        auto delivered{server.Snapshot()};
+        BOOST_REQUIRE(Wait([&] {
+            delivered = server.Snapshot();
+            return sink.Messages().size() == 2 && delivered.pending_ingress_bytes == 0 &&
+                delivered.peers.size() == 1 && delivered.peers[0].received_messages == 2;
+        }));
         const auto messages{sink.Messages()};
         BOOST_CHECK(messages[0].message == proposal); BOOST_CHECK(messages[1].message == vote);
         BOOST_CHECK_EQUAL(messages[0].peer, messages[1].peer);
-        BOOST_CHECK_EQUAL(server.Snapshot().peers[0].received_messages, 2U);
-        BOOST_CHECK_EQUAL(server.Snapshot().ingress_discarded_messages, 0U);
+        BOOST_CHECK_EQUAL(delivered.peers[0].received_messages, 2U);
+        BOOST_CHECK_EQUAL(delivered.ingress_discarded_messages, 0U);
     }
 }
 
