@@ -192,7 +192,16 @@ endpoint-reported: its prices, volumes and times are the endpoint's claims.
   after the panel was hidden, the machine slept, reads failed for longer than
   three intervals, or the endpoint changed during the read. Merging such a
   page would draw the missing intervals as "auctions without an observed
-  time" even though the source has their times. A failed candle read never fails
+  time" even though the source has their times. An EMPTY newest page of the
+  same source (a quiet market, from an endpoint that ends its newest window
+  at its own clock; this node ends it just past its newest candle, so its
+  pages are never empty while it holds one) continues the held window when
+  nothing was certified after what the window accounts for (its newest
+  auction, or the verified head it was read after); nothing is re-read,
+  however long the market stays quiet. When auctions are unaccounted (the
+  held newest interval may have grown after it was read, or they have no
+  observed time) the whole window is read, but at most once every five
+  minutes; until then the window continues and the held ticks extend it. A failed candle read never fails
   the market read, and it backs off: the next read of the same market,
   interval and source waits 2 s after the first failure, doubling to 60 s,
   until a page arrives. So a failing display read never turns live updates

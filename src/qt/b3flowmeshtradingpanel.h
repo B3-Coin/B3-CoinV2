@@ -236,11 +236,15 @@ private:
     //! The candles page the next job should read for the displayed market
     //! ({interval, limit}), or nothing: a whole window after a market,
     //! interval or source change (or when the forming candle could not be
-    //! extended from the held ticks), else the newest few intervals about
-    //! every 10 s. Only while the displayed data carries observed times.
+    //! extended from the held ticks, or once CANDLES_FULL_REFRESH_MS after
+    //! the last whole window while empty pages left auctions unaccounted),
+    //! else the newest few intervals about every 10 s. Only while the
+    //! displayed data carries observed times.
     std::optional<std::pair<flowmesh::CandleInterval, size_t>> candlesDue() const;
-    //! Applies a candles page read by a job for the displayed market.
-    void applyCandles(const B3FlowMeshMarketData::CandlePage& page, size_t limit);
+    //! Applies a candles page read by a job for the displayed market;
+    //! `read_next` is the next sequence of the verified head the job read
+    //! just before the page (nullopt: unknown).
+    void applyCandles(const B3FlowMeshMarketData::CandlePage& page, size_t limit, std::optional<uint64_t> read_next = std::nullopt);
     void requestOrderReview();
     //! The certified own curve an Edit is bound to: the selected row's
     //! canonical side at selection time, and only while its points are
@@ -598,6 +602,18 @@ private:
     bool m_candles_refetch{false};
     //! A whole window of candles, and the newest few intervals.
     static constexpr size_t CANDLES_WINDOW{300}, CANDLES_NEWEST{3};
+    //! Every auction before this sequence that has an observed time is in
+    //! m_candles: the verified head a whole window, or a page merged into
+    //! it, was read after (0: none known).
+    uint64_t m_candles_next{0};
+    //! When the last whole window was applied (on m_watch_clock).
+    std::optional<qint64> m_candles_window_at;
+    //! An empty newest page continued m_candles while auctions after its
+    //! newest one stay unaccounted (the held newest interval may have grown
+    //! after it was read, or they have no observed time): the whole window
+    //! is read again, but at most once per CANDLES_FULL_REFRESH_MS.
+    bool m_candles_unproven{false};
+    static constexpr qint64 CANDLES_FULL_REFRESH_MS{300'000};
     //! Consecutive failed candles reads of one market, interval and source:
     //! the next is not due before `retry_at` (on m_watch_clock), 2 s after
     //! the first failure and doubling to 60 s, so a failing display read

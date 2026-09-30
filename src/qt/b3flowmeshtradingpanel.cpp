@@ -1202,11 +1202,16 @@ std::optional<std::pair<flowmesh::CandleInterval, size_t>> B3FlowMeshTradingPane
     // The held ticks did not continue the window: read it again, at most
     // every 2 s.
     if (m_candles_refetch && m_candles_age.elapsed() >= 2'000) return std::pair{m_candle_interval, WINDOW};
+    // Empty newest pages left auctions unaccounted: the whole window once
+    // CANDLES_FULL_REFRESH_MS have passed since the last one.
+    if (m_candles_unproven && (!m_candles_window_at || m_watch_clock.elapsed() - *m_candles_window_at >= CANDLES_FULL_REFRESH_MS)) {
+        return std::pair{m_candle_interval, WINDOW};
+    }
     if (m_candles_age.elapsed() >= 10'000) return std::pair{m_candle_interval, NEWEST};
     return std::nullopt;
 }
 
-void B3FlowMeshTradingPanel::applyCandles(const B3FlowMeshMarketData::CandlePage& page, const size_t limit)
+void B3FlowMeshTradingPanel::applyCandles(const B3FlowMeshMarketData::CandlePage& page, const size_t limit, const std::optional<uint64_t> read_next)
 {
     if (!m_snapshot) return;
     const bool same{m_candles && m_candles_market == m_snapshot->market && m_candles->interval == page.interval &&
@@ -1230,6 +1235,33 @@ void B3FlowMeshTradingPanel::applyCandles(const B3FlowMeshMarketData::CandlePage
                    page.candles.front().first_sequence == held.back().last_sequence + 1;
         };
         if (!reaches()) {
+            // An empty page of the same source: no auction with an observed
+            // time in its intervals. A quiet market (an endpoint that ends
+            // its newest window at its own clock serves such pages once no
+            // auction happened for three intervals) has nothing to read
+            // again: when nothing was certified after what the held window
+            // accounts for, up to the verified head this read followed (a
+            // newer head only makes this less likely), the window is
+            // current and continues. Otherwise auctions are unaccounted
+            // (the held newest interval may have grown after it was read,
+            // or they have no observed time): the whole window is read, at
+            // most once per CANDLES_FULL_REFRESH_MS, and continues until
+            // then.
+            if (same && page.candles.empty()) {
+                const auto& held{m_candles->candles};
+                const uint64_t accounted{std::max(m_candles_next, held.empty() || held.back().last_sequence == std::numeric_limits<uint64_t>::max()
+                                                                      ? uint64_t{0} : held.back().last_sequence + 1)};
+                const bool quiet{m_snapshot->next_sequence <= accounted};
+                const bool recent{m_candles_window_at && m_watch_clock.elapsed() - *m_candles_window_at < CANDLES_FULL_REFRESH_MS};
+                if (quiet || recent) {
+                    // Complete up to the page's end only when proven so.
+                    if (quiet) m_candles->before_ms = std::max(m_candles->before_ms, page.before_ms);
+                    m_candles_unproven |= !quiet;
+                    m_candles_age.start();
+                    m_candles_failure.reset();
+                    return;
+                }
+            }
             m_candles_age.invalidate();
             m_candles_failure.reset();
             return;
@@ -1239,8 +1271,12 @@ void B3FlowMeshTradingPanel::applyCandles(const B3FlowMeshMarketData::CandlePage
         merged.candles.insert(merged.candles.end(), page.candles.begin(), page.candles.end());
         merged.before_ms = std::max(merged.before_ms, page.before_ms);
         m_candles = std::move(merged);
+        if (read_next) m_candles_next = std::max(m_candles_next, *read_next);
     } else {
         m_candles = page;
+        m_candles_next = page.available && read_next ? *read_next : 0;
+        m_candles_unproven = false;
+        if (limit >= CANDLES_WINDOW) m_candles_window_at = m_watch_clock.elapsed();
     }
     m_candles_market = m_snapshot->market;
     m_candles_age.start();
@@ -2396,13 +2432,17 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
             SetChoices(m_effect, choices, previous_effect, true);
         }
         const auto selected_now{market()};
+        // The verified head this job read before its candles page.
+        const std::optional<uint64_t> read_next{result->snapshot && result->snapshot->market == result->views_market
+                                                    ? std::optional{result->snapshot->next_sequence} : std::nullopt};
         if (result->snapshot && selected_now && result->snapshot->market == selected_now->id) {
-            // Moved, not copied: nothing reads the job's snapshot afterwards.
+            // Moved, not copied: nothing reads the job's snapshot afterwards
+            // (but read_next, taken above).
             applySelectedSnapshot(std::move(*result->snapshot), result->snapshot_age, result->basis_head);
         } else if (!selected_now || !m_snapshot || selected_now->id != m_snapshot->market) { m_snapshot.reset(); m_response_age.invalidate(); m_queue_age.invalidate(); updateDataViews(); }
         if (result->candles && selected_now && m_snapshot && m_snapshot->market == selected_now->id && result->views_market == selected_now->id &&
             result->candles->interval == m_candle_interval) {
-            applyCandles(*result->candles, result->candles_limit);
+            applyCandles(*result->candles, result->candles_limit, read_next);
             updateDataViews();
         } else if (!result->candles_error.isEmpty() && result->candles_interval && selected_now && m_snapshot && m_snapshot->market == selected_now->id &&
                    result->views_market == selected_now->id && *result->candles_interval == m_candle_interval) {

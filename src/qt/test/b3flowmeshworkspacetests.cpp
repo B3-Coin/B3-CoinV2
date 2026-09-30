@@ -3092,6 +3092,76 @@ private Q_SLOTS:
         QCOMPARE(panel.m_candles->source, QStringLiteral("https://operator.invalid:18443"));
         QVERIFY(panel.candlesDue()); QCOMPARE(panel.candlesDue()->second, size_t{300});
     }
+    void aQuietMarketsEmptyNewestPageContinuesTheHeldWindow()
+    {
+        // Review of 2026-09-30 (UI round, should-fix 2): once a market had no
+        // auction for three intervals, an endpoint that ends its newest
+        // window at its own clock serves an empty page. It did not continue
+        // the held window, so the whole 300-interval window was read again
+        // every 10 s, indefinitely. Nothing to read on a quiet market; the
+        // whole window at most every five minutes while auctions are
+        // unaccounted.
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteDataWithTimes()));
+        panel.m_candle_interval = flowmesh::CandleInterval::M1;
+        const auto minute = [](int m, uint64_t first, uint64_t last) {
+            return CandleJson(OBSERVED_T0 + m * 60'000, first, last, 1000, 1000, 1000, 1000, 250'000);
+        };
+        const auto page = [](int64_t before_minute, int64_t span, const std::vector<UniValue>& candles) {
+            return ParseCandles(CandlesJson("1m", 60'000, OBSERVED_T0 + before_minute * 60'000, span, candles), flowmesh::CandleInterval::M1);
+        };
+        const auto window_due = [&] { return panel.candlesDue() && panel.candlesDue()->second == B3FlowMeshTradingPanel::CANDLES_WINDOW; };
+        // A held window: minutes 0 and 1 (auctions 1 and 2), read after the
+        // verified head whose next sequence is 3.
+        panel.m_snapshot->next_sequence = 3;
+        panel.applyCandles(page(2, 300, {minute(0, 1, 1), minute(1, 2, 2)}), 300, 3);
+        QVERIFY(!panel.candlesDue());
+        // Minutes 7-9 hold no auction: continued, nothing merged or re-read.
+        panel.applyCandles(page(10, 3, {}), 3, 3);
+        QVERIFY(!panel.candlesDue());
+        QCOMPARE(panel.m_candles->candles.size(), size_t{2});
+        QCOMPARE(panel.m_candles->before_ms, OBSERVED_T0 + 10 * 60'000);
+        QVERIFY(!panel.m_candles_unproven);
+        // However long it stays quiet: never the whole window again.
+        panel.m_candles_window_at = panel.m_watch_clock.elapsed() - B3FlowMeshTradingPanel::CANDLES_FULL_REFRESH_MS - 1;
+        panel.applyCandles(page(16, 3, {}), 3, 3);
+        QVERIFY(!panel.candlesDue());
+        // A page whose job head is unknown changes nothing.
+        panel.applyCandles(page(17, 3, {}), 3);
+        QVERIFY(!panel.candlesDue());
+        // Auctions 3 and 4 were certified, but an empty page does not show
+        // them (the held newest minute may have grown after it was read, or
+        // they have no observed time). A whole window was read under five
+        // minutes ago: continued until five minutes have passed.
+        panel.m_snapshot->next_sequence = 5;
+        panel.m_candles_window_at = panel.m_watch_clock.elapsed();
+        panel.applyCandles(page(18, 3, {}), 3, 5);
+        QCOMPARE(panel.m_candles->candles.size(), size_t{2});
+        QVERIFY(panel.m_candles_unproven);
+        QVERIFY(!panel.candlesDue());
+        // Unproven, the page's end is not taken as complete.
+        QCOMPARE(panel.m_candles->before_ms, OBSERVED_T0 + 17 * 60'000);
+        panel.m_candles_window_at = panel.m_watch_clock.elapsed() - B3FlowMeshTradingPanel::CANDLES_FULL_REFRESH_MS;
+        QVERIFY(window_due());
+        // That whole window accounts for them: quiet again.
+        panel.applyCandles(page(19, 300, {minute(0, 1, 1), minute(1, 2, 2), minute(2, 3, 4)}), 300, 5);
+        QVERIFY(!panel.m_candles_unproven); QCOMPARE(panel.m_candles_next, uint64_t{5});
+        QVERIFY(!panel.candlesDue());
+        panel.applyCandles(page(20, 3, {}), 3, 5);
+        QVERIFY(!panel.candlesDue());
+        // Unaccounted auctions after five minutes without a whole window:
+        // it is read at once.
+        panel.m_snapshot->next_sequence = 7;
+        panel.m_candles_window_at = panel.m_watch_clock.elapsed() - B3FlowMeshTradingPanel::CANDLES_FULL_REFRESH_MS;
+        panel.applyCandles(page(21, 3, {}), 3, 7);
+        QVERIFY(window_due());
+        // An empty page from another source never continues the window.
+        panel.m_snapshot->next_sequence = 3;
+        panel.applyCandles(page(2, 300, {minute(0, 1, 1), minute(1, 2, 2)}), 300, 3);
+        QVERIFY(!panel.candlesDue());
+        panel.applyCandles(ParseCandles(CandlesJson("1m", 60'000, OBSERVED_T0 + 10 * 60'000, 3, {}, "https://other.invalid:18443"),
+                                        flowmesh::CandleInterval::M1), 3, 3);
+        QVERIFY(window_due());
+    }
     void timeCandlesContinueTheServedPageWithHeldTicksOnce()
     {
         B3FlowMeshTradingPanel panel;
