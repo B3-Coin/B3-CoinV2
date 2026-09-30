@@ -490,8 +490,9 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
                 out.push_back(std::move(row));
             }
         };
-        build(inverse ? levels->bids : levels->asks, !inverse, m_asks);
-        build(inverse ? levels->asks : levels->bids, inverse, m_bids);
+        // `bid` names the canonical side: the B3 view's asks are canonical bids.
+        build(inverse ? levels->bids : levels->asks, /*bid=*/inverse, m_asks);
+        build(inverse ? levels->asks : levels->bids, /*bid=*/!inverse, m_bids);
         notes << tr("All %n standing order(s) · uniform-price auction", nullptr, static_cast<int>(levels->total_curves));
         if (!grouping.exact) notes << tr("Grouped by %1 %2").arg(ScaledDecimal(grouping.mantissa, grouping.exponent), price_units);
         for (const auto* side : {&levels->bids, &levels->asks}) {

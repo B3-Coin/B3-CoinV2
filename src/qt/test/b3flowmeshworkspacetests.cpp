@@ -1317,6 +1317,36 @@ private Q_SLOTS:
         auto* stale{book.findChild<QLabel*>(QStringLiteral("flowMeshBookStale"))}; QVERIFY(stale); QVERIFY(!stale->isHidden());
         QCOMPARE(levels(), size_t{2}); // Retained, not silently emptied.
     }
+    void groupedBookLevelsAreLabelledWithAnEdgeEveryOrderAccepts()
+    {
+        B3FlowMeshOrderBook book; book.resize(420, 400); book.show(); QCoreApplication::processEvents();
+        // Bids 1000, 998, ... and asks 1010, 1012, ... in 0.01 B3 (10-tick)
+        // buckets: a buy labelled with its lower edge, a sell with its upper.
+        const auto grouping{Grouping(false, 1, -2, 6)};
+        book.setSnapshot(WithLevels(SyntheticLimitBook(8), grouping), false, grouping);
+        QVERIFY(book.showsVerifiedLevels());
+        const auto* model{book.model()};
+        const int spread{model->spreadRow()};
+        QCOMPARE(model->row(spread - 1).price, QStringLiteral("1.01"));  // asks 1001-1010: 1010
+        QCOMPARE(model->row(spread - 2).price, QStringLiteral("1.02"));  // 1011-1020
+        QCOMPARE(model->row(spread + 1).price, QStringLiteral("1"));     // bids 1000-1009: 1000
+        QCOMPARE(model->row(spread + 2).price, QStringLiteral("0.99"));  // 990-999
+        QVERIFY(model->row(spread - 1).tooltip.startsWith(QStringLiteral("Sell 1.01 B3 / tUSD")));
+        QVERIFY(model->row(spread + 1).tooltip.startsWith(QStringLiteral("Buy 1 B3 / tUSD")));
+        QCOMPARE(model->row(spread - 1).click_price, QStringLiteral("1.01"));
+        QCOMPARE(model->row(spread + 2).click_price, QStringLiteral("0.99"));
+        // The B3 view: a canonical bid is a displayed sell, labelled with the
+        // upper token-per-B3 edge; its exact price is its lowest canonical one.
+        const auto inverse{Grouping(true, 1, -4, 6)}; // 0.0001 token per B3
+        book.setSnapshot(WithLevels(SyntheticLimitBook(8), inverse), true, inverse);
+        QVERIFY(book.showsVerifiedLevels());
+        QVERIFY(model->row(spread - 1).tooltip.startsWith(QStringLiteral("Sell ")));
+        QCOMPARE(model->row(spread - 1).price, QStringLiteral("1"));      // 1000 atoms: exactly 1 token per B3
+        QCOMPARE(model->row(spread - 1).click_price, ExactInversePrice(1000, 6));
+        QVERIFY(model->row(spread + 1).tooltip.startsWith(QStringLiteral("Buy ")));
+        QCOMPARE(model->row(spread + 1).price, QStringLiteral("0.99"));   // 1010 atoms: 1000/1010 floored to the step
+        QCOMPARE(model->row(spread + 1).click_price, ExactInversePrice(1010, 6));
+    }
     void orderBookSpreadRowIsExactCrossedOrOneSided()
     {
         B3FlowMeshOrderBook book; book.resize(420, 400); book.show(); QCoreApplication::processEvents();
