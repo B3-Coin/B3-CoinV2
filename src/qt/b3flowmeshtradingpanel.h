@@ -447,6 +447,11 @@ private:
         *m_quantity_label{nullptr}, *m_price_label{nullptr}, *m_ticket_total{nullptr}, *m_ticket_fee{nullptr}, *m_ticket_available{nullptr}, *m_grid_note{nullptr},
         *m_history_note{nullptr}, *m_own_note{nullptr}, *m_identity_detail{nullptr};
     B3FlowMeshChart* m_chart{nullptr};
+    //! Observed-time intervals (1m…1d) while the displayed data carries
+    //! times, else auction-order buckets (every 1, 5 or 20 auctions).
+    QComboBox* m_candle_interval_combo{nullptr};
+    //! Rebuilds the interval choices for the mode the data allows.
+    void updateIntervalChoices(bool time);
     //! Clearing ticks held for m_ticks_market (see MergeHeldTicks); display only.
     std::deque<B3FlowMeshMarketData::Tick> m_ticks;
     QString m_ticks_market;
@@ -459,7 +464,7 @@ private:
     //! source served them (never recomputed here), and when they were read.
     std::optional<B3FlowMeshMarketData::CandlePage> m_candles;
     QString m_candles_market;
-    flowmesh::CandleInterval m_candle_interval{flowmesh::CandleInterval::M1};
+    flowmesh::CandleInterval m_candle_interval{flowmesh::CandleInterval::M5};
     QElapsedTimer m_candles_age;
     //! The forming candle could not be extended from the held ticks.
     bool m_candles_refetch{false};

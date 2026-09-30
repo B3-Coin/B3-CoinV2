@@ -447,6 +447,23 @@ bool MergeHeldTicks(std::deque<Tick>& held, const TickPage& page)
     return kept;
 }
 
+std::optional<flowmesh::ClearingTick> ToClearingTick(const Tick& tick)
+{
+    const auto hash{uint256::FromHex(tick.hash.toStdString())};
+    if (!hash) return std::nullopt;
+    flowmesh::ClearingTick out;
+    out.sequence = tick.sequence;
+    out.microblock_hash = *hash;
+    out.kind = tick.kind == QStringLiteral("handoff") ? flowmesh::ClearingTick::Kind::HANDOFF
+             : tick.kind == QStringLiteral("settlement") ? flowmesh::ClearingTick::Kind::SETTLEMENT
+                                                         : flowmesh::ClearingTick::Kind::EXECUTION;
+    out.cleared = tick.cleared;
+    out.price = tick.price;
+    out.volume = tick.volume;
+    out.imbalance = tick.imbalance;
+    return out;
+}
+
 std::vector<Trade> TicksAsTrades(const std::deque<Tick>& held)
 {
     std::vector<Trade> out;

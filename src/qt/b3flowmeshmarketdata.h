@@ -175,6 +175,9 @@ struct Snapshot {
 //! ticks were replaced (or the page was unavailable).
 inline constexpr size_t MAX_HELD_TICKS{256};
 bool MergeHeldTicks(std::deque<Tick>& held, const TickPage& page);
+//! A held tick as the engine's clearing tick (for the shared observed-time
+//! bucketing); nullopt for a malformed hash.
+std::optional<flowmesh::ClearingTick> ToClearingTick(const Tick& tick);
 //! The held ticks as the chart's trades: cleared ticks with their exact
 //! notional (price x volume; fees are not part of a tick), others as clearings
 //! without a match.

@@ -3,6 +3,7 @@
 #include <qt/b3flowmeshtradingpanel.h>
 #include <qt/b3flowmeshchart.h>
 #include <qt/b3theme.h>
+#include <flowmesh/observed_time.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <node/flowmesh_client_work.h>
@@ -170,10 +171,8 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     auto* chart_card{new QWidget{center}}; B3Theme::markCard(chart_card); auto* chart_layout{new QVBoxLayout{chart_card}};
     auto* chart_modes{new QHBoxLayout}; auto* modes{new QButtonGroup{chart_card}};
     auto* candle_interval{new QComboBox{chart_card}}; candle_interval->setObjectName(QStringLiteral("flowMeshCandleInterval"));
-    candle_interval->setAccessibleName(tr("Microblocks per candlestick"));
-    for (const int count : {1, 5, 20}) candle_interval->addItem(tr("%1 microblock(s)").arg(count), count);
-    candle_interval->setCurrentIndex(1);
-    candle_interval->setToolTip(tr("Candles group actual clearings by microblock sequence. These intervals are not minutes; no signed trade timestamp is available."));
+    m_candle_interval_combo = candle_interval;
+    updateIntervalChoices(false);
     for (const auto& mode : {std::pair{tr("Candles"), B3FlowMeshChart::Mode::Prices}, std::pair{tr("Depth"), B3FlowMeshChart::Mode::Liquidity}}) {
         auto* button{new QPushButton{mode.first, chart_card}}; button->setCheckable(true); button->setChecked(mode.second == B3FlowMeshChart::Mode::Prices); button->setProperty("b3variant", QStringLiteral("timeframe")); modes->addButton(button); chart_modes->addWidget(button);
         button->setObjectName(mode.second == B3FlowMeshChart::Mode::Prices ? QStringLiteral("flowMeshChartPrices") : QStringLiteral("flowMeshChartLiquidity"));
@@ -184,8 +183,20 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_clearing_strip->setAccessibleName(tr("Latest auction")); B3Theme::markTextRole(m_clearing_strip, QStringLiteral("secondary"));
     m_clearing_strip->setToolTip(ClearingStripTip());
     m_clearing_strip->hide(); chart_layout->addWidget(m_clearing_strip);
-    connect(candle_interval, &QComboBox::currentIndexChanged, this, [this, candle_interval] { m_chart->setCandleInterval(candle_interval->currentData().toULongLong()); });
-    m_chart->setToolTip(tr("Candles show open, high, low and close from actual clearings, grouped by microblock sequence. Hover to inspect a candle and its volume. Idle intervals are not filled in. Depth lines show evaluated demand and supply, not historical trades."));
+    connect(candle_interval, &QComboBox::currentIndexChanged, this, [this, candle_interval] {
+        const auto identity{candle_interval->currentData(Qt::UserRole + 1).toString()};
+        if (identity.startsWith(QLatin1Char('t'))) {
+            const auto interval{flowmesh::ParseCandleInterval(identity.mid(1).toStdString())};
+            if (!interval || *interval == m_candle_interval) return;
+            m_candle_interval = *interval;
+            // Another interval is another window: read it at once.
+            updateDataViews();
+            refresh();
+        } else {
+            m_chart->setCandleInterval(candle_interval->currentData().toULongLong());
+        }
+    });
+    m_chart->setToolTip(tr("Candles show open, high, low and close from actual clearings. Hover to inspect a candle and its volume; scroll to zoom, drag to pan and double-click for the latest. Periods without an observed auction are not filled in. Depth lines show evaluated demand and supply, not historical trades."));
     const auto table = [](QWidget* parent, const QStringList& headers, const char* name) {
         auto* view{new QTableWidget{parent}}; view->setObjectName(QLatin1String(name)); view->setColumnCount(headers.size()); view->setHorizontalHeaderLabels(headers); view->verticalHeader()->hide(); view->setShowGrid(false); view->setAlternatingRowColors(false); view->setEditTriggers(QAbstractItemView::NoEditTriggers); view->setSelectionMode(QAbstractItemView::NoSelection); view->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); view->verticalHeader()->setDefaultSectionSize(26); view->setMinimumWidth(200); return view;
     };
@@ -511,6 +522,45 @@ void B3FlowMeshTradingPanel::updateDataViews()
         chart_snapshot->history_page_partial = false; chart_snapshot->history_truncated = m_ticks.front().sequence > 0;
     }
     m_chart->setInverted(inverse); m_chart->setSnapshot(chart_snapshot); m_chart->setLoading(m_loading);
+    {
+        // Candles in operator-observed time: the source's page, continued
+        // with the held ticks' own times by the node's bucketing.
+        B3FlowMeshChart::TimeSeries series;
+        series.interval = m_candle_interval;
+        if (matched && m_snapshot->observed) {
+            const auto& observed{*m_snapshot->observed};
+            series.available = observed.available;
+            series.source = observed.source;
+            series.remote = m_snapshot->remote;
+            if (!observed.available) series.reason = observed.reason;
+            const bool held{m_candles && m_candles_market == m_snapshot->market && m_candles->interval == m_candle_interval &&
+                            m_candles->source == observed.source};
+            if (observed.available && !held) {
+                series.loading = true;
+            } else if (observed.available && !m_candles->available) {
+                series.reason = m_candles->reason;
+            } else if (observed.available) {
+                std::vector<std::pair<flowmesh::ObservedStamp, flowmesh::ClearingTick>> newer;
+                const uint64_t served{m_candles->candles.empty() ? 0 : m_candles->candles.back().last_sequence};
+                if (!m_candles->candles.empty() && m_ticks_market == m_snapshot->market) {
+                    for (const auto& tick : m_ticks) {
+                        if (tick.sequence <= served) continue;
+                        const auto stamp{m_tick_times.find(tick.sequence)};
+                        const auto clearing{ToClearingTick(tick)};
+                        // A tick without its time yet: the next page brings it.
+                        if (stamp == m_tick_times.end() || !clearing) break;
+                        newer.emplace_back(stamp->second, *clearing);
+                    }
+                }
+                bool incomplete{false};
+                series.candles = flowmesh::ExtendObservedCandles(m_candles->candles, m_candle_interval, newer, &incomplete);
+                if (incomplete) m_candles_refetch = true;
+            }
+        }
+        updateIntervalChoices(series.available);
+        m_chart->setTimeSeries(std::move(series));
+        m_chart->setNowMs(QDateTime::currentMSecsSinceEpoch());
+    }
     QString strip, strip_exact;
     if (ticks_current) {
         const auto last_match{std::find_if(m_ticks.rbegin(), m_ticks.rend(), [](const auto& tick) { return tick.cleared; })};
@@ -647,7 +697,9 @@ void B3FlowMeshTradingPanel::updateDataViews()
     if (m_last_price->toolTip() != last_price_tip) m_last_price->setToolTip(last_price_tip);
     m_history_note->setText(history_note); m_history_note->setToolTip(history_tooltip);
     m_chart->setToolTip((reported ? tr("Endpoint-reported price and fill history; execution results are not independently verified.") : tr("Locally verified execution history.")) +
-        tr("\nCandles show open, high, low and close by microblock sequence, not elapsed time. Hover to inspect prices and summed trade volume. Unfilled sequence intervals remain gaps; the first and latest candle may contain only part of their interval. Depth shows current orders separately."));
+        (m_chart->timeMode()
+             ? tr("\nCandles are UTC intervals of operator-observed time: when the serving node applied each certified auction, by its own clock, never certified execution time. Dotted stretches are proven to hold no auction; hatched ones hold auctions without an observed time. Scroll to zoom, drag to pan, double-click for the latest. Depth shows current orders separately.")
+             : tr("\nThis server does not report times: candles show open, high, low and close in auction order, not elapsed time. Unfilled intervals remain gaps; the first and latest candle may contain only part of their interval. Depth shows current orders separately.")));
     m_history_view->setToolTip(m_history_note->toolTip());
 }
 
@@ -766,6 +818,31 @@ std::optional<uint64_t> B3FlowMeshTradingPanel::ticksAfter(const QString& market
     return m_ticks.back().sequence;
 }
 
+void B3FlowMeshTradingPanel::updateIntervalChoices(const bool time)
+{
+    auto* combo{m_candle_interval_combo};
+    if (!combo) return;
+    const bool shows_time{combo->count() > 0 && combo->itemData(0, Qt::UserRole + 1).toString().startsWith(QLatin1Char('t'))};
+    if (combo->count() > 0 && shows_time == time) return;
+    std::vector<Choice> choices;
+    QString selected;
+    if (time) {
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            const QString name{QString::fromLatin1(flowmesh::CandleIntervalName(interval))};
+            choices.push_back({name, static_cast<int>(interval), QLatin1Char('t') + name});
+        }
+        selected = QLatin1Char('t') + QString::fromLatin1(flowmesh::CandleIntervalName(m_candle_interval));
+        combo->setAccessibleName(tr("Candle interval (UTC)"));
+        combo->setToolTip(tr("UTC candles in operator-observed time: when the serving node applied each certified auction, by its own clock. Not certified execution time; auctions it applied late are shown only within their bounds."));
+    } else {
+        for (const int count : {1, 5, 20}) choices.push_back({B3FlowMeshChart::AuctionOrderLabel(count), count, QStringLiteral("s%1").arg(count)});
+        selected = QStringLiteral("s%1").arg(m_chart ? m_chart->candleInterval() : 5);
+        combo->setAccessibleName(tr("Auctions per candlestick"));
+        combo->setToolTip(tr("This server does not report times: candles group actual clearings in auction order. These are not minutes."));
+    }
+    SetChoices(combo, choices, selected, true);
+}
+
 void B3FlowMeshTradingPanel::mergeHeldTicks()
 {
     if (!m_snapshot) return;
@@ -793,9 +870,12 @@ std::optional<std::pair<flowmesh::CandleInterval, size_t>> B3FlowMeshTradingPane
     if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->observed || !m_snapshot->observed->available) return std::nullopt;
     constexpr size_t WINDOW{300}, NEWEST{3};
     if (!m_candles || m_candles_market != m_snapshot->market || m_candles->interval != m_candle_interval ||
-        m_candles->source != m_snapshot->observed->source || !m_candles_age.isValid() || m_candles_refetch) {
+        m_candles->source != m_snapshot->observed->source || !m_candles_age.isValid()) {
         return std::pair{m_candle_interval, WINDOW};
     }
+    // The held ticks did not continue the window: read it again, at most
+    // every 2 s.
+    if (m_candles_refetch && m_candles_age.elapsed() >= 2'000) return std::pair{m_candle_interval, WINDOW};
     if (m_candles_age.elapsed() >= 10'000) return std::pair{m_candle_interval, NEWEST};
     return std::nullopt;
 }

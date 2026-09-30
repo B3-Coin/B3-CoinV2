@@ -673,6 +673,50 @@ class B3FlowMeshWorkspaceTests : public QObject
         panel.m_price->setText(QStringLiteral("1.009")); panel.m_quantity->setText(QStringLiteral("0.25")); panel.updateDataViews(); panel.updateMarketText(); panel.show(); QCoreApplication::processEvents();
     }
 
+    //! A synthetic observed-time market for the visual QA export: ninety
+    //! minutes of 1m candles served by the node (a quiet stretch, a hatched
+    //! gap of late auctions and a restart seam), held ticks with their times
+    //! and the newest minute continued from them.
+    void ShowSyntheticTimeChart(B3FlowMeshTradingPanel& panel)
+    {
+        const int64_t start{OBSERVED_T0 - 90 * 60'000};
+        UniValue candles{UniValue::VARR};
+        uint64_t sequence{1000};
+        CAmount price{1'000};
+        std::vector<UniValue> rows;
+        for (int minute{0}; minute < 90; ++minute) {
+            if (minute >= 20 && minute < 26) continue; // quiet: no auction existed
+            if (minute == 40) { sequence += 7; continue; } // 7 auctions applied late
+            const bool seam{minute == 60};
+            const uint64_t first{sequence};
+            const int entries{3 + (minute * 7) % 9};
+            CAmount open{price}, high{price}, low{price};
+            uint64_t volume{0}, quote{0};
+            for (int i{0}; i < entries; ++i) {
+                price = std::max<CAmount>(900, price + ((minute * 13 + i * 5) % 7) - 3);
+                high = std::max(high, price); low = std::min(low, price);
+                const uint64_t lot{static_cast<uint64_t>(40'000 + ((minute + i) % 5) * 15'000)};
+                volume += lot; quote += lot * static_cast<uint64_t>(price);
+                ++sequence;
+            }
+            UniValue c{CandleJson(start + minute * 60'000, first, sequence - 1, open, high, low, price, volume, seam ? std::vector<std::string>{"seam_before"} : std::vector<std::string>{})};
+            c.pushKV("quote_volume", std::to_string(quote));
+            candles.push_back(c);
+        }
+        auto page{CandlesJson("1m", 60'000, OBSERVED_T0, 90, {}, "this_node", false)};
+        page.pushKV("candles", candles);
+        auto data{Data()};
+        data.pushKV("clearing_ticks", TickPageJson({TickJson(sequence, H(4), true, "bid")}, false));
+        UniValue snapshot{data["snapshot"]}; snapshot.pushKV("next_microblock_sequence", sequence + 1); data.pushKV("snapshot", snapshot);
+        data.pushKV("observed_time", ObservedJson({StampJson(sequence, H(4), "live", OBSERVED_T0 + 20'000)}, "this_node"));
+        auto s{Parse(data)};
+        panel.m_candle_interval = flowmesh::CandleInterval::M1;
+        Observe(panel, s, true);
+        panel.mergeHeldTicks();
+        panel.applyCandles(ParseCandles(page, flowmesh::CandleInterval::M1), 300);
+        panel.updateDataViews();
+        panel.m_chart->setNowMs(OBSERVED_T0 + 30'000);
+    }
 private Q_SLOTS:
     void initTestCase()
     {
@@ -1929,6 +1973,7 @@ private Q_SLOTS:
         probe.candles_response = CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 300,
             {CandleJson(OBSERVED_T0, 1, 1, 1000, 1000, 1000, 1000, 250'000), CandleJson(OBSERVED_T0 + 60'000, 2, 2, 1000, 1000, 1000, 1000, 250'000)});
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_candle_interval = flowmesh::CandleInterval::M1;
         panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
         QCOMPARE(probe.market_options.size(), size_t{1});
         QVERIFY(probe.market_options[0]["observed_time"].isTrue());
@@ -1954,8 +1999,11 @@ private Q_SLOTS:
         QCOMPARE(panel.m_candles->candles[0].first_sequence, uint64_t{1});
         QCOMPARE(panel.m_candles->candles[1].high, CAmount{1004});
         QCOMPARE(panel.m_candles->before_ms, OBSERVED_T0 + 180'000);
-        // The forming candle that the held ticks could not extend is fetched again.
+        // A window the held ticks could not continue is read again, at
+        // most every 2 s.
         panel.m_candles_refetch = true;
+        QVERIFY(!panel.candlesDue());
+        QTest::qWait(2050);
         QVERIFY(panel.candlesDue()); QCOMPARE(panel.candlesDue()->second, size_t{300});
         panel.m_candles_refetch = false;
         // Another interval (or source) is a whole window again.
@@ -1967,6 +2015,104 @@ private Q_SLOTS:
         panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
         QVERIFY(!panel.m_read_failed);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void timeCandlesContinueTheServedPageWithHeldTicksOnce()
+    {
+        B3FlowMeshTradingPanel panel;
+        auto s{Parse(RemoteDataWithTimes())};
+        panel.m_candle_interval = flowmesh::CandleInterval::M1;
+        Observe(panel, s);
+        panel.mergeHeldTicks();
+        // Before candles arrive the chart says so; it is already in time.
+        panel.updateDataViews();
+        QVERIFY(panel.m_chart->timeMode()); QVERIFY(panel.m_chart->timeSeries().loading);
+        auto* combo{panel.findChild<QComboBox*>(QStringLiteral("flowMeshCandleInterval"))};
+        QVERIFY(combo); QCOMPARE(combo->count(), 6); QCOMPARE(combo->currentText(), QStringLiteral("1m"));
+        // The node served tick 1 in the first minute; tick 2 (61 s) is held
+        // with its time and continues the page in the next minute.
+        panel.m_snapshot = s; panel.m_candles_market = s.market;
+        panel.applyCandles(ParseCandles(CandlesJson("1m", 60'000, OBSERVED_T0 + 60'000, 300,
+            {CandleJson(OBSERVED_T0, 1, 1, 990, 990, 990, 990, 100'000)}), flowmesh::CandleInterval::M1), 300);
+        panel.updateDataViews();
+        const auto& series{panel.m_chart->timeSeries()};
+        QVERIFY(!series.loading); QVERIFY(series.remote);
+        QCOMPARE(series.candles.size(), size_t{2});
+        QCOMPARE(series.candles[1].open_ms, OBSERVED_T0 + 60'000);
+        QCOMPARE(series.candles[1].first_sequence, uint64_t{2}); QCOMPARE(series.candles[1].close, CAmount{1000});
+        // Nothing counted twice when the page already holds the tick.
+        panel.applyCandles(ParseCandles(CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 300,
+            {CandleJson(OBSERVED_T0, 1, 1, 990, 990, 990, 990, 100'000), CandleJson(OBSERVED_T0 + 60'000, 2, 2, 1000, 1000, 1000, 1000, 250'000)}),
+            flowmesh::CandleInterval::M1), 300);
+        panel.updateDataViews();
+        QCOMPARE(panel.m_chart->timeSeries().candles.size(), size_t{2});
+        QVERIFY(panel.m_chart->timeSeries().candles[1].base_volume == 250'000);
+        QVERIFY(!panel.m_candles_refetch);
+        // Choosing another interval asks for its window.
+        combo->setCurrentIndex(3);
+        QCOMPARE(panel.m_candle_interval, flowmesh::CandleInterval::H1);
+        QVERIFY(panel.candlesDue()); QCOMPARE(panel.candlesDue()->first, flowmesh::CandleInterval::H1);
+        QVERIFY(panel.m_chart->timeSeries().loading);
+    }
+    void olderServersKeepAuctionOrderWithANote()
+    {
+        B3FlowMeshTradingPanel panel;
+        auto v{RemoteDataWithViews()};
+        UniValue off{UniValue::VOBJ}; off.pushKV("available", false); off.pushKV("unavailable_reason", "endpoint_does_not_advertise_observed_time");
+        off.pushKV("source", "https://operator.invalid:18443"); off.pushKV("source_kind", "operator_observed"); off.pushKV("certified", false);
+        v.pushKV("observed_time", off);
+        Observe(panel, Parse(v)); panel.mergeHeldTicks(); panel.updateDataViews();
+        QVERIFY(!panel.m_chart->timeMode());
+        QCOMPARE(panel.m_chart->timeSeries().reason, QStringLiteral("endpoint_does_not_advertise_observed_time"));
+        auto* combo{panel.findChild<QComboBox*>(QStringLiteral("flowMeshCandleInterval"))};
+        QVERIFY(combo); QCOMPARE(combo->count(), 3); QCOMPARE(combo->currentText(), QStringLiteral("Every 5 auctions"));
+        QVERIFY(combo->toolTip().contains(QStringLiteral("does not report times")));
+        QVERIFY(!panel.candlesDue());
+        QVERIFY(panel.m_chart->toolTip().contains(QStringLiteral("does not report times")));
+        // Once the server reports times, the chart and its choices switch.
+        panel.m_snapshot = Parse(RemoteDataWithTimes()); panel.mergeHeldTicks(); panel.updateDataViews();
+        QVERIFY(panel.m_chart->timeMode()); QCOMPARE(combo->count(), 6);
+    }
+    void timeChartSpansAxisAndViewport()
+    {
+        using flowmesh::ObservedCandle;
+        ObservedCandle a; a.open_ms = OBSERVED_T0; a.first_sequence = 3; a.last_sequence = 5;
+        ObservedCandle b; b.open_ms = OBSERVED_T0 + 300'000; b.first_sequence = 6; b.last_sequence = 6;
+        QCOMPARE(B3FlowMeshChart::SpanBetween(a, b).first, B3FlowMeshChart::Between::QUIET);
+        b.flags = flowmesh::CANDLE_SEAM_BEFORE;
+        QCOMPARE(B3FlowMeshChart::SpanBetween(a, b).first, B3FlowMeshChart::Between::SEAM);
+        b.first_sequence = 9;
+        QCOMPARE(B3FlowMeshChart::SpanBetween(a, b), (std::pair{B3FlowMeshChart::Between::GAP, uint64_t{3}}));
+        // UTC labels per interval.
+        QCOMPARE(B3FlowMeshChart::TimeAxisLabel(OBSERVED_T0 + 5 * 60'000, flowmesh::CandleInterval::M5), QStringLiteral("12:05"));
+        QCOMPARE(B3FlowMeshChart::TimeAxisLabel(OBSERVED_T0 - 12 * 3'600'000, flowmesh::CandleInterval::H1), QStringLiteral("Sep 30"));
+        QCOMPARE(B3FlowMeshChart::TimeAxisLabel(OBSERVED_T0, flowmesh::CandleInterval::D1), QStringLiteral("Sep 30"));
+        QCOMPARE(B3FlowMeshChart::ProvenanceText(true, QStringLiteral("https://trade.example.org:18443")),
+                 QStringLiteral("Prices, volumes and times reported by trade.example.org · not verified"));
+        QVERIFY(B3FlowMeshChart::ProvenanceText(false, QStringLiteral("this_node")).contains(QStringLiteral("times observed by this node (not certified)")));
+        // Viewport: follows the newest candle, zooms, pans and resets.
+        B3FlowMeshChart chart; chart.resize(700, 400);
+        B3FlowMeshChart::TimeSeries series; series.available = true; series.source = QStringLiteral("this_node");
+        series.interval = flowmesh::CandleInterval::M1;
+        for (int i{0}; i < 200; ++i) {
+            ObservedCandle c; c.open_ms = OBSERVED_T0 + i * 60'000; c.first_sequence = c.last_sequence = static_cast<uint64_t>(i);
+            c.entries = c.clearings = 1; c.open = c.high = c.low = c.close = 1000 + i; c.base_volume = 1; c.quote_volume = 1000 + i;
+            series.candles.push_back(c);
+        }
+        chart.setTimeSeries(series); chart.setNowMs(OBSERVED_T0 + 199 * 60'000 + 30'000);
+        QVERIFY(chart.followsTail());
+        QCOMPARE(chart.timeWindow().second, OBSERVED_T0 + 199 * 60'000);
+        QCOMPARE(chart.timeWindow().second - chart.timeWindow().first, int64_t{59} * 60'000);
+        chart.zoomTime(2.0);
+        QCOMPARE(chart.timeSlots(), 30.0); QVERIFY(chart.followsTail());
+        chart.panTime(20);
+        QVERIFY(!chart.followsTail()); QCOMPARE(chart.timeWindow().second, OBSERVED_T0 + 179 * 60'000);
+        chart.panTime(-100);
+        QVERIFY(chart.followsTail());
+        chart.zoomTime(0.01); QCOMPARE(chart.timeSlots(), 500.0);
+        chart.resetTimeView(); QCOMPARE(chart.timeSlots(), 60.0); QVERIFY(chart.followsTail());
+        // Painting is bounded to the window and never throws on edges.
+        QImage image{chart.size(), QImage::Format_ARGB32}; chart.render(&image);
+        series.candles.clear(); chart.setTimeSeries(series); chart.render(&image);
     }
     void heldTicksExtendOnlyConsecutiveAgreeingPages()
     {
@@ -5467,6 +5613,15 @@ private Q_SLOTS:
         panel.m_snapshot->paused = true; panel.m_market_data[0].ready = false; panel.m_market_data[0].checkpoint_pending = true; panel.m_market_data[0].checkpoint = QString::fromStdString(H(80).GetHex()); panel.updateMarketText();
         QVERIFY(save(QStringLiteral("synthetic-flowmesh-paused.png")));
         panel.m_read_failed = true; panel.updateMarketText(); QVERIFY(save(QStringLiteral("synthetic-flowmesh-stale.png")));
+        {
+            B3FlowMeshTradingPanel timed; timed.resize(1320, 940); timed.m_timer->stop();
+            ShowSyntheticTimeChart(timed); timed.show(); QCoreApplication::processEvents();
+            QVERIFY(timed.m_chart->timeMode());
+            QImage image{timed.size(), QImage::Format_ARGB32}; image.fill(Qt::transparent); timed.render(&image);
+            QVERIFY(image.save(output.filePath(QStringLiteral("synthetic-flowmesh-time-candles.png"))));
+            QImage chart{timed.m_chart->size(), QImage::Format_ARGB32}; chart.fill(Qt::transparent); timed.m_chart->render(&chart);
+            QVERIFY(chart.save(output.filePath(QStringLiteral("synthetic-flowmesh-time-chart.png"))));
+        }
         panel.hide(); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_wallet); // Fixture cannot submit.
     }
     void cleanupTestCase()
