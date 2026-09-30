@@ -186,6 +186,47 @@ PriceText LimitSpread(CAmount bid, CAmount ask, int decimals, CAmount step, bool
     }
     return out;
 }
+enum class Rounding { DOWN, UP, NEAREST };
+//! A canonical price in the displayed orientation times 10^places, rounded
+//! in `rounding`'s direction (NEAREST: half up); `whole` tells whether
+//! nothing was rounded. nullopt for an inverse zero, invalid arguments, and
+//! B3 per token of an asset with more than nine decimals (a whole number:
+//! callers format it exactly).
+std::optional<Wide> ScaledPrice(const CAmount raw, const int decimals, const bool inverse, const int places, const Rounding rounding, bool* whole = nullptr)
+{
+    if (raw < 0 || !MoneyRange(raw) || decimals < 0 || decimals > 18 || places < 0 || places > 18) return std::nullopt;
+    std::optional<Ratio> ratio;
+    if (inverse) ratio = InverseRatio(raw, decimals);
+    else if (decimals <= 9) ratio = Ratio{Wide{static_cast<uint64_t>(raw)}, Pow10(9 - decimals)};
+    if (!ratio) return std::nullopt;
+    // Bounded: a numerator below 2^63 (or 10^9 inverted) times 10^18 fits.
+    const Wide scaled{ratio->numerator * Pow10(places)};
+    Wide units{scaled / ratio->denominator};
+    const Wide remainder{scaled % ratio->denominator};
+    if (whole) *whole = remainder == 0;
+    if (remainder != 0 && (rounding == Rounding::UP || (rounding == Rounding::NEAREST && remainder >= ratio->denominator - remainder))) ++units;
+    return units;
+}
+//! `units` x 10^-places with exactly `places` decimal places.
+QString ScaledText(const Wide units, const int places)
+{
+    QString text{WideText(units)};
+    if (places <= 0) return text;
+    text = text.rightJustified(places + 1, QLatin1Char('0'));
+    text.insert(text.size() - places, QLatin1Char('.'));
+    return text;
+}
+QString RoundedPrice(const CAmount raw, const int decimals, const bool inverse, const int places, const Rounding rounding, bool* exact)
+{
+    if (raw < 0 || !MoneyRange(raw) || decimals < 0 || decimals > 18 || places < 0 || places > 18) return {};
+    if (!inverse && decimals > 9) {
+        // A whole number of B3 per token: only zeros follow the point.
+        if (exact) *exact = true;
+        return PadDecimals(FormatPrice(raw, decimals), places);
+    }
+    const auto units{ScaledPrice(raw, decimals, inverse, places, rounding, exact)};
+    return units ? ScaledText(*units, places) : QString{};
+}
 [[noreturn]] void Fail(const char* text) { throw std::runtime_error{text}; }
 bool ValidUnits(const Units& u) { return u.known && u.decimals >= 0 && u.decimals <= 18 && u.quantity_step > 0 && u.price_step > 0; }
 std::optional<CAmount> Error(QString* error, const QString& text) { if (error) *error = text; return std::nullopt; }
@@ -715,29 +756,99 @@ QString ExactInversePrice(CAmount raw, int decimals)
 }
 QString FixedDisplayPrice(const CAmount raw, const int decimals, const bool inverse, const int places, const bool up, bool* exact)
 {
-    if (raw < 0 || !MoneyRange(raw) || decimals < 0 || decimals > 18 || places < 0 || places > 18) return {};
-    std::optional<Ratio> ratio;
-    if (inverse) {
-        ratio = InverseRatio(raw, decimals);
-    } else if (decimals <= 9) {
-        ratio = Ratio{Wide{static_cast<uint64_t>(raw)}, Pow10(9 - decimals)};
-    } else {
-        // A whole number of B3 per token: only zeros follow the point.
-        if (exact) *exact = true;
-        return PadDecimals(FormatPrice(raw, decimals), places);
+    return RoundedPrice(raw, decimals, inverse, places, up ? Rounding::UP : Rounding::DOWN, exact);
+}
+QString NearestDisplayPrice(const CAmount raw, const int decimals, const bool inverse, const int places, bool* exact)
+{
+    return RoundedPrice(raw, decimals, inverse, places, Rounding::NEAREST, exact);
+}
+std::optional<int> ViewPricePlaces(const Units& units, const bool inverse, const std::vector<CAmount>& references)
+{
+    if (!ValidUnits(units) || units.price_step > MAX_MONEY) return std::nullopt;
+    if (!inverse) {
+        // Every on-grid price is exact at the tick's places.
+        if (units.decimals > 9) return 0;
+        int places{NeededDecimals(Wide{static_cast<uint64_t>(units.price_step)}, 9 - units.decimals)};
+        for (const CAmount price : references) {
+            if (price > 0 && MoneyRange(price)) places = std::max(places, NeededDecimals(Wide{static_cast<uint64_t>(price)}, 9 - units.decimals));
+        }
+        return places;
     }
-    if (!ratio) return {};
-    // Bounded: a numerator below 2^63 (or 10^9 inverted) times 10^18 fits.
+    const CAmount step{units.price_step};
+    // The fewest places at which each reference and its neighbouring ticks
+    // have three different nearest labels, none of them zero. Checked for
+    // all references at once: labels that differ at some places can meet at
+    // more.
+    const auto resolved = [&](const int places) {
+        bool any{false};
+        for (const CAmount price : references) {
+            if (price <= 0 || !MoneyRange(price)) continue;
+            any = true;
+            const auto own{ScaledPrice(price, units.decimals, true, places, Rounding::NEAREST)};
+            if (!own || *own == 0) return false;
+            for (const CAmount neighbour : {price > step ? price - step : CAmount{0}, price <= MAX_MONEY - step ? price + step : CAmount{0}}) {
+                if (neighbour <= 0) continue;
+                const auto other{ScaledPrice(neighbour, units.decimals, true, places, Rounding::NEAREST)};
+                if (!other || *other == *own) return false;
+            }
+        }
+        return any;
+    };
+    for (int places{0}; places <= 18; ++places) {
+        if (resolved(places)) return places;
+    }
+    return std::nullopt;
+}
+PriceText ViewPrice(const CAmount raw, const Units& units, const bool inverse, const std::optional<int> places)
+{
+    if (!places || !ValidUnits(units)) return DisplayPrice(raw, units, inverse);
+    bool whole{true};
+    const QString text{NearestDisplayPrice(raw, units.decimals, inverse, *places, &whole)};
+    // An inverse zero, or a positive price too small for these places (never
+    // "≈0"): the price's own significant digits, as DisplayPrice shows it.
+    const bool zero{std::none_of(text.begin(), text.end(), [](const QChar c) { return c >= QLatin1Char('1') && c <= QLatin1Char('9'); })};
+    if (text.isEmpty() || (!whole && zero)) return DisplayPrice(raw, units, inverse);
+    PriceText out;
+    out.exact = inverse ? ExactInversePrice(raw, units.decimals) : FormatPrice(raw, units.decimals);
+    out.text = whole ? text : QStringLiteral("≈") + text;
+    out.approximate = !whole;
+    return out;
+}
+PriceText ViewSpread(const CAmount bid, const CAmount ask, const Units& units, const bool inverse, const std::optional<int> places)
+{
+    const auto exact{DisplaySpread(bid, ask, units, inverse)};
+    if (!places || !ValidUnits(units) || exact.exact.isEmpty()) return exact;
+    PriceText out;
+    out.exact = exact.exact;
+    if (!inverse) {
+        // Both prices are exact: so is their difference, at the view's places.
+        out.text = PadDecimals(FormatPrice(ask - bid, units.decimals), *places);
+        return out;
+    }
+    // The difference of the two labels beside the spread. The B3 view's
+    // higher price is the canonical best bid's.
+    bool high_whole{true}, low_whole{true};
+    const auto high{ScaledPrice(bid, units.decimals, true, *places, Rounding::NEAREST, &high_whole)};
+    const auto low{ScaledPrice(ask, units.decimals, true, *places, Rounding::NEAREST, &low_whole)};
+    // A label shown with its own digits instead (ViewPrice) is no column value.
+    if (!high || !low || *high == 0 || *low == 0 || *high < *low) return exact;
+    out.text = ScaledText(*high - *low, *places);
+    if (!high_whole || !low_whole) {
+        out.text.prepend(QStringLiteral("≈"));
+        out.approximate = true;
+    }
+    return out;
+}
+QString RoundedDecimal(const QString& text, const int places)
+{
+    if (places < 0 || places > 18 || text.contains(QLatin1Char('/'))) return {};
+    const auto ratio{PositiveRatio(text)};
+    if (!ratio || ratio->numerator > ~Wide{0} / Pow10(places)) return {};
     const Wide scaled{ratio->numerator * Pow10(places)};
     Wide units{scaled / ratio->denominator};
-    const bool whole{scaled % ratio->denominator == 0};
-    if (!whole && up) ++units;
-    if (exact) *exact = whole;
-    QString text{WideText(units)};
-    if (places == 0) return text;
-    text = text.rightJustified(places + 1, QLatin1Char('0'));
-    text.insert(text.size() - places, QLatin1Char('.'));
-    return text;
+    const Wide remainder{scaled % ratio->denominator};
+    if (remainder != 0 && remainder >= ratio->denominator - remainder) ++units;
+    return ScaledText(units, places);
 }
 QString PadDecimals(QString text, const int places)
 {

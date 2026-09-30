@@ -112,25 +112,39 @@ any of those servers already serves.
   the canonical view (every on-grid price exact, e.g. `1.000` at 0.001 B3),
   the step's places when grouped (`1.00` at 0.01, `0.9900` at 0.0001). In
   the B3 view with one level per canonical price, token-per-B3 prices do not
-  end, so each label is rounded to the fewest places at which every label,
-  and the label of each neighbouring tick, still reads back through
-  `ParseDisplayLimit` as exactly its own canonical price (for the side a
-  click on it naturally takes): the B3 view's tick precision at the prices
-  shown, even when those prices end early (1000 atoms is exactly 1, shown
-  `1.000` beside 799-801). A sell level rounds up and a buy level down: the
-  direction every order of the level accepts, as for grouped edges. "≈" is then said once, in the Price header (its tooltip
-  states the rule), never per row; each rounded level keeps its exact price
-  in its tooltip and says "about" to a screen reader. Size and Total share
-  one count: the places the held levels need. The fallback projection
-  follows the same rule. `FixedDisplayPrice`, `PadDecimals` and
-  `NeededDecimals` (qt/b3flowmeshmarketdata.h) do the formatting; display
-  only, never parsed into an action.
+  end, so the view has ONE rounding rule (`ViewPricePlaces`, second review
+  of 2026-09-30): every price of a level or an order is rounded to the
+  nearest value (half up), never by side, at the fewest places at which the
+  market's best prices and their neighbouring ticks have three different
+  values (the B3 view's tick precision at the market's price, even when a
+  best price ends early: 1000 atoms is exactly 1, shown `1.000` beside
+  799-801). The book's rows, the spread row and Your orders all use it, so a
+  price reads the same wherever it appears: the viewer's sell of B3 at 997
+  atoms is `1.003` in its row and `≈1.003 tUSD / B3` under Your orders (the
+  earlier directed rule showed it on a row labelled `1.004`). Exact levels
+  far from the market whose prices round to one value share ONE row: its
+  size is their sum, its tooltip lists each exact price, size and order
+  count, and a click offers its deepest price (the one that takes every
+  level in it). "≈" is said once, in the Price header (its tooltip states
+  the rule), never per row; each rounded level keeps its exact price in its
+  tooltip and says "about" to a screen reader. Size and Total share one
+  count: the places the rows need. The fallback projection follows the
+  same rule. `ViewPricePlaces`, `ViewPrice`, `ViewSpread`,
+  `NearestDisplayPrice`, `PadDecimals` and `NeededDecimals`
+  (qt/b3flowmeshmarketdata.h) do the formatting; display only, never parsed
+  into an action. Trade displays (last price, trade history, the trades
+  tape, the chart, the clearing strip) keep `DisplayPrice`'s significant
+  digits for now.
 - Depth bars on ONE scale shared by both sides; the viewer's own orders
   marked; tooltips with order count, grouped range, average price.
-- Spread row: `Spread <exact> · <pct>%` (200 x (ask - bid) / (ask + bid),
-  the same in both views); a crossed or locked book, legal after a pro-rata
-  auction, shows `Crossed · next auction ≈P for V (indicative)` from the
-  standing clearing.
+- Spread row: `Spread <difference> · <pct>%`. The difference is that of the
+  two prices beside it as they are shown, at the view's places (`≈0.002`
+  between `1.001` and `0.999`; `0.010` B3 between `1.010` and `1.000`),
+  "≈" when either is rounded, the exact spread in its tooltip. The share,
+  200 x (ask - bid) / (ask + bid), is exact and the same in both views. A
+  crossed or locked book, legal after a pro-rata auction, shows
+  `Crossed · next auction ≈P for V (indicative)` from the standing clearing,
+  P at the view's places.
 - Flash: a newly appearing price (not a size change) flashes 800 ms,
   staggered; "Animate order book" (context menu, default on) and the
   platform's UI effects setting turn it off. The timer runs only while a
@@ -139,18 +153,19 @@ any of those servers already serves.
   into the ticket whenever the ticket reads it back, for its side, as exactly
   the level's canonical price (the edge every order of a grouped level
   accepts): always in the canonical view, and in the B3 view whenever the
-  click takes the side the level's orders face (buy B3 at a sell level, sell
-  B3 at a buy level), because each label is rounded in that direction.
-  Otherwise the fewest places from the shown count, rounded toward the
-  ticket's side, that do; the exact form only if none does. The executable
-  limit is therefore always exactly the level's canonical price: a rounded
-  B3-view text is adjusted only in the customer's favour, the ticket shows
-  "Safely adjusted executable limit: <exact>", the review shows the exact
-  canonical limit with the entered text and the adjustment, and that exact
-  limit is what would be signed. The price is re-derived from the gates'
-  current verified data; the side is kept, the marketable limit unchecked,
-  nothing is reviewed or signed. "Set size on click" (default off, unlike
-  Hyperliquid) also sets the cumulative size within the available balance.
+  nearest value happens to lie on the side the ticket rounds toward.
+  Otherwise the fewest more places, rounded toward the ticket's side, that
+  do and still round to the label shown (buy B3 at the row `1.003`: `1.0031`,
+  never the next row's `1.004`; a grouped edge may take the same places);
+  the exact form only if none does. The executable limit is therefore always
+  exactly the level's canonical price: a rounded B3-view text is adjusted
+  only in the customer's favour, the ticket shows "Safely adjusted
+  executable limit: <exact>", the review shows the exact canonical limit
+  with the entered text and the adjustment, and that exact limit is what
+  would be signed. The price is re-derived from the gates' current verified
+  data; the side is kept, the marketable limit unchecked, nothing is
+  reviewed or signed. "Set size on click" (default off, unlike Hyperliquid)
+  also sets the cumulative size within the available balance.
 - Grouping selector: Exact, then `1, 2, 5 x 10^(k-4)` and `10^(k-3..k-1)`
   around the displayed price's magnitude `k` (integer digit counts), each
   valid for the orientation; kept per market and orientation for the

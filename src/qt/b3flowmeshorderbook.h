@@ -74,14 +74,18 @@ private:
  * below it, Price | Size | Total with Total cumulative from the best level,
  * cumulative depth bars on one scale shared by both sides, only non-empty
  * levels, the viewer's own quantity marked, and as many rows as the view's
- * height holds. Grouped levels are labelled with an edge every lot in them
- * accepts. A crossed book (legal after a pro-rata auction) says so and shows
- * the standing clearing instead of a negative spread. Without verified
- * levels the book falls back to the exact limit-shaped curves of the first
- * curve page, labelled partial. A new price flashes for FLASH_MS unless
- * animation is off. Clicking a level offers its price, as shown, to the
- * ticket, which reads it back as exactly the level's canonical price;
- * nothing is ever signed from the book. There is no price-time priority. */
+ * height holds. Prices follow the view's one rounding rule
+ * (ViewPricePlaces: to the nearest value at one count of places, never by
+ * side), which Your orders and the spread row share; exact levels whose
+ * prices round to one value share a row, each exact price in its tooltip.
+ * Grouped levels are labelled with an edge every lot in them accepts. A
+ * crossed book (legal after a pro-rata auction) says so and shows the
+ * standing clearing instead of a negative spread. Without verified levels
+ * the book falls back to the exact limit-shaped curves of the first curve
+ * page, labelled partial. A new price flashes for FLASH_MS unless animation
+ * is off. Clicking a level offers its price, as shown, to the ticket, which
+ * reads it back as exactly the level's canonical price; nothing is ever
+ * signed from the book. There is no price-time priority. */
 class B3FlowMeshOrderBook : public QWidget
 {
     Q_OBJECT
@@ -117,6 +121,10 @@ public:
     bool showsVerifiedLevels() const { return m_verified; }
     //! The orientation the rows were last shown in (B3 view: true).
     bool shownInverse() const { return m_inverse; }
+    //! The view's price places (ViewPricePlaces) the rows were last shown
+    //! with: the one rounding rule of every price of a level or an order in
+    //! this view (nullopt: none shown, or DisplayPrice's own digits).
+    const std::optional<int>& pricePlaces() const { return m_price_places; }
     //! Flash progress of a row, 0 (none) to 1 (peak), at the book's clock.
     double flashIntensity(int row) const;
     //! The row the pointer is over, or -1; the book highlights from the
@@ -168,6 +176,7 @@ private:
     QTimer* m_flash_timer;
     int m_rows_per_side{0}, m_hover_row{-1};
     bool m_verified{false}, m_inverse{false};
+    std::optional<int> m_price_places;
     //! Displayed sides, best first, and the spread row.
     std::vector<Level> m_asks, m_bids;
     QString m_spread, m_spread_tip, m_head;

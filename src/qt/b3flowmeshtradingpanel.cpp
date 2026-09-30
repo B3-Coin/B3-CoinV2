@@ -785,17 +785,20 @@ void B3FlowMeshTradingPanel::updateDataViews()
         separators = std::move(shifted);
         separators.insert(static_cast<int>(at));
     }
+    // Your orders' prices as the order book shows them: the view's one
+    // rounding rule, so an order reads the same in its row and here.
+    const auto& view_places{m_order_book->pricePlaces()};
     for (const auto& c : s.own_curves) {
         QString description;
         const auto ladder{LadderStepsOf(c)};
-        if (c.points.size() == 2 && c.points[1].price == c.points[0].price + 1) description = FormatDisplayPrice(c.side == QStringLiteral("bid") ? c.points[0].price : c.points[1].price, u, inverse) + QLatin1Char(' ') + (inverse ? price_units : QStringLiteral("B3"));
+        if (c.points.size() == 2 && c.points[1].price == c.points[0].price + 1) description = ViewPrice(c.side == QStringLiteral("bid") ? c.points[0].price : c.points[1].price, u, inverse, view_places).text + QLatin1Char(' ') + (inverse ? price_units : QStringLiteral("B3"));
         else if (ladder && ladder->size() > 1) {
             // Best first, each price with quantity left.
             auto steps{*ladder};
             const bool bid{c.side == QStringLiteral("bid")};
             std::sort(steps.begin(), steps.end(), [&](const auto& a, const auto& b) { return bid ? a.price > b.price : a.price < b.price; });
             QStringList prices;
-            for (const auto& step : steps) if (step.remaining > 0) prices << FormatDisplayPrice(step.price, u, inverse);
+            for (const auto& step : steps) if (step.remaining > 0) prices << ViewPrice(step.price, u, inverse, view_places).text;
             description = tr("Ladder · %1").arg(prices.join(QStringLiteral(" / ")));
         } else description = tr("%1-point curve").arg(c.points.size());
         const bool buy{DisplayBuy(c.side, inverse)};
@@ -1383,12 +1386,20 @@ void B3FlowMeshTradingPanel::fillFromBook(const QString& shown, const CAmount ca
         const auto limit{ParseDisplayLimit(text, units, inverse, buy)};
         return limit && limit->price == canonical;
     };
+    const auto dot{shown.indexOf(QLatin1Char('.'))};
+    const int shown_places{dot < 0 ? 0 : static_cast<int>(shown.size() - dot - 1)};
+    // A level's label is its price rounded to the nearest value (the view's
+    // one rule; grouped rows show an edge instead): more places must still
+    // round to it, so the ticket shows the price the row, Your orders and
+    // the spread show, never a neighbouring row's (1.0031 for a row shown
+    // 1.003, not 1.004).
+    const bool nearest_label{(!m_order_book->showsVerifiedLevels() || bookGrouping().exact) && RoundedDecimal(shown, shown_places) == shown};
+    const auto shows_as_label = [&](const QString& text) { return !nearest_label || RoundedDecimal(text, shown_places) == shown; };
     QString price;
     if (!shown.isEmpty() && reads_back(shown)) price = shown;
-    const auto dot{shown.indexOf(QLatin1Char('.'))};
-    for (int places{dot < 0 ? 0 : static_cast<int>(shown.size() - dot - 1)}; price.isEmpty() && places <= 18; ++places) {
+    for (int places{shown_places}; price.isEmpty() && places <= 18; ++places) {
         const auto rounded{FixedDisplayPrice(canonical, units.decimals, inverse, places, /*up=*/buy)};
-        if (!rounded.isEmpty() && reads_back(rounded)) price = rounded;
+        if (!rounded.isEmpty() && reads_back(rounded) && shows_as_label(rounded)) price = rounded;
     }
     if (price.isEmpty()) {
         const auto exact{inverse ? ExactInversePrice(canonical, units.decimals) : FormatPrice(canonical, units.decimals)};

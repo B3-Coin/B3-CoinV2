@@ -56,11 +56,36 @@ QString FormatDisplayPrice(CAmount raw_price, const Units& units, bool inverse);
 QString ExactInversePrice(CAmount raw_price, int base_decimals);
 //! A canonical price in the displayed orientation with exactly `places`
 //! decimal places (0-18, zero-padded), rounded up (`up`) or down, never to
-//! nearest, so a caller can round each label in the direction every order of
-//! its level accepts. Display only (the order book's columns of one decimal
-//! count); `exact` tells whether nothing was rounded. Empty for an inverse
-//! price of 0 (no finite token-per-B3 price) or invalid arguments.
+//! nearest: text that ParseDisplayLimit reads back for one side (a clicked
+//! level in the ticket). `exact` tells whether nothing was rounded. Empty for
+//! an inverse price of 0 (no finite token-per-B3 price) or invalid arguments.
 QString FixedDisplayPrice(CAmount raw_price, int base_decimals, bool inverse, int places, bool up, bool* exact = nullptr);
+//! As FixedDisplayPrice, rounded to the nearest value (half up) instead.
+QString NearestDisplayPrice(CAmount raw_price, int base_decimals, bool inverse, int places, bool* exact = nullptr);
+//! One view's price places: the one rounding rule of every price of a level
+//! or an order that view shows (the order book's rows, the spread beside
+//! them, your orders, a clicked level in the ticket), so the same canonical
+//! price reads the same everywhere in it. B3 per token: the market tick's
+//! places, where every on-grid price is exact. Token per B3: the fewest
+//! places at which each reference price (the market's best prices) and its
+//! neighbouring canonical ticks have three different nearest values, none of
+//! them zero: the view resolves one tick at the market's price. Prices far
+//! from it may share a value (the order book shows them as one row).
+//! nullopt without valid units or, in the B3 view, a positive reference, or
+//! when 18 places do not resolve it: callers then use DisplayPrice.
+std::optional<int> ViewPricePlaces(const Units& units, bool inverse, const std::vector<CAmount>& references);
+//! A canonical price at a view's places, rounded to nearest, never by side:
+//! as DisplayPrice, "≈" and the exact form when rounded. Without places, or
+//! for a positive price too small for them (never "≈0"), DisplayPrice.
+PriceText ViewPrice(CAmount raw_price, const Units& units, bool inverse, std::optional<int> places);
+//! The spread at a view's places: the difference of the two best prices as
+//! ViewPrice shows them (so it reads against the labels beside it), "≈"
+//! when either is rounded, with the exact spread. Without places, or when a
+//! best price has no value at them, DisplaySpread.
+PriceText ViewSpread(CAmount bid, CAmount ask, const Units& units, bool inverse, std::optional<int> places);
+//! A plain positive decimal rounded half up to exactly `places` decimal
+//! places; empty for anything else (a fraction, zero, out of range).
+QString RoundedDecimal(const QString& text, int places);
 //! `text` (an exact decimal) zero-padded to at least `places` decimal places.
 QString PadDecimals(QString text, int places);
 //! The decimal places `raw` needs at `decimals` (trailing zeros dropped).

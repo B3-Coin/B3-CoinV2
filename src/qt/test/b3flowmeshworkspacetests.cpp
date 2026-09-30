@@ -63,6 +63,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -1288,9 +1289,10 @@ private Q_SLOTS:
         const auto& shown_asks{inverse ? levels.bids.levels : levels.asks.levels};
         const auto& shown_bids{inverse ? levels.asks.levels : levels.bids.levels};
         // One decimal count for the column (the tick's, or the B3 view's
-        // rounding), a displayed sell rounded up and a buy down.
+        // rounding), every price to the nearest value, never by side.
         const int places{Places(model->row(per_side - 1).price)};
-        const auto label = [&](const BookLevel& level, bool displayed_ask) { return FixedDisplayPrice(level.low, 6, inverse, places, inverse && displayed_ask); };
+        QCOMPARE(book.pricePlaces(), std::optional<int>{places});
+        const auto label = [&](const BookLevel& level, bool) { return NearestDisplayPrice(level.low, 6, inverse, places); };
         QCOMPARE(model->row(per_side - 1).price, label(shown_asks[0], true));
         QCOMPARE(model->row(per_side + 1).price, label(shown_bids[0], false));
         QCOMPARE(model->row(0).price, label(shown_asks[static_cast<size_t>(per_side) - 1], true));
@@ -1348,7 +1350,7 @@ private Q_SLOTS:
         book.setSnapshot(WithLevels(moved, {}, H(20)), inverse);
         QVERIFY(book.flashing());
         const int new_row{inverse ? per_side - 2 : per_side + 2};
-        QCOMPARE(model->row(new_row).price, FixedDisplayPrice(999, 6, inverse, Places(model->row(new_row).price), inverse));
+        QCOMPARE(model->row(new_row).price, NearestDisplayPrice(999, 6, inverse, Places(model->row(new_row).price)));
         QTRY_VERIFY_WITH_TIMEOUT(book.flashIntensity(new_row) > 0, 1000);
         QTRY_VERIFY_WITH_TIMEOUT(!book.flashing(), 3000);
         QCOMPARE(book.flashIntensity(new_row), 0.0);
@@ -1366,6 +1368,8 @@ private Q_SLOTS:
         const auto dot{text.indexOf(QLatin1Char('.'))};
         return dot < 0 ? 0 : static_cast<int>(text.size() - dot - 1);
     }
+    //! A price text without its "≈" (the book's header carries it).
+    static QString Bare(const QString& text) { return text.startsWith(QStringLiteral("≈")) ? text.mid(1) : text; }
     //! Every level row's price, size and total have one decimal count per
     //! column, and no cell carries its own "≈"; returns the price places.
     static int CheckOneDecimalCountPerColumn(const B3FlowMeshOrderBook& book)
@@ -1406,28 +1410,34 @@ private Q_SLOTS:
         QCOMPARE(model->row(spread + 1).size, QStringLiteral("0.100")); // 100'000 atoms, and 0.125 below it
         QCOMPARE(header(0), QStringLiteral("Price (B3)"));
         // The B3 view: token-per-B3 prices do not end, so they are rounded
-        // to one count for the column, a sell up and a buy down, and "≈" is
-        // said once, in the header; each exact price stays in its tooltip.
+        // to one count for the column, to the nearest value on both sides
+        // (the view's one rule), and "≈" is said once, in the header; each
+        // exact price stays in its tooltip.
         book.setSnapshot(snapshot, true);
         const int places{CheckOneDecimalCountPerColumn(book)};
         QVERIFY(places > 0 && places <= 6);
+        QCOMPARE(book.pricePlaces(), std::optional<int>{places});
         QCOMPARE(header(0), QStringLiteral("Price (tUSD) ≈"));
         QVERIFY(header(0, Qt::ToolTipRole).contains(QStringLiteral("rounded to %1 decimal places").arg(places)));
+        QVERIFY(header(0, Qt::ToolTipRole).contains(QStringLiteral("never by side")));
         const auto& levels{*snapshot.levels};
         int rounded_rows{0};
+        std::set<QString> labels;
         for (int row{0}; row < model->rowCount(); ++row) {
             const auto& shown{model->row(row)};
             if (shown.kind != B3FlowMeshLadderModel::Row::Kind::Ask && shown.kind != B3FlowMeshLadderModel::Row::Kind::Bid) continue;
             const bool ask_row{shown.kind == B3FlowMeshLadderModel::Row::Kind::Ask};
             // The B3 view's asks are canonical bids, best (highest) first.
             const auto& level{ask_row ? levels.bids.levels[static_cast<size_t>(spread - 1 - row)] : levels.asks.levels[static_cast<size_t>(row - spread - 1)]};
-            // A sell rounds up and a buy down: every order in it accepts it.
+            // The nearest value, whichever side: the same text Your orders
+            // and the spread use for this price.
             bool whole{false};
-            QCOMPARE(shown.price, FixedDisplayPrice(level.low, 6, true, places, /*up=*/ask_row, &whole));
-            // It reads back as exactly its own price for the side a click
-            // on it takes (buy B3 at a sell, sell B3 at a buy).
-            const auto back{ParseDisplayLimit(shown.price, units, true, /*display_buy=*/ask_row)};
-            QVERIFY2(back && back->price == level.low, qPrintable(shown.price));
+            QCOMPARE(shown.price, NearestDisplayPrice(level.low, 6, true, places, &whole));
+            QCOMPARE(shown.price, Bare(ViewPrice(level.low, units, true, places).text));
+            // One tick is resolved at these prices: every label is its own,
+            // and a click offers exactly its own price.
+            QVERIFY2(labels.insert(shown.price).second, qPrintable(shown.price));
+            QCOMPARE(shown.click_canonical, level.low);
             // A rounded label keeps its exact price in the tooltip and says
             // "about" to a screen reader; an exact one (1000: 1) does not.
             QCOMPARE(shown.tooltip.contains(QStringLiteral("Exact: ") + ExactInversePrice(level.low, 6)), !whole);
@@ -1491,6 +1501,140 @@ private Q_SLOTS:
         QCOMPARE(NeededDecimals(util::Unsigned128{120'000}, 6), 2);
         QCOMPARE(NeededDecimals(util::Unsigned128{0}, 6), 0);
         QCOMPARE(NeededDecimals(util::Unsigned128{1}, 9), 9);
+    }
+    void viewPricesRoundToTheNearestValueAtOneCountOfPlaces()
+    {
+        const auto units{SyntheticLimitBook().units}; // 6 decimals, price step 1
+        // To the nearest value, half up, never by side: 1000/997 is 1.003
+        // (rounded up it was 1.004, the next tick's value).
+        bool exact{true};
+        QCOMPARE(NearestDisplayPrice(997, 6, true, 3, &exact), QStringLiteral("1.003")); QVERIFY(!exact);
+        QCOMPARE(FixedDisplayPrice(997, 6, true, 3, /*up=*/true), QStringLiteral("1.004"));
+        QCOMPARE(NearestDisplayPrice(1003, 6, true, 3), QStringLiteral("0.997"));
+        QCOMPARE(NearestDisplayPrice(800, 6, true, 1, &exact), QStringLiteral("1.3")); QVERIFY(!exact); // 1.25, half up
+        QCOMPARE(NearestDisplayPrice(1000, 6, false, 3, &exact), QStringLiteral("1.000")); QVERIFY(exact);
+        // A view's places. B3 per token: the tick's. Token per B3: the fewest
+        // at which the best prices and their neighbouring ticks differ.
+        QCOMPARE(ViewPricePlaces(units, false, {}), std::optional<int>{3});
+        QCOMPARE(ViewPricePlaces(units, true, {999, 1001}), std::optional<int>{3});
+        // 799, 800 and 801 need three places although 800 is exactly 1.25.
+        QCOMPARE(ViewPricePlaces(units, true, {800, 1000}), std::optional<int>{3});
+        // 1999, 2000, 2001: 0.5003, 0.5000, 0.4998.
+        QCOMPARE(ViewPricePlaces(units, true, {2000}), std::optional<int>{4});
+        QVERIFY(!ViewPricePlaces(units, true, {}));
+        // A price at a view's places: "≈" and the exact form when rounded.
+        const auto rounded{ViewPrice(997, units, true, 3)};
+        QCOMPARE(rounded.text, QStringLiteral("≈1.003")); QCOMPARE(rounded.exact, QStringLiteral("1000/997")); QVERIFY(rounded.approximate);
+        QCOMPARE(ViewPrice(1000, units, true, 3).text, QStringLiteral("1.000")); QVERIFY(!ViewPrice(1000, units, true, 3).approximate);
+        QCOMPARE(ViewPrice(1010, units, false, 3).text, QStringLiteral("1.010"));
+        // Without places, or too small for them (never "≈0.000"): DisplayPrice.
+        QCOMPARE(ViewPrice(997, units, true, std::nullopt), DisplayPrice(997, units, true));
+        QCOMPARE(ViewPrice(1'000'000'000'000, units, true, 3), DisplayPrice(1'000'000'000'000, units, true));
+        // The spread: the difference of the two prices as shown.
+        const auto spread{ViewSpread(999, 1001, units, true, 3)};
+        QCOMPARE(spread.text, QStringLiteral("≈0.002")); QVERIFY(spread.approximate); // 1.001 - 0.999
+        QCOMPARE(spread.exact, DisplaySpread(999, 1001, units, true).exact);
+        QCOMPARE(ViewSpread(1000, 1010, units, false, 3).text, QStringLiteral("0.010"));
+        QCOMPARE(ViewSpread(999, 1001, units, true, std::nullopt), DisplaySpread(999, 1001, units, true));
+        // Rounding a decimal the ticket shows to the places of a label.
+        QCOMPARE(RoundedDecimal(QStringLiteral("1.0031"), 3), QStringLiteral("1.003"));
+        QCOMPARE(RoundedDecimal(QStringLiteral("1.0035"), 3), QStringLiteral("1.004"));
+        QCOMPARE(RoundedDecimal(QStringLiteral("1"), 2), QStringLiteral("1.00"));
+        for (const auto* text : {"1/3", "≈1.003", "0", "", "1.2.3"}) QVERIFY2(RoundedDecimal(QString::fromUtf8(text), 3).isEmpty(), text);
+    }
+    void aPriceReadsTheSameInItsRowYourOrdersTheSpreadAndTheTicket()
+    {
+        // Review of 2026-09-30, the default B3 view at 1320 x 940: Your
+        // orders showed the viewer's sell of B3 at ≈1.003, the book marked
+        // it on the row labelled 1.004 and showed another price as 1.003,
+        // and the labels beside the spread (1.002 and 0.999) did not differ
+        // by the spread it showed (≈0.002). One rule for the view: to the
+        // nearest value at one count of places, never by side.
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); panel.m_timer->stop();
+        ShowSyntheticTimeMarket(panel, SyntheticSource::LOCAL);
+        QVERIFY(panel.inverted()); QVERIFY(panel.m_order_book->showsVerifiedLevels());
+        const auto* model{panel.m_order_book->model()};
+        const auto& units{panel.m_snapshot->units};
+        const auto places{panel.m_order_book->pricePlaces()};
+        QCOMPARE(places, std::optional<int>{3});
+        const int spread{model->spreadRow()};
+        std::set<QString> sells, buys;
+        int own_row{-1};
+        for (int row{0}; row < model->rowCount(); ++row) {
+            const auto& shown{model->row(row)};
+            if (shown.kind != B3FlowMeshLadderModel::Row::Kind::Ask && shown.kind != B3FlowMeshLadderModel::Row::Kind::Bid) continue;
+            // Each row: its level's price to the nearest value, its own label.
+            QCOMPARE(shown.price, NearestDisplayPrice(shown.click_canonical, units.decimals, true, *places));
+            QVERIFY2((shown.kind == B3FlowMeshLadderModel::Row::Kind::Ask ? sells : buys).insert(shown.price).second, qPrintable(shown.price));
+            if (shown.own) own_row = row;
+        }
+        // The viewer's sell of B3 (a canonical bid at 997 atoms): marked on
+        // the row shown 1.003, and Your orders shows the same price.
+        QVERIFY(own_row >= 0 && own_row < spread);
+        QCOMPARE(model->row(own_row).click_canonical, CAmount{997});
+        QCOMPARE(model->row(own_row).price, QStringLiteral("1.003"));
+        QCOMPARE(panel.m_own_view->item(0, 0)->text(), QStringLiteral("Sell B3"));
+        QCOMPARE(panel.m_own_view->item(0, 1)->text(), QStringLiteral("≈%1 tUSD / B3").arg(model->row(own_row).price));
+        // The spread row: the difference of the two labels beside it.
+        const auto scaled = [](QString text) { text.remove(QLatin1Char('.')); return text.toLongLong(); };
+        const auto above{model->row(spread - 1).price}, below{model->row(spread + 1).price};
+        QCOMPARE(above, QStringLiteral("1.001")); QCOMPARE(below, QStringLiteral("0.999"));
+        QCOMPARE(SpreadText(*panel.m_order_book), QStringLiteral("Spread  ≈%1 tUSD · 0.2%").arg(FormatAmount(scaled(above) - scaled(below), *places)));
+        // A click on the viewer's row fills that price: as shown when the
+        // ticket reads it back exactly (sell B3), else with more places that
+        // still show as it (buy B3: 1.0031, never the next row's 1.004).
+        for (const int side : {1, 0}) {
+            panel.m_side->setCurrentIndex(side);
+            QVERIFY(panel.m_order_book->activateRow(own_row));
+            const auto text{panel.m_price->text()};
+            const auto parsed{ParseDisplayLimit(text, units, true, /*display_buy=*/side == 0)};
+            QVERIFY2(parsed && parsed->price == 997, qPrintable(text));
+            QCOMPARE(RoundedDecimal(text, *places), model->row(own_row).price);
+            QCOMPARE(text, side == 1 ? QStringLiteral("1.003") : QStringLiteral("1.0031"));
+        }
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_wallet);
+    }
+    void levelsWhosePricesRoundToOneValueShareARow()
+    {
+        // Far from the market two canonical ticks can round to one value at
+        // the view's places (set by the best prices): 1000/1428 and 1000/1429
+        // tUSD per B3 are both 0.700. They share one row, never two rows
+        // with one label, each exact price and size in its tooltip.
+        auto snapshot{SyntheticLimitBook(4)};
+        snapshot.curves.push_back(LimitCurve("ask", 90, 1428, 100'000));
+        snapshot.curves.push_back(LimitCurve("ask", 91, 1429, 200'000));
+        const auto levelled{WithLevels(snapshot, {}, H(20))};
+        B3FlowMeshOrderBook book; book.resize(420, 900); book.show(); QCoreApplication::processEvents();
+        book.setSnapshot(levelled, true);
+        QVERIFY(book.showsVerifiedLevels());
+        QCOMPARE(book.pricePlaces(), std::optional<int>{3});
+        const auto* model{book.model()};
+        std::set<QString> buys;
+        int shared{-1};
+        for (int row{0}; row < model->rowCount(); ++row) {
+            if (model->row(row).kind != B3FlowMeshLadderModel::Row::Kind::Bid) continue;
+            QVERIFY2(buys.insert(model->row(row).price).second, qPrintable(model->row(row).price));
+            if (model->row(row).price == QStringLiteral("0.700")) shared = row;
+        }
+        QCOMPARE(buys.size(), size_t{5}); // 0.990, 0.988, 0.986, 0.984 and 0.700
+        QVERIFY(shared > model->spreadRow());
+        const auto& row{model->row(shared)};
+        // Its size: both levels' B3 at their own prices, 0.1428 + 0.2858.
+        QCOMPARE(row.size, PadDecimals(QStringLiteral("0.4286"), Places(row.size)));
+        QVERIFY(row.tooltip.contains(QStringLiteral("2 prices round to this value")));
+        QVERIFY(row.tooltip.contains(QStringLiteral("Exact %1: 0.1 tUSD").arg(ExactInversePrice(1428, 6))));
+        QVERIFY(row.tooltip.contains(QStringLiteral("Exact %1: 0.2 tUSD").arg(ExactInversePrice(1429, 6))));
+        QVERIFY(model->data(model->index(shared, 0), Qt::AccessibleTextRole).toString().contains(QStringLiteral("about 0.700")));
+        // A click offers the price that takes every level of the row: its
+        // deepest, with the total up to it.
+        QCOMPARE(row.click_canonical, CAmount{1429});
+        QCOMPARE(row.click_cumulative, levelled.levels->asks.levels.back().cumulative);
+        QVERIFY(row.tooltip.contains(QStringLiteral("exactly %1 tUSD / B3").arg(ExactInversePrice(1429, 6))));
+        // In the canonical view both prices are exact: two rows.
+        book.setSnapshot(levelled, false);
+        int canonical_rows{0};
+        for (const auto& shown : model->rows()) canonical_rows += shown.price == QStringLiteral("1.428") || shown.price == QStringLiteral("1.429");
+        QCOMPARE(canonical_rows, 2);
     }
     void identicalBookUpdatesDoNotRepaintTheLadder()
     {
@@ -1646,16 +1790,22 @@ private Q_SLOTS:
                 const bool canonical_bid{ask_row == inverse};
                 QCOMPARE(parsed->price, canonical_bid ? level.low : level.high);
                 QCOMPARE(parsed->price, model->row(row).click_canonical);
-                // Hyperliquid's click-to-price: the price as shown, whenever
-                // the click takes the side the level's orders face (buy at a
-                // sell level, sell at a buy level), and always in the
-                // canonical view. Otherwise the same places or more, rounded
-                // toward the ticket's side: never an exact fraction here.
-                if (buy == ask_row || !inverse) {
+                // Hyperliquid's click-to-price: the price as shown whenever
+                // the ticket reads it back, for its side, as exactly the
+                // level's canonical price, and always in the canonical view.
+                // Otherwise the same places (a grouped edge) or more, rounded
+                // toward the ticket's side: never an exact fraction here, and
+                // for an exact level (its label the nearest value) still the
+                // price the row shows (1.0021 for a row shown 1.002, never
+                // another row's 1.003).
+                const auto shown_reads{ParseDisplayLimit(shown, panel.m_snapshot->units, inverse, buy)};
+                if ((shown_reads && shown_reads->price == model->row(row).click_canonical) || !inverse) {
                     QCOMPARE(panel.m_price->text(), shown);
                 } else {
-                    QVERIFY2(Places(panel.m_price->text()) >= Places(shown), qPrintable(panel.m_price->text() + QStringLiteral(" / ") + shown));
+                    // A grouped edge may take the same places, rounded the other way.
+                    QVERIFY2(Places(panel.m_price->text()) >= Places(shown) + (grouped ? 0 : 1), qPrintable(panel.m_price->text() + QStringLiteral(" / ") + shown));
                     QVERIFY(!panel.m_price->text().contains(QLatin1Char('/')));
+                    if (!grouped) QCOMPARE(RoundedDecimal(panel.m_price->text(), Places(shown)), shown);
                 }
                 // A rounded B3-view text is adjusted only in the customer's
                 // favour, and the ticket shows the exact executable limit.
@@ -1922,7 +2072,8 @@ private Q_SLOTS:
         const auto ladder{LadderCurve("bid", 5, {{1000, 300'000}, {990, 200'000}, {980, 100'000}}, 100'000)};
         s.curves.front() = ladder; s.own_curves = {ladder};
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, s);
-        QCOMPARE(panel.m_own_view->item(0, 1)->text(), QStringLiteral("Ladder · 1 / 0.99 / 0.98"));
+        // Each price as the order book shows it: the tick's three places.
+        QCOMPARE(panel.m_own_view->item(0, 1)->text(), QStringLiteral("Ladder · 1.000 / 0.990 / 0.980"));
         panel.m_own_view->selectRow(0);
         QVERIFY(panel.editAvailable());
         panel.editOrder();
@@ -1956,12 +2107,17 @@ private Q_SLOTS:
     void orderBookSpreadRowIsExactCrossedOrOneSided()
     {
         B3FlowMeshOrderBook book; book.resize(420, 400); book.show(); QCoreApplication::processEvents();
-        // 1000 and 1010 atoms per atom of a 6-decimal token: 0.01 B3, and
-        // 200 x 10 / 2010 = 0.995% of the midpoint (the same in both views).
+        // 1000 and 1010 atoms per atom of a 6-decimal token: 0.010 B3 at
+        // the tick's places, and 200 x 10 / 2010 = 0.995% of the midpoint
+        // (the same in both views).
         book.setSnapshot(WithLevels(SyntheticLimitBook()), false);
-        QCOMPARE(SpreadText(book), QStringLiteral("Spread  0.01 B3 · 0.995%"));
+        QCOMPARE(SpreadText(book), QStringLiteral("Spread  0.010 B3 · 0.995%"));
+        // The B3 view: the difference of the two prices beside it as they
+        // are shown (1.000 - 0.990), exactly 1/101 in its tooltip.
         book.setSnapshot(WithLevels(SyntheticLimitBook()), true);
-        QCOMPARE(SpreadText(book), QStringLiteral("Spread  ≈0.0099 tUSD · 0.995%"));
+        QCOMPARE(book.model()->row(book.model()->spreadRow() - 1).price, QStringLiteral("1.000"));
+        QCOMPARE(book.model()->row(book.model()->spreadRow() + 1).price, QStringLiteral("0.990"));
+        QCOMPARE(SpreadText(book), QStringLiteral("Spread  ≈0.010 tUSD · 0.995%"));
         QVERIFY(book.model()->row(book.model()->spreadRow()).tooltip.contains(QStringLiteral("Exact spread: 1/101 tUSD / B3")));
         // Crossed after a rationed auction: never a negative spread; the
         // standing clearing, labelled indicative.
@@ -7296,12 +7452,13 @@ private Q_SLOTS:
         QVERIFY(QToolTip::text().startsWith(panel.m_chart->toolTip()));
         QVERIFY(QToolTip::text().endsWith(panel.m_chart->exactPrices()));
         QToolTip::hideText();
-        // A spread between rounded prices is rounded to their places too.
+        // A spread between rounded prices is the difference of the prices
+        // beside it, as shown (1.000 - 0.990), its exact value on hover.
         B3FlowMeshOrderBook book; book.setSnapshot(SyntheticLimitBook(), true);
-        QCOMPARE(SpreadText(book), QStringLiteral("Spread  ≈0.0099 tUSD · 0.995%"));
+        QCOMPARE(SpreadText(book), QStringLiteral("Spread  ≈0.010 tUSD · 0.995%"));
         QVERIFY(book.model()->row(book.model()->spreadRow()).tooltip.endsWith(QStringLiteral("Exact spread: 1/101 tUSD / B3")));
         book.setSnapshot(SyntheticLimitBook(), false);
-        QCOMPARE(SpreadText(book), QStringLiteral("Spread  0.01 B3 · 0.995%"));
+        QCOMPARE(SpreadText(book), QStringLiteral("Spread  0.010 B3 · 0.995%"));
         QVERIFY(!book.model()->row(book.model()->spreadRow()).tooltip.contains(QStringLiteral("Exact spread")));
         // Clearing strip and indicative line list what they rounded.
         auto s{Parse(RemoteDataWithViews())};
