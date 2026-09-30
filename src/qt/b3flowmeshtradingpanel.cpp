@@ -553,6 +553,7 @@ void B3FlowMeshTradingPanel::updateMarketText()
 void B3FlowMeshTradingPanel::updateDataViews()
 {
     using namespace B3FlowMeshMarketData;
+    ++m_view_builds;
     const auto selected{market()}; const bool matched{selected && m_snapshot && selected->id == m_snapshot->market};
     const bool inverse{inverted()};
     // Held ticks that reach the displayed head give the chart its longer
@@ -1347,6 +1348,9 @@ void B3FlowMeshTradingPanel::updateControls()
     m_check_receipt->setEnabled(idle && selectedStatusRead().has_value());
     updateStatusReadState();
     m_chart->setStale(m_snapshot && (m_read_failed || !m_response_age.isValid() || m_response_age.elapsed() > 3000));
+    // The time axis reaches now between replies (it repaints only when a
+    // new bucket starts); display only.
+    m_chart->setNowMs(QDateTime::currentMSecsSinceEpoch());
     m_order_book->setStale(m_snapshot && (m_read_failed || !m_response_age.isValid() || m_response_age.elapsed() > 3000));
     m_chart->setLoading(m_loading);
     updateConnectionState();
@@ -2200,7 +2204,8 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
         }
         const auto selected_now{market()};
         if (result->snapshot && selected_now && result->snapshot->market == selected_now->id) {
-            applySelectedSnapshot(*result->snapshot, result->snapshot_age, result->basis_head);
+            // Moved, not copied: nothing reads the job's snapshot afterwards.
+            applySelectedSnapshot(std::move(*result->snapshot), result->snapshot_age, result->basis_head);
         } else if (!selected_now || !m_snapshot || selected_now->id != m_snapshot->market) { m_snapshot.reset(); m_response_age.invalidate(); m_queue_age.invalidate(); updateDataViews(); }
         if (result->candles && selected_now && m_snapshot && m_snapshot->market == selected_now->id && result->views_market == selected_now->id &&
             result->candles->interval == m_candle_interval) {
@@ -2283,19 +2288,34 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
             m_read_failed = true; notice(tr("Unchanged snapshot did not match the retained certificate and provenance; data was not reused.")); m_catalog_age.invalidate();
             return SnapshotApply::MISMATCH;
         }
-        auto retained{*m_snapshot}; retained.running = fresh.running; retained.paused = fresh.paused; retained.chain_reconciling = fresh.chain_reconciling; retained.handoff = fresh.handoff; retained.observer = fresh.observer; retained.halt = fresh.halt; retained.error = fresh.error; retained.pending_actions = fresh.pending_actions; retained.active_seats = fresh.active_seats; retained.quorum_required = fresh.quorum_required;
-        retained.remote = fresh.remote; retained.endpoint = fresh.endpoint; retained.certificate_verified = fresh.certificate_verified; retained.account_state_verified = fresh.account_state_verified; retained.execution_result_verified = fresh.execution_result_verified; retained.b3_checkpoint_confirmed = fresh.b3_checkpoint_confirmed; retained.event_gap = fresh.event_gap;
+        // Updated in place: the retained head's curves, history and levels
+        // are never copied for a status refresh.
+        auto& retained{*m_snapshot};
+        // Only what the data views draw asks for them again; status alone
+        // is the caller's updateMarketText (ticket, gates and banners).
+        bool display{retained.certificate_verified != fresh.certificate_verified || retained.account_state_verified != fresh.account_state_verified ||
+                     retained.event_gap != fresh.event_gap || retained.endpoint != fresh.endpoint || retained.observed != fresh.observed ||
+                     (fresh.levels && retained.levels != fresh.levels)};
+        retained.running = fresh.running; retained.paused = fresh.paused; retained.chain_reconciling = fresh.chain_reconciling; retained.handoff = fresh.handoff; retained.observer = fresh.observer; retained.halt = std::move(fresh.halt); retained.error = std::move(fresh.error); retained.pending_actions = fresh.pending_actions; retained.active_seats = fresh.active_seats; retained.quorum_required = fresh.quorum_required;
+        retained.remote = fresh.remote; retained.endpoint = std::move(fresh.endpoint); retained.certificate_verified = fresh.certificate_verified; retained.account_state_verified = fresh.account_state_verified; retained.execution_result_verified = fresh.execution_result_verified; retained.b3_checkpoint_confirmed = fresh.b3_checkpoint_confirmed; retained.event_gap = fresh.event_gap;
         // Cosmetic discovery can advance without a new certified
         // microblock. Keep the exact account/book and user inputs;
         // only accept units for this same canonical asset.
-        if (fresh.units.known && fresh.units.asset == retained.base) retained.units = fresh.units;
+        if (fresh.units.known && fresh.units.asset == retained.base && fresh.units != retained.units) { retained.units = std::move(fresh.units); display = true; }
         // Read at this same head: they replace the retained ones.
         retained.ticks = std::move(fresh.ticks); retained.indicative = std::move(fresh.indicative);
         retained.observed = std::move(fresh.observed);
         // Levels come with a changed head, or when this read asked for them
         // again (another grouping): take them, else keep the head's own.
         if (fresh.levels) retained.levels = std::move(fresh.levels);
-        m_snapshot = std::move(retained); m_response_age = age; mergeHeldTicks(); updateDataViews();
+        m_response_age = age;
+        // Held ticks and their times are shared text: copies are cheap.
+        const auto ticks_before{m_ticks};
+        const auto times_before{m_tick_times};
+        const auto received_before{m_received_times};
+        mergeHeldTicks();
+        display = display || m_ticks != ticks_before || m_tick_times != times_before || m_received_times != received_before;
+        if (display) updateDataViews();
     } else {
         if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age = age;
         // Tape only: a server without observed times, one new auction since
@@ -2510,15 +2530,20 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
         m_watch.Finished(now, Outcome::Failed, jitter);
         m_reconcile_pending = true;
     } else {
-        const auto& s{*result->snapshot};
+        auto& s{*result->snapshot};
         const uint64_t displayed{m_snapshot->next_sequence ? m_snapshot->next_sequence - 1 : 0};
         const bool head_moved{!s.unchanged && s.head != scope.known_head};
         const auto outcome{B3FlowMeshWatch::Classify(false, result->status.toStdString(), result->supported, result->waited,
                                                      head_moved, result->endpoint_live_ms)};
         const bool live_head_change{result->supported && !result->gap && result->status == QStringLiteral("head_changed")};
-        if (applySelectedSnapshot(s, result->snapshot_age, scope.known_head, live_head_change) == SnapshotApply::APPLIED) {
-            const auto index{m_market->currentIndex()};
-            if (index >= 0 && static_cast<size_t>(index) < m_market_data.size()) DeriveRowFromSnapshot(m_market_data[index], s);
+        const uint64_t reply_head{!s.unchanged && s.next_sequence ? s.next_sequence - 1 : displayed};
+        // The selected row as this reply determines it, derived before the
+        // reply moves into the display (it is never copied).
+        const auto index{m_market->currentIndex()};
+        std::optional<B3FlowMeshTrading::Market> row;
+        if (index >= 0 && static_cast<size_t>(index) < m_market_data.size()) { row = m_market_data[index]; DeriveRowFromSnapshot(*row, s); }
+        if (applySelectedSnapshot(std::move(s), result->snapshot_age, scope.known_head, live_head_change) == SnapshotApply::APPLIED) {
+            if (row) m_market_data[index] = std::move(*row);
             m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_read_error.clear(); m_loading = false;
             linkToast(true);
         }
@@ -2534,7 +2559,7 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
         }
         if (result->gap) {
             m_reconcile_pending = true;
-            addGapMarker(scope.market, displayed, !s.unchanged && s.next_sequence ? s.next_sequence - 1 : displayed);
+            addGapMarker(scope.market, displayed, reply_head);
             updateDataViews();
         }
     }

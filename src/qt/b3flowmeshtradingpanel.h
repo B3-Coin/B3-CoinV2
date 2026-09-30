@@ -186,6 +186,8 @@ private:
     void updateControls();
     void updateMarketText();
     void updateDataViews();
+    //! How many times the data views were rebuilt (tests and diagnostics).
+    uint64_t m_view_builds{0};
     void updateTicket();
     void openFunding(bool withdrawal);
     bool depositDraftAvailable() const;

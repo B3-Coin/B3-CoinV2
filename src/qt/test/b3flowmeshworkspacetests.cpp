@@ -5336,6 +5336,47 @@ private Q_SLOTS:
         QVERIFY(panel.m_status->text().contains(QStringLiteral("unbacked")));
         QVERIFY(!panel.m_order->isEnabled());
     }
+    void unchangedReplyRefreshesStatusWithoutRebuildingViews()
+    {
+        // A quiet watch timeout or a same-head poll: status fields update in
+        // place; the views are rebuilt only when something they draw changed.
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        auto shown{WithLevels(Parse(RemoteDataWithTimes()), {}, H(5))};
+        QVERIFY(shown.levels && shown.levels->available);
+        Observe(panel, shown, true);
+        const auto curves{panel.m_snapshot->curves};
+        const auto reply = [&] {
+            auto fresh{shown}; fresh.unchanged = true; fresh.curves.clear(); fresh.own_curves.clear(); fresh.history.clear(); fresh.depth.clear();
+            fresh.levels.reset(); fresh.ticks = TickPage{}; fresh.ticks->available = true; fresh.ticks->remote = true;
+            return fresh;
+        };
+        const auto apply = [&](Snapshot fresh) {
+            QElapsedTimer age; age.start();
+            QCOMPARE(panel.applySelectedSnapshot(std::move(fresh), age, panel.m_snapshot->head), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        };
+        apply(reply());
+        const auto builds{panel.m_view_builds};
+        // Status only: the queue and the runtime's pause.
+        auto status{reply()}; status.pending_actions = 3; status.paused = true;
+        apply(status);
+        QCOMPARE(panel.m_view_builds, builds);
+        QCOMPARE(panel.m_snapshot->pending_actions, uint64_t{3}); QVERIFY(panel.m_snapshot->paused);
+        QCOMPARE(panel.m_snapshot->curves, curves); QVERIFY(panel.m_snapshot->levels == shown.levels);
+        QVERIFY(!panel.m_snapshot->unchanged);
+        // Something drawn: an event gap, other observed times, other units.
+        auto gap{reply()}; gap.event_gap = true;
+        apply(gap); QCOMPARE(panel.m_view_builds, builds + 1);
+        apply(gap); QCOMPARE(panel.m_view_builds, builds + 1);
+        auto times{gap}; times.observed->rows.pop_back();
+        apply(times); QCOMPARE(panel.m_view_builds, builds + 2);
+        auto units{times}; units.units.ticker = QStringLiteral("tUSD2");
+        apply(units); QCOMPARE(panel.m_view_builds, builds + 3);
+        QCOMPARE(panel.m_snapshot->units.ticker, QStringLiteral("tUSD2"));
+        // Levels asked for again (another grouping) are drawn at once.
+        auto levels{units}; levels.levels = shown.levels; levels.levels->total_curves += 1;
+        apply(levels); QCOMPARE(panel.m_view_builds, builds + 4);
+        QCOMPARE(panel.m_snapshot->levels->total_curves, shown.levels->total_curves + 1);
+    }
     void unchangedReplySupersededByNewerSnapshotIsNotAFailure()
     {
         using Apply = B3FlowMeshTradingPanel::SnapshotApply;
