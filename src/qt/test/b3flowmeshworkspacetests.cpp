@@ -859,6 +859,47 @@ class B3FlowMeshWorkspaceTests : public QObject
         panel.updateWatchState();
         panel.m_watch.mode = B3FlowMeshWatch::Mode::Live; panel.m_watch.last_ok_at = panel.m_watch_clock.elapsed();
     }
+    //! The next certified head of the synthetic observed-time market, as a
+    //! local live update brings it: one more auction (its tick and observed
+    //! time), a partial fill at one level and, every third head, an order at
+    //! a new price. The node's exact levels of every curve, the viewer's own
+    //! marked. Display only; nothing is signed.
+    static Snapshot NextSyntheticHead(const Snapshot& shown, const std::deque<Tick>& held, uint64_t n, std::optional<CAmount> new_bid = std::nullopt)
+    {
+        auto s{shown};
+        const uint64_t sequence{s.next_sequence};
+        uint256 hash; hash.begin()[0] = static_cast<unsigned char>(sequence & 0xff); hash.begin()[1] = static_cast<unsigned char>(sequence >> 8); hash.begin()[2] = 0x5c;
+        s.next_sequence = sequence + 1; s.head = QString::fromStdString(hash.GetHex());
+        uint256 root{hash}; root.begin()[3] = 0x77; s.state_root = QString::fromStdString(root.GetHex());
+        Tick t; t.sequence = sequence; t.hash = s.head; t.kind = QStringLiteral("execution"); t.side = QStringLiteral("none");
+        t.cleared = sequence % 4 != 1;
+        const CAmount last{held.empty() ? 1000 : held.back().price ? held.back().price : 1000};
+        if (t.cleared) { t.price = std::clamp<CAmount>(last + static_cast<CAmount>((sequence * 7919) % 5) - 2, 994, 1006); t.volume = 30'000 + static_cast<CAmount>((sequence * 104729) % 7) * 17'500; }
+        TickPage page; page.available = true; page.ticks = {t};
+        s.ticks = page;
+        ObservedTimes times{*s.observed};
+        flowmesh::ObservedStamp stamp; stamp.sequence = sequence; stamp.hash = hash; stamp.mode = flowmesh::ObservedMode::LIVE;
+        stamp.ms = OBSERVED_T0 + static_cast<int64_t>(n) * 1'700;
+        times.rows = {stamp};
+        s.observed = times;
+        if (t.cleared) {
+            Trade trade; trade.sequence = sequence; trade.hash = t.hash; trade.anchor_height = 50; trade.cleared = true;
+            trade.price = t.price; trade.quantity = t.volume; trade.notional = t.price * t.volume; trade.fee = *FeeExample(trade.notional);
+            trade.own_fills_known = true; s.history.push_back(trade);
+            while (s.history.size() > 100) s.history.erase(s.history.begin());
+        }
+        // A partial fill at one level, and every third head a new price.
+        auto& filled{s.curves[static_cast<size_t>(n * 5) % 24]};
+        if (filled.remaining > 20'000) { filled.filled += 10'000; filled.remaining -= 10'000; }
+        if (new_bid) {
+            s.curves.push_back(LimitCurve("bid", static_cast<unsigned char>(140 + n % 110), *new_bid, 65'000));
+        } else if (n % 3 == 0) {
+            const bool bid{n % 2 == 0};
+            s.curves.push_back(LimitCurve(bid ? "bid" : "ask", static_cast<unsigned char>(140 + n % 110), bid ? 987 - static_cast<CAmount>(n % 4) : 1013 + static_cast<CAmount>(n % 4), 45'000 + static_cast<CAmount>(n % 5) * 20'000));
+        }
+        s.depth = Aggregate(s.curves);
+        return WithLevels(s, {}, H(5));
+    }
 private Q_SLOTS:
     void initTestCase()
     {
@@ -6809,6 +6850,69 @@ private Q_SLOTS:
             auto* mode{older.findChild<QComboBox*>(QStringLiteral("flowMeshLiquidityMode"))};
             QVERIFY(mode); mode->setCurrentIndex(2); QCoreApplication::processEvents();
             QVERIFY(render(older, QStringLiteral("synthetic-flowmesh-auction-order-fallback.png")));
+        }
+        {
+            // Responsiveness: the same realistic book (24 accounts' limit
+            // orders, a four-price ladder a side, the viewer's own bid),
+            // UTC candles and the tape, then 36 more certified auctions
+            // through the live-update handler as the local engine brings
+            // them (a partial fill each, a new price every third). The book
+            // updates in place and flashes new prices; renders stay at the
+            // update rate.
+            B3FlowMeshTradingPanel live; live.resize(1320, 1320); live.m_timer->stop();
+            ShowSyntheticTimeMarket(live, SyntheticSource::LOCAL);
+            live.m_client_info = [] { UniValue info{UniValue::VOBJ}; info.pushKV("backend", "local"); info.pushKV("engine_enabled", true); info.pushKV("endpoints", UniValue{UniValue::VARR}); return info; }();
+            QApplication::setEffectEnabled(Qt::UI_General, true); B3FlowMeshOrderBook::SetAnimationSetting(true);
+            const auto apply = [&](uint64_t n, std::optional<CAmount> new_bid = std::nullopt) {
+                auto next{NextSyntheticHead(*live.m_snapshot, live.m_ticks, n, new_bid)};
+                QElapsedTimer age; age.start();
+                QVERIFY(live.applySelectedSnapshot(std::move(next), age, live.m_snapshot->head, true) == B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+                QCoreApplication::processEvents();
+            };
+            for (uint64_t n{1}; n <= 35; ++n) apply(n);
+            apply(36, 1000); // A new price beside the spread: its flash runs now.
+            QVERIFY(live.m_order_book->flashing());
+            QVERIFY(live.m_order_book->showsVerifiedLevels());
+            QVERIFY(live.m_snapshot->levels->bids.levels.size() >= 10 && live.m_snapshot->levels->asks.levels.size() >= 10);
+            QVERIFY(live.m_order_book->rowsPerSide() >= 10);
+            QTest::qWait(B3FlowMeshOrderBook::FLASH_MS / 2);
+            QVERIFY(render(live, QStringLiteral("synthetic-flowmesh-responsive-live-book.png")));
+            // The book, the UTC candles and the tape side by side, as they
+            // stand after the stream (display only; nothing is signed).
+            QWidget side;
+            auto* row{new QHBoxLayout{&side}};
+            auto* chart{new B3FlowMeshChart{&side}};
+            chart->setInverted(true); chart->setSnapshot(*live.m_snapshot); chart->setTimeSeries(live.m_chart->timeSeries());
+            chart->setNowMs(OBSERVED_T0 + 90'000); row->addWidget(chart, 1);
+            auto* book{new B3FlowMeshOrderBook{&side}}; book->setFixedWidth(430);
+            book->setSnapshot(live.m_snapshot, true); row->addWidget(book);
+            auto* tape{new B3FlowMeshTradeTape{&side}}; tape->setFixedWidth(360);
+            tape->setRows(B3FlowMeshTradeTape::BuildRows(live.m_ticks, live.m_tick_times), live.m_snapshot->units, true,
+                          QStringLiteral("this_node"), false, {});
+            row->addWidget(tape);
+            side.resize(1760, 900); side.show(); QCoreApplication::processEvents(); QCoreApplication::processEvents();
+            QVERIFY(chart->timeMode());
+            QVERIFY(book->rowsPerSide() >= 10);
+            QVERIFY(tape->table()->rowCount() >= 40);
+            QVERIFY(render(side, QStringLiteral("synthetic-flowmesh-responsive-book-chart-tape.png")));
+            // An order review open with the local engine: the book keeps
+            // following live updates (display only); the ticket, balances
+            // and every gate stay on the data of before the review.
+            live.m_busy = true; live.updateControls();
+            live.m_watch.Enable(live.m_watch_clock.elapsed(), true, true); live.m_watch.mode = B3FlowMeshWatch::Mode::Live;
+            QVERIFY(live.liveWhileBusy());
+            const auto gate_head{live.m_snapshot->head};
+            for (uint64_t n{37}; n <= 40; ++n) {
+                auto next{NextSyntheticHead(*live.displayedSnapshot(), live.m_ticks, n)};
+                QElapsedTimer age; age.start();
+                live.applyDisplayOnly(std::move(next), age);
+                QCoreApplication::processEvents();
+            }
+            QCOMPARE(live.m_snapshot->head, gate_head);
+            QVERIFY(live.m_order_book->head() != gate_head);
+            QVERIFY(render(live, QStringLiteral("synthetic-flowmesh-responsive-review-live-book.png")));
+            live.m_busy = false; live.m_watch.Disable();
+            QVERIFY(!live.m_thread); QVERIFY(!live.m_watch_thread);
         }
         panel.hide(); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_wallet); // Fixture cannot submit.
     }
