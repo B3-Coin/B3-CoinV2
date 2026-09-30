@@ -441,4 +441,159 @@ BOOST_AUTO_TEST_CASE(endpoint_times_past_the_display_bound_are_rejected)
     BOOST_CHECK(held.at(10).flags & flowmesh::OBSERVED_IMPLAUSIBLE);
 }
 
+namespace {
+constexpr int64_t MINUTE{60'000};
+flowmesh::ObservedCandle Bucket(const int64_t open_ms, const uint64_t first, const uint64_t last)
+{
+    flowmesh::ObservedCandle out;
+    out.open_ms = open_ms;
+    out.first_sequence = first;
+    out.last_sequence = last;
+    out.entries = static_cast<uint32_t>(last - first + 1);
+    out.clearings = 1;
+    out.open = out.high = out.low = out.close = 42;
+    out.base_volume = last - first + 1;
+    out.quote_volume = 42 * (last - first + 1);
+    return out;
+}
+flowmesh::ObservedCandlePage Window(const int64_t from_ms, const int64_t before_ms, std::vector<flowmesh::ObservedCandle> candles)
+{
+    flowmesh::ObservedCandlePage out;
+    out.available = true;
+    out.remote = true;
+    out.source = "https://endpoint.invalid:18443";
+    out.interval = flowmesh::CandleInterval::M1;
+    out.from_ms = from_ms;
+    out.before_ms = before_ms;
+    out.more = true;
+    out.candles = std::move(candles);
+    return out;
+}
+//! The strict client check: what a page bounded to `head` says re-parses
+//! against that very head, unchanged.
+void CheckBoundedTo(const flowmesh::ObservedCandlePage& page, const uint64_t head)
+{
+    std::string error;
+    const auto read{node::FlowMeshParseObservedCandles(node::FlowMeshObservedCandlePageJson(page), page.interval, head, error)};
+    BOOST_REQUIRE_MESSAGE(read, error);
+    BOOST_CHECK(read->candles == page.candles);
+    BOOST_CHECK_EQUAL(read->from_ms, page.from_ms);
+    BOOST_CHECK_EQUAL(read->before_ms, page.before_ms);
+    BOOST_CHECK_EQUAL(read->more, page.more);
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(holding_back_candles_past_the_verified_head)
+{
+    const int64_t from{NOW - 8 * MINUTE}, before{NOW + 2 * MINUTE};
+    const auto a{Bucket(NOW - 5 * MINUTE, 3, 4)}, b{Bucket(NOW - 2 * MINUTE, 5, 6)}, forming{Bucket(NOW - MINUTE, 7, 9)};
+    // The same forming bucket as an earlier page served it.
+    const auto earlier{Bucket(NOW - MINUTE, 7, 8)};
+
+    // (a) Nothing past the head: unchanged, whatever is held.
+    {
+        auto page{Window(from, before, {a, b, forming})};
+        const auto hold{node::FlowMeshHoldBackObservedCandles(page, 9, earlier)};
+        BOOST_CHECK_EQUAL(hold.held_back, 0U);
+        BOOST_CHECK(!hold.substituted);
+        BOOST_CHECK(page.candles == (std::vector{a, b, forming}));
+        BOOST_CHECK_EQUAL(page.before_ms, before);
+        CheckBoundedTo(page, 9);
+    }
+    // (b) The forming bucket goes past the head and nothing is held: it is
+    // left out, and so is its interval.
+    {
+        auto page{Window(from, before, {a, b, forming})};
+        const auto hold{node::FlowMeshHoldBackObservedCandles(page, 8, std::nullopt)};
+        BOOST_CHECK_EQUAL(hold.held_back, 1U);
+        BOOST_CHECK(!hold.substituted);
+        BOOST_CHECK(page.candles == (std::vector{a, b}));
+        BOOST_CHECK_EQUAL(page.before_ms, forming.open_ms);
+        BOOST_CHECK_EQUAL(page.from_ms, from);
+        BOOST_CHECK(page.more);
+        CheckBoundedTo(page, 8);
+    }
+    // (c) An earlier view of that bucket within the head stands in for it.
+    {
+        auto page{Window(from, before, {a, b, forming})};
+        const auto hold{node::FlowMeshHoldBackObservedCandles(page, 8, earlier)};
+        BOOST_CHECK_EQUAL(hold.held_back, 1U);
+        BOOST_CHECK(hold.substituted);
+        BOOST_CHECK(page.candles == (std::vector{a, b, earlier}));
+        BOOST_CHECK_EQUAL(page.before_ms, forming.open_ms + MINUTE);
+        CheckBoundedTo(page, 8);
+    }
+    // (d) Anything else is never substituted: another first auction, a
+    // view past the head, another bucket.
+    for (const auto& other : {Bucket(NOW - MINUTE, 8, 8), Bucket(NOW - MINUTE, 7, 9), Bucket(NOW - 3 * MINUTE, 7, 8)}) {
+        auto page{Window(from, before, {a, b, forming})};
+        const auto hold{node::FlowMeshHoldBackObservedCandles(page, 8, other)};
+        BOOST_CHECK_EQUAL(hold.held_back, 1U);
+        BOOST_CHECK(!hold.substituted);
+        BOOST_CHECK(page.candles == (std::vector{a, b}));
+        BOOST_CHECK_EQUAL(page.before_ms, forming.open_ms);
+        CheckBoundedTo(page, 8);
+    }
+    // (e) A rollover: two buckets past the head. The page ends at the
+    // earlier view of the first; the next bucket is never shown.
+    {
+        const auto next{Bucket(NOW, 10, 11)};
+        auto page{Window(from, before, {a, b, forming, next})};
+        const auto hold{node::FlowMeshHoldBackObservedCandles(page, 8, earlier)};
+        BOOST_CHECK_EQUAL(hold.held_back, 2U);
+        BOOST_CHECK(hold.substituted);
+        BOOST_CHECK(page.candles == (std::vector{a, b, earlier}));
+        BOOST_CHECK_EQUAL(page.before_ms, forming.open_ms + MINUTE);
+        CheckBoundedTo(page, 8);
+        // Once the head reaches the first, only the later one is held back.
+        auto later{Window(from, before, {a, b, forming, next})};
+        const auto moved{node::FlowMeshHoldBackObservedCandles(later, 10, earlier)};
+        BOOST_CHECK_EQUAL(moved.held_back, 1U);
+        BOOST_CHECK(!moved.substituted);
+        BOOST_CHECK(later.candles == (std::vector{a, b, forming}));
+        BOOST_CHECK_EQUAL(later.before_ms, next.open_ms);
+        CheckBoundedTo(later, 10);
+    }
+    // (f) A window not aligned to the interval (a caller's before_ms of
+    // "now"): lowered by whole intervals from from_ms, so it stays valid.
+    {
+        const int64_t offset{30'000};
+        auto page{Window(from + offset, before + offset, {a, b, forming})};
+        node::FlowMeshHoldBackObservedCandles(page, 8, std::nullopt);
+        BOOST_CHECK_EQUAL((page.before_ms - page.from_ms) % MINUTE, 0);
+        BOOST_CHECK_EQUAL(page.before_ms, NOW - 2 * MINUTE + offset);
+        BOOST_CHECK_LE(page.before_ms, forming.open_ms);
+        BOOST_CHECK_GT(page.before_ms, b.open_ms);
+        CheckBoundedTo(page, 8);
+        auto substituted{Window(from + offset, before + offset, {a, b, forming})};
+        BOOST_CHECK(node::FlowMeshHoldBackObservedCandles(substituted, 8, earlier).substituted);
+        BOOST_CHECK_EQUAL((substituted.before_ms - substituted.from_ms) % MINUTE, 0);
+        BOOST_CHECK_EQUAL(substituted.before_ms, NOW - MINUTE + offset);
+        BOOST_CHECK_GT(substituted.before_ms, forming.open_ms);
+        BOOST_CHECK(substituted.candles.back() == earlier);
+        CheckBoundedTo(substituted, 8);
+    }
+    // (g) Everything past the head, nothing held: an empty, valid window.
+    {
+        auto page{Window(from, before, {a, b, forming})};
+        const auto hold{node::FlowMeshHoldBackObservedCandles(page, 2, std::nullopt)};
+        BOOST_CHECK_EQUAL(hold.held_back, 3U);
+        BOOST_CHECK(page.candles.empty());
+        BOOST_CHECK_EQUAL(page.before_ms, a.open_ms);
+        BOOST_CHECK_GE(page.before_ms, page.from_ms);
+        CheckBoundedTo(page, 2);
+    }
+    // Unavailable and empty pages are left as they are.
+    {
+        auto empty{Window(from, before, {})};
+        BOOST_CHECK_EQUAL(node::FlowMeshHoldBackObservedCandles(empty, 0, earlier).held_back, 0U);
+        BOOST_CHECK_EQUAL(empty.before_ms, before);
+        BOOST_CHECK(empty.candles.empty());
+        auto unavailable{Window(from, before, {forming})};
+        unavailable.available = false;
+        BOOST_CHECK_EQUAL(node::FlowMeshHoldBackObservedCandles(unavailable, 0, earlier).held_back, 0U);
+        BOOST_CHECK_EQUAL(unavailable.candles.size(), 1U);
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

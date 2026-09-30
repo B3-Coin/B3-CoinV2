@@ -1490,7 +1490,9 @@ RPCHelpMan getflowmeshcandles()
                 {"limit", RPCArg::Type::NUM, RPCArg::Default{200}, "Window length in intervals, 1-500"},
             }},
         },
-        RPCResult{T::OBJ, "", "Candles in the window [before_ms - limit x interval, before_ms), oldest first", {
+        RPCResult{T::OBJ, "", "Candles in the window [from_ms, before_ms), oldest first. From a remote endpoint, buckets ending past the head "
+                              "this client verified are held back (it is never refreshed for this page) and before_ms then ends before them; the "
+                              "newest bucket shown may be this client's earlier view of the first one held back. A market-data read moves that head", {
             {T::BOOL, "available", "The source records observed time"},
             {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, endpoint_does_not_advertise_candles, or why the endpoint's page was refused"},
             {T::STR, "source", "this_node, or the endpoint URL that reported them"},
@@ -1500,7 +1502,7 @@ RPCHelpMan getflowmeshcandles()
             {T::STR, "interval", "The interval"},
             {T::NUM, "interval_ms", "Its length in milliseconds"},
             {T::NUM, "from_ms", "Inclusive start of the window"},
-            {T::NUM, "before_ms", "Exclusive end of the window"},
+            {T::NUM, "before_ms", "Exclusive end of the window; from a remote endpoint, lowered by whole intervals to leave out held-back buckets"},
             {T::BOOL, "more", "Older candles exist: continue with before_ms = from_ms"},
             {T::ARR, "candles", "Only buckets holding placed entries", {
                 {T::OBJ, "", "One bucket", {

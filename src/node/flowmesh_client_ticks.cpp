@@ -6,6 +6,7 @@
 #include <flowmesh/observed_time.h>
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -369,6 +370,31 @@ std::optional<flowmesh::ObservedCandlePage> FlowMeshParseObservedCandles(const U
         error = "endpoint_candles_rejected";
         return std::nullopt;
     }
+}
+
+FlowMeshCandleHoldBack FlowMeshHoldBackObservedCandles(flowmesh::ObservedCandlePage& page, const uint64_t head,
+                                                       const std::optional<flowmesh::ObservedCandle>& held) noexcept
+{
+    FlowMeshCandleHoldBack out;
+    if (!page.available || page.candles.empty()) return out;
+    const auto split{std::find_if(page.candles.begin(), page.candles.end(),
+                                  [&](const flowmesh::ObservedCandle& candle) { return candle.last_sequence > head; })};
+    if (split == page.candles.end()) return out;
+    const flowmesh::ObservedCandle first{*split};
+    out.held_back = static_cast<size_t>(std::distance(split, page.candles.end()));
+    page.candles.erase(split, page.candles.end());
+    const int64_t step{flowmesh::CandleIntervalMs(page.interval)};
+    // Both are inside the window, below OBSERVED_MS_LIMIT: no overflow.
+    int64_t end{first.open_ms};
+    if (held && held->open_ms == first.open_ms && held->first_sequence == first.first_sequence && held->last_sequence <= head) {
+        page.candles.push_back(*held);
+        end = first.open_ms + step;
+        out.substituted = true;
+    }
+    // Whole intervals from from_ms, so the window stays valid when it is
+    // not aligned; `first` is inside it, so end >= from_ms.
+    page.before_ms = std::min(page.before_ms, page.from_ms + ((end - page.from_ms) / step) * step);
+    return out;
 }
 
 } // namespace node

@@ -6,6 +6,7 @@
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_client_action_wait.h>
 #include <node/flowmesh_client_outcome.h>
+#include <node/flowmesh_client_ticks.h>
 #include <node/flowmesh_service.h>
 #include <node/flowmesh_timing.h>
 #include <chain.h>
@@ -6307,6 +6308,17 @@ struct TickProxy {
     //! last sequence.
     uint64_t candles_ahead{0};
     std::vector<std::pair<std::string, UniValue>> requests;
+    //! Signalled whenever a page is served, a request is held or `released`
+    //! is set.
+    std::condition_variable changed;
+    //! When set, every 'updates' or 'snapshot' request after a served
+    //! 'candles' page is held (counted in `held`) until `released`, at most
+    //! 10 s: a head refresh made on behalf of that page.
+    bool hold_refresh_after_candles{false}, candles_served{false}, released{false};
+    size_t held{0};
+    //! The last sequence of the newest candle of the last page served, as
+    //! the endpoint served it.
+    std::optional<uint64_t> served_newest;
 
     node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
     {
@@ -6317,14 +6329,32 @@ struct TickProxy {
         bool corrupt;
         uint64_t ahead;
         {
-            std::lock_guard lock{mutex};
+            std::unique_lock lock{mutex};
             requests.emplace_back(method, json["params"]);
             inject = advert;
             corrupt = tamper;
             ahead = candles_ahead;
+            if ((method == "updates" || method == "snapshot") && hold_refresh_after_candles && candles_served && !released) {
+                ++held;
+                changed.notify_all();
+                changed.wait_for(lock, std::chrono::seconds{10}, [&] { return released; });
+            }
         }
         const auto reply{node::FlowMeshHttpsRequest(upstream, "/flowmesh/v1", request.body, std::chrono::seconds{10}, 32 << 20)};
         if (!reply.response_received) return {502, R"({"ok":false,"error":"proxy upstream failed"})"};
+        if (method == "candles") {
+            UniValue served;
+            std::optional<uint64_t> newest;
+            if (served.read(reply.body) && served["result"]["candles"].isArray() && !served["result"]["candles"].empty()) {
+                newest = served["result"]["candles"].getValues().back()["last_sequence"].getInt<uint64_t>();
+            }
+            {
+                std::lock_guard lock{mutex};
+                candles_served = true;
+                served_newest = newest;
+            }
+            changed.notify_all();
+        }
         UniValue parsed;
         if ((!inject && !corrupt && !ahead) || !parsed.read(reply.body) || !parsed["ok"].isTrue()) return {reply.status, reply.body};
         UniValue result{parsed["result"]};
@@ -6403,7 +6433,138 @@ flowmesh::MarketDataQuery TickPage()
 }
 } // namespace
 
-BOOST_AUTO_TEST_CASE(remote_candles_are_checked_against_a_head_verified_after_the_page)
+namespace {
+//! A remote candles page within `head`: no candle goes past it, and the page
+//! re-parses unchanged under the client's strict check against it.
+void CheckCandlesWithin(const flowmesh::ObservedCandlePage& page, const uint64_t head)
+{
+    BOOST_CHECK_MESSAGE(page.available, page.unavailable_reason);
+    for (const auto& candle : page.candles) BOOST_CHECK_LE(candle.last_sequence, head);
+    std::string error;
+    const auto read{node::FlowMeshParseObservedCandles(node::FlowMeshObservedCandlePageJson(page), page.interval, head, error)};
+    BOOST_REQUIRE_MESSAGE(read, error);
+    BOOST_CHECK(read->candles == page.candles);
+    BOOST_CHECK_EQUAL(read->before_ms, page.before_ms);
+}
+//! Whether a head refresh ('updates' or 'snapshot') was sent after the
+//! first `from` recorded requests.
+bool RefreshedSince(TickProxy& proxy, const size_t from)
+{
+    std::lock_guard lock{proxy.mutex};
+    for (size_t i{from}; i < proxy.requests.size(); ++i) {
+        if (proxy.requests[i].first == "updates" || proxy.requests[i].first == "snapshot") return true;
+    }
+    return false;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(a_remote_candles_read_never_holds_the_work_gate_across_network)
+{
+    LiveMarket live{*this, m_path_root / "remote-candles-gate", {}, {16}, {}, {true}, {node::FLOWMESH_API_CANDLES_DEFAULT}};
+    // Past the observed-time warm-up this quorum-holding node stamps live.
+    std::this_thread::sleep_for(std::chrono::milliseconds{4600});
+    live.Deposit();
+    TickProxy proxy{.upstream = live.Endpoint()};
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "remote-candles-gate-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    flowmesh::MarketDataQuery query;
+    query.ticks = flowmesh::ClearingTickQuery{std::nullopt, 16};
+    query.observed_time = true;
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, query, error), error);
+    const auto read{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(read, error);
+    BOOST_REQUIRE_EQUAL(read->snapshot.next_microblock_sequence, 2U);
+
+    // The endpoint certifies another auction after this client's market
+    // read, as on any active market: its forming candle ends at 2, past the
+    // verified head 1.
+    live.Certify(SignedCancel(0));
+    bool returned{false};
+    std::string candles_error;
+    std::future<std::optional<flowmesh::ObservedCandlePage>> candles;
+    std::future<interfaces::FlowMeshActionReceipt> status;
+    // Declared last, so it runs first on any early exit: a held request is
+    // released before anything waits for it.
+    struct Release {
+        TickProxy& proxy;
+        ~Release()
+        {
+            {
+                std::lock_guard lock{proxy.mutex};
+                proxy.released = true;
+            }
+            proxy.changed.notify_all();
+        }
+    } const release{proxy};
+    size_t before{0};
+    {
+        std::lock_guard lock{proxy.mutex};
+        proxy.hold_refresh_after_candles = true;
+        before = proxy.requests.size();
+    }
+    candles = std::async(std::launch::async, [&] {
+        auto page{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, candles_error)};
+        {
+            std::lock_guard lock{proxy.mutex};
+            returned = true;
+        }
+        proxy.changed.notify_all();
+        return page;
+    });
+    size_t held{0};
+    {
+        std::unique_lock lock{proxy.mutex};
+        BOOST_REQUIRE(proxy.changed.wait_for(lock, std::chrono::seconds{20}, [&] { return returned || proxy.held > 0; }));
+        held = proxy.held;
+    }
+    if (held > 0) {
+        // The candles read is waiting for the network on behalf of its page:
+        // a trading step (a status read, which sends nothing) must not wait
+        // for it.
+        status = std::async(std::launch::async, [&] { return client->ActionStatus(market, uint256::ONE, false); });
+        BOOST_CHECK_MESSAGE(status.wait_for(std::chrono::seconds{1}) == std::future_status::ready,
+                            "a status read waited for a candles read's network request");
+        {
+            std::lock_guard lock{proxy.mutex};
+            proxy.released = true;
+        }
+        proxy.changed.notify_all();
+        status.get();
+    }
+    const auto page{candles.get()};
+    BOOST_REQUIRE_MESSAGE(page, candles_error);
+    {
+        std::lock_guard lock{proxy.mutex};
+        // Premise: the endpoint served a page past the verified head.
+        BOOST_REQUIRE(proxy.served_newest);
+        BOOST_REQUIRE_EQUAL(*proxy.served_newest, 2U);
+        BOOST_CHECK_EQUAL(proxy.held, 0U);
+        BOOST_REQUIRE_GT(proxy.requests.size(), before);
+        BOOST_CHECK_EQUAL(proxy.requests[before].first, "candles");
+        // The market-data reads below pass.
+        proxy.hold_refresh_after_candles = false;
+    }
+    // Nothing but the page was asked for: the head is not refreshed.
+    BOOST_CHECK(!RefreshedSince(proxy, before));
+    // The page stays within the head this client verified before it.
+    CheckCandlesWithin(*page, 1);
+
+    // The next market-data read moves the head; the next page reaches it.
+    const auto after{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(after, error);
+    BOOST_CHECK_EQUAL(after->snapshot.next_microblock_sequence, 3U);
+    // (Past the endpoint's two candle pages a second for this client.)
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    const auto next{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(next, error);
+    BOOST_REQUIRE(!next->candles.empty());
+    BOOST_CHECK_EQUAL(next->candles.back().last_sequence, 2U);
+    CheckCandlesWithin(*next, 2);
+}
+
+BOOST_AUTO_TEST_CASE(remote_candles_past_the_verified_head_are_held_back)
 {
     LiveMarket live{*this, m_path_root / "remote-candles-race", {}, {16}, {}, {true}, {node::FLOWMESH_API_CANDLES_DEFAULT}};
     // Past the observed-time warm-up this quorum-holding node stamps live.
@@ -6421,18 +6582,31 @@ BOOST_AUTO_TEST_CASE(remote_candles_are_checked_against_a_head_verified_after_th
     const auto held{client->Data(market, std::nullopt, query, error)};
     BOOST_REQUIRE_MESSAGE(held, error);
     BOOST_REQUIRE_EQUAL(held->snapshot.next_microblock_sequence, 2U);
+    // One more certified entry, by a signer of its own.
+    const auto certify_cancel = [&](const unsigned char seed) {
+        CKey key;
+        std::array<unsigned char, 32> secret{};
+        secret.back() = seed;
+        key.Set(secret.begin(), secret.end(), true);
+        flowmesh::Action cancel;
+        cancel.signer = flowmesh::AccountForKey(XOnlyPubKey{key.GetPubKey()});
+        cancel.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+        BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, cancel));
+        live.Certify(cancel);
+    };
 
     // The endpoint certifies another auction between this client's market
     // read and its candles read, as on any active market: the endpoint's
-    // forming candle now ends past the head the client verified.
+    // forming candle now ends past the head the client verified. It is held
+    // back, and nothing is asked for but the page.
     live.Certify(SignedCancel(0));
+    auto sent{proxy.Requests()};
     const auto page{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
     BOOST_REQUIRE_MESSAGE(page, error);
-    BOOST_CHECK_MESSAGE(page->available, page->unavailable_reason);
-    BOOST_REQUIRE(!page->candles.empty());
-    BOOST_CHECK_EQUAL(page->candles.back().last_sequence, 2U);
-    // Accepted against the endpoint's head, verified after the page: the
-    // client's head (with its ticks and their times) is at the page's end.
+    CheckCandlesWithin(*page, 1);
+    BOOST_CHECK(!RefreshedSince(proxy, sent));
+    // The ordinary market-data read verifies the endpoint's head, with its
+    // ticks and their times.
     const auto after{client->Data(market, std::nullopt, query, error)};
     BOOST_REQUIRE_MESSAGE(after, error);
     BOOST_CHECK_EQUAL(after->snapshot.next_microblock_sequence, 3U);
@@ -6445,15 +6619,15 @@ BOOST_AUTO_TEST_CASE(remote_candles_are_checked_against_a_head_verified_after_th
     }
     BOOST_CHECK(timed.contains(1) && timed.contains(2));
 
-    // Fail closed: a page whose newest candle goes past any head the
-    // endpoint can prove is refused, after the head refresh.
+    // An endpoint claiming a candle past any head it can prove: the page is
+    // returned without it, never with it (and not refused).
     {
         std::lock_guard lock{proxy.mutex};
         proxy.candles_ahead = 1000;
     }
-    const auto refused{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
-    BOOST_CHECK(!refused);
-    BOOST_CHECK_MESSAGE(error.find("past the endpoint's verified head") != std::string::npos, error);
+    const auto forged{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(forged, error);
+    CheckCandlesWithin(*forged, 2);
     {
         std::lock_guard lock{proxy.mutex};
         proxy.candles_ahead = 0;
@@ -6462,7 +6636,9 @@ BOOST_AUTO_TEST_CASE(remote_candles_are_checked_against_a_head_verified_after_th
     std::this_thread::sleep_for(std::chrono::milliseconds{1100});
     const auto again{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
     BOOST_REQUIRE_MESSAGE(again, error);
+    BOOST_REQUIRE(!again->candles.empty());
     BOOST_CHECK_EQUAL(again->candles.back().last_sequence, 2U);
+    CheckCandlesWithin(*again, 2);
     // A window past the display bound is never asked for: the request ends
     // at 10000-01-01 (the second page of this second).
     const auto bounded{client->Candles(market, flowmesh::CandleInterval::M1, std::numeric_limits<int64_t>::max(), 10, error)};
@@ -6478,6 +6654,35 @@ BOOST_AUTO_TEST_CASE(remote_candles_are_checked_against_a_head_verified_after_th
         BOOST_REQUIRE(params["before_ms"].isNum());
         BOOST_CHECK_EQUAL(params["before_ms"].getInt<int64_t>(), flowmesh::OBSERVED_MS_LIMIT);
     }
+
+    // Active again: the endpoint's head moves to 3 before the next page. The
+    // page still ends at the verified head 2, whether the newest bucket is
+    // this client's earlier view of the forming one or the bucket before a
+    // new one; nothing is refreshed for it.
+    certify_cancel(0x71);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    sent = proxy.Requests();
+    const auto active{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(active, error);
+    BOOST_REQUIRE(!active->candles.empty());
+    BOOST_CHECK_EQUAL(active->candles.back().last_sequence, 2U);
+    CheckCandlesWithin(*active, 2);
+    BOOST_CHECK(!RefreshedSince(proxy, sent));
+    {
+        std::lock_guard lock{proxy.mutex};
+        BOOST_REQUIRE(proxy.served_newest);
+        BOOST_CHECK_EQUAL(*proxy.served_newest, 3U);
+    }
+    // The next market-data read verifies it; the next page reaches it.
+    const auto caught_up{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(caught_up, error);
+    BOOST_CHECK_EQUAL(caught_up->snapshot.next_microblock_sequence, 4U);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    const auto latest{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(latest, error);
+    BOOST_REQUIRE(!latest->candles.empty());
+    BOOST_CHECK_EQUAL(latest->candles.back().last_sequence, 3U);
+    CheckCandlesWithin(*latest, 3);
     client.reset();
 }
 

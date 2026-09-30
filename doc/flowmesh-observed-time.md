@@ -164,23 +164,40 @@ Replies label the section with the endpoint's URL or say why there is none
 (`endpoint_does_not_advertise_observed_time`, `observed_time_not_yet_received`).
 
 `Candles` asks the endpoint serving the market's data, only when it
-advertises candles. The work gate is not held across the request, which uses a
-lane with its own TLS connection (busy fails at once), so an order never waits
-for a candles page. The page is structure-checked (interval, window, aligned
-ascending opens, non-overlapping sequences, consistent prices, exact volumes)
-and no candle may go past a head this client verified. The endpoint's forming
-candle ends at the endpoint's own head, which on an active market is nearly
-always a few auctions past the head the client verified before the request
-(round trip plus verification, at about five auctions a second). So a page
-that reaches past the held head is checked against a consistent head: the
-endpoint's head verified after the page was served, by the same refresh a
-market-data read makes (with its ticks and their times). An honest endpoint's
-head is then at or past every candle it served; a page that still goes past
-it, or a change of endpoint meanwhile, is refused. So is a page whose window
-ends past 10000-01-01 or holds a candle at or past it (`endpoint_candles_rejected:
-out of range`); the client itself never asks for a window ending past that
-bound. The page stays labelled
-endpoint-reported: its prices, volumes and times are the endpoint's claims.
+advertises candles. It is display work: the work gate is taken only for a
+brief passive read, without I/O, of the endpoint and the verified head (never
+ahead of queued trading work, never reserving the gate after it), and never
+across the request, which uses a lane with its own TLS connection (busy fails
+at once). Nothing is refreshed, verified or written for a candles page, so an
+order never waits for one beyond that read. The page is structure-checked
+(interval, window, aligned ascending opens, non-overlapping sequences,
+consistent prices, exact volumes), and no candle it returns goes past the head
+this client verified before the request.
+
+The endpoint's forming candle ends at the endpoint's own head, which on an
+active market is nearly always a few auctions past the head the client
+verified (round trip plus verification, at about five auctions a second). The
+client never fetches a newer head for a page: the candles ending past its
+verified head (a suffix, since sequences ascend) are held back, and before_ms
+is lowered by whole intervals from from_ms (so an unaligned window stays
+valid) to leave their buckets out. Only the newest bucket still grows, so the
+client keeps, per market and interval, the newest candle of the latest page
+from that endpoint (at most 48, never replaced by an older history page,
+cleared on reconnect); when that earlier view of the first held-back bucket
+(same open and first auction) ends within the verified head, it stands in for
+it and the window includes its bucket. The next market-data read moves the
+head, and the next page reaches it. Accepted residuals: the first read of a
+market and interval from an endpoint has no earlier view, so an active
+forming bucket is missing from that page (Qt rebuilds it from the held ticks,
+exactly when they reach back to the last candle kept, else from one 2 s
+window re-read); a remote RPC consumer that never reads market data sees
+candles only up to its last verified head; and an endpoint that claims a
+candle past any head it can prove is no longer reported as an error, it is
+simply never shown. A page whose window ends past 10000-01-01 or holds a
+candle at or past it is refused (`endpoint_candles_rejected: out of range`);
+the client itself never asks for a window ending past that bound. The page
+stays labelled endpoint-reported: its prices, volumes and times are the
+endpoint's claims.
 
 ## 5. Qt
 
@@ -203,7 +220,9 @@ endpoint-reported: its prices, volumes and times are the endpoint's claims.
   with the note "This server does not report times (older version)".
 - **Candle reads.** A 300-interval window after a market, interval or source
   change (or at most every 2 s while the held ticks cannot continue it), else
-  the newest three intervals about every 10 s. Those newest intervals are
+  the newest three intervals about every 10 s. A remote page ends at the
+  verified head: its newest bucket may be held back or be this client's
+  earlier view of it, which the held ticks continue. Those newest intervals are
   merged only where they continue the held window of the same source: they
   reach back over its newest candle, or their first candle directly follows
   its last auction. Otherwise the whole window is read at once. That happens
@@ -297,8 +316,10 @@ failure; a stalled flush never blocks Record or reads; candle JSON),
 `flowmesh_runtime_tests` (recorded after commit with its liveness, catch-up and
 deferral late, level peer live, throwing clock, the market-data section),
 `flowmesh_client_ticks_tests` (adverts, row binding and plausibility, candle
-page checks, round trip), `flowmesh_client_market_view_tests` (public contract
-on and off for both flags, rate limit, remote labels and candles, older
-endpoint reasons). Qt: `test_b3_flowmeshworkspace-qt` (parsing, requests,
+page checks, round trip, holding back candles past the verified head),
+`flowmesh_client_market_view_tests` (public contract on and off for both
+flags, rate limit, remote labels and candles, held-back candles, a candles
+read never holding the work gate across the network, older endpoint
+reasons). Qt: `test_b3_flowmeshworkspace-qt` (parsing, requests,
 time candles, viewport, fallback, tape, wording, receipt times). Functional
 (opt-in, run directly): `feature_flowmesh_observed_time.py`.

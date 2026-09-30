@@ -15,7 +15,8 @@ candles served, the defaults) and validator 1 (-flowmeshapiobservedtime=0
 - through validator 0's endpoint the client labels the times with that
   endpoint and reads its candles, labelled endpoint-reported, also when an
   auction is certified between its market read and its candles read (the
-  endpoint's forming candle then ends past the client's verified head);
+  endpoint's forming candle then ends past the client's verified head, and
+  the page is held back to that head until a market-data read moves it);
 - validator 1's endpoint never receives observed_time or 'candles', and the
   client says why there are none;
 - validator 3 stopped while the others trade and started again: the times it
@@ -248,19 +249,35 @@ class FlowMeshObservedTimeTest(FlowMeshLiquidityTest):
 
         # An auction certified between the client's market read and its
         # candles read, as on any active market: the endpoint's forming
-        # candle ends past the head the client verified. The page is checked
-        # against the endpoint's head verified after it, and accepted.
+        # candle ends past the head the client verified. The page is bounded
+        # to that head (what goes past it is held back; the client refreshes
+        # nothing for a candles page) and reaches the auction once a
+        # market-data read has verified it.
         client_next = self.client.getflowmeshmarketdata(market, {"limit": 1})["snapshot"]["next_microblock_sequence"]
         self.operator_order(market, "ask", 4 * PRICE, 1)
         assert n0.getflowmeshmarketdata(market, {"limit": 1})["snapshot"]["next_microblock_sequence"] > client_next
         raced = self.client.getflowmeshcandles(market, {"interval": "1m"})
         assert_equal((raced["available"], raced["source"]), (True, relay0.url))
-        newest = raced["candles"][-1]
-        assert newest["last_sequence"] >= client_next, (newest, client_next)
+        assert raced["candles"], raced
+        assert all(candle["last_sequence"] < client_next for candle in raced["candles"]), (raced, client_next)
         after_next = self.client.getflowmeshmarketdata(market, {"limit": 1})["snapshot"]["next_microblock_sequence"]
-        assert newest["last_sequence"] < after_next, (newest, after_next)
-        self.log.info("FLOWMESH_OBSERVED_CANDLES_RACE client_next=%d newest_last=%d after_next=%d",
-                      client_next, newest["last_sequence"], after_next)
+        assert after_next > client_next, (after_next, client_next)
+        caught_up = {}
+
+        def candles_caught_up():
+            try:
+                page = self.client.getflowmeshcandles(market, {"interval": "1m"})
+            except JSONRPCException as error:
+                # Two pages a second per client at the endpoint.
+                if "Public candles request budget exhausted" not in error.error.get("message", ""):
+                    raise
+                return False
+            caught_up["last"] = page["candles"][-1]["last_sequence"] if page["candles"] else None
+            return (bool(page["candles"]) and page["candles"][-1]["last_sequence"] >= client_next and
+                    all(candle["last_sequence"] < after_next for candle in page["candles"]))
+        self.wait_until(candles_caught_up, timeout=30, check_interval=.6)
+        self.log.info("FLOWMESH_OBSERVED_CANDLES_HELD client_next=%d raced_last=%d caught_up_last=%d",
+                      client_next, raced["candles"][-1]["last_sequence"], caught_up["last"])
 
         # Through validator 1 (both flags off): never asked, and why.
         relay0.configure(unavailable=True)
