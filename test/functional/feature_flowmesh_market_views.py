@@ -168,6 +168,35 @@ class FlowMeshMarketViewsTest(FlowMeshLiquidityTest):
         # Without the option every reply is as before.
         assert "book_levels" not in n0.getflowmeshmarketdata(market, {"limit": 1})
 
+    def ladder(self, node, market, side, steps, label):
+        sequence = self.market_data(node, market)["account"]["next_sequence"]
+        status = self.certify_action(node, market, "submitflowmeshladder", (market, side, steps, sequence), label, sequence)
+        self.wait_until(lambda: self.market_data(node, market)["account"]["next_sequence"] == sequence + 1,
+                        timeout=90, check_interval=.1)
+        # The signing reply itself describes the signed ladder.
+        records = self.client_results if node is self.client else self.liquidity_report["native_action_receipts"]
+        response = records[-1]["initial_response"]
+        assert_equal(response["action_id"], status["action_id"])
+        assert_equal((response["side"], response["sequence"]), (side, sequence))
+        assert_equal(response["quantity"], sum(step["quantity"] for step in steps))
+        return response
+
+    def check_ladder_options(self, market):
+        n0 = self.nodes[0]
+        step = {"price": PRICE, "quantity": 1}
+        for side, steps, code, message in (
+            ("buy", [step], -8, "side must be 'bid' or 'ask'"),
+            ("bid", [], -8, "steps must hold 1 to 4 prices"),
+            ("bid", [{"price": PRICE + i, "quantity": 1} for i in range(5)], -8, "steps must hold 1 to 4 prices"),
+            ("bid", {"price": PRICE}, -3, "JSON value of type object is not of expected type array"),
+            ("bid", [step, step], -8, "each ladder price must be distinct"),
+            ("bid", [{"price": PRICE, "quantity": 0}], -8, "quantity must be in the range [1, MAX_MONEY]"),
+            ("bid", [{"price": PRICE, "quantity": 1, "tif": "ioc"}], -8, "Unknown step option 'tif'"),
+            ("bid", [{"price": MAX_MONEY, "quantity": 1}], -8, "bid price must be below MAX_MONEY"),
+            ("bid", [{"price": MAX_MONEY - 1, "quantity": 2}], -8, "the ladder's total quantity or reservation exceeds MAX_MONEY"),
+        ):
+            assert_raises_rpc_error(code, message, n0.submitflowmeshladder, market, side, steps)
+
     def check_levels(self, market, groupings):
         """The local engine's levels equal the ones computed here from every
         paged curve; the client's, from its verified state, equal them at the
@@ -345,7 +374,35 @@ class FlowMeshMarketViewsTest(FlowMeshLiquidityTest):
         # Book levels: the operator's standing ask and a bid of the client,
         # exact and in canonical groups of 10^6 ticks (d = 9, h = 10^6).
         self.order(self.client, market, "bid", PRICE // 2, 3, "levels_bid")
-        levels = self.check_levels(market, ((None, None), ({"orientation": "canonical", "mantissa": 1, "exponent": 6, "decimals": 9}, 10**6)))
+        grouped = ({"orientation": "canonical", "mantissa": 1, "exponent": 6, "decimals": 9}, 10**6)
+        self.check_levels(market, ((None, None), grouped))
+
+        # Ladder orders: several prices on one side as one curve, through the
+        # existing signed submission. Each replaces its side's order.
+        self.check_ladder_options(market)
+        bid_steps = [{"price": PRICE // 2, "quantity": 3}, {"price": PRICE // 2 - 1_000_000, "quantity": 2},
+                     {"price": PRICE // 2 - 3_000_000, "quantity": 4}, {"price": PRICE // 2 - 3_000_001, "quantity": 1}]
+        ask_steps = [{"price": 3 * PRICE, "quantity": 1}, {"price": 2 * PRICE, "quantity": 1}, {"price": 2 * PRICE + 5_000_000, "quantity": 2}]
+        bid = self.ladder(self.client, market, "bid", bid_steps, "ladder_bid")
+        ask = self.ladder(self.nodes[0], market, "ask", ask_steps, "ladder_ask")
+        assert_equal(bid["reservation"], sum(step["price"] * step["quantity"] for step in bid_steps))
+        assert_equal(ask["reservation"], 4)
+        assert_equal([step["price"] for step in bid["steps"]], sorted(step["price"] for step in bid_steps))
+        # Two adjacent prices share a breakpoint: seven, not eight.
+        assert_equal(len(bid["points"]), 7)
+        levels = self.check_levels(market, ((None, None), grouped))
+        # Each step is its own exact level, the account's own share.
+        head, curves = self.all_curves(self.nodes[0], market)
+        own_bid = [curve for curve in curves if curve["side"] == "bid"]
+        assert_equal(len(own_bid), 1)
+        assert_equal(own_bid[0]["points"], [{"price": point["price"], "quantity": point["quantity"]} for point in bid["points"]])
+        exact = self.client.getflowmeshmarketdata(market, {"limit": 1, "levels": {}})
+        if exact["snapshot"]["last_microblock_hash"] == head:
+            rows = exact["book_levels"]["bids"]["levels"]
+            assert_equal([(row["low"], row["size"], row["own"]) for row in rows],
+                         sorted(((step["price"], step["quantity"], step["quantity"]) for step in bid_steps), reverse=True))
+            reserved = exact["account"]["b3_reserved_atoms"]
+            assert_equal(reserved, bid["reservation"])
         self.log.info("FLOWMESH_MARKET_VIEWS levels=%s", json.dumps(levels))
         self.liquidity_report["checks_complete"] = True
         self.log.info("FLOWMESH_MARKET_VIEWS rationed=%s what_if=%s", json.dumps(rationed), json.dumps(what_if))

@@ -915,6 +915,7 @@ RPCHelpMan retryflowmeshaction();
 RPCHelpMan listflowmeshvaultoperations();
 RPCHelpMan submitflowmeshdeposit();
 RPCHelpMan submitflowmeshorder();
+RPCHelpMan submitflowmeshladder();
 RPCHelpMan cancelflowmeshorder();
 RPCHelpMan requestflowmeshwithdrawal();
 RPCHelpMan startflowmeshvalidator();
@@ -1047,6 +1048,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &submitbridgecarrier},
         {"wallet", &submitflowmeshdeposit},
         {"wallet", &submitflowmeshorder},
+        {"wallet", &submitflowmeshladder},
         {"wallet", &simulaterawtransaction},
         {"wallet", &sendall},
         {"wallet", &unloadwallet},

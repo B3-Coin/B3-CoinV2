@@ -247,6 +247,84 @@ BOOST_AUTO_TEST_CASE(buy_funded_with_exactly_the_notional_is_accepted)
     BOOST_CHECK(next.LedgerView().SolvencyHolds());
 }
 
+BOOST_AUTO_TEST_CASE(ladder_orders_are_one_staircase_curve_reserving_exactly_their_notional)
+{
+    using flowmesh::LadderStep;
+    using Breakpoint = flowmesh::ClearingEngine::Breakpoint;
+    const auto same = [](const std::optional<std::vector<Breakpoint>>& got, const std::vector<std::pair<CAmount, CAmount>>& want) {
+        BOOST_REQUIRE(got);
+        BOOST_REQUIRE_EQUAL(got->size(), want.size());
+        for (size_t i{0}; i < want.size(); ++i) {
+            BOOST_CHECK_EQUAL((*got)[i].price, want[i].first);
+            BOOST_CHECK_EQUAL((*got)[i].qty, want[i].second);
+        }
+    };
+    // Steps in any order; adjacent prices share a breakpoint.
+    same(flowmesh::MakeLadderBidCurve({{110, 30}, {100, 10}, {104, 5}, {103, 20}}),
+         {{100, 65}, {101, 55}, {103, 55}, {104, 35}, {105, 30}, {110, 30}, {111, 0}});
+    same(flowmesh::MakeLadderAskCurve({{126, 9}, {120, 7}, {140, 11}, {125, 8}}),
+         {{119, 0}, {120, 7}, {124, 7}, {125, 15}, {126, 24}, {139, 24}, {140, 35}});
+    // Four separate prices use all eight breakpoints; a zero-price ask
+    // step sells at any price.
+    const auto four{flowmesh::MakeLadderBidCurve({{10, 1}, {20, 2}, {30, 3}, {40, 4}})};
+    BOOST_REQUIRE(four && four->size() == flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS);
+    same(flowmesh::MakeLadderAskCurve({{0, 4}, {5, 6}}), {{0, 4}, {4, 4}, {5, 10}});
+    // One step is exactly the limit order.
+    same(flowmesh::MakeLadderBidCurve({{7, 3}}), {{7, 3}, {8, 0}});
+    same(flowmesh::MakeLimitBidCurve(7, 3), {{7, 3}, {8, 0}});
+    same(flowmesh::MakeLadderAskCurve({{7, 3}}), {{6, 0}, {7, 3}});
+    same(flowmesh::MakeLimitAskCurve(7, 3), {{6, 0}, {7, 3}});
+    same(flowmesh::MakeLadderAskCurve({{0, 3}}), {{0, 3}});
+    // Every ladder is a valid v1 curve.
+    const flowmesh::ClearingEngine engine{uint256::ONE, Quote(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    BOOST_CHECK(engine.CurveIsValid(flowmesh::ClearingEngine::Side::BID, *four));
+    BOOST_CHECK(engine.CurveIsValid(flowmesh::ClearingEngine::Side::ASK, *flowmesh::MakeLadderAskCurve({{0, 4}, {5, 6}, {7, 1}, {9, 2}})));
+    // Refused: no steps, five, a repeated price, a zero quantity, a
+    // negative price, a bid at MAX_MONEY, a total beyond MAX_MONEY.
+    for (const auto& steps : std::vector<std::vector<LadderStep>>{
+             {}, {{1, 1}, {2, 1}, {3, 1}, {4, 1}, {5, 1}}, {{5, 1}, {5, 2}}, {{5, 0}}, {{-1, 1}},
+             {{MAX_MONEY / 2, MAX_MONEY / 2 + 1}, {1, MAX_MONEY / 2 + 1}}}) {
+        BOOST_CHECK(!flowmesh::MakeLadderBidCurve(steps));
+        BOOST_CHECK(!flowmesh::MakeLadderAskCurve(steps));
+        BOOST_CHECK(!flowmesh::LadderReservation(true, steps) && !flowmesh::LadderReservation(false, steps));
+    }
+    BOOST_CHECK(!flowmesh::MakeLadderBidCurve({{MAX_MONEY, 1}}));
+    BOOST_CHECK(flowmesh::MakeLadderAskCurve({{MAX_MONEY, 1}}));
+    // Reservation: the sum of quantity x price for a bid, of quantities for an ask.
+    BOOST_CHECK(flowmesh::LadderReservation(true, {{10, 1}, {20, 2}, {30, 3}, {40, 4}}) == CAmount{300});
+    BOOST_CHECK(flowmesh::LadderReservation(false, {{10, 1}, {20, 2}, {30, 3}, {40, 4}}) == CAmount{10});
+    BOOST_CHECK(!flowmesh::LadderReservation(true, {{MAX_MONEY - 1, 2}}));
+
+    // Executed as an ordinary signed SUBMIT: Alice's bid ladder reserves
+    // exactly its notional; Bob's ask ladder clears against it.
+    Net net;
+    const auto ladder = [&](const CKey& key, const bool buy, const std::vector<LadderStep>& steps) {
+        Action a;
+        a.signer = flowmesh::AccountForKey(Xonly(key));
+        a.sequence = 0;
+        a.type = static_cast<uint8_t>(buy ? ActionType::SUBMIT_BID : ActionType::SUBMIT_ASK);
+        a.curve = buy ? *flowmesh::MakeLadderBidCurve(steps) : *flowmesh::MakeLadderAskCurve(steps);
+        BOOST_REQUIRE(flowmesh::SignAction(key, MESH_DOMAIN, MESH_CONFIG, a));
+        return a;
+    };
+    FlowMeshState next{net.state};
+    BatchResult result;
+    (void)MustBuild(net, {Deposit(Outpoint(0x0a, 0)), Deposit(Outpoint(0x0b, 1)),
+                          ladder(net.alice_key, true, {{50'000, 4}, {40'000, 5}}),
+                          ladder(net.bob_key, false, {{50'000, 3}, {60'000, 7}})}, next, result);
+    BOOST_CHECK_EQUAL(result.applied.size(), 4U);
+    BOOST_REQUIRE(result.clearing.cleared);
+    BOOST_CHECK_EQUAL(result.clearing.price, 50'000);
+    BOOST_CHECK_EQUAL(result.clearing.volume, 3);
+    BOOST_CHECK_EQUAL(next.LedgerView().Available(net.alice, BaseX()), 3);
+    // 400,000 reserved, 150,000 spent: the rest (1 at 50,000 and 5 at
+    // 40,000) is still reserved exactly.
+    BOOST_CHECK_EQUAL(next.LedgerView().Reserved(net.alice, Quote()), 250'000);
+    BOOST_CHECK_EQUAL(next.LedgerView().Available(net.alice, Quote()), 200'000);
+    BOOST_CHECK_EQUAL(next.LedgerView().Reserved(net.bob, BaseX()), 7);
+    BOOST_CHECK(next.LedgerView().SolvencyHolds());
+}
+
 BOOST_AUTO_TEST_CASE(microblock_identity_is_semantic_and_permutation_independent)
 {
     // Codex re-audit item 1: one logical action set => one canonical

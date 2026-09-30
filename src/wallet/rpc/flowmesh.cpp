@@ -7,6 +7,7 @@
 #include <flowmesh/auth.h>
 #include <flowmesh/market.h>
 #include <flowmesh/market_view.h>
+#include <flowmesh/microblock.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
 #include <modern/asset_output.h>
@@ -1785,6 +1786,125 @@ RPCHelpMan submitflowmeshorder()
             out.pushKV("side", side);
             out.pushKV("price", price);
             out.pushKV("quantity", quantity);
+            return out;
+        }};
+}
+
+//! The ladder steps of submitflowmeshladder, strictly: 1 to
+//! FLOWMESH_LADDER_MAX_STEPS objects {price, quantity}, distinct positive
+//! prices (a bid below MAX_MONEY), positive quantities, and a reservation
+//! within the monetary range. Checked before any key is read.
+static std::vector<flowmesh::LadderStep> ParseLadderSteps(const UniValue& value, const bool bid)
+{
+    if (!value.isArray()) throw JSONRPCError(RPC_TYPE_ERROR, "steps must be an array");
+    if (value.empty() || value.size() > flowmesh::FLOWMESH_LADDER_MAX_STEPS) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("steps must hold 1 to %d prices", flowmesh::FLOWMESH_LADDER_MAX_STEPS));
+    }
+    std::vector<flowmesh::LadderStep> steps;
+    std::set<CAmount> prices;
+    for (const auto& item : value.getValues()) {
+        if (!item.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "each step must be an object");
+        for (const auto& key : item.getKeys()) {
+            if (key != "price" && key != "quantity") throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown step option '" + key + "'");
+        }
+        const CAmount price{ExactPositiveAmount(item["price"], "price")};
+        const CAmount quantity{ExactPositiveAmount(item["quantity"], "quantity")};
+        if (bid && price >= MAX_MONEY) throw JSONRPCError(RPC_INVALID_PARAMETER, "bid price must be below MAX_MONEY");
+        if (!prices.insert(price).second) throw JSONRPCError(RPC_INVALID_PARAMETER, "each ladder price must be distinct");
+        steps.push_back({price, quantity});
+    }
+    if (!flowmesh::LadderReservation(bid, steps)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "the ladder's total quantity or reservation exceeds MAX_MONEY");
+    }
+    return steps;
+}
+
+RPCHelpMan submitflowmeshladder()
+{
+    return RPCHelpMan{
+        "submitflowmeshladder",
+        "Place a locally signed ladder of limit orders on one side: up to " + util::ToString(flowmesh::FLOWMESH_LADDER_MAX_STEPS) +
+            " prices, each with its own quantity, as ONE standing curve (a staircase with one-tick drops) carried by the same "
+            "signed SUBMIT_BID or SUBMIT_ASK action as submitflowmeshorder. FlowMesh keeps one curve per account and side, so like "
+            "any order it replaces this account's order on that side, and its quantity counts from zero. A bid ladder buys each "
+            "step's quantity at its price or below and reserves exactly the sum of quantity x price B3 atoms; an ask ladder sells "
+            "each step at its price or above and reserves the sum of its quantities. It fills in the same uniform-price auction; "
+            "a step is not a separate order and cannot be cancelled alone. Clients that predate ladders show it only as a general "
+            "curve (curve depth), and their marketable-limit helper then refuses to price the market. A queued/admitted receipt is "
+            "not a fill. For an unknown outcome, retain the action_id and use retryflowmeshaction rather than signing a replacement.\n" +
+            HELP_REQUIRING_PASSPHRASE,
+        {
+            {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte market id"},
+            {"side", RPCArg::Type::STR, RPCArg::Optional::NO, "'bid' or 'ask'"},
+            {"steps", RPCArg::Type::ARR, RPCArg::Optional::NO, "The ladder's prices, in any order", {
+                {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "One price", {
+                    {"price", RPCArg::Type::NUM, RPCArg::Optional::NO, "Limit price in B3 atomic units per base unit"},
+                    {"quantity", RPCArg::Type::NUM, RPCArg::Optional::NO, "Exact integer base-asset quantity at this price"},
+                }},
+            }},
+            {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Account sequence (default: current certified next sequence)"},
+            SubmitWaitArg(),
+        },
+        AcceptedActionResult("Signed ladder submission receipt", {
+            {RPCResult::Type::STR, "side", "bid or ask"},
+            {RPCResult::Type::ARR, "steps", "The ladder's prices, ascending", {
+                {RPCResult::Type::OBJ, "", "One price", {
+                    {RPCResult::Type::NUM, "price", "Limit price in B3 atomic units per base unit"},
+                    {RPCResult::Type::NUM, "quantity", "Base-asset quantity at this price"},
+                }},
+            }},
+            {RPCResult::Type::NUM, "quantity", "Total base-asset quantity"},
+            {RPCResult::Type::NUM, "reservation", "What the ladder reserves: B3 atoms for a bid, base units for an ask"},
+            {RPCResult::Type::ARR, "points", "The signed curve's breakpoints", {
+                {RPCResult::Type::OBJ, "", "Breakpoint", {
+                    {RPCResult::Type::NUM, "price", "B3 atoms per base atomic unit"},
+                    {RPCResult::Type::NUM, "quantity", "Base atomic units at this price"},
+                }},
+            }},
+        }),
+        RPCExamples{HelpExampleCli("submitflowmeshladder", "\"<market_id>\" bid '[{\"price\":10000,\"quantity\":500},{\"price\":9900,\"quantity\":800}]'") +
+                    HelpExampleRpc("submitflowmeshladder", "\"<market_id>\", \"ask\", [{\"price\":10100,\"quantity\":300},{\"price\":10200,\"quantity\":300}]")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<CWallet> wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            const uint256 market_id{ParseMarketId(request.params[0])};
+            const std::string side{request.params[1].get_str()};
+            if (side != "bid" && side != "ask") throw JSONRPCError(RPC_INVALID_PARAMETER, "side must be 'bid' or 'ask'");
+            const bool bid{side == "bid"};
+            auto steps{ParseLadderSteps(request.params[2], bid)};
+            const auto curve{bid ? flowmesh::MakeLadderBidCurve(steps) : flowmesh::MakeLadderAskCurve(steps)};
+            const auto reservation{flowmesh::LadderReservation(bid, steps)};
+            if (!curve || !reservation) throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid ladder");
+            const auto wait{ParseSubmitWait(request.params[4])};
+            WalletActionContext context{GetWalletActionContext(*wallet, market_id)};
+            flowmesh::Action action;
+            action.signer = context.account;
+            action.sequence = OptionalSequence(request.params[3], context.market.next_account_sequence);
+            action.type = static_cast<uint8_t>(bid ? flowmesh::ActionType::SUBMIT_BID : flowmesh::ActionType::SUBMIT_ASK);
+            action.curve = *curve;
+            UniValue out{SubmitSignedAction(*wallet, context, std::move(action), wait)};
+            std::sort(steps.begin(), steps.end(), [](const auto& a, const auto& b) { return a.price < b.price; });
+            UniValue step_list{UniValue::VARR};
+            CAmount total{0};
+            for (const auto& step : steps) {
+                UniValue row{UniValue::VOBJ};
+                row.pushKV("price", step.price);
+                row.pushKV("quantity", step.qty);
+                step_list.push_back(std::move(row));
+                total += step.qty;
+            }
+            UniValue points{UniValue::VARR};
+            for (const auto& point : *curve) {
+                UniValue row{UniValue::VOBJ};
+                row.pushKV("price", point.price);
+                row.pushKV("quantity", point.qty);
+                points.push_back(std::move(row));
+            }
+            out.pushKV("side", side);
+            out.pushKV("steps", std::move(step_list));
+            out.pushKV("quantity", total);
+            out.pushKV("reservation", *reservation);
+            out.pushKV("points", std::move(points));
             return out;
         }};
 }
