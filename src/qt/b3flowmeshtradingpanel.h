@@ -466,6 +466,11 @@ private:
     //! or the source changes. Display only.
     std::map<uint64_t, flowmesh::ObservedStamp> m_tick_times;
     QString m_tick_times_source;
+    //! Tape only, for a source that reports no observed times: when this app
+    //! received a held tick live, one new auction per reply while the link
+    //! was Live (never older rows, a catch-up or a reconnect). Never a chart
+    //! input; dropped with the held tick, and when times become available.
+    std::map<uint64_t, int64_t> m_received_times;
     //! Observed-time candles of m_candles_market at m_candle_interval, as the
     //! source served them (never recomputed here), and when they were read.
     std::optional<B3FlowMeshMarketData::CandlePage> m_candles;

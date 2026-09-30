@@ -584,7 +584,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
     m_order_book->setSnapshot(matched ? m_snapshot : std::nullopt, inverse);
     {
         const bool timed{matched && m_snapshot->observed && m_snapshot->observed->available};
-        const auto rows{matched && m_ticks_market == m_snapshot->market ? B3FlowMeshTradeTape::BuildRows(m_ticks, m_tick_times)
+        const auto rows{matched && m_ticks_market == m_snapshot->market ? B3FlowMeshTradeTape::BuildRows(m_ticks, m_tick_times, m_received_times)
                                                                          : std::vector<B3FlowMeshTradeTape::Row>{}};
         m_trade_tape->setRows(rows, matched ? m_snapshot->units : Units{}, inverse, timed ? m_tick_times_source : QString{},
                               matched && m_snapshot->remote,
@@ -898,11 +898,13 @@ void B3FlowMeshTradingPanel::mergeHeldTicks()
     if (m_ticks_market != m_snapshot->market) {
         m_ticks.clear();
         m_tick_times.clear();
+        m_received_times.clear();
         m_ticks_market = m_snapshot->market;
     }
     if (m_snapshot->ticks && m_snapshot->ticks->available && !B3FlowMeshMarketData::MergeHeldTicks(m_ticks, *m_snapshot->ticks)) {
         // Replaced ticks start their times again.
         m_tick_times.clear();
+        m_received_times.clear();
     }
     const auto* observed{m_snapshot->observed && m_snapshot->observed->available ? &*m_snapshot->observed : nullptr};
     if (observed && observed->source != m_tick_times_source) {
@@ -911,6 +913,9 @@ void B3FlowMeshTradingPanel::mergeHeldTicks()
         m_tick_times_source = observed->source;
     }
     B3FlowMeshMarketData::MergeHeldTimes(m_tick_times, m_ticks, observed);
+    // Receipt times only while no observed times exist, and only for held ticks.
+    if (observed || m_ticks.empty()) m_received_times.clear();
+    else std::erase_if(m_received_times, [&](const auto& item) { return item.first < m_ticks.front().sequence || item.first > m_ticks.back().sequence; });
 }
 
 std::optional<std::pair<flowmesh::CandleInterval, size_t>> B3FlowMeshTradingPanel::candlesDue() const
@@ -2038,7 +2043,22 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
         m_snapshot = std::move(retained); m_response_age = age; mergeHeldTicks(); updateDataViews();
     } else {
         if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age = age;
-        m_snapshot = std::move(fresh); m_response_age = age; mergeHeldTicks(); updateDataViews();
+        // Tape only: a server without observed times, one new auction since
+        // the displayed head, received while the link was Live and without
+        // an event gap: when this app received it. Nothing older, never a
+        // chart input.
+        const bool one_new{m_snapshot && m_snapshot->market == fresh.market && fresh.next_sequence == m_snapshot->next_sequence + 1};
+        const bool was_live{!m_read_failed && m_response_age.isValid() && m_response_age.elapsed() <= B3FlowMeshMarketData::LINK_FRESH_MS};
+        const bool untimed{!fresh.observed || !fresh.observed->available};
+        const bool receipt{one_new && was_live && untimed && !fresh.event_gap && fresh.certified};
+        const uint64_t head_sequence{fresh.next_sequence ? fresh.next_sequence - 1 : 0};
+        const QString head_hash{fresh.head};
+        m_snapshot = std::move(fresh); m_response_age = age; mergeHeldTicks();
+        if (receipt && !m_ticks.empty() && m_ticks_market == m_snapshot->market && m_ticks.back().sequence == head_sequence &&
+            m_ticks.back().hash == head_hash) {
+            m_received_times[head_sequence] = QDateTime::currentMSecsSinceEpoch() - age.elapsed();
+        }
+        updateDataViews();
     }
     // Display only (the banner's "since" time); every gate uses m_response_age.
     m_last_live_wall_ms = QDateTime::currentMSecsSinceEpoch() - age.elapsed(); m_last_live_market = m_snapshot->market;

@@ -2178,6 +2178,42 @@ private Q_SLOTS:
         tape.setRows({}, units, false, {}, true, QStringLiteral("endpoint_does_not_advertise_observed_time"));
         QVERIFY(tape.findChild<QLabel*>(QStringLiteral("flowMeshTradeTapeNote"))->text().contains(QStringLiteral("No matched auctions")));
     }
+    void olderServersGetReceiptTimesForLiveSingleAuctionsOnly()
+    {
+        B3FlowMeshTradingPanel panel;
+        // An older server: ticks, no observed times.
+        const auto at = [](uint64_t next, std::vector<UniValue> ticks, bool observed = false) {
+            auto v{RemoteData(false)};
+            UniValue snapshot{v["snapshot"]}; snapshot.pushKV("next_microblock_sequence", next);
+            snapshot.pushKV("last_microblock_hash", H(static_cast<unsigned char>(next + 100)).GetHex()); v.pushKV("snapshot", snapshot);
+            v.pushKV("clearing_ticks", TickPageJson(ticks));
+            if (observed) v.pushKV("observed_time", ObservedJson({}));
+            return Parse(v);
+        };
+        const auto tick = [](uint64_t sequence) { return TickJson(sequence, H(static_cast<unsigned char>(sequence + 101)), true); };
+        Observe(panel, at(3, {tick(1), tick(2)})); panel.mergeHeldTicks();
+        QElapsedTimer age; age.start();
+        // One new auction while Live: its receipt time, shown in the tape only.
+        QCOMPARE(panel.applySelectedSnapshot(at(4, {tick(3)}), age, {}), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QCOMPARE(panel.m_received_times.size(), size_t{1}); QVERIFY(panel.m_received_times.contains(3));
+        const auto rows{B3FlowMeshTradeTape::BuildRows(panel.m_ticks, panel.m_tick_times, panel.m_received_times)};
+        QVERIFY(rows[0].received_ms); QVERIFY(!rows[1].received_ms);
+        QString tip;
+        QVERIFY(B3FlowMeshTradeTape::TimeText(rows[0], {}, true, &tip) != QStringLiteral("—"));
+        QVERIFY(tip.contains(QStringLiteral("Received by this app")));
+        QVERIFY(!panel.m_chart->timeMode());
+        // Two new auctions at once (a catch-up or a slow poll): none.
+        QCOMPARE(panel.applySelectedSnapshot(at(6, {tick(4), tick(5)}), age, {}), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QCOMPARE(panel.m_received_times.size(), size_t{1});
+        // After a failed read, not Live: none.
+        panel.m_read_failed = true;
+        QCOMPARE(panel.applySelectedSnapshot(at(7, {tick(6)}), age, {}), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QCOMPARE(panel.m_received_times.size(), size_t{1});
+        panel.m_read_failed = false;
+        // A server that reports times: receipt times are dropped, never mixed.
+        QCOMPARE(panel.applySelectedSnapshot(at(8, {tick(7)}, true), age, {}), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QVERIFY(panel.m_received_times.empty());
+    }
     void historyAndStripShowObservedTimesNotMicroblocks()
     {
         B3FlowMeshTradingPanel panel;

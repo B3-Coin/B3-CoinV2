@@ -35,14 +35,19 @@ public:
         //! last direction), 0 for the first one held.
         int direction{0};
         std::optional<flowmesh::ObservedStamp> stamp;
+        //! Only from a source that reports no observed times: when this app
+        //! received the auction live, one new auction per reply (never for
+        //! older rows, a catch-up or a reconnect). Never a chart input.
+        std::optional<int64_t> received_ms;
         bool operator==(const Row&) const = default;
     };
     //! The newest cleared held ticks, newest first, at most MAX_ROWS, with
-    //! the stamps held for them.
+    //! the stamps held for them (and receipt times, where kept).
     static std::vector<Row> BuildRows(const std::deque<B3FlowMeshMarketData::Tick>& ticks,
-                                      const std::map<uint64_t, flowmesh::ObservedStamp>& times);
-    //! "HH:mm:ss" (local) for a live stamp, else "—"; `tooltip` explains it,
-    //! with UTC milliseconds and the sequence.
+                                      const std::map<uint64_t, flowmesh::ObservedStamp>& times,
+                                      const std::map<uint64_t, int64_t>& received = {});
+    //! "HH:mm:ss" (local) for a live stamp or a receipt time, else "—";
+    //! `tooltip` explains which, with UTC milliseconds and the sequence.
     static QString TimeText(const Row& row, const QString& source, bool remote, QString* tooltip = nullptr);
 
     explicit B3FlowMeshTradeTape(QWidget* parent = nullptr);

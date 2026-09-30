@@ -26,7 +26,8 @@ QString Utc(int64_t ms)
 } // namespace
 
 std::vector<B3FlowMeshTradeTape::Row> B3FlowMeshTradeTape::BuildRows(const std::deque<B3FlowMeshMarketData::Tick>& ticks,
-                                                                     const std::map<uint64_t, flowmesh::ObservedStamp>& times)
+                                                                     const std::map<uint64_t, flowmesh::ObservedStamp>& times,
+                                                                     const std::map<uint64_t, int64_t>& received)
 {
     std::vector<Row> rows;
     std::optional<CAmount> previous;
@@ -47,6 +48,8 @@ std::vector<B3FlowMeshTradeTape::Row> B3FlowMeshTradeTape::BuildRows(const std::
         if (const auto stamp{times.find(tick.sequence)}; stamp != times.end() &&
             QString::fromStdString(stamp->second.hash.GetHex()) == tick.hash) {
             row.stamp = stamp->second;
+        } else if (const auto at{received.find(tick.sequence)}; at != received.end()) {
+            row.received_ms = at->second;
         }
         rows.push_back(std::move(row));
     }
@@ -66,6 +69,9 @@ QString B3FlowMeshTradeTape::TimeText(const Row& row, const QString& source, con
         tip = tr("No trade time: %1 applied this auction late (after a catch-up, a lag or a restart), at %2. That is only an upper bound.").arg(who, Utc(row.stamp->ms));
     } else if (row.stamp) {
         tip = tr("No trade time: %1's clock stood behind an earlier stamp when it applied this auction.").arg(who);
+    } else if (row.received_ms) {
+        text = QDateTime::fromMSecsSinceEpoch(*row.received_ms).toLocalTime().toString(QStringLiteral("HH:mm:ss"));
+        tip = tr("Received by this app at %1 (this computer's clock): this server reports no times. The auction was certified at or before then; not a certified or observed trade time.").arg(Utc(*row.received_ms));
     } else {
         tip = source.isEmpty() ? tr("No trade time: this source does not report observed times.")
                                : tr("No trade time: %1 has no observed time for this auction (earlier history, or not observed live).").arg(who);
@@ -139,8 +145,11 @@ void B3FlowMeshTradeTape::setRows(const std::vector<Row>& rows, const B3FlowMesh
             } else if (item->text() != values[c]) {
                 item->setText(values[c]);
             }
-            const QColor foreground{c == 0 ? price_color : c == 2 && (!row.stamp || row.stamp->mode != flowmesh::ObservedMode::LIVE) ? B3Theme::kTextMuted
-                                    : c == 2 && (row.stamp->flags & flowmesh::OBSERVED_IMPLAUSIBLE) ? B3Theme::kWarning : B3Theme::kTextPrimary};
+            const bool live{row.stamp && row.stamp->mode == flowmesh::ObservedMode::LIVE};
+            // Observed live: primary; received by this app: secondary; no time: muted.
+            const QColor time_color{live ? ((row.stamp->flags & flowmesh::OBSERVED_IMPLAUSIBLE) ? B3Theme::kWarning : B3Theme::kTextPrimary)
+                                         : !row.stamp && row.received_ms ? B3Theme::kTextSecondary : B3Theme::kTextMuted};
+            const QColor foreground{c == 0 ? price_color : c == 2 ? time_color : B3Theme::kTextPrimary};
             if (item->foreground().color() != foreground) item->setForeground(foreground);
             const QString tip{c == 0 ? price_tip : c == 2 ? time_tip : QString{}};
             if (item->toolTip() != tip) item->setToolTip(tip);
@@ -151,6 +160,7 @@ void B3FlowMeshTradeTape::setRows(const std::vector<Row>& rows, const B3FlowMesh
     if (!known) note = tr("Verified asset precision required");
     else if (rows.empty()) note = tr("No matched auctions held yet");
     else if (!source.isEmpty()) note = tr("Times observed by %1 · not certified · local time").arg(Who(source, remote));
+    else if (std::any_of(rows.begin(), rows.end(), [](const auto& row) { return row.received_ms.has_value(); })) note = tr("This server reports no times · times received by this app, live only");
     else note = reason == QStringLiteral("endpoint_does_not_advertise_observed_time") ? tr("This server does not report times (older version)")
                                                                                    : tr("No observed times");
     if (remote && known && !rows.empty()) note += tr(" · endpoint-reported");
