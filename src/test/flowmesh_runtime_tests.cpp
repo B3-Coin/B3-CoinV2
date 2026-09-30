@@ -7242,7 +7242,7 @@ std::shared_ptr<node::FlowMeshObservedTimeLog> ObservedLogFor(ObservedTestClock&
 }
 
 //! Health() ticks until the observed-time warm-up (4 s at the default 2 s
-//! round timeout, sampled once a second) has passed with a connected peer.
+//! round timeout) has passed with a connected peer.
 void WarmObservedTime(HealthRuntimeFixture& f, ObservedTestClock& clock)
 {
     f.runtime->FlowMeshPeerConnected(5);
@@ -7309,6 +7309,43 @@ BOOST_AUTO_TEST_CASE(observed_time_is_recorded_after_commit_with_its_liveness)
     const auto page{log->Candles(flowmesh::CandleInterval::H1, std::nullopt, 10)};
     BOOST_REQUIRE_EQUAL(page.candles.size(), 1U);
     BOOST_CHECK_GE(page.candles.front().entries, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(observed_time_warmup_starts_within_a_tick_of_catching_up)
+{
+    // The warm-up (4 s at the default 2 s round timeout) ends one period and
+    // at most a tick after the node catches up, not up to a chain-gate
+    // sample (1 s) later: here the node catches up between two samples,
+    // once by its chain gate opening (as after a start) and once by a peer
+    // connecting while the gate is open.
+    const auto warmup{flowmesh::ObservedWarmupFor(std::chrono::milliseconds{2000}) + std::chrono::milliseconds{250}};
+    for (const bool by_gate : {true, false}) {
+        BOOST_TEST_CONTEXT("by_gate=" << by_gate) {
+            ObservedTestClock clock;
+            const auto log{ObservedLogFor(clock)};
+            HealthRuntimeFixture f{m_args.GetDataDirBase() / (by_gate ? "flowmesh_observed_warmup_gate" : "flowmesh_observed_warmup_peer"), log, 3};
+            f.chain.m_current = f.entries.front().anchor;
+            std::string error;
+            BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+            if (by_gate) {
+                f.runtime->FlowMeshPeerConnected(5);
+                f.chain.SetReconciled(false);
+            }
+            // A tick samples the chain gate; this observer is not caught up.
+            f.Health();
+            if (by_gate) {
+                f.chain.SetReconciled(true);
+            } else {
+                f.runtime->FlowMeshPeerConnected(5);
+            }
+            const auto caught_up{f.clock.m_now};
+            while (f.clock.m_now < caught_up + warmup) f.Health();
+            f.Certificate(9, 0);
+            const auto stamp{ObservedAt(*log, f, 0)};
+            BOOST_CHECK(stamp.mode == flowmesh::ObservedMode::LIVE);
+            BOOST_CHECK_MESSAGE(stamp.delay == flowmesh::ObservedDelay::NONE, flowmesh::ObservedDelayName(stamp.delay));
+        }
+    }
 }
 
 BOOST_AUTO_TEST_CASE(observed_time_marks_a_reconciliation_deferred_certificate_late)

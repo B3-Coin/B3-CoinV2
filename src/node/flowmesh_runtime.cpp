@@ -4588,18 +4588,24 @@ void FlowMeshRuntime::ObserveTimeMaintenance(const size_t connected_peers)
     // acceptable anchor height (for the stale-anchor check). Sampled here,
     // so a commit takes no chain lock for either.
     if (std::none_of(m_markets.begin(), m_markets.end(), [](const auto& item) { return item.second->observed != nullptr; })) return;
-    // Paced: the two chain reads below take the chain lock, and this runs
-    // on the worker; a second's granularity is enough for a 2 s tolerance.
+    // Paced: the two chain reads take the chain lock on the worker, so an
+    // open gate is sampled at most once a second. A closed gate (a brief B3
+    // reconciliation, or the start) is read again on every tick, and
+    // everything else is observed on every tick: the warm-up starts within
+    // a tick of the node catching up and lasts ObservedWarmupFor(), not up
+    // to a sample interval more.
     const auto now{m_config.clock->Now()};
-    if (now < m_next_observed_sample) return;
-    m_next_observed_sample = now + OBSERVED_SAMPLE_INTERVAL;
-    const auto anchor{m_config.chain->Current()};
-    const bool gate_open{m_config.chain->Acceptable(anchor)};
+    if (!m_observed_gate || !m_observed_gate->open || now >= m_next_observed_sample) {
+        m_next_observed_sample = now + OBSERVED_SAMPLE_INTERVAL;
+        const auto anchor{m_config.chain->Current()};
+        m_observed_gate = ObservedGateSample{anchor.height, m_config.chain->Acceptable(anchor)};
+    }
+    const bool gate_open{m_observed_gate->open};
     for (auto& [id, market_ptr] : m_markets) {
         (void)id;
         Market& market{*market_ptr};
         if (!market.observed) continue;
-        if (gate_open) market.observed_anchor_height = anchor.height;
+        if (gate_open) market.observed_anchor_height = m_observed_gate->anchor_height;
         const auto lag{market.lag.Summary()};
         const uint64_t next{market.next_sequence};
         // Without a peer only a node that certifies alone (a local quorum,

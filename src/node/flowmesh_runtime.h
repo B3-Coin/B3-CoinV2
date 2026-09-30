@@ -887,10 +887,17 @@ private:
     std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> m_health;
     //! Worker-owned (under m_market_mutex): the next tick that publishes.
     flowmesh::WireClock::time_point m_next_health_publish{};
-    //! Observed-time upkeep (display only) samples the chain gate at most
-    //! once per OBSERVED_SAMPLE_INTERVAL.
+    //! Observed-time upkeep (display only) samples an open chain gate at
+    //! most once per OBSERVED_SAMPLE_INTERVAL (a closed one on every tick);
+    //! the markets' warm-up is observed on every tick against the latest
+    //! sample.
     static constexpr std::chrono::seconds OBSERVED_SAMPLE_INTERVAL{1};
     flowmesh::WireClock::time_point m_next_observed_sample{};
+    struct ObservedGateSample {
+        int32_t anchor_height{-1};
+        bool open{false};
+    };
+    std::optional<ObservedGateSample> m_observed_gate;
 
     // Exact signed critical objects: <=8192 / 64 MiB globally, <=16 MiB per
     // market. Retry at >=1s, or at once when a pause cancelled the admitted
