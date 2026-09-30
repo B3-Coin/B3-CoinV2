@@ -532,19 +532,19 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
                     const auto average{DisplayPrice(static_cast<CAmount>(*cumulative_notional / static_cast<uint64_t>(level.cumulative)), u, inverse)};
                     tip << tr("Average price to here ≈%1 %2").arg(average.text.startsWith(QStringLiteral("≈")) ? average.text.mid(1) : average.text, price_units);
                 }
-                tip << tr("%n standing order(s) (one per account and side)", nullptr, static_cast<int>(level.curves));
+                tip << (level.curves == 1 ? tr("1 standing order (one per account and side)") : tr("%1 standing orders (one per account and side)").arg(level.curves));
                 if (level.own > 0) tip << tr("Your order: %1 %2 at this level").arg(FormatAmount(level.own, decimals), token);
                 if (!row.click_price.isEmpty()) tip << tr("Click to use this price in the ticket (nothing is signed).");
                 row.tooltip = tip.join(QLatin1Char('\n'));
-                row.accessible = tr("%1 %2, size %3, total %4, %n order(s)", nullptr, static_cast<int>(level.curves))
-                    .arg(displayed_ask ? tr("Sell") : tr("Buy"), row.price, row.size, row.total) + (row.own ? tr(", includes yours") : QString{});
+                row.accessible = tr("%1 %2, size %3, total %4, %5 order(s)").arg(displayed_ask ? tr("Sell") : tr("Buy"), row.price, row.size, row.total).arg(level.curves) +
+                                 (row.own ? tr(", includes yours") : QString{});
                 out.push_back(std::move(row));
             }
         };
         // `bid` names the canonical side: the B3 view's asks are canonical bids.
         build(inverse ? levels->bids : levels->asks, /*bid=*/inverse, m_asks);
         build(inverse ? levels->asks : levels->bids, /*bid=*/!inverse, m_bids);
-        notes << tr("All %n standing order(s) · uniform-price auction", nullptr, static_cast<int>(levels->total_curves));
+        notes << (levels->total_curves == 1 ? tr("All 1 standing order · uniform-price auction") : tr("All %1 standing orders · uniform-price auction").arg(levels->total_curves));
         if (!grouping.exact) notes << tr("Grouped by %1 %2").arg(ScaledDecimal(grouping.mantissa, grouping.exponent), price_units);
         for (const auto* side : {&levels->bids, &levels->asks}) {
             if (!side->available) notes << tr("Some levels unavailable (%1)").arg(side->reason);
@@ -552,7 +552,7 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
         }
         if (inverse) notes << tr("B3 amounts at each order's own price");
     } else {
-        // Fallback: the exact limit-shaped curves of the first curve page.
+        // Fallback: the limit and ladder orders of the first curve page.
         const auto book{ProjectLimitBook(s, inverse)};
         const auto add = [&](const LimitLevel& level, std::vector<Level>& out, CAmount& cumulative, Wide& cumulative_display) {
             Level row;
@@ -564,8 +564,8 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
             row.size = inverse ? FormatAmount(level.gross_notional, 9) : FormatAmount(level.remaining, decimals);
             row.total = FormatWide(cumulative_display, inverse ? 9 : decimals);
             if (level.canonical_price > 0) row.click_price = inverse ? ExactInversePrice(level.canonical_price, decimals) : FormatPrice(level.canonical_price, decimals);
-            row.tooltip = tr("Price: %1 %2%3\nSize: %4\nTotal from the best level: %5\n%n limit order(s) at this level", nullptr, static_cast<int>(level.curve_count))
-                .arg(row.price, price_units, shown.approximate ? tr(" (exact %1)").arg(shown.exact) : QString{}, row.size, row.total);
+            row.tooltip = tr("Price: %1 %2%3\nSize: %4\nTotal from the best level: %5\n%6 limit or ladder order(s) at this level")
+                .arg(row.price, price_units, shown.approximate ? tr(" (exact %1)").arg(shown.exact) : QString{}, row.size, row.total).arg(level.curve_count);
             out.push_back(std::move(row));
         };
         CAmount ask_tokens{0}, bid_tokens{0};
@@ -574,14 +574,14 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
         for (const auto& level : book.bids) add(level, m_bids, bid_tokens, bid_display);
         if (book.complete) { best_bid = book.canonical_best_bid; best_ask = book.canonical_best_ask; }
         notes << (s.levels && !s.levels->available && !s.levels->reason.isEmpty()
-                      ? tr("Book levels unavailable (%1) · limit orders of the first page only").arg(s.levels->reason)
-                      : s.levels && s.levels->available ? tr("Updating levels…") : tr("Limit orders of the first curve page only"));
+                      ? tr("Book levels unavailable (%1) · limit and ladder orders of the first curve page only").arg(s.levels->reason)
+                      : s.levels && s.levels->available ? tr("Updating levels…") : tr("Limit and ladder orders of the first curve page only"));
         if (!s.curves_complete) notes << tr("Partial snapshot · other orders may be missing");
-        if (book.general_curves) notes << tr("%n non-limit curve(s): see Curve depth", nullptr, static_cast<int>(book.general_curves));
-        if (book.invalid_curves) notes << tr("%n invalid or overflowing curve(s) omitted", nullptr, static_cast<int>(book.invalid_curves));
-        if (book.zero_inverse_curves) notes << tr("%n zero-price order(s) have no inverse price", nullptr, static_cast<int>(book.zero_inverse_curves));
+        if (book.general_curves) notes << tr("%1 non-limit curve(s): see Curve depth").arg(book.general_curves);
+        if (book.invalid_curves) notes << tr("%1 invalid or overflowing curve(s) omitted").arg(book.invalid_curves);
+        if (book.zero_inverse_curves) notes << tr("%1 zero-price order(s) have no inverse price").arg(book.zero_inverse_curves);
         if (inverse) notes << tr("B3 amounts are gross equivalents at limit");
-        note_tip += tr("\nShown without the node's book levels: only exact limit-shaped curves of the first 128-curve page are grouped by price; general curves are not turned into limit orders.");
+        note_tip += tr("\nShown without the node's book levels: only the limit and ladder orders of the first 128-curve page are grouped by price; general curves are not turned into limit orders.");
     }
     // The spread row, from the exact best prices whatever the grouping.
     m_spread_tip = tr("The difference between the best sell and best buy price, and its share of their midpoint. "

@@ -1133,7 +1133,7 @@ private Q_SLOTS:
         QVERIFY(ComputeMarketableLimit(snapshot, true, false, 100, std::nullopt, &error));
         auto general{LimitCurve("ask", 5, 1030, 50'000)}; general.points.back().price += 3; general.points.front().price += 1;
         snapshot.own_curves = {general};
-        QVERIFY(!ComputeMarketableLimit(snapshot, true, false, 100, std::nullopt, &error)); QVERIFY(error.contains(QStringLiteral("not a simple limit")));
+        QVERIFY(!ComputeMarketableLimit(snapshot, true, false, 100, std::nullopt, &error)); QVERIFY(error.contains(QStringLiteral("not a limit or ladder order")));
         // The own bid side never matters to a buy.
         snapshot.own_curves = {LimitCurve("bid", 5, 1005, 10)};
         QVERIFY(ComputeMarketableLimit(snapshot, true, false, 100, std::nullopt, &error));
@@ -1481,6 +1481,100 @@ private Q_SLOTS:
         panel.m_orientation->setCurrentIndex(0); QCoreApplication::processEvents();
         QCOMPARE(combo->currentText(), QStringLiteral("0.01"));
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    static Curve LadderCurve(const char* side, unsigned char owner, const std::vector<flowmesh::LadderStep>& steps, CAmount filled = 0)
+    {
+        Curve curve; curve.account = QString::fromStdString(H(owner).GetHex()); curve.side = QLatin1String(side);
+        const bool bid{curve.side == QStringLiteral("bid")};
+        const auto points{bid ? flowmesh::MakeLadderBidCurve(steps) : flowmesh::MakeLadderAskCurve(steps)};
+        if (!points) throw std::runtime_error{"Invalid synthetic ladder fixture"};
+        for (const auto& point : *points) curve.points.push_back({point.price, point.qty});
+        const CAmount maximum{bid ? curve.points.front().quantity : curve.points.back().quantity};
+        curve.filled = filled; curve.remaining = maximum - filled;
+        curve.reserved = *flowmesh::LadderReservation(bid, steps);
+        return curve;
+    }
+    void ladderTicketReadsEveryPriceAndReviewsOneOrder()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        QVERIFY(panel.m_ladder_rows->isHidden());
+        panel.m_ladder->setChecked(true);
+        QVERIFY(!panel.m_ladder_rows->isHidden()); QVERIFY(!panel.m_marketable->isEnabled()); QVERIFY(!panel.m_marketable->isChecked());
+        panel.m_price->setText(QStringLiteral("1")); panel.m_quantity->setText(QStringLiteral("0.3"));
+        panel.m_ladder_prices[0]->setText(QStringLiteral("0.99")); panel.m_ladder_quantities[0]->setText(QStringLiteral("0.2"));
+        panel.m_ladder_prices[1]->setText(QStringLiteral("0.98")); panel.m_ladder_quantities[1]->setText(QStringLiteral("0.4"));
+        const auto steps{panel.ladderSteps()};
+        QVERIFY(steps);
+        QCOMPARE(steps->size(), size_t{3});
+        QCOMPARE((*steps)[1], (flowmesh::LadderStep{990, 200'000}));
+        // 300,000 x 1000 + 200,000 x 990 + 400,000 x 980 atoms: 0.89 B3.
+        QVERIFY2(panel.m_ticket_total->text().contains(QStringLiteral("Ladder of 3 prices · 0.9 tUSD in total")), qPrintable(panel.m_ticket_total->text()));
+        QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("Reserves exactly 0.89 B3")));
+        // No what-if for a ladder: the indicative is a limit order's.
+        QVERIFY(!panel.indicativeDraft().isObject()); QVERIFY(panel.m_indicative->isHidden());
+        // The review shows one order of every price; cancelling signs nothing.
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        QString reviewed;
+        QTimer::singleShot(0, &panel, [&] { if (panel.m_confirmation) { reviewed = panel.m_confirmation->text(); panel.m_confirmation->done(QMessageBox::Cancel); } });
+        panel.begin(B3FlowMeshTrading::Operation::Order);
+        QVERIFY2(reviewed.contains(QStringLiteral("Ladder Buy of 3 prices, ONE standing order on this side")), qPrintable(reviewed));
+        QVERIFY(reviewed.contains(QStringLiteral("0.4 tUSD at 0.98 B3 / tUSD")));
+        QVERIFY(reviewed.contains(QStringLiteral("Replaces your current Buy order")));
+        QCOMPARE(unlock.count(), 0); QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
+        // Rows that do not read exactly are refused, with the row named.
+        QString error;
+        panel.m_ladder_prices[1]->setText(QStringLiteral("1"));
+        QVERIFY(!panel.ladderSteps(&error)); QVERIFY(error.contains(QStringLiteral("must differ")));
+        panel.m_ladder_prices[1]->setText(QStringLiteral("0.98")); panel.m_ladder_quantities[1]->clear();
+        QVERIFY(!panel.ladderSteps(&error)); QVERIFY(error.contains(QStringLiteral("price 3")));
+        QVERIFY(panel.m_ticket_total->text().startsWith(QStringLiteral("Ladder  —")));
+        // One price in ladder mode is an ordinary limit order.
+        panel.m_ladder_prices[0]->clear(); panel.m_ladder_quantities[0]->clear(); panel.m_ladder_prices[1]->clear();
+        QTimer::singleShot(0, &panel, [&] { if (panel.m_confirmation) { reviewed = panel.m_confirmation->text(); panel.m_confirmation->done(QMessageBox::Cancel); } });
+        panel.begin(B3FlowMeshTrading::Operation::Order);
+        QVERIFY(reviewed.startsWith(QStringLiteral("Selected wallet")) && reviewed.contains(QStringLiteral("Limit Buy: 0.3 tUSD")));
+        // Leaving ladder mode enables the marketable limit again.
+        panel.m_ladder->setChecked(false);
+        QVERIFY(panel.m_ladder_rows->isHidden()); QVERIFY(panel.m_marketable->isEnabled());
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void editingALadderPrefillsWhatRemainsAtEachPrice()
+    {
+        auto s{Parse(RemoteData())};
+        // The viewer's bid ladder, 0.1 filled from its best price.
+        const auto ladder{LadderCurve("bid", 5, {{1000, 300'000}, {990, 200'000}, {980, 100'000}}, 100'000)};
+        s.curves.front() = ladder; s.own_curves = {ladder};
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, s);
+        QCOMPARE(panel.m_own_view->item(0, 1)->text(), QStringLiteral("Ladder · 1 / 0.99 / 0.98"));
+        panel.m_own_view->selectRow(0);
+        QVERIFY(panel.editAvailable());
+        panel.editOrder();
+        QVERIFY(panel.m_ladder->isChecked());
+        QCOMPARE(panel.m_price->text(), QStringLiteral("1")); QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.2"));
+        QCOMPARE(panel.m_ladder_prices[0]->text(), QStringLiteral("0.99")); QCOMPARE(panel.m_ladder_quantities[0]->text(), QStringLiteral("0.2"));
+        QCOMPARE(panel.m_ladder_prices[1]->text(), QStringLiteral("0.98")); QCOMPARE(panel.m_ladder_quantities[1]->text(), QStringLiteral("0.1"));
+        QVERIFY(panel.m_ladder_prices[2]->text().isEmpty());
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("replaces that side's whole order")));
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QVERIFY(m_wallet->IsLocked());
+    }
+    void ladderOrdersAreBookLevelsForTheMarketableLimit()
+    {
+        // Another account's ask ladder is exact limit liquidity, so the book
+        // stays complete and the marketable limit prices against it.
+        auto s{SyntheticLimitBook(4)};
+        s.curves.push_back(LadderCurve("ask", 95, {{1004, 50'000}, {1006, 70'000}}));
+        const auto book{ProjectLimitBook(s, false)};
+        QVERIFY(book.complete); QCOMPARE(book.general_curves, size_t{0});
+        QCOMPARE(*book.canonical_best_ask, CAmount{1004});
+        QString error;
+        const auto limit{ComputeMarketableLimit(s, true, false, 100, std::nullopt, &error)};
+        QVERIFY2(limit, qPrintable(error));
+        QCOMPARE(limit->reference, CAmount{1004});
+        // The viewer's own ask ladder is never crossed, at any of its prices.
+        auto own{s}; const auto mine{LadderCurve("ask", 5, {{1020, 10'000}, {1012, 10'000}})};
+        own.curves.push_back(mine); own.own_curves = {mine};
+        QVERIFY(!ComputeMarketableLimit(own, true, false, 1000, std::nullopt, &error));
+        QVERIFY(error.contains(QStringLiteral("cross your own opposite order")));
     }
     void orderBookSpreadRowIsExactCrossedOrOneSided()
     {

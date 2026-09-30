@@ -4,6 +4,7 @@
 #define BITCOIN_QT_B3FLOWMESHTRADINGPANEL_H
 
 #include <qt/b3flowmeshtrading.h>
+#include <flowmesh/microblock.h>
 #include <qt/b3flowmeshmarketdata.h>
 #include <qt/b3flowmeshnotices.h>
 #include <qt/b3flowmeshorderbook.h>
@@ -14,6 +15,7 @@
 #include <QPointer>
 #include <QWidget>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -155,6 +157,9 @@ private:
             // shown price may change; its slippage and mode may not.
             bool marketable{false};
             QString slippage;
+            //! Ladder mode and its rows, exactly as clicked.
+            bool ladder{false};
+            QStringList ladder_text;
         };
         std::optional<OrderContext> order_context;
     };
@@ -187,8 +192,17 @@ private:
     //! is the caller's gate.
     std::optional<B3FlowMeshMarketData::MarketableLimit> marketableLimit(QString* error) const;
     //! The ticket's order as the indicative draft {side, price, quantity} in
-    //! canonical units; null when it does not parse.
+    //! canonical units; null when it does not parse or is a ladder.
     UniValue indicativeDraft() const;
+    //! The ticket's ladder steps in canonical units, in row order (the price
+    //! and quantity fields first, then each non-empty ladder row), each read
+    //! exactly as a single order's price and quantity are; nullopt with
+    //! `error` when a row does not parse, prices repeat, or the ladder's
+    //! reservation leaves the monetary range. `adjusted`: an inverse price
+    //! was adjusted in the customer's favour.
+    std::optional<std::vector<flowmesh::LadderStep>> ladderSteps(QString* error = nullptr, bool* adjusted = nullptr) const;
+    //! The ladder fields' text, for a deferred review's comparison.
+    QStringList ladderText() const;
     //! The last held tick of `market`, when the held ticks are that market's.
     std::optional<uint64_t> ticksAfter(const QString& market) const;
     //! The book grouping the order book displays (exact: none).
@@ -452,6 +466,11 @@ private:
     QString m_edit_side;
     std::vector<B3FlowMeshMarketData::Point> m_edit_points;
     QCheckBox* m_marketable{nullptr};
+    //! Ladder mode: the price and quantity fields are its first step, these
+    //! its second to fourth (empty rows are skipped).
+    QCheckBox* m_ladder{nullptr};
+    QWidget* m_ladder_rows{nullptr};
+    std::array<QLineEdit*, flowmesh::FLOWMESH_LADDER_MAX_STEPS - 1> m_ladder_prices{}, m_ladder_quantities{};
     QLineEdit* m_slippage{nullptr};
     QLabel* m_marketable_note{nullptr};
     QLineEdit* m_endpoint{nullptr};

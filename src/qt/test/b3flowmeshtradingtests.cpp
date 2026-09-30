@@ -13,6 +13,7 @@
 #include <streams.h>
 #include <test/util/flowmesh.h>
 #include <util/int128.h>
+#include <util/moneystr.h>
 #include <util/translation.h>
 #include <QTest>
 #include <algorithm>
@@ -444,6 +445,82 @@ private Q_SLOTS:
             a.replaces->limit.reset(); a.replaces->points = 3;
             QVERIFY(Describe(a).contains(QStringLiteral("curve of 3 points (0.75 tUSD left)")));
         }
+    }
+    void ladderOrdersSignOneCurveAndReviewEveryPrice()
+    {
+        auto a{Order()}; a.display_decimals = 6; a.display_ticker = QStringLiteral("tUSD");
+        a.ladder = {{1000, 300'000}, {990, 200'000}, {980, 400'000}, {979, 100'000}};
+        a.price = 1000; a.amount = 1'000'000;
+        const auto r{Parameters(a)};
+        QCOMPARE(r.method, std::string{"submitflowmeshladder"});
+        QCOMPARE(r.params.size(), size_t{4});
+        QCOMPARE(r.params[1].get_str(), std::string{"bid"});
+        QCOMPARE(r.params[2].size(), size_t{4});
+        QCOMPARE(r.params[2][1]["price"].getInt<int64_t>(), int64_t{990});
+        QCOMPARE(r.params[2][1]["quantity"].getInt<int64_t>(), int64_t{200'000});
+        QCOMPARE(r.params[3].getInt<int64_t>(), int64_t{7});
+        a.submit_wait_ms = 2000; QCOMPARE(Parameters(a).params.size(), size_t{5}); a.submit_wait_ms = 0;
+        // The review lists every price, best first, and the exact reservation.
+        const auto text{Describe(a)};
+        QVERIFY2(text.contains(QStringLiteral("Ladder Buy of 4 prices, ONE standing order on this side")), qPrintable(text));
+        QVERIFY(text.indexOf(QStringLiteral("0.3 tUSD at 1 B3 / tUSD")) < text.indexOf(QStringLiteral("0.1 tUSD at 0.979 B3 / tUSD")));
+        QVERIFY(text.contains(QStringLiteral("Total quantity: 1 tUSD")));
+        // 300,000 x 1000 + 200,000 x 990 + 400,000 x 980 + 100,000 x 979 atoms.
+        QVERIFY(text.contains(QStringLiteral("Exact B3 reservation: %1 B3").arg(QString::fromStdString(FormatMoney(300'000'000 + 198'000'000 + 392'000'000 + 97'900'000)))));
+        QVERIFY(text.contains(QStringLiteral("a price cannot be cancelled or edited alone")));
+        QVERIFY(text.contains(QStringLiteral("Wallets before this version show it only as a curve")));
+        QCOMPARE(ShortTitle(a), QStringLiteral("Buy ladder · 4 prices · 1 tUSD"));
+        a.replaces = Action::Replaces{500'000, 0, std::nullopt, 8, 4};
+        QVERIFY(Describe(a).contains(QStringLiteral("Replaces your current Buy ladder of 4 prices (0.5 tUSD left)")));
+        // The B3 view: exact reciprocal prices and token caps.
+        a.inverse_display = true;
+        QVERIFY(Describe(a).contains(QStringLiteral("Ladder Sell B3 of 4 prices")));
+        QVERIFY(Describe(a).contains(QStringLiteral("receive up to 0.3 tUSD at no less than 1 tUSD / B3 (exact)")));
+        a.inverse_display = false;
+        // Refused before any call: a repeated price, a lone step, an
+        // unaffordable reservation, and more than four prices.
+        auto repeated{a}; repeated.ladder[1].first = 1000; QVERIFY(Rejected([&] { Parameters(repeated); }));
+        auto lone{a}; lone.ladder.resize(1); QVERIFY(Rejected([&] { Parameters(lone); }));
+        auto five{a}; five.ladder.emplace_back(970, 1); QVERIFY(Rejected([&] { Parameters(five); }));
+        auto poor{a}; poor.market.b3_available = 100; QVERIFY(Rejected([&] { Parameters(poor); }));
+        // An ask ladder reserves its quantities.
+        auto ask{a}; ask.side = QStringLiteral("ask"); ask.ladder = {{1010, 100'000}, {1020, 200'000}};
+        QCOMPARE(Parameters(ask).method, std::string{"submitflowmeshladder"});
+        QVERIFY(Describe(ask).contains(QStringLiteral("Reserves 0.3 tUSD (the sum of the quantities)")));
+        // A retained ladder is named as one, never re-priced.
+        SavedAction saved; saved.type = 0; saved.sequence = 9;
+        const auto points{*flowmesh::MakeLadderBidCurve({{1000, 300'000}, {990, 200'000}})};
+        for (const auto& point : points) saved.canonical_points.push_back({point.price, point.qty});
+        QCOMPARE(ShortTitle(saved, 6, QStringLiteral("tUSD"), false), QStringLiteral("Buy ladder · 2 prices · sequence 9"));
+    }
+    void ladderCurvesAreRecognisedExactlyWithWhatRemains()
+    {
+        using B3FlowMeshMarketData::LadderStepsOf;
+        using B3FlowMeshMarketData::Point;
+        const auto points = [](const std::vector<flowmesh::ClearingEngine::Breakpoint>& curve) {
+            std::vector<Point> out; for (const auto& point : curve) out.push_back({point.price, point.qty}); return out;
+        };
+        // A four-price bid ladder after a fill of 35: the best-priced lots
+        // fill first (the 110 and 104 prices), 103 and 100 are whole.
+        const auto bid{points(*flowmesh::MakeLadderBidCurve({{100, 10}, {103, 20}, {104, 5}, {110, 30}}))};
+        const auto steps{LadderStepsOf(QStringLiteral("bid"), bid, 35)};
+        QVERIFY(steps); QCOMPARE(steps->size(), size_t{4});
+        QCOMPARE((*steps)[0], (B3FlowMeshMarketData::LadderStep{100, 10, 10}));
+        QCOMPARE((*steps)[1], (B3FlowMeshMarketData::LadderStep{103, 20, 20}));
+        QCOMPARE((*steps)[2], (B3FlowMeshMarketData::LadderStep{104, 5, 0}));
+        QCOMPARE((*steps)[3], (B3FlowMeshMarketData::LadderStep{110, 30, 0}));
+        // An ask ladder with a price-zero step; a limit order is one step.
+        const auto ask{LadderStepsOf(QStringLiteral("ask"), points(*flowmesh::MakeLadderAskCurve({{0, 4}, {5, 6}})), 2)};
+        QVERIFY(ask); QCOMPARE((*ask)[0], (B3FlowMeshMarketData::LadderStep{0, 4, 2})); QCOMPARE((*ask)[1], (B3FlowMeshMarketData::LadderStep{5, 6, 6}));
+        const auto limit{LadderStepsOf(QStringLiteral("bid"), points(*flowmesh::MakeLimitBidCurve(7, 3)))};
+        QVERIFY(limit); QCOMPARE(limit->size(), size_t{1});
+        // Anything else is not a ladder: a slope, an equivalent but not
+        // canonical staircase (a redundant flat point), a bid not ending at zero.
+        QVERIFY(!LadderStepsOf(QStringLiteral("bid"), {{100, 10}, {200, 0}}));
+        QVERIFY(!LadderStepsOf(QStringLiteral("bid"), {{100, 10}, {101, 5}, {105, 5}, {109, 5}, {110, 0}}));
+        QVERIFY(!LadderStepsOf(QStringLiteral("bid"), {{100, 10}, {101, 5}}));
+        QVERIFY(!LadderStepsOf(QStringLiteral("ask"), {{5, 4}, {6, 6}}));
+        QVERIFY(!LadderStepsOf(QStringLiteral("side"), bid));
     }
     void exactReceiptRetryHasNoSigningOrEconomicArguments()
     {

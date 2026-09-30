@@ -272,14 +272,27 @@ std::vector<flowmesh::LevelGrouping> BookGroupingChoices(std::optional<CAmount> 
                                                          const Units& units, bool inverse);
 //! A grouping's display step ("0.01"), or "Exact".
 QString GroupingLabel(const flowmesh::LevelGrouping& grouping);
-//! Only exact MakeLimitBidCurve / MakeLimitAskCurve shapes are projected.
-//! Invalid curves and overflowing entire price groups are omitted fail-closed;
-//! general curves remain in Aggregate(), not misrepresented as limit orders.
+//! Only limit orders and ladder orders (LadderStepsOf: each price is a limit)
+//! are projected. Invalid curves and overflowing entire price groups are
+//! omitted fail-closed; general curves remain in Aggregate(), not
+//! misrepresented as limit orders.
 LimitBook ProjectLimitBook(const Snapshot& snapshot, bool inverse);
 //! The exact limit price of a native limit-shaped curve (the shapes
 //! MakeLimitBidCurve / MakeLimitAskCurve emit); nullopt for any other curve.
 //! It does not validate the curve itself.
 std::optional<CAmount> LimitPriceOf(const Curve& curve);
+//! One price of a ladder order: canonical price, original quantity and what
+//! remains of it after fills (the best-priced lots fill first).
+struct LadderStep {
+    CAmount price{0}, quantity{0}, remaining{0};
+    bool operator==(const LadderStep&) const = default;
+};
+//! The prices of a curve exactly as a ladder order builds it
+//! (flowmesh::MakeLadderBidCurve / MakeLadderAskCurve: 1 to 4 prices, one
+//! of them a limit order), ascending, with each price's remaining quantity
+//! after `filled`; nullopt for any other curve.
+std::optional<std::vector<LadderStep>> LadderStepsOf(const QString& side, const std::vector<Point>& points, CAmount filled = 0);
+std::optional<std::vector<LadderStep>> LadderStepsOf(const Curve& curve);
 
 //! A client-side "marketable limit": the best verified opposite price
 //! moved by at most the given slippage. It is an ordinary limit order, not a

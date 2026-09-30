@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace B3FlowMeshTrading {
@@ -47,12 +48,19 @@ struct Action {
         QString reference_display;
     };
     std::optional<Marketable> marketable;
+    //! A ladder order of 2 to 4 prices: canonical (price, quantity) steps,
+    //! signed as ONE curve through submitflowmeshladder; empty for a single
+    //! limit order (price and amount). For a ladder, price is its best step
+    //! and amount its total quantity, for titles only.
+    std::vector<std::pair<CAmount, CAmount>> ladder;
     //! Presentation only: the account's current order on this side, which a
     //! SUBMIT atomically replaces (its quantity then counts from zero).
     struct Replaces {
         CAmount remaining{0}, filled{0};
         std::optional<CAmount> limit; // Empty for a curve that is not a simple limit.
         size_t points{0};
+        //! Prices of a replaced ladder order (0: not a ladder).
+        size_t ladder_prices{0};
     };
     std::optional<Replaces> replaces;
 };

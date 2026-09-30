@@ -5,6 +5,7 @@
 #include <flowmesh/clearing.h>
 #include <flowmesh/market.h>
 #include <flowmesh/market_view.h>
+#include <flowmesh/microblock.h>
 #include <util/strencodings.h>
 #include <util/int128.h>
 #include <QObject>
@@ -865,26 +866,33 @@ LimitBook ProjectLimitBook(const Snapshot& snapshot, bool inverse)
             continue;
         }
         // These are precisely the integer step shapes emitted by the native
-        // limit helpers. Sloped or merely equivalent curves are not orders.
-        const auto limit{LimitPriceOf(curve)};
-        if (!limit) {
+        // limit and ladder helpers: every price is a limit order's. Sloped or
+        // merely equivalent curves are not orders.
+        const auto steps{LadderStepsOf(curve)};
+        if (!steps) {
             ++out.general_curves;
             continue;
         }
-        const CAmount price{*limit};
-        const Wide notional{Wide{static_cast<uint64_t>(price)} * static_cast<uint64_t>(curve.remaining)};
-        if (notional > static_cast<uint64_t>(MAX_MONEY)) {
+        bool overflow{false}, zero{false};
+        for (const auto& step : *steps) {
+            overflow |= Wide{static_cast<uint64_t>(step.price)} * static_cast<uint64_t>(step.remaining) > static_cast<uint64_t>(MAX_MONEY);
+            zero |= inverse && step.price == 0 && step.remaining > 0;
+        }
+        if (overflow) {
             ++out.invalid_curves;
             continue;
         }
-        if (inverse && price == 0) {
+        if (zero) {
             ++out.zero_inverse_curves;
             continue;
         }
-        auto& group{groups[{bid, price}]};
-        group.remaining += static_cast<uint64_t>(curve.remaining);
-        group.notional += notional;
-        ++group.curves;
+        for (const auto& step : *steps) {
+            if (step.remaining == 0) continue;
+            auto& group{groups[{bid, step.price}]};
+            group.remaining += static_cast<uint64_t>(step.remaining);
+            group.notional += Wide{static_cast<uint64_t>(step.price)} * static_cast<uint64_t>(step.remaining);
+            ++group.curves;
+        }
     }
     for (const auto& [key, group] : groups) {
         // Omit the WHOLE group if aggregation exceeds the supported range;
@@ -956,6 +964,48 @@ QString GroupingLabel(const flowmesh::LevelGrouping& grouping)
     return text;
 }
 
+std::optional<std::vector<LadderStep>> LadderStepsOf(const QString& side, const std::vector<Point>& points, const CAmount filled)
+{
+    const bool bid{side == QStringLiteral("bid")};
+    if ((!bid && side != QStringLiteral("ask")) || points.empty() || points.size() > flowmesh::HARD_MAX_CURVE_POINTS || filled < 0) return std::nullopt;
+    std::vector<flowmesh::LadderStep> steps;
+    if (!bid && points.front().quantity > 0) {
+        if (points.front().price != 0) return std::nullopt;
+        steps.push_back({0, points.front().quantity});
+    }
+    for (size_t i{1}; i < points.size(); ++i) {
+        const auto& a{points[i - 1]};
+        const auto& b{points[i]};
+        if (a.quantity == b.quantity) continue;
+        // Every change is a one-tick step.
+        if (a.price >= MAX_MONEY || b.price != a.price + 1) return std::nullopt;
+        if (bid ? b.quantity > a.quantity : b.quantity < a.quantity) return std::nullopt;
+        steps.push_back(bid ? flowmesh::LadderStep{a.price, a.quantity - b.quantity} : flowmesh::LadderStep{b.price, b.quantity - a.quantity});
+    }
+    // Exactly the builder's canonical points, nothing merely equivalent.
+    const auto rebuilt{bid ? flowmesh::MakeLadderBidCurve(steps) : flowmesh::MakeLadderAskCurve(steps)};
+    if (!rebuilt || rebuilt->size() != points.size()) return std::nullopt;
+    std::vector<flowmesh::ClearingEngine::Breakpoint> exact;
+    for (size_t i{0}; i < points.size(); ++i) {
+        if ((*rebuilt)[i].price != points[i].price || (*rebuilt)[i].qty != points[i].quantity) return std::nullopt;
+        exact.push_back((*rebuilt)[i]);
+    }
+    const auto remaining = [&](const CAmount price) {
+        return price < 0 ? CAmount{0} : std::max<CAmount>(0, flowmesh::ClearingEngine::EvaluateCurve(exact, price) - filled);
+    };
+    std::vector<LadderStep> out;
+    std::sort(steps.begin(), steps.end(), [](const auto& a, const auto& b) { return a.price < b.price; });
+    for (const auto& step : steps) {
+        out.push_back({step.price, step.qty, bid ? remaining(step.price) - remaining(step.price + 1) : remaining(step.price) - remaining(step.price - 1)});
+    }
+    return out;
+}
+
+std::optional<std::vector<LadderStep>> LadderStepsOf(const Curve& curve)
+{
+    return LadderStepsOf(curve.side, curve.points, curve.filled);
+}
+
 std::optional<CAmount> LimitPriceOf(const Curve& curve)
 {
     const auto& p{curve.points};
@@ -1021,12 +1071,16 @@ std::optional<MarketableLimit> ComputeMarketableLimit(const Snapshot& s, bool di
     }
     out.visible = visible > static_cast<uint64_t>(MAX_MONEY) ? MAX_MONEY : static_cast<CAmount>(visible);
     out.covers_quantity = quantity && *quantity > 0 && out.visible >= *quantity;
-    // Never cross this account's own opposite order.
+    // Never cross this account's own opposite order (any price of a ladder).
     for (const auto& own : s.own_curves) {
         if (own.side == (bid ? QStringLiteral("bid") : QStringLiteral("ask")) || own.remaining == 0) continue;
-        const auto price{LimitPriceOf(own)};
-        if (!price) return fail(QStringLiteral("Your own opposite order is not a simple limit; cancel it or enter a limit price."));
-        if (bid ? *price <= out.price : *price >= out.price) return fail(QStringLiteral("This limit would cross your own opposite order; cancel or edit it first, or enter a limit price."));
+        const auto steps{LadderStepsOf(own)};
+        if (!steps) return fail(QStringLiteral("Your own opposite order is not a limit or ladder order; cancel it or enter a limit price."));
+        for (const auto& step : *steps) {
+            if (step.remaining > 0 && (bid ? step.price <= out.price : step.price >= out.price)) {
+                return fail(QStringLiteral("This limit would cross your own opposite order; cancel or edit it first, or enter a limit price."));
+            }
+        }
     }
     return out;
 }

@@ -238,6 +238,31 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_marketable_note = Label(QString{}, ticket_card); m_marketable_note->setObjectName(QStringLiteral("flowMeshMarketableNote"));
     B3Theme::markTextRole(m_marketable_note, QStringLiteral("secondary")); m_marketable_note->hide(); ticket->addWidget(m_marketable_note);
     m_quantity_label = Label(tr("Quantity · token"), ticket_card); ticket->addWidget(m_quantity_label); m_quantity = entry("flowMeshRawQuantity", 64); m_quantity->setPlaceholderText(tr("Enter quantity")); ticket->addWidget(m_quantity);
+    // Ladder: up to three more prices on this side, one order with the first.
+    m_ladder = new QCheckBox{tr("Ladder · up to %1 prices").arg(flowmesh::FLOWMESH_LADDER_MAX_STEPS), ticket_card};
+    m_ladder->setObjectName(QStringLiteral("flowMeshLadder"));
+    m_ladder->setToolTip(tr("Several prices on this side as ONE order: each price has its own quantity, and the price and quantity above are the first. "
+                            "Like any order it replaces your order on this side; a price cannot be cancelled or edited alone. A buy reserves exactly the sum of quantity x price, as separate orders would. Nothing is signed until you review it."));
+    ticket->addWidget(m_ladder);
+    m_ladder_rows = new QWidget{ticket_card};
+    auto* ladder_grid{new QGridLayout{m_ladder_rows}}; ladder_grid->setContentsMargins(0, 0, 0, 0);
+    for (size_t i{0}; i < m_ladder_prices.size(); ++i) {
+        const int n{static_cast<int>(i) + 2};
+        m_ladder_prices[i] = entry(QStringLiteral("flowMeshLadderPrice%1").arg(n).toLatin1().constData(), 64);
+        m_ladder_quantities[i] = entry(QStringLiteral("flowMeshLadderQuantity%1").arg(n).toLatin1().constData(), 64);
+        m_ladder_prices[i]->setPlaceholderText(tr("Price %1").arg(n)); m_ladder_quantities[i]->setPlaceholderText(tr("Quantity %1").arg(n));
+        m_ladder_prices[i]->setAccessibleName(tr("Ladder price %1").arg(n)); m_ladder_quantities[i]->setAccessibleName(tr("Ladder quantity %1").arg(n));
+        ladder_grid->addWidget(m_ladder_prices[i], static_cast<int>(i), 0); ladder_grid->addWidget(m_ladder_quantities[i], static_cast<int>(i), 1);
+        connect(m_ladder_prices[i], &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateTicket);
+        connect(m_ladder_quantities[i], &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateTicket);
+    }
+    m_ladder_rows->hide(); ticket->addWidget(m_ladder_rows);
+    connect(m_ladder, &QCheckBox::toggled, this, [this](bool on) {
+        m_ladder_rows->setVisible(on);
+        // A ladder names its own prices: never a marketable limit.
+        if (on) m_marketable->setChecked(false);
+        updateTicket(); updateControls();
+    });
     m_grid_note = Label(tr("Token units will be verified from asset metadata."), ticket_card); B3Theme::markTextRole(m_grid_note, QStringLiteral("secondary"));
     m_ticket_available = Label(tr("Available  —"), ticket_card); ticket->addWidget(m_ticket_available); m_ticket_total = Label(tr("Limit notional  —"), ticket_card); ticket->addWidget(m_ticket_total);
     m_ticket_fee = Label(tr("Spot fee 0.01% · seller-paid"), ticket_card); B3Theme::markTextRole(m_ticket_fee, QStringLiteral("secondary")); ticket->addWidget(m_ticket_fee);
@@ -681,8 +706,17 @@ void B3FlowMeshTradingPanel::updateDataViews()
     }
     for (const auto& c : s.own_curves) {
         QString description;
+        const auto ladder{LadderStepsOf(c)};
         if (c.points.size() == 2 && c.points[1].price == c.points[0].price + 1) description = FormatDisplayPrice(c.side == QStringLiteral("bid") ? c.points[0].price : c.points[1].price, u, inverse) + QLatin1Char(' ') + (inverse ? price_units : QStringLiteral("B3"));
-        else description = tr("%1-point curve").arg(c.points.size());
+        else if (ladder && ladder->size() > 1) {
+            // Best first, each price with quantity left.
+            auto steps{*ladder};
+            const bool bid{c.side == QStringLiteral("bid")};
+            std::sort(steps.begin(), steps.end(), [&](const auto& a, const auto& b) { return bid ? a.price > b.price : a.price < b.price; });
+            QStringList prices;
+            for (const auto& step : steps) if (step.remaining > 0) prices << FormatDisplayPrice(step.price, u, inverse);
+            description = tr("Ladder · %1").arg(prices.join(QStringLiteral(" / ")));
+        } else description = tr("%1-point curve").arg(c.points.size());
         const bool buy{DisplayBuy(c.side, inverse)};
         own.push_back({inverse ? (buy ? tr("Buy B3") : tr("Sell B3")) : (buy ? tr("Buy") : tr("Sell")), description,
             (inverse ? (buy ? tr("Spend up to ") : tr("Receive up to ")) : QString{}) + FormatAmount(c.remaining, u.decimals),
@@ -811,7 +845,24 @@ void B3FlowMeshTradingPanel::updateTicket()
     const auto budget{ReplacementBudget(free, reserved)};
     m_ticket_available->setText(tr("Available  %1 %2").arg(FormatAmount(free, bid ? 9 : u.decimals), bid ? QStringLiteral("B3") : ticker));
     available_tooltip = tr("This side already reserves %1 %2; a replacement may use %3 %2 including that reservation.").arg(FormatAmount(reserved, bid ? 9 : u.decimals), bid ? QStringLiteral("B3") : ticker, budget ? FormatAmount(*budget, bid ? 9 : u.decimals) : QStringLiteral("—"));
-    QString error; const auto limit{ParseDisplayLimit(m_price->text(), u, inverse, buy, &error)};
+    QString error;
+    if (m_ladder->isChecked()) {
+        // One order of several prices: its exact total and reservation.
+        const auto steps{ladderSteps(&error)};
+        if (!steps) { m_ticket_total->setText(tr("Ladder  —")); total_tooltip = error; apply_tooltips(); return; }
+        CAmount total{0};
+        for (const auto& step : *steps) total += step.qty;
+        const auto reservation{*flowmesh::LadderReservation(bid, *steps)};
+        m_ticket_total->setText((steps->size() == 1 ? tr("Ladder of 1 price · %1 %2 in total\n%3") : tr("Ladder of %4 prices · %1 %2 in total\n%3"))
+            .arg(FormatAmount(total, u.decimals), ticker,
+                 bid ? tr("Reserves exactly %1 B3 (the sum of quantity x price)").arg(FormatAmount(reservation, 9))
+                     : tr("Reserves %1 %2").arg(FormatAmount(reservation, u.decimals), ticker))
+            .arg(steps->size()));
+        total_tooltip = tr("A ladder is one standing order on this side: each price fills in the same uniform-price auction, a price cannot be cancelled alone, and it replaces your order on this side. With one price it is an ordinary limit order.");
+        apply_tooltips();
+        return;
+    }
+    const auto limit{ParseDisplayLimit(m_price->text(), u, inverse, buy, &error)};
     const auto quantity{ParseQuantity(m_quantity->text(), u, &error)};
     if (!limit || !quantity) { m_ticket_total->setText(tr("Order value  —")); total_tooltip = error; apply_tooltips(); return; }
     const auto total{Notional(limit->price, *quantity)}; if (!total) { m_ticket_total->setText(tr("Order value exceeds supported range")); apply_tooltips(); return; }
@@ -842,6 +893,8 @@ bool B3FlowMeshTradingPanel::depositDraftAvailable() const
 UniValue B3FlowMeshTradingPanel::indicativeDraft() const
 {
     using namespace B3FlowMeshMarketData;
+    // A what-if is computed for a limit order only, never a ladder.
+    if (m_ladder && m_ladder->isChecked()) return {};
     const auto selected{market()};
     if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->units.known || m_snapshot->units.asset != selected->base) return {};
     const bool buy{m_side->currentIndex() == 0}, inverse{inverted()};
@@ -853,6 +906,49 @@ UniValue B3FlowMeshTradingPanel::indicativeDraft() const
     draft.pushKV("price", limit->price);
     draft.pushKV("quantity", *quantity);
     return draft;
+}
+
+std::optional<std::vector<flowmesh::LadderStep>> B3FlowMeshTradingPanel::ladderSteps(QString* error, bool* adjusted) const
+{
+    using namespace B3FlowMeshMarketData;
+    const auto fail = [&](const QString& text) -> std::optional<std::vector<flowmesh::LadderStep>> {
+        if (error) *error = text;
+        return std::nullopt;
+    };
+    if (adjusted) *adjusted = false;
+    const auto selected{market()};
+    if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->units.known) return fail(tr("Verified asset precision is required."));
+    const auto& units{m_snapshot->units};
+    const bool buy{m_side->currentIndex() == 0}, inverse{inverted()};
+    std::vector<std::pair<QLineEdit*, QLineEdit*>> rows{{m_price, m_quantity}};
+    for (size_t i{0}; i < m_ladder_prices.size(); ++i) rows.emplace_back(m_ladder_prices[i], m_ladder_quantities[i]);
+    std::vector<flowmesh::LadderStep> steps;
+    for (size_t i{0}; i < rows.size(); ++i) {
+        const QString price{rows[i].first->text().trimmed()}, quantity{rows[i].second->text().trimmed()};
+        if (i > 0 && price.isEmpty() && quantity.isEmpty()) continue;
+        if (price.isEmpty() || quantity.isEmpty()) return fail(tr("Enter both a price and a quantity for price %1.").arg(i + 1));
+        QString why;
+        const auto limit{ParseDisplayLimit(price, units, inverse, buy, &why)};
+        if (!limit) return fail(tr("Price %1: %2").arg(i + 1).arg(why));
+        const auto amount{ParseQuantity(quantity, units, &why)};
+        if (!amount) return fail(tr("Quantity %1: %2").arg(i + 1).arg(why));
+        if (std::any_of(steps.begin(), steps.end(), [&](const auto& step) { return step.price == limit->price; })) {
+            return fail(tr("Each price of a ladder must differ (price %1 repeats one above).").arg(i + 1));
+        }
+        if (adjusted && limit->adjusted) *adjusted = true;
+        steps.push_back({limit->price, *amount});
+    }
+    if (!flowmesh::LadderReservation(CanonicalSide(buy, inverse) == QStringLiteral("bid"), steps)) {
+        return fail(tr("The ladder's total exceeds the supported market range."));
+    }
+    return steps;
+}
+
+QStringList B3FlowMeshTradingPanel::ladderText() const
+{
+    QStringList out;
+    for (size_t i{0}; i < m_ladder_prices.size(); ++i) out << m_ladder_prices[i]->text() << m_ladder_quantities[i]->text();
+    return out;
 }
 
 flowmesh::LevelGrouping B3FlowMeshTradingPanel::bookGrouping() const
@@ -1063,8 +1159,11 @@ bool B3FlowMeshTradingPanel::editAvailable() const
     // a read runs: it only prefills the ticket and signs nothing.
     if (!orderReviewAvailable() || m_deferred_review) return false;
     const auto curve{editCurve()};
-    const auto price{curve ? B3FlowMeshMarketData::LimitPriceOf(*curve) : std::nullopt};
-    return price && *price > 0 && curve->remaining > 0;
+    if (!curve || curve->remaining <= 0) return false;
+    // A limit order, or a ladder order: the prices it still has quantity at.
+    const auto steps{B3FlowMeshMarketData::LadderStepsOf(*curve)};
+    return steps && std::any_of(steps->begin(), steps->end(), [](const auto& step) { return step.price > 0 && step.remaining > 0; }) &&
+           std::all_of(steps->begin(), steps->end(), [](const auto& step) { return step.price > 0 || step.remaining == 0; });
 }
 
 void B3FlowMeshTradingPanel::editOrder()
@@ -1076,15 +1175,34 @@ void B3FlowMeshTradingPanel::editOrder()
     const auto curve{*editCurve()};
     const auto& units{m_snapshot->units};
     const bool inverse{inverted()}, buy{B3FlowMeshMarketData::DisplayBuy(curve.side, inverse)};
-    const CAmount price{*B3FlowMeshMarketData::LimitPriceOf(curve)};
+    // The prices it still has quantity at, best first, with what remains.
+    auto steps{*B3FlowMeshMarketData::LadderStepsOf(curve)};
+    std::erase_if(steps, [](const auto& step) { return step.remaining == 0; });
+    const bool bid{curve.side == QStringLiteral("bid")};
+    std::sort(steps.begin(), steps.end(), [&](const auto& a, const auto& b) { return bid ? a.price > b.price : a.price < b.price; });
+    const auto text = [&](CAmount price) {
+        return inverse ? B3FlowMeshMarketData::ExactInversePrice(price, units.decimals) : B3FlowMeshMarketData::FormatPrice(price, units.decimals);
+    };
     m_marketable->setChecked(false);
     m_side->setCurrentIndex(buy ? 0 : 1); (buy ? m_buy : m_sell)->setChecked(true);
-    m_price->setText(inverse ? B3FlowMeshMarketData::ExactInversePrice(price, units.decimals) : B3FlowMeshMarketData::FormatPrice(price, units.decimals));
-    m_quantity->setText(B3FlowMeshMarketData::FormatAmount(curve.remaining, units.decimals));
+    m_ladder->setChecked(steps.size() > 1);
+    m_price->setText(text(steps.front().price));
+    m_quantity->setText(B3FlowMeshMarketData::FormatAmount(steps.front().remaining, units.decimals));
+    for (size_t i{0}; i < m_ladder_prices.size(); ++i) {
+        const bool used{i + 1 < steps.size()};
+        m_ladder_prices[i]->setText(used ? text(steps[i + 1].price) : QString{});
+        m_ladder_quantities[i]->setText(used ? B3FlowMeshMarketData::FormatAmount(steps[i + 1].remaining, units.decimals) : QString{});
+    }
     updateTicket();
     m_price->setFocus();
-    notice(tr("Edit prefilled a replacement for your %1 order: %2 %3 at its current limit. Nothing was signed or sent. Change the price or quantity, then review it: the new order replaces that side's order and its quantity counts from zero.")
-               .arg(inverse ? (buy ? tr("Buy B3") : tr("Sell B3")) : (buy ? tr("Buy") : tr("Sell")), m_quantity->text(), units.ticker));
+    const QString side{inverse ? (buy ? tr("Buy B3") : tr("Sell B3")) : (buy ? tr("Buy") : tr("Sell"))};
+    if (steps.size() > 1) {
+        notice(tr("Edit prefilled a replacement for your %1 ladder: its %2 prices with what remains at each. Nothing was signed or sent. Change any price or quantity, then review it: the new ladder replaces that side's whole order and its quantities count from zero.")
+                   .arg(side).arg(steps.size()));
+    } else {
+        notice(tr("Edit prefilled a replacement for your %1 order: %2 %3 at its current limit. Nothing was signed or sent. Change the price or quantity, then review it: the new order replaces that side's order and its quantity counts from zero.")
+                   .arg(side, m_quantity->text(), units.ticker));
+    }
 }
 
 void B3FlowMeshTradingPanel::fillFromBook(const QString& price, const CAmount cumulative, const QString& head)
@@ -1206,7 +1324,10 @@ void B3FlowMeshTradingPanel::updateControls()
     for (auto* field : {m_price, m_quantity, m_amount, m_destination, m_deposit_txid, m_deposit_vout}) field->setEnabled(idle);
     m_side->setEnabled(idle); m_asset->setEnabled(idle); m_effect->setEnabled(idle);
     m_buy->setEnabled(idle); m_sell->setEnabled(idle);
-    m_marketable->setEnabled(idle); m_slippage->setEnabled(idle);
+    m_marketable->setEnabled(idle && !m_ladder->isChecked()); m_slippage->setEnabled(idle);
+    m_ladder->setEnabled(idle && !m_marketable->isChecked());
+    for (auto* field : m_ladder_prices) field->setEnabled(idle);
+    for (auto* field : m_ladder_quantities) field->setEnabled(idle);
     m_order->setEnabled(orderReviewAvailable()); m_cancel_order->setEnabled(ready && selected->has_account && !pending);
     m_edit_order->setEnabled(editAvailable());
     m_order->setToolTip(tr("Review first checks fresh market readiness and your certified balance. This button does not mean trading is ready. A failed or paused check signs and sends nothing; there is no automatic retry."));
@@ -1376,18 +1497,40 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
                 if (!marketable) throw std::runtime_error{tr("Marketable limit unavailable: %1 Nothing was signed or submitted.").arg(error).toStdString()};
                 const QSignalBlocker block{m_price}; m_price->setText(marketable->display);
             }
-            const auto limit{B3FlowMeshMarketData::ParseDisplayLimit(m_price->text(), m_snapshot->units, a.inverse_display, m_side->currentIndex() == 0, &error)};
-            const auto quantity{B3FlowMeshMarketData::ParseQuantity(m_quantity->text(), m_snapshot->units, &error)};
-            if (!limit || !quantity) throw std::runtime_error{error.toStdString()}; a.price = limit->price; a.amount = *quantity;
-            a.display_limit_adjusted = limit->adjusted; a.entered_display_limit = m_price->text();
+            std::optional<std::vector<flowmesh::LadderStep>> ladder;
+            if (m_ladder->isChecked()) {
+                bool adjusted{false};
+                ladder = ladderSteps(&error, &adjusted);
+                if (!ladder) throw std::runtime_error{error.toStdString()};
+                if (ladder->size() > 1) {
+                    // Signed as one curve; price and amount only title it.
+                    const bool bid{a.side == QStringLiteral("bid")};
+                    for (const auto& step : *ladder) {
+                        a.ladder.emplace_back(step.price, step.qty);
+                        a.amount += step.qty;
+                        if (a.price == 0 || (bid ? step.price > a.price : step.price < a.price)) a.price = step.price;
+                    }
+                    a.display_limit_adjusted = adjusted;
+                }
+            }
+            if (a.ladder.empty()) {
+                const auto limit{B3FlowMeshMarketData::ParseDisplayLimit(m_price->text(), m_snapshot->units, a.inverse_display, m_side->currentIndex() == 0, &error)};
+                const auto quantity{B3FlowMeshMarketData::ParseQuantity(m_quantity->text(), m_snapshot->units, &error)};
+                if (!limit || !quantity) throw std::runtime_error{error.toStdString()}; a.price = limit->price; a.amount = *quantity;
+                a.display_limit_adjusted = limit->adjusted; a.entered_display_limit = m_price->text();
+            }
             if (marketable) {
-                if (limit->price != marketable->price || limit->adjusted) throw std::runtime_error{"The marketable limit did not round-trip exactly. Nothing was signed."};
+                // A marketable limit is never a ladder (the mode unchecks it).
+                if (!a.ladder.empty() || a.price != marketable->price || a.display_limit_adjusted) throw std::runtime_error{"The marketable limit did not round-trip exactly. Nothing was signed."};
                 a.marketable = Action::Marketable{marketable->reference, marketable->visible, marketable->slippage_bps, marketable->reference_display};
             }
             // A SUBMIT atomically replaces this side's certified order: say so
             // in both orientations, with what it replaces.
             for (const auto& own : m_snapshot->own_curves) {
-                if (own.side == a.side) a.replaces = Action::Replaces{own.remaining, own.filled, B3FlowMeshMarketData::LimitPriceOf(own), own.points.size()};
+                if (own.side != a.side) continue;
+                const auto steps{B3FlowMeshMarketData::LadderStepsOf(own)};
+                a.replaces = Action::Replaces{own.remaining, own.filled, B3FlowMeshMarketData::LimitPriceOf(own), own.points.size(),
+                                              steps && steps->size() > 1 ? steps->size() : size_t{0}};
             }
         } else if (operation == Operation::Deposit || operation == Operation::Withdraw) {
             const auto text{operation == Operation::Withdraw ? m_withdrawal_draft_amount : m_amount->text()};
@@ -1443,7 +1586,7 @@ bool B3FlowMeshTradingPanel::deferReview(Operation operation, bool funding)
     if (operation == Operation::Order)
         m_deferred_review->order_context = DeferredReview::OrderContext{m_wallet, *selected, m_snapshot->units,
             m_price->text(), m_quantity->text(), m_side->currentIndex(), inverted(), m_active_result && m_active_result->receipt_only,
-            m_marketable->isChecked(), m_slippage->text()};
+            m_marketable->isChecked(), m_slippage->text(), m_ladder->isChecked(), ladderText()};
     if (m_active_result && m_active_result->passive && m_refresh_yields < MAX_REFRESH_YIELDS) m_yield_refresh->store(true);
     m_busy = true; updateControls(); return true;
 }
@@ -1468,7 +1611,8 @@ void B3FlowMeshTradingPanel::resumeReview()
             context.market.account != selected->account || context.market.remote != selected->remote ||
             context.units != m_snapshot->units || (!context.marketable && context.price != m_price->text()) || context.quantity != m_quantity->text() ||
             context.side != m_side->currentIndex() || context.inverse != inverted() ||
-            context.marketable != m_marketable->isChecked() || context.slippage != m_slippage->text()) {
+            context.marketable != m_marketable->isChecked() || context.slippage != m_slippage->text() ||
+            context.ladder != m_ladder->isChecked() || context.ladder_text != ladderText()) {
             notice(tr("The order inputs, asset units or wallet/market binding changed. Review the order again; nothing was signed or submitted.")); return;
         }
         if (needs_market_read) {
@@ -1716,7 +1860,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                     // monotonic observation only fails closed until refresh.
                     if (watch_queue && queue_watch.elapsed() >= 30'000) throw std::runtime_error{"Queued requests have not certified for 30 seconds. Refresh before submitting; no new mutation was started."};
                     if (method != "submitflowmeshdeposit" && method != "retryflowmeshaction" && (backend->isLocked() || backend->privateKeysDisabled())) throw std::runtime_error{"The captured wallet is locked for spending."};
-                    if (method == "sendrawtransaction" || method == "submitflowmeshorder" || method == "cancelflowmeshorder" || method == "requestflowmeshwithdrawal" || method == "submitflowmeshdeposit" || method == "retryflowmeshaction") result->write_attempted = true;
+                    if (method == "sendrawtransaction" || method == "submitflowmeshorder" || method == "submitflowmeshladder" || method == "cancelflowmeshorder" || method == "requestflowmeshwithdrawal" || method == "submitflowmeshdeposit" || method == "retryflowmeshaction") result->write_attempted = true;
                 }
                 return node->executeRpc(method, params, method == "getblockchaininfo" || method == "testmempoolaccept" ? "" : uri);
             };

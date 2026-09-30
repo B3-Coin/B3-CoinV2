@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see COPYING.
 #include <qt/b3flowmeshtrading.h>
+#include <flowmesh/microblock.h>
 #include <qt/b3flowmeshmarketdata.h>
 #include <core_io.h>
 #include <flowmesh/batch.h>
@@ -172,6 +173,28 @@ Request Parameters(const Action& a)
     switch (a.operation) {
     case Operation::Order: {
         if (a.side != QStringLiteral("bid") && a.side != QStringLiteral("ask")) Fail("Choose bid or ask.");
+        if (!a.ladder.empty()) {
+            // A ladder: 2-4 distinct prices as one curve; its reservation
+            // must fit this side's available plus already reserved balance.
+            const bool bid{a.side == QStringLiteral("bid")};
+            if (a.ladder.size() < 2 || a.ladder.size() > flowmesh::FLOWMESH_LADDER_MAX_STEPS) Fail("A ladder order has 2 to 4 prices.");
+            std::vector<flowmesh::LadderStep> steps;
+            UniValue list{UniValue::VARR};
+            for (const auto& [price, quantity] : a.ladder) {
+                Positive(price); Positive(quantity);
+                steps.push_back({price, quantity});
+                UniValue step{UniValue::VOBJ}; step.pushKV("price", price); step.pushKV("quantity", quantity);
+                list.push_back(std::move(step));
+            }
+            const auto reservation{flowmesh::LadderReservation(bid, steps)};
+            const auto budget{B3FlowMeshMarketData::ReplacementBudget(bid ? a.market.b3_available : a.market.base_available,
+                                                                     bid ? a.market.b3_reserved : a.market.base_reserved)};
+            if (!(bid ? flowmesh::MakeLadderBidCurve(steps) : flowmesh::MakeLadderAskCurve(steps)) || !reservation) Fail("The ladder's prices must differ and its total must stay within the consensus range.");
+            if (!budget || *reservation > *budget) Fail("The ladder exceeds this side's available plus already reserved certified balance.");
+            r.method = "submitflowmeshladder"; r.params.push_back(a.side.toStdString()); r.params.push_back(list); r.params.push_back(a.market.sequence);
+            if (a.submit_wait_ms > 0) r.params.push_back(a.submit_wait_ms);
+            break;
+        }
         Positive(a.price); Positive(a.amount);
         if (a.price > MAX_MONEY / a.amount) Fail("The order's B3 notional exceeds the consensus range.");
         const bool bid{a.side == QStringLiteral("bid")};
@@ -280,8 +303,49 @@ QString ReplacesDisclosure(const Action& a)
     const QString side{SideTitle(a.side == QStringLiteral("bid"), a.inverse_display)};
     const auto amount = [&](CAmount n) { return BaseAmount(n, a.display_decimals, a.display_ticker); };
     const QString current{r.limit ? QStringLiteral("%1 order (%2 left; %3 already filled)").arg(side, amount(r.remaining), amount(r.filled))
-                                  : QStringLiteral("%1 curve of %2 points (%3 left)").arg(side).arg(r.points).arg(amount(r.remaining))};
+                          : r.ladder_prices ? QStringLiteral("%1 ladder of %2 prices (%3 left)").arg(side).arg(r.ladder_prices).arg(amount(r.remaining))
+                                            : QStringLiteral("%1 curve of %2 points (%3 left)").arg(side).arg(r.points).arg(amount(r.remaining))};
     return QStringLiteral("\nReplaces your current %1. The new quantity counts from zero; the reservation is adjusted by the difference.").arg(current);
+}
+
+//! The review of a ladder order: every price with its quantity, the exact
+//! reservation, and what a ladder is (one order on its side).
+QString DescribeLadder(const Action& a, const QString& prefix)
+{
+    const bool bid{a.side == QStringLiteral("bid")};
+    std::vector<flowmesh::LadderStep> steps;
+    for (const auto& [price, quantity] : a.ladder) { Positive(price); Positive(quantity); steps.push_back({price, quantity}); }
+    const auto reservation{flowmesh::LadderReservation(bid, steps)};
+    if (a.ladder.size() < 2 || !reservation) Fail("Invalid ladder order.");
+    if (a.inverse_display && !a.display_decimals) Fail("Verified asset precision is required for the inverse order review.");
+    // Best first: a bid's highest price, an ask's lowest.
+    std::sort(steps.begin(), steps.end(), [&](const auto& x, const auto& y) { return bid ? x.price > y.price : x.price < y.price; });
+    const QString token{a.display_ticker.isEmpty() ? QStringLiteral("token") : a.display_ticker};
+    const auto amount = [&](CAmount n) { return BaseAmount(n, a.display_decimals, a.display_ticker); };
+    const auto price = [&](CAmount p) {
+        if (!a.display_decimals) return QStringLiteral("%1 B3 atoms per raw unit").arg(p);
+        return a.inverse_display ? QStringLiteral("%1 %2 / B3").arg(B3FlowMeshMarketData::ExactInversePrice(p, *a.display_decimals), token)
+                                 : QStringLiteral("%1 B3 / %2").arg(B3FlowMeshMarketData::FormatPrice(p, *a.display_decimals), token);
+    };
+    CAmount total{0};
+    QString lines;
+    for (const auto& step : steps) {
+        total += step.qty;
+        lines += a.inverse_display
+                     ? QStringLiteral("\n  • %1 %2 at %3 %4 (exact)").arg(bid ? QStringLiteral("receive up to") : QStringLiteral("spend up to"), amount(step.qty),
+                                                                          bid ? QStringLiteral("no less than") : QStringLiteral("no more than"), price(step.price))
+                     : QStringLiteral("\n  • %1 at %2").arg(amount(step.qty), price(step.price));
+    }
+    QString review{prefix + QStringLiteral("Ladder %1 of %2 prices, ONE standing order on this side:%3\nTotal quantity: %4.")
+                                .arg(SideTitle(bid, a.inverse_display)).arg(steps.size()).arg(lines, amount(total))};
+    review += bid ? QStringLiteral("\nExact B3 reservation: %1 B3, the sum of quantity x price (as separate limit orders would reserve).").arg(QString::fromStdString(FormatMoney(*reservation)))
+                  : QStringLiteral("\nReserves %1 (the sum of the quantities). The B3 received depends on the auction fills, before the allocated B3 fee.").arg(amount(*reservation));
+    review += QStringLiteral("\nExact canonical steps (B3 atoms per token atom : token atoms):");
+    for (const auto& step : steps) review += QStringLiteral(" %1 : %2;").arg(step.price).arg(step.qty);
+    if (a.display_limit_adjusted) review += QStringLiteral("\nAt least one entered price was adjusted only in your favor to the exact executable price listed above; those exact prices are what will be signed.");
+    review += QStringLiteral("\nAccount sequence: %1. One uniform-price curve auction per microblock, not price-time priority. Accepted is not filled. No network fee for this request.").arg(a.market.sequence);
+    review += QStringLiteral("\nA ladder is one order: a price cannot be cancelled or edited alone, and cancelling or replacing this side removes every price. Wallets before this version show it only as a curve.");
+    return review + ReplacesDisclosure(a);
 }
 } // namespace
 
@@ -294,6 +358,7 @@ QString Describe(const Action& a)
     if (a.native) amount = QString::fromStdString(FormatMoney(a.amount)) + QStringLiteral(" B3");
     switch (a.operation) {
     case Operation::Order: {
+        if (!a.ladder.empty()) return DescribeLadder(a, prefix);
         Positive(a.price); Positive(a.amount);
         if (a.price > MAX_MONEY / a.amount) Fail("The order's B3 notional exceeds the consensus range.");
         if (a.inverse_display) {
@@ -556,7 +621,9 @@ QString ShortTitle(const Action& a)
     const bool bid{a.side == QStringLiteral("bid")};
     const QString native{QString::fromStdString(FormatMoney(a.amount)) + QStringLiteral(" B3")};
     switch (a.operation) {
-    case Operation::Order: return OrderTitle(bid, a.price, a.amount, a.display_decimals, a.display_ticker, a.inverse_display);
+    case Operation::Order:
+        if (!a.ladder.empty()) return QStringLiteral("%1 ladder · %2 prices · %3").arg(SideTitle(bid, a.inverse_display)).arg(a.ladder.size()).arg(BaseAmount(a.amount, a.display_decimals, a.display_ticker));
+        return OrderTitle(bid, a.price, a.amount, a.display_decimals, a.display_ticker, a.inverse_display);
     case Operation::Cancel: return QStringLiteral("Cancel %1").arg(SideTitle(bid, a.inverse_display));
     case Operation::Withdraw: return QStringLiteral("Withdraw %1").arg(a.native ? native : BaseAmount(a.amount, a.display_decimals, a.display_ticker));
     case Operation::Deposit: return QStringLiteral("Deposit %1").arg(a.native ? native : BaseAmount(a.amount, a.display_decimals, a.display_ticker));
@@ -578,6 +645,11 @@ QString ShortTitle(const SavedAction& a, std::optional<int> decimals, const QStr
         if (p.size() == 2 && p[0].price < MAX_MONEY && p[1].price == p[0].price + 1 &&
             (bid ? p[0].quantity > 0 && p[1].quantity == 0 : p[0].quantity == 0 && p[1].quantity > 0)) {
             return OrderTitle(bid, bid ? p[0].price : p[1].price, bid ? p[0].quantity : p[1].quantity, decimals, ticker, inverse);
+        }
+        std::vector<B3FlowMeshMarketData::Point> points;
+        for (const auto& point : p) points.push_back({point.price, point.quantity});
+        if (const auto steps{B3FlowMeshMarketData::LadderStepsOf(bid ? QStringLiteral("bid") : QStringLiteral("ask"), points)}; steps && steps->size() >= 2) {
+            return QStringLiteral("%1 ladder · %2 prices%3").arg(SideTitle(bid, inverse)).arg(steps->size()).arg(a.sequence ? QStringLiteral(" · sequence %1").arg(*a.sequence) : QString{});
         }
         return QStringLiteral("%1 order%2").arg(SideTitle(bid, inverse), a.sequence ? QStringLiteral(" · sequence %1").arg(*a.sequence) : QString{});
     }
