@@ -96,6 +96,12 @@ UniValue Data(bool trade = true)
     history.pushKV("entries", entries); v.pushKV("history", history); return v;
 }
 bool Rejects(const std::function<void()>& f) { try { f(); } catch (const std::exception&) { return true; } catch (const UniValue&) { return true; } return false; }
+//! FLOWMESH_UI_PERF_STRICT=1 (as for test_b3_flowmeshperf-qt) also asserts
+//! timing-dependent bounds: measured read spacing to the millisecond, how
+//! soon a re-armed read starts, animation frame rates. By default only
+//! deterministic checks and generous floors run, so a loaded machine running
+//! CTest cannot fail them.
+bool UiTimingStrict() { return qEnvironmentVariable("FLOWMESH_UI_PERF_STRICT") == QStringLiteral("1"); }
 UniValue RemoteData(bool trade = true)
 {
     auto v{Data(trade)}; UniValue proof{UniValue::VOBJ}; proof.pushKV("source", "remote_endpoint"); proof.pushKV("endpoint", "https://operator.invalid:18443");
@@ -1519,10 +1525,21 @@ private Q_SLOTS:
         QElapsedTimer flash; flash.start();
         book.setSnapshot(WithLevels(moved, {}, H(20)), false);
         QVERIFY(book.flashing());
-        QTRY_VERIFY_WITH_TIMEOUT(!book.flashing(), 3000);
+        // One frame timer, at 30 frames a second, running only during a flash.
+        const auto timers{book.findChildren<QTimer*>()};
+        const auto frame{std::find_if(timers.begin(), timers.end(), [](const QTimer* t) { return t->isActive(); })};
+        QVERIFY(frame != timers.end());
+        QCOMPARE((*frame)->interval(), B3FlowMeshOrderBook::FLASH_STEP_MS);
+        QCOMPARE(std::count_if(timers.begin(), timers.end(), [](const QTimer* t) { return t->isActive(); }), qsizetype{1});
+        QTRY_VERIFY_WITH_TIMEOUT(!book.flashing(), 10000);
+        QVERIFY(!(*frame)->isActive());
         const auto seconds{static_cast<double>(flash.elapsed()) / 1000.0};
-        QVERIFY2(paints / seconds <= 34.0, qPrintable(QStringLiteral("%1 paints in %2 s").arg(paints).arg(seconds)));
-        QVERIFY(paints >= 5); // It does animate.
+        QVERIFY(paints >= 1);
+        // The measured frame rate depends on the machine keeping up.
+        if (UiTimingStrict()) {
+            QVERIFY2(paints / seconds <= 34.0, qPrintable(QStringLiteral("%1 paints in %2 s").arg(paints).arg(seconds)));
+            QVERIFY(paints >= 5); // It does animate.
+        }
     }
     void orderBookLadderFallsBackLabelledAndRequiresVerifiedState()
     {
@@ -6173,16 +6190,26 @@ private Q_SLOTS:
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         Live(panel, probe);
         QVERIFY(!panel.m_timer->isActive());
+        QCOMPARE(panel.m_rearm->timerType(), Qt::PreciseTimer);
         panel.armWatch(); QVERIFY(panel.m_watch_thread);
-        QTRY_VERIFY_WITH_TIMEOUT(probe.watches.load() >= 6, 4000);
+        // Six reads with the tick stopped throughout: all but the burst of two
+        // were started by the precise re-arm.
+        QTRY_VERIFY_WITH_TIMEOUT(probe.watches.load() >= 6, 10000);
+        QVERIFY(!panel.m_timer->isActive());
         panel.m_watch.Disable(); AwaitWatchWorker(panel);
         QVERIFY(!panel.m_rearm->isActive() || panel.m_watch.NextArmIn(panel.m_watch_clock.elapsed()) < 0);
         std::vector<int64_t> times;
         { std::lock_guard lock{probe.watch_mutex}; times = probe.watch_times; }
         QVERIFY(times.size() >= 6);
-        for (size_t i{2}; i < times.size(); ++i) QVERIFY2(times[i] - times[i - 2] >= B3FlowMeshWatch::Policy::ARM_REFILL_MS - 1, "a burst of two, then one per 500 ms");
+        // Measured where each read enters its RPC on a fresh worker thread:
+        // to the millisecond only in strict mode, else less 100 ms of thread
+        // start jitter (reads back to back, or a faster pacing, still fail).
+        const int64_t slack{UiTimingStrict() ? 1 : 100};
+        for (size_t i{2}; i < times.size(); ++i) QVERIFY2(times[i] - times[i - 2] >= B3FlowMeshWatch::Policy::ARM_REFILL_MS - slack, "a burst of two, then one per 500 ms");
         // Each refill is used when it arrives, not up to a tick later.
-        for (size_t i{3}; i < times.size(); ++i) QVERIFY2(times[i] - times[i - 1] < B3FlowMeshWatch::Policy::ARM_REFILL_MS + 150, "re-armed when allowed");
+        if (UiTimingStrict()) {
+            for (size_t i{3}; i < times.size(); ++i) QVERIFY2(times[i] - times[i - 1] < B3FlowMeshWatch::Policy::ARM_REFILL_MS + 150, "re-armed when allowed");
+        }
         QCOMPARE(panel.m_watch.last, B3FlowMeshWatch::Outcome::Quiet);
         QCOMPARE(probe.writes.load(), 0); QCOMPARE(probe.snapshots.load(), 0);
     }

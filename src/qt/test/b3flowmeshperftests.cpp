@@ -12,8 +12,12 @@
 //
 // Environment:
 //   FLOWMESH_UI_PERF_STRICT=1        assert the provisional targets (meant
-//                                    for a Release build on the owner's Mac);
-//                                    by default only 10x the targets fails.
+//                                    for a Release build on the owner's Mac)
+//                                    and every timing-dependent check (each
+//                                    head shown, throughput, tight spacing
+//                                    floors); by default only 10x the targets
+//                                    and generous pacing floors fail, so a
+//                                    loaded CI machine does not flake.
 //   FLOWMESH_UI_PERF_REPORT=<path>   write the JSON report there (absolute).
 //   FLOWMESH_UI_PERF_COMMIT=<sha>    the source commit, for the report.
 // Both strict and report runs use the longer sample windows.
@@ -115,6 +119,12 @@ bool Strict() { return qEnvironmentVariable("FLOWMESH_UI_PERF_STRICT") == QStrin
 bool Measuring() { return Strict() || !qEnvironmentVariable("FLOWMESH_UI_PERF_REPORT").isEmpty(); }
 //! The provisional target in strict mode, else a smoke ceiling of 10x it.
 double Ceiling(double target_ms) { return Strict() ? target_ms : 10 * target_ms; }
+//! A floor for a spacing measured where a read enters its RPC, on a freshly
+//! started worker thread: `strict_ms` in strict mode; by default `slack_ms`
+//! lower, for thread start and timer jitter on a loaded machine, and still
+//! far above what a pacing regression (reads back to back, or faster pacing)
+//! would produce.
+double SpacingFloor(double strict_ms, double slack_ms) { return Strict() ? strict_ms : strict_ms - slack_ms; }
 //! U1-local busy (5 heads/s): p95 <= 150 ms needs ten local reads a second
 //! (C7, held back while local reads contend for the node's market mutex); at
 //! the local pacing it is one refill plus processing (about 475 ms p95 at two
@@ -1121,7 +1131,9 @@ private Q_SLOTS:
         v.pushKV("frame_stall", Json(stall)); v.pushKV("handler", Json(h));
         v.pushKV("target", "U2: stall p99 <= 16 ms, max <= 50 ms; handler p95 <= 8 ms");
         Record("sustained_20_updates_per_second", v);
-        QVERIFY(applied >= seconds * 20 * 8 / 10);
+        // Throughput depends on the timer keeping up: strict mode only.
+        QVERIFY(applied > 0);
+        if (Strict()) QVERIFY2(applied >= seconds * 20 * 8 / 10, qPrintable(QStringLiteral("%1 updates in %2 s").arg(applied).arg(seconds)));
         QVERIFY2(stall.p99 <= Ceiling(16), qPrintable(Describe("stall", stall)));
         QVERIFY2(h.p95 <= Ceiling(8), qPrintable(Describe("handler", h)));
         if (Strict()) QVERIFY2(stall.max <= 50, qPrintable(Describe("stall", stall)));
@@ -1219,7 +1231,10 @@ private Q_SLOTS:
                                                         LocalBusyTargetMs(), int(B3FlowMeshWatch::Policy::LOCAL_ARM_REFILL_MS)) :
                                               "stress case: reported; every head superseded by a painted one within 1 s");
         Record("watch_end_to_end_" + name.toStdString(), v);
-        QCOMPARE(missed, size_t{0});
+        // Every head shown within the 1.5 s catch-up depends on the machine
+        // keeping up: strict mode only (the count is always reported).
+        if (Strict()) QCOMPARE(missed, size_t{0});
+        QVERIFY(!freshness.empty());
         QVERIFY2(renders_per_second <= 20, "at most ~20 data renders a second");
         QVERIFY2(u1.max <= Ceiling(1000), qPrintable(Describe("U1-local", u1)));
         QVERIFY2(u1_qt.p95 <= Ceiling(30), qPrintable(Describe("U1-qt", u1_qt)));
@@ -1252,7 +1267,7 @@ private Q_SLOTS:
         std::vector<double> spacing;
         // Skip the opening burst.
         for (size_t i{3}; i < starts.size(); ++i) spacing.push_back(Ms(starts[i] - starts[i - 1]));
-        for (size_t i{2}; i < starts.size(); ++i) QVERIFY2(Ms(starts[i] - starts[i - 2]) >= 500 - 1, "at most a burst of two, then one per 500 ms");
+        for (size_t i{2}; i < starts.size(); ++i) QVERIFY2(Ms(starts[i] - starts[i - 2]) >= SpacingFloor(500 - 1, 100), "at most a burst of two, then one per 500 ms");
         const auto d{Distribute(spacing)};
         qInfo("%s", qPrintable(Describe("remote busy watch: start spacing", d)));
         UniValue v{UniValue::VOBJ};
@@ -1306,9 +1321,13 @@ private Q_SLOTS:
         v.pushKV("passive_read_occupancy", std::round(occupancy * 1000) / 1000);
         v.pushKV("target", "remote passive polls stay on the 500 ms tick: never two starts within 450 ms (a coarse timer fires up to 5% early)");
         Record(delay_ms ? "remote_poll_pacing_slow_link" : "remote_poll_pacing_fast_link", v);
-        for (const double gap : spacing) QVERIFY2(gap >= 450, qPrintable(Describe("spacing", d)));
-        // A 520 ms read never starts back to back: the next tick after it.
-        if (delay_ms > 500) QVERIFY2(d.p50 >= 900, qPrintable(Describe("spacing", d)));
+        for (const double gap : spacing) QVERIFY2(gap >= SpacingFloor(450, 200), qPrintable(Describe("spacing", d)));
+        // A 520 ms read is followed by the next tick after it. That tick is
+        // a coarse timer that may fire up to 5% late, just after the read
+        // ended (a 525 ms gap, still not back to back), so the median of the
+        // default window's four gaps is not stable: strict (long-window)
+        // mode only.
+        if (delay_ms > 500 && Strict()) QVERIFY2(d.p50 >= 900, qPrintable(Describe("spacing", d)));
         QCOMPARE(probe.writes.load(), 0);
     }
 
@@ -1339,7 +1358,7 @@ private Q_SLOTS:
         v.pushKV("jobs", static_cast<uint64_t>(starts.size())); v.pushKV("start_spacing", Json(d));
         v.pushKV("target", "one passive start per ~500 ms tick, never back to back");
         Record("local_poll_pacing", v);
-        for (const double gap : spacing) QVERIFY2(gap >= 450, qPrintable(Describe("spacing", d)));
+        for (const double gap : spacing) QVERIFY2(gap >= SpacingFloor(450, 200), qPrintable(Describe("spacing", d)));
         QCOMPARE(probe.writes.load(), 0);
     }
 

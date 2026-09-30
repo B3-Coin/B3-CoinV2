@@ -167,8 +167,13 @@ against a synthetic in-process market: 57 limit orders a side from 114
 accounts, a four-price ladder a side, the viewer's own bid, 50 book levels a
 side, 256 held ticks with observed times and 300 one-minute candles. No
 socket, signing or submission is involved. By default only 10x a target
-fails (a smoke check); `FLOWMESH_UI_PERF_STRICT=1` asserts the targets (meant
-for a Release build on the owner's Mac); `FLOWMESH_UI_PERF_REPORT=<absolute
+fails (a smoke check), and no check depends on the machine keeping up:
+pacing floors allow 100-200 ms of thread-start and timer jitter, and
+throughput, "every head shown" and frame-rate checks are skipped, so CTest on
+a loaded machine does not flake. `FLOWMESH_UI_PERF_STRICT=1` asserts the
+targets and those timing checks (meant for a Release build on the owner's
+Mac); `test_b3_flowmeshworkspace-qt` honours the same variable for its
+measured live-update spacing and flash frame rate. `FLOWMESH_UI_PERF_REPORT=<absolute
 path>` writes the JSON report with distributions and metadata (build type,
 Qt, QPA, CPU, cores, OS, version; `FLOWMESH_UI_PERF_COMMIT` names the
 commit). Strict and report runs use the longer sample windows.
