@@ -3444,16 +3444,16 @@ private Q_SLOTS:
         // The widget: one row per auction, the price coloured, updated in place.
         B3FlowMeshTradeTape tape;
         const auto units{Parse(Data()).units};
-        tape.setRows(rows, units, false, QStringLiteral("this_node"), false, {});
+        tape.setRows(rows, units, false, QStringLiteral("this_node"), false, {}, false, std::nullopt);
         QCOMPARE(tape.table()->rowCount(), 5);
         QCOMPARE(tape.table()->item(0, 0)->foreground().color(), B3Theme::kPositive);
         QCOMPARE(tape.table()->item(1, 0)->foreground().color(), B3Theme::kNegative);
         QCOMPARE(tape.table()->item(1, 2)->foreground().color(), B3Theme::kTextMuted);
         auto* first{tape.table()->item(0, 0)};
-        tape.setRows(rows, units, false, QStringLiteral("this_node"), false, {});
+        tape.setRows(rows, units, false, QStringLiteral("this_node"), false, {}, false, std::nullopt);
         QCOMPARE(tape.table()->item(0, 0), first);
         QVERIFY(tape.findChild<QLabel*>(QStringLiteral("flowMeshTradeTapeNote"))->text().contains(QStringLiteral("observed by this node")));
-        tape.setRows({}, units, false, {}, true, QStringLiteral("endpoint_does_not_advertise_observed_time"));
+        tape.setRows({}, units, false, {}, true, QStringLiteral("endpoint_does_not_advertise_observed_time"), false, std::nullopt);
         QVERIFY(tape.findChild<QLabel*>(QStringLiteral("flowMeshTradeTapeNote"))->text().contains(QStringLiteral("No matched auctions")));
     }
     void remoteTapeIsLabelledReported()
@@ -3667,27 +3667,29 @@ private Q_SLOTS:
     {
         const auto s{Parse(RemoteDataWithViews())};
         const auto& tick{s.ticks->ticks[1]};
-        QCOMPARE(ClearingTickText(tick, s.units, false, true), QStringLiteral("Last auction · 0.25 tUSD at 1 B3 / tUSD · buyers left 0.05 tUSD unfilled · endpoint-reported"));
+        // Without a view's places (nullopt): DisplayPrice's own digits.
+        const std::optional<int> none;
+        QCOMPARE(ClearingTickText(tick, s.units, false, true, nullptr, {}, none), QStringLiteral("Last auction · 0.25 tUSD at 1 B3 / tUSD · buyers left 0.05 tUSD unfilled · endpoint-reported"));
         // With its observed time, never its number.
-        QCOMPARE(ClearingTickText(tick, s.units, false, false, nullptr, QStringLiteral("12:34:56")), QStringLiteral("Last auction 12:34:56 · 0.25 tUSD at 1 B3 / tUSD · buyers left 0.05 tUSD unfilled"));
-        const auto inverse{ClearingTickText(tick, s.units, true, false)};
+        QCOMPARE(ClearingTickText(tick, s.units, false, false, nullptr, QStringLiteral("12:34:56"), none), QStringLiteral("Last auction 12:34:56 · 0.25 tUSD at 1 B3 / tUSD · buyers left 0.05 tUSD unfilled"));
+        const auto inverse{ClearingTickText(tick, s.units, true, false, nullptr, {}, none)};
         QVERIFY(inverse.contains(QStringLiteral("tUSD / B3"))); QVERIFY(inverse.contains(QStringLiteral("B3 sellers left 0.05 tUSD unfilled")));
         QVERIFY(!inverse.contains(QStringLiteral("endpoint-reported")));
-        QCOMPARE(ClearingTickText(s.ticks->ticks[0], s.units, false, false), QStringLiteral("Last auction · no match"));
+        QCOMPARE(ClearingTickText(s.ticks->ticks[0], s.units, false, false, nullptr, {}, none), QStringLiteral("Last auction · no match"));
         auto other{tick}; other.kind = QStringLiteral("handoff"); other.cleared = false;
-        QCOMPARE(ClearingTickText(other, s.units, false, false), QStringLiteral("Validator handoff · no auction"));
+        QCOMPARE(ClearingTickText(other, s.units, false, false, nullptr, {}, none), QStringLiteral("Validator handoff · no auction"));
         other = tick; other.side = QStringLiteral("unknown");
-        QVERIFY(ClearingTickText(other, s.units, false, false).contains(QStringLiteral("unfilled side not observed")));
-        const auto what_if{IndicativeText(*s.indicative, s.units, false)};
+        QVERIFY(ClearingTickText(other, s.units, false, false, nullptr, {}, none).contains(QStringLiteral("unfilled side not observed")));
+        const auto what_if{IndicativeText(*s.indicative, s.units, false, nullptr, none)};
         QVERIFY(what_if.startsWith(QStringLiteral("Indicative, not certified")));
         QVERIFY(what_if.contains(QStringLiteral("would clear at 1 B3 / tUSD, filling 0.1875 of 1 tUSD")));
         QVERIFY(what_if.contains(QStringLiteral("other pending orders excluded"))); QVERIFY(what_if.contains(QStringLiteral("replaces your standing order")));
         auto standing{Parse([] { auto v{RemoteData()}; v.pushKV("indicative", IndicativeJson(false)); return v; }())};
-        QCOMPARE(IndicativeText(*standing.indicative, standing.units, false), QStringLiteral("Indicative, not certified: no cross · best bid 1 · best ask 1.001"));
+        QCOMPARE(IndicativeText(*standing.indicative, standing.units, false, nullptr, none), QStringLiteral("Indicative, not certified: no cross · best bid 1 · best ask 1.001"));
         auto bounds{*s.indicative}; bounds.fill_max = 187'501;
-        QVERIFY(IndicativeText(bounds, s.units, false).contains(QStringLiteral("filling 0.1875 to 0.187501 of 1 tUSD")));
+        QVERIFY(IndicativeText(bounds, s.units, false, nullptr, none).contains(QStringLiteral("filling 0.1875 to 0.187501 of 1 tUSD")));
         Indicative unavailable; unavailable.reason = QStringLiteral("work_budget");
-        QCOMPARE(IndicativeText(unavailable, s.units, false), QStringLiteral("Indicative price unavailable (work_budget)"));
+        QCOMPARE(IndicativeText(unavailable, s.units, false, nullptr, none), QStringLiteral("Indicative price unavailable (work_budget)"));
     }
     void bookLevelsParseExactlyOrFailClosedPerSection()
     {
@@ -7669,12 +7671,13 @@ private Q_SLOTS:
         QVERIFY(!book.model()->row(book.model()->spreadRow()).tooltip.contains(QStringLiteral("Exact spread")));
         // Clearing strip and indicative line list what they rounded.
         auto s{Parse(RemoteDataWithViews())};
+        // Without a view's places (nullopt): DisplayPrice's own digits.
         auto tick{s.ticks->ticks[1]}; tick.price = 1009; QString exact;
-        QVERIFY(ClearingTickText(tick, s.units, true, false, &exact).contains(QStringLiteral("at ≈0.99108 tUSD / B3")));
+        QVERIFY(ClearingTickText(tick, s.units, true, false, &exact, {}, std::nullopt).contains(QStringLiteral("at ≈0.99108 tUSD / B3")));
         QCOMPARE(exact, QStringLiteral("Exact price: 1000/1009 tUSD / B3"));
-        ClearingTickText(tick, s.units, false, false, &exact); QVERIFY(exact.isEmpty());
+        ClearingTickText(tick, s.units, false, false, &exact, {}, std::nullopt); QVERIFY(exact.isEmpty());
         auto view{*s.indicative}; view.price = 1009; view.best_bid = 1009; view.best_ask = 1010;
-        QVERIFY(IndicativeText(view, s.units, true, &exact).contains(QStringLiteral("would clear at ≈0.99108 tUSD / B3")));
+        QVERIFY(IndicativeText(view, s.units, true, &exact, std::nullopt).contains(QStringLiteral("would clear at ≈0.99108 tUSD / B3")));
         QVERIFY(exact.startsWith(QStringLiteral("Exact prices: "))); QVERIFY(exact.contains(QStringLiteral("1000/1009"))); QVERIFY(exact.contains(QStringLiteral("100/101")));
         QVERIFY(!panel.m_wallet); QVERIFY(!panel.m_thread);
     }

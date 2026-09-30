@@ -277,13 +277,15 @@ std::vector<Trade> TicksAsTrades(const std::deque<Tick>& held);
 //! auction's number belongs in the tooltip. `exact_prices`, when given,
 //! receives the exact form of every price the text shows rounded (empty
 //! when none was), for a tooltip. Prices at the view's `places`
-//! (ViewPrice; nullopt: DisplayPrice).
-QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices = nullptr,
-                         const QString& when = {}, std::optional<int> places = std::nullopt);
+//! (ViewPrice; nullopt: DisplayPrice). No argument has a default: a caller
+//! states the rule it shows, so a new embedding cannot fall back to
+//! DisplayPrice beside a book at the view's places unnoticed.
+QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices,
+                         const QString& when, std::optional<int> places);
 //! The indicative line for the ticket; empty when there is nothing to say.
-//! Prices at the view's `places` (ViewPrice; nullopt: DisplayPrice).
-QString IndicativeText(const Indicative& view, const Units& units, bool inverse, QString* exact_prices = nullptr,
-                       std::optional<int> places = std::nullopt);
+//! Prices at the view's `places` (ViewPrice; nullopt: DisplayPrice), stated
+//! by every caller as for ClearingTickText.
+QString IndicativeText(const Indicative& view, const Units& units, bool inverse, QString* exact_prices, std::optional<int> places);
 //! A price-grouped projection of exact limit-shaped curves, not FIFO orders.
 //! Raw fields always retain canonical units: base raw quantity and B3 atoms.
 //! Inverse amount is gross B3 at this limit, not a promised execution amount.

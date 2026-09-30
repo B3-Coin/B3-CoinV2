@@ -102,7 +102,7 @@ B3FlowMeshTradeTape::B3FlowMeshTradeTape(QWidget* parent) : QWidget{parent}
     m_note->setTextFormat(Qt::PlainText); m_note->setWordWrap(true);
     B3Theme::markTextRole(m_note, QStringLiteral("secondary"));
     layout->addWidget(m_note);
-    setRows({}, {}, false, {}, false, {});
+    setRows({}, {}, false, {}, false, {}, false, std::nullopt);
 }
 
 QString B3FlowMeshTradeTape::ReportedLabel()

@@ -56,9 +56,9 @@ public:
     //! endpoint's claims, not execution this client verified (a remote
     //! client's ticks): the note, the header and every row say so. Prices
     //! at the view's `places` (ViewPrice; nullopt: DisplayPrice), as the
-    //! order book shows them.
+    //! order book shows them; no default, so every caller states the rule.
     void setRows(const std::vector<Row>& rows, const B3FlowMeshMarketData::Units& units, bool inverse, const QString& source,
-                 bool remote, const QString& reason, bool reported = false, std::optional<int> places = std::nullopt);
+                 bool remote, const QString& reason, bool reported, std::optional<int> places);
     //! The provenance label of endpoint-reported rows.
     static QString ReportedLabel();
     QTableWidget* table() const { return m_table; }
