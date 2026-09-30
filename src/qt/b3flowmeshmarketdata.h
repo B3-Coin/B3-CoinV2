@@ -148,6 +148,43 @@ struct Indicative {
     CAmount draft_price{0}, draft_quantity{0};
     bool operator==(const Indicative&) const = default;
 };
+//! One price level of the node's "book_levels" (a canonical side), checked
+//! against its bucket's exact canonical range. Display only.
+struct BookLevel {
+    util::Unsigned128 bucket{0};
+    //! Canonical price zero in the inverse view (no finite token-per-B3 price).
+    bool zero_price{false};
+    CAmount low{0}, high{0}, size{0}, cumulative{0}, own{0};
+    //! Exact B3 atoms of the level, when the node computed them.
+    std::optional<util::Unsigned128> notional;
+    uint32_t curves{0};
+    bool operator==(const BookLevel&) const = default;
+};
+struct BookLevelsSide {
+    bool available{false}, more{false};
+    //! Why the side is unavailable, or why it stopped early (truncated).
+    QString reason, truncated;
+    //! Best first: bids by descending, asks by ascending canonical price.
+    std::vector<BookLevel> levels;
+    bool operator==(const BookLevelsSide&) const = default;
+};
+//! The node's price levels of every verified standing curve at the reply's
+//! head (getflowmeshmarketdata "book_levels"): never certified, pending
+//! actions excluded. A malformed section is only unavailable ("malformed");
+//! it never fails the read or is shown as data.
+struct BookLevels {
+    bool available{false};
+    QString reason, head;
+    size_t depth{0}, total_curves{0};
+    //! The grouping the node used, as asked for.
+    flowmesh::LevelGrouping grouping;
+    //! Exact best standing prices, whatever the grouping.
+    std::optional<CAmount> best_bid, best_ask;
+    BookLevelsSide bids, asks;
+    //! The standing curves cleared as they are, with no draft.
+    Indicative standing;
+    bool operator==(const BookLevels&) const = default;
+};
 struct Snapshot {
     QString market, base, domain, config, head, state_root, account, halt, error;
     Units units;
@@ -167,6 +204,9 @@ struct Snapshot {
     std::optional<TickPage> ticks;
     std::optional<Indicative> indicative;
     std::optional<ObservedTimes> observed;
+    //! Present when the reply carried them: a changed head, or an unchanged
+    //! reply asked for them (see B3FlowMeshTradingPanel's levels request).
+    std::optional<BookLevels> levels;
     bool operator==(const Snapshot&) const = default;
 };
 //! Ticks the panel holds for one market: consecutive, oldest first, at most

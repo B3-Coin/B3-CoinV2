@@ -10,12 +10,14 @@
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
+#include <node/flowmesh_client.h>
 #include <node/flowmesh_client_work.h>
 #include <rpc/server.h>
 #include <qt/clientmodel.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
 #include <flowmesh/market.h>
+#include <flowmesh/market_view.h>
 #include <flowmesh/microblock.h>
 #include <test/util/setup_common.h>
 #include <util/int128.h>
@@ -205,6 +207,33 @@ Snapshot SyntheticLimitBook(size_t levels = 8)
     }
     snapshot.depth = Aggregate(snapshot.curves);
     return snapshot;
+}
+
+//! The node's "book_levels" of `curves` at `head`, as the local RPC projects
+//! them: the engine's own aggregation, never a Qt reimplementation.
+UniValue LevelsJson(const std::vector<Curve>& curves, const uint256& head, const flowmesh::LevelGrouping& grouping = {},
+                    const std::optional<uint256>& own = std::nullopt, size_t depth = flowmesh::MARKET_DATA_MAX_LEVELS)
+{
+    std::vector<flowmesh::ClearingEngine::CurveView> views;
+    for (const auto& curve : curves) {
+        flowmesh::ClearingEngine::CurveView view;
+        view.account_id = *uint256::FromHex(curve.account.toStdString());
+        view.side = curve.side == QStringLiteral("bid") ? flowmesh::ClearingEngine::Side::BID : flowmesh::ClearingEngine::Side::ASK;
+        for (const auto& point : curve.points) view.points.push_back({point.price, point.quantity});
+        view.filled_quantity = curve.filled; view.remaining_quantity = curve.remaining; view.reserved_amount = curve.reserved;
+        views.push_back(std::move(view));
+    }
+    flowmesh::BookLevelsQuery query;
+    query.depth = depth; query.grouping = grouping; query.account = own;
+    auto levels{flowmesh::ComputeBookLevels(views, query)};
+    levels.head = head; levels.standing.head = head;
+    return node::FlowMeshBookLevelsJson(levels);
+}
+flowmesh::LevelGrouping Grouping(bool inverse, uint8_t mantissa, int32_t exponent, uint8_t decimals)
+{
+    flowmesh::LevelGrouping grouping; grouping.exact = false; grouping.inverse = inverse;
+    grouping.mantissa = mantissa; grouping.exponent = exponent; grouping.decimals = decimals;
+    return grouping;
 }
 
 bool SaveOrderBookGallery(const Snapshot& snapshot, bool inverse, const QString& directory, const QString& filename, const QString& heading)
@@ -2366,6 +2395,110 @@ private Q_SLOTS:
         QVERIFY(IndicativeText(bounds, s.units, false).contains(QStringLiteral("filling 0.1875 to 0.187501 of 1 tUSD")));
         Indicative unavailable; unavailable.reason = QStringLiteral("work_budget");
         QCOMPARE(IndicativeText(unavailable, s.units, false), QStringLiteral("Indicative price unavailable (work_budget)"));
+    }
+    void bookLevelsParseExactlyOrFailClosedPerSection()
+    {
+        const auto book{SyntheticLimitBook()};
+        auto data{Data()};
+        data.pushKV("book_levels", LevelsJson(book.curves, H(4), {}, H(5)));
+        const auto s{Parse(data)};
+        QVERIFY(s.levels && s.levels->available);
+        QCOMPARE(s.levels->head, s.head);
+        QCOMPARE(s.levels->bids.levels.size(), size_t{8});
+        QCOMPARE(s.levels->asks.levels.size(), size_t{8});
+        // Exact levels: best bid 1000 with 100,000 of which 0 filled.
+        QCOMPARE(s.levels->bids.levels[0].low, CAmount{1000});
+        QCOMPARE(s.levels->bids.levels[0].size, CAmount{100'000});
+        QCOMPARE(*s.levels->best_bid, CAmount{1000});
+        QCOMPARE(*s.levels->best_ask, CAmount{1010});
+        CAmount asks{0}; for (const auto& level : s.levels->asks.levels) asks += level.size;
+        QCOMPARE(s.levels->asks.levels.back().cumulative, asks);
+        // The viewer's own order (account 5 holds none in this book).
+        QCOMPARE(s.levels->bids.levels[0].own, CAmount{0});
+        QVERIFY(s.levels->bids.levels[0].notional);
+        QVERIFY(s.levels->standing.available && !s.levels->standing.has_draft);
+        // A canonical grouping of 0.01 B3 per 6-decimal token: 10 ticks.
+        auto grouped_data{Data()};
+        grouped_data.pushKV("book_levels", LevelsJson(book.curves, H(4), Grouping(false, 1, -2, 6)));
+        const auto grouped{Parse(grouped_data)};
+        QVERIFY(grouped.levels && grouped.levels->available);
+        QVERIFY(grouped.levels->grouping == Grouping(false, 1, -2, 6));
+        QCOMPARE(grouped.levels->bids.levels[0].low, CAmount{1000});
+        QCOMPARE(grouped.levels->bids.levels[0].high, CAmount{1009});
+        // Every tampered section is only unavailable; the read still parses.
+        const auto tampered = [&](const std::function<void(UniValue&)>& change) {
+            auto value{Data()};
+            auto levels{LevelsJson(book.curves, H(4))};
+            change(levels);
+            value.pushKV("book_levels", levels);
+            const auto parsed{Parse(value)};
+            return parsed.levels && !parsed.levels->available && parsed.levels->reason == QStringLiteral("malformed") &&
+                   parsed.levels->bids.levels.empty() && parsed.curves.size() == 2;
+        };
+        const auto row = [](UniValue& levels, const char* side, size_t index, const char* key, const UniValue& value) {
+            auto rows{levels[side]["levels"]}; auto item{rows[index]}; item.pushKV(key, value);
+            UniValue replaced{UniValue::VARR}; for (size_t i{0}; i < rows.size(); ++i) replaced.push_back(i == index ? item : rows[i]);
+            auto section{levels[side]}; section.pushKV("levels", replaced); levels.pushKV(side, section);
+        };
+        QVERIFY(tampered([](UniValue& v) { v.pushKV("head", H(9).GetHex()); }));               // another head
+        QVERIFY(tampered([](UniValue& v) { v.pushKV("certified", true); }));
+        QVERIFY(tampered([&](UniValue& v) { row(v, "bids", 1, "cumulative", 1); }));           // not the running sum
+        QVERIFY(tampered([&](UniValue& v) { row(v, "bids", 1, "low", 1000); row(v, "bids", 1, "high", 1000); row(v, "bids", 1, "bucket", "1000"); })); // overlaps
+        QVERIFY(tampered([&](UniValue& v) { row(v, "asks", 0, "high", 1011); }));             // not its bucket
+        QVERIFY(tampered([&](UniValue& v) { row(v, "asks", 0, "own", 10'000'000); }));         // own over size
+        QVERIFY(tampered([&](UniValue& v) { row(v, "asks", 0, "notional", "1"); }));          // priced outside
+        QVERIFY(tampered([&](UniValue& v) { row(v, "asks", 0, "bucket", "-5"); }));
+        QVERIFY(tampered([](UniValue& v) { v.pushKV("depth", 4); }));                         // more rows than asked
+        QVERIFY(tampered([](UniValue& v) { v.pushKV("best_bid", 990); }));                    // outside the best level
+        QVERIFY(tampered([](UniValue& v) { auto g{v["grouping"]}; g.pushKV("exact", false); v.pushKV("grouping", g); }));
+        // Unavailable levels keep their reason and show nothing.
+        auto missing{Data()};
+        UniValue unavailable{UniValue::VOBJ}; unavailable.pushKV("available", false); unavailable.pushKV("unavailable_reason", "work_budget");
+        unavailable.pushKV("certified", false); unavailable.pushKV("excludes_pending_actions", true); unavailable.pushKV("basis", "verified_standing_curves");
+        unavailable.pushKV("head", H(4).GetHex()); unavailable.pushKV("depth", 50); UniValue exact{UniValue::VOBJ}; exact.pushKV("exact", true); unavailable.pushKV("grouping", exact);
+        missing.pushKV("book_levels", unavailable);
+        const auto none{Parse(missing)};
+        QVERIFY(none.levels && !none.levels->available && none.levels->reason == QStringLiteral("work_budget"));
+    }
+    void unchangedReadsKeepTheHeadsLevelsOrTakeFreshOnes()
+    {
+        B3FlowMeshTradingPanel panel; panel.m_timer->stop();
+        auto data{Data()};
+        data.pushKV("book_levels", LevelsJson(Parse(Data()).curves, H(4)));
+        Observe(panel, Parse(data));
+        QVERIFY(panel.m_snapshot->levels && panel.m_snapshot->levels->available);
+        const auto held{*panel.m_snapshot->levels};
+        // A light poll without levels keeps the head's own.
+        auto light{Data()}; light.pushKV("unchanged", true);
+        QElapsedTimer age; age.start();
+        QVERIFY(panel.applySelectedSnapshot(Parse(light), age, panel.m_snapshot->head) == B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QVERIFY(panel.m_snapshot->levels && *panel.m_snapshot->levels == held);
+        // One that brings them again (another grouping) replaces them.
+        light.pushKV("book_levels", LevelsJson(Parse(Data()).curves, H(4), Grouping(false, 1, -2, 6)));
+        QVERIFY(panel.applySelectedSnapshot(Parse(light), age, panel.m_snapshot->head) == B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QVERIFY(panel.m_snapshot->levels && panel.m_snapshot->levels->grouping == Grouping(false, 1, -2, 6));
+    }
+    void marketReadsAskForBookLevelsAgainOnlyWhenNeeded()
+    {
+        FundingReadProbe probe; probe.live_ms = 0;
+        probe.data = RemoteData(); probe.data.pushKV("book_levels", LevelsJson(Parse(RemoteData()).curves, H(4)));
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.market_options.size(), size_t{1});
+        const auto first{probe.market_options[0]["levels"]};
+        QCOMPARE(first["depth"].getInt<int>(), 50);
+        QVERIFY(!first.exists("group"));
+        // The displayed snapshot had no levels: asked for even at the same head.
+        QVERIFY(first["include_unchanged"].isTrue());
+        QVERIFY(panel.m_snapshot->levels && panel.m_snapshot->levels->available);
+        // Held for this head in this grouping: an unchanged read computes nothing.
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.market_options.size(), size_t{2});
+        QVERIFY(!probe.market_options[1]["levels"].exists("include_unchanged"));
+        // The indicative for the ticket's draft is its own section: the book
+        // never asks for a draft-free indicative.
+        QVERIFY(probe.market_options[1].exists("indicative") && probe.market_options[1]["indicative"].exists("draft"));
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void marketReadsAskForHeldTicksAndTheTicketDraft()
     {

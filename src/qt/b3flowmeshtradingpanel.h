@@ -100,6 +100,8 @@ private:
         QString views_market;
         std::optional<uint64_t> ticks_after;
         UniValue draft;
+        //! The book levels request for `views_market` (see levelsRequest).
+        UniValue levels;
         //! Observed-time candles this job reads for `views_market`, when due
         //! (captured on the GUI thread), and what it read. A failed candles
         //! read never fails the job: it only leaves `candles_error`.
@@ -127,7 +129,7 @@ private:
         QElapsedTimer snapshot_age;
         //! As Result's, for the watched market.
         std::optional<uint64_t> ticks_after;
-        UniValue draft;
+        UniValue draft, levels;
     };
     struct DeferredReview {
         B3FlowMeshTrading::Operation operation;
@@ -189,6 +191,13 @@ private:
     UniValue indicativeDraft() const;
     //! The last held tick of `market`, when the held ticks are that market's.
     std::optional<uint64_t> ticksAfter(const QString& market) const;
+    //! The book grouping the order book displays (exact: none).
+    flowmesh::LevelGrouping bookGrouping() const;
+    //! The "levels" option of a selected-market read: the deepest levels in
+    //! bookGrouping(), and include_unchanged while the displayed levels are
+    //! missing or of another grouping, so a grouping change applies at the
+    //! next read even on an idle market. Null without a selected market.
+    UniValue levelsRequest() const;
     //! Extends the held ticks (and their observed times) from the displayed
     //! snapshot's page.
     void mergeHeldTicks();

@@ -4,6 +4,7 @@
 #include <qt/b3assettransfer.h>
 #include <flowmesh/clearing.h>
 #include <flowmesh/market.h>
+#include <flowmesh/market_view.h>
 #include <util/strencodings.h>
 #include <util/int128.h>
 #include <QObject>
@@ -344,6 +345,104 @@ Indicative IndicativeOf(const UniValue& v, const Snapshot& s)
         out = {};
         out.reason = QStringLiteral("malformed");
         out.has_draft = draft; out.draft_side = side; out.draft_price = price; out.draft_quantity = quantity;
+    }
+    return out;
+}
+flowmesh::LevelGrouping GroupingOf(const UniValue& v)
+{
+    flowmesh::LevelGrouping out;
+    out.exact = Flag(F(v, "exact"));
+    if (out.exact) return out;
+    const auto orientation{Text(F(v, "orientation"))};
+    if (orientation != QStringLiteral("canonical") && orientation != QStringLiteral("inverse")) Fail("Unknown level grouping orientation.");
+    out.inverse = orientation == QStringLiteral("inverse");
+    const auto mantissa{Count(F(v, "mantissa"))}, decimals{Count(F(v, "decimals"))};
+    const auto& exponent{F(v, "exponent")};
+    if (!exponent.isNum() || mantissa > 5 || decimals > 18) Fail("Invalid level grouping.");
+    const auto power{exponent.getInt<int64_t>()};
+    if (power < -64 || power > 64) Fail("Invalid level grouping exponent.");
+    out.mantissa = static_cast<uint8_t>(mantissa); out.exponent = static_cast<int32_t>(power); out.decimals = static_cast<uint8_t>(decimals);
+    if (!flowmesh::LevelGroupingError(out).empty()) Fail("Invalid level grouping.");
+    return out;
+}
+BookLevelsSide LevelsSideOf(const UniValue& v, const bool bid, const BookLevels& levels)
+{
+    BookLevelsSide side;
+    side.available = Flag(F(v, "available")); side.more = Flag(F(v, "more"));
+    if (!F(v, "truncated_reason").isNull()) side.truncated = Text(F(v, "truncated_reason")).left(64);
+    const auto& rows{F(v, "levels")};
+    if (!rows.isArray() || rows.size() > levels.depth) Fail("Oversized book levels.");
+    if (!side.available) {
+        side.reason = Text(F(v, "unavailable_reason")).left(64);
+        if (!rows.empty()) Fail("Levels of an unavailable side.");
+        return side;
+    }
+    Wide running{0};
+    for (const auto& row : rows.getValues()) {
+        BookLevel level;
+        const auto bucket{Text(F(row, "bucket"))};
+        const auto index{bucket == QStringLiteral("0") ? std::optional<Wide>{0} : PositiveInteger(bucket)};
+        if (!index) Fail("Invalid book level bucket.");
+        level.bucket = *index; level.zero_price = Flag(F(row, "zero_price"));
+        level.low = Amount(F(row, "low")); level.high = Amount(F(row, "high"));
+        level.size = Amount(F(row, "size")); level.cumulative = Amount(F(row, "cumulative")); level.own = Amount(F(row, "own"));
+        const auto curves{Count(F(row, "curves"))};
+        if (curves == 0 || curves > flowmesh::BOOK_SNAPSHOT_MAX_CURVES || level.size == 0 || level.own > level.size) Fail("Invalid book level.");
+        level.curves = static_cast<uint32_t>(curves);
+        // Exactly its bucket's range, disjoint from and worse than the last.
+        const auto range{flowmesh::LevelBucketRange(levels.grouping, bid, level.bucket, level.zero_price)};
+        if (!range || range->first != level.low || range->second != level.high) Fail("Book level outside its bucket.");
+        if (!side.levels.empty() && (bid ? level.high >= side.levels.back().low : level.low <= side.levels.back().high)) Fail("Book levels out of order.");
+        running += static_cast<uint64_t>(level.size);
+        if (running != static_cast<uint64_t>(level.cumulative)) Fail("Book level cumulative mismatch.");
+        if (!F(row, "notional").isNull()) {
+            const auto text{Text(F(row, "notional"))};
+            const auto notional{text == QStringLiteral("0") ? std::optional<Wide>{0} : PositiveInteger(text)};
+            // Every lot is priced within the level's range.
+            if (!notional || *notional < Wide{static_cast<uint64_t>(level.size)} * static_cast<uint64_t>(level.low) ||
+                *notional > Wide{static_cast<uint64_t>(level.size)} * static_cast<uint64_t>(level.high)) Fail("Book level notional outside its range.");
+            level.notional = notional;
+        }
+        side.levels.push_back(std::move(level));
+    }
+    return side;
+}
+BookLevels BookLevelsOf(const UniValue& v, const Snapshot& s)
+{
+    BookLevels out;
+    try {
+        if (Flag(F(v, "certified")) || !Flag(F(v, "excludes_pending_actions")) || Text(F(v, "basis")) != QStringLiteral("verified_standing_curves")) {
+            Fail("Book levels are never certified.");
+        }
+        out.available = Flag(F(v, "available"));
+        out.head = Id(F(v, "head"), true);
+        const auto depth{Count(F(v, "depth"))};
+        if (depth == 0 || depth > flowmesh::MARKET_DATA_MAX_LEVELS) Fail("Invalid book level depth.");
+        out.depth = depth;
+        out.grouping = GroupingOf(F(v, "grouping"));
+        if (!out.available) {
+            out.reason = Text(F(v, "unavailable_reason")).left(160);
+            return out;
+        }
+        // Levels of another head than this snapshot's are not shown.
+        if (out.head != s.head) Fail("Book levels of another head.");
+        const auto total{Count(F(v, "total_curves"))};
+        if (total > flowmesh::BOOK_SNAPSHOT_MAX_CURVES) Fail("Invalid book level curve count.");
+        out.total_curves = total;
+        if (!F(v, "best_bid").isNull()) out.best_bid = Amount(F(v, "best_bid"));
+        if (!F(v, "best_ask").isNull()) out.best_ask = Amount(F(v, "best_ask"));
+        out.bids = LevelsSideOf(F(v, "bids"), true, out);
+        out.asks = LevelsSideOf(F(v, "asks"), false, out);
+        // The exact best price lies in the best level, and exists with it.
+        for (const auto& [side, best] : {std::pair{&out.bids, out.best_bid}, std::pair{&out.asks, out.best_ask}}) {
+            if (side->levels.empty()) continue;
+            if (!best || *best < side->levels.front().low || *best > side->levels.front().high) Fail("Best price outside the best level.");
+        }
+        out.standing = IndicativeOf(F(v, "standing"), s);
+        if (out.standing.has_draft) Fail("A standing clearing has no draft.");
+    } catch (const std::exception&) {
+        out = {};
+        out.reason = QStringLiteral("malformed");
     }
     return out;
 }
@@ -983,6 +1082,8 @@ Snapshot Parse(const UniValue& value)
     if (!F(value, "clearing_ticks").isNull()) s.ticks = Ticks(F(value, "clearing_ticks"), s);
     if (!F(value, "indicative").isNull()) s.indicative = IndicativeOf(F(value, "indicative"), s);
     if (!F(value, "observed_time").isNull()) s.observed = ObservedOf(F(value, "observed_time"), s);
+    // Also on an unchanged reply that asked for them (after a grouping change).
+    if (!F(value, "book_levels").isNull()) s.levels = BookLevelsOf(F(value, "book_levels"), s);
     if (s.unchanged) return s;
     const auto& liquidity{F(value, "liquidity")}; s.curves_complete = Flag(F(liquidity, "complete")); s.curves = Curves(F(liquidity, "curves"), 128); s.depth = Aggregate(s.curves);
     if (s.curves_complete && Count(F(liquidity, "total_curves")) != s.curves.size()) Fail("Complete liquidity count does not match its curves.");

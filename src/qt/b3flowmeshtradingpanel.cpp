@@ -64,10 +64,13 @@ bool NoSpendingRequired(const std::string& method) {
         method == "getflowmeshmarketdata" || method == "getflowmeshcandles" || method == "getflowmeshactionstatus" || method == "listflowmeshactions" || method == "listflowmeshvaultoperations" || method == "testmempoolaccept";
 }
 //! Display sections of a selected-market read: the clearing ticks after the
-//! last one held (the newest otherwise) and, only while the ticket holds an
-//! order that parses, the indicative next clearing for it (a node copies the
-//! standing curves once per head for it). Display only; nothing is signed.
-void AddMarketViews(UniValue& options, const std::optional<uint64_t>& after, const UniValue& draft)
+//! last one held (the newest otherwise), the book levels of every verified
+//! standing curve in the displayed grouping (`levels`, see levelsRequest)
+//! and, only while the ticket holds an order that parses, the indicative
+//! next clearing for it (a node copies the standing curves once per head
+//! for both). The book's spread row never uses that draft indicative: its
+//! standing clearing comes with the levels. Display only; nothing is signed.
+void AddMarketViews(UniValue& options, const std::optional<uint64_t>& after, const UniValue& draft, const UniValue& levels)
 {
     UniValue ticks{UniValue::VOBJ};
     if (after) ticks.pushKV("after_sequence", *after);
@@ -75,6 +78,7 @@ void AddMarketViews(UniValue& options, const std::optional<uint64_t>& after, con
     options.pushKV("ticks", std::move(ticks));
     // Operator-observed times of the head, history and ticks; display only.
     options.pushKV("observed_time", true);
+    if (levels.isObject()) options.pushKV("levels", levels);
     if (!draft.isObject()) return;
     UniValue indicative{UniValue::VOBJ};
     indicative.pushKV("draft", draft);
@@ -839,6 +843,36 @@ UniValue B3FlowMeshTradingPanel::indicativeDraft() const
     return draft;
 }
 
+flowmesh::LevelGrouping B3FlowMeshTradingPanel::bookGrouping() const
+{
+    return {};
+}
+
+UniValue B3FlowMeshTradingPanel::levelsRequest() const
+{
+    const auto selected{market()};
+    if (!selected) return {};
+    const auto grouping{bookGrouping()};
+    UniValue levels{UniValue::VOBJ};
+    levels.pushKV("depth", static_cast<uint64_t>(flowmesh::MARKET_DATA_MAX_LEVELS));
+    if (!grouping.exact) {
+        UniValue group{UniValue::VOBJ};
+        group.pushKV("orientation", grouping.inverse ? "inverse" : "canonical");
+        group.pushKV("mantissa", grouping.mantissa);
+        group.pushKV("exponent", grouping.exponent);
+        group.pushKV("decimals", grouping.decimals);
+        levels.pushKV("group", std::move(group));
+    }
+    // An unchanged reply carries levels only when asked: after a grouping
+    // change, or when the head's levels are missing or were not copied.
+    const bool displayed{m_snapshot && m_snapshot->market == selected->id};
+    const auto* held{displayed && m_snapshot->levels ? &*m_snapshot->levels : nullptr};
+    if (displayed && (!held || held->grouping != grouping || (!held->available && held->reason == QStringLiteral("head_changed")))) {
+        levels.pushKV("include_unchanged", true);
+    }
+    return levels;
+}
+
 std::optional<uint64_t> B3FlowMeshTradingPanel::ticksAfter(const QString& market) const
 {
     if (m_ticks.empty() || m_ticks_market != market) return std::nullopt;
@@ -1565,7 +1599,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     auto* node{&m_wallet->node()}; const auto backend{m_backend}; const auto cancel{m_cancel}; const auto yield_refresh{m_yield_refresh};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
     const auto selected{market()}; const QString selected_id{selected ? selected->id : QString{}};
-    result->views_market = selected_id; result->ticks_after = ticksAfter(selected_id); result->draft = indicativeDraft();
+    result->views_market = selected_id; result->ticks_after = ticksAfter(selected_id); result->draft = indicativeDraft(); result->levels = levelsRequest();
     if (const auto due{candlesDue()}) { result->candles_interval = due->first; result->candles_limit = due->second; }
     const auto phase{foreground_read ? (m_route_pending || m_market_data.empty() || !m_catalog_age.isValid() ? RefreshPhase::Catalog : RefreshPhase::None)
                                      : nextPassivePhase()};
@@ -1743,7 +1777,8 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                         UniValue params{UniValue::VARR}; params.push_back(selected->id.toStdString()); UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
                         // The held ticks and the ticket belong to the displayed market only.
                         AddMarketViews(options, selected->id == result->views_market ? result->ticks_after : std::nullopt,
-                                       selected->id == result->views_market ? result->draft : UniValue{});
+                                       selected->id == result->views_market ? result->draft : UniValue{},
+                                       selected->id == result->views_market ? result->levels : UniValue{});
                         if (!known_head.isEmpty() && selected->id == selected_id && !result->catalog) {
                             options.pushKV("known_head", known_head.toStdString());
                             result->basis_head = known_head;
@@ -2040,6 +2075,9 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
         // Read at this same head: they replace the retained ones.
         retained.ticks = std::move(fresh.ticks); retained.indicative = std::move(fresh.indicative);
         retained.observed = std::move(fresh.observed);
+        // Levels come with a changed head, or when this read asked for them
+        // again (another grouping): take them, else keep the head's own.
+        if (fresh.levels) retained.levels = std::move(fresh.levels);
         m_snapshot = std::move(retained); m_response_age = age; mergeHeldTicks(); updateDataViews();
     } else {
         if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age = age;
@@ -2176,7 +2214,7 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
     auto result{std::make_shared<WatchResult>()};
     result->scope = {m_wallet, m_generation, m_watch_generation, selected->id, selected->account, m_snapshot->head};
     result->release = release;
-    result->ticks_after = ticksAfter(selected->id); result->draft = indicativeDraft();
+    result->ticks_after = ticksAfter(selected->id); result->draft = indicativeDraft(); result->levels = levelsRequest();
     auto* node{&m_wallet->node()};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())};
     const auto cancel{m_cancel};
@@ -2190,7 +2228,7 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
             UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
             options.pushKV("known_head", result->scope.known_head.toStdString());
             options.pushKV("watch_ms", result->release ? int64_t{0} : B3FlowMeshWatch::Policy::WATCH_MS);
-            AddMarketViews(options, result->ticks_after, result->draft);
+            AddMarketViews(options, result->ticks_after, result->draft, result->levels);
             params.push_back(options);
             const auto response{node->executeRpc("getflowmeshmarketdata", params, uri)};
             result->snapshot_age.restart();
