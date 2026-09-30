@@ -100,6 +100,22 @@ any of those servers already serves.
   best prices beside the spread, `Price | Size | Total` with Total
   cumulative, as many rows per side as the height holds (only non-empty
   levels), updated in place (no model reset or row churn).
+- One number of decimal places per column, on every row (Hyperliquid's
+  fixed precision; review of 2026-09-30). Price: the market tick's places in
+  the canonical view (every on-grid price exact, e.g. `1.000` at 0.001 B3),
+  the step's places when grouped (`1.00` at 0.01, `0.9900` at 0.0001). In
+  the B3 view with one level per canonical price, token-per-B3 prices do not
+  end, so each label is rounded to the fewest places at which every label
+  still reads back through `ParseDisplayLimit` as exactly its own canonical
+  price (for the side a click on it naturally takes), a sell level up and a
+  buy level down: the direction every order of the level accepts, as for
+  grouped edges. "≈" is then said once, in the Price header (its tooltip
+  states the rule), never per row; each rounded level keeps its exact price
+  in its tooltip and says "about" to a screen reader. Size and Total share
+  one count: the places the held levels need. The fallback projection
+  follows the same rule. `FixedDisplayPrice`, `PadDecimals` and
+  `NeededDecimals` (qt/b3flowmeshmarketdata.h) do the formatting; display
+  only, never parsed into an action.
 - Depth bars on ONE scale shared by both sides; the viewer's own orders
   marked; tooltips with order count, grouped range, average price.
 - Spread row: `Spread <exact> · <pct>%` (200 x (ask - bid) / (ask + bid),

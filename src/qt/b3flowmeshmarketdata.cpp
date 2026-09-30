@@ -689,6 +689,47 @@ QString ExactInversePrice(CAmount raw, int decimals)
     const auto ratio{InverseRatio(raw, decimals)};
     return ratio ? ExactRatioText(*ratio) : QStringLiteral("—");
 }
+QString FixedDisplayPrice(const CAmount raw, const int decimals, const bool inverse, const int places, const bool up, bool* exact)
+{
+    if (raw < 0 || !MoneyRange(raw) || decimals < 0 || decimals > 18 || places < 0 || places > 18) return {};
+    std::optional<Ratio> ratio;
+    if (inverse) {
+        ratio = InverseRatio(raw, decimals);
+    } else if (decimals <= 9) {
+        ratio = Ratio{Wide{static_cast<uint64_t>(raw)}, Pow10(9 - decimals)};
+    } else {
+        // A whole number of B3 per token: only zeros follow the point.
+        if (exact) *exact = true;
+        return PadDecimals(FormatPrice(raw, decimals), places);
+    }
+    if (!ratio) return {};
+    // Bounded: a numerator below 2^63 (or 10^9 inverted) times 10^18 fits.
+    const Wide scaled{ratio->numerator * Pow10(places)};
+    Wide units{scaled / ratio->denominator};
+    const bool whole{scaled % ratio->denominator == 0};
+    if (!whole && up) ++units;
+    if (exact) *exact = whole;
+    QString text{WideText(units)};
+    if (places == 0) return text;
+    text = text.rightJustified(places + 1, QLatin1Char('0'));
+    text.insert(text.size() - places, QLatin1Char('.'));
+    return text;
+}
+QString PadDecimals(QString text, const int places)
+{
+    if (places <= 0) return text;
+    const auto dot{text.indexOf(QLatin1Char('.'))};
+    const int have{dot < 0 ? 0 : static_cast<int>(text.size() - dot - 1)};
+    if (dot < 0) text += QLatin1Char('.');
+    if (have < places) text += QString(places - have, QLatin1Char('0'));
+    return text;
+}
+int NeededDecimals(Wide raw, const int decimals)
+{
+    int places{std::max(0, decimals)};
+    while (places > 0 && raw % 10 == 0) { raw /= 10; --places; }
+    return places;
+}
 QString FormatDepthQuantity(CAmount price, CAmount quantity, int decimals, bool inverse)
 {
     if (!inverse) return FormatAmount(quantity, decimals);

@@ -54,7 +54,8 @@ public:
     //! A different row count resets the model (only when the view's height
     //! changes); otherwise only changed rows emit dataChanged.
     void setRows(std::vector<Row> rows);
-    void setHeaders(const QStringList& headers);
+    //! Column titles and their tooltips (a title's own text when empty).
+    void setHeaders(const QStringList& headers, const QStringList& tips = {});
     const Row& row(int index) const { return m_rows[static_cast<size_t>(index)]; }
     const std::vector<Row>& rows() const { return m_rows; }
     //! The spread row's index (-1 without rows).
@@ -62,7 +63,7 @@ public:
 
 private:
     std::vector<Row> m_rows;
-    QStringList m_headers{tr("Price"), tr("Size"), tr("Total")};
+    QStringList m_headers{tr("Price"), tr("Size"), tr("Total")}, m_header_tips;
 };
 
 /** A Hyperliquid-style order book of the certified FlowMesh market.
@@ -154,6 +155,7 @@ private:
     };
     void layoutRows();
     void viewResized();
+    void fitColumns();
     QLabel *m_last, *m_note, *m_stale;
     QComboBox* m_grouping;
     std::vector<flowmesh::LevelGrouping> m_grouping_choices;

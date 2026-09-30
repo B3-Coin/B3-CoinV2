@@ -54,6 +54,17 @@ PriceText DisplayPrice(CAmount raw_price, const Units& units, bool inverse);
 QString FormatDisplayPrice(CAmount raw_price, int base_decimals, bool inverse = false);
 QString FormatDisplayPrice(CAmount raw_price, const Units& units, bool inverse);
 QString ExactInversePrice(CAmount raw_price, int base_decimals);
+//! A canonical price in the displayed orientation with exactly `places`
+//! decimal places (0-18, zero-padded), rounded up (`up`) or down, never to
+//! nearest, so a caller can round each label in the direction every order of
+//! its level accepts. Display only (the order book's columns of one decimal
+//! count); `exact` tells whether nothing was rounded. Empty for an inverse
+//! price of 0 (no finite token-per-B3 price) or invalid arguments.
+QString FixedDisplayPrice(CAmount raw_price, int base_decimals, bool inverse, int places, bool up, bool* exact = nullptr);
+//! `text` (an exact decimal) zero-padded to at least `places` decimal places.
+QString PadDecimals(QString text, int places);
+//! The decimal places `raw` needs at `decimals` (trailing zeros dropped).
+int NeededDecimals(util::Unsigned128 raw, int decimals);
 //! The exact spread between two canonical best prices in the displayed
 //! orientation, rounded to the places its prices show (with `exact`); empty
 //! when ask < bid or, in the B3 view, a price is zero. Display only.

@@ -72,6 +72,55 @@ QString RelativeSpread(const CAmount bid, const CAmount ask)
     if (scaled == 0) return QStringLiteral("<0.001%");
     return FormatWide(scaled, 3) + QLatin1Char('%');
 }
+Wide AsWide(const CAmount amount) { return Wide{static_cast<uint64_t>(std::max<CAmount>(0, amount))}; }
+//! The price column's one decimal count (Hyperliquid shows every row of a
+//! column with the same places). Canonical, one level per price: the market
+//! tick's places, where every on-grid price is exact. Grouped: the step's.
+//! Inverse, one level per canonical price: the fewest places at which each
+//! label, rounded in the direction every order of its level accepts (a
+//! displayed sell up, a displayed buy down), reads back through
+//! ParseDisplayLimit, for the side a click on it naturally takes, as exactly
+//! its own canonical price, so no two levels of a side share a label.
+struct PriceColumn {
+    int places{0};
+    //! Inverse labels that read back as no exact price even at 18 places
+    //! (canonical price, rounded up): they keep their own exact form, and
+    //! never widen the column.
+    std::set<std::pair<CAmount, bool>> unmapped;
+};
+//! `labels`: each level's canonical price and whether its label rounds up.
+PriceColumn ChoosePriceColumn(const Units& u, const bool inverse, const flowmesh::LevelGrouping& grouping,
+                              const std::vector<std::pair<CAmount, bool>>& labels)
+{
+    PriceColumn out;
+    if (!grouping.exact) {
+        out.places = std::max(0, -static_cast<int>(grouping.exponent));
+        return out;
+    }
+    if (!inverse) {
+        if (u.decimals > 9) return out; // whole B3 per token
+        out.places = NeededDecimals(AsWide(u.price_step), 9 - u.decimals);
+        for (const auto& [price, up] : labels) out.places = std::max(out.places, NeededDecimals(AsWide(price), 9 - u.decimals));
+        return out;
+    }
+    for (const auto& [price, up] : labels) {
+        if (price <= 0) continue;
+        const int before{out.places};
+        for (;;) {
+            const auto text{FixedDisplayPrice(price, u.decimals, true, out.places, up)};
+            // A displayed sell's label is clicked to buy B3, a displayed buy's to sell it.
+            const auto back{text.isEmpty() ? std::nullopt : ParseDisplayLimit(text, u, true, /*display_buy=*/up)};
+            if (back && back->price == price) break;
+            if (out.places == 18) {
+                out.unmapped.emplace(price, up);
+                out.places = before;
+                break;
+            }
+            ++out.places;
+        }
+    }
+    return out;
+}
 } // namespace
 
 QVariant B3FlowMeshLadderModel::data(const QModelIndex& index, const int role) const
@@ -106,7 +155,8 @@ QVariant B3FlowMeshLadderModel::data(const QModelIndex& index, const int role) c
 QVariant B3FlowMeshLadderModel::headerData(const int section, const Qt::Orientation orientation, const int role) const
 {
     if (orientation != Qt::Horizontal || section < 0 || section >= m_headers.size()) return {};
-    if (role == Qt::DisplayRole || role == Qt::ToolTipRole) return m_headers[section];
+    if (role == Qt::DisplayRole) return m_headers[section];
+    if (role == Qt::ToolTipRole) return section < m_header_tips.size() && !m_header_tips[section].isEmpty() ? m_header_tips[section] : m_headers[section];
     if (role == Qt::TextAlignmentRole) return static_cast<int>((section == 0 ? Qt::AlignLeft : Qt::AlignRight) | Qt::AlignVCenter);
     return {};
 }
@@ -126,10 +176,11 @@ void B3FlowMeshLadderModel::setRows(std::vector<Row> rows)
     }
 }
 
-void B3FlowMeshLadderModel::setHeaders(const QStringList& headers)
+void B3FlowMeshLadderModel::setHeaders(const QStringList& headers, const QStringList& tips)
 {
-    if (headers == m_headers) return;
+    if (headers == m_headers && tips == m_header_tips) return;
     m_headers = headers;
+    m_header_tips = tips;
     Q_EMIT headerDataChanged(Qt::Horizontal, 0, 2);
 }
 
@@ -252,7 +303,10 @@ B3FlowMeshOrderBook::B3FlowMeshOrderBook(QWidget* parent) : QWidget{parent}
     m_view->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
     m_view->verticalHeader()->setDefaultSectionSize(ROW_HEIGHT);
     m_view->verticalHeader()->setMinimumSectionSize(ROW_HEIGHT);
-    m_view->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    // Price takes what Size and Total (a fixed share each) leave: its title
+    // can carry the one "≈" of a rounded column.
+    m_view->horizontalHeader()->setSectionResizeMode(QHeaderView::Fixed);
+    m_view->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_view->horizontalHeader()->setHighlightSections(false);
     m_view->setShowGrid(false); m_view->setAlternatingRowColors(false);
     m_view->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -366,8 +420,22 @@ bool B3FlowMeshOrderBook::activateRow(const int row)
     return true;
 }
 
+void B3FlowMeshOrderBook::fitColumns()
+{
+    // Size and Total: over a quarter of the width each, and room for their
+    // titles; Price (stretched) takes the rest.
+    auto* header{m_view->horizontalHeader()};
+    const int width{m_view->viewport()->width()};
+    for (const int section : {1, 2}) {
+        const QString title{m_model->headerData(section, Qt::Horizontal, Qt::DisplayRole).toString()};
+        const int size{std::max(width * 27 / 100, header->fontMetrics().horizontalAdvance(title) + 20)};
+        if (header->sectionSize(section) != size) header->resizeSection(section, size);
+    }
+}
+
 void B3FlowMeshOrderBook::viewResized()
 {
+    fitColumns();
     const int rows{std::max(1, (m_view->viewport()->height() / ROW_HEIGHT - 1) / 2)};
     if (rows == m_rows_per_side) return;
     m_rows_per_side = rows;
@@ -437,7 +505,16 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
     const bool known{snapshot && KnownUnits(*snapshot)};
     const QString token{known ? snapshot->units.ticker : tr("token")};
     const QString base{inverse ? QStringLiteral("B3") : token}, quote{inverse ? token : QStringLiteral("B3")};
-    m_model->setHeaders({tr("Price (%1)").arg(quote), tr("Size (%1)").arg(base), tr("Total (%1)").arg(base)});
+    // Headers: "≈" once on the price column when some label is rounded.
+    const auto headers = [&](const bool rounded, const int places) {
+        const QString exact_tip{tr("Hover a level for its exact price and the orders in it.")};
+        m_model->setHeaders({rounded ? tr("Price (%1) ≈").arg(quote) : tr("Price (%1)").arg(quote), tr("Size (%1)").arg(base), tr("Total (%1)").arg(base)},
+                            {rounded ? (places == 1 ? tr("Prices rounded to 1 decimal place: a sell level up and a buy level down, so every order in it accepts the price shown. %1").arg(exact_tip)
+                                                    : tr("Prices rounded to %1 decimal places: a sell level up and a buy level down, so every order in it accepts the price shown. %2").arg(places).arg(exact_tip))
+                                     : tr("Price in %1 per %2. %3").arg(quote, base, exact_tip),
+                             tr("Quantity at this level, in %1").arg(base), tr("Cumulative quantity from the best level, in %1").arg(base)});
+        fitColumns();
+    };
     m_asks.clear(); m_bids.clear(); m_head.clear(); m_verified = false; m_inverse = inverse;
     const QString last_tip{tr("Historical last trade, not the current book midpoint. Endpoint-reported history is not independently execution-verified when marked reported.")};
     if (!known || !snapshot->certified || (snapshot->remote && (!snapshot->certificate_verified || !snapshot->account_state_verified))) {
@@ -446,6 +523,7 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
         m_note->setText(!snapshot ? tr("Select a market · no snapshot") : !known ? tr("Verified asset precision required") : tr("Verified order state unavailable"));
         m_note->setToolTip(QString{});
         m_flash_key.clear();
+        headers(false, 0);
         layoutRows();
         if (m_view_observer) m_view_observer(m_head, false);
         return;
@@ -473,9 +551,35 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
     QString note_tip{tr("FlowMesh clears one uniform-price auction per certified entry: there is no price-time priority and no queue position. "
                         "A level is the quantity of standing orders whose own limit lies at its price, after fills; Total is cumulative from the best level. "
                         "Pending orders are not included until certified. A crossed book can stand after a rationed auction until the next certified one.")};
+    // One decimal count per column (Hyperliquid's fixed-precision rows):
+    // prices from the market tick or the grouping step, sizes and totals the
+    // places the held levels need. "≈" appears once, in the price header.
+    PriceColumn column;
+    int size_places{0};
+    bool rounded{false};
     if (usable) {
         m_verified = true;
         best_bid = levels->best_bid; best_ask = levels->best_ask;
+        {
+            std::vector<std::pair<CAmount, bool>> labels;
+            for (const auto* side : {&levels->bids, &levels->asks}) {
+                const bool bid{side == &levels->bids};
+                std::optional<Wide> cumulative_notional{Wide{0}};
+                for (const auto& level : side->levels) {
+                    // In the B3 view a canonical bid is a displayed sell: up.
+                    if (grouping.exact) labels.emplace_back(level.low, inverse && bid);
+                    if (inverse) {
+                        if (level.notional) size_places = std::max(size_places, NeededDecimals(*level.notional, 9));
+                        if (cumulative_notional && level.notional) *cumulative_notional += *level.notional;
+                        else cumulative_notional.reset();
+                        if (cumulative_notional) size_places = std::max(size_places, NeededDecimals(*cumulative_notional, 9));
+                    } else {
+                        size_places = std::max({size_places, NeededDecimals(AsWide(level.size), decimals), NeededDecimals(AsWide(level.cumulative), decimals)});
+                    }
+                }
+            }
+            column = ChoosePriceColumn(u, inverse, grouping, labels);
+        }
         // Displayed sides: in the B3 view a canonical bid (buying the
         // token) sells B3 and is a displayed ask, best first either way.
         const auto build = [&](const BookLevelsSide& side, const bool bid, std::vector<Level>& out) {
@@ -486,25 +590,39 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
                 CAmount click{0};
                 bool clickable{false};
                 if (grouping.exact) {
-                    const auto shown{DisplayPrice(level.low, u, inverse)};
-                    row.price = inverse && level.low == 0 ? QStringLiteral("—") : shown.text;
-                    if (shown.approximate) exact = shown.exact;
+                    if (inverse && level.low == 0) {
+                        row.price = QStringLiteral("—");
+                    } else {
+                        // Rounded toward what every order of the level accepts.
+                        const bool up{inverse && bid};
+                        bool whole{true};
+                        QString text{column.unmapped.contains({level.low, up}) ? QString{} : FixedDisplayPrice(level.low, decimals, inverse, column.places, up, &whole)};
+                        if (text.isEmpty()) {
+                            const auto shown{DisplayPrice(level.low, u, inverse)};
+                            text = shown.text; whole = !shown.approximate;
+                        }
+                        row.price = text;
+                        if (!whole) {
+                            exact = inverse ? ExactInversePrice(level.low, decimals) : FormatPrice(level.low, decimals);
+                            rounded = true;
+                        }
+                    }
                     click = level.low; clickable = level.low > 0;
                 } else if (!grouping.inverse) {
                     // Canonical buckets of g ticks: a buy labelled with its
                     // lower edge, a sell with its upper edge.
                     const Wide ticks{grouping.mantissa * Pow10(grouping.exponent + 9 - grouping.decimals)};
                     const Wide edge{bid ? Wide{static_cast<uint64_t>(level.low)} : level.bucket * ticks};
-                    row.price = FormatPrice(static_cast<CAmount>(edge), decimals);
+                    row.price = PadDecimals(FormatPrice(static_cast<CAmount>(edge), decimals), column.places);
                     click = bid ? level.low : level.high; clickable = click > 0;
                 } else if (level.zero_price) {
                     row.price = bid ? QStringLiteral("∞") : tr("Any");
                     exact = bid ? tr("Buys the token only at price zero: no finite token-per-B3 price") : tr("Sells the token at any price: accepts any token-per-B3 price");
                 } else if (!bid && level.bucket == 0) {
-                    row.price = QStringLiteral("< ") + ScaledDecimal(grouping.mantissa, grouping.exponent);
+                    row.price = QStringLiteral("< ") + PadDecimals(ScaledDecimal(grouping.mantissa, grouping.exponent), column.places);
                     exact = tr("Every price below one display step");
                 } else {
-                    row.price = ScaledDecimal(level.bucket * grouping.mantissa, grouping.exponent);
+                    row.price = PadDecimals(ScaledDecimal(level.bucket * grouping.mantissa, grouping.exponent), column.places);
                     // Every lot of a buy bucket accepts its lower canonical
                     // edge (a displayed sell), of a sell bucket its upper one.
                     click = bid ? level.low : level.high; clickable = click > 0;
@@ -515,12 +633,12 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
                 if (cumulative_notional && level.notional) *cumulative_notional += *level.notional;
                 else cumulative_notional.reset();
                 if (inverse) {
-                    row.size = level.notional ? FormatWide(*level.notional, 9) : QStringLiteral("—");
-                    row.total = cumulative_notional ? FormatWide(*cumulative_notional, 9) : QStringLiteral("—");
+                    row.size = level.notional ? PadDecimals(FormatWide(*level.notional, 9), size_places) : QStringLiteral("—");
+                    row.total = cumulative_notional ? PadDecimals(FormatWide(*cumulative_notional, 9), size_places) : QStringLiteral("—");
                     row.cumulative_display = cumulative_notional;
                 } else {
-                    row.size = FormatAmount(level.size, decimals);
-                    row.total = FormatAmount(level.cumulative, decimals);
+                    row.size = PadDecimals(FormatAmount(level.size, decimals), size_places);
+                    row.total = PadDecimals(FormatAmount(level.cumulative, decimals), size_places);
                     row.cumulative_display = Wide{static_cast<uint64_t>(level.cumulative)};
                 }
                 const bool displayed_ask{bid == inverse};
@@ -546,7 +664,8 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
                 if (level.own > 0) tip << tr("Your order: %1 %2 at this level").arg(FormatAmount(level.own, decimals), token);
                 if (!row.click_price.isEmpty()) tip << tr("Click to use this price in the ticket (nothing is signed).");
                 row.tooltip = tip.join(QLatin1Char('\n'));
-                row.accessible = tr("%1 %2, size %3, total %4, %5 order(s)").arg(displayed_ask ? tr("Sell") : tr("Buy"), row.price, row.size, row.total).arg(level.curves) +
+                row.accessible = tr("%1 %2, size %3, total %4, %5 order(s)").arg(displayed_ask ? tr("Sell") : tr("Buy"),
+                                                                               exact.isEmpty() ? row.price : tr("about %1").arg(row.price), row.size, row.total).arg(level.curves) +
                                  (row.own ? tr(", includes yours") : QString{});
                 out.push_back(std::move(row));
             }
@@ -564,24 +683,56 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
     } else {
         // Fallback: the limit and ladder orders of the first curve page.
         const auto book{ProjectLimitBook(s, inverse)};
-        const auto add = [&](const LimitLevel& level, std::vector<Level>& out, CAmount& cumulative, Wide& cumulative_display) {
+        {
+            // The same one decimal count per column as the node's levels.
+            std::vector<std::pair<CAmount, bool>> labels;
+            for (const auto* rows : {&book.asks, &book.bids}) {
+                const bool displayed_ask{rows == &book.asks};
+                Wide cumulative{0};
+                for (const auto& level : *rows) {
+                    labels.emplace_back(level.canonical_price, inverse && displayed_ask);
+                    size_places = std::max(size_places, NeededDecimals(AsWide(inverse ? level.gross_notional : level.remaining), inverse ? 9 : decimals));
+                }
+                // Totals run from the best level: the asks' from the last.
+                for (size_t i{0}; i < rows->size(); ++i) {
+                    const auto& level{displayed_ask ? (*rows)[rows->size() - 1 - i] : (*rows)[i]};
+                    cumulative += AsWide(inverse ? level.gross_notional : level.remaining);
+                    size_places = std::max(size_places, NeededDecimals(cumulative, inverse ? 9 : decimals));
+                }
+            }
+            column = ChoosePriceColumn(u, inverse, flowmesh::LevelGrouping{}, labels);
+        }
+        const auto add = [&](const LimitLevel& level, std::vector<Level>& out, CAmount& cumulative, Wide& cumulative_display, const bool displayed_ask) {
             Level row;
-            const auto shown{DisplayPrice(level.canonical_price, u, inverse)};
-            row.price = inverse && level.canonical_price == 0 ? QStringLiteral("—") : shown.text;
+            const bool up{inverse && displayed_ask};
+            bool whole{true};
+            QString text;
+            if (inverse && level.canonical_price == 0) {
+                text = QStringLiteral("—");
+            } else {
+                if (!column.unmapped.contains({level.canonical_price, up})) text = FixedDisplayPrice(level.canonical_price, decimals, inverse, column.places, up, &whole);
+                if (text.isEmpty()) {
+                    const auto shown{DisplayPrice(level.canonical_price, u, inverse)};
+                    text = shown.text; whole = !shown.approximate;
+                }
+            }
+            row.price = text;
+            rounded |= !whole;
             cumulative += level.remaining;
             cumulative_display += inverse ? static_cast<uint64_t>(level.gross_notional) : static_cast<uint64_t>(level.remaining);
             row.cumulative_tokens = cumulative; row.cumulative_display = cumulative_display;
-            row.size = inverse ? FormatAmount(level.gross_notional, 9) : FormatAmount(level.remaining, decimals);
-            row.total = FormatWide(cumulative_display, inverse ? 9 : decimals);
+            row.size = PadDecimals(inverse ? FormatAmount(level.gross_notional, 9) : FormatAmount(level.remaining, decimals), size_places);
+            row.total = PadDecimals(FormatWide(cumulative_display, inverse ? 9 : decimals), size_places);
             if (level.canonical_price > 0) row.click_price = inverse ? ExactInversePrice(level.canonical_price, decimals) : FormatPrice(level.canonical_price, decimals);
+            const QString exact{inverse ? ExactInversePrice(level.canonical_price, decimals) : FormatPrice(level.canonical_price, decimals)};
             row.tooltip = tr("Price: %1 %2%3\nSize: %4\nTotal from the best level: %5\n%6 limit or ladder order(s) at this level")
-                .arg(row.price, price_units, shown.approximate ? tr(" (exact %1)").arg(shown.exact) : QString{}, row.size, row.total).arg(level.curve_count);
+                .arg(row.price, price_units, whole ? QString{} : tr(" (exact %1)").arg(exact), row.size, row.total).arg(level.curve_count);
             out.push_back(std::move(row));
         };
         CAmount ask_tokens{0}, bid_tokens{0};
         Wide ask_display{0}, bid_display{0};
-        for (auto it{book.asks.rbegin()}; it != book.asks.rend(); ++it) add(*it, m_asks, ask_tokens, ask_display);
-        for (const auto& level : book.bids) add(level, m_bids, bid_tokens, bid_display);
+        for (auto it{book.asks.rbegin()}; it != book.asks.rend(); ++it) add(*it, m_asks, ask_tokens, ask_display, true);
+        for (const auto& level : book.bids) add(level, m_bids, bid_tokens, bid_display, false);
         if (book.complete) { best_bid = book.canonical_best_bid; best_ask = book.canonical_best_ask; }
         notes << (s.levels && !s.levels->available && !s.levels->reason.isEmpty()
                       ? tr("Book levels unavailable (%1) · limit and ladder orders of the first curve page only").arg(s.levels->reason)
@@ -593,6 +744,7 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
         if (inverse) notes << tr("B3 amounts are gross equivalents at limit");
         note_tip += tr("\nShown without the node's book levels: only the limit and ladder orders of the first 128-curve page are grouped by price; general curves are not turned into limit orders.");
     }
+    headers(rounded, column.places);
     // The spread row, from the exact best prices whatever the grouping.
     m_spread_tip = tr("The difference between the best sell and best buy price, and its share of their midpoint. "
                       "FlowMesh clears at one uniform price per auction; a crossed book (a buy above a sell) can stand after a rationed auction until the next certified one.");

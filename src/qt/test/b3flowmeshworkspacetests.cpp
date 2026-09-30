@@ -1280,21 +1280,25 @@ private Q_SLOTS:
         const auto& levels{*snapshot.levels};
         const auto& shown_asks{inverse ? levels.bids.levels : levels.asks.levels};
         const auto& shown_bids{inverse ? levels.asks.levels : levels.bids.levels};
-        const auto label = [&](const BookLevel& level) { return DisplayPrice(level.low, snapshot.units, inverse).text; };
-        QCOMPARE(model->row(per_side - 1).price, label(shown_asks[0]));
-        QCOMPARE(model->row(per_side + 1).price, label(shown_bids[0]));
-        QCOMPARE(model->row(0).price, label(shown_asks[static_cast<size_t>(per_side) - 1]));
+        // One decimal count for the column (the tick's, or the B3 view's
+        // rounding), a displayed sell rounded up and a buy down.
+        const int places{Places(model->row(per_side - 1).price)};
+        const auto label = [&](const BookLevel& level, bool displayed_ask) { return FixedDisplayPrice(level.low, 6, inverse, places, inverse && displayed_ask); };
+        QCOMPARE(model->row(per_side - 1).price, label(shown_asks[0], true));
+        QCOMPARE(model->row(per_side + 1).price, label(shown_bids[0], false));
+        QCOMPARE(model->row(0).price, label(shown_asks[static_cast<size_t>(per_side) - 1], true));
         QVERIFY(model->row(per_side - 1).kind == B3FlowMeshLadderModel::Row::Kind::Ask);
         QVERIFY(model->row(per_side + 1).kind == B3FlowMeshLadderModel::Row::Kind::Bid);
         QCOMPARE(model->data(model->index(per_side - 1, 0), Qt::ForegroundRole).value<QColor>(), B3Theme::kNegative);
         QCOMPARE(model->data(model->index(per_side + 1, 0), Qt::ForegroundRole).value<QColor>(), B3Theme::kPositive);
         // Total is cumulative from the best level.
+        const int size_places{Places(model->row(per_side + 1).size)};
         if (!inverse) {
-            QCOMPARE(model->row(per_side + 1).total, FormatAmount(shown_bids[0].size, 6));
-            QCOMPARE(model->row(per_side + 2).total, FormatAmount(shown_bids[0].size + shown_bids[1].size, 6));
-            QCOMPARE(model->row(per_side + 2).size, FormatAmount(shown_bids[1].size, 6));
+            QCOMPARE(model->row(per_side + 1).total, PadDecimals(FormatAmount(shown_bids[0].size, 6), size_places));
+            QCOMPARE(model->row(per_side + 2).total, PadDecimals(FormatAmount(shown_bids[0].size + shown_bids[1].size, 6), size_places));
+            QCOMPARE(model->row(per_side + 2).size, PadDecimals(FormatAmount(shown_bids[1].size, 6), size_places));
         } else {
-            QCOMPARE(model->row(per_side + 1).size, FormatAmount(static_cast<CAmount>(*shown_bids[0].notional), 9));
+            QCOMPARE(model->row(per_side + 1).size, PadDecimals(FormatAmount(static_cast<CAmount>(*shown_bids[0].notional), 9), size_places));
         }
         // One depth scale for both sides: the deeper side's last visible row is 1.
         const double ask_depth{model->row(0).depth}, bid_depth{model->row(2 * per_side).depth};
@@ -1337,7 +1341,7 @@ private Q_SLOTS:
         book.setSnapshot(WithLevels(moved, {}, H(20)), inverse);
         QVERIFY(book.flashing());
         const int new_row{inverse ? per_side - 2 : per_side + 2};
-        QCOMPARE(model->row(new_row).price, DisplayPrice(999, snapshot.units, inverse).text);
+        QCOMPARE(model->row(new_row).price, FixedDisplayPrice(999, 6, inverse, Places(model->row(new_row).price), inverse));
         QTRY_VERIFY_WITH_TIMEOUT(book.flashIntensity(new_row) > 0, 1000);
         QTRY_VERIFY_WITH_TIMEOUT(!book.flashing(), 3000);
         QCOMPARE(book.flashIntensity(new_row), 0.0);
@@ -1348,6 +1352,125 @@ private Q_SLOTS:
         QVERIFY(!book.flashing());
         B3FlowMeshOrderBook::SetAnimationSetting(true);
         QCOMPARE(reset.count(), 0); QCOMPARE(removed.count(), 0); QCOMPARE(inserted.count(), 0);
+    }
+    //! The decimal places of a displayed number ("0.120" has 3).
+    static int Places(const QString& text)
+    {
+        const auto dot{text.indexOf(QLatin1Char('.'))};
+        return dot < 0 ? 0 : static_cast<int>(text.size() - dot - 1);
+    }
+    //! Every level row's price, size and total have one decimal count per
+    //! column, and no cell carries its own "≈"; returns the price places.
+    static int CheckOneDecimalCountPerColumn(const B3FlowMeshOrderBook& book)
+    {
+        std::array<std::optional<int>, 3> places;
+        int rows{0};
+        for (const auto& row : book.model()->rows()) {
+            if (row.kind != B3FlowMeshLadderModel::Row::Kind::Ask && row.kind != B3FlowMeshLadderModel::Row::Kind::Bid) continue;
+            ++rows;
+            const std::array<QString, 3> cells{row.price, row.size, row.total};
+            for (size_t c{0}; c < 3; ++c) {
+                if (cells[c] == QStringLiteral("—")) continue;
+                if (cells[c].contains(QStringLiteral("≈"))) { qWarning() << "per-row approximation" << cells[c]; return -1; }
+                if (!places[c]) places[c] = Places(cells[c]);
+                if (*places[c] != Places(cells[c])) { qWarning() << "column" << c << "mixes" << *places[c] << "and" << cells[c]; return -1; }
+            }
+        }
+        if (rows < 2 || !places[0]) return -1;
+        // Size and Total share one count, as Hyperliquid's do.
+        if (places[1] && places[2] && *places[1] != *places[2]) { qWarning() << "size" << *places[1] << "total" << *places[2]; return -1; }
+        return *places[0];
+    }
+    void orderBookColumnsShowOneDecimalCountAndApproximateOnlyInTheHeader()
+    {
+        const auto snapshot{WithLevels(SyntheticLimitBook(16), {}, H(20))};
+        const auto& units{snapshot.units}; // 6 decimals, price step 1: 0.001 B3 per token
+        B3FlowMeshOrderBook book; book.resize(420, 900); book.show(); QCoreApplication::processEvents();
+        const auto* model{book.model()};
+        const auto header = [&](int section, int role = Qt::DisplayRole) { return model->headerData(section, Qt::Horizontal, role).toString(); };
+        // Canonical, one level per price: the market tick's three places,
+        // every price exact, no "≈" anywhere.
+        book.setSnapshot(snapshot, false);
+        QVERIFY(book.showsVerifiedLevels());
+        QCOMPARE(CheckOneDecimalCountPerColumn(book), 3);
+        const int spread{model->spreadRow()};
+        QCOMPARE(model->row(spread + 1).price, QStringLiteral("1.000")); // 1000 atoms
+        QCOMPARE(model->row(spread - 1).price, QStringLiteral("1.010"));
+        QCOMPARE(model->row(spread + 1).size, QStringLiteral("0.100")); // 100'000 atoms, and 0.125 below it
+        QCOMPARE(header(0), QStringLiteral("Price (B3)"));
+        // The B3 view: token-per-B3 prices do not end, so they are rounded
+        // to one count for the column, a sell up and a buy down, and "≈" is
+        // said once, in the header; each exact price stays in its tooltip.
+        book.setSnapshot(snapshot, true);
+        const int places{CheckOneDecimalCountPerColumn(book)};
+        QVERIFY(places > 0 && places <= 6);
+        QCOMPARE(header(0), QStringLiteral("Price (tUSD) ≈"));
+        QVERIFY(header(0, Qt::ToolTipRole).contains(QStringLiteral("rounded to %1 decimal places").arg(places)));
+        const auto& levels{*snapshot.levels};
+        int rounded_rows{0};
+        for (int row{0}; row < model->rowCount(); ++row) {
+            const auto& shown{model->row(row)};
+            if (shown.kind != B3FlowMeshLadderModel::Row::Kind::Ask && shown.kind != B3FlowMeshLadderModel::Row::Kind::Bid) continue;
+            const bool ask_row{shown.kind == B3FlowMeshLadderModel::Row::Kind::Ask};
+            // The B3 view's asks are canonical bids, best (highest) first.
+            const auto& level{ask_row ? levels.bids.levels[static_cast<size_t>(spread - 1 - row)] : levels.asks.levels[static_cast<size_t>(row - spread - 1)]};
+            // A sell rounds up and a buy down: every order in it accepts it.
+            bool whole{false};
+            QCOMPARE(shown.price, FixedDisplayPrice(level.low, 6, true, places, /*up=*/ask_row, &whole));
+            // It reads back as exactly its own price for the side a click
+            // on it takes (buy B3 at a sell, sell B3 at a buy).
+            const auto back{ParseDisplayLimit(shown.price, units, true, /*display_buy=*/ask_row)};
+            QVERIFY2(back && back->price == level.low, qPrintable(shown.price));
+            // A rounded label keeps its exact price in the tooltip and says
+            // "about" to a screen reader; an exact one (1000: 1) does not.
+            QCOMPARE(shown.tooltip.contains(QStringLiteral("Exact: ") + ExactInversePrice(level.low, 6)), !whole);
+            QCOMPARE(model->data(model->index(row, 0), Qt::AccessibleTextRole).toString().contains(QStringLiteral("about ") + shown.price), !whole);
+            rounded_rows += !whole;
+        }
+        QVERIFY(rounded_rows > 10);
+        // Grouped: the step's places, exact edges, no "≈".
+        const auto canonical_grouping{Grouping(false, 1, -2, 6)};
+        book.setSnapshot(WithLevels(SyntheticLimitBook(16), canonical_grouping, H(20)), false, canonical_grouping);
+        QVERIFY(book.showsVerifiedLevels());
+        QCOMPARE(CheckOneDecimalCountPerColumn(book), 2);
+        QCOMPARE(model->row(model->spreadRow() + 1).price, QStringLiteral("1.00"));
+        QCOMPARE(header(0), QStringLiteral("Price (B3)"));
+        const auto inverse_grouping{Grouping(true, 1, -4, 6)};
+        book.setSnapshot(WithLevels(SyntheticLimitBook(16), inverse_grouping, H(20)), true, inverse_grouping);
+        QVERIFY(book.showsVerifiedLevels());
+        QCOMPARE(CheckOneDecimalCountPerColumn(book), 4);
+        QCOMPARE(model->row(model->spreadRow() - 1).price, QStringLiteral("1.0000"));
+        QCOMPARE(header(0), QStringLiteral("Price (tUSD)"));
+        // Without the node's levels the fallback rows follow the same rule.
+        book.setSnapshot(SyntheticLimitBook(16), true);
+        QVERIFY(!book.showsVerifiedLevels());
+        QVERIFY(CheckOneDecimalCountPerColumn(book) > 0);
+        QCOMPARE(header(0), QStringLiteral("Price (tUSD) ≈"));
+        book.setSnapshot(SyntheticLimitBook(16), false);
+        QCOMPARE(CheckOneDecimalCountPerColumn(book), 3);
+        QCOMPARE(header(0), QStringLiteral("Price (B3)"));
+    }
+    void fixedDisplayPricesRoundOnlyInTheirDirection()
+    {
+        // 1000/1003 tUSD per B3 = 0.997008973...
+        bool exact{true};
+        QCOMPARE(FixedDisplayPrice(1003, 6, true, 4, true, &exact), QStringLiteral("0.9971")); QVERIFY(!exact);
+        QCOMPARE(FixedDisplayPrice(1003, 6, true, 4, false, &exact), QStringLiteral("0.9970")); QVERIFY(!exact);
+        QCOMPARE(FixedDisplayPrice(1000, 6, true, 4, true, &exact), QStringLiteral("1.0000")); QVERIFY(exact);
+        QCOMPARE(FixedDisplayPrice(1000, 6, false, 3, false, &exact), QStringLiteral("1.000")); QVERIFY(exact);
+        QCOMPARE(FixedDisplayPrice(1234, 6, false, 2, true, &exact), QStringLiteral("1.24")); QVERIFY(!exact);
+        QCOMPARE(FixedDisplayPrice(1234, 6, false, 0, false, &exact), QStringLiteral("1"));
+        QCOMPARE(FixedDisplayPrice(7, 12, false, 2, false, &exact), QStringLiteral("7000.00")); QVERIFY(exact);
+        // No finite inverse of price zero; invalid places.
+        QVERIFY(FixedDisplayPrice(0, 6, true, 4, true).isEmpty());
+        QVERIFY(FixedDisplayPrice(1000, 6, true, 19, true).isEmpty());
+        QCOMPARE(FixedDisplayPrice(1, 0, true, 18, true), QStringLiteral("1000000000.000000000000000000"));
+        QCOMPARE(PadDecimals(QStringLiteral("1"), 3), QStringLiteral("1.000"));
+        QCOMPARE(PadDecimals(QStringLiteral("0.5"), 3), QStringLiteral("0.500"));
+        QCOMPARE(PadDecimals(QStringLiteral("12.3456"), 2), QStringLiteral("12.3456")); // never truncates
+        QCOMPARE(NeededDecimals(util::Unsigned128{120'000}, 6), 2);
+        QCOMPARE(NeededDecimals(util::Unsigned128{0}, 6), 0);
+        QCOMPARE(NeededDecimals(util::Unsigned128{1}, 9), 9);
     }
     void identicalBookUpdatesDoNotRepaintTheLadder()
     {
@@ -1572,10 +1695,10 @@ private Q_SLOTS:
         const int spread{model->spreadRow()};
         QCOMPARE(model->row(spread - 1).price, QStringLiteral("1.01"));  // asks 1001-1010: 1010
         QCOMPARE(model->row(spread - 2).price, QStringLiteral("1.02"));  // 1011-1020
-        QCOMPARE(model->row(spread + 1).price, QStringLiteral("1"));     // bids 1000-1009: 1000
+        QCOMPARE(model->row(spread + 1).price, QStringLiteral("1.00"));  // bids 1000-1009: 1000
         QCOMPARE(model->row(spread + 2).price, QStringLiteral("0.99"));  // 990-999
         QVERIFY(model->row(spread - 1).tooltip.startsWith(QStringLiteral("Sell 1.01 B3 / tUSD")));
-        QVERIFY(model->row(spread + 1).tooltip.startsWith(QStringLiteral("Buy 1 B3 / tUSD")));
+        QVERIFY(model->row(spread + 1).tooltip.startsWith(QStringLiteral("Buy 1.00 B3 / tUSD")));
         QCOMPARE(model->row(spread - 1).click_price, QStringLiteral("1.01"));
         QCOMPARE(model->row(spread + 2).click_price, QStringLiteral("0.99"));
         // The B3 view: a canonical bid is a displayed sell, labelled with the
@@ -1584,10 +1707,10 @@ private Q_SLOTS:
         book.setSnapshot(WithLevels(SyntheticLimitBook(8), inverse), true, inverse);
         QVERIFY(book.showsVerifiedLevels());
         QVERIFY(model->row(spread - 1).tooltip.startsWith(QStringLiteral("Sell ")));
-        QCOMPARE(model->row(spread - 1).price, QStringLiteral("1"));      // 1000 atoms: exactly 1 token per B3
+        QCOMPARE(model->row(spread - 1).price, QStringLiteral("1.0000")); // 1000 atoms: exactly 1 token per B3
         QCOMPARE(model->row(spread - 1).click_price, ExactInversePrice(1000, 6));
         QVERIFY(model->row(spread + 1).tooltip.startsWith(QStringLiteral("Buy ")));
-        QCOMPARE(model->row(spread + 1).price, QStringLiteral("0.99"));   // 1010 atoms: 1000/1010 floored to the step
+        QCOMPARE(model->row(spread + 1).price, QStringLiteral("0.9900")); // 1010 atoms: 1000/1010 floored to the step
         QCOMPARE(model->row(spread + 1).click_price, ExactInversePrice(1010, 6));
     }
     void bookGroupingChoicesFollowThePriceMagnitude()
