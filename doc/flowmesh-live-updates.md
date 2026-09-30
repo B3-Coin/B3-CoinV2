@@ -129,7 +129,7 @@ only; balances, orders and action outcomes come from verified state.
 
 The trading panel keeps one live-update read outstanding for the selected
 market on a second worker while it is visible and idle (with the local
-engine also during a review or an action, for display only; see below). While live, the
+engine also while a review is open, for display only; see below). While live, the
 500 ms tick keeps display ageing and the auxiliary Catalog, Status, Effects
 and Receipt cycle (so checkpoint eligibility and saved requests still
 refresh every 5 s); only the market read of a passive refresh is left to the
@@ -170,14 +170,19 @@ send the panel from live mode or from a probe to polling, it closes the
 live-update connection with one `watch_ms` 0 read.
 
 With the local engine, the order book, chart and trades tape keep following
-live updates while an order review is open or an action is in flight. Those
-reads are display only: the gates, balances, the review and what is signed
-keep the verified data of before the review (the review shows exactly the
-values it signs), and a click on a book level is refused while the book
-shows newer data than the gates. A remote client keeps these views frozen
-during a review or an action, as before: its reads hold the client's work
-gate, which is not preemptive, so a display read could delay the order being
-sent.
+live updates while an order review is open. Those reads are display only:
+the gates, balances, the review and what is signed keep the verified data of
+before the review (the review shows exactly the values it signs), and a click
+on a book level is refused while the book shows newer data than the gates.
+Once the review is approved and the order is being sent (or while any other
+job is in flight, such as the read that opens a review), no display read is
+armed and one that returns meanwhile is dropped: a local read takes the
+node's market mutex, which the submission also needs and which nothing can
+preempt. At most the one live read already outstanding when the order is
+sent overlaps it, as in live mode without a review. A remote client keeps
+these views frozen during a review or an action, as before: its reads hold
+the client's work gate, which is not preemptive, so a display read could
+delay the order being sent.
 
 A remote endpoint without live updates is polled on the 500 ms tick, never
 back to back: a slow link's read (longer than 500 ms) is followed by the next

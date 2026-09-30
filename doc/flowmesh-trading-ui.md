@@ -99,7 +99,8 @@ FlowMesh worker also needs. Cells change in place, and data that did not
 change repaints nothing. A market switch reads the new market at once.
 
 With your own node's engine, the book, chart and tape keep updating while an
-order review is open or an order is being sent. The review itself shows,
+order review is open; they pause while the approved order is being sent, so
+that no display read competes with it inside your node. The review itself shows,
 and signs, exactly the values it was opened with; balances and the trading
 checks stay on the data of before the review. A click on a book level is
 refused (with a note in Activity) whenever the book shows newer or older

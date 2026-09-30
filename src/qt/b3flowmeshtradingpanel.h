@@ -348,10 +348,12 @@ private:
     //! What the data views show: m_display while it is newer than
     //! m_snapshot (same market), else m_snapshot.
     const std::optional<B3FlowMeshMarketData::Snapshot>& displayedSnapshot() const;
-    //! Live updates continue while an operation or a review is in progress,
+    //! Live updates continue while a review (or another dialog) is open,
     //! for display only: the local engine only (a remote client's reads hold
     //! its work gate, which is not preemptive, so a display read could delay
-    //! the order being sent), live, and with no failed read or warning.
+    //! the order being sent), live, with no failed read or warning, and with
+    //! no job in flight: never while the user's own order is being sent (a
+    //! local read takes the node's market mutex, which the submission needs).
     bool liveWhileBusy() const;
     //! The head a live update is armed against and applied on: while busy
     //! the displayed one, else m_snapshot's, so a display-only head is never
@@ -467,8 +469,8 @@ private:
     uint64_t m_refresh_epoch{0};
     std::optional<B3FlowMeshMarketData::Snapshot> m_snapshot;
     //! Display only (the local engine; see liveWhileBusy): a verified live
-    //! update newer than m_snapshot that arrived while an operation or a
-    //! review was in progress. The book, chart, tape and own-order rows show
+    //! update newer than m_snapshot that arrived while a review was open.
+    //! The book, chart, tape and own-order rows show
     //! it; no gate, balance, catalog row, freshness age, review or signed
     //! value ever reads it. Dropped once m_snapshot reaches it and on any
     //! market, wallet or catalog identity change.

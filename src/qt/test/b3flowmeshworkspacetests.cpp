@@ -6231,7 +6231,7 @@ private Q_SLOTS:
     }
     void localBookFollowsLiveUpdatesDuringAReviewButGatesDoNot()
     {
-        // An order review is open (or an action in flight): with the local
+        // An order review is open (nothing in flight yet): with the local
         // engine the book, tape and own-order rows keep following live
         // updates, for display only. The gates, balances, freshness and the
         // catalog row stay on the data of before the review.
@@ -6295,6 +6295,52 @@ private Q_SLOTS:
         QVERIFY(!panel.m_display);
         QCOMPARE(panel.m_market_data[0].sequence, uint64_t{9});
         panel.m_watch.Disable(); AwaitWatchWorker(panel);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void localBookFreezesWhileTheOrderIsSent()
+    {
+        // Review of 2026-09-30: display-only live reads run while a review is
+        // open, never while the user's own order is in flight. A local read
+        // takes the node's market mutex, which the submission also needs and
+        // nothing can preempt: no display read is armed then, and one armed
+        // during the review that returns while the order is sent is dropped.
+        FundingReadProbe probe; probe.data = Data(); probe.watch_data = NewerLocalData(); probe.watch_object = LocalWatchObject();
+        probe.hold_watch = true;
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); AttachOfflineWallet(panel);
+        Observe(panel, WithLevels(Parse(Data())), false);
+        LocalLive(panel);
+        const auto gate_head{panel.m_snapshot->head};
+        const auto book_head{panel.m_order_book->head()};
+        QVERIFY(!book_head.isEmpty());
+        panel.m_busy = true; panel.updateControls(); // A review is open.
+        QVERIFY(panel.liveWhileBusy());
+        panel.armWatch(); QVERIFY(panel.m_watch_thread);
+        QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+        // Approved: the order is being sent. The in-flight job as startJob
+        // leaves it (a never-started owned thread; nothing runs or writes).
+        auto sending{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        B3FlowMeshTrading::Action action;
+        action.operation = B3FlowMeshTrading::Operation::Order; action.market = panel.m_market_data.front();
+        action.side = QStringLiteral("bid"); action.price = 1000; action.amount = 1;
+        sending->action = action; sending->wallet = panel.m_wallet_name;
+        panel.m_active_result = sending;
+        panel.m_thread = new QThread{&panel};
+        QVERIFY(!panel.liveWhileBusy());
+        // The display read armed during the review returns now: dropped.
+        probe.hold_watch = false; probe.watch_release.release(); AwaitWatchWorker(panel);
+        QVERIFY(!panel.m_display);
+        QCOMPARE(panel.displayedSnapshot()->head, gate_head);
+        QCOMPARE(panel.m_order_book->head(), book_head);
+        // No other is armed while it is in flight: directly, by the precise
+        // re-arm or by the tick.
+        panel.m_watch.retry_at = 0; panel.m_watch.tokens = B3FlowMeshWatch::Policy::ARM_BURST;
+        panel.armWatch(); QVERIFY(!panel.m_watch_thread);
+        panel.rearmWatch(); QVERIFY(!panel.m_watch_thread);
+        panel.tick(); QVERIFY(!panel.m_watch_thread);
+        QCOMPARE(probe.watches.load(), 1);
+        QCOMPARE(panel.m_snapshot->head, gate_head);
+        delete panel.m_thread; panel.m_thread = nullptr; panel.m_active_result.reset();
+        panel.m_busy = false; panel.m_watch.Disable(); panel.updateControls();
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void remoteBookStaysFrozenDuringAReview()

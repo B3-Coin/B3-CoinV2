@@ -2652,7 +2652,8 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
         // A probe starts only with no job in flight: an ordinary market read
         // already on its way would move the client's cursor under it.
         if (m_thread && m_watch.mode != B3FlowMeshWatch::Mode::Live) return;
-        // While busy only for display (the local engine; see liveWhileBusy).
+        // While busy only for display, during a review with nothing in
+        // flight (the local engine; see liveWhileBusy).
         if ((m_busy && !liveWhileBusy()) || !isVisible() || !m_security_warning.isEmpty() || m_read_failed || !m_watch.MayArm(m_watch_clock.elapsed())) return;
         m_watch.Armed(m_watch_clock.elapsed());
     }
@@ -2715,10 +2716,10 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
     const auto& scope{result->scope};
     const auto selected{market()};
     // Applied only on top of exactly the head it was armed against, for the
-    // same wallet, market and account. While an operation or a review is in
-    // progress it is shown only (the local engine; see liveWhileBusy), never
-    // applied. Anything else is dropped silently: never a failure, and never
-    // renewed freshness.
+    // same wallet, market and account. While a review is open it is shown
+    // only (the local engine; see liveWhileBusy), never applied; while an
+    // operation is in flight it is dropped. Anything else is dropped
+    // silently: never a failure, and never renewed freshness.
     const auto& basis{watchBasis()};
     if (!m_wallet || scope.wallet != m_wallet || scope.generation != m_generation || scope.watch_generation != m_watch_generation ||
         m_cancel->load() || (m_busy && !liveWhileBusy()) || !selected || selected->id != scope.market || selected->account != scope.account ||
@@ -2809,7 +2810,11 @@ const std::optional<B3FlowMeshMarketData::Snapshot>& B3FlowMeshTradingPanel::dis
 bool B3FlowMeshTradingPanel::liveWhileBusy() const
 {
     const auto selected{market()};
-    return m_busy && m_watch.local && m_watch.mode == B3FlowMeshWatch::Mode::Live && !m_read_failed && m_security_warning.isEmpty() &&
+    // Only while a review (or another dialog) is open with no job in flight:
+    // never while the user's own order, retry or preparation is being sent,
+    // nor during the read that opens a review. A local read takes the node's
+    // market mutex, which the submission also needs and nothing can preempt.
+    return m_busy && !m_thread && m_watch.local && m_watch.mode == B3FlowMeshWatch::Mode::Live && !m_read_failed && m_security_warning.isEmpty() &&
            isVisible() && selected && m_snapshot && m_snapshot->market == selected->id && !m_snapshot->remote;
 }
 
