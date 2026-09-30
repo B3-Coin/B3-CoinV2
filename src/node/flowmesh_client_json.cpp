@@ -3,6 +3,7 @@
 #include <node/flowmesh_client.h>
 
 #include <flowmesh/action_reason.h>
+#include <flowmesh/observed_time.h>
 
 #include <algorithm>
 namespace node {
@@ -89,6 +90,39 @@ static UniValue IndicativeJson(const flowmesh::IndicativeClearing& value)
     if (value.draft_fill_max) out.pushKV("draft_fill_max", *value.draft_fill_max);
     return out;
 }
+//! Present only when requested, so every earlier reply is unchanged.
+//! Operator-observed time: when the source applied each entry by its own
+//! clock, never a certified execution time. A LIVE row has observed_ms; a
+//! DELAYED row only applied_here_ms, an upper bound that is never a trade
+//! time; an UNTIMED row neither. delay_reason appears only where the source
+//! kept it (this node's own RPC), never in a public reply.
+static UniValue ObservedTimesJson(const flowmesh::ObservedTimes& value)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("available", value.available);
+    if (!value.available) out.pushKV("unavailable_reason", value.unavailable_reason);
+    out.pushKV("source", value.source);
+    out.pushKV("source_kind", "operator_observed");
+    out.pushKV("certified", false);
+    out.pushKV("clock_suspect", value.clock_suspect);
+    if (value.recorded_since_sequence) out.pushKV("recorded_since_sequence", *value.recorded_since_sequence);
+    UniValue rows{UniValue::VARR};
+    for (const auto& stamp : value.rows) {
+        UniValue row{UniValue::VOBJ};
+        row.pushKV("sequence", stamp.sequence);
+        row.pushKV("microblock_hash", stamp.hash.GetHex());
+        row.pushKV("mode", flowmesh::ObservedModeName(stamp.mode));
+        if (stamp.mode == flowmesh::ObservedMode::LIVE) row.pushKV("observed_ms", stamp.ms);
+        if (stamp.mode == flowmesh::ObservedMode::DELAYED) row.pushKV("applied_here_ms", stamp.ms);
+        UniValue flags{UniValue::VARR};
+        for (const auto& name : flowmesh::ObservedFlagNames(stamp.flags, /*public_only=*/false)) flags.push_back(name);
+        row.pushKV("flags", std::move(flags));
+        if (stamp.delay != flowmesh::ObservedDelay::NONE) row.pushKV("delay_reason", flowmesh::ObservedDelayName(stamp.delay));
+        rows.push_back(std::move(row));
+    }
+    out.pushKV("rows", std::move(rows));
+    return out;
+}
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data)
 {
     UniValue out{UniValue::VOBJ};
@@ -150,6 +184,7 @@ UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data)
     out.pushKV("verification", std::move(verification));
     if (data.ticks) out.pushKV("clearing_ticks", ClearingTicksJson(*data.ticks, data.remote));
     if (data.indicative) out.pushKV("indicative", IndicativeJson(*data.indicative));
+    if (data.observed) out.pushKV("observed_time", ObservedTimesJson(*data.observed));
     if (data.unchanged) return out;
 
     UniValue liquidity{UniValue::VOBJ};

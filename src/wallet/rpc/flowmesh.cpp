@@ -120,7 +120,8 @@ static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
     if (options.isNull()) return query;
     if (!options.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "options must be an object");
     const std::set<std::string> allowed{
-        "limit", "curve_limit", "before_sequence", "curve_cursor", "expected_head", "known_head", "ticks", "indicative"};
+        "limit", "curve_limit", "before_sequence", "curve_cursor", "expected_head", "known_head", "ticks", "indicative",
+        "observed_time"};
     for (const auto& key : options.getKeys()) {
         if (!allowed.contains(key)) throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown option '" + key + "'");
     }
@@ -174,6 +175,10 @@ static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
             tick_query.after_sequence = integer("after_sequence", 0, std::numeric_limits<uint64_t>::max(), &ticks);
         }
         if (ticks.exists("limit")) tick_query.limit = integer("limit", 1, flowmesh::MARKET_DATA_MAX_TICKS, &ticks);
+    }
+    if (options.exists("observed_time")) {
+        if (!options["observed_time"].isBool()) throw JSONRPCError(RPC_TYPE_ERROR, "observed_time must be a boolean");
+        query.observed_time = options["observed_time"].get_bool();
     }
     if (options.exists("indicative")) {
         const UniValue& indicative{options["indicative"]};
@@ -1068,7 +1073,9 @@ RPCHelpMan getflowmeshmarketdata()
         "All prices are integer B3 atoms per base atomic unit and all quantities are integer base units; B3 has nine decimals. "
         "History contains at most the latest 256 certified microblocks, rebuilt during normal verified startup replay. "
         "Account fills are explicitly marked unknown if outside the bounded per-entry account cache. "
-        "Microblocks contain no execution timestamp: chart actual cleared entries against sequence. "
+        "Microblocks contain no certified execution timestamp. observed_time adds operator-observed time: when the node that served "
+        "the data applied each entry, by that node's own clock, labelled with its source and never certified; entries it applied late "
+        "(catch-up, a lag, a reconciliation wait or the warm-up after a start) carry only an upper bound, and history it never observed has no time. "
         "local_observed_at is only this process's observation time and is absent for replayed heads. "
         "An old head on an idle market does not prove quorum failure. Standing curve identity is account and side; the v1 state does not retain submission ids or original submission sequences. "
         "Use expected_head when continuing curve pages; a changed head rejects pagination. "
@@ -1093,6 +1100,7 @@ RPCHelpMan getflowmeshmarketdata()
                     {"after_sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Ticks after this microblock sequence; omit for the newest"},
                     {"limit", RPCArg::Type::NUM, RPCArg::Default{64}, "Ticks, 1-256"},
                 }},
+                {"observed_time", RPCArg::Type::BOOL, RPCArg::Default{false}, "Operator-observed times of the head and of the returned history and ticks, also returned with an unchanged known_head; never certified"},
                 {"indicative", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Indicative next clearing of the verified standing curves, also returned with an unchanged known_head; never certified", {
                     {"draft", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "A prospective limit order of this wallet's account, replacing its standing curve on that side", {
                         {"side", RPCArg::Type::STR, RPCArg::Optional::NO, "bid or ask"},
@@ -1167,6 +1175,28 @@ RPCHelpMan getflowmeshmarketdata()
                 {T::NUM, "best_ask", /*optional=*/true, "Lowest price with standing ask quantity, over every verified curve (never the draft)"},
                 {T::NUM, "draft_fill_min", /*optional=*/true, "The draft's fill at that price (exact when equal to draft_fill_max)"},
                 {T::NUM, "draft_fill_max", /*optional=*/true, "Upper bound of the draft's fill"},
+            }},
+            {T::OBJ, "observed_time", /*optional=*/true, "Present only when observed_time was true: operator-observed time, when the source applied each entry by its own clock; never certified execution time", {
+                {T::BOOL, "available", "The source records observed times"},
+                {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, endpoint_does_not_advertise_observed_time, observed_time_withdrawn or malformed"},
+                {T::STR, "source", "this_node, or the endpoint URL that reported them"},
+                {T::STR, "source_kind", "operator_observed"},
+                {T::BOOL, "certified", "Always false"},
+                {T::BOOL, "clock_suspect", "The source's clock is suspected wrong"},
+                {T::NUM, "recorded_since_sequence", /*optional=*/true, "Oldest entry the source retains a time for; earlier history has none"},
+                {T::ARR, "rows", "The head and the returned history and tick entries the source has a time for, ascending", {
+                    {T::OBJ, "", "One entry", {
+                        {T::NUM, "sequence", "Global microblock sequence"},
+                        {T::STR_HEX, "microblock_hash", "Certified microblock id"},
+                        {T::STR, "mode", "live (applied while caught up), delayed (applied late: only an upper bound) or untimed (no time: the source's clock stood behind an earlier stamp)"},
+                        {T::NUM, "observed_ms", /*optional=*/true, "live only: Unix milliseconds when the source applied it"},
+                        {T::NUM, "applied_here_ms", /*optional=*/true, "delayed only: when the source applied it, an upper bound, never a trade time"},
+                        {T::ARR, "flags", "clock_clamped, clock_step, clock_suspect, restart, no_clearing_data or implausible (a failed plausibility check of an endpoint's stamp)", {
+                            {T::STR, "", "Flag"},
+                        }},
+                        {T::STR, "delay_reason", /*optional=*/true, "Why this node applied it late: catchup, deferred, behind, peer_hint, stale_anchor, warmup or clock_stepped_back"},
+                    }},
+                }},
             }},
             {T::OBJ, "watch", /*optional=*/true, "Present only when watch_ms was given: this read's local latency observation, never evidence", {
                 {T::STR, "status", "none, no_cursor, head_changed, ready, gap, timeout, interrupted, restarted, busy, deadline (endpoint), or not_eligible, lane_busy, superseded, unsupported, failed, revalidate, invalid, ticks_catchup, other (this client)"},

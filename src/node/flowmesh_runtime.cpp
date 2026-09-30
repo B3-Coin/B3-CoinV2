@@ -3707,14 +3707,19 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketData(
     // Freed after every lock below.
     std::vector<std::shared_ptr<const flowmesh::BookCurves>> dropped;
     std::optional<flowmesh::MarketData> out;
+    std::shared_ptr<FlowMeshObservedTimeLog> observed;
     {
         timing_lock_3102.Mark("lock_requested_us");
         std::lock_guard<std::mutex> lock{m_market_mutex};
         timing_lock_3102.Mark("lock_acquired_us");
         PruneBookCaptures(dropped);
         out = MarketDataLocked(market_id, account, query, error);
+        if (out && query.observed_time) observed = ObservedLogLocked(market_id);
         timing_lock_3102.Mark("lock_released_us");
     }
+    // Observed times are looked up after the market lock: every entry in the
+    // reply was recorded before that lock was released.
+    if (out && query.observed_time) FillObservedTimes(*out, observed.get());
     // Display views only: the curves are copied page by page, never in one
     // hold of the market lock, and the view is computed by the caller.
     if (out && query.indicative && out->snapshot.certified) {
@@ -3786,6 +3791,36 @@ std::shared_ptr<const flowmesh::BookCurves> FlowMeshRuntime::BookCopy(
     return book;
 }
 
+std::shared_ptr<FlowMeshObservedTimeLog> FlowMeshRuntime::ObservedLogLocked(const flowmesh::MarketId& market_id) const
+{
+    const auto it{m_markets.find(market_id)};
+    return it == m_markets.end() ? nullptr : it->second->observed;
+}
+
+void FillObservedTimes(flowmesh::MarketData& out, const FlowMeshObservedTimeLog* log)
+{
+    auto& section{out.observed.emplace()};
+    if (!log) {
+        section.unavailable_reason = "not_recorded_by_this_node";
+        return;
+    }
+    // The head and exactly the reply's history and tick entries, by hash.
+    std::vector<std::pair<uint64_t, uint256>> entries;
+    if (out.snapshot.certified && out.snapshot.next_microblock_sequence > 0) {
+        entries.emplace_back(out.snapshot.next_microblock_sequence - 1, out.snapshot.last_microblock_hash);
+    }
+    for (const auto& entry : out.history.entries) entries.emplace_back(entry.sequence, entry.microblock_hash);
+    if (out.ticks) {
+        for (const auto& tick : out.ticks->ticks) entries.emplace_back(tick.sequence, tick.microblock_hash);
+    }
+    const auto summary{log->GetSummary()};
+    section.available = true;
+    section.source = "this_node";
+    section.clock_suspect = summary.clock_suspect;
+    section.recorded_since_sequence = summary.recorded_since;
+    section.rows = log->Lookup(entries);
+}
+
 std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
     const flowmesh::MarketId& market_id,
     const std::optional<flowmesh::AccountId>& account,
@@ -3796,7 +3831,7 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
         (query.curve_cursor && !query.expected_head) ||
         (query.known_head && (query.curve_cursor || query.before_sequence)) ||
         (query.status_only && (query.curve_cursor || query.before_sequence || query.expected_head || query.ticks ||
-                               query.indicative)) ||
+                               query.indicative || query.observed_time)) ||
         (query.ticks && (query.ticks->limit == 0 || query.ticks->limit > flowmesh::MARKET_DATA_MAX_TICKS))) {
         error = "Invalid bounded market-data query or pagination snapshot";
         return std::nullopt;
@@ -3904,13 +3939,20 @@ std::optional<FlowMeshClientSnapshotView> FlowMeshRuntime::ClientSnapshotView(
     FlowMeshTimingSpan timing_lock_3198{__func__};
     timing_lock_3198.Field("lock_name", std::string{"market_mutex"});
     timing_lock_3198.Mark("lock_requested_us");
-    std::lock_guard lock{m_market_mutex};
-    timing_lock_3198.Mark("lock_acquired_us");
-    auto evidence{ClientSnapshotLocked(market_id, error)};
-    if (!evidence) return std::nullopt;
-    auto reported{MarketDataLocked(market_id, account, reported_query, error)};
-    if (!reported) return std::nullopt;
-    return FlowMeshClientSnapshotView{std::move(*evidence), std::move(*reported)};
+    std::optional<FlowMeshClientSnapshotView> out;
+    std::shared_ptr<FlowMeshObservedTimeLog> observed;
+    {
+        std::lock_guard lock{m_market_mutex};
+        timing_lock_3198.Mark("lock_acquired_us");
+        auto evidence{ClientSnapshotLocked(market_id, error)};
+        if (!evidence) return std::nullopt;
+        auto reported{MarketDataLocked(market_id, account, reported_query, error)};
+        if (!reported) return std::nullopt;
+        if (reported_query.observed_time) observed = ObservedLogLocked(market_id);
+        out.emplace(FlowMeshClientSnapshotView{std::move(*evidence), std::move(*reported)});
+    }
+    if (reported_query.observed_time) FillObservedTimes(out->reported, observed.get());
+    return out;
 }
 
 std::optional<flowmesh::ClientStateEvidence> FlowMeshRuntime::ClientSnapshotLocked(

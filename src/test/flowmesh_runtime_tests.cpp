@@ -11,6 +11,7 @@
 #include <hash.h>
 #include <logging.h>
 #include <node/flowmesh_action_pool.h>
+#include <node/flowmesh_client.h>
 #include <node/flowmesh_observed_time_log.h>
 #include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
@@ -7288,6 +7289,68 @@ BOOST_AUTO_TEST_CASE(observed_time_marks_a_reconciliation_deferred_certificate_l
     // A brief closure does not restart the warm-up: the next one is live.
     f.Certificate(9, 1);
     BOOST_CHECK(ObservedAt(*log, f, 1).mode == flowmesh::ObservedMode::LIVE);
+}
+
+BOOST_AUTO_TEST_CASE(observed_time_in_market_data_only_when_requested)
+{
+    ObservedTestClock clock;
+    const auto log{ObservedLogFor(clock)};
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_observed_market_data", log, 3};
+    f.chain.m_current = f.entries.front().anchor;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    WarmObservedTime(f, clock);
+    f.Certificate(9, 0);
+    clock.wall_ms += 400;
+    f.Certificate(9, 1);
+
+    flowmesh::MarketDataQuery query;
+    query.ticks = flowmesh::ClearingTickQuery{std::nullopt, 16};
+    const auto plain{f.runtime->MarketData(f.market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(plain, error);
+    BOOST_CHECK(!plain->observed);
+    const auto plain_json{node::FlowMeshClientMarketDataJson(*plain).write()};
+    BOOST_CHECK(plain_json.find("observed_time") == std::string::npos);
+
+    query.observed_time = true;
+    auto timed{f.runtime->MarketData(f.market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(timed, error);
+    BOOST_REQUIRE(timed->observed);
+    const auto& section{*timed->observed};
+    BOOST_CHECK(section.available);
+    BOOST_CHECK_EQUAL(section.source, "this_node");
+    BOOST_CHECK_EQUAL(section.recorded_since_sequence.value_or(99), 0U);
+    // Exactly the reply's entries (head, history and ticks), once each.
+    BOOST_REQUIRE_EQUAL(section.rows.size(), 2U);
+    BOOST_CHECK_EQUAL(section.rows[0].sequence, 0U);
+    BOOST_CHECK(section.rows[0].hash == f.entries[0].GetHash());
+    BOOST_CHECK(section.rows[1].mode == flowmesh::ObservedMode::LIVE);
+    BOOST_CHECK_EQUAL(section.rows[1].ms - section.rows[0].ms, 400);
+    // Everything else in the reply is byte for byte the same.
+    const auto timed_json{node::FlowMeshClientMarketDataJson(*timed)};
+    BOOST_CHECK(timed_json["observed_time"]["rows"][1]["observed_ms"].getInt<int64_t>() == section.rows[1].ms);
+    BOOST_CHECK_EQUAL(timed_json["observed_time"]["certified"].get_bool(), false);
+    BOOST_CHECK_EQUAL(timed_json["observed_time"]["source_kind"].get_str(), "operator_observed");
+    timed->observed.reset();
+    BOOST_CHECK_EQUAL(node::FlowMeshClientMarketDataJson(*timed).write(), plain_json);
+
+    // An unchanged light poll still carries the head's time and its ticks'.
+    flowmesh::MarketDataQuery light;
+    light.known_head = f.entries[1].GetHash();
+    light.observed_time = true;
+    const auto unchanged{f.runtime->MarketData(f.market, std::nullopt, light, error)};
+    BOOST_REQUIRE_MESSAGE(unchanged, error);
+    BOOST_CHECK(unchanged->unchanged);
+    BOOST_REQUIRE(unchanged->observed);
+    BOOST_REQUIRE_EQUAL(unchanged->observed->rows.size(), 1U);
+    BOOST_CHECK_EQUAL(unchanged->observed->rows[0].sequence, 1U);
+    BOOST_CHECK(node::FlowMeshClientMarketDataJson(*unchanged).exists("observed_time"));
+
+    // A status-only read never carries it.
+    flowmesh::MarketDataQuery status;
+    status.status_only = true;
+    status.observed_time = true;
+    BOOST_CHECK(!f.runtime->MarketData(f.market, std::nullopt, status, error));
 }
 
 BOOST_AUTO_TEST_CASE(observed_time_throwing_clock_never_affects_the_commit)

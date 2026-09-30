@@ -115,6 +115,10 @@ struct MarketDataQuery {
     std::optional<ClearingTickQuery> ticks;
     //! Indicative next clearing, also computed for a light known_head poll.
     std::optional<IndicativeQuery> indicative;
+    //! Operator-observed times of the head and of the reply's history and
+    //! tick entries, also for a light known_head poll; never with
+    //! status_only. Display data only.
+    bool observed_time{false};
 };
 
 struct MarketAccountFill {
@@ -478,6 +482,8 @@ struct MarketData {
     std::optional<ClearingTickPage> ticks;
     //! Present only when the query asked for it; never certified.
     std::optional<IndicativeClearing> indicative;
+    //! Present only when the query asked for observed_time; never certified.
+    std::optional<ObservedTimes> observed;
     //! Transient input of ComputeMarketViews; never projected or serialized.
     std::shared_ptr<const BookCurves> book;
     //! Public-client verification observations; never serialized into state roots.

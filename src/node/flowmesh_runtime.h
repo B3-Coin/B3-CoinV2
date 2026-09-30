@@ -294,6 +294,11 @@ struct FlowMeshRuntimeMarketConfig {
     std::shared_ptr<FlowMeshObservedTimeLog> observed{};
 };
 
+/** Sets `out.observed` from `log` (null: not recorded by this node): the
+ * stamps of the head and of exactly the reply's history and tick entries
+ * whose hash matches. Display only; call outside the runtime's locks. */
+void FillObservedTimes(flowmesh::MarketData& out, const FlowMeshObservedTimeLog* log);
+
 struct FlowMeshRuntimeConfig {
     FlowMeshRuntimeChain* chain{nullptr};
     FlowMeshRuntimeKeyProvider* keys{nullptr};
@@ -719,6 +724,8 @@ private:
     void ProcessCatchupCommand(const CatchupCommand& command);
     void ProcessAddMarketCommand(AddMarketCommand command);
     void RemovePeerOnWorker(flowmesh::WirePeerId peer);
+    //! Caller holds m_market_mutex. The market's observed-time log, if any.
+    std::shared_ptr<FlowMeshObservedTimeLog> ObservedLogLocked(const flowmesh::MarketId& market_id) const;
     //! Caller holds m_market_mutex. Display-only observed-time upkeep of
     //! every market that records it; decides nothing.
     void ObserveTimeMaintenance(size_t connected_peers);
