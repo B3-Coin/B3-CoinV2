@@ -6037,6 +6037,74 @@ BOOST_AUTO_TEST_CASE(trading_api_candles_are_bounded_and_rate_limited)
     BOOST_CHECK_EQUAL(limited, node::FLOWMESH_API_CANDLES_BUDGET_ERROR);
 }
 
+BOOST_AUTO_TEST_CASE(remote_client_labels_endpoint_observed_time_and_candles)
+{
+    LiveMarket on{*this, m_path_root / "remote-observed", {}, {16}, {}, {true}, {node::FLOWMESH_API_CANDLES_DEFAULT}};
+    // Past the observed-time warm-up this quorum-holding node stamps live.
+    std::this_thread::sleep_for(std::chrono::milliseconds{4600});
+    on.Deposit();
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {on.Endpoint()}, m_path_root / "remote-observed-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    flowmesh::MarketDataQuery query;
+    query.ticks = flowmesh::ClearingTickQuery{std::nullopt, 16};
+    query.observed_time = true;
+    // The first read learns the endpoint's adverts; the next one asks.
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, query, error), error);
+    const auto data{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(data, error);
+    BOOST_REQUIRE(data->observed);
+    const auto& times{*data->observed};
+    BOOST_CHECK_MESSAGE(times.available, times.unavailable_reason);
+    BOOST_CHECK_EQUAL(times.source, on.Endpoint().url);
+    BOOST_REQUIRE(!times.rows.empty());
+    const auto& head{times.rows.back()};
+    BOOST_CHECK_EQUAL(head.sequence, data->snapshot.next_microblock_sequence - 1);
+    BOOST_CHECK(head.hash == data->snapshot.last_microblock_hash);
+    BOOST_CHECK(head.mode == flowmesh::ObservedMode::LIVE);
+    BOOST_CHECK(!(head.flags & flowmesh::OBSERVED_IMPLAUSIBLE));
+    // The JSON a wallet RPC caller sees names the endpoint as the source.
+    BOOST_CHECK_EQUAL(node::FlowMeshClientMarketDataJson(*data)["observed_time"]["source"].get_str(), on.Endpoint().url);
+    // A read that does not ask gets no section.
+    query.observed_time = false;
+    const auto plain{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(plain, error);
+    BOOST_CHECK(!plain->observed);
+
+    const auto page{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(page, error);
+    BOOST_CHECK_MESSAGE(page->available, page->unavailable_reason);
+    BOOST_CHECK(page->remote);
+    BOOST_CHECK_EQUAL(page->source, on.Endpoint().url);
+    BOOST_REQUIRE(!page->candles.empty());
+    BOOST_CHECK_EQUAL(page->candles.back().last_sequence, head.sequence);
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_says_why_an_older_endpoint_has_no_times)
+{
+    // Ticks as f8a3432 serves them, no observed time and no candles.
+    LiveMarket old{*this, m_path_root / "remote-observed-old", {}, {16}};
+    old.Deposit();
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {old.Endpoint()}, m_path_root / "remote-observed-old-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    flowmesh::MarketDataQuery query;
+    query.ticks = flowmesh::ClearingTickQuery{std::nullopt, 16};
+    query.observed_time = true;
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, query, error), error);
+    const auto data{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(data, error);
+    BOOST_REQUIRE(data->ticks);
+    BOOST_CHECK(data->ticks->available);
+    BOOST_REQUIRE(data->observed);
+    BOOST_CHECK(!data->observed->available);
+    BOOST_CHECK_EQUAL(data->observed->unavailable_reason, "endpoint_does_not_advertise_observed_time");
+    const auto page{client->Candles(market, flowmesh::CandleInterval::M5, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(page, error);
+    BOOST_CHECK(!page->available);
+    BOOST_CHECK_EQUAL(page->unavailable_reason, "endpoint_does_not_advertise_candles");
+}
+
 namespace {
 //! Forwards public API requests to a live endpoint and records each request's
 //! method and params. It can add a clearing_ticks_max advertisement to every

@@ -80,6 +80,8 @@ constexpr size_t CLIENT_ACTION_OUTCOME_MAX_REPLY{2 * CLIENT_ACTION_WAIT_MAX_REPL
                                                  4 * flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES + 64 * 1024};
 static_assert(CLIENT_ACTION_OUTCOME_MAX_REPLY <= CLIENT_MAX_REPLY);
 constexpr size_t CLIENT_OUTCOME_EVIDENCE_MAX_REPLY{2 * flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES + 4096};
+// A 'candles' page: at most 500 candles of a few hundred bytes.
+constexpr size_t CLIENT_CANDLES_MAX_REPLY{1024 * 1024};
 // A waited submission's reply: its acknowledgement plus one (opt-in) 'action' reply.
 constexpr size_t CLIENT_SUBMIT_WAIT_MAX_REPLY{CLIENT_ACTION_OUTCOME_MAX_REPLY + 64 * 1024};
 static_assert(CLIENT_SUBMIT_WAIT_MAX_REPLY <= CLIENT_MAX_REPLY);
@@ -1334,6 +1336,17 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // Per endpoint, under m_work: its advertisement is ignored until then,
     // after it refused "ticks" as an unknown field.
     std::vector<std::chrono::steady_clock::time_point> m_clearing_ticks_withdrawn;
+    // Per endpoint (index-stable), under m_work: it advertised
+    // observed_time_v1 (withdrawn with the ticks), and the largest
+    // 'candles' page it advertised (zero: never called).
+    std::vector<bool> m_observed_time;
+    std::vector<size_t> m_observed_candles;
+    // Display-only candles lane: its own TLS connection, so m_work is never
+    // held across a candles request. Only try-locked, never while holding
+    // m_work; a busy lane means the caller tries again later.
+    std::mutex m_display_lane;
+    FlowMeshHttpsClient m_display_https;
+    std::atomic<bool> m_display_reset{false};
     // Never acquire m_work from a wallet metadata lookup: it covers HTTPS.
     mutable std::mutex m_metadata_mutex;
     FlowMeshAssetMetadataCatalog m_metadata;
@@ -1448,6 +1461,13 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         //! The head a live-update read last gave up its watch for, to let an
         //! ordinary read fetch the missing ticks: at most once per head.
         uint256 catchup_head;
+        //! Endpoint-reported observed times of held ticks (never evidence),
+        //! from one endpoint only (times_source); see
+        //! FlowMeshMergeObservedTimes.
+        std::map<uint64_t, flowmesh::ObservedStamp> times;
+        std::string times_source;
+        std::string times_reason;
+        bool times_clock_suspect{false};
     };
     std::map<uint256, TickRing> m_ticks;
     //! One market-data read's clearing-tick request. Only Data() and Watch()
@@ -1461,6 +1481,13 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         size_t limit{0};
         //! The page of the reply that last set or confirmed the verified head.
         std::optional<UniValue> page;
+        //! The caller asked for observed times; sent with "ticks" only to an
+        //! endpoint that advertises them.
+        bool observed{false};
+        bool observed_sent{false};
+        //! That reply's observed-time section, and when it was received.
+        std::optional<UniValue> observed_page;
+        int64_t received_ms{0};
     };
     //! Under m_work: the request for a market's missing ticks.
     TickRequest TicksAfterRing(const uint256& id) const
@@ -1478,6 +1505,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (!ticks) return {};
         return [this, ticks](UniValue& params, const size_t endpoint) {
             ticks->sent.reset();
+            ticks->observed_sent = false;
             const size_t advertised{m_clearing_ticks.at(endpoint)};
             if (advertised == 0) return;
             // Held ticks more than a page behind the verified head could only
@@ -1491,6 +1519,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             params.pushKV("ticks", std::move(value));
             ticks->sent = endpoint;
             ticks->limit = advertised;
+            ticks->observed_sent = ticks->observed && m_observed_time.at(endpoint);
+            if (ticks->observed_sent) params.pushKV("observed_time", true);
         };
     }
     //! An endpoint refused "ticks" as unknown: withdrawn for a while, and the
@@ -1500,8 +1530,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (!ticks) return {};
         return [this, ticks](const size_t endpoint) {
             m_clearing_ticks.at(endpoint) = 0;
+            m_observed_time.at(endpoint) = false;
             m_clearing_ticks_withdrawn.at(endpoint) = std::chrono::steady_clock::now() + FLOWMESH_CLIENT_TICKS_WITHDRAWN_FOR;
             ticks->sent.reset();
+            ticks->observed_sent = false;
             return true;
         };
     }
@@ -1511,6 +1543,12 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     {
         if (!ticks || ticks->sent != endpoint) return;
         ticks->page = value["reported_data"]["clearing_ticks"];
+        if (ticks->observed_sent) {
+            ticks->observed_page = value["reported_data"]["observed_time"];
+            ticks->received_ms = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());
+        } else {
+            ticks->observed_page.reset();
+        }
     }
     //! After the read's Refresh: merges its page against the verified head.
     //! A bad page costs only the ticks, never the read.
@@ -1525,6 +1563,22 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         const auto& head{cache.verified.certified.entry};
         ring.reason = FlowMeshMergeClearingTicks(ring.ticks, *ticks.page, ticks.after, ticks.limit, head.sequence, head.GetHash());
         if (!ring.reason.empty()) LogDebug(BCLog::NET, "FlowMesh clearing ticks for market=%s: %s\n", id.GetHex(), ring.reason);
+        // Observed times: one endpoint's series only, bound to held ticks.
+        const auto& source{m_endpoints.at(cache.endpoint).url};
+        if (ring.times_source != source) {
+            ring.times.clear();
+            ring.times_source.clear();
+        }
+        if (ticks.observed_page) {
+            ring.times_reason = FlowMeshMergeObservedTimes(ring.times, *ticks.observed_page, ring.ticks, ticks.received_ms,
+                                                           ring.times_clock_suspect);
+            if (ring.times_reason.empty() || !ring.times.empty()) ring.times_source = source;
+        } else {
+            std::erase_if(ring.times, [&](const auto& item) {
+                return ring.ticks.empty() || item.first < ring.ticks.front().sequence || item.first > ring.ticks.back().sequence;
+            });
+            if (ticks.observed && !m_observed_time.at(cache.endpoint)) ring.times_reason = "endpoint_does_not_advertise_observed_time";
+        }
     }
     //! The caller's page of held ticks: available only when they reach the
     //! verified head (whose hash the tick there carries).
@@ -1540,6 +1594,45 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             return out;
         }
         return flowmesh::PageClearingTicks(it->second.ticks, query);
+    }
+    //! The endpoint's observed times for the reply's head, history and
+    //! ticks, labelled with that endpoint. Endpoint-reported display data:
+    //! flagged, never corrected; noexcept, so it can never fail a read.
+    flowmesh::ObservedTimes ObservedView(const Cache& cache, const flowmesh::MarketData& out,
+                                         const std::optional<int64_t> head_floor_ms) const noexcept
+    {
+        flowmesh::ObservedTimes view;
+        try {
+            view.source = m_endpoints.at(cache.endpoint).url;
+            const auto it{m_ticks.find(cache.pins.market_id)};
+            if (it == m_ticks.end() || it->second.times_source != view.source) {
+                view.unavailable_reason = !m_observed_time.at(cache.endpoint) ? "endpoint_does_not_advertise_observed_time"
+                    : it != m_ticks.end() && !it->second.times_reason.empty() ? it->second.times_reason
+                                                                                : "observed_time_not_yet_received";
+                return view;
+            }
+            const auto& ring{it->second};
+            view.available = true;
+            view.clock_suspect = ring.times_clock_suspect;
+            std::map<uint64_t, uint256> wanted;
+            const auto& head{cache.verified.certified.entry};
+            wanted.emplace(head.sequence, head.GetHash());
+            for (const auto& entry : out.history.entries) wanted.emplace(entry.sequence, entry.microblock_hash);
+            if (out.ticks) for (const auto& tick : out.ticks->ticks) wanted.emplace(tick.sequence, tick.microblock_hash);
+            for (const auto& [sequence, hash] : wanted) {
+                const auto stamp{ring.times.find(sequence)};
+                if (stamp == ring.times.end() || stamp->second.hash != hash) continue;
+                auto row{stamp->second};
+                if (sequence == head.sequence && head_floor_ms && row.mode == flowmesh::ObservedMode::LIVE && row.ms < *head_floor_ms) {
+                    row.flags |= flowmesh::OBSERVED_IMPLAUSIBLE;
+                }
+                view.rows.push_back(row);
+            }
+        } catch (...) {
+            view = {};
+            view.unavailable_reason = "malformed";
+        }
+        return view;
     }
     //! Under m_work: the cache's verified curves for display views, which are
     //! computed from this copy only after m_work is released.
@@ -1665,8 +1758,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         m_submit_wait.at(endpoint) = FlowMeshAdvertisedSubmitWait(status);
         m_action_outcome.at(endpoint) = FlowMeshAdvertisedActionOutcome(status);
         LearnUpdatesWatch(FlowMeshAdvertisedUpdatesWatch(status), endpoint);
-        m_clearing_ticks.at(endpoint) = std::chrono::steady_clock::now() < m_clearing_ticks_withdrawn.at(endpoint)
-                                            ? 0 : FlowMeshAdvertisedClearingTicks(status);
+        const bool withdrawn{std::chrono::steady_clock::now() < m_clearing_ticks_withdrawn.at(endpoint)};
+        m_clearing_ticks.at(endpoint) = withdrawn ? 0 : FlowMeshAdvertisedClearingTicks(status);
+        m_observed_time.at(endpoint) = !withdrawn && FlowMeshAdvertisedObservedTime(status);
+        m_observed_candles.at(endpoint) = FlowMeshAdvertisedObservedCandles(status);
     }
     void LearnUpdatesWatch(const std::chrono::milliseconds advertised, size_t endpoint)
     {
@@ -2387,6 +2482,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         out->snapshot.pending_handoff = Flag(cache.status, "pending_handoff"); out->snapshot.halt = Text(cache.status, "halt");
         out->snapshot.error = Text(cache.status, "error"); out->snapshot.runtime.round = Number(cache.status, "round", UINT32_MAX);
         out->snapshot.pending_actions = Number(cache.status, "pending_actions", 65536);
+        // Display only: the earliest a stamp of the head can plausibly be (the
+        // block that made its anchor final, less the block future bound).
+        std::optional<int64_t> head_floor_ms;
         {
             LOCK(::cs_main); SyncIndexes();
             const auto checkpoint{m_chainman.ActiveChainstate().ModernFlowMeshCheckpoints().Index().Head(cache.pins.market_id)};
@@ -2396,9 +2494,18 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 Fail("B3 checkpoint advanced while reading account state; refresh required before signing");
             out->b3_checkpoint_confirmed = checkpoint && checkpoint->core.microblock_hash == out->snapshot.last_microblock_hash &&
                 checkpoint->core.state_root == out->snapshot.state_root;
+            if (query.observed_time) {
+                const auto final_height{static_cast<int64_t>(cache.verified.certified.entry.anchor.height) + Consensus::FLOWMESH_ANCHOR_DEPTH};
+                const auto& chain{m_chainman.ActiveChain()};
+                if (final_height >= 0 && final_height <= chain.Height()) {
+                    head_floor_ms = chain[static_cast<int>(final_height)]->GetBlockTime() * 1000 - 120'000;
+                }
+            }
         }
         if (!out->unchanged) ReportedHistory(*out, cache.reported);
         if (query.ticks) out->ticks = TicksView(cache, *query.ticks);
+        // Never on a signing preflight (it never asks), never a failure.
+        if (query.observed_time) out->observed = ObservedView(cache, *out, head_floor_ms);
         return std::move(*out);
     }
     flowmesh::ClientEvidencePins RecheckActionAuthority(Pending& p)
@@ -3267,6 +3374,8 @@ public:
         m_watch_unanswered.resize(m_endpoints.size());
         m_clearing_ticks.resize(m_endpoints.size());
         m_clearing_ticks_withdrawn.resize(m_endpoints.size());
+        m_observed_time.resize(m_endpoints.size());
+        m_observed_candles.resize(m_endpoints.size());
         for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({.url = endpoint.url, .available = false, .last_error = {}});
         if (!m_endpoints.empty()) m_status.selected_endpoint = m_endpoints[m_selected].url;
         PublishSavedView();
@@ -3303,11 +3412,14 @@ public:
                 m_watch_unanswered.push_back(false);
                 m_clearing_ticks.push_back(0);
                 m_clearing_ticks_withdrawn.emplace_back();
+                m_observed_time.push_back(false);
+                m_observed_candles.push_back(0);
             }
             m_selected = selected; m_preferred = selected; m_retry_after[selected] = {};
             m_https.Reset(); // Explicit connect revalidates existing trust.
             m_wait_reset = true;
             m_watch_reset = true;
+            m_display_reset = true;
             {
                 std::lock_guard status_lock{m_status_mutex};
                 if (added) m_status.endpoints.push_back({.url = endpoint.url, .available = false, .last_error = {}});
@@ -3426,6 +3538,7 @@ public:
             MarkWorkAcquired(timing_lock_1245);
             try {
                 auto ticks{TicksAfterRing(id)};
+                ticks.observed = query.observed_time;
                 auto& cache{Refresh(id, account, query, query.ticks ? &ticks : nullptr)};
                 if (query.ticks) MergeTicks(id, cache, ticks);
                 out = Project(cache, account, query);
@@ -3439,6 +3552,84 @@ public:
         // released, so no signing preflight or action waits for them.
         flowmesh::ComputeMarketViews(*out, query);
         return out;
+    }
+    /** The endpoint serving this market's data, asked for one page of its
+     * observed-time candles, only when it advertises them. Endpoint-reported
+     * display data: only the page's structure and that no candle goes past
+     * the verified head are checked. The work gate is held only to read the
+     * endpoint and head, never across the request, so an order never waits
+     * for a candles page; a busy candles lane fails at once. */
+    std::optional<flowmesh::ObservedCandlePage> Candles(const uint256& id, const flowmesh::CandleInterval interval,
+                                                        const std::optional<int64_t> before_ms, const size_t limit,
+                                                        std::string& error) override
+    {
+        FlowMeshTimingSpan timing{"client_candles"};
+        std::unique_lock lane{m_display_lane, std::try_to_lock};
+        if (!lane.owns_lock()) {
+            error = "A candles read is already in progress";
+            return std::nullopt;
+        }
+        HttpsEndpoint target;
+        size_t endpoint{0}, advertised{0};
+        uint64_t head_sequence{0};
+        {
+            WorkLock lock{*this};
+            const auto it{m_cache.find(id)};
+            if (it == m_cache.end()) {
+                error = "Read this market's data before its candles";
+                return std::nullopt;
+            }
+            endpoint = it->second.endpoint;
+            head_sequence = it->second.verified.certified.entry.sequence;
+            advertised = m_observed_candles.at(endpoint);
+            target = m_endpoints.at(endpoint);
+        }
+        flowmesh::ObservedCandlePage out;
+        out.interval = interval;
+        out.remote = true;
+        out.source = target.url;
+        if (advertised == 0) {
+            out.unavailable_reason = "endpoint_does_not_advertise_candles";
+            return out;
+        }
+        UniValue params{UniValue::VOBJ};
+        params.pushKV("market_id", id.GetHex());
+        params.pushKV("interval", flowmesh::CandleIntervalName(interval));
+        if (before_ms) params.pushKV("before_ms", *before_ms);
+        params.pushKV("limit", uint64_t{std::clamp<size_t>(limit, 1, advertised)});
+        UniValue request{UniValue::VOBJ};
+        request.pushKV("method", "candles");
+        request.pushKV("params", std::move(params));
+        if (m_display_reset.exchange(false)) m_display_https.Reset();
+        const auto reply{m_display_https.Request(target, "/flowmesh/v1", request.write(), CLIENT_REQUEST_TIMEOUT, CLIENT_CANDLES_MAX_REPLY)};
+        try {
+            if (!reply.response_received) Fail(reply.error.empty() ? "No HTTPS response" : reply.error);
+            UniValue parsed;
+            if (!parsed.read(reply.body)) Fail("Malformed endpoint JSON response");
+            Keys(parsed, {"ok", "result", "error"});
+            if (!Flag(parsed, "ok")) {
+                const auto text{Text(parsed, "error")};
+                if (text == "This method is not exposed by the public trading API") {
+                    // A stale advertisement: withdrawn until relearned.
+                    WorkLock lock{*this};
+                    m_observed_candles.at(endpoint) = 0;
+                }
+                Fail(text);
+            }
+            if (reply.status != 200) Fail("Unexpected HTTPS response status");
+            auto page{FlowMeshParseObservedCandles(parsed["result"], interval, head_sequence, error)};
+            if (!page) {
+                m_display_https.Reset();
+                return std::nullopt;
+            }
+            page->remote = true;
+            page->source = target.url;
+            return page;
+        } catch (const std::exception& e) {
+            m_display_https.Reset();
+            error = e.what();
+            return std::nullopt;
+        }
     }
     std::optional<flowmesh::MarketData> Watch(const uint256& id, const std::optional<uint256>& account,
                                              const flowmesh::MarketDataQuery& query, const std::chrono::milliseconds requested,
@@ -3624,6 +3815,7 @@ public:
                             const auto gaps{event_gaps()};
                             cache.fresh.reset();
                             auto ticks{TicksAfterRing(id)};
+                            ticks.observed = query.observed_time;
                             if (ApplyUpdatesPage(cache, id, result, endpoint)) {
                                 Snapshot(id, account, flowmesh::ClientEventCursor{cache.cursor}, query.ticks ? &ticks : nullptr);
                             }
@@ -3884,6 +4076,7 @@ public:
             m_https.Reset();
             m_wait_reset = true;
             m_watch_reset = true;
+            m_display_reset = true;
             // Do not call Markets/Refresh/QueryAction/Send: a connection probe
             // must not touch market caches, account cursors or durable history.
             Call("markets", UniValue{UniValue::VOBJ}, [&](const UniValue& value, size_t) {
