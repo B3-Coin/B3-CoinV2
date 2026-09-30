@@ -5190,6 +5190,35 @@ private Q_SLOTS:
         QCOMPARE(panel.m_own_view->rowCount(), 0); QVERIFY(panel.m_balances->text().isEmpty());
         QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_wallet);
     }
+    void marketSwitchYieldsThePassiveReadAndReadsTheNewMarketAtOnce()
+    {
+        // A passive read of the market being left stops at its next RPC (the
+        // catalog call under way completes) and the new market is read at
+        // once; the old market's snapshot is never read.
+        FundingReadProbe probe; probe.held_method = "listflowmeshmarkets";
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        struct Cleanup { FundingReadProbe& probe; B3FlowMeshTradingPanel& panel; ~Cleanup() { probe.auxiliary_release.release(8); panel.cancelAndWait(); } } cleanup{probe, panel};
+        auto other{panel.m_market_data.front()};
+        other.base = QString::fromStdString(H(90).GetHex());
+        other.id = QString::fromStdString(flowmesh::ComputeFlowMeshMarketId(H(1), H(90))->GetHex());
+        other.vault = QString::fromStdString(flowmesh::ComputeFlowMeshVaultId(H(1), *uint256::FromHex(other.id.toStdString()))->GetHex());
+        panel.m_market_data.push_back(other);
+        { QSignalBlocker blocked{panel.m_market}; panel.m_market->addItem(QStringLiteral("Other synthetic market"), other.id); }
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Catalog;
+        panel.startJob(); QVERIFY(probe.auxiliary_entered.tryAcquire(1, 2000));
+        const auto passive{panel.m_active_result};
+        QVERIFY(passive && passive->passive);
+        panel.m_market->setCurrentIndex(1);
+        QVERIFY(panel.m_yield_refresh->load());
+        probe.auxiliary_release.release();
+        // The next read is of the new market, without waiting for a tick.
+        QTRY_VERIFY_WITH_TIMEOUT(panel.m_active_result && panel.m_active_result != passive, 2000);
+        QVERIFY(passive->refresh_yielded);
+        QCOMPARE(panel.m_active_result->views_market, other.id);
+        QVERIFY(!panel.m_timer->isActive());
+        QCOMPARE(probe.snapshots.load(), 0);
+        QCOMPARE(probe.writes.load(), 0);
+    }
     void backgroundReadDoesNotWeakenReadinessGuards()
     {
         for (int condition{0}; condition < 7; ++condition) {

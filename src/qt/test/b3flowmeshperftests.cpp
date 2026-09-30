@@ -1282,6 +1282,37 @@ private Q_SLOTS:
         QCOMPARE(probe.writes.load(), 0);
     }
 
+    //! The local engine polling (its watch failing, so backing off): local
+    //! passive jobs take milliseconds, so the 500 ms tick already starts
+    //! one every ~500 ms; clock-scheduling them would change nothing.
+    void localPollPacing()
+    {
+        MarketProbe probe{{SyntheticMarket::Options{}}};
+        probe.fail_watch = true;
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); Attach(panel);
+        Show(panel, probe);
+        panel.show(); Spin(50);
+        panel.updateWatchState();
+        const int seconds{Measuring() ? 10 : 4};
+        panel.m_timer->start();
+        Spin(seconds * 1000);
+        panel.m_timer->stop(); panel.m_watch.Disable();
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_watch_thread, 5000);
+        std::vector<int64_t> starts;
+        { std::lock_guard lock{probe.m_record}; starts = probe.job_starts_us; }
+        QVERIFY(starts.size() >= 3);
+        std::vector<double> spacing;
+        for (size_t i{1}; i < starts.size(); ++i) spacing.push_back(Ms(starts[i] - starts[i - 1]));
+        const auto d{Distribute(spacing)};
+        qInfo("%s", qPrintable(Describe("local poll starts (watch backing off)", d)));
+        UniValue v{UniValue::VOBJ};
+        v.pushKV("jobs", static_cast<uint64_t>(starts.size())); v.pushKV("start_spacing", Json(d));
+        v.pushKV("target", "one passive start per ~500 ms tick, never back to back");
+        Record("local_poll_pacing", v);
+        for (const double gap : spacing) QVERIFY2(gap >= 450, qPrintable(Describe("spacing", d)));
+        QCOMPARE(probe.writes.load(), 0);
+    }
+
     //! U5: a market switch until the new market's book is painted.
     void marketSwitch()
     {

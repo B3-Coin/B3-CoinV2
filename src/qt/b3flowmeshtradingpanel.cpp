@@ -372,6 +372,10 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         updateMarketText(); updateDataViews();
     });
     connect(m_market, &QComboBox::currentIndexChanged, this, [this] {
+        // A passive read of the market being left yields at its next RPC
+        // (an RPC already under way still completes); the new market is
+        // then read at once. User-paced, like a review click.
+        if (m_active_result && m_active_result->passive) m_yield_refresh->store(true);
         resetRefreshSchedule();
         m_deferred_status.reset(); // A queued click never follows a market switch.
         // A failed read/backoff belongs to its selected market. Another listed
@@ -2125,6 +2129,10 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
             // guards and the normal confirmation. No automatic approval.
             startJob(std::nullopt, std::nullopt, false, false, std::nullopt, {}, true);
             if (m_thread) { m_busy = true; updateControls(); }
+        } else if (const auto selected{market()}; selected && selected->id != result->views_market) {
+            // A market switch yielded this read: read the new market now,
+            // not a tick later (refresh drains a queued connect first).
+            refresh();
         }
         return; // finishJob drains a captured explicit status next, if any.
     }
