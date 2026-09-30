@@ -205,13 +205,20 @@ endpoint-reported: its prices, volumes and times are the endpoint's claims.
   imports stay without a time); tooltips give the observer, UTC to the
   millisecond (or the late upper bound), flags and the auction number.
 - **Servers without observed time.** The tape may show when this app received
-  an auction, only for a live update whose endpoint waited and saw the head
-  move (watch status `head_changed`, no gap) that brought exactly one new
-  auction while the link was Live, from an endpoint not advertising that it is
-  not ready; a poll, a catch-up or an endpoint replaying older entries in
-  consecutive replies never stamps one. Labelled "received by this app", never
-  a chart input, dropped as soon as the source reports times. An endpoint that
-  offers no live updates (c10c952, f8a3432) therefore gets no receipt times.
+  an auction: received in a live update, so the auction was certified at or
+  before then (possibly earlier). Only a live update whose source held the
+  displayed head when its wait began and saw it move during the wait (watch
+  status `ready` with the head moved, no gap) stamps one, and only when it
+  brought exactly one new auction while the link was Live, from an endpoint
+  not advertising that it is not ready. `head_changed` does not qualify: the
+  local engine and a public endpoint answer it at once, without waiting,
+  whenever the known head is already stale. A poll, a catch-up or an
+  endpoint replaying older entries in consecutive replies never stamps one. A
+  source catching up while it waits, without advertising that it is not
+  ready, can still produce a late stamp. Labelled "received by this app",
+  never a chart input, dropped as soon as the source reports times. An
+  endpoint that offers no live updates (c10c952, f8a3432) therefore gets no
+  receipt times.
 - **Wording.** The clearing strip ("Last auction 12:34:56 · …"), the trade
   history's Time column, the progress line, toasts and gap notes no longer show
   microblock numbers; each keeps the auction number in its tooltip.

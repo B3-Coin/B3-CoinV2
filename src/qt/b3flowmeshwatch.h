@@ -41,6 +41,15 @@ enum class Outcome {
 Outcome Classify(bool rpc_error, std::string_view status, bool supported, bool waited,
                  bool head_moved, uint32_t endpoint_live_ms);
 
+//! The reply shows that its source held the caller's known head when its
+//! wait began and that the head moved during the wait: a supported watch
+//! that waited and woke on an event ("ready"), with no gap, and a changed
+//! head. "head_changed" is not such evidence: the local engine and a public
+//! endpoint answer it AT ONCE, without waiting, whenever the known head is
+//! already stale (a display that lags, or a source catching up). For the
+//! trades tape's receipt times only; never a gate.
+bool HeadMovedDuringWait(std::string_view status, bool supported, bool gap, bool head_moved);
+
 struct Policy {
     static constexpr int64_t WATCH_MS{1500};          //!< Requested watch_ms.
     static constexpr int64_t TICK_MS{500};            //!< The ordinary poll interval.

@@ -2480,11 +2480,15 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
         if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age = age;
         // Tape only: a server without observed times, one new auction since
         // the displayed head, received while the link was Live and without
-        // an event gap: when this app received it. Only from a live update
-        // whose endpoint waited and saw the head move (head_changed): an
-        // endpoint or node replaying old entries in consecutive replies, a
-        // poll or a catch-up never stamps one, nor an endpoint advertising
-        // that it is not ready. Nothing older, never a chart input.
+        // an event gap: when this app received it, which bounds its
+        // certification (at or before then) and nothing more. Only from a
+        // live update whose source held the displayed head when its wait
+        // began and saw it move during the wait (HeadMovedDuringWait): a
+        // reply answered at once for a stale known head, a poll, a replay of
+        // old entries in consecutive replies or a catch-up never stamps one,
+        // nor an endpoint advertising that it is not ready. A source that
+        // catches up while it waits, without saying so, can still stamp one
+        // late. Nothing older, never a chart input.
         const bool one_new{m_snapshot && m_snapshot->market == fresh.market && fresh.next_sequence == m_snapshot->next_sequence + 1};
         const bool was_live{!m_read_failed && m_response_age.isValid() && m_response_age.elapsed() <= B3FlowMeshMarketData::LINK_FRESH_MS};
         const bool untimed{!fresh.observed || !fresh.observed->available};
@@ -2707,7 +2711,7 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
         const bool head_moved{!s.unchanged && s.head != scope.known_head};
         const auto outcome{B3FlowMeshWatch::Classify(false, result->status.toStdString(), result->supported, result->waited,
                                                      head_moved, result->endpoint_live_ms)};
-        const bool live_head_change{result->supported && !result->gap && result->status == QStringLiteral("head_changed")};
+        const bool live_head_change{B3FlowMeshWatch::HeadMovedDuringWait(result->status.toStdString(), result->supported, result->gap, head_moved)};
         const uint64_t reply_head{!s.unchanged && s.next_sequence ? s.next_sequence - 1 : displayed};
         // The selected row as this reply determines it, derived before the
         // reply moves into the display (it is never copied).

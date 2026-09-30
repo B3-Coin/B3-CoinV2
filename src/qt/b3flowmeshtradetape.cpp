@@ -71,7 +71,7 @@ QString B3FlowMeshTradeTape::TimeText(const Row& row, const QString& source, con
         tip = tr("No trade time: %1's clock stood behind an earlier stamp when it applied this auction.").arg(who);
     } else if (row.received_ms) {
         text = QDateTime::fromMSecsSinceEpoch(*row.received_ms).toLocalTime().toString(QStringLiteral("HH:mm:ss"));
-        tip = tr("Received by this app at %1 (this computer's clock) in a live update the server sent as the auction arrived: this server reports no times. The auction was certified at or before then; not a certified or observed trade time.").arg(Utc(*row.received_ms));
+        tip = tr("Received by this app at %1 (this computer's clock) in a live update: this server reports no times. The auction was certified at or before then, possibly earlier; not a certified or observed trade time.").arg(Utc(*row.received_ms));
     } else {
         tip = source.isEmpty() ? tr("No trade time: this source does not report observed times.")
                                : tr("No trade time: %1 has no observed time for this auction (earlier history, or not observed live).").arg(who);

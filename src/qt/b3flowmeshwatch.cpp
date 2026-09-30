@@ -21,6 +21,15 @@ Outcome Classify(const bool rpc_error, const std::string_view status, const bool
     return Outcome::NotWaited;
 }
 
+bool HeadMovedDuringWait(const std::string_view status, const bool supported, const bool gap, const bool head_moved)
+{
+    // Both the local engine (LocalBackend::Watch) and the public 'updates'
+    // handler compare the known head before any wait and answer
+    // "head_changed" at once when it differs; a change seen while waiting
+    // is reported as the event that woke the wait ("ready").
+    return supported && !gap && head_moved && status == "ready";
+}
+
 void Policy::Enable(const int64_t now, const bool advertised, const bool local)
 {
     this->local = local;

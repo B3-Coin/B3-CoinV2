@@ -371,8 +371,10 @@ private:
     //! Applies one verified read of the selected market, never moving the
     //! display backwards: a reply against a head the display has left, or an
     //! older full snapshot, is superseded (dropped, not a failure).
-    //! `live_head_change`: the reply is a live update whose endpoint waited
-    //! and saw the head move (watch status head_changed, no gap), the only
+    //! `live_head_change`: the reply is a live update whose source held the
+    //! displayed head when its wait began and saw it move during the wait
+    //! (B3FlowMeshWatch::HeadMovedDuringWait: watch status ready, no gap; a
+    //! head_changed reply was answered at once, without waiting), the only
     //! reply that may stamp a receipt time in the tape (review B2).
     SnapshotApply applySelectedSnapshot(B3FlowMeshMarketData::Snapshot fresh, const QElapsedTimer& age, const QString& basis_head,
                                         bool live_head_change = false);

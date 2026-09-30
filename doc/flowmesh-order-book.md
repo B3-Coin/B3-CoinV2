@@ -150,11 +150,15 @@ any of those servers already serves.
 
 The tape (next to the order book, "Trades") shows operator-observed times
 where the source serves them. For a server without them, a "received by this
-app" time is stamped only for a live update whose endpoint waited and saw the
-head move (`head_changed`, no gap), bringing exactly one new auction, with
+app" time says only that the auction came in a live update and was certified
+at or before then. It is stamped only for a live update whose source held the
+displayed head when its wait began and saw it move during the wait (watch
+status `ready`, head moved, no gap), bringing exactly one new auction, with
 the link Live and the endpoint not advertising that it is not ready; every
-other reply leaves "—" (review B2). An endpoint without live updates therefore
-gets no receipt times.
+other reply leaves "—" (review B2). A `head_changed` reply never stamps one:
+the local engine and the public endpoint answer it at once, without waiting,
+for a stale known head. An endpoint without live updates therefore gets no
+receipt times.
 
 ## 5. Owner rulings still open
 

@@ -2944,6 +2944,45 @@ private Q_SLOTS:
         QCOMPARE(panel.applySelectedSnapshot(at(8, {tick(7)}, true), age, {}, true), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
         QVERIFY(panel.m_received_times.empty());
     }
+    void receiptTimesNeedTheHeadToMoveDuringTheWait()
+    {
+        // "head_changed" is answered at once, without any wait, whenever the
+        // known head is already stale (the local engine and the public
+        // endpoint alike): a lagging display or a source catching up, so it
+        // never stamps a receipt time. A watch that waited at the displayed
+        // head and woke as that head moved ("ready") does.
+        const auto base = [] {
+            auto v{RemoteData(false)};
+            v.pushKV("clearing_ticks", TickPageJson({TickJson(1, H(12), false), TickJson(2, H(4), true)}));
+            return v;
+        };
+        const auto newer = [&] {
+            auto v{base()}; auto snapshot{v["snapshot"]};
+            snapshot.pushKV("next_microblock_sequence", 4); snapshot.pushKV("last_microblock_hash", H(10).GetHex()); v.pushKV("snapshot", snapshot);
+            auto account{v["account"]}; account.pushKV("next_sequence", 9); v.pushKV("account", account);
+            v.pushKV("clearing_ticks", TickPageJson({TickJson(3, H(10), true)}));
+            return v;
+        };
+        for (const bool moved_during_wait : {false, true}) {
+            FundingReadProbe probe; probe.live_ms = 2000; probe.data = base(); probe.watch_data = newer();
+            probe.watch_object = WatchObject(moved_during_wait ? "ready" : "head_changed", true, true);
+            B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(base())); panel.mergeHeldTicks();
+            QCOMPARE(panel.m_ticks.back().sequence, uint64_t{2});
+            Live(panel, probe);
+            probe.hold_watch = true;
+            panel.armWatch(); QVERIFY(panel.m_watch_thread);
+            QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+            probe.watch_release.release(); // Only this read returns; the next one is held.
+            QTRY_COMPARE_WITH_TIMEOUT(panel.m_snapshot->head, QString::fromStdString(H(10).GetHex()), 3000);
+            // The one new auction is held either way; only a change seen
+            // during the wait gives it a receipt time.
+            QCOMPARE(panel.m_ticks.back().sequence, uint64_t{3});
+            QCOMPARE(panel.m_received_times.contains(3), moved_during_wait);
+            QCOMPARE(panel.m_received_times.size(), size_t{moved_during_wait ? 1U : 0U});
+            panel.m_watch.Disable(); probe.hold_watch = false; probe.watch_release.release(); AwaitWatchWorker(panel);
+            QCOMPARE(probe.writes.load(), 0);
+        }
+    }
     void historyAndStripShowObservedTimesNotMicroblocks()
     {
         B3FlowMeshTradingPanel panel;

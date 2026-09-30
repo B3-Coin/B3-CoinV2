@@ -1285,6 +1285,22 @@ private Q_SLOTS:
             QCOMPARE(Classify(false, label, false, false, false, 2000), WOutcome::NotWaited);
         }
     }
+    void watchReceiptEvidenceIsAHeadThatMovedDuringTheWait()
+    {
+        using B3FlowMeshWatch::HeadMovedDuringWait;
+        // Woken by the event of a new head while waiting at the known one.
+        QVERIFY(HeadMovedDuringWait("ready", true, false, true));
+        // Answered at once, without waiting, for an already stale known head.
+        QVERIFY(!HeadMovedDuringWait("head_changed", true, false, true));
+        // Woken by another event (the head did not move), a gap, unsupported.
+        QVERIFY(!HeadMovedDuringWait("ready", true, false, false));
+        QVERIFY(!HeadMovedDuringWait("ready", true, true, true));
+        QVERIFY(!HeadMovedDuringWait("ready", false, false, true));
+        for (const char* label : {"timeout", "gap", "restarted", "ticks_catchup", "not_eligible", "lane_busy", "superseded",
+                                  "revalidate", "busy", "deadline", "interrupted", "other", "none"}) {
+            QVERIFY2(!HeadMovedDuringWait(label, true, false, true), label);
+        }
+    }
     void watchNonWaitedOutcomesArePaced()
     {
         using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using B3FlowMeshWatch::Classify; using WOutcome = B3FlowMeshWatch::Outcome;
