@@ -6192,6 +6192,9 @@ struct TickProxy {
     std::mutex mutex;
     std::optional<uint64_t> advert;
     bool tamper{false};
+    //! Moves the newest candle of every 'candles' page this far past its
+    //! last sequence.
+    uint64_t candles_ahead{0};
     std::vector<std::pair<std::string, UniValue>> requests;
 
     node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
@@ -6201,17 +6204,29 @@ struct TickProxy {
         const auto method{json["method"].get_str()};
         std::optional<uint64_t> inject;
         bool corrupt;
+        uint64_t ahead;
         {
             std::lock_guard lock{mutex};
             requests.emplace_back(method, json["params"]);
             inject = advert;
             corrupt = tamper;
+            ahead = candles_ahead;
         }
         const auto reply{node::FlowMeshHttpsRequest(upstream, "/flowmesh/v1", request.body, std::chrono::seconds{10}, 32 << 20)};
         if (!reply.response_received) return {502, R"({"ok":false,"error":"proxy upstream failed"})"};
         UniValue parsed;
-        if ((!inject && !corrupt) || !parsed.read(reply.body) || !parsed["ok"].isTrue()) return {reply.status, reply.body};
+        if ((!inject && !corrupt && !ahead) || !parsed.read(reply.body) || !parsed["ok"].isTrue()) return {reply.status, reply.body};
         UniValue result{parsed["result"]};
+        if (ahead && method == "candles" && result["candles"].isArray() && !result["candles"].empty()) {
+            const auto& candles{result["candles"].getValues()};
+            UniValue rows{UniValue::VARR};
+            for (size_t i{0}; i < candles.size(); ++i) {
+                UniValue row{candles[i]};
+                if (i + 1 == candles.size()) row.pushKV("last_sequence", row["last_sequence"].getInt<uint64_t>() + ahead);
+                rows.push_back(row);
+            }
+            result.pushKV("candles", rows);
+        }
         if (inject && method == "markets") {
             UniValue rows{UniValue::VARR};
             for (auto row : result.getValues()) {
@@ -6276,6 +6291,69 @@ flowmesh::MarketDataQuery TickPage()
     return query;
 }
 } // namespace
+
+BOOST_AUTO_TEST_CASE(remote_candles_are_checked_against_a_head_verified_after_the_page)
+{
+    LiveMarket live{*this, m_path_root / "remote-candles-race", {}, {16}, {}, {true}, {node::FLOWMESH_API_CANDLES_DEFAULT}};
+    // Past the observed-time warm-up this quorum-holding node stamps live.
+    std::this_thread::sleep_for(std::chrono::milliseconds{4600});
+    live.Deposit();
+    TickProxy proxy{.upstream = live.Endpoint()};
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "remote-candles-race-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    flowmesh::MarketDataQuery query;
+    query.ticks = flowmesh::ClearingTickQuery{std::nullopt, 16};
+    query.observed_time = true;
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, query, error), error);
+    const auto held{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(held, error);
+    BOOST_REQUIRE_EQUAL(held->snapshot.next_microblock_sequence, 2U);
+
+    // The endpoint certifies another auction between this client's market
+    // read and its candles read, as on any active market: the endpoint's
+    // forming candle now ends past the head the client verified.
+    live.Certify(SignedCancel(0));
+    const auto page{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(page, error);
+    BOOST_CHECK_MESSAGE(page->available, page->unavailable_reason);
+    BOOST_REQUIRE(!page->candles.empty());
+    BOOST_CHECK_EQUAL(page->candles.back().last_sequence, 2U);
+    // Accepted against the endpoint's head, verified after the page: the
+    // client's head (with its ticks and their times) is at the page's end.
+    const auto after{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(after, error);
+    BOOST_CHECK_EQUAL(after->snapshot.next_microblock_sequence, 3U);
+    BOOST_REQUIRE(after->ticks && after->ticks->available);
+    BOOST_CHECK_EQUAL(after->ticks->ticks.back().sequence, 2U);
+    BOOST_REQUIRE(after->observed && after->observed->available);
+    std::set<uint64_t> timed;
+    for (const auto& row : after->observed->rows) {
+        if (row.mode == flowmesh::ObservedMode::LIVE) timed.insert(row.sequence);
+    }
+    BOOST_CHECK(timed.contains(1) && timed.contains(2));
+
+    // Fail closed: a page whose newest candle goes past any head the
+    // endpoint can prove is refused, after the head refresh.
+    {
+        std::lock_guard lock{proxy.mutex};
+        proxy.candles_ahead = 1000;
+    }
+    const auto refused{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_CHECK(!refused);
+    BOOST_CHECK_MESSAGE(error.find("past the endpoint's verified head") != std::string::npos, error);
+    {
+        std::lock_guard lock{proxy.mutex};
+        proxy.candles_ahead = 0;
+    }
+    // (Past the endpoint's two candle pages a second for this client.)
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    const auto again{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(again, error);
+    BOOST_CHECK_EQUAL(again->candles.back().last_sequence, 2U);
+    client.reset();
+}
 
 BOOST_AUTO_TEST_CASE(remote_client_holds_endpoint_ticks_bound_to_its_verified_head)
 {

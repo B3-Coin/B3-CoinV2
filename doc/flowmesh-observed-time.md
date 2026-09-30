@@ -154,13 +154,20 @@ Replies label the section with the endpoint's URL or say why there is none
 (`endpoint_does_not_advertise_observed_time`, `observed_time_not_yet_received`).
 
 `Candles` asks the endpoint serving the market's data, only when it
-advertises candles. The work gate is held only to read that endpoint and the
-verified head, never across the request, which uses a lane with its own TLS
-connection (busy fails at once), so an order never waits for a candles page.
-The page is structure-checked (interval, window, aligned ascending opens,
-non-overlapping sequences none past the verified head, consistent prices,
-exact volumes) and stays labelled endpoint-reported: its prices, volumes and
-times are the endpoint's claims.
+advertises candles. The work gate is not held across the request, which uses a
+lane with its own TLS connection (busy fails at once), so an order never waits
+for a candles page. The page is structure-checked (interval, window, aligned
+ascending opens, non-overlapping sequences, consistent prices, exact volumes)
+and no candle may go past a head this client verified. The endpoint's forming
+candle ends at the endpoint's own head, which on an active market is nearly
+always a few auctions past the head the client verified before the request
+(round trip plus verification, at about five auctions a second). So a page
+that reaches past the held head is checked against a consistent head: the
+endpoint's head verified after the page was served, by the same refresh a
+market-data read makes (with its ticks and their times). An honest endpoint's
+head is then at or past every candle it served; a page that still goes past
+it, or a change of endpoint meanwhile, is refused. The page stays labelled
+endpoint-reported: its prices, volumes and times are the endpoint's claims.
 
 ## 5. Qt
 

@@ -3565,9 +3565,16 @@ public:
     /** The endpoint serving this market's data, asked for one page of its
      * observed-time candles, only when it advertises them. Endpoint-reported
      * display data: only the page's structure and that no candle goes past
-     * the verified head are checked. The work gate is held only to read the
-     * endpoint and head, never across the request, so an order never waits
-     * for a candles page; a busy candles lane fails at once. */
+     * a head this client verified are checked. The work gate is not held
+     * across the candles request, so an order never waits for a candles
+     * page; a busy candles lane fails at once.
+     *
+     * The endpoint's forming candle ends at its own head, which on an
+     * active market is nearly always past the head this client verified
+     * before the request. Such a page is checked against a consistent head:
+     * the endpoint's current head, verified after the page was served (an
+     * ordinary Refresh, as a market-data read makes). A page that still goes
+     * past it, or an endpoint that changed meanwhile, is refused. */
     std::optional<flowmesh::ObservedCandlePage> Candles(const uint256& id, const flowmesh::CandleInterval interval,
                                                         const std::optional<int64_t> before_ms, const size_t limit,
                                                         std::string& error) override
@@ -3626,18 +3633,52 @@ public:
                 Fail(text);
             }
             if (reply.status != 200) Fail("Unexpected HTTPS response status");
-            auto page{FlowMeshParseObservedCandles(parsed["result"], interval, head_sequence, error)};
+            // The structure first; the head is checked below.
+            auto page{FlowMeshParseObservedCandles(parsed["result"], interval, std::numeric_limits<uint64_t>::max(), error)};
             if (!page) {
                 m_display_https.Reset();
                 return std::nullopt;
             }
             page->remote = true;
             page->source = target.url;
+            const uint64_t newest{page->candles.empty() ? 0 : page->candles.back().last_sequence};
+            if (newest > head_sequence) {
+                timing.Field("head_refresh", uint64_t{1});
+                if (!ConsistentCandlesHead(id, endpoint, newest, error)) return std::nullopt;
+            }
             return page;
         } catch (const std::exception& e) {
             m_display_https.Reset();
             error = e.what();
             return std::nullopt;
+        }
+    }
+    /** Under m_work: a page whose newest candle ends at `newest`, from
+     * `endpoint`, is consistent with a head this client verified. The page
+     * was served before this call, so an honest endpoint's head now is at or
+     * past it; a head refresh verifies that head (with its ticks and their
+     * observed times, as the caller's next market-data read would). */
+    bool ConsistentCandlesHead(const uint256& id, const size_t endpoint, const uint64_t newest, std::string& error)
+    {
+        WorkLock lock{*this};
+        try {
+            const auto held = [&]() -> const Cache& {
+                const auto it{m_cache.find(id)};
+                if (it == m_cache.end()) Fail("Read this market's data before its candles");
+                if (it->second.endpoint != endpoint) Fail("The market's endpoint changed during the candles read");
+                return it->second;
+            };
+            if (held().verified.certified.entry.sequence >= newest) return true;
+            auto ticks{TicksAfterRing(id)};
+            ticks.observed = true;
+            auto& cache{Refresh(id, held().account_scope, flowmesh::MarketDataQuery{}, &ticks)};
+            MergeTicks(id, cache, ticks);
+            // The endpoint cannot prove a head its own candles reach.
+            if (held().verified.certified.entry.sequence < newest) Fail("endpoint_candles_rejected: a candle goes past the endpoint's verified head");
+            return true;
+        } catch (const std::exception& e) {
+            error = e.what();
+            return false;
         }
     }
     std::optional<flowmesh::MarketData> Watch(const uint256& id, const std::optional<uint256>& account,
