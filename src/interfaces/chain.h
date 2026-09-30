@@ -858,6 +858,15 @@ public:
         watch.status = "unsupported";
         return flowMeshMarketData(market_id, account_id, query, error);
     }
+    //! One page of a market's operator-observed UTC candles, display only
+    //! (FlowMeshTradingBackend::Candles).
+    virtual std::optional<flowmesh::ObservedCandlePage> flowMeshCandles(
+        const uint256& market_id, flowmesh::CandleInterval interval, std::optional<int64_t> before_ms,
+        size_t limit, std::string& error)
+    {
+        error = "FlowMesh observed-time candles are not available in this node";
+        return std::nullopt;
+    }
     //! Current active-chain registry fact (not the 30-deep runtime view).
     virtual bool flowMeshMarketEstablished(const uint256& market_id) = 0;
     virtual bool submitFlowMeshAction(const uint256& market_id,

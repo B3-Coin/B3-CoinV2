@@ -2248,6 +2248,46 @@ std::optional<flowmesh::MarketData> FlowMeshService::MarketData(
     return out;
 }
 
+std::optional<flowmesh::ObservedCandlePage> FlowMeshService::ObservedCandles(
+    const flowmesh::MarketId& market_id, const flowmesh::CandleInterval interval,
+    const std::optional<int64_t> before_ms, size_t limit, const bool allow_disk, std::string& error) const
+{
+    std::shared_ptr<FlowMeshObservedTimeLog> log;
+    {
+        std::lock_guard<std::mutex> lock{m_impl->mutex};
+        const auto it{m_impl->markets.find(market_id)};
+        if (it == m_impl->markets.end()) {
+            error = "Unknown FlowMesh market";
+            return std::nullopt;
+        }
+        log = it->second->observed;
+    }
+    limit = std::clamp<size_t>(limit, 1, flowmesh::OBSERVED_CANDLE_PAGE_MAX);
+    if (!log) {
+        flowmesh::ObservedCandlePage out;
+        out.interval = interval;
+        out.unavailable_reason = "not_recorded_by_this_node";
+        out.source = "this_node";
+        return out;
+    }
+    auto page{log->Candles(interval, before_ms, limit)};
+    page.source = "this_node";
+    if (!allow_disk) return page;
+    // The window reaches before the memory window: the database holds the
+    // older candles (the memory window is always the newest).
+    const auto oldest{log->OldestMemoryOpen(interval)};
+    if (oldest && page.from_ms >= *oldest) return page;
+    const int64_t disk_before{oldest ? std::min(page.before_ms, *oldest) : page.before_ms};
+    bool older{false};
+    auto disk{m_impl->observed_store->ReadCandles(market_id, interval, page.from_ms, disk_before, limit, &older)};
+    for (auto& candle : page.candles) {
+        if (disk.empty() || candle.open_ms > disk.back().open_ms) disk.push_back(std::move(candle));
+    }
+    page.candles = std::move(disk);
+    page.more = older;
+    return page;
+}
+
 std::optional<flowmesh::ClientStateEvidence> FlowMeshService::ClientSnapshot(
     const flowmesh::MarketId& market_id, std::string& error) const
 {

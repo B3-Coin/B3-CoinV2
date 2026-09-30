@@ -8,6 +8,7 @@
 #include <node/flowmesh_client_join.h>
 #include <node/flowmesh_https.h>
 #include <univalue.h>
+#include <util/int128.h>
 
 #include <chrono>
 #include <cstddef>
@@ -84,6 +85,17 @@ public:
     //! Fresh read-only HTTPS availability probe. Never signs, retries an action,
     //! resets an outbox/cursor or changes configured trust. Busy fails promptly.
     virtual FlowMeshClientReconnectResult Reconnect() { return {}; }
+    //! One page of a market's operator-observed UTC candles (display only,
+    //! never certified). The local engine may page its disk beyond the
+    //! memory window; a remote backend asks the endpoint that serves its
+    //! market data, only when that endpoint advertises candles, and labels
+    //! them endpoint-reported. Never signs or sends an action.
+    virtual std::optional<flowmesh::ObservedCandlePage> Candles(const uint256& market, flowmesh::CandleInterval interval,
+                                                                std::optional<int64_t> before_ms, size_t limit, std::string& error)
+    {
+        error = "This trading backend does not serve observed-time candles";
+        return std::nullopt;
+    }
     virtual std::optional<interfaces::FlowMeshPendingCheckpoint> Checkpoint(const uint256& market, std::string& error) = 0;
     virtual std::vector<interfaces::FlowMeshVaultOperation> VaultOperations(const std::optional<uint256>& market, std::string& error) = 0;
     virtual std::optional<interfaces::FlowMeshVaultOperation> VaultOperation(const uint256& effect, std::string& error) = 0;
@@ -201,6 +213,10 @@ std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(
 
 //! Shared public projection used by the wallet RPC and restricted endpoint.
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);
+//! One page of operator-observed candles (getflowmeshcandles and the
+//! restricted API's 'candles'): volumes are exact decimal strings.
+UniValue FlowMeshObservedCandlePageJson(const flowmesh::ObservedCandlePage& page);
+std::string FlowMeshUnsigned128Text(util::Unsigned128 value);
 //! The event page part of an 'updates' reply (cursor, gap, more, event ids
 //! and events), ordinary or watched.
 UniValue FlowMeshClientUpdatesPageJson(const flowmesh::ClientEventPage& page);

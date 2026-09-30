@@ -1354,6 +1354,101 @@ RPCHelpMan getflowmeshmarketdata()
         }};
 }
 
+RPCHelpMan getflowmeshcandles()
+{
+    using T = RPCResult::Type;
+    return RPCHelpMan{
+        "getflowmeshcandles",
+        "Read one page of a market's candles in operator-observed time: UTC-aligned buckets of the clearings the serving node applied "
+        "while caught up with the network, by that node's own clock. Display only and never certified: microblocks carry no execution time. "
+        "An entry the node applied late is counted only when its whole time bound lies inside one bucket (flag late); otherwise it is in no "
+        "candle and the buckets it may belong to are flagged partial. Nothing is interpolated and empty buckets are not returned: two candles "
+        "whose sequences are consecutive (the later without seam_before) prove that no auction happened between them; anything else is a gap. "
+        "With the local engine, older pages come from this node's observed-time database; a remote client asks the endpoint that serves its "
+        "market data, only when that endpoint advertises candles, and those prices, volumes and times are the endpoint's claims.",
+        {
+            {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Market id"},
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Page options", {
+                {"interval", RPCArg::Type::STR, RPCArg::Default{"1m"}, "1m, 5m, 15m, 1h, 4h or 1d"},
+                {"before_ms", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Exclusive end of the window in Unix milliseconds; omit for the newest"},
+                {"limit", RPCArg::Type::NUM, RPCArg::Default{200}, "Window length in intervals, 1-500"},
+            }},
+        },
+        RPCResult{T::OBJ, "", "Candles in the window [before_ms - limit x interval, before_ms), oldest first", {
+            {T::BOOL, "available", "The source records observed time"},
+            {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, endpoint_does_not_advertise_candles, or why the endpoint's page was refused"},
+            {T::STR, "source", "this_node, or the endpoint URL that reported them"},
+            {T::STR, "source_kind", "operator_observed"},
+            {T::BOOL, "certified", "Always false"},
+            {T::BOOL, "endpoint_reported", "Prices, volumes and times are the endpoint's claims, not verified here"},
+            {T::STR, "interval", "The interval"},
+            {T::NUM, "interval_ms", "Its length in milliseconds"},
+            {T::NUM, "from_ms", "Inclusive start of the window"},
+            {T::NUM, "before_ms", "Exclusive end of the window"},
+            {T::BOOL, "more", "Older candles exist: continue with before_ms = from_ms"},
+            {T::ARR, "candles", "Only buckets holding placed entries", {
+                {T::OBJ, "", "One bucket", {
+                    {T::NUM, "open_ms", "UTC-aligned bucket start"},
+                    {T::NUM, "first_sequence", "First placed microblock"},
+                    {T::NUM, "last_sequence", "Last placed microblock"},
+                    {T::NUM, "entries", "Placed microblocks"},
+                    {T::NUM, "clearings", "Placed microblocks with a match"},
+                    {T::NUM, "open", /*optional=*/true, "First clearing price, B3 atoms per base unit (with a clearing)"},
+                    {T::NUM, "high", /*optional=*/true, "Highest clearing price"},
+                    {T::NUM, "low", /*optional=*/true, "Lowest clearing price"},
+                    {T::NUM, "close", /*optional=*/true, "Last clearing price"},
+                    {T::STR, "base_volume", "Exact matched base units, decimal"},
+                    {T::STR, "quote_volume", "Exact matched B3 atoms (price x volume per clearing), decimal"},
+                    {T::ARR, "flags", "partial, late, seam_before or clock", {
+                        {T::STR, "", "Flag"},
+                    }},
+                }},
+            }},
+        }},
+        RPCExamples{HelpExampleCli("getflowmeshcandles", "\"<market_id>\" '{\"interval\":\"5m\",\"limit\":100}'")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            const uint256 market_id{ParseMarketId(request.params[0])};
+            const UniValue& options{request.params[1]};
+            flowmesh::CandleInterval interval{flowmesh::CandleInterval::M1};
+            std::optional<int64_t> before_ms;
+            size_t limit{200};
+            if (!options.isNull()) {
+                if (!options.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "options must be an object");
+                for (const auto& key : options.getKeys()) {
+                    if (key != "interval" && key != "before_ms" && key != "limit") throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown option '" + key + "'");
+                }
+                if (options.exists("interval")) {
+                    if (!options["interval"].isStr()) throw JSONRPCError(RPC_TYPE_ERROR, "interval must be a string");
+                    const auto parsed{flowmesh::ParseCandleInterval(options["interval"].get_str())};
+                    if (!parsed) throw JSONRPCError(RPC_INVALID_PARAMETER, "interval must be 1m, 5m, 15m, 1h, 4h or 1d");
+                    interval = *parsed;
+                }
+                const auto number = [&](const char* name, const uint64_t minimum, const uint64_t maximum) {
+                    const auto& value{options[name]};
+                    uint64_t out{0};
+                    try {
+                        if (!value.isNum()) throw UniValue::type_error{name};
+                        out = value.getInt<uint64_t>();
+                    } catch (const std::runtime_error&) {
+                        throw JSONRPCError(RPC_TYPE_ERROR, std::string{name} + " must be a nonnegative integer");
+                    }
+                    if (out < minimum || out > maximum) throw JSONRPCError(RPC_INVALID_PARAMETER, std::string{name} + " is outside its supported range");
+                    return out;
+                };
+                if (options.exists("before_ms")) before_ms = static_cast<int64_t>(number("before_ms", 0, std::numeric_limits<int64_t>::max()));
+                if (options.exists("limit")) limit = number("limit", 1, 500);
+            }
+            std::string error;
+            const auto page{wallet->chain().flowMeshCandles(market_id, interval, before_ms, limit, error)};
+            if (!page) throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "FlowMesh candles are unavailable" : error);
+            UniValue out{node::FlowMeshObservedCandlePageJson(*page)};
+            out.pushKV("endpoint_reported", page->remote);
+            return out;
+        }};
+}
+
 RPCHelpMan getflowmeshbalance()
 {
     return RPCHelpMan{

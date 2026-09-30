@@ -1290,6 +1290,17 @@ public:
         if (m_node.flowmesh) return node::MakeLocalFlowMeshBackend(*m_node.flowmesh)->Watch(market_id, account_id, query, wait, watch, error);
         return interfaces::Chain::flowMeshWatchMarketData(market_id, account_id, query, wait, watch, error);
     }
+    std::optional<flowmesh::ObservedCandlePage> flowMeshCandles(
+        const uint256& market_id, const flowmesh::CandleInterval interval, const std::optional<int64_t> before_ms,
+        const size_t limit, std::string& error) override
+    {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Candles(market_id, interval, before_ms, limit, error);
+        if (!m_node.flowmesh) {
+            error = "FlowMesh service is not available in this node";
+            return std::nullopt;
+        }
+        return m_node.flowmesh->ObservedCandles(market_id, interval, before_ms, limit, /*allow_disk=*/true, error);
+    }
     bool flowMeshMarketEstablished(const uint256& market_id) override
     {
         LOCK(::cs_main);

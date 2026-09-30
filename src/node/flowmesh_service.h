@@ -206,6 +206,13 @@ public:
         const flowmesh::MarketId& market_id,
         const std::optional<flowmesh::AccountId>& account,
         const flowmesh::MarketDataQuery& query, std::string& error) const;
+    /** One page of this node's operator-observed UTC candles for a market
+     * (display only): a time window [before - limit x interval, before),
+     * from the memory window, and with `allow_disk` also from the
+     * observed-time database beyond it. Never takes the market lock. */
+    std::optional<flowmesh::ObservedCandlePage> ObservedCandles(
+        const flowmesh::MarketId& market_id, flowmesh::CandleInterval interval,
+        std::optional<int64_t> before_ms, size_t limit, bool allow_disk, std::string& error) const;
     std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
         const flowmesh::MarketId& market_id, std::string& error) const;
     std::optional<FlowMeshClientSnapshotView> ClientSnapshotView(

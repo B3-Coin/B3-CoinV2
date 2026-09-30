@@ -123,6 +123,52 @@ static UniValue ObservedTimesJson(const flowmesh::ObservedTimes& value)
     out.pushKV("rows", std::move(rows));
     return out;
 }
+std::string FlowMeshUnsigned128Text(util::Unsigned128 value)
+{
+    std::string out;
+    do {
+        out.insert(out.begin(), static_cast<char>('0' + static_cast<unsigned>(value % 10)));
+        value /= 10;
+    } while (value != 0);
+    return out;
+}
+UniValue FlowMeshObservedCandlePageJson(const flowmesh::ObservedCandlePage& page)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("available", page.available);
+    if (!page.available) out.pushKV("unavailable_reason", page.unavailable_reason);
+    out.pushKV("source", page.source);
+    out.pushKV("source_kind", "operator_observed");
+    out.pushKV("certified", false);
+    out.pushKV("interval", flowmesh::CandleIntervalName(page.interval));
+    out.pushKV("interval_ms", flowmesh::CandleIntervalMs(page.interval));
+    out.pushKV("from_ms", page.from_ms);
+    out.pushKV("before_ms", page.before_ms);
+    out.pushKV("more", page.more);
+    UniValue candles{UniValue::VARR};
+    for (const auto& candle : page.candles) {
+        UniValue row{UniValue::VOBJ};
+        row.pushKV("open_ms", candle.open_ms);
+        row.pushKV("first_sequence", candle.first_sequence);
+        row.pushKV("last_sequence", candle.last_sequence);
+        row.pushKV("entries", uint64_t{candle.entries});
+        row.pushKV("clearings", uint64_t{candle.clearings});
+        if (candle.clearings > 0) {
+            row.pushKV("open", candle.open);
+            row.pushKV("high", candle.high);
+            row.pushKV("low", candle.low);
+            row.pushKV("close", candle.close);
+        }
+        row.pushKV("base_volume", FlowMeshUnsigned128Text(candle.base_volume));
+        row.pushKV("quote_volume", FlowMeshUnsigned128Text(candle.quote_volume));
+        UniValue flags{UniValue::VARR};
+        for (const auto& name : flowmesh::ObservedCandleFlagNames(candle.flags)) flags.push_back(name);
+        row.pushKV("flags", std::move(flags));
+        candles.push_back(std::move(row));
+    }
+    out.pushKV("candles", std::move(candles));
+    return out;
+}
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data)
 {
     UniValue out{UniValue::VOBJ};

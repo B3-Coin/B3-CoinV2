@@ -5,6 +5,8 @@
 
 #include <node/flowmesh_observed_time_log.h>
 
+#include <node/flowmesh_client.h>
+
 #include <test/util/setup_common.h>
 #include <util/fs.h>
 
@@ -370,6 +372,33 @@ BOOST_AUTO_TEST_CASE(blocked_flush_never_blocks_record_or_reads)
     store.SetFlushHookForTest({});
     store.Stop();
     BOOST_CHECK(log->GetSummary().persisted);
+}
+
+BOOST_AUTO_TEST_CASE(candle_page_json_exact_volumes_and_labels)
+{
+    FakeClocks clocks;
+    const auto log{MakeLog(clocks)};
+    log->Record(0, EntryHash(0), ObservedDelay::NONE, std::nullopt);
+    clocks.Advance(61'000);
+    log->Record(1, EntryHash(1), ObservedDelay::NONE, Tick(1, MAX_MONEY, MAX_MONEY));
+    auto page{log->Candles(CandleInterval::M1, std::nullopt, 10)};
+    page.source = "this_node";
+    const auto json{node::FlowMeshObservedCandlePageJson(page)};
+    BOOST_CHECK_EQUAL(json["source_kind"].get_str(), "operator_observed");
+    BOOST_CHECK(!json["certified"].get_bool());
+    BOOST_CHECK_EQUAL(json["interval"].get_str(), "1m");
+    BOOST_CHECK_EQUAL(json["interval_ms"].getInt<int64_t>(), 60'000);
+    const auto& candles{json["candles"]};
+    BOOST_REQUIRE_EQUAL(candles.size(), 2U);
+    // No prices without a clearing.
+    BOOST_CHECK(!candles[0].exists("open"));
+    BOOST_CHECK_EQUAL(candles[0]["base_volume"].get_str(), "0");
+    BOOST_CHECK_EQUAL(candles[1]["open"].getInt<int64_t>(), MAX_MONEY);
+    BOOST_CHECK_EQUAL(candles[1]["base_volume"].get_str(), "662200000000000000");
+    // MAX_MONEY squared needs more than 64 bits and is exact.
+    BOOST_CHECK_EQUAL(candles[1]["quote_volume"].get_str(), "438508840000000000000000000000000000");
+    BOOST_CHECK_EQUAL(candles[1]["flags"].size(), 0U);
+    BOOST_CHECK_EQUAL(candles[0]["flags"][0].get_str(), "seam_before");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

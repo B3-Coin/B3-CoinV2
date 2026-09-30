@@ -325,6 +325,14 @@ public:
         }
         return out;
     }
+    //! This node's own observed-time candles. Only a local caller pages the
+    //! disk beyond the memory window; the public API serves memory only.
+    std::optional<flowmesh::ObservedCandlePage> Candles(const uint256& id, const flowmesh::CandleInterval interval,
+                                                        const std::optional<int64_t> before_ms, const size_t limit,
+                                                        std::string& error) override
+    {
+        return m_service.ObservedCandles(id, interval, before_ms, limit, /*allow_disk=*/!m_public_api, error);
+    }
     std::optional<flowmesh::MarketData> Data(const uint256& id, const std::optional<uint256>& account,
                                           const flowmesh::MarketDataQuery& query, std::string& error) override
     {
