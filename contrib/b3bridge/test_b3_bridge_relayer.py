@@ -550,7 +550,7 @@ class RelayerTests(unittest.TestCase):
         args = SimpleNamespace(
             ethereum_chain_id=1, trusted_root=ROOT_B, start_block=None,
             b3_confirmations=1, beacon_url="https://beacon.invalid",
-            payload_tool="ethcheck")
+            payload_tool="ethcheck", dry_run=False)
         primary = FakeRpc({
             "eth_chainId": "0x1",
             "eth_getCode": pinned_code,
@@ -584,7 +584,7 @@ class RelayerTests(unittest.TestCase):
         args = SimpleNamespace(
             ethereum_chain_id=1, trusted_root=ROOT_B, start_block=None,
             b3_confirmations=1, beacon_url="https://beacon.invalid",
-            work_root=None, payload_tool="ethcheck", scan_chunk=100)
+            work_root=None, payload_tool="ethcheck", scan_chunk=100, dry_run=False)
         primary = FakeRpc({
             "eth_chainId": "0x1",
             "eth_getCode": pinned_code,
@@ -918,7 +918,7 @@ class RelayerTests(unittest.TestCase):
             self.assertFalse(any(method == "sendrawtransaction"
                                  for method, _ in node.calls))
 
-    def test_conflicted_wallet_transaction_is_reprepared(self):
+    def test_conflicted_wallet_transaction_is_preserved_for_reconciliation(self):
         with tempfile.TemporaryDirectory() as directory:
             state = relayer.State(Path(directory) / "state.sqlite3")
             state.bind({"bridge": 1}, 1)
@@ -946,14 +946,16 @@ class RelayerTests(unittest.TestCase):
                     "code": -5, "message": "not found"}),
                 "sendrawtransaction": "bb" * 32})
             relayer.process_jobs(state, node, wallet, 1, False, 2000, 10000)
-            self.assertEqual(state.first()["state"], "planned")
+            self.assertEqual(state.first()["state"], "prepared")
             relayer.process_jobs(state, node, wallet, 1, False, 2000, 10000)
             row = state.first()
-            self.assertEqual(prepared, ["aa" * 32, "bb" * 32])
-            self.assertEqual(row["txid"], "bb" * 32)
-            self.assertEqual(row["state"], "broadcast")
+            self.assertEqual(prepared, ["aa" * 32])
+            self.assertEqual(row["txid"], "aa" * 32)
+            self.assertEqual(row["state"], "prepared")
+            self.assertEqual(row["fee_atoms"], 1000)
+            self.assertFalse(any(method == "sendrawtransaction" for method, _ in node.calls))
 
-    def test_node_reported_input_conflict_is_reprepared_next_cycle(self):
+    def test_node_reported_input_conflict_retries_same_bytes_next_cycle(self):
         with tempfile.TemporaryDirectory() as directory:
             state = relayer.State(Path(directory) / "state.sqlite3")
             state.bind({"bridge": 1}, 1)
@@ -973,7 +975,7 @@ class RelayerTests(unittest.TestCase):
                 if len(send_count) == 1:
                     raise relayer.RpcError({
                         "code": -26, "message": "txn-mempool-conflict"})
-                return "bb" * 32
+                return "aa" * 32
 
             not_found = relayer.RpcError({"code": -5,
                                           "message": "not found"})
@@ -986,10 +988,11 @@ class RelayerTests(unittest.TestCase):
                 "getmempoolentry": not_found,
                 "sendrawtransaction": send})
             relayer.process_jobs(state, node, wallet, 1, False, 2000, 10000)
-            self.assertEqual(state.first()["state"], "planned")
+            self.assertEqual(state.first()["state"], "prepared")
             relayer.process_jobs(state, node, wallet, 1, False, 2000, 10000)
             self.assertEqual(state.first()["state"], "broadcast")
-            self.assertEqual(state.first()["txid"], "bb" * 32)
+            self.assertEqual(state.first()["txid"], "aa" * 32)
+            self.assertEqual(prepared, ["aa" * 32])
 
     def test_wallet_conflict_discovered_after_send_is_bounded_to_next_cycle(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1019,8 +1022,9 @@ class RelayerTests(unittest.TestCase):
                 "sendrawtransaction": relayer.RpcError({
                     "code": -26, "message": "txn-mempool-conflict"})})
             relayer.process_jobs(state, node, wallet, 1, False, 2000, 10000)
-            self.assertEqual(state.first()["state"], "planned")
-            self.assertIsNone(state.first()["txid"])
+            self.assertEqual(state.first()["state"], "prepared")
+            self.assertEqual(state.first()["txid"], txid)
+            self.assertEqual(state.first()["fee_atoms"], 1000)
             self.assertEqual(sum(method == "submitbridgecarrier"
                                  for method, _ in wallet.calls), 1)
 

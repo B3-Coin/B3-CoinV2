@@ -61,7 +61,7 @@ class SchedulingTests(unittest.TestCase):
         self.state.add_plan([{"kind": "mint", "payload_hex": "03"}])
         with self.mocked_cycle() as (emit, process, scan):
             self.cycle()
-            self.assertEqual(emit.call_count, 1)
+            emit.assert_not_called()
             process.assert_called_once()
             scan.assert_not_called()
         self.assertEqual([row["kind"] for row in self.state.pending()], ["mint"])

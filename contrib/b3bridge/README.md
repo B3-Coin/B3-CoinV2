@@ -107,7 +107,7 @@ binaries under `bin/` and the relayer, helpers, tests, and this guide under
 offline recovery suite before configuring credentials:
 
 ```sh
-python3 contrib/b3bridge/test_b3_bridge_relayer.py
+python3 -m unittest discover -s contrib/b3bridge -p 'test_*.py' -v
 ```
 
 The operator examples below use the unpacked-archive path `./bin/`. In a
@@ -459,6 +459,36 @@ transaction and `getbridgeproofstatus` with the B3 node before retrying; an
 unknown response is not proof that no transaction was sent. A per-database
 process lock prevents competing local daemon instances.
 
+Reorg reconciliation now invalidates affected connection observations without
+discarding any original transaction ID, signed bytes or reserved network fee.
+It preserves verified payload dependency order and does not reactivate unused
+superseded plans. A wallet conflict, missing-input error or mempool conflict
+is not proof that a prepared transaction can never settle. The relayer reports
+`job_waiting_conflict_resolution` and reconciles its exact original effect on
+later cycles; it does not automatically prepare a replacement. If the original
+can be sent again, the retry uses its exact recorded bytes. A permanently spent
+input may require separately reviewed operator recovery; do not edit/reset the
+database to obtain a new transaction. Inconsistent pending state or missing
+transaction/fee evidence fails before preparation or broadcast. These checks
+cannot reconstruct history already erased by older software or authenticate a
+coherently rewritten database.
+
+Already verified pending deposits/backfills and prepared sync work are drained
+before OPTIONAL fresh beacon proof capture. Their pinned bridge identity,
+provider runtime-code checks, unchanged finalized B3 light-client snapshot,
+transaction/effect reconciliation, B3 finality and fee checks remain mandatory.
+This does not accept an unverified proof, extend Ethereum fork support, or
+permit a stale mint that B3 consensus rejects. Pristine optional sync work and
+new deposit discovery still require independently verified fresh planning.
+Dry-run mode never enters the live pending-plan submission path.
+
+The source repair is covered by `test_relayer_recovery_preservation.py` plus
+the existing relay, scheduling, cache and coalescing suites. It repairs relay
+bookkeeping/liveness only: it does not release orphaned validator locks,
+establish a safe conflicting-certificate recovery, renew an immutable expired
+Ethereum verifier, or demonstrate deployed bridge operation. No consensus,
+quorum, signer-journal or contract change is included.
+
 On the first run with authenticated receipt-root scanning, a database created
 by the preview relayer replays once from the immutable deployment height. This
 is intentional: the old `eth_getLogs` cursor is not accepted as proof that no
@@ -475,7 +505,8 @@ the managed work root before the retention limit removes them. Increasing the
 limit consumes disk, so monitor both the work-root filesystem and database.
 
 Standard error is newline-delimited JSON suitable for an operator log. Alert
-on `cycle_failed`, repeated `job_waiting_finality`, and a cursor that stops
+on `cycle_failed`, repeated `job_waiting_finality` or
+`job_waiting_conflict_resolution`, and a cursor that stops
 moving. In daemon mode a failed cycle is retried after `--poll-seconds`; in
 `--one-shot` mode a failed cycle exits nonzero for monitoring and CI.
 

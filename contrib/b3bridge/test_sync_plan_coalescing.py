@@ -173,13 +173,13 @@ class SyncPlanCoalescingTests(unittest.TestCase):
         with self.assertRaisesRegex(RelayerError, "invalid durable"):
             self.state.first()
 
-    def test_reorg_reopen_discards_order_bound_to_previous_snapshot(self):
+    def test_reorg_reopen_preserves_exact_payload_dependency_order(self):
         self.state.add_plan([record(2), record(1)])
         self.state.coalesce_verified_sync_plan([record(1), record(2)])
         self.state.reopen_from(1)
-        self.assertIsNone(self.state.db.execute(
+        self.assertIsNotNone(self.state.db.execute(
             "SELECT value FROM meta WHERE key='verified_sync_order'").fetchone())
-        self.assertEqual(self.payloads(), ["0002", "0001"])
+        self.assertEqual(self.payloads(), ["0001", "0002"])
 
 
 if __name__ == "__main__":

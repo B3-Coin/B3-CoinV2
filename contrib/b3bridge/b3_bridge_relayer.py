@@ -680,12 +680,25 @@ class State:
             self.db.execute("DELETE FROM jobs WHERE id=?", (row_id,))
 
     def reopen_from(self, row_id):
+        """Invalidate connections, never forget potentially published bytes.
+
+        A local reorg does not prove a previously signed transaction cannot
+        still settle. Keep its exact identity and fee reservation. The stored
+        verified sync order records payload dependencies, not proof of their
+        current inclusion; retaining it does not waive process_jobs' checks.
+        Unused superseded plans are not resurrected by a chain observation.
+        """
         with self.tx():
-            self.db.execute("DELETE FROM meta WHERE key='verified_sync_order'")
-            self.db.execute("""UPDATE jobs SET state='planned',txid=NULL,raw_tx=NULL,
-                               effect_height=NULL,effect_block=NULL,
-                               fee_atoms=NULL,fee_day=NULL
-                               WHERE id>=?""", (row_id,))
+            if self.db.execute(
+                    "SELECT 1 FROM jobs WHERE id>=? AND state!='superseded' "
+                    "AND ((txid IS NULL)!=(raw_tx IS NULL)) LIMIT 1", (row_id,)).fetchone():
+                raise RelayerError("incomplete prepared bridge identity; inspect state without resetting it")
+            self.db.execute("""UPDATE jobs SET state=CASE
+                               WHEN state='confirmed' AND txid IS NOT NULL THEN 'broadcast'
+                               WHEN state='confirmed' THEN 'planned'
+                               ELSE state END,
+                               effect_height=NULL,effect_block=NULL
+                               WHERE id>=? AND state!='superseded'""", (row_id,))
 
     def prepared(self, row_id, txid, raw_tx, fee_atoms, fee_day,
                  max_fee_atoms, daily_fee_budget_atoms):
@@ -701,13 +714,20 @@ class State:
                     f"daily relayer fee budget exhausted for {fee_day}")
             changed = self.db.execute(
                 """UPDATE jobs SET state='prepared',txid=?,raw_tx=?,fee_atoms=?,fee_day=?
-                   WHERE id=? AND state='planned'""",
+                   WHERE id=? AND state='planned' AND txid IS NULL AND raw_tx IS NULL
+                   AND fee_atoms IS NULL AND fee_day IS NULL
+                   AND effect_height IS NULL AND effect_block IS NULL""",
                 (txid, raw_tx, fee_atoms, fee_day, row_id)).rowcount
             if changed != 1:
                 raise RelayerError("bridge job changed while reserving its network fee")
 
     def reset_transaction(self, row_id):
         with self.tx():
+            row = self.db.execute("SELECT * FROM jobs WHERE id=?", (row_id,)).fetchone()
+            if row is None or row["state"] != "planned" or any(
+                    row[field] is not None for field in
+                    ("txid", "raw_tx", "fee_atoms", "fee_day", "effect_height", "effect_block")):
+                raise RelayerError("cannot discard prepared bridge history; reconcile the original transaction")
             self.db.execute("""UPDATE jobs SET state='planned',txid=NULL,raw_tx=NULL,
                                effect_height=NULL,effect_block=NULL,
                                fee_atoms=NULL,fee_day=NULL WHERE id=?""", (row_id,))
@@ -1793,6 +1813,26 @@ def audit_confirmed(state, node, wallet, required):
         return
 
 
+def validate_pending_job(row):
+    """Reject incomplete/inconsistent local evidence before any wallet/send call.
+
+    This is a consistency check, not authentication of a coherently rewritten
+    database. It cannot restore transaction history lost by an older relayer.
+    """
+    history = ("txid", "raw_tx", "fee_atoms", "fee_day", "effect_height", "effect_block")
+    if row["state"] == "planned":
+        if any(row[field] is not None for field in history):
+            raise RelayerError("planned bridge job has transaction history; reconcile without overwriting it")
+        return
+    if row["state"] not in ("prepared", "broadcast") or any(
+            row[field] is None for field in ("txid", "raw_tx", "fee_atoms", "fee_day")):
+        raise RelayerError("incomplete prepared bridge history; inspect state without resetting it")
+    norm_hex(row["txid"], 32, False)
+    norm_hex(row["raw_tx"], prefix=False)
+    if not isinstance(row["fee_atoms"], int) or row["fee_atoms"] < 0 or not row["fee_day"]:
+        raise RelayerError("invalid prepared bridge fee history; inspect state without resetting it")
+
+
 def process_jobs(state, node, wallet, required, dry_run,
                  max_fee_atoms=None, daily_fee_budget_atoms=None):
     if dry_run:
@@ -1805,6 +1845,7 @@ def process_jobs(state, node, wallet, required, dry_run,
         row = state.first()
         if row is None:
             return
+        validate_pending_job(row)
         info = node.call("getbridgeinfo")
         if not info.get("active") or not info.get("state_available"):
             raise RelayerError("B3 bridge is not active with available state")
@@ -1846,8 +1887,7 @@ def process_jobs(state, node, wallet, required, dry_run,
             continue
         seen = confirmations(wallet, row["txid"])
         if seen is not None and seen < 0:
-            state.reset_transaction(row["id"])
-            log("job_reprepared", kind=row["kind"], txid=row["txid"],
+            log("job_waiting_conflict_resolution", kind=row["kind"], txid=row["txid"],
                 reason="wallet-conflict")
             return
         in_mempool = (mempool_has(node, row["txid"])
@@ -1865,20 +1905,16 @@ def process_jobs(state, node, wallet, required, dry_run,
             except RpcError as send_error:
                 seen = confirmations(wallet, row["txid"])
                 if seen is not None and seen < 0:
-                    state.reset_transaction(row["id"])
-                    log("job_reprepared", kind=row["kind"], txid=row["txid"],
+                    log("job_waiting_conflict_resolution", kind=row["kind"], txid=row["txid"],
                         reason="send-conflict")
-                    # Bound conflict recovery to one wallet preparation per
-                    # cycle.  A conflicting wallet transaction may keep
-                    # reporting the same abandoned txid until its wallet state
-                    # settles; spinning here could repeatedly reserve/release
-                    # fees and monopolize the daemon loop.
+                    # A conflict observation is not a finalized revocation of
+                    # the signed transaction. Preserve bytes and fee budget;
+                    # recheck its exact effect in a later bounded cycle.
                     return
                 if (seen is None or seen == 0) and mempool_has(node, row["txid"]):
                     seen = 0
                 elif transaction_conflict_error(send_error):
-                    state.reset_transaction(row["id"])
-                    log("job_reprepared", kind=row["kind"], txid=row["txid"],
+                    log("job_waiting_conflict_resolution", kind=row["kind"], txid=row["txid"],
                         reason="node-conflict")
                     return
                 elif seen is None or seen == 0:
@@ -1945,6 +1981,29 @@ def run_once(args, state, eth, witnesses, node, wallet, prefix):
     if info.get("light_client_bootstrapped"):
         store_snapshot = validate_store_snapshot(
             node.call("getbridgelightclientstore"), info)
+    if not args.dry_run:
+        pending = state.pending()
+        if any(row["kind"] not in ("bootstrap", "update") or
+               row["state"] != "planned" or row["txid"] is not None or
+               row["raw_tx"] is not None for row in pending):
+            # These records already contain the verified proof dependencies.
+            # A fresh beacon update is OPTIONAL for their reconciliation; its
+            # outage/unsupported horizon must not erase or indefinitely mask
+            # prepared work. Runtime pins above and B3 consensus/freshness,
+            # effect, finality and fee checks below are still mandatory.
+            rechecked_info = node.call("getbridgeinfo")
+            if bridge_identity(rechecked_info, eth_chain, args.trusted_root) != identity:
+                raise RelayerError("B3 bridge pins changed before pending-plan recovery")
+            rechecked_store = None
+            if rechecked_info.get("light_client_bootstrapped"):
+                rechecked_store = validate_store_snapshot(
+                    node.call("getbridgelightclientstore"), rechecked_info)
+            if store_snapshot_fingerprint(rechecked_store) != store_snapshot_fingerprint(store_snapshot):
+                raise RelayerError("B3 light-client store changed before pending-plan recovery; retry")
+            reconcile_pending_sync_effects(state, node, rechecked_info, finalized_height(node))
+            process_jobs(state, node, wallet, args.b3_confirmations, False,
+                         args.max_fee_atoms, args.daily_fee_budget_atoms)
+            return
     common = capture_common(args.beacon_url.rstrip("/"), args.trusted_root,
                             info, store_snapshot)
     sync_dir = Path(args.work_root) / "sync"
