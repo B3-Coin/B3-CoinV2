@@ -155,8 +155,12 @@ recheck and pool-drop notices count against it too. The runtime remembers it
 only while the action is live on this node, that is queued for the worker
 or held in its pool. It forgets the identity:
 
-- when the worker has handled the action's last queued frame, or the queue
-  refused it, and the pool does not hold the action;
+- when the worker has handled the action's last counted frame, or the queue
+  refused it, and the pool does not hold the action. A frame is counted
+  when a public submission queues it for a known identity, or while the
+  action is already remembered. The frame carries that mark, and only a
+  counted frame ends the count: this node's own frames and a public frame
+  with no identity never do;
 - when the pool drops the action, because it was certified or pruned.
 
 One case is not covered: a queued local frame that the runtime queue
@@ -169,8 +173,20 @@ rule as the ring: the 64-action share applies only once 2,048 are held. A
 client whose live actions are within its share therefore keeps their
 attribution unless at least 32 other identities hold live actions here at
 once. Actions whose lives have ended no longer count. A forgotten action's
-notices count as of unknown identity. The record costs under 1 MB per
-market.
+notices count as of unknown identity.
+
+This is a per-market memory bound driven by the public API, and it is
+twice e9facb6's 1,024-action bound. Each remembered action is one node in
+each of four ordered maps: its ActionId, its serial, and IdentityShares'
+serial-to-identity map and per-identity serial set. The identity string is
+held twice. "ipv6/64:" plus 16 hex digits is 24 characters, longer than
+libc++'s 22-character short-string buffer, so both copies are heap blocks.
+Estimated from libc++ node and allocation sizes on macOS arm64, not
+measured, that is about 0.3 KB per action when identities hold full shares
+and about 0.4 KB when every action comes from a different identity. The
+worst case is about 0.85 MB at 2,048 actions, under 1 MB. Each market has
+its own record. The owner has not yet accepted the larger bound; see
+"Review items left unchanged".
 
 A public deposit refused because its outpoint has no anchored facts appends
 no notice: it carries no credential, and the refusal is already in the
@@ -188,6 +204,22 @@ identity also share its 64: a busy NAT address, /64 or load balancer then
 keeps only its newest 64 notices. A remote client's evicted proof reads
 "unknown", which is safe. An already-included resubmission appends no
 notice at all.
+
+"Other identities" is weaker for IPv6 than it sounds. One identity is one
+IPv4 address or one IPv6 /64, and a single IPv6 customer commonly holds a
+/56 (256 /64s) or a /48 (65,536). One such customer can therefore present
+the 32 or more identities that the protection above assumes, and flood the
+ring and the attribution record alone. The effect is bounded to the
+best-effort part:
+
+- other clients' notices and attributions are evicted early, so their
+  outcomes read "unknown", or count against the unknown identity's share;
+- nothing becomes a false result: no notice is invented or moved to
+  another action, a certified outcome is never replaced, and "unknown"
+  stays unknown until it is proven.
+
+A coarser second share, for example per /48, applied only under pressure
+would narrow this. It is out of scope for this range.
 
 ## Foreground latency of outcome re-proofs
 
@@ -207,6 +239,12 @@ row per process.
 
 ## Review items left unchanged
 
+- **Attribution memory bound.** The per-market public attribution record
+  grew from e9facb6's 1,024 entries to 2,048, so that the 32-identity
+  guarantee matches the ring's (see "Local notice rings" for its cost). The
+  plan says DoS bounds may only tighten, so this needs the owner's explicit
+  acceptance. The alternative is to keep 1,024, which weakens the guarantee
+  to 16 identities for attributions.
 - **Decisive inclusion.** For an executed action that a Byzantine proposer
   re-includes as BAD_SEQUENCE, the opt-in 'action' reply and the local
   backend prefer the event ring's newest certified inclusion. They do not
