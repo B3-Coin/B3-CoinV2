@@ -2603,6 +2603,60 @@ private Q_SLOTS:
         QVERIFY(!panel.m_read_failed);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
+    void aFailedCandlesReadBacksOffAndKeepsLiveUpdates()
+    {
+        // Every candles read fails (as a remote client's did on any active
+        // market): each failure backs off, from 2 s and doubling, so live
+        // updates keep supplying the market read instead of the tick
+        // polling the market (and candles) twice a second.
+        FundingReadProbe probe; probe.live_ms = 2000; probe.data = RemoteDataWithTimes(); probe.candles_response = UniValue{};
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteDataWithTimes()));
+        panel.m_candle_interval = flowmesh::CandleInterval::M1;
+        Live(panel, probe);
+        panel.m_watch.mode = B3FlowMeshWatch::Mode::Live; panel.m_watch.last_ok_at = panel.m_watch_clock.elapsed();
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
+        // No page held: the window is due, so this tick reads it.
+        QVERIFY(panel.candlesDue()); QVERIFY(!panel.liveSkipsPoll());
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.candle_options.size(), size_t{1});
+        QVERIFY(!panel.m_read_failed);
+        // Failed: not due again for 2 s; meanwhile live updates supply the read.
+        panel.m_watch.last_ok_at = panel.m_watch_clock.elapsed();
+        QVERIFY(!panel.candlesDue());
+        QVERIFY(panel.liveSkipsPoll());
+        QVERIFY(panel.m_candles_failure);
+        QVERIFY(panel.m_candles_failure->retry_at - panel.m_watch_clock.elapsed() > 1500);
+        // The chart says why instead of reading forever.
+        panel.updateDataViews();
+        QVERIFY(!panel.m_chart->timeSeries().loading);
+        QVERIFY(panel.m_chart->timeSeries().reason.contains(QStringLiteral("Synthetic candles unavailable")));
+        // Once the back-off has passed it is read again; a second failure
+        // waits twice as long.
+        panel.m_candles_failure->retry_at = panel.m_watch_clock.elapsed();
+        QVERIFY(panel.candlesDue()); QCOMPARE(panel.candlesDue()->second, size_t{300});
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.candle_options.size(), size_t{2});
+        QCOMPARE(panel.m_candles_failure->failures, 2);
+        QVERIFY(panel.m_candles_failure->retry_at - panel.m_watch_clock.elapsed() > 3500);
+        panel.m_watch.last_ok_at = panel.m_watch_clock.elapsed();
+        QVERIFY(panel.liveSkipsPoll());
+        // Another interval starts afresh: its window is due at once.
+        panel.m_candle_interval = flowmesh::CandleInterval::M5;
+        QVERIFY(panel.candlesDue());
+        panel.m_candle_interval = flowmesh::CandleInterval::M1;
+        QVERIFY(!panel.candlesDue());
+        // A page ends the back-off.
+        probe.candles_response = CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 300,
+            {CandleJson(OBSERVED_T0, 1, 1, 1000, 1000, 1000, 1000, 250'000), CandleJson(OBSERVED_T0 + 60'000, 2, 2, 1000, 1000, 1000, 1000, 250'000)});
+        panel.m_candles_failure->retry_at = panel.m_watch_clock.elapsed();
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.candle_options.size(), size_t{3});
+        QVERIFY(panel.m_candles && panel.m_candles->available);
+        QVERIFY(!panel.m_candles_failure);
+        QVERIFY(!panel.candlesDue());
+        panel.m_watch.Disable(); AwaitWatchWorker(panel);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
     void timeCandlesContinueTheServedPageWithHeldTicksOnce()
     {
         B3FlowMeshTradingPanel panel;

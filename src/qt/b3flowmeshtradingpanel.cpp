@@ -643,7 +643,9 @@ void B3FlowMeshTradingPanel::updateDataViews()
             const bool held{m_candles && m_candles_market == view->market && m_candles->interval == m_candle_interval &&
                             m_candles->source == observed.source};
             if (observed.available && !held) {
-                series.loading = true;
+                // A failed read says why rather than reading forever.
+                if (const auto* failure{candlesFailure(view->market, observed.source)}) series.reason = failure->error;
+                else series.loading = true;
             } else if (observed.available && !m_candles->available) {
                 series.reason = m_candles->reason;
             } else if (observed.available) {
@@ -1152,10 +1154,34 @@ void B3FlowMeshTradingPanel::mergeHeldTicks()
     else std::erase_if(m_received_times, [&](const auto& item) { return item.first < m_ticks.front().sequence || item.first > m_ticks.back().sequence; });
 }
 
+QString B3FlowMeshTradingPanel::candlesKey(const QString& market, const QString& source) const
+{
+    return market + QLatin1Char('|') + QString::fromUtf8(flowmesh::CandleIntervalName(m_candle_interval)) + QLatin1Char('|') + source;
+}
+
+const B3FlowMeshTradingPanel::CandlesFailure* B3FlowMeshTradingPanel::candlesFailure(const QString& market, const QString& source) const
+{
+    return m_candles_failure && m_candles_failure->key == candlesKey(market, source) ? &*m_candles_failure : nullptr;
+}
+
+void B3FlowMeshTradingPanel::noteCandlesFailure(const QString& error)
+{
+    if (!m_snapshot || !m_snapshot->observed) return;
+    const QString key{candlesKey(m_snapshot->market, m_snapshot->observed->source)};
+    if (!m_candles_failure || m_candles_failure->key != key) m_candles_failure = CandlesFailure{.key = key};
+    auto& failure{*m_candles_failure};
+    failure.error = error.left(200);
+    failure.failures = std::min(failure.failures + 1, 16);
+    const qint64 backoff{std::min(CANDLES_RETRY_MAX_MS, CANDLES_RETRY_MIN_MS << std::min(failure.failures - 1, 5))};
+    failure.retry_at = m_watch_clock.elapsed() + backoff;
+}
+
 std::optional<std::pair<flowmesh::CandleInterval, size_t>> B3FlowMeshTradingPanel::candlesDue() const
 {
     const auto selected{market()};
     if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->observed || !m_snapshot->observed->available) return std::nullopt;
+    // After a failed read, not before its back-off.
+    if (const auto* failure{candlesFailure(m_snapshot->market, m_snapshot->observed->source)}; failure && m_watch_clock.elapsed() < failure->retry_at) return std::nullopt;
     constexpr size_t WINDOW{300}, NEWEST{3};
     if (!m_candles || m_candles_market != m_snapshot->market || m_candles->interval != m_candle_interval ||
         m_candles->source != m_snapshot->observed->source || !m_candles_age.isValid()) {
@@ -1186,6 +1212,7 @@ void B3FlowMeshTradingPanel::applyCandles(const B3FlowMeshMarketData::CandlePage
     m_candles_market = m_snapshot->market;
     m_candles_age.start();
     m_candles_refetch = false;
+    m_candles_failure.reset();
 }
 
 bool B3FlowMeshTradingPanel::depositReady() const
@@ -2316,6 +2343,11 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
         if (result->candles && selected_now && m_snapshot && m_snapshot->market == selected_now->id && result->views_market == selected_now->id &&
             result->candles->interval == m_candle_interval) {
             applyCandles(*result->candles, result->candles_limit);
+            updateDataViews();
+        } else if (!result->candles_error.isEmpty() && result->candles_interval && selected_now && m_snapshot && m_snapshot->market == selected_now->id &&
+                   result->views_market == selected_now->id && *result->candles_interval == m_candle_interval) {
+            // Display only: backs off, and live updates go on.
+            noteCandlesFailure(result->candles_error);
             updateDataViews();
         }
         const bool changed_selection{selected_now && (selected_now->id != previous || (!result->read_market.isEmpty() && selected_now->id != result->read_market))};

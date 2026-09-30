@@ -584,6 +584,27 @@ private:
     QElapsedTimer m_candles_age;
     //! The forming candle could not be extended from the held ticks.
     bool m_candles_refetch{false};
+    //! Consecutive failed candles reads of one market, interval and source:
+    //! the next is not due before `retry_at` (on m_watch_clock), 2 s after
+    //! the first failure and doubling to 60 s, so a failing display read
+    //! never turns live updates back into a poll on every tick. A page, or
+    //! another market, interval or source, ends it. While no page is held
+    //! the chart shows `error` instead of reading forever.
+    struct CandlesFailure {
+        QString key;
+        QString error;
+        int failures{0};
+        qint64 retry_at{0};
+    };
+    std::optional<CandlesFailure> m_candles_failure;
+    static constexpr qint64 CANDLES_RETRY_MIN_MS{2'000}, CANDLES_RETRY_MAX_MS{60'000};
+    //! Identifies the candles of `market` at m_candle_interval from `source`.
+    QString candlesKey(const QString& market, const QString& source) const;
+    //! A failure of this job's candles read (for the displayed market and
+    //! interval): backs off.
+    void noteCandlesFailure(const QString& error);
+    //! The recorded failure while it applies to `market` and `source`.
+    const CandlesFailure* candlesFailure(const QString& market, const QString& source) const;
     QLabel *m_clearing_strip{nullptr}, *m_indicative{nullptr};
     QTableWidget *m_depth_view{nullptr}, *m_history_view{nullptr}, *m_own_view{nullptr}, *m_pending_view{nullptr};
     B3FlowMeshToasts* m_toasts{nullptr};

@@ -186,7 +186,11 @@ endpoint-reported: its prices, volumes and times are the endpoint's claims.
 - **Candle reads.** A 300-interval window after a market, interval or source
   change (or at most every 2 s while the held ticks cannot continue it), else
   the newest three intervals about every 10 s. A failed candle read never fails
-  the market read.
+  the market read, and it backs off: the next read of the same market,
+  interval and source waits 2 s after the first failure, doubling to 60 s,
+  until a page arrives. So a failing display read never turns live updates
+  back into a poll on every tick. While no page is held the chart shows the
+  error instead of "Reading observed-time candles…".
 - **Trades tape** (liquidity card, "Trades"): the newest 50 matched auctions,
   Price | Size | Time. A uniform auction has no taker side: a price is coloured
   by its change from the previous auction. Time is local `HH:mm:ss` only for a
