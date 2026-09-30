@@ -182,10 +182,13 @@ std::optional<flowmesh::ClearingTick> ToClearingTick(const Tick& tick);
 //! notional (price x volume; fees are not part of a tick), others as clearings
 //! without a match.
 std::vector<Trade> TicksAsTrades(const std::deque<Tick>& held);
-//! "Auction #N · …" for the latest tick, in the display orientation.
-//! `exact_prices`, when given, receives the exact form of every price the
-//! text shows rounded (empty when none was), for a tooltip.
-QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices = nullptr);
+//! "Last auction 12:34:56 · …" for the latest tick, in the display
+//! orientation; `when` is its observed local time ("": none shown). The
+//! auction's number belongs in the tooltip. `exact_prices`, when given,
+//! receives the exact form of every price the text shows rounded (empty
+//! when none was), for a tooltip.
+QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices = nullptr,
+                         const QString& when = {});
 //! The indicative line for the ticket; empty when there is nothing to say.
 QString IndicativeText(const Indicative& view, const Units& units, bool inverse, QString* exact_prices = nullptr);
 //! A price-grouped projection of exact limit-shaped curves, not FIFO orders.

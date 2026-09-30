@@ -123,7 +123,7 @@ void SetChoices(QComboBox* combo, const std::vector<Choice>& choices, const QStr
 }
 QString ClearingStripTip()
 {
-    return B3FlowMeshTradingPanel::tr("The latest certified auction: its uniform price, matched quantity and the side whose orders were left partly unfilled at that price. Microblocks carry no timestamp.");
+    return B3FlowMeshTradingPanel::tr("The latest certified auction: its uniform price, matched quantity and the side whose orders were left partly unfilled at that price. Its time is when the serving node observed it, by that node's clock; auctions carry no certified time.");
 }
 QString IndicativeTip()
 {
@@ -203,13 +203,15 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     auto* liquidity_card{new QWidget{center}}; B3Theme::markCard(liquidity_card); auto* liquidity_layout{new QVBoxLayout{liquidity_card}};
     auto* liquidity_title{Label(tr("Liquidity"), liquidity_card)}; liquidity_title->setObjectName(QStringLiteral("flowMeshLiquidityTitle")); B3Theme::markTextRole(liquidity_title, QStringLiteral("h3")); liquidity_layout->addWidget(liquidity_title);
     auto* liquidity_mode{new QComboBox{liquidity_card}}; liquidity_mode->setObjectName(QStringLiteral("flowMeshLiquidityMode"));
-    liquidity_mode->setAccessibleName(tr("Liquidity display")); liquidity_mode->addItems({tr("Order book"), tr("Curve depth")}); liquidity_layout->addWidget(liquidity_mode);
+    liquidity_mode->setAccessibleName(tr("Liquidity display")); liquidity_mode->addItems({tr("Order book"), tr("Curve depth"), tr("Trades")}); liquidity_layout->addWidget(liquidity_mode);
     m_order_book = new B3FlowMeshOrderBook{liquidity_card}; liquidity_layout->addWidget(m_order_book, 1);
+    m_trade_tape = new B3FlowMeshTradeTape{liquidity_card}; liquidity_layout->addWidget(m_trade_tape, 1); m_trade_tape->hide();
     m_depth_view = table(liquidity_card, {tr("Price"), tr("Buy liquidity"), tr("Sell liquidity")}, "flowMeshCurveDepth"); liquidity_layout->addWidget(m_depth_view, 1);
     m_liquidity_note = Label(tr("No certified curves yet."), liquidity_card); B3Theme::markTextRole(m_liquidity_note, QStringLiteral("secondary")); liquidity_layout->addWidget(m_liquidity_note);
     m_depth_view->hide(); m_liquidity_note->hide();
     connect(liquidity_mode, &QComboBox::currentIndexChanged, this, [this](int index) {
         m_order_book->setVisible(index == 0); m_depth_view->setVisible(index == 1); m_liquidity_note->setVisible(index == 1);
+        m_trade_tape->setVisible(index == 2);
     });
     auto* ticket_card{new QWidget{center}}; ticket_card->setMinimumWidth(250); B3Theme::markCard(ticket_card); auto* ticket{new QVBoxLayout{ticket_card}};
     auto* sides{new QHBoxLayout}; auto* side_group{new QButtonGroup{ticket_card}};
@@ -260,7 +262,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_edit_order->setToolTip(tr("Fills the ticket with a replacement of the selected order: same side, its exact limit and its remaining quantity. Nothing is signed: review the replacement to send it. A new order on a side replaces that side's order at once; there is no gap and no second request."));
     m_cancel_order = new QPushButton{tr("Cancel selected Buy / Sell side…"), own};
     own_actions->addWidget(m_edit_order); own_actions->addWidget(m_cancel_order); own_layout->addLayout(own_actions); m_activity->addTab(own, tr("Your orders"));
-    auto* history_page{new QWidget{m_activity}}; auto* history_layout{new QVBoxLayout{history_page}}; m_history_note = Label(tr("No trades yet"), history_page); history_layout->addWidget(m_history_note); m_history_view = table(history_page, {tr("Trade batch"), tr("Price (B3)"), tr("Amount"), tr("Your buy"), tr("Your sell")}, "flowMeshCertifiedFills"); history_layout->addWidget(m_history_view); m_activity->addTab(history_page, tr("Trade history"));
+    auto* history_page{new QWidget{m_activity}}; auto* history_layout{new QVBoxLayout{history_page}}; m_history_note = Label(tr("No trades yet"), history_page); history_layout->addWidget(m_history_note); m_history_view = table(history_page, {tr("Time"), tr("Price (B3)"), tr("Amount"), tr("Your buy"), tr("Your sell")}, "flowMeshCertifiedFills"); history_layout->addWidget(m_history_view); m_activity->addTab(history_page, tr("Trade history"));
     m_log = new QPlainTextEdit{m_activity}; m_log->setObjectName(QStringLiteral("flowMeshOperationLog")); m_log->setReadOnly(true); m_log->setMaximumBlockCount(100); m_activity->addTab(m_log, tr("Activity")); layout->addWidget(m_activity);
     auto* saved_page{new QWidget{m_activity}}; auto* saved_layout{new QVBoxLayout{saved_page}};
     m_saved_selector = new QComboBox{saved_page}; m_saved_selector->setObjectName(QStringLiteral("flowMeshSavedActions"));
@@ -492,7 +494,12 @@ void B3FlowMeshTradingPanel::updateMarketText()
     QString progress;
     if (selected && selected->checkpoint_pending) progress = tr("Certified checkpoint awaiting B3 publication. This is separate from trade execution.");
     else if (selected && m_pending_sequence && selected->id == m_pending_market && !m_receipt) progress = tr("Request submitted at account sequence %1. A sequence change alone does not prove its outcome. No automatic retry.").arg(*m_pending_sequence);
-    else if (matched) progress = tr("Certified microblock #%1 · epoch %2 · configured threshold %3 of %4 FN seats · %5 queued actions\nAn available runtime or configured threshold is not proof that those validators are currently online.").arg(m_snapshot->next_sequence ? m_snapshot->next_sequence - 1 : 0).arg(m_snapshot->epoch).arg(m_snapshot->quorum_required).arg(m_snapshot->active_seats).arg(m_snapshot->pending_actions);
+    else if (matched) {
+        const uint64_t head{m_snapshot->next_sequence ? m_snapshot->next_sequence - 1 : 0};
+        const QString when{observedClock(head, m_snapshot->head)};
+        progress = tr("Latest certified auction %1 · epoch %2 · configured threshold %3 of %4 FN seats · %5 queued actions\nAn available runtime or configured threshold is not proof that those validators are currently online.")
+                       .arg(when.isEmpty() ? tr("#%1").arg(head) : tr("%1 (#%2)").arg(when).arg(head)).arg(m_snapshot->epoch).arg(m_snapshot->quorum_required).arg(m_snapshot->active_seats).arg(m_snapshot->pending_actions);
+    }
     else progress = tr("Uniform-price curve auction · no price-time priority, no fabricated prices or trades.");
     if (matched) progress = B3FlowMeshMarketData::StatusText(*m_snapshot, m_read_failed || !m_response_age.isValid() ? -1 : m_response_age.elapsed(), m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1) + QLatin1Char('\n') + progress;
     if (m_receipt && selected && selected->id == m_pending_market && receiptWalletSelected()) {
@@ -564,8 +571,10 @@ void B3FlowMeshTradingPanel::updateDataViews()
     QString strip, strip_exact;
     if (ticks_current) {
         const auto last_match{std::find_if(m_ticks.rbegin(), m_ticks.rend(), [](const auto& tick) { return tick.cleared; })};
-        strip = ClearingTickText(last_match != m_ticks.rend() ? *last_match : m_ticks.back(), m_snapshot->units, inverse, m_snapshot->remote, &strip_exact);
-        if (last_match != m_ticks.rend() && last_match != m_ticks.rbegin()) strip += tr(" · latest microblock #%1").arg(m_ticks.back().sequence);
+        const auto& shown{last_match != m_ticks.rend() ? *last_match : m_ticks.back()};
+        strip = ClearingTickText(shown, m_snapshot->units, inverse, m_snapshot->remote, &strip_exact, observedClock(shown.sequence, shown.hash));
+        if (last_match != m_ticks.rend() && last_match != m_ticks.rbegin()) strip += tr(" · later auctions had no match");
+        strip_exact = tr("Auction #%1").arg(shown.sequence) + (strip_exact.isEmpty() ? QString{} : QLatin1Char('\n') + strip_exact);
     } else if (matched && m_snapshot->ticks && !m_snapshot->ticks->available) {
         strip = tr("Auction ticks unavailable (%1)").arg(m_snapshot->ticks->reason);
     }
@@ -573,6 +582,14 @@ void B3FlowMeshTradingPanel::updateDataViews()
     if (const QString tip{ClearingStripTip() + (strip_exact.isEmpty() ? QString{} : QStringLiteral("\n") + strip_exact)}; m_clearing_strip->toolTip() != tip) m_clearing_strip->setToolTip(tip);
     m_clearing_strip->setVisible(!strip.isEmpty());
     m_order_book->setSnapshot(matched ? m_snapshot : std::nullopt, inverse);
+    {
+        const bool timed{matched && m_snapshot->observed && m_snapshot->observed->available};
+        const auto rows{matched && m_ticks_market == m_snapshot->market ? B3FlowMeshTradeTape::BuildRows(m_ticks, m_tick_times)
+                                                                         : std::vector<B3FlowMeshTradeTape::Row>{}};
+        m_trade_tape->setRows(rows, matched ? m_snapshot->units : Units{}, inverse, timed ? m_tick_times_source : QString{},
+                              matched && m_snapshot->remote,
+                              matched && m_snapshot->observed ? m_snapshot->observed->reason : QString{});
+    }
     if (!matched || !m_snapshot->units.known) {
         for (auto* table : {m_depth_view, m_history_view, m_own_view}) SetRows(table, {});
         m_own_view->clearSelection();
@@ -601,13 +618,16 @@ void B3FlowMeshTradingPanel::updateDataViews()
     m_liquidity_note->setToolTip(tr("Each row evaluates all remaining curves at that price; do not sum the rows. Only certified curves are shown. A zero canonical price has no finite inverse and is shown as a dash.") +
         (inverse ? tr("\nBuy/sell liquidity is gross B3 equivalents at each sampled price, not fixed B3-sized orders. Original token quantities remain the exact order amounts.") : QString{}));
     if (m_history_view->columnCount() != 6) m_history_view->setColumnCount(6);
-    m_history_view->setHorizontalHeaderLabels({tr("Trade batch"), tr("Price (%1)").arg(price_units), tr("Amount (%1)").arg(quantity_units), tr("Your buy"), tr("Your sell"), tr("Auction fee (B3)")});
+    m_history_view->setHorizontalHeaderLabels({tr("Time"), tr("Price (%1)").arg(price_units), tr("Amount (%1)").arg(quantity_units), tr("Your buy"), tr("Your sell"), tr("Auction fee (B3)")});
+    m_history_view->horizontalHeaderItem(0)->setToolTip(tr("Local time the serving node observed the auction (operator-observed, not certified); a dash means no observed time. Hover a row for its auction number."));
     m_history_view->horizontalHeaderItem(5)->setToolTip(tr("Whole-auction B3 fee, not your individual allocation. Endpoint-reported history remains unverified when indicated below."));
     m_own_view->setHorizontalHeaderLabels({tr("Side"), tr("Price"), tr("Remaining (%1)").arg(u.ticker), tr("Reserved")});
     QString last_price{tr("Last price  —")}, last_price_tip;
     std::vector<uint64_t> history_sequences;
     // The exact form of each history row's rounded price (empty: exact).
     std::vector<QString> history_exact;
+    // The time cell's tooltip of each history row: its number and time.
+    std::vector<QString> history_times;
     for (auto it{s.history.rbegin()}; it != s.history.rend(); ++it) {
         if (!it->cleared || it->quantity == 0) continue;
         const auto price{DisplayPrice(it->price, u, inverse)};
@@ -616,7 +636,11 @@ void B3FlowMeshTradingPanel::updateDataViews()
             if (price.approximate) last_price_tip = tr("Exact last trade price: %1 %2").arg(price.exact, price_units);
         }
         history_exact.push_back(price.approximate ? tr("Exact price: %1 %2").arg(price.exact, price_units) : QString{});
-        history.push_back({QStringLiteral("#%1").arg(it->sequence), price.text, FormatDepthQuantity(it->price, it->quantity, u.decimals, inverse),
+        B3FlowMeshTradeTape::Row as_row; as_row.sequence = it->sequence; as_row.stamp = observedStamp(it->sequence, it->hash);
+        QString time_tip;
+        const QString when{B3FlowMeshTradeTape::TimeText(as_row, s.observed && s.observed->available ? s.observed->source : QString{}, s.remote, &time_tip)};
+        history_times.push_back(time_tip);
+        history.push_back({when, price.text, FormatDepthQuantity(it->price, it->quantity, u.decimals, inverse),
             it->own_fills_known ? FormatDepthQuantity(it->price, inverse ? it->own_sell : it->own_buy, u.decimals, inverse) : QStringLiteral("—"),
             it->own_fills_known ? FormatDepthQuantity(it->price, inverse ? it->own_buy : it->own_sell, u.decimals, inverse) : QStringLiteral("—"), FormatAmount(it->fee, 9)});
         history_sequences.push_back(it->sequence);
@@ -627,10 +651,12 @@ void B3FlowMeshTradingPanel::updateDataViews()
     for (const auto& marker : m_gap_markers) {
         if (marker.market != s.market) continue;
         const auto at{std::find_if(history_sequences.begin(), history_sequences.end(), [&](uint64_t sequence) { return sequence <= marker.from_sequence; }) - history_sequences.begin()};
-        const QString text{marker.to_sequence > marker.from_sequence ? tr("— events missed between #%1 and #%2 —").arg(marker.from_sequence).arg(marker.to_sequence)
-                                                                     : tr("— events missed at #%1 —").arg(marker.to_sequence)};
+        const QString text{tr("— events missed here —")};
         history.insert(history.begin() + at, QStringList{text, QString{}, QString{}, QString{}, QString{}, QString{}});
         history_exact.insert(history_exact.begin() + at, QString{});
+        history_times.insert(history_times.begin() + at, marker.to_sequence > marker.from_sequence
+            ? tr("Live updates missed events between auctions #%1 and #%2.").arg(marker.from_sequence).arg(marker.to_sequence)
+            : tr("Live updates missed events at auction #%1.").arg(marker.to_sequence));
         history_sequences.insert(history_sequences.begin() + at, marker.to_sequence);
         std::set<int> shifted;
         for (const int row : separators) shifted.insert(row >= at ? row + 1 : row);
@@ -657,7 +683,8 @@ void B3FlowMeshTradingPanel::updateDataViews()
         auto* item{m_history_view->item(row, 0)};
         if (!item) continue;
         const bool separator{separators.contains(row)};
-        const QString tip{separator ? tr("Live updates missed events here. Balances and orders were re-verified from a certified snapshot; missing trades may not be listed.") : QString{}};
+        const QString row_time{static_cast<size_t>(row) < history_times.size() ? history_times[row] : QString{}};
+        const QString tip{separator ? row_time + tr("\nBalances and orders were re-verified from a certified snapshot; missing trades may not be listed.") : row_time};
         if (item->toolTip() != tip) item->setToolTip(tip);
         const QBrush brush{separator ? palette().brush(QPalette::PlaceholderText) : QBrush{}};
         if (item->foreground() != brush) item->setForeground(brush);
@@ -681,7 +708,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
     for (int i{0}; i < static_cast<int>(s.own_curves.size()); ++i) { const auto& c{s.own_curves[i]}; m_own_view->item(i, 0)->setToolTip(tr("Certified account %1\nFilled: %2 %3\nCancellation targets this account's whole selected side.").arg(c.account, FormatAmount(c.filled, u.decimals), u.ticker)); }
     QString history_note{!s.history_available ? tr("History unavailable on this node") : history.empty() ? tr("No trades in recent history") : s.history_truncated || s.history_page_partial ? tr("Recent trades · partial history") : tr("Confirmed trades")};
     if (inverse && !history.empty()) history_note += tr(" · gross B3 before fees");
-    QString history_tooltip{tr("Only retained certified clearings are shown, indexed by microblock sequence. A dash means your fill is unknown, not zero. Missing history does not prove that no trading occurred.") +
+    QString history_tooltip{tr("Only retained certified clearings are shown. Times are when the serving node observed each auction, never certified; a dash in Time means no observed time, and a dash in a fill column means your fill is unknown, not zero. Missing history does not prove that no trading occurred.") +
         (inverse ? tr("\nB3 buys are gross proceeds before your allocated B3 fee. This snapshot does not report each account's fee, so net B3 received is not invented.") : QString{})};
     const bool reported{s.remote && !s.execution_result_verified};
     if (reported) {
@@ -816,6 +843,28 @@ std::optional<uint64_t> B3FlowMeshTradingPanel::ticksAfter(const QString& market
 {
     if (m_ticks.empty() || m_ticks_market != market) return std::nullopt;
     return m_ticks.back().sequence;
+}
+
+std::optional<flowmesh::ObservedStamp> B3FlowMeshTradingPanel::observedStamp(const uint64_t sequence, const QString& hash) const
+{
+    if (!m_snapshot) return std::nullopt;
+    const auto matches = [&](const flowmesh::ObservedStamp& stamp) {
+        return hash.isEmpty() || QString::fromStdString(stamp.hash.GetHex()) == hash.toLower();
+    };
+    if (m_ticks_market == m_snapshot->market) {
+        if (const auto held{m_tick_times.find(sequence)}; held != m_tick_times.end() && matches(held->second)) return held->second;
+    }
+    if (m_snapshot->observed && m_snapshot->observed->available) {
+        for (const auto& row : m_snapshot->observed->rows) if (row.sequence == sequence && matches(row)) return row;
+    }
+    return std::nullopt;
+}
+
+QString B3FlowMeshTradingPanel::observedClock(const uint64_t sequence, const QString& hash) const
+{
+    const auto stamp{observedStamp(sequence, hash)};
+    if (!stamp || stamp->mode != flowmesh::ObservedMode::LIVE) return {};
+    return QDateTime::fromMSecsSinceEpoch(stamp->ms).toLocalTime().toString(QStringLiteral("HH:mm:ss"));
 }
 
 void B3FlowMeshTradingPanel::updateIntervalChoices(const bool time)
@@ -2315,8 +2364,8 @@ void B3FlowMeshTradingPanel::addGapMarker(const QString& market, const uint64_t 
     m_gap_markers.push_back(std::move(marker));
     while (m_gap_markers.size() > MAX_GAP_MARKERS) m_gap_markers.pop_front();
     notice(to_sequence > from_sequence
-        ? tr("Live updates missed events between microblock #%1 and #%2; balances and orders were re-verified from a certified snapshot; your pending requests are being re-checked. No request was resent.").arg(from_sequence).arg(to_sequence)
-        : tr("Live updates missed events at microblock #%1; balances and orders were re-verified from a certified snapshot; your pending requests are being re-checked. No request was resent.").arg(to_sequence));
+        ? tr("Live updates missed events between auctions #%1 and #%2; balances and orders were re-verified from a certified snapshot; your pending requests are being re-checked. No request was resent.").arg(from_sequence).arg(to_sequence)
+        : tr("Live updates missed events at auction #%1; balances and orders were re-verified from a certified snapshot; your pending requests are being re-checked. No request was resent.").arg(to_sequence));
 }
 
 void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
@@ -2630,7 +2679,11 @@ void B3FlowMeshTradingPanel::observeRequests()
         using std::chrono::seconds;
         if (fresh & EXECUTED) toast(key + QStringLiteral(":executed"), Kind::Success, tr("Executed: %1 · %2").arg(title, shown.outcome.mid(2)), seconds{8});
         else if (fresh & NOT_EXECUTED) toast(key + QStringLiteral(":not-executed"), Kind::Warning, tr("%1 · %2").arg(title, shown.status), seconds{20});
-        else if (fresh & CERTIFIED) toast(key + QStringLiteral(":certified"), Kind::Info, tr("Certified: %1 · included in batch #%2").arg(title).arg(receipt.microblock_sequence), seconds{8});
+        else if (fresh & CERTIFIED) {
+            const QString when{observedClock(receipt.microblock_sequence, receipt.microblock_hash)};
+            toast(key + QStringLiteral(":certified"), Kind::Info, when.isEmpty() ? tr("Certified: %1 · included in auction #%2").arg(title).arg(receipt.microblock_sequence)
+                                                                                 : tr("Certified: %1 · included in the auction at %2").arg(title, when), seconds{8});
+        }
         if (fresh & UNCERTAIN) toast(key + QStringLiteral(":uncertain"), Kind::Warning, tr("Outcome unknown: %1 · review before trading; it is never re-signed.").arg(title), seconds{20});
         if (fresh & REFUSED) toast(key + QStringLiteral(":refused"), Kind::Warning, tr("Refusal reported: %1 · treated as unknown until reviewed.").arg(title), seconds{20});
     };

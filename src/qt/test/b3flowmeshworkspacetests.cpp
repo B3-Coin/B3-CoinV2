@@ -5,6 +5,7 @@
 #include <qt/b3flowmeshnotices.h>
 #include <qt/b3flowmeshorderbook.h>
 #include <qt/b3flowmeshtradingpanel.h>
+#include <qt/b3flowmeshtradetape.h>
 #include <qt/b3theme.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
@@ -2114,6 +2115,83 @@ private Q_SLOTS:
         QImage image{chart.size(), QImage::Format_ARGB32}; chart.render(&image);
         series.candles.clear(); chart.setTimeSeries(series); chart.render(&image);
     }
+    void tradeTapeShowsLiveTimesOnlyAndColoursByPriceChange()
+    {
+        const auto tick = [](uint64_t sequence, CAmount price, bool cleared = true) {
+            Tick t; t.sequence = sequence; t.hash = QString::fromStdString(H(static_cast<unsigned char>(sequence)).GetHex());
+            t.kind = QStringLiteral("execution"); t.side = QStringLiteral("none"); t.cleared = cleared;
+            if (cleared) { t.price = price; t.volume = 10; }
+            return t;
+        };
+        std::deque<Tick> ticks{tick(1, 100), tick(2, 0, false), tick(3, 105), tick(4, 105), tick(5, 90), tick(6, 95)};
+        std::map<uint64_t, flowmesh::ObservedStamp> times;
+        const auto stamp = [](uint64_t sequence, flowmesh::ObservedMode mode, int64_t ms) {
+            flowmesh::ObservedStamp out; out.sequence = sequence; out.hash = H(static_cast<unsigned char>(sequence)); out.mode = mode; out.ms = ms; return out;
+        };
+        times[6] = stamp(6, flowmesh::ObservedMode::LIVE, OBSERVED_T0 + 5'000);
+        times[5] = stamp(5, flowmesh::ObservedMode::DELAYED, OBSERVED_T0 + 4'000);
+        times[4] = stamp(4, flowmesh::ObservedMode::LIVE, OBSERVED_T0 + 3'000); times[4].hash = H(99); // another entry's: ignored
+        const auto rows{B3FlowMeshTradeTape::BuildRows(ticks, times)};
+        // Cleared auctions only, newest first.
+        QCOMPARE(rows.size(), size_t{5});
+        QCOMPARE(rows[0].sequence, uint64_t{6}); QCOMPARE(rows[4].sequence, uint64_t{1});
+        // Up, down, and an unchanged price keeping the last direction.
+        QCOMPARE(rows[0].direction, 1); QCOMPARE(rows[1].direction, -1); QCOMPARE(rows[2].direction, 1); QCOMPARE(rows[3].direction, 1); QCOMPARE(rows[4].direction, 0);
+        QString tip;
+        const auto live{B3FlowMeshTradeTape::TimeText(rows[0], QStringLiteral("https://trade.example.org"), true, &tip)};
+        QCOMPARE(live, QDateTime::fromMSecsSinceEpoch(OBSERVED_T0 + 5'000).toLocalTime().toString(QStringLiteral("HH:mm:ss")));
+        QVERIFY(tip.contains(QStringLiteral("Observed by trade.example.org at 2026-09-30 12:00:05.000 UTC")));
+        QVERIFY(tip.contains(QStringLiteral("not certified"))); QVERIFY(tip.contains(QStringLiteral("Auction #6")));
+        // Applied late: never a trade time, only its bound in the tooltip.
+        QCOMPARE(B3FlowMeshTradeTape::TimeText(rows[1], QStringLiteral("this_node"), false, &tip), QStringLiteral("—"));
+        QVERIFY(tip.contains(QStringLiteral("upper bound")));
+        QCOMPARE(B3FlowMeshTradeTape::TimeText(rows[2], QStringLiteral("this_node"), false, &tip), QStringLiteral("—"));
+        QVERIFY(!rows[2].stamp);
+        // At most fifty rows.
+        std::deque<Tick> many; for (uint64_t i{0}; i < 200; ++i) many.push_back(tick(i + 1, 100 + static_cast<CAmount>(i % 7)));
+        QCOMPARE(B3FlowMeshTradeTape::BuildRows(many, {}).size(), B3FlowMeshTradeTape::MAX_ROWS);
+        // The widget: one row per auction, the price coloured, updated in place.
+        B3FlowMeshTradeTape tape;
+        const auto units{Parse(Data()).units};
+        tape.setRows(rows, units, false, QStringLiteral("this_node"), false, {});
+        QCOMPARE(tape.table()->rowCount(), 5);
+        QCOMPARE(tape.table()->item(0, 0)->foreground().color(), B3Theme::kPositive);
+        QCOMPARE(tape.table()->item(1, 0)->foreground().color(), B3Theme::kNegative);
+        QCOMPARE(tape.table()->item(1, 2)->foreground().color(), B3Theme::kTextMuted);
+        auto* first{tape.table()->item(0, 0)};
+        tape.setRows(rows, units, false, QStringLiteral("this_node"), false, {});
+        QCOMPARE(tape.table()->item(0, 0), first);
+        QVERIFY(tape.findChild<QLabel*>(QStringLiteral("flowMeshTradeTapeNote"))->text().contains(QStringLiteral("observed by this node")));
+        tape.setRows({}, units, false, {}, true, QStringLiteral("endpoint_does_not_advertise_observed_time"));
+        QVERIFY(tape.findChild<QLabel*>(QStringLiteral("flowMeshTradeTapeNote"))->text().contains(QStringLiteral("No matched auctions")));
+    }
+    void historyAndStripShowObservedTimesNotMicroblocks()
+    {
+        B3FlowMeshTradingPanel panel;
+        auto v{RemoteDataWithTimes()};
+        Observe(panel, Parse(v)); panel.mergeHeldTicks(); panel.updateDataViews(); panel.updateMarketText();
+        const QString clock{QDateTime::fromMSecsSinceEpoch(OBSERVED_T0 + 61'000).toLocalTime().toString(QStringLiteral("HH:mm:ss"))};
+        // The trade history's time column and the clearing strip.
+        QCOMPARE(panel.m_history_view->horizontalHeaderItem(0)->text(), QStringLiteral("Time"));
+        QCOMPARE(panel.m_history_view->item(0, 0)->text(), clock);
+        QVERIFY(panel.m_history_view->item(0, 0)->toolTip().contains(QStringLiteral("Auction #2")));
+        QVERIFY(panel.m_clearing_strip->text().startsWith(QStringLiteral("Last auction ") + clock));
+        QVERIFY(panel.m_progress->text().contains(QStringLiteral("Latest certified auction ") + clock));
+        // The Trades view of the liquidity card.
+        auto* mode{panel.findChild<QComboBox*>(QStringLiteral("flowMeshLiquidityMode"))};
+        QVERIFY(mode); QCOMPARE(mode->itemText(2), QStringLiteral("Trades"));
+        mode->setCurrentIndex(2);
+        QVERIFY(!panel.m_trade_tape->isHidden()); QVERIFY(panel.m_order_book->isHidden());
+        QCOMPARE(panel.m_trade_tape->table()->rowCount(), 1);
+        QCOMPARE(panel.m_trade_tape->table()->item(0, 2)->text(), clock);
+        // No primary label speaks of microblocks.
+        for (const QString& text : {panel.m_clearing_strip->text(), panel.m_progress->text(), panel.m_chart->toolTip(),
+                                    panel.m_history_note->toolTip(), panel.m_clearing_strip->toolTip()}) {
+            QVERIFY2(!text.contains(QStringLiteral("microblock"), Qt::CaseInsensitive), qPrintable(text));
+        }
+        auto* interval{panel.findChild<QComboBox*>(QStringLiteral("flowMeshCandleInterval"))};
+        for (int i{0}; i < interval->count(); ++i) QVERIFY(!interval->itemText(i).contains(QStringLiteral("microblock"), Qt::CaseInsensitive));
+    }
     void heldTicksExtendOnlyConsecutiveAgreeingPages()
     {
         const auto tick = [](uint64_t sequence, bool cleared = false) {
@@ -2147,13 +2225,15 @@ private Q_SLOTS:
     {
         const auto s{Parse(RemoteDataWithViews())};
         const auto& tick{s.ticks->ticks[1]};
-        QCOMPARE(ClearingTickText(tick, s.units, false, true), QStringLiteral("Auction #2 · 0.25 tUSD at 1 B3 / tUSD · buyers left 0.05 tUSD unfilled · endpoint-reported"));
+        QCOMPARE(ClearingTickText(tick, s.units, false, true), QStringLiteral("Last auction · 0.25 tUSD at 1 B3 / tUSD · buyers left 0.05 tUSD unfilled · endpoint-reported"));
+        // With its observed time, never its number.
+        QCOMPARE(ClearingTickText(tick, s.units, false, false, nullptr, QStringLiteral("12:34:56")), QStringLiteral("Last auction 12:34:56 · 0.25 tUSD at 1 B3 / tUSD · buyers left 0.05 tUSD unfilled"));
         const auto inverse{ClearingTickText(tick, s.units, true, false)};
         QVERIFY(inverse.contains(QStringLiteral("tUSD / B3"))); QVERIFY(inverse.contains(QStringLiteral("B3 sellers left 0.05 tUSD unfilled")));
         QVERIFY(!inverse.contains(QStringLiteral("endpoint-reported")));
-        QCOMPARE(ClearingTickText(s.ticks->ticks[0], s.units, false, false), QStringLiteral("Auction #1 · no match"));
+        QCOMPARE(ClearingTickText(s.ticks->ticks[0], s.units, false, false), QStringLiteral("Last auction · no match"));
         auto other{tick}; other.kind = QStringLiteral("handoff"); other.cleared = false;
-        QVERIFY(ClearingTickText(other, s.units, false, false).contains(QStringLiteral("validator handoff, no auction")));
+        QCOMPARE(ClearingTickText(other, s.units, false, false), QStringLiteral("Validator handoff · no auction"));
         other = tick; other.side = QStringLiteral("unknown");
         QVERIFY(ClearingTickText(other, s.units, false, false).contains(QStringLiteral("unfilled side not observed")));
         const auto what_if{IndicativeText(*s.indicative, s.units, false)};
@@ -2185,7 +2265,8 @@ private Q_SLOTS:
         QCOMPARE(first["indicative"]["draft"]["quantity"].getInt<int64_t>(), int64_t{1'000'000});
         QCOMPARE(panel.m_ticks.size(), size_t{2});
         QVERIFY(!panel.m_clearing_strip->isHidden());
-        QVERIFY(panel.m_clearing_strip->text().startsWith(QStringLiteral("Auction #2 · 0.25 tUSD at 1 B3 / tUSD")));
+        QVERIFY(panel.m_clearing_strip->text().startsWith(QStringLiteral("Last auction · 0.25 tUSD at 1 B3 / tUSD")));
+        QVERIFY(panel.m_clearing_strip->toolTip().contains(QStringLiteral("Auction #2")));
         QVERIFY(!panel.m_indicative->isHidden());
         QVERIFY(panel.m_indicative->text().contains(QStringLiteral("would clear at 1 B3 / tUSD")));
         // The chart draws the held ticks.
@@ -3092,7 +3173,7 @@ private Q_SLOTS:
                  (remote ? QStringLiteral("Endpoint-reported trades · execution results not independently verified") : QStringLiteral("Confirmed trades")) +
                  (inverse ? QStringLiteral(" · gross B3 before fees") : QString{}));
         QCOMPARE(panel.m_ticket_fee->toolTip(), QStringLiteral("Actual protocol fee asset: B3. The whole-auction fee is 0.01% of matched B3 and is allocated among B3 receivers. Your exact allocated amount is unknown before execution; this is not a stable-asset charge. Submitting an order has no network fee."));
-        QCOMPARE(panel.m_progress->text(), StatusText(snapshot, 0, -1) + QStringLiteral("\nCertified microblock #41 · epoch 0 · configured threshold 3 of 4 FN seats · 0 queued actions\nAn available runtime or configured threshold is not proof that those validators are currently online."));
+        QCOMPARE(panel.m_progress->text(), StatusText(snapshot, 0, -1) + QStringLiteral("\nLatest certified auction #41 · epoch 0 · configured threshold 3 of 4 FN seats · 0 queued actions\nAn available runtime or configured threshold is not proof that those validators are currently online."));
         QSignalSpy depth_changed{panel.m_depth_view->model(), &QAbstractItemModel::dataChanged};
         QSignalSpy history_changed{panel.m_history_view->model(), &QAbstractItemModel::dataChanged};
         QSignalSpy own_changed{panel.m_own_view->model(), &QAbstractItemModel::dataChanged};
@@ -4964,14 +5045,17 @@ private Q_SLOTS:
         QCOMPARE(panel.m_gap_markers.front().to_sequence, uint64_t{3});
         // A log line, a separator between the trades before and after, and
         // the tracked request is reconciled before anything else.
-        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("missed events between microblock #2 and #3")));
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("missed events between auctions #2 and #3")));
         QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("No request was resent")));
         QCOMPARE(panel.m_history_view->rowCount(), before + 2);
-        QCOMPARE(panel.m_history_view->item(0, 0)->text(), QStringLiteral("#3"));
-        QVERIFY(panel.m_history_view->item(1, 0)->text().contains(QStringLiteral("events missed between #2 and #3")));
-        QVERIFY(!panel.m_history_view->item(1, 0)->toolTip().isEmpty());
-        QCOMPARE(panel.m_history_view->item(2, 0)->text(), QStringLiteral("#2"));
-        QVERIFY(panel.m_history_view->item(2, 0)->toolTip().isEmpty());
+        // No observed time here: a dash, the auction's number in its tooltip.
+        QCOMPARE(panel.m_history_view->item(0, 0)->text(), QStringLiteral("—"));
+        QVERIFY(panel.m_history_view->item(0, 0)->toolTip().contains(QStringLiteral("Auction #3")));
+        QVERIFY(panel.m_history_view->item(1, 0)->text().contains(QStringLiteral("events missed here")));
+        QVERIFY(panel.m_history_view->item(1, 0)->toolTip().contains(QStringLiteral("between auctions #2 and #3")));
+        QCOMPARE(panel.m_history_view->item(2, 0)->text(), QStringLiteral("—"));
+        QVERIFY(panel.m_history_view->item(2, 0)->toolTip().contains(QStringLiteral("Auction #2")));
+        QVERIFY(!panel.m_history_view->item(2, 0)->toolTip().contains(QStringLiteral("missed")));
         QVERIFY(panel.m_reconcile_pending);
         QCOMPARE(panel.nextPassivePhase(), B3FlowMeshTradingPanel::RefreshPhase::Receipt);
         QCOMPARE(panel.m_refresh_phase, B3FlowMeshTradingPanel::RefreshPhase::Status);
@@ -5167,7 +5251,7 @@ private Q_SLOTS:
             const auto* hit{viewport->childAt(strip->geometry().center())};
             return hit && (hit == strip || strip->isAncestorOf(hit));
         };
-        panel.toast(QStringLiteral("a"), Kind::Info, QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in batch #9"), milliseconds{60'000});
+        panel.toast(QStringLiteral("a"), Kind::Info, QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in auction #9"), milliseconds{60'000});
         panel.toast(QStringLiteral("b"), Kind::Warning, QStringLiteral("Connection lost · last verified data is shown and new orders are paused. Your requests are re-checked first when it returns."), milliseconds{50});
         QCoreApplication::processEvents();
         QCOMPARE(strip->texts().size(), 2);
@@ -5201,7 +5285,7 @@ private Q_SLOTS:
         QVERIFY(panel.m_toasts->texts().isEmpty());
         auto receipt{saved.actions[0].receipt}; Certify(receipt, 9);
         for (int i{0}; i < 3; ++i) panel.applyReceipt(receipt);
-        QCOMPARE(panel.m_toasts->texts(), (QStringList{QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in batch #9")}));
+        QCOMPARE(panel.m_toasts->texts(), (QStringList{QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in auction #9")}));
         QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD")));
         // A verified outcome of the same request is announced once more.
         B3FlowMeshTrading::Outcome outcome; outcome.status = QStringLiteral("applied"); outcome.final = true; outcome.reason_code = QStringLiteral("APPLIED");
@@ -5243,7 +5327,7 @@ private Q_SLOTS:
         QVERIFY(view->item(0, 6)->text().contains(QStringLiteral("may still execute")));
         QCOMPARE(view->item(0, 6)->foreground().color(), B3Theme::kAccent);
         // Only the verified inclusion is announced, never "not executed".
-        QCOMPARE(panel.m_toasts->texts(), (QStringList{QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in batch #9")}));
+        QCOMPARE(panel.m_toasts->texts(), (QStringList{QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in auction #9")}));
         // It is not settled: it stays in progress after the linger interval.
         for (auto& [key, seen] : panel.m_request_seen) seen.settled_age.invalidate();
         panel.m_last_settled.invalidate(); panel.updateControls();

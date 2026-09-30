@@ -7,6 +7,7 @@
 #include <qt/b3flowmeshmarketdata.h>
 #include <qt/b3flowmeshnotices.h>
 #include <qt/b3flowmeshorderbook.h>
+#include <qt/b3flowmeshtradetape.h>
 #include <qt/b3flowmeshwatch.h>
 #include <qt/walletmodel.h>
 #include <QElapsedTimer>
@@ -452,6 +453,11 @@ private:
     QComboBox* m_candle_interval_combo{nullptr};
     //! Rebuilds the interval choices for the mode the data allows.
     void updateIntervalChoices(bool time);
+    //! The observed stamp of a displayed entry: its held tick's, else the
+    //! displayed reply's (same hash when given).
+    std::optional<flowmesh::ObservedStamp> observedStamp(uint64_t sequence, const QString& hash = {}) const;
+    //! Local "HH:mm:ss" of an entry observed live, else empty.
+    QString observedClock(uint64_t sequence, const QString& hash = {}) const;
     //! Clearing ticks held for m_ticks_market (see MergeHeldTicks); display only.
     std::deque<B3FlowMeshMarketData::Tick> m_ticks;
     QString m_ticks_market;
@@ -475,6 +481,7 @@ private:
     bool m_link_toast_down{false};
     uint64_t m_link_toast_episode{0};
     B3FlowMeshOrderBook* m_order_book{nullptr};
+    B3FlowMeshTradeTape* m_trade_tape{nullptr};
     QTabWidget* m_activity{nullptr};
     QWidget* m_advanced{nullptr};
     QPushButton *m_buy{nullptr}, *m_sell{nullptr};

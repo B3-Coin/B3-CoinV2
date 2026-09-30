@@ -478,20 +478,21 @@ std::vector<Trade> TicksAsTrades(const std::deque<Tick>& held)
     return out;
 }
 
-QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices)
+QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices, const QString& when)
 {
     if (exact_prices) exact_prices->clear();
     QString text;
-    if (tick.kind == QStringLiteral("handoff")) text = QObject::tr("Microblock #%1 · validator handoff, no auction").arg(tick.sequence);
-    else if (tick.kind == QStringLiteral("settlement")) text = QObject::tr("Microblock #%1 · withdrawal settlement, no auction").arg(tick.sequence);
-    else if (!tick.cleared) text = QObject::tr("Auction #%1 · no match").arg(tick.sequence);
-    else if (!ValidUnits(units)) text = QObject::tr("Auction #%1 · matched (asset precision unavailable)").arg(tick.sequence);
+    const QString at{when.isEmpty() ? QString{} : QLatin1Char(' ') + when};
+    if (tick.kind == QStringLiteral("handoff")) text = QObject::tr("Validator handoff%1 · no auction").arg(at);
+    else if (tick.kind == QStringLiteral("settlement")) text = QObject::tr("Withdrawal settlement%1 · no auction").arg(at);
+    else if (!tick.cleared) text = QObject::tr("Last auction%1 · no match").arg(at);
+    else if (!ValidUnits(units)) text = QObject::tr("Last auction%1 · matched (asset precision unavailable)").arg(at);
     else {
         const QString price_units{inverse ? QObject::tr("%1 / B3").arg(units.ticker) : QObject::tr("B3 / %1").arg(units.ticker)};
         const auto price{DisplayPrice(tick.price, units, inverse)};
         if (exact_prices && price.approximate) *exact_prices = QObject::tr("Exact price: %1 %2").arg(price.exact, price_units);
-        text = QObject::tr("Auction #%1 · %2 %3 at %4 %5").arg(tick.sequence).arg(FormatAmount(tick.volume, units.decimals), units.ticker,
-                                                               inverse && tick.price == 0 ? QObject::tr("zero") : price.text, price_units);
+        text = QObject::tr("Last auction%1 · %2 %3 at %4 %5").arg(at).arg(FormatAmount(tick.volume, units.decimals), units.ticker,
+                                                                   inverse && tick.price == 0 ? QObject::tr("zero") : price.text, price_units);
         // In the B3 view a canonical bid (buying the token) sells B3.
         const bool bid{tick.side == QStringLiteral("bid")};
         if (tick.side == QStringLiteral("unknown")) text += QObject::tr(" · unfilled side not observed");
@@ -1027,7 +1028,7 @@ QString StatusText(const Snapshot& s, int64_t response_age, int64_t certificate_
     if (s.halt != QStringLiteral("none") || !s.error.isEmpty()) return QStringLiteral("Market halted · %1").arg(!s.error.isEmpty() ? s.error : s.halt);
     if (s.handoff) return QStringLiteral("Validator handoff · new orders paused; certified settlement remains available.");
     if (s.paused) return QStringLiteral("Market paused · quorum or checkpoint progress required.");
-    if (!s.certified) return QStringLiteral("Awaiting first certified microblock · no price or fills yet.");
+    if (!s.certified) return QStringLiteral("Awaiting the first certified auction · no price or fills yet.");
     if (s.remote && (!s.certificate_verified || !s.account_state_verified)) return QStringLiteral("Remote evidence not verified · new actions disabled.");
     if (s.pending_actions > 0 && queued_without_progress >= 30'000) return QStringLiteral("Queued requests have not certified for 30 seconds · new submissions paused locally. Existing requests are not canceled.");
     if (s.remote) return QStringLiteral("Remote client · certificate and whole-state verified locally; newest network head is not proven. %1%2")
