@@ -3014,8 +3014,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // Send's local authority check, before any network use.
         const auto pins{Pins(p.market)};
         if (pins.domain != p.domain || pins.execution_config_id != p.config) Fail("Cannot retry retained action under different domain/config");
-        // The embedded status read is charged like the waited read it replaces.
-        if (!m_action_polls.TryChargeAttempt(now)) return std::nullopt;
+        // Its optional embedded status read must yield to ordinary queued
+        // demand, just like WaitedActionStatus. Send still delivers the exact
+        // authorized action through the ordinary path when the wait yields.
+        if (!m_action_polls.TryChargeUnqueuedAttempt(now)) return std::nullopt;
         LaneSubmission s;
         s.key = {p.market, p.action.Id()};
         s.target = m_endpoints.at(endpoint);
@@ -3568,8 +3570,9 @@ public:
      * observed-time candles, only when it advertises them. Endpoint-reported
      * display data: only the page's structure and that no candle goes past
      * a head this client verified are checked. The work gate is not held
-     * across the candles request, so an order never waits for a candles
-     * page; a busy candles lane fails at once.
+     * across the candles HTTPS request; a busy candles lane fails at once.
+     * A page ahead of the held head still needs the ordinary verified
+     * refresh below, which holds m_work and may delay a concurrent order.
      *
      * The endpoint's forming candle ends at its own head, which on an
      * active market is nearly always past the head this client verified

@@ -154,6 +154,33 @@ BOOST_AUTO_TEST_CASE(waited_fast_path_yields_even_when_only_its_own_key_is_queue
     BOOST_CHECK_EQUAL(poll.AttemptsInWindow(now), 2U);
 }
 
+BOOST_AUTO_TEST_CASE(embedded_submission_waits_share_the_ordinary_fifo_guard)
+{
+    Poll poll;
+    const Poll::TimePoint start{};
+    BOOST_REQUIRE(poll.TryChargeAttempt(start));
+    BOOST_REQUIRE(poll.TryChargeAttempt(start));
+    const std::array older{Key(3, 1), Key(3, 2), Key(4, 1)};
+    for (const auto& key : older) BOOST_REQUIRE(poll.Demand(key));
+    for (size_t i{0}; i < older.size(); ++i) {
+        const auto now{start + Poll::REFILL_INTERVAL * (i + 1)};
+        const auto charged{poll.AttemptsInWindow(now)};
+        // PrepareLaneSubmission and WaitedActionStatus both use this guard.
+        // Neither an embedded wait on a newly authorized submission nor a
+        // repeated waited status may consume the older request's token.
+        BOOST_CHECK(!poll.TryChargeUnqueuedAttempt(now));
+        BOOST_CHECK(!poll.TryChargeUnqueuedAttempt(now));
+        BOOST_CHECK_EQUAL(poll.AttemptsInWindow(now), charged);
+        const auto selected{poll.Take(now)};
+        BOOST_REQUIRE(selected);
+        BOOST_CHECK(*selected == older[i]);
+        BOOST_REQUIRE(poll.TryChargeAttempt(now));
+        BOOST_REQUIRE(poll.MarkObserved(*selected));
+    }
+    BOOST_CHECK_EQUAL(poll.DemandCount(), 0U);
+    BOOST_CHECK(poll.TryChargeUnqueuedAttempt(start + 4 * Poll::REFILL_INTERVAL));
+}
+
 BOOST_AUTO_TEST_CASE(waited_and_ordinary_attempts_share_one_rolling_budget)
 {
     Poll poll;

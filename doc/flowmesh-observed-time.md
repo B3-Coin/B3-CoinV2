@@ -155,8 +155,13 @@ Replies label the section with the endpoint's URL or say why there is none
 
 `Candles` asks the endpoint serving the market's data, only when it
 advertises candles. The work gate is not held across the request, which uses a
-lane with its own TLS connection (busy fails at once), so an order never waits
-for a candles page. The page is structure-checked (interval, window, aligned
+lane with its own TLS connection (busy fails at once). The page download
+itself does not hold the order work gate. If its forming candle is ahead of
+the held certified head, however, the subsequent ordinary verified refresh
+does hold that gate; a concurrent order can wait for its network reads,
+verification and durable high-water save. Eliminating that contention needs
+a separately reviewed consistent-snapshot path, not weaker verification.
+The page is structure-checked (interval, window, aligned
 ascending opens, non-overlapping sequences, consistent prices, exact volumes)
 and no candle may go past a head this client verified. The endpoint's forming
 candle ends at the endpoint's own head, which on an active market is nearly
