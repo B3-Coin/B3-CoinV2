@@ -5,13 +5,17 @@
 #include <node/flowmesh_https.h>
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_client_action_wait.h>
+#include <node/flowmesh_client_outcome.h>
 #include <node/flowmesh_service.h>
+#include <node/flowmesh_timing.h>
 #include <chain.h>
 #include <consensus/era.h>
 #include <consensus/flowmesh_params.h>
 #include <crypto/sha256.h>
 #include <dbwrapper.h>
 #include <flowmesh/bls_certificate.h>
+#include <flowmesh/market_view.h>
+#include <flowmesh/outcome_evidence.h>
 #include <flowmesh/production_engine.h>
 #include <flowmesh/production_wire.h>
 #include <modern/asset_output.h>
@@ -25,6 +29,8 @@
 #include <node/flowmesh_vault_index.h>
 #include <node/fn_seat_index.h>
 #include <primitives/block.h>
+#include <test/util/common.h>
+#include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
 #include <util/sock.h>
@@ -46,10 +52,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -481,6 +490,108 @@ BOOST_AUTO_TEST_CASE(https_client_reuses_verified_connection_and_exact_request_b
     BOOST_REQUIRE_MESSAGE(reset.response_received, reset.error);
     BOOST_CHECK(!reset.connection_reused);
     BOOST_CHECK(reset.tls_handshake_performed);
+}
+
+BOOST_AUTO_TEST_CASE(https_client_warm_matches_only_a_reusable_connection_to_the_same_origin)
+{
+    node::FlowMeshHttpsServer server{Options(), [](const auto&) {
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    node::FlowMeshHttpsServer other{Options(), [](const auto&) {
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    BOOST_REQUIRE_MESSAGE(other.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    node::FlowMeshHttpsClient client;
+    BOOST_CHECK(!client.Warm(endpoint)); // Nothing retained yet.
+    BOOST_REQUIRE(client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024).response_received);
+    BOOST_CHECK(client.Warm(endpoint));
+    // The same origin spelled differently is the same connection.
+    auto spelled{endpoint};
+    spelled.url += "/flowmesh/v1";
+    BOOST_CHECK(client.Warm(spelled));
+    // Another origin, another pin, no pin, another CA file or a malformed
+    // endpoint never match; the check changes nothing.
+    BOOST_CHECK(!client.Warm(Endpoint(other)));
+    auto wrong_pin{endpoint};
+    wrong_pin.certificate_sha256 = std::string(64, '0');
+    BOOST_CHECK(!client.Warm(wrong_pin));
+    auto no_pin{endpoint};
+    no_pin.certificate_sha256.clear();
+    BOOST_CHECK(!client.Warm(no_pin));
+    auto other_ca{endpoint};
+    other_ca.ca_file = m_path_root / "other-ca.pem";
+    BOOST_CHECK(!client.Warm(other_ca));
+    auto malformed{endpoint};
+    malformed.url = "http://127.0.0.1";
+    BOOST_CHECK(!client.Warm(malformed));
+    BOOST_CHECK(client.Warm(endpoint));
+    const auto reused{client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(reused.response_received, reused.error);
+    BOOST_CHECK(reused.connection_reused);
+    client.Reset();
+    BOOST_CHECK(!client.Warm(endpoint));
+    // A connection the server closed is never reported warm.
+    BOOST_REQUIRE(client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024).response_received);
+    BOOST_REQUIRE(client.Warm(endpoint));
+    server.Stop();
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{2}};
+    while (client.Warm(endpoint) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    BOOST_CHECK(!client.Warm(endpoint));
+    other.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_client_swap_carries_a_verified_connection_without_a_new_handshake)
+{
+    ConnectionObservation connections;
+    node::FlowMeshHttpsServer server{Options(), [](const auto& request) {
+        return node::FlowMeshHttpsServer::Response{200, request.body};
+    }};
+    BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(server,
+        [&](bool tcp_nodelay) { connections.Record(tcp_nodelay); }));
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    node::FlowMeshHttpsClient ordinary, lane;
+    const auto first{ordinary.Request(endpoint, "/flowmesh/v1", "{\"first\":1}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(first.response_received, first.error);
+    BOOST_CHECK(first.tls_handshake_performed);
+    BOOST_REQUIRE(ordinary.Warm(endpoint));
+    BOOST_REQUIRE(!lane.Warm(endpoint));
+    BOOST_CHECK(lane.Swap(ordinary));
+    BOOST_CHECK(lane.Warm(endpoint));
+    BOOST_CHECK(!ordinary.Warm(endpoint));
+    // The carried connection serves the other session without a handshake.
+    const auto carried{lane.Request(endpoint, "/flowmesh/v1", "{\"carried\":1}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(carried.response_received, carried.error);
+    BOOST_CHECK_EQUAL(carried.body, "{\"carried\":1}");
+    BOOST_CHECK(carried.connection_reused);
+    BOOST_CHECK(!carried.tls_handshake_performed);
+    BOOST_CHECK(carried.request_may_have_been_sent);
+    // Handed back, it serves the first session again: still one connection.
+    BOOST_CHECK(ordinary.Swap(lane));
+    const auto back{ordinary.Request(endpoint, "/flowmesh/v1", "{\"back\":1}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(back.response_received, back.error);
+    BOOST_CHECK(back.connection_reused);
+    BOOST_CHECK(!back.tls_handshake_performed);
+    const auto samples{connections.Await(1)};
+    BOOST_REQUIRE(samples);
+    // The session left with the empty state opens its own connection.
+    const auto own{lane.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(own.response_received, own.error);
+    BOOST_CHECK(!own.connection_reused);
+    BOOST_CHECK(own.tls_handshake_performed);
+    BOOST_REQUIRE(connections.Await(2));
+    // Sessions with different keep-alive policies never exchange state.
+    node::FlowMeshHttpsClient one_shot{false};
+    BOOST_CHECK(!one_shot.Swap(ordinary));
+    BOOST_CHECK(ordinary.Warm(endpoint));
+    server.Stop();
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
 }
 
 BOOST_AUTO_TEST_CASE(https_warm_response_loss_is_unknown_without_hidden_replay)
@@ -2207,24 +2318,71 @@ struct ScriptedEndpoint {
     UniValue markets{UniValue::VARR};
     UniValue plain{UniValue::VOBJ}, waited{UniValue::VOBJ}, submit{UniValue::VOBJ};
     unsigned plain_reads{0}, waited_reads{0}, submits{0}, market_reads{0};
+    //! Opt-in outcome requests: 'action' reads carrying "outcome": true, and
+    //! 'outcome_evidence' reads (answered with `evidence`, or `evidence_error`).
+    unsigned outcome_flags{0}, evidence_reads{0};
+    UniValue evidence{UniValue::VOBJ};
+    std::string evidence_error;
+    //! Answer "outcome" with the unknown-field error (a downgraded endpoint).
+    bool reject_outcome_field{false};
+    //! Unwaited 'action' replies for specific ActionIds (instead of `plain`),
+    //! and how often each was read.
+    std::map<std::string, UniValue> by_action;
+    std::map<std::string, unsigned> by_action_reads;
+    //! Called with the method and params before `mutex` is taken, so a test
+    //! can hold one request while others (on other connections) are served.
+    //! Set before the endpoint serves.
+    std::function<void(const std::string&, const UniValue&)> before;
+    //! Submissions carrying wait_ms, counted apart from `submits` and
+    //! answered with `waited_submit`, or, with reject_submit_wait, with the
+    //! unknown-field error (a downgraded endpoint).
+    unsigned waited_submits{0};
+    UniValue waited_submit{UniValue::VOBJ};
+    bool reject_submit_wait{false};
+    //! The params of every submission, in arrival order.
+    std::vector<UniValue> submitted;
 
     node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
     {
         UniValue json;
         if (!json.read(request.body) || !json.isObject() || !json["method"].isStr()) return {400, R"({"ok":false,"error":"test","result":null})"};
         const auto& method{json["method"].get_str()};
+        if (before) before(method, json["params"]);
         std::lock_guard lock{mutex};
         UniValue out{UniValue::VOBJ};
         out.pushKV("ok", true);
+        if (method == "action" && json["params"].exists("outcome")) {
+            ++outcome_flags;
+            if (reject_outcome_field) return {400, R"({"ok":false,"error":"Unknown or duplicate client API field"})"};
+        }
+        if (method == "outcome_evidence") {
+            ++evidence_reads;
+            if (!evidence_error.empty()) return {400, R"({"ok":false,"error":")" + evidence_error + R"("})"};
+            out.pushKV("result", evidence);
+            out.pushKV("error", "");
+            return {200, out.write()};
+        }
         if (method == "markets") {
             ++market_reads;
             out.pushKV("result", markets);
         } else if (method == "submit") {
-            ++submits;
-            out.pushKV("result", submit);
+            submitted.push_back(json["params"]);
+            if (json["params"].exists("wait_ms")) {
+                ++waited_submits;
+                if (reject_submit_wait) return {400, R"({"ok":false,"error":"Unknown or duplicate client API field"})"};
+                out.pushKV("result", waited_submit);
+            } else {
+                ++submits;
+                out.pushKV("result", submit);
+            }
         } else if (method == "action" && json["params"].exists("wait_ms")) {
             ++waited_reads;
             out.pushKV("result", waited);
+        } else if (method == "action" && json["params"]["action_id"].isStr() &&
+                   by_action.contains(json["params"]["action_id"].get_str())) {
+            const auto& id{json["params"]["action_id"].get_str()};
+            ++by_action_reads[id];
+            out.pushKV("result", by_action.at(id));
         } else if (method == "action") {
             ++plain_reads;
             out.pushKV("result", plain);
@@ -2238,6 +2396,67 @@ struct ScriptedEndpoint {
     {
         std::lock_guard lock{mutex};
         return {plain_reads, waited_reads, submits, market_reads};
+    }
+};
+
+//! Holds the requests a ScriptedEndpoint::before hook passes to Hold until
+//! Release (at most 4 s), and tells the test when they arrived.
+struct RequestGate {
+    std::mutex mutex;
+    std::condition_variable condition;
+    unsigned entered{0};
+    bool released{false};
+    void Hold()
+    {
+        std::unique_lock lock{mutex};
+        ++entered;
+        condition.notify_all();
+        condition.wait_for(lock, std::chrono::seconds{4}, [&] { return released; });
+    }
+    bool AwaitEntered(const unsigned count = 1)
+    {
+        std::unique_lock lock{mutex};
+        return condition.wait_for(lock, std::chrono::seconds{3}, [&] { return entered >= count; });
+    }
+    void Release()
+    {
+        {
+            std::lock_guard lock{mutex};
+            released = true;
+        }
+        condition.notify_all();
+    }
+};
+
+//! Records this process's FlowMesh timing spans (default off, as in
+//! production) for one test; Stop returns the events of one stage. The
+//! process-wide capture is left stopped and empty, as other suites expect.
+struct TimingCapture {
+    bool active{true};
+    TimingCapture() { node::FlowMeshTimingControl("start"); }
+    ~TimingCapture()
+    {
+        try {
+            if (active) node::FlowMeshTimingControl("stop");
+            Clear();
+        } catch (...) {
+        }
+    }
+    static void Clear()
+    {
+        node::FlowMeshTimingControl("start");
+        node::FlowMeshTimingControl("stop");
+    }
+    std::vector<UniValue> Stop(const std::string& stage)
+    {
+        active = false;
+        const auto capture{node::FlowMeshTimingControl("stop")};
+        std::vector<UniValue> out;
+        for (const auto& row : capture["events"].getValues()) {
+            const auto& event{row["event"]};
+            if (event["stage"].isStr() && event["stage"].get_str() == stage) out.push_back(event);
+        }
+        return out;
     }
 };
 
@@ -2257,9 +2476,18 @@ struct ClientLaneFixture : TestingSetup {
     flowmesh::VaultId vault;
     flowmesh::ActiveFnBlsSeatSet seats;
     std::vector<bls::SecretKey> secrets;
+    //! The bootstrap user deposit established on this chain (account 0x41).
+    COutPoint deposit_outpoint;
+    //! ClientLaneFixture(n) only: n more keyed accounts, each with a
+    //! bootstrap user deposit of BOOK_DEPOSIT base units (outputs 1..n of the
+    //! same transaction), for books wider than one curve page.
+    static constexpr CAmount BOOK_DEPOSIT{1'000};
+    std::vector<CKey> book_keys;
+    std::vector<COutPoint> book_deposits;
     CBlockIndex* original_tip{nullptr};
 
-    ClientLaneFixture()
+    ClientLaneFixture() : ClientLaneFixture(size_t{0}) {}
+    explicit ClientLaneFixture(const size_t book_accounts)
         : TestingSetup(ChainType::REGTEST, {.extra_args = {"-b3modernregtest", "-b3flowmeshtest", "-b3corridorlength=130"}})
     {
         HttpsFixture::CreateCertificate(cert, key, pin, true);
@@ -2289,6 +2517,22 @@ struct ClientLaneFixture : TestingSetup {
         CMutableTransaction bootstrap;
         bootstrap.version = 2;
         bootstrap.vout.push_back(*deposit);
+        for (size_t i{0}; i < book_accounts; ++i) {
+            CKey book_key;
+            std::array<unsigned char, 32> secret{};
+            secret[0] = 0x6b;
+            secret[30] = static_cast<unsigned char>((i + 1) >> 8);
+            secret[31] = static_cast<unsigned char>(i + 1);
+            book_key.Set(secret.begin(), secret.end(), true);
+            const auto holder{flowmesh::AccountForKey(XOnlyPubKey{book_key.GetPubKey()})};
+            const auto output{modern::MakeDexVaultOutput(asset, BOOK_DEPOSIT, vault, modern::VAULT_KIND_USER_DEPOSIT,
+                                                         modern::FlowMeshUserDepositShard(vault, holder), holder)};
+            BOOST_REQUIRE(output);
+            bootstrap.vout.push_back(*output);
+            book_keys.push_back(book_key);
+        }
+        deposit_outpoint = COutPoint{bootstrap.GetHash(), 0};
+        for (size_t i{0}; i < book_accounts; ++i) book_deposits.emplace_back(bootstrap.GetHash(), static_cast<uint32_t>(i + 1));
 
         LOCK(::cs_main);
         auto& chainstate{chainman.ActiveChainstate()};
@@ -2345,6 +2589,41 @@ struct ClientLaneFixture : TestingSetup {
         m_node.chainman->ActiveChain().SetTip(*original_tip);
     }
 
+    //! Connect one synthetic B3 block carrying `records` and index it.
+    void ConnectMpaBlock(const std::vector<CMpaRecord>& records)
+    {
+        LOCK(::cs_main);
+        auto& chainman{*m_node.chainman};
+        auto& chainstate{chainman.ActiveChainstate()};
+        auto& chain{chainstate.m_chain};
+        const auto& params{chainman.GetConsensus()};
+        CMutableTransaction transaction;
+        transaction.version = 2;
+        transaction.mpa = records;
+        CBlock block;
+        block.nVersion = 2;
+        block.hashPrevBlock = chain.Tip()->GetBlockHash();
+        block.nTime = chain.Tip()->nTime + 1;
+        block.nNonce = chain.Height() + 1;
+        block.vtx = {MakeTransactionRef(transaction)};
+        auto* index{chainman.m_blockman.InsertBlockIndex(block.GetHash())};
+        BOOST_REQUIRE(index);
+        index->nHeight = chain.Height() + 1;
+        index->pprev = chain.Tip();
+        index->nTime = block.nTime;
+        index->BuildSkip();
+        chain.SetTip(*index);
+        auto& seat_tracker{chainstate.ModernFnSeats()};
+        auto& vault_tracker{chainstate.ModernFlowMeshVaults()};
+        auto& checkpoint_tracker{chainstate.ModernFlowMeshCheckpoints()};
+        seat_tracker.BlockConnected(block, *index, params);
+        vault_tracker.BlockConnected(block, *index, params);
+        checkpoint_tracker.BlockConnected(block, *index, chain, params, seat_tracker.Index(), vault_tracker.Index());
+        BOOST_REQUIRE(seat_tracker.Synced(index->GetBlockHash()));
+        BOOST_REQUIRE(vault_tracker.Synced(index->GetBlockHash()));
+        BOOST_REQUIRE(checkpoint_tracker.Synced(index->GetBlockHash()));
+    }
+
     node::FlowMeshHttpsServer::Options Options(uint16_t port = 0) const
     {
         node::FlowMeshHttpsServer::Options options;
@@ -2357,9 +2636,15 @@ struct ClientLaneFixture : TestingSetup {
     {
         return {"https://127.0.0.1:" + std::to_string(port), cert, pin};
     }
-    std::unique_ptr<node::FlowMeshHttpsServer> Serve(ScriptedEndpoint& endpoint, uint16_t port = 0) const
+    //! `connections`, when set, is told of every connection the endpoint admits.
+    std::unique_ptr<node::FlowMeshHttpsServer> Serve(ScriptedEndpoint& endpoint, uint16_t port = 0,
+                                                     ConnectionObservation* connections = nullptr) const
     {
         auto server{std::make_unique<node::FlowMeshHttpsServer>(Options(port), [&endpoint](const auto& request) { return endpoint.Handle(request); })};
+        if (connections) {
+            BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(*server,
+                [connections](bool tcp_nodelay) { connections->Record(tcp_nodelay); }));
+        }
         std::string error;
         BOOST_REQUIRE_MESSAGE(server->Start(error), error);
         return server;
@@ -2369,8 +2654,9 @@ struct ClientLaneFixture : TestingSetup {
     {
         return ClientConnectFixture::SeedRetainedAction(path, market, owner, domain, config);
     }
-    //! This market's discovery row, advertising `wait` when nonzero.
-    UniValue MarketRow(std::chrono::milliseconds wait) const
+    //! This market's discovery row, advertising `wait` (and `submit_wait`
+    //! on 'submit') when nonzero.
+    UniValue MarketRow(std::chrono::milliseconds wait, std::chrono::milliseconds submit_wait = std::chrono::milliseconds{0}) const
     {
         UniValue row{UniValue::VOBJ};
         row.pushKV("domain", domain.GetHex()); row.pushKV("market_id", market.GetHex());
@@ -2380,7 +2666,22 @@ struct ClientLaneFixture : TestingSetup {
         row.pushKV("halt", ""); row.pushKV("error", "");
         row.pushKV("next_microblock_sequence", 1); row.pushKV("last_microblock_hash", uint256{}.GetHex());
         if (wait.count()) row.pushKV("action_wait_ms_max", wait.count());
+        if (submit_wait.count()) row.pushKV("submit_wait_ms_max", submit_wait.count());
         return row;
+    }
+    //! A cancel signed by this fixture's trading key under this market's pins.
+    flowmesh::Action SignedCancel(const uint64_t sequence) const
+    {
+        CKey key;
+        std::array<unsigned char, 32> secret{};
+        secret.back() = 0x5a;
+        key.Set(secret.begin(), secret.end(), true);
+        flowmesh::Action action;
+        action.signer = flowmesh::AccountForKey(XOnlyPubKey{key.GetPubKey()});
+        action.sequence = sequence;
+        action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+        BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, action));
+        return action;
     }
     static UniValue Receipt(const flowmesh::Action& action, const std::string& state)
     {
@@ -2388,6 +2689,19 @@ struct ClientLaneFixture : TestingSetup {
         receipt.pushKV("action_id", action.Id().GetHex()); receipt.pushKV("receipt_state", state);
         receipt.pushKV("reason", "scripted " + state);
         return receipt;
+    }
+    //! A waited 'submit' reply: the acknowledgement in `state`, the embedded
+    //! 'action' reply (omitted when null) and the wait_status hint.
+    static UniValue WaitedSubmitReply(const flowmesh::Action& action, const std::string& state, UniValue embedded,
+                                      const std::string& wait_status)
+    {
+        auto reply{Receipt(action, state)};
+        if (!embedded.isNull()) {
+            embedded.pushKV("wait_status", wait_status);
+            reply.pushKV("action", std::move(embedded));
+        }
+        reply.pushKV("wait_status", wait_status);
+        return reply;
     }
     /** An 'action' reply proving the action's inclusion in a microblock that
      * this market's seats certified. The client checks inclusion by that
@@ -2435,6 +2749,54 @@ struct ClientLaneFixture : TestingSetup {
         receipt.pushKV("microblock_sequence", entry.sequence);
         receipt.pushKV("certified_payload", HexStr(*payload));
         return receipt;
+    }
+    /** An opt-in 'action' reply for a microblock whose body really executes
+     * `action`: its certified payload plus the outcome evidence that hashes
+     * to the entry's result root. Also returns the evidence hex alone. */
+    std::pair<UniValue, std::string> OutcomeReceipt(const flowmesh::Action& action, const uint64_t next_sequence = 0) const
+    {
+        const auto& params{m_node.chainman->GetConsensus()};
+        const CScript treasury{params.modern_pos->treasury_script.begin(), params.modern_pos->treasury_script.end()};
+        node::ChainAnchorPolicy anchors{*m_node.chainman, Consensus::FLOWMESH_ANCHOR_DEPTH};
+        flowmesh::AnchorRef anchor;
+        int height;
+        {
+            LOCK(::cs_main);
+            height = m_node.chainman->ActiveChain().Height();
+            const auto* index{m_node.chainman->ActiveChain()[static_cast<int>(seats.anchor_height)]};
+            anchor = {index->nHeight, index->GetBlockHash()};
+        }
+        flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+        // The signer's next account sequence before this entry: an action at
+        // exactly that sequence consumes it.
+        if (next_sequence > 0) flowmesh::test_only::StateFunding::SetNextSequence(initial, action.signer, next_sequence);
+        flowmesh::ProductionEpochGate gate{domain, market, seats};
+        flowmesh::ProductionEntryCheck check;
+        const std::vector<flowmesh::Action> body{action};
+        const auto built{flowmesh::BuildProductionExecutionEntry(initial, domain, market, seats, gate, 0, 0, {}, anchor,
+            {height, std::nullopt, &anchors}, modern::AssetOwnerCommitment(treasury), body, nullptr, check)};
+        BOOST_REQUIRE_MESSAGE(built, flowmesh::ProductionEntryCheckName(check));
+        std::vector<flowmesh::IndexedBlsSignature> signatures;
+        const auto context{flowmesh::ProductionCertificateContext(built->entry)};
+        for (uint32_t i{0}; i < flowmesh::FlowMeshBlsThreshold(seats.Size()); ++i) {
+            const auto signature{flowmesh::SignBlsMicroblockCertificate(secrets[i], context, seats)};
+            BOOST_REQUIRE(signature);
+            signatures.push_back({i, *signature});
+        }
+        flowmesh::BlsMicroblockCertificate certificate;
+        BOOST_REQUIRE(flowmesh::AssembleProductionEntryCertificate(built->entry, seats, signatures, certificate) ==
+                      flowmesh::BlsCertificateAssemblyCheck::OK);
+        const auto payload{flowmesh::EncodeProductionCertifiedPayload({built->entry, certificate}, seats.Size())};
+        BOOST_REQUIRE(payload);
+        const auto evidence{flowmesh::EncodeExecutionOutcomeEvidenceV1(built->entry.sequence, built->entry.GetHash(),
+            flowmesh::MakeExecutionOutcomePreimageV1(built->result), built->effects)};
+        BOOST_REQUIRE(evidence);
+        auto receipt{Receipt(action, "certified_inclusion")};
+        receipt.pushKV("microblock_hash", built->entry.GetHash().GetHex());
+        receipt.pushKV("microblock_sequence", built->entry.sequence);
+        receipt.pushKV("certified_payload", HexStr(*payload));
+        receipt.pushKV("outcome_evidence", HexStr(*evidence));
+        return {receipt, HexStr(*evidence)};
     }
     //! The outbox row Restore reads back for `action`, from a closed journal.
     static UniValue DurableRow(const fs::path& path, const flowmesh::Action& action)
@@ -2689,6 +3051,3860 @@ BOOST_AUTO_TEST_CASE(lane_needs_a_delivery_acknowledged_in_this_process)
     BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 1, 1, 1}));
     client.reset();
     server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(lane_borrows_the_warm_ordinary_connection_for_its_first_waited_read)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.plain = validator.submit = Receipt(action, "admitted");
+    validator.waited = CertifiedReceipt(action);
+    validator.waited.pushKV("wait_status", "terminal");
+    ConnectionObservation connections;
+    auto server{Serve(validator, 0, &connections)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
+    BOOST_REQUIRE_EQUAL(connections.Count(), 1U);
+    std::this_thread::sleep_for(std::chrono::milliseconds{150}); // Refill the automatic read budget.
+
+    // The lane has never connected; the ordinary connection just delivered
+    // the action. The waited read carries it: the endpoint sees no second
+    // connection and the read performs no TLS handshake.
+    std::vector<UniValue> spans;
+    interfaces::FlowMeshActionReceipt waited;
+    {
+        TimingCapture timing;
+        waited = client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
+        spans = timing.Stop("client_action_wait");
+    }
+    BOOST_CHECK(waited.certificate_verified);
+    BOOST_CHECK_EQUAL(waited.state, "certified_inclusion");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 1, 1, 1}));
+    BOOST_CHECK_EQUAL(connections.Count(), 1U);
+    BOOST_REQUIRE_EQUAL(spans.size(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["connection_reused"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["tls_handshake_performed"].getInt<uint64_t>(), 0U);
+    BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["result"].get_str(), "certified");
+    // Handed back: ordinary work keeps using the same connection.
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 1, 1, 2}));
+    BOOST_CHECK_EQUAL(connections.Count(), 1U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(lane_keeps_the_carried_connection_when_ordinary_work_opened_its_own)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.plain = validator.submit = validator.waited = Receipt(action, "admitted");
+    validator.waited.pushKV("wait_status", "timeout");
+    RequestGate gate;
+    std::atomic<bool> hold{true};
+    validator.before = [&](const std::string& method, const UniValue& params) {
+        if (method == "action" && params.exists("wait_ms") && hold.exchange(false)) gate.Hold();
+    };
+    ConnectionObservation connections;
+    auto server{Serve(validator, 0, &connections)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+
+    TimingCapture timing;
+    std::thread waiter{[&] { (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000}); }};
+    BOOST_REQUIRE(gate.AwaitEntered());
+    // While the lane carries the connection, ordinary work is not blocked
+    // by the wait and opens its own connection.
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    gate.Release();
+    waiter.join();
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    // Both sessions are warm now: the lane keeps what it carried and the
+    // next waited read uses it without borrowing or a handshake.
+    (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto spans{timing.Stop("client_action_wait")};
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 2, 1, 3}));
+    BOOST_REQUIRE_EQUAL(spans.size(), 2U);
+    BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 0U);
+    BOOST_CHECK_EQUAL(spans[1]["borrowed"].getInt<uint64_t>(), 0U);
+    BOOST_CHECK_EQUAL(spans[1]["connection_reused"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[1]["tls_handshake_performed"].getInt<uint64_t>(), 0U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(lane_hands_back_no_connection_that_an_explicit_reconnect_reset)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.plain = validator.submit = validator.waited = Receipt(action, "admitted");
+    validator.waited.pushKV("wait_status", "timeout");
+    RequestGate gate;
+    std::atomic<bool> hold{true};
+    validator.before = [&](const std::string& method, const UniValue& params) {
+        if (method == "action" && params.exists("wait_ms") && hold.exchange(false)) gate.Hold();
+    };
+    ConnectionObservation connections;
+    auto server{Serve(validator, 0, &connections)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+
+    TimingCapture timing;
+    std::thread waiter{[&] { (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000}); }};
+    BOOST_REQUIRE(gate.AwaitEntered());
+    // An explicit reconnect revalidates trust while the lane carries the
+    // connection verified before it: that one is never handed back.
+    BOOST_CHECK_EQUAL(client->Reconnect().status, "reachable");
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    gate.Release();
+    waiter.join();
+    // Ordinary work keeps the reconnect's connection.
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    // The lane drops what it carried before its next request, then carries
+    // the reconnect's verified connection.
+    (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
+    const auto spans{timing.Stop("client_action_wait")};
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    BOOST_REQUIRE_EQUAL(spans.size(), 2U);
+    BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 0U);
+    BOOST_CHECK_EQUAL(spans[1]["borrowed"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[1]["connection_reused"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[1]["handed_back"].getInt<uint64_t>(), 1U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_submit_wait_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(waited_submit_without_a_submit_advert_chains_one_waited_read)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    // An f8a3432 endpoint: the action wait only.
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.submit = Receipt(action, "admitted");
+    validator.waited = CertifiedReceipt(action);
+    validator.waited.pushKV("wait_status", "terminal");
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // The ordinary submission, then one waited read of the exact action at
+    // the endpoint that acknowledged it: the verified inclusion in one call.
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(receipt.certificate_verified);
+    BOOST_CHECK_EQUAL(receipt.state, "certified_inclusion");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 1, 1, 1}));
+    {
+        std::lock_guard lock{validator.mutex};
+        BOOST_CHECK_EQUAL(validator.waited_submits, 0U);
+        BOOST_REQUIRE_EQUAL(validator.submitted.size(), 1U);
+        BOOST_CHECK(!validator.submitted[0].exists("wait_ms"));
+        BOOST_CHECK_EQUAL(validator.submitted[0]["action_hex"].get_str(), HexStr(*flowmesh::EncodeProductionActionPayload(action)));
+    }
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].receipt.certificate_verified);
+    BOOST_CHECK(saved[0].may_have_been_sent);
+    client.reset();
+    server->Stop();
+    const auto durable{DurableRow(path, action)};
+    BOOST_CHECK(durable["may_have_been_sent"].get_bool());
+    BOOST_CHECK_EQUAL(durable["receipt"]["receipt_state"].get_str(), "certified_inclusion");
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_without_any_wait_advert_is_one_plain_submission)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    // A c10c952 endpoint: no waits at all.
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{0}));
+    validator.submit = Receipt(action, "admitted");
+    validator.waited = CertifiedReceipt(action);
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(!receipt.certificate_verified);
+    BOOST_CHECK_EQUAL(receipt.state, "admitted");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 1, 1}));
+    // A definite refusal never waits either, even where waits are offered.
+    const auto refused_action{SignedCancel(5)};
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.markets = UniValue{UniValue::VARR};
+        validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+        validator.submit = Receipt(refused_action, "rejected");
+    }
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto refused{client->Submit(market, refused_action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(refused.state, "rejected");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 2, 2}));
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_is_one_request_that_verifies_certified_inclusion)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}, std::chrono::milliseconds{1000}));
+    validator.waited_submit = WaitedSubmitReply(action, "queued", CertifiedReceipt(action), "terminal");
+    ConnectionObservation connections;
+    auto server{Serve(validator, 0, &connections)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    std::vector<UniValue> spans;
+    interfaces::FlowMeshActionReceipt receipt;
+    {
+        TimingCapture timing;
+        receipt = client->Submit(market, action, std::chrono::milliseconds{2000});
+        spans = timing.Stop("client_submit_wait");
+    }
+    // One request: the submission carried the wait, and its reply's
+    // certificate verified under local B3 authority.
+    BOOST_CHECK(receipt.certificate_verified);
+    BOOST_CHECK_EQUAL(receipt.state, "certified_inclusion");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 0, 1}));
+    BOOST_CHECK_EQUAL(connections.Count(), 1U);
+    {
+        std::lock_guard lock{validator.mutex};
+        BOOST_CHECK_EQUAL(validator.waited_submits, 1U);
+        BOOST_REQUIRE_EQUAL(validator.submitted.size(), 1U);
+        const auto& sent{validator.submitted[0]};
+        BOOST_CHECK_EQUAL(sent["action_hex"].get_str(), HexStr(*flowmesh::EncodeProductionActionPayload(action)));
+        BOOST_CHECK_EQUAL(sent["action_id"].get_str(), action.Id().GetHex());
+        // The smaller of the request and the endpoint's advertised maximum.
+        BOOST_CHECK_EQUAL(sent["wait_ms"].getInt<int64_t>(), 1000);
+        // No outcome evidence is advertised here, so none is asked for.
+        BOOST_CHECK(!sent.exists("outcome"));
+    }
+    BOOST_REQUIRE_EQUAL(spans.size(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["result"].get_str(), "certified");
+    BOOST_CHECK_EQUAL(spans[0]["wait_status"].get_str(), "terminal");
+    // The lane carried the ordinary connection the discovery read opened.
+    BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["tls_handshake_performed"].getInt<uint64_t>(), 0U);
+    BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 1U);
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].receipt.certificate_verified);
+    BOOST_CHECK(saved[0].may_have_been_sent);
+    BOOST_CHECK(saved[0].previously_certified);
+    client.reset();
+    server->Stop();
+    const auto durable{DurableRow(path, action)};
+    BOOST_CHECK(durable["may_have_been_sent"].get_bool());
+    BOOST_CHECK(durable["previously_certified"].get_bool());
+    BOOST_CHECK_EQUAL(durable["receipt"]["receipt_state"].get_str(), "certified_inclusion");
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_asks_for_outcome_evidence_only_where_offered)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    auto row{MarketRow(std::chrono::milliseconds{1000}, std::chrono::milliseconds{1000})};
+    row.pushKV("action_outcome_v1", true);
+    validator.markets.push_back(row);
+    validator.waited_submit = WaitedSubmitReply(action, "queued", OutcomeReceipt(action).first, "terminal");
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(receipt.certificate_verified);
+    BOOST_REQUIRE(receipt.outcome_verified);
+    BOOST_REQUIRE(receipt.outcome);
+    BOOST_CHECK_EQUAL(receipt.outcome->evidence, "certified_result_preimage");
+    std::lock_guard lock{validator.mutex};
+    BOOST_REQUIRE_EQUAL(validator.submitted.size(), 1U);
+    BOOST_CHECK(validator.submitted[0]["outcome"].get_bool());
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_refused_as_an_unknown_field_resends_the_exact_bytes_without_wait)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    // A downgraded endpoint that still advertises the submit wait (a stale
+    // advertisement), and no action wait, so nothing else follows.
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{0}, std::chrono::milliseconds{1000}));
+    validator.reject_submit_wait = true;
+    validator.submit = Receipt(action, "rejected");
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    // The refused field admitted nothing; the same bytes went again without
+    // it. The waited attempt might have been delivered, so the second
+    // endpoint answer's refusal is not definite.
+    BOOST_CHECK_EQUAL(receipt.state, "unknown");
+    BOOST_CHECK(!receipt.certificate_verified);
+    {
+        std::lock_guard lock{validator.mutex};
+        BOOST_CHECK_EQUAL(validator.waited_submits, 1U);
+        BOOST_CHECK_EQUAL(validator.submits, 1U);
+        BOOST_REQUIRE_EQUAL(validator.submitted.size(), 2U);
+        BOOST_CHECK(validator.submitted[0].exists("wait_ms"));
+        BOOST_CHECK(!validator.submitted[1].exists("wait_ms"));
+        BOOST_CHECK_EQUAL(validator.submitted[0]["action_hex"].get_str(), validator.submitted[1]["action_hex"].get_str());
+        validator.submit = Receipt(SignedCancel(5), "admitted");
+    }
+    // The capability is withdrawn: the next submission carries no wait.
+    const auto next{client->Submit(market, SignedCancel(5), std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(next.state, "admitted");
+    std::lock_guard lock{validator.mutex};
+    BOOST_CHECK_EQUAL(validator.waited_submits, 1U);
+    BOOST_CHECK_EQUAL(validator.submits, 2U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_without_a_reply_stays_unknown_and_is_never_resent_to_that_endpoint)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}, std::chrono::milliseconds{1000}));
+    validator.plain = Receipt(action, "admitted");
+    validator.waited_submit = WaitedSubmitReply(action, "queued", CertifiedReceipt(action), "terminal");
+    // The endpoint holds the waited submission past its 2 s request
+    // deadline: it may have admitted it, and no reply is ever written.
+    validator.before = [](const std::string& method, const UniValue& params) {
+        if (method == "submit" && params.exists("wait_ms")) std::this_thread::sleep_for(std::chrono::milliseconds{2300});
+    };
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto start{std::chrono::steady_clock::now()};
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{5});
+    BOOST_CHECK_EQUAL(receipt.state, "unknown");
+    BOOST_CHECK(!receipt.certificate_verified);
+    BOOST_CHECK(!receipt.reason.empty());
+    {
+        std::lock_guard lock{validator.mutex};
+        BOOST_CHECK_EQUAL(validator.waited_submits, 1U);
+        BOOST_CHECK_EQUAL(validator.submits, 0U);
+    }
+    // Retained, possibly delivered, visible, and still blocking a different
+    // instruction for its account sequence.
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].may_have_been_sent);
+    BOOST_CHECK_EQUAL(saved[0].receipt.state, "unknown");
+    auto other{SignedCancel(4)};
+    other.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_ASK);
+    {
+        CKey key;
+        std::array<unsigned char, 32> secret{};
+        secret.back() = 0x5a;
+        key.Set(secret.begin(), secret.end(), true);
+        BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, other));
+    }
+    BOOST_REQUIRE(other.Id() != action.Id());
+    const auto blocked{client->Submit(market, other, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(blocked.state, "rejected");
+    BOOST_CHECK(blocked.reason.find("A different retained action already uses this account sequence") != std::string::npos);
+    // The exact action resolves by an ordinary status read, not a resend.
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    BOOST_CHECK_EQUAL(client->ActionStatus(market, action.Id(), false).state, "admitted");
+    {
+        std::lock_guard lock{validator.mutex};
+        BOOST_CHECK_EQUAL(validator.waited_submits, 1U);
+        BOOST_CHECK_EQUAL(validator.submits, 0U);
+    }
+    client.reset();
+    server->Stop();
+    BOOST_CHECK(DurableRow(path, action)["may_have_been_sent"].get_bool());
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_without_a_reply_resends_the_exact_bytes_only_to_the_other_endpoint)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint silent, other;
+    silent.markets.push_back(MarketRow(std::chrono::milliseconds{0}, std::chrono::milliseconds{1000}));
+    silent.before = [](const std::string& method, const UniValue& params) {
+        if (method == "submit" && params.exists("wait_ms")) std::this_thread::sleep_for(std::chrono::milliseconds{2300});
+    };
+    other.markets.push_back(MarketRow(std::chrono::milliseconds{0}));
+    other.submit = Receipt(action, "admitted");
+    auto silent_server{Serve(silent)};
+    auto other_server{Serve(other)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman,
+        {Endpoint(silent_server->Port()), Endpoint(other_server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    // The ordinary failover, minus the endpoint that did not answer.
+    BOOST_CHECK_EQUAL(receipt.state, "admitted");
+    {
+        std::lock_guard lock{silent.mutex};
+        BOOST_CHECK_EQUAL(silent.waited_submits, 1U);
+        BOOST_CHECK_EQUAL(silent.submits, 0U);
+    }
+    std::lock_guard lock{other.mutex};
+    BOOST_CHECK_EQUAL(other.waited_submits, 0U);
+    BOOST_REQUIRE_EQUAL(other.submits, 1U);
+    BOOST_CHECK_EQUAL(other.submitted[0]["action_hex"].get_str(), HexStr(*flowmesh::EncodeProductionActionPayload(action)));
+    client.reset();
+    silent_server->Stop();
+    other_server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_unwinding_after_its_request_releases_the_flight_and_stays_unknown)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}, std::chrono::milliseconds{1000}));
+    // The endpoint certifies it at once, but the reply is never applied.
+    validator.waited_submit = WaitedSubmitReply(action, "queued", CertifiedReceipt(action), "terminal");
+    validator.plain = Receipt(action, "queued");
+    validator.submit = Receipt(action, "admitted");
+    validator.waited = CertifiedReceipt(action);
+    validator.waited.pushKV("wait_status", "terminal");
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // An unwind after the request (as a failed allocation there would) and
+    // before the reply is applied under the work gate.
+    unsigned faults{0};
+    BOOST_REQUIRE(node::SetFlowMeshLaneSubmissionFaultForTest(*client, [&] {
+        ++faults;
+        throw std::runtime_error{"Injected unwind after the waited submission's request"};
+    }));
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(faults, 1U);
+    // Possibly delivered: unknown, never refused, and never the unapplied
+    // certification.
+    BOOST_CHECK_EQUAL(receipt.state, "unknown");
+    BOOST_CHECK(!receipt.certificate_verified);
+    BOOST_CHECK(receipt.action_id == action.Id());
+    BOOST_CHECK(receipt.reason.find("Injected unwind") != std::string::npos);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 0, 1}));
+    BOOST_REQUIRE(node::SetFlowMeshLaneSubmissionFaultForTest(*client, {}));
+    // The flight was released: the row is back in the saved view, possibly
+    // delivered, and durable as such.
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].may_have_been_sent);
+    BOOST_CHECK_EQUAL(saved[0].receipt.state, "unknown");
+    BOOST_CHECK(!saved[0].receipt.certificate_verified);
+    // A different instruction for the same account sequence is still refused.
+    auto other{action};
+    other.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_ASK);
+    {
+        CKey key;
+        std::array<unsigned char, 32> secret{};
+        secret.back() = 0x5a;
+        key.Set(secret.begin(), secret.end(), true);
+        BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, other));
+    }
+    BOOST_REQUIRE(other.Id() != action.Id());
+    const auto blocked{client->Submit(market, other, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(blocked.state, "rejected");
+    BOOST_CHECK(blocked.reason.find("A different retained action already uses this account sequence") != std::string::npos);
+    // Its status reads, and an exact retry resends the retained bytes
+    // (never "in flight").
+    BOOST_CHECK_EQUAL(client->ActionStatus(market, action.Id(), false).state, "queued");
+    const auto retried{client->ActionStatus(market, action.Id(), true)};
+    BOOST_CHECK_EQUAL(retried.state, "admitted");
+    BOOST_CHECK(retried.reason.find("in flight") == std::string::npos);
+    {
+        std::lock_guard lock{validator.mutex};
+        BOOST_CHECK_EQUAL(validator.waited_submits, 1U);
+        BOOST_REQUIRE_EQUAL(validator.submits, 1U);
+        BOOST_REQUIRE_EQUAL(validator.submitted.size(), 2U);
+        BOOST_CHECK(!validator.submitted[1].exists("wait_ms"));
+        BOOST_CHECK_EQUAL(validator.submitted[1]["action_hex"].get_str(), validator.submitted[0]["action_hex"].get_str());
+    }
+    // The wait lane was unlocked: a waited read takes it and verifies the
+    // inclusion (after the automatic status budget refills).
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    const auto certified{client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(certified.certificate_verified);
+    BOOST_CHECK_EQUAL(certified.state, "certified_inclusion");
+    {
+        std::lock_guard lock{validator.mutex};
+        BOOST_CHECK_EQUAL(validator.waited_reads, 1U);
+    }
+    client.reset();
+    server->Stop();
+    BOOST_CHECK(DurableRow(path, action)["may_have_been_sent"].get_bool());
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_row_is_absent_from_the_saved_view_and_never_resent_until_submit_returns)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}, std::chrono::milliseconds{1000}));
+    validator.submit = Receipt(action, "admitted");
+    validator.waited_submit = WaitedSubmitReply(action, "queued", CertifiedReceipt(action), "terminal");
+    RequestGate gate;
+    validator.before = [&](const std::string& method, const UniValue& params) {
+        if (method == "submit" && params.exists("wait_ms")) gate.Hold();
+    };
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    interfaces::FlowMeshActionReceipt receipt;
+    std::thread submitter{[&] { receipt = client->Submit(market, action, std::chrono::milliseconds{2000}); }};
+    BOOST_REQUIRE(gate.AwaitEntered());
+    // In flight: the saved view answers at once, without the row, exactly
+    // as while an ordinary submission's network call is in flight.
+    const auto start{std::chrono::steady_clock::now()};
+    BOOST_CHECK(client->SavedActions(action.signer, market).empty());
+    BOOST_CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds{500});
+    // The same exact action is not sent again meanwhile.
+    const auto again{client->Submit(market, action)};
+    BOOST_CHECK_EQUAL(again.state, "unknown");
+    BOOST_CHECK(again.reason.find("in flight") != std::string::npos);
+    // A different instruction for the same account sequence is refused.
+    auto other{action};
+    other.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_ASK);
+    {
+        CKey key;
+        std::array<unsigned char, 32> secret{};
+        secret.back() = 0x5a;
+        key.Set(secret.begin(), secret.end(), true);
+        BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, other));
+    }
+    const auto blocked{client->Submit(market, other)};
+    BOOST_CHECK_EQUAL(blocked.state, "rejected");
+    BOOST_CHECK(blocked.reason.find("A different retained action already uses this account sequence") != std::string::npos);
+    gate.Release();
+    submitter.join();
+    BOOST_CHECK(receipt.certificate_verified);
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].receipt.certificate_verified);
+    std::lock_guard lock{validator.mutex};
+    BOOST_CHECK_EQUAL(validator.waited_submits, 1U);
+    BOOST_CHECK_EQUAL(validator.submits, 0U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_refusal_after_a_concurrent_observation_is_not_definite)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{0}, std::chrono::milliseconds{1000}));
+    validator.plain = Receipt(action, "admitted");
+    validator.waited_submit = WaitedSubmitReply(action, "rejected", UniValue{}, "none");
+    RequestGate gate;
+    validator.before = [&](const std::string& method, const UniValue& params) {
+        if (method == "submit" && params.exists("wait_ms")) gate.Hold();
+    };
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    interfaces::FlowMeshActionReceipt receipt;
+    std::thread submitter{[&] { receipt = client->Submit(market, action, std::chrono::milliseconds{2000}); }};
+    BOOST_REQUIRE(gate.AwaitEntered());
+    // A status read during the flight observes the action admitted.
+    BOOST_CHECK_EQUAL(client->ActionStatus(market, action.Id(), false).state, "admitted");
+    gate.Release();
+    submitter.join();
+    // One endpoint's later refusal never undoes that observation.
+    BOOST_CHECK_EQUAL(receipt.state, "admitted");
+    BOOST_CHECK(receipt.reason.find("rejected") != std::string::npos);
+    auto other{action};
+    other.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_ASK);
+    {
+        CKey key;
+        std::array<unsigned char, 32> secret{};
+        secret.back() = 0x5a;
+        key.Set(secret.begin(), secret.end(), true);
+        BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, other));
+    }
+    BOOST_CHECK_EQUAL(client->Submit(market, other).state, "rejected");
+    // Without a concurrent observation, a refusal of the first delivery is
+    // definite, exactly as for an ordinary submission.
+    const auto fresh{SignedCancel(5)};
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.waited_submit = WaitedSubmitReply(fresh, "rejected", UniValue{}, "none");
+    }
+    // The gate stays released: nothing is held from here on.
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    BOOST_CHECK_EQUAL(client->Submit(market, fresh, std::chrono::milliseconds{2000}).state, "rejected");
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_certification_whose_outbox_save_fails_is_returned_unverified)
+{
+#ifdef WIN32
+    BOOST_TEST_MESSAGE("Needs RLIMIT_FSIZE to fail the outbox write");
+#else
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}, std::chrono::milliseconds{1000}));
+    validator.waited_submit = WaitedSubmitReply(action, "queued", CertifiedReceipt(action), "terminal");
+    // The write-ahead record is durable before the request leaves; writes
+    // fail from then on, so saving the verified inclusion fails.
+    std::optional<ScopedFailedFileWrites> full_disk;
+    validator.before = [&](const std::string& method, const UniValue& params) {
+        if (method == "submit" && params.exists("wait_ms")) full_disk.emplace();
+    };
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    full_disk.reset();
+    // Never a verified label that is not durable.
+    BOOST_CHECK(!receipt.certificate_verified);
+    BOOST_CHECK_EQUAL(receipt.state, "unknown");
+    BOOST_CHECK(receipt.reason.find("LevelDB") != std::string::npos);
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(!saved[0].receipt.certificate_verified);
+    BOOST_CHECK(saved[0].may_have_been_sent);
+    // Still never resent: the no-replay marker stays set in memory.
+    BOOST_CHECK(saved[0].previously_certified);
+    client.reset();
+    server->Stop();
+    BOOST_CHECK(DurableRow(path, action)["may_have_been_sent"].get_bool());
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_the_endpoint_did_not_wait_for_chains_one_waited_read)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}, std::chrono::milliseconds{1000}));
+    // Every wait slot was taken: admitted, but not waited for.
+    validator.waited_submit = WaitedSubmitReply(action, "queued", Receipt(action, "queued"), "busy");
+    validator.waited = CertifiedReceipt(action);
+    validator.waited.pushKV("wait_status", "terminal");
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(receipt.certificate_verified);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 1, 0, 1}));
+    std::lock_guard lock{validator.mutex};
+    BOOST_CHECK_EQUAL(validator.waited_submits, 1U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_never_takes_the_lane_for_a_retained_action)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}, std::chrono::milliseconds{1000}));
+    validator.submit = Receipt(action, "admitted");
+    validator.waited = Receipt(action, "admitted");
+    validator.waited.pushKV("wait_status", "timeout");
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_REQUIRE_EQUAL(client->Submit(market, action).state, "admitted");
+    // Submitting the retained action again resends its exact bytes by the
+    // ordinary path (a waited read may follow), never as a waited submission.
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    BOOST_CHECK_EQUAL(client->Submit(market, action, std::chrono::milliseconds{2000}).state, "admitted");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 1, 2, 1}));
+    std::lock_guard lock{validator.mutex};
+    BOOST_CHECK_EQUAL(validator.waited_submits, 0U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+//! One public API call; (HTTP status, parsed body).
+std::pair<int, UniValue> ApiCall(const node::HttpsEndpoint& endpoint, const std::string& method, const std::string& params)
+{
+    const auto reply{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
+        "{\"method\":\"" + method + "\",\"params\":" + params + "}", std::chrono::seconds{5}, 1 << 24)};
+    BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+    UniValue value;
+    BOOST_REQUIRE(value.read(reply.body));
+    return {reply.status, value};
+}
+
+/** Runs `burst` at the start of a fresh one-second budget window of this
+ * identity, up to five times, until one run finishes within 900 ms; its
+ * result, or nullopt when none fitted (the caller fails). */
+template <typename Fn>
+auto FittedBurst(Fn&& burst) -> std::optional<decltype(burst())>
+{
+    for (int attempt{0}; attempt < 5; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1100}); // every earlier window has ended
+        const auto start{std::chrono::steady_clock::now()};
+        auto result{burst()};
+        if (std::chrono::steady_clock::now() - start < std::chrono::milliseconds{900}) return result;
+    }
+    return std::nullopt;
+}
+
+std::set<std::string> KeySet(const UniValue& object)
+{
+    const auto keys{object.getKeys()};
+    return {keys.begin(), keys.end()};
+}
+
+//! The status object keys an f8a3432 server sends with health disabled.
+std::set<std::string> PreviousStatusKeys(const UniValue& status)
+{
+    std::set<std::string> out{"market_id", "domain", "base_asset_id", "vault_id", "execution_config_id", "quote_asset",
+                              "available", "running", "paused", "pending_handoff", "halt", "error",
+                              "next_microblock_sequence", "last_microblock_hash", "epoch", "round", "pending_actions",
+                              "checkpoint_pending"};
+    if (status["checkpoint_pending"].get_bool()) {
+        out.insert({"pending_checkpoint_id", "pending_checkpoint_sequence", "pending_checkpoint_effect_count"});
+    }
+    return out;
+}
+
+// The field readers of the c10c952 and f8a3432 remote clients
+// (src/node/flowmesh_client.cpp at both revisions; identical there), copied
+// verbatim apart from their names.
+[[noreturn]] void PreviousFail(const std::string& reason) { throw std::runtime_error(reason); }
+std::string PreviousText(const UniValue& object, const char* key, size_t maximum = 1024)
+{
+    const auto& value{object[key]};
+    if (!value.isStr() || value.get_str().size() > maximum) PreviousFail(std::string{"Invalid text: "} + key);
+    return value.get_str();
+}
+uint256 PreviousId(const UniValue& object, const char* key, bool zero = false)
+{
+    const auto text{PreviousText(object, key, 64)};
+    const auto hash{uint256::FromHex(text)};
+    if (text.size() != 64 || !hash || (!zero && hash->IsNull())) PreviousFail(std::string{"Invalid identifier: "} + key);
+    return *hash;
+}
+uint64_t PreviousNumber(const UniValue& object, const char* key, uint64_t maximum = INT64_MAX)
+{
+    if (!object[key].isNum()) PreviousFail(std::string{"Expected integer: "} + key);
+    const auto value{object[key].getInt<uint64_t>()};
+    if (value > maximum) PreviousFail(std::string{"Integer exceeds client bound: "} + key);
+    return value;
+}
+bool PreviousFlag(const UniValue& object, const char* key)
+{
+    if (!object[key].isBool()) PreviousFail(std::string{"Expected boolean: "} + key);
+    return object[key].get_bool();
+}
+
+/** Everything a c10c952 or f8a3432 remote client takes from one status
+ * object. Their RemoteBackend reads status objects only by named field:
+ * CheckStatus (market rows and every snapshot and updates reply), the
+ * reported head in Refresh, Project, Market, LearnMetadata's presence check
+ * and, in f8a3432 only, FlowMeshAdvertisedActionWait. Their strict Keys()
+ * check covers only their own requests, the {ok, result, error} envelope,
+ * cursor rows and the endpoint file, never a status object; and neither
+ * copies a status object into anything it returns. So a status key these
+ * readers do not name cannot change what either client does. */
+struct PreviousClientStatusRead {
+    uint256 domain, market_id, base_asset_id, vault_id, execution_config_id;
+    std::string quote_asset;
+    bool running{false}, paused{false}, pending_handoff{false}, chain_reconciling{false};
+    std::string halt, error;
+    uint64_t next_microblock_sequence{0};
+    uint256 last_microblock_hash;
+    uint64_t round{0}, pending_actions{0};
+    bool checkpoint_pending{false};
+    uint256 pending_checkpoint_id;
+    uint64_t pending_checkpoint_sequence{0}, pending_checkpoint_effect_count{0};
+    bool asset_display{false};
+    //! f8a3432 only; c10c952 has no action wait.
+    int64_t action_wait_ms{0};
+
+    friend bool operator==(const PreviousClientStatusRead&, const PreviousClientStatusRead&) = default;
+};
+
+//! f8a3432's FlowMeshAdvertisedActionWait, verbatim.
+std::chrono::milliseconds PreviousAdvertisedActionWait(const UniValue& status) noexcept
+{
+    try {
+        if (!status.isObject()) return {};
+        const auto& value{status.find_value("action_wait_ms_max")};
+        if (!value.isNum()) return {};
+        return std::chrono::milliseconds{std::min<uint64_t>(value.getInt<uint64_t>(), node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count())};
+    } catch (...) {
+        return {};
+    }
+}
+
+//! Every read in the order those clients make them; throws where they fail.
+PreviousClientStatusRead ReadAsPreviousClients(const UniValue& value)
+{
+    PreviousClientStatusRead out;
+    // CheckStatus (the pins are compared by the caller).
+    out.domain = PreviousId(value, "domain");
+    out.market_id = PreviousId(value, "market_id");
+    out.base_asset_id = PreviousId(value, "base_asset_id");
+    out.vault_id = PreviousId(value, "vault_id");
+    out.execution_config_id = PreviousId(value, "execution_config_id");
+    out.quote_asset = PreviousText(value, "quote_asset");
+    out.running = PreviousFlag(value, "running");
+    out.paused = PreviousFlag(value, "paused");
+    out.pending_handoff = PreviousFlag(value, "pending_handoff");
+    if (value.exists("chain_reconciling")) out.chain_reconciling = PreviousFlag(value, "chain_reconciling");
+    out.halt = PreviousText(value, "halt");
+    out.error = PreviousText(value, "error");
+    out.next_microblock_sequence = PreviousNumber(value, "next_microblock_sequence");
+    out.last_microblock_hash = PreviousId(value, "last_microblock_hash", true);
+    // Project and Market.
+    out.round = PreviousNumber(value, "round", UINT32_MAX);
+    out.pending_actions = PreviousNumber(value, "pending_actions", 65536);
+    out.checkpoint_pending = PreviousFlag(value, "checkpoint_pending");
+    if (out.checkpoint_pending) {
+        out.pending_checkpoint_id = PreviousId(value, "pending_checkpoint_id");
+        out.pending_checkpoint_sequence = PreviousNumber(value, "pending_checkpoint_sequence");
+        out.pending_checkpoint_effect_count = PreviousNumber(value, "pending_checkpoint_effect_count", UINT32_MAX);
+    }
+    // LearnMetadata parses only this one named object, when present.
+    out.asset_display = value.exists("asset_display");
+    out.action_wait_ms = PreviousAdvertisedActionWait(value).count();
+    return out;
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_health_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(client_shows_advertised_readiness_without_changing_endpoints)
+{
+    const auto path{m_path_root / "readiness-client"};
+    ScriptedEndpoint behind, older;
+    auto row{MarketRow(std::chrono::milliseconds{0})};
+    row.pushKV("health_api_version", 1);
+    row.pushKV("endpoint_ready", false);
+    UniValue codes{UniValue::VARR};
+    codes.push_back("catching_up");
+    row.pushKV("endpoint_not_ready", codes);
+    behind.markets.push_back(row);
+    older.markets.push_back(MarketRow(std::chrono::milliseconds{0}));
+    auto first{Serve(behind)};
+    auto second{Serve(older)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(first->Port()), Endpoint(second->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    auto status{client->Status()};
+    BOOST_REQUIRE_EQUAL(status.endpoints.size(), 2U);
+    BOOST_CHECK_EQUAL(status.endpoints[0].readiness, "not_ready");
+    BOOST_CHECK_EQUAL(status.endpoints[0].readiness_market, market.GetHex());
+    BOOST_CHECK((status.endpoints[0].not_ready == std::vector<std::string>{"catching_up"}));
+    BOOST_CHECK_GT(status.endpoints[0].readiness_observed_ms, 0);
+    BOOST_CHECK_EQUAL(status.endpoints[1].readiness, "unknown");
+    // Display only: the endpoint that reports itself not ready still serves
+    // the reads, exactly as before.
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_CHECK_EQUAL(behind.Counts()[3], 2U);
+    BOOST_CHECK_EQUAL(older.Counts()[3], 0U);
+    // A malformed hint is unknown and never fails the read.
+    {
+        std::lock_guard lock{behind.mutex};
+        auto malformed{MarketRow(std::chrono::milliseconds{0})};
+        malformed.pushKV("health_api_version", 1);
+        malformed.pushKV("endpoint_ready", "no");
+        malformed.pushKV("endpoint_not_ready", codes);
+        behind.markets = UniValue{UniValue::VARR};
+        behind.markets.push_back(malformed);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    status = client->Status();
+    BOOST_CHECK_EQUAL(status.endpoints[0].readiness, "unknown");
+    BOOST_CHECK(status.endpoints[0].readiness_market.empty());
+    BOOST_CHECK(status.endpoints[0].not_ready.empty());
+    BOOST_CHECK_EQUAL(status.endpoints[0].readiness_observed_ms, 0);
+    client.reset();
+    first->Stop();
+    second->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(api_health_disabled_keeps_the_previous_contract)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-health-disabled"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    // The factory default is disabled: exactly the previous contract.
+    auto api{node::MakeFlowMeshTradingApi(service, Options())};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    const auto [status, refused]{ApiCall(endpoint, "health", "{}")};
+    BOOST_CHECK_EQUAL(status, 400);
+    BOOST_CHECK_EQUAL(refused["error"].get_str(), "This method is not exposed by the public trading API");
+    const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+    BOOST_REQUIRE_EQUAL(markets_status, 200);
+    BOOST_REQUIRE_EQUAL(markets["result"].size(), 1U);
+    const auto& row{markets["result"][0]};
+    BOOST_CHECK(KeySet(row) == PreviousStatusKeys(row));
+    const auto [updates_status, updates]{ApiCall(endpoint, "updates", "{\"market_id\":\"" + market.GetHex() + "\"}")};
+    BOOST_REQUIRE_MESSAGE(updates_status == 200, updates.write());
+    auto keys{PreviousStatusKeys(updates["result"]["status"])};
+    keys.insert("chain_reconciling");
+    BOOST_CHECK(KeySet(updates["result"]["status"]) == keys);
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(previous_clients_take_the_same_from_status_objects_with_added_keys)
+{
+    // -flowmeshapihealth defaults to 1, like the other additive status
+    // adverts, so the status objects c10c952 and f8a3432 clients read carry
+    // keys they never name. The replies are not byte-identical; what those
+    // clients take from them, and so what they do, is.
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-status-previous-clients"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    // Every additive status capability of this revision on, as init enables
+    // them by default (and the default-off watch too).
+    auto api{node::MakeFlowMeshTradingApi(
+        service, Options(), {},
+        {node::FLOWMESH_API_ACTION_WAIT_DEFAULT, node::FLOWMESH_API_ACTION_WAITERS_DEFAULT, true},
+        {true}, {true}, {std::chrono::milliseconds{2000}, 2}, {node::FLOWMESH_API_CLEARING_TICKS_DEFAULT}, {true},
+        {node::FLOWMESH_API_CANDLES_DEFAULT})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    const std::string one_market{"{\"market_id\":\"" + market.GetHex() + "\"}"};
+    const std::set<std::string> added{"health_api_version", "endpoint_ready", "endpoint_not_ready",
+                                      "submit_wait_ms_max", "updates_watch_ms_max", "action_outcome_v1",
+                                      "clearing_ticks_max", "observed_time_v1", "observed_candles_max"};
+
+    const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+    BOOST_REQUIRE_EQUAL(markets_status, 200);
+    BOOST_REQUIRE_EQUAL(markets["result"].size(), 1U);
+    const auto [updates_status, updates]{ApiCall(endpoint, "updates", one_market)};
+    BOOST_REQUIRE_MESSAGE(updates_status == 200, updates.write());
+    for (const UniValue* object : {&markets["result"][0], &updates["result"]["status"]}) {
+        // What an f8a3432 server sends: the keys it names and no others.
+        auto previous_keys{PreviousStatusKeys(*object)};
+        previous_keys.insert("action_wait_ms_max");
+        if (object == &updates["result"]["status"]) previous_keys.insert("chain_reconciling");
+        auto expected{previous_keys};
+        expected.insert(added.begin(), added.end());
+        BOOST_REQUIRE(KeySet(*object) == expected);
+        UniValue previous{UniValue::VOBJ};
+        for (size_t i{0}; i < object->size(); ++i) {
+            if (previous_keys.contains(object->getKeys()[i])) previous.pushKV(object->getKeys()[i], object->getValues()[i]);
+        }
+        BOOST_REQUIRE(KeySet(previous) == previous_keys);
+
+        // Both previous clients take exactly the same from the object this
+        // revision sends as from the f8a3432 one with the same values.
+        const auto read{ReadAsPreviousClients(*object)};
+        BOOST_CHECK(read == ReadAsPreviousClients(previous));
+        BOOST_CHECK(read.market_id == market);
+        BOOST_CHECK_EQUAL(read.action_wait_ms, node::FLOWMESH_API_ACTION_WAIT_DEFAULT.count());
+        // The same holds for any further key, of any type or position.
+        UniValue further{*object};
+        UniValue nested{UniValue::VOBJ};
+        nested.pushKV("running", false);
+        further.pushKV("zz_later_capability", nested);
+        further.pushKV("aa_later_list", UniValue{UniValue::VARR});
+        BOOST_CHECK(ReadAsPreviousClients(further) == read);
+    }
+    // The readers are faithful: a status object without a field they name
+    // fails them, as it failed those clients.
+    UniValue missing{markets["result"][0]};
+    UniValue without{UniValue::VOBJ};
+    for (size_t i{0}; i < missing.size(); ++i) {
+        if (missing.getKeys()[i] != "round") without.pushKV(missing.getKeys()[i], missing.getValues()[i]);
+    }
+    BOOST_CHECK_EXCEPTION(ReadAsPreviousClients(without), std::runtime_error, HasReason{"Expected integer: round"});
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(api_health_contract_capability_and_parameters)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-health-enabled"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {}, {true})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    const std::string one_market{"{\"market_id\":\"" + market.GetHex() + "\"}"};
+
+    const auto [status, reply]{ApiCall(endpoint, "health", "{}")};
+    BOOST_REQUIRE_EQUAL(status, 200);
+    const auto& health{reply["result"]};
+    BOOST_CHECK_EQUAL(health["health_version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(health["observation"].get_str(), "local-node");
+    BOOST_CHECK_EQUAL(health["service"]["state"].get_str(), "running");
+    // No operator detail on the public path.
+    BOOST_CHECK(!health["service"].exists("flowmesh_peers"));
+    BOOST_REQUIRE_EQUAL(health["markets"].size(), 1U);
+    const auto& row{health["markets"][0]};
+    BOOST_CHECK_EQUAL(row["market_id"].get_str(), market.GetHex());
+    BOOST_CHECK(!row.exists("error"));
+    BOOST_CHECK(!row.exists("proposal_wait_reason"));
+    BOOST_CHECK(!row["catchup"].exists("peers_hinting_ahead"));
+
+    const auto [single_status, single]{ApiCall(endpoint, "health", one_market)};
+    BOOST_CHECK_EQUAL(single_status, 200);
+    BOOST_CHECK_EQUAL(single["result"]["markets"].size(), 1U);
+    const auto [unknown_status, unknown]{ApiCall(endpoint, "health", "{\"market_id\":\"" + uint256::ONE.GetHex() + "\"}")};
+    BOOST_CHECK_EQUAL(unknown_status, 400);
+    BOOST_CHECK_EQUAL(unknown["error"].get_str(), "Unknown market");
+    const auto [invalid_status, invalid]{ApiCall(endpoint, "health", "{\"market_id\":\"zz\"}")};
+    BOOST_CHECK_EQUAL(invalid_status, 400);
+    BOOST_CHECK_EQUAL(invalid["error"].get_str(), "Invalid identifier: market_id");
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100}); // Refill the per-client health budget.
+    const auto [field_status, field]{ApiCall(endpoint, "health", "{\"verbose\":true}")};
+    BOOST_CHECK_EQUAL(field_status, 400);
+    BOOST_CHECK_EQUAL(field["error"].get_str(), "Unknown or duplicate client API field");
+
+    // Every status object advertises the capability and this endpoint's
+    // readiness for the market, as the health row reports it.
+    const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+    BOOST_REQUIRE_EQUAL(markets_status, 200);
+    BOOST_REQUIRE_EQUAL(markets["result"].size(), 1U);
+    const auto [updates_status, updates]{ApiCall(endpoint, "updates", one_market)};
+    BOOST_REQUIRE_EQUAL(updates_status, 200);
+    for (const auto* object : {&markets["result"][0], &updates["result"]["status"]}) {
+        auto keys{PreviousStatusKeys(*object)};
+        keys.insert({"health_api_version", "endpoint_ready", "endpoint_not_ready"});
+        if (object == &updates["result"]["status"]) keys.insert("chain_reconciling");
+        BOOST_CHECK(KeySet(*object) == keys);
+        BOOST_CHECK_EQUAL((*object)["health_api_version"].getInt<int>(), 1);
+        BOOST_CHECK_EQUAL((*object)["endpoint_ready"].get_bool(), row["ready"].get_bool());
+        BOOST_CHECK_EQUAL((*object)["endpoint_not_ready"].write(), row["not_ready"].write());
+    }
+    api->Stop();
+    service.Stop();
+    // A stopped service's endpoint reports itself not ready.
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto [stopped_status, stopped]{ApiCall(Endpoint(api->Port()), "health", one_market)};
+    BOOST_REQUIRE_EQUAL(stopped_status, 200);
+    BOOST_CHECK_EQUAL(stopped["result"]["service"]["state"].get_str(), "stopped");
+    BOOST_CHECK_EQUAL(stopped["result"]["markets"][0]["not_ready"].write(), "[\"service_stopped\",\"market_not_installed\"]");
+    api->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(api_health_is_cached_and_rate_limited_per_client)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-health-budget"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {}, {true})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    // Within the cache interval the all-markets reply is the same object,
+    // local ages included.
+    const auto start{std::chrono::steady_clock::now()};
+    const auto [first_status, first]{ApiCall(endpoint, "health", "{}")};
+    const auto [second_status, second]{ApiCall(endpoint, "health", "{}")};
+    if (std::chrono::steady_clock::now() - start < node::FLOWMESH_API_HEALTH_CACHE) {
+        BOOST_CHECK_EQUAL(first["result"].write(), second["result"].write());
+    }
+    BOOST_CHECK_EQUAL(first_status, 200);
+    BOOST_CHECK_EQUAL(second_status, 200);
+    // Four per second per client, then 429; single-market reads count too.
+    BOOST_CHECK_EQUAL(ApiCall(endpoint, "health", "{\"market_id\":\"" + market.GetHex() + "\"}").first, 200);
+    BOOST_CHECK_EQUAL(ApiCall(endpoint, "health", "{}").first, 200);
+    const auto [spent_status, spent]{ApiCall(endpoint, "health", "{}")};
+    if (std::chrono::steady_clock::now() - start < std::chrono::seconds{1}) {
+        BOOST_CHECK_EQUAL(spent_status, 429);
+        BOOST_CHECK_EQUAL(spent["error"].get_str(), node::FLOWMESH_API_HEALTH_BUDGET_ERROR);
+    }
+    // The ordinary admission budget is separate and unchanged.
+    BOOST_CHECK_EQUAL(ApiCall(endpoint, "markets", "{}").first, 200);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    BOOST_CHECK_EQUAL(ApiCall(endpoint, "health", "{}").first, 200);
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_budget_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(order_budget_refuses_orders_not_cancels_before_authentication)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-order-budget"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    auto api{node::MakeFlowMeshTradingApi(service, Options())};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    // Unsigned actions: each order is charged to the order sub-budget before
+    // authentication refuses it, which is what makes junk orders cost budget.
+    const auto action = [&](flowmesh::ActionType type, uint64_t sequence) {
+        flowmesh::Action out;
+        out.signer = uint256{uint8_t{0x77}};
+        out.sequence = sequence;
+        out.type = static_cast<uint8_t>(type);
+        if (type == flowmesh::ActionType::SUBMIT_BID) out.curve = {{5, 1}};
+        return out;
+    };
+    const auto params = [&](const flowmesh::Action& value) {
+        return "{\"market_id\":\"" + market.GetHex() + "\",\"action_id\":\"" + value.Id().GetHex() +
+               "\",\"action_hex\":\"" + HexStr(*flowmesh::EncodeProductionActionPayload(value)) + "\"}";
+    };
+    const std::string authentication{"Action authentication failed for this chain/domain/market configuration"};
+    const std::string exhausted{"Public trading order budget exhausted; cancels and withdrawals are still accepted"};
+    flowmesh::Action deposit;
+    deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
+    deposit.outpoint = COutPoint{Txid::FromUint256(uint256{uint8_t{0x78}}), 0};
+    struct Burst {
+        std::vector<std::pair<int, std::string>> orders;
+        node::HttpsRequestResult non_compact;
+        std::pair<int, UniValue> cancel, deposit;
+    };
+    // The budgets use one-second windows: a burst that does not fit in one
+    // is repeated, never passed unchecked.
+    const auto burst{FittedBurst([&] {
+        Burst out;
+        for (uint64_t n{0}; n < 12; ++n) {
+            const auto [status, reply]{ApiCall(endpoint, "submit", params(action(flowmesh::ActionType::SUBMIT_BID, n)))};
+            out.orders.emplace_back(status, reply["error"].get_str());
+        }
+        // non_compact_submit_still_order_budgeted: the 13th order, sent with
+        // a body the pre-parse classifier counts as a read, still hits the
+        // post-parse order budget.
+        out.non_compact = node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
+            "{ \"method\":\"submit\",\"params\":" + params(action(flowmesh::ActionType::SUBMIT_BID, 12)) + "}",
+            std::chrono::seconds{5}, 1 << 20);
+        out.cancel = ApiCall(endpoint, "submit", params(action(flowmesh::ActionType::CANCEL_BID, 13)));
+        out.deposit = ApiCall(endpoint, "submit", params(deposit));
+        return out;
+    })};
+    BOOST_REQUIRE_MESSAGE(burst, "no burst fitted in one budget window");
+    for (const auto& [status, text] : burst->orders) {
+        BOOST_CHECK_EQUAL(status, 400);
+        BOOST_CHECK_EQUAL(text, authentication);
+    }
+    BOOST_REQUIRE(burst->non_compact.response_received);
+    BOOST_CHECK_EQUAL(burst->non_compact.status, 400);
+    UniValue refused;
+    BOOST_REQUIRE(refused.read(burst->non_compact.body));
+    BOOST_CHECK_EQUAL(refused["error"].get_str(), exhausted);
+    // order_budget_refuses_orders_not_cancels: the cancel is not charged (it
+    // reaches authentication), a deposit shares the order budget.
+    BOOST_CHECK_EQUAL(burst->cancel.first, 400);
+    BOOST_CHECK_EQUAL(burst->cancel.second["error"].get_str(), authentication);
+    BOOST_CHECK_EQUAL(burst->deposit.first, 400);
+    BOOST_CHECK_EQUAL(burst->deposit.second["error"].get_str(), exhausted);
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_outcome_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(api_outcome_contract_advert_and_opt_in_only)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-outcome"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    const std::string ids{"{\"market_id\":\"" + market.GetHex() + "\",\"action_id\":\"" +
+                          uint256{uint8_t{2}}.GetHex() + "\""};
+    const std::string evidence_params{"{\"market_id\":\"" + market.GetHex() +
+        "\",\"microblock_sequence\":7,\"microblock_hash\":\"" + uint256{uint8_t{3}}.GetHex() + "\"}"};
+    std::string v1_reply;
+    {
+        // api_outcome_param_and_method_rejected_when_disabled: the factory
+        // default is disabled, exactly the previous contract.
+        auto api{node::MakeFlowMeshTradingApi(service, Options())};
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        const auto endpoint{Endpoint(api->Port())};
+        const auto [status, reply]{ApiCall(endpoint, "action", ids + "}")};
+        BOOST_REQUIRE_EQUAL(status, 200);
+        v1_reply = reply["result"].write();
+        const auto [param_status, param]{ApiCall(endpoint, "action", ids + ",\"outcome\":true}")};
+        BOOST_CHECK_EQUAL(param_status, 400);
+        BOOST_CHECK_EQUAL(param["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+        const auto [method_status, method]{ApiCall(endpoint, "outcome_evidence", evidence_params)};
+        BOOST_CHECK_EQUAL(method_status, 400);
+        BOOST_CHECK_EQUAL(method["error"].get_str(), "This method is not exposed by the public trading API");
+        // api_outcome_advert_only_when_enabled.
+        const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+        BOOST_REQUIRE_EQUAL(markets_status, 200);
+        BOOST_CHECK(!markets["result"][0].exists("action_outcome_v1"));
+        api->Stop();
+    }
+    {
+        auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {}, {}, {true})};
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        const auto endpoint{Endpoint(api->Port())};
+        const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+        BOOST_REQUIRE_EQUAL(markets_status, 200);
+        BOOST_CHECK(markets["result"][0]["action_outcome_v1"].get_bool());
+        auto keys{PreviousStatusKeys(markets["result"][0])};
+        keys.insert("action_outcome_v1");
+        BOOST_CHECK(KeySet(markets["result"][0]) == keys);
+        // api_v1_replies_byte_identical_without_opt_in: without "outcome"
+        // (or with false) the reply is the v1 reply, byte for byte.
+        const auto [status, reply]{ApiCall(endpoint, "action", ids + "}")};
+        BOOST_REQUIRE_EQUAL(status, 200);
+        BOOST_CHECK_EQUAL(reply["result"].write(), v1_reply);
+        const auto [false_status, opted_out]{ApiCall(endpoint, "action", ids + ",\"outcome\":false}")};
+        BOOST_REQUIRE_EQUAL(false_status, 200);
+        BOOST_CHECK_EQUAL(opted_out["result"].write(), v1_reply);
+        const auto [bad_status, bad]{ApiCall(endpoint, "action", ids + ",\"outcome\":1}")};
+        BOOST_CHECK_EQUAL(bad_status, 400);
+        BOOST_CHECK_EQUAL(bad["error"].get_str(), "Expected boolean: outcome");
+        // Opted in, an unknown action is still unknown, with no evidence parts.
+        const auto [opt_status, opted]{ApiCall(endpoint, "action", ids + ",\"outcome\":true}")};
+        BOOST_REQUIRE_EQUAL(opt_status, 200);
+        BOOST_CHECK_EQUAL(opted["result"]["receipt_state"].get_str(), "unknown");
+        BOOST_CHECK(!opted["result"].exists("outcome_evidence"));
+        BOOST_CHECK(!opted["result"].exists("outcome_evidence_error"));
+        BOOST_CHECK(!opted["result"].exists("pool_notice"));
+        // The method answers only from memory: nothing retained is EXPIRED.
+        const auto [expired_status, expired]{ApiCall(endpoint, "outcome_evidence", evidence_params)};
+        BOOST_CHECK_EQUAL(expired_status, 400);
+        BOOST_CHECK_EQUAL(expired["error"].get_str(), "FlowMesh outcome evidence is unavailable: EXPIRED");
+        const auto [unknown_status, unknown]{ApiCall(endpoint, "outcome_evidence",
+            "{\"market_id\":\"" + market.GetHex() + "\",\"microblock_sequence\":7}")};
+        BOOST_CHECK_EQUAL(unknown_status, 400);
+        BOOST_CHECK_EQUAL(unknown["error"].get_str(), "Invalid text: microblock_hash");
+        // api_outcome_extra_parts_charge_tokens: the method costs one more
+        // read token; refused, it is the documented budget error. The budget
+        // uses one-second windows: a burst that does not fit in one is
+        // repeated, never passed unchecked.
+        const auto fitted{FittedBurst([&] {
+            for (int i{0}; i < 27; ++i) ApiCall(endpoint, "markets", "{}");
+            return ApiCall(endpoint, "outcome_evidence", evidence_params);
+        })};
+        BOOST_REQUIRE_MESSAGE(fitted, "no burst fitted in one budget window");
+        BOOST_CHECK_EQUAL(fitted->first, 400);
+        BOOST_CHECK_EQUAL(fitted->second["error"].get_str(), node::FLOWMESH_API_OUTCOME_BUDGET_ERROR);
+        api->Stop();
+    }
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_submit_wait_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(trading_api_submit_keeps_the_previous_contract_unless_submit_waits_are_offered)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-submit-wait"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    // A correctly signed cancel under this market's pins. This service has
+    // no certified genesis yet, so it refuses the submission before queueing.
+    CKey key;
+    std::array<unsigned char, 32> secret{};
+    secret.back() = 9;
+    key.Set(secret.begin(), secret.end(), true);
+    flowmesh::Action action;
+    action.signer = flowmesh::AccountForKey(XOnlyPubKey{key.GetPubKey()});
+    action.sequence = 4;
+    action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+    BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, action));
+    const std::string submission{"{\"market_id\":\"" + market.GetHex() + "\",\"action_id\":\"" + action.Id().GetHex() +
+                                 "\",\"action_hex\":\"" + HexStr(*flowmesh::EncodeProductionActionPayload(action)) + "\""};
+    std::string previous_reply;
+    for (const auto& [name, policy] : std::vector<std::pair<std::string, node::FlowMeshTradingApiWait>>{
+             {"waits disabled", {}},
+             {"waits not offered on submit", {std::chrono::milliseconds{2000}, 4}},
+             {"submit waits without action waits", {std::chrono::milliseconds{0}, 4, true}}}) {
+        BOOST_TEST_CONTEXT(name) {
+            auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, policy)};
+            BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+            const auto endpoint{Endpoint(api->Port())};
+            const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+            BOOST_REQUIRE_EQUAL(markets_status, 200);
+            BOOST_CHECK(!markets["result"][0].exists("submit_wait_ms_max"));
+            // Exactly the previous contract: wait_ms is an unknown field,
+            // refused before anything is decoded or admitted.
+            const auto [refused_status, refused]{ApiCall(endpoint, "submit", submission + ",\"wait_ms\":500}")};
+            BOOST_CHECK_EQUAL(refused_status, 400);
+            BOOST_CHECK_EQUAL(refused["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+            const auto [status, reply]{ApiCall(endpoint, "submit", submission + "}")};
+            BOOST_REQUIRE_EQUAL(status, 200);
+            BOOST_CHECK_EQUAL(reply["result"]["receipt_state"].get_str(), "rejected");
+            if (previous_reply.empty()) previous_reply = reply["result"].write();
+            BOOST_CHECK_EQUAL(reply["result"].write(), previous_reply);
+            api->Stop();
+        }
+    }
+    auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {std::chrono::milliseconds{2000}, 4, true})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    // Offered: advertised next to the action wait, with the same maximum.
+    const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+    BOOST_REQUIRE_EQUAL(markets_status, 200);
+    const auto& row{markets["result"][0]};
+    BOOST_CHECK_EQUAL(row["submit_wait_ms_max"].getInt<int64_t>(), 2000);
+    auto keys{PreviousStatusKeys(row)};
+    keys.insert({"action_wait_ms_max", "submit_wait_ms_max"});
+    BOOST_CHECK(KeySet(row) == keys);
+    // Without wait_ms, the reply is the previous one, byte for byte.
+    const auto [plain_status, plain]{ApiCall(endpoint, "submit", submission + "}")};
+    BOOST_REQUIRE_EQUAL(plain_status, 200);
+    BOOST_CHECK_EQUAL(plain["result"].write(), previous_reply);
+    // A refused submission never waits: the same receipt, "none", and no
+    // embedded action reply, at once.
+    const auto start{std::chrono::steady_clock::now()};
+    const auto [waited_status, waited]{ApiCall(endpoint, "submit", submission + ",\"wait_ms\":2000}")};
+    BOOST_CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{1});
+    BOOST_REQUIRE_EQUAL(waited_status, 200);
+    BOOST_CHECK_EQUAL(waited["result"]["receipt_state"].get_str(), "rejected");
+    BOOST_CHECK_EQUAL(waited["result"]["wait_status"].get_str(), "none");
+    BOOST_CHECK(!waited["result"].exists("action"));
+    UniValue without_wait{UniValue::VOBJ};
+    for (const auto& key_name : waited["result"].getKeys()) {
+        if (key_name != "wait_status") without_wait.pushKV(key_name, waited["result"][key_name]);
+    }
+    BOOST_CHECK_EQUAL(without_wait.write(), previous_reply);
+    // Outcome evidence is not offered by this endpoint: an unknown field.
+    const auto [outcome_status, outcome]{ApiCall(endpoint, "submit", submission + ",\"wait_ms\":2000,\"outcome\":true}")};
+    BOOST_CHECK_EQUAL(outcome_status, 400);
+    BOOST_CHECK_EQUAL(outcome["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_submit_refuses_a_malformed_wait_before_decoding_the_action)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-submit-wait-malformed"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {std::chrono::milliseconds{2000}, 4, true}, {}, {true})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    // An undecodable action: any error that names wait_ms or outcome was
+    // raised before the action was decoded, so nothing was admitted.
+    const std::string invalid{"{\"market_id\":\"" + market.GetHex() + "\",\"action_id\":\"" + uint256{uint8_t{2}}.GetHex() +
+                              "\",\"action_hex\":\"zz\""};
+    for (const auto& [wait, expected] : std::vector<std::pair<std::string, std::string>>{
+             {"\"500\"", "Expected integer: wait_ms"}, {"true", "Expected integer: wait_ms"},
+             {"1.5", ""}, {"-1", ""}, {"18446744073709551616", ""}}) {
+        BOOST_TEST_CONTEXT("wait_ms=" << wait) {
+            const auto [status, reply]{ApiCall(endpoint, "submit", invalid + ",\"wait_ms\":" + wait + "}")};
+            BOOST_CHECK_EQUAL(status, 400);
+            BOOST_CHECK(reply["error"].get_str() != "Invalid bounded bytes: action_hex");
+            if (!expected.empty()) BOOST_CHECK_EQUAL(reply["error"].get_str(), expected);
+        }
+    }
+    const auto [bad_outcome_status, bad_outcome]{ApiCall(endpoint, "submit", invalid + ",\"wait_ms\":5,\"outcome\":1}")};
+    BOOST_CHECK_EQUAL(bad_outcome_status, 400);
+    BOOST_CHECK_EQUAL(bad_outcome["error"].get_str(), "Expected boolean: outcome");
+    const auto [lone_status, lone]{ApiCall(endpoint, "submit", invalid + ",\"outcome\":true}")};
+    BOOST_CHECK_EQUAL(lone_status, 400);
+    BOOST_CHECK_EQUAL(lone["error"].get_str(), "outcome on 'submit' applies only with wait_ms");
+    // A valid wait reaches the action's own checks.
+    const auto [decoded_status, decoded]{ApiCall(endpoint, "submit", invalid + ",\"wait_ms\":500}")};
+    BOOST_CHECK_EQUAL(decoded_status, 400);
+    BOOST_CHECK_EQUAL(decoded["error"].get_str(), "Invalid bounded bytes: action_hex");
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+//! The same reply without the opt-in evidence (as a v1 endpoint sends it).
+UniValue WithoutEvidence(const UniValue& reply)
+{
+    UniValue out{UniValue::VOBJ};
+    for (const auto& key : reply.getKeys()) if (key != "outcome_evidence") out.pushKV(key, reply[key]);
+    return out;
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_outcome_evidence_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(advertised_action_outcome_parses_only_true)
+{
+    UniValue status{UniValue::VOBJ};
+    BOOST_CHECK(!node::FlowMeshAdvertisedActionOutcome(status));
+    for (const char* value : {"1", "\"true\"", "false", "null"}) {
+        UniValue row{UniValue::VOBJ};
+        UniValue parsed;
+        BOOST_REQUIRE(parsed.read(std::string{"["} + value + "]"));
+        row.pushKV("action_outcome_v1", parsed[0]);
+        BOOST_CHECK(!node::FlowMeshAdvertisedActionOutcome(row));
+    }
+    status.pushKV("action_outcome_v1", true);
+    BOOST_CHECK(node::FlowMeshAdvertisedActionOutcome(status));
+    BOOST_CHECK(!node::FlowMeshAdvertisedActionOutcome(UniValue{}));
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_verifies_outcome_evidence_only_on_advertising_endpoints)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    auto row{MarketRow(std::chrono::milliseconds{0})};
+    row.pushKV("action_outcome_v1", true);
+    validator.markets.push_back(row);
+    validator.plain = OutcomeReceipt(action).first;
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK_EQUAL(receipt.state, "certified_inclusion");
+    BOOST_CHECK(receipt.certificate_verified);
+    BOOST_REQUIRE(receipt.outcome_verified);
+    BOOST_REQUIRE(receipt.outcome);
+    // The seeded cancel is at sequence 3 of a fresh account: included, not
+    // executed, and not final (the same bytes could still execute).
+    BOOST_CHECK_EQUAL(receipt.outcome->status, "included_not_executed");
+    BOOST_CHECK(!receipt.outcome->final);
+    BOOST_CHECK_EQUAL(receipt.outcome->reason_code, "INCLUDED_BAD_SEQUENCE");
+    BOOST_CHECK_EQUAL(receipt.outcome->evidence, "certified_result_preimage");
+    BOOST_CHECK(receipt.outcome->microblock_hash == receipt.microblock_hash);
+    BOOST_CHECK_EQUAL(receipt.reason_code, "INCLUDED_BAD_SEQUENCE");
+    BOOST_CHECK_EQUAL(validator.outcome_flags, 1U);
+    // Verified once, it is returned without another request.
+    const auto again{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(again.outcome_verified);
+    BOOST_CHECK_EQUAL(validator.Counts()[0], 1U);
+    client.reset();
+    server->Stop();
+
+    // An endpoint that does not advertise it never receives "outcome", and
+    // the verified inclusion says why there is no outcome.
+    const fs::path other{m_path_root / "client-old"};
+    const auto seeded{Seed(other, owner)};
+    ScriptedEndpoint old;
+    old.markets.push_back(MarketRow(std::chrono::milliseconds{0}));
+    old.plain = WithoutEvidence(OutcomeReceipt(seeded).first); // a v1 reply
+    auto old_server{Serve(old)};
+    auto old_client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(old_server->Port())}, other, error)};
+    BOOST_REQUIRE_MESSAGE(old_client, error);
+    BOOST_REQUIRE_EQUAL(old_client->Markets(std::nullopt).size(), 1U);
+    const auto unoffered{old_client->ActionStatus(market, seeded.Id(), false)};
+    BOOST_CHECK(unoffered.certificate_verified);
+    BOOST_CHECK(!unoffered.outcome_verified);
+    BOOST_CHECK(!unoffered.outcome);
+    BOOST_CHECK_EQUAL(unoffered.reason_code, "OUTCOME_NOT_OFFERED");
+    BOOST_CHECK_EQUAL(old.outcome_flags, 0U);
+    old_client.reset();
+    old_server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(evidence_failure_never_downgrades_inclusion)
+{
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto run = [&](const std::string& name, const std::function<void(UniValue&)>& mutate) {
+        const fs::path path{m_path_root / fs::PathFromString(name)};
+        const auto action{Seed(path, owner)};
+        ScriptedEndpoint validator;
+        auto row{MarketRow(std::chrono::milliseconds{0})};
+        row.pushKV("action_outcome_v1", true);
+        validator.markets.push_back(row);
+        auto reply{OutcomeReceipt(action).first};
+        mutate(reply);
+        validator.plain = reply;
+        auto server{Serve(validator)};
+        std::string error;
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        auto receipt{client->ActionStatus(market, action.Id(), false)};
+        client.reset();
+        server->Stop();
+        return receipt;
+    };
+    // Tampered evidence: the result root no longer matches.
+    const auto tampered{run("tampered", [](UniValue& reply) {
+        auto hex{reply["outcome_evidence"].get_str()};
+        hex[hex.size() - 1] = hex.back() == '0' ? '1' : '0';
+        reply.pushKV("outcome_evidence", hex);
+    })};
+    BOOST_CHECK(tampered.certificate_verified);
+    BOOST_CHECK_EQUAL(tampered.state, "certified_inclusion");
+    BOOST_CHECK(!tampered.outcome_verified && !tampered.outcome);
+    BOOST_CHECK_EQUAL(tampered.reason_code, "OUTCOME_EVIDENCE_INVALID");
+    const auto malformed{run("malformed", [](UniValue& reply) { reply.pushKV("outcome_evidence", "zz"); })};
+    BOOST_CHECK(malformed.certificate_verified && !malformed.outcome_verified);
+    BOOST_CHECK_EQUAL(malformed.reason_code, "OUTCOME_EVIDENCE_INVALID");
+    for (const std::string code : {"EXPIRED", "TOO_LARGE", "BUDGET"}) {
+        const auto missing{run("missing-" + code, [&](UniValue& reply) {
+            UniValue without{UniValue::VOBJ};
+            for (const auto& key : reply.getKeys()) if (key != "outcome_evidence") without.pushKV(key, reply[key]);
+            without.pushKV("outcome_evidence_error", code);
+            reply = without;
+        })};
+        BOOST_CHECK(missing.certificate_verified && !missing.outcome_verified);
+        BOOST_CHECK_EQUAL(missing.reason_code, (code == "EXPIRED" ? "OUTCOME_EVIDENCE_EXPIRED"
+                                                : code == "TOO_LARGE" ? "OUTCOME_EVIDENCE_TOO_LARGE"
+                                                                      : "OUTCOME_EVIDENCE_BUDGET"));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(outcome_upgrade_at_most_once_per_endpoint)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    auto row{MarketRow(std::chrono::milliseconds{0})};
+    row.pushKV("action_outcome_v1", true);
+    validator.markets.push_back(row);
+    auto [reply, evidence]{OutcomeReceipt(action)};
+    UniValue without{UniValue::VOBJ};
+    for (const auto& key : reply.getKeys()) if (key != "outcome_evidence") without.pushKV(key, reply[key]);
+    without.pushKV("outcome_evidence_error", "BUDGET");
+    validator.plain = without;
+    validator.evidence_error = "FlowMesh outcome evidence is unavailable: EXPIRED";
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto first{client->ActionStatus(market, action.Id(), false)};
+    BOOST_REQUIRE(first.certificate_verified);
+    BOOST_CHECK(!first.outcome_verified);
+    BOOST_CHECK_EQUAL(first.reason_code, "OUTCOME_EVIDENCE_BUDGET");
+    BOOST_CHECK_EQUAL(validator.evidence_reads, 0U);
+    // The verified inclusion asks its endpoint once for the evidence; an
+    // unavailable answer is recorded and never retried against it.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100}); // leave the status budget's window
+    const auto expired{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(expired.certificate_verified && !expired.outcome_verified);
+    BOOST_CHECK_EQUAL(expired.reason_code, "OUTCOME_EVIDENCE_EXPIRED");
+    BOOST_CHECK_EQUAL(validator.evidence_reads, 1U);
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.evidence_error.clear();
+        validator.evidence.pushKV("outcome_evidence", evidence);
+    }
+    const auto still{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(!still.outcome_verified);
+    BOOST_CHECK_EQUAL(validator.evidence_reads, 1U);
+    BOOST_CHECK_EQUAL(validator.Counts()[0], 1U); // inclusion is never re-read
+    client.reset();
+
+    // A fresh process asks again and verifies from the evidence method.
+    auto restarted{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(restarted, error);
+    BOOST_REQUIRE_EQUAL(restarted->Markets(std::nullopt).size(), 1U);
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.plain = reply; // an ordinary proof, with evidence
+    }
+    const auto proved{restarted->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(proved.certificate_verified);
+    BOOST_CHECK(proved.outcome_verified);
+    restarted.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(unknown_field_error_clears_both_capabilities)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    auto row{MarketRow(std::chrono::milliseconds{1000})};
+    row.pushKV("action_outcome_v1", true);
+    validator.markets.push_back(row);
+    validator.plain = WithoutEvidence(OutcomeReceipt(action).first); // its v1 reply
+    validator.reject_outcome_field = true;
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // The downgraded endpoint refuses the field: nothing is applied, and both
+    // advertised capabilities are withdrawn until it advertises them again.
+    const auto refused{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(!refused.certificate_verified);
+    BOOST_CHECK_EQUAL(validator.outcome_flags, 1U);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    const auto plain{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(plain.certificate_verified);
+    BOOST_CHECK(!plain.outcome_verified);
+    BOOST_CHECK_EQUAL(plain.reason_code, "OUTCOME_NOT_OFFERED");
+    BOOST_CHECK_EQUAL(validator.outcome_flags, 1U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+//! A different signed action of the same account at the same sequence.
+flowmesh::Action SameSequenceConsumer(const flowmesh::Action& action)
+{
+    auto consumer{action};
+    consumer.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_ASK);
+    consumer.credential = {4, 5, 6};
+    return consumer;
+}
+
+/** An opt-in 'action' reply for `action` whose pool notice names
+ * `consumer_id` in the microblock of `consumer_reply` (an OutcomeReceipt)
+ * and carries that entry and its outcome evidence. */
+UniValue ConsumerNoticeReply(const flowmesh::Action& action, const UniValue& consumer_reply, const uint256& consumer_id)
+{
+    UniValue reply{UniValue::VOBJ};
+    reply.pushKV("action_id", action.Id().GetHex());
+    reply.pushKV("receipt_state", "rejected");
+    reply.pushKV("reason", "FlowMesh action account sequence was already used by another certified action");
+    UniValue named{UniValue::VOBJ};
+    named.pushKV("action_id", consumer_id.GetHex());
+    named.pushKV("microblock_sequence", consumer_reply["microblock_sequence"]);
+    named.pushKV("microblock_hash", consumer_reply["microblock_hash"]);
+    UniValue notice{UniValue::VOBJ};
+    notice.pushKV("reason_code", "STALE_SEQUENCE");
+    notice.pushKV("account_sequence", action.sequence);
+    notice.pushKV("next_account_sequence", action.sequence + 1);
+    notice.pushKV("consumed_by", std::move(named));
+    reply.pushKV("pool_notice", std::move(notice));
+    reply.pushKV("consumer_certified_payload", consumer_reply["certified_payload"]);
+    reply.pushKV("consumer_outcome_evidence", consumer_reply["outcome_evidence"]);
+    return reply;
+}
+
+UniValue AdvertisingRow(UniValue row)
+{
+    row.pushKV("action_outcome_v1", true);
+    return row;
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_not_executed_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(not_executed_requires_verified_other_consumer)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    const auto consumer{SameSequenceConsumer(action)};
+    // The consumer is at the account's next sequence: it uses sequence 3.
+    const auto consumed{OutcomeReceipt(consumer, action.sequence).first};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+    validator.plain = ConsumerNoticeReply(action, consumed, consumer.Id());
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK_EQUAL(receipt.state, "rejected");
+    BOOST_CHECK(!receipt.certificate_verified);
+    BOOST_REQUIRE(receipt.outcome_verified);
+    BOOST_REQUIRE(receipt.outcome);
+    BOOST_CHECK_EQUAL(receipt.outcome->status, "not_executed");
+    BOOST_CHECK(receipt.outcome->final);
+    BOOST_CHECK_EQUAL(receipt.outcome->reason_code, "NOT_EXECUTED_SEQUENCE_CONSUMED");
+    BOOST_CHECK_EQUAL(receipt.outcome->evidence, "certified_sequence_consumer");
+    BOOST_REQUIRE(receipt.outcome->consumed_by);
+    BOOST_CHECK(receipt.outcome->consumed_by->action_id == consumer.Id());
+    BOOST_CHECK_EQUAL(receipt.outcome->consumed_by->microblock_hash.GetHex(), consumed["microblock_hash"].get_str());
+    BOOST_CHECK_EQUAL(receipt.reason_code, "NOT_EXECUTED_SEQUENCE_CONSUMED");
+    BOOST_CHECK(receipt.reason.find("can never execute") != std::string::npos);
+    BOOST_CHECK_EQUAL(client->Status().pending_actions, 0U);
+    // Final: no further status read, and a retry never sends it again.
+    const auto again{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK(again.outcome_verified);
+    const auto retried{client->ActionStatus(market, action.Id(), true)};
+    BOOST_CHECK(retried.outcome_verified);
+    BOOST_CHECK_EQUAL(retried.state, "rejected");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 0, 0, 1}));
+    client.reset();
+    server->Stop();
+    const auto durable{DurableRow(path, action)};
+    BOOST_REQUIRE(durable["not_executed_consumer"].isObject());
+    BOOST_CHECK_EQUAL(durable["not_executed_consumer"]["action_id"].get_str(), consumer.Id().GetHex());
+    BOOST_CHECK_EQUAL(durable["not_executed_consumer"]["microblock_hash"].get_str(), consumed["microblock_hash"].get_str());
+
+    // Anything short of that proof leaves the possibly delivered action
+    // unknown and marks nothing.
+    const auto run = [&](const std::string& name, const UniValue& reply) {
+        const fs::path other{m_path_root / fs::PathFromString(name)};
+        const auto seeded{Seed(other, owner)};
+        BOOST_REQUIRE(seeded.Id() == action.Id());
+        ScriptedEndpoint endpoint;
+        endpoint.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+        endpoint.plain = reply;
+        auto other_server{Serve(endpoint)};
+        auto other_client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(other_server->Port())}, other, error)};
+        BOOST_REQUIRE_MESSAGE(other_client, error);
+        BOOST_REQUIRE_EQUAL(other_client->Markets(std::nullopt).size(), 1U);
+        const auto observed{other_client->ActionStatus(market, action.Id(), false)};
+        BOOST_CHECK_MESSAGE(observed.state == "unknown", name);
+        BOOST_CHECK_MESSAGE(!observed.outcome_verified && !observed.outcome, name);
+        BOOST_CHECK_MESSAGE(observed.reason_code.empty(), name);
+        other_client.reset();
+        other_server->Stop();
+        BOOST_CHECK_MESSAGE(!DurableRow(other, action).exists("not_executed_consumer"), name);
+    };
+    // The named consumer did not use the sequence (BAD_SEQUENCE there).
+    run("not-consumed", ConsumerNoticeReply(action, OutcomeReceipt(consumer).first, consumer.Id()));
+    // The "consumer" is this very action: that is execution, not a proof.
+    run("self", ConsumerNoticeReply(action, OutcomeReceipt(action, action.sequence).first, action.Id()));
+    // Another account's action at the same number proves nothing.
+    auto stranger{consumer};
+    stranger.signer = *uint256::FromHex(std::string(64, '5'));
+    run("other-signer", ConsumerNoticeReply(action, OutcomeReceipt(stranger, action.sequence).first, stranger.Id()));
+    // Evidence that does not hash to the certified result root.
+    auto tampered{ConsumerNoticeReply(action, consumed, consumer.Id())};
+    auto hex{tampered["consumer_outcome_evidence"].get_str()};
+    hex[hex.size() - 1] = hex.back() == '0' ? '1' : '0';
+    tampered.pushKV("consumer_outcome_evidence", hex);
+    run("tampered", tampered);
+    // The notice names a different microblock than the certified entry.
+    auto misnamed{ConsumerNoticeReply(action, consumed, consumer.Id())};
+    UniValue named{misnamed["pool_notice"]["consumed_by"]};
+    named.pushKV("microblock_hash", uint256{uint8_t{7}}.GetHex());
+    UniValue notice{misnamed["pool_notice"]};
+    notice.pushKV("consumed_by", named);
+    misnamed.pushKV("pool_notice", notice);
+    run("misnamed", misnamed);
+    // A certificate that does not verify under local B3 authority.
+    auto forged{ConsumerNoticeReply(action, consumed, consumer.Id())};
+    auto payload{forged["consumer_certified_payload"].get_str()};
+    payload[payload.size() - 3] = payload[payload.size() - 3] == 'a' ? 'b' : 'a';
+    forged.pushKV("consumer_certified_payload", payload);
+    run("forged", forged);
+}
+
+BOOST_AUTO_TEST_CASE(not_executed_marker_saved_before_label_and_withdrawn_on_save_failure)
+{
+#ifdef WIN32
+    BOOST_TEST_MESSAGE("Needs RLIMIT_FSIZE to fail the outbox write");
+#else
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    const auto consumer{SameSequenceConsumer(action)};
+    const auto consumed{OutcomeReceipt(consumer, action.sequence).first};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+    validator.plain = ConsumerNoticeReply(action, consumed, consumer.Id());
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    interfaces::FlowMeshActionReceipt failed;
+    {
+        ScopedFailedFileWrites full_disk;
+        failed = client->ActionStatus(market, action.Id(), false);
+    }
+    // Never a verified outcome that is not durable.
+    BOOST_CHECK_EQUAL(failed.state, "unknown");
+    BOOST_CHECK(!failed.outcome_verified && !failed.outcome);
+    BOOST_CHECK(failed.reason_code.empty());
+    const auto retained{client->SavedActions(owner, market)};
+    BOOST_REQUIRE_EQUAL(retained.size(), 1U);
+    BOOST_CHECK(!retained[0].receipt.outcome_verified);
+    BOOST_CHECK_EQUAL(retained[0].receipt.state, "unknown");
+    // With writes working, the same reply proves it again, durably.
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    const auto proved{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK_EQUAL(proved.state, "rejected");
+    BOOST_CHECK(proved.outcome_verified);
+    client.reset();
+    server->Stop();
+    BOOST_CHECK(DurableRow(path, action)["not_executed_consumer"].isObject());
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(restart_marker_blocks_resend_and_counts_unresolved)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    const auto consumer{SameSequenceConsumer(action)};
+    const auto consumed{OutcomeReceipt(consumer, action.sequence).first};
+    std::string error;
+    {
+        ScriptedEndpoint validator;
+        validator.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+        validator.plain = ConsumerNoticeReply(action, consumed, consumer.Id());
+        auto server{Serve(validator)};
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        BOOST_REQUIRE(client->ActionStatus(market, action.Id(), false).outcome_verified);
+        client.reset();
+        server->Stop();
+    }
+    // Restarted against an endpoint that offers no outcomes: the marker is
+    // not a verified outcome, the action counts as unresolved, and a retry
+    // never sends it.
+    {
+        ScriptedEndpoint old;
+        old.markets.push_back(MarketRow(std::chrono::milliseconds{0}));
+        old.plain = ClientLaneFixture::Receipt(action, "rejected");
+        old.submit = ClientLaneFixture::Receipt(action, "queued");
+        auto server{Serve(old)};
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_CHECK_EQUAL(client->Status().pending_actions, 1U);
+        BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        const auto retried{client->ActionStatus(market, action.Id(), true)};
+        BOOST_CHECK_EQUAL(retried.state, "unknown");
+        BOOST_CHECK(!retried.outcome_verified && !retried.outcome);
+        BOOST_CHECK(retried.reason.find("Previously proven not executed") != std::string::npos);
+        BOOST_CHECK(retried.reason.find("will not be resubmitted") != std::string::npos);
+        BOOST_CHECK_EQUAL(old.Counts()[2], 0U); // never sent
+        BOOST_CHECK_EQUAL(old.outcome_flags, 0U);
+        BOOST_CHECK_EQUAL(client->Status().pending_actions, 1U);
+        client.reset();
+        server->Stop();
+        BOOST_CHECK(DurableRow(path, action)["not_executed_consumer"].isObject());
+    }
+    // An endpoint that offers outcomes but no longer has the consumer's
+    // evidence: one re-proof attempt per process, then nothing more.
+    {
+        ScriptedEndpoint expired;
+        expired.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+        expired.plain = ClientLaneFixture::Receipt(action, "unknown");
+        expired.by_action.emplace(consumer.Id().GetHex(), WithoutEvidence(consumed));
+        auto server{Serve(expired)};
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        const auto first{client->ActionStatus(market, action.Id(), false)};
+        BOOST_CHECK_EQUAL(first.state, "unknown");
+        BOOST_CHECK(!first.outcome_verified);
+        std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+        (void)client->ActionStatus(market, action.Id(), false);
+        {
+            std::lock_guard lock{expired.mutex};
+            BOOST_CHECK_EQUAL(expired.by_action_reads[consumer.Id().GetHex()], 1U);
+        }
+        BOOST_CHECK_EQUAL(expired.Counts()[2], 0U);
+        client.reset();
+        server->Stop();
+    }
+    // The consumer's certified inclusion and evidence renew the proof.
+    {
+        ScriptedEndpoint validator;
+        validator.markets.push_back(AdvertisingRow(MarketRow(std::chrono::milliseconds{0})));
+        validator.plain = ClientLaneFixture::Receipt(action, "unknown");
+        validator.by_action.emplace(consumer.Id().GetHex(), consumed);
+        auto server{Serve(validator)};
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        const auto renewed{client->ActionStatus(market, action.Id(), false)};
+        BOOST_CHECK_EQUAL(renewed.state, "rejected");
+        BOOST_REQUIRE(renewed.outcome_verified && renewed.outcome);
+        BOOST_CHECK_EQUAL(renewed.outcome->status, "not_executed");
+        BOOST_CHECK_EQUAL(client->Status().pending_actions, 0U);
+        const auto again{client->ActionStatus(market, action.Id(), false)};
+        BOOST_CHECK(again.outcome_verified);
+        {
+            std::lock_guard lock{validator.mutex};
+            BOOST_CHECK_EQUAL(validator.by_action_reads[consumer.Id().GetHex()], 1U);
+        }
+        BOOST_CHECK_EQUAL(validator.Counts()[0], 0U); // A itself was never read
+        BOOST_CHECK_EQUAL(validator.Counts()[2], 0U);
+        client.reset();
+        server->Stop();
+    }
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+//! A long request deadline, so a watch is bounded by its own wait.
+node::FlowMeshHttpsServer::Options WatchOptions(const ClientLaneFixture& fixture)
+{
+    auto options{fixture.Options()};
+    options.request_timeout = std::chrono::seconds{10};
+    return options;
+}
+std::string UpdatesParams(const uint256& market, const std::string& extra = {})
+{
+    return "{\"market_id\":\"" + market.GetHex() + "\"" + (extra.empty() ? "" : "," + extra) + "}";
+}
+std::string CursorParam(const UniValue& cursor)
+{
+    return "\"cursor\":" + cursor.write();
+}
+uint64_t Elapsed(const std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+}
+//! The key set of a watched reply: the page, the status and the hint only.
+const std::set<std::string> WATCHED_REPLY_KEYS{"cursor", "gap", "more", "oldest_event_id", "latest_event_id",
+                                               "events", "status", "watch_status"};
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_watch_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(api_watch_slots_leave_room_for_action_waits)
+{
+    std::string error;
+    // Without an explicit count, every configuration that started before
+    // watches existed still starts: the default shrinks to the room left.
+    for (const size_t action_slots : {size_t{0}, size_t{4}, size_t{6}, size_t{7}, size_t{12}}) {
+        const auto slots{node::FlowMeshApiWatchSlots(action_slots, true, std::nullopt, error)};
+        BOOST_REQUIRE(slots);
+        BOOST_CHECK_EQUAL(*slots, std::min<size_t>(8, 14 - action_slots));
+    }
+    BOOST_CHECK_EQUAL(*node::FlowMeshApiWatchSlots(12, true, std::nullopt, error), 2U);
+    // An explicit count is kept when it fits, refused when it does not.
+    BOOST_CHECK_EQUAL(*node::FlowMeshApiWatchSlots(4, true, 10, error), 10U);
+    BOOST_CHECK_EQUAL(*node::FlowMeshApiWatchSlots(12, true, 2, error), 2U);
+    BOOST_CHECK_EQUAL(*node::FlowMeshApiWatchSlots(12, true, 0, error), 0U);
+    error.clear();
+    BOOST_CHECK(!node::FlowMeshApiWatchSlots(5, true, 10, error));
+    BOOST_CHECK(error.find("-flowmeshapiwatchers=10") != std::string::npos);
+    // ... unless watches are off, when no watch slot exists at all.
+    BOOST_CHECK_EQUAL(*node::FlowMeshApiWatchSlots(12, false, 10, error), 10U);
+    for (const int64_t bad : {int64_t{-1}, int64_t{11}, int64_t{1'000'000}}) {
+        error.clear();
+        BOOST_CHECK(!node::FlowMeshApiWatchSlots(0, true, bad, error));
+        BOOST_CHECK(!error.empty());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_updates_watch_disabled_keeps_exact_contract)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-watch-disabled"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    // The factory default is disabled, and so are zero watchers.
+    for (const node::FlowMeshTradingApiWatch watch : {node::FlowMeshTradingApiWatch{},
+                                                       node::FlowMeshTradingApiWatch{std::chrono::milliseconds{2000}, 0}}) {
+        auto api{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {}, watch)};
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        const auto endpoint{Endpoint(api->Port())};
+        const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+        BOOST_REQUIRE_EQUAL(markets_status, 200);
+        BOOST_REQUIRE_EQUAL(markets["result"].size(), 1U);
+        BOOST_CHECK(KeySet(markets["result"][0]) == PreviousStatusKeys(markets["result"][0]));
+        const auto [updates_status, updates]{ApiCall(endpoint, "updates", UpdatesParams(market))};
+        BOOST_REQUIRE_EQUAL(updates_status, 200);
+        auto keys{PreviousStatusKeys(updates["result"]["status"])};
+        keys.insert("chain_reconciling");
+        BOOST_CHECK(KeySet(updates["result"]["status"]) == keys);
+        BOOST_CHECK(updates["result"].exists("reported_data"));
+        BOOST_CHECK(!updates["result"].exists("watch_status"));
+        const auto [refused, rejection]{ApiCall(endpoint, "updates", UpdatesParams(market, "\"watch_ms\":500"))};
+        BOOST_CHECK_EQUAL(refused, 400);
+        BOOST_CHECK_EQUAL(rejection["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+        api->Stop();
+    }
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_updates_watch_contract)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-watch-contract"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    auto api{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {},
+                                          {std::chrono::milliseconds{2000}, 8})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+
+    // Every status object advertises the capability, and nothing else changes.
+    const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+    BOOST_REQUIRE_EQUAL(markets_status, 200);
+    const auto& row{markets["result"][0]};
+    BOOST_CHECK_EQUAL(row["updates_watch_ms_max"].getInt<int>(), 2000);
+    auto row_keys{PreviousStatusKeys(row)};
+    row_keys.insert("updates_watch_ms_max");
+    BOOST_CHECK(KeySet(row) == row_keys);
+    const auto [plain_status, plain]{ApiCall(endpoint, "updates", UpdatesParams(market))};
+    BOOST_REQUIRE_EQUAL(plain_status, 200);
+    BOOST_CHECK_EQUAL(plain["result"]["status"]["updates_watch_ms_max"].getInt<int>(), 2000);
+    BOOST_CHECK(plain["result"].exists("reported_data"));
+    BOOST_CHECK(!plain["result"].exists("watch_status"));
+    const auto cursor{plain["result"]["cursor"]};
+    const auto head{plain["result"]["status"]["last_microblock_hash"].get_str()};
+
+    const auto watched = [&](const std::string& extra, const char* expected, const uint64_t at_least_ms, const uint64_t below_ms) {
+        const auto start{std::chrono::steady_clock::now()};
+        const auto [status, reply]{ApiCall(endpoint, "updates", UpdatesParams(market, extra))};
+        const auto elapsed{Elapsed(start)};
+        BOOST_TEST_CONTEXT(extra) {
+            BOOST_REQUIRE_MESSAGE(status == 200, reply.write());
+            BOOST_CHECK_EQUAL(reply["result"]["watch_status"].get_str(), expected);
+            BOOST_CHECK(KeySet(reply["result"]) == WATCHED_REPLY_KEYS);
+            BOOST_CHECK_EQUAL(reply["result"]["status"]["updates_watch_ms_max"].getInt<int>(), 2000);
+            BOOST_CHECK_GE(elapsed, at_least_ms);
+            BOOST_CHECK_LT(elapsed, below_ms);
+        }
+        return reply["result"];
+    };
+    // Answered at once, without a slot: zero, no cursor, a gap, a changed head.
+    watched("\"watch_ms\":0," + CursorParam(cursor), "none", 0, 1000);
+    watched("\"watch_ms\":2000", "no_cursor", 0, 1000);
+    UniValue foreign{UniValue::VOBJ};
+    foreign.pushKV("instance_id", uint256::ONE.GetHex());
+    foreign.pushKV("event_id", 0);
+    const auto gap{watched("\"watch_ms\":2000," + CursorParam(foreign), "gap", 0, 1000)};
+    BOOST_CHECK(gap["gap"].get_bool());
+    UniValue future{cursor};
+    future.pushKV("event_id", cursor["event_id"].getInt<uint64_t>() + 5);
+    watched("\"watch_ms\":2000," + CursorParam(future), "gap", 0, 1000);
+    watched("\"watch_ms\":2000," + CursorParam(cursor) + ",\"known_head\":\"" + uint256::ONE.GetHex() + "\"", "head_changed", 0, 1000);
+    // Nothing new for this cursor and head: it waits, then times out.
+    const auto quiet{watched("\"watch_ms\":300," + CursorParam(cursor) + ",\"known_head\":\"" + head + "\"", "timeout", 280, 1500)};
+    BOOST_CHECK(quiet["events"].empty());
+    BOOST_CHECK_EQUAL(quiet["cursor"].write(), cursor.write());
+    // Unknown markets and paging are refused before any slot or wait.
+    for (const auto& [params, message] : std::vector<std::pair<std::string, std::string>>{
+             {"{\"market_id\":\"" + uint256::ONE.GetHex() + "\",\"watch_ms\":2000," + CursorParam(cursor) + "}", "Unknown FlowMesh market"},
+             {UpdatesParams(market, "\"watch_ms\":2000,\"limit\":10," + CursorParam(cursor)), "watch_ms cannot be combined with history paging"},
+             {UpdatesParams(market, "\"watch_ms\":2000,\"before_sequence\":1," + CursorParam(cursor)), "watch_ms cannot be combined with history paging"}}) {
+        const auto start{std::chrono::steady_clock::now()};
+        const auto [status, reply]{ApiCall(endpoint, "updates", params)};
+        BOOST_CHECK_EQUAL(status, 400);
+        BOOST_CHECK_EQUAL(reply["error"].get_str(), message);
+        BOOST_CHECK_LT(Elapsed(start), 1000U);
+    }
+    for (const std::string bad : {"-1", "1.5", "\"500\"", "true", "18446744073709551616", "1,\"watch_ms\":2"}) {
+        BOOST_TEST_CONTEXT("watch_ms=" << bad) {
+            const auto [status, reply]{ApiCall(endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":" + bad))};
+            BOOST_CHECK_EQUAL(status, 400);
+            BOOST_CHECK(!reply["ok"].get_bool());
+        }
+    }
+    api->Stop();
+
+    // Any unsigned integer is clamped to the advertised maximum, not refused.
+    auto brief{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {},
+                                            {std::chrono::milliseconds{400}, 8})};
+    BOOST_REQUIRE_MESSAGE(brief->Start(error), error);
+    for (const std::string wait : {"60000", "18446744073709551615"}) {
+        const auto start{std::chrono::steady_clock::now()};
+        const auto [status, reply]{ApiCall(Endpoint(brief->Port()), "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":" + wait))};
+        BOOST_REQUIRE_EQUAL(status, 200);
+        BOOST_CHECK_EQUAL(reply["result"]["watch_status"].get_str(), "timeout");
+        BOOST_CHECK_GE(Elapsed(start), 380U);
+        BOOST_CHECK_LT(Elapsed(start), 1500U);
+    }
+    brief->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_updates_watchers_are_bounded_and_hold_no_permit)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-watch-busy"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    // No action waits: two permits plus the watch slots are all the workers.
+    auto api{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {},
+                                          {std::chrono::milliseconds{1500}, 8})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    const auto cursor{ApiCall(endpoint, "updates", UpdatesParams(market)).second["result"]["cursor"]};
+    const auto watch = [&] {
+        const auto start{std::chrono::steady_clock::now()};
+        const auto [status, reply]{ApiCall(endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500"))};
+        BOOST_REQUIRE_EQUAL(status, 200);
+        return std::pair{reply["result"]["watch_status"].get_str(), Elapsed(start)};
+    };
+    auto first{std::async(std::launch::async, watch)};
+    auto second{std::async(std::launch::async, watch)};
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    // A third watcher from this address gets the immediate reply.
+    const auto [third, third_ms]{watch()};
+    BOOST_CHECK_EQUAL(third, "busy");
+    BOOST_CHECK_LT(third_ms, 1000U);
+    // The sleepers hold no HTTPS permit: ordinary reads keep both permits.
+    for (int i{0}; i < 4; ++i) {
+        const auto start{std::chrono::steady_clock::now()};
+        BOOST_CHECK_EQUAL(ApiCall(endpoint, "markets", "{}").first, 200);
+        BOOST_CHECK_LT(Elapsed(start), 1000U);
+    }
+    for (auto* waiter : {&first, &second}) {
+        const auto [label, elapsed]{waiter->get()};
+        BOOST_CHECK_EQUAL(label, "timeout");
+        BOOST_CHECK_GE(elapsed, 1400U);
+    }
+    api->Stop();
+
+    // Capacity: one slot means the second watcher is refused at once.
+    auto single{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {},
+                                             {std::chrono::milliseconds{1500}, 1})};
+    BOOST_REQUIRE_MESSAGE(single->Start(error), error);
+    const auto single_endpoint{Endpoint(single->Port())};
+    auto sleeping{std::async(std::launch::async, [&] {
+        return ApiCall(single_endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500")).second;
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    const auto [status, refused]{ApiCall(single_endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500"))};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK_EQUAL(refused["result"]["watch_status"].get_str(), "busy");
+    BOOST_CHECK_EQUAL(sleeping.get()["result"]["watch_status"].get_str(), "timeout");
+    single->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_updates_watch_wakes_on_commit_and_ends_on_stop)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-watch-commit"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    auto api{node::MakeFlowMeshTradingApi(service, WatchOptions(*this), {}, {}, {}, {},
+                                          {std::chrono::milliseconds{2500}, 8})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    const auto plain{ApiCall(endpoint, "updates", UpdatesParams(market)).second["result"]};
+    BOOST_REQUIRE_EQUAL(plain["status"]["next_microblock_sequence"].getInt<int>(), 0);
+    const std::string watch_params{UpdatesParams(market, CursorParam(plain["cursor"]) + ",\"known_head\":\"" +
+                                                 plain["status"]["last_microblock_hash"].get_str() + "\",\"watch_ms\":2500")};
+    const auto start{std::chrono::steady_clock::now()};
+    auto watcher{std::async(std::launch::async, [&] { return ApiCall(endpoint, "updates", watch_params).second["result"]; })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    // Arming the seats certifies the market genesis: the commit's head event
+    // ends the watch early.
+    BOOST_REQUIRE_MESSAGE(service.ArmSeatKeys(secrets, error), error);
+    const auto woken{watcher.get()};
+    BOOST_CHECK_EQUAL(woken["watch_status"].get_str(), "ready");
+    BOOST_CHECK_LT(Elapsed(start), 2400U);
+    BOOST_REQUIRE(!woken["events"].empty());
+    BOOST_CHECK_EQUAL(woken["events"][0]["kind"].get_str(), "certified_head");
+    BOOST_CHECK_EQUAL(woken["status"]["next_microblock_sequence"].getInt<int>(), 1);
+    BOOST_CHECK(!woken.exists("reported_data"));
+
+    // Stopping the API ends a sleeping watch at once, not after its wait.
+    const std::string next_params{UpdatesParams(market, CursorParam(woken["cursor"]) + ",\"known_head\":\"" +
+                                                woken["status"]["last_microblock_hash"].get_str() + "\",\"watch_ms\":2500")};
+    auto pending{std::async(std::launch::async, [&] {
+        const auto reply{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
+            "{\"method\":\"updates\",\"params\":" + next_params + "}", std::chrono::seconds{5}, 1 << 20)};
+        return std::chrono::steady_clock::now();
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    const auto stop_start{std::chrono::steady_clock::now()};
+    api->Stop();
+    BOOST_CHECK_LT(std::chrono::duration_cast<std::chrono::milliseconds>(pending.get() - stop_start).count(), 1200);
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(updates_watch_page_fits_its_reply_bound)
+{
+    // The largest page: CLIENT_EVENT_PAGE_MAX events, every optional field
+    // present, and reasons at their bound made of characters JSON escapes
+    // six times over. The status object is well below the headroom kept.
+    flowmesh::ClientEventPage page;
+    page.cursor = {uint256::ONE, std::numeric_limits<uint64_t>::max()};
+    page.oldest_event_id = page.latest_event_id = std::numeric_limits<uint64_t>::max();
+    page.more = true;
+    for (size_t i{0}; i < flowmesh::CLIENT_EVENT_PAGE_MAX; ++i) {
+        flowmesh::ClientEvent event;
+        event.event_id = std::numeric_limits<uint64_t>::max() - i;
+        event.market_id = event.action_id = event.account_id = event.signed_action_hash = event.microblock_hash = uint256::ONE;
+        event.kind = flowmesh::ClientEventKind::CERTIFIED_INCLUDED;
+        event.microblock_sequence = std::numeric_limits<uint64_t>::max();
+        event.account_sequence = std::numeric_limits<uint64_t>::max();
+        event.reason = std::string(160, '\x01');
+        page.events.push_back(event);
+    }
+    const auto size{node::FlowMeshClientUpdatesPageJson(page).write().size()};
+    BOOST_TEST_MESSAGE("worst-case watched page: " << size << " bytes");
+    BOOST_CHECK_LT(size + 64 * 1024, node::FLOWMESH_API_WATCH_MAX_REPLY);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+/** A running service on the lane fixture's chain whose four armed seats
+ * certify the market genesis, served by a real restricted API. Restart()
+ * replaces both on the same datadir and port: a new event-log instance. */
+struct LiveMarket {
+    ClientLaneFixture& fixture;
+    const fs::path path;
+    const node::FlowMeshTradingApiWatch watch;
+    const node::FlowMeshTradingApiTicks ticks;
+    const node::FlowMeshTradingApiOutcome outcome;
+    const node::FlowMeshTradingApiObservedTime observed;
+    const node::FlowMeshTradingApiCandles candles;
+    std::unique_ptr<node::FlowMeshService> service;
+    std::unique_ptr<node::FlowMeshHttpsServer> api;
+    uint16_t port{0};
+    //! Told of every connection the API admits (set before Start).
+    std::function<void(bool)> connection_observer;
+    LiveMarket(ClientLaneFixture& f, fs::path p, const node::FlowMeshTradingApiWatch w = {},
+               const node::FlowMeshTradingApiTicks t = {}, const node::FlowMeshTradingApiOutcome o = {},
+               const node::FlowMeshTradingApiObservedTime obs = {}, const node::FlowMeshTradingApiCandles c = {})
+        : fixture{f}, path{std::move(p)}, watch{w}, ticks{t}, outcome{o}, observed{obs}, candles{c}
+    {
+        // Certify the market genesis, publish its checkpoint on B3, and start
+        // again: the market then admits actions.
+        Start();
+        std::string error;
+        const auto checkpoint{service->NextCheckpointMpa(fixture.market, error)};
+        BOOST_REQUIRE_MESSAGE(checkpoint, error);
+        Stop();
+        fixture.ConnectMpaBlock({checkpoint->record});
+        Start();
+    }
+    ~LiveMarket() { Stop(); }
+    void Start()
+    {
+        service = std::make_unique<node::FlowMeshService>(*fixture.m_node.chainman, path);
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(service->Start(*fixture.m_node.peerman, error), error);
+        BOOST_REQUIRE_MESSAGE(service->ArmSeatKeys(fixture.secrets, error), error);
+        auto options{fixture.Options(port)};
+        options.request_timeout = std::chrono::seconds{10};
+        api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, outcome, watch, ticks, observed, candles);
+        if (connection_observer) {
+            BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(*api, [this](bool nodelay) {
+                if (connection_observer) connection_observer(nodelay);
+            }));
+        }
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        port = api->Port();
+        BOOST_REQUIRE(WaitSequence(1));
+    }
+    //! Starts the API again (same port), now telling `observer` of each connection.
+    void ObserveConnections(std::function<void(bool)> observer)
+    {
+        api->Stop();
+        connection_observer = std::move(observer);
+        BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(*api, [this](bool nodelay) {
+            if (connection_observer) connection_observer(nodelay);
+        }));
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        BOOST_REQUIRE_EQUAL(api->Port(), port);
+    }
+    void Stop()
+    {
+        if (api) api->Stop();
+        api.reset();
+        if (service) service->Stop();
+        service.reset();
+    }
+    void Restart()
+    {
+        const auto next{service->MarketStatus(fixture.market)->next_sequence};
+        Stop();
+        Start();
+        BOOST_REQUIRE(WaitSequence(next));
+    }
+    bool WaitSequence(const uint64_t next) const
+    {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{10}};
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto status{service->MarketStatus(fixture.market)};
+            if (status && status->next_sequence >= next && status->halt == node::FlowMeshRuntimeHalt::NONE) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        return false;
+    }
+    //! Certifies one more entry holding `action`.
+    void Certify(const flowmesh::Action& action)
+    {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{10}};
+        while (service->MarketStatus(fixture.market)->paused && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        const auto next{service->MarketStatus(fixture.market)->next_sequence};
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(service->SubmitLocalAction(fixture.market, action, error), error);
+        BOOST_REQUIRE(WaitSequence(next + 1));
+    }
+    //! Certifies one more entry: the fixture's bootstrap user deposit.
+    void Deposit()
+    {
+        flowmesh::Action deposit;
+        deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
+        deposit.outpoint = fixture.deposit_outpoint;
+        Certify(deposit);
+    }
+    node::HttpsEndpoint Endpoint() const { return fixture.Endpoint(port); }
+};
+
+flowmesh::MarketDataQuery Page()
+{
+    flowmesh::MarketDataQuery query;
+    query.limit = 100;
+    return query;
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_watch_lane_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(event_gap_is_raised_only_when_a_snapshot_skips_events)
+{
+    LiveMarket live{*this, m_path_root / "gap-service"};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "gap-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto first{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(first, error);
+    BOOST_CHECK_EQUAL(first->snapshot.next_microblock_sequence, 1U);
+    BOOST_CHECK(!first->event_gap);
+    // A new head is read through a snapshot taken after the page that
+    // reported it. The events in between are still delivered: no gap.
+    live.Deposit();
+    const auto moved{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(moved, error);
+    BOOST_CHECK_EQUAL(moved->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(!moved->event_gap);
+    BOOST_CHECK_EQUAL(client->Status().event_gaps, 0U);
+    const auto again{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(again, error);
+    BOOST_CHECK(!again->event_gap);
+    BOOST_CHECK_EQUAL(client->Status().event_gaps, 0U);
+    // A restarted endpoint has a new event log: its events were skipped.
+    live.Restart();
+    const auto restarted{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(restarted, error);
+    BOOST_CHECK(restarted->event_gap);
+    BOOST_CHECK_EQUAL(client->Status().event_gaps, 1U);
+    client.reset();
+}
+
+namespace {
+//! Forwards public API requests to a live endpoint. It can hold watched
+//! 'updates' replies, drop them (never written: the reply outlives the
+//! request deadline), corrupt 'snapshot' state bytes, and inject a stale
+//! updates_watch_ms_max into 'markets' and 'snapshot' status objects.
+struct WatchProxy {
+    node::HttpsEndpoint upstream;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool hold{false}, drop{false}, corrupt_snapshot{false}, inject_advert{false};
+    unsigned watched{0}, held{0};
+    std::vector<std::string> methods;
+
+    void Hold(const bool value)
+    {
+        {
+            std::lock_guard lock{mutex};
+            hold = value;
+        }
+        changed.notify_all();
+    }
+    bool AwaitHeld(const unsigned count)
+    {
+        std::unique_lock lock{mutex};
+        return changed.wait_for(lock, std::chrono::seconds{5}, [&] { return held >= count; });
+    }
+    node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
+    {
+        UniValue json;
+        if (!json.read(request.body) || !json["method"].isStr()) return {400, R"({"ok":false,"error":"proxy"})"};
+        const auto method{json["method"].get_str()};
+        const bool is_watch{method == "updates" && json["params"].exists("watch_ms")};
+        {
+            std::lock_guard lock{mutex};
+            methods.push_back(method);
+            watched += is_watch;
+        }
+        const auto reply{node::FlowMeshHttpsRequest(upstream, "/flowmesh/v1", request.body, std::chrono::seconds{10}, 32 << 20)};
+        if (!reply.response_received) return {502, R"({"ok":false,"error":"proxy upstream failed"})"};
+        std::string body{reply.body};
+        if (is_watch) {
+            std::unique_lock lock{mutex};
+            ++held;
+            changed.notify_all();
+            changed.wait_for(lock, std::chrono::seconds{5}, [&] { return !hold; });
+            if (drop) {
+                lock.unlock();
+                std::this_thread::sleep_until(request.deadline + std::chrono::milliseconds{200});
+            }
+        }
+        UniValue parsed;
+        if ((corrupt_snapshot || inject_advert) && parsed.read(body) && parsed["ok"].isTrue()) {
+            UniValue result{parsed["result"]};
+            if (corrupt_snapshot && method == "snapshot") {
+                auto state{result["state_bytes"].get_str()};
+                state[state.size() - 2] = state[state.size() - 2] == '0' ? '1' : '0';
+                result.pushKV("state_bytes", state);
+            }
+            if (inject_advert && method == "snapshot") {
+                UniValue status{result["status"]};
+                status.pushKV("updates_watch_ms_max", 2000);
+                result.pushKV("status", status);
+            }
+            if (inject_advert && method == "markets") {
+                UniValue rows{UniValue::VARR};
+                for (auto row : result.getValues()) {
+                    row.pushKV("updates_watch_ms_max", 2000);
+                    rows.push_back(row);
+                }
+                result = rows;
+            }
+            parsed.pushKV("result", result);
+            body = parsed.write();
+        }
+        return {reply.status, body};
+    }
+    unsigned Watched()
+    {
+        std::lock_guard lock{mutex};
+        return watched;
+    }
+};
+
+std::unique_ptr<node::FlowMeshHttpsServer> Proxy(const ClientLaneFixture& fixture, WatchProxy& proxy,
+                                                 std::chrono::milliseconds request_timeout = std::chrono::seconds{10})
+{
+    auto options{fixture.Options()};
+    options.request_timeout = request_timeout;
+    auto server{std::make_unique<node::FlowMeshHttpsServer>(options, [&proxy](const auto& request) { return proxy.Handle(request); })};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server->Start(error), error);
+    return server;
+}
+
+using Watched = std::pair<std::optional<flowmesh::MarketData>, interfaces::FlowMeshMarketWatch>;
+Watched WatchRead(node::FlowMeshTradingBackend& client, const uint256& market, std::chrono::milliseconds wait, std::string& error)
+{
+    interfaces::FlowMeshMarketWatch watch;
+    auto data{client.Watch(market, std::nullopt, Page(), wait, watch, error)};
+    return {std::move(data), watch};
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(watch_applies_a_commit_through_the_verified_snapshot)
+{
+    LiveMarket live{*this, m_path_root / "watch-commit-service", {std::chrono::milliseconds{2000}, 8}};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "watch-commit-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 2000U);
+    const auto start{std::chrono::steady_clock::now()};
+    auto pending{std::async(std::launch::async, [&] {
+        std::string watch_error;
+        auto result{WatchRead(*client, market, std::chrono::milliseconds{1500}, watch_error)};
+        BOOST_CHECK_MESSAGE(result.first, watch_error);
+        return result;
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    live.Deposit();
+    // The deposit's admission events wake the (unfiltered) watch first; the
+    // caller watches again at once until the commit's head arrives.
+    auto [data, watch]{pending.get()};
+    for (int follow{0}; data && watch.waited && data->snapshot.next_microblock_sequence < 2 && follow < 5; ++follow) {
+        std::tie(data, watch) = WatchRead(*client, market, std::chrono::milliseconds{1500}, error);
+    }
+    BOOST_REQUIRE(data);
+    BOOST_CHECK(watch.status == "ready" || watch.status == "head_changed");
+    BOOST_CHECK(watch.supported && watch.waited && !watch.gap);
+    BOOST_CHECK_EQUAL(watch.endpoint, live.Endpoint().url);
+    BOOST_CHECK_EQUAL(watch.endpoint_live_ms, 2000U);
+    BOOST_CHECK_LT(Elapsed(start), 1400U);
+    // The new head is the verified snapshot's, never the page's claim.
+    BOOST_CHECK_EQUAL(data->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(data->certificate_verified && data->account_state_verified && data->remote);
+    BOOST_CHECK(!data->event_gap);
+    const auto ordinary{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE(ordinary);
+    BOOST_CHECK(ordinary->snapshot.last_microblock_hash == data->snapshot.last_microblock_hash);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(watch_lane_leaves_work_gate_free_and_times_out_quietly)
+{
+    LiveMarket live{*this, m_path_root / "watch-quiet-service", {std::chrono::milliseconds{2000}, 8}};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "watch-quiet-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto before{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(before, error);
+    const auto start{std::chrono::steady_clock::now()};
+    auto pending{std::async(std::launch::async, [&] {
+        std::string watch_error;
+        return WatchRead(*client, market, std::chrono::milliseconds{1200}, watch_error);
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    // The work gate is free while the watch sleeps on its lane.
+    for (int i{0}; i < 3; ++i) {
+        const auto read_start{std::chrono::steady_clock::now()};
+        BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+        BOOST_CHECK(client->Data(market, std::nullopt, Page(), error));
+        BOOST_CHECK(client->SavedActions(uint256::ONE, market).empty());
+        BOOST_CHECK_LT(Elapsed(read_start), 800U);
+    }
+    // A second watch while the lane is busy reads ordinarily at once.
+    const auto second_start{std::chrono::steady_clock::now()};
+    std::string second_error;
+    const auto [second, second_watch]{WatchRead(*client, market, std::chrono::milliseconds{1200}, second_error)};
+    BOOST_CHECK(second);
+    BOOST_CHECK_EQUAL(second_watch.status, "lane_busy");
+    BOOST_CHECK(!second_watch.supported && !second_watch.waited);
+    BOOST_CHECK_LT(Elapsed(second_start), 800U);
+    const auto [data, watch]{pending.get()};
+    BOOST_REQUIRE(data);
+    BOOST_CHECK_EQUAL(watch.status, "timeout");
+    BOOST_CHECK(watch.supported && watch.waited && !watch.gap);
+    BOOST_CHECK_GE(Elapsed(start), 1150U);
+    BOOST_CHECK(data->snapshot.last_microblock_hash == before->snapshot.last_microblock_hash);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(watch_never_sends_watch_ms_to_an_endpoint_without_advertisement)
+{
+    LiveMarket live{*this, m_path_root / "watch-off-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-off-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    // Before any snapshot, and after one: never a watched request.
+    for (int i{0}; i < 3; ++i) {
+        const auto start{std::chrono::steady_clock::now()};
+        const auto [data, watch]{WatchRead(*client, market, std::chrono::milliseconds{1500}, error)};
+        BOOST_REQUIRE_MESSAGE(data, error);
+        BOOST_CHECK_EQUAL(watch.status, "not_eligible");
+        BOOST_CHECK(!watch.supported && !watch.waited);
+        BOOST_CHECK_LT(Elapsed(start), 1000U);
+    }
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 0U);
+    BOOST_CHECK_EQUAL(proxy.Watched(), 0U);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_unknown_field_withdraws_capability_and_reads_ordinarily)
+{
+    // A stale advertisement: the endpoint rejects watch_ms.
+    LiveMarket live{*this, m_path_root / "watch-stale-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    proxy.inject_advert = true;
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-stale-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error); // A snapshot learns the advert.
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 2000U);
+    const auto [data, watch]{WatchRead(*client, market, std::chrono::milliseconds{1500}, error)};
+    BOOST_REQUIRE_MESSAGE(data, error); // The same call read ordinarily.
+    BOOST_CHECK_EQUAL(watch.status, "unsupported");
+    BOOST_CHECK(!watch.supported && !watch.waited);
+    BOOST_CHECK_EQUAL(proxy.Watched(), 1U);
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 0U);
+    // Withdrawn until the endpoint advertises it again.
+    const auto [again, again_watch]{WatchRead(*client, market, std::chrono::milliseconds{1500}, error)};
+    BOOST_CHECK(again);
+    BOOST_CHECK_EQUAL(again_watch.status, "not_eligible");
+    BOOST_CHECK_EQUAL(proxy.Watched(), 1U);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_superseded_cursor_is_not_applied)
+{
+    LiveMarket live{*this, m_path_root / "watch-superseded-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-superseded-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    proxy.Hold(true);
+    auto pending{std::async(std::launch::async, [&] {
+        std::string watch_error;
+        return WatchRead(*client, market, std::chrono::milliseconds{1500}, watch_error);
+    })};
+    // The commit wakes the watch; its reply is held while an ordinary read
+    // advances the cache past the watched cursor.
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    live.Deposit();
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    const auto ordinary{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(ordinary, error);
+    BOOST_CHECK_EQUAL(ordinary->snapshot.next_microblock_sequence, 2U);
+    proxy.Hold(false);
+    const auto [data, watch]{pending.get()};
+    BOOST_REQUIRE(data);
+    BOOST_CHECK_EQUAL(watch.status, "superseded");
+    BOOST_CHECK(!watch.supported && !watch.waited);
+    BOOST_CHECK(data->snapshot.last_microblock_hash == ordinary->snapshot.last_microblock_hash);
+    BOOST_CHECK(!data->event_gap);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_transport_loss_marks_endpoint_unanswered_without_cooldown)
+{
+    LiveMarket live{*this, m_path_root / "watch-loss-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    proxy.drop = true;
+    auto front{Proxy(*this, proxy, std::chrono::milliseconds{1000})};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-loss-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    const auto [lost, lost_watch]{WatchRead(*client, market, std::chrono::milliseconds{300}, error)};
+    BOOST_CHECK(!lost);
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK_EQUAL(lost_watch.status, "failed");
+    const auto status{client->Status()};
+    BOOST_CHECK_EQUAL(status.endpoints.at(0).retry_after_ms, 0);
+    BOOST_CHECK_EQUAL(status.endpoints.at(0).consecutive_failures, 0U);
+    // Unanswered: the next call reads ordinarily (which answers), and only
+    // then may the endpoint be watched again.
+    proxy.drop = false;
+    error.clear();
+    const auto [ordinary, ordinary_watch]{WatchRead(*client, market, std::chrono::milliseconds{300}, error)};
+    BOOST_REQUIRE_MESSAGE(ordinary, error);
+    BOOST_CHECK_EQUAL(ordinary_watch.status, "not_eligible");
+    BOOST_CHECK_EQUAL(proxy.Watched(), 1U);
+    const auto [again, again_watch]{WatchRead(*client, market, std::chrono::milliseconds{300}, error)};
+    BOOST_CHECK(again);
+    BOOST_CHECK_EQUAL(again_watch.status, "timeout");
+    BOOST_CHECK_EQUAL(proxy.Watched(), 2U);
+    // A watch never sends or resends an action.
+    for (const auto& method : proxy.methods) BOOST_CHECK(method == "updates" || method == "snapshot" || method == "markets");
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_head_change_verifies_snapshot_before_exposing_state)
+{
+    LiveMarket live{*this, m_path_root / "watch-forged-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-forged-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto before{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(before, error);
+    live.Deposit();
+    // The watched page reports the new head; the snapshot's state is forged.
+    proxy.corrupt_snapshot = true;
+    const auto [forged, watch]{WatchRead(*client, market, std::chrono::milliseconds{1500}, error)};
+    BOOST_CHECK(!forged);
+    BOOST_CHECK_EQUAL(watch.status, "invalid");
+    BOOST_CHECK(!error.empty());
+    // Nothing from the forged reply was exposed: an honest read verifies anew.
+    proxy.corrupt_snapshot = false;
+    error.clear();
+    const auto honest{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(honest, error);
+    BOOST_CHECK_EQUAL(honest->snapshot.next_microblock_sequence, 2U);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_rechecks_local_authority_after_its_wait)
+{
+    LiveMarket live{*this, m_path_root / "watch-authority-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-authority-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    proxy.Hold(true);
+    auto pending{std::async(std::launch::async, [&] {
+        std::string watch_error;
+        return WatchRead(*client, market, std::chrono::milliseconds{1500}, watch_error);
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    live.Deposit();
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    // While the reply is held, B3 connects a checkpoint past the cached head:
+    // the cached state no longer applies under local authority.
+    const auto checkpoint{live.service->NextCheckpointMpa(market, error)};
+    BOOST_REQUIRE_MESSAGE(checkpoint, error);
+    BOOST_REQUIRE_EQUAL(checkpoint->sequence, 1U);
+    ConnectMpaBlock({checkpoint->record});
+    proxy.Hold(false);
+    const auto [data, watch]{pending.get()};
+    BOOST_REQUIRE(data);
+    BOOST_CHECK_EQUAL(watch.status, "revalidate");
+    BOOST_CHECK(!watch.supported);
+    // The ordinary read re-verified, reported the gap and moved past the checkpoint.
+    BOOST_CHECK_EQUAL(data->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(data->event_gap);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(watch_lane_connection_released_after_busy)
+{
+    LiveMarket live{*this, m_path_root / "watch-busy-service", {std::chrono::milliseconds{2000}, 8}};
+    std::atomic<unsigned> connections{0};
+    live.ObserveConnections([&](bool) { ++connections; });
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "watch-busy-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto data{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(data, error);
+    // A kept-alive lane: two quiet watches, one connection.
+    BOOST_CHECK_EQUAL(WatchRead(*client, market, std::chrono::milliseconds{300}, error).second.status, "timeout");
+    const auto lane{connections.load()};
+    BOOST_CHECK_EQUAL(WatchRead(*client, market, std::chrono::milliseconds{300}, error).second.status, "timeout");
+    BOOST_CHECK_EQUAL(connections.load(), lane);
+    // Both watch slots of this address are taken: 'busy', and the lane lets
+    // its connection go.
+    const auto cursor{ApiCall(live.Endpoint(), "updates", UpdatesParams(market)).second["result"]["cursor"]};
+    const std::string held{UpdatesParams(market, CursorParam(cursor) + ",\"known_head\":\"" + data->snapshot.last_microblock_hash.GetHex() + "\",\"watch_ms\":1500")};
+    auto first{std::async(std::launch::async, [&] { return ApiCall(live.Endpoint(), "updates", held); })};
+    auto second{std::async(std::launch::async, [&] { return ApiCall(live.Endpoint(), "updates", held); })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    const auto [busy_data, busy]{WatchRead(*client, market, std::chrono::milliseconds{300}, error)};
+    BOOST_CHECK(busy_data);
+    BOOST_CHECK_EQUAL(busy.status, "busy");
+    BOOST_CHECK(busy.supported && !busy.waited);
+    first.get();
+    second.get();
+    const auto before{connections.load()};
+    BOOST_CHECK_EQUAL(WatchRead(*client, market, std::chrono::milliseconds{300}, error).second.status, "timeout");
+    BOOST_CHECK_EQUAL(connections.load(), before + 1);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(local_backend_watch_wakes_on_commit_and_needs_known_head)
+{
+    LiveMarket live{*this, m_path_root / "watch-local-service"};
+    auto local{node::MakeLocalFlowMeshBackend(*live.service)};
+    std::string error;
+    const auto current{local->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(current, error);
+    // Without the head it holds, a caller is answered at once.
+    const auto start{std::chrono::steady_clock::now()};
+    const auto [plain, plain_watch]{WatchRead(*local, market, std::chrono::milliseconds{1500}, error)};
+    BOOST_CHECK(plain);
+    BOOST_CHECK_EQUAL(plain_watch.status, "not_eligible");
+    BOOST_CHECK(!plain_watch.supported);
+    BOOST_CHECK_LT(Elapsed(start), 800U);
+    auto query{Page()};
+    query.known_head = current->snapshot.last_microblock_hash;
+    const auto watch_read = [&] {
+        interfaces::FlowMeshMarketWatch watch;
+        std::string watch_error;
+        auto data{local->Watch(market, std::nullopt, query, std::chrono::milliseconds{1500}, watch, watch_error)};
+        return std::pair{std::move(data), watch};
+    };
+    const auto quiet_start{std::chrono::steady_clock::now()};
+    const auto [quiet, quiet_watch]{watch_read()};
+    BOOST_REQUIRE(quiet);
+    BOOST_CHECK(quiet->unchanged);
+    BOOST_CHECK_EQUAL(quiet_watch.status, "timeout");
+    BOOST_CHECK(quiet_watch.supported && quiet_watch.waited);
+    BOOST_CHECK_GE(Elapsed(quiet_start), 1450U);
+    const auto wake_start{std::chrono::steady_clock::now()};
+    auto pending{std::async(std::launch::async, watch_read)};
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    live.Deposit();
+    // Its admission events wake the watch first; the commit's head follows.
+    auto [woken, woken_watch]{pending.get()};
+    for (int follow{0}; woken && woken->unchanged && woken_watch.waited && follow < 5; ++follow) {
+        std::tie(woken, woken_watch) = watch_read();
+    }
+    BOOST_REQUIRE(woken);
+    BOOST_CHECK(woken_watch.status == "ready" || woken_watch.status == "head_changed");
+    BOOST_CHECK(!woken->unchanged);
+    BOOST_CHECK_EQUAL(woken->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK_LT(Elapsed(wake_start), 1400U);
+    // A caller behind the head is answered at once.
+    const auto [behind, behind_watch]{watch_read()};
+    BOOST_CHECK(behind);
+    BOOST_CHECK_EQUAL(behind_watch.status, "head_changed");
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_market_view_tests, ClientLaneFixture)
+
+namespace {
+std::pair<int, UniValue> ApiCall(const node::HttpsEndpoint& endpoint, const std::string& method, const std::string& params)
+{
+    const auto reply{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
+        "{\"method\":\"" + method + "\",\"params\":{" + params + "}}", std::chrono::seconds{10}, 32 << 20)};
+    BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+    UniValue value;
+    BOOST_REQUIRE(value.read(reply.body));
+    return {reply.status, value};
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(trading_api_without_clearing_ticks_keeps_the_previous_contract)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket off{*this, m_path_root / "ticks-off"};
+    const auto [status, snapshot]{ApiCall(off.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK(!snapshot["result"]["status"].exists("clearing_ticks_max"));
+    BOOST_CHECK(!snapshot["result"]["reported_data"].exists("clearing_ticks"));
+    const auto [markets_status, markets]{ApiCall(off.Endpoint(), "markets", "")};
+    BOOST_CHECK_EQUAL(markets_status, 200);
+    BOOST_CHECK(!markets["result"][0].exists("clearing_ticks_max"));
+    for (const char* method : {"snapshot", "updates"}) {
+        const auto [refused, rejection]{ApiCall(off.Endpoint(), method, id + ",\"ticks\":{}")};
+        BOOST_CHECK_EQUAL(refused, 400);
+        BOOST_CHECK_EQUAL(rejection["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_serves_clearing_ticks_when_enabled)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket on{*this, m_path_root / "ticks-on", {std::chrono::milliseconds{2000}, 2}, {16}};
+    on.Deposit();
+    const auto [status, plain]{ApiCall(on.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK_EQUAL(plain["result"]["status"]["clearing_ticks_max"].getInt<int>(), 16);
+    // Not asked for: reported_data is unchanged.
+    BOOST_CHECK(!plain["result"]["reported_data"].exists("clearing_ticks"));
+    const auto [ticked_status, ticked]{ApiCall(on.Endpoint(), "snapshot", id + ",\"ticks\":{}")};
+    BOOST_CHECK_EQUAL(ticked_status, 200);
+    const auto head{ticked["result"]["status"]["last_microblock_hash"].get_str()};
+    const auto& ticks{ticked["result"]["reported_data"]["clearing_ticks"]};
+    BOOST_CHECK(ticks["available"].get_bool());
+    BOOST_REQUIRE_EQUAL(ticks["ticks"].size(), 2U);
+    BOOST_CHECK_EQUAL(ticks["ticks"][0]["sequence"].getInt<int>(), 0);
+    BOOST_CHECK_EQUAL(ticks["ticks"][1]["microblock_hash"].get_str(), head);
+    BOOST_CHECK_EQUAL(ticks["ticks"][1]["kind"].get_str(), "execution");
+    BOOST_CHECK_EQUAL(ticks["ticks"][1]["imbalance_side"].get_str(), "none");
+
+    // A light poll: unchanged heavy data, still the ticks after a position.
+    const auto [light_status, light]{ApiCall(on.Endpoint(), "updates",
+        id + ",\"known_head\":\"" + head + "\",\"ticks\":{\"after_sequence\":0}")};
+    BOOST_CHECK_EQUAL(light_status, 200);
+    BOOST_CHECK(light["result"]["reported_data"]["unchanged"].get_bool());
+    BOOST_REQUIRE_EQUAL(light["result"]["reported_data"]["clearing_ticks"]["ticks"].size(), 1U);
+    BOOST_CHECK_EQUAL(light["result"]["reported_data"]["clearing_ticks"]["ticks"][0]["microblock_hash"].get_str(), head);
+    // A larger limit is clamped to the advertised maximum, never refused.
+    const auto [clamped_status, clamped]{ApiCall(on.Endpoint(), "updates", id + ",\"ticks\":{\"limit\":18446744073709551615}")};
+    BOOST_CHECK_EQUAL(clamped_status, 200);
+    BOOST_CHECK_EQUAL(clamped["result"]["reported_data"]["clearing_ticks"]["ticks"].size(), 2U);
+    // Malformed parameters are refused before any read.
+    for (const std::string bad : {"{\"limit\":0}", "{\"limit\":-1}", "{\"after\":1}", "[]", "{\"after_sequence\":\"1\"}"}) {
+        BOOST_TEST_CONTEXT("ticks=" << bad) {
+            const auto [refused, rejection]{ApiCall(on.Endpoint(), "snapshot", id + ",\"ticks\":" + bad)};
+            BOOST_CHECK_EQUAL(refused, 400);
+            BOOST_CHECK(!rejection["ok"].get_bool());
+        }
+    }
+    // A watched page carries no reported_data, so no ticks either.
+    const auto [watched_status, watched]{ApiCall(on.Endpoint(), "updates", id + ",\"watch_ms\":500,\"ticks\":{}")};
+    BOOST_CHECK_EQUAL(watched_status, 400);
+    BOOST_CHECK_EQUAL(watched["error"].get_str(), "ticks cannot be combined with watch_ms");
+}
+
+BOOST_AUTO_TEST_CASE(book_levels_are_local_views_of_verified_state_only)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket live{*this, m_path_root / "levels-service", {std::chrono::milliseconds{2000}, 2}, {16}};
+    // The public API has no levels: an unknown field, and its replies are
+    // exactly as before (no book_levels anywhere).
+    for (const char* method : {"snapshot", "updates"}) {
+        const auto [refused, rejection]{ApiCall(live.Endpoint(), method, id + ",\"levels\":{}")};
+        BOOST_CHECK_EQUAL(refused, 400);
+        BOOST_CHECK_EQUAL(rejection["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+        const auto [status, plain]{ApiCall(live.Endpoint(), method, id)};
+        BOOST_CHECK_EQUAL(status, 200);
+        BOOST_CHECK(plain.write().find("book_levels") == std::string::npos);
+    }
+    std::string error;
+    auto remote{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "levels-client", error)};
+    BOOST_REQUIRE_MESSAGE(remote, error);
+    auto local{node::MakeLocalFlowMeshBackend(*live.service)};
+    const uint256 account{uint8_t{0x41}};
+    auto query{Page()};
+    query.levels = flowmesh::BookLevelsQuery{};
+    query.levels->depth = 5;
+    query.levels->account = account;
+    for (auto* backend : {remote.get(), local.get()}) {
+        BOOST_TEST_CONTEXT((backend == remote.get() ? "remote" : "local")) {
+            const auto data{backend->Data(market, account, query, error)};
+            BOOST_REQUIRE_MESSAGE(data, error);
+            BOOST_CHECK(!data->book);
+            BOOST_REQUIRE(data->levels);
+            const auto& levels{*data->levels};
+            BOOST_CHECK(levels.available);
+            BOOST_CHECK(levels.head == data->snapshot.last_microblock_hash);
+            BOOST_CHECK_EQUAL(levels.depth, 5U);
+            // The verified book is empty.
+            BOOST_CHECK_EQUAL(levels.total_curves, 0U);
+            BOOST_CHECK(levels.bids.available && levels.bids.levels.empty() && !levels.bids.more);
+            BOOST_CHECK(!levels.best_bid && !levels.best_ask);
+            BOOST_CHECK(levels.standing.available && !levels.standing.cleared && !levels.standing.draft);
+            const auto json{node::FlowMeshClientMarketDataJson(*data)};
+            BOOST_REQUIRE(json.exists("book_levels"));
+            BOOST_CHECK(!json["book_levels"]["certified"].get_bool());
+            BOOST_CHECK(json["book_levels"]["excludes_pending_actions"].get_bool());
+            BOOST_CHECK_EQUAL(json["book_levels"]["basis"].get_str(), "verified_standing_curves");
+            BOOST_CHECK(json["book_levels"]["grouping"]["exact"].get_bool());
+            // A light poll at the same head carries none unless asked.
+            auto light{query};
+            light.known_head = data->snapshot.last_microblock_hash;
+            const auto unchanged{backend->Data(market, account, light, error)};
+            BOOST_REQUIRE_MESSAGE(unchanged, error);
+            BOOST_CHECK(unchanged->unchanged && !unchanged->levels);
+            BOOST_CHECK(!node::FlowMeshClientMarketDataJson(*unchanged).exists("book_levels"));
+            light.levels->include_unchanged = true;
+            const auto asked{backend->Data(market, account, light, error)};
+            BOOST_REQUIRE_MESSAGE(asked, error);
+            BOOST_REQUIRE(asked->unchanged && asked->levels);
+            BOOST_CHECK(*asked->levels == levels);
+            BOOST_CHECK(node::FlowMeshClientMarketDataJson(*asked).exists("book_levels"));
+            // Not asked for: absent.
+            const auto plain{backend->Data(market, account, Page(), error)};
+            BOOST_REQUIRE_MESSAGE(plain, error);
+            BOOST_CHECK(!plain->levels);
+            BOOST_CHECK(!node::FlowMeshClientMarketDataJson(*plain).exists("book_levels"));
+            // Invalid levels are refused by both backends.
+            auto bad{query};
+            bad.levels->depth = 0;
+            BOOST_CHECK(!backend->Data(market, account, bad, error));
+        }
+    }
+    // A new certified head: the remote levels follow the newly verified state.
+    live.Deposit();
+    const auto moved{remote->Data(market, account, query, error)};
+    BOOST_REQUIRE_MESSAGE(moved, error);
+    BOOST_REQUIRE(moved->levels);
+    BOOST_CHECK_EQUAL(moved->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(moved->levels->head == moved->snapshot.last_microblock_hash);
+    remote.reset();
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_without_observed_time_keeps_the_previous_contract)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket off{*this, m_path_root / "observed-off", {}, {16}};
+    const auto [status, snapshot]{ApiCall(off.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK(!snapshot["result"]["status"].exists("observed_time_v1"));
+    for (const char* method : {"snapshot", "updates"}) {
+        const auto [refused, rejection]{ApiCall(off.Endpoint(), method, id + ",\"observed_time\":true")};
+        BOOST_CHECK_EQUAL(refused, 400);
+        BOOST_CHECK_EQUAL(rejection["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_observed_time_only_when_requested)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket on{*this, m_path_root / "observed-on", {std::chrono::milliseconds{2000}, 2}, {16}, {}, {true}};
+    on.Deposit();
+    const auto [status, plain]{ApiCall(on.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK(plain["result"]["status"]["observed_time_v1"].get_bool());
+    // Not asked for: reported_data is unchanged.
+    BOOST_CHECK(!plain["result"]["reported_data"].exists("observed_time"));
+    for (const char* method : {"snapshot", "updates"}) {
+        BOOST_TEST_CONTEXT(method) {
+            const auto [timed_status, timed]{ApiCall(on.Endpoint(), method, id + ",\"ticks\":{},\"observed_time\":true")};
+            BOOST_REQUIRE_EQUAL(timed_status, 200);
+            const auto& section{timed["result"]["reported_data"]["observed_time"]};
+            BOOST_CHECK(section["available"].get_bool());
+            BOOST_CHECK_EQUAL(section["source"].get_str(), "endpoint_operator");
+            BOOST_CHECK_EQUAL(section["source_kind"].get_str(), "operator_observed");
+            BOOST_CHECK(!section["certified"].get_bool());
+            const auto& ticks{timed["result"]["reported_data"]["clearing_ticks"]["ticks"]};
+            BOOST_REQUIRE_EQUAL(section["rows"].size(), ticks.size());
+            for (size_t i{0}; i < ticks.size(); ++i) {
+                const auto& row{section["rows"][i]};
+                BOOST_CHECK_EQUAL(row["sequence"].getInt<int>(), ticks[i]["sequence"].getInt<int>());
+                BOOST_CHECK_EQUAL(row["microblock_hash"].get_str(), ticks[i]["microblock_hash"].get_str());
+                // Public rows never say why an entry was late.
+                BOOST_CHECK(!row.exists("delay_reason"));
+                for (const auto& flag : row["flags"].getValues()) {
+                    BOOST_CHECK(flag.get_str() == "clock_clamped" || flag.get_str() == "clock_step" ||
+                                flag.get_str() == "clock_suspect" || flag.get_str() == "restart");
+                }
+                BOOST_CHECK(row.exists("observed_ms") != row.exists("applied_here_ms") || row["mode"].get_str() == "untimed");
+            }
+        }
+    }
+    // Refused with a watch, whose page has no reported_data.
+    const auto [watched_status, watched]{ApiCall(on.Endpoint(), "updates", id + ",\"watch_ms\":500,\"observed_time\":true")};
+    BOOST_CHECK_EQUAL(watched_status, 400);
+    BOOST_CHECK_EQUAL(watched["error"].get_str(), "observed_time cannot be combined with watch_ms");
+    const auto [bad_status, bad]{ApiCall(on.Endpoint(), "snapshot", id + ",\"observed_time\":1")};
+    BOOST_CHECK_EQUAL(bad_status, 400);
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_without_candles_keeps_the_previous_contract)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket off{*this, m_path_root / "candles-off", {}, {16}, {}, {true}};
+    const auto [status, snapshot]{ApiCall(off.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK(!snapshot["result"]["status"].exists("observed_candles_max"));
+    const auto [refused, rejection]{ApiCall(off.Endpoint(), "candles", id + ",\"interval\":\"1m\"")};
+    BOOST_CHECK_EQUAL(refused, 400);
+    BOOST_CHECK_EQUAL(rejection["error"].get_str(), "This method is not exposed by the public trading API");
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_candles_are_bounded_and_rate_limited)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket on{*this, m_path_root / "candles-on", {}, {16}, {}, {true}, {3}};
+    // Past the observed-time warm-up this quorum-holding node stamps live.
+    std::this_thread::sleep_for(std::chrono::milliseconds{4600});
+    on.Deposit();
+    const auto [status, plain]{ApiCall(on.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK_EQUAL(plain["result"]["status"]["observed_candles_max"].getInt<int>(), 3);
+    const auto [page_status, page]{ApiCall(on.Endpoint(), "candles", id + ",\"interval\":\"1m\",\"limit\":18446744073709551615")};
+    BOOST_REQUIRE_MESSAGE(page_status == 200, page.write());
+    const auto& result{page["result"]};
+    BOOST_CHECK_EQUAL(result["source"].get_str(), "endpoint_operator");
+    BOOST_CHECK(!result["certified"].get_bool());
+    BOOST_CHECK_EQUAL(result["interval"].get_str(), "1m");
+    // The page is clamped to the advertised three intervals.
+    BOOST_CHECK_EQUAL(result["before_ms"].getInt<int64_t>() - result["from_ms"].getInt<int64_t>(), 3 * 60'000);
+    BOOST_REQUIRE_GE(result["candles"].size(), 1U);
+    const auto& newest{result["candles"][result["candles"].size() - 1]};
+    BOOST_CHECK_EQUAL(newest["last_sequence"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(newest["entries"].getInt<int>(), 1);
+    // Refused before any read: a bad interval or limit.
+    for (const std::string bad : {",\"interval\":\"2m\"", ",\"interval\":\"1m\",\"limit\":0", "", ",\"interval\":\"1m\",\"from\":1"}) {
+        BOOST_TEST_CONTEXT("params" << bad) {
+            const auto [refused, rejection]{ApiCall(on.Endpoint(), "candles", id + bad)};
+            BOOST_CHECK(refused == 400 || refused == 429);
+        }
+    }
+    // At most two pages per second per client: HTTP 429 beyond.
+    std::vector<int> statuses;
+    std::string limited;
+    for (int i{0}; i < 3; ++i) {
+        const auto [code, reply]{ApiCall(on.Endpoint(), "candles", id + ",\"interval\":\"5m\"")};
+        statuses.push_back(code);
+        if (code == 429) limited = reply["error"].get_str();
+    }
+    BOOST_CHECK(std::find(statuses.begin(), statuses.end(), 429) != statuses.end());
+    BOOST_CHECK_EQUAL(limited, node::FLOWMESH_API_CANDLES_BUDGET_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_labels_endpoint_observed_time_and_candles)
+{
+    LiveMarket on{*this, m_path_root / "remote-observed", {}, {16}, {}, {true}, {node::FLOWMESH_API_CANDLES_DEFAULT}};
+    // Past the observed-time warm-up this quorum-holding node stamps live.
+    std::this_thread::sleep_for(std::chrono::milliseconds{4600});
+    on.Deposit();
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {on.Endpoint()}, m_path_root / "remote-observed-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    flowmesh::MarketDataQuery query;
+    query.ticks = flowmesh::ClearingTickQuery{std::nullopt, 16};
+    query.observed_time = true;
+    // The first read learns the endpoint's adverts; the next one asks.
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, query, error), error);
+    const auto data{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(data, error);
+    BOOST_REQUIRE(data->observed);
+    const auto& times{*data->observed};
+    BOOST_CHECK_MESSAGE(times.available, times.unavailable_reason);
+    BOOST_CHECK_EQUAL(times.source, on.Endpoint().url);
+    BOOST_REQUIRE(!times.rows.empty());
+    const auto& head{times.rows.back()};
+    BOOST_CHECK_EQUAL(head.sequence, data->snapshot.next_microblock_sequence - 1);
+    BOOST_CHECK(head.hash == data->snapshot.last_microblock_hash);
+    BOOST_CHECK(head.mode == flowmesh::ObservedMode::LIVE);
+    BOOST_CHECK(!(head.flags & flowmesh::OBSERVED_IMPLAUSIBLE));
+    // The JSON a wallet RPC caller sees names the endpoint as the source.
+    BOOST_CHECK_EQUAL(node::FlowMeshClientMarketDataJson(*data)["observed_time"]["source"].get_str(), on.Endpoint().url);
+    // A read that does not ask gets no section.
+    query.observed_time = false;
+    const auto plain{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(plain, error);
+    BOOST_CHECK(!plain->observed);
+
+    const auto page{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(page, error);
+    BOOST_CHECK_MESSAGE(page->available, page->unavailable_reason);
+    BOOST_CHECK(page->remote);
+    BOOST_CHECK_EQUAL(page->source, on.Endpoint().url);
+    BOOST_REQUIRE(!page->candles.empty());
+    BOOST_CHECK_EQUAL(page->candles.back().last_sequence, head.sequence);
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_says_why_an_older_endpoint_has_no_times)
+{
+    // Ticks as f8a3432 serves them, no observed time and no candles.
+    LiveMarket old{*this, m_path_root / "remote-observed-old", {}, {16}};
+    old.Deposit();
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {old.Endpoint()}, m_path_root / "remote-observed-old-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    flowmesh::MarketDataQuery query;
+    query.ticks = flowmesh::ClearingTickQuery{std::nullopt, 16};
+    query.observed_time = true;
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, query, error), error);
+    const auto data{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(data, error);
+    BOOST_REQUIRE(data->ticks);
+    BOOST_CHECK(data->ticks->available);
+    BOOST_REQUIRE(data->observed);
+    BOOST_CHECK(!data->observed->available);
+    BOOST_CHECK_EQUAL(data->observed->unavailable_reason, "endpoint_does_not_advertise_observed_time");
+    const auto page{client->Candles(market, flowmesh::CandleInterval::M5, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(page, error);
+    BOOST_CHECK(!page->available);
+    BOOST_CHECK_EQUAL(page->unavailable_reason, "endpoint_does_not_advertise_candles");
+}
+
+namespace {
+//! Forwards public API requests to a live endpoint and records each request's
+//! method and params. It can add a clearing_ticks_max advertisement to every
+//! status object and replace the hash of the last tick of every reply.
+struct TickProxy {
+    node::HttpsEndpoint upstream;
+    std::mutex mutex;
+    std::optional<uint64_t> advert;
+    bool tamper{false};
+    //! Moves the newest candle of every 'candles' page this far past its
+    //! last sequence.
+    uint64_t candles_ahead{0};
+    std::vector<std::pair<std::string, UniValue>> requests;
+
+    node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
+    {
+        UniValue json;
+        if (!json.read(request.body) || !json["method"].isStr()) return {400, R"({"ok":false,"error":"proxy"})"};
+        const auto method{json["method"].get_str()};
+        std::optional<uint64_t> inject;
+        bool corrupt;
+        uint64_t ahead;
+        {
+            std::lock_guard lock{mutex};
+            requests.emplace_back(method, json["params"]);
+            inject = advert;
+            corrupt = tamper;
+            ahead = candles_ahead;
+        }
+        const auto reply{node::FlowMeshHttpsRequest(upstream, "/flowmesh/v1", request.body, std::chrono::seconds{10}, 32 << 20)};
+        if (!reply.response_received) return {502, R"({"ok":false,"error":"proxy upstream failed"})"};
+        UniValue parsed;
+        if ((!inject && !corrupt && !ahead) || !parsed.read(reply.body) || !parsed["ok"].isTrue()) return {reply.status, reply.body};
+        UniValue result{parsed["result"]};
+        if (ahead && method == "candles" && result["candles"].isArray() && !result["candles"].empty()) {
+            const auto& candles{result["candles"].getValues()};
+            UniValue rows{UniValue::VARR};
+            for (size_t i{0}; i < candles.size(); ++i) {
+                UniValue row{candles[i]};
+                if (i + 1 == candles.size()) row.pushKV("last_sequence", row["last_sequence"].getInt<uint64_t>() + ahead);
+                rows.push_back(row);
+            }
+            result.pushKV("candles", rows);
+        }
+        if (inject && method == "markets") {
+            UniValue rows{UniValue::VARR};
+            for (auto row : result.getValues()) {
+                row.pushKV("clearing_ticks_max", *inject);
+                rows.push_back(row);
+            }
+            result = rows;
+        } else if (inject && result["status"].isObject()) {
+            UniValue status{result["status"]};
+            status.pushKV("clearing_ticks_max", *inject);
+            result.pushKV("status", status);
+        }
+        if (corrupt && result["reported_data"]["clearing_ticks"]["ticks"].isArray() &&
+            !result["reported_data"]["clearing_ticks"]["ticks"].empty()) {
+            UniValue reported{result["reported_data"]};
+            UniValue page{reported["clearing_ticks"]};
+            const auto& ticks{page["ticks"].getValues()};
+            UniValue rows{UniValue::VARR};
+            for (size_t i{0}; i < ticks.size(); ++i) {
+                UniValue row{ticks[i]};
+                if (i + 1 == ticks.size()) row.pushKV("microblock_hash", uint256::ONE.GetHex());
+                rows.push_back(row);
+            }
+            page.pushKV("ticks", rows);
+            reported.pushKV("clearing_ticks", page);
+            result.pushKV("reported_data", reported);
+        }
+        parsed.pushKV("result", result);
+        return {reply.status, parsed.write()};
+    }
+    //! The "ticks" parameter of each recorded request that carried one.
+    std::vector<std::pair<std::string, UniValue>> TickParams()
+    {
+        std::lock_guard lock{mutex};
+        std::vector<std::pair<std::string, UniValue>> out;
+        for (const auto& [method, params] : requests) {
+            if (params.exists("ticks")) out.emplace_back(method, params["ticks"]);
+        }
+        return out;
+    }
+    size_t Requests()
+    {
+        std::lock_guard lock{mutex};
+        return requests.size();
+    }
+};
+
+std::unique_ptr<node::FlowMeshHttpsServer> TickProxyServer(const ClientLaneFixture& fixture, TickProxy& proxy)
+{
+    auto options{fixture.Options()};
+    options.request_timeout = std::chrono::seconds{10};
+    auto server{std::make_unique<node::FlowMeshHttpsServer>(options, [&proxy](const auto& request) { return proxy.Handle(request); })};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server->Start(error), error);
+    return server;
+}
+
+flowmesh::MarketDataQuery TickPage()
+{
+    auto query{Page()};
+    query.ticks = flowmesh::ClearingTickQuery{};
+    return query;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(remote_candles_are_checked_against_a_head_verified_after_the_page)
+{
+    LiveMarket live{*this, m_path_root / "remote-candles-race", {}, {16}, {}, {true}, {node::FLOWMESH_API_CANDLES_DEFAULT}};
+    // Past the observed-time warm-up this quorum-holding node stamps live.
+    std::this_thread::sleep_for(std::chrono::milliseconds{4600});
+    live.Deposit();
+    TickProxy proxy{.upstream = live.Endpoint()};
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "remote-candles-race-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    flowmesh::MarketDataQuery query;
+    query.ticks = flowmesh::ClearingTickQuery{std::nullopt, 16};
+    query.observed_time = true;
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, query, error), error);
+    const auto held{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(held, error);
+    BOOST_REQUIRE_EQUAL(held->snapshot.next_microblock_sequence, 2U);
+
+    // The endpoint certifies another auction between this client's market
+    // read and its candles read, as on any active market: the endpoint's
+    // forming candle now ends past the head the client verified.
+    live.Certify(SignedCancel(0));
+    const auto page{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(page, error);
+    BOOST_CHECK_MESSAGE(page->available, page->unavailable_reason);
+    BOOST_REQUIRE(!page->candles.empty());
+    BOOST_CHECK_EQUAL(page->candles.back().last_sequence, 2U);
+    // Accepted against the endpoint's head, verified after the page: the
+    // client's head (with its ticks and their times) is at the page's end.
+    const auto after{client->Data(market, std::nullopt, query, error)};
+    BOOST_REQUIRE_MESSAGE(after, error);
+    BOOST_CHECK_EQUAL(after->snapshot.next_microblock_sequence, 3U);
+    BOOST_REQUIRE(after->ticks && after->ticks->available);
+    BOOST_CHECK_EQUAL(after->ticks->ticks.back().sequence, 2U);
+    BOOST_REQUIRE(after->observed && after->observed->available);
+    std::set<uint64_t> timed;
+    for (const auto& row : after->observed->rows) {
+        if (row.mode == flowmesh::ObservedMode::LIVE) timed.insert(row.sequence);
+    }
+    BOOST_CHECK(timed.contains(1) && timed.contains(2));
+
+    // Fail closed: a page whose newest candle goes past any head the
+    // endpoint can prove is refused, after the head refresh.
+    {
+        std::lock_guard lock{proxy.mutex};
+        proxy.candles_ahead = 1000;
+    }
+    const auto refused{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_CHECK(!refused);
+    BOOST_CHECK_MESSAGE(error.find("past the endpoint's verified head") != std::string::npos, error);
+    {
+        std::lock_guard lock{proxy.mutex};
+        proxy.candles_ahead = 0;
+    }
+    // (Past the endpoint's two candle pages a second for this client.)
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    const auto again{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
+    BOOST_REQUIRE_MESSAGE(again, error);
+    BOOST_CHECK_EQUAL(again->candles.back().last_sequence, 2U);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_holds_endpoint_ticks_bound_to_its_verified_head)
+{
+    LiveMarket live{*this, m_path_root / "remote-ticks-service", {}, {256}};
+    TickProxy proxy{.upstream = live.Endpoint()};
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "remote-ticks-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    // The first read learns the advertisement from its snapshot's status.
+    const auto first{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(first, error);
+    BOOST_REQUIRE(first->ticks);
+    BOOST_CHECK(!first->ticks->available);
+    BOOST_CHECK_EQUAL(first->ticks->unavailable_reason, "clearing_ticks_not_yet_received");
+    BOOST_CHECK(proxy.TickParams().empty());
+    // The next one asks for the newest ticks, bound to the verified head.
+    const auto held{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(held, error);
+    BOOST_REQUIRE(held->ticks && held->ticks->available);
+    BOOST_REQUIRE_EQUAL(held->ticks->ticks.size(), 1U);
+    BOOST_CHECK(held->ticks->ticks.back().microblock_hash == held->snapshot.last_microblock_hash);
+    BOOST_CHECK_EQUAL(node::FlowMeshClientMarketDataJson(*held)["clearing_ticks"]["source"].get_str(), "endpoint_reported");
+    auto sent{proxy.TickParams()};
+    BOOST_REQUIRE_EQUAL(sent.size(), 1U);
+    BOOST_CHECK_EQUAL(sent[0].first, "updates");
+    BOOST_CHECK(!sent[0].second.exists("after_sequence"));
+    BOOST_CHECK_EQUAL(sent[0].second["limit"].getInt<int>(), 256);
+    // A new head: only the ticks after the last one held are asked for,
+    // with the updates page and with the snapshot that verifies the head.
+    live.Deposit();
+    const auto moved{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(moved, error);
+    BOOST_CHECK_EQUAL(moved->snapshot.next_microblock_sequence, 2U);
+    BOOST_REQUIRE(moved->ticks && moved->ticks->available);
+    BOOST_REQUIRE_EQUAL(moved->ticks->ticks.size(), 2U);
+    BOOST_CHECK(moved->ticks->ticks.back().microblock_hash == moved->snapshot.last_microblock_hash);
+    sent = proxy.TickParams();
+    BOOST_REQUIRE_EQUAL(sent.size(), 3U);
+    for (size_t i : {1, 2}) {
+        BOOST_CHECK_EQUAL(sent[i].first, i == 1 ? "updates" : "snapshot");
+        BOOST_CHECK_EQUAL(sent[i].second["after_sequence"].getInt<int>(), 0);
+    }
+    // The caller's own page of what is held.
+    auto after{TickPage()};
+    after.ticks->after_sequence = 0;
+    const auto newest{client->Data(market, std::nullopt, after, error)};
+    BOOST_REQUIRE_MESSAGE(newest, error);
+    BOOST_REQUIRE(newest->ticks && newest->ticks->available);
+    BOOST_REQUIRE_EQUAL(newest->ticks->ticks.size(), 1U);
+    BOOST_CHECK_EQUAL(newest->ticks->ticks[0].sequence, 1U);
+    // Reads without ticks, and the status read a signing preflight uses,
+    // never carry them.
+    const auto carried{proxy.TickParams().size()};
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    const auto status{client->Market(market, std::nullopt)};
+    BOOST_REQUIRE(status);
+    BOOST_CHECK(status->error.empty());
+    BOOST_CHECK_EQUAL(proxy.TickParams().size(), carried);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_withdraws_a_stale_ticks_advertisement)
+{
+    // The endpoint serves no ticks; the proxy advertises them anyway.
+    LiveMarket live{*this, m_path_root / "stale-ticks-service"};
+    TickProxy proxy{.upstream = live.Endpoint()};
+    proxy.advert = 256;
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "stale-ticks-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // Refused as an unknown field: the same endpoint is read again without
+    // them, and the read succeeds.
+    const auto requests{proxy.Requests()};
+    const auto data{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(data, error);
+    BOOST_CHECK_EQUAL(proxy.Requests(), requests + 2);
+    BOOST_REQUIRE_EQUAL(proxy.TickParams().size(), 1U);
+    BOOST_REQUIRE(data->ticks);
+    BOOST_CHECK(!data->ticks->available);
+    BOOST_CHECK(client->Status().endpoints.at(0).available);
+    BOOST_CHECK(client->Status().endpoints.at(0).last_error.empty());
+    // Advertised again, but withdrawn for a while: never sent again.
+    for (int read{0}; read < 3; ++read) BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, TickPage(), error), error);
+    BOOST_CHECK_EQUAL(proxy.TickParams().size(), 1U);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_drops_a_contradicting_tick_page_but_not_the_read)
+{
+    LiveMarket live{*this, m_path_root / "tampered-ticks-service", {}, {256}};
+    TickProxy proxy{.upstream = live.Endpoint()};
+    proxy.tamper = true;
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "tampered-ticks-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // The tick at the verified head names another hash: only the ticks go.
+    const auto data{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(data, error);
+    BOOST_CHECK(data->certificate_verified && data->account_state_verified);
+    BOOST_REQUIRE(data->ticks);
+    BOOST_CHECK(!data->ticks->available && data->ticks->ticks.empty());
+    BOOST_CHECK(data->ticks->unavailable_reason.starts_with("endpoint_clearing_ticks_rejected"));
+    {
+        std::lock_guard lock{proxy.mutex};
+        proxy.tamper = false;
+    }
+    const auto fixed{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(fixed, error);
+    BOOST_REQUIRE(fixed->ticks && fixed->ticks->available);
+    BOOST_CHECK(fixed->ticks->ticks.back().microblock_hash == fixed->snapshot.last_microblock_hash);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(remote_client_far_behind_asks_for_the_newest_ticks)
+{
+    // An operator's two-tick pages.
+    LiveMarket live{*this, m_path_root / "far-ticks-service", {}, {2}};
+    TickProxy proxy{.upstream = live.Endpoint()};
+    auto server{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, m_path_root / "far-ticks-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, TickPage(), error), error);
+    const auto held{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(held, error);
+    BOOST_REQUIRE(held->ticks && held->ticks->available);
+    // Four heads verified by reads that ask for no ticks (as a signing
+    // preflight's): the held ticks are now more than a page behind.
+    for (unsigned char signer{0}; signer < 4; ++signer) {
+        CKey key;
+        std::array<unsigned char, 32> secret{};
+        secret.back() = static_cast<unsigned char>(0x60 + signer);
+        key.Set(secret.begin(), secret.end(), true);
+        flowmesh::Action cancel;
+        cancel.signer = flowmesh::AccountForKey(XOnlyPubKey{key.GetPubKey()});
+        cancel.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+        BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, cancel));
+        live.Certify(cancel);
+        BOOST_REQUIRE(client->Market(market, std::nullopt));
+    }
+    const auto before{proxy.TickParams().size()};
+    const auto caught_up{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(caught_up, error);
+    BOOST_CHECK_EQUAL(caught_up->snapshot.next_microblock_sequence, 5U);
+    // One read reaches the head: the newest page, not the one after the ring.
+    BOOST_REQUIRE(caught_up->ticks && caught_up->ticks->available);
+    BOOST_CHECK(caught_up->ticks->ticks.back().microblock_hash == caught_up->snapshot.last_microblock_hash);
+    const auto sent{proxy.TickParams()};
+    BOOST_REQUIRE_GT(sent.size(), before);
+    for (size_t i{before}; i < sent.size(); ++i) {
+        BOOST_CHECK(!sent[i].second.exists("after_sequence"));
+        BOOST_CHECK_EQUAL(sent[i].second["limit"].getInt<int>(), 2);
+    }
+    // Current again: the next read asks only for the ticks after the ring.
+    live.Deposit();
+    const auto next{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(next, error);
+    BOOST_REQUIRE(next->ticks && next->ticks->available);
+    BOOST_CHECK(next->ticks->ticks.back().microblock_hash == next->snapshot.last_microblock_hash);
+    const auto later{proxy.TickParams()};
+    BOOST_REQUIRE_GT(later.size(), sent.size());
+    BOOST_CHECK_EQUAL(later.back().second["after_sequence"].getInt<int>(), 4);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(live_update_reads_fetch_missing_ticks_once_with_an_ordinary_read)
+{
+    LiveMarket live{*this, m_path_root / "watch-ticks-service", {std::chrono::milliseconds{2000}, 4}, {256}};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "watch-ticks-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto held{client->Data(market, std::nullopt, TickPage(), error)};
+    BOOST_REQUIRE_MESSAGE(held, error);
+    BOOST_REQUIRE(held->ticks && held->ticks->available);
+    auto query{TickPage()};
+    query.known_head = held->snapshot.last_microblock_hash;
+    const auto watch_read = [&] {
+        interfaces::FlowMeshMarketWatch watch;
+        auto data{client->Watch(market, std::nullopt, query, std::chrono::milliseconds{300}, watch, error)};
+        BOOST_REQUIRE_MESSAGE(data, error);
+        return std::pair{std::move(*data), watch};
+    };
+    // A watch: the lane now holds a kept-alive connection.
+    const auto [held_again, opened]{watch_read()};
+    BOOST_CHECK(opened.supported && opened.waited);
+    // A new head verified by a read that asks for no ticks (as a signing
+    // preflight's): the held ticks now stop short of it.
+    live.Deposit();
+    BOOST_REQUIRE(client->Market(market, std::nullopt));
+    const auto [caught_up, first]{watch_read()};
+    // Only the ticks were missing: the caller may watch again at once.
+    BOOST_CHECK_EQUAL(first.status, "ticks_catchup");
+    BOOST_CHECK(!first.supported);
+    BOOST_CHECK(first.waited);
+    BOOST_CHECK(first.endpoint_live_ms > 0);
+    BOOST_REQUIRE(caught_up.ticks && caught_up.ticks->available);
+    BOOST_CHECK(caught_up.ticks->ticks.back().microblock_hash == caught_up.snapshot.last_microblock_hash);
+    // Current again: the next read watches, on the lane's kept connection.
+    query.known_head = caught_up.snapshot.last_microblock_hash;
+    std::vector<UniValue> spans;
+    {
+        TimingCapture timing;
+        const auto [quiet, second]{watch_read()};
+        spans = timing.Stop("client_market_watch");
+        BOOST_CHECK(second.supported);
+        BOOST_REQUIRE(quiet.ticks && quiet.ticks->available);
+    }
+    BOOST_REQUIRE_EQUAL(spans.size(), 1U);
+    BOOST_REQUIRE(spans[0].exists("connection_reused"));
+    BOOST_CHECK_EQUAL(spans[0]["connection_reused"].getInt<uint64_t>(), 1U);
+    client.reset();
+}
+
+BOOST_AUTO_TEST_CASE(indicative_clearing_comes_from_verified_state_on_both_backends)
+{
+    LiveMarket live{*this, m_path_root / "views-service"};
+    std::string error;
+    auto remote{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "views-client", error)};
+    BOOST_REQUIRE_MESSAGE(remote, error);
+    auto local{node::MakeLocalFlowMeshBackend(*live.service)};
+    const uint256 account{uint8_t{0x41}};
+    auto query{Page()};
+    query.indicative = flowmesh::IndicativeQuery{flowmesh::IndicativeDraft{flowmesh::ClearingEngine::Side::ASK, 5, 1, account}};
+    for (auto* backend : {remote.get(), local.get()}) {
+        BOOST_TEST_CONTEXT((backend == remote.get() ? "remote" : "local")) {
+            const auto data{backend->Data(market, account, query, error)};
+            BOOST_REQUIRE_MESSAGE(data, error);
+            BOOST_CHECK(!data->book); // The transient copy never leaves the backend.
+            BOOST_REQUIRE(data->indicative);
+            const auto& view{*data->indicative};
+            BOOST_CHECK(view.available);
+            BOOST_CHECK(view.head == data->snapshot.last_microblock_hash);
+            BOOST_CHECK(view.draft == query.indicative->draft);
+            // The verified book is empty: nothing would clear.
+            BOOST_CHECK(!view.cleared && !view.draft_replaces_curve && !view.best_bid && !view.best_ask);
+            BOOST_CHECK(view.draft_fill_min == CAmount{0} && view.draft_fill_max == CAmount{0});
+            const auto json{node::FlowMeshClientMarketDataJson(*data)};
+            BOOST_CHECK(!json["indicative"]["certified"].get_bool());
+            BOOST_CHECK(json["indicative"]["excludes_pending_actions"].get_bool());
+            BOOST_CHECK_EQUAL(json["indicative"]["basis"].get_str(), "verified_standing_curves_with_draft");
+            BOOST_CHECK(json["indicative"]["draft"]["assumes_admission"].get_bool());
+            BOOST_CHECK(json["indicative"]["draft"]["account_known"].get_bool());
+            // A light poll at the same head still answers.
+            auto light{query};
+            light.known_head = data->snapshot.last_microblock_hash;
+            const auto unchanged{backend->Data(market, account, light, error)};
+            BOOST_REQUIRE_MESSAGE(unchanged, error);
+            BOOST_CHECK(unchanged->unchanged);
+            BOOST_REQUIRE(unchanged->indicative);
+            BOOST_CHECK(unchanged->indicative->available);
+            BOOST_CHECK(unchanged->indicative->head == data->snapshot.last_microblock_hash);
+            BOOST_CHECK(node::FlowMeshClientMarketDataJson(*unchanged).exists("indicative"));
+            // Not asked for: absent, and the reply is unchanged.
+            const auto plain{backend->Data(market, account, Page(), error)};
+            BOOST_REQUIRE_MESSAGE(plain, error);
+            BOOST_CHECK(!plain->indicative && !plain->ticks);
+            BOOST_CHECK(!node::FlowMeshClientMarketDataJson(*plain).exists("indicative"));
+        }
+    }
+    // A new certified head: the remote view follows the newly verified state.
+    live.Deposit();
+    const auto moved{remote->Data(market, account, query, error)};
+    BOOST_REQUIRE_MESSAGE(moved, error);
+    BOOST_REQUIRE(moved->indicative);
+    BOOST_CHECK_EQUAL(moved->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(moved->indicative->head == moved->snapshot.last_microblock_hash);
+    remote.reset();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+//! More standing curves than one 128-curve page.
+struct WideBookFixture : ClientLaneFixture {
+    static constexpr size_t ACCOUNTS{150};
+    WideBookFixture() : ClientLaneFixture{ACCOUNTS} {}
+};
+
+//! A loopback relay in front of a real endpoint that rewrites the
+//! endpoint's unauthenticated projection (reported_data) in every reply
+//! carrying one: no standing curves at all, and made-up book levels and
+//! indicative views (which the public API never serves). A client that took
+//! any display view from reported data would show these.
+struct ReportedDataTamper {
+    node::HttpsEndpoint upstream;
+    std::atomic<unsigned> tampered{0};
+    node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
+    {
+        const auto reply{node::FlowMeshHttpsRequest(upstream, request.path, request.body, std::chrono::seconds{8}, 32 << 20)};
+        if (!reply.response_received) return {502, R"({"ok":false,"error":"relay","result":null})"};
+        UniValue value;
+        if (!value.read(reply.body) || !value["result"].isObject() || !value["result"]["reported_data"].isObject()) return {reply.status, reply.body};
+        UniValue result{value["result"]};
+        UniValue reported{result["reported_data"]};
+        if (reported["liquidity"].isObject()) {
+            UniValue liquidity{reported["liquidity"]};
+            liquidity.pushKV("curves", UniValue{UniValue::VARR});
+            liquidity.pushKV("total_curves", 0);
+            reported.pushKV("liquidity", liquidity);
+        }
+        UniValue fake{UniValue::VOBJ};
+        fake.pushKV("available", true);
+        fake.pushKV("total_curves", 1);
+        fake.pushKV("bids", UniValue{UniValue::VOBJ});
+        fake.pushKV("asks", UniValue{UniValue::VOBJ});
+        reported.pushKV("book_levels", fake);
+        reported.pushKV("indicative", fake);
+        result.pushKV("reported_data", reported);
+        value.pushKV("result", result);
+        ++tampered;
+        return {reply.status, value.write()};
+    }
+};
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_wide_book_tests, WideBookFixture)
+
+BOOST_AUTO_TEST_CASE(remote_levels_cover_every_verified_curve_and_ignore_reported_data)
+{
+    // Critique S7 and the remote half of "more than 128 curves": through an
+    // endpoint whose reported data claims an empty book, the remote client's
+    // levels are exactly ComputeBookLevels over its verified state, all 150
+    // standing curves (ladders included), never the reported projection.
+    LiveMarket live{*this, m_path_root / "wide-book-service"};
+    std::string error;
+    const auto settle = [&] {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+        for (;;) {
+            const auto status{live.service->MarketStatus(market)};
+            BOOST_REQUIRE(status);
+            if (!status->paused && status->pending_actions == 0 && status->halt == node::FlowMeshRuntimeHalt::NONE) return;
+            BOOST_REQUIRE_MESSAGE(std::chrono::steady_clock::now() < deadline, "the book's actions did not certify");
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+    };
+    // Local submissions share the node's action token bucket: a refused
+    // one waits for its refill and is sent again (never another action).
+    const auto submit = [&](const flowmesh::Action& action) {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+        while (!live.service->SubmitLocalAction(market, action, error)) {
+            BOOST_REQUIRE_MESSAGE(error == "FlowMesh action is rate limited" && std::chrono::steady_clock::now() < deadline, error);
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+    };
+    settle();
+    for (const auto& outpoint : book_deposits) {
+        flowmesh::Action deposit;
+        deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
+        deposit.outpoint = outpoint;
+        submit(deposit);
+    }
+    settle();
+    // One ask per account (no bids: nothing clears), a four-price ladder for
+    // every tenth, many sharing a price with others.
+    size_t ladders{0};
+    for (size_t i{0}; i < book_keys.size(); ++i) {
+        flowmesh::Action ask;
+        ask.signer = flowmesh::AccountForKey(XOnlyPubKey{book_keys[i].GetPubKey()});
+        ask.sequence = 0;
+        ask.type = static_cast<uint8_t>(flowmesh::ActionType::SUBMIT_ASK);
+        const CAmount price{1'000 + 3 * static_cast<CAmount>(i % 40)};
+        const auto curve{i % 10 == 0 ? flowmesh::MakeLadderAskCurve({{price, 5}, {price + 1, 4}, {price + 7, 3}, {price + 20, 2}})
+                                     : flowmesh::MakeLimitAskCurve(price, 1 + static_cast<CAmount>(i % 7))};
+        BOOST_REQUIRE(curve);
+        ladders += i % 10 == 0;
+        ask.curve = *curve;
+        BOOST_REQUIRE(flowmesh::SignAction(book_keys[i], domain, config, ask));
+        submit(ask);
+    }
+    BOOST_REQUIRE_EQUAL(ladders, 15U);
+    settle();
+
+    ReportedDataTamper tamper{live.Endpoint()};
+    auto options{Options()};
+    options.request_timeout = std::chrono::seconds{10};
+    node::FlowMeshHttpsServer relay{options, [&tamper](const auto& request) { return tamper.Handle(request); }};
+    BOOST_REQUIRE_MESSAGE(relay.Start(error), error);
+    auto remote{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(relay.Port())}, m_path_root / "wide-book-client", error)};
+    BOOST_REQUIRE_MESSAGE(remote, error);
+    auto local{node::MakeLocalFlowMeshBackend(*live.service)};
+    const auto account{flowmesh::AccountForKey(XOnlyPubKey{book_keys[0].GetPubKey()})};
+
+    // Every verified standing curve, page by page at one head.
+    const auto all_curves = [&](const uint256& head) {
+        std::vector<flowmesh::ClearingEngine::CurveView> curves;
+        flowmesh::MarketDataQuery page;
+        page.limit = 1;
+        page.curve_limit = 128;
+        page.expected_head = head;
+        for (size_t pages{0};; ++pages) {
+            const auto data{local->Data(market, std::nullopt, page, error)};
+            BOOST_REQUIRE_MESSAGE(data, error);
+            BOOST_REQUIRE(data->snapshot.last_microblock_hash == head);
+            curves.insert(curves.end(), data->liquidity.curves.begin(), data->liquidity.curves.end());
+            if (!data->liquidity.next_cursor) break;
+            BOOST_REQUIRE(pages < 4);
+            page.curve_cursor = data->liquidity.next_cursor;
+        }
+        return curves;
+    };
+    const auto canonical{[] { flowmesh::LevelGrouping g; g.exact = false; g.mantissa = 1; g.exponent = 1; g.decimals = 9; return g; }()};
+    const auto inverse{[] { flowmesh::LevelGrouping g; g.exact = false; g.inverse = true; g.mantissa = 2; g.exponent = -6; g.decimals = 9; return g; }()};
+    size_t compared{0};
+    for (const auto& grouping : {flowmesh::LevelGrouping{}, canonical, inverse}) {
+        BOOST_TEST_CONTEXT("grouping exact=" << grouping.exact << " inverse=" << grouping.inverse) {
+            BOOST_REQUIRE(flowmesh::LevelGroupingError(grouping).empty());
+            auto query{Page()};
+            query.levels = flowmesh::BookLevelsQuery{};
+            query.levels->depth = flowmesh::MARKET_DATA_MAX_LEVELS;
+            query.levels->grouping = grouping;
+            query.levels->account = account;
+            const auto data{remote->Data(market, account, query, error)};
+            BOOST_REQUIRE_MESSAGE(data, error);
+            BOOST_REQUIRE(data->remote && data->certificate_verified && data->account_state_verified);
+            BOOST_REQUIRE(data->levels);
+            const auto& levels{*data->levels};
+            const auto head{data->snapshot.last_microblock_hash};
+            // The whole verified book, not the reported (empty) one and not
+            // only the first page the reply carries.
+            BOOST_CHECK_EQUAL(data->liquidity.total_curves, WideBookFixture::ACCOUNTS);
+            BOOST_CHECK_EQUAL(data->liquidity.curves.size(), 128U);
+            BOOST_CHECK(levels.available);
+            BOOST_CHECK_EQUAL(levels.total_curves, WideBookFixture::ACCOUNTS);
+            BOOST_CHECK(levels.head == head);
+            const auto curves{all_curves(head)};
+            BOOST_REQUIRE_EQUAL(curves.size(), WideBookFixture::ACCOUNTS);
+            auto expected{flowmesh::ComputeBookLevels(curves, *query.levels)};
+            expected.head = head;
+            expected.standing.head = head;
+            BOOST_CHECK(levels == expected);
+            BOOST_CHECK(expected.asks.available && !expected.asks.levels.empty() && expected.bids.levels.empty());
+            // The ladders' own prices are levels of their own; account 0's
+            // ladder is its own share.
+            if (grouping.exact) {
+                BOOST_CHECK(std::any_of(levels.asks.levels.begin(), levels.asks.levels.end(), [](const auto& level) { return level.low == 1'020 && level.own == 2; }));
+                BOOST_CHECK_EQUAL(levels.asks.levels.front().low, 1'000);
+            }
+            ++compared;
+        }
+    }
+    BOOST_CHECK_EQUAL(compared, 3U);
+    BOOST_CHECK(tamper.tampered.load() > 0);
+    remote.reset();
+    relay.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_submit_outcome_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(public_submit_derives_no_outcome_it_would_discard)
+{
+    LiveMarket live{*this, m_path_root / "submit-outcome-service", {}, {}, {true}};
+    const auto action{SignedCancel(0)};
+    live.Certify(action);
+    BOOST_REQUIRE(live.service->ClientRecentInclusion(market, action.Id()));
+    // Anyone may replay a public certified action. The public reply never
+    // states an outcome, so none is derived for it: no outcome-part read.
+    const std::string params{"{\"market_id\":\"" + market.GetHex() + "\",\"action_id\":\"" + action.Id().GetHex() +
+                             "\",\"action_hex\":\"" + HexStr(*flowmesh::EncodeProductionActionPayload(action)) + "\"}"};
+    const auto reads{live.service->ClientOutcomeReadsForTest()};
+    for (int i{0}; i < 3; ++i) {
+        const auto [status, reply]{ApiCall(live.Endpoint(), "submit", params)};
+        BOOST_REQUIRE_EQUAL(status, 200);
+        BOOST_CHECK_EQUAL(reply["result"]["receipt_state"].get_str(), "certified_inclusion");
+        BOOST_CHECK(!reply["result"]["outcome_verified"].get_bool());
+        BOOST_CHECK(!reply["result"].exists("outcome"));
+    }
+    BOOST_CHECK_EQUAL(live.service->ClientOutcomeReadsForTest(), reads);
+    // The node's own backend (wallet RPC and Qt) still verifies it.
+    const auto local{node::MakeLocalFlowMeshBackend(*live.service)};
+    const auto receipt{local->Submit(market, action)};
+    BOOST_CHECK_EQUAL(receipt.state, "certified_inclusion");
+    BOOST_CHECK(receipt.outcome_verified);
+    BOOST_REQUIRE(receipt.outcome);
+    BOOST_CHECK_EQUAL(receipt.outcome->status, "rejected"); // nothing to cancel
+    BOOST_CHECK_GT(live.service->ClientOutcomeReadsForTest(), reads);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_snapshot_outcome_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(snapshot_of_the_inclusion_head_keeps_its_verified_outcome)
+{
+    LiveMarket live{*this, m_path_root / "snapshot-outcome-service", {}, {}, {true}};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "snapshot-outcome-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto before{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(before, error);
+    const auto action{SignedCancel(0)};
+    const auto submitted{client->Submit(market, action)};
+    BOOST_REQUIRE_MESSAGE(submitted.state != "rejected", submitted.reason);
+    // The opt-in status read verifies the inclusion and its outcome.
+    interfaces::FlowMeshActionReceipt receipt;
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{20}};
+    while (std::chrono::steady_clock::now() < deadline) {
+        receipt = client->ActionStatus(market, action.Id(), false);
+        if (receipt.certificate_verified && receipt.outcome_verified) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    BOOST_REQUIRE(receipt.certificate_verified);
+    BOOST_REQUIRE(receipt.outcome_verified);
+    BOOST_REQUIRE(receipt.outcome);
+    BOOST_CHECK_EQUAL(receipt.outcome->status, "rejected"); // nothing to cancel
+    // The next read moves the client to the head holding the action through
+    // a snapshot, which verifies that inclusion again. The outcome stays
+    // verified without any further request.
+    const auto moved{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(moved, error);
+    BOOST_REQUIRE(moved->snapshot.last_microblock_hash == receipt.microblock_hash);
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].receipt.certificate_verified);
+    BOOST_CHECK(saved[0].receipt.microblock_hash == receipt.microblock_hash);
+    BOOST_CHECK(saved[0].receipt.outcome_verified);
+    BOOST_REQUIRE(saved[0].receipt.outcome);
+    BOOST_CHECK_EQUAL(saved[0].receipt.outcome->status, "rejected");
+    BOOST_CHECK_EQUAL(saved[0].receipt.reason_code, receipt.reason_code);
+    client.reset();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

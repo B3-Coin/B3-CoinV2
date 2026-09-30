@@ -8,15 +8,20 @@
 #include <node/flowmesh_client_join.h>
 #include <node/flowmesh_https.h>
 #include <univalue.h>
+#include <util/int128.h>
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 class ChainstateManager;
+namespace flowmesh {
+struct ClientEventPage;
+} // namespace flowmesh
 namespace node {
 class FlowMeshService;
 
@@ -40,7 +45,27 @@ public:
     virtual std::optional<interfaces::FlowMeshMarketStatus> Market(const uint256& market, const std::optional<uint256>& account) = 0;
     virtual std::optional<flowmesh::MarketData> Data(const uint256& market, const std::optional<uint256>& account,
                                                    const flowmesh::MarketDataQuery& query, std::string& error) = 0;
-    virtual interfaces::FlowMeshActionReceipt Submit(const uint256& market, const flowmesh::Action& action) = 0;
+    //! One bounded live-update read of a market: at most `wait` spent waiting
+    //! for a change the endpoint can report, then the same verified data
+    //! Data() returns. Never signs, sends or resends an action. A zero wait
+    //! is an ordinary read that also releases a remote client's watch lane.
+    virtual std::optional<flowmesh::MarketData> Watch(const uint256& market, const std::optional<uint256>& account,
+                                                    const flowmesh::MarketDataQuery& query, std::chrono::milliseconds wait,
+                                                    interfaces::FlowMeshMarketWatch& watch, std::string& error)
+    {
+        watch = {};
+        watch.status = "unsupported";
+        return Data(market, account, query, error);
+    }
+    //! A nonzero wait lets a remote backend return a verified inclusion from
+    //! this call: at most one bounded wait at the endpoint for the delivered
+    //! action's certification, in the submission itself where the endpoint
+    //! offers it, else as one waited status read right after the delivery.
+    //! It never signs or resends to wait, and the receipt is never less
+    //! conservative than an unwaited Submit followed by that read. The local
+    //! engine answers at once.
+    virtual interfaces::FlowMeshActionReceipt Submit(const uint256& market, const flowmesh::Action& action,
+                                                     std::chrono::milliseconds wait = std::chrono::milliseconds{0}) = 0;
     //! A nonzero wait (only without retry) lets a remote backend hold one read
     //! of an action it just delivered open at the endpoint, bounded, until the
     //! action is certified there. It never resends or signs, and the receipt
@@ -60,6 +85,17 @@ public:
     //! Fresh read-only HTTPS availability probe. Never signs, retries an action,
     //! resets an outbox/cursor or changes configured trust. Busy fails promptly.
     virtual FlowMeshClientReconnectResult Reconnect() { return {}; }
+    //! One page of a market's operator-observed UTC candles (display only,
+    //! never certified). The local engine may page its disk beyond the
+    //! memory window; a remote backend asks the endpoint that serves its
+    //! market data, only when that endpoint advertises candles, and labels
+    //! them endpoint-reported. Never signs or sends an action.
+    virtual std::optional<flowmesh::ObservedCandlePage> Candles(const uint256& market, flowmesh::CandleInterval interval,
+                                                                std::optional<int64_t> before_ms, size_t limit, std::string& error)
+    {
+        error = "This trading backend does not serve observed-time candles";
+        return std::nullopt;
+    }
     virtual std::optional<interfaces::FlowMeshPendingCheckpoint> Checkpoint(const uint256& market, std::string& error) = 0;
     virtual std::vector<interfaces::FlowMeshVaultOperation> VaultOperations(const std::optional<uint256>& market, std::string& error) = 0;
     virtual std::optional<interfaces::FlowMeshVaultOperation> VaultOperation(const uint256& effect, std::string& error) = 0;
@@ -72,13 +108,23 @@ std::unique_ptr<FlowMeshTradingBackend> MakeLocalFlowMeshBackend(
 std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
     ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints,
     const fs::path& client_datadir, std::string& error, const FlowMeshJoinWindows& join_windows = {});
+//! Test only; nothing in the node calls it. A remote backend's waited
+//! submission then calls `fault` after its lane request and before it takes
+//! the work gate to apply the reply, so a throw from `fault` models an unwind
+//! between the two. Empty clears it. False for a backend that is not remote.
+bool SetFlowMeshLaneSubmissionFaultForTest(FlowMeshTradingBackend& backend, std::function<void()> fault);
 
 //! Node-local latency policy for the restricted API's bounded 'action' wait,
 //! never consensus. A zero max or zero waiters disables it: no capability is
 //! advertised and 'action' keeps its exact previous request contract.
+//! `submit` also offers the same wait, in the same slots, on 'submit' (the
+//! submit_wait_ms_max advert): a waited submission's reply adds the 'action'
+//! reply for the admitted action after the wait. Off, or with waits
+//! disabled, 'submit' keeps its exact previous request and reply contract.
 struct FlowMeshTradingApiWait {
     std::chrono::milliseconds max{0};
     size_t waiters{0};
+    bool submit{false};
 };
 inline constexpr std::chrono::milliseconds FLOWMESH_API_ACTION_WAIT_MAX{2500};
 inline constexpr std::chrono::milliseconds FLOWMESH_API_ACTION_WAIT_DEFAULT{2000};
@@ -87,15 +133,136 @@ inline constexpr size_t FLOWMESH_API_ACTION_WAITERS_MAX{12};
 //! Connections doing HTTPS work at once, as with the API's two workers before
 //! waits existed; each wait slot adds a worker that only sleeps in a wait.
 inline constexpr size_t FLOWMESH_API_ACTIVE_PERMITS{2};
+//! Action-wait and watch slots together: each adds a sleeping worker, and the
+//! HTTPS server's worker bound is never raised for them.
+inline constexpr size_t FLOWMESH_API_MAX_WAIT_SLOTS{FLOWMESH_HTTPS_MAX_WORKER_THREADS - FLOWMESH_API_ACTIVE_PERMITS};
+static_assert(FLOWMESH_API_ACTION_WAITERS_MAX <= FLOWMESH_API_MAX_WAIT_SLOTS);
+
+//! Node-local latency policy for the restricted API's bounded 'updates' watch,
+//! never consensus. A zero max or zero watchers disables it: no capability is
+//! advertised and 'updates' keeps its exact previous request and reply
+//! contract. A watched 'updates' read waits, holding a separate slot and no
+//! HTTPS permit, until an event after the client's cursor exists for its
+//! market and account filter, the head differs from its known head, or its
+//! deadline; its reply is the ordinary event page and status object with no
+//! reported_data.
+struct FlowMeshTradingApiWatch {
+    std::chrono::milliseconds max{0};
+    size_t watchers{0};
+};
+inline constexpr std::chrono::milliseconds FLOWMESH_API_UPDATES_WATCH_MAX{2500};
+//! Off until the pending-checkpoint memo has been reviewed and the cost of
+//! concurrent watchers measured; 2000 ms is the intended enabled value.
+inline constexpr std::chrono::milliseconds FLOWMESH_API_UPDATES_WATCH_DEFAULT{0};
+inline constexpr size_t FLOWMESH_API_UPDATES_WATCHERS_DEFAULT{8};
+inline constexpr size_t FLOWMESH_API_UPDATES_WATCHERS_MAX{10};
+//! A watched 'updates' reply: at most CLIENT_EVENT_PAGE_MAX events and one
+//! status object, never reported_data. The server refuses a larger one.
+inline constexpr size_t FLOWMESH_API_WATCH_MAX_REPLY{512 * 1024};
+/** Watch slots for `action_slots` action-wait slots: an explicitly requested
+ * count (0..FLOWMESH_API_UPDATES_WATCHERS_MAX), refused when watches are
+ * enabled and it exceeds the room the action waits leave; otherwise the
+ * default, reduced to that room, so a configuration valid before watches
+ * existed never fails to start. nullopt and `error` when refused. */
+std::optional<size_t> FlowMeshApiWatchSlots(size_t action_slots, bool watch_enabled,
+                                            std::optional<int64_t> requested, std::string& error);
+
+//! Node-local policy for the restricted API's public 'health' method and the
+//! advisory readiness keys (health_api_version, endpoint_ready,
+//! endpoint_not_ready) in its status objects; never consensus or evidence.
+//! Disabled keeps the exact previous request and reply contract: 'health'
+//! is not exposed and status objects carry no readiness keys.
+struct FlowMeshTradingApiHealth {
+    bool enabled{false};
+};
+//! Per client IPv4 address or IPv6 /64, charged after the API's ordinary
+//! admission budget; tighter than it.
+inline constexpr unsigned FLOWMESH_API_HEALTH_PER_CLIENT_PER_SECOND{4};
+//! The all-markets 'health' reply is rebuilt at most this often.
+inline constexpr std::chrono::milliseconds FLOWMESH_API_HEALTH_CACHE{250};
+inline constexpr const char* FLOWMESH_API_HEALTH_BUDGET_ERROR{"Public health request budget exhausted"};
+
+//! Node-local policy for opt-in, verifiable action outcomes on the restricted
+//! API: the "action_outcome_v1" advert in status objects, the 'action'
+//! parameter "outcome" and the 'outcome_evidence' method. Disabled keeps the
+//! exact previous request and reply contract. Evidence comes only from this
+//! node's in-memory recent window, never from the store.
+struct FlowMeshTradingApiOutcome {
+    bool enabled{false};
+};
+inline constexpr const char* FLOWMESH_API_OUTCOME_BUDGET_ERROR{
+    "Public trading request budget exhausted before outcome evidence"};
+
+//! Node-local policy for clearing ticks on the restricted API's 'snapshot' and
+//! unwatched 'updates' reads: the "clearing_ticks_max" advert in status
+//! objects and an optional "ticks" parameter {after_sequence, limit}, whose
+//! page (limit clamped to max) rides in reported_data. Endpoint-reported
+//! display data from the bounded in-memory history, never evidence. Zero keeps
+//! the exact previous request and reply contract.
+struct FlowMeshTradingApiTicks {
+    size_t max{0};
+};
+inline constexpr size_t FLOWMESH_API_CLEARING_TICKS_DEFAULT{flowmesh::MARKET_DATA_MAX_TICKS};
+
+//! Node-local policy for operator-observed time on the restricted API's
+//! 'snapshot' and unwatched 'updates' reads: the "observed_time_v1" advert in
+//! status objects and an optional "observed_time": true parameter, whose
+//! section (this endpoint's stamps of the reply's head, history and ticks)
+//! rides in reported_data. Endpoint-reported display data: never certified,
+//! never evidence; public rows carry only the clock flags and never why an
+//! entry was late or anything about seats. Disabled keeps the exact
+//! previous request and reply contract.
+struct FlowMeshTradingApiObservedTime {
+    bool enabled{false};
+};
+
+//! Node-local policy for the restricted API's 'candles' method: one page of
+//! this node's operator-observed UTC candles, served from the observed-time
+//! log's memory window only (never the disk), with the "observed_candles_max"
+//! advert (the largest page, at most 500). The candles are computed once per
+//! commit, never per request, and a page is O(its length) to copy; a request
+//! costs one more read token than the admission budget and at most
+//! FLOWMESH_API_CANDLES_PER_CLIENT_PER_SECOND pages per client. Display data,
+//! never certified or evidence. Zero keeps the exact previous contract
+//! ('candles' is not exposed).
+struct FlowMeshTradingApiCandles {
+    size_t max{0};
+};
+inline constexpr size_t FLOWMESH_API_CANDLES_DEFAULT{500};
+inline constexpr unsigned FLOWMESH_API_CANDLES_PER_CLIENT_PER_SECOND{2};
+inline constexpr const char* FLOWMESH_API_CANDLES_BUDGET_ERROR{"Public candles request budget exhausted"};
 
 //! Restricted HTTPS adapter. It holds no wallet and never invokes the RPC table.
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(
     FlowMeshService& service, FlowMeshHttpsServer::Options options,
-    FlowMeshAssetMetadataCatalog metadata = {}, FlowMeshTradingApiWait wait = {});
+    FlowMeshAssetMetadataCatalog metadata = {}, FlowMeshTradingApiWait wait = {},
+    FlowMeshTradingApiHealth health = {}, FlowMeshTradingApiOutcome outcome = {},
+    FlowMeshTradingApiWatch watch = {}, FlowMeshTradingApiTicks ticks = {},
+    FlowMeshTradingApiObservedTime observed = {}, FlowMeshTradingApiCandles candles = {});
 
 //! Shared public projection used by the wallet RPC and restricted endpoint.
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);
-UniValue FlowMeshClientReceiptJson(const interfaces::FlowMeshActionReceipt& receipt);
+//! One page of operator-observed candles (getflowmeshcandles and the
+//! restricted API's 'candles'): volumes are exact decimal strings.
+UniValue FlowMeshObservedCandlePageJson(const flowmesh::ObservedCandlePage& page);
+std::string FlowMeshUnsigned128Text(util::Unsigned128 value);
+//! The local RPC's "book_levels" section (getflowmeshmarketdata levels):
+//! bucket and notional are exact decimal strings. A public reply never
+//! carries it (its queries never ask for levels).
+UniValue FlowMeshBookLevelsJson(const flowmesh::BookLevels& value);
+UniValue FlowMeshLevelGroupingJson(const flowmesh::LevelGrouping& grouping);
+//! The event page part of an 'updates' reply (cursor, gap, more, event ids
+//! and events), ordinary or watched.
+UniValue FlowMeshClientUpdatesPageJson(const flowmesh::ClientEventPage& page);
+//! PUBLIC_V1 writes exactly the previous receipt keys (updates, submit, a v1
+//! 'action' reply, the outbox row). PUBLIC_OUTCOME_V1 (an opt-in 'action'
+//! reply) adds reason_code when known; LOCAL_RPC adds it, the display stage
+//! and the verified outcome.
+enum class FlowMeshReceiptJsonScope : uint8_t { PUBLIC_V1, PUBLIC_OUTCOME_V1, LOCAL_RPC };
+UniValue FlowMeshClientReceiptJson(const interfaces::FlowMeshActionReceipt& receipt,
+                                   FlowMeshReceiptJsonScope scope = FlowMeshReceiptJsonScope::PUBLIC_V1);
+//! The verified outcome object of a LOCAL_RPC receipt.
+UniValue FlowMeshActionOutcomeJson(const interfaces::FlowMeshActionOutcome& outcome);
 UniValue FlowMeshClientStatusJson(const interfaces::FlowMeshClientStatus& status);
 } // namespace node
 #endif

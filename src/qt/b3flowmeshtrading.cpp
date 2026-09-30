@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see COPYING.
 #include <qt/b3flowmeshtrading.h>
+#include <flowmesh/microblock.h>
 #include <qt/b3flowmeshmarketdata.h>
 #include <core_io.h>
 #include <flowmesh/batch.h>
@@ -172,22 +173,50 @@ Request Parameters(const Action& a)
     switch (a.operation) {
     case Operation::Order: {
         if (a.side != QStringLiteral("bid") && a.side != QStringLiteral("ask")) Fail("Choose bid or ask.");
+        if (!a.ladder.empty()) {
+            // A ladder: 2-4 distinct prices as one curve; its reservation
+            // must fit this side's available plus already reserved balance.
+            const bool bid{a.side == QStringLiteral("bid")};
+            if (a.ladder.size() < 2 || a.ladder.size() > flowmesh::FLOWMESH_LADDER_MAX_STEPS) Fail("A ladder order has 2 to 4 prices.");
+            std::vector<flowmesh::LadderStep> steps;
+            UniValue list{UniValue::VARR};
+            for (const auto& [price, quantity] : a.ladder) {
+                Positive(price); Positive(quantity);
+                steps.push_back({price, quantity});
+                UniValue step{UniValue::VOBJ}; step.pushKV("price", price); step.pushKV("quantity", quantity);
+                list.push_back(std::move(step));
+            }
+            const auto reservation{flowmesh::LadderReservation(bid, steps)};
+            const auto budget{B3FlowMeshMarketData::ReplacementBudget(bid ? a.market.b3_available : a.market.base_available,
+                                                                     bid ? a.market.b3_reserved : a.market.base_reserved)};
+            if (!(bid ? flowmesh::MakeLadderBidCurve(steps) : flowmesh::MakeLadderAskCurve(steps)) || !reservation) Fail("The ladder's prices must differ and its total must stay within the consensus range.");
+            if (!budget || *reservation > *budget) Fail("The ladder exceeds this side's available plus already reserved certified balance.");
+            r.method = "submitflowmeshladder"; r.params.push_back(a.side.toStdString()); r.params.push_back(list); r.params.push_back(a.market.sequence);
+            if (a.submit_wait_ms > 0) r.params.push_back(a.submit_wait_ms);
+            break;
+        }
         Positive(a.price); Positive(a.amount);
         if (a.price > MAX_MONEY / a.amount) Fail("The order's B3 notional exceeds the consensus range.");
         const bool bid{a.side == QStringLiteral("bid")};
         const auto budget{B3FlowMeshMarketData::ReplacementBudget(bid ? a.market.b3_available : a.market.base_available,
                                                                  bid ? a.market.b3_reserved : a.market.base_reserved)};
         if (!budget || (bid ? a.price >= MAX_MONEY || a.price * a.amount > *budget : a.amount > *budget)) Fail("The replacement exceeds this side's available plus already reserved certified balance or price range.");
-        r.method = "submitflowmeshorder"; r.params.push_back(a.side.toStdString()); r.params.push_back(a.price); r.params.push_back(a.amount); r.params.push_back(a.market.sequence); break;
+        r.method = "submitflowmeshorder"; r.params.push_back(a.side.toStdString()); r.params.push_back(a.price); r.params.push_back(a.amount); r.params.push_back(a.market.sequence);
+        if (a.submit_wait_ms > 0) r.params.push_back(a.submit_wait_ms);
+        break;
     }
     case Operation::Cancel:
         if (a.side != QStringLiteral("bid") && a.side != QStringLiteral("ask")) Fail("Choose bid or ask.");
-        r.method = "cancelflowmeshorder"; r.params.push_back(a.side.toStdString()); r.params.push_back(a.market.sequence); break;
+        r.method = "cancelflowmeshorder"; r.params.push_back(a.side.toStdString()); r.params.push_back(a.market.sequence);
+        if (a.submit_wait_ms > 0) r.params.push_back(a.submit_wait_ms);
+        break;
     case Operation::Withdraw:
         Positive(a.amount); Address(a.destination);
         if (a.amount > (a.native ? a.market.b3_available : a.market.base_available)) Fail("The withdrawal exceeds the available certified balance.");
         r.method = "requestflowmeshwithdrawal"; r.params.push_back(a.native ? "B3" : a.market.base.toStdString());
-        r.params.push_back(a.native ? ValueFromAmount(a.amount) : UniValue{a.amount}); r.params.push_back(a.destination.toStdString()); r.params.push_back(a.market.sequence); break;
+        r.params.push_back(a.native ? ValueFromAmount(a.amount) : UniValue{a.amount}); r.params.push_back(a.destination.toStdString()); r.params.push_back(a.market.sequence);
+        if (a.submit_wait_ms > 0) r.params.push_back(a.submit_wait_ms);
+        break;
     case Operation::Deposit:
         Positive(a.amount); r.method = "flowmeshdeposit"; r.params.clear(); r.params.setArray(); r.params.push_back(a.market.base.toStdString());
         r.params.push_back(a.native ? "B3" : a.market.base.toStdString()); r.params.push_back(a.native ? ValueFromAmount(a.amount) : UniValue{a.amount});
@@ -210,6 +239,11 @@ Request Parameters(const Action& a)
     return r;
 }
 
+int SubmissionWaitMs(const Operation operation, const bool remote, const bool wallet_was_unlocked, const int wait_ms)
+{
+    return remote && wallet_was_unlocked && Sequenced(operation) && wait_ms > 0 ? wait_ms : 0;
+}
+
 UniValue DispatchApproved(const Action& a, bool approved, const std::function<bool()>& cancelled, const RpcCall& rpc)
 {
     if (!approved || cancelled()) Fail("Action cancelled; nothing was submitted.");
@@ -221,6 +255,123 @@ UniValue DispatchApproved(const Action& a, bool approved, const std::function<bo
     return rpc(request.method, request.params);
 }
 
+namespace {
+QString BaseAmount(CAmount amount, std::optional<int> decimals, const QString& ticker)
+{
+    if (!decimals) return QStringLiteral("%1 raw units").arg(amount);
+    return B3FlowMeshMarketData::FormatAmount(amount, *decimals) + QLatin1Char(' ') + (ticker.isEmpty() ? QStringLiteral("token") : ticker);
+}
+QString SideTitle(bool bid, bool inverse)
+{
+    // Inverse view: a canonical bid spends B3 (Sell B3), an ask receives it.
+    if (inverse) return bid ? QStringLiteral("Sell B3") : QStringLiteral("Buy B3");
+    return bid ? QStringLiteral("Buy") : QStringLiteral("Sell");
+}
+//! How one request title reads: its orientation, verified decimals and
+//! ticker, and the view whose one price rule it follows (none: a request of
+//! another market, or one read without a view).
+struct TitleForm {
+    bool inverse{false};
+    std::optional<int> decimals;
+    QString ticker;
+    const TitleView* view{nullptr};
+};
+//! A request of the view's market reads in the view: its orientation, its
+//! verified units and its places. Any other keeps the action's own forms.
+TitleForm FormOf(const Action& a, const TitleView& view)
+{
+    if (!view.market.isEmpty() && view.market == a.market.id && view.units.known &&
+        (!a.display_decimals || *a.display_decimals == view.units.decimals)) {
+        return {view.inverse, view.units.decimals, view.units.ticker, &view};
+    }
+    return {a.inverse_display, a.display_decimals, a.display_ticker, nullptr};
+}
+QString OrderTitle(bool bid, CAmount price, CAmount quantity, const TitleForm& form)
+{
+    const auto& decimals{form.decimals};
+    const QString side{SideTitle(bid, form.inverse && decimals)};
+    if (!decimals) return QStringLiteral("%1 %2 @ %3 B3 atoms per raw unit").arg(side, BaseAmount(quantity, decimals, form.ticker)).arg(price);
+    const QString token{form.ticker.isEmpty() ? QStringLiteral("token") : form.ticker};
+    // A short label: in the view, its one price rule (the order book's
+    // places), so the title reads as the book, Your orders and the trades
+    // show this price; else the shared display formatter. The review and the
+    // saved request's details show the exact signed limit.
+    const QString limit{form.view ? B3FlowMeshMarketData::ViewPrice(price, form.view->units, form.inverse, form.view->places).text
+                                  : B3FlowMeshMarketData::FormatDisplayPrice(price, *decimals, form.inverse)};
+    if (form.inverse) {
+        return QStringLiteral("%1 · %2 %3 · limit %4 %5/B3").arg(side, bid ? QStringLiteral("receive up to") : QStringLiteral("spend up to"),
+            BaseAmount(quantity, decimals, form.ticker), limit, token);
+    }
+    return QStringLiteral("%1 %2 @ %3 B3/%4").arg(side, BaseAmount(quantity, decimals, form.ticker), limit, token);
+}
+//! The marketable-limit disclosure, in the review's own orientation and units.
+QString MarketableDisclosure(const Action& a)
+{
+    if (!a.marketable) return {};
+    const auto& m{*a.marketable};
+    const QString token{a.display_ticker.isEmpty() ? QStringLiteral("token") : a.display_ticker};
+    const QString units{a.inverse_display ? QStringLiteral("%1 / B3").arg(token) : QStringLiteral("B3 / %1").arg(token)};
+    const QString depth{a.display_decimals ? QString{B3FlowMeshMarketData::FormatAmount(m.visible, *a.display_decimals) + QLatin1Char(' ') + token}
+                                           : QString{QString::number(m.visible) + QStringLiteral(" raw base-asset units")}};
+    return QStringLiteral("\nMarketable limit, not a market order: priced from the best certified opposite order at %1 %2 with at most %3% slippage. "
+                          "The auction clears at one uniform price, never worse than the limit above. Certified opposite depth at or better than that limit: %4 "
+                          "(visible depth, not a fill estimate). Any unfilled part stays as a standing order until you cancel it: FlowMesh has no market or immediate-or-cancel orders.")
+        .arg(m.reference_display, units, B3FlowMeshMarketData::FormatSlippage(m.slippage_bps), depth);
+}
+//! What a new order replaces on its side, in the review's orientation.
+QString ReplacesDisclosure(const Action& a)
+{
+    if (!a.replaces) return {};
+    const auto& r{*a.replaces};
+    const QString side{SideTitle(a.side == QStringLiteral("bid"), a.inverse_display)};
+    const auto amount = [&](CAmount n) { return BaseAmount(n, a.display_decimals, a.display_ticker); };
+    const QString current{r.limit ? QStringLiteral("%1 order (%2 left; %3 already filled)").arg(side, amount(r.remaining), amount(r.filled))
+                          : r.ladder_prices ? QStringLiteral("%1 ladder of %2 prices (%3 left)").arg(side).arg(r.ladder_prices).arg(amount(r.remaining))
+                                            : QStringLiteral("%1 curve of %2 points (%3 left)").arg(side).arg(r.points).arg(amount(r.remaining))};
+    return QStringLiteral("\nReplaces your current %1. The new quantity counts from zero; the reservation is adjusted by the difference.").arg(current);
+}
+
+//! The review of a ladder order: every price with its quantity, the exact
+//! reservation, and what a ladder is (one order on its side).
+QString DescribeLadder(const Action& a, const QString& prefix)
+{
+    const bool bid{a.side == QStringLiteral("bid")};
+    std::vector<flowmesh::LadderStep> steps;
+    for (const auto& [price, quantity] : a.ladder) { Positive(price); Positive(quantity); steps.push_back({price, quantity}); }
+    const auto reservation{flowmesh::LadderReservation(bid, steps)};
+    if (a.ladder.size() < 2 || !reservation) Fail("Invalid ladder order.");
+    if (a.inverse_display && !a.display_decimals) Fail("Verified asset precision is required for the inverse order review.");
+    // Best first: a bid's highest price, an ask's lowest.
+    std::sort(steps.begin(), steps.end(), [&](const auto& x, const auto& y) { return bid ? x.price > y.price : x.price < y.price; });
+    const QString token{a.display_ticker.isEmpty() ? QStringLiteral("token") : a.display_ticker};
+    const auto amount = [&](CAmount n) { return BaseAmount(n, a.display_decimals, a.display_ticker); };
+    const auto price = [&](CAmount p) {
+        if (!a.display_decimals) return QStringLiteral("%1 B3 atoms per raw unit").arg(p);
+        return a.inverse_display ? QStringLiteral("%1 %2 / B3").arg(B3FlowMeshMarketData::ExactInversePrice(p, *a.display_decimals), token)
+                                 : QStringLiteral("%1 B3 / %2").arg(B3FlowMeshMarketData::FormatPrice(p, *a.display_decimals), token);
+    };
+    CAmount total{0};
+    QString lines;
+    for (const auto& step : steps) {
+        total += step.qty;
+        lines += a.inverse_display
+                     ? QStringLiteral("\n  • %1 %2 at %3 %4 (exact)").arg(bid ? QStringLiteral("receive up to") : QStringLiteral("spend up to"), amount(step.qty),
+                                                                          bid ? QStringLiteral("no less than") : QStringLiteral("no more than"), price(step.price))
+                     : QStringLiteral("\n  • %1 at %2").arg(amount(step.qty), price(step.price));
+    }
+    QString review{prefix + QStringLiteral("Ladder %1 of %2 prices, ONE standing order on this side:%3\nTotal quantity: %4.")
+                                .arg(SideTitle(bid, a.inverse_display)).arg(steps.size()).arg(lines, amount(total))};
+    review += bid ? QStringLiteral("\nExact B3 reservation: %1 B3, the sum of quantity x price (as separate limit orders would reserve).").arg(QString::fromStdString(FormatMoney(*reservation)))
+                  : QStringLiteral("\nReserves %1 (the sum of the quantities). The B3 received depends on the auction fills, before the allocated B3 fee.").arg(amount(*reservation));
+    review += QStringLiteral("\nExact canonical steps (B3 atoms per token atom : token atoms):");
+    for (const auto& step : steps) review += QStringLiteral(" %1 : %2;").arg(step.price).arg(step.qty);
+    if (a.display_limit_adjusted) review += QStringLiteral("\nAt least one entered price was adjusted only in your favor to the exact executable price listed above; those exact prices are what will be signed.");
+    review += QStringLiteral("\nAccount sequence: %1. One uniform-price curve auction per microblock, not price-time priority. Accepted is not filled. No network fee for this request.").arg(a.market.sequence);
+    review += QStringLiteral("\nA ladder is one order: a price cannot be cancelled or edited alone, and cancelling or replacing this side removes every price. Wallets before this version show it only as a curve.");
+    return review + ReplacesDisclosure(a);
+}
+} // namespace
+
 QString Describe(const Action& a)
 {
     const QString prefix{(a.operation == Operation::Order ? QStringLiteral("Order type: Limit\n") : QString{}) +
@@ -231,6 +382,7 @@ QString Describe(const Action& a)
     if (a.native) amount = QString::fromStdString(FormatMoney(a.amount)) + QStringLiteral(" B3");
     switch (a.operation) {
     case Operation::Order: {
+        if (!a.ladder.empty()) return DescribeLadder(a, prefix);
         Positive(a.price); Positive(a.amount);
         if (a.price > MAX_MONEY / a.amount) Fail("The order's B3 notional exceeds the consensus range.");
         if (a.inverse_display) {
@@ -247,11 +399,11 @@ QString Describe(const Action& a)
                      a.side, QString::number(a.market.sequence))};
             review += QStringLiteral("\nExact canonical limit: %1 B3 atoms per token atom; quantity cap: %2 token atoms.").arg(a.price).arg(a.amount);
             if (a.display_limit_adjusted) review += QStringLiteral("\nYour entered limit was %1 %2 / B3. It was adjusted only in your favor to the executable limit %3 %2 / B3 shown above; that exact canonical limit is what will be signed.").arg(a.entered_display_limit, a.display_ticker, executable);
-            return review;
+            return review + ReplacesDisclosure(a) + MarketableDisclosure(a);
         }
         QString price = QString::number(a.price) + QStringLiteral(" B3 atoms per raw base unit");
         if (a.display_decimals) price = B3FlowMeshMarketData::FormatPrice(a.price, *a.display_decimals) + QStringLiteral(" B3 / ") + a.display_ticker;
-        return prefix + QStringLiteral("Limit %1: %2 at %3.\nExact limit notional: %4 B3\nAccount sequence: %5\nOne uniform-price curve auction, not price-time priority. Accepted is not filled. Protocol fee is 0.01% of matched notional deducted from seller proceeds; actual allocation depends on certified fills. No network fee for this request.").arg(a.side == QStringLiteral("bid") ? QStringLiteral("Buy") : QStringLiteral("Sell"), base_amount, price, QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence));
+        return prefix + QStringLiteral("Limit %1: %2 at %3.\nExact limit notional: %4 B3\nAccount sequence: %5\nOne uniform-price curve auction, not price-time priority. Accepted is not filled. Protocol fee is 0.01% of matched notional deducted from seller proceeds; actual allocation depends on certified fills. No network fee for this request.").arg(a.side == QStringLiteral("bid") ? QStringLiteral("Buy") : QStringLiteral("Sell"), base_amount, price, QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence)) + ReplacesDisclosure(a) + MarketableDisclosure(a);
     }
     case Operation::Cancel: return prefix + QStringLiteral("Cancel this account's standing %1 (%2); sequence %3. Cancellation is not certified until processed.").arg(
         a.inverse_display ? (B3FlowMeshMarketData::DisplayBuy(a.side, true) ? QStringLiteral("Buy B3") : QStringLiteral("Sell B3")) : a.side,
@@ -291,15 +443,91 @@ Receipt ParseReceipt(const UniValue& value, const QString& market, const QString
         r.microblock_hash = Id(Field(value, "microblock_hash")); r.microblock_sequence = Integer(Field(value, "microblock_sequence"));
     }
     if (r.state == QStringLiteral("certified_inclusion") && (!r.certificate_verified || r.microblock_hash.isEmpty())) Fail("Action inclusion lacks verified certificate evidence.");
-    if (r.outcome_verified && !r.Included()) Fail("An execution outcome cannot precede verified action inclusion.");
+    if (!Field(value, "reason_code").isNull()) r.reason_code = Text(Field(value, "reason_code"));
+    if (!Field(value, "stage").isNull()) r.stage = Text(Field(value, "stage"));
+    if (!Field(value, "outcome").isNull()) r.outcome = ParseOutcome(Field(value, "outcome"));
+    if (r.outcome_verified != r.outcome.has_value()) Fail("A verified outcome flag and its outcome disagree.");
+    if (r.outcome) {
+        if (r.outcome->status == QStringLiteral("not_executed")) {
+            // Proven never to execute: a rejection naming the consumer.
+            if (r.state != QStringLiteral("rejected") || r.outcome->consumed_by.isEmpty()) Fail("A not-executed outcome lacks its consuming action.");
+        } else if (!r.Included() || r.outcome->microblock_hash != r.microblock_hash) {
+            Fail("An execution outcome cannot precede verified action inclusion.");
+        }
+    }
     return r;
+}
+
+Outcome ParseOutcome(const UniValue& value)
+{
+    Outcome o;
+    o.status = Text(Field(value, "status"));
+    if (o.status != QStringLiteral("applied") && o.status != QStringLiteral("rejected") &&
+        o.status != QStringLiteral("included_not_executed") && o.status != QStringLiteral("not_executed")) Fail("Unknown verified outcome status.");
+    o.final = Flag(Field(value, "final"));
+    o.reason_code = Text(Field(value, "reason_code"));
+    o.reason_text = Text(Field(value, "reason_text"));
+    o.evidence = Text(Field(value, "evidence"));
+    o.microblock_sequence = Integer(Field(value, "microblock_sequence"));
+    o.microblock_hash = Id(Field(value, "microblock_hash"));
+    if (!Field(value, "fill").isNull()) {
+        const auto& fill{Field(value, "fill")};
+        Outcome::Fill f;
+        f.side = Text(Field(fill, "side"));
+        if (f.side != QStringLiteral("bid") && f.side != QStringLiteral("ask")) Fail("Unknown verified fill side.");
+        f.cleared = Flag(Field(fill, "cleared")); f.superseded_in_entry = Flag(Field(fill, "superseded_in_entry"));
+        f.quantity = Money(Field(fill, "quantity"), false); f.price = Money(Field(fill, "price"), false);
+        f.quote_atoms = Money(Field(fill, "quote_atoms"), false); f.fee_atoms = Money(Field(fill, "fee_atoms"), false);
+        f.net_quote_atoms = Money(Field(fill, "net_quote_atoms"), false);
+        o.fill = f;
+    }
+    if (!Field(value, "withdrawal").isNull()) o.withdrawal_amount = Money(Field(Field(value, "withdrawal"), "amount"), false);
+    if (!Field(value, "deposit").isNull()) o.deposit_amount = Money(Field(Field(value, "deposit"), "amount"), false);
+    if (!Field(value, "consumed_by").isNull()) {
+        o.consumed_by = Id(Field(Field(value, "consumed_by"), "action_id"));
+        o.consumed_in_sequence = Integer(Field(Field(value, "consumed_by"), "microblock_sequence"));
+    }
+    // An unrecognised reason is displayed as such and never changes finality.
+    static const std::set<QString> known{QStringLiteral("APPLIED"), QStringLiteral("REJECTED_BY_STATE"),
+        QStringLiteral("INCLUDED_BAD_SEQUENCE"), QStringLiteral("INCLUDED_EQUIVOCATION"), QStringLiteral("INCLUDED_MALFORMED"),
+        QStringLiteral("DEPOSIT_NOT_CREDITED"), QStringLiteral("NOT_EXECUTED_SEQUENCE_CONSUMED")};
+    if (!known.contains(o.reason_code)) {
+        o.final = false;
+        o.reason_text = QStringLiteral("Unrecognised reason; outcome unchanged.");
+    }
+    return o;
+}
+
+QString DescribeOutcome(const Outcome& o)
+{
+    if (o.status == QStringLiteral("not_executed")) {
+        // "Never executes" only when final (an unrecognised reason is not).
+        return QStringLiteral("%1: its account sequence was used by another certified request (%2…) in batch #%3.%4")
+            .arg(o.final ? QStringLiteral("Never executes") : QStringLiteral("Reported not executed"), o.consumed_by.left(16),
+                 QString::number(o.consumed_in_sequence), o.final ? QString{} : QStringLiteral(" Not final."));
+    }
+    QString text;
+    if (o.status == QStringLiteral("applied")) text = QStringLiteral("Executed in certified batch #%1.").arg(o.microblock_sequence);
+    else if (o.status == QStringLiteral("rejected")) text = QStringLiteral("Not executed in certified batch #%1: %2").arg(o.microblock_sequence).arg(o.reason_text);
+    else text = QStringLiteral("Included in certified batch #%1 but not executed: %2").arg(o.microblock_sequence).arg(o.reason_text);
+    if (o.fill) {
+        if (o.fill->superseded_in_entry) text += QStringLiteral(" Replaced before clearing in the same batch; no fill.");
+        else if (o.fill->quantity == 0) text += QStringLiteral(" No fill in that batch; the order rests on the book.");
+        else text += QStringLiteral(" Filled %1 at %2 (quote %3, fee %4). Any remainder rests on the book.")
+            .arg(o.fill->quantity).arg(o.fill->price).arg(o.fill->quote_atoms).arg(o.fill->fee_atoms);
+    }
+    if (o.withdrawal_amount) text += QStringLiteral(" Withdrawal of %1 requested; a certified checkpoint and a vault transaction must follow.").arg(*o.withdrawal_amount);
+    if (o.deposit_amount) text += QStringLiteral(" Deposit of %1 credited.").arg(*o.deposit_amount);
+    if (!o.final) text += QStringLiteral(" Not final.");
+    return text;
 }
 
 QString DescribeReceipt(const Receipt& r)
 {
     QString text;
-    if (r.Included()) text = QStringLiteral("Exact action inclusion verified in certified microblock #%1. %2")
-        .arg(r.microblock_sequence).arg(r.outcome_verified ? QStringLiteral("Execution evidence verified; inspect the reported outcome separately.") : QStringLiteral("Execution outcome is unknown: inclusion alone does not prove a fill, successful withdrawal or B3 payout."));
+    if (r.NotExecuted()) text = DescribeOutcome(*r.outcome);
+    else if (r.Included()) text = QStringLiteral("Exact action inclusion verified in certified microblock #%1. %2")
+        .arg(r.microblock_sequence).arg(r.outcome ? DescribeOutcome(*r.outcome) : QStringLiteral("Execution outcome is unknown: inclusion alone does not prove a fill, successful withdrawal or B3 payout."));
     else if (r.no_resubmit) text = QStringLiteral("Previously certified; fresh proof currently unavailable. The retained verified record prevents resubmission; this is not a never-established submission outcome.");
     else if (r.state == QStringLiteral("admitted")) text = QStringLiteral("Endpoint reports pool admission; not certified inclusion or execution.");
     else if (r.state == QStringLiteral("queued")) text = QStringLiteral("Request queued; pool admission, certified inclusion and execution are not yet proven.");
@@ -310,6 +538,153 @@ QString DescribeReceipt(const Receipt& r)
     if (!r.endpoint.isEmpty()) text += QStringLiteral("\nEndpoint: %1").arg(r.endpoint);
     if (!r.reason.isEmpty()) text += QStringLiteral("\n%1").arg(r.reason);
     return text;
+}
+
+
+StageView DescribeStage(const Receipt& r, bool local, RequestKind kind, std::optional<int> decimals, const QString& ticker)
+{
+    StageView v;
+    if (r.MayStillExecute() && (r.NotExecuted() || r.Included())) {
+        // Verified, but not final: the exact bytes may still execute (or a
+        // deposit still be credited) later. Never "not executed", never settled.
+        const auto& o{*r.outcome};
+        const QString reason{o.reason_text.isEmpty() ? o.reason_code : o.reason_text};
+        v.reached = r.Included() ? Stage::OutcomeVerified : Stage::Signed; v.flag = StageFlag::NotFinal;
+        v.status = r.Included() ? QStringLiteral("Included in certified batch #%1, not executed yet · not final, may still execute (%2)").arg(QString::number(o.microblock_sequence), reason)
+                                : QStringLiteral("Not executed yet · not final, may still execute (%1)").arg(reason);
+        v.outcome = QStringLiteral("not executed yet · may still execute");
+        return v;
+    }
+    if (r.NotExecuted()) {
+        // Proven and final: a different certified action consumed its sequence.
+        v.reached = Stage::Signed; v.flag = StageFlag::NotExecuted; v.terminal = r.Terminal(); v.settled = true;
+        v.status = QStringLiteral("Not executed (its account sequence was used by another certified request)");
+        v.outcome = QStringLiteral("✕ not executed");
+        return v;
+    }
+    if (r.Included() && r.outcome_verified && r.outcome) {
+        const auto& o{*r.outcome};
+        v.reached = Stage::OutcomeVerified; v.terminal = r.Terminal(); v.settled = true;
+        if (o.status == QStringLiteral("applied")) {
+            v.status = QStringLiteral("Executed in certified batch #%1").arg(o.microblock_sequence);
+            if (kind == RequestKind::Cancel) v.outcome = QStringLiteral("✓ cancelled");
+            else if (kind == RequestKind::Order && o.fill) {
+                if (o.fill->superseded_in_entry) v.outcome = QStringLiteral("✓ replaced before clearing · no fill");
+                else if (o.fill->quantity == 0) v.outcome = QStringLiteral("✓ no fill yet · resting");
+                else v.outcome = QStringLiteral("✓ filled %1").arg(BaseAmount(o.fill->quantity, decimals, ticker));
+            } else v.outcome = QStringLiteral("✓ applied");
+        } else {
+            // Final here: a non-final one is shown above as "may still execute".
+            v.flag = StageFlag::NotExecuted;
+            v.status = (o.status == QStringLiteral("rejected") ? QStringLiteral("Not executed (%1)") : QStringLiteral("Included but not executed (%1)"))
+                           .arg(o.reason_text.isEmpty() ? o.reason_code : o.reason_text);
+            v.outcome = QStringLiteral("✕ not executed");
+        }
+        // Only an applied outcome with an unrecognised reason reaches this.
+        if (!o.final) v.status += QStringLiteral(" · not final");
+        return v;
+    }
+    if (r.Included()) {
+        v.reached = Stage::Certified; v.settled = true;
+        v.status = QStringLiteral("Included in certified batch #%1 · applied or rejected is not reported").arg(r.microblock_sequence);
+        v.outcome = QStringLiteral("not reported");
+        return v;
+    }
+    if (r.no_resubmit) {
+        v.reached = Stage::Certified; v.flag = StageFlag::CertifiedEarlier; v.settled = true;
+        v.status = QStringLiteral("Certified earlier · fresh proof pending · never resent");
+        v.outcome = QStringLiteral("not reported");
+        return v;
+    }
+    // Before verified inclusion the receipt state decides; the backend stage
+    // only tells a retained, never-sent instruction from a possibly sent one.
+    if (r.state == QStringLiteral("admitted")) {
+        v.reached = Stage::Admitted;
+        v.status = local ? QStringLiteral("Admitted by your node") : QStringLiteral("Endpoint reports admission (unverified)");
+    } else if (r.state == QStringLiteral("queued")) {
+        v.reached = Stage::Sent;
+        v.status = local ? QStringLiteral("Queued by your node") : QStringLiteral("Endpoint queued it (reported)");
+    } else if (r.state == QStringLiteral("rejected")) {
+        v.reached = Stage::Signed; v.flag = StageFlag::Refused;
+        v.status = QStringLiteral("Refusal reported · treated as unknown until reviewed");
+    } else if (r.stage == QStringLiteral("signed")) {
+        v.reached = Stage::Signed;
+        v.status = QStringLiteral("Signed and saved · not sent yet");
+    } else {
+        v.reached = r.stage == QStringLiteral("sent") ? Stage::Sent : Stage::Signed; v.flag = StageFlag::Uncertain;
+        v.status = local ? QStringLiteral("Outcome unknown · never re-signed") : QStringLiteral("Delivery unconfirmed · outcome unknown · never re-signed");
+    }
+    return v;
+}
+
+QString StageName(Stage stage)
+{
+    switch (stage) {
+    case Stage::Signing: return QStringLiteral("Signing");
+    case Stage::Signed: return QStringLiteral("Signed");
+    case Stage::Sent: return QStringLiteral("Sent");
+    case Stage::Admitted: return QStringLiteral("Admitted");
+    case Stage::Certified: return QStringLiteral("Certified");
+    case Stage::OutcomeVerified: return QStringLiteral("Outcome verified");
+    }
+    return {};
+}
+
+RequestKind KindOf(Operation operation)
+{
+    return operation == Operation::Order ? RequestKind::Order : operation == Operation::Cancel ? RequestKind::Cancel : RequestKind::Other;
+}
+
+RequestKind KindOf(const SavedAction& action)
+{
+    return action.type <= 1 ? RequestKind::Order : action.type <= 3 ? RequestKind::Cancel : RequestKind::Other;
+}
+
+QString ShortTitle(const Action& a, const TitleView& view)
+{
+    const bool bid{a.side == QStringLiteral("bid")};
+    const QString native{QString::fromStdString(FormatMoney(a.amount)) + QStringLiteral(" B3")};
+    const auto form{FormOf(a, view)};
+    switch (a.operation) {
+    case Operation::Order:
+        if (!a.ladder.empty()) return QStringLiteral("%1 ladder · %2 prices · %3").arg(SideTitle(bid, form.inverse)).arg(a.ladder.size()).arg(BaseAmount(a.amount, form.decimals, form.ticker));
+        return OrderTitle(bid, a.price, a.amount, form);
+    case Operation::Cancel: return QStringLiteral("Cancel %1").arg(SideTitle(bid, form.inverse));
+    case Operation::Withdraw: return QStringLiteral("Withdraw %1").arg(a.native ? native : BaseAmount(a.amount, form.decimals, form.ticker));
+    case Operation::Deposit: return QStringLiteral("Deposit %1").arg(a.native ? native : BaseAmount(a.amount, form.decimals, form.ticker));
+    case Operation::Admit: return QStringLiteral("Admit deposit %1…:%2").arg(a.txid.left(12)).arg(a.vout);
+    case Operation::Checkpoint: return QStringLiteral("Publish checkpoint");
+    case Operation::Vault: return QStringLiteral("Publish vault transaction");
+    }
+    return {};
+}
+
+QString ShortTitle(const SavedAction& a, const TitleView& view)
+{
+    const bool bid{a.type == 0 || a.type == 2};
+    const bool inverse{view.inverse};
+    // Verified units only of the view's own market; never assumed for another.
+    const bool shown{!view.market.isEmpty() && view.market == a.market && view.units.known};
+    const TitleForm form{inverse, shown ? std::optional<int>{view.units.decimals} : std::nullopt, shown ? view.units.ticker : QString{}, shown ? &view : nullptr};
+    if (a.type == 2 || a.type == 3) return QStringLiteral("Cancel %1").arg(SideTitle(bid, inverse));
+    if (a.type <= 1) {
+        // The same exact limit shapes DescribeSavedAction recognises; any
+        // other curve is named, never re-priced.
+        const auto& p{a.canonical_points};
+        if (p.size() == 2 && p[0].price < MAX_MONEY && p[1].price == p[0].price + 1 &&
+            (bid ? p[0].quantity > 0 && p[1].quantity == 0 : p[0].quantity == 0 && p[1].quantity > 0)) {
+            return OrderTitle(bid, bid ? p[0].price : p[1].price, bid ? p[0].quantity : p[1].quantity, form);
+        }
+        std::vector<B3FlowMeshMarketData::Point> points;
+        for (const auto& point : p) points.push_back({point.price, point.quantity});
+        if (const auto steps{B3FlowMeshMarketData::LadderStepsOf(bid ? QStringLiteral("bid") : QStringLiteral("ask"), points)}; steps && steps->size() >= 2) {
+            return QStringLiteral("%1 ladder · %2 prices%3").arg(SideTitle(bid, inverse)).arg(steps->size()).arg(a.sequence ? QStringLiteral(" · sequence %1").arg(*a.sequence) : QString{});
+        }
+        return QStringLiteral("%1 order%2").arg(SideTitle(bid, inverse), a.sequence ? QStringLiteral(" · sequence %1").arg(*a.sequence) : QString{});
+    }
+    if (a.type == 4) return QStringLiteral("Withdrawal request");
+    if (a.type == 5) return QStringLiteral("Deposit admission");
+    return QStringLiteral("Request (type %1)").arg(a.type);
 }
 
 SavedActions ParseSavedActions(const UniValue& value)

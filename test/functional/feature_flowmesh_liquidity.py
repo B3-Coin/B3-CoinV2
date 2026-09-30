@@ -262,7 +262,9 @@ class FlowMeshLiquidityTest(FlowMeshLatencyTest):
             native["entry_check"] = native_action_entry(status, market, self.market_data(node, market)["domain"])
             sample = {"label": label, "action_id": action_id, "initial_response": response, "status": status}
         assert_equal(status["certificate_verified"], True)
-        assert_equal(status["outcome_verified"], False)
+        # A verified outcome, when present, is the including entry's own.
+        assert_equal(status["outcome_verified"], "outcome" in status)
+        assert "outcome" not in status or status["outcome"]["microblock_hash"] == status.get("microblock_hash"), status
         target = (status["microblock_sequence"], status["microblock_hash"])
         def applied_everywhere():
             for replica in self.nodes:

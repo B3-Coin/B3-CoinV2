@@ -37,7 +37,11 @@ matched B3 notional, deducted from seller proceeds. An order request itself
 has no on-chain network fee.
 
 There is **one order per side per account**. A new Buy replaces that account's
-Buy curve; a new Sell replaces its Sell curve. FlowMesh matches persistent
+Buy curve; a new Sell replaces its Sell curve. To place several prices on one
+side, tick **Ladder · up to 4 prices**: the price and quantity fields are its
+first price and up to three more rows follow. A ladder is still one order: it
+replaces that side, a price cannot be cancelled alone, and a buy reserves
+exactly the sum of quantity x price. FlowMesh matches persistent
 demand/supply curves at one uniform price per certified auction, not by
 price-time order-book priority. **Your orders** shows certified remaining and
 reserved amounts. Choose Buy or Sell in the order form, then use the matching
@@ -59,10 +63,16 @@ the old one or proves it failed.
 ## Read the graph and liquidity
 
 Price points are actual certified clearings, indexed by **microblock sequence**,
-not timestamps or invented candles. Liquidity shows demand and supply evaluated
-at each price—not cumulative CLOB levels. Curve lines are a display guide, not
-an executable quote. Partial curve pages and bounded recent history are labeled;
-a dash in your fill column means unknown, not zero.
+not timestamps or invented candles. The **Order book** shows the exact levels of
+every verified standing order (all accounts, ladder prices included): sells
+above the spread, buys below, Total cumulative from the best price, your own
+orders marked, an optional price grouping, and a click puts a level's exact
+price into the ticket without signing anything. A crossed book can stand after
+a rationed auction; the spread row then shows the indicative next auction.
+**Curve depth** shows demand and supply evaluated at each price. Curve lines are
+a display guide, not an executable quote. Partial curve pages and bounded recent
+history are labeled; a dash in your fill column means unknown, not zero. See
+doc/flowmesh-order-book.md.
 
 An idle market may produce no new microblocks. An old chart point alone does not
 prove loss of quorum. Stale reads, paused markets and validator handoffs can
@@ -75,6 +85,52 @@ that validators are offline. Existing requests remain pending, not canceled;
 certified settlement controls remain available. A new certified head or an empty
 queue clears this local condition. The timer starts from this page's observation,
 not an invented certified timestamp, and resets when you change wallet or market.
+
+## How the page stays current
+
+The book, chart and trades tape follow verified updates as they arrive: with
+your own node's engine, a new certified auction on a quiet market usually
+reaches the screen within tens of milliseconds. Your node's engine and a
+remote endpoint are each read at most twice a second (live updates, or
+polling every 0.5 s when a remote operator offers none), so on a busy market
+the screen moves in steps of about half a second. Faster local reads wait
+for a node change: today each read copies the market under a lock the
+FlowMesh worker also needs. Cells change in place, and data that did not
+change repaints nothing. A market switch reads the new market at once.
+
+With your own node's engine, the book, chart and tape keep updating while an
+order review is open; they pause while the approved order is being sent, so
+that no display read competes with it inside your node. The review itself shows,
+and signs, exactly the values it was opened with; balances and the trading
+checks stay on the data of before the review. A click on a book level is
+refused (with a note in Activity) whenever the book shows newer or older
+data than those checks, or the data is not current and ready to trade on:
+the price is taken again from the verified data, never from the book's text.
+With a remote endpoint the views wait while the review is open or the order
+is sent, so no display read can delay the order.
+
+**With a remote endpoint** (your computer reading a server, for example a
+VPS): the panel repaints the book as soon as a verified update arrives, and
+replies that bring nothing new (a quiet live update, a poll at the same
+certified head) change nothing on screen. What it cannot yet change is how
+soon an update arrives:
+
+- An endpoint whose operator has not enabled live updates
+  (`-flowmeshapiwatch`, off by default) is polled every 0.5 s, so a new
+  auction can wait up to half a second before it is even asked for. If you
+  run the endpoint yourself you can enable it (see
+  [flowmesh-live-updates.md](flowmesh-live-updates.md) §4 and §6); the book
+  then follows each new head, at most twice a second.
+- Every new certified head costs your client a full download of the
+  market's verified state from the endpoint, and its verification, before
+  anything is shown. That is the main remaining delay on a remote link, and
+  it grows with the market. Removing it needs a separately designed change
+  (verifying each new auction against the state you already hold instead of
+  downloading all of it again), which is not in this version.
+
+The "Stale" marks on the book and chart follow what they show; the
+connection line and every trading check follow the verified data the checks
+use (new orders stop after 3 s without a verified update).
 
 ## Withdraw and settle
 

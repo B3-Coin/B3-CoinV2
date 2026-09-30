@@ -22,6 +22,8 @@ namespace node {
 inline constexpr std::chrono::seconds FLOWMESH_HTTPS_DEFAULT_REQUEST_TIMEOUT{10};
 inline constexpr std::chrono::seconds FLOWMESH_HTTPS_DEFAULT_IDLE_TIMEOUT{30};
 inline constexpr std::chrono::minutes FLOWMESH_HTTPS_DEFAULT_CONNECTION_LIFETIME{5};
+//! FlowMeshHttpsServer::Options::worker_threads bound.
+inline constexpr size_t FLOWMESH_HTTPS_MAX_WORKER_THREADS{16};
 
 struct HttpsEndpoint {
     /** An HTTPS origin, optionally ending in /flowmesh/v1. No userinfo,
@@ -75,6 +77,19 @@ public:
                                std::chrono::milliseconds timeout,
                                size_t max_reply_bytes);
     void Reset();
+    /** True when a Request to `endpoint` would reuse the retained connection
+     * now: the same normalized origin, CA file and pin, a completed and still
+     * valid TLS handshake, inside the age, idle and request-count limits, and
+     * no pending EOF or unread bytes. A transport choice only, never trust:
+     * Request still re-checks origin, pin and CA-file content before a byte is
+     * written. No DNS, connect, file read or write; same external
+     * serialization as Request. */
+    bool Warm(const HttpsEndpoint& endpoint);
+    /** Exchange the retained connections, with their trust state, of two
+     * sessions. The caller exclusively owns both, and neither is inside
+     * Request. Returns false and changes nothing when their keep-alive
+     * policies differ. */
+    bool Swap(FlowMeshHttpsClient& other) noexcept;
 
 private:
     struct Impl;

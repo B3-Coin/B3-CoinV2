@@ -81,6 +81,14 @@ struct FlowMeshPendingCheckpoint {
     uint32_t effect_count{0};
 };
 
+/** The status fields of the pending type-8 checkpoint, as status objects
+ * report them. Never the publication payload. */
+struct FlowMeshPendingCheckpointStatus {
+    modern::FlowMeshCheckpointId checkpoint_id;
+    uint64_t sequence{0};
+    uint32_t effect_count{0};
+};
+
 /** Test observation of the service's per-market memos since construction.
  * Local counters only; never a protocol, durable or public status fact. */
 struct FlowMeshServiceMemoCounts {
@@ -89,6 +97,9 @@ struct FlowMeshServiceMemoCounts {
     uint64_t head_entry_lookups{0}, head_entry_reads{0};
     //! Settlement-requirement lookups, and the misses that derived a plan.
     uint64_t settlement_lookups{0}, settlement_plans{0};
+    //! Pending-checkpoint status lookups, and the misses that scanned the
+    //! store for the candidate and built its record.
+    uint64_t pending_checkpoint_lookups{0}, pending_checkpoint_scans{0};
 };
 
 /** One exact live keyless input selected for a type-9 vault operation. */
@@ -117,6 +128,18 @@ struct FlowMeshServiceTransport {
     FlowMeshNetConfig network;
     bool LegacyEnabled() const { return mode == "legacy" || mode == "dual"; }
     bool IndependentEnabled() const { return mode == "independent" || mode == "dual"; }
+};
+
+/** Result of one local submission through the service. */
+struct FlowMeshLocalSubmit {
+    //! Refused before a decision or by the queue (not running, reconciling,
+    //! rate limited, full): `error` says why; nothing was admitted.
+    bool refused{false};
+    std::string error;
+    //! Meaningful when !refused.
+    FlowMeshLocalAdmission admission;
+    //! Event log position just before the enqueue (ENQUEUE only).
+    std::optional<flowmesh::ClientEventCursor> cursor_before;
 };
 
 /**
@@ -161,6 +184,16 @@ public:
     FlowMeshNetConnectResult AddNetworkPeer(const std::string& peer);
     std::vector<FlowMeshRuntimeDeliverySnapshot> DeliverySnapshots(
         std::optional<flowmesh::MarketId> market_id = std::nullopt) const;
+    /** Local, advisory health of this service and its markets (see
+     * node/flowmesh_health.h): what this node has observed, never evidence
+     * or an input to admission, relay, signing or verification. Takes only
+     * leaf mutexes and a shared snapshot: never cs_main, the service or
+     * market mutex, the store or the network, so it answers while the chain
+     * or the runtime worker is busy. `market` limits the rows to one market. */
+    FlowMeshServiceHealth Health(
+        const std::optional<flowmesh::MarketId>& market = std::nullopt) const;
+    /** Node-local health thresholds; call before Start. */
+    void SetHealthPolicy(const FlowMeshHealthPolicy& policy);
 
     std::vector<FlowMeshServiceMarket> Markets() const;
     std::optional<FlowMeshServiceMarket> Market(
@@ -173,11 +206,19 @@ public:
         const flowmesh::MarketId& market_id,
         const std::optional<flowmesh::AccountId>& account,
         const flowmesh::MarketDataQuery& query, std::string& error) const;
+    /** One page of this node's operator-observed UTC candles for a market
+     * (display only): a time window [before - limit x interval, before),
+     * from the memory window, and with `allow_disk` also from the
+     * observed-time database beyond it. Never takes the market lock. */
+    std::optional<flowmesh::ObservedCandlePage> ObservedCandles(
+        const flowmesh::MarketId& market_id, flowmesh::CandleInterval interval,
+        std::optional<int64_t> before_ms, size_t limit, bool allow_disk, std::string& error) const;
     std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
         const flowmesh::MarketId& market_id, std::string& error) const;
     std::optional<FlowMeshClientSnapshotView> ClientSnapshotView(
         const flowmesh::MarketId& market_id,
-        const std::optional<flowmesh::AccountId>& account, std::string& error) const;
+        const std::optional<flowmesh::AccountId>& account, std::string& error,
+        const flowmesh::MarketDataQuery& reported_query = {}) const;
     std::optional<std::vector<unsigned char>> ClientCertifiedEntry(
         const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error) const;
     flowmesh::ClientEventPage ClientEvents(
@@ -193,12 +234,47 @@ public:
     flowmesh::ClientActionWait WaitClientActionStatus(
         const flowmesh::MarketId& market_id, const uint256& action_id,
         std::chrono::steady_clock::time_point deadline,
-        const std::function<bool()>& interrupted) const;
+        const std::function<bool()>& interrupted, bool include_notices = false) const;
     void WakeClientWaiters() const;
+    //! The runtime's ClientEventsPending; GAP without a runtime, as
+    //! ClientEvents then reports a gap.
+    flowmesh::ClientWatchResult ClientEventsPending(
+        const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+        const std::optional<flowmesh::AccountId>& account) const;
+    /** Bounded event watch on the current runtime; INTERRUPTED at once
+     * without one. The service mutex is released before it blocks, and
+     * stopping the runtime interrupts it. */
+    flowmesh::ClientWatchResult WaitClientEvents(
+        const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+        const std::optional<flowmesh::AccountId>& account,
+        std::chrono::steady_clock::time_point deadline,
+        const std::function<bool()>& interrupted) const;
+    //! Memory-only reads of the runtime's recent certified window and local
+    //! notices (see FlowMeshRuntime); empty without a runtime.
+    std::optional<std::pair<uint64_t, uint256>> ClientRecentInclusion(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
+    FlowMeshClientOutcomeParts ClientOutcomeParts(
+        const flowmesh::MarketId& market_id, uint64_t sequence, const uint256& hash, bool want_payload) const;
+    //! For tests: ClientOutcomeParts calls since this service was created.
+    uint64_t ClientOutcomeReadsForTest() const;
+    std::optional<flowmesh::ClientActionNotice> NewestClientNoticeIfNewer(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
+    /** Bool fallback: true only when the action was queued or is already
+     * included in a certified microblock; `error` explains anything else. */
     bool SubmitLocalAction(const flowmesh::MarketId& market_id,
                            const flowmesh::Action& action,
                            std::string& error);
+    /** The checked submission (FlowMeshRuntime::SubmitLocalActionChecked)
+     * behind the service's own availability gates. `origin` is NODE only for
+     * this node's own wallet RPC and GUI (see flowmesh::ClientNoticeOrigin);
+     * `submitter` is a PUBLIC request's client identity (IPv4, or IPv6 /64). */
+    FlowMeshLocalSubmit SubmitLocalActionChecked(const flowmesh::MarketId& market_id,
+                                                 const flowmesh::Action& action,
+                                                 flowmesh::ClientNoticeOrigin origin = flowmesh::ClientNoticeOrigin::PUBLIC,
+                                                 const std::string& submitter = {});
+    //! Current client event log position; nullopt without a runtime.
+    std::optional<flowmesh::ClientEventCursor> ClientEventCursor() const;
     FlowMeshSeatKeyStatus SeatKeyStatus() const;
     //! For tests: how often the seat transition's memos were consulted and
     //! how often they had to recompute.
@@ -211,8 +287,19 @@ public:
                         const std::optional<uint256>& expected_fingerprint,
                         FlowMeshSeatKeyStatus* result = nullptr);
 
-    /** Earliest unconnected effect-bearing entry, fully encoded for MPA. */
+    /** Earliest unconnected effect-bearing entry, fully encoded for MPA.
+     * Always derived afresh: publication never uses a retained answer. */
     std::optional<FlowMeshPendingCheckpoint> NextCheckpointMpa(
+        const flowmesh::MarketId& market_id, std::string& error) const;
+    /** The id, sequence and effect count of the checkpoint NextCheckpointMpa
+     * would build now, behind the same gates and with the same errors;
+     * nullopt with an empty error when none is pending. The answer ("none
+     * pending" included) is retained per market for one exact durable store
+     * marker (FlowMeshPendingCheckpointKey), so repeated status reads at one
+     * head skip the store scan. An error, a store that has not completed
+     * replay, or a marker or reconciled tip that moved while the answer was
+     * derived is never retained. For status objects only. */
+    std::optional<FlowMeshPendingCheckpointStatus> PendingCheckpointStatus(
         const flowmesh::MarketId& market_id, std::string& error) const;
 
     /** Resolve one connected, unconsumed effect into its exact type-9 proof. */

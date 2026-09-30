@@ -31,7 +31,8 @@ namespace node {
  * bypass automatic scheduling and keep their existing bounded endpoint cycle.
  *
  * The caller serializes access, supplies actual steady-clock time, and charges
- * immediately before EACH automatic HTTP attempt. Taking a demand is not an
+ * immediately before EACH automatic HTTP attempt, plus (RecordExtraCost) any
+ * extra endpoint tokens an opt-in outcome reply cost. Taking a demand is not an
  * HTTP attempt. If failover exhausts the allowance, the caller must retain its
  * next endpoint instead of restarting indefinitely at the same failed ones.
  */
@@ -98,6 +99,20 @@ public:
     {
         Advance(now);
         return Available();
+    }
+
+    //! An opt-in outcome reply costs the endpoint one admission token per
+    //! evidence part on top of the request itself. Records those extra
+    //! tokens in the rolling window, spending burst tokens as available, so
+    //! automatic reads never exceed their share of the endpoint's per-client
+    //! budget. Never refunds; the window keeps at most two seconds' worth.
+    void RecordExtraCost(TimePoint now, size_t extra)
+    {
+        now = Advance(now);
+        for (; extra > 0 && m_attempts.size() < 2 * AUTOMATIC_ATTEMPTS_PER_SECOND; --extra) {
+            m_attempts.push_back(now);
+            if (m_tokens > 0) --m_tokens;
+        }
     }
 
     //! Only call after an actual, usable remote action-status observation.

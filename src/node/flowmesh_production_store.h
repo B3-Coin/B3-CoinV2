@@ -8,11 +8,14 @@
 #include <dbwrapper.h>
 #include <flowmesh/production_engine.h>
 #include <flowmesh/market_data.h>
+#include <flowmesh/outcome_evidence.h>
+#include <flowmesh/seat_evidence.h>
 #include <modern/flowmesh_checkpoint.h>
 
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -64,6 +67,61 @@ struct ProductionCheckpointCandidate {
 struct StoredLockedProductionCandidate {
     flowmesh::ProductionEntryCore entry;
     std::vector<flowmesh::Action> evidence;
+};
+
+/**
+ * The store's OWN re-execution result of one appended or replayed EXECUTION
+ * entry, handed to its caller after the durable write. Immutable once
+ * published and shared read-only with API readers. Never a source of
+ * certified state: the runtime serves it only as outcome evidence, which a
+ * client verifies against the entry's certified result_root.
+ */
+struct ProductionOutcomeRecord {
+    uint64_t sequence{0};
+    uint256 entry_hash;
+    //! Marker only: the preimage and effects are cleared because their
+    //! encoding would exceed FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES.
+    bool too_large{false};
+    flowmesh::ExecutionOutcomePreimageV1 preimage;
+    std::vector<modern::FlowMeshEffectV1> effects;
+    //! O(1) conservative memory estimate, used by every retention bound.
+    size_t charged_bytes{0};
+};
+inline constexpr size_t OUTCOME_RECORD_MAX_BYTES{flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES};
+//! Replay keeps only the newest records, by count and by charged bytes.
+inline constexpr size_t OUTCOME_REPLAY_TAIL_ENTRIES{1024};
+inline constexpr size_t OUTCOME_REPLAY_TAIL_BYTES{8U << 20};
+
+//! Moves `result` and `effects` into a new record; a record whose evidence
+//! could not be encoded within its bound is kept as a too_large marker.
+std::shared_ptr<const ProductionOutcomeRecord> MakeProductionOutcomeRecord(
+    uint64_t sequence, const uint256& entry_hash, flowmesh::BatchResult&& result,
+    std::vector<modern::FlowMeshEffectV1>&& effects);
+
+//! Appends `record` to a newest-last tail and evicts from the front until at
+//! most `max_entries` records and `max_bytes` charged bytes remain.
+void RetainOutcomeTail(std::deque<std::shared_ptr<const ProductionOutcomeRecord>>& tail, size_t& tail_bytes,
+                       std::shared_ptr<const ProductionOutcomeRecord> record,
+                       size_t max_entries = OUTCOME_REPLAY_TAIL_ENTRIES,
+                       size_t max_bytes = OUTCOME_REPLAY_TAIL_BYTES);
+
+//! Seat-misbehaviour evidence records a store retains, newest kept.
+inline constexpr size_t SEAT_EVIDENCE_MAX_RECORDS{64};
+
+struct StoredSeatEvidence {
+    //! Store-local insertion order.
+    uint64_t index{0};
+    flowmesh::SeatEvidence evidence;
+};
+
+/** The seat-misbehaviour evidence a store holds. Information only. */
+struct SeatEvidenceLog {
+    //! Records ever inserted into this store, evicted ones included.
+    uint64_t recorded{0};
+    //! Newest first, at most SEAT_EVIDENCE_MAX_RECORDS.
+    std::vector<StoredSeatEvidence> retained;
+    //! Retained records that no longer decode: skipped, never fatal.
+    uint64_t unreadable{0};
 };
 
 /** Exact B3 block that connected one durable type-8 checkpoint. */
@@ -144,6 +202,9 @@ public:
     bool MarkAgreementBootstrapComplete(const uint256& identity, std::string& error);
 
     bool ReadMarker(std::optional<Marker>& out, std::string& error);
+    /** ReadMarker, and under the same lock whether the store has completed
+     * startup replay (the condition every checkpoint read requires). */
+    bool ReadMarkerAndReadiness(std::optional<Marker>& out, bool& ready, std::string& error);
 
     /**
      * Validate marker and every production namespace without writing. A
@@ -171,6 +232,10 @@ public:
      * If supplied, `validation_failure` is reset on entry and populated only
      * for an execution validation rejection before any durable write. Storage
      * failures (including uncertain writes) never populate it.
+     * If supplied, `outcome_out` is reset on entry and, after the durable
+     * write, receives this append's own re-execution result (moved, never
+     * recomputed or encoded here). A settlement-only entry uses a different
+     * result commitment and gets no record.
      */
     bool AppendExecution(
         const flowmesh::ProductionEntryCore& entry,
@@ -181,7 +246,8 @@ public:
         const uint256& treasury_owner_commitment,
         const flowmesh::DepositVerifier* deposits,
         flowmesh::FlowMeshState& next_state_out, std::string& error,
-        std::optional<flowmesh::ProductionEntryCheck>* validation_failure = nullptr);
+        std::optional<flowmesh::ProductionEntryCheck>* validation_failure = nullptr,
+        std::shared_ptr<const ProductionOutcomeRecord>* outcome_out = nullptr);
 
     /**
      * Validate and atomically append one outgoing-set EPOCH_HANDOFF. The
@@ -255,6 +321,10 @@ public:
     flowmesh::MarketHistoryPage ReadMarketHistory(uint64_t before_sequence,
                                                 size_t limit);
 
+    /** The same bounded cache as clearing ticks, oldest first. Unavailable
+     * before startup replay completes or for a limit outside 1..MAX_TICKS. */
+    flowmesh::ClearingTickPage ReadClearingTicks(const flowmesh::ClearingTickQuery& query);
+
     /**
      * Return the earliest entry after the last connected type-8 that must be
      * published: sequence-zero market genesis, every handoff, or the first
@@ -270,7 +340,10 @@ public:
      * Rebuild from the caller's canonical initial state. Every stored entry,
      * BLS certificate, anchor, fee-bearing execution and epoch checkpoint is
      * revalidated. Output state/hash change only after the complete replay
-     * agrees with the authoritative marker.
+     * agrees with the authoritative marker. A complete replay also retains the
+     * re-execution records of its newest execution entries (bounded by
+     * OUTCOME_REPLAY_TAIL_*) for one TakeReplayOutcomes call; a replay clears
+     * any earlier tail first and a failed replay publishes none.
      */
     bool Replay(flowmesh::FlowMeshState& state, uint256& last_hash,
                 const ProductionSeatSetSource& seat_sets,
@@ -307,6 +380,25 @@ public:
     bool ReadLock(const flowmesh::ProductionSignPosition& position,
                   std::optional<uint256>& out, std::string& error);
 
+    /** Moves out the last complete replay's outcome tail (oldest first). */
+    std::vector<std::shared_ptr<const ProductionOutcomeRecord>> TakeReplayOutcomes();
+
+    /**
+     * Seat-misbehaviour evidence (flowmesh/seat_evidence.h). Information
+     * only: replay, appends, locks, signing and every market decision ignore
+     * it, and a failure here never halts or blocks a market. Its own
+     * namespace is written synchronously, holds at most
+     * SEAT_EVIDENCE_MAX_RECORDS (the oldest record is evicted) and is
+     * deduplicated by evidence id. Older binaries ignore that namespace: it
+     * is not safety data, so a downgrade must not fail closed on it.
+     *
+     * Record inserts `evidence` into an open store unless a retained record
+     * has its id (`inserted` is then false). The caller has checked it with
+     * CheckSeatEvidence; the store checks only its canonical encoding.
+     */
+    bool RecordSeatEvidence(const flowmesh::SeatEvidence& evidence, bool& inserted, std::string& error);
+    bool ReadSeatEvidence(SeatEvidenceLog& out, std::string& error);
+
 private:
     CDBWrapper m_db;
     const bool m_preagreement;
@@ -317,6 +409,7 @@ private:
     //! A reopened nonempty store becomes ready only after full replay.
     bool m_ready{false};
     std::deque<flowmesh::MarketHistoryEntry> m_market_history;
+    std::deque<std::shared_ptr<const ProductionOutcomeRecord>> m_replay_outcomes;
 };
 
 } // namespace node

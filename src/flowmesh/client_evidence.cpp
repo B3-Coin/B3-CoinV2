@@ -4,7 +4,10 @@
 
 #include <flowmesh/client_evidence.h>
 
+#include <flowmesh/market_view.h>
+
 #include <streams.h>
+#include <util/check.h>
 
 #include <algorithm>
 #include <limits>
@@ -136,6 +139,7 @@ std::optional<MarketData> ClientMarketData(
         query.curve_limit == 0 || query.curve_limit > MARKET_DATA_MAX_CURVES ||
         (query.curve_cursor && !query.expected_head) ||
         (query.known_head && (query.curve_cursor || query.before_sequence)) ||
+        (query.levels && !LevelsQueryValid(*query.levels)) ||
         (query.expected_head && *query.expected_head != entry.GetHash())) {
         error = "FlowMesh client snapshot/query context is invalid";
         return std::nullopt;
@@ -190,17 +194,211 @@ const char* ClientWaitResultName(const ClientWaitResult result)
     return "unknown";
 }
 
+const char* ClientWatchResultName(const ClientWatchResult result)
+{
+    switch (result) {
+    case ClientWatchResult::READY: return "ready";
+    case ClientWatchResult::GAP: return "gap";
+    case ClientWatchResult::TIMEOUT: return "timeout";
+    case ClientWatchResult::INTERRUPTED: return "interrupted";
+    case ClientWatchResult::RESTARTED: return "restarted";
+    case ClientWatchResult::BUSY: return "busy";
+    }
+    return "unknown";
+}
+
 ClientEventLog::ClientEventLog(const uint256& instance_id) : m_instance_id{instance_id} {}
+
+IdentityShares::IdentityShares(const size_t capacity, const size_t share)
+    : m_capacity{std::max<size_t>(capacity, 1)}, m_share{std::max<size_t>(share, 1)} {}
+
+std::optional<uint64_t> IdentityShares::Indexed(const std::set<uint64_t>& serials) const
+{
+    if (serials.size() <= m_share) return std::nullopt;
+    return *serials.begin();
+}
+
+void IdentityShares::Reindex(const std::optional<uint64_t> before, const std::optional<uint64_t> after, SerialNode& spare)
+{
+    if (before == after) return;
+    if (!after) {
+        m_over_share.erase(*before);
+        return;
+    }
+    // Moves an existing index node, or uses the caller's spare one: no
+    // allocation, so no throw.
+    SerialNode node{before ? m_over_share.extract(*before) : std::move(spare)};
+    node.value() = *after;
+    m_over_share.insert(std::move(node));
+}
+
+std::optional<uint64_t> IdentityShares::Insert(const uint64_t serial, const std::string& identity)
+{
+    // Every allocation comes first, so a throw (such as bad_alloc) leaves
+    // this unchanged and m_identity, m_serials and m_over_share in step.
+    // The identity's slot is the last allocation; nothing after it throws.
+    const auto make = [](const uint64_t value) {
+        std::set<uint64_t> one{value};
+        return one.extract(one.begin());
+    };
+    SerialNode entry{make(serial)}, spare{make(serial)};
+    auto identity_entry{[&] {
+        std::map<uint64_t, std::string> one{{serial, identity}};
+        return one.extract(one.begin());
+    }()};
+    const auto owner{m_serials.try_emplace(identity).first};
+    const size_t held{owner->second.size()};
+    const auto before{Indexed(owner->second)};
+    owner->second.insert(std::move(entry));
+    Reindex(before, Indexed(owner->second), spare);
+    m_identity.insert(std::move(identity_entry));
+    if (m_identity.size() <= m_capacity) return std::nullopt;
+    // `serial` is the newest entry: at `share` or more the identity has an
+    // older one, within its share it is not over it, and past the capacity
+    // (at least one) the oldest overall is another entry.
+    const uint64_t drop{held >= m_share ? *owner->second.begin()
+                        : !m_over_share.empty() ? *m_over_share.begin()
+                        : m_identity.begin()->first};
+    Erase(drop);
+    return drop;
+}
+
+void IdentityShares::Erase(const uint64_t serial)
+{
+    // Allocates nothing: an identity still over its share after this has its
+    // index node moved to its new oldest serial.
+    const auto it{m_identity.find(serial)};
+    if (it == m_identity.end()) return;
+    const auto owner{m_serials.find(it->second)};
+    const auto before{Indexed(owner->second)};
+    owner->second.erase(serial);
+    SerialNode none;
+    Reindex(before, Indexed(owner->second), none);
+    if (owner->second.empty()) m_serials.erase(owner);
+    m_identity.erase(it);
+}
+
+const std::string* IdentityShares::Identity(const uint64_t serial) const
+{
+    const auto it{m_identity.find(serial)};
+    return it == m_identity.end() ? nullptr : &it->second;
+}
+
+void IdentityShares::Clear()
+{
+    m_identity.clear();
+    m_serials.clear();
+    m_over_share.clear();
+}
+
+bool ClientNoticeEndsWait(const ActionReasonCode code)
+{
+    return code == ActionReasonCode::STALE_SEQUENCE || code == ActionReasonCode::DROPPED_SEQUENCE_CONSUMED ||
+           code == ActionReasonCode::STALE_SEQUENCE_UNATTRIBUTED ||
+           code == ActionReasonCode::DEPOSIT_ALREADY_CREDITED;
+}
 
 void ClientEventLog::Reset(const uint256& instance_id)
 {
+    Signalled signalled;
     {
         std::lock_guard lock{m_mutex};
         m_instance_id = instance_id;
         m_last_event_id = 0;
         m_events.clear();
+        m_notices.clear();
+        m_public_notices.clear();
+        m_public_shares.Clear();
+        ++m_notice_changes;
+        SignalWatchersLocked(std::nullopt, signalled);
     }
     m_changed.notify_all();
+    Notify(signalled);
+}
+
+void ClientEventLog::SignalWatchersLocked(const std::optional<uint64_t> appended_after, Signalled& out) const
+{
+    for (const auto& watcher : m_watchers) {
+        if (watcher->signalled) continue;
+        // Read()'s eviction rule: the cursor can no longer be resumed.
+        bool wake{!appended_after ||
+                  (!m_events.empty() && watcher->after.event_id < m_events.front().event_id - 1)};
+        // Only the retained new events; an evicted new one also evicted the cursor.
+        for (auto it{m_events.rbegin()}; !wake && it != m_events.rend() && it->event_id > *appended_after; ++it) {
+            wake = Matches(*it, watcher->market, watcher->account);
+        }
+        if (!wake) continue;
+        watcher->signalled = true;
+        out.push_back(watcher);
+    }
+}
+
+void ClientEventLog::Notify(const Signalled& watchers)
+{
+    // After unlocking: a woken watcher never blocks on the appender's lock.
+    // The shared owner keeps a watcher that already returned alive.
+    for (const auto& watcher : watchers) watcher->changed.notify_one();
+}
+
+void ClientEventLog::AppendNotices(std::vector<ClientActionNotice> notices)
+{
+    if (notices.empty()) return;
+    bool notify{false};
+    {
+        std::lock_guard lock{m_mutex};
+        for (auto& notice : notices) {
+            notice.after_event_id = m_last_event_id;
+            notice.serial = ++m_notice_serial;
+            if (notice.origin == ClientNoticeOrigin::NODE) {
+                notice.submitter.clear();
+                m_notices.push_back(std::move(notice));
+                if (m_notices.size() > CLIENT_NOTICE_CAPACITY) m_notices.pop_front();
+                continue;
+            }
+            // Kept while the ring has room; once full, the identities'
+            // shares pick the notice that goes.
+            const auto dropped{m_public_shares.Insert(notice.serial, notice.submitter)};
+            m_public_notices.emplace(notice.serial, std::move(notice));
+            if (dropped) m_public_notices.erase(*dropped);
+        }
+        ++m_notice_changes;
+        notify = m_notice_waiters != 0;
+    }
+    if (notify) m_changed.notify_all();
+}
+
+std::optional<ClientActionNotice> ClientEventLog::NewestNotice(const MarketId& market, const uint256& action_id) const
+{
+    std::lock_guard lock{m_mutex};
+    return NewestNoticeLocked(market, action_id);
+}
+
+std::optional<ClientActionNotice> ClientEventLog::NewestNoticeIfNewer(const MarketId& market,
+                                                                     const uint256& action_id) const
+{
+    std::lock_guard lock{m_mutex};
+    auto notice{NewestNoticeLocked(market, action_id)};
+    if (!notice) return notice;
+    uint64_t newest_id{0};
+    if (ActionStatusLocked(market, action_id, nullptr, &newest_id) && notice->after_event_id < newest_id) {
+        return std::nullopt;
+    }
+    return notice;
+}
+
+std::optional<ClientActionNotice> ClientEventLog::NewestNoticeLocked(const MarketId& market,
+                                                                     const uint256& action_id) const
+{
+    const ClientActionNotice* newest{nullptr};
+    // Each ring newest first; the first match is that ring's newest.
+    const auto newer = [&](const ClientActionNotice& notice) {
+        if (notice.market_id != market || notice.action_id != action_id) return false;
+        if (!newest || notice.serial > newest->serial) newest = &notice;
+        return true;
+    };
+    for (auto it{m_notices.rbegin()}; it != m_notices.rend() && !newer(*it); ++it) {}
+    for (auto it{m_public_notices.rbegin()}; it != m_public_notices.rend() && !newer(it->second); ++it) {}
+    return newest ? std::optional{*newest} : std::nullopt;
 }
 
 bool ClientEventLog::AppendLocked(ClientEvent&& event)
@@ -217,24 +415,33 @@ bool ClientEventLog::AppendLocked(ClientEvent&& event)
 void ClientEventLog::Append(ClientEvent event)
 {
     bool notify{false};
+    Signalled signalled;
     {
         std::lock_guard lock{m_mutex};
-        notify = AppendLocked(std::move(event)) && m_waiters != 0;
+        const uint64_t before{m_last_event_id};
+        const bool appended{AppendLocked(std::move(event))};
+        notify = appended && m_waiters != 0;
+        if (appended && !m_watchers.empty()) SignalWatchersLocked(before, signalled);
     }
     // After unlocking: a woken waiter never blocks on the appender's lock.
     if (notify) m_changed.notify_all();
+    Notify(signalled);
 }
 
 void ClientEventLog::Append(std::vector<ClientEvent> events)
 {
     bool appended{false};
     bool notify{false};
+    Signalled signalled;
     {
         std::lock_guard lock{m_mutex};
+        const uint64_t before{m_last_event_id};
         for (auto& event : events) appended = AppendLocked(std::move(event)) || appended;
         notify = appended && m_waiters != 0;
+        if (appended && !m_watchers.empty()) SignalWatchersLocked(before, signalled);
     }
     if (notify) m_changed.notify_all();
+    Notify(signalled);
 }
 
 ClientEventCursor ClientEventLog::Cursor() const
@@ -264,8 +471,7 @@ ClientEventPage ClientEventLog::Read(const std::optional<ClientEventCursor>& aft
         if (event.event_id <= out.cursor.event_id) continue;
         if (out.events.size() == limit) { out.more = true; break; }
         out.cursor.event_id = event.event_id;
-        if (market && event.market_id != *market) continue;
-        if (account && event.kind != ClientEventKind::CERTIFIED_HEAD && event.account_id != *account) continue;
+        if (!Matches(event, market, account)) continue;
         out.events.push_back(event);
     }
     if (!out.more) out.cursor.event_id = m_last_event_id;
@@ -281,7 +487,8 @@ std::optional<ClientEvent> ClientEventLog::ActionStatus(const MarketId& market,
 
 std::optional<ClientEvent> ClientEventLog::ActionStatusLocked(const MarketId& market,
                                                             const uint256& action_id,
-                                                            ClientEventKind* const newest) const
+                                                            ClientEventKind* const newest,
+                                                            uint64_t* const newest_id) const
 {
     std::optional<ClientEvent> out;
     if (action_id.IsNull()) return out;
@@ -289,6 +496,7 @@ std::optional<ClientEvent> ClientEventLog::ActionStatusLocked(const MarketId& ma
     for (auto it{m_events.rbegin()}; it != m_events.rend(); ++it) {
         if (it->market_id != market || it->action_id != action_id) continue;
         if (first && newest) *newest = it->kind;
+        if (first && newest_id) *newest_id = it->event_id;
         first = false;
         if (!out || StatusPriority(it->kind) > StatusPriority(out->kind)) out = *it;
         if (out->kind == ClientEventKind::CERTIFIED_INCLUDED) break;
@@ -298,15 +506,27 @@ std::optional<ClientEvent> ClientEventLog::ActionStatusLocked(const MarketId& ma
 
 ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const uint256& action_id,
                                                   const std::chrono::steady_clock::time_point deadline,
-                                                  const std::function<bool()>& interrupted) const
+                                                  const std::function<bool()>& interrupted,
+                                                  const bool include_notices) const
 {
     std::unique_lock lock{m_mutex};
     ClientEventKind newest{ClientEventKind::QUEUE_ADMITTED};
-    ClientActionWait out{ActionStatusLocked(market, action_id, &newest)};
+    uint64_t newest_id{0};
+    ClientActionWait out{.status = ActionStatusLocked(market, action_id, &newest, &newest_id)};
+    const auto read_notice = [&] {
+        if (include_notices) out.notice = NewestNoticeLocked(market, action_id);
+    };
+    read_notice();
+    // Without notices this is exactly the v1 predicate. With them, a refusal
+    // notice newer than every event of the action also ends the wait.
     const auto terminal = [&] {
-        return out.status && (out.status->kind == ClientEventKind::CERTIFIED_INCLUDED ||
-                              (out.status->kind == ClientEventKind::POOL_REFUSED &&
-                               newest == ClientEventKind::POOL_REFUSED));
+        if (out.status && (out.status->kind == ClientEventKind::CERTIFIED_INCLUDED ||
+                           (out.status->kind == ClientEventKind::POOL_REFUSED &&
+                            newest == ClientEventKind::POOL_REFUSED))) {
+            return true;
+        }
+        return include_notices && out.notice && ClientNoticeEndsWait(out.notice->code) &&
+               (!out.status || out.notice->after_event_id >= newest_id);
     };
     if (terminal()) {
         out.result = ClientWaitResult::TERMINAL;
@@ -316,21 +536,33 @@ ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const 
     const uint256 instance{m_instance_id};
     const uint64_t wake{m_wake_epoch};
     uint64_t seen{m_last_event_id};
+    uint64_t seen_notices{m_notice_changes};
     // Declared after lock, so it is destroyed, and uncounted, under m_mutex.
     struct Waiter {
         size_t& count;
-        explicit Waiter(size_t& waiters) : count{waiters} { ++count; }
-        ~Waiter() { --count; }
-    } waiter{m_waiters};
+        size_t* notice_count;
+        Waiter(size_t& waiters, size_t* notice_waiters) : count{waiters}, notice_count{notice_waiters}
+        {
+            ++count;
+            if (notice_count) ++*notice_count;
+        }
+        ~Waiter()
+        {
+            --count;
+            if (notice_count) --*notice_count;
+        }
+    } waiter{m_waiters, include_notices ? &m_notice_waiters : nullptr};
     while (true) {
         if (!m_changed.wait_until(lock, deadline, [&] {
                 return m_last_event_id != seen || m_instance_id != instance ||
-                       m_wake_epoch != wake || (interrupted && interrupted());
+                       m_wake_epoch != wake || (interrupted && interrupted()) ||
+                       (include_notices && m_notice_changes != seen_notices);
             })) {
             return out; // TIMEOUT with the current nonterminal status.
         }
         if (m_instance_id != instance) {
             out.status = ActionStatusLocked(market, action_id, nullptr);
+            read_notice();
             out.result = ClientWaitResult::RESTARTED;
             return out;
         }
@@ -348,8 +580,13 @@ ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const 
             relevant = it->market_id == market && it->action_id == action_id;
         }
         seen = m_last_event_id;
+        if (include_notices && m_notice_changes != seen_notices) {
+            seen_notices = m_notice_changes;
+            relevant = true;
+        }
         if (!relevant) continue;
-        out.status = ActionStatusLocked(market, action_id, &newest);
+        out.status = ActionStatusLocked(market, action_id, &newest, &newest_id);
+        read_notice();
         if (terminal()) {
             out.result = ClientWaitResult::TERMINAL;
             return out;
@@ -359,11 +596,83 @@ ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const 
 
 void ClientEventLog::WakeWaiters() const
 {
+    Signalled signalled;
     {
         std::lock_guard lock{m_mutex};
         ++m_wake_epoch;
+        SignalWatchersLocked(std::nullopt, signalled);
     }
     m_changed.notify_all();
+    Notify(signalled);
+}
+
+ClientWatchResult ClientEventLog::PendingLocked(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                                const std::optional<AccountId>& account) const
+{
+    // Read()'s gap rule: another instance, a future cursor or an evicted one.
+    if (after.instance_id != m_instance_id || after.event_id > m_last_event_id ||
+        (!m_events.empty() && after.event_id < m_events.front().event_id - 1)) {
+        return ClientWatchResult::GAP;
+    }
+    for (auto it{m_events.rbegin()}; it != m_events.rend() && it->event_id > after.event_id; ++it) {
+        if (Matches(*it, market, account)) return ClientWatchResult::READY;
+    }
+    return ClientWatchResult::TIMEOUT;
+}
+
+ClientWatchResult ClientEventLog::EventsPending(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                                const std::optional<AccountId>& account) const
+{
+    std::lock_guard lock{m_mutex};
+    return PendingLocked(after, market, account);
+}
+
+ClientWatchResult ClientEventLog::WaitEvents(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                             const std::optional<AccountId>& account,
+                                             const std::chrono::steady_clock::time_point deadline,
+                                             const std::function<bool()>& interrupted) const
+{
+    std::unique_lock lock{m_mutex};
+    // The pending check and the registration share the lock every append
+    // signals under, so no append can fall between them.
+    if (const auto now{PendingLocked(after, market, account)}; now != ClientWatchResult::TIMEOUT) return now;
+    if (m_watchers.size() >= CLIENT_EVENT_MAX_WATCHERS) return ClientWatchResult::BUSY;
+    const uint256 instance{m_instance_id};
+    const uint64_t wake{m_wake_epoch};
+    const auto self{std::make_shared<EventWatcher>(after, market, account)};
+    m_watchers.push_back(self);
+    // Declared after lock, so it is destroyed, and deregistered, under m_mutex.
+    struct Deregister {
+        std::vector<std::shared_ptr<EventWatcher>>& watchers;
+        const EventWatcher* self;
+        ~Deregister()
+        {
+            const auto it{std::find_if(watchers.begin(), watchers.end(),
+                                       [&](const auto& watcher) { return watcher.get() == self; })};
+            // Registered above under this same lock; only this call removes it.
+            Assert(it != watchers.end());
+            watchers.erase(it);
+        }
+    } deregister{m_watchers, self.get()};
+    while (true) {
+        if (!self->changed.wait_until(lock, deadline, [&] {
+                return self->signalled || m_instance_id != instance || m_wake_epoch != wake ||
+                       (interrupted && interrupted());
+            })) {
+            return ClientWatchResult::TIMEOUT;
+        }
+        if (m_instance_id != instance) return ClientWatchResult::RESTARTED;
+        if (m_wake_epoch != wake || (interrupted && interrupted())) return ClientWatchResult::INTERRUPTED;
+        if (const auto now{PendingLocked(after, market, account)}; now != ClientWatchResult::TIMEOUT) return now;
+        // Defensive: an append signals only a READY or GAP condition.
+        self->signalled = false;
+    }
+}
+
+size_t ClientEventLog::WatchersForTest() const
+{
+    std::lock_guard lock{m_mutex};
+    return m_watchers.size();
 }
 
 } // namespace flowmesh

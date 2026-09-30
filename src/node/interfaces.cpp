@@ -1246,7 +1246,7 @@ public:
             out.error = runtime->error;
         }
         std::string checkpoint_error;
-        if (const auto checkpoint{m_node.flowmesh->NextCheckpointMpa(
+        if (const auto checkpoint{m_node.flowmesh->PendingCheckpointStatus(
                 market_id, checkpoint_error)}) {
             out.checkpoint_pending = true;
             out.pending_checkpoint_id = checkpoint->checkpoint_id;
@@ -1281,6 +1281,26 @@ public:
         }
         return m_node.flowmesh->MarketData(market_id, account_id, query, error);
     }
+    std::optional<flowmesh::MarketData> flowMeshWatchMarketData(
+        const uint256& market_id, const std::optional<uint256>& account_id,
+        const flowmesh::MarketDataQuery& query, std::chrono::milliseconds wait,
+        interfaces::FlowMeshMarketWatch& watch, std::string& error) override
+    {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Watch(market_id, account_id, query, wait, watch, error);
+        if (m_node.flowmesh) return node::MakeLocalFlowMeshBackend(*m_node.flowmesh)->Watch(market_id, account_id, query, wait, watch, error);
+        return interfaces::Chain::flowMeshWatchMarketData(market_id, account_id, query, wait, watch, error);
+    }
+    std::optional<flowmesh::ObservedCandlePage> flowMeshCandles(
+        const uint256& market_id, const flowmesh::CandleInterval interval, const std::optional<int64_t> before_ms,
+        const size_t limit, std::string& error) override
+    {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Candles(market_id, interval, before_ms, limit, error);
+        if (!m_node.flowmesh) {
+            error = "FlowMesh service is not available in this node";
+            return std::nullopt;
+        }
+        return m_node.flowmesh->ObservedCandles(market_id, interval, before_ms, limit, /*allow_disk=*/true, error);
+    }
     bool flowMeshMarketEstablished(const uint256& market_id) override
     {
         LOCK(::cs_main);
@@ -1313,10 +1333,10 @@ public:
         return m_node.flowmesh->SubmitLocalAction(market_id, action, error);
     }
     interfaces::FlowMeshActionReceipt submitFlowMeshActionReceipt(
-        const uint256& market_id, const flowmesh::Action& action) override
+        const uint256& market_id, const flowmesh::Action& action, std::chrono::milliseconds wait) override
     {
-        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Submit(market_id, action);
-        return interfaces::Chain::submitFlowMeshActionReceipt(market_id, action);
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Submit(market_id, action, wait);
+        return interfaces::Chain::submitFlowMeshActionReceipt(market_id, action, wait);
     }
     interfaces::FlowMeshActionReceipt flowMeshActionStatus(
         const uint256& market_id, const uint256& action_id, bool retry, std::chrono::milliseconds wait) override

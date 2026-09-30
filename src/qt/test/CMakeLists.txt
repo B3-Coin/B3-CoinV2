@@ -139,6 +139,21 @@ if(ENABLE_WALLET)
     ENVIRONMENT "QT_QPA_PLATFORM=minimal"
   )
 
+  # Qt UI responsiveness harness (doc/flowmesh-latency-definition.md U1-U5):
+  # synthetic in-process market reads, an offline never-unlocked wallet, no
+  # sockets or submissions. Smoke ceilings by default; see the file header
+  # for FLOWMESH_UI_PERF_STRICT and FLOWMESH_UI_PERF_REPORT.
+  add_executable(test_b3_flowmeshperf-qt b3flowmeshperftests.cpp)
+  target_compile_definitions(test_b3_flowmeshperf-qt PRIVATE B3_UI_PERF_BUILD_TYPE="$<CONFIG>")
+  target_link_libraries(test_b3_flowmeshperf-qt
+    core_interface bitcoinqt test_util bitcoin_node univalue Boost::headers Qt6::Test
+  )
+  import_plugins(test_b3_flowmeshperf-qt)
+  add_test(NAME test_b3_flowmeshperf-qt COMMAND test_b3_flowmeshperf-qt)
+  set_tests_properties(test_b3_flowmeshperf-qt PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=minimal"
+  )
+
   add_executable(test_b3_flowmeshop-qt b3flowmeshoptests.cpp)
   target_link_libraries(test_b3_flowmeshop-qt
     core_interface bitcoinqt bitcoin_node univalue Qt6::Test

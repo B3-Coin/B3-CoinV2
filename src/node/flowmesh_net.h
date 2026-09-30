@@ -134,6 +134,12 @@ public:
     //! itself; the 30-second hold limit is unchanged.
     void NotifyIngressReady();
     FlowMeshNetSnapshot Snapshot() const;
+    //! Test-only I/O worker observation: passes started (each counted after
+    //! the pass re-armed the wake-up), and passes whose wait returned with the
+    //! local wake-up signal readable. Relay, NotifyIngressReady and Stop all
+    //! use that one signal.
+    struct WorkerCounts { uint64_t passes{0}, wakeups{0}; };
+    WorkerCounts WorkerCountsForTest() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

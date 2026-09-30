@@ -5,6 +5,7 @@
 #ifndef B3COIN_FLOWMESH_CLIENT_EVIDENCE_H
 #define B3COIN_FLOWMESH_CLIENT_EVIDENCE_H
 
+#include <flowmesh/action_reason.h>
 #include <flowmesh/market_data.h>
 #include <flowmesh/production_wire.h>
 
@@ -12,7 +13,12 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
+#include <string>
 #include <vector>
 
 namespace flowmesh {
@@ -21,6 +27,71 @@ namespace flowmesh {
 inline constexpr size_t CLIENT_STATE_MAX_BYTES{8 * 1024 * 1024};
 inline constexpr size_t CLIENT_EVENT_CAPACITY{2048};
 inline constexpr size_t CLIENT_EVENT_PAGE_MAX{256};
+//! Per notice origin (ClientNoticeOrigin): each origin has its own ring.
+inline constexpr size_t CLIENT_NOTICE_CAPACITY{2048};
+//! PUBLIC ring only: one requesting identity's share once the ring is full
+//! (ClientActionNotice::submitter, applied by IdentityShares; notices whose
+//! identity is unknown count as one identity). While there is room every
+//! notice is kept, so one identity alone can use the whole ring. Once full,
+//! an identity holding this many or more replaces its own oldest notice, and
+//! an identity within its share loses one to others only when more than
+//! CLIENT_NOTICE_CAPACITY / CLIENT_NOTICE_PER_SUBMITTER identities hold
+//! notices, never through one identity's traffic.
+inline constexpr size_t CLIENT_NOTICE_PER_SUBMITTER{64};
+
+/**
+ * Which entry a bounded, oldest-first collection drops once one entry too
+ * many is held, when each entry belongs to one requesting identity (the
+ * empty string is one identity too). Entries are named by serials that only
+ * increase. Every entry is kept while at most `capacity` are held, so one
+ * identity alone can use the whole capacity. Past it, Insert names one entry
+ * to drop:
+ * - the inserting identity's own oldest, when it already held `share` or
+ *   more;
+ * - otherwise the oldest entry of an identity holding more than `share`;
+ * - otherwise the oldest entry overall.
+ * Once full, an identity at its share therefore only replaces its own
+ * entries, an identity over its share loses its oldest first, and an
+ * identity within its share loses an entry only when every identity is
+ * within its share, which takes more than capacity / share identities.
+ * Every operation is logarithmic in the entries held. Insert either
+ * records the entry or, if an allocation throws, changes nothing; Erase
+ * never throws.
+ */
+class IdentityShares
+{
+public:
+    IdentityShares(size_t capacity, size_t share);
+    /** Records `serial`, above every serial recorded before, for `identity`.
+     * Returns the serial to drop when this makes one entry too many; it is
+     * never `serial` itself and is already forgotten here. */
+    std::optional<uint64_t> Insert(uint64_t serial, const std::string& identity);
+    //! Forgets `serial`, if recorded. Never throws.
+    void Erase(uint64_t serial);
+    //! The identity `serial` was recorded for, if it is recorded.
+    const std::string* Identity(uint64_t serial) const;
+    size_t Size() const { return m_identity.size(); }
+    void Clear();
+
+private:
+    using Serials = std::map<std::string, std::set<uint64_t>>;
+    using SerialNode = std::set<uint64_t>::node_type;
+    // An identity over its share has its oldest serial in m_over_share.
+    std::optional<uint64_t> Indexed(const std::set<uint64_t>& serials) const;
+    //! Moves an identity's m_over_share entry from `before` to `after`
+    //! (either may be none). A new entry uses `spare`, which must then hold
+    //! a node; nothing here allocates.
+    void Reindex(std::optional<uint64_t> before, std::optional<uint64_t> after, SerialNode& spare);
+
+    size_t m_capacity;
+    size_t m_share;
+    std::map<uint64_t, std::string> m_identity; // oldest first
+    Serials m_serials;
+    std::set<uint64_t> m_over_share;
+};
+//! Concurrent event watches (ClientEventLog::WaitEvents) per log. Defence in
+//! depth only: every caller bounds its own watchers far below this.
+inline constexpr size_t CLIENT_EVENT_MAX_WATCHERS{64};
 
 struct ClientEvidencePins {
     uint256 domain;
@@ -79,6 +150,16 @@ enum class ClientEventKind : uint8_t {
 };
 const char* ClientEventKindName(ClientEventKind kind);
 
+//! The certified action that consumed an account sequence: which action, in
+//! which certified microblock. Memory only.
+struct ClientConsumerRef {
+    uint256 action_id;
+    uint64_t microblock_sequence{0};
+    uint256 microblock_hash;
+
+    friend bool operator==(const ClientConsumerRef&, const ClientConsumerRef&) = default;
+};
+
 struct ClientEvent {
     uint64_t event_id{0};
     MarketId market_id;
@@ -93,7 +174,56 @@ struct ClientEvent {
     uint64_t microblock_sequence{0};
     uint256 microblock_hash;
     std::string reason;
+    // Memory-only annotations, never serialized in any v1 reply or page.
+    ActionReasonCode reason_code{ActionReasonCode::NONE};
+    std::optional<ClientConsumerRef> consumed_by;
 };
+
+/**
+ * Who submitted the action a notice is about, which picks its ring. NODE is
+ * this node's own wallet RPC and GUI; PUBLIC is everything else that reaches
+ * the local submission path (the public trading API, whose traffic anyone
+ * can generate), and the default. Public traffic can then only ever evict
+ * public notices, never the ones this node's own not-executed proofs need.
+ */
+enum class ClientNoticeOrigin : uint8_t { PUBLIC, NODE };
+
+/**
+ * A local observation about one API-origin action, kept beside (never inside)
+ * the v1 event ring: notices take no event id, no ring capacity and never
+ * appear in a v1 page, status or gap. They name what this node decided about
+ * one attempt (refused, answered from certified state, dropped from its pool)
+ * and, when known, the certified action that consumed the sequence. A notice
+ * is an endpoint claim, never evidence and never an execution outcome.
+ */
+struct ClientActionNotice {
+    //! The event log's last event id when the notice was appended. A notice is
+    //! newer than an event iff after_event_id >= event.event_id.
+    uint64_t after_event_id{0};
+    MarketId market_id;
+    uint256 action_id;
+    AccountId account_id;
+    uint64_t account_sequence{0};
+    uint8_t action_type{0};
+    uint256 signed_action_hash;
+    ActionReasonCode code{ActionReasonCode::NONE};
+    //! Certified NextSequence(signer) this node's decision used.
+    uint64_t next_account_sequence{0};
+    std::optional<ClientConsumerRef> consumed_by;
+    //! The ring it is kept in.
+    ClientNoticeOrigin origin{ClientNoticeOrigin::PUBLIC};
+    //! PUBLIC only: the requesting client identity whose attempt caused it
+    //! (an IPv4 address, or an IPv6 /64), empty when unknown. Names whose
+    //! share of the full PUBLIC ring it counts against
+    //! (CLIENT_NOTICE_PER_SUBMITTER); memory-only and never in any reply.
+    std::string submitter;
+    //! Append order across both rings, set by AppendNotices.
+    uint64_t serial{0};
+};
+
+//! Notice codes that end an opt-in wait: this node will not admit the
+//! attempt, whatever its eventual outcome.
+bool ClientNoticeEndsWait(ActionReasonCode code);
 
 struct ClientEventPage {
     ClientEventCursor cursor;
@@ -115,11 +245,26 @@ const char* ClientWaitResultName(ClientWaitResult result);
 struct ClientActionWait {
     std::optional<ClientEvent> status;
     ClientWaitResult result{ClientWaitResult::TIMEOUT};
+    //! Only for an include_notices wait: the action's newest notice at return.
+    std::optional<ClientActionNotice> notice;
 };
+
+//! Why an event watch (ClientEventLog::WaitEvents) returned. A latency
+//! observation only, never evidence: the caller reads the page itself.
+enum class ClientWatchResult : uint8_t {
+    READY,       // Read(after, market, account) would now return an event
+    GAP,         // Read(after, ...) would now report a gap
+    TIMEOUT,     // deadline reached with nothing new for this filter
+    INTERRUPTED, // WakeWaiters() or the caller's interrupt predicate
+    RESTARTED,   // Reset(): a new instance (Read then reports a gap)
+    BUSY,        // CLIENT_EVENT_MAX_WATCHERS watches already registered
+};
+const char* ClientWatchResultName(ClientWatchResult result);
 
 /** Memory-only, globally bounded per runtime. No callbacks or network work; a
  * condition variable wakes bounded long-poll observers, whose count and
- * lifetime the caller bounds. The log retains no per-waiter state.
+ * lifetime the caller bounds. The only per-waiter state is the registration
+ * of a current event watch (at most CLIENT_EVENT_MAX_WATCHERS).
  * An absent action status means unknown/expired, never a definite rejection.
  * Pool refusal is an observation of one attempt, not an execution outcome. */
 class ClientEventLog {
@@ -149,18 +294,83 @@ public:
      * nonblocking, lock-free read. */
     ClientActionWait WaitActionStatus(const MarketId& market, const uint256& action_id,
                                       std::chrono::steady_clock::time_point deadline,
-                                      const std::function<bool()>& interrupted) const;
+                                      const std::function<bool()>& interrupted,
+                                      bool include_notices = false) const;
     /** Ends every current wait with INTERRUPTED (shutdown, never a result). */
     void WakeWaiters() const;
+    /** Nonblocking, O(events after the cursor): READY or GAP exactly when
+     * Read(after, market, account) would now return an event or report a
+     * gap, otherwise TIMEOUT. */
+    ClientWatchResult EventsPending(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                    const std::optional<AccountId>& account) const;
+    /** Blocks until EventsPending(after, market, account) is no longer
+     * TIMEOUT, the bounded deadline passes, WakeWaiters() or interrupted()
+     * ends the wait, or Reset() starts a new instance; BUSY at once while
+     * CLIENT_EVENT_MAX_WATCHERS watches exist. Returns no events: the caller
+     * reads its page with Read(), exactly as an unwaited reader does.
+     * The watcher sleeps on its own condition variable, which an append
+     * signals only when it matches the watcher's filter or evicts its cursor,
+     * and notifies after the log's mutex is released. interrupted() runs
+     * under that mutex and must be a nonblocking, lock-free read. */
+    ClientWatchResult WaitEvents(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                 const std::optional<AccountId>& account,
+                                 std::chrono::steady_clock::time_point deadline,
+                                 const std::function<bool()>& interrupted) const;
+    //! Test observation: current event watches.
+    size_t WatchersForTest() const;
+    /** Appends local notices in order under one lock, with at most one
+     * wakeup and only while an include_notices wait exists. Each goes to the
+     * bounded ring of its origin (CLIENT_NOTICE_CAPACITY each), so notices of
+     * one origin never evict the other's. The PUBLIC ring keeps every notice
+     * while it has room; once full, IdentityShares picks the notice that goes
+     * (CLIENT_NOTICE_PER_SUBMITTER). Never touches the v1 events. */
+    void AppendNotices(std::vector<ClientActionNotice> notices);
+    std::optional<ClientActionNotice> NewestNotice(const MarketId& market, const uint256& action_id) const;
+    //! The newest notice only while it is newer than every retained event of
+    //! the action (or the action has none), under one lock.
+    std::optional<ClientActionNotice> NewestNoticeIfNewer(const MarketId& market, const uint256& action_id) const;
 
 private:
+    //! The one filter shared by Read() and event watches, so they never disagree.
+    static bool Matches(const ClientEvent& event, const std::optional<MarketId>& market,
+                        const std::optional<AccountId>& account)
+    {
+        return (!market || event.market_id == *market) &&
+               (!account || event.kind == ClientEventKind::CERTIFIED_HEAD || event.account_id == *account);
+    }
+    //! One registered WaitEvents call. Shared, so that an appender can
+    //! notify it after unlocking even when the watch has returned meanwhile.
+    struct EventWatcher {
+        EventWatcher(const ClientEventCursor& after_in, const std::optional<MarketId>& market_in,
+                     const std::optional<AccountId>& account_in)
+            : after{after_in}, market{market_in}, account{account_in} {}
+        const ClientEventCursor after;
+        const std::optional<MarketId> market;
+        const std::optional<AccountId> account;
+        std::condition_variable changed;
+        //! Guarded by m_mutex.
+        bool signalled{false};
+    };
+    using Signalled = std::vector<std::shared_ptr<EventWatcher>>;
+    // Caller holds m_mutex.
+    ClientWatchResult PendingLocked(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                    const std::optional<AccountId>& account) const;
+    // Caller holds m_mutex. Marks each unmarked watcher that an event with an
+    // id above `appended_after` matches, or whose cursor the ring no longer
+    // retains; without a bound, every watcher. The caller notifies `out`
+    // after unlocking.
+    void SignalWatchersLocked(std::optional<uint64_t> appended_after, Signalled& out) const;
+    static void Notify(const Signalled& watchers);
     // Caller holds m_mutex. False only at the fail-closed event-id limit.
     bool AppendLocked(ClientEvent&& event);
     // Caller holds m_mutex. newest, when given, receives the kind of the
     // action's newest retained event (unchanged if there is none).
+    // newest_id, when given, receives that event's id (unchanged if none).
     std::optional<ClientEvent> ActionStatusLocked(const MarketId& market,
                                                 const uint256& action_id,
-                                                ClientEventKind* newest) const;
+                                                ClientEventKind* newest,
+                                                uint64_t* newest_id = nullptr) const;
+    std::optional<ClientActionNotice> NewestNoticeLocked(const MarketId& market, const uint256& action_id) const;
 
     mutable std::mutex m_mutex;
     mutable std::condition_variable m_changed;
@@ -170,6 +380,19 @@ private:
     // Current waiters; appends skip the notification when there are none.
     mutable size_t m_waiters{0};
     std::deque<ClientEvent> m_events;
+    // Notices: one separate ring per origin, their own change counter and
+    // waiter count. m_notice_serial orders appends across both rings. The
+    // PUBLIC ring is keyed by serial (oldest first), and m_public_shares
+    // holds the same serials by submitter; both hold at most
+    // CLIENT_NOTICE_CAPACITY.
+    std::deque<ClientActionNotice> m_notices;
+    std::map<uint64_t, ClientActionNotice> m_public_notices;
+    IdentityShares m_public_shares{CLIENT_NOTICE_CAPACITY, CLIENT_NOTICE_PER_SUBMITTER};
+    uint64_t m_notice_serial{0};
+    uint64_t m_notice_changes{0};
+    mutable size_t m_notice_waiters{0};
+    // Current event watches; guarded by m_mutex, at most CLIENT_EVENT_MAX_WATCHERS.
+    mutable std::vector<std::shared_ptr<EventWatcher>> m_watchers;
 };
 
 } // namespace flowmesh

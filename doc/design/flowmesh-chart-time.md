@@ -57,4 +57,19 @@ as a chart-only patch. Futures oracle/funding time also needs its own approved
 rules, not the display clock.
 
 No chart data, timestamps, signed formats, consensus or running application
-were changed by this investigation. Time-based candles remain unimplemented.
+were changed by this investigation.
+
+## Implemented (2026-09-30): operator-observed time
+
+The display-only path above is implemented as recommended; see
+`doc/flowmesh-observed-time.md`. Each node records when it applied every
+certified entry by its own clock, keeps it in a separate display-only
+database, and serves it only on request, labelled with the node that observed
+it and `certified: false`. Catch-up imports and every other late application
+stay without a trade time (only an upper bound, shown as such in a tooltip),
+exactly as this document requires; missing history is a gap; backward clock
+steps never pin or invent a time; different operators' clocks are never mixed
+(one series per source). Time candles use fixed UTC intervals, actual
+chronological prices and exact turnover. Validator-certified execution time
+remains unimplemented and needs the separate protocol decision described
+above (its constraints are summarised in the same document, §8).

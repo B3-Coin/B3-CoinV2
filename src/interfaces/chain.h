@@ -286,6 +286,50 @@ struct FlowMeshMarketStatus {
     std::string endpoint;
 };
 
+//! A per-action execution outcome this client VERIFIED: recomputed from data
+//! that hashes to the quorum-certified result root of the including entry
+//! (or taken from the local engine's own re-execution), or proven impossible
+//! because a different certified action consumed its sequence.
+struct FlowMeshActionOutcome {
+    //! applied | rejected | included_not_executed | not_executed
+    std::string status;
+    //! The outcome can never change (applied, rejected by state, malformed,
+    //! not_executed). BAD_SEQUENCE/EQUIVOCATION inclusions and an uncredited
+    //! deposit are not final: the same bytes may still execute later.
+    bool final{false};
+    //! flowmesh::ActionReasonCode name.
+    std::string reason_code;
+    //! certified_result_preimage | local_engine_execution | certified_sequence_consumer
+    std::string evidence;
+    uint64_t microblock_sequence{0};
+    uint256 microblock_hash;
+    struct Fill {
+        std::string side;
+        bool cleared{false}, superseded_in_entry{false};
+        CAmount quantity{0}, price{0}, quote_atoms{0}, fee_atoms{0}, net_quote_atoms{0};
+    };
+    std::optional<Fill> fill;
+    struct Withdrawal {
+        uint256 receipt_id;
+        uint256 asset;
+        CAmount amount{0};
+    };
+    std::optional<Withdrawal> withdrawal;
+    struct Deposit {
+        COutPoint outpoint;
+        uint256 asset;
+        CAmount amount{0};
+    };
+    std::optional<Deposit> deposit;
+    struct ConsumedBy {
+        uint256 action_id;
+        uint64_t microblock_sequence{0};
+        uint256 microblock_hash;
+    };
+    //! not_executed only: the certified action that consumed the sequence.
+    std::optional<ConsumedBy> consumed_by;
+};
+
 //! Never equate local queue admission, a network write, or an endpoint reply
 //! with pool admission, certified inclusion, or a successfully executed action.
 struct FlowMeshActionReceipt {
@@ -299,6 +343,13 @@ struct FlowMeshActionReceipt {
     uint64_t microblock_sequence{0};
     //! Locally derived owner of the retained instruction, never an endpoint row.
     std::optional<uint256> account_id;
+    //! flowmesh::ActionReasonCode name of the observation or outcome this
+    //! receipt reports, or empty. Never evidence by itself.
+    std::string reason_code;
+    //! Display stage, computed only by node::FlowMeshReceiptStage.
+    std::string stage;
+    //! Present exactly when outcome_verified.
+    std::optional<FlowMeshActionOutcome> outcome;
     bool Admitted() const { return state == "queued" || state == "admitted" || state == "certified_inclusion"; }
 };
 
@@ -327,6 +378,35 @@ struct FlowMeshClientEndpointStatus {
     int64_t last_attempt_ms{0};
     int64_t retry_after_ms{0};
     uint32_t consecutive_failures{0};
+    //! What the endpoint last advertised about its own readiness in a status
+    //! object: "unknown" (not advertised), "ready" or "not_ready", for which
+    //! market, with its codes and when (Unix ms, or zero). Display only: never
+    //! evidence and never an input to endpoint selection or retries.
+    std::string readiness{"unknown"};
+    std::string readiness_market;
+    std::vector<std::string> not_ready;
+    int64_t readiness_observed_ms{0};
+    //! The bounded 'updates' watch (live updates) this endpoint last
+    //! advertised, in milliseconds; zero when it offers none. A latency
+    //! capability, never evidence.
+    uint32_t live_updates_ms{0};
+};
+//! One live-update market read's local observation (see
+//! Chain::flowMeshWatchMarketData); never evidence.
+struct FlowMeshMarketWatch {
+    //! Closed set: node::FLOWMESH_CLIENT_WATCH_LABELS.
+    std::string status{"none"};
+    //! An endpoint (or the local engine) served the watch.
+    bool supported{false};
+    //! It waited, or reported a change or gap, or (ticks_catchup) the watch
+    //! was eligible but this call read ordinarily once for clearing ticks:
+    //! the caller may watch again at once. Otherwise the caller paces itself.
+    bool waited{false};
+    //! This read found an event gap (events may have been missed).
+    bool gap{false};
+    //! The endpoint the watch was for, and its advertised watch maximum.
+    std::string endpoint;
+    uint32_t endpoint_live_ms{0};
 };
 struct FlowMeshClientStatus {
     std::string backend{"local"};
@@ -766,13 +846,39 @@ public:
     virtual std::optional<flowmesh::MarketData> flowMeshMarketData(
         const uint256& market_id, const std::optional<uint256>& account_id,
         const flowmesh::MarketDataQuery& query, std::string& error) = 0;
+    //! One bounded live-update read: waits up to `wait` for a change the
+    //! endpoint (or the local engine) can report, then returns the same
+    //! verified data flowMeshMarketData would. Never signs or sends an action.
+    virtual std::optional<flowmesh::MarketData> flowMeshWatchMarketData(
+        const uint256& market_id, const std::optional<uint256>& account_id,
+        const flowmesh::MarketDataQuery& query, std::chrono::milliseconds wait,
+        FlowMeshMarketWatch& watch, std::string& error)
+    {
+        watch = {};
+        watch.status = "unsupported";
+        return flowMeshMarketData(market_id, account_id, query, error);
+    }
+    //! One page of a market's operator-observed UTC candles, display only
+    //! (FlowMeshTradingBackend::Candles).
+    virtual std::optional<flowmesh::ObservedCandlePage> flowMeshCandles(
+        const uint256& market_id, flowmesh::CandleInterval interval, std::optional<int64_t> before_ms,
+        size_t limit, std::string& error)
+    {
+        error = "FlowMesh observed-time candles are not available in this node";
+        return std::nullopt;
+    }
     //! Current active-chain registry fact (not the 30-deep runtime view).
     virtual bool flowMeshMarketEstablished(const uint256& market_id) = 0;
     virtual bool submitFlowMeshAction(const uint256& market_id,
                                       const flowmesh::Action& action,
                                       std::string& error) = 0;
+    //! A nonzero wait lets the remote trading client wait, bounded and at
+    //! most once, at its endpoint for the delivered action's certified
+    //! inclusion before returning. It never resends or signs to wait; the
+    //! local engine answers immediately.
     virtual FlowMeshActionReceipt submitFlowMeshActionReceipt(const uint256& market_id,
-                                                             const flowmesh::Action& action)
+                                                             const flowmesh::Action& action,
+                                                             std::chrono::milliseconds wait = std::chrono::milliseconds{0})
     {
         FlowMeshActionReceipt receipt;
         receipt.action_id = action.Id();

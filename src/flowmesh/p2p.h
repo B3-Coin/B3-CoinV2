@@ -62,6 +62,48 @@ inline constexpr double FLOWMESH_COMMITTEE_TOKEN_BURST{32.0};
 inline constexpr double FLOWMESH_COMMITTEE_TOKEN_RATE{8.0};
 inline constexpr double FLOWMESH_CONTROL_TOKEN_BURST{64.0};
 inline constexpr double FLOWMESH_CONTROL_TOKEN_RATE{16.0};
+// Committee frames the runtime can prove it would only drop (a slot it has
+// already appended, an exact repeat of verified agreement bytes) take no
+// committee token or queue slot. They spend this separate per-(peer, market)
+// budget instead, so a flood of them is still refused RATE_LIMITED. It is
+// eight times the committee budget; see the sizing note below.
+inline constexpr double FLOWMESH_SETTLED_TOKEN_BURST{256.0};
+inline constexpr double FLOWMESH_SETTLED_TOKEN_RATE{64.0};
+// Each such frame must also find a token in its sender's settled budget
+// across all markets together, and spends one from both or from neither.
+// The per-(peer, market) budget alone let one peer consume 256 at once and
+// 64/s in every admitted market, so its total grew with the market count.
+//
+// A "peer" or "sender" here is one connection identity: the legacy B3
+// NodeId, or the FMN2 session's peer id. It is not an operator key, so a
+// reconnect, or the same operator carried over legacy and FMN2 at once
+// (dual carriage), gets a fresh budget.
+//
+// Sizing: in the warm persistent-trades benchmark (4 validators, one market,
+// star relay, no sentry) a sender's consumed frames at one receiver averaged
+// 8-12/s and peaked at 27 in any 1 s and 82 in any 5 s, against 320 and 576
+// allowed per market. In steady state the burst (512) only absorbs short
+// peaks and the refill rate decides: this budget binds when one sender's
+// summed sustained settled rate across all markets exceeds 128/s, which is
+// about 11 markets at the measured 12/s average. For one market the
+// per-market budget (64/s) binds first.
+//
+// What this does not bound: it is a per-peer bound only; nothing in
+// admission bounds all peers together. On FMN2 the one aggregate bound is
+// the shared critical receive bucket (global_rx lane 0, flowmesh_net.cpp:
+// 1024 frames at once, 512/s), which a handful of flooding authenticated
+// peers (each with this budget plus its committee budget) can still empty,
+// and FMN2 then fails whichever connection reads next. Legacy/dual B3
+// carriage has no FlowMesh aggregate receive bound at all.
+//
+// Re-validate both settled budgets before running with more seats or with
+// sentries: late copies come from every validator relaying each vote it
+// verifies, so their rate grows with the seat count and slot rate, and it
+// was measured with 4 validators only. getflowmeshdeliveryinfo's
+// settled_frames_rate_limited must stay 0 in honest runs; a non-zero value
+// there means one of these budgets binds.
+inline constexpr double FLOWMESH_SETTLED_PEER_TOKEN_BURST{512.0};
+inline constexpr double FLOWMESH_SETTLED_PEER_TOKEN_RATE{128.0};
 
 enum class WireMessageKind : uint8_t {
     HELLO = 0,
@@ -118,6 +160,9 @@ const char* WireCheckName(WireCheck check);
 
 std::optional<std::vector<unsigned char>> EncodeWireMessage(const WireMessage& message,
                                                             WireCheck& check);
+/** EncodeWireMessage's framing verdict without building the encoded bytes.
+ * Admission needs only the verdict; the encoder uses this same check. */
+bool CheckWireMessage(const WireMessage& message, WireCheck& check);
 std::optional<WireMessage> DecodeWireMessage(WireMessageKind kind,
                                              std::span<const unsigned char> bytes,
                                              WireCheck& check);
@@ -160,6 +205,10 @@ enum class QueueResult : uint8_t {
 struct QueuedWireMessage {
     WirePeerId peer{0};
     WireMessage message;
+    //! This node's own bookkeeping, never framed or relayed: whoever queued
+    //! the frame counted it (FlowMeshRuntime: towards a public submitter),
+    //! so the worker settles exactly the frames marked.
+    bool counted{false};
 };
 
 /**
@@ -174,8 +223,26 @@ struct QueuedWireMessage {
 class BoundedWireQueue
 {
 public:
+    //! `counted` is carried to Pop unchanged (QueuedWireMessage::counted)
+    //! and plays no part in admission.
     QueueResult Push(WirePeerId peer, WireMessage message,
-                     WireClock::time_point now = WireClock::now());
+                     WireClock::time_point now = WireClock::now(), bool counted = false);
+    //! Admission of a frame the caller has proven its worker would only
+    //! drop. Nothing is queued and no committee token is spent: the framing
+    //! verdict is Push's, then one settled-frame token of (peer, market) and
+    //! one of the peer's settled budget across all markets are spent, both
+    //! or neither. ACCEPTED means consumed.
+    QueueResult ConsumeSettled(WirePeerId peer, const WireMessage& message,
+                               WireClock::time_point now = WireClock::now());
+    //! For a committee frame, and without spending or refilling anything:
+    //! MALFORMED on Push's framing verdict; otherwise RATE_LIMITED when
+    //! neither ConsumeSettled's budgets nor Push's committee budget has a
+    //! token for it at `now`, else ACCEPTED. Queue capacity is not checked,
+    //! and other kinds are always ACCEPTED. It lets a caller skip costly
+    //! work, such as hashing a large frame, for a frame that both admissions
+    //! would refuse RATE_LIMITED.
+    QueueResult PeekSettledOrCommittee(WirePeerId peer, const WireMessage& message,
+                                       WireClock::time_point now = WireClock::now()) const;
     std::optional<QueuedWireMessage> Pop();
     void RemovePeer(WirePeerId peer);
 
@@ -195,6 +262,7 @@ private:
         double count_tokens{FLOWMESH_ACTION_TOKEN_COUNT_BURST};
         double byte_tokens{FLOWMESH_ACTION_TOKEN_BYTE_BURST};
         double committee_tokens{FLOWMESH_COMMITTEE_TOKEN_BURST};
+        double settled_tokens{FLOWMESH_SETTLED_TOKEN_BURST};
         WireClock::time_point updated{};
         bool initialized{false};
     };
@@ -203,9 +271,16 @@ private:
         WireClock::time_point updated{};
         bool initialized{false};
     };
+    struct SettledPeerBucket {
+        double tokens{FLOWMESH_SETTLED_PEER_TOKEN_BURST};
+        WireClock::time_point updated{};
+        bool initialized{false};
+    };
 
     using PeerMarket = std::pair<WirePeerId, MarketId>;
 
+    static void Refill(TokenBucket& bucket, WireClock::time_point now);
+    static void Refill(SettledPeerBucket& bucket, WireClock::time_point now);
     bool ConsumeTokens(WirePeerId peer, const WireMessage& message,
                        WireClock::time_point now);
     bool EvictOneLowerPriority(WirePriority higher_than,
@@ -220,6 +295,8 @@ private:
     std::map<PeerMarket, Usage> m_peer_market_actions;
     std::map<PeerMarket, TokenBucket> m_tokens;
     std::map<WirePeerId, ControlTokenBucket> m_control_tokens;
+    //! Only peers that reached ConsumeSettled; RemovePeer erases the entry.
+    std::map<WirePeerId, SettledPeerBucket> m_settled_peer_tokens;
     size_t m_size{0};
     size_t m_bytes{0};
 };

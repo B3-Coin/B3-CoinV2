@@ -93,6 +93,47 @@ BOOST_AUTO_TEST_CASE(commands_header_and_strict_shapes_round_trip)
     BOOST_CHECK(check == WireCheck::TOO_LARGE);
 }
 
+// Admission asks only for the framing verdict. It must be exactly the
+// encoder's verdict, check code included, and Push's MALFORMED result.
+BOOST_AUTO_TEST_CASE(framing_check_is_the_encoder_verdict_without_encoding)
+{
+    using namespace flowmesh;
+    std::vector<WireMessage> messages;
+    for (const auto kind : {WireMessageKind::HELLO, WireMessageKind::ACTION,
+                            WireMessageKind::PROPOSAL, WireMessageKind::ATTESTATION,
+                            WireMessageKind::CERTIFICATE, WireMessageKind::GET,
+                            WireMessageKind::ENTRIES, WireMessageKind::AGREEMENT}) {
+        messages.push_back(Message(kind));
+        auto bad_version{Message(kind)};
+        ++bad_version.header.version;
+        messages.push_back(bad_version);
+        auto null_market{Message(kind)};
+        null_market.header.market_id.SetNull();
+        messages.push_back(null_market);
+        auto too_large{Message(kind)};
+        too_large.payload.assign(PayloadLimitForWireKind(kind) + 1, 0x42);
+        messages.push_back(too_large);
+        auto short_payload{Message(kind)};
+        short_payload.payload.pop_back();
+        messages.push_back(short_payload);
+        auto bad_prefix{Message(kind)};
+        bad_prefix.payload.front() ^= 0xff;
+        messages.push_back(bad_prefix);
+    }
+    BoundedWireQueue queue;
+    const auto now{WireClock::time_point{std::chrono::seconds{100}}};
+    size_t refused{0};
+    for (const auto& message : messages) {
+        WireCheck encoded_check{WireCheck::OK}, checked{WireCheck::UNKNOWN_COMMAND};
+        const bool encoded{EncodeWireMessage(message, encoded_check).has_value()};
+        BOOST_CHECK_EQUAL(CheckWireMessage(message, checked), encoded);
+        BOOST_CHECK(checked == encoded_check);
+        BOOST_CHECK_EQUAL(queue.Push(1, message, now) == QueueResult::MALFORMED, !encoded);
+        refused += !encoded;
+    }
+    BOOST_CHECK_GT(refused, 8U * 4U);
+}
+
 BOOST_AUTO_TEST_CASE(agreement_is_distinct_bounded_and_uses_critical_committee_budget)
 {
     using namespace flowmesh;
@@ -197,6 +238,204 @@ BOOST_AUTO_TEST_CASE(priority_lanes_protect_certificates_and_enforce_rate_limits
     BOOST_CHECK(actions.Push(2, Message(WireMessageKind::ACTION),
                              now + std::chrono::seconds{1}) ==
                 QueueResult::ACCEPTED);
+}
+
+// The counted mark is the enqueuer's own bookkeeping: carried to Pop as
+// given, and never a reason to admit or refuse a frame.
+BOOST_AUTO_TEST_CASE(counted_mark_is_carried_unchanged_and_admits_nothing)
+{
+    using namespace flowmesh;
+    const auto now{WireClock::time_point{std::chrono::seconds{100}}};
+    BoundedWireQueue queue;
+    for (const bool counted : {true, false, true}) {
+        BOOST_REQUIRE(queue.Push(1, Message(WireMessageKind::ACTION), now, counted) == QueueResult::ACCEPTED);
+    }
+    BOOST_REQUIRE(queue.Push(1, Message(WireMessageKind::ACTION), now) == QueueResult::ACCEPTED);
+    for (const bool counted : {true, false, true, false}) {
+        const auto item{queue.Pop()};
+        BOOST_REQUIRE(item);
+        BOOST_CHECK_EQUAL(item->counted, counted);
+    }
+    BOOST_CHECK(queue.Empty());
+    BoundedWireQueue limited;
+    for (size_t i{0}; i < 256; ++i) {
+        BOOST_REQUIRE(limited.Push(2, Message(WireMessageKind::ACTION), now, i % 2 == 0) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(limited.Push(2, Message(WireMessageKind::ACTION), now, true) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK(limited.Push(2, Message(WireMessageKind::ACTION), now) == QueueResult::RATE_LIMITED);
+}
+
+// Frames the runtime proves its worker would only drop take no committee
+// token or queue slot, but a separate, generous per-(peer, market) budget
+// still bounds them, after the unchanged framing verdict.
+BOOST_AUTO_TEST_CASE(settled_frames_spend_a_separate_bounded_budget)
+{
+    using namespace flowmesh;
+    BoundedWireQueue queue;
+    const auto now{WireClock::time_point{std::chrono::seconds{400}}};
+    const auto vote{Message(WireMessageKind::ATTESTATION)};
+    auto truncated{vote};
+    truncated.payload.pop_back();
+    BOOST_CHECK(queue.ConsumeSettled(3, truncated, now) == QueueResult::MALFORMED);
+    for (size_t i{0}; i < static_cast<size_t>(FLOWMESH_SETTLED_TOKEN_BURST); ++i) {
+        BOOST_REQUIRE(queue.ConsumeSettled(3, i % 2 ? vote : Message(WireMessageKind::AGREEMENT), now) ==
+                      QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(queue.ConsumeSettled(3, vote, now) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK(queue.ConsumeSettled(3, truncated, now) == QueueResult::MALFORMED);
+    BOOST_CHECK(queue.Empty());
+
+    // The committee budget is untouched and still bounds queued frames.
+    for (size_t i{0}; i < static_cast<size_t>(FLOWMESH_COMMITTEE_TOKEN_BURST); ++i) {
+        BOOST_REQUIRE(queue.Push(3, vote, now) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(queue.Push(3, vote, now) == QueueResult::RATE_LIMITED);
+
+    // Other peers and markets have budgets of their own.
+    BOOST_CHECK(queue.ConsumeSettled(4, vote, now) == QueueResult::ACCEPTED);
+    auto other_market{vote};
+    other_market.header.market_id.begin()[1] = 7;
+    BOOST_CHECK(queue.ConsumeSettled(3, other_market, now) == QueueResult::ACCEPTED);
+
+    // It refills at its own rate, not the committee rate.
+    const auto later{now + std::chrono::seconds{1}};
+    for (size_t i{0}; i < static_cast<size_t>(FLOWMESH_SETTLED_TOKEN_RATE); ++i) {
+        BOOST_REQUIRE(queue.ConsumeSettled(3, vote, later) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(queue.ConsumeSettled(3, vote, later) == QueueResult::RATE_LIMITED);
+
+    // A disconnect resets it with the peer's other buckets.
+    queue.RemovePeer(3);
+    BOOST_CHECK(queue.Empty());
+    BOOST_CHECK(queue.ConsumeSettled(3, vote, later) == QueueResult::ACCEPTED);
+}
+
+// A peer's settled frames in all markets together also spend one per-peer
+// budget, so admitting more markets does not multiply what one peer may have
+// consumed. A refusal by either budget spends nothing from the other.
+BOOST_AUTO_TEST_CASE(settled_frames_are_bounded_per_peer_across_markets)
+{
+    using namespace flowmesh;
+    // The counts below are written for these values.
+    static_assert(FLOWMESH_SETTLED_TOKEN_BURST == 256.0 && FLOWMESH_SETTLED_TOKEN_RATE == 64.0);
+    static_assert(FLOWMESH_SETTLED_PEER_TOKEN_BURST == 512.0 && FLOWMESH_SETTLED_PEER_TOKEN_RATE == 128.0);
+    BoundedWireQueue queue;
+    const auto now{WireClock::time_point{std::chrono::seconds{500}}};
+    const auto in_market = [](const unsigned char market) {
+        auto out{Message(WireMessageKind::ATTESTATION)};
+        out.header.market_id.begin()[1] = market;
+        return out;
+    };
+    const auto consume = [&](const WirePeerId peer, const unsigned char market, const size_t count,
+                             const WireClock::time_point when) {
+        size_t accepted{0};
+        for (size_t i{0}; i < count; ++i) {
+            accepted += queue.ConsumeSettled(peer, in_market(market), when) == QueueResult::ACCEPTED;
+        }
+        return accepted;
+    };
+
+    // One market's own budget binds first; its 50 refusals spend nothing
+    // from the peer's budget, so the other 256 still fit in two further
+    // markets that each stay below their own burst.
+    BOOST_CHECK_EQUAL(consume(3, 1, 306, now), 256U);
+    BOOST_CHECK_EQUAL(consume(3, 2, 128, now), 128U);
+    BOOST_CHECK_EQUAL(consume(3, 3, 128, now), 128U);
+    // The peer's budget is spent: a market with all of its own budget left
+    // refuses too.
+    BOOST_CHECK(queue.ConsumeSettled(3, in_market(4), now) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK_EQUAL(consume(3, 4, 199, now), 0U);
+    auto truncated{in_market(4)};
+    truncated.payload.pop_back();
+    BOOST_CHECK(queue.ConsumeSettled(3, truncated, now) == QueueResult::MALFORMED);
+    BOOST_CHECK(queue.Empty());
+    // Other peers and the committee budget are unaffected.
+    BOOST_CHECK(queue.ConsumeSettled(4, in_market(4), now) == QueueResult::ACCEPTED);
+    BOOST_CHECK(queue.Push(3, in_market(4), now) == QueueResult::ACCEPTED);
+
+    // Two seconds refill 256 of the peer's budget. The 200 refusals above
+    // spent none of market 4's own budget, which is still whole.
+    const auto later{now + std::chrono::seconds{2}};
+    BOOST_CHECK_EQUAL(consume(3, 4, 257, later), 256U);
+    BOOST_CHECK(queue.ConsumeSettled(3, in_market(5), later) == QueueResult::RATE_LIMITED);
+
+    // It refills at its own rate: one more second admits 128 in total,
+    // although market 2 alone could take 256 by then.
+    const auto third{later + std::chrono::seconds{1}};
+    BOOST_CHECK_EQUAL(consume(3, 2, 200, third), 128U);
+
+    // A disconnect resets it with the peer's other buckets.
+    queue.RemovePeer(3);
+    BOOST_CHECK(queue.ConsumeSettled(3, in_market(6), third) == QueueResult::ACCEPTED);
+}
+
+// The peek admission runs before costly work reports whether either budget
+// could still admit a committee frame, with Push's framing verdict first,
+// and spends and refills nothing.
+BOOST_AUTO_TEST_CASE(settled_or_committee_peek_spends_nothing)
+{
+    using namespace flowmesh;
+    BoundedWireQueue queue;
+    const auto now{WireClock::time_point{std::chrono::seconds{600}}};
+    const auto certificate{Message(WireMessageKind::CERTIFICATE, 64)};
+    auto truncated{Message(WireMessageKind::AGREEMENT)};
+    truncated.payload.pop_back();
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, truncated, now) == QueueResult::MALFORMED);
+    // A peer never seen has both budgets whole.
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, certificate, now) == QueueResult::ACCEPTED);
+
+    // Settled budget spent, committee budget whole: still admissible. Many
+    // peeks leave the committee budget exactly as it was.
+    const auto settled_burst{static_cast<size_t>(FLOWMESH_SETTLED_TOKEN_BURST)};
+    for (size_t i{0}; i < settled_burst; ++i) {
+        BOOST_REQUIRE(queue.ConsumeSettled(3, certificate, now) == QueueResult::ACCEPTED);
+    }
+    BOOST_REQUIRE(queue.ConsumeSettled(3, certificate, now) == QueueResult::RATE_LIMITED);
+    for (size_t i{0}; i < 100; ++i) {
+        BOOST_REQUIRE(queue.PeekSettledOrCommittee(3, certificate, now) == QueueResult::ACCEPTED);
+    }
+    const auto committee_burst{static_cast<size_t>(FLOWMESH_COMMITTEE_TOKEN_BURST)};
+    for (size_t i{0}; i < committee_burst; ++i) {
+        BOOST_REQUIRE(queue.Push(3, certificate, now) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(queue.Push(3, certificate, now) == QueueResult::RATE_LIMITED);
+    // Neither budget can admit it now.
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, certificate, now) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, truncated, now) == QueueResult::MALFORMED);
+    // Only committee frames are judged; other peers and markets have their own.
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, Message(WireMessageKind::ACTION), now) == QueueResult::ACCEPTED);
+    BOOST_CHECK(queue.PeekSettledOrCommittee(4, certificate, now) == QueueResult::ACCEPTED);
+    auto other_market{certificate};
+    other_market.header.market_id.begin()[1] = 7;
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, other_market, now) == QueueResult::ACCEPTED);
+
+    // One refilled settled token makes it admissible again, and the peek
+    // leaves that token for the admission that follows.
+    const auto settled_token{now + std::chrono::milliseconds{1000 / static_cast<int>(FLOWMESH_SETTLED_TOKEN_RATE) + 1}};
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, certificate, settled_token) == QueueResult::ACCEPTED);
+    BOOST_CHECK(queue.ConsumeSettled(3, certificate, settled_token) == QueueResult::ACCEPTED);
+    BOOST_CHECK(queue.ConsumeSettled(3, certificate, settled_token) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, certificate, settled_token) == QueueResult::RATE_LIMITED);
+
+    // The per-peer budget across markets counts: in a market whose own
+    // settled budget is whole, a peer with no settled token left across
+    // markets and no committee token there is refused.
+    BoundedWireQueue across;
+    for (unsigned char market{1}; market <= 2; ++market) {
+        auto frame{certificate};
+        frame.header.market_id.begin()[1] = market;
+        for (size_t i{0}; i < settled_burst; ++i) {
+            BOOST_REQUIRE(across.ConsumeSettled(5, frame, now) == QueueResult::ACCEPTED);
+        }
+    }
+    auto third{certificate};
+    third.header.market_id.begin()[1] = 3;
+    BOOST_REQUIRE(across.ConsumeSettled(5, third, now) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK(across.PeekSettledOrCommittee(5, third, now) == QueueResult::ACCEPTED); // committee whole
+    for (size_t i{0}; i < committee_burst; ++i) {
+        BOOST_REQUIRE(across.Push(5, third, now) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(across.PeekSettledOrCommittee(5, third, now) == QueueResult::RATE_LIMITED);
 }
 
 BOOST_AUTO_TEST_CASE(lower_priority_work_is_evicted_but_b3_has_no_dependency)

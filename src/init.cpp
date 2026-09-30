@@ -588,6 +588,14 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-flowmeshapiport=<port>", "Restricted HTTPS trading API port (default: 5650)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapiactionwait=<ms>", strprintf("Longest time the restricted HTTPS trading API holds an action-status read open until this node records the action's certified inclusion; offered only for actions this node has already seen, and advertised to clients (default: %d, 0 disables it and keeps the previous request contract, maximum: %d). Node-local latency policy, not consensus.", node::FLOWMESH_API_ACTION_WAIT_DEFAULT.count(), node::FLOWMESH_API_ACTION_WAIT_MAX.count()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapiactionwaiters=<n>", strprintf("Concurrent waited action-status reads on the restricted HTTPS trading API, at most %d per client IPv4 address or IPv6 /64 (default: %d, 0 disables waits, maximum: %d). Each adds a worker thread that only sleeps; HTTPS handshake, read and write work stays at %d connections at a time. Any client may wait on public action ids (for example from 'updates'), so a few addresses can hold every slot; a waited read that finds none free gets the immediate reply, with wait_status 'busy'.", node::FlowMeshActionWaitSlots::MAX_PER_PEER, node::FLOWMESH_API_ACTION_WAITERS_DEFAULT, node::FLOWMESH_API_ACTION_WAITERS_MAX, node::FLOWMESH_API_ACTIVE_PERMITS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapisubmitwait", "Also offer the bounded -flowmeshapiactionwait on the restricted HTTPS trading API's 'submit', in the same -flowmeshapiactionwaiters slots, and advertise it (submit_wait_ms_max): a waited submission's reply adds the 'action' reply for the action it admitted after the wait, so a remote client can learn a certified inclusion in one round trip (default: 1). A refused submission never waits, and the embedded read costs one more request token. 0, or disabled action waits, keeps the previous 'submit' request and reply contract exactly. Node-local latency policy, not consensus.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapiwatch=<ms>", strprintf("Longest time the restricted HTTPS trading API holds an 'updates' read open until an event after the client's cursor exists for its market and account, or its known head is no longer current; advertised to clients (default: %d, 0 disables it and keeps the previous request and reply contract, maximum: %d). A watched reply is the event page and status object without reported_data. Node-local latency policy, not consensus.", node::FLOWMESH_API_UPDATES_WATCH_DEFAULT.count(), node::FLOWMESH_API_UPDATES_WATCH_MAX.count()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapiwatchers=<n>", strprintf("Concurrent watched 'updates' reads on the restricted HTTPS trading API, at most %d per client IPv4 address or IPv6 /64, in a pool separate from waited action-status reads (default: %d, reduced so that waited action-status reads and watches together use at most %d worker threads that only sleep; maximum: %d). An explicit value above that room is refused while watches are enabled. A watched read that finds no free slot gets the immediate reply, with watch_status 'busy'.", node::FlowMeshActionWaitSlots::MAX_PER_PEER, node::FLOWMESH_API_UPDATES_WATCHERS_DEFAULT, node::FLOWMESH_API_MAX_WAIT_SLOTS, node::FLOWMESH_API_UPDATES_WATCHERS_MAX), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapioutcome", "Offer verifiable action outcomes on the restricted HTTPS trading API, on explicit request only: the \"action_outcome_v1\" advert in status objects, the 'action' parameter \"outcome\" and the 'outcome_evidence' method (default: 1). 0 keeps the previous request and reply contract exactly. Evidence is served only from this node's bounded in-memory window of recent certified entries (at most 1,024 per market); clients verify it against the quorum-certified result root. Each extra part costs one more request token.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapiclearingticks=<n>", strprintf("Largest page of clearing ticks (one per certified microblock of the bounded in-memory history: price, volume and the side left unfilled) the restricted HTTPS trading API returns inside reported_data on 'snapshot' and unwatched 'updates' reads that ask for them, and advertises to clients as clearing_ticks_max (default: %u, 0 disables it and keeps the previous request and reply contract, maximum: %u). Endpoint-reported display data, never evidence.", node::FLOWMESH_API_CLEARING_TICKS_DEFAULT, flowmesh::MARKET_DATA_MAX_TICKS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapiobservedtime", "Offer operator-observed time on the restricted HTTPS trading API: the \"observed_time_v1\" advert in status objects and, on 'snapshot' and unwatched 'updates' reads that ask for it, this node's stamps of when it applied the reply's head, history and ticks, inside reported_data (default: 1). 0 keeps the previous request and reply contract exactly. Display data, never certified or evidence; it reveals this node's clock and how late it applies entries. Rows carry only clock flags, never why an entry was late or anything about seats.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapicandles=<n>", strprintf("Largest page of the restricted HTTPS trading API's 'candles' method: this node's operator-observed UTC candles (1m to 1d) from its bounded memory window, never its disk, advertised as observed_candles_max (default: %u, 0 disables it and keeps the previous request and reply contract, maximum: %u). The candles are computed once per certified entry, never per request; each page costs one more request token and at most %u pages per second per client. Display data, never certified or evidence.", node::FLOWMESH_API_CANDLES_DEFAULT, node::FLOWMESH_API_CANDLES_DEFAULT, node::FLOWMESH_API_CANDLES_PER_CLIENT_PER_SECOND), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapihealth", "Serve the public 'health' method on the restricted HTTPS trading API and add advisory per-market endpoint readiness (health_api_version, endpoint_ready, endpoint_not_ready) to its status objects (default: 1). 0 keeps the previous request and reply contract exactly. A local observation for routing and status pages, never evidence; 'health' is charged by the API's admission budget and then by a tighter per-client budget.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapicert=<file>", "PEM server certificate chain for the restricted HTTPS trading API; relative paths are resolved under the network datadir", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapikey=<file>", "PEM TLS server key for the restricted HTTPS trading API (not an FN or wallet key). Encrypted/prompted keys are unsupported; relative paths use the network datadir.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY | ArgsManager::SENSITIVE, OptionsCategory::CONNECTION);
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers. Relative paths will be prefixed by the net-specific datadir location.%s",
@@ -725,6 +733,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-acceptnonstdtxn", strprintf("Relay and mine \"non-standard\" transactions (test networks only; default: %u)", DEFAULT_ACCEPT_NON_STD_TXN), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-incrementalrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define cost of relay, used for mempool limiting and replacement policy. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_INCREMENTAL_RELAY_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-dustrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define dust, the value of an output such that it will cost more than its value in fees at this fee rate to spend it. (default: %s)", CURRENCY_UNIT, FormatMoney(DUST_RELAY_TX_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-flowmeshhealthtestgracems=<ms>", strprintf("Regtest only, for tests: set every FlowMesh health grace (gate reconciliation, catch-up lag, no peers) to <ms> (0-%d)", node::FLOWMESH_TEST_HEALTH_GRACE_MAX.count()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-flowmeshtestjoinwindowms=<ms>", strprintf("Regtest only, for tests: set both windows within which the HTTPS trading client's wallet signing preflight may reuse a just-verified market refresh instead of requesting another (default: %d ms since that refresh completed and %d ms since it started; 0-%d)", node::FlowMeshJoinWindows{}.completion.count(), node::FlowMeshJoinWindows{}.max_observation_age.count(), node::FLOWMESH_TEST_JOIN_WINDOW_MAX.count()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-acceptstalefeeestimates", strprintf("Read fee estimates even if they are stale (%sdefault: %u) fee estimates are considered stale if they are %s hours old", "regtest only; ", DEFAULT_ACCEPT_STALE_FEE_ESTIMATES, Ticks<std::chrono::hours>(MAX_FILE_AGE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-bytespersigop", strprintf("Equivalent bytes per sigop in transactions for relay and mining (default: %u)", DEFAULT_BYTES_PER_SIGOP), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
@@ -1197,6 +1206,16 @@ bool AppInitParameterInteraction(const ArgsManager& args)
             if (it == TEST_OPTIONS_DOC.end()) {
                 InitWarning(strprintf(_("Unrecognised option \"%s\" provided in -test=<option>."), option));
             }
+        }
+    }
+
+    if (args.IsArgSet("-flowmeshhealthtestgracems")) {
+        if (chainparams.GetChainType() != ChainType::REGTEST) {
+            return InitError(Untranslated("-flowmeshhealthtestgracems can only be used with regtest"));
+        }
+        const int64_t grace{args.GetIntArg("-flowmeshhealthtestgracems", 0)};
+        if (grace < 0 || grace > node::FLOWMESH_TEST_HEALTH_GRACE_MAX.count()) {
+            return InitError(Untranslated(strprintf("-flowmeshhealthtestgracems must be between 0 and %d", node::FLOWMESH_TEST_HEALTH_GRACE_MAX.count())));
         }
     }
 
@@ -2039,6 +2058,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (flowmesh_api && !flowmesh_validator) {
         return InitError(Untranslated("-flowmeshapi requires -enableflowmeshvalidator=1"));
     }
+    if (args.IsArgSet("-flowmeshhealthtestgracems") && !flowmesh_validator) {
+        return InitError(Untranslated("-flowmeshhealthtestgracems requires -enableflowmeshvalidator=1"));
+    }
     if (args.IsArgSet("-flowmeshtestjoinwindowms") && flowmesh_validator) {
         return InitError(Untranslated("-flowmeshtestjoinwindowms applies only to the HTTPS trading client (-enableflowmeshvalidator=0)"));
     }
@@ -2096,6 +2118,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                                      peerman_opts);
     std::string flowmesh_error;
     if (node.flowmesh) {
+        if (args.IsArgSet("-flowmeshhealthtestgracems")) {
+            // Regtest-only and bounded, checked in AppInitParameterInteraction.
+            const std::chrono::milliseconds grace{args.GetIntArg("-flowmeshhealthtestgracems", 0)};
+            node.flowmesh->SetHealthPolicy(node::FlowMeshHealthPolicy::WithGrace(grace));
+            LogInfo("FlowMesh health graces set to %d ms for tests", grace.count());
+        }
         if (!node.flowmesh->Start(*node.peerman, flowmesh_error)) {
             return InitError(Untranslated(strprintf("FlowMesh production service failed to start: %s", flowmesh_error)));
         }
@@ -2125,12 +2153,43 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             if (action_waiters < 0 || action_waiters > int64_t(node::FLOWMESH_API_ACTION_WAITERS_MAX)) {
                 return InitError(Untranslated(strprintf("-flowmeshapiactionwaiters must be between 0 and %d", node::FLOWMESH_API_ACTION_WAITERS_MAX)));
             }
-            const node::FlowMeshTradingApiWait action_wait_policy{std::chrono::milliseconds{action_wait}, size_t(action_waiters)};
-            node.flowmesh_api = node::MakeFlowMeshTradingApi(*node.flowmesh, std::move(options), flowmesh_metadata, action_wait_policy);
+            const node::FlowMeshTradingApiWait action_wait_policy{std::chrono::milliseconds{action_wait}, size_t(action_waiters),
+                                                                  args.GetBoolArg("-flowmeshapisubmitwait", true)};
+            const auto watch{args.GetIntArg("-flowmeshapiwatch", node::FLOWMESH_API_UPDATES_WATCH_DEFAULT.count())};
+            if (watch < 0 || watch > node::FLOWMESH_API_UPDATES_WATCH_MAX.count()) {
+                return InitError(Untranslated(strprintf("-flowmeshapiwatch must be between 0 and %d", node::FLOWMESH_API_UPDATES_WATCH_MAX.count())));
+            }
+            // As the API counts them: action-wait slots exist only while waits are enabled.
+            const size_t action_slots{action_wait > 0 ? size_t(action_waiters) : 0};
+            std::string watch_error;
+            const auto watchers{node::FlowMeshApiWatchSlots(action_slots, watch > 0,
+                args.IsArgSet("-flowmeshapiwatchers") ? std::optional{args.GetIntArg("-flowmeshapiwatchers", 0)} : std::nullopt,
+                watch_error)};
+            if (!watchers) return InitError(Untranslated(watch_error));
+            const node::FlowMeshTradingApiWatch watch_policy{std::chrono::milliseconds{watch}, *watchers};
+            const node::FlowMeshTradingApiHealth health_policy{args.GetBoolArg("-flowmeshapihealth", true)};
+            const node::FlowMeshTradingApiOutcome outcome_policy{args.GetBoolArg("-flowmeshapioutcome", true)};
+            const auto clearing_ticks{args.GetIntArg("-flowmeshapiclearingticks", node::FLOWMESH_API_CLEARING_TICKS_DEFAULT)};
+            if (clearing_ticks < 0 || clearing_ticks > int64_t(flowmesh::MARKET_DATA_MAX_TICKS)) {
+                return InitError(Untranslated(strprintf("-flowmeshapiclearingticks must be between 0 and %u", flowmesh::MARKET_DATA_MAX_TICKS)));
+            }
+            const node::FlowMeshTradingApiTicks ticks_policy{size_t(clearing_ticks)};
+            const node::FlowMeshTradingApiObservedTime observed_policy{args.GetBoolArg("-flowmeshapiobservedtime", true)};
+            const auto candles{args.GetIntArg("-flowmeshapicandles", node::FLOWMESH_API_CANDLES_DEFAULT)};
+            if (candles < 0 || candles > int64_t(node::FLOWMESH_API_CANDLES_DEFAULT)) {
+                return InitError(Untranslated(strprintf("-flowmeshapicandles must be between 0 and %u", node::FLOWMESH_API_CANDLES_DEFAULT)));
+            }
+            const node::FlowMeshTradingApiCandles candles_policy{size_t(candles)};
+            node.flowmesh_api = node::MakeFlowMeshTradingApi(*node.flowmesh, std::move(options), flowmesh_metadata,
+                                                             action_wait_policy, health_policy, outcome_policy, watch_policy,
+                                                             ticks_policy, observed_policy, candles_policy);
             if (!node.flowmesh_api || !node.flowmesh_api->Start(flowmesh_error)) {
                 return InitError(Untranslated("FlowMesh HTTPS API failed to start: " + flowmesh_error));
             }
             LogInfo("FlowMesh restricted HTTPS trading API started on port %u", node.flowmesh_api->Port());
+            if (watch > 0 && *watchers > 0) {
+                LogInfo("FlowMesh restricted HTTPS trading API watches 'updates' for up to %d ms with %u watch slots", watch, *watchers);
+            }
         }
     } else {
         const auto urls{args.GetArgs("-flowmeshendpoint")};

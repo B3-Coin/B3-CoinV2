@@ -12,6 +12,7 @@
 #include <serialize.h>
 #include <uint256.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <ios>
 #include <optional>
@@ -303,6 +304,95 @@ inline std::optional<std::vector<ClearingEngine::Breakpoint>> MakeLimitAskCurve(
     if (price < 0 || price > MAX_MONEY || qty <= 0 || qty > MAX_MONEY) return std::nullopt;
     if (price == 0) return std::vector<ClearingEngine::Breakpoint>{{0, qty}};
     return std::vector<ClearingEngine::Breakpoint>{{price - 1, 0}, {price, qty}};
+}
+
+// ---- Ladder orders: several limit prices on one side, as ONE curve -----
+//
+// The engine keeps one curve per account and side, and a v1 curve holds
+// FLOWMESH_V1_MAX_CURVE_POINTS breakpoints. A ladder of up to four limit
+// prices is a staircase curve with one-tick drops, carried by the existing
+// SUBMIT_BID / SUBMIT_ASK action: no new action, signed format, rule or
+// fee. Like any submission it replaces the account's curve on that side,
+// and its quantity counts from zero.
+
+//! Most prices in one ladder: two breakpoints per price.
+inline constexpr size_t FLOWMESH_LADDER_MAX_STEPS{FLOWMESH_V1_MAX_CURVE_POINTS / 2};
+
+struct LadderStep {
+    CAmount price{0};
+    CAmount qty{0};
+    bool operator==(const LadderStep&) const = default;
+};
+
+namespace detail {
+inline bool LadderStepsValid(std::vector<LadderStep>& steps, const CAmount maximum_price)
+{
+    if (steps.empty() || steps.size() > FLOWMESH_LADDER_MAX_STEPS) return false;
+    std::sort(steps.begin(), steps.end(), [](const LadderStep& a, const LadderStep& b) { return a.price < b.price; });
+    CAmount total{0};
+    for (size_t i{0}; i < steps.size(); ++i) {
+        const auto& step{steps[i]};
+        if (step.price < 0 || step.price > maximum_price || step.qty <= 0 || step.qty > MAX_MONEY - total) return false;
+        if (i > 0 && steps[i - 1].price == step.price) return false;
+        total += step.qty;
+    }
+    return true;
+}
+inline void AddLadderPoint(std::vector<ClearingEngine::Breakpoint>& points, const CAmount price, const CAmount qty)
+{
+    if (!points.empty() && points.back().price == price) points.back().qty = qty;
+    else points.push_back({price, qty});
+}
+} // namespace detail
+
+//! BUY each step's quantity at its price or below: demand is the sum of the
+//! steps priced at or above p. Distinct prices below MAX_MONEY, positive
+//! quantities, at most FLOWMESH_LADDER_MAX_STEPS; one step is exactly
+//! MakeLimitBidCurve. Its reservation is exactly the sum of quantity x price
+//! (LadderReservation), as separate limit orders would reserve.
+inline std::optional<std::vector<ClearingEngine::Breakpoint>> MakeLadderBidCurve(std::vector<LadderStep> steps)
+{
+    if (!detail::LadderStepsValid(steps, MAX_MONEY - 1)) return std::nullopt;
+    CAmount total{0};
+    for (const auto& step : steps) total += step.qty;
+    std::vector<ClearingEngine::Breakpoint> points;
+    for (const auto& step : steps) {
+        detail::AddLadderPoint(points, step.price, total);
+        total -= step.qty;
+        detail::AddLadderPoint(points, step.price + 1, total);
+    }
+    return points;
+}
+
+//! SELL each step's quantity at its price or above: supply is the sum of
+//! the steps priced at or below p. A step at price 0 sells at any price, as
+//! MakeLimitAskCurve(0, q) does; one step is exactly MakeLimitAskCurve.
+inline std::optional<std::vector<ClearingEngine::Breakpoint>> MakeLadderAskCurve(std::vector<LadderStep> steps)
+{
+    if (!detail::LadderStepsValid(steps, MAX_MONEY)) return std::nullopt;
+    CAmount total{0};
+    std::vector<ClearingEngine::Breakpoint> points;
+    for (const auto& step : steps) {
+        if (step.price > 0) detail::AddLadderPoint(points, step.price - 1, total);
+        total += step.qty;
+        detail::AddLadderPoint(points, step.price, total);
+    }
+    return points;
+}
+
+//! What a valid ladder reserves when submitted: B3 atoms (the sum of
+//! quantity x price) for a bid, base units (the sum of quantities) for an
+//! ask; nullopt for an invalid ladder or one beyond MAX_MONEY, which the
+//! engine would refuse.
+inline std::optional<CAmount> LadderReservation(const bool bid, std::vector<LadderStep> steps)
+{
+    if (!detail::LadderStepsValid(steps, bid ? MAX_MONEY - 1 : MAX_MONEY)) return std::nullopt;
+    util::Unsigned128 total{0};
+    for (const auto& step : steps) {
+        total += static_cast<util::Unsigned128>(step.qty) * static_cast<util::Unsigned128>(bid ? step.price : 1);
+        if (total > static_cast<util::Unsigned128>(MAX_MONEY)) return std::nullopt;
+    }
+    return static_cast<CAmount>(total);
 }
 
 } // namespace flowmesh

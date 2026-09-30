@@ -4,9 +4,16 @@
 
 #include <node/flowmesh_timing.h>
 #include <node/flowmesh_runtime.h>
+#include <node/flowmesh_action_pool.h>
+#include <node/flowmesh_observed_time_log.h>
+#include <node/flowmesh_recent_window.h>
+#include <node/flowmesh_seat_evidence_recorder.h>
 
 #include <crypto/common.h>
+#include <flowmesh/market_view.h>
+#include <flowmesh/observed_time.h>
 #include <hash.h>
+#include <logging.h>
 #include <random.h>
 #include <serialize.h>
 #include <streams.h>
@@ -25,15 +32,25 @@
 namespace node {
 namespace {
 
-constexpr flowmesh::WirePeerId LOCAL_ACTION_PEER{
-    std::numeric_limits<flowmesh::WirePeerId>::min()};
+constexpr flowmesh::WirePeerId LOCAL_ACTION_PEER{FLOWMESH_LOCAL_ACTION_PEER};
 constexpr size_t MAX_RUNTIME_CANDIDATES_PER_SEQUENCE{8};
+// Local drop notices per commit; further drops are only counted by the pool.
+constexpr size_t MAX_LOCAL_DROP_NOTICES{256};
+// Local relay policy, never consensus: an ACTION frame may carry a sender
+// head up to this many slots ahead of or behind this node's head. Behind
+// needs a proof from this node's recent certified window.
+constexpr uint64_t ACTION_HEADER_AHEAD{2};
+constexpr uint64_t ACTION_HEADER_BEHIND{2};
 constexpr size_t MAX_PENDING_MARKET_ADDITIONS{1'024};
 constexpr size_t MAX_CATCHUP_COMMANDS{64};
 constexpr size_t MAX_ACTIVE_CATCHUPS{16};
 constexpr size_t MAX_CATCHUP_COOLDOWNS{256};
 constexpr size_t MAX_CATCHUP_PROFILES{256};
 constexpr size_t MAX_DISCOVERY_PEERS{256};
+// Health observation only: at most one runtime health snapshot per interval
+// from the worker's tick, and the tracked connected-peer set's safety bound.
+constexpr auto HEALTH_PUBLISH_INTERVAL{std::chrono::milliseconds{250}};
+constexpr size_t MAX_HEALTH_CONNECTED_PEERS{4096};
 // At the service's 250 ms tick, leave half of the 16/s control budget
 // available for catch-up requests/responses rather than starving them.
 constexpr size_t MAX_ANNOUNCEMENTS_PER_TICK{2};
@@ -90,370 +107,6 @@ std::string CatchupDetails(const uint16_t requested, const uint32_t requested_by
            " received_bytes=" + std::to_string(received_bytes) +
            " elapsed_ms=" + std::to_string(elapsed_ms);
 }
-
-class RuntimeActionPool
-{
-public:
-    using Verifier = std::function<bool(const flowmesh::Action&)>;
-
-    void SetVerifier(Verifier verifier) { m_verifier = std::move(verifier); }
-
-    bool Add(const flowmesh::Action& action,
-             const flowmesh::WirePeerId origin,
-             const flowmesh::WireClock::time_point now)
-    {
-        if (!action.ShapeIsCanonical() || !m_verifier || !m_verifier(action)) {
-            return false;
-        }
-        const uint256 id{action.Id()};
-        if (m_actions.count(id) != 0) return false;
-        const size_t bytes{static_cast<size_t>(::GetSerializeSize(action))};
-        if (m_actions.size() >= flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_COUNT ||
-            bytes > flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_BYTES ||
-            m_bytes > flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_BYTES - bytes) {
-            return false;
-        }
-        if (origin != LOCAL_ACTION_PEER) {
-            const Usage& usage{m_peer_usage[origin]};
-            if (usage.count >=
-                    flowmesh::FLOWMESH_ACTION_POOL_PER_PEER_MARKET_COUNT ||
-                bytes > flowmesh::FLOWMESH_ACTION_POOL_PER_PEER_MARKET_BYTES ||
-                usage.bytes >
-                    flowmesh::FLOWMESH_ACTION_POOL_PER_PEER_MARKET_BYTES -
-                        bytes) {
-                return false;
-            }
-        }
-        if (action.IsDeposit()) {
-            if (m_deposits.count(action.outpoint) != 0) return false;
-        } else if (m_signed.count({action.signer, action.sequence}) != 0) {
-            return false;
-        }
-        m_actions.emplace(id, StoredAction{action});
-        m_origins.emplace(id, origin);
-        m_bytes += bytes;
-        if (origin != LOCAL_ACTION_PEER) {
-            Usage& usage{m_peer_usage[origin]};
-            ++usage.count;
-            usage.bytes += bytes;
-        }
-        if (action.IsDeposit()) {
-            m_deposits.emplace(action.outpoint, id);
-        } else {
-            m_signed.emplace(std::make_pair(action.signer, action.sequence), id);
-        }
-        if (origin == LOCAL_ACTION_PEER) {
-            m_local_retries.push_back(id);
-            m_actions.at(id).local_retry = LocalRetry{
-                now + FlowMeshLocalActionRelayBudget::REPEAT_DELAY,
-                std::prev(m_local_retries.end())};
-        }
-        return true;
-    }
-
-    // Only local admission creates a retry obligation. The list owns IDs,
-    // never another copy of the action, and Drop removes its entry atomically.
-    // Unlike received duplicate envelopes, this local obligation survives a
-    // certified-head change. The signed action/outpoint is never rewritten.
-    std::optional<flowmesh::WireMessage> PrepareLocalRetry(
-        const flowmesh::WireHeader& header, const flowmesh::FlowMeshState& state,
-        const flowmesh::DepositVerifier* deposits, const flowmesh::AnchorRef& anchor,
-        const flowmesh::WireClock::time_point now, size_t& scanned)
-    {
-        const size_t maximum{m_local_retries.size()};
-        for (size_t visited{0}; visited < maximum && !m_local_retries.empty() &&
-             scanned < FlowMeshLocalActionRelayBudget::MAX_ACTIONS_SCANNED; ++visited) {
-            ++scanned;
-            auto& stored{m_actions.at(m_local_retries.front())};
-            if (!StillPending(stored.action, state) || !m_verifier ||
-                !stored.action.ShapeIsCanonical()) {
-                RemoveLocalRetry(stored);
-                continue;
-            }
-            if (now < stored.local_retry->next_attempt) {
-                m_local_retries.splice(m_local_retries.end(), m_local_retries,
-                                       m_local_retries.begin());
-                continue;
-            }
-            if (!m_verifier(stored.action)) {
-                RemoveLocalRetry(stored);
-                continue;
-            }
-            if (stored.action.IsDeposit() &&
-                (deposits == nullptr || !deposits->GetDeposit(stored.action.outpoint, anchor))) {
-                // Missing anchored facts are not authorization to advertise a
-                // deposit, but can become available later. Pace rechecks too.
-                CompleteLocalRetry(now);
-                continue;
-            }
-            const auto payload{flowmesh::EncodeProductionActionPayload(stored.action)};
-            if (!payload) {
-                RemoveLocalRetry(stored);
-                continue;
-            }
-            return flowmesh::WireMessage{flowmesh::WireMessageKind::ACTION,
-                                         header, *payload};
-        }
-        return std::nullopt;
-    }
-
-    void CompleteLocalRetry(const flowmesh::WireClock::time_point now)
-    {
-        auto& stored{m_actions.at(m_local_retries.front())};
-        stored.local_retry->next_attempt = now + FlowMeshLocalActionRelayBudget::REPEAT_DELAY;
-        m_local_retries.splice(m_local_retries.end(), m_local_retries,
-                               m_local_retries.begin());
-    }
-
-    std::optional<std::vector<flowmesh::Action>> EvidenceFor(
-        const std::span<const flowmesh::Action> semantic_actions) const
-    {
-        std::vector<flowmesh::Action> out;
-        out.reserve(semantic_actions.size());
-        for (const flowmesh::Action& semantic : semantic_actions) {
-            const auto it{m_actions.find(semantic.Id())};
-            if (it == m_actions.end()) return std::nullopt;
-            flowmesh::Action stripped{it->second.action};
-            stripped.credential.clear();
-            const auto semantic_bytes{
-                flowmesh::EncodeProductionActionPayload(semantic)};
-            const auto stripped_bytes{
-                flowmesh::EncodeProductionActionPayload(stripped)};
-            if (!semantic_bytes || !stripped_bytes ||
-                *semantic_bytes != *stripped_bytes) {
-                return std::nullopt;
-            }
-            out.push_back(it->second.action);
-        }
-        return out;
-    }
-
-    size_t Size() const { return m_actions.size(); }
-
-    bool ContainsExact(const flowmesh::Action& action) const
-    {
-        const auto it{m_actions.find(action.Id())};
-        if (it == m_actions.end()) return false;
-        return flowmesh::EncodeProductionActionPayload(action) ==
-               flowmesh::EncodeProductionActionPayload(it->second.action);
-    }
-
-    std::vector<flowmesh::Action> Select(
-        const flowmesh::FlowMeshState& state, const size_t maximum) const
-    {
-        std::vector<flowmesh::Action> out;
-        out.reserve(std::min(maximum, m_actions.size()));
-        for (const auto& [outpoint, id] : m_deposits) {
-            if (out.size() >= maximum) return out;
-            if (!state.DepositConsumed(outpoint)) out.push_back(m_actions.at(id).action);
-        }
-        const flowmesh::AccountId* signer_before{nullptr};
-        uint64_t expected{0};
-        for (const auto& [key, id] : m_signed) {
-            if (out.size() >= maximum) return out;
-            const auto& [signer, sequence]{key};
-            if (signer_before == nullptr || *signer_before != signer) {
-                signer_before = &key.first;
-                expected = state.NextSequence(signer);
-            }
-            if (sequence != expected) continue;
-            out.push_back(m_actions.at(id).action);
-            ++expected;
-        }
-        return out;
-    }
-
-    // Admit an obligation only for an incoming exact authenticated duplicate.
-    // Action::Id deliberately excludes credentials, so compare full bytes.
-    bool QueueDuplicateForward(const flowmesh::Action& action,
-                               const flowmesh::WireMessage& message,
-                               const flowmesh::WirePeerId peer,
-                               const flowmesh::FlowMeshState& state,
-                               const flowmesh::WireClock::time_point now)
-    {
-        const auto found{m_actions.find(action.Id())};
-        if (found == m_actions.end() || !action.ShapeIsCanonical() ||
-            !m_verifier || !m_verifier(action) || !StillPending(action, state)) return false;
-        auto& stored{found->second};
-        const auto bytes{flowmesh::EncodeProductionActionPayload(stored.action)};
-        if (!bytes || *bytes != message.payload) return false;
-        if (stored.forward) return true; // coalesce without changing FIFO order/origin
-        if (stored.last_forward_attempt &&
-            now < *stored.last_forward_attempt + FlowMeshDuplicateActionRelayBudget::REPEAT_DELAY) return false;
-        m_pending_forwards.push_back(found->first);
-        stored.forward = PendingForward{message.header, peer,
-                                        std::prev(m_pending_forwards.end())};
-        return true;
-    }
-
-    bool HasPendingForwards() const { return !m_pending_forwards.empty(); }
-
-    // Invalid/stale obligations are removed. A valid front remains in place
-    // until its complete frame fits the shared budget, preventing tail loss.
-    std::optional<flowmesh::WireMessage> PrepareDuplicateForward(
-        const flowmesh::WireHeader& expected,
-        const flowmesh::FlowMeshState& state,
-        flowmesh::WirePeerId& exclude_peer)
-    {
-        if (m_pending_forwards.empty()) return std::nullopt;
-        auto& stored{m_actions.at(m_pending_forwards.front())};
-        if (!(stored.forward->header == expected) ||
-            !StillPending(stored.action, state) || !m_verifier ||
-            !m_verifier(stored.action)) {
-            RemoveForward(stored);
-            return std::nullopt;
-        }
-        const auto payload{flowmesh::EncodeProductionActionPayload(stored.action)};
-        if (!payload) {
-            RemoveForward(stored);
-            return std::nullopt;
-        }
-        exclude_peer = stored.forward->peer;
-        return flowmesh::WireMessage{flowmesh::WireMessageKind::ACTION,
-                                     stored.forward->header, *payload};
-    }
-
-    void CompleteDuplicateForward(const flowmesh::WireClock::time_point now)
-    {
-        auto& stored{m_actions.at(m_pending_forwards.front())};
-        stored.last_forward_attempt = now;
-        RemoveForward(stored);
-    }
-
-    void ClearDuplicateForwards()
-    {
-        while (!m_pending_forwards.empty()) {
-            RemoveForward(m_actions.at(m_pending_forwards.front()));
-        }
-    }
-
-    void Prune(const flowmesh::FlowMeshState& state)
-    {
-        for (auto it{m_deposits.begin()}; it != m_deposits.end();) {
-            if (!state.DepositConsumed(it->first)) {
-                ++it;
-                continue;
-            }
-            Drop(it->second);
-            it = m_deposits.erase(it);
-        }
-        for (auto it{m_signed.begin()}; it != m_signed.end();) {
-            if (it->first.second >= state.NextSequence(it->first.first)) {
-                ++it;
-                continue;
-            }
-            Drop(it->second);
-            it = m_signed.erase(it);
-        }
-    }
-
-    /**
-     * A certified execution is a terminal disposition for every action in
-     * its body, including a deposit rejected by the anchored chain-state
-     * verifier. Remove those exact actions so an invalid deposit cannot be
-     * proposed and certified forever while producing empty effects.
-     */
-    void DropCertified(std::span<const flowmesh::Action> actions)
-    {
-        for (const flowmesh::Action& action : actions) {
-            const uint256 id{action.Id()};
-            if (m_actions.count(id) == 0) continue;
-            if (action.IsDeposit()) {
-                const auto deposit{m_deposits.find(action.outpoint)};
-                if (deposit != m_deposits.end() && deposit->second == id) {
-                    m_deposits.erase(deposit);
-                }
-            } else {
-                const auto key{std::make_pair(action.signer,
-                                              action.sequence)};
-                const auto signed_action{m_signed.find(key)};
-                if (signed_action != m_signed.end() &&
-                    signed_action->second == id) {
-                    m_signed.erase(signed_action);
-                }
-            }
-            Drop(id);
-        }
-    }
-
-    // Shared by retained local retries and local queue items whose transport
-    // header aged while a higher-priority certificate advanced this state.
-    static bool StillPending(const flowmesh::Action& action,
-                             const flowmesh::FlowMeshState& state)
-    {
-        return action.IsDeposit() ? !state.DepositConsumed(action.outpoint)
-                                  : action.sequence >= state.NextSequence(action.signer);
-    }
-
-private:
-    struct PendingForward {
-        flowmesh::WireHeader header;
-        flowmesh::WirePeerId peer;
-        std::list<uint256>::iterator position;
-    };
-    struct LocalRetry {
-        flowmesh::WireClock::time_point next_attempt;
-        std::list<uint256>::iterator position;
-    };
-    struct StoredAction {
-        flowmesh::Action action;
-        std::optional<flowmesh::WireClock::time_point> last_forward_attempt{};
-        std::optional<PendingForward> forward{};
-        std::optional<LocalRetry> local_retry{};
-    };
-
-    void RemoveLocalRetry(StoredAction& stored)
-    {
-        if (!stored.local_retry) return;
-        m_local_retries.erase(stored.local_retry->position);
-        stored.local_retry.reset();
-    }
-
-    void RemoveForward(StoredAction& stored)
-    {
-        if (!stored.forward) return;
-        m_pending_forwards.erase(stored.forward->position);
-        stored.forward.reset();
-    }
-
-    void Drop(const uint256& id)
-    {
-        const auto it{m_actions.find(id)};
-        if (it == m_actions.end()) return;
-        const size_t bytes{static_cast<size_t>(::GetSerializeSize(it->second.action))};
-        m_bytes -= bytes;
-        const auto origin{m_origins.find(id)};
-        if (origin != m_origins.end()) {
-            if (origin->second != LOCAL_ACTION_PEER) {
-                auto usage{m_peer_usage.find(origin->second)};
-                if (usage != m_peer_usage.end()) {
-                    --usage->second.count;
-                    usage->second.bytes -= bytes;
-                    if (usage->second.count == 0) m_peer_usage.erase(usage);
-                }
-            }
-            m_origins.erase(origin);
-        }
-        RemoveForward(it->second);
-        RemoveLocalRetry(it->second);
-        m_actions.erase(it);
-    }
-
-    struct Usage {
-        size_t count{0};
-        size_t bytes{0};
-    };
-
-    Verifier m_verifier;
-    std::map<uint256, StoredAction> m_actions;
-    std::list<uint256> m_pending_forwards; // one ID, no payload, per stored action
-    std::list<uint256> m_local_retries; // local origin only; one ID per stored action
-    std::map<uint256, flowmesh::WirePeerId> m_origins;
-    std::map<flowmesh::WirePeerId, Usage> m_peer_usage;
-    std::map<COutPoint, uint256> m_deposits;
-    std::map<std::pair<flowmesh::AccountId, uint64_t>, uint256> m_signed;
-    size_t m_bytes{0};
-};
 
 bool SameSeatIdentity(const flowmesh::ActiveFnBlsSeatSet& a,
                       const flowmesh::ActiveFnBlsSeatSet& b)
@@ -542,10 +195,23 @@ struct FlowMeshRuntime::Market {
     static constexpr size_t RECENT_DURABLE_ENTRIES{8};
     std::deque<std::pair<uint64_t, uint256>> recent_durable;
     uint256 certified_state_root;
-    std::optional<flowmesh::ProductionCertifiedEnvelope> client_head;
+    //! Shared with the newest item of `recent`: one copy, counted once.
+    std::shared_ptr<const flowmesh::ProductionCertifiedEnvelope> client_head;
     size_t client_head_seat_count{0};
+    //! This runtime's own most recent certified entries and re-execution
+    //! records (memory only; see FlowMeshRecentCertifiedWindow).
+    FlowMeshRecentCertifiedWindow recent;
+    FlowMeshRecentWindowLimits recent_limits;
     flowmesh::ClientEventLog& client_events;
     std::optional<int64_t> local_observed_at;
+    // Operator-observed time, display only: nothing here decides anything.
+    // The log, the caught-up observation behind its warm-up, the highest
+    // slot that waited for B3 reconciliation, and the current acceptable
+    // anchor height as the maintenance tick last sampled it.
+    std::shared_ptr<FlowMeshObservedTimeLog> observed;
+    flowmesh::ObservedWarmup observed_warmup;
+    std::optional<uint64_t> observed_deferred_watermark;
+    std::optional<int32_t> observed_anchor_height;
     FlowMeshProductionStore* store{nullptr};
     const flowmesh::DepositVerifier* deposits{nullptr};
     FlowMeshRuntimeChain* chain{nullptr};
@@ -575,7 +241,121 @@ struct FlowMeshRuntime::Market {
     };
     std::map<uint256, AgreementForward> agreement_forwarded;
 
-    RuntimeActionPool pool;
+    FlowMeshActionPool pool;
+    //! ActionIds this node's own wallet RPC or GUI queued (NODE origin), at
+    //! most NODE_ORIGIN_ACTIONS, oldest evicted first. Their worker-recheck
+    //! and pool-drop notices go to the NODE notice ring; every other queued
+    //! local action's go to the PUBLIC ring. Only NODE-origin submissions
+    //! add here, so public API traffic can never fill it.
+    static constexpr size_t NODE_ORIGIN_ACTIONS{1024};
+    std::deque<uint256> node_origin_order;
+    std::set<uint256> node_origin;
+    void NoteNodeOrigin(const uint256& id)
+    {
+        if (!node_origin.insert(id).second) return;
+        node_origin_order.push_back(id);
+        if (node_origin_order.size() > NODE_ORIGIN_ACTIONS) {
+            node_origin.erase(node_origin_order.front());
+            node_origin_order.pop_front();
+        }
+    }
+    flowmesh::ClientNoticeOrigin NoticeOrigin(const uint256& id) const
+    {
+        return node_origin.contains(id) ? flowmesh::ClientNoticeOrigin::NODE : flowmesh::ClientNoticeOrigin::PUBLIC;
+    }
+    //! The requesting identity that first queued each PUBLIC-origin action
+    //! (see ClientActionNotice::submitter), only while the action is live
+    //! here: a frame of it is queued for the worker, or the pool holds it. A
+    //! later submission of the same bytes never moves it. It is forgotten
+    //! once the action's last queued frame is handled (or refused by the
+    //! queue) while the pool does not hold it, and when the pool drops it
+    //! (certified or pruned), so only live actions count against the bound
+    //! below. The action's worker-recheck and pool-drop notices count against
+    //! that identity's share of the PUBLIC ring.
+    //! At most PUBLIC_SUBMITTER_ACTIONS live actions are remembered; past
+    //! that, IdentityShares picks the one forgotten (its notices then count
+    //! as of unknown identity). An identity within its share
+    //! (CLIENT_NOTICE_PER_SUBMITTER) keeps its attributions unless more than
+    //! PUBLIC_SUBMITTER_ACTIONS / CLIENT_NOTICE_PER_SUBMITTER identities hold
+    //! live actions, as for the ring itself.
+    static constexpr size_t PUBLIC_SUBMITTER_ACTIONS{flowmesh::CLIENT_NOTICE_CAPACITY};
+    struct PublicSubmission {
+        uint64_t serial{0};
+        //! Frames of the action counted as queued and not yet handled.
+        uint32_t frames{0};
+    };
+    uint64_t public_submission_serial{0};
+    std::map<uint256, PublicSubmission> public_submissions;
+    std::map<uint64_t, uint256> public_submission_ids;
+    flowmesh::IdentityShares public_submitters{PUBLIC_SUBMITTER_ACTIONS, flowmesh::CLIENT_NOTICE_PER_SUBMITTER};
+    /** A PUBLIC frame of `id` from `submitter` is about to be queued. True
+     * when it was counted: the caller then queues it marked counted
+     * (QueuedWireMessage::counted) and settles it with PublicFrameDone if
+     * the queue refuses it; the worker settles every counted frame it takes,
+     * and only those. */
+    bool NotePublicFrame(const uint256& id, const std::string& submitter)
+    {
+        auto it{public_submissions.find(id)};
+        if (it == public_submissions.end()) {
+            if (submitter.empty()) return false;
+            const uint64_t serial{++public_submission_serial};
+            // Both maps first and IdentityShares last, which either records
+            // the serial or changes nothing: if anything here throws, this
+            // entry is removed again, so every serial IdentityShares holds
+            // keeps its entries in both maps.
+            it = public_submissions.emplace(id, PublicSubmission{.serial = serial}).first;
+            std::optional<uint64_t> dropped;
+            try {
+                public_submission_ids.emplace(serial, id);
+                dropped = public_submitters.Insert(serial, submitter);
+            } catch (...) {
+                public_submission_ids.erase(serial);
+                public_submissions.erase(it);
+                throw;
+            }
+            // Never the entry just added (IdentityShares::Insert); a serial
+            // without entries is only forgotten.
+            if (dropped) {
+                if (const auto gone{public_submission_ids.find(*dropped)}; gone != public_submission_ids.end()) {
+                    public_submissions.erase(gone->second);
+                    public_submission_ids.erase(gone);
+                }
+            }
+        }
+        if (it->second.frames < std::numeric_limits<uint32_t>::max()) ++it->second.frames;
+        return true;
+    }
+    //! One counted frame of `id` left the queue: handled by the worker, or
+    //! refused by the queue.
+    void PublicFrameDone(const uint256& id)
+    {
+        const auto it{public_submissions.find(id)};
+        if (it == public_submissions.end()) return;
+        if (it->second.frames > 0) --it->second.frames;
+        if (it->second.frames == 0 && !pool.Contains(id)) ForgetPublicSubmitter(it);
+    }
+    //! The pool dropped `id` (certified or pruned).
+    void PublicActionDropped(const uint256& id)
+    {
+        const auto it{public_submissions.find(id)};
+        if (it != public_submissions.end() && it->second.frames == 0) ForgetPublicSubmitter(it);
+    }
+    void ForgetPublicSubmitter(const std::map<uint256, PublicSubmission>::iterator it)
+    {
+        public_submitters.Erase(it->second.serial);
+        public_submission_ids.erase(it->second.serial);
+        public_submissions.erase(it);
+    }
+    //! A queued action's notice: its ring and, for PUBLIC, its submitter.
+    void TagNotice(flowmesh::ClientActionNotice& notice) const
+    {
+        notice.origin = NoticeOrigin(notice.action_id);
+        notice.submitter.clear();
+        if (notice.origin != flowmesh::ClientNoticeOrigin::PUBLIC) return;
+        if (const auto it{public_submissions.find(notice.action_id)}; it != public_submissions.end()) {
+            if (const auto* identity{public_submitters.Identity(it->second.serial)}) notice.submitter = *identity;
+        }
+    }
     bool ready{true};
     bool paused{false};
     uint32_t round{0};
@@ -587,6 +367,12 @@ struct FlowMeshRuntime::Market {
     bool pending_handoff{false};
     FlowMeshRuntimeHalt halt{FlowMeshRuntimeHalt::NONE};
     std::string error;
+    // Health observation only; nothing reads these to decide anything. The
+    // last seat-transition pause reason (a fixed diagnostic literal), when
+    // this process last applied a head, and verified catch-up lag.
+    std::string pause_reason;
+    std::optional<flowmesh::WireClock::time_point> head_advanced_at;
+    FlowMeshLagTracker lag;
     std::optional<flowmesh::AnchorRef> previous_anchor;
     std::map<std::pair<int32_t, uint256>, uint64_t> committed_anchors;
     std::map<uint256, Candidate> candidates;
@@ -596,6 +382,19 @@ struct FlowMeshRuntime::Market {
     std::map<uint256, std::map<uint32_t, flowmesh::IndexedBlsSignature>>
         attestations;
     std::map<uint32_t, uint256> attested_hash_by_seat;
+    // Seat-misbehaviour evidence, information only: nothing reads these to
+    // decide anything. The store's records ever inserted and those it retains
+    // (newest first, with their ids), detections not recorded, seats whose
+    // equivocation at this slot was already handled, the check-and-write
+    // pace, and the recorder's verification work (observation only).
+    uint64_t seat_evidence_recorded{0};
+    std::shared_ptr<const std::vector<flowmesh::SeatEvidence>> seat_evidence;
+    std::set<uint256> seat_evidence_ids;
+    uint64_t seat_evidence_unrecorded{0};
+    std::set<uint32_t> seat_evidence_slot_seats;
+    flowmesh::WireClock::time_point seat_evidence_window{};
+    size_t seat_evidence_window_checks{0};
+    FlowMeshSeatEvidenceWork seat_evidence_work;
     std::optional<flowmesh::WireClock::time_point> last_announcement;
     flowmesh::WireClock::time_point next_announcement{};
     flowmesh::MarketDataRuntimeDiagnostics diagnostics;
@@ -618,7 +417,8 @@ struct FlowMeshRuntime::Market {
           next_sequence{config.next_sequence},
           next_effect_index{config.next_effect_index},
           last_hash{config.last_microblock_hash},
-          certified_state_root{config.state.Root()}, client_events{events}, store{config.store},
+          certified_state_root{config.state.Root()}, recent_limits{runtime_config.recent_window},
+          client_events{events}, observed{config.observed}, store{config.store},
           deposits{config.deposits}, chain{runtime_config.chain},
           keys{runtime_config.keys}, clock{runtime_config.clock},
           relay{&runtime_config.relay},
@@ -626,7 +426,8 @@ struct FlowMeshRuntime::Market {
           agreement_timeout_remaining{runtime_config.round_timeout},
           ready{config.readiness == FlowMeshRuntimeMarketReadiness::READY},
           paused{!ready},
-          round_started{runtime_config.clock->Now()}
+          round_started{runtime_config.clock->Now()},
+          lag{config.next_sequence}
     {
         delivery.market_id = market_id;
     }
@@ -690,7 +491,16 @@ struct WorkerTrace {
     uint64_t finish_lock_requested_us{0}, finish_locked_us{0};
     size_t queue_before{0}, queue_after{0}, queue_bytes{0}, control_depth{0};
     bool worker_processing{false}, worker_waiting{false}, tick_pending{false};
-    bool coalesced{false}, delivery_completion{false}, predicate_ready_before_wait{false};
+    // coalesced: an exact repeat of verified AGREEMENT bytes consumed at
+    // admission. certified_slot_consumed: a committee frame for a slot this
+    // worker has already appended, consumed at admission. Neither is queued.
+    // settled_rate_limited: either kind refused because the sender's
+    // separate budget for consumed frames is empty. refused_before_hash: a
+    // frame refused before its bytes were hashed, because no budget of the
+    // sender could admit it (or its framing is malformed).
+    bool coalesced{false}, certified_slot_consumed{false}, settled_rate_limited{false};
+    bool refused_before_hash{false};
+    bool delivery_completion{false}, predicate_ready_before_wait{false};
     std::optional<flowmesh::WireHeader> header;
     flowmesh::WireMessageKind kind{flowmesh::WireMessageKind::ACTION};
     std::optional<flowmesh::WirePeerId> peer;
@@ -751,6 +561,9 @@ struct WorkerTrace {
             row.pushKV("worker_waiting", worker_waiting);
             row.pushKV("tick_pending", tick_pending);
             row.pushKV("coalesced", coalesced);
+            row.pushKV("certified_slot_consumed", certified_slot_consumed);
+            row.pushKV("settled_rate_limited", settled_rate_limited);
+            row.pushKV("refused_before_hash", refused_before_hash);
             row.pushKV("delivery_completion", delivery_completion);
             if (header) {
                 row.pushKV("market_id", header->market_id.GetHex());
@@ -1125,10 +938,13 @@ std::optional<FlowMeshSeatTransition> CurrentSeatTransition(Market& market)
     case FlowMeshSeatTransitionKind::CONTINUE:
         if (transition.next_seats) break;
         market.paused = false;
+        market.pause_reason.clear();
         return transition;
     case FlowMeshSeatTransitionKind::PAUSED:
         if (transition.next_seats) break;
         market.paused = true;
+        market.pause_reason = transition.pause_reason.empty()
+            ? std::string{"seat_transition_paused"} : transition.pause_reason.substr(0, 64);
         return transition;
     case FlowMeshSeatTransitionKind::HANDOFF:
         if (transition.next_seats &&
@@ -1140,6 +956,7 @@ std::optional<FlowMeshSeatTransition> CurrentSeatTransition(Market& market)
             transition.next_seats->epoch == market.seats.epoch + 1 &&
             !SameSeatIdentity(*transition.next_seats, market.seats)) {
             market.paused = false;
+            market.pause_reason.clear();
             return transition;
         }
         break;
@@ -1576,6 +1393,7 @@ bool RestoreRetainedCandidate(Market& market)
     if (!market.pending_candidate_restore) return true;
     if (market.halt != FlowMeshRuntimeHalt::NONE) return false;
     market.paused = true;
+    market.pause_reason = "retained_candidate_restore";
     // Do not evaluate a saved candidate through the live production gate
     // until checkpoint/index reconciliation has finished. This also prevents
     // messages queued during startup from signing ahead of restoration.
@@ -1641,7 +1459,8 @@ bool RetainCandidateBeforeSigning(Market& market,
 template <typename Market>
 flowmesh::ClientEvent MakeClientActionEvent(Market& market, const flowmesh::ClientEventKind kind,
                                            const flowmesh::Action& action, std::string reason,
-                                           const flowmesh::ProductionEntryCore* certified)
+                                           const flowmesh::ProductionEntryCore* certified,
+                                           const flowmesh::ActionReasonCode code = flowmesh::ActionReasonCode::NONE)
 {
     flowmesh::ClientEvent event;
     event.market_id = market.market_id;
@@ -1657,15 +1476,98 @@ flowmesh::ClientEvent MakeClientActionEvent(Market& market, const flowmesh::Clie
         event.signed_action_hash = Hash(*bytes);
     }
     event.reason = std::move(reason);
+    event.reason_code = code;
     return event;
 }
 
 template <typename Market>
 void ClientActionEvent(Market& market, const flowmesh::ClientEventKind kind,
                        const flowmesh::Action& action, std::string reason = {},
-                       const flowmesh::ProductionEntryCore* certified = nullptr)
+                       const flowmesh::ProductionEntryCore* certified = nullptr,
+                       const flowmesh::ActionReasonCode code = flowmesh::ActionReasonCode::NONE)
 {
-    market.client_events.Append(MakeClientActionEvent(market, kind, action, std::move(reason), certified));
+    market.client_events.Append(MakeClientActionEvent(market, kind, action, std::move(reason), certified, code));
+}
+
+template <typename Market>
+FlowMeshLocalAdmission DecideLocal(const Market& market, const flowmesh::Action& action)
+{
+    // The ring is scanned only when the decision needs it (a used sequence
+    // or deposit), never on the common open-sequence path.
+    return FlowMeshDecideLocalAdmission(market.state, market.recent,
+        [&] { return market.client_events.ActionStatus(market.market_id, action.Id()); }, action);
+}
+
+template <typename Market>
+flowmesh::ClientActionNotice LocalNotice(const Market& market, const flowmesh::Action& action,
+                                         const FlowMeshLocalAdmission& admission,
+                                         const std::span<const unsigned char> payload)
+{
+    flowmesh::ClientActionNotice notice;
+    notice.market_id = market.market_id;
+    notice.action_id = action.Id();
+    notice.account_id = action.signer;
+    notice.account_sequence = action.sequence;
+    notice.action_type = action.type;
+    notice.signed_action_hash = Hash(payload);
+    notice.code = admission.code;
+    notice.next_account_sequence = admission.next_account_sequence;
+    notice.consumed_by = admission.consumer;
+    return notice;
+}
+
+//! Operator-observed time, display only (flowmesh_observed_time_log.h).
+//! How far past the local head an unverified deferred frame can move the
+//! deferral watermark.
+constexpr uint64_t OBSERVED_DEFERRAL_REACH{16};
+//! An entry anchored more than this many blocks behind the current
+//! acceptable anchor was proposed well before it was applied here.
+constexpr int32_t OBSERVED_ANCHOR_MARGIN{2};
+
+//! A slot at `sequence` waited for B3 reconciliation: its entry, when
+//! applied, is recorded as applied late. Never read by any decision.
+template <typename Market>
+void NoteObservedDeferral(Market& market, const uint64_t sequence)
+{
+    if (!market.observed) return;
+    const uint64_t reach{market.next_sequence > std::numeric_limits<uint64_t>::max() - OBSERVED_DEFERRAL_REACH
+                             ? std::numeric_limits<uint64_t>::max()
+                             : market.next_sequence + OBSERVED_DEFERRAL_REACH};
+    market.observed_deferred_watermark = std::max(market.observed_deferred_watermark.value_or(0), std::min(sequence, reach));
+}
+
+/** Records when this node applied the entry it just appended durably.
+ * Display only: it reads only observations (lag, the warm-up, the tick the
+ * append cached), never changes the market and never throws, so a failure
+ * here costs a gap in the times and nothing else. The tick is the store's
+ * newest cached one, an O(1) read under the store's own mutex. */
+template <typename Market>
+void RecordObservedTime(Market& market, const flowmesh::ProductionEntryCore& entry, const bool from_catchup) noexcept
+{
+    if (!market.observed) return;
+    try {
+        FlowMeshTimingSpan timing{"observed_time_record"};
+        const auto lag{market.lag.Summary()};
+        flowmesh::ObservedLivenessInputs inputs;
+        inputs.sequence = entry.sequence;
+        inputs.from_catchup = from_catchup;
+        inputs.deferred_watermark = market.observed_deferred_watermark;
+        inputs.proven_target = lag.proven_target;
+        inputs.anchor_stale = entry.sequence > 0 && market.observed_anchor_height &&
+                              entry.anchor.height < *market.observed_anchor_height - OBSERVED_ANCHOR_MARGIN;
+        inputs.warm = market.observed_warmup.Warm(market.clock->Now(), flowmesh::ObservedWarmupFor(market.round_timeout));
+        std::optional<flowmesh::ClearingTick> tick;
+        if (market.store) {
+            const auto page{market.store->ReadClearingTicks({std::nullopt, 1})};
+            if (page.available && !page.ticks.empty()) tick = page.ticks.back();
+        }
+        const auto stamp{market.observed->Record(entry.sequence, market.last_hash,
+                                                 flowmesh::ClassifyObservedLiveness(inputs), tick)};
+        timing.Field("sequence", entry.sequence);
+        timing.Field("mode", std::string{flowmesh::ObservedModeName(stamp.mode)});
+        timing.Field("delay", std::string{flowmesh::ObservedDelayName(stamp.delay)});
+    } catch (...) {
+    }
 }
 
 template <typename Market>
@@ -1705,6 +1607,7 @@ bool DeferCertifiedAnchorRejection(
     DeliveryEvent(market, "publication_deferred", flowmesh::WireMessageKind::CERTIFICATE,
                   entry.GetHash(), entry.sequence, std::nullopt,
                   "anchor validation interrupted by chain reconciliation", EntryTrace(entry));
+    NoteObservedDeferral(market, entry.sequence);
     return true;
 }
 
@@ -1712,7 +1615,9 @@ template <typename Market>
 bool CommitCertified(Market& market,
                      const flowmesh::ProductionCertifiedEnvelope& certified,
                      typename Market::Candidate& candidate,
-                     bool* reconciliation_deferred = nullptr)
+                     const std::pair<size_t, size_t> recent_others,
+                     bool* reconciliation_deferred = nullptr,
+                     const bool from_catchup = false)
 {
     if (reconciliation_deferred) *reconciliation_deferred = false;
     const uint64_t delivery_generation{market.chain->DeliveryGeneration()};
@@ -1728,11 +1633,13 @@ bool CommitCertified(Market& market,
             DeliveryEvent(market, "certificate_validation_deferred", flowmesh::WireMessageKind::CERTIFICATE,
                           certified.entry.GetHash(), certified.entry.sequence, std::nullopt,
                           "verified certificate interrupted before append", EntryTrace(certified.entry));
+            NoteObservedDeferral(market, certified.entry.sequence);
         }
         return false;
     }
     std::string error;
     std::optional<flowmesh::ProductionEntryCheck> validation_failure;
+    std::shared_ptr<const ProductionOutcomeRecord> outcome;
     DeliveryEvent(market, "publication_started", flowmesh::WireMessageKind::CERTIFICATE,
                   certified.entry.GetHash(), certified.entry.sequence, std::nullopt, {}, EntryTrace(certified.entry));
     if (certified.entry.kind == static_cast<uint8_t>(
@@ -1742,7 +1649,7 @@ bool CommitCertified(Market& market,
                 certified.entry, certified.certificate, market.seats,
                 market.state, AnchorContext(market),
                 market.treasury_owner_commitment, market.deposits, persisted,
-                error, &validation_failure) ||
+                error, &validation_failure, &outcome) ||
             persisted.Root() != candidate.next_state.Root()) {
             if (DeferCertifiedAnchorRejection(market, certified.entry,
                                               validation_failure, delivery_generation)) {
@@ -1787,7 +1694,7 @@ bool CommitCertified(Market& market,
                   market.last_hash, certified.entry.sequence, std::nullopt, {}, EntryTrace(certified.entry));
     TraceActions(market, "action_certified", certified.entry);
     market.certified_state_root = certified.entry.state_root;
-    market.client_head = certified;
+    market.client_head = std::make_shared<const flowmesh::ProductionCertifiedEnvelope>(certified);
     market.client_head_seat_count = market.seats.Size();
     // One append and one wakeup for the head and its inclusion events. A
     // woken client-action waiter still reads the payload through
@@ -1799,15 +1706,39 @@ bool CommitCertified(Market& market,
     head_event.kind = flowmesh::ClientEventKind::CERTIFIED_HEAD;
     head_event.microblock_sequence = certified.entry.sequence;
     head_event.microblock_hash = market.last_hash;
+    std::vector<std::pair<uint256, uint32_t>> ids;
+    ids.reserve(certified.entry.actions.size());
     for (const auto& action : certified.entry.actions) {
         committed_events.push_back(MakeClientActionEvent(
             market, flowmesh::ClientEventKind::CERTIFIED_INCLUDED, action,
             "semantic inclusion only; execution outcome not established by this event",
             &certified.entry));
+        ids.emplace_back(committed_events.back().action_id, static_cast<uint32_t>(ids.size()));
     }
+    // Publish the window item before the inclusion events: a waiter woken by
+    // CERTIFIED_INCLUDED always finds this entry and its record. A handoff
+    // has a payload and no record.
+    FlowMeshRecentCertifiedWindow::Item recent_item;
+    recent_item.sequence = certified.entry.sequence;
+    recent_item.epoch = certified.entry.epoch;
+    recent_item.hash = market.last_hash;
+    recent_item.envelope = market.client_head;
+    recent_item.seat_count = market.client_head_seat_count;
+    recent_item.payload_bytes = FlowMeshRecentCertifiedWindow::EstimatePayloadBytes(certified);
+    recent_item.ids = FlowMeshRecentCertifiedWindow::IndexIds(std::move(ids));
+    if (outcome && outcome->sequence == certified.entry.sequence && outcome->entry_hash == market.last_hash) {
+        recent_item.outcome = std::move(outcome);
+    }
+    market.recent.Push(std::move(recent_item), market.recent_limits, recent_others.first, recent_others.second);
     market.client_events.Append(std::move(committed_events));
     market.local_observed_at = GetTime();
+    // Display only, after the durable append; changes nothing below.
+    RecordObservedTime(market, certified.entry, from_catchup);
     ++market.next_sequence;
+    // Health observation only. Advancing the local head is the only way a
+    // proven lag ends; a commit never ends a lag episode by itself.
+    market.head_advanced_at = market.clock->Now();
+    market.lag.LocalAdvanced(market.next_sequence, *market.head_advanced_at);
     market.pool.ClearDuplicateForwards(); // never rewrite a queued retry to the new head
     market.next_effect_index += certified.entry.effect_count;
     market.previous_anchor = certified.entry.anchor;
@@ -1815,10 +1746,52 @@ bool CommitCertified(Market& market,
                               certified.entry.anchor.hash}] =
         certified.entry.sequence;
     market.pool.DropCertified(certified.entry.actions);
-    market.pool.Prune(market.state);
+    if (!market.public_submissions.empty()) {
+        for (const auto& action : certified.entry.actions) market.PublicActionDropped(action.Id());
+    }
+    // Local drop notices: a queued API-origin action whose sequence this
+    // entry consumed. The consumer is in this very entry: such an action was
+    // admitted while its sequence was open, and every commit prunes. Deposits
+    // are never reported: only the deposit itself can consume its outpoint,
+    // and DropCertified already removed it by id.
+    std::vector<flowmesh::ClientActionNotice> drops;
+    const auto* committed_item{market.recent.Find(certified.entry.sequence)};
+    if (committed_item && committed_item->hash != market.last_hash) committed_item = nullptr;
+    // Pruned public actions forget their submitters once their notices are
+    // tagged (at most PUBLIC_SUBMITTER_ACTIONS ids).
+    std::vector<uint256> pruned_public;
+    FlowMeshActionPool::DropObserver pruned;
+    if (!market.public_submissions.empty()) {
+        pruned = [&](const uint256& id) {
+            if (market.public_submissions.contains(id)) pruned_public.push_back(id);
+        };
+    }
+    for (const auto& dropped : market.pool.Prune(market.state, MAX_LOCAL_DROP_NOTICES, pruned)) {
+        flowmesh::ClientActionNotice& notice{drops.emplace_back()};
+        notice.market_id = market.market_id;
+        notice.action_id = dropped.Id();
+        notice.account_id = dropped.signer;
+        notice.account_sequence = dropped.sequence;
+        notice.action_type = dropped.type;
+        if (const auto bytes{flowmesh::EncodeProductionActionPayload(dropped)}) notice.signed_action_hash = Hash(*bytes);
+        notice.code = flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED;
+        notice.next_account_sequence = market.state.NextSequence(dropped.signer);
+        market.TagNotice(notice);
+        if (committed_item) {
+            if (const auto consumer{FlowMeshRecentCertifiedWindow::ConsumerIn(*committed_item, dropped.signer,
+                                                                               dropped.sequence)}) {
+                notice.consumed_by = flowmesh::ClientConsumerRef{consumer->action_id, consumer->microblock_sequence,
+                                                                 consumer->microblock_hash};
+            }
+        }
+    }
+    for (const auto& id : pruned_public) market.PublicActionDropped(id);
+    // After this commit's events, in one append.
+    if (!drops.empty()) market.client_events.AppendNotices(std::move(drops));
     market.candidates.clear();
     market.attestations.clear();
     market.attested_hash_by_seat.clear();
+    market.seat_evidence_slot_seats.clear();
     market.evidence_retry.reset();
     market.evidence_retry_eligible = false;
     const auto last_message_observed_at{market.diagnostics.last_message_observed_at};
@@ -2245,6 +2218,12 @@ void FlowMeshRuntime::DeferMessage(Market& market, const flowmesh::QueuedWireMes
     }
     m_deferred_messages.emplace(key, queued);
     m_deferred_deadlines.emplace(key, m_config.clock->Now() + std::chrono::seconds{60});
+    if (queued.message.kind == flowmesh::WireMessageKind::PROPOSAL ||
+        queued.message.kind == flowmesh::WireMessageKind::ATTESTATION ||
+        queued.message.kind == flowmesh::WireMessageKind::AGREEMENT ||
+        queued.message.kind == flowmesh::WireMessageKind::CERTIFICATE) {
+        NoteObservedDeferral(market, queued.message.header.sequence);
+    }
     m_deferred_bytes += bytes;
     market.delivery.deferred_bytes += bytes;
     ++market.delivery.deferred_objects;
@@ -2443,16 +2422,55 @@ void FlowMeshRuntime::ProcessDeliveryEvent(const FlowMeshDeliveryEvent& event)
     // Written is not remotely verified: retain while semantically relevant.
 }
 
+uint64_t FlowMeshRuntime::AdmissionHashCountForTest() const
+{
+    std::lock_guard<std::mutex> lock{m_queue_mutex};
+    return m_admission_hashes;
+}
+
+size_t FlowMeshRuntime::PublicSubmittersForTest(const flowmesh::MarketId& market_id) const
+{
+    std::lock_guard<std::mutex> lock{m_market_mutex};
+    const auto it{m_markets.find(market_id)};
+    return it == m_markets.end() ? 0 : it->second->public_submissions.size();
+}
+
+std::optional<std::string> FlowMeshRuntime::PublicSubmitterForTest(const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    std::lock_guard<std::mutex> lock{m_market_mutex};
+    const auto it{m_markets.find(market_id)};
+    if (it == m_markets.end()) return std::nullopt;
+    const auto entry{it->second->public_submissions.find(action_id)};
+    if (entry == it->second->public_submissions.end()) return std::nullopt;
+    const auto* identity{it->second->public_submitters.Identity(entry->second.serial)};
+    return identity ? std::optional<std::string>{*identity} : std::nullopt;
+}
+
+FlowMeshSeatEvidenceWork FlowMeshRuntime::SeatEvidenceWorkForTest() const
+{
+    std::lock_guard<std::mutex> lock{m_market_mutex};
+    FlowMeshSeatEvidenceWork out;
+    for (const auto& [id, market] : m_markets) {
+        (void)id;
+        out.checks += market->seat_evidence_work.checks;
+        out.chain_lookups += market->seat_evidence_work.chain_lookups;
+        out.seat_set_checks += market->seat_evidence_work.seat_set_checks;
+        out.signature_checks += market->seat_evidence_work.signature_checks;
+    }
+    return out;
+}
+
 std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshRuntime::DeliverySnapshots(
     const std::optional<flowmesh::MarketId> market_id) const
 {
     // Start() takes the queue lock before the market lock; never nest them
     // in the opposite order here.
-    std::map<flowmesh::MarketId, uint64_t> coalesced, consumed;
+    std::map<flowmesh::MarketId, uint64_t> coalesced, consumed, settled_limited;
     {
         std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
         for (const auto& [id, quiet] : m_agreement_quiet) coalesced.emplace(id, quiet.coalesced);
         for (const auto& [id, certified] : m_certified_admission) consumed.emplace(id, certified.consumed);
+        settled_limited = m_settled_rate_limited;
     }
     FlowMeshTimingSpan timing_lock_2250{__func__};
     timing_lock_2250.Field("lock_name", std::string{"market_mutex"});
@@ -2469,6 +2487,9 @@ std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshRuntime::DeliverySnapshots(
         }
         if (const auto count{consumed.find(id)}; count != consumed.end()) {
             out.back().certified_slot_frames_consumed = count->second;
+        }
+        if (const auto count{settled_limited.find(id)}; count != settled_limited.end()) {
+            out.back().settled_frames_rate_limited = count->second;
         }
         out.back().sampled_monotonic_us = TraceNow(*market->clock);
         out.back().trace_global_bytes = g_runtime_trace_bytes.load(std::memory_order_relaxed);
@@ -2579,6 +2600,12 @@ bool FlowMeshRuntime::InitializeMarket(
     // Publish after the WHOLE market validates: AddMarket may run on a live
     // service, and a failed initialization must not leak partial lookup events.
     std::deque<flowmesh::ClientEvent> restored_client_actions;
+    // The store's replayed re-execution records attach to the rebuilt recent
+    // window by exact (sequence, hash); a mismatch attaches nothing. Items
+    // are pushed as they are read, so the window's bounds apply throughout.
+    const auto replay_outcomes{config.store->TakeReplayOutcomes()};
+    auto replay_outcome{replay_outcomes.begin()};
+    const auto recent_others{RecentWindowOthers(*market)};
     uint256 previous_hash;
     uint64_t expected_effect_start{0};
     for (uint64_t sequence{0}; sequence < config.next_sequence; ++sequence) {
@@ -2610,9 +2637,38 @@ bool FlowMeshRuntime::InitializeMarket(
                 "restored semantic inclusion only; execution outcome not established by this event", &stored->entry));
         }
         if (sequence + 1 == config.next_sequence) {
-            market->client_head = flowmesh::ProductionCertifiedEnvelope{
-                stored->entry, stored->certificate};
+            market->client_head = std::make_shared<const flowmesh::ProductionCertifiedEnvelope>(
+                flowmesh::ProductionCertifiedEnvelope{stored->entry, stored->certificate});
             market->client_head_seat_count = historical_seats->Size();
+        }
+        // Rebuild the recent window from the reads this loop already makes:
+        // envelopes for the newest entries, bare items for the outcome tail.
+        const FlowMeshRecentWindowLimits& limits{market->recent_limits};
+        if (config.next_sequence - sequence <= std::max(limits.payload_entries, limits.outcome_entries)) {
+            FlowMeshRecentCertifiedWindow::Item item;
+            item.sequence = sequence;
+            item.epoch = stored->entry.epoch;
+            item.hash = previous_hash;
+            if (config.next_sequence - sequence <= limits.payload_entries) {
+                item.envelope = sequence + 1 == config.next_sequence
+                    ? market->client_head
+                    : std::make_shared<const flowmesh::ProductionCertifiedEnvelope>(
+                          flowmesh::ProductionCertifiedEnvelope{stored->entry, stored->certificate});
+                item.seat_count = historical_seats->Size();
+                item.payload_bytes = FlowMeshRecentCertifiedWindow::EstimatePayloadBytes(*item.envelope);
+                std::vector<std::pair<uint256, uint32_t>> ids;
+                ids.reserve(stored->entry.actions.size());
+                for (const auto& action : stored->entry.actions) {
+                    ids.emplace_back(action.Id(), static_cast<uint32_t>(ids.size()));
+                }
+                item.ids = FlowMeshRecentCertifiedWindow::IndexIds(std::move(ids));
+            }
+            while (replay_outcome != replay_outcomes.end() && (*replay_outcome)->sequence < sequence) ++replay_outcome;
+            if (replay_outcome != replay_outcomes.end() && (*replay_outcome)->sequence == sequence &&
+                (*replay_outcome)->entry_hash == item.hash) {
+                item.outcome = *replay_outcome;
+            }
+            market->recent.Push(std::move(item), limits, recent_others.first, recent_others.second);
         }
         if (sequence + 1 == config.next_sequence &&
             stored->entry.kind == static_cast<uint8_t>(
@@ -2645,7 +2701,9 @@ bool FlowMeshRuntime::InitializeMarket(
     }
     if (retained) {
         for (const flowmesh::Action& action : retained->evidence) {
-            if (!market->pool.Add(action, LOCAL_ACTION_PEER, market->clock->Now())) {
+            // Restored evidence is not an API submission: no notices.
+            if (market->pool.Add(action, LOCAL_ACTION_PEER, market->clock->Now(), {}) !=
+                flowmesh::ActionReasonCode::ADMITTED) {
                 error = "FlowMesh runtime retained action evidence no longer authenticates";
                 return false;
             }
@@ -2662,6 +2720,17 @@ bool FlowMeshRuntime::InitializeMarket(
         }
     }
     if (!InitializeAgreement(*market, config, error)) return false;
+    {
+        // Information only: unreadable evidence never blocks the market.
+        SeatEvidenceLog log;
+        std::string evidence_error;
+        if (config.store->ReadSeatEvidence(log, evidence_error)) {
+            SetSeatEvidence(*market, log);
+        } else {
+            LogWarning("FlowMesh market %s cannot read its seat-misbehaviour evidence: %s\n",
+                       config.market_id.GetHex(), evidence_error);
+        }
+    }
     RoundEntered(*market, "market_initialized");
     for (auto& event : restored_client_actions) m_client_events.Append(std::move(event));
     m_markets.emplace(config.market_id, std::move(market));
@@ -2981,6 +3050,7 @@ bool FlowMeshRuntime::Start(std::string& error)
         if (!InitializeMarkets(error)) return false;
         m_admitted_markets.clear();
         m_certified_admission.clear();
+        m_settled_rate_limited.clear();
         m_probe_markets.clear();
         m_peer_probe_cursors.clear();
         m_evidence_retry_budget = {};
@@ -2996,6 +3066,11 @@ bool FlowMeshRuntime::Start(std::string& error)
                 m_probe_markets.push_back(market_id);
             }
         }
+        // A health observation exists from Start on, so a missing or aging
+        // one always means a worker that has not ticked.
+        m_connected_peers.clear();
+        m_no_peers_since = m_config.clock->Now();
+        PublishHealth(*m_no_peers_since, 0, m_no_peers_since, /*force=*/true);
     }
     m_stopping = false;
     m_started = true;
@@ -3057,22 +3132,29 @@ void FlowMeshRuntime::Stop()
 flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     const flowmesh::WirePeerId peer, flowmesh::WireMessage message)
 {
+    return Enqueue(peer, std::move(message), /*counted=*/false);
+}
+
+flowmesh::QueueResult FlowMeshRuntime::Enqueue(
+    const flowmesh::WirePeerId peer, flowmesh::WireMessage message, const bool counted)
+{
     WorkerTrace trace{*m_config.clock, "wire_enqueue"};
     trace.Wire(message, peer);
     if (message.kind == flowmesh::WireMessageKind::AGREEMENT &&
         (message.payload.empty() || message.payload.size() > flowmesh::FLOWMESH_AGREEMENT_MAX_BYTES)) {
         return flowmesh::QueueResult::MALFORMED;
     }
-    // Hash outside the queue lock; a bounded frame is at most four MiB.
-    const std::optional<uint256> agreement_payload{
-        message.kind == flowmesh::WireMessageKind::AGREEMENT
-            ? std::optional<uint256>{Hash(message.payload)} : std::nullopt};
-    std::optional<uint256> certificate_entry;
-    if (message.kind == flowmesh::WireMessageKind::CERTIFICATE) {
-        if (const auto bytes{CertifiedEntryBytes(message.payload)}) certificate_entry = Hash(*bytes);
-    }
+    // An AGREEMENT's payload (up to 4 MiB) is hashed only when this market
+    // has verified agreement bytes on record, and a CERTIFICATE's entry
+    // bytes (up to 2 MiB) only when the record of recent appends holds an
+    // entry under this exact wire header. Either is hashed outside the queue
+    // lock and only while the sender could still be admitted (hash_unlocked
+    // below). A first copy of a new certificate is never hashed here.
+    const auto certificate_bytes{message.kind == flowmesh::WireMessageKind::CERTIFICATE
+        ? CertifiedEntryBytes(message.payload) : std::nullopt};
+    std::optional<uint256> agreement_payload, certificate_entry;
     if (trace.enabled) trace.queue_lock_requested_us = TraceNow(*m_config.clock);
-    std::lock_guard<std::mutex> lock{m_queue_mutex};
+    std::unique_lock<std::mutex> lock{m_queue_mutex};
     if (trace.enabled) {
         trace.queue_locked_us = TraceNow(*m_config.clock);
         trace.queue_before = trace.queue_after = m_queue.Size();
@@ -3090,6 +3172,67 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     if (m_admitted_markets.count(message.header.market_id) == 0) {
         return flowmesh::QueueResult::MARKET_LIMIT;
     }
+    // Both consumptions below take no committee token or queue slot, but
+    // still spend the sender's separate settled-frame budgets after the
+    // unchanged framing verdict: 256 burst and 64/s per peer and market, and
+    // 512 burst and 128/s per peer across all markets
+    // (BoundedWireQueue::ConsumeSettled). When either is empty the frame is
+    // refused RATE_LIMITED, as a committee frame is: FMN2 then holds that
+    // sender's critical channel and stops reading it, and legacy B3 carriage
+    // refuses the frame. A peer is one connection identity (legacy NodeId or
+    // FMN2 session id), so a reconnect or dual carriage gets a fresh budget.
+    // This bounds each such peer however many markets it uses, including
+    // unauthenticated legacy/dual B3 ingress, which has no FMN2 receive
+    // budget. It does not bound all peers together: on FMN2 only the shared
+    // critical receive bucket does, and a handful of flooding peers can still
+    // empty it (see FLOWMESH_SETTLED_PEER_TOKEN_BURST). With 4 validators an
+    // honest sender averaged 8-12 consumed frames per second per market; in
+    // steady state the per-peer budget binds once one sender's summed
+    // sustained settled rate exceeds 128/s, about 11 markets at 12/s. That
+    // sizing must be re-validated with more seats.
+    const auto consume_settled = [&] { // Caller holds m_queue_mutex.
+        const auto result{m_queue.ConsumeSettled(peer, message, m_config.clock->Now())};
+        if (result == flowmesh::QueueResult::RATE_LIMITED) ++m_settled_rate_limited[message.header.market_id];
+        if (trace.enabled) {
+            trace.result = result;
+            trace.settled_rate_limited = result == flowmesh::QueueResult::RATE_LIMITED;
+        }
+        return result;
+    };
+    // Hashing is admission's one costly step, and a refused FMN2 frame is
+    // offered again on every retry (100 ms..1 s backoff for up to 30 s).
+    // Before unlocking to hash, check without spending whether the sender
+    // still has a settled or a committee token that could admit this frame.
+    // If neither could, the frame is refused RATE_LIMITED unhashed, whatever
+    // its hash, and counted with the settled refusals (its settled budget is
+    // empty). Only one verdict moves: exact agreement bytes under a changed
+    // header, which the hash shows to be MALFORMED, are found so on a retry
+    // once a token is back. In every other case the result is the hashed
+    // path's. Returns the early result, or nullopt with `out` set and the
+    // lock held again.
+    const auto hash_unlocked = [&](const auto& bytes, std::optional<uint256>& out)
+        -> std::optional<flowmesh::QueueResult> { // Caller holds `lock`.
+        const auto admissible{m_queue.PeekSettledOrCommittee(peer, message, m_config.clock->Now())};
+        if (admissible != flowmesh::QueueResult::ACCEPTED) {
+            if (admissible == flowmesh::QueueResult::RATE_LIMITED) ++m_settled_rate_limited[message.header.market_id];
+            if (trace.enabled) {
+                trace.result = admissible;
+                trace.settled_rate_limited = admissible == flowmesh::QueueResult::RATE_LIMITED;
+                trace.refused_before_hash = true;
+            }
+            return admissible;
+        }
+        ++m_admission_hashes;
+        lock.unlock();
+        out = Hash(bytes);
+        lock.lock();
+        // Admission may have stopped, or the market been reset, meanwhile.
+        if (!m_started || m_stopping) return flowmesh::QueueResult::STOPPED;
+        if (m_admitted_markets.count(message.header.market_id) == 0) {
+            return flowmesh::QueueResult::MARKET_LIMIT;
+        }
+        return std::nullopt;
+    };
     // The agreement engine already verified and retained these exact bytes.
     // Another copy can add no vote or proof, but it used to spend one of the
     // sender's eight committee admissions per second and, once refused, hold
@@ -3097,6 +3240,12 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     // first proposal. Consume it here. A copy is let through again whenever
     // its recovery forward is due, and different bytes (such as a COMMIT
     // repeated with newly attached proof) are never matched.
+    if (message.kind == flowmesh::WireMessageKind::AGREEMENT) {
+        const auto quiet{m_agreement_quiet.find(message.header.market_id)};
+        if (quiet != m_agreement_quiet.end() && !quiet->second.payloads.empty()) {
+            if (const auto early{hash_unlocked(message.payload, agreement_payload)}) return *early;
+        }
+    }
     if (agreement_payload) {
         const auto quiet{m_agreement_quiet.find(message.header.market_id)};
         if (quiet != m_agreement_quiet.end()) {
@@ -3108,12 +3257,12 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
                 if (message.header != known->second.header) return flowmesh::QueueResult::MALFORMED;
                 if (known->second.header.sequence < quiet->second.sequence ||
                     m_config.clock->Now() < known->second.until) {
-                    ++quiet->second.coalesced;
-                    if (trace.enabled) {
-                        trace.result = flowmesh::QueueResult::ACCEPTED;
-                        trace.coalesced = true;
+                    const auto result{consume_settled()};
+                    if (result == flowmesh::QueueResult::ACCEPTED) {
+                        ++quiet->second.coalesced;
+                        if (trace.enabled) trace.coalesced = true;
                     }
-                    return flowmesh::QueueResult::ACCEPTED;
+                    return result;
                 }
             }
         }
@@ -3126,38 +3275,52 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     // already-durable duplicate HandleCertificate ignores. They still spent
     // the sender's eight committee admissions per second first and, once
     // refused, held that sender's critical channel (100 ms..1 s backoff) in
-    // front of its next slot's proposal and votes. Consume them here. Nothing
-    // is queued or processed for them, so no work bound moves; the framing
-    // verdict is unchanged, so a malformed frame still disconnects its sender.
-    // Every frame at or above the durably appended sequence, and every older
-    // certificate that is not byte-identical to a recorded append
-    // (CERTIFICATE_CONFLICT detection), still spends a committee token and
-    // takes the verified path.
-    if (message.kind == flowmesh::WireMessageKind::ATTESTATION ||
-        message.kind == flowmesh::WireMessageKind::AGREEMENT ||
-        message.kind == flowmesh::WireMessageKind::CERTIFICATE) {
+    // front of its next slot's proposal and votes. Consume them here, against
+    // the settled-frame budget above. Nothing is queued or processed for
+    // them; the framing verdict is unchanged, so a malformed frame still
+    // disconnects its sender. Every frame at or above the durably appended
+    // sequence, and every older certificate that is not byte-identical to a
+    // recorded append (CERTIFICATE_CONFLICT detection), still spends a
+    // committee token and takes the verified path.
+    //
+    // Cheap checks first, under the lock: a recorded append for this market,
+    // a sequence below the next one to append and, for a CERTIFICATE, a
+    // recorded entry under the same wire header. Only then, and only if the
+    // sender could still be admitted, are the entry bytes hashed, outside
+    // the lock, and the record consulted again.
+    enum class Settled { NO, YES, NEEDS_ENTRY_HASH };
+    const auto settled_slot = [&] { // Caller holds m_queue_mutex.
+        if (message.kind != flowmesh::WireMessageKind::ATTESTATION &&
+            message.kind != flowmesh::WireMessageKind::AGREEMENT &&
+            message.kind != flowmesh::WireMessageKind::CERTIFICATE) return Settled::NO;
         const auto certified{m_certified_admission.find(message.header.market_id)};
-        if (certified != m_certified_admission.end() &&
-            message.header.sequence < certified->second.next_sequence &&
-            (message.kind != flowmesh::WireMessageKind::CERTIFICATE ||
-             (certificate_entry &&
-              std::any_of(certified->second.entries.begin(), certified->second.entries.end(),
-                          [&](const auto& entry) {
-                              return entry.first == message.header && entry.second == *certificate_entry;
-                          })))) {
-            flowmesh::WireCheck check;
-            if (!flowmesh::EncodeWireMessage(message, check)) return flowmesh::QueueResult::MALFORMED;
-            ++certified->second.consumed;
-            if (trace.enabled) {
-                trace.result = flowmesh::QueueResult::ACCEPTED;
-                trace.coalesced = true;
-            }
-            return flowmesh::QueueResult::ACCEPTED;
+        if (certified == m_certified_admission.end() ||
+            message.header.sequence >= certified->second.next_sequence) return Settled::NO;
+        if (message.kind != flowmesh::WireMessageKind::CERTIFICATE) return Settled::YES;
+        if (!certificate_bytes) return Settled::NO;
+        for (const auto& [header, entry_hash] : certified->second.entries) {
+            if (header != message.header) continue;
+            if (!certificate_entry) return Settled::NEEDS_ENTRY_HASH;
+            if (entry_hash == *certificate_entry) return Settled::YES;
         }
+        return Settled::NO;
+    };
+    auto settled{settled_slot()};
+    if (settled == Settled::NEEDS_ENTRY_HASH) {
+        if (const auto early{hash_unlocked(*certificate_bytes, certificate_entry)}) return *early;
+        settled = settled_slot();
+    }
+    if (settled == Settled::YES) {
+        const auto result{consume_settled()};
+        if (result == flowmesh::QueueResult::ACCEPTED) {
+            ++m_certified_admission.at(message.header.market_id).consumed;
+            if (trace.enabled) trace.certified_slot_consumed = true;
+        }
+        return result;
     }
     if (trace.enabled) trace.enqueue_started_us = TraceNow(*m_config.clock);
     const auto result{m_queue.Push(peer, std::move(message),
-                                   m_config.clock->Now())};
+                                   m_config.clock->Now(), counted)};
     if (trace.enabled) {
         trace.enqueued_us = TraceNow(*m_config.clock);
         trace.result = result;
@@ -3210,6 +3373,8 @@ void FlowMeshRuntime::FlowMeshPeerConnected(const flowmesh::WirePeerId peer)
     if (m_discovery_peers.size() < MAX_DISCOVERY_PEERS) {
         m_discovery_peers.insert(peer);
     }
+    if (m_connected_peers.size() < MAX_HEALTH_CONNECTED_PEERS) m_connected_peers.insert(peer);
+    if (!m_connected_peers.empty()) m_no_peers_since.reset();
     // Coalesce concurrent handshakes. Announcements are still rate-limited
     // on the worker, so connection churn cannot create an unbounded queue.
     m_discovery_refresh = true;
@@ -3224,6 +3389,9 @@ void FlowMeshRuntime::FlowMeshPeerDisconnected(
     std::lock_guard<std::mutex> lock{m_queue_mutex};
     m_queue.RemovePeer(peer);
     m_discovery_peers.erase(peer);
+    if (m_connected_peers.erase(peer) != 0 && m_connected_peers.empty()) {
+        m_no_peers_since = m_config.clock->Now();
+    }
     std::erase_if(m_catchup_commands, [&](const CatchupCommand& command) {
         return command.peer == peer;
     });
@@ -3314,10 +3482,49 @@ std::vector<flowmesh::MarketId> FlowMeshRuntime::MarketIds() const
 flowmesh::QueueResult FlowMeshRuntime::SubmitLocalAction(
     const flowmesh::MarketId& market_id, const flowmesh::Action& action)
 {
+    const auto result{SubmitLocalActionChecked(market_id, action)};
+    if (result.queued) return *result.queued;
+    // Answered from certified state without queueing: an exact inclusion is
+    // an accepted submission; a refusal or unknown outcome is not.
+    return result.admission.kind == FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED
+               ? flowmesh::QueueResult::ACCEPTED : flowmesh::QueueResult::MARKET_LIMIT;
+}
+
+flowmesh::ClientEventCursor FlowMeshRuntime::ClientEventCursor() const
+{
+    return m_client_events.Cursor();
+}
+
+std::optional<flowmesh::ClientActionNotice> FlowMeshRuntime::NewestClientNotice(
+    const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    return m_client_events.NewestNotice(market_id, action_id);
+}
+
+std::optional<flowmesh::ClientActionNotice> FlowMeshRuntime::NewestClientNoticeIfNewer(
+    const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    return m_client_events.NewestNoticeIfNewer(market_id, action_id);
+}
+
+FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
+    const flowmesh::MarketId& market_id, const flowmesh::Action& action,
+    const flowmesh::ClientNoticeOrigin origin, const std::string& submitter)
+{
+    FlowMeshLocalSubmitResult out;
     const auto payload{flowmesh::EncodeProductionActionPayload(action)};
-    if (!payload) return flowmesh::QueueResult::MALFORMED;
+    if (!payload) {
+        out.queued = flowmesh::QueueResult::MALFORMED;
+        return out;
+    }
     flowmesh::WireMessage message;
     TraceContext trace;
+    std::optional<flowmesh::ClientActionNotice> notice;
+    uint256 domain, config_id;
+    const flowmesh::DepositVerifier* deposits{nullptr};
+    bool pooled{false};
+    // A queued frame counted towards its public submitter (NotePublicFrame).
+    bool counted{false};
     {
         FlowMeshTimingSpan timing_lock_3034{__func__};
         timing_lock_3034.Field("lock_name", std::string{"market_mutex"});
@@ -3327,19 +3534,106 @@ flowmesh::QueueResult FlowMeshRuntime::SubmitLocalAction(
         const auto it{m_markets.find(market_id)};
         if (it == m_markets.end() || !it->second->ready ||
             it->second->halt != FlowMeshRuntimeHalt::NONE) {
-            return flowmesh::QueueResult::MARKET_LIMIT;
+            out.queued = flowmesh::QueueResult::MARKET_LIMIT;
+            return out;
         }
-        message.kind = flowmesh::WireMessageKind::ACTION;
-        message.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market_id,
-                          it->second->seats.epoch,
-                          it->second->next_sequence};
-        message.payload = *payload;
-        trace.epoch = message.header.epoch;
-        trace.seat_set_hash = it->second->seats.set_hash;
+        // Decided in the existing first lock scope, before anything is
+        // queued: no extra lock and no Schnorr work under this mutex. Exact
+        // bytes this node already pools (for example relayed by a peer, which
+        // has neither the local sequence window nor the deposit facts check)
+        // are queued as before and keep the worker's duplicate answer: a
+        // pooled action may still execute, so it is never refused here.
+        pooled = it->second->pool.ContainsExact(action);
+        if (!pooled) out.admission = DecideLocal(*it->second, action);
+        const auto tag = [&](flowmesh::ClientActionNotice& value) {
+            value.origin = origin;
+            if (origin == flowmesh::ClientNoticeOrigin::PUBLIC) value.submitter = submitter;
+        };
+        if (out.admission.kind != FlowMeshLocalAdmission::Kind::ENQUEUE) {
+            notice = LocalNotice(*it->second, action, out.admission, *payload);
+            tag(*notice);
+            domain = it->second->domain;
+            config_id = it->second->state.ConfigId();
+        } else {
+            message.kind = flowmesh::WireMessageKind::ACTION;
+            message.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market_id,
+                              it->second->seats.epoch,
+                              it->second->next_sequence};
+            message.payload = *payload;
+            trace.epoch = message.header.epoch;
+            trace.seat_set_hash = it->second->seats.set_hash;
+            deposits = it->second->deposits;
+            // Kept for a facts refusal's notice (built outside the lock).
+            // Only this node's own deposits earn one: a public deposit has no
+            // credential, so its outpoint could be made up by anyone, and the
+            // refusal is already bound to the submit reply.
+            if (action.IsDeposit() && !pooled && origin == flowmesh::ClientNoticeOrigin::NODE) {
+                notice = LocalNotice(*it->second, action, out.admission, *payload);
+                tag(*notice);
+            }
+            // Its later worker and drop notices keep this origin's ring and,
+            // for PUBLIC, the submitter's share of it while it is live here.
+            if (origin == flowmesh::ClientNoticeOrigin::NODE) {
+                it->second->NoteNodeOrigin(action.Id());
+            } else {
+                counted = it->second->NotePublicFrame(action.Id(), submitter);
+            }
+        }
+    }
+    if (out.admission.kind == FlowMeshLocalAdmission::Kind::ENQUEUE && action.IsDeposit() && !pooled) {
+        // A deposit is admitted only with anchored facts. Checked here, on the
+        // submitting thread and outside the market lock (this takes cs_main),
+        // never on the consensus worker: the public API cannot put chain
+        // calls on the worker, nor fill the pool with fact-less deposits.
+        // Remote deposits are unchanged, so mixed committees are unaffected.
+        const bool facts{deposits != nullptr && deposits->GetDeposit(action.outpoint, m_config.chain->Current())};
+        if (!facts) {
+            out.admission.kind = FlowMeshLocalAdmission::Kind::REFUSE;
+            out.admission.code = flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE;
+            // Bound to this reply (and, for this node's own deposit, a
+            // notice) only: no v1 event, which any later attempt for the same
+            // outpoint could otherwise inherit.
+            if (notice) {
+                notice->code = out.admission.code;
+                m_client_events.AppendNotices({std::move(*notice)});
+            }
+            if (counted) {
+                // Never queued: settle the frame this attempt counted.
+                FlowMeshTimingSpan timing_lock{__func__};
+                timing_lock.Field("lock_name", std::string{"market_mutex"});
+                timing_lock.Mark("lock_requested_us");
+                std::lock_guard<std::mutex> lock{m_market_mutex};
+                timing_lock.Mark("lock_acquired_us");
+                if (const auto it{m_markets.find(market_id)}; it != m_markets.end()) {
+                    it->second->PublicFrameDone(action.Id());
+                }
+            }
+            return out;
+        }
+        notice.reset();
+    }
+    if (notice) {
+        // Answered from certified state: nothing is queued, relayed or
+        // pooled, and no v1 event is appended (queue refusals append none
+        // either). Only an authenticated attempt earns a notice. A deposit
+        // has no credential and credited outpoints are public, so anyone
+        // could replay one: as for a missing-facts refusal, only this node's
+        // own deposit earns a notice, and a public one's answer is bound to
+        // the submit reply. An inclusion earns none: the retained window and
+        // ring already answer it, and a replay of any public certified
+        // action must not churn the notice ring.
+        if (out.admission.kind != FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED &&
+            (action.IsDeposit() ? origin == flowmesh::ClientNoticeOrigin::NODE
+                                : flowmesh::CheckProductionActionCredential(action, domain, config_id, market_id))) {
+            m_client_events.AppendNotices({std::move(*notice)});
+        }
+        return out;
     }
     trace.wire_hash = WireTrace(message).wire_hash;
     const uint64_t sequence{message.header.sequence};
-    const auto result{EnqueueWireMessage(LOCAL_ACTION_PEER, std::move(message))};
+    out.cursor_before = m_client_events.Cursor();
+    const auto result{Enqueue(LOCAL_ACTION_PEER, std::move(message), counted)};
+    out.queued = result;
     trace.observed_monotonic_us = TraceNow(*m_config.clock);
     // Preserve submission's original lock scope. This is the observed push
     // result, not an atomic queue timestamp: worker events may precede this
@@ -3361,8 +3655,12 @@ flowmesh::QueueResult FlowMeshRuntime::SubmitLocalAction(
             ClientActionEvent(*it->second, flowmesh::ClientEventKind::QUEUE_ADMITTED,
                               action, "bounded runtime queue only; pool admission is pending");
         }
+        // A refused frame never reaches the worker: settle it here.
+        if (it != m_markets.end() && counted && result != flowmesh::QueueResult::ACCEPTED) {
+            it->second->PublicFrameDone(action.Id());
+        }
     }
-    return result;
+    return out;
 }
 
 std::optional<FlowMeshRuntimeMarketStatus> FlowMeshRuntime::MarketStatus(
@@ -3405,10 +3703,123 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketData(
 {
     FlowMeshTimingSpan timing_lock_3102{__func__};
     timing_lock_3102.Field("lock_name", std::string{"market_mutex"});
-    timing_lock_3102.Mark("lock_requested_us");
-    std::lock_guard<std::mutex> lock{m_market_mutex};
-    timing_lock_3102.Mark("lock_acquired_us");
-    return MarketDataLocked(market_id, account, query, error);
+    // Freed after every lock below.
+    std::vector<std::shared_ptr<const flowmesh::BookCurves>> dropped;
+    std::optional<flowmesh::MarketData> out;
+    std::shared_ptr<FlowMeshObservedTimeLog> observed;
+    {
+        timing_lock_3102.Mark("lock_requested_us");
+        std::lock_guard<std::mutex> lock{m_market_mutex};
+        timing_lock_3102.Mark("lock_acquired_us");
+        PruneBookCaptures(dropped);
+        out = MarketDataLocked(market_id, account, query, error);
+        if (out && query.observed_time) observed = ObservedLogLocked(market_id);
+        timing_lock_3102.Mark("lock_released_us");
+    }
+    // Observed times are looked up after the market lock: every entry in the
+    // reply was recorded before that lock was released.
+    if (out && query.observed_time) FillObservedTimes(*out, observed.get());
+    // Display views only: the curves are copied page by page, never in one
+    // hold of the market lock, and the view is computed by the caller. Book
+    // levels need them only for a changed head (or when asked for an
+    // unchanged one), so a light known_head poll copies nothing for them.
+    if (out && (query.indicative || flowmesh::LevelsWanted(*out, query)) && out->snapshot.certified) {
+        out->book = BookCopy(market_id, out->snapshot.last_microblock_hash, timing_lock_3102);
+    }
+    return out;
+}
+
+void FlowMeshRuntime::PruneBookCaptures(std::vector<std::shared_ptr<const flowmesh::BookCurves>>& dropped) const
+{
+    if (m_book_captures.empty()) return;
+    const auto now{m_config.clock->Now()};
+    for (auto it{m_book_captures.begin()}; it != m_book_captures.end();) {
+        const auto market{m_markets.find(it->first)};
+        if (market == m_markets.end() || market->second->last_hash != it->second.book->head ||
+            now - it->second.used >= BOOK_CAPTURE_IDLE) {
+            dropped.push_back(std::move(it->second.book));
+            it = m_book_captures.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::shared_ptr<const flowmesh::BookCurves> FlowMeshRuntime::BookCopy(
+    const flowmesh::MarketId& market_id, const uint256& head, FlowMeshTimingSpan& timing) const
+{
+    // Declared before every lock: freed after it.
+    std::vector<std::shared_ptr<const flowmesh::BookCurves>> dropped;
+    {
+        std::lock_guard<std::mutex> lock{m_market_mutex};
+        if (const auto held{m_book_captures.find(market_id)};
+            held != m_book_captures.end() && held->second.book->head == head) {
+            held->second.used = m_config.clock->Now();
+            timing.Field("book_copy", std::string{"reused"});
+            return held->second.book;
+        }
+    }
+    size_t pages{0};
+    std::chrono::steady_clock::duration longest{0};
+    auto book{std::make_shared<const flowmesh::BookCurves>(flowmesh::CopyBookCurves(
+        head,
+        [&](const std::optional<flowmesh::ClearingEngine::CurveKey>& after, const size_t limit)
+            -> std::optional<flowmesh::ClearingEngine::CurvePage> {
+            // One page per hold, exactly a curve-paging read's work.
+            std::lock_guard<std::mutex> lock{m_market_mutex};
+            const auto started{timing.Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
+            const auto it{m_markets.find(market_id)};
+            if (it == m_markets.end() || it->second->last_hash != head) return std::nullopt;
+            auto page{it->second->state.ReadCurves(limit, after)};
+            if (timing.Enabled()) longest = std::max(longest, std::chrono::steady_clock::now() - started);
+            return page;
+        },
+        pages))};
+    timing.Field("book_copy", book->unavailable_reason.empty() ? std::string{"copied"} : book->unavailable_reason);
+    timing.Field("book_copy_holds", uint64_t(pages));
+    timing.Field("book_copy_curves", uint64_t(book->curves.size()));
+    timing.Field("book_copy_longest_hold_us", uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(longest).count()));
+    if (book->unavailable_reason != "head_changed") {
+        // Retained for later reads at this head while it is current.
+        std::lock_guard<std::mutex> lock{m_market_mutex};
+        const auto it{m_markets.find(market_id)};
+        if (it != m_markets.end() && it->second->last_hash == head) {
+            auto& slot{m_book_captures[market_id]};
+            if (slot.book) dropped.push_back(std::move(slot.book));
+            slot = {book, m_config.clock->Now()};
+        }
+    }
+    return book;
+}
+
+std::shared_ptr<FlowMeshObservedTimeLog> FlowMeshRuntime::ObservedLogLocked(const flowmesh::MarketId& market_id) const
+{
+    const auto it{m_markets.find(market_id)};
+    return it == m_markets.end() ? nullptr : it->second->observed;
+}
+
+void FillObservedTimes(flowmesh::MarketData& out, const FlowMeshObservedTimeLog* log)
+{
+    auto& section{out.observed.emplace()};
+    if (!log) {
+        section.unavailable_reason = "not_recorded_by_this_node";
+        return;
+    }
+    // The head and exactly the reply's history and tick entries, by hash.
+    std::vector<std::pair<uint64_t, uint256>> entries;
+    if (out.snapshot.certified && out.snapshot.next_microblock_sequence > 0) {
+        entries.emplace_back(out.snapshot.next_microblock_sequence - 1, out.snapshot.last_microblock_hash);
+    }
+    for (const auto& entry : out.history.entries) entries.emplace_back(entry.sequence, entry.microblock_hash);
+    if (out.ticks) {
+        for (const auto& tick : out.ticks->ticks) entries.emplace_back(tick.sequence, tick.microblock_hash);
+    }
+    const auto summary{log->GetSummary()};
+    section.available = true;
+    section.source = "this_node";
+    section.clock_suspect = summary.clock_suspect;
+    section.recorded_since_sequence = summary.recorded_since;
+    section.rows = log->Lookup(entries);
 }
 
 std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
@@ -3419,7 +3830,11 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
     if (query.limit == 0 || query.limit > flowmesh::MARKET_DATA_MAX_HISTORY ||
         query.curve_limit == 0 || query.curve_limit > flowmesh::MARKET_DATA_MAX_CURVES ||
         (query.curve_cursor && !query.expected_head) ||
-        (query.known_head && (query.curve_cursor || query.before_sequence))) {
+        (query.known_head && (query.curve_cursor || query.before_sequence)) ||
+        (query.status_only && (query.curve_cursor || query.before_sequence || query.expected_head || query.ticks ||
+                               query.indicative || query.observed_time || query.levels)) ||
+        (query.ticks && (query.ticks->limit == 0 || query.ticks->limit > flowmesh::MARKET_DATA_MAX_TICKS)) ||
+        (query.levels && !flowmesh::LevelsQueryValid(*query.levels))) {
         error = "Invalid bounded market-data query or pagination snapshot";
         return std::nullopt;
     }
@@ -3471,7 +3886,22 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
         snapshot.runtime.active_catchup_requests += key.second == market_id;
     }
     out.unchanged = query.known_head && *query.known_head == market.last_hash;
-    if (out.unchanged || !snapshot.certified) return out;
+    // Read with the head above, and also for an unchanged head: a light
+    // known_head poll still receives the ticks after its own position.
+    if (query.ticks) {
+        if (market.store) {
+            out.ticks = market.store->ReadClearingTicks(*query.ticks);
+            // Never a tick beyond the head this reply reports.
+            if (std::erase_if(out.ticks->ticks, [&](const auto& tick) { return tick.sequence >= market.next_sequence; })) {
+                out.ticks->more = false;
+            }
+        } else {
+            out.ticks.emplace().unavailable_reason = "history_not_ready";
+        }
+    }
+    // The curves a display view needs are copied by MarketData after this
+    // lock (BookCopy), and the view is computed outside every runtime lock.
+    if (out.unchanged || query.status_only || !snapshot.certified) return out;
 
     out.liquidity = market.state.ReadCurves(query.curve_limit, query.curve_cursor);
     if (account) {
@@ -3505,18 +3935,26 @@ std::optional<flowmesh::ClientStateEvidence> FlowMeshRuntime::ClientSnapshot(
 
 std::optional<FlowMeshClientSnapshotView> FlowMeshRuntime::ClientSnapshotView(
     const flowmesh::MarketId& market_id,
-    const std::optional<flowmesh::AccountId>& account, std::string& error) const
+    const std::optional<flowmesh::AccountId>& account, std::string& error,
+    const flowmesh::MarketDataQuery& reported_query) const
 {
     FlowMeshTimingSpan timing_lock_3198{__func__};
     timing_lock_3198.Field("lock_name", std::string{"market_mutex"});
     timing_lock_3198.Mark("lock_requested_us");
-    std::lock_guard lock{m_market_mutex};
-    timing_lock_3198.Mark("lock_acquired_us");
-    auto evidence{ClientSnapshotLocked(market_id, error)};
-    if (!evidence) return std::nullopt;
-    auto reported{MarketDataLocked(market_id, account, {}, error)};
-    if (!reported) return std::nullopt;
-    return FlowMeshClientSnapshotView{std::move(*evidence), std::move(*reported)};
+    std::optional<FlowMeshClientSnapshotView> out;
+    std::shared_ptr<FlowMeshObservedTimeLog> observed;
+    {
+        std::lock_guard lock{m_market_mutex};
+        timing_lock_3198.Mark("lock_acquired_us");
+        auto evidence{ClientSnapshotLocked(market_id, error)};
+        if (!evidence) return std::nullopt;
+        auto reported{MarketDataLocked(market_id, account, reported_query, error)};
+        if (!reported) return std::nullopt;
+        if (reported_query.observed_time) observed = ObservedLogLocked(market_id);
+        out.emplace(FlowMeshClientSnapshotView{std::move(*evidence), std::move(*reported)});
+    }
+    if (reported_query.observed_time) FillObservedTimes(out->reported, observed.get());
+    return out;
 }
 
 std::optional<flowmesh::ClientStateEvidence> FlowMeshRuntime::ClientSnapshotLocked(
@@ -3549,7 +3987,7 @@ std::optional<std::vector<unsigned char>> FlowMeshRuntime::ClientCertifiedEntry(
     FlowMeshTimingSpan timing_lock_3233{__func__};
     timing_lock_3233.Field("lock_name", std::string{"market_mutex"});
     timing_lock_3233.Mark("lock_requested_us");
-    std::lock_guard lock{m_market_mutex};
+    std::unique_lock lock{m_market_mutex};
     timing_lock_3233.Mark("lock_acquired_us");
     const auto it{m_markets.find(market_id)};
     if (it == m_markets.end() || !it->second->store || sequence >= it->second->next_sequence) {
@@ -3557,16 +3995,80 @@ std::optional<std::vector<unsigned char>> FlowMeshRuntime::ClientCertifiedEntry(
         return std::nullopt;
     }
     const auto& market{*it->second};
-    if (market.client_head && market.client_head->entry.sequence == sequence) {
-        return flowmesh::EncodeProductionCertifiedPayload(*market.client_head, market.client_head_seat_count);
+    // Retained recent entries (the head included) are encoded from memory,
+    // outside this lock; only older sequences read the store.
+    std::shared_ptr<const flowmesh::ProductionCertifiedEnvelope> envelope;
+    size_t seat_count{0};
+    if (const auto* item{market.recent.Find(sequence)}; item && item->envelope) {
+        envelope = item->envelope;
+        seat_count = item->seat_count;
+    } else if (market.client_head && market.client_head->entry.sequence == sequence) {
+        envelope = market.client_head;
+        seat_count = market.client_head_seat_count;
+    }
+    if (envelope) {
+        lock.unlock();
+        return flowmesh::EncodeProductionCertifiedPayload(*envelope, seat_count);
     }
     const auto seats{market.chain->SeatSetForSequence(market.domain, market_id, sequence)};
     std::optional<StoredProductionEntry> stored;
+    CountObservation(m_client_entry_store_reads);
     if (!seats || !market.store->ReadEntry(sequence, *seats, stored, error) || !stored) {
         if (error.empty()) error = "FlowMesh certified entry authority is unavailable";
         return std::nullopt;
     }
     return flowmesh::EncodeProductionCertifiedPayload({stored->entry, stored->certificate}, seats->Size());
+}
+
+std::optional<std::pair<uint64_t, uint256>> FlowMeshRuntime::ClientRecentInclusion(
+    const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    std::lock_guard lock{m_market_mutex};
+    const auto it{m_markets.find(market_id)};
+    if (it == m_markets.end()) return std::nullopt;
+    return it->second->recent.Inclusion(action_id);
+}
+
+FlowMeshClientOutcomeParts FlowMeshRuntime::ClientOutcomeParts(
+    const flowmesh::MarketId& market_id, const uint64_t sequence, const uint256& hash,
+    const bool want_payload) const
+{
+    FlowMeshClientOutcomeParts out;
+    std::lock_guard lock{m_market_mutex};
+    const auto it{m_markets.find(market_id)};
+    if (it == m_markets.end()) return out;
+    const auto* item{it->second->recent.Find(sequence)};
+    out.sequence_retained = item != nullptr;
+    if (!item || item->hash != hash) return out;
+    out.found = true;
+    if (want_payload && item->envelope) {
+        out.envelope = item->envelope;
+        out.seat_count = item->seat_count;
+    }
+    out.outcome = item->outcome;
+    return out;
+}
+
+uint64_t FlowMeshRuntime::ClientEntryStoreReadsForTest() const
+{
+    return m_client_entry_store_reads.load(std::memory_order_relaxed);
+}
+
+size_t FlowMeshRuntime::BookCapturesForTest() const
+{
+    std::lock_guard<std::mutex> lock{m_market_mutex};
+    return m_book_captures.size();
+}
+
+std::pair<size_t, size_t> FlowMeshRuntime::RecentWindowOthers(const Market& self) const
+{
+    std::pair<size_t, size_t> out;
+    for (const auto& [id, market] : m_markets) {
+        if (market.get() == &self) continue;
+        out.first += market->recent.PayloadExtraBytes();
+        out.second += market->recent.OutcomeBytes();
+    }
+    return out;
 }
 
 flowmesh::ClientEventPage FlowMeshRuntime::ClientEvents(
@@ -3586,9 +4088,27 @@ std::optional<flowmesh::ClientEvent> FlowMeshRuntime::ClientActionStatus(
 flowmesh::ClientActionWait FlowMeshRuntime::WaitClientActionStatus(
     const flowmesh::MarketId& market_id, const uint256& action_id,
     const std::chrono::steady_clock::time_point deadline,
-    const std::function<bool()>& interrupted) const
+    const std::function<bool()>& interrupted, const bool include_notices) const
 {
     return m_client_events.WaitActionStatus(market_id, action_id, deadline, [&] {
+        return m_client_waits_closed.load() || (interrupted && interrupted());
+    }, include_notices);
+}
+
+flowmesh::ClientWatchResult FlowMeshRuntime::ClientEventsPending(
+    const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+    const std::optional<flowmesh::AccountId>& account) const
+{
+    return m_client_events.EventsPending(after, market, account);
+}
+
+flowmesh::ClientWatchResult FlowMeshRuntime::WaitClientEvents(
+    const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+    const std::optional<flowmesh::AccountId>& account,
+    const std::chrono::steady_clock::time_point deadline,
+    const std::function<bool()>& interrupted) const
+{
+    return m_client_events.WaitEvents(after, market, account, deadline, [&] {
         return m_client_waits_closed.load() || (interrupted && interrupted());
     });
 }
@@ -3752,6 +4272,16 @@ void FlowMeshRuntime::ProcessAddMarketCommand(AddMarketCommand command)
             if (command.market.readiness == FlowMeshRuntimeMarketReadiness::READY) {
                 m_probe_markets.push_back(command.market.market_id);
             }
+            // Health: an added market (or a shell replaced by a ready one)
+            // is observed before AddMarket returns, not up to a tick later.
+            size_t connected_peers{0};
+            std::optional<flowmesh::WireClock::time_point> no_peers_since;
+            {
+                std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
+                connected_peers = m_connected_peers.size();
+                no_peers_since = m_no_peers_since;
+            }
+            PublishHealth(m_config.clock->Now(), connected_peers, no_peers_since, /*force=*/true);
         }
     }
     if (ok) {
@@ -3799,6 +4329,10 @@ void FlowMeshRuntime::RemovePeerOnWorker(const flowmesh::WirePeerId peer)
         it = m_deferred_messages.erase(it);
     }
     std::erase_if(m_receive_recovery, [&](const auto& item) { return item.first == peer; });
+    for (auto& [id, market] : m_markets) {
+        (void)id;
+        market->lag.RemovePeer(peer);
+    }
     m_peer_probe_cursors.erase(peer);
     m_catchup_tracker.RemovePeer(peer);
     std::erase_if(m_catchup_profiles, [&](const auto& item) { return item.first.first == peer; });
@@ -3829,6 +4363,23 @@ void FlowMeshRuntime::ProcessMessage(
     const auto it{m_markets.find(queued.message.header.market_id)};
     if (it == m_markets.end()) return;
     Market& market{*it->second};
+    // A counted local action frame leaves the queue here however it is
+    // answered, including by every early return below. Its public submitter
+    // is settled on the way out, after any notice about it was tagged. Only
+    // a counted frame settles: one counted for nobody (this node's own, or a
+    // public one without an identity) never ends another frame's count.
+    struct LocalFrameSettle {
+        Market& market;
+        std::optional<uint256> id;
+        ~LocalFrameSettle()
+        {
+            if (id) market.PublicFrameDone(*id);
+        }
+    } settle{market, std::nullopt};
+    if (queued.counted && queued.peer == LOCAL_ACTION_PEER && queued.message.kind == flowmesh::WireMessageKind::ACTION &&
+        !market.public_submissions.empty()) {
+        if (const auto action{flowmesh::DecodeProductionActionPayload(queued.message.payload)}) settle.id = action->Id();
+    }
     if (!market.ready) return;
     BenchSpan processing{market, "message_processing_completed", queued.message.kind,
                          uint256{}, queued.message.header.sequence};
@@ -3924,10 +4475,14 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
     }
     bool refresh{false};
     std::vector<flowmesh::WirePeerId> peers;
+    size_t connected_peers{0};
+    std::optional<flowmesh::WireClock::time_point> no_peers_since;
     {
         std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
         refresh = std::exchange(m_discovery_refresh, false);
         peers.assign(m_discovery_peers.begin(), m_discovery_peers.end());
+        connected_peers = m_connected_peers.size();
+        no_peers_since = m_no_peers_since;
     }
     const auto now{m_config.clock->Now()};
     for (auto it{m_pending_catchup.begin()}; it != m_pending_catchup.end();) {
@@ -3943,6 +4498,7 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
         if (now >= it->second) it = m_catchup_cooldowns.erase(it);
         else ++it;
     }
+    ObserveTimeMaintenance(connected_peers);
     { FlowMeshTimingSpan timing{"tick_retry_deferred"}; RetryDeferredMessages(); }
     { FlowMeshTimingSpan timing{"tick_retry_deliveries"}; RetryDeliveries(); }
     { FlowMeshTimingSpan timing{"tick_regenerate"}; RegenerateDeliveries(); }
@@ -4017,6 +4573,103 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
     RetryRetainedEvidence();
     RetryLocalActions();
     ForwardPendingDuplicateActions();
+    {
+        FlowMeshTimingSpan timing{"tick_publish_health"};
+        PublishHealth(m_config.clock->Now(), connected_peers, no_peers_since, /*force=*/false);
+    }
+}
+
+void FlowMeshRuntime::ObserveTimeMaintenance(const size_t connected_peers)
+{
+    // Operator-observed time, display only: whether each market is caught
+    // up (for the warm-up that keeps old relayed certificates from being
+    // stamped live after a start or an interruption) and the current
+    // acceptable anchor height (for the stale-anchor check). Sampled here,
+    // so a commit takes no chain lock for either.
+    if (std::none_of(m_markets.begin(), m_markets.end(), [](const auto& item) { return item.second->observed != nullptr; })) return;
+    // Paced: the two chain reads take the chain lock on the worker, so an
+    // open gate is sampled at most once a second. A closed gate (a brief B3
+    // reconciliation, or the start) is read again on every tick, and
+    // everything else is observed on every tick: the warm-up starts within
+    // a tick of the node catching up and lasts ObservedWarmupFor(), not up
+    // to a sample interval more.
+    const auto now{m_config.clock->Now()};
+    if (!m_observed_gate || !m_observed_gate->open || now >= m_next_observed_sample) {
+        m_next_observed_sample = now + OBSERVED_SAMPLE_INTERVAL;
+        const auto anchor{m_config.chain->Current()};
+        m_observed_gate = ObservedGateSample{anchor.height, m_config.chain->Acceptable(anchor)};
+    }
+    const bool gate_open{m_observed_gate->open};
+    for (auto& [id, market_ptr] : m_markets) {
+        (void)id;
+        Market& market{*market_ptr};
+        if (!market.observed) continue;
+        if (gate_open) market.observed_anchor_height = m_observed_gate->anchor_height;
+        const auto lag{market.lag.Summary()};
+        // Without a peer only a node that certifies alone (a local quorum,
+        // regtest) can be applying entries as they are certified.
+        const bool reachable{connected_peers > 0 ||
+                             (market.ready && LocalSeatKeys(market).size() >= flowmesh::FlowMeshBlsThreshold(market.seats.Size()))};
+        // Unverified HELLO hints are not an input (as for readiness): only a
+        // proven lag interrupts it.
+        const bool caught_up{market.ready && market.halt == FlowMeshRuntimeHalt::NONE && gate_open && reachable &&
+                             !lag.proven_target};
+        // A lag or gate closure shorter than one round does not restart it.
+        market.observed_warmup.Observe(caught_up, now, market.round_timeout);
+    }
+}
+
+void FlowMeshRuntime::PublishHealth(const flowmesh::WireClock::time_point now, const size_t connected_peers,
+                                    const std::optional<flowmesh::WireClock::time_point> no_peers_since,
+                                    const bool force)
+{
+    // Ticks also come from HELLO, peer connections, commits and B3 tips, so
+    // pace the copy: every reader waits for this worker's market lock.
+    if (!force && now < m_next_health_publish) return;
+    m_next_health_publish = now + HEALTH_PUBLISH_INTERVAL;
+    auto out{std::make_shared<FlowMeshRuntimeHealthSnapshot>()};
+    out->published_at = now;
+    out->connected_peers = connected_peers;
+    out->no_peers_since = connected_peers == 0 ? no_peers_since : std::nullopt;
+    out->markets.reserve(m_markets.size());
+    for (auto& [id, market_ptr] : m_markets) {
+        Market& market{*market_ptr};
+        market.lag.Expire(now);
+        auto& row{out->markets.emplace_back()};
+        row.market_id = id;
+        row.installed = market.ready;
+        row.epoch = market.seats.epoch;
+        row.next_sequence = market.next_sequence;
+        row.last_hash = market.last_hash;
+        row.active_seats = market.seats.Size();
+        row.quorum_required = row.active_seats == 0 ? 0 : flowmesh::FlowMeshBlsThreshold(row.active_seats);
+        row.pending_actions = market.pool.Size();
+        row.paused = market.paused;
+        row.pending_handoff = market.pending_handoff;
+        row.pause_reason = market.ready ? market.pause_reason : std::string{"insufficient_seats"};
+        row.halted = market.halt != FlowMeshRuntimeHalt::NONE;
+        row.halt = FlowMeshRuntimeHaltName(market.halt);
+        row.error = market.error.substr(0, 1024);
+        if (market.proposal_wait_sequence == market.next_sequence) row.proposal_wait_reason = market.proposal_wait_reason;
+        row.head_advanced_at = market.head_advanced_at;
+        row.local_observed_at = market.local_observed_at;
+        row.lag = market.lag.Summary();
+        row.seat_evidence_recorded = market.seat_evidence_recorded;
+        row.seat_evidence = market.seat_evidence;
+        row.seat_evidence_unrecorded = market.seat_evidence_unrecorded;
+    }
+    std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> previous;
+    {
+        std::lock_guard<std::mutex> lock{m_health_mutex};
+        previous = std::exchange(m_health, std::move(out));
+    }
+    // The previous snapshot is released after the unlock.
+}
+
+std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> FlowMeshRuntime::HealthSnapshot() const
+{
+    std::lock_guard<std::mutex> lock{m_health_mutex};
+    return m_health;
 }
 
 void FlowMeshRuntime::RetryLocalActions()
@@ -4365,6 +5018,8 @@ void FlowMeshRuntime::HandleHello(
     // A hint neither changes the active committee nor establishes finality.
     // Only the existing certificate-verification/re-execution path can move
     // our state. Do not pause signing or report a trusted remote tip here.
+    // Health shows the hint as unverified and never starts a lag from it.
+    market.lag.Hello(peer, message.header.sequence, market.clock->Now());
     if (message.header.sequence > market.next_sequence) {
         RequestCatchup(peer, market.market_id);
     } else if (message.header.sequence < market.next_sequence) {
@@ -4385,92 +5040,195 @@ void FlowMeshRuntime::HandleAction(
     const flowmesh::WireMessage& message)
 {
     const bool local{peer == LOCAL_ACTION_PEER};
-    if (message.header.version != flowmesh::FLOWMESH_WIRE_VERSION_V1 ||
-        message.header.market_id != market.market_id ||
-        message.header.epoch != market.seats.epoch ||
-        message.header.sequence > market.next_sequence ||
-        (!local && message.header.sequence != market.next_sequence)) {
-        if (local) {
-            if (const auto action{flowmesh::DecodeProductionActionPayload(message.payload)}) {
-                ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action,
-                                  "local queued action header is not current authority; this attempt was not admitted");
+    auto& counters{market.delivery.action_admission};
+    const auto& header{message.header};
+    const uint64_t next{market.next_sequence};
+    // 0. A local frame is answered from this node's pool and certified state
+    // before its header is checked. Its header was stamped at submission and
+    // goes stale when the head or the epoch moves while it is queued; an
+    // action that is pooled here or already certified must then not read
+    // "rejected". Only a frame that would still be queued meets the header
+    // checks below, with their existing texts.
+    std::optional<flowmesh::Action> action;
+    if (local) {
+        action = flowmesh::DecodeProductionActionPayload(message.payload);
+        if (!action) return;
+        // An exact duplicate keeps today's answer, whatever its header.
+        if (market.pool.ContainsExact(*action)) {
+            ClientActionEvent(market, flowmesh::ClientEventKind::POOL_ADMITTED, *action,
+                              "exact signed action already present in pool", nullptr,
+                              flowmesh::ActionReasonCode::DUPLICATE_PENDING);
+            return;
+        }
+        // Authoritative recheck of the submit-time decision: state may have
+        // advanced while this frame was queued. It runs before the header
+        // checks and the header proof's inclusion and pending-state refusals,
+        // so a frame whose own attempt was certified while it waited is never
+        // refused.
+        const auto admission{DecideLocal(market, *action)};
+        if (admission.kind == FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED) return; // its inclusion is retained
+        if (admission.kind != FlowMeshLocalAdmission::Kind::ENQUEUE && AuthenticateAction(market, *action)) {
+            if (admission.kind == FlowMeshLocalAdmission::Kind::REFUSE) {
+                auto event{MakeClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action,
+                    admission.code == flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE
+                        ? "account sequence is more than 64 beyond the certified next sequence; this attempt was not admitted"
+                        : "account sequence already used by another certified action; this attempt was not admitted",
+                    nullptr, admission.code)};
+                event.consumed_by = admission.consumer;
+                market.client_events.Append(std::move(event));
             }
+            // The refusal event (if any) first, so the notice is newer.
+            auto notice{LocalNotice(market, *action, admission, message.payload)};
+            market.TagNotice(notice);
+            market.client_events.AppendNotices({std::move(notice)});
+            return;
+        }
+        // An unauthenticated attempt earns no event of its own here: Add
+        // below refuses it with the existing text.
+    }
+    const auto refuse_local = [&](const char* reason, const flowmesh::ActionReasonCode code) {
+        ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason, nullptr, code);
+    };
+    // 1. Identity. Remote refusals are counted only: they create no event.
+    if (header.version != flowmesh::FLOWMESH_WIRE_VERSION_V1 ||
+        header.market_id != market.market_id || header.epoch != market.seats.epoch) {
+        if (local) {
+            refuse_local("local queued action header is not current authority; this attempt was not admitted",
+                         flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
+        } else {
+            CountObservation(counters.header_refused_identity);
         }
         return;
     }
-    const auto action{flowmesh::DecodeProductionActionPayload(message.payload)};
-    if (!action) return;
-    const bool refresh_local_header{local && message.header.sequence < market.next_sequence};
-    if (refresh_local_header) {
-        // SubmitLocalAction captures its wrapper before taking the bounded
-        // queue lock. A certificate can overtake it there. As with an already
-        // admitted local retry, only its routing sequence may advance: first
-        // recheck pending state, current authority and anchored deposit facts.
-        // Add below still authenticates the original shape/credential and
-        // enforces all pool/conflicting-sequence limits. No remote envelope
-        // receives this treatment, and no action payload is rewritten.
-        const auto refuse = [&](const char* reason) {
-            ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason);
+    // 2. Ahead: only a remote sender, at most two slots. Its header claims
+    // only its own head, and any peer may already stamp this node's head on
+    // any frame, so accepting it grants nothing new; it helps a lagging
+    // validator gather the evidence it needs once it catches up.
+    const bool ahead{header.sequence > next};
+    if (ahead && (local || header.sequence - next > ACTION_HEADER_AHEAD)) {
+        if (local) {
+            refuse_local("local queued action header is not current authority; this attempt was not admitted",
+                         flowmesh::ActionReasonCode::HEADER_NOT_CURRENT);
+        } else {
+            CountObservation(counters.header_refused_far);
+        }
+        return;
+    }
+    // 3. Behind: at most two slots, and only with the proof below.
+    const bool behind{header.sequence < next};
+    if (behind && next - header.sequence > ACTION_HEADER_BEHIND) {
+        if (local) {
+            refuse_local("local queued action lacks a complete retained certified-head interval; check exact-action status before retry",
+                         flowmesh::ActionReasonCode::HEAD_INTERVAL_UNAVAILABLE);
+        } else {
+            CountObservation(counters.header_refused_far);
+        }
+        return;
+    }
+    // 4. Decode (a local frame already is).
+    if (!local) {
+        action = flowmesh::DecodeProductionActionPayload(message.payload);
+        if (!action) return;
+    }
+    // 5. Proof for a header behind this head. A local wrapper can be
+    // overtaken by a certificate while queued; a remote sender can lag this
+    // node by a slot or two. Only the routing header may then advance, and
+    // only after proving over the WHOLE interval since that head that no
+    // certified entry this node retains disposed of this action: StillPending
+    // alone does not exclude a certified action whose execution was rejected
+    // without consuming its sequence or deposit. It fails closed after a
+    // restart gap, an epoch change or window eviction. Add below still
+    // authenticates the original bytes; the payload is never rewritten.
+    if (behind) {
+        const auto refuse = [&](const char* reason, const flowmesh::ActionReasonCode code) {
+            if (local) {
+                ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason, nullptr, code);
+            } else {
+                CountObservation(counters.header_refused_unproven);
+            }
         };
-        // Only the immediately preceding durable body is retained here with
-        // authenticated authority. It must cover the ENTIRE interval since
-        // this wrapper was captured: StillPending alone does not exclude a
-        // certified action whose execution was rejected without consuming its
-        // deposit or account sequence. Older/missing evidence needs existing
-        // exact-action status/recovery, not an unbounded history scan or an
-        // observational client-event-ring inference. This deliberately does
-        // not promise autonomous progress across multiple head advances.
-        if (!market.client_head || message.header.sequence != market.next_sequence - 1 ||
-            market.client_head->entry.sequence != message.header.sequence ||
-            market.client_head->entry.epoch != message.header.epoch ||
-            market.client_head->entry.market_id != market.market_id) {
-            refuse("local queued action lacks a complete retained certified-head interval; check exact-action status before retry");
+        const uint256 id{action->Id()};
+        for (uint64_t sequence{header.sequence}; sequence < next; ++sequence) {
+            const auto* item{market.recent.Find(sequence)};
+            if (!item || !item->envelope || item->epoch != header.epoch) {
+                refuse("local queued action lacks a complete retained certified-head interval; check exact-action status before retry",
+                       flowmesh::ActionReasonCode::HEAD_INTERVAL_UNAVAILABLE);
+                return;
+            }
+            if (FlowMeshRecentCertifiedWindow::BodyIndex(*item, id)) {
+                refuse("local queued action was already certified; inclusion is terminal regardless of execution outcome",
+                       flowmesh::ActionReasonCode::ALREADY_INCLUDED);
+                return;
+            }
+        }
+        if (!FlowMeshActionPool::StillPending(*action, market.state)) {
+            refuse("local queued action is no longer pending in current state; prior certified inclusion is not undone",
+                   flowmesh::ActionReasonCode::STALE_SEQUENCE_UNATTRIBUTED);
             return;
         }
-        const auto id{action->Id()};
-        if (std::any_of(market.client_head->entry.actions.begin(), market.client_head->entry.actions.end(),
-                        [&](const auto& included) { return included.Id() == id; })) {
-            refuse("local queued action was already certified; inclusion is terminal regardless of execution outcome");
-            return;
-        }
-        if (!RuntimeActionPool::StillPending(*action, market.state)) {
-            refuse("local queued action is no longer pending in current state; prior certified inclusion is not undone");
-            return;
-        }
-        const auto transition{CurrentSeatTransition(market)};
-        const auto anchor{market.chain->Current()};
-        if (market.pending_handoff || market.pending_candidate_restore || !transition ||
-            transition->kind != FlowMeshSeatTransitionKind::CONTINUE || !market.chain->Acceptable(anchor)) {
-            refuse("local queued action cannot refresh its header while current authority is unavailable; retry exact instruction");
-            return;
-        }
-        if (action->IsDeposit() && (market.deposits == nullptr || !market.deposits->GetDeposit(action->outpoint, anchor))) {
-            refuse("local queued deposit has no current anchored facts; this attempt was not admitted");
-            return;
+        // Local frames also recheck current authority and anchored deposit
+        // facts, as before. Remote frames get neither: an equal-header remote
+        // frame never had them, and remote traffic must not add chain calls
+        // to the worker.
+        if (local) {
+            const auto transition{CurrentSeatTransition(market)};
+            const auto anchor{market.chain->Current()};
+            if (market.pending_handoff || market.pending_candidate_restore || !transition ||
+                transition->kind != FlowMeshSeatTransitionKind::CONTINUE || !market.chain->Acceptable(anchor)) {
+                refuse("local queued action cannot refresh its header while current authority is unavailable; retry exact instruction",
+                       flowmesh::ActionReasonCode::AUTHORITY_UNAVAILABLE);
+                return;
+            }
+            if (action->IsDeposit() && (market.deposits == nullptr || !market.deposits->GetDeposit(action->outpoint, anchor))) {
+                refuse("local queued deposit has no current anchored facts; this attempt was not admitted",
+                       flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+                return;
+            }
         }
     }
-    if (!market.pool.Add(*action, peer, market.clock->Now())) {
+    // Relays and duplicate forwards carry this node's own head.
+    auto routed{message};
+    routed.header.sequence = next;
+    // A local head cancel/withdrawal/claim may use the reserved capacity;
+    // every other local submission stops short of it.
+    const auto type{static_cast<flowmesh::ActionType>(action->type)};
+    const bool priority_eligible{local && !action->IsDeposit() &&
+        (type == flowmesh::ActionType::CANCEL_BID || type == flowmesh::ActionType::CANCEL_ASK ||
+         type == flowmesh::ActionType::WITHDRAW || type == flowmesh::ActionType::CLAIM_SEAT_REWARD) &&
+        action->sequence >= market.state.NextSequence(action->signer) &&
+        action->sequence - market.state.NextSequence(action->signer) < FLOWMESH_POOL_PRIORITY_SEQUENCE_AHEAD};
+    const auto added{market.pool.Add(*action, peer, market.clock->Now(),
+                                      {.api_origin = local, .priority_eligible = priority_eligible})};
+    if (added != flowmesh::ActionReasonCode::ADMITTED) {
         const bool already_admitted{market.pool.ContainsExact(*action)};
+        // Existing texts, byte-identical; only the memory-only code is new.
+        const auto code{already_admitted ? flowmesh::ActionReasonCode::DUPLICATE_PENDING
+                        : added == flowmesh::ActionReasonCode::DUPLICATE_PENDING
+                            ? flowmesh::ActionReasonCode::DUPLICATE_ID_OTHER_CREDENTIAL : added};
         ClientActionEvent(market, already_admitted ? flowmesh::ClientEventKind::POOL_ADMITTED
                                                    : flowmesh::ClientEventKind::POOL_REFUSED,
                           *action, already_admitted ? "exact signed action already present in pool"
-                              : "pool refused this attempt (authentication, conflicting sequence or capacity); not an execution result");
+                              : code == flowmesh::ActionReasonCode::SUBMIT_LANE_FULL
+                                  ? "pool capacity reserved for cancels and withdrawals; this order was not admitted"
+                                  : "pool refused this attempt (authentication, conflicting sequence or capacity); not an execution result",
+                          nullptr, code);
         if (peer != LOCAL_ACTION_PEER) {
-            market.pool.QueueDuplicateForward(*action, message, peer,
+            market.pool.QueueDuplicateForward(*action, routed, peer,
                                                market.state, market.clock->Now());
         }
         return;
     }
+    if (ahead) CountObservation(counters.header_accepted_ahead);
+    if (behind) CountObservation(counters.header_restamped_behind);
     CountObservation(market.delivery.verified);
     ClientActionEvent(market, flowmesh::ClientEventKind::POOL_ADMITTED, *action,
-                      "authenticated action added to pool; not yet certified");
+                      "authenticated action added to pool; not yet certified", nullptr,
+                      flowmesh::ActionReasonCode::ADMITTED);
     DeliveryEvent(market, "action_verified", flowmesh::WireMessageKind::ACTION,
                   action->Id(), market.next_sequence, peer);
     DeliveryEvent(market, "action_round_observed", flowmesh::WireMessageKind::ACTION,
                   action->Id(), market.next_sequence, peer,
                   "pool_admission" + RoundTiming(market), SchedulingContext(market));
-    auto routed{message};
-    if (refresh_local_header) routed.header.sequence = market.next_sequence;
     RelayMessage(market, std::move(routed), std::nullopt,
                  local
                      ? std::nullopt
@@ -5043,6 +5801,8 @@ void FlowMeshRuntime::HandleAttestation(
         prior->second != *matching_hash) {
         DeliveryEvent(market, "attestation_refused", flowmesh::WireMessageKind::ATTESTATION,
                       *matching_hash, market.next_sequence, peer, "seat_already_attested_other_candidate", receive_trace);
+        RecordAttestationEquivocation(market, attestation->seat_index, prior->second, *matching_hash,
+                                      attestation->signature);
         return;
     }
     auto& by_seat{market.attestations[*matching_hash]};
@@ -5238,12 +5998,24 @@ void FlowMeshRuntime::HandleCertificate(
             return;
         }
         if (stored->entry.GetHash() != certified->entry.GetHash()) {
+            // Halt first: recording is information only and never decides it.
             HaltMarket(market, FlowMeshRuntimeHalt::CERTIFICATE_CONFLICT,
                        "two valid FlowMesh certificates conflict at one sequence");
+            // The received certificate verified just above, over its entry's
+            // context; the stored one is checked again (never trusted from disk).
+            RecordSeatEvidence(market, flowmesh::SeatEvidence{
+                flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT, market.domain, market.market_id,
+                flowmesh::SeatCertificateStatement(stored->certificate, stored->entry.seat_set_hash),
+                flowmesh::SeatCertificateStatement(certified->certificate, certified->entry.seat_set_hash),
+                std::nullopt},
+                /*first_signature_verified=*/false, /*second_signature_verified=*/true);
         }
         return;
     }
     if (certified->entry.sequence > market.next_sequence) {
+        // BLS-verified above: this node is provably behind, whichever path
+        // delivered the certificate. Observation only.
+        market.lag.Proven(certified->entry.sequence, market.clock->Now());
         if (!from_catchup && peer != LOCAL_ACTION_PEER) {
             RequestCatchup(peer, market.market_id);
         }
@@ -5268,6 +6040,7 @@ void FlowMeshRuntime::HandleCertificate(
             DeliveryEvent(market, "certificate_validation_deferred", flowmesh::WireMessageKind::CERTIFICATE,
                           certified->entry.GetHash(), certified->entry.sequence, peer,
                           "verified certificate awaits execution after reconciliation", EntryTrace(certified->entry));
+            NoteObservedDeferral(market, certified->entry.sequence);
         }
     };
     const uint256 hash{certified->entry.GetHash()};
@@ -5299,12 +6072,8 @@ void FlowMeshRuntime::HandleCertificate(
         candidate_it = market.candidates.emplace(hash,
                                                   std::move(*candidate)).first;
     }
-    if (!CommitCertified(market, *certified, candidate_it->second, reconciliation_deferred)) return;
-    // Durable now: admission may consume later copies of this slot's votes
-    // and of exactly these entry bytes without a committee token.
-    if (const auto bytes{CertifiedEntryBytes(message.payload)}) {
-        NoteCertifiedAdmission(message.header, Hash(*bytes), market.next_sequence);
-    }
+    if (!CommitCertified(market, *certified, candidate_it->second, RecentWindowOthers(market),
+                         reconciliation_deferred, from_catchup)) return;
     // The next slot is proposed from the maintenance tick. When this node
     // holds the next slot's proposer seat and the market still holds admitted
     // work, it must not wait up to a full tick interval, so reuse the existing
@@ -5319,6 +6088,14 @@ void FlowMeshRuntime::HandleCertificate(
             peer == LOCAL_ACTION_PEER
                 ? std::nullopt
                 : std::optional<flowmesh::WirePeerId>{peer});
+    }
+    // Durable now: admission may consume later copies of this slot's votes
+    // and of exactly these entry bytes without a committee token. Recorded
+    // after the relay so its hash and queue lock stay off the relay path; a
+    // copy admitted before this line is charged and dropped by the durable
+    // duplicate check, as before.
+    if (const auto bytes{CertifiedEntryBytes(message.payload)}) {
+        NoteCertifiedAdmission(message.header, Hash(*bytes), market.next_sequence);
     }
 }
 
@@ -5508,8 +6285,11 @@ void FlowMeshRuntime::HandleEntries(
                 request.max_entries, request.max_bytes, entries->size(),
                 message.payload.size(), applied)};
         if (!tail_slack) {
+            // Health: this peer may hold more; speculative, not a tip proof.
+            market.lag.Speculative(peer, finished);
             RequestCatchup(peer, market.market_id);
         } else {
+            market.lag.SpeculativeEnd(finished);
             CountObservation(market.delivery.catchup_completed);
             DeliveryEvent(market, "catchup_page_applied_with_tail_slack", flowmesh::WireMessageKind::ENTRIES,
                           market.last_hash, market.next_sequence, peer, apply_details);

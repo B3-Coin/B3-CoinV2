@@ -6,13 +6,17 @@
 #include <core_io.h>
 #include <flowmesh/auth.h>
 #include <flowmesh/market.h>
+#include <flowmesh/market_view.h>
+#include <flowmesh/microblock.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
 #include <modern/asset_output.h>
 #include <modern/mpa.h>
+#include <node/flowmesh_action_stage.h>
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_client_action_wait.h>
 #include <node/flowmesh_client_join.h>
+#include <node/flowmesh_client_outcome.h>
 #include <policy/policy.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
@@ -78,6 +82,8 @@ static uint256 ParseActionId(const UniValue& value)
     return action;
 }
 
+static interfaces::FlowMeshActionReceipt StripInconsistentOutcome(interfaces::FlowMeshActionReceipt receipt);
+
 // Never replace the locally approved identity with a transport response, or
 // turn an uncertain submission into an exception that loses that identity.
 static interfaces::FlowMeshActionReceipt BoundActionReceipt(
@@ -92,8 +98,23 @@ static interfaces::FlowMeshActionReceipt BoundActionReceipt(
         receipt.reason = "Unusable action receipt; submission outcome is unknown";
     }
     receipt.action_id = action_id;
+    return StripInconsistentOutcome(std::move(receipt));
+}
+
+static interfaces::FlowMeshActionReceipt StripInconsistentOutcome(interfaces::FlowMeshActionReceipt receipt)
+{
+    node::FlowMeshStripInconsistentOutcome(receipt);
     return receipt;
 }
+
+//! The receipt's display stage (node::FlowMeshReceiptStage). The remote
+//! client's retained row supplies whether the instruction may have been sent.
+static void StageReceipt(interfaces::FlowMeshActionReceipt& receipt, const bool may_have_been_sent, const bool retained)
+{
+    receipt.stage = node::FlowMeshReceiptStage(receipt, may_have_been_sent, retained);
+}
+
+static CAmount ExactPositiveAmount(const UniValue& value, const std::string& name);
 
 static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
 {
@@ -101,12 +122,14 @@ static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
     if (options.isNull()) return query;
     if (!options.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "options must be an object");
     const std::set<std::string> allowed{
-        "limit", "curve_limit", "before_sequence", "curve_cursor", "expected_head", "known_head"};
+        "limit", "curve_limit", "before_sequence", "curve_cursor", "expected_head", "known_head", "ticks", "indicative",
+        "observed_time", "levels"};
     for (const auto& key : options.getKeys()) {
         if (!allowed.contains(key)) throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown option '" + key + "'");
     }
-    const auto integer = [&](const std::string& name, const uint64_t minimum, const uint64_t maximum) {
-        const UniValue& value{options[name]};
+    const auto integer = [&](const std::string& name, const uint64_t minimum, const uint64_t maximum,
+                             const UniValue* object = nullptr) {
+        const UniValue& value{(object ? *object : options)[name]};
         if (!value.isNum()) throw JSONRPCError(RPC_TYPE_ERROR, name + " must be an integer");
         uint64_t number;
         try {
@@ -142,6 +165,90 @@ static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
     }
     if (query.known_head && (query.curve_cursor || query.before_sequence)) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "known_head cannot be combined with pagination cursors");
+    }
+    if (options.exists("ticks")) {
+        const UniValue& ticks{options["ticks"]};
+        if (!ticks.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "ticks must be an object");
+        for (const auto& key : ticks.getKeys()) {
+            if (key != "after_sequence" && key != "limit") throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown ticks option '" + key + "'");
+        }
+        auto& tick_query{query.ticks.emplace()};
+        if (ticks.exists("after_sequence")) {
+            tick_query.after_sequence = integer("after_sequence", 0, std::numeric_limits<uint64_t>::max(), &ticks);
+        }
+        if (ticks.exists("limit")) tick_query.limit = integer("limit", 1, flowmesh::MARKET_DATA_MAX_TICKS, &ticks);
+    }
+    if (options.exists("observed_time")) {
+        if (!options["observed_time"].isBool()) throw JSONRPCError(RPC_TYPE_ERROR, "observed_time must be a boolean");
+        query.observed_time = options["observed_time"].get_bool();
+    }
+    if (options.exists("levels")) {
+        const UniValue& levels{options["levels"]};
+        if (!levels.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "levels must be an object");
+        for (const auto& key : levels.getKeys()) {
+            if (key != "depth" && key != "group" && key != "include_unchanged") {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown levels option '" + key + "'");
+            }
+        }
+        auto& levels_query{query.levels.emplace()};
+        if (levels.exists("depth")) levels_query.depth = integer("depth", 1, flowmesh::MARKET_DATA_MAX_LEVELS, &levels);
+        if (levels.exists("include_unchanged")) {
+            if (!levels["include_unchanged"].isBool()) throw JSONRPCError(RPC_TYPE_ERROR, "include_unchanged must be a boolean");
+            levels_query.include_unchanged = levels["include_unchanged"].get_bool();
+        }
+        if (levels.exists("group")) {
+            const UniValue& group{levels["group"]};
+            if (!group.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "levels group must be an object");
+            for (const auto& key : group.getKeys()) {
+                if (key != "orientation" && key != "mantissa" && key != "exponent" && key != "decimals") {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown levels group option '" + key + "'");
+                }
+            }
+            if (!group["orientation"].isStr() || (group["orientation"].get_str() != "canonical" && group["orientation"].get_str() != "inverse")) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "levels group orientation must be canonical or inverse");
+            }
+            if (!group["exponent"].isNum()) throw JSONRPCError(RPC_TYPE_ERROR, "exponent must be an integer");
+            int64_t exponent;
+            try {
+                exponent = group["exponent"].getInt<int64_t>();
+            } catch (const std::runtime_error&) {
+                throw JSONRPCError(RPC_TYPE_ERROR, "exponent must be an integer");
+            }
+            if (exponent < -64 || exponent > 64) throw JSONRPCError(RPC_INVALID_PARAMETER, "exponent is outside its supported range");
+            auto& grouping{levels_query.grouping};
+            grouping.exact = false;
+            grouping.inverse = group["orientation"].get_str() == "inverse";
+            grouping.mantissa = static_cast<uint8_t>(integer("mantissa", 1, 5, &group));
+            grouping.exponent = static_cast<int32_t>(exponent);
+            grouping.decimals = static_cast<uint8_t>(integer("decimals", 0, 18, &group));
+            if (const auto error{flowmesh::LevelGroupingError(grouping)}; !error.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "levels group: " + error);
+            }
+        }
+    }
+    if (options.exists("indicative")) {
+        const UniValue& indicative{options["indicative"]};
+        if (!indicative.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "indicative must be an object");
+        for (const auto& key : indicative.getKeys()) {
+            if (key != "draft") throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown indicative option '" + key + "'");
+        }
+        auto& indicative_query{query.indicative.emplace()};
+        if (indicative.exists("draft")) {
+            const UniValue& draft{indicative["draft"]};
+            if (!draft.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "indicative draft must be an object");
+            for (const auto& key : draft.getKeys()) {
+                if (key != "side" && key != "price" && key != "quantity") {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown indicative draft option '" + key + "'");
+                }
+            }
+            if (!draft["side"].isStr() || (draft["side"].get_str() != "bid" && draft["side"].get_str() != "ask")) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "indicative draft side must be bid or ask");
+            }
+            // The signing account is the caller's: added by the RPC itself.
+            indicative_query.draft = flowmesh::IndicativeDraft{
+                draft["side"].get_str() == "bid" ? flowmesh::ClearingEngine::Side::BID : flowmesh::ClearingEngine::Side::ASK,
+                ExactPositiveAmount(draft["price"], "price"), ExactPositiveAmount(draft["quantity"], "quantity"), std::nullopt};
+        }
     }
     return query;
 }
@@ -373,9 +480,35 @@ static WalletActionContext GetWalletActionContext(CWallet& wallet,
     return {std::move(secret), account, *status};
 }
 
+//! The optional trailing wait_ms of the signed-action RPCs.
+static RPCArg SubmitWaitArg()
+{
+    return {"wait_ms", RPCArg::Type::NUM, RPCArg::Default{0},
+            strprintf("Remote client only: before returning, wait at most this many milliseconds (0-%d) for this "
+                      "new action's certified inclusion, verified under local B3 authority: inside the submission "
+                      "itself where the endpoint offers it (one request), else by one waited status read of the "
+                      "delivered action. Never signs again or resends to wait; a receipt that is not verified in "
+                      "time is returned exactly as without a wait. 0, the local engine and older endpoints return "
+                      "at once.",
+                      node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count())};
+}
+
+//! Parsed before anything is signed.
+static std::chrono::milliseconds ParseSubmitWait(const UniValue& value)
+{
+    if (value.isNull()) return {};
+    const auto wait{value.getInt<int64_t>()};
+    if (wait < 0 || wait > node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           strprintf("wait_ms must be between 0 and %d", node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count()));
+    }
+    return std::chrono::milliseconds{wait};
+}
+
 static UniValue SubmitSignedAction(CWallet& wallet,
                                    WalletActionContext& context,
-                                   flowmesh::Action action)
+                                   flowmesh::Action action,
+                                   const std::chrono::milliseconds wait = std::chrono::milliseconds{0})
 {
     if (!flowmesh::SignAction(context.secret, context.market.domain,
                               context.market.execution_config_id, action) ||
@@ -383,10 +516,15 @@ static UniValue SubmitSignedAction(CWallet& wallet,
         throw JSONRPCError(RPC_INTERNAL_ERROR,
                            "Unable to sign the canonical FlowMesh action");
     }
+    // The signing key is not needed past this point: never keep a copy
+    // alive across the submission and its bounded wait.
+    context.secret = CKey{};
     auto receipt{BoundActionReceipt(
-        wallet.chain().submitFlowMeshActionReceipt(context.market.market_id, action), action.Id())};
+        wallet.chain().submitFlowMeshActionReceipt(context.market.market_id, action, wait), action.Id())};
     receipt.account_id = context.account;
-    UniValue out{node::FlowMeshClientReceiptJson(receipt)};
+    const bool remote{wallet.chain().flowMeshClientStatus().backend == "remote"};
+    StageReceipt(receipt, remote && receipt.state != "rejected", remote);
+    UniValue out{node::FlowMeshClientReceiptJson(receipt, node::FlowMeshReceiptJsonScope::LOCAL_RPC)};
     out.pushKV("market_id", context.market.market_id.GetHex());
     out.pushKV("sequence", action.sequence);
     return out;
@@ -566,9 +704,46 @@ static RPCResult ActionReceiptResult(
         {RPCResult::Type::STR, "reason", "Bounded receipt explanation; unknown is not definite rejection"},
         {RPCResult::Type::STR, "endpoint", "Reporting endpoint, or empty for the local engine"},
         {RPCResult::Type::BOOL, "certificate_verified", "An inclusion certificate was verified"},
-        {RPCResult::Type::BOOL, "outcome_verified", "Per-action execution outcome independently verified; certificate inclusion alone does not establish this"},
+        {RPCResult::Type::BOOL, "outcome_verified", "True exactly when 'outcome' is present: either recomputed by this client from data that hashes to the quorum-certified result root of the including entry (or the local engine's own re-execution), or proven impossible because a different certified action consumed its sequence (not_executed). Inclusion alone never sets it. Evidence is retained only for recent batches (at most 1,024 per market, fewer under load)"},
         {RPCResult::Type::STR_HEX, "microblock_hash", /*optional=*/true, "Certificate-linked microblock hash"},
         {RPCResult::Type::NUM, "microblock_sequence", /*optional=*/true, "Certificate-linked microblock sequence"},
+        {RPCResult::Type::STR, "reason_code", /*optional=*/true, "Named reason (observation, outcome or evidence availability); an unrecognised name means the outcome is unchanged. Never evidence by itself"},
+        {RPCResult::Type::STR, "stage", /*optional=*/true, "Display stage: signed, sent, queued, admitted, certified, outcome_verified, not_executed, refused or unknown"},
+        {RPCResult::Type::OBJ, "outcome", /*optional=*/true, "Verified per-action outcome, present exactly when outcome_verified", {
+            {RPCResult::Type::STR, "status", "applied, rejected (by state), included_not_executed or not_executed"},
+            {RPCResult::Type::BOOL, "final", "The outcome can never change. included_not_executed and an uncredited deposit are not final: the same bytes may still execute"},
+            {RPCResult::Type::STR, "reason_code", "Named outcome reason"},
+            {RPCResult::Type::STR, "reason_text", "One-line explanation"},
+            {RPCResult::Type::STR, "evidence", "certified_result_preimage, local_engine_execution or certified_sequence_consumer"},
+            {RPCResult::Type::NUM, "microblock_sequence", "The certified entry the outcome comes from"},
+            {RPCResult::Type::STR_HEX, "microblock_hash", "The certified entry the outcome comes from"},
+            {RPCResult::Type::OBJ, "fill", /*optional=*/true, "Orders: this entry's clearing for the account's side", {
+                {RPCResult::Type::STR, "side", "bid or ask"},
+                {RPCResult::Type::BOOL, "cleared", "The entry's auction cleared"},
+                {RPCResult::Type::BOOL, "superseded_in_entry", "A later order or cancel on the same side in the same entry replaced this curve before clearing"},
+                {RPCResult::Type::NUM, "quantity", "Base units filled in this entry; a remainder rests on the book"},
+                {RPCResult::Type::NUM, "price", "Uniform clearing price, native-B3 atomic units per base unit"},
+                {RPCResult::Type::NUM, "quote_atoms", "Bid: quote paid. Ask: gross proceeds"},
+                {RPCResult::Type::NUM, "fee_atoms", "Ask: fee withheld from proceeds"},
+                {RPCResult::Type::NUM, "net_quote_atoms", "Bid: quote paid. Ask: net proceeds"},
+            }},
+            {RPCResult::Type::OBJ, "withdrawal", /*optional=*/true, "Withdrawals: the certified withdrawal receipt", {
+                {RPCResult::Type::STR_HEX, "receipt_id", "Withdrawal receipt id"},
+                {RPCResult::Type::STR_HEX, "asset", "Asset"},
+                {RPCResult::Type::NUM, "amount", "Amount"},
+            }},
+            {RPCResult::Type::OBJ, "deposit", /*optional=*/true, "Deposits: the certified acceptance", {
+                {RPCResult::Type::STR_HEX, "txid", "Deposit transaction"},
+                {RPCResult::Type::NUM, "vout", "Deposit output"},
+                {RPCResult::Type::STR_HEX, "asset", "Asset"},
+                {RPCResult::Type::NUM, "amount", "Amount credited"},
+            }},
+            {RPCResult::Type::OBJ, "consumed_by", /*optional=*/true, "not_executed: the certified action that consumed the sequence", {
+                {RPCResult::Type::STR_HEX, "action_id", "Consuming action"},
+                {RPCResult::Type::NUM, "microblock_sequence", "Its certified entry"},
+                {RPCResult::Type::STR_HEX, "microblock_hash", "Its certified entry"},
+            }},
+        }},
     };
     fields.emplace_back(RPCResult::Type::STR_HEX, "market_id", "FlowMesh market id");
     for (RPCResult& field : action_fields) {
@@ -622,12 +797,18 @@ static RPCHelpMan ActionStatusRPC(const bool retry)
             const auto account{ExistingWalletAccount(*wallet)};
             if (!account) throw JSONRPCError(RPC_WALLET_ERROR, "This wallet has no FlowMesh account");
             const bool remote{wallet->chain().flowMeshClientStatus().backend == "remote"};
+            // Display stage only: whether the retained row may have been sent,
+            // read from the ownership lookup below (no extra backend call).
+            bool may_have_been_sent{false};
             if (remote) {
                 // Retained ownership is local durable metadata. A preliminary
                 // HTTPS query is neither necessary nor authority to retry.
                 const auto saved{wallet->chain().flowMeshSavedActions(*account, market_id)};
-                if (std::none_of(saved.begin(), saved.end(), [&](const auto& row) { return row.receipt.action_id == action_id; }))
+                const auto row{std::find_if(saved.begin(), saved.end(), [&](const auto& item) { return item.receipt.action_id == action_id; })};
+                if (row == saved.end())
                     throw JSONRPCError(RPC_WALLET_ERROR, "Action is not retained for this wallet's existing FlowMesh account");
+                // A status read may deliver (retry), never un-deliver.
+                may_have_been_sent = row->may_have_been_sent || retry;
             }
             auto receipt{BoundActionReceipt(wallet->chain().flowMeshActionStatus(market_id, action_id, remote && retry, wait), action_id)};
             if (receipt.account_id != account) {
@@ -639,7 +820,8 @@ static RPCHelpMan ActionStatusRPC(const bool retry)
                     throw JSONRPCError(RPC_WALLET_ERROR, "Action is not retained for this wallet's existing FlowMesh account");
                 }
             }
-            UniValue out{node::FlowMeshClientReceiptJson(receipt)};
+            StageReceipt(receipt, may_have_been_sent, remote);
+            UniValue out{node::FlowMeshClientReceiptJson(receipt, node::FlowMeshReceiptJsonScope::LOCAL_RPC)};
             out.pushKV("market_id", market_id.GetHex());
             return out;
         }};
@@ -663,6 +845,13 @@ RPCResult ClientStatusResult()
                     {RPCResult::Type::NUM, "last_attempt_ms", "Unix time in milliseconds of last completed attempt, or zero"},
                     {RPCResult::Type::NUM, "retry_after_ms", "Unix time in milliseconds before another automatic read attempt, or zero"},
                     {RPCResult::Type::NUM, "consecutive_failures", "Consecutive transport failures; API or market errors do not impose a transport cooldown"},
+                    {RPCResult::Type::STR, "readiness", "What the endpoint last advertised about its own readiness: unknown (not advertised), ready or not_ready. Display only; never evidence and never used to choose an endpoint"},
+                    {RPCResult::Type::STR, "readiness_market", "Market that readiness was reported for, or empty"},
+                    {RPCResult::Type::ARR, "not_ready", "The endpoint's advertised not-ready codes; a code you do not know still means not ready", {
+                        {RPCResult::Type::STR, "", "Not-ready code"},
+                    }},
+                    {RPCResult::Type::NUM, "readiness_observed_ms", "Unix time in milliseconds of that observation, or zero"},
+                    {RPCResult::Type::NUM, "live_updates_ms", "Longest bounded live-update watch this endpoint last advertised (updates_watch_ms_max), or zero when it offers none; a latency capability, never evidence"},
                 }},
             }},
         }};
@@ -775,7 +964,10 @@ RPCHelpMan listflowmeshactions()
                     row.pushKV("signed_bytes_sha256", item.signed_bytes_sha256); row.pushKV("signed_bytes_size", item.signed_bytes_size);
                     row.pushKV("initial_submission_ms", item.initial_submission_ms);
                     row.pushKV("may_have_been_sent", item.may_have_been_sent); row.pushKV("previously_certified", item.previously_certified);
-                    UniValue receipt{node::FlowMeshClientReceiptJson(item.receipt)}; receipt.pushKV("market_id", item.market_id.GetHex());
+                    auto staged{StripInconsistentOutcome(item.receipt)};
+                    StageReceipt(staged, item.may_have_been_sent, true);
+                    UniValue receipt{node::FlowMeshClientReceiptJson(staged, node::FlowMeshReceiptJsonScope::LOCAL_RPC)};
+                    receipt.pushKV("market_id", item.market_id.GetHex());
                     row.pushKV("receipt", std::move(receipt)); actions.push_back(std::move(row));
                 }
             }
@@ -916,6 +1108,87 @@ RPCHelpMan listflowmeshmarkets()
         }};
 }
 
+static std::vector<RPCResult> IndicativeResultFields()
+{
+    using T = RPCResult::Type;
+    return {
+        {T::BOOL, "available", "Computed within its bounded work"},
+        {T::STR, "unavailable_reason", /*optional=*/true, "work_budget (also: a book over 16384 standing curves), malformed_curve, invalid_draft, overflow, no_certified_state or head_changed (the head moved while this node copied the curves; read again)"},
+        {T::BOOL, "certified", "Always false"},
+        {T::BOOL, "excludes_pending_actions", "Always true: queued and uncertified actions are not included"},
+        {T::STR, "basis", "verified_standing_curves or verified_standing_curves_with_draft"},
+        {T::STR_HEX, "head", "Certified head whose curves were used; compare with snapshot.last_microblock_hash"},
+        {T::OBJ, "draft", /*optional=*/true, "The draft as evaluated", {
+            {T::STR, "side", "bid or ask"},
+            {T::NUM, "price", "Limit price in B3 atoms per base unit"},
+            {T::NUM, "quantity", "Base units"},
+            {T::BOOL, "account_known", "This wallet's account is known, so its rationed fill is exact"},
+            {T::BOOL, "replaces_standing_curve", "The draft replaces this account's standing curve on that side"},
+            {T::BOOL, "assumes_admission", "Always true: balance and reservation are not checked"},
+        }},
+        {T::BOOL, "cleared", "A nonzero match would occur"},
+        {T::NUM, "price", "Uniform price it would clear at; zero when not cleared"},
+        {T::NUM, "volume", "Base units it would match"},
+        {T::NUM, "imbalance", "|demand - supply| at that price, saturated at the monetary maximum"},
+        {T::STR, "imbalance_side", "Side that would be left unfilled: bid, ask or none"},
+        {T::NUM, "best_bid", /*optional=*/true, "Highest price with standing bid quantity, over every verified curve (never the draft)"},
+        {T::NUM, "best_ask", /*optional=*/true, "Lowest price with standing ask quantity, over every verified curve (never the draft)"},
+        {T::NUM, "draft_fill_min", /*optional=*/true, "The draft's fill at that price (exact when equal to draft_fill_max)"},
+        {T::NUM, "draft_fill_max", /*optional=*/true, "Upper bound of the draft's fill"},
+    };
+}
+
+static std::vector<RPCResult> BookLevelsSideResult()
+{
+    using T = RPCResult::Type;
+    return {
+        {T::BOOL, "available", "The side was aggregated within the bounded work"},
+        {T::STR, "unavailable_reason", /*optional=*/true, "work_budget or overflow (a level over the monetary maximum)"},
+        {T::BOOL, "more", "More levels follow the last one returned"},
+        {T::STR, "truncated_reason", /*optional=*/true, "The levels stopped early (work_budget or overflow): those returned are an exact prefix"},
+        {T::ARR, "levels", "Best first: bids by descending, asks by ascending canonical price", {
+            {T::OBJ, "", "One price level", {
+                {T::STR, "bucket", "Display bucket index as an exact decimal: the canonical price (exact), floor(price / step) of a bid or ceil of an ask (canonical), ceil(u) of a bid or floor(u) of an ask with u = 10^(9 - decimals - exponent) / (mantissa x price) (inverse)"},
+                {T::BOOL, "zero_price", "Canonical price zero in the inverse view: no finite token-per-B3 price"},
+                {T::NUM, "low", "Lowest canonical price in the level (B3 atoms per base unit)"},
+                {T::NUM, "high", "Highest canonical price in the level; the monetary maximum for an unbounded end"},
+                {T::NUM, "size", "Remaining base units whose own limit lies in the level"},
+                {T::NUM, "cumulative", "Base units from the best level through this one"},
+                {T::STR, "notional", /*optional=*/true, "Exact B3 atoms at each lot's own price, as a decimal; omitted when a curve has more prices in the level than the bounded computation reads"},
+                {T::NUM, "curves", "Standing curves with quantity in the level (one per account and side)"},
+                {T::NUM, "own", "This wallet's account's part of size"},
+            }},
+        }},
+    };
+}
+
+static std::vector<RPCResult> BookLevelsResultFields()
+{
+    using T = RPCResult::Type;
+    return {
+        {T::BOOL, "available", "Computed within its bounded work"},
+        {T::STR, "unavailable_reason", /*optional=*/true, "no_certified_state, head_changed (the head moved while this node copied the curves; read again), work_budget (also a book over 16384 standing curves) or malformed_curve"},
+        {T::BOOL, "certified", "Always false"},
+        {T::BOOL, "excludes_pending_actions", "Always true: queued and uncertified actions are not included"},
+        {T::STR, "basis", "verified_standing_curves"},
+        {T::STR_HEX, "head", "Certified head whose curves were used; compare with snapshot.last_microblock_hash"},
+        {T::NUM, "depth", "Levels per side asked for"},
+        {T::OBJ, "grouping", "The grouping used, as asked for", {
+            {T::BOOL, "exact", "One level per canonical price"},
+            {T::STR, "orientation", /*optional=*/true, "canonical or inverse"},
+            {T::NUM, "mantissa", /*optional=*/true, "1, 2 or 5"},
+            {T::NUM, "exponent", /*optional=*/true, "Power of ten of the display step"},
+            {T::NUM, "decimals", /*optional=*/true, "Base asset decimals the step is for"},
+        }},
+        {T::NUM, "total_curves", /*optional=*/true, "Standing curves aggregated"},
+        {T::NUM, "best_bid", /*optional=*/true, "Exact highest price with standing bid quantity"},
+        {T::NUM, "best_ask", /*optional=*/true, "Exact lowest price with standing ask quantity; zero for an ask that sells at any price"},
+        {T::OBJ, "bids", /*optional=*/true, "Canonical bids", BookLevelsSideResult()},
+        {T::OBJ, "asks", /*optional=*/true, "Canonical asks", BookLevelsSideResult()},
+        {T::OBJ, "standing", /*optional=*/true, "What the next clearing would be if the verified standing curves were cleared as they are, without any draft (a crossed book after a rationed clearing clears at the next certified execution); NOT certified", IndicativeResultFields()},
+    };
+}
+
 RPCHelpMan getflowmeshmarketdata()
 {
     using T = RPCResult::Type;
@@ -927,12 +1200,19 @@ RPCHelpMan getflowmeshmarketdata()
         "All prices are integer B3 atoms per base atomic unit and all quantities are integer base units; B3 has nine decimals. "
         "History contains at most the latest 256 certified microblocks, rebuilt during normal verified startup replay. "
         "Account fills are explicitly marked unknown if outside the bounded per-entry account cache. "
-        "Microblocks contain no execution timestamp: chart actual cleared entries against sequence. "
+        "Microblocks contain no certified execution timestamp. observed_time adds operator-observed time: when the node that served "
+        "the data applied each entry, by that node's own clock, labelled with its source and never certified; entries it applied late "
+        "(catch-up, a lag, a reconciliation wait or the warm-up after a start) carry only an upper bound, and history it never observed has no time. "
         "local_observed_at is only this process's observation time and is absent for replayed heads. "
         "An old head on an idle market does not prove quorum failure. Standing curve identity is account and side; the v1 state does not retain submission ids or original submission sequences. "
         "Use expected_head when continuing curve pages; a changed head rejects pagination. "
         "known_head returns current lightweight status with unchanged=true when immutable data is unchanged. "
-        "Checkpoint status remains available through listflowmeshmarkets; this bounded query does not scan the checkpoint backlog.\n",
+        "Checkpoint status remains available through listflowmeshmarkets; this bounded query does not scan the checkpoint backlog. "
+        "watch_ms makes this a live-update read: it first waits, at most that long and at most 1500 ms, until the endpoint (or the local engine) can report a new event, "
+        "gap or head for this market and wallet, then returns the same verified data and a watch object. A remote client watches only an endpoint that advertises "
+        "live updates (getflowmeshclientinfo live_updates_ms) and otherwise reads at once; the wallet is held for at most watch_ms plus 5 seconds. "
+        "When watch.supported or watch.waited is false, callers must pace repeated reads themselves (at least 500 ms apart). watch_ms 0 is an ordinary read "
+        "that also closes the remote client's live-update connection. A watch never signs, submits or resends an action.\n",
         {
             {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Market id"},
             {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Bounded query options", {
@@ -942,6 +1222,29 @@ RPCHelpMan getflowmeshmarketdata()
                 {"curve_cursor", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Exclusive bid:<account_id> or ask:<account_id> cursor; requires expected_head"},
                 {"expected_head", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Reject if the certified head has changed"},
                 {"known_head", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Omit heavy data when the head matches; cannot be combined with pagination cursors"},
+                {"watch_ms", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Live update: wait up to this many milliseconds (0-2000, at most 1500 used) for a change before reading; cannot be combined with before_sequence, curve_cursor or expected_head"},
+                {"ticks", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Clearing ticks, oldest first, also returned with an unchanged known_head", {
+                    {"after_sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Ticks after this microblock sequence; omit for the newest"},
+                    {"limit", RPCArg::Type::NUM, RPCArg::Default{64}, "Ticks, 1-256"},
+                }},
+                {"observed_time", RPCArg::Type::BOOL, RPCArg::Default{false}, "Operator-observed times of the head and of the returned history and ticks, also returned with an unchanged known_head; never certified"},
+                {"levels", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Price levels of all verified standing curves (not only the curve page), computed by this node when the head changed; never certified", {
+                    {"depth", RPCArg::Type::NUM, RPCArg::Default{20}, "Levels per side, 1-50"},
+                    {"group", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Group prices into display buckets of mantissa x 10^exponent; omit for one level per canonical price", {
+                        {"orientation", RPCArg::Type::STR, RPCArg::Optional::NO, "canonical (B3 per token) or inverse (token per B3)"},
+                        {"mantissa", RPCArg::Type::NUM, RPCArg::Optional::NO, "1, 2 or 5"},
+                        {"exponent", RPCArg::Type::NUM, RPCArg::Optional::NO, "Power of ten of the display step. Canonical: the step is mantissa x 10^(exponent + 9 - decimals) price ticks, so exponent + 9 - decimals must be 0-18 (within the monetary maximum); inverse: 9 - decimals - exponent must be 0-36"},
+                        {"decimals", RPCArg::Type::NUM, RPCArg::Optional::NO, "The base asset's display decimals, 0-18"},
+                    }},
+                    {"include_unchanged", RPCArg::Type::BOOL, RPCArg::Default{false}, "Also compute them for an unchanged known_head (after a grouping change)"},
+                }},
+                {"indicative", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Indicative next clearing of the verified standing curves, also returned with an unchanged known_head; never certified", {
+                    {"draft", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "A prospective limit order of this wallet's account, replacing its standing curve on that side", {
+                        {"side", RPCArg::Type::STR, RPCArg::Optional::NO, "bid or ask"},
+                        {"price", RPCArg::Type::NUM, RPCArg::Optional::NO, "Limit price in B3 atomic units per base unit"},
+                        {"quantity", RPCArg::Type::NUM, RPCArg::Optional::NO, "Exact integer base-asset quantity"},
+                    }},
+                }},
             }},
         },
         RPCResult{T::OBJ, "", "Bounded certified market snapshot", {
@@ -962,8 +1265,60 @@ RPCHelpMan getflowmeshmarketdata()
                 {T::BOOL, "execution_result_verified", "Execution results independently replayed; a state certificate alone is insufficient"},
                 {T::BOOL, "b3_checkpoint_confirmed", "B3 checkpoint confirmation independently checked"},
                 {T::BOOL, "history_endpoint_reported", "History is endpoint-reported rather than independently execution-verified"},
-                {T::BOOL, "event_gap", "Explicit cursor gap requiring snapshot recovery"},
+                {T::BOOL, "event_gap", "Sticky: the client's event cursor for this market was lost at least once (endpoint-reported gap, other endpoint or restarted endpoint, restart of this client, or a wallet/authority change), so events in between may never have been seen; balances and orders still come only from verified snapshots"},
                 {T::BOOL, "freshest_network_head_proven", "False: a valid response does not prove the freshest network head"},
+            }},
+            {T::OBJ, "clearing_ticks", /*optional=*/true, "Present only when ticks was given: one tick per certified microblock of the bounded history, including on unchanged responses", {
+                {T::BOOL, "available", "Ticks are available through this backend"},
+                {T::STR, "unavailable_reason", /*optional=*/true, "Why they are not"},
+                {T::STR, "source", "local_engine (replayed by this node), or endpoint_reported (only the tick at the verified head is checked, against that head's hash)"},
+                {T::NUM, "oldest_retained_sequence", /*optional=*/true, "Oldest retained tick"},
+                {T::BOOL, "gap", "Ticks after after_sequence were evicted before the first returned one: missing record, not a period without trading"},
+                {T::BOOL, "more", "More retained ticks follow; continue after the last sequence"},
+                {T::ARR, "ticks", "Consecutive microblocks, oldest first; no execution timestamp", {
+                    {T::OBJ, "", "One certified microblock", {
+                        {T::NUM, "sequence", "Global microblock sequence"},
+                        {T::STR_HEX, "microblock_hash", "Certified microblock id"},
+                        {T::STR, "kind", "execution, settlement or handoff"},
+                        {T::BOOL, "cleared", "An actual nonzero match occurred"},
+                        {T::NUM, "price", "Uniform clearing price in B3 atoms per base unit; zero when not cleared"},
+                        {T::NUM, "volume", "Matched base units"},
+                        {T::NUM, "imbalance", "Committed |demand - supply| at the clearing price, saturated at the monetary maximum"},
+                        {T::STR, "imbalance_side", "Side left unfilled at the price: bid, ask, none, or unknown when it was not observed"},
+                    }},
+                }},
+            }},
+            {T::OBJ, "indicative", /*optional=*/true, "Present only when indicative was given. NOT certified: what the next clearing would be if the verified standing curves (and the draft) were cleared now; actions not yet certified are excluded", IndicativeResultFields()},
+            {T::OBJ, "book_levels", /*optional=*/true, "Present only when levels was given and the head changed (or include_unchanged). NOT certified: price levels this node aggregated from every verified standing curve; actions not yet certified are excluded. Not a price-time order book: each level is the quantity of standing curves whose own limit lies in its price range", BookLevelsResultFields()},
+            {T::OBJ, "observed_time", /*optional=*/true, "Present only when observed_time was true: operator-observed time, when the source applied each entry by its own clock; never certified execution time", {
+                {T::BOOL, "available", "The source records observed times"},
+                {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, endpoint_does_not_advertise_observed_time, observed_time_withdrawn or malformed"},
+                {T::STR, "source", "this_node, or the endpoint URL that reported them"},
+                {T::STR, "source_kind", "operator_observed"},
+                {T::BOOL, "certified", "Always false"},
+                {T::BOOL, "clock_suspect", "The source's clock is suspected wrong"},
+                {T::NUM, "recorded_since_sequence", /*optional=*/true, "Oldest entry the source retains a time for; earlier history has none"},
+                {T::ARR, "rows", "The head and the returned history and tick entries the source has a time for, ascending", {
+                    {T::OBJ, "", "One entry", {
+                        {T::NUM, "sequence", "Global microblock sequence"},
+                        {T::STR_HEX, "microblock_hash", "Certified microblock id"},
+                        {T::STR, "mode", "live (applied while caught up), delayed (applied late: only an upper bound) or untimed (no time: the source's clock stood behind an earlier stamp)"},
+                        {T::NUM, "observed_ms", /*optional=*/true, "live only: Unix milliseconds when the source applied it"},
+                        {T::NUM, "applied_here_ms", /*optional=*/true, "delayed only: when the source applied it, an upper bound, never a trade time"},
+                        {T::ARR, "flags", "clock_clamped, clock_step, clock_suspect, restart, no_clearing_data or implausible (a failed plausibility check of an endpoint's stamp)", {
+                            {T::STR, "", "Flag"},
+                        }},
+                        {T::STR, "delay_reason", /*optional=*/true, "Why this node applied it late: catchup, deferred, behind, stale_anchor, warmup or clock_stepped_back (peer_hint only on a row an earlier development build recorded)"},
+                    }},
+                }},
+            }},
+            {T::OBJ, "watch", /*optional=*/true, "Present only when watch_ms was given: this read's local latency observation, never evidence", {
+                {T::STR, "status", "none, no_cursor, head_changed, ready, gap, timeout, interrupted, restarted, busy, deadline (endpoint), or not_eligible, lane_busy, superseded, unsupported, failed, revalidate, invalid, ticks_catchup, other (this client)"},
+                {T::BOOL, "supported", "The endpoint (or the local engine) served the watch"},
+                {T::BOOL, "waited", "It waited or reported a change or gap, or (ticks_catchup) read ordinarily once for clearing ticks; watch again at once. Otherwise pace the next read"},
+                {T::BOOL, "gap", "This read found an event gap"},
+                {T::STR, "endpoint", "Endpoint the watch was for, or empty"},
+                {T::NUM, "endpoint_live_ms", "That endpoint's advertised live-update maximum, or zero"},
             }},
             {T::OBJ, "base_metadata", /*optional=*/true, "Verified display precision and sourced cosmetic labels, including on unchanged responses; does not certify backing", {
                 {T::BOOL, "known", "Immutable display precision is verified"},
@@ -1003,7 +1358,7 @@ RPCHelpMan getflowmeshmarketdata()
                     {T::NUM, "proposals_verified_different_round", "Fully checked candidate proposals processed despite differing local rounds; not a count of unique signers"},
                     {T::NUM, "proposals_conflicting_lock", "Authenticated competing proposals ignored while preserving the exact local safety lock; not evidence of a conflicting certificate"},
                     {T::NUM, "attestations_without_candidate", "Decoded attestation frames naming an in-range seat received with no cached candidate; these are not verified votes"},
-                    {T::NUM, "last_message_observed_at", /*optional=*/true, "Local Unix observation time of market traffic, not certified time"},
+                    {T::NUM, "last_message_observed_at", /*optional=*/true, "Local Unix observation time of market traffic processed by the FlowMesh worker, not certified time; frames consumed at admission (exact repeats of verified agreement bytes, committee frames for already appended slots) are not counted"},
                     {T::STR_HEX, "local_locked_candidate", /*optional=*/true, "Cached local safety-lock candidate at the current signing position; no journal is read by this RPC"},
                 }},
             }},
@@ -1053,12 +1408,52 @@ RPCHelpMan getflowmeshmarketdata()
             const auto wallet{GetWalletForJSONRPCRequest(request)};
             if (!wallet) return UniValue::VNULL;
             const uint256 market_id{ParseMarketId(request.params[0])};
-            const auto query{ParseMarketDataQuery(request.params[1])};
+            // watch_ms is taken out before the shared, strict query parser.
+            UniValue options{request.params[1]};
+            std::optional<std::chrono::milliseconds> watch_ms;
+            if (options.isObject() && options.exists("watch_ms")) {
+                const auto& value{options["watch_ms"]};
+                uint64_t wait{0};
+                try {
+                    if (!value.isNum()) throw UniValue::type_error{"watch_ms"};
+                    wait = value.getInt<uint64_t>();
+                } catch (const std::runtime_error&) {
+                    // Not a number, negative, fractional or beyond 64 bits.
+                    throw JSONRPCError(RPC_TYPE_ERROR, "watch_ms must be a nonnegative integer");
+                }
+                if (wait > 2000) throw JSONRPCError(RPC_INVALID_PARAMETER, "watch_ms is outside its supported range");
+                watch_ms = std::chrono::milliseconds{wait};
+                UniValue rest{UniValue::VOBJ};
+                for (const auto& key : options.getKeys()) {
+                    if (key != "watch_ms") rest.pushKV(key, options[key]);
+                }
+                options = std::move(rest);
+            }
+            auto query{ParseMarketDataQuery(options)};
+            if (watch_ms && (query.before_sequence || query.curve_cursor || query.expected_head)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "watch_ms cannot be combined with before_sequence, curve_cursor or expected_head");
+            }
             const auto account{ExistingWalletAccount(*wallet)};
+            // A draft is this wallet's own prospective order.
+            if (query.indicative && query.indicative->draft) query.indicative->draft->account = account;
+            // Each level's own share is this wallet's.
+            if (query.levels) query.levels->account = account;
             std::string error;
-            const auto data{wallet->chain().flowMeshMarketData(market_id, account, query, error)};
+            interfaces::FlowMeshMarketWatch watch;
+            const auto data{watch_ms ? wallet->chain().flowMeshWatchMarketData(market_id, account, query, *watch_ms, watch, error)
+                                     : wallet->chain().flowMeshMarketData(market_id, account, query, error)};
             if (!data) throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "FlowMesh market data is unavailable" : error);
             UniValue out{CertifiedMarketDataJson(*data)};
+            if (watch_ms) {
+                UniValue observed{UniValue::VOBJ};
+                observed.pushKV("status", watch.status);
+                observed.pushKV("supported", watch.supported);
+                observed.pushKV("waited", watch.waited);
+                observed.pushKV("gap", watch.gap);
+                observed.pushKV("endpoint", watch.endpoint);
+                observed.pushKV("endpoint_live_ms", uint64_t{watch.endpoint_live_ms});
+                out.pushKV("watch", std::move(observed));
+            }
             UniValue metadata{UniValue::VOBJ};
             {
                 LOCK(wallet->cs_wallet);
@@ -1071,6 +1466,101 @@ RPCHelpMan getflowmeshmarketdata()
                 metadata.pushKV("test_only", asset.test_only);
             }
             out.pushKV("base_metadata", std::move(metadata));
+            return out;
+        }};
+}
+
+RPCHelpMan getflowmeshcandles()
+{
+    using T = RPCResult::Type;
+    return RPCHelpMan{
+        "getflowmeshcandles",
+        "Read one page of a market's candles in operator-observed time: UTC-aligned buckets of the clearings the serving node applied "
+        "while caught up with the network, by that node's own clock. Display only and never certified: microblocks carry no execution time. "
+        "An entry the node applied late is counted only when its whole time bound lies inside one bucket (flag late); otherwise it is in no "
+        "candle and the buckets it may belong to are flagged partial. Nothing is interpolated and empty buckets are not returned: two candles "
+        "whose sequences are consecutive (the later without seam_before) prove that no auction happened between them; anything else is a gap. "
+        "With the local engine, older pages come from this node's observed-time database; a remote client asks the endpoint that serves its "
+        "market data, only when that endpoint advertises candles, and those prices, volumes and times are the endpoint's claims.",
+        {
+            {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Market id"},
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Page options", {
+                {"interval", RPCArg::Type::STR, RPCArg::Default{"1m"}, "1m, 5m, 15m, 1h, 4h or 1d"},
+                {"before_ms", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Exclusive end of the window in Unix milliseconds; omit for the newest"},
+                {"limit", RPCArg::Type::NUM, RPCArg::Default{200}, "Window length in intervals, 1-500"},
+            }},
+        },
+        RPCResult{T::OBJ, "", "Candles in the window [before_ms - limit x interval, before_ms), oldest first", {
+            {T::BOOL, "available", "The source records observed time"},
+            {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, endpoint_does_not_advertise_candles, or why the endpoint's page was refused"},
+            {T::STR, "source", "this_node, or the endpoint URL that reported them"},
+            {T::STR, "source_kind", "operator_observed"},
+            {T::BOOL, "certified", "Always false"},
+            {T::BOOL, "endpoint_reported", "Prices, volumes and times are the endpoint's claims, not verified here"},
+            {T::STR, "interval", "The interval"},
+            {T::NUM, "interval_ms", "Its length in milliseconds"},
+            {T::NUM, "from_ms", "Inclusive start of the window"},
+            {T::NUM, "before_ms", "Exclusive end of the window"},
+            {T::BOOL, "more", "Older candles exist: continue with before_ms = from_ms"},
+            {T::ARR, "candles", "Only buckets holding placed entries", {
+                {T::OBJ, "", "One bucket", {
+                    {T::NUM, "open_ms", "UTC-aligned bucket start"},
+                    {T::NUM, "first_sequence", "First placed microblock"},
+                    {T::NUM, "last_sequence", "Last placed microblock"},
+                    {T::NUM, "entries", "Placed microblocks"},
+                    {T::NUM, "clearings", "Placed microblocks with a match"},
+                    {T::NUM, "open", /*optional=*/true, "First clearing price, B3 atoms per base unit (with a clearing)"},
+                    {T::NUM, "high", /*optional=*/true, "Highest clearing price"},
+                    {T::NUM, "low", /*optional=*/true, "Lowest clearing price"},
+                    {T::NUM, "close", /*optional=*/true, "Last clearing price"},
+                    {T::STR, "base_volume", "Exact matched base units, decimal"},
+                    {T::STR, "quote_volume", "Exact matched B3 atoms (price x volume per clearing), decimal"},
+                    {T::ARR, "flags", "partial, late, seam_before or clock", {
+                        {T::STR, "", "Flag"},
+                    }},
+                }},
+            }},
+        }},
+        RPCExamples{HelpExampleCli("getflowmeshcandles", "\"<market_id>\" '{\"interval\":\"5m\",\"limit\":100}'")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            const uint256 market_id{ParseMarketId(request.params[0])};
+            const UniValue& options{request.params[1]};
+            flowmesh::CandleInterval interval{flowmesh::CandleInterval::M1};
+            std::optional<int64_t> before_ms;
+            size_t limit{200};
+            if (!options.isNull()) {
+                if (!options.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "options must be an object");
+                for (const auto& key : options.getKeys()) {
+                    if (key != "interval" && key != "before_ms" && key != "limit") throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown option '" + key + "'");
+                }
+                if (options.exists("interval")) {
+                    if (!options["interval"].isStr()) throw JSONRPCError(RPC_TYPE_ERROR, "interval must be a string");
+                    const auto parsed{flowmesh::ParseCandleInterval(options["interval"].get_str())};
+                    if (!parsed) throw JSONRPCError(RPC_INVALID_PARAMETER, "interval must be 1m, 5m, 15m, 1h, 4h or 1d");
+                    interval = *parsed;
+                }
+                const auto number = [&](const char* name, const uint64_t minimum, const uint64_t maximum) {
+                    const auto& value{options[name]};
+                    uint64_t out{0};
+                    try {
+                        if (!value.isNum()) throw UniValue::type_error{name};
+                        out = value.getInt<uint64_t>();
+                    } catch (const std::runtime_error&) {
+                        throw JSONRPCError(RPC_TYPE_ERROR, std::string{name} + " must be a nonnegative integer");
+                    }
+                    if (out < minimum || out > maximum) throw JSONRPCError(RPC_INVALID_PARAMETER, std::string{name} + " is outside its supported range");
+                    return out;
+                };
+                if (options.exists("before_ms")) before_ms = static_cast<int64_t>(number("before_ms", 0, std::numeric_limits<int64_t>::max()));
+                if (options.exists("limit")) limit = number("limit", 1, 500);
+            }
+            std::string error;
+            const auto page{wallet->chain().flowMeshCandles(market_id, interval, before_ms, limit, error)};
+            if (!page) throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "FlowMesh candles are unavailable" : error);
+            UniValue out{node::FlowMeshObservedCandlePageJson(*page)};
+            out.pushKV("endpoint_reported", page->remote);
             return out;
         }};
 }
@@ -1231,7 +1721,9 @@ RPCHelpMan submitflowmeshdeposit()
             auto receipt{BoundActionReceipt(
                 wallet->chain().submitFlowMeshActionReceipt(market_id, action), action.Id())};
             receipt.account_id = *account;
-            UniValue out{node::FlowMeshClientReceiptJson(receipt)};
+            const bool remote{wallet->chain().flowMeshClientStatus().backend == "remote"};
+            StageReceipt(receipt, remote && receipt.state != "rejected", remote);
+            UniValue out{node::FlowMeshClientReceiptJson(receipt, node::FlowMeshReceiptJsonScope::LOCAL_RPC)};
             out.pushKV("kind", QueueActionName(action.type));
             out.pushKV("market_id", market_id.GetHex());
             out.pushKV("deposit_txid", outpoint.hash.GetHex());
@@ -1257,6 +1749,7 @@ RPCHelpMan submitflowmeshorder()
              "Exact integer base-asset quantity"},
             {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
              "Account sequence (default: current certified next sequence)"},
+            SubmitWaitArg(),
         },
         AcceptedActionResult("Signed order submission receipt", {
             {RPCResult::Type::STR, "side", "bid or ask"},
@@ -1264,7 +1757,8 @@ RPCHelpMan submitflowmeshorder()
             {RPCResult::Type::NUM, "quantity", "Exact base-asset quantity"},
         }),
         RPCExamples{HelpExampleCli(
-            "submitflowmeshorder", "\"<market_id>\" bid 10000 500")},
+            "submitflowmeshorder", "\"<market_id>\" bid 10000 500") +
+                    HelpExampleCli("submitflowmeshorder", "\"<market_id>\" bid 10000 500 7 2000")},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
             const std::shared_ptr<CWallet> wallet{
                 GetWalletForJSONRPCRequest(request)};
@@ -1274,6 +1768,7 @@ RPCHelpMan submitflowmeshorder()
             const CAmount price{ExactPositiveAmount(request.params[2], "price")};
             const CAmount quantity{
                 ExactPositiveAmount(request.params[3], "quantity")};
+            const auto wait{ParseSubmitWait(request.params[5])};
             WalletActionContext context{
                 GetWalletActionContext(*wallet, market_id)};
             flowmesh::Action action;
@@ -1287,10 +1782,129 @@ RPCHelpMan submitflowmeshorder()
                                     : flowmesh::ActionType::SPOT_TO_FUTURES);
             action.curve = LimitCurve(side, price, quantity);
             UniValue out{SubmitSignedAction(*wallet, context,
-                                             std::move(action))};
+                                             std::move(action), wait)};
             out.pushKV("side", side);
             out.pushKV("price", price);
             out.pushKV("quantity", quantity);
+            return out;
+        }};
+}
+
+//! The ladder steps of submitflowmeshladder, strictly: 1 to
+//! FLOWMESH_LADDER_MAX_STEPS objects {price, quantity}, distinct positive
+//! prices (a bid below MAX_MONEY), positive quantities, and a reservation
+//! within the monetary range. Checked before any key is read.
+static std::vector<flowmesh::LadderStep> ParseLadderSteps(const UniValue& value, const bool bid)
+{
+    if (!value.isArray()) throw JSONRPCError(RPC_TYPE_ERROR, "steps must be an array");
+    if (value.empty() || value.size() > flowmesh::FLOWMESH_LADDER_MAX_STEPS) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("steps must hold 1 to %d prices", flowmesh::FLOWMESH_LADDER_MAX_STEPS));
+    }
+    std::vector<flowmesh::LadderStep> steps;
+    std::set<CAmount> prices;
+    for (const auto& item : value.getValues()) {
+        if (!item.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "each step must be an object");
+        for (const auto& key : item.getKeys()) {
+            if (key != "price" && key != "quantity") throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown step option '" + key + "'");
+        }
+        const CAmount price{ExactPositiveAmount(item["price"], "price")};
+        const CAmount quantity{ExactPositiveAmount(item["quantity"], "quantity")};
+        if (bid && price >= MAX_MONEY) throw JSONRPCError(RPC_INVALID_PARAMETER, "bid price must be below MAX_MONEY");
+        if (!prices.insert(price).second) throw JSONRPCError(RPC_INVALID_PARAMETER, "each ladder price must be distinct");
+        steps.push_back({price, quantity});
+    }
+    if (!flowmesh::LadderReservation(bid, steps)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "the ladder's total quantity or reservation exceeds MAX_MONEY");
+    }
+    return steps;
+}
+
+RPCHelpMan submitflowmeshladder()
+{
+    return RPCHelpMan{
+        "submitflowmeshladder",
+        "Place a locally signed ladder of limit orders on one side: up to " + util::ToString(flowmesh::FLOWMESH_LADDER_MAX_STEPS) +
+            " prices, each with its own quantity, as ONE standing curve (a staircase with one-tick drops) carried by the same "
+            "signed SUBMIT_BID or SUBMIT_ASK action as submitflowmeshorder. FlowMesh keeps one curve per account and side, so like "
+            "any order it replaces this account's order on that side, and its quantity counts from zero. A bid ladder buys each "
+            "step's quantity at its price or below and reserves exactly the sum of quantity x price B3 atoms; an ask ladder sells "
+            "each step at its price or above and reserves the sum of its quantities. It fills in the same uniform-price auction; "
+            "a step is not a separate order and cannot be cancelled alone. Clients that predate ladders show it only as a general "
+            "curve (curve depth), and their marketable-limit helper then refuses to price the market. A queued/admitted receipt is "
+            "not a fill. For an unknown outcome, retain the action_id and use retryflowmeshaction rather than signing a replacement.\n" +
+            HELP_REQUIRING_PASSPHRASE,
+        {
+            {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte market id"},
+            {"side", RPCArg::Type::STR, RPCArg::Optional::NO, "'bid' or 'ask'"},
+            {"steps", RPCArg::Type::ARR, RPCArg::Optional::NO, "The ladder's prices, in any order", {
+                {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "One price", {
+                    {"price", RPCArg::Type::NUM, RPCArg::Optional::NO, "Limit price in B3 atomic units per base unit"},
+                    {"quantity", RPCArg::Type::NUM, RPCArg::Optional::NO, "Exact integer base-asset quantity at this price"},
+                }},
+            }},
+            {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Account sequence (default: current certified next sequence)"},
+            SubmitWaitArg(),
+        },
+        AcceptedActionResult("Signed ladder submission receipt", {
+            {RPCResult::Type::STR, "side", "bid or ask"},
+            {RPCResult::Type::ARR, "steps", "The ladder's prices, ascending", {
+                {RPCResult::Type::OBJ, "", "One price", {
+                    {RPCResult::Type::NUM, "price", "Limit price in B3 atomic units per base unit"},
+                    {RPCResult::Type::NUM, "quantity", "Base-asset quantity at this price"},
+                }},
+            }},
+            {RPCResult::Type::NUM, "quantity", "Total base-asset quantity"},
+            {RPCResult::Type::NUM, "reservation", "What the ladder reserves: B3 atoms for a bid, base units for an ask"},
+            {RPCResult::Type::ARR, "points", "The signed curve's breakpoints", {
+                {RPCResult::Type::OBJ, "", "Breakpoint", {
+                    {RPCResult::Type::NUM, "price", "B3 atoms per base atomic unit"},
+                    {RPCResult::Type::NUM, "quantity", "Base atomic units at this price"},
+                }},
+            }},
+        }),
+        RPCExamples{HelpExampleCli("submitflowmeshladder", "\"<market_id>\" bid '[{\"price\":10000,\"quantity\":500},{\"price\":9900,\"quantity\":800}]'") +
+                    HelpExampleRpc("submitflowmeshladder", "\"<market_id>\", \"ask\", [{\"price\":10100,\"quantity\":300},{\"price\":10200,\"quantity\":300}]")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<CWallet> wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            const uint256 market_id{ParseMarketId(request.params[0])};
+            const std::string side{request.params[1].get_str()};
+            if (side != "bid" && side != "ask") throw JSONRPCError(RPC_INVALID_PARAMETER, "side must be 'bid' or 'ask'");
+            const bool bid{side == "bid"};
+            auto steps{ParseLadderSteps(request.params[2], bid)};
+            const auto curve{bid ? flowmesh::MakeLadderBidCurve(steps) : flowmesh::MakeLadderAskCurve(steps)};
+            const auto reservation{flowmesh::LadderReservation(bid, steps)};
+            if (!curve || !reservation) throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid ladder");
+            const auto wait{ParseSubmitWait(request.params[4])};
+            WalletActionContext context{GetWalletActionContext(*wallet, market_id)};
+            flowmesh::Action action;
+            action.signer = context.account;
+            action.sequence = OptionalSequence(request.params[3], context.market.next_account_sequence);
+            action.type = static_cast<uint8_t>(bid ? flowmesh::ActionType::SUBMIT_BID : flowmesh::ActionType::SUBMIT_ASK);
+            action.curve = *curve;
+            UniValue out{SubmitSignedAction(*wallet, context, std::move(action), wait)};
+            std::sort(steps.begin(), steps.end(), [](const auto& a, const auto& b) { return a.price < b.price; });
+            UniValue step_list{UniValue::VARR};
+            CAmount total{0};
+            for (const auto& step : steps) {
+                UniValue row{UniValue::VOBJ};
+                row.pushKV("price", step.price);
+                row.pushKV("quantity", step.qty);
+                step_list.push_back(std::move(row));
+                total += step.qty;
+            }
+            UniValue points{UniValue::VARR};
+            for (const auto& point : *curve) {
+                UniValue row{UniValue::VOBJ};
+                row.pushKV("price", point.price);
+                row.pushKV("quantity", point.qty);
+                points.push_back(std::move(row));
+            }
+            out.pushKV("side", side);
+            out.pushKV("steps", std::move(step_list));
+            out.pushKV("quantity", total);
+            out.pushKV("reservation", *reservation);
+            out.pushKV("points", std::move(points));
             return out;
         }};
 }
@@ -1308,6 +1922,7 @@ RPCHelpMan cancelflowmeshorder()
              "'bid' or 'ask'"},
             {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
              "Account sequence (default: current certified next sequence)"},
+            SubmitWaitArg(),
         },
         AcceptedActionResult("Signed cancellation submission receipt", {
             {RPCResult::Type::STR, "side", "bid or ask"},
@@ -1324,6 +1939,7 @@ RPCHelpMan cancelflowmeshorder()
                 throw JSONRPCError(RPC_INVALID_PARAMETER,
                                    "side must be 'bid' or 'ask'");
             }
+            const auto wait{ParseSubmitWait(request.params[3])};
             WalletActionContext context{
                 GetWalletActionContext(*wallet, market_id)};
             flowmesh::Action action;
@@ -1334,7 +1950,7 @@ RPCHelpMan cancelflowmeshorder()
                 side == "bid" ? flowmesh::ActionType::CANCEL_BID
                               : flowmesh::ActionType::CANCEL_ASK);
             UniValue out{SubmitSignedAction(*wallet, context,
-                                             std::move(action))};
+                                             std::move(action), wait)};
             out.pushKV("side", side);
             return out;
         }};
@@ -1357,6 +1973,7 @@ RPCHelpMan requestflowmeshwithdrawal()
              "Owner address for the eventual payout"},
             {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
              "Account sequence (default: current certified next sequence)"},
+            SubmitWaitArg(),
         },
         AcceptedActionResult("Signed withdrawal submission receipt", {
             {RPCResult::Type::STR, "asset", "B3 or the colored-asset id"},
@@ -1390,6 +2007,7 @@ RPCHelpMan requestflowmeshwithdrawal()
             }
             const CScript destination_script{
                 GetScriptForDestination(destination)};
+            const auto wait{ParseSubmitWait(request.params[5])};
             WalletActionContext context{
                 GetWalletActionContext(*wallet, market_id)};
             if (asset != modern::NativeAsset() &&
@@ -1408,7 +2026,7 @@ RPCHelpMan requestflowmeshwithdrawal()
             action.destination =
                 modern::AssetOwnerCommitment(destination_script);
             UniValue out{SubmitSignedAction(*wallet, context,
-                                             std::move(action))};
+                                             std::move(action), wait)};
             out.pushKV("asset", asset == modern::NativeAsset()
                                     ? "B3"
                                     : asset.GetHex());

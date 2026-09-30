@@ -119,8 +119,10 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   external_signer.cpp
   flowmesh/bls_certificate.cpp
   flowmesh/p2p.cpp
+  flowmesh/outcome_evidence.cpp
   flowmesh/production_engine.cpp
   flowmesh/production_wire.cpp
+  flowmesh/seat_evidence.cpp
   init/common.cpp
   kernel/chainparams.cpp
   legacy/checkpoints.cpp
@@ -265,13 +267,18 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/flowmesh_agreement.cpp
   flowmesh/preagreement.cpp
   flowmesh/agreement_wire.cpp
+  node/flowmesh_health.cpp
   node/flowmesh_runtime.cpp
   node/flowmesh_timing.cpp
   node/flowmesh_service.cpp
   node/flowmesh_client.cpp
   node/flowmesh_client_settlement.cpp
+  node/flowmesh_client_ticks.cpp
+  node/flowmesh_observed_time_log.cpp
   node/flowmesh_https.cpp
   flowmesh/client_evidence.cpp
+  flowmesh/market_view.cpp
+  flowmesh/observed_time.cpp
   node/flowmesh_net.cpp
   node/flowmesh_store.cpp
   node/flowmesh_vault_index.cpp

@@ -10,6 +10,8 @@
 #include <flowmesh/production_wire.h>
 #include <node/flowmesh_delivery.h>
 #include <node/flowmesh_agreement.h>
+#include <node/flowmesh_health.h>
+#include <node/flowmesh_local_admission.h>
 #include <node/flowmesh_production_store.h>
 
 #include <atomic>
@@ -29,6 +31,9 @@
 #include <vector>
 
 namespace node {
+
+class FlowMeshTimingSpan;
+class FlowMeshObservedTimeLog;
 
 /** Immutable historical identity used to authorize a seat-reward claim. */
 struct FlowMeshHistoricalRewardSeat {
@@ -205,6 +210,24 @@ struct FlowMeshRuntimeEvent {
  * Admission includes legacy queue acceptance, which has no socket completion.
  * catchup_completed counts applied pages with local tail slack, not a tip ACK.
  * event_queue_overflows is node-global and repeated in each market snapshot. */
+/** ACTION frame header policy observations (local relay policy, never
+ * consensus). A frame's header only claims its sender's certified head. */
+struct FlowMeshRuntimeActionAdmission {
+    //! Remote frames for another version, market or epoch.
+    uint64_t header_refused_identity{0};
+    //! Remote frames more than two slots ahead or behind this node's head.
+    uint64_t header_refused_far{0};
+    //! Remote frames behind this head whose interval this node could not
+    //! prove excludes the action (not retained, epoch change, included, or
+    //! no longer pending).
+    uint64_t header_refused_unproven{0};
+    //! Frames admitted from a sender one or two slots ahead (a lagging node).
+    uint64_t header_accepted_ahead{0};
+    //! Frames admitted from a sender one or two slots behind, relayed with
+    //! this node's head (the payload is never touched).
+    uint64_t header_restamped_behind{0};
+};
+
 struct FlowMeshRuntimeDeliverySnapshot {
     flowmesh::MarketId market_id;
     uint64_t created{0}, admitted{0}, refused{0}, retried{0};
@@ -221,6 +244,17 @@ struct FlowMeshRuntimeDeliverySnapshot {
     // appended, and exact entry copies of its recent appends, consumed at
     // admission without a committee token, queue slot or handler pass.
     uint64_t certified_slot_frames_consumed{0};
+    // Frames of either kind above refused RATE_LIMITED because their sender
+    // spent one of its separate budgets for consumed frames (per market, or
+    // across all markets). This includes a frame refused before admission
+    // hashed it, because its sender had no settled and no committee token
+    // left. A peer is one connection identity (legacy NodeId or FMN2 session
+    // id). In steady state the per-peer budget binds when one sender's summed
+    // sustained settled rate exceeds 128/s (about 11 markets at the 12/s
+    // average measured with four validators); a non-zero value points at a
+    // flooding peer, or at a larger committee or market count whose honest
+    // relays outgrew the sizing.
+    uint64_t settled_frames_rate_limited{0};
     size_t pending_objects{0}, pending_bytes{0};
     size_t deferred_objects{0}, deferred_bytes{0};
     std::string current_reason;
@@ -233,6 +267,7 @@ struct FlowMeshRuntimeDeliverySnapshot {
     uint64_t trace_global_bytes{0}, trace_global_events_dropped{0};
     // At most 128 events. Clocks are monotonic and local to this process.
     std::vector<FlowMeshRuntimeEvent> events;
+    FlowMeshRuntimeActionAdmission action_admission;
 };
 
 struct FlowMeshRuntimeMarketConfig {
@@ -254,7 +289,15 @@ struct FlowMeshRuntimeMarketConfig {
     /** A discovered live market may exist before a valid k>=4 set exists. */
     FlowMeshRuntimeMarketReadiness readiness{
         FlowMeshRuntimeMarketReadiness::READY};
+    //! Display-only operator-observed time (flowmesh_observed_time_log.h),
+    //! recorded after each durable commit. Nothing in the runtime reads it.
+    std::shared_ptr<FlowMeshObservedTimeLog> observed{};
 };
+
+/** Sets `out.observed` from `log` (null: not recorded by this node): the
+ * stamps of the head and of exactly the reply's history and tick entries
+ * whose hash matches. Display only; call outside the runtime's locks. */
+void FillObservedTimes(flowmesh::MarketData& out, const FlowMeshObservedTimeLog* log);
 
 struct FlowMeshRuntimeConfig {
     FlowMeshRuntimeChain* chain{nullptr};
@@ -271,6 +314,9 @@ struct FlowMeshRuntimeConfig {
     //! At least one minute; global probe pacing remains one request per second.
     std::chrono::milliseconds legacy_probe_interval{std::chrono::seconds{60}};
     std::function<void(uint64_t)> cancel_delivery;
+    //! Memory-only retention of recent certified entries per market. The
+    //! defaults are the production bounds; tests may only lower them.
+    FlowMeshRecentWindowLimits recent_window{};
 };
 
 struct FlowMeshRuntimeMarketStatus {
@@ -410,6 +456,40 @@ public:
         : FlowMeshCommitteeRelayBudget{messages, bytes} {}
 };
 
+/** Shared, immutable parts of one retained recent certified entry. Encoding
+ * happens outside every runtime lock. */
+struct FlowMeshClientOutcomeParts {
+    //! The exact (sequence, hash) is retained in the recent window.
+    bool found{false};
+    //! The sequence is retained, whatever its hash.
+    bool sequence_retained{false};
+    std::shared_ptr<const flowmesh::ProductionCertifiedEnvelope> envelope;
+    size_t seat_count{0};
+    //! The store's own re-execution record, when retained.
+    std::shared_ptr<const ProductionOutcomeRecord> outcome;
+};
+
+/** The seat-misbehaviour recorder's verification work (observation only). */
+struct FlowMeshSeatEvidenceWork {
+    //! Detections checked: past the dedup and the per-market pace.
+    uint64_t checks{0};
+    //! Chain seat-set reads for a set other than the market's installed one.
+    uint64_t chain_lookups{0};
+    //! Seat-set validations and BLS verifications (flowmesh::SeatEvidenceWork).
+    uint64_t seat_set_checks{0};
+    uint64_t signature_checks{0};
+};
+
+/** One local API/RPC submission: the certified-state decision and, only when
+ * that decision is ENQUEUE, the bounded queue's verdict. */
+struct FlowMeshLocalSubmitResult {
+    std::optional<flowmesh::QueueResult> queued;
+    FlowMeshLocalAdmission admission;
+    //! The client event log position just before the enqueue. A refusal
+    //! event at or before it belongs to an earlier attempt, not this one.
+    std::optional<flowmesh::ClientEventCursor> cursor_before;
+};
+
 /** Certificate, state, status and reported history captured at one head. */
 struct FlowMeshClientSnapshotView {
     flowmesh::ClientStateEvidence evidence;
@@ -472,6 +552,34 @@ public:
      */
     flowmesh::QueueResult SubmitLocalAction(
         const flowmesh::MarketId& market_id, const flowmesh::Action& action);
+    /**
+     * The same admission, first decided against this node's certified state
+     * in the same market-lock scope (FlowMeshDecideLocalAdmission). Only an
+     * ENQUEUE decision reaches the queue. Any other decision appends no v1
+     * event; an authenticated attempt (pure Schnorr, outside the market
+     * lock; a deposit is its outpoint fact) gets a local notice. Never
+     * applied to remote frames, proposals or certified entries. `origin`
+     * picks the notice ring of this submission's notices, including the
+     * worker's recheck and pool-drop notices for it: NODE only for this
+     * node's own wallet RPC and GUI, never for public API traffic. A PUBLIC
+     * deposit gets no notice from this call, whether refused for missing
+     * facts or answered as already credited (it has no credential). `submitter`, for PUBLIC only, is the requesting client's
+     * identity (IPv4, or IPv6 /64): its notices count against that
+     * identity's share of the PUBLIC ring (CLIENT_NOTICE_PER_SUBMITTER).
+     */
+    FlowMeshLocalSubmitResult SubmitLocalActionChecked(
+        const flowmesh::MarketId& market_id, const flowmesh::Action& action,
+        flowmesh::ClientNoticeOrigin origin = flowmesh::ClientNoticeOrigin::PUBLIC,
+        const std::string& submitter = {});
+    //! Current position of the client event log (a cheap leaf-lock read).
+    flowmesh::ClientEventCursor ClientEventCursor() const;
+    //! The newest local notice for this exact action, if retained.
+    std::optional<flowmesh::ClientActionNotice> NewestClientNotice(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
+    //! The newest local notice only while it is newer than every retained
+    //! event of this exact action.
+    std::optional<flowmesh::ClientActionNotice> NewestClientNoticeIfNewer(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
     std::optional<FlowMeshRuntimeMarketStatus> MarketStatus(
         const flowmesh::MarketId& market_id) const;
@@ -490,12 +598,33 @@ public:
     std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
         const flowmesh::MarketId& market_id, std::string& error) const;
     /** Certificate/state and bounded reported history captured under ONE market
-     * lock. A later publication cannot mix two heads into this response. */
+     * lock. A later publication cannot mix two heads into this response.
+     * `reported_query` shapes only the reported (unauthenticated) part. */
     std::optional<FlowMeshClientSnapshotView> ClientSnapshotView(
         const flowmesh::MarketId& market_id,
-        const std::optional<flowmesh::AccountId>& account, std::string& error) const;
+        const std::optional<flowmesh::AccountId>& account, std::string& error,
+        const flowmesh::MarketDataQuery& reported_query = {}) const;
+    /** One certified entry as a client payload. Entries in the recent window
+     * (the head included) are encoded from memory outside the market lock;
+     * only older sequences read the store. */
     std::optional<std::vector<unsigned char>> ClientCertifiedEntry(
         const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error) const;
+    /** Memory-only: the retained certified entry that includes this exact
+     * action (a decisive disposition first, else the newest), if any. */
+    std::optional<std::pair<uint64_t, uint256>> ClientRecentInclusion(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
+    /** Memory-only: shared parts of one retained (sequence, hash). Never
+     * reads the store, encodes or verifies under the lock. */
+    FlowMeshClientOutcomeParts ClientOutcomeParts(
+        const flowmesh::MarketId& market_id, uint64_t sequence, const uint256& hash,
+        bool want_payload) const;
+    /** Test-only: ClientCertifiedEntry calls that read the store. */
+    uint64_t ClientEntryStoreReadsForTest() const;
+    //! A display view's curve copy unused for this long is dropped by the
+    //! next market-data read.
+    static constexpr std::chrono::seconds BOOK_CAPTURE_IDLE{30};
+    /** Test-only: display-view curve copies retained (one per market at most). */
+    size_t BookCapturesForTest() const;
     flowmesh::ClientEventPage ClientEvents(
         const std::optional<flowmesh::ClientEventCursor>& after,
         const std::optional<flowmesh::MarketId>& market,
@@ -509,9 +638,23 @@ public:
     flowmesh::ClientActionWait WaitClientActionStatus(
         const flowmesh::MarketId& market_id, const uint256& action_id,
         std::chrono::steady_clock::time_point deadline,
-        const std::function<bool()>& interrupted) const;
-    /** Ends every current client-action wait (shutdown, never a result). */
+        const std::function<bool()>& interrupted, bool include_notices = false) const;
+    /** Ends every current client-action wait and event watch (shutdown,
+     * never a result). */
     void WakeClientWaiters() const;
+    //! Nonblocking: would ClientEvents(after, market, account) now return an
+    //! event (READY) or report a gap (GAP)? Otherwise TIMEOUT.
+    flowmesh::ClientWatchResult ClientEventsPending(
+        const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+        const std::optional<flowmesh::AccountId>& account) const;
+    /** Bounded watch on the client event log (see ClientEventLog::WaitEvents).
+     * Holds no queue or market lock while it sleeps. Before Start and from
+     * Stop on, every current and later watch that would sleep is INTERRUPTED. */
+    flowmesh::ClientWatchResult WaitClientEvents(
+        const flowmesh::ClientEventCursor& after, const flowmesh::MarketId& market,
+        const std::optional<flowmesh::AccountId>& account,
+        std::chrono::steady_clock::time_point deadline,
+        const std::function<bool()>& interrupted) const;
 
     /** Test/shutdown aid: waits only for this runtime's current work queue. */
     bool WaitForIdle(std::chrono::milliseconds timeout);
@@ -520,6 +663,23 @@ public:
     bool NotifyDeliveryEvent(const FlowMeshDeliveryEvent& event);
     std::vector<FlowMeshRuntimeDeliverySnapshot> DeliverySnapshots(
         std::optional<flowmesh::MarketId> market = std::nullopt) const;
+
+    /** Latest worker-published health observation: published once by Start
+     * and at most every 250 ms from the worker's tick. Takes only a leaf
+     * mutex (never the market or queue mutex, cs_main or the store), so it
+     * answers while the worker is busy or wedged; the snapshot's age is then
+     * itself the signal. Null before the first Start. Never evidence. */
+    std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> HealthSnapshot() const;
+
+    /** Test-only: how many frames' bytes admission has hashed so far. */
+    uint64_t AdmissionHashCountForTest() const;
+    /** Test-only: the seat-misbehaviour recorder's work, summed over markets. */
+    FlowMeshSeatEvidenceWork SeatEvidenceWorkForTest() const;
+    /** Test-only: public actions whose submitter the market remembers. */
+    size_t PublicSubmittersForTest(const flowmesh::MarketId& market_id) const;
+    /** Test-only: the identity the market remembers as `action_id`'s public
+     * submitter, if any. */
+    std::optional<std::string> PublicSubmitterForTest(const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
 private:
     struct Market;
@@ -536,6 +696,8 @@ private:
     bool InitializeMarket(const FlowMeshRuntimeMarketConfig& config,
                           std::string& error);
     void WorkerLoop();
+    //! EnqueueWireMessage, with the frame marked counted (QueuedWireMessage).
+    flowmesh::QueueResult Enqueue(flowmesh::WirePeerId peer, flowmesh::WireMessage message, bool counted);
     void ProcessMessage(const flowmesh::QueuedWireMessage& queued, uint64_t dequeued_us);
     void ProcessTick(uint64_t requested_us, uint64_t dequeued_us);
     struct PendingDelivery;
@@ -562,6 +724,15 @@ private:
     void ProcessCatchupCommand(const CatchupCommand& command);
     void ProcessAddMarketCommand(AddMarketCommand command);
     void RemovePeerOnWorker(flowmesh::WirePeerId peer);
+    //! Caller holds m_market_mutex. The market's observed-time log, if any.
+    std::shared_ptr<FlowMeshObservedTimeLog> ObservedLogLocked(const flowmesh::MarketId& market_id) const;
+    //! Caller holds m_market_mutex. Display-only observed-time upkeep of
+    //! every market that records it; decides nothing.
+    void ObserveTimeMaintenance(size_t connected_peers);
+    //! Caller holds m_market_mutex. Copies values the worker already owns;
+    //! never reads the store, signs, executes or calls LocalSeatKeys.
+    void PublishHealth(flowmesh::WireClock::time_point now, size_t connected_peers,
+                       std::optional<flowmesh::WireClock::time_point> no_peers_since, bool force);
 
     void HandleAction(Market& market, flowmesh::WirePeerId peer,
                       const flowmesh::WireMessage& message);
@@ -610,7 +781,35 @@ private:
         const flowmesh::MarketDataQuery& query, std::string& error) const;
     std::optional<flowmesh::ClientStateEvidence> ClientSnapshotLocked(
         const flowmesh::MarketId& market_id, std::string& error) const;
+    //! Caller holds m_market_mutex: the other markets' counted recent-window
+    //! payload and outcome bytes (their global caps' remaining room).
+    std::pair<size_t, size_t> RecentWindowOthers(const Market& self) const;
+    //! A display view's copy of one market's standing curves (see BookCopy).
+    struct BookCapture {
+        std::shared_ptr<const flowmesh::BookCurves> book;
+        flowmesh::WireClock::time_point used;
+    };
+    //! Guarded by m_market_mutex. Per market, the standing curves copied once
+    //! for the certified head a display view (indicative clearing) last asked
+    //! about, so repeated reads at one head copy nothing. Views are computed
+    //! from it outside every lock. Every market-data read drops (freeing
+    //! them after the lock) captures of a head that is no longer current and
+    //! captures unused for BOOK_CAPTURE_IDLE.
+    mutable std::map<flowmesh::MarketId, BookCapture> m_book_captures;
+    //! Caller holds m_market_mutex: moves stale captures into `dropped`.
+    void PruneBookCaptures(std::vector<std::shared_ptr<const flowmesh::BookCurves>>& dropped) const;
+    /** The standing curves of `head` for display views: the retained capture,
+     * or a copy taken one bounded page (MARKET_DATA_MAX_CURVES curves) per
+     * m_market_mutex hold (flowmesh::CopyBookCurves), as a curve-paging read
+     * takes it, so no hold copies the whole book. Takes the lock itself; the
+     * caller must not hold it. A book over MARKET_VIEW_MAX_BOOK_CURVES is not
+     * copied ("work_budget"), and a head that moves between holds ends the
+     * copy ("head_changed"). */
+    std::shared_ptr<const flowmesh::BookCurves> BookCopy(const flowmesh::MarketId& market_id, const uint256& head,
+                                                         FlowMeshTimingSpan& timing) const;
     std::map<flowmesh::MarketId, std::unique_ptr<Market>> m_markets;
+    //! ClientCertifiedEntry store reads (test observation only).
+    mutable std::atomic<uint64_t> m_client_entry_store_reads{0};
 
     mutable std::mutex m_queue_mutex;
     std::condition_variable m_work_cv;
@@ -652,10 +851,22 @@ private:
         uint64_t consumed{0};
     };
     std::map<flowmesh::MarketId, CertifiedAdmission> m_certified_admission;
+    //! Admitted markets only; guarded by m_queue_mutex. Diagnostic count of
+    //! frames refused because their sender's settled-frame budget was spent.
+    std::map<flowmesh::MarketId, uint64_t> m_settled_rate_limited;
+    //! Guarded by m_queue_mutex. Frames whose bytes admission hashed (an
+    //! agreement payload, a certificate's entry bytes); test observation.
+    uint64_t m_admission_hashes{0};
     void NoteCertifiedAdmission(const flowmesh::WireHeader& header, const uint256& entry_bytes_hash,
                                 uint64_t next_sequence);
     //! Negotiated connections only, capped independently of incoming hints.
     std::set<flowmesh::WirePeerId> m_discovery_peers;
+    //! Health observation only, never a discovery or relay input: the
+    //! currently connected FlowMesh peers (uncapped by the discovery bound;
+    //! bounded by the transports' own connection limits) and since when there
+    //! have been none. Guarded by m_queue_mutex.
+    std::set<flowmesh::WirePeerId> m_connected_peers;
+    std::optional<flowmesh::WireClock::time_point> m_no_peers_since;
     std::deque<flowmesh::WirePeerId> m_removed_peers;
     std::deque<CatchupCommand> m_catchup_commands;
     std::deque<AddMarketCommand> m_add_market_commands;
@@ -671,6 +882,22 @@ private:
     //! Diagnostic state only, guarded by m_queue_mutex; never a wake predicate.
     bool m_worker_waiting{false};
     std::thread m_worker;
+    //! Leaf: acquired after m_market_mutex, never before it.
+    mutable std::mutex m_health_mutex;
+    std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> m_health;
+    //! Worker-owned (under m_market_mutex): the next tick that publishes.
+    flowmesh::WireClock::time_point m_next_health_publish{};
+    //! Observed-time upkeep (display only) samples an open chain gate at
+    //! most once per OBSERVED_SAMPLE_INTERVAL (a closed one on every tick);
+    //! the markets' warm-up is observed on every tick against the latest
+    //! sample.
+    static constexpr std::chrono::seconds OBSERVED_SAMPLE_INTERVAL{1};
+    flowmesh::WireClock::time_point m_next_observed_sample{};
+    struct ObservedGateSample {
+        int32_t anchor_height{-1};
+        bool open{false};
+    };
+    std::optional<ObservedGateSample> m_observed_gate;
 
     // Exact signed critical objects: <=8192 / 64 MiB globally, <=16 MiB per
     // market. Retry at >=1s, or at once when a pause cancelled the admitted

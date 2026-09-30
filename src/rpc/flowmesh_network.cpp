@@ -3,6 +3,7 @@
 
 #include <node/context.h>
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_health.h>
 #include <node/flowmesh_service.h>
 #include <node/flowmesh_timing.h>
 #include <chainparams.h>
@@ -331,8 +332,17 @@ static RPCHelpMan getflowmeshdeliveryinfo()
                     {RPCResult::Type::NUM, "receive_deferred", "Critical messages deferred after admission because B3 reconciliation started"},
                     {RPCResult::Type::NUM, "receive_refused", "Deferred ingress capacity or expiry refusals"},
                     {RPCResult::Type::NUM, "agreement_duplicates_coalesced", "Exact repeats of already verified preliminary-agreement bytes consumed at admission; not receipt of anything new"},
+                    {RPCResult::Type::NUM, "certified_slot_frames_consumed", "Committee frames for slots this node already appended (older votes and agreement messages, exact copies of its recent certified entries) consumed at admission without a queue slot or verification; not receipt of anything new"},
+                    {RPCResult::Type::NUM, "settled_frames_rate_limited", "Frames of the two kinds above refused because their sender exceeded a separate budget for consumed frames (256 burst and 64 per second per peer and market, 512 burst and 128 per second per peer across all markets). A peer is one connection identity (legacy NodeId or FMN2 session id); a reconnect or dual carriage gets a fresh budget. In steady state the per-peer budget binds when one sender's summed sustained rate of such frames exceeds 128 per second, about 11 markets at the 12 per second average measured with four validators; a non-zero value means a budget binds"},
                     {RPCResult::Type::NUM, "deferred_objects", "Currently retained critical incoming objects"},
                     {RPCResult::Type::NUM, "deferred_bytes", "Bytes charged to retained critical incoming objects"},
+                    {RPCResult::Type::OBJ, "action_admission", "ACTION frame header policy (local relay policy, never consensus). A frame's header only claims its sender's certified head", {
+                        {RPCResult::Type::NUM, "header_refused_identity", "Remote frames for another version, market or epoch"},
+                        {RPCResult::Type::NUM, "header_refused_far", "Remote frames more than two slots ahead of or behind this node's head"},
+                        {RPCResult::Type::NUM, "header_refused_unproven", "Remote frames behind this head whose interval this node could not prove excludes the action"},
+                        {RPCResult::Type::NUM, "header_accepted_ahead", "Frames admitted from a sender one or two slots ahead of this node"},
+                        {RPCResult::Type::NUM, "header_restamped_behind", "Frames admitted from a sender one or two slots behind, relayed with this node's head"},
+                    }},
                     {RPCResult::Type::STR, "current_reason", "Most recent delivery/refusal/retry reason"},
                     {RPCResult::Type::STR_HEX, "last_target_hash", "Last recorded target object"},
                     {RPCResult::Type::ARR, "events", "At most 128 recent events, not a complete audit journal", {
@@ -401,8 +411,17 @@ static RPCHelpMan getflowmeshdeliveryinfo()
                 item.pushKV("receive_deferred", snapshot.receive_deferred);
                 item.pushKV("receive_refused", snapshot.receive_refused);
                 item.pushKV("agreement_duplicates_coalesced", snapshot.agreement_duplicates_coalesced);
+                item.pushKV("certified_slot_frames_consumed", snapshot.certified_slot_frames_consumed);
+                item.pushKV("settled_frames_rate_limited", snapshot.settled_frames_rate_limited);
                 item.pushKV("deferred_objects", uint64_t{snapshot.deferred_objects});
                 item.pushKV("deferred_bytes", uint64_t{snapshot.deferred_bytes});
+                UniValue action_admission{UniValue::VOBJ};
+                action_admission.pushKV("header_refused_identity", snapshot.action_admission.header_refused_identity);
+                action_admission.pushKV("header_refused_far", snapshot.action_admission.header_refused_far);
+                action_admission.pushKV("header_refused_unproven", snapshot.action_admission.header_refused_unproven);
+                action_admission.pushKV("header_accepted_ahead", snapshot.action_admission.header_accepted_ahead);
+                action_admission.pushKV("header_restamped_behind", snapshot.action_admission.header_restamped_behind);
+                item.pushKV("action_admission", std::move(action_admission));
                 item.pushKV("current_reason", snapshot.current_reason);
                 item.pushKV("last_target_hash", snapshot.last_target_hash.GetHex());
                 UniValue events{UniValue::VARR};
@@ -435,6 +454,124 @@ static RPCHelpMan getflowmeshdeliveryinfo()
         }};
 }
 
+static std::vector<RPCResult> SeatEvidenceStatementResult()
+{
+    using Type = RPCResult::Type;
+    return {
+        {Type::NUM, "seat_epoch", "Seat epoch of the signed certificate context"},
+        {Type::STR_HEX, "seat_set_hash", "Anchored seat set of that epoch"},
+        {Type::NUM, "sequence", "Microblock sequence"},
+        {Type::STR_HEX, "microblock_hash", "Signed microblock hash"},
+        {Type::NUM, "seat_index", /*optional=*/true, "attestation_equivocation: the signing seat's index in the set"},
+        {Type::STR_HEX, "signer_bitmap", /*optional=*/true, "certificate_conflict: LSB-first signer bitmap"},
+        {Type::STR_HEX, "signature", "BLS signature (one seat's, or the certificate's aggregate) over the B3/FLOWMESH/CERT/V1 digest of domain, market_id, seat_epoch, seat_set_hash, sequence and microblock_hash"},
+    };
+}
+
+static RPCResult HealthResult()
+{
+    using Type = RPCResult::Type;
+    const RPCResult codes{Type::STR, "", "Not-ready code; treat any code you do not know as not ready"};
+    return {Type::OBJ, "", "Local, advisory health observation", {
+        {Type::NUM, "health_version", "Health object version, currently 1"},
+        {Type::STR, "observation", "Always local-node: what this node observed, never certified evidence or a proof of the network's freshest head"},
+        {Type::BOOL, "ready", "service_ready and every listed market ready; a label only, market rows decide per-market routing"},
+        {Type::BOOL, "service_ready", "No service-level not-ready code"},
+        {Type::ARR, "not_ready", "Service-level codes: service_stopped, initial_block_download, below_activation, reconciling_prolonged, worker_stalled, no_flowmesh_peers", {codes}},
+        {Type::OBJ, "service", "", {
+            {Type::STR, "state", "running, stopped or dormant (the A2/A3 schedule is incomplete)"},
+            {Type::STR, "chain_gate", /*optional=*/true, "B3 reconciliation gate while running: open or closed"},
+            {Type::STR, "chain_gate_reason", /*optional=*/true, "open, starting, initial_block_download, below_activation, reconciling, idle_wait_timeout, store_reconciliation_failed, market_refresh_failed, checkpoint_reconciliation_failed or tip_changed"},
+            {Type::NUM, "chain_gate_closed_ms", /*optional=*/true, "Local milliseconds the gate has been continuously closed"},
+            {Type::NUM, "worker_observation_age_ms", /*optional=*/true, "Local milliseconds since the runtime worker last published an observation; grows while the worker is stalled"},
+            {Type::NUM, "flowmesh_peers", /*optional=*/true, "Connected FlowMesh peers (operator detail)"},
+            {Type::NUM, "no_peers_ms", /*optional=*/true, "Local milliseconds without any FlowMesh peer (operator detail)"},
+        }},
+        {Type::OBJ, "policy", "Node-local thresholds, never consensus", {
+            {Type::NUM, "reconcile_grace_ms", "Continuous gate closure before reconciling_prolonged"},
+            {Type::NUM, "lag_grace_ms", "Catch-up duration before catching_up"},
+            {Type::NUM, "worker_stall_ms", "Observation age before worker_stalled"},
+            {Type::NUM, "no_peers_grace_ms", "Time without FlowMesh peers before no_flowmesh_peers"},
+            {Type::NUM, "live_window_ms", "Label only: a head applied within this window is live, otherwise idle"},
+        }},
+        {Type::ARR, "markets", "At most 256 markets, in market id order", {
+            {Type::OBJ, "", "", {
+                {Type::STR_HEX, "market_id", "Market identity"},
+                {Type::BOOL, "ready", "No not-ready code for this market"},
+                {Type::ARR, "not_ready", "Service codes plus market_not_installed, market_halted or catching_up (stalled_with_pending_work is reserved)", {codes}},
+                {Type::STR, "state", "One label: stopped, not_installed, halted, inactive, reconciling, worker_stalled, isolated, insufficient_seats, handoff_pending, paused, stalled, catching_up, live or idle"},
+                {Type::STR, "halt", /*optional=*/true, "Runtime halt code, or none"},
+                {Type::BOOL, "paused", /*optional=*/true, "Runtime pause"},
+                {Type::STR, "pause_reason", /*optional=*/true, "Fixed pause reason, or empty; b3_reconciliation_pending is the normal per-block pause"},
+                {Type::BOOL, "pending_handoff", /*optional=*/true, "A committee handoff waits for its anchor depth"},
+                {Type::NUM, "epoch", /*optional=*/true, "Current seat epoch"},
+                {Type::NUM, "active_seats", /*optional=*/true, "Active seat count"},
+                {Type::NUM, "quorum_required", /*optional=*/true, "Signatures a certificate needs"},
+                {Type::NUM, "pending_actions", /*optional=*/true, "Actions held in this node's pool"},
+                {Type::NUM, "next_microblock_sequence", /*optional=*/true, "Next sequence this node will apply"},
+                {Type::STR_HEX, "last_microblock_hash", /*optional=*/true, "Hash of this node's certified head, or zero"},
+                {Type::NUM, "head_age_ms", /*optional=*/true, "Local milliseconds since this process applied its head; idle markets age legitimately"},
+                {Type::NUM, "head_local_observed_unix", /*optional=*/true, "Local wall-clock seconds when this node applied its head; an observation, not certified time"},
+                {Type::OBJ, "catchup", /*optional=*/true, "Catch-up observation", {
+                    {Type::BOOL, "behind", "Proven or speculative lag"},
+                    {Type::NUM, "behind_ms", /*optional=*/true, "Local milliseconds continuously behind"},
+                    {Type::NUM, "proven_target", /*optional=*/true, "One past the highest BLS-verified certificate this node has not applied yet; cannot be hidden"},
+                    {Type::NUM, "proven_behind_ms", /*optional=*/true, "Local milliseconds continuously provably behind; only this lag makes the market catching_up"},
+                    {Type::BOOL, "speculative", "A verified catch-up page arrived without tail slack; not a proof and never a readiness input"},
+                    {Type::NUM, "peer_hint_next_sequence", /*optional=*/true, "Highest unverified peer head announcement (operator detail)"},
+                    {Type::NUM, "peers_hinting_ahead", /*optional=*/true, "Peers announcing a head ahead of ours, unverified (operator detail)"},
+                }},
+                {Type::OBJ, "seat_evidence", /*optional=*/true, "Seat-misbehaviour evidence this node recorded for the market. Information only: "
+                    "never a readiness input, never a penalty, never consensus. Each record carries every signed field and is checkable against "
+                    "the anchored seat set each statement names", {
+                    {Type::NUM, "recorded", "Records ever kept in this market's store, evicted ones included"},
+                    {Type::NUM, "retained", "Records the store still holds, at most 64"},
+                    {Type::NUM, "unrecorded", /*optional=*/true, "Detections this process could not record: not verifiable against this node's chain, over the per-minute check pace (applied before any verification), or a failed write (operator detail)"},
+                    {Type::ARR, "latest", "Newest first: every retained record with operator detail, otherwise at most 4", {
+                        {Type::OBJ, "", "", {
+                            {Type::STR_HEX, "evidence_id", "Order-independent record identity"},
+                            {Type::STR, "kind", "attestation_equivocation (one seat signed two microblocks at one epoch and sequence) or certificate_conflict (two valid threshold certificates for two microblocks at one sequence)"},
+                            {Type::STR_HEX, "domain", "Chain domain every statement signs"},
+                            {Type::STR_HEX, "market_id", "Market every statement signs"},
+                            {Type::OBJ, "first", "The statement this node held first (its earlier vote or durable entry)", SeatEvidenceStatementResult()},
+                            {Type::OBJ, "second", "The conflicting statement it received", SeatEvidenceStatementResult()},
+                            {Type::STR_HEX, "seat_public_key", /*optional=*/true, "attestation_equivocation: BLS public key of the seat at seat_index in the named set; compare with your own keys (getflowmeshvalidatorinfo)"},
+                            {Type::ARR, "double_signers", /*optional=*/true, "certificate_conflict under one seat set: the seats in both signer bitmaps, each of which signed both", {
+                                {Type::NUM, "", "Seat index"},
+                            }},
+                        }},
+                    }},
+                }},
+                {Type::STR, "error", /*optional=*/true, "Bounded runtime error text (operator detail)"},
+                {Type::STR, "proposal_wait_reason", /*optional=*/true, "Why the next slot's proposal waits (operator detail)"},
+            }},
+        }},
+        {Type::BOOL, "markets_truncated", "More markets exist than listed"},
+    }};
+}
+
+static RPCHelpMan getflowmeshhealth()
+{
+    return RPCHelpMan{
+        "getflowmeshhealth",
+        "Read this node's local FlowMesh health without a wallet: per-market certified head, local head age, halt and pause state, "
+        "seat counts, catch-up lag and advisory endpoint readiness, with operator detail. The public HTTPS 'health' method serves "
+        "the same object without operator detail. A local observation, never certified evidence, a proof of the network's freshest "
+        "head, or an input to admission, relay, signing or verification.\n",
+        {{"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Limit to one market; otherwise all markets"}},
+        HealthResult(),
+        RPCExamples{HelpExampleCli("getflowmeshhealth", "") + HelpExampleCli("getflowmeshhealth", "\"<market_id>\"")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto& service{EnsureAnyNodeContext(request.context).flowmesh};
+            if (!service) throw JSONRPCError(RPC_MISC_ERROR, "FlowMesh engine is not enabled on this node; see getflowmeshclientinfo");
+            std::optional<flowmesh::MarketId> market;
+            if (!request.params[0].isNull()) market = ParseHashV(request.params[0], "market_id");
+            const auto health{service->Health(market)};
+            if (market && !health.Find(*market)) throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown FlowMesh market");
+            return node::FlowMeshServiceHealthJson(health, /*operator_detail=*/true);
+        }};
+}
+
 static RPCHelpMan flowmeshtiming()
 {
     return RPCHelpMan{
@@ -458,6 +595,7 @@ void RegisterFlowMeshNetworkRPCCommands(CRPCTable& table)
         {"flowmesh", &flowmeshconnect},
         {"flowmesh", &getflowmeshnetworkinfo},
         {"flowmesh", &getflowmeshdeliveryinfo},
+        {"flowmesh", &getflowmeshhealth},
     };
     for (const auto& command : commands) table.appendCommand(command.name, &command);
 #ifdef ENABLE_FLOWMESH_P2FV_BOOTSTRAP_TEST

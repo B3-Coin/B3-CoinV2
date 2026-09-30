@@ -70,6 +70,9 @@ add_executable(test_bitcoin
   feefrac_tests.cpp
   feerounder_tests.cpp
   flatfile_tests.cpp
+  flowmesh_action_pool_tests.cpp
+  flowmesh_action_reason_tests.cpp
+  flowmesh_api_admission_tests.cpp
   flowmesh_asset_metadata_tests.cpp
   public_asset_metadata_tests.cpp
   flowmesh_batch_tests.cpp
@@ -85,13 +88,25 @@ add_executable(test_bitcoin
   flowmesh_production_store_tests.cpp
   flowmesh_runtime_tests.cpp
   flowmesh_service_tests.cpp
+  flowmesh_health_tests.cpp
   flowmesh_net_tests.cpp
   flowmesh_https_tests.cpp
   flowmesh_client_evidence_tests.cpp
   flowmesh_client_join_tests.cpp
   flowmesh_client_poll_tests.cpp
+  flowmesh_client_ticks_tests.cpp
   flowmesh_action_wait_tests.cpp
   flowmesh_client_action_wait_tests.cpp
+  flowmesh_client_watch_tests.cpp
+  flowmesh_client_outcome_tests.cpp
+  flowmesh_client_readiness_tests.cpp
+  flowmesh_local_admission_tests.cpp
+  flowmesh_market_view_tests.cpp
+  flowmesh_observed_time_tests.cpp
+  flowmesh_observed_time_log_tests.cpp
+  flowmesh_outcome_evidence_tests.cpp
+  flowmesh_recent_window_tests.cpp
+  flowmesh_seat_evidence_tests.cpp
   flowmesh_client_work_tests.cpp
   flowmesh_timing_tests.cpp
   flowmesh_transport_compat_tests.cpp

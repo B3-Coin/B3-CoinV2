@@ -7,6 +7,7 @@
 
 #include <consensus/flowmesh_params.h>
 #include <crypto/common.h>
+#include <flowmesh/market_view.h>
 #include <flowmesh/production_wire.h>
 #include <logging.h>
 #include <random.h>
@@ -28,6 +29,46 @@
 #include <vector>
 
 namespace node {
+
+std::shared_ptr<const ProductionOutcomeRecord> MakeProductionOutcomeRecord(
+    const uint64_t sequence, const uint256& entry_hash, flowmesh::BatchResult&& result,
+    std::vector<modern::FlowMeshEffectV1>&& effects)
+{
+    auto record{std::make_shared<ProductionOutcomeRecord>()};
+    record->sequence = sequence;
+    record->entry_hash = entry_hash;
+    record->preimage = flowmesh::MakeExecutionOutcomePreimageV1(std::move(result));
+    record->effects = std::move(effects);
+    const auto& p{record->preimage};
+    // Upper bound of the evidence encoding, and of the memory it occupies.
+    const size_t fills{p.bid_fill.size() + p.ask_fill.size()};
+    const size_t encoded{128 + 32 * p.applied.size() + 33 * p.rejected.size() + 40 * fills +
+                         56 * p.seller_fees.size() + 40 * p.seat_rewards.size() + 228 * record->effects.size()};
+    if (encoded > OUTCOME_RECORD_MAX_BYTES) {
+        record->too_large = true;
+        record->preimage = {};
+        record->effects.clear();
+        record->charged_bytes = 256;
+    } else {
+        record->charged_bytes = 256 + 32 * p.applied.size() + 40 * p.rejected.size() + 48 * fills +
+                                56 * p.seller_fees.size() + 40 * p.seat_rewards.size() +
+                                240 * record->effects.size();
+    }
+    return record;
+}
+
+void RetainOutcomeTail(std::deque<std::shared_ptr<const ProductionOutcomeRecord>>& tail, size_t& tail_bytes,
+                       std::shared_ptr<const ProductionOutcomeRecord> record, const size_t max_entries,
+                       const size_t max_bytes)
+{
+    if (!record) return;
+    tail_bytes += record->charged_bytes;
+    tail.push_back(std::move(record));
+    while (!tail.empty() && (tail.size() > max_entries || tail_bytes > max_bytes)) {
+        tail_bytes -= tail.front()->charged_bytes;
+        tail.pop_front();
+    }
+}
 
 bool FlowMeshHandoffConnectionMature(
     const ProductionB3Connection& connection,
@@ -99,9 +140,12 @@ struct StoreTrace {
     }
 };
 
+//! `post` is the state right after `result`'s execution, or null when it is
+//! not at hand; a clearing's rationed side is then UNKNOWN, never guessed.
 void CacheMarketHistory(std::deque<flowmesh::MarketHistoryEntry>& history,
                         const flowmesh::ProductionEntryCore& entry,
-                        const flowmesh::BatchResult* result)
+                        const flowmesh::BatchResult* result,
+                        const flowmesh::FlowMeshState* post)
 {
     flowmesh::MarketHistoryEntry item;
     item.sequence = entry.sequence;
@@ -139,6 +183,11 @@ void CacheMarketHistory(std::deque<flowmesh::MarketHistoryEntry>& history,
             item.account_fills.push_back(fill);
         }
         item.account_fills_complete = bid == clearing.bid_fill.end() && ask == clearing.ask_fill.end();
+        item.settlement = !result->settled_withdrawals.empty();
+        item.imbalance = clearing.imbalance;
+        item.imbalance_side = !clearing.cleared ? flowmesh::ImbalanceSide::NONE
+                              : post ? flowmesh::ObserveImbalanceSide(clearing, *post)
+                                     : flowmesh::ImbalanceSide::UNKNOWN;
     }
     history.push_back(std::move(item));
     if (history.size() > flowmesh::MARKET_DATA_HISTORY_CAPACITY) history.pop_front();
@@ -150,6 +199,10 @@ constexpr uint8_t KEY_CONNECTION{'c'};
 constexpr uint8_t KEY_LOCK{'l'};
 constexpr uint8_t KEY_LOCKED_CANDIDATE{'p'};
 constexpr uint8_t KEY_LEGACY_SNAPSHOT{'s'};
+// Seat-misbehaviour evidence, information only. Unknown to older binaries,
+// whose scans skip prefixes they do not name.
+constexpr uint8_t KEY_SEAT_EVIDENCE{'x'};
+constexpr uint8_t KEY_SEAT_EVIDENCE_META{'y'};
 
 constexpr size_t MAX_DISK_ENTRY_BYTES{
     flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES +
@@ -228,6 +281,15 @@ LockKeyType LockedCandidateKey(
 {
     return {KEY_LOCKED_CANDIDATE, position.epoch, position.sequence};
 }
+
+struct SeatEvidenceMeta {
+    uint8_t version{1};
+    //! Records ever inserted, evicted ones included.
+    uint64_t recorded{0};
+    uint64_t next_index{0};
+
+    SERIALIZE_METHODS(SeatEvidenceMeta, obj) { READWRITE(obj.version, obj.recorded, obj.next_index); }
+};
 
 bool SameSemanticAction(const flowmesh::Action& semantic,
                         const flowmesh::Action& evidence)
@@ -1386,8 +1448,17 @@ FlowMeshProductionStore::FlowMeshProductionStore(DBParams db_params, const bool 
 bool FlowMeshProductionStore::ReadMarker(std::optional<Marker>& out,
                                          std::string& error)
 {
+    bool ready{false};
+    return ReadMarkerAndReadiness(out, ready, error);
+}
+
+bool FlowMeshProductionStore::ReadMarkerAndReadiness(std::optional<Marker>& out,
+                                                     bool& ready,
+                                                     std::string& error)
+{
     const std::lock_guard<std::mutex> guard{m_mutex};
     out.reset();
+    ready = m_open && m_ready;
     Marker marker;
     switch (ReadMarkerStrict(m_db, marker, m_preagreement)) {
     case ReadResult::NOT_FOUND: return true;
@@ -1670,10 +1741,12 @@ bool FlowMeshProductionStore::AppendExecution(
     const uint256& treasury_owner_commitment,
     const flowmesh::DepositVerifier* deposits,
     flowmesh::FlowMeshState& next_state_out, std::string& error,
-    std::optional<flowmesh::ProductionEntryCheck>* validation_failure)
+    std::optional<flowmesh::ProductionEntryCheck>* validation_failure,
+    std::shared_ptr<const ProductionOutcomeRecord>* outcome_out)
 {
     StoreTrace trace{"append_execution", entry};
     if (validation_failure) validation_failure->reset();
+    if (outcome_out) outcome_out->reset();
     trace.Mark(trace.lock_requested_us);
     const std::lock_guard<std::mutex> guard{m_mutex};
     trace.Mark(trace.lock_acquired_us);
@@ -1713,7 +1786,7 @@ bool FlowMeshProductionStore::AppendExecution(
                                        active_seats};
     flowmesh::ProductionEntryCheck check;
     trace.Mark(trace.execution_started_us);
-    const auto executed{flowmesh::ExecuteProductionEntry(
+    auto executed{flowmesh::ExecuteProductionEntry(
         current_state, entry, marker.domain, marker.market_id, active_seats,
         gate, marker.next_sequence, marker.next_effect_index,
         marker.last_microblock_hash,
@@ -1761,8 +1834,14 @@ bool FlowMeshProductionStore::AppendExecution(
         error = std::string{"FlowMesh v3 execution append failed: "} + e.what();
         return false;
     }
-    CacheMarketHistory(m_market_history, entry, &executed->result);
+    CacheMarketHistory(m_market_history, entry, &executed->result, &executed->next_state);
     next_state_out = executed->next_state;
+    // After the durable write and after MakeDiskEntry consumed the effects:
+    // hand the caller this exact re-execution by move. Nothing is encoded.
+    if (outcome_out && executed->settlements.empty()) {
+        *outcome_out = MakeProductionOutcomeRecord(entry.sequence, next.last_microblock_hash,
+                                                   std::move(executed->result), std::move(executed->effects));
+    }
     return true;
 }
 
@@ -1860,7 +1939,7 @@ bool FlowMeshProductionStore::AppendHandoff(
         error = std::string{"FlowMesh v3 handoff append failed: "} + e.what();
         return false;
     }
-    CacheMarketHistory(m_market_history, handoff, nullptr);
+    CacheMarketHistory(m_market_history, handoff, nullptr, nullptr);
     return true;
 }
 
@@ -2099,7 +2178,10 @@ bool FlowMeshProductionStore::Replay(
     // leaves the store fail-closed until a complete replay succeeds.
     m_ready = false;
     m_market_history.clear();
+    m_replay_outcomes.clear();
     std::deque<flowmesh::MarketHistoryEntry> history;
+    std::deque<std::shared_ptr<const ProductionOutcomeRecord>> outcomes;
+    size_t outcome_bytes{0};
     Marker marker;
     if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !ValidateStorage(m_db, marker, error)) {
@@ -2148,7 +2230,7 @@ bool FlowMeshProductionStore::Replay(
         if (stored->entry.kind == static_cast<uint8_t>(
                                       flowmesh::ProductionEntryKind::EXECUTION)) {
             flowmesh::ProductionEntryCheck check;
-            const auto executed{flowmesh::ExecuteProductionEntry(
+            auto executed{flowmesh::ExecuteProductionEntry(
                 working, stored->entry, marker.domain, marker.market_id,
                 *active_seats, gate, sequence, next_effect_index,
                 running_hash, anchors,
@@ -2163,8 +2245,21 @@ bool FlowMeshProductionStore::Replay(
                 error = "FlowMesh v3 replay effects/settlements differ from deterministic execution";
                 return false;
             }
-            CacheMarketHistory(history, stored->entry, &executed->result);
+            // Only entries the bounded cache can retain pay for observing
+            // the rationed side on their post-execution book.
+            const bool retained{marker.next_sequence - sequence <= flowmesh::MARKET_DATA_HISTORY_CAPACITY};
+            CacheMarketHistory(history, stored->entry, &executed->result,
+                               retained ? &executed->next_state : nullptr);
             working = executed->next_state;
+            // Only the newest entries can survive the tail's count bound;
+            // older ones cost no record at all.
+            if (executed->settlements.empty() &&
+                marker.next_sequence - sequence <= OUTCOME_REPLAY_TAIL_ENTRIES) {
+                RetainOutcomeTail(outcomes, outcome_bytes,
+                                  MakeProductionOutcomeRecord(sequence, stored->entry.GetHash(),
+                                                              std::move(executed->result),
+                                                              std::move(executed->effects)));
+            }
         } else {
             const auto next_seats{seat_sets.GetSeatSet(
                 marker.domain, marker.market_id, stored->entry.next_epoch,
@@ -2183,7 +2278,7 @@ bool FlowMeshProductionStore::Replay(
                 return false;
             }
 
-            CacheMarketHistory(history, stored->entry, nullptr);
+            CacheMarketHistory(history, stored->entry, nullptr, nullptr);
 
             DiskConnection connection;
             const ReadResult connected{
@@ -2262,8 +2357,18 @@ bool FlowMeshProductionStore::Replay(
     state = std::move(working);
     last_hash = running_hash;
     m_market_history = std::move(history);
+    m_replay_outcomes = std::move(outcomes);
     m_ready = !m_preagreement || marker.agreement_bootstrap_complete;
     return true;
+}
+
+std::vector<std::shared_ptr<const ProductionOutcomeRecord>> FlowMeshProductionStore::TakeReplayOutcomes()
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    std::vector<std::shared_ptr<const ProductionOutcomeRecord>> out{
+        std::make_move_iterator(m_replay_outcomes.begin()), std::make_move_iterator(m_replay_outcomes.end())};
+    m_replay_outcomes.clear();
+    return out;
 }
 
 flowmesh::MarketHistoryPage FlowMeshProductionStore::ReadMarketHistory(
@@ -2285,6 +2390,17 @@ flowmesh::MarketHistoryPage FlowMeshProductionStore::ReadMarketHistory(
         out.entries.push_back(*it);
     }
     return out;
+}
+
+flowmesh::ClearingTickPage FlowMeshProductionStore::ReadClearingTicks(const flowmesh::ClearingTickQuery& query)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    if (!m_open || !m_ready) {
+        flowmesh::ClearingTickPage out;
+        out.unavailable_reason = "history_not_ready";
+        return out;
+    }
+    return flowmesh::PageClearingTicks(m_market_history, query);
 }
 
 flowmesh::ProductionLockResult FlowMeshProductionStore::LockCandidate(
@@ -2456,6 +2572,118 @@ bool FlowMeshProductionStore::ReadLockedCandidate(
     }
     out = *candidate;
     return true;
+}
+
+namespace {
+//! Every retained evidence key, oldest first, with the records that decode.
+bool ReadSeatEvidenceNamespace(CDBWrapper& db, SeatEvidenceMeta& meta, std::vector<uint64_t>& keys,
+                               SeatEvidenceLog& log, std::string& error)
+{
+    meta = {};
+    keys.clear();
+    log = {};
+    switch (ReadStrict(db, KEY_SEAT_EVIDENCE_META, meta)) {
+    case ReadResult::FOUND:
+        if (meta.version != 1) {
+            error = "FlowMesh seat evidence has an unknown format";
+            return false;
+        }
+        break;
+    case ReadResult::NOT_FOUND: break;
+    case ReadResult::ERROR:
+        error = "FlowMesh seat evidence counters are unreadable";
+        return false;
+    }
+    std::unique_ptr<CDBIterator> it{db.NewIterator()};
+    for (it->Seek(SequenceKeyType{KEY_SEAT_EVIDENCE, 0}); it->Valid(); it->Next()) {
+        uint8_t prefix{0};
+        if (!it->GetKey(prefix) || prefix != KEY_SEAT_EVIDENCE) break;
+        SequenceKeyType key;
+        if (!it->GetKeyExact(key)) {
+            ++log.unreadable;
+            continue;
+        }
+        keys.push_back(key.sequence);
+        std::vector<unsigned char> bytes;
+        const auto evidence{it->GetValueExact(bytes) ? flowmesh::DecodeSeatEvidence(bytes) : std::nullopt};
+        if (!evidence) {
+            ++log.unreadable;
+            continue;
+        }
+        log.retained.push_back({key.sequence, *evidence});
+    }
+    if (!it->StatusOK()) {
+        error = "FlowMesh seat evidence scan failed";
+        return false;
+    }
+    std::reverse(log.retained.begin(), log.retained.end());
+    // Counters written by this format never lag their records; repair a
+    // missing meta record rather than reuse an index.
+    if (!keys.empty()) meta.next_index = std::max(meta.next_index, keys.back() + 1);
+    meta.recorded = std::max<uint64_t>(meta.recorded, keys.size());
+    log.recorded = meta.recorded;
+    return true;
+}
+} // namespace
+
+bool FlowMeshProductionStore::RecordSeatEvidence(const flowmesh::SeatEvidence& evidence, bool& inserted,
+                                                 std::string& error)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    inserted = false;
+    if (!m_open) {
+        error = "FlowMesh store is not open";
+        return false;
+    }
+    const auto bytes{flowmesh::EncodeSeatEvidence(evidence)};
+    if (!bytes) {
+        error = "FlowMesh seat evidence is not canonical";
+        return false;
+    }
+    try {
+        SeatEvidenceMeta meta;
+        std::vector<uint64_t> keys;
+        SeatEvidenceLog log;
+        if (!ReadSeatEvidenceNamespace(m_db, meta, keys, log, error)) return false;
+        const uint256 id{evidence.Id()};
+        if (std::any_of(log.retained.begin(), log.retained.end(),
+                        [&](const StoredSeatEvidence& item) { return item.evidence.Id() == id; })) {
+            return true;
+        }
+        if (meta.next_index == std::numeric_limits<uint64_t>::max()) {
+            error = "FlowMesh seat evidence index is exhausted";
+            return false;
+        }
+        CDBBatch batch{m_db};
+        batch.Write(SequenceKeyType{KEY_SEAT_EVIDENCE, meta.next_index}, *bytes);
+        // Oldest first, until the new record fits the bound.
+        for (size_t i{0}; i + SEAT_EVIDENCE_MAX_RECORDS < keys.size() + 1; ++i) {
+            batch.Erase(SequenceKeyType{KEY_SEAT_EVIDENCE, keys[i]});
+        }
+        ++meta.next_index;
+        if (meta.recorded != std::numeric_limits<uint64_t>::max()) ++meta.recorded;
+        batch.Write(KEY_SEAT_EVIDENCE_META, meta);
+        m_db.WriteBatch(batch, /*fSync=*/true);
+    } catch (const std::exception& e) {
+        error = std::string{"FlowMesh seat evidence write failed: "} + e.what();
+        return false;
+    }
+    inserted = true;
+    return true;
+}
+
+bool FlowMeshProductionStore::ReadSeatEvidence(SeatEvidenceLog& out, std::string& error)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    SeatEvidenceMeta meta;
+    std::vector<uint64_t> keys;
+    try {
+        return ReadSeatEvidenceNamespace(m_db, meta, keys, out, error);
+    } catch (const std::exception& e) {
+        out = {};
+        error = std::string{"FlowMesh seat evidence read failed: "} + e.what();
+        return false;
+    }
 }
 
 bool FlowMeshProductionStore::ReadLock(

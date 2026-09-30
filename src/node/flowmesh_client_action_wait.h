@@ -26,19 +26,32 @@ inline constexpr std::chrono::milliseconds FLOWMESH_CLIENT_ACTION_WAIT_MAX{2500}
 //! wait_ms; seeing it withdraws the capability learned for that endpoint.
 inline constexpr std::string_view FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR{"Unknown or duplicate client API field"};
 
-//! Capability in a market status object: action_wait_ms_max, capped at the
-//! client maximum. Zero (never send wait_ms) when absent or not an unsigned
+//! A wait capability in a market status object, capped at the client
+//! maximum. Zero (never send wait_ms) when absent or not an unsigned
 //! integer: a malformed hint only disables the wait, never fails the read.
-inline std::chrono::milliseconds FlowMeshAdvertisedActionWait(const UniValue& status) noexcept
+inline std::chrono::milliseconds FlowMeshAdvertisedWait(const UniValue& status, const char* key) noexcept
 {
     try {
         if (!status.isObject()) return {};
-        const auto& value{status.find_value("action_wait_ms_max")};
+        const auto& value{status.find_value(key)};
         if (!value.isNum()) return {};
         return std::chrono::milliseconds{std::min<uint64_t>(value.getInt<uint64_t>(), FLOWMESH_CLIENT_ACTION_WAIT_MAX.count())};
     } catch (...) {
         return {};
     }
+}
+
+//! action_wait_ms_max: the bounded wait on an 'action' read.
+inline std::chrono::milliseconds FlowMeshAdvertisedActionWait(const UniValue& status) noexcept
+{
+    return FlowMeshAdvertisedWait(status, "action_wait_ms_max");
+}
+
+//! submit_wait_ms_max: the same bounded wait on 'submit', whose reply then
+//! embeds the 'action' reply for the admitted action after the wait.
+inline std::chrono::milliseconds FlowMeshAdvertisedSubmitWait(const UniValue& status) noexcept
+{
+    return FlowMeshAdvertisedWait(status, "submit_wait_ms_max");
 }
 
 //! A retained action's state as seen when a caller asks to wait for it.
@@ -68,6 +81,35 @@ inline std::chrono::milliseconds FlowMeshActionWaitFor(const FlowMeshActionWaitR
     if (request.retry || request.requested.count() <= 0 || !request.may_have_been_sent ||
         request.certificate_verified || request.previously_certified || request.rejected ||
         !request.delivery_endpoint_known || request.advertised.count() <= 0) return {};
+    return std::min({request.requested, request.advertised, FLOWMESH_CLIENT_ACTION_WAIT_MAX});
+}
+
+//! A submission as seen when its caller asks to wait for its inclusion.
+struct FlowMeshSubmitWaitRequest {
+    //! Caller's wait; zero or less never waits.
+    std::chrono::milliseconds requested{0};
+    //! The exact signed instruction has never been delivered: it was retained
+    //! by this very submission. Any resend takes the ordinary path, so a
+    //! previously delivered, certified or proven not-executed action never
+    //! travels with a wait.
+    bool new_instruction{false};
+    //! The ordinary submission endpoint's advertised maximum; zero when not
+    //! advertised (older endpoints reject wait_ms on 'submit').
+    std::chrono::milliseconds advertised{0};
+    //! That endpoint is in transport cooldown, or left a lane request of this
+    //! process unanswered since its last successful response.
+    bool endpoint_cooling{false};
+    bool endpoint_unanswered{false};
+};
+
+/** The wait to send with a submission, or zero when the ordinary submission
+ * path delivers it. Latency policy only: a waited submission carries the
+ * same exact bytes to the same endpoint, and its reply is verified and
+ * applied like a submission acknowledgement plus a waited read. */
+inline std::chrono::milliseconds FlowMeshSubmitWaitFor(const FlowMeshSubmitWaitRequest& request) noexcept
+{
+    if (request.requested.count() <= 0 || !request.new_instruction || request.advertised.count() <= 0 ||
+        request.endpoint_cooling || request.endpoint_unanswered) return {};
     return std::min({request.requested, request.advertised, FLOWMESH_CLIENT_ACTION_WAIT_MAX});
 }
 

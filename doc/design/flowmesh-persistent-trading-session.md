@@ -7,7 +7,11 @@ Status: original design reference, with the first bounded reuse stage now
 implemented at `c81cdb2bc270db0f4721c55cb15e759c588d8202`. See the separate
 [qualification report](../flowmesh-https-reuse-qualification.md) for what was
 actually built and measured. The two-lane backend, push/live-result path,
-fully asynchronous server and later policies below remain proposals. This
+fully asynchronous server and later policies below remain proposals. A bounded
+form of stage 3 (a negotiated `updates` watch whose sleeping handler holds a
+worker but no permit) is implemented and off by default; see
+[FlowMesh live updates](../flowmesh-live-updates.md). The thread-free waiter
+completed from the I/O owner remains a proposal. This
 document must not be read as qualification of that entire design. No running
 tester endpoint/client was upgraded and no economic rule was changed.
 

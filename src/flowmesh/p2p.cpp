@@ -184,21 +184,20 @@ const char* WireCheckName(const WireCheck check)
     return "unknown";
 }
 
-std::optional<std::vector<unsigned char>> EncodeWireMessage(
-    const WireMessage& message, WireCheck& check)
+bool CheckWireMessage(const WireMessage& message, WireCheck& check)
 {
     check = WireCheck::OK;
     if (message.header.version != FLOWMESH_WIRE_VERSION_V1) {
         check = WireCheck::BAD_VERSION;
-        return std::nullopt;
+        return false;
     }
     if (message.header.market_id.IsNull()) {
         check = WireCheck::NULL_MARKET;
-        return std::nullopt;
+        return false;
     }
     if (message.payload.size() > PayloadLimitForWireKind(message.kind)) {
         check = WireCheck::TOO_LARGE;
-        return std::nullopt;
+        return false;
     }
     if (!PayloadShapeValid(message.kind, message.payload)) {
         check = message.kind == WireMessageKind::GET
@@ -206,8 +205,15 @@ std::optional<std::vector<unsigned char>> EncodeWireMessage(
                     : message.kind == WireMessageKind::ENTRIES
                           ? WireCheck::BAD_CATCHUP_RESPONSE
                           : WireCheck::WRONG_LENGTH;
-        return std::nullopt;
+        return false;
     }
+    return true;
+}
+
+std::optional<std::vector<unsigned char>> EncodeWireMessage(
+    const WireMessage& message, WireCheck& check)
+{
+    if (!CheckWireMessage(message, check)) return std::nullopt;
     std::vector<unsigned char> out;
     out.reserve(FLOWMESH_WIRE_HEADER_SIZE + message.payload.size());
     AppendU16(out, message.header.version);
@@ -337,11 +343,8 @@ bool DecodeCatchupRequest(const std::span<const unsigned char> payload,
            max_bytes > 0 && max_bytes <= FLOWMESH_CATCHUP_MAX_BYTES;
 }
 
-bool BoundedWireQueue::ConsumeTokens(const WirePeerId peer,
-                                     const WireMessage& message,
-                                     const WireClock::time_point now)
+void BoundedWireQueue::Refill(TokenBucket& bucket, const WireClock::time_point now)
 {
-    TokenBucket& bucket{m_tokens[{peer, message.header.market_id}]};
     if (!bucket.initialized) {
         bucket.updated = now;
         bucket.initialized = true;
@@ -357,8 +360,33 @@ bool BoundedWireQueue::ConsumeTokens(const WirePeerId peer,
         bucket.committee_tokens = std::min(
             FLOWMESH_COMMITTEE_TOKEN_BURST,
             bucket.committee_tokens + seconds * FLOWMESH_COMMITTEE_TOKEN_RATE);
+        bucket.settled_tokens = std::min(
+            FLOWMESH_SETTLED_TOKEN_BURST,
+            bucket.settled_tokens + seconds * FLOWMESH_SETTLED_TOKEN_RATE);
         bucket.updated = now;
     }
+}
+
+void BoundedWireQueue::Refill(SettledPeerBucket& bucket, const WireClock::time_point now)
+{
+    if (!bucket.initialized) {
+        bucket.updated = now;
+        bucket.initialized = true;
+    } else if (now > bucket.updated) {
+        const double seconds{
+            std::chrono::duration<double>(now - bucket.updated).count()};
+        bucket.tokens = std::min(FLOWMESH_SETTLED_PEER_TOKEN_BURST,
+                                 bucket.tokens + seconds * FLOWMESH_SETTLED_PEER_TOKEN_RATE);
+        bucket.updated = now;
+    }
+}
+
+bool BoundedWireQueue::ConsumeTokens(const WirePeerId peer,
+                                     const WireMessage& message,
+                                     const WireClock::time_point now)
+{
+    TokenBucket& bucket{m_tokens[{peer, message.header.market_id}]};
+    Refill(bucket, now);
     if (message.kind == WireMessageKind::ACTION) {
         if (bucket.count_tokens < 1.0 ||
             bucket.byte_tokens < static_cast<double>(message.MemoryUsage())) {
@@ -467,10 +495,12 @@ bool BoundedWireQueue::EvictOneLowerPriority(
 }
 
 QueueResult BoundedWireQueue::Push(const WirePeerId peer, WireMessage message,
-                                   const WireClock::time_point now)
+                                   const WireClock::time_point now, const bool counted)
 {
+    // Only the framing verdict is needed; never copy a (up to 4 MiB) frame
+    // just to discard the encoding under the caller's queue lock.
     WireCheck check;
-    if (!EncodeWireMessage(message, check)) return QueueResult::MALFORMED;
+    if (!CheckWireMessage(message, check)) return QueueResult::MALFORMED;
     if (!ConsumeTokens(peer, message, now)) return QueueResult::RATE_LIMITED;
 
     const size_t bytes{message.MemoryUsage()};
@@ -507,10 +537,53 @@ QueueResult BoundedWireQueue::Push(const WirePeerId peer, WireMessage message,
            m_bytes > FLOWMESH_QUEUE_GLOBAL_BYTES - bytes) {
         if (!EvictOneLowerPriority(priority)) return QueueResult::GLOBAL_LIMIT;
     }
-    QueuedWireMessage item{peer, std::move(message)};
+    QueuedWireMessage item{.peer = peer, .message = std::move(message), .counted = counted};
     AccountAdd(item);
     m_lanes[static_cast<size_t>(priority)].push_back(std::move(item));
     return QueueResult::ACCEPTED;
+}
+
+QueueResult BoundedWireQueue::ConsumeSettled(const WirePeerId peer, const WireMessage& message,
+                                             const WireClock::time_point now)
+{
+    // Framing first, exactly as Push: a malformed frame still disconnects
+    // its sender whether or not its budget is spent.
+    WireCheck check;
+    if (!CheckWireMessage(message, check)) return QueueResult::MALFORMED;
+    // Same (peer, market) key as Push, so the caller's admitted-market check
+    // bounds this map as it bounds Push's, and RemovePeer resets it.
+    TokenBucket& bucket{m_tokens[{peer, message.header.market_id}]};
+    Refill(bucket, now);
+    // The peer's budget across all markets; RemovePeer resets it too.
+    SettledPeerBucket& across{m_settled_peer_tokens[peer]};
+    Refill(across, now);
+    // Both or neither: a refusal by one budget spends nothing from the other.
+    if (bucket.settled_tokens < 1.0 || across.tokens < 1.0) return QueueResult::RATE_LIMITED;
+    bucket.settled_tokens -= 1.0;
+    across.tokens -= 1.0;
+    return QueueResult::ACCEPTED;
+}
+
+QueueResult BoundedWireQueue::PeekSettledOrCommittee(const WirePeerId peer, const WireMessage& message,
+                                                     const WireClock::time_point now) const
+{
+    WireCheck check;
+    if (!CheckWireMessage(message, check)) return QueueResult::MALFORMED;
+    if (message.kind != WireMessageKind::PROPOSAL && message.kind != WireMessageKind::ATTESTATION &&
+        message.kind != WireMessageKind::CERTIFICATE && message.kind != WireMessageKind::AGREEMENT) {
+        return QueueResult::ACCEPTED;
+    }
+    // Refill copies with the spending paths' own arithmetic. A bucket that
+    // does not exist yet would be created full.
+    TokenBucket pair;
+    if (const auto it{m_tokens.find({peer, message.header.market_id})}; it != m_tokens.end()) pair = it->second;
+    Refill(pair, now);
+    SettledPeerBucket across;
+    if (const auto it{m_settled_peer_tokens.find(peer)}; it != m_settled_peer_tokens.end()) across = it->second;
+    Refill(across, now);
+    const bool settled{pair.settled_tokens >= 1.0 && across.tokens >= 1.0};
+    const bool committee{pair.committee_tokens >= 1.0};
+    return settled || committee ? QueueResult::ACCEPTED : QueueResult::RATE_LIMITED;
 }
 
 std::optional<QueuedWireMessage> BoundedWireQueue::Pop()
@@ -545,6 +618,7 @@ void BoundedWireQueue::RemovePeer(const WirePeerId peer)
         }
     }
     m_control_tokens.erase(peer);
+    m_settled_peer_tokens.erase(peer);
 }
 
 size_t BoundedWireQueue::PeerBytes(const WirePeerId peer) const
