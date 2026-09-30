@@ -39,6 +39,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPersistentModelIndex>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -3392,6 +3393,124 @@ private Q_SLOTS:
         // Painting is bounded to the window and never throws on edges.
         QImage image{chart.size(), QImage::Format_ARGB32}; chart.render(&image);
         series.candles.clear(); chart.setTimeSeries(series); chart.render(&image);
+    }
+    void timeChartRefusesUndrawableTimesAndBoundsItsAxis()
+    {
+        // Never shown: every check below runs before (or without) a paint.
+        using flowmesh::ObservedCandle;
+        constexpr int64_t MAX{std::numeric_limits<int64_t>::max()};
+        constexpr int64_t LIMIT{flowmesh::OBSERVED_MS_LIMIT};
+        constexpr int64_t LAST{LIMIT - 60'000};
+        B3FlowMeshChart chart; chart.resize(900, 420);
+        chart.setSnapshot(Parse(RemoteData()));
+        const auto priced = [](int64_t open_ms) {
+            ObservedCandle c; c.open_ms = open_ms; c.first_sequence = c.last_sequence = 3; c.entries = c.clearings = 1;
+            c.open = c.high = c.low = c.close = 1000; c.base_volume = 1; c.quote_volume = 1000;
+            return c;
+        };
+        B3FlowMeshChart::TimeSeries series; series.available = true; series.remote = true;
+        series.source = QStringLiteral("https://operator.invalid:18443"); series.interval = flowmesh::CandleInterval::M1;
+        // The candle that froze the axis: the last 1m bucket start below
+        // INT64_MAX. Refused before anything is drawn.
+        series.candles = {priced(MAX - MAX % 60'000)};
+        chart.setTimeSeries(series); chart.setNowMs(OBSERVED_T0);
+        QVERIFY(chart.timeMode());
+        QVERIFY(chart.timeSeries().candles.empty());
+        QCOMPARE(chart.timeSeries().reason, QStringLiteral("malformed"));
+        QVERIFY(chart.timeWindow().second < LIMIT);
+        // So are unaligned, unordered and negative bucket starts.
+        for (const auto& bad : std::vector<std::vector<ObservedCandle>>{{priced(OBSERVED_T0 + 1)}, {priced(OBSERVED_T0 + 60'000), priced(OBSERVED_T0)},
+                                                                       {priced(OBSERVED_T0), priced(OBSERVED_T0)}, {priced(-60'000)}, {priced(LIMIT)}}) {
+            series.candles = bad; chart.setTimeSeries(series);
+            QVERIFY(chart.timeSeries().candles.empty()); QCOMPARE(chart.timeSeries().reason, QStringLiteral("malformed"));
+        }
+        // A far clock is held below the bound too.
+        chart.setNowMs(MAX); QVERIFY(chart.timeWindow().second <= LAST);
+        chart.setNowMs(-1); QCOMPARE(chart.timeWindow().second, int64_t{0});
+        chart.setNowMs(OBSERVED_T0);
+
+        // The axis labels: exactly the old loop's on an honest window, never
+        // past the window's end and never more than asked, even at the edge.
+        const auto old_loop = [](int64_t left, int64_t right, int64_t step) {
+            std::vector<int64_t> out;
+            for (int64_t open{left - left % step}; open <= right; open += step) if (open >= left) out.push_back(open);
+            return out;
+        };
+        for (const int64_t step : {int64_t{60'000}, int64_t{360'000}, int64_t{3'600'000}}) {
+            QCOMPARE(B3FlowMeshChart::AxisLabelOpens(OBSERVED_T0 - 59 * 60'000, OBSERVED_T0, step, 1000), old_loop(OBSERVED_T0 - 59 * 60'000, OBSERVED_T0, step));
+        }
+        const int64_t edge{MAX - MAX % 60'000};
+        const auto labels{B3FlowMeshChart::AxisLabelOpens(edge - 59 * 60'000, edge, 360'000, 14)};
+        QVERIFY(!labels.empty()); QVERIFY(labels.size() <= 14);
+        for (const auto open : labels) QVERIFY(open >= edge - 59 * 60'000 && open <= edge && open % 360'000 == 0);
+        const auto capped{B3FlowMeshChart::AxisLabelOpens(0, MAX, 1, 12)};
+        QCOMPARE(capped.size(), size_t{12}); QCOMPARE(capped.back(), int64_t{11});
+        QCOMPARE(B3FlowMeshChart::AxisLabelOpens(MAX - 1, MAX, MAX, 5), std::vector<int64_t>{MAX});
+        QVERIFY(B3FlowMeshChart::AxisLabelOpens(0, 10, 0, 5).empty());
+        QVERIFY(B3FlowMeshChart::AxisLabelOpens(10, 0, 1, 5).empty());
+        QVERIFY(B3FlowMeshChart::AxisLabelOpens(-10, 10, 1, 5).empty());
+        QVERIFY(B3FlowMeshChart::AxisLabelOpens(0, 10, 1, 0).empty());
+        QImage image{chart.size(), QImage::Format_ARGB32}; chart.render(&image);
+
+        // The newest bucket before the bound: zoom, pan and drag stay inside
+        // [0, LAST], whatever they are asked.
+        series.candles = {priced(LAST)}; chart.setTimeSeries(series);
+        QCOMPARE(chart.timeSeries().candles.size(), size_t{1}); QVERIFY(chart.timeSeries().reason.isEmpty());
+        QCOMPARE(chart.timeWindow().second, LAST);
+        const auto bounded = [&] {
+            const auto [left, right]{chart.timeWindow()};
+            return left >= 0 && left <= right && right <= LAST;
+        };
+        const double nan{std::numeric_limits<double>::quiet_NaN()}, inf{std::numeric_limits<double>::infinity()};
+        chart.zoomTime(0.8, 0.5); QVERIFY(bounded());
+        chart.zoomTime(1.25, 0.0); QVERIFY(bounded());
+        for (const double slots : {100.0, -100.0, 1e300, -1e300, inf, -inf, nan}) { chart.panTime(slots); QVERIFY(bounded()); }
+        chart.panTime(-1e300); QVERIFY(bounded()); QVERIFY(chart.followsTail());
+        // One pan moves at most ten million buckets.
+        chart.panTime(1e300); QVERIFY(bounded()); QCOMPARE(chart.timeWindow().second, LAST - int64_t{10'000'000} * 60'000);
+        const double slots_before{chart.timeSlots()};
+        chart.zoomTime(nan, 0.5); chart.zoomTime(2.0, nan); chart.zoomTime(inf, 0.5); chart.zoomTime(2.0, inf);
+        QCOMPARE(chart.timeSlots(), slots_before); QVERIFY(bounded());
+        chart.resetTimeView();
+        for (const double to : {1e9, -1e9}) {
+            QMouseEvent press{QEvent::MouseButtonPress, QPointF{400, 200}, QPointF{400, 200}, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier};
+            QCoreApplication::sendEvent(&chart, &press);
+            QMouseEvent move{QEvent::MouseMove, QPointF{to, 200}, QPointF{to, 200}, Qt::NoButton, Qt::LeftButton, Qt::NoModifier};
+            QCoreApplication::sendEvent(&chart, &move);
+            QVERIFY(bounded());
+            QMouseEvent release{QEvent::MouseButtonRelease, QPointF{to, 200}, QPointF{to, 200}, Qt::LeftButton, Qt::NoButton, Qt::NoModifier};
+            QCoreApplication::sendEvent(&chart, &release);
+        }
+        chart.render(&image);
+        // Daily buckets: a pan past 1970 stops at the epoch.
+        series.interval = flowmesh::CandleInterval::D1; series.candles = {priced(LIMIT - 86'400'000)}; chart.setTimeSeries(series);
+        QCOMPARE(chart.timeWindow().second, LIMIT - 86'400'000);
+        chart.panTime(1e300); QCOMPARE(chart.timeWindow(), (std::pair{int64_t{0}, int64_t{0}}));
+        chart.panTime(-1e300); QVERIFY(chart.followsTail()); QCOMPARE(chart.timeWindow().second, LIMIT - 86'400'000);
+        chart.render(&image);
+    }
+    void heldTickTimesPastTheBoundNeverExtendCandles()
+    {
+        // Never shown and no events processed: a failure is an assertion.
+        B3FlowMeshTradingPanel panel;
+        auto s{Parse(RemoteDataWithTimes())};
+        panel.m_candle_interval = flowmesh::CandleInterval::M1;
+        Observe(panel, s);
+        panel.mergeHeldTicks();
+        panel.m_snapshot = s; panel.m_candles_market = s.market;
+        panel.applyCandles(ParseCandles(CandlesJson("1m", 60'000, OBSERVED_T0 + 60'000, 300,
+            {CandleJson(OBSERVED_T0, 1, 1, 990, 990, 990, 990, 100'000)}), flowmesh::CandleInterval::M1), 300);
+        // The endpoint's time of the held tick 2, near INT64_MAX (the client
+        // keeps it, flagged implausible), is no time: nothing extends.
+        QVERIFY(panel.m_tick_times.contains(2));
+        panel.m_tick_times.at(2).ms = std::numeric_limits<int64_t>::max() - 1;
+        panel.updateDataViews();
+        const auto& series{panel.m_chart->timeSeries()};
+        QVERIFY(series.available); QVERIFY(series.reason.isEmpty());
+        QCOMPARE(series.candles.size(), size_t{1});
+        for (const auto& candle : series.candles) QVERIFY(candle.open_ms < flowmesh::OBSERVED_MS_LIMIT);
+        QCOMPARE(series.candles.back().open_ms, OBSERVED_T0);
+        QVERIFY(panel.m_chart->timeWindow().second < flowmesh::OBSERVED_MS_LIMIT);
     }
     void unchangedRepliesKeepTheirObservedTimes()
     {

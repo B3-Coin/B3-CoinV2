@@ -178,7 +178,12 @@ endpoint-reported: its prices, volumes and times are the endpoint's claims.
   observed time is hatched and counted; a clock seam is marked. Partial candles
   are hollow. After the newest candle the axis is blank. Wheel zoom (10-500
   buckets), drag pan, double-click for the latest; painting covers visible
-  buckets only. Headers: locally "Certified execution · times observed by this
+  buckets only. The chart refuses a series whose bucket starts are
+  unaligned, out of order or not before 10000-01-01 (shown as unavailable,
+  "malformed"); zoom and pan stay between 1970 and the last bucket before
+  that bound (one pan or drag moves at most ten million buckets), and the
+  axis draws at most one label per 72 px of its width, never stepping past
+  its window. Headers: locally "Certified execution · times observed by this
   node (not certified)", remotely "Prices, volumes and times reported by
   <host> · not verified"; the axis names the observer and says UTC. Without
   times (an older server) the chart keeps auction order ("Every 5 auctions")
