@@ -86,6 +86,30 @@ certified settlement controls remain available. A new certified head or an empty
 queue clears this local condition. The timer starts from this page's observation,
 not an invented certified timestamp, and resets when you change wallet or market.
 
+## How the page stays current
+
+The book, chart and trades tape follow verified updates as they arrive: with
+your own node's engine, a new certified auction usually reaches the screen
+within tens of milliseconds, and the engine is read up to ten times a second; a
+remote endpoint is read at most twice a second (live updates, when its
+operator offers them, else polling every 0.5 s). Cells change in place, and
+data that did not change repaints nothing. A market switch reads the new
+market at once.
+
+With your own node's engine, the book, chart and tape keep updating while an
+order review is open or an order is being sent. The review itself shows,
+and signs, exactly the values it was opened with; balances and the trading
+checks stay on the data of before the review. A click on a book level is
+refused (with a note in Activity) whenever the book shows newer or older
+data than those checks, or the data is not current and ready to trade on:
+the price is taken again from the verified data, never from the book's text.
+With a remote endpoint the views wait while the review is open or the order
+is sent, so no display read can delay the order.
+
+The "Stale" marks on the book and chart follow what they show; the
+connection line and every trading check follow the verified data the checks
+use (new orders stop after 3 s without a verified update).
+
 ## Withdraw and settle
 
 Choose **Withdraw**, the asset and amount, and a B3 destination address. This

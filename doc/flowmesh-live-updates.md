@@ -128,7 +128,8 @@ only; balances, orders and action outcomes come from verified state.
 ## 4. Qt
 
 The trading panel keeps one live-update read outstanding for the selected
-market on a second worker while it is visible and idle. While live, the
+market on a second worker while it is visible and idle (with the local
+engine also during a review or an action, for display only; see below). While live, the
 500 ms tick keeps display ageing and the auxiliary Catalog, Status, Effects
 and Receipt cycle (so checkpoint eligibility and saved requests still
 refresh every 5 s); only the market read of a passive refresh is left to the
@@ -150,10 +151,39 @@ retry in N s)", "live updates reconnecting in N s" or "No live update for
 once (a `ticks_catchup` read is re-armed at once and counts as neither a live
 reply nor a strike); three in a row fall back to polling for 10 s, busy for 10 s, an
 endpoint without the capability for 60 s, failures back off 1-30 s, and the
-panel never sends more than two watch reads per second. When replies the
+panel never sends a remote endpoint more than a burst of two watch reads and
+then one per 500 ms. The local engine (a node's own wallet: no network,
+endpoint or admission budget) is read at up to a burst of two and then one
+per 100 ms (ten a second), a provisional owner default of 2026-09-30 that
+amends the watch critique's two-per-second floor for the local engine only;
+a reply that names an endpoint returns that panel to the remote pacing at
+once. The next read starts when the pacing allows it, on a precise timer,
+not on the next 500 ms tick. When replies the
 client keeps its connection for (`superseded`, `revalidate`, `lane_busy`)
 send the panel from live mode or from a probe to polling, it closes the
 live-update connection with one `watch_ms` 0 read.
+
+With the local engine, the order book, chart and trades tape keep following
+live updates while an order review is open or an action is in flight. Those
+reads are display only: the gates, balances, the review and what is signed
+keep the verified data of before the review (the review shows exactly the
+values it signs), and a click on a book level is refused while the book
+shows newer data than the gates. A remote client keeps these views frozen
+during a review or an action, as before: its reads hold the client's work
+gate, which is not preemptive, so a display read could delay the order being
+sent.
+
+A remote endpoint without live updates is polled on the 500 ms tick, never
+back to back: a slow link's read (longer than 500 ms) is followed by the next
+tick's, so the passive share of the client's work gate does not rise.
+
+`-flowmeshapiwatch` stays off by default. A remote trader polls at two reads
+a second unless the endpoint's operator enables it; an operator who serves
+their own trading client can enable it now, after measuring the verified
+state each new head makes the client download (every new head costs one
+whole-state read and its verification under the client's work gate; a
+verified incremental apply would remove it and needs its own design) and
+the items of section 6.
 
 A reported gap adds a log line, a separator row in the trade history and an
 "event gap" suffix for 30 s, and the tracked request is reconciled first.
