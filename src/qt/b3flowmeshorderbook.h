@@ -83,8 +83,10 @@ class B3FlowMeshOrderBook : public QWidget
 {
     Q_OBJECT
 public:
-    //! Flash length, its largest stagger and the timer step while one runs.
-    static constexpr int FLASH_MS{800}, FLASH_STAGGER_MS{450}, FLASH_STEP_MS{16};
+    //! Flash length, its largest stagger and the timer step while one runs:
+    //! 30 frames a second, only while a flash runs (the responsiveness
+    //! design's frame budget; data renders themselves stay at most ~20/s).
+    static constexpr int FLASH_MS{800}, FLASH_STAGGER_MS{450}, FLASH_STEP_MS{33};
     static constexpr int ROW_HEIGHT{22};
     explicit B3FlowMeshOrderBook(QWidget* parent = nullptr);
     //! The node's levels are shown only in `grouping`, their head's and the

@@ -1291,6 +1291,26 @@ private Q_SLOTS:
         QVERIFY(paints > 0);
         QCOMPARE(book.view()->columnSpan(book.rowsPerSide(), 0), 3);
     }
+    void bookFlashAnimatesAtThirtyFramesASecond()
+    {
+        // A new price flashes for FLASH_MS: its frames repaint the ladder at
+        // most 30 times a second (one timer, only while a flash runs).
+        QApplication::setEffectEnabled(Qt::UI_General, true);
+        B3FlowMeshOrderBook::SetAnimationSetting(true);
+        auto snapshot{WithLevels(SyntheticLimitBook(16), {}, H(20))};
+        B3FlowMeshOrderBook book; book.resize(420, 440); book.setSnapshot(snapshot, false);
+        book.show(); for (int i{0}; i < 3; ++i) QCoreApplication::processEvents();
+        int paints{0};
+        book.setViewObserver([&](const QString&, bool painted) { if (painted) ++paints; });
+        auto moved{snapshot}; moved.curves.push_back(LimitCurve("bid", 60, 999, 70'000));
+        QElapsedTimer flash; flash.start();
+        book.setSnapshot(WithLevels(moved, {}, H(20)), false);
+        QVERIFY(book.flashing());
+        QTRY_VERIFY_WITH_TIMEOUT(!book.flashing(), 3000);
+        const auto seconds{static_cast<double>(flash.elapsed()) / 1000.0};
+        QVERIFY2(paints / seconds <= 34.0, qPrintable(QStringLiteral("%1 paints in %2 s").arg(paints).arg(seconds)));
+        QVERIFY(paints >= 5); // It does animate.
+    }
     void orderBookLadderFallsBackLabelledAndRequiresVerifiedState()
     {
         const auto original{Parse(RemoteData())};
