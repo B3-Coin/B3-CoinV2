@@ -280,26 +280,15 @@ struct FlowMeshAgreement::Impl {
         dirty = true;
     }
     void Flush(const char* reason) { if (dirty) Persist(reason); }
-    // Forces the pending whole-slot batch out on every normal return from a
-    // mutating public entry point. A caught failure has already halted the
-    // engine, and an unwritten slot must never outlive that halt silently.
-    struct FlushOnReturn {
-        Impl& s;
-        explicit FlushOnReturn(Impl& impl) : s{impl} {}
-        ~FlushOnReturn()
-        {
-            if (s.halted || !s.dirty) return;
-            try {
-                s.Flush("persist_public_return");
-            } catch (const std::exception& e) {
-                s.halted = true;
-                s.last_error = std::string{"agreement journal flush failed: "} + e.what();
-            } catch (...) {
-                s.halted = true;
-                s.last_error = "agreement journal flush failed";
-            }
-        }
-    };
+    // Run inside the public entry point's try block, before selecting its
+    // return value. A flush failure must reach Stop/error and return false;
+    // a destructor cannot revise success that the caller will use to relay.
+    bool FinishPublicCall(const bool result)
+    {
+        if (dirty) Crash(FlowMeshAgreementCrashPoint::BEFORE_PUBLIC_RETURN_PERSIST);
+        Flush("persist_public_return");
+        return result;
+    }
     std::optional<PreagreementPreparedCertificate> Highest() const
     {
         return slot.highest.empty() ? std::nullopt : DecodePreagreementPrepared(slot.highest);
@@ -866,24 +855,22 @@ bool FlowMeshAgreement::Advance(const PreagreementContext& context, const Active
 bool FlowMeshAgreement::SubmitCandidate(const std::span<const unsigned char> entry, std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
-    Impl::FlushOnReturn flush{s};
     Impl::TraceSpan trace{s, "submit_candidate"};
     try {
         s.usable.clear();
         const auto decoded{DecodeProductionEntry(entry)};
         if (!decoded || !EntryMatches(Bytes{entry.begin(), entry.end()}, s.Context(), decoded->GetHash())) {
-            error = "candidate does not match pinned agreement context"; return false;
+            error = "candidate does not match pinned agreement context"; return s.FinishPublicCall(false);
         }
-        if (s.IsDecided()) return decoded->GetHash() == *DecidedCandidate();
+        if (s.IsDecided()) return s.FinishPublicCall(decoded->GetHash() == *DecidedCandidate());
         s.RememberCandidate(Bytes{entry.begin(), entry.end()}, decoded->GetHash());
-        return s.Pump();
+        return s.FinishPublicCall(s.Pump());
     } catch (const std::exception& e) { return s.Stop(std::string{"agreement candidate failure: "} + e.what(), error); }
 }
 
 bool FlowMeshAgreement::Receive(const AgreementMessage& message, std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
-    Impl::FlushOnReturn flush{s};
     Impl::TraceSpan trace{s, "receive", message};
     try {
         s.usable.clear();
@@ -892,9 +879,9 @@ bool FlowMeshAgreement::Receive(const AgreementMessage& message, std::string& er
             Impl::TraceSpan validation{s, "validate_received_message", message.candidate};
             valid = s.ValidMessage(message, s.seats, s.Context());
         }
-        if (!valid) { error = "invalid agreement message"; return false; }
-        if (message.stage == AgreementStage::DECISION) { s.SaveDecision(message); return true; }
-        if (s.IsDecided()) return true;
+        if (!valid) { error = "invalid agreement message"; return s.FinishPublicCall(false); }
+        if (message.stage == AgreementStage::DECISION) { s.SaveDecision(message); return s.FinishPublicCall(true); }
+        if (s.IsDecided()) return s.FinishPublicCall(true);
         const bool fresh{!s.received.contains(Key(message))};
         bool enrichment{false};
         if (!fresh && message.stage == AgreementStage::COMMIT) {
@@ -908,18 +895,18 @@ bool FlowMeshAgreement::Receive(const AgreementMessage& message, std::string& er
         // permanent journal halt inside Track(). Unchanged retries cost zero.
         if ((fresh && s.received.size() >= MAX_RECORDS) ||
             ((fresh || enrichment) && EncodeAgreementMessage(message)->size() > MAX_SLOT_BYTES - s.received_bytes)) {
-            error = "agreement incoming message resource limit"; return false;
+            error = "agreement incoming message resource limit"; return s.FinishPublicCall(false);
         }
         if (message.view > s.slot.view && message.stage != AgreementStage::VIEW_CHANGE) {
-            if (!message.new_view) { error = "higher agreement view lacks quorum new-view proof"; return false; }
+            if (!message.new_view) { error = "higher agreement view lacks quorum new-view proof"; return s.FinishPublicCall(false); }
             s.Pump();
-            if (!s.MoveView(message.view, false)) { error = "waiting for durable signing intent recovery"; return false; }
+            if (!s.MoveView(message.view, false)) { error = "waiting for durable signing intent recovery"; return s.FinishPublicCall(false); }
         }
         // Old authenticated proposals can supply the candidate needed by a
         // later highest-prepared report, but never resurrect old-view votes.
         if (message.stage == AgreementStage::PROPOSAL) {
             if (const auto old{s.pending_proposals.find(message.view)}; old != s.pending_proposals.end() &&
-                old->second.candidate != message.candidate) { error = "leader equivocated in agreement view"; return false; }
+                old->second.candidate != message.candidate) { error = "leader equivocated in agreement view"; return s.FinishPublicCall(false); }
             s.RememberProposalCandidate(message);
         }
         s.Track(message);
@@ -927,29 +914,27 @@ bool FlowMeshAgreement::Receive(const AgreementMessage& message, std::string& er
         if (message.stage == AgreementStage::VIEW_CHANGE && message.view > s.slot.view &&
             s.reports[message.view].size() >= s.seats.Size() - s.Quorum() + 1) {
             s.Pump();
-            if (!s.MoveView(message.view, true)) return true;
+            if (!s.MoveView(message.view, true)) return s.FinishPublicCall(true);
         }
-        return s.Pump();
+        return s.FinishPublicCall(s.Pump());
     } catch (const std::exception& e) { return s.Stop(std::string{"agreement receive failure: "} + e.what(), error); }
 }
 
 bool FlowMeshAgreement::Timeout(std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
-    Impl::FlushOnReturn flush{s};
     Impl::TraceSpan trace{s, "timeout"};
     try {
         s.usable.clear();
         s.Pump();
         if (!s.IsDecided() && s.MoveView(s.slot.view + 1, true)) s.Pump();
-        return true;
+        return s.FinishPublicCall(true);
     } catch (const std::exception& e) { return s.Stop(std::string{"agreement timeout failure: "} + e.what(), error); }
 }
 
 bool FlowMeshAgreement::Retry(std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
-    Impl::FlushOnReturn flush{s};
     Impl::TraceSpan trace{s, "retry"};
     try {
         // Evidence and anchors can become available again between retries.
@@ -977,7 +962,7 @@ bool FlowMeshAgreement::Retry(std::string& error)
             sent_bytes += bytes.size();
             ++s.retry_cursor;
         }
-        return true;
+        return s.FinishPublicCall(true);
     } catch (const std::exception& e) { return s.Stop(std::string{"agreement retry failure: "} + e.what(), error); }
 }
 

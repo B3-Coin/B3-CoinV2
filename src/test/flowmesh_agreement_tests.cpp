@@ -826,6 +826,60 @@ BOOST_AUTO_TEST_CASE(folded_slot_changes_are_durable_at_every_public_return)
     BOOST_CHECK(EncodeAgreementMessage(*retained) == EncodeAgreementMessage(f.Proposal(f.a)));
 }
 
+// A keyless observer has no signing write to carry its folded changes. A
+// failure of the final flush must fail the public call, not just set Halted
+// after returning success: HandleAgreement uses Receive's result to decide
+// whether it may relay the received message before refreshing the halt state.
+BOOST_AUTO_TEST_CASE(final_deferred_flush_failure_refuses_keyless_receive_and_caller_relay)
+{
+    const AgreementFixture f;
+    const fs::path path{m_args.GetDataDirBase() / "agreement-final-flush-failure"};
+    std::string error;
+    bool available{true};
+    std::vector<AgreementMessage> output;
+    const auto keyless = [&] {
+        auto callbacks{f.Callbacks(8, output, available)};
+        callbacks.local_keys = [] { return std::vector<bls::SecretKey>{}; };
+        return callbacks;
+    };
+    {
+        size_t failed_writes{0};
+        auto callbacks{keyless()};
+        callbacks.crash = [&](const auto point) {
+            if (point == node::FlowMeshAgreementCrashPoint::BEFORE_PUBLIC_RETURN_PERSIST) {
+                ++failed_writes;
+                // Same exception type as CDBWrapper::WriteBatch on a storage
+                // failure, at the exact deferred-flush boundary, before I/O.
+                throw dbwrapper_error("injected final agreement journal write failure");
+            }
+        };
+        node::FlowMeshAgreement engine{DBParams{.path = path, .cache_bytes = 1 << 20}, std::move(callbacks)};
+        BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+        const bool received{engine.Receive(f.Proposal(f.a), error)};
+        // Exercise the production caller's success-only relay contract. The
+        // engine's own publish callback is counted independently below.
+        std::vector<AgreementMessage> caller_relays;
+        if (received) caller_relays.push_back(f.Proposal(f.a));
+        BOOST_CHECK(!received);
+        BOOST_CHECK_EQUAL(failed_writes, 1U);
+        BOOST_CHECK(engine.Halted());
+        BOOST_CHECK(error.find("injected final agreement journal write failure") != std::string::npos);
+        BOOST_CHECK_EQUAL(error, engine.LastError());
+        BOOST_CHECK(caller_relays.empty());
+        BOOST_CHECK(output.empty());
+        BOOST_CHECK(!engine.Retry(error));
+        BOOST_CHECK(!engine.SubmitCandidate(f.b, error));
+        BOOST_CHECK(output.empty());
+    }
+    // The failed batch published nothing and left no candidate/proposal in
+    // the journal. Reopening may only recover the earlier bootstrap state.
+    node::FlowMeshAgreement restarted{DBParams{.path = path, .cache_bytes = 1 << 20}, keyless()};
+    BOOST_REQUIRE_MESSAGE(restarted.Open(f.context, f.seats, Filled(77), false, error), error);
+    BOOST_CHECK(!restarted.CandidateBytes(f.hash_a));
+    BOOST_REQUIRE(restarted.Retry(error));
+    BOOST_CHECK(output.empty());
+}
+
 // Every BLS signature follows a synchronous whole-slot write that covers every
 // folded change recorded before it, including the resumed-intent path that
 // has no write of its own; a slot therefore needs three fewer barriers.
