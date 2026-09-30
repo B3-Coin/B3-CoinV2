@@ -20,9 +20,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -99,6 +103,139 @@ util::Signed128 SideTotal(const flowmesh::FlowMeshState& state, const Side side,
         total += std::max<CAmount>(0, flowmesh::ClearingEngine::EvaluateCurve(curve.points, price) - curve.filled_quantity);
     }
     return total;
+}
+
+//! A step ladder as up to four (price, quantity) steps on one curve: a bid
+//! buys each step's quantity at its price or below, an ask sells at or above.
+std::vector<Breakpoint> Ladder(const Side side, std::vector<std::pair<CAmount, CAmount>> steps)
+{
+    std::sort(steps.begin(), steps.end());
+    std::vector<Breakpoint> out;
+    const auto add = [&](const CAmount price, const CAmount qty) {
+        if (!out.empty() && out.back().price == price) out.back().qty = qty;
+        else out.push_back({price, qty});
+    };
+    if (side == Side::BID) {
+        CAmount total{0};
+        for (const auto& step : steps) total += step.second;
+        for (const auto& [price, qty] : steps) {
+            add(price, total);
+            total -= qty;
+            add(price + 1, total);
+        }
+    } else {
+        CAmount total{0};
+        for (const auto& [price, qty] : steps) {
+            if (price > 0) add(price - 1, total);
+            total += qty;
+            add(price, total);
+        }
+    }
+    return out;
+}
+
+//! A random valid curve of any shape: a limit, a ladder or a general curve.
+std::vector<Breakpoint> AnyCurve(FastRandomContext& rng, const Side side)
+{
+    if (rng.randrange(3) != 0) return RandomCurve(rng, side);
+    std::vector<std::pair<CAmount, CAmount>> steps;
+    CAmount price{static_cast<CAmount>(rng.randrange(12))};
+    const size_t n{static_cast<size_t>(1 + rng.randrange(4))};
+    for (size_t i{0}; i < n; ++i) {
+        steps.emplace_back(price, 1 + static_cast<CAmount>(rng.randrange(500)));
+        price += 1 + static_cast<CAmount>(rng.randrange(9));
+    }
+    return Ladder(side, steps);
+}
+
+using U128 = util::Unsigned128;
+
+//! R(p) of a curve, with R(-1) = 0.
+CAmount Remaining(const flowmesh::ClearingEngine::CurveView& curve, const CAmount price)
+{
+    if (price < 0) return 0;
+    return std::max<CAmount>(0, flowmesh::ClearingEngine::EvaluateCurve(curve.points, price) - curve.filled_quantity);
+}
+
+//! Lots whose own limit is exactly `price`.
+CAmount LevelAt(const flowmesh::ClearingEngine::CurveView& curve, const CAmount price)
+{
+    return curve.side == Side::BID ? Remaining(curve, price) - Remaining(curve, price + 1)
+                                   : Remaining(curve, price) - Remaining(curve, price - 1);
+}
+
+//! The display bucket of a price by its definition, independently of the
+//! implementation: the smallest or largest index whose edge accepts it.
+std::pair<U128, bool> BruteBucket(const Side side, const CAmount price, const flowmesh::LevelGrouping& grouping)
+{
+    if (grouping.exact) return {static_cast<U128>(price), false};
+    const auto pow10 = [](int n) { U128 out{1}; while (n-- > 0) out *= 10; return out; };
+    if (!grouping.inverse) {
+        const U128 ticks{grouping.mantissa * pow10(grouping.exponent + 9 - grouping.decimals)};
+        U128 index{0};
+        if (side == Side::BID) { while ((index + 1) * ticks <= static_cast<U128>(price)) ++index; }
+        else { while (index * ticks < static_cast<U128>(price)) ++index; }
+        return {index, false};
+    }
+    if (price == 0) return {0, true};
+    const U128 scale{pow10(9 - grouping.decimals - grouping.exponent)};
+    const U128 unit{grouping.mantissa * static_cast<U128>(price)};
+    // Displayed sell (canonical bid): the smallest b with b x unit >= scale;
+    // displayed buy (canonical ask): the largest b with b x unit <= scale.
+    U128 index{scale / unit};
+    if (side == Side::BID) { if (index * unit < scale) ++index; }
+    return {index, false};
+}
+
+struct BruteLevel {
+    U128 bucket{0};
+    bool zero_price{false};
+    CAmount any_price{0};
+    U128 size{0}, notional{0};
+    std::set<flowmesh::AccountId> accounts;
+    CAmount own{0};
+    //! Distinct prices of each curve in the bucket.
+    std::map<flowmesh::AccountId, size_t> prices;
+};
+
+//! Every level of a side by a scan of every integer price up to `top`.
+std::vector<BruteLevel> BruteLevels(const std::vector<flowmesh::ClearingEngine::CurveView>& curves, const Side side,
+                                    const flowmesh::LevelGrouping& grouping, const flowmesh::AccountId& own, const CAmount top)
+{
+    std::map<std::pair<bool, U128>, BruteLevel> buckets;
+    for (CAmount price{0}; price <= top; ++price) {
+        for (const auto& curve : curves) {
+            if (curve.side != side) continue;
+            const CAmount level{LevelAt(curve, price)};
+            if (level <= 0) continue;
+            const auto [index, zero]{BruteBucket(side, price, grouping)};
+            auto [it, inserted]{buckets.try_emplace({zero, index})};
+            auto& bucket{it->second};
+            if (inserted) { bucket.bucket = index; bucket.zero_price = zero; bucket.any_price = price; }
+            bucket.size += static_cast<U128>(level);
+            bucket.notional += static_cast<U128>(level) * static_cast<U128>(price);
+            bucket.accounts.insert(curve.account_id);
+            ++bucket.prices[curve.account_id];
+            if (curve.account_id == own) bucket.own += level;
+        }
+    }
+    std::vector<BruteLevel> out;
+    for (auto& [key, bucket] : buckets) out.push_back(std::move(bucket));
+    std::sort(out.begin(), out.end(), [&](const BruteLevel& a, const BruteLevel& b) {
+        return side == Side::BID ? a.any_price > b.any_price : a.any_price < b.any_price;
+    });
+    return out;
+}
+
+flowmesh::LevelGrouping Grouping(const bool inverse, const uint8_t mantissa, const int32_t exponent, const uint8_t decimals)
+{
+    flowmesh::LevelGrouping grouping;
+    grouping.exact = false;
+    grouping.inverse = inverse;
+    grouping.mantissa = mantissa;
+    grouping.exponent = exponent;
+    grouping.decimals = decimals;
+    return grouping;
 }
 
 } // namespace
@@ -606,6 +743,443 @@ BOOST_AUTO_TEST_CASE(indicative_fails_closed_on_budget_malformed_curves_and_inva
     // An empty book: available, nothing to clear.
     const auto empty{flowmesh::ComputeIndicative({}, {})};
     BOOST_CHECK(empty.available && !empty.cleared && !empty.best_bid && !empty.best_ask);
+}
+
+BOOST_AUTO_TEST_CASE(book_levels_match_an_integer_scan_in_every_grouping)
+{
+    FastRandomContext rng{uint256{53}};
+    // Exact; canonical steps of 1, 2, 5, 10 and 50 ticks (d = 9); inverse
+    // u = 10^3 / P (d = 6, h = 1), 10^4 / (5 P) and 10^2 / (2 P).
+    const std::vector<flowmesh::LevelGrouping> groupings{
+        flowmesh::LevelGrouping{}, Grouping(false, 1, 0, 9), Grouping(false, 2, 0, 9), Grouping(false, 5, 0, 9),
+        Grouping(false, 1, 1, 9), Grouping(false, 5, 1, 9), Grouping(true, 1, 0, 6), Grouping(true, 5, -1, 6),
+        Grouping(true, 2, 1, 6)};
+    size_t levels_checked{0}, truncated_by_depth{0}, ladders{0}, notionals{0};
+    for (int iteration{0}; iteration < 160; ++iteration) {
+        auto state{EmptyState()};
+        const uint8_t accounts{static_cast<uint8_t>(1 + rng.randrange(10))};
+        for (uint8_t i{0}; i < accounts; ++i) Fund(state, Account(i));
+        const auto submit = [&] {
+            for (uint8_t i{0}; i < accounts; ++i) {
+                for (const Side side : {Side::BID, Side::ASK}) {
+                    if (rng.randrange(3) == 0) continue;
+                    const auto curve{AnyCurve(rng, side)};
+                    ladders += curve.size() > 2;
+                    BOOST_REQUIRE(state.SubmitCurve(Account(i), side, curve));
+                }
+            }
+        };
+        // Random fills: a clearing leaves partially filled curves behind.
+        submit();
+        BOOST_REQUIRE(state.ClearSlot());
+        if (rng.randbool()) submit();
+        const auto curves{state.ReadCurves(std::numeric_limits<size_t>::max()).curves};
+        const auto root{state.Root()};
+        const flowmesh::AccountId own{Account(static_cast<uint8_t>(rng.randrange(accounts)))};
+        // Every level lies at or below the highest breakpoint.
+        CAmount top{0};
+        for (const auto& curve : curves) top = std::max(top, curve.points.back().price + 1);
+        std::optional<CAmount> best_bid, best_ask;
+        for (CAmount price{0}; price <= top; ++price) {
+            if (SideTotal(state, Side::BID, price) > 0) best_bid = price;
+            if (!best_ask && SideTotal(state, Side::ASK, price) > 0) best_ask = price;
+        }
+        for (const auto& grouping : groupings) {
+            flowmesh::BookLevelsQuery query;
+            query.grouping = grouping;
+            query.depth = 1 + rng.randrange(flowmesh::MARKET_DATA_MAX_LEVELS);
+            query.account = own;
+            const auto levels{flowmesh::ComputeBookLevels(curves, query)};
+            BOOST_REQUIRE(levels.available);
+            BOOST_CHECK(levels.grouping == grouping);
+            BOOST_CHECK_EQUAL(levels.depth, query.depth);
+            BOOST_CHECK_EQUAL(levels.total_curves, curves.size());
+            for (const Side side : {Side::BID, Side::ASK}) {
+                const auto& got{side == Side::BID ? levels.bids : levels.asks};
+                BOOST_REQUIRE(got.available);
+                BOOST_CHECK(got.truncated_reason.empty());
+                const auto expected{BruteLevels(curves, side, grouping, own, top)};
+                BOOST_REQUIRE_EQUAL(got.levels.size(), std::min(expected.size(), query.depth));
+                BOOST_CHECK_EQUAL(got.more, expected.size() > query.depth);
+                truncated_by_depth += got.more;
+                U128 cumulative{0};
+                for (size_t i{0}; i < got.levels.size(); ++i) {
+                    const auto& level{got.levels[i]};
+                    const auto& brute{expected[i]};
+                    cumulative += brute.size;
+                    BOOST_CHECK(level.bucket == brute.bucket);
+                    BOOST_CHECK_EQUAL(level.zero_price, brute.zero_price);
+                    BOOST_CHECK(static_cast<U128>(level.size) == brute.size);
+                    BOOST_CHECK(static_cast<U128>(level.cumulative) == cumulative);
+                    BOOST_CHECK_EQUAL(level.curves, brute.accounts.size());
+                    BOOST_CHECK_EQUAL(level.own, brute.own);
+                    // Exact notional unless a curve has more prices in the
+                    // level than the bounded walk reads.
+                    const bool walked{std::all_of(brute.prices.begin(), brute.prices.end(), [](const auto& item) {
+                        return item.second <= flowmesh::MARKET_VIEW_LEVEL_NOTIONAL_PRICES;
+                    })};
+                    BOOST_CHECK_EQUAL(level.notional.has_value(), walked);
+                    if (level.notional) BOOST_CHECK(*level.notional == brute.notional);
+                    notionals += walked;
+                    BOOST_CHECK(level.low <= brute.any_price && brute.any_price <= level.high);
+                    // Cumulative is the side's total at the level's far edge.
+                    const CAmount edge{side == Side::BID ? level.low : level.high};
+                    BOOST_CHECK(static_cast<util::Signed128>(level.cumulative) == SideTotal(state, side, edge));
+                    ++levels_checked;
+                }
+            }
+            // Best prices are exact, whatever the grouping.
+            BOOST_CHECK(levels.best_bid == best_bid);
+            BOOST_CHECK(levels.best_ask == best_ask);
+            // The standing clearing is the indicative without a draft.
+            BOOST_CHECK(levels.standing == flowmesh::ComputeIndicative(curves, {}));
+        }
+        BOOST_CHECK(state.Root() == root);
+    }
+    BOOST_CHECK(levels_checked > 5'000 && truncated_by_depth > 50 && ladders > 100 && notionals > levels_checked / 2);
+    BOOST_TEST_MESSAGE("book levels checked: " << levels_checked << ", with notional " << notionals << ", depth-limited sides " << truncated_by_depth);
+}
+
+BOOST_AUTO_TEST_CASE(book_levels_canonical_step_is_m_times_ten_to_e_plus_nine_minus_d)
+{
+    // A price P shows as P x 10^(d - 9) B3 per token. With d = 6 a step of
+    // 0.01 B3 per token is 10 ticks (m x 10^(e + 9 - d)), never 10^-5 (the
+    // sign-inverted e + d - 9); with d = 9 a tick is 1 B3 per token.
+    BOOST_CHECK(flowmesh::LevelGroupingError(Grouping(false, 1, -2, 6)).empty());
+    auto state{EmptyState()};
+    for (uint8_t i{0}; i < 3; ++i) Fund(state, Account(i));
+    BOOST_REQUIRE(state.SubmitCurve(Account(0), Side::BID, *flowmesh::MakeLimitBidCurve(1234, 7)));
+    BOOST_REQUIRE(state.SubmitCurve(Account(1), Side::BID, *flowmesh::MakeLimitBidCurve(1239, 5)));
+    BOOST_REQUIRE(state.SubmitCurve(Account(2), Side::ASK, *flowmesh::MakeLimitAskCurve(1241, 3)));
+    const auto curves{state.ReadCurves(8).curves};
+    flowmesh::BookLevelsQuery query;
+    query.grouping = Grouping(false, 1, -2, 6);
+    const auto levels{flowmesh::ComputeBookLevels(curves, query)};
+    BOOST_REQUIRE(levels.available);
+    BOOST_REQUIRE_EQUAL(levels.bids.levels.size(), 1U);
+    // 1.234 and 1.239 B3 per token buy at 1.23: bucket 123, ticks 1230-1239.
+    BOOST_CHECK(levels.bids.levels[0].bucket == 123);
+    BOOST_CHECK_EQUAL(levels.bids.levels[0].low, 1230);
+    BOOST_CHECK_EQUAL(levels.bids.levels[0].high, 1239);
+    BOOST_CHECK_EQUAL(levels.bids.levels[0].size, 12);
+    BOOST_CHECK_EQUAL(levels.bids.levels[0].curves, 2U);
+    // 1.241 sells at 1.25: bucket 125, ticks 1241-1250.
+    BOOST_REQUIRE_EQUAL(levels.asks.levels.size(), 1U);
+    BOOST_CHECK(levels.asks.levels[0].bucket == 125);
+    BOOST_CHECK_EQUAL(levels.asks.levels[0].low, 1241);
+    BOOST_CHECK_EQUAL(levels.asks.levels[0].high, 1250);
+    // Every label is a price every lot of its level accepts.
+    BOOST_CHECK(levels.bids.levels[0].low <= *levels.best_bid && levels.asks.levels[0].high >= *levels.best_ask);
+    BOOST_CHECK(!flowmesh::LevelGroupingError(Grouping(false, 1, -2, 9)).empty());
+    // 10 B3 per token with d = 6: 10^4 ticks, one bucket from 0 to 9999.
+    query.grouping = Grouping(false, 1, 1, 6);
+    const auto coarse{flowmesh::ComputeBookLevels(curves, query)};
+    BOOST_REQUIRE_EQUAL(coarse.bids.levels.size(), 1U);
+    BOOST_CHECK_EQUAL(coarse.bids.levels[0].low, 0);
+    BOOST_CHECK_EQUAL(coarse.bids.levels[0].high, 9'999);
+    BOOST_CHECK(coarse.asks.levels[0].bucket == 1 && coarse.asks.levels[0].high == 10'000);
+
+    // Valid ranges: e + 9 - d in 0..18 with the step within the monetary
+    // range (canonical), 9 - d - e in 0..36 (inverse), m in {1, 2, 5}.
+    BOOST_CHECK(!flowmesh::LevelGroupingError(Grouping(false, 1, -4, 6)).empty()); // 10^-1 ticks
+    BOOST_CHECK(flowmesh::LevelGroupingError(Grouping(false, 1, -3, 6)).empty());  // 1 tick
+    BOOST_CHECK(flowmesh::LevelGroupingError(Grouping(false, 5, 17, 9)).empty());  // 5 x 10^17 ticks
+    BOOST_CHECK(!flowmesh::LevelGroupingError(Grouping(false, 1, 18, 9)).empty()); // over MAX_MONEY
+    BOOST_CHECK(!flowmesh::LevelGroupingError(Grouping(false, 3, 0, 9)).empty());
+    BOOST_CHECK(!flowmesh::LevelGroupingError(Grouping(false, 1, 0, 19)).empty());
+    BOOST_CHECK(flowmesh::LevelGroupingError(Grouping(true, 1, 3, 6)).empty());    // s = 0
+    BOOST_CHECK(!flowmesh::LevelGroupingError(Grouping(true, 1, 4, 6)).empty());   // s = -1
+    BOOST_CHECK(flowmesh::LevelGroupingError(Grouping(true, 2, -33, 6)).empty());  // s = 36
+    BOOST_CHECK(!flowmesh::LevelGroupingError(Grouping(true, 2, -34, 6)).empty()); // s = 37
+    BOOST_CHECK(!flowmesh::LevelGroupingError(Grouping(true, 1, std::numeric_limits<int32_t>::min(), 6)).empty());
+    query.grouping = Grouping(true, 1, 4, 6);
+    const auto refused{flowmesh::ComputeBookLevels(curves, query)};
+    BOOST_CHECK(!refused.available);
+    BOOST_CHECK_EQUAL(refused.unavailable_reason, "invalid_grouping");
+    for (const size_t depth : {size_t{0}, flowmesh::MARKET_DATA_MAX_LEVELS + 1}) {
+        flowmesh::BookLevelsQuery bad;
+        bad.depth = depth;
+        BOOST_CHECK(!flowmesh::LevelsQueryValid(bad));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(book_levels_inverse_partition_is_exact_contiguous_and_conservative)
+{
+    const auto pow10 = [](int n) { U128 out{1}; while (n-- > 0) out *= 10; return out; };
+    for (const auto& [mantissa, exponent, decimals] : std::vector<std::tuple<uint8_t, int32_t, uint8_t>>{
+             {1, -2, 6}, {5, -3, 6}, {2, -4, 9}, {1, 0, 9}, {2, 1, 6}, {5, 0, 3}}) {
+        const auto grouping{Grouping(true, mantissa, exponent, decimals)};
+        BOOST_REQUIRE(flowmesh::LevelGroupingError(grouping).empty());
+        const U128 scale{pow10(9 - decimals - exponent)};
+        // One unit of one account at each price, one side at a time: every
+        // level then holds exactly its prices.
+        for (const Side side : {Side::BID, Side::ASK}) {
+            std::vector<flowmesh::ClearingEngine::CurveView> curves;
+            const CAmount top{std::min<CAmount>(static_cast<CAmount>(scale) + 3, 2'500)};
+            for (CAmount price{1}; price <= top; ++price) {
+                uint256 account;
+                *account.begin() = static_cast<uint8_t>(price & 0xff);
+                *(account.begin() + 1) = static_cast<uint8_t>(price >> 8);
+                const auto points{side == Side::BID ? *flowmesh::MakeLimitBidCurve(price, 1) : *flowmesh::MakeLimitAskCurve(price, 1)};
+                curves.push_back({account, side, points, 0, 1, 0});
+            }
+            flowmesh::BookLevelsQuery query;
+            query.grouping = grouping;
+            query.depth = flowmesh::MARKET_DATA_MAX_LEVELS;
+            const auto levels{flowmesh::ComputeBookLevels(curves, query, 1 << 24)};
+            BOOST_REQUIRE(levels.available);
+            const auto& got{side == Side::BID ? levels.bids : levels.asks};
+            BOOST_REQUIRE(!got.levels.empty());
+            std::optional<CAmount> previous_edge;
+            for (const auto& level : got.levels) {
+                BOOST_CHECK(level.low <= level.high);
+                // Contiguous and disjoint: each level starts where the last ended.
+                if (previous_edge) BOOST_CHECK_EQUAL(side == Side::BID ? level.high : level.low, *previous_edge);
+                previous_edge = side == Side::BID ? level.low - 1 : level.high + 1;
+                // Exactly the prices of the range that exist in the book.
+                const CAmount first{std::max<CAmount>(level.low, 1)}, last{std::min(level.high, top)};
+                BOOST_CHECK_EQUAL(level.size, last - first + 1);
+                BOOST_CHECK_EQUAL(level.curves, static_cast<uint32_t>(last - first + 1));
+                for (CAmount price{first}; price <= last; ++price) {
+                    BOOST_CHECK(BruteBucket(side, price, grouping).first == level.bucket);
+                    // Conservative labels: a displayed sell (canonical bid) is
+                    // labelled at or above u, a displayed buy at or below it.
+                    const U128 unit{mantissa * static_cast<U128>(price)};
+                    if (side == Side::BID) BOOST_CHECK(level.bucket * unit >= scale);
+                    else BOOST_CHECK(level.bucket * unit <= scale);
+                }
+                // Just outside the range, the bucket differs.
+                if (level.low > 1) BOOST_CHECK(BruteBucket(side, level.low - 1, grouping).first != level.bucket);
+                if (level.high < top) BOOST_CHECK(BruteBucket(side, level.high + 1, grouping).first != level.bucket);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(book_levels_decompose_ladders_slopes_zero_prices_and_fills)
+{
+    auto state{EmptyState()};
+    for (uint8_t i{0}; i < 6; ++i) Fund(state, Account(i));
+    // A four-step ladder per side, eight breakpoints each.
+    const auto bid_ladder{Ladder(Side::BID, {{100, 10}, {103, 20}, {104, 5}, {110, 30}})};
+    const auto ask_ladder{Ladder(Side::ASK, {{120, 7}, {125, 8}, {126, 9}, {140, 11}})};
+    BOOST_CHECK_EQUAL(bid_ladder.size(), 7U); // 103 and 104 share a point
+    BOOST_CHECK(ask_ladder.size() <= 8U);
+    BOOST_REQUIRE(state.SubmitCurve(Account(0), Side::BID, bid_ladder));
+    BOOST_REQUIRE(state.SubmitCurve(Account(1), Side::ASK, ask_ladder));
+    // A sloped bid: E(190) = 10 + floor(-9) = 1 and E(199) = 0.
+    BOOST_REQUIRE(state.SubmitCurve(Account(2), Side::BID, {{100, 10}, {200, 0}}));
+    BOOST_CHECK_EQUAL(flowmesh::ClearingEngine::EvaluateCurve({{100, 10}, {200, 0}}, 190), 1);
+    BOOST_CHECK_EQUAL(flowmesh::ClearingEngine::EvaluateCurve({{100, 10}, {200, 0}}, 199), 0);
+    // An ask whose first quantity is positive sells at any price down to 0.
+    BOOST_REQUIRE(state.SubmitCurve(Account(3), Side::ASK, {{150, 4}, {160, 6}}));
+    const auto curves{state.ReadCurves(8).curves};
+
+    flowmesh::BookLevelsQuery query;
+    query.depth = flowmesh::MARKET_DATA_MAX_LEVELS;
+    query.account = Account(0);
+    const auto exact{flowmesh::ComputeBookLevels(curves, query)};
+    BOOST_REQUIRE(exact.available);
+    // The ladder's steps appear as its own levels, the slope's lots at 190
+    // (190 has 1 lot: E(190) - E(191) = 1 - 0 with E(191) = 10 + floor(-9.1)).
+    const auto find = [](const flowmesh::BookLevelsSide& side, const CAmount price) -> const flowmesh::BookLevel* {
+        for (const auto& level : side.levels) if (level.low == price) return &level;
+        return nullptr;
+    };
+    // The slope has one lot at each of 100, 110, ..., 190.
+    for (const auto& [price, size] : std::vector<std::pair<CAmount, CAmount>>{{110, 30}, {104, 5}, {103, 20}, {100, 10}}) {
+        const auto* level{find(exact.bids, price)};
+        BOOST_REQUIRE(level);
+        BOOST_CHECK_EQUAL(level->own, size);
+        BOOST_CHECK_EQUAL(level->size, size + (price % 10 == 0 ? 1 : 0));
+        BOOST_CHECK_EQUAL(level->curves, price % 10 == 0 ? 2U : 1U);
+    }
+    for (CAmount price{120}; price <= 190; price += 10) BOOST_CHECK(find(exact.bids, price) && find(exact.bids, price)->size == 1);
+    BOOST_CHECK_EQUAL(exact.bids.levels.size(), 12U);
+    BOOST_CHECK(exact.best_bid == CAmount{190});
+    // Asks: 4 at price 0 first, then the ladder and the slope's rise.
+    BOOST_CHECK_EQUAL(exact.asks.levels.front().low, 0);
+    BOOST_CHECK_EQUAL(exact.asks.levels.front().size, 4);
+    BOOST_CHECK(exact.best_ask == CAmount{0});
+
+    // Canonical groups of 50 ticks (d = 9, h = 5 x 10^1): the slope's bucket
+    // at 100 holds D(100) - D(150) of it = 10 - 5, and 150 the other 5.
+    query.grouping = Grouping(false, 5, 1, 9);
+    query.account.reset();
+    const auto grouped{flowmesh::ComputeBookLevels(curves, query)};
+    BOOST_REQUIRE(grouped.available);
+    BOOST_REQUIRE_EQUAL(grouped.bids.levels.size(), 2U);
+    BOOST_CHECK(grouped.bids.levels[0].bucket == 3 && grouped.bids.levels[0].size == 5);
+    BOOST_CHECK(grouped.bids.levels[1].bucket == 2 && grouped.bids.levels[1].size == 5 + 65);
+    BOOST_CHECK_EQUAL(grouped.bids.levels[1].curves, 2U);
+    // The ladder's notional is its exact quantity x price per step, the
+    // slope's 100 + 110 + ... + 140.
+    const auto ladder_notional{U128{10} * 100 + U128{20} * 103 + U128{5} * 104 + U128{30} * 110};
+    BOOST_REQUIRE(grouped.bids.levels[1].notional);
+    BOOST_CHECK(*grouped.bids.levels[1].notional == ladder_notional + 100 + 110 + 120 + 130 + 140);
+    BOOST_REQUIRE(grouped.bids.levels[0].notional);
+    BOOST_CHECK(*grouped.bids.levels[0].notional == 150 + 160 + 170 + 180 + 190);
+
+    // One wide bucket holding a slope with a lot at each of 100 prices:
+    // more than the bounded walk reads, so the level has no notional; its
+    // size stays exact.
+    std::vector<flowmesh::ClearingEngine::CurveView> steep{{Account(9), Side::BID, {{0, 100}, {100, 0}}, 0, 100, 0}};
+    query.grouping = Grouping(false, 5, 2, 9);
+    const auto wide{flowmesh::ComputeBookLevels(steep, query)};
+    BOOST_REQUIRE_EQUAL(wide.bids.levels.size(), 1U);
+    BOOST_CHECK_EQUAL(wide.bids.levels[0].size, 100);
+    BOOST_CHECK(!wide.bids.levels[0].notional);
+    query.grouping = {};
+    BOOST_CHECK_EQUAL(flowmesh::ComputeBookLevels(steep, query).bids.levels.size(), flowmesh::MARKET_DATA_MAX_LEVELS);
+
+    // The inverse view: the zero-price ask is its own first level, with no
+    // finite token-per-B3 price.
+    query.grouping = Grouping(true, 1, -2, 6);
+    const auto inverse{flowmesh::ComputeBookLevels(curves, query)};
+    BOOST_REQUIRE(inverse.available);
+    BOOST_CHECK(inverse.asks.levels.front().zero_price);
+    BOOST_CHECK_EQUAL(inverse.asks.levels.front().size, 4);
+
+    // Fills remove the best-priced lots first: a fill of 35 empties the
+    // ladder's 110 (30) and 104 (5) steps and leaves 103 and 100 whole.
+    auto filled{curves};
+    BOOST_REQUIRE(filled[0].account_id == Account(0) && filled[0].side == Side::BID);
+    filled[0].filled_quantity = 35;
+    query.grouping = {};
+    query.account = Account(0);
+    const auto after{flowmesh::ComputeBookLevels(filled, query)};
+    BOOST_REQUIRE(find(after.bids, 110));
+    BOOST_CHECK_EQUAL(find(after.bids, 110)->own, 0); // only the slope's lot
+    BOOST_CHECK(!find(after.bids, 104));
+    BOOST_CHECK_EQUAL(find(after.bids, 103)->own, 20);
+    BOOST_CHECK_EQUAL(find(after.bids, 100)->own, 10);
+    BOOST_CHECK_EQUAL(after.bids.levels.back().cumulative, 65 - 35 + 10);
+}
+
+BOOST_AUTO_TEST_CASE(book_levels_show_a_crossed_residual_after_a_prorata_clearing)
+{
+    // Bids A@10 x5 and B@12 x5, asks C@9 x7 and E@11 x5. The auction clears
+    // 7 at 9 (volume 7 at 9 and 10, the lower price wins) and rations A and
+    // B: the residual book is crossed, 12 above 11. The ids are pinned
+    // (Allocate gives a tie to the lower id), and the standing clearing is
+    // compared with ClearSlot on a copy rather than assumed.
+    auto state{EmptyState()};
+    for (uint8_t i{0}; i < 4; ++i) Fund(state, Account(i));
+    BOOST_REQUIRE(state.SubmitCurve(Account(0), Side::BID, *flowmesh::MakeLimitBidCurve(10, 5)));
+    BOOST_REQUIRE(state.SubmitCurve(Account(1), Side::BID, *flowmesh::MakeLimitBidCurve(12, 5)));
+    BOOST_REQUIRE(state.SubmitCurve(Account(2), Side::ASK, *flowmesh::MakeLimitAskCurve(9, 7)));
+    BOOST_REQUIRE(state.SubmitCurve(Account(3), Side::ASK, *flowmesh::MakeLimitAskCurve(11, 5)));
+    const auto first{state.ClearSlot()};
+    BOOST_REQUIRE(first && first->cleared);
+    BOOST_CHECK_EQUAL(first->price, 9);
+    BOOST_CHECK_EQUAL(first->volume, 7);
+    const auto curves{state.ReadCurves(8).curves};
+    const auto levels{flowmesh::ComputeBookLevels(curves, {})};
+    BOOST_REQUIRE(levels.available);
+    BOOST_CHECK(levels.best_bid == CAmount{12});
+    BOOST_CHECK(levels.best_ask == CAmount{11});
+    BOOST_CHECK(*levels.best_bid > *levels.best_ask);
+    auto copy{state};
+    const auto next{copy.ClearSlot()};
+    BOOST_REQUIRE(next && next->cleared);
+    BOOST_REQUIRE(levels.standing.available && levels.standing.cleared);
+    BOOST_CHECK_EQUAL(levels.standing.price, next->price);
+    BOOST_CHECK_EQUAL(levels.standing.volume, next->volume);
+    BOOST_CHECK_EQUAL(levels.standing.imbalance, next->imbalance);
+    BOOST_CHECK_EQUAL(next->price, 11);
+    BOOST_CHECK(!levels.standing.draft);
+}
+
+BOOST_AUTO_TEST_CASE(book_levels_fail_closed_or_stop_as_an_exact_prefix)
+{
+    auto state{EmptyState()};
+    for (uint8_t i{0}; i < 20; ++i) {
+        Fund(state, Account(i));
+        BOOST_REQUIRE(state.SubmitCurve(Account(i), Side::BID, {{static_cast<CAmount>(i), 50}, {static_cast<CAmount>(i) + 300, 0}}));
+        BOOST_REQUIRE(state.SubmitCurve(Account(i), Side::ASK, *flowmesh::MakeLimitAskCurve(400 + i, 3)));
+    }
+    const auto curves{state.ReadCurves(64).curves};
+    flowmesh::BookLevelsQuery query;
+    query.depth = flowmesh::MARKET_DATA_MAX_LEVELS;
+    const auto full{flowmesh::ComputeBookLevels(curves, query)};
+    BOOST_REQUIRE(full.available && full.bids.more);
+    // Not even the first pass fits: no levels at all.
+    for (const size_t budget : {size_t{0}, size_t{50}, size_t{200}}) {
+        const auto starved{flowmesh::ComputeBookLevels(curves, query, budget)};
+        BOOST_CHECK(!starved.available);
+        BOOST_CHECK_EQUAL(starved.unavailable_reason, "work_budget");
+        BOOST_CHECK(starved.bids.levels.empty() && starved.asks.levels.empty());
+    }
+    // Anything in between is an exact prefix of the full levels.
+    size_t prefixes{0};
+    for (size_t budget{300}; budget < 20'000; budget += 97) {
+        const auto partial{flowmesh::ComputeBookLevels(curves, query, budget)};
+        if (!partial.available) continue;
+        for (const auto* pair : {&partial.bids, &partial.asks}) {
+            const auto& whole{pair == &partial.bids ? full.bids : full.asks};
+            if (!pair->available) {
+                BOOST_CHECK_EQUAL(pair->unavailable_reason, "work_budget");
+                continue;
+            }
+            BOOST_REQUIRE(pair->levels.size() <= whole.levels.size());
+            for (size_t i{0}; i < pair->levels.size(); ++i) BOOST_CHECK(pair->levels[i] == whole.levels[i]);
+            if (pair->levels.size() < whole.levels.size()) {
+                BOOST_CHECK_EQUAL(pair->truncated_reason, "work_budget");
+                ++prefixes;
+            }
+        }
+    }
+    BOOST_CHECK(prefixes > 10);
+
+    // A malformed curve (never in verified state) makes the view unavailable.
+    auto malformed{curves};
+    std::swap(malformed.front().points.front(), malformed.front().points.back());
+    const auto refused{flowmesh::ComputeBookLevels(malformed, query)};
+    BOOST_CHECK(!refused.available);
+    BOOST_CHECK_EQUAL(refused.unavailable_reason, "malformed_curve");
+
+    // Sizes beyond MAX_MONEY stop the side, never saturate: two MAX_MONEY
+    // bids at one price have no level; at two prices, only the first.
+    std::vector<flowmesh::ClearingEngine::CurveView> huge;
+    for (uint8_t i{0}; i < 2; ++i) huge.push_back({Account(i), Side::BID, *flowmesh::MakeLimitBidCurve(5, MAX_MONEY), 0, MAX_MONEY, 0});
+    const auto same{flowmesh::ComputeBookLevels(huge, query)};
+    BOOST_REQUIRE(same.available);
+    BOOST_CHECK(!same.bids.available);
+    BOOST_CHECK_EQUAL(same.bids.unavailable_reason, "overflow");
+    huge[1].points = *flowmesh::MakeLimitBidCurve(4, MAX_MONEY);
+    const auto apart{flowmesh::ComputeBookLevels(huge, query)};
+    BOOST_REQUIRE(apart.bids.available);
+    BOOST_REQUIRE_EQUAL(apart.bids.levels.size(), 1U);
+    BOOST_CHECK_EQUAL(apart.bids.levels[0].size, MAX_MONEY);
+    BOOST_CHECK_EQUAL(apart.bids.truncated_reason, "overflow");
+    // An empty book: available, no levels.
+    const auto empty{flowmesh::ComputeBookLevels({}, query)};
+    BOOST_CHECK(empty.available && empty.bids.levels.empty() && empty.asks.levels.empty() && !empty.bids.more);
+}
+
+BOOST_AUTO_TEST_CASE(book_levels_of_a_full_limit_book_fit_the_budget)
+{
+    // 16384 limit curves (the display copy's bound): the first pass and 50
+    // levels a side stay well within the budget. Logged, not a timing claim.
+    std::vector<flowmesh::ClearingEngine::CurveView> curves;
+    for (uint32_t i{0}; i < flowmesh::MARKET_VIEW_MAX_BOOK_CURVES; ++i) {
+        uint256 account;
+        std::memcpy(account.begin(), &i, sizeof(i));
+        const bool bid{i % 2 == 0};
+        const CAmount price{bid ? 1000 - static_cast<CAmount>((i / 2) % 500) : 1001 + static_cast<CAmount>((i / 2) % 500)};
+        curves.push_back({account, bid ? Side::BID : Side::ASK,
+                          bid ? *flowmesh::MakeLimitBidCurve(price, 1 + i % 9) : *flowmesh::MakeLimitAskCurve(price, 1 + i % 9), 0, 1 + i % 9, 0});
+    }
+    flowmesh::BookLevelsQuery query;
+    query.depth = flowmesh::MARKET_DATA_MAX_LEVELS;
+    const auto started{std::chrono::steady_clock::now()};
+    const auto levels{flowmesh::ComputeBookLevels(curves, query)};
+    const auto elapsed{std::chrono::steady_clock::now() - started};
+    BOOST_REQUIRE(levels.available);
+    BOOST_CHECK_EQUAL(levels.bids.levels.size(), flowmesh::MARKET_DATA_MAX_LEVELS);
+    BOOST_CHECK(levels.bids.truncated_reason.empty() && levels.asks.truncated_reason.empty());
+    BOOST_CHECK(levels.best_bid == CAmount{1000} && levels.best_ask == CAmount{1001});
+    BOOST_TEST_MESSAGE("book levels of 16384 limit curves: " << std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() << " us");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

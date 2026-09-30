@@ -99,6 +99,107 @@ struct IndicativeClearing {
     //! its account is known (min == max), otherwise its bounds.
     std::optional<CAmount> draft_fill_min;
     std::optional<CAmount> draft_fill_max;
+    bool operator==(const IndicativeClearing&) const = default;
+};
+
+//! At most this many book levels per side in one reply.
+inline constexpr size_t MARKET_DATA_MAX_LEVELS{50};
+inline constexpr size_t MARKET_DATA_DEFAULT_LEVELS{20};
+
+/** How book levels group canonical prices: into the buckets of a display
+ * step h = mantissa x 10^exponent, in B3 per token (canonical) or in token
+ * per B3 (inverse), for a base asset of `decimals` decimals. A displayed
+ * buy bucket is labelled with its lower edge and a displayed sell bucket
+ * with its upper edge, so every lot in a bucket accepts its label price.
+ * Display only; never read by signing or any market decision. */
+struct LevelGrouping {
+    //! One level per canonical price; the other fields are unused.
+    bool exact{true};
+    bool inverse{false};
+    //! 1, 2 or 5.
+    uint8_t mantissa{1};
+    int32_t exponent{0};
+    //! The base asset's verified decimals (0-18), as the caller displays it.
+    uint8_t decimals{0};
+    bool operator==(const LevelGrouping&) const = default;
+};
+
+struct BookLevelsQuery {
+    //! Levels per side, 1..MARKET_DATA_MAX_LEVELS.
+    size_t depth{MARKET_DATA_DEFAULT_LEVELS};
+    LevelGrouping grouping;
+    //! Also compute them for an unchanged known_head reply (after a grouping
+    //! change); otherwise only a reply of a changed head carries them.
+    bool include_unchanged{false};
+    //! The caller's own account, for each level's own share. Set by the
+    //! local RPC from its wallet, never taken from a request.
+    std::optional<AccountId> account;
+    bool operator==(const BookLevelsQuery&) const = default;
+};
+
+/** One price level (bucket) of one side of the verified standing curves.
+ * Exact: every quantity is the lots whose own limit lies in [low, high]
+ * (a bid lot's highest price, an ask lot's lowest), after fills. */
+struct BookLevel {
+    //! The display bucket index: the canonical price (exact grouping),
+    //! floor(P / g) of a bid or ceil(P / g) of an ask (canonical, g ticks),
+    //! ceil(u) of a canonical bid or floor(u) of a canonical ask with u =
+    //! 10^s / (mantissa x P) (inverse). Zero for the zero-price level of the
+    //! inverse view.
+    util::Unsigned128 bucket{0};
+    //! Canonical price 0 in the inverse view: no finite token-per-B3 price
+    //! (an ask that sells at any price, or a bid that buys only for free).
+    bool zero_price{false};
+    //! The bucket's inclusive range of canonical prices (B3 atoms per base
+    //! atom); an unbounded end is MAX_MONEY.
+    CAmount low{0}, high{0};
+    //! Base units at this level, and from the best level through it.
+    CAmount size{0}, cumulative{0};
+    //! Exact B3 atoms of the level at each lot's own price (sum of
+    //! quantity x price); absent when a curve had more distinct prices in
+    //! the bucket than the level's bounded walk reads.
+    std::optional<util::Unsigned128> notional;
+    //! Standing curves with quantity here (one per account and side).
+    uint32_t curves{0};
+    //! The caller's account's part of `size`.
+    CAmount own{0};
+    bool operator==(const BookLevel&) const = default;
+};
+
+struct BookLevelsSide {
+    bool available{false};
+    //! "work_budget" or "overflow" before the first level; empty when available.
+    std::string unavailable_reason;
+    //! Best first: bids by descending, asks by ascending canonical price.
+    std::vector<BookLevel> levels;
+    //! More levels follow the last one returned.
+    bool more{false};
+    //! The levels stopped early ("work_budget" or "overflow"): those returned
+    //! are an exact prefix and nothing deeper is guessed.
+    std::string truncated_reason;
+    bool operator==(const BookLevelsSide&) const = default;
+};
+
+/** Aggregated price levels of the verified standing curves of one certified
+ * head. Never certified: computed by this node from the curves it verified
+ * or holds, excluding every pending action. Display only. */
+struct BookLevels {
+    bool available{false};
+    //! "no_certified_state", "head_changed", "work_budget" (also a book over
+    //! MARKET_VIEW_MAX_BOOK_CURVES) or "malformed_curve".
+    std::string unavailable_reason;
+    //! Certified head of the curves, set by the caller.
+    uint256 head;
+    size_t depth{0};
+    LevelGrouping grouping;
+    size_t total_curves{0};
+    //! Exact best standing prices, independent of the grouping.
+    std::optional<CAmount> best_bid, best_ask;
+    BookLevelsSide bids, asks;
+    //! The standing curves cleared as they are, with no draft: what the next
+    //! auction would do if nothing else arrived. Not certified.
+    IndicativeClearing standing;
+    bool operator==(const BookLevels&) const = default;
 };
 
 struct MarketDataQuery {

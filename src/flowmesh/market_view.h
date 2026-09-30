@@ -60,6 +60,40 @@ inline constexpr size_t MARKET_VIEW_MAX_BOOK_CURVES{size_t{1} << 14};
 IndicativeClearing ComputeIndicative(std::span<const ClearingEngine::CurveView> curves, const IndicativeQuery& query,
                                      size_t budget = MARKET_VIEW_WORK_BUDGET);
 
+//! Work one book-levels computation may spend over both sides: a unit per
+//! breakpoint read and per curve evaluation. Its first pass reads every
+//! curve's best level, so a book whose first pass exceeds it has no levels
+//! ("work_budget"); after that the levels stop early, as an exact prefix.
+inline constexpr size_t MARKET_VIEW_LEVELS_WORK_BUDGET{size_t{1} << 20};
+//! Distinct prices of one curve a grouped level reads for its exact B3
+//! notional; beyond it the level has no notional (its size stays exact).
+inline constexpr size_t MARKET_VIEW_LEVEL_NOTIONAL_PRICES{16};
+
+/** Why `grouping` cannot be computed, or empty. Canonical: the display step
+ * h = m x 10^e B3 per token is g = m x 10^(e + 9 - d) canonical ticks (a
+ * canonical price P is P x 10^(d - 9) B3 per token), which must be a whole
+ * number of ticks from 1 to MAX_MONEY. Inverse: u(P) = 10^s / (m x P) with
+ * s = 9 - d - e, which must lie in 0..36. m is 1, 2 or 5 and d is 0..18. */
+std::string LevelGroupingError(const LevelGrouping& grouping);
+//! A valid levels query: depth 1..MARKET_DATA_MAX_LEVELS and a valid grouping.
+bool LevelsQueryValid(const BookLevelsQuery& query);
+
+/** The top `query.depth` price levels per side of `curves` as the book holds
+ * them, best first, in the query's grouping; the standing clearing (no
+ * draft) and the exact best prices. Every level is exact: a bid bucket
+ * [lo, hi] holds R(lo) - R(hi + 1) of each curve and an ask bucket R(hi) -
+ * R(lo - 1) (R(-1) = 0), where R(p) = max(0, evaluate(p) - filled) is the
+ * curve's remaining quantity at p; cumulative is the running sum from the
+ * best level, equal to the side's total demand at lo (bids) or supply at hi
+ * (asks). A level is emitted only after every curve's part of it is summed.
+ * Within `budget` (MARKET_VIEW_LEVELS_WORK_BUDGET) the whole view is
+ * unavailable when the first pass does not fit, and otherwise stops early
+ * as an exact prefix; a level or cumulative size over MAX_MONEY stops its
+ * side ("overflow"), never saturated. Never touches a state; head is left
+ * to the caller. */
+BookLevels ComputeBookLevels(std::span<const ClearingEngine::CurveView> curves, const BookLevelsQuery& query,
+                             size_t budget = MARKET_VIEW_LEVELS_WORK_BUDGET);
+
 //! One page of at most `limit` standing curves after `after`, exactly as
 //! ClearingEngine::ReadCurves returns it at the head the caller pins, or
 //! nullopt when that head is no longer current.

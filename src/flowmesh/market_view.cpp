@@ -335,6 +335,376 @@ IndicativeClearing ComputeIndicative(const std::span<const ClearingEngine::Curve
     return out;
 }
 
+namespace {
+using U128 = util::Unsigned128;
+
+U128 Pow10(int exponent)
+{
+    U128 out{1};
+    while (exponent-- > 0) out *= 10;
+    return out;
+}
+
+CAmount Clamp(const U128 value)
+{
+    return value > static_cast<U128>(MAX_MONEY) ? MAX_MONEY : static_cast<CAmount>(value);
+}
+
+//! One display bucket: its index and its inclusive canonical price range.
+struct Bucket {
+    U128 index{0};
+    bool zero_price{false};
+    CAmount low{0}, high{0};
+};
+
+/** The buckets of a valid grouping (LevelGroupingError is empty). Every
+ * canonical price of a side lies in exactly one bucket, and the buckets are
+ * contiguous, disjoint ranges, so a bucket is identified by its low end. */
+class Partition
+{
+    enum class Kind { EXACT, CANONICAL, INVERSE };
+    Kind m_kind{Kind::EXACT};
+    //! Canonical: ticks per bucket. Inverse: 10^s and the mantissa.
+    CAmount m_ticks{1};
+    U128 m_scale{1}, m_mantissa{1};
+
+    static CAmount CeilDiv(const CAmount a, const CAmount b) { return a / b + (a % b != 0 ? 1 : 0); }
+    static U128 CeilDiv(const U128 a, const U128 b) { return a / b + (a % b != 0 ? 1 : 0); }
+
+public:
+    explicit Partition(const LevelGrouping& grouping)
+    {
+        if (grouping.exact) return;
+        if (!grouping.inverse) {
+            m_kind = Kind::CANONICAL;
+            m_ticks = static_cast<CAmount>(grouping.mantissa) * static_cast<CAmount>(Pow10(grouping.exponent + 9 - grouping.decimals));
+        } else {
+            m_kind = Kind::INVERSE;
+            m_scale = Pow10(9 - grouping.decimals - grouping.exponent);
+            m_mantissa = grouping.mantissa;
+        }
+    }
+
+    //! A canonical bid at `price`: a displayed buy in the canonical view
+    //! (floor, labelled with the lower edge), a displayed sell in the
+    //! inverse view (ceil of u, labelled with the upper edge).
+    Bucket Bid(const CAmount price) const
+    {
+        switch (m_kind) {
+        case Kind::EXACT: return {static_cast<U128>(price), false, price, price};
+        case Kind::CANONICAL: {
+            const CAmount index{price / m_ticks}, low{index * m_ticks};
+            return {static_cast<U128>(index), false, low, std::min<CAmount>(low + (m_ticks - 1), MAX_MONEY)};
+        }
+        case Kind::INVERSE: {
+            if (price == 0) return {0, true, 0, 0};
+            const U128 index{CeilDiv(m_scale, m_mantissa * static_cast<U128>(price))};
+            const U128 low{CeilDiv(m_scale, m_mantissa * index)};
+            const U128 high{index >= 2 ? CeilDiv(m_scale, m_mantissa * (index - 1)) - 1 : static_cast<U128>(MAX_MONEY)};
+            return {index, false, Clamp(low), Clamp(high)};
+        }
+        }
+        return {};
+    }
+
+    //! A canonical ask at `price`: a displayed sell in the canonical view
+    //! (ceil, labelled with the upper edge), a displayed buy in the inverse
+    //! view (floor of u, labelled with the lower edge).
+    Bucket Ask(const CAmount price) const
+    {
+        switch (m_kind) {
+        case Kind::EXACT: return {static_cast<U128>(price), false, price, price};
+        case Kind::CANONICAL: {
+            const CAmount index{CeilDiv(price, m_ticks)};
+            const CAmount high{index * m_ticks};
+            return {static_cast<U128>(index), false, index == 0 ? CAmount{0} : high - m_ticks + 1, std::min(high, MAX_MONEY)};
+        }
+        case Kind::INVERSE: {
+            if (price == 0) return {0, true, 0, 0};
+            const U128 index{m_scale / (m_mantissa * static_cast<U128>(price))};
+            const U128 low{m_scale / (m_mantissa * (index + 1)) + 1};
+            const U128 high{index >= 1 ? m_scale / (m_mantissa * index) : static_cast<U128>(MAX_MONEY)};
+            return {index, false, Clamp(low), Clamp(high)};
+        }
+        }
+        return {};
+    }
+};
+
+/** The highest price below `bound` (every price when absent) at which a bid
+ * curve has remaining quantity it does not also have at `bound`: the next
+ * bid level, generalising HighestBid (T = filled + R(bound)). */
+std::optional<CAmount> NextBidBelow(const Item& item, const std::optional<CAmount> bound, Work& work)
+{
+    const auto& points{*item.points};
+    CAmount threshold{item.filled};
+    if (bound) {
+        if (*bound <= 0 || !work.Spend(1)) return std::nullopt;
+        threshold = std::max(threshold, ClearingEngine::EvaluateCurve(points, *bound));
+    }
+    if (points.front().qty <= threshold) return std::nullopt;
+    // Quantities never rise: the breakpoints above the threshold are a prefix.
+    size_t k{0};
+    for (size_t i{1}; i < points.size(); ++i) {
+        if (points[i].qty > threshold) k = i;
+    }
+    if (k + 1 >= points.size()) return std::nullopt;
+    CAmount low{points[k].price}, high{points[k + 1].price - 1};
+    if (bound) high = std::min(high, *bound - 1);
+    if (low > high) return std::nullopt;
+    while (low < high) {
+        const CAmount middle{low + (high - low + 1) / 2};
+        if (!work.Spend(1)) return std::nullopt;
+        if (ClearingEngine::EvaluateCurve(points, middle) > threshold) low = middle;
+        else high = middle - 1;
+    }
+    return low;
+}
+
+/** The lowest price above `bound` (-1: every price) at which an ask curve
+ * has remaining quantity it does not also have at `bound`: the next ask
+ * level, generalising LowestAsk (T = filled + R(bound), R(-1) = 0). An ask
+ * whose first quantity exceeds its fill offers it at price 0. */
+std::optional<CAmount> NextAskAbove(const Item& item, const CAmount bound, Work& work)
+{
+    const auto& points{*item.points};
+    CAmount threshold{item.filled};
+    if (bound >= 0) {
+        if (bound >= MAX_MONEY || !work.Spend(1)) return std::nullopt;
+        threshold = std::max(threshold, ClearingEngine::EvaluateCurve(points, bound));
+    }
+    if (points.back().qty <= threshold) return std::nullopt;
+    size_t k{0};
+    while (points[k].qty <= threshold) ++k;
+    CAmount low{std::max(k == 0 ? CAmount{0} : points[k - 1].price + 1, bound + 1)}, high{points[k].price};
+    if (low > high) return std::nullopt;
+    while (low < high) {
+        const CAmount middle{low + (high - low) / 2};
+        if (!work.Spend(1)) return std::nullopt;
+        if (ClearingEngine::EvaluateCurve(points, middle) > threshold) high = middle;
+        else low = middle + 1;
+    }
+    return low;
+}
+
+//! A curve's next level and the bucket that holds it.
+struct Cursor {
+    Bucket bucket;
+    CAmount level{0};
+    size_t item{0};
+};
+
+//! One side's merge of every curve's next bucket, best first.
+class LevelMerge
+{
+    const std::vector<Item>& m_items;
+    const Partition& m_partition;
+    const bool m_bid;
+    std::vector<Cursor> m_heap;
+    U128 m_cumulative{0};
+    bool m_done{false};
+
+    bool Before(const Cursor& a, const Cursor& b) const { return m_bid ? a.bucket.low < b.bucket.low : a.bucket.low > b.bucket.low; }
+    void Push(const Cursor& cursor)
+    {
+        m_heap.push_back(cursor);
+        std::push_heap(m_heap.begin(), m_heap.end(), [&](const Cursor& a, const Cursor& b) { return Before(a, b); });
+    }
+    Cursor Pop()
+    {
+        std::pop_heap(m_heap.begin(), m_heap.end(), [&](const Cursor& a, const Cursor& b) { return Before(a, b); });
+        auto out{m_heap.back()};
+        m_heap.pop_back();
+        return out;
+    }
+    //! R(p), with R(-1) = 0 for an ask.
+    std::optional<CAmount> Remaining(const Item& item, const CAmount price, Work& work) const
+    {
+        if (price < 0) return CAmount{0};
+        if (!work.Spend(1)) return std::nullopt;
+        return std::max<CAmount>(0, ClearingEngine::EvaluateCurve(*item.points, price) - item.filled);
+    }
+    std::optional<CAmount> Next(const Item& item, const Bucket& from, Work& work) const
+    {
+        return m_bid ? NextBidBelow(item, from.low, work) : NextAskAbove(item, from.high, work);
+    }
+    void Stop(const char* reason)
+    {
+        m_done = true;
+        if (side.levels.empty()) {
+            side.available = false;
+            side.unavailable_reason = reason;
+        } else {
+            side.truncated_reason = reason;
+        }
+    }
+
+public:
+    BookLevelsSide side;
+
+    LevelMerge(const std::vector<Item>& items, const Partition& partition, const bool bid)
+        : m_items{items}, m_partition{partition}, m_bid{bid}
+    {
+        side.available = true;
+    }
+
+    //! Adds every curve of this side at its best level; false when the
+    //! budget ran out. `best` receives the side's exact best price.
+    bool Start(Work& work, std::optional<CAmount>& best)
+    {
+        for (size_t i{0}; i < m_items.size(); ++i) {
+            const Item& item{m_items[i]};
+            if ((item.side == Side::BID) != m_bid) continue;
+            const auto level{m_bid ? NextBidBelow(item, std::nullopt, work) : NextAskAbove(item, -1, work)};
+            if (work.Exhausted()) return false;
+            if (!level) continue;
+            Push({m_bid ? m_partition.Bid(*level) : m_partition.Ask(*level), *level, i});
+            if (!best || (m_bid ? *level > *best : *level < *best)) best = level;
+        }
+        return true;
+    }
+
+    bool Done() const { return m_done; }
+
+    //! Emits the next level, or ends the side (depth, empty, budget, overflow).
+    void Step(const size_t depth, const std::optional<AccountId>& account, Work& work)
+    {
+        if (m_done) return;
+        if (m_heap.empty()) {
+            m_done = true;
+            return;
+        }
+        if (side.levels.size() >= depth) {
+            side.more = true;
+            m_done = true;
+            return;
+        }
+        std::vector<Cursor> members{Pop()};
+        while (!m_heap.empty() && m_heap.front().bucket.low == members.front().bucket.low) members.push_back(Pop());
+        const Bucket& bucket{members.front().bucket};
+        BookLevel level;
+        level.bucket = bucket.index;
+        level.zero_price = bucket.zero_price;
+        level.low = bucket.low;
+        level.high = bucket.high;
+        U128 size{0}, notional{0};
+        bool notional_known{true};
+        for (const auto& member : members) {
+            const Item& item{m_items[member.item]};
+            // The bucket's lots of this curve: R(lo) - R(hi + 1) for a bid,
+            // R(hi) - R(lo - 1) for an ask.
+            const auto inner{Remaining(item, m_bid ? bucket.low : bucket.high, work)};
+            const auto outer{Remaining(item, m_bid ? bucket.high + 1 : bucket.low - 1, work)};
+            if (!inner || !outer) return Stop("work_budget");
+            const CAmount part{*inner - *outer};
+            size += static_cast<U128>(part);
+            if (size > static_cast<U128>(MAX_MONEY)) return Stop("overflow");
+            ++level.curves;
+            if (account && item.account == *account) level.own += part;
+            if (!notional_known) continue;
+            // Exact notional: the lots at each of this curve's prices in the
+            // bucket, from its best one, within a bounded walk.
+            const auto at_level{Remaining(item, member.level, work)};
+            if (!at_level) return Stop("work_budget");
+            if (*at_level == *inner) {
+                notional += static_cast<U128>(part) * static_cast<U128>(member.level);
+                continue;
+            }
+            CAmount price{member.level}, beyond{*outer}, here{*at_level};
+            for (size_t prices{1};; ++prices) {
+                notional += static_cast<U128>(here - beyond) * static_cast<U128>(price);
+                const auto next{m_bid ? NextBidBelow(item, price, work) : NextAskAbove(item, price, work)};
+                if (work.Exhausted()) return Stop("work_budget");
+                if (!next || (m_bid ? *next < bucket.low : *next > bucket.high)) break;
+                if (prices >= MARKET_VIEW_LEVEL_NOTIONAL_PRICES) {
+                    notional_known = false;
+                    break;
+                }
+                const auto remaining{Remaining(item, *next, work)};
+                if (!remaining) return Stop("work_budget");
+                beyond = here;
+                here = *remaining;
+                price = *next;
+            }
+        }
+        m_cumulative += size;
+        if (m_cumulative > static_cast<U128>(MAX_MONEY)) return Stop("overflow");
+        level.size = static_cast<CAmount>(size);
+        level.cumulative = static_cast<CAmount>(m_cumulative);
+        if (notional_known) level.notional = notional;
+        side.levels.push_back(std::move(level));
+        for (const auto& member : members) {
+            const auto next{Next(m_items[member.item], bucket, work)};
+            if (work.Exhausted()) return Stop("work_budget");
+            if (next) Push({m_bid ? m_partition.Bid(*next) : m_partition.Ask(*next), *next, member.item});
+        }
+    }
+};
+} // namespace
+
+std::string LevelGroupingError(const LevelGrouping& grouping)
+{
+    if (grouping.exact) return {};
+    if (grouping.mantissa != 1 && grouping.mantissa != 2 && grouping.mantissa != 5) return "mantissa must be 1, 2 or 5";
+    if (grouping.decimals > 18) return "decimals must be 0-18";
+    if (grouping.exponent < -64 || grouping.exponent > 64) return "exponent is outside its supported range";
+    if (!grouping.inverse) {
+        // A canonical price P shows as P x 10^(d - 9) B3 per token.
+        const int power{grouping.exponent + 9 - grouping.decimals};
+        if (power < 0 || power > 18 || static_cast<U128>(grouping.mantissa) * Pow10(power) > static_cast<U128>(MAX_MONEY)) {
+            return "a canonical price step must be a whole number of price ticks up to the monetary maximum";
+        }
+        return {};
+    }
+    const int scale{9 - grouping.decimals - grouping.exponent};
+    if (scale < 0 || scale > 36) return "an inverse price step must lie between 10^-36 and 1 times the exact inverse scale";
+    return {};
+}
+
+bool LevelsQueryValid(const BookLevelsQuery& query)
+{
+    return query.depth >= 1 && query.depth <= MARKET_DATA_MAX_LEVELS && LevelGroupingError(query.grouping).empty();
+}
+
+BookLevels ComputeBookLevels(const std::span<const ClearingEngine::CurveView> curves, const BookLevelsQuery& query,
+                             const size_t budget)
+{
+    BookLevels out;
+    out.depth = query.depth;
+    out.grouping = query.grouping;
+    out.total_curves = curves.size();
+    const auto fail = [&](const char* reason) {
+        BookLevels failed;
+        failed.depth = query.depth;
+        failed.grouping = query.grouping;
+        failed.total_curves = curves.size();
+        failed.unavailable_reason = reason;
+        return failed;
+    };
+    if (!LevelsQueryValid(query)) return fail("invalid_grouping");
+    Work work{budget};
+    std::vector<Item> items;
+    items.reserve(curves.size());
+    for (const auto& curve : curves) {
+        if (!work.Spend(1 + curve.points.size())) return fail("work_budget");
+        if (!WellFormed(curve.side, curve.points, curve.filled_quantity)) return fail("malformed_curve");
+        items.push_back({curve.side, curve.account_id, &curve.points, curve.filled_quantity});
+    }
+    const Partition partition{query.grouping};
+    LevelMerge bids{items, partition, true}, asks{items, partition, false};
+    if (!bids.Start(work, out.best_bid) || !asks.Start(work, out.best_ask)) return fail("work_budget");
+    // Both sides share the budget, a level at a time.
+    while (!bids.Done() || !asks.Done()) {
+        bids.Step(query.depth, query.account, work);
+        asks.Step(query.depth, query.account, work);
+    }
+    out.available = true;
+    out.bids = std::move(bids.side);
+    out.asks = std::move(asks.side);
+    out.standing = ComputeIndicative(curves, IndicativeQuery{});
+    return out;
+}
+
 BookCurves CopyBookCurves(const uint256& head, const BookPageReader& read, size_t& pages, const size_t max_curves)
 {
     BookCurves out{head, {}, {}};
