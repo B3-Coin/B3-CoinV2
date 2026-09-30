@@ -7,7 +7,10 @@
 
 #include <flowmesh/clearing.h>
 #include <flowmesh/market.h>
+#include <uint256.h>
+#include <util/int128.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -191,6 +194,196 @@ struct ClearingTickPage {
     //! a gap in the record, never a period without trading.
     bool gap{false};
     //! Retained ticks follow this page: continue after its last sequence.
+    bool more{false};
+};
+
+/** Operator-observed time (doc/design/flowmesh-chart-time.md): when a node
+ * durably applied a certified microblock, by that node's own wall clock.
+ * Display data only, like a clearing tick: never certified, never part of a
+ * root, certificate, commitment or signed object, and never read by signing,
+ * admission, execution, verification or any market decision. V1 microblocks
+ * carry no execution time; this is an observation, labelled with the node
+ * that made it, and history without one stays without a time. */
+enum class ObservedMode : uint8_t {
+    //! Applied while the node was caught up with the network: its
+    //! observation of the entry as it was certified.
+    LIVE = 1,
+    //! Applied late (catch-up, a deferral, a proven or hinted lag, a stale
+    //! anchor, or the warm-up after start): `ms` is only when the node
+    //! applied it, an upper bound, never a trade time.
+    DELAYED = 2,
+    //! Applied while the wall clock stood more than the slew tolerance
+    //! behind an earlier stamp: no time at all.
+    UNTIMED = 3,
+};
+
+inline const char* ObservedModeName(const ObservedMode mode)
+{
+    switch (mode) {
+    case ObservedMode::LIVE: return "live";
+    case ObservedMode::DELAYED: return "delayed";
+    case ObservedMode::UNTIMED: return "untimed";
+    }
+    return "untimed";
+}
+
+//! Why an entry is not LIVE (NONE for a LIVE one). Local detail only: never
+//! in a public reply.
+enum class ObservedDelay : uint8_t { NONE, CATCHUP, DEFERRED, BEHIND, HINT, STALE_ANCHOR, WARMUP, CLOCK_BACK };
+
+inline const char* ObservedDelayName(const ObservedDelay delay)
+{
+    switch (delay) {
+    case ObservedDelay::NONE: return "none";
+    case ObservedDelay::CATCHUP: return "catchup";
+    case ObservedDelay::DEFERRED: return "deferred";
+    case ObservedDelay::BEHIND: return "behind";
+    case ObservedDelay::HINT: return "peer_hint";
+    case ObservedDelay::STALE_ANCHOR: return "stale_anchor";
+    case ObservedDelay::WARMUP: return "warmup";
+    case ObservedDelay::CLOCK_BACK: return "clock_stepped_back";
+    }
+    return "none";
+}
+
+enum ObservedFlag : uint8_t {
+    //! The wall clock stood up to the slew tolerance (1 s) behind the
+    //! previous stamp; the stamp holds that previous value.
+    OBSERVED_CLOCK_CLAMPED = 1 << 0,
+    //! Wall and steady clocks disagreed by more than 1 s since the previous
+    //! stamp: time continuity with it is not established.
+    OBSERVED_CLOCK_STEP = 1 << 1,
+    //! This node's clock is suspected wrong (it stood behind the B3 tip's
+    //! block time by more than the block future bound).
+    OBSERVED_CLOCK_SUSPECT = 1 << 2,
+    //! The first stamp of this process: continuity with the previous stamp
+    //! (an earlier process) is not established.
+    OBSERVED_RESTART = 1 << 3,
+    //! The entry's clearing tick was unavailable when it was recorded; it is
+    //! counted without a price. Local detail only.
+    OBSERVED_NO_CLEARING = 1 << 4,
+    //! Set by a remote client only: a plausibility check of the endpoint's
+    //! stamp failed. The stamp is shown flagged, never corrected.
+    OBSERVED_IMPLAUSIBLE = 1 << 5,
+};
+//! The only stamp flags a public reply carries: none of them names a seat.
+inline constexpr uint8_t OBSERVED_PUBLIC_FLAGS{OBSERVED_CLOCK_CLAMPED | OBSERVED_CLOCK_STEP | OBSERVED_CLOCK_SUSPECT |
+                                               OBSERVED_RESTART};
+
+struct ObservedStamp {
+    uint64_t sequence{0};
+    uint256 hash;
+    ObservedMode mode{ObservedMode::UNTIMED};
+    //! Unix milliseconds. LIVE: the observation; DELAYED: when the node
+    //! applied the entry (an upper bound only); UNTIMED: zero.
+    int64_t ms{0};
+    uint8_t flags{0};
+    ObservedDelay delay{ObservedDelay::NONE};
+    bool operator==(const ObservedStamp&) const = default;
+};
+
+/** The observed times of one market-data reply, for exactly the sequences
+ * of its history page and tick page whose hash they carry. Present only
+ * when the query asked for them. */
+struct ObservedTimes {
+    bool available{false};
+    //! Why they are unavailable; empty when available.
+    std::string unavailable_reason;
+    //! "this_node", "endpoint_operator" (in a public reply) or, at a remote
+    //! client, the endpoint URL that reported them.
+    std::string source;
+    bool clock_suspect{false};
+    //! The first sequence the source recorded (retained), if any.
+    std::optional<uint64_t> recorded_since_sequence;
+    //! Ascending sequences.
+    std::vector<ObservedStamp> rows;
+};
+
+enum class CandleInterval : uint8_t { M1, M5, M15, H1, H4, D1 };
+inline constexpr std::array<CandleInterval, 6> CANDLE_INTERVALS{
+    CandleInterval::M1, CandleInterval::M5, CandleInterval::M15,
+    CandleInterval::H1, CandleInterval::H4, CandleInterval::D1};
+
+inline int64_t CandleIntervalMs(const CandleInterval interval)
+{
+    switch (interval) {
+    case CandleInterval::M1: return 60'000;
+    case CandleInterval::M5: return 300'000;
+    case CandleInterval::M15: return 900'000;
+    case CandleInterval::H1: return 3'600'000;
+    case CandleInterval::H4: return 14'400'000;
+    case CandleInterval::D1: return 86'400'000;
+    }
+    return 60'000;
+}
+
+inline const char* CandleIntervalName(const CandleInterval interval)
+{
+    switch (interval) {
+    case CandleInterval::M1: return "1m";
+    case CandleInterval::M5: return "5m";
+    case CandleInterval::M15: return "15m";
+    case CandleInterval::H1: return "1h";
+    case CandleInterval::H4: return "4h";
+    case CandleInterval::D1: return "1d";
+    }
+    return "1m";
+}
+
+inline std::optional<CandleInterval> ParseCandleInterval(const std::string& name)
+{
+    for (const auto interval : CANDLE_INTERVALS) {
+        if (name == CandleIntervalName(interval)) return interval;
+    }
+    return std::nullopt;
+}
+
+enum ObservedCandleFlag : uint8_t {
+    //! An entry whose time bounds overlap this bucket could not be placed in
+    //! it (or in any bucket): its volume and prices are missing here.
+    CANDLE_PARTIAL = 1 << 0,
+    //! Holds a DELAYED entry whose whole time bound lies inside this bucket.
+    CANDLE_LATE = 1 << 1,
+    //! Time continuity with the previous candle is not established (a clock
+    //! step or a restart at its first entry): never fill the space between.
+    CANDLE_SEAM_BEFORE = 1 << 2,
+    //! A member stamp carries a clock flag (clamped, step or suspect).
+    CANDLE_CLOCK = 1 << 3,
+};
+
+/** One UTC-epoch-aligned bucket of operator-observed time: exactly the
+ * entries placed in it, never an interpolation. Two candles whose sequences
+ * are consecutive (and the later without CANDLE_SEAM_BEFORE) prove that no
+ * microblock existed between them. */
+struct ObservedCandle {
+    //! floor(ms / interval) * interval, Unix milliseconds.
+    int64_t open_ms{0};
+    uint64_t first_sequence{0}, last_sequence{0};
+    uint32_t entries{0}, clearings{0};
+    //! Canonical integer prices; meaningful only when clearings > 0.
+    CAmount open{0}, high{0}, low{0}, close{0};
+    //! Exact sums: base units, and B3 atoms (price x volume per clearing).
+    util::Unsigned128 base_volume{0}, quote_volume{0};
+    uint8_t flags{0};
+    bool operator==(const ObservedCandle&) const = default;
+};
+
+/** A time window of one interval's candles, oldest first: every candle
+ * whose open is in [from_ms, before_ms). A window without candles is not
+ * evidence of no trading unless the neighbours are contiguous. */
+struct ObservedCandlePage {
+    bool available{false};
+    std::string unavailable_reason;
+    //! As ObservedTimes::source.
+    std::string source;
+    //! The candles were reported by a remote endpoint: their prices,
+    //! volumes and times are that endpoint's claims, not verified here.
+    bool remote{false};
+    CandleInterval interval{CandleInterval::M1};
+    int64_t from_ms{0}, before_ms{0};
+    std::vector<ObservedCandle> candles;
+    //! Older candles may exist before from_ms: continue with before_ms =
+    //! from_ms.
     bool more{false};
 };
 
