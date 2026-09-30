@@ -135,12 +135,17 @@ any of those servers already serves.
   into an action. Every other price the panel shows for the market uses the
   same places too: the last price in the header and above the book, trade
   history, the trades tape, the chart's labels and axis, the clearing
-  strip, the Liquidity table, the indicative line and the marketable-limit
-  note (a trade at 1003 atoms is `≈0.997` everywhere, not `≈0.99701` beside
-  a book row `0.997`). Without best prices the market's last trade sets the
-  places; with neither, each price keeps `DisplayPrice`'s own significant
-  digits. The review, the ticket's executable limit and saved-request
-  titles keep their exact forms.
+  strip, the Liquidity table, the indicative line, the marketable-limit
+  note and the limit in the titles of the request rows above Your orders
+  (in flight, tracked and saved; a trade or a limit at 1003 atoms is
+  `≈0.997` everywhere, not `≈0.99701` beside a book row `0.997`). A request
+  title of the displayed market reads in the view's orientation and is
+  re-read whenever the places change; one of another market keeps its own
+  orientation and `DisplayPrice`'s digits. Without best prices the market's
+  last trade sets the places; with neither, each price keeps
+  `DisplayPrice`'s own significant digits. Titles are labels, not exact
+  values: the review, the ticket's executable limit and a saved request's
+  details keep the exact forms.
 - Depth bars on ONE scale shared by both sides; the viewer's own orders
   marked; tooltips with order count, grouped range, average price.
 - Spread row: `Spread <difference> · <pct>%`. The difference is that of the

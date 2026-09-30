@@ -267,19 +267,42 @@ QString SideTitle(bool bid, bool inverse)
     if (inverse) return bid ? QStringLiteral("Sell B3") : QStringLiteral("Buy B3");
     return bid ? QStringLiteral("Buy") : QStringLiteral("Sell");
 }
-QString OrderTitle(bool bid, CAmount price, CAmount quantity, std::optional<int> decimals, const QString& ticker, bool inverse)
+//! How one request title reads: its orientation, verified decimals and
+//! ticker, and the view whose one price rule it follows (none: a request of
+//! another market, or one read without a view).
+struct TitleForm {
+    bool inverse{false};
+    std::optional<int> decimals;
+    QString ticker;
+    const TitleView* view{nullptr};
+};
+//! A request of the view's market reads in the view: its orientation, its
+//! verified units and its places. Any other keeps the action's own forms.
+TitleForm FormOf(const Action& a, const TitleView& view)
 {
-    const QString side{SideTitle(bid, inverse && decimals)};
-    if (!decimals) return QStringLiteral("%1 %2 @ %3 B3 atoms per raw unit").arg(side, BaseAmount(quantity, decimals, ticker)).arg(price);
-    const QString token{ticker.isEmpty() ? QStringLiteral("token") : ticker};
-    // A short label: the shared display formatter. The review and the saved
-    // request's details show the exact signed limit.
-    const QString limit{B3FlowMeshMarketData::FormatDisplayPrice(price, *decimals, inverse)};
-    if (inverse) {
-        return QStringLiteral("%1 · %2 %3 · limit %4 %5/B3").arg(side, bid ? QStringLiteral("receive up to") : QStringLiteral("spend up to"),
-            BaseAmount(quantity, decimals, ticker), limit, token);
+    if (!view.market.isEmpty() && view.market == a.market.id && view.units.known &&
+        (!a.display_decimals || *a.display_decimals == view.units.decimals)) {
+        return {view.inverse, view.units.decimals, view.units.ticker, &view};
     }
-    return QStringLiteral("%1 %2 @ %3 B3/%4").arg(side, BaseAmount(quantity, decimals, ticker), limit, token);
+    return {a.inverse_display, a.display_decimals, a.display_ticker, nullptr};
+}
+QString OrderTitle(bool bid, CAmount price, CAmount quantity, const TitleForm& form)
+{
+    const auto& decimals{form.decimals};
+    const QString side{SideTitle(bid, form.inverse && decimals)};
+    if (!decimals) return QStringLiteral("%1 %2 @ %3 B3 atoms per raw unit").arg(side, BaseAmount(quantity, decimals, form.ticker)).arg(price);
+    const QString token{form.ticker.isEmpty() ? QStringLiteral("token") : form.ticker};
+    // A short label: in the view, its one price rule (the order book's
+    // places), so the title reads as the book, Your orders and the trades
+    // show this price; else the shared display formatter. The review and the
+    // saved request's details show the exact signed limit.
+    const QString limit{form.view ? B3FlowMeshMarketData::ViewPrice(price, form.view->units, form.inverse, form.view->places).text
+                                  : B3FlowMeshMarketData::FormatDisplayPrice(price, *decimals, form.inverse)};
+    if (form.inverse) {
+        return QStringLiteral("%1 · %2 %3 · limit %4 %5/B3").arg(side, bid ? QStringLiteral("receive up to") : QStringLiteral("spend up to"),
+            BaseAmount(quantity, decimals, form.ticker), limit, token);
+    }
+    return QStringLiteral("%1 %2 @ %3 B3/%4").arg(side, BaseAmount(quantity, decimals, form.ticker), limit, token);
 }
 //! The marketable-limit disclosure, in the review's own orientation and units.
 QString MarketableDisclosure(const Action& a)
@@ -616,17 +639,18 @@ RequestKind KindOf(const SavedAction& action)
     return action.type <= 1 ? RequestKind::Order : action.type <= 3 ? RequestKind::Cancel : RequestKind::Other;
 }
 
-QString ShortTitle(const Action& a)
+QString ShortTitle(const Action& a, const TitleView& view)
 {
     const bool bid{a.side == QStringLiteral("bid")};
     const QString native{QString::fromStdString(FormatMoney(a.amount)) + QStringLiteral(" B3")};
+    const auto form{FormOf(a, view)};
     switch (a.operation) {
     case Operation::Order:
-        if (!a.ladder.empty()) return QStringLiteral("%1 ladder · %2 prices · %3").arg(SideTitle(bid, a.inverse_display)).arg(a.ladder.size()).arg(BaseAmount(a.amount, a.display_decimals, a.display_ticker));
-        return OrderTitle(bid, a.price, a.amount, a.display_decimals, a.display_ticker, a.inverse_display);
-    case Operation::Cancel: return QStringLiteral("Cancel %1").arg(SideTitle(bid, a.inverse_display));
-    case Operation::Withdraw: return QStringLiteral("Withdraw %1").arg(a.native ? native : BaseAmount(a.amount, a.display_decimals, a.display_ticker));
-    case Operation::Deposit: return QStringLiteral("Deposit %1").arg(a.native ? native : BaseAmount(a.amount, a.display_decimals, a.display_ticker));
+        if (!a.ladder.empty()) return QStringLiteral("%1 ladder · %2 prices · %3").arg(SideTitle(bid, form.inverse)).arg(a.ladder.size()).arg(BaseAmount(a.amount, form.decimals, form.ticker));
+        return OrderTitle(bid, a.price, a.amount, form);
+    case Operation::Cancel: return QStringLiteral("Cancel %1").arg(SideTitle(bid, form.inverse));
+    case Operation::Withdraw: return QStringLiteral("Withdraw %1").arg(a.native ? native : BaseAmount(a.amount, form.decimals, form.ticker));
+    case Operation::Deposit: return QStringLiteral("Deposit %1").arg(a.native ? native : BaseAmount(a.amount, form.decimals, form.ticker));
     case Operation::Admit: return QStringLiteral("Admit deposit %1…:%2").arg(a.txid.left(12)).arg(a.vout);
     case Operation::Checkpoint: return QStringLiteral("Publish checkpoint");
     case Operation::Vault: return QStringLiteral("Publish vault transaction");
@@ -634,9 +658,13 @@ QString ShortTitle(const Action& a)
     return {};
 }
 
-QString ShortTitle(const SavedAction& a, std::optional<int> decimals, const QString& ticker, bool inverse)
+QString ShortTitle(const SavedAction& a, const TitleView& view)
 {
     const bool bid{a.type == 0 || a.type == 2};
+    const bool inverse{view.inverse};
+    // Verified units only of the view's own market; never assumed for another.
+    const bool shown{!view.market.isEmpty() && view.market == a.market && view.units.known};
+    const TitleForm form{inverse, shown ? std::optional<int>{view.units.decimals} : std::nullopt, shown ? view.units.ticker : QString{}, shown ? &view : nullptr};
     if (a.type == 2 || a.type == 3) return QStringLiteral("Cancel %1").arg(SideTitle(bid, inverse));
     if (a.type <= 1) {
         // The same exact limit shapes DescribeSavedAction recognises; any
@@ -644,7 +672,7 @@ QString ShortTitle(const SavedAction& a, std::optional<int> decimals, const QStr
         const auto& p{a.canonical_points};
         if (p.size() == 2 && p[0].price < MAX_MONEY && p[1].price == p[0].price + 1 &&
             (bid ? p[0].quantity > 0 && p[1].quantity == 0 : p[0].quantity == 0 && p[1].quantity > 0)) {
-            return OrderTitle(bid, bid ? p[0].price : p[1].price, bid ? p[0].quantity : p[1].quantity, decimals, ticker, inverse);
+            return OrderTitle(bid, bid ? p[0].price : p[1].price, bid ? p[0].quantity : p[1].quantity, form);
         }
         std::vector<B3FlowMeshMarketData::Point> points;
         for (const auto& point : p) points.push_back({point.price, point.quantity});

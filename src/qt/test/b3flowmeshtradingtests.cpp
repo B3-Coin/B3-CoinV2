@@ -394,33 +394,82 @@ private Q_SLOTS:
     }
     void shortTitlesUseExactUnitsAndNoRpcNames()
     {
+        // Read without the view (another market's request): the action's own
+        // orientation and DisplayPrice's digits.
+        const TitleView none;
         auto a{Order()}; a.price = 1000; a.amount = 1'000'000; a.display_decimals = 6; a.display_ticker = QStringLiteral("tUSD");
-        QCOMPARE(ShortTitle(a), QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD"));
-        a.side = QStringLiteral("ask"); QCOMPARE(ShortTitle(a), QStringLiteral("Sell 1 tUSD @ 1 B3/tUSD"));
+        QCOMPARE(ShortTitle(a, none), QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD"));
+        a.side = QStringLiteral("ask"); QCOMPARE(ShortTitle(a, none), QStringLiteral("Sell 1 tUSD @ 1 B3/tUSD"));
         // Inverse view: a canonical ask receives B3 (Buy B3) and spends tokens.
         a.inverse_display = true; a.price = 500;
-        QCOMPARE(ShortTitle(a), QStringLiteral("Buy B3 · spend up to 1 tUSD · limit 2 tUSD/B3"));
+        QCOMPARE(ShortTitle(a, none), QStringLiteral("Buy B3 · spend up to 1 tUSD · limit 2 tUSD/B3"));
         // A label shows a rounded reciprocal; the review shows the exact limit.
-        a.price = 1009; QCOMPARE(ShortTitle(a), QStringLiteral("Buy B3 · spend up to 1 tUSD · limit ≈0.99108 tUSD/B3"));
+        a.price = 1009; QCOMPARE(ShortTitle(a, none), QStringLiteral("Buy B3 · spend up to 1 tUSD · limit ≈0.99108 tUSD/B3"));
         QVERIFY(Describe(a).contains(QStringLiteral("1000/1009")));
         a.price = 500;
         a.display_decimals.reset(); a.display_ticker.clear();
-        QVERIFY(ShortTitle(a).contains(QStringLiteral("raw units")));
+        QVERIFY(ShortTitle(a, none).contains(QStringLiteral("raw units")));
         auto cancel{Order()}; cancel.operation = Operation::Cancel;
-        QCOMPARE(ShortTitle(cancel), QStringLiteral("Cancel Buy"));
-        cancel.inverse_display = true; QCOMPARE(ShortTitle(cancel), QStringLiteral("Cancel Sell B3"));
-        SavedAction saved; saved.type = 0; saved.sequence = 7;
+        QCOMPARE(ShortTitle(cancel, none), QStringLiteral("Cancel Buy"));
+        cancel.inverse_display = true; QCOMPARE(ShortTitle(cancel, none), QStringLiteral("Cancel Sell B3"));
+        // A saved instruction reads in the view: its market's verified units.
+        auto units{TokenUnits()}; units.ticker = QStringLiteral("tUSD");
+        TitleView view; view.market = Order().market.id; view.units = units;
+        SavedAction saved; saved.market = view.market; saved.type = 0; saved.sequence = 7;
         saved.canonical_points = {{1000, 1'000'000}, {1001, 0}};
-        QCOMPARE(ShortTitle(saved, 6, QStringLiteral("tUSD"), false), QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD"));
+        QCOMPARE(ShortTitle(saved, view), QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD"));
         saved.canonical_points = {{1000, 1'000'000}, {1005, 0}}; // not the exact limit shape: named, never re-priced
-        QCOMPARE(ShortTitle(saved, 6, QStringLiteral("tUSD"), false), QStringLiteral("Buy order · sequence 7"));
-        saved.type = 3; QCOMPARE(ShortTitle(saved, 6, QStringLiteral("tUSD"), true), QStringLiteral("Cancel Buy B3"));
-        saved.type = 4; QCOMPARE(ShortTitle(saved, std::nullopt, {}, false), QStringLiteral("Withdrawal request"));
+        QCOMPARE(ShortTitle(saved, view), QStringLiteral("Buy order · sequence 7"));
+        view.inverse = true;
+        saved.type = 3; QCOMPARE(ShortTitle(saved, view), QStringLiteral("Cancel Buy B3"));
+        view.inverse = false;
+        saved.type = 4; QCOMPARE(ShortTitle(saved, none), QStringLiteral("Withdrawal request"));
         QCOMPARE(KindOf(Operation::Order), RequestKind::Order); QCOMPARE(KindOf(Operation::Cancel), RequestKind::Cancel);
         QCOMPARE(KindOf(Operation::Withdraw), RequestKind::Other);
-        for (const auto& title : {ShortTitle(Order()), ShortTitle(cancel), ShortTitle(saved, std::nullopt, {}, false)}) {
+        for (const auto& title : {ShortTitle(Order(), none), ShortTitle(cancel, none), ShortTitle(saved, none)}) {
             QVERIFY(!title.contains(QStringLiteral("flowmesh"), Qt::CaseInsensitive));
         }
+    }
+    void requestTitlesReadTheLimitAsTheirViewShowsIt()
+    {
+        // Review of 2026-09-30: the request rows above Your orders read a
+        // limit with DisplayPrice's digits (≈0.99701 for 1003 atoms) while
+        // the order book, Your orders and the trades show ≈0.997 for it.
+        using namespace B3FlowMeshMarketData;
+        auto units{TokenUnits()}; units.ticker = QStringLiteral("tUSD");
+        auto a{Order()}; a.price = 1003; a.amount = 250'000; a.display_decimals = 6; a.display_ticker = QStringLiteral("tUSD"); a.inverse_display = true;
+        TitleView view; view.inverse = true; view.market = a.market.id; view.units = units;
+        view.places = ViewPricePlaces(units, true, {1003});
+        QCOMPARE(view.places, std::optional<int>{3});
+        QCOMPARE(ViewPrice(1003, units, true, view.places).text, QStringLiteral("≈0.997"));
+        QCOMPARE(ShortTitle(a, view), QStringLiteral("Sell B3 · receive up to 0.25 tUSD · limit ≈0.997 tUSD/B3"));
+        // The saved instruction of the same limit reads the same.
+        SavedAction saved; saved.market = a.market.id; saved.type = 0; saved.sequence = 8;
+        saved.canonical_points = {{1003, 250'000}, {1004, 0}};
+        QCOMPARE(ShortTitle(saved, view), ShortTitle(a, view));
+        // The review's other prices, as ViewPrice shows them at the view's places.
+        for (const auto& [price, shown] : std::vector<std::pair<CAmount, QString>>{{1004, QStringLiteral("≈0.996")}, {1009, QStringLiteral("≈0.991")}, {1429, QStringLiteral("≈0.700")}, {1000, QStringLiteral("1.000")}}) {
+            a.price = price;
+            QCOMPARE(ViewPrice(price, units, true, view.places).text, shown);
+            QVERIFY2(ShortTitle(a, view).endsWith(QStringLiteral(" · limit %1 tUSD/B3").arg(shown)), qPrintable(ShortTitle(a, view)));
+        }
+        a.price = 1003;
+        // A request signed in the other orientation reads in the view's.
+        a.inverse_display = false;
+        QCOMPARE(ShortTitle(a, view), QStringLiteral("Sell B3 · receive up to 0.25 tUSD · limit ≈0.997 tUSD/B3"));
+        view.inverse = false; view.places = ViewPricePlaces(units, false, {1003});
+        QCOMPARE(ShortTitle(a, view), QStringLiteral("Buy 0.25 tUSD @ 1.003 B3/tUSD"));
+        QCOMPARE(ShortTitle(saved, view), ShortTitle(a, view));
+        // Another market's request keeps its own orientation and digits; a
+        // saved one has no verified units here.
+        view.inverse = true; view.places = 3;
+        a.inverse_display = true;
+        view.market = QString::fromStdString(H(77).GetHex());
+        QCOMPARE(ShortTitle(a, view), QStringLiteral("Sell B3 · receive up to 0.25 tUSD · limit ≈0.99701 tUSD/B3"));
+        QVERIFY(ShortTitle(saved, view).contains(QStringLiteral("raw unit")));
+        // So does one whose units differ from the view's.
+        view.market = a.market.id; a.display_decimals = 8;
+        QVERIFY(ShortTitle(a, view).contains(QStringLiteral("≈0.00997")));
     }
     void marketableAndReplaceDisclosuresArePresentationOnly()
     {
@@ -469,7 +518,7 @@ private Q_SLOTS:
         QVERIFY(text.contains(QStringLiteral("Exact B3 reservation: %1 B3").arg(QString::fromStdString(FormatMoney(300'000'000 + 198'000'000 + 392'000'000 + 97'900'000)))));
         QVERIFY(text.contains(QStringLiteral("a price cannot be cancelled or edited alone")));
         QVERIFY(text.contains(QStringLiteral("Wallets before this version show it only as a curve")));
-        QCOMPARE(ShortTitle(a), QStringLiteral("Buy ladder · 4 prices · 1 tUSD"));
+        QCOMPARE(ShortTitle(a, TitleView{}), QStringLiteral("Buy ladder · 4 prices · 1 tUSD"));
         a.replaces = Action::Replaces{500'000, 0, std::nullopt, 8, 4};
         QVERIFY(Describe(a).contains(QStringLiteral("Replaces your current Buy ladder of 4 prices (0.5 tUSD left)")));
         // The B3 view: exact reciprocal prices and token caps.
@@ -488,10 +537,11 @@ private Q_SLOTS:
         QCOMPARE(Parameters(ask).method, std::string{"submitflowmeshladder"});
         QVERIFY(Describe(ask).contains(QStringLiteral("Reserves 0.3 tUSD (the sum of the quantities)")));
         // A retained ladder is named as one, never re-priced.
-        SavedAction saved; saved.type = 0; saved.sequence = 9;
+        SavedAction saved; saved.market = a.market.id; saved.type = 0; saved.sequence = 9;
         const auto points{*flowmesh::MakeLadderBidCurve({{1000, 300'000}, {990, 200'000}})};
         for (const auto& point : points) saved.canonical_points.push_back({point.price, point.qty});
-        QCOMPARE(ShortTitle(saved, 6, QStringLiteral("tUSD"), false), QStringLiteral("Buy ladder · 2 prices · sequence 9"));
+        TitleView view; view.market = a.market.id; view.units = TokenUnits();
+        QCOMPARE(ShortTitle(saved, view), QStringLiteral("Buy ladder · 2 prices · sequence 9"));
     }
     void ladderCurvesAreRecognisedExactlyWithWhatRemains()
     {

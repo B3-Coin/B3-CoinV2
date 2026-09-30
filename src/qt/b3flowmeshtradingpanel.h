@@ -300,11 +300,16 @@ private:
     //! action ID, the tracked request and this market's unsettled saved
     //! requests, plus requests that settled in the last minute. Display only.
     void updatePendingView();
-    //! A request's short title: the reviewed action's own title when this
-    //! panel signed it, else its saved instruction, else its ID.
+    //! A request's short title, read in titleView(): the reviewed action's
+    //! when this panel signed it, else its saved instruction's, else its ID.
     QString requestTitle(const QString& key, const B3FlowMeshTrading::SavedAction* saved, const QString& action_id) const;
     //! Exact display units, only for the selected market's verified asset.
     std::pair<std::optional<int>, QString> requestUnits(const QString& market) const;
+    //! The view request titles are read in: the displayed orientation, the
+    //! selected market's verified units (as requestUnits) and the order
+    //! book's places while it shows that market in that orientation, so a
+    //! title's limit reads as the book and Your orders show the price.
+    B3FlowMeshTrading::TitleView titleView() const;
     //! Shows a toast once per key and mirrors it to the Activity log; never
     //! while the panel is tearing down or switching wallets.
     void toast(const QString& key, B3FlowMeshToasts::Kind kind, const QString& text, std::chrono::milliseconds ttl);
@@ -523,11 +528,18 @@ private:
     bool m_requests_seeded{false};
     QElapsedTimer m_last_settled; // When any request last settled in view.
     // Captured on the GUI thread when a signed job starts: the in-flight row
-    // never reads worker-owned Result fields.
-    QString m_inflight_title, m_inflight_market;
-    // Titles of the request this panel signed (by key) and of an uncertain
-    // write that returned no action ID.
-    QString m_tracked_title, m_tracked_title_key, m_uncertain_title;
+    // never reads worker-owned Result fields. Its title is read when shown
+    // (titleView), as every request title is.
+    std::optional<B3FlowMeshTrading::Action> m_inflight_action;
+    QString m_inflight_market;
+    // The request this panel signed (by key) and an uncertain write that
+    // returned no action ID (or its fallback title: a resent saved request).
+    std::optional<B3FlowMeshTrading::Action> m_tracked_action, m_uncertain_action;
+    QString m_tracked_title_key, m_uncertain_title;
+    // The market the order book last showed (empty: none), and the view the
+    // request rows were last shown in: a change of either re-reads them.
+    QString m_book_market;
+    B3FlowMeshTrading::TitleView m_titles_view;
     B3FlowMeshTrading::RequestKind m_tracked_kind{B3FlowMeshTrading::RequestKind::Other};
     std::optional<uint64_t> m_pending_sequence;
     QComboBox* m_market{nullptr};

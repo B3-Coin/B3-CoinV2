@@ -1627,6 +1627,70 @@ private Q_SLOTS:
         // The chart's labels and axis too.
         QCOMPARE(panel.m_chart->pricePlaces(), places);
     }
+    void aRequestTitleReadsItsLimitAsYourOrdersDoes()
+    {
+        // Review of 2026-09-30: the request rows above Your orders (in
+        // flight, tracked and saved) read a limit with DisplayPrice's digits,
+        // ≈1.00301 for the viewer's bid at 997 atoms and ≈0.99701 at 1003,
+        // beside Your orders' and the book's ≈1.003 and ≈0.997.
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); AttachOfflineWallet(panel);
+        ShowSyntheticTimeMarket(panel, SyntheticSource::LOCAL);
+        QVERIFY(panel.inverted()); QVERIFY(panel.m_wallet);
+        const auto places{panel.m_order_book->pricePlaces()};
+        QCOMPARE(places, std::optional<int>{3});
+        auto* view{panel.findChild<QTableWidget*>(QStringLiteral("flowMeshPendingActions"))};
+        QVERIFY(view);
+        // Saved requests for the viewer's standing bid (997 atoms) and at 1003.
+        B3FlowMeshTrading::SavedActions saved; saved.account = panel.m_snapshot->account;
+        auto own{SavedBid(panel, 70, "unknown", "sent", 300)}; own.canonical_points = {{997, 250'000}, {998, 0}};
+        auto other{SavedBid(panel, 72, "unknown", "sent", 200)}; other.canonical_points = {{1003, 250'000}, {1004, 0}};
+        saved.actions = {own, other};
+        panel.restoreSavedActions(saved);
+        QVERIFY(!view->isHidden()); QCOMPARE(view->rowCount(), 2);
+        // Your orders: "≈1.003 tUSD / B3"; its request row the same price.
+        const QString own_price{panel.m_own_view->item(0, 1)->text().section(QLatin1Char(' '), 0, 0)};
+        QCOMPARE(own_price, QStringLiteral("≈1.003"));
+        QCOMPARE(RowText(view, 0).first(), QStringLiteral("Sell B3 · receive up to 0.25 tUSD · limit %1 tUSD/B3").arg(own_price));
+        // 1003 atoms: the book's row for that price, and the request row.
+        const auto* model{panel.m_order_book->model()};
+        QString row_1003;
+        for (const auto& row : model->rows()) if (row.click_canonical == 1003) row_1003 = row.price;
+        QCOMPARE(row_1003, QStringLiteral("0.997"));
+        QCOMPARE(RowText(view, 1).first(), QStringLiteral("Sell B3 · receive up to 0.25 tUSD · limit ≈%1 tUSD/B3").arg(row_1003));
+        // The request this panel signed (reviewed in the canonical view) and
+        // the in-flight one read in the view as well.
+        B3FlowMeshTrading::Action signed_order; signed_order.operation = B3FlowMeshTrading::Operation::Order;
+        signed_order.market = panel.m_market_data.front(); signed_order.side = QStringLiteral("bid");
+        signed_order.price = 1003; signed_order.amount = 250'000; signed_order.display_decimals = 6; signed_order.display_ticker = QStringLiteral("tUSD");
+        panel.m_tracked_action = signed_order;
+        panel.m_tracked_title_key = B3FlowMeshTradingPanel::RequestKey(other.market, other.account, other.receipt.action_id);
+        panel.m_inflight_action = signed_order; panel.m_inflight_market = signed_order.market.id;
+        panel.updatePendingView();
+        QCOMPARE(RowText(view, 0).first(), RowText(view, 2).first()); // in flight, then the tracked one
+        QCOMPARE(RowText(view, 0).first(), QStringLiteral("Sell B3 · receive up to 0.25 tUSD · limit ≈0.997 tUSD/B3"));
+        // Best prices near 2000 atoms need four places: a views-only update
+        // (as a live update while a review is open) reads the rows again.
+        panel.m_snapshot->levels->best_bid = 1999; panel.m_snapshot->levels->best_ask = 2001;
+        panel.updateDataViews();
+        QCOMPARE(panel.m_order_book->pricePlaces(), std::optional<int>{4});
+        QCOMPARE(panel.m_own_view->item(0, 1)->text(), QStringLiteral("≈1.0030 tUSD / B3"));
+        QCOMPARE(RowText(view, 1).first(), QStringLiteral("Sell B3 · receive up to 0.25 tUSD · limit ≈1.0030 tUSD/B3"));
+        QCOMPARE(RowText(view, 2).first(), QStringLiteral("Sell B3 · receive up to 0.25 tUSD · limit ≈0.9970 tUSD/B3"));
+        panel.m_snapshot->levels->best_bid = 999; panel.m_snapshot->levels->best_ask = 1001;
+        panel.updateDataViews();
+        QCOMPARE(panel.m_order_book->pricePlaces(), std::optional<int>{3});
+        QCOMPARE(RowText(view, 2).first(), QStringLiteral("Sell B3 · receive up to 0.25 tUSD · limit ≈0.997 tUSD/B3"));
+        // Another orientation, other places: the rows are read again.
+        panel.m_orientation->setCurrentIndex(0); QCoreApplication::processEvents();
+        QVERIFY(!panel.inverted());
+        QCOMPARE(panel.m_order_book->pricePlaces(), std::optional<int>{3});
+        QCOMPARE(panel.m_own_view->item(0, 1)->text(), QStringLiteral("0.997 B3"));
+        QCOMPARE(RowText(view, 1).first(), QStringLiteral("Buy 0.25 tUSD @ 0.997 B3/tUSD"));
+        QCOMPARE(RowText(view, 2).first(), QStringLiteral("Buy 0.25 tUSD @ 1.003 B3/tUSD"));
+        QCOMPARE(RowText(view, 0).first(), RowText(view, 2).first());
+        panel.m_inflight_action.reset(); panel.m_inflight_market.clear();
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QVERIFY(m_wallet->IsLocked());
+    }
     void levelsWhosePricesRoundToOneValueShareARow()
     {
         // Far from the market two canonical ticks can round to one value at
@@ -7032,7 +7096,8 @@ private Q_SLOTS:
         saved.actions = {SavedBid(panel, 61, "unknown", "sent"), earlier};
         panel.restoreSavedActions(saved);
         QVERIFY(!view->isHidden()); QCOMPARE(view->rowCount(), 1);
-        QCOMPARE(RowText(view, 0), (QStringList{QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD"), QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("!"), QString{}, QString{},
+        // Its limit as the order book and Your orders show it (the tick's places).
+        QCOMPARE(RowText(view, 0), (QStringList{QStringLiteral("Buy 1 tUSD @ 1.000 B3/tUSD"), QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("!"), QString{}, QString{},
                                                  QStringLiteral("Delivery unconfirmed · outcome unknown · never re-signed")}));
         QCOMPARE(view->item(0, 2)->data(Qt::AccessibleTextRole).toString(), QStringLiteral("Sent: done"));
         QCOMPARE(view->item(0, 3)->data(Qt::AccessibleTextRole).toString(), QStringLiteral("Admitted: unknown"));
@@ -7088,10 +7153,10 @@ private Q_SLOTS:
         action.display_decimals = 6; action.display_ticker = QStringLiteral("tUSD");
         // The regtest sync check fails this job before any write.
         panel.startJob(action); QVERIFY(panel.m_thread);
-        QCOMPARE(RowText(view, 0).first(), QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD"));
+        QCOMPARE(RowText(view, 0).first(), QStringLiteral("Buy 1 tUSD @ 1.000 B3/tUSD"));
         QCOMPARE(view->item(0, 6)->text(), QStringLiteral("Checking, signing and sending…"));
         QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
-        QVERIFY(panel.m_inflight_title.isEmpty()); QVERIFY(view->isHidden());
+        QVERIFY(!panel.m_inflight_action); QVERIFY(view->isHidden());
         QVERIFY(!panel.m_uncertain); QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void toastsAreDeduplicatedBoundedAndExpire()
@@ -7179,8 +7244,8 @@ private Q_SLOTS:
         QVERIFY(panel.m_toasts->texts().isEmpty());
         auto receipt{saved.actions[0].receipt}; Certify(receipt, 9);
         for (int i{0}; i < 3; ++i) panel.applyReceipt(receipt);
-        QCOMPARE(panel.m_toasts->texts(), (QStringList{QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in auction #9")}));
-        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD")));
+        QCOMPARE(panel.m_toasts->texts(), (QStringList{QStringLiteral("Certified: Buy 1 tUSD @ 1.000 B3/tUSD · included in auction #9")}));
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Certified: Buy 1 tUSD @ 1.000 B3/tUSD")));
         // A verified outcome of the same request is announced once more.
         B3FlowMeshTrading::Outcome outcome; outcome.status = QStringLiteral("applied"); outcome.final = true; outcome.reason_code = QStringLiteral("APPLIED");
         outcome.microblock_sequence = 9; outcome.microblock_hash = receipt.microblock_hash;
@@ -7188,13 +7253,13 @@ private Q_SLOTS:
         receipt.outcome = outcome; receipt.outcome_verified = true; receipt.stage = QStringLiteral("outcome_verified");
         panel.applyReceipt(receipt); panel.applyReceipt(receipt);
         QCOMPARE(panel.m_toasts->texts().size(), 2);
-        QCOMPARE(panel.m_toasts->texts().back(), QStringLiteral("Executed: Buy 1 tUSD @ 1 B3/tUSD · filled 0.25 tUSD"));
+        QCOMPARE(panel.m_toasts->texts().back(), QStringLiteral("Executed: Buy 1 tUSD @ 1.000 B3/tUSD · filled 0.25 tUSD"));
         // An unknown outcome is a warning that says it is never re-signed.
         saved.actions[0].receipt = receipt; saved.actions[0].receipt.no_resubmit = true; // The outbox now retains its certification.
         saved.actions.insert(saved.actions.begin(), SavedBid(panel, 76, "unknown", "sent", 400));
         panel.restoreSavedActions(saved);
         QCOMPARE(panel.m_toasts->texts().size(), 3);
-        QVERIFY(panel.m_toasts->texts().back().startsWith(QStringLiteral("Outcome unknown: Buy 1 tUSD @ 1 B3/tUSD")));
+        QVERIFY(panel.m_toasts->texts().back().startsWith(QStringLiteral("Outcome unknown: Buy 1 tUSD @ 1.000 B3/tUSD")));
         QVERIFY(panel.m_toasts->texts().back().contains(QStringLiteral("never re-signed")));
         QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
     }
@@ -7221,7 +7286,7 @@ private Q_SLOTS:
         QVERIFY(view->item(0, 6)->text().contains(QStringLiteral("may still execute")));
         QCOMPARE(view->item(0, 6)->foreground().color(), B3Theme::kAccent);
         // Only the verified inclusion is announced, never "not executed".
-        QCOMPARE(panel.m_toasts->texts(), (QStringList{QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in auction #9")}));
+        QCOMPARE(panel.m_toasts->texts(), (QStringList{QStringLiteral("Certified: Buy 1 tUSD @ 1.000 B3/tUSD · included in auction #9")}));
         // It is not settled: it stays in progress after the linger interval.
         for (auto& [key, seen] : panel.m_request_seen) seen.settled_age.invalidate();
         panel.m_last_settled.invalidate(); panel.updateControls();
@@ -7237,7 +7302,7 @@ private Q_SLOTS:
         QCOMPARE(view->item(0, 5)->text(), QStringLiteral("✕ not executed"));
         QCOMPARE(view->item(0, 6)->foreground().color(), B3Theme::kNegative);
         QCOMPARE(panel.m_toasts->texts().size(), 2);
-        QVERIFY(panel.m_toasts->texts().back().startsWith(QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD · Not executed (")));
+        QVERIFY(panel.m_toasts->texts().back().startsWith(QStringLiteral("Buy 1 tUSD @ 1.000 B3/tUSD · Not executed (")));
         panel.updateControls(); QVERIFY(!view->isHidden());
         for (auto& [key, seen] : panel.m_request_seen) seen.settled_age.invalidate();
         panel.updateControls(); QVERIFY(view->isHidden());

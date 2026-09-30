@@ -687,11 +687,13 @@ void B3FlowMeshTradingPanel::updateDataViews()
         if (matched && view->levels && view->levels->available) { best_bid = view->levels->best_bid; best_ask = view->levels->best_ask; }
         m_order_book->setGroupingChoices(BookGroupingChoices(best_bid, best_ask, matched ? view->units : Units{}, inverse), grouping);
         m_order_book->setSnapshot(matched ? view : std::nullopt, inverse, grouping);
+        m_book_market = matched ? view->market : QString{};
     }
     // Every price in this view at the order book's places (the view's one
-    // rounding rule): trades, the chart and the clearing strip read the
-    // same as the book's rows and Your orders.
+    // rounding rule): trades, the chart, the clearing strip and the request
+    // rows' titles read the same as the book's rows and Your orders.
     const auto view_places{m_order_book->pricePlaces()};
+    if (titleView() != m_titles_view) updatePendingView();
     m_chart->setPricePlaces(view_places);
     QString strip, strip_exact;
     if (ticks_current) {
@@ -2023,7 +2025,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
         restoreLock(); m_busy = false; notice(tr("Queued requests have not certified for 30 seconds. No new request was submitted. Refresh and inspect the market; existing requests are not canceled.")); updateControls(); return;
     }
     // The in-flight request row is captured here, on the GUI thread.
-    m_inflight_title = action && SignedAction(action->operation) ? B3FlowMeshTrading::ShortTitle(*action) : QString{};
+    m_inflight_action = action && SignedAction(action->operation) ? action : std::nullopt;
     m_inflight_market = action ? action->market.id : QString{};
     m_busy = action.has_value() || exact_retry; m_loading = !action && !m_snapshot; m_cancel->store(false); m_attempt_age.restart(); updateControls(); m_chart->setLoading(m_loading);
     auto result{std::make_shared<Result>()}; result->action = action; result->prepared = prepared; result->broadcast = prepared.has_value(); result->wallet = m_wallet_name;
@@ -2282,7 +2284,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
 
 void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
 {
-    stopWorker(); m_active_result.reset(); m_inflight_title.clear(); m_inflight_market.clear();
+    stopWorker(); m_active_result.reset(); m_inflight_action.reset(); m_inflight_market.clear();
     if (result->receipt_scope && !statusReadValid(*result->receipt_scope, false)) {
         result->receipt.reset(); result->receipt_error.clear();
         result->receipt_market.clear(); result->receipt_account.clear(); result->receipt_action_id.clear();
@@ -2483,7 +2485,7 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
         if (SignedAction(a.operation)) m_pending_sequence = a.market.sequence;
         if (result->receipt) {
             m_receipt.reset(); // The explicitly reviewed new instruction, not a late status read.
-            m_tracked_title = B3FlowMeshTrading::ShortTitle(a); m_tracked_kind = B3FlowMeshTrading::KindOf(a.operation);
+            m_tracked_action = a; m_tracked_kind = B3FlowMeshTrading::KindOf(a.operation);
             m_tracked_title_key = RequestKey(a.market.id, a.market.account, result->receipt->action_id);
             applyReceipt(*result->receipt);
             // Command names live in Details; the log says where to look.
@@ -3082,7 +3084,7 @@ void B3FlowMeshTradingPanel::cancelAndWait()
         if (m_active_result->receipt && m_active_result->receipt->Included()) applyReceipt(*m_active_result->receipt);
         notice(tr("Wallet changed or operation closed after submission began. Inspect this saved request; it was not cancelled or retried.\n%1").arg(m_uncertain_details));
     }
-    m_active_result.reset(); m_inflight_title.clear(); m_inflight_market.clear(); restoreLock();
+    m_active_result.reset(); m_inflight_action.reset(); m_inflight_market.clear(); restoreLock();
     // Worker captures are gone and relocking has been attempted. Retain any
     // security warning, not a strong wallet owner that prevents shutdown.
     // The durable client outbox and public action/uncertainty records are not
@@ -3097,7 +3099,8 @@ void B3FlowMeshTradingPanel::markUncertain(const std::shared_ptr<Result>& result
     m_uncertain_market = result->action ? result->action->market.id : result->exact_retry ? m_pending_market : QString{};
     m_uncertain_account = result->action ? result->action->market.account : result->exact_retry ? m_pending_account : QString{};
     m_uncertain_details = tr("Captured wallet: %1").arg(result->wallet);
-    m_uncertain_title = result->action ? B3FlowMeshTrading::ShortTitle(*result->action) : tr("Resent saved request");
+    m_uncertain_action = result->action;
+    m_uncertain_title = result->action ? QString{} : tr("Resent saved request");
     if (result->action) m_uncertain_details += QStringLiteral("\n") + B3FlowMeshTrading::Describe(*result->action);
     if (result->prepared) m_uncertain_details += tr("\nExact transaction ID: %1").arg(result->prepared->txid);
     if (!m_uncertain_action_id.isEmpty()) m_uncertain_details += tr("\nExact action ID: %1").arg(m_uncertain_action_id);
@@ -3105,7 +3108,7 @@ void B3FlowMeshTradingPanel::markUncertain(const std::shared_ptr<Result>& result
         m_receipt = result->receipt; m_receipt_wallet = m_wallet;
         m_pending_market = result->action->market.id; m_pending_account = result->action->market.account;
         if (SignedAction(result->action->operation)) m_pending_sequence = result->action->market.sequence;
-        m_tracked_title = B3FlowMeshTrading::ShortTitle(*result->action); m_tracked_kind = B3FlowMeshTrading::KindOf(result->action->operation);
+        m_tracked_action = *result->action; m_tracked_kind = B3FlowMeshTrading::KindOf(result->action->operation);
         m_tracked_title_key = RequestKey(m_pending_market, m_pending_account, result->receipt->action_id);
     }
     observeRequests();
@@ -3339,12 +3342,22 @@ void B3FlowMeshTradingPanel::observeRequests()
 
 QString B3FlowMeshTradingPanel::requestTitle(const QString& key, const B3FlowMeshTrading::SavedAction* saved, const QString& action_id) const
 {
-    if (key == m_tracked_title_key && !m_tracked_title.isEmpty()) return m_tracked_title;
-    if (saved) {
-        const auto [decimals, ticker]{requestUnits(saved->market)};
-        return B3FlowMeshTrading::ShortTitle(*saved, decimals, ticker, inverted());
-    }
+    if (key == m_tracked_title_key && m_tracked_action) return B3FlowMeshTrading::ShortTitle(*m_tracked_action, titleView());
+    if (saved) return B3FlowMeshTrading::ShortTitle(*saved, titleView());
     return tr("Request %1…").arg(action_id.left(12));
+}
+
+B3FlowMeshTrading::TitleView B3FlowMeshTradingPanel::titleView() const
+{
+    B3FlowMeshTrading::TitleView view;
+    view.inverse = inverted();
+    const auto selected{market()};
+    if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->units.known || m_snapshot->units.asset != selected->base) return view;
+    view.market = selected->id; view.units = m_snapshot->units;
+    // The view's one price rule, only as the book last showed this market
+    // in this orientation (never another market's or orientation's places).
+    if (m_book_market == selected->id && m_order_book->shownInverse() == view.inverse) view.places = m_order_book->pricePlaces();
+    return view;
 }
 
 std::pair<std::optional<int>, QString> B3FlowMeshTradingPanel::requestUnits(const QString& market) const
@@ -3378,6 +3391,8 @@ void B3FlowMeshTradingPanel::linkToast(const bool restored)
 void B3FlowMeshTradingPanel::updatePendingView()
 {
     using namespace B3FlowMeshTrading;
+    // Every title below reads in the view as it is now.
+    m_titles_view = titleView();
     const auto selected{market()};
     const auto [decimals, ticker]{requestUnits(selected ? selected->id : QString{})};
     const bool local{selected && !selected->remote};
@@ -3419,12 +3434,13 @@ void B3FlowMeshTradingPanel::updatePendingView()
         push(std::move(row));
         shown.insert(key);
     };
-    if (m_wallet && !m_inflight_title.isEmpty() && selected && m_inflight_market == selected->id) {
-        push({{m_inflight_title, QStringLiteral("…"), {}, {}, {}, {}, tr("Checking, signing and sending…")},
+    if (m_wallet && m_inflight_action && selected && m_inflight_market == selected->id) {
+        push({{ShortTitle(*m_inflight_action, m_titles_view), QStringLiteral("…"), {}, {}, {}, {}, tr("Checking, signing and sending…")},
               {tr("Signed: in progress"), {}, {}, {}, {}, {}}, {}, tr("Nothing is certified yet. There is no automatic retry."), {}});
     }
     if (m_wallet && m_uncertain && m_uncertain_action_id.isEmpty() && uncertainWalletSelected()) {
-        push({{m_uncertain_title.isEmpty() ? tr("Request") : m_uncertain_title, QStringLiteral("!"), {}, {}, {}, {}, tr("Outcome unknown · no action ID was returned · review before trading")},
+        push({{m_uncertain_action ? ShortTitle(*m_uncertain_action, m_titles_view) : m_uncertain_title.isEmpty() ? tr("Request") : m_uncertain_title,
+               QStringLiteral("!"), {}, {}, {}, {}, tr("Outcome unknown · no action ID was returned · review before trading")},
               {tr("Signed: unknown"), {}, {}, {}, {}, {}}, {}, m_uncertain_details, B3Theme::kAccent});
     }
     if (m_wallet && selected) {

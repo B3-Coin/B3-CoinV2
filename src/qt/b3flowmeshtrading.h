@@ -4,6 +4,7 @@
 #define BITCOIN_QT_B3FLOWMESHTRADING_H
 
 #include <qt/b3assettransfer.h>
+#include <qt/b3flowmeshmarketdata.h>
 #include <univalue.h>
 #include <QString>
 #include <cstdint>
@@ -182,10 +183,26 @@ struct StageView {
 StageView DescribeStage(const Receipt& receipt, bool local, RequestKind kind,
                         std::optional<int> decimals = {}, const QString& ticker = {});
 QString StageName(Stage stage);
-//! A short request title in exact display units ("Buy 1 tUSD @ 1 B3/tUSD",
-//! "Cancel Sell B3"); never an RPC name or a guessed amount.
-QString ShortTitle(const Action& action);
-QString ShortTitle(const SavedAction& action, std::optional<int> decimals, const QString& ticker, bool inverse);
+//! The view a request title is read in: the displayed orientation and, for
+//! the displayed market (`market`, its verified `units`), the view's price
+//! places (the order book's, ViewPricePlaces; nullopt: none shown).
+struct TitleView {
+    bool inverse{false};
+    QString market;
+    B3FlowMeshMarketData::Units units;
+    std::optional<int> places;
+    bool operator==(const TitleView&) const = default;
+};
+//! A short request title ("Buy 1 tUSD @ 1.000 B3/tUSD", "Cancel Sell B3");
+//! never an RPC name or a guessed amount. Quantities are exact; a limit is a
+//! display label (the review and the saved request's details show the exact
+//! signed limit). A request of the view's market reads in the view's
+//! orientation, its limit as the order book, Your orders and the trades show
+//! that price (ViewPrice at the view's places). Any other request keeps its
+//! own orientation and DisplayPrice's digits; a saved one of another market
+//! (no verified units here) shows raw units.
+QString ShortTitle(const Action& action, const TitleView& view);
+QString ShortTitle(const SavedAction& action, const TitleView& view);
 RequestKind KindOf(Operation operation);
 RequestKind KindOf(const SavedAction& action);
 SavedActions ParseSavedActions(const UniValue& value);
