@@ -92,7 +92,8 @@ public:
 
     //! Persistence plumbing for FlowMeshObservedTimeStore.
     struct Pending {
-        std::vector<flowmesh::ObservedStamp> rows;
+        //! A deque: dropping the oldest on overflow is O(1).
+        std::deque<flowmesh::ObservedStamp> rows;
         std::map<std::pair<uint8_t, int64_t>, flowmesh::ObservedCandle> candles;
         bool Empty() const { return rows.empty() && candles.empty(); }
     };

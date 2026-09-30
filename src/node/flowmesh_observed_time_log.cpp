@@ -216,7 +216,7 @@ flowmesh::ObservedStamp FlowMeshObservedTimeLog::Record(const uint64_t sequence,
             if (!m_recorded_since) m_recorded_since = sequence;
             m_pending.rows.push_back(stamp);
             if (m_pending.rows.size() > PENDING_ROWS_MAX) {
-                m_pending.rows.erase(m_pending.rows.begin());
+                m_pending.rows.pop_front();
                 ++m_rows_not_persisted;
             }
             for (const auto& [interval, candle] : changes) {
