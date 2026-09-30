@@ -575,8 +575,10 @@ private:
     //! received a held tick live, from a live update whose endpoint saw the
     //! head move while it waited, with exactly one new auction while the link
     //! was Live and the endpoint not advertising that it lags (never older
-    //! rows, a poll, a catch-up or a reconnect). Never a chart input; dropped
-    //! with the held tick, and when times become available.
+    //! rows, a poll, a catch-up or a reconnect). Non-decreasing by sequence:
+    //! a time earlier than one already held (the clock stepped back) is not
+    //! recorded. Never a chart input; dropped with the held tick, and when
+    //! times become available.
     std::map<uint64_t, int64_t> m_received_times;
     //! Observed-time candles of m_candles_market at m_candle_interval, as the
     //! source served them (never recomputed here), and when they were read.

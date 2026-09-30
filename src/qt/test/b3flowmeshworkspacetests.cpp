@@ -2944,6 +2944,39 @@ private Q_SLOTS:
         QCOMPARE(panel.applySelectedSnapshot(at(8, {tick(7)}, true), age, {}, true), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
         QVERIFY(panel.m_received_times.empty());
     }
+    void receiptTimesNeverRunBackwards()
+    {
+        // The design's "backward clock step -> —": a receipt time is never
+        // earlier than one already held for an older auction.
+        B3FlowMeshTradingPanel panel;
+        const auto at = [](uint64_t next, std::vector<UniValue> ticks) {
+            auto v{RemoteData(false)};
+            UniValue snapshot{v["snapshot"]}; snapshot.pushKV("next_microblock_sequence", next);
+            snapshot.pushKV("last_microblock_hash", H(static_cast<unsigned char>(next + 100)).GetHex()); v.pushKV("snapshot", snapshot);
+            v.pushKV("clearing_ticks", TickPageJson(ticks));
+            return Parse(v);
+        };
+        const auto tick = [](uint64_t sequence) { return TickJson(sequence, H(static_cast<unsigned char>(sequence + 101)), true); };
+        Observe(panel, at(3, {tick(1), tick(2)})); panel.mergeHeldTicks();
+        QElapsedTimer age; age.start();
+        // Auction 2 was stamped an hour ahead of this computer's clock as it
+        // stands now: the clock has since stepped back (an NTP correction).
+        const int64_t ahead{QDateTime::currentMSecsSinceEpoch() + 3'600'000};
+        panel.m_received_times[2] = ahead;
+        QCOMPARE(panel.applySelectedSnapshot(at(4, {tick(3)}), age, {}, /*live_head_change=*/true), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QCOMPARE(panel.m_ticks.back().sequence, uint64_t{3});
+        QVERIFY(!panel.m_received_times.contains(3));
+        QCOMPARE(panel.m_received_times.at(2), ahead);
+        const auto rows{B3FlowMeshTradeTape::BuildRows(panel.m_ticks, panel.m_tick_times, panel.m_received_times)};
+        QCOMPARE(rows[0].sequence, uint64_t{3});
+        QVERIFY(!rows[0].received_ms);
+        QCOMPARE(B3FlowMeshTradeTape::TimeText(rows[0], {}, true), QStringLiteral("—"));
+        // Once no held time is ahead of the clock, stamps resume, in order.
+        panel.m_received_times[2] = QDateTime::currentMSecsSinceEpoch() - 1000;
+        QCOMPARE(panel.applySelectedSnapshot(at(5, {tick(4)}), age, {}, true), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QVERIFY(panel.m_received_times.contains(4));
+        QVERIFY(panel.m_received_times.at(4) >= panel.m_received_times.at(2));
+    }
     void receiptTimesNeedTheHeadToMoveDuringTheWait()
     {
         // "head_changed" is answered at once, without any wait, whenever the

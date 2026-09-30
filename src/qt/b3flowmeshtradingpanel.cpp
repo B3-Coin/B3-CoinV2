@@ -2499,7 +2499,14 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
         m_snapshot = std::move(fresh); m_response_age = age; dropCaughtUpDisplay(); mergeHeldTicks();
         if (receipt && !m_ticks.empty() && m_ticks_market == m_snapshot->market && m_ticks.back().sequence == head_sequence &&
             m_ticks.back().hash == head_hash) {
-            m_received_times[head_sequence] = QDateTime::currentMSecsSinceEpoch() - age.elapsed();
+            const int64_t received{QDateTime::currentMSecsSinceEpoch() - age.elapsed()};
+            // Monotonic against the times already held (all of earlier
+            // auctions): after this computer's clock stepped back (an NTP
+            // correction) a newer auction is left without a time ("—")
+            // rather than shown received before an older one.
+            const bool monotonic{std::none_of(m_received_times.begin(), m_received_times.end(),
+                                              [&](const auto& held) { return held.second > received; })};
+            if (monotonic) m_received_times[head_sequence] = received;
         }
         updateDataViews();
     }

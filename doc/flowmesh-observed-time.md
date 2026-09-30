@@ -212,8 +212,10 @@ endpoint-reported: its prices, volumes and times are the endpoint's claims.
   brought exactly one new auction while the link was Live, from an endpoint
   not advertising that it is not ready. `head_changed` does not qualify: the
   local engine and a public endpoint answer it at once, without waiting,
-  whenever the known head is already stale. A poll, a catch-up or an
-  endpoint replaying older entries in consecutive replies never stamps one. A
+  whenever the known head is already stale. A poll, a catch-up, an endpoint
+  replaying older entries in consecutive replies, or a time earlier than one
+  already held for an older auction (this computer's clock stepped back)
+  never stamps one. A
   source catching up while it waits, without advertising that it is not
   ready, can still produce a late stamp. Labelled "received by this app",
   never a chart input, dropped as soon as the source reports times. An
