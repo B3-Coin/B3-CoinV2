@@ -93,6 +93,9 @@ public:
     //! Persistence plumbing for FlowMeshObservedTimeStore.
     struct Pending {
         std::vector<flowmesh::ObservedStamp> rows;
+        //! At most CandleMemoryWindow(interval) + 1 full snapshots for each
+        //! interval. A prolonged disk/restore outage drops older optional
+        //! buckets (restart history gaps), never votes, receipts or funds.
         std::map<std::pair<uint8_t, int64_t>, flowmesh::ObservedCandle> candles;
         bool Empty() const { return rows.empty() && candles.empty(); }
     };

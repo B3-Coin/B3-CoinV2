@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -303,6 +304,42 @@ BOOST_AUTO_TEST_CASE(rows_beyond_store_head_dropped_and_mismatch_wipes)
     BOOST_CHECK(log->Lookup(Known(0, 12)).empty());
     BOOST_CHECK(log->Candles(CandleInterval::M1, std::nullopt, 10).candles.empty());
     BOOST_CHECK(!log->GetSummary().recorded_since);
+}
+
+BOOST_AUTO_TEST_CASE(unavailable_async_restore_bounds_pending_candles)
+{
+    FakeClocks clocks;
+    // No database exists: every optional restore attempt must refuse while
+    // the runtime can continue recording. One new M1 bucket per commit.
+    FlowMeshObservedTimeStore store{Options(m_path_root / "unopened_observed_store")};
+    const auto log{MakeLog(clocks)};
+    store.AttachAsync(log, 0, {});
+    const uint64_t total{3 * flowmesh::CandleMemoryWindow(CandleInterval::M1)};
+    for (uint64_t i{0}; i < total; ++i) {
+        log->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i));
+        clocks.Advance(60'000);
+        if (i % 100 == 0) store.FlushNow(false);
+    }
+    store.Stop();
+    BOOST_CHECK(!log->GetSummary().persisted);
+    const auto pending{log->TakePending()};
+    size_t bound{0};
+    for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+        const auto id{static_cast<uint8_t>(interval)};
+        const auto first{pending.candles.lower_bound({id, 0})};
+        const auto end{pending.candles.upper_bound({id, std::numeric_limits<int64_t>::max()})};
+        BOOST_CHECK_LE(static_cast<size_t>(std::distance(first, end)), flowmesh::CandleMemoryWindow(interval) + 1);
+        bound += flowmesh::CandleMemoryWindow(interval) + 1;
+        BOOST_REQUIRE(first != end);
+        BOOST_CHECK_EQUAL(first->second.open_ms, *log->OldestMemoryOpen(interval));
+        BOOST_CHECK_EQUAL(std::prev(end)->second.last_sequence, total - 1);
+    }
+    BOOST_CHECK_LE(pending.candles.size(), bound);
+    // Only persistence loses old buckets. Current candles and exact rows
+    // remain accessible, and a normal fresh record still advances both.
+    BOOST_CHECK_EQUAL(log->Lookup({{total - 1, EntryHash(total - 1)}}).size(), 1U);
+    log->Record(total, EntryHash(total), ObservedDelay::NONE, Tick(total));
+    BOOST_CHECK_EQUAL(log->Candles(CandleInterval::M1, std::nullopt, 1).candles.back().last_sequence, total);
 }
 
 BOOST_AUTO_TEST_CASE(pending_overflow_drops_rows_from_persistence_only)

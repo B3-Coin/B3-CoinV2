@@ -205,6 +205,21 @@ flowmesh::ObservedStamp FlowMeshObservedTimeLog::Record(const uint64_t sequence,
             for (const auto& [interval, candle] : changes) {
                 m_pending.candles[{static_cast<uint8_t>(interval), candle.open_ms}] = candle;
             }
+            // A restore or disk flush may never succeed. Keep only the same
+            // bounded interval windows as the in-memory rollup, not every
+            // bucket ever recorded while storage was unavailable. Dropping
+            // whole optional snapshots leaves a history gap after restart;
+            // it never removes the current candle or any signing evidence.
+            for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+                const auto& retained{m_rollup.Candles(interval)};
+                if (retained.empty()) continue;
+                const auto id{static_cast<uint8_t>(interval)};
+                auto it{m_pending.candles.lower_bound({id, 0})};
+                while (it != m_pending.candles.end() && it->first.first == id &&
+                       it->first.second < retained.front().open_ms) {
+                    it = m_pending.candles.erase(it);
+                }
+            }
         }
         m_generation.fetch_add(1, std::memory_order_acq_rel);
         return stamp;
