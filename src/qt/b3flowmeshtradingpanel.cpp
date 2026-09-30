@@ -974,11 +974,12 @@ void B3FlowMeshTradingPanel::updateTicket()
         CAmount total{0};
         for (const auto& step : *steps) total += step.qty;
         const auto reservation{*flowmesh::LadderReservation(bid, *steps)};
-        m_ticket_total->setText((steps->size() == 1 ? tr("Ladder of 1 price · %1 %2 in total\n%3") : tr("Ladder of %4 prices · %1 %2 in total\n%3"))
-            .arg(FormatAmount(total, u.decimals), ticker,
-                 bid ? tr("Reserves exactly %1 B3 (the sum of quantity x price)").arg(FormatAmount(reservation, 9))
-                     : tr("Reserves %1 %2").arg(FormatAmount(reservation, u.decimals), ticker))
-            .arg(steps->size()));
+        const QString amount{FormatAmount(total, u.decimals)};
+        const QString reserves{bid ? tr("Reserves exactly %1 B3 (the sum of quantity x price)").arg(FormatAmount(reservation, 9))
+                                   : tr("Reserves %1 %2").arg(FormatAmount(reservation, u.decimals), ticker)};
+        // One arg chain per text: the one-price text has no %4 to fill.
+        m_ticket_total->setText(steps->size() == 1 ? tr("Ladder of 1 price · %1 %2 in total\n%3").arg(amount, ticker, reserves)
+                                                   : tr("Ladder of %4 prices · %1 %2 in total\n%3").arg(amount, ticker, reserves).arg(steps->size()));
         total_tooltip = tr("A ladder is one standing order on this side: each price fills in the same uniform-price auction, a price cannot be cancelled alone, and it replaces your order on this side. With one price it is an ordinary limit order.");
         apply_tooltips();
         return;

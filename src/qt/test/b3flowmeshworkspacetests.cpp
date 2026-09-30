@@ -2199,6 +2199,30 @@ private Q_SLOTS:
         QVERIFY(panel.m_ladder_rows->isHidden()); QVERIFY(panel.m_marketable->isEnabled());
         QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
     }
+    void ladderTotalsFillEveryArgumentOfTheirText()
+    {
+        // The one-price text has no price-count argument: formatting it
+        // must not ask Qt for one ("QString::arg: Argument missing").
+        static QtMessageHandler forward{nullptr};
+        static QStringList arg_warnings;
+        arg_warnings.clear();
+        forward = qInstallMessageHandler([](QtMsgType type, const QMessageLogContext& context, const QString& text) {
+            if (text.startsWith(QStringLiteral("QString::arg"))) arg_warnings << text;
+            else if (forward) forward(type, context, text);
+        });
+        struct Restore { ~Restore() { qInstallMessageHandler(forward); } } restore;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_ladder->setChecked(true);
+        panel.m_price->setText(QStringLiteral("1")); panel.m_quantity->setText(QStringLiteral("0.3"));
+        QCOMPARE(panel.m_ticket_total->text(), QStringLiteral("Ladder of 1 price · 0.3 tUSD in total\nReserves exactly 0.3 B3 (the sum of quantity x price)"));
+        panel.m_ladder_prices[0]->setText(QStringLiteral("0.99")); panel.m_ladder_quantities[0]->setText(QStringLiteral("0.2"));
+        // 300,000 x 1000 + 200,000 x 990 atoms: 0.498 B3.
+        QCOMPARE(panel.m_ticket_total->text(), QStringLiteral("Ladder of 2 prices · 0.5 tUSD in total\nReserves exactly 0.498 B3 (the sum of quantity x price)"));
+        panel.m_ladder_prices[0]->setText(QString{}); panel.m_ladder_quantities[0]->setText(QString{});
+        panel.m_sell->click();
+        QCOMPARE(panel.m_ticket_total->text(), QStringLiteral("Ladder of 1 price · 0.3 tUSD in total\nReserves 0.3 tUSD"));
+        QVERIFY2(arg_warnings.isEmpty(), qPrintable(arg_warnings.join(QLatin1Char('\n'))));
+    }
     void editingALadderPrefillsWhatRemainsAtEachPrice()
     {
         auto s{Parse(RemoteData())};
