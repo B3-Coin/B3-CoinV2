@@ -1124,15 +1124,21 @@ private Q_SLOTS:
     {
         QTest::addColumn<int>("period_ms");
         QTest::addColumn<QString>("name");
-        QTest::newRow("quiet") << 1200 << QStringLiteral("quiet");
-        QTest::newRow("busy-5-per-second") << 200 << QStringLiteral("busy_5");
-        QTest::newRow("stress-20-per-second") << 50 << QStringLiteral("stress_20");
+        QTest::addColumn<bool>("remote");
+        QTest::newRow("quiet") << 1200 << QStringLiteral("quiet") << false;
+        QTest::newRow("busy-5-per-second") << 200 << QStringLiteral("busy_5") << false;
+        QTest::newRow("stress-20-per-second") << 50 << QStringLiteral("stress_20") << false;
+        // In process, without a network: the remote pacing alone (U1-remote
+        // adds the link and the verified state download; reported only).
+        QTest::newRow("remote-busy-5-per-second") << 200 << QStringLiteral("remote_busy_5") << true;
     }
     void watchEndToEnd()
     {
         QFETCH(int, period_ms);
         QFETCH(QString, name);
-        MarketProbe probe{{SyntheticMarket::Options{}}};
+        QFETCH(bool, remote);
+        SyntheticMarket::Options options; options.remote = remote;
+        MarketProbe probe{{options}};
         B3FlowMeshTradingPanel panel; panel.resize(1320, 940); Attach(panel);
         Show(panel, probe);
         PaintLog paints; paints.Attach(panel, *panel.m_order_book, *panel.m_chart);
@@ -1182,19 +1188,33 @@ private Q_SLOTS:
         qInfo("%s", qPrintable(Describe("U1-local (commit -> book shows it)", u1)));
         qInfo("%s", qPrintable(Describe("U1-qt (reply -> book shows it)", u1_qt)));
         UniValue v{UniValue::VOBJ};
-        v.pushKV("head_period_ms", period_ms); v.pushKV("seconds", seconds); v.pushKV("heads", last - first + 1);
+        v.pushKV("head_period_ms", period_ms); v.pushKV("remote_pacing", remote); v.pushKV("seconds", seconds); v.pushKV("heads", last - first + 1);
         v.pushKV("never_painted", static_cast<uint64_t>(missed));
         v.pushKV("u1_local", Json(u1)); v.pushKV("u1_qt", Json(u1_qt));
         v.pushKV("book_paints", static_cast<uint64_t>(paints.book.size()));
-        v.pushKV("target", period_ms >= 1000 ? "U1-local quiet p95 <= 50 ms, p99 <= 100 ms; U1-qt p95 <= 30 ms" :
+        // Data renders (installs) in any one second: at most ~20 (the owner's
+        // provisional default), whatever the head rate. Flash frames are a
+        // separate animation at 30 Hz, only while a new price flashes.
+        size_t renders_per_second{0};
+        for (size_t i{0}, j{0}; j < paints.installed.size(); ++j) {
+            while (paints.installed[j].us - paints.installed[i].us >= 1'000'000) ++i;
+            renders_per_second = std::max(renders_per_second, j - i + 1);
+        }
+        const double paint_rate{paints.book.size() / std::max(1.0, static_cast<double>(seconds))};
+        qInfo("book: at most %zu data renders in any second; %.1f paints a second (flash frames included)", renders_per_second, paint_rate);
+        v.pushKV("max_renders_in_one_second", static_cast<uint64_t>(renders_per_second));
+        v.pushKV("book_paints_per_second", std::round(paint_rate * 10) / 10);
+        v.pushKV("target", remote ? "reported only: the remote pacing without a network; U1-qt p95 <= 30 ms" :
+                           period_ms >= 1000 ? "U1-local quiet p95 <= 50 ms, p99 <= 100 ms; U1-qt p95 <= 30 ms" :
                            period_ms >= 200 ? "U1-local busy p95 <= 150 ms (local reads up to 10/s); U1-qt p95 <= 30 ms" :
                                               "stress case: reported; every head superseded by a painted one within 1 s");
         Record("watch_end_to_end_" + name.toStdString(), v);
         QCOMPARE(missed, size_t{0});
+        QVERIFY2(renders_per_second <= 20, "at most ~20 data renders a second");
         QVERIFY2(u1.max <= Ceiling(1000), qPrintable(Describe("U1-local", u1)));
         QVERIFY2(u1_qt.p95 <= Ceiling(30), qPrintable(Describe("U1-qt", u1_qt)));
-        if (period_ms >= 1000) QVERIFY2(u1.p95 <= Ceiling(50), qPrintable(Describe("U1-local quiet", u1)));
-        else if (period_ms >= 200) QVERIFY2(u1.p95 <= Ceiling(150), qPrintable(Describe("U1-local busy", u1)));
+        if (!remote && period_ms >= 1000) QVERIFY2(u1.p95 <= Ceiling(50), qPrintable(Describe("U1-local quiet", u1)));
+        else if (!remote && period_ms >= 200) QVERIFY2(u1.p95 <= Ceiling(150), qPrintable(Describe("U1-local busy", u1)));
         QCOMPARE(probe.writes.load(), 0);
     }
 
