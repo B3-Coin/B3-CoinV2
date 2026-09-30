@@ -80,8 +80,9 @@ inline constexpr int64_t FLOWMESH_CLIENT_OBSERVED_FUTURE_MS{5000};
  * sequence of `ring` whose tick carries the row's hash; `held` afterwards
  * holds only sequences in `ring`. Flagged, never corrected: a LIVE time
  * below an earlier sequence's LIVE time, and any time more than
- * FLOWMESH_CLIENT_OBSERVED_FUTURE_MS after `received_ms`. Only public flags
- * are taken from the endpoint. `clock_suspect` receives the section's flag.
+ * FLOWMESH_CLIENT_OBSERVED_FUTURE_MS after `received_ms`. A time at or past
+ * OBSERVED_MS_LIMIT refuses the section. Only public flags are taken from
+ * the endpoint. `clock_suspect` receives the section's flag.
  *
  * Returns empty on success. An endpoint's own "available": false leaves
  * `held` and returns its reason; any other failure clears `held` and returns
@@ -91,8 +92,8 @@ std::string FlowMeshMergeObservedTimes(std::map<uint64_t, flowmesh::ObservedStam
                                        bool& clock_suspect) noexcept;
 
 /** Checks one 'candles' reply of an endpoint: the interval it was asked for,
- * a window of at most OBSERVED_CANDLE_PAGE_MAX intervals, aligned ascending
- * opens inside it, ascending non-overlapping sequences none beyond
+ * a window of at most OBSERVED_CANDLE_PAGE_MAX intervals ending at most at
+ * OBSERVED_MS_LIMIT, aligned ascending opens inside it, ascending non-overlapping sequences none beyond
  * `head_sequence` (the client's verified head), consistent prices and exact
  * decimal volumes. The endpoint's prices, volumes and times stay its
  * claims: only their structure is checked. nullopt and `error` when

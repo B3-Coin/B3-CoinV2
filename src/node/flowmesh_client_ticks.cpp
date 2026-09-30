@@ -158,6 +158,15 @@ int64_t Signed(const UniValue& object, const char* key)
     return number;
 }
 
+//! An observed time or bucket start (below OBSERVED_MS_LIMIT), or with
+//! `window_end` a window's end (at most OBSERVED_MS_LIMIT).
+int64_t Time(const UniValue& object, const char* key, const bool window_end = false)
+{
+    const int64_t ms{Signed(object, key)};
+    if (window_end ? ms > flowmesh::OBSERVED_MS_LIMIT : !flowmesh::ObservedTimeInRange(ms)) Reject(std::string{"out of range: "} + key);
+    return ms;
+}
+
 uint256 Hash(const UniValue& object, const char* key)
 {
     const auto text{String(object, key, 64)};
@@ -246,10 +255,10 @@ std::string FlowMeshMergeObservedTimes(std::map<uint64_t, flowmesh::ObservedStam
                 const auto mode{String(row, "mode", 16)};
                 if (mode == "live") {
                     stamp.mode = flowmesh::ObservedMode::LIVE;
-                    stamp.ms = Signed(row, "observed_ms");
+                    stamp.ms = Time(row, "observed_ms");
                 } else if (mode == "delayed") {
                     stamp.mode = flowmesh::ObservedMode::DELAYED;
-                    stamp.ms = Signed(row, "applied_here_ms");
+                    stamp.ms = Time(row, "applied_here_ms");
                 } else if (mode == "untimed") {
                     stamp.mode = flowmesh::ObservedMode::UNTIMED;
                 } else {
@@ -304,8 +313,8 @@ std::optional<flowmesh::ObservedCandlePage> FlowMeshParseObservedCandles(const U
             if (String(result, "interval", 8) != flowmesh::CandleIntervalName(interval)) Reject("another interval");
             const int64_t step{flowmesh::CandleIntervalMs(interval)};
             if (Signed(result, "interval_ms") != step) Reject("another interval length");
-            page.from_ms = Signed(result, "from_ms");
-            page.before_ms = Signed(result, "before_ms");
+            page.from_ms = Time(result, "from_ms", /*window_end=*/true);
+            page.before_ms = Time(result, "before_ms", /*window_end=*/true);
             if (page.before_ms < page.from_ms || (page.before_ms - page.from_ms) % step != 0 ||
                 page.before_ms - page.from_ms > static_cast<int64_t>(flowmesh::OBSERVED_CANDLE_PAGE_MAX) * step) {
                 Reject("invalid window");
@@ -316,7 +325,7 @@ std::optional<flowmesh::ObservedCandlePage> FlowMeshParseObservedCandles(const U
             for (const auto& row : rows.getValues()) {
                 if (!row.isObject()) Reject("candle is not an object");
                 flowmesh::ObservedCandle candle;
-                candle.open_ms = Signed(row, "open_ms");
+                candle.open_ms = Time(row, "open_ms");
                 if (candle.open_ms % step != 0 || candle.open_ms < page.from_ms || candle.open_ms >= page.before_ms) Reject("misaligned candle");
                 if (!page.candles.empty() && candle.open_ms <= page.candles.back().open_ms) Reject("candles out of order");
                 candle.first_sequence = Unsigned(row, "first_sequence", std::numeric_limits<uint64_t>::max());

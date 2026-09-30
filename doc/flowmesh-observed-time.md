@@ -150,6 +150,9 @@ only (another endpoint starts again), with only the public flags taken. They
 are flagged `implausible`, never corrected, when a live time goes backwards
 with sequence, when any time is more than 5 s after it was received, or when
 the head's time is before the block that made its anchor final less 120 s.
+A section holding a time at or past 10000-01-01 (the display bound
+`OBSERVED_MS_LIMIT`) is refused (`endpoint_observed_time_rejected: out of
+range`) and its held rows are cleared.
 Replies label the section with the endpoint's URL or say why there is none
 (`endpoint_does_not_advertise_observed_time`, `observed_time_not_yet_received`).
 
@@ -166,7 +169,10 @@ that reaches past the held head is checked against a consistent head: the
 endpoint's head verified after the page was served, by the same refresh a
 market-data read makes (with its ticks and their times). An honest endpoint's
 head is then at or past every candle it served; a page that still goes past
-it, or a change of endpoint meanwhile, is refused. The page stays labelled
+it, or a change of endpoint meanwhile, is refused. So is a page whose window
+ends past 10000-01-01 or holds a candle at or past it (`endpoint_candles_rejected:
+out of range`); the client itself never asks for a window ending past that
+bound. The page stays labelled
 endpoint-reported: its prices, volumes and times are the endpoint's claims.
 
 ## 5. Qt

@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <functional>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -6462,6 +6463,21 @@ BOOST_AUTO_TEST_CASE(remote_candles_are_checked_against_a_head_verified_after_th
     const auto again{client->Candles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, error)};
     BOOST_REQUIRE_MESSAGE(again, error);
     BOOST_CHECK_EQUAL(again->candles.back().last_sequence, 2U);
+    // A window past the display bound is never asked for: the request ends
+    // at 10000-01-01 (the second page of this second).
+    const auto bounded{client->Candles(market, flowmesh::CandleInterval::M1, std::numeric_limits<int64_t>::max(), 10, error)};
+    BOOST_REQUIRE_MESSAGE(bounded, error);
+    BOOST_CHECK_MESSAGE(bounded->available, bounded->unavailable_reason);
+    BOOST_CHECK_EQUAL(bounded->before_ms, flowmesh::OBSERVED_MS_LIMIT);
+    BOOST_CHECK(bounded->candles.empty());
+    {
+        std::lock_guard lock{proxy.mutex};
+        BOOST_REQUIRE(!proxy.requests.empty());
+        const auto& [method, params]{proxy.requests.back()};
+        BOOST_CHECK_EQUAL(method, "candles");
+        BOOST_REQUIRE(params["before_ms"].isNum());
+        BOOST_CHECK_EQUAL(params["before_ms"].getInt<int64_t>(), flowmesh::OBSERVED_MS_LIMIT);
+    }
     client.reset();
 }
 

@@ -3613,7 +3613,9 @@ public:
         UniValue params{UniValue::VOBJ};
         params.pushKV("market_id", id.GetHex());
         params.pushKV("interval", flowmesh::CandleIntervalName(interval));
-        if (before_ms) params.pushKV("before_ms", *before_ms);
+        // Never a window past the display bound: an endpoint echoing one
+        // back would be refused.
+        if (before_ms) params.pushKV("before_ms", std::min(*before_ms, flowmesh::OBSERVED_MS_LIMIT));
         params.pushKV("limit", uint64_t{std::clamp<size_t>(limit, 1, advertised)});
         UniValue request{UniValue::VOBJ};
         request.pushKV("method", "candles");

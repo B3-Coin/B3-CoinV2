@@ -11,6 +11,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <deque>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -396,6 +397,48 @@ BOOST_AUTO_TEST_CASE(endpoint_candles_are_structure_checked)
     BOOST_REQUIRE_EQUAL(read->candles.size(), 1U);
     BOOST_CHECK(read->candles[0] == candle);
     BOOST_CHECK_EQUAL(read->from_ms, written.from_ms);
+}
+
+BOOST_AUTO_TEST_CASE(endpoint_times_past_the_display_bound_are_rejected)
+{
+    constexpr int64_t MAX{std::numeric_limits<int64_t>::max()};
+    constexpr int64_t BOUND{flowmesh::OBSERVED_MS_LIMIT};
+    std::string error;
+    // The page that froze the Qt chart: one well-formed candle at the last
+    // 1m bucket start below INT64_MAX, in a window ending at INT64_MAX.
+    BOOST_CHECK(!node::FlowMeshParseObservedCandles(CandleReply({Candle(MAX - MAX % 60'000, 3, 3)}, "1m", MAX),
+                                                    flowmesh::CandleInterval::M1, 7, error));
+    BOOST_CHECK_MESSAGE(error.starts_with("endpoint_candles_rejected: out of range"), error);
+    // The edges: the last bucket before 10000-01-01 in a window ending at
+    // it is accepted; a bucket at it (a window ending past it) is not.
+    error.clear();
+    const auto edge{node::FlowMeshParseObservedCandles(CandleReply({Candle(BOUND - 60'000, 3, 3)}, "1m", BOUND), flowmesh::CandleInterval::M1, 7, error)};
+    BOOST_REQUIRE_MESSAGE(edge, error);
+    BOOST_CHECK_EQUAL(edge->before_ms, BOUND);
+    BOOST_CHECK_EQUAL(edge->candles.back().open_ms, BOUND - 60'000);
+    BOOST_CHECK(!node::FlowMeshParseObservedCandles(CandleReply({Candle(BOUND, 3, 3)}, "1m", BOUND + 60'000), flowmesh::CandleInterval::M1, 7, error));
+    BOOST_CHECK_MESSAGE(error.starts_with("endpoint_candles_rejected: out of range"), error);
+
+    // Stamps: the whole section is refused and what was held is cleared.
+    std::deque<Tick> ring;
+    for (uint64_t i{10}; i < 12; ++i) ring.push_back(At(i));
+    for (const auto& row : {Stamp(10, TickHash(10), "live", MAX - 1), Stamp(10, TickHash(10), "delayed", BOUND),
+                            Stamp(10, TickHash(10), "live", BOUND)}) {
+        std::map<uint64_t, flowmesh::ObservedStamp> held;
+        bool suspect{false};
+        BOOST_REQUIRE_EQUAL(node::FlowMeshMergeObservedTimes(held, Section({Stamp(11, TickHash(11), "live", NOW)}), ring, NOW, suspect), "");
+        BOOST_REQUIRE_EQUAL(held.size(), 1U);
+        const auto reason{node::FlowMeshMergeObservedTimes(held, Section({row, Stamp(11, TickHash(11), "live", NOW)}), ring, NOW, suspect)};
+        BOOST_CHECK_MESSAGE(reason.starts_with("endpoint_observed_time_rejected: out of range"), reason);
+        BOOST_CHECK(held.empty());
+    }
+    // In range but far ahead of its receipt: kept and flagged, as before.
+    std::map<uint64_t, flowmesh::ObservedStamp> held;
+    bool suspect{false};
+    BOOST_CHECK_EQUAL(node::FlowMeshMergeObservedTimes(held, Section({Stamp(10, TickHash(10), "live", BOUND - 1)}), ring, NOW, suspect), "");
+    BOOST_REQUIRE(held.contains(10));
+    BOOST_CHECK_EQUAL(held.at(10).ms, BOUND - 1);
+    BOOST_CHECK(held.at(10).flags & flowmesh::OBSERVED_IMPLAUSIBLE);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
