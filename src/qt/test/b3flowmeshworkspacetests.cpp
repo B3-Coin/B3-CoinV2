@@ -1278,7 +1278,7 @@ private Q_SLOTS:
         book.show(); for (int i{0}; i < 3; ++i) QCoreApplication::processEvents();
         QCOMPARE(book.view()->columnSpan(book.rowsPerSide(), 0), 3);
         int paints{0};
-        book.setPaintObserver([&](const QString& head) { QCOMPARE(head, snapshot.head); ++paints; });
+        book.setViewObserver([&](const QString& head, bool painted) { QVERIFY(!head.isEmpty()); if (painted) ++paints; });
         for (int i{0}; i < 5; ++i) { book.setSnapshot(Snapshot{snapshot}, true); QCoreApplication::processEvents(); }
         QCOMPARE(paints, 0);
         // A real change still repaints.

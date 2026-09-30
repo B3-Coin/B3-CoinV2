@@ -203,7 +203,7 @@ protected:
     void paintEvent(QPaintEvent* event) override
     {
         QTableView::paintEvent(event);
-        if (m_book->m_paint_observer) m_book->m_paint_observer(m_book->m_head);
+        if (m_book->m_view_observer) m_book->m_view_observer(m_book->m_head, true);
     }
     void mouseMoveEvent(QMouseEvent* event) override
     {
@@ -447,6 +447,7 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
         m_note->setToolTip(QString{});
         m_flash_key.clear();
         layoutRows();
+        if (m_view_observer) m_view_observer(m_head, false);
         return;
     }
     const auto& s{*snapshot};
@@ -626,4 +627,5 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
                   QLatin1Char('|') + QString::number(grouping.exact) + QString::number(grouping.inverse) + QString::number(grouping.mantissa) +
                   QLatin1Char(',') + QString::number(grouping.exponent) + QLatin1Char(',') + QString::number(grouping.decimals);
     layoutRows();
+    if (m_view_observer) m_view_observer(m_head, false);
 }

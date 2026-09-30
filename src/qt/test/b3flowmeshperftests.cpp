@@ -648,16 +648,32 @@ private:
     bool m_closing{false};
 };
 
-//! Book and chart paints: when, and which head the book showed.
+//! Book and chart paints (when, and which head the book showed), and when
+//! the book installed rows for a head.
 struct PaintLog {
     struct Paint { int64_t us{0}; std::optional<std::pair<uint64_t, unsigned char>> head; };
-    std::vector<Paint> book;
+    std::vector<Paint> book, installed;
     std::vector<int64_t> chart;
     void Attach(B3FlowMeshTradingPanel& panel, B3FlowMeshOrderBook& book_widget, B3FlowMeshChart& chart_widget)
     {
         (void)panel;
-        book_widget.setPaintObserver([this](const QString& head) { book.push_back({NowUs(), SequenceOf(head)}); });
+        book_widget.setViewObserver([this](const QString& head, bool painted) { (painted ? book : installed).push_back({NowUs(), SequenceOf(head)}); });
         chart_widget.setPaintObserver([this] { chart.push_back(NowUs()); });
+    }
+    void Clear() { book.clear(); installed.clear(); chart.clear(); }
+    /** When head `h` (of market `market`) was first on screen after `from`
+     * (critique S7): when rows for a head at least as new were installed,
+     * or, when that install changed pixels, the paint that followed before
+     * the next install. A head that changes no pixel never paints. */
+    std::optional<int64_t> Shown(uint64_t h, int64_t from, unsigned char market = 0) const
+    {
+        const auto at{std::find_if(installed.begin(), installed.end(), [&](const auto& install) {
+            return install.us >= from && install.head && install.head->second == market && install.head->first >= h;
+        })};
+        if (at == installed.end()) return std::nullopt;
+        const int64_t until{std::next(at) == installed.end() ? INT64_MAX : std::next(at)->us};
+        const auto painted{std::find_if(book.begin(), book.end(), [&](const auto& paint) { return paint.us >= at->us && paint.us < until && paint.head == at->head; })};
+        return painted != book.end() ? painted->us : at->us;
     }
 };
 
@@ -916,7 +932,7 @@ private Q_SLOTS:
         panel.show(); Spin(50);
         PaintLog paints; paints.Attach(panel, *panel.m_order_book, *panel.m_chart);
         Apply(panel, probe, 5, false);
-        paints.book.clear(); paints.chart.clear();
+        paints.Clear();
         const auto cost{Apply(panel, probe, Measuring() ? 200 : 60, false)};
         const auto handler{Distribute(cost.handler)};
         qInfo("%s", qPrintable(Describe("unchanged reply: handler", handler)));
@@ -959,7 +975,7 @@ private Q_SLOTS:
             ticks.push_back(Ms(NowUs() - started));
             QVERIFY(!panel.m_thread); QVERIFY(!panel.m_watch_thread);
             QCoreApplication::processEvents();
-            if (i == 4) { paints.book.clear(); paints.chart.clear(); }
+            if (i == 4) paints.Clear();
         }
         panel.m_watch.outstanding = false; panel.m_watch.Disable();
         const auto d{Distribute(ticks)};
@@ -1127,7 +1143,7 @@ private Q_SLOTS:
         QTRY_COMPARE_WITH_TIMEOUT(panel.m_watch.mode, B3FlowMeshWatch::Mode::Live, 5000);
         Spin(300);
         const uint64_t first{probe.market().HeadSequence() + 1};
-        paints.book.clear();
+        paints.Clear();
         const int seconds{Measuring() ? (period_ms >= 1000 ? 30 : 10) : (period_ms >= 1000 ? 6 : 3)};
         std::atomic_bool stop{false};
         std::thread committer{[&] {
@@ -1153,23 +1169,18 @@ private Q_SLOTS:
         for (uint64_t h{first}; h <= last; ++h) {
             const auto commit{committed.find(h)};
             if (commit == committed.end()) continue;
-            const auto painted{std::find_if(paints.book.begin(), paints.book.end(), [&](const auto& paint) {
-                return paint.us >= commit->second && paint.head && paint.head->first >= h;
-            })};
-            if (painted == paints.book.end()) { ++missed; continue; }
-            freshness.push_back(Ms(painted->us - commit->second));
+            const auto shown{paints.Shown(h, commit->second)};
+            if (!shown) { ++missed; continue; }
+            freshness.push_back(Ms(*shown - commit->second));
             if (const auto reply{replies.find(h)}; reply != replies.end()) {
-                const auto shown{std::find_if(paints.book.begin(), paints.book.end(), [&](const auto& paint) {
-                    return paint.us >= reply->second && paint.head && paint.head->first >= h;
-                })};
-                if (shown != paints.book.end()) qt.push_back(Ms(shown->us - reply->second));
+                if (const auto on_screen{paints.Shown(h, reply->second)}) qt.push_back(Ms(*on_screen - reply->second));
             }
         }
         const auto u1{Distribute(freshness)}, u1_qt{Distribute(qt)};
         qInfo("watch end to end (%s, a head every %d ms): %llu heads, %zu never painted", qPrintable(name), period_ms,
               static_cast<unsigned long long>(last - first + 1), missed);
-        qInfo("%s", qPrintable(Describe("U1-local (commit -> painted book)", u1)));
-        qInfo("%s", qPrintable(Describe("U1-qt (reply -> painted book)", u1_qt)));
+        qInfo("%s", qPrintable(Describe("U1-local (commit -> book shows it)", u1)));
+        qInfo("%s", qPrintable(Describe("U1-qt (reply -> book shows it)", u1_qt)));
         UniValue v{UniValue::VOBJ};
         v.pushKV("head_period_ms", period_ms); v.pushKV("seconds", seconds); v.pushKV("heads", last - first + 1);
         v.pushKV("never_painted", static_cast<uint64_t>(missed));
@@ -1287,19 +1298,17 @@ private Q_SLOTS:
         for (int i{0}; i < (Measuring() ? 20 : 6); ++i) {
             Spin(700);
             const unsigned char target{static_cast<unsigned char>((i + 1) % 2)};
-            paints.book.clear();
+            paints.Clear();
             const int64_t started{NowUs()};
             panel.m_market->setCurrentIndex(target);
-            QTRY_VERIFY_WITH_TIMEOUT(std::any_of(paints.book.begin(), paints.book.end(), [&](const auto& paint) {
-                return paint.head && paint.head->second == target;
-            }), 5000);
-            const auto shown{std::find_if(paints.book.begin(), paints.book.end(), [&](const auto& paint) { return paint.head && paint.head->second == target; })};
-            switches.push_back(Ms(shown->us - started));
+            QTRY_VERIFY_WITH_TIMEOUT(paints.Shown(0, started, target).has_value(), 5000);
+            Spin(20); // The paint that follows the install.
+            switches.push_back(Ms(*paints.Shown(0, started, target) - started));
         }
         panel.m_timer->stop(); panel.m_watch.Disable();
         QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread && !panel.m_thread, 5000);
         const auto d{Distribute(switches)};
-        qInfo("%s", qPrintable(Describe("market switch -> verified book painted (local engine)", d)));
+        qInfo("%s", qPrintable(Describe("market switch -> verified book shown (local engine)", d)));
         UniValue v{UniValue::VOBJ};
         v.pushKV("switch_to_verified_paint", Json(d));
         v.pushKV("target", "U5: <= 50 ms to the first paint of the new market (local engine: a fresh verified read)");

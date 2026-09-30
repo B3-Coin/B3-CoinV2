@@ -124,9 +124,11 @@ public:
     QComboBox* groupingSelector() const { return m_grouping; }
     //! The head of the data the rows were last shown from (empty: none).
     const QString& head() const { return m_head; }
-    //! Diagnostics and tests only (never set in production): called at the
-    //! end of every paint of the ladder, with head().
-    void setPaintObserver(std::function<void(const QString& head)> observer) { m_paint_observer = std::move(observer); }
+    //! Diagnostics and tests only (never set in production): called with
+    //! head() when setSnapshot has installed rows (`painted` false; rows
+    //! that did not change repaint nothing) and at the end of every paint of
+    //! the ladder (`painted` true).
+    void setViewObserver(std::function<void(const QString& head, bool painted)> observer) { m_view_observer = std::move(observer); }
 
 Q_SIGNALS:
     //! The viewer chose another price grouping for the displayed orientation.
@@ -165,6 +167,6 @@ private:
     //! Per row: when its flash started (m_clock ms, staggered), or -1.
     std::vector<qint64> m_flash_start;
     QElapsedTimer m_clock;
-    std::function<void(const QString&)> m_paint_observer;
+    std::function<void(const QString&, bool)> m_view_observer;
 };
 #endif
