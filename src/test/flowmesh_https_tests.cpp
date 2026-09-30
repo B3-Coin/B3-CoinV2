@@ -4005,13 +4005,14 @@ BOOST_AUTO_TEST_CASE(previous_clients_take_the_same_from_status_objects_with_add
     auto api{node::MakeFlowMeshTradingApi(
         service, Options(), {},
         {node::FLOWMESH_API_ACTION_WAIT_DEFAULT, node::FLOWMESH_API_ACTION_WAITERS_DEFAULT, true},
-        {true}, {true}, {std::chrono::milliseconds{2000}, 2}, {node::FLOWMESH_API_CLEARING_TICKS_DEFAULT}, {true})};
+        {true}, {true}, {std::chrono::milliseconds{2000}, 2}, {node::FLOWMESH_API_CLEARING_TICKS_DEFAULT}, {true},
+        {node::FLOWMESH_API_CANDLES_DEFAULT})};
     BOOST_REQUIRE_MESSAGE(api->Start(error), error);
     const auto endpoint{Endpoint(api->Port())};
     const std::string one_market{"{\"market_id\":\"" + market.GetHex() + "\"}"};
     const std::set<std::string> added{"health_api_version", "endpoint_ready", "endpoint_not_ready",
                                       "submit_wait_ms_max", "updates_watch_ms_max", "action_outcome_v1",
-                                      "clearing_ticks_max", "observed_time_v1"};
+                                      "clearing_ticks_max", "observed_time_v1", "observed_candles_max"};
 
     const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
     BOOST_REQUIRE_EQUAL(markets_status, 200);
@@ -5262,6 +5263,7 @@ struct LiveMarket {
     const node::FlowMeshTradingApiTicks ticks;
     const node::FlowMeshTradingApiOutcome outcome;
     const node::FlowMeshTradingApiObservedTime observed;
+    const node::FlowMeshTradingApiCandles candles;
     std::unique_ptr<node::FlowMeshService> service;
     std::unique_ptr<node::FlowMeshHttpsServer> api;
     uint16_t port{0};
@@ -5269,8 +5271,8 @@ struct LiveMarket {
     std::function<void(bool)> connection_observer;
     LiveMarket(ClientLaneFixture& f, fs::path p, const node::FlowMeshTradingApiWatch w = {},
                const node::FlowMeshTradingApiTicks t = {}, const node::FlowMeshTradingApiOutcome o = {},
-               const node::FlowMeshTradingApiObservedTime obs = {})
-        : fixture{f}, path{std::move(p)}, watch{w}, ticks{t}, outcome{o}, observed{obs}
+               const node::FlowMeshTradingApiObservedTime obs = {}, const node::FlowMeshTradingApiCandles c = {})
+        : fixture{f}, path{std::move(p)}, watch{w}, ticks{t}, outcome{o}, observed{obs}, candles{c}
     {
         // Certify the market genesis, publish its checkpoint on B3, and start
         // again: the market then admits actions.
@@ -5291,7 +5293,7 @@ struct LiveMarket {
         BOOST_REQUIRE_MESSAGE(service->ArmSeatKeys(fixture.secrets, error), error);
         auto options{fixture.Options(port)};
         options.request_timeout = std::chrono::seconds{10};
-        api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, outcome, watch, ticks, observed);
+        api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, outcome, watch, ticks, observed, candles);
         if (connection_observer) {
             BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(*api, [this](bool nodelay) {
                 if (connection_observer) connection_observer(nodelay);
@@ -5980,6 +5982,59 @@ BOOST_AUTO_TEST_CASE(trading_api_observed_time_only_when_requested)
     BOOST_CHECK_EQUAL(watched["error"].get_str(), "observed_time cannot be combined with watch_ms");
     const auto [bad_status, bad]{ApiCall(on.Endpoint(), "snapshot", id + ",\"observed_time\":1")};
     BOOST_CHECK_EQUAL(bad_status, 400);
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_without_candles_keeps_the_previous_contract)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket off{*this, m_path_root / "candles-off", {}, {16}, {}, {true}};
+    const auto [status, snapshot]{ApiCall(off.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK(!snapshot["result"]["status"].exists("observed_candles_max"));
+    const auto [refused, rejection]{ApiCall(off.Endpoint(), "candles", id + ",\"interval\":\"1m\"")};
+    BOOST_CHECK_EQUAL(refused, 400);
+    BOOST_CHECK_EQUAL(rejection["error"].get_str(), "This method is not exposed by the public trading API");
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_candles_are_bounded_and_rate_limited)
+{
+    const std::string id{"\"market_id\":\"" + market.GetHex() + "\""};
+    LiveMarket on{*this, m_path_root / "candles-on", {}, {16}, {}, {true}, {3}};
+    // Past the observed-time warm-up this quorum-holding node stamps live.
+    std::this_thread::sleep_for(std::chrono::milliseconds{4600});
+    on.Deposit();
+    const auto [status, plain]{ApiCall(on.Endpoint(), "snapshot", id)};
+    BOOST_CHECK_EQUAL(status, 200);
+    BOOST_CHECK_EQUAL(plain["result"]["status"]["observed_candles_max"].getInt<int>(), 3);
+    const auto [page_status, page]{ApiCall(on.Endpoint(), "candles", id + ",\"interval\":\"1m\",\"limit\":18446744073709551615")};
+    BOOST_REQUIRE_MESSAGE(page_status == 200, page.write());
+    const auto& result{page["result"]};
+    BOOST_CHECK_EQUAL(result["source"].get_str(), "endpoint_operator");
+    BOOST_CHECK(!result["certified"].get_bool());
+    BOOST_CHECK_EQUAL(result["interval"].get_str(), "1m");
+    // The page is clamped to the advertised three intervals.
+    BOOST_CHECK_EQUAL(result["before_ms"].getInt<int64_t>() - result["from_ms"].getInt<int64_t>(), 3 * 60'000);
+    BOOST_REQUIRE_GE(result["candles"].size(), 1U);
+    const auto& newest{result["candles"][result["candles"].size() - 1]};
+    BOOST_CHECK_EQUAL(newest["last_sequence"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(newest["entries"].getInt<int>(), 1);
+    // Refused before any read: a bad interval or limit.
+    for (const std::string bad : {",\"interval\":\"2m\"", ",\"interval\":\"1m\",\"limit\":0", "", ",\"interval\":\"1m\",\"from\":1"}) {
+        BOOST_TEST_CONTEXT("params" << bad) {
+            const auto [refused, rejection]{ApiCall(on.Endpoint(), "candles", id + bad)};
+            BOOST_CHECK(refused == 400 || refused == 429);
+        }
+    }
+    // At most two pages per second per client: HTTP 429 beyond.
+    std::vector<int> statuses;
+    std::string limited;
+    for (int i{0}; i < 3; ++i) {
+        const auto [code, reply]{ApiCall(on.Endpoint(), "candles", id + ",\"interval\":\"5m\"")};
+        statuses.push_back(code);
+        if (code == 429) limited = reply["error"].get_str();
+    }
+    BOOST_CHECK(std::find(statuses.begin(), statuses.end(), 429) != statuses.end());
+    BOOST_CHECK_EQUAL(limited, node::FLOWMESH_API_CANDLES_BUDGET_ERROR);
 }
 
 namespace {

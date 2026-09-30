@@ -216,13 +216,29 @@ struct FlowMeshTradingApiObservedTime {
     bool enabled{false};
 };
 
+//! Node-local policy for the restricted API's 'candles' method: one page of
+//! this node's operator-observed UTC candles, served from the observed-time
+//! log's memory window only (never the disk), with the "observed_candles_max"
+//! advert (the largest page, at most 500). The candles are computed once per
+//! commit, never per request, and a page is O(its length) to copy; a request
+//! costs one more read token than the admission budget and at most
+//! FLOWMESH_API_CANDLES_PER_CLIENT_PER_SECOND pages per client. Display data,
+//! never certified or evidence. Zero keeps the exact previous contract
+//! ('candles' is not exposed).
+struct FlowMeshTradingApiCandles {
+    size_t max{0};
+};
+inline constexpr size_t FLOWMESH_API_CANDLES_DEFAULT{500};
+inline constexpr unsigned FLOWMESH_API_CANDLES_PER_CLIENT_PER_SECOND{2};
+inline constexpr const char* FLOWMESH_API_CANDLES_BUDGET_ERROR{"Public candles request budget exhausted"};
+
 //! Restricted HTTPS adapter. It holds no wallet and never invokes the RPC table.
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(
     FlowMeshService& service, FlowMeshHttpsServer::Options options,
     FlowMeshAssetMetadataCatalog metadata = {}, FlowMeshTradingApiWait wait = {},
     FlowMeshTradingApiHealth health = {}, FlowMeshTradingApiOutcome outcome = {},
     FlowMeshTradingApiWatch watch = {}, FlowMeshTradingApiTicks ticks = {},
-    FlowMeshTradingApiObservedTime observed = {});
+    FlowMeshTradingApiObservedTime observed = {}, FlowMeshTradingApiCandles candles = {});
 
 //! Shared public projection used by the wallet RPC and restricted endpoint.
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);

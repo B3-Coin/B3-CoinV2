@@ -24,6 +24,7 @@
 #include <flowmesh/action_reason.h>
 #include <flowmesh/client_evidence.h>
 #include <flowmesh/market_view.h>
+#include <flowmesh/observed_time.h>
 #include <flowmesh/outcome_evidence.h>
 #include <flowmesh/production_wire.h>
 #include <hash.h>
@@ -73,6 +74,7 @@ constexpr auto CLIENT_REQUEST_TIMEOUT{std::chrono::seconds{5}};
 // A waited 'action' reply carries at most one hex certified entry.
 constexpr size_t CLIENT_ACTION_WAIT_MAX_REPLY{2 * (flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES + 1024) + 64 * 1024};
 static_assert(CLIENT_ACTION_WAIT_MAX_REPLY <= CLIENT_MAX_REPLY);
+static_assert(FLOWMESH_API_CANDLES_DEFAULT == flowmesh::OBSERVED_CANDLE_PAGE_MAX);
 // An opt-in reply adds at most the consumer's hex entry and two hex evidences.
 constexpr size_t CLIENT_ACTION_OUTCOME_MAX_REPLY{2 * CLIENT_ACTION_WAIT_MAX_REPLY +
                                                  4 * flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES + 64 * 1024};
@@ -92,6 +94,10 @@ constexpr auto API_WAIT_REPLY_RESERVE{std::chrono::milliseconds{1000}};
 //! A spent public 'health' budget: HTTP 429, like the admission budget.
 struct HealthBudgetExhausted : std::runtime_error {
     HealthBudgetExhausted() : std::runtime_error{FLOWMESH_API_HEALTH_BUDGET_ERROR} {}
+};
+//! A spent public 'candles' budget: HTTP 429 as well.
+struct CandlesBudgetExhausted : std::runtime_error {
+    CandlesBudgetExhausted() : std::runtime_error{FLOWMESH_API_CANDLES_BUDGET_ERROR} {}
 };
 void Keys(const UniValue& value, std::initializer_list<const char*> allowed)
 {
@@ -559,6 +565,24 @@ class TradingApi {
     const size_t m_ticks_max;
     // Operator-observed time; disabled keeps the exact previous contract.
     const bool m_observed_time;
+    // Largest 'candles' page; zero keeps the exact previous contract.
+    const size_t m_candles_max;
+    std::mutex m_candles_mutex;
+    //! Per PeerKey, at most 1,024 identities; guarded by m_candles_mutex.
+    std::map<std::string, std::pair<std::chrono::steady_clock::time_point, unsigned>> m_candle_clients;
+    //! Caller holds m_candles_mutex. Charged after Admit, per client address.
+    bool ChargeCandles(const std::string& remote_address)
+    {
+        const auto now{std::chrono::steady_clock::now()};
+        auto key{FlowMeshActionWaitSlots::PeerKey(remote_address)};
+        if (!m_candle_clients.contains(key) && m_candle_clients.size() >= 1024) {
+            std::erase_if(m_candle_clients, [&](const auto& pair) { return now - pair.second.first > std::chrono::minutes{1}; });
+            if (m_candle_clients.size() >= 1024) return false;
+        }
+        auto& bucket{m_candle_clients[std::move(key)]};
+        if (now - bucket.first >= std::chrono::seconds{1}) bucket = {now, 0};
+        return ++bucket.second <= FLOWMESH_API_CANDLES_PER_CLIENT_PER_SECOND;
+    }
     //! A public reply's observed times: labelled as this endpoint's, with
     //! only the clock flags (never a delay reason or anything seat-related).
     static void PublicObservedTimes(flowmesh::MarketData& data)
@@ -635,6 +659,8 @@ class TradingApi {
         if (m_ticks_max) out.pushKV("clearing_ticks_max", uint64_t{m_ticks_max});
         // And for "observed_time" on the same reads.
         if (m_observed_time) out.pushKV("observed_time_v1", true);
+        // The 'candles' method and its largest page.
+        if (m_candles_max) out.pushKV("observed_candles_max", uint64_t{m_candles_max});
         AddReadiness(out, status.market_id, health);
         return out;
     }
@@ -919,7 +945,7 @@ public:
     explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
                         const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome,
                         const FlowMeshTradingApiWatch watch, const FlowMeshTradingApiTicks ticks,
-                        const FlowMeshTradingApiObservedTime observed)
+                        const FlowMeshTradingApiObservedTime observed, const FlowMeshTradingApiCandles candles)
         : m_service(service), m_local(service, std::move(metadata), /*public_api=*/true),
           m_wait_max{wait.waiters == 0 ? std::chrono::milliseconds{0}
                                        : std::clamp(wait.max, std::chrono::milliseconds{0}, FLOWMESH_API_ACTION_WAIT_MAX)},
@@ -933,7 +959,8 @@ public:
           m_watches{m_watch_max.count() ? std::min({watch.watchers, FLOWMESH_API_UPDATES_WATCHERS_MAX,
                                                     FLOWMESH_API_MAX_WAIT_SLOTS - m_waits.Capacity()}) : 0},
           m_health{health.enabled}, m_outcome{outcome.enabled},
-          m_ticks_max{std::min(ticks.max, flowmesh::MARKET_DATA_MAX_TICKS)}, m_observed_time{observed.enabled} {}
+          m_ticks_max{std::min(ticks.max, flowmesh::MARKET_DATA_MAX_TICKS)}, m_observed_time{observed.enabled},
+          m_candles_max{std::min(candles.max, flowmesh::OBSERVED_CANDLE_PAGE_MAX)} {}
     size_t WaitSlots() const { return m_waits.Capacity(); }
     size_t WatchSlots() const { return m_watches.Capacity(); }
     //! Server stop hook: refuse new waits and watches and end every current one.
@@ -1146,6 +1173,32 @@ public:
             if (!value) Fail(error.empty() ? "No connected unconsumed effect" : error);
             return VaultJson(*value);
         }
+        if (method == "candles" && m_candles_max) {
+            // Memory only, never the disk: the observed-time log keeps the
+            // candles up to date at each commit, so a page is only a copy.
+            Keys(params, {"market_id", "interval", "before_ms", "limit"});
+            const auto id{Id(params, "market_id")};
+            const auto interval{flowmesh::ParseCandleInterval(Text(params, "interval", 8))};
+            if (!interval) Fail("Invalid candle interval");
+            const std::optional<int64_t> before{params.exists("before_ms")
+                ? std::optional{static_cast<int64_t>(Number(params, "before_ms", std::numeric_limits<int64_t>::max()))}
+                : std::nullopt};
+            // Any unsigned integer is clamped to the advertised maximum.
+            const uint64_t limit{params.exists("limit") ? Number(params, "limit", std::numeric_limits<uint64_t>::max()) : m_candles_max};
+            if (limit == 0) Fail("Invalid candle limit");
+            {
+                std::lock_guard lock{m_candles_mutex};
+                if (!ChargeCandles(http.remote_address)) throw CandlesBudgetExhausted{};
+            }
+            if (!m_admission.ChargeExtra(http.remote_address, FlowMeshApiRequestClass::READ, std::chrono::steady_clock::now())) {
+                throw CandlesBudgetExhausted{};
+            }
+            std::string error;
+            auto page{m_local.Candles(id, *interval, before, static_cast<size_t>(std::min<uint64_t>(limit, m_candles_max)), error)};
+            if (!page) Fail(error.empty() ? "No observed-time candles are available" : error);
+            page->source = "endpoint_operator";
+            return FlowMeshObservedCandlePageJson(*page);
+        }
         if (method == "health" && m_health) {
             // A local, advisory observation, never evidence. Cheap: leaf
             // mutexes only, never cs_main, a market lock, the store, a wait
@@ -1189,6 +1242,9 @@ public:
             }
             return {200, std::move(body)};
         } catch (const HealthBudgetExhausted& e) {
+            UniValue out{UniValue::VOBJ}; out.pushKV("ok", false); out.pushKV("error", e.what());
+            return {429, out.write()};
+        } catch (const CandlesBudgetExhausted& e) {
             UniValue out{UniValue::VOBJ}; out.pushKV("ok", false); out.pushKV("error", e.what());
             return {429, out.write()};
         } catch (const std::exception& e) {
@@ -3982,10 +4038,11 @@ std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(FlowMeshService& ser
                                                         FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
                                                         const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome,
                                                         const FlowMeshTradingApiWatch watch, const FlowMeshTradingApiTicks ticks,
-                                                        const FlowMeshTradingApiObservedTime observed)
+                                                        const FlowMeshTradingApiObservedTime observed,
+                                                        const FlowMeshTradingApiCandles candles)
 {
     options.max_reply_bytes = CLIENT_MAX_REPLY;
-    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait, health, outcome, watch, ticks, observed)};
+    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait, health, outcome, watch, ticks, observed, candles)};
     // Handshake, read, handler and write concurrency stays at the two workers
     // the API always had. Each wait or watch slot adds a worker that only
     // sleeps in a suspended wait. Disabled waits and watches leave exactly
