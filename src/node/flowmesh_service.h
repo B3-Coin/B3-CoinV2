@@ -30,6 +30,8 @@ class PeerManager;
 
 namespace node {
 
+class FlowMeshObservedTimeStore;
+
 /** Explicit fresh-market selection; exact nonzero 64-hex IDs, no wildcards.
  * Duplicate selections are harmless and configuration order is irrelevant. */
 bool ParseFlowMeshPreagreementMarkets(const std::vector<std::string>& values,
@@ -279,6 +281,8 @@ public:
     //! For tests: how often the seat transition's memos were consulted and
     //! how often they had to recompute.
     FlowMeshServiceMemoCounts MemoCountsForTest() const;
+    //! For tests: the display-only observed-time store.
+    FlowMeshObservedTimeStore& ObservedTimeStoreForTest() const;
     bool ArmSeatKeys(std::vector<bls::SecretKey> keys, std::string& error,
                      const std::optional<uint256>& expected_fingerprint = std::nullopt,
                      FlowMeshSeatKeyStatus* result = nullptr);

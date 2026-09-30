@@ -222,7 +222,8 @@ public:
     FlowMeshObservedTimeStore& operator=(const FlowMeshObservedTimeStore&) = delete;
 
     //! Opens the database, wiping and recreating a corrupt one. False (and
-    //! memory-only logs) only when even that fails. Never throws.
+    //! memory-only logs) only when even that fails. Never throws. The flush
+    //! thread calls it when it starts, before its first flush or load.
     bool Open(std::string& error);
     bool IsOpen() const;
     /** Queues `log` (a fresh one) and returns at once: no disk access and
@@ -236,6 +237,7 @@ public:
      * of the market's disk candles. Never throws. */
     void Attach(const std::shared_ptr<FlowMeshObservedTimeLog>& log, uint64_t store_next_sequence,
                 const std::vector<std::pair<uint64_t, uint256>>& known) noexcept;
+    //! Starts the flush thread, which opens the database first.
     void Start();
     //! Stops the flush thread, then flushes every log once, synced.
     void Stop();

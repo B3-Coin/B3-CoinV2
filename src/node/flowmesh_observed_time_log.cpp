@@ -647,6 +647,12 @@ void FlowMeshObservedTimeStore::Stop()
 void FlowMeshObservedTimeStore::FlushLoop()
 {
     util::ThreadRename("flowmesh-obstime");
+    // Opened here, never on the service's start path (display data only:
+    // a failure leaves every log in memory).
+    if (!IsOpen()) {
+        std::string error;
+        Open(error);
+    }
     std::unique_lock lock{m_mutex};
     while (!m_stopping) {
         // A queued market is loaded at once, not after the interval.

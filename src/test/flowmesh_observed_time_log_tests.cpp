@@ -1076,6 +1076,33 @@ BOOST_AUTO_TEST_CASE(concurrent_attach_record_read_and_flush_stress)
     BOOST_CHECK(!store.ReadCandles(first, CandleInterval::M1, 0, T0 + 86'400'000, 50).empty());
 }
 
+// Start opens the database on the store's own thread, before its first
+// flush or load: a market attached before it is loaded and persisted.
+BOOST_AUTO_TEST_CASE(the_store_thread_opens_its_database)
+{
+    const auto path{m_path_root / "observed_thread_open"};
+    FakeClocks clocks;
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        BOOST_CHECK(!store.IsOpen());
+        const auto log{MakeLog(clocks)};
+        store.Attach(log, 0, {});
+        log->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0));
+        store.Start();
+        store.Stop();
+        BOOST_CHECK(store.IsOpen());
+        BOOST_CHECK(log->GetSummary().persisted);
+        BOOST_CHECK_EQUAL(log->Lookup(Known(0, 1)).size(), 1U);
+    }
+    FlowMeshObservedTimeStore store{Options(path)};
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 1, Known(0, 1));
+    store.Start();
+    store.Stop();
+    BOOST_CHECK_EQUAL(log->Lookup(Known(0, 1)).size(), 1U);
+    BOOST_CHECK_EQUAL(log->GetSummary().recorded_since.value_or(99), 0U);
+}
+
 // A log given its history after entries were recorded ends exactly as one
 // loaded before them with the same clock readings (the same stamps, memory
 // candles, candles and rows to persist, recorded_since), whether the clock

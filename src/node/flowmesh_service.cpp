@@ -1955,12 +1955,10 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
     config.cancel_delivery = [impl = m_impl.get()](uint64_t delivery_id) {
         impl->CancelDelivery(delivery_id);
     };
-    {
-        // Display only: an unusable database leaves observed time in memory.
-        std::string observed_error;
-        m_impl->observed_store->Open(observed_error);
-        m_impl->observed_store->Start();
-    }
+    // Display only: the store's own thread opens its database (an unusable
+    // one leaves observed time in memory), never this start path, which
+    // holds the B3 reconciliation gate closed.
+    m_impl->observed_store->Start();
     auto runtime{std::make_shared<FlowMeshRuntime>(
         std::move(config), std::vector<FlowMeshRuntimeMarketConfig>{})};
     if (!runtime->Start(error)) {
@@ -2551,6 +2549,11 @@ FlowMeshSeatKeyStatus FlowMeshService::SeatKeyStatus() const
 uint64_t FlowMeshService::ClientOutcomeReadsForTest() const
 {
     return m_impl->client_outcome_reads.load(std::memory_order_relaxed);
+}
+
+FlowMeshObservedTimeStore& FlowMeshService::ObservedTimeStoreForTest() const
+{
+    return *m_impl->observed_store;
 }
 
 FlowMeshServiceMemoCounts FlowMeshService::MemoCountsForTest() const
