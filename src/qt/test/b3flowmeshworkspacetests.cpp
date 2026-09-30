@@ -2279,6 +2279,73 @@ private Q_SLOTS:
         for (auto* field : prices()) { QVERIFY(field->text().isEmpty()); QVERIFY(!field->isUndoAvailable()); QVERIFY(!field->isRedoAvailable()); }
         QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
     }
+    void aMarketOrWalletChangeClearsTheTicket()
+    {
+        // Ticket prices are B3 per token of the selected market and its
+        // quantities are that token: a market the user picks, a selection the
+        // catalog moves, or a wallet switch clears them all with their
+        // history. The same market read again (a new account row too) keeps them.
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        const auto entries = [&] {
+            std::vector<QLineEdit*> out{panel.m_price, panel.m_quantity};
+            for (size_t i{0}; i < panel.m_ladder_prices.size(); ++i) { out.push_back(panel.m_ladder_prices[i]); out.push_back(panel.m_ladder_quantities[i]); }
+            return out;
+        };
+        const auto fill = [&] {
+            panel.m_ladder->setChecked(true);
+            for (auto* field : entries()) field->setText(QString{});
+            QTest::keyClicks(panel.m_price, QStringLiteral("1")); QTest::keyClicks(panel.m_quantity, QStringLiteral("0.3"));
+            QTest::keyClicks(panel.m_ladder_prices[0], QStringLiteral("0.5")); QTest::keyClicks(panel.m_ladder_quantities[0], QStringLiteral("0.2"));
+            // Typed, then undone: an empty field whose redo would bring it back.
+            QTest::keyClicks(panel.m_ladder_prices[1], QStringLiteral("0.4")); panel.m_ladder_prices[1]->undo();
+        };
+        const auto cleared = [&] {
+            for (auto* field : entries()) if (!field->text().isEmpty() || field->isUndoAvailable() || field->isRedoAvailable()) return false;
+            return true;
+        };
+        const auto other_of = [](const B3FlowMeshTrading::Market& market) {
+            auto other{market};
+            other.base = QString::fromStdString(H(90).GetHex());
+            other.id = QString::fromStdString(flowmesh::ComputeFlowMeshMarketId(H(1), H(90))->GetHex());
+            other.vault = QString::fromStdString(flowmesh::ComputeFlowMeshVaultId(H(1), *uint256::FromHex(other.id.toStdString()))->GetHex());
+            return other;
+        };
+        // 1) The same market, even with another account row: kept.
+        Observe(panel, Parse(RemoteData()));
+        const auto original{panel.m_market_data.front()}; const auto other{other_of(original)};
+        fill();
+        QVERIFY(!cleared());
+        B3FlowMeshTradingPanel::Result same; auto renamed{original}; renamed.account = QString::fromStdString(H(93).GetHex());
+        same.markets = {renamed, other};
+        panel.applyMarketCatalog(same);
+        QVERIFY(panel.market()); QCOMPARE(panel.market()->id, original.id);
+        QCOMPARE(panel.m_price->text(), QStringLiteral("1")); QCOMPARE(panel.m_ladder_prices[0]->text(), QStringLiteral("0.5"));
+        QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.3")); QCOMPARE(panel.m_ladder_quantities[0]->text(), QStringLiteral("0.2"));
+        // 2) The catalog no longer lists the selected market: the selection moves, the ticket clears.
+        B3FlowMeshTradingPanel::Result moved; moved.markets = {other};
+        panel.applyMarketCatalog(moved);
+        QVERIFY(panel.market()); QCOMPARE(panel.market()->id, other.id);
+        QVERIFY(cleared());
+        // 3) A market the user picks, through the real selection callback
+        // (a modelled read in flight keeps it from starting a real one).
+        Observe(panel, Parse(RemoteData()));
+        panel.m_market_data.push_back(other_of(panel.m_market_data.front()));
+        { QSignalBlocker blocked{panel.m_market}; panel.m_market->addItem(QStringLiteral("Other synthetic market"), other.id); }
+        fill();
+        QVERIFY(!cleared());
+        ReadInFlight(panel);
+        panel.m_market->setCurrentIndex(1);
+        QVERIFY(panel.market()); QCOMPARE(panel.market()->id, other.id);
+        QVERIFY(cleared());
+        // 4) A wallet switch (its market list is read again, the first selected).
+        Observe(panel, Parse(RemoteData()));
+        fill();
+        QVERIFY(!cleared());
+        panel.setWalletModel(nullptr);
+        QVERIFY(cleared());
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
     void ladderOrdersAreBookLevelsForTheMarketableLimit()
     {
         // Another account's ask ladder is exact limit liquidity, so the book

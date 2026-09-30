@@ -413,6 +413,10 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         if (m_active_result && m_active_result->passive) m_yield_refresh->store(true);
         resetRefreshSchedule();
         m_deferred_status.reset(); // A queued click never follows a market switch.
+        // The ticket was typed for the market left: its prices and quantities
+        // are never read in another token. (Internal list updates block this
+        // signal, so this runs only for a market the user picked.)
+        clearTicketEntries();
         // A failed read/backoff belongs to its selected market. Another listed
         // market may already have a certified head and can be read immediately.
         m_read_error.clear(); m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_attempt_age.invalidate();
@@ -505,6 +509,10 @@ void B3FlowMeshTradingPanel::setWalletModel(WalletModel* wallet)
     m_request_seen.clear(); m_request_order.clear(); m_requests_seeded = false; m_last_settled.invalidate();
     m_toasts->clear(); m_link_toast_down = false; m_link_toast_age.invalidate();
     m_amount->clear(); m_withdrawal_draft_amount.clear(); m_destination->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
+    // The market list is cleared below with its signal blocked and read
+    // again for this wallet, its first market selected: the previous
+    // wallet's ticket is never read in that market.
+    clearTicketEntries();
     m_client_info.reset(); m_connection_error.clear(); m_connect_error.clear();
     { QSignalBlocker blocker{m_saved_selector}; m_saved_selector->clear(); }
     m_receipt_card->setText(wallet ? tr("Loading this wallet's locally saved requests. No action is automatically resent.") : tr("Open a wallet to inspect its saved requests."));
@@ -1033,7 +1041,7 @@ std::optional<std::vector<flowmesh::LadderStep>> B3FlowMeshTradingPanel::ladderS
     if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->units.known) return fail(tr("Verified asset precision is required."));
     const auto& units{m_snapshot->units};
     const bool buy{m_side->currentIndex() == 0}, inverse{inverted()};
-    // The prices a view change clears are exactly the ones read here.
+    // The prices a view, market or wallet change clears are exactly the ones read here.
     const auto prices{ticketPriceFields()};
     std::vector<std::pair<QLineEdit*, QLineEdit*>> rows{{prices[0], m_quantity}};
     for (size_t i{0}; i < m_ladder_quantities.size(); ++i) rows.emplace_back(prices[i + 1], m_ladder_quantities[i]);
@@ -1083,6 +1091,15 @@ void B3FlowMeshTradingPanel::clearTicketPrices()
     // the old text back to be read in the other unit. setText drops the
     // whole history, even when the field is already empty.
     for (auto* field : ticketPriceFields()) field->setText(QString{});
+}
+
+void B3FlowMeshTradingPanel::clearTicketEntries()
+{
+    // A market's prices are B3 per its token and its quantities are that
+    // token: none is read in another market. setText, like clearTicketPrices.
+    clearTicketPrices();
+    m_quantity->setText(QString{});
+    for (auto* field : m_ladder_quantities) field->setText(QString{});
 }
 
 flowmesh::LevelGrouping B3FlowMeshTradingPanel::bookGrouping() const
@@ -3071,6 +3088,11 @@ void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
     if (route_asset && selection.isEmpty()) notice(tr("No established market was reported for the selected asset. This panel does not bootstrap one."));
     if (result.catalog) m_catalog_age.restart();
     const auto selected{market()};
+    // A selection this catalog moved (the market left the catalog, an asset
+    // was routed) never reads the ticket typed for the market it left. Only
+    // the market's identity counts: a new account row of the same market
+    // (the first admission) keeps a typed order.
+    if (previous_market && (!selected || previous_market->id != selected->id || previous_market->base != selected->base)) clearTicketEntries();
     if (previous_market && (!selected || previous_market->id != selected->id || previous_market->base != selected->base ||
         previous_market->vault != selected->vault || previous_market->domain != selected->domain ||
         previous_market->config != selected->config || previous_market->account != selected->account || previous_market->remote != selected->remote)) {
