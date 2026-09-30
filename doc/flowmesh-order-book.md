@@ -112,11 +112,13 @@ any of those servers already serves.
   the canonical view (every on-grid price exact, e.g. `1.000` at 0.001 B3),
   the step's places when grouped (`1.00` at 0.01, `0.9900` at 0.0001). In
   the B3 view with one level per canonical price, token-per-B3 prices do not
-  end, so each label is rounded to the fewest places at which every label
-  still reads back through `ParseDisplayLimit` as exactly its own canonical
-  price (for the side a click on it naturally takes), a sell level up and a
-  buy level down: the direction every order of the level accepts, as for
-  grouped edges. "≈" is then said once, in the Price header (its tooltip
+  end, so each label is rounded to the fewest places at which every label,
+  and the label of each neighbouring tick, still reads back through
+  `ParseDisplayLimit` as exactly its own canonical price (for the side a
+  click on it naturally takes): the B3 view's tick precision at the prices
+  shown, even when those prices end early (1000 atoms is exactly 1, shown
+  `1.000` beside 799-801). A sell level rounds up and a buy level down: the
+  direction every order of the level accepts, as for grouped edges. "≈" is then said once, in the Price header (its tooltip
   states the rule), never per row; each rounded level keeps its exact price
   in its tooltip and says "about" to a screen reader. Size and Total share
   one count: the places the held levels need. The fallback projection

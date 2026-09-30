@@ -80,7 +80,10 @@ Wide AsWide(const CAmount amount) { return Wide{static_cast<uint64_t>(std::max<C
 //! label, rounded in the direction every order of its level accepts (a
 //! displayed sell up, a displayed buy down), reads back through
 //! ParseDisplayLimit, for the side a click on it naturally takes, as exactly
-//! its own canonical price, so no two levels of a side share a label.
+//! its own canonical price, so no two levels of a side share a label; and so
+//! would the labels of its neighbouring ticks, so the column resolves one
+//! tick at the prices it shows (the B3 view's tick precision) even when
+//! those prices happen to end early (1000 atoms: exactly 1).
 struct PriceColumn {
     int places{0};
     //! Inverse labels that read back as no exact price even at 18 places
@@ -103,20 +106,29 @@ PriceColumn ChoosePriceColumn(const Units& u, const bool inverse, const flowmesh
         for (const auto& [price, up] : labels) out.places = std::max(out.places, NeededDecimals(AsWide(price), 9 - u.decimals));
         return out;
     }
-    for (const auto& [price, up] : labels) {
-        if (price <= 0) continue;
-        const int before{out.places};
-        for (;;) {
-            const auto text{FixedDisplayPrice(price, u.decimals, true, out.places, up)};
+    // The fewest places from `from` at which `price`'s label reads back.
+    const auto places_for = [&](const CAmount price, const bool up, const int from) -> std::optional<int> {
+        for (int places{from}; places <= 18; ++places) {
+            const auto text{FixedDisplayPrice(price, u.decimals, true, places, up)};
             // A displayed sell's label is clicked to buy B3, a displayed buy's to sell it.
             const auto back{text.isEmpty() ? std::nullopt : ParseDisplayLimit(text, u, true, /*display_buy=*/up)};
-            if (back && back->price == price) break;
-            if (out.places == 18) {
-                out.unmapped.emplace(price, up);
-                out.places = before;
-                break;
-            }
-            ++out.places;
+            if (back && back->price == price) return places;
+        }
+        return std::nullopt;
+    };
+    const CAmount step{std::max<CAmount>(1, u.price_step)};
+    for (const auto& [price, up] : labels) {
+        if (price <= 0) continue;
+        const auto own{places_for(price, up, out.places)};
+        if (!own) {
+            out.unmapped.emplace(price, up);
+            continue;
+        }
+        out.places = *own;
+        // Its neighbouring ticks: never a reason to mark this label.
+        for (const CAmount neighbour : {price > step ? price - step : CAmount{0}, price <= MAX_MONEY - step ? price + step : CAmount{0}}) {
+            if (neighbour <= 0) continue;
+            if (const auto places{places_for(neighbour, up, out.places)}) out.places = *places;
         }
     }
     return out;

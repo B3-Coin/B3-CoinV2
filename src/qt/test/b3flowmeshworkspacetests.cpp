@@ -1442,6 +1442,19 @@ private Q_SLOTS:
         QCOMPARE(CheckOneDecimalCountPerColumn(book), 4);
         QCOMPARE(model->row(model->spreadRow() - 1).price, QStringLiteral("1.0000"));
         QCOMPARE(header(0), QStringLiteral("Price (tUSD)"));
+        // Prices that happen to end early (800 atoms: 1.25; 1000: 1) still
+        // show the tick precision around them: telling 799, 800 and 801
+        // apart needs three places, not the two those prices alone would.
+        {
+            auto short_book{SyntheticLimitBook(1)};
+            short_book.curves = {LimitCurve("bid", 20, 800, 100'000), LimitCurve("ask", 80, 1000, 100'000)};
+            book.setSnapshot(WithLevels(short_book, {}, H(20)), true);
+            QVERIFY(book.showsVerifiedLevels());
+            QCOMPARE(CheckOneDecimalCountPerColumn(book), 3);
+            QCOMPARE(model->row(model->spreadRow() - 1).price, QStringLiteral("1.250"));
+            QCOMPARE(model->row(model->spreadRow() + 1).price, QStringLiteral("1.000"));
+            QCOMPARE(header(0), QStringLiteral("Price (tUSD)"));
+        }
         // Without the node's levels the fallback rows follow the same rule.
         book.setSnapshot(SyntheticLimitBook(16), true);
         QVERIFY(!book.showsVerifiedLevels());
