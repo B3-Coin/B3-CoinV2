@@ -7176,8 +7176,9 @@ private Q_SLOTS:
             // The order book: the node's exact levels of 24 accounts' limit
             // orders, a four-price ladder per side and the viewer's own bid,
             // laid out as Hyperliquid's, beside UTC candles and the tape.
-            // Tall enough for the ladder to hold ten levels a side.
-            B3FlowMeshTradingPanel book; book.resize(1320, 1320); book.m_timer->stop();
+            // At the standard 1320 x 940, as the owner sees it: the ladder
+            // holds at least ten levels a side.
+            B3FlowMeshTradingPanel book; book.resize(1320, 940); book.m_timer->stop();
             ShowSyntheticTimeMarket(book, SyntheticSource::LOCAL);
             QCoreApplication::processEvents();
             QVERIFY(book.m_order_book->showsVerifiedLevels());
@@ -7247,7 +7248,7 @@ private Q_SLOTS:
             // them (a partial fill each, a new price every third). The book
             // updates in place and flashes new prices; renders stay at the
             // update rate.
-            B3FlowMeshTradingPanel live; live.resize(1320, 1320); live.m_timer->stop();
+            B3FlowMeshTradingPanel live; live.resize(1320, 940); live.m_timer->stop();
             ShowSyntheticTimeMarket(live, SyntheticSource::LOCAL);
             live.m_client_info = [] { UniValue info{UniValue::VOBJ}; info.pushKV("backend", "local"); info.pushKV("engine_enabled", true); info.pushKV("endpoints", UniValue{UniValue::VARR}); return info; }();
             QApplication::setEffectEnabled(Qt::UI_General, true); B3FlowMeshOrderBook::SetAnimationSetting(true);
