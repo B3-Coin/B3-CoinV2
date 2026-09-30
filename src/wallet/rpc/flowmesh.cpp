@@ -1308,7 +1308,7 @@ RPCHelpMan getflowmeshmarketdata()
                         {T::ARR, "flags", "clock_clamped, clock_step, clock_suspect, restart, no_clearing_data or implausible (a failed plausibility check of an endpoint's stamp)", {
                             {T::STR, "", "Flag"},
                         }},
-                        {T::STR, "delay_reason", /*optional=*/true, "Why this node applied it late: catchup, deferred, behind, peer_hint, stale_anchor, warmup or clock_stepped_back"},
+                        {T::STR, "delay_reason", /*optional=*/true, "Why this node applied it late: catchup, deferred, behind, stale_anchor, warmup or clock_stepped_back (peer_hint only on a row an earlier development build recorded)"},
                     }},
                 }},
             }},

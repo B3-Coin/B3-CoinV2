@@ -7348,6 +7348,40 @@ BOOST_AUTO_TEST_CASE(observed_time_warmup_starts_within_a_tick_of_catching_up)
     }
 }
 
+BOOST_AUTO_TEST_CASE(observed_time_ignores_an_unverified_peer_hint)
+{
+    ObservedTestClock clock;
+    const auto log{ObservedLogFor(clock)};
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_observed_hint", log, 4};
+    f.chain.m_current = f.entries.front().anchor;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    // One peer announces a head far ahead and keeps it alive (a hint lasts
+    // HINT_TTL). Unverified, it is shown as a hint but neither holds back
+    // the warm-up nor delays a stamp: any one peer could otherwise keep this
+    // node's times delayed for as long as it keeps saying so.
+    f.Hello(8, 999);
+    WarmObservedTime(f, clock);
+    const auto health{f.Health()};
+    BOOST_CHECK_EQUAL(f.Lag(health).peers_hinting_ahead, 1U);
+    BOOST_CHECK_EQUAL(f.Lag(health).peer_hint_next_sequence.value_or(0), 999U);
+    BOOST_CHECK(!f.Lag(health).proven_target);
+    for (const uint64_t sequence : {0U, 1U}) {
+        f.Certificate(9, sequence);
+        const auto stamp{ObservedAt(*log, f, sequence)};
+        BOOST_CHECK(stamp.mode == flowmesh::ObservedMode::LIVE);
+        BOOST_CHECK_MESSAGE(stamp.delay == flowmesh::ObservedDelay::NONE, flowmesh::ObservedDelayName(stamp.delay));
+    }
+    BOOST_CHECK_EQUAL(f.Lag(f.Health()).peers_hinting_ahead, 1U);
+    // A verified certificate beyond the head still proves the lag: the
+    // catch-up that follows is recorded late.
+    f.Certificate(9, 3);
+    BOOST_CHECK(f.Lag(f.Health()).proven_target);
+    BOOST_REQUIRE_GE(f.Gets(9), 1U);
+    f.Entries(9, 2, {f.payloads[2]});
+    BOOST_CHECK(ObservedAt(*log, f, 2).mode == flowmesh::ObservedMode::DELAYED);
+}
+
 BOOST_AUTO_TEST_CASE(observed_time_marks_a_reconciliation_deferred_certificate_late)
 {
     ObservedTestClock clock;

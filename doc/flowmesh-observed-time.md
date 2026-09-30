@@ -25,16 +25,24 @@ node records a stamp for the entry: `{sequence, hash, mode, ms, flags}`.
 An entry is `delayed` when any of these holds: it came from a catch-up page; a
 certificate, proposal, attestation or agreement frame of its slot waited for B3
 reconciliation (a per-market watermark, raised at most 16 past the head by an
-unverified deferred frame); this node holds a verified certificate, or a peer
-hint announces a head, **more than one entry beyond** the one being committed
-(a peer level with it is not ahead); its anchor is more than two blocks behind
-the current acceptable anchor; or the node has not been caught up for the
-warm-up, `max(2 s, 2 x round timeout)` (4 s by default). Caught up means ready,
-not halted, chain gate open, a connected FlowMesh peer (or a local signing
-quorum), no proven lag and no hint more than one entry ahead; an interruption
-shorter than one round timeout (a brief B3 reconciliation, a lag resolved within
-a round) does not restart the warm-up. Whether this node signed an entry is not
-an input: nothing observable can reveal a seat.
+unverified deferred frame); this node holds a BLS-verified certificate **more
+than one entry beyond** the one being committed (one for that entry itself is
+level with it, not ahead); its anchor is more than two blocks behind the
+current acceptable anchor; or the node has not been caught up for the warm-up,
+`max(2 s, 2 x round timeout)` (4 s by default). Caught up means ready, not
+halted, chain gate open, a connected FlowMesh peer (or a local signing quorum)
+and no proven lag; an interruption shorter than one round timeout (a brief B3
+reconciliation, a lag resolved within a round) does not restart the warm-up.
+The warm-up is observed on every runtime tick (the chain gate, which takes the
+chain lock, is read at most once a second while it is open and on every tick
+while it is closed), so it starts within a tick of the node catching up.
+
+Two things are deliberately not inputs. Whether this node signed an entry:
+nothing observable can reveal a seat. And an unverified peer HELLO hint of a
+higher head: any one connected peer could otherwise keep a node's stamps
+(and so its candles and tape times) delayed indefinitely by re-announcing a
+head it does not have. Hints stay display only, as for readiness; a real lag
+is proven by a verified certificate, and a catch-up is recorded late anyway.
 
 Clocks: a backward wall-clock step of at most 1 s is held at the previous stamp
 (`clock_clamped`); a larger one records entries `untimed` until the clock passes

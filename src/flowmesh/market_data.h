@@ -319,9 +319,9 @@ enum class ObservedMode : uint8_t {
     //! Applied while the node was caught up with the network: its
     //! observation of the entry as it was certified.
     LIVE = 1,
-    //! Applied late (catch-up, a deferral, a proven or hinted lag, a stale
-    //! anchor, or the warm-up after start): `ms` is only when the node
-    //! applied it, an upper bound, never a trade time.
+    //! Applied late (catch-up, a deferral, a proven lag, a stale anchor, or
+    //! the warm-up after start): `ms` is only when the node applied it, an
+    //! upper bound, never a trade time.
     DELAYED = 2,
     //! Applied while the wall clock stood more than the slew tolerance
     //! behind an earlier stamp: no time at all.
@@ -339,7 +339,8 @@ inline const char* ObservedModeName(const ObservedMode mode)
 }
 
 //! Why an entry is not LIVE (NONE for a LIVE one). Local detail only: never
-//! in a public reply.
+//! in a public reply. HINT is no longer recorded (an unverified peer hint
+//! decides nothing); it names rows an earlier build of this branch stored.
 enum class ObservedDelay : uint8_t { NONE, CATCHUP, DEFERRED, BEHIND, HINT, STALE_ANCHOR, WARMUP, CLOCK_BACK };
 
 inline const char* ObservedDelayName(const ObservedDelay delay)

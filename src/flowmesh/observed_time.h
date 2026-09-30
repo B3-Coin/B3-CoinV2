@@ -55,10 +55,10 @@ struct ObservedLivenessInputs {
     //! waited for B3 reconciliation (deferred), if any.
     std::optional<uint64_t> deferred_watermark;
     //! One past the highest BLS-verified certificate held for a sequence not
-    //! applied yet (FlowMeshLagSummary::proven_target).
+    //! applied yet (FlowMeshLagSummary::proven_target). An unverified peer
+    //! HELLO hint is never an input: any one peer could otherwise keep
+    //! every stamp delayed by announcing a head it does not have.
     std::optional<uint64_t> proven_target;
-    //! The highest next sequence an (unverified) peer hint announced.
-    std::optional<uint64_t> hint_next;
     //! The entry's anchor is more than a small margin behind the current
     //! acceptable anchor: it was proposed well before now.
     bool anchor_stale{false};
@@ -66,9 +66,9 @@ struct ObservedLivenessInputs {
     bool warm{false};
 };
 
-/** NONE (LIVE) only when nothing says the entry is late. A peer holding
- * exactly the entry being committed (announcing sequence + 1) is level with
- * this node, not ahead of it. */
+/** NONE (LIVE) only when nothing proven or observed here says the entry is
+ * late. A verified certificate for exactly the entry being committed
+ * (proven target sequence + 1) is level with this node, not ahead of it. */
 ObservedDelay ClassifyObservedLiveness(const ObservedLivenessInputs& inputs) noexcept;
 
 /** Since when the market has been caught up, continuously. Observed by the

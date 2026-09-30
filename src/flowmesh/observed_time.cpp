@@ -62,7 +62,6 @@ ObservedDelay ClassifyObservedLiveness(const ObservedLivenessInputs& in) noexcep
     // A certificate held for a later sequence: this entry was certified at
     // least a round before this node applied it.
     if (in.proven_target && *in.proven_target > next) return ObservedDelay::BEHIND;
-    if (in.hint_next && *in.hint_next > next) return ObservedDelay::HINT;
     if (in.anchor_stale) return ObservedDelay::STALE_ANCHOR;
     if (!in.warm) return ObservedDelay::WARMUP;
     return ObservedDelay::NONE;

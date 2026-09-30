@@ -241,12 +241,6 @@ BOOST_AUTO_TEST_CASE(liveness_classifier_matrix)
     in.proven_target = 102;
     BOOST_CHECK(flowmesh::ClassifyObservedLiveness(in) == ObservedDelay::BEHIND);
     in = base;
-    // A peer level with this entry (announcing 101) is not ahead.
-    in.hint_next = 101;
-    BOOST_CHECK(flowmesh::ClassifyObservedLiveness(in) == ObservedDelay::NONE);
-    in.hint_next = 102;
-    BOOST_CHECK(flowmesh::ClassifyObservedLiveness(in) == ObservedDelay::HINT);
-    in = base;
     in.anchor_stale = true;
     BOOST_CHECK(flowmesh::ClassifyObservedLiveness(in) == ObservedDelay::STALE_ANCHOR);
     in = base;

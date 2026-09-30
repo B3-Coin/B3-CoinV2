@@ -1553,7 +1553,6 @@ void RecordObservedTime(Market& market, const flowmesh::ProductionEntryCore& ent
         inputs.from_catchup = from_catchup;
         inputs.deferred_watermark = market.observed_deferred_watermark;
         inputs.proven_target = lag.proven_target;
-        inputs.hint_next = lag.peer_hint_next_sequence;
         inputs.anchor_stale = entry.sequence > 0 && market.observed_anchor_height &&
                               entry.anchor.height < *market.observed_anchor_height - OBSERVED_ANCHOR_MARGIN;
         inputs.warm = market.observed_warmup.Warm(market.clock->Now(), flowmesh::ObservedWarmupFor(market.round_timeout));
@@ -4607,15 +4606,14 @@ void FlowMeshRuntime::ObserveTimeMaintenance(const size_t connected_peers)
         if (!market.observed) continue;
         if (gate_open) market.observed_anchor_height = m_observed_gate->anchor_height;
         const auto lag{market.lag.Summary()};
-        const uint64_t next{market.next_sequence};
         // Without a peer only a node that certifies alone (a local quorum,
         // regtest) can be applying entries as they are certified.
         const bool reachable{connected_peers > 0 ||
                              (market.ready && LocalSeatKeys(market).size() >= flowmesh::FlowMeshBlsThreshold(market.seats.Size()))};
+        // Unverified HELLO hints are not an input (as for readiness): only a
+        // proven lag interrupts it.
         const bool caught_up{market.ready && market.halt == FlowMeshRuntimeHalt::NONE && gate_open && reachable &&
-                             !lag.proven_target &&
-                             !(lag.peer_hint_next_sequence && next < std::numeric_limits<uint64_t>::max() &&
-                               *lag.peer_hint_next_sequence > next + 1)};
+                             !lag.proven_target};
         // A lag or gate closure shorter than one round does not restart it.
         market.observed_warmup.Observe(caught_up, now, market.round_timeout);
     }
