@@ -148,10 +148,13 @@ the last one held and, while the ticket holds an order that parses, for its
 indicative clearing. When the held ticks reach the displayed head:
 
 - a strip under the chart shows the latest auction, for example
-  "Auction #2 · 0.25 tUSD at 1 B3 / tUSD · buyers left 0.05 tUSD unfilled"
-  ("B3 sellers" in the B3 view; "endpoint-reported" for a remote client);
-- the chart draws the same actual clearings over up to 256 microblocks instead
-  of the 100-row history page.
+  "Last auction 12:34:56 · 0.25 tUSD at 1 B3 / tUSD · buyers left 0.05 tUSD
+  unfilled" ("B3 sellers" in the B3 view; "endpoint-reported" for a remote
+  client; the time only when the serving node observed it live, the auction
+  number in the tooltip; see `flowmesh-observed-time.md`);
+- without observed times, the chart draws the same actual clearings in
+  auction order over up to 256 auctions instead of the 100-row history page;
+  with them it draws UTC time candles.
 
 Under the ticket, the indicative line appears only for the order it was
 computed for ("Indicative, not certified: would clear at ... filling ... if
@@ -175,7 +178,8 @@ Wallet RPC callers that pass neither option get byte-identical replies.
   separate persistence and Qt restore path).
 - Aggregated book buckets, on the node or the public API.
 - Indicative clearing including uncertified pool actions, certified chart time
-  and per-tick verified outcomes for remote clients.
+  and per-tick verified outcomes for remote clients. (Operator-observed chart
+  time is in `flowmesh-observed-time.md`.)
 
 ## 6. Tests
 
