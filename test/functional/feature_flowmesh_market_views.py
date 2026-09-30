@@ -200,23 +200,32 @@ class FlowMeshMarketViewsTest(FlowMeshLiquidityTest):
     def check_levels(self, market, groupings):
         """The local engine's levels equal the ones computed here from every
         paged curve; the client's, from its verified state, equal them at the
-        same head (own shares are each wallet's)."""
+        same head (own shares are each wallet's). Every grouping is compared,
+        all at one head: a read that sees the head move is taken again, never
+        skipped."""
         n0 = self.nodes[0]
+        compared = []
         for group, ticks in groupings:
             levels = {"depth": 50, **({"group": group} if group else {})}
+            seen = {}
 
-            def same_head():
+            def at_one_head():
                 self.pump_b3()
                 local = n0.getflowmeshmarketdata(market, {"limit": 1, "curve_limit": 1, "levels": levels})
+                head = local["snapshot"]["last_microblock_hash"]
                 remote = self.client.getflowmeshmarketdata(market, {"limit": 1, "curve_limit": 1, "levels": levels})
-                if local["snapshot"]["last_microblock_hash"] != remote["snapshot"]["last_microblock_hash"]:
-                    return None
-                return local, remote
-            self.wait_until(lambda: same_head() is not None, timeout=60, check_interval=.2)
-            local, remote = same_head()
-            head, curves = self.all_curves(n0, market)
-            if head != local["snapshot"]["last_microblock_hash"]:
-                continue
+                if remote["snapshot"]["last_microblock_hash"] != head:
+                    return False
+                paged_head, curves = self.all_curves(n0, market)
+                # Light polls at that head: levels only when asked again.
+                light = n0.getflowmeshmarketdata(market, {"known_head": head, "levels": levels})
+                asked = n0.getflowmeshmarketdata(market, {"known_head": head, "levels": {**levels, "include_unchanged": True}})
+                if paged_head != head or not light["unchanged"] or not asked["unchanged"]:
+                    return False
+                seen.update(local=local, remote=remote, head=head, curves=curves, light=light, asked=asked)
+                return True
+            self.wait_until(at_one_head, timeout=60, check_interval=.2)
+            local, remote, head, curves = seen["local"], seen["remote"], seen["head"], seen["curves"]
             for data in (local, remote):
                 view = data["book_levels"]
                 assert_equal((view["available"], view["certified"], view["excludes_pending_actions"], view["basis"], view["head"]),
@@ -237,16 +246,16 @@ class FlowMeshMarketViewsTest(FlowMeshLiquidityTest):
             strip = lambda view: {**view, "bids": {**view["bids"], "levels": [{**row, "own": 0} for row in view["bids"]["levels"]]},
                                   "asks": {**view["asks"], "levels": [{**row, "own": 0} for row in view["asks"]["levels"]]}}
             assert_equal(strip(local["book_levels"]), strip(remote["book_levels"]))
-            # A light poll carries levels only when asked.
-            light = n0.getflowmeshmarketdata(market, {"known_head": head, "levels": levels})
-            if light["unchanged"]:
-                assert "book_levels" not in light
-                asked = n0.getflowmeshmarketdata(market, {"known_head": head, "levels": {**levels, "include_unchanged": True}})
-                if asked["unchanged"]:
-                    assert_equal(asked["book_levels"], local["book_levels"])
-        return local["book_levels"]
+            assert "book_levels" not in seen["light"]
+            assert_equal(seen["asked"]["book_levels"], local["book_levels"])
+            compared.append(group)
+        # Every grouping asked for was compared.
+        assert_equal(compared, [group for group, _ in groupings])
+        self.levels_compared += len(compared)
+        return seen["local"]["book_levels"]
 
     def run_test(self):
+        self.levels_compared = 0
         market, asset = self.bootstrap_latency_market()
         self.fund_latency_client(market, asset)
         self.fund_seller(market, asset)
@@ -396,13 +405,27 @@ class FlowMeshMarketViewsTest(FlowMeshLiquidityTest):
         own_bid = [curve for curve in curves if curve["side"] == "bid"]
         assert_equal(len(own_bid), 1)
         assert_equal(own_bid[0]["points"], [{"price": point["price"], "quantity": point["quantity"]} for point in bid["points"]])
-        exact = self.client.getflowmeshmarketdata(market, {"limit": 1, "levels": {}})
-        if exact["snapshot"]["last_microblock_hash"] == head:
-            rows = exact["book_levels"]["bids"]["levels"]
-            assert_equal([(row["low"], row["size"], row["own"]) for row in rows],
-                         sorted(((step["price"], step["quantity"], step["quantity"]) for step in bid_steps), reverse=True))
-            reserved = exact["account"]["b3_reserved_atoms"]
-            assert_equal(reserved, bid["reservation"])
+        # The client's exact levels at the operator's current head (read
+        # again whenever the head moved in between; never skipped).
+        found = {}
+
+        def client_at_head():
+            self.pump_b3()
+            current = self.nodes[0].getflowmeshmarketdata(market, {"limit": 1, "curve_limit": 1})["snapshot"]["last_microblock_hash"]
+            data = self.client.getflowmeshmarketdata(market, {"limit": 1, "levels": {}})
+            if data["snapshot"]["last_microblock_hash"] != current:
+                return False
+            found["data"] = data
+            return True
+        self.wait_until(client_at_head, timeout=60, check_interval=.2)
+        exact = found["data"]
+        rows = exact["book_levels"]["bids"]["levels"]
+        assert_equal([(row["low"], row["size"], row["own"]) for row in rows],
+                     sorted(((step["price"], step["quantity"], step["quantity"]) for step in bid_steps), reverse=True))
+        reserved = exact["account"]["b3_reserved_atoms"]
+        assert_equal(reserved, bid["reservation"])
+        # Two groupings, twice (before and after the ladders), all compared.
+        assert_equal(self.levels_compared, 4)
         self.log.info("FLOWMESH_MARKET_VIEWS levels=%s", json.dumps(levels))
         self.liquidity_report["checks_complete"] = True
         self.log.info("FLOWMESH_MARKET_VIEWS rationed=%s what_if=%s", json.dumps(rationed), json.dumps(what_if))

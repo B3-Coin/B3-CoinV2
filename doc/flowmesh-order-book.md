@@ -224,7 +224,10 @@ receipt times.
 - Functional (`feature_flowmesh_market_views.py`): option errors, ladder RPC
   errors, a four-price bid ladder and a three-price ask ladder, levels equal
   to those computed from every paged curve (exact and grouped) and equal
-  between the local engine and the remote client.
+  between the local engine and the remote client. Every grouping is
+  compared at one head (a read that sees the head move is taken again, never
+  skipped), the light-poll and `include_unchanged` checks always run, and
+  the test asserts that all four comparisons happened.
 - Qt (`test_b3_flowmeshworkspace-qt`, `test_b3_flowmeshtrading-qt`): parsing
   fails closed per section, the unchanged merge, requests, the ladder layout,
   shared depth, own marker, no churn, flash, fallback, spread texts, grouped
