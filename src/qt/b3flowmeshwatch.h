@@ -54,9 +54,15 @@ struct Policy {
     //! slow link's round trips (a new TLS connection and a snapshot).
     static constexpr int64_t PROBE_HOLD_MS{WATCH_MS + 3000};
     //! Hard floor on the read rate, whatever the outcome: a burst of two,
-    //! then one more every 500 ms (at most two watch reads per second).
+    //! then one more every 500 ms (at most two watch reads per second to a
+    //! remote endpoint; the local engine refills faster, see below).
     static constexpr int ARM_BURST{2};
     static constexpr int64_t ARM_REFILL_MS{500};
+    //! The local engine only: one more every 100 ms (at most ten reads a
+    //! second). Provisional owner default of 2026-09-30, amending the watch
+    //! critique's two-per-second floor for the local engine, which has no
+    //! network, endpoint or Admit budget; a remote endpoint keeps 500 ms.
+    static constexpr int64_t LOCAL_ARM_REFILL_MS{100};
 
     Mode mode{Mode::Off};
     //! The last finished read's outcome (for display only).
@@ -65,9 +71,19 @@ struct Policy {
     unsigned failures{0}, not_waited{0};
     int tokens{ARM_BURST};
     int64_t armed_at{0}, last_ok_at{-1}, retry_at{0}, refill_at{0};
+    //! Reading the local engine: no network, endpoint or Admit budget. Set
+    //! from the client info when enabled; any reply that names an endpoint
+    //! clears it (Remote).
+    bool local{false};
+    //! LOCAL_ARM_REFILL_MS for the local engine, else ARM_REFILL_MS.
+    int64_t RefillMs() const { return local ? LOCAL_ARM_REFILL_MS : ARM_REFILL_MS; }
 
-    //! `advertised`: the local engine, or an endpoint advertising live updates.
-    void Enable(int64_t now, bool advertised);
+    //! `advertised`: the local engine, or an endpoint advertising live
+    //! updates. `local`: the local engine (LOCAL_ARM_REFILL_MS).
+    void Enable(int64_t now, bool advertised, bool local = false);
+    //! A reply named an endpoint: whatever the client info said, this is
+    //! not the local engine, so the remote pacing applies at once.
+    void Remote() { local = false; }
     void Disable();
     bool MayArm(int64_t now);
     void Armed(int64_t now);

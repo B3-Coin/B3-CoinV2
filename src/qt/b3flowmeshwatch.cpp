@@ -21,8 +21,9 @@ Outcome Classify(const bool rpc_error, const std::string_view status, const bool
     return Outcome::NotWaited;
 }
 
-void Policy::Enable(const int64_t now, const bool advertised)
+void Policy::Enable(const int64_t now, const bool advertised, const bool local)
 {
+    this->local = local;
     mode = advertised ? Mode::Probing : Mode::Polling;
     failures = 0;
     not_waited = 0;
@@ -46,10 +47,10 @@ void Policy::Refill(const int64_t now)
         refill_at = now;
         return;
     }
-    const int64_t earned{(now - refill_at) / ARM_REFILL_MS};
+    const int64_t earned{(now - refill_at) / RefillMs()};
     if (earned <= 0) return;
     tokens = static_cast<int>(std::min<int64_t>(ARM_BURST, tokens + earned));
-    refill_at = tokens >= ARM_BURST ? now : refill_at + earned * ARM_REFILL_MS;
+    refill_at = tokens >= ARM_BURST ? now : refill_at + earned * RefillMs();
 }
 
 bool Policy::MayArm(const int64_t now)
@@ -69,7 +70,7 @@ int64_t Policy::NextArmIn(const int64_t now) const
     Policy later{*this};
     later.Refill(at);
     if (later.tokens > 0) return at - now;
-    return later.refill_at + ARM_REFILL_MS - now;
+    return later.refill_at + RefillMs() - now;
 }
 
 void Policy::Armed(const int64_t now)

@@ -1320,6 +1320,42 @@ private Q_SLOTS:
         for (size_t i{2}; i < arms.size(); ++i) QVERIFY(arms[i] - arms[i - 2] >= Policy::ARM_REFILL_MS);
         QCOMPARE(p.mode, Mode::Live); QVERIFY(!p.PollEveryTick());
     }
+    void watchLocalEngineIsPacedTenPerSecondAndRemoteTwo()
+    {
+        using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using WOutcome = B3FlowMeshWatch::Outcome;
+        // A busy market: every read returns a changed head 10 ms later.
+        const auto run = [](Policy& p, int64_t until, int64_t from = 0) {
+            std::vector<int64_t> arms;
+            for (int64_t now{from}; now < until; now += 5) {
+                if (p.outstanding) { if (now - p.armed_at >= 10) p.Finished(now, WOutcome::Changed, 0.0); continue; }
+                if (p.MayArm(now)) { p.Armed(now); arms.push_back(now); }
+            }
+            return arms;
+        };
+        Policy local; local.Enable(0, true, /*local=*/true);
+        QVERIFY(local.local); QCOMPARE(local.RefillMs(), Policy::LOCAL_ARM_REFILL_MS);
+        const auto fast{run(local, 10'000)};
+        // At most the burst plus ten per second.
+        QVERIFY(fast.size() <= size_t{2 + 10 * 10});
+        QVERIFY(fast.size() >= size_t{9 * 10});
+        for (size_t i{2}; i < fast.size(); ++i) QVERIFY(fast[i] - fast[i - 2] >= Policy::LOCAL_ARM_REFILL_MS);
+        QCOMPARE(local.mode, Mode::Live);
+        // Remote: unchanged, two per second.
+        Policy remote; remote.Enable(0, true);
+        QVERIFY(!remote.local); QCOMPARE(remote.RefillMs(), Policy::ARM_REFILL_MS);
+        const auto slow{run(remote, 10'000)};
+        QVERIFY(slow.size() <= size_t{2 + 2 * 10});
+        for (size_t i{2}; i < slow.size(); ++i) QVERIFY(slow[i] - slow[i - 2] >= Policy::ARM_REFILL_MS);
+        // A reply that names an endpoint: the remote pacing at once.
+        local.Remote();
+        QVERIFY(!local.local); QCOMPARE(local.RefillMs(), Policy::ARM_REFILL_MS);
+        const auto after{run(local, 20'000, 10'000)};
+        QVERIFY(after.size() <= size_t{2 + 2 * 10});
+        for (size_t i{2}; i < after.size(); ++i) QVERIFY(after[i] - after[i - 2] >= Policy::ARM_REFILL_MS);
+        // Re-enabling as remote keeps it remote.
+        local.Enable(20'000, true);
+        QCOMPARE(local.RefillMs(), Policy::ARM_REFILL_MS);
+    }
     void watchNextArmInIsTheEarliestMayArm()
     {
         using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using WOutcome = B3FlowMeshWatch::Outcome;

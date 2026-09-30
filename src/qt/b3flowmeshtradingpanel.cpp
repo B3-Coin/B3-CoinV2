@@ -2461,13 +2461,16 @@ void B3FlowMeshTradingPanel::updateWatchState()
     const bool eligible{m_wallet && m_backend && selected && m_security_warning.isEmpty() && m_client_info.has_value()};
     const QString key{eligible ? QStringLiteral("%1/%2/%3").arg(m_generation).arg(selected->id, local ? QStringLiteral("local") : endpoint) : QString{}};
     const bool advertised{local || live > 0};
+    // The local engine's reads have no network or endpoint budget: up to
+    // ten a second (a reply naming an endpoint drops to the remote pacing).
+    const bool local_pacing{local && !(selected && m_snapshot && m_snapshot->market == selected->id && m_snapshot->remote)};
     if (key != m_watch_key) {
         m_watch_key = key; ++m_watch_generation; m_watch_watchdog = false;
         if (key.isEmpty()) m_watch.Disable();
-        else m_watch.Enable(now, advertised);
+        else m_watch.Enable(now, advertised, local_pacing);
     } else if (!key.isEmpty() && advertised && !m_watch_advertised && m_watch.mode == B3FlowMeshWatch::Mode::Polling) {
         // The endpoint (again) advertises live updates: try at once.
-        m_watch.Enable(now, true);
+        m_watch.Enable(now, true, local_pacing);
     }
     m_watch_advertised = advertised;
     if (!m_watch_watchdog && m_watch.WatchdogTripped(now)) {
@@ -2564,6 +2567,9 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
     }
     const double jitter{QRandomGenerator::global()->generateDouble() * 0.4 - 0.2};
     const auto before{m_watch.mode};
+    // Classified per reply as well: the local engine names no endpoint, so
+    // a reply that does is paced as a remote endpoint's, at once.
+    if (!result->endpoint.isEmpty()) m_watch.Remote();
     const bool wrong_identity{result->snapshot && (result->snapshot->market != selected->id || result->snapshot->base != selected->base ||
         result->snapshot->domain != selected->domain || result->snapshot->config != selected->config ||
         (!result->snapshot->unchanged && selected->has_account && selected->account != result->snapshot->account))};

@@ -5631,6 +5631,40 @@ private Q_SLOTS:
         QCOMPARE(panel.m_watch.last, B3FlowMeshWatch::Outcome::Quiet);
         QCOMPARE(probe.writes.load(), 0); QCOMPARE(probe.snapshots.load(), 0);
     }
+    void localEngineLiveUpdatesUpToTenPerSecond()
+    {
+        // The local engine names no endpoint: its live updates are paced at
+        // up to ten reads a second. A reply that names one (a remote
+        // endpoint after all) drops to two a second at once.
+        FundingReadProbe probe;
+        probe.data = Data(); probe.watch_data = Data();
+        UniValue local_watch{UniValue::VOBJ};
+        local_watch.pushKV("status", "timeout"); local_watch.pushKV("supported", true); local_watch.pushKV("waited", true);
+        local_watch.pushKV("gap", false); local_watch.pushKV("endpoint", ""); local_watch.pushKV("endpoint_live_ms", 0);
+        probe.watch_object = local_watch;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(Data()));
+        panel.show(); QCoreApplication::processEvents();
+        UniValue info{UniValue::VOBJ}; info.pushKV("backend", "local"); info.pushKV("engine_enabled", true); info.pushKV("endpoints", UniValue{UniValue::VARR});
+        panel.m_client_info = info;
+        panel.updateWatchState();
+        QVERIFY(panel.m_watch.local); QCOMPARE(panel.m_watch.RefillMs(), B3FlowMeshWatch::Policy::LOCAL_ARM_REFILL_MS);
+        panel.armWatch(); QVERIFY(panel.m_watch_thread);
+        QTRY_VERIFY_WITH_TIMEOUT(probe.watches.load() >= 10, 3000);
+        std::vector<int64_t> times;
+        { std::lock_guard lock{probe.watch_mutex}; times = probe.watch_times; }
+        for (size_t i{2}; i < times.size(); ++i) QVERIFY2(times[i] - times[i - 2] >= B3FlowMeshWatch::Policy::LOCAL_ARM_REFILL_MS - 1, "a burst of two, then one per 100 ms");
+        // Ten reads took about a second, not five.
+        QVERIFY2(times[9] - times[0] < 2000, "local reads are paced at ten a second");
+        // A reply that names an endpoint: the remote pacing from then on.
+        auto remote_watch{local_watch}; remote_watch.pushKV("endpoint", "https://operator.invalid:18443"); remote_watch.pushKV("endpoint_live_ms", 2000);
+        probe.watch_object = remote_watch;
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch.local, 2000);
+        const int switched{probe.watches.load()};
+        QTest::qWait(1600);
+        QVERIFY2(probe.watches.load() - switched <= 4, "at most two a second once an endpoint is named");
+        panel.m_watch.Disable(); AwaitWatchWorker(panel);
+        QCOMPARE(probe.writes.load(), 0); QCOMPARE(probe.snapshots.load(), 0);
+    }
     void tickCatchupKeepsLiveModeAndRearmsAtOnce()
     {
         // A tick-less read moved the head: the client reads the missing
