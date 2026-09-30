@@ -405,6 +405,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         // market may already have a certified head and can be read immediately.
         m_read_error.clear(); m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_attempt_age.invalidate();
         m_gap_markers.clear();
+        m_display.reset(); m_display_confirmed.invalidate();
         const auto selected{market()};
         if (!selected || !m_snapshot || selected->id != m_snapshot->market) {
             m_amount->clear(); m_withdrawal_draft_amount.clear(); m_destination->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
@@ -425,9 +426,11 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         // rows keep their index while the certified data behind them changes.
         const auto rows{m_own_view->selectionModel()->selectedRows()};
         const int row{rows.isEmpty() ? -1 : rows.front().row()};
-        const bool shown{row >= 0 && m_snapshot && static_cast<size_t>(row) < m_snapshot->own_curves.size()};
-        m_edit_side = shown ? m_snapshot->own_curves[row].side : QString{};
-        m_edit_points = shown ? m_snapshot->own_curves[row].points : std::vector<B3FlowMeshMarketData::Point>{};
+        // The order shown in that row (Edit then requires exactly it in the
+        // gates' verified data; see editCurve).
+        const bool shown{row >= 0 && static_cast<size_t>(row) < m_shown_own_curves.size()};
+        m_edit_side = shown ? m_shown_own_curves[row].side : QString{};
+        m_edit_points = shown ? m_shown_own_curves[row].points : std::vector<B3FlowMeshMarketData::Point>{};
         updateControls();
     });
     connect(m_deposit, &QPushButton::clicked, this, [this] { openFunding(false); });
@@ -484,7 +487,7 @@ void B3FlowMeshTradingPanel::tick()
 void B3FlowMeshTradingPanel::setWalletModel(WalletModel* wallet)
 {
     cancelAndWait();
-    m_wallet = wallet; m_backend.reset(); m_market_data.clear(); m_effect_data.clear(); m_snapshot.reset();
+    m_wallet = wallet; m_backend.reset(); m_market_data.clear(); m_effect_data.clear(); m_snapshot.reset(); m_display.reset(); m_display_confirmed.invalidate();
     m_saved_actions = {}; m_saved_actions_ready = false;
     // Request rows and notices are per wallet; the next attach seeds them again.
     m_request_seen.clear(); m_request_order.clear(); m_requests_seeded = false; m_last_settled.invalidate();
@@ -611,13 +614,16 @@ void B3FlowMeshTradingPanel::updateDataViews()
 {
     using namespace B3FlowMeshMarketData;
     ++m_view_builds;
-    const auto selected{market()}; const bool matched{selected && m_snapshot && selected->id == m_snapshot->market};
+    // What the views show: m_display while it is newer (display only), else
+    // the gates' own m_snapshot.
+    const auto& view{displayedSnapshot()};
+    const auto selected{market()}; const bool matched{selected && view && selected->id == view->market};
     const bool inverse{inverted()};
     // Held ticks that reach the displayed head give the chart its longer
     // window of the same actual clearings (endpoint-reported for a remote
     // client, as its history is).
-    const bool ticks_current{matched && !m_ticks.empty() && m_ticks_market == m_snapshot->market && m_ticks.back().hash == m_snapshot->head};
-    std::optional<Snapshot> chart_snapshot{matched ? m_snapshot : std::nullopt};
+    const bool ticks_current{matched && !m_ticks.empty() && m_ticks_market == view->market && m_ticks.back().hash == view->head};
+    std::optional<Snapshot> chart_snapshot{matched ? view : std::nullopt};
     if (ticks_current) {
         chart_snapshot->history = TicksAsTrades(m_ticks); chart_snapshot->history_available = true;
         chart_snapshot->history_page_partial = false; chart_snapshot->history_truncated = m_ticks.front().sequence > 0;
@@ -628,13 +634,13 @@ void B3FlowMeshTradingPanel::updateDataViews()
         // with the held ticks' own times by the node's bucketing.
         B3FlowMeshChart::TimeSeries series;
         series.interval = m_candle_interval;
-        if (matched && m_snapshot->observed) {
-            const auto& observed{*m_snapshot->observed};
+        if (matched && view->observed) {
+            const auto& observed{*view->observed};
             series.available = observed.available;
             series.source = observed.source;
-            series.remote = m_snapshot->remote;
+            series.remote = view->remote;
             if (!observed.available) series.reason = observed.reason;
-            const bool held{m_candles && m_candles_market == m_snapshot->market && m_candles->interval == m_candle_interval &&
+            const bool held{m_candles && m_candles_market == view->market && m_candles->interval == m_candle_interval &&
                             m_candles->source == observed.source};
             if (observed.available && !held) {
                 series.loading = true;
@@ -643,7 +649,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
             } else if (observed.available) {
                 std::vector<std::pair<flowmesh::ObservedStamp, flowmesh::ClearingTick>> newer;
                 const uint64_t served{m_candles->candles.empty() ? 0 : m_candles->candles.back().last_sequence};
-                if (!m_candles->candles.empty() && m_ticks_market == m_snapshot->market) {
+                if (!m_candles->candles.empty() && m_ticks_market == view->market) {
                     for (const auto& tick : m_ticks) {
                         if (tick.sequence <= served) continue;
                         const auto stamp{m_tick_times.find(tick.sequence)};
@@ -666,11 +672,11 @@ void B3FlowMeshTradingPanel::updateDataViews()
     if (ticks_current) {
         const auto last_match{std::find_if(m_ticks.rbegin(), m_ticks.rend(), [](const auto& tick) { return tick.cleared; })};
         const auto& shown{last_match != m_ticks.rend() ? *last_match : m_ticks.back()};
-        strip = ClearingTickText(shown, m_snapshot->units, inverse, m_snapshot->remote, &strip_exact, observedClock(shown.sequence, shown.hash));
+        strip = ClearingTickText(shown, view->units, inverse, view->remote, &strip_exact, observedClock(shown.sequence, shown.hash));
         if (last_match != m_ticks.rend() && last_match != m_ticks.rbegin()) strip += tr(" · later auctions had no match");
         strip_exact = tr("Auction #%1").arg(shown.sequence) + (strip_exact.isEmpty() ? QString{} : QLatin1Char('\n') + strip_exact);
-    } else if (matched && m_snapshot->ticks && !m_snapshot->ticks->available) {
-        strip = tr("Auction ticks unavailable (%1)").arg(m_snapshot->ticks->reason);
+    } else if (matched && view->ticks && !view->ticks->available) {
+        strip = tr("Auction ticks unavailable (%1)").arg(view->ticks->reason);
     }
     if (m_clearing_strip->text() != strip) m_clearing_strip->setText(strip);
     if (const QString tip{ClearingStripTip() + (strip_exact.isEmpty() ? QString{} : QStringLiteral("\n") + strip_exact)}; m_clearing_strip->toolTip() != tip) m_clearing_strip->setToolTip(tip);
@@ -680,29 +686,29 @@ void B3FlowMeshTradingPanel::updateDataViews()
         // carries over), and the choices around the displayed price.
         const auto grouping{bookGrouping()};
         std::optional<CAmount> best_bid, best_ask;
-        if (matched && m_snapshot->levels && m_snapshot->levels->available) { best_bid = m_snapshot->levels->best_bid; best_ask = m_snapshot->levels->best_ask; }
-        m_order_book->setGroupingChoices(BookGroupingChoices(best_bid, best_ask, matched ? m_snapshot->units : Units{}, inverse), grouping);
-        m_order_book->setSnapshot(matched ? m_snapshot : std::nullopt, inverse, grouping);
+        if (matched && view->levels && view->levels->available) { best_bid = view->levels->best_bid; best_ask = view->levels->best_ask; }
+        m_order_book->setGroupingChoices(BookGroupingChoices(best_bid, best_ask, matched ? view->units : Units{}, inverse), grouping);
+        m_order_book->setSnapshot(matched ? view : std::nullopt, inverse, grouping);
     }
     {
-        const bool timed{matched && m_snapshot->observed && m_snapshot->observed->available};
-        const auto rows{matched && m_ticks_market == m_snapshot->market ? B3FlowMeshTradeTape::BuildRows(m_ticks, m_tick_times, m_received_times)
+        const bool timed{matched && view->observed && view->observed->available};
+        const auto rows{matched && m_ticks_market == view->market ? B3FlowMeshTradeTape::BuildRows(m_ticks, m_tick_times, m_received_times)
                                                                          : std::vector<B3FlowMeshTradeTape::Row>{}};
-        m_trade_tape->setRows(rows, matched ? m_snapshot->units : Units{}, inverse, timed ? m_tick_times_source : QString{},
-                              matched && m_snapshot->remote,
-                              matched && m_snapshot->observed ? m_snapshot->observed->reason : QString{},
+        m_trade_tape->setRows(rows, matched ? view->units : Units{}, inverse, timed ? m_tick_times_source : QString{},
+                              matched && view->remote,
+                              matched && view->observed ? view->observed->reason : QString{},
                               // As the trade history: a remote client's ticks
                               // are the endpoint's claims (critique B5).
-                              matched && m_snapshot->remote && !m_snapshot->execution_result_verified);
+                              matched && view->remote && !view->execution_result_verified);
     }
-    if (!matched || !m_snapshot->units.known) {
+    if (!matched || !view->units.known) {
         for (auto* table : {m_depth_view, m_history_view, m_own_view}) SetRows(table, {});
-        m_own_view->clearSelection();
+        m_own_view->clearSelection(); m_shown_own_curves.clear();
         if (auto* title{m_depth_view->parentWidget()->findChild<QLabel*>(QStringLiteral("flowMeshLiquidityTitle"))}) title->setText(tr("Liquidity"));
         m_history_note->setText(tr("Trade history unavailable")); m_own_note->setText(tr("Orders unavailable"));
         m_last_price->setText(tr("Last price  —")); m_last_price->setToolTip(QString{}); m_liquidity_note->setText(matched ? tr("Asset precision unavailable") : m_loading ? tr("Loading liquidity…") : selected ? tr("Market data unavailable") : tr("Select a market")); return;
     }
-    const auto& s{*m_snapshot}; const auto& u{s.units};
+    const auto& s{*view}; const auto& u{s.units};
     m_own_note->setText(s.own_curves.empty() ? tr("No open orders") : tr("Your open orders"));
     m_own_note->setToolTip(tr("Orders are persistent certified curves. Replacing a side changes that entire curve; there is no price-time priority queue."));
     std::vector<QStringList> depth, history, own;
@@ -788,6 +794,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
     }
     SetRows(m_depth_view, depth, [](int column, const QString& text) { return column == 0 ? new DepthPriceItem{text} : new QTableWidgetItem{text}; });
     SetRows(m_history_view, history); SetRows(m_own_view, own);
+    m_shown_own_curves = s.own_curves;
     // A selection whose order changed (or whose row now shows the other
     // side) is dropped: selecting it again binds the order now shown.
     if (const auto rows{m_own_view->selectionModel()->selectedRows()}; !rows.isEmpty()) {
@@ -1054,8 +1061,9 @@ UniValue B3FlowMeshTradingPanel::levelsRequest() const
     }
     // An unchanged reply carries levels only when asked: after a grouping
     // change, or when the head's levels are missing or were not copied.
-    const bool displayed{m_snapshot && m_snapshot->market == selected->id};
-    const auto* held{displayed && m_snapshot->levels ? &*m_snapshot->levels : nullptr};
+    const auto& shown{displayedSnapshot()};
+    const bool displayed{shown && shown->market == selected->id};
+    const auto* held{displayed && shown->levels ? &*shown->levels : nullptr};
     if (displayed && (!held || held->grouping != grouping || (!held->available && held->reason == QStringLiteral("head_changed")))) {
         levels.pushKV("include_unchanged", true);
     }
@@ -1070,15 +1078,16 @@ std::optional<uint64_t> B3FlowMeshTradingPanel::ticksAfter(const QString& market
 
 std::optional<flowmesh::ObservedStamp> B3FlowMeshTradingPanel::observedStamp(const uint64_t sequence, const QString& hash) const
 {
-    if (!m_snapshot) return std::nullopt;
+    const auto& shown{displayedSnapshot()};
+    if (!shown) return std::nullopt;
     const auto matches = [&](const flowmesh::ObservedStamp& stamp) {
         return hash.isEmpty() || QString::fromStdString(stamp.hash.GetHex()) == hash.toLower();
     };
-    if (m_ticks_market == m_snapshot->market) {
+    if (m_ticks_market == shown->market) {
         if (const auto held{m_tick_times.find(sequence)}; held != m_tick_times.end() && matches(held->second)) return held->second;
     }
-    if (m_snapshot->observed && m_snapshot->observed->available) {
-        for (const auto& row : m_snapshot->observed->rows) if (row.sequence == sequence && matches(row)) return row;
+    if (shown->observed && shown->observed->available) {
+        for (const auto& row : shown->observed->rows) if (row.sequence == sequence && matches(row)) return row;
     }
     return std::nullopt;
 }
@@ -1117,19 +1126,21 @@ void B3FlowMeshTradingPanel::updateIntervalChoices(const bool time)
 
 void B3FlowMeshTradingPanel::mergeHeldTicks()
 {
-    if (!m_snapshot) return;
-    if (m_ticks_market != m_snapshot->market) {
+    // The held ticks follow what the views show (m_display while busy).
+    const auto& shown{displayedSnapshot()};
+    if (!shown) return;
+    if (m_ticks_market != shown->market) {
         m_ticks.clear();
         m_tick_times.clear();
         m_received_times.clear();
-        m_ticks_market = m_snapshot->market;
+        m_ticks_market = shown->market;
     }
-    if (m_snapshot->ticks && m_snapshot->ticks->available && !B3FlowMeshMarketData::MergeHeldTicks(m_ticks, *m_snapshot->ticks)) {
+    if (shown->ticks && shown->ticks->available && !B3FlowMeshMarketData::MergeHeldTicks(m_ticks, *shown->ticks)) {
         // Replaced ticks start their times again.
         m_tick_times.clear();
         m_received_times.clear();
     }
-    const auto* observed{m_snapshot->observed && m_snapshot->observed->available ? &*m_snapshot->observed : nullptr};
+    const auto* observed{shown->observed && shown->observed->available ? &*shown->observed : nullptr};
     if (observed && observed->source != m_tick_times_source) {
         // One source's series only: another endpoint's clock is never mixed in.
         m_tick_times.clear();
@@ -1434,11 +1445,15 @@ void B3FlowMeshTradingPanel::updateControls()
     m_saved_selector->setEnabled(idle);
     m_check_receipt->setEnabled(idle && selectedStatusRead().has_value());
     updateStatusReadState();
-    m_chart->setStale(m_snapshot && (m_read_failed || !m_response_age.isValid() || m_response_age.elapsed() > 3000));
+    // The views' stale label follows what they show: while busy, live
+    // updates for display confirm it; the gates keep their own freshness.
+    const bool display_live{m_busy && !m_read_failed && m_display_confirmed.isValid() && m_display_confirmed.elapsed() <= 3000};
+    const bool views_stale{m_snapshot && (m_read_failed || !m_response_age.isValid() || m_response_age.elapsed() > 3000) && !display_live};
+    m_chart->setStale(views_stale);
     // The time axis reaches now between replies (it repaints only when a
     // new bucket starts); display only.
     m_chart->setNowMs(QDateTime::currentMSecsSinceEpoch());
-    m_order_book->setStale(m_snapshot && (m_read_failed || !m_response_age.isValid() || m_response_age.elapsed() > 3000));
+    m_order_book->setStale(views_stale);
     m_chart->setLoading(m_loading);
     updateConnectionState();
     updateLinkBanner();
@@ -2400,6 +2415,7 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
         // again (another grouping): take them, else keep the head's own.
         if (fresh.levels) retained.levels = std::move(fresh.levels);
         m_response_age = age;
+        dropCaughtUpDisplay();
         // Held ticks and their times are shared text: copies are cheap.
         const auto ticks_before{m_ticks};
         const auto times_before{m_tick_times};
@@ -2423,7 +2439,7 @@ auto B3FlowMeshTradingPanel::applySelectedSnapshot(B3FlowMeshMarketData::Snapsho
                            !endpointNotReady(fresh.endpoint)};
         const uint64_t head_sequence{fresh.next_sequence ? fresh.next_sequence - 1 : 0};
         const QString head_hash{fresh.head};
-        m_snapshot = std::move(fresh); m_response_age = age; mergeHeldTicks();
+        m_snapshot = std::move(fresh); m_response_age = age; dropCaughtUpDisplay(); mergeHeldTicks();
         if (receipt && !m_ticks.empty() && m_ticks_market == m_snapshot->market && m_ticks.back().sequence == head_sequence &&
             m_ticks.back().hash == head_hash) {
             m_received_times[head_sequence] = QDateTime::currentMSecsSinceEpoch() - age.elapsed();
@@ -2535,7 +2551,8 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
 {
     if (!m_wallet || !m_backend || m_watch_thread || m_cancel->load() || m_closing) return;
     const auto selected{market()};
-    if (!selected || !m_snapshot || m_snapshot->market != selected->id) {
+    const auto& basis{watchBasis()};
+    if (!selected || !basis || basis->market != selected->id) {
         if (release) m_watch_release_pending = false;
         return;
     }
@@ -2543,11 +2560,12 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
         // A probe starts only with no job in flight: an ordinary market read
         // already on its way would move the client's cursor under it.
         if (m_thread && m_watch.mode != B3FlowMeshWatch::Mode::Live) return;
-        if (m_busy || !isVisible() || !m_security_warning.isEmpty() || m_read_failed || !m_watch.MayArm(m_watch_clock.elapsed())) return;
+        // While busy only for display (the local engine; see liveWhileBusy).
+        if ((m_busy && !liveWhileBusy()) || !isVisible() || !m_security_warning.isEmpty() || m_read_failed || !m_watch.MayArm(m_watch_clock.elapsed())) return;
         m_watch.Armed(m_watch_clock.elapsed());
     }
     auto result{std::make_shared<WatchResult>()};
-    result->scope = {m_wallet, m_generation, m_watch_generation, selected->id, selected->account, m_snapshot->head};
+    result->scope = {m_wallet, m_generation, m_watch_generation, selected->id, selected->account, basis->head};
     result->release = release;
     result->ticks_after = ticksAfter(selected->id); result->draft = indicativeDraft(); result->levels = levelsRequest();
     auto* node{&m_wallet->node()};
@@ -2604,13 +2622,15 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
     const auto now{m_watch_clock.elapsed()};
     const auto& scope{result->scope};
     const auto selected{market()};
-    // Applied only on top of exactly the display it was armed against, for
-    // the same wallet, market and account, and never while an operation is
-    // in progress. Anything else is dropped silently: never a failure, and
-    // never renewed freshness.
+    // Applied only on top of exactly the head it was armed against, for the
+    // same wallet, market and account. While an operation or a review is in
+    // progress it is shown only (the local engine; see liveWhileBusy), never
+    // applied. Anything else is dropped silently: never a failure, and never
+    // renewed freshness.
+    const auto& basis{watchBasis()};
     if (!m_wallet || scope.wallet != m_wallet || scope.generation != m_generation || scope.watch_generation != m_watch_generation ||
-        m_cancel->load() || m_busy || !selected || selected->id != scope.market || selected->account != scope.account ||
-        !m_snapshot || m_snapshot->market != scope.market || m_snapshot->head != scope.known_head) {
+        m_cancel->load() || (m_busy && !liveWhileBusy()) || !selected || selected->id != scope.market || selected->account != scope.account ||
+        !basis || basis->market != scope.market || basis->head != scope.known_head) {
         m_watch.Dropped();
         scheduleRearm();
         return;
@@ -2629,7 +2649,8 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
         m_reconcile_pending = true;
     } else {
         auto& s{*result->snapshot};
-        const uint64_t displayed{m_snapshot->next_sequence ? m_snapshot->next_sequence - 1 : 0};
+        const uint64_t displayed{basis->next_sequence ? basis->next_sequence - 1 : 0};
+        const bool display_only{m_busy};
         const bool head_moved{!s.unchanged && s.head != scope.known_head};
         const auto outcome{B3FlowMeshWatch::Classify(false, result->status.toStdString(), result->supported, result->waited,
                                                      head_moved, result->endpoint_live_ms)};
@@ -2639,8 +2660,10 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
         // reply moves into the display (it is never copied).
         const auto index{m_market->currentIndex()};
         std::optional<B3FlowMeshTrading::Market> row;
-        if (index >= 0 && static_cast<size_t>(index) < m_market_data.size()) { row = m_market_data[index]; DeriveRowFromSnapshot(*row, s); }
-        if (applySelectedSnapshot(std::move(s), result->snapshot_age, scope.known_head, live_head_change) == SnapshotApply::APPLIED) {
+        if (!display_only && index >= 0 && static_cast<size_t>(index) < m_market_data.size()) { row = m_market_data[index]; DeriveRowFromSnapshot(*row, s); }
+        if (display_only) {
+            applyDisplayOnly(std::move(s), result->snapshot_age);
+        } else if (applySelectedSnapshot(std::move(s), result->snapshot_age, scope.known_head, live_head_change) == SnapshotApply::APPLIED) {
             if (row) m_market_data[index] = std::move(*row);
             m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_read_error.clear(); m_loading = false;
             linkToast(true);
@@ -2683,6 +2706,38 @@ void B3FlowMeshTradingPanel::rearmWatch()
     if (m_watch_thread) return;
     armWatch();
     if (!m_watch_thread) scheduleRearm();
+}
+
+const std::optional<B3FlowMeshMarketData::Snapshot>& B3FlowMeshTradingPanel::displayedSnapshot() const
+{
+    const bool newer{m_display && m_snapshot && m_display->market == m_snapshot->market && m_display->next_sequence > m_snapshot->next_sequence};
+    return newer ? m_display : m_snapshot;
+}
+
+bool B3FlowMeshTradingPanel::liveWhileBusy() const
+{
+    const auto selected{market()};
+    return m_busy && m_watch.local && m_watch.mode == B3FlowMeshWatch::Mode::Live && !m_read_failed && m_security_warning.isEmpty() &&
+           isVisible() && selected && m_snapshot && m_snapshot->market == selected->id && !m_snapshot->remote;
+}
+
+auto B3FlowMeshTradingPanel::applyDisplayOnly(B3FlowMeshMarketData::Snapshot fresh, const QElapsedTimer& age) -> SnapshotApply
+{
+    const auto& shown{displayedSnapshot()};
+    if (!shown || fresh.market != shown->market) return SnapshotApply::SUPERSEDED;
+    // Any verified reply at or after the shown head confirms what is shown.
+    if (fresh.unchanged ? fresh.head != shown->head : fresh.next_sequence < shown->next_sequence) return SnapshotApply::SUPERSEDED;
+    m_display_confirmed = age;
+    if (fresh.unchanged || fresh.head == shown->head) return SnapshotApply::SUPERSEDED;
+    m_display = std::move(fresh);
+    mergeHeldTicks();
+    updateDataViews();
+    return SnapshotApply::APPLIED;
+}
+
+void B3FlowMeshTradingPanel::dropCaughtUpDisplay()
+{
+    if (m_display && (!m_snapshot || m_display->market != m_snapshot->market || m_display->next_sequence <= m_snapshot->next_sequence)) m_display.reset();
 }
 
 void B3FlowMeshTradingPanel::stopWatchWorker(const bool join)
@@ -2828,6 +2883,7 @@ void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
         selected->domain != m_snapshot->domain || selected->config != m_snapshot->config || selected->remote != m_snapshot->remote)) {
         m_snapshot.reset(); m_response_age.invalidate(); m_certificate_age.invalidate(); m_queue_age.invalidate();
     }
+    dropCaughtUpDisplay();
     // The job's rows were captured when it started. When a newer head was
     // displayed meanwhile, its selected row must not roll back to them.
     const auto index{m_market->currentIndex()};
@@ -2859,6 +2915,7 @@ void B3FlowMeshTradingPanel::cancelAndWait()
     m_reconcile_pending = false; m_last_job_was_reconcile = false;
     m_polling_since.invalidate();
     m_gap_markers.clear();
+    m_display.reset(); m_display_confirmed.invalidate();
     // Draining a running write does not prove it was cancelled. Preserve its
     // public identity even if a wallet switch disconnects the completion slot.
     if (m_active_result && m_active_result->write_attempted) {

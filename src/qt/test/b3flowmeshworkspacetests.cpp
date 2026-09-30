@@ -824,6 +824,41 @@ class B3FlowMeshWorkspaceTests : public QObject
         panel.show(); QCoreApplication::processEvents();
     }
 
+    //! Data() one head later (sequence 3 -> 4, head H(10)): a new standing
+    //! bid of another account at 998 and the viewer's own bid partly filled.
+    static UniValue NewerLocalData()
+    {
+        auto data{Data()}; auto snapshot{data["snapshot"]};
+        snapshot.pushKV("next_microblock_sequence", 4); snapshot.pushKV("last_microblock_hash", H(10).GetHex());
+        snapshot.pushKV("state_root", H(11).GetHex()); data.pushKV("snapshot", snapshot);
+        auto liquidity{data["liquidity"]}; UniValue curves{liquidity["curves"]};
+        auto extra{CurveJson("bid", 9)}; UniValue points{UniValue::VARR};
+        for (const auto [price, quantity] : {std::pair{998, 400'000}, std::pair{999, 0}}) { UniValue p{UniValue::VOBJ}; p.pushKV("price", price); p.pushKV("quantity", quantity); points.push_back(p); }
+        extra.pushKV("points", points); extra.pushKV("filled_quantity", 0); extra.pushKV("remaining_quantity", 400'000); extra.pushKV("reserved_amount", 399'200'000);
+        curves.push_back(extra); liquidity.pushKV("curves", curves); liquidity.pushKV("total_curves", 3); data.pushKV("liquidity", liquidity);
+        auto account{data["account"]}; account.pushKV("next_sequence", 9);
+        // The viewer replaced its bid: now at 998.
+        auto own{CurveJson("bid")}; UniValue own_points{UniValue::VARR};
+        for (const auto [price, quantity] : {std::pair{998, 1'000'000}, std::pair{999, 0}}) { UniValue p{UniValue::VOBJ}; p.pushKV("price", price); p.pushKV("quantity", quantity); own_points.push_back(p); }
+        own.pushKV("points", own_points); own.pushKV("filled_quantity", 0); own.pushKV("remaining_quantity", 1'000'000); own.pushKV("reserved_amount", 998'000'000);
+        UniValue owns{UniValue::VARR}; owns.push_back(own); account.pushKV("curves", owns); data.pushKV("account", account);
+        return data;
+    }
+    static UniValue LocalWatchObject(const char* status = "head_changed")
+    {
+        UniValue watch{UniValue::VOBJ}; watch.pushKV("status", status); watch.pushKV("supported", true); watch.pushKV("waited", true);
+        watch.pushKV("gap", false); watch.pushKV("endpoint", ""); watch.pushKV("endpoint_live_ms", 0);
+        return watch;
+    }
+    //! A local-engine panel with live updates, as the tick leaves it.
+    static void LocalLive(B3FlowMeshTradingPanel& panel)
+    {
+        panel.show(); QCoreApplication::processEvents();
+        UniValue info{UniValue::VOBJ}; info.pushKV("backend", "local"); info.pushKV("engine_enabled", true); info.pushKV("endpoints", UniValue{UniValue::VARR});
+        panel.m_client_info = info;
+        panel.updateWatchState();
+        panel.m_watch.mode = B3FlowMeshWatch::Mode::Live; panel.m_watch.last_ok_at = panel.m_watch_clock.elapsed();
+    }
 private Q_SLOTS:
     void initTestCase()
     {
@@ -5755,6 +5790,114 @@ private Q_SLOTS:
         QVERIFY2(probe.watches.load() - switched <= 4, "at most two a second once an endpoint is named");
         panel.m_watch.Disable(); AwaitWatchWorker(panel);
         QCOMPARE(probe.writes.load(), 0); QCOMPARE(probe.snapshots.load(), 0);
+    }
+    void localBookFollowsLiveUpdatesDuringAReviewButGatesDoNot()
+    {
+        // An order review is open (or an action in flight): with the local
+        // engine the book, tape and own-order rows keep following live
+        // updates, for display only. The gates, balances, freshness and the
+        // catalog row stay on the data of before the review.
+        FundingReadProbe probe; probe.data = Data(); probe.watch_data = NewerLocalData(); probe.watch_object = LocalWatchObject();
+        probe.hold_watch = true;
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); AttachOfflineWallet(panel);
+        Observe(panel, WithLevels(Parse(Data())), false);
+        LocalLive(panel);
+        QVERIFY(panel.m_watch.local);
+        const auto gate_head{panel.m_snapshot->head};
+        const auto observed{panel.m_response_age.msecsSinceReference()};
+        const auto row{panel.m_market_data[0]};
+        const auto own_before{panel.m_own_view->item(0, 2)->text()};
+        panel.m_busy = true; panel.updateControls(); // A review is open.
+        QVERIFY(panel.liveWhileBusy());
+        panel.armWatch(); QVERIFY(panel.m_watch_thread);
+        QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+        // Read after the handler signalled entry (its options were recorded first).
+        QCOMPARE(QString::fromStdString(probe.market_options.back()["known_head"].get_str()), gate_head);
+        probe.watch_release.release();
+        QTRY_VERIFY_WITH_TIMEOUT(panel.m_display.has_value(), 3000);
+        const auto shown_head{QString::fromStdString(H(10).GetHex())};
+        // Shown: the book, the own-order rows.
+        QCOMPARE(panel.displayedSnapshot()->head, shown_head);
+        QCOMPARE(panel.m_order_book->head(), shown_head);
+        QVERIFY(panel.m_own_view->item(0, 2)->text() != own_before);
+        // Not applied: the gates' snapshot, its freshness, the catalog row.
+        QCOMPARE(panel.m_snapshot->head, gate_head);
+        QCOMPARE(panel.m_response_age.msecsSinceReference(), observed);
+        QCOMPARE(panel.m_market_data[0].sequence, row.sequence);
+        QCOMPARE(panel.m_market_data[0].b3_reserved, row.b3_reserved);
+        QVERIFY(panel.m_busy);
+        // The views' stale label follows what they show: confirmed by the
+        // live update, while the gates' own data has aged out.
+        auto* stale{panel.m_order_book->findChild<QLabel*>(QStringLiteral("flowMeshBookStale"))};
+        panel.m_response_age.invalidate(); panel.updateControls();
+        QVERIFY(stale->isHidden()); QVERIFY(!panel.dataReady());
+        panel.m_busy = false; panel.updateControls(); QVERIFY(!stale->isHidden());
+        panel.m_busy = true; panel.m_response_age.start(); panel.updateControls();
+        // The next display read follows the shown head.
+        QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+        QCOMPARE(QString::fromStdString(probe.market_options.back()["known_head"].get_str()), shown_head);
+        // A book click while busy is ignored; once idle, the book shows
+        // newer data than the gates, so a click is refused with a notice.
+        panel.m_watch.Disable(); probe.hold_watch = false; probe.watch_release.release(); AwaitWatchWorker(panel);
+        panel.m_busy = false; panel.updateControls();
+        const int spread{panel.m_order_book->model()->spreadRow()};
+        panel.m_price->setText(QStringLiteral("7"));
+        panel.m_order_book->activateRow(spread + 1);
+        QCOMPARE(panel.m_price->text(), QStringLiteral("7"));
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("its price was not used")));
+        // Idle: a live update is armed against the gates' head, and its
+        // reply is applied to them; the display is then dropped.
+        probe.hold_watch = true;
+        panel.updateWatchState(); panel.m_watch.mode = B3FlowMeshWatch::Mode::Live; panel.m_watch.retry_at = 0; panel.m_watch.tokens = B3FlowMeshWatch::Policy::ARM_BURST;
+        panel.armWatch(); QVERIFY(panel.m_watch_thread);
+        QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+        QCOMPARE(QString::fromStdString(probe.market_options.back()["known_head"].get_str()), gate_head);
+        probe.watch_release.release();
+        QTRY_COMPARE_WITH_TIMEOUT(panel.m_snapshot->head, shown_head, 3000);
+        QVERIFY(!panel.m_display);
+        QCOMPARE(panel.m_market_data[0].sequence, uint64_t{9});
+        panel.m_watch.Disable(); AwaitWatchWorker(panel);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void remoteBookStaysFrozenDuringAReview()
+    {
+        // A remote client's reads hold its work gate: no display read may
+        // delay the order being sent, so nothing is armed while busy.
+        FundingReadProbe probe; probe.live_ms = 2000; probe.watch_data = NewerRemoteData(); probe.watch_object = WatchObject("head_changed", true, true);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        Live(panel, probe);
+        panel.m_watch.mode = B3FlowMeshWatch::Mode::Live; panel.m_watch.last_ok_at = panel.m_watch_clock.elapsed();
+        panel.m_busy = true;
+        QVERIFY(!panel.liveWhileBusy());
+        panel.armWatch(); QVERIFY(!panel.m_watch_thread);
+        QCOMPARE(probe.watches.load(), 0);
+        panel.m_busy = false;
+    }
+    void ownOrderSelectionBindsToTheRowShown()
+    {
+        // The rows show m_display while busy: a selection binds to the
+        // order shown in that row, and Edit requires exactly that order in
+        // the gates' data (here, only once they have caught up).
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        Observe(panel, WithLevels(Parse(Data())), false);
+        LocalLive(panel);
+        const auto newer{WithLevels(Parse(NewerLocalData()))};
+        panel.m_busy = true;
+        QElapsedTimer age; age.start();
+        QCOMPARE(panel.applyDisplayOnly(newer, age), B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QCOMPARE(panel.m_shown_own_curves, newer.own_curves);
+        panel.m_own_view->selectRow(0);
+        QCOMPARE(panel.m_edit_points, newer.own_curves[0].points);
+        QCOMPARE(panel.m_edit_side, newer.own_curves[0].side);
+        QVERIFY(newer.own_curves[0].points != panel.m_snapshot->own_curves[0].points);
+        panel.m_busy = false; panel.updateControls();
+        // The gates' data still holds the replaced order: nothing to edit
+        // (never the gates' order in that row index, which is not shown).
+        QVERIFY(!panel.editCurve()); QVERIFY(!panel.editAvailable());
+        // The gates catch up: the display is dropped, the binding holds.
+        QVERIFY(panel.applySelectedSnapshot(newer, age, panel.m_snapshot->head) == B3FlowMeshTradingPanel::SnapshotApply::APPLIED);
+        QVERIFY(!panel.m_display);
+        QVERIFY(panel.editCurve()); QCOMPARE(panel.editCurve()->points, newer.own_curves[0].points);
     }
     void tickCatchupKeepsLiveModeAndRearmsAtOnce()
     {

@@ -339,6 +339,23 @@ private:
     //! m_rearm's timeout: arm, or wait again while the policy still waits.
     void rearmWatch();
     void finishWatch(const std::shared_ptr<WatchResult>& result);
+    //! What the data views show: m_display while it is newer than
+    //! m_snapshot (same market), else m_snapshot.
+    const std::optional<B3FlowMeshMarketData::Snapshot>& displayedSnapshot() const;
+    //! Live updates continue while an operation or a review is in progress,
+    //! for display only: the local engine only (a remote client's reads hold
+    //! its work gate, which is not preemptive, so a display read could delay
+    //! the order being sent), live, and with no failed read or warning.
+    bool liveWhileBusy() const;
+    //! The head a live update is armed against and applied on: while busy
+    //! the displayed one, else m_snapshot's, so a display-only head is never
+    //! the basis of a gate-changing apply.
+    const std::optional<B3FlowMeshMarketData::Snapshot>& watchBasis() const { return m_busy ? displayedSnapshot() : m_snapshot; }
+    //! A live update that arrived while busy: shown, never applied to
+    //! m_snapshot (see m_display). APPLIED when it became the shown head.
+    SnapshotApply applyDisplayOnly(B3FlowMeshMarketData::Snapshot fresh, const QElapsedTimer& age);
+    //! m_display once m_snapshot has reached it (or left its market).
+    void dropCaughtUpDisplay();
     //! Drops any outstanding live-update result; joins its worker only when
     //! the panel closes (a wallet or market switch never blocks on it).
     void stopWatchWorker(bool join);
@@ -441,6 +458,19 @@ private:
     unsigned m_refresh_yields{0};
     uint64_t m_refresh_epoch{0};
     std::optional<B3FlowMeshMarketData::Snapshot> m_snapshot;
+    //! Display only (the local engine; see liveWhileBusy): a verified live
+    //! update newer than m_snapshot that arrived while an operation or a
+    //! review was in progress. The book, chart, tape and own-order rows show
+    //! it; no gate, balance, catalog row, freshness age, review or signed
+    //! value ever reads it. Dropped once m_snapshot reaches it and on any
+    //! market, wallet or catalog identity change.
+    std::optional<B3FlowMeshMarketData::Snapshot> m_display;
+    //! When a verified reply last confirmed what the views show while busy
+    //! (the views' stale label only).
+    QElapsedTimer m_display_confirmed;
+    //! The own orders the Your-orders rows show, in row order: a selection
+    //! binds to the order shown there, never to another snapshot's row.
+    std::vector<B3FlowMeshMarketData::Curve> m_shown_own_curves;
     QElapsedTimer m_response_age, m_certificate_age, m_catalog_age, m_attempt_age, m_queue_age;
     // Restarted when the panel is shown and polls again; invalid while hidden,
     // so a hidden interval never reads as a stale connection.
