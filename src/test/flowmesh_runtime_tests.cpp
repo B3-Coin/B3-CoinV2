@@ -7196,11 +7196,11 @@ std::shared_ptr<node::FlowMeshObservedTimeLog> ObservedLogFor(ObservedTestClock&
 }
 
 //! Health() ticks until the observed-time warm-up (4 s at the default 2 s
-//! round timeout) has passed with a connected peer.
+//! round timeout, sampled once a second) has passed with a connected peer.
 void WarmObservedTime(HealthRuntimeFixture& f, ObservedTestClock& clock)
 {
     f.runtime->FlowMeshPeerConnected(5);
-    for (int i{0}; i < 18; ++i) {
+    for (int i{0}; i < 24; ++i) {
         f.Health();
         clock.wall_ms += 250;
         clock.steady_ms += 250;

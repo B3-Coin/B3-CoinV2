@@ -4585,9 +4585,13 @@ void FlowMeshRuntime::ObserveTimeMaintenance(const size_t connected_peers)
     // acceptable anchor height (for the stale-anchor check). Sampled here,
     // so a commit takes no chain lock for either.
     if (std::none_of(m_markets.begin(), m_markets.end(), [](const auto& item) { return item.second->observed != nullptr; })) return;
+    // Paced: the two chain reads below take the chain lock, and this runs
+    // on the worker; a second's granularity is enough for a 2 s tolerance.
+    const auto now{m_config.clock->Now()};
+    if (now < m_next_observed_sample) return;
+    m_next_observed_sample = now + OBSERVED_SAMPLE_INTERVAL;
     const auto anchor{m_config.chain->Current()};
     const bool gate_open{m_config.chain->Acceptable(anchor)};
-    const auto now{m_config.clock->Now()};
     for (auto& [id, market_ptr] : m_markets) {
         (void)id;
         Market& market{*market_ptr};
