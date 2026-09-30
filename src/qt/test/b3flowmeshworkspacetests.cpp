@@ -726,7 +726,7 @@ class B3FlowMeshWorkspaceTests : public QObject
         // Ladder orders: one curve per side, four prices (eight breakpoints).
         Curve ladder_bid; ladder_bid.account = QString::fromStdString(H(40).GetHex()); ladder_bid.side = QStringLiteral("bid");
         ladder_bid.points = {{985, 400'000}, {986, 300'000}, {988, 300'000}, {989, 200'000}, {991, 200'000}, {992, 100'000}, {994, 100'000}, {995, 0}};
-        ladder_bid.remaining = 400'000; ladder_bid.reserved = 390'700'000;
+        ladder_bid.remaining = 400'000; ladder_bid.reserved = 395'800'000; // 100,000 x (985 + 988 + 991 + 994)
         Curve ladder_ask; ladder_ask.account = QString::fromStdString(H(41).GetHex()); ladder_ask.side = QStringLiteral("ask");
         ladder_ask.points = {{1005, 0}, {1006, 150'000}, {1008, 150'000}, {1009, 300'000}, {1011, 300'000}, {1012, 450'000}, {1014, 450'000}, {1015, 600'000}};
         ladder_ask.remaining = 600'000; ladder_ask.reserved = 600'000;
@@ -768,6 +768,8 @@ class B3FlowMeshWorkspaceTests : public QObject
             }
         }
         s.ticks = page;
+        // The node's exact levels of every curve (the viewer's own marked).
+        s = WithLevels(s, {}, H(5));
         s.remote = source != SyntheticSource::LOCAL;
         if (s.remote) { s.endpoint = endpoint; s.certificate_verified = s.account_state_verified = true; }
         if (source == SyntheticSource::OLDER_SERVER) times.reason = QStringLiteral("endpoint_does_not_advertise_observed_time");
@@ -1159,9 +1161,14 @@ private Q_SLOTS:
         const int row{book.model()->spreadRow()};
         return row < 0 ? QString{} : book.model()->row(row).price;
     }
+    //! The snapshot with the node's levels of its own curves at its head.
     static Snapshot WithLevels(Snapshot snapshot, const flowmesh::LevelGrouping& grouping = {}, const std::optional<uint256>& own = std::nullopt)
     {
         auto data{Data()};
+        auto head{data["snapshot"]};
+        head.pushKV("last_microblock_hash", snapshot.head.toStdString()); head.pushKV("next_microblock_sequence", snapshot.next_sequence);
+        data.pushKV("snapshot", head);
+        data.pushKV("history", [] { UniValue h{UniValue::VOBJ}; h.pushKV("available", true); h.pushKV("truncated", false); h.pushKV("scope", "bounded-certified-log-cache"); h.pushKV("entries", UniValue{UniValue::VARR}); return h; }());
         data.pushKV("book_levels", LevelsJson(snapshot.curves, *uint256::FromHex(snapshot.head.toStdString()), grouping, own));
         snapshot.levels = Parse(data).levels;
         return snapshot;
@@ -6318,6 +6325,65 @@ private Q_SLOTS:
             auto* mode{remote.findChild<QComboBox*>(QStringLiteral("flowMeshLiquidityMode"))};
             QVERIFY(mode); mode->setCurrentIndex(2); QCoreApplication::processEvents();
             QVERIFY(render(remote, QStringLiteral("synthetic-flowmesh-time-remote.png")));
+        }
+        {
+            // The order book: the node's exact levels of 24 accounts' limit
+            // orders, a four-price ladder per side and the viewer's own bid,
+            // laid out as Hyperliquid's, beside UTC candles and the tape.
+            // Tall enough for the ladder to hold ten levels a side.
+            B3FlowMeshTradingPanel book; book.resize(1320, 1320); book.m_timer->stop();
+            ShowSyntheticTimeMarket(book, SyntheticSource::LOCAL);
+            QCoreApplication::processEvents();
+            QVERIFY(book.m_order_book->showsVerifiedLevels());
+            QVERIFY(book.m_snapshot->levels->bids.levels.size() >= 10 && book.m_snapshot->levels->asks.levels.size() >= 10);
+            QVERIFY(book.m_order_book->rowsPerSide() >= 10);
+            QVERIFY(render(book, QStringLiteral("synthetic-flowmesh-book-levels.png")));
+            QVERIFY(render(*book.m_order_book, QStringLiteral("synthetic-flowmesh-book-ladder.png")));
+            // The canonical orientation, then 0.01 B3 groups (the node's
+            // grouped levels, as the next read after choosing them brings).
+            book.m_orientation->setCurrentIndex(0); QCoreApplication::processEvents();
+            QVERIFY(render(*book.m_order_book, QStringLiteral("synthetic-flowmesh-book-canonical.png")));
+            // Hover from the spread to the fifth bid.
+            const int spread{book.m_order_book->model()->spreadRow()};
+            book.m_order_book->setHoverRow(spread + 5);
+            QVERIFY(render(*book.m_order_book, QStringLiteral("synthetic-flowmesh-book-hover.png")));
+            book.m_order_book->setHoverRow(-1);
+            const auto grouping{Grouping(false, 1, -2, 6)};
+            book.m_book_groupings[{book.m_snapshot->market, false}] = grouping;
+            book.m_snapshot = WithLevels(*book.m_snapshot, grouping, H(5));
+            book.updateDataViews(); QCoreApplication::processEvents();
+            QVERIFY(book.m_order_book->showsVerifiedLevels());
+            QCOMPARE(book.m_order_book->groupingSelector()->currentText(), QStringLiteral("0.01"));
+            QVERIFY(render(*book.m_order_book, QStringLiteral("synthetic-flowmesh-book-grouped.png")));
+            // A ladder order in the ticket: four prices, one order.
+            book.m_book_groupings.clear(); book.m_snapshot = WithLevels(*book.m_snapshot, {}, H(5));
+            book.m_orientation->setCurrentIndex(1); QCoreApplication::processEvents();
+            // Sell B3 (a canonical bid ladder); the walletless fixture's
+            // buttons are disabled, so the side is set directly.
+            book.m_side->setCurrentIndex(1); book.m_sell->setChecked(true);
+            book.m_ladder->setChecked(true);
+            book.m_price->setText(QStringLiteral("1.002")); book.m_quantity->setText(QStringLiteral("0.3"));
+            const std::array<std::pair<const char*, const char*>, 3> rows{{{"1.004", "0.2"}, {"1.006", "0.2"}, {"1.01", "0.1"}}};
+            for (size_t i{0}; i < rows.size(); ++i) { book.m_ladder_prices[i]->setText(QLatin1String(rows[i].first)); book.m_ladder_quantities[i]->setText(QLatin1String(rows[i].second)); }
+            QVERIFY(book.ladderSteps());
+            book.updateTicket(); QCoreApplication::processEvents();
+            QVERIFY(book.m_order_book->showsVerifiedLevels());
+            QVERIFY(book.m_ticket_total->text().contains(QStringLiteral("Reserves exactly")));
+            QVERIFY(render(book, QStringLiteral("synthetic-flowmesh-ladder-ticket.png")));
+            QVERIFY(!book.m_thread); QVERIFY(!book.m_wallet);
+        }
+        {
+            // The book alone, tall: rows fill the height.
+            auto snapshot{SyntheticLimitBook(14)};
+            snapshot.curves.push_back(LadderCurve("bid", 40, {{966, 150'000}, {969, 150'000}, {972, 150'000}, {975, 150'000}}, 50'000));
+            snapshot.curves.push_back(LadderCurve("ask", 41, {{1041, 90'000}, {1043, 90'000}, {1045, 90'000}, {1047, 90'000}}));
+            snapshot = WithLevels(snapshot, {}, H(20));
+            B3FlowMeshOrderBook alone; alone.resize(460, 900); alone.setSnapshot(snapshot, false);
+            alone.show(); QCoreApplication::processEvents(); QCoreApplication::processEvents();
+            QVERIFY(alone.rowsPerSide() >= 17);
+            QVERIFY(render(alone, QStringLiteral("synthetic-flowmesh-orderbook-tall.png")));
+            alone.setSnapshot(snapshot, true); QCoreApplication::processEvents();
+            QVERIFY(render(alone, QStringLiteral("synthetic-flowmesh-orderbook-tall-b3.png")));
         }
         {
             B3FlowMeshTradingPanel older; older.resize(1320, 940); older.m_timer->stop();
