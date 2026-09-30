@@ -3241,7 +3241,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // target and charge one automatic attempt, and again to apply the reply by
     // QueryAction's rules, never across the network wait. It never sends or
     // signs, and a receipt verified meanwhile is returned unchanged. nullopt
-    // means nothing was applied; the caller then takes the ordinary path. A
+    // means nothing was applied; ActionStatus then takes the ordinary path,
+    // while Submit's chained read just returns its submission receipt. A
     // reply applied whose outbox save then failed is returned as the ordinary
     // refresh would return it: unverified, with the failure as its reason.
     //
@@ -3297,8 +3298,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             if (std::chrono::steady_clock::now() < m_retry_after.at(endpoint)) { outcome("cooldown"); return std::nullopt; }
             if (m_wait_unanswered.at(endpoint)) { outcome("unanswered"); return std::nullopt; }
             // Do not let this opportunistic lane bypass queued status work.
-            // Refusal falls through to the ordinary FIFO path in the same
-            // ActionStatus call, which still returns only this action's receipt.
+            // From ActionStatus, refusal falls through to the ordinary FIFO
+            // path in the same call, which still returns only this action's
+            // receipt. Submit's chained read has no such fallback.
             if (!m_action_polls.TryChargeUnqueuedAttempt(std::chrono::steady_clock::now())) { outcome("coalesced"); return std::nullopt; }
             target = m_endpoints.at(endpoint);
             with_outcome = m_action_outcome.at(endpoint);
@@ -3950,6 +3952,12 @@ public:
         // At most one bounded waited read of the action just delivered: what
         // a caller's getflowmeshactionstatus(wait_ms) right after this call
         // would send, without that caller's turnaround. It never resends.
+        // Unlike ActionStatus, there is no ordinary-path fallback here: when
+        // the read yields (queued status demand, a busy lane, cooldown, no
+        // advertised wait) or applies nothing, the submission receipt above
+        // is returned as it is, no status demand is queued and no queued
+        // demand is served. Its status is left to the caller's next
+        // ActionStatus read.
         if (chain && out.state != "rejected" && !out.certificate_verified) {
             if (auto waited{WaitedActionStatus(market, action.Id(), wait)}) return std::move(*waited);
         }
