@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -172,6 +173,7 @@ public:
     void FlushNow(bool sync) noexcept;
     //! Disk candles of one market with open in [from_ms, before_ms), at most
     //! `limit`, ascending; `older` is set when one exists before from_ms.
+    //! Never holds the store mutex across the read.
     std::vector<flowmesh::ObservedCandle> ReadCandles(const flowmesh::MarketId& market, flowmesh::CandleInterval interval,
                                                       int64_t from_ms, int64_t before_ms, size_t limit, bool* older = nullptr) const;
     //! Tests only: runs inside every flush, before its batch is written.
@@ -184,14 +186,18 @@ private:
         std::chrono::steady_clock::time_point next_sweep{};
     };
     void FlushLoop();
-    void WipeMarket(const flowmesh::MarketId& market);
+    //! Caller holds m_flush_mutex.
+    static void WipeMarket(CDBWrapper& db, const flowmesh::MarketId& market);
 
     const Options m_options;
+    //! Published once, under both mutexes (Open); read under either. Freed
+    //! only with the store, so a reader may use it after dropping m_mutex.
     std::unique_ptr<CDBWrapper> m_db;
     mutable std::mutex m_mutex;
-    std::vector<Attached> m_attached;
+    //! A list: a flush pass keeps pointers to its items across the pass.
+    std::list<Attached> m_attached;
     std::function<void()> m_hook;
-    //! Serializes flush passes (the thread's and Stop's).
+    //! Serializes Open and flush passes (the thread's and Stop's).
     std::mutex m_flush_mutex;
     std::condition_variable m_cv;
     bool m_stopping{false};

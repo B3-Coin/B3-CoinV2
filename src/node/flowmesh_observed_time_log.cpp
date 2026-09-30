@@ -316,8 +316,12 @@ FlowMeshObservedTimeStore::~FlowMeshObservedTimeStore() { Stop(); }
 bool FlowMeshObservedTimeStore::Open(std::string& error)
 {
     std::lock_guard flush{m_flush_mutex};
-    std::lock_guard lock{m_mutex};
-    if (m_db) return true;
+    {
+        std::lock_guard lock{m_mutex};
+        if (m_db) return true;
+    }
+    // Built and checked without m_mutex (readers never wait for this disk
+    // work), then published under it.
     DBParams params{.path = m_options.path, .cache_bytes = m_options.cache_bytes, .memory_only = m_options.memory_only};
     for (const bool wipe : {false, true}) {
         try {
@@ -328,7 +332,11 @@ bool FlowMeshObservedTimeStore::Open(std::string& error)
             std::unique_ptr<CDBIterator> it{db->NewIterator()};
             it->SeekToFirst();
             if (!it->StatusOK()) throw dbwrapper_error{"unreadable observed-time database"};
-            m_db = std::move(db);
+            it.reset();
+            {
+                std::lock_guard lock{m_mutex};
+                m_db = std::move(db);
+            }
             if (wipe) LogWarning("FlowMesh observed-time database was unreadable and has been recreated empty\n");
             return true;
         } catch (const std::exception& e) {
@@ -345,12 +353,11 @@ bool FlowMeshObservedTimeStore::IsOpen() const
     return m_db != nullptr;
 }
 
-void FlowMeshObservedTimeStore::WipeMarket(const flowmesh::MarketId& market)
+void FlowMeshObservedTimeStore::WipeMarket(CDBWrapper& db, const flowmesh::MarketId& market)
 {
-    // Caller holds m_mutex and m_flush_mutex.
-    CDBBatch batch{*m_db};
+    CDBBatch batch{db};
     size_t erased{0};
-    std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
+    std::unique_ptr<CDBIterator> it{db.NewIterator()};
     for (it->Seek(RowKey{KEY_ROW, market, 0}); it->Valid(); it->Next()) {
         RowKey key;
         if (!it->GetKey(key) || key.prefix != KEY_ROW || key.market != market) break;
@@ -364,7 +371,7 @@ void FlowMeshObservedTimeStore::WipeMarket(const flowmesh::MarketId& market)
         ++erased;
     }
     batch.Write(MetaKey{KEY_META, market}, MetaValue{});
-    m_db->WriteBatch(batch, true);
+    db.WriteBatch(batch, true);
     LogWarning("FlowMesh market %s: observed times did not match this node's certified log and were cleared (%u records)\n",
                market.GetHex(), static_cast<unsigned>(erased));
 }
@@ -387,7 +394,7 @@ void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTim
             MetaValue meta;
             const bool has_meta{m_db->Read(MetaKey{KEY_META, market}, meta)};
             if (has_meta && (meta.version != META_VERSION || meta.domain != log->Domain())) {
-                WipeMarket(market);
+                WipeMarket(*m_db, market);
             }
             m_db->Write(MetaKey{KEY_META, market}, MetaValue{META_VERSION, log->Domain()}, true);
             // Rows the production store never certified here are erased.
@@ -420,7 +427,7 @@ void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTim
                 rows.push_back(*stamp);
             }
             if (mismatch) {
-                WipeMarket(market);
+                WipeMarket(*m_db, market);
                 rows.clear();
             }
             it->Seek(RowKey{KEY_ROW, market, 0});
@@ -507,20 +514,22 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
         std::lock_guard flush{m_flush_mutex};
         std::vector<Attached*> attached;
         std::function<void()> hook;
+        CDBWrapper* db{nullptr};
         {
             std::lock_guard lock{m_mutex};
             for (auto& item : m_attached) attached.push_back(&item);
             hook = m_hook;
+            db = m_db.get();
         }
         const auto now{std::chrono::steady_clock::now()};
         for (auto* item : attached) {
             auto& log{*item->log};
             auto pending{log.TakePending()};
             if (pending.Empty() && now < item->next_sweep) continue;
-            if (!m_db) continue;
+            if (!db) continue;
             try {
                 const uint256 market{log.MarketId()};
-                CDBBatch batch{*m_db};
+                CDBBatch batch{*db};
                 std::optional<uint64_t> newest_row;
                 for (const auto& row : pending.rows) {
                     batch.Write(RowKey{KEY_ROW, market, row.sequence}, ToRow(row));
@@ -537,7 +546,7 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
                 if (now >= item->next_sweep) {
                     item->next_sweep = now + SWEEP_INTERVAL;
                     // Retention, a bounded amount per sweep.
-                    std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
+                    std::unique_ptr<CDBIterator> it{db->NewIterator()};
                     size_t erased{0};
                     if (newest_row && *newest_row >= ROW_RETENTION && item->oldest_row && *item->oldest_row <= *newest_row - ROW_RETENTION) {
                         const uint64_t keep_from{*newest_row - ROW_RETENTION + 1};
@@ -563,7 +572,7 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
                     }
                 }
                 if (hook) hook();
-                m_db->WriteBatch(batch, sync);
+                db->WriteBatch(batch, sync);
                 log.SetPersisted(true);
             } catch (const std::exception& e) {
                 // Lost rows become a gap after a restart; the market is
@@ -584,9 +593,16 @@ std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(con
     if (older) *older = false;
     std::vector<flowmesh::ObservedCandle> out;
     try {
-        std::lock_guard lock{m_mutex};
-        if (!m_db || before_ms <= from_ms) return out;
-        std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
+        CDBWrapper* db{nullptr};
+        {
+            std::lock_guard lock{m_mutex};
+            db = m_db.get();
+        }
+        // Read without m_mutex: the database outlives every reader (it is
+        // freed only with the store) and LevelDB reads are safe beside the
+        // flush thread's writes.
+        if (!db || before_ms <= from_ms) return out;
+        std::unique_ptr<CDBIterator> it{db->NewIterator()};
         const auto matches = [&](const CandleKey& key) {
             return key.prefix == KEY_CANDLE && key.market == market && key.interval == static_cast<uint8_t>(interval);
         };
@@ -608,6 +624,7 @@ std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(con
         }
     } catch (const std::exception&) {
         out.clear();
+        if (older) *older = false;
     }
     return out;
 }
