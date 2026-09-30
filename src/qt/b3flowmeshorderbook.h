@@ -111,8 +111,10 @@ public:
     bool showsVerifiedLevels() const { return m_verified; }
     //! Flash progress of a row, 0 (none) to 1 (peak), at the book's clock.
     double flashIntensity(int row) const;
-    //! The row the pointer is over, or -1.
+    //! The row the pointer is over, or -1; the book highlights from the
+    //! spread to it.
     int hoverRow() const { return m_hover_row; }
+    void setHoverRow(int row);
     //! Offers row `row`'s exact price to the ticket (as a click does).
     bool activateRow(int row);
     //! The price-grouping selector's choices (BookGroupingChoices) and the
@@ -140,7 +142,6 @@ private:
     };
     void layoutRows();
     void viewResized();
-    void setHoverRow(int row);
     QLabel *m_last, *m_note, *m_stale;
     QComboBox* m_grouping;
     std::vector<flowmesh::LevelGrouping> m_grouping_choices;

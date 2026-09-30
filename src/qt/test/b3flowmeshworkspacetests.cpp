@@ -1218,6 +1218,8 @@ private Q_SLOTS:
         const int own_row{inverse ? per_side - 1 : per_side + 1};
         QVERIFY(model->data(model->index(own_row, 0), B3FlowMeshLadderModel::OwnRole).toBool());
         QVERIFY(model->row(own_row).tooltip.contains(QStringLiteral("Your order")));
+        // Hover highlights from the spread to the hovered level.
+        book.setHoverRow(own_row); QCOMPARE(book.hoverRow(), own_row); book.setHoverRow(-1);
         QVERIFY(model->row(own_row).tooltip.contains(QStringLiteral("1 standing order")));
         QVERIFY(model->data(model->index(own_row, 0), Qt::AccessibleTextRole).toString().contains(QStringLiteral("includes yours")));
         QVERIFY(!model->data(model->index(per_side + 2, 0), B3FlowMeshLadderModel::OwnRole).toBool() || inverse);
@@ -1264,6 +1266,8 @@ private Q_SLOTS:
     {
         const auto original{Parse(RemoteData())};
         B3FlowMeshOrderBook book; book.resize(420, 400); book.show(); QCoreApplication::processEvents();
+        // Exact until the panel offers choices for a price.
+        QCOMPARE(book.groupingSelector()->count(), 1); QCOMPARE(book.groupingSelector()->currentText(), QStringLiteral("Exact"));
         book.setSnapshot(original, false);
         auto* last{book.findChild<QLabel*>(QStringLiteral("flowMeshBookLast"))};
         auto* note{book.findChild<QLabel*>(QStringLiteral("flowMeshBookNote"))};

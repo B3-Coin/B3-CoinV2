@@ -233,6 +233,8 @@ B3FlowMeshOrderBook::B3FlowMeshOrderBook(QWidget* parent) : QWidget{parent}
     });
     header->addWidget(m_grouping);
     layout->addLayout(header);
+    // Exact until choices for a price arrive.
+    setGroupingChoices({flowmesh::LevelGrouping{}}, flowmesh::LevelGrouping{});
     m_stale = Text(this, "flowMeshBookStale"); m_stale->setText(tr("Stale snapshot · last known orders"));
     B3Theme::markTextRole(m_stale, QStringLiteral("secondary")); m_stale->hide(); layout->addWidget(m_stale);
     m_model = new B3FlowMeshLadderModel{this};
