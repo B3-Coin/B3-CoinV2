@@ -399,8 +399,11 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     connect(m_endpoint, &QLineEdit::returnPressed, this, &B3FlowMeshTradingPanel::requestConnect);
     connect(m_endpoint, &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateConnectionState);
     connect(m_orientation, &QComboBox::currentIndexChanged, this, [this] {
-        // Never reinterpret a typed price or a deferred click in another unit.
-        m_price->clear(); m_deferred_review.reset();
+        // Never reinterpret a typed price or a deferred click in another
+        // unit: every price of the ticket, the ladder's included (hidden rows
+        // too), and with no undo or redo that would bring one back.
+        // Quantities are token amounts in both views and are kept.
+        clearTicketPrices(); m_deferred_review.reset();
         updateMarketText(); updateDataViews();
     });
     connect(m_market, &QComboBox::currentIndexChanged, this, [this] {
@@ -1030,8 +1033,10 @@ std::optional<std::vector<flowmesh::LadderStep>> B3FlowMeshTradingPanel::ladderS
     if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->units.known) return fail(tr("Verified asset precision is required."));
     const auto& units{m_snapshot->units};
     const bool buy{m_side->currentIndex() == 0}, inverse{inverted()};
-    std::vector<std::pair<QLineEdit*, QLineEdit*>> rows{{m_price, m_quantity}};
-    for (size_t i{0}; i < m_ladder_prices.size(); ++i) rows.emplace_back(m_ladder_prices[i], m_ladder_quantities[i]);
+    // The prices a view change clears are exactly the ones read here.
+    const auto prices{ticketPriceFields()};
+    std::vector<std::pair<QLineEdit*, QLineEdit*>> rows{{prices[0], m_quantity}};
+    for (size_t i{0}; i < m_ladder_quantities.size(); ++i) rows.emplace_back(prices[i + 1], m_ladder_quantities[i]);
     std::vector<flowmesh::LadderStep> steps;
     for (size_t i{0}; i < rows.size(); ++i) {
         const QString price{rows[i].first->text().trimmed()}, quantity{rows[i].second->text().trimmed()};
@@ -1059,6 +1064,25 @@ QStringList B3FlowMeshTradingPanel::ladderText() const
     QStringList out;
     for (size_t i{0}; i < m_ladder_prices.size(); ++i) out << m_ladder_prices[i]->text() << m_ladder_quantities[i]->text();
     return out;
+}
+
+std::array<QLineEdit*, flowmesh::FLOWMESH_LADDER_MAX_STEPS> B3FlowMeshTradingPanel::ticketPriceFields() const
+{
+    static_assert(std::tuple_size_v<decltype(m_ladder_prices)> + 1 == flowmesh::FLOWMESH_LADDER_MAX_STEPS);
+    static_assert(std::tuple_size_v<decltype(m_ladder_quantities)> == std::tuple_size_v<decltype(m_ladder_prices)>);
+    std::array<QLineEdit*, flowmesh::FLOWMESH_LADDER_MAX_STEPS> fields{};
+    fields[0] = m_price;
+    std::copy(m_ladder_prices.begin(), m_ladder_prices.end(), fields.begin() + 1);
+    return fields;
+}
+
+void B3FlowMeshTradingPanel::clearTicketPrices()
+{
+    // setText, never clear(): clear() is an undoable edit, and on a field
+    // that is already empty it keeps the redo, so Undo or Redo would bring
+    // the old text back to be read in the other unit. setText drops the
+    // whole history, even when the field is already empty.
+    for (auto* field : ticketPriceFields()) field->setText(QString{});
 }
 
 flowmesh::LevelGrouping B3FlowMeshTradingPanel::bookGrouping() const

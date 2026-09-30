@@ -2219,6 +2219,66 @@ private Q_SLOTS:
         QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("replaces that side's whole order")));
         QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QVERIFY(m_wallet->IsLocked());
     }
+    void flippingTheViewClearsEveryTicketPriceWithItsHistory()
+    {
+        // A ticket price is B3 per token in one view and token per B3 in the
+        // other: a flip clears every price of the ticket, the ladder's too,
+        // with the undo and redo that would bring one back. Token quantities
+        // mean the same in both views and are kept.
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        const auto prices = [&] { std::vector<QLineEdit*> out{panel.m_price}; out.insert(out.end(), panel.m_ladder_prices.begin(), panel.m_ladder_prices.end()); return out; };
+        const auto type = [](QLineEdit* field, const char* text) { field->setText(QString{}); QTest::keyClicks(field, QString::fromLatin1(text)); };
+        QString reviewed;
+        const auto review = [&] {
+            reviewed.clear();
+            QTimer::singleShot(0, &panel, [&] { if (panel.m_confirmation) { reviewed = panel.m_confirmation->text(); panel.m_confirmation->done(QMessageBox::Cancel); } });
+            panel.begin(B3FlowMeshTrading::Operation::Order);
+        };
+        panel.m_ladder->setChecked(true);
+        // Typed, so each field has an undo history: bids resting below the market.
+        type(panel.m_price, "1"); type(panel.m_quantity, "0.3");
+        type(panel.m_ladder_prices[0], "0.5"); type(panel.m_ladder_quantities[0], "0.2");
+        type(panel.m_ladder_prices[1], "0.25"); type(panel.m_ladder_quantities[1], "0.4");
+        // Typed, then undone: an empty field whose redo would bring it back.
+        type(panel.m_ladder_prices[2], "0.1"); panel.m_ladder_prices[2]->undo();
+        QVERIFY(panel.m_ladder_prices[2]->text().isEmpty()); QVERIFY(panel.m_ladder_prices[2]->isRedoAvailable());
+        const auto canonical{panel.ladderSteps()};
+        QVERIFY(canonical); QCOMPARE(canonical->size(), size_t{3});
+        QCOMPARE((*canonical)[1], (flowmesh::LadderStep{500, 200'000}));
+        // This fixture reaches the review, so the refusal below is real.
+        review(); QVERIFY2(reviewed.contains(QStringLiteral("0.4 tUSD at 0.25 B3 / tUSD")), qPrintable(reviewed));
+        auto* orientation{panel.findChild<QComboBox*>(QStringLiteral("flowMeshOrientation"))};
+        QVERIFY(orientation); QVERIFY(orientation->isEnabled());
+        orientation->setCurrentIndex(1); // The real view selection callback.
+        for (auto* field : prices()) {
+            QVERIFY2(field->text().isEmpty(), qPrintable(field->objectName()));
+            QVERIFY2(!field->isUndoAvailable() && !field->isRedoAvailable(), qPrintable(field->objectName()));
+        }
+        QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.3"));
+        QCOMPARE(panel.m_ladder_quantities[0]->text(), QStringLiteral("0.2")); QCOMPARE(panel.m_ladder_quantities[1]->text(), QStringLiteral("0.4"));
+        // Entering the first price again never revives the others (read as
+        // tUSD per B3, resting bids at 0.5 and 0.25 B3 became 2 and 4 B3).
+        panel.m_price->setText(QStringLiteral("1"));
+        QString error;
+        QVERIFY(!panel.ladderSteps(&error)); QVERIFY2(error.contains(QStringLiteral("price 2")), qPrintable(error));
+        QVERIFY(panel.m_ticket_total->text().startsWith(QStringLiteral("Ladder  —")));
+        review(); QVERIFY(reviewed.isEmpty()); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_thread);
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("quantity for price 2")));
+        for (auto* field : panel.m_ladder_prices) { field->undo(); field->redo(); QVERIFY(field->text().isEmpty()); }
+        // The other direction clears the same way.
+        type(panel.m_ladder_prices[0], "0.5");
+        orientation->setCurrentIndex(0);
+        for (auto* field : prices()) { QVERIFY(field->text().isEmpty()); QVERIFY(!field->isUndoAvailable()); QVERIFY(!field->isRedoAvailable()); }
+        // Hidden ladder rows keep no price across a flip either: checking
+        // Ladder again would show it, now in the other unit.
+        type(panel.m_ladder_prices[1], "0.25"); panel.m_ladder->setChecked(false);
+        QVERIFY(panel.m_ladder_rows->isHidden());
+        orientation->setCurrentIndex(1);
+        panel.m_ladder->setChecked(true);
+        for (auto* field : prices()) { QVERIFY(field->text().isEmpty()); QVERIFY(!field->isUndoAvailable()); QVERIFY(!field->isRedoAvailable()); }
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
     void ladderOrdersAreBookLevelsForTheMarketableLimit()
     {
         // Another account's ask ladder is exact limit liquidity, so the book
