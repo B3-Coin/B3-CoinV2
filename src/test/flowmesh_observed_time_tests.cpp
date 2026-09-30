@@ -28,7 +28,7 @@ using flowmesh::ObservedStamp;
 // 2026-09-30T12:00:00Z
 constexpr int64_t T0{1790769600000};
 
-uint256 Hash(const uint64_t sequence)
+uint256 EntryHash(const uint64_t sequence)
 {
     uint256 out;
     out.data()[0] = static_cast<unsigned char>(sequence & 0xff);
@@ -41,7 +41,7 @@ ObservedStamp Stamp(const uint64_t sequence, const int64_t ms, const ObservedMod
 {
     ObservedStamp out;
     out.sequence = sequence;
-    out.hash = Hash(sequence);
+    out.hash = EntryHash(sequence);
     out.mode = mode;
     out.ms = mode == ObservedMode::UNTIMED ? 0 : ms;
     out.flags = flags;
@@ -53,7 +53,7 @@ ClearingTick Tick(const uint64_t sequence, const CAmount price, const CAmount vo
 {
     ClearingTick out;
     out.sequence = sequence;
-    out.microblock_hash = Hash(sequence);
+    out.microblock_hash = EntryHash(sequence);
     out.cleared = volume > 0;
     out.price = volume > 0 ? price : 0;
     out.volume = volume;

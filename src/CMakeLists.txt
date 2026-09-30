@@ -274,6 +274,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/flowmesh_client.cpp
   node/flowmesh_client_settlement.cpp
   node/flowmesh_client_ticks.cpp
+  node/flowmesh_observed_time_log.cpp
   node/flowmesh_https.cpp
   flowmesh/client_evidence.cpp
   flowmesh/market_view.cpp
