@@ -156,11 +156,12 @@ panel never sends more than a burst of two watch reads and then one per
 second (the provisional C7 default of 2026-09-30) is held back: each local
 read copies the book, the account and the store's history under the node's
 market mutex, which the FlowMesh worker's tick also takes, and the
-validator A/B showed the tick waiting for it (p99 0.02 ms with no reader,
-0.12 ms at two full reads a second, 10.2 ms and a 25.7 ms maximum at ten).
-It needs a node change first: local reads served from a snapshot published
-per certified head, outside that mutex. A reply that names an endpoint marks
-a panel remote at once. The next read starts when the pacing allows it, on
+validator A/B showed the tick waiting behind such reads, worst at ten a
+second (maxima of 25.7 and 200.9 ms, and 1.1 s behind one stalled read,
+against at most 7.1 ms with no reader; flowmesh-latency-definition.md has
+the per-holder table). It needs a node change first: local reads served
+from a snapshot published per certified head, outside that mutex. A reply
+that names an endpoint marks a panel remote at once. The next read starts when the pacing allows it, on
 a precise timer, not on the next 500 ms tick; on a busy market that means a
 remote endpoint's watch reads now reach the full two a second (they were
 held to the tick before, 500-1000 ms apart), and each changed head still
@@ -188,13 +189,40 @@ A remote endpoint without live updates is polled on the 500 ms tick, never
 back to back: a slow link's read (longer than 500 ms) is followed by the next
 tick's, so the passive share of the client's work gate does not rise.
 
-`-flowmeshapiwatch` stays off by default. A remote trader polls at two reads
-a second unless the endpoint's operator enables it; an operator who serves
-their own trading client can enable it now, after measuring the verified
-state each new head makes the client download (every new head costs one
-whole-state read and its verification under the client's work gate; a
-verified incremental apply would remove it and needs its own design) and
-the items of section 6.
+**A remote client (a trader's computer reading a VPS endpoint).** What
+the panel does for it: a verified reply with a new head is applied and the
+book repainted at once, whether it came from a live update or a poll; a
+same-head reply (a quiet watch timeout, a same-head poll, including the
+first one after each new head) updates status only, with no view rebuild,
+book install or paint; cells change in place. What it does not change:
+commit-to-screen latency (U1-remote) is the same as before this round,
+because it is set outside Qt. In order of effect:
+
+1. `-flowmeshapiwatch` stays off by default, so a remote trader polls at two
+   reads a second and a new head waits for the next poll. An operator who
+   serves their own trading client (the owner's VPS) can enable it now: first
+   measure the `state_bytes` each new head makes the client download on that
+   market, then the items of section 6. With it the next read is armed at
+   once after a changed head, at most two a second.
+2. Every new head costs the remote client an `updates` round trip that
+   reports the head, then a `snapshot` round trip that downloads the whole
+   market state (`state_bytes`, up to 8 MiB) with its certified microblock,
+   BLS verification of the certificate, decoding the whole state and checking
+   its root against the certified one, and a durable save of the client's
+   high-water mark, all under the client's work gate, which is not
+   preemptive (an order waits for a passive read already holding it). The book, levels, account and
+   own-order rows come from that verified state. Removing this per-head
+   download is the deferred *verified incremental state apply*: the client
+   would fetch only the new certified entries (from the endpoint's
+   recent-certified window, through a capability-advertised, bounded,
+   admission-charged method), re-execute them with the consensus code on the
+   state it already holds, check the resulting state root against the
+   certificate, and fall back to a snapshot on any gap or mismatch, with no
+   cold reads or BLS work under the endpoint's market mutex. It needs its own
+   design and review (owner go/no-go); no consensus or signed-format change.
+3. The remote book stays frozen while a review is open or an order is in
+   flight (a display read would hold the work gate the order needs), and
+   the remote client never gets the local engine's display-only reads.
 
 A reported gap adds a log line, a separator row in the trade history and an
 "event gap" suffix for 30 s, and the tracked request is reconciled first.

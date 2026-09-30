@@ -148,18 +148,23 @@ n reported, p99 only from n >= 100, and the metadata of the harness report.
 for a head at least as new as the one measured, or, when that install
 changed pixels, the paint that follows it. A head whose changes lie below
 the visible rows paints nothing, so "first paint" alone would overstate U1.
-"Quiet" means an inter-head gap of at least one second (the watch's burst of
-two times the refill); anything faster is "busy".
+"Quiet" means an inter-head gap of at least one second: two refills of the
+500 ms live-update pacing (the watch's burst of two), which today applies to
+the local engine and a remote endpoint alike; if the local pacing changes,
+"quiet" for U1-local is two of its refills. Anything faster is "busy". The
+harness's quiet run holds about 24 heads (30 s at one per 1.2 s), so it
+estimates p95; the quiet p99 target needs a run of at least 100 heads and is
+not gated.
 
 | Metric | Measures | Provisional target |
 |---|---|---|
 | U1-local | Local engine: head committed -> the book shows it | Quiet: p95 <= 50 ms, p99 <= 100 ms. Busy at 5 heads/s: p95 <= 600 ms at the shipped two local reads a second (one 500 ms refill plus processing); p95 <= 150 ms needs ten a second (C7, held back, see below). 20 heads/s is a stress case, reported only. |
 | U1-qt | Any backend: verified reply returned -> the book shows it | p95 <= 30 ms |
-| U1-remote | Remote endpoint head -> the book shows it | Reported, not gated (a WAN gate needs an owner ruling); dominated by the per-head verified state download |
+| U1-remote | Remote endpoint head -> the book shows it | Reported, not gated (a WAN gate needs an owner ruling); unchanged by this round: set by the endpoint's live updates (off by default, so a 0.5 s poll) and the per-head verified state download (see "Remote endpoint" below) |
 | U2 | GUI stall at 20 applied updates/s with the pointer on the chart | Stall p99 <= 16 ms, max <= 50 ms; update handler p95 <= 8 ms |
 | U3 | Chart hover, wheel zoom and drag pan paint, 1320 x 940 | p95 <= 8 ms |
 | U4 | The 500 ms housekeeping tick with unchanged data | <= 2 ms and no book or chart paint (the marketable limit is included) |
-| U4b | An unchanged reply (quiet watch timeout, same-head poll) | <= 2 ms and no book or chart paint |
+| U4b | An unchanged reply (quiet watch timeout, same-head poll), including the first one after each new head | <= 2 ms, no view rebuild and no book or chart paint (remote and local) |
 | U5 | Market switch -> the new market's book is shown | <= 50 ms (local engine: a fresh verified read) |
 
 **Harness.** `test_b3_flowmeshperf-qt` (QT_QPA_PLATFORM=minimal) runs these
@@ -192,41 +197,91 @@ never start back to back (the remote client's work gate is not preemptive).
 --latency-local-reader-hz=N [--latency-local-reader-busy] --latency-lock-capture`
 serves a trading panel's local live updates on operator 0 during the measured
 phase (as the panel's watch worker sends them, at up to N reads a second) and
-records operator 0's market-mutex waits, so M1 and the waits of the runtime's
-other mutex holders can be compared at 0, 2 and 10 reads a second. The busy
-mode never waits (every read is a full read): an upper bound of the reader's
-load at that rate.
+records operator 0's market-mutex waits per holder: the FlowMesh runtime
+worker (ProcessTick, ProcessMessage, ProcessDeliveryEvent; pooled as
+`runtime_worker_wait_ms`, the tick alone as `runtime_tick_wait_ms`), client
+calls (`client_calls_wait_ms`: submissions, status and snapshot reads) and
+MarketData reads (the reader's and the fixture's own). Compare the worker's
+tail per holder across arms: pooled, its thousands of near-zero message
+waits hide a tick that waits behind a reader. The busy mode never waits
+(every read is a full read): an upper bound of the reader's load at that
+rate.
 
 **Measured on this branch** (RelWithDebInfo, minimal QPA, the owner's Mac,
-report runs; before -> after this round's responsiveness commits):
+strict report runs; before this round -> after it, with local reads held at
+two a second):
 
 | Metric | Before | After |
 |---|---|---|
-| U1-local quiet | p95 12 ms | p95 17 ms (n = 24; within noise, target 50) |
-| U1-local busy, 5 heads/s | p95 485 ms | p95 15 ms (ten local reads a second) |
-| U1-local stress, 20 heads/s | p95 470 ms | p95 74 ms |
-| U1-qt | p95 11 ms | p95 12-16 ms |
-| U2 handler (B3 view) / stall p99 | 1.2 ms / 4.6 ms | 1.1 ms / 4.2 ms |
-| U3 hover, zoom, pan | p95 0.5 ms | p95 0.6 ms |
+| U1-local quiet | p95 12 ms | p95 18 ms (n = 24; within noise, target 50) |
+| U1-local busy, 5 heads/s | p95 485 ms | p95 420 ms (two local reads a second; 15 ms was measured with ten) |
+| U1-local stress, 20 heads/s | p95 470 ms | p95 507 ms (two a second; 74 ms with ten) |
+| U1-qt | p95 11 ms | p95 12-17 ms |
+| U2 handler (B3 view) / stall p99 | 1.2 ms / 4.6 ms | 1.4 ms / 4.2 ms |
+| U3 hover, zoom, pan | p95 0.5 ms | p95 0.7-0.9 ms |
 | U4 idle tick (marketable) | 0.01 (0.12) ms, no paint | same |
-| U4b unchanged reply | 1.0 ms, **the book repainted every time** | 0.05 ms, no paint |
-| U5 market switch (local) | p95 20 ms | p95 20 ms |
+| U4b unchanged reply | 1.0 ms, **the book repainted every time** | 0.07 ms, no paint; the first one after a new head no longer rebuilds the views |
+| U5 market switch (local) | p95 20 ms | p95 21 ms |
 
 A strict run (`FLOWMESH_UI_PERF_STRICT=1`) passes every provisional target
 on this Mac with this RelWithDebInfo build; a Release build is the intended
 reference.
 
-The remote pacing without a network (5 heads/s, two reads a second) costs
-U1 p95 about 415 ms; WAN U1-remote adds the link and the per-head verified
-state download (reported only).
+**Local reads at ten a second (C7): held back.** The provisional default of
+2026-09-30 read the local engine up to ten times a second. Each local read
+copies the book, the account and the store's history and ticks under the
+node's market mutex, which the runtime worker's tick also takes. The A/B
+(four operators, 2 + 40 bid/cancel pairs a run, n = 332-382 ticks a run;
+two batches, the second with the per-holder report) cannot show that ten
+reads a second is safe:
 
-The validator A/B (four operators, 40 measured bid/cancel pairs a run):
-M1 p50 461/481 ms with no reader, 464 ms (2/s) and 469 ms (10/s) watching,
-466 ms (2/s) and 483 ms (10/s, 9.5 full reads a second) never waiting; the
-other market-mutex holders' wait p99 stayed 0.4-5.7 ms in every arm. The
-runs also showed waits of 1-3 s on the market mutex in arms with and
-without a reader: MarketData reads the production store's history and
-ticks under the market mutex, so during a disk-flush stall the runtime
-tick can wait behind a reader that waits on the store mutex. That is a
-node issue independent of the panel's read rate, reported separately.
+| Arm (operator 0) | Runs | ProcessTick wait p99 | ProcessTick wait max | M1 p50 |
+|---|---|---|---|---|
+| No reader (the fixture's own reads only) | 4 | 0.015-3.9 ms | 0.04-7.1 ms | 461-486 ms |
+| 2/s, watching | 2 | 0.02 / 0.21 ms | 6.2 / 28.3 ms | 464 / 474 ms |
+| 2/s, full reads | 2 | 0.12 / 0.11 ms | 6.8 / 57.2 ms | 466 / 467 ms |
+| 10/s, watching | 2 | 1.05 / 0.12 ms | **1105.8** / 6.0 ms | 469 / 459 ms |
+| 10/s, full reads (9.5-9.6 reads/s) | 2 | **10.2** / 0.22 ms | **25.7 / 200.9** ms | 483 / 489 ms |
+
+The largest tick waits come with ten reads a second (one behind a 1.15 s
+MarketData hold: the store's history and ticks are read under the mutex, so a
+store stall becomes a mutex stall), and a single run's p99 moves by about 50x
+between batches: at this size the A/B bounds
+nothing, and the fixture has one market with few curves, so a real book's
+copies hold the mutex longer. M1 p50 stays within run-to-run noise. The
+pooled "other holders" p99 reported before (0.4-5.7 ms in every arm) mixed
+about 2,500 near-zero message waits with client calls and hid the tick.
+
+So the panel reads the local engine at the remote pacing (a burst of two,
+then one per 500 ms; `LOCAL_ARM_REFILL_MS`), as it polled before this
+round, and only while a review is open or nothing is in flight: never while
+the user's own order is being sent. Ten local reads a second needs, first, a
+node change that serves local reads outside the market mutex (a snapshot
+published per certified head, and the store's history and ticks read
+without it), then an A/B with at least 100 measured pairs a run on a
+realistic book, for the owner's C7 ruling.
+
+**Remote endpoint (the owner's Mac -> VPS).** U1-remote is unchanged by this
+round. What the panel now does for a remote client: a verified reply with a
+new head is applied and the book repainted at once (live update or poll);
+same-head replies, including the first after each new head, rebuild no view
+and paint nothing; cells change in place; with live updates the next watch
+is armed on a precise timer, so on a busy market a remote endpoint's watch
+reads now reach the full two a second (before, the tick held them 500-1000 ms
+apart); a slow link's polls never start back to back. In the harness, the
+remote pacing alone (no network, 5 heads/s, two reads a second) gives U1 p95
+about 423 ms. The two levers that matter remotely, in order:
+
+1. Enable `-flowmeshapiwatch` on the owner's own endpoints, after measuring
+   the `state_bytes` each new head makes the client download on that market
+   and the items of flowmesh-live-updates.md §6. Without it a remote trader
+   polls every 0.5 s.
+2. The owner's go/no-go on the verified incremental state apply
+   (flowmesh-live-updates.md §4): today every new head costs the remote
+   client an `updates` round trip, a whole-state `snapshot` download (up to
+   8 MiB) with BLS and state-root verification and a durable high-water-mark
+   save, all under its non-preemptive work gate. It needs its own design and
+   review.
+
+The remote book stays frozen during a review or while an order is sent.
 

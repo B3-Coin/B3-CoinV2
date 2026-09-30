@@ -109,6 +109,25 @@ the price is taken again from the verified data, never from the book's text.
 With a remote endpoint the views wait while the review is open or the order
 is sent, so no display read can delay the order.
 
+**With a remote endpoint** (your computer reading a server, for example a
+VPS): the panel repaints the book as soon as a verified update arrives, and
+replies that bring nothing new (a quiet live update, a poll at the same
+certified head) change nothing on screen. What it cannot yet change is how
+soon an update arrives:
+
+- An endpoint whose operator has not enabled live updates
+  (`-flowmeshapiwatch`, off by default) is polled every 0.5 s, so a new
+  auction can wait up to half a second before it is even asked for. If you
+  run the endpoint yourself you can enable it (see
+  [flowmesh-live-updates.md](flowmesh-live-updates.md) §4 and §6); the book
+  then follows each new head, at most twice a second.
+- Every new certified head costs your client a full download of the
+  market's verified state from the endpoint, and its verification, before
+  anything is shown. That is the main remaining delay on a remote link, and
+  it grows with the market. Removing it needs a separately designed change
+  (verifying each new auction against the state you already hold instead of
+  downloading all of it again), which is not in this version.
+
 The "Stale" marks on the book and chart follow what they show; the
 connection line and every trading check follow the verified data the checks
 use (new orders stop after 3 s without a verified update).
