@@ -129,11 +129,13 @@ class FlowMeshObservedTimeTest(FlowMeshLiquidityTest):
             ({"limit": 0}, -8, "limit is outside its supported range"),
             ({"limit": 501}, -8, "limit is outside its supported range"),
             ({"before_ms": -1}, -3, "before_ms must be a nonnegative integer"),
+            ({"before_ms": 2**63}, -8, "before_ms is outside its supported range"),
             ({"from_ms": 1}, -8, "Unknown option 'from_ms'"),
         ):
             assert_raises_rpc_error(code, message, n0.getflowmeshcandles, market, options)
-        # A window past 10000-01-01 (the display bound) is clamped, never
-        # refused: no observed time is at or past it.
+        # A window past 10000-01-01 (the display bound), up to INT64_MAX, is
+        # clamped: no observed time is at or past it. Above INT64_MAX it is
+        # refused as out of range (above).
         page = n0.getflowmeshcandles(market, {"interval": "1m", "before_ms": 2**63 - 1})
         assert_equal((page["available"], page["before_ms"], page["from_ms"], page["candles"]),
                      (True, OBSERVED_MS_LIMIT, OBSERVED_MS_LIMIT - 200 * 60_000, []))
