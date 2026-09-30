@@ -336,14 +336,18 @@ BOOST_AUTO_TEST_CASE(extend_served_candles_with_live_ticks)
     const auto& expected{node.Candles(CandleInterval::M1)};
     BOOST_REQUIRE_EQUAL(extended.size(), expected.size());
     for (size_t i{0}; i < extended.size(); ++i) BOOST_CHECK(extended[i] == expected[i]);
-    // A ring that no longer reaches the served candle, or a late stamp,
-    // asks for a refetch.
+    // A ring that no longer reaches the served candle asks for a refetch.
     std::vector<std::pair<ObservedStamp, ClearingTick>> skipped{{Stamp(7, T0 + 70'001), Tick(7, 1, 1)}};
     flowmesh::ExtendObservedCandles(served, CandleInterval::M1, skipped, &incomplete);
     BOOST_CHECK(incomplete);
+    // A late stamp without a known bound is placed nowhere: the candle it
+    // may belong to is partial, and nothing is refetched in a loop for it.
     std::vector<std::pair<ObservedStamp, ClearingTick>> late{{Stamp(5, T0 + 50'001, ObservedMode::DELAYED), Tick(5, 1, 1)}};
-    flowmesh::ExtendObservedCandles(served, CandleInterval::M1, late, &incomplete);
-    BOOST_CHECK(incomplete);
+    const auto flagged{flowmesh::ExtendObservedCandles(served, CandleInterval::M1, late, &incomplete)};
+    BOOST_CHECK(!incomplete);
+    BOOST_REQUIRE_EQUAL(flagged.size(), 1U);
+    BOOST_CHECK(flagged.back().flags & flowmesh::CANDLE_PARTIAL);
+    BOOST_CHECK_EQUAL(flagged.back().entries, served.back().entries);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

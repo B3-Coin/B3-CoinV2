@@ -168,8 +168,11 @@ private:
  * stamp with its entry's tick, ascending. The newest served candle is
  * continued, never recomputed: an entry the page did not count is added to
  * it only when it follows that candle's last sequence. Returns the extended
- * page; `incomplete` is set when a stamp did not continue the page (the ring
- * no longer reaches it) or was not LIVE, so the caller should refetch. */
+ * page; `incomplete` is set when the first stamp does not continue the page
+ * (the held ticks no longer reach it), so the caller should refetch. A late
+ * or untimed stamp is bucketed as the node does (placed only inside its
+ * bound, else the candles it may belong to are marked partial); the node's
+ * own page, refetched later, may place it more precisely. */
 std::vector<ObservedCandle> ExtendObservedCandles(std::vector<ObservedCandle> candles, CandleInterval interval,
                                                   const std::vector<std::pair<ObservedStamp, ClearingTick>>& newer,
                                                   bool* incomplete = nullptr);

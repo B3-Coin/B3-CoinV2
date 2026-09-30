@@ -214,7 +214,6 @@ std::vector<ObservedCandle> ExtendObservedCandles(std::vector<ObservedCandle> ca
         if (stamp.sequence <= served_last) continue;
         if (first && stamp.sequence != served_last + 1 && incomplete) *incomplete = true;
         first = false;
-        if (stamp.mode != ObservedMode::LIVE && incomplete) *incomplete = true;
         rollup.Add(stamp, tick);
     }
     candles.pop_back();
