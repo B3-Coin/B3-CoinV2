@@ -1296,7 +1296,27 @@ BOOST_AUTO_TEST_CASE(market_start_never_waits_for_observed_time_storage)
     const auto genesis{Genesis()};
     Retain(genesis);
     std::string error;
+    // Declared before the service, so they outlive it: its destructor's
+    // Stop may still run the store's hook.
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered{false}, release{false};
+    const auto release_hook = [&] {
+        {
+            std::lock_guard lock{mutex};
+            release = true;
+        }
+        cv.notify_all();
+    };
     node::FlowMeshService service{*m_node.chainman, ServicePath()};
+    std::future<bool> started;
+    // Released on every path before the start is awaited and before the
+    // service stops, so a failed REQUIRE below never leaves either waiting
+    // on a thread held in the hook.
+    const struct Releaser {
+        std::function<void()> release;
+        ~Releaser() { release(); }
+    } releaser{release_hook};
     auto& store{service.ObservedTimeStoreForTest()};
     BOOST_REQUIRE(store.Open(error));
     // Another market's pending row, so the store's first flush writes and
@@ -1305,33 +1325,17 @@ BOOST_AUTO_TEST_CASE(market_start_never_waits_for_observed_time_storage)
         domain, flowmesh::MarketId{uint256{uint8_t{0x77}}})};
     store.Attach(dummy, 0, {});
     dummy->Record(0, uint256::ONE, flowmesh::ObservedDelay::NONE, std::nullopt);
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool entered{false}, release{false};
     store.SetFlushHookForTest([&] {
         std::unique_lock lock{mutex};
         entered = true;
         cv.notify_all();
         cv.wait(lock, [&] { return release; });
     });
-    const auto release_hook = [&] {
-        {
-            std::lock_guard lock{mutex};
-            release = true;
-        }
-        cv.notify_all();
-    };
     store.Start();
     {
         std::unique_lock lock{mutex};
         BOOST_REQUIRE(cv.wait_for(lock, 10s, [&] { return entered; }));
     }
-    std::future<bool> started;
-    // Released on every path before the start is awaited.
-    const struct Releaser {
-        std::function<void()> release;
-        ~Releaser() { release(); }
-    } releaser{release_hook};
     started = std::async(std::launch::async, [&] {
         std::string start_error;
         const bool ok{service.Start(*m_node.peerman, start_error)};

@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <limits>
 #include <map>
@@ -766,13 +767,28 @@ BOOST_AUTO_TEST_CASE(attach_never_waits_for_a_stalled_flush)
     FakeClocks clocks;
     std::string error;
     {
-        FlowMeshObservedTimeStore store{Options(path)};
-        BOOST_REQUIRE(store.Open(error));
-        const auto busy{MakeLog(clocks)};
-        store.Attach(busy, 0, {});
+        // Declared before the store, so they outlive it: its destructor's
+        // Stop may still run the hook.
         std::mutex mutex;
         std::condition_variable cv;
         bool entered{false}, release{false};
+        const auto release_hook = [&] {
+            {
+                std::lock_guard lock{mutex};
+                release = true;
+            }
+            cv.notify_all();
+        };
+        FlowMeshObservedTimeStore store{Options(path)};
+        // Released on every path before the store stops, so a failed
+        // REQUIRE below never leaves Stop joining a thread held in the hook.
+        const struct Releaser {
+            std::function<void()> release;
+            ~Releaser() { release(); }
+        } releaser{release_hook};
+        BOOST_REQUIRE(store.Open(error));
+        const auto busy{MakeLog(clocks)};
+        store.Attach(busy, 0, {});
         store.SetFlushHookForTest([&] {
             std::unique_lock lock{mutex};
             entered = true;
@@ -788,19 +804,17 @@ BOOST_AUTO_TEST_CASE(attach_never_waits_for_a_stalled_flush)
         // The flush thread holds its pass inside the disk write.
         const auto starting{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, OTHER_MARKET, clocks.Get())};
         auto attach{std::async(std::launch::async, [&] { store.Attach(starting, 0, {}); })};
-        const bool attached{attach.wait_for(std::chrono::seconds{2}) == std::future_status::ready};
+        // Generous deadlines: a passing run never waits for them, and the
+        // failure they catch blocks until the hook is released.
+        const bool attached{attach.wait_for(std::chrono::seconds{30}) == std::future_status::ready};
         // A candles read of either market (the queued one's load waits for
         // that stalled disk) answers at once too.
         auto read{std::async(std::launch::async, [&] {
             (void)store.ReadCandles(OTHER_MARKET, CandleInterval::M1, 0, T0 + 3'600'000, 10);
             return store.ReadCandles(MARKET, CandleInterval::M1, 0, T0 + 3'600'000, 10);
         })};
-        const bool read_done{read.wait_for(std::chrono::seconds{2}) == std::future_status::ready};
-        {
-            std::lock_guard lock{mutex};
-            release = true;
-        }
-        cv.notify_all();
+        const bool read_done{read.wait_for(std::chrono::seconds{30}) == std::future_status::ready};
+        release_hook();
         attach.get();
         (void)read.get();
         BOOST_CHECK_MESSAGE(attached, "Attach waited for the flush thread's disk write");
