@@ -3026,8 +3026,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // Send's local authority check, before any network use.
         const auto pins{Pins(p.market)};
         if (pins.domain != p.domain || pins.execution_config_id != p.config) Fail("Cannot retry retained action under different domain/config");
-        // The embedded status read is charged like the waited read it replaces.
-        if (!m_action_polls.TryChargeAttempt(now)) return std::nullopt;
+        // Its optional embedded status read must yield to ordinary queued
+        // demand, just like WaitedActionStatus. Send still delivers the exact
+        // authorized action through the ordinary path when the wait yields.
+        if (!m_action_polls.TryChargeUnqueuedAttempt(now)) return std::nullopt;
         LaneSubmission s;
         s.key = {p.market, p.action.Id()};
         s.target = m_endpoints.at(endpoint);
