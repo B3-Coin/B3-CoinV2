@@ -41,6 +41,7 @@
 #include <QVBoxLayout>
 #include <algorithm>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -88,9 +89,36 @@ QString RpcError(const UniValue& error) {
     const auto& message{error.find_value("message")};
     return error.isObject() && message.isStr() ? QString::fromStdString(message.get_str()).left(500) : QStringLiteral("FlowMesh RPC failed.");
 }
+//! A curve-depth price cell whose exact inverse price, in its tooltip, is
+//! computed only when the tooltip is read: the same text, without formatting
+//! every row of a (usually hidden) table on each update.
+class DepthPriceItem final : public QTableWidgetItem
+{
+public:
+    static constexpr int TYPE{QTableWidgetItem::UserType + 1};
+    explicit DepthPriceItem(const QString& text) : QTableWidgetItem{text, TYPE} {}
+    //! No tooltip unless `inverse`.
+    void setExactInverse(bool inverse, CAmount price, int decimals)
+    {
+        m_inverse = inverse; m_price = price; m_decimals = decimals;
+    }
+    QVariant data(int role) const override
+    {
+        if (role != Qt::ToolTipRole) return QTableWidgetItem::data(role);
+        if (!m_inverse) return QString{};
+        return B3FlowMeshTradingPanel::tr("Exact inverse price: %1").arg(B3FlowMeshMarketData::ExactInversePrice(m_price, m_decimals));
+    }
+
+private:
+    bool m_inverse{false};
+    CAmount m_price{0};
+    int m_decimals{0};
+};
 // Keep the model and its existing items alive during background updates.
 // Identical data must not reset selection, scroll position or widget geometry.
-void SetRows(QTableWidget* table, const std::vector<QStringList>& rows)
+// `make`, when given, creates the new items (of a column).
+void SetRows(QTableWidget* table, const std::vector<QStringList>& rows,
+             const std::function<QTableWidgetItem*(int column, const QString& text)>& make = {})
 {
     const int scroll{table->verticalScrollBar()->value()};
     if (table->rowCount() != static_cast<int>(rows.size())) table->setRowCount(static_cast<int>(rows.size()));
@@ -98,7 +126,7 @@ void SetRows(QTableWidget* table, const std::vector<QStringList>& rows)
         for (int c{0}; c < rows[r].size(); ++c) {
             auto* item{table->item(r, c)};
             if (!item) {
-                item = new QTableWidgetItem{rows[r][c]};
+                item = make ? make(c, rows[r][c]) : new QTableWidgetItem{rows[r][c]};
                 item->setTextAlignment(c == 0 ? Qt::AlignLeft | Qt::AlignVCenter : Qt::AlignRight | Qt::AlignVCenter);
                 table->setItem(r, c, item);
             } else if (item->text() != rows[r][c]) item->setText(rows[r][c]);
@@ -726,7 +754,8 @@ void B3FlowMeshTradingPanel::updateDataViews()
             (inverse ? (buy ? tr("Spend up to ") : tr("Receive up to ")) : QString{}) + FormatAmount(c.remaining, u.decimals),
             FormatAmount(c.reserved, c.side == QStringLiteral("bid") ? 9 : u.decimals) + (c.side == QStringLiteral("bid") ? QStringLiteral(" B3") : QLatin1Char(' ') + u.ticker)});
     }
-    SetRows(m_depth_view, depth); SetRows(m_history_view, history); SetRows(m_own_view, own);
+    SetRows(m_depth_view, depth, [](int column, const QString& text) { return column == 0 ? new DepthPriceItem{text} : new QTableWidgetItem{text}; });
+    SetRows(m_history_view, history); SetRows(m_own_view, own);
     // A selection whose order changed (or whose row now shows the other
     // side) is dropped: selecting it again binds the order now shown.
     if (const auto rows{m_own_view->selectionModel()->selectedRows()}; !rows.isEmpty()) {
@@ -748,8 +777,10 @@ void B3FlowMeshTradingPanel::updateDataViews()
         }
     }
     for (int i{0}; i < m_depth_view->rowCount(); ++i) {
-        const QString tooltip{inverse ? tr("Exact inverse price: %1").arg(ExactInversePrice(s.depth[s.depth.size() - 1 - i].price, u.decimals)) : QString{}};
-        m_depth_view->item(i, 0)->setToolTip(tooltip);
+        // The exact inverse price is formatted only when its tooltip is read.
+        if (m_depth_view->item(i, 0)->type() == DepthPriceItem::TYPE) {
+            static_cast<DepthPriceItem*>(m_depth_view->item(i, 0))->setExactInverse(inverse, s.depth[s.depth.size() - 1 - i].price, u.decimals);
+        }
         if (m_depth_view->item(i, 1)->foreground().color() != B3Theme::kPositive) m_depth_view->item(i, 1)->setForeground(B3Theme::kPositive);
         if (m_depth_view->item(i, 2)->foreground().color() != B3Theme::kNegative) m_depth_view->item(i, 2)->setForeground(B3Theme::kNegative);
     }

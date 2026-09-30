@@ -3838,6 +3838,40 @@ private Q_SLOTS:
         QVERIFY(depth_changed.count() > 0); // Real updates are not suppressed.
         QVERIFY(panel.m_depth_view->item(changed_row, 1)->text() != before);
     }
+    void identicalRefreshHasNoHeaderChurnAndLazyDepthTips()
+    {
+        // Identical header text changes nothing (Qt skips it), and a depth
+        // row's exact inverse price is formatted only when its tooltip is
+        // read (the table is usually hidden).
+        B3FlowMeshTradingPanel panel; panel.resize(1200, 850);
+        AttachOfflineWallet(panel);
+        const auto snapshot{Parse(RemoteData())};
+        Observe(panel, snapshot, true);
+        QSignalSpy depth{panel.m_depth_view->model(), &QAbstractItemModel::headerDataChanged};
+        QSignalSpy history{panel.m_history_view->model(), &QAbstractItemModel::headerDataChanged};
+        QSignalSpy own{panel.m_own_view->model(), &QAbstractItemModel::headerDataChanged};
+        for (int i{0}; i < 3; ++i) { panel.m_snapshot = snapshot; panel.updateDataViews(); }
+        QCOMPARE(depth.count(), 0); QCOMPARE(history.count(), 0); QCOMPARE(own.count(), 0);
+        QVERIFY(panel.m_history_view->horizontalHeaderItem(1)->text().contains(QStringLiteral("tUSD / B3")));
+        QVERIFY(panel.m_depth_view->horizontalHeaderItem(2)->toolTip().contains(QStringLiteral("Gross quantity in B3")));
+        // Another orientation relabels once.
+        { QSignalBlocker blocked{panel.m_orientation}; panel.m_orientation->setCurrentIndex(0); }
+        panel.updateDataViews(); panel.updateDataViews();
+        QVERIFY(depth.count() > 0 && history.count() > 0);
+        QVERIFY(panel.m_history_view->horizontalHeaderItem(1)->text().contains(QStringLiteral("B3 / tUSD")));
+        QCOMPARE(panel.m_depth_view->item(0, 0)->toolTip(), QString{});
+        const int relabels{static_cast<int>(depth.count())};
+        panel.updateDataViews(); QCOMPARE(static_cast<int>(depth.count()), relabels);
+        // Inverse: the exact price, from the cell's own canonical price.
+        { QSignalBlocker blocked{panel.m_orientation}; panel.m_orientation->setCurrentIndex(1); }
+        panel.updateDataViews();
+        for (int row{0}; row < panel.m_depth_view->rowCount(); ++row) {
+            auto* item{panel.m_depth_view->item(row, 0)};
+            QCOMPARE(item->type(), QTableWidgetItem::UserType + 1);
+            const auto price{snapshot.depth[snapshot.depth.size() - 1 - static_cast<size_t>(row)].price};
+            QCOMPARE(item->toolTip(), QStringLiteral("Exact inverse price: %1").arg(ExactInversePrice(price, 6)));
+        }
+    }
     void reconciliationRefreshRetainsInputAndReceipts()
     {
         B3FlowMeshTradingPanel panel;
