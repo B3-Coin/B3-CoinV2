@@ -438,7 +438,7 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
     const QString token{known ? snapshot->units.ticker : tr("token")};
     const QString base{inverse ? QStringLiteral("B3") : token}, quote{inverse ? token : QStringLiteral("B3")};
     m_model->setHeaders({tr("Price (%1)").arg(quote), tr("Size (%1)").arg(base), tr("Total (%1)").arg(base)});
-    m_asks.clear(); m_bids.clear(); m_head.clear(); m_verified = false;
+    m_asks.clear(); m_bids.clear(); m_head.clear(); m_verified = false; m_inverse = inverse;
     const QString last_tip{tr("Historical last trade, not the current book midpoint. Endpoint-reported history is not independently execution-verified when marked reported.")};
     if (!known || !snapshot->certified || (snapshot->remote && (!snapshot->certificate_verified || !snapshot->account_state_verified))) {
         m_last->setText(tr("Last trade  —")); m_last->setToolTip(last_tip);

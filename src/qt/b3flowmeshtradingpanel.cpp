@@ -153,6 +153,29 @@ void SetChoices(QComboBox* combo, const std::vector<Choice>& choices, const QStr
     if (selected_index < 0 && fallback && !choices.empty()) selected_index = 0;
     if (combo->currentIndex() != selected_index) combo->setCurrentIndex(selected_index);
 }
+//! Whether the book of `s` offers `price` (canonical) to a click: an edge of
+//! one of the node's verified levels shown in `grouping` (exact: its price;
+//! grouped: the edge every order in it accepts), or, where the book shows no
+//! such levels, a limit or ladder price of the projected curve page.
+bool BookOffersPrice(const B3FlowMeshMarketData::Snapshot& s, const CAmount price, const bool inverse, const flowmesh::LevelGrouping& grouping)
+{
+    if (price <= 0) return false;
+    const auto* levels{s.levels ? &*s.levels : nullptr};
+    if (levels && levels->available && levels->head == s.head && levels->grouping == grouping && (grouping.exact || grouping.inverse == inverse)) {
+        for (const auto* side : {&levels->bids, &levels->asks}) {
+            const bool bid{side == &levels->bids};
+            for (const auto& level : side->levels) {
+                if ((grouping.exact || bid ? level.low : level.high) == price) return true;
+            }
+        }
+        return false;
+    }
+    const auto book{B3FlowMeshMarketData::ProjectLimitBook(s, inverse)};
+    for (const auto* rows : {&book.asks, &book.bids}) {
+        for (const auto& level : *rows) if (level.canonical_price == price) return true;
+    }
+    return false;
+}
 QString ClearingStripTip()
 {
     return B3FlowMeshTradingPanel::tr("The latest certified auction: its uniform price, matched quantity and the side whose orders were left partly unfilled at that price. Its time is when the serving node observed it, by that node's clock; auctions carry no certified time.");
@@ -1182,6 +1205,15 @@ bool B3FlowMeshTradingPanel::orderReady() const
     return orderReviewAvailable() && depositReady();
 }
 
+bool B3FlowMeshTradingPanel::dataReady() const
+{
+    const auto selected{market()};
+    return selected && m_snapshot && m_snapshot->market == selected->id && !m_read_failed &&
+           B3FlowMeshMarketData::AdmissionReady(*m_snapshot, m_response_age.isValid() ? m_response_age.elapsed() : -1,
+                                                m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1,
+                                                m_queue_age.isValid() ? m_queue_age.elapsed() : -1);
+}
+
 std::optional<B3FlowMeshMarketData::Curve> B3FlowMeshTradingPanel::editCurve() const
 {
     const auto selected{market()};
@@ -1251,14 +1283,29 @@ void B3FlowMeshTradingPanel::fillFromBook(const QString& price, const CAmount cu
     using namespace B3FlowMeshMarketData;
     const auto selected{market()};
     // The ticket's fields are frozen while an operation or a review waits.
-    if (m_busy || m_deferred_review || !selected || !m_snapshot || m_snapshot->market != selected->id || m_snapshot->head != head ||
-        !m_snapshot->units.known || m_snapshot->units.asset != selected->base) return;
+    if (m_busy || m_deferred_review) return;
+    // Critique B2: the price goes into a field that is signed after review,
+    // so it comes only from the data the gates read, shown as it is now.
+    const auto refuse = [this] {
+        notice(tr("The order book did not show current, ready verified data when clicked; its price was not used. Nothing was changed, signed or sent."));
+    };
+    if (!selected || !m_snapshot || m_snapshot->market != selected->id || m_snapshot->head != head ||
+        !m_snapshot->units.known || m_snapshot->units.asset != selected->base ||
+        m_order_book->shownInverse() != inverted() || !dataReady()) {
+        refuse();
+        return;
+    }
     const auto& units{m_snapshot->units};
     const bool buy{m_side->currentIndex() == 0}, inverse{inverted()};
     // Only a price the ticket reads back exactly, never adjusted.
     const auto limit{ParseDisplayLimit(price, units, inverse, buy)};
     if (!limit || limit->adjusted) {
         notice(tr("That book level's price cannot be entered exactly for this side. Nothing was changed, signed or sent."));
+        return;
+    }
+    // Re-derived from the verified data, never taken from the book's text.
+    if (!BookOffersPrice(*m_snapshot, limit->price, inverse, bookGrouping())) {
+        refuse();
         return;
     }
     m_marketable->setChecked(false);
@@ -1355,7 +1402,7 @@ void B3FlowMeshTradingPanel::updateControls()
     // opening its review; writes remain serialized by m_busy and m_thread.
     const bool connecting{m_deferred_connect || (m_active_result && !m_active_result->connect_url.isEmpty())};
     const bool signing{idle && !connecting && m_saved_actions_ready && !m_uncertain && !m_backend->privateKeysDisabled()};
-    const bool data_ready{selected && m_snapshot && m_snapshot->market == selected->id && !m_read_failed && B3FlowMeshMarketData::AdmissionReady(*m_snapshot, m_response_age.isValid() ? m_response_age.elapsed() : -1, m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1)};
+    const bool data_ready{dataReady()};
     const bool ready{signing && selected && selected->ready && data_ready};
     const bool settlement_ready{selected && m_snapshot && m_snapshot->market == selected->id &&
         !m_read_failed && m_response_age.isValid() && m_response_age.elapsed() <= 3000 &&

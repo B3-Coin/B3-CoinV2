@@ -112,6 +112,8 @@ public:
     bool flashing() const;
     //! The node's verified levels are shown (not the fallback projection).
     bool showsVerifiedLevels() const { return m_verified; }
+    //! The orientation the rows were last shown in (B3 view: true).
+    bool shownInverse() const { return m_inverse; }
     //! Flash progress of a row, 0 (none) to 1 (peak), at the book's clock.
     double flashIntensity(int row) const;
     //! The row the pointer is over, or -1; the book highlights from the
@@ -159,7 +161,7 @@ private:
     B3FlowMeshLadderModel* m_model;
     QTimer* m_flash_timer;
     int m_rows_per_side{0}, m_hover_row{-1};
-    bool m_verified{false};
+    bool m_verified{false}, m_inverse{false};
     //! Displayed sides, best first, and the spread row.
     std::vector<Level> m_asks, m_bids;
     QString m_spread, m_spread_tip, m_head;

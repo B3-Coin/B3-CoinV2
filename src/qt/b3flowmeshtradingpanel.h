@@ -196,6 +196,9 @@ private:
     bool withdrawalReady() const;
     bool orderReviewAvailable() const;
     bool orderReady() const;
+    //! The selected market's verified data is current and tradable: the
+    //! freshness and readiness part of every trading gate.
+    bool dataReady() const;
     //! The marketable-limit price for the ticket's side, orientation,
     //! slippage and quantity from the displayed certified snapshot. Freshness
     //! is the caller's gate.
@@ -254,9 +257,12 @@ private:
     //! size on click", its cumulative size within the available balance)
     //! goes into the ticket, as typing would. Keeps the ticket's side,
     //! unchecks the marketable limit, and never opens a review, signs or
-    //! sends anything. Ignored while an operation or a review is pending,
-    //! for data of another head, or for a price that does not round-trip
-    //! exactly through the ticket's parser.
+    //! sends anything. Ignored while an operation or a review is pending.
+    //! Refused, with a notice, unless the book shows the gates' own verified
+    //! data (its head, in this orientation) and that data is ready (see
+    //! dataReady), or when the price is not one that data offers (the price
+    //! is re-derived from it, never taken from the book's text alone), or
+    //! does not round-trip exactly through the ticket's parser.
     void fillFromBook(const QString& price, CAmount cumulative, const QString& head);
     void begin(B3FlowMeshTrading::Operation operation);
     bool confirm(const QString& text, bool final_transaction);

@@ -1441,6 +1441,49 @@ private Q_SLOTS:
         B3FlowMeshOrderBook::SetSizeOnClick(false);
         QVERIFY(!panel.m_thread); QCOMPARE(probe.writes.load(), 0);
     }
+    void clickToPriceUsesOnlyCurrentReadyVerifiedData()
+    {
+        // Critique B2: a clicked level's price goes into a field that is
+        // signed after review, so a click is refused, with a notice, unless
+        // the book shows the gates' own data (its head, this orientation),
+        // that data is ready, and the price is one it offers.
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); AttachOfflineWallet(panel);
+        Observe(panel, WithLevels(SyntheticLimitBook(10)), false);
+        panel.show(); QCoreApplication::processEvents();
+        QVERIFY(panel.m_order_book->showsVerifiedLevels());
+        auto* model{panel.m_order_book->model()};
+        const int row{model->spreadRow() + 1};
+        const auto offered{model->row(row).click_price};
+        const auto refused = [&](const std::function<void()>& change, const std::function<void()>& restore) {
+            const auto notices = [&] { return panel.m_log->toPlainText().count(QStringLiteral("its price was not used")); };
+            panel.m_price->setText(QStringLiteral("7")); const auto before{notices()};
+            change();
+            panel.m_order_book->activateRow(row);
+            const bool unchanged{panel.m_price->text() == QStringLiteral("7")};
+            const bool noticed{notices() == before + 1};
+            restore();
+            return unchanged && noticed;
+        };
+        // Ready and current: the price is used.
+        QVERIFY(panel.m_order_book->activateRow(row)); QCOMPARE(panel.m_price->text(), offered);
+        // Not ready: a failed read, stale data, a paused market.
+        QVERIFY(refused([&] { panel.m_read_failed = true; }, [&] { panel.m_read_failed = false; }));
+        QVERIFY(refused([&] { panel.m_response_age.invalidate(); }, [&] { panel.m_response_age.start(); }));
+        QVERIFY(refused([&] { panel.m_snapshot->paused = true; }, [&] { panel.m_snapshot->paused = false; }));
+        // Another head behind the book, or another orientation.
+        const auto head{panel.m_snapshot->head};
+        QVERIFY(refused([&] { panel.m_snapshot->head = QString::fromStdString(H(77).GetHex()); }, [&] { panel.m_snapshot->head = head; }));
+        QVERIFY(refused([&] { QSignalBlocker blocked{panel.m_orientation}; panel.m_orientation->setCurrentIndex(1); },
+                        [&] { QSignalBlocker blocked{panel.m_orientation}; panel.m_orientation->setCurrentIndex(0); }));
+        // The price is re-derived from the data: one it no longer offers is refused.
+        const auto levels{panel.m_snapshot->levels};
+        QVERIFY(refused([&] { panel.m_snapshot->levels->bids.levels.clear(); panel.m_snapshot->levels->asks.levels.clear(); },
+                        [&] { panel.m_snapshot->levels = levels; }));
+        // Back to current and ready: used again.
+        panel.m_price->clear();
+        QVERIFY(panel.m_order_book->activateRow(row)); QCOMPARE(panel.m_price->text(), offered);
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QVERIFY(m_wallet->IsLocked());
+    }
     void groupedBookLevelsAreLabelledWithAnEdgeEveryOrderAccepts()
     {
         B3FlowMeshOrderBook book; book.resize(420, 400); book.show(); QCoreApplication::processEvents();
