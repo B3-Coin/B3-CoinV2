@@ -2657,6 +2657,53 @@ private Q_SLOTS:
         panel.m_watch.Disable(); AwaitWatchWorker(panel);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
+    void aNewestCandlesPageThatSkipsHeldIntervalsReadsTheWholeWindow()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteDataWithTimes()));
+        panel.m_candle_interval = flowmesh::CandleInterval::M1;
+        const auto minute = [](int m, uint64_t first, uint64_t last) {
+            return CandleJson(OBSERVED_T0 + m * 60'000, first, last, 1000, 1000, 1000, 1000, 250'000);
+        };
+        const auto page = [](int64_t before_minute, int64_t span, const std::vector<UniValue>& candles, const std::string& source = "https://operator.invalid:18443") {
+            return ParseCandles(CandlesJson("1m", 60'000, OBSERVED_T0 + before_minute * 60'000, span, candles, source), flowmesh::CandleInterval::M1);
+        };
+        // A held window: minutes 0 and 1 (auctions 1 and 2).
+        panel.applyCandles(page(2, 300, {minute(0, 1, 1), minute(1, 2, 2)}), 300);
+        QCOMPARE(panel.m_candles->candles.size(), size_t{2});
+        QVERIFY(!panel.candlesDue());
+        // Hidden (or asleep, or failing) through minutes 2 to 6 of trading:
+        // the newest three intervals no longer reach the held window. Merged,
+        // minutes 2 and 3 would read as auctions without an observed time,
+        // which the source has. Not merged; the whole window is read at once.
+        panel.applyCandles(page(7, 3, {minute(4, 9, 10), minute(5, 11, 12), minute(6, 13, 13)}), 3);
+        QCOMPARE(panel.m_candles->candles.size(), size_t{2});
+        QCOMPARE(panel.m_candles->candles.back().last_sequence, uint64_t{2});
+        QVERIFY(panel.candlesDue()); QCOMPARE(panel.candlesDue()->second, size_t{300});
+        // The whole window leaves no gap the source does not have.
+        panel.applyCandles(page(7, 300, {minute(0, 1, 1), minute(1, 2, 2), minute(2, 3, 5), minute(3, 6, 8), minute(4, 9, 10),
+                                         minute(5, 11, 12), minute(6, 13, 13)}), 300);
+        QCOMPARE(panel.m_candles->candles.size(), size_t{7});
+        for (size_t i{1}; i < panel.m_candles->candles.size(); ++i) {
+            QCOMPARE(panel.m_candles->candles[i].first_sequence, panel.m_candles->candles[i - 1].last_sequence + 1);
+        }
+        QVERIFY(!panel.candlesDue());
+        // A newest page over the held newest candle (grown since) is merged.
+        panel.applyCandles(page(8, 3, {minute(5, 11, 12), minute(6, 13, 15), minute(7, 16, 16)}), 3);
+        QCOMPARE(panel.m_candles->candles.size(), size_t{8});
+        QCOMPARE(panel.m_candles->candles[6].last_sequence, uint64_t{15});
+        QVERIFY(!panel.candlesDue());
+        // So is one whose first candle directly follows the held newest one
+        // (the market was quiet in between).
+        panel.applyCandles(page(12, 3, {minute(9, 17, 17), minute(10, 18, 18), minute(11, 19, 19)}), 3);
+        QCOMPARE(panel.m_candles->candles.size(), size_t{11});
+        QVERIFY(!panel.candlesDue());
+        // A newest page from another source (the market's endpoint changed
+        // while it was read) never replaces the window.
+        panel.applyCandles(page(13, 3, {minute(12, 20, 20)}, "https://other.invalid:18443"), 3);
+        QCOMPARE(panel.m_candles->candles.size(), size_t{11});
+        QCOMPARE(panel.m_candles->source, QStringLiteral("https://operator.invalid:18443"));
+        QVERIFY(panel.candlesDue()); QCOMPARE(panel.candlesDue()->second, size_t{300});
+    }
     void timeCandlesContinueTheServedPageWithHeldTicksOnce()
     {
         B3FlowMeshTradingPanel panel;

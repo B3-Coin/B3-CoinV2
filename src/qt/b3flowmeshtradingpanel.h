@@ -584,6 +584,8 @@ private:
     QElapsedTimer m_candles_age;
     //! The forming candle could not be extended from the held ticks.
     bool m_candles_refetch{false};
+    //! A whole window of candles, and the newest few intervals.
+    static constexpr size_t CANDLES_WINDOW{300}, CANDLES_NEWEST{3};
     //! Consecutive failed candles reads of one market, interval and source:
     //! the next is not due before `retry_at` (on m_watch_clock), 2 s after
     //! the first failure and doubling to 60 s, so a failing display read

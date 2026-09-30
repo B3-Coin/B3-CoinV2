@@ -1182,7 +1182,7 @@ std::optional<std::pair<flowmesh::CandleInterval, size_t>> B3FlowMeshTradingPane
     if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->observed || !m_snapshot->observed->available) return std::nullopt;
     // After a failed read, not before its back-off.
     if (const auto* failure{candlesFailure(m_snapshot->market, m_snapshot->observed->source)}; failure && m_watch_clock.elapsed() < failure->retry_at) return std::nullopt;
-    constexpr size_t WINDOW{300}, NEWEST{3};
+    constexpr size_t WINDOW{CANDLES_WINDOW}, NEWEST{CANDLES_NEWEST};
     if (!m_candles || m_candles_market != m_snapshot->market || m_candles->interval != m_candle_interval ||
         m_candles->source != m_snapshot->observed->source || !m_candles_age.isValid()) {
         return std::pair{m_candle_interval, WINDOW};
@@ -1199,8 +1199,29 @@ void B3FlowMeshTradingPanel::applyCandles(const B3FlowMeshMarketData::CandlePage
     if (!m_snapshot) return;
     const bool same{m_candles && m_candles_market == m_snapshot->market && m_candles->interval == page.interval &&
                     m_candles->source == page.source && m_candles->available && page.available};
-    if (same && limit < 300) {
-        // The newest intervals only: they replace what the window held there.
+    if (limit < CANDLES_WINDOW && page.available) {
+        // The newest intervals only, merged only where they continue the
+        // held window of this very source: the page reaches back over the
+        // held newest candle (which may have grown since it was read), or
+        // its first candle directly follows that one's last auction, or
+        // nothing was held before the page starts. Otherwise (the panel was
+        // hidden, the machine slept, reads failed for longer than the page
+        // covers, or the source changed while it was read) the intervals in
+        // between would read as auctions without an observed time, which
+        // the source does have: the whole window is read now instead.
+        const auto reaches = [&] {
+            if (!same) return false;
+            const auto& held{m_candles->candles};
+            if (held.empty()) return page.from_ms <= m_candles->before_ms;
+            if (page.from_ms <= held.back().open_ms) return true;
+            return !page.candles.empty() && held.back().last_sequence < std::numeric_limits<uint64_t>::max() &&
+                   page.candles.front().first_sequence == held.back().last_sequence + 1;
+        };
+        if (!reaches()) {
+            m_candles_age.invalidate();
+            m_candles_failure.reset();
+            return;
+        }
         auto merged{*m_candles};
         std::erase_if(merged.candles, [&](const auto& candle) { return candle.open_ms >= page.from_ms; });
         merged.candles.insert(merged.candles.end(), page.candles.begin(), page.candles.end());

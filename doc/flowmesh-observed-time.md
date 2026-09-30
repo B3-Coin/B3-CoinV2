@@ -185,7 +185,14 @@ endpoint-reported: its prices, volumes and times are the endpoint's claims.
   with the note "This server does not report times (older version)".
 - **Candle reads.** A 300-interval window after a market, interval or source
   change (or at most every 2 s while the held ticks cannot continue it), else
-  the newest three intervals about every 10 s. A failed candle read never fails
+  the newest three intervals about every 10 s. Those newest intervals are
+  merged only where they continue the held window of the same source: they
+  reach back over its newest candle, or their first candle directly follows
+  its last auction. Otherwise the whole window is read at once. That happens
+  after the panel was hidden, the machine slept, reads failed for longer than
+  three intervals, or the endpoint changed during the read. Merging such a
+  page would draw the missing intervals as "auctions without an observed
+  time" even though the source has their times. A failed candle read never fails
   the market read, and it backs off: the next read of the same market,
   interval and source waits 2 s after the first failure, doubling to 60 s,
   until a page arrives. So a failing display read never turns live updates
