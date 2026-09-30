@@ -205,6 +205,31 @@ receipt times.
 3. Product defaults set provisionally here: ladder of up to 4 prices per
    side; "Set size on click" off; "Animate order book" on; display cap 16384
    standing curves.
+4. **Before merge or release (review of 2026-09-30, process note).** Two
+   points need the owner's explicit ruling; nothing in code was changed for
+   them:
+   - **Workspace and branch.** This work is on `feat/flowmesh-hl-learnings-claude`
+     in `/Users/josh/development/ON/B3-FlowMesh-hl`. The checked-in CLAUDE.md
+     scope lock (owner ruling 2026-09-03) names only
+     `/Users/josh/development/ON/B3-FlowMesh` on branch `FlowMesh`. The later
+     instructions this round relied on (2026-09-24 "make your own branch",
+     2026-09-29 "implement and improve this enough") are not reconciled with
+     that tracked document; under its own precedence rules the
+     reconciliation must land in a reviewed commit before this branch is
+     merged or released.
+   - **Ladder orders shipped as a provisional default.** The order-book
+     design held ladder orders (L1: the wallet RPC; L2: the Qt flow) back
+     "pending an owner ruling"; this branch ships both
+     (`submitflowmeshladder` and "Ladder · up to 4 prices"). Once any user
+     of this client places a ladder, every c10c952 and f8a3432 wallet in
+     that market shows it only under Curve depth, its marketable-limit
+     helper refuses to price the whole market (it requires a book of limit
+     orders only), and it cannot Edit a ladder. The ladder review says only
+     that wallets before this version show it as a curve. Options for the
+     ruling: accept as is; keep the Ladder checkbox behind an opt-in setting
+     until the ruling; and/or add to the review that older wallets'
+     marketable-limit helper will refuse this market. The RPC help and §3
+     already state the market-wide effect.
 
 ## 6. Tests
 
