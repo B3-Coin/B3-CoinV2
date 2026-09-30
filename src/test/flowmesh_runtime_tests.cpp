@@ -10120,12 +10120,13 @@ BOOST_AUTO_TEST_CASE(public_submitters_are_remembered_only_while_the_action_is_l
         *flowmesh::EncodeProductionActionPayload(holder)}) == flowmesh::QueueResult::ACCEPTED);
     f.Drain();
     BOOST_REQUIRE_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 2U);
-    // 20 identities (more than PUBLIC_SUBMITTER_ACTIONS / 64 = 16 of the
-    // earlier bound) each submit more than their share of different
-    // withdrawals at that sequence. Each is open when submitted, so each is
-    // counted; then its life here ends. The first ones the local queue takes
-    // and the worker's pool refuses (the sequence is held); past the queue's
-    // burst, the queue refuses them.
+    // 20 identities each submit more than their share (64) of different
+    // withdrawals at that sequence, 1,440 in all: more than e9facb6's
+    // 1,024-entry FIFO held, though under the 2,048-action bound
+    // (public_submitters_reach_the_attribution_bound reaches that). Each is
+    // open when submitted, so each is counted; then its life here ends. The
+    // first ones the local queue takes and the worker's pool refuses (the
+    // sequence is held); past the queue's burst, the queue refuses them.
     uint64_t amount{0};
     const auto withdrawal = [&] {
         flowmesh::Action action;
@@ -10174,6 +10175,130 @@ BOOST_AUTO_TEST_CASE(public_submitters_are_remembered_only_while_the_action_is_l
     BOOST_CHECK_EQUAL(dropped->submitter, client);
     BOOST_REQUIRE(dropped->consumed_by);
     BOOST_CHECK(dropped->consumed_by->action_id == consumer.Id());
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(public_submitters_reach_the_attribution_bound)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "notice_submitter_bound"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true;
+    // Only node L holds these actions, and nothing is certified.
+    const uint32_t proposer_seat{flowmesh::ProductionProposerSeatIndex(1, 0, f.seats.seats.Size())};
+    size_t proposer{0};
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        if (f.seats.secrets[i].GetPublicKey() == f.seats.seats.members[proposer_seat].key.Key()) proposer = i;
+    }
+    const size_t local{(proposer + 1) % f.runtimes.size()};
+    f.network.SetFilter([&](size_t from, size_t, const flowmesh::WireMessage& wire) {
+        if (from == local && wire.kind == flowmesh::WireMessageKind::ACTION) return false;
+        return f.Observe(wire);
+    });
+    auto& runtime{*f.runtimes[local]};
+    const auto config{f.initial.ConfigId()};
+    // The runtime's bound (PUBLIC_SUBMITTER_ACTIONS) is the ring's capacity:
+    // 2,048 live actions, a share of 64, so 32 identities fit in full.
+    constexpr size_t BOUND{flowmesh::CLIENT_NOTICE_CAPACITY}, SHARE{flowmesh::CLIENT_NOTICE_PER_SUBMITTER};
+    static_assert(BOUND == 2048 && SHARE == 64);
+    constexpr size_t FULL{BOUND / SHARE};
+    // Every action is pooled. The local queue admits a burst of 256 and then
+    // 64 a second of this node's clock, so time moves between batches.
+    size_t queued{0};
+    const auto submit = [&](const flowmesh::Action& action, const std::string& who) {
+        const auto submitted{runtime.SubmitLocalActionChecked(f.market, action, flowmesh::ClientNoticeOrigin::PUBLIC, who)};
+        BOOST_REQUIRE(submitted.admission.kind == node::FlowMeshLocalAdmission::Kind::ENQUEUE);
+        BOOST_REQUIRE(submitted.queued && *submitted.queued == flowmesh::QueueResult::ACCEPTED);
+        if (++queued % 128 == 0) {
+            f.Drain();
+            f.clocks[local].m_now += std::chrono::seconds{2};
+        }
+        return action.Id();
+    };
+    // Sequences first..first+count-1 of one account, within its window.
+    const auto actions = [&](const CKey& key, const std::string& who, uint64_t first, size_t count) {
+        std::vector<uint256> ids;
+        for (uint64_t n{first}; n < first + count; ++n) {
+            ids.push_back(submit(SignedAction(key, f.domain, config, n, flowmesh::ActionType::CANCEL_BID), who));
+        }
+        return ids;
+    };
+    const auto identity = [](size_t i) { return strprintf("ipv6/64:20010db8%08x", i); };
+    const auto submitter = [&](const uint256& id) { return runtime.PublicSubmitterForTest(f.market, id).value_or("(none)"); };
+    const std::string client{"198.51.100.7"};
+    CKey client_key;
+    client_key.MakeNewKey(true);
+    const auto proof{actions(client_key, client, 0, 1).front()};
+    // 31 other identities each fill their share: 32 identities in all.
+    std::vector<std::vector<uint256>> held;
+    for (size_t i{0}; i + 1 < FULL; ++i) {
+        CKey key;
+        key.MakeNewKey(true);
+        held.push_back(actions(key, identity(i), 0, SHARE));
+    }
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 1 + (FULL - 1) * SHARE);
+    BOOST_CHECK_EQUAL(submitter(proof), client);
+    // A 33rd identity: all but its last action fill the bound exactly, and
+    // everyone keeps their attributions.
+    CKey last_key;
+    last_key.MakeNewKey(true);
+    auto last{actions(last_key, identity(FULL - 1), 0, SHARE - 1)};
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), BOUND);
+    BOOST_CHECK_EQUAL(submitter(proof), client);
+    // Its last: every identity is within its share, so the oldest
+    // attribution overall, the client's, is forgotten. Only the attribution:
+    // the pool still holds the client's action.
+    last.push_back(actions(last_key, identity(FULL - 1), SHARE - 1, 1).front());
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), BOUND);
+    BOOST_CHECK_EQUAL(submitter(proof), "(none)");
+    BOOST_CHECK_EQUAL(submitter(last.back()), identity(FULL - 1));
+    BOOST_CHECK_EQUAL(submitter(held.front().front()), identity(0));
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 1 + FULL * SHARE);
+    // An identity at its share replaces only its own oldest.
+    CKey more_key;
+    more_key.MakeNewKey(true);
+    const auto more{actions(more_key, identity(0), 0, 1).front()};
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), BOUND);
+    BOOST_CHECK_EQUAL(submitter(more), identity(0));
+    BOOST_CHECK_EQUAL(submitter(held[0][0]), "(none)");
+    BOOST_CHECK_EQUAL(submitter(held[0][1]), identity(0));
+    BOOST_CHECK_EQUAL(submitter(held[1][0]), identity(1));
+    BOOST_CHECK_EQUAL(submitter(last.front()), identity(FULL - 1));
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 2 + FULL * SHARE);
+}
+
+BOOST_AUTO_TEST_CASE(a_certified_public_action_ends_its_submitters_attribution)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "notice_submitter_certified"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    const std::string client{"198.51.100.7"};
+    CKey key;
+    key.MakeNewKey(true);
+    const auto action{SignedAction(key, f.domain, f.initial.ConfigId(), 0, flowmesh::ActionType::CANCEL_BID)};
+    const auto submitted{runtime.SubmitLocalActionChecked(f.market, action, flowmesh::ClientNoticeOrigin::PUBLIC, client)};
+    BOOST_REQUIRE(submitted.queued && *submitted.queued == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    // Its frame was handled while the pool holds it: the attribution stays.
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 1U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmitterForTest(f.market, action.Id()).value_or("(none)"), client);
+    f.block_commits = false;
+    BOOST_REQUIRE(Settle(f, [&] { return f.AllAt(2); }));
+    f.Drain();
+    // Certified: the pool drops it on commit, and its attribution with it.
+    const auto status{runtime.ClientActionStatus(f.market, action.Id())};
+    BOOST_REQUIRE(status);
+    BOOST_CHECK(status->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+    BOOST_CHECK(!runtime.PublicSubmitterForTest(f.market, action.Id()));
     BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
 }
 
