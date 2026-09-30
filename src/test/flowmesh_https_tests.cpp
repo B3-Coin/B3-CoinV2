@@ -14,6 +14,7 @@
 #include <crypto/sha256.h>
 #include <dbwrapper.h>
 #include <flowmesh/bls_certificate.h>
+#include <flowmesh/market_view.h>
 #include <flowmesh/outcome_evidence.h>
 #include <flowmesh/production_engine.h>
 #include <flowmesh/production_wire.h>
@@ -2477,9 +2478,16 @@ struct ClientLaneFixture : TestingSetup {
     std::vector<bls::SecretKey> secrets;
     //! The bootstrap user deposit established on this chain (account 0x41).
     COutPoint deposit_outpoint;
+    //! ClientLaneFixture(n) only: n more keyed accounts, each with a
+    //! bootstrap user deposit of BOOK_DEPOSIT base units (outputs 1..n of the
+    //! same transaction), for books wider than one curve page.
+    static constexpr CAmount BOOK_DEPOSIT{1'000};
+    std::vector<CKey> book_keys;
+    std::vector<COutPoint> book_deposits;
     CBlockIndex* original_tip{nullptr};
 
-    ClientLaneFixture()
+    ClientLaneFixture() : ClientLaneFixture(size_t{0}) {}
+    explicit ClientLaneFixture(const size_t book_accounts)
         : TestingSetup(ChainType::REGTEST, {.extra_args = {"-b3modernregtest", "-b3flowmeshtest", "-b3corridorlength=130"}})
     {
         HttpsFixture::CreateCertificate(cert, key, pin, true);
@@ -2509,7 +2517,22 @@ struct ClientLaneFixture : TestingSetup {
         CMutableTransaction bootstrap;
         bootstrap.version = 2;
         bootstrap.vout.push_back(*deposit);
+        for (size_t i{0}; i < book_accounts; ++i) {
+            CKey book_key;
+            std::array<unsigned char, 32> secret{};
+            secret[0] = 0x6b;
+            secret[30] = static_cast<unsigned char>((i + 1) >> 8);
+            secret[31] = static_cast<unsigned char>(i + 1);
+            book_key.Set(secret.begin(), secret.end(), true);
+            const auto holder{flowmesh::AccountForKey(XOnlyPubKey{book_key.GetPubKey()})};
+            const auto output{modern::MakeDexVaultOutput(asset, BOOK_DEPOSIT, vault, modern::VAULT_KIND_USER_DEPOSIT,
+                                                         modern::FlowMeshUserDepositShard(vault, holder), holder)};
+            BOOST_REQUIRE(output);
+            bootstrap.vout.push_back(*output);
+            book_keys.push_back(book_key);
+        }
         deposit_outpoint = COutPoint{bootstrap.GetHash(), 0};
+        for (size_t i{0}; i < book_accounts; ++i) book_deposits.emplace_back(bootstrap.GetHash(), static_cast<uint32_t>(i + 1));
 
         LOCK(::cs_main);
         auto& chainstate{chainman.ActiveChainstate()};
@@ -6627,6 +6650,183 @@ BOOST_AUTO_TEST_CASE(indicative_clearing_comes_from_verified_state_on_both_backe
     BOOST_CHECK_EQUAL(moved->snapshot.next_microblock_sequence, 2U);
     BOOST_CHECK(moved->indicative->head == moved->snapshot.last_microblock_hash);
     remote.reset();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+//! More standing curves than one 128-curve page.
+struct WideBookFixture : ClientLaneFixture {
+    static constexpr size_t ACCOUNTS{150};
+    WideBookFixture() : ClientLaneFixture{ACCOUNTS} {}
+};
+
+//! A loopback relay in front of a real endpoint that rewrites the
+//! endpoint's unauthenticated projection (reported_data) in every reply
+//! carrying one: no standing curves at all, and made-up book levels and
+//! indicative views (which the public API never serves). A client that took
+//! any display view from reported data would show these.
+struct ReportedDataTamper {
+    node::HttpsEndpoint upstream;
+    std::atomic<unsigned> tampered{0};
+    node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
+    {
+        const auto reply{node::FlowMeshHttpsRequest(upstream, request.path, request.body, std::chrono::seconds{8}, 32 << 20)};
+        if (!reply.response_received) return {502, R"({"ok":false,"error":"relay","result":null})"};
+        UniValue value;
+        if (!value.read(reply.body) || !value["result"].isObject() || !value["result"]["reported_data"].isObject()) return {reply.status, reply.body};
+        UniValue result{value["result"]};
+        UniValue reported{result["reported_data"]};
+        if (reported["liquidity"].isObject()) {
+            UniValue liquidity{reported["liquidity"]};
+            liquidity.pushKV("curves", UniValue{UniValue::VARR});
+            liquidity.pushKV("total_curves", 0);
+            reported.pushKV("liquidity", liquidity);
+        }
+        UniValue fake{UniValue::VOBJ};
+        fake.pushKV("available", true);
+        fake.pushKV("total_curves", 1);
+        fake.pushKV("bids", UniValue{UniValue::VOBJ});
+        fake.pushKV("asks", UniValue{UniValue::VOBJ});
+        reported.pushKV("book_levels", fake);
+        reported.pushKV("indicative", fake);
+        result.pushKV("reported_data", reported);
+        value.pushKV("result", result);
+        ++tampered;
+        return {reply.status, value.write()};
+    }
+};
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_wide_book_tests, WideBookFixture)
+
+BOOST_AUTO_TEST_CASE(remote_levels_cover_every_verified_curve_and_ignore_reported_data)
+{
+    // Critique S7 and the remote half of "more than 128 curves": through an
+    // endpoint whose reported data claims an empty book, the remote client's
+    // levels are exactly ComputeBookLevels over its verified state, all 150
+    // standing curves (ladders included), never the reported projection.
+    LiveMarket live{*this, m_path_root / "wide-book-service"};
+    std::string error;
+    const auto settle = [&] {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+        for (;;) {
+            const auto status{live.service->MarketStatus(market)};
+            BOOST_REQUIRE(status);
+            if (!status->paused && status->pending_actions == 0 && status->halt == node::FlowMeshRuntimeHalt::NONE) return;
+            BOOST_REQUIRE_MESSAGE(std::chrono::steady_clock::now() < deadline, "the book's actions did not certify");
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+    };
+    // Local submissions share the node's action token bucket: a refused
+    // one waits for its refill and is sent again (never another action).
+    const auto submit = [&](const flowmesh::Action& action) {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+        while (!live.service->SubmitLocalAction(market, action, error)) {
+            BOOST_REQUIRE_MESSAGE(error == "FlowMesh action is rate limited" && std::chrono::steady_clock::now() < deadline, error);
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+    };
+    settle();
+    for (const auto& outpoint : book_deposits) {
+        flowmesh::Action deposit;
+        deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
+        deposit.outpoint = outpoint;
+        submit(deposit);
+    }
+    settle();
+    // One ask per account (no bids: nothing clears), a four-price ladder for
+    // every tenth, many sharing a price with others.
+    size_t ladders{0};
+    for (size_t i{0}; i < book_keys.size(); ++i) {
+        flowmesh::Action ask;
+        ask.signer = flowmesh::AccountForKey(XOnlyPubKey{book_keys[i].GetPubKey()});
+        ask.sequence = 0;
+        ask.type = static_cast<uint8_t>(flowmesh::ActionType::SUBMIT_ASK);
+        const CAmount price{1'000 + 3 * static_cast<CAmount>(i % 40)};
+        const auto curve{i % 10 == 0 ? flowmesh::MakeLadderAskCurve({{price, 5}, {price + 1, 4}, {price + 7, 3}, {price + 20, 2}})
+                                     : flowmesh::MakeLimitAskCurve(price, 1 + static_cast<CAmount>(i % 7))};
+        BOOST_REQUIRE(curve);
+        ladders += i % 10 == 0;
+        ask.curve = *curve;
+        BOOST_REQUIRE(flowmesh::SignAction(book_keys[i], domain, config, ask));
+        submit(ask);
+    }
+    BOOST_REQUIRE_EQUAL(ladders, 15U);
+    settle();
+
+    ReportedDataTamper tamper{live.Endpoint()};
+    auto options{Options()};
+    options.request_timeout = std::chrono::seconds{10};
+    node::FlowMeshHttpsServer relay{options, [&tamper](const auto& request) { return tamper.Handle(request); }};
+    BOOST_REQUIRE_MESSAGE(relay.Start(error), error);
+    auto remote{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(relay.Port())}, m_path_root / "wide-book-client", error)};
+    BOOST_REQUIRE_MESSAGE(remote, error);
+    auto local{node::MakeLocalFlowMeshBackend(*live.service)};
+    const auto account{flowmesh::AccountForKey(XOnlyPubKey{book_keys[0].GetPubKey()})};
+
+    // Every verified standing curve, page by page at one head.
+    const auto all_curves = [&](const uint256& head) {
+        std::vector<flowmesh::ClearingEngine::CurveView> curves;
+        flowmesh::MarketDataQuery page;
+        page.limit = 1;
+        page.curve_limit = 128;
+        page.expected_head = head;
+        for (size_t pages{0};; ++pages) {
+            const auto data{local->Data(market, std::nullopt, page, error)};
+            BOOST_REQUIRE_MESSAGE(data, error);
+            BOOST_REQUIRE(data->snapshot.last_microblock_hash == head);
+            curves.insert(curves.end(), data->liquidity.curves.begin(), data->liquidity.curves.end());
+            if (!data->liquidity.next_cursor) break;
+            BOOST_REQUIRE(pages < 4);
+            page.curve_cursor = data->liquidity.next_cursor;
+        }
+        return curves;
+    };
+    const auto canonical{[] { flowmesh::LevelGrouping g; g.exact = false; g.mantissa = 1; g.exponent = 1; g.decimals = 9; return g; }()};
+    const auto inverse{[] { flowmesh::LevelGrouping g; g.exact = false; g.inverse = true; g.mantissa = 2; g.exponent = -6; g.decimals = 9; return g; }()};
+    size_t compared{0};
+    for (const auto& grouping : {flowmesh::LevelGrouping{}, canonical, inverse}) {
+        BOOST_TEST_CONTEXT("grouping exact=" << grouping.exact << " inverse=" << grouping.inverse) {
+            BOOST_REQUIRE(flowmesh::LevelGroupingError(grouping).empty());
+            auto query{Page()};
+            query.levels = flowmesh::BookLevelsQuery{};
+            query.levels->depth = flowmesh::MARKET_DATA_MAX_LEVELS;
+            query.levels->grouping = grouping;
+            query.levels->account = account;
+            const auto data{remote->Data(market, account, query, error)};
+            BOOST_REQUIRE_MESSAGE(data, error);
+            BOOST_REQUIRE(data->remote && data->certificate_verified && data->account_state_verified);
+            BOOST_REQUIRE(data->levels);
+            const auto& levels{*data->levels};
+            const auto head{data->snapshot.last_microblock_hash};
+            // The whole verified book, not the reported (empty) one and not
+            // only the first page the reply carries.
+            BOOST_CHECK_EQUAL(data->liquidity.total_curves, WideBookFixture::ACCOUNTS);
+            BOOST_CHECK_EQUAL(data->liquidity.curves.size(), 128U);
+            BOOST_CHECK(levels.available);
+            BOOST_CHECK_EQUAL(levels.total_curves, WideBookFixture::ACCOUNTS);
+            BOOST_CHECK(levels.head == head);
+            const auto curves{all_curves(head)};
+            BOOST_REQUIRE_EQUAL(curves.size(), WideBookFixture::ACCOUNTS);
+            auto expected{flowmesh::ComputeBookLevels(curves, *query.levels)};
+            expected.head = head;
+            expected.standing.head = head;
+            BOOST_CHECK(levels == expected);
+            BOOST_CHECK(expected.asks.available && !expected.asks.levels.empty() && expected.bids.levels.empty());
+            // The ladders' own prices are levels of their own; account 0's
+            // ladder is its own share.
+            if (grouping.exact) {
+                BOOST_CHECK(std::any_of(levels.asks.levels.begin(), levels.asks.levels.end(), [](const auto& level) { return level.low == 1'020 && level.own == 2; }));
+                BOOST_CHECK_EQUAL(levels.asks.levels.front().low, 1'000);
+            }
+            ++compared;
+        }
+    }
+    BOOST_CHECK_EQUAL(compared, 3U);
+    BOOST_CHECK(tamper.tampered.load() > 0);
+    remote.reset();
+    relay.Stop();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

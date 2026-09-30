@@ -214,7 +214,13 @@ receipt times.
   crossed residual; budget prefixes and overflow; bucket ranges; memoised
   views; full-book cost. `flowmesh_microblock_tests`: ladder builders and a
   signed ladder executed. Runtime and HTTPS: levels only when wanted, one copy
-  per head, refusals, both backends from verified state, never public.
+  per head, refusals, both backends from verified state, never public; and
+  (`flowmesh_client_wide_book_tests`) a remote client reading 150 verified
+  standing curves (fifteen of them four-price ladders) through a relay that
+  rewrites the endpoint's `reported_data` to an empty book with made-up
+  levels: its levels in exact, canonical and inverse groupings equal
+  `ComputeBookLevels` over every verified curve paged from the serving node,
+  never the reported projection (critique S7).
 - Functional (`feature_flowmesh_market_views.py`): option errors, ladder RPC
   errors, a four-price bid ladder and a three-price ask ladder, levels equal
   to those computed from every paged curve (exact and grouped) and equal
