@@ -13,7 +13,9 @@ candles served, the defaults) and validator 1 (-flowmeshapiobservedtime=0
   getflowmeshcandles aggregates exactly what the rollup rules place;
 - the RPC options are strict;
 - through validator 0's endpoint the client labels the times with that
-  endpoint and reads its candles, labelled endpoint-reported;
+  endpoint and reads its candles, labelled endpoint-reported, also when an
+  auction is certified between its market read and its candles read (the
+  endpoint's forming candle then ends past the client's verified head);
 - validator 1's endpoint never receives observed_time or 'candles', and the
   client says why there are none;
 - validator 3 stopped while the others trade and started again: the times it
@@ -236,6 +238,22 @@ class FlowMeshObservedTimeTest(FlowMeshLiquidityTest):
         assert_equal((page["available"], page["source"], page["endpoint_reported"], page["certified"]), (True, relay0.url, True, False))
         own = n0.getflowmeshcandles(market, {"interval": "1m", "before_ms": page["before_ms"]})
         assert_equal(page["candles"], own["candles"])
+
+        # An auction certified between the client's market read and its
+        # candles read, as on any active market: the endpoint's forming
+        # candle ends past the head the client verified. The page is checked
+        # against the endpoint's head verified after it, and accepted.
+        client_next = self.client.getflowmeshmarketdata(market, {"limit": 1})["snapshot"]["next_microblock_sequence"]
+        self.operator_order(market, "ask", 4 * PRICE, 1)
+        assert n0.getflowmeshmarketdata(market, {"limit": 1})["snapshot"]["next_microblock_sequence"] > client_next
+        raced = self.client.getflowmeshcandles(market, {"interval": "1m"})
+        assert_equal((raced["available"], raced["source"]), (True, relay0.url))
+        newest = raced["candles"][-1]
+        assert newest["last_sequence"] >= client_next, (newest, client_next)
+        after_next = self.client.getflowmeshmarketdata(market, {"limit": 1})["snapshot"]["next_microblock_sequence"]
+        assert newest["last_sequence"] < after_next, (newest, after_next)
+        self.log.info("FLOWMESH_OBSERVED_CANDLES_RACE client_next=%d newest_last=%d after_next=%d",
+                      client_next, newest["last_sequence"], after_next)
 
         # Through validator 1 (both flags off): never asked, and why.
         relay0.configure(unavailable=True)
