@@ -1320,6 +1320,44 @@ private Q_SLOTS:
         for (size_t i{2}; i < arms.size(); ++i) QVERIFY(arms[i] - arms[i - 2] >= Policy::ARM_REFILL_MS);
         QCOMPARE(p.mode, Mode::Live); QVERIFY(!p.PollEveryTick());
     }
+    void watchNextArmInIsTheEarliestMayArm()
+    {
+        using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using WOutcome = B3FlowMeshWatch::Outcome;
+        // Random outcome sequences at random times: NextArmIn names exactly
+        // the first millisecond MayArm allows (checked on copies: MayArm
+        // turns a due Polling or Backoff retry into Probing).
+        uint64_t state{0x9e3779b97f4a7c15ULL};
+        const auto next = [&](uint64_t bound) { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state % bound; };
+        constexpr std::array outcomes{WOutcome::Changed, WOutcome::Quiet, WOutcome::NotWaited, WOutcome::Busy,
+                                      WOutcome::Unsupported, WOutcome::Failed, WOutcome::Refreshed};
+        for (int run{0}; run < 200; ++run) {
+            Policy p; p.Enable(0, next(4) != 0);
+            int64_t now{0};
+            for (int step{0}; step < 40; ++step) {
+                const auto wait{p.NextArmIn(now)};
+                QVERIFY(wait >= 0);
+                for (const int64_t before : {int64_t{0}, wait / 2, wait - 1}) {
+                    if (before < 0 || before >= wait) continue;
+                    Policy early{p}; QVERIFY(!early.MayArm(now + before));
+                }
+                { Policy due{p}; QVERIFY(due.MayArm(now + wait)); }
+                now += wait + static_cast<int64_t>(next(3) == 0 ? next(700) : 0);
+                QVERIFY(p.MayArm(now)); p.Armed(now);
+                QCOMPARE(p.NextArmIn(now), int64_t{-1}); // Outstanding.
+                now += static_cast<int64_t>(next(1600));
+                p.Finished(now, outcomes[next(outcomes.size())], static_cast<double>(next(401)) / 1000.0 - 0.2);
+            }
+        }
+        Policy off; QCOMPARE(off.NextArmIn(0), int64_t{-1});
+        // A burst of two, then one per 500 ms.
+        Policy p; p.Enable(0, true);
+        QCOMPARE(p.NextArmIn(0), int64_t{0}); p.MayArm(0); p.Armed(0); p.Finished(10, WOutcome::Changed, 0.0);
+        QCOMPARE(p.NextArmIn(10), int64_t{0}); p.MayArm(10); p.Armed(10); p.Finished(20, WOutcome::Changed, 0.0);
+        QCOMPARE(p.NextArmIn(20), Policy::ARM_REFILL_MS - 20);
+        // Answered without waiting: never before the retry time.
+        p.MayArm(Policy::ARM_REFILL_MS); p.Armed(Policy::ARM_REFILL_MS); p.Finished(Policy::ARM_REFILL_MS + 5, WOutcome::NotWaited, 0.0);
+        QCOMPARE(p.NextArmIn(Policy::ARM_REFILL_MS + 5), Policy::TICK_MS);
+    }
     void watchProbeHoldsTheMarketPollForABoundedTime()
     {
         using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using WOutcome = B3FlowMeshWatch::Outcome;

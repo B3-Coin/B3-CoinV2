@@ -381,6 +381,9 @@ struct FundingReadProbe {
     UniValue watch_data{RemoteData()};
     UniValue watch_object{UniValue::VOBJ};
     std::atomic_int watches{0}, releases{0};
+    //! When each live-update read arrived (steady milliseconds).
+    std::mutex watch_mutex;
+    std::vector<int64_t> watch_times;
     std::atomic_bool hold_watch{false}, fail_watch{false};
     QSemaphore watch_entered, watch_release;
     //! A busy validator, as the remote client sees it: a live-update read
@@ -451,6 +454,7 @@ struct FundingReadProbe {
                     market_options.push_back(options);
                     if (options.isObject() && options.exists("watch_ms")) {
                         if (options["watch_ms"].getInt<int>() == 0) { ++releases; result = data; result.pushKV("watch", watch_object); return true; }
+                        { std::lock_guard lock{watch_mutex}; watch_times.push_back(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
                         ++watches; watch_entered.release();
                         if (supersede_on_concurrent_read) {
                             const int before{snapshots.load()};
@@ -5574,6 +5578,29 @@ private Q_SLOTS:
         QCOMPARE(probe.releases.load(), 1);
         QVERIFY(!panel.m_watch_release_pending);
         QCOMPARE(probe.watches.load(), int(B3FlowMeshWatch::Policy::NOT_WAITED_LIMIT)); QCOMPARE(probe.writes.load(), 0);
+    }
+    void liveUpdatesRearmWhenAllowedNotOnTheNextTick()
+    {
+        // Replies that return at once (a busy endpoint): after the burst of
+        // two, each read starts when the policy's token refills, on the
+        // panel's precise re-arm, with no tick at all; never faster than a
+        // burst of two and then one per 500 ms.
+        FundingReadProbe probe; probe.live_ms = 2000; probe.watch_object = WatchObject("timeout", true, true);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        Live(panel, probe);
+        QVERIFY(!panel.m_timer->isActive());
+        panel.armWatch(); QVERIFY(panel.m_watch_thread);
+        QTRY_VERIFY_WITH_TIMEOUT(probe.watches.load() >= 6, 4000);
+        panel.m_watch.Disable(); AwaitWatchWorker(panel);
+        QVERIFY(!panel.m_rearm->isActive() || panel.m_watch.NextArmIn(panel.m_watch_clock.elapsed()) < 0);
+        std::vector<int64_t> times;
+        { std::lock_guard lock{probe.watch_mutex}; times = probe.watch_times; }
+        QVERIFY(times.size() >= 6);
+        for (size_t i{2}; i < times.size(); ++i) QVERIFY2(times[i] - times[i - 2] >= B3FlowMeshWatch::Policy::ARM_REFILL_MS - 1, "a burst of two, then one per 500 ms");
+        // Each refill is used when it arrives, not up to a tick later.
+        for (size_t i{3}; i < times.size(); ++i) QVERIFY2(times[i] - times[i - 1] < B3FlowMeshWatch::Policy::ARM_REFILL_MS + 150, "re-armed when allowed");
+        QCOMPARE(panel.m_watch.last, B3FlowMeshWatch::Outcome::Quiet);
+        QCOMPARE(probe.writes.load(), 0); QCOMPARE(probe.snapshots.load(), 0);
     }
     void tickCatchupKeepsLiveModeAndRearmsAtOnce()
     {

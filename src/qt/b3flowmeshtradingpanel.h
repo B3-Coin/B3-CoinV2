@@ -325,6 +325,13 @@ private:
     //! `release` sends watch_ms 0: an ordinary read that closes the remote
     //! client's live-update connection.
     void armWatch(bool release = false);
+    //! After a live update finished or was dropped without arming the next
+    //! one: arm it when the policy next allows (its retry time and token
+    //! refill), on a precise timer rather than the next 500 ms tick. The
+    //! policy's pacing is unchanged; armWatch keeps every other check.
+    void scheduleRearm();
+    //! m_rearm's timeout: arm, or wait again while the policy still waits.
+    void rearmWatch();
     void finishWatch(const std::shared_ptr<WatchResult>& result);
     //! Drops any outstanding live-update result; joins its worker only when
     //! the panel closes (a wallet or market switch never blocks on it).
@@ -385,6 +392,8 @@ private:
     // Live updates: a second worker keeps at most one bounded watch read
     // outstanding for the selected market (see B3FlowMeshWatch::Policy).
     QThread* m_watch_thread{nullptr};
+    //! Single-shot, Qt::PreciseTimer: a coarse timer may fire early.
+    QTimer* m_rearm{nullptr};
     B3FlowMeshWatch::Policy m_watch;
     QElapsedTimer m_watch_clock;
     // Bumped whenever an outstanding watch result must be dropped.

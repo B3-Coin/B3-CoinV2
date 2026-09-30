@@ -417,6 +417,8 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_timer = new QTimer{this}; m_timer->setInterval(500);
     m_watch_clock.start();
     connect(m_timer, &QTimer::timeout, this, &B3FlowMeshTradingPanel::tick);
+    m_rearm = new QTimer{this}; m_rearm->setSingleShot(true); m_rearm->setTimerType(Qt::PreciseTimer);
+    connect(m_rearm, &QTimer::timeout, this, &B3FlowMeshTradingPanel::rearmWatch);
     connect(qApp, &QCoreApplication::aboutToQuit, this, [this] { m_closing = true; cancelAndWait(); });
     updateControls();
 }
@@ -2549,6 +2551,7 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
         m_cancel->load() || m_busy || !selected || selected->id != scope.market || selected->account != scope.account ||
         !m_snapshot || m_snapshot->market != scope.market || m_snapshot->head != scope.known_head) {
         m_watch.Dropped();
+        scheduleRearm();
         return;
     }
     const double jitter{QRandomGenerator::global()->generateDouble() * 0.4 - 0.2};
@@ -2599,6 +2602,23 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
     // hide its outcome, without discarding the scheduled phase.
     updateMarketText();
     armWatch();
+    if (!m_watch_thread) scheduleRearm();
+}
+
+void B3FlowMeshTradingPanel::scheduleRearm()
+{
+    const auto wait{m_watch.NextArmIn(m_watch_clock.elapsed())};
+    // Now (0): armWatch refused for another reason (busy, hidden, a read in
+    // flight); the tick tries again. Never: Off or already outstanding.
+    if (wait <= 0 || m_closing || m_cancel->load()) return;
+    m_rearm->start(static_cast<int>(std::min<int64_t>(wait, B3FlowMeshWatch::Policy::UNSUPPORTED_RETRY_MS)));
+}
+
+void B3FlowMeshTradingPanel::rearmWatch()
+{
+    if (m_watch_thread) return;
+    armWatch();
+    if (!m_watch_thread) scheduleRearm();
 }
 
 void B3FlowMeshTradingPanel::stopWatchWorker(const bool join)
@@ -2762,7 +2782,7 @@ void B3FlowMeshTradingPanel::stopWorker()
 void B3FlowMeshTradingPanel::cancelAndWait()
 {
     resetRefreshSchedule();
-    m_timer->stop(); m_cancel->store(true); m_deferred_review.reset(); m_deferred_status.reset(); m_deferred_connect.reset(); ++m_generation;
+    m_timer->stop(); m_rearm->stop(); m_cancel->store(true); m_deferred_review.reset(); m_deferred_status.reset(); m_deferred_connect.reset(); ++m_generation;
     m_busy = true; updateControls();
     if (m_wallet) disconnect(m_wallet, nullptr, this, nullptr);
     if (m_confirmation) m_confirmation->reject();

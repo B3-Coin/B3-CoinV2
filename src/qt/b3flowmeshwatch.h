@@ -97,6 +97,11 @@ struct Policy {
     int64_t BackoffMs() const;
     //! Milliseconds until a retry is allowed (0 when allowed now).
     int64_t RetryInMs(int64_t now) const { return retry_at > now ? retry_at - now : 0; }
+    //! Milliseconds until MayArm would first return true (0: now), from the
+    //! retry time and the token refill; -1 while Off or a read is
+    //! outstanding. The panel re-arms then instead of on its next tick; the
+    //! pacing rules themselves are unchanged.
+    int64_t NextArmIn(int64_t now) const;
 
 private:
     void Refill(int64_t now);

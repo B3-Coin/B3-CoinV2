@@ -61,6 +61,17 @@ bool Policy::MayArm(const int64_t now)
     return tokens > 0;
 }
 
+int64_t Policy::NextArmIn(const int64_t now) const
+{
+    if (mode == Mode::Off || outstanding) return -1;
+    // Tokens as MayArm would see them at the retry time, or now.
+    const int64_t at{std::max(now, retry_at)};
+    Policy later{*this};
+    later.Refill(at);
+    if (later.tokens > 0) return at - now;
+    return later.refill_at + ARM_REFILL_MS - now;
+}
+
 void Policy::Armed(const int64_t now)
 {
     Refill(now);
