@@ -223,7 +223,12 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_refresh = new QPushButton{tr("Refresh now"), content}; m_refresh->setToolTip(tr("Market data updates automatically. Request an immediate read-only update."));
     m_progress = Label(QString{}, content); B3Theme::markTextRole(m_progress, QStringLiteral("secondary"));
     auto* center{new QSplitter{Qt::Horizontal, content}}; center->setChildrenCollapsible(false);
-    auto* chart_card{new QWidget{center}}; B3Theme::markCard(chart_card); auto* chart_layout{new QVBoxLayout{chart_card}};
+    // Hyperliquid's layout: the chart above the activity tabs on the left,
+    // and the order book and the ticket each the full height beside them,
+    // so the book shows its depth (the tabs no longer take its height).
+    auto* market_column{new QSplitter{Qt::Vertical, center}}; market_column->setChildrenCollapsible(false);
+    market_column->setObjectName(QStringLiteral("flowMeshMarketColumn"));
+    auto* chart_card{new QWidget{market_column}}; B3Theme::markCard(chart_card); auto* chart_layout{new QVBoxLayout{chart_card}};
     auto* chart_modes{new QHBoxLayout}; auto* modes{new QButtonGroup{chart_card}};
     auto* candle_interval{new QComboBox{chart_card}}; candle_interval->setObjectName(QStringLiteral("flowMeshCandleInterval"));
     m_candle_interval_combo = candle_interval;
@@ -256,9 +261,12 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         auto* view{new QTableWidget{parent}}; view->setObjectName(QLatin1String(name)); view->setColumnCount(headers.size()); view->setHorizontalHeaderLabels(headers); view->verticalHeader()->hide(); view->setShowGrid(false); view->setAlternatingRowColors(false); view->setEditTriggers(QAbstractItemView::NoEditTriggers); view->setSelectionMode(QAbstractItemView::NoSelection); view->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); view->verticalHeader()->setDefaultSectionSize(26); view->setMinimumWidth(200); return view;
     };
     auto* liquidity_card{new QWidget{center}}; B3Theme::markCard(liquidity_card); auto* liquidity_layout{new QVBoxLayout{liquidity_card}};
-    auto* liquidity_title{Label(tr("Liquidity"), liquidity_card)}; liquidity_title->setObjectName(QStringLiteral("flowMeshLiquidityTitle")); B3Theme::markTextRole(liquidity_title, QStringLiteral("h3")); liquidity_layout->addWidget(liquidity_title);
+    // The title and the view selector share one row: the height is the book's.
+    auto* liquidity_header{new QHBoxLayout}; liquidity_header->setContentsMargins(0, 0, 0, 0);
+    auto* liquidity_title{Label(tr("Liquidity"), liquidity_card)}; liquidity_title->setObjectName(QStringLiteral("flowMeshLiquidityTitle")); B3Theme::markTextRole(liquidity_title, QStringLiteral("h3")); liquidity_header->addWidget(liquidity_title, 1);
     auto* liquidity_mode{new QComboBox{liquidity_card}}; liquidity_mode->setObjectName(QStringLiteral("flowMeshLiquidityMode"));
-    liquidity_mode->setAccessibleName(tr("Liquidity display")); liquidity_mode->addItems({tr("Order book"), tr("Curve depth"), tr("Trades")}); liquidity_layout->addWidget(liquidity_mode);
+    liquidity_mode->setAccessibleName(tr("Liquidity display")); liquidity_mode->addItems({tr("Order book"), tr("Curve depth"), tr("Trades")}); liquidity_header->addWidget(liquidity_mode);
+    liquidity_layout->addLayout(liquidity_header);
     m_order_book = new B3FlowMeshOrderBook{liquidity_card}; liquidity_layout->addWidget(m_order_book, 1);
     m_trade_tape = new B3FlowMeshTradeTape{liquidity_card}; liquidity_layout->addWidget(m_trade_tape, 1); m_trade_tape->hide();
     m_depth_view = table(liquidity_card, {tr("Price"), tr("Buy liquidity"), tr("Sell liquidity")}, "flowMeshCurveDepth"); liquidity_layout->addWidget(m_depth_view, 1);
@@ -323,8 +331,8 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_indicative->hide(); ticket->addWidget(m_indicative);
     m_order = new QPushButton{tr("Review buy order…"), ticket_card}; m_order->setObjectName(QStringLiteral("flowMeshSubmitOrder")); m_order->setProperty("b3variant", QStringLiteral("primary")); ticket->addWidget(m_order);
     m_order->setToolTip(tr("One order per side. A new order replaces that side. Orders clear together at one auction price; an accepted request is not a fill.")); ticket->addStretch();
-    center->addWidget(chart_card); center->addWidget(liquidity_card); center->addWidget(ticket_card); center->setStretchFactor(0, 6); center->setStretchFactor(1, 3); center->setStretchFactor(2, 3); center->setSizes({600, 290, 300}); layout->addWidget(center, 1);
-    m_activity = new QTabWidget{content}; m_activity->setMinimumHeight(185);
+    center->addWidget(market_column); center->addWidget(liquidity_card); center->addWidget(ticket_card); center->setStretchFactor(0, 6); center->setStretchFactor(1, 3); center->setStretchFactor(2, 3); center->setSizes({600, 290, 300}); layout->addWidget(center, 1);
+    m_activity = new QTabWidget{market_column}; m_activity->setMinimumHeight(185);
     auto* own{new QWidget{m_activity}}; auto* own_layout{new QVBoxLayout{own}};
     m_pending_view = table(own, {tr("Request"), tr("Signed"), tr("Sent"), tr("Admitted"), tr("Certified"), tr("Outcome"), tr("Status")}, "flowMeshPendingActions");
     m_pending_view->setAccessibleName(tr("Your requests in progress"));
@@ -343,7 +351,8 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_cancel_order = new QPushButton{tr("Cancel selected Buy / Sell side…"), own};
     own_actions->addWidget(m_edit_order); own_actions->addWidget(m_cancel_order); own_layout->addLayout(own_actions); m_activity->addTab(own, tr("Your orders"));
     auto* history_page{new QWidget{m_activity}}; auto* history_layout{new QVBoxLayout{history_page}}; m_history_note = Label(tr("No trades yet"), history_page); history_layout->addWidget(m_history_note); m_history_view = table(history_page, {tr("Time"), tr("Price (B3)"), tr("Amount"), tr("Your buy"), tr("Your sell")}, "flowMeshCertifiedFills"); history_layout->addWidget(m_history_view); m_activity->addTab(history_page, tr("Trade history"));
-    m_log = new QPlainTextEdit{m_activity}; m_log->setObjectName(QStringLiteral("flowMeshOperationLog")); m_log->setReadOnly(true); m_log->setMaximumBlockCount(100); m_activity->addTab(m_log, tr("Activity")); layout->addWidget(m_activity);
+    m_log = new QPlainTextEdit{m_activity}; m_log->setObjectName(QStringLiteral("flowMeshOperationLog")); m_log->setReadOnly(true); m_log->setMaximumBlockCount(100); m_activity->addTab(m_log, tr("Activity"));
+    market_column->addWidget(chart_card); market_column->addWidget(m_activity); market_column->setStretchFactor(0, 3); market_column->setStretchFactor(1, 2);
     auto* saved_page{new QWidget{m_activity}}; auto* saved_layout{new QVBoxLayout{saved_page}};
     m_saved_selector = new QComboBox{saved_page}; m_saved_selector->setObjectName(QStringLiteral("flowMeshSavedActions"));
     saved_layout->addWidget(m_saved_selector);

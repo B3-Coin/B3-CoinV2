@@ -48,6 +48,7 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSignalSpy>
+#include <QSplitter>
 #include <QTableWidget>
 #include <QTabWidget>
 #include <QTemporaryDir>
@@ -1947,6 +1948,33 @@ private Q_SLOTS:
         auto empty{SyntheticLimitBook(1)}; empty.curves.clear();
         book.setSnapshot(WithLevels(empty), false);
         QCOMPARE(SpreadText(book), QStringLiteral("No standing orders"));
+    }
+    void orderBookShowsDepthAtTheStandardPanelSize()
+    {
+        // At the standard 1320 x 940 the ladder holds at least ten levels a
+        // side, as Hyperliquid's does: the activity tabs sit under the chart
+        // and the book (and the ticket) take the full height beside them.
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); panel.m_timer->stop();
+        Observe(panel, WithLevels(SyntheticLimitBook(16), {}, H(20)), true);
+        panel.show(); for (int i{0}; i < 3; ++i) QCoreApplication::processEvents();
+        QVERIFY(panel.m_order_book->showsVerifiedLevels());
+        const int per_side{panel.m_order_book->rowsPerSide()};
+        QVERIFY2(per_side >= 10, qPrintable(QStringLiteral("%1 levels a side").arg(per_side)));
+        int asks{0}, bids{0};
+        for (const auto& row : panel.m_order_book->model()->rows()) {
+            asks += row.kind == B3FlowMeshLadderModel::Row::Kind::Ask;
+            bids += row.kind == B3FlowMeshLadderModel::Row::Kind::Bid;
+        }
+        QCOMPARE(asks, per_side); QCOMPARE(bids, per_side);
+        auto* column{panel.findChild<QSplitter*>(QStringLiteral("flowMeshMarketColumn"))};
+        QVERIFY(column);
+        QCOMPARE(column->indexOf(panel.m_activity), 1);
+        QVERIFY(column->isAncestorOf(panel.m_chart));
+        QVERIFY(!column->isAncestorOf(panel.m_order_book));
+        QVERIFY(!column->isAncestorOf(panel.m_order));
+        // The book's card is as tall as the chart and the tabs together.
+        auto* book_card{panel.m_order_book->parentWidget()};
+        QVERIFY(book_card->height() >= column->height() - 8);
     }
     void switchingBookAndCurveViewsPreservesUnsubmittedInput()
     {

@@ -100,6 +100,13 @@ any of those servers already serves.
   best prices beside the spread, `Price | Size | Total` with Total
   cumulative, as many rows per side as the height holds (only non-empty
   levels), updated in place (no model reset or row churn).
+- Layout (Hyperliquid's): the chart sits above the activity tabs (your
+  orders, trade history, activity, saved requests) in the left column; the
+  order book and the ticket each take the full height beside it, and the
+  book's title and view selector share one row. At the standard 1320 x 940
+  panel the ladder holds 12 levels a side in the exported screenshots (at
+  least 10 is tested), where the tabs under all three columns used to leave
+  it about 5.
 - One number of decimal places per column, on every row (Hyperliquid's
   fixed precision; review of 2026-09-30). Price: the market tick's places in
   the canonical view (every on-grid price exact, e.g. `1.000` at 0.001 B3),
