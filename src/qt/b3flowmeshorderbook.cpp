@@ -416,7 +416,7 @@ bool B3FlowMeshOrderBook::activateRow(const int row)
     if (row < 0 || row >= m_model->rowCount()) return false;
     const auto& item{m_model->row(row)};
     if (item.click_price.isEmpty() || (item.kind != Kind::Ask && item.kind != Kind::Bid)) return false;
-    Q_EMIT levelClicked(item.click_price, item.click_cumulative, m_head);
+    Q_EMIT levelClicked(item.click_price, item.click_canonical, item.click_cumulative, m_head);
     return true;
 }
 
@@ -461,7 +461,7 @@ void B3FlowMeshOrderBook::layoutRows()
     const auto fill = [&](B3FlowMeshLadderModel::Row& row, const Level& level, const Kind kind) {
         row.kind = kind; row.price = level.price; row.size = level.size; row.total = level.total;
         row.tooltip = level.tooltip; row.accessible = level.accessible; row.own = level.own;
-        row.click_price = level.click_price; row.click_cumulative = level.cumulative_tokens;
+        row.click_price = level.click_price; row.click_canonical = level.click_canonical; row.click_cumulative = level.cumulative_tokens;
         // Floating point only for the bar's pixel width.
         row.depth = deepest == 0 ? 0.0 : static_cast<double>(depth_of(level)) / static_cast<double>(deepest);
     };
@@ -627,7 +627,9 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
                     // edge (a displayed sell), of a sell bucket its upper one.
                     click = bid ? level.low : level.high; clickable = click > 0;
                 }
-                if (clickable) row.click_price = inverse ? ExactInversePrice(click, decimals) : FormatPrice(click, decimals);
+                // A click offers the price as shown; the ticket reads it
+                // back as exactly `click` (see fillFromBook).
+                if (clickable) { row.click_price = row.price; row.click_canonical = click; }
                 row.own = level.own > 0;
                 row.cumulative_tokens = level.cumulative;
                 if (cumulative_notional && level.notional) *cumulative_notional += *level.notional;
@@ -662,7 +664,10 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
                 }
                 tip << (level.curves == 1 ? tr("1 standing order (one per account and side)") : tr("%1 standing orders (one per account and side)").arg(level.curves));
                 if (level.own > 0) tip << tr("Your order: %1 %2 at this level").arg(FormatAmount(level.own, decimals), token);
-                if (!row.click_price.isEmpty()) tip << tr("Click to use this price in the ticket (nothing is signed).");
+                if (!row.click_price.isEmpty()) {
+                    tip << (inverse ? tr("Click to use this price in the ticket (nothing is signed); the ticket and the review show its exact executable price.")
+                                    : tr("Click to use this price in the ticket (nothing is signed)."));
+                }
                 row.tooltip = tip.join(QLatin1Char('\n'));
                 row.accessible = tr("%1 %2, size %3, total %4, %5 order(s)").arg(displayed_ask ? tr("Sell") : tr("Buy"),
                                                                                exact.isEmpty() ? row.price : tr("about %1").arg(row.price), row.size, row.total).arg(level.curves) +
@@ -723,7 +728,7 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<Snapshot>& snapshot, c
             row.cumulative_tokens = cumulative; row.cumulative_display = cumulative_display;
             row.size = PadDecimals(inverse ? FormatAmount(level.gross_notional, 9) : FormatAmount(level.remaining, decimals), size_places);
             row.total = PadDecimals(FormatWide(cumulative_display, inverse ? 9 : decimals), size_places);
-            if (level.canonical_price > 0) row.click_price = inverse ? ExactInversePrice(level.canonical_price, decimals) : FormatPrice(level.canonical_price, decimals);
+            if (level.canonical_price > 0 && text != QStringLiteral("—")) { row.click_price = text; row.click_canonical = level.canonical_price; }
             const QString exact{inverse ? ExactInversePrice(level.canonical_price, decimals) : FormatPrice(level.canonical_price, decimals)};
             row.tooltip = tr("Price: %1 %2%3\nSize: %4\nTotal from the best level: %5\n%6 limit or ladder order(s) at this level")
                 .arg(row.price, price_units, whole ? QString{} : tr(" (exact %1)").arg(exact), row.size, row.total).arg(level.curve_count);

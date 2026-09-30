@@ -126,11 +126,22 @@ any of those servers already serves.
   staggered; "Animate order book" (context menu, default on) and the
   platform's UI effects setting turn it off. The timer runs only while a
   flash does.
-- Click a level: its exact price goes into the ticket (the edge every order
-  of a grouped level accepts, read back unadjusted); the side is kept, the
-  marketable limit unchecked, nothing is reviewed or signed. "Set size on
-  click" (default off, unlike Hyperliquid) also sets the cumulative size
-  within the available balance.
+- Click a level (Hyperliquid's click-to-price): its price **as shown** goes
+  into the ticket whenever the ticket reads it back, for its side, as exactly
+  the level's canonical price (the edge every order of a grouped level
+  accepts): always in the canonical view, and in the B3 view whenever the
+  click takes the side the level's orders face (buy B3 at a sell level, sell
+  B3 at a buy level), because each label is rounded in that direction.
+  Otherwise the fewest places from the shown count, rounded toward the
+  ticket's side, that do; the exact form only if none does. The executable
+  limit is therefore always exactly the level's canonical price: a rounded
+  B3-view text is adjusted only in the customer's favour, the ticket shows
+  "Safely adjusted executable limit: <exact>", the review shows the exact
+  canonical limit with the entered text and the adjustment, and that exact
+  limit is what would be signed. The price is re-derived from the gates'
+  current verified data; the side is kept, the marketable limit unchecked,
+  nothing is reviewed or signed. "Set size on click" (default off, unlike
+  Hyperliquid) also sets the cumulative size within the available balance.
 - Grouping selector: Exact, then `1, 2, 5 x 10^(k-4)` and `10^(k-3..k-1)`
   around the displayed price's magnitude `k` (integer digit counts), each
   valid for the orientation; kept per market and orientation for the

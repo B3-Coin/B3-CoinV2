@@ -253,17 +253,23 @@ private:
     //! side, exact limit and remaining quantity. Signs and sends nothing; the
     //! replacement is the ordinary reviewed order (a native per-side replace).
     void editOrder();
-    //! A click on an order-book level: its exact price text (and, with "Set
-    //! size on click", its cumulative size within the available balance)
-    //! goes into the ticket, as typing would. Keeps the ticket's side,
-    //! unchecks the marketable limit, and never opens a review, signs or
-    //! sends anything. Ignored while an operation or a review is pending.
-    //! Refused, with a notice, unless the book shows the gates' own verified
-    //! data (its head, in this orientation) and that data is ready (see
-    //! dataReady), or when the price is not one that data offers (the price
-    //! is re-derived from it, never taken from the book's text alone), or
-    //! does not round-trip exactly through the ticket's parser.
-    void fillFromBook(const QString& price, CAmount cumulative, const QString& head);
+    //! A click on an order-book level: its price (and, with "Set size on
+    //! click", its cumulative size within the available balance) goes into
+    //! the ticket, as typing would. The text is the price as the book shows
+    //! it (`shown`, Hyperliquid's click-to-price) when the ticket reads it
+    //! back, for its side, as exactly the level's canonical price; otherwise
+    //! the fewest places from the shown count, rounded toward the ticket's
+    //! side, that do; otherwise the exact price. So the executable limit is
+    //! always exactly `canonical`: the ticket and the review show it (any
+    //! adjustment only in the customer's favour, disclosed), and it is what
+    //! would be signed. Keeps the ticket's side, unchecks the marketable
+    //! limit, and never opens a review, signs or sends anything. Ignored
+    //! while an operation or a review is pending. Refused, with a notice,
+    //! unless the book shows the gates' own verified data (its head, in this
+    //! orientation) and that data is ready (see dataReady), or when
+    //! `canonical` is not a price that data offers (re-derived from it,
+    //! never taken from the book's text alone).
+    void fillFromBook(const QString& shown, CAmount canonical, CAmount cumulative, const QString& head);
     void begin(B3FlowMeshTrading::Operation operation);
     bool confirm(const QString& text, bool final_transaction);
     void startJob(std::optional<B3FlowMeshTrading::Action> action = std::nullopt,

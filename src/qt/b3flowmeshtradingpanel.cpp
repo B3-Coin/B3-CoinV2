@@ -417,8 +417,8 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     connect(m_order, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::requestOrderReview);
     connect(m_cancel_order, &QPushButton::clicked, this, [this] { begin(Operation::Cancel); });
     connect(m_edit_order, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::editOrder);
-    connect(m_order_book, &B3FlowMeshOrderBook::levelClicked, this, [this](const QString& price, qint64 cumulative, const QString& head) {
-        fillFromBook(price, static_cast<CAmount>(cumulative), head);
+    connect(m_order_book, &B3FlowMeshOrderBook::levelClicked, this, [this](const QString& price, qint64 canonical, qint64 cumulative, const QString& head) {
+        fillFromBook(price, static_cast<CAmount>(canonical), static_cast<CAmount>(cumulative), head);
     });
     connect(m_order_book, &B3FlowMeshOrderBook::groupingSelected, this, &B3FlowMeshTradingPanel::selectBookGrouping);
     connect(m_own_view->selectionModel(), &QItemSelectionModel::selectionChanged, this, [this] {
@@ -1340,7 +1340,7 @@ void B3FlowMeshTradingPanel::editOrder()
     }
 }
 
-void B3FlowMeshTradingPanel::fillFromBook(const QString& price, const CAmount cumulative, const QString& head)
+void B3FlowMeshTradingPanel::fillFromBook(const QString& shown, const CAmount canonical, const CAmount cumulative, const QString& head)
 {
     using namespace B3FlowMeshMarketData;
     const auto selected{market()};
@@ -1359,15 +1359,34 @@ void B3FlowMeshTradingPanel::fillFromBook(const QString& price, const CAmount cu
     }
     const auto& units{m_snapshot->units};
     const bool buy{m_side->currentIndex() == 0}, inverse{inverted()};
-    // Only a price the ticket reads back exactly, never adjusted.
-    const auto limit{ParseDisplayLimit(price, units, inverse, buy)};
-    if (!limit || limit->adjusted) {
-        notice(tr("That book level's price cannot be entered exactly for this side. Nothing was changed, signed or sent."));
+    // Re-derived from the verified data, never taken from the book's text.
+    if (canonical <= 0 || !BookOffersPrice(*m_snapshot, canonical, inverse, bookGrouping())) {
+        refuse();
         return;
     }
-    // Re-derived from the verified data, never taken from the book's text.
-    if (!BookOffersPrice(*m_snapshot, limit->price, inverse, bookGrouping())) {
-        refuse();
+    // Hyperliquid's click-to-price: the price as shown, when the ticket
+    // reads it back for its side as exactly the level's canonical price (a
+    // rounded B3-view label is then adjusted only in the customer's favour,
+    // and the ticket and review say so); else the same or more places
+    // rounded toward this side; else the exact price. Never a different
+    // canonical price.
+    const auto reads_back = [&](const QString& text) {
+        const auto limit{ParseDisplayLimit(text, units, inverse, buy)};
+        return limit && limit->price == canonical;
+    };
+    QString price;
+    if (!shown.isEmpty() && reads_back(shown)) price = shown;
+    const auto dot{shown.indexOf(QLatin1Char('.'))};
+    for (int places{dot < 0 ? 0 : static_cast<int>(shown.size() - dot - 1)}; price.isEmpty() && places <= 18; ++places) {
+        const auto rounded{FixedDisplayPrice(canonical, units.decimals, inverse, places, /*up=*/buy)};
+        if (!rounded.isEmpty() && reads_back(rounded)) price = rounded;
+    }
+    if (price.isEmpty()) {
+        const auto exact{inverse ? ExactInversePrice(canonical, units.decimals) : FormatPrice(canonical, units.decimals)};
+        if (reads_back(exact)) price = exact;
+    }
+    if (price.isEmpty()) {
+        notice(tr("That book level's price cannot be entered exactly for this side. Nothing was changed, signed or sent."));
         return;
     }
     m_marketable->setChecked(false);
@@ -1378,7 +1397,7 @@ void B3FlowMeshTradingPanel::fillFromBook(const QString& price, const CAmount cu
         const bool bid{CanonicalSide(buy, inverse) == QStringLiteral("bid")};
         const auto budget{ReplacementBudget(bid ? selected->b3_available : selected->base_available, bid ? selected->b3_reserved : selected->base_reserved)};
         CAmount quantity{cumulative};
-        if (budget) quantity = std::min(quantity, bid ? (limit->price > 0 ? *budget / limit->price : 0) : *budget);
+        if (budget) quantity = std::min(quantity, bid ? *budget / canonical : *budget);
         quantity -= quantity % std::max<CAmount>(1, units.quantity_step);
         if (quantity > 0) m_quantity->setText(FormatAmount(quantity, units.decimals));
     }

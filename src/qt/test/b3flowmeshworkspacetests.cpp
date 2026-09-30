@@ -1595,35 +1595,82 @@ private Q_SLOTS:
         QVERIFY(panel.m_order_book->showsVerifiedLevels());
         auto* model{panel.m_order_book->model()};
         const int spread{model->spreadRow()};
+        panel.m_quantity->setText(QStringLiteral("0.1"));
         for (const bool buy : {true, false}) {
             (buy ? panel.m_buy : panel.m_sell)->click();
             for (const int row : {spread - 1, spread + 1, spread + 3}) {
                 panel.m_marketable->setChecked(true);
-                const auto clicked{model->row(row).click_price};
-                QVERIFY2(!clicked.isEmpty(), qPrintable(model->row(row).price));
+                const auto shown{model->row(row).price};
+                QCOMPARE(model->row(row).click_price, shown);
                 QVERIFY(panel.m_order_book->activateRow(row));
-                // The exact on-grid price, read back unadjusted; same side.
-                QCOMPARE(panel.m_price->text(), clicked);
                 const auto parsed{ParseDisplayLimit(panel.m_price->text(), panel.m_snapshot->units, inverse, buy)};
-                QVERIFY(parsed); QVERIFY(!parsed->adjusted);
+                QVERIFY(parsed);
                 QCOMPARE(panel.m_side->currentIndex(), buy ? 0 : 1);
                 QVERIFY(!panel.m_marketable->isChecked());
-                // Grouped labels are an edge every order of the level accepts.
+                // Grouped labels are an edge every order of the level accepts;
+                // the executable limit is exactly that canonical edge.
                 const bool ask_row{row < spread};
                 const auto& level{ask_row ? (inverse ? panel.m_snapshot->levels->bids.levels : panel.m_snapshot->levels->asks.levels)[static_cast<size_t>(spread - 1 - row)]
                                           : (inverse ? panel.m_snapshot->levels->asks.levels : panel.m_snapshot->levels->bids.levels)[static_cast<size_t>(row - spread - 1)]};
                 const bool canonical_bid{ask_row == inverse};
                 QCOMPARE(parsed->price, canonical_bid ? level.low : level.high);
+                QCOMPARE(parsed->price, model->row(row).click_canonical);
+                // Hyperliquid's click-to-price: the price as shown, whenever
+                // the click takes the side the level's orders face (buy at a
+                // sell level, sell at a buy level), and always in the
+                // canonical view. Otherwise the same places or more, rounded
+                // toward the ticket's side: never an exact fraction here.
+                if (buy == ask_row || !inverse) {
+                    QCOMPARE(panel.m_price->text(), shown);
+                } else {
+                    QVERIFY2(Places(panel.m_price->text()) >= Places(shown), qPrintable(panel.m_price->text() + QStringLiteral(" / ") + shown));
+                    QVERIFY(!panel.m_price->text().contains(QLatin1Char('/')));
+                }
+                // A rounded B3-view text is adjusted only in the customer's
+                // favour, and the ticket shows the exact executable limit.
+                QVERIFY(!parsed->adjusted || inverse);
+                if (inverse) {
+                    QVERIFY2(panel.m_ticket_total->text().contains((parsed->adjusted ? QStringLiteral("Safely adjusted executable limit: ") : QStringLiteral("Exact executable limit: ")) +
+                                                                  ExactInversePrice(parsed->price, 6)), qPrintable(panel.m_ticket_total->text()));
+                }
             }
         }
         // Nothing opens a review, signs or reads for it.
         QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_deferred_review);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+        // The review of a clicked price shows exactly the level's canonical
+        // limit, the only price that would be signed, and any adjustment of
+        // the shown text (only in the customer's favour).
+        bool adjusted_reviewed{false};
+        for (const bool buy : {true, false}) {
+            (buy ? panel.m_buy : panel.m_sell)->click();
+            // The second sell level (998 atoms: 1000/998 tUSD per B3 does not end).
+            QVERIFY(panel.m_order_book->activateRow(spread - 2));
+            const auto shown{panel.m_price->text()};
+            const auto parsed{ParseDisplayLimit(shown, panel.m_snapshot->units, inverse, buy)};
+            QVERIFY(parsed); QCOMPARE(parsed->price, model->row(spread - 2).click_canonical);
+            adjusted_reviewed |= parsed->adjusted;
+            QString review;
+            QTimer::singleShot(0, &panel, [&] {
+                if (panel.m_confirmation) { review = panel.m_confirmation->text(); panel.m_confirmation->done(QMessageBox::Cancel); }
+            });
+            panel.begin(B3FlowMeshTrading::Operation::Order);
+            QVERIFY2(!review.isEmpty(), qPrintable(panel.m_log->toPlainText().right(400)));
+            if (inverse) {
+                QVERIFY2(review.contains(QStringLiteral("Exact canonical limit: %1 B3 atoms per token atom").arg(parsed->price)), qPrintable(review));
+                QCOMPARE(review.contains(QStringLiteral("Your entered limit was %1 tUSD / B3").arg(shown)), parsed->adjusted);
+            } else {
+                QVERIFY2(review.contains(QStringLiteral(" at %1 B3 / tUSD").arg(FormatPrice(parsed->price, 6))), qPrintable(review));
+            }
+            QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_thread);
+        }
+        QCOMPARE(adjusted_reviewed, inverse);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
         // Ignored while busy, while a review waits, or for another head.
         const auto before{panel.m_price->text()};
         const int other{spread + 2};
         panel.m_busy = true; QVERIFY(panel.m_order_book->activateRow(other)); QCOMPARE(panel.m_price->text(), before); panel.m_busy = false;
-        panel.fillFromBook(model->row(other).click_price, 1, QString::fromStdString(H(77).GetHex()));
+        panel.fillFromBook(model->row(other).click_price, model->row(other).click_canonical, 1, QString::fromStdString(H(77).GetHex()));
         QCOMPARE(panel.m_price->text(), before);
         // The spread row and padding are not clickable.
         QVERIFY(!panel.m_order_book->activateRow(spread));
@@ -1700,7 +1747,9 @@ private Q_SLOTS:
         QVERIFY(model->row(spread - 1).tooltip.startsWith(QStringLiteral("Sell 1.01 B3 / tUSD")));
         QVERIFY(model->row(spread + 1).tooltip.startsWith(QStringLiteral("Buy 1.00 B3 / tUSD")));
         QCOMPARE(model->row(spread - 1).click_price, QStringLiteral("1.01"));
+        QCOMPARE(model->row(spread - 1).click_canonical, CAmount{1010});
         QCOMPARE(model->row(spread + 2).click_price, QStringLiteral("0.99"));
+        QCOMPARE(model->row(spread + 2).click_canonical, CAmount{990});
         // The B3 view: a canonical bid is a displayed sell, labelled with the
         // upper token-per-B3 edge; its exact price is its lowest canonical one.
         const auto inverse{Grouping(true, 1, -4, 6)}; // 0.0001 token per B3
@@ -1708,10 +1757,12 @@ private Q_SLOTS:
         QVERIFY(book.showsVerifiedLevels());
         QVERIFY(model->row(spread - 1).tooltip.startsWith(QStringLiteral("Sell ")));
         QCOMPARE(model->row(spread - 1).price, QStringLiteral("1.0000")); // 1000 atoms: exactly 1 token per B3
-        QCOMPARE(model->row(spread - 1).click_price, ExactInversePrice(1000, 6));
+        QCOMPARE(model->row(spread - 1).click_price, QStringLiteral("1.0000"));
+        QCOMPARE(model->row(spread - 1).click_canonical, CAmount{1000});
         QVERIFY(model->row(spread + 1).tooltip.startsWith(QStringLiteral("Buy ")));
         QCOMPARE(model->row(spread + 1).price, QStringLiteral("0.9900")); // 1010 atoms: 1000/1010 floored to the step
-        QCOMPARE(model->row(spread + 1).click_price, ExactInversePrice(1010, 6));
+        QCOMPARE(model->row(spread + 1).click_price, QStringLiteral("0.9900"));
+        QCOMPARE(model->row(spread + 1).click_canonical, CAmount{1010});
     }
     void bookGroupingChoicesFollowThePriceMagnitude()
     {

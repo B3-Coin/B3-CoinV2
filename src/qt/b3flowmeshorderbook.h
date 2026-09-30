@@ -30,7 +30,7 @@ public:
         KindRole,
         //! The viewer's own account has quantity at this level.
         OwnRole,
-        //! A click offers this exact ticket price (empty: not clickable).
+        //! A click offers this price, as shown (empty: not clickable).
         ClickPriceRole,
     };
     struct Row {
@@ -40,10 +40,11 @@ public:
         QString price, size, total, tooltip, accessible;
         double depth{0};
         bool own{false};
-        //! A clickable level's exact ticket text and cumulative token
-        //! quantity (base atoms) from the best level.
+        //! A clickable level's price as the row shows it, the exact
+        //! canonical price that text stands for (B3 atoms per base atom),
+        //! and its cumulative token quantity (base atoms) from the best level.
         QString click_price;
-        CAmount click_cumulative{0};
+        CAmount click_canonical{0}, click_cumulative{0};
         bool operator==(const Row&) const = default;
     };
     explicit B3FlowMeshLadderModel(QObject* parent = nullptr) : QAbstractTableModel{parent} {}
@@ -78,7 +79,8 @@ private:
  * the standing clearing instead of a negative spread. Without verified
  * levels the book falls back to the exact limit-shaped curves of the first
  * curve page, labelled partial. A new price flashes for FLASH_MS unless
- * animation is off. Clicking a level offers its exact price to the ticket;
+ * animation is off. Clicking a level offers its price, as shown, to the
+ * ticket, which reads it back as exactly the level's canonical price;
  * nothing is ever signed from the book. There is no price-time priority. */
 class B3FlowMeshOrderBook : public QWidget
 {
@@ -121,7 +123,7 @@ public:
     //! spread to it.
     int hoverRow() const { return m_hover_row; }
     void setHoverRow(int row);
-    //! Offers row `row`'s exact price to the ticket (as a click does).
+    //! Offers row `row`'s price to the ticket (as a click does).
     bool activateRow(int row);
     //! The price-grouping selector's choices (BookGroupingChoices) and the
     //! current one; a selection only emits groupingSelected.
@@ -138,15 +140,17 @@ public:
 Q_SIGNALS:
     //! The viewer chose another price grouping for the displayed orientation.
     void groupingSelected(const flowmesh::LevelGrouping& grouping);
-    //! A level was clicked: its exact ticket price text, its cumulative
-    //! token quantity (base atoms) from the best level, and the head of the
-    //! data it was shown from. Never a signing or review request.
-    void levelClicked(const QString& price, qint64 cumulative, const QString& head);
+    //! A level was clicked: its price as shown, the exact canonical price
+    //! it stands for, its cumulative token quantity (base atoms) from the
+    //! best level, and the head of the data it was shown from. Never a
+    //! signing or review request.
+    void levelClicked(const QString& price, qint64 canonical, qint64 cumulative, const QString& head);
 
 private:
     friend class B3FlowMeshLadderView;
     struct Level {
         QString price, size, total, tooltip, accessible, click_price;
+        CAmount click_canonical{0};
         bool own{false};
         CAmount cumulative_tokens{0};
         //! Cumulative in the displayed base unit for the depth bar (tokens,
