@@ -60,6 +60,23 @@ PRE_ADMISSION_REJECTIONS = {
     "FlowMesh service is reconciling the B3 tip",
     "FlowMesh market is paused (at least four active seats are required)",
 }
+# The client's labels on a status read that was pending or coalesced and so
+# repeats a retained observation (ActionStatus in node/flowmesh_client.cpp).
+COALESCED_STATUS_PREFIXES = (
+    "Status read pending/coalesced; retained submission observation only. ",
+    "Status read coalesced; retained endpoint observation, not a fresh response. ",
+)
+
+
+def pre_admission_rejection(reason):
+    """A definite pre-admission refusal: retried with the same signed action.
+    Also when a coalesced status read repeats the retained observation of
+    one, which the client prefixes with one of COALESCED_STATUS_PREFIXES."""
+    for prefix in COALESCED_STATUS_PREFIXES:
+        if reason.startswith(prefix):
+            reason = reason[len(prefix):]
+            break
+    return reason in PRE_ADMISSION_REJECTIONS
 
 
 def positive_number(value):
@@ -457,7 +474,7 @@ class FlowMeshLatencyTest(FlowMeshPreagreementTest):
             if state == "admitted" and "admitted_observed_host_us" not in sample:
                 sample["admitted_observed_host_us"] = status_observed
                 sample["admitted_observed_ms"] = (status_observed - start) / 1000
-            retryable = state == "unknown" or (state == "rejected" and status["reason"] in PRE_ADMISSION_REJECTIONS)
+            retryable = state == "unknown" or (state == "rejected" and pre_admission_rejection(status["reason"]))
             assert state != "rejected" or retryable, status
             if state == "certified_inclusion" and target is None:
                 assert_equal(status["certificate_verified"], True)
