@@ -29,9 +29,13 @@ With --latency-local-reader-busy every read is an ordinary full read that
 waits for nothing, as on a market whose head moves faster than the reader:
 an upper bound of the reader's market-mutex load at that rate.
 --latency-lock-capture records operator 0's market-mutex waits (flowmeshtiming)
-during the measured phase: the reader's own MarketData holds and every other
-holder's wait for the mutex (the runtime worker's certified commits among
-them), so both arms can be compared.
+during the measured phase: the reader's own MarketData holds, the FlowMesh
+runtime worker's waits (ProcessTick, ProcessMessage, ProcessDeliveryEvent:
+the tick, messages and delivery events, reported pooled and per stage, never
+mixed with client calls) and the client calls' waits (submissions, status and
+snapshot reads), so the arms can be compared per holder. Compare the worker's
+tail (p99, max) across arms: its thousands of near-zero message waits hide a
+tick that waits behind a reader in any pooled figure.
 """
 
 import argparse
@@ -144,8 +148,12 @@ class LocalMarketReader(threading.Thread):
             self.stopped_s = time.monotonic()
 
     def stop(self):
+        """Stops and joins the reader; never raises (see check), so cleanup
+        after it still runs and an earlier failure is not masked."""
         self.stop_event.set()
         self.join(timeout=10)
+
+    def check(self):
         assert not self.is_alive(), "local reader did not stop"
         assert self.error is None, f"local reader failed: {self.error}"
 
@@ -153,14 +161,22 @@ class LocalMarketReader(threading.Thread):
         seconds = (self.stopped_s or time.monotonic()) - self.started_s
         return {"hz": round(1000.0 / self.refill_ms, 3), "busy": self.busy, "reads": len(self.durations_ms), "seconds": round(seconds, 3),
                 "reads_per_second": round(len(self.durations_ms) / seconds, 3) if seconds > 0 else None,
-                "head_changes_seen": self.changed, "watch_statuses": dict(self.statuses),
+                "head_changes_seen": self.changed, "watch_statuses": dict(self.statuses), "error": self.error,
                 "read_ms": distribution(self.durations_ms, target_ms)}
+
+
+# The FlowMesh runtime worker's market-mutex holders: its tick, the messages
+# and the delivery events it processes. A wait here delays certification.
+RUNTIME_WORKER_STAGES = ("ProcessTick", "ProcessMessage", "ProcessDeliveryEvent")
 
 
 def market_mutex_waits(captures, target_ms):
     """Market-mutex waits (lock_acquired - lock_requested) by holder, in ms,
     and the MarketData reads' own holds and longest book-copy page hold, over
-    one capture per measured pair (each within the capture's event bound)."""
+    one capture per measured pair (each within the capture's event bound).
+    The runtime worker's waits are reported apart from client calls, pooled
+    and per stage (by_holder_wait_ms): pooled, the worker's many near-zero
+    message waits would hide a tick waiting behind a reader."""
     waits, reader_holds, book_holds = {}, [], []
     events = [row for capture in captures for row in capture["events"]]
     for row in events:
@@ -174,9 +190,14 @@ def market_mutex_waits(captures, target_ms):
             reader_holds.append((event["lock_released_us"] - event["lock_acquired_us"]) / 1000)
         if "book_copy_longest_hold_us" in event:
             book_holds.append(event["book_copy_longest_hold_us"] / 1000)
-    others = [value for name, rows in waits.items() if name.startswith("other:") for value in rows]
+    worker_names = {"other:" + stage for stage in RUNTIME_WORKER_STAGES}
+    worker = [value for name, rows in waits.items() if name in worker_names for value in rows]
+    clients = [value for name, rows in waits.items() if name.startswith("other:") and name not in worker_names for value in rows]
     return {"captures": len(captures), "dropped": sum(capture["dropped"] for capture in captures), "events": len(events),
-            "other_holders_wait_ms": distribution(others, target_ms),
+            "runtime_worker_stages": list(RUNTIME_WORKER_STAGES),
+            "runtime_worker_wait_ms": distribution(worker, target_ms),
+            "runtime_tick_wait_ms": distribution(waits.get("other:ProcessTick", []), target_ms),
+            "client_calls_wait_ms": distribution(clients, target_ms),
             "by_holder_wait_ms": {name: distribution(rows, target_ms) for name, rows in sorted(waits.items())},
             "reader_marketdata_hold_ms": distribution(reader_holds, target_ms),
             "reader_book_copy_longest_page_hold_ms": distribution(book_holds, target_ms)}
@@ -667,14 +688,20 @@ class FlowMeshLatencyTest(FlowMeshPreagreementTest):
                     if phase == "measured":
                         assert all(after > before for before, after in zip(heights_before, heights_after)), "B3 must advance during the measured workload"
                 finally:
-                    if phase == "measured" and self.options.latency_lock_capture:
-                        if capturing:
-                            captures.append(self.nodes[0].flowmeshtiming("stop"))
-                        self.latency_report["operator0_market_mutex"] = market_mutex_waits(captures, self.options.latency_target_ms)
-                    if reader is not None:
-                        reader.stop()
-                        self.latency_report["local_reader"] = reader.summary(self.options.latency_target_ms)
-                    self.end_b3_workload()
+                    # The workload always ends, and a failure here never
+                    # masks the one that brought the run here.
+                    try:
+                        if reader is not None:
+                            reader.stop()
+                            self.latency_report["local_reader"] = reader.summary(self.options.latency_target_ms)
+                        if phase == "measured" and self.options.latency_lock_capture:
+                            if capturing:
+                                captures.append(self.nodes[0].flowmeshtiming("stop"))
+                            self.latency_report["operator0_market_mutex"] = market_mutex_waits(captures, self.options.latency_target_ms)
+                    finally:
+                        self.end_b3_workload()
+                if reader is not None:
+                    reader.check()
                 if self.options.latency_production_logging:
                     self.verify_production_logging(market_id, phase + "_after")
                 else:
