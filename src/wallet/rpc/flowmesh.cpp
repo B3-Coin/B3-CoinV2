@@ -1486,7 +1486,7 @@ RPCHelpMan getflowmeshcandles()
             {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Market id"},
             {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Page options", {
                 {"interval", RPCArg::Type::STR, RPCArg::Default{"1m"}, "1m, 5m, 15m, 1h, 4h or 1d"},
-                {"before_ms", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Exclusive end of the window in Unix milliseconds; omit for the newest"},
+                {"before_ms", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Exclusive end of the window in Unix milliseconds; omit for the newest. A value past 253402300800000 (10000-01-01T00:00:00Z) is clamped to it: every observed time is before it"},
                 {"limit", RPCArg::Type::NUM, RPCArg::Default{200}, "Window length in intervals, 1-500"},
             }},
         },
@@ -1553,7 +1553,9 @@ RPCHelpMan getflowmeshcandles()
                     if (out < minimum || out > maximum) throw JSONRPCError(RPC_INVALID_PARAMETER, std::string{name} + " is outside its supported range");
                     return out;
                 };
-                if (options.exists("before_ms")) before_ms = static_cast<int64_t>(number("before_ms", 0, std::numeric_limits<int64_t>::max()));
+                // Clamped, not refused: no observed time is at or past the
+                // display bound, and the reply's window never ends past it.
+                if (options.exists("before_ms")) before_ms = std::min(static_cast<int64_t>(number("before_ms", 0, std::numeric_limits<int64_t>::max())), flowmesh::OBSERVED_MS_LIMIT);
                 if (options.exists("limit")) limit = number("limit", 1, 500);
             }
             std::string error;

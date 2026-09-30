@@ -11,7 +11,7 @@ candles served, the defaults) and validator 1 (-flowmeshapiobservedtime=0
 - each validator records when it applied every certified entry; its own RPC
   returns the stamps of the head, history and ticks (never certified), and
   getflowmeshcandles aggregates exactly what the rollup rules place;
-- the RPC options are strict;
+- the RPC options are strict, and a window past 10000-01-01 is clamped;
 - through validator 0's endpoint the client labels the times with that
   endpoint and reads its candles, labelled endpoint-reported, also when an
   auction is certified between its market read and its candles read (the
@@ -35,6 +35,8 @@ from test_framework.util import assert_equal, assert_raises_rpc_error
 
 PRICE = 40_000_000
 HOUR_MS = 3_600_000
+# 10000-01-01T00:00:00Z: every observed time is before it.
+OBSERVED_MS_LIMIT = 253_402_300_800_000
 
 
 def observed_bodies(relay):
@@ -129,6 +131,11 @@ class FlowMeshObservedTimeTest(FlowMeshLiquidityTest):
             ({"from_ms": 1}, -8, "Unknown option 'from_ms'"),
         ):
             assert_raises_rpc_error(code, message, n0.getflowmeshcandles, market, options)
+        # A window past 10000-01-01 (the display bound) is clamped, never
+        # refused: no observed time is at or past it.
+        page = n0.getflowmeshcandles(market, {"interval": "1m", "before_ms": 2**63 - 1})
+        assert_equal((page["available"], page["before_ms"], page["from_ms"], page["candles"]),
+                     (True, OBSERVED_MS_LIMIT, OBSERVED_MS_LIMIT - 200 * 60_000, []))
         # Without the option every reply is as before.
         assert "observed_time" not in n0.getflowmeshmarketdata(market, {"limit": 1, "ticks": {}})
 

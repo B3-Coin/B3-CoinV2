@@ -113,6 +113,13 @@ placed entries: `open_ms`, `first_sequence`, `last_sequence`, `entries`,
 `endpoint_reported`. The local engine pages its database beyond the memory
 window; a remote client asks its endpoint.
 
+Every observed time and candle open is before 10000-01-01T00:00:00Z
+(`OBSERVED_MS_LIMIT`, 253402300800000 ms), a display bound only. A larger
+`before_ms` is clamped to it, never refused. A wall clock at or past it
+records entries `untimed` (`clock_suspect`, reason `clock_stepped_back`) and
+never becomes the floor later stamps must pass, and a stored row or candle
+at or past it (a corrupt database) is never read back.
+
 ## 3. Public trading API
 
 | Flag | Default | Meaning |

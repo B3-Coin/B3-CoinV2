@@ -7,6 +7,8 @@
 
 #include <node/flowmesh_client.h>
 
+#include <dbwrapper.h>
+#include <serialize.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
 
@@ -17,6 +19,7 @@
 #include <condition_variable>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -83,11 +86,80 @@ FlowMeshObservedTimeStore::Options Options(const fs::path& path)
     return out;
 }
 
+//! The store's own row and candle layouts (flowmesh_observed_time_log.cpp),
+//! to write what it never writes itself.
+struct RawRowKey {
+    uint8_t prefix{'r'};
+    uint256 market;
+    uint64_t sequence{0};
+    SERIALIZE_METHODS(RawRowKey, obj) { READWRITE(obj.prefix, obj.market, Using<BigEndianFormatter<8>>(obj.sequence)); }
+};
+struct RawRowValue {
+    uint256 hash;
+    uint8_t mode{0};
+    int64_t ms{0};
+    uint8_t flags{0};
+    uint8_t delay{0};
+    SERIALIZE_METHODS(RawRowValue, obj) { READWRITE(obj.hash, obj.mode, obj.ms, obj.flags, obj.delay); }
+};
+struct RawCandleKey {
+    uint8_t prefix{'c'};
+    uint256 market;
+    uint8_t interval{0};
+    uint64_t open_ms{0};
+    SERIALIZE_METHODS(RawCandleKey, obj) { READWRITE(obj.prefix, obj.market, obj.interval, Using<BigEndianFormatter<8>>(obj.open_ms)); }
+};
+struct RawCandleValue {
+    uint64_t first_sequence{0}, last_sequence{0};
+    uint32_t entries{0}, clearings{0};
+    int64_t open{0}, high{0}, low{0}, close{0};
+    uint64_t base_low{0}, base_high{0}, quote_low{0}, quote_high{0};
+    uint8_t flags{0};
+    SERIALIZE_METHODS(RawCandleValue, obj)
+    {
+        READWRITE(obj.first_sequence, obj.last_sequence, obj.entries, obj.clearings, obj.open, obj.high, obj.low,
+                  obj.close, obj.base_low, obj.base_high, obj.quote_low, obj.quote_high, obj.flags);
+    }
+};
+
 std::vector<std::pair<uint64_t, uint256>> Known(const uint64_t from, const uint64_t to)
 {
     std::vector<std::pair<uint64_t, uint256>> out;
     for (uint64_t i{from}; i < to; ++i) out.emplace_back(i, EntryHash(i));
     return out;
+}
+
+const flowmesh::MarketId OTHER_MARKET{uint256{"00000000000000000000000000000000000000000000000000000000000000e2"}};
+
+//! Three recorded entries a minute apart from T0 (1m candles at T0, +1 and
+//! +2 minutes), then what the store never writes itself: 1m bucket starts
+//! at the display bound, at 2^63 and at 2^64 - 1 (negative as int64), one
+//! not aligned, one at 2^63 for OTHER_MARKET, and entry 2's row stamped at
+//! the bound.
+void WriteOutOfBoundTimes(const fs::path& path, FakeClocks& clocks)
+{
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        store.Attach(log, 0, {});
+        for (uint64_t i{0}; i < 3; ++i) {
+            log->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i));
+            clocks.Advance(60'000);
+        }
+        store.Stop();
+    }
+    CDBWrapper db{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+    const RawCandleValue value{1, 1, 1, 1, 10, 10, 10, 10, 1, 0, 10, 0, 0};
+    CDBBatch batch{db};
+    for (const uint64_t open : {static_cast<uint64_t>(flowmesh::OBSERVED_MS_LIMIT), uint64_t{1} << 63,
+                                std::numeric_limits<uint64_t>::max(), static_cast<uint64_t>(T0 + 30'000)}) {
+        batch.Write(RawCandleKey{'c', MARKET, 0, open}, value);
+    }
+    batch.Write(RawCandleKey{'c', OTHER_MARKET, 0, uint64_t{1} << 63}, value);
+    batch.Write(RawRowKey{'r', MARKET, 2}, RawRowValue{EntryHash(2), static_cast<uint8_t>(ObservedMode::LIVE), flowmesh::OBSERVED_MS_LIMIT, 0, 0});
+    db.WriteBatch(batch, true);
 }
 
 } // namespace
@@ -399,6 +471,91 @@ BOOST_AUTO_TEST_CASE(candle_page_json_exact_volumes_and_labels)
     BOOST_CHECK_EQUAL(candles[1]["quote_volume"].get_str(), "438508840000000000000000000000000000");
     BOOST_CHECK_EQUAL(candles[1]["flags"].size(), 0U);
     BOOST_CHECK_EQUAL(candles[0]["flags"][0].get_str(), "seam_before");
+}
+
+BOOST_AUTO_TEST_CASE(far_future_wall_clock_is_untimed_and_never_the_floor)
+{
+    FakeClocks clocks;
+    clocks.wall = flowmesh::OBSERVED_MS_LIMIT;
+    const auto log{MakeLog(clocks)};
+    // A clock at or past 10000-01-01 is no time: untimed and flagged.
+    auto stamp{log->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0))};
+    BOOST_REQUIRE(stamp.mode == ObservedMode::UNTIMED);
+    BOOST_CHECK(stamp.delay == ObservedDelay::CLOCK_BACK);
+    BOOST_CHECK_EQUAL(stamp.ms, 0);
+    BOOST_CHECK(stamp.flags & flowmesh::OBSERVED_CLOCK_SUSPECT);
+    BOOST_CHECK(log->Candles(CandleInterval::M1, std::nullopt, 10).candles.empty());
+    // It never became the monotonic floor: once corrected, the next entry
+    // has a time again (a step from the previous stamp).
+    clocks.wall = T0;
+    clocks.steady_ms += 1000;
+    stamp = log->Record(1, EntryHash(1), ObservedDelay::NONE, Tick(1));
+    BOOST_REQUIRE(stamp.mode == ObservedMode::LIVE);
+    BOOST_CHECK_EQUAL(stamp.ms, T0);
+    BOOST_CHECK(stamp.flags & flowmesh::OBSERVED_CLOCK_STEP);
+    const auto minutes{log->Candles(CandleInterval::M1, std::nullopt, 10).candles};
+    BOOST_REQUIRE_EQUAL(minutes.size(), 1U);
+    BOOST_CHECK_EQUAL(minutes.back().open_ms, T0);
+    BOOST_CHECK(minutes.back().flags & flowmesh::CANDLE_PARTIAL);
+    // Neither extreme clock overflows the step check; both are untimed.
+    uint64_t sequence{2};
+    for (const int64_t wall : {std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max()}) {
+        clocks.wall = wall;
+        clocks.steady_ms += 1000;
+        stamp = log->Record(sequence, EntryHash(sequence), ObservedDelay::NONE, Tick(sequence));
+        ++sequence;
+        BOOST_CHECK(stamp.mode == ObservedMode::UNTIMED);
+        BOOST_CHECK_EQUAL(stamp.ms, 0);
+    }
+    clocks.wall = T0 + 5'000;
+    clocks.steady_ms += 1000;
+    stamp = log->Record(sequence, EntryHash(sequence), ObservedDelay::NONE, Tick(sequence));
+    BOOST_CHECK(stamp.mode == ObservedMode::LIVE);
+    BOOST_CHECK_EQUAL(stamp.ms, T0 + 5'000);
+}
+
+BOOST_AUTO_TEST_CASE(stored_times_past_the_display_bound_are_never_loaded)
+{
+    const auto path{m_path_root / "observed_bound_load"};
+    FakeClocks clocks;
+    WriteOutOfBoundTimes(path, clocks);
+    FlowMeshObservedTimeStore store{Options(path)};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 3, Known(0, 3));
+    // The row at the bound is not read back, and none of those candles is.
+    BOOST_CHECK_EQUAL(log->Lookup(Known(0, 3)).size(), 2U);
+    const auto page{log->Candles(CandleInterval::M1, std::nullopt, 500)};
+    BOOST_CHECK_EQUAL(page.candles.size(), 3U);
+    for (const auto& candle : page.candles) BOOST_CHECK(flowmesh::ObservedTimeInRange(candle.open_ms) && candle.open_ms % 60'000 == 0);
+    BOOST_CHECK_EQUAL(page.before_ms, T0 + 180'000);
+    // The recorder's floor is its last real time: the next entry is live.
+    clocks.Advance(60'000);
+    const auto stamp{log->Record(3, EntryHash(3), ObservedDelay::NONE, Tick(3))};
+    BOOST_CHECK(stamp.mode == ObservedMode::LIVE);
+    BOOST_CHECK_EQUAL(stamp.ms, clocks.wall.load());
+    store.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(stored_keys_past_the_display_bound_end_the_disk_scan)
+{
+    const auto path{m_path_root / "observed_bound_scan"};
+    FakeClocks clocks;
+    WriteOutOfBoundTimes(path, clocks);
+    FlowMeshObservedTimeStore store{Options(path)};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    // Keys are compared unsigned: a key at or past 2^63 ends the scan and is
+    // never an older candle; one at the bound or unaligned is skipped.
+    bool older{true};
+    const auto disk{store.ReadCandles(MARKET, CandleInterval::M1, 0, std::numeric_limits<int64_t>::max(), 500, &older)};
+    BOOST_CHECK(!older);
+    BOOST_CHECK_EQUAL(disk.size(), 3U);
+    for (const auto& candle : disk) BOOST_CHECK(flowmesh::ObservedTimeInRange(candle.open_ms) && candle.open_ms % 60'000 == 0);
+    older = true;
+    BOOST_CHECK(store.ReadCandles(OTHER_MARKET, CandleInterval::M1, 0, flowmesh::OBSERVED_MS_LIMIT, 500, &older).empty());
+    BOOST_CHECK(!older);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -96,7 +96,7 @@ std::optional<flowmesh::ObservedStamp> FromRow(const uint64_t sequence, const Ro
 {
     if (row.mode < static_cast<uint8_t>(flowmesh::ObservedMode::LIVE) ||
         row.mode > static_cast<uint8_t>(flowmesh::ObservedMode::UNTIMED) ||
-        row.delay > static_cast<uint8_t>(flowmesh::ObservedDelay::CLOCK_BACK) || row.ms < 0) return std::nullopt;
+        row.delay > static_cast<uint8_t>(flowmesh::ObservedDelay::CLOCK_BACK) || !flowmesh::ObservedTimeInRange(row.ms)) return std::nullopt;
     flowmesh::ObservedStamp out;
     out.sequence = sequence;
     out.hash = row.hash;
@@ -118,8 +118,13 @@ CandleValue ToValue(const flowmesh::ObservedCandle& candle)
             candle.low, candle.close, base_low, base_high, quote_low, quote_high, candle.flags};
 }
 
-std::optional<flowmesh::ObservedCandle> FromValue(const int64_t open_ms, const CandleValue& value)
+std::optional<flowmesh::ObservedCandle> FromValue(const uint64_t key_open_ms, const flowmesh::CandleInterval interval, const CandleValue& value)
 {
+    // A key the rollup cannot have written (out of range or unaligned) is
+    // skipped, never cast into a negative or far-future open.
+    if (key_open_ms >= static_cast<uint64_t>(flowmesh::OBSERVED_MS_LIMIT)) return std::nullopt;
+    const int64_t open_ms{static_cast<int64_t>(key_open_ms)};
+    if (open_ms % flowmesh::CandleIntervalMs(interval) != 0) return std::nullopt;
     if (value.last_sequence < value.first_sequence || value.clearings > value.entries ||
         (value.clearings > 0 && (value.low > value.high || value.open < value.low || value.open > value.high ||
                                  value.close < value.low || value.close > value.high))) return std::nullopt;
@@ -161,7 +166,8 @@ flowmesh::ObservedStamp FlowMeshObservedTimeLog::Record(const uint64_t sequence,
         stamp.hash = hash;
         stamp.delay = delay;
         stamp.mode = delay == flowmesh::ObservedDelay::NONE ? flowmesh::ObservedMode::LIVE : flowmesh::ObservedMode::DELAYED;
-        const int64_t wall{m_clocks.wall_ms()};
+        // Clamped so the step check below cannot overflow on any clock value.
+        const int64_t wall{std::clamp<int64_t>(m_clocks.wall_ms(), -flowmesh::OBSERVED_MS_LIMIT, flowmesh::OBSERVED_MS_LIMIT)};
         const auto steady{m_clocks.steady()};
         if (m_clock_suspect.load(std::memory_order_relaxed)) stamp.flags |= flowmesh::OBSERVED_CLOCK_SUSPECT;
         if (!tick || tick->sequence != sequence || tick->microblock_hash != hash) stamp.flags |= flowmesh::OBSERVED_NO_CLEARING;
@@ -176,7 +182,18 @@ flowmesh::ObservedStamp FlowMeshObservedTimeLog::Record(const uint64_t sequence,
                     steady_delta - wall_delta > flowmesh::OBSERVED_CLOCK_SLEW_MS) stamp.flags |= flowmesh::OBSERVED_CLOCK_STEP;
             }
             m_previous = std::pair{wall, steady};
-            if (m_last_ms && wall < *m_last_ms) {
+            if (wall >= flowmesh::OBSERVED_MS_LIMIT) {
+                // A clock at or past the display bound (10000-01-01) is
+                // broken, not a time: untimed, flagged suspect and never the
+                // monotonic floor, so later stamps are timed again as soon
+                // as it is back below the bound. CLOCK_BACK is reused
+                // deliberately: the delay vocabulary stays unchanged for a
+                // state no working clock reaches.
+                stamp.mode = flowmesh::ObservedMode::UNTIMED;
+                stamp.delay = flowmesh::ObservedDelay::CLOCK_BACK;
+                stamp.ms = 0;
+                stamp.flags |= flowmesh::OBSERVED_CLOCK_SUSPECT;
+            } else if (m_last_ms && wall < *m_last_ms) {
                 if (*m_last_ms - wall <= flowmesh::OBSERVED_CLOCK_SLEW_MS) {
                     stamp.ms = *m_last_ms;
                     stamp.flags |= flowmesh::OBSERVED_CLOCK_CLAMPED;
@@ -429,7 +446,7 @@ void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTim
                         key.interval != static_cast<uint8_t>(interval)) break;
                     CandleValue value;
                     if (!it->GetValue(value)) continue;
-                    auto candle{FromValue(static_cast<int64_t>(key.open_ms), value)};
+                    auto candle{FromValue(key.open_ms, interval, value)};
                     // Never a candle holding an entry the store does not have.
                     if (!candle || candle->last_sequence >= store_next_sequence) continue;
                     out.push_back(*candle);
@@ -573,18 +590,21 @@ std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(con
         const auto matches = [&](const CandleKey& key) {
             return key.prefix == KEY_CANDLE && key.market == market && key.interval == static_cast<uint8_t>(interval);
         };
+        // Keys are unsigned: compared as such, a corrupt key at or past 2^63
+        // ends the scan instead of reading as a negative open.
+        const uint64_t from{static_cast<uint64_t>(std::max<int64_t>(0, from_ms))};
+        const uint64_t before{static_cast<uint64_t>(std::max<int64_t>(0, before_ms))};
         if (older) {
             it->Seek(CandleKey{KEY_CANDLE, market, static_cast<uint8_t>(interval), 0});
             CandleKey key;
-            *older = it->Valid() && it->GetKey(key) && matches(key) && static_cast<int64_t>(key.open_ms) < from_ms;
+            *older = it->Valid() && it->GetKey(key) && matches(key) && key.open_ms < from;
         }
-        for (it->Seek(CandleKey{KEY_CANDLE, market, static_cast<uint8_t>(interval), static_cast<uint64_t>(std::max<int64_t>(0, from_ms))});
-             it->Valid() && out.size() < limit; it->Next()) {
+        for (it->Seek(CandleKey{KEY_CANDLE, market, static_cast<uint8_t>(interval), from}); it->Valid() && out.size() < limit; it->Next()) {
             CandleKey key;
-            if (!it->GetKey(key) || !matches(key) || static_cast<int64_t>(key.open_ms) >= before_ms) break;
+            if (!it->GetKey(key) || !matches(key) || key.open_ms >= before) break;
             CandleValue value;
             if (!it->GetValue(value)) continue;
-            if (auto candle{FromValue(static_cast<int64_t>(key.open_ms), value)}) out.push_back(*candle);
+            if (auto candle{FromValue(key.open_ms, interval, value)}) out.push_back(*candle);
         }
     } catch (const std::exception&) {
         out.clear();
