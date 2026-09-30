@@ -89,12 +89,14 @@ not an invented certified timestamp, and resets when you change wallet or market
 ## How the page stays current
 
 The book, chart and trades tape follow verified updates as they arrive: with
-your own node's engine, a new certified auction usually reaches the screen
-within tens of milliseconds, and the engine is read up to ten times a second; a
-remote endpoint is read at most twice a second (live updates, when its
-operator offers them, else polling every 0.5 s). Cells change in place, and
-data that did not change repaints nothing. A market switch reads the new
-market at once.
+your own node's engine, a new certified auction on a quiet market usually
+reaches the screen within tens of milliseconds. Your node's engine and a
+remote endpoint are each read at most twice a second (live updates, or
+polling every 0.5 s when a remote operator offers none), so on a busy market
+the screen moves in steps of about half a second. Faster local reads wait
+for a node change: today each read copies the market under a lock the
+FlowMesh worker also needs. Cells change in place, and data that did not
+change repaints nothing. A market switch reads the new market at once.
 
 With your own node's engine, the book, chart and tape keep updating while an
 order review is open or an order is being sent. The review itself shows,

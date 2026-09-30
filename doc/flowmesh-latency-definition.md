@@ -153,7 +153,7 @@ two times the refill); anything faster is "busy".
 
 | Metric | Measures | Provisional target |
 |---|---|---|
-| U1-local | Local engine: head committed -> the book shows it | Quiet: p95 <= 50 ms, p99 <= 100 ms. Busy at 5 heads/s: p95 <= 150 ms with local reads up to 10/s (about 450-550 ms at two reads a second). 20 heads/s is a stress case, reported only. |
+| U1-local | Local engine: head committed -> the book shows it | Quiet: p95 <= 50 ms, p99 <= 100 ms. Busy at 5 heads/s: p95 <= 600 ms at the shipped two local reads a second (one 500 ms refill plus processing); p95 <= 150 ms needs ten a second (C7, held back, see below). 20 heads/s is a stress case, reported only. |
 | U1-qt | Any backend: verified reply returned -> the book shows it | p95 <= 30 ms |
 | U1-remote | Remote endpoint head -> the book shows it | Reported, not gated (a WAN gate needs an owner ruling); dominated by the per-head verified state download |
 | U2 | GUI stall at 20 applied updates/s with the pointer on the chart | Stall p99 <= 16 ms, max <= 50 ms; update handler p95 <= 8 ms |

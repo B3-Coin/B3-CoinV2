@@ -151,14 +151,20 @@ retry in N s)", "live updates reconnecting in N s" or "No live update for
 once (a `ticks_catchup` read is re-armed at once and counts as neither a live
 reply nor a strike); three in a row fall back to polling for 10 s, busy for 10 s, an
 endpoint without the capability for 60 s, failures back off 1-30 s, and the
-panel never sends a remote endpoint more than a burst of two watch reads and
-then one per 500 ms. The local engine (a node's own wallet: no network,
-endpoint or admission budget) is read at up to a burst of two and then one
-per 100 ms (ten a second), a provisional owner default of 2026-09-30 that
-amends the watch critique's two-per-second floor for the local engine only;
-a reply that names an endpoint returns that panel to the remote pacing at
-once. The next read starts when the pacing allows it, on a precise timer,
-not on the next 500 ms tick. When replies the
+panel never sends more than a burst of two watch reads and then one per
+500 ms, to a remote endpoint or to the local engine. Ten local reads a
+second (the provisional C7 default of 2026-09-30) is held back: each local
+read copies the book, the account and the store's history under the node's
+market mutex, which the FlowMesh worker's tick also takes, and the
+validator A/B showed the tick waiting for it (p99 0.02 ms with no reader,
+0.12 ms at two full reads a second, 10.2 ms and a 25.7 ms maximum at ten).
+It needs a node change first: local reads served from a snapshot published
+per certified head, outside that mutex. A reply that names an endpoint marks
+a panel remote at once. The next read starts when the pacing allows it, on
+a precise timer, not on the next 500 ms tick; on a busy market that means a
+remote endpoint's watch reads now reach the full two a second (they were
+held to the tick before, 500-1000 ms apart), and each changed head still
+costs that client a whole verified state read. When replies the
 client keeps its connection for (`superseded`, `revalidate`, `lane_busy`)
 send the panel from live mode or from a probe to polling, it closes the
 live-update connection with one `watch_ms` 0 read.

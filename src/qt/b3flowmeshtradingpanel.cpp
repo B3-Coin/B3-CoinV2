@@ -2619,8 +2619,8 @@ void B3FlowMeshTradingPanel::updateWatchState()
     const bool eligible{m_wallet && m_backend && selected && m_security_warning.isEmpty() && m_client_info.has_value()};
     const QString key{eligible ? QStringLiteral("%1/%2/%3").arg(m_generation).arg(selected->id, local ? QStringLiteral("local") : endpoint) : QString{}};
     const bool advertised{local || live > 0};
-    // The local engine's reads have no network or endpoint budget: up to
-    // ten a second (a reply naming an endpoint drops to the remote pacing).
+    // The local engine's own pacing (LOCAL_ARM_REFILL_MS, today the same two
+    // reads a second); a reply naming an endpoint drops to the remote pacing.
     const bool local_pacing{local && !(selected && m_snapshot && m_snapshot->market == selected->id && m_snapshot->remote)};
     if (key != m_watch_key) {
         m_watch_key = key; ++m_watch_generation; m_watch_watchdog = false;

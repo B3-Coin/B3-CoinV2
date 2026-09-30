@@ -63,15 +63,20 @@ struct Policy {
     //! slow link's round trips (a new TLS connection and a snapshot).
     static constexpr int64_t PROBE_HOLD_MS{WATCH_MS + 3000};
     //! Hard floor on the read rate, whatever the outcome: a burst of two,
-    //! then one more every 500 ms (at most two watch reads per second to a
-    //! remote endpoint; the local engine refills faster, see below).
+    //! then one more every 500 ms (at most two watch reads per second, to a
+    //! remote endpoint and to the local engine alike).
     static constexpr int ARM_BURST{2};
     static constexpr int64_t ARM_REFILL_MS{500};
-    //! The local engine only: one more every 100 ms (at most ten reads a
-    //! second). Provisional owner default of 2026-09-30, amending the watch
-    //! critique's two-per-second floor for the local engine, which has no
-    //! network, endpoint or Admit budget; a remote endpoint keeps 500 ms.
-    static constexpr int64_t LOCAL_ARM_REFILL_MS{100};
+    //! The local engine's refill: the same 500 ms. Ten reads a second (100
+    //! ms; the provisional C7 default of 2026-09-30) is held back until the
+    //! node reads a market without holding its market mutex for the copy:
+    //! each local read copies the book, account and store history under
+    //! that mutex, which the FlowMesh worker's tick also takes. In the
+    //! validator A/B the tick's p99 wait for it was 0.02 ms with no reader,
+    //! 0.12 ms at two full reads a second and 10.2 ms (max 25.7 ms) at ten,
+    //! on a one-market fixture with few curves. A separate constant, so the
+    //! local pacing can change on its own once that is fixed and ruled.
+    static constexpr int64_t LOCAL_ARM_REFILL_MS{ARM_REFILL_MS};
 
     Mode mode{Mode::Off};
     //! The last finished read's outcome (for display only).
@@ -80,9 +85,9 @@ struct Policy {
     unsigned failures{0}, not_waited{0};
     int tokens{ARM_BURST};
     int64_t armed_at{0}, last_ok_at{-1}, retry_at{0}, refill_at{0};
-    //! Reading the local engine: no network, endpoint or Admit budget. Set
-    //! from the client info when enabled; any reply that names an endpoint
-    //! clears it (Remote).
+    //! Reading the local engine: no network, endpoint or Admit budget (its
+    //! reads still take the node's market mutex). Set from the client info
+    //! when enabled; any reply that names an endpoint clears it (Remote).
     bool local{false};
     //! LOCAL_ARM_REFILL_MS for the local engine, else ARM_REFILL_MS.
     int64_t RefillMs() const { return local ? LOCAL_ARM_REFILL_MS : ARM_REFILL_MS; }

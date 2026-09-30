@@ -1336,7 +1336,7 @@ private Q_SLOTS:
         for (size_t i{2}; i < arms.size(); ++i) QVERIFY(arms[i] - arms[i - 2] >= Policy::ARM_REFILL_MS);
         QCOMPARE(p.mode, Mode::Live); QVERIFY(!p.PollEveryTick());
     }
-    void watchLocalEngineIsPacedTenPerSecondAndRemoteTwo()
+    void watchLocalEngineIsPacedAtTwoPerSecondLikeRemote()
     {
         using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using WOutcome = B3FlowMeshWatch::Outcome;
         // A busy market: every read returns a changed head 10 ms later.
@@ -1348,13 +1348,16 @@ private Q_SLOTS:
             }
             return arms;
         };
+        // The local engine is held at the remote pacing until its reads stop
+        // contending with the FlowMesh worker for the node's market mutex
+        // (review of 2026-09-30, C7): at most a burst of two, then two a second.
+        QCOMPARE(Policy::LOCAL_ARM_REFILL_MS, Policy::ARM_REFILL_MS);
         Policy local; local.Enable(0, true, /*local=*/true);
-        QVERIFY(local.local); QCOMPARE(local.RefillMs(), Policy::LOCAL_ARM_REFILL_MS);
-        const auto fast{run(local, 10'000)};
-        // At most the burst plus ten per second.
-        QVERIFY(fast.size() <= size_t{2 + 10 * 10});
-        QVERIFY(fast.size() >= size_t{9 * 10});
-        for (size_t i{2}; i < fast.size(); ++i) QVERIFY(fast[i] - fast[i - 2] >= Policy::LOCAL_ARM_REFILL_MS);
+        QVERIFY(local.local); QCOMPARE(local.RefillMs(), Policy::ARM_REFILL_MS);
+        const auto paced{run(local, 10'000)};
+        QVERIFY(paced.size() <= size_t{2 + 2 * 10});
+        QVERIFY(paced.size() >= size_t{2 * 10});
+        for (size_t i{2}; i < paced.size(); ++i) QVERIFY(paced[i] - paced[i - 2] >= Policy::ARM_REFILL_MS);
         QCOMPARE(local.mode, Mode::Live);
         // Remote: unchanged, two per second.
         Policy remote; remote.Enable(0, true);
