@@ -220,10 +220,13 @@ endpoint's claims.
   with the note "This server does not report times (older version)".
 - **Candle reads.** A 300-interval window after a market, interval or source
   change (or at most every 2 s while the held ticks cannot continue it), else
-  the newest three intervals about every 10 s. A remote page ends at the
-  verified head: its newest bucket may be held back or be this client's
-  earlier view of it, which the held ticks continue. Those newest intervals are
-  merged only where they continue the held window of the same source: they
+  the newest three intervals about every 10 s, only in a passive refresh:
+  never in an order review's, funding, receipt, connect or action read, which
+  the user waits for (they stay due for the next passive refresh). A remote
+  page ends at the verified head: its newest bucket may be held back or be
+  this client's earlier view of it, which the held ticks continue. Those
+  newest intervals are merged only where they continue the held window of
+  the same source: they
   reach back over its newest candle, or their first candle directly follows
   its last auction. Otherwise the whole window is read at once. That happens
   after the panel was hidden, the machine slept, reads failed for longer than
@@ -321,5 +324,6 @@ page checks, round trip, holding back candles past the verified head),
 flags, rate limit, remote labels and candles, held-back candles, a candles
 read never holding the work gate across the network, older endpoint
 reasons). Qt: `test_b3_flowmeshworkspace-qt` (parsing, requests,
-time candles, viewport, fallback, tape, wording, receipt times). Functional
-(opt-in, run directly): `feature_flowmesh_observed_time.py`.
+candles only in passive reads, time candles, viewport, fallback, tape,
+wording, receipt times). Functional (opt-in, run directly):
+`feature_flowmesh_observed_time.py`.

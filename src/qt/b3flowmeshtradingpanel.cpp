@@ -2096,7 +2096,13 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
     const auto selected{market()}; const QString selected_id{selected ? selected->id : QString{}};
     result->views_market = selected_id; result->ticks_after = ticksAfter(selected_id); result->draft = indicativeDraft(); result->levels = levelsRequest();
-    if (const auto due{candlesDue()}) { result->candles_interval = due->first; result->candles_limit = due->second; }
+    // Candles are display only: never in an order review's, funding,
+    // receipt, connect or action job, which a user waits for. They stay
+    // due, so the next passive job reads them (liveSkipsPoll() is false
+    // while they are due).
+    if (result->passive) {
+        if (const auto due{candlesDue()}) { result->candles_interval = due->first; result->candles_limit = due->second; }
+    }
     const auto phase{foreground_read ? (m_route_pending || m_market_data.empty() || !m_catalog_age.isValid() ? RefreshPhase::Catalog : RefreshPhase::None)
                                      : nextPassivePhase()};
     if (result->passive || foreground_read) {

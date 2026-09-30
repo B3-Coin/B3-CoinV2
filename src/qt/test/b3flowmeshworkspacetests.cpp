@@ -3294,6 +3294,31 @@ private Q_SLOTS:
         QVERIFY(!panel.m_read_failed);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
+    void aReviewReadNeverReadsCandles()
+    {
+        // An order review opens only when its own read finishes: display
+        // candles never ride in it, even when they are due. They stay due
+        // and the next passive job reads them.
+        FundingReadProbe probe; probe.live_ms = 0; probe.data = RemoteDataWithTimes();
+        probe.candles_response = CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 300,
+            {CandleJson(OBSERVED_T0, 1, 1, 1000, 1000, 1000, 1000, 250'000), CandleJson(OBSERVED_T0 + 60'000, 2, 2, 1000, 1000, 1000, 1000, 250'000)});
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteDataWithTimes()));
+        panel.m_candle_interval = flowmesh::CandleInterval::M1;
+        QVERIFY(panel.candlesDue());
+        panel.startJob(std::nullopt, std::nullopt, false, false, std::nullopt, {}, /*foreground_read=*/true);
+        QVERIFY(panel.m_active_result && !panel.m_active_result->passive && panel.m_active_result->foreground_read);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        // The review's market read ran, without a candles read.
+        QCOMPARE(probe.market_options.size(), size_t{1});
+        QVERIFY(probe.candle_options.empty());
+        QVERIFY(panel.candlesDue());
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.candle_options.size(), size_t{1});
+        QCOMPARE(probe.candle_options[0]["limit"].getInt<int>(), 300);
+        QVERIFY(panel.m_candles && panel.m_candles->available);
+        QVERIFY(!panel.candlesDue());
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
     void aFailedCandlesReadBacksOffAndKeepsLiveUpdates()
     {
         // Every candles read fails (as a remote client's did on any active
