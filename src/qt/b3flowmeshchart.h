@@ -5,6 +5,7 @@
 #include <qt/b3flowmeshmarketdata.h>
 #include <util/int128.h>
 #include <QWidget>
+#include <functional>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -91,6 +92,9 @@ public:
     //! when none was). The hover tooltip adds it to toolTip().
     QString exactPrices() const { return m_exact_prices; }
     QSize minimumSizeHint() const override { return {280, 260}; }
+    //! Diagnostics and tests only (never set in production): called at the
+    //! end of every paint.
+    void setPaintObserver(std::function<void()> observer) { m_paint_observer = std::move(observer); }
 protected:
     bool event(QEvent*) override;
     void paintEvent(QPaintEvent*) override;
@@ -121,5 +125,6 @@ private:
     bool m_inverted{false};
     QPointF m_pointer{-1, -1};
     QString m_exact_prices;
+    std::function<void()> m_paint_observer;
 };
 #endif

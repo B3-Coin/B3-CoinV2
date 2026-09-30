@@ -54,6 +54,7 @@ Q_SIGNALS:
     void securityWarning(const QString& warning);
 private:
     friend class B3FlowMeshWorkspaceTests;
+    friend class B3FlowMeshPerfTests;
     enum class RefreshPhase { None, Catalog, Status, Effects, Receipt };
     struct StatusRead {
         // Attribution only; a queued read must never own a wallet/backend.
@@ -169,6 +170,12 @@ private:
         interfaces::Node* node;
         QString url;
     };
+    //! The 500 ms housekeeping tick: while shown, ages the display, re-keys
+    //! the live-update policy, arms a watch and polls unless live updates
+    //! supply the market read; while hidden, only closes a live connection.
+    void tick();
+    //! Whether the panel was visible at the previous tick.
+    bool m_tick_was_visible{false};
     void requestConnect();
     void resumeConnect();
     void updateConnectionState();

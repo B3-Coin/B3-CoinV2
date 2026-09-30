@@ -283,6 +283,11 @@ void B3FlowMeshChart::wheelEvent(QWheelEvent* e)
 void B3FlowMeshChart::leaveEvent(QEvent*) { m_pointer = {-1, -1}; update(); }
 void B3FlowMeshChart::paintEvent(QPaintEvent*)
 {
+    // Every return below ends a paint.
+    struct Painted {
+        const std::function<void()>& observer;
+        ~Painted() { if (observer) observer(); }
+    } painted{m_paint_observer};
     QPainter p{this}; p.setRenderHint(QPainter::Antialiasing); p.fillRect(rect(), B3Theme::kSurface);
     p.setFont(QFont{font().family(), 9});
     m_exact_prices.clear();

@@ -388,29 +388,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     connect(m_buy, &QPushButton::clicked, this, [this] { m_side->setCurrentIndex(0); updateTicket(); }); connect(m_sell, &QPushButton::clicked, this, [this] { m_side->setCurrentIndex(1); updateTicket(); });
     m_timer = new QTimer{this}; m_timer->setInterval(500);
     m_watch_clock.start();
-    connect(m_timer, &QTimer::timeout, this, [this, was_visible = false]() mutable {
-        const bool visible{isVisible()};
-        const bool became_hidden{was_visible && !visible};
-        was_visible = visible;
-        if (!visible) {
-            // Hidden: no polls or watches. A live-update connection is closed
-            // once instead of lingering until the endpoint's idle timeout.
-            if (became_hidden && (m_watch.mode == B3FlowMeshWatch::Mode::Live || m_watch.mode == B3FlowMeshWatch::Mode::Probing)) m_watch_release_pending = true;
-            if (m_watch_release_pending) armWatch(/*release=*/true);
-            m_polling_since.invalidate();
-            return;
-        }
-        if (!m_polling_since.isValid()) m_polling_since.start();
-        updateMarketText();
-        updateWatchState();
-        // A watch is armed before the poll, so a probe it starts holds this
-        // tick's market read. While live updates arrive (or a probe is
-        // outstanding), the 500 ms tick keeps display ageing and the
-        // auxiliary cycle; the watch supplies the market read.
-        armWatch();
-        if (!liveSkipsPoll()) refresh();
-        if (m_watch_release_pending && m_watch.mode != B3FlowMeshWatch::Mode::Live && m_watch.mode != B3FlowMeshWatch::Mode::Probing) armWatch(/*release=*/true);
-    });
+    connect(m_timer, &QTimer::timeout, this, &B3FlowMeshTradingPanel::tick);
     connect(qApp, &QCoreApplication::aboutToQuit, this, [this] { m_closing = true; cancelAndWait(); });
     updateControls();
 }
@@ -419,6 +397,31 @@ B3FlowMeshTradingPanel::~B3FlowMeshTradingPanel()
 {
     m_closing = true;
     cancelAndWait();
+}
+
+void B3FlowMeshTradingPanel::tick()
+{
+    const bool visible{isVisible()};
+    const bool became_hidden{m_tick_was_visible && !visible};
+    m_tick_was_visible = visible;
+    if (!visible) {
+        // Hidden: no polls or watches. A live-update connection is closed
+        // once instead of lingering until the endpoint's idle timeout.
+        if (became_hidden && (m_watch.mode == B3FlowMeshWatch::Mode::Live || m_watch.mode == B3FlowMeshWatch::Mode::Probing)) m_watch_release_pending = true;
+        if (m_watch_release_pending) armWatch(/*release=*/true);
+        m_polling_since.invalidate();
+        return;
+    }
+    if (!m_polling_since.isValid()) m_polling_since.start();
+    updateMarketText();
+    updateWatchState();
+    // A watch is armed before the poll, so a probe it starts holds this
+    // tick's market read. While live updates arrive (or a probe is
+    // outstanding), the 500 ms tick keeps display ageing and the
+    // auxiliary cycle; the watch supplies the market read.
+    armWatch();
+    if (!liveSkipsPoll()) refresh();
+    if (m_watch_release_pending && m_watch.mode != B3FlowMeshWatch::Mode::Live && m_watch.mode != B3FlowMeshWatch::Mode::Probing) armWatch(/*release=*/true);
 }
 
 void B3FlowMeshTradingPanel::setWalletModel(WalletModel* wallet)

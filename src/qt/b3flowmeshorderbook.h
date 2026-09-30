@@ -7,6 +7,7 @@
 #include <QElapsedTimer>
 #include <QTableView>
 #include <QWidget>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -121,6 +122,11 @@ public:
     //! current one; a selection only emits groupingSelected.
     void setGroupingChoices(const std::vector<flowmesh::LevelGrouping>& choices, const flowmesh::LevelGrouping& selected);
     QComboBox* groupingSelector() const { return m_grouping; }
+    //! The head of the data the rows were last shown from (empty: none).
+    const QString& head() const { return m_head; }
+    //! Diagnostics and tests only (never set in production): called at the
+    //! end of every paint of the ladder, with head().
+    void setPaintObserver(std::function<void(const QString& head)> observer) { m_paint_observer = std::move(observer); }
 
 Q_SIGNALS:
     //! The viewer chose another price grouping for the displayed orientation.
@@ -159,5 +165,6 @@ private:
     //! Per row: when its flash started (m_clock ms, staggered), or -1.
     std::vector<qint64> m_flash_start;
     QElapsedTimer m_clock;
+    std::function<void(const QString&)> m_paint_observer;
 };
 #endif

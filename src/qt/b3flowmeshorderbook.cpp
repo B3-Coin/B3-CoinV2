@@ -200,6 +200,11 @@ protected:
         QTableView::resizeEvent(event);
         m_book->viewResized();
     }
+    void paintEvent(QPaintEvent* event) override
+    {
+        QTableView::paintEvent(event);
+        if (m_book->m_paint_observer) m_book->m_paint_observer(m_book->m_head);
+    }
     void mouseMoveEvent(QMouseEvent* event) override
     {
         QTableView::mouseMoveEvent(event);
