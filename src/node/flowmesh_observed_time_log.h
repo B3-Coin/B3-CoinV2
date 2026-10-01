@@ -231,9 +231,10 @@ public:
      * no wait for a flush. The flush thread then loads its retained rows
      * and candles before it writes any row of it, and flushes it from then
      * on. Rows at or after `store_next_sequence` (never certified here) are
-     * erased; a row whose hash differs from `known` (sequence, hash) of the
-     * production store wipes the market's times; so does a meta record of
-     * another domain. Until the load ends, the log's reads are unavailable
+     * erased, together with every candle holding any such row; a row whose
+     * hash differs from `known` (sequence, hash) of the production store
+     * wipes the market's times; so does a meta record of another domain.
+     * Until the load ends, the log's reads are unavailable
      * (FlowMeshObservedTimeLog::LOADING_REASON) and ReadCandles serves none
      * of the market's disk candles. Never throws. */
     void Attach(const std::shared_ptr<FlowMeshObservedTimeLog>& log, uint64_t store_next_sequence,

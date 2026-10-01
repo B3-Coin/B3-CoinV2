@@ -550,6 +550,19 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db) no
                 erase.Erase(key);
                 erased = true;
             }
+            // A candle cannot be truncated without the original clearings.
+            // Drop the whole optional bucket when it contains an entry
+            // beyond the accepted head, including older intervals that a
+            // later disk page could otherwise return after this reload.
+            for (it->Seek(CandleKey{KEY_CANDLE, market, 0, 0}); it->Valid(); it->Next()) {
+                CandleKey key;
+                if (!it->GetKey(key) || key.prefix != KEY_CANDLE || key.market != market) break;
+                CandleValue value;
+                if (!it->GetValue(value) || value.last_sequence >= store_next_sequence) {
+                    erase.Erase(key);
+                    erased = true;
+                }
+            }
             if (erased) db->WriteBatch(erase, true);
             // The newest retained rows; a hash the store contradicts wipes.
             const uint64_t from{store_next_sequence > FlowMeshObservedTimeLog::RING ? store_next_sequence - FlowMeshObservedTimeLog::RING : 0};

@@ -548,6 +548,35 @@ BOOST_AUTO_TEST_CASE(rows_beyond_store_head_dropped_and_mismatch_wipes)
         store.FlushNow(false);
         BOOST_CHECK_EQUAL(log->Lookup(Known(0, 20)).size(), 12U);
         for (const auto& candle : log->Candles(CandleInterval::H1, std::nullopt, 10).candles) BOOST_CHECK_LT(candle.last_sequence, 12U);
+        // Memory filtering alone is insufficient: the persisted bucket
+        // originally held sequence 19, and older-page reads use the DB.
+        bool older{true};
+        const auto disk{store.ReadCandles(MARKET, CandleInterval::H1, T0, T0 + 3'600'000, 10, &older)};
+        BOOST_CHECK(disk.empty());
+        BOOST_CHECK(!older);
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            for (const auto& candle : store.ReadCandles(MARKET, interval, 0, T0 + 86'400'000, 100)) {
+                BOOST_CHECK_LT(candle.last_sequence, 12U);
+            }
+        }
+        store.Stop();
+    }
+    {
+        // Erased, not hidden: a reopened database never serves them either.
+        FlowMeshObservedTimeStore store{Options(path)};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        store.Attach(log, 12, Known(0, 12));
+        store.FlushNow(false);
+        size_t served{0};
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            for (const auto& candle : store.ReadCandles(MARKET, interval, 0, T0 + 86'400'000, 100)) {
+                BOOST_CHECK_LT(candle.last_sequence, 12U);
+                ++served;
+            }
+        }
+        BOOST_CHECK_EQUAL(served, 0U);
         store.Stop();
     }
     FlowMeshObservedTimeStore store{Options(path)};

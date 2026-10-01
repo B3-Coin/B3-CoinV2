@@ -88,11 +88,13 @@ auction existed between them; anything else is a gap.
   gap after a restart). A crash loses at most the unflushed second (a gap).
 - At start, after the production store replays, the market **queues** its
   history and goes on at once. The thread then loads it, before it writes any
-  row of that market: rows at or after the store's next sequence are erased, a
-  row whose hash contradicts the store's retained hashes (or another domain)
-  clears the market's times, and the newest rows and each interval's memory
-  window are reloaded. An unreadable database is wiped and recreated; if even
-  that fails, times stay in memory.
+  row of that market: rows at or after the store's next sequence are erased,
+  with every stored candle holding such an entry (a candle cannot be cut
+  back, so neither a disk page nor a later start can serve one), a row whose
+  hash contradicts the store's retained hashes (or another domain) clears
+  the market's times, and the newest rows and each interval's memory window
+  are reloaded. An unreadable database is wiped and recreated; if even that
+  fails, times stay in memory.
 - Entries committed while the history loads keep only their clock readings
   and are stamped once it has loaded, exactly as if it had loaded first
   (the same clamps, steps, untimed entries and continued candles; a stored
@@ -101,8 +103,9 @@ auction existed between them; anything else is a gap.
   market's `observed_time` section and candles are unavailable with
   `observed_time_loading` and its disk candles are not served: never a
   partial answer, which a chart would hold as its whole window. The load
-  itself is replayed off the recorder's mutex. Normally this lasts a few
-  milliseconds after a start; only a slow or stalled disk makes it longer,
+  itself is replayed off the recorder's mutex. The load checks every stored
+  candle of the market, so after a start it lasts up to tens of milliseconds
+  per market at full retention; only a slow or stalled disk makes it longer,
   and then only the display waits.
 - Retention: 262,144 rows per market; candles 1m 14 days, 5m 60 days, 15m 180
   days, 1h 2 years, 4h 5 years, 1d 10 years (swept at most once a minute, a
