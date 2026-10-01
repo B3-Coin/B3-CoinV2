@@ -269,10 +269,11 @@ public:
      * Until the load succeeds, the log's reads are unavailable
      * (FlowMeshObservedTimeLog::LOADING_REASON) and ReadCandles serves none
      * of the market's disk candles. A load that cannot read or write the
-     * database is retried Options::load_retry later, at most
-     * Options::load_attempts attempts in all; then it is given up, logged:
-     * the log records in memory only and the market's disk is neither
-     * served nor written until restart. Never throws. */
+     * database (an error, or a scan ending on a read error) is retried
+     * Options::load_retry later, at most Options::load_attempts attempts in
+     * all; then it is given up, logged: the log records in memory only and
+     * the market's disk is neither served nor written until restart. Never
+     * throws. */
     void Attach(const std::shared_ptr<FlowMeshObservedTimeLog>& log, uint64_t store_next_sequence,
                 const std::vector<std::pair<uint64_t, uint256>>& known) noexcept;
     //! Starts the flush thread, which opens the database first.

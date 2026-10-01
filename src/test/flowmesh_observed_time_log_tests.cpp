@@ -1467,6 +1467,52 @@ BOOST_AUTO_TEST_CASE(a_load_that_cannot_read_its_history_never_serves_or_writes_
     BOOST_CHECK(row.hash == EntryHash(12));
 }
 
+// A read error a scan meets (an unreadable candle block) fails the load as
+// a thrown one does: it is not a load that found fewer candles.
+BOOST_AUTO_TEST_CASE(a_read_error_during_the_load_is_not_a_load)
+{
+    const auto path{m_path_root / "observed_unreadable_candles"};
+    FakeClocks clocks;
+    WriteUnreadableBlock(path, clocks, 20, 'c');
+    FlowMeshObservedTimeStore store{Options(path)};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 20, Known(0, 20));
+    store.FlushNow(false);
+    BOOST_CHECK(log->GetSummary().loading);
+    BOOST_CHECK(!log->GetSummary().persisted);
+    store.Stop();
+    BOOST_CHECK(!log->GetSummary().loading);
+    BOOST_CHECK(!log->GetSummary().persisted);
+    BOOST_CHECK(store.ReadCandles(MARKET, CandleInterval::M1, 0, T0 + 86'400'000, 100).empty());
+}
+
+// A wipe (here for a meta record of another domain) that meets an
+// unreadable block writes nothing, since a key the block hid would survive
+// it: the load fails instead and the stored rows stay as they were.
+BOOST_AUTO_TEST_CASE(a_wipe_that_meets_a_read_error_writes_nothing)
+{
+    const auto path{m_path_root / "observed_unreadable_wipe"};
+    FakeClocks clocks;
+    WriteUnreadableBlock(path, clocks, 20, 'c');
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const uint256 other_domain{uint256{"00000000000000000000000000000000000000000000000000000000000000d1"}};
+        const auto log{std::make_shared<FlowMeshObservedTimeLog>(other_domain, MARKET, clocks.Get())};
+        store.Attach(log, 20, {});
+        store.FlushNow(false);
+        BOOST_CHECK(log->GetSummary().loading);
+        store.Stop();
+        BOOST_CHECK(!log->GetSummary().loading);
+        BOOST_CHECK(!log->GetSummary().persisted);
+    }
+    CDBWrapper db{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+    for (uint64_t i{0}; i < 20; ++i) BOOST_CHECK(db.Exists(RawRowKey{'r', MARKET, i}));
+}
+
 // A load that fails once at any stage leaves the market loading: its reads
 // stay unavailable, none of its disk candles (which hold entries beyond
 // the head until the erase) is served and nothing of it is written. The

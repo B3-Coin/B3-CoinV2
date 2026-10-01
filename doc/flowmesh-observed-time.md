@@ -105,9 +105,10 @@ auction existed between them; anything else is a gap.
   the market's times, and the newest rows and each interval's memory window
   are reloaded. An unreadable database is wiped and recreated; if even that
   fails, times stay in memory.
-- A load that cannot read or write the database (an I/O error) is not a
-  load. The market stays as while loading (`observed_time_loading`, its
-  entries waiting) and none of its disk candles is served or rows written.
+- A load that cannot read or write the database (an I/O error, or a scan
+  that meets an unreadable block) is not a load. The market stays as while
+  loading (`observed_time_loading`, its entries waiting) and none of its
+  disk candles is served or rows written.
   It is attempted at most 3 times, 5 s apart; shutdown attempts a load still
   queued at once and gives it up if that fails. Entries wait during the
   retries as during a slow load: at most 4096, any more are a gap (counted
@@ -117,7 +118,11 @@ auction existed between them; anything else is a gap.
   recorded and served from memory, as when the database cannot be opened,
   and its disk is neither served nor written. `observed_time` holds display
   data only and may be removed if this repeats. A disk candle is served,
-  and a row written, only for a market whose load succeeded.
+  and a row written, only for a market whose load succeeded; a disk page
+  that meets an unreadable block is served as none. An unreadable block is
+  not repaired: once a LevelDB compaction reaches it, every later write of
+  the whole database can fail, for every market, until `observed_time` is
+  removed.
 - Entries committed while the history loads keep only their clock readings
   and are stamped once it has loaded, exactly as if it had loaded first
   (the same clamps, steps, untimed entries and continued candles; a stored

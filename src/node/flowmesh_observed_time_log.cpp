@@ -493,6 +493,8 @@ void FlowMeshObservedTimeStore::WipeMarket(CDBWrapper& db, const flowmesh::Marke
         batch.Erase(key);
         ++erased;
     }
+    // A key an unreadable block hid would survive the wipe: the load fails.
+    if (!it->StatusOK()) throw dbwrapper_error{"observed-time database read error"};
     batch.Write(MetaKey{KEY_META, market}, MetaValue{});
     db.WriteBatch(batch, true);
     LogWarning("FlowMesh market %s: observed times did not match this node's certified log and were cleared (%u records)\n",
@@ -553,6 +555,11 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db, co
             db->Write(MetaKey{KEY_META, market}, MetaValue{META_VERSION, log.Domain()}, true);
             // Rows the production store never certified here are erased.
             std::unique_ptr<CDBIterator> it{db->NewIterator()};
+            // A scan that ends on a read error has not seen every key: the
+            // load fails (the iterator keeps its first error).
+            const auto scanned = [&] {
+                if (!it->StatusOK()) throw dbwrapper_error{"observed-time database read error"};
+            };
             CDBBatch erase{*db};
             bool erased{false};
             for (it->Seek(RowKey{KEY_ROW, market, store_next_sequence}); it->Valid(); it->Next()) {
@@ -561,6 +568,7 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db, co
                 erase.Erase(key);
                 erased = true;
             }
+            scanned();
             // A candle cannot be truncated without the original clearings.
             // Drop the whole optional bucket when it contains an entry
             // beyond the accepted head, including older intervals that a
@@ -574,6 +582,7 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db, co
                     erased = true;
                 }
             }
+            scanned();
             stage("erase");
             if (erased) db->WriteBatch(erase, true);
             stage("rows");
@@ -595,6 +604,7 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db, co
                 }
                 rows.push_back(*stamp);
             }
+            scanned();
             if (mismatch) {
                 WipeMarket(*db, market);
                 rows.clear();
@@ -604,6 +614,7 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db, co
                 RowKey key;
                 if (it->GetKey(key) && key.prefix == KEY_ROW && key.market == market) item.oldest_row = key.sequence;
             }
+            scanned();
             stage("candles");
             // The memory window of every interval, ending at the newest time.
             std::optional<int64_t> newest;
@@ -628,6 +639,7 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db, co
                     if (!candle || candle->last_sequence >= store_next_sequence) continue;
                     out.push_back(*candle);
                 }
+                scanned();
             }
             const auto recorded_since{mismatch ? std::nullopt : item.oldest_row};
             if (mismatch) item.oldest_row.reset();
@@ -893,6 +905,8 @@ std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(con
             if (!it->GetValue(value)) continue;
             if (auto candle{FromValue(key.open_ms, interval, value)}) out.push_back(*candle);
         }
+        // A page that skipped an unreadable block is not served as whole.
+        if (!it->StatusOK()) throw dbwrapper_error{"observed-time database read error"};
     } catch (const std::exception&) {
         out.clear();
         if (older) *older = false;
