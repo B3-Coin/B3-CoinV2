@@ -76,7 +76,9 @@ auction existed between them; anything else is a gap.
 - **Only its own thread (`flowmesh-obstime`) opens, loads, erases, wipes
   and writes it**: it opens the database when it starts; it writes at most
   once a second, unsynced, one batch per market with rows and candles
-  together, and once synced at shutdown after the runtime stopped. It never
+  together; at shutdown, after the runtime stopped, it flushes once more and
+  ends with one synced write even when nothing was pending, so every earlier
+  unsynced batch reaches the disk. It never
   runs on the FlowMesh tick or worker thread, on the service start or on a
   market start (both hold the B3 reconciliation gate closed for every
   market), so a stalled disk delays only the flush (tested with a flush held

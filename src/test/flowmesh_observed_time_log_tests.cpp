@@ -631,6 +631,29 @@ BOOST_AUTO_TEST_CASE(flush_failure_sets_persisted_false)
     BOOST_CHECK(log->GetSummary().persisted);
 }
 
+BOOST_AUTO_TEST_CASE(stop_syncs_an_already_flushed_tail)
+{
+    FakeClocks clocks;
+    FlowMeshObservedTimeStore store{Options(m_path_root / "observed_final_sync")};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 0, {});
+    log->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0));
+    store.FlushNow(false);
+    BOOST_CHECK(log->TakePending().Empty());
+    unsigned writes{0};
+    store.SetFlushHookForTest([&] { ++writes; });
+    store.Stop();
+    BOOST_CHECK_EQUAL(writes, 1U);
+    BOOST_CHECK(log->GetSummary().persisted);
+    // A failure of that final sync is visible even with no new rows.
+    store.SetFlushHookForTest([] { throw std::runtime_error{"sync"}; });
+    store.Stop();
+    BOOST_CHECK(!log->GetSummary().persisted);
+    store.SetFlushHookForTest({});
+}
+
 BOOST_AUTO_TEST_CASE(blocked_flush_never_blocks_record_or_reads)
 {
     FakeClocks clocks;

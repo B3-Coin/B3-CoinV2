@@ -751,13 +751,25 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
                     }
                 }
                 if (hook) hook();
-                db->WriteBatch(batch, sync);
+                // One final synced batch below covers these writes and
+                // every previous unsynced pass, even with no pending rows.
+                db->WriteBatch(batch, false);
                 log.SetPersisted(true);
             } catch (const std::exception& e) {
                 // Lost rows become a gap after a restart; the market is
                 // never affected.
                 LogDebug(BCLog::NET, "FlowMesh observed-time flush failed for market %s: %s\n", log.MarketId().GetHex(), e.what());
                 log.SetPersisted(false);
+            }
+        }
+        if (sync && db) {
+            try {
+                CDBBatch final_sync{*db};
+                if (hook) hook();
+                db->WriteBatch(final_sync, true);
+            } catch (const std::exception& e) {
+                LogDebug(BCLog::NET, "FlowMesh observed-time final sync failed: %s\n", e.what());
+                for (auto* item : attached) item->log->SetPersisted(false);
             }
         }
     } catch (...) {

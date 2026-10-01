@@ -199,8 +199,9 @@ private:
  *
  * Only its own flush thread writes it: at most once per interval, unsynced,
  * one batch per market (rows and candles together, so a crash loses a
- * consistent tail), and synced once at Stop. It is never written by the
- * FlowMesh tick or worker thread, so a stalled disk delays only the flush.
+ * consistent tail), and every Stop ends with one synced write. It is never
+ * written by the FlowMesh tick or worker thread, so a stalled disk delays
+ * only the flush.
  * A corrupt database is wiped and recreated; one that cannot be opened
  * leaves every log memory only. Retention: 262,144 rows per market; candles
  * 1m 14 days, 5m 60 days, 15m 180 days, 1h 2 years, 4h 5 years, 1d 10 years. */
@@ -241,7 +242,8 @@ public:
                 const std::vector<std::pair<uint64_t, uint256>>& known) noexcept;
     //! Starts the flush thread, which opens the database first.
     void Start();
-    //! Stops the flush thread, then flushes every log once, synced.
+    //! Stops the flush thread, writes every pending log, then syncs the
+    //! database even when previous unsynced passes left no pending rows.
     void Stop();
     //! One flush pass on the calling thread (the flush thread's body).
     void FlushNow(bool sync) noexcept;
@@ -251,7 +253,8 @@ public:
     //! across the read.
     std::vector<flowmesh::ObservedCandle> ReadCandles(const flowmesh::MarketId& market, flowmesh::CandleInterval interval,
                                                       int64_t from_ms, int64_t before_ms, size_t limit, bool* older = nullptr) const;
-    //! Tests only: runs inside every flush, before its batch is written.
+    //! Tests only: runs inside every flush, before its batch is written,
+    //! and before Stop's final synced write.
     void SetFlushHookForTest(std::function<void()> hook);
 
 private:
