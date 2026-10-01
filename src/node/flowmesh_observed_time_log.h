@@ -146,11 +146,15 @@ public:
     /** Replaces memory with the reloaded data (as Load), then applies every
      * Record since BeginLoad in order with its own clock readings: the
      * result is exactly the synchronous Load followed by those Records,
-     * except that entries dropped beyond RING are a gap. The work is done
-     * off the mutex (Record never waits for it); under it only the entries
-     * recorded meanwhile are applied and the state is swapped in. Never
-     * throws: a failure leaves the log empty and recording, and returns
-     * false (the history was not installed). */
+     * except that entries dropped beyond RING are a gap. The history is
+     * rebuilt and the waiting entries replayed off the mutex, in at most
+     * eight rounds that stop once 64 or fewer wait; under the mutex the
+     * entries recorded during the last round are applied and the state is
+     * swapped in. A Record arriving then waits for that replay: normally at
+     * most 64 entries, and at most RING only when Records kept pace with
+     * the replay for all eight rounds. Never throws: a failure leaves the
+     * log empty and recording, and returns false (the history was not
+     * installed). */
     bool FinishLoad(std::vector<flowmesh::ObservedStamp> rows,
                     std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
                     std::optional<uint64_t> recorded_since) noexcept;

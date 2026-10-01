@@ -131,7 +131,10 @@ auction existed between them; anything else is a gap.
   market's `observed_time` section and candles are unavailable with
   `observed_time_loading` and its disk candles are not served: never a
   partial answer, which a chart would hold as its whole window. The load
-  itself is replayed off the recorder's mutex. The load checks every stored
+  itself is replayed off the recorder's mutex: a `Record` arriving as it
+  ends waits only for the entries recorded during its last replay round,
+  normally under 64 and at most 4096 (measured in a test build: under a
+  millisecond warm, about 2 ms cold). The load checks every stored
   candle of the market, so after a start it lasts up to tens of milliseconds
   per market at full retention; only a slow or stalled disk makes it longer,
   and then only the display waits.

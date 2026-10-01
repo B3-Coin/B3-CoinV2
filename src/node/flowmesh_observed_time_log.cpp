@@ -385,9 +385,12 @@ bool FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> ro
         if (m_fail_next_finish_load.exchange(false, std::memory_order_relaxed)) throw std::bad_alloc{};
         State state{Reloaded(std::move(rows), std::move(candles), recorded_since)};
         // Replayed off the mutex, so Record (the runtime worker, under its
-        // market lock) never waits for this work. Each round swaps the
-        // buffer out in O(1); rounds repeat while entries keep arriving, so
-        // what is left for the mutex is a handful (RING at most).
+        // market lock) waits for none of this. Each round swaps the buffer
+        // out in O(1); rounds repeat while more than UNDER_LOCK_MAX arrived
+        // during the previous one, at most ROUNDS times. What is left for
+        // the mutex below is what arrived during the last round: at most
+        // UNDER_LOCK_MAX unless Records kept pace with the replay for every
+        // round, and never more than RING.
         constexpr size_t UNDER_LOCK_MAX{64};
         constexpr int ROUNDS{8};
         for (int round{0}; round < ROUNDS; ++round) {
