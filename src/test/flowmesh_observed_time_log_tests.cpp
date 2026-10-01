@@ -15,6 +15,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -29,7 +30,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -353,6 +356,54 @@ void MakeHistory(History& out)
     for (const auto interval : flowmesh::CANDLE_INTERVALS) {
         out.candles[static_cast<size_t>(interval)] = source->Candles(interval, std::nullopt, flowmesh::OBSERVED_CANDLE_PAGE_MAX).candles;
     }
+}
+
+//! A key the store never writes, to pad the database ('A' sorts before the
+//! meta keys, 'N' between them and the candles, 'd' between the candles and
+//! the rows).
+struct RawPadKey {
+    uint8_t prefix{'A'};
+    uint32_t index{0};
+    SERIALIZE_METHODS(RawPadKey, obj) { READWRITE(obj.prefix, Using<BigEndianFormatter<4>>(obj.index)); }
+};
+
+//! A real read error under MARKET: `count` stored entries, padding so that
+//! its `prefix` keys ('M' meta, 'c' candles) sit in data blocks of their
+//! own after a first block Open reads, compacted into a table, then one
+//! byte of that block flipped. Every read of the block then fails its
+//! checksum (Corruption), every time. Relies on the store's uncompressed
+//! tables and checked reads; a layout that no longer matches fails here.
+void WriteUnreadableBlock(const fs::path& path, FakeClocks& clocks, const uint64_t count, const uint8_t prefix)
+{
+    Populate(path, clocks, count, 1'000);
+    {
+        CDBWrapper db{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        CDBBatch batch{db};
+        const std::vector<unsigned char> value(200, 0x5a);
+        for (const uint8_t pad : {uint8_t{'A'}, uint8_t{'N'}, uint8_t{'d'}}) {
+            for (uint32_t i{0}; i < 400; ++i) batch.Write(RawPadKey{pad, i}, value);
+        }
+        db.WriteBatch(batch, true);
+        db.CompactFull();
+    }
+    std::vector<char> pattern{static_cast<char>(prefix)};
+    for (const auto byte : MARKET) pattern.push_back(static_cast<char>(byte));
+    bool flipped{false};
+    for (const auto& entry : fs::directory_iterator(path)) {
+        if (entry.path().extension() != ".ldb") continue;
+        std::fstream file{entry.path(), std::ios::in | std::ios::out | std::ios::binary};
+        std::vector<char> bytes{std::istreambuf_iterator<char>{file}, {}};
+        const auto at{std::search(bytes.begin(), bytes.end(), pattern.begin(), pattern.end())};
+        if (at == bytes.end()) continue;
+        const auto offset{std::distance(bytes.begin(), at) + 5};
+        const char byte{static_cast<char>(bytes[offset] ^ 0x40)};
+        file.clear();
+        file.seekp(offset);
+        file.write(&byte, 1);
+        flipped = true;
+        break;
+    }
+    BOOST_REQUIRE(flipped);
 }
 
 } // namespace
@@ -905,6 +956,18 @@ BOOST_AUTO_TEST_CASE(stored_keys_past_the_display_bound_end_the_disk_scan)
     FlowMeshObservedTimeStore store{Options(path)};
     std::string error;
     BOOST_REQUIRE(store.Open(error));
+    // Disk pages are served only for a market whose load succeeded, never
+    // for one with no attached log here (never attached, or an Attach that
+    // failed and left none).
+    BOOST_CHECK(store.ReadCandles(MARKET, CandleInterval::M1, 0, std::numeric_limits<int64_t>::max(), 500).empty());
+    BOOST_CHECK(store.ReadCandles(OTHER_MARKET, CandleInterval::M1, 0, flowmesh::OBSERVED_MS_LIMIT, 500).empty());
+    // So both are attached and loaded first. No stored candle holds an
+    // entry at or beyond either head: the load erases none of them.
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 3, Known(0, 3));
+    const auto other{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, OTHER_MARKET, clocks.Get())};
+    store.Attach(other, 2, {});
+    store.FlushNow(false);
     // Keys are compared unsigned: a key at or past 2^63 ends the scan and is
     // never an older candle; one at the bound or unaligned is skipped.
     bool older{true};
@@ -1362,6 +1425,311 @@ BOOST_AUTO_TEST_CASE(a_load_finishing_while_entries_arrive_equals_one_loaded_bef
         BOOST_CHECK_EQUAL(sequence, reference_sequence);
         CheckSameView(View(*log, sequence), want, "run " + std::to_string(run));
     }
+}
+
+// A load that hits a real read error (the meta block fails its checksum on
+// every read) never restores the market: its disk candles, which still
+// hold entries beyond the head, are not served, and its new entries are
+// not written beside them. Stop's attempt fails too: the market is then
+// memory only (recording goes on), still never served or written.
+BOOST_AUTO_TEST_CASE(a_load_that_cannot_read_its_history_never_serves_or_writes_it)
+{
+    const auto path{m_path_root / "observed_unreadable_meta"};
+    FakeClocks clocks;
+    WriteUnreadableBlock(path, clocks, 20, 'M');
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        store.Attach(log, 12, Known(0, 12));
+        store.FlushNow(false);
+        clocks.Advance(1'000);
+        log->Record(12, EntryHash(12, 2), ObservedDelay::NONE, std::nullopt);
+        store.FlushNow(false);
+        BOOST_CHECK(!log->GetSummary().persisted);
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            BOOST_CHECK(store.ReadCandles(MARKET, interval, 0, T0 + 86'400'000, 100).empty());
+        }
+        store.Stop();
+        const auto summary{log->GetSummary()};
+        BOOST_CHECK(!summary.loading);
+        BOOST_CHECK(!summary.persisted);
+        BOOST_CHECK_EQUAL(log->Lookup({{12, EntryHash(12, 2)}}).size(), 1U);
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            BOOST_CHECK(store.ReadCandles(MARKET, interval, 0, T0 + 86'400'000, 100).empty());
+        }
+    }
+    // The stored row is the old one: the new entry was never written.
+    CDBWrapper db{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+    RawRowValue row;
+    BOOST_REQUIRE(db.Read(RawRowKey{'r', MARKET, 12}, row));
+    BOOST_CHECK(row.hash == EntryHash(12));
+}
+
+// A load that fails once at any stage leaves the market loading: its reads
+// stay unavailable, none of its disk candles (which hold entries beyond
+// the head until the erase) is served and nothing of it is written. The
+// retry then loads it as a slow load would: the history, the entry that
+// waited, the rejected candles erased.
+BOOST_AUTO_TEST_CASE(a_failed_load_is_fenced_until_its_retry_succeeds)
+{
+    for (const std::string stage : {"meta", "erase", "rows", "candles"}) {
+        const auto path{m_path_root / fs::PathFromString("observed_retry_" + stage)};
+        FakeClocks clocks;
+        Populate(path, clocks, 20, 1'000);
+        auto options{Options(path)};
+        options.load_retry = std::chrono::milliseconds{0};
+        FlowMeshObservedTimeStore store{options};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        store.Attach(log, 12, Known(0, 12));
+        unsigned reached{0}, writes{0};
+        store.SetLoadHookForTest([&](const flowmesh::MarketId& market, const char* at) {
+            BOOST_CHECK(market == MARKET);
+            if (stage == at && reached++ == 0) throw std::runtime_error{"injected"};
+        });
+        store.SetFlushHookForTest([&] { ++writes; });
+        store.FlushNow(false);
+        BOOST_CHECK_EQUAL(reached, 1U);
+        clocks.Advance(1'000);
+        log->Record(12, EntryHash(12), ObservedDelay::NONE, Tick(12));
+        BOOST_CHECK(log->GetSummary().loading);
+        BOOST_CHECK(!log->GetSummary().persisted);
+        BOOST_CHECK(!log->Candles(CandleInterval::M1, std::nullopt, 10).available);
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            BOOST_CHECK(store.ReadCandles(MARKET, interval, 0, T0 + 86'400'000, 100).empty());
+        }
+        BOOST_CHECK_EQUAL(writes, 0U);
+        store.FlushNow(false);
+        BOOST_CHECK_EQUAL(reached, 2U);
+        BOOST_CHECK(!log->GetSummary().loading);
+        BOOST_CHECK(log->GetSummary().persisted);
+        BOOST_CHECK_EQUAL(log->Lookup(Known(0, 13)).size(), 13U);
+        BOOST_CHECK_EQUAL(writes, 1U);
+        size_t served{0};
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            for (const auto& candle : store.ReadCandles(MARKET, interval, 0, T0 + 86'400'000, 100)) {
+                BOOST_CHECK_EQUAL(candle.first_sequence, 12U);
+                BOOST_CHECK_EQUAL(candle.last_sequence, 12U);
+                ++served;
+            }
+        }
+        BOOST_CHECK_EQUAL(served, flowmesh::CANDLE_INTERVALS.size());
+        store.SetLoadHookForTest({});
+        store.SetFlushHookForTest({});
+        store.Stop();
+    }
+}
+
+// Every attempt fails: after load_attempts the market is memory only until
+// restart. Its entries (those that waited, then new ones) are recorded and
+// read from memory; nothing of it is served from disk or written, and what
+// it would persist is dropped each pass, never accumulated.
+BOOST_AUTO_TEST_CASE(a_load_given_up_keeps_the_market_in_memory_only)
+{
+    const auto path{m_path_root / "observed_given_up"};
+    FakeClocks clocks;
+    Populate(path, clocks, 20, 1'000);
+    auto options{Options(path)};
+    options.load_retry = std::chrono::milliseconds{0};
+    FlowMeshObservedTimeStore store{options};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 20, Known(0, 20));
+    unsigned attempts{0}, writes{0};
+    store.SetLoadHookForTest([&](const flowmesh::MarketId&, const char* at) {
+        if (std::string_view{at} == "meta") {
+            ++attempts;
+            throw std::runtime_error{"injected"};
+        }
+    });
+    store.SetFlushHookForTest([&] { ++writes; });
+    for (uint64_t i{20}; i < 23; ++i) {
+        clocks.Advance(1'000);
+        log->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i));
+        BOOST_CHECK(log->GetSummary().loading);
+        store.FlushNow(false);
+    }
+    BOOST_CHECK_EQUAL(attempts, options.load_attempts);
+    const auto summary{log->GetSummary()};
+    BOOST_CHECK(!summary.loading);
+    BOOST_CHECK(!summary.persisted);
+    BOOST_CHECK_EQUAL(log->Lookup(Known(20, 23)).size(), 3U);
+    clocks.Advance(1'000);
+    log->Record(23, EntryHash(23), ObservedDelay::NONE, Tick(23));
+    BOOST_CHECK_EQUAL(log->Candles(CandleInterval::M1, std::nullopt, 10).candles.back().last_sequence, 23U);
+    store.FlushNow(false);
+    BOOST_CHECK(log->TakePending().Empty());
+    BOOST_CHECK_EQUAL(attempts, options.load_attempts);
+    BOOST_CHECK_EQUAL(writes, 0U);
+    BOOST_CHECK(store.ReadCandles(MARKET, CandleInterval::M1, 0, T0 + 86'400'000, 100).empty());
+    store.Stop();
+    // Only Stop's final synced write.
+    BOOST_CHECK_EQUAL(writes, 1U);
+    BOOST_CHECK_EQUAL(attempts, options.load_attempts);
+    store.SetLoadHookForTest({});
+    store.SetFlushHookForTest({});
+}
+
+// Stop attempts a load whose retry is not due yet: a disk that recovered
+// gets the history and the entries that waited.
+BOOST_AUTO_TEST_CASE(stop_attempts_a_queued_load_at_once)
+{
+    const auto path{m_path_root / "observed_stop_retry"};
+    FakeClocks clocks;
+    Populate(path, clocks, 20, 1'000);
+    auto options{Options(path)};
+    options.load_retry = std::chrono::hours{1};
+    FlowMeshObservedTimeStore store{options};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 20, Known(0, 20));
+    unsigned reached{0};
+    store.SetLoadHookForTest([&](const flowmesh::MarketId&, const char* at) {
+        if (std::string_view{at} == "meta" && reached++ == 0) throw std::runtime_error{"injected"};
+    });
+    store.FlushNow(false);
+    clocks.Advance(1'000);
+    log->Record(20, EntryHash(20), ObservedDelay::NONE, Tick(20));
+    store.FlushNow(false);
+    BOOST_CHECK_EQUAL(reached, 1U);
+    BOOST_CHECK(log->GetSummary().loading);
+    store.Stop();
+    BOOST_CHECK_EQUAL(reached, 2U);
+    BOOST_CHECK(!log->GetSummary().loading);
+    BOOST_CHECK(log->GetSummary().persisted);
+    BOOST_CHECK_EQUAL(log->Lookup(Known(0, 21)).size(), 21U);
+    const auto disk{store.ReadCandles(MARKET, CandleInterval::M1, T0, T0 + 60'000, 10)};
+    BOOST_REQUIRE_EQUAL(disk.size(), 1U);
+    BOOST_CHECK_EQUAL(disk.front().first_sequence, 0U);
+    BOOST_CHECK_EQUAL(disk.front().last_sequence, 20U);
+    store.SetLoadHookForTest({});
+}
+
+// A history read and checked but not installed (FinishLoad failing, as an
+// allocation failure would) leaves the log empty and recording: the market
+// is given up, so its fresh candles never overwrite the stored ones of the
+// same buckets and the failure stays visible (never persisted again by a
+// sweep).
+BOOST_AUTO_TEST_CASE(a_load_that_cannot_install_its_history_is_given_up)
+{
+    const auto path{m_path_root / "observed_install_failure"};
+    FakeClocks clocks;
+    Populate(path, clocks, 20, 1'000);
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        store.Attach(log, 20, Known(0, 20));
+        log->FailNextFinishLoadForTest();
+        unsigned writes{0};
+        store.SetFlushHookForTest([&] { ++writes; });
+        store.FlushNow(false);
+        BOOST_CHECK(!log->GetSummary().loading);
+        BOOST_CHECK(!log->GetSummary().persisted);
+        BOOST_CHECK_EQUAL(writes, 0U);
+        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+            BOOST_CHECK(store.ReadCandles(MARKET, interval, 0, T0 + 86'400'000, 100).empty());
+        }
+        // An entry in the same minute is recorded in memory, never written.
+        log->Record(20, EntryHash(20), ObservedDelay::NONE, Tick(20));
+        BOOST_CHECK_EQUAL(log->Candles(CandleInterval::M1, std::nullopt, 10).candles.back().last_sequence, 20U);
+        store.FlushNow(false);
+        BOOST_CHECK(!log->GetSummary().persisted);
+        BOOST_CHECK_EQUAL(writes, 0U);
+        store.SetFlushHookForTest({});
+        store.Stop();
+        BOOST_CHECK(!log->GetSummary().persisted);
+    }
+    // The stored candles still hold entries 0..19.
+    FlowMeshObservedTimeStore store{Options(path)};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 20, Known(0, 20));
+    store.FlushNow(false);
+    BOOST_CHECK(log->GetSummary().persisted);
+    for (const auto interval : {CandleInterval::M1, CandleInterval::D1}) {
+        const auto disk{store.ReadCandles(MARKET, interval, 0, T0 + 86'400'000, 100)};
+        BOOST_REQUIRE_EQUAL(disk.size(), 1U);
+        BOOST_CHECK_EQUAL(disk.front().first_sequence, 0U);
+        BOOST_CHECK_EQUAL(disk.front().last_sequence, 19U);
+        BOOST_CHECK_EQUAL(disk.front().entries, 20U);
+    }
+    store.Stop();
+}
+
+// A market whose load is given up never affects another: the other market
+// loads, writes and is served as usual, and Stop's final synced write runs
+// once for the store.
+BOOST_AUTO_TEST_CASE(a_market_given_up_never_affects_another)
+{
+    const auto path{m_path_root / "observed_given_up_beside"};
+    FakeClocks clocks;
+    Populate(path, clocks, 20, 1'000);
+    {
+        auto options{Options(path)};
+        options.load_retry = std::chrono::milliseconds{0};
+        FlowMeshObservedTimeStore store{options};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        const auto other{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, OTHER_MARKET, clocks.Get())};
+        unsigned attempts{0}, other_stages{0};
+        store.SetLoadHookForTest([&](const flowmesh::MarketId& market, const char* at) {
+            if (market != MARKET) {
+                ++other_stages;
+                return;
+            }
+            if (std::string_view{at} == "meta") {
+                ++attempts;
+                throw std::runtime_error{"injected"};
+            }
+        });
+        store.Attach(log, 20, Known(0, 20));
+        store.Attach(other, 0, {});
+        for (uint64_t i{0}; i < 3; ++i) {
+            clocks.Advance(1'000);
+            log->Record(20 + i, EntryHash(20 + i), ObservedDelay::NONE, Tick(20 + i));
+            other->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i));
+            store.FlushNow(false);
+        }
+        BOOST_CHECK_EQUAL(attempts, options.load_attempts);
+        // One load of the other market, every stage, once.
+        BOOST_CHECK_EQUAL(other_stages, 4U);
+        BOOST_CHECK(!log->GetSummary().loading);
+        BOOST_CHECK(!log->GetSummary().persisted);
+        BOOST_CHECK_EQUAL(log->Lookup(Known(20, 23)).size(), 3U);
+        BOOST_CHECK(store.ReadCandles(MARKET, CandleInterval::M1, 0, T0 + 86'400'000, 100).empty());
+        BOOST_CHECK(!other->GetSummary().loading);
+        BOOST_CHECK(other->GetSummary().persisted);
+        const auto disk{store.ReadCandles(OTHER_MARKET, CandleInterval::M1, 0, T0 + 86'400'000, 100)};
+        BOOST_REQUIRE_EQUAL(disk.size(), 1U);
+        BOOST_CHECK_EQUAL(disk.front().first_sequence, 0U);
+        BOOST_CHECK_EQUAL(disk.front().last_sequence, 2U);
+        unsigned writes{0};
+        store.SetFlushHookForTest([&] { ++writes; });
+        store.Stop();
+        BOOST_CHECK_EQUAL(writes, 1U);
+        BOOST_CHECK(other->GetSummary().persisted);
+        BOOST_CHECK_EQUAL(attempts, options.load_attempts);
+        store.SetFlushHookForTest({});
+        store.SetLoadHookForTest({});
+    }
+    // The given-up market's rows are untouched and none of its new ones was
+    // written; the other market's are on disk.
+    CDBWrapper db{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+    RawRowValue row;
+    BOOST_REQUIRE(db.Read(RawRowKey{'r', MARKET, 19}, row));
+    BOOST_CHECK(row.hash == EntryHash(19));
+    BOOST_CHECK(!db.Exists(RawRowKey{'r', MARKET, 20}));
+    BOOST_REQUIRE(db.Read(RawRowKey{'r', OTHER_MARKET, 2}, row));
+    BOOST_CHECK(row.hash == EntryHash(2));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

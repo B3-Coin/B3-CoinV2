@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <new>
 #include <stdexcept>
 
 namespace node {
@@ -381,6 +382,7 @@ bool FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> ro
     // Entries taken out of m_early and not yet installed (lost on failure).
     uint64_t taken{0};
     try {
+        if (m_fail_next_finish_load.exchange(false, std::memory_order_relaxed)) throw std::bad_alloc{};
         State state{Reloaded(std::move(rows), std::move(candles), recorded_since)};
         // Replayed off the mutex, so Record (the runtime worker, under its
         // market lock) never waits for this work. Each round swaps the
@@ -507,7 +509,7 @@ void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTim
         log->BeginLoad();
         {
             std::lock_guard lock{m_mutex};
-            m_attached.push_back(Attached{log, std::nullopt, {}, LoadJob{store_next_sequence, known}, true});
+            m_attached.push_back(Attached{.log = log, .load = LoadJob{store_next_sequence, known}});
             m_load_requested = true;
         }
         m_cv.notify_all();
@@ -517,35 +519,32 @@ void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTim
     }
 }
 
-void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db) noexcept
+void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db, const std::chrono::steady_clock::time_point now,
+                                        const bool at_stop, const LoadHook& hook) noexcept
 {
-    // Caller holds m_flush_mutex.
+    // Caller holds m_flush_mutex; item.load is set and stays queued until a
+    // load succeeds or is given up. The market is restored only once every
+    // read and write below succeeded.
     auto& log{*item.log};
-    // Set once the disk holds only what may be served (the erasures and
-    // wipes below are done), before the log serves its history: a reader
-    // that finds the log loaded never finds its disk candles withheld.
-    const auto disk_settled = [&]() noexcept {
-        try {
-            std::lock_guard lock{m_mutex};
-            item.loading = false;
-        } catch (...) {
-        }
-    };
-    bool finished{false};
+    // FinishLoad ran: nothing after it is a failed attempt.
+    bool installed{false};
     try {
-        const LoadJob job{std::move(*item.load)};
-        item.load.reset();
-        const uint64_t store_next_sequence{job.store_next_sequence};
-        const auto& known{job.known};
         if (!db) {
-            disk_settled();
-            finished = true;
-            log.FinishLoad({}, {}, std::nullopt);
-            log.SetPersisted(false);
+            // Open failed (logged there): nothing to retry.
+            LoadFailed(item, "the database is not open", now, at_stop, /*retryable=*/false);
             return;
         }
+        const LoadJob& job{*item.load};
+        const uint64_t store_next_sequence{job.store_next_sequence};
+        const auto& known{job.known};
         const uint256 market{log.MarketId()};
+        const auto stage = [&](const char* name) {
+            if (hook) hook(log.MarketId(), name);
+        };
         try {
+            // An earlier failed attempt may have set it.
+            item.oldest_row.reset();
+            stage("meta");
             MetaValue meta;
             const bool has_meta{db->Read(MetaKey{KEY_META, market}, meta)};
             if (has_meta && (meta.version != META_VERSION || meta.domain != log.Domain())) {
@@ -575,7 +574,9 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db) no
                     erased = true;
                 }
             }
+            stage("erase");
             if (erased) db->WriteBatch(erase, true);
+            stage("rows");
             // The newest retained rows; a hash the store contradicts wipes.
             const uint64_t from{store_next_sequence > FlowMeshObservedTimeLog::RING ? store_next_sequence - FlowMeshObservedTimeLog::RING : 0};
             std::vector<flowmesh::ObservedStamp> rows;
@@ -603,6 +604,7 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db) no
                 RowKey key;
                 if (it->GetKey(key) && key.prefix == KEY_ROW && key.market == market) item.oldest_row = key.sequence;
             }
+            stage("candles");
             // The memory window of every interval, ending at the newest time.
             std::optional<int64_t> newest;
             for (auto row{rows.rbegin()}; row != rows.rend() && !newest; ++row) {
@@ -630,26 +632,69 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db) no
             const auto recorded_since{mismatch ? std::nullopt : item.oldest_row};
             if (mismatch) item.oldest_row.reset();
             it.reset();
-            disk_settled();
-            finished = true;
-            // A history FinishLoad failed to install (it then leaves the log
-            // empty) is not what the disk holds: not persisted, as before
-            // the load moved to this thread.
-            log.SetPersisted(log.FinishLoad(std::move(rows), std::move(candles), recorded_since));
+            // Restored: the disk holds only what may be served. Set before
+            // the log serves its history, so a reader that finds the log
+            // loaded never finds its disk candles withheld.
+            {
+                std::lock_guard lock{m_mutex};
+                item.restored = true;
+            }
+            item.load.reset();
+            installed = true;
+            if (log.FinishLoad(std::move(rows), std::move(candles), recorded_since)) {
+                log.SetPersisted(true);
+            } else {
+                // Not installed: FinishLoad left the log empty and recording,
+                // so its fresh candles would overwrite the stored ones of the
+                // same buckets. Given up as a failed load is: memory only.
+                try {
+                    std::lock_guard lock{m_mutex};
+                    item.restored = false;
+                } catch (...) {
+                }
+                log.SetPersisted(false);
+                LogWarning("FlowMesh market %s: observed times could not be installed; they are kept in memory only until restart "
+                           "(<flowmeshdatadir>/observed_time holds display data only and may be removed if this repeats)\n",
+                           market.GetHex());
+            }
         } catch (const std::exception& e) {
-            LogWarning("FlowMesh market %s: observed times could not be read (%s); recording starts empty\n",
-                       market.GetHex(), e.what());
-            disk_settled();
-            finished = true;
-            log.FinishLoad({}, {}, std::nullopt);
-            log.SetPersisted(false);
+            if (!installed) LoadFailed(item, e.what(), now, at_stop, /*retryable=*/true);
         }
     } catch (...) {
-        item.load.reset();
-        disk_settled();
-        if (!finished) log.FinishLoad({}, {}, std::nullopt);
-        log.SetPersisted(false);
+        if (!installed) LoadFailed(item, "unknown error", now, at_stop, /*retryable=*/true);
     }
+}
+
+void FlowMeshObservedTimeStore::LoadFailed(Attached& item, const char* const why, const std::chrono::steady_clock::time_point now,
+                                           const bool at_stop, const bool retryable) noexcept
+{
+    // Caller holds m_flush_mutex. Never restored here: the market's disk
+    // candles stay withheld and nothing of it is written.
+    auto& log{*item.log};
+    ++item.load_attempts;
+    log.SetPersisted(false);
+    if (retryable && !at_stop && item.load_attempts < m_options.load_attempts) {
+        // The log keeps loading: its reads stay unavailable and its entries
+        // wait (at most RING) to be stamped by the attempt that succeeds.
+        item.retry_load = now + m_options.load_retry;
+        try {
+            LogWarning("FlowMesh market %s: observed times could not be read (%s, attempt %u of %u); retrying\n",
+                       log.MarketId().GetHex(), why, item.load_attempts, m_options.load_attempts);
+        } catch (...) {
+        }
+        return;
+    }
+    // Given up: the log records in memory only (its waiting entries are
+    // stamped on an empty history) and this market's disk is neither
+    // served nor written until restart.
+    item.load.reset();
+    try {
+        LogWarning("FlowMesh market %s: observed times could not be read (%s); they are kept in memory only until restart "
+                   "(<flowmeshdatadir>/observed_time holds display data only and may be removed if this repeats)\n",
+                   log.MarketId().GetHex(), why);
+    } catch (...) {
+    }
+    log.FinishLoad({}, {}, std::nullopt);
 }
 
 void FlowMeshObservedTimeStore::Start()
@@ -669,7 +714,8 @@ void FlowMeshObservedTimeStore::Stop()
     m_cv.notify_all();
     if (m_thread.joinable()) m_thread.join();
     // Every runtime writer has stopped before the service calls this. A
-    // market still queued is loaded (and erased) before its rows are written.
+    // load still queued is attempted at once: the market is loaded (and
+    // erased) before any of its rows is written, or given up.
     FlushNow(/*sync=*/true);
 }
 
@@ -699,22 +745,33 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
         std::lock_guard flush{m_flush_mutex};
         std::vector<Attached*> attached;
         std::function<void()> hook;
+        LoadHook load_hook;
         CDBWrapper* db{nullptr};
         {
             std::lock_guard lock{m_mutex};
             for (auto& item : m_attached) attached.push_back(&item);
             hook = m_hook;
+            load_hook = m_load_hook;
             db = m_db.get();
             m_load_requested = false;
         }
-        // Queued markets first, on this thread: a market's erasures and
-        // wipes always reach the disk before any of its new rows.
-        for (auto* item : attached) {
-            if (item->load) RunLoad(*item, db);
-        }
         const auto now{std::chrono::steady_clock::now()};
+        // Queued markets first, on this thread: a market's erasures and
+        // wipes always reach the disk before any of its new rows. A failed
+        // load waits for its retry; Stop's pass attempts it at once.
+        for (auto* item : attached) {
+            if (item->load && (sync || now >= item->retry_load)) RunLoad(*item, db, now, /*at_stop=*/sync, load_hook);
+        }
         for (auto* item : attached) {
             auto& log{*item->log};
+            if (!item->restored) {
+                // Not checked against the production store: nothing of it
+                // is written. While its load is queued the log is loading
+                // (nothing pending); once given up it is memory only, and
+                // what it would persist is dropped each pass.
+                if (!item->load) (void)log.TakePending();
+                continue;
+            }
             auto pending{log.TakePending()};
             if (pending.Empty() && now < item->next_sweep) continue;
             if (!db) continue;
@@ -799,11 +856,17 @@ std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(con
         CDBWrapper* db{nullptr};
         {
             std::lock_guard lock{m_mutex};
-            // A queued market's disk may still hold rows and candles its
-            // load will erase or wipe: none is served until then (a gap).
+            // Only a market whose load succeeded: until then, after it was
+            // given up, or for a market never attached here, its disk may
+            // hold rows and candles a load would erase or wipe. None is
+            // served (a gap).
+            bool restored{false};
             for (const auto& item : m_attached) {
-                if (item.loading && item.log->MarketId() == market) return out;
+                if (item.log->MarketId() != market) continue;
+                if (!item.restored) return out;
+                restored = true;
             }
+            if (!restored) return out;
             db = m_db.get();
         }
         // Read without m_mutex: the database outlives every reader (it is
@@ -841,6 +904,12 @@ void FlowMeshObservedTimeStore::SetFlushHookForTest(std::function<void()> hook)
 {
     std::lock_guard lock{m_mutex};
     m_hook = std::move(hook);
+}
+
+void FlowMeshObservedTimeStore::SetLoadHookForTest(LoadHook hook)
+{
+    std::lock_guard lock{m_mutex};
+    m_load_hook = std::move(hook);
 }
 
 } // namespace node

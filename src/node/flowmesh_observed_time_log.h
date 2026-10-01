@@ -154,6 +154,9 @@ public:
     bool FinishLoad(std::vector<flowmesh::ObservedStamp> rows,
                     std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
                     std::optional<uint64_t> recorded_since) noexcept;
+    //! Tests only: the next FinishLoad fails as an allocation failure would
+    //! (the history is not installed).
+    void FailNextFinishLoadForTest() noexcept { m_fail_next_finish_load.store(true, std::memory_order_relaxed); }
 
 private:
     //! One Record's inputs and clock readings.
@@ -203,6 +206,7 @@ private:
     std::atomic<bool> m_persisted{true};
     std::atomic<bool> m_clock_suspect{false};
     std::atomic<uint64_t> m_generation{0};
+    std::atomic<bool> m_fail_next_finish_load{false};
 };
 
 /** The one display-only database of every market's observed time, at
@@ -218,7 +222,9 @@ private:
  * one batch per market (rows and candles together, so a crash loses a
  * consistent tail), and every Stop ends with one synced write. It is never
  * written by the FlowMesh tick or worker thread, so a stalled disk delays
- * only the flush.
+ * only the flush. A market's disk is served and written only once its load
+ * succeeded; a load that fails is retried, then given up (that market then
+ * stays memory only until restart).
  * A corrupt database is wiped and recreated; one that cannot be opened
  * leaves every log memory only. Retention: 262,144 rows per market; candles
  * 1m 14 days, 5m 60 days, 15m 180 days, 1h 2 years, 4h 5 years, 1d 10 years. */
@@ -230,7 +236,15 @@ public:
         bool memory_only{false};
         size_t cache_bytes{size_t{1} << 20};
         std::chrono::milliseconds flush_interval{1000};
+        //! A failed load is retried this long after the attempt, at most
+        //! load_attempts attempts in all; then that market is memory only
+        //! until restart.
+        std::chrono::milliseconds load_retry{5000};
+        unsigned load_attempts{3};
     };
+    //! Tests only: the market and the load stage ("meta", "erase", "rows",
+    //! "candles"); a throw is a failed attempt.
+    using LoadHook = std::function<void(const flowmesh::MarketId& market, const char* stage)>;
     static constexpr uint64_t ROW_RETENTION{262'144};
     //! Erases per retention sweep of one market (bounds one flush's work).
     static constexpr size_t SWEEP_ERASE_MAX{4096};
@@ -252,27 +266,36 @@ public:
      * erased, together with every candle holding any such row; a row whose
      * hash differs from `known` (sequence, hash) of the production store
      * wipes the market's times; so does a meta record of another domain.
-     * Until the load ends, the log's reads are unavailable
+     * Until the load succeeds, the log's reads are unavailable
      * (FlowMeshObservedTimeLog::LOADING_REASON) and ReadCandles serves none
-     * of the market's disk candles. Never throws. */
+     * of the market's disk candles. A load that cannot read or write the
+     * database is retried Options::load_retry later, at most
+     * Options::load_attempts attempts in all; then it is given up, logged:
+     * the log records in memory only and the market's disk is neither
+     * served nor written until restart. Never throws. */
     void Attach(const std::shared_ptr<FlowMeshObservedTimeLog>& log, uint64_t store_next_sequence,
                 const std::vector<std::pair<uint64_t, uint256>>& known) noexcept;
     //! Starts the flush thread, which opens the database first.
     void Start();
-    //! Stops the flush thread, writes every pending log, then syncs the
-    //! database even when previous unsynced passes left no pending rows.
+    //! Stops the flush thread, attempts a load still queued at once (given
+    //! up if it fails), writes every pending log, then syncs the database
+    //! even when previous unsynced passes left no pending rows.
     void Stop();
     //! One flush pass on the calling thread (the flush thread's body).
     void FlushNow(bool sync) noexcept;
     //! Disk candles of one market with open in [from_ms, before_ms), at most
     //! `limit`, ascending; `older` is set when one exists before from_ms.
-    //! None while that market's load is queued. Never holds the store mutex
-    //! across the read.
+    //! None unless the market's load succeeded: none while it is queued or
+    //! retried, after it was given up, or for a market never attached.
+    //! Never holds the store mutex across the read.
     std::vector<flowmesh::ObservedCandle> ReadCandles(const flowmesh::MarketId& market, flowmesh::CandleInterval interval,
                                                       int64_t from_ms, int64_t before_ms, size_t limit, bool* older = nullptr) const;
     //! Tests only: runs inside every flush, before its batch is written,
     //! and before Stop's final synced write.
     void SetFlushHookForTest(std::function<void()> hook);
+    //! Tests only: runs inside every load attempt before each stage's disk
+    //! work ("meta", "erase", "rows", "candles").
+    void SetLoadHookForTest(LoadHook hook);
 
 private:
     //! What Attach queues for the flush thread.
@@ -282,19 +305,29 @@ private:
     };
     struct Attached {
         std::shared_ptr<FlowMeshObservedTimeLog> log;
-        //! These three belong to the holder of m_flush_mutex once the item
-        //! is published.
+        //! These belong to the holder of m_flush_mutex once the item is
+        //! published. `load` stays queued until a load succeeds or is given
+        //! up.
         std::optional<uint64_t> oldest_row;
         std::chrono::steady_clock::time_point next_sweep{};
         std::optional<LoadJob> load;
-        //! Under m_mutex: set until the load's disk work is done, and no
-        //! disk candle of the market is served meanwhile.
-        bool loading{false};
+        unsigned load_attempts{0};
+        std::chrono::steady_clock::time_point retry_load{};
+        //! The load succeeded: the disk holds only what may be served. Only
+        //! then are the market's disk candles served and its rows written.
+        //! Written under m_mutex by the holder of m_flush_mutex; read under
+        //! either.
+        bool restored{false};
     };
     void FlushLoop();
-    //! One queued load (the body Attach ran before queueing). Caller holds
+    //! One attempt of a queued load (the body Attach ran before queueing).
+    //! `at_stop`: no later attempt. Caller holds m_flush_mutex.
+    void RunLoad(Attached& item, CDBWrapper* db, std::chrono::steady_clock::time_point now, bool at_stop,
+                 const LoadHook& hook) noexcept;
+    //! A failed attempt: retried later, or given up. Caller holds
     //! m_flush_mutex.
-    void RunLoad(Attached& item, CDBWrapper* db) noexcept;
+    void LoadFailed(Attached& item, const char* why, std::chrono::steady_clock::time_point now, bool at_stop,
+                    bool retryable) noexcept;
     //! Caller holds m_flush_mutex.
     static void WipeMarket(CDBWrapper& db, const flowmesh::MarketId& market);
 
@@ -307,6 +340,7 @@ private:
     //! while Attach appends.
     std::list<Attached> m_attached;
     std::function<void()> m_hook;
+    LoadHook m_load_hook;
     //! A load is queued (wakes the flush thread).
     bool m_load_requested{false};
     //! Serializes Open, loads and flush passes (the thread's and Stop's).
