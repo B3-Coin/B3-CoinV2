@@ -65,6 +65,14 @@ public:
     //! Unflushed rows. Beyond it the oldest are dropped from persistence
     //! only (a gap after a restart), never from memory.
     static constexpr size_t PENDING_ROWS_MAX{8192};
+    //! Unflushed candle snapshots of `interval`: CandleMemoryWindow + 1
+    //! (4742 for the six). Only a flush stalled for longer than the window
+    //! reaches it; the oldest snapshot, which can no longer change, is then
+    //! dropped from persistence only and counted (candles_not_persisted),
+    //! never from memory. The stored candle of that bucket stays as it was
+    //! at the last successful flush, or is absent, as after a crash; the
+    //! sequence gap to the next stored candle shows it.
+    static size_t PendingCandlesMax(flowmesh::CandleInterval interval) { return flowmesh::CandleMemoryWindow(interval) + 1; }
     //! Why every read is unavailable while the history loads.
     static constexpr const char* LOADING_REASON{"observed_time_loading"};
 
@@ -75,7 +83,9 @@ public:
 
     /** One durable commit, in sequence order. `delay` NONE records it LIVE.
      * `tick` is the entry's clearing; one of another entry is ignored and
-     * the entry counts without a price. Memory only, O(1); never throws.
+     * the entry counts without a price. Memory only and bounded (at most
+     * PendingCandlesMax snapshots of each interval wait to be persisted, a
+     * map); never throws.
      * While the history loads it keeps only this call's clock readings (at
      * most RING entries; beyond that the oldest are dropped, a gap) and
      * returns a provisional UNTIMED stamp; FinishLoad stamps the entry. */
@@ -98,6 +108,9 @@ public:
         bool persisted{true};
         bool clock_suspect{false};
         uint64_t rows_not_persisted{0};
+        //! Internal (never serialized): candle snapshots dropped beyond
+        //! PendingCandlesMax.
+        uint64_t candles_not_persisted{0};
         uint64_t record_failures{0};
         //! Internal (never serialized): the history is loading, so every
         //! read is unavailable with LOADING_REASON.
@@ -113,7 +126,10 @@ public:
     struct Pending {
         //! A deque: dropping the oldest on overflow is O(1).
         std::deque<flowmesh::ObservedStamp> rows;
+        //! At most PendingCandlesMax(interval) for each interval.
         std::map<std::pair<uint8_t, int64_t>, flowmesh::ObservedCandle> candles;
+        //! How many of `candles` each interval holds.
+        std::array<size_t, flowmesh::CANDLE_INTERVALS.size()> candle_counts{};
         bool Empty() const { return rows.empty() && candles.empty(); }
     };
     Pending TakePending();
@@ -163,6 +179,7 @@ private:
         //! This process's previous Record: raw wall and steady readings.
         std::optional<std::pair<int64_t, std::chrono::steady_clock::time_point>> previous;
         uint64_t rows_not_persisted{0};
+        uint64_t candles_not_persisted{0};
     };
     //! The body of Record, on the live state or on one being reloaded.
     static flowmesh::ObservedStamp Apply(State& state, const Raw& raw);

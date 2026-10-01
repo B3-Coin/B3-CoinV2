@@ -23,6 +23,7 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -609,6 +610,113 @@ BOOST_AUTO_TEST_CASE(pending_overflow_drops_rows_from_persistence_only)
     // Memory keeps the newest ring.
     BOOST_CHECK_EQUAL(log->Lookup({{total - 1, EntryHash(total - 1)}}).size(), 1U);
     BOOST_CHECK(log->TakePending().Empty());
+}
+
+// A flush that never drains (a stalled disk) for three days of one entry a
+// minute: each interval keeps at most its memory window + 1 unflushed
+// snapshots, the newest, and the drop is counted. Memory is untouched.
+BOOST_AUTO_TEST_CASE(pending_candles_stay_within_each_memory_window_while_nothing_drains)
+{
+    FakeClocks clocks;
+    const auto log{MakeLog(clocks)};
+    const uint64_t total{3 * flowmesh::CandleMemoryWindow(CandleInterval::M1)};
+    for (uint64_t i{0}; i < total; ++i) {
+        log->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i));
+        clocks.Advance(60'000);
+    }
+    // Only the one-minute candles outgrow their budget in three days.
+    BOOST_CHECK_EQUAL(log->GetSummary().candles_not_persisted, total - FlowMeshObservedTimeLog::PendingCandlesMax(CandleInterval::M1));
+    const auto pending{log->TakePending()};
+    size_t bound{0};
+    for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+        const auto id{static_cast<uint8_t>(interval)};
+        const auto first{pending.candles.lower_bound({id, std::numeric_limits<int64_t>::min()})};
+        const auto end{pending.candles.upper_bound({id, std::numeric_limits<int64_t>::max()})};
+        BOOST_CHECK_LE(static_cast<size_t>(std::distance(first, end)), flowmesh::CandleMemoryWindow(interval) + 1);
+        bound += flowmesh::CandleMemoryWindow(interval) + 1;
+        BOOST_REQUIRE(first != end);
+        BOOST_CHECK_EQUAL(first->second.open_ms, *log->OldestMemoryOpen(interval));
+        BOOST_CHECK_EQUAL(std::prev(end)->second.last_sequence, total - 1);
+    }
+    BOOST_CHECK_LE(pending.candles.size(), bound);
+    // Only persistence loses old buckets: the newest stamp and candle stay.
+    BOOST_CHECK_EQUAL(log->Lookup({{total - 1, EntryHash(total - 1)}}).size(), 1U);
+    log->Record(total, EntryHash(total), ObservedDelay::NONE, Tick(total));
+    BOOST_CHECK_EQUAL(log->Candles(CandleInterval::M1, std::nullopt, 1).candles.back().last_sequence, total);
+}
+
+// The same bound with the store's own thread held inside its disk write
+// for three days of entries: nothing drains, nothing grows past it.
+BOOST_AUTO_TEST_CASE(a_stalled_flush_thread_never_grows_pending_candles)
+{
+    FakeClocks clocks;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered{false}, release{false};
+    const auto release_hook = [&] {
+        {
+            std::lock_guard lock{mutex};
+            release = true;
+        }
+        cv.notify_all();
+    };
+    FlowMeshObservedTimeStore store{Options(m_path_root / "observed_pending_stall")};
+    // Declared after the store: a failed check releases the thread before
+    // the store's destructor joins it.
+    const struct Releaser {
+        std::function<void()> release;
+        ~Releaser() { release(); }
+    } releaser{release_hook};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 0, {});
+    store.FlushNow(false);
+    store.SetFlushHookForTest([&] {
+        std::unique_lock lock{mutex};
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+    });
+    log->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0));
+    store.Start();
+    {
+        std::unique_lock lock{mutex};
+        BOOST_REQUIRE(cv.wait_for(lock, std::chrono::seconds{10}, [&] { return entered; }));
+    }
+    const uint64_t total{3 * flowmesh::CandleMemoryWindow(CandleInterval::M1)};
+    for (uint64_t i{1}; i <= total; ++i) {
+        clocks.Advance(60'000);
+        log->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i));
+    }
+    size_t bound{0};
+    for (const auto interval : flowmesh::CANDLE_INTERVALS) bound += FlowMeshObservedTimeLog::PendingCandlesMax(interval);
+    BOOST_CHECK_LE(log->TakePending().candles.size(), bound);
+    BOOST_CHECK_GT(log->GetSummary().candles_not_persisted, 0U);
+    release_hook();
+    store.SetFlushHookForTest({});
+    store.Stop();
+}
+
+// With the flush draining, no snapshot is ever dropped, even when the wall
+// clock steps forward past the 1m window between two flushes: the last
+// update of the candle that left the window is still flushed.
+BOOST_AUTO_TEST_CASE(a_draining_flush_never_drops_a_candle_snapshot)
+{
+    FakeClocks clocks;
+    const auto log{MakeLog(clocks)};
+    log->Record(0, EntryHash(0), ObservedDelay::NONE, Tick(0));
+    (void)log->TakePending();
+    clocks.Advance(10'000);
+    log->Record(1, EntryHash(1), ObservedDelay::NONE, Tick(1));
+    clocks.wall += 2 * 86'400'000LL;
+    clocks.Advance(1'000);
+    log->Record(2, EntryHash(2), ObservedDelay::NONE, Tick(2));
+    const auto pending{log->TakePending()};
+    const auto minute{pending.candles.find({static_cast<uint8_t>(CandleInterval::M1), T0})};
+    BOOST_REQUIRE(minute != pending.candles.end());
+    BOOST_CHECK_EQUAL(minute->second.last_sequence, 1U);
+    BOOST_CHECK_EQUAL(log->GetSummary().candles_not_persisted, 0U);
 }
 
 BOOST_AUTO_TEST_CASE(flush_failure_sets_persisted_false)

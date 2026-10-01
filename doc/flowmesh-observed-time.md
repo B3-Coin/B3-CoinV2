@@ -66,10 +66,11 @@ auction existed between them; anything else is a gap.
 
 ### Storage and the FlowMesh critical path
 
-- `Record` is memory only, O(1) (a 4096-stamp ring, the six rollups, a bounded
-  queue of rows to persist whose oldest is dropped in O(1)) and `noexcept`; its
-  mutex is a leaf taken inside the market lock. A failure costs a gap, never
-  the commit (tested with a clock that throws).
+- `Record` is memory only and bounded (a 4096-stamp ring, the six rollups, a
+  bounded queue of rows to persist whose oldest is dropped in O(1), and at most
+  4,742 candle snapshots to persist, a map) and `noexcept`; its mutex is a leaf
+  taken inside the market lock. A failure costs a gap, never the commit
+  (tested with a clock that throws).
 - One separate LevelDB, `<flowmeshdatadir>/observed_time`, market-prefixed keys,
   outside every production store (its fail-closed checks can never be affected;
   older binaries never open it).
@@ -87,7 +88,14 @@ auction existed between them; anything else is a gap.
   read pages the database without it. Shutdown joins the thread, so a hung
   write there delays shutdown (after the runtime stopped), never trading.
 - More than 8192 unflushed rows: the oldest are dropped from persistence only (a
-  gap after a restart). A crash loses at most the unflushed second (a gap).
+  gap after a restart). Unflushed candle snapshots are bounded too: at most
+  each interval's memory window + 1 (4,742 for the six). Only a flush stalled
+  for longer than an interval's window reaches that; its oldest snapshot,
+  which can no longer change, is then dropped from persistence only and
+  counted. The stored candle of that bucket stays as it was at the last
+  successful flush, or is absent, as after a crash; the sequence gap to the
+  next stored candle shows it. A crash loses at most the unflushed second (a
+  gap).
 - At start, after the production store replays, the market **queues** its
   history and goes on at once. The thread then loads it, before it writes any
   row of that market: rows at or after the store's next sequence are erased,

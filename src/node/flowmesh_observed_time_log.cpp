@@ -214,7 +214,16 @@ flowmesh::ObservedStamp FlowMeshObservedTimeLog::Apply(State& state, const Raw& 
             ++state.rows_not_persisted;
         }
         for (const auto& [interval, candle] : changes) {
-            state.pending.candles[{static_cast<uint8_t>(interval), candle.open_ms}] = candle;
+            const auto id{static_cast<uint8_t>(interval)};
+            if (!state.pending.candles.insert_or_assign({id, candle.open_ms}, candle).second) continue;
+            // A new snapshot. Beyond the interval's budget (a flush stalled
+            // for longer than its memory window) the oldest is dropped: more
+            // than window + 1 aligned opens never fit in the window, so that
+            // candle has left it and can no longer change.
+            if (++state.pending.candle_counts[id] <= PendingCandlesMax(interval)) continue;
+            state.pending.candles.erase(state.pending.candles.lower_bound({id, std::numeric_limits<int64_t>::min()}));
+            --state.pending.candle_counts[id];
+            ++state.candles_not_persisted;
         }
     }
     return stamp;
@@ -309,6 +318,7 @@ FlowMeshObservedTimeLog::Summary FlowMeshObservedTimeLog::GetSummary() const
         out.loading = m_loading;
         if (!m_loading) out.recorded_since = m_state.recorded_since;
         out.rows_not_persisted = m_state.rows_not_persisted + m_early_dropped;
+        out.candles_not_persisted = m_state.candles_not_persisted;
     }
     out.persisted = m_persisted.load(std::memory_order_relaxed);
     out.clock_suspect = m_clock_suspect.load(std::memory_order_relaxed);
@@ -393,6 +403,7 @@ bool FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> ro
             // Only what was recorded during the replay above.
             for (const auto& raw : m_early) (void)Apply(state, raw);
             state.rows_not_persisted += m_state.rows_not_persisted + m_early_dropped;
+            state.candles_not_persisted += m_state.candles_not_persisted;
             // The replaced state is freed below, after the mutex.
             std::swap(m_state, state);
             m_early.clear();
@@ -406,6 +417,7 @@ bool FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> ro
             std::lock_guard lock{m_mutex};
             State fresh;
             fresh.rows_not_persisted = m_state.rows_not_persisted + m_early_dropped + taken + m_early.size();
+            fresh.candles_not_persisted = m_state.candles_not_persisted;
             std::swap(m_state, fresh);
             m_early.clear();
             m_early_dropped = 0;
