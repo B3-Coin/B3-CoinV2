@@ -95,7 +95,9 @@ auction existed between them; anything else is a gap.
   counted. The stored candle of that bucket stays as it was at the last
   successful flush, or is absent, as after a crash; the sequence gap to the
   next stored candle shows it. A crash loses at most the unflushed second (a
-  gap).
+  gap). A failed write is a gap too: the times stay in memory and the next
+  flush writes again; each market's first failed write is logged as a
+  warning, later ones only with `-debug=net`.
 - At start, after the production store replays, the market **queues** its
   history and goes on at once. The thread then loads it, before it writes any
   row of that market: rows at or after the store's next sequence are erased,

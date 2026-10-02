@@ -10,6 +10,7 @@
 
 #include <dbwrapper.h>
 #include <serialize.h>
+#include <test/util/logging.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
 
@@ -799,6 +800,47 @@ BOOST_AUTO_TEST_CASE(flush_failure_sets_persisted_false)
     store.SetFlushHookForTest({});
     store.FlushNow(false);
     BOOST_CHECK(log->GetSummary().persisted);
+}
+
+// A market's first failed write is a warning naming it; a broken disk fails
+// every pass, so its later failures are debug only. Each market is warned
+// once.
+BOOST_AUTO_TEST_CASE(a_markets_first_failed_write_is_one_warning)
+{
+    FakeClocks clocks;
+    FlowMeshObservedTimeStore store{Options(m_path_root / "observed_fail_warning")};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    const auto other{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, OTHER_MARKET, clocks.Get())};
+    store.Attach(log, 0, {});
+    store.Attach(other, 0, {});
+    store.FlushNow(false);
+    std::map<std::string, int> warnings;
+    {
+        DebugLogHelper counter{"observed times could not be written", [&](const std::string* line) {
+            for (const auto& market : {MARKET, OTHER_MARKET}) {
+                if (line && line->find(market.GetHex()) != std::string::npos) ++warnings[market.GetHex()];
+            }
+            return false;
+        }};
+        store.SetFlushHookForTest([] { throw std::runtime_error{"disk"}; });
+        for (uint64_t i{0}; i < 3; ++i) {
+            clocks.Advance(1'000);
+            log->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i));
+            other->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i));
+            store.FlushNow(false);
+            BOOST_CHECK(!log->GetSummary().persisted);
+            BOOST_CHECK(!other->GetSummary().persisted);
+        }
+        store.SetFlushHookForTest({});
+    }
+    BOOST_CHECK_EQUAL(warnings[MARKET.GetHex()], 1);
+    BOOST_CHECK_EQUAL(warnings[OTHER_MARKET.GetHex()], 1);
+    log->Record(3, EntryHash(3), ObservedDelay::NONE, Tick(3));
+    store.FlushNow(false);
+    BOOST_CHECK(log->GetSummary().persisted);
+    store.Stop();
 }
 
 BOOST_AUTO_TEST_CASE(stop_syncs_an_already_flushed_tail)

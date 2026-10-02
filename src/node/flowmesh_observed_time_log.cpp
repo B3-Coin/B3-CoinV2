@@ -841,8 +841,17 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
                 log.SetPersisted(true);
             } catch (const std::exception& e) {
                 // Lost rows become a gap after a restart; the market is
-                // never affected.
-                LogDebug(BCLog::NET, "FlowMesh observed-time flush failed for market %s: %s\n", log.MarketId().GetHex(), e.what());
+                // never affected. Its first failure is a warning; a broken
+                // disk fails every pass, so later ones are debug only.
+                if (!item->write_warned) {
+                    item->write_warned = true;
+                    LogWarning("FlowMesh market %s: observed times could not be written (%s); they are kept in memory, the "
+                               "unwritten ones are a gap after a restart, and each flush writes again (later failures are "
+                               "logged with -debug=net)\n",
+                               log.MarketId().GetHex(), e.what());
+                } else {
+                    LogDebug(BCLog::NET, "FlowMesh observed-time flush failed for market %s: %s\n", log.MarketId().GetHex(), e.what());
+                }
                 log.SetPersisted(false);
             }
         }

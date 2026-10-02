@@ -333,6 +333,8 @@ private:
         //! Written under m_mutex by the holder of m_flush_mutex; read under
         //! either.
         bool restored{false};
+        //! A write of this market failed and was logged as a warning (once).
+        bool write_warned{false};
     };
     void FlushLoop();
     //! One attempt of a queued load (the body Attach ran before queueing).
