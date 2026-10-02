@@ -1139,9 +1139,9 @@ BOOST_AUTO_TEST_CASE(hash_mismatch_wipe_preserves_new_history_on_next_restart)
         std::string error;
         BOOST_REQUIRE(store.Open(error));
         const auto log{MakeLog(clocks)};
-        store.Attach(log, 13, Known(12, 1));
+        store.Attach(log, 13, Known(12, 13));
         store.FlushNow(false);
-        const auto rows{log->Lookup(Known(12, 1))};
+        const auto rows{log->Lookup(Known(12, 13))};
         BOOST_REQUIRE_EQUAL(rows.size(), 1U);
         BOOST_CHECK_EQUAL(rows.front().sequence, 12U);
         BOOST_CHECK(!store.ReadCandles(MARKET, CandleInterval::M1, T0, T0 + 180'000, 10).empty());
