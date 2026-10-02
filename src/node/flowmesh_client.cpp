@@ -82,6 +82,8 @@ static_assert(CLIENT_ACTION_OUTCOME_MAX_REPLY <= CLIENT_MAX_REPLY);
 constexpr size_t CLIENT_OUTCOME_EVIDENCE_MAX_REPLY{2 * flowmesh::FLOWMESH_OUTCOME_EVIDENCE_MAX_BYTES + 4096};
 // A 'candles' page: at most 500 candles of a few hundred bytes.
 constexpr size_t CLIENT_CANDLES_MAX_REPLY{1024 * 1024};
+// One held newest candle per cached market and interval.
+constexpr size_t CLIENT_MAX_HELD_CANDLES{CLIENT_MAX_CACHED_MARKETS * flowmesh::CANDLE_INTERVALS.size()};
 // A waited submission's reply: its acknowledgement plus one (opt-in) 'action' reply.
 constexpr size_t CLIENT_SUBMIT_WAIT_MAX_REPLY{CLIENT_ACTION_OUTCOME_MAX_REPLY + 64 * 1024};
 static_assert(CLIENT_SUBMIT_WAIT_MAX_REPLY <= CLIENT_MAX_REPLY);
@@ -586,11 +588,13 @@ class TradingApi {
         return ++bucket.second <= FLOWMESH_API_CANDLES_PER_CLIENT_PER_SECOND;
     }
     //! A public reply's observed times: labelled as this endpoint's, with
-    //! only the clock flags (never a delay reason or anything seat-related).
+    //! only the clock flags (never a delay reason or anything seat-related)
+    //! and without this node's storage detail.
     static void PublicObservedTimes(flowmesh::MarketData& data)
     {
         if (!data.observed) return;
         data.observed->source = "endpoint_operator";
+        data.observed->storage.reset();
         for (auto& row : data.observed->rows) {
             row.flags &= flowmesh::OBSERVED_PUBLIC_FLAGS;
             row.delay = flowmesh::ObservedDelay::NONE;
@@ -1347,6 +1351,16 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     std::mutex m_display_lane;
     FlowMeshHttpsClient m_display_https;
     std::atomic<bool> m_display_reset{false};
+    // Under m_display_lane only, never under m_work alone: per (market,
+    // interval), the newest candle of the latest page read from that
+    // endpoint, the only bucket that can still grow. It stands in for a later
+    // page's first held-back bucket once a verified head reaches it. At most
+    // CLIENT_MAX_HELD_CANDLES; cleared with the lane's connection.
+    struct HeldCandle {
+        size_t endpoint;
+        flowmesh::ObservedCandle candle;
+    };
+    std::map<std::pair<uint256, flowmesh::CandleInterval>, HeldCandle> m_held_candles;
     // Never acquire m_work from a wallet metadata lookup: it covers HTTPS.
     mutable std::mutex m_metadata_mutex;
     FlowMeshAssetMetadataCatalog m_metadata;
@@ -3229,7 +3243,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // target and charge one automatic attempt, and again to apply the reply by
     // QueryAction's rules, never across the network wait. It never sends or
     // signs, and a receipt verified meanwhile is returned unchanged. nullopt
-    // means nothing was applied; the caller then takes the ordinary path. A
+    // means nothing was applied; ActionStatus then takes the ordinary path,
+    // while Submit's chained read just returns its submission receipt. A
     // reply applied whose outbox save then failed is returned as the ordinary
     // refresh would return it: unverified, with the failure as its reason.
     //
@@ -3285,8 +3300,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             if (std::chrono::steady_clock::now() < m_retry_after.at(endpoint)) { outcome("cooldown"); return std::nullopt; }
             if (m_wait_unanswered.at(endpoint)) { outcome("unanswered"); return std::nullopt; }
             // Do not let this opportunistic lane bypass queued status work.
-            // Refusal falls through to the ordinary FIFO path in the same
-            // ActionStatus call, which still returns only this action's receipt.
+            // From ActionStatus, refusal falls through to the ordinary FIFO
+            // path in the same call, which still returns only this action's
+            // receipt. Submit's chained read has no such fallback.
             if (!m_action_polls.TryChargeUnqueuedAttempt(std::chrono::steady_clock::now())) { outcome("coalesced"); return std::nullopt; }
             target = m_endpoints.at(endpoint);
             with_outcome = m_action_outcome.at(endpoint);
@@ -3568,23 +3584,33 @@ public:
     }
     /** The endpoint serving this market's data, asked for one page of its
      * observed-time candles, only when it advertises them. Endpoint-reported
-     * display data: only the page's structure and that no candle goes past
-     * a head this client verified are checked. The work gate is not held
-     * across the candles HTTPS request; a busy candles lane fails at once.
-     * A page ahead of the held head still needs the ordinary verified
-     * refresh below, which holds m_work and may delay a concurrent order.
+     * display data: only the page's structure is checked (a malformed page
+     * is refused), and the page is bounded to a head this client verified:
+     * candles ending past it are held back, never refused (below). Display
+     * work: the work gate is taken only briefly and passively, without I/O,
+     * to read the endpoint and the verified head before the request and to
+     * withdraw a stale candles advertisement after it, never across the
+     * request (it has its own lane and connection; a busy lane fails at
+     * once). Nothing here refreshes the head, verifies certificates or
+     * writes durable state. So an order never waits for a candles page
+     * beyond those reads.
      *
-     * The endpoint's forming candle ends at its own head, which on an
-     * active market is nearly always past the head this client verified
-     * before the request. Such a page is checked against a consistent head:
-     * the endpoint's current head, verified after the page was served (an
-     * ordinary Refresh, as a market-data read makes). A page that still goes
-     * past it, or an endpoint that changed meanwhile, is refused. */
+     * The endpoint's forming candle ends at its own head, which on an active
+     * market is nearly always past the head this client verified before the
+     * request. That head bounds the page: candles ending past it are held
+     * back and before_ms then ends before them. The first held-back bucket
+     * may be this client's previous view of it (the newest candle of the
+     * latest page from that endpoint, held per market and interval) once that
+     * view ends within the head; Qt continues it with the held ticks. The
+     * next market-data read moves the head. */
     std::optional<flowmesh::ObservedCandlePage> Candles(const uint256& id, const flowmesh::CandleInterval interval,
                                                         const std::optional<int64_t> before_ms, const size_t limit,
                                                         std::string& error) override
     {
         FlowMeshTimingSpan timing{"client_candles"};
+        // Display work, whoever asks: never ahead of queued trading work and
+        // never reserving the gate after it (no linger window).
+        const FlowMeshClientWorkScope display{FlowMeshClientWorkPriority::PASSIVE, FlowMeshClientWorkLinger::NONE};
         std::unique_lock lane{m_display_lane, std::try_to_lock};
         if (!lane.owns_lock()) {
             error = "A candles read is already in progress";
@@ -3616,12 +3642,17 @@ public:
         UniValue params{UniValue::VOBJ};
         params.pushKV("market_id", id.GetHex());
         params.pushKV("interval", flowmesh::CandleIntervalName(interval));
-        if (before_ms) params.pushKV("before_ms", *before_ms);
+        // Never a window past the display bound: an endpoint echoing one
+        // back would be refused.
+        if (before_ms) params.pushKV("before_ms", std::min(*before_ms, flowmesh::OBSERVED_MS_LIMIT));
         params.pushKV("limit", uint64_t{std::clamp<size_t>(limit, 1, advertised)});
         UniValue request{UniValue::VOBJ};
         request.pushKV("method", "candles");
         request.pushKV("params", std::move(params));
-        if (m_display_reset.exchange(false)) m_display_https.Reset();
+        if (m_display_reset.exchange(false)) {
+            m_display_https.Reset();
+            m_held_candles.clear();
+        }
         const auto reply{m_display_https.Request(target, "/flowmesh/v1", request.write(), CLIENT_REQUEST_TIMEOUT, CLIENT_CANDLES_MAX_REPLY)};
         try {
             if (!reply.response_received) Fail(reply.error.empty() ? "No HTTPS response" : reply.error);
@@ -3638,7 +3669,7 @@ public:
                 Fail(text);
             }
             if (reply.status != 200) Fail("Unexpected HTTPS response status");
-            // The structure first; the head is checked below.
+            // The structure first; the head bounds it below.
             auto page{FlowMeshParseObservedCandles(parsed["result"], interval, std::numeric_limits<uint64_t>::max(), error)};
             if (!page) {
                 m_display_https.Reset();
@@ -3646,44 +3677,28 @@ public:
             }
             page->remote = true;
             page->source = target.url;
-            const uint64_t newest{page->candles.empty() ? 0 : page->candles.back().last_sequence};
-            if (newest > head_sequence) {
-                timing.Field("head_refresh", uint64_t{1});
-                if (!ConsistentCandlesHead(id, endpoint, newest, error)) return std::nullopt;
+            const std::optional<flowmesh::ObservedCandle> served_newest{
+                page->candles.empty() ? std::nullopt : std::optional{page->candles.back()}};
+            const std::pair key{id, interval};
+            const auto stored{m_held_candles.find(key)};
+            const bool same_endpoint{stored != m_held_candles.end() && stored->second.endpoint == endpoint};
+            const auto hold{FlowMeshHoldBackObservedCandles(*page, head_sequence,
+                                                            same_endpoint ? std::optional{stored->second.candle} : std::nullopt)};
+            if (hold.held_back > 0) {
+                timing.Field("held_back", uint64_t{hold.held_back});
+                timing.Field("substituted", uint64_t{hold.substituted});
+            }
+            // The page's own newest view, as served: an older page (with
+            // before_ms) never replaces a newer one of the same endpoint.
+            if (served_newest && (!same_endpoint || !before_ms || served_newest->open_ms >= stored->second.candle.open_ms)) {
+                if (stored == m_held_candles.end() && m_held_candles.size() >= CLIENT_MAX_HELD_CANDLES) m_held_candles.erase(m_held_candles.begin());
+                m_held_candles.insert_or_assign(key, HeldCandle{endpoint, *served_newest});
             }
             return page;
         } catch (const std::exception& e) {
             m_display_https.Reset();
             error = e.what();
             return std::nullopt;
-        }
-    }
-    /** Under m_work: a page whose newest candle ends at `newest`, from
-     * `endpoint`, is consistent with a head this client verified. The page
-     * was served before this call, so an honest endpoint's head now is at or
-     * past it; a head refresh verifies that head (with its ticks and their
-     * observed times, as the caller's next market-data read would). */
-    bool ConsistentCandlesHead(const uint256& id, const size_t endpoint, const uint64_t newest, std::string& error)
-    {
-        WorkLock lock{*this};
-        try {
-            const auto held = [&]() -> const Cache& {
-                const auto it{m_cache.find(id)};
-                if (it == m_cache.end()) Fail("Read this market's data before its candles");
-                if (it->second.endpoint != endpoint) Fail("The market's endpoint changed during the candles read");
-                return it->second;
-            };
-            if (held().verified.certified.entry.sequence >= newest) return true;
-            auto ticks{TicksAfterRing(id)};
-            ticks.observed = true;
-            auto& cache{Refresh(id, held().account_scope, flowmesh::MarketDataQuery{}, &ticks)};
-            MergeTicks(id, cache, ticks);
-            // The endpoint cannot prove a head its own candles reach.
-            if (held().verified.certified.entry.sequence < newest) Fail("endpoint_candles_rejected: a candle goes past the endpoint's verified head");
-            return true;
-        } catch (const std::exception& e) {
-            error = e.what();
-            return false;
         }
     }
     std::optional<flowmesh::MarketData> Watch(const uint256& id, const std::optional<uint256>& account,
@@ -3942,6 +3957,12 @@ public:
         // At most one bounded waited read of the action just delivered: what
         // a caller's getflowmeshactionstatus(wait_ms) right after this call
         // would send, without that caller's turnaround. It never resends.
+        // Unlike ActionStatus, there is no ordinary-path fallback here: when
+        // the read yields (queued status demand, a busy lane, cooldown, no
+        // advertised wait) or applies nothing, the submission receipt above
+        // is returned as it is, no status demand is queued and no queued
+        // demand is served. Its status is left to the caller's next
+        // ActionStatus read.
         if (chain && out.state != "rejected" && !out.certificate_verified) {
             if (auto waited{WaitedActionStatus(market, action.Id(), wait)}) return std::move(*waited);
         }

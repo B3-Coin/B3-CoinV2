@@ -125,20 +125,24 @@ public:
     using Changes = std::vector<std::pair<CandleInterval, ObservedCandle>>;
     /** Adds the next stamp; a sequence at or before the last one added is
      * ignored. `tick` must be that entry's own clearing (same sequence and
-     * hash), else the entry counts without a price. `changed`, when given,
-     * receives every candle this call created or changed. */
+     * hash), else the entry counts without a price. A time at or past
+     * OBSERVED_MS_LIMIT counts as no time (as an UNTIMED entry). `changed`,
+     * when given, receives every candle this call created or changed. */
     void Add(const ObservedStamp& stamp, const std::optional<ClearingTick>& tick, Changes* changed = nullptr);
 
     //! Replaces one interval's held candles (ascending opens), trimmed to
-    //! its memory window.
+    //! its memory window. A candle whose open is out of range
+    //! (ObservedTimeInRange) or not aligned to the interval is dropped.
     void Restore(CandleInterval interval, std::vector<ObservedCandle> candles);
     //! The continuity reloaded with them: the last stamp's sequence and the
-    //! last LIVE time of a contiguous run ending there.
+    //! last LIVE time of a contiguous run ending there (dropped when out of
+    //! range).
     void RestoreLast(std::optional<uint64_t> last_sequence, std::optional<int64_t> last_live_ms);
 
     /** The held candles with open in [before - limit x interval, before),
-     * before = `before_ms` or just past the newest candle. `more` when
-     * older candles are held. `limit` is clamped to 1..OBSERVED_CANDLE_PAGE_MAX. */
+     * before = `before_ms` (clamped to 0..OBSERVED_MS_LIMIT) or just past
+     * the newest candle. `more` when older candles are held. `limit` is
+     * clamped to 1..OBSERVED_CANDLE_PAGE_MAX. */
     ObservedCandlePage Page(CandleInterval interval, std::optional<int64_t> before_ms, size_t limit) const;
     const std::deque<ObservedCandle>& Candles(CandleInterval interval) const;
     std::optional<uint64_t> LastSequence() const { return m_last_sequence; }

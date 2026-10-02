@@ -1292,7 +1292,7 @@ RPCHelpMan getflowmeshmarketdata()
             {T::OBJ, "book_levels", /*optional=*/true, "Present only when levels was given and the head changed (or include_unchanged). NOT certified: price levels this node aggregated from every verified standing curve; actions not yet certified are excluded. Not a price-time order book: each level is the quantity of standing curves whose own limit lies in its price range", BookLevelsResultFields()},
             {T::OBJ, "observed_time", /*optional=*/true, "Present only when observed_time was true: operator-observed time, when the source applied each entry by its own clock; never certified execution time", {
                 {T::BOOL, "available", "The source records observed times"},
-                {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, endpoint_does_not_advertise_observed_time, observed_time_withdrawn or malformed"},
+                {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, observed_time_loading (the market's history is still loading after a start; retry), endpoint_does_not_advertise_observed_time, observed_time_withdrawn or malformed"},
                 {T::STR, "source", "this_node, or the endpoint URL that reported them"},
                 {T::STR, "source_kind", "operator_observed"},
                 {T::BOOL, "certified", "Always false"},
@@ -1310,6 +1310,11 @@ RPCHelpMan getflowmeshmarketdata()
                         }},
                         {T::STR, "delay_reason", /*optional=*/true, "Why this node applied it late: catchup, deferred, behind, stale_anchor, warmup or clock_stepped_back (peer_hint only on a row an earlier development build recorded)"},
                     }},
+                }},
+                {T::OBJ, "storage", /*optional=*/true, "This node's own section only (operator detail; never in a public reply or from an endpoint): how its observed-time database keeps these times", {
+                    {T::BOOL, "persisted", "False after a failed write or history load attempt; false until restart once the market's disk history was given up (its times are then kept in memory only, from recorded_since_sequence)"},
+                    {T::NUM, "rows_not_persisted", "Entries whose times were dropped from persistence before any write: a gap after a restart (a failed write shows only in persisted)"},
+                    {T::NUM, "candles_not_persisted", "Candle snapshots dropped from persistence before any write: the stored candle keeps its last written state"},
                 }},
             }},
             {T::OBJ, "watch", /*optional=*/true, "Present only when watch_ms was given: this read's local latency observation, never evidence", {
@@ -1486,13 +1491,15 @@ RPCHelpMan getflowmeshcandles()
             {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Market id"},
             {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Page options", {
                 {"interval", RPCArg::Type::STR, RPCArg::Default{"1m"}, "1m, 5m, 15m, 1h, 4h or 1d"},
-                {"before_ms", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Exclusive end of the window in Unix milliseconds; omit for the newest"},
+                {"before_ms", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Exclusive end of the window in Unix milliseconds; omit for the newest. A value past 253402300800000 (10000-01-01T00:00:00Z), up to 9223372036854775807, is clamped to it (every observed time is before it); a value above 9223372036854775807 is refused as out of range"},
                 {"limit", RPCArg::Type::NUM, RPCArg::Default{200}, "Window length in intervals, 1-500"},
             }},
         },
-        RPCResult{T::OBJ, "", "Candles in the window [before_ms - limit x interval, before_ms), oldest first", {
+        RPCResult{T::OBJ, "", "Candles in the window [from_ms, before_ms), oldest first. From a remote endpoint, buckets ending past the head "
+                              "this client verified are held back (it is never refreshed for this page) and before_ms then ends before them; the "
+                              "newest bucket shown may be this client's earlier view of the first one held back. A market-data read moves that head", {
             {T::BOOL, "available", "The source records observed time"},
-            {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, endpoint_does_not_advertise_candles, or why the endpoint's page was refused"},
+            {T::STR, "unavailable_reason", /*optional=*/true, "not_recorded_by_this_node, observed_time_loading (the market's history is still loading after a start; retry), observed_time_disk_unavailable (the window reaches before the memory window and this node's observed-time database could not be read; never served as the memory part alone), endpoint_does_not_advertise_candles, or why the endpoint's page was refused"},
             {T::STR, "source", "this_node, or the endpoint URL that reported them"},
             {T::STR, "source_kind", "operator_observed"},
             {T::BOOL, "certified", "Always false"},
@@ -1500,7 +1507,7 @@ RPCHelpMan getflowmeshcandles()
             {T::STR, "interval", "The interval"},
             {T::NUM, "interval_ms", "Its length in milliseconds"},
             {T::NUM, "from_ms", "Inclusive start of the window"},
-            {T::NUM, "before_ms", "Exclusive end of the window"},
+            {T::NUM, "before_ms", "Exclusive end of the window; from a remote endpoint, lowered by whole intervals to leave out held-back buckets"},
             {T::BOOL, "more", "Older candles exist: continue with before_ms = from_ms"},
             {T::ARR, "candles", "Only buckets holding placed entries", {
                 {T::OBJ, "", "One bucket", {
@@ -1553,7 +1560,10 @@ RPCHelpMan getflowmeshcandles()
                     if (out < minimum || out > maximum) throw JSONRPCError(RPC_INVALID_PARAMETER, std::string{name} + " is outside its supported range");
                     return out;
                 };
-                if (options.exists("before_ms")) before_ms = static_cast<int64_t>(number("before_ms", 0, std::numeric_limits<int64_t>::max()));
+                // Up to INT64_MAX clamped, not refused: no observed time is at
+                // or past the display bound, and the reply's window never ends
+                // past it. Above INT64_MAX, number() refuses it as out of range.
+                if (options.exists("before_ms")) before_ms = std::min(static_cast<int64_t>(number("before_ms", 0, std::numeric_limits<int64_t>::max())), flowmesh::OBSERVED_MS_LIMIT);
                 if (options.exists("limit")) limit = number("limit", 1, 500);
             }
             std::string error;

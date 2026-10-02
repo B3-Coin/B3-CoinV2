@@ -15,7 +15,6 @@
 #include <QToolTip>
 #include <algorithm>
 #include <cmath>
-#include <limits>
 
 using namespace B3FlowMeshMarketData;
 B3FlowMeshChart::B3FlowMeshChart(QWidget* parent) : QWidget{parent} { setMouseTracking(true); setMinimumHeight(280); setObjectName(QStringLiteral("certifiedAuctionChart")); }
@@ -38,24 +37,21 @@ void B3FlowMeshChart::setSnapshot(const std::optional<Snapshot>& s)
 void B3FlowMeshChart::setMode(Mode mode) { if (m_mode == mode) return; m_mode = mode; update(); }
 namespace {
 constexpr double MIN_TIME_SLOTS{10}, MAX_TIME_SLOTS{500}, DEFAULT_TIME_SLOTS{60};
-int64_t BoundedTimeOpen(const long double ms, const flowmesh::CandleInterval interval)
-{
-    if (ms <= 0) return 0;
-    const int64_t maximum{flowmesh::CandleOpenMs(std::numeric_limits<int64_t>::max(), interval)};
-    if (ms >= static_cast<long double>(maximum)) return maximum;
-    return flowmesh::CandleOpenMs(static_cast<int64_t>(ms), interval);
-}
-int64_t ShiftTimeBuckets(const int64_t right, const double slots, const flowmesh::CandleInterval interval)
+//! One pan or drag moves at most this many buckets: with every bucket at or
+//! below LastOpen, the window arithmetic then stays far inside int64.
+constexpr double MAX_PAN_SLOTS{10'000'000};
+//! The newest bucket start any view may show (OBSERVED_MS_LIMIT - interval).
+int64_t LastOpen(const flowmesh::CandleInterval interval) { return flowmesh::CandleOpenMs(flowmesh::OBSERVED_MS_LIMIT - 1, interval); }
+//! Candles the time axis can draw: bucket starts in range, aligned and
+//! strictly ascending, as every parser and the rollup produce them.
+bool DrawableCandles(const std::vector<flowmesh::ObservedCandle>& candles, const flowmesh::CandleInterval interval)
 {
     const int64_t step{flowmesh::CandleIntervalMs(interval)};
-    const int64_t maximum{flowmesh::CandleOpenMs(std::numeric_limits<int64_t>::max(), interval)};
-    const int64_t maximum_slots{maximum / step};
-    const long double rounded{std::round(static_cast<long double>(slots))};
-    if (rounded >= static_cast<long double>(maximum_slots)) return 0;
-    if (rounded <= -static_cast<long double>(maximum_slots)) return maximum;
-    const int64_t shift{static_cast<int64_t>(rounded) * step};
-    if (shift >= 0) return shift >= right ? 0 : right - shift;
-    return right >= maximum + shift ? maximum : right - shift;
+    for (size_t i{0}; i < candles.size(); ++i) {
+        const int64_t open{candles[i].open_ms};
+        if (!flowmesh::ObservedTimeInRange(open) || open % step != 0 || (i > 0 && open <= candles[i - 1].open_ms)) return false;
+    }
+    return true;
 }
 QString Host(const QString& source)
 {
@@ -65,6 +61,12 @@ QString Host(const QString& source)
 } // namespace
 void B3FlowMeshChart::setTimeSeries(TimeSeries series)
 {
+    // Defence in depth: the parsers and the rollup never produce these, and
+    // the window arithmetic below relies on it.
+    if (!DrawableCandles(series.candles, series.interval)) {
+        series.candles.clear();
+        series.reason = QStringLiteral("malformed");
+    }
     if (m_time == series) return;
     // Another interval, source or mode starts at the newest candle again.
     if (m_time.interval != series.interval || m_time.source != series.source || m_time.available != series.available) {
@@ -74,8 +76,9 @@ void B3FlowMeshChart::setTimeSeries(TimeSeries series)
     m_time = std::move(series);
     update();
 }
-void B3FlowMeshChart::setNowMs(const int64_t now_ms)
+void B3FlowMeshChart::setNowMs(int64_t now_ms)
 {
+    now_ms = std::clamp<int64_t>(now_ms, 0, flowmesh::OBSERVED_MS_LIMIT - 1);
     const auto interval{m_time.interval};
     const bool same_bucket{flowmesh::CandleOpenMs(now_ms, interval) == flowmesh::CandleOpenMs(m_now_ms, interval)};
     m_now_ms = now_ms;
@@ -103,27 +106,32 @@ std::pair<int64_t, int64_t> B3FlowMeshChart::timeWindow() const
 }
 void B3FlowMeshChart::zoomTime(const double factor, const double anchor_fraction)
 {
+    // std::clamp keeps a NaN and llround of one is unspecified.
     if (!std::isfinite(factor) || factor <= 0 || !std::isfinite(anchor_fraction)) return;
     const int64_t step{flowmesh::CandleIntervalMs(m_time.interval)};
     const auto [left, right]{timeWindow()};
     const double anchor{std::clamp(anchor_fraction, 0.0, 1.0)};
+    const double anchor_bucket{static_cast<double>(left) + anchor * static_cast<double>(right - left)};
     const double slots{std::clamp(m_time_slots / factor, MIN_TIME_SLOTS, MAX_TIME_SLOTS)};
     if (slots == m_time_slots) return;
     m_time_slots = slots;
     if (anchor < 1.0 || m_time_right) {
-        const long double offset{(1.0L - anchor) * ((slots - 1) * static_cast<long double>(step) - (right - left))};
-        m_time_right = BoundedTimeOpen(static_cast<long double>(right) + offset + step / 2, m_time.interval);
+        const int64_t last_open{LastOpen(m_time.interval)};
+        const double new_right{std::clamp(anchor_bucket + (1.0 - anchor) * (slots - 1) * static_cast<double>(step),
+                                          0.0, static_cast<double>(last_open))};
+        m_time_right = std::min(flowmesh::CandleOpenMs(static_cast<int64_t>(std::llround(new_right)) + step / 2, m_time.interval), last_open);
     }
     update();
 }
 void B3FlowMeshChart::panTime(const double slots)
 {
     if (!std::isfinite(slots)) return;
-    const int64_t right{ShiftTimeBuckets(timeRight(), slots, m_time.interval)};
+    const int64_t step{flowmesh::CandleIntervalMs(m_time.interval)};
+    const int64_t right{timeRight() - static_cast<int64_t>(std::llround(std::clamp(slots, -MAX_PAN_SLOTS, MAX_PAN_SLOTS))) * step};
     // Reaching the newest bucket again follows the tail.
     m_time_right.reset();
     const int64_t tail{timeRight()};
-    if (right < tail) m_time_right = std::max<int64_t>(0, right);
+    if (right < tail) m_time_right = std::clamp<int64_t>(right, 0, LastOpen(m_time.interval));
     update();
 }
 void B3FlowMeshChart::resetTimeView()
@@ -131,6 +139,19 @@ void B3FlowMeshChart::resetTimeView()
     m_time_right.reset();
     m_time_slots = DEFAULT_TIME_SLOTS;
     update();
+}
+std::vector<int64_t> B3FlowMeshChart::AxisLabelOpens(const int64_t left, const int64_t right, const int64_t label_step, const size_t max_labels)
+{
+    std::vector<int64_t> out;
+    if (label_step <= 0 || left < 0 || right < left) return out;
+    // `open` never passes `right`, so no addition can overflow, and at most
+    // max_labels are returned whatever the window holds.
+    for (int64_t open{left - left % label_step}; out.size() < max_labels;) {
+        if (open >= left) out.push_back(open);
+        if (right - open < label_step) break;
+        open += label_step;
+    }
+    return out;
 }
 QString B3FlowMeshChart::TimeAxisLabel(const int64_t open_ms, const flowmesh::CandleInterval interval)
 {
@@ -265,12 +286,17 @@ void B3FlowMeshChart::mouseMoveEvent(QMouseEvent* e)
     if (m_dragging && timeMode()) {
         const double slot_width{std::max(1.0, (width() - 116.0) / std::max(1.0, m_time_slots))};
         const double slots{(m_pointer.x() - m_drag_origin.x()) / slot_width};
-        if (!std::isfinite(slots)) return;
-        m_time_right = ShiftTimeBuckets(m_drag_right, slots, m_time.interval);
-        // Past the newest bucket: follow the tail again.
-        const auto chosen{m_time_right};
-        m_time_right.reset();
-        if (*chosen < timeRight()) m_time_right = chosen;
+        const int64_t step{flowmesh::CandleIntervalMs(m_time.interval)};
+        // Bounded (a non-finite move changes nothing): every chosen bucket
+        // stays in [0, LastOpen].
+        if (std::isfinite(slots)) {
+            const int64_t moved{static_cast<int64_t>(std::llround(std::clamp(slots, -MAX_PAN_SLOTS, MAX_PAN_SLOTS))) * step};
+            m_time_right = std::clamp<int64_t>(m_drag_right - moved, 0, LastOpen(m_time.interval));
+            // Past the newest bucket: follow the tail again.
+            const auto chosen{m_time_right};
+            m_time_right.reset();
+            if (*chosen < timeRight()) m_time_right = chosen;
+        }
     }
     update();
 }
@@ -556,14 +582,7 @@ void B3FlowMeshChart::paintTime(QPainter& p, const QRectF& plot, const int axis_
     }
     // UTC axis: a label every k buckets, k keeping labels about 72 px apart.
     const int64_t every{std::max<int64_t>(1, static_cast<int64_t>(std::ceil(72.0 / std::max<qreal>(slot_width, 0.1))))};
-    const int64_t label_step{every * step};
-    const int64_t first_label{left - left % label_step};
-    // Count only labels in this bounded window; advancing after the final
-    // one could overflow for an endpoint's representable far-future time.
-    const int64_t label_count{(right - first_label) / label_step + 1};
-    for (int64_t i{0}; i < label_count; ++i) {
-        const int64_t open{first_label + i * label_step};
-        if (open < left) continue;
+    for (const int64_t open : AxisLabelOpens(left, right, every * step, static_cast<size_t>(plot.width() / 72.0) + 2)) {
         const qreal at{x(open)};
         p.setPen(B3Theme::kBorder);
         p.drawLine(QPointF{at, plot.bottom()}, QPointF{at, plot.bottom() + 3});

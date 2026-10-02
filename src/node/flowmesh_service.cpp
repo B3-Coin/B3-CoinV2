@@ -1657,7 +1657,7 @@ bool FlowMeshService::Impl::InstallMarket(
         std::vector<std::pair<uint64_t, uint256>> known;
         const auto retained{store->ReadClearingTicks({std::nullopt, flowmesh::MARKET_DATA_MAX_TICKS})};
         for (const auto& tick : retained.ticks) known.emplace_back(tick.sequence, tick.microblock_hash);
-        observed_store->AttachAsync(observed, marker->next_sequence, std::move(known));
+        observed_store->Attach(observed, marker->next_sequence, std::move(known));
         std::lock_guard<std::mutex> lock{mutex};
         resources->observed = observed;
     }
@@ -1955,12 +1955,10 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
     config.cancel_delivery = [impl = m_impl.get()](uint64_t delivery_id) {
         impl->CancelDelivery(delivery_id);
     };
-    {
-        // Display only: an unusable database leaves observed time in memory.
-        std::string observed_error;
-        m_impl->observed_store->Open(observed_error);
-        m_impl->observed_store->Start();
-    }
+    // Display only: the store's own thread opens its database (an unusable
+    // one leaves observed time in memory), never this start path, which
+    // holds the B3 reconciliation gate closed.
+    m_impl->observed_store->Start();
     auto runtime{std::make_shared<FlowMeshRuntime>(
         std::move(config), std::vector<FlowMeshRuntimeMarketConfig>{})};
     if (!runtime->Start(error)) {
@@ -2272,14 +2270,26 @@ std::optional<flowmesh::ObservedCandlePage> FlowMeshService::ObservedCandles(
     }
     auto page{log->Candles(interval, before_ms, limit)};
     page.source = "this_node";
-    if (!allow_disk) return page;
+    // Unavailable while the market's history loads: never disk candles
+    // under a page that lacks the memory window.
+    if (!page.available || !allow_disk) return page;
     // The window reaches before the memory window: the database holds the
     // older candles (the memory window is always the newest).
     const auto oldest{log->OldestMemoryOpen(interval)};
     if (oldest && page.from_ms >= *oldest) return page;
     const int64_t disk_before{oldest ? std::min(page.before_ms, *oldest) : page.before_ms};
-    bool older{false};
-    auto disk{m_impl->observed_store->ReadCandles(market_id, interval, page.from_ms, disk_before, limit, &older)};
+    bool older{false}, failed{false};
+    auto disk{m_impl->observed_store->ReadCandles(market_id, interval, page.from_ms, disk_before, limit, &older, &failed)};
+    if (failed) {
+        // The window needs the database and it could not be read: never the
+        // memory part alone as if nothing older existed (a chart would hold
+        // it as the whole window).
+        page.available = false;
+        page.unavailable_reason = FlowMeshObservedTimeStore::READ_FAILED_REASON;
+        page.candles.clear();
+        page.more = false;
+        return page;
+    }
     for (auto& candle : page.candles) {
         if (disk.empty() || candle.open_ms > disk.back().open_ms) disk.push_back(std::move(candle));
     }
@@ -2549,6 +2559,11 @@ FlowMeshSeatKeyStatus FlowMeshService::SeatKeyStatus() const
 uint64_t FlowMeshService::ClientOutcomeReadsForTest() const
 {
     return m_impl->client_outcome_reads.load(std::memory_order_relaxed);
+}
+
+FlowMeshObservedTimeStore& FlowMeshService::ObservedTimeStoreForTest() const
+{
+    return *m_impl->observed_store;
 }
 
 FlowMeshServiceMemoCounts FlowMeshService::MemoCountsForTest() const

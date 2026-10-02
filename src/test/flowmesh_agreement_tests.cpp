@@ -1106,4 +1106,95 @@ BOOST_AUTO_TEST_CASE(accepted_proposal_is_written_with_the_first_vote_that_depen
     BOOST_CHECK(!restarted.Halted());
 }
 
+// A validator reaches the same deferred write as a keyless observer. After it
+// moves views its VIEW_CHANGE is already signed, so an old-view proposal is
+// only folded into the slot and Sign returns the existing record without a
+// write. A failure of the final flush must fail Receive, so the caller does
+// not relay the proposal from an engine that is already halted.
+BOOST_AUTO_TEST_CASE(final_deferred_flush_failure_refuses_keyed_old_view_receive)
+{
+    const AgreementFixture f;
+    const fs::path path{m_args.GetDataDirBase() / "agreement-final-flush-failure-keyed"};
+    std::string error;
+    bool available{true};
+    std::vector<AgreementMessage> output;
+    {
+        bool armed{false};
+        size_t failed_writes{0};
+        auto callbacks{f.Callbacks(8, output, available)};
+        callbacks.crash = [&](const auto point) {
+            if (armed && point == node::FlowMeshAgreementCrashPoint::BEFORE_PUBLIC_RETURN_PERSIST) {
+                ++failed_writes;
+                throw dbwrapper_error("injected final agreement journal write failure");
+            }
+        };
+        node::FlowMeshAgreement engine{DBParams{.path = path, .cache_bytes = 1 << 20}, std::move(callbacks)};
+        BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+        BOOST_REQUIRE(engine.Receive(f.Report(0, 4), error));
+        BOOST_REQUIRE(engine.Receive(f.Report(1, 4), error));
+        BOOST_REQUIRE(engine.Receive(f.Report(2, 4), error));
+        BOOST_REQUIRE_EQUAL(engine.View(), 4U);
+        const size_t published{output.size()};
+        // Seat 8's VIEW_CHANGE is already signed and durable, so the old-view
+        // proposal is only folded; the public return is its only write.
+        armed = true;
+        const bool received{engine.Receive(f.Proposal(f.a), error)};
+        // Exercise the production caller's success-only relay contract.
+        std::vector<AgreementMessage> caller_relays;
+        if (received) caller_relays.push_back(f.Proposal(f.a));
+        BOOST_CHECK(!received);
+        BOOST_CHECK_EQUAL(failed_writes, 1U);
+        BOOST_CHECK(engine.Halted());
+        BOOST_CHECK(error.find("injected final agreement journal write failure") != std::string::npos);
+        BOOST_CHECK_EQUAL(error, engine.LastError());
+        BOOST_CHECK(caller_relays.empty());
+        BOOST_CHECK_EQUAL(output.size(), published);
+    }
+    // The failed batch left the signed view change in place and no proposal
+    // candidate behind it.
+    node::FlowMeshAgreement restarted{DBParams{.path = path, .cache_bytes = 1 << 20}, f.Callbacks(8, output, available)};
+    BOOST_REQUIRE_MESSAGE(restarted.Open(f.context, f.seats, Filled(77), false, error), error);
+    BOOST_CHECK_EQUAL(restarted.View(), 4U);
+    BOOST_CHECK(!restarted.CandidateBytes(f.hash_a));
+}
+
+// SubmitCandidate keeps the same contract. Without a key to propose it, a
+// submitted candidate is only folded into the slot, so a failure of the final
+// flush must return false with the journal error, not success from an engine
+// that is already halted.
+BOOST_AUTO_TEST_CASE(final_deferred_flush_failure_refuses_keyless_candidate_submit)
+{
+    const AgreementFixture f;
+    const fs::path path{m_args.GetDataDirBase() / "agreement-final-flush-failure-submit"};
+    std::string error;
+    bool available{true};
+    std::vector<AgreementMessage> output;
+    const auto keyless = [&] {
+        auto callbacks{f.Callbacks(8, output, available)};
+        callbacks.local_keys = [] { return std::vector<bls::SecretKey>{}; };
+        return callbacks;
+    };
+    {
+        size_t failed_writes{0};
+        auto callbacks{keyless()};
+        callbacks.crash = [&](const auto point) {
+            if (point == node::FlowMeshAgreementCrashPoint::BEFORE_PUBLIC_RETURN_PERSIST) {
+                ++failed_writes;
+                throw dbwrapper_error("injected final agreement journal write failure");
+            }
+        };
+        node::FlowMeshAgreement engine{DBParams{.path = path, .cache_bytes = 1 << 20}, std::move(callbacks)};
+        BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+        BOOST_CHECK(!engine.SubmitCandidate(f.a, error));
+        BOOST_CHECK_EQUAL(failed_writes, 1U);
+        BOOST_CHECK(engine.Halted());
+        BOOST_CHECK(error.find("agreement candidate failure: injected final agreement journal write failure") != std::string::npos);
+        BOOST_CHECK_EQUAL(error, engine.LastError());
+        BOOST_CHECK(output.empty());
+    }
+    node::FlowMeshAgreement restarted{DBParams{.path = path, .cache_bytes = 1 << 20}, keyless()};
+    BOOST_REQUIRE_MESSAGE(restarted.Open(f.context, f.seats, Filled(77), false, error), error);
+    BOOST_CHECK(!restarted.CandidateBytes(f.hash_a));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

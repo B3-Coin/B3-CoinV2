@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <new>
 #include <stdexcept>
 
 namespace node {
@@ -96,7 +97,7 @@ std::optional<flowmesh::ObservedStamp> FromRow(const uint64_t sequence, const Ro
 {
     if (row.mode < static_cast<uint8_t>(flowmesh::ObservedMode::LIVE) ||
         row.mode > static_cast<uint8_t>(flowmesh::ObservedMode::UNTIMED) ||
-        row.delay > static_cast<uint8_t>(flowmesh::ObservedDelay::CLOCK_BACK) || row.ms < 0) return std::nullopt;
+        row.delay > static_cast<uint8_t>(flowmesh::ObservedDelay::CLOCK_BACK) || !flowmesh::ObservedTimeInRange(row.ms)) return std::nullopt;
     flowmesh::ObservedStamp out;
     out.sequence = sequence;
     out.hash = row.hash;
@@ -118,8 +119,13 @@ CandleValue ToValue(const flowmesh::ObservedCandle& candle)
             candle.low, candle.close, base_low, base_high, quote_low, quote_high, candle.flags};
 }
 
-std::optional<flowmesh::ObservedCandle> FromValue(const int64_t open_ms, const CandleValue& value)
+std::optional<flowmesh::ObservedCandle> FromValue(const uint64_t key_open_ms, const flowmesh::CandleInterval interval, const CandleValue& value)
 {
+    // A key the rollup cannot have written (out of range or unaligned) is
+    // skipped, never cast into a negative or far-future open.
+    if (key_open_ms >= static_cast<uint64_t>(flowmesh::OBSERVED_MS_LIMIT)) return std::nullopt;
+    const int64_t open_ms{static_cast<int64_t>(key_open_ms)};
+    if (open_ms % flowmesh::CandleIntervalMs(interval) != 0) return std::nullopt;
     if (value.last_sequence < value.first_sequence || value.clearings > value.entries ||
         (value.clearings > 0 && (value.low > value.high || value.open < value.low || value.open > value.high ||
                                  value.close < value.low || value.close > value.high))) return std::nullopt;
@@ -151,74 +157,111 @@ FlowMeshObservedTimeLog::FlowMeshObservedTimeLog(uint256 domain, flowmesh::Marke
 {
 }
 
+flowmesh::ObservedStamp FlowMeshObservedTimeLog::Apply(State& state, const Raw& raw)
+{
+    flowmesh::ObservedStamp stamp;
+    stamp.sequence = raw.sequence;
+    stamp.hash = raw.hash;
+    stamp.delay = raw.delay;
+    stamp.mode = raw.delay == flowmesh::ObservedDelay::NONE ? flowmesh::ObservedMode::LIVE : flowmesh::ObservedMode::DELAYED;
+    stamp.flags = raw.flags;
+    const int64_t wall{raw.wall};
+    const auto steady{raw.steady};
+    if (state.ring.empty() || state.ring.back().sequence < raw.sequence) {
+        if (!state.previous) {
+            stamp.flags |= flowmesh::OBSERVED_RESTART;
+        } else {
+            const int64_t wall_delta{wall - state.previous->first};
+            const int64_t steady_delta{std::chrono::duration_cast<std::chrono::milliseconds>(steady - state.previous->second).count()};
+            if (wall_delta - steady_delta > flowmesh::OBSERVED_CLOCK_SLEW_MS ||
+                steady_delta - wall_delta > flowmesh::OBSERVED_CLOCK_SLEW_MS) stamp.flags |= flowmesh::OBSERVED_CLOCK_STEP;
+        }
+        state.previous = std::pair{wall, steady};
+        if (wall >= flowmesh::OBSERVED_MS_LIMIT) {
+            // A clock at or past the display bound (10000-01-01) is
+            // broken, not a time: untimed, flagged suspect and never the
+            // monotonic floor, so later stamps are timed again as soon
+            // as it is back below the bound. CLOCK_BACK is reused
+            // deliberately: the delay vocabulary stays unchanged for a
+            // state no working clock reaches.
+            stamp.mode = flowmesh::ObservedMode::UNTIMED;
+            stamp.delay = flowmesh::ObservedDelay::CLOCK_BACK;
+            stamp.ms = 0;
+            stamp.flags |= flowmesh::OBSERVED_CLOCK_SUSPECT;
+        } else if (state.last_ms && wall < *state.last_ms) {
+            if (*state.last_ms - wall <= flowmesh::OBSERVED_CLOCK_SLEW_MS) {
+                stamp.ms = *state.last_ms;
+                stamp.flags |= flowmesh::OBSERVED_CLOCK_CLAMPED;
+            } else {
+                // Never pinned at the old value: no time until the clock
+                // passes it again.
+                stamp.mode = flowmesh::ObservedMode::UNTIMED;
+                stamp.delay = flowmesh::ObservedDelay::CLOCK_BACK;
+                stamp.ms = 0;
+                stamp.flags |= flowmesh::OBSERVED_CLOCK_STEP;
+            }
+        } else {
+            stamp.ms = std::max<int64_t>(wall, 1);
+        }
+        if (stamp.mode != flowmesh::ObservedMode::UNTIMED) state.last_ms = stamp.ms;
+        flowmesh::ObservedRollup::Changes changes;
+        state.rollup.Add(stamp, raw.tick, &changes);
+        state.ring.push_back(stamp);
+        if (state.ring.size() > RING) state.ring.pop_front();
+        if (!state.recorded_since) state.recorded_since = raw.sequence;
+        state.pending.rows.push_back(stamp);
+        if (state.pending.rows.size() > PENDING_ROWS_MAX) {
+            state.pending.rows.pop_front();
+            ++state.rows_not_persisted;
+        }
+        for (const auto& [interval, candle] : changes) {
+            const auto id{static_cast<uint8_t>(interval)};
+            if (!state.pending.candles.insert_or_assign({id, candle.open_ms}, candle).second) continue;
+            // A new snapshot. Beyond the interval's budget (a flush stalled
+            // for longer than its memory window, or a clock stepping forward
+            // past it between flushes) the oldest is dropped: more
+            // than window + 1 aligned opens never fit in the window, so that
+            // candle has left it and can no longer change.
+            if (++state.pending.candle_counts[id] <= PendingCandlesMax(interval)) continue;
+            state.pending.candles.erase(state.pending.candles.lower_bound({id, std::numeric_limits<int64_t>::min()}));
+            --state.pending.candle_counts[id];
+            ++state.candles_not_persisted;
+        }
+    }
+    return stamp;
+}
+
 flowmesh::ObservedStamp FlowMeshObservedTimeLog::Record(const uint64_t sequence, const uint256& hash,
                                                         const flowmesh::ObservedDelay delay,
                                                         const std::optional<flowmesh::ClearingTick>& tick) noexcept
 {
     try {
+        Raw raw;
+        raw.sequence = sequence;
+        raw.hash = hash;
+        raw.delay = delay;
+        raw.tick = tick;
+        // Clamped so the step check cannot overflow on any clock value.
+        raw.wall = std::clamp<int64_t>(m_clocks.wall_ms(), -flowmesh::OBSERVED_MS_LIMIT, flowmesh::OBSERVED_MS_LIMIT);
+        raw.steady = m_clocks.steady();
+        if (m_clock_suspect.load(std::memory_order_relaxed)) raw.flags |= flowmesh::OBSERVED_CLOCK_SUSPECT;
+        if (!tick || tick->sequence != sequence || tick->microblock_hash != hash) raw.flags |= flowmesh::OBSERVED_NO_CLEARING;
         flowmesh::ObservedStamp stamp;
-        stamp.sequence = sequence;
-        stamp.hash = hash;
-        stamp.delay = delay;
-        stamp.mode = delay == flowmesh::ObservedDelay::NONE ? flowmesh::ObservedMode::LIVE : flowmesh::ObservedMode::DELAYED;
-        const int64_t wall{m_clocks.wall_ms()};
-        const auto steady{m_clocks.steady()};
-        if (m_clock_suspect.load(std::memory_order_relaxed)) stamp.flags |= flowmesh::OBSERVED_CLOCK_SUSPECT;
-        if (!tick || tick->sequence != sequence || tick->microblock_hash != hash) stamp.flags |= flowmesh::OBSERVED_NO_CLEARING;
-        std::lock_guard lock{m_mutex};
-        if (m_ring.empty() || m_ring.back().sequence < sequence) {
-            if (!m_previous) {
-                stamp.flags |= flowmesh::OBSERVED_RESTART;
-            } else {
-                const int64_t wall_delta{wall - m_previous->first};
-                const int64_t steady_delta{std::chrono::duration_cast<std::chrono::milliseconds>(steady - m_previous->second).count()};
-                if (wall_delta - steady_delta > flowmesh::OBSERVED_CLOCK_SLEW_MS ||
-                    steady_delta - wall_delta > flowmesh::OBSERVED_CLOCK_SLEW_MS) stamp.flags |= flowmesh::OBSERVED_CLOCK_STEP;
-            }
-            m_previous = std::pair{wall, steady};
-            if (m_last_ms && wall < *m_last_ms) {
-                if (*m_last_ms - wall <= flowmesh::OBSERVED_CLOCK_SLEW_MS) {
-                    stamp.ms = *m_last_ms;
-                    stamp.flags |= flowmesh::OBSERVED_CLOCK_CLAMPED;
-                } else {
-                    // Never pinned at the old value: no time until the clock
-                    // passes it again.
-                    stamp.mode = flowmesh::ObservedMode::UNTIMED;
-                    stamp.delay = flowmesh::ObservedDelay::CLOCK_BACK;
-                    stamp.ms = 0;
-                    stamp.flags |= flowmesh::OBSERVED_CLOCK_STEP;
+        {
+            std::lock_guard lock{m_mutex};
+            if (m_loading) {
+                // Stamped by FinishLoad, as if the history had loaded first.
+                if (m_early.size() >= RING) {
+                    m_early.pop_front();
+                    ++m_early_dropped;
                 }
+                m_early.push_back(std::move(raw));
+                stamp.sequence = sequence;
+                stamp.hash = hash;
+                stamp.mode = flowmesh::ObservedMode::UNTIMED;
+                stamp.delay = delay;
             } else {
-                stamp.ms = std::max<int64_t>(wall, 1);
-            }
-            if (stamp.mode != flowmesh::ObservedMode::UNTIMED) m_last_ms = stamp.ms;
-            flowmesh::ObservedRollup::Changes changes;
-            m_rollup.Add(stamp, tick, &changes);
-            m_ring.push_back(stamp);
-            if (m_ring.size() > RING) m_ring.pop_front();
-            if (!m_recorded_since) m_recorded_since = sequence;
-            m_pending.rows.push_back(stamp);
-            if (m_pending.rows.size() > PENDING_ROWS_MAX) {
-                m_pending.rows.erase(m_pending.rows.begin());
-                ++m_rows_not_persisted;
-            }
-            for (const auto& [interval, candle] : changes) {
-                m_pending.candles[{static_cast<uint8_t>(interval), candle.open_ms}] = candle;
-            }
-            // A restore or disk flush may never succeed. Keep only the same
-            // bounded interval windows as the in-memory rollup, not every
-            // bucket ever recorded while storage was unavailable. Dropping
-            // whole optional snapshots leaves a history gap after restart;
-            // it never removes the current candle or any signing evidence.
-            for (const auto interval : flowmesh::CANDLE_INTERVALS) {
-                const auto& retained{m_rollup.Candles(interval)};
-                if (retained.empty()) continue;
-                const auto id{static_cast<uint8_t>(interval)};
-                auto it{m_pending.candles.lower_bound({id, 0})};
-                while (it != m_pending.candles.end() && it->first.first == id &&
-                       it->first.second < retained.front().open_ms) {
-                    it = m_pending.candles.erase(it);
-                }
+                stamp = Apply(m_state, raw);
             }
         }
         m_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -233,10 +276,13 @@ std::vector<flowmesh::ObservedStamp> FlowMeshObservedTimeLog::Lookup(const std::
 {
     std::vector<flowmesh::ObservedStamp> out;
     std::lock_guard lock{m_mutex};
+    // While loading, the retained history is unknown: none, never a part.
+    if (m_loading) return out;
+    const auto& ring{m_state.ring};
     for (const auto& [sequence, hash] : entries) {
-        const auto it{std::lower_bound(m_ring.begin(), m_ring.end(), sequence,
+        const auto it{std::lower_bound(ring.begin(), ring.end(), sequence,
                                        [](const auto& stamp, const uint64_t value) { return stamp.sequence < value; })};
-        if (it != m_ring.end() && it->sequence == sequence && it->hash == hash) out.push_back(*it);
+        if (it != ring.end() && it->sequence == sequence && it->hash == hash) out.push_back(*it);
     }
     std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.sequence < b.sequence; });
     out.erase(std::unique(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.sequence == b.sequence; }), out.end());
@@ -247,13 +293,22 @@ flowmesh::ObservedCandlePage FlowMeshObservedTimeLog::Candles(const flowmesh::Ca
                                                               const std::optional<int64_t> before_ms, const size_t limit) const
 {
     std::lock_guard lock{m_mutex};
-    return m_rollup.Page(interval, before_ms, limit);
+    if (m_loading) {
+        // Never an available page without the history: a reader would hold
+        // it as the whole window.
+        flowmesh::ObservedCandlePage out;
+        out.interval = interval;
+        out.unavailable_reason = LOADING_REASON;
+        return out;
+    }
+    return m_state.rollup.Page(interval, before_ms, limit);
 }
 
 std::optional<int64_t> FlowMeshObservedTimeLog::OldestMemoryOpen(const flowmesh::CandleInterval interval) const
 {
     std::lock_guard lock{m_mutex};
-    const auto& candles{m_rollup.Candles(interval)};
+    if (m_loading) return std::nullopt;
+    const auto& candles{m_state.rollup.Candles(interval)};
     return candles.empty() ? std::nullopt : std::optional{candles.front().open_ms};
 }
 
@@ -262,8 +317,10 @@ FlowMeshObservedTimeLog::Summary FlowMeshObservedTimeLog::GetSummary() const
     Summary out;
     {
         std::lock_guard lock{m_mutex};
-        out.recorded_since = m_recorded_since;
-        out.rows_not_persisted = m_rows_not_persisted;
+        out.loading = m_loading;
+        if (!m_loading) out.recorded_since = m_state.recorded_since;
+        out.rows_not_persisted = m_state.rows_not_persisted + m_early_dropped;
+        out.candles_not_persisted = m_state.candles_not_persisted;
     }
     out.persisted = m_persisted.load(std::memory_order_relaxed);
     out.clock_suspect = m_clock_suspect.load(std::memory_order_relaxed);
@@ -275,37 +332,106 @@ FlowMeshObservedTimeLog::Pending FlowMeshObservedTimeLog::TakePending()
 {
     Pending out;
     std::lock_guard lock{m_mutex};
-    std::swap(out, m_pending);
+    std::swap(out, m_state.pending);
+    return out;
+}
+
+FlowMeshObservedTimeLog::State FlowMeshObservedTimeLog::Reloaded(
+    std::vector<flowmesh::ObservedStamp> rows,
+    std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
+    const std::optional<uint64_t> recorded_since)
+{
+    State out;
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.sequence < b.sequence; });
+    if (rows.size() > RING) rows.erase(rows.begin(), rows.end() - RING);
+    out.ring.assign(rows.begin(), rows.end());
+    for (const auto interval : flowmesh::CANDLE_INTERVALS) out.rollup.Restore(interval, std::move(candles[static_cast<size_t>(interval)]));
+    std::optional<int64_t> last_live;
+    for (auto it{out.ring.rbegin()}; it != out.ring.rend(); ++it) {
+        if (!out.last_ms && it->mode != flowmesh::ObservedMode::UNTIMED) out.last_ms = it->ms;
+        if (it->mode == flowmesh::ObservedMode::LIVE) {
+            // Only a run of consecutive sequences ending at the newest row
+            // bounds what follows.
+            const bool contiguous{it->sequence + static_cast<uint64_t>(std::distance(out.ring.rbegin(), it)) == out.ring.back().sequence};
+            if (contiguous) last_live = it->ms;
+            break;
+        }
+    }
+    out.rollup.RestoreLast(out.ring.empty() ? std::nullopt : std::optional{out.ring.back().sequence}, last_live);
+    out.recorded_since = recorded_since ? recorded_since : out.ring.empty() ? std::nullopt : std::optional{out.ring.front().sequence};
     return out;
 }
 
 void FlowMeshObservedTimeLog::Load(std::vector<flowmesh::ObservedStamp> rows,
                                    std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
-                                   const std::optional<uint64_t> recorded_since, const bool preserve_recorded)
+                                   const std::optional<uint64_t> recorded_since)
 {
-    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.sequence < b.sequence; });
-    if (rows.size() > RING) rows.erase(rows.begin(), rows.end() - RING);
+    BeginLoad();
+    FinishLoad(std::move(rows), std::move(candles), recorded_since);
+}
+
+void FlowMeshObservedTimeLog::BeginLoad() noexcept
+{
     std::lock_guard lock{m_mutex};
-    if (preserve_recorded && (!m_ring.empty() || !m_pending.Empty())) return;
-    m_ring.assign(rows.begin(), rows.end());
-    m_rollup = flowmesh::ObservedRollup{};
-    for (const auto interval : flowmesh::CANDLE_INTERVALS) m_rollup.Restore(interval, std::move(candles[static_cast<size_t>(interval)]));
-    m_last_ms.reset();
-    std::optional<int64_t> last_live;
-    for (auto it{m_ring.rbegin()}; it != m_ring.rend(); ++it) {
-        if (!m_last_ms && it->mode != flowmesh::ObservedMode::UNTIMED) m_last_ms = it->ms;
-        if (it->mode == flowmesh::ObservedMode::LIVE) {
-            // Only a run of consecutive sequences ending at the newest row
-            // bounds what follows.
-            const bool contiguous{it->sequence + static_cast<uint64_t>(std::distance(m_ring.rbegin(), it)) == m_ring.back().sequence};
-            if (contiguous) last_live = it->ms;
-            break;
+    m_loading = true;
+}
+
+bool FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> rows,
+                                         std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles,
+                                         const std::optional<uint64_t> recorded_since) noexcept
+{
+    // Entries taken out of m_early and not yet installed (lost on failure).
+    uint64_t taken{0};
+    try {
+        if (m_fail_next_finish_load.exchange(false, std::memory_order_relaxed)) throw std::bad_alloc{};
+        State state{Reloaded(std::move(rows), std::move(candles), recorded_since)};
+        // Replayed off the mutex, so Record (the runtime worker, under its
+        // market lock) waits for none of this. Each round swaps the buffer
+        // out in O(1); rounds repeat while more than UNDER_LOCK_MAX arrived
+        // during the previous one, at most ROUNDS times. The rest, what
+        // arrived during the last round, is applied in the same hold of the
+        // mutex that measured it: at most UNDER_LOCK_MAX unless Records kept
+        // pace with the replay for every round, and never more than RING.
+        constexpr size_t UNDER_LOCK_MAX{64};
+        constexpr int ROUNDS{8};
+        for (int round{0};; ++round) {
+            std::deque<Raw> batch;
+            {
+                std::lock_guard lock{m_mutex};
+                if (round == ROUNDS || (round > 0 && m_early.size() <= UNDER_LOCK_MAX)) {
+                    for (const auto& raw : m_early) (void)Apply(state, raw);
+                    state.rows_not_persisted += m_state.rows_not_persisted + m_early_dropped;
+                    state.candles_not_persisted += m_state.candles_not_persisted;
+                    // The replaced state is freed below, after the mutex.
+                    std::swap(m_state, state);
+                    m_early.clear();
+                    m_early_dropped = 0;
+                    m_loading = false;
+                    break;
+                }
+                batch.swap(m_early);
+            }
+            taken += batch.size();
+            for (const auto& raw : batch) (void)Apply(state, raw);
         }
+        m_generation.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+    } catch (...) {
+        try {
+            std::lock_guard lock{m_mutex};
+            State fresh;
+            fresh.rows_not_persisted = m_state.rows_not_persisted + m_early_dropped + taken + m_early.size();
+            fresh.candles_not_persisted = m_state.candles_not_persisted;
+            std::swap(m_state, fresh);
+            m_early.clear();
+            m_early_dropped = 0;
+            m_loading = false;
+        } catch (...) {
+        }
+        m_record_failures.fetch_add(1, std::memory_order_relaxed);
+        m_generation.fetch_add(1, std::memory_order_acq_rel);
+        return false;
     }
-    m_rollup.RestoreLast(m_ring.empty() ? std::nullopt : std::optional{m_ring.back().sequence}, last_live);
-    m_recorded_since = recorded_since ? recorded_since : m_ring.empty() ? std::nullopt : std::optional{m_ring.front().sequence};
-    m_pending = {};
-    m_previous.reset();
 }
 
 FlowMeshObservedTimeStore::FlowMeshObservedTimeStore(Options options) : m_options{std::move(options)} {}
@@ -319,7 +445,10 @@ bool FlowMeshObservedTimeStore::Open(std::string& error)
         std::lock_guard lock{m_mutex};
         if (m_db) return true;
     }
+    // Built and checked without m_mutex (readers never wait for this disk
+    // work), then published under it.
     DBParams params{.path = m_options.path, .cache_bytes = m_options.cache_bytes, .memory_only = m_options.memory_only};
+    params.env_for_test = m_options.env_for_test;
     for (const bool wipe : {false, true}) {
         try {
             params.wipe_data = wipe;
@@ -329,6 +458,7 @@ bool FlowMeshObservedTimeStore::Open(std::string& error)
             std::unique_ptr<CDBIterator> it{db->NewIterator()};
             it->SeekToFirst();
             if (!it->StatusOK()) throw dbwrapper_error{"unreadable observed-time database"};
+            it.reset();
             {
                 std::lock_guard lock{m_mutex};
                 m_db = std::move(db);
@@ -349,12 +479,11 @@ bool FlowMeshObservedTimeStore::IsOpen() const
     return m_db != nullptr;
 }
 
-void FlowMeshObservedTimeStore::WipeMarket(const flowmesh::MarketId& market)
+void FlowMeshObservedTimeStore::WipeMarket(CDBWrapper& db, const flowmesh::MarketId& market)
 {
-    // Caller holds m_flush_mutex; never the registration mutex during I/O.
-    CDBBatch batch{*m_db};
+    CDBBatch batch{db};
     size_t erased{0};
-    std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
+    std::unique_ptr<CDBIterator> it{db.NewIterator()};
     for (it->Seek(RowKey{KEY_ROW, market, 0}); it->Valid(); it->Next()) {
         RowKey key;
         if (!it->GetKey(key) || key.prefix != KEY_ROW || key.market != market) break;
@@ -367,163 +496,227 @@ void FlowMeshObservedTimeStore::WipeMarket(const flowmesh::MarketId& market)
         batch.Erase(key);
         ++erased;
     }
+    // A key an unreadable block hid would survive the wipe: the load fails.
+    if (!it->StatusOK()) throw dbwrapper_error{"observed-time database read error"};
     batch.Write(MetaKey{KEY_META, market}, MetaValue{});
-    m_db->WriteBatch(batch, true);
+    db.WriteBatch(batch, true);
     LogWarning("FlowMesh market %s: observed times did not match this node's certified log and were cleared (%u records)\n",
                market.GetHex(), static_cast<unsigned>(erased));
 }
 
 void FlowMeshObservedTimeStore::Attach(const std::shared_ptr<FlowMeshObservedTimeLog>& log, const uint64_t store_next_sequence,
-                                       const std::vector<std::pair<uint64_t, uint256>>& known) noexcept
+                                       std::vector<std::pair<uint64_t, uint256>> known) noexcept
 {
     if (!log) return;
     try {
-        auto attached{std::make_shared<Attached>()};
-        attached->log = log;
-        attached->restore = RestoreRequest{store_next_sequence, known};
-        std::lock_guard flush{m_flush_mutex};
-        if (RestoreAttached(*attached, /*preserve_recorded=*/false)) attached->restore.reset();
-        std::lock_guard lock{m_mutex};
-        RegisterAttached(std::move(attached));
-    } catch (...) {
-        log->SetPersisted(false);
-    }
-}
-
-void FlowMeshObservedTimeStore::AttachAsync(const std::shared_ptr<FlowMeshObservedTimeLog>& log, const uint64_t store_next_sequence,
-                                            std::vector<std::pair<uint64_t, uint256>> known) noexcept
-{
-    if (!log) return;
-    log->SetPersisted(false);
-    try {
-        auto attached{std::make_shared<Attached>()};
-        attached->log = log;
-        attached->restore = RestoreRequest{store_next_sequence, std::move(known)};
+        // Queued only: the caller (a market start inside the B3
+        // reconciliation gate) never waits for this database or a flush.
+        log->BeginLoad();
+        auto item{std::make_shared<Attached>()};
+        item->log = log;
+        item->load = LoadJob{store_next_sequence, std::move(known)};
         {
             std::lock_guard lock{m_mutex};
-            RegisterAttached(std::move(attached));
-            m_restore_queued = true;
+            const auto current{std::find_if(m_attached.begin(), m_attached.end(), [&](const auto& old) {
+                return old->log->MarketId() == log->MarketId();
+            })};
+            if (current == m_attached.end()) m_attached.push_back(std::move(item));
+            else *current = std::move(item);
+            m_load_requested = true;
         }
         m_cv.notify_all();
     } catch (...) {
+        log->FinishLoad({}, {}, std::nullopt);
         log->SetPersisted(false);
     }
 }
 
-void FlowMeshObservedTimeStore::RegisterAttached(std::shared_ptr<Attached> attached)
+void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db, const std::chrono::steady_clock::time_point now,
+                                        const bool at_stop, const LoadHook& hook) noexcept
 {
-    const auto previous{std::find_if(m_attached.begin(), m_attached.end(), [&](const auto& item) {
-        return item->log->MarketId() == attached->log->MarketId();
-    })};
-    if (previous == m_attached.end()) m_attached.push_back(std::move(attached));
-    else *previous = std::move(attached);
-}
-
-bool FlowMeshObservedTimeStore::RestoreAttached(Attached& attached, const bool preserve_recorded) noexcept
-{
-    const auto& log{attached.log};
-    const uint256 market{log->MarketId()};
+    // Caller holds m_flush_mutex; item.load is set and stays queued until a
+    // load succeeds or is given up. The market is restored only once every
+    // read and write below succeeded.
+    auto& log{*item.log};
+    // FinishLoad ran: nothing after it is a failed attempt.
+    bool installed{false};
     try {
-        const uint64_t store_next_sequence{attached.restore->next_sequence};
-        const auto& known{attached.restore->known};
-        if (!m_db) {
-            log->SetPersisted(false);
-            return false;
+        if (!db) {
+            // Open failed (logged there): nothing to retry.
+            LoadFailed(item, "the database is not open", now, at_stop, /*retryable=*/false);
+            return;
         }
-        MetaValue meta;
-        const bool has_meta{m_db->Read(MetaKey{KEY_META, market}, meta)};
-        if (has_meta && (meta.version != META_VERSION || meta.domain != log->Domain())) {
-            WipeMarket(market);
-        }
-        m_db->Write(MetaKey{KEY_META, market}, MetaValue{META_VERSION, log->Domain()}, true);
-        // Rows the production store never certified here are erased.
-        std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
-        CDBBatch erase{*m_db};
-        bool erased{false};
-        for (it->Seek(RowKey{KEY_ROW, market, store_next_sequence}); it->Valid(); it->Next()) {
-            RowKey key;
-            if (!it->GetKey(key) || key.prefix != KEY_ROW || key.market != market) break;
-            erase.Erase(key);
-            erased = true;
-        }
-        // A candle cannot be truncated without the original clearings.
-        // Drop the whole optional bucket when it contains an entry
-        // beyond the accepted head, including older intervals that a
-        // later disk page could otherwise return after this reload.
-        for (it->Seek(CandleKey{KEY_CANDLE, market, 0, 0}); it->Valid(); it->Next()) {
-            CandleKey key;
-            if (!it->GetKey(key) || key.prefix != KEY_CANDLE || key.market != market) break;
-            CandleValue value;
-            if (!it->GetValue(value) || value.last_sequence >= store_next_sequence) {
+        const LoadJob& job{*item.load};
+        const uint64_t store_next_sequence{job.store_next_sequence};
+        const auto& known{job.known};
+        const uint256 market{log.MarketId()};
+        const auto stage = [&](const char* name) {
+            if (hook) hook(log.MarketId(), name);
+        };
+        try {
+            // An earlier failed attempt may have set it.
+            item.oldest_row.reset();
+            stage("meta");
+            MetaValue meta;
+            const bool has_meta{db->Read(MetaKey{KEY_META, market}, meta)};
+            if (has_meta && (meta.version != META_VERSION || meta.domain != log.Domain())) {
+                WipeMarket(*db, market);
+            }
+            db->Write(MetaKey{KEY_META, market}, MetaValue{META_VERSION, log.Domain()}, true);
+            // Rows the production store never certified here are erased.
+            std::unique_ptr<CDBIterator> it{db->NewIterator()};
+            // A scan that ends on a read error has not seen every key: the
+            // load fails (the iterator keeps its first error).
+            const auto scanned = [&] {
+                if (!it->StatusOK()) throw dbwrapper_error{"observed-time database read error"};
+            };
+            CDBBatch erase{*db};
+            bool erased{false};
+            for (it->Seek(RowKey{KEY_ROW, market, store_next_sequence}); it->Valid(); it->Next()) {
+                RowKey key;
+                if (!it->GetKey(key) || key.prefix != KEY_ROW || key.market != market) break;
                 erase.Erase(key);
                 erased = true;
             }
-        }
-        if (erased) m_db->WriteBatch(erase, true);
-        // The newest retained rows; a hash the store contradicts wipes.
-        const uint64_t from{store_next_sequence > FlowMeshObservedTimeLog::RING ? store_next_sequence - FlowMeshObservedTimeLog::RING : 0};
-        std::vector<flowmesh::ObservedStamp> rows;
-        std::map<uint64_t, uint256> expected{known.begin(), known.end()};
-        bool mismatch{false};
-        for (it->Seek(RowKey{KEY_ROW, market, from}); it->Valid(); it->Next()) {
-            RowKey key;
-            if (!it->GetKey(key) || key.prefix != KEY_ROW || key.market != market || key.sequence >= store_next_sequence) break;
-            RowValue value;
-            if (!it->GetValue(value)) continue;
-            const auto stamp{FromRow(key.sequence, value)};
-            if (!stamp) continue;
-            if (const auto want{expected.find(key.sequence)}; want != expected.end() && want->second != stamp->hash) {
-                mismatch = true;
-                break;
-            }
-            rows.push_back(*stamp);
-        }
-        if (mismatch) {
-            WipeMarket(market);
-            rows.clear();
-        }
-        it->Seek(RowKey{KEY_ROW, market, 0});
-        if (it->Valid()) {
-            RowKey key;
-            if (it->GetKey(key) && key.prefix == KEY_ROW && key.market == market) attached.oldest_row = key.sequence;
-        }
-        // The memory window of every interval, ending at the newest time.
-        std::optional<int64_t> newest;
-        for (auto row{rows.rbegin()}; row != rows.rend() && !newest; ++row) {
-            if (row->mode != flowmesh::ObservedMode::UNTIMED) newest = row->ms;
-        }
-        std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles;
-        for (const auto interval : flowmesh::CANDLE_INTERVALS) {
-            if (!newest || mismatch) break;
-            const int64_t step{flowmesh::CandleIntervalMs(interval)};
-            const int64_t window{static_cast<int64_t>(flowmesh::CandleMemoryWindow(interval)) * step};
-            const int64_t start{std::max<int64_t>(0, flowmesh::CandleOpenMs(*newest, interval) - window)};
-            auto& out{candles[static_cast<size_t>(interval)]};
-            for (it->Seek(CandleKey{KEY_CANDLE, market, static_cast<uint8_t>(interval), static_cast<uint64_t>(start)}); it->Valid(); it->Next()) {
+            scanned();
+            // A candle cannot be truncated without the original clearings.
+            // Drop the whole optional bucket when it contains an entry
+            // beyond the accepted head, including older intervals that a
+            // later disk page could otherwise return after this reload.
+            for (it->Seek(CandleKey{KEY_CANDLE, market, 0, 0}); it->Valid(); it->Next()) {
                 CandleKey key;
-                if (!it->GetKey(key) || key.prefix != KEY_CANDLE || key.market != market ||
-                    key.interval != static_cast<uint8_t>(interval)) break;
+                if (!it->GetKey(key) || key.prefix != KEY_CANDLE || key.market != market) break;
                 CandleValue value;
-                if (!it->GetValue(value)) continue;
-                auto candle{FromValue(static_cast<int64_t>(key.open_ms), value)};
-                // Never a candle holding an entry the store does not have.
-                if (!candle || candle->last_sequence >= store_next_sequence) continue;
-                out.push_back(*candle);
+                if (!it->GetValue(value) || value.last_sequence >= store_next_sequence) {
+                    erase.Erase(key);
+                    erased = true;
+                }
             }
+            scanned();
+            stage("erase");
+            if (erased) db->WriteBatch(erase, true);
+            stage("rows");
+            // The newest retained rows; a hash the store contradicts wipes.
+            const uint64_t from{store_next_sequence > FlowMeshObservedTimeLog::RING ? store_next_sequence - FlowMeshObservedTimeLog::RING : 0};
+            std::vector<flowmesh::ObservedStamp> rows;
+            std::map<uint64_t, uint256> expected{known.begin(), known.end()};
+            bool mismatch{false};
+            for (it->Seek(RowKey{KEY_ROW, market, from}); it->Valid(); it->Next()) {
+                RowKey key;
+                if (!it->GetKey(key) || key.prefix != KEY_ROW || key.market != market || key.sequence >= store_next_sequence) break;
+                RowValue value;
+                if (!it->GetValue(value)) continue;
+                const auto stamp{FromRow(key.sequence, value)};
+                if (!stamp) continue;
+                if (const auto want{expected.find(key.sequence)}; want != expected.end() && want->second != stamp->hash) {
+                    mismatch = true;
+                    break;
+                }
+                rows.push_back(*stamp);
+            }
+            scanned();
+            if (mismatch) {
+                WipeMarket(*db, market);
+                rows.clear();
+            }
+            it->Seek(RowKey{KEY_ROW, market, 0});
+            if (it->Valid()) {
+                RowKey key;
+                if (it->GetKey(key) && key.prefix == KEY_ROW && key.market == market) item.oldest_row = key.sequence;
+            }
+            scanned();
+            stage("candles");
+            // The memory window of every interval, ending at the newest time.
+            std::optional<int64_t> newest;
+            for (auto row{rows.rbegin()}; row != rows.rend() && !newest; ++row) {
+                if (row->mode != flowmesh::ObservedMode::UNTIMED) newest = row->ms;
+            }
+            std::array<std::vector<flowmesh::ObservedCandle>, flowmesh::CANDLE_INTERVALS.size()> candles;
+            for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+                if (!newest || mismatch) break;
+                const int64_t step{flowmesh::CandleIntervalMs(interval)};
+                const int64_t window{static_cast<int64_t>(flowmesh::CandleMemoryWindow(interval)) * step};
+                const int64_t start{std::max<int64_t>(0, flowmesh::CandleOpenMs(*newest, interval) - window)};
+                auto& out{candles[static_cast<size_t>(interval)]};
+                for (it->Seek(CandleKey{KEY_CANDLE, market, static_cast<uint8_t>(interval), static_cast<uint64_t>(start)}); it->Valid(); it->Next()) {
+                    CandleKey key;
+                    if (!it->GetKey(key) || key.prefix != KEY_CANDLE || key.market != market ||
+                        key.interval != static_cast<uint8_t>(interval)) break;
+                    CandleValue value;
+                    if (!it->GetValue(value)) continue;
+                    auto candle{FromValue(key.open_ms, interval, value)};
+                    // Never a candle holding an entry the store does not have.
+                    if (!candle || candle->last_sequence >= store_next_sequence) continue;
+                    out.push_back(*candle);
+                }
+                scanned();
+            }
+            const auto recorded_since{mismatch ? std::nullopt : item.oldest_row};
+            if (mismatch) item.oldest_row.reset();
+            it.reset();
+            // Restored: the disk holds only what may be served. Set before
+            // the log serves its history, so a reader that finds the log
+            // loaded never finds its disk candles withheld.
+            {
+                std::lock_guard lock{m_mutex};
+                item.restored = true;
+            }
+            item.load.reset();
+            installed = true;
+            if (log.FinishLoad(std::move(rows), std::move(candles), recorded_since)) {
+                log.SetPersisted(true);
+            } else {
+                // Not installed: FinishLoad left the log empty and recording,
+                // so its fresh candles would overwrite the stored ones of the
+                // same buckets. Given up as a failed load is: memory only.
+                try {
+                    std::lock_guard lock{m_mutex};
+                    item.restored = false;
+                } catch (...) {
+                }
+                log.SetPersisted(false);
+                LogWarning("FlowMesh market %s: observed times could not be installed; they are kept in memory only until restart "
+                           "(<flowmeshdatadir>/observed_time holds display data only and may be removed if this repeats)\n",
+                           market.GetHex());
+            }
+        } catch (const std::exception& e) {
+            if (!installed) LoadFailed(item, e.what(), now, at_stop, /*retryable=*/true);
         }
-        const auto recorded_since{mismatch ? std::nullopt : attached.oldest_row};
-        if (mismatch) attached.oldest_row.reset();
-        log->Load(std::move(rows), std::move(candles), recorded_since, preserve_recorded);
-        log->SetPersisted(true);
-        attached.restored.store(true, std::memory_order_release);
-        return true;
-    } catch (const std::exception& e) {
-        LogWarning("FlowMesh market %s: observed times could not be read (%s); recording continues in memory\n",
-                   market.GetHex(), e.what());
+    } catch (...) {
+        if (!installed) LoadFailed(item, "unknown error", now, at_stop, /*retryable=*/true);
+    }
+}
+
+void FlowMeshObservedTimeStore::LoadFailed(Attached& item, const char* const why, const std::chrono::steady_clock::time_point now,
+                                           const bool at_stop, const bool retryable) noexcept
+{
+    // Caller holds m_flush_mutex. Never restored here: the market's disk
+    // candles stay withheld and nothing of it is written.
+    auto& log{*item.log};
+    ++item.load_attempts;
+    log.SetPersisted(false);
+    if (retryable && !at_stop && item.load_attempts < m_options.load_attempts) {
+        // The log keeps loading: its reads stay unavailable and its entries
+        // wait (at most RING) to be stamped by the attempt that succeeds.
+        item.retry_load = now + m_options.load_retry;
+        try {
+            LogWarning("FlowMesh market %s: observed times could not be read (%s, attempt %u of %u); retrying\n",
+                       log.MarketId().GetHex(), why, item.load_attempts, m_options.load_attempts);
+        } catch (...) {
+        }
+        return;
+    }
+    // Given up: the log records in memory only (its waiting entries are
+    // stamped on an empty history) and this market's disk is neither
+    // served nor written until restart.
+    item.load.reset();
+    try {
+        LogWarning("FlowMesh market %s: observed times could not be read (%s); they are kept in memory only until restart "
+                   "(<flowmeshdatadir>/observed_time holds display data only and may be removed if this repeats)\n",
+                   log.MarketId().GetHex(), why);
     } catch (...) {
     }
-    log->SetPersisted(false);
-    return false;
+    log.FinishLoad({}, {}, std::nullopt);
 }
 
 void FlowMeshObservedTimeStore::Start()
@@ -542,18 +735,27 @@ void FlowMeshObservedTimeStore::Stop()
     }
     m_cv.notify_all();
     if (m_thread.joinable()) m_thread.join();
-    // Every runtime writer has stopped before the service calls this.
+    // Every runtime writer has stopped before the service calls this. A
+    // load still queued is attempted at once: the market is loaded (and
+    // erased) before any of its rows is written, or given up.
     FlushNow(/*sync=*/true);
 }
 
 void FlowMeshObservedTimeStore::FlushLoop()
 {
     util::ThreadRename("flowmesh-obstime");
+    // Opened here, never on the service's start path (display data only:
+    // a failure leaves every log in memory).
+    if (!IsOpen()) {
+        std::string error;
+        Open(error);
+    }
     std::unique_lock lock{m_mutex};
     while (!m_stopping) {
-        m_cv.wait_for(lock, m_options.flush_interval, [&] { return m_stopping || m_restore_queued; });
+        // A queued market is loaded at once, not after the interval.
+        m_cv.wait_for(lock, m_options.flush_interval, [&] { return m_stopping || m_load_requested; });
         if (m_stopping) break;
-        m_restore_queued = false;
+        m_load_requested = false;
         lock.unlock();
         FlushNow(/*sync=*/false);
         lock.lock();
@@ -566,30 +768,43 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
         std::lock_guard flush{m_flush_mutex};
         std::vector<std::shared_ptr<Attached>> attached;
         std::function<void()> hook;
+        LoadHook load_hook;
+        CDBWrapper* db{nullptr};
+        bool stopping{false};
         {
             std::lock_guard lock{m_mutex};
             attached = m_attached;
             hook = m_hook;
+            load_hook = m_load_hook;
+            db = m_db.get();
+            m_load_requested = false;
+            stopping = m_stopping;
         }
         const auto now{std::chrono::steady_clock::now()};
+        // Queued markets first, on this thread: a market's erasures and
+        // wipes always reach the disk before any of its new rows. A failed
+        // load waits for its retry; once the store stops (whichever pass
+        // sees it first, Stop's at the latest) it is attempted at once and
+        // given up if that fails. A synced pass alone changes neither.
         for (const auto& item : attached) {
-            if (item->restore) {
-                if (!sync && now < item->retry_restore) continue;
-                if (!RestoreAttached(*item, /*preserve_recorded=*/true)) {
-                    // Optional restore failures retry at a bounded cadence;
-                    // recording continues in its bounded memory queue.
-                    item->retry_restore = now + std::chrono::seconds{5};
-                    continue;
-                }
-                item->restore.reset();
-            }
+            if (item->load && (stopping || now >= item->retry_load)) RunLoad(*item, db, now, /*at_stop=*/stopping, load_hook);
+        }
+        for (const auto& item : attached) {
             auto& log{*item->log};
+            if (!item->restored) {
+                // Not checked against the production store: nothing of it
+                // is written. While its load is queued the log is loading
+                // (nothing pending); once given up it is memory only, and
+                // what it would persist is dropped each pass.
+                if (!item->load) (void)log.TakePending();
+                continue;
+            }
             auto pending{log.TakePending()};
             if (pending.Empty() && now < item->next_sweep) continue;
-            if (!m_db) continue;
+            if (!db) continue;
             try {
                 const uint256 market{log.MarketId()};
-                CDBBatch batch{*m_db};
+                CDBBatch batch{*db};
                 std::optional<uint64_t> newest_row;
                 for (const auto& row : pending.rows) {
                     batch.Write(RowKey{KEY_ROW, market, row.sequence}, ToRow(row));
@@ -606,7 +821,7 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
                 if (now >= item->next_sweep) {
                     item->next_sweep = now + SWEEP_INTERVAL;
                     // Retention, a bounded amount per sweep.
-                    std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
+                    std::unique_ptr<CDBIterator> it{db->NewIterator()};
                     size_t erased{0};
                     if (newest_row && *newest_row >= ROW_RETENTION && item->oldest_row && *item->oldest_row <= *newest_row - ROW_RETENTION) {
                         const uint64_t keep_from{*newest_row - ROW_RETENTION + 1};
@@ -632,22 +847,38 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
                     }
                 }
                 if (hook) hook();
-                // One final synced batch below covers these writes and
-                // every previous unsynced pass, even with no pending rows.
-                m_db->WriteBatch(batch, false);
+                // The final durability barrier below covers these writes
+                // and every previous unsynced pass, even with no pending rows.
+                db->WriteBatch(batch, false);
                 log.SetPersisted(true);
             } catch (const std::exception& e) {
                 // Lost rows become a gap after a restart; the market is
-                // never affected.
-                LogDebug(BCLog::NET, "FlowMesh observed-time flush failed for market %s: %s\n", log.MarketId().GetHex(), e.what());
+                // never affected. Its first failure is a warning; a broken
+                // disk fails every pass, so later ones are debug only.
+                if (!item->write_warned) {
+                    item->write_warned = true;
+                    LogWarning("FlowMesh market %s: observed times could not be written (%s); they are kept in memory, the "
+                               "unwritten ones are a gap after a restart, and each flush writes again (later failures are "
+                               "logged with -debug=net)\n",
+                               log.MarketId().GetHex(), e.what());
+                } else {
+                    LogDebug(BCLog::NET, "FlowMesh observed-time flush failed for market %s: %s\n", log.MarketId().GetHex(), e.what());
+                }
                 log.SetPersisted(false);
             }
         }
-        if (sync && m_db) {
+        if (sync && db) {
             try {
-                CDBBatch final_sync{*m_db};
+                CDBBatch final_sync{*db};
                 if (hook) hook();
-                m_db->WriteBatch(final_sync, true);
+                // An empty synced write alone may first rotate a full
+                // memtable and then sync only its NEW WAL. Force prior WALs
+                // into synced tables/manifest before syncing the current WAL.
+                // CompactFull is void; this checked write also surfaces a
+                // sticky background table/manifest failure. Chart-only I/O,
+                // under the flush mutex, never the market or store mutex.
+                db->CompactFull();
+                db->WriteBatch(final_sync, true);
             } catch (const std::exception& e) {
                 LogDebug(BCLog::NET, "FlowMesh observed-time final sync failed: %s\n", e.what());
                 for (const auto& item : attached) item->log->SetPersisted(false);
@@ -660,40 +891,61 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
 std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(const flowmesh::MarketId& market,
                                                                              const flowmesh::CandleInterval interval,
                                                                              const int64_t from_ms, const int64_t before_ms,
-                                                                             const size_t limit, bool* older) const
+                                                                             const size_t limit, bool* older, bool* failed) const
 {
     if (older) *older = false;
+    if (failed) *failed = false;
     std::vector<flowmesh::ObservedCandle> out;
     try {
         CDBWrapper* db{nullptr};
+        std::function<void()> hook;
         {
             std::lock_guard lock{m_mutex};
-            const bool restored{std::any_of(m_attached.begin(), m_attached.end(), [&](const auto& item) {
-                return item->log->MarketId() == market && item->restored.load(std::memory_order_acquire);
-            })};
+            // Only a market whose load succeeded: until then, after it was
+            // given up, or for a market never attached here, its disk may
+            // hold rows and candles a load would erase or wipe. None is
+            // served (a gap).
+            bool restored{false};
+            for (const auto& item : m_attached) {
+                if (item->log->MarketId() != market) continue;
+                if (!item->restored) return out;
+                restored = true;
+            }
             if (!restored) return out;
             db = m_db.get();
+            hook = m_read_hook;
         }
+        // Read without m_mutex: the database outlives every reader (it is
+        // freed only with the store) and LevelDB reads are safe beside the
+        // flush thread's writes.
         if (!db || before_ms <= from_ms) return out;
+        if (hook) hook();
         std::unique_ptr<CDBIterator> it{db->NewIterator()};
         const auto matches = [&](const CandleKey& key) {
             return key.prefix == KEY_CANDLE && key.market == market && key.interval == static_cast<uint8_t>(interval);
         };
+        // Keys are unsigned: compared as such, a corrupt key at or past 2^63
+        // ends the scan instead of reading as a negative open.
+        const uint64_t from{static_cast<uint64_t>(std::max<int64_t>(0, from_ms))};
+        const uint64_t before{static_cast<uint64_t>(std::max<int64_t>(0, before_ms))};
         if (older) {
             it->Seek(CandleKey{KEY_CANDLE, market, static_cast<uint8_t>(interval), 0});
             CandleKey key;
-            *older = it->Valid() && it->GetKey(key) && matches(key) && static_cast<int64_t>(key.open_ms) < from_ms;
+            *older = it->Valid() && it->GetKey(key) && matches(key) && key.open_ms < from;
         }
-        for (it->Seek(CandleKey{KEY_CANDLE, market, static_cast<uint8_t>(interval), static_cast<uint64_t>(std::max<int64_t>(0, from_ms))});
-             it->Valid() && out.size() < limit; it->Next()) {
+        for (it->Seek(CandleKey{KEY_CANDLE, market, static_cast<uint8_t>(interval), from}); it->Valid() && out.size() < limit; it->Next()) {
             CandleKey key;
-            if (!it->GetKey(key) || !matches(key) || static_cast<int64_t>(key.open_ms) >= before_ms) break;
+            if (!it->GetKey(key) || !matches(key) || key.open_ms >= before) break;
             CandleValue value;
             if (!it->GetValue(value)) continue;
-            if (auto candle{FromValue(static_cast<int64_t>(key.open_ms), value)}) out.push_back(*candle);
+            if (auto candle{FromValue(key.open_ms, interval, value)}) out.push_back(*candle);
         }
+        // A page that skipped an unreadable block is not served as whole.
+        if (!it->StatusOK()) throw dbwrapper_error{"observed-time database read error"};
     } catch (const std::exception&) {
         out.clear();
+        if (older) *older = false;
+        if (failed) *failed = true;
     }
     return out;
 }
@@ -702,6 +954,18 @@ void FlowMeshObservedTimeStore::SetFlushHookForTest(std::function<void()> hook)
 {
     std::lock_guard lock{m_mutex};
     m_hook = std::move(hook);
+}
+
+void FlowMeshObservedTimeStore::SetReadHookForTest(std::function<void()> hook)
+{
+    std::lock_guard lock{m_mutex};
+    m_read_hook = std::move(hook);
+}
+
+void FlowMeshObservedTimeStore::SetLoadHookForTest(LoadHook hook)
+{
+    std::lock_guard lock{m_mutex};
+    m_load_hook = std::move(hook);
 }
 
 } // namespace node

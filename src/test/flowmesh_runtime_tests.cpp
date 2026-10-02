@@ -7448,6 +7448,12 @@ BOOST_AUTO_TEST_CASE(observed_time_in_market_data_only_when_requested)
     BOOST_CHECK(timed_json["observed_time"]["rows"][1]["observed_ms"].getInt<int64_t>() == section.rows[1].ms);
     BOOST_CHECK_EQUAL(timed_json["observed_time"]["certified"].get_bool(), false);
     BOOST_CHECK_EQUAL(timed_json["observed_time"]["source_kind"].get_str(), "operator_observed");
+    // This node's own section carries its storage detail (operator only).
+    BOOST_REQUIRE(section.storage);
+    BOOST_CHECK(section.storage->persisted);
+    BOOST_CHECK_EQUAL(section.storage->rows_not_persisted, 0U);
+    BOOST_CHECK_EQUAL(section.storage->candles_not_persisted, 0U);
+    BOOST_CHECK(timed_json["observed_time"]["storage"]["persisted"].get_bool());
     timed->observed.reset();
     BOOST_CHECK_EQUAL(node::FlowMeshClientMarketDataJson(*timed).write(), plain_json);
 

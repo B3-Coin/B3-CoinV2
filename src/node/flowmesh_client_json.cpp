@@ -121,6 +121,14 @@ static UniValue ObservedTimesJson(const flowmesh::ObservedTimes& value)
         rows.push_back(std::move(row));
     }
     out.pushKV("rows", std::move(rows));
+    // Operator detail of this node's own section only (never public).
+    if (value.storage) {
+        UniValue storage{UniValue::VOBJ};
+        storage.pushKV("persisted", value.storage->persisted);
+        storage.pushKV("rows_not_persisted", value.storage->rows_not_persisted);
+        storage.pushKV("candles_not_persisted", value.storage->candles_not_persisted);
+        out.pushKV("storage", std::move(storage));
+    }
     return out;
 }
 std::string FlowMeshUnsigned128Text(util::Unsigned128 value)

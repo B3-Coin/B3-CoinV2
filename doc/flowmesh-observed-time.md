@@ -66,25 +66,107 @@ auction existed between them; anything else is a gap.
 
 ### Storage and the FlowMesh critical path
 
-- `Record` is memory only, O(1) (a 4096-stamp ring, the six rollups, a bounded
-  queue of rows to persist) and `noexcept`; its mutex is a leaf taken inside the
-  market lock. A failure costs a gap, never the commit (tested with a clock that
-  throws).
+- `Record` is memory only and bounded (a 4096-stamp ring, the six rollups, a
+  bounded queue of rows to persist whose oldest is dropped in O(1), and at most
+  4,742 candle snapshots to persist, a map) and `noexcept`; its mutex is a leaf
+  taken inside the market lock. A failure costs a gap, never the commit
+  (tested with a clock that throws).
 - One separate LevelDB, `<flowmeshdatadir>/observed_time`, market-prefixed keys,
   outside every production store (its fail-closed checks can never be affected;
   older binaries never open it).
-- **Only its own thread (`flowmesh-obstime`) writes it**: at most once a
-  second, unsynced, one batch per market with rows and candles together, and
-  once synced at shutdown after the runtime stopped. It never runs on the
-  FlowMesh tick or worker thread, so a stalled disk delays only the flush
-  (tested with a flush held inside its write while commits and reads go on).
+- **Only its own thread (`flowmesh-obstime`) opens, loads, erases, wipes
+  and writes it**: it opens the database when it starts; it writes at most
+  once a second, unsynced, one batch per market with rows and candles
+  together; at shutdown, after the runtime stopped, it flushes once more and
+  ends with a full compaction and then one checked synced write even when
+  nothing was pending. An empty synced write alone is insufficient: LevelDB
+  may rotate a full memtable first and sync only its new WAL, leaving the old
+  unsynced WAL waiting for a table flush. Compaction waits for the preceding
+  data's synced tables and manifest; the checked write also detects sticky
+  background I/O failures. This can rewrite retained chart data and increase
+  shutdown time, but never runs under a market lock. It never
+  runs on the FlowMesh tick or worker thread, on the service start or on a
+  market start (both hold the B3 reconciliation gate closed for every
+  market), so a stalled disk delays only the flush (tested with a flush held
+  inside its write while commits, reads, a market attach and a whole service
+  start go on). The store's mutex is never held across disk work: a candles
+  read pages the database without it. Shutdown joins the thread, so a hung
+  write there delays shutdown (after the runtime stopped), never trading.
 - More than 8192 unflushed rows: the oldest are dropped from persistence only (a
-  gap after a restart). A crash loses at most the unflushed second (a gap).
-- At start, after the production store replays: rows at or after its next
-  sequence are erased, a row whose hash contradicts the store's retained hashes
-  (or another domain) clears the market's times, and the newest rows and each
-  interval's memory window are reloaded. An unreadable database is wiped and
-  recreated; if even that fails, times stay in memory.
+  gap after a restart). Unflushed candle snapshots are bounded too: at most
+  each interval's memory window + 1 (4,742 for the six). Only a flush stalled
+  for longer than an interval's window reaches that, or a wall clock that
+  steps forward past the window again and again between two flushes (each
+  step opens new buckets); its oldest snapshot, which can no longer change,
+  is then dropped from persistence only and counted. The stored candle of
+  that bucket stays as it was at the last
+  successful flush, or is absent, as after a crash; the sequence gap to the
+  next stored candle shows it. Normal flushing has a one-second cadence, but
+  unsynced batches do not guarantee a one-second loss bound under storage or
+  machine failure: every batch not yet made durable may be lost. The clean
+  shutdown barrier covers successful previous batches; failed writes and
+  deliberately dropped snapshots remain gaps. A failed write is a gap too:
+  the times stay in memory and the next
+  flush writes again; each market's first failed write is logged as a
+  warning, later ones only with `-debug=net`.
+- At start, after the production store replays, the market **queues** its
+  history and goes on at once. The thread then loads it, before it writes any
+  row of that market: rows at or after the store's next sequence are erased,
+  with every stored candle holding such an entry (a candle cannot be cut
+  back, so neither a disk page nor a later start can serve one; the entries
+  recorded since begin such a bucket again, so its candle may undercount,
+  missing the kept entries before the head, and is marked as a seam:
+  `seam_before` when its first entry is the first after the restart,
+  `partial` when an untimed entry came first), a row whose
+  hash contradicts the store's retained hashes (or another domain) clears
+  the market's times, and the newest rows and each interval's memory window
+  are reloaded. Repeated registrations of the same market replace the queued
+  handle, rather than retaining retired histories forever. An in-flight flush
+  may finish on its shared old handle; the replacement is checked on a later
+  serialized pass before its disk history is served. An unreadable database
+  is wiped and recreated; if even that
+  fails, times stay in memory.
+- A load that cannot read or write the database (an I/O error, or a scan
+  that meets an unreadable block) is not a load. The market stays as while
+  loading (`observed_time_loading`, its entries waiting) and none of its
+  disk candles is served or rows written.
+  It is attempted at most 3 times, 5 s apart; shutdown attempts a load still
+  queued at once and gives it up if that fails. Entries wait during the
+  retries as during a slow load: at most 4096, any more are a gap (counted
+  as not persisted) and missing from the candles. A load given up (or a
+  history that could not be installed) is logged with the reason and leaves
+  that market's times in memory only until restart: its entries are
+  recorded and served from memory, as when the database cannot be opened,
+  and its disk is neither served nor written. Its candle pages are then
+  available with only the candles of entries recorded since the start
+  (those that waited included): a client takes the start of its history
+  from the market-data section's `recorded_since_sequence`, and
+  `storage.persisted` stays false. `observed_time` holds display
+  data only and may be removed if this repeats. A disk candle is served,
+  and a row written, only for a market whose load succeeded. A candle page
+  whose window needs the database when it cannot be read (an I/O error, or
+  an unreadable block) is unavailable, `observed_time_disk_unavailable`,
+  never the memory window alone as if nothing older existed. An unreadable block is
+  not repaired: once a LevelDB compaction reaches it, every later write of
+  the whole database can fail, for every market, until `observed_time` is
+  removed.
+- Entries committed while the history loads keep only their clock readings
+  and are stamped once it has loaded, exactly as if it had loaded first
+  (the same clamps, steps, untimed entries and continued candles; a stored
+  bucket is continued, never replaced, except one the load erased for
+  holding an entry at or beyond the head, above). At most 4096 wait; beyond that the
+  oldest are a gap, counted as not persisted. Until the load finishes the
+  market's `observed_time` section and candles are unavailable with
+  `observed_time_loading` and its disk candles are not served: never a
+  partial answer, which a chart would hold as its whole window. The load
+  itself is replayed off the recorder's mutex: a `Record` arriving as it
+  ends waits only for the entries recorded during its last replay round,
+  at most 64, or at most 4096 only when entries kept arriving as fast as
+  the replay for all eight rounds (4096 measured in a test build: under a
+  millisecond warm, about 2 ms cold). The load checks every stored
+  candle of the market, so after a start it lasts up to tens of milliseconds
+  per market at full retention; only a slow or stalled disk makes it longer,
+  and then only the display waits.
 - Retention: 262,144 rows per market; candles 1m 14 days, 5m 60 days, 15m 180
   days, 1h 2 years, 4h 5 years, 1d 10 years (swept at most once a minute, a
   bounded number of erases per sweep). Memory windows: 1m one day, 5m three
@@ -95,7 +177,9 @@ auction existed between them; anything else is a gap.
 `getflowmeshmarketdata <market> {"observed_time": true, ...}` adds an
 `observed_time` section (present only when requested, also on an unchanged
 `known_head` poll, refused with a status-only read): `available`,
-`unavailable_reason`, `source` (`this_node`), `source_kind`
+`unavailable_reason` (`not_recorded_by_this_node`, or `observed_time_loading`
+while this node's history of the market still loads after a start: retry),
+`source` (`this_node`), `source_kind`
 (`operator_observed`), `certified` (always false), `clock_suspect`,
 `recorded_since_sequence`, and `rows` for the head and exactly the reply's
 history and tick entries whose hash matches: `sequence`, `microblock_hash`,
@@ -104,6 +188,15 @@ history and tick entries whose hash matches: `sequence`, `microblock_hash`,
 unchanged: times live beside them, so tick equality (which drives clients'
 conflict checks) can never change because of them.
 
+This node's own section (`source` `this_node`, also while its history
+loads) adds `storage`, operator detail that a public reply and an endpoint
+never carry: `persisted` (false after a failed write or history load
+attempt, and until restart once the market's disk history was given up:
+its times are then kept in memory only, from `recorded_since_sequence`),
+`rows_not_persisted` and `candles_not_persisted` (times and candle
+snapshots dropped from persistence before any write, a gap after a
+restart; a failed write shows only in `persisted`).
+
 `getflowmeshcandles <market> {"interval": "1m|5m|15m|1h|4h|1d", "before_ms": n,
 "limit": 1-500}` returns the candles with open in
 `[before_ms - limit x interval, before_ms)`, oldest first, only buckets holding
@@ -111,7 +204,23 @@ placed entries: `open_ms`, `first_sequence`, `last_sequence`, `entries`,
 `clearings`, `open/high/low/close` (with a clearing), `base_volume` and
 `quote_volume` as exact decimal strings, `flags`, plus `more` and
 `endpoint_reported`. The local engine pages its database beyond the memory
-window; a remote client asks its endpoint.
+window; a remote client asks its endpoint. While the market's history loads
+the page is unavailable with `observed_time_loading` (the public `candles`
+method answers the same, and a remote client reports it as
+`endpoint_unavailable: observed_time_loading`); Qt reads candles only once
+the market-data section is available. A local page whose window reaches
+before the memory window is unavailable with
+`observed_time_disk_unavailable` when the database cannot be read for it
+(the public `candles` method never reads the disk); a later read retries.
+
+Every observed time and candle open is before 10000-01-01T00:00:00Z
+(`OBSERVED_MS_LIMIT`, 253402300800000 ms), a display bound only. A larger
+`before_ms`, up to 9223372036854775807 (`INT64_MAX`), is clamped to it; a
+value above `INT64_MAX` is refused as out of range (`getflowmeshcandles` and
+the public `candles` method alike). A wall clock at or past it
+records entries `untimed` (`clock_suspect`, reason `clock_stepped_back`) and
+never becomes the floor later stamps must pass, and a stored row or candle
+at or past it (a corrupt database) is never read back.
 
 ## 3. Public trading API
 
@@ -150,29 +259,47 @@ only (another endpoint starts again), with only the public flags taken. They
 are flagged `implausible`, never corrected, when a live time goes backwards
 with sequence, when any time is more than 5 s after it was received, or when
 the head's time is before the block that made its anchor final less 120 s.
+A section holding a time at or past 10000-01-01 (the display bound
+`OBSERVED_MS_LIMIT`) is refused (`endpoint_observed_time_rejected: out of
+range`) and its held rows are cleared.
 Replies label the section with the endpoint's URL or say why there is none
 (`endpoint_does_not_advertise_observed_time`, `observed_time_not_yet_received`).
 
 `Candles` asks the endpoint serving the market's data, only when it
-advertises candles. The work gate is not held across the request, which uses a
-lane with its own TLS connection (busy fails at once). The page download
-itself does not hold the order work gate. If its forming candle is ahead of
-the held certified head, however, the subsequent ordinary verified refresh
-does hold that gate; a concurrent order can wait for its network reads,
-verification and durable high-water save. Eliminating that contention needs
-a separately reviewed consistent-snapshot path, not weaker verification.
-The page is structure-checked (interval, window, aligned
-ascending opens, non-overlapping sequences, consistent prices, exact volumes)
-and no candle may go past a head this client verified. The endpoint's forming
-candle ends at the endpoint's own head, which on an active market is nearly
-always a few auctions past the head the client verified before the request
-(round trip plus verification, at about five auctions a second). So a page
-that reaches past the held head is checked against a consistent head: the
-endpoint's head verified after the page was served, by the same refresh a
-market-data read makes (with its ticks and their times). An honest endpoint's
-head is then at or past every candle it served; a page that still goes past
-it, or a change of endpoint meanwhile, is refused. The page stays labelled
-endpoint-reported: its prices, volumes and times are the endpoint's claims.
+advertises candles. It is display work: the work gate is taken only for a
+brief passive read, without I/O, of the endpoint and the verified head (never
+ahead of queued trading work, never reserving the gate after it), and never
+across the request, which uses a lane with its own TLS connection (busy fails
+at once). Nothing is refreshed, verified or written for a candles page, so an
+order never waits for one beyond that read. The page is structure-checked
+(interval, window, aligned ascending opens, non-overlapping sequences,
+consistent prices, exact volumes), and no candle it returns goes past the head
+this client verified before the request.
+
+The endpoint's forming candle ends at the endpoint's own head, which on an
+active market is nearly always a few auctions past the head the client
+verified (round trip plus verification, at about five auctions a second). The
+client never fetches a newer head for a page: the candles ending past its
+verified head (a suffix, since sequences ascend) are held back, and before_ms
+is lowered by whole intervals from from_ms (so an unaligned window stays
+valid) to leave their buckets out. Only the newest bucket still grows, so the
+client keeps, per market and interval, the newest candle of the latest page
+from that endpoint (at most 48, never replaced by an older history page,
+cleared on reconnect); when that earlier view of the first held-back bucket
+(same open and first auction) ends within the verified head, it stands in for
+it and the window includes its bucket. The next market-data read moves the
+head, and the next page reaches it. Accepted residuals: the first read of a
+market and interval from an endpoint has no earlier view, so an active
+forming bucket is missing from that page (Qt rebuilds it from the held ticks,
+exactly when they reach back to the last candle kept, else from one 2 s
+window re-read); a remote RPC consumer that never reads market data sees
+candles only up to its last verified head; and an endpoint that claims a
+candle past any head it can prove is no longer reported as an error, it is
+simply never shown. A page whose window ends past 10000-01-01 or holds a
+candle at or past it is refused (`endpoint_candles_rejected: out of range`);
+the client itself never asks for a window ending past that bound. The page
+stays labelled endpoint-reported: its prices, volumes and times are the
+endpoint's claims.
 
 ## 5. Qt
 
@@ -183,15 +310,25 @@ endpoint-reported: its prices, volumes and times are the endpoint's claims.
   observed time is hatched and counted; a clock seam is marked. Partial candles
   are hollow. After the newest candle the axis is blank. Wheel zoom (10-500
   buckets), drag pan, double-click for the latest; painting covers visible
-  buckets only. Headers: locally "Certified execution · times observed by this
+  buckets only. The chart refuses a series whose bucket starts are
+  unaligned, out of order or not before 10000-01-01 (shown as unavailable,
+  "malformed"); zoom and pan stay between 1970 and the last bucket before
+  that bound (one pan or drag moves at most ten million buckets), and the
+  axis draws at most one label per 72 px of its width, never stepping past
+  its window. Headers: locally "Certified execution · times observed by this
   node (not certified)", remotely "Prices, volumes and times reported by
   <host> · not verified"; the axis names the observer and says UTC. Without
   times (an older server) the chart keeps auction order ("Every 5 auctions")
   with the note "This server does not report times (older version)".
 - **Candle reads.** A 300-interval window after a market, interval or source
   change (or at most every 2 s while the held ticks cannot continue it), else
-  the newest three intervals about every 10 s. Those newest intervals are
-  merged only where they continue the held window of the same source: they
+  the newest three intervals about every 10 s, only in a passive refresh:
+  never in an order review's, funding, receipt, connect or action read, which
+  the user waits for (they stay due for the next passive refresh). A remote
+  page ends at the verified head: its newest bucket may be held back or be
+  this client's earlier view of it, which the held ticks continue. Those
+  newest intervals are merged only where they continue the held window of
+  the same source: they
   reach back over its newest candle, or their first candle directly follows
   its last auction. Otherwise the whole window is read at once. That happens
   after the panel was hidden, the machine slept, reads failed for longer than
@@ -279,13 +416,28 @@ volumes, late placement only inside a bound, partial and seam flags, quiet
 proof, liveness matrix including a level peer, warm-up tolerance, paging,
 retention, client extension), `flowmesh_observed_time_log_tests` (clock clamp,
 step, untimed, restart; persistence and reload; lost tail is a gap; corrupt
-database; rows past the store head; hash mismatch; pending overflow; flush
-failure; a stalled flush never blocks Record or reads; candle JSON),
+database; rows past the store head, and a bucket erased for them restarting
+as a seam; hash mismatch; pending overflow; only a stopping store giving a
+failing load up early; flush
+failure; a stalled flush never blocks Record, reads or a market attach; a
+history loaded after entries equals one loaded first, at the log and at the
+store whenever the queued load runs, with more than 4096 waiting entries,
+a clock an hour behind, and a load racing new entries; reads while loading
+are unavailable; a contradicted queued history is never served; the store
+thread opens the database; concurrent attach, record, read and flush;
+a failed disk read is reported, never an empty history; each market's
+first failed write is one warning; persistence losses and a given-up
+history are reported in this node's section; candle JSON),
+`flowmesh_service_tests` (a market start and the service start never wait
+for observed-time storage; a page whose disk read fails is unavailable),
 `flowmesh_runtime_tests` (recorded after commit with its liveness, catch-up and
 deferral late, level peer live, throwing clock, the market-data section),
 `flowmesh_client_ticks_tests` (adverts, row binding and plausibility, candle
-page checks, round trip), `flowmesh_client_market_view_tests` (public contract
-on and off for both flags, rate limit, remote labels and candles, older
-endpoint reasons). Qt: `test_b3_flowmeshworkspace-qt` (parsing, requests,
-time candles, viewport, fallback, tape, wording, receipt times). Functional
-(opt-in, run directly): `feature_flowmesh_observed_time.py`.
+page checks, round trip, holding back candles past the verified head),
+`flowmesh_client_market_view_tests` (public contract on and off for both
+flags, rate limit, remote labels and candles, held-back candles, a candles
+read never holding the work gate across the network, older endpoint
+reasons). Qt: `test_b3_flowmeshworkspace-qt` (parsing, requests,
+candles only in passive reads, time candles, viewport, fallback, tape,
+wording, receipt times). Functional (opt-in, run directly):
+`feature_flowmesh_observed_time.py`.

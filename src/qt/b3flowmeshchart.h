@@ -62,6 +62,10 @@ public:
     void resetTimeView();
     //! A UTC axis label for a bucket start at this interval.
     static QString TimeAxisLabel(int64_t open_ms, flowmesh::CandleInterval interval);
+    //! The axis label positions: the multiples of `label_step` in
+    //! [left, right], ascending, at most `max_labels` of them. Never steps
+    //! past `right`. Empty for label_step <= 0, left < 0 or right < left.
+    static std::vector<int64_t> AxisLabelOpens(int64_t left, int64_t right, int64_t label_step, size_t max_labels);
     //! What the prices and times are and who reported them.
     static QString ProvenanceText(bool remote, const QString& source);
     //! "Every N auctions" for the auction-order fallback.

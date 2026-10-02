@@ -77,6 +77,10 @@ void ObservedRollup::Add(const ObservedStamp& stamp, const std::optional<Clearin
     const bool priced{tick && tick->sequence == stamp.sequence && tick->microblock_hash == stamp.hash};
     const bool cleared{priced && tick->cleared && tick->volume > 0 && MoneyRange(tick->price) && MoneyRange(tick->volume)};
     const std::optional<int64_t> after{m_last_live_ms};
+    // A time at or past OBSERVED_MS_LIMIT is no time: like an untimed entry
+    // it is placed nowhere, marks the next candle partial and never becomes
+    // the live bound.
+    const bool timed{stamp.ms > 0 && stamp.ms < OBSERVED_MS_LIMIT};
     for (const auto interval : CANDLE_INTERVALS) {
         if (!Tracked(interval)) continue;
         auto& series{m_series[Index(interval)]};
@@ -87,9 +91,9 @@ void ObservedRollup::Add(const ObservedStamp& stamp, const std::optional<Clearin
         };
         std::optional<int64_t> place;
         bool late{false};
-        if (stamp.mode == ObservedMode::LIVE && stamp.ms > 0) {
+        if (stamp.mode == ObservedMode::LIVE && timed) {
             place = CandleOpenMs(stamp.ms, interval);
-        } else if (stamp.mode == ObservedMode::DELAYED && stamp.ms > 0 && after && *after <= stamp.ms &&
+        } else if (stamp.mode == ObservedMode::DELAYED && timed && after && *after <= stamp.ms &&
                    CandleOpenMs(*after, interval) == CandleOpenMs(stamp.ms, interval)) {
             place = CandleOpenMs(stamp.ms, interval);
             late = true;
@@ -102,7 +106,7 @@ void ObservedRollup::Add(const ObservedStamp& stamp, const std::optional<Clearin
                 const int64_t low{CandleOpenMs(*after, interval)};
                 for (auto it{series.candles.rbegin()}; it != series.candles.rend() && it->open_ms >= low; ++it) mark(*it, CANDLE_PARTIAL);
             }
-            if (stamp.mode == ObservedMode::DELAYED && stamp.ms > 0) {
+            if (stamp.mode == ObservedMode::DELAYED && timed) {
                 const int64_t high{CandleOpenMs(stamp.ms, interval)};
                 if (!series.candles.empty() && series.candles.back().open_ms == high) {
                     mark(series.candles.back(), CANDLE_PARTIAL);
@@ -149,7 +153,7 @@ void ObservedRollup::Add(const ObservedStamp& stamp, const std::optional<Clearin
         }
         if (changed) changed->emplace_back(interval, candle);
     }
-    if (stamp.mode == ObservedMode::LIVE && stamp.ms > 0) m_last_live_ms = stamp.ms;
+    if (stamp.mode == ObservedMode::LIVE && timed) m_last_live_ms = stamp.ms;
 }
 
 void ObservedRollup::Restore(const CandleInterval interval, std::vector<ObservedCandle> candles)
@@ -157,20 +161,24 @@ void ObservedRollup::Restore(const CandleInterval interval, std::vector<Observed
     if (!Tracked(interval)) return;
     auto& series{m_series[Index(interval)]};
     series = {};
+    // Only bucket starts Add can have made: in range and aligned. Every held
+    // open is then at most OBSERVED_MS_LIMIT - interval.
+    const int64_t step{CandleIntervalMs(interval)};
+    std::erase_if(candles, [&](const auto& candle) { return !ObservedTimeInRange(candle.open_ms) || candle.open_ms % step != 0; });
     std::sort(candles.begin(), candles.end(), [](const auto& a, const auto& b) { return a.open_ms < b.open_ms; });
     for (auto& candle : candles) {
         if (!series.candles.empty() && series.candles.back().open_ms == candle.open_ms) continue;
         series.candles.push_back(std::move(candle));
     }
     if (series.candles.empty()) return;
-    const int64_t window{static_cast<int64_t>(CandleMemoryWindow(interval)) * CandleIntervalMs(interval)};
+    const int64_t window{static_cast<int64_t>(CandleMemoryWindow(interval)) * step};
     while (series.candles.front().open_ms < series.candles.back().open_ms - window) series.candles.pop_front();
 }
 
 void ObservedRollup::RestoreLast(const std::optional<uint64_t> last_sequence, const std::optional<int64_t> last_live_ms)
 {
     m_last_sequence = last_sequence;
-    m_last_live_ms = last_sequence ? last_live_ms : std::nullopt;
+    m_last_live_ms = last_sequence && last_live_ms && ObservedTimeInRange(*last_live_ms) ? last_live_ms : std::nullopt;
 }
 
 ObservedCandlePage ObservedRollup::Page(const CandleInterval interval, const std::optional<int64_t> before_ms, size_t limit) const
@@ -181,7 +189,9 @@ ObservedCandlePage ObservedRollup::Page(const CandleInterval interval, const std
     limit = std::clamp<size_t>(limit, 1, OBSERVED_CANDLE_PAGE_MAX);
     const auto& candles{Candles(interval)};
     const int64_t step{CandleIntervalMs(interval)};
-    int64_t before{before_ms ? std::max<int64_t>(0, *before_ms)
+    // Every held open is at most OBSERVED_MS_LIMIT - step (Add and Restore
+    // hold nothing at or past the bound), so neither end passes it.
+    int64_t before{before_ms ? std::clamp<int64_t>(*before_ms, 0, OBSERVED_MS_LIMIT)
                              : candles.empty() ? 0 : candles.back().open_ms + step};
     const int64_t span{static_cast<int64_t>(limit) * step};
     out.before_ms = before;

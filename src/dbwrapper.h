@@ -19,6 +19,10 @@
 #include <stdexcept>
 #include <string>
 
+namespace leveldb {
+class Env;
+}
+
 static const size_t DBWRAPPER_PREALLOC_KEY_SIZE = 64;
 static const size_t DBWRAPPER_PREALLOC_VALUE_SIZE = 1024;
 static const size_t DBWRAPPER_MAX_FILE_SIZE = 32 << 20; // 32 MiB
@@ -44,6 +48,9 @@ struct DBParams {
     bool obfuscate = false;
     //! Passed-through options.
     DBOptions options{};
+    //! Tests only: borrowed environment, which must outlive the wrapper.
+    //! Must not be combined with memory_only. Null uses the normal backend.
+    leveldb::Env* env_for_test{nullptr};
 };
 
 class dbwrapper_error : public std::runtime_error

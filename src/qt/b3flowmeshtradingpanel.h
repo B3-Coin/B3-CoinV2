@@ -215,6 +215,17 @@ private:
     std::optional<std::vector<flowmesh::LadderStep>> ladderSteps(QString* error = nullptr, bool* adjusted = nullptr) const;
     //! The ladder fields' text, for a deferred review's comparison.
     QStringList ladderText() const;
+    //! Every ticket field whose text is a price in the displayed orientation
+    //! and market, in ladder row order: the limit price (the ladder's first
+    //! step), then the ladder's other prices. ladderSteps reads exactly these,
+    //! and a view, market or wallet change clears exactly these.
+    std::array<QLineEdit*, flowmesh::FLOWMESH_LADDER_MAX_STEPS> ticketPriceFields() const;
+    //! Empties every ticket price with its undo and redo history, so a price
+    //! typed in one view or market is never read, or brought back, in another.
+    void clearTicketPrices();
+    //! clearTicketPrices, and every ticket quantity the same way: on a market
+    //! or wallet change, where the quantities' token changes too.
+    void clearTicketEntries();
     //! The last held tick of `market`, when the held ticks are that market's.
     std::optional<uint64_t> ticksAfter(const QString& market) const;
     //! The book grouping the order book displays (exact: none).

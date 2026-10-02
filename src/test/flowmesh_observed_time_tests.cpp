@@ -12,6 +12,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -342,6 +343,85 @@ BOOST_AUTO_TEST_CASE(extend_served_candles_with_live_ticks)
     BOOST_REQUIRE_EQUAL(flagged.size(), 1U);
     BOOST_CHECK(flagged.back().flags & flowmesh::CANDLE_PARTIAL);
     BOOST_CHECK_EQUAL(flagged.back().entries, served.back().entries);
+}
+
+BOOST_AUTO_TEST_CASE(times_past_the_display_bound_are_never_placed)
+{
+    constexpr int64_t MAX{std::numeric_limits<int64_t>::max()};
+    constexpr int64_t LIMIT{flowmesh::OBSERVED_MS_LIMIT};
+    // 10000-01-01T00:00:00Z, a bucket start of every interval.
+    BOOST_CHECK_EQUAL(LIMIT, int64_t{253'402'300'800} * 1000);
+    BOOST_CHECK(flowmesh::ObservedTimeInRange(0) && flowmesh::ObservedTimeInRange(LIMIT - 1));
+    BOOST_CHECK(!flowmesh::ObservedTimeInRange(-1) && !flowmesh::ObservedTimeInRange(LIMIT));
+
+    // A reply or a clock at or past the bound is no time: placed nowhere,
+    // exactly as an untimed entry.
+    ObservedRollup rollup;
+    rollup.Add(Stamp(1, T0 + 1), Tick(1, 5, 1));
+    rollup.Add(Stamp(2, MAX - 1), Tick(2, 6, 1));
+    rollup.Add(Stamp(3, LIMIT), Tick(3, 7, 1));
+    for (const auto interval : flowmesh::CANDLE_INTERVALS) {
+        BOOST_TEST_CONTEXT("interval " << flowmesh::CandleIntervalName(interval)) {
+            BOOST_REQUIRE_EQUAL(rollup.Candles(interval).size(), 1U);
+            BOOST_CHECK_LT(rollup.Candles(interval).back().open_ms, LIMIT);
+        }
+    }
+    BOOST_CHECK_EQUAL(rollup.LastLiveMs().value_or(0), T0 + 1);
+    // The next timed entry opens a candle marked partial: the untimed ones
+    // happened before it.
+    rollup.Add(Stamp(4, T0 + 120'000), Tick(4, 8, 1));
+    const auto& minutes{rollup.Candles(CandleInterval::M1)};
+    BOOST_REQUIRE_EQUAL(minutes.size(), 2U);
+    BOOST_CHECK(minutes.back().flags & flowmesh::CANDLE_PARTIAL);
+    BOOST_CHECK_EQUAL(minutes.back().first_sequence, 4U);
+    // A requested window never ends past the bound.
+    const auto page{rollup.Page(CandleInterval::M1, MAX, 500)};
+    BOOST_CHECK_EQUAL(page.before_ms, LIMIT);
+    BOOST_CHECK_EQUAL(page.from_ms, LIMIT - 500 * 60'000);
+    BOOST_CHECK(page.candles.empty());
+    BOOST_CHECK(page.more);
+    // A client extending a served page with such a stamp places nothing.
+    const std::vector<ObservedCandle> served{minutes.begin(), minutes.end()};
+    bool incomplete{true};
+    const auto extended{flowmesh::ExtendObservedCandles(served, CandleInterval::M1, {{Stamp(5, MAX - 1), Tick(5, 9, 1)}}, &incomplete)};
+    BOOST_CHECK(!incomplete);
+    BOOST_REQUIRE_EQUAL(extended.size(), served.size());
+    BOOST_CHECK_EQUAL(extended.back().open_ms, T0 + 120'000);
+    BOOST_CHECK(extended.back().flags & flowmesh::CANDLE_PARTIAL);
+}
+
+BOOST_AUTO_TEST_CASE(restored_times_past_the_display_bound_are_dropped)
+{
+    constexpr int64_t MAX{std::numeric_limits<int64_t>::max()};
+    constexpr int64_t LIMIT{flowmesh::OBSERVED_MS_LIMIT};
+    ObservedRollup restored;
+    // A reloaded live bound past the bound bounds nothing.
+    restored.RestoreLast(5, MAX);
+    BOOST_CHECK(!restored.LastLiveMs());
+    restored.RestoreLast(5, LIMIT);
+    BOOST_CHECK(!restored.LastLiveMs());
+    restored.RestoreLast(5, T0);
+    BOOST_CHECK_EQUAL(restored.LastLiveMs().value_or(0), T0);
+    // Restored candles (a store's, a served page's) are only bucket starts
+    // Add can make: in range and aligned.
+    const auto candle = [](const int64_t open_ms, const uint64_t sequence) {
+        ObservedCandle out;
+        out.open_ms = open_ms;
+        out.first_sequence = out.last_sequence = sequence;
+        out.entries = 1;
+        return out;
+    };
+    restored.Restore(CandleInterval::M1, {candle(T0, 1), candle(MAX - MAX % 60'000, 2), candle(-60'000, 3), candle(T0 + 1, 4)});
+    BOOST_REQUIRE_EQUAL(restored.Candles(CandleInterval::M1).size(), 1U);
+    BOOST_REQUIRE_EQUAL(restored.Candles(CandleInterval::M1).front().open_ms, T0);
+    const auto page{restored.Page(CandleInterval::M1, std::nullopt, 500)};
+    BOOST_CHECK_EQUAL(page.before_ms, T0 + 60'000);
+    BOOST_REQUIRE_EQUAL(page.candles.size(), 1U);
+    BOOST_CHECK_EQUAL(page.candles.front().first_sequence, 1U);
+    // The newest bucket before the bound is kept; the window then ends at it.
+    restored.Restore(CandleInterval::M1, {candle(LIMIT - 60'000, 5), candle(LIMIT, 6)});
+    BOOST_REQUIRE_EQUAL(restored.Candles(CandleInterval::M1).size(), 1U);
+    BOOST_CHECK_EQUAL(restored.Page(CandleInterval::M1, std::nullopt, 500).before_ms, LIMIT);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

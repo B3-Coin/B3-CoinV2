@@ -17,6 +17,7 @@
 #include <node/flowmesh_checkpoint_index.h>
 #include <node/flowmesh_health.h>
 #include <node/flowmesh_market_memo.h>
+#include <node/flowmesh_observed_time_log.h>
 #include <node/fn_seat_index.h>
 #include <primitives/block.h>
 #include <test/util/setup_common.h>
@@ -29,9 +30,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -1280,6 +1283,137 @@ BOOST_AUTO_TEST_CASE(retained_service_lock_rejects_conflicting_proposal_after_re
         BOOST_CHECK(service.MarketStatus(market)->last_microblock_hash == entry.GetHash());
     }
     CheckLock(entry, /*committed=*/true);
+}
+
+// Display storage never runs on a market start: with the observed-time
+// store's thread held inside its disk write, the service still starts,
+// installs the market and opens the B3 reconciliation gate. The market's
+// candles answer at once as still loading, and are available once the
+// store's thread moves on.
+BOOST_AUTO_TEST_CASE(market_start_never_waits_for_observed_time_storage)
+{
+    using namespace std::chrono_literals;
+    const auto genesis{Genesis()};
+    Retain(genesis);
+    std::string error;
+    // Declared before the service, so they outlive it: its destructor's
+    // Stop may still run the store's hook.
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered{false}, release{false};
+    const auto release_hook = [&] {
+        {
+            std::lock_guard lock{mutex};
+            release = true;
+        }
+        cv.notify_all();
+    };
+    node::FlowMeshService service{*m_node.chainman, ServicePath()};
+    std::future<bool> started;
+    // Released on every path before the start is awaited and before the
+    // service stops, so a failed REQUIRE below never leaves either waiting
+    // on a thread held in the hook.
+    const struct Releaser {
+        std::function<void()> release;
+        ~Releaser() { release(); }
+    } releaser{release_hook};
+    auto& store{service.ObservedTimeStoreForTest()};
+    BOOST_REQUIRE(store.Open(error));
+    // Another market's pending row, so the store's first flush writes and
+    // stops inside the hook.
+    const auto dummy{std::make_shared<node::FlowMeshObservedTimeLog>(
+        domain, flowmesh::MarketId{uint256{uint8_t{0x77}}})};
+    store.Attach(dummy, 0, {});
+    dummy->Record(0, uint256::ONE, flowmesh::ObservedDelay::NONE, std::nullopt);
+    store.SetFlushHookForTest([&] {
+        std::unique_lock lock{mutex};
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+    });
+    store.Start();
+    {
+        std::unique_lock lock{mutex};
+        BOOST_REQUIRE(cv.wait_for(lock, 10s, [&] { return entered; }));
+    }
+    started = std::async(std::launch::async, [&] {
+        std::string start_error;
+        const bool ok{service.Start(*m_node.peerman, start_error)};
+        if (!ok) BOOST_TEST_MESSAGE("start: " << start_error);
+        return ok;
+    });
+    const bool prompt{started.wait_for(30s) == std::future_status::ready};
+    if (!prompt) release_hook();
+    BOOST_REQUIRE_MESSAGE(prompt, "the service start waited for observed-time storage");
+    BOOST_REQUIRE(started.get());
+    BOOST_REQUIRE(WaitUntil([&] {
+        const auto health{service.Health(market)};
+        const auto* row{health.Find(market)};
+        return row && row->observation && row->observation->installed;
+    }));
+    BOOST_CHECK(!service.Health(market).gate.closed);
+    // The market's history is queued behind the stuck disk write: its
+    // candles say so at once, never a page without that history.
+    auto read{std::async(std::launch::async, [&] {
+        std::string read_error;
+        return service.ObservedCandles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, /*allow_disk=*/true, read_error);
+    })};
+    const bool read_prompt{read.wait_for(10s) == std::future_status::ready};
+    if (!read_prompt) release_hook();
+    BOOST_REQUIRE_MESSAGE(read_prompt, "a candles read waited for observed-time storage");
+    const auto loading{read.get()};
+    BOOST_REQUIRE(loading);
+    BOOST_CHECK(!loading->available);
+    BOOST_CHECK_EQUAL(loading->unavailable_reason, node::FlowMeshObservedTimeLog::LOADING_REASON);
+    BOOST_CHECK(loading->candles.empty());
+
+    release_hook();
+    store.FlushNow(false);
+    const auto loaded{service.ObservedCandles(market, flowmesh::CandleInterval::M1, std::nullopt, 10, /*allow_disk=*/true, error)};
+    BOOST_REQUIRE(loaded);
+    BOOST_CHECK(loaded->available);
+    BOOST_CHECK_EQUAL(loaded->source, "this_node");
+    store.SetFlushHookForTest({});
+    service.Stop();
+    BOOST_CHECK(dummy->GetSummary().persisted);
+}
+
+// A candle window that reaches before the memory window needs the
+// observed-time database (with no entry yet, every window with an end
+// does). When that read fails, the page is unavailable with its reason,
+// never the memory window alone as if nothing older existed; a memory-only
+// read (the public candles method) is unaffected, and the next read that
+// succeeds is served.
+BOOST_AUTO_TEST_CASE(a_candle_page_whose_disk_read_fails_is_unavailable)
+{
+    const auto genesis{Genesis()};
+    Retain(genesis);
+    std::string error;
+    node::FlowMeshService service{*m_node.chainman, ServicePath()};
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    const auto read = [&](const bool allow_disk) {
+        std::string read_error;
+        const auto page{service.ObservedCandles(market, flowmesh::CandleInterval::M1, int64_t{1'790'769'600'000}, 10, allow_disk, read_error)};
+        BOOST_REQUIRE_MESSAGE(page, read_error);
+        return *page;
+    };
+    // Loaded by the store's own thread.
+    BOOST_REQUIRE(WaitUntil([&] { return read(/*allow_disk=*/true).available; }));
+    auto& store{service.ObservedTimeStoreForTest()};
+    store.SetReadHookForTest([] { throw std::runtime_error{"injected read error"}; });
+    const auto failed{read(/*allow_disk=*/true)};
+    BOOST_CHECK(!failed.available);
+    BOOST_CHECK_EQUAL(failed.unavailable_reason, node::FlowMeshObservedTimeStore::READ_FAILED_REASON);
+    BOOST_CHECK_EQUAL(failed.unavailable_reason, "observed_time_disk_unavailable");
+    BOOST_CHECK(failed.candles.empty());
+    BOOST_CHECK(!failed.more);
+    BOOST_CHECK_EQUAL(failed.source, "this_node");
+    const auto memory{read(/*allow_disk=*/false)};
+    BOOST_CHECK(memory.available);
+    BOOST_CHECK(memory.unavailable_reason.empty());
+    store.SetReadHookForTest({});
+    BOOST_CHECK(read(/*allow_disk=*/true).available);
+    service.Stop();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

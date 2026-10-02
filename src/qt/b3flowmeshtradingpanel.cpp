@@ -403,9 +403,22 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     connect(m_endpoint, &QLineEdit::returnPressed, this, &B3FlowMeshTradingPanel::requestConnect);
     connect(m_endpoint, &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateConnectionState);
     connect(m_orientation, &QComboBox::currentIndexChanged, this, [this] {
-        // Never reinterpret a typed price or a deferred click in another unit.
-        m_deferred_review.reset(); m_price->clear();
-        for (auto* price : m_ladder_prices) price->clear();
+        // Never reinterpret a typed price or a deferred click in another
+        // unit: every price of the ticket, the ladder's included (hidden rows
+        // too), and with no undo or redo that would bring one back.
+        m_deferred_review.reset();
+        // A flip changes how the ticket reads, never the order it drafts:
+        // the side selected in the view left is the other button here, as
+        // buying the token is selling B3, so the same order is the other
+        // button. Every orientation change is a change between the two views
+        // (two fixed items, never changed under a signal blocker), so this
+        // swaps the pressed button. Quantities are token amounts of that same
+        // side in both views and are kept; a marketable limit re-prices that
+        // same side. The side is set before the prices are cleared, so no
+        // marketable re-price ever runs for the other side.
+        const bool buy{B3FlowMeshMarketData::DisplayBuy(B3FlowMeshMarketData::CanonicalSide(m_side->currentIndex() == 0, !inverted()), inverted())};
+        m_side->setCurrentIndex(buy ? 0 : 1); (buy ? m_buy : m_sell)->setChecked(true);
+        clearTicketPrices();
         updateMarketText(); updateDataViews();
     });
     connect(m_market, &QComboBox::currentIndexChanged, this, [this] {
@@ -415,6 +428,10 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         if (m_active_result && m_active_result->passive) m_yield_refresh->store(true);
         resetRefreshSchedule();
         m_deferred_status.reset(); // A queued click never follows a market switch.
+        // The ticket was typed for the market left: its prices and quantities
+        // are never read in another token. (Internal list updates block this
+        // signal, so this runs only for a market the user picked.)
+        clearTicketEntries();
         // A failed read/backoff belongs to its selected market. Another listed
         // market may already have a certified head and can be read immediately.
         m_read_error.clear(); m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_attempt_age.invalidate();
@@ -507,6 +524,10 @@ void B3FlowMeshTradingPanel::setWalletModel(WalletModel* wallet)
     m_request_seen.clear(); m_request_order.clear(); m_requests_seeded = false; m_last_settled.invalidate();
     m_toasts->clear(); m_link_toast_down = false; m_link_toast_age.invalidate();
     m_amount->clear(); m_withdrawal_draft_amount.clear(); m_destination->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
+    // The market list is cleared below with its signal blocked and read
+    // again for this wallet, its first market selected: the previous
+    // wallet's ticket is never read in that market.
+    clearTicketEntries();
     m_client_info.reset(); m_connection_error.clear(); m_connect_error.clear();
     { QSignalBlocker blocker{m_saved_selector}; m_saved_selector->clear(); }
     m_receipt_card->setText(wallet ? tr("Loading this wallet's locally saved requests. No action is automatically resent.") : tr("Open a wallet to inspect its saved requests."));
@@ -976,11 +997,12 @@ void B3FlowMeshTradingPanel::updateTicket()
         CAmount total{0};
         for (const auto& step : *steps) total += step.qty;
         const auto reservation{*flowmesh::LadderReservation(bid, *steps)};
-        m_ticket_total->setText((steps->size() == 1 ? tr("Ladder of 1 price · %1 %2 in total\n%3") : tr("Ladder of %4 prices · %1 %2 in total\n%3"))
-            .arg(FormatAmount(total, u.decimals), ticker,
-                 bid ? tr("Reserves exactly %1 B3 (the sum of quantity x price)").arg(FormatAmount(reservation, 9))
-                     : tr("Reserves %1 %2").arg(FormatAmount(reservation, u.decimals), ticker))
-            .arg(steps->size()));
+        const QString amount{FormatAmount(total, u.decimals)};
+        const QString reserves{bid ? tr("Reserves exactly %1 B3 (the sum of quantity x price)").arg(FormatAmount(reservation, 9))
+                                   : tr("Reserves %1 %2").arg(FormatAmount(reservation, u.decimals), ticker)};
+        // One arg chain per text: the one-price text has no %4 to fill.
+        m_ticket_total->setText(steps->size() == 1 ? tr("Ladder of 1 price · %1 %2 in total\n%3").arg(amount, ticker, reserves)
+                                                   : tr("Ladder of %4 prices · %1 %2 in total\n%3").arg(amount, ticker, reserves).arg(steps->size()));
         total_tooltip = tr("A ladder is one standing order on this side: each price fills in the same uniform-price auction, a price cannot be cancelled alone, and it replaces your order on this side. With one price it is an ordinary limit order.");
         apply_tooltips();
         return;
@@ -1043,8 +1065,10 @@ std::optional<std::vector<flowmesh::LadderStep>> B3FlowMeshTradingPanel::ladderS
     if (!selected || !m_snapshot || m_snapshot->market != selected->id || !m_snapshot->units.known) return fail(tr("Verified asset precision is required."));
     const auto& units{m_snapshot->units};
     const bool buy{m_side->currentIndex() == 0}, inverse{inverted()};
-    std::vector<std::pair<QLineEdit*, QLineEdit*>> rows{{m_price, m_quantity}};
-    for (size_t i{0}; i < m_ladder_prices.size(); ++i) rows.emplace_back(m_ladder_prices[i], m_ladder_quantities[i]);
+    // The prices a view, market or wallet change clears are exactly the ones read here.
+    const auto prices{ticketPriceFields()};
+    std::vector<std::pair<QLineEdit*, QLineEdit*>> rows{{prices[0], m_quantity}};
+    for (size_t i{0}; i < m_ladder_quantities.size(); ++i) rows.emplace_back(prices[i + 1], m_ladder_quantities[i]);
     std::vector<flowmesh::LadderStep> steps;
     for (size_t i{0}; i < rows.size(); ++i) {
         const QString price{rows[i].first->text().trimmed()}, quantity{rows[i].second->text().trimmed()};
@@ -1072,6 +1096,34 @@ QStringList B3FlowMeshTradingPanel::ladderText() const
     QStringList out;
     for (size_t i{0}; i < m_ladder_prices.size(); ++i) out << m_ladder_prices[i]->text() << m_ladder_quantities[i]->text();
     return out;
+}
+
+std::array<QLineEdit*, flowmesh::FLOWMESH_LADDER_MAX_STEPS> B3FlowMeshTradingPanel::ticketPriceFields() const
+{
+    static_assert(std::tuple_size_v<decltype(m_ladder_prices)> + 1 == flowmesh::FLOWMESH_LADDER_MAX_STEPS);
+    static_assert(std::tuple_size_v<decltype(m_ladder_quantities)> == std::tuple_size_v<decltype(m_ladder_prices)>);
+    std::array<QLineEdit*, flowmesh::FLOWMESH_LADDER_MAX_STEPS> fields{};
+    fields[0] = m_price;
+    std::copy(m_ladder_prices.begin(), m_ladder_prices.end(), fields.begin() + 1);
+    return fields;
+}
+
+void B3FlowMeshTradingPanel::clearTicketPrices()
+{
+    // setText, never clear(): clear() is an undoable edit, and on a field
+    // that is already empty it keeps the redo, so Undo or Redo would bring
+    // the old text back to be read in the other unit. setText drops the
+    // whole history, even when the field is already empty.
+    for (auto* field : ticketPriceFields()) field->setText(QString{});
+}
+
+void B3FlowMeshTradingPanel::clearTicketEntries()
+{
+    // A market's prices are B3 per its token and its quantities are that
+    // token: none is read in another market. setText, like clearTicketPrices.
+    clearTicketPrices();
+    m_quantity->setText(QString{});
+    for (auto* field : m_ladder_quantities) field->setText(QString{});
 }
 
 flowmesh::LevelGrouping B3FlowMeshTradingPanel::bookGrouping() const
@@ -2067,7 +2119,13 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
     const auto selected{market()}; const QString selected_id{selected ? selected->id : QString{}};
     result->views_market = selected_id; result->ticks_after = ticksAfter(selected_id); result->draft = indicativeDraft(); result->levels = levelsRequest();
-    if (const auto due{candlesDue()}) { result->candles_interval = due->first; result->candles_limit = due->second; }
+    // Candles are display only: never in an order review's, funding,
+    // receipt, connect or action job, which a user waits for. They stay
+    // due, so the next passive job reads them (liveSkipsPoll() is false
+    // while they are due).
+    if (result->passive) {
+        if (const auto due{candlesDue()}) { result->candles_interval = due->first; result->candles_limit = due->second; }
+    }
     const auto phase{foreground_read ? (m_route_pending || m_market_data.empty() || !m_catalog_age.isValid() ? RefreshPhase::Catalog : RefreshPhase::None)
                                      : nextPassivePhase()};
     if (result->passive || foreground_read) {
@@ -3060,6 +3118,11 @@ void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
     if (route_asset && selection.isEmpty()) notice(tr("No established market was reported for the selected asset. This panel does not bootstrap one."));
     if (result.catalog) m_catalog_age.restart();
     const auto selected{market()};
+    // A selection this catalog moved (the market left the catalog, an asset
+    // was routed) never reads the ticket typed for the market it left. Only
+    // the market's identity counts: a new account row of the same market
+    // (the first admission) keeps a typed order.
+    if (previous_market && (!selected || previous_market->id != selected->id || previous_market->base != selected->base)) clearTicketEntries();
     if (previous_market && (!selected || previous_market->id != selected->id || previous_market->base != selected->base ||
         previous_market->vault != selected->vault || previous_market->domain != selected->domain ||
         previous_market->config != selected->config || previous_market->account != selected->account || previous_market->remote != selected->remote)) {

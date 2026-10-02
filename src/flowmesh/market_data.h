@@ -382,6 +382,15 @@ enum ObservedFlag : uint8_t {
 inline constexpr uint8_t OBSERVED_PUBLIC_FLAGS{OBSERVED_CLOCK_CLAMPED | OBSERVED_CLOCK_STEP | OBSERVED_CLOCK_SUSPECT |
                                                OBSERVED_RESTART};
 
+//! Display bound only (never consensus, never signed or certified):
+//! 10000-01-01T00:00:00Z. Every observed time and candle open is below it; a
+//! window's exclusive end may equal it. The parsers, the store, the rollup and
+//! the chart refuse or ignore a time at or past it, so bucket, window and axis
+//! arithmetic on any accepted time stays far inside int64.
+inline constexpr int64_t OBSERVED_MS_LIMIT{253'402'300'800'000};
+static_assert(OBSERVED_MS_LIMIT % 86'400'000 == 0); // a bucket start of every CandleInterval
+inline constexpr bool ObservedTimeInRange(const int64_t ms) { return ms >= 0 && ms < OBSERVED_MS_LIMIT; }
+
 struct ObservedStamp {
     uint64_t sequence{0};
     uint256 hash;
@@ -409,6 +418,20 @@ struct ObservedTimes {
     std::optional<uint64_t> recorded_since_sequence;
     //! Ascending sequences.
     std::vector<ObservedStamp> rows;
+    //! How this node's observed-time database keeps its times (operator
+    //! detail). Only in this node's own section: never in a public reply,
+    //! never from an endpoint.
+    struct Storage {
+        //! False after a failed write or history load attempt; false until
+        //! restart once the market's disk history was given up (its times
+        //! are then kept in memory only).
+        bool persisted{true};
+        //! Dropped from persistence before any write (a gap after a
+        //! restart); a failed write shows only in `persisted`.
+        uint64_t rows_not_persisted{0};
+        uint64_t candles_not_persisted{0};
+    };
+    std::optional<Storage> storage;
 };
 
 enum class CandleInterval : uint8_t { M1, M5, M15, H1, H4, D1 };

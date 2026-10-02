@@ -80,8 +80,9 @@ inline constexpr int64_t FLOWMESH_CLIENT_OBSERVED_FUTURE_MS{5000};
  * sequence of `ring` whose tick carries the row's hash; `held` afterwards
  * holds only sequences in `ring`. Flagged, never corrected: a LIVE time
  * below an earlier sequence's LIVE time, and any time more than
- * FLOWMESH_CLIENT_OBSERVED_FUTURE_MS after `received_ms`. Only public flags
- * are taken from the endpoint. `clock_suspect` receives the section's flag.
+ * FLOWMESH_CLIENT_OBSERVED_FUTURE_MS after `received_ms`. A time at or past
+ * OBSERVED_MS_LIMIT refuses the section. Only public flags are taken from
+ * the endpoint. `clock_suspect` receives the section's flag.
  *
  * Returns empty on success. An endpoint's own "available": false leaves
  * `held` and returns its reason; any other failure clears `held` and returns
@@ -91,14 +92,35 @@ std::string FlowMeshMergeObservedTimes(std::map<uint64_t, flowmesh::ObservedStam
                                        bool& clock_suspect) noexcept;
 
 /** Checks one 'candles' reply of an endpoint: the interval it was asked for,
- * a window of at most OBSERVED_CANDLE_PAGE_MAX intervals, aligned ascending
- * opens inside it, ascending non-overlapping sequences none beyond
+ * a window of at most OBSERVED_CANDLE_PAGE_MAX intervals ending at most at
+ * OBSERVED_MS_LIMIT, aligned ascending opens inside it, ascending non-overlapping sequences none beyond
  * `head_sequence` (the client's verified head), consistent prices and exact
  * decimal volumes. The endpoint's prices, volumes and times stay its
  * claims: only their structure is checked. nullopt and `error` when
  * refused. Never throws. */
 std::optional<flowmesh::ObservedCandlePage> FlowMeshParseObservedCandles(const UniValue& result, flowmesh::CandleInterval interval,
                                                                          uint64_t head_sequence, std::string& error) noexcept;
+
+struct FlowMeshCandleHoldBack {
+    //! Candles removed because they end past the head.
+    size_t held_back{0};
+    //! The first removed bucket was replaced by an earlier view of it.
+    bool substituted{false};
+};
+
+/** Display only: bounds an endpoint's candles page to `head`, a head this
+ * client verified, without asking anyone for a newer one. `page` passed
+ * FlowMeshParseObservedCandles (ascending opens, ascending non-overlapping
+ * sequences), so the candles ending past `head` are a suffix; they are
+ * removed. Only the newest bucket still grows, so an earlier view of the
+ * first removed bucket (same open and first sequence) that ends within
+ * `head`, when `held`, stands in for it. before_ms is lowered by whole
+ * intervals from from_ms (also for an unaligned window) until it leaves out
+ * the removed buckets and keeps every remaining candle; from_ms and more are
+ * unchanged. The result re-parses with FlowMeshParseObservedCandles against
+ * `head`. Never throws. */
+FlowMeshCandleHoldBack FlowMeshHoldBackObservedCandles(flowmesh::ObservedCandlePage& page, uint64_t head,
+                                                       const std::optional<flowmesh::ObservedCandle>& held) noexcept;
 
 } // namespace node
 

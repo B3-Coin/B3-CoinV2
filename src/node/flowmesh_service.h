@@ -30,6 +30,8 @@ class PeerManager;
 
 namespace node {
 
+class FlowMeshObservedTimeStore;
+
 /** Explicit fresh-market selection; exact nonzero 64-hex IDs, no wildcards.
  * Duplicate selections are harmless and configuration order is irrelevant. */
 bool ParseFlowMeshPreagreementMarkets(const std::vector<std::string>& values,
@@ -209,7 +211,10 @@ public:
     /** One page of this node's operator-observed UTC candles for a market
      * (display only): a time window [before - limit x interval, before),
      * from the memory window, and with `allow_disk` also from the
-     * observed-time database beyond it. Never takes the market lock. */
+     * observed-time database beyond it. A window that needs the database
+     * when it cannot be read is unavailable
+     * (FlowMeshObservedTimeStore::READ_FAILED_REASON), never the memory
+     * part alone. Never takes the market lock. */
     std::optional<flowmesh::ObservedCandlePage> ObservedCandles(
         const flowmesh::MarketId& market_id, flowmesh::CandleInterval interval,
         std::optional<int64_t> before_ms, size_t limit, bool allow_disk, std::string& error) const;
@@ -279,6 +284,8 @@ public:
     //! For tests: how often the seat transition's memos were consulted and
     //! how often they had to recompute.
     FlowMeshServiceMemoCounts MemoCountsForTest() const;
+    //! For tests: the display-only observed-time store.
+    FlowMeshObservedTimeStore& ObservedTimeStoreForTest() const;
     bool ArmSeatKeys(std::vector<bls::SecretKey> keys, std::string& error,
                      const std::optional<uint256>& expected_fingerprint = std::nullopt,
                      FlowMeshSeatKeyStatus* result = nullptr);
