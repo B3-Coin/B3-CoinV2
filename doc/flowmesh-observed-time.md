@@ -118,8 +118,10 @@ auction existed between them; anything else is a gap.
   recorded and served from memory, as when the database cannot be opened,
   and its disk is neither served nor written. `observed_time` holds display
   data only and may be removed if this repeats. A disk candle is served,
-  and a row written, only for a market whose load succeeded; a disk page
-  that meets an unreadable block is served as none. An unreadable block is
+  and a row written, only for a market whose load succeeded. A candle page
+  whose window needs the database when it cannot be read (an I/O error, or
+  an unreadable block) is unavailable, `observed_time_disk_unavailable`,
+  never the memory window alone as if nothing older existed. An unreadable block is
   not repaired: once a LevelDB compaction reaches it, every later write of
   the whole database can fail, for every market, until `observed_time` is
   removed.
@@ -170,7 +172,10 @@ window; a remote client asks its endpoint. While the market's history loads
 the page is unavailable with `observed_time_loading` (the public `candles`
 method answers the same, and a remote client reports it as
 `endpoint_unavailable: observed_time_loading`); Qt reads candles only once
-the market-data section is available.
+the market-data section is available. A local page whose window reaches
+before the memory window is unavailable with
+`observed_time_disk_unavailable` when the database cannot be read for it
+(the public `candles` method never reads the disk); a later read retries.
 
 Every observed time and candle open is before 10000-01-01T00:00:00Z
 (`OBSERVED_MS_LIMIT`, 253402300800000 ms), a display bound only. A larger
@@ -382,8 +387,9 @@ store whenever the queued load runs, with more than 4096 waiting entries,
 a clock an hour behind, and a load racing new entries; reads while loading
 are unavailable; a contradicted queued history is never served; the store
 thread opens the database; concurrent attach, record, read and flush;
-candle JSON), `flowmesh_service_tests` (a market start and the service
-start never wait for observed-time storage),
+a failed disk read is reported, never an empty history; candle JSON),
+`flowmesh_service_tests` (a market start and the service start never wait
+for observed-time storage; a page whose disk read fails is unavailable),
 `flowmesh_runtime_tests` (recorded after commit with its liveness, catch-up and
 deferral late, level peer live, throwing clock, the market-data section),
 `flowmesh_client_ticks_tests` (adverts, row binding and plausibility, candle

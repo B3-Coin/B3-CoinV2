@@ -292,12 +292,22 @@ public:
     //! `limit`, ascending; `older` is set when one exists before from_ms.
     //! None unless the market's load succeeded: none while it is queued or
     //! retried, after it was given up, or for a market never attached.
+    //! `failed` is set, with none returned and `older` false, when the read
+    //! met an error or an unreadable block: the market's disk may still hold
+    //! these candles, so this is never "no older history".
     //! Never holds the store mutex across the read.
     std::vector<flowmesh::ObservedCandle> ReadCandles(const flowmesh::MarketId& market, flowmesh::CandleInterval interval,
-                                                      int64_t from_ms, int64_t before_ms, size_t limit, bool* older = nullptr) const;
+                                                      int64_t from_ms, int64_t before_ms, size_t limit, bool* older = nullptr,
+                                                      bool* failed = nullptr) const;
+    //! Why a candle page that needs this database is unavailable when
+    //! ReadCandles failed.
+    static constexpr const char* READ_FAILED_REASON{"observed_time_disk_unavailable"};
     //! Tests only: runs inside every flush, before its batch is written,
     //! and before Stop's final synced write.
     void SetFlushHookForTest(std::function<void()> hook);
+    //! Tests only: runs inside every ReadCandles of a market whose load
+    //! succeeded, before its disk read; a throw is a failed read.
+    void SetReadHookForTest(std::function<void()> hook);
     //! Tests only: runs inside every load attempt before each stage's disk
     //! work ("meta", "erase", "rows", "candles").
     void SetLoadHookForTest(LoadHook hook);
@@ -346,6 +356,7 @@ private:
     std::list<Attached> m_attached;
     std::function<void()> m_hook;
     LoadHook m_load_hook;
+    std::function<void()> m_read_hook;
     //! A load is queued (wakes the flush thread).
     bool m_load_requested{false};
     //! Serializes Open, loads and flush passes (the thread's and Stop's).

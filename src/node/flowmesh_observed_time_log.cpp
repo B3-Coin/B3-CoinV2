@@ -863,12 +863,14 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
 std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(const flowmesh::MarketId& market,
                                                                              const flowmesh::CandleInterval interval,
                                                                              const int64_t from_ms, const int64_t before_ms,
-                                                                             const size_t limit, bool* older) const
+                                                                             const size_t limit, bool* older, bool* failed) const
 {
     if (older) *older = false;
+    if (failed) *failed = false;
     std::vector<flowmesh::ObservedCandle> out;
     try {
         CDBWrapper* db{nullptr};
+        std::function<void()> hook;
         {
             std::lock_guard lock{m_mutex};
             // Only a market whose load succeeded: until then, after it was
@@ -883,11 +885,13 @@ std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(con
             }
             if (!restored) return out;
             db = m_db.get();
+            hook = m_read_hook;
         }
         // Read without m_mutex: the database outlives every reader (it is
         // freed only with the store) and LevelDB reads are safe beside the
         // flush thread's writes.
         if (!db || before_ms <= from_ms) return out;
+        if (hook) hook();
         std::unique_ptr<CDBIterator> it{db->NewIterator()};
         const auto matches = [&](const CandleKey& key) {
             return key.prefix == KEY_CANDLE && key.market == market && key.interval == static_cast<uint8_t>(interval);
@@ -913,6 +917,7 @@ std::vector<flowmesh::ObservedCandle> FlowMeshObservedTimeStore::ReadCandles(con
     } catch (const std::exception&) {
         out.clear();
         if (older) *older = false;
+        if (failed) *failed = true;
     }
     return out;
 }
@@ -921,6 +926,12 @@ void FlowMeshObservedTimeStore::SetFlushHookForTest(std::function<void()> hook)
 {
     std::lock_guard lock{m_mutex};
     m_hook = std::move(hook);
+}
+
+void FlowMeshObservedTimeStore::SetReadHookForTest(std::function<void()> hook)
+{
+    std::lock_guard lock{m_mutex};
+    m_read_hook = std::move(hook);
 }
 
 void FlowMeshObservedTimeStore::SetLoadHookForTest(LoadHook hook)

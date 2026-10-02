@@ -1378,4 +1378,42 @@ BOOST_AUTO_TEST_CASE(market_start_never_waits_for_observed_time_storage)
     BOOST_CHECK(dummy->GetSummary().persisted);
 }
 
+// A candle window that reaches before the memory window needs the
+// observed-time database (with no entry yet, every window with an end
+// does). When that read fails, the page is unavailable with its reason,
+// never the memory window alone as if nothing older existed; a memory-only
+// read (the public candles method) is unaffected, and the next read that
+// succeeds is served.
+BOOST_AUTO_TEST_CASE(a_candle_page_whose_disk_read_fails_is_unavailable)
+{
+    const auto genesis{Genesis()};
+    Retain(genesis);
+    std::string error;
+    node::FlowMeshService service{*m_node.chainman, ServicePath()};
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    const auto read = [&](const bool allow_disk) {
+        std::string read_error;
+        const auto page{service.ObservedCandles(market, flowmesh::CandleInterval::M1, int64_t{1'790'769'600'000}, 10, allow_disk, read_error)};
+        BOOST_REQUIRE_MESSAGE(page, read_error);
+        return *page;
+    };
+    // Loaded by the store's own thread.
+    BOOST_REQUIRE(WaitUntil([&] { return read(/*allow_disk=*/true).available; }));
+    auto& store{service.ObservedTimeStoreForTest()};
+    store.SetReadHookForTest([] { throw std::runtime_error{"injected read error"}; });
+    const auto failed{read(/*allow_disk=*/true)};
+    BOOST_CHECK(!failed.available);
+    BOOST_CHECK_EQUAL(failed.unavailable_reason, node::FlowMeshObservedTimeStore::READ_FAILED_REASON);
+    BOOST_CHECK_EQUAL(failed.unavailable_reason, "observed_time_disk_unavailable");
+    BOOST_CHECK(failed.candles.empty());
+    BOOST_CHECK(!failed.more);
+    BOOST_CHECK_EQUAL(failed.source, "this_node");
+    const auto memory{read(/*allow_disk=*/false)};
+    BOOST_CHECK(memory.available);
+    BOOST_CHECK(memory.unavailable_reason.empty());
+    store.SetReadHookForTest({});
+    BOOST_CHECK(read(/*allow_disk=*/true).available);
+    service.Stop();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

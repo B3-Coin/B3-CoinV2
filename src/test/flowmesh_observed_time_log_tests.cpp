@@ -367,25 +367,28 @@ struct RawPadKey {
     SERIALIZE_METHODS(RawPadKey, obj) { READWRITE(obj.prefix, Using<BigEndianFormatter<4>>(obj.index)); }
 };
 
-//! A real read error under MARKET: `count` stored entries, padding so that
-//! its `prefix` keys ('M' meta, 'c' candles) sit in data blocks of their
-//! own after a first block Open reads, compacted into a table, then one
-//! byte of that block flipped. Every read of the block then fails its
-//! checksum (Corruption), every time. Relies on the store's uncompressed
-//! tables and checked reads; a layout that no longer matches fails here.
-void WriteUnreadableBlock(const fs::path& path, FakeClocks& clocks, const uint64_t count, const uint8_t prefix)
+//! `count` stored entries under MARKET, then padding so that its meta ('M')
+//! and candle ('c') keys sit in data blocks of their own after a first block
+//! Open reads, compacted into a table.
+void WritePaddedTable(const fs::path& path, FakeClocks& clocks, const uint64_t count)
 {
     Populate(path, clocks, count, 1'000);
-    {
-        CDBWrapper db{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
-        CDBBatch batch{db};
-        const std::vector<unsigned char> value(200, 0x5a);
-        for (const uint8_t pad : {uint8_t{'A'}, uint8_t{'N'}, uint8_t{'d'}}) {
-            for (uint32_t i{0}; i < 400; ++i) batch.Write(RawPadKey{pad, i}, value);
-        }
-        db.WriteBatch(batch, true);
-        db.CompactFull();
+    CDBWrapper db{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+    CDBBatch batch{db};
+    const std::vector<unsigned char> value(200, 0x5a);
+    for (const uint8_t pad : {uint8_t{'A'}, uint8_t{'N'}, uint8_t{'d'}}) {
+        for (uint32_t i{0}; i < 400; ++i) batch.Write(RawPadKey{pad, i}, value);
     }
+    db.WriteBatch(batch, true);
+    db.CompactFull();
+}
+
+//! Flips one byte of the table block holding MARKET's first `prefix` key
+//! (WritePaddedTable): every read of that block then fails its checksum
+//! (Corruption), every time. Relies on the store's uncompressed tables and
+//! checked reads; false when the layout no longer matches.
+bool FlipBlock(const fs::path& path, const uint8_t prefix)
+{
     std::vector<char> pattern{static_cast<char>(prefix)};
     for (const auto byte : MARKET) pattern.push_back(static_cast<char>(byte));
     bool flipped{false};
@@ -403,7 +406,15 @@ void WriteUnreadableBlock(const fs::path& path, FakeClocks& clocks, const uint64
         flipped = true;
         break;
     }
-    BOOST_REQUIRE(flipped);
+    return flipped;
+}
+
+//! A real read error under MARKET: WritePaddedTable, then the block of its
+//! `prefix` keys ('M' meta, 'c' candles) made unreadable (FlipBlock).
+void WriteUnreadableBlock(const fs::path& path, FakeClocks& clocks, const uint64_t count, const uint8_t prefix)
+{
+    WritePaddedTable(path, clocks, count);
+    BOOST_REQUIRE(FlipBlock(path, prefix));
 }
 
 } // namespace
@@ -1511,6 +1522,55 @@ BOOST_AUTO_TEST_CASE(a_wipe_that_meets_a_read_error_writes_nothing)
     }
     CDBWrapper db{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
     for (uint64_t i{0}; i < 20; ++i) BOOST_CHECK(db.Exists(RawRowKey{'r', MARKET, i}));
+}
+
+// A disk read of a loaded market that meets an error says so: no candles,
+// `older` unset and `failed` set, for a thrown error and for a block found
+// unreadable after the load alike. Never an empty page that reads as "no
+// older history"; the next read that succeeds serves the page again.
+BOOST_AUTO_TEST_CASE(a_failed_disk_read_is_reported_never_an_empty_history)
+{
+    const auto path{m_path_root / "observed_unreadable_read"};
+    FakeClocks clocks;
+    WritePaddedTable(path, clocks, 20);
+    FlowMeshObservedTimeStore store{Options(path)};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 20, Known(0, 20));
+    store.FlushNow(false);
+    BOOST_REQUIRE(!log->GetSummary().loading);
+    bool older{false}, failed{false};
+    // One 1m candle at T0 (entries 0..19); a window after it has it older.
+    const auto read = [&](const int64_t from_ms) {
+        older = !older;
+        failed = !failed;
+        return store.ReadCandles(MARKET, CandleInterval::M1, from_ms, T0 + 3'600'000, 100, &older, &failed);
+    };
+    BOOST_CHECK_EQUAL(read(0).size(), 1U);
+    BOOST_CHECK(!older);
+    BOOST_CHECK(!failed);
+    BOOST_CHECK(read(T0 + 60'000).empty());
+    BOOST_CHECK(older);
+    BOOST_CHECK(!failed);
+    store.SetReadHookForTest([] { throw dbwrapper_error{"injected read error"}; });
+    for (const int64_t from : {int64_t{0}, T0 + 60'000}) {
+        BOOST_CHECK(read(from).empty());
+        BOOST_CHECK(!older);
+        BOOST_CHECK(failed);
+    }
+    store.SetReadHookForTest({});
+    BOOST_CHECK_EQUAL(read(0).size(), 1U);
+    BOOST_CHECK(!failed);
+    // The loaded market's candle block made unreadable: LevelDB's iterators
+    // never cache a block, so the next read meets it.
+    BOOST_REQUIRE(FlipBlock(path, 'c'));
+    for (const int64_t from : {int64_t{0}, T0 + 60'000}) {
+        BOOST_CHECK(read(from).empty());
+        BOOST_CHECK(!older);
+        BOOST_CHECK(failed);
+    }
+    store.Stop();
 }
 
 // A load that fails once at any stage leaves the market loading: its reads

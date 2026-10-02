@@ -2278,8 +2278,18 @@ std::optional<flowmesh::ObservedCandlePage> FlowMeshService::ObservedCandles(
     const auto oldest{log->OldestMemoryOpen(interval)};
     if (oldest && page.from_ms >= *oldest) return page;
     const int64_t disk_before{oldest ? std::min(page.before_ms, *oldest) : page.before_ms};
-    bool older{false};
-    auto disk{m_impl->observed_store->ReadCandles(market_id, interval, page.from_ms, disk_before, limit, &older)};
+    bool older{false}, failed{false};
+    auto disk{m_impl->observed_store->ReadCandles(market_id, interval, page.from_ms, disk_before, limit, &older, &failed)};
+    if (failed) {
+        // The window needs the database and it could not be read: never the
+        // memory part alone as if nothing older existed (a chart would hold
+        // it as the whole window).
+        page.available = false;
+        page.unavailable_reason = FlowMeshObservedTimeStore::READ_FAILED_REASON;
+        page.candles.clear();
+        page.more = false;
+        return page;
+    }
     for (auto& candle : page.candles) {
         if (disk.empty() || candle.open_ms > disk.back().open_ms) disk.push_back(std::move(candle));
     }
