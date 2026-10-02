@@ -2407,7 +2407,10 @@ private Q_SLOTS:
         QCOMPARE(panel.indicativeDraft().write(), before.write());
         QCOMPARE(panel.m_price->text(), ExactInversePrice(2020, 6)); // The same limit, read as tUSD per B3.
         QVERIFY(panel.m_sell->isChecked()); QVERIFY(!panel.m_buy->isChecked()); // Sell B3 is buying tUSD.
-        QVERIFY(panel.m_quantity_label->text().contains(QStringLiteral("Receive up to")));
+        // The order's intent, whatever the labels call it: still a bid for
+        // 300000 token atoms.
+        QCOMPARE(TicketSide(panel), QStringLiteral("bid"));
+        QCOMPARE(ParseQuantity(panel.m_quantity->text(), panel.m_snapshot->units), std::optional<CAmount>{300'000});
         QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.3")); QVERIFY(panel.m_marketable->isChecked());
         panel.m_orientation->setCurrentIndex(0);
         QCOMPARE(panel.indicativeDraft().write(), before.write());
@@ -2503,7 +2506,10 @@ private Q_SLOTS:
             QCOMPARE(panel.m_buy->isChecked(), panel.m_side->currentIndex() == 0);
             QCOMPARE(panel.m_sell->isChecked(), panel.m_side->currentIndex() == 1);
             QVERIFY(panel.m_order->text().contains(DisplayBuy(side, panel.inverted()) ? QStringLiteral("buy") : QStringLiteral("sell")));
-            QVERIFY(panel.m_quantity_label->text().contains(!panel.inverted() ? QStringLiteral("Quantity") : bid ? QStringLiteral("Receive up to") : QStringLiteral("Spend up to")));
+            // The order's quantities in token atoms, whatever the labels
+            // call them (its side is checked above, its prices below).
+            QCOMPARE(ParseQuantity(panel.m_quantity->text(), panel.m_snapshot->units), std::optional<CAmount>{300'000});
+            if (mode == 2) QCOMPARE(ParseQuantity(panel.m_ladder_quantities[0]->text(), panel.m_snapshot->units), std::optional<CAmount>{200'000});
             // Token quantities, the mode and the slippage mean the same: kept.
             QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.3"));
             QCOMPARE(panel.m_ladder_quantities[0]->text(), mode == 2 ? QStringLiteral("0.2") : QString{});
