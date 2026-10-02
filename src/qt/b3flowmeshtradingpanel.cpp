@@ -402,8 +402,19 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         // Never reinterpret a typed price or a deferred click in another
         // unit: every price of the ticket, the ladder's included (hidden rows
         // too), and with no undo or redo that would bring one back.
-        // Quantities are token amounts in both views and are kept.
-        clearTicketPrices(); m_deferred_review.reset();
+        m_deferred_review.reset();
+        // A flip changes how the ticket reads, never the order it drafts:
+        // the side selected in the view left is the other button here, as
+        // buying the token is selling B3, so the same order is the other
+        // button. Every orientation change is a change between the two views
+        // (two fixed items, never changed under a signal blocker), so this
+        // swaps the pressed button. Quantities are token amounts of that same
+        // side in both views and are kept; a marketable limit re-prices that
+        // same side. The side is set before the prices are cleared, so no
+        // marketable re-price ever runs for the other side.
+        const bool buy{B3FlowMeshMarketData::DisplayBuy(B3FlowMeshMarketData::CanonicalSide(m_side->currentIndex() == 0, !inverted()), inverted())};
+        m_side->setCurrentIndex(buy ? 0 : 1); (buy ? m_buy : m_sell)->setChecked(true);
+        clearTicketPrices();
         updateMarketText(); updateDataViews();
     });
     connect(m_market, &QComboBox::currentIndexChanged, this, [this] {

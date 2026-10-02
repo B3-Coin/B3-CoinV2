@@ -2370,6 +2370,300 @@ private Q_SLOTS:
         QVERIFY(cleared());
         QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
     }
+    //! The ticket's side as a review titles it: buying the token is selling B3.
+    static QString SideTitle(bool bid, bool inverse)
+    {
+        return inverse ? (bid ? QStringLiteral("Sell B3") : QStringLiteral("Buy B3")) : (bid ? QStringLiteral("Buy") : QStringLiteral("Sell"));
+    }
+    //! The ticket's canonical side, as begin() signs it.
+    static QString TicketSide(const B3FlowMeshTradingPanel& panel)
+    {
+        return CanonicalSide(panel.m_side->currentIndex() == 0, panel.inverted());
+    }
+    //! Other accounts' limits on both sides and none of the viewer's, so a
+    //! marketable limit prices either side without crossing an own order.
+    static Snapshot TwoSidedOthersBook(const UniValue& data, CAmount bid, CAmount ask)
+    {
+        auto snapshot{Parse(data)};
+        snapshot.curves = {LimitCurve("bid", 30, bid, 1'000'000), LimitCurve("ask", 31, ask, 1'000'000)};
+        snapshot.own_curves.clear(); snapshot.depth = Aggregate(snapshot.curves);
+        return snapshot;
+    }
+    void marketableViewFlipNeverReversesTheOrder()
+    {
+        // Audit of ecd726f (2026-10-01), finding 4, its walletless fixture: a
+        // view flip kept the quantity, the pressed button and Marketable, so
+        // the canonical side reversed (bid 2020 became ask 990) and a new
+        // valid price appeared at once. A flip is view-only: the same order.
+        B3FlowMeshTradingPanel panel; panel.m_timer->stop();
+        Observe(panel, TwoSidedOthersBook(Data(), 1000, 2000));
+        panel.m_quantity->setText(QStringLiteral("0.3"));
+        panel.m_marketable->setChecked(true);
+        const auto before{panel.indicativeDraft()};
+        QVERIFY(before.isObject());
+        QCOMPARE(before.write(), std::string{R"({"side":"bid","price":2020,"quantity":300000})"});
+        QCOMPARE(panel.m_price->text(), QStringLiteral("2.02"));
+        panel.m_orientation->setCurrentIndex(1); // The real view selection callback.
+        QCOMPARE(panel.indicativeDraft().write(), before.write());
+        QCOMPARE(panel.m_price->text(), ExactInversePrice(2020, 6)); // The same limit, read as tUSD per B3.
+        QVERIFY(panel.m_sell->isChecked()); QVERIFY(!panel.m_buy->isChecked()); // Sell B3 is buying tUSD.
+        QVERIFY(panel.m_quantity_label->text().contains(QStringLiteral("Receive up to")));
+        QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.3")); QVERIFY(panel.m_marketable->isChecked());
+        panel.m_orientation->setCurrentIndex(0);
+        QCOMPARE(panel.indicativeDraft().write(), before.write());
+        QCOMPARE(panel.m_price->text(), QStringLiteral("2.02"));
+        QVERIFY(panel.m_buy->isChecked()); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_wallet);
+    }
+    void aViewFlipKeepsTheTicketsCanonicalOrder_data()
+    {
+        QTest::addColumn<bool>("inverse");
+        QTest::addColumn<QString>("side");
+        QTest::addColumn<int>("mode"); // 0 limit, 1 marketable limit, 2 ladder
+        for (const bool inverse : {false, true}) {
+            for (const char* side : {"bid", "ask"}) {
+                for (const int mode : {0, 1, 2}) {
+                    const auto name{QStringLiteral("%1 %2 %3").arg(inverse ? QStringLiteral("B3 view") : QStringLiteral("canonical view"), QLatin1String(side),
+                                                                   mode == 0 ? QStringLiteral("limit") : mode == 1 ? QStringLiteral("marketable") : QStringLiteral("ladder"))};
+                    QTest::newRow(qPrintable(name)) << inverse << QString::fromLatin1(side) << mode;
+                }
+            }
+        }
+    }
+    void aViewFlipKeepsTheTicketsCanonicalOrder()
+    {
+        // Both views, both sides, each ticket mode: a flip (and a flip back)
+        // keeps the canonical side, the token quantities and the mode. Typed
+        // prices are cleared with their history (never reinterpreted); the
+        // same canonical prices entered in the new view draft exactly the
+        // order of before, and the review names that same side and limits.
+        QFETCH(bool, inverse); QFETCH(QString, side); QFETCH(int, mode);
+        const bool bid{side == QStringLiteral("bid")};
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        Observe(panel, TwoSidedOthersBook(RemoteData(), 990, 1010), inverse);
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        auto* orientation{panel.findChild<QComboBox*>(QStringLiteral("flowMeshOrientation"))};
+        QVERIFY(orientation); QVERIFY(orientation->isEnabled());
+        for (auto* field : panel.ticketPriceFields()) field->setText(QString{});
+        // Exact in both views: 0.8 / 0.5 B3 is 1.25 / 2 tUSD per B3.
+        const std::array<CAmount, 2> limits{bid ? 800 : 1250, bid ? 500 : 2000};
+        const auto shown = [&](CAmount price) { return panel.inverted() ? ExactInversePrice(price, 6) : FormatPrice(price, 6); };
+        const auto prices = [&] {
+            std::vector<QLineEdit*> out{panel.m_price};
+            out.insert(out.end(), panel.m_ladder_prices.begin(), panel.m_ladder_prices.end());
+            return out;
+        };
+        const auto enter = [&] {
+            panel.m_price->setText(shown(limits[0]));
+            if (mode == 2) panel.m_ladder_prices[0]->setText(shown(limits[1]));
+        };
+        const auto canonical = [&] {
+            if (mode != 2) return panel.indicativeDraft().write();
+            const auto steps{panel.ladderSteps()};
+            std::string out{TicketSide(panel).toStdString()};
+            if (steps) for (const auto& step : *steps) out += ' ' + std::to_string(step.price) + ':' + std::to_string(step.qty);
+            return out;
+        };
+        const auto review = [&] {
+            QString text;
+            QTimer::singleShot(0, &panel, [&] { if (panel.m_confirmation) { text = panel.m_confirmation->text(); panel.m_confirmation->done(QMessageBox::Cancel); } });
+            panel.begin(B3FlowMeshTrading::Operation::Order);
+            QCoreApplication::sendPostedEvents();
+            return text;
+        };
+        // The review names this side and these exact canonical limits.
+        const auto names_order = [&](const QString& text, CAmount first) {
+            if (mode == 2) {
+                return text.contains(QStringLiteral("Ladder %1 of 2 prices").arg(SideTitle(bid, panel.inverted()))) &&
+                       text.contains(QStringLiteral("token atoms): %1 : 300000; %2 : 200000;").arg(limits[0]).arg(limits[1]));
+            }
+            if (panel.inverted()) {
+                return text.contains(QStringLiteral("Canonical side: %1;").arg(side)) &&
+                       text.contains(QStringLiteral("Exact canonical limit: %1 B3 atoms per token atom; quantity cap: 300000 token atoms.").arg(first));
+            }
+            return text.contains(QStringLiteral("Limit %1: 0.3 tUSD (300000 atomic units) at %2 B3 / tUSD.").arg(bid ? QStringLiteral("Buy") : QStringLiteral("Sell"), FormatPrice(first, 6)));
+        };
+        (DisplayBuy(side, inverse) ? panel.m_buy : panel.m_sell)->click();
+        QCOMPARE(TicketSide(panel), side);
+        panel.m_quantity->setText(QStringLiteral("0.3"));
+        if (mode == 1) panel.m_marketable->setChecked(true);
+        if (mode == 2) { panel.m_ladder->setChecked(true); panel.m_ladder_quantities[0]->setText(QStringLiteral("0.2")); }
+        if (mode != 1) enter();
+        const QString price_before{panel.m_price->text()}, slippage{panel.m_slippage->text()};
+        QVERIFY(!price_before.isEmpty());
+        const auto draft{canonical()};
+        QVERIFY2(draft.find(side.toStdString()) != std::string::npos, draft.c_str());
+        const CAmount first{mode == 1 ? panel.indicativeDraft()["price"].getInt<CAmount>() : limits[0]};
+        auto text{review()};
+        QVERIFY2(names_order(text, first), qPrintable(text));
+        for (const bool back : {false, true}) {
+            orientation->setCurrentIndex(back == inverse ? 1 : 0); // The real view selection callback.
+            QCOMPARE(panel.inverted(), back == inverse);
+            // The same canonical side, read through the other button.
+            QCOMPARE(TicketSide(panel), side);
+            QCOMPARE(panel.m_buy->isChecked(), panel.m_side->currentIndex() == 0);
+            QCOMPARE(panel.m_sell->isChecked(), panel.m_side->currentIndex() == 1);
+            QVERIFY(panel.m_order->text().contains(DisplayBuy(side, panel.inverted()) ? QStringLiteral("buy") : QStringLiteral("sell")));
+            QVERIFY(panel.m_quantity_label->text().contains(!panel.inverted() ? QStringLiteral("Quantity") : bid ? QStringLiteral("Receive up to") : QStringLiteral("Spend up to")));
+            // Token quantities, the mode and the slippage mean the same: kept.
+            QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.3"));
+            QCOMPARE(panel.m_ladder_quantities[0]->text(), mode == 2 ? QStringLiteral("0.2") : QString{});
+            QCOMPARE(panel.m_marketable->isChecked(), mode == 1); QCOMPARE(panel.m_ladder->isChecked(), mode == 2);
+            QCOMPARE(panel.m_slippage->text(), slippage);
+            if (mode == 1) {
+                // Re-priced at once for the same side: the same exact limit.
+                QCOMPARE(canonical(), draft);
+                QCOMPARE(panel.m_price->text(), back ? price_before : shown(first));
+            } else {
+                for (auto* field : prices()) {
+                    QVERIFY2(field->text().isEmpty(), qPrintable(field->objectName()));
+                    QVERIFY(!field->isUndoAvailable()); QVERIFY(!field->isRedoAvailable());
+                }
+                QVERIFY(!panel.indicativeDraft().isObject()); QVERIFY(!panel.ladderSteps());
+                enter(); // The same canonical limits, typed in this view.
+                QCOMPARE(canonical(), draft);
+            }
+            text = review();
+            QVERIFY2(names_order(text, first), qPrintable(text));
+        }
+        QCOMPARE(panel.m_price->text(), price_before);
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked()); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result);
+    }
+    void aViewFlipKeepsAnEditOnTheOrderItReplaces_data()
+    {
+        QTest::addColumn<bool>("inverse");
+        QTest::addColumn<bool>("ladder");
+        QTest::newRow("canonical view, limit bid") << false << false;
+        QTest::newRow("B3 view, limit bid") << true << false;
+        QTest::newRow("canonical view, ladder ask") << false << true;
+        QTest::newRow("B3 view, ladder ask") << true << true;
+    }
+    void aViewFlipKeepsAnEditOnTheOrderItReplaces()
+    {
+        // Edit prefills a replacement of the selected own order. A flip
+        // afterwards keeps it a replacement of that order: the same canonical
+        // side and remaining quantities, only its prices to enter again.
+        QFETCH(bool, inverse); QFETCH(bool, ladder);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        auto snapshot{Parse(RemoteData())}; // The viewer's limit bid: 1 B3/tUSD, 0.75 tUSD left.
+        if (ladder) {
+            snapshot.own_curves = {LadderCurve("ask", 5, {{1250, 100'000}, {2000, 200'000}})};
+            snapshot.curves = {snapshot.curves.back(), snapshot.own_curves.front()};
+            snapshot.depth = Aggregate(snapshot.curves);
+        }
+        const QString side{ladder ? QStringLiteral("ask") : QStringLiteral("bid")};
+        Observe(panel, snapshot, inverse);
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        auto* orientation{panel.findChild<QComboBox*>(QStringLiteral("flowMeshOrientation"))};
+        QVERIFY(orientation);
+        panel.m_own_view->selectRow(0); QCOMPARE(panel.m_edit_side, side);
+        QVERIFY(panel.m_edit_order->isEnabled()); panel.m_edit_order->click();
+        QCOMPARE(TicketSide(panel), side); QCOMPARE(panel.m_ladder->isChecked(), ladder);
+        const QString quantity{panel.m_quantity->text()}, second{panel.m_ladder_quantities[0]->text()};
+        QCOMPARE(quantity, ladder ? QStringLiteral("0.1") : QStringLiteral("0.75"));
+        orientation->setCurrentIndex(inverse ? 0 : 1);
+        QCOMPARE(TicketSide(panel), side); QCOMPARE(panel.m_edit_side, side);
+        QCOMPARE(panel.m_quantity->text(), quantity); QCOMPARE(panel.m_ladder_quantities[0]->text(), second);
+        QCOMPARE(panel.m_ladder->isChecked(), ladder);
+        QVERIFY(panel.m_price->text().isEmpty()); QVERIFY(!panel.m_price->isUndoAvailable());
+        const auto shown = [&](CAmount price) { return panel.inverted() ? ExactInversePrice(price, 6) : FormatPrice(price, 6); };
+        panel.m_price->setText(shown(ladder ? 1250 : 1000));
+        if (ladder) panel.m_ladder_prices[0]->setText(shown(2000));
+        QString review;
+        QTimer::singleShot(0, &panel, [&] { if (panel.m_confirmation) { review = panel.m_confirmation->text(); panel.m_confirmation->done(QMessageBox::Cancel); } });
+        panel.begin(B3FlowMeshTrading::Operation::Order);
+        QCoreApplication::sendPostedEvents();
+        QVERIFY2(review.contains(QStringLiteral("Replaces your current %1").arg(SideTitle(!ladder, panel.inverted()))), qPrintable(review));
+        if (ladder) QVERIFY2(review.contains(QStringLiteral("token atoms): 1250 : 100000; 2000 : 200000;")), qPrintable(review));
+        else if (panel.inverted()) QVERIFY2(review.contains(QStringLiteral("Canonical side: bid;")), qPrintable(review));
+        else QVERIFY2(review.contains(QStringLiteral("Limit Buy: 0.75 tUSD")), qPrintable(review));
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked()); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result);
+    }
+    void aViewFlipNeverChangesAPendingReview()
+    {
+        // A review click waiting for its read, then a review that is open:
+        // the view selector is disabled for both. A flip that still arrives
+        // drops the waiting click (it never opens on inputs read in another
+        // view) and never changes an open review's text or what it signs.
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        Observe(panel, TwoSidedOthersBook(RemoteData(), 990, 1010));
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        auto* orientation{panel.findChild<QComboBox*>(QStringLiteral("flowMeshOrientation"))};
+        QVERIFY(orientation);
+        panel.m_quantity->setText(QStringLiteral("0.3"));
+        panel.m_marketable->setChecked(true);
+        const auto draft{panel.indicativeDraft().write()};
+        QCOMPARE(draft, std::string{R"({"side":"bid","price":1020,"quantity":300000})"});
+        // 1) Deferred behind a read.
+        ReadInFlight(panel);
+        panel.m_order->click();
+        QVERIFY(panel.m_deferred_review); QVERIFY(!orientation->isEnabled());
+        orientation->setCurrentIndex(1);
+        QVERIFY(!panel.m_deferred_review);
+        QCOMPARE(TicketSide(panel), QStringLiteral("bid"));
+        panel.stopWorker(); panel.m_busy = false; panel.m_response_age.restart();
+        bool opened{false};
+        QTimer::singleShot(0, &panel, [&] { if (panel.m_confirmation) { opened = true; panel.m_confirmation->done(QMessageBox::Cancel); } });
+        panel.resumeReview();
+        QCoreApplication::sendPostedEvents(); // The check runs now, never inside the next review.
+        QVERIFY(!opened); QVERIFY(!panel.m_confirmation);
+        panel.updateControls(); panel.updateTicket();
+        QCOMPARE(panel.indicativeDraft().write(), draft);
+        // 2) Open: its text is fixed, and the ticket keeps the order after it.
+        QString shown, after;
+        bool locked{false};
+        QTimer::singleShot(0, &panel, [&] {
+            if (!panel.m_confirmation) return;
+            shown = panel.m_confirmation->text(); locked = !orientation->isEnabled() && panel.m_confirmation->isVisible();
+            orientation->setCurrentIndex(0);
+            after = panel.m_confirmation->text();
+            panel.m_confirmation->done(QMessageBox::Cancel);
+        });
+        panel.begin(B3FlowMeshTrading::Operation::Order);
+        QCoreApplication::sendPostedEvents();
+        QVERIFY(locked); QVERIFY(!shown.isEmpty()); QCOMPARE(after, shown);
+        QVERIFY2(shown.contains(QStringLiteral("Canonical side: bid;")), qPrintable(shown));
+        QVERIFY(!panel.inverted()); QCOMPARE(TicketSide(panel), QStringLiteral("bid"));
+        panel.updateTicket();
+        QCOMPARE(panel.indicativeDraft().write(), draft);
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked()); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result);
+    }
+    void aViewFlipKeepsTheCancelTarget_data()
+    {
+        QTest::addColumn<bool>("inverse"); QTest::addColumn<QString>("side");
+        for (const bool inverse : {false, true}) {
+            for (const char* side : {"bid", "ask"}) {
+                QTest::newRow(qPrintable(QStringLiteral("%1 %2").arg(inverse ? QStringLiteral("B3 view") : QStringLiteral("canonical view"), QLatin1String(side)))) << inverse << QString::fromLatin1(side);
+            }
+        }
+    }
+    void aViewFlipKeepsTheCancelTarget()
+    {
+        // Cancel targets the ticket's side: a flip never moves it to the
+        // account's other standing order (on ecd726f it did).
+        QFETCH(bool, inverse); QFETCH(QString, side);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        Observe(panel, Parse(RemoteData()), inverse);
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        auto* orientation{panel.findChild<QComboBox*>(QStringLiteral("flowMeshOrientation"))};
+        QVERIFY(orientation);
+        (DisplayBuy(side, inverse) ? panel.m_buy : panel.m_sell)->click();
+        const auto review = [&] {
+            QString text;
+            QTimer::singleShot(0, &panel, [&] { if (panel.m_confirmation) { text = panel.m_confirmation->text(); panel.m_confirmation->done(QMessageBox::Cancel); } });
+            panel.begin(B3FlowMeshTrading::Operation::Cancel);
+            QCoreApplication::sendPostedEvents();
+            return text;
+        };
+        const QString target{QStringLiteral("standing %1 (%2)").arg(inverse ? SideTitle(side == QStringLiteral("bid"), true) : side, side)};
+        const QString before{review()};
+        QVERIFY2(before.contains(target), qPrintable(before));
+        orientation->setCurrentIndex(inverse ? 0 : 1);
+        QCOMPARE(TicketSide(panel), side);
+        QVERIFY(panel.m_cancel_order->text().contains(DisplayBuy(side, panel.inverted()) ? QStringLiteral("buy") : QStringLiteral("sell")));
+        const QString after{review()};
+        QVERIFY2(after.contains(QStringLiteral("standing %1 (%2)").arg(panel.inverted() ? SideTitle(side == QStringLiteral("bid"), true) : side, side)), qPrintable(after));
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked()); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result);
+    }
     void ladderOrdersAreBookLevelsForTheMarketableLimit()
     {
         // Another account's ask ladder is exact limit liquidity, so the book
@@ -4695,7 +4989,7 @@ private Q_SLOTS:
         QCOMPARE(panel.m_chart->pricePointCount(), 1);
         QVERIFY(panel.m_pair_title->text().contains(QStringLiteral("B3")));
         QVERIFY(panel.m_price_label->text().contains(QStringLiteral("tUSD / B3")));
-        QVERIFY(panel.m_quantity_label->text().contains(QStringLiteral("Spend")));
+        QVERIFY(panel.m_quantity_label->text().contains(QStringLiteral("Receive")));
         QVERIFY(panel.m_quantity_label->text().contains(QStringLiteral("tUSD")));
         QVERIFY(panel.m_buy->text().contains(QStringLiteral("B3")));
         QVERIFY(panel.m_own_view->item(0, 0)->text().contains(QStringLiteral("Sell")));
@@ -4749,6 +5043,10 @@ private Q_SLOTS:
         QVERIFY(orientation);
         QVERIFY(orientation->isEnabled());
         orientation->setCurrentIndex(1);
+        // The flip kept the ticket's canonical bid (Sell B3 here); this
+        // review is of Buy B3, selected as a person would.
+        QVERIFY(panel.m_sell->isChecked());
+        panel.m_buy->click();
         panel.m_price->setText(QStringLiteral("2"));
         panel.m_quantity->setText(QStringLiteral("1"));
         QVERIFY(panel.m_ticket_available->text().contains(QStringLiteral("0.25 tUSD")));
