@@ -1813,6 +1813,42 @@ BOOST_AUTO_TEST_CASE(stop_attempts_a_queued_load_at_once)
     store.SetLoadHookForTest({});
 }
 
+// Only a stopping store gives a failing load up after one attempt: a synced
+// pass of a running store (FlushNow(true)) neither attempts a load before
+// its retry is due nor gives a failed one up.
+BOOST_AUTO_TEST_CASE(a_synced_pass_alone_never_gives_a_failing_load_up)
+{
+    const auto path{m_path_root / "observed_synced_retry"};
+    FakeClocks clocks;
+    Populate(path, clocks, 20, 1'000);
+    auto options{Options(path)};
+    options.load_retry = std::chrono::hours{1};
+    FlowMeshObservedTimeStore store{options};
+    std::string error;
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{MakeLog(clocks)};
+    store.Attach(log, 20, Known(0, 20));
+    unsigned reached{0};
+    store.SetLoadHookForTest([&](const flowmesh::MarketId&, const char* at) {
+        if (std::string_view{at} == "meta" && reached++ == 0) throw std::runtime_error{"injected"};
+    });
+    store.FlushNow(true);
+    BOOST_CHECK_EQUAL(reached, 1U);
+    BOOST_CHECK(log->GetSummary().loading);
+    // Its retry is an hour away: a second synced pass leaves it queued.
+    store.FlushNow(true);
+    BOOST_CHECK_EQUAL(reached, 1U);
+    BOOST_CHECK(log->GetSummary().loading);
+    BOOST_CHECK(store.ReadCandles(MARKET, CandleInterval::M1, T0, T0 + 60'000, 10).empty());
+    // Stop attempts it at once, and the recovered disk loads.
+    store.Stop();
+    BOOST_CHECK_EQUAL(reached, 2U);
+    BOOST_CHECK(!log->GetSummary().loading);
+    BOOST_CHECK(log->GetSummary().persisted);
+    BOOST_CHECK_EQUAL(store.ReadCandles(MARKET, CandleInterval::M1, T0, T0 + 60'000, 10).size(), 1U);
+    store.SetLoadHookForTest({});
+}
+
 // A history read and checked but not installed (FinishLoad failing, as an
 // allocation failure would) leaves the log empty and recording: the market
 // is given up, so its fresh candles never overwrite the stored ones of the

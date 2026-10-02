@@ -760,6 +760,7 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
         std::function<void()> hook;
         LoadHook load_hook;
         CDBWrapper* db{nullptr};
+        bool stopping{false};
         {
             std::lock_guard lock{m_mutex};
             for (auto& item : m_attached) attached.push_back(&item);
@@ -767,13 +768,16 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
             load_hook = m_load_hook;
             db = m_db.get();
             m_load_requested = false;
+            stopping = m_stopping;
         }
         const auto now{std::chrono::steady_clock::now()};
         // Queued markets first, on this thread: a market's erasures and
         // wipes always reach the disk before any of its new rows. A failed
-        // load waits for its retry; Stop's pass attempts it at once.
+        // load waits for its retry; once the store stops (whichever pass
+        // sees it first, Stop's at the latest) it is attempted at once and
+        // given up if that fails. A synced pass alone changes neither.
         for (auto* item : attached) {
-            if (item->load && (sync || now >= item->retry_load)) RunLoad(*item, db, now, /*at_stop=*/sync, load_hook);
+            if (item->load && (stopping || now >= item->retry_load)) RunLoad(*item, db, now, /*at_stop=*/stopping, load_hook);
         }
         for (auto* item : attached) {
             auto& log{*item->log};

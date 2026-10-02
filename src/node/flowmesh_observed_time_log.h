@@ -295,6 +295,9 @@ public:
     //! even when previous unsynced passes left no pending rows.
     void Stop();
     //! One flush pass on the calling thread (the flush thread's body).
+    //! `sync` ends it with a synced write. Only a stopping store (Stop
+    //! called) attempts a queued load before its retry is due and gives a
+    //! failing one up after that attempt; `sync` alone never does.
     void FlushNow(bool sync) noexcept;
     //! Disk candles of one market with open in [from_ms, before_ms), at most
     //! `limit`, ascending; `older` is set when one exists before from_ms.
@@ -346,7 +349,8 @@ private:
     };
     void FlushLoop();
     //! One attempt of a queued load (the body Attach ran before queueing).
-    //! `at_stop`: no later attempt. Caller holds m_flush_mutex.
+    //! `at_stop` (the store is stopping): no later attempt. Caller holds
+    //! m_flush_mutex.
     void RunLoad(Attached& item, CDBWrapper* db, std::chrono::steady_clock::time_point now, bool at_stop,
                  const LoadHook& hook) noexcept;
     //! A failed attempt: retried later, or given up. Caller holds
@@ -373,6 +377,8 @@ private:
     //! Never taken by Attach or ReadCandles.
     std::mutex m_flush_mutex;
     std::condition_variable m_cv;
+    //! Set by Stop (cleared by Start), under m_mutex: the flush thread
+    //! ends, and a queued load is attempted at once and not retried.
     bool m_stopping{false};
     std::thread m_thread;
 };
