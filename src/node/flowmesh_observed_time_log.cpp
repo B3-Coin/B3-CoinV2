@@ -218,7 +218,8 @@ flowmesh::ObservedStamp FlowMeshObservedTimeLog::Apply(State& state, const Raw& 
             const auto id{static_cast<uint8_t>(interval)};
             if (!state.pending.candles.insert_or_assign({id, candle.open_ms}, candle).second) continue;
             // A new snapshot. Beyond the interval's budget (a flush stalled
-            // for longer than its memory window) the oldest is dropped: more
+            // for longer than its memory window, or a clock stepping forward
+            // past it between flushes) the oldest is dropped: more
             // than window + 1 aligned opens never fit in the window, so that
             // candle has left it and can no longer change.
             if (++state.pending.candle_counts[id] <= PendingCandlesMax(interval)) continue;

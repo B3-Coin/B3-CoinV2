@@ -67,11 +67,13 @@ public:
     static constexpr size_t PENDING_ROWS_MAX{8192};
     //! Unflushed candle snapshots of `interval`: CandleMemoryWindow + 1
     //! (4742 for the six). Only a flush stalled for longer than the window
-    //! reaches it; the oldest snapshot, which can no longer change, is then
-    //! dropped from persistence only and counted (candles_not_persisted),
-    //! never from memory. The stored candle of that bucket stays as it was
-    //! at the last successful flush, or is absent, as after a crash; the
-    //! sequence gap to the next stored candle shows it.
+    //! reaches it, or a wall clock stepping forward past the window again
+    //! and again between two flushes; the oldest snapshot, which can no
+    //! longer change, is then dropped from persistence only and counted
+    //! (candles_not_persisted), never from memory. The stored candle of
+    //! that bucket stays as it was at the last successful flush, or is
+    //! absent, as after a crash; the sequence gap to the next stored candle
+    //! shows it.
     static size_t PendingCandlesMax(flowmesh::CandleInterval interval) { return flowmesh::CandleMemoryWindow(interval) + 1; }
     //! Why every read is unavailable while the history loads.
     static constexpr const char* LOADING_REASON{"observed_time_loading"};

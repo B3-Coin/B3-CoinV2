@@ -657,6 +657,51 @@ BOOST_AUTO_TEST_CASE(rows_beyond_store_head_dropped_and_mismatch_wipes)
     BOOST_CHECK(!log->GetSummary().recorded_since);
 }
 
+// The one exception to "a stored bucket is continued, never replaced": a
+// bucket holding an entry at or beyond the store's head is erased whole by
+// the load (a candle cannot be cut back), so the entries recorded since
+// begin it again. Its candle undercounts (the kept entries before the head
+// are not in it) and is marked as a seam: seam_before when its first entry
+// is the first after the restart, partial when an untimed one came first.
+BOOST_AUTO_TEST_CASE(a_bucket_erased_by_the_load_restarts_as_a_seam)
+{
+    for (const bool clock_back : {false, true}) {
+        BOOST_TEST_CONTEXT("clock_back=" << clock_back) {
+            const auto path{m_path_root / (clock_back ? "observed_restarted_back" : "observed_restarted")};
+            FakeClocks clocks;
+            // Entries 0..19, a second apart: all in the 1m bucket at T0.
+            Populate(path, clocks, 20, 1'000);
+            FlowMeshObservedTimeStore store{Options(path)};
+            std::string error;
+            BOOST_REQUIRE(store.Open(error));
+            const auto log{MakeLog(clocks)};
+            store.Attach(log, 12, Known(0, 12));
+            store.FlushNow(false);
+            BOOST_REQUIRE(!log->GetSummary().loading);
+            BOOST_CHECK_EQUAL(log->Lookup(Known(0, 12)).size(), 12U);
+            BOOST_CHECK(log->Candles(CandleInterval::M1, std::nullopt, 10).candles.empty());
+            uint64_t first{12};
+            if (clock_back) {
+                clocks.wall -= 3'600'000;
+                BOOST_CHECK(log->Record(first, EntryHash(first), ObservedDelay::NONE, Tick(first)).mode == ObservedMode::UNTIMED);
+                ++first;
+                clocks.Advance(3'600'000);
+            }
+            clocks.Advance(1'000);
+            BOOST_CHECK(log->Record(first, EntryHash(first), ObservedDelay::NONE, Tick(first)).mode == ObservedMode::LIVE);
+            const auto page{log->Candles(CandleInterval::M1, std::nullopt, 10)};
+            BOOST_REQUIRE_EQUAL(page.candles.size(), 1U);
+            const auto& candle{page.candles.front()};
+            BOOST_CHECK_EQUAL(candle.open_ms, T0);
+            BOOST_CHECK_EQUAL(candle.first_sequence, first);
+            BOOST_CHECK_EQUAL(candle.entries, 1U);
+            BOOST_CHECK_EQUAL((candle.flags & flowmesh::CANDLE_SEAM_BEFORE) != 0, !clock_back);
+            BOOST_CHECK_EQUAL((candle.flags & flowmesh::CANDLE_PARTIAL) != 0, clock_back);
+            store.Stop();
+        }
+    }
+}
+
 BOOST_AUTO_TEST_CASE(pending_overflow_drops_rows_from_persistence_only)
 {
     FakeClocks clocks;

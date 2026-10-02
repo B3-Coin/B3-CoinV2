@@ -90,9 +90,11 @@ auction existed between them; anything else is a gap.
 - More than 8192 unflushed rows: the oldest are dropped from persistence only (a
   gap after a restart). Unflushed candle snapshots are bounded too: at most
   each interval's memory window + 1 (4,742 for the six). Only a flush stalled
-  for longer than an interval's window reaches that; its oldest snapshot,
-  which can no longer change, is then dropped from persistence only and
-  counted. The stored candle of that bucket stays as it was at the last
+  for longer than an interval's window reaches that, or a wall clock that
+  steps forward past the window again and again between two flushes (each
+  step opens new buckets); its oldest snapshot, which can no longer change,
+  is then dropped from persistence only and counted. The stored candle of
+  that bucket stays as it was at the last
   successful flush, or is absent, as after a crash; the sequence gap to the
   next stored candle shows it. A crash loses at most the unflushed second (a
   gap). A failed write is a gap too: the times stay in memory and the next
@@ -102,7 +104,11 @@ auction existed between them; anything else is a gap.
   history and goes on at once. The thread then loads it, before it writes any
   row of that market: rows at or after the store's next sequence are erased,
   with every stored candle holding such an entry (a candle cannot be cut
-  back, so neither a disk page nor a later start can serve one), a row whose
+  back, so neither a disk page nor a later start can serve one; the entries
+  recorded since begin such a bucket again, so its candle may undercount,
+  missing the kept entries before the head, and is marked as a seam:
+  `seam_before` when its first entry is the first after the restart,
+  `partial` when an untimed entry came first), a row whose
   hash contradicts the store's retained hashes (or another domain) clears
   the market's times, and the newest rows and each interval's memory window
   are reloaded. An unreadable database is wiped and recreated; if even that
@@ -118,7 +124,11 @@ auction existed between them; anything else is a gap.
   history that could not be installed) is logged with the reason and leaves
   that market's times in memory only until restart: its entries are
   recorded and served from memory, as when the database cannot be opened,
-  and its disk is neither served nor written. `observed_time` holds display
+  and its disk is neither served nor written. Its candle pages are then
+  available with only the candles of entries recorded since the start
+  (those that waited included): a client takes the start of its history
+  from the market-data section's `recorded_since_sequence`, and
+  `storage.persisted` stays false. `observed_time` holds display
   data only and may be removed if this repeats. A disk candle is served,
   and a row written, only for a market whose load succeeded. A candle page
   whose window needs the database when it cannot be read (an I/O error, or
@@ -130,7 +140,8 @@ auction existed between them; anything else is a gap.
 - Entries committed while the history loads keep only their clock readings
   and are stamped once it has loaded, exactly as if it had loaded first
   (the same clamps, steps, untimed entries and continued candles; a stored
-  bucket is continued, never replaced). At most 4096 wait; beyond that the
+  bucket is continued, never replaced, except one the load erased for
+  holding an entry at or beyond the head, above). At most 4096 wait; beyond that the
   oldest are a gap, counted as not persisted. Until the load finishes the
   market's `observed_time` section and candles are unavailable with
   `observed_time_loading` and its disk candles are not served: never a
@@ -392,7 +403,9 @@ volumes, late placement only inside a bound, partial and seam flags, quiet
 proof, liveness matrix including a level peer, warm-up tolerance, paging,
 retention, client extension), `flowmesh_observed_time_log_tests` (clock clamp,
 step, untimed, restart; persistence and reload; lost tail is a gap; corrupt
-database; rows past the store head; hash mismatch; pending overflow; flush
+database; rows past the store head, and a bucket erased for them restarting
+as a seam; hash mismatch; pending overflow; only a stopping store giving a
+failing load up early; flush
 failure; a stalled flush never blocks Record, reads or a market attach; a
 history loaded after entries equals one loaded first, at the log and at the
 store whenever the queued load runs, with more than 4096 waiting entries,
