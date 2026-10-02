@@ -156,11 +156,11 @@ public:
      * result is exactly the synchronous Load followed by those Records,
      * except that entries dropped beyond RING are a gap. The history is
      * rebuilt and the waiting entries replayed off the mutex, in at most
-     * eight rounds that stop once 64 or fewer wait; under the mutex the
-     * entries recorded during the last round are applied and the state is
-     * swapped in. A Record arriving then waits for that replay: normally at
-     * most 64 entries, and at most RING only when Records kept pace with
-     * the replay for all eight rounds. Never throws: a failure leaves the
+     * eight rounds; once 64 or fewer wait (or after the eighth round) they
+     * are applied in the same hold of the mutex that found them, and the
+     * state is swapped in. A Record arriving then waits for that replay: at
+     * most 64 entries, or at most RING only when Records kept pace with the
+     * replay for all eight rounds. Never throws: a failure leaves the
      * log empty and recording, and returns false (the history was not
      * installed). */
     bool FinishLoad(std::vector<flowmesh::ObservedStamp> rows,

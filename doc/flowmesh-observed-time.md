@@ -137,7 +137,8 @@ auction existed between them; anything else is a gap.
   partial answer, which a chart would hold as its whole window. The load
   itself is replayed off the recorder's mutex: a `Record` arriving as it
   ends waits only for the entries recorded during its last replay round,
-  normally under 64 and at most 4096 (measured in a test build: under a
+  at most 64, or at most 4096 only when entries kept arriving as fast as
+  the replay for all eight rounds (4096 measured in a test build: under a
   millisecond warm, about 2 ms cold). The load checks every stored
   candle of the market, so after a start it lasts up to tens of milliseconds
   per market at full retention; only a slow or stalled disk makes it longer,

@@ -387,33 +387,31 @@ bool FlowMeshObservedTimeLog::FinishLoad(std::vector<flowmesh::ObservedStamp> ro
         // Replayed off the mutex, so Record (the runtime worker, under its
         // market lock) waits for none of this. Each round swaps the buffer
         // out in O(1); rounds repeat while more than UNDER_LOCK_MAX arrived
-        // during the previous one, at most ROUNDS times. What is left for
-        // the mutex below is what arrived during the last round: at most
-        // UNDER_LOCK_MAX unless Records kept pace with the replay for every
-        // round, and never more than RING.
+        // during the previous one, at most ROUNDS times. The rest, what
+        // arrived during the last round, is applied in the same hold of the
+        // mutex that measured it: at most UNDER_LOCK_MAX unless Records kept
+        // pace with the replay for every round, and never more than RING.
         constexpr size_t UNDER_LOCK_MAX{64};
         constexpr int ROUNDS{8};
-        for (int round{0}; round < ROUNDS; ++round) {
+        for (int round{0};; ++round) {
             std::deque<Raw> batch;
             {
                 std::lock_guard lock{m_mutex};
-                if (round > 0 && m_early.size() <= UNDER_LOCK_MAX) break;
+                if (round == ROUNDS || (round > 0 && m_early.size() <= UNDER_LOCK_MAX)) {
+                    for (const auto& raw : m_early) (void)Apply(state, raw);
+                    state.rows_not_persisted += m_state.rows_not_persisted + m_early_dropped;
+                    state.candles_not_persisted += m_state.candles_not_persisted;
+                    // The replaced state is freed below, after the mutex.
+                    std::swap(m_state, state);
+                    m_early.clear();
+                    m_early_dropped = 0;
+                    m_loading = false;
+                    break;
+                }
                 batch.swap(m_early);
             }
             taken += batch.size();
             for (const auto& raw : batch) (void)Apply(state, raw);
-        }
-        {
-            std::lock_guard lock{m_mutex};
-            // Only what was recorded during the replay above.
-            for (const auto& raw : m_early) (void)Apply(state, raw);
-            state.rows_not_persisted += m_state.rows_not_persisted + m_early_dropped;
-            state.candles_not_persisted += m_state.candles_not_persisted;
-            // The replaced state is freed below, after the mutex.
-            std::swap(m_state, state);
-            m_early.clear();
-            m_early_dropped = 0;
-            m_loading = false;
         }
         m_generation.fetch_add(1, std::memory_order_acq_rel);
         return true;
