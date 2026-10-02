@@ -479,7 +479,7 @@ bool FlowMeshObservedTimeStore::IsOpen() const
     return m_db != nullptr;
 }
 
-void FlowMeshObservedTimeStore::WipeMarket(CDBWrapper& db, const flowmesh::MarketId& market)
+void FlowMeshObservedTimeStore::WipeMarket(CDBWrapper& db, const flowmesh::MarketId& market, const uint256& domain)
 {
     CDBBatch batch{db};
     size_t erased{0};
@@ -498,7 +498,9 @@ void FlowMeshObservedTimeStore::WipeMarket(CDBWrapper& db, const flowmesh::Marke
     }
     // A key an unreadable block hid would survive the wipe: the load fails.
     if (!it->StatusOK()) throw dbwrapper_error{"observed-time database read error"};
-    batch.Write(MetaKey{KEY_META, market}, MetaValue{});
+    // The emptied display history still belongs to this domain. Otherwise
+    // fresh rows recorded after a hash mismatch are wiped again at restart.
+    batch.Write(MetaKey{KEY_META, market}, MetaValue{META_VERSION, domain});
     db.WriteBatch(batch, true);
     LogWarning("FlowMesh market %s: observed times did not match this node's certified log and were cleared (%u records)\n",
                market.GetHex(), static_cast<unsigned>(erased));
@@ -560,7 +562,7 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db, co
             MetaValue meta;
             const bool has_meta{db->Read(MetaKey{KEY_META, market}, meta)};
             if (has_meta && (meta.version != META_VERSION || meta.domain != log.Domain())) {
-                WipeMarket(*db, market);
+                WipeMarket(*db, market, log.Domain());
             }
             db->Write(MetaKey{KEY_META, market}, MetaValue{META_VERSION, log.Domain()}, true);
             // Rows the production store never certified here are erased.
@@ -616,7 +618,7 @@ void FlowMeshObservedTimeStore::RunLoad(Attached& item, CDBWrapper* const db, co
             }
             scanned();
             if (mismatch) {
-                WipeMarket(*db, market);
+                WipeMarket(*db, market, log.Domain());
                 rows.clear();
             }
             it->Seek(RowKey{KEY_ROW, market, 0});

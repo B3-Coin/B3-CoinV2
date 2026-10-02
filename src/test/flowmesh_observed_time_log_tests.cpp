@@ -1114,6 +1114,41 @@ BOOST_AUTO_TEST_CASE(a_replaced_failed_attachment_does_not_fence_new_disk_reads)
     BOOST_CHECK_EQUAL(disk.front().last_sequence, 0U);
 }
 
+BOOST_AUTO_TEST_CASE(hash_mismatch_wipe_preserves_new_history_on_next_restart)
+{
+    const auto path{m_path_root / "observed_hash_wipe_restart"};
+    FakeClocks clocks;
+    Populate(path, clocks, 20, 1'000);
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        auto known{Known(0, 12)};
+        known[5].second = EntryHash(5, 7);
+        store.Attach(log, 12, known);
+        store.FlushNow(false);
+        BOOST_CHECK(log->Lookup(Known(0, 12)).empty());
+        clocks.Advance(61'000);
+        log->Record(12, EntryHash(12), ObservedDelay::NONE, Tick(12));
+        store.Stop();
+        BOOST_CHECK(log->GetSummary().persisted);
+    }
+    {
+        FlowMeshObservedTimeStore store{Options(path)};
+        std::string error;
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{MakeLog(clocks)};
+        store.Attach(log, 13, Known(12, 1));
+        store.FlushNow(false);
+        const auto rows{log->Lookup(Known(12, 1))};
+        BOOST_REQUIRE_EQUAL(rows.size(), 1U);
+        BOOST_CHECK_EQUAL(rows.front().sequence, 12U);
+        BOOST_CHECK(!store.ReadCandles(MARKET, CandleInterval::M1, T0, T0 + 180'000, 10).empty());
+        store.Stop();
+    }
+}
+
 BOOST_AUTO_TEST_CASE(candle_page_json_exact_volumes_and_labels)
 {
     FakeClocks clocks;

@@ -366,7 +366,7 @@ private:
     void LoadFailed(Attached& item, const char* why, std::chrono::steady_clock::time_point now, bool at_stop,
                     bool retryable) noexcept;
     //! Caller holds m_flush_mutex.
-    static void WipeMarket(CDBWrapper& db, const flowmesh::MarketId& market);
+    static void WipeMarket(CDBWrapper& db, const flowmesh::MarketId& market, const uint256& domain);
 
     const Options m_options;
     //! Published once, under both mutexes (Open); read under either. Freed

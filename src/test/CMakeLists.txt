@@ -104,6 +104,7 @@ add_executable(test_bitcoin
   flowmesh_market_view_tests.cpp
   flowmesh_observed_time_tests.cpp
   flowmesh_observed_time_log_tests.cpp
+  flowmesh_observed_time_durability_tests.cpp
   flowmesh_outcome_evidence_tests.cpp
   flowmesh_recent_window_tests.cpp
   flowmesh_seat_evidence_tests.cpp
@@ -287,6 +288,7 @@ target_link_libraries(test_bitcoin
   bitcoin_cli
   bitcoin_node
   bitcoin_consensus
+  leveldb
   minisketch
   secp256k1
   Boost::headers
