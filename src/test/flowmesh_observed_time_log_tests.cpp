@@ -675,6 +675,49 @@ BOOST_AUTO_TEST_CASE(pending_overflow_drops_rows_from_persistence_only)
     BOOST_CHECK(log->TakePending().Empty());
 }
 
+// What a market's times lost from persistence is operator detail of this
+// node's own market-data section (storage), with the persisted flag; a
+// section without this node's log has none.
+BOOST_AUTO_TEST_CASE(persistence_losses_are_reported_in_this_nodes_section)
+{
+    FakeClocks clocks;
+    const auto log{MakeLog(clocks)};
+    // A minute apart: both the row queue and the one-minute candles overflow.
+    const uint64_t total{FlowMeshObservedTimeLog::PENDING_ROWS_MAX + 10};
+    for (uint64_t i{0}; i < total; ++i) {
+        log->Record(i, EntryHash(i), ObservedDelay::NONE, Tick(i));
+        clocks.Advance(60'000);
+    }
+    log->SetPersisted(false);
+    const auto summary{log->GetSummary()};
+    BOOST_REQUIRE_EQUAL(summary.rows_not_persisted, 10U);
+    BOOST_REQUIRE_GT(summary.candles_not_persisted, 0U);
+    flowmesh::MarketData data;
+    node::FillObservedTimes(data, log.get());
+    BOOST_REQUIRE(data.observed);
+    BOOST_CHECK(data.observed->available);
+    BOOST_REQUIRE(data.observed->storage);
+    BOOST_CHECK(!data.observed->storage->persisted);
+    BOOST_CHECK_EQUAL(data.observed->storage->rows_not_persisted, 10U);
+    BOOST_CHECK_EQUAL(data.observed->storage->candles_not_persisted, summary.candles_not_persisted);
+    const auto json{node::FlowMeshClientMarketDataJson(data)};
+    const auto& storage{json["observed_time"]["storage"]};
+    BOOST_REQUIRE(storage.isObject());
+    BOOST_CHECK(!storage["persisted"].get_bool());
+    BOOST_CHECK_EQUAL(storage["rows_not_persisted"].getInt<uint64_t>(), 10U);
+    BOOST_CHECK_EQUAL(storage["candles_not_persisted"].getInt<uint64_t>(), summary.candles_not_persisted);
+    log->SetPersisted(true);
+    data.observed.reset();
+    node::FillObservedTimes(data, log.get());
+    BOOST_REQUIRE(data.observed && data.observed->storage);
+    BOOST_CHECK(data.observed->storage->persisted);
+    data.observed.reset();
+    node::FillObservedTimes(data, nullptr);
+    BOOST_REQUIRE(data.observed);
+    BOOST_CHECK(!data.observed->storage);
+    BOOST_CHECK(!node::FlowMeshClientMarketDataJson(data)["observed_time"].exists("storage"));
+}
+
 // A flush that never drains (a stalled disk) for three days of one entry a
 // minute: each interval keeps at most its memory window + 1 unflushed
 // snapshots, the newest, and the drop is counted. Memory is untouched.
@@ -1220,6 +1263,9 @@ BOOST_AUTO_TEST_CASE(reads_while_the_history_loads_are_unavailable_never_partial
     BOOST_CHECK_EQUAL(data.observed->unavailable_reason, FlowMeshObservedTimeLog::LOADING_REASON);
     BOOST_CHECK(!data.observed->recorded_since_sequence);
     BOOST_CHECK(data.observed->rows.empty());
+    // Its storage detail is there while it loads (nothing failed yet).
+    BOOST_REQUIRE(data.observed->storage);
+    BOOST_CHECK(data.observed->storage->persisted);
     store.FlushNow(false);
     BOOST_CHECK(!log->GetSummary().loading);
     data.observed.reset();
@@ -1706,6 +1752,15 @@ BOOST_AUTO_TEST_CASE(a_load_given_up_keeps_the_market_in_memory_only)
     BOOST_CHECK(!summary.loading);
     BOOST_CHECK(!summary.persisted);
     BOOST_CHECK_EQUAL(log->Lookup(Known(20, 23)).size(), 3U);
+    // The market-data section serves memory only, from the first entry
+    // recorded here, and says its times are not persisted.
+    flowmesh::MarketData data;
+    node::FillObservedTimes(data, log.get());
+    BOOST_REQUIRE(data.observed);
+    BOOST_CHECK(data.observed->available);
+    BOOST_CHECK_EQUAL(data.observed->recorded_since_sequence.value_or(0), 20U);
+    BOOST_REQUIRE(data.observed->storage);
+    BOOST_CHECK(!data.observed->storage->persisted);
     clocks.Advance(1'000);
     log->Record(23, EntryHash(23), ObservedDelay::NONE, Tick(23));
     BOOST_CHECK_EQUAL(log->Candles(CandleInterval::M1, std::nullopt, 10).candles.back().last_sequence, 23U);

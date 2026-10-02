@@ -418,6 +418,20 @@ struct ObservedTimes {
     std::optional<uint64_t> recorded_since_sequence;
     //! Ascending sequences.
     std::vector<ObservedStamp> rows;
+    //! How this node's observed-time database keeps its times (operator
+    //! detail). Only in this node's own section: never in a public reply,
+    //! never from an endpoint.
+    struct Storage {
+        //! False after a failed write or history load attempt; false until
+        //! restart once the market's disk history was given up (its times
+        //! are then kept in memory only).
+        bool persisted{true};
+        //! Dropped from persistence before any write (a gap after a
+        //! restart); a failed write shows only in `persisted`.
+        uint64_t rows_not_persisted{0};
+        uint64_t candles_not_persisted{0};
+    };
+    std::optional<Storage> storage;
 };
 
 enum class CandleInterval : uint8_t { M1, M5, M15, H1, H4, D1 };

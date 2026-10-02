@@ -148,6 +148,8 @@ class FlowMeshObservedTimeTest(FlowMeshLiquidityTest):
         section = data["observed_time"]
         assert_equal((section["available"], section["source"], section["source_kind"], section["certified"]),
                      (True, "this_node", "operator_observed", False))
+        # This node's storage detail (operator only): nothing was lost.
+        assert_equal(section["storage"], {"persisted": True, "rows_not_persisted": 0, "candles_not_persisted": 0})
         ticks = data["clearing_ticks"]["ticks"]
         rows = section["rows"]
         by_sequence = {tick["sequence"]: tick for tick in ticks}
@@ -236,6 +238,8 @@ class FlowMeshObservedTimeTest(FlowMeshLiquidityTest):
         self.wait_until(lambda: remote_times() is not None, timeout=60, check_interval=.2)
         remote = remote_times()
         assert_equal((remote["observed_time"]["source"], remote["observed_time"]["certified"]), (relay0.url, False))
+        # Only a node's own section carries its storage detail.
+        assert "storage" not in remote["observed_time"], remote["observed_time"]
         local_rows = {row["sequence"]: row for row in self.timed(n0, market)["observed_time"]["rows"]}
         for row in remote["observed_time"]["rows"]:
             mine = local_rows[row["sequence"]]

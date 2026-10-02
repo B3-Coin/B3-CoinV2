@@ -105,12 +105,20 @@ public:
     struct Summary {
         //! Unset while the history loads.
         std::optional<uint64_t> recorded_since;
+        //! persisted, rows_not_persisted and candles_not_persisted are
+        //! reported only in this node's own market-data section
+        //! (flowmesh::ObservedTimes::storage), never in a public reply.
+        //! False after a failed write or load attempt, and for good once
+        //! the store gave the market's disk history up.
         bool persisted{true};
         bool clock_suspect{false};
+        //! Entries dropped from persistence before any write: beyond
+        //! PENDING_ROWS_MAX, beyond RING while the history loaded, or in a
+        //! history that could not be installed.
         uint64_t rows_not_persisted{0};
-        //! Internal (never serialized): candle snapshots dropped beyond
-        //! PendingCandlesMax.
+        //! Candle snapshots dropped beyond PendingCandlesMax.
         uint64_t candles_not_persisted{0};
+        //! Internal (never serialized): failed Records and installs.
         uint64_t record_failures{0};
         //! Internal (never serialized): the history is loading, so every
         //! read is unavailable with LOADING_REASON.

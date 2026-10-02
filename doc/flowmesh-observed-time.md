@@ -163,6 +163,15 @@ history and tick entries whose hash matches: `sequence`, `microblock_hash`,
 unchanged: times live beside them, so tick equality (which drives clients'
 conflict checks) can never change because of them.
 
+This node's own section (`source` `this_node`, also while its history
+loads) adds `storage`, operator detail that a public reply and an endpoint
+never carry: `persisted` (false after a failed write or history load
+attempt, and until restart once the market's disk history was given up:
+its times are then kept in memory only, from `recorded_since_sequence`),
+`rows_not_persisted` and `candles_not_persisted` (times and candle
+snapshots dropped from persistence before any write, a gap after a
+restart; a failed write shows only in `persisted`).
+
 `getflowmeshcandles <market> {"interval": "1m|5m|15m|1h|4h|1d", "before_ms": n,
 "limit": 1-500}` returns the candles with open in
 `[before_ms - limit x interval, before_ms)`, oldest first, only buckets holding
@@ -389,7 +398,9 @@ store whenever the queued load runs, with more than 4096 waiting entries,
 a clock an hour behind, and a load racing new entries; reads while loading
 are unavailable; a contradicted queued history is never served; the store
 thread opens the database; concurrent attach, record, read and flush;
-a failed disk read is reported, never an empty history; candle JSON),
+a failed disk read is reported, never an empty history; each market's
+first failed write is one warning; persistence losses and a given-up
+history are reported in this node's section; candle JSON),
 `flowmesh_service_tests` (a market start and the service start never wait
 for observed-time storage; a page whose disk read fails is unavailable),
 `flowmesh_runtime_tests` (recorded after commit with its liveness, catch-up and

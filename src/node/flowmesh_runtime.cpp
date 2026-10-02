@@ -3806,6 +3806,9 @@ void FillObservedTimes(flowmesh::MarketData& out, const FlowMeshObservedTimeLog*
         return;
     }
     const auto summary{log->GetSummary()};
+    // Operator detail of this node's own section, also while it loads (a
+    // failed load attempt is retried): PublicObservedTimes removes it.
+    section.storage = flowmesh::ObservedTimes::Storage{summary.persisted, summary.rows_not_persisted, summary.candles_not_persisted};
     if (summary.loading) {
         // The retained history is still being read (a market start): no
         // rows rather than a part of them, and no false recorded_since.

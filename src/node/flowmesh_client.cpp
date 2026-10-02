@@ -588,11 +588,13 @@ class TradingApi {
         return ++bucket.second <= FLOWMESH_API_CANDLES_PER_CLIENT_PER_SECOND;
     }
     //! A public reply's observed times: labelled as this endpoint's, with
-    //! only the clock flags (never a delay reason or anything seat-related).
+    //! only the clock flags (never a delay reason or anything seat-related)
+    //! and without this node's storage detail.
     static void PublicObservedTimes(flowmesh::MarketData& data)
     {
         if (!data.observed) return;
         data.observed->source = "endpoint_operator";
+        data.observed->storage.reset();
         for (auto& row : data.observed->rows) {
             row.flags &= flowmesh::OBSERVED_PUBLIC_FLAGS;
             row.delay = flowmesh::ObservedDelay::NONE;

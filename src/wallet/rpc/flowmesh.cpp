@@ -1311,6 +1311,11 @@ RPCHelpMan getflowmeshmarketdata()
                         {T::STR, "delay_reason", /*optional=*/true, "Why this node applied it late: catchup, deferred, behind, stale_anchor, warmup or clock_stepped_back (peer_hint only on a row an earlier development build recorded)"},
                     }},
                 }},
+                {T::OBJ, "storage", /*optional=*/true, "This node's own section only (operator detail; never in a public reply or from an endpoint): how its observed-time database keeps these times", {
+                    {T::BOOL, "persisted", "False after a failed write or history load attempt; false until restart once the market's disk history was given up (its times are then kept in memory only, from recorded_since_sequence)"},
+                    {T::NUM, "rows_not_persisted", "Entries whose times were dropped from persistence before any write: a gap after a restart (a failed write shows only in persisted)"},
+                    {T::NUM, "candles_not_persisted", "Candle snapshots dropped from persistence before any write: the stored candle keeps its last written state"},
+                }},
             }},
             {T::OBJ, "watch", /*optional=*/true, "Present only when watch_ms was given: this read's local latency observation, never evidence", {
                 {T::STR, "status", "none, no_cursor, head_changed, ready, gap, timeout, interrupted, restarted, busy, deadline (endpoint), or not_eligible, lane_busy, superseded, unsupported, failed, revalidate, invalid, ticks_catchup, other (this client)"},

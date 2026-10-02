@@ -6150,6 +6150,8 @@ BOOST_AUTO_TEST_CASE(trading_api_observed_time_only_when_requested)
             BOOST_CHECK_EQUAL(section["source"].get_str(), "endpoint_operator");
             BOOST_CHECK_EQUAL(section["source_kind"].get_str(), "operator_observed");
             BOOST_CHECK(!section["certified"].get_bool());
+            // This node's storage detail is operator-only, never public.
+            BOOST_CHECK(!section.exists("storage"));
             const auto& ticks{timed["result"]["reported_data"]["clearing_ticks"]["ticks"]};
             BOOST_REQUIRE_EQUAL(section["rows"].size(), ticks.size());
             for (size_t i{0}; i < ticks.size(); ++i) {
