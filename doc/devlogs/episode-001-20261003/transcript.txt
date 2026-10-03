@@ -1,0 +1,17 @@
+Building B3 with evidence
+Hey everyone, Josh here. This is the first B three development diary. I'll share the progress milestone by milestone, including the bugs and the tests behind each fix. You're seeing an earlier regtest wallet capture, not a demonstration of production V two. Today, I'm looking at the accounting, agreement and restart recovery work behind FlowMesh V two.
+
+The same funds cannot be spent twice
+First, the money. The isolated accounting model follows funds through deposits, shared spot balances, order reservations, fees and payouts. Two markets must not reserve the same money twice. Moving cash between spot and futures needs an explicit authorized instruction. Futures cannot silently take spot funds. These are tested accounting mechanics, not a finished futures trading or margin system.
+
+Balances must match their history
+A balance also needs a believable history. The model replays its recorded inputs when restoring a snapshot. A separate checker examines conservation and ownership. I am keeping the earlier failing examples alongside the repair tests, so the fixes stay inspectable. But an internally consistent rewritten history still needs an external trusted commitment to detect it. A passing model is not a security audit.
+
+Agreement when messages go wrong
+Next, agreement. The tests exercise delayed messages, duplicates, missing data, partitions, faulty leaders and late certificates. The important question is whether a replica keeps its earlier obligations instead of forgetting them to make progress. The checker counts issued synthetic signatures, even ones other replicas never received. This evidence has fixed membership and synthetic authentication. It does not qualify live consensus.
+
+Restart without forgetting decisions
+Recovery adds actual files, SQLite stores and separate child processes. Tests interrupt processes at selected boundaries, reopen the stores and check what survived. A committed accounting batch must not run twice after a restart or duplicate certificate. Required signing evidence must remain binding. These are useful recovery tests, but process kills and injected failures do not prove safety under actual machine power loss.
+
+A reproducible milestone
+For this diary, I repeated four selected isolated suites from one pinned commit. All three hundred and thirty two tests passed: accounting, agreement, storage and runner checks. I'll include the commands and results with the written update. Native integration, complete futures, bridge qualification and real network latency are separate checkpoints. That is the progress I can show today, without pretending the whole V two release is finished.

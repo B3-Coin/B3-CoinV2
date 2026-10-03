@@ -1,0 +1,179 @@
+1
+00:00:00,500 --> 00:00:02,260
+Hey everyone, Josh here.
+
+2
+00:00:02,260 --> 00:00:05,779
+This is the first B three development diary.
+
+3
+00:00:05,779 --> 00:00:11,499
+I'll share the progress milestone by milestone, including the bugs and the tests
+
+4
+00:00:11,499 --> 00:00:12,819
+behind each fix.
+
+5
+00:00:12,819 --> 00:00:18,538
+You're seeing an earlier regtest wallet capture, not a demonstration of production V
+
+6
+00:00:18,538 --> 00:00:18,978
+two.
+
+7
+00:00:18,978 --> 00:00:24,698
+Today, I'm looking at the accounting, agreement and restart recovery work behind FlowMesh
+
+8
+00:00:24,698 --> 00:00:25,578
+V two.
+
+9
+00:00:26,978 --> 00:00:28,313
+First, the money.
+
+10
+00:00:28,313 --> 00:00:34,100
+The isolated accounting model follows funds through deposits, shared spot balances, order reservations,
+
+11
+00:00:34,100 --> 00:00:35,436
+fees and payouts.
+
+12
+00:00:35,436 --> 00:00:39,443
+Two markets must not reserve the same money twice.
+
+13
+00:00:39,443 --> 00:00:44,340
+Moving cash between spot and futures needs an explicit authorized instruction.
+
+14
+00:00:44,340 --> 00:00:47,011
+Futures cannot silently take spot funds.
+
+15
+00:00:47,011 --> 00:00:52,798
+These are tested accounting mechanics, not a finished futures trading or margin system.
+
+16
+00:00:54,198 --> 00:00:57,697
+A balance also needs a believable history.
+
+17
+00:00:57,697 --> 00:01:02,694
+The model replays its recorded inputs when restoring a snapshot.
+
+18
+00:01:02,694 --> 00:01:06,193
+A separate checker examines conservation and ownership.
+
+19
+00:01:06,193 --> 00:01:12,690
+I am keeping the earlier failing examples alongside the repair tests, so the
+
+20
+00:01:12,690 --> 00:01:14,189
+fixes stay inspectable.
+
+21
+00:01:14,189 --> 00:01:20,687
+But an internally consistent rewritten history still needs an external trusted commitment to
+
+22
+00:01:20,687 --> 00:01:21,686
+detect it.
+
+23
+00:01:21,686 --> 00:01:25,684
+A passing model is not a security audit.
+
+24
+00:01:27,084 --> 00:01:28,137
+Next, agreement.
+
+25
+00:01:28,137 --> 00:01:34,979
+The tests exercise delayed messages, duplicates, missing data, partitions, faulty leaders and late
+
+26
+00:01:34,979 --> 00:01:35,506
+certificates.
+
+27
+00:01:35,506 --> 00:01:42,348
+The important question is whether a replica keeps its earlier obligations instead of
+
+28
+00:01:42,348 --> 00:01:44,979
+forgetting them to make progress.
+
+29
+00:01:44,979 --> 00:01:51,295
+The checker counts issued synthetic signatures, even ones other replicas never received.
+
+30
+00:01:51,295 --> 00:01:55,506
+This evidence has fixed membership and synthetic authentication.
+
+31
+00:01:55,506 --> 00:01:58,664
+It does not qualify live consensus.
+
+32
+00:02:00,064 --> 00:02:05,504
+Recovery adds actual files, SQLite stores and separate child processes.
+
+33
+00:02:05,504 --> 00:02:12,576
+Tests interrupt processes at selected boundaries, reopen the stores and check what survived.
+
+34
+00:02:12,576 --> 00:02:19,648
+A committed accounting batch must not run twice after a restart or duplicate
+
+35
+00:02:19,648 --> 00:02:20,192
+certificate.
+
+36
+00:02:20,192 --> 00:02:23,456
+Required signing evidence must remain binding.
+
+37
+00:02:23,456 --> 00:02:30,528
+These are useful recovery tests, but process kills and injected failures do not
+
+38
+00:02:30,528 --> 00:02:34,336
+prove safety under actual machine power loss.
+
+39
+00:02:35,736 --> 00:02:41,134
+For this diary, I repeated four selected isolated suites from one pinned commit.
+
+40
+00:02:41,134 --> 00:02:46,531
+All three hundred and thirty two tests passed: accounting, agreement, storage and runner
+
+41
+00:02:46,531 --> 00:02:46,946
+checks.
+
+42
+00:02:46,946 --> 00:02:51,098
+I'll include the commands and results with the written update.
+
+43
+00:02:51,098 --> 00:02:56,496
+Native integration, complete futures, bridge qualification and real network latency are separate checkpoints.
+
+44
+00:02:56,496 --> 00:03:01,893
+That is the progress I can show today, without pretending the whole V
+
+45
+00:03:01,893 --> 00:03:03,554
+two release is finished.

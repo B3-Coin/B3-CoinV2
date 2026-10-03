@@ -1,0 +1,38 @@
+{
+  "local_test_revision": "b4b1de423a4be3efe852deb3ed851d0bfce156fc",
+  "public_source_revision": "269ebc48370b94be3ed26c180232c22236241257",
+  "comparison": "Identical Git objects at both revisions; no differences for these exact paths",
+  "scope": "Selected isolated model sources, runner guards, and native integration gate only; not all native code",
+  "objects": [
+    {
+      "path": "ci/run_flowmesh_models.py",
+      "type": "blob",
+      "oid": "64890c070c36e675c17418eae36c111183df2f09"
+    },
+    {
+      "path": "ci/test_flowmesh_models_runner.py",
+      "type": "blob",
+      "oid": "c6cb656b81b6971d7dfe612258c30fa475132690"
+    },
+    {
+      "path": "test/flowmesh_v2_agreement",
+      "type": "tree",
+      "oid": "e25102d0a9adb695c74f182dd49af0971399b1f1"
+    },
+    {
+      "path": "test/flowmesh_v2_model",
+      "type": "tree",
+      "oid": "ccca1777dd3c2e6b39bf840d16690f97da48d0b1"
+    },
+    {
+      "path": "test/flowmesh_v2_storage",
+      "type": "tree",
+      "oid": "759f7afe306d3d48ae670948a5d7a9397a5cbe3c"
+    },
+    {
+      "path": "test/flowmesh_v2_fastpath_native/INTEGRATION_GATE.md",
+      "type": "blob",
+      "oid": "142d0ce7a5164b5cf28d1557b9b4be4403bab700"
+    }
+  ]
+}
