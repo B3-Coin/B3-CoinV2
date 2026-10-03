@@ -4431,10 +4431,13 @@ static RPCHelpMan getbridgelightclientstore()
                        }},
                       {RPCResult::Type::OBJ, "store", "Exact Ethereum light-client store",
                        {
-                           {RPCResult::Type::OBJ, "finalized_header", "Beacon header, execution header, and execution branch"},
+                           // The nested objects are the b3-bridge-ethcheck store.json
+                           // shape (bridge::lcjson::StoreSnapshotJson); their keys are
+                           // not listed here, so -rpcdoccheck must not type-check them.
+                           {RPCResult::Type::OBJ, "finalized_header", "Beacon header, execution header, and execution branch", {}, /*skip_type_check=*/true},
                            {RPCResult::Type::NUM, "period", "Current Ethereum sync-committee period"},
-                           {RPCResult::Type::OBJ, "current_sync_committee", "All 512 current public keys and aggregate key"},
-                           {RPCResult::Type::OBJ, "next_sync_committee", /*optional=*/true, "All 512 next public keys and aggregate key"},
+                           {RPCResult::Type::OBJ, "current_sync_committee", "All 512 current public keys and aggregate key", {}, /*skip_type_check=*/true},
+                           {RPCResult::Type::OBJ, "next_sync_committee", /*optional=*/true, "All 512 next public keys and aggregate key", {}, /*skip_type_check=*/true},
                        }},
                   }},
         RPCExamples{HelpExampleCli("getbridgelightclientstore", "") +
