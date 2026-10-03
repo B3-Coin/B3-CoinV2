@@ -580,7 +580,7 @@ int GuiMain(int argc, char* argv[])
     // (notifications, some window managers) without touching the QSettings
     // compat key above.
 #ifdef B3_FLOWMESH_REGTEST_CLIENT
-    QGuiApplication::setApplicationDisplayName(QStringLiteral("B3 FlowMesh REGTEST TEST5"));
+    QGuiApplication::setApplicationDisplayName(QStringLiteral("B3 FlowMesh REGTEST TEST6"));
 #else
     QGuiApplication::setApplicationDisplayName(QStringLiteral("B3 Hive"));
 #endif

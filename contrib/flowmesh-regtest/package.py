@@ -195,7 +195,7 @@ def verify_macos(app, architecture, minimum):
     executable = app / "Contents/MacOS" / TARGET
     frameworks = app / "Contents/Frameworks"
     info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-    require(info["CFBundleIdentifier"] == "org.b3coin.flowmesh.regtest.test5", "Wrong bundle identity")
+    require(info["CFBundleIdentifier"] == "org.b3coin.flowmesh.regtest.test6", "Wrong bundle identity")
     require(info["CFBundleShortVersionString"] == "1.1.5" and info.get("B3CandidateVersion") == VERSION,
             "Wrong bundle version")
     require(version_tuple(info["LSMinimumSystemVersion"]) == version_tuple(minimum), "Minimum OS metadata differs")

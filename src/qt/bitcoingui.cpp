@@ -142,7 +142,7 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         m_shell = new B3Shell(this);
         m_shell->setWalletWidget(walletFrame);
 #ifdef B3_FLOWMESH_REGTEST_CLIENT
-        m_shell->topStatus()->setNetwork(QStringLiteral("B3 FlowMesh REGTEST TEST4 — ") +
+        m_shell->topStatus()->setNetwork(QStringLiteral("B3 FlowMesh REGTEST TEST6 — ") +
                                          tr("Test tokens have no value. Futures are informational only."),
                                          QStringLiteral("[regtest]"));
 #else
@@ -1850,7 +1850,7 @@ void BitcoinGUI::updateProxyIcon()
 void BitcoinGUI::updateWindowTitle()
 {
 #ifdef B3_FLOWMESH_REGTEST_CLIENT
-    QString window_title = QStringLiteral("B3 FlowMesh REGTEST TEST4");
+    QString window_title = QStringLiteral("B3 FlowMesh REGTEST TEST6");
 #else
     QString window_title = HIVE_NAME;
 #endif

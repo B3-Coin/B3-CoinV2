@@ -5,6 +5,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import plistlib
+import re
 import unittest
 import tempfile
 from unittest import mock
@@ -149,6 +151,67 @@ class PackageTests(unittest.TestCase):
         for value in ("", "15; true", "15.beta", "-1", "15.0.0.0.1"):
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 PACKAGE.version_tuple(value)
+
+    def macos_fixture(self, path):
+        # Synthetic tools exercise the verifier, not Mach-O/deployment qualification.
+        app = Path(path) / "Guarded.app"
+        executable = app / "Contents/MacOS" / PACKAGE.TARGET
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"synthetic executable")
+        cocoa = app / "Contents/PlugIns/platforms/libqcocoa.dylib"
+        cocoa.parent.mkdir(parents=True)
+        cocoa.write_bytes(b"synthetic Cocoa plugin")
+        cmake = (PACKAGE.SOURCE / "src/qt/test/flowmeshclosedtest.cmake").read_text()
+        identity = re.search(r'MACOSX_BUNDLE_GUI_IDENTIFIER "([^"]+)"', cmake).group(1)
+        info = {"CFBundleIdentifier": identity, "CFBundleShortVersionString": "1.1.5",
+                "B3CandidateVersion": PACKAGE.VERSION, "LSMinimumSystemVersion": "15.0"}
+        plist = app / "Contents/Info.plist"
+        plist.write_bytes(plistlib.dumps(info))
+        return app, plist, info, cocoa
+
+    @staticmethod
+    def macos_tools(*args):
+        if args[0] == "file":
+            return "Mach-O arm64" if args[-1].name in (PACKAGE.TARGET, "libqcocoa.dylib") else "data"
+        if args[0] == "lipo":
+            return "arm64"
+        if args[0] == "otool" and args[1] == "-l":
+            return "cmd LC_BUILD_VERSION\n minos 15.0\n"
+        if args[0] == "otool" and args[1] == "-L":
+            return "binary:\n\t/usr/lib/libSystem.B.dylib (version 1)\n"
+        raise AssertionError(args)
+
+    def test_macos_verifier_accepts_configured_test6_identity(self):
+        with tempfile.TemporaryDirectory() as path:
+            app, _, info, _ = self.macos_fixture(path)
+            self.assertEqual(info["CFBundleIdentifier"], "org.b3coin.flowmesh.regtest.test6")
+            with mock.patch.object(PACKAGE, "run", side_effect=self.macos_tools):
+                binaries = PACKAGE.verify_macos(app, "arm64", "15.0")
+            self.assertIn("Contents/MacOS/" + PACKAGE.TARGET, binaries)
+
+    def test_macos_verifier_refuses_wrong_identity_before_tools(self):
+        with tempfile.TemporaryDirectory() as path:
+            app, plist, info, _ = self.macos_fixture(path)
+            for identity in ("org.b3coin.flowmesh.regtest.test5", "org.b3coin.mainnet"):
+                with self.subTest(identity=identity):
+                    info["CFBundleIdentifier"] = identity
+                    plist.write_bytes(plistlib.dumps(info))
+                    with mock.patch.object(PACKAGE, "run") as run:
+                        with self.assertRaisesRegex(RuntimeError, "Wrong bundle identity"):
+                            PACKAGE.verify_macos(app, "arm64", "15.0")
+                        run.assert_not_called()
+
+    def test_macos_identity_fix_preserves_architecture_minimum_and_plugin_checks(self):
+        with tempfile.TemporaryDirectory() as path:
+            app, _, _, cocoa = self.macos_fixture(path)
+            with mock.patch.object(PACKAGE, "run", side_effect=self.macos_tools):
+                with self.assertRaisesRegex(RuntimeError, "Wrong binary architecture"):
+                    PACKAGE.verify_macos(app, "x86_64", "15.0")
+                with self.assertRaisesRegex(RuntimeError, "Minimum OS metadata differs"):
+                    PACKAGE.verify_macos(app, "arm64", "14.0")
+                cocoa.unlink()  # Disposable synthetic fixture, not a user's wallet.
+                with self.assertRaisesRegex(RuntimeError, "Missing Cocoa plugin"):
+                    PACKAGE.verify_macos(app, "arm64", "15.0")
 
     def test_public_docs_contain_no_operator_path(self):
         for name in ("README.md", "profile-vps-20260926.json", "regtest-ca.pem",
