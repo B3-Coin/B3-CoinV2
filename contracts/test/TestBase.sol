@@ -11,6 +11,7 @@ interface Vm {
     function deal(address account, uint256 newBalance) external;
     function readFileBinary(string calldata path) external view returns (bytes memory data);
     function warp(uint256 newTimestamp) external;
+    function load(address target, bytes32 slot) external view returns (bytes32 data);
 }
 
 abstract contract TestBase {
