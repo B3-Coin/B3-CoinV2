@@ -49,7 +49,7 @@ vault take 5-6.5 days.
 - **2026-10-08 17:11:59 UTC:** the old Ethereum verifier lapses (accepted),
   stranding its 3 test USDT; relaying 814,051 first is optional (B-2).
 - **Once reviewed (S1):** a hard fork for B3's health: **H1** rotates
-  producers (frozen since ~826,841 [H, O2]) every 1,440 blocks with a 24 h
+  producers (Set_3 since ~815,321, stuck since ~826,841 [H, O2]) every 1,440 blocks with a 24 h
   escape; **H2** hardened checkpoint (RT1).
 - **In parallel (S2):** harness on local anvil chains (RT0, RT2, RT3).
 - **Then (S3-S4):** fresh lineage, new contracts, node rules, forwarders;
