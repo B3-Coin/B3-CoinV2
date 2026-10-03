@@ -234,9 +234,10 @@ private:
  *
  * Only its own flush thread writes it: at most once per interval, unsynced,
  * one batch per market (rows and candles together, so a crash loses a
- * consistent tail), and every Stop waits for compaction then ends with one
- * checked synced write (an empty synced write alone misses rotated old WALs).
- * Shutdown may rewrite retained chart data. It is never
+ * consistent tail), and every Stop waits for a memtable-to-table/manifest
+ * barrier then ends with one checked synced write (an empty synced write alone
+ * misses rotated old WALs). Shutdown no longer requests full-history manual
+ * compaction; ordinary background compaction may still rewrite tables. It is never
  * written by the FlowMesh tick or worker thread, so a stalled disk delays
  * only the flush. A market's disk is served and written only once its load
  * succeeded; a load that fails is retried, then given up (that market then
@@ -303,7 +304,7 @@ public:
     //! even when previous unsynced passes left no pending rows.
     void Stop();
     //! One flush pass on the calling thread (the flush thread's body).
-    //! `sync` ends it with compaction and a checked synced write. Only a stopping store (Stop
+    //! `sync` ends it with a memtable barrier and a checked synced write. Only a stopping store (Stop
     //! called) attempts a queued load before its retry is due and gives a
     //! failing one up after that attempt; `sync` alone never does.
     void FlushNow(bool sync) noexcept;

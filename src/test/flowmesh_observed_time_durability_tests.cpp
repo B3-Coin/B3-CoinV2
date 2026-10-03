@@ -438,4 +438,97 @@ BOOST_AUTO_TEST_CASE(stop_reports_manifest_sync_failure)
     CheckSyncFailure(m_path_root / "observed_manifest_sync_failure", /*table=*/false);
 }
 
+BOOST_AUTO_TEST_CASE(stop_avoids_forced_retained_history_compaction)
+{
+    // This small two-flush fixture stays below automatic-compaction pressure.
+    // It tests removal of the forced full-range rewrite, not a guarantee that
+    // arbitrary workloads never compact or that shutdown has constant cost.
+    const auto path{m_path_root / "observed_retained_tables"};
+    std::unique_ptr<leveldb::Env> storage{leveldb::NewMemEnv(leveldb::Env::Default())};
+    DurabilityEnv env{storage.get()};
+    env.ReleaseBackground();
+    Clocks clocks;
+    constexpr uint64_t FIRST{64};
+    constexpr uint64_t SECOND{64};
+    std::string error;
+    {
+        FlowMeshObservedTimeStore store{Options(path, env)};
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, MARKET, clocks.Get())};
+        store.Attach(log, 0, {});
+        store.FlushNow(false);
+        for (uint64_t sequence{0}; sequence < FIRST; ++sequence) Record(*log, clocks, sequence);
+        store.FlushNow(false);
+        store.Stop();
+        BOOST_REQUIRE(log->GetSummary().persisted);
+    }
+    std::vector<std::string> retained;
+    for (const auto& file : env.Files()) {
+        if (file.alive && IsTable(file.name) && file.written > 0) retained.push_back(file.name);
+    }
+    BOOST_REQUIRE(!retained.empty());
+
+    FlowMeshObservedTimeStore store{Options(path, env)};
+    BOOST_REQUIRE(store.Open(error));
+    const auto log{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, MARKET, clocks.Get())};
+    store.Attach(log, FIRST, Known(FIRST));
+    store.FlushNow(false);
+    BOOST_REQUIRE_EQUAL(log->Lookup(Known(FIRST)).size(), FIRST);
+    for (uint64_t sequence{FIRST}; sequence < FIRST + SECOND; ++sequence) Record(*log, clocks, sequence);
+    store.FlushNow(false);
+    store.Stop();
+    BOOST_CHECK(log->GetSummary().persisted);
+
+    const auto after{env.Files()};
+    for (const auto& name : retained) {
+        const auto file{std::find_if(after.begin(), after.end(), [&](const auto& state) { return state.name == name; })};
+        BOOST_REQUIRE(file != after.end());
+        BOOST_CHECK_MESSAGE(file->alive, "Stop forced a retained table rewrite: " << name);
+    }
+    BOOST_CHECK(std::any_of(after.begin(), after.end(), [&](const auto& file) {
+        return file.alive && IsTable(file.name) && file.written > 0 && file.written == file.synced &&
+               std::find(retained.begin(), retained.end(), file.name) == retained.end();
+    }));
+}
+
+BOOST_AUTO_TEST_CASE(repeated_memtable_barriers_preserve_history)
+{
+    // Unlike the small rewrite regression, this fixture permits normal
+    // background compaction; only durability and exact recovery are required.
+    const auto path{m_path_root / "observed_repeated_barriers"};
+    std::unique_ptr<leveldb::Env> storage{leveldb::NewMemEnv(leveldb::Env::Default())};
+    DurabilityEnv env{storage.get()};
+    env.ReleaseBackground();
+    Clocks clocks;
+    constexpr uint64_t ROWS{768};
+    std::string error;
+    {
+        FlowMeshObservedTimeStore store{Options(path, env)};
+        BOOST_REQUIRE(store.Open(error));
+        const auto log{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, MARKET, clocks.Get())};
+        store.Attach(log, 0, {});
+        store.FlushNow(false);
+        for (uint64_t sequence{0}; sequence < ROWS; ++sequence) {
+            Record(*log, clocks, sequence);
+            if ((sequence + 1) % 64 == 0) store.FlushNow(true);
+        }
+        store.Stop();
+        BOOST_REQUIRE(log->GetSummary().persisted);
+        env.FreezeWrites();
+    }
+    BOOST_REQUIRE(env.LoseUnsyncedBytes().ok());
+    FlowMeshObservedTimeStore reopened{Options(path, env)};
+    BOOST_REQUIRE(reopened.Open(error));
+    const auto recovered{std::make_shared<FlowMeshObservedTimeLog>(TEST_DOMAIN, MARKET, clocks.Get())};
+    reopened.Attach(recovered, ROWS, Known(ROWS));
+    reopened.FlushNow(false);
+    const auto rows{recovered->Lookup(Known(ROWS))};
+    BOOST_REQUIRE_EQUAL(rows.size(), ROWS);
+    for (size_t i{0}; i < rows.size(); ++i) {
+        BOOST_CHECK_EQUAL(rows[i].sequence, i);
+        BOOST_CHECK(rows[i].hash == EntryHash(i));
+        BOOST_CHECK_EQUAL(rows[i].ms, T0 + static_cast<int64_t>(i));
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

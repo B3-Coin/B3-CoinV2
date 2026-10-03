@@ -78,13 +78,16 @@ auction existed between them; anything else is a gap.
   and writes it**: it opens the database when it starts; it writes at most
   once a second, unsynced, one batch per market with rows and candles
   together; at shutdown, after the runtime stopped, it flushes once more and
-  ends with a full compaction and then one checked synced write even when
+  ends with a memtable barrier and then one checked synced write even when
   nothing was pending. An empty synced write alone is insufficient: LevelDB
   may rotate a full memtable first and sync only its new WAL, leaving the old
-  unsynced WAL waiting for a table flush. Compaction waits for the preceding
+  unsynced WAL waiting for a table flush. The barrier waits for the preceding
   data's synced tables and manifest; the checked write also detects sticky
-  background I/O failures. This can rewrite retained chart data and increase
-  shutdown time, but never runs under a market lock. It never
+  background I/O failures. Its manual compaction point sorts below all chart
+  keys, avoiding the former forced full-history rewrite. Ordinary background
+  compaction can still rewrite retained tables or delay the barrier; this is
+  not a constant-time shutdown or a bound on total disk I/O. It never runs
+  under a market lock. It never
   runs on the FlowMesh tick or worker thread, on the service start or on a
   market start (both hold the B3 reconciliation gate closed for every
   market), so a stalled disk delays only the flush (tested with a flush held

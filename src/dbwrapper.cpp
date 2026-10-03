@@ -301,6 +301,20 @@ std::optional<std::string> CDBWrapper::GetProperty(const std::string& property) 
 
 void CDBWrapper::CompactFull() { DBContext().pdb->CompactRange(nullptr, nullptr); }
 
+void CDBWrapper::FlushMemTables()
+{
+    // Bundled LevelDB first waits for the immutable memtable and forces the
+    // current one into synced tables/manifest. The subsequent manual range
+    // is an inclusive POINT, not an empty range. It selects overlapping SST
+    // key intervals, not just tables containing this exact key.
+    // Chart keys ('M', 'c', 'r') and the length-prefixed obfuscation key sort
+    // above this point, so their tables are not manually compacted. Generic
+    // callers may overlap it; ordinary background compaction also remains
+    // enabled. This avoids requesting a full-range compaction, not all I/O.
+    const leveldb::Slice point{"\x00", 1};
+    DBContext().pdb->CompactRange(&point, &point);
+}
+
 size_t CDBWrapper::DynamicMemoryUsage() const
 {
     std::optional<size_t> parsed;

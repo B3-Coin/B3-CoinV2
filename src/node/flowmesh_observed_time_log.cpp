@@ -876,10 +876,13 @@ void FlowMeshObservedTimeStore::FlushNow(const bool sync) noexcept
                 // An empty synced write alone may first rotate a full
                 // memtable and then sync only its NEW WAL. Force prior WALs
                 // into synced tables/manifest before syncing the current WAL.
-                // CompactFull is void; this checked write also surfaces a
+                // The zero-point range is below every chart key, so no
+                // full-history manual compaction is requested. Ordinary
+                // background compaction can still run. FlushMemTables is
+                // void; this checked write also surfaces a
                 // sticky background table/manifest failure. Chart-only I/O,
                 // under the flush mutex, never the market or store mutex.
-                db->CompactFull();
+                db->FlushMemTables();
                 db->WriteBatch(final_sync, true);
             } catch (const std::exception& e) {
                 LogDebug(BCLog::NET, "FlowMesh observed-time final sync failed: %s\n", e.what());

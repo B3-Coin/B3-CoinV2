@@ -291,6 +291,13 @@ public:
     //! Perform a blocking full compaction of the underlying LevelDB.
     void CompactFull();
 
+    //! Blocking memtable-to-table/manifest barrier using bundled LevelDB's
+    //! CompactRange at the one-byte zero point, rather than the full range.
+    //! Existing tables whose key intervals overlap that point may still be
+    //! compacted, as may tables selected by ordinary background compaction.
+    //! A sticky table/manifest failure is surfaced by the next checked write.
+    void FlushMemTables();
+
     //! Return a LevelDB property value, if available.
     std::optional<std::string> GetProperty(const std::string& property) const;
 

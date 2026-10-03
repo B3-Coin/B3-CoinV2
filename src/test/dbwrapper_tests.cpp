@@ -69,6 +69,29 @@ BOOST_AUTO_TEST_CASE(dbwrapper)
     }
 }
 
+BOOST_AUTO_TEST_CASE(dbwrapper_flush_memtables)
+{
+    // Generic wrapper keys may overlap the zero point. The helper promises a
+    // durability barrier, not absence of compaction for every possible key.
+    for (const bool obfuscate : {false, true}) {
+        const auto path{m_path_root / (obfuscate ? "flush_obfuscated" : "flush_plain")};
+        {
+            CDBWrapper dbw{{.path = path, .cache_bytes = 1_MiB, .obfuscate = obfuscate}};
+            BOOST_REQUIRE(dbw.Write(uint8_t{0}, uint64_t{17}));
+            BOOST_REQUIRE(dbw.Write(uint8_t{1}, uint64_t{23}));
+            dbw.FlushMemTables();
+            CDBBatch checked{dbw};
+            BOOST_REQUIRE(dbw.WriteBatch(checked, true));
+        }
+        CDBWrapper reopened{{.path = path, .cache_bytes = 1_MiB, .obfuscate = obfuscate}};
+        uint64_t value{0};
+        BOOST_REQUIRE(reopened.Read(uint8_t{0}, value));
+        BOOST_CHECK_EQUAL(value, 17U);
+        BOOST_REQUIRE(reopened.Read(uint8_t{1}, value));
+        BOOST_CHECK_EQUAL(value, 23U);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(dbwrapper_basic_data)
 {
     // Perform tests both obfuscated and non-obfuscated.
