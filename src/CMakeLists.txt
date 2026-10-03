@@ -563,6 +563,22 @@ if(B3_BRIDGE_TOOLS)
       secp256k1
       univalue
   )
+
+  # REGTEST ONLY synthetic sync-committee tool: Beacon-API light-client
+  # objects over local anvil headers, signed by public deterministic keys.
+  # Refuses Ethereum mainnet and non-0xb3 fork domains.
+  add_executable(b3-bridge-regtest-beacon bridge/regtest_beacon.cpp)
+  target_link_libraries(b3-bridge-regtest-beacon
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
 endif()
 
 if(BUILD_TESTS)
