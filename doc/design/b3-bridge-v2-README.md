@@ -82,6 +82,7 @@ open to ruling.
 | B-19, B-21 | Legacy bUSD frozen (O9); separate P3 and pin releases [yes] |
 | B-23 | Resumable lineage (extension ≥ 46,080 blocks); migration leaf; residual stranding [yes; needs explicit owner acceptance] |
 | B-24 | Adapter gate: USDT by kind 9; USDT0 upgrades unobservable [recorded USDT0 waiver] |
+| B-25-B-36 | Proposed staker-signed fast Arbitrum deposits, a bounded OD-8 exception (`doc/design/b3-bridge-v2-staker-signed-deposits.md` §8) [**B-25 needs an explicit ruling**] |
 | C-n, FD-n, N-n, RP-n | Contract (contracts §13), finality (finality §15), node (node §16) and regtest (regtest §9) choices [yes; N-1 (new deposits backstop dead-vault losses) needs acceptance] |
 
 ## Biggest risks
@@ -111,4 +112,6 @@ open to ruling.
 B-n); [contracts spec](b3-bridge-v2-contracts-spec.md);
 [node changes](b3-bridge-v2-node-changes.md);
 [finality dependency](b3-bridge-v2-finality-dependency.md) (H1, P3);
-[regtest plan](b3-bridge-v2-regtest-plan.md).
+[regtest plan](b3-bridge-v2-regtest-plan.md);
+[staker-signed deposits](b3-bridge-v2-staker-signed-deposits.md) (FSD
+proposal, B-25-B-36).
