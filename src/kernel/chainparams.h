@@ -130,6 +130,13 @@ public:
     const ChainTxData& TxData() const { return chainTxData; }
 
     /**
+     * SHA256 of the raw -b3bridgepins file bytes this regtest chain applied,
+     * or nullopt when no pin file is in use (always nullopt outside the
+     * -b3modernregtest -b3flowmeshtest regtest configuration).
+     */
+    const std::optional<uint256>& B3BridgePinsHash() const { return m_b3_bridge_pins_sha256; }
+
+    /**
      * SigNetOptions holds configurations for creating a signet CChainParams.
      */
     struct SigNetOptions {
@@ -144,6 +151,35 @@ public:
         int64_t start_time;
         int64_t timeout;
         int min_activation_height;
+    };
+
+    /**
+     * External V1 decentralized-bridge pins read from a -b3bridgepins file
+     * (REGTEST ONLY, and only with -b3modernregtest -b3flowmeshtest). They
+     * point the synthetic flowmesh-test bUSD at a local anvil deployment and
+     * a synthetic beacon checkpoint. The origin chain stays 31337 and the
+     * activation heights stay at A3, so every pin takes effect from the
+     * bridge activation height.
+     */
+    struct B3RegTestBridgePins {
+        //! Synthetic flowmesh-test mint caps (raw bUSD units), used whenever
+        //! a pin file does not override them.
+        static constexpr CAmount DEFAULT_MAX_PER_BLOCK{1'000'000'000};
+        static constexpr CAmount DEFAULT_MAX_PER_EPOCH{10'000'000'000};
+
+        Consensus::BridgeEthAddress vault{};
+        Consensus::BridgeEthAddress token{};
+        uint64_t origin_deployment_block{0};
+        uint256 vault_runtime_code_hash{};
+        //! Origin-token runtime code hash: the direct-token adapter v1
+        //! meaning of BridgeAssetParams::implementation_or_adapter.
+        uint256 token_runtime_code_hash{};
+        std::optional<CAmount> max_per_block{};
+        std::optional<CAmount> max_per_epoch{};
+        Consensus::EthereumLightClientPins light_client{};
+        Consensus::BridgeDecentralizedWithdrawalPins withdrawal{};
+        //! SHA256 of the raw pin file bytes.
+        uint256 file_sha256{};
     };
 
     /**
@@ -189,6 +225,9 @@ public:
         int64_t halving_interval{0};
         int64_t treasury_percent{0};
         std::vector<unsigned char> treasury_script{};
+        //! Parsed -b3bridgepins file; applied only together with
+        //! flowmesh_test.
+        std::optional<B3RegTestBridgePins> bridge_pins{};
     };
 
     struct RegTestOptions {
@@ -226,6 +265,7 @@ protected:
     std::vector<AssumeutxoData> m_assumeutxo_data;
     ChainTxData chainTxData;
     HeadersSyncParams m_headers_sync_params;
+    std::optional<uint256> m_b3_bridge_pins_sha256{};
 };
 
 std::optional<ChainType> GetNetworkForMagic(const MessageStartChars& pchMessageStart);

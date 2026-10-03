@@ -1078,6 +1078,9 @@ public:
             assert(pos.Valid());
             consensus.modern_pos = pos;
 
+            if (b3.bridge_pins && !b3.flowmesh_test) {
+                throw std::runtime_error("-b3bridgepins requires -b3flowmeshtest");
+            }
             if (b3.flowmesh_test) {
                 // Four deterministic functional-test wallets share the
                 // synthetic historical population. Every right is unique and
@@ -1149,8 +1152,8 @@ public:
                 consensus.bridge_withdrawal_activation_height =
                     busd.activation_height;
                 busd.mint_caps = Consensus::BridgeMintCaps{
-                    .max_per_block = 1'000'000'000,
-                    .max_per_epoch = 10'000'000'000,
+                    .max_per_block = B3RegTestBridgePins::DEFAULT_MAX_PER_BLOCK,
+                    .max_per_epoch = B3RegTestBridgePins::DEFAULT_MAX_PER_EPOCH,
                     .epoch_length_blocks = static_cast<uint32_t>(b3.epoch_length),
                 };
                 Consensus::EthereumLightClientPins light_client;
@@ -1173,6 +1176,36 @@ public:
                     Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
                 withdrawal.withdrawal_rules_commitment = uint256{uint8_t{5}};
                 busd.managed_withdrawal = withdrawal;
+                if (b3.bridge_pins) {
+                    // -b3bridgepins (regtest plan section 3.3): point the
+                    // synthetic bUSD at a local anvil V1 decentralized
+                    // deployment. Chain id 31337 and the A3 activation and
+                    // withdrawal heights above are kept, so every pin takes
+                    // effect from bridge activation.
+                    const B3RegTestBridgePins& pins{*b3.bridge_pins};
+                    busd.asset.vault_address = pins.vault;
+                    busd.asset.token_address = pins.token;
+                    busd.origin_deployment_block = pins.origin_deployment_block;
+                    busd.vault_runtime_code_hash = pins.vault_runtime_code_hash;
+                    busd.implementation_or_adapter =
+                        pins.token_runtime_code_hash;
+                    if (pins.max_per_block) {
+                        busd.mint_caps->max_per_block = *pins.max_per_block;
+                    }
+                    if (pins.max_per_epoch) {
+                        busd.mint_caps->max_per_epoch = *pins.max_per_epoch;
+                    }
+                    busd.light_client = pins.light_client;
+                    busd.withdrawal_mode = Consensus::BridgeWithdrawalMode::
+                        DECENTRALIZED_VERIFIER_V1;
+                    busd.managed_withdrawal.reset();
+                    busd.decentralized_withdrawal = pins.withdrawal;
+                    if (!Consensus::BridgeMintParamsReady(busd)) {
+                        throw std::runtime_error(
+                            "-b3bridgepins does not form a complete bridge configuration");
+                    }
+                    m_b3_bridge_pins_sha256 = pins.file_sha256;
+                }
                 assert(Consensus::BridgeMintParamsReady(busd));
                 consensus.busd_bridge = std::move(busd);
             }

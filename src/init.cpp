@@ -90,6 +90,7 @@
 #include <util/fs.h>
 #include <util/fs_helpers.h>
 #include <util/moneystr.h>
+#include <util/readwritefile.h>
 #include <util/result.h>
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
@@ -1405,6 +1406,40 @@ static std::optional<CService> CheckBindingConflicts(const CConnman::Options& co
     return std::nullopt;
 }
 
+// B3 regtest plan section 3.3 (RP-1), REGTEST ONLY: a -b3flowmeshtest datadir
+// records which -b3bridgepins file its chain was judged under, as the file's
+// SHA256 in hex (sha256sum byte order) or "none"; a missing record (a datadir
+// older than the record) counts as "none". Every V1 pin takes effect at the
+// bUSD activation height and restart or reindex replays connected blocks
+// under the current file, so a changed file is refused on every reindex and
+// once the block index holds any entry at or above activation.
+static constexpr const char* B3_BRIDGE_PINS_RECORD_FILENAME{"b3bridgepins.sha256"};
+static constexpr size_t MAX_B3_BRIDGE_PINS_RECORD_SIZE{128};
+
+static std::string B3BridgePinsRecordValue(const CChainParams& chainparams)
+{
+    const std::optional<uint256>& hash{chainparams.B3BridgePinsHash()};
+    return hash ? HexStr(*hash) : std::string{"none"};
+}
+
+//! Read the pin-file record into `record` (nullopt when there is none; a
+//! corrupt record simply differs from every value). False if it exists but
+//! cannot be read.
+static bool ReadB3BridgePinsRecord(const fs::path& path, std::optional<std::string>& record)
+{
+    record.reset();
+    const auto [read, data]{ReadBinaryFile(path, MAX_B3_BRIDGE_PINS_RECORD_SIZE + 1)};
+    if (!read) return !fs::exists(path);
+    record = util::TrimString(data);
+    return true;
+}
+
+static bool WriteB3BridgePinsRecord(const fs::path& path, const std::string& value)
+{
+    const fs::path temp{path + ".new"};
+    return WriteBinaryFile(temp, value + "\n") && RenameOver(temp, path);
+}
+
 // A GUI user may opt to retry once with do_reindex set if there is a failure during chainstate initialization.
 // The function therefore has to support re-entry.
 static ChainstateLoadResult InitAndLoadChainstate(
@@ -1992,6 +2027,27 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     bool do_reindex{args.GetBoolArg("-reindex", false)};
     const bool do_reindex_chainstate{args.GetBoolArg("-reindex-chainstate", false)};
 
+    // B3 regtest-only -b3bridgepins record (see B3_BRIDGE_PINS_RECORD_FILENAME).
+    // -b3flowmeshtest requires -b3modernregtest and always configures bUSD.
+    const bool b3_bridge_pins_guard{chainparams.GetChainType() == ChainType::REGTEST &&
+                                    args.GetBoolArg("-b3flowmeshtest", false)};
+    const fs::path b3_bridge_pins_record_path{args.GetDataDirNet() / B3_BRIDGE_PINS_RECORD_FILENAME};
+    const std::string b3_bridge_pins_value{B3BridgePinsRecordValue(chainparams)};
+    std::optional<std::string> b3_bridge_pins_record;
+    if (b3_bridge_pins_guard && !ReadB3BridgePinsRecord(b3_bridge_pins_record_path, b3_bridge_pins_record)) {
+        return InitError(Untranslated(strprintf("Cannot read %s", fs::quoted(fs::PathToString(b3_bridge_pins_record_path)))));
+    }
+    // A missing record counts as "none" (see above).
+    const bool b3_bridge_pins_changed{b3_bridge_pins_guard &&
+                                      b3_bridge_pins_record.value_or("none") != b3_bridge_pins_value};
+    // A reindex replays every stored block under the current file, so it can
+    // never apply a changed one. Refuse before anything is wiped.
+    const bilingual_str b3_bridge_pins_reindex_error{Untranslated(
+        "-b3bridgepins differs from the pin file recorded for this datadir; -reindex and -reindex-chainstate cannot apply a changed pin file; start from a fresh -datadir")};
+    if (b3_bridge_pins_changed && (do_reindex || do_reindex_chainstate)) {
+        return InitError(b3_bridge_pins_reindex_error);
+    }
+
     // Chainstate initialization and loading may be retried once with reindexing by GUI users
     auto [status, error] = InitAndLoadChainstate(
         node,
@@ -2010,6 +2066,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             return false;
         }
         do_reindex = true;
+        if (b3_bridge_pins_changed) {
+            return InitError(b3_bridge_pins_reindex_error);
+        }
         if (!Assert(node.shutdown_signal)->reset()) {
             LogError("Internal error: failed to reset shutdown signal.\n");
         }
@@ -2033,6 +2092,27 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     ChainstateManager& chainman = *Assert(node.chainman);
     auto& kernel_notifications{*Assert(node.notifications)};
+
+    if (b3_bridge_pins_guard) {
+        // Pins take effect at the bUSD activation height A, and any stored
+        // block at or above A may already have been judged, or rejected and
+        // flagged invalid, under the recorded file. So a changed file is
+        // accepted only while the block index holds no entry at or above A.
+        const int activation_height{*Assert(Assert(chainparams.GetConsensus().busd_bridge)->activation_height)};
+        const int tip_height{WITH_LOCK(chainman.GetMutex(), return chainman.ActiveHeight())};
+        if (b3_bridge_pins_changed &&
+            WITH_LOCK(chainman.GetMutex(), return std::ranges::any_of(chainman.BlockIndex(), [&](const auto& entry) {
+                return entry.second.nHeight >= activation_height;
+            }))) {
+            return InitError(Untranslated("-b3bridgepins differs from the pin file recorded for this datadir, which already stores blocks at or above bridge activation; start from a fresh -datadir"));
+        }
+        if (b3_bridge_pins_record != b3_bridge_pins_value) {
+            if (!WriteB3BridgePinsRecord(b3_bridge_pins_record_path, b3_bridge_pins_value)) {
+                return InitError(Untranslated(strprintf("Cannot write %s", fs::quoted(fs::PathToString(b3_bridge_pins_record_path)))));
+            }
+            LogInfo("Recorded -b3bridgepins %s at height %d", b3_bridge_pins_value, tip_height);
+        }
+    }
 
     assert(!node.peerman);
     // B3: the automatic staking loop. Idle until a wallet starts it

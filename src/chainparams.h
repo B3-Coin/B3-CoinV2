@@ -8,9 +8,25 @@
 
 #include <kernel/chainparams.h> // IWYU pragma: export
 
+#include <cstddef>
 #include <memory>
+#include <string_view>
 
 class ArgsManager;
+
+/** Largest -b3bridgepins file the node reads (regtest-only). */
+inline constexpr size_t MAX_B3_BRIDGE_PINS_FILE_SIZE{64 * 1024};
+
+/**
+ * Parse and validate the contents of a -b3bridgepins file (REGTEST ONLY):
+ * strict JSON {"format": "b3-regtest-bridge-pins/1", "v1_decentralized":
+ * {...}} with 0x-prefixed hex in raw Ethereum byte order. The result's
+ * file_sha256 is the SHA256 of exactly these bytes.
+ *
+ * @throws std::runtime_error("Invalid -b3bridgepins file: ...") on any
+ *         schema or validation failure.
+ */
+CChainParams::B3RegTestBridgePins ParseB3RegTestBridgePins(std::string_view json);
 
 /**
  * Creates and returns a std::unique_ptr<CChainParams> of the chosen chain.
