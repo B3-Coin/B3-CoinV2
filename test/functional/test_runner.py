@@ -90,6 +90,11 @@ EXTENDED_SCRIPTS = [
     'feature_pruning.py',
     'feature_dbcrash.py',
     'feature_index_prune.py',
+    # Regtest bridge harness (local anvil + forge --offline); skips without foundry.
+    'feature_b3_bridge_rt0_toolchain.py',
+    # RT2 and RT3a also skip without the B3_BRIDGE_TOOLS executables.
+    'feature_b3_bridge_rt2_light_client.py',
+    'feature_b3_bridge_rt3_v1_route_a.py --deposit-only',
 ]
 
 # Special script to run each bench sanity check

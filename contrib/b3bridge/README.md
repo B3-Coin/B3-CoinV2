@@ -520,3 +520,213 @@ broadcast result. Changing RPC providers, restarting, or using `--one-shot`
 must not bypass these checks. Preserve the retained work directory, SQLite
 database, emitted plan, transaction ids, and both nodes' logs for recovery and
 incident review.
+
+## Regtest synthetic beacon
+
+**REGTEST ONLY.** These pieces drive the unchanged relayer and the real B3
+light client end to end on one machine: a local `anvil` (chain id 31337, no
+`--fork-url`), the V1 contracts plus the regtest mocks in
+`contracts/regtest/`, a synthetic sync committee over anvil's real execution
+blocks, and a `-b3modernregtest -b3flowmeshtest` regtest node started with
+`-b3bridgepins`. The committee secrets are derived from a public seed, so
+nothing they sign means anything outside regtest. The regtest plan is in
+`doc/design/b3-bridge-v2-regtest-plan.md`. The functional tests that use
+them are `feature_b3_bridge_rt0_toolchain.py`,
+`feature_b3_bridge_rt2_light_client.py` and
+`feature_b3_bridge_rt3_v1_route_a.py --deposit-only`; their harness lives in
+`test/functional/test_framework/{anvil,b3bridge}.py`. The regtest-only
+refusals of the Python pieces are unit-tested offline by
+`contrib/b3bridge/test_regtest_mock_beacon.py` (run `python3 -m unittest`
+here) and by `TestFrameworkB3BridgeGuards` in
+`test/functional/test_framework/b3bridge.py` (run by
+`feature_framework_unit_tests.py`).
+
+### `b3-bridge-regtest-beacon`
+
+You build this tool with `-DB3_BRIDGE_TOOLS=ON`, like `b3-bridge-ethcheck`.
+It reads one request file and prints JSON to standard output:
+
+```sh
+./bin/b3-bridge-regtest-beacon request.json > outputs.json
+```
+
+```json
+{"version": 1,
+ "genesis_validators_root": "0x<32 bytes>", "fork_version": "0xb3000001",
+ "electra_epoch": 0, "slot_offset": S0, "base_block": B0,
+ "headers": [<eth_getBlockByNumber results for B0, B0+1, ...>],
+ "outputs": [{"kind": "bootstrap"},
+             {"kind": "update", "finalized": N}]}
+```
+
+- Block N has slot S0 + N. The bootstrap is the header of B0, which is the
+  pinned checkpoint.
+- An update finalizes N. Block N+1 is the attested header, so its execution
+  header must be in `headers`. The signature slot is the attested slot + 1,
+  and all 512 members sign.
+- The next committee is included when the attested and signature slots fall
+  in the same period.
+- Member i of the committee for period p has the BLS secret key
+  `FromIKM(SHA256("B3-REGTEST-SYNC-COMMITTEE-V1" ‖ LE64(p) ‖ LE32(i)))`.
+- Optional update fields build negative cases: `participants` (1-512),
+  `next_committee`, `signature_slot`, `slot_shift`,
+  `sign_genesis_validators_root`, `sign_fork_version` and
+  `finalized_proposer_index`.
+
+Each output carries the following fields:
+
+- `data`: the Beacon API object;
+- `payload_hex`: the `BOOTSTRAP`/`UPDATE` bridge record you pass to
+  `submitbridgecarrier`;
+- for a bootstrap: the checkpoint root, slot, block, block hash and period;
+- for an update: the finalized root, slot, block and block hash, the
+  attested and signature slots, the period, the participant count and
+  `has_next_committee`.
+
+The same headers always give byte-identical output. If the request is
+malformed or refused, the tool exits 1 and writes `FAIL: ...` to standard
+error.
+
+### `regtest/mock_beacon.py`
+
+This is a standard-library Beacon API server over the tool:
+
+```sh
+python3 contrib/b3bridge/regtest/mock_beacon.py --anvil http://127.0.0.1:8545 \
+  --tool ./bin/b3-bridge-regtest-beacon --pins /abs/path/pins.json --port 5052
+```
+
+It checks that the pin file's checkpoint root equals the beacon header root
+the tool derives for the checkpoint block on this anvil. It then follows the
+anvil head and finalizes head-1, moved back to an earlier block when needed so
+that the attested and signature slots stay in the finalized block's period.
+It serves these endpoints under `/eth/v1/`:
+
+- `beacon/genesis`;
+- `config/fork_schedule`;
+- `beacon/light_client/bootstrap/<root>`;
+- `beacon/light_client/updates` (one best update per period, each with the
+  next committee);
+- `beacon/light_client/finality_update`;
+- `beacon/headers/head`.
+
+Tests import `SyntheticBeacon` and call `finalize_through(n)`,
+`set_participants(period, k)` and `serve(port)` directly. Point the relayer at
+it with `--beacon-url http://127.0.0.1:5052`. On regtest, `--ethereum-rpc
+http://127.0.0.1:P` and `--ethereum-rpc-secondary http://localhost:P` are the
+same anvil. They pass only the mechanical distinct-origin check and are not
+independent providers.
+
+### Pin file (`-b3bridgepins=<absolute path>`)
+
+`write_regtest_bridge_pins()` in the functional-test harness writes this file
+from the live anvil deployment. The node reads at most 64 KiB and parses
+strict JSON, so an unknown, duplicate or missing key is an error:
+
+```json
+{"format": "b3-regtest-bridge-pins/1",
+ "v1_decentralized": {
+  "origin_chain_id": 31337, "vault": "0x..", "token": "0x..",
+  "origin_deployment_block": 3, "vault_runtime_code_hash": "0x..",
+  "token_runtime_code_hash": "0x..", "max_deposit_raw": 1000000000,
+  "max_per_block": 1000000000, "max_per_epoch": 10000000000,
+  "light_client": {
+   "trusted_checkpoint_root": "0x..", "trusted_checkpoint_slot": 20480,
+   "checkpoint_execution_block": 3, "genesis_validators_root": "0x..",
+   "fork_schedule": [{"activation_epoch": 0, "fork_version": "0xb3000001"}],
+   "fork_schedule_valid_through_epoch": 1664, "electra_epoch": 0,
+   "min_sync_committee_participants": 342, "max_sync_lag_slots": 8192},
+  "verifier": "0x..", "verifier_runtime_code_hash": "0x..",
+  "bootstrap_validator_set_hash": "0x..", "min_bridge_validators": 4,
+  "max_bridge_validators": 64, "min_bridge_total_weight": 4,
+  "max_epoch_lag": 86400}}
+```
+
+- Hex values are 0x-prefixed, in raw Ethereum byte order, as `getbridgeinfo`
+  prints them.
+- `max_per_block`, `max_per_epoch`, `min_sync_committee_participants` and
+  `max_sync_lag_slots` are optional. Their defaults are 1e9, 1e10, 342 and
+  8192.
+- `electra_epoch` is required and must be `0`: the synthetic beacon builds
+  Electra objects from genesis, so any other value could never bootstrap.
+- The node fills the withdrawal-rules version and commitment from the V1
+  constants.
+- `token_runtime_code_hash` becomes the direct-token
+  `implementation_or_adapter` pin.
+- The node refuses the file unless all of these hold:
+  - `origin_chain_id` is exactly 31337;
+  - vault, token and verifier are non-zero and pairwise distinct;
+  - deployment block ≤ checkpoint block ≤ deployment block + 20,000;
+  - 0 < `max_deposit_raw` ≤ block cap ≤ epoch cap ≤ MAX_MONEY;
+  - the genesis validators root is not Ethereum mainnet's;
+  - every fork version starts with `0xb3`;
+  - `electra_epoch` is 0;
+  - the light-client and withdrawal pins are internally valid.
+- With the file, bUSD runs in `decentralized-verifier-v1` mode. Activation
+  and withdrawal heights stay at A3 (163).
+- `getbridgeinfo` reports the pinned tuple.
+
+### Regtest-only guards
+
+- **Mainnet and test networks.** `-b3bridgepins` on main, testnet, testnet4
+  or signet fails with `-b3bridgepins is regtest-only`. Without the option,
+  every network's parameters are unchanged, including the default
+  `-b3flowmeshtest` synthetic bridge. One deliberate, fail-closed difference
+  is visible there: before this option existed, a `b3bridgepins=` line in a
+  main or test-network `b3coin.conf` was ignored with an "unknown
+  configuration value" warning; it now stops startup with the error above.
+  (The other `-b3*` regtest knobs are still ignored there.)
+- **Regtest without the test switches.** On regtest the option requires both
+  `-b3modernregtest` and `-b3flowmeshtest`.
+- **Changing the pin file.** A `-b3flowmeshtest` datadir records the pin
+  file's SHA256 (or `none`) in `<datadir>/regtest/b3bridgepins.sha256`. A
+  missing record counts as `none`, because a datadir older than the record
+  was always judged without a pin file.
+  - Once the block index holds any entry (block or header) at or above bUSD
+    activation, a different pin file is an init error, even when the tip is
+    still below activation: `-b3bridgepins differs from the pin file recorded
+    for this datadir, which already stores blocks at or above bridge
+    activation; start from a fresh -datadir`. A stored block may already
+    have been judged, or rejected and flagged invalid, under the recorded
+    file, and a later restart would not judge it again.
+  - `-reindex` and `-reindex-chainstate` refuse a changed file at any height,
+    before anything is wiped (`... -reindex and -reindex-chainstate cannot
+    apply a changed pin file; start from a fresh -datadir`).
+  - The record cannot tell a deleted record from a datadir that predates
+    it: a datadir whose record was deleted is treated as judged without a
+    pin file. Do not delete it; start from a fresh `-datadir` instead.
+- **Tool and mock beacon.**
+  - Both refuse the Ethereum mainnet genesis validators root, any fork version
+    outside `0xb3`, and any `electra_epoch` other than 0.
+  - The mock accepts only `http://127.0.0.1` or `http://localhost` endpoints,
+    binds 127.0.0.1, and ignores HTTP proxies.
+- **Mock contracts.** The mocks in `contracts/regtest/` are never imported by
+  `contracts/src/` or `contracts/script/`.
+- **Forge runs.** The harness runs `forge --offline` with `--out`,
+  `--cache-path` and broadcast records under the build directory. The one
+  exception is RT0's run of the production `Deploy.s.sol`: a forge script
+  may write only where `contracts/foundry.toml`'s `fs_permissions` allow,
+  so its candidate manifest goes to
+  `contracts/deployments/local-rt0-<pid>.json` (gitignored) and is deleted
+  afterwards. A killed run can leave that file behind.
+
+### Deviations from the regtest plan
+
+These are reported here rather than silently built in (solve-and-report):
+
+- **Pin activation (plan section 3.3).** The plan says each added or changed
+  pin takes effect above the tip, with activation heights in the pin file.
+  The V1 pin file has no heights: every pin applies from bUSD activation
+  (A3 = 163, unchanged from the default `-b3flowmeshtest` bridge), and a
+  changed file is refused as described above. Height-scheduled re-pins
+  (V entry, re-pins) are left to the V2 pin-file sections.
+- **One clock (plan section 3.5).** The plan asks for one monotonic clock
+  driving anvil and B3 mock time. The harness runs the corridor under mock
+  time, then returns B3 to the wall clock and stakes continuously, as
+  `feature_b3_finality_soak.py` does, because the four-validator BLS
+  finality fixture is only proven live in real time. anvil mines on demand
+  with wall-clock timestamps. B3 heights at each step therefore vary between
+  runs (`bridge_evidence.json` records them), and RT2's relayer loop
+  tolerates repeated tip or finality races (up to 29 identical failed cycles
+  within 600 s). Clock jumps use mock time explicitly: RT0's one-day jump
+  and RT2's freshness boundary.
