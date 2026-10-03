@@ -1,0 +1,64 @@
+{
+  "revision": "b4b1de423a4be3efe852deb3ed851d0bfce156fc",
+  "profile": "four selected isolated suites; not full branch qualification",
+  "date": "2026-10-03",
+  "date_timezone": "Asia/Calcutta",
+  "python": "3.14.6",
+  "hash_seed": 0,
+  "results": [
+    {
+      "suite": "runner",
+      "expected": 8,
+      "discovered": 8,
+      "tests_run": 8,
+      "test_seconds": 0.013,
+      "wall_seconds": 0.092,
+      "exit_code": 0,
+      "complete_pass": true,
+      "command": "PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3.14 -B ci/run_flowmesh_models.py --suite runner",
+      "log": "evidence/runner.log",
+      "sha256": "cd49cd7b4a0524e7d9968e35acd589dddb162d4cb0ca772aa98cb41cbce55057"
+    },
+    {
+      "suite": "accounting",
+      "expected": 113,
+      "discovered": 113,
+      "tests_run": 113,
+      "test_seconds": 64.32,
+      "wall_seconds": 64.398,
+      "exit_code": 0,
+      "complete_pass": true,
+      "command": "PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3.14 -B ci/run_flowmesh_models.py --suite accounting",
+      "log": "evidence/accounting.log",
+      "sha256": "2ddd020868c479dcd06dcf85924cf1a2c975ee2cfbcb18bfdc46f76ebcad922c"
+    },
+    {
+      "suite": "agreement",
+      "expected": 142,
+      "discovered": 142,
+      "tests_run": 142,
+      "test_seconds": 76.483,
+      "wall_seconds": 76.596,
+      "exit_code": 0,
+      "complete_pass": true,
+      "command": "PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3.14 -B ci/run_flowmesh_models.py --suite agreement",
+      "log": "evidence/agreement.log",
+      "sha256": "b3b814e6898926f4913b420d06bc42148af32aab61994a185642391ce0581d3f"
+    },
+    {
+      "suite": "storage",
+      "expected": 69,
+      "discovered": 69,
+      "tests_run": 69,
+      "test_seconds": 49.788,
+      "wall_seconds": 49.937,
+      "exit_code": 0,
+      "complete_pass": true,
+      "command": "PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3.14 -B ci/run_flowmesh_models.py --suite storage",
+      "log": "evidence/storage.log",
+      "sha256": "5fc44fd26c67f2f228ec39e889a303e7dee669175afa81c997452f4835fe833e"
+    }
+  ],
+  "total": 332,
+  "all_pass": true
+}

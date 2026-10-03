@@ -1,0 +1,14 @@
+runner: discovered 8 tests
+test_empty_suite_fails (test_flowmesh_models_runner.DiscoveryGuardTests.test_empty_suite_fails) ... ok
+test_empty_test_module_fails (test_flowmesh_models_runner.DiscoveryGuardTests.test_empty_test_module_fails) ... ok
+test_import_error_fails (test_flowmesh_models_runner.DiscoveryGuardTests.test_import_error_fails) ... ok
+test_load_tests_cannot_silently_remove_a_method (test_flowmesh_models_runner.DiscoveryGuardTests.test_load_tests_cannot_silently_remove_a_method) ... ok
+test_module_below_reviewed_floor_fails (test_flowmesh_models_runner.DiscoveryGuardTests.test_module_below_reviewed_floor_fails) ... ok
+test_new_modules_are_included_automatically (test_flowmesh_models_runner.DiscoveryGuardTests.test_new_modules_are_included_automatically) ... ok
+test_removed_required_file_fails (test_flowmesh_models_runner.DiscoveryGuardTests.test_removed_required_file_fails) ... ok
+test_skipped_or_expected_failure_is_not_success (test_flowmesh_models_runner.DiscoveryGuardTests.test_skipped_or_expected_failure_is_not_success) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.013s
+
+OK
