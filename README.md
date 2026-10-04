@@ -265,3 +265,78 @@ provide persistent reference context. None of these mechanisms automatically
 turns a saved conversation into weight training. Further work needs a sufficient
 language-learning dataset and independent reply evaluations; repeating the small
 B3 fixtures has already demonstrated overfitting.
+
+### Preparing a broader language experiment
+
+`contrib/b3ai/language/` prepares the next experiment without modifying the saved
+scratch models. The proposed design is recorded in `pilot.json`: port the tested
+NumPy architecture to an accelerated runtime, verify its mathematics against a
+small saved reference, measure the local GPU, and then run a bounded language
+pilot from our own random weights. The GPU backend and trainer are not yet
+implemented. No additional runtime dependency has been installed; `CLAUDE.md`
+requires an owner exception before dependency installation.
+
+The first objective is readable English continuation, before dialogue teaching
+or B3 task qualification. The proposed 5,395,201-parameter model has six layers,
+a width of 256, and 2,048 byte-token positions. Its new tokenizer contract would
+add an end-of-document token to the 256 UTF-8 byte values. This exceeds the old
+CPU reference limits and requires a separate versioned model/checkpoint contract;
+the existing scratch adapter cannot serve it. These settings are a proposal,
+not a demonstrated capability or a promised training duration.
+
+The original TinyStories TXT files are pinned to dataset revision
+`f54c09fd23315a6f9c86f9dc80f725de7d8f9c64`. The dataset is synthetic fiction under
+CDLA-Sharing-1.0; it supplies language examples, not reviewed B3 knowledge.
+Use complete `<|endoftext|>`-delimited stories, rather than splitting on newline
+or using the historical dataset viewer's broken row boundaries.
+See the [dataset card](https://huggingface.co/datasets/roneneldan/TinyStories)
+and [paper](https://arxiv.org/abs/2305.07759). Small-model story results do not
+establish general conversational or tool capability.
+
+The importer is offline by default:
+
+```sh
+python3 -m contrib.b3ai.language.corpus --source /path/TinyStories-train.txt --validation-source /path/TinyStories-valid.txt --output build-ai/language-data-local
+python3 -m contrib.b3ai.language.reference --output build-ai/language-reference.npz
+python3 -m unittest discover -s contrib/b3ai/language/tests -v
+```
+
+An explicit `--fetch`, with no local-source arguments, imports only the two
+pinned official HTTPS files. Defaults bound the entire import to 32 MiB of source
+bytes and 20,000 documents, with 90/10 budgets for the train and official
+validation sources. Each run reserves a new output directory and refuses to
+overwrite another run. The official train source stays in train; normalized
+content hashes divide the official validation source into validation and test.
+Global exact and normalized document deduplication precedes tokenization. This
+does not detect all semantically similar stories.
+
+Prepared JSONL files, split checksums, source byte offsets, attribution and a
+manifest are saved. Bounded prefixes record their actual prefix checksums and
+leave the expected whole-file checksum unverified. Local source identity is
+caller-declared unless a complete file matches the published upstream checksum.
+Incomplete final stories are excluded; invalid UTF-8 and NUL bytes are rejected.
+A prefix pilot is not a representative random sample of the complete dataset.
+
+The local preparation imported 18,000 training stories, 949 validation stories
+and 1,051 test stories. Training text contains 16,087,093 UTF-8 bytes. This is
+data preparation, not a new trained model or a quality result.
+
+`reference.py` saves initial parameters, logits, masked loss, all gradients,
+causal comparison logits, and one clipped AdamW update with its moments. It uses
+the existing NumPy implementation and records its implementation hash. The NPZ
+contains numeric arrays and JSON bytes, requires no pickle, and is published
+atomically without overwriting an existing path. The future CPU port must match
+this reference before the GPU port is tested.
+
+`language_exam.json` freezes 20 separately authored continuation prompts and
+explicit teacher-review criteria. Test stories and exam prompts must stay out of
+training and checkpoint selection. Lower validation loss alone cannot pass the
+language milestone. Store raw generations, including failures, and assess
+readability and continuity after selecting the checkpoint using validation.
+The provisional thresholds are pilot decisions, not a validated benchmark.
+
+The current Hive system text with tools disabled and empty lessons already uses
+1,132 UTF-8 bytes, before user input, lessons, history or role framing. The
+2,048-byte language pilot therefore does not establish enough context for normal
+Hive conversations. Later work needs a measured dialogue/context design, learned
+turn endings, compatible serving, and independent B3/tool evaluations.

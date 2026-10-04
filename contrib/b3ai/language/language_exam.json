@@ -1,0 +1,35 @@
+{
+  "schema": "b3-language-continuation-exam/v1",
+  "purpose": "Frozen teacher-authored continuation probes, assessed after validation selects a checkpoint. This is a narrow language diagnostic, not an assistant qualification exam.",
+  "use": "Never give these prompts or review answers to the language trainer or use their results to select a checkpoint within this pilot.",
+  "novelty": "These are separately authored prompts. Individual words or phrases may occur in the public corpus; their absence is not guaranteed.",
+  "generation": {"maximum_new_byte_tokens": 256, "temperatures": [0.0, 0.8], "seed": 1729, "stop": "learned end-of-document token or token budget; preserve raw output"},
+  "review": {
+    "readability": "0: mostly gibberish; 1: readable fragments with broken syntax or repetition; 2: at least one grammatical, understandable complete sentence",
+    "continuity": "0: contradicts or ignores the premise; 1: partly follows it; 2: follows the premise with a plausible continuation",
+    "record": "Store raw text and token IDs, both scores, a brief reason, model/corpus/exam hashes and generation settings. Empty output remains a failure.",
+    "provisional_gate": "For the greedy outputs, at least 18 of 20 score 2 for readability and at least 14 score 2 for continuity. These teacher-chosen pilot thresholds are not a validated benchmark and do not prove assistant reliability."
+  },
+  "prompts": [
+    {"id": "language-01", "text": "Mira put a seed in a small pot. Every morning she watered it. One day,"},
+    {"id": "language-02", "text": "The little boat had a red sail. When the wind began to blow,"},
+    {"id": "language-03", "text": "A boy found a lost scarf beside the school gate. He wanted to return it, so"},
+    {"id": "language-04", "text": "The kitten was afraid of the rain. Ana opened the door and"},
+    {"id": "language-05", "text": "They had three apples and three children. To share the apples fairly,"},
+    {"id": "language-06", "text": "Jules could not reach the book on the high shelf. He asked his tall sister to"},
+    {"id": "language-07", "text": "The room became dark when the lamp went out. Dad found a torch and"},
+    {"id": "language-08", "text": "The path was muddy after the rain. Before going outside, Ravi put on"},
+    {"id": "language-09", "text": "A bird made a nest in the tree. The children watched quietly because"},
+    {"id": "language-10", "text": "The soup was still very hot. Lena waited a little before"},
+    {"id": "language-11", "text": "The clock rang at seven. Sam woke up and got ready for"},
+    {"id": "language-12", "text": "At the park, Noor saw someone drop a bag. She picked it up and"},
+    {"id": "language-13", "text": "Ben forgot his umbrella. His friend had a large one, so"},
+    {"id": "language-14", "text": "The children built a tower with wooden blocks. The bottom was too narrow, and"},
+    {"id": "language-15", "text": "Nia heard a soft knock at the door. When she opened it,"},
+    {"id": "language-16", "text": "A small turtle wanted to cross the path. The gardener moved slowly and"},
+    {"id": "language-17", "text": "The twins wanted to bake a cake. First, they read the recipe and"},
+    {"id": "language-18", "text": "It was cold outside, but the house was warm. Omar took off his"},
+    {"id": "language-19", "text": "The child had never flown a kite before. Her grandfather showed her how to"},
+    {"id": "language-20", "text": "The dog brought a ball to the girl. She smiled and"}
+  ]
+}

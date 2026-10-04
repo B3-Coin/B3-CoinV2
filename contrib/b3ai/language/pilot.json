@@ -1,0 +1,88 @@
+{
+  "schema": "b3-language-pilot-plan/v1",
+  "status": "prepared; GPU backend not implemented or installed",
+  "purpose": "Test whether a broader language corpus and a larger random-start model improve English continuations before B3 dialogue teaching.",
+  "hardware_observed": {
+    "chip": "Apple M4 Max",
+    "unified_memory_bytes": 137438953472,
+    "architecture": "arm64",
+    "gpu_training_capability": "unverified until runtime capability and numerical checks pass"
+  },
+  "proposed_runtime": {
+    "python": "existing bundled Python 3.12.14",
+    "directory": "build-ai/language-runtime/venv",
+    "packages": {"torch": "2.14.1", "numpy": "2.3.5"},
+    "installation": "requires owner exception to CLAUDE.md dependency-installation prohibition",
+    "backend_order": ["CPU numerical parity", "MPS numerical parity", "MPS throughput and memory benchmark"],
+    "official_documentation": "https://docs.pytorch.org/docs/stable/notes/mps.html",
+    "weights": "our own random initialization; no downloaded pretrained weights"
+  },
+  "corpus": {
+    "repository": "roneneldan/TinyStories",
+    "revision": "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64",
+    "source": "original train and validation TXT files with complete endoftext-delimited stories",
+    "license": "CDLA-Sharing-1.0",
+    "license_url": "https://cdla.dev/sharing-1-0/",
+    "max_source_bytes_total": 33554432,
+    "max_documents_total": 20000,
+    "budgets": "90 percent train source, 10 percent official validation source",
+    "splits": "train source stays in train; official validation stories split by normalized content hash into validation and test",
+    "deduplication": "global exact and normalized document deduplication before tokenization",
+    "integrity": "save admitted prefix hashes, offsets, split hashes, and expected whole-file hashes; a partial import does not verify a whole-file hash",
+    "truth_status": "synthetic fiction for language learning; no reviewed B3 facts",
+    "further_scale": "increase data only after the bounded pilot and contamination checks; a prefix pilot is not representative of the complete dataset"
+  },
+  "numerical_reference": {
+    "source": "existing manual-gradient NumPy Transformer and AdamW",
+    "fixture_config": {"vocab_size": 256, "context_length": 8, "width": 8, "layers": 2, "heads": 2, "ff_multiplier": 4, "seed": 42},
+    "checks": ["logits", "masked loss", "all parameter gradients", "one AdamW update and moments", "causal suffix invariance"],
+    "cpu_float32_tolerance": {"absolute": 0.00002, "relative": 0.0002},
+    "mps_float32_tolerance": {"absolute": 0.0002, "relative": 0.002},
+    "failure_action": "investigate and report; never silently relax tolerances or proceed to a long training run"
+  },
+  "proposed_language_model": {
+    "version": "separate GPU language model and checkpoint contract; legacy scratch checkpoints unchanged",
+    "architecture": "pre-layernorm causal Transformer, learned position embeddings, ReLU feedforward, untied output head",
+    "vocab_size": 257,
+    "tokenizer": "UTF-8 bytes 0 through 255 plus explicit end-of-document token 256; new tokenizer version",
+    "context_length": 2048,
+    "context_unit": "byte tokens, not words",
+    "width": 256,
+    "layers": 6,
+    "heads": 8,
+    "ff_multiplier": 4,
+    "seed": 42,
+    "parameter_count": 5395201,
+    "hive_context_measurement": {"tools_disabled_system_bytes_with_empty_lessons": 1132, "bytes_remaining_in_proposed_context": 916, "exclusions": "user text, lesson content, history, role framing and generation budget", "implication": "the language pilot is not a full Hive conversation model; integration needs a separate measured context and dialogue design"},
+    "precision": "float32 first; mixed precision requires a separate measured decision",
+    "compatibility": "exceeds the existing CPU scratch model limits; cannot be loaded by the current scratch HTTP adapter"
+  },
+  "bounded_experiment": {
+    "run_directory": "fresh exclusive directory under build-ai/language-runs",
+    "maximum_optimizer_updates": 1000,
+    "batch_size_proposal": 4,
+    "maximum_training_tokens": 8192000,
+    "maximum_wall_seconds": 7200,
+    "maximum_process_memory_bytes": 34359738368,
+    "benchmark_before_training": "measure complete optimizer updates, device memory and wall time; reduce batch/context or stop if caps cannot be met",
+    "learning_rate_proposal": 0.0003,
+    "gradient_clip_norm_proposal": 1.0,
+    "evaluation_interval_proposal": 100,
+    "validation_selection": "token-weighted next-token loss on fixed validation windows, including the random baseline; keep best complete state",
+    "test_isolation": "test split and language_exam.json do not select checkpoints or supply training targets",
+    "report": "record actual tokens, updates, wall time, throughput, peak memory, random baseline, validation curve, selected step, raw test continuations and manual review",
+    "stopping": "stop at the first update, token, wall or memory cap; save actual progress without declaring success"
+  },
+  "quality_milestones": [
+    "Readable English continuations on separately authored fixed prompts and untouched held-out stories. A lower prediction loss alone does not pass this milestone.",
+    "Teacher-reviewed multi-turn dialogue training, uncertainty examples, B3 source references and corrections, followed by a separate task exam.",
+    "Hive integration with measured instruction/history/lesson context budget, learned turn endings, and compatible checkpoint and response protocol.",
+    "Only after dialogue qualification, structured calls to the existing four public diagnostics with independent argument and factual-result checks."
+  ],
+  "limits": [
+    "This plan and its parameter count do not establish useful language or conversation capability.",
+    "TinyStories tests a narrow synthetic story domain; success does not establish general chat, B3 expertise or tool reliability.",
+    "No training occurs just by saving a conversation or a lesson.",
+    "No wallet actions, production node connections, consensus changes, external compute spending or publication are part of this experiment."
+  ]
+}
