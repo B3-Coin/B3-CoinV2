@@ -127,3 +127,75 @@ Next development milestones are a reproducible B3 question/task evaluation set,
 teacher-reviewed improvement experiments and then additional task tools with
 appropriate confirmation. Model training and verifiable publication of lesson
 revisions require separate designs and measured results.
+
+### Training our own model from scratch
+
+`contrib/b3ai/scratch/` is a separate CPU research experiment: our own causal
+Transformer, initialized randomly, using NumPy for numerical operations and
+manual backpropagation. It loads no pretrained weights. The UTF-8 byte tokenizer
+is self-contained. The model includes learned token/position embeddings,
+multiple attention heads, residual connections, layer normalization and a feed
+forward network. AdamW updates all learned parameters.
+
+The first model is deliberately tiny. The built-in corpus contains 14
+source-reviewed training records and 4 held-out records, describing the inspected
+B3 baseline. It is a teaching fixture, not enough data for general language
+pretraining. Split assignments precede tokenization; random windows stay within
+one record. Corpus and split hashes, model configuration, optimizer state, random
+generator state and experiment status accompany each checkpoint. These are local
+provenance records, with no on-chain commitment or proof of factual correctness.
+
+Use a Python environment that already has NumPy; these commands install nothing:
+
+```sh
+python3 -m unittest discover -s contrib/b3ai/scratch/tests -v
+python3 -m contrib.b3ai.scratch.train --output build-ai/scratch-experiment --steps 200
+python3 -m contrib.b3ai.scratch.sample build-ai/scratch-experiment/model.npz --prompt "B3 is "
+```
+
+The training command writes `model.npz`, `corpus.jsonl` and `report.json` to the
+chosen output directory. It refuses to replace an existing experiment unless
+`--resume` is supplied. Resume restores the learned parameters, AdamW moments and
+batch-selection RNG; corpus, model configuration and batch shape must match.
+The implementation hash and learning rate must also match. The report records
+Python and NumPy versions; identical numerical results assume the same runtime.
+The report compares fixed training and held-out byte-prediction losses against
+the untrained baseline. A reduction in loss establishes only that this limited
+prediction task improved; it does not establish conversational ability or B3
+task correctness. Text samples may be incoherent or factually wrong.
+
+`--corpus` accepts the same reviewed-record JSONL schema as the saved fixture.
+For custom data, the review flag is the caller's declaration; the trainer does
+not independently verify the sources. The report distinguishes custom data from
+the exact built-in B3 fixture and records its content hash.
+
+The first local run used 137,216 parameters, a 64-byte context and 200 updates.
+Fixed training loss fell from 5.9527 to 2.3886; fixed held-out loss fell from
+5.9043 to 2.5298. The generated sample remained incoherent. All 44 numerical,
+checkpoint, corpus and adapter tests passed, including exact resumed updates and
+custom-corpus provenance. A temporary loopback test with the actual checkpoint
+also verified model listing, generated output, tool rejection and context
+overflow rejection. This result demonstrates learning on the small fixture,
+with no demonstrated chat or task ability.
+
+An optional compatible HTTP adapter is explicitly experimental:
+
+```sh
+python3 -m contrib.b3ai.scratch.server --checkpoint build-ai/scratch-experiment/model.npz --allow-experimental
+```
+
+It binds only to a loopback IP address and never starts or accesses a B3 node.
+It serves generated text as `b3-scratch-experiment`, rejects streaming and tools,
+and refuses prompts beyond the checkpoint's context limit. The tiny initial
+checkpoint has a short byte context and is not qualified for the normal Hive
+assistant prompt. Keep it in the direct sampling/API experiment until a later
+model supports the full instruction and lesson context, learned turn endings
+and the tool protocol. This byte model has no end-of-turn token: its completions
+reach their byte budget and report `finish_reason: length`. No canned response
+is substituted for the model's output.
+
+Numerical checks cover finite-difference gradients, causal attention, learning
+on a sanity corpus, checkpoint integrity and exact resumed updates. Reliable
+chat and tool use remain separate milestones: obtain a sufficiently broad
+reviewed language corpus, train dialogue and tool-call behavior, run independent
+B3 task evaluations, and then integrate a qualified checkpoint with Hive.
