@@ -199,3 +199,69 @@ on a sanity corpus, checkpoint integrity and exact resumed updates. Reliable
 chat and tool use remain separate milestones: obtain a sufficiently broad
 reviewed language corpus, train dialogue and tool-call behavior, run independent
 B3 task evaluations, and then integrate a qualified checkpoint with Hive.
+
+### More training and short dialogue lessons
+
+Continuing the original prose experiment from 200 to 2,000 updates reduced its
+fixed training loss from 2.3886 to 0.3437, while fixed validation loss worsened
+from 2.5298 to 3.9509. Evaluating all held-out adjacent-byte targets with a sliding
+64-byte context confirmed the same trend: 2.5597 to 3.9805. The student was
+memorizing the fixture. A separate 400-update checkpoint preserved the best
+observed fixed validation loss in this control run, 2.4884. These checkpoints
+are retained as distinct experiments.
+
+`dialogue_data.py` supplies teacher-authored short B3 questions and concise,
+source-checked answers. Related questions intentionally share consistent answer
+targets. Validation contains different questions about those same topics; it
+does not establish independent knowledge or broad conversational ability.
+Sources and explicit splits are saved with the corpus. The inference function
+generates from the learned weights and does not retrieve these target answers.
+
+`teach.py` trains on complete conversation records. Loss applies only to answer
+bytes and the final newline; prompt targets and padding are excluded. Validation
+scores every validation answer byte and selects the lowest-loss checkpoint.
+Patience stops the run when repeated evaluations show no improvement. The saved
+parameters, AdamW state and batch RNG all correspond to the selected update;
+the report separately records attempted updates and the selected update.
+
+To run this stage with an existing random-start B3 checkpoint:
+
+```sh
+python3 -m contrib.b3ai.scratch.teach --output build-ai/scratch-dialogue --initialize-from build-ai/scratch-experiment/model.npz --steps 2500 --evaluation-interval 100 --patience 5 --prompt "What is B3?"
+```
+
+Choose a new output directory; existing directories are refused. This stage
+resets AdamW moments for the new objective and records the parent checkpoint's
+hash. It can increase the context while retaining the existing learned
+positions and initializing additional positions randomly. The default is
+256 bytes. It requires a float32 parent and identical other model settings.
+This is a recorded transfer to a new teaching stage, rather than an exact resume
+of the preceding experiment. Custom corpora use caller-declared review labels.
+The checkpoint's random-initialization provenance describes the origin of our
+own model weights; the parent record identifies this stage's learned starting
+weights. It does not mean the transferred parameters were reset to random values.
+
+Actual reply sampling stops at the first generated newline, or reports length
+when its budget expires. Empty or incorrect output is preserved for evaluation;
+no corrected answer is substituted. Checkpoint selection uses validation data,
+so separate probes are required to assess replies outside those questions.
+This stage remains experimental and has no tool execution or live node data.
+The original HTTP adapter accepts only the earlier sanity-pretraining stage.
+
+The local dialogue curriculum contains 192 training turns and 24 validation
+turns across 24 topics. The transferred 149,504-parameter model attempted 900
+teaching updates and selected update 400: validation answer loss fell from
+2.9335 to 2.1024. A separate 495,360-parameter model started from random weights,
+attempted 700 updates and selected update 200, with validation answer loss
+6.0366 to 2.3683. Its additional capacity did not resolve the language problem.
+Neither candidate produced usable replies on the separate question probes.
+These results do not support promoting either checkpoint to a conversational
+assistant. All 61 code checks passed; those checks verify implementation and
+saved-state behavior, not the factual quality of generated answers.
+
+Training checkpoints and the actual teaching corpus are saved locally. Chat
+history in the Hive prototype is session memory, and reviewed local lessons
+provide persistent reference context. None of these mechanisms automatically
+turns a saved conversation into weight training. Further work needs a sufficient
+language-learning dataset and independent reply evaluations; repeating the small
+B3 fixtures has already demonstrated overfitting.
