@@ -296,6 +296,129 @@ private Q_SLOTS:
         }
     }
 
+    void mixedTrainingSeparatesItsOptimizerFromBothInheritedStages()
+    {
+        B3AiPage page{nullptr, path()};
+        const QString reportPath{m_state->filePath(QStringLiteral("mixed-report.json"))};
+        auto report = mixedReport();
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(page.loadTrainingReport(reportPath));
+        const QString expected{QStringLiteral("%1 mixed updates · %2 in this run · %3 prior language · %4 prior B3 teaching")
+            .arg(QLocale().toString(qint64{1000}), QLocale().toString(qint64{1000}),
+                 QLocale().toString(qint64{4000}), QLocale().toString(qint64{900}))};
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingSavedUpdates")->text(), expected);
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingAttemptedUpdates")->text(), expected);
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingCurrentLoss")->text(), QLocale().toString(0.8, 'g', 6));
+        QVERIFY(page.findChild<QLabel*>("aiTrainingStatus")->text().startsWith(QStringLiteral("Language and B3 tool practice · ")));
+        QVERIFY(page.findChild<QLabel*>("aiTrainingNotice")->text().contains(QStringLiteral("two parts language loss")));
+        QVERIFY(page.findChild<QLabel*>("aiTrainingNotice")->text().contains(QStringLiteral("simulated results")));
+        QVERIFY(!page.findChild<B3AiClient*>()->busy());
+
+        // A baseline-only report has no accepted training-batch loss yet.
+        report.insert(QStringLiteral("attempted_steps"), 0);
+        report.insert(QStringLiteral("selected_step"), 0);
+        report.insert(QStringLiteral("attempted_mixed_steps"), 0);
+        report.insert(QStringLiteral("selected_mixed_step"), 0);
+        report.insert(QStringLiteral("training_tokens"), 0);
+        report.insert(QStringLiteral("cumulative_mixed_training_tokens"), 0);
+        report.insert(QStringLiteral("history"), QJsonArray{report.value(QStringLiteral("history")).toArray().first()});
+        report.insert(QStringLiteral("best_validation_loss"), 1.5);
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(page.loadTrainingReport(reportPath));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingCurrentLoss")->text(), QLocale().toString(1.5, 'g', 6));
+
+        report = mixedReport(600);
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(page.loadTrainingReport(reportPath));
+        const QString continued{QStringLiteral("%1 mixed updates · %2 in this run · %3 prior language · %4 prior B3 teaching")
+            .arg(QLocale().toString(qint64{1600}), QLocale().toString(qint64{1000}),
+                 QLocale().toString(qint64{4000}), QLocale().toString(qint64{900}))};
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingSavedUpdates")->text(), continued);
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingAttemptedUpdates")->text(), continued);
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingTokens")->text(), QLocale().toString(qint64{4156921}));
+    }
+
+    void malformedMixedLineageAndWeightedLossClearPreviousProgress()
+    {
+        B3AiPage page{nullptr, path()};
+        const QString reportPath{m_state->filePath(QStringLiteral("mixed-report.json"))};
+        QList<QJsonObject> invalid;
+        for (const QString& field : {QStringLiteral("inherited_language_steps"), QStringLiteral("inherited_b3_teaching_steps"),
+                QStringLiteral("base_mixed_step"), QStringLiteral("base_mixed_training_tokens"),
+                QStringLiteral("attempted_mixed_steps"), QStringLiteral("selected_mixed_step"),
+                QStringLiteral("cumulative_mixed_training_tokens"), QStringLiteral("batch_rng_reset")}) {
+            auto report = mixedReport();
+            report.remove(field);
+            invalid.append(report);
+        }
+        for (const QString& field : {QStringLiteral("attempted_mixed_steps"), QStringLiteral("selected_mixed_step"),
+                QStringLiteral("cumulative_mixed_training_tokens")}) {
+            auto report = mixedReport();
+            report.insert(field, report.value(field).toDouble() + 1);
+            invalid.append(report);
+        }
+        for (const QString& field : {QStringLiteral("optimizer_reset"), QStringLiteral("batch_rng_reset")}) {
+            auto fresh = mixedReport();
+            fresh.insert(field, false);
+            invalid.append(fresh);
+            auto continued = mixedReport(600);
+            continued.insert(field, true);
+            invalid.append(continued);
+        }
+        auto report = mixedReport();
+        report.insert(QStringLiteral("base_step"), 0);
+        invalid.append(report);
+        report = mixedReport();
+        report.insert(QStringLiteral("inherited_b3_teaching_steps"), -1);
+        invalid.append(report);
+        report = mixedReport();
+        report.insert(QStringLiteral("inherited_language_steps"), (1 << 24) - 900);
+        invalid.append(report);
+        for (const QString& field : {QStringLiteral("language_validation"), QStringLiteral("instruction_validation"),
+                QStringLiteral("validation"), QStringLiteral("train")}) {
+            report = mixedReport();
+            auto history = report.value(QStringLiteral("history")).toArray();
+            auto row = history.last().toObject();
+            row.insert(field, field == QStringLiteral("train") ? QJsonValue(QJsonValue::Null) : QJsonValue(-1.0));
+            history.replace(history.size() - 1, row);
+            report.insert(QStringLiteral("history"), history);
+            invalid.append(report);
+        }
+        report = mixedReport();
+        auto history = report.value(QStringLiteral("history")).toArray();
+        auto row = history.first().toObject();
+        row.insert(QStringLiteral("train"), 1.0);
+        history.replace(0, row);
+        report.insert(QStringLiteral("history"), history);
+        invalid.append(report);
+        report = mixedReport();
+        history = report.value(QStringLiteral("history")).toArray();
+        row = history.last().toObject();
+        row.insert(QStringLiteral("instruction_validation"), 0.9);
+        history.replace(history.size() - 1, row);
+        report.insert(QStringLiteral("history"), history);
+        invalid.append(report);
+        // All rows have internally consistent weighted losses, but the saved
+        // step still cannot claim to be best if another full evaluation won.
+        report = mixedReport();
+        history = report.value(QStringLiteral("history")).toArray();
+        history.insert(1, QJsonObject{{QStringLiteral("step"), 500}, {QStringLiteral("train"), 0.9},
+            {QStringLiteral("language_validation"), 0.6}, {QStringLiteral("instruction_validation"), 0.9},
+            {QStringLiteral("validation"), 0.7}, {QStringLiteral("elapsed_seconds"), 130.0}});
+        report.insert(QStringLiteral("history"), history);
+        invalid.append(report);
+        for (const auto& value : invalid) {
+            QVERIFY(writeReport(reportPath, mixedReport()));
+            QVERIFY(page.loadTrainingReport(reportPath));
+            QVERIFY(writeReport(reportPath, value));
+            QVERIFY(!page.loadTrainingReport(reportPath));
+            QCOMPARE(page.findChild<QLabel*>("aiTrainingSavedUpdates")->text(), QStringLiteral("—"));
+            QCOMPARE(page.findChild<QLabel*>("aiTrainingTokens")->text(), QStringLiteral("—"));
+            QCOMPARE(page.findChild<QLabel*>("aiTrainingCurrentLoss")->text(), QStringLiteral("—"));
+            QCOMPARE(page.findChild<QLabel*>("aiTrainingStatus")->text(), QStringLiteral("Report unavailable"));
+        }
+    }
+
     void malformedOversizedAndMissingTrainingReportsClearValues()
     {
         B3AiPage page{nullptr, path()};
@@ -365,6 +488,30 @@ private Q_SLOTS:
     }
 
 private:
+    QJsonObject mixedReport(qint64 base = 0) const
+    {
+        auto report = trainingReport();
+        report.insert(QStringLiteral("stage"), QStringLiteral("mixed-b3-tools"));
+        report.insert(QStringLiteral("optimizer_reset"), base == 0);
+        report.insert(QStringLiteral("batch_rng_reset"), base == 0);
+        report.insert(QStringLiteral("inherited_language_steps"), 4000);
+        report.insert(QStringLiteral("inherited_b3_teaching_steps"), 900);
+        report.insert(QStringLiteral("base_mixed_step"), base);
+        report.insert(QStringLiteral("base_mixed_training_tokens"), base * 1000);
+        report.insert(QStringLiteral("attempted_mixed_steps"), base + 1000);
+        report.insert(QStringLiteral("selected_mixed_step"), base + 1000);
+        report.insert(QStringLiteral("cumulative_mixed_training_tokens"), base * 1000 + 3556921);
+        report.insert(QStringLiteral("best_validation_loss"), 0.8);
+        report.insert(QStringLiteral("history"), QJsonArray{
+            QJsonObject{{QStringLiteral("step"), 0}, {QStringLiteral("train"), QJsonValue(QJsonValue::Null)},
+                {QStringLiteral("language_validation"), 1.1}, {QStringLiteral("instruction_validation"), 2.3},
+                {QStringLiteral("validation"), 1.5}, {QStringLiteral("elapsed_seconds"), 1.2}},
+            QJsonObject{{QStringLiteral("step"), 1000}, {QStringLiteral("train"), 1.03},
+                {QStringLiteral("language_validation"), 0.9}, {QStringLiteral("instruction_validation"), 0.6},
+                {QStringLiteral("validation"), 0.8}, {QStringLiteral("elapsed_seconds"), 265.7}}});
+        return report;
+    }
+
     QJsonObject trainingReport() const
     {
         return {{QStringLiteral("stage"), QStringLiteral("language-pilot")},

@@ -55,7 +55,9 @@ constexpr qint64 MAX_TRAINING_TOKENS{MAX_TRAINING_UPDATES * 16384};
 struct TrainingProgress {
     QString status;
     bool teaching{false};
+    bool mixed{false};
     qint64 inheritedLanguageSteps{0};
+    qint64 inheritedTeachingSteps{0};
     qint64 parameters{0};
     qint64 attempted{0};
     qint64 saved{0};
@@ -88,7 +90,8 @@ bool ReportNumber(const QJsonObject& object, const QString& key, double& result)
 bool ParseTrainingProgress(const QJsonObject& report, TrainingProgress& result)
 {
     const QString stage{report.value(QStringLiteral("stage")).toString()};
-    if ((stage != QStringLiteral("language-pilot") && stage != QStringLiteral("b3-supervised-answers")) ||
+    if ((stage != QStringLiteral("language-pilot") && stage != QStringLiteral("b3-supervised-answers") &&
+         stage != QStringLiteral("mixed-b3-tools")) ||
         report.value(QStringLiteral("experimental")) != true ||
         !report.value(QStringLiteral("status")).isString() ||
         report.value(QStringLiteral("status")).toString().isEmpty() ||
@@ -96,6 +99,11 @@ bool ParseTrainingProgress(const QJsonObject& report, TrainingProgress& result)
         !report.value(QStringLiteral("config")).isObject()) return false;
     result.status = report.value(QStringLiteral("status")).toString();
     result.teaching = stage == QStringLiteral("b3-supervised-answers");
+    result.mixed = stage == QStringLiteral("mixed-b3-tools");
+    if (result.mixed && (!ReportInteger(report, QStringLiteral("inherited_language_steps"), 0,
+            MAX_TRAINING_UPDATES, result.inheritedLanguageSteps) ||
+        !ReportInteger(report, QStringLiteral("inherited_b3_teaching_steps"), 0,
+            MAX_TRAINING_UPDATES - result.inheritedLanguageSteps, result.inheritedTeachingSteps))) return false;
     if (result.teaching && (report.value(QStringLiteral("optimizer_reset")) != true ||
         !ReportInteger(report, QStringLiteral("inherited_language_steps"), 0, MAX_TRAINING_UPDATES,
                        result.inheritedLanguageSteps))) return false;
@@ -123,6 +131,23 @@ bool ParseTrainingProgress(const QJsonObject& report, TrainingProgress& result)
         QStringLiteral("attempted_total_steps"), QStringLiteral("selected_total_step"), QStringLiteral("cumulative_training_tokens")};
     bool continuation{false};
     for (const QString& field : continuationFields) continuation |= report.contains(field);
+    if (result.mixed) {
+        qint64 baseStep{0}, baseTokens{0}, cumulative{0};
+        const QJsonValue optimizerReset{report.value(QStringLiteral("optimizer_reset"))};
+        const QJsonValue rngReset{report.value(QStringLiteral("batch_rng_reset"))};
+        if (continuation ||
+            !ReportInteger(report, QStringLiteral("base_mixed_step"), 0, MAX_TRAINING_UPDATES, baseStep) ||
+            !ReportInteger(report, QStringLiteral("base_mixed_training_tokens"), 0, MAX_TRAINING_TOKENS, baseTokens) ||
+            !ReportInteger(report, QStringLiteral("attempted_mixed_steps"), 0, MAX_TRAINING_UPDATES, result.attempted) ||
+            !ReportInteger(report, QStringLiteral("selected_mixed_step"), 0, result.attempted, result.saved) ||
+            !ReportInteger(report, QStringLiteral("cumulative_mixed_training_tokens"), 0, MAX_TRAINING_TOKENS, cumulative) ||
+            result.attempted != baseStep + result.localAttempted || result.saved != baseStep + result.localSaved ||
+            cumulative != baseTokens + result.tokens || baseTokens > baseStep * 16384 ||
+            !optimizerReset.isBool() || !rngReset.isBool() ||
+            optimizerReset.toBool() != (baseStep == 0) || rngReset.toBool() != (baseStep == 0) ||
+            result.attempted > MAX_TRAINING_UPDATES - result.inheritedLanguageSteps - result.inheritedTeachingSteps) return false;
+        result.tokens = cumulative;
+    }
     if (result.teaching && (continuation ||
         result.inheritedLanguageSteps > MAX_TRAINING_UPDATES - result.localAttempted)) return false;
     if (continuation) {
@@ -149,10 +174,19 @@ bool ParseTrainingProgress(const QJsonObject& report, TrainingProgress& result)
         qint64 step{0};
         double trainingLoss{0}, validationLoss{0}, elapsed{0};
         if (!ReportInteger(entry, QStringLiteral("step"), 0, result.localAttempted, step) || step <= previous ||
-            !ReportNumber(entry, QStringLiteral("train"), trainingLoss) ||
+            (result.mixed && step == 0 ? !entry.value(QStringLiteral("train")).isNull()
+                                      : !ReportNumber(entry, QStringLiteral("train"), trainingLoss)) ||
             !ReportNumber(entry, QStringLiteral("validation"), validationLoss) ||
             !ReportNumber(entry, QStringLiteral("elapsed_seconds"), elapsed) || elapsed < previousElapsed ||
             elapsed > 315576000 || (previous == -1 && step != 0)) return false;
+        if (result.mixed) {
+            double languageLoss{0}, instructionLoss{0};
+            if (!ReportNumber(entry, QStringLiteral("language_validation"), languageLoss) ||
+                !ReportNumber(entry, QStringLiteral("instruction_validation"), instructionLoss)) return false;
+            const double combined{(2 * languageLoss + instructionLoss) / 3};
+            if (!std::isfinite(combined) ||
+                std::abs(combined - validationLoss) > 1e-9 * std::max(1.0, combined)) return false;
+        }
         previous = step;
         previousElapsed = elapsed;
         result.currentLoss = validationLoss;
@@ -567,11 +601,15 @@ bool B3AiPage::loadTrainingReport(const QString& path)
         !ParseTrainingProgress(parsed.object(), progress)) return failure(tr("The file is not a supported experimental student training report, or its progress values are invalid."));
     const QLocale locale;
     const auto updates = [&](qint64 total, qint64 local) {
+        if (progress.mixed) return tr("%1 mixed updates · %2 in this run · %3 prior language · %4 prior B3 teaching")
+            .arg(locale.toString(total), locale.toString(local), locale.toString(progress.inheritedLanguageSteps),
+                 locale.toString(progress.inheritedTeachingSteps));
         if (progress.teaching) return tr("%1 in B3 teaching · %2 prior language updates")
             .arg(locale.toString(local), locale.toString(progress.inheritedLanguageSteps));
         return total == local ? locale.toString(total) : tr("%1 total · %2 in this run").arg(locale.toString(total), locale.toString(local));
     };
-    m_trainingStatus->setText(progress.teaching ? tr("B3 teaching · %1").arg(progress.status) : progress.status);
+    m_trainingStatus->setText(progress.mixed ? tr("Language and B3 tool practice · %1").arg(progress.status) :
+        progress.teaching ? tr("B3 teaching · %1").arg(progress.status) : progress.status);
     m_trainingParameters->setText(locale.toString(progress.parameters));
     m_trainingSavedUpdates->setText(updates(progress.saved, progress.localSaved));
     m_trainingAttemptedUpdates->setText(updates(progress.attempted, progress.localAttempted));
@@ -579,7 +617,9 @@ bool B3AiPage::loadTrainingReport(const QString& path)
     m_trainingCurrentLoss->setText(locale.toString(progress.currentLoss, 'g', 6));
     m_trainingBestLoss->setText(locale.toString(progress.bestLoss, 'g', 6));
     m_trainingElapsed->setText(tr("%1 seconds").arg(locale.toString(progress.elapsed, 'f', 1)));
-    m_trainingNotice->setText(tr("Saved report loaded. Refresh to read later saved progress; this page does not run training."));
+    m_trainingNotice->setText(progress.mixed
+        ? tr("Saved report loaded. Validation combines two parts language loss and one part instruction loss. Tool practice uses simulated results; this page does not run training or tools.")
+        : tr("Saved report loaded. Refresh to read later saved progress; this page does not run training."));
     B3Theme::markTextRole(m_trainingNotice, QStringLiteral("secondary"));
     return true;
 }
