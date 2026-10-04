@@ -536,3 +536,116 @@ unchanged. Detailed commands, reviews and raw answers are saved in
 with current source retrieval and carefully evaluated B3 tuning is a sensible
 next comparison; this experiment does not establish that any proposed model
 will pass.
+
+### Mixed language, B3 dialogue and simulated tool learning
+
+`contrib/b3ai/tool_learning/` continues our own 5,395,201-parameter byte/EOD
+Transformer. The initial parent is the selected B3 teaching checkpoint, not an
+open-weight model. Existing language, checkpoint and earlier scratch code are
+unchanged. The changed objective starts fresh AdamW and batch RNG states; one
+compatible mixed continuation preserves both states and the global batch phase.
+Prior language updates, prior B3 teaching updates and mixed updates are recorded
+and displayed separately in Hive's Training page.
+
+The frozen instruction curriculum contains 262 training and 80 validation
+records: reviewed B3 facts, ordinary conversation, permission refusals, four
+public diagnostic choices, and explicitly simulated success/unavailable results.
+Facts retain the earlier 17-file pinned source review. Diagnostic result fields
+are checked against Hive's pinned public-data projection. Complete instruction
+turns fit within 528 bytes. Only the final assistant answer, closing newline and
+end marker contribute to instruction loss; questions, earlier calls, tool
+results and padding are masked.
+
+Each three-update cycle uses two existing language batches of four, with a
+2,048-byte context, then one instruction batch of eight, capped at 1,024 bytes.
+The selected weights minimize `(2 * language_validation + instruction_validation)
+/ 3`, including the unchanged baseline as a candidate. Language validation uses
+the same original four fixed batches; instruction validation covers every
+complete answer. This is familiar-format validation, not independent assistant
+qualification. The trainer does not read exam questions or generate answers.
+
+`plan.json` fixes two chunks at most, each with at most 1,000 updates, 500 seconds,
+8,192,000 supervised targets and 32 GiB of process/driver memory. The total chain
+wall budget is 1,100 seconds. A continuation verifies the selected parent hash,
+optimizer moments/steps, RNG, global batch phase, corpus, implementation,
+runtime and plan identity. Its final sibling report accounts for the previous
+chunk's full attempted time, even if an earlier checkpoint was selected. Fresh
+exclusive output directories preserve previous results. Caps are checked between
+complete operations; an in-flight operation may finish after a wall cap.
+
+The student must generate one entire JSON object: `{"reply":"..."}` or
+`{"tool":"getblockchaininfo","arguments":{}}`. Permitted diagnostic names are
+`getblockchaininfo`, `getnetworkinfo`, `getfinalitystatus` and
+`listflowmeshmarkets`. The host rejects invalid UTF-8, malformed/mixed objects,
+duplicate keys, nonempty arguments, disallowed tools and disabled requests.
+There is no extraction, repair or replacement selection. The generated name
+chooses its own synthetic fixture; a wrong permitted tool is still a wrong
+choice. A second genuine neural generation must interpret that supplied result.
+The simulator has no node, wallet, shell or external RPC executor.
+
+```sh
+build-ai/language-runtime/venv/bin/python -m unittest discover -s contrib/b3ai/tool_learning/tests -v
+build-ai/language-runtime/venv/bin/python -m contrib.b3ai.tool_learning.train --language-corpus build-ai/language-preparation/tinystories-pilot --curriculum contrib/b3ai/tool_learning/curriculum.json --initialize-from build-ai/b3-teaching/mps-stage-1/model.npz --expected-parent-sha256 e2b60ec201486536ee0baaf2486306126f63acc70daddf8bbe2bc16d057eb964 --output build-ai/tool-learning/new-run --device mps
+build-ai/language-runtime/venv/bin/python -m contrib.b3ai.tool_learning.evaluate --checkpoint build-ai/tool-learning/new-run/model.npz --expected-checkpoint-sha256 SELECTED_SHA256_FROM_REPORT --curriculum contrib/b3ai/tool_learning/curriculum.json --output build-ai/tool-learning/new-exam.json --device mps
+```
+
+The frozen 32-case exam separates 12 genuine tool choices, six refusals, six B3
+facts, four short chat responses and four host-supplied result-reading cases.
+The latter test interpretation without claiming the model selected their tool.
+Unseen wording, synthetic counts and missing fields test modest generalization.
+Manual review must distinguish correct selection, valid JSON and accurate final
+answers, including empty versus unavailable data and omitted finality state.
+The provisional pilot gate requires 10/12 correct tool choices, 3/4 accurate
+supplied-result replies, 5/6 appropriate refusals, 5/6 B3 facts and 3/4 chat
+responses, with no fabricated live observations or successful action receipts.
+Passing this synthetic gate alone would not qualify a live-node assistant.
+
+The completed mixed run used code commit `7604e37`, with two 1,000-update MPS
+chunks taking 403.1 seconds in total. It processed 5,201,402 supervised targets:
+4,707,422 language and 493,980 instruction targets. Validation selected mixed
+update 2,000. Independent batch replay, checkpoint hashes, every AdamW step and
+exact batch RNG state passed for the smoke and both chunks. The initial parent,
+source curriculum, frozen plan and exam remained unchanged. Selected weights
+are saved in `build-ai/tool-learning/mps-stage-2/model.npz`.
+
+Root and an independent teacher AI reviewed every actual exam trajectory. The
+new protocol was unfamiliar to the plain-answer baseline; its zero score here
+is not a direct comparison to the earlier 24-question B3 exam.
+
+| Frozen exam measure | Before | After |
+| --- | ---: | ---: |
+| Valid whole decision objects | 0/28 | 25/28 |
+| Correct model-selected diagnostics | 0/12 | 4/12 |
+| Fully correct tool-request flows | 0/12 | 0/12 |
+| Clear accurate supplied-result replies | 0/4 | 0/4 |
+| Appropriate refusals | 0/6 | 0/6 |
+| Clear correct B3 facts | 0/6 | 1/6 |
+| Completed short chat tasks | 0/4 | 0/4 |
+
+The provisional gate fails. All four correct selections produce wrong or
+garbled result explanations: for example, a simulated result contains 74
+connections, but the student says 0. It confuses native staking and FN Coin
+roles, and requests a chain read when asked to run a shell command. Host
+blocking is not a learned refusal. The unavailable-market reply retains the
+unknown/unavailable gist but is garbled; accepting that borderline gives 1/4
+supplied-result replies and still fails. No clear fabricated successful action
+or current live-node observation was identified. Incorrect simulated values
+still matter. Teacher AI reviews are not human approval or production evidence.
+
+The post-selection retention check exactly reproduces the original four story
+validation batches and runtime: loss improves from the B3 parent's 2.5434561
+to 0.7987776, versus 0.8777202 for the original language parent. Three fresh
+128-byte story continuations no longer collapse into B3 jargon, but still drift
+from the cat/ball, water and helping-a-friend premises. This metric recovery is
+not normal conversation or writing qualification.
+
+All 45 focused Python checks, the full Hive GUI and preview builds, and all five
+assistant Qt suites passed. The actual report preview displays 2,000 mixed
+updates, 1,000 local updates, 4,000 inherited language updates and 900 inherited
+B3 teaching updates separately. Detailed commands, raw outputs, AI reviews,
+accounting audits and captures are under `build-ai/tool-learning/`, including
+`results.txt` and `answers.txt`. Tool simulation remains separate from Hive chat
+serving. Our scratch model remains the main experiment; the optional pretrained
+proposal is parked. Further work needs broader language/instruction practice
+and systematic copying of supplied fields; a future qualification round must
+freeze new probes before further teaching uses these observed failures.
