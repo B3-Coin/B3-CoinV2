@@ -87,6 +87,33 @@ struct BIP9Deployment {
 };
 
 /**
+ * The fresh finality lineage (bridge V2, B-8; finality-dependency doc
+ * section 6): a re-bootstrap of BLS finality at height R_f whose genesis
+ * committee comes from Snapshot(R_f - 1) and whose certificates sign the
+ * B3/FINALITY/V2 digest under their own lineage id, journal namespace and
+ * tracker state. The V1 lineage is unaffected by it.
+ *
+ * Unset on every shipped network: mainnet and test networks have no
+ * activation height until a reviewed hard fork pins one, and mainnet digest
+ * V2 only ever comes from V2 P3 (B-7). Regtest sets it solely through the
+ * -b3freshlineageheight startup knob.
+ */
+struct FreshLineageParams {
+    //! R_f: first height whose blocks may carry fresh-lineage certificates.
+    //! GenesisHeight() = R_f - 1 is a V1-grid checkpoint and history leaf 0
+    //! (the contracts' GENESIS_HEIGHT).
+    int activation_height{0};
+    //! FD-7: the fresh lineage's own maximum epoch extension (blocks); the
+    //! V1 lineage keeps ModernPosParams::max_epoch_extension.
+    int max_epoch_extension{0};
+    //! B-7 staging signer: the V1 single-vote signer additionally signs
+    //! digest V2 for this lineage. Regtest only; never true on mainnet.
+    bool staging_signer{false};
+
+    constexpr int GenesisHeight() const { return activation_height - 1; }
+};
+
+/**
  * Parameters that influence chain consensus.
  */
 struct Params {
@@ -246,6 +273,17 @@ struct Params {
      * bridge_withdrawal_activation_height must also be ratified and pinned.
      */
     std::optional<BridgeAssetParams> busd_bridge;
+    /**
+     * Fresh finality lineage (FreshLineageParams above). Unset means no
+     * fresh lineage exists and every fresh-lineage rule stays inactive;
+     * only regtest's -b3freshlineageheight knob sets it.
+     */
+    std::optional<FreshLineageParams> fresh_lineage;
+    //! True from R_f on a chain that configures the fresh lineage.
+    bool FreshLineageRulesActive(int height) const
+    {
+        return fresh_lineage && height >= fresh_lineage->activation_height;
+    }
     /**
      * TEST-ONLY override of the historical FN disintegration collateral
      * (Proof of Disintegration). Unset everywhere except regtest fixtures:

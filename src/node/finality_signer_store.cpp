@@ -21,8 +21,26 @@ namespace node {
 namespace {
 
 constexpr uint8_t SIGNER_STATE_VERSION{1};
-constexpr std::array<unsigned char, 8> SIGNER_STATE_MAGIC{
+using SignerStateMagic = std::array<unsigned char, 8>;
+//! CHAIN_DOMAIN_V1 journals (unchanged since V1).
+constexpr SignerStateMagic SIGNER_STATE_MAGIC{
     'B', '3', 'F', 'S', 'L', 'O', 'C', 'K'};
+//! FRESH_LINEAGE_V2 journals. A different magic, not only a different file
+//! name, so a journal copied or renamed across namespaces fails closed.
+constexpr SignerStateMagic FRESH_LINEAGE_SIGNER_STATE_MAGIC{
+    'B', '3', 'F', 'S', 'L', 'I', 'N', '2'};
+
+//! The file magic of a namespace, or nullptr for a value outside the enum.
+const SignerStateMagic* MagicFor(const FinalitySignerNamespace ns)
+{
+    switch (ns) {
+    case FinalitySignerNamespace::CHAIN_DOMAIN_V1:
+        return &SIGNER_STATE_MAGIC;
+    case FinalitySignerNamespace::FRESH_LINEAGE_V2:
+        return &FRESH_LINEAGE_SIGNER_STATE_MAGIC;
+    }
+    return nullptr;
+}
 
 enum class ReadStatus { ABSENT, VALID, INVALID };
 
@@ -133,8 +151,8 @@ bool IsValidState(const FinalitySignerState& state, std::string& error)
     return true;
 }
 
-ReadStatus ReadState(const fs::path& path, FinalitySignerState& out,
-                     std::string& error)
+ReadStatus ReadState(const fs::path& path, const SignerStateMagic& expected_magic,
+                     FinalitySignerState& out, std::string& error)
 {
     std::error_code ec;
     const bool exists{std::filesystem::exists(path.std_path(), ec)};
@@ -152,13 +170,13 @@ ReadStatus ReadState(const fs::path& path, FinalitySignerState& out,
     }
     try {
         HashVerifier verifier{file};
-        std::array<unsigned char, SIGNER_STATE_MAGIC.size()> magic{};
+        SignerStateMagic magic{};
         uint8_t version{0};
         DiskState disk;
         verifier >> magic >> version >> disk;
         uint256 checksum;
         file >> checksum;
-        if (magic != SIGNER_STATE_MAGIC) {
+        if (magic != expected_magic) {
             error = "wrong signer-state file magic";
             return ReadStatus::INVALID;
         }
@@ -190,8 +208,8 @@ void RemoveNoThrow(const fs::path& path)
     fs::remove(path, ec);
 }
 
-bool WriteState(const fs::path& path, const FinalitySignerState& state,
-                std::string& error)
+bool WriteState(const fs::path& path, const SignerStateMagic& magic,
+                const FinalitySignerState& state, std::string& error)
 {
     const uint16_t random_suffix{FastRandomContext().rand<uint16_t>()};
     const fs::path tmp{fs::path{path.parent_path()} / fs::u8path(strprintf(
@@ -205,7 +223,7 @@ bool WriteState(const fs::path& path, const FinalitySignerState& state,
     }
     try {
         HashedSourceWriter writer{out};
-        writer << SIGNER_STATE_MAGIC << SIGNER_STATE_VERSION << ToDisk(state);
+        writer << magic << SIGNER_STATE_VERSION << ToDisk(state);
         out << writer.GetHash();
     } catch (const std::exception& e) {
         (void)out.fclose();
@@ -241,12 +259,21 @@ bool WriteState(const fs::path& path, const FinalitySignerState& state,
 } // namespace
 
 fs::path FinalitySignerStore::StatePath(
-    const fs::path& directory, const uint256& chain_domain,
-    const modern::ValidatorKeyBytes& validator_key)
+    const fs::path& directory, const uint256& scope_id,
+    const modern::ValidatorKeyBytes& validator_key,
+    const FinalitySignerNamespace ns)
 {
-    return directory / fs::u8path(strprintf(
-        "finality_signer_v1_%s_%s.dat", chain_domain.GetHex(),
-        HexStr(validator_key)));
+    switch (ns) {
+    case FinalitySignerNamespace::CHAIN_DOMAIN_V1:
+        return directory / fs::u8path(strprintf(
+            "finality_signer_v1_%s_%s.dat", scope_id.GetHex(),
+            HexStr(validator_key)));
+    case FinalitySignerNamespace::FRESH_LINEAGE_V2:
+        return directory / fs::u8path(strprintf(
+            "finality_signer_v2_lineage_%s_%s.dat", scope_id.GetHex(),
+            HexStr(validator_key)));
+    }
+    return {};
 }
 
 bool FinalitySignerStore::MatchesOperatorRecoveryIncident(
@@ -293,7 +320,8 @@ bool FinalitySignerStore::CheckOperatorRecoveryIncident(
         return false;
     }
     FinalitySignerState state;
-    const auto result{ReadState(StatePath(directory, chain_domain, validator_key), state, error)};
+    const auto result{ReadState(StatePath(directory, chain_domain, validator_key),
+                                SIGNER_STATE_MAGIC, state, error)};
     if (result == ReadStatus::ABSENT) {
         error = "operator-trusted recovery requires an intact existing signer journal; the journal is absent";
         return false;
@@ -303,13 +331,15 @@ bool FinalitySignerStore::CheckOperatorRecoveryIncident(
 }
 
 bool FinalitySignerStore::Open(
-    const fs::path& directory, const uint256& chain_domain,
-    const modern::ValidatorKeyBytes& validator_key, std::string& error)
+    const fs::path& directory, const uint256& scope_id,
+    const modern::ValidatorKeyBytes& validator_key, std::string& error,
+    const FinalitySignerNamespace ns)
 {
     m_open = false;
     m_state.reset();
     m_path.clear();
-    if (directory.empty() || chain_domain.IsNull()) {
+    const SignerStateMagic* const magic{MagicFor(ns)};
+    if (directory.empty() || scope_id.IsNull() || !magic) {
         error = "invalid finality signer store identity";
         return false;
     }
@@ -326,13 +356,14 @@ bool FinalitySignerStore::Open(
                           fs::PathToString(directory));
         return false;
     }
-    m_chain_domain = chain_domain;
+    m_namespace = ns;
+    m_chain_domain = scope_id;
     m_validator_key = validator_key;
-    m_path = StatePath(directory, chain_domain, validator_key);
+    m_path = StatePath(directory, scope_id, validator_key, ns);
 
     FinalitySignerState loaded;
     std::string read_error;
-    switch (ReadState(m_path, loaded, read_error)) {
+    switch (ReadState(m_path, *magic, loaded, read_error)) {
     case ReadStatus::ABSENT:
         m_open = true;
         return true;
@@ -340,7 +371,7 @@ bool FinalitySignerStore::Open(
         error = strprintf("unsafe finality signer state: %s", read_error);
         return false;
     case ReadStatus::VALID:
-        if (loaded.chain_domain != chain_domain ||
+        if (loaded.chain_domain != scope_id ||
             loaded.validator_key != validator_key) {
             error = "finality signer state belongs to another chain or validator";
             return false;
@@ -368,9 +399,14 @@ bool FinalitySignerStore::Commit(const FinalitySignerState& next,
     // Re-read immediately before replacement. A missing, corrupt, or changed
     // predecessor is never overwritten: it may be the only surviving safety
     // record from another process or an interrupted operator action.
+    const SignerStateMagic* const magic{MagicFor(m_namespace)};
+    if (!magic) {
+        error = "unknown finality signer namespace";
+        return false;
+    }
     FinalitySignerState disk;
     std::string read_error;
-    const ReadStatus status{ReadState(m_path, disk, read_error)};
+    const ReadStatus status{ReadState(m_path, *magic, disk, read_error)};
     if (m_state) {
         if (status != ReadStatus::VALID || disk != *m_state) {
             error = status == ReadStatus::INVALID
@@ -389,7 +425,7 @@ bool FinalitySignerStore::Commit(const FinalitySignerState& next,
 
     if (m_state && *m_state == next) return true;
 
-    if (!WriteState(m_path, next, error)) return false;
+    if (!WriteState(m_path, *magic, next, error)) return false;
     m_state = next;
     return true;
 }
@@ -517,6 +553,12 @@ bool FinalitySignerStore::CommitPinnedRecoveryAnchor(
 {
     if (!m_open || !m_state) {
         error = "finality signer state is not durably initialized";
+        return false;
+    }
+    if (m_namespace != FinalitySignerNamespace::CHAIN_DOMAIN_V1) {
+        // Pinned and operator recoveries repair one V1 incident. The fresh
+        // lineage has none (finality-dependency section 6.4).
+        error = "pinned recovery applies only to the V1 chain-domain journal";
         return false;
     }
     if (!recovery.Valid() || anchor_digest.IsNull()) {

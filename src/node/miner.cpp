@@ -585,6 +585,14 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                              cert_error);
                 }
             }
+            // Fresh finality lineage (bridge V2 S3, regtest knob only): a
+            // judged MPA type-11 record next to the unchanged V1 one. No cell;
+            // the MODERN_PAYLOAD_ROOT commitment below binds it.
+            if (b3_consensus.fresh_lineage) {
+                node::AppendFreshLineageCertificate(finality, m_chainstate.FinalitySignatures().Fresh(),
+                                                    m_chainstate.m_chain, b3_consensus, *pindexPrev,
+                                                    bridge_index, coinbaseTx);
+            }
             if (production_plan.action == RegtestFinalityProduction::REQUIRE_HANDOVER &&
                 !included_current_epoch_certificate) {
                 throw std::runtime_error(strprintf(

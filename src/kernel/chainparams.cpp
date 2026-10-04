@@ -23,6 +23,7 @@
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <script/script.h>
+#include <tinyformat.h>
 #include <uint256.h>
 #include <util/chaintype.h>
 #include <util/log.h>
@@ -1208,6 +1209,45 @@ public:
                 }
                 assert(Consensus::BridgeMintParamsReady(busd));
                 consensus.busd_bridge = std::move(busd);
+            }
+
+            // Fresh finality lineage (bridge V2 B-8; regtest plan section
+            // 3.3): REGTEST ONLY and only with -b3flowmeshtest. Its genesis
+            // G = R_f - 1 is history leaf 0 and must be a V1-grid
+            // checkpoint, G >= M and (G - M) mod checkpoint_interval == 0
+            // (modern::IsCheckpointHeight). The B-7 staging signer is on
+            // whenever the lineage is configured here: on regtest the V1
+            // single-vote signer also signs digest V2. No other network
+            // sets fresh_lineage.
+            if (b3.fresh_max_epoch_extension && !b3.fresh_lineage_height) {
+                throw std::runtime_error("-b3freshmaxepochextension requires -b3freshlineageheight");
+            }
+            if (b3.fresh_lineage_height) {
+                if (!b3.flowmesh_test) {
+                    throw std::runtime_error("-b3freshlineageheight requires -b3flowmeshtest");
+                }
+                const int fresh_height{*b3.fresh_lineage_height};
+                const int extension{b3.fresh_max_epoch_extension.value_or(
+                    B3ModernRegTestOptions::DEFAULT_FRESH_MAX_EPOCH_EXTENSION)};
+                if (fresh_height <= 1) {
+                    throw std::runtime_error("Invalid value for -b3freshlineageheight: must be above 1");
+                }
+                if (extension <= 0) {
+                    throw std::runtime_error("Invalid value for -b3freshmaxepochextension: must be positive");
+                }
+                const int modern_start{*Consensus::ModernPosStartHeight(consensus)};
+                const int genesis_height{fresh_height - 1};
+                if (genesis_height < modern_start ||
+                    (genesis_height - modern_start) % pos.checkpoint_interval != 0) {
+                    throw std::runtime_error(strprintf(
+                        "-b3freshlineageheight=%d: genesis checkpoint %d must be a checkpoint height >= M=%d on the %d-block grid",
+                        fresh_height, genesis_height, modern_start, pos.checkpoint_interval));
+                }
+                consensus.fresh_lineage = Consensus::FreshLineageParams{
+                    .activation_height = fresh_height,
+                    .max_epoch_extension = extension,
+                    .staging_signer = true,
+                };
             }
         }
 

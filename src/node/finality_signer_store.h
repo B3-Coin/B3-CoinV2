@@ -9,6 +9,7 @@
 #include <uint256.h>
 #include <util/fs.h>
 
+#include <cstdint>
 #include <optional>
 #include <limits>
 #include <string>
@@ -16,8 +17,29 @@
 namespace node {
 
 /**
- * Crash-safe anti-equivocation state for one (chain domain, validator key).
- * No private key material is ever written.
+ * Which finality lineage a signer journal protects. Each namespace has its own
+ * file name and its own file magic, so a journal written for one namespace is
+ * never opened, read, reset or replaced as the other: a V1 orphan lock cannot
+ * block fresh-lineage signing, and no fresh-lineage write can move a V1 lock.
+ *
+ *  - CHAIN_DOMAIN_V1: the V1 lineage (modern::FinalityDigest). The scope id is
+ *    the chain domain. File "finality_signer_v1_<domain>_<vk>.dat", magic
+ *    "B3FSLOCK". This is every journal written before bridge V2 S3, unchanged.
+ *  - FRESH_LINEAGE_V2: the fresh bridge-V2 lineage (modern::FinalityDigestV2,
+ *    finality-dependency section 6.4). The scope id is the lineage id. File
+ *    "finality_signer_v2_lineage_<lineage id>_<vk>.dat", magic "B3FSLIN2".
+ *
+ * Both hex fields of a file name use uint256::GetHex(). The record layout,
+ * checksum, version byte and every safety rule are the same in both.
+ */
+enum class FinalitySignerNamespace : uint8_t {
+    CHAIN_DOMAIN_V1 = 1,
+    FRESH_LINEAGE_V2 = 2,
+};
+
+/**
+ * Crash-safe anti-equivocation state for one (scope id, validator key) in one
+ * FinalitySignerNamespace. No private key material is ever written.
  *
  * `last_signed_*` prevents signing the same or a lower height with a
  * different object. `lock_*` additionally prevents signing a higher
@@ -29,6 +51,8 @@ namespace node {
  * the store itself cannot establish agreement on the chosen chain.
  */
 struct FinalitySignerState {
+    //! Scope id: the chain domain (CHAIN_DOMAIN_V1) or the fresh lineage id
+    //! (FRESH_LINEAGE_V2). The field keeps its V1 name and disk position.
     uint256 chain_domain{};
     modern::ValidatorKeyBytes validator_key{};
     int32_t last_signed_height{-1};
@@ -67,15 +91,23 @@ struct FinalitySignerState {
 class FinalitySignerStore
 {
 public:
-    bool Open(const fs::path& directory, const uint256& chain_domain,
+    /** Open the journal of (`scope_id`, `validator_key`) in namespace `ns`.
+     * The default namespace keeps every V1 caller byte-identical. A file of
+     * the other namespace is never consulted; one copied to this path fails
+     * closed on its magic. */
+    bool Open(const fs::path& directory, const uint256& scope_id,
               const modern::ValidatorKeyBytes& validator_key,
-              std::string& error);
+              std::string& error,
+              FinalitySignerNamespace ns = FinalitySignerNamespace::CHAIN_DOMAIN_V1);
 
     bool IsOpen() const { return m_open; }
     bool IsAbsent() const { return m_open && !m_state.has_value(); }
     const std::optional<FinalitySignerState>& State() const { return m_state; }
     const fs::path& Path() const { return m_path; }
+    //! The scope id; under FRESH_LINEAGE_V2 this is the lineage id.
     const uint256& ChainDomain() const { return m_chain_domain; }
+    const uint256& ScopeId() const { return m_chain_domain; }
+    FinalitySignerNamespace Namespace() const { return m_namespace; }
 
     /** Establish a durable pre-signing marker. Only an absent file may become
      * empty; an existing valid state is left untouched. */
@@ -105,19 +137,24 @@ public:
      * record. Then moves ONLY the ancestry lock to the pinned anchor (strictly
      * newer); the last actual vote is retained. `anchor_digest` is the exact
      * finality digest this node derives for the anchor checkpoint. The signer
-     * must validate the selected trust mode before calling this write. */
+     * must validate the selected trust mode before calling this write.
+     * CHAIN_DOMAIN_V1 only: a fresh-lineage journal refuses it. */
     bool CommitPinnedRecoveryAnchor(
         const Consensus::FinalitySignerRecovery& recovery,
         const uint256& anchor_digest, std::string& error);
 
+    /** The journal path of (`scope_id`, `validator_key`) in namespace `ns`;
+     * empty for a value outside FinalitySignerNamespace. */
     static fs::path StatePath(
-        const fs::path& directory, const uint256& chain_domain,
-        const modern::ValidatorKeyBytes& validator_key);
+        const fs::path& directory, const uint256& scope_id,
+        const modern::ValidatorKeyBytes& validator_key,
+        FinalitySignerNamespace ns = FinalitySignerNamespace::CHAIN_DOMAIN_V1);
 
     /** Read-only configuration preflight. Unlike Open(), creates no directory
      * and never initializes a missing journal. Checks the exact intact incident
      * only, not anchor agreement or chain eligibility. The live signer and
-     * durable write must recheck their own current state before applying it. */
+     * durable write must recheck their own current state before applying it.
+     * Both recovery helpers apply to the CHAIN_DOMAIN_V1 journal only. */
     static bool CheckOperatorRecoveryIncident(
         const fs::path& directory, const uint256& chain_domain,
         const modern::ValidatorKeyBytes& validator_key,
@@ -130,6 +167,7 @@ private:
     bool Commit(const FinalitySignerState& next, std::string& error);
 
     bool m_open{false};
+    FinalitySignerNamespace m_namespace{FinalitySignerNamespace::CHAIN_DOMAIN_V1};
     fs::path m_path;
     uint256 m_chain_domain{};
     modern::ValidatorKeyBytes m_validator_key{};

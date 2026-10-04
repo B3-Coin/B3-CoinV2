@@ -30,6 +30,7 @@
 #include <functional>
 #include <initializer_list>
 #include <limits>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -352,6 +353,15 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
           args.GetBoolArg("-b3flowmeshtest", false))) {
         throw std::runtime_error("-b3bridgepins requires -b3modernregtest and -b3flowmeshtest (regtest-only)");
     }
+    // Fresh finality lineage knobs (bridge V2 regtest plan section 3.3):
+    // like -b3bridgepins they only ever apply to the FlowMesh regtest.
+    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension"}) {
+        if (args.IsArgSet(knob) &&
+            !(args.GetBoolArg("-b3modernregtest", false) &&
+              args.GetBoolArg("-b3flowmeshtest", false))) {
+            throw std::runtime_error(strprintf("%s requires -b3modernregtest and -b3flowmeshtest (regtest-only)", knob));
+        }
+    }
     if (args.GetBoolArg("-b3flowmeshtest", false) &&
         !args.GetBoolArg("-b3modernregtest", false)) {
         throw std::runtime_error("-b3flowmeshtest requires -b3modernregtest");
@@ -395,6 +405,20 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
         if (args.IsArgSet("-b3bridgepins")) {
             b3.bridge_pins = ReadB3RegTestBridgePinsFile(args.GetArg("-b3bridgepins", ""));
         }
+        // Fresh finality lineage at R_f (B-8) with the B-7 staging signer;
+        // RegTest() enforces the grid and the flowmesh requirement.
+        const auto read_fresh{[&](const char* name, int64_t min_value, std::optional<int>& field) {
+            if (args.IsArgSet(name)) {
+                const int64_t v{args.GetIntArg(name, 0)};
+                if (v < min_value || v > std::numeric_limits<int>::max()) {
+                    throw std::runtime_error(strprintf("Invalid value for %s: must be in [%d, %d]",
+                                                       name, min_value, std::numeric_limits<int>::max()));
+                }
+                field = static_cast<int>(v);
+            }
+        }};
+        read_fresh("-b3freshlineageheight", 2, b3.fresh_lineage_height);
+        read_fresh("-b3freshmaxepochextension", 1, b3.fresh_max_epoch_extension);
         options.b3_modern = b3;
     }
     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
@@ -474,6 +498,13 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
     // a startup error (before this knob existed it was ignored as unknown).
     if (chain != ChainType::REGTEST && args.IsArgSet("-b3bridgepins")) {
         throw std::runtime_error("-b3bridgepins is regtest-only");
+    }
+    // The fresh finality lineage knobs likewise configure the regtest
+    // staging lineage only; every other network leaves fresh_lineage unset.
+    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension"}) {
+        if (chain != ChainType::REGTEST && args.IsArgSet(knob)) {
+            throw std::runtime_error(strprintf("%s is regtest-only", knob));
+        }
     }
     switch (chain) {
     case ChainType::MAIN:

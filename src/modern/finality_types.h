@@ -54,6 +54,11 @@ inline constexpr size_t BIP340_SIG_SIZE{64};
 //! MPA record maxima and declared verification costs (owner-frozen 2026-08-23).
 //! 1 cost unit ~ 1 us on the reference machine (portable blst).
 inline constexpr size_t FINALITY_CERTIFICATE_RECORD_MAX{112 + 1024 + 96}; // FinalizedBlock + bitmap(8192) + sig = 1,232
+//! Fresh-lineage digest V2 carrier (modern/finality_v2.h): FinalizedBlockV2 +
+//! bitmap(8192) + sig = 1,305 (b3-bridge-v2-contracts-spec.md section 2.1).
+inline constexpr size_t FINALITY_CERTIFICATE_V2_RECORD_MAX{185 + 1024 + 96};
+//! Its smallest record: FinalizedBlockV2 + bitmap(n <= 8) + sig = 282.
+inline constexpr size_t FINALITY_CERTIFICATE_V2_RECORD_MIN{185 + 1 + 96};
 inline constexpr size_t FINALITY_KEY_EVIDENCE_SIZE{244};       // 32 + 48 + 4 + 64 + 96
 inline constexpr int64_t FINALITY_CERTIFICATE_VERIFY_COST{2000};
 inline constexpr int64_t FINALITY_KEY_EVIDENCE_VERIFY_COST{700};

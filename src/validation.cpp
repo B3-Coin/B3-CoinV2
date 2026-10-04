@@ -2526,9 +2526,11 @@ bool Chainstate::RefreshFinalityAnchor()
     node::FinalityTracker& finality{ModernFinality()};
     if (!finality.Sync(m_chain, m_blockman, consensus, *tip,
                        bridge_index)) return true;
-    if (const auto& fin{finality.Current().finalized}) {
+    // V1's finalized checkpoint, or an included fresh-lineage (V2)
+    // certificate's when higher (regtest -b3freshlineageheight only).
+    if (const auto pin{finality.PinnedCheckpoint()}) {
         BlockValidationState state;
-        return RaiseFinalityAnchorDurably(state, fin->height, fin->block_hash);
+        return RaiseFinalityAnchorDurably(state, pin->first, pin->second);
     }
     return true;
 }
@@ -4938,10 +4940,11 @@ bool Chainstate::ConnectTip(
             *block_to_connect, *pindexNew, m_chainman.GetConsensus(),
             m_bridge_state ? &m_bridge_state->Index() : nullptr);
         // The finality pin: a certificate connected on the active chain pins
-        // its checkpoint for the life of the process (monotone).
+        // its checkpoint for the life of the process (monotone); a fresh-
+        // lineage (V2) certificate pins like V1 (regtest knob only).
         if (m_finality_tracker->Synced(pindexNew->GetBlockHash())) {
-            if (const auto& fin{m_finality_tracker->Current().finalized}) {
-                if (!RaiseFinalityAnchorDurably(state, fin->height, fin->block_hash)) return false;
+            if (const auto pin{m_finality_tracker->PinnedCheckpoint()}) {
+                if (!RaiseFinalityAnchorDurably(state, pin->first, pin->second)) return false;
             }
         }
     }

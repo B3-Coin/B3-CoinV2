@@ -352,6 +352,13 @@ bool FinalitySigner::SetKeys(
     m_error.clear();
     m_key_error.clear();
     m_permanent_error = false;
+    // An offline signer has no journal directory for the fresh lineage either.
+    m_store_directory.clear();
+    m_fresh_scope.SetNull();
+    m_fresh_store = FinalitySignerStore{};
+    m_fresh_last_signed = -1;
+    m_fresh_error.clear();
+    m_fresh_permanent_error = false;
     error.clear();
     return true;
 }
@@ -398,6 +405,14 @@ bool FinalitySigner::SetKeysPersistent(
     m_error.clear();
     m_key_error.clear();
     m_permanent_error = false;
+    // The fresh-lineage journal lives in the same directory under its own
+    // namespace; it is opened lazily once the fresh lineage id is known.
+    m_store_directory = store_directory;
+    m_fresh_scope.SetNull();
+    m_fresh_store = FinalitySignerStore{};
+    m_fresh_last_signed = -1;
+    m_fresh_error.clear();
+    m_fresh_permanent_error = false;
     return true;
 }
 
@@ -926,6 +941,18 @@ std::vector<FinalitySig> FinalitySigner::MaybeSign(const FinalityTracker& tracke
                                                    const Consensus::Params& params, FinalitySignaturePool& pool,
                                                    const BridgeStateIndex* bridge_index)
 {
+    std::vector<FinalitySig> out{MaybeSignV1(tracker, chain, params, pool, bridge_index)};
+    // Regtest staging signer only (no-op unless params.fresh_lineage has
+    // staging_signer). Runs even when the V1 pass refused (orphan lock,
+    // broken V1 lineage): the fresh journal is independent (RT4 item 2).
+    MaybeSignFresh(tracker, chain, params, pool.Fresh(), bridge_index);
+    return out;
+}
+
+std::vector<FinalitySig> FinalitySigner::MaybeSignV1(const FinalityTracker& tracker, const CChain& chain,
+                                                     const Consensus::Params& params, FinalitySignaturePool& pool,
+                                                     const BridgeStateIndex* bridge_index)
+{
     std::vector<FinalitySig> out;
     if (m_keys.empty() || !params.legacy_b3coin || !params.modern_pos) return out;
     if (!EnsurePersistentSafety(tracker, chain, params, bridge_index)) {
@@ -1032,6 +1059,274 @@ std::vector<FinalitySig> FinalitySigner::MaybeSign(const FinalityTracker& tracke
             continue;
         }
         m_last_signed = h;
+        out.push_back(std::move(sig));
+    }
+    return out;
+}
+
+// ------------------------------- fresh lineage (bridge V2 stage S3, regtest staging)
+
+void FinalitySigner::FailFresh(std::string error, const bool permanent)
+{
+    if (m_fresh_error != error) {
+        LogError("finality signer (fresh lineage, regtest staging): disabled safely: %s", error);
+    }
+    m_fresh_error = std::move(error);
+    m_fresh_permanent_error = m_fresh_permanent_error || permanent;
+}
+
+bool FinalitySigner::EnsureFreshPersistentSafety(const FreshLineageState& state, const CChain& chain,
+                                                 const Consensus::Params& params,
+                                                 const BridgeStateIndex* bridge_index)
+{
+    if (m_fresh_scope != state.lineage_id) {
+        // Another fresh lineage (first use, or a reorg across GENESIS_HEIGHT)
+        // has its own journal, watermark and error state; this holds for an
+        // offline signer's in-memory watermark too. A journal of an earlier
+        // lineage is left untouched on disk and never consulted.
+        m_fresh_scope = state.lineage_id;
+        m_fresh_store = FinalitySignerStore{};
+        m_fresh_last_signed = -1;
+        m_fresh_error.clear();
+        m_fresh_permanent_error = false;
+    }
+    if (m_store_directory.empty()) return true; // unit-test/offline signer
+    if (m_fresh_permanent_error) return false;
+    if (!m_fresh_store.IsOpen()) {
+        // Never the V1 journal: its own file name and magic, so a V1 orphan
+        // lock neither blocks nor is touched by fresh-lineage votes.
+        FinalitySignerStore store;
+        std::string error;
+        if (!store.Open(m_store_directory, state.lineage_id, m_validator_key, error,
+                        FinalitySignerNamespace::FRESH_LINEAGE_V2)) {
+            FailFresh(strprintf("cannot open the fresh-lineage signer journal: %s", error));
+            return false;
+        }
+        m_fresh_store = std::move(store);
+    }
+
+    const CBlockIndex* tip{chain.Tip()};
+    const auto domain{params.legacy_final_hash
+                          ? modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)
+                          : std::nullopt};
+    if (!tip || !params.modern_pos || !domain || state.genesis_height < 0) {
+        FailFresh("fresh-lineage schedule is not configured", /*permanent=*/false);
+        return false;
+    }
+    const Consensus::ModernPosParams& pos{*params.modern_pos};
+    const int genesis{state.genesis_height};
+
+    // An absent journal is ambiguous once this validator could hold a live,
+    // unrecorded fresh vote: V1's rule, unchanged, on the fresh state. Before
+    // the first included fresh certificate every fresh-signable checkpoint
+    // counts, member or not: a same-lineage fork diverging after R_f - 1 may
+    // have rotated and seated this validator in a later committee. Once a
+    // fresh certificate is included, only unfinalized fresh-signable
+    // checkpoints in the {current, current-1} window where this validator is
+    // a member count, so a genuine newcomer can arm before its first seat.
+    if (m_fresh_store.IsAbsent()) {
+        const int signable_to{tip->nHeight - pos.checkpoint_depth};
+        int highest_signable{-1};
+        if (signable_to > genesis) {
+            highest_signable = signable_to - ((signable_to - genesis) % pos.checkpoint_interval);
+        }
+        bool may_hide_live_vote{false};
+        if (highest_signable > genesis) {
+            if (!state.finalized) {
+                may_hide_live_vote = true;
+            } else {
+                int h{std::max(genesis + pos.checkpoint_interval, state.finalized->height + 1)};
+                const int rem{(h - genesis) % pos.checkpoint_interval};
+                if (rem != 0) h += pos.checkpoint_interval - rem;
+                for (; h <= highest_signable; h += pos.checkpoint_interval) {
+                    const auto epoch{modern::EpochOfHeight(state.epoch_starts, h)};
+                    const auto set{epoch ? state.SetForEpoch(*epoch) : nullptr};
+                    if (set && set->IndexOf(m_validator_key)) {
+                        may_hide_live_vote = true;
+                        break;
+                    }
+                }
+            }
+        }
+        std::string error;
+        if (may_hide_live_vote) {
+            FailFresh(strprintf("fresh-lineage signer journal is absent after fresh checkpoint %d became signable; refusing to recreate a possibly deleted anti-equivocation record",
+                                highest_signable),
+                      /*permanent=*/false);
+            return false;
+        }
+        if (!m_fresh_store.InitializeEmpty(error)) {
+            FailFresh(strprintf("cannot initialize the fresh-lineage signer journal: %s", error));
+            return false;
+        }
+    }
+
+    const FinalitySignerState& persisted{*m_fresh_store.State()};
+    m_fresh_last_signed = persisted.last_signed_height;
+    if (persisted.lock_height < 0) {
+        m_fresh_error.clear();
+        return true;
+    }
+    const CBlockIndex* locked{chain[persisted.lock_height]};
+    if (locked && locked->GetBlockHash() == persisted.lock_block_hash) {
+        m_fresh_error.clear();
+        return true;
+    }
+
+    // The voted branch disappeared. As in V1, the sole lock-change proof is a
+    // strictly newer fresh-lineage certificate that consensus validated and
+    // included on this active chain, signed by the exact same fresh epoch and
+    // ruleset-2 committee. There are no pinned or operator recoveries for the
+    // fresh lineage.
+    std::string refusal;
+    const auto& finalized{state.finalized};
+    const bool newer_certificate{finalized.has_value() && finalized->height > persisted.lock_height &&
+                                 finalized->certified_at > finalized->height &&
+                                 chain[finalized->certified_at] != nullptr};
+    if (!newer_certificate) {
+        refusal = strprintf(
+            "active chain does not descend from signed fresh-lineage checkpoint %d %s and has no newer included fresh-lineage certificate; refusing to vote on this fork",
+            persisted.lock_height, persisted.lock_block_hash.ToString());
+    } else {
+        const auto hash_at{[&chain](const int h) -> std::optional<uint256> {
+            const CBlockIndex* index{chain[h]};
+            if (!index) return std::nullopt;
+            return index->GetBlockHash();
+        }};
+        const auto fb{ExpectedFinalizedBlockV2(finalized->epoch, finalized->height, state, hash_at, params,
+                                               bridge_index)};
+        const auto finalized_set{state.SetForEpoch(finalized->epoch)};
+        if (!fb || modern::FinalityCertIdV2(*fb) != finalized->cert_id) {
+            refusal = "cannot reconstruct the included fresh-lineage certificate used to move the ancestry lock";
+        } else if (!finalized_set) {
+            refusal = "cannot reconstruct the fresh committee that signed the included certificate";
+        } else if (finalized->epoch != persisted.lock_epoch ||
+                   finalized_set->set_hash != persisted.lock_signing_set_hash) {
+            refusal = "included fresh-lineage certificate does not use the exact fresh epoch and committee of the orphaned signer lock";
+        } else {
+            std::string error;
+            if (!m_fresh_store.CommitCertifiedAnchor(finalized->height, finalized->block_hash,
+                                                     modern::FinalityDigestV2(*domain, *fb), finalized->epoch,
+                                                     finalized_set->set_hash, fb->validator_set_hash, error)) {
+                FailFresh(strprintf("cannot persist the certified fresh-lineage ancestry lock: %s", error));
+                return false;
+            }
+            m_fresh_error.clear();
+            return true;
+        }
+    }
+    FailFresh(refusal, /*permanent=*/false);
+    return false;
+}
+
+std::vector<FreshLineageSig> FinalitySigner::MaybeSignFresh(const FinalityTracker& tracker, const CChain& chain,
+                                                            const Consensus::Params& params,
+                                                            FreshLineageSignaturePool& pool,
+                                                            const BridgeStateIndex* bridge_index)
+{
+    // Regtest params are the only producer of staging_signer = true
+    // (-b3freshlineageheight); mainnet and testnet never reach past here.
+    if (m_keys.empty() || !params.fresh_lineage || !params.fresh_lineage->staging_signer ||
+        !params.legacy_b3coin || !params.modern_pos) {
+        return {};
+    }
+    std::vector<FreshLineageSig> out{SignFresh(tracker, chain, params, pool, bridge_index)};
+    // The V1 staking status shows V1 only: leave the fresh watermark and
+    // refusal where getfinalitylineage reads them (node-local).
+    pool.ReportLocalSigner(m_fresh_last_signed, m_fresh_error);
+    return out;
+}
+
+std::vector<FreshLineageSig> FinalitySigner::SignFresh(const FinalityTracker& tracker, const CChain& chain,
+                                                       const Consensus::Params& params,
+                                                       FreshLineageSignaturePool& pool,
+                                                       const BridgeStateIndex* bridge_index)
+{
+    std::vector<FreshLineageSig> out;
+    const CBlockIndex* tip{chain.Tip()};
+    const auto domain{params.legacy_final_hash
+                          ? modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)
+                          : std::nullopt};
+    if (!tip || !domain) return out;
+    const Consensus::ModernPosParams& pos{*params.modern_pos};
+
+    // The fresh state of the tip. One block early (tip == R_f - 1) the
+    // projection for R_f already names the lineage, so the journal can be
+    // established before any fresh checkpoint becomes signable.
+    std::optional<FreshLineageState> projected;
+    const FreshLineageState* state{nullptr};
+    if (const auto& current{tracker.Current().fresh}; current && current->bootstrapped) {
+        state = &*current;
+    } else if (tip->nHeight + 1 == params.fresh_lineage->activation_height) {
+        projected = tracker.Projected(tip->nHeight + 1, params).fresh;
+        if (projected && projected->bootstrapped) state = &*projected;
+    }
+    if (!state || state->lineage_broken) return out;
+    if (!EnsureFreshPersistentSafety(*state, chain, params, bridge_index)) return out;
+
+    int deepest{std::max(m_fresh_last_signed, state->genesis_height)};
+    if (state->finalized) deepest = std::max(deepest, state->finalized->height);
+    // Never propose at or below the durable fresh ancestry lock.
+    if (m_fresh_store.IsOpen() && m_fresh_store.State()) {
+        deepest = std::max(deepest, m_fresh_store.State()->lock_height);
+    }
+    // The fresh grid is anchored at GENESIS_HEIGHT (on the V1 grid by the
+    // knob's own check); the local signing delay applies as in V1.
+    const auto signing_window{m_signing_policy.Checkpoints(tip->nHeight, pos.checkpoint_depth,
+                                                           state->genesis_height, pos.checkpoint_interval,
+                                                           deepest)};
+    if (!signing_window) return out;
+    const auto hash_at{[&chain](const int h) -> std::optional<uint256> {
+        const CBlockIndex* index{chain[h]};
+        if (!index) return std::nullopt;
+        return index->GetBlockHash();
+    }};
+    for (int64_t candidate{signing_window->first_checkpoint}; candidate <= signing_window->last_checkpoint;
+         candidate += pos.checkpoint_interval) {
+        const int h{static_cast<int>(candidate)};
+        const auto epoch{modern::EpochOfHeight(state->epoch_starts, h)};
+        if (!epoch) continue;
+        const auto set{state->SetForEpoch(*epoch)};
+        if (!set) continue;
+        const auto index{set->IndexOf(m_validator_key)};
+        if (!index) continue;
+        // B-37 (per-epoch fresh keys) is out of this slice: the committee
+        // records the V1 FINALITY_KEY binding key, so the V1 key signs.
+        const bls::SecretKey* key{KeyFor(set->members->Members()[*index].bls_pubkey)};
+        if (!key) continue;
+        const auto fb{ExpectedFinalizedBlockV2(*epoch, h, *state, hash_at, params, bridge_index)};
+        if (!fb) continue;
+        const uint256 digest{modern::FinalityDigestV2(*domain, *fb)};
+        FreshLineageSig sig;
+        sig.lineage_id = state->lineage_id;
+        sig.epoch = *epoch;
+        sig.height = static_cast<uint64_t>(h);
+        sig.index = *index;
+        sig.signature = key->Sign(std::span<const unsigned char>(digest.begin(), 32)).Compressed();
+        // Persist the exact vote and its ancestry lock in the fresh journal
+        // before the vote reaches even the node-local pool.
+        if (m_fresh_store.IsOpen()) {
+            std::string error;
+            if (!m_fresh_store.CommitSignedCheckpoint(h, fb->block_hash, digest, *epoch, set->set_hash,
+                                                      fb->validator_set_hash, error)) {
+                FailFresh(strprintf("cannot persist fresh-lineage checkpoint %d before signing relay: %s", h, error));
+                break;
+            }
+            m_fresh_last_signed = h;
+        }
+        const FreshLineageSignaturePool::Accept accepted{pool.Submit(sig, tracker, chain, params, bridge_index)};
+        if (accepted == FreshLineageSignaturePool::Accept::POOL_FULL) {
+            // Older than every retained slot: recorded as signed, not relayed.
+            m_fresh_last_signed = h;
+            continue;
+        }
+        if (accepted != FreshLineageSignaturePool::Accept::ACCEPTED &&
+            accepted != FreshLineageSignaturePool::Accept::DUPLICATE) {
+            LogDebug(BCLog::VALIDATION, "finality signer (fresh lineage): own vote for %d not pooled (%s)\n", h,
+                     FreshLineageSignaturePool::AcceptName(accepted));
+            continue;
+        }
+        m_fresh_last_signed = h;
         out.push_back(std::move(sig));
     }
     return out;

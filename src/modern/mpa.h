@@ -48,6 +48,10 @@ namespace modern {
  *   8  FlowMesh checkpoint                 known; A3 height-gated
  *   9  FlowMesh vault effect proof         known; A3 height-gated
  *  10  Ethereum bridge record              known; bridge-height-gated
+ *  11  FINALITY_CERTIFICATE_V2             known; fresh-lineage-height-gated
+ *      (fresh finality lineage, digest V2; coinbase-only, no metadata cell;
+ *      the fresh-lineage activation height is unset on every shipped network
+ *      and only regtest's -b3freshlineageheight knob sets it)
  * Every other (type, version) is UNKNOWN. Unknown -> invalid; known but not
  * activated -> invalid; known and activated -> parsed with that type's exact
  * grammar. There is no generic/user-data record type.
@@ -72,12 +76,13 @@ namespace modern {
  * against the derived binding index plus an in-block overlay.
  */
 
-//! Frozen record type numbers (see creation_action.h for 1-10).
+//! Frozen record type numbers (see creation_action.h for 1-11).
 inline constexpr uint16_t MPA_TYPE_FINALITY_CERTIFICATE{CREATION_ACTION_FINALITY_CERTIFICATE};
 inline constexpr uint16_t MPA_TYPE_FINALITY_KEY_EVIDENCE{CREATION_ACTION_FINALITY_KEY_EVIDENCE};
 inline constexpr uint16_t MPA_TYPE_FLOWMESH_CHECKPOINT{CREATION_ACTION_FLOWMESH_CHECKPOINT};
 inline constexpr uint16_t MPA_TYPE_FLOWMESH_VAULT_PROOF{CREATION_ACTION_FLOWMESH_VAULT_PROOF};
 inline constexpr uint16_t MPA_TYPE_BRIDGE{CREATION_ACTION_BRIDGE};
+inline constexpr uint16_t MPA_TYPE_FINALITY_CERTIFICATE_V2{CREATION_ACTION_FINALITY_CERTIFICATE_V2};
 inline constexpr uint16_t MPA_VERSION_V1{1};
 
 enum class PayloadTypeStatus { UNKNOWN, INACTIVE, ACTIVE };
@@ -122,6 +127,15 @@ inline PayloadTypeStatus GetPayloadTypeStatus(const uint16_t type, const uint16_
         // that configuration in the transition release; unconfigured
         // networks remain fail-closed.
         return Consensus::ModernObjectRulesActive(params) ? PayloadTypeStatus::ACTIVE : PayloadTypeStatus::INACTIVE;
+    case MPA_TYPE_FINALITY_CERTIFICATE_V2:
+        // Fresh finality lineage (digest V2): live from R_f on a chain whose
+        // consensus configures Params::fresh_lineage on top of the X-pin
+        // configuration. No shipped network configures it, and a caller
+        // without a height fails closed.
+        return height && Consensus::ModernObjectRulesActive(params) &&
+                       params.FreshLineageRulesActive(*height)
+                   ? PayloadTypeStatus::ACTIVE
+                   : PayloadTypeStatus::INACTIVE;
     default:
         return PayloadTypeStatus::UNKNOWN;
     }
@@ -151,6 +165,12 @@ inline bool PayloadSizeAllowed(const uint16_t type, const size_t size)
                size <= FLOWMESH_VAULT_PROOF_RECORD_MAX_SIZE;
     case MPA_TYPE_BRIDGE:
         return size >= 2 && size <= bridge::MAX_BRIDGE_RECORD_SIZE;
+    case MPA_TYPE_FINALITY_CERTIFICATE_V2:
+        // FinalizedBlockV2(185) || bitmap(ceil(n/8), 1..1024) || sig(96): every
+        // size in this range is the exact length for some set size n; the
+        // exact width is checked when the payload is decoded for the epoch's n.
+        return size >= FINALITY_CERTIFICATE_V2_RECORD_MIN &&
+               size <= FINALITY_CERTIFICATE_V2_RECORD_MAX;
     default:
         return false;
     }

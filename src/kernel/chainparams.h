@@ -228,6 +228,14 @@ public:
         //! Parsed -b3bridgepins file; applied only together with
         //! flowmesh_test.
         std::optional<B3RegTestBridgePins> bridge_pins{};
+        //! -b3freshlineageheight (R_f) and -b3freshmaxepochextension: the
+        //! fresh finality lineage with the B-7 staging signer (bridge V2
+        //! regtest plan section 3.3). Applied only together with
+        //! flowmesh_test; R_f - 1 must lie on the V1 checkpoint grid.
+        std::optional<int> fresh_lineage_height{};
+        std::optional<int> fresh_max_epoch_extension{};
+        //! B-23's fresh-lineage extension on regtest profile R.
+        static constexpr int DEFAULT_FRESH_MAX_EPOCH_EXTENSION{1'280};
     };
 
     struct RegTestOptions {

@@ -7,6 +7,7 @@
 #include <consensus/params.h>
 #include <crypto/bls.h>
 #include <modern/finality_types.h>
+#include <node/finality_fresh_signature.h>
 #include <node/finality_signer_store.h>
 #include <node/finality_signing_policy.h>
 #include <node/finality_tracker.h>
@@ -126,6 +127,12 @@ public:
     size_t TrackedCheckpoints() const { return m_slots.size(); }
     size_t SignatureCount(uint64_t epoch, uint64_t height) const;
 
+    //! The fresh-lineage vote pool (bridge V2 S3, regtest knob only). It is
+    //! owned here so every holder of the V1 pool (Chainstate, tests) reaches
+    //! it; it shares no slot, bound or verification with the V1 pool.
+    FreshLineageSignaturePool& Fresh() { return m_fresh; }
+    const FreshLineageSignaturePool& Fresh() const { return m_fresh; }
+
     struct CheckpointStatus {
         modern::FinalizedBlock checkpoint;
         uint256 signing_set_hash;
@@ -171,6 +178,7 @@ private:
         std::map<uint32_t, std::array<unsigned char, modern::BLS_SIGNATURE_SIZE>> sigs; // index -> signature
     };
     std::map<std::pair<uint64_t, uint64_t>, Slot> m_slots;
+    FreshLineageSignaturePool m_fresh;
 };
 
 /**
@@ -237,13 +245,66 @@ public:
      * Sign every checkpoint now signable and not yet signed; the produced
      * messages are already submitted to `pool` (self-aggregation) and are
      * returned for network relay. `tracker` must be synced to the tip.
+     *
+     * With the regtest staging signer configured (Consensus::Params::
+     * fresh_lineage with staging_signer, only the -b3freshlineageheight knob
+     * sets it), the same call afterwards runs MaybeSignFresh into
+     * pool.Fresh(), whether or not the V1 pass refused. The return value and
+     * every V1 effect (journal, watermark, LastError) are unchanged by it.
      */
     std::vector<FinalitySig> MaybeSign(const FinalityTracker& tracker, const CChain& chain,
                                        const Consensus::Params& params,
                                        FinalitySignaturePool& pool,
                                        const BridgeStateIndex* bridge_index = nullptr);
 
+    /**
+     * Regtest staging signer for the fresh lineage (bridge V2 S3; finality
+     * dependency section 8, B-7): the V1 single-vote logic, unchanged, over
+     * the fresh state and digest V2. Signs each fresh checkpoint on the grid
+     * above GENESIS_HEIGHT once the depth is reached, strictly increasing,
+     * with the BLS key the fresh committee records for this validator (the
+     * V1 FINALITY_KEY binding keys: per-epoch keys, B-37, are a later slice).
+     * A persistent signer first records every vote in its own
+     * FRESH_LINEAGE_V2 journal keyed by the lineage id, never the V1 one.
+     * Failures are reported through FreshLastError() and, with the
+     * watermark, into pool.ReportLocalSigner() for getfinalitylineage (the
+     * V1 LastError() and staking status are unchanged). No-op unless the
+     * staging signer is configured. Returns the votes submitted to `pool`;
+     * they have no P2P relay in this slice (see FreshLineageSig).
+     */
+    std::vector<FreshLineageSig> MaybeSignFresh(const FinalityTracker& tracker, const CChain& chain,
+                                                const Consensus::Params& params,
+                                                FreshLineageSignaturePool& pool,
+                                                const BridgeStateIndex* bridge_index = nullptr);
+    int FreshLastSignedHeight() const { return m_fresh_last_signed; }
+    const std::string& FreshLastError() const { return m_fresh_error; }
+    //! The fresh-lineage journal (open only for a persistent signer once the
+    //! fresh lineage id is known).
+    const FinalitySignerStore& FreshStore() const { return m_fresh_store; }
+
 private:
+    //! The V1 signing pass (the pre-S3 MaybeSign body, unchanged).
+    std::vector<FinalitySig> MaybeSignV1(const FinalityTracker& tracker, const CChain& chain,
+                                         const Consensus::Params& params,
+                                         FinalitySignaturePool& pool,
+                                         const BridgeStateIndex* bridge_index);
+    //! MaybeSignFresh after its configuration guard: the signing pass.
+    std::vector<FreshLineageSig> SignFresh(const FinalityTracker& tracker, const CChain& chain,
+                                           const Consensus::Params& params,
+                                           FreshLineageSignaturePool& pool,
+                                           const BridgeStateIndex* bridge_index);
+    //! Fresh-lineage counterpart of EnsurePersistentSafety for `state`'s
+    //! lineage: resets the watermark and errors on a lineage change (offline
+    //! signers too), opens the FRESH_LINEAGE_V2 journal, initializes an
+    //! absent one under V1's rule (never once a fresh checkpoint is signable
+    //! before the first included fresh certificate; afterwards only when no
+    //! unfinalized window checkpoint seats this validator), and moves the
+    //! lock only on a newer included V2 certificate of the same fresh epoch
+    //! and set.
+    bool EnsureFreshPersistentSafety(const FreshLineageState& state, const CChain& chain,
+                                     const Consensus::Params& params,
+                                     const BridgeStateIndex* bridge_index);
+    void FailFresh(std::string error, bool permanent = true);
     bool EnsurePersistentSafety(const FinalityTracker& tracker,
                                 const CChain& chain,
                                 const Consensus::Params& params,
@@ -304,6 +365,17 @@ private:
     //! Recoverable key availability is separate from durable safety failures.
     std::string m_key_error;
     bool m_permanent_error{false};
+
+    //! Fresh lineage (regtest staging signer). The journal directory of a
+    //! persistent signer (empty for an offline/test signer, which keeps only
+    //! the in-memory watermark, exactly like the V1 offline signer).
+    fs::path m_store_directory;
+    //! The fresh lineage id the fresh journal, watermark and errors belong to.
+    uint256 m_fresh_scope{};
+    FinalitySignerStore m_fresh_store;
+    int m_fresh_last_signed{-1};
+    std::string m_fresh_error;
+    bool m_fresh_permanent_error{false};
 };
 
 } // namespace node

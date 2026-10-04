@@ -28,7 +28,10 @@ namespace modern {
  *
  * Declared costs (frozen): FINALITY_CERTIFICATE 2,000; FINALITY_KEY_EVIDENCE
  * 700; FLOWMESH_SEAT_BINDING 700; FLOWMESH_CHECKPOINT 6,000;
- * FLOWMESH_VAULT_PROOF 500; BRIDGE_V1 12,000. A bridge record consumes the
+ * FLOWMESH_VAULT_PROOF 500; BRIDGE_V1 12,000; FINALITY_CERTIFICATE_V2 (fresh
+ * lineage, type 11) 2,000 -- the same single FastAggregateVerify as type 4
+ * plus a few fixed-size hashes, so a coinbase carrying one V1 and one V2
+ * certificate declares 4,000. A bridge record consumes the
  * complete per-transaction budget because its inner kind may perform a
  * 512-key BLS aggregate check plus SSZ/Keccak/MPT verification. The type-8
  * cost admits at most two checkpoints under the frozen 12,000-unit
@@ -51,6 +54,7 @@ inline int64_t PayloadRecordVerifyCost(const uint16_t type, const uint16_t versi
     case CREATION_ACTION_FLOWMESH_CHECKPOINT: return FLOWMESH_CHECKPOINT_VERIFY_COST;
     case CREATION_ACTION_FLOWMESH_VAULT_PROOF: return FLOWMESH_VAULT_PROOF_VERIFY_COST;
     case CREATION_ACTION_BRIDGE: return BRIDGE_VERIFY_COST;
+    case CREATION_ACTION_FINALITY_CERTIFICATE_V2: return FINALITY_CERTIFICATE_VERIFY_COST;
     default: return 0;
     }
 }
