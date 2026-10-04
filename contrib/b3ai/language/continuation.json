@@ -1,0 +1,20 @@
+{
+  "schema": "b3-language-continuation-plan/v1",
+  "reason": "first pilot failed writing exam while fixed validation continued improving",
+  "parent_checkpoint": "build-ai/language-runs/mps-language-pilot/model.npz",
+  "parent_sha256": "f758a6f55733d02ec108fa46654578378f41bcac3ac9259e2dc9ab4da0f2750b",
+  "parent_optimizer_steps": 1000,
+  "additional_chunks": 3,
+  "maximum_updates_per_chunk": 1000,
+  "maximum_chain_wall_seconds": 1800,
+  "maximum_wall_seconds_per_chunk": 500,
+  "maximum_supervised_tokens_per_chunk": 8192000,
+  "maximum_process_or_driver_memory_bytes": 34359738368,
+  "weights": "own trained weights from our random-start family; restore AdamW and batch RNG",
+  "invariants": "same model configuration, corpus, runtime and optimization; verified model/checkpoint/batch implementation hashes",
+  "selection": "validation only, retaining the parent baseline when continuation does not improve",
+  "exam": "language_exam_v2.json",
+  "exam_sha256": "90f08d66b73b41b53d33aac718659c9abd68bac47a3854328da0a7ef11b965eb",
+  "exam_policy": "frozen before continuation; generate after the predeclared stage, not at intermediate checkpoints",
+  "qualification": "fresh readability and continuity review after stage; no presumed success or Hive activation"
+}

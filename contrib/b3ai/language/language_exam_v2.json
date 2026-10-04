@@ -1,0 +1,103 @@
+{
+  "schema": "b3-language-continuation-exam/v1",
+  "purpose": "Fresh teacher-authored probes frozen before a predeclared continuation stage. No new checkpoint is selected using their generations.",
+  "use": "Keep out of all training and checkpoint selection; generate only after the predeclared continuation stage. Original exam is now exploratory.",
+  "novelty": "These are separately authored prompts. Individual words or phrases may occur in the public corpus; their absence is not guaranteed.",
+  "generation": {
+    "maximum_new_byte_tokens": 256,
+    "temperatures": [
+      0.0,
+      0.8
+    ],
+    "seed": 1729,
+    "stop": "learned end-of-document token or token budget; preserve raw output"
+  },
+  "review": {
+    "readability": "0: mostly gibberish; 1: readable fragments with broken syntax or repetition; 2: at least one grammatical, understandable complete sentence",
+    "continuity": "0: contradicts or ignores the premise; 1: partly follows it; 2: follows the premise with a plausible continuation",
+    "record": "Store raw text and token IDs, both scores, a brief reason, model/corpus/exam hashes and generation settings. Empty output remains a failure.",
+    "provisional_gate": "For the greedy outputs, at least 18 of 20 score 2 for readability and at least 14 score 2 for continuity. These teacher-chosen pilot thresholds are not a validated benchmark and do not prove assistant reliability."
+  },
+  "prompts": [
+    {
+      "id": "fresh-language-01",
+      "text": "Jia left a cup of water in the freezer. The next morning, when she opened it,"
+    },
+    {
+      "id": "fresh-language-02",
+      "text": "Milo saw his neighbor carrying heavy bags. He walked over and said,"
+    },
+    {
+      "id": "fresh-language-03",
+      "text": "Ella painted a picture of the sea. She chose blue paint because"
+    },
+    {
+      "id": "fresh-language-04",
+      "text": "A red balloon got caught in a tree. The child could not reach it, so"
+    },
+    {
+      "id": "fresh-language-05",
+      "text": "The puppies had been running all afternoon. At last, they lay down and"
+    },
+    {
+      "id": "fresh-language-06",
+      "text": "There was a hole in the bucket. Each time I filled it with water,"
+    },
+    {
+      "id": "fresh-language-07",
+      "text": "The train was about to leave. Ishan found his seat and"
+    },
+    {
+      "id": "fresh-language-08",
+      "text": "Sara and her brother wanted to play different games. After talking,"
+    },
+    {
+      "id": "fresh-language-09",
+      "text": "Grandmother made bread in the kitchen. Soon the house smelled"
+    },
+    {
+      "id": "fresh-language-10",
+      "text": "The snowman stood in the sunshine. As the weather grew warmer,"
+    },
+    {
+      "id": "fresh-language-11",
+      "text": "Tom dropped a glass on the floor. He called an adult to"
+    },
+    {
+      "id": "fresh-language-12",
+      "text": "The ducklings followed their mother into the pond. One little duckling"
+    },
+    {
+      "id": "fresh-language-13",
+      "text": "A girl took her new bicycle to a quiet path. She held the handlebars and"
+    },
+    {
+      "id": "fresh-language-14",
+      "text": "The farmer heard the hens making a loud noise. He went to the coop and"
+    },
+    {
+      "id": "fresh-language-15",
+      "text": "A storm knocked a branch onto the road. The driver slowed down and"
+    },
+    {
+      "id": "fresh-language-16",
+      "text": "Leo wanted to send his friend a birthday card. He wrote a message and"
+    },
+    {
+      "id": "fresh-language-17",
+      "text": "The class visited a garden full of flowers. Their teacher asked them to"
+    },
+    {
+      "id": "fresh-language-18",
+      "text": "A mouse found a crumb under the table. It picked it up and"
+    },
+    {
+      "id": "fresh-language-19",
+      "text": "Rina was learning to tie her shoes. After several tries, she finally"
+    },
+    {
+      "id": "fresh-language-20",
+      "text": "A boy lost his way on a walk. He stopped beside a shop and"
+    }
+  ]
+}
