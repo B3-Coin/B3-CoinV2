@@ -380,6 +380,66 @@ class TeachingTrainTests(unittest.TestCase):
                 language_train.runtime("cpu"), SimpleNamespace(manifest_hash="x"), 2, 0.0003, 1,
                 language_train.implementation_hash(), language_train.component_hashes(), 2)
 
+    def test_final_save_or_device_failure_preserves_selected_and_writes_finite_failure_report(self):
+        real_save, real_sync = train.save_checkpoint, language_train.synchronize
+        cases = (("save-os", OSError), ("save-value", ValueError),
+                 ("save-runtime", RuntimeError), ("device", RuntimeError))
+        for failure_kind, exception_type in cases:
+            with self.subTest(failure=failure_kind):
+                output = self.directory / failure_kind
+                selected_bytes = []
+                problem = "injected final " + failure_kind + " failure"
+                options, expected_steps = {}, 2
+                scorer = contextlib.nullcontext()
+                if failure_kind == "save-os":
+                    # A token stop between scheduled evaluations selects better
+                    # weights only during the final fallback evaluation.
+                    curriculum = Curriculum(self.curriculum_path, context_length=256)
+                    tokens = int(curriculum.batch("train", np.random.default_rng(42), 2)[2].sum())
+                    options = {"evaluation_interval": 3, "max_tokens": tokens}
+                    expected_steps = 1
+                    scorer = mock.patch.object(train, "score", side_effect=[2.0, 3.0, 2.0, 1.0])
+
+                def save(path, *args, **kwargs):
+                    if path.name == "last.npz" and failure_kind != "device":
+                        raise exception_type(problem)
+                    real_save(path, *args, **kwargs)
+                    if path.name == "model.npz":
+                        selected_bytes.append(path.read_bytes())
+
+                def synchronize(device):
+                    if failure_kind == "device" and (output / "last.npz").exists():
+                        raise exception_type(problem)
+                    real_sync(device)
+
+                with scorer, mock.patch.object(train, "save_checkpoint", side_effect=save), \
+                        mock.patch.object(language_train, "synchronize", side_effect=synchronize):
+                    with self.assertRaisesRegex(exception_type, problem):
+                        self.fit(failure_kind, **options)
+                report = json.loads((output / "report.json").read_text(),
+                    parse_constant=lambda value: self.fail("Non-finite failure report constant: " + value))
+                self.assertTrue(report["status"].startswith("failed teaching experiment"))
+                self.assertEqual(report["stop_reason"], "failure")
+                self.assertEqual(report["failure"], problem)
+                self.assertEqual(report["attempted_steps"], expected_steps)
+                self.assertEqual([item["step"] for item in report["history"]], list(range(expected_steps + 1)))
+                self.assertGreater(report["training_tokens"], 0)
+                self.assertTrue(report["selected_checkpoint_available"])
+                self.assertIsNone(report["last_checkpoint_sha256"])
+                self.assertFalse(report["last_state_validation_available"])
+                self.assertEqual((output / "last.npz").exists(), failure_kind == "device")
+                self.assertTrue(selected_bytes)
+                self.assertEqual((output / "model.npz").read_bytes(), selected_bytes[-1])
+                self.assertEqual(report["selected_checkpoint_sha256"], hashlib.sha256(selected_bytes[-1]).hexdigest())
+                model, optimizer, metadata = load_checkpoint(output / "model.npz")
+                self.assert_steps(model, optimizer, report["selected_step"])
+                self.assertEqual(metadata["selected_or_saved_step"], report["selected_step"])
+                self.assertEqual(metadata["validation_loss_at_save"], report["best_validation_loss"])
+                if failure_kind == "save-os":
+                    self.assertEqual(report["selected_step"], 1)
+                    self.assertEqual(report["best_validation_loss"], 1.0)
+                self.assertEqual(self.parent_path.read_bytes(), self.parent_bytes)
+
     def test_existing_output_is_never_overwritten(self):
         output = self.directory / "run"
         output.mkdir()

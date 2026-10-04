@@ -316,12 +316,17 @@ def fit(curriculum_path, output, *, initialize_from, expected_parent_sha256, dev
     stop_now = resource_stop()
     if stop_now is not None:
         stop = stop_now
-    if stop != "memory_limit":
-        try:
-            snapshot("last.npz", attempted, current_validation)
-        except ResourceLimitError as error:
-            stop = error.reason
-    language_train.synchronize(device)
+    report["best_validation_loss"] = best
+    try:
+        if stop != "memory_limit":
+            try:
+                snapshot("last.npz", attempted, current_validation)
+            except ResourceLimitError as error:
+                stop = error.reason
+        language_train.synchronize(device)
+    except (OSError, ValueError, RuntimeError) as error:
+        failure(error)
+        raise
     report.update({"status": "finished teaching experiment; factual answers not qualified", "stop_reason": stop,
                    "best_validation_loss": best, "elapsed_seconds": time.monotonic() - started,
                    "peak_memory": peak, "selected_checkpoint_available": True,
