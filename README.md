@@ -121,20 +121,22 @@ node, wallet, model connection or chain datadir. The manual preview at
 `build/bin/b3_student_ai_preview` uses disposable settings and lessons, without
 starting B3. Pass `--capture-dir /path/to/screenshots` to capture its four tabs
 and compact layout. Pass `--training-report /path/to/report.json` to inspect a
-saved language training report. A preview is disconnected until a service is configured; it does not
+saved language or B3 teaching report. A preview is disconnected until a service is configured; it does not
 simulate successful model replies or invent node observations.
 
-In **Training**, choose a local language `report.json` and click **Refresh
+In **Training**, choose a local student `report.json` and click **Refresh
 progress** to read its latest saved state. The view shows model size, saved and
 attempted local/global updates, processed targets, validation loss and elapsed
-run time. It checks report size, schema and numeric consistency, clears stale
+run time. B3 teaching reports display fresh optimizer updates separately from
+the inherited language updates. They require an explicit optimizer reset and
+reject language-continuation counters. The view checks report size, schema and numeric consistency, clears stale
 values on errors, and retains the path only for the current session. This view
 does not start training or qualify a model for chat or B3 tasks.
 
-Next development milestones are a reproducible B3 question/task evaluation set,
-teacher-reviewed improvement experiments and then additional task tools with
-appropriate confirmation. Model training and verifiable publication of lesson
-revisions require separate designs and measured results.
+The experiments below include frozen writing and B3 question evaluations.
+Further milestones are reliable dialogue, tool-call evaluations and additional
+task tools with appropriate confirmation. Verifiable publication of lesson
+revisions requires a separate design and measured results.
 
 ### Training our own model from scratch
 

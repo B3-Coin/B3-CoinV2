@@ -216,6 +216,37 @@ private Q_SLOTS:
         QCOMPARE(page.findChild<QLabel*>("aiTrainingTokens")->text(), QStringLiteral("—"));
     }
 
+    void teachingReportsKeepFreshOptimizerAndInheritedUpdatesSeparate()
+    {
+        B3AiPage page{nullptr, path()};
+        const QString reportPath{m_state->filePath(QStringLiteral("teaching-report.json"))};
+        auto report = trainingReport();
+        report.insert(QStringLiteral("stage"), QStringLiteral("b3-supervised-answers"));
+        report.insert(QStringLiteral("optimizer_reset"), true);
+        report.insert(QStringLiteral("inherited_language_steps"), 4000);
+        report.insert(QStringLiteral("training_tokens"), 240000);
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(page.loadTrainingReport(reportPath));
+        const QString expected{QStringLiteral("%1 in B3 teaching · %2 prior language updates")
+            .arg(QLocale().toString(qint64{1000}), QLocale().toString(qint64{4000}))};
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingSavedUpdates")->text(), expected);
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingAttemptedUpdates")->text(), expected);
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingTokens")->text(), QLocale().toString(qint64{240000}));
+        QVERIFY(page.findChild<QLabel*>("aiTrainingStatus")->text().startsWith(QStringLiteral("B3 teaching · ")));
+        report.insert(QStringLiteral("optimizer_reset"), false);
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(!page.loadTrainingReport(reportPath));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingSavedUpdates")->text(), QStringLiteral("—"));
+        report.insert(QStringLiteral("optimizer_reset"), true);
+        report.insert(QStringLiteral("base_step"), 4000);
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(!page.loadTrainingReport(reportPath));
+        report.remove(QStringLiteral("base_step"));
+        report.insert(QStringLiteral("inherited_language_steps"), (1 << 24));
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(!page.loadTrainingReport(reportPath));
+    }
+
     void invalidTrainingSchemaClearsStaleProgress()
     {
         B3AiPage page{nullptr, path()};
