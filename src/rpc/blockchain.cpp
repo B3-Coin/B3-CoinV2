@@ -35,6 +35,7 @@
 #include <modern/fn_pod.h>
 #include <net.h>
 #include <net_processing.h>
+#include <node/finality_fresh_export.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
 #include <consensus/era.h>
@@ -5146,6 +5147,594 @@ static RPCHelpMan getbridgewithdrawalproof()
     };
 }
 
+// ------------------------------------------------------------------------
+// Fresh finality lineage (bridge V2 stage S3, regtest-only knob): status,
+// Verifier V2 calldata export and the hidden vote relay. Every value
+// consumed by Ethereum is "0x"-prefixed raw (EVM-order) bytes, as in
+// getbridgefinalityproof; B3 block hashes without an _evm suffix are in
+// ordinary display order.
+
+namespace {
+
+std::optional<uint256> FreshLineageChainDomain(const Consensus::Params& consensus)
+{
+    if (!consensus.legacy_final_hash) return std::nullopt;
+    return modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash);
+}
+
+void EnsureFreshLineageConfigured(const Consensus::Params& consensus)
+{
+    if (!consensus.fresh_lineage || !consensus.modern_pos) {
+        throw JSONRPCError(RPC_MISC_ERROR,
+                           "The fresh finality lineage is not configured on this chain "
+                           "(regtest-only -b3freshlineageheight)");
+    }
+}
+
+/** Bring the live bridge index (when its rules are active at the tip) and the
+ *  live finality tracker to the active tip; nullptr when unavailable. */
+node::FinalityTracker* SyncFinalityAtTip(Chainstate& chainstate, const Consensus::Params& consensus,
+                                         const node::BridgeStateIndex*& bridge_index)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    bridge_index = nullptr;
+    const CBlockIndex* tip{chainstate.m_chain.Tip()};
+    if (!tip) return nullptr;
+    if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+        node::BridgeStateTracker& bridge{chainstate.ModernBridgeState()};
+        if (!bridge.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) return nullptr;
+        bridge_index = &bridge.Index();
+    }
+    node::FinalityTracker& tracker{chainstate.ModernFinality()};
+    if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip, bridge_index)) return nullptr;
+    return &tracker;
+}
+
+std::vector<RPCResult> FreshSetHeaderDoc()
+{
+    return {
+        {RPCResult::Type::NUM, "epoch", "Fresh-lineage epoch stamped in the header"},
+        {RPCResult::Type::NUM, "ruleset_version", "Always 2 (V1's 110-byte header layout)"},
+        {RPCResult::Type::NUM, "validator_count", "Committee member count"},
+        {RPCResult::Type::NUM, "total_weight", "Whole modern B3"},
+        {RPCResult::Type::NUM, "quorum_weight", "Required signed weight, floor(2W/3)+1"},
+        {RPCResult::Type::STR_HEX, "aggregate_pubkey", "Compressed aggregate BLS public key"},
+        {RPCResult::Type::STR_HEX, "members_root", "Depth-13 ordered member-tree root"},
+        {RPCResult::Type::STR_HEX, "set_hash", "keccak256(encoded_header)"},
+        {RPCResult::Type::STR_HEX, "encoded_header", "Canonical 110-byte header"},
+    };
+}
+
+UniValue FreshSetHeaderToJSON(const modern::ValidatorSetHeader& header, const uint256& set_hash)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("epoch", header.epoch);
+    out.pushKV("ruleset_version", header.ruleset_version);
+    out.pushKV("validator_count", header.validator_count);
+    out.pushKV("total_weight", header.total_weight);
+    out.pushKV("quorum_weight", header.quorum_weight);
+    out.pushKV("aggregate_pubkey", EvmHex(header.aggregate_pubkey));
+    out.pushKV("members_root", EvmHex(header.members_root));
+    out.pushKV("set_hash", EvmHex(set_hash));
+    out.pushKV("encoded_header", EvmHex(header.Encode()));
+    return out;
+}
+
+UniValue FreshHistoryPathToJSON(const modern::FinalityHistoryPathV2& path)
+{
+    UniValue out{UniValue::VARR};
+    for (const uint256& sibling : path) out.push_back(EvmHex(sibling));
+    return out;
+}
+
+struct FreshCertificateContext {
+    node::FreshLineageRelayArtifacts artifacts;
+    int inclusion_height{-1};
+    uint256 inclusion_hash{};
+    int genesis_height{-1};
+    uint256 genesis_block_hash{};
+    int prev_height{-1};
+    uint256 prev_block_hash{};
+    uint256 digest{};
+    uint256 cert_id{};
+};
+
+/** Reconstruct the exact parent-derived fresh-lineage state for a historical
+ *  block, re-judge its type-11 record and build the Verifier V2 artifacts
+ *  (the fresh counterpart of BuildBridgeCertificateContext). */
+std::optional<FreshCertificateContext> BuildFreshCertificateContext(
+    Chainstate& chainstate, const Consensus::Params& consensus, const CBlockIndex& inclusion,
+    const std::optional<uint64_t> requested_prev_index, std::string& error) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    auto fail{[&](std::string message) -> std::optional<FreshCertificateContext> {
+        error = std::move(message);
+        return std::nullopt;
+    }};
+    if (!consensus.fresh_lineage || !consensus.modern_pos) return fail("fresh finality lineage is not configured");
+    const Consensus::FreshLineageParams& fl{*consensus.fresh_lineage};
+    const int interval{consensus.modern_pos->checkpoint_interval};
+    if (!inclusion.pprev || chainstate.m_chain[inclusion.nHeight] != &inclusion) {
+        return fail("certificate block is not on the active chain");
+    }
+    const auto chain_domain{FreshLineageChainDomain(consensus)};
+    if (!chain_domain) return fail("the finality chain domain is not pinned");
+    if (inclusion.nHeight < fl.activation_height) {
+        return fail("certificate block is below the fresh lineage activation height");
+    }
+
+    CBlock block;
+    if (!chainstate.m_blockman.ReadBlock(block, inclusion)) {
+        return fail("certificate block data is unavailable (possibly pruned)");
+    }
+    if (block.vtx.empty()) return fail("certificate block has no coinbase");
+
+    // Replay the public indexes to the inclusion parent (as for V1): old
+    // certificates stay reproducible after their committees leave the
+    // retained window, and a block from another fork is rejected.
+    node::BridgeStateTracker bridge_history;
+    const node::BridgeStateIndex* bridge_index{nullptr};
+    if (Consensus::BridgeRulesActive(inclusion.pprev->nHeight, consensus)) {
+        if (!bridge_history.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *inclusion.pprev)) {
+            return fail("historical bridge state is unavailable at certificate parent");
+        }
+        bridge_index = &bridge_history.Index();
+    }
+    node::FinalityTracker finality_history;
+    if (!finality_history.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *inclusion.pprev,
+                               bridge_index)) {
+        return fail("historical finality state is unavailable at certificate parent");
+    }
+    const node::FinalityTracker::State projected{finality_history.Projected(inclusion.nHeight, consensus)};
+    if (!projected.fresh || !projected.fresh->bootstrapped) {
+        return fail("the fresh lineage is not bootstrapped at the certificate block");
+    }
+    const node::FreshLineageState& fresh{*projected.fresh};
+    std::optional<modern::FinalityCertificateV2Record> record;
+    if (!modern::MatchFinalityCertificateV2ForEpoch(
+            *block.vtx.at(0), [&fresh](const uint64_t epoch) { return fresh.SetSize(epoch); }, record, error)) {
+        return std::nullopt;
+    }
+    if (!record) return fail("selected block contains no fresh-lineage certificate");
+    if (!finality_history.CheckBlockCertificate(block, inclusion, consensus, error, bridge_index)) {
+        return std::nullopt;
+    }
+    const modern::FinalizedBlockV2& fb{record->finalized_block};
+    const auto signing{fresh.SetForEpoch(fb.epoch)};
+    const auto successor{fb.epoch == fresh.epoch ? fresh.next : fresh.current};
+    if (!signing || !successor) return fail("certificate signing or successor committee is unavailable");
+
+    // History leaves 0..k-1 of this chain (leaf i at G + i * interval).
+    const uint64_t k{fb.checkpoint_index};
+    std::vector<uint256> leaves;
+    leaves.reserve(k);
+    for (uint64_t i{0}; i < k; ++i) {
+        const int64_t h{int64_t{fresh.genesis_height} + static_cast<int64_t>(i) * interval};
+        const CBlockIndex* ancestor{h <= inclusion.nHeight ? inclusion.GetAncestor(static_cast<int>(h)) : nullptr};
+        if (!ancestor) return fail("a checkpoint history block is unavailable");
+        leaves.push_back(modern::FinalityHistoryLeaf(static_cast<uint64_t>(h), ancestor->GetBlockHash()));
+    }
+    // The verifier's latest accepted checkpoint, by default the previous
+    // fresh-finalized checkpoint of this chain (index 0 = GENESIS_HEIGHT).
+    const uint64_t prev_index{requested_prev_index.value_or(fresh.finalized ? fresh.finalized->checkpoint_index : 0)};
+    if (prev_index >= k) {
+        return fail(strprintf("prev_index %u must be below the certificate's checkpoint index %u", prev_index, k));
+    }
+    auto artifacts{node::BuildFreshLineageRelayArtifacts(*chain_domain, fb, record->certificate, *signing,
+                                                         *successor, leaves, prev_index, error)};
+    if (!artifacts) return std::nullopt;
+
+    FreshCertificateContext out;
+    out.artifacts = std::move(*artifacts);
+    out.inclusion_height = inclusion.nHeight;
+    out.inclusion_hash = inclusion.GetBlockHash();
+    out.genesis_height = fresh.genesis_height;
+    out.genesis_block_hash = fresh.genesis_block_hash;
+    out.prev_height = fresh.genesis_height + static_cast<int>(prev_index) * interval;
+    out.prev_block_hash = inclusion.GetAncestor(out.prev_height)->GetBlockHash();
+    out.digest = modern::FinalityDigestV2(*chain_domain, fb);
+    out.cert_id = modern::FinalityCertIdV2(fb);
+    error.clear();
+    return out;
+}
+
+} // namespace
+
+static RPCHelpMan getfinalitylineage()
+{
+    return RPCHelpMan{
+        "getfinalitylineage",
+        "B3 fresh finality lineage (digest V2) status for the active chain: configuration, lineage id,\n"
+        "genesis checkpoint R_f-1, committee headers by fresh epoch, the finalized V2 checkpoint and the\n"
+        "checkpoint-history frontier. Configured only by the regtest-only -b3freshlineageheight knob;\n"
+        "otherwise only configured=false is returned. Ethereum-facing values are 0x-prefixed EVM-order\n"
+        "bytes; block hashes without an _evm suffix are in ordinary B3 display order.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "",
+                  {
+                      {RPCResult::Type::BOOL, "configured", "Whether this chain configures a fresh finality lineage"},
+                      {RPCResult::Type::BOOL, "staging_signer", /*optional=*/true, "Whether the V1 single-vote signer also signs digest V2 (regtest staging, V1 binding keys)"},
+                      {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "R_f, the first block that can carry a fresh-lineage certificate"},
+                      {RPCResult::Type::NUM, "genesis_height", /*optional=*/true, "GENESIS_HEIGHT = R_f-1, history leaf 0"},
+                      {RPCResult::Type::NUM, "max_epoch_extension", /*optional=*/true, "Blocks a fresh epoch may run past E before the lineage breaks"},
+                      {RPCResult::Type::NUM, "checkpoint_interval", /*optional=*/true, "Checkpoint grid spacing"},
+                      {RPCResult::Type::STR_HEX, "chain_domain", /*optional=*/true, "B3 modern chain domain"},
+                      {RPCResult::Type::NUM, "tip_height", /*optional=*/true, "Active tip height"},
+                      {RPCResult::Type::BOOL, "state_available", /*optional=*/true, "Whether the finality state could be derived at the tip"},
+                      {RPCResult::Type::BOOL, "bootstrapped", /*optional=*/true, "Whether Set'_0 exists on this chain"},
+                      {RPCResult::Type::STR_HEX, "genesis_block_hash", /*optional=*/true, "Block hash at R_f-1 (display order)"},
+                      {RPCResult::Type::STR_HEX, "genesis_block_hash_evm", /*optional=*/true, "Block hash at R_f-1 as signed (raw bytes)"},
+                      {RPCResult::Type::STR_HEX, "genesis_leaf", /*optional=*/true, "historyLeaf(R_f-1, its hash)"},
+                      {RPCResult::Type::STR_HEX, "lineage_id", /*optional=*/true, "TaggedHash(\"B3/FINALITY/LINEAGE/V2\", chain_domain || R_f-1 || hash || genesis_set_hash)"},
+                      {RPCResult::Type::STR_HEX, "genesis_set_hash", /*optional=*/true, "setHash(Set'_0)"},
+                      {RPCResult::Type::NUM, "epoch", /*optional=*/true, "Current fresh-lineage epoch"},
+                      {RPCResult::Type::ARR, "epoch_starts", /*optional=*/true, "First height of every fresh epoch",
+                       {{RPCResult::Type::NUM, "", "Epoch start height"}}},
+                      {RPCResult::Type::BOOL, "handover_certified", /*optional=*/true, "Whether the current epoch's handover certificate is included"},
+                      {RPCResult::Type::BOOL, "lineage_broken", /*optional=*/true, "Whether the lineage broke for good (no further V2 certificate is valid)"},
+                      {RPCResult::Type::NUM, "break_height", /*optional=*/true, "First height at which the current epoch breaks without a handover"},
+                      {RPCResult::Type::OBJ, "genesis_set", /*optional=*/true, "Set'_0 (epoch 0)", FreshSetHeaderDoc()},
+                      {RPCResult::Type::OBJ, "previous_set", /*optional=*/true, "Set'_{epoch-1}", FreshSetHeaderDoc()},
+                      {RPCResult::Type::OBJ, "current_set", /*optional=*/true, "Set'_epoch", FreshSetHeaderDoc()},
+                      {RPCResult::Type::OBJ, "next_set", /*optional=*/true, "Set'_{epoch+1}", FreshSetHeaderDoc()},
+                      {RPCResult::Type::OBJ, "finalized", /*optional=*/true, "The latest fresh-finalized checkpoint",
+                       {
+                           {RPCResult::Type::NUM, "height", "Certified height"},
+                           {RPCResult::Type::STR_HEX, "block_hash", "Certified hash (display order)"},
+                           {RPCResult::Type::STR_HEX, "block_hash_evm", "Certified hash as signed (raw bytes)"},
+                           {RPCResult::Type::NUM, "epoch", "Signing epoch"},
+                           {RPCResult::Type::NUM, "checkpoint_index", "History index"},
+                           {RPCResult::Type::STR_HEX, "checkpoint_history_root", "Root over history leaves 0..checkpoint_index-1"},
+                           {RPCResult::Type::STR_HEX, "cert_id", "keccak256(FinalizedBlockV2)"},
+                           {RPCResult::Type::NUM, "certified_at", "Height of the block that carried the certificate"},
+                       }},
+                      {RPCResult::Type::OBJ, "history", /*optional=*/true, "Checkpoint-history frontier at the tip",
+                       {
+                           {RPCResult::Type::NUM, "checkpoint_count", "Grid checkpoints from R_f-1 through the tip (history leaves 0..count-1)"},
+                           {RPCResult::Type::NUM, "last_checkpoint_height", "Height of leaf checkpoint_count-1"},
+                           {RPCResult::Type::STR_HEX, "root", "Depth-32 root over leaves 0..checkpoint_count-1"},
+                           {RPCResult::Type::NUM, "finalized_leaf_count", "Leaves held by the consensus accumulator (through the finalized index)"},
+                       }},
+                      {RPCResult::Type::NUM, "pool_checkpoints", /*optional=*/true, "Checkpoints tracked by the local fresh-lineage vote pool (finalized ones are reclaimed on the next submission, as in the V1 pool)"},
+                      {RPCResult::Type::OBJ, "local_signer", /*optional=*/true, "Node-local staging signer status, present once this node's finality signer ran a fresh-lineage pass (the staking status reports the V1 signer only; fresh votes have no P2P relay and are moved with getfinalitylineagevotes / submitfinalitylineagevote)",
+                       {
+                           {RPCResult::Type::NUM, "last_signed_height", "Anti-repeat watermark: the highest fresh checkpoint this node's signer recorded, or -1"},
+                           {RPCResult::Type::STR, "last_error", "Why fresh-lineage signing is currently disabled (absent journal, orphan lock, journal failure), or empty"},
+                       }},
+                  }},
+        RPCExamples{HelpExampleCli("getfinalitylineage", "") + HelpExampleRpc("getfinalitylineage", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            UniValue result{UniValue::VOBJ};
+            const bool configured{consensus.fresh_lineage.has_value() && consensus.modern_pos.has_value()};
+            result.pushKV("configured", configured);
+            if (!configured) return result;
+            const Consensus::FreshLineageParams& fl{*consensus.fresh_lineage};
+            const int interval{consensus.modern_pos->checkpoint_interval};
+            result.pushKV("staging_signer", fl.staging_signer);
+            result.pushKV("activation_height", fl.activation_height);
+            result.pushKV("genesis_height", fl.GenesisHeight());
+            result.pushKV("max_epoch_extension", fl.max_epoch_extension);
+            result.pushKV("checkpoint_interval", interval);
+            if (const auto domain{FreshLineageChainDomain(consensus)}) result.pushKV("chain_domain", EvmHex(*domain));
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            result.pushKV("tip_height", tip ? tip->nHeight : -1);
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            const node::FinalityTracker* tracker{SyncFinalityAtTip(chainstate, consensus, bridge_index)};
+            result.pushKV("state_available", tracker != nullptr);
+            if (tracker) {
+                const std::optional<node::FreshLineageState>& fresh{tracker->Current().fresh};
+                result.pushKV("bootstrapped", fresh.has_value() && fresh->bootstrapped);
+                if (fresh) {
+                    result.pushKV("genesis_block_hash", fresh->genesis_block_hash.GetHex());
+                    result.pushKV("genesis_block_hash_evm", EvmHex(fresh->genesis_block_hash));
+                    result.pushKV("genesis_leaf",
+                                  EvmHex(modern::FinalityHistoryLeaf(static_cast<uint64_t>(fresh->genesis_height),
+                                                                     fresh->genesis_block_hash)));
+                }
+                if (fresh && fresh->bootstrapped) {
+                    result.pushKV("lineage_id", EvmHex(fresh->lineage_id));
+                    if (fresh->genesis) result.pushKV("genesis_set_hash", EvmHex(fresh->genesis->set_hash));
+                    result.pushKV("epoch", fresh->epoch);
+                    UniValue starts{UniValue::VARR};
+                    for (const int start : fresh->epoch_starts) starts.push_back(start);
+                    result.pushKV("epoch_starts", std::move(starts));
+                    result.pushKV("handover_certified", fresh->handover_certified);
+                    result.pushKV("lineage_broken", fresh->lineage_broken);
+                    if (!fresh->epoch_starts.empty()) {
+                        result.pushKV("break_height", int64_t{fresh->epoch_starts.back()} +
+                                                          consensus.modern_pos->finality_epoch_blocks +
+                                                          fl.max_epoch_extension);
+                    }
+                    const auto push_set{[&result](const std::string& key,
+                                                  const std::shared_ptr<const node::FreshLineageSet>& set) {
+                        if (set) result.pushKV(key, FreshSetHeaderToJSON(set->header, set->set_hash));
+                    }};
+                    push_set("genesis_set", fresh->genesis);
+                    push_set("previous_set", fresh->previous);
+                    push_set("current_set", fresh->current);
+                    push_set("next_set", fresh->next);
+                    if (fresh->finalized) {
+                        const node::FreshFinalizedCheckpoint& f{*fresh->finalized};
+                        UniValue fin{UniValue::VOBJ};
+                        fin.pushKV("height", f.height);
+                        fin.pushKV("block_hash", f.block_hash.GetHex());
+                        fin.pushKV("block_hash_evm", EvmHex(f.block_hash));
+                        fin.pushKV("epoch", f.epoch);
+                        fin.pushKV("checkpoint_index", f.checkpoint_index);
+                        fin.pushKV("checkpoint_history_root", EvmHex(f.history_root));
+                        fin.pushKV("cert_id", EvmHex(f.cert_id));
+                        fin.pushKV("certified_at", f.certified_at);
+                        result.pushKV("finalized", std::move(fin));
+                    }
+                    if (tip && tip->nHeight >= fresh->genesis_height && interval > 0) {
+                        const uint64_t count{static_cast<uint64_t>((tip->nHeight - fresh->genesis_height) / interval) + 1};
+                        const auto hash_at{[&chainstate](const int h) -> std::optional<uint256> {
+                            const CBlockIndex* index{chainstate.m_chain[h]};
+                            if (!index) return std::nullopt;
+                            return index->GetBlockHash();
+                        }};
+                        if (const auto root{node::FreshHistoryRootAt(*fresh, count, hash_at, interval)}) {
+                            UniValue history{UniValue::VOBJ};
+                            history.pushKV("checkpoint_count", count);
+                            history.pushKV("last_checkpoint_height",
+                                           fresh->genesis_height + static_cast<int>(count - 1) * interval);
+                            history.pushKV("root", EvmHex(*root));
+                            history.pushKV("finalized_leaf_count", fresh->history.count);
+                            result.pushKV("history", std::move(history));
+                        }
+                    }
+                }
+            }
+            const node::FreshLineageSignaturePool& fresh_pool{chainstate.FinalitySignatures().Fresh()};
+            result.pushKV("pool_checkpoints", static_cast<uint64_t>(fresh_pool.TrackedCheckpoints()));
+            if (const auto& signer{fresh_pool.LocalSigner()}) {
+                UniValue local{UniValue::VOBJ};
+                local.pushKV("last_signed_height", signer->last_signed_height);
+                local.pushKV("last_error", signer->last_error);
+                result.pushKV("local_signer", std::move(local));
+            }
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan getfinalitylineagecertificate()
+{
+    return RPCHelpMan{
+        "getfinalitylineagecertificate",
+        "Export the fresh-lineage (digest V2) certificate carried by an active-chain block as the exact\n"
+        "permissionless B3FinalityVerifierV2.submitCertificate calldata, with the finalized block V2\n"
+        "fields, both ruleset-2 set headers, the BLS proof witness and the checkpoint-history paths.\n"
+        "Historical state is reconstructed from validated block data; pruned, non-active, malformed or\n"
+        "mismatched certificates fail closed. Configured only by the regtest-only -b3freshlineageheight\n"
+        "knob. This RPC handles no Ethereum private key.\n",
+        {
+            {"hash_or_height", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Active-chain block whose coinbase carries the fresh-lineage certificate",
+             RPCArgOptions{.skip_type_check = true, .type_str = {"", "string or numeric"}}},
+            {"prev_index", RPCArg::Type::NUM,
+             RPCArg::DefaultHint{"the previous fresh-finalized checkpoint index on this chain, or 0"},
+             "History index of the verifier's latest accepted checkpoint, placed by ancestry_path "
+             "(below checkpoint_index; 0 is R_f-1)"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Verifier V2 relay artifacts",
+                  {
+                      {RPCResult::Type::NUM, "inclusion_height", "B3 certificate inclusion height"},
+                      {RPCResult::Type::STR_HEX, "inclusion_block", "Inclusion hash (display order)"},
+                      {RPCResult::Type::STR_HEX, "inclusion_block_evm", "Inclusion hash (raw bytes)"},
+                      {RPCResult::Type::STR_HEX, "lineage_id", "FinalizedBlockV2.lineageId"},
+                      {RPCResult::Type::NUM, "height", "FinalizedBlockV2.height, the certified checkpoint"},
+                      {RPCResult::Type::STR_HEX, "block_hash", "Certified hash (display order)"},
+                      {RPCResult::Type::STR_HEX, "block_hash_evm", "FinalizedBlockV2.blockHash (raw bytes)"},
+                      {RPCResult::Type::STR_HEX, "withdrawal_root", "FinalizedBlockV2.withdrawalRoot"},
+                      {RPCResult::Type::STR_HEX, "validator_set_hash", "FinalizedBlockV2.validatorSetHash (successor set hash)"},
+                      {RPCResult::Type::NUM, "epoch", "FinalizedBlockV2.epoch (signing epoch)"},
+                      {RPCResult::Type::NUM, "checkpoint_index", "FinalizedBlockV2.checkpointIndex"},
+                      {RPCResult::Type::STR_HEX, "checkpoint_history_root", "FinalizedBlockV2.checkpointHistoryRoot"},
+                      {RPCResult::Type::NUM, "bridge_flags", "FinalizedBlockV2.bridgeFlags"},
+                      {RPCResult::Type::STR_HEX, "encoded", "The 185-byte FinalizedBlockV2"},
+                      {RPCResult::Type::STR_HEX, "digest_v2", "TaggedHash(\"B3/FINALITY/V2\", chain_domain || encoded), the BLS message"},
+                      {RPCResult::Type::STR_HEX, "cert_id", "keccak256(encoded)"},
+                      {RPCResult::Type::OBJ, "signing_set", "SetHeader signingSet", FreshSetHeaderDoc()},
+                      {RPCResult::Type::OBJ, "successor_set", "SetHeader successor", FreshSetHeaderDoc()},
+                      {RPCResult::Type::NUM, "validator_count", "Signing-committee member count"},
+                      {RPCResult::Type::STR_HEX, "signer_bitmap", "LSB-first signer bitmap"},
+                      {RPCResult::Type::NUM, "signer_count", "Bitmap signer count"},
+                      {RPCResult::Type::NUM, "signed_weight", "Signed weight in whole modern B3"},
+                      {RPCResult::Type::ARR, "absent_indices", "Non-signer indices carried as membership witnesses",
+                       {{RPCResult::Type::NUM, "", "Absent member index"}}},
+                      {RPCResult::Type::STR_HEX, "proof", "ABI-encoded BlsDigestProver proof"},
+                      {RPCResult::Type::OBJ, "history", "Checkpoint-history paths under checkpoint_history_root",
+                       {
+                           {RPCResult::Type::NUM, "prev_index", "Index placed by ancestry_path"},
+                           {RPCResult::Type::NUM, "prev_height", "Checkpoint height of prev_index"},
+                           {RPCResult::Type::STR_HEX, "prev_block_hash", "Hash at prev_height (display order)"},
+                           {RPCResult::Type::STR_HEX, "prev_block_hash_evm", "Hash at prev_height (raw bytes)"},
+                           {RPCResult::Type::STR_HEX, "prev_leaf", "historyLeaf(prev_height, prev_block_hash_evm)"},
+                           {RPCResult::Type::ARR, "ancestry_path", "bytes32[32] ancestryPath (leaf level first)",
+                            {{RPCResult::Type::STR_HEX, "", "Sibling"}}},
+                           {RPCResult::Type::NUM, "genesis_height", "R_f-1, history index 0"},
+                           {RPCResult::Type::STR_HEX, "genesis_leaf", "historyLeaf(R_f-1, its hash)"},
+                           {RPCResult::Type::ARR, "leaf0_path", "Path of the genesis leaf (index 0), the K_OF_N bootstrap's leaf0Path",
+                            {{RPCResult::Type::STR_HEX, "", "Sibling"}}},
+                       }},
+                      {RPCResult::Type::STR, "function", "Solidity signature of the encoded call"},
+                      {RPCResult::Type::STR_HEX, "calldata", "Exact B3FinalityVerifierV2.submitCertificate calldata"},
+                      {RPCResult::Type::BOOL, "private_key_required_by_rpc", "Always false"},
+                      {RPCResult::Type::STR, "abi_note", "How the calldata is assembled"},
+                  }},
+        RPCExamples{HelpExampleCli("getfinalitylineagecertificate", "272") +
+                    HelpExampleCli("getfinalitylineagecertificate", "272 1")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            EnsureFreshLineageConfigured(consensus);
+            std::optional<uint64_t> prev_index;
+            if (!request.params[1].isNull()) {
+                const int64_t raw{request.params[1].getInt<int64_t>()};
+                if (raw < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "prev_index must be nonnegative");
+                prev_index = static_cast<uint64_t>(raw);
+            }
+            const CBlockIndex* inclusion{ParseHashOrHeight(request.params[0], chainman)};
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            if (!inclusion || chainstate.m_chain[inclusion->nHeight] != inclusion) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Certificate block is not on the active chain");
+            }
+            std::string error;
+            const auto context{BuildFreshCertificateContext(chainstate, consensus, *inclusion, prev_index, error)};
+            if (!context) throw JSONRPCError(RPC_MISC_ERROR, error);
+            const node::FreshLineageRelayArtifacts& a{context->artifacts};
+            const modern::FinalizedBlockV2& fb{a.fb};
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("inclusion_height", context->inclusion_height);
+            result.pushKV("inclusion_block", context->inclusion_hash.GetHex());
+            result.pushKV("inclusion_block_evm", EvmHex(context->inclusion_hash));
+            result.pushKV("lineage_id", EvmHex(fb.lineage_id));
+            result.pushKV("height", fb.height);
+            result.pushKV("block_hash", fb.block_hash.GetHex());
+            result.pushKV("block_hash_evm", EvmHex(fb.block_hash));
+            result.pushKV("withdrawal_root", EvmHex(fb.withdrawal_root));
+            result.pushKV("validator_set_hash", EvmHex(fb.validator_set_hash));
+            result.pushKV("epoch", fb.epoch);
+            result.pushKV("checkpoint_index", fb.checkpoint_index);
+            result.pushKV("checkpoint_history_root", EvmHex(fb.checkpoint_history_root));
+            result.pushKV("bridge_flags", fb.bridge_flags);
+            result.pushKV("encoded", EvmHex(fb.Encode()));
+            result.pushKV("digest_v2", EvmHex(context->digest));
+            result.pushKV("cert_id", EvmHex(context->cert_id));
+            result.pushKV("signing_set", FreshSetHeaderToJSON(a.signing_header, a.signing_set_hash));
+            result.pushKV("successor_set", FreshSetHeaderToJSON(a.successor_header, a.successor_set_hash));
+            result.pushKV("validator_count", a.signing_header.validator_count);
+            result.pushKV("signer_bitmap", EvmHex(a.bitmap));
+            result.pushKV("signer_count", a.signer_count);
+            result.pushKV("signed_weight", a.signed_weight);
+            UniValue absent{UniValue::VARR};
+            for (const bridge::BootstrapAbsentWitness& witness : a.absent) absent.push_back(witness.index);
+            result.pushKV("absent_indices", std::move(absent));
+            result.pushKV("proof", EvmHex(a.proof_abi));
+            UniValue history{UniValue::VOBJ};
+            history.pushKV("prev_index", a.prev_index);
+            history.pushKV("prev_height", context->prev_height);
+            history.pushKV("prev_block_hash", context->prev_block_hash.GetHex());
+            history.pushKV("prev_block_hash_evm", EvmHex(context->prev_block_hash));
+            history.pushKV("prev_leaf", EvmHex(a.prev_leaf));
+            history.pushKV("ancestry_path", FreshHistoryPathToJSON(a.ancestry_path));
+            history.pushKV("genesis_height", context->genesis_height);
+            history.pushKV("genesis_leaf", EvmHex(a.leaf0));
+            history.pushKV("leaf0_path", FreshHistoryPathToJSON(a.leaf0_path));
+            result.pushKV("history", std::move(history));
+            result.pushKV("function", std::string{node::FRESH_SUBMIT_CERTIFICATE_SIGNATURE});
+            result.pushKV("calldata", EvmHex(a.submit_calldata));
+            result.pushKV("private_key_required_by_rpc", false);
+            result.pushKV("abi_note",
+                          "submitCertificate(fb, signingSet, successor, ancestryPath, proof) on "
+                          "B3FinalityVerifierV2 (contracts spec section 3.3): 4-byte selector, a 44-word head "
+                          "(9 fb words, signingSet offset, successor offset, 32 ancestryPath words, proof "
+                          "offset), then both SetHeader tuples and the proof bytes. ancestry_path places "
+                          "history.prev_index, which must be the verifier's latest accepted index; when the "
+                          "verifier holds a different checkpoint pass its index as prev_index. "
+                          "withdrawal_root is zero and bridge_flags 0 until the bridge V2 regime supplies them.");
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan getfinalitylineagevotes()
+{
+    return RPCHelpMan{
+        "getfinalitylineagevotes",
+        "Return the verified fresh-lineage votes held by the local pool that are still useful on the\n"
+        "active chain (regtest staging relay; there is no P2P transport for them).\n",
+        {},
+        RPCResult{RPCResult::Type::ARR, "", "Votes, newest checkpoint first",
+                  {{RPCResult::Type::OBJ, "", "Vote",
+                    {
+                        {RPCResult::Type::STR_HEX, "lineage_id", "Fresh lineage id"},
+                        {RPCResult::Type::NUM, "epoch", "Signing fresh epoch"},
+                        {RPCResult::Type::NUM, "height", "Checkpoint height"},
+                        {RPCResult::Type::NUM, "index", "Member index in Set'_epoch"},
+                        {RPCResult::Type::STR_HEX, "signature", "Compressed BLS signature over digest V2"},
+                        {RPCResult::Type::STR_HEX, "hex", "The 148-byte serialized vote for submitfinalitylineagevote"},
+                    }}}},
+        RPCExamples{HelpExampleCli("getfinalitylineagevotes", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            EnsureFreshLineageConfigured(consensus);
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            const node::FinalityTracker* tracker{SyncFinalityAtTip(chainstate, consensus, bridge_index)};
+            if (!tracker) throw JSONRPCError(RPC_MISC_ERROR, "Finality state is unavailable at the active tip");
+            UniValue out{UniValue::VARR};
+            for (const node::FreshLineageSig& sig : chainstate.FinalitySignatures().Fresh().VerifiedSignatures(
+                     *tracker, chainstate.m_chain, consensus, bridge_index)) {
+                DataStream ss;
+                ss << sig;
+                UniValue vote{UniValue::VOBJ};
+                vote.pushKV("lineage_id", EvmHex(sig.lineage_id));
+                vote.pushKV("epoch", sig.epoch);
+                vote.pushKV("height", sig.height);
+                vote.pushKV("index", sig.index);
+                vote.pushKV("signature", HexStr(sig.signature));
+                vote.pushKV("hex", HexStr(ss));
+                out.push_back(std::move(vote));
+            }
+            return out;
+        },
+    };
+}
+
+static RPCHelpMan submitfinalitylineagevote()
+{
+    return RPCHelpMan{
+        "submitfinalitylineagevote",
+        "Submit one serialized fresh-lineage vote to the local pool (regtest staging relay). The vote is\n"
+        "fully verified (lineage id, grid, depth, epoch, member index, BLS over digest V2) before it is kept.\n",
+        {
+            {"hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "The 148-byte serialized vote (getfinalitylineagevotes \"hex\")"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "",
+                  {
+                      {RPCResult::Type::STR, "result",
+                       "accepted, duplicate, stale, unconfigured, lineage-mismatch, unknown-epoch, not-checkpoint, "
+                       "too-shallow, bad-index, pool-full or bad-signature"},
+                  }},
+        RPCExamples{HelpExampleCli("submitfinalitylineagevote", "\"hex\"")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            EnsureFreshLineageConfigured(consensus);
+            const std::vector<unsigned char> bytes{ParseHexV(request.params[0], "hex")};
+            if (bytes.size() != node::FreshLineageSig::SERIALIZED_SIZE) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
+                                   strprintf("A fresh-lineage vote is exactly %u bytes",
+                                             node::FreshLineageSig::SERIALIZED_SIZE));
+            }
+            node::FreshLineageSig sig;
+            DataStream ss{bytes};
+            ss >> sig;
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            const node::FinalityTracker* tracker{SyncFinalityAtTip(chainstate, consensus, bridge_index)};
+            if (!tracker) throw JSONRPCError(RPC_MISC_ERROR, "Finality state is unavailable at the active tip");
+            const auto accept{chainstate.FinalitySignatures().Fresh().Submit(sig, *tracker, chainstate.m_chain,
+                                                                             consensus, bridge_index)};
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("result", node::FreshLineageSignaturePool::AcceptName(accept));
+            return result;
+        },
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -5182,6 +5771,10 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getbridgeproofstatus},
         {"blockchain", &getbridgefinalityproof},
         {"blockchain", &getbridgewithdrawalproof},
+        {"blockchain", &getfinalitylineage},
+        {"blockchain", &getfinalitylineagecertificate},
+        {"hidden", &getfinalitylineagevotes},
+        {"hidden", &submitfinalitylineagevote},
         {"hidden", &invalidateblock},
         {"hidden", &reconsiderblock},
         {"blockchain", &waitfornewblock},

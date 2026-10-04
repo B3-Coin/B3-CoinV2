@@ -180,6 +180,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getfinalityset", 0, "epoch" },
     { "getfinalityset", 1, "offset" },
     { "getfinalityset", 2, "count" },
+    { "getfinalitylineagecertificate", 0, "hash_or_height", ParamFormat::JSON_OR_STRING },
+    { "getfinalitylineagecertificate", 1, "prev_index" },
     { "signbridgebootstrap", 1, "binding_seq" },
     { "waitforblockheight", 0, "height" },
     { "waitforblockheight", 1, "timeout" },
