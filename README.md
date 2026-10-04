@@ -398,6 +398,32 @@ from the prepared corpus; similar phrases and near-duplicates are not excluded.
 Only validation selects checkpoints during the chain; generate fresh writing
 probes after that stage rather than at intermediate steps.
 
+All three local continuation chunks completed. The final selected state is
+global update 4,000, with 14,174,291 cumulative supervised byte/EOD targets.
+Validation loss reached 0.8777202; the continuation chain took 807.1 seconds,
+after the original 265.8-second pilot. Independent replay reproduced every
+sampling batch, RNG state and target count. CPU validation reproduced the final
+MPS score within 1.27e-7, and the original scratch sources/checkpoint remain
+unchanged.
+
+The fresh writing exam still failed. Under its literal rule of at least one
+grammatical sentence, 12/20 greedy outputs and 4/20 sampled outputs scored 2 for
+readability, including explicitly recorded borderline judgments. No output in
+either group scored 2 for following its premise. Repetition, unrelated trees
+and parks, malformed words and broken syntax remain common. Lower validation
+loss has not qualified this model for conversation or B3 tasks. Raw generations,
+token IDs, both review scores and reasons are preserved under
+`build-ai/language-runs/mps-continuation-3/`. The fresh exam is now used; future
+qualification requires newly frozen probes.
+
+An exploratory diagnostic after the failed exam continued the first four saved
+test stories from their first 80 characters. Greedy output still drifted or
+repeated, although teacher-forced next-byte accuracy over the following 128
+targets ranged from 65.6% to 79.7%. This small diagnostic does not establish the
+cause or choose a checkpoint. Further work must address free generation before
+dialogue teaching, serving or tool integration; additional low loss alone is not
+an acceptance criterion.
+
 `language_exam.json` freezes 20 separately authored continuation prompts and
 explicit teacher-review criteria. Test stories and exam prompts must stay out of
 training and checkpoint selection. Lower validation loss alone cannot pass the

@@ -1,6 +1,6 @@
 {
   "schema": "b3-language-pilot-plan/v1",
-  "status": "isolated runtime installed with owner approval; 1000-update GPU pilot completed; first writing exam failed; bounded continuation prepared separately",
+  "status": "approved isolated GPU runtime installed; 4000 total language updates completed; frozen fresh writing exam failed; checkpoint remains experimental and is not connected to Hive chat",
   "purpose": "Test whether a broader language corpus and a larger random-start model improve English continuations before B3 dialogue teaching.",
   "hardware_observed": {
     "chip": "Apple M4 Max",
@@ -11,9 +11,16 @@
   "proposed_runtime": {
     "python": "existing bundled Python 3.12.14",
     "directory": "build-ai/language-runtime/venv",
-    "packages": {"torch": "2.14.1", "numpy": "2.3.5"},
+    "packages": {
+      "torch": "2.14.1",
+      "numpy": "2.3.5"
+    },
     "installation": "owner explicitly approved the isolated exception, recorded in CLAUDE.md",
-    "backend_order": ["CPU numerical parity", "MPS numerical parity", "MPS throughput and memory benchmark"],
+    "backend_order": [
+      "CPU numerical parity",
+      "MPS numerical parity",
+      "MPS throughput and memory benchmark"
+    ],
     "official_documentation": "https://docs.pytorch.org/docs/stable/notes/mps.html",
     "weights": "our own random initialization; no downloaded pretrained weights"
   },
@@ -34,12 +41,32 @@
   },
   "numerical_reference": {
     "source": "existing manual-gradient NumPy Transformer and AdamW",
-    "fixture_config": {"vocab_size": 256, "context_length": 8, "width": 8, "layers": 2, "heads": 2, "ff_multiplier": 4, "seed": 42},
-    "checks": ["logits", "masked loss", "all parameter gradients", "one AdamW update and moments", "causal suffix invariance"],
+    "fixture_config": {
+      "vocab_size": 256,
+      "context_length": 8,
+      "width": 8,
+      "layers": 2,
+      "heads": 2,
+      "ff_multiplier": 4,
+      "seed": 42
+    },
+    "checks": [
+      "logits",
+      "masked loss",
+      "all parameter gradients",
+      "one AdamW update and moments",
+      "causal suffix invariance"
+    ],
     "optimizer_comparison": "Use identical saved gradients to isolate optimizer parity. Separately compare autograd gradients and resulting logits/loss after a complete update.",
     "investigated_rounding_difference": "Two CPU key-bias entries exceeded the parameter tolerance after a combined autograd/AdamW update because tiny float32 residuals are amplified by AdamW epsilon. A common attention key bias cancels mathematically. Every other parameter and the resulting logits/loss pass the unchanged tolerances; the difference is explicitly covered in regression tests and the local parity report.",
-    "cpu_float32_tolerance": {"absolute": 0.00002, "relative": 0.0002},
-    "mps_float32_tolerance": {"absolute": 0.0002, "relative": 0.002},
+    "cpu_float32_tolerance": {
+      "absolute": 2e-05,
+      "relative": 0.0002
+    },
+    "mps_float32_tolerance": {
+      "absolute": 0.0002,
+      "relative": 0.002
+    },
     "failure_action": "investigate and report; never silently relax tolerances or proceed to a long training run"
   },
   "proposed_language_model": {
@@ -55,7 +82,12 @@
     "ff_multiplier": 4,
     "seed": 42,
     "parameter_count": 5395201,
-    "hive_context_measurement": {"tools_disabled_system_bytes_with_empty_lessons": 1132, "bytes_remaining_in_proposed_context": 916, "exclusions": "user text, lesson content, history, role framing and generation budget", "implication": "the language pilot is not a full Hive conversation model; integration needs a separate measured context and dialogue design"},
+    "hive_context_measurement": {
+      "tools_disabled_system_bytes_with_empty_lessons": 1132,
+      "bytes_remaining_in_proposed_context": 916,
+      "exclusions": "user text, lesson content, history, role framing and generation budget",
+      "implication": "the language pilot is not a full Hive conversation model; integration needs a separate measured context and dialogue design"
+    },
     "precision": "float32 first; mixed precision requires a separate measured decision",
     "compatibility": "exceeds the existing CPU scratch model limits; cannot be loaded by the current scratch HTTP adapter"
   },
@@ -86,5 +118,33 @@
     "TinyStories tests a narrow synthetic story domain; success does not establish general chat, B3 expertise or tool reliability.",
     "No training occurs just by saving a conversation or a lesson.",
     "No wallet actions, production node connections, consensus changes, external compute spending or publication are part of this experiment."
-  ]
+  ],
+  "completed_local_stage": {
+    "selected_total_step": 4000,
+    "cumulative_supervised_byte_eod_targets": 14174291,
+    "best_fixed_validation_loss": 0.8777201877354266,
+    "initial_pilot_wall_seconds": 265.8179,
+    "continuation_chain_wall_seconds": 807.1100517499726,
+    "checkpoint": "build-ai/language-runs/mps-continuation-3/model.npz",
+    "checkpoint_sha256": "a503bbfdb474018f840f045779ba46344b5ef58a032310e0fb8d615f9de70390",
+    "fresh_exam": "language_exam_v2.json",
+    "fresh_exam_sha256": "90f08d66b73b41b53d33aac718659c9abd68bac47a3854328da0a7ef11b965eb",
+    "fresh_exam_result": "failed provisional writing gate; raw text and scores preserved",
+    "greedy": {
+      "outputs": 20,
+      "readability_score2": 12,
+      "continuity_score2": 0
+    },
+    "sampled": {
+      "outputs": 20,
+      "readability_score2": 4,
+      "continuity_score2": 0
+    },
+    "review_caveat": "Readability2 requires only one grammatical sentence and includes borderline judgments; it does not denote a coherent complete output.",
+    "review": "build-ai/language-runs/mps-continuation-3/independent-teacher-review.json",
+    "audit": "build-ai/language-preparation/continuation-independent-audit.json",
+    "audit_result": "All 4,000 sampled batches, RNG states and optimizer counters reproduced; independent CPU validation differs by 1.27e-7; original scratch artifacts unchanged.",
+    "hive_ui": "Training tab reads local saved reports; it does not run training or connect the new checkpoint to chat",
+    "next_requirement": "improve independently examined free generation before dialogue, serving and B3/tool qualification; used exams become exploratory"
+  }
 }
