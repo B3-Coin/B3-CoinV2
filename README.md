@@ -266,23 +266,22 @@ turns a saved conversation into weight training. Further work needs a sufficient
 language-learning dataset and independent reply evaluations; repeating the small
 B3 fixtures has already demonstrated overfitting.
 
-### Preparing a broader language experiment
+### Broader language data and local GPU training
 
-`contrib/b3ai/language/` prepares the next experiment without modifying the saved
-scratch models. The proposed design is recorded in `pilot.json`: port the tested
-NumPy architecture to an accelerated runtime, verify its mathematics against a
-small saved reference, measure the local GPU, and then run a bounded language
-pilot from our own random weights. The GPU backend and trainer are not yet
-implemented. No additional runtime dependency has been installed; `CLAUDE.md`
-requires an owner exception before dependency installation.
+`contrib/b3ai/language/` implements a separate accelerated language experiment
+without modifying the saved scratch models. `pilot.json` records the design and
+limits. The owner approved PyTorch, NumPy and their required dependencies in the
+isolated ignored `build-ai/language-runtime/venv`; that limited exception is
+recorded in `CLAUDE.md`. Our model architecture and randomly initialized weights
+remain our own. PyTorch supplies device operations and automatic differentiation.
 
 The first objective is readable English continuation, before dialogue teaching
-or B3 task qualification. The proposed 5,395,201-parameter model has six layers,
-a width of 256, and 2,048 byte-token positions. Its new tokenizer contract would
-add an end-of-document token to the 256 UTF-8 byte values. This exceeds the old
-CPU reference limits and requires a separate versioned model/checkpoint contract;
-the existing scratch adapter cannot serve it. These settings are a proposal,
-not a demonstrated capability or a promised training duration.
+or B3 task qualification. The default 5,395,201-parameter model has six layers,
+a width of 256, and 2,048 byte-token positions. Its new tokenizer adds an
+end-of-document token, ID 256, to the 256 UTF-8 byte values. This exceeds the old
+CPU reference limits and uses the separate `b3-language-transformer/v1` checkpoint
+contract. The existing scratch adapter cannot serve it. Model size alone does
+not establish language or assistant capability.
 
 The original TinyStories TXT files are pinned to dataset revision
 `f54c09fd23315a6f9c86f9dc80f725de7d8f9c64`. The dataset is synthetic fiction under
@@ -325,8 +324,55 @@ data preparation, not a new trained model or a quality result.
 causal comparison logits, and one clipped AdamW update with its moments. It uses
 the existing NumPy implementation and records its implementation hash. The NPZ
 contains numeric arrays and JSON bytes, requires no pickle, and is published
-atomically without overwriting an existing path. The future CPU port must match
-this reference before the GPU port is tested.
+atomically without overwriting an existing path. The CPU and MPS model ports pass
+the fixed numerical tolerances for logits, loss, gradients and an AdamW update
+using identical saved gradients. A complete CPU autograd/AdamW update differs on
+two redundant attention key-bias entries because floating-point residuals are
+amplified by AdamW's epsilon. Common key bias cancels in attention softmax;
+every other parameter and the resulting predictions pass the original
+tolerances. Regression tests and the local numerical report explicitly preserve
+this distinction; no gradients or tolerances are silently altered.
+
+`batches.py` verifies prepared manifests, source contracts, split hashes and
+global normalized uniqueness before loading UTF-8 bytes plus EOD. Batches select
+windows within one document. Padding and targets after EOD have zero loss;
+the document-ending target is supervised. Validation uses fixed batches and
+token-weighted cross entropy; the test split is never batched for selection.
+
+Run with the approved isolated runtime from this checkout:
+
+```sh
+build-ai/language-runtime/venv/bin/python -m unittest discover -s contrib/b3ai/language/tests -v
+build-ai/language-runtime/venv/bin/python -m contrib.b3ai.language.train --corpus build-ai/language-preparation/tinystories-pilot --output build-ai/language-runs/new-benchmark --device mps --benchmark
+build-ai/language-runtime/venv/bin/python -m contrib.b3ai.language.train --corpus build-ai/language-preparation/tinystories-pilot --output build-ai/language-runs/new-pilot --device mps --steps 1000
+build-ai/language-runtime/venv/bin/python -m contrib.b3ai.language.evaluate --checkpoint build-ai/language-runs/new-pilot/model.npz --output build-ai/language-runs/new-pilot/exam.json --device mps
+```
+
+Runs reserve fresh output directories. Resource caps apply between complete
+operations: at most 1,000 optimizer updates, 8,192,000 supervised training tokens,
+7,200 seconds, and 32 GiB process RSS or GPU driver allocations. The initial
+random baseline participates in validation selection. `model.npz` retains the
+best validation state; `last.npz` preserves the final attempted state when memory
+allows. Both record optimizer moments, steps, batch RNG, corpus and code hashes,
+runtime, and the validation loss at that state. An unscored final state has a null
+loss. This CLI currently supports fresh experiments, not resumed training runs;
+checkpoint loading itself restores the full state and passes exact CPU resume
+tests. Unknown files and checkpoints from another run cannot be overwritten.
+
+The local M4 Max benchmark measured three complete optimizer updates after one
+warmup: 0.256 seconds per update on average, with about 5.54 GB of GPU driver
+allocations. Actual wall time, supervised tokens, selected step and memory are
+saved in each run report. The benchmark does not predict final language quality.
+
+The first 5,395,201-parameter GPU pilot completed 1,000 updates in 265.8 seconds,
+processing 3,556,921 supervised byte/EOD targets. Fixed validation loss fell
+from 5.7539 to 2.0201 and selected update 1,000. The writing exam failed:
+none of the 40 recorded greedy or sampled continuations was understandable,
+complete language that followed its premise. All reached the generation budget.
+Declining validation loss supports testing more training; it does not establish
+that additional updates will produce coherent language. Preserve this failed
+exam. Reusing its results to plan further experiments makes it exploratory;
+final qualification needs fresh, frozen probes.
 
 `language_exam.json` freezes 20 separately authored continuation prompts and
 explicit teacher-review criteria. Test stories and exam prompts must stay out of

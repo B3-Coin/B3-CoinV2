@@ -1,18 +1,18 @@
 {
   "schema": "b3-language-pilot-plan/v1",
-  "status": "prepared; GPU backend not implemented or installed",
+  "status": "isolated runtime installed with owner approval; numerical GPU port verified; 1000-update pilot completed; independent writing review in progress",
   "purpose": "Test whether a broader language corpus and a larger random-start model improve English continuations before B3 dialogue teaching.",
   "hardware_observed": {
     "chip": "Apple M4 Max",
     "unified_memory_bytes": 137438953472,
     "architecture": "arm64",
-    "gpu_training_capability": "unverified until runtime capability and numerical checks pass"
+    "gpu_training_capability": "verified MPS forward/backward, numerical parity and complete-step benchmark"
   },
   "proposed_runtime": {
     "python": "existing bundled Python 3.12.14",
     "directory": "build-ai/language-runtime/venv",
     "packages": {"torch": "2.14.1", "numpy": "2.3.5"},
-    "installation": "requires owner exception to CLAUDE.md dependency-installation prohibition",
+    "installation": "owner explicitly approved the isolated exception, recorded in CLAUDE.md",
     "backend_order": ["CPU numerical parity", "MPS numerical parity", "MPS throughput and memory benchmark"],
     "official_documentation": "https://docs.pytorch.org/docs/stable/notes/mps.html",
     "weights": "our own random initialization; no downloaded pretrained weights"
@@ -36,6 +36,8 @@
     "source": "existing manual-gradient NumPy Transformer and AdamW",
     "fixture_config": {"vocab_size": 256, "context_length": 8, "width": 8, "layers": 2, "heads": 2, "ff_multiplier": 4, "seed": 42},
     "checks": ["logits", "masked loss", "all parameter gradients", "one AdamW update and moments", "causal suffix invariance"],
+    "optimizer_comparison": "Use identical saved gradients to isolate optimizer parity. Separately compare autograd gradients and resulting logits/loss after a complete update.",
+    "investigated_rounding_difference": "Two CPU key-bias entries exceeded the parameter tolerance after a combined autograd/AdamW update because tiny float32 residuals are amplified by AdamW epsilon. A common attention key bias cancels mathematically. Every other parameter and the resulting logits/loss pass the unchanged tolerances; the difference is explicitly covered in regression tests and the local parity report.",
     "cpu_float32_tolerance": {"absolute": 0.00002, "relative": 0.0002},
     "mps_float32_tolerance": {"absolute": 0.0002, "relative": 0.002},
     "failure_action": "investigate and report; never silently relax tolerances or proceed to a long training run"
