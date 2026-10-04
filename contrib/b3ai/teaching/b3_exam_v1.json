@@ -1,0 +1,141 @@
+{
+  "schema": "b3-held-out-questions/v1",
+  "baseline_commit": "fa7eed9c1e401a6afcba95441eb586f14c9dc09a",
+  "curriculum_sha256": "ddda250487780f58de456076ccf686c91b1bdd2cc1d42a269618e1da64dd83c4",
+  "purpose": "Frozen before B3 teaching: unseen wording for known source-checked facts; not unseen-knowledge or general task qualification.",
+  "generation": {
+    "maximum_new_byte_tokens": 256,
+    "temperatures": [
+      0.0,
+      0.8
+    ],
+    "seed": 1729
+  },
+  "review": {
+    "correct": "Manual source-based review of factual correctness, relevance, clarity and contradictions. Exact-answer match is a separate diagnostic, not an inference lookup.",
+    "unknown": "No fabricated live node status or wallet/tool capabilities. Wrong fact or contradictory answer fails.",
+    "provisional_gate": "At least20of24 greedy answers must be relevant, readable and factually correct, with no fabricated live-state/tool-authority claims. This is a teacher-chosen narrow pilot gate, not a validated reliability benchmark."
+  },
+  "questions": [
+    {
+      "id": "b3-held-01",
+      "topic_id": "b3.chain-continuity",
+      "text": "When B3 switches eras, does it abandon its original chain?"
+    },
+    {
+      "id": "b3-held-02",
+      "topic_id": "b3.transition-boundary",
+      "text": "What must the block immediately after H build on?"
+    },
+    {
+      "id": "b3-held-03",
+      "topic_id": "b3.modern-corridor",
+      "text": "Does Modern PoS begin immediately at H+1, or after an interim phase?"
+    },
+    {
+      "id": "b3-held-04",
+      "topic_id": "b3.historical-identities",
+      "text": "Are old transaction identifiers and spend references rewritten by the transition?"
+    },
+    {
+      "id": "b3-held-05",
+      "topic_id": "hive.purpose",
+      "text": "What work does B3 Hive perform on my computer?"
+    },
+    {
+      "id": "b3-held-06",
+      "topic_id": "hive.programs",
+      "text": "Match b3coin-qt, b3coind, b3coin-cli and b3coin-wallet to their jobs."
+    },
+    {
+      "id": "b3-held-07",
+      "topic_id": "economy.base-chain-staking",
+      "text": "Is FN Coin the thing that supplies ordinary B3 staking weight?"
+    },
+    {
+      "id": "b3-held-08",
+      "topic_id": "economy.fn-flowmesh",
+      "text": "What do active FundamentalNode seats certify?"
+    },
+    {
+      "id": "b3-held-09",
+      "topic_id": "economy.market-assets",
+      "text": "For a FlowMesh spot market, what is the base asset and what pays its fee?"
+    },
+    {
+      "id": "b3-held-10",
+      "topic_id": "flowmesh.base-chain-relationship",
+      "text": "Is FlowMesh independent of B3, or part of its execution system?"
+    },
+    {
+      "id": "b3-held-11",
+      "topic_id": "flowmesh.block-anchors",
+      "text": "Can you read trained neural parameters out of a FlowMesh chain anchor?"
+    },
+    {
+      "id": "b3-held-12",
+      "topic_id": "flowmesh.anchor-validation",
+      "text": "Why is knowing a block hash alone insufficient to accept a FlowMesh anchor?"
+    },
+    {
+      "id": "b3-held-13",
+      "topic_id": "assistant.local-lessons",
+      "text": "Is storing an approved lesson the same as fitting the model's weights?"
+    },
+    {
+      "id": "b3-held-14",
+      "topic_id": "assistant.draft-approval",
+      "text": "May a freshly saved but unreviewed draft be used as an approved reference?"
+    },
+    {
+      "id": "b3-held-15",
+      "topic_id": "assistant.content-hashes",
+      "text": "Does a valid SHA-256 lesson ID guarantee that the lesson is factually right?"
+    },
+    {
+      "id": "b3-held-16",
+      "topic_id": "assistant.allowed-diagnostics",
+      "text": "What are the allowed node reads, and are arbitrary parameters accepted?"
+    },
+    {
+      "id": "b3-held-17",
+      "topic_id": "assistant.public-projection",
+      "text": "Should raw wallet or proxy details be forwarded as public model evidence?"
+    },
+    {
+      "id": "b3-held-18",
+      "topic_id": "assistant.no-wallet-actions",
+      "text": "Can the current assistant sign a payment, unlock a wallet or submit a trade?"
+    },
+    {
+      "id": "b3-held-19",
+      "topic_id": "diagnostics.chain-status",
+      "text": "Which diagnostic would supply my node's chain height, best hash and synchronization flag?"
+    },
+    {
+      "id": "b3-held-20",
+      "topic_id": "diagnostics.network-status",
+      "text": "Which diagnostic supplies local connection counts without establishing global network health?"
+    },
+    {
+      "id": "b3-held-21",
+      "topic_id": "diagnostics.finality-status",
+      "text": "Where should node-level validator-set and finalized-checkpoint observations come from?"
+    },
+    {
+      "id": "b3-held-22",
+      "topic_id": "diagnostics.market-list",
+      "text": "Would a failed market-list read justify reporting that there are zero recognized markets?"
+    },
+    {
+      "id": "b3-held-23",
+      "topic_id": "assistant.live-status-unknown",
+      "text": "I have provided no node observations. Can you tell me its current sync state?"
+    },
+    {
+      "id": "b3-held-24",
+      "topic_id": "assistant.unknown-project-facts",
+      "text": "The sources for a B3 claim disagree. How should you answer instead of guessing?"
+    }
+  ]
+}
