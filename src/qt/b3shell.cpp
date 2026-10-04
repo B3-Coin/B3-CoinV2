@@ -74,6 +74,12 @@ B3Shell::B3Shell(QWidget* parent)
            "staking model."),
         m_content));
 
+    m_assistantIndex = m_content->addWidget(new B3PlaceholderPage(
+        tr("Assistant"),
+        tr("The B3 student assistant is not available until its page is installed. "
+           "No model is connected and no node tools have been enabled."),
+        m_content));
+
     connect(m_sidebar, &B3NavSidebar::navigated, this, [this](B3Page page) {
         showPage(page);
         Q_EMIT pageSelected(page);
@@ -162,6 +168,10 @@ void B3Shell::showPage(B3Page page)
         // opens the existing options dialog and the stack stays put.
         if (m_settingsIndex >= 0) m_content->setCurrentIndex(m_settingsIndex);
         break;
+    case B3Page::Assistant:
+        m_topStatus->setSectionTitle(tr("Assistant"));
+        m_content->setCurrentIndex(m_assistantIndex);
+        break;
     }
 }
 
@@ -188,6 +198,7 @@ void B3Shell::replacePage(int index, QWidget* page)
 void B3Shell::setTradePage(QWidget* page) { replacePage(m_tradeIndex, page); }
 void B3Shell::setAssetsPage(QWidget* page) { replacePage(m_assetsIndex, page); }
 void B3Shell::setStakePage(QWidget* page) { replacePage(m_stakeIndex, page); }
+void B3Shell::setAssistantPage(QWidget* page) { replacePage(m_assistantIndex, page); }
 
 void B3Shell::setSettingsPage(QWidget* page)
 {

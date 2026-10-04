@@ -97,6 +97,13 @@ QPixmap sidebarGlyphPixmap(B3Page page, int logicalSize, qreal devicePixelRatio,
                              QPointF{8.0 + std::cos(angle) * 6.2, 8.0 + std::sin(angle) * 6.2});
         }
         break;
+    case B3Page::Assistant:
+        painter.drawRoundedRect(QRectF{2.0, 2.5, 12.0, 9.0}, 2.0, 2.0);
+        painter.drawPolyline(QPolygonF{{4.0, 11.5}, {4.0, 14.0}, {7.0, 11.5}});
+        for (int dot = 0; dot < 3; ++dot) {
+            painter.drawEllipse(QPointF{5.0 + dot * 3.0, 7.0}, 0.45, 0.45);
+        }
+        break;
     }
     painter.end();
     glyph.setDevicePixelRatio(devicePixelRatio);
@@ -213,6 +220,7 @@ B3NavSidebar::B3NavSidebar(QWidget* parent)
     addItem(B3Page::Assets, tr("Assets"), "navAssets");
     addItem(B3Page::Stake, tr("Stake"), "navStake");
     addItem(B3Page::Activity, tr("Activity"), "navActivity");
+    addItem(B3Page::Assistant, tr("Assistant"), "navAssistant");
     m_layout->addStretch(1);
     addItem(B3Page::Settings, tr("Settings"), "navSettings");
 

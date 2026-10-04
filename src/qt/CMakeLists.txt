@@ -67,6 +67,14 @@ unset(warn_flags)
 # The bitcoinqt sources have to include headers in
 # order to parse them to collect translatable strings.
 add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
+  b3aiclient.cpp
+  b3aiclient.h
+  b3ailessonstore.cpp
+  b3ailessonstore.h
+  b3aipage.cpp
+  b3aipage.h
+  b3aipublicdata.cpp
+  b3aipublicdata.h
   b3chartwidget.cpp
   b3chartwidget.h
   b3fixed.cpp
@@ -171,6 +179,8 @@ set_property(SOURCE macnotificationhandler.mm
 target_link_libraries(bitcoinqt
   PUBLIC
     Qt6::Widgets
+    Qt6::Network
+    Qt6::Concurrent
   PRIVATE
     core_interface
     b3_update
@@ -283,7 +293,6 @@ if(ENABLE_WALLET)
   target_link_libraries(bitcoinqt
     PRIVATE
       bitcoin_wallet
-      Qt6::Network
   )
 endif()
 

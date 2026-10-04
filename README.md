@@ -74,3 +74,56 @@ Translation sources and inherited locale files live under `src/qt/locale`.
 See the [translation process](doc/translation_process.md) and
 [translation strings policy](doc/translation_strings_policy.md) before making
 translation changes.
+
+## Student assistant prototype
+
+The Hive sidebar now includes **Assistant**, with Chat, Lessons and Connection
+tabs. This is a separate application feature; it does not change B3 consensus.
+
+In **Connection**, enter a model-service URL, a model name and, when required,
+an API key. The service must support the Chat Completions request format and
+function calling to use node tools. HTTPS is required for remote services; HTTP
+is accepted only for literal loopback addresses. Click **Apply connection**,
+then send a message in Chat. Applying settings alone sends no request. No model
+is bundled, downloaded, started or trained by this prototype.
+
+Chat and API keys stay in memory. Only the service URL and model name are saved
+in application settings. Messages and relevant approved lessons are sent to the
+configured service. Node tools are off on every startup and require explicit
+opt-in. Their complete allowlist is `getblockchaininfo`, `getnetworkinfo`,
+`getfinalitystatus` and `listflowmeshmarkets`, without arguments. An explicit
+field projection removes wallet accounts/balances, proxy and address details,
+market endpoints, local queued-action counts, signature pools and raw RPC error
+text before results reach the model or the evidence view. Market listing still
+uses B3's existing wallet RPC and may be unavailable without an unambiguous
+loaded wallet. The assistant cannot create or sign transactions, place trades,
+execute shell commands, or call other RPCs.
+
+Lessons starts with four source-cited B3 lessons pinned to the inspected
+`30825f9` baseline. A teacher can correct an answer, identify its source, save a
+draft and explicitly approve it. Only approved lessons are retrieved into chat.
+Custom lessons live in `student-ai/lessons.json` under Qt's application-data
+location; writes are atomic and detect conflicting or damaged files. Their
+SHA-256 identifiers identify exact lesson content, not its truth. Approval is a
+review decision. This is local retrieval memory, not training of model weights,
+an autonomous teacher service or an on-chain learning commitment. Existing B3
+block anchors refer to chain positions and are not lesson storage.
+
+Build with Qt GUI tests enabled, then run the isolated assistant checks:
+
+```sh
+cmake --build build --target test_b3_ai-client-qt test_b3_ai-lessons-qt test_b3_ai-public-data-qt test_b3_ai-page-qt test_b3_ai-shell-qt b3_student_ai_preview
+ctest --test-dir build -R '^test_b3_ai-' --output-on-failure
+```
+
+The model-client tests use a loopback mock service; the other checks create no
+node, wallet, model connection or chain datadir. The manual preview at
+`build/bin/b3_student_ai_preview` uses disposable settings and lessons, without
+starting B3. Pass `--capture-dir /path/to/screenshots` to capture its four UI
+views. A preview is disconnected until a service is configured; it does not
+simulate successful model replies or invent node observations.
+
+Next development milestones are a reproducible B3 question/task evaluation set,
+teacher-reviewed improvement experiments and then additional task tools with
+appropriate confirmation. Model training and verifiable publication of lesson
+revisions require separate designs and measured results.

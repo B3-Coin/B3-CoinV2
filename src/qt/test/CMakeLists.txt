@@ -21,6 +21,67 @@ if(NOT BUILD_GUI_TESTS)
   return()
 endif()
 
+# Assistant checks deliberately link only Qt and the code under test. They
+# never initialize a node, wallet, production settings, or a chain datadir.
+add_executable(test_b3_ai-client-qt
+  b3aiclienttests.cpp
+  ../b3aiclient.cpp
+  ../b3aiclient.h
+)
+target_include_directories(test_b3_ai-client-qt PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test_b3_ai-client-qt Qt6::Core Qt6::Network Qt6::Concurrent Qt6::Test)
+set_target_properties(test_b3_ai-client-qt PROPERTIES AUTOMOC_MOC_OPTIONS "")
+add_test(NAME test_b3_ai-client-qt COMMAND test_b3_ai-client-qt)
+
+add_executable(test_b3_ai-lessons-qt
+  b3ailessonstoretests.cpp
+  ../b3ailessonstore.cpp
+  ../b3ailessonstore.h
+)
+target_include_directories(test_b3_ai-lessons-qt PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test_b3_ai-lessons-qt Qt6::Core Qt6::Test)
+add_test(NAME test_b3_ai-lessons-qt COMMAND test_b3_ai-lessons-qt)
+
+add_executable(test_b3_ai-public-data-qt
+  b3aipublicdatatests.cpp
+  ../b3aipublicdata.cpp
+  ../b3aipublicdata.h
+)
+target_include_directories(test_b3_ai-public-data-qt PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test_b3_ai-public-data-qt Qt6::Core Qt6::Test)
+add_test(NAME test_b3_ai-public-data-qt COMMAND test_b3_ai-public-data-qt)
+
+# The preview and focused UI tests share the native assistant and shell, while
+# keeping the production node and wallet completely outside their lifecycle.
+add_library(b3_ai_ui_test_support STATIC EXCLUDE_FROM_ALL
+  ../b3aipage.cpp ../b3aipage.h
+  ../b3aiclient.cpp ../b3aiclient.h
+  ../b3ailessonstore.cpp ../b3ailessonstore.h
+  ../b3aipublicdata.cpp ../b3aipublicdata.h
+  ../b3shell.cpp ../b3shell.h
+  ../b3navsidebar.cpp ../b3navsidebar.h
+  ../b3placeholderpage.cpp ../b3placeholderpage.h
+  ../b3theme.cpp ../b3theme.h
+  ../b3topstatus.cpp ../b3topstatus.h
+)
+target_compile_definitions(b3_ai_ui_test_support PUBLIC QT_NO_KEYWORDS QT_USE_QSTRINGBUILDER)
+set_target_properties(b3_ai_ui_test_support PROPERTIES AUTOMOC_MOC_OPTIONS "")
+target_include_directories(b3_ai_ui_test_support PUBLIC ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(b3_ai_ui_test_support PUBLIC Qt6::Widgets Qt6::Network Qt6::Concurrent core_interface univalue)
+
+add_executable(b3_student_ai_preview EXCLUDE_FROM_ALL b3ai_preview_main.cpp)
+target_link_libraries(b3_student_ai_preview b3_ai_ui_test_support)
+
+add_executable(test_b3_ai-page-qt b3aipagetests.cpp)
+target_link_libraries(test_b3_ai-page-qt b3_ai_ui_test_support Qt6::Test)
+add_test(NAME test_b3_ai-page-qt COMMAND test_b3_ai-page-qt)
+set_tests_properties(test_b3_ai-page-qt PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_b3_ai-shell-qt b3ai_shell_test_main.cpp b3shelltests.cpp b3shelltests.h)
+target_link_libraries(test_b3_ai-shell-qt b3_ai_ui_test_support Qt6::Test)
+add_test(NAME test_b3_ai-shell-qt COMMAND test_b3_ai-shell-qt)
+set_tests_properties(test_b3_ai-shell-qt PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_bitcoin-qt
   apptests.cpp
   b3shelltests.cpp

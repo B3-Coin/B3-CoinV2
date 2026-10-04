@@ -50,6 +50,8 @@ public:
     void setTradePage(QWidget* page);
     void setAssetsPage(QWidget* page);
     void setStakePage(QWidget* page);
+    //! Install the assistant independently of wallet availability.
+    void setAssistantPage(QWidget* page);
     //! Install an in-shell Settings page. Until one is set, selecting
     //! Settings leaves the content stack unchanged (the window opens the
     //! options dialog instead).
@@ -75,6 +77,7 @@ private:
     int m_tradeIndex{-1};
     int m_assetsIndex{-1};
     int m_stakeIndex{-1};
+    int m_assistantIndex{-1};
     int m_settingsIndex{-1};
     B3Page m_currentPage{B3Page::Dashboard};
 };

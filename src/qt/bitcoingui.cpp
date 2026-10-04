@@ -12,6 +12,7 @@
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
 #include <qt/b3navsidebar.h>
+#include <qt/b3aipage.h>
 #include <qt/b3settingspage.h>
 #include <qt/updatecontroller.h>
 #include <QPushButton>
@@ -141,6 +142,7 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         // navigation back to existing functionality; it invents nothing.
         m_shell = new B3Shell(this);
         m_shell->setWalletWidget(walletFrame);
+        m_shell->setAssistantPage(new B3AiPage(&m_node, {}, m_shell));
 #ifdef B3_FLOWMESH_REGTEST_CLIENT
         m_shell->topStatus()->setNetwork(QStringLiteral("B3 FlowMesh REGTEST TEST6 — ") +
                                          tr("Test tokens have no value. Futures are informational only."),
@@ -213,10 +215,19 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
     } else
 #endif // ENABLE_WALLET
     {
-        /* When compiled without wallet or -disablewallet is provided,
-         * the central widget is the rpc console.
-         */
-        setCentralWidget(rpcConsole);
+        // The assistant uses public node reads and remains available when
+        // wallet support is absent. Keep the existing RPC console as Overview.
+        m_shell = new B3Shell(this);
+        m_shell->setWalletWidget(rpcConsole);
+        m_shell->setAssistantPage(new B3AiPage(&m_node, {}, m_shell));
+        m_shell->topStatus()->setNetwork(m_network_style->getAppName(),
+                                         m_network_style->getTitleAddText());
+        for (B3Page page : {B3Page::Send, B3Page::Receive, B3Page::Activity,
+                            B3Page::Trade, B3Page::Assets, B3Page::Stake}) {
+            m_shell->sidebar()->setPageEnabled(page, false);
+        }
+        connect(m_shell, &B3Shell::pageSelected, this, &BitcoinGUI::onShellPageSelected);
+        setCentralWidget(m_shell);
         Q_EMIT consoleShown(rpcConsole);
     }
 
@@ -826,6 +837,9 @@ void BitcoinGUI::createToolBars()
 
 void BitcoinGUI::setClientModel(ClientModel *_clientModel, interfaces::BlockAndHeaderTipInfo* tip_info)
 {
+    if (!_clientModel && m_shell) {
+        if (auto* assistant = m_shell->findChild<B3AiPage*>()) assistant->detachNode();
+    }
     this->clientModel = _clientModel;
     if(_clientModel)
     {
@@ -1358,6 +1372,7 @@ void BitcoinGUI::onShellPageSelected(B3Page page)
     case B3Page::Trade:
     case B3Page::Assets:
     case B3Page::Stake:
+    case B3Page::Assistant:
         break;
     }
     if (m_shell) updateNavigationActions(m_shell->currentPage());

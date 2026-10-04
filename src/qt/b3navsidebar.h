@@ -26,6 +26,7 @@ enum class B3Page {
     Settings = 5,
     Send = 6,
     Receive = 7,
+    Assistant = 8,
 };
 Q_DECLARE_METATYPE(B3Page)
 

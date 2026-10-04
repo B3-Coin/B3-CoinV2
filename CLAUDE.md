@@ -1,5 +1,17 @@
 # B3Coin Core — Repository Context
 
+## Student assistant scope (owner ruling 2026-10-04)
+
+The project owner has explicitly requested that the B3 student assistant and its
+UI be developed separately with its own branch. This task uses
+`codex/b3-student-ai`; that ruling supersedes the older audit workspace and branch
+restrictions below. Work in the separate `b3-student-ai` checkout based on
+`flowmeshV2-dev`; keep changes scoped to
+the assistant, its Hive integration, documentation, and isolated tests. Do not
+alter consensus, release parameters, production data, or other working folders.
+The existing restrictions on pushes, history rewriting, dependency installation,
+and production-node testing continue to apply.
+
 ## Branch and audit scope lock (owner ruling 2026-09-03)
 
 - The authorized Claude workspace is `/Users/josh/development/ON/B3-FlowMesh`,

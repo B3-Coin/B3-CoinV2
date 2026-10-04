@@ -81,6 +81,7 @@ void B3ShellTests::everyDestinationHasMatchingTitleAndSelection_data()
     QTest::newRow("assets") << B3Page::Assets << QStringLiteral("navAssets") << QStringLiteral("Assets") << false;
     QTest::newRow("stake") << B3Page::Stake << QStringLiteral("navStake") << QStringLiteral("Stake") << false;
     QTest::newRow("settings") << B3Page::Settings << QStringLiteral("navSettings") << QStringLiteral("Settings") << false;
+    QTest::newRow("assistant") << B3Page::Assistant << QStringLiteral("navAssistant") << QStringLiteral("Assistant") << false;
 }
 
 void B3ShellTests::everyDestinationHasMatchingTitleAndSelection()
@@ -92,6 +93,7 @@ void B3ShellTests::everyDestinationHasMatchingTitleAndSelection()
     B3Shell shell;
     shell.setWalletWidget(new QLabel(QStringLiteral("wallet-content")));
     shell.setSettingsPage(new QLabel(QStringLiteral("settings-content")));
+    shell.setAssistantPage(new QLabel(QStringLiteral("assistant-content")));
     QSignalSpy navigated(&shell, &B3Shell::pageSelected);
     auto* button = shell.sidebar()->findChild<QToolButton*>(button_name);
     auto* heading = shell.topStatus()->findChild<QLabel*>("B3TopStatusTitle");
