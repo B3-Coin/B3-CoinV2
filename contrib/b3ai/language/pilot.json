@@ -1,6 +1,6 @@
 {
   "schema": "b3-language-pilot-plan/v1",
-  "status": "isolated runtime installed with owner approval; numerical GPU port verified; 1000-update pilot completed; independent writing review in progress",
+  "status": "isolated runtime installed with owner approval; 1000-update GPU pilot completed; first writing exam failed; bounded continuation prepared separately",
   "purpose": "Test whether a broader language corpus and a larger random-start model improve English continuations before B3 dialogue teaching.",
   "hardware_observed": {
     "chip": "Apple M4 Max",

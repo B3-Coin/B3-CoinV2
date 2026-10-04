@@ -345,6 +345,7 @@ Run with the approved isolated runtime from this checkout:
 build-ai/language-runtime/venv/bin/python -m unittest discover -s contrib/b3ai/language/tests -v
 build-ai/language-runtime/venv/bin/python -m contrib.b3ai.language.train --corpus build-ai/language-preparation/tinystories-pilot --output build-ai/language-runs/new-benchmark --device mps --benchmark
 build-ai/language-runtime/venv/bin/python -m contrib.b3ai.language.train --corpus build-ai/language-preparation/tinystories-pilot --output build-ai/language-runs/new-pilot --device mps --steps 1000
+build-ai/language-runtime/venv/bin/python -m contrib.b3ai.language.train --corpus build-ai/language-preparation/tinystories-pilot --output build-ai/language-runs/new-continuation --initialize-from build-ai/language-runs/new-pilot/model.npz --device mps --steps 1000
 build-ai/language-runtime/venv/bin/python -m contrib.b3ai.language.evaluate --checkpoint build-ai/language-runs/new-pilot/model.npz --output build-ai/language-runs/new-pilot/exam.json --device mps
 ```
 
@@ -355,9 +356,17 @@ random baseline participates in validation selection. `model.npz` retains the
 best validation state; `last.npz` preserves the final attempted state when memory
 allows. Both record optimizer moments, steps, batch RNG, corpus and code hashes,
 runtime, and the validation loss at that state. An unscored final state has a null
-loss. This CLI currently supports fresh experiments, not resumed training runs;
-checkpoint loading itself restores the full state and passes exact CPU resume
-tests. Unknown files and checkpoints from another run cannot be overwritten.
+loss. `--initialize-from` continues in a fresh directory with the parent's
+weights, AdamW moments, steps and batch RNG. It requires matching model, corpus,
+runtime, batch/optimizer settings, source components, and reproduced validation.
+Same-code CPU split runs reproduce uninterrupted updates exactly. Only the
+explicitly pinned original GPU trainer revision is accepted across the addition
+of this continuation feature, with all numerical and batching components
+unchanged; that transition is recorded as a reviewed code-revision continuation.
+Reports distinguish local updates from global steps and cumulative targets.
+Checkpoint random-start provenance denotes our model family's origin; a continued
+run's metadata identifies its actual trained parent. Unknown files and
+checkpoints from another run cannot be overwritten.
 
 The local M4 Max benchmark measured three complete optimizer updates after one
 warmup: 0.256 seconds per update on average, with about 5.54 GB of GPU driver
@@ -373,6 +382,13 @@ Declining validation loss supports testing more training; it does not establish
 that additional updates will produce coherent language. Preserve this failed
 exam. Reusing its results to plan further experiments makes it exploratory;
 final qualification needs fresh, frozen probes.
+
+`continuation.json` predeclares three additional chunks of at most 1,000 updates
+each, with a 500-second per-chunk wall cap and 1,800-second chain cap. The fresh
+`language_exam_v2.json` was frozen before those chunks. Its full prompts are absent
+from the prepared corpus; similar phrases and near-duplicates are not excluded.
+Only validation selects checkpoints during the chain; generate fresh writing
+probes after that stage rather than at intermediate steps.
 
 `language_exam.json` freezes 20 separately authored continuation prompts and
 explicit teacher-review criteria. Test stories and exam prompts must stay out of

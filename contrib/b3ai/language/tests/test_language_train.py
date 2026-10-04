@@ -5,6 +5,7 @@
 import contextlib
 import hashlib
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,7 +15,7 @@ import numpy as np
 import torch
 
 from contrib.b3ai.language.batches import Corpus
-from contrib.b3ai.language.checkpoint import load_checkpoint
+from contrib.b3ai.language.checkpoint import load_checkpoint, save_checkpoint
 from contrib.b3ai.language.corpus import prepare_corpus
 from contrib.b3ai.language.model import GpuConfig
 from contrib.b3ai.language import train
@@ -228,6 +229,131 @@ class LanguageTrainTests(unittest.TestCase):
         self.assertTrue((self.directory / "run" / "model.npz").is_file())
         self.assertFalse((self.directory / "run" / "last.npz").exists())
         self.assertIsNone(report["last_checkpoint_sha256"])
+
+    def test_two_plus_two_continuation_matches_four_uninterrupted_cpu_updates(self):
+        whole = self.fit("whole", steps=4)
+        first = self.fit("first", steps=2)
+        parent_path = self.directory / "first" / "last.npz"
+        original_parent = parent_path.read_bytes()
+        continued = self.fit("continued", steps=2, initialize_from=parent_path)
+        whole_model, whole_optimizer, whole_metadata = load_checkpoint(self.directory / "whole" / "last.npz")
+        continued_model, continued_optimizer, continued_metadata = load_checkpoint(self.directory / "continued" / "last.npz")
+        self.assert_same_state(whole_model, whole_optimizer, continued_model, continued_optimizer)
+        self.assertEqual(whole_metadata["batch_rng_state"], continued_metadata["batch_rng_state"])
+        self.assertEqual(whole["training_tokens"], continued["cumulative_training_tokens"])
+        self.assertEqual(first["training_tokens"], continued["base_training_tokens"])
+        self.assertEqual(continued["base_step"], 2)
+        self.assertEqual(continued["attempted_steps"], 2)
+        self.assertEqual(continued["attempted_total_steps"], 4)
+        self.assertEqual(continued_metadata["selected_or_saved_step"], 4)
+        self.assertEqual(continued_metadata["run_local_step"], 2)
+        self.assertEqual(continued_metadata["training_tokens_at_save"], whole_metadata["training_tokens_at_save"])
+        self.assertEqual(continued_metadata["run_local_training_tokens_at_save"], continued["training_tokens"])
+        self.assertEqual(continued["parent_checkpoint_sha256"], hashlib.sha256(original_parent).hexdigest())
+        self.assertEqual(continued["parent_implementation_hash"], train.implementation_hash())
+        self.assertEqual(continued["component_hashes"], train.component_hashes())
+        self.assertEqual(continued["continuation"], "same-code continuation")
+        for before, after in zip(whole["history"][2:], continued["history"]):
+            self.assertEqual(before["total_step"], after["total_step"])
+            self.assertEqual(before["train"], after["train"])
+            self.assertEqual(before["validation"], after["validation"])
+        self.assertEqual(parent_path.read_bytes(), original_parent)
+        self.assertEqual(continued["parent_validation_check"]["saved_loss"],
+                         continued["parent_validation_check"]["recomputed_loss"])
+        self.assertFalse(continued["test_split_used_for_selection"])
+
+    def test_parent_state_remains_baseline_candidate_with_global_steps_and_moments(self):
+        self.fit("parent", steps=2)
+        parent_path = self.directory / "parent" / "last.npz"
+        parent_model, parent_optimizer, metadata = load_checkpoint(parent_path)
+        saved = metadata["validation_loss_at_save"]
+        with mock.patch.object(train, "score", side_effect=[4.0, saved, 3.0, saved + 1, 2.0, saved + 2]):
+            report = self.fit("child", steps=2, initialize_from=parent_path)
+        child_model, child_optimizer, selected = load_checkpoint(self.directory / "child" / "model.npz")
+        self.assert_same_state(parent_model, parent_optimizer, child_model, child_optimizer)
+        self.assertEqual(report["selected_step"], 0)
+        self.assertEqual(report["selected_total_step"], 2)
+        self.assertEqual(selected["selected_or_saved_step"], 2)
+        self.assertEqual(selected["run_local_step"], 0)
+        self.assertEqual(selected["training_tokens_at_save"], metadata["training_tokens_at_save"])
+        self.assertEqual(selected["batch_rng_state"], metadata["batch_rng_state"])
+
+    def test_continuation_rejects_mismatched_contracts_before_output_reservation(self):
+        self.fit("parent", steps=2)
+        parent = self.directory / "parent" / "last.npz"
+        model, optimizer, metadata = load_checkpoint(parent)
+        mutations = {
+            "corpus": lambda value: value.update(corpus_manifest_hash="0" * 64),
+            "runtime": lambda value: value["runtime"].update(torch="different-version"),
+            "code": lambda value: value.update(implementation_hash="0" * 64),
+            "component": lambda value: value["component_hashes"].update({"model.py": "0" * 64}),
+            "family": lambda value: value.update(model_family_origin="external pretrained weights"),
+            "batch": lambda value: value["training"].update(batch_size=4),
+            "lr": lambda value: value["training"].update(learning_rate=0.0004),
+            "decay": lambda value: value["training"].update(weight_decay=0.02),
+            "clip": lambda value: value["training"].update(clip_norm=2.0),
+            "validation_batches": lambda value: value["training"].update(validation_batches=2),
+            "rng_kind": lambda value: value["batch_rng_state"].update(bit_generator="MT19937"),
+            "rng_missing": lambda value: value["batch_rng_state"].pop("uinteger"),
+            "rng_counter": lambda value: value["batch_rng_state"].update(has_uint32=True),
+            "rng_increment": lambda value: value["batch_rng_state"]["state"].update(inc=2),
+            "tokens": lambda value: value.update(training_tokens_at_save=-1),
+            "global_step": lambda value: value.update(selected_or_saved_step=3),
+            "local_step": lambda value: value.update(run_local_step=3),
+            "validation_loss": lambda value: value.update(validation_loss_at_save=value["validation_loss_at_save"] + 1),
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(contract=name):
+                changed = json.loads(json.dumps(metadata))
+                mutation(changed)
+                candidate = self.directory / (name + ".npz")
+                save_checkpoint(candidate, model, optimizer, changed)
+                with self.assertRaises(ValueError):
+                    self.fit("rejected-" + name, steps=2, initialize_from=candidate)
+                self.assertFalse((self.directory / ("rejected-" + name)).exists())
+        original_config = self.config
+        self.config = GpuConfig(**dict(self.config.to_dict(), seed=43))
+        with self.assertRaises(ValueError):
+            self.fit("wrong-config", steps=2, initialize_from=parent)
+        self.assertFalse((self.directory / "wrong-config").exists())
+        self.config = original_config
+        optimizer.param_groups[0]["weight_decay"] = 0.02
+        wrong_optimizer = self.directory / "wrong-optimizer.npz"
+        save_checkpoint(wrong_optimizer, model, optimizer, metadata)
+        with self.assertRaises(ValueError):
+            self.fit("wrong-optimizer", steps=2, initialize_from=wrong_optimizer)
+        self.assertFalse((self.directory / "wrong-optimizer").exists())
+
+    def test_only_the_reviewed_legacy_trainer_can_cross_code_revisions(self):
+        self.fit("parent", steps=2)
+        model, optimizer, metadata = load_checkpoint(self.directory / "parent" / "last.npz")
+        metadata.pop("component_hashes")
+        metadata["implementation_hash"] = train.REVIEWED_LEGACY_TRAINER
+        legacy = self.directory / "legacy.npz"
+        save_checkpoint(legacy, model, optimizer, metadata)
+        report = self.fit("legacy-child", steps=1, initialize_from=legacy)
+        self.assertEqual(report["base_step"], 2)
+        self.assertEqual(report["attempted_total_steps"], 3)
+        self.assertEqual(report["continuation"], "continuation from explicitly reviewed trainer revision")
+        changed_components = dict(train.component_hashes(), **{"model.py": "0" * 64})
+        with mock.patch.object(train, "component_hashes", return_value=changed_components):
+            with self.assertRaises(ValueError):
+                self.fit("changed-components", steps=1, initialize_from=legacy)
+        self.assertFalse((self.directory / "changed-components").exists())
+        metadata["implementation_hash"] = "f" * 64
+        unsupported = self.directory / "unsupported.npz"
+        save_checkpoint(unsupported, model, optimizer, metadata)
+        with self.assertRaises(ValueError):
+            self.fit("unsupported", steps=1, initialize_from=unsupported)
+        self.assertFalse((self.directory / "unsupported").exists())
+
+    def test_continuation_does_not_overwrite_parent_or_existing_run(self):
+        self.fit("parent", steps=2)
+        parent_path = self.directory / "parent" / "last.npz"
+        files = {path.name: path.read_bytes() for path in parent_path.parent.iterdir()}
+        with self.assertRaises(FileExistsError):
+            self.fit("parent", steps=2, initialize_from=parent_path)
+        self.assertEqual({path.name: path.read_bytes() for path in parent_path.parent.iterdir()}, files)
 
 
 if __name__ == "__main__":

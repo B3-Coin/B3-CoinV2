@@ -16,13 +16,130 @@ import numpy as np
 import torch
 
 from .batches import Corpus, TOKENIZER_VERSION
-from .checkpoint import save_checkpoint
+from .checkpoint import MAX_STEPS, load_checkpoint, save_checkpoint
 from .model import GpuConfig, TorchTransformer
 
 
 MAX_SECONDS = 7200
 MAX_TOKENS = 8192000
 MAX_MEMORY = 32 * 1024**3
+VALIDATION_ATOL = 2e-5
+VALIDATION_RTOL = 1e-5
+MODEL_FAMILY_ORIGIN = "our own randomly initialized byte/EOD language Transformer"
+# A reviewed trainer revision may continue only with the unchanged numerical,
+# persistence and corpus-batching components that produced the original run.
+REVIEWED_LEGACY_TRAINER = "e7b037e57cb15d4e7c9e591f8a32d8500ec8c558c2e69857bf6de14dfc7eb451"
+REVIEWED_LEGACY_COMPONENTS = {
+    "model.py": "a2cf234c658d797688bd5445cf5a805073c65e5bf852b82c07cedce0cdcb6d46",
+    "checkpoint.py": "eb8dddd903a9c826ab3c0c7f60829f22945c9858cd7ddfe72b70743e806ebffa",
+    "batches.py": "2f432329f32a9438b83bc8c7b17653bc355865858dce5b3503d5b2b8f08d5b99",
+}
+
+
+def component_hashes():
+    return {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+            for name in ("model.py", "checkpoint.py", "batches.py")}
+
+
+def _file_hash(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _parent_state(model, optimizer, metadata, config, versions, corpus, batch_size,
+                  learning_rate, validation_batches, code_hash, components, steps):
+    """Validate a continuation contract; no arbitrary trainer revision is accepted."""
+    if (model.config != config or metadata.get("stage") != "language-pilot"
+            or metadata.get("experimental") is not True
+            or metadata.get("runtime") != versions
+            or metadata.get("corpus_manifest_hash") != corpus.manifest_hash):
+        raise ValueError("Continuation configuration, corpus or runtime does not match the parent.")
+    parent_code = metadata.get("implementation_hash")
+    if parent_code == code_hash and metadata.get("component_hashes") == components:
+        continuation = "same-code continuation"
+        if metadata.get("model_family_origin") != MODEL_FAMILY_ORIGIN:
+            raise ValueError("Continuation parent has an incompatible model-family origin.")
+    elif (parent_code == REVIEWED_LEGACY_TRAINER and components == REVIEWED_LEGACY_COMPONENTS
+          and "component_hashes" not in metadata):
+        continuation = "continuation from explicitly reviewed trainer revision"
+    else:
+        raise ValueError("Continuation parent trainer or component hashes are incompatible.")
+    settings = metadata.get("training")
+    invariants = {"batch_size": batch_size, "learning_rate": learning_rate,
+                  "weight_decay": 0.01, "clip_norm": 1.0, "validation_batches": validation_batches}
+    if type(settings) is not dict or any(type(settings.get(key)) is not type(value)
+            or settings[key] != value for key, value in invariants.items()):
+        raise ValueError("Continuation training settings do not match the parent.")
+    if len(optimizer.param_groups) != 1:
+        raise ValueError("Continuation requires one AdamW parameter group.")
+    group = optimizer.param_groups[0]
+    if (group["lr"] != learning_rate or group["betas"] != (0.9, 0.999)
+            or group["eps"] != 1e-8 or group["weight_decay"] != 0.01
+            or any(group.get(option) is not False for option in
+                   ("amsgrad", "maximize", "capturable", "differentiable", "foreach", "fused"))):
+        raise ValueError("Continuation AdamW settings are incompatible.")
+    base_step, base_tokens = metadata.get("selected_or_saved_step"), metadata.get("training_tokens_at_save")
+    if (type(base_step) is not int or not 0 <= base_step <= MAX_STEPS - steps
+            or type(base_tokens) is not int
+            or not base_step * batch_size <= base_tokens <= base_step * batch_size * config.context_length):
+        raise ValueError("Continuation parent steps or cumulative token count are invalid.")
+    states = optimizer.state
+    if base_step == 0:
+        if states:
+            raise ValueError("A step-zero continuation must have an uninitialized optimizer.")
+    elif (set(states) != set(model.params.values())
+          or any(state["step"].item() != base_step for state in states.values())):
+        raise ValueError("Continuation optimizer parameter steps do not match the saved global step.")
+    if "run_local_step" in metadata:
+        local, previous_base = metadata["run_local_step"], metadata.get("base_step")
+        local_tokens, previous_tokens = metadata.get("run_local_training_tokens_at_save"), metadata.get("base_training_tokens")
+        if (type(local) is not int or type(previous_base) is not int or min(local, previous_base) < 0
+                or local + previous_base != base_step
+                or type(local_tokens) is not int or type(previous_tokens) is not int
+                or min(local_tokens, previous_tokens) < 0 or local_tokens + previous_tokens != base_tokens
+                or metadata.get("cumulative_training_tokens_at_save") != base_tokens):
+            raise ValueError("Continuation parent local/global counters are inconsistent.")
+    raw_rng = metadata.get("batch_rng_state")
+    if (type(raw_rng) is not dict or set(raw_rng) != {"bit_generator", "state", "has_uint32", "uinteger"}
+            or raw_rng["bit_generator"] != "PCG64" or type(raw_rng["state"]) is not dict
+            or set(raw_rng["state"]) != {"state", "inc"}
+            or any(type(value) is not int or not 0 <= value < 2**128 for value in raw_rng["state"].values())
+            or raw_rng["state"]["inc"] % 2 != 1
+            or type(raw_rng["has_uint32"]) is not int or raw_rng["has_uint32"] not in (0, 1)
+            or type(raw_rng["uinteger"]) is not int or not 0 <= raw_rng["uinteger"] < 2**32):
+        raise ValueError("Continuation parent batch RNG state is invalid.")
+    rng = np.random.default_rng(config.seed)
+    try:
+        rng.bit_generator.state = raw_rng
+    except (ValueError, TypeError, OverflowError) as error:
+        raise ValueError("Continuation parent batch RNG cannot be restored.") from error
+    if rng.bit_generator.state != raw_rng:
+        raise ValueError("Continuation parent batch RNG state was not restored exactly.")
+    parent_loss = metadata.get("validation_loss_at_save")
+    if parent_loss is not None and (type(parent_loss) not in (int, float)
+                                   or not math.isfinite(parent_loss) or parent_loss < 0):
+        raise ValueError("Continuation parent validation loss is invalid.")
+    return rng, base_step, base_tokens, continuation, parent_loss
+
+
+def _move_state(model, optimizer, device):
+    """Move parameters and moments together, retaining CPU scalar step counters."""
+    before = model.params
+    states = {name: optimizer.state.get(parameter) for name, parameter in before.items()}
+    group = optimizer.param_groups[0]
+    model.to(device)
+    result = torch.optim.AdamW(list(model.params.values()), lr=group["lr"], betas=group["betas"],
+                              eps=group["eps"], weight_decay=group["weight_decay"], foreach=False, fused=False)
+    for name, state in states.items():
+        if state is not None:
+            parameter = model.params[name]
+            result.state[parameter] = {"step": state["step"].cpu(),
+                                       "exp_avg": state["exp_avg"].to(device),
+                                       "exp_avg_sq": state["exp_avg_sq"].to(device)}
+    return result
 
 
 def implementation_hash():
@@ -99,8 +216,8 @@ def _report(output, report):
 
 def fit(corpus_path, output, config, *, device="cpu", steps=1000, batch_size=4,
         evaluation_interval=100, validation_batches=4, max_seconds=MAX_SECONDS,
-        max_tokens=MAX_TOKENS, learning_rate=0.0003):
-    """Reserve a fresh run; select by validation, never inspect the test split."""
+        max_tokens=MAX_TOKENS, learning_rate=0.0003, initialize_from=None):
+    """Start or continue in a fresh run; select only by fixed validation batches."""
     _limits(config, steps, batch_size, evaluation_interval, validation_batches,
             max_seconds, max_tokens, learning_rate)
     versions = runtime(device)
@@ -108,21 +225,39 @@ def fit(corpus_path, output, config, *, device="cpu", steps=1000, batch_size=4,
     if not all(corpus.splits[split] for split in ("train", "validation", "test")):
         raise ValueError("A pilot needs nonempty train, validation and untouched test splits.")
     output = Path(output)
-    output.mkdir(parents=True, exist_ok=False)
+    if output.exists() or output.is_symlink():
+        raise FileExistsError("Training output already exists; every continuation needs a fresh directory.")
     started = time.monotonic()
-    model = TorchTransformer(config).to(device)
-    optimizer = torch.optim.AdamW(list(model.params.values()), lr=learning_rate,
-                                 weight_decay=0.01, foreach=False, fused=False)
-    rng = np.random.default_rng(config.seed)
+    code_hash, components = implementation_hash(), component_hashes()
+    parent_sha, parent_code, parent_loss = None, None, None
+    base_step, base_tokens, continuation = 0, 0, "fresh random-start training"
+    if initialize_from is None:
+        model = TorchTransformer(config).to(device)
+        optimizer = torch.optim.AdamW(list(model.params.values()), lr=learning_rate,
+                                     weight_decay=0.01, foreach=False, fused=False)
+        rng = np.random.default_rng(config.seed)
+    else:
+        model, optimizer, parent = load_checkpoint(initialize_from, device="cpu")
+        parent_sha = _file_hash(initialize_from)
+        rng, base_step, base_tokens, continuation, parent_loss = _parent_state(
+            model, optimizer, parent, config, versions, corpus, batch_size,
+            learning_rate, validation_batches, code_hash, components, steps)
+        parent_code = parent["implementation_hash"]
+        optimizer = _move_state(model, optimizer, device)
     train_rng, validation_rng = np.random.default_rng(1234), np.random.default_rng(1729)
     probes = {split: [corpus.batch(split, generator, batch_size, config.context_length)
                      for _ in range(validation_batches)]
               for split, generator in (("train", train_rng), ("validation", validation_rng))}
     report = {"stage": "language-pilot", "status": "running", "experimental": True,
-              "initialization": "our own random weights; no pretrained weights",
+              "initialization": ("our own random weights; no pretrained weights" if initialize_from is None
+                                 else "own trained checkpoint; weights, AdamW and batch RNG restored"),
+              "model_family_origin": MODEL_FAMILY_ORIGIN, "continuation": continuation,
+              "parent_checkpoint_sha256": parent_sha, "parent_implementation_hash": parent_code,
+              "base_step": base_step, "base_training_tokens": base_tokens,
               "runtime": versions, "config": config.to_dict(), "parameter_count": model.parameter_count,
               "tokenizer": TOKENIZER_VERSION, "run_id": str(uuid.uuid4()),
-              "implementation_hash": implementation_hash(), "corpus_manifest_hash": corpus.manifest_hash,
+              "implementation_hash": code_hash, "component_hashes": components,
+              "corpus_manifest_hash": corpus.manifest_hash,
               "split_hashes": {key: value["sha256"] for key, value in corpus.manifest["splits"].items()},
               "training": {"batch_size": batch_size, "learning_rate": learning_rate, "weight_decay": 0.01,
                            "clip_norm": 1.0, "requested_steps": steps, "max_seconds": max_seconds,
@@ -130,7 +265,9 @@ def fit(corpus_path, output, config, *, device="cpu", steps=1000, batch_size=4,
                            "validation_batches": validation_batches, "evaluation_interval": evaluation_interval},
               "test_split_used_for_selection": False,
               "limitations": "Fixed-window validation is a selection metric, not language or assistant qualification. Resource caps are checked between complete operations.",
-              "history": [], "attempted_steps": 0, "selected_step": 0, "training_tokens": 0}
+              "history": [], "attempted_steps": 0, "selected_step": 0, "training_tokens": 0,
+              "attempted_total_steps": base_step, "selected_total_step": base_step,
+              "cumulative_training_tokens": base_tokens}
     peak = memory(device)
 
     def observe_memory():
@@ -139,8 +276,15 @@ def fit(corpus_path, output, config, *, device="cpu", steps=1000, batch_size=4,
     def snapshot(path, step, validation):
         metadata = {"stage": "language-pilot", "experimental": True, "run_id": report["run_id"],
                     "implementation_hash": report["implementation_hash"], "corpus_manifest_hash": corpus.manifest_hash,
-                    "runtime": versions, "selected_or_saved_step": step, "validation_loss_at_save": validation,
-                    "training_tokens_at_save": report["training_tokens"], "batch_rng_state": rng.bit_generator.state,
+                    "component_hashes": components, "model_family_origin": MODEL_FAMILY_ORIGIN,
+                    "continuation": continuation, "parent_checkpoint_sha256": parent_sha,
+                    "parent_implementation_hash": parent_code, "base_step": base_step, "base_training_tokens": base_tokens,
+                    "runtime": versions, "selected_or_saved_step": base_step + step, "run_local_step": step,
+                    "validation_loss_at_save": validation,
+                    "training_tokens_at_save": base_tokens + report["training_tokens"],
+                    "cumulative_training_tokens_at_save": base_tokens + report["training_tokens"],
+                    "run_local_training_tokens_at_save": report["training_tokens"],
+                    "batch_rng_state": rng.bit_generator.state,
                     "training": report["training"], "limits": report["limitations"]}
         save_checkpoint(path, model, optimizer, metadata)
         observe_memory()
@@ -148,10 +292,22 @@ def fit(corpus_path, output, config, *, device="cpu", steps=1000, batch_size=4,
     def evaluate(step):
         values = {split: score(model, batches, device) for split, batches in probes.items()}
         observe_memory()
-        report["history"].append({"step": step, **values, "elapsed_seconds": time.monotonic() - started})
+        report["history"].append({"step": step, "total_step": base_step + step,
+                                  **values, "elapsed_seconds": time.monotonic() - started})
         return values
 
     initial = evaluate(0)
+    if initialize_from is not None:
+        if parent_loss is not None and not math.isclose(initial["validation"], parent_loss,
+                                                        rel_tol=VALIDATION_RTOL, abs_tol=VALIDATION_ATOL):
+            raise ValueError("Parent validation loss did not reproduce on the fixed validation batches.")
+        report["parent_validation_check"] = {
+            "saved_loss": parent_loss, "recomputed_loss": initial["validation"],
+            "absolute_tolerance": VALIDATION_ATOL, "relative_tolerance": VALIDATION_RTOL,
+            "saved_loss_available": parent_loss is not None,
+        }
+    # Validate the parent and its metric before claiming a new output directory.
+    output.mkdir(parents=True, exist_ok=False)
     report["baseline"] = initial
     best = initial["validation"]
     snapshot(output / "model.npz", 0, best)
@@ -182,7 +338,9 @@ def fit(corpus_path, output, config, *, device="cpu", steps=1000, batch_size=4,
         optimizer.step()
         synchronize(device)
         report["attempted_steps"] = step
+        report["attempted_total_steps"] = base_step + step
         report["training_tokens"] += token_count
+        report["cumulative_training_tokens"] = base_tokens + report["training_tokens"]
         observe_memory()
         if max(peak.values()) >= MAX_MEMORY:
             stop = "memory_limit"
@@ -195,6 +353,7 @@ def fit(corpus_path, output, config, *, device="cpu", steps=1000, batch_size=4,
             last_validation = values["validation"]
             if last_validation < best:
                 best, report["selected_step"] = last_validation, step
+                report["selected_total_step"] = base_step + step
                 snapshot(output / "model.npz", step, best)
             report["best_validation_loss"] = best
             report["peak_memory"] = peak
@@ -208,6 +367,7 @@ def fit(corpus_path, output, config, *, device="cpu", steps=1000, batch_size=4,
         last_validation = values["validation"]
         if last_validation < best:
             best, report["selected_step"] = last_validation, attempted
+            report["selected_total_step"] = base_step + attempted
             snapshot(output / "model.npz", attempted, best)
     # Preserve the last state when feasible; stale validation is never attached
     # to a newer unscored state after a resource limit stops further evaluation.
@@ -219,8 +379,8 @@ def fit(corpus_path, output, config, *, device="cpu", steps=1000, batch_size=4,
     report.update({"status": "finished experiment; language quality not assessed", "stop_reason": stop,
                    "best_validation_loss": best, "elapsed_seconds": elapsed, "peak_memory": peak,
                    "effective_training_tokens_per_second": report["training_tokens"] / elapsed,
-                   "selected_checkpoint_sha256": hashlib.sha256((output / "model.npz").read_bytes()).hexdigest(),
-                   "last_checkpoint_sha256": hashlib.sha256((output / "last.npz").read_bytes()).hexdigest() if (output / "last.npz").exists() else None})
+                   "selected_checkpoint_sha256": _file_hash(output / "model.npz"),
+                   "last_checkpoint_sha256": _file_hash(output / "last.npz") if (output / "last.npz").exists() else None})
     _report(output, report)
     return report
 
@@ -280,15 +440,19 @@ def main(argv=None):
     parser.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     parser.add_argument("--evaluation-interval", type=int, default=100)
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--initialize-from", type=Path,
+                        help="Continue our compatible language checkpoint in a fresh output directory.")
     args = parser.parse_args(argv)
     try:
         config = GpuConfig(context_length=args.context_length, width=args.width, layers=args.layers, heads=args.heads)
         if args.benchmark:
+            if args.initialize_from is not None:
+                raise ValueError("A benchmark discards a fresh random model; it cannot continue a checkpoint.")
             result = benchmark(args.corpus, args.output, config, device=args.device, batch_size=args.batch_size)
         else:
             result = fit(args.corpus, args.output, config, device=args.device, batch_size=args.batch_size,
                          steps=args.steps, max_seconds=args.max_seconds, max_tokens=args.max_tokens,
-                         evaluation_interval=args.evaluation_interval)
+                         evaluation_interval=args.evaluation_interval, initialize_from=args.initialize_from)
         print(json.dumps(result, allow_nan=False), flush=True)
     except (OSError, ValueError, RuntimeError) as error:
         parser.exit(2, f"Language experiment failed: {error}\n")
