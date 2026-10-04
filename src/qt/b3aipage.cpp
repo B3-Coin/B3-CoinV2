@@ -14,6 +14,8 @@
 
 #include <QCheckBox>
 #include <QDir>
+#include <QFile>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QFrame>
@@ -25,6 +27,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QLocale>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -38,10 +41,132 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace {
 constexpr int MAX_DISPLAY_CHARS{20000};
+constexpr qint64 MAX_TRAINING_REPORT_BYTES{1024 * 1024};
+constexpr qint64 MAX_TRAINING_UPDATES{1 << 24};
+constexpr qint64 MAX_TRAINING_TOKENS{MAX_TRAINING_UPDATES * 16384};
+
+struct TrainingProgress {
+    QString status;
+    qint64 parameters{0};
+    qint64 attempted{0};
+    qint64 saved{0};
+    qint64 localAttempted{0};
+    qint64 localSaved{0};
+    qint64 tokens{0};
+    double currentLoss{0};
+    double bestLoss{0};
+    double elapsed{0};
+};
+
+bool ReportInteger(const QJsonObject& object, const QString& key, qint64 low, qint64 high, qint64& result)
+{
+    const QJsonValue value{object.value(key)};
+    if (!value.isDouble() || !std::isfinite(value.toDouble()) || std::floor(value.toDouble()) != value.toDouble()) return false;
+    const qint64 parsed{value.toInteger(-1)};
+    if (parsed < low || parsed > high) return false;
+    result = parsed;
+    return true;
+}
+
+bool ReportNumber(const QJsonObject& object, const QString& key, double& result)
+{
+    const QJsonValue value{object.value(key)};
+    if (!value.isDouble() || !std::isfinite(value.toDouble()) || value.toDouble() < 0) return false;
+    result = value.toDouble();
+    return true;
+}
+
+bool ParseTrainingProgress(const QJsonObject& report, TrainingProgress& result)
+{
+    if (report.value(QStringLiteral("stage")) != QStringLiteral("language-pilot") ||
+        report.value(QStringLiteral("experimental")) != true ||
+        !report.value(QStringLiteral("status")).isString() ||
+        report.value(QStringLiteral("status")).toString().isEmpty() ||
+        report.value(QStringLiteral("status")).toString().size() > 200 ||
+        !report.value(QStringLiteral("config")).isObject()) return false;
+    result.status = report.value(QStringLiteral("status")).toString();
+    const QJsonObject config{report.value(QStringLiteral("config")).toObject()};
+    qint64 vocab{0}, context{0}, width{0}, layers{0}, heads{0}, multiplier{0}, seed{0};
+    if (!ReportInteger(config, QStringLiteral("vocab_size"), 257, 257, vocab) ||
+        !ReportInteger(config, QStringLiteral("context_length"), 1, 4096, context) ||
+        !ReportInteger(config, QStringLiteral("width"), 1, 256, width) ||
+        !ReportInteger(config, QStringLiteral("layers"), 1, 8, layers) ||
+        !ReportInteger(config, QStringLiteral("heads"), 1, 16, heads) ||
+        !ReportInteger(config, QStringLiteral("ff_multiplier"), 1, 8, multiplier) ||
+        !ReportInteger(config, QStringLiteral("seed"), 0, std::numeric_limits<qint64>::max(), seed) || width % heads) return false;
+    const qint64 hidden{width * multiplier};
+    const qint64 expectedParameters{2 * vocab * width + context * width +
+        layers * (4 * width * width + 2 * width * hidden + 9 * width + hidden) + 2 * width + vocab};
+    if (!ReportInteger(report, QStringLiteral("parameter_count"), 1, 8000000, result.parameters) ||
+        result.parameters != expectedParameters ||
+        !ReportInteger(report, QStringLiteral("attempted_steps"), 0, MAX_TRAINING_UPDATES, result.localAttempted) ||
+        !ReportInteger(report, QStringLiteral("selected_step"), 0, result.localAttempted, result.localSaved) ||
+        !ReportInteger(report, QStringLiteral("training_tokens"), 0, MAX_TRAINING_TOKENS, result.tokens) ||
+        result.tokens > result.localAttempted * 16384) return false;
+    result.attempted = result.localAttempted;
+    result.saved = result.localSaved;
+    const QStringList continuationFields{QStringLiteral("base_step"), QStringLiteral("base_training_tokens"),
+        QStringLiteral("attempted_total_steps"), QStringLiteral("selected_total_step"), QStringLiteral("cumulative_training_tokens")};
+    bool continuation{false};
+    for (const QString& field : continuationFields) continuation |= report.contains(field);
+    if (continuation) {
+        qint64 baseStep{0}, baseTokens{0}, cumulative{0};
+        if (!ReportInteger(report, QStringLiteral("base_step"), 0, MAX_TRAINING_UPDATES, baseStep) ||
+            !ReportInteger(report, QStringLiteral("base_training_tokens"), 0, MAX_TRAINING_TOKENS, baseTokens) ||
+            !ReportInteger(report, QStringLiteral("attempted_total_steps"), 0, MAX_TRAINING_UPDATES, result.attempted) ||
+            !ReportInteger(report, QStringLiteral("selected_total_step"), 0, result.attempted, result.saved) ||
+            !ReportInteger(report, QStringLiteral("cumulative_training_tokens"), 0, MAX_TRAINING_TOKENS, cumulative) ||
+            result.attempted != baseStep + result.localAttempted || result.saved != baseStep + result.localSaved ||
+            cumulative != baseTokens + result.tokens || baseTokens > baseStep * 16384) return false;
+        result.tokens = cumulative;
+    }
+    if (!report.value(QStringLiteral("history")).isArray()) return false;
+    const QJsonArray history{report.value(QStringLiteral("history")).toArray()};
+    if (history.isEmpty() || history.size() > 1001) return false;
+    qint64 previous{-1};
+    double previousElapsed{0};
+    double minimumValidation{std::numeric_limits<double>::infinity()};
+    bool foundSaved{false};
+    for (const QJsonValue value : history) {
+        if (!value.isObject()) return false;
+        const QJsonObject entry{value.toObject()};
+        qint64 step{0};
+        double trainingLoss{0}, validationLoss{0}, elapsed{0};
+        if (!ReportInteger(entry, QStringLiteral("step"), 0, result.localAttempted, step) || step <= previous ||
+            !ReportNumber(entry, QStringLiteral("train"), trainingLoss) ||
+            !ReportNumber(entry, QStringLiteral("validation"), validationLoss) ||
+            !ReportNumber(entry, QStringLiteral("elapsed_seconds"), elapsed) || elapsed < previousElapsed ||
+            elapsed > 315576000 || (previous == -1 && step != 0)) return false;
+        previous = step;
+        previousElapsed = elapsed;
+        result.currentLoss = validationLoss;
+        result.elapsed = elapsed;
+        minimumValidation = std::min(minimumValidation, validationLoss);
+        if (step == result.localSaved) {
+            result.bestLoss = validationLoss;
+            foundSaved = true;
+        }
+    }
+    if (!foundSaved || std::abs(result.bestLoss - minimumValidation) > 1e-9 * std::max(1.0, result.bestLoss)) return false;
+    if (report.contains(QStringLiteral("best_validation_loss"))) {
+        double best{0};
+        if (!ReportNumber(report, QStringLiteral("best_validation_loss"), best) ||
+            std::abs(best - result.bestLoss) > 1e-9 * std::max(1.0, result.bestLoss)) return false;
+    }
+    if (report.contains(QStringLiteral("elapsed_seconds"))) {
+        double elapsed{0};
+        if (!ReportNumber(report, QStringLiteral("elapsed_seconds"), elapsed) || elapsed < result.elapsed || elapsed > 315576000) return false;
+        result.elapsed = elapsed;
+    }
+    return true;
+}
 
 QLabel* Note(const QString& text, QWidget* parent)
 {
@@ -245,6 +370,66 @@ B3AiPage::B3AiPage(interfaces::Node* node, const QString& lessonPath, QWidget* p
     connection->setWidget(connectionContent);
     m_tabs->addTab(connection, tr("Connection"));
 
+    auto* training = new QScrollArea(m_tabs);
+    training->setWidgetResizable(true);
+    training->setFrameShape(QFrame::NoFrame);
+    auto* trainingContent = new QWidget(training);
+    auto* trainingLayout = new QVBoxLayout(trainingContent);
+    trainingLayout->setContentsMargins(20, 20, 20, 20);
+    trainingLayout->setSpacing(16);
+    auto* trainingWarning = Note(tr("Experimental language training. Chat and B3 task ability are not qualified."), trainingContent);
+    trainingWarning->setObjectName(QStringLiteral("aiTrainingWarning"));
+    B3Theme::markTextRole(trainingWarning, QStringLiteral("negative"));
+    trainingLayout->addWidget(trainingWarning);
+    trainingLayout->addWidget(Note(tr("Inspect the saved progress of our own model. Choose a local report.json file, then refresh to read its latest saved update."), trainingContent));
+    m_trainingPath = new QLineEdit(trainingContent);
+    m_trainingPath->setObjectName(QStringLiteral("aiTrainingReportPath"));
+    m_trainingPath->setReadOnly(true);
+    m_trainingPath->setPlaceholderText(tr("No training report selected"));
+    trainingLayout->addWidget(m_trainingPath);
+    auto* trainingActions = new QHBoxLayout();
+    auto* chooseTraining = new QPushButton(tr("Choose training report…"), trainingContent);
+    chooseTraining->setObjectName(QStringLiteral("aiChooseTrainingReport"));
+    chooseTraining->setProperty("b3variant", QStringLiteral("primary"));
+    m_trainingRefresh = new QPushButton(tr("Refresh progress"), trainingContent);
+    m_trainingRefresh->setObjectName(QStringLiteral("aiRefreshTrainingReport"));
+    m_trainingRefresh->setEnabled(false);
+    trainingActions->addWidget(chooseTraining);
+    trainingActions->addWidget(m_trainingRefresh);
+    trainingActions->addStretch();
+    trainingLayout->addLayout(trainingActions);
+    m_trainingNotice = Note(tr("Choose a report to view actual saved values."), trainingContent);
+    m_trainingNotice->setObjectName(QStringLiteral("aiTrainingNotice"));
+    trainingLayout->addWidget(m_trainingNotice);
+    auto* trainingForm = new QFormLayout();
+    trainingForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    const auto trainingValue = [&](const QString& name, const QString& title) {
+        auto* value = Note(QStringLiteral("—"), trainingContent);
+        value->setObjectName(name);
+        value->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        trainingForm->addRow(title, value);
+        return value;
+    };
+    m_trainingStatus = trainingValue(QStringLiteral("aiTrainingStatus"), tr("Reported status"));
+    m_trainingParameters = trainingValue(QStringLiteral("aiTrainingParameters"), tr("Model parameters"));
+    m_trainingSavedUpdates = trainingValue(QStringLiteral("aiTrainingSavedUpdates"), tr("Best saved update"));
+    m_trainingAttemptedUpdates = trainingValue(QStringLiteral("aiTrainingAttemptedUpdates"), tr("Updates attempted"));
+    m_trainingTokens = trainingValue(QStringLiteral("aiTrainingTokens"), tr("Language tokens processed"));
+    m_trainingCurrentLoss = trainingValue(QStringLiteral("aiTrainingCurrentLoss"), tr("Latest validation loss"));
+    m_trainingBestLoss = trainingValue(QStringLiteral("aiTrainingBestLoss"), tr("Best validation loss"));
+    m_trainingElapsed = trainingValue(QStringLiteral("aiTrainingElapsed"), tr("Reported run time"));
+    trainingLayout->addLayout(trainingForm);
+    trainingLayout->addWidget(Note(tr("Validation loss measures text prediction errors. A lower loss does not establish readable answers, conversation skill or safe tool use. Progress belongs to the selected report; its file path is kept only for this session."), trainingContent));
+    trainingLayout->addStretch();
+    training->setWidget(trainingContent);
+    m_tabs->addTab(training, tr("Training"));
+    connect(chooseTraining, &QPushButton::clicked, this, [this] {
+        const QString selected{QFileDialog::getOpenFileName(this, tr("Choose local training report"),
+            m_trainingReportPath, tr("JSON training reports (*.json)"))};
+        if (!selected.isEmpty()) loadTrainingReport(selected);
+    });
+    connect(m_trainingRefresh, &QPushButton::clicked, this, &B3AiPage::refreshTrainingReport);
+
     const QString path{lessonPath.isEmpty()
         ? QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/student-ai/lessons.json")
         : lessonPath};
@@ -335,6 +520,63 @@ B3AiPage::B3AiPage(interfaces::Node* node, const QString& lessonPath, QWidget* p
 }
 
 B3AiPage::~B3AiPage() = default;
+
+void B3AiPage::clearTrainingValues()
+{
+    for (QLabel* value : {m_trainingStatus, m_trainingParameters, m_trainingSavedUpdates,
+            m_trainingAttemptedUpdates, m_trainingTokens, m_trainingCurrentLoss, m_trainingBestLoss, m_trainingElapsed}) {
+        value->setText(QStringLiteral("—"));
+    }
+}
+
+bool B3AiPage::loadTrainingReport(const QString& path)
+{
+    clearTrainingValues();
+    m_trainingReportPath = path;
+    m_trainingPath->setText(path.left(4096));
+    m_trainingRefresh->setEnabled(!path.isEmpty());
+    const auto failure = [this](const QString& problem) {
+        m_trainingStatus->setText(tr("Report unavailable"));
+        m_trainingNotice->setText(problem);
+        B3Theme::markTextRole(m_trainingNotice, QStringLiteral("negative"));
+        return false;
+    };
+    if (path.isEmpty() || path.size() > 4096) return failure(tr("Choose a local JSON training report."));
+    const QFileInfo info{path};
+    if (!info.isFile()) return failure(tr("The selected training report is missing or is not a regular file."));
+    if (info.size() > MAX_TRAINING_REPORT_BYTES) return failure(tr("The training report exceeds the 1 MiB size limit."));
+    QFile file{path};
+    if (!file.open(QIODevice::ReadOnly)) return failure(tr("The training report could not be opened."));
+    const QByteArray bytes{file.read(MAX_TRAINING_REPORT_BYTES + 1)};
+    if (file.error() != QFileDevice::NoError || bytes.size() > MAX_TRAINING_REPORT_BYTES) {
+        return failure(tr("The training report could not be read within its size limit."));
+    }
+    QJsonParseError parseError;
+    const QJsonDocument parsed{QJsonDocument::fromJson(bytes, &parseError)};
+    TrainingProgress progress;
+    if (parseError.error != QJsonParseError::NoError || !parsed.isObject() ||
+        !ParseTrainingProgress(parsed.object(), progress)) return failure(tr("The file is not a supported experimental language training report, or its progress values are invalid."));
+    const QLocale locale;
+    const auto updates = [&](qint64 total, qint64 local) {
+        return total == local ? locale.toString(total) : tr("%1 total · %2 in this run").arg(locale.toString(total), locale.toString(local));
+    };
+    m_trainingStatus->setText(progress.status);
+    m_trainingParameters->setText(locale.toString(progress.parameters));
+    m_trainingSavedUpdates->setText(updates(progress.saved, progress.localSaved));
+    m_trainingAttemptedUpdates->setText(updates(progress.attempted, progress.localAttempted));
+    m_trainingTokens->setText(locale.toString(progress.tokens));
+    m_trainingCurrentLoss->setText(locale.toString(progress.currentLoss, 'g', 6));
+    m_trainingBestLoss->setText(locale.toString(progress.bestLoss, 'g', 6));
+    m_trainingElapsed->setText(tr("%1 seconds").arg(locale.toString(progress.elapsed, 'f', 1)));
+    m_trainingNotice->setText(tr("Saved report loaded. Refresh to read later saved progress; this page does not run training."));
+    B3Theme::markTextRole(m_trainingNotice, QStringLiteral("secondary"));
+    return true;
+}
+
+void B3AiPage::refreshTrainingReport()
+{
+    loadTrainingReport(m_trainingReportPath);
+}
 
 void B3AiPage::detachNode()
 {

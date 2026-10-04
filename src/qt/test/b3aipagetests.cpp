@@ -7,9 +7,13 @@
 
 #include <QCheckBox>
 #include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QLocale>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSettings>
@@ -45,7 +49,8 @@ private Q_SLOTS:
         auto* composer = page.findChild<QPlainTextEdit*>("aiComposer");
         auto* transcript = page.findChild<QTextBrowser*>("aiTranscript");
         QVERIFY(tabs && tools && send && starter && composer && transcript);
-        QCOMPARE(tabs->count(), 3);
+        QCOMPARE(tabs->count(), 4);
+        QCOMPARE(tabs->tabText(3), QStringLiteral("Training"));
         QVERIFY(!tools->isChecked());
         QVERIFY(!tools->isEnabled());
         QVERIFY(!send->isEnabled());
@@ -155,7 +160,203 @@ private Q_SLOTS:
         QVERIFY(!restarted.findChild<QCheckBox*>("aiNodeTools")->isChecked());
     }
 
+    void trainingReportDisplaysActualValuesAndRefreshes()
+    {
+        B3AiPage page{nullptr, path()};
+        auto* refresh = page.findChild<QPushButton*>("aiRefreshTrainingReport");
+        QVERIFY(refresh && !refresh->isEnabled());
+        QVERIFY(page.findChild<QLabel*>("aiTrainingWarning")->text().contains(QStringLiteral("not qualified")));
+        const QString reportPath{m_state->filePath(QStringLiteral("report.json"))};
+        QVERIFY(writeReport(reportPath, trainingReport()));
+        QVERIFY(page.loadTrainingReport(reportPath));
+        QVERIFY(refresh->isEnabled());
+        QCOMPARE(page.findChild<QLineEdit*>("aiTrainingReportPath")->text(), reportPath);
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingParameters")->text(), QLocale().toString(qint64{5395201}));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingSavedUpdates")->text(), QLocale().toString(qint64{1000}));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingTokens")->text(), QLocale().toString(qint64{3556921}));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingCurrentLoss")->text(), QLocale().toString(2.02, 'g', 6));
+        auto updated = trainingReport();
+        updated.insert(QStringLiteral("status"), QStringLiteral("running"));
+        updated.insert(QStringLiteral("attempted_steps"), 1100);
+        updated.insert(QStringLiteral("training_tokens"), 3900000);
+        auto history = updated.value(QStringLiteral("history")).toArray();
+        history.append(QJsonObject{{QStringLiteral("step"), 1100}, {QStringLiteral("train"), 2.1},
+            {QStringLiteral("validation"), 2.1}, {QStringLiteral("elapsed_seconds"), 290.0}});
+        updated.insert(QStringLiteral("history"), history);
+        updated.insert(QStringLiteral("elapsed_seconds"), 291.0);
+        QVERIFY(writeReport(reportPath, updated));
+        refresh->click();
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingAttemptedUpdates")->text(), QLocale().toString(qint64{1100}));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingSavedUpdates")->text(), QLocale().toString(qint64{1000}));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingCurrentLoss")->text(), QLocale().toString(2.1, 'g', 6));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingBestLoss")->text(), QLocale().toString(2.02, 'g', 6));
+        QVERIFY(!page.findChild<B3AiClient*>()->busy());
+    }
+
+    void continuedTrainingSeparatesLocalAndTotalProgress()
+    {
+        B3AiPage page{nullptr, path()};
+        auto report = trainingReport();
+        report.insert(QStringLiteral("base_step"), 1000);
+        report.insert(QStringLiteral("base_training_tokens"), 3556921);
+        report.insert(QStringLiteral("attempted_total_steps"), 2000);
+        report.insert(QStringLiteral("selected_total_step"), 2000);
+        report.insert(QStringLiteral("cumulative_training_tokens"), 7113842);
+        const QString reportPath{m_state->filePath(QStringLiteral("report.json"))};
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(page.loadTrainingReport(reportPath));
+        const QString expected{QStringLiteral("%1 total · %2 in this run")
+            .arg(QLocale().toString(qint64{2000}), QLocale().toString(qint64{1000}))};
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingSavedUpdates")->text(), expected);
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingAttemptedUpdates")->text(), expected);
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingTokens")->text(), QLocale().toString(qint64{7113842}));
+        report.insert(QStringLiteral("selected_total_step"), 1999);
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(!page.loadTrainingReport(reportPath));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingTokens")->text(), QStringLiteral("—"));
+    }
+
+    void invalidTrainingSchemaClearsStaleProgress()
+    {
+        B3AiPage page{nullptr, path()};
+        const QString reportPath{m_state->filePath(QStringLiteral("report.json"))};
+        QList<QJsonObject> invalid;
+        auto report = trainingReport();
+        report.insert(QStringLiteral("stage"), QStringLiteral("sanity-dialogue"));
+        invalid.append(report);
+        report = trainingReport();
+        report.insert(QStringLiteral("experimental"), false);
+        invalid.append(report);
+        report = trainingReport();
+        report.insert(QStringLiteral("parameter_count"), 8000001);
+        invalid.append(report);
+        report = trainingReport();
+        report.insert(QStringLiteral("attempted_steps"), 0.5);
+        invalid.append(report);
+        report = trainingReport();
+        report.insert(QStringLiteral("selected_step"), 1001);
+        invalid.append(report);
+        report = trainingReport();
+        report.insert(QStringLiteral("best_validation_loss"), -1.0);
+        invalid.append(report);
+        report = trainingReport();
+        auto config = report.value(QStringLiteral("config")).toObject();
+        config.insert(QStringLiteral("context_length"), 4097);
+        report.insert(QStringLiteral("config"), config);
+        invalid.append(report);
+        report = trainingReport();
+        auto history = report.value(QStringLiteral("history")).toArray();
+        auto row = history.last().toObject();
+        row.insert(QStringLiteral("validation"), QStringLiteral("not a number"));
+        history.replace(history.size() - 1, row);
+        report.insert(QStringLiteral("history"), history);
+        invalid.append(report);
+        for (const auto& value : invalid) {
+            QVERIFY(writeReport(reportPath, trainingReport()));
+            QVERIFY(page.loadTrainingReport(reportPath));
+            QVERIFY(writeReport(reportPath, value));
+            QVERIFY(!page.loadTrainingReport(reportPath));
+            for (const QString& name : {QStringLiteral("aiTrainingParameters"), QStringLiteral("aiTrainingSavedUpdates"),
+                    QStringLiteral("aiTrainingTokens"), QStringLiteral("aiTrainingCurrentLoss"), QStringLiteral("aiTrainingElapsed")}) {
+                QCOMPARE(page.findChild<QLabel*>(name)->text(), QStringLiteral("—"));
+            }
+            QCOMPARE(page.findChild<QLabel*>("aiTrainingStatus")->text(), QStringLiteral("Report unavailable"));
+            QVERIFY(!page.findChild<QLabel*>("aiTrainingNotice")->text().isEmpty());
+        }
+    }
+
+    void malformedOversizedAndMissingTrainingReportsClearValues()
+    {
+        B3AiPage page{nullptr, path()};
+        const QString reportPath{m_state->filePath(QStringLiteral("report.json"))};
+        const QList<QByteArray> invalid{QByteArray{"{broken"}, QByteArray{"{\"stage\":\"language-pilot\",\"best_validation_loss\":NaN}"},
+            QByteArray{"{\"stage\":\"language-pilot\",\"best_validation_loss\":1e999}"}, QByteArray(1024 * 1024 + 1, ' ')};
+        for (const auto& bytes : invalid) {
+            QVERIFY(writeReport(reportPath, trainingReport()));
+            QVERIFY(page.loadTrainingReport(reportPath));
+            QFile file{reportPath};
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(file.write(bytes), bytes.size());
+            file.close();
+            page.findChild<QPushButton*>("aiRefreshTrainingReport")->click();
+            QCOMPARE(page.findChild<QLabel*>("aiTrainingTokens")->text(), QStringLiteral("—"));
+            QCOMPARE(page.findChild<QLabel*>("aiTrainingStatus")->text(), QStringLiteral("Report unavailable"));
+        }
+        QVERIFY(writeReport(reportPath, trainingReport()));
+        QVERIFY(page.loadTrainingReport(reportPath));
+        QVERIFY(QFile::remove(reportPath));
+        page.findChild<QPushButton*>("aiRefreshTrainingReport")->click();
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingParameters")->text(), QStringLiteral("—"));
+        QVERIFY(!page.loadTrainingReport(m_state->path()));
+    }
+
+    void reportedBestMustMatchLowestObservedValidationLoss()
+    {
+        B3AiPage page{nullptr, path()};
+        const QString reportPath{m_state->filePath(QStringLiteral("report.json"))};
+        QVERIFY(writeReport(reportPath, trainingReport()));
+        QVERIFY(page.loadTrainingReport(reportPath));
+        auto report = trainingReport();
+        auto history = report.value(QStringLiteral("history")).toArray();
+        // The selected step and its claimed best loss agree with each other,
+        // but another recorded evaluation was better. This must not appear
+        // in the UI as a valid best-checkpoint selection.
+        history.insert(1, QJsonObject{{QStringLiteral("step"), 500}, {QStringLiteral("train"), 2.0},
+            {QStringLiteral("validation"), 1.9}, {QStringLiteral("elapsed_seconds"), 130.0}});
+        report.insert(QStringLiteral("history"), history);
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(!page.loadTrainingReport(reportPath));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingBestLoss")->text(), QStringLiteral("—"));
+        report.remove(QStringLiteral("best_validation_loss"));
+        QVERIFY(writeReport(reportPath, report));
+        QVERIFY(!page.loadTrainingReport(reportPath));
+        QCOMPARE(page.findChild<QLabel*>("aiTrainingSavedUpdates")->text(), QStringLiteral("—"));
+    }
+
+    void trainingPathIsSessionOnlyAndReportStatusIsPlainText()
+    {
+        const QString reportPath{m_state->filePath(QStringLiteral("PRIVATE_SELECTED_TRAINING_REPORT.json"))};
+        auto report = trainingReport();
+        const QString status{QStringLiteral("<img src='https://example.invalid/pixel'>running")};
+        report.insert(QStringLiteral("status"), status);
+        QVERIFY(writeReport(reportPath, report));
+        B3AiPage page{nullptr, path()};
+        QVERIFY(page.loadTrainingReport(reportPath));
+        auto* label = page.findChild<QLabel*>("aiTrainingStatus");
+        QCOMPARE(label->text(), status);
+        QCOMPARE(label->textFormat(), Qt::PlainText);
+        for (const QString& name : QSettings{}.allKeys()) {
+            QVERIFY(!QSettings{}.value(name).toString().contains(QStringLiteral("PRIVATE_SELECTED_TRAINING_REPORT")));
+        }
+        B3AiPage restarted{nullptr, path()};
+        QVERIFY(restarted.findChild<QLineEdit*>("aiTrainingReportPath")->text().isEmpty());
+        QVERIFY(!restarted.findChild<QPushButton*>("aiRefreshTrainingReport")->isEnabled());
+    }
+
 private:
+    QJsonObject trainingReport() const
+    {
+        return {{QStringLiteral("stage"), QStringLiteral("language-pilot")},
+            {QStringLiteral("experimental"), true},
+            {QStringLiteral("status"), QStringLiteral("finished experiment; language quality not assessed")},
+            {QStringLiteral("config"), QJsonObject{{QStringLiteral("vocab_size"), 257}, {QStringLiteral("context_length"), 2048},
+                {QStringLiteral("width"), 256}, {QStringLiteral("layers"), 6}, {QStringLiteral("heads"), 8},
+                {QStringLiteral("ff_multiplier"), 4}, {QStringLiteral("seed"), 42}}},
+            {QStringLiteral("parameter_count"), 5395201}, {QStringLiteral("attempted_steps"), 1000},
+            {QStringLiteral("selected_step"), 1000}, {QStringLiteral("training_tokens"), 3556921},
+            {QStringLiteral("best_validation_loss"), 2.02}, {QStringLiteral("elapsed_seconds"), 265.8},
+            {QStringLiteral("history"), QJsonArray{QJsonObject{{QStringLiteral("step"), 0}, {QStringLiteral("train"), 5.71},
+                {QStringLiteral("validation"), 5.75}, {QStringLiteral("elapsed_seconds"), 1.2}},
+                QJsonObject{{QStringLiteral("step"), 1000}, {QStringLiteral("train"), 2.09},
+                {QStringLiteral("validation"), 2.02}, {QStringLiteral("elapsed_seconds"), 265.7}}}}};
+    }
+    bool writeReport(const QString& reportPath, const QJsonObject& report) const
+    {
+        QFile file{reportPath};
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+        const QByteArray bytes{QJsonDocument(report).toJson()};
+        return file.write(bytes) == bytes.size();
+    }
     QString path() const { return m_state->filePath(QStringLiteral("lessons.json")); }
     std::unique_ptr<QTemporaryDir> m_state;
 };

@@ -36,6 +36,8 @@ public:
     ~B3AiPage() override;
     //! Drain pending node reads before the application tears down its core.
     void detachNode();
+    //! Inspect a bounded local progress report; never starts training or a node.
+    bool loadTrainingReport(const QString& path);
 
 private:
     void resizeEvent(QResizeEvent* event) override;
@@ -51,6 +53,8 @@ private:
     void saveDraft();
     void approveLesson();
     void removeLesson();
+    void refreshTrainingReport();
+    void clearTrainingValues();
 
     interfaces::Node* m_node{nullptr};
     B3AiClient* m_client{nullptr};
@@ -81,6 +85,18 @@ private:
     QBoxLayout* m_starterLayout{nullptr};
     QBoxLayout* m_chatActions{nullptr};
     QBoxLayout* m_lessonActions{nullptr};
+    QLineEdit* m_trainingPath{nullptr};
+    QLabel* m_trainingNotice{nullptr};
+    QLabel* m_trainingStatus{nullptr};
+    QLabel* m_trainingParameters{nullptr};
+    QLabel* m_trainingSavedUpdates{nullptr};
+    QLabel* m_trainingAttemptedUpdates{nullptr};
+    QLabel* m_trainingTokens{nullptr};
+    QLabel* m_trainingCurrentLoss{nullptr};
+    QLabel* m_trainingBestLoss{nullptr};
+    QLabel* m_trainingElapsed{nullptr};
+    QPushButton* m_trainingRefresh{nullptr};
+    QString m_trainingReportPath;
     bool m_configured{false};
     bool m_lessonWritable{false};
     bool m_loadingLesson{false};

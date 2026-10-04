@@ -42,14 +42,18 @@ int main(int argc, char* argv[])
     shell.show();
 
     const QStringList args = app.arguments();
+    const int training_report = args.indexOf(QStringLiteral("--training-report"));
+    if (training_report >= 0 && training_report + 1 < args.size()) {
+        if (!page->loadTrainingReport(args.at(training_report + 1))) return 1;
+    }
     const int capture = args.indexOf(QStringLiteral("--capture-dir"));
     if (capture >= 0 && capture + 1 < args.size()) {
         const QString output = args.at(capture + 1);
         if (!QDir().mkpath(output)) return 1;
-        QTimer::singleShot(300, &shell, [&] {
+        QTimer::singleShot(300, &shell, [&, output] {
             bool okay = true;
             auto* tabs = page->findChild<QTabWidget*>();
-            const QStringList names{QStringLiteral("chat"), QStringLiteral("lessons"), QStringLiteral("connection")};
+            const QStringList names{QStringLiteral("chat"), QStringLiteral("lessons"), QStringLiteral("connection"), QStringLiteral("training")};
             for (int index = 0; index < names.size(); ++index) {
                 if (tabs) tabs->setCurrentIndex(index);
                 if (index == 1) {

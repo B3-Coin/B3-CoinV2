@@ -77,7 +77,7 @@ translation changes.
 
 ## Student assistant prototype
 
-The Hive sidebar now includes **Assistant**, with Chat, Lessons and Connection
+The Hive sidebar now includes **Assistant**, with Chat, Lessons, Connection and Training
 tabs. This is a separate application feature; it does not change B3 consensus.
 
 In **Connection**, enter a model-service URL, a model name and, when required,
@@ -119,9 +119,17 @@ ctest --test-dir build -R '^test_b3_ai-' --output-on-failure
 The model-client tests use a loopback mock service; the other checks create no
 node, wallet, model connection or chain datadir. The manual preview at
 `build/bin/b3_student_ai_preview` uses disposable settings and lessons, without
-starting B3. Pass `--capture-dir /path/to/screenshots` to capture its four UI
-views. A preview is disconnected until a service is configured; it does not
+starting B3. Pass `--capture-dir /path/to/screenshots` to capture its four tabs
+and compact layout. Pass `--training-report /path/to/report.json` to inspect a
+saved language training report. A preview is disconnected until a service is configured; it does not
 simulate successful model replies or invent node observations.
+
+In **Training**, choose a local language `report.json` and click **Refresh
+progress** to read its latest saved state. The view shows model size, saved and
+attempted local/global updates, processed targets, validation loss and elapsed
+run time. It checks report size, schema and numeric consistency, clears stale
+values on errors, and retains the path only for the current session. This view
+does not start training or qualify a model for chat or B3 tasks.
 
 Next development milestones are a reproducible B3 question/task evaluation set,
 teacher-reviewed improvement experiments and then additional task tools with
