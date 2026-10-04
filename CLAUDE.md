@@ -9,8 +9,15 @@ restrictions below. Work in the separate `b3-student-ai` checkout based on
 `flowmeshV2-dev`; keep changes scoped to
 the assistant, its Hive integration, documentation, and isolated tests. Do not
 alter consensus, release parameters, production data, or other working folders.
-The existing restrictions on pushes, history rewriting, dependency installation,
-and production-node testing continue to apply.
+The existing restrictions on pushes, history rewriting and production-node
+testing continue to apply. The owner explicitly approved installing PyTorch,
+NumPy and their required runtime dependencies for this task, and recording this
+limited exception. Install them only in the isolated ignored
+`build-ai/language-runtime/venv` within this checkout, for developing and testing
+the local GPU language-training experiment. This exception does not authorize
+global installations, other projects, external compute spending, pretrained
+model downloads or production-node testing. The dependency prohibition below
+continues to govern other work.
 
 ## Branch and audit scope lock (owner ruling 2026-09-03)
 
