@@ -772,11 +772,24 @@ class B3BridgeRT2LightClientTest(B3BridgeChainMixin, BitcoinTestFramework):
         n4.wait_until_stopped(timeout=180)
         assert_equal(read_record(record), original)
 
+        # -stopatheight may still connect blocks past the target while shutting
+        # down (see its help text in init.cpp), so pin the tip at A3 - 1 here,
+        # keeping the stored entries at and above activation.
+        self.start_node(4, extra_args=b3_bridge_args(self.pins_path) + ["-connect=0"])
+        overshoot = n4.getblockcount() > stop_at
+        if overshoot:
+            n4.invalidateblock(n0.getblockhash(stop_at + 1))
+        assert_equal(n4.getblockcount(), stop_at)
+        assert_equal(n4.getblockheader(n0.getblockhash(BRIDGE_ACTIVATION_HEIGHT))["height"], BRIDGE_ACTIVATION_HEIGHT)
+        self.stop_node(4)
+
         self.log.info("n4: with blocks at or above activation stored, a changed file is refused at tip A3 - 1")
         with n4.assert_debug_log([f"hashBestChain={n0.getblockhash(stop_at)} height={stop_at} "]):
             stored_refusal = start_refused(n4, b3_bridge_args(self.altered_path), NODE_PINS_CHANGED_ERROR)
         assert_equal(read_record(record), original)
         self.start_node(4, extra_args=b3_bridge_args(self.pins_path))
+        if overshoot:
+            n4.reconsiderblock(n0.getblockhash(stop_at + 1))
         activation_block = n0.getblockhash(BRIDGE_ACTIVATION_HEIGHT)
         assert_equal(n4.getblockheader(activation_block)["height"], BRIDGE_ACTIVATION_HEIGHT)
         self.stop_node(4)
