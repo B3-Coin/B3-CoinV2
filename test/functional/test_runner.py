@@ -95,6 +95,8 @@ EXTENDED_SCRIPTS = [
     # RT2 and RT3a also skip without the B3_BRIDGE_TOOLS executables.
     'feature_b3_bridge_rt2_light_client.py',
     'feature_b3_bridge_rt3_v1_route_a.py --deposit-only',
+    # Fresh finality lineage (digest V2, regtest-only knob); local nodes only.
+    'feature_b3_fresh_lineage.py',
 ]
 
 # Special script to run each bench sanity check
