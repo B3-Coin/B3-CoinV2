@@ -1,0 +1,96 @@
+{
+  "schema": "b3-student-ai-publication-evidence/v1",
+  "branch": "b3-studenr-ai",
+  "inference_source_head": "805844102ab5a8975ef0099edf9517c287998f1a",
+  "date": "2026-10-05",
+  "status": "experimental; assistant readiness failed",
+  "training_or_inference_performed_during_publication": false,
+  "checkpoints": {
+    "current": {
+      "path": "build-ai/counterfactual/run/model.npz",
+      "sha256": "9be18ffb27889b6748d141f94fe3c663c70d109d09e33bdd1b072e5b165a7b85",
+      "bytes": 64819082,
+      "included_in_git_publication": false
+    },
+    "previous": {
+      "path": "build-ai/tool-learning/mps-stage-2/model.npz",
+      "sha256": "89b6320058e75c5e8cf512557571e25ce09da48b52b456b61259d7a4a31dc0f8",
+      "bytes": 64822175,
+      "included_in_git_publication": false
+    },
+    "final_audit": {
+      "path": "build-ai/counterfactual/run/last.npz",
+      "sha256": "a8c33089138861e2381aabc53172c737e38c4c61130d5a3ae07d19166365a1e9",
+      "bytes": 64819159,
+      "included_in_git_publication": false
+    }
+  },
+  "evidence": {
+    "exam.json": {
+      "sha256": "b7fc22349b3a5604bfad7ad07b416cb42d2beb6222f9b1d3cd01e137a2dc514a",
+      "bytes": 79578,
+      "local_original": "build-ai/counterfactual/fresh-test-1rw16546/exam.json"
+    },
+    "previous-raw.json": {
+      "sha256": "a445f5c51b18ddbf7afb75b8b40b56ba334fd038867a63bfde29da8346459f4b",
+      "bytes": 258610,
+      "local_original": "build-ai/counterfactual/fresh-test-1rw16546/previous-raw.json"
+    },
+    "current-raw.json": {
+      "sha256": "05a28ce93b25f007c49ce3a6c16b569c975fb3a24df3b37b1c111d68d97ce635",
+      "bytes": 153956,
+      "local_original": "build-ai/counterfactual/fresh-test-1rw16546/current-raw.json"
+    },
+    "mechanical-scores.json": {
+      "sha256": "69f2c628054ea9bed0cd2b133e30261816b21e979d3cbe154d0d08d560247e1e",
+      "bytes": 87543,
+      "local_original": "build-ai/counterfactual/fresh-test-1rw16546/mechanical-scores.json"
+    },
+    "independent-review.json": {
+      "sha256": "dfafc55c19f6e0560a462a2acc2c47ce1aa8461c5980567878cecc3d670e60c1",
+      "bytes": 72792,
+      "local_original": "build-ai/counterfactual/fresh-test-1rw16546/independent-review.json"
+    },
+    "dialogue-review.json": {
+      "sha256": "b3172f31bdfc60e52fd3aaed95d42a63d52a8f1ffaf3a259c184319dd650a051",
+      "bytes": 37264,
+      "local_original": "build-ai/counterfactual/fresh-test-1rw16546/dialogue-review.json"
+    },
+    "diagnostic.py": {
+      "sha256": "9e0e4ba2da1f337b0b1de09dcf316c6027a6a1886642d7f8676dd5b7409e261f",
+      "bytes": 24495,
+      "local_original": "build-ai/counterfactual/fresh-test-1rw16546/diagnostic.py"
+    },
+    "training-report.json": {
+      "sha256": "991094dce9fb9a7578ce942dd38644c5f7b4054a2782a08e2263c71f21f31f46",
+      "bytes": 57238,
+      "local_original": "build-ai/counterfactual/run/report.json"
+    }
+  },
+  "counterfactual_source_sha256": {
+    "contrib/b3ai/counterfactual/__init__.py": "6f905354cde8be547d999468c01cb172ff5446ea2e226d26b968e7976642debf",
+    "contrib/b3ai/counterfactual/curriculum.json": "d37672666c4fa0716cd293f9f9e8c06836284e575946b411d17b05fa8a7fb986",
+    "contrib/b3ai/counterfactual/data.py": "f6db04da07dd755e9b60a293ecc360e3f410c9df0e6a674d7f9c229abdc523fa",
+    "contrib/b3ai/counterfactual/evaluate.py": "4308a3af5c8c83eb8342ad981968c49f8749225ed5d5e32ca20ef8f1ea848620",
+    "contrib/b3ai/counterfactual/exam.json": "fb464234d522fc6e1029fae17b6f42ca41b758895634c8203c6ed4a0cc023f4c",
+    "contrib/b3ai/counterfactual/freeze.py": "8eb21ee8a38825e21a0656cf44cb844063d0aac584b1133231ea892d92b2e979",
+    "contrib/b3ai/counterfactual/plan.json": "98113a29447ce47e459dc85fa925d3c59e2de42119e09bb85fe37142fabcebec",
+    "contrib/b3ai/counterfactual/prior_probes.json": "391d62d23e4b9ce92dae79026ae0a2a4ab8b4642a62369a99c512f6a9c485135",
+    "contrib/b3ai/counterfactual/rehearse.py": "56dfdfd238dcf68a7f07fe1e1d33b61595601a4aa55108a4d3b3e2c53cde189e",
+    "contrib/b3ai/counterfactual/tests/support.py": "4ec387deb32172d76dd4e483d594f1619e582ca1e5a4dabf543ee56c15c32b94",
+    "contrib/b3ai/counterfactual/tests/test_data.py": "bb15da98083ed1700398071c4635f89671ed9b27ce86e47ad9d230f99d1da395",
+    "contrib/b3ai/counterfactual/tests/test_evaluate.py": "895e635bbe98fdcd334a7dae3193bd9d7875c0a02bec5e1fd3bddaa9ab9071cf",
+    "contrib/b3ai/counterfactual/tests/test_freeze.py": "17db1f23dbfae614f65abfbea017565bd85ffa742666709aa4f9010ef5e26fda",
+    "contrib/b3ai/counterfactual/tests/test_train.py": "4269176e300a408d7f055d3c91c7aef110640f3a76bfcb7415a5ba7422b3bf60",
+    "contrib/b3ai/counterfactual/train.py": "7f161d44ae82ec513de62d53dfdbb3162857bb234dd5afb17dba861c339f3c5b"
+  },
+  "publication_validation": {
+    "data_scoring_plan_seal_tests_passed": 24,
+    "toy_trainer_and_recording_tests_run": false
+  },
+  "notes": [
+    "Evidence files are unchanged copies; source paths identify their original local locations.",
+    "Checkpoints and story corpus remain git-ignored and local.",
+    "Numeric grading is mechanical; broader dialogue grading is AI review."
+  ]
+}

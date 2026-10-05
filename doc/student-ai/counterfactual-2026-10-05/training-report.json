@@ -1,0 +1,1764 @@
+{
+  "stage": "counterfactual-grounding",
+  "status": "finished grounding experiment; narrow value reading only, assistant not qualified",
+  "experimental": true,
+  "objective": "one mixed batch per update: story practice, paired counterfactual grounding, reviewed replay",
+  "update_definition": "one AdamW step on one batch of exactly 16 whole rows (3 story windows of at most 1,024 bytes, 10 grounding turns, 3 replay turns), right-padded to 1,024 columns, with one forward and one backward pass; 1,000 updates are therefore 1,000 batches",
+  "optimizer_reset": true,
+  "batch_rng_reset": true,
+  "parent_checkpoint": "build-ai/tool-learning/mps-stage-2/model.npz",
+  "parent_checkpoint_sha256": "89b6320058e75c5e8cf512557571e25ce09da48b52b456b61259d7a4a31dc0f8",
+  "parent_stage": "mixed-b3-tools",
+  "parent_selected_or_saved_step": 2000,
+  "parent_implementation_hash": "25151bd076b47d76e46f1b47b4166e52b074767f442d3c1563e08cfcedc56fa1",
+  "inherited_language_steps": 4000,
+  "inherited_b3_teaching_steps": 900,
+  "runtime": {
+    "python": "3.12.14",
+    "numpy": "2.3.5",
+    "torch": "2.14.1",
+    "device": "mps",
+    "precision": "float32"
+  },
+  "config": {
+    "vocab_size": 257,
+    "context_length": 2048,
+    "width": 256,
+    "layers": 6,
+    "heads": 8,
+    "ff_multiplier": 4,
+    "seed": 42
+  },
+  "parameter_count": 5395201,
+  "model_family_origin": "our own randomly initialized byte/EOD language Transformer",
+  "run_id": "8f072968-2d24-4b59-b218-d9c970337fbc",
+  "implementation_hash": "7730409475c863c9d0a2e78ba856efc04c6a60285e1ea6290f467ac9d9091dca",
+  "component_hashes": {
+    "model.py": "a2cf234c658d797688bd5445cf5a805073c65e5bf852b82c07cedce0cdcb6d46",
+    "checkpoint.py": "eb8dddd903a9c826ab3c0c7f60829f22945c9858cd7ddfe72b70743e806ebffa",
+    "batches.py": "2f432329f32a9438b83bc8c7b17653bc355865858dce5b3503d5b2b8f08d5b99"
+  },
+  "mixed_component_hashes": {
+    "instruction_data.py": "af92acb58dfae39093991afdc5888231072b6e48ab61a929faee73fa3963c1bb",
+    "protocol.py": "9b61dc2d9ac13767bf7ce139f417a70d9b4b12c393103e2aec6246982ed91042",
+    "source_curriculum_loader.py": "ccf45f9390bb8dbe93c9031bbb9a58940f5ac31f778d00db56bfc3dd2ffb442c",
+    "language_train.py": "a5c441ba501fc6e7b99f3d05dc1b86a1088877d07ca696dc21693365852a4b03"
+  },
+  "plan_sha256": "98113a29447ce47e459dc85fa925d3c59e2de42119e09bb85fe37142fabcebec",
+  "language_corpus_manifest_hash": "89fda1f48e77be90a639fb795dffc3174ac1168aadb9ee43738c64f97440d1bb",
+  "instruction_corpus_sha256": "67307f936371612ad1ae5730f617f8c94b7429bddc8b0c01a5e8011e217fc2f4",
+  "grounding_curriculum_sha256": "d37672666c4fa0716cd293f9f9e8c06836284e575946b411d17b05fa8a7fb986",
+  "schedule_sha256": "2551dca92124fabaadb140354f9407813d673ab4b3b63421ff48ebf79e533bf6",
+  "seals": {
+    "seal_1": "10fd3dddcc98dc7d4c58eec634b1bb791d4059a22b3a3b9e65e4a251fb7a0392",
+    "seal_2": "6959e0599b0c610a3579351bba6304c8b5e8f520be3daa33b1e6917f4a557e92",
+    "seal_3": "fb5b384ddff8d75e20e90e21cba71a1231b32535c3fb2b07c6d0590c5fab3b51"
+  },
+  "replay_records": 206,
+  "resource_limits": {
+    "maximum_updates": 1000,
+    "maximum_wall_seconds": 500,
+    "wall_reserve_seconds": 20,
+    "maximum_supervised_targets": 8192000,
+    "maximum_memory_bytes": 34359738368,
+    "accounting": "the wall clock starts when the trainer starts, so loading, baseline validation, in-loop validation and checkpoint writes all count; supervised targets are positions with positive loss weight in all three streams, checked before each update; memory is process peak RSS plus GPU driver allocation and each alone; caps are checked between complete updates"
+  },
+  "phases": [
+    {
+      "name": "bare-value",
+      "first": 1,
+      "last": 250,
+      "cycle": [
+        "value"
+      ]
+    },
+    {
+      "name": "ramp",
+      "first": 251,
+      "last": 300,
+      "cycle": [
+        "value",
+        "json"
+      ]
+    },
+    {
+      "name": "short-json",
+      "first": 301,
+      "last": 1000,
+      "cycle": [
+        "json",
+        "json",
+        "json",
+        "json",
+        "json",
+        "json",
+        "value"
+      ]
+    }
+  ],
+  "batch": {
+    "language_rows": 3,
+    "language_context": 1024,
+    "grounding_rows": 10,
+    "replay_rows": 3,
+    "maximum_width": 1024
+  },
+  "optimizer": {
+    "type": "torch.optim.AdamW",
+    "reset": "fresh AdamW; the parent's saved moments and batch generator state are discarded and never used",
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.01,
+    "clip_norm": 1.0,
+    "learning_rate": {
+      "warmup_updates": 50,
+      "peak": 0.0003,
+      "hold_until": 700,
+      "final": 0.0001,
+      "final_update": 1000
+    },
+    "continuity": "one optimizer and one set of generators across all phases; nothing is reset at a phase change"
+  },
+  "seeds": {
+    "language_batches": 42,
+    "schedule": 4201,
+    "language_validation": 1729,
+    "timing": 9001,
+    "exam_data": 2026100501,
+    "curriculum_data": 2026100502,
+    "validation_data": 2026100503
+  },
+  "attempted_updates": 1000,
+  "selected_update": 800,
+  "training_targets": 2769388,
+  "stream_targets": {
+    "language": 2389993,
+    "grounding": 120620,
+    "replay": 258775
+  },
+  "history": [
+    {
+      "update": 0,
+      "language": 0.7987776030018762,
+      "replay": {
+        "all": 0.1335695761084739,
+        "replayed": 0.11316806272055578,
+        "not_replayed": 0.17722471484767136,
+        "categories": {
+          "b3_fact": 0.09016790137030305,
+          "chat": 0.6595454616980119,
+          "refusal": 0.08832809371008,
+          "tool_choice": 0.07474784990096225,
+          "tool_failure": 0.0376366424734575,
+          "tool_result": 0.22116168421072085
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 5.930541114469545,
+        "exact_turns": 0,
+        "turns": 80,
+        "supervised_exact_turns": 0,
+        "value_target_loss": 9.339386463165283,
+        "formatting_loss": 1.3673055231571198,
+        "class_loss": {
+          "value": 9.339386463165283,
+          "terminator": 6.861750316619873,
+          "boilerplate": 0.5823848383767264,
+          "unknown_word": 2.737627846854074,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 0.0,
+          "digit2": 0.0,
+          "digit3": 0.0,
+          "terminator": 0.0
+        },
+        "minimum_margin": 0.012639045715332031,
+        "exact_vector": "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "value": {
+          "pairs_both_exact": 0,
+          "pairs": 16,
+          "exact_turns": 0,
+          "turns": 40,
+          "unknown_exact": 0,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 0,
+          "pairs": 16,
+          "exact_turns": 0,
+          "turns": 40,
+          "unknown_exact": 0,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 5.341591312830123,
+        "exact_turns": 0,
+        "turns": 320,
+        "supervised_exact_turns": 0,
+        "value_target_loss": 8.626535448724823,
+        "formatting_loss": 1.0412847678382675,
+        "class_loss": {
+          "value": 8.626535448724823,
+          "terminator": 7.106768539973667,
+          "boilerplate": 0.4347363906247275,
+          "unknown_word": 2.664306504385812,
+          "unsupervised_terminator": 6.1910739839077
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.0,
+          "digit2": 0.08455882352941177,
+          "digit3": 0.06060606060606061,
+          "terminator": 0.013888888888888888
+        },
+        "minimum_margin": 0.0015101432800292969,
+        "exact_vector": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "value": {
+          "pairs_both_exact": 0,
+          "pairs": 72,
+          "exact_turns": 0,
+          "turns": 160,
+          "unknown_exact": 0,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 0,
+          "pairs": 72,
+          "exact_turns": 0,
+          "turns": 160,
+          "unknown_exact": 0,
+          "unknown": 16
+        }
+      },
+      "train_loss": null,
+      "learning_rate": 5.999999999999999e-06,
+      "selection_key": [
+        0,
+        0,
+        0,
+        -2.280828926730659,
+        0
+      ],
+      "elapsed_seconds": 2.5171052920632064,
+      "evaluation_seconds": 1.4518065829761326
+    },
+    {
+      "update": 100,
+      "language": 0.8681135503779892,
+      "replay": {
+        "all": 0.5581366081836244,
+        "replayed": 0.2250366067584557,
+        "not_replayed": 1.2709036710846626,
+        "categories": {
+          "b3_fact": 0.23835427876070764,
+          "chat": 0.7477185509421609,
+          "refusal": 0.10125991240353652,
+          "tool_choice": 0.15387704801959032,
+          "tool_failure": 0.6909049375213846,
+          "tool_result": 1.453465018581892
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 2.9782978834304132,
+        "exact_turns": 4,
+        "turns": 80,
+        "supervised_exact_turns": 4,
+        "value_target_loss": 3.2953498363494873,
+        "formatting_loss": 2.5922815799713135,
+        "class_loss": {
+          "value": 3.2953498363494873,
+          "terminator": 3.5149276733398436,
+          "boilerplate": 2.4604749952043807,
+          "unknown_word": 1.101470606667655,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 0.25,
+          "digit2": 0.234375,
+          "digit3": 0.109375,
+          "terminator": 0.4375
+        },
+        "minimum_margin": 0.0068569183349609375,
+        "exact_vector": "00000000000000000000000000000000000000000000000000000000000000000000000010101010",
+        "value": {
+          "pairs_both_exact": 0,
+          "pairs": 16,
+          "exact_turns": 4,
+          "turns": 40,
+          "unknown_exact": 4,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 0,
+          "pairs": 16,
+          "exact_turns": 0,
+          "turns": 40,
+          "unknown_exact": 0,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 2.7212162066854364,
+        "exact_turns": 55,
+        "turns": 320,
+        "supervised_exact_turns": 68,
+        "value_target_loss": 2.2173060709341414,
+        "formatting_loss": 2.8743553502219066,
+        "class_loss": {
+          "value": 2.2173060709341414,
+          "terminator": 4.582905326570783,
+          "boilerplate": 2.7035003525870187,
+          "unknown_word": 1.1337717601231165,
+          "unsupervised_terminator": 4.680675238370895
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.3923611111111111,
+          "digit2": 0.48161764705882354,
+          "digit3": 0.5681818181818182,
+          "terminator": 0.3368055555555556
+        },
+        "minimum_margin": 0.00011157989501953125,
+        "exact_vector": "11001000010001000000000001001100110001000100000000000000100000000000000000000100000011000000000010001000110000000100000000000000010000000000100000000000000010000100010010000000010010000000010011000100010000000100000000000000000000000000000000000000100000000000000000000000000001001100010010001010101010101010101010101010",
+        "value": {
+          "pairs_both_exact": 7,
+          "pairs": 72,
+          "exact_turns": 55,
+          "turns": 160,
+          "unknown_exact": 15,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 0,
+          "pairs": 72,
+          "exact_turns": 0,
+          "turns": 160,
+          "unknown_exact": 0,
+          "unknown": 16
+        }
+      },
+      "train_loss": {
+        "language": 0.9902878403663635,
+        "grounding": 0.6016175150871277,
+        "replay": 0.1256740540266037,
+        "value": 0.9169127345085144,
+        "terminator": 0.18764150142669678,
+        "boilerplate": 0.005019392818212509,
+        "unknown_word": 0.0406513549387455,
+        "unsupervised_terminator": 2.1724910736083984,
+        "formatting": 0.05719713494181633,
+        "class_targets": {
+          "value": 18,
+          "terminator": 4,
+          "boilerplate": 10,
+          "unknown_word": 14,
+          "unsupervised_terminator": 6
+        }
+      },
+      "learning_rate": 0.0003,
+      "selection_key": [
+        0,
+        0,
+        4,
+        -1.3571493468556195,
+        100
+      ],
+      "elapsed_seconds": 38.51050637522712,
+      "evaluation_seconds": 1.2216015411540866
+    },
+    {
+      "update": 200,
+      "language": 0.9010531188521002,
+      "replay": {
+        "all": 0.660660177626828,
+        "replayed": 0.2049987704389287,
+        "not_replayed": 1.635684018782936,
+        "categories": {
+          "b3_fact": 0.20600729095974152,
+          "chat": 0.8106323285536332,
+          "refusal": 0.1770064718846424,
+          "tool_choice": 0.04783893351614808,
+          "tool_failure": 0.9886768090463903,
+          "tool_result": 1.8393370635477995
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 3.135761834878837,
+        "exact_turns": 5,
+        "turns": 80,
+        "supervised_exact_turns": 5,
+        "value_target_loss": 3.2815436522165933,
+        "formatting_loss": 2.7358498215675353,
+        "class_loss": {
+          "value": 3.2815436522165933,
+          "terminator": 4.594614505767822,
+          "boilerplate": 2.470312009538923,
+          "unknown_word": 0.7024353572300502,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 0.296875,
+          "digit2": 0.375,
+          "digit3": 0.3125,
+          "terminator": 0.46875
+        },
+        "minimum_margin": 0.003307342529296875,
+        "exact_vector": "00000000000000000000000000000000000000000000000000000000000000000000100010101010",
+        "value": {
+          "pairs_both_exact": 0,
+          "pairs": 16,
+          "exact_turns": 5,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 0,
+          "pairs": 16,
+          "exact_turns": 0,
+          "turns": 40,
+          "unknown_exact": 0,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 2.515132855020636,
+        "exact_turns": 112,
+        "turns": 320,
+        "supervised_exact_turns": 130,
+        "value_target_loss": 1.503240249060482,
+        "formatting_loss": 3.1340061070083025,
+        "class_loss": {
+          "value": 1.503240249060482,
+          "terminator": 4.940844024930682,
+          "boilerplate": 2.9533223152160644,
+          "unknown_word": 0.5291755199432373,
+          "unsupervised_terminator": 5.421747932831447
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.7118055555555556,
+          "digit2": 0.6433823529411765,
+          "digit3": 0.6666666666666666,
+          "terminator": 0.4166666666666667
+        },
+        "minimum_margin": 0.0010957717895507812,
+        "exact_vector": "10001000010011000000100011000100110010000100110001001000110010000100110011001000110011001100100010001100110011000100110010000000010011001100110011001100110010000100110011001000110011000000010011001100000001001100110001001000010000001100100011000100000010000100010010000100000011000100110010101010101000101010101010101010",
+        "value": {
+          "pairs_both_exact": 32,
+          "pairs": 72,
+          "exact_turns": 112,
+          "turns": 160,
+          "unknown_exact": 15,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 0,
+          "pairs": 72,
+          "exact_turns": 0,
+          "turns": 160,
+          "unknown_exact": 0,
+          "unknown": 16
+        }
+      },
+      "train_loss": {
+        "language": 0.9623482823371887,
+        "grounding": 0.20860163867473602,
+        "replay": 0.14610950648784637,
+        "value": 0.3767637610435486,
+        "terminator": 0.009504043497145176,
+        "boilerplate": 0.0027275828178972006,
+        "unknown_word": 0.0038899709470570087,
+        "unsupervised_terminator": null,
+        "formatting": 0.00611581327393651,
+        "class_targets": {
+          "value": 21,
+          "terminator": 10,
+          "boilerplate": 10,
+          "unknown_word": 14,
+          "unsupervised_terminator": 0
+        }
+      },
+      "learning_rate": 0.0003,
+      "selection_key": [
+        0,
+        0,
+        5,
+        -1.413937908056622,
+        200
+      ],
+      "elapsed_seconds": 72.36152912513353,
+      "evaluation_seconds": 1.233040832914412
+    },
+    {
+      "update": 300,
+      "language": 0.9182740976153821,
+      "replay": {
+        "all": 0.6070992010466094,
+        "replayed": 0.18960963579624124,
+        "not_replayed": 1.5004429715124474,
+        "categories": {
+          "b3_fact": 0.17621129854699039,
+          "chat": 0.6273648825558749,
+          "refusal": 0.14114560823485325,
+          "tool_choice": 0.1709700073609805,
+          "tool_failure": 0.9631609116157476,
+          "tool_result": 1.6695587491249642
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 1.2705527955451899,
+        "exact_turns": 14,
+        "turns": 80,
+        "supervised_exact_turns": 14,
+        "value_target_loss": 2.422714432080587,
+        "formatting_loss": 0.17626868151128292,
+        "class_loss": {
+          "value": 2.422714432080587,
+          "terminator": 0.6813165515661239,
+          "boilerplate": 0.10411898578916277,
+          "unknown_word": 0.4260937826974051,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 0.4375,
+          "digit2": 0.328125,
+          "digit3": 0.453125,
+          "terminator": 0.8125
+        },
+        "minimum_margin": 0.006295680999755859,
+        "exact_vector": "00000000000000000000000000001000000010000000000001000000100000000011000011111111",
+        "value": {
+          "pairs_both_exact": 0,
+          "pairs": 16,
+          "exact_turns": 9,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 0,
+          "pairs": 16,
+          "exact_turns": 5,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 0.29623712580124334,
+        "exact_turns": 184,
+        "turns": 320,
+        "supervised_exact_turns": 210,
+        "value_target_loss": 0.5078306025852358,
+        "formatting_loss": 0.08568536151539195,
+        "class_loss": {
+          "value": 0.5078306025852358,
+          "terminator": 0.2766978676830019,
+          "boilerplate": 0.06658411089863096,
+          "unknown_word": 0.05424347945622036,
+          "unsupervised_terminator": 2.599757800499598
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.7847222222222222,
+          "digit2": 0.8786764705882353,
+          "digit3": 0.9090909090909091,
+          "terminator": 0.7465277777777778
+        },
+        "minimum_margin": 0.005219459533691406,
+        "exact_vector": "10101101110111111000110011001111001111011100111101011110111010001000111011100111110011011100010010001111110111011100110110100000010111101101110011100100110010000000110011101100110011000101011111001101010011101100110100001000010001001100110010001111110011000100110011001100010011110100110011101101111111111011111111111111",
+        "value": {
+          "pairs_both_exact": 46,
+          "pairs": 72,
+          "exact_turns": 129,
+          "turns": 160,
+          "unknown_exact": 15,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 9,
+          "pairs": 72,
+          "exact_turns": 55,
+          "turns": 160,
+          "unknown_exact": 14,
+          "unknown": 16
+        }
+      },
+      "train_loss": {
+        "language": 1.0207321643829346,
+        "grounding": 0.4160235822200775,
+        "replay": 0.13375911116600037,
+        "value": 1.2197990417480469,
+        "terminator": 0.13868696987628937,
+        "boilerplate": 0.010808703489601612,
+        "unknown_word": 0.0067245191894471645,
+        "unsupervised_terminator": 0.008836924098432064,
+        "formatting": 0.019088590517640114,
+        "class_targets": {
+          "value": 22,
+          "terminator": 9,
+          "boilerplate": 130,
+          "unknown_word": 14,
+          "unsupervised_terminator": 1
+        }
+      },
+      "learning_rate": 0.0003,
+      "selection_key": [
+        0,
+        5,
+        14,
+        -0.7928121763189377,
+        300
+      ],
+      "elapsed_seconds": 106.61553937522694,
+      "evaluation_seconds": 1.2592898330185562
+    },
+    {
+      "update": 400,
+      "language": 0.9217670341789886,
+      "replay": {
+        "all": 0.6331670063832746,
+        "replayed": 0.1600937165986182,
+        "not_replayed": 1.6454487771850426,
+        "categories": {
+          "b3_fact": 0.14720579926224,
+          "chat": 0.6676435665650802,
+          "refusal": 0.161579473477574,
+          "tool_choice": 0.05835431864141752,
+          "tool_failure": 1.2114634827105668,
+          "tool_result": 1.7820506964107823
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 1.1761680873094407,
+        "exact_turns": 18,
+        "turns": 80,
+        "supervised_exact_turns": 18,
+        "value_target_loss": 2.5567240715026855,
+        "formatting_loss": 0.009466299274936318,
+        "class_loss": {
+          "value": 2.5567240715026855,
+          "terminator": 0.06476417649537325,
+          "boilerplate": 0.001566602529159614,
+          "unknown_word": 0.31663319042750765,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 0.5,
+          "digit2": 0.46875,
+          "digit3": 0.375,
+          "terminator": 0.96875
+        },
+        "minimum_margin": 0.024383544921875,
+        "exact_vector": "00000000000000000010000000001000000010000000000000000000000011110011100011111111",
+        "value": {
+          "pairs_both_exact": 1,
+          "pairs": 16,
+          "exact_turns": 10,
+          "turns": 40,
+          "unknown_exact": 6,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 1,
+          "pairs": 16,
+          "exact_turns": 8,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 0.12759525299187185,
+        "exact_turns": 245,
+        "turns": 320,
+        "supervised_exact_turns": 262,
+        "value_target_loss": 0.26705526409810676,
+        "formatting_loss": 0.012098470326307436,
+        "class_loss": {
+          "value": 0.26705526409810676,
+          "terminator": 0.03221092584343361,
+          "boilerplate": 0.010087224774594818,
+          "unknown_word": 0.004811351985803672,
+          "unsupervised_terminator": 0.8305207587157687
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.8958333333333334,
+          "digit2": 0.9375,
+          "digit3": 0.9393939393939394,
+          "terminator": 0.9166666666666666
+        },
+        "minimum_margin": 0.002460479736328125,
+        "exact_vector": "11110000111011111000100111111111011111000101111101101101110011100001111111101111111001111111110111101111111111111011010110000111110111111111111111111110111110110001010111111001111111011100111011101111000011101101111111111111010010001111111111011110111111110101000101111111010111110101111111111111111111111111111111111111",
+        "value": {
+          "pairs_both_exact": 48,
+          "pairs": 72,
+          "exact_turns": 131,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 35,
+          "pairs": 72,
+          "exact_turns": 114,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        }
+      },
+      "train_loss": {
+        "language": 1.1651266813278198,
+        "grounding": 0.17740102112293243,
+        "replay": 0.0824575126171112,
+        "value": 0.48548462986946106,
+        "terminator": 0.2699063718318939,
+        "boilerplate": 0.001675832667388022,
+        "unknown_word": 0.0007720993016846478,
+        "unsupervised_terminator": 2.1388118267059326,
+        "formatting": 0.01722542569041252,
+        "class_targets": {
+          "value": 19,
+          "terminator": 8,
+          "boilerplate": 130,
+          "unknown_word": 14,
+          "unsupervised_terminator": 2
+        }
+      },
+      "learning_rate": 0.0003,
+      "selection_key": [
+        1,
+        8,
+        18,
+        -0.752676279362349,
+        400
+      ],
+      "elapsed_seconds": 142.63298945920542,
+      "evaluation_seconds": 1.3699200840201229
+    },
+    {
+      "update": 500,
+      "language": 0.9134131145131376,
+      "replay": {
+        "all": 0.6190648359981684,
+        "replayed": 0.13655581875643763,
+        "not_replayed": 1.651537167343733,
+        "categories": {
+          "b3_fact": 0.1451407720804981,
+          "chat": 0.5716098785400391,
+          "refusal": 0.06493181116144423,
+          "tool_choice": 0.05081916579654097,
+          "tool_failure": 1.2369190967866104,
+          "tool_result": 1.782043027576532
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 1.368612466660221,
+        "exact_turns": 19,
+        "turns": 80,
+        "supervised_exact_turns": 19,
+        "value_target_loss": 3.027935187021891,
+        "formatting_loss": 0.03147833799012005,
+        "class_loss": {
+          "value": 3.027935187021891,
+          "terminator": 0.19695853106677533,
+          "boilerplate": 0.00783831040774073,
+          "unknown_word": 0.1841752188546317,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 0.8125,
+          "digit2": 0.375,
+          "digit3": 0.3125,
+          "terminator": 0.90625
+        },
+        "minimum_margin": 0.026737213134765625,
+        "exact_vector": "00000000001000000011000000000000000000000000001000000100000010100011101011111111",
+        "value": {
+          "pairs_both_exact": 0,
+          "pairs": 16,
+          "exact_turns": 9,
+          "turns": 40,
+          "unknown_exact": 7,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 1,
+          "pairs": 16,
+          "exact_turns": 10,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 0.1321668114254591,
+        "exact_turns": 239,
+        "turns": 320,
+        "supervised_exact_turns": 254,
+        "value_target_loss": 0.27329358303477996,
+        "formatting_loss": 0.007823997632261704,
+        "class_loss": {
+          "value": 0.27329358303477996,
+          "terminator": 0.060982476188136,
+          "boilerplate": 0.0025081497766742747,
+          "unknown_word": 0.02106512870107378,
+          "unsupervised_terminator": 0.6921714120156442
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.8784722222222222,
+          "digit2": 0.9375,
+          "digit3": 0.9015151515151515,
+          "terminator": 0.9340277777777778
+        },
+        "minimum_margin": 0.022745132446289062,
+        "exact_vector": "00110110111111111011100010011111001101110001101101110011010111111001111101111111111111111110010111011111001111011010111111110000001011110111011111110111111111110001011110101110111101111010011111111111001111110111111111011011001100101111111100111111111101110111010110110011000011111111011111111111111111111111111111011101",
+        "value": {
+          "pairs_both_exact": 31,
+          "pairs": 72,
+          "exact_turns": 103,
+          "turns": 160,
+          "unknown_exact": 14,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 51,
+          "pairs": 72,
+          "exact_turns": 136,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        }
+      },
+      "train_loss": {
+        "language": 0.873954713344574,
+        "grounding": 0.0543799065053463,
+        "replay": 0.04897035285830498,
+        "value": 0.1680232286453247,
+        "terminator": 0.0034192733000963926,
+        "boilerplate": 0.0012089560041204095,
+        "unknown_word": 0.0025253836065530777,
+        "unsupervised_terminator": null,
+        "formatting": 0.0013668357860296965,
+        "class_targets": {
+          "value": 22,
+          "terminator": 10,
+          "boilerplate": 130,
+          "unknown_word": 14,
+          "unsupervised_terminator": 0
+        }
+      },
+      "learning_rate": 0.0003,
+      "selection_key": [
+        1,
+        10,
+        19,
+        -0.8061937999765988,
+        500
+      ],
+      "elapsed_seconds": 179.179389459081,
+      "evaluation_seconds": 1.309771667001769
+    },
+    {
+      "update": 600,
+      "language": 0.9010117536840531,
+      "replay": {
+        "all": 0.7396857159615757,
+        "replayed": 0.17669682913578105,
+        "not_replayed": 1.9443687948924373,
+        "categories": {
+          "b3_fact": 0.15299312110115862,
+          "chat": 0.655353826826269,
+          "refusal": 0.1282752103089167,
+          "tool_choice": 0.1902013148009444,
+          "tool_failure": 1.4038078141038435,
+          "tool_result": 2.1145166509936146
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 0.947757408682224,
+        "exact_turns": 25,
+        "turns": 80,
+        "supervised_exact_turns": 25,
+        "value_target_loss": 1.7915826042493184,
+        "formatting_loss": 0.030861141526838765,
+        "class_loss": {
+          "value": 1.7915826042493184,
+          "terminator": 0.24197585601359606,
+          "boilerplate": 0.0007018966001591512,
+          "unknown_word": 0.5863747596740723,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 1.0,
+          "digit2": 0.46875,
+          "digit3": 0.578125,
+          "terminator": 0.921875
+        },
+        "minimum_margin": 0.010025978088378906,
+        "exact_vector": "10000111010100000010100000000000000010000000000000010111101000000011000011111111",
+        "value": {
+          "pairs_both_exact": 0,
+          "pairs": 16,
+          "exact_turns": 12,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 2,
+          "pairs": 16,
+          "exact_turns": 13,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 0.05131822848419604,
+        "exact_turns": 273,
+        "turns": 320,
+        "supervised_exact_turns": 301,
+        "value_target_loss": 0.09782970541646716,
+        "formatting_loss": 0.004689297119689222,
+        "class_loss": {
+          "value": 0.09782970541646716,
+          "terminator": 0.044833621319932196,
+          "boilerplate": 0.0006748646996649248,
+          "unknown_word": 0.014149213708671076,
+          "unsupervised_terminator": 1.0664198926339548
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.9756944444444444,
+          "digit2": 0.9632352941176471,
+          "digit3": 0.9924242424242424,
+          "terminator": 0.8923611111111112
+        },
+        "minimum_margin": 0.0088348388671875,
+        "exact_vector": "00110011011111011111100111111111001111111111111111111010111111001110111111111111111111111111111110111111111111111111111111101111010111110111111111110101111111100001111111001111111111111101111111110111001011111111111111111111110110011111111111111110101111111101100011111111000011111101111111111111111111111111111111111111",
+        "value": {
+          "pairs_both_exact": 55,
+          "pairs": 72,
+          "exact_turns": 137,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 52,
+          "pairs": 72,
+          "exact_turns": 136,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        }
+      },
+      "train_loss": {
+        "language": 0.968109667301178,
+        "grounding": 0.01675792597234249,
+        "replay": 0.09750302881002426,
+        "value": 0.049127716571092606,
+        "terminator": 0.008288905024528503,
+        "boilerplate": 0.0011006511049345136,
+        "unknown_word": 0.0006105211214162409,
+        "unsupervised_terminator": 2.076738119125366,
+        "formatting": 0.0014679341111332178,
+        "class_targets": {
+          "value": 20,
+          "terminator": 7,
+          "boilerplate": 130,
+          "unknown_word": 14,
+          "unsupervised_terminator": 3
+        }
+      },
+      "learning_rate": 0.0003,
+      "selection_key": [
+        2,
+        13,
+        25,
+        -0.675155330500686,
+        600
+      ],
+      "elapsed_seconds": 214.03476795903407,
+      "evaluation_seconds": 1.2576224589720368
+    },
+    {
+      "update": 700,
+      "language": 0.8946143417762449,
+      "replay": {
+        "all": 0.6519493001615684,
+        "replayed": 0.14743989443185135,
+        "not_replayed": 1.731498041648748,
+        "categories": {
+          "b3_fact": 0.11708337854342445,
+          "chat": 0.6870384433052756,
+          "refusal": 0.08689903597316831,
+          "tool_choice": 0.18553751324142156,
+          "tool_failure": 1.2976523629070198,
+          "tool_result": 1.8680560151987005
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 1.0916928907411287,
+        "exact_turns": 22,
+        "turns": 80,
+        "supervised_exact_turns": 22,
+        "value_target_loss": 2.2144516706466675,
+        "formatting_loss": 0.011509270750684664,
+        "class_loss": {
+          "value": 2.2144516706466675,
+          "terminator": 0.0895567815285176,
+          "boilerplate": 0.0003596263538513865,
+          "unknown_word": 0.5542549065181187,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 0.796875,
+          "digit2": 0.578125,
+          "digit3": 0.4375,
+          "terminator": 0.96875
+        },
+        "minimum_margin": 0.049388885498046875,
+        "exact_vector": "10000101001100000010100000000000000000100000000000010000110010100001000011111111",
+        "value": {
+          "pairs_both_exact": 1,
+          "pairs": 16,
+          "exact_turns": 10,
+          "turns": 40,
+          "unknown_exact": 4,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 1,
+          "pairs": 16,
+          "exact_turns": 12,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 0.04439298253132935,
+        "exact_turns": 278,
+        "turns": 320,
+        "supervised_exact_turns": 301,
+        "value_target_loss": 0.0892397611471959,
+        "formatting_loss": 0.0006819654075812863,
+        "class_loss": {
+          "value": 0.0892397611471959,
+          "terminator": 0.003956253230821208,
+          "boilerplate": 0.0003545366252572941,
+          "unknown_word": 0.029529668789889132,
+          "unsupervised_terminator": 0.8999088930237727
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.9722222222222222,
+          "digit2": 0.9705882352941176,
+          "digit3": 0.9772727272727273,
+          "terminator": 0.9201388888888888
+        },
+        "minimum_margin": 0.05740547180175781,
+        "exact_vector": "11110011110111111111101101111111111111111111111111111010111101111010111111111111111111111111111111101111001111111011111111101111101111110111111111111111111111110001110110111110111111111001111110111101000111111111111111111111011110101111111111111111111101110101011111111111000111111101111101111111111111111111111111111111",
+        "value": {
+          "pairs_both_exact": 51,
+          "pairs": 72,
+          "exact_turns": 133,
+          "turns": 160,
+          "unknown_exact": 15,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 57,
+          "pairs": 72,
+          "exact_turns": 145,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        }
+      },
+      "train_loss": {
+        "language": 1.0005837678909302,
+        "grounding": 0.0018553161062300205,
+        "replay": 0.050656966865062714,
+        "value": 0.0045870160683989525,
+        "terminator": 0.00020632598898373544,
+        "boilerplate": 9.491877426626161e-05,
+        "unknown_word": 0.00650741858407855,
+        "unsupervised_terminator": 0.1336980015039444,
+        "formatting": 0.00010061111970571801,
+        "class_targets": {
+          "value": 20,
+          "terminator": 7,
+          "boilerplate": 130,
+          "unknown_word": 14,
+          "unsupervised_terminator": 3
+        }
+      },
+      "learning_rate": 0.0003,
+      "selection_key": [
+        1,
+        12,
+        22,
+        -0.7112490423164083,
+        700
+      ],
+      "elapsed_seconds": 247.66023191716522,
+      "evaluation_seconds": 1.2118813749402761
+    },
+    {
+      "update": 800,
+      "language": 0.8807036138426226,
+      "replay": {
+        "all": 0.577019823856856,
+        "replayed": 0.11636319218934336,
+        "not_replayed": 1.5627324415534383,
+        "categories": {
+          "b3_fact": 0.09524337563100735,
+          "chat": 0.688987829468467,
+          "refusal": 0.0970459952600685,
+          "tool_choice": 0.05513897581889643,
+          "tool_failure": 1.1119755654439438,
+          "tool_result": 1.7046134111731988
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 0.9649997559268918,
+        "exact_turns": 26,
+        "turns": 80,
+        "supervised_exact_turns": 26,
+        "value_target_loss": 1.6962467829386394,
+        "formatting_loss": 0.07812916960392613,
+        "class_loss": {
+          "value": 1.6962467829386394,
+          "terminator": 0.5802215790841728,
+          "boilerplate": 0.006401682535319456,
+          "unknown_word": 0.5758586611066546,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 0.828125,
+          "digit2": 0.625,
+          "digit3": 0.546875,
+          "terminator": 0.78125
+        },
+        "minimum_margin": 0.039722442626953125,
+        "exact_vector": "00000011111010000011110000000001000010100000000000110000000011000011000011111011",
+        "value": {
+          "pairs_both_exact": 3,
+          "pairs": 16,
+          "exact_turns": 13,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 3,
+          "pairs": 16,
+          "exact_turns": 13,
+          "turns": 40,
+          "unknown_exact": 4,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 0.04014346526413773,
+        "exact_turns": 254,
+        "turns": 320,
+        "supervised_exact_turns": 300,
+        "value_target_loss": 0.06481393825025916,
+        "formatting_loss": 0.006524273218940823,
+        "class_loss": {
+          "value": 0.06481393825025916,
+          "terminator": 0.06897497105195985,
+          "boilerplate": 0.00027920343563891947,
+          "unknown_word": 0.009651297969477517,
+          "unsupervised_terminator": 3.0484597977095595
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.9756944444444444,
+          "digit2": 0.9705882352941176,
+          "digit3": 1.0,
+          "terminator": 0.8159722222222222
+        },
+        "minimum_margin": 0.04999351501464844,
+        "exact_vector": "11111111001110111111000011111111001111111111111111111010111111111000111111111111111011111111111111101111001111111111111110100100000111111111111111110111110101000000011110100010011111110001110111110011100011111111111111011111010110101111111111111111111111110101010111111111000111110101111101111111111111111111111111111111",
+        "value": {
+          "pairs_both_exact": 46,
+          "pairs": 72,
+          "exact_turns": 123,
+          "turns": 160,
+          "unknown_exact": 15,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 49,
+          "pairs": 72,
+          "exact_turns": 131,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        }
+      },
+      "train_loss": {
+        "language": 1.0186371803283691,
+        "grounding": 0.020012719556689262,
+        "replay": 0.01896810159087181,
+        "value": 0.06682875007390976,
+        "terminator": 0.0015655753668397665,
+        "boilerplate": 0.00016009430692065507,
+        "unknown_word": 0.0006093740230426192,
+        "unsupervised_terminator": 6.618783473968506,
+        "formatting": 0.0002415714698145166,
+        "class_targets": {
+          "value": 19,
+          "terminator": 8,
+          "boilerplate": 130,
+          "unknown_word": 14,
+          "unsupervised_terminator": 2
+        }
+      },
+      "learning_rate": 0.00023333333333333333,
+      "selection_key": [
+        3,
+        13,
+        26,
+        -0.6540221873196193,
+        800
+      ],
+      "elapsed_seconds": 280.6384331670124,
+      "evaluation_seconds": 1.1945712498854846
+    },
+    {
+      "update": 900,
+      "language": 0.842276869894384,
+      "replay": {
+        "all": 0.5528290060298141,
+        "replayed": 0.08337337513963462,
+        "not_replayed": 1.557369713806179,
+        "categories": {
+          "b3_fact": 0.06325413368139236,
+          "chat": 0.5785929138010198,
+          "refusal": 0.03703351028508424,
+          "tool_choice": 0.07374224006380449,
+          "tool_failure": 1.1948297598066122,
+          "tool_result": 1.6714833811190812
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 1.045438833996258,
+        "exact_turns": 29,
+        "turns": 80,
+        "supervised_exact_turns": 29,
+        "value_target_loss": 1.913910150527954,
+        "formatting_loss": 0.04709655563347041,
+        "class_loss": {
+          "value": 1.913910150527954,
+          "terminator": 0.37350685549899937,
+          "boilerplate": 0.0004665127955377102,
+          "unknown_word": 0.6716194152832031,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 0.921875,
+          "digit2": 0.625,
+          "digit3": 0.5625,
+          "terminator": 0.828125
+        },
+        "minimum_margin": 0.0055027008056640625,
+        "exact_vector": "00000110111110000010010000100001000010100000000011110001001000000011000011111111",
+        "value": {
+          "pairs_both_exact": 2,
+          "pairs": 16,
+          "exact_turns": 13,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 2,
+          "pairs": 16,
+          "exact_turns": 16,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 0.027849033403097818,
+        "exact_turns": 261,
+        "turns": 320,
+        "supervised_exact_turns": 308,
+        "value_target_loss": 0.047992833055598885,
+        "formatting_loss": 0.004147106356761575,
+        "class_loss": {
+          "value": 0.047992833055598885,
+          "terminator": 0.0434234756144828,
+          "boilerplate": 0.00021946943098945278,
+          "unknown_word": 0.001548721089160868,
+          "unsupervised_terminator": 2.6820015834333994
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.9895833333333334,
+          "digit2": 0.9779411764705882,
+          "digit3": 1.0,
+          "terminator": 0.8229166666666666
+        },
+        "minimum_margin": 0.018782615661621094,
+        "exact_vector": "11111111111111111011000011111111010111111011111111111011111110011000111111111111111101111111011111111111111111111100111110100101010111111111111111111111101111100001011110101010111101110101011111110111000011111111111111101111000110101111011111101111111111110101010111111111000111111101111111111111111111111111111111111111",
+        "value": {
+          "pairs_both_exact": 44,
+          "pairs": 72,
+          "exact_turns": 127,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 50,
+          "pairs": 72,
+          "exact_turns": 134,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        }
+      },
+      "train_loss": {
+        "language": 0.8165024518966675,
+        "grounding": 0.004161517135798931,
+        "replay": 0.0026147831231355667,
+        "value": 0.0021619678009301424,
+        "terminator": 0.00019930501002818346,
+        "boilerplate": 0.00019177714420948178,
+        "unknown_word": 0.015192345716059208,
+        "unsupervised_terminator": 1.0700379610061646,
+        "formatting": 0.00019205592980142683,
+        "class_targets": {
+          "value": 19,
+          "terminator": 5,
+          "boilerplate": 130,
+          "unknown_word": 14,
+          "unsupervised_terminator": 5
+        }
+      },
+      "learning_rate": 0.00016666666666666666,
+      "selection_key": [
+        2,
+        16,
+        29,
+        -0.6570296930100922,
+        900
+      ],
+      "elapsed_seconds": 313.38014916703105,
+      "evaluation_seconds": 1.1979640829376876
+    },
+    {
+      "update": 1000,
+      "language": 0.8186545819197628,
+      "replay": {
+        "all": 0.5321096234647908,
+        "replayed": 0.07286604454477723,
+        "not_replayed": 1.5147985922503857,
+        "categories": {
+          "b3_fact": 0.0491673274630519,
+          "chat": 0.45807400616732513,
+          "refusal": 0.06327995134981025,
+          "tool_choice": 0.06885013668069502,
+          "tool_failure": 1.0386040123709797,
+          "tool_result": 1.6646863750039265
+        },
+        "targets": {
+          "b3_fact": 3110,
+          "chat": 220,
+          "refusal": 852,
+          "tool_choice": 716,
+          "tool_failure": 548,
+          "tool_result": 1741
+        }
+      },
+      "grounding_validation": {
+        "loss": 1.09294881229907,
+        "exact_turns": 29,
+        "turns": 80,
+        "supervised_exact_turns": 29,
+        "value_target_loss": 2.1113802989323935,
+        "formatting_loss": 0.0337996200993075,
+        "class_loss": {
+          "value": 2.1113802989323935,
+          "terminator": 0.26949206352001054,
+          "boilerplate": 0.0001292710392070668,
+          "unknown_word": 0.5991217749459403,
+          "unsupervised_terminator": null
+        },
+        "class_targets": {
+          "value": 192,
+          "terminator": 80,
+          "boilerplate": 560,
+          "unknown_word": 112,
+          "unsupervised_terminator": 0
+        },
+        "position_accuracy": {
+          "digit1": 0.84375,
+          "digit2": 0.515625,
+          "digit3": 0.5625,
+          "terminator": 0.921875
+        },
+        "minimum_margin": 0.0001468658447265625,
+        "exact_vector": "00000011110100011010110000100000000000100000000001010001100011100011000011111111",
+        "value": {
+          "pairs_both_exact": 3,
+          "pairs": 16,
+          "exact_turns": 14,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        },
+        "json": {
+          "pairs_both_exact": 1,
+          "pairs": 16,
+          "exact_turns": 15,
+          "turns": 40,
+          "unknown_exact": 5,
+          "unknown": 8
+        }
+      },
+      "training_fit": {
+        "loss": 0.015609878388288548,
+        "exact_turns": 276,
+        "turns": 320,
+        "supervised_exact_turns": 311,
+        "value_target_loss": 0.031756808130727336,
+        "formatting_loss": 0.0009265017525448658,
+        "class_loss": {
+          "value": 0.031756808130727336,
+          "terminator": 0.009451861764578748,
+          "boilerplate": 7.396575134147757e-05,
+          "unknown_word": 0.00107577393230583,
+          "unsupervised_terminator": 1.650944488743941
+        },
+        "class_targets": {
+          "value": 692,
+          "terminator": 224,
+          "boilerplate": 2240,
+          "unknown_word": 224,
+          "unsupervised_terminator": 96
+        },
+        "position_accuracy": {
+          "digit1": 0.9861111111111112,
+          "digit2": 0.9889705882352942,
+          "digit3": 0.9924242424242424,
+          "terminator": 0.8645833333333334
+        },
+        "minimum_margin": 0.09444046020507812,
+        "exact_vector": "00111111111111111011000111111111010111111111111110111011111111111010111111111111111111111111011111101111111111111111111111101101010111111111111111111101111111100001111110111010111101110101111111111111000011111111111111111111010110011111111111111111111111110101011111111111000111111101111111111111111111111111111111111111",
+        "value": {
+          "pairs_both_exact": 52,
+          "pairs": 72,
+          "exact_turns": 135,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        },
+        "json": {
+          "pairs_both_exact": 54,
+          "pairs": 72,
+          "exact_turns": 141,
+          "turns": 160,
+          "unknown_exact": 16,
+          "unknown": 16
+        }
+      },
+      "train_loss": {
+        "language": 0.8745928406715393,
+        "grounding": 0.005499483086168766,
+        "replay": 0.0010130919981747866,
+        "value": 0.0015774961793795228,
+        "terminator": 0.0007339102448895574,
+        "boilerplate": 0.0004141972749494016,
+        "unknown_word": 0.00913411658257246,
+        "unsupervised_terminator": 3.149059295654297,
+        "formatting": 0.0005055438377894461,
+        "class_targets": {
+          "value": 16,
+          "terminator": 4,
+          "boilerplate": 10,
+          "unknown_word": 14,
+          "unsupervised_terminator": 6
+        }
+      },
+      "learning_rate": 9.999999999999999e-05,
+      "selection_key": [
+        1,
+        15,
+        29,
+        -0.6614898129212033,
+        1000
+      ],
+      "elapsed_seconds": 346.02352483407594,
+      "evaluation_seconds": 1.1963234590366483
+    }
+  ],
+  "independent_exam_used": false,
+  "exam_parsed_by_trainer": false,
+  "generation_performed": false,
+  "real_tools_executed": false,
+  "limitations": "Validation selects weights and is not qualification. All tool results are synthetic. Caps are checked between complete updates.",
+  "baseline": {
+    "language": 0.7987776030018762,
+    "instruction": 0.13356957546469894
+  },
+  "selected_checkpoint_sha256": "9be18ffb27889b6748d141f94fe3c663c70d109d09e33bdd1b072e5b165a7b85",
+  "preflight": {
+    "warmup_pass_seconds": [
+      0.31910937489010394,
+      0.2997987079434097,
+      0.3003750841598958
+    ],
+    "timed_pass_seconds": [
+      0.3012996248435229,
+      0.3010945830028504,
+      0.30063279205933213,
+      0.30032945796847343,
+      0.3003354580141604,
+      0.30055712489411235,
+      0.30054733296856284,
+      0.30020587518811226
+    ],
+    "typical_pass_seconds": 0.30055712489411235,
+    "evaluation_seconds": 1.4518065829761326,
+    "elapsed_before_projection": 6.415233750129119,
+    "projected_total_seconds": 341.4904244740028,
+    "limit_seconds": 450
+  },
+  "first_update_completed": true,
+  "elapsed_seconds": 346.1013296251185,
+  "stop_reason": "update_limit",
+  "peak_memory": {
+    "process_peak_rss_bytes": 1038041088,
+    "gpu_driver_allocated_bytes": 8780480512
+  },
+  "peak_memory_sum_bytes": 9818521600,
+  "last_checkpoint_sha256": "a8c33089138861e2381aabc53172c737e38c4c61130d5a3ae07d19166365a1e9",
+  "parent_unchanged": true
+}

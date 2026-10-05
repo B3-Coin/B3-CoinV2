@@ -1,0 +1,185 @@
+{
+  "schema": "b3-counterfactual-grounding-plan/v1",
+  "stage": "counterfactual-grounding",
+  "model": "our own randomly initialized byte/EOD Transformer; inherited own weights only; architecture unchanged",
+  "hypothesis": "Pairs that repeat one question and change only the requested supplied value teach the student to read that value instead of recalling a memorised reply.",
+  "parent": {
+    "path": "build-ai/tool-learning/mps-stage-2/model.npz",
+    "sha256": "89b6320058e75c5e8cf512557571e25ce09da48b52b456b61259d7a4a31dc0f8",
+    "stage": "mixed-b3-tools",
+    "optimizer_steps": 2000,
+    "language_validation_loss": 0.7987776030018762,
+    "instruction_validation_loss": 0.13356957546469894
+  },
+  "data": {
+    "language_corpus": "build-ai/language-preparation/tinystories-pilot",
+    "language_manifest_sha256": "89fda1f48e77be90a639fb795dffc3174ac1168aadb9ee43738c64f97440d1bb",
+    "language_train_documents": 18000,
+    "instruction_corpus": "contrib/b3ai/tool_learning/curriculum.json",
+    "instruction_corpus_sha256": "67307f936371612ad1ae5730f617f8c94b7429bddc8b0c01a5e8011e217fc2f4",
+    "grounding_curriculum": "contrib/b3ai/counterfactual/curriculum.json",
+    "grounding_curriculum_sha256": "d37672666c4fa0716cd293f9f9e8c06836284e575946b411d17b05fa8a7fb986",
+    "prior_probes_sha256": "391d62d23e4b9ce92dae79026ae0a2a4ab8b4642a62369a99c512f6a9c485135",
+    "exam_sha256": "fb464234d522fc6e1029fae17b6f42ca41b758895634c8203c6ed4a0cc023f4c",
+    "schedule_sha256": "2551dca92124fabaadb140354f9407813d673ab4b3b63421ff48ebf79e533bf6",
+    "turn_arithmetic": "training 72 pairs x 2 members x 2 answer modes + 16 unknown scenarios x 2 modes = 320 turns; validation 16 x 2 x 2 + 8 x 2 = 80 turns; exam 64 short-JSON pairs = 128 gated answers",
+    "targets": "every grounding target is a decimal integer or the word unknown, alone or wrapped as {\"reply\":...}, computed from a synthetic fixture and re-derived from the rendered prompt on every load; replay targets are the pre-existing frozen reviewed material, reused unchanged",
+    "value_sampling": "training pair values follow the fixed digit patterns listed in curriculum.json (prefix, digit-difference, swap and mixed-length pairs); two-digit values led by 2, 3 or 4 are drawn twice as often because the published held-out ranges (exam 200-399, validation 400-499) lead with those digits; no exam item is used"
+  },
+  "update_definition": "one AdamW step on one batch of exactly 16 whole rows (3 story windows of at most 1,024 bytes, 10 grounding turns, 3 replay turns), right-padded to 1,024 columns, with one forward and one backward pass; 1,000 updates are therefore 1,000 batches",
+  "batch": {
+    "language_rows": 3,
+    "language_context": 1024,
+    "grounding_rows": 10,
+    "replay_rows": 3,
+    "maximum_width": 1024
+  },
+  "sampling": {
+    "language": "frozen Corpus.batch('train', generator, 3, 1024) with its own generator; every batch is right-padded with weightless zeros to the fixed width of 1,024, which the causal mask makes numerically neutral",
+    "grounding": "precomputed schedule from shuffled epochs: odd updates one contrast unit (three pairs on one shared fixture) and two independent pairs; even updates one contrast unit, one independent pair and two unknown turns; both members of every pair are always in the same batch; one answer mode per update",
+    "replay": "precomputed schedule from shuffled epochs over the 206 frozen training records in the replay categories"
+  },
+  "replay_categories": [
+    "b3_fact",
+    "chat",
+    "refusal",
+    "tool_choice"
+  ],
+  "loss": {
+    "combination": "mean of three per-stream weighted mean cross-entropies (language, grounding, replay), each computed as the frozen model.loss computes it",
+    "language_and_replay_weights": "1 on every supervised target, as in the frozen pipeline",
+    "grounding_weights": "value digits 1.0; the byte that ends the value 1.0; first letter of unknown 1.0; every other answer byte including JSON wrapper, newline and end-of-document 0.25",
+    "unsupervised_terminator": "in training only, the byte that ends a two-digit value led by 2-9 has weight 0: inside 8-199 that stop is predictable without reading the result, and it is wrong for every held-out value",
+    "reported_separately": "unweighted mean cross-entropy per class, for every training batch and for validation: value (the digits of a supplied value only), terminator (the supervised byte that ends a value), boilerplate (JSON wrapper, newline, end-of-document), unknown_word (the letters of unknown) and unsupervised_terminator; value-target loss is the value class and formatting loss is terminator plus boilerplate. A turn is exact when every answer byte, including an unsupervised terminator, is the argmax; supervised-only exactness is reported beside it for the training fit"
+  },
+  "phases": [
+    {
+      "name": "bare-value",
+      "first": 1,
+      "last": 250,
+      "cycle": [
+        "value"
+      ]
+    },
+    {
+      "name": "ramp",
+      "first": 251,
+      "last": 300,
+      "cycle": [
+        "value",
+        "json"
+      ]
+    },
+    {
+      "name": "short-json",
+      "first": 301,
+      "last": 1000,
+      "cycle": [
+        "json",
+        "json",
+        "json",
+        "json",
+        "json",
+        "json",
+        "value"
+      ]
+    }
+  ],
+  "optimizer": {
+    "type": "torch.optim.AdamW",
+    "reset": "fresh AdamW; the parent's saved moments and batch generator state are discarded and never used",
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.01,
+    "clip_norm": 1.0,
+    "learning_rate": {
+      "warmup_updates": 50,
+      "peak": 0.0003,
+      "hold_until": 700,
+      "final": 0.0001,
+      "final_update": 1000
+    },
+    "continuity": "one optimizer and one set of generators across all phases; nothing is reset at a phase change"
+  },
+  "seeds": {
+    "language_batches": 42,
+    "schedule": 4201,
+    "language_validation": 1729,
+    "timing": 9001,
+    "exam_data": 2026100501,
+    "curriculum_data": 2026100502,
+    "validation_data": 2026100503
+  },
+  "limits": {
+    "maximum_updates": 1000,
+    "maximum_wall_seconds": 500,
+    "wall_reserve_seconds": 20,
+    "maximum_supervised_targets": 8192000,
+    "maximum_memory_bytes": 34359738368,
+    "accounting": "the wall clock starts when the trainer starts, so loading, baseline validation, in-loop validation and checkpoint writes all count; supervised targets are positions with positive loss weight in all three streams, checked before each update; memory is process peak RSS plus GPU driver allocation and each alone; caps are checked between complete updates"
+  },
+  "preflight": {
+    "warmup_passes": 3,
+    "timed_passes": 8,
+    "step_allowance_seconds": 0.02,
+    "projection_limit_seconds": 450,
+    "rule": "before the first update the trainer must reproduce the parent's recorded validation losses, and the projection elapsed + updates x (upper-median of the timed gradient passes + allowance) + remaining validations x measured validation time must not exceed the limit; the timed passes use the fixed training batch shape and a separate generator and change no weight; otherwise the trainer stops with zero updates"
+  },
+  "evaluation": {
+    "interval": 100,
+    "in_loop": "teacher-forced only: frozen story validation batches, frozen replay validation per category, the 80 grounding validation turns and the 320 training turns (training fit, never used for selection); the trainer never parses the exam and never generates text. Its command line only hashes the exam file and compares the sealed exam prompt hashes, frame hashes and numbers against the training data"
+  },
+  "selection": "among the unchanged baseline and every evaluated state, maximise in order: short-JSON validation pairs with both members exact (0-16), short-JSON exact validation turns (0-40), all exact validation turns (0-80), lower mean of story, replayed-category and grounding validation loss, later update. model.npz holds the selected state and is the only checkpoint examined; last.npz is kept for audit and never examined on the exam.",
+  "stop_policy": [
+    "The run ledger is created exclusively immediately before the first optimizer step; the trainer refuses to start when it exists.",
+    "A stop before the first optimizer step (preflight abort, parent mismatch, or any failure) changes no weight, writes no ledger and consumes nothing. Operator rule, not enforced by code: at most one restart into a new directory, and every attempt is reported.",
+    "Any stop, failure or interrupt after the first optimizer step ends the experiment: no relaunch, no extension. The state selected so far (model.npz, recorded in report.json after every update) is what gets examined.",
+    "The loop stops at the wall limit minus the reserve so the final validation, selection, last.npz and report finish inside the limit.",
+    "One recording per checkpoint, written exclusively to its fixed place in the freeze directory, gate section first. Each section keeps whatever it generated if interrupted. An incomplete gate section means the gate is not met; it is never rerun."
+  ],
+  "gate": {
+    "what": "result reading with a host-supplied prior tool call; the student's own tool choice is not part of the gate",
+    "primary_required_pairs": 52,
+    "primary": "at least 52 of 64 held-out short-JSON pairs in which both generated answers are valid UTF-8, end with the learned end-of-document token and are byte-for-byte {\"reply\":\"V\"} plus one newline",
+    "secondary": "the same count under protocol validity (validate_action) with reply equal to V; reported beside the primary count, and the scorer's headline states it when the two fall on opposite sides of 52",
+    "meaning": "passing establishes one narrow value-reading skill; it does not establish general assistant or tester readiness"
+  },
+  "retention": {
+    "headline": "frozen story validation loss and replay validation loss over the 60 records of the four replayed categories, before and after; descriptive, no pass/fail threshold",
+    "not_replayed_by_design": "tool_result and tool_failure records are not replayed because the brief lists B3, chat, refusal and tool-choice replay; their loss is reported separately. Predicted side effect, stated before training: questions about a supplied result that carry no answer-mode instruction may drift toward short answers.",
+    "generations": "the tracked 32-case tool exam through the unchanged trajectory driver, before and after; exploratory, previously seen, mechanical counts only"
+  },
+  "departures_from_proposal": [
+    "The proposed three-update rotation (language, grounding, replay) is replaced by one mixed batch per update, so all 1,000 updates carry grounding and retention signal; one update is still one batch.",
+    "Story practice uses 1,024-byte windows inside the mixed batch instead of 2,048-byte windows; the retention measurement still uses the frozen 2,048-byte validation batches.",
+    "The proposed switch at update 500 is replaced by bare-value only through update 250, an alternating ramp through 300, then six short-JSON batches for each bare-value batch.",
+    "Learning rate warms up to 3e-4 and decays to 1e-4 instead of the parent stage's constant 1e-4.",
+    "Loss weights favour value bytes over JSON boilerplate, and one predictable terminator byte is unsupervised.",
+    "Most pairs (48 of 72 in training, 12 of 16 in validation, 48 of 64 in the exam) sit on a fixture shared by three pairs (total, inbound, outbound), so the field word must be read."
+  ],
+  "disclosures": [
+    "All sentence frames and both answer-mode instructions were written by the implementing assistant as inputs only; no model output is a target.",
+    "After design review, training frames 2 and 5 and validation frame 2 were reworded to contain the letters 'out' outside the field phrase. The gap was noticed by comparison with an exam frame; exam frames were not changed.",
+    "The exam file was generated before the training curriculum, but its seal was written after drafts of the curriculum and plan existed; the seals prove the exam did not change after sealing and before any model read an exam prompt, not that it preceded those drafts.",
+    "Fixtures impose no arithmetic consistency between total, inbound and outbound counts, so that only the requested value changes within a pair; they are not realistic node output.",
+    "A no-update gradient timing pass was run on the parent during design, before this plan was frozen; it changed no weight and saved nothing.",
+    "The trainer, recorder and scorer were rehearsed end to end at full size on freshly random weights, never the student; the rehearsal sealed with this plan is of exactly the sealed code and records its own update count and generation budgets."
+  ],
+  "caveats": [
+    "One skill: copying one integer for one of three fixed field phrases from a host-supplied simulated getnetworkinfo result under an explicit answer-mode instruction.",
+    "The short answers do not begin with the word Simulated, unlike the frozen result explanations; they are a drill format, not a reply style for Hive.",
+    "Exam frames are fresh paraphrases by the same author and share the field phrases, the mode instruction and some short word windows with training; five of eight exam frames are labelled near and three far, and both groups are reported.",
+    "Exam frame 5 places the word 'in' directly after the field phrase, which no training frame does; a failure cluster on its total and outbound questions would reflect that untrained look-alike.",
+    "Exam integers are 200-399 only, always three digits. Writing a third digit after a leading 2-9, and stopping after it, are never supervised in training; that transfer is the bet behind the unsupervised terminator.",
+    "Field synonyms and paraphrased mode instructions are untested.",
+    "One run and one seed: no variance estimate. 64 pairs are clustered in 24 distinct questions.",
+    "The checkpoint is chosen on validation among at most 11 states; last.npz is never examined.",
+    "The baseline score on the gate is structurally near zero because the parent never saw the answer-mode instruction, so before-to-after is not an effect size.",
+    "Missing-data handling is outside the gate; bare-value results reuse the gate fixtures and are not independent evidence.",
+    "Greedy decoding and mechanical scoring only. AI review is not human approval.",
+    "The design used diagnosis results from the same parent, so those diagnosis cases cannot serve as independent evidence afterwards."
+  ]
+}
