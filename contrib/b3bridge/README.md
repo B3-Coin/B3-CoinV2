@@ -532,11 +532,13 @@ blocks, and a `-b3modernregtest -b3flowmeshtest` regtest node started with
 nothing they sign means anything outside regtest. The regtest plan is in
 `doc/design/b3-bridge-v2-regtest-plan.md`. The functional tests that use
 them are `feature_b3_bridge_rt0_toolchain.py`,
-`feature_b3_bridge_rt2_light_client.py` and
-`feature_b3_bridge_rt3_v1_route_a.py --deposit-only`; their harness lives in
-`test/functional/test_framework/{anvil,b3bridge}.py`. The regtest-only
-refusals of the Python pieces are unit-tested offline by
-`contrib/b3bridge/test_regtest_mock_beacon.py` (run `python3 -m unittest`
+`feature_b3_bridge_rt2_light_client.py`,
+`feature_b3_bridge_rt3_v1_route_a.py --deposit-only` and, for bridge V2,
+`feature_b3_bridge_rt4a_round_trip.py` and `feature_b3_bridge_rt4_kofn_gate.py`;
+their harness lives in `test/functional/test_framework/{anvil,b3bridge}.py`.
+The regtest-only refusals of the Python pieces are unit-tested offline by
+`contrib/b3bridge/test_regtest_mock_beacon.py`,
+`contrib/b3bridge/test_b3_bridge_observe_v2.py` (run `python3 -m unittest`
 here) and by `TestFrameworkB3BridgeGuards` in
 `test/functional/test_framework/b3bridge.py` (run by
 `feature_framework_unit_tests.py`).
@@ -616,6 +618,38 @@ it with `--beacon-url http://127.0.0.1:5052`. On regtest, `--ethereum-rpc
 http://127.0.0.1:P` and `--ethereum-rpc-secondary http://localhost:P` are the
 same anvil. They pass only the mechanical distinct-origin check and are not
 independent providers.
+
+### `b3_bridge_observe_v2.py` (bridge V2 kind 9 observer)
+
+A one-shot, standard-library observer for the bridge V2 burn gate (node
+changes rev 11 section 8). It reads `getbridgev2info.observation_plan`,
+calls `eth_getProof(address, slots, anchor.number)` for each account of each
+requested subject, in plan order, builds each record with
+`buildbridgeobservationv2` and submits it with the wallet's
+`submitbridgecarrier`:
+
+```sh
+python3 contrib/b3bridge/b3_bridge_observe_v2.py --ethereum-rpc http://127.0.0.1:8545 \
+  --b3-rpc-url http://127.0.0.1:P --b3-cookie <datadir>/regtest/.cookie \
+  --wallet relayer [--subjects 1,2,3] [--dry-run]
+```
+
+- Subjects: 1 VERIFIER_E (Verifier V2 liveness, set hashes, latest
+  certificate), 2 RESERVE_E (Vault V2 `nextDepositId`, `locked`,
+  `absorbedTotal` and the token's balance of the vault), 3 TOKEN_FLAGS
+  (paused, deprecated, vault blacklisted).
+- The plan's anchor is the newest retained V2 execution anchor with a state
+  root, so relay a light-client update for a recent block first; a record
+  must name an anchor newer than its subject's latest observation.
+- It refuses every endpoint but plain http on 127.0.0.1 or localhost (bridge
+  V2 is configured only by the regtest pin file), a B3 chain other than
+  regtest, an Ethereum chain id other than the plan's `origin_chain_id`, an
+  anchor whose block hash differs on the Ethereum endpoint, a subject whose
+  anchor is not newer, and proofs that do not answer for the plan's account
+  and keys. Every subject is built before anything is submitted.
+- It prints one JSON object (anchor, decoded values, verdicts, payloads and
+  txids); a refusal prints `error: ...` and exits 1. The B3 wallet signs; no
+  key is handled here.
 
 ### Pin file (`-b3bridgepins=<absolute path>`)
 
@@ -728,5 +762,8 @@ These are reported here rather than silently built in (solve-and-report):
   with wall-clock timestamps. B3 heights at each step therefore vary between
   runs (`bridge_evidence.json` records them), and RT2's relayer loop
   tolerates repeated tip or finality races (up to 29 identical failed cycles
-  within 600 s). Clock jumps use mock time explicitly: RT0's one-day jump
-  and RT2's freshness boundary.
+  within 600 s). Clock jumps use mock time explicitly: RT0's one-day jump,
+  RT2's freshness boundary and RT4's stale-observation drill, which runs
+  after RT4a's release and reindex steps and then produces blocks under mock
+  time, because a block staked 5,000 s ahead keeps the wall clock behind the
+  chain for the rest of the test.
