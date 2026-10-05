@@ -6,11 +6,16 @@
 
 #include <bridge/proof.h>
 #include <bridge/rlp.h>
+#include <bridge/withdrawal_v2_calldata.h>
 #include <crypto/common.h>
 #include <crypto/keccak256.h>
 #include <modern/asset_output.h>
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
+#include <modern/bridge_v2.h>
+#include <modern/mpa.h>
+#include <modern/withdrawal_v2.h>
+#include <node/finality_fresh_lineage.h>
 #include <primitives/transaction.h>
 #include <test/data/eth_lc_fixture.h>
 #include <util/strencodings.h>
@@ -20,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -330,9 +336,18 @@ struct ReceiptFixture {
     std::vector<CScript> recipient_scripts{};
 };
 
+/**
+ * One-receipt trie holding `deposits` as Deposit logs of `vault` for
+ * `token`. `receipt_type` != 0 wraps the receipt in that EIP-2718 envelope;
+ * `padding_log_bytes` > 0 appends one non-vault log with that much data after
+ * the deposits (their log indices are unchanged), enlarging the terminal
+ * receipt node.
+ */
 ReceiptFixture MakeReceiptFixture(
-    const Consensus::Params& params,
-    const std::vector<DepositSpec>& deposits)
+    const Consensus::BridgeEthAddress& vault,
+    const Consensus::BridgeEthAddress& token,
+    const std::vector<DepositSpec>& deposits,
+    const uint8_t receipt_type = 0, const size_t padding_log_bytes = 0)
 {
     std::vector<std::vector<unsigned char>> encoded_logs;
     std::vector<CScript> recipient_scripts;
@@ -340,9 +355,7 @@ ReceiptFixture MakeReceiptFixture(
         std::array<unsigned char, 32> deposit_topic{};
         WriteBE64(deposit_topic.data() + 24, deposit.id);
         std::array<unsigned char, 32> token_topic{};
-        std::copy(params.busd_bridge->asset.token_address.begin(),
-                  params.busd_bridge->asset.token_address.end(),
-                  token_topic.begin() + 12);
+        std::copy(token.begin(), token.end(), token_topic.begin() + 12);
         std::vector<std::vector<unsigned char>> topics{
             EncodedBytes(std::span<const unsigned char>{
                 bridge::DepositTopic().begin(), 32}),
@@ -357,17 +370,28 @@ ReceiptFixture MakeReceiptFixture(
         std::copy(encoded_recipient.begin(), encoded_recipient.end(),
                   data.begin() + 32);
         const std::vector<std::vector<unsigned char>> log_fields{
-            EncodedBytes(params.busd_bridge->asset.vault_address),
-            bridge::RlpEncodeList(topics), EncodedBytes(data)};
+            EncodedBytes(vault), bridge::RlpEncodeList(topics),
+            EncodedBytes(data)};
         encoded_logs.push_back(bridge::RlpEncodeList(log_fields));
+    }
+    if (padding_log_bytes > 0) {
+        std::array<unsigned char, 20> other{};
+        other.fill(0x99);
+        const std::vector<unsigned char> padding(padding_log_bytes, 0xab);
+        encoded_logs.push_back(bridge::RlpEncodeList(
+            {EncodedBytes(other), bridge::RlpEncodeList({}),
+             EncodedBytes(padding)}));
     }
 
     std::array<unsigned char, 256> bloom{};
     const std::vector<std::vector<unsigned char>> receipt_fields{
         bridge::RlpEncodeUint64(1), bridge::RlpEncodeUint64(1),
         EncodedBytes(bloom), bridge::RlpEncodeList(encoded_logs)};
-    const std::vector<unsigned char> receipt{
+    std::vector<unsigned char> receipt;
+    if (receipt_type != 0) receipt.push_back(receipt_type);
+    const std::vector<unsigned char> receipt_list{
         bridge::RlpEncodeList(receipt_fields)};
+    receipt.insert(receipt.end(), receipt_list.begin(), receipt_list.end());
 
     // A one-item receipts trie: key rlp(0) = 0x80, nibbles [8,0], encoded as
     // an even leaf path 0x20 || 0x80.
@@ -393,6 +417,15 @@ ReceiptFixture MakeReceiptFixture(
     out.header = bridge::RlpEncodeList(header_fields);
     out.block_hash = Keccak(out.header);
     return out;
+}
+
+ReceiptFixture MakeReceiptFixture(
+    const Consensus::Params& params,
+    const std::vector<DepositSpec>& deposits)
+{
+    return MakeReceiptFixture(params.busd_bridge->asset.vault_address,
+                              params.busd_bridge->asset.token_address,
+                              deposits);
 }
 
 void SeedVerifiedAnchor(node::BridgeStateIndex& index,
@@ -507,6 +540,283 @@ CBlock Block(const uint32_t time,
     block.nTime = time;
     block.vtx = std::move(transactions);
     return block;
+}
+
+// -- Bridge V2 fixtures (node changes sections 3-7) -------------------------
+
+constexpr int BRIDGE_V2_HEIGHT{BRIDGE_HEIGHT + 10};
+
+Consensus::BridgeEthAddress FilledAddress(const uint8_t fill)
+{
+    Consensus::BridgeEthAddress out;
+    out.fill(fill);
+    return out;
+}
+
+/**
+ * The V1 test bridge (managed, active from BRIDGE_HEIGHT) plus a complete
+ * Ethereum-mainnet V2 envelope from V = BRIDGE_HEIGHT + 10: Vault V2 0x44..,
+ * USDT, both OI-3 code hashes (required on chain 1), the eth_lc_fixture
+ * light-client pins (mainnet genesis validators root) and caps 100/150 per
+ * 10-block epoch.
+ */
+Consensus::Params V2Params(const int burn_height = BRIDGE_V2_HEIGHT,
+                           const uint64_t origin_deployment_block = 1)
+{
+    Consensus::Params params{FullyActiveBridgeParams(false)};
+    Consensus::BridgeV2Params v2;
+    v2.activation_height = BRIDGE_V2_HEIGHT;
+    v2.burn_height = burn_height;
+    v2.light_client = *FixtureBridgeParams().busd_bridge->light_client;
+    v2.verifier.address = FilledAddress(0x55);
+    v2.verifier.runtime_code_hash = TestHash(51);
+    v2.verifier.min_bridge_validators = 4;
+    v2.verifier.max_bridge_validators = 64;
+    v2.verifier.min_bridge_total_weight = 900;
+    Consensus::BridgeV2VaultEntry& vault{v2.vault};
+    vault.origin_chain_id = Consensus::BUSD_ETHEREUM_CHAIN_ID;
+    vault.vault_address = FilledAddress(0x44);
+    vault.token_address = Consensus::BUSD_ETHEREUM_USDT;
+    vault.vault_runtime_code_hash = TestHash(52);
+    vault.token_runtime_code_hash = TestHash(53);
+    vault.origin_deployment_block = origin_deployment_block;
+    vault.max_deposit_raw = 100;
+    vault.mint_caps = Consensus::BridgeMintCaps{
+        .max_per_block = 100,
+        .max_per_epoch = 150,
+        .epoch_length_blocks = 10,
+    };
+    BOOST_REQUIRE(v2.Valid());
+    BOOST_REQUIRE(vault.vault_address != params.busd_bridge->asset.vault_address);
+    params.bridge_v2 = std::move(v2);
+    BOOST_REQUIRE(params.BridgeV2RulesActive(BRIDGE_V2_HEIGHT));
+    BOOST_REQUIRE(!params.BridgeV2RulesActive(BRIDGE_V2_HEIGHT - 1));
+    return params;
+}
+
+ReceiptFixture MakeV2ReceiptFixture(const Consensus::Params& params,
+                                    const std::vector<DepositSpec>& deposits,
+                                    const uint8_t receipt_type = 0,
+                                    const size_t padding_log_bytes = 0)
+{
+    return MakeReceiptFixture(params.bridge_v2->vault.vault_address,
+                              params.bridge_v2->vault.token_address, deposits,
+                              receipt_type, padding_log_bytes);
+}
+
+uint256 V2TestBlockHash(const int height)
+{
+    return TestBlockHash(static_cast<uint32_t>(50'000 + height));
+}
+
+/**
+ * Connect a hand-built delta at `height` extending the tip that seeds one
+ * verified light-client store and anchor into the empty V1 or V2 store (the
+ * V2 seed below V is a fixture shortcut, as the V1 seed below A3 is).
+ */
+void SeedVerifiedAnchorAt(node::BridgeStateIndex& index,
+                          const ReceiptFixture& fixture, const int height,
+                          const bool v2_store,
+                          const uint64_t beacon_slot = 32,
+                          const uint64_t finalized_timestamp = 1'000)
+{
+    BOOST_REQUIRE(!(v2_store ? index.LightClientV2() : index.LightClient()));
+    bridge::LightClientStore store;
+    store.finalized_header.beacon.slot = beacon_slot;
+    store.finalized_header.execution.block_number = fixture.block_number;
+    store.finalized_header.execution.block_hash = fixture.block_hash;
+    store.finalized_header.execution.receipts_root = fixture.receipts_root;
+    store.finalized_header.execution.timestamp = finalized_timestamp;
+    store.period = bridge::PeriodAtSlot(beacon_slot);
+    store.current.pubkeys.resize(bridge::ssz::SYNC_COMMITTEE_SIZE);
+
+    node::BridgeBlockDelta seed;
+    seed.height = height;
+    seed.block_hash = V2TestBlockHash(height);
+    seed.previous_height = index.ConnectedHeight();
+    seed.previous_block_hash = index.ConnectedHash();
+    seed.v2_store = v2_store;
+    seed.light_client_after = store;
+    seed.light_client_connection_after =
+        node::BridgeStateConnection{seed.height, seed.block_hash};
+    seed.anchors_added.push_back(node::BridgeExecutionAnchor{
+        fixture.block_number, fixture.block_hash, fixture.receipts_root,
+        beacon_slot, fixture.block_number, fixture.timestamp, seed.height,
+        seed.block_hash});
+    seed.withdrawal_tree_before = index.WithdrawalTree();
+    seed.withdrawal_tree_after = index.WithdrawalTree();
+    seed.withdrawal_tree_v2_before = index.WithdrawalTreeV2();
+    seed.withdrawal_tree_v2_after = index.WithdrawalTreeV2();
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(seed, error), error);
+}
+
+//! VerifyBlock + ConnectBlock of one candidate at the next height (the
+//! bridge activation height on an empty index).
+node::BridgeBlockDelta ConnectNext(node::BridgeStateIndex& index,
+                                   const Consensus::Params& params,
+                                   std::vector<CTransactionRef> transactions = {},
+                                   const uint32_t time = 1'060)
+{
+    const int height{index.ConnectedHeight() < 0
+                         ? BRIDGE_HEIGHT
+                         : index.ConnectedHeight() + 1};
+    node::BridgeBlockDelta delta;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(
+        index.VerifyBlock(Block(time, std::move(transactions)), height,
+                          V2TestBlockHash(height), params, delta, error),
+        error);
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
+    return delta;
+}
+
+void ConnectEmptyThrough(node::BridgeStateIndex& index,
+                         const Consensus::Params& params, const int height)
+{
+    while (index.ConnectedHeight() < height) ConnectNext(index, params);
+}
+
+//! A kind 3 MINT naming the V2 vault entry, encoded under the V2 limits.
+CTransactionRef MintTransactionV2(const Consensus::Params& params,
+                                  const ReceiptFixture& fixture,
+                                  const uint32_t log_index,
+                                  const CAmount amount)
+{
+    const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
+    const auto entry{modern::ConfiguredBridgeV2EntryId(params)};
+    BOOST_REQUIRE(asset);
+    BOOST_REQUIRE(entry);
+    BOOST_REQUIRE(log_index < fixture.recipient_scripts.size());
+    bridge::BridgeMintV1 mint{*entry, 0, fixture.block_hash,
+                              fixture.block_number, 0, log_index,
+                              {fixture.header}, {fixture.mpt_node}};
+    const auto record{bridge::MakeBridgeMpaRecord(
+        bridge::BridgeRecordV1{bridge::BridgeRecordKindV1::MINT, mint},
+        bridge::BRIDGE_MPT_LIMITS_V2)};
+    const auto owner{modern::MakeAssetOwnerOutput(
+        *asset, amount, fixture.recipient_scripts[log_index])};
+    BOOST_REQUIRE(record);
+    BOOST_REQUIRE(owner);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vout = {*owner, *binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
+}
+
+//! A kind 6 burn of `amount` bUSD V2 naming `registry` (default: the V2
+//! vault entry id) and an Ethereum recipient filled with `recipient_tag`.
+CTransactionRef BurnTransactionV2(
+    const Consensus::Params& params, const uint8_t source_tag,
+    const CAmount amount, const uint8_t recipient_tag,
+    const std::optional<uint256>& registry = std::nullopt,
+    const std::optional<modern::AssetId>& burned_asset = std::nullopt)
+{
+    const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
+    const auto entry{modern::ConfiguredBridgeV2EntryId(params)};
+    BOOST_REQUIRE(asset);
+    BOOST_REQUIRE(entry);
+    bridge::BridgeBurnV1 burn_record;
+    burn_record.registry_id = registry.value_or(*entry);
+    burn_record.burn_output_index = 0;
+    burn_record.raw_amount = static_cast<uint64_t>(amount);
+    burn_record.ethereum_recipient.fill(recipient_tag);
+    const auto record{bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{
+        bridge::BridgeRecordKindV1::BRIDGE_BURN, burn_record})};
+    const auto burn{modern::MakeAssetBurnOutput(
+        burned_asset.value_or(*asset), amount)};
+    BOOST_REQUIRE(record);
+    BOOST_REQUIRE(burn);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint{Txid::FromUint256(TestHash(source_tag)), 0};
+    tx.vout = {*burn, *binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
+}
+
+//! A kind 5 managed withdrawal of `amount` V1 bUSD.
+CTransactionRef ManagedWithdrawalTransaction(const Consensus::Params& params,
+                                             const CAmount amount)
+{
+    const auto asset{modern::ConfiguredBridgeAssetId(params)};
+    const auto registry{modern::ConfiguredBridgeRegistryId(params)};
+    BOOST_REQUIRE(asset);
+    BOOST_REQUIRE(registry);
+    bridge::BridgeManagedWithdrawalV1 withdrawal;
+    withdrawal.registry_id = *registry;
+    withdrawal.burn_output_index = 0;
+    withdrawal.raw_amount = static_cast<uint64_t>(amount);
+    withdrawal.ethereum_recipient.fill(0x66);
+    const auto record{bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{
+        bridge::BridgeRecordKindV1::MANAGED_WITHDRAWAL, withdrawal})};
+    const auto burn{modern::MakeAssetBurnOutput(*asset, amount)};
+    BOOST_REQUIRE(record);
+    BOOST_REQUIRE(burn);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vout = {*burn, *binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
+}
+
+//! A kind 1 BOOTSTRAP from the eth_lc_fixture checkpoint.
+CTransactionRef FixtureBootstrapTransaction()
+{
+    bridge::BridgeBootstrapV1 bootstrap;
+    bootstrap.header = bridge::LightClientHeader{
+        FixtureBeacon(ethfx::U1_FINALIZED_BEACON),
+        FixtureExecution(ethfx::U1_FINALIZED_EXEC),
+        FixtureBranch(ethfx::U1_FINALIZED_EXEC_BRANCH)};
+    bootstrap.current_committee = FixtureCommittee(
+        ethfx::BOOTSTRAP_COMMITTEE_PUBKEYS, ethfx::BOOTSTRAP_COMMITTEE_AGG);
+    bootstrap.current_committee_branch =
+        FixtureBranch(ethfx::BOOTSTRAP_COMMITTEE_BRANCH);
+    const auto record{bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{
+        bridge::BridgeRecordKindV1::BOOTSTRAP, bootstrap})};
+    BOOST_REQUIRE(record);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vout = {*binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
+}
+
+//! A kind 2 UPDATE carrying the eth_lc_fixture committee update.
+CTransactionRef FixtureUpdateTransaction()
+{
+    const auto record{bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{
+        bridge::BridgeRecordKindV1::UPDATE,
+        bridge::BridgeUpdateV1{FixtureCommitteeUpdate()}})};
+    BOOST_REQUIRE(record);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vout = {*binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
+}
+
+bool VerifyFails(const node::BridgeStateIndex& index, const CBlock& block,
+                 const int height, const Consensus::Params& params,
+                 const std::string& expected)
+{
+    node::BridgeBlockDelta ignored;
+    std::string error;
+    if (index.VerifyBlock(block, height, V2TestBlockHash(height), params,
+                          ignored, error)) {
+        BOOST_ERROR("bridge block unexpectedly verified at height " << height);
+        return false;
+    }
+    BOOST_CHECK_MESSAGE(error.find(expected) != std::string::npos,
+                        "error '" << error << "' lacks '" << expected << "'");
+    return error.find(expected) != std::string::npos;
 }
 
 } // namespace
@@ -1667,6 +1977,696 @@ BOOST_AUTO_TEST_CASE(connect_is_atomic_and_recent_undo_is_bounded)
     BOOST_CHECK(error.find("no longer retained") != std::string::npos);
     BOOST_CHECK_EQUAL(index.ConnectedHeight(), pruned_height);
     BOOST_CHECK(index.ConnectedHash() == TestBlockHash(pruned_height));
+}
+
+// -- Bridge V2 (node changes sections 3-7) ----------------------------------
+
+BOOST_AUTO_TEST_CASE(v2_store_routing)
+{
+    // Kinds 1 and 2 from V run against the separate V2 store, built here
+    // from the real eth_lc_fixture checkpoint and committee update; the V1
+    // store, its anchors and its finalized snapshot do not move.
+    const uint64_t fixture_block{ethfx::U1_FINALIZED_EXEC.block_number};
+    const Consensus::Params params{V2Params(BRIDGE_V2_HEIGHT, fixture_block)};
+    const ReceiptFixture v1_fixture{
+        MakeReceiptFixture(params, {{1, 60, 0x71}})};
+    node::BridgeStateIndex index;
+    SeedVerifiedAnchor(index, v1_fixture);
+    ConnectEmptyThrough(index, params, BRIDGE_V2_HEIGHT - 1);
+    const auto v1_store{index.LightClient()};
+    const auto v1_connection{index.LightClientLastConnected()};
+    BOOST_REQUIRE(v1_store);
+    BOOST_REQUIRE(v1_connection);
+    BOOST_CHECK(!index.LightClientV2());
+    BOOST_CHECK_EQUAL(index.AnchorCountV2(), 0U);
+    BOOST_CHECK(!index.FinalizedLightClientSnapshotV2(BRIDGE_V2_HEIGHT));
+
+    const CTransactionRef bootstrap{FixtureBootstrapTransaction()};
+    const CTransactionRef update{FixtureUpdateTransaction()};
+    // The V1 store is bootstrapped, but from V an update needs the V2 one.
+    VerifyFails(index, Block(1'060, {update}), BRIDGE_V2_HEIGHT, params,
+                "light-client update precedes bootstrap");
+    // Below V the same bootstrap is a second V1 bootstrap.
+    VerifyFails(index, Block(1'060, {bootstrap}), BRIDGE_V2_HEIGHT - 1,
+                params, "already bootstrapped");
+
+    const node::BridgeBlockDelta boot_delta{
+        ConnectNext(index, params, {bootstrap})};
+    BOOST_CHECK(boot_delta.v2_store);
+    BOOST_CHECK(!boot_delta.light_client_before);
+    BOOST_REQUIRE(boot_delta.light_client_after);
+    BOOST_REQUIRE_EQUAL(boot_delta.anchors_added.size(), 1U);
+    const uint256 v2_anchor_hash{
+        FixtureHex32(ethfx::U1_FINALIZED_EXEC.block_hash)};
+    BOOST_CHECK(boot_delta.anchors_added.front().block_hash == v2_anchor_hash);
+
+    BOOST_REQUIRE(index.LightClientV2());
+    BOOST_CHECK(*index.LightClientV2() == FixtureBootstrapStore());
+    const node::BridgeStateConnection boot_connection{
+        BRIDGE_V2_HEIGHT, V2TestBlockHash(BRIDGE_V2_HEIGHT)};
+    BOOST_CHECK(index.LightClientV2LastConnected() ==
+                std::optional<node::BridgeStateConnection>{boot_connection});
+    BOOST_CHECK(index.AnchorV2(v2_anchor_hash).has_value());
+    BOOST_CHECK(!index.Anchor(v2_anchor_hash));
+    BOOST_CHECK_EQUAL(index.AnchorCountV2(), 1U);
+    BOOST_CHECK(index.AnchorForTargetV2(fixture_block, BRIDGE_V2_HEIGHT)
+                    .has_value());
+    BOOST_CHECK(!index.AnchorForTargetV2(fixture_block, BRIDGE_V2_HEIGHT - 1));
+    // V1 is untouched.
+    BOOST_CHECK(index.LightClient() == v1_store);
+    BOOST_CHECK(index.LightClientLastConnected() == v1_connection);
+    BOOST_CHECK_EQUAL(index.AnchorCount(), 1U);
+    BOOST_CHECK(!index.AnchorV2(v1_fixture.block_hash));
+    const auto v1_anchor{
+        index.AnchorForTarget(v1_fixture.block_number, BRIDGE_V2_HEIGHT)};
+    BOOST_REQUIRE(v1_anchor);
+    BOOST_CHECK(v1_anchor->block_hash == v1_fixture.block_hash);
+    BOOST_CHECK(!index.AnchorForTarget(fixture_block, BRIDGE_V2_HEIGHT));
+
+    // The per-store second-bootstrap guard.
+    VerifyFails(index, Block(1'061, {bootstrap}), BRIDGE_V2_HEIGHT + 1,
+                params, "already bootstrapped");
+
+    const node::BridgeBlockDelta update_delta{
+        ConnectNext(index, params, {update})};
+    BOOST_CHECK(update_delta.v2_store);
+    BOOST_CHECK(update_delta.anchors_added.empty());
+    BOOST_REQUIRE(index.LightClientV2());
+    BOOST_CHECK(index.LightClientV2()->next.has_value());
+    BOOST_CHECK(!index.LightClient()->next);
+
+    // Snapshots: V1 keeps its seed; V2 follows its own deltas only.
+    const auto v1_snapshot{
+        index.FinalizedLightClientSnapshot(BRIDGE_V2_HEIGHT + 1)};
+    BOOST_REQUIRE(v1_snapshot);
+    BOOST_CHECK(v1_snapshot->connection == *v1_connection);
+    BOOST_CHECK(v1_snapshot->store == *v1_store);
+    BOOST_CHECK(!index.FinalizedLightClientSnapshotV2(BRIDGE_V2_HEIGHT - 1));
+    const auto v2_at_boot{
+        index.FinalizedLightClientSnapshotV2(BRIDGE_V2_HEIGHT)};
+    BOOST_REQUIRE(v2_at_boot);
+    BOOST_CHECK_EQUAL(v2_at_boot->connection.height, BRIDGE_V2_HEIGHT);
+    BOOST_CHECK(!v2_at_boot->store.next);
+    const auto v2_at_update{
+        index.FinalizedLightClientSnapshotV2(BRIDGE_V2_HEIGHT + 1)};
+    BOOST_REQUIRE(v2_at_update);
+    BOOST_CHECK_EQUAL(v2_at_update->connection.height, BRIDGE_V2_HEIGHT + 1);
+    BOOST_CHECK(v2_at_update->store.next.has_value());
+
+    // Undo unwinds the V2 store alone.
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(
+                              BRIDGE_V2_HEIGHT + 1,
+                              V2TestBlockHash(BRIDGE_V2_HEIGHT + 1), error),
+                          error);
+    BOOST_REQUIRE(index.LightClientV2());
+    BOOST_CHECK(!index.LightClientV2()->next);
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(
+                              BRIDGE_V2_HEIGHT,
+                              V2TestBlockHash(BRIDGE_V2_HEIGHT), error),
+                          error);
+    BOOST_CHECK(!index.LightClientV2());
+    BOOST_CHECK(!index.LightClientV2LastConnected());
+    BOOST_CHECK_EQUAL(index.AnchorCountV2(), 0U);
+    BOOST_CHECK(!index.FinalizedLightClientSnapshotV2(BRIDGE_V2_HEIGHT));
+    BOOST_CHECK(index.LightClient() == v1_store);
+    BOOST_CHECK_EQUAL(index.AnchorCount(), 1U);
+
+    // Kind 4 from V extends the V2 anchors only; a V1 anchor is unknown to
+    // the V2 store. Both stores may hold an anchor at the same number.
+    const uint256 receipts_699{TestBlockHash(699)};
+    const uint256 receipts_700{TestBlockHash(700)};
+    const std::vector<unsigned char> header_699{
+        ExecutionHeader(uint256{}, 699, receipts_699, 1'699)};
+    const uint256 hash_699{Keccak(header_699)};
+    const std::vector<unsigned char> header_700{
+        ExecutionHeader(hash_699, 700, receipts_700, 1'700)};
+    const uint256 hash_700{Keccak(header_700)};
+    const Consensus::Params backfill_params{V2Params()};
+    node::BridgeStateIndex backfill_index;
+    SeedVerifiedAnchor(backfill_index, v1_fixture);
+    ConnectEmptyThrough(backfill_index, backfill_params, BRIDGE_V2_HEIGHT - 2);
+    node::BridgeBlockDelta v2_seed;
+    v2_seed.height = BRIDGE_V2_HEIGHT - 1;
+    v2_seed.block_hash = V2TestBlockHash(v2_seed.height);
+    v2_seed.previous_height = backfill_index.ConnectedHeight();
+    v2_seed.previous_block_hash = backfill_index.ConnectedHash();
+    v2_seed.v2_store = true;
+    v2_seed.anchors_added.push_back(node::BridgeExecutionAnchor{
+        700, hash_700, receipts_700, 32, 700, 1'700, v2_seed.height,
+        v2_seed.block_hash});
+    BOOST_REQUIRE_EQUAL(v1_fixture.block_number, 700U);
+    BOOST_REQUIRE_MESSAGE(backfill_index.ConnectBlock(v2_seed, error), error);
+    BOOST_CHECK(backfill_index.AnchorV2(hash_700).has_value());
+    BOOST_CHECK(backfill_index.Anchor(v1_fixture.block_hash).has_value());
+
+    VerifyFails(backfill_index,
+                Block(1'060, {BackfillTransaction(v1_fixture.block_hash, 699,
+                                                  {v1_fixture.header})}),
+                BRIDGE_V2_HEIGHT, backfill_params,
+                "backfill names an unretained anchor");
+    // Below V the V2 anchor is unknown to the V1 store.
+    const CTransactionRef backfill{
+        BackfillTransaction(hash_700, 699, {header_700, header_699})};
+    VerifyFails(backfill_index, Block(1'060, {backfill}),
+                BRIDGE_V2_HEIGHT - 1, backfill_params,
+                "backfill names an unretained anchor");
+    const node::BridgeBlockDelta backfill_delta{
+        ConnectNext(backfill_index, backfill_params, {backfill})};
+    BOOST_CHECK(backfill_delta.v2_store);
+    BOOST_REQUIRE_EQUAL(backfill_delta.anchors_added.size(), 1U);
+    BOOST_CHECK(backfill_index.AnchorV2(hash_699).has_value());
+    BOOST_CHECK(!backfill_index.Anchor(hash_699));
+    BOOST_CHECK_EQUAL(backfill_index.AnchorCount(), 1U);
+    BOOST_CHECK_EQUAL(backfill_index.AnchorCountV2(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(v2_mint_large_typed_receipt)
+{
+    const Consensus::Params params{V2Params()};
+    const auto asset_v2{modern::ConfiguredBridgeV2AssetId(params)};
+    BOOST_REQUIRE(asset_v2);
+    // A type-0x05 receipt (beyond V1's 1..4) whose terminal node exceeds
+    // V1's 1,024-byte limit but fits V2's 8,192.
+    const ReceiptFixture fixture{
+        MakeV2ReceiptFixture(params, {{1, 60, 0x31}}, 0x05, 1'700)};
+    BOOST_CHECK_GT(fixture.mpt_node.size(), bridge::MAX_BRIDGE_RLP_ITEM_SIZE);
+    BOOST_CHECK_LE(fixture.mpt_node.size(),
+                   bridge::MAX_BRIDGE_TERMINAL_RECEIPT_NODE_SIZE_V2);
+    BOOST_CHECK_GT(fixture.mpt_node.size(), 2'000U);
+
+    node::BridgeStateIndex index;
+    SeedVerifiedAnchorAt(index, fixture, BRIDGE_V2_HEIGHT - 1,
+                         /*v2_store=*/true);
+    const CTransactionRef mint{MintTransactionV2(params, fixture, 0, 60)};
+
+    // Below V the record needs limits V1 does not have.
+    VerifyFails(index, Block(1'060, {mint}), BRIDGE_V2_HEIGHT - 1, params,
+                "bridge record is malformed");
+    // The structural MPA rule that mempool admission and block checks run
+    // before any bridge state selects the same limits by height.
+    {
+        std::string mpa_error;
+        BOOST_CHECK(!modern::CheckTransactionMpa(*mint, params,
+                                                 BRIDGE_V2_HEIGHT - 1,
+                                                 mpa_error));
+        BOOST_CHECK_EQUAL(mpa_error, "mpa-malformed-bridge-record");
+        mpa_error.clear();
+        BOOST_CHECK_MESSAGE(modern::CheckTransactionMpa(*mint, params,
+                                                        BRIDGE_V2_HEIGHT,
+                                                        mpa_error),
+                            mpa_error);
+        // Without a bridge V2 envelope the V1 limits hold at every height.
+        Consensus::Params no_v2{params};
+        no_v2.bridge_v2.reset();
+        mpa_error.clear();
+        BOOST_CHECK(!modern::CheckTransactionMpa(*mint, no_v2,
+                                                 BRIDGE_V2_HEIGHT + 100,
+                                                 mpa_error));
+        BOOST_CHECK_EQUAL(mpa_error, "mpa-malformed-bridge-record");
+    }
+
+    node::BridgeTxAuthorization authorization;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.VerifyTransaction(*mint, BRIDGE_V2_HEIGHT,
+                                                  1'060, params,
+                                                  authorization, error),
+                          error);
+    BOOST_REQUIRE(authorization.mint);
+    BOOST_CHECK(authorization.mint->authorization.asset == *asset_v2);
+    BOOST_CHECK(!authorization.HasWithdrawal());
+
+    const node::BridgeBlockDelta delta{ConnectNext(index, params, {mint})};
+    BOOST_CHECK(delta.v2_store);
+    BOOST_REQUIRE_EQUAL(delta.mint_authorizations.size(), 1U);
+    const auto& minted{delta.mint_authorizations.front().authorization};
+    BOOST_CHECK(minted.asset == *asset_v2);
+    BOOST_CHECK(minted.asset != *modern::ConfiguredBridgeAssetId(params));
+    BOOST_CHECK_EQUAL(minted.amount, 60);
+    BOOST_CHECK(minted.recipient_script == fixture.recipient_scripts.front());
+    BOOST_CHECK_EQUAL(minted.nullifier.nullifier_namespace,
+                      bridge::BRIDGE_NULLIFIER_NAMESPACE_V2);
+
+    // From V a V1-registry mint is refused, even for a V1 deposit.
+    const ReceiptFixture v1_fixture{
+        MakeReceiptFixture(params, {{2, 60, 0x32}})};
+    VerifyFails(index,
+                Block(1'061, {MintTransactionWithAmount(params, v1_fixture, 0,
+                                                        60)}),
+                BRIDGE_V2_HEIGHT + 1, params,
+                "registry id does not match the V2 vault entry");
+
+    // V1 keeps its receipt types: a small type-0x05 receipt is malformed
+    // under the V1 mint rules.
+    const Consensus::Params v1_params{BridgeParams()};
+    const ReceiptFixture typed_v1{MakeReceiptFixture(
+        v1_params.busd_bridge->asset.vault_address,
+        v1_params.busd_bridge->asset.token_address, {{3, 60, 0x33}}, 0x05)};
+    BOOST_REQUIRE_LE(typed_v1.mpt_node.size(), bridge::MAX_BRIDGE_RLP_ITEM_SIZE);
+    node::BridgeStateIndex v1_index;
+    SeedVerifiedAnchor(v1_index, typed_v1);
+    VerifyFails(v1_index,
+                Block(1'060, {MintTransactionWithAmount(v1_params, typed_v1, 0,
+                                                        60)}),
+                BRIDGE_HEIGHT, v1_params, "bridge mint receipt is malformed");
+}
+
+BOOST_AUTO_TEST_CASE(v2_mint_replay_and_namespace)
+{
+    const Consensus::Params params{V2Params()};
+    const auto asset_v1{modern::ConfiguredBridgeAssetId(params)};
+    const auto asset_v2{modern::ConfiguredBridgeV2AssetId(params)};
+    BOOST_REQUIRE(asset_v1);
+    BOOST_REQUIRE(asset_v2);
+    // The same deposit id on both vaults: one V1 mint before V, one V2 mint
+    // from V, kept apart by vault and nullifier namespace.
+    const ReceiptFixture v1_fixture{
+        MakeReceiptFixture(params, {{7, 60, 0x41}})};
+    const ReceiptFixture v2_fixture{MakeV2ReceiptFixture(
+        params, {{7, 60, 0x42}, {8, 50, 0x43}})};
+    node::BridgeStateIndex index;
+    SeedVerifiedAnchor(index, v1_fixture);
+    const node::BridgeBlockDelta v1_mint{ConnectNext(
+        index, params, {MintTransactionWithAmount(params, v1_fixture, 0, 60)})};
+    BOOST_CHECK(!v1_mint.v2_store);
+    ConnectEmptyThrough(index, params, BRIDGE_V2_HEIGHT - 2);
+    SeedVerifiedAnchorAt(index, v2_fixture, BRIDGE_V2_HEIGHT - 1,
+                         /*v2_store=*/true);
+
+    const CTransactionRef mint{MintTransactionV2(params, v2_fixture, 0, 60)};
+    const node::BridgeBlockDelta delta{ConnectNext(index, params, {mint})};
+    BOOST_REQUIRE_EQUAL(delta.nullifiers_added.size(), 1U);
+    const bridge::BridgeDepositKey v2_key{
+        Consensus::BUSD_ETHEREUM_CHAIN_ID,
+        params.bridge_v2->vault.vault_address, 7,
+        bridge::BRIDGE_NULLIFIER_NAMESPACE_V2};
+    BOOST_CHECK(delta.nullifiers_added.front() == v2_key);
+    BOOST_CHECK(index.IsNullified(v2_key));
+    bridge::BridgeDepositKey v2_vault_in_v1_namespace{v2_key};
+    v2_vault_in_v1_namespace.nullifier_namespace =
+        bridge::BRIDGE_NULLIFIER_NAMESPACE_V1;
+    BOOST_CHECK(!index.IsNullified(v2_vault_in_v1_namespace));
+    BOOST_CHECK(index.IsNullified(
+        v1_mint.mint_authorizations.front().authorization.nullifier));
+    BOOST_CHECK_EQUAL(index.NullifierCount(), 2U);
+    BOOST_CHECK_EQUAL(
+        index.NullifierCount(bridge::BRIDGE_NULLIFIER_NAMESPACE_V1), 1U);
+    BOOST_CHECK_EQUAL(
+        index.NullifierCount(bridge::BRIDGE_NULLIFIER_NAMESPACE_V2), 1U);
+    const auto connection{index.NullifierConnection(v2_key)};
+    BOOST_REQUIRE(connection);
+    BOOST_CHECK_EQUAL(connection->height, BRIDGE_V2_HEIGHT);
+    // Epochs: V2 counts from V, keyed by the bUSD V2 AssetId.
+    BOOST_CHECK_EQUAL(index.EpochMinted(*asset_v2, 0), 60);
+    BOOST_CHECK_EQUAL(index.EpochMinted(*asset_v1, 0), 60);
+
+    // Replay at V + 1, alone and together with a fresh deposit.
+    VerifyFails(index, Block(1'061, {mint}), BRIDGE_V2_HEIGHT + 1, params,
+                "already nullified");
+    const CTransactionRef second{MintTransactionV2(params, v2_fixture, 1, 50)};
+    VerifyFails(index, Block(1'061, {mint, second}), BRIDGE_V2_HEIGHT + 1,
+                params, "already nullified");
+    // The V2 epoch counter (cap 150) carries the earlier mint: 60 + 50.
+    const node::BridgeBlockDelta second_delta{
+        ConnectNext(index, params, {second})};
+    BOOST_CHECK_EQUAL(index.EpochMinted(*asset_v2, 0), 110);
+    BOOST_REQUIRE_EQUAL(second_delta.epoch_mint_changes.size(), 1U);
+    BOOST_CHECK(second_delta.epoch_mint_changes.front().asset == *asset_v2);
+    BOOST_CHECK_EQUAL(second_delta.epoch_mint_changes.front().before, 60);
+
+    // Undo returns both V2 nullifiers and the epoch counter.
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(
+                              BRIDGE_V2_HEIGHT + 1,
+                              V2TestBlockHash(BRIDGE_V2_HEIGHT + 1), error),
+                          error);
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(
+                              BRIDGE_V2_HEIGHT,
+                              V2TestBlockHash(BRIDGE_V2_HEIGHT), error),
+                          error);
+    BOOST_CHECK(!index.IsNullified(v2_key));
+    BOOST_CHECK_EQUAL(
+        index.NullifierCount(bridge::BRIDGE_NULLIFIER_NAMESPACE_V2), 0U);
+    BOOST_CHECK_EQUAL(
+        index.NullifierCount(bridge::BRIDGE_NULLIFIER_NAMESPACE_V1), 1U);
+    BOOST_CHECK_EQUAL(index.EpochMinted(*asset_v2, 0), 0);
+    BOOST_CHECK_EQUAL(index.EpochMinted(*asset_v1, 0), 60);
+}
+
+BOOST_AUTO_TEST_CASE(v2_burn_tree_roots_undo)
+{
+    const Consensus::Params params{V2Params()};
+    const auto asset_v2{modern::ConfiguredBridgeV2AssetId(params)};
+    const auto entry_id{modern::ConfiguredBridgeV2EntryId(params)};
+    BOOST_REQUIRE(asset_v2);
+    BOOST_REQUIRE(entry_id);
+    const uint256 empty_root{
+        modern::WithdrawalZeroHashes()[modern::WITHDRAWAL_TREE_DEPTH]};
+
+    node::BridgeStateIndex index;
+    ConnectEmptyThrough(index, params, BRIDGE_V2_HEIGHT - 1);
+    // No root V2 is recorded below V (the V2 tree is empty there and
+    // certificates sign zero without consulting the index).
+    BOOST_CHECK(!index.WithdrawalRootV2AtHeight(BRIDGE_V2_HEIGHT - 1));
+    BOOST_CHECK(index.WithdrawalTreeV2().root == empty_root);
+    BOOST_CHECK(node::FinalityWithdrawalRootV2(BRIDGE_V2_HEIGHT - 1, params,
+                                               &index) ==
+                std::optional<uint256>{uint256{}});
+
+    const CTransactionRef first{BurnTransactionV2(params, 90, 11, 0x91)};
+    const CTransactionRef second{BurnTransactionV2(params, 91, 22, 0x92)};
+    // Below V a kind 6 naming the V2 entry is a V1 burn, refused on this
+    // managed V1 bridge.
+    VerifyFails(index, Block(1'060, {first}), BRIDGE_V2_HEIGHT - 1, params,
+                "decentralized bridge burn is disabled");
+    // Kind 5 stays valid below V and closes at V.
+    const CTransactionRef managed{ManagedWithdrawalTransaction(params, 25)};
+    node::BridgeBlockDelta managed_delta;
+    std::string error;
+    BOOST_CHECK_MESSAGE(index.VerifyBlock(Block(1'060, {managed}),
+                                          BRIDGE_V2_HEIGHT - 1,
+                                          V2TestBlockHash(1), params,
+                                          managed_delta, error),
+                        error);
+    VerifyFails(index, Block(1'060, {managed}), BRIDGE_V2_HEIGHT, params,
+                "managed bridge withdrawals are closed from the bridge V2 activation height");
+    // From V the record must name the V2 entry and burn bUSD V2.
+    VerifyFails(index,
+                Block(1'060, {BurnTransactionV2(
+                                 params, 92, 11, 0x93,
+                                 modern::ConfiguredBridgeRegistryId(params))}),
+                BRIDGE_V2_HEIGHT, params,
+                "bridge burn does not name the V2 vault entry");
+    VerifyFails(index,
+                Block(1'060, {BurnTransactionV2(
+                                 params, 93, 11, 0x94, std::nullopt,
+                                 modern::ConfiguredBridgeAssetId(params))}),
+                BRIDGE_V2_HEIGHT, params, "exact bUSD V2 BURN output");
+    // W2 = V + 5 keeps burns closed at V.
+    const Consensus::Params late_burns{V2Params(BRIDGE_V2_HEIGHT + 5)};
+    VerifyFails(index, Block(1'060, {first}), BRIDGE_V2_HEIGHT, late_burns,
+                "bridge V2 burns are not active");
+    BOOST_CHECK(modern::ConfiguredBridgeV2EntryId(late_burns) == entry_id);
+
+    // V: an empty block; the certificate root is the empty V2 tree.
+    const node::BridgeBlockDelta at_v{ConnectNext(index, params)};
+    BOOST_CHECK(at_v.v2_store);
+    BOOST_CHECK(index.WithdrawalRootV2AtHeight(BRIDGE_V2_HEIGHT) ==
+                std::optional<uint256>{empty_root});
+    BOOST_CHECK(node::FinalityWithdrawalRootV2(BRIDGE_V2_HEIGHT, params,
+                                               &index) ==
+                std::optional<uint256>{empty_root});
+
+    // The per-transaction preview reports the V2 leaf (and so SIGHASH_ALL).
+    node::BridgeTxAuthorization authorization;
+    BOOST_REQUIRE_MESSAGE(index.VerifyTransaction(*first, BRIDGE_V2_HEIGHT + 1,
+                                                  1'061, params,
+                                                  authorization, error),
+                          error);
+    BOOST_REQUIRE(authorization.withdrawal_v2);
+    BOOST_CHECK(authorization.HasWithdrawal());
+    BOOST_CHECK(!authorization.decentralized_withdrawal);
+    BOOST_CHECK(!authorization.mint);
+    auto preview{index.BeginBlockPreview(BRIDGE_V2_HEIGHT + 1, 1'061,
+                                         TestHash(95), params, error)};
+    BOOST_REQUIRE_MESSAGE(preview != nullptr, error);
+    const std::array<CTransactionRef, 1> chunk{first};
+    BOOST_REQUIRE_MESSAGE(preview->TryAppend(chunk, error), error);
+    BOOST_CHECK(!preview->TryAppend(chunk, error));
+    BOOST_CHECK(error.find("duplicated") != std::string::npos);
+
+    // V + 1: two burns take ids 0 and 1 of the V2 tree.
+    const int burn_height{BRIDGE_V2_HEIGHT + 1};
+    const node::BridgeBlockDelta delta{
+        ConnectNext(index, params, {first, second}, 1'061)};
+    BOOST_REQUIRE_EQUAL(delta.withdrawals_v2_added.size(), 2U);
+    BOOST_CHECK(delta.decentralized_withdrawals_added.empty());
+    BOOST_CHECK(delta.withdrawal_tree_after == delta.withdrawal_tree_before);
+    modern::WithdrawalTreeState expected;
+    for (size_t i{0}; i < delta.withdrawals_v2_added.size(); ++i) {
+        const node::BridgeWithdrawalV2Request& request{
+            delta.withdrawals_v2_added[i]};
+        const modern::BridgeWithdrawalV2& w{request.withdrawal};
+        BOOST_CHECK_EQUAL(w.withdrawal_id, i);
+        BOOST_CHECK_EQUAL(w.destination_chain_id,
+                          Consensus::BUSD_ETHEREUM_CHAIN_ID);
+        BOOST_CHECK(w.asset_id == *asset_v2);
+        BOOST_CHECK(w.vault == params.bridge_v2->vault.vault_address);
+        BOOST_CHECK(w.token == Consensus::BUSD_ETHEREUM_USDT);
+        BOOST_CHECK(w.recipient == FilledAddress(static_cast<uint8_t>(0x91 + i)));
+        BOOST_CHECK_EQUAL(w.amount, i == 0 ? 11 : 22);
+        BOOST_CHECK_EQUAL(w.b3_height, static_cast<uint64_t>(burn_height));
+        BOOST_CHECK_EQUAL(request.connected_height, burn_height);
+        BOOST_CHECK(request.connected_block == V2TestBlockHash(burn_height));
+        BOOST_CHECK(modern::BridgeWithdrawalLeafV2(w) ==
+                    std::optional<uint256>{request.leaf});
+        BOOST_CHECK(modern::AppendBridgeWithdrawalV2(expected, w) ==
+                    std::optional<uint256>{request.leaf});
+    }
+    BOOST_CHECK(delta.withdrawal_tree_v2_after == expected);
+    BOOST_CHECK(index.WithdrawalTreeV2() == expected);
+    BOOST_CHECK(index.WithdrawalRootV2AtHeight(burn_height) ==
+                std::optional<uint256>{expected.root});
+    BOOST_CHECK(node::FinalityWithdrawalRootV2(burn_height, params, &index) ==
+                std::optional<uint256>{expected.root});
+    BOOST_CHECK(index.WithdrawalRootV2AtHeight(BRIDGE_V2_HEIGHT) ==
+                std::optional<uint256>{empty_root});
+    BOOST_CHECK_EQUAL(index.WithdrawalV2Count(), 2U);
+    BOOST_CHECK_EQUAL(index.DecentralizedWithdrawalCount(), 0U);
+    BOOST_CHECK_EQUAL(index.WithdrawalTree().count, 0U);
+    const node::BridgeWithdrawalId first_source{first->GetHash(), 0};
+    const auto by_source{index.WithdrawalV2(first_source)};
+    BOOST_REQUIRE(by_source);
+    BOOST_CHECK(*by_source == delta.withdrawals_v2_added[0]);
+    BOOST_CHECK(index.WithdrawalV2(uint64_t{1}) ==
+                std::optional<node::BridgeWithdrawalV2Request>{
+                    delta.withdrawals_v2_added[1]});
+    BOOST_CHECK(!index.WithdrawalV2(node::BridgeWithdrawalId{first->GetHash(), 1}));
+    BOOST_CHECK(!index.DecentralizedWithdrawal(first_source));
+    BOOST_CHECK(!index.WithdrawalsV2Through(burn_height + 1));
+    const auto through_v{index.WithdrawalsV2Through(BRIDGE_V2_HEIGHT)};
+    BOOST_REQUIRE(through_v);
+    BOOST_CHECK(through_v->empty());
+
+    // The S1 relay builder reproduces the indexed root from the prefix and
+    // folds each path back to it, as Vault V2 does.
+    const auto prefix{index.WithdrawalsV2Through(burn_height)};
+    BOOST_REQUIRE(prefix);
+    BOOST_REQUIRE_EQUAL(prefix->size(), 2U);
+    std::vector<modern::BridgeWithdrawalV2> withdrawals;
+    for (const auto& request : *prefix) withdrawals.push_back(request.withdrawal);
+    for (uint64_t id{0}; id < withdrawals.size(); ++id) {
+        const auto artifacts{bridge::BuildWithdrawalV2RelayArtifacts(
+            withdrawals, id, expected.root, error)};
+        BOOST_REQUIRE_MESSAGE(artifacts, error);
+        BOOST_CHECK(artifacts->leaf == prefix->at(id).leaf);
+        BOOST_CHECK_EQUAL(artifacts->release_calldata.size(),
+                          bridge::VAULT_V2_RELEASE_CALLDATA_SIZE);
+    }
+
+    // A replayed burn source is refused; a new one continues at id 2.
+    VerifyFails(index, Block(1'062, {first}), burn_height + 1, params,
+                "duplicated");
+    const CTransactionRef third{BurnTransactionV2(params, 96, 33, 0x97)};
+    const node::BridgeBlockDelta third_delta{
+        ConnectNext(index, params, {third}, 1'062)};
+    BOOST_REQUIRE_EQUAL(third_delta.withdrawals_v2_added.size(), 1U);
+    BOOST_CHECK_EQUAL(
+        third_delta.withdrawals_v2_added.front().withdrawal.withdrawal_id, 2U);
+
+    // Undo restores the tree, roots and maps exactly; replay is identical.
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(
+                              burn_height + 1,
+                              V2TestBlockHash(burn_height + 1), error),
+                          error);
+    BOOST_CHECK(index.WithdrawalTreeV2() == expected);
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(
+                              burn_height, V2TestBlockHash(burn_height), error),
+                          error);
+    BOOST_CHECK_EQUAL(index.WithdrawalV2Count(), 0U);
+    BOOST_CHECK(!index.WithdrawalV2(first_source));
+    BOOST_CHECK(!index.WithdrawalV2(uint64_t{0}));
+    BOOST_CHECK_EQUAL(index.WithdrawalTreeV2().count, 0U);
+    BOOST_CHECK(index.WithdrawalTreeV2().root == empty_root);
+    BOOST_CHECK(!index.WithdrawalRootV2AtHeight(burn_height));
+    BOOST_CHECK(index.WithdrawalRootV2AtHeight(BRIDGE_V2_HEIGHT) ==
+                std::optional<uint256>{empty_root});
+    const node::BridgeBlockDelta replay{
+        ConnectNext(index, params, {first, second}, 1'061)};
+    BOOST_CHECK(replay.withdrawals_v2_added == delta.withdrawals_v2_added);
+    BOOST_CHECK(replay.withdrawal_tree_v2_after == delta.withdrawal_tree_v2_after);
+}
+
+BOOST_AUTO_TEST_CASE(v2_delta_store_invariants)
+{
+    // ConnectBlock refuses deltas that mix the V1 and V2 regimes.
+    node::BridgeStateIndex index;
+    node::BridgeBlockDelta wrong_namespace;
+    wrong_namespace.height = BRIDGE_V2_HEIGHT;
+    wrong_namespace.block_hash = V2TestBlockHash(BRIDGE_V2_HEIGHT);
+    wrong_namespace.v2_store = true;
+    bridge::BridgeDepositKey v1_key;
+    v1_key.origin_chain_id = 1;
+    v1_key.vault_address.fill(0x21);
+    v1_key.deposit_id = 1;
+    wrong_namespace.nullifiers_added.push_back(v1_key);
+    std::string error;
+    BOOST_CHECK(!index.ConnectBlock(wrong_namespace, error));
+    BOOST_CHECK(error.find("namespace does not match") != std::string::npos);
+
+    node::BridgeBlockDelta v2_leaf_below_v;
+    v2_leaf_below_v.height = BRIDGE_V2_HEIGHT - 1;
+    v2_leaf_below_v.block_hash = V2TestBlockHash(BRIDGE_V2_HEIGHT - 1);
+    v2_leaf_below_v.withdrawals_v2_added.emplace_back();
+    error.clear();
+    BOOST_CHECK(!index.ConnectBlock(v2_leaf_below_v, error));
+    BOOST_CHECK(error.find("withdrawals do not match its store") !=
+                std::string::npos);
+
+    node::BridgeBlockDelta v1_leaf_from_v;
+    v1_leaf_from_v.height = BRIDGE_V2_HEIGHT;
+    v1_leaf_from_v.block_hash = V2TestBlockHash(BRIDGE_V2_HEIGHT);
+    v1_leaf_from_v.v2_store = true;
+    v1_leaf_from_v.decentralized_withdrawals_added.emplace_back();
+    error.clear();
+    BOOST_CHECK(!index.ConnectBlock(v1_leaf_from_v, error));
+    BOOST_CHECK(error.find("withdrawals do not match its store") !=
+                std::string::npos);
+    BOOST_CHECK_EQUAL(index.ConnectedHeight(), -1);
+    BOOST_CHECK(index.History().empty());
+}
+
+BOOST_AUTO_TEST_CASE(v2_burn_readiness)
+{
+    const Consensus::Params params{V2Params()};
+    const Consensus::BridgeV2Params& v2{*params.bridge_v2};
+    node::LineageV2View good;
+    good.configured = true;
+    good.bootstrapped = true;
+    good.current_count = 4;
+    good.current_weight = 900;
+    good.next_count = 64;
+    good.next_weight = 5'000;
+    std::string reason;
+    BOOST_CHECK(node::BridgeV2BurnReadiness(good, v2, reason) ==
+                node::BridgeBurnReadiness::READY);
+    BOOST_CHECK(reason.empty());
+
+    const auto not_ready = [&](const node::LineageV2View& view,
+                               const Consensus::BridgeV2Params& pins,
+                               const std::string& expected) {
+        std::string why;
+        BOOST_CHECK(node::BridgeV2BurnReadiness(view, pins, why) ==
+                    node::BridgeBurnReadiness::NOT_READY);
+        BOOST_CHECK_MESSAGE(why.find(expected) != std::string::npos,
+                            "reason '" << why << "' lacks '" << expected << "'");
+    };
+    node::LineageV2View view{good};
+    view.configured = false;
+    not_ready(view, v2, "not configured");
+    view = good;
+    view.bootstrapped = false;
+    not_ready(view, v2, "not bootstrapped");
+    view = good;
+    view.broken = true;
+    not_ready(view, v2, "broken");
+    view = good;
+    view.current_count = 3;
+    not_ready(view, v2, "current fresh-lineage committee");
+    view = good;
+    view.next_count = 65;
+    not_ready(view, v2, "next fresh-lineage committee");
+    view = good;
+    view.current_weight = 899;
+    not_ready(view, v2, "current fresh-lineage committee");
+    view = good;
+    view.next_count = 0;
+    view.next_weight = 0;
+    not_ready(view, v2, "next fresh-lineage committee");
+    Consensus::BridgeV2Params incomplete{v2};
+    incomplete.verifier.address = {};
+    not_ready(good, incomplete, "parameters are incomplete");
+
+    // The temporary gate's error text, for V2 burns only.
+    const CTransactionRef burn{BurnTransactionV2(params, 98, 5, 0x99)};
+    std::string error;
+    BOOST_CHECK(!node::CheckBridgeV2BurnReadiness(
+        *burn, node::BridgeBurnReadiness::NOT_READY, error));
+    BOOST_CHECK(error.find("temporary gate") != std::string::npos);
+    BOOST_CHECK(error.find("fresh finality lineage") != std::string::npos);
+    error.clear();
+    BOOST_CHECK(!node::CheckBridgeV2BurnReadiness(
+        Block(1'000, {burn}), node::BridgeBurnReadiness::UNAVAILABLE, error));
+    BOOST_CHECK(error.find("unavailable") != std::string::npos);
+    BOOST_CHECK(node::CheckBridgeV2BurnReadiness(
+        *burn, node::BridgeBurnReadiness::READY, error));
+    const ReceiptFixture fixture{MakeV2ReceiptFixture(params, {{1, 60, 0x31}})};
+    BOOST_CHECK(node::CheckBridgeV2BurnReadiness(
+        *MintTransactionV2(params, fixture, 0, 60),
+        node::BridgeBurnReadiness::NOT_READY, error));
+}
+
+BOOST_AUTO_TEST_CASE(finality_withdrawal_root_v2)
+{
+    const uint256 empty_root{
+        modern::WithdrawalZeroHashes()[modern::WITHDRAWAL_TREE_DEPTH]};
+    // Without a bridge V2 envelope the root is zero at every height.
+    const Consensus::Params v1_only{FullyActiveBridgeParams(true)};
+    BOOST_REQUIRE(!v1_only.bridge_v2);
+    for (const int height : {0, BRIDGE_HEIGHT, BRIDGE_V2_HEIGHT, 1'000'000}) {
+        BOOST_CHECK(node::FinalityWithdrawalRootV2(height, v1_only, nullptr) ==
+                    std::optional<uint256>{uint256{}});
+    }
+    // ... and an index on such a chain records no V2 root at any height
+    // (no per-block V2 state on mainnet or testnet).
+    {
+        node::BridgeStateIndex v1_index;
+        ConnectEmptyThrough(v1_index, v1_only, BRIDGE_V2_HEIGHT + 2);
+        for (int height{BRIDGE_HEIGHT}; height <= BRIDGE_V2_HEIGHT + 2;
+             ++height) {
+            BOOST_CHECK(!v1_index.WithdrawalRootV2AtHeight(height));
+            BOOST_CHECK(node::FinalityWithdrawalRootV2(height, v1_only,
+                                                       &v1_index) ==
+                        std::optional<uint256>{uint256{}});
+        }
+        BOOST_CHECK(std::none_of(v1_index.History().begin(),
+                                 v1_index.History().end(),
+                                 [](const node::BridgeBlockDelta& delta) {
+                                     return delta.v2_store;
+                                 }));
+        // Undo below V needs no V2 root either.
+        std::string error;
+        BOOST_CHECK_MESSAGE(v1_index.DisconnectBlock(
+                                BRIDGE_V2_HEIGHT + 2,
+                                V2TestBlockHash(BRIDGE_V2_HEIGHT + 2), error),
+                            error);
+    }
+    // An incomplete envelope is inactive, hence zero.
+    Consensus::Params incomplete{V2Params()};
+    incomplete.bridge_v2->vault.token_runtime_code_hash.SetNull();
+    BOOST_REQUIRE(!incomplete.bridge_v2->Valid());
+    BOOST_CHECK(node::FinalityWithdrawalRootV2(BRIDGE_V2_HEIGHT, incomplete,
+                                               nullptr) ==
+                std::optional<uint256>{uint256{}});
+
+    const Consensus::Params params{V2Params()};
+    BOOST_CHECK(node::FinalityWithdrawalRootV2(BRIDGE_V2_HEIGHT - 1, params,
+                                               nullptr) ==
+                std::optional<uint256>{uint256{}});
+    // From V it fails closed without an index or without the height.
+    BOOST_CHECK(!node::FinalityWithdrawalRootV2(BRIDGE_V2_HEIGHT, params,
+                                                nullptr));
+    node::BridgeStateIndex index;
+    ConnectEmptyThrough(index, params, BRIDGE_V2_HEIGHT);
+    BOOST_CHECK(node::FinalityWithdrawalRootV2(BRIDGE_V2_HEIGHT, params,
+                                               &index) ==
+                std::optional<uint256>{empty_root});
+    BOOST_CHECK(!node::FinalityWithdrawalRootV2(BRIDGE_V2_HEIGHT + 1, params,
+                                                &index));
+    // The V1 hook is unchanged by the V2 regime (managed V1: zero).
+    BOOST_CHECK(node::FinalityWithdrawalRoot(BRIDGE_V2_HEIGHT, params,
+                                             &index) ==
+                std::optional<uint256>{uint256{}});
 }
 
 BOOST_AUTO_TEST_SUITE_END()

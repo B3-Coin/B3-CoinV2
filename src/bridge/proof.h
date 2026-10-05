@@ -69,7 +69,46 @@ static_assert(MAX_BRIDGE_HEADER_WIRE_SIZE <=
               MAX_BRIDGE_LIGHT_CLIENT_HEADER_SIZE);
 static_assert(MAX_BRIDGE_BOOTSTRAP_WIRE_SIZE <= MAX_BRIDGE_RECORD_SIZE);
 static_assert(MAX_BRIDGE_UPDATE_WIRE_SIZE <= MAX_BRIDGE_RECORD_SIZE);
+// V1 only: a V1 mint always fits the record. The V2 receipt limits below can
+// sum past it (ancestry 20 KiB + receipt proof 16 KiB), so for V2 the 32 KiB
+// record bound itself, enforced by both codec directions, caps that sum.
 static_assert(MAX_BRIDGE_MINT_WIRE_SIZE <= MAX_BRIDGE_RECORD_SIZE);
+
+/**
+ * Size limits on a kind-3 MINT's receipt proof (`mpt_nodes`). The terminal
+ * node is the LAST element: VerifyMptProof walks root-first, must consume
+ * every node and ends on the receipt value, so the receipt-bearing leaf is
+ * always the final node. Ancestry headers, backfills, the 64-node count and
+ * the 32 KiB record cap are the same under every limit set.
+ */
+struct BridgeMptLimits {
+    size_t max_node_size;
+    size_t max_terminal_node_size;
+    size_t max_total_bytes;
+};
+
+//! Today's exact receipt-proof limits, used below the bridge V2 height.
+inline constexpr BridgeMptLimits BRIDGE_MPT_LIMITS_V1{
+    MAX_BRIDGE_RLP_ITEM_SIZE, MAX_BRIDGE_RLP_ITEM_SIZE, MAX_BRIDGE_MPT_BYTES};
+//! Bridge V2 (doc/design/b3-bridge-v2-node-changes.md section 4): a terminal
+//! receipt node up to 8,192 bytes and a receipt proof up to 16 KiB; every
+//! other node keeps the 1,024-byte limit.
+inline constexpr size_t MAX_BRIDGE_TERMINAL_RECEIPT_NODE_SIZE_V2{8'192};
+inline constexpr size_t MAX_BRIDGE_MPT_BYTES_V2{16'384};
+inline constexpr BridgeMptLimits BRIDGE_MPT_LIMITS_V2{
+    MAX_BRIDGE_RLP_ITEM_SIZE, MAX_BRIDGE_TERMINAL_RECEIPT_NODE_SIZE_V2,
+    MAX_BRIDGE_MPT_BYTES_V2};
+
+// Blob lengths travel as u16, and V2 only widens V1.
+static_assert(MAX_BRIDGE_TERMINAL_RECEIPT_NODE_SIZE_V2 <= 0xffff);
+static_assert(BRIDGE_MPT_LIMITS_V2.max_node_size ==
+              BRIDGE_MPT_LIMITS_V1.max_node_size);
+static_assert(BRIDGE_MPT_LIMITS_V2.max_terminal_node_size >=
+              BRIDGE_MPT_LIMITS_V1.max_terminal_node_size);
+static_assert(BRIDGE_MPT_LIMITS_V2.max_total_bytes >=
+              BRIDGE_MPT_LIMITS_V1.max_total_bytes);
+static_assert(BRIDGE_MPT_LIMITS_V2.max_terminal_node_size <=
+              BRIDGE_MPT_LIMITS_V2.max_total_bytes);
 
 enum class BridgeRecordKindV1 : uint8_t {
     BOOTSTRAP = 1,
@@ -456,18 +495,31 @@ inline bool DecodeUpdate(Reader& reader, LightClientUpdate& update)
            reader.U64(update.signature_slot);
 }
 
+//! Item size limit for element `index` of `count`: the last element may use
+//! the (possibly larger) terminal limit.
+inline size_t BlobItemLimit(const size_t index, const size_t count,
+                            const size_t max_item, const size_t max_terminal_item)
+{
+    return index + 1 == count ? max_terminal_item : max_item;
+}
+
 inline bool EncodeBlobVector(Writer& writer,
                              const std::vector<std::vector<unsigned char>>& blobs,
                              const size_t max_count, const size_t max_total,
-                             const bool require_nonempty)
+                             const bool require_nonempty,
+                             const size_t max_item = MAX_BRIDGE_RLP_ITEM_SIZE,
+                             const size_t max_terminal_item = MAX_BRIDGE_RLP_ITEM_SIZE)
 {
     if ((require_nonempty && blobs.empty()) || blobs.size() > max_count) {
         return false;
     }
     size_t total{0};
-    for (const auto& blob : blobs) {
-        if (blob.empty() || blob.size() > MAX_BRIDGE_RLP_ITEM_SIZE ||
-            blob.size() > max_total - total) {
+    for (size_t i{0}; i < blobs.size(); ++i) {
+        const auto& blob{blobs[i]};
+        if (blob.empty() ||
+            blob.size() > BlobItemLimit(i, blobs.size(), max_item,
+                                        max_terminal_item) ||
+            blob.size() > 0xffff || blob.size() > max_total - total) {
             return false;
         }
         total += blob.size();
@@ -483,7 +535,9 @@ inline bool EncodeBlobVector(Writer& writer,
 inline bool DecodeBlobVector(Reader& reader,
                              std::vector<std::vector<unsigned char>>& blobs,
                              const size_t max_count, const size_t max_total,
-                             const bool require_nonempty)
+                             const bool require_nonempty,
+                             const size_t max_item = MAX_BRIDGE_RLP_ITEM_SIZE,
+                             const size_t max_terminal_item = MAX_BRIDGE_RLP_ITEM_SIZE)
 {
     uint8_t count{0};
     if (!reader.U8(count) || (require_nonempty && count == 0) ||
@@ -495,7 +549,8 @@ inline bool DecodeBlobVector(Reader& reader,
     size_t total{0};
     for (uint8_t i{0}; i < count; ++i) {
         uint16_t size{0};
-        if (!reader.U16(size) || size == 0 || size > MAX_BRIDGE_RLP_ITEM_SIZE ||
+        if (!reader.U16(size) || size == 0 ||
+            size > BlobItemLimit(i, count, max_item, max_terminal_item) ||
             size > max_total - total || size > reader.Remaining()) {
             return false;
         }
@@ -561,8 +616,15 @@ inline std::optional<ssz::SyncCommittee> DecodeBridgeSyncCommitteeV1(
     return committee;
 }
 
+/**
+ * Canonical encode. `mpt_limits` applies only to a MINT's receipt proof; the
+ * V1 default keeps every pre-V2 caller byte-identical. Consensus selects the
+ * limit set by height (V2 from the bridge V2 activation height), so a record
+ * that only fits the V2 limits is malformed below that height.
+ */
 inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
-    const BridgeRecordV1& record)
+    const BridgeRecordV1& record,
+    const BridgeMptLimits& mpt_limits = BRIDGE_MPT_LIMITS_V1)
 {
     using namespace proof_detail;
     Writer writer;
@@ -603,8 +665,10 @@ inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
                         /*require_nonempty=*/true) &&
                     EncodeBlobVector(writer, value->mpt_nodes,
                                      MAX_BRIDGE_MPT_NODES,
-                                     MAX_BRIDGE_MPT_BYTES,
-                                     /*require_nonempty=*/true);
+                                     mpt_limits.max_total_bytes,
+                                     /*require_nonempty=*/true,
+                                     mpt_limits.max_node_size,
+                                     mpt_limits.max_terminal_node_size);
         }
         break;
     case BridgeRecordKindV1::EXECUTION_BACKFILL:
@@ -658,8 +722,10 @@ inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
     return encoded;
 }
 
+//! Strict decode under `mpt_limits` (see EncodeBridgeRecordV1).
 inline std::optional<BridgeRecordV1> DecodeBridgeRecordV1(
-    const std::span<const unsigned char> encoded)
+    const std::span<const unsigned char> encoded,
+    const BridgeMptLimits& mpt_limits = BRIDGE_MPT_LIMITS_V1)
 {
     using namespace proof_detail;
     if (encoded.size() < 2 || encoded.size() > MAX_BRIDGE_RECORD_SIZE) {
@@ -705,8 +771,10 @@ inline std::optional<BridgeRecordV1> DecodeBridgeRecordV1(
                               MAX_BRIDGE_EXECUTION_ANCESTRY_BYTES,
                               /*require_nonempty=*/true) ||
             !DecodeBlobVector(reader, value.mpt_nodes, MAX_BRIDGE_MPT_NODES,
-                              MAX_BRIDGE_MPT_BYTES,
-                              /*require_nonempty=*/true) ||
+                              mpt_limits.max_total_bytes,
+                              /*require_nonempty=*/true,
+                              mpt_limits.max_node_size,
+                              mpt_limits.max_terminal_node_size) ||
             !reader.Empty()) {
             return std::nullopt;
         }
@@ -754,22 +822,24 @@ inline std::optional<BridgeRecordV1> DecodeBridgeRecordV1(
 }
 
 inline std::optional<CMpaRecord> MakeBridgeMpaRecord(
-    const BridgeRecordV1& record)
+    const BridgeRecordV1& record,
+    const BridgeMptLimits& mpt_limits = BRIDGE_MPT_LIMITS_V1)
 {
-    auto encoded{EncodeBridgeRecordV1(record)};
+    auto encoded{EncodeBridgeRecordV1(record, mpt_limits)};
     if (!encoded) return std::nullopt;
     return CMpaRecord{BRIDGE_MPA_TYPE, BRIDGE_MPA_VERSION_V1,
                       std::move(*encoded)};
 }
 
 inline std::optional<BridgeRecordV1> DecodeBridgeMpaRecordV1(
-    const CMpaRecord& record)
+    const CMpaRecord& record,
+    const BridgeMptLimits& mpt_limits = BRIDGE_MPT_LIMITS_V1)
 {
     if (record.payload_type != BRIDGE_MPA_TYPE ||
         record.payload_version != BRIDGE_MPA_VERSION_V1) {
         return std::nullopt;
     }
-    return DecodeBridgeRecordV1(record.payload);
+    return DecodeBridgeRecordV1(record.payload, mpt_limits);
 }
 
 inline std::optional<std::vector<unsigned char>> EncodeBridgeProofV1(

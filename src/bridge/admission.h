@@ -192,17 +192,34 @@ inline bool BridgeAssetRegistryEntryActiveAt(const BridgeAssetRegistryEntry& ent
            (!entry.approval_last_height || height <= *entry.approval_last_height);
 }
 
+/**
+ * Nullifier namespaces. Every V1 key (the managed and decentralized V1 vault
+ * entries) is namespace 1; bridge V2 vault entries mint under namespace 2
+ * (doc/design/b3-bridge-v2-node-changes.md section 3.4: the V1 nullifiers
+ * freeze at V and V2 keeps its own set). The namespace separates the sets in
+ * one ordered container. It must never make one vault mintable twice, so
+ * chainparams refuses a V2 vault equal to the V1 vault (the regtest pin-file
+ * cross-check; every later network pin must keep it).
+ */
+inline constexpr uint8_t BRIDGE_NULLIFIER_NAMESPACE_V1{1};
+inline constexpr uint8_t BRIDGE_NULLIFIER_NAMESPACE_V2{2};
+
 /** Collision-free logical replay key; persistent wire encoding remains open. */
 struct BridgeDepositKey {
     uint64_t origin_chain_id{0};
     EthAddress vault_address{};
     uint64_t deposit_id{0};
+    // Last member and last tie element: three-field V1 initialisers keep
+    // namespace 1, and the relative order of V1 keys is unchanged.
+    uint8_t nullifier_namespace{BRIDGE_NULLIFIER_NAMESPACE_V1};
 
     friend bool operator==(const BridgeDepositKey&, const BridgeDepositKey&) = default;
     friend bool operator<(const BridgeDepositKey& a, const BridgeDepositKey& b)
     {
-        return std::tie(a.origin_chain_id, a.vault_address, a.deposit_id) <
-               std::tie(b.origin_chain_id, b.vault_address, b.deposit_id);
+        return std::tie(a.origin_chain_id, a.vault_address, a.deposit_id,
+                        a.nullifier_namespace) <
+               std::tie(b.origin_chain_id, b.vault_address, b.deposit_id,
+                        b.nullifier_namespace);
     }
 };
 
@@ -269,7 +286,8 @@ inline BridgeAdmissionResult AdmitProvenDeposit(
     out.amount = *amount;
     out.recipient_script = RecipientV1Script(*recipient);
     out.nullifier = BridgeDepositKey{registry.origin_chain_id, registry.vault_address,
-                                     deposit.event.deposit_id};
+                                     deposit.event.deposit_id,
+                                     BRIDGE_NULLIFIER_NAMESPACE_V1};
     return BridgeAdmissionResult::OK;
 }
 

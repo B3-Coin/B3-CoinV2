@@ -166,81 +166,63 @@ CChainParams::B3RegTestBridgePins ReadB3RegTestBridgePinsFile(const std::string&
     return ParseB3RegTestBridgePins(contents);
 }
 
-} // namespace
-
-CChainParams::B3RegTestBridgePins ParseB3RegTestBridgePins(std::string_view json)
+//! origin_chain_id must be the local anvil chain.
+void CheckBridgePinsChainId(const UniValue& object, const std::string& where)
 {
-    UniValue root;
-    if (!root.read(json)) ThrowInvalidBridgePins("not a valid JSON document");
-    CheckBridgePinsKeys(root, "file", {"format", "v1_decentralized"});
-    const UniValue& format{root.find_value("format")};
-    if (!format.isStr() || format.get_str() != B3_BRIDGE_PINS_FORMAT) {
-        ThrowInvalidBridgePins(strprintf("format must be \"%s\"", B3_BRIDGE_PINS_FORMAT));
-    }
-
-    const std::string v1_where{"v1_decentralized"};
-    const UniValue& v1{root.find_value(v1_where)};
-    CheckBridgePinsKeys(v1, v1_where,
-                        {"origin_chain_id", "vault", "token", "origin_deployment_block",
-                         "vault_runtime_code_hash", "token_runtime_code_hash",
-                         "max_deposit_raw", "light_client", "verifier",
-                         "verifier_runtime_code_hash", "bootstrap_validator_set_hash",
-                         "min_bridge_validators", "max_bridge_validators",
-                         "min_bridge_total_weight", "max_epoch_lag"},
-                        {"max_per_block", "max_per_epoch"});
-
-    CChainParams::B3RegTestBridgePins pins;
-    const uint64_t chain_id{GetBridgePinsUInt<uint64_t>(v1, v1_where, "origin_chain_id")};
+    const uint64_t chain_id{GetBridgePinsUInt<uint64_t>(object, where, "origin_chain_id")};
     if (chain_id != B3_BRIDGE_PINS_CHAIN_ID) {
         ThrowInvalidBridgePins(strprintf("%s.origin_chain_id must be %u (the local anvil chain), not %u",
-                                         v1_where, B3_BRIDGE_PINS_CHAIN_ID, chain_id));
+                                         where, B3_BRIDGE_PINS_CHAIN_ID, chain_id));
     }
+}
 
-    pins.vault = GetBridgePinsHex<20>(v1, v1_where, "vault");
-    pins.token = GetBridgePinsHex<20>(v1, v1_where, "token");
-    const Consensus::BridgeEthAddress verifier{GetBridgePinsHex<20>(v1, v1_where, "verifier")};
-    if (Consensus::BridgeAddressIsNull(pins.vault) ||
-        Consensus::BridgeAddressIsNull(pins.token) ||
+//! Non-zero, pairwise distinct vault, token and verifier addresses.
+void CheckBridgePinsAddresses(const std::string& prefix,
+                              const Consensus::BridgeEthAddress& vault,
+                              const Consensus::BridgeEthAddress& token,
+                              const Consensus::BridgeEthAddress& verifier)
+{
+    if (Consensus::BridgeAddressIsNull(vault) ||
+        Consensus::BridgeAddressIsNull(token) ||
         Consensus::BridgeAddressIsNull(verifier)) {
-        ThrowInvalidBridgePins("vault, token and verifier addresses must be non-zero");
+        ThrowInvalidBridgePins(strprintf("%svault, token and verifier addresses must be non-zero", prefix));
     }
-    if (pins.vault == pins.token || pins.vault == verifier || pins.token == verifier) {
-        ThrowInvalidBridgePins("vault, token and verifier addresses must be pairwise distinct");
+    if (vault == token || vault == verifier || token == verifier) {
+        ThrowInvalidBridgePins(strprintf("%svault, token and verifier addresses must be pairwise distinct", prefix));
     }
+}
 
-    pins.origin_deployment_block = GetBridgePinsUInt<uint64_t>(v1, v1_where, "origin_deployment_block");
-    if (pins.origin_deployment_block < 1) {
-        ThrowInvalidBridgePins(strprintf("%s.origin_deployment_block must be at least 1", v1_where));
-    }
-    pins.vault_runtime_code_hash = GetBridgePinsHash(v1, v1_where, "vault_runtime_code_hash");
-    pins.token_runtime_code_hash = GetBridgePinsHash(v1, v1_where, "token_runtime_code_hash");
+std::optional<CAmount> GetOptionalBridgePinsAmount(const UniValue& object, const std::string& where,
+                                                   std::string_view key)
+{
+    if (object.find_value(key).isNull()) return std::nullopt;
+    return GetBridgePinsAmount(object, where, key);
+}
 
-    // Regtest plan section 3.3 check 1 and node-changes section 3.4
-    // assertion 3: a deposit of the vault's MAX_DEPOSIT_RAW must fit one
-    // block, or it would wait forever.
-    const CAmount max_deposit_raw{GetBridgePinsAmount(v1, v1_where, "max_deposit_raw")};
-    if (!v1.find_value("max_per_block").isNull()) {
-        pins.max_per_block = GetBridgePinsAmount(v1, v1_where, "max_per_block");
-    }
-    if (!v1.find_value("max_per_epoch").isNull()) {
-        pins.max_per_epoch = GetBridgePinsAmount(v1, v1_where, "max_per_epoch");
-    }
-    const CAmount block_cap{pins.max_per_block.value_or(CChainParams::B3RegTestBridgePins::DEFAULT_MAX_PER_BLOCK)};
-    const CAmount epoch_cap{pins.max_per_epoch.value_or(CChainParams::B3RegTestBridgePins::DEFAULT_MAX_PER_EPOCH)};
+// Regtest plan section 3.3 check 1 and node-changes section 3.4 assertion
+// 3: a deposit of the vault's MAX_DEPOSIT_RAW must fit one block, or it
+// would wait forever.
+void CheckBridgePinsCaps(const std::string& label, CAmount max_deposit_raw,
+                         CAmount block_cap, CAmount epoch_cap)
+{
     if (max_deposit_raw <= 0 || max_deposit_raw > block_cap || block_cap > epoch_cap) {
-        ThrowInvalidBridgePins(strprintf("caps must satisfy 0 < max_deposit_raw (%d) <= max_per_block (%d) <= max_per_epoch (%d) <= MAX_MONEY",
-                                         max_deposit_raw, block_cap, epoch_cap));
+        ThrowInvalidBridgePins(strprintf("%s must satisfy 0 < max_deposit_raw (%d) <= max_per_block (%d) <= max_per_epoch (%d) <= MAX_MONEY",
+                                         label, max_deposit_raw, block_cap, epoch_cap));
     }
+}
 
-    const std::string lc_where{v1_where + ".light_client"};
-    const UniValue& lc{v1.find_value("light_client")};
+//! The light_client object of a section whose vault deploys at (or after)
+//! deployment_block. Shared by v1_decentralized and v2.
+Consensus::EthereumLightClientPins ParseBridgePinsLightClient(const UniValue& lc, const std::string& lc_where,
+                                                              uint64_t deployment_block)
+{
     CheckBridgePinsKeys(lc, lc_where,
                         {"trusted_checkpoint_root", "trusted_checkpoint_slot",
                          "checkpoint_execution_block", "genesis_validators_root",
                          "fork_schedule", "fork_schedule_valid_through_epoch",
                          "electra_epoch"},
                         {"min_sync_committee_participants", "max_sync_lag_slots"});
-    Consensus::EthereumLightClientPins& light{pins.light_client};
+    Consensus::EthereumLightClientPins light;
     light.trusted_checkpoint_root = GetBridgePinsHash(lc, lc_where, "trusted_checkpoint_root");
     light.trusted_checkpoint_slot = GetBridgePinsUInt<uint64_t>(lc, lc_where, "trusted_checkpoint_slot");
 
@@ -248,11 +230,11 @@ CChainParams::B3RegTestBridgePins ParseB3RegTestBridgePins(std::string_view json
     // reach the vault deployment block within the cumulative backfill bound,
     // as the bootstrap record is judged in consensus.
     const uint64_t checkpoint_block{GetBridgePinsUInt<uint64_t>(lc, lc_where, "checkpoint_execution_block")};
-    if (checkpoint_block < pins.origin_deployment_block ||
-        checkpoint_block - pins.origin_deployment_block > bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS) {
+    if (checkpoint_block < deployment_block ||
+        checkpoint_block - deployment_block > bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS) {
         ThrowInvalidBridgePins(strprintf("%s.checkpoint_execution_block (%u) must lie within %u blocks at or after origin_deployment_block (%u)",
                                          lc_where, checkpoint_block, bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS,
-                                         pins.origin_deployment_block));
+                                         deployment_block));
     }
 
     light.genesis_validators_root = GetBridgePinsHash(lc, lc_where, "genesis_validators_root");
@@ -305,6 +287,45 @@ CChainParams::B3RegTestBridgePins ParseB3RegTestBridgePins(std::string_view json
                                          "and cover the checkpoint epoch and electra_epoch; max_sync_lag_slots must be non-zero)",
                                          lc_where));
     }
+    return light;
+}
+
+//! The v1_decentralized section (regtest plan section 3.3).
+void ParseBridgePinsV1(const UniValue& v1, CChainParams::B3RegTestBridgePins& pins)
+{
+    const std::string v1_where{"v1_decentralized"};
+    CheckBridgePinsKeys(v1, v1_where,
+                        {"origin_chain_id", "vault", "token", "origin_deployment_block",
+                         "vault_runtime_code_hash", "token_runtime_code_hash",
+                         "max_deposit_raw", "light_client", "verifier",
+                         "verifier_runtime_code_hash", "bootstrap_validator_set_hash",
+                         "min_bridge_validators", "max_bridge_validators",
+                         "min_bridge_total_weight", "max_epoch_lag"},
+                        {"max_per_block", "max_per_epoch"});
+
+    CheckBridgePinsChainId(v1, v1_where);
+
+    pins.vault = GetBridgePinsHex<20>(v1, v1_where, "vault");
+    pins.token = GetBridgePinsHex<20>(v1, v1_where, "token");
+    const Consensus::BridgeEthAddress verifier{GetBridgePinsHex<20>(v1, v1_where, "verifier")};
+    CheckBridgePinsAddresses("", pins.vault, pins.token, verifier);
+
+    pins.origin_deployment_block = GetBridgePinsUInt<uint64_t>(v1, v1_where, "origin_deployment_block");
+    if (pins.origin_deployment_block < 1) {
+        ThrowInvalidBridgePins(strprintf("%s.origin_deployment_block must be at least 1", v1_where));
+    }
+    pins.vault_runtime_code_hash = GetBridgePinsHash(v1, v1_where, "vault_runtime_code_hash");
+    pins.token_runtime_code_hash = GetBridgePinsHash(v1, v1_where, "token_runtime_code_hash");
+
+    const CAmount max_deposit_raw{GetBridgePinsAmount(v1, v1_where, "max_deposit_raw")};
+    pins.max_per_block = GetOptionalBridgePinsAmount(v1, v1_where, "max_per_block");
+    pins.max_per_epoch = GetOptionalBridgePinsAmount(v1, v1_where, "max_per_epoch");
+    CheckBridgePinsCaps("caps", max_deposit_raw,
+                        pins.max_per_block.value_or(CChainParams::B3RegTestBridgePins::DEFAULT_MAX_PER_BLOCK),
+                        pins.max_per_epoch.value_or(CChainParams::B3RegTestBridgePins::DEFAULT_MAX_PER_EPOCH));
+
+    pins.light_client = ParseBridgePinsLightClient(v1.find_value("light_client"), v1_where + ".light_client",
+                                                   pins.origin_deployment_block);
 
     Consensus::BridgeDecentralizedWithdrawalPins& withdrawal{pins.withdrawal};
     withdrawal.ethereum_verifier_address = verifier;
@@ -322,6 +343,101 @@ CChainParams::B3RegTestBridgePins ParseB3RegTestBridgePins(std::string_view json
                                          v1_where, Consensus::MIN_BRIDGE_VALIDATORS_V1,
                                          Consensus::MAX_PROVEN_BRIDGE_VALIDATORS_V1));
     }
+}
+
+/**
+ * The bridge V2 section (node changes sections 3.1-3.3 and 12.2): one anvil
+ * Vault V2 entry, its fresh light-client store and the Verifier V2 member
+ * bounds, plus V and W2. OI-3: only values knowable before the chain first
+ * stores a block at or above A3 are keys. The vault and verifier runtime
+ * code hashes, the lineage id and the mirrored windows commit to
+ * blockHash(R_f - 1), so naming them is refused as an unknown key.
+ */
+CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v2)
+{
+    const std::string v2_where{"v2"};
+    CheckBridgePinsKeys(v2, v2_where,
+                        {"origin_chain_id", "vault", "token", "token_runtime_code_hash",
+                         "origin_deployment_block", "max_deposit_raw", "light_client",
+                         "verifier", "min_bridge_validators", "max_bridge_validators",
+                         "min_bridge_total_weight", "activation_height"},
+                        {"burn_height", "max_per_block", "max_per_epoch"});
+
+    CChainParams::B3RegTestBridgePins::V2Section section;
+    CheckBridgePinsChainId(v2, v2_where);
+    section.origin_chain_id = B3_BRIDGE_PINS_CHAIN_ID;
+
+    section.vault = GetBridgePinsHex<20>(v2, v2_where, "vault");
+    section.token = GetBridgePinsHex<20>(v2, v2_where, "token");
+    section.verifier = GetBridgePinsHex<20>(v2, v2_where, "verifier");
+    CheckBridgePinsAddresses(v2_where + " ", section.vault, section.token, section.verifier);
+
+    section.origin_deployment_block = GetBridgePinsUInt<uint64_t>(v2, v2_where, "origin_deployment_block");
+    if (section.origin_deployment_block < 1) {
+        ThrowInvalidBridgePins(strprintf("%s.origin_deployment_block must be at least 1", v2_where));
+    }
+    section.token_runtime_code_hash = GetBridgePinsHash(v2, v2_where, "token_runtime_code_hash");
+
+    section.max_deposit_raw = GetBridgePinsAmount(v2, v2_where, "max_deposit_raw");
+    section.max_per_block = GetOptionalBridgePinsAmount(v2, v2_where, "max_per_block");
+    section.max_per_epoch = GetOptionalBridgePinsAmount(v2, v2_where, "max_per_epoch");
+    CheckBridgePinsCaps(v2_where + " caps", section.max_deposit_raw,
+                        section.max_per_block.value_or(CChainParams::B3RegTestBridgePins::DEFAULT_V2_MAX_PER_BLOCK),
+                        section.max_per_epoch.value_or(CChainParams::B3RegTestBridgePins::DEFAULT_V2_MAX_PER_EPOCH));
+
+    section.light_client = ParseBridgePinsLightClient(v2.find_value("light_client"), v2_where + ".light_client",
+                                                      section.origin_deployment_block);
+
+    section.min_bridge_validators = GetBridgePinsUInt<uint32_t>(v2, v2_where, "min_bridge_validators");
+    section.max_bridge_validators = GetBridgePinsUInt<uint32_t>(v2, v2_where, "max_bridge_validators");
+    section.min_bridge_total_weight = GetBridgePinsUInt<uint64_t>(v2, v2_where, "min_bridge_total_weight");
+    if (section.min_bridge_validators < Consensus::MIN_BRIDGE_VALIDATORS_V1 ||
+        section.max_bridge_validators < section.min_bridge_validators ||
+        section.max_bridge_validators > Consensus::MAX_PROVEN_BRIDGE_VALIDATORS_V1 ||
+        section.min_bridge_total_weight == 0) {
+        ThrowInvalidBridgePins(strprintf("%s verifier pins need %u <= min_bridge_validators <= max_bridge_validators <= %u "
+                                         "and min_bridge_total_weight > 0",
+                                         v2_where, Consensus::MIN_BRIDGE_VALIDATORS_V1,
+                                         Consensus::MAX_PROVEN_BRIDGE_VALIDATORS_V1));
+    }
+
+    // V and W2 are B3 heights. RegTest() checks them against A3 and R_f.
+    constexpr uint32_t max_height{static_cast<uint32_t>(std::numeric_limits<int>::max())};
+    const uint32_t activation_height{GetBridgePinsUInt<uint32_t>(v2, v2_where, "activation_height")};
+    if (activation_height < 1 || activation_height > max_height) {
+        ThrowInvalidBridgePins(strprintf("%s.activation_height must be between 1 and %u", v2_where, max_height));
+    }
+    section.activation_height = static_cast<int>(activation_height);
+    if (!v2.find_value("burn_height").isNull()) {
+        const uint32_t burn_height{GetBridgePinsUInt<uint32_t>(v2, v2_where, "burn_height")};
+        if (burn_height < activation_height || burn_height > max_height) {
+            ThrowInvalidBridgePins(strprintf("%s.burn_height (%u) must be between activation_height (%u) and %u",
+                                             v2_where, burn_height, activation_height, max_height));
+        }
+        section.burn_height = static_cast<int>(burn_height);
+    }
+    return section;
+}
+
+} // namespace
+
+CChainParams::B3RegTestBridgePins ParseB3RegTestBridgePins(std::string_view json)
+{
+    UniValue root;
+    if (!root.read(json)) ThrowInvalidBridgePins("not a valid JSON document");
+    CheckBridgePinsKeys(root, "file", {"format"}, {"v1_decentralized", "v2"});
+    const bool has_v1{root.exists("v1_decentralized")};
+    const bool has_v2{root.exists("v2")};
+    if (!has_v1 && !has_v2) ThrowInvalidBridgePins("file needs v1_decentralized or v2");
+    const UniValue& format{root.find_value("format")};
+    if (!format.isStr() || format.get_str() != B3_BRIDGE_PINS_FORMAT) {
+        ThrowInvalidBridgePins(strprintf("format must be \"%s\"", B3_BRIDGE_PINS_FORMAT));
+    }
+
+    CChainParams::B3RegTestBridgePins pins;
+    pins.has_v1 = has_v1;
+    if (has_v1) ParseBridgePinsV1(root.find_value("v1_decentralized"), pins);
+    if (has_v2) pins.v2 = ParseBridgePinsV2(root.find_value("v2"));
 
     CSHA256().Write(UCharCast(json.data()), json.size()).Finalize(pins.file_sha256.begin());
     return pins;

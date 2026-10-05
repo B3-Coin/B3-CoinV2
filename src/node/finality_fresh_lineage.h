@@ -149,8 +149,10 @@ struct FreshLineageState {
 /**
  * Node-changes section 7.4 interface: what the bridge V2 regime reads of the
  * fresh lineage (bootstrapped, broken, epoch, set summaries, finalized
- * height, handover status). Not consumed yet: the bridge V2 burn gate is a
- * later slice, which also needs the section's CertIdAt(index) (not provided).
+ * height, handover status). Consumed by the TEMPORARY bridge V2 burn gate
+ * (node::BridgeV2BurnReadiness, node/bridge_state.h: section 8.4 rows C1/C2
+ * only). The kind 9 liveness rows that replace that gate in a later slice
+ * also need the section's CertIdAt(index) (not provided yet).
  */
 struct LineageV2View {
     bool configured{false};
@@ -172,23 +174,31 @@ struct LineageV2View {
 LineageV2View MakeLineageV2View(const Consensus::Params& params, const std::optional<FreshLineageState>& state);
 
 /**
- * withdrawalRoot a fresh-lineage certificate must carry at `height`. This
- * slice signs zero at every height: contracts spec section 2.4 asks for zero
- * below V (BRIDGE_ACTIVATION_HEIGHT) and FinalityWithdrawalRootV2(height)
- * from V, but no V exists on B3 before the bridge V2 regime (V will come
- * from the regtest pin file, effective only above the tip when pinned, so
- * already-connected blocks keep this rule on replay). Until that regime
- * replaces this hook, a Verifier V2 must be deployed with a V above every
- * fresh-certified height: a zero root at or above V reverts on Ethereum
- * (verifier step 5) and the verifier could no longer follow rotations.
+ * withdrawalRoot a fresh-lineage certificate must carry at `height`:
+ * node::FinalityWithdrawalRootV2 (node/bridge_state.h; contracts spec section
+ * 2.4, node changes section 7.4). That is zero below the bridge V2
+ * activation height V, and zero at every height without a complete bridge V2
+ * envelope. Only a regtest node started with a -b3bridgepins v2 section has
+ * that envelope; mainnet and testnet never do. From V it is the indexed V2
+ * withdrawal-tree root at `height`, which is non-zero even for the empty tree.
+ * A Verifier V2 deployed with the same V therefore accepts certificates on
+ * both sides of V (verifier step 5). From V, a missing index or an index
+ * lacking `height` fails closed: nullopt, which the judge reports as
+ * fresh-withdrawal-root-unavailable and which makes the signer and the
+ * expected-block builder skip that height. Every caller passes the bridge
+ * index whenever bridge rules are active at its tip, and V >= A3.
+ * V is fixed before any block at or above A3 is stored: the pin file is
+ * read at first start, and the init.cpp pin record refuses later changes.
+ * Connected blocks therefore replay under the rule they were judged by.
  */
 std::optional<uint256> FreshLineageWithdrawalRoot(int height, const Consensus::Params& params,
                                                   const BridgeStateIndex* bridge_index);
 /**
  * bridgeFlags a fresh-lineage certificate must carry at `height`. This
- * slice signs 0 at every height (no sticky FINALITY_CONFLICT exists yet);
- * the bridge V2 regime replaces this hook with BridgeFlagsV2 (node changes
- * sections 7.4 and 8.5), under the same V constraint as the withdrawal root.
+ * slice signs 0 at every height: no sticky FINALITY_CONFLICT exists yet, and
+ * conflict kind 13 is a later slice. That slice replaces this hook with
+ * BridgeFlagsV2 (node changes sections 7.4 and 8.5), which is 0 below V like
+ * the withdrawal root.
  */
 std::optional<uint8_t> FreshLineageBridgeFlags(int height, const Consensus::Params& params,
                                                const BridgeStateIndex* bridge_index);

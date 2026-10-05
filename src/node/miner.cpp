@@ -242,7 +242,20 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
             throw std::runtime_error(
                 "bridge state is unavailable for block assembly");
         }
-        if (b3_bridge_withdrawals_active &&
+        if (b3_consensus.BridgeV2RulesActive(nHeight)) {
+            // From the bridge V2 height every BRIDGE_BURN is a V2 burn: the
+            // block rule's W2 check and TEMPORARY V2 gate (validation.cpp
+            // ConnectBlock) replace the V1 readiness, so a burn that became
+            // unready after mempool admission is skipped, never assembled.
+            std::string not_ready_reason;
+            bridge_burn_readiness =
+                b3_consensus.BridgeV2BurnRulesActive(nHeight)
+                    ? node::ProjectedBridgeV2BurnReadiness(
+                          m_chainstate.ModernFinality(), m_chainstate.m_chain,
+                          m_chainstate.m_blockman, b3_consensus, *pindexPrev,
+                          bridge.Index(), not_ready_reason)
+                    : BridgeBurnReadiness::UNAVAILABLE;
+        } else if (b3_bridge_withdrawals_active &&
             b3_consensus.busd_bridge->withdrawal_mode ==
                 Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
             b3_consensus.busd_bridge->decentralized_withdrawal) {

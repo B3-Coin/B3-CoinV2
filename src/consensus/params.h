@@ -285,6 +285,32 @@ struct Params {
         return fresh_lineage && height >= fresh_lineage->activation_height;
     }
     /**
+     * Bridge V2 regime (BridgeV2Params in consensus/bridge_params.h). Unset
+     * on every shipped network, which keeps every V2 rule inactive; only the
+     * regtest pin file's v2 section sets it until a reviewed release pins
+     * every value. A set envelope must be complete: the node refuses to
+     * start otherwise (BridgeV2ConfigurationValid, checked in init.cpp on
+     * every network), so the Valid() test below is defensive only and never
+     * lets the V1 rules continue silently past V on a running node.
+     */
+    std::optional<BridgeV2Params> bridge_v2;
+    //! True from V on a chain whose bridge V2 envelope is complete.
+    bool BridgeV2RulesActive(int height) const
+    {
+        return bridge_v2 && bridge_v2->Valid() &&
+               height >= bridge_v2->activation_height;
+    }
+    //! Node changes section 3.4 startup assertion: unset, or complete.
+    bool BridgeV2ConfigurationValid() const
+    {
+        return !bridge_v2 || bridge_v2->Valid();
+    }
+    //! True from W2 (>= V): V2 burns may append leaf V2.
+    bool BridgeV2BurnRulesActive(int height) const
+    {
+        return BridgeV2RulesActive(height) && height >= bridge_v2->burn_height;
+    }
+    /**
      * TEST-ONLY override of the historical FN disintegration collateral
      * (Proof of Disintegration). Unset everywhere except regtest fixtures:
      * the mainnet historical collateral schedule (25M/20M/15M B3 by height)

@@ -282,8 +282,14 @@ inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params&
             error = "mpa-malformed-flowmesh-vault-proof";
             return false;
         }
+        // From the bridge V2 height V a kind-3 receipt proof may use the V2
+        // limits (8,192-byte terminal node, 16 KiB proof); below it, and on
+        // every network without bridge_v2, the V1 limits stay exact.
         if (rec.payload_type == MPA_TYPE_BRIDGE &&
-            !bridge::DecodeBridgeMpaRecordV1(rec)) {
+            !bridge::DecodeBridgeMpaRecordV1(
+                rec, height && params.BridgeV2RulesActive(*height)
+                         ? bridge::BRIDGE_MPT_LIMITS_V2
+                         : bridge::BRIDGE_MPT_LIMITS_V1)) {
             error = "mpa-malformed-bridge-record";
             return false;
         }

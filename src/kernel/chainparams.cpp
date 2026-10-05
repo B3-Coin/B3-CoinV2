@@ -1177,12 +1177,13 @@ public:
                     Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
                 withdrawal.withdrawal_rules_commitment = uint256{uint8_t{5}};
                 busd.managed_withdrawal = withdrawal;
-                if (b3.bridge_pins) {
+                if (b3.bridge_pins && b3.bridge_pins->has_v1) {
                     // -b3bridgepins (regtest plan section 3.3): point the
                     // synthetic bUSD at a local anvil V1 decentralized
                     // deployment. Chain id 31337 and the A3 activation and
                     // withdrawal heights above are kept, so every pin takes
-                    // effect from bridge activation.
+                    // effect from bridge activation. A file with only a v2
+                    // section leaves the synthetic MANAGED_V1 bUSD as is.
                     const B3RegTestBridgePins& pins{*b3.bridge_pins};
                     busd.asset.vault_address = pins.vault;
                     busd.asset.token_address = pins.token;
@@ -1205,7 +1206,11 @@ public:
                         throw std::runtime_error(
                             "-b3bridgepins does not form a complete bridge configuration");
                     }
-                    m_b3_bridge_pins_sha256 = pins.file_sha256;
+                }
+                // The record guard in init.cpp keys on this hash of the whole
+                // file, whichever sections it carries.
+                if (b3.bridge_pins) {
+                    m_b3_bridge_pins_sha256 = b3.bridge_pins->file_sha256;
                 }
                 assert(Consensus::BridgeMintParamsReady(busd));
                 consensus.busd_bridge = std::move(busd);
@@ -1248,6 +1253,91 @@ public:
                     .max_epoch_extension = extension,
                     .staging_signer = true,
                 };
+            }
+
+            // Bridge V2 (node changes sections 3.1-3.4; regtest plan section
+            // 3.3): REGTEST ONLY, from the pin file's v2 section, and the
+            // only place any network sets bridge_v2. V2 rides on the V1
+            // bridge tracker and on the fresh lineage, whose certificates
+            // carry the V2 withdrawal root from V, so V >= A3 and V >= R_f
+            // (node changes 3.4 assertion 4; also V > R_f - 1, the
+            // verifier's genesis height). V >= A3 also makes the init.cpp
+            // record guard OI-3's rule: V2 pins affect no block below A3,
+            // and once a block at or above A3 is stored the file can no
+            // longer change. The OI-3 code hashes stay unset (31337 only).
+            if (b3.bridge_pins && b3.bridge_pins->v2) {
+                const B3RegTestBridgePins::V2Section& v2{*b3.bridge_pins->v2};
+                if (!consensus.fresh_lineage) {
+                    throw std::runtime_error("-b3bridgepins v2 requires -b3freshlineageheight");
+                }
+                // -b3bridgepins requires -b3flowmeshtest (checked above),
+                // which always configures bUSD at A3.
+                assert(consensus.busd_bridge && consensus.busd_bridge->activation_height);
+                const Consensus::BridgeAssetParams& v1{*consensus.busd_bridge};
+                const int bridge_height{*v1.activation_height};
+                const int fresh_height{consensus.fresh_lineage->activation_height};
+                const int burn_height{v2.burn_height.value_or(v2.activation_height)};
+                if (v2.activation_height < bridge_height) {
+                    throw std::runtime_error(strprintf(
+                        "-b3bridgepins v2.activation_height (%d) must be at or above the bUSD activation height A3 (%d)",
+                        v2.activation_height, bridge_height));
+                }
+                if (v2.activation_height < fresh_height) {
+                    throw std::runtime_error(strprintf(
+                        "-b3bridgepins v2.activation_height (%d) must be at or above -b3freshlineageheight (%d)",
+                        v2.activation_height, fresh_height));
+                }
+                if (burn_height < v2.activation_height) {
+                    throw std::runtime_error(strprintf(
+                        "-b3bridgepins v2.burn_height (%d) must be at or above v2.activation_height (%d)",
+                        burn_height, v2.activation_height));
+                }
+                // A V2 entry on a V1 vault would mint the same deposit
+                // twice, once per nullifier namespace; a V2 vault or
+                // verifier on any V1 contract, or a V2 token on the V1
+                // vault or withdrawal contract, is a misconfiguration.
+                std::vector<Consensus::BridgeEthAddress> v1_contracts{
+                    v1.asset.vault_address, v1.asset.token_address};
+                if (v1.decentralized_withdrawal) {
+                    v1_contracts.push_back(v1.decentralized_withdrawal->ethereum_verifier_address);
+                }
+                if (v1.managed_withdrawal) {
+                    v1_contracts.push_back(v1.managed_withdrawal->authority_address);
+                }
+                const auto is_v1_contract{[&](const Consensus::BridgeEthAddress& address) {
+                    return std::ranges::find(v1_contracts, address) != v1_contracts.end();
+                }};
+                if (is_v1_contract(v2.vault) || is_v1_contract(v2.verifier) ||
+                    (v2.token != v1.asset.token_address && is_v1_contract(v2.token))) {
+                    throw std::runtime_error(
+                        "-b3bridgepins v2 vault and verifier must differ from every V1 bridge contract, and the v2 token may only reuse the V1 token");
+                }
+
+                Consensus::BridgeV2Params bridge_v2;
+                bridge_v2.activation_height = v2.activation_height;
+                bridge_v2.burn_height = burn_height;
+                bridge_v2.light_client = v2.light_client;
+                bridge_v2.verifier.address = v2.verifier;
+                bridge_v2.verifier.min_bridge_validators = v2.min_bridge_validators;
+                bridge_v2.verifier.max_bridge_validators = v2.max_bridge_validators;
+                bridge_v2.verifier.min_bridge_total_weight = v2.min_bridge_total_weight;
+                Consensus::BridgeV2VaultEntry& entry{bridge_v2.vault};
+                entry.origin_chain_id = v2.origin_chain_id;
+                entry.vault_address = v2.vault;
+                entry.token_address = v2.token;
+                entry.token_runtime_code_hash = v2.token_runtime_code_hash;
+                entry.origin_deployment_block = v2.origin_deployment_block;
+                entry.max_deposit_raw = v2.max_deposit_raw;
+                entry.mint_caps = Consensus::BridgeMintCaps{
+                    .max_per_block = v2.max_per_block.value_or(B3RegTestBridgePins::DEFAULT_V2_MAX_PER_BLOCK),
+                    .max_per_epoch = v2.max_per_epoch.value_or(B3RegTestBridgePins::DEFAULT_V2_MAX_PER_EPOCH),
+                    .epoch_length_blocks = static_cast<uint32_t>(b3.epoch_length),
+                };
+                if (!bridge_v2.Valid()) {
+                    throw std::runtime_error(
+                        "-b3bridgepins v2 does not form a complete bridge V2 configuration");
+                }
+                consensus.bridge_v2 = std::move(bridge_v2);
             }
         }
 

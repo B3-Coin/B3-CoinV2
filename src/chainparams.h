@@ -20,8 +20,10 @@ inline constexpr size_t MAX_B3_BRIDGE_PINS_FILE_SIZE{64 * 1024};
 /**
  * Parse and validate the contents of a -b3bridgepins file (REGTEST ONLY):
  * strict JSON {"format": "b3-regtest-bridge-pins/1", "v1_decentralized":
- * {...}} with 0x-prefixed hex in raw Ethereum byte order. The result's
- * file_sha256 is the SHA256 of exactly these bytes.
+ * {...}, "v2": {...}} holding at least one of the two sections, with
+ * 0x-prefixed hex in raw Ethereum byte order. The result's file_sha256 is
+ * the SHA256 of exactly these bytes, and has_v1 records whether the V1
+ * section was present.
  *
  * @throws std::runtime_error("Invalid -b3bridgepins file: ...") on any
  *         schema or validation failure.

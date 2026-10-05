@@ -160,13 +160,58 @@ public:
      * a synthetic beacon checkpoint. The origin chain stays 31337 and the
      * activation heights stay at A3, so every pin takes effect from the
      * bridge activation height.
+     *
+     * A file may instead (or also) carry a bridge V2 section (`v2`): one
+     * fresh anvil Vault V2 entry, its fresh light-client store and the
+     * Verifier V2 bounds, applied from V >= A3 (consensus.bridge_v2). With
+     * no V1 section the synthetic MANAGED_V1 bUSD stays as without a file.
      */
     struct B3RegTestBridgePins {
         //! Synthetic flowmesh-test mint caps (raw bUSD units), used whenever
         //! a pin file does not override them.
         static constexpr CAmount DEFAULT_MAX_PER_BLOCK{1'000'000'000};
         static constexpr CAmount DEFAULT_MAX_PER_EPOCH{10'000'000'000};
+        //! B-14 bridge V2 caps (10,000 bUSD per block and per mint epoch),
+        //! used whenever the v2 section does not override them.
+        static constexpr CAmount DEFAULT_V2_MAX_PER_BLOCK{10'000'000'000};
+        static constexpr CAmount DEFAULT_V2_MAX_PER_EPOCH{10'000'000'000};
 
+        /**
+         * The v2 section (node changes sections 3.1-3.3 and 12.2). OI-3:
+         * every V2 pin must be in the file before the chain first stores a
+         * block at or above A3 (the -b3bridgepins record then refuses any
+         * change, and V >= A3), so only values knowable before then are
+         * keys. The vault and verifier runtime code hashes, the lineage id
+         * and the mirrored windows commit to blockHash(R_f - 1) and are
+         * deliberately absent: BridgeV2Params leaves both code hashes unset,
+         * which BridgeV2Params::Valid() accepts only off Ethereum mainnet.
+         */
+        struct V2Section {
+            //! Always the local anvil chain (31337).
+            uint64_t origin_chain_id{0};
+            Consensus::BridgeEthAddress vault{};
+            Consensus::BridgeEthAddress token{};
+            Consensus::BridgeEthAddress verifier{};
+            //! Lower bound of the first anvil block that may hold vault
+            //! events (Vault V2 is deployed after R_f - 1).
+            uint64_t origin_deployment_block{0};
+            uint256 token_runtime_code_hash{};
+            CAmount max_deposit_raw{0};
+            std::optional<CAmount> max_per_block{};
+            std::optional<CAmount> max_per_epoch{};
+            Consensus::EthereumLightClientPins light_client{};
+            uint32_t min_bridge_validators{0};
+            uint32_t max_bridge_validators{0};
+            uint64_t min_bridge_total_weight{0};
+            //! V: first height of V2 records and of the V2 withdrawal tree.
+            int activation_height{0};
+            //! W2 >= V; V when unset (B-12).
+            std::optional<int> burn_height{};
+        };
+
+        //! Whether the file carried a v1_decentralized section. True by
+        //! default so hand-built pins keep their V1 meaning.
+        bool has_v1{true};
         Consensus::BridgeEthAddress vault{};
         Consensus::BridgeEthAddress token{};
         uint64_t origin_deployment_block{0};
@@ -178,6 +223,8 @@ public:
         std::optional<CAmount> max_per_epoch{};
         Consensus::EthereumLightClientPins light_client{};
         Consensus::BridgeDecentralizedWithdrawalPins withdrawal{};
+        //! The bridge V2 section, when the file carried one.
+        std::optional<V2Section> v2{};
         //! SHA256 of the raw pin file bytes.
         uint256 file_sha256{};
     };

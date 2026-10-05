@@ -9,6 +9,7 @@
 #include <logging.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_schedule.h>
+#include <node/bridge_state.h>
 
 #include <algorithm>
 #include <limits>
@@ -137,20 +138,18 @@ LineageV2View MakeLineageV2View(const Consensus::Params& params, const std::opti
 
 // ------------------------------------------------------------ bridge hooks
 
-std::optional<uint256> FreshLineageWithdrawalRoot(const int /*height*/, const Consensus::Params& /*params*/,
-                                                  const BridgeStateIndex* /*bridge_index*/)
+std::optional<uint256> FreshLineageWithdrawalRoot(const int height, const Consensus::Params& params,
+                                                  const BridgeStateIndex* bridge_index)
 {
-    // Bridge V2 is not in this slice: every fresh-lineage checkpoint signs
-    // the zero root (contracts spec section 2.4, "zero below V"). No V exists
-    // on B3 yet, so a Verifier V2 must use a V above every fresh-certified
-    // height until the bridge V2 regime replaces this hook (header comment).
-    return uint256{};
+    // Zero below V (and wherever bridge_v2 is unset), the indexed V2 tree
+    // root from V; nullopt when the index cannot answer (header comment).
+    return FinalityWithdrawalRootV2(height, params, bridge_index);
 }
 
 std::optional<uint8_t> FreshLineageBridgeFlags(const int /*height*/, const Consensus::Params& /*params*/,
                                                const BridgeStateIndex* /*bridge_index*/)
 {
-    // No sticky FINALITY_CONFLICT exists before the bridge V2 regime.
+    // No sticky FINALITY_CONFLICT (conflict kind 13) exists in this slice.
     return uint8_t{0};
 }
 

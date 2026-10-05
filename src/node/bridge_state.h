@@ -9,6 +9,7 @@
 #include <bridge/eth_light_client.h>
 #include <consensus/params.h>
 #include <modern/withdrawal_tree.h>
+#include <modern/withdrawal_v2.h>
 #include <primitives/block.h>
 #include <primitives/transaction_identifier.h>
 #include <uint256.h>
@@ -32,6 +33,8 @@ namespace node {
 
 class BlockManager;
 class BridgeStateIndex;
+class FinalityTracker;
+struct LineageV2View;
 
 /** Parent-derived ability of B3's current and next validator sets to produce
  * a withdrawal root accepted by the pinned Ethereum verifier. UNAVAILABLE is
@@ -56,6 +59,51 @@ bool CheckBridgeBurnReadiness(const CTransaction& tx,
 bool CheckBridgeBurnReadiness(const CBlock& block,
                               BridgeBurnReadiness readiness,
                               std::string& error);
+
+/**
+ * TEMPORARY bridge V2 burn gate (node changes section 8.4 rows C1/C2 only):
+ * READY iff the V2 envelope is complete, the fresh lineage is configured,
+ * bootstrapped and not broken, and its current and next committees each
+ * have a member count within the Verifier V2 bounds and at least its
+ * minimum total weight. Height >= W2 is the bridge verifier's rule (a kind 6
+ * below W2 is invalid there). Never UNAVAILABLE: the caller reports
+ * UNAVAILABLE when it cannot reconstruct the lineage view.
+ * The kind 9 liveness rows (C3, C4, E1-E8), the impairment and wind-down
+ * terms and the B-22 committee replace this predicate in later slices;
+ * until then a V2 burn needs only a live fresh lineage. `reason` names the
+ * first failed condition.
+ */
+BridgeBurnReadiness BridgeV2BurnReadiness(
+    const LineageV2View& lineage, const Consensus::BridgeV2Params& params,
+    std::string& reason);
+
+/** CheckBridgeBurnReadiness for the V2 regime: the error text names the
+ * temporary gate. Callers apply it only from the bridge V2 height. */
+bool CheckBridgeV2BurnReadiness(const CTransaction& tx,
+                                BridgeBurnReadiness readiness,
+                                std::string& error);
+bool CheckBridgeV2BurnReadiness(const CBlock& block,
+                                BridgeBurnReadiness readiness,
+                                std::string& error);
+
+/**
+ * The TEMPORARY bridge V2 burn gate for the block that would extend
+ * `parent`: syncs `finality` to `parent` (with `bridge_index`, which must be
+ * synced to `parent` too) and applies BridgeV2BurnReadiness to the fresh
+ * lineage projected for parent + 1. UNAVAILABLE without a bridge V2
+ * envelope or when the finality state cannot be reconstructed.
+ *
+ * The one evaluation shared by mempool admission, block connection
+ * (validation.cpp), block assembly (node/miner.cpp) and wallet bridge
+ * prevalidation (node/interfaces.cpp), so a V2 burn the assembler selects
+ * is one the block rule accepts. W2 is checked by each caller (its own
+ * refusal text); this function does not look at it. Under cs_main.
+ */
+BridgeBurnReadiness ProjectedBridgeV2BurnReadiness(
+    FinalityTracker& finality, const CChain& chain,
+    const BlockManager& blockman, const Consensus::Params& params,
+    const CBlockIndex& parent, const BridgeStateIndex& bridge_index,
+    std::string& reason);
 
 /** Recent active-chain blocks whose bridge effects can be undone in memory. */
 inline constexpr size_t BRIDGE_STATE_UNDO_BLOCKS{288};
@@ -149,6 +197,24 @@ struct BridgeDecentralizedWithdrawalRequest {
                            const BridgeDecentralizedWithdrawalRequest&) = default;
 };
 
+/**
+ * One consensus-derived bridge V2 leaf (node changes sections 7.2-7.3). As
+ * for V1, the kind 6 record supplies only the recipient and names the exact
+ * bUSD V2 burn; the id, destination chain, asset, vault, token and B3 height
+ * come from the V2 entry and the active-chain position.
+ */
+struct BridgeWithdrawalV2Request {
+    Txid transaction_id{};
+    uint32_t burn_output_index{0};
+    modern::BridgeWithdrawalV2 withdrawal{};
+    uint256 leaf{};
+    int connected_height{-1};
+    uint256 connected_block{};
+
+    friend bool operator==(const BridgeWithdrawalV2Request&,
+                           const BridgeWithdrawalV2Request&) = default;
+};
+
 struct BridgeWithdrawalId {
     Txid transaction_id{};
     uint32_t burn_output_index{0};
@@ -171,11 +237,13 @@ struct BridgeTxAuthorization {
     std::optional<BridgeManagedWithdrawalRequest> withdrawal{};
     std::optional<BridgeDecentralizedWithdrawalRequest>
         decentralized_withdrawal{};
+    std::optional<BridgeWithdrawalV2Request> withdrawal_v2{};
 
     bool HasWithdrawal() const
     {
         return withdrawal.has_value() ||
-               decentralized_withdrawal.has_value();
+               decentralized_withdrawal.has_value() ||
+               withdrawal_v2.has_value();
     }
 };
 
@@ -195,6 +263,12 @@ struct BridgeEpochMintChange {
  * connected identity. Empty active blocks are retained so disconnect identity
  * remains exact. Light-client snapshots are present only when the block
  * changed that store.
+ *
+ * From the bridge V2 activation height V (`v2_store`), the light-client
+ * fields and `anchors_added` refer to the separate V2 store, mints use
+ * nullifier namespace 2, the V1 withdrawal tree is frozen and V2 burns
+ * append to the V2 tree (node changes section 3.4). The V2 tree fields are
+ * carried at every height; below V they stay the empty tree.
  */
 struct BridgeBlockDelta {
     int height{-1};
@@ -214,6 +288,10 @@ struct BridgeBlockDelta {
         decentralized_withdrawals_added{};
     modern::WithdrawalTreeState withdrawal_tree_before{};
     modern::WithdrawalTreeState withdrawal_tree_after{};
+    bool v2_store{false};
+    std::vector<BridgeWithdrawalV2Request> withdrawals_v2_added{};
+    modern::WithdrawalTreeState withdrawal_tree_v2_before{};
+    modern::WithdrawalTreeState withdrawal_tree_v2_after{};
 };
 
 /**
@@ -331,13 +409,17 @@ public:
      * finality. Recent candidates come from the bounded undo history; the
      * first active-chain store is retained as a starvation-proof floor.
      * Callers must still verify connection.block_hash against the active chain.
+     * This is the V1 store; V2-store deltas are skipped.
      */
     std::optional<BridgeLightClientSnapshot>
     FinalizedLightClientSnapshot(int finalized_b3_height) const;
     CAmount EpochMinted(const modern::AssetId& asset, uint64_t epoch) const;
     int ConnectedHeight() const { return m_connected_height; }
     uint256 ConnectedHash() const { return m_connected_hash; }
+    //! Every nullifier, both namespaces.
     size_t NullifierCount() const { return m_nullifiers.size(); }
+    //! Nullifiers of one namespace (bridge::BRIDGE_NULLIFIER_NAMESPACE_*).
+    size_t NullifierCount(uint8_t nullifier_namespace) const;
     size_t AnchorCount() const { return m_anchors.size(); }
     size_t WithdrawalCount() const { return m_withdrawals.size(); }
     size_t DecentralizedWithdrawalCount() const
@@ -346,7 +428,50 @@ public:
     }
     const std::deque<BridgeBlockDelta>& History() const { return m_history; }
 
+    // -- Bridge V2 (node changes sections 3.4, 4 and 7) -------------------
+    // The V2 light-client store and anchors start empty at V; the V1 store,
+    // nullifiers and tree freeze at V. Withdrawal roots V2 are recorded for
+    // every connected height from V only; below V (and on every chain
+    // without a bridge V2 envelope) FinalityWithdrawalRootV2 is zero without
+    // consulting the index.
+
+    const std::optional<bridge::LightClientStore>& LightClientV2() const
+    {
+        return m_light_client_v2;
+    }
+    const std::optional<BridgeStateConnection>&
+    LightClientV2LastConnected() const
+    {
+        return m_light_client_connection_v2;
+    }
+    //! FinalizedLightClientSnapshot over the V2 store only.
+    std::optional<BridgeLightClientSnapshot>
+    FinalizedLightClientSnapshotV2(int finalized_b3_height) const;
+    std::optional<BridgeExecutionAnchor> AnchorV2(
+        const uint256& block_hash) const;
+    //! AnchorForTarget over the V2 anchors (same rules and caveats).
+    std::optional<BridgeExecutionAnchor> AnchorForTargetV2(
+        uint64_t target_block_number, int finalized_b3_height) const;
+    size_t AnchorCountV2() const { return m_anchors_v2.size(); }
+    std::optional<BridgeWithdrawalV2Request> WithdrawalV2(
+        uint64_t withdrawal_id) const;
+    //! Confirmed active-chain V2 burn source -> its consensus leaf.
+    std::optional<BridgeWithdrawalV2Request> WithdrawalV2(
+        const BridgeWithdrawalId& source) const;
+    //! Exact consecutive V2 withdrawal prefix connected through `height`.
+    std::optional<std::vector<BridgeWithdrawalV2Request>>
+    WithdrawalsV2Through(int height) const;
+    std::optional<uint256> WithdrawalRootV2AtHeight(int height) const;
+    const modern::WithdrawalTreeState& WithdrawalTreeV2() const
+    {
+        return m_withdrawal_tree_v2;
+    }
+    size_t WithdrawalV2Count() const { return m_withdrawals_v2.size(); }
+
 private:
+    std::optional<BridgeLightClientSnapshot> FinalizedSnapshot(
+        int finalized_b3_height, bool v2_store) const;
+
     std::optional<bridge::LightClientStore> m_light_client{};
     std::optional<BridgeStateConnection> m_light_client_connection{};
     std::optional<BridgeLightClientSnapshot> m_light_client_floor{};
@@ -362,6 +487,15 @@ private:
     std::map<BridgeWithdrawalId, uint64_t> m_decentralized_withdrawal_sources{};
     modern::WithdrawalTreeState m_withdrawal_tree{};
     std::map<int, uint256> m_withdrawal_roots{};
+    std::optional<bridge::LightClientStore> m_light_client_v2{};
+    std::optional<BridgeStateConnection> m_light_client_connection_v2{};
+    std::optional<BridgeLightClientSnapshot> m_light_client_floor_v2{};
+    std::map<uint256, BridgeExecutionAnchor> m_anchors_v2{};
+    std::map<uint64_t, uint256> m_anchor_by_height_v2{};
+    std::map<uint64_t, BridgeWithdrawalV2Request> m_withdrawals_v2{};
+    std::map<BridgeWithdrawalId, uint64_t> m_withdrawal_v2_sources{};
+    modern::WithdrawalTreeState m_withdrawal_tree_v2{};
+    std::map<int, uint256> m_withdrawal_v2_roots{};
     int m_connected_height{-1};
     uint256 m_connected_hash{};
     std::deque<BridgeBlockDelta> m_history{};
@@ -375,6 +509,17 @@ private:
  * depth-32 tree root is nonzero. An unavailable index fails closed.
  */
 std::optional<uint256> FinalityWithdrawalRoot(
+    int height, const Consensus::Params& params,
+    const BridgeStateIndex* bridge_index);
+
+/**
+ * withdrawalRoot a fresh-lineage (digest V2) certificate must carry at
+ * `height` (node changes section 7.4; contracts spec section 2.4): zero below
+ * V or without a complete bridge V2 envelope, from V the indexed V2 tree root
+ * (the empty depth-32 root is non-zero). An index lacking the height fails
+ * closed, as does a missing index from V.
+ */
+std::optional<uint256> FinalityWithdrawalRootV2(
     int height, const Consensus::Params& params,
     const BridgeStateIndex* bridge_index);
 

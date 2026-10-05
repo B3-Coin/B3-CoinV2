@@ -1225,7 +1225,16 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
                                      "bridge-rules-inactive");
             }
-            if (node::HasDecentralizedBridgeBurn(tx) &&
+            // From the bridge V2 height V every BRIDGE_BURN is a V2 burn
+            // (node changes section 3.4): W2 replaces the V1 withdrawal gate.
+            const bool bridge_v2{
+                consensus.BridgeV2RulesActive(next_block_height)};
+            if (bridge_v2 && node::HasDecentralizedBridgeBurn(tx) &&
+                !consensus.BridgeV2BurnRulesActive(next_block_height)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                     "bridge-v2-burn-rules-inactive");
+            }
+            if (node::HasDecentralizedBridgeBurn(tx) && !bridge_v2 &&
                 !Consensus::BridgeWithdrawalRulesActive(next_block_height,
                                                         consensus)) {
                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
@@ -1243,7 +1252,36 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
             }
             node::BridgeBurnReadiness burn_readiness{
                 node::BridgeBurnReadiness::READY};
-            if (node::HasDecentralizedBridgeBurn(tx) &&
+            if (bridge_v2 && node::HasDecentralizedBridgeBurn(tx)) {
+                // TEMPORARY V2 burn gate (node changes section 8.4 rows
+                // C1/C2 only): the projected fresh lineage must be live and
+                // its committees able to authorize a Verifier V2 root. The
+                // kind 9 liveness gate replaces this in a later slice. Block
+                // assembly and wallet prevalidation share this evaluation.
+                std::string not_ready_reason;
+                burn_readiness = node::ProjectedBridgeV2BurnReadiness(
+                    m_active_chainstate.ModernFinality(),
+                    m_active_chainstate.m_chain,
+                    m_active_chainstate.m_blockman, consensus, *tip,
+                    tracker.Index(), not_ready_reason);
+                std::string readiness_error;
+                if (!node::CheckBridgeV2BurnReadiness(
+                        tx, burn_readiness, readiness_error)) {
+                    if (!not_ready_reason.empty()) {
+                        readiness_error += ": " + not_ready_reason;
+                    }
+                    return state.Invalid(
+                        burn_readiness ==
+                                node::BridgeBurnReadiness::UNAVAILABLE
+                            ? TxValidationResult::TX_MEMPOOL_POLICY
+                            : TxValidationResult::TX_CONSENSUS,
+                        burn_readiness ==
+                                node::BridgeBurnReadiness::UNAVAILABLE
+                            ? "bridge-v2-burn-readiness-unavailable"
+                            : "bridge-v2-burn-not-ready",
+                        readiness_error);
+                }
+            } else if (node::HasDecentralizedBridgeBurn(tx) &&
                 consensus.busd_bridge->withdrawal_mode ==
                     Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
                 consensus.busd_bridge->decentralized_withdrawal) {
@@ -3623,14 +3661,49 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                           *pindex->pprev)) {
             return state.Error("bridge state is unavailable");
         }
-        if (node::HasDecentralizedBridgeBurn(block) &&
+        // From the bridge V2 height V every BRIDGE_BURN is a V2 burn (node
+        // changes section 3.4): W2 replaces the V1 withdrawal gate.
+        const bool bridge_v2{
+            params.GetConsensus().BridgeV2RulesActive(pindex->nHeight)};
+        if (bridge_v2 && node::HasDecentralizedBridgeBurn(block) &&
+            !params.GetConsensus().BridgeV2BurnRulesActive(
+                pindex->nHeight)) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_CONSENSUS,
+                "bridge-v2-burn-rules-inactive");
+        }
+        if (node::HasDecentralizedBridgeBurn(block) && !bridge_v2 &&
             !Consensus::BridgeWithdrawalRulesActive(
                 pindex->nHeight, params.GetConsensus())) {
             return state.Invalid(
                 BlockValidationResult::BLOCK_CONSENSUS,
                 "bridge-withdrawal-rules-inactive");
         }
-        if (node::HasDecentralizedBridgeBurn(block) &&
+        if (bridge_v2 && node::HasDecentralizedBridgeBurn(block)) {
+            // TEMPORARY V2 burn gate (node changes section 8.4 rows C1/C2
+            // only), judged on the lineage projected from the exact parent.
+            // The kind 9 liveness gate replaces this in a later slice. Block
+            // assembly applies the same evaluation (node/miner.cpp).
+            std::string not_ready_reason;
+            const node::BridgeBurnReadiness readiness{
+                node::ProjectedBridgeV2BurnReadiness(
+                    ModernFinality(), m_chain, m_blockman,
+                    params.GetConsensus(), *pindex->pprev, tracker.Index(),
+                    not_ready_reason)};
+            if (readiness == node::BridgeBurnReadiness::UNAVAILABLE) {
+                return state.Error("bridge V2 burn readiness is unavailable");
+            }
+            std::string readiness_error;
+            if (!node::CheckBridgeV2BurnReadiness(
+                    block, readiness, readiness_error)) {
+                if (!not_ready_reason.empty()) {
+                    readiness_error += ": " + not_ready_reason;
+                }
+                return state.Invalid(
+                    BlockValidationResult::BLOCK_CONSENSUS,
+                    "bridge-v2-burn-not-ready", readiness_error);
+            }
+        } else if (node::HasDecentralizedBridgeBurn(block) &&
             params.GetConsensus().busd_bridge->withdrawal_mode ==
                 Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
             params.GetConsensus().busd_bridge->decentralized_withdrawal) {
@@ -3683,6 +3756,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         }
         for (const node::BridgeDecentralizedWithdrawalRequest& withdrawal :
              bridge_delta.decentralized_withdrawals_added) {
+            bridge_withdrawal_transactions.insert(withdrawal.transaction_id);
+        }
+        for (const node::BridgeWithdrawalV2Request& withdrawal :
+             bridge_delta.withdrawals_v2_added) {
             bridge_withdrawal_transactions.insert(withdrawal.transaction_id);
         }
     }

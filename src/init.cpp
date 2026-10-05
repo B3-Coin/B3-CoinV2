@@ -2027,6 +2027,15 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     bool do_reindex{args.GetBoolArg("-reindex", false)};
     const bool do_reindex_chainstate{args.GetBoolArg("-reindex-chainstate", false)};
 
+    // Bridge V2 pins, every network (node changes section 3.4: incomplete
+    // schedules fail closed at startup). Only the regtest pin file sets
+    // bridge_v2 today, and it already refuses an incomplete v2 section; this
+    // keeps any later network pin from silently leaving V1 rules active.
+    if (!chainparams.GetConsensus().BridgeV2ConfigurationValid()) {
+        return InitError(Untranslated(
+            "The bridge V2 consensus parameters are set but incomplete; refusing to start"));
+    }
+
     // B3 regtest-only -b3bridgepins record (see B3_BRIDGE_PINS_RECORD_FILENAME).
     // -b3flowmeshtest requires -b3modernregtest and always configures bUSD.
     const bool b3_bridge_pins_guard{chainparams.GetChainType() == ChainType::REGTEST &&

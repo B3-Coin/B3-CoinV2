@@ -397,6 +397,124 @@ inline bool BridgeMintParamsReady(const BridgeAssetParams& params)
     return false;
 }
 
+// ---------------------------------------------------------------- bridge V2
+//
+// Height-activated bridge V2 regime (doc/design/b3-bridge-v2-node-changes.md
+// sections 3.1-3.3): one fresh Ethereum vault entry minting bUSD V2, a fresh
+// light-client store and the Verifier V2 pins. BridgeAssetParams above stays
+// byte-for-byte unchanged, so every V1 identity keeps validating history.
+// Unset on every shipped network; only the regtest pin file's v2 section
+// populates it until a reviewed release pins every value (stage S7).
+
+//! Serialization version byte of the bUSD V2 AssetId preimage (node changes
+//! section 3.2): BridgeAssetIdV1's field order with version 2.
+inline constexpr uint8_t BRIDGE_ASSET_IDENTITY_VERSION_V2{2};
+//! Vault entry proof kind 1: Ethereum receipt proofs through the finalized
+//! light client, minted by record kind 3 (node changes section 3.3).
+inline constexpr uint8_t BRIDGE_V2_PROOF_KIND_ETHEREUM_RECEIPT{1};
+//! B-14: 10,000 bUSD (raw, six decimals) per block, per mint epoch and per
+//! deposit (Vault V2 MAX_DEPOSIT_RAW).
+inline constexpr CAmount BRIDGE_V2_DEFAULT_CAP_RAW{10'000'000'000};
+
+/** One Vault V2 entry (node changes section 3.3). */
+struct BridgeV2VaultEntry {
+    uint64_t origin_chain_id{0};
+    BridgeEthAddress vault_address{};
+    BridgeEthAddress token_address{};
+    uint8_t origin_decimals{BUSD_ORIGIN_DECIMALS};
+    uint8_t asset_decimals{BUSD_ASSET_DECIMALS};
+    // OI-3: the vault's extcodehash commits to blockHash(R_f - 1) through
+    // its verifier and lineage immutables, so a regtest fixture cannot know
+    // it before the first block >= A. Required before any non-regtest
+    // activation: BridgeV2Params::Valid() refuses origin chain 1 without it
+    // (stage S7 pins it).
+    std::optional<uint256> vault_runtime_code_hash{};
+    uint256 token_runtime_code_hash{};
+    uint8_t proof_kind{BRIDGE_V2_PROOF_KIND_ETHEREUM_RECEIPT};
+    // First Ethereum block that may hold vault events; the relayer's first
+    // log scan. A lower bound is safe; zero is an incomplete pin.
+    uint64_t origin_deployment_block{0};
+    CAmount max_deposit_raw{0};
+    BridgeMintCaps mint_caps{};
+
+    bool Valid() const
+    {
+        return origin_chain_id != 0 && !BridgeAddressIsNull(vault_address) &&
+               !BridgeAddressIsNull(token_address) &&
+               vault_address != token_address &&
+               origin_decimals == BUSD_ORIGIN_DECIMALS &&
+               asset_decimals == BUSD_ASSET_DECIMALS &&
+               (!vault_runtime_code_hash ||
+                !vault_runtime_code_hash->IsNull()) &&
+               !token_runtime_code_hash.IsNull() &&
+               proof_kind == BRIDGE_V2_PROOF_KIND_ETHEREUM_RECEIPT &&
+               origin_deployment_block > 0 && mint_caps.Valid() &&
+               max_deposit_raw > 0 &&
+               max_deposit_raw <= mint_caps.max_per_block;
+    }
+};
+
+/**
+ * Verifier V2 pins mirrored by B3 (node changes section 3.1). The member and
+ * weight bounds are the verifier's immutable bridge-authorizing interval, in
+ * the units of BridgeDecentralizedWithdrawalPins. The code hash carries the
+ * vault's OI-3 caveat.
+ */
+struct BridgeV2VerifierPins {
+    BridgeEthAddress address{};
+    std::optional<uint256> runtime_code_hash{};
+    uint32_t min_bridge_validators{0};
+    uint32_t max_bridge_validators{0};
+    uint64_t min_bridge_total_weight{0};
+
+    bool Valid() const
+    {
+        return !BridgeAddressIsNull(address) &&
+               (!runtime_code_hash || !runtime_code_hash->IsNull()) &&
+               min_bridge_validators >= MIN_BRIDGE_VALIDATORS_V1 &&
+               max_bridge_validators >= min_bridge_validators &&
+               max_bridge_validators <= MAX_PROVEN_BRIDGE_VALIDATORS_V1 &&
+               min_bridge_total_weight > 0;
+    }
+};
+
+/**
+ * Complete bridge V2 envelope. V (`activation_height`) is the first height
+ * of V2 records and of the V2 withdrawal tree and equals the verifier's
+ * BRIDGE_ACTIVATION_HEIGHT; W2 (`burn_height`) >= V is the first height of
+ * V2 burns (B-12 default W2 = V). Neither enters the registry id.
+ */
+struct BridgeV2Params {
+    int32_t activation_height{-1};
+    int32_t burn_height{-1};
+    EthereumLightClientPins light_client{};
+    BridgeV2VerifierPins verifier{};
+    BridgeV2VaultEntry vault{};
+
+    bool Valid() const
+    {
+        if (activation_height < 1 || burn_height < activation_height ||
+            !light_client.Valid() || !vault.Valid() || !verifier.Valid() ||
+            verifier.address == vault.vault_address ||
+            verifier.address == vault.token_address) {
+            return false;
+        }
+        // As BridgeMintParamsReady: an Ethereum-mainnet entry is exactly
+        // USDT under the mainnet beacon root, so a testnet light client
+        // copied with chain id 1 fails closed. Mainnet also needs both
+        // code-hash pins (node changes section 3.4 assertion 1); only a
+        // non-mainnet fixture may leave the OI-3 hashes unset.
+        if (vault.origin_chain_id == BUSD_ETHEREUM_CHAIN_ID &&
+            (vault.token_address != BUSD_ETHEREUM_USDT ||
+             light_client.genesis_validators_root !=
+                 ETHEREUM_MAINNET_GENESIS_VALIDATORS_ROOT ||
+             !vault.vault_runtime_code_hash || !verifier.runtime_code_hash)) {
+            return false;
+        }
+        return true;
+    }
+};
+
 } // namespace Consensus
 
 #endif // B3COIN_CONSENSUS_BRIDGE_PARAMS_H

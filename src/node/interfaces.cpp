@@ -975,13 +975,36 @@ public:
             return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
         }
 
-        if (HasDecentralizedBridgeBurn(tx) &&
+        // From the bridge V2 height every BRIDGE_BURN is a V2 burn: the
+        // mempool's W2 check and TEMPORARY V2 gate (validation.cpp) replace
+        // the V1 withdrawal height and V1 committee readiness.
+        const bool bridge_v2{consensus.BridgeV2RulesActive(expected_next_height)};
+        if (bridge_v2 && HasDecentralizedBridgeBurn(tx)) {
+            if (!consensus.BridgeV2BurnRulesActive(expected_next_height)) {
+                error = "Bridge V2 withdrawals are disabled for the next block";
+                return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
+            }
+            std::string not_ready_reason;
+            const BridgeBurnReadiness readiness{ProjectedBridgeV2BurnReadiness(
+                chainstate.ModernFinality(), chainstate.m_chain,
+                chainstate.m_blockman, consensus, *tip, tracker.Index(),
+                not_ready_reason)};
+            if (readiness == BridgeBurnReadiness::UNAVAILABLE) {
+                error = "Bridge V2 withdrawal readiness is unavailable at the active tip";
+                return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
+            }
+            if (!CheckBridgeV2BurnReadiness(tx, readiness, error)) {
+                if (!not_ready_reason.empty()) error += ": " + not_ready_reason;
+                return interfaces::BridgePrevalidationResult::REJECTED;
+            }
+        }
+        if (!bridge_v2 && HasDecentralizedBridgeBurn(tx) &&
             !Consensus::BridgeWithdrawalRulesActive(expected_next_height,
                                                      consensus)) {
             error = "Bridge withdrawals are disabled for the next block";
             return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
         }
-        if (HasDecentralizedBridgeBurn(tx) &&
+        if (!bridge_v2 && HasDecentralizedBridgeBurn(tx) &&
             consensus.busd_bridge->withdrawal_mode ==
                 Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
             consensus.busd_bridge->decentralized_withdrawal) {

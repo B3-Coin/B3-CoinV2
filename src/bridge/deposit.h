@@ -41,8 +41,18 @@ struct EthLog {
     std::vector<unsigned char> data{};
 };
 
+/** Highest EIP-2718 receipt type byte the V1 bridge accepts (types 1..4). */
+inline constexpr uint8_t RECEIPT_MAX_TYPE_V1{0x04};
+/**
+ * Bridge V2 (doc/design/b3-bridge-v2-node-changes.md section 4): every
+ * EIP-2718 type byte 0x01..0x7f whose body is the same four-field receipt
+ * RLP. 0x7f is also EIP-2718's ceiling: a first byte >= 0xc0 is a legacy
+ * RLP list, and 0x80..0xbf is no receipt at all.
+ */
+inline constexpr uint8_t RECEIPT_MAX_TYPE_V2{0x7f};
+
 struct EthReceipt {
-    uint8_t type{0};       // 0 legacy; 1..4 typed (EIP-2718 envelope)
+    uint8_t type{0};       // 0 legacy; 1..0x7f typed (EIP-2718 envelope; V1 accepts 1..4)
     bool status{false};    // post-Byzantium status byte
     uint64_t cumulative_gas{0};
     std::vector<EthLog> logs{};
@@ -63,16 +73,22 @@ inline std::optional<uint64_t> RlpUint64(const RlpItem& item)
 } // namespace deposit_detail
 
 /** Decode a receipts-trie VALUE (as returned by VerifyMptProof) into a
- *  receipt. Handles the legacy shape and EIP-2718 typed envelopes 1..4.
- *  Pre-Byzantium state-root receipts are rejected — the light client only
- *  ever proves recent finalized blocks. */
-inline std::optional<EthReceipt> DecodeReceipt(std::span<const unsigned char> value)
+ *  receipt. Handles the legacy shape and EIP-2718 typed envelopes
+ *  1..max_typed_envelope (RECEIPT_MAX_TYPE_V1 = 4 by default, the V1 rule;
+ *  RECEIPT_MAX_TYPE_V2 = 0x7f from the bridge V2 height). A larger bound is
+ *  clamped to 0x7f. Every typed body must be the four-field receipt list, so
+ *  an unknown body still fails closed. Pre-Byzantium state-root receipts are
+ *  rejected — the light client only ever proves recent finalized blocks. */
+inline std::optional<EthReceipt> DecodeReceipt(
+    std::span<const unsigned char> value,
+    const uint8_t max_typed_envelope = RECEIPT_MAX_TYPE_V1)
 {
     using deposit_detail::RlpUint64;
-    if (value.empty()) return std::nullopt;
+    // 0x00 is neither a valid EIP-2718 type here nor a valid first RLP byte.
+    if (value.empty() || value[0] == 0x00) return std::nullopt;
     EthReceipt out;
-    if (value[0] <= 0x04) { // typed envelope (0x00 is not a valid first RLP byte here)
-        if (value[0] == 0x00 || value.size() < 2) return std::nullopt;
+    if (value[0] <= std::min(max_typed_envelope, RECEIPT_MAX_TYPE_V2)) { // typed envelope
+        if (value.size() < 2) return std::nullopt;
         out.type = value[0];
         value = value.subspan(1);
     }

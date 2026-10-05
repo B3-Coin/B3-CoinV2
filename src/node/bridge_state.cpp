@@ -4,6 +4,7 @@
 
 #include <node/bridge_state.h>
 
+#include <bridge/admission_v2.h>
 #include <bridge/deposit.h>
 #include <bridge/exec_chain.h>
 #include <bridge/mpt.h>
@@ -15,7 +16,10 @@
 #include <modern/asset_output.h>
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
+#include <modern/bridge_v2.h>
 #include <node/blockstorage.h>
+#include <node/finality_fresh_lineage.h>
+#include <node/finality_tracker.h>
 
 #include <algorithm>
 #include <limits>
@@ -40,6 +44,8 @@ using DecentralizedWithdrawalMap =
     std::map<uint64_t, BridgeDecentralizedWithdrawalRequest>;
 using DecentralizedWithdrawalSourceMap =
     std::map<BridgeWithdrawalId, uint64_t>;
+using WithdrawalV2Map = std::map<uint64_t, BridgeWithdrawalV2Request>;
+using WithdrawalV2SourceMap = std::map<BridgeWithdrawalId, uint64_t>;
 
 bool SameBeaconHeader(const bridge::ssz::BeaconBlockHeader& a,
                       const bridge::ssz::BeaconBlockHeader& b)
@@ -229,6 +235,11 @@ bool IsConfiguredAndActive(const Consensus::Params& params, const int height,
     return true;
 }
 
+/**
+ * Candidate-local overlays over one connected state. The light-client and
+ * anchor references name the store the candidate height selects (V1 below
+ * the bridge V2 height V, V2 from V); every other base is shared.
+ */
 struct ScratchState {
     ScratchState(
         const std::optional<bridge::LightClientStore>& light_client,
@@ -237,7 +248,10 @@ struct ScratchState {
         const WithdrawalMap& withdrawals,
         const DecentralizedWithdrawalMap& decentralized_withdrawals,
         const DecentralizedWithdrawalSourceMap& decentralized_sources,
-        const modern::WithdrawalTreeState& withdrawal_tree)
+        const modern::WithdrawalTreeState& withdrawal_tree,
+        const WithdrawalV2Map& withdrawals_v2,
+        const WithdrawalV2SourceMap& withdrawal_v2_sources,
+        const modern::WithdrawalTreeState& withdrawal_tree_v2)
         : light_client_base{light_client},
           anchors_base{anchors},
           anchor_by_height_base{anchor_by_height},
@@ -246,7 +260,10 @@ struct ScratchState {
           withdrawals_base{withdrawals},
           decentralized_withdrawals_base{decentralized_withdrawals},
           decentralized_sources_base{decentralized_sources},
-          withdrawal_tree{withdrawal_tree}
+          withdrawals_v2_base{withdrawals_v2},
+          withdrawal_v2_sources_base{withdrawal_v2_sources},
+          withdrawal_tree{withdrawal_tree},
+          withdrawal_tree_v2{withdrawal_tree_v2}
     {
     }
 
@@ -346,6 +363,25 @@ struct ScratchState {
         return true;
     }
 
+    bool AddWithdrawalV2(const BridgeWithdrawalId& source,
+                         const modern::BridgeWithdrawalV2& withdrawal,
+                         uint256& leaf)
+    {
+        if (withdrawal_v2_sources_base.contains(source) ||
+            withdrawal_v2_sources_overlay.contains(source) ||
+            withdrawals_v2_base.contains(withdrawal.withdrawal_id) ||
+            withdrawals_v2_overlay.contains(withdrawal.withdrawal_id)) {
+            return false;
+        }
+        const auto appended{modern::AppendBridgeWithdrawalV2(
+            withdrawal_tree_v2, withdrawal)};
+        if (!appended) return false;
+        leaf = *appended;
+        withdrawal_v2_sources_overlay.insert(source);
+        withdrawals_v2_overlay.insert(withdrawal.withdrawal_id);
+        return true;
+    }
+
     const std::optional<bridge::LightClientStore>& light_client_base;
     const AnchorMap& anchors_base;
     const AnchorHeightMap& anchor_by_height_base;
@@ -354,6 +390,8 @@ struct ScratchState {
     const WithdrawalMap& withdrawals_base;
     const DecentralizedWithdrawalMap& decentralized_withdrawals_base;
     const DecentralizedWithdrawalSourceMap& decentralized_sources_base;
+    const WithdrawalV2Map& withdrawals_v2_base;
+    const WithdrawalV2SourceMap& withdrawal_v2_sources_base;
 
     std::optional<bridge::LightClientStore> light_client_overlay{};
     bool light_client_changed{false};
@@ -364,7 +402,10 @@ struct ScratchState {
     std::set<BridgeWithdrawalId> withdrawals_overlay{};
     std::set<uint64_t> decentralized_withdrawals_overlay{};
     std::set<BridgeWithdrawalId> decentralized_sources_overlay{};
+    std::set<uint64_t> withdrawals_v2_overlay{};
+    std::set<BridgeWithdrawalId> withdrawal_v2_sources_overlay{};
     modern::WithdrawalTreeState withdrawal_tree{};
+    modern::WithdrawalTreeState withdrawal_tree_v2{};
     CAmount minted_this_block{0};
 };
 
@@ -397,13 +438,19 @@ bool AddAnchor(const BridgeExecutionAnchor& anchor, ScratchState& state,
     return true;
 }
 
+/**
+ * Kind 1 against the store the height selects: the V1 pins and vault
+ * deployment block below V, the V2 entry's from V. The guard below is
+ * therefore per store, so the V2 store can be bootstrapped once although the
+ * V1 store already was (node changes section 3.4).
+ */
 bool VerifyBootstrap(const bridge::BridgeBootstrapV1& bootstrap,
                      const int height, const uint256& block_hash,
-                     const Consensus::BridgeAssetParams& configured,
+                     const Consensus::EthereumLightClientPins& pins,
+                     const uint64_t origin_deployment_block,
                      ScratchState& state, BridgeBlockDelta& delta,
                      std::string& error)
 {
-    const Consensus::EthereumLightClientPins& pins{*configured.light_client};
     if (state.LightClient()) {
         error = "bridge light client is already bootstrapped";
         return false;
@@ -419,7 +466,7 @@ bool VerifyBootstrap(const bridge::BridgeBootstrapV1& bootstrap,
     }
     if (!ExecutionRangeReachable(
             bootstrap.header.execution.block_number,
-            *configured.origin_deployment_block)) {
+            origin_deployment_block)) {
         error =
             "bridge bootstrap cannot reach the configured vault deployment block";
         return false;
@@ -534,6 +581,131 @@ bool VerifyBackfill(const bridge::BridgeExecutionBackfillV1& proof,
     return true;
 }
 
+/**
+ * The receipt-proof half of a kind 3 MINT, shared by V1 and V2: the target
+ * block is at or after the vault deployment, the light-client head is inside
+ * the pinned fork schedule and fresh, the named anchor is retained in the
+ * selected store, the execution ancestry and cumulative backfill bound hold,
+ * the receipt is in the proven root, decodes with EIP-2718 types up to
+ * `max_receipt_type`, and names one exact Deposit log of `vault`.
+ */
+std::optional<bridge::DepositEvent> ProveMintDeposit(
+    const bridge::BridgeMintV1& proof,
+    const Consensus::EthereumLightClientPins& pins,
+    const uint64_t origin_deployment_block,
+    const bridge::EthAddress& vault, const uint8_t max_receipt_type,
+    const int64_t candidate_time, const ScratchState& state,
+    std::string& error)
+{
+    if (proof.target_block_number < origin_deployment_block) {
+        error =
+            "bridge mint target precedes the configured origin deployment block";
+        return std::nullopt;
+    }
+    const bridge::LightClientStore* light_client{state.LightClient()};
+    if (light_client == nullptr) {
+        error = "bridge mint precedes light-client bootstrap";
+        return std::nullopt;
+    }
+    if (!SlotUsesKnownFork(
+            light_client->finalized_header.beacon.slot, pins)) {
+        error = "bridge mint uses a light-client head beyond the pinned fork schedule";
+        return std::nullopt;
+    }
+    if (!FinalizedHeadFresh(*light_client, candidate_time, pins)) {
+        error = "bridge mint light-client head is stale";
+        return std::nullopt;
+    }
+    const BridgeExecutionAnchor* anchor{
+        state.Anchor(proof.finalized_anchor_hash)};
+    if (anchor == nullptr) {
+        error = "bridge mint names an unretained execution anchor";
+        return std::nullopt;
+    }
+    const auto target{bridge::VerifyExecAncestry(
+        anchor->block_hash, proof.target_block_number,
+        proof.ancestry_headers)};
+    if (!target) {
+        error = "bridge mint execution ancestry is invalid";
+        return std::nullopt;
+    }
+    if (!CheckCumulativeBackfillTarget(*anchor, target->block_number,
+                                       error)) {
+        return std::nullopt;
+    }
+    const std::vector<unsigned char> trie_key{
+        bridge::RlpEncodeUint64(proof.tx_index)};
+    const auto receipt_value{bridge::VerifyMptProof(
+        target->receipts_root, trie_key, proof.mpt_nodes)};
+    if (!receipt_value) {
+        error = "bridge mint receipt is not included in the proven root";
+        return std::nullopt;
+    }
+    const auto receipt{bridge::DecodeReceipt(*receipt_value, max_receipt_type)};
+    if (!receipt) {
+        error = "bridge mint receipt is malformed";
+        return std::nullopt;
+    }
+    const auto event{bridge::ExtractDepositAt(
+        *receipt, vault, proof.receipt_log_index)};
+    if (!event) {
+        error = "bridge mint does not name one exact configured-vault deposit log";
+        return std::nullopt;
+    }
+    return event;
+}
+
+/**
+ * The state half of a kind 3 MINT, shared by V1 and V2 once admission has
+ * produced `authorization`: the nullifier is unused, the named output pays
+ * exactly the authorized OWNER, the ptxid is unique in the block, and the
+ * nullifier, per-block total and epoch counter are recorded.
+ */
+bool ConnectMintAuthorization(
+    const CTransaction& tx, const uint32_t output_index,
+    const bridge::BridgeMintAuthorization& authorization,
+    const std::pair<modern::AssetId, uint64_t>& epoch_key,
+    const CAmount epoch_used, ScratchState& state, BridgeBlockDelta& delta,
+    BridgeTxAuthorization& tx_result, std::string& error)
+{
+    if (state.IsNullified(authorization.nullifier)) {
+        error = "bridge deposit is already nullified";
+        return false;
+    }
+    if (output_index >= tx.vout.size()) {
+        error = "bridge mint output index is out of range";
+        return false;
+    }
+    const auto expected{modern::MakeAssetOwnerOutput(
+        authorization.asset, authorization.amount,
+        authorization.recipient_script)};
+    if (!expected || tx.vout[output_index] != *expected) {
+        error = "bridge mint is not paid to the exact authorized OWNER output";
+        return false;
+    }
+
+    const BridgeTxMintAuthorization connected{
+        tx.GetPtxid(), output_index, authorization};
+    if (std::any_of(delta.mint_authorizations.begin(),
+                    delta.mint_authorizations.end(),
+                    [&](const auto& prior) {
+                        return prior.transaction_id == connected.transaction_id;
+                    })) {
+        error = "bridge block duplicates a mint ptxid";
+        return false;
+    }
+    if (!state.AddNullifier(authorization.nullifier)) {
+        error = "bridge deposit is already nullified";
+        return false;
+    }
+    state.minted_this_block += authorization.amount;
+    state.SetEpochMinted(epoch_key, epoch_used + authorization.amount);
+    delta.nullifiers_added.push_back(authorization.nullifier);
+    delta.mint_authorizations.push_back(connected);
+    tx_result.mint = connected;
+    return true;
+}
+
 bool VerifyMint(const CTransaction& tx, const bridge::BridgeMintV1& proof,
                 const int height, const int64_t candidate_time,
                 const uint256& block_hash, const Consensus::Params& params,
@@ -546,62 +718,11 @@ bool VerifyMint(const CTransaction& tx, const bridge::BridgeMintV1& proof,
         error = "bridge mint registry id does not match the configured registry";
         return false;
     }
-    if (proof.target_block_number < *configured.origin_deployment_block) {
-        error =
-            "bridge mint target precedes the configured origin deployment block";
-        return false;
-    }
-    const bridge::LightClientStore* light_client{state.LightClient()};
-    if (light_client == nullptr) {
-        error = "bridge mint precedes light-client bootstrap";
-        return false;
-    }
-    const Consensus::EthereumLightClientPins& pins{*configured.light_client};
-    if (!SlotUsesKnownFork(
-            light_client->finalized_header.beacon.slot, pins)) {
-        error = "bridge mint uses a light-client head beyond the pinned fork schedule";
-        return false;
-    }
-    if (!FinalizedHeadFresh(*light_client, candidate_time, pins)) {
-        error = "bridge mint light-client head is stale";
-        return false;
-    }
-    const BridgeExecutionAnchor* anchor{
-        state.Anchor(proof.finalized_anchor_hash)};
-    if (anchor == nullptr) {
-        error = "bridge mint names an unretained execution anchor";
-        return false;
-    }
-    const auto target{bridge::VerifyExecAncestry(
-        anchor->block_hash, proof.target_block_number,
-        proof.ancestry_headers)};
-    if (!target) {
-        error = "bridge mint execution ancestry is invalid";
-        return false;
-    }
-    if (!CheckCumulativeBackfillTarget(*anchor, target->block_number,
-                                       error)) {
-        return false;
-    }
-    const std::vector<unsigned char> trie_key{
-        bridge::RlpEncodeUint64(proof.tx_index)};
-    const auto receipt_value{bridge::VerifyMptProof(
-        target->receipts_root, trie_key, proof.mpt_nodes)};
-    if (!receipt_value) {
-        error = "bridge mint receipt is not included in the proven root";
-        return false;
-    }
-    const auto receipt{bridge::DecodeReceipt(*receipt_value)};
-    if (!receipt) {
-        error = "bridge mint receipt is malformed";
-        return false;
-    }
-    const auto event{bridge::ExtractDepositAt(
-        *receipt, configured.asset.vault_address, proof.receipt_log_index)};
-    if (!event) {
-        error = "bridge mint does not name one exact configured-vault deposit log";
-        return false;
-    }
+    const auto event{ProveMintDeposit(
+        proof, *configured.light_client, *configured.origin_deployment_block,
+        configured.asset.vault_address, bridge::RECEIPT_MAX_TYPE_V1,
+        candidate_time, state, error)};
+    if (!event) return false;
 
     const uint64_t epoch{BridgeEpoch(height, configured)};
     const auto asset{modern::ConfiguredBridgeAssetId(params)};
@@ -625,42 +746,62 @@ bool VerifyMint(const CTransaction& tx, const bridge::BridgeMintV1& proof,
         error = "bridge mint deposit fails registry, recipient, amount, or cap admission";
         return false;
     }
-    if (state.IsNullified(authorization.nullifier)) {
-        error = "bridge deposit is already nullified";
-        return false;
-    }
-    if (proof.output_index >= tx.vout.size()) {
-        error = "bridge mint output index is out of range";
-        return false;
-    }
-    const auto expected{modern::MakeAssetOwnerOutput(
-        authorization.asset, authorization.amount,
-        authorization.recipient_script)};
-    if (!expected || tx.vout[proof.output_index] != *expected) {
-        error = "bridge mint is not paid to the exact authorized OWNER output";
-        return false;
-    }
+    return ConnectMintAuthorization(tx, proof.output_index, authorization,
+                                    epoch_key, epoch_used, state, delta,
+                                    tx_result, error);
+}
 
-    const BridgeTxMintAuthorization connected{
-        tx.GetPtxid(), proof.output_index, authorization};
-    if (std::any_of(delta.mint_authorizations.begin(),
-                    delta.mint_authorizations.end(),
-                    [&](const auto& prior) {
-                        return prior.transaction_id == connected.transaction_id;
-                    })) {
-        error = "bridge block duplicates a mint ptxid";
+/**
+ * Kind 3 from V (node changes section 4): the record names the V2 vault
+ * entry id, the receipt is proven against the V2 store with the V2 receipt
+ * limits (decoded by the caller) and EIP-2718 types 1..0x7f, and admission is
+ * the V2 entry's, minting bUSD V2 under nullifier namespace 2. The epoch is
+ * (height - V) / epoch length, keyed by the bUSD V2 AssetId; the per-block
+ * total stays shared (V1 mints are invalid from V).
+ */
+bool VerifyMintV2(const CTransaction& tx, const bridge::BridgeMintV1& proof,
+                  const int height, const int64_t candidate_time,
+                  const Consensus::Params& params, ScratchState& state,
+                  BridgeBlockDelta& delta, BridgeTxAuthorization& tx_result,
+                  std::string& error)
+{
+    const Consensus::BridgeV2Params& v2{*params.bridge_v2};
+    const auto entry_id{modern::ConfiguredBridgeV2EntryId(params)};
+    if (!entry_id || proof.registry_id != *entry_id) {
+        error = "bridge mint registry id does not match the V2 vault entry";
         return false;
     }
-    if (!state.AddNullifier(authorization.nullifier)) {
-        error = "bridge deposit is already nullified";
+    const auto event{ProveMintDeposit(
+        proof, v2.light_client, v2.vault.origin_deployment_block,
+        v2.vault.vault_address, bridge::RECEIPT_MAX_TYPE_V2, candidate_time,
+        state, error)};
+    if (!event) return false;
+
+    const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
+    if (!asset || height < v2.activation_height) {
+        error = "bridge mint asset identity is unavailable";
         return false;
     }
-    state.minted_this_block += authorization.amount;
-    state.SetEpochMinted(epoch_key, epoch_used + authorization.amount);
-    delta.nullifiers_added.push_back(authorization.nullifier);
-    delta.mint_authorizations.push_back(connected);
-    tx_result.mint = connected;
-    return true;
+    const uint64_t epoch{
+        static_cast<uint64_t>(height - v2.activation_height) /
+        v2.vault.mint_caps.epoch_length_blocks};
+    const auto epoch_key{std::make_pair(*asset, epoch)};
+    const CAmount epoch_used{state.EpochMinted(epoch_key)};
+    bridge::BridgeMintAuthorization authorization;
+    const bridge::BridgeAdmissionResult admitted{bridge::AdmitDepositV2(
+        v2, *asset,
+        bridge::ProvenBridgeDeposit{v2.vault.origin_chain_id,
+                                    proof.target_block_number,
+                                    v2.vault.vault_address, *event},
+        height, bridge::BridgeMintBudget{state.minted_this_block, epoch_used},
+        authorization)};
+    if (admitted != bridge::BridgeAdmissionResult::OK) {
+        error = "bridge mint deposit fails registry, recipient, amount, or cap admission";
+        return false;
+    }
+    return ConnectMintAuthorization(tx, proof.output_index, authorization,
+                                    epoch_key, epoch_used, state, delta,
+                                    tx_result, error);
 }
 
 bool VerifyWithdrawal(
@@ -789,6 +930,79 @@ bool VerifyBridgeBurn(
     return true;
 }
 
+/**
+ * Kind 6 from V (node changes section 7.2, checks 1 and 4 of this slice):
+ * valid only from W2, naming the V2 vault entry id, a non-null Ethereum
+ * recipient and the exact bUSD V2 BURN output. The leaf V2 takes the next id
+ * of the V2 tree, the V2 entry's chain, vault and token, and this height.
+ * The reserve bound (check 2) is implied by asset conservation while one
+ * entry exists and nothing is credited by migration; the wind-down bound
+ * (check 3) and the full gate (check 4 beyond the caller's temporary
+ * lineage gate) need kind 9 observations and come with them.
+ */
+bool VerifyBridgeBurnV2(
+    const CTransaction& tx, const bridge::BridgeBurnV1& record,
+    const int height, const uint256& block_hash,
+    const Consensus::Params& params, ScratchState& state,
+    BridgeBlockDelta& delta, BridgeTxAuthorization& tx_result,
+    std::string& error)
+{
+    if (!params.BridgeV2BurnRulesActive(height)) {
+        error = "bridge V2 burns are not active";
+        return false;
+    }
+    const Consensus::BridgeV2VaultEntry& entry{params.bridge_v2->vault};
+    const auto entry_id{modern::ConfiguredBridgeV2EntryId(params)};
+    const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
+    if (!entry_id || !asset || record.registry_id != *entry_id) {
+        error = "bridge burn does not name the V2 vault entry";
+        return false;
+    }
+    if (bridge::EthAddressIsNull(record.ethereum_recipient)) {
+        error = "bridge V2 burn Ethereum recipient is null";
+        return false;
+    }
+    if (record.raw_amount == 0 ||
+        record.raw_amount > static_cast<uint64_t>(MAX_MONEY)) {
+        error = "bridge V2 burn amount is invalid";
+        return false;
+    }
+    const CAmount amount{static_cast<CAmount>(record.raw_amount)};
+    if (record.burn_output_index >= tx.vout.size()) {
+        error = "bridge V2 burn output index is out of range";
+        return false;
+    }
+    const auto expected{modern::MakeAssetBurnOutput(*asset, amount)};
+    if (!expected || tx.vout[record.burn_output_index] != *expected) {
+        error = "bridge V2 burn record does not name the exact bUSD V2 BURN output";
+        return false;
+    }
+
+    modern::BridgeWithdrawalV2 withdrawal;
+    withdrawal.withdrawal_id = state.withdrawal_tree_v2.count;
+    withdrawal.destination_chain_id = entry.origin_chain_id;
+    withdrawal.asset_id = *asset;
+    withdrawal.vault = entry.vault_address;
+    withdrawal.token = entry.token_address;
+    withdrawal.recipient = record.ethereum_recipient;
+    withdrawal.amount = amount;
+    withdrawal.b3_height = static_cast<uint64_t>(height);
+
+    uint256 leaf;
+    const BridgeWithdrawalId source{tx.GetHash(), record.burn_output_index};
+    if (!state.AddWithdrawalV2(source, withdrawal, leaf)) {
+        error = "bridge V2 withdrawal id or burn source is duplicated";
+        return false;
+    }
+    delta.withdrawal_tree_v2_after = state.withdrawal_tree_v2;
+    BridgeWithdrawalV2Request request{
+        tx.GetHash(), record.burn_output_index, withdrawal, leaf, height,
+        block_hash};
+    delta.withdrawals_v2_added.push_back(request);
+    tx_result.withdrawal_v2 = std::move(request);
+    return true;
+}
+
 bool VerifyBridgeTransaction(
     const CTransaction& tx, const int height, const int64_t candidate_time,
     const uint256& block_hash, const Consensus::Params& params,
@@ -800,8 +1014,16 @@ bool VerifyBridgeTransaction(
         error = "bridge consensus parameters are incomplete";
         return false;
     }
+    // From V every record kind runs against the V2 regime (node changes
+    // section 3.4): the caller's ScratchState already names the V2 store.
+    const bool v2{params.BridgeV2RulesActive(height)};
+    if (v2 != delta.v2_store) {
+        error = "bridge candidate store does not match its height";
+        return false;
+    }
     const Consensus::EthereumLightClientPins& pins{
-        *params.busd_bridge->light_client};
+        v2 ? params.bridge_v2->light_client
+           : *params.busd_bridge->light_client};
     const CMpaRecord* bridge_record{nullptr};
     for (const CMpaRecord& record : tx.mpa) {
         if (record.payload_type != bridge::BRIDGE_MPA_TYPE) continue;
@@ -825,7 +1047,11 @@ bool VerifyBridgeTransaction(
     if (!modern::CheckBridgeRecordBinding(tx, *bridge_record, error)) {
         return false;
     }
-    const auto decoded{bridge::DecodeBridgeMpaRecordV1(*bridge_record)};
+    // The V2 receipt limits (8,192-byte terminal node, 16 KiB proof) apply
+    // only from V; below it a record that needs them is malformed.
+    const auto decoded{bridge::DecodeBridgeMpaRecordV1(
+        *bridge_record,
+        v2 ? bridge::BRIDGE_MPT_LIMITS_V2 : bridge::BRIDGE_MPT_LIMITS_V1)};
     if (!decoded) {
         error = "bridge record is malformed";
         return false;
@@ -835,13 +1061,20 @@ bool VerifyBridgeTransaction(
         [&](const auto& payload) -> bool {
             using T = std::decay_t<decltype(payload)>;
             if constexpr (std::is_same_v<T, bridge::BridgeBootstrapV1>) {
-                return VerifyBootstrap(payload, height, block_hash,
-                                       *params.busd_bridge,
-                                       state, delta, error);
+                return VerifyBootstrap(
+                    payload, height, block_hash, pins,
+                    v2 ? params.bridge_v2->vault.origin_deployment_block
+                       : *params.busd_bridge->origin_deployment_block,
+                    state, delta, error);
             } else if constexpr (std::is_same_v<T, bridge::BridgeUpdateV1>) {
                 return VerifyUpdate(payload, height, block_hash, pins, state,
                                     delta, error);
             } else if constexpr (std::is_same_v<T, bridge::BridgeMintV1>) {
+                if (v2) {
+                    return VerifyMintV2(tx, payload, height, candidate_time,
+                                        params, state, delta, tx_result,
+                                        error);
+                }
                 return VerifyMint(tx, payload, height, candidate_time,
                                   block_hash, params, state, delta, tx_result,
                                   error);
@@ -851,11 +1084,20 @@ bool VerifyBridgeTransaction(
                                       delta, error);
             } else if constexpr (
                 std::is_same_v<T, bridge::BridgeManagedWithdrawalV1>) {
+                if (v2) {
+                    error = "managed bridge withdrawals are closed from the bridge V2 activation height";
+                    return false;
+                }
                 return VerifyWithdrawal(tx, payload, height, block_hash,
                                         params, state, delta, tx_result,
                                         error);
             } else if constexpr (
                 std::is_same_v<T, bridge::BridgeBurnV1>) {
+                if (v2) {
+                    return VerifyBridgeBurnV2(tx, payload, height,
+                                              block_hash, params, state,
+                                              delta, tx_result, error);
+                }
                 return VerifyBridgeBurn(tx, payload, height, block_hash,
                                         params, state, delta, tx_result,
                                         error);
@@ -917,9 +1159,105 @@ bool CheckBridgeBurnReadiness(const CBlock& block,
     return false;
 }
 
+BridgeBurnReadiness BridgeV2BurnReadiness(
+    const LineageV2View& lineage, const Consensus::BridgeV2Params& params,
+    std::string& reason)
+{
+    reason.clear();
+    const auto not_ready{[&reason](std::string why) {
+        reason = std::move(why);
+        return BridgeBurnReadiness::NOT_READY;
+    }};
+    if (!params.Valid()) {
+        return not_ready("bridge V2 parameters are incomplete");
+    }
+    if (!lineage.configured) {
+        return not_ready("fresh finality lineage is not configured");
+    }
+    if (!lineage.bootstrapped) {
+        return not_ready("fresh finality lineage is not bootstrapped");
+    }
+    if (lineage.broken) {
+        return not_ready("fresh finality lineage is broken");
+    }
+    const Consensus::BridgeV2VerifierPins& verifier{params.verifier};
+    const auto authorizes{[&verifier](const uint32_t count,
+                                      const uint64_t weight) {
+        return count >= verifier.min_bridge_validators &&
+               count <= verifier.max_bridge_validators &&
+               weight >= verifier.min_bridge_total_weight;
+    }};
+    if (!authorizes(lineage.current_count, lineage.current_weight)) {
+        return not_ready(
+            "current fresh-lineage committee cannot authorize a Verifier V2 root");
+    }
+    if (!authorizes(lineage.next_count, lineage.next_weight)) {
+        return not_ready(
+            "next fresh-lineage committee cannot authorize a Verifier V2 root");
+    }
+    return BridgeBurnReadiness::READY;
+}
+
+namespace {
+
+std::string BridgeV2BurnReadinessError(const BridgeBurnReadiness readiness)
+{
+    return readiness == BridgeBurnReadiness::UNAVAILABLE
+               ? "bridge V2 burn readiness is unavailable"
+               : "bridge V2 burn requires a live fresh finality lineage whose current and next committees can authorize a Verifier V2 root (temporary gate; the kind 9 liveness gate is pending)";
+}
+
+} // namespace
+
+bool CheckBridgeV2BurnReadiness(const CTransaction& tx,
+                                const BridgeBurnReadiness readiness,
+                                std::string& error)
+{
+    if (!HasDecentralizedBridgeBurn(tx) ||
+        readiness == BridgeBurnReadiness::READY) {
+        return true;
+    }
+    error = BridgeV2BurnReadinessError(readiness);
+    return false;
+}
+
+bool CheckBridgeV2BurnReadiness(const CBlock& block,
+                                const BridgeBurnReadiness readiness,
+                                std::string& error)
+{
+    if (!HasDecentralizedBridgeBurn(block) ||
+        readiness == BridgeBurnReadiness::READY) {
+        return true;
+    }
+    error = BridgeV2BurnReadinessError(readiness);
+    return false;
+}
+
+BridgeBurnReadiness ProjectedBridgeV2BurnReadiness(
+    FinalityTracker& finality, const CChain& chain,
+    const BlockManager& blockman, const Consensus::Params& params,
+    const CBlockIndex& parent, const BridgeStateIndex& bridge_index,
+    std::string& reason)
+{
+    reason.clear();
+    if (!params.bridge_v2) {
+        reason = "bridge V2 is not configured";
+        return BridgeBurnReadiness::UNAVAILABLE;
+    }
+    if (!finality.Sync(chain, blockman, params, parent, &bridge_index)) {
+        reason = "the fresh finality lineage cannot be reconstructed at the parent block";
+        return BridgeBurnReadiness::UNAVAILABLE;
+    }
+    const int height{parent.nHeight + 1};
+    return BridgeV2BurnReadiness(
+        MakeLineageV2View(params, finality.Projected(height, params).fresh),
+        *params.bridge_v2, reason);
+}
+
 struct BridgeBlockPreview::Impl {
     Impl(const int candidate_height, const int64_t candidate_time,
          const uint256& preview_block_id, const Consensus::Params& params,
+         const bool v2_store,
          const std::optional<bridge::LightClientStore>& light_client,
          const AnchorMap& anchors, const AnchorHeightMap& anchor_by_height,
          const NullifierSet& nullifiers, const EpochMintMap& epoch_minted,
@@ -927,6 +1265,9 @@ struct BridgeBlockPreview::Impl {
          const DecentralizedWithdrawalMap& decentralized_withdrawals,
          const DecentralizedWithdrawalSourceMap& decentralized_sources,
          const modern::WithdrawalTreeState& withdrawal_tree,
+         const WithdrawalV2Map& withdrawals_v2,
+         const WithdrawalV2SourceMap& withdrawal_v2_sources,
+         const modern::WithdrawalTreeState& withdrawal_tree_v2,
          const int connected_height, const uint256& connected_hash)
         : height{candidate_height},
           time{candidate_time},
@@ -935,7 +1276,8 @@ struct BridgeBlockPreview::Impl {
           state{std::make_unique<ScratchState>(
               light_client, anchors, anchor_by_height, nullifiers,
               epoch_minted, withdrawals, decentralized_withdrawals,
-              decentralized_sources, withdrawal_tree)}
+              decentralized_sources, withdrawal_tree, withdrawals_v2,
+              withdrawal_v2_sources, withdrawal_tree_v2)}
     {
         delta.height = height;
         delta.block_hash = block_id;
@@ -943,6 +1285,9 @@ struct BridgeBlockPreview::Impl {
         delta.previous_block_hash = connected_hash;
         delta.withdrawal_tree_before = withdrawal_tree;
         delta.withdrawal_tree_after = withdrawal_tree;
+        delta.v2_store = v2_store;
+        delta.withdrawal_tree_v2_before = withdrawal_tree_v2;
+        delta.withdrawal_tree_v2_after = withdrawal_tree_v2;
     }
 
     const int height;
@@ -1003,24 +1348,27 @@ bool BridgeBlockPreview::TryAppend(
     return true;
 }
 
-std::optional<BridgeExecutionAnchor> BridgeStateIndex::Anchor(
-    const uint256& block_hash) const
+namespace {
+
+std::optional<BridgeExecutionAnchor> FindAnchor(const AnchorMap& anchors,
+                                                const uint256& block_hash)
 {
-    const auto it{m_anchors.find(block_hash)};
-    return it == m_anchors.end()
+    const auto it{anchors.find(block_hash)};
+    return it == anchors.end()
                ? std::nullopt
                : std::optional<BridgeExecutionAnchor>{it->second};
 }
 
-std::optional<BridgeExecutionAnchor> BridgeStateIndex::AnchorForTarget(
-    const uint64_t target_block_number, const int finalized_b3_height) const
+std::optional<BridgeExecutionAnchor> FindAnchorForTarget(
+    const AnchorMap& anchors, const AnchorHeightMap& anchor_by_height,
+    const uint64_t target_block_number, const int finalized_b3_height)
 {
     if (finalized_b3_height < 0) return std::nullopt;
 
-    for (auto it{m_anchor_by_height.lower_bound(target_block_number)};
-         it != m_anchor_by_height.end(); ++it) {
-        const auto anchor_it{m_anchors.find(it->second)};
-        if (anchor_it == m_anchors.end()) continue;
+    for (auto it{anchor_by_height.lower_bound(target_block_number)};
+         it != anchor_by_height.end(); ++it) {
+        const auto anchor_it{anchors.find(it->second)};
+        if (anchor_it == anchors.end()) continue;
         const BridgeExecutionAnchor& anchor{anchor_it->second};
         if (anchor.block_number != it->first ||
             anchor.connected_height < 0 ||
@@ -1033,6 +1381,44 @@ std::optional<BridgeExecutionAnchor> BridgeStateIndex::AnchorForTarget(
         return anchor;
     }
     return std::nullopt;
+}
+
+} // namespace
+
+std::optional<BridgeExecutionAnchor> BridgeStateIndex::Anchor(
+    const uint256& block_hash) const
+{
+    return FindAnchor(m_anchors, block_hash);
+}
+
+std::optional<BridgeExecutionAnchor> BridgeStateIndex::AnchorV2(
+    const uint256& block_hash) const
+{
+    return FindAnchor(m_anchors_v2, block_hash);
+}
+
+std::optional<BridgeExecutionAnchor> BridgeStateIndex::AnchorForTarget(
+    const uint64_t target_block_number, const int finalized_b3_height) const
+{
+    return FindAnchorForTarget(m_anchors, m_anchor_by_height,
+                               target_block_number, finalized_b3_height);
+}
+
+std::optional<BridgeExecutionAnchor> BridgeStateIndex::AnchorForTargetV2(
+    const uint64_t target_block_number, const int finalized_b3_height) const
+{
+    return FindAnchorForTarget(m_anchors_v2, m_anchor_by_height_v2,
+                               target_block_number, finalized_b3_height);
+}
+
+size_t BridgeStateIndex::NullifierCount(
+    const uint8_t nullifier_namespace) const
+{
+    return static_cast<size_t>(std::count_if(
+        m_nullifiers.begin(), m_nullifiers.end(),
+        [nullifier_namespace](const bridge::BridgeDepositKey& key) {
+            return key.nullifier_namespace == nullifier_namespace;
+        }));
 }
 
 std::optional<BridgeStateConnection> BridgeStateIndex::NullifierConnection(
@@ -1048,7 +1434,25 @@ std::optional<BridgeLightClientSnapshot>
 BridgeStateIndex::FinalizedLightClientSnapshot(
     const int finalized_b3_height) const
 {
+    return FinalizedSnapshot(finalized_b3_height, /*v2_store=*/false);
+}
+
+std::optional<BridgeLightClientSnapshot>
+BridgeStateIndex::FinalizedLightClientSnapshotV2(
+    const int finalized_b3_height) const
+{
+    return FinalizedSnapshot(finalized_b3_height, /*v2_store=*/true);
+}
+
+std::optional<BridgeLightClientSnapshot> BridgeStateIndex::FinalizedSnapshot(
+    const int finalized_b3_height, const bool v2_store) const
+{
     if (finalized_b3_height < 0) return std::nullopt;
+    const auto& light_client{v2_store ? m_light_client_v2 : m_light_client};
+    const auto& light_client_connection{
+        v2_store ? m_light_client_connection_v2 : m_light_client_connection};
+    const auto& light_client_floor{
+        v2_store ? m_light_client_floor_v2 : m_light_client_floor};
 
     const auto eligible{[finalized_b3_height](
                             const std::optional<bridge::LightClientStore>& store,
@@ -1062,15 +1466,17 @@ BridgeStateIndex::FinalizedLightClientSnapshot(
     }};
 
     // If the current store is final, it is necessarily the newest candidate.
-    if (const auto current{eligible(m_light_client,
-                                    m_light_client_connection)}) {
+    if (const auto current{eligible(light_client,
+                                    light_client_connection)}) {
         return current;
     }
 
     // Every retained changing delta carries both sides of the transition.
     // Checking newest-to-oldest therefore also recovers the exact store just
     // before the oldest retained update without keeping another large copy.
+    // A delta's light-client fields belong to the store its v2_store names.
     for (auto it{m_history.rbegin()}; it != m_history.rend(); ++it) {
+        if (it->v2_store != v2_store) continue;
         if (const auto after{eligible(it->light_client_after,
                                      it->light_client_connection_after)}) {
             return after;
@@ -1081,10 +1487,10 @@ BridgeStateIndex::FinalizedLightClientSnapshot(
         }
     }
 
-    if (m_light_client_floor &&
-        m_light_client_floor->connection.height >= 0 &&
-        m_light_client_floor->connection.height <= finalized_b3_height) {
-        return m_light_client_floor;
+    if (light_client_floor &&
+        light_client_floor->connection.height >= 0 &&
+        light_client_floor->connection.height <= finalized_b3_height) {
+        return light_client_floor;
     }
     return std::nullopt;
 }
@@ -1173,6 +1579,70 @@ std::optional<uint256> FinalityWithdrawalRoot(
     return bridge_index->WithdrawalRootAtHeight(height);
 }
 
+std::optional<BridgeWithdrawalV2Request> BridgeStateIndex::WithdrawalV2(
+    const uint64_t withdrawal_id) const
+{
+    const auto it{m_withdrawals_v2.find(withdrawal_id)};
+    return it == m_withdrawals_v2.end()
+               ? std::nullopt
+               : std::optional<BridgeWithdrawalV2Request>{it->second};
+}
+
+std::optional<BridgeWithdrawalV2Request> BridgeStateIndex::WithdrawalV2(
+    const BridgeWithdrawalId& source) const
+{
+    const auto source_it{m_withdrawal_v2_sources.find(source)};
+    if (source_it == m_withdrawal_v2_sources.end()) return std::nullopt;
+    const auto withdrawal_it{m_withdrawals_v2.find(source_it->second)};
+    if (withdrawal_it == m_withdrawals_v2.end() ||
+        withdrawal_it->second.transaction_id != source.transaction_id ||
+        withdrawal_it->second.burn_output_index !=
+            source.burn_output_index ||
+        withdrawal_it->second.withdrawal.withdrawal_id !=
+            source_it->second) {
+        return std::nullopt;
+    }
+    return withdrawal_it->second;
+}
+
+std::optional<std::vector<BridgeWithdrawalV2Request>>
+BridgeStateIndex::WithdrawalsV2Through(const int height) const
+{
+    if (height < 0 || height > m_connected_height ||
+        !m_withdrawal_v2_roots.contains(height)) {
+        return std::nullopt;
+    }
+    std::vector<BridgeWithdrawalV2Request> out;
+    for (const auto& [id, request] : m_withdrawals_v2) {
+        if (request.connected_height > height) break;
+        if (id != out.size() || request.withdrawal.withdrawal_id != id ||
+            request.withdrawal.b3_height !=
+                static_cast<uint64_t>(request.connected_height)) {
+            return std::nullopt;
+        }
+        out.push_back(request);
+    }
+    return out;
+}
+
+std::optional<uint256> BridgeStateIndex::WithdrawalRootV2AtHeight(
+    const int height) const
+{
+    const auto it{m_withdrawal_v2_roots.find(height)};
+    return it == m_withdrawal_v2_roots.end()
+               ? std::nullopt
+               : std::optional<uint256>{it->second};
+}
+
+std::optional<uint256> FinalityWithdrawalRootV2(
+    const int height, const Consensus::Params& params,
+    const BridgeStateIndex* bridge_index)
+{
+    if (!params.BridgeV2RulesActive(height)) return uint256{};
+    if (bridge_index == nullptr) return std::nullopt;
+    return bridge_index->WithdrawalRootV2AtHeight(height);
+}
+
 CAmount BridgeStateIndex::EpochMinted(const modern::AssetId& asset,
                                       const uint64_t epoch) const
 {
@@ -1199,11 +1669,15 @@ std::unique_ptr<BridgeBlockPreview> BridgeStateIndex::BeginBlockPreview(
         return nullptr;
     }
 
+    const bool v2_store{params.BridgeV2RulesActive(candidate_height)};
     auto impl{std::make_unique<BridgeBlockPreview::Impl>(
-        candidate_height, candidate_time, preview_block_id, params,
-        m_light_client, m_anchors, m_anchor_by_height, m_nullifiers,
+        candidate_height, candidate_time, preview_block_id, params, v2_store,
+        v2_store ? m_light_client_v2 : m_light_client,
+        v2_store ? m_anchors_v2 : m_anchors,
+        v2_store ? m_anchor_by_height_v2 : m_anchor_by_height, m_nullifiers,
         m_epoch_minted, m_withdrawals, m_decentralized_withdrawals,
         m_decentralized_withdrawal_sources, m_withdrawal_tree,
+        m_withdrawals_v2, m_withdrawal_v2_sources, m_withdrawal_tree_v2,
         m_connected_height, m_connected_hash)};
     return std::unique_ptr<BridgeBlockPreview>{
         new BridgeBlockPreview{std::move(impl)}};
@@ -1226,12 +1700,24 @@ bool BridgeStateIndex::VerifyBlock(
     out.previous_block_hash = m_connected_hash;
     out.withdrawal_tree_before = m_withdrawal_tree;
     out.withdrawal_tree_after = m_withdrawal_tree;
+    out.v2_store = params.BridgeV2RulesActive(height);
+    out.withdrawal_tree_v2_before = m_withdrawal_tree_v2;
+    out.withdrawal_tree_v2_after = m_withdrawal_tree_v2;
 
-    ScratchState state{m_light_client, m_anchors, m_anchor_by_height,
+    const auto& light_client{out.v2_store ? m_light_client_v2
+                                          : m_light_client};
+    const auto& light_client_connection{
+        out.v2_store ? m_light_client_connection_v2
+                     : m_light_client_connection};
+    ScratchState state{light_client,
+                       out.v2_store ? m_anchors_v2 : m_anchors,
+                       out.v2_store ? m_anchor_by_height_v2
+                                    : m_anchor_by_height,
                        m_nullifiers, m_epoch_minted, m_withdrawals,
                        m_decentralized_withdrawals,
                        m_decentralized_withdrawal_sources,
-                       m_withdrawal_tree};
+                       m_withdrawal_tree, m_withdrawals_v2,
+                       m_withdrawal_v2_sources, m_withdrawal_tree_v2};
     for (const CTransactionRef& tx : block.vtx) {
         BridgeTxAuthorization ignored;
         if (!VerifyBridgeTransaction(*tx, height, block.GetBlockTime(),
@@ -1241,9 +1727,9 @@ bool BridgeStateIndex::VerifyBlock(
         }
     }
     if (state.light_client_changed) {
-        out.light_client_before = m_light_client;
+        out.light_client_before = light_client;
         out.light_client_after = state.LightClientState();
-        out.light_client_connection_before = m_light_client_connection;
+        out.light_client_connection_before = light_client_connection;
         out.light_client_connection_after =
             BridgeStateConnection{height, block_hash};
     }
@@ -1255,6 +1741,7 @@ bool BridgeStateIndex::VerifyBlock(
             BridgeEpochMintChange{key.first, key.second, before, after});
     }
     out.withdrawal_tree_after = state.withdrawal_tree;
+    out.withdrawal_tree_v2_after = state.withdrawal_tree_v2;
     return true;
 }
 
@@ -1301,6 +1788,13 @@ bool BridgeStateIndex::VerifyTransaction(
         out.decentralized_withdrawal =
             delta.decentralized_withdrawals_added.front();
     }
+    if (!delta.withdrawals_v2_added.empty()) {
+        if (delta.withdrawals_v2_added.size() != 1) {
+            error = "bridge candidate transaction produced multiple V2 withdrawals";
+            return false;
+        }
+        out.withdrawal_v2 = delta.withdrawals_v2_added.front();
+    }
     return true;
 }
 
@@ -1319,6 +1813,19 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
         return false;
     }
 
+    // The light-client fields and anchors of a delta belong to the store its
+    // v2_store flag names (node changes section 3.4).
+    std::optional<bridge::LightClientStore>& light_client{
+        delta.v2_store ? m_light_client_v2 : m_light_client};
+    std::optional<BridgeStateConnection>& light_client_connection{
+        delta.v2_store ? m_light_client_connection_v2
+                       : m_light_client_connection};
+    std::optional<BridgeLightClientSnapshot>& light_client_floor{
+        delta.v2_store ? m_light_client_floor_v2 : m_light_client_floor};
+    AnchorMap& anchors{delta.v2_store ? m_anchors_v2 : m_anchors};
+    AnchorHeightMap& anchor_by_height{
+        delta.v2_store ? m_anchor_by_height_v2 : m_anchor_by_height};
+
     // Validate every effect against the live base state and against earlier
     // entries in this delta before mutating any live container.
     const bool light_client_changed{
@@ -1335,11 +1842,11 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
     if (light_client_changed) {
         const BridgeStateConnection expected{delta.height, delta.block_hash};
         if (!delta.light_client_after ||
-            !SameOptionalStore(m_light_client, delta.light_client_before) ||
+            !SameOptionalStore(light_client, delta.light_client_before) ||
             SameOptionalStore(delta.light_client_before,
                               delta.light_client_after) ||
             delta.light_client_connection_before !=
-                m_light_client_connection ||
+                light_client_connection ||
             delta.light_client_connection_after != expected) {
             error = "bridge delta light-client before-state does not match";
             return false;
@@ -1364,8 +1871,8 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
             !HasValidBackfillOrigin(anchor) ||
             anchor.connected_height != delta.height ||
             anchor.connected_block != delta.block_hash ||
-            m_anchors.contains(anchor.block_hash) ||
-            m_anchor_by_height.contains(anchor.block_number) ||
+            anchors.contains(anchor.block_hash) ||
+            anchor_by_height.contains(anchor.block_number) ||
             !added_anchor_hashes.insert(anchor.block_hash).second ||
             !added_anchor_heights.insert(anchor.block_number).second) {
             error = "bridge delta contains a duplicate or mismatched execution anchor";
@@ -1394,9 +1901,18 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
         }
         authorized_amount += authorization.authorization.amount;
     }
+    // V1 mints use namespace 1 below V; V2 mints namespace 2 from V. The V1
+    // nullifier set is therefore frozen at V.
+    const uint8_t expected_namespace{
+        delta.v2_store ? bridge::BRIDGE_NULLIFIER_NAMESPACE_V2
+                       : bridge::BRIDGE_NULLIFIER_NAMESPACE_V1};
     std::set<bridge::BridgeDepositKey> listed_nullifiers;
     for (const bridge::BridgeDepositKey& nullifier :
          delta.nullifiers_added) {
+        if (nullifier.nullifier_namespace != expected_namespace) {
+            error = "bridge delta nullifier namespace does not match its store";
+            return false;
+        }
         if (!listed_nullifiers.insert(nullifier).second ||
             m_nullifiers.contains(nullifier) ||
             m_nullifier_connections.contains(nullifier)) {
@@ -1427,6 +1943,16 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
     }
     if (changed_amount != authorized_amount) {
         error = "bridge delta mint amount does not match epoch accounting";
+        return false;
+    }
+
+    // The V1 withdrawal requests and tree freeze at V; V2 leaves exist only
+    // from V.
+    if (delta.v2_store
+            ? (!delta.withdrawals_added.empty() ||
+               !delta.decentralized_withdrawals_added.empty())
+            : !delta.withdrawals_v2_added.empty()) {
+        error = "bridge delta withdrawals do not match its store";
         return false;
     }
 
@@ -1485,19 +2011,58 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
         return false;
     }
 
+    if (!(delta.withdrawal_tree_v2_before == m_withdrawal_tree_v2)) {
+        error = "bridge delta V2 withdrawal-tree before-state does not match";
+        return false;
+    }
+    modern::WithdrawalTreeState expected_tree_v2{m_withdrawal_tree_v2};
+    std::set<BridgeWithdrawalId> v2_sources;
+    for (const BridgeWithdrawalV2Request& request :
+         delta.withdrawals_v2_added) {
+        const BridgeWithdrawalId source{request.transaction_id,
+                                        request.burn_output_index};
+        const auto expected_leaf{
+            modern::BridgeWithdrawalLeafV2(request.withdrawal)};
+        if (request.transaction_id.IsNull() ||
+            request.withdrawal.withdrawal_id != expected_tree_v2.count ||
+            request.withdrawal.b3_height !=
+                static_cast<uint64_t>(delta.height) ||
+            request.connected_height != delta.height ||
+            request.connected_block != delta.block_hash || !expected_leaf ||
+            *expected_leaf != request.leaf ||
+            !withdrawal_transactions.insert(request.transaction_id).second ||
+            !v2_sources.insert(source).second ||
+            m_withdrawal_v2_sources.contains(source) ||
+            m_withdrawals_v2.contains(request.withdrawal.withdrawal_id) ||
+            !modern::AppendWithdrawalLeaf(expected_tree_v2, request.leaf)) {
+            error = "bridge delta contains an invalid V2 withdrawal";
+            return false;
+        }
+    }
+    if (!(delta.withdrawal_tree_v2_after == expected_tree_v2)) {
+        error = "bridge delta V2 withdrawal-tree after-state does not match";
+        return false;
+    }
+    // V2 roots exist only from V: below it (and on every chain without a
+    // bridge V2 envelope) the V2 tree stays empty and FinalityWithdrawalRootV2
+    // is zero without consulting the index, so nothing is recorded there.
+    if (delta.v2_store && m_withdrawal_v2_roots.contains(delta.height)) {
+        error = "bridge delta duplicates a V2 withdrawal-root height";
+        return false;
+    }
+
     if (light_client_changed) {
-        m_light_client = delta.light_client_after;
-        m_light_client_connection =
-            delta.light_client_connection_after;
-        if (!m_light_client_floor) {
-            m_light_client_floor = BridgeLightClientSnapshot{
+        light_client = delta.light_client_after;
+        light_client_connection = delta.light_client_connection_after;
+        if (!light_client_floor) {
+            light_client_floor = BridgeLightClientSnapshot{
                 *delta.light_client_after,
                 *delta.light_client_connection_after};
         }
     }
     for (const BridgeExecutionAnchor& anchor : delta.anchors_added) {
-        m_anchors.emplace(anchor.block_hash, anchor);
-        m_anchor_by_height.emplace(anchor.block_number, anchor.block_hash);
+        anchors.emplace(anchor.block_hash, anchor);
+        anchor_by_height.emplace(anchor.block_number, anchor.block_hash);
     }
     for (const bridge::BridgeDepositKey& nullifier :
          delta.nullifiers_added) {
@@ -1525,8 +2090,20 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
                                request.burn_output_index},
             request.withdrawal.withdrawal_id);
     }
+    for (const BridgeWithdrawalV2Request& request :
+         delta.withdrawals_v2_added) {
+        m_withdrawals_v2.emplace(request.withdrawal.withdrawal_id, request);
+        m_withdrawal_v2_sources.emplace(
+            BridgeWithdrawalId{request.transaction_id,
+                               request.burn_output_index},
+            request.withdrawal.withdrawal_id);
+    }
     m_withdrawal_tree = delta.withdrawal_tree_after;
     m_withdrawal_roots.emplace(delta.height, m_withdrawal_tree.root);
+    m_withdrawal_tree_v2 = delta.withdrawal_tree_v2_after;
+    if (delta.v2_store) {
+        m_withdrawal_v2_roots.emplace(delta.height, m_withdrawal_tree_v2.root);
+    }
     m_connected_height = delta.height;
     m_connected_hash = delta.block_hash;
     m_history.push_back(delta);
@@ -1554,6 +2131,16 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
         return false;
     }
     const BridgeBlockDelta& delta{m_history.back()};
+    std::optional<bridge::LightClientStore>& light_client{
+        delta.v2_store ? m_light_client_v2 : m_light_client};
+    std::optional<BridgeStateConnection>& light_client_connection{
+        delta.v2_store ? m_light_client_connection_v2
+                       : m_light_client_connection};
+    std::optional<BridgeLightClientSnapshot>& light_client_floor{
+        delta.v2_store ? m_light_client_floor_v2 : m_light_client_floor};
+    AnchorMap& anchors{delta.v2_store ? m_anchors_v2 : m_anchors};
+    AnchorHeightMap& anchor_by_height{
+        delta.v2_store ? m_anchor_by_height_v2 : m_anchor_by_height};
 
     // Validate the complete undo against live state before removing or
     // rewriting anything. A failed deep or corrupt undo leaves state intact.
@@ -1563,6 +2150,29 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
         root_at_height->second != delta.withdrawal_tree_after.root) {
         error = "bridge undo withdrawal-tree after-state does not match";
         return false;
+    }
+    // A V2 root was recorded for this height exactly when it is V2-store.
+    const auto root_v2_at_height{m_withdrawal_v2_roots.find(height)};
+    if (!(m_withdrawal_tree_v2 == delta.withdrawal_tree_v2_after) ||
+        (delta.v2_store
+             ? (root_v2_at_height == m_withdrawal_v2_roots.end() ||
+                root_v2_at_height->second !=
+                    delta.withdrawal_tree_v2_after.root)
+             : root_v2_at_height != m_withdrawal_v2_roots.end())) {
+        error = "bridge undo V2 withdrawal-tree after-state does not match";
+        return false;
+    }
+    for (auto it{delta.withdrawals_v2_added.rbegin()};
+         it != delta.withdrawals_v2_added.rend(); ++it) {
+        const auto found{m_withdrawals_v2.find(it->withdrawal.withdrawal_id)};
+        const auto source_found{m_withdrawal_v2_sources.find(
+            BridgeWithdrawalId{it->transaction_id, it->burn_output_index})};
+        if (found == m_withdrawals_v2.end() || !(found->second == *it) ||
+            source_found == m_withdrawal_v2_sources.end() ||
+            source_found->second != it->withdrawal.withdrawal_id) {
+            error = "bridge undo cannot remove its V2 withdrawal";
+            return false;
+        }
     }
     for (auto it{delta.decentralized_withdrawals_added.rbegin()};
          it != delta.decentralized_withdrawals_added.rend(); ++it) {
@@ -1611,10 +2221,10 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
     }
     for (auto it{delta.anchors_added.rbegin()};
          it != delta.anchors_added.rend(); ++it) {
-        const auto found{m_anchors.find(it->block_hash)};
-        const auto by_height{m_anchor_by_height.find(it->block_number)};
-        if (found == m_anchors.end() || !(found->second == *it) ||
-            by_height == m_anchor_by_height.end() ||
+        const auto found{anchors.find(it->block_hash)};
+        const auto by_height{anchor_by_height.find(it->block_number)};
+        if (found == anchors.end() || !(found->second == *it) ||
+            by_height == anchor_by_height.end() ||
             by_height->second != it->block_hash) {
             error = "bridge undo cannot remove its execution anchor";
             return false;
@@ -1626,8 +2236,8 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
     if (light_client_changed) {
         if (!delta.light_client_after ||
             !delta.light_client_connection_after ||
-            !SameOptionalStore(m_light_client, delta.light_client_after) ||
-            m_light_client_connection !=
+            !SameOptionalStore(light_client, delta.light_client_after) ||
+            light_client_connection !=
                 delta.light_client_connection_after) {
             error = "bridge undo light-client after-state does not match";
             return false;
@@ -1648,8 +2258,16 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
             BridgeWithdrawalId{it->transaction_id,
                                it->burn_output_index});
     }
+    for (auto it{delta.withdrawals_v2_added.rbegin()};
+         it != delta.withdrawals_v2_added.rend(); ++it) {
+        m_withdrawals_v2.erase(it->withdrawal.withdrawal_id);
+        m_withdrawal_v2_sources.erase(
+            BridgeWithdrawalId{it->transaction_id, it->burn_output_index});
+    }
     m_withdrawal_roots.erase(height);
     m_withdrawal_tree = delta.withdrawal_tree_before;
+    m_withdrawal_v2_roots.erase(height);
+    m_withdrawal_tree_v2 = delta.withdrawal_tree_v2_before;
     for (auto it{delta.epoch_mint_changes.rbegin()};
          it != delta.epoch_mint_changes.rend(); ++it) {
         const auto key{std::make_pair(it->asset, it->epoch)};
@@ -1666,18 +2284,17 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
     }
     for (auto it{delta.anchors_added.rbegin()};
          it != delta.anchors_added.rend(); ++it) {
-        m_anchors.erase(it->block_hash);
-        m_anchor_by_height.erase(it->block_number);
+        anchors.erase(it->block_hash);
+        anchor_by_height.erase(it->block_number);
     }
     if (light_client_changed) {
-        if (m_light_client_floor &&
-            m_light_client_floor->connection ==
+        if (light_client_floor &&
+            light_client_floor->connection ==
                 *delta.light_client_connection_after) {
-            m_light_client_floor.reset();
+            light_client_floor.reset();
         }
-        m_light_client = delta.light_client_before;
-        m_light_client_connection =
-            delta.light_client_connection_before;
+        light_client = delta.light_client_before;
+        light_client_connection = delta.light_client_connection_before;
     }
     m_connected_height = delta.previous_height;
     m_connected_hash = delta.previous_block_hash;
@@ -1700,6 +2317,15 @@ void BridgeStateIndex::Clear()
     m_decentralized_withdrawal_sources.clear();
     m_withdrawal_tree = modern::WithdrawalTreeState{};
     m_withdrawal_roots.clear();
+    m_light_client_v2.reset();
+    m_light_client_connection_v2.reset();
+    m_light_client_floor_v2.reset();
+    m_anchors_v2.clear();
+    m_anchor_by_height_v2.clear();
+    m_withdrawals_v2.clear();
+    m_withdrawal_v2_sources.clear();
+    m_withdrawal_tree_v2 = modern::WithdrawalTreeState{};
+    m_withdrawal_v2_roots.clear();
     m_connected_height = -1;
     m_connected_hash.SetNull();
     m_history.clear();
