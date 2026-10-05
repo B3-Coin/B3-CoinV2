@@ -182,6 +182,8 @@ static const char* BridgeRecordKindName(
         return "managed-withdrawal";
     case bridge::BridgeRecordKindV1::BRIDGE_BURN:
         return "bridge-burn";
+    case bridge::BridgeRecordKindV1::ETH_STATE_OBSERVATION:
+        return "eth-state-observation";
     }
     return "unknown";
 }
@@ -1792,7 +1794,9 @@ RPCHelpMan submitbridgecarrier()
     return RPCHelpMan{
         "submitbridgecarrier",
         "Fund, sign, and optionally broadcast one canonical bridge bootstrap, "
-        "Ethereum light-client update, or execution-backfill type-10 record. "
+        "Ethereum light-client update, execution-backfill, or (from the bridge "
+        "V2 activation height, regtest only) Ethereum state-observation (kind "
+        "9) type-10 record. "
         "The payload must be produced by an external bridge proof builder. "
         "Mint and managed-withdrawal records are rejected by this command. "
         "A mandatory zero-valued B3MC policy-9 output binds the exact MPA "
@@ -1816,7 +1820,7 @@ RPCHelpMan submitbridgecarrier()
              }},
         },
         AssetTransactionResult("Created bridge carrier transaction", {
-            {RPCResult::Type::STR, "record_kind", "bootstrap, update, or execution-backfill"},
+            {RPCResult::Type::STR, "record_kind", "bootstrap, update, execution-backfill, or eth-state-observation"},
             {RPCResult::Type::NUM, "binding_vout", "Signed B3MC bridge binding output index"},
         }),
         RPCExamples{HelpExampleCli(
@@ -1828,10 +1832,13 @@ RPCHelpMan submitbridgecarrier()
                     bridge::BridgeRecordKindV1::BOOTSTRAP &&
                 parsed.decoded.kind != bridge::BridgeRecordKindV1::UPDATE &&
                 parsed.decoded.kind !=
-                    bridge::BridgeRecordKindV1::EXECUTION_BACKFILL) {
+                    bridge::BridgeRecordKindV1::EXECUTION_BACKFILL &&
+                parsed.decoded.kind !=
+                    bridge::BridgeRecordKindV1::ETH_STATE_OBSERVATION) {
                 throw JSONRPCError(
                     RPC_INVALID_PARAMETER,
-                    "submitbridgecarrier accepts only bootstrap, update, or execution-backfill records");
+                    "submitbridgecarrier accepts only bootstrap, update, or execution-backfill records, "
+                    "and eth-state-observation records from the bridge V2 activation height");
             }
 
             const std::shared_ptr<CWallet> wallet{
@@ -2054,10 +2061,17 @@ RPCHelpMan bridgewithdraw()
         "the vault-bound bUSD V2 asset instead: the BRIDGE_BURN record names "
         "the V2 vault entry, needs the bridge V2 burn height, and confirms as "
         "a leaf V2 of the V2 withdrawal tree whose root fresh-lineage "
-        "certificates carry. Until the kind 9 liveness gates exist, consensus "
-        "requires only a live fresh finality lineage whose current and next "
-        "committees meet the Verifier V2 bounds (a temporary gate). Prove it "
-        "with getbridgewithdrawalproofv2 against an accepted certificate. "
+        "certificates carry. Consensus then applies the full V2 burn gate "
+        "(rows C1-C4 and E1-E8): a live, unbroken fresh finality lineage whose "
+        "current and next committees meet the Verifier V2 bounds and whose "
+        "finality keeps up, no sticky conflict, and fresh connected kind 9 "
+        "observations (a LIVE VERIFIER_E on B3's lineage, TOKEN_FLAGS showing "
+        "a token that pays, and RESERVE_E), also at the burn's position after "
+        "earlier records of its block. Each burn must also fit the vault "
+        "entry's reserve and the wind-down bound of the latest RESERVE_E, and "
+        "the mempool refuses a burn whose gate closes within its margin. "
+        "getbridgev2info burn_gate names the row that refuses a burn. Prove "
+        "it with getbridgewithdrawalproofv2 against an accepted certificate. "
         "The burn and "
         "recipient are bound together by the canonical type-10 record and its "
         "signed B3MC policy-9 output. No OP_RETURN is used.\n" +

@@ -31,6 +31,7 @@
 #include <logging/timer.h>
 #include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
+#include <modern/bridge_binding.h>
 #include <modern/bridge_v2.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
@@ -67,11 +68,14 @@
 #include <util/fs.h>
 #include <util/strencodings.h>
 #include <util/syserror.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <versionbits.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 
 #include <condition_variable>
@@ -80,6 +84,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -5721,6 +5726,352 @@ const Consensus::BridgeV2Params& EnsureBridgeV2Configured(const Consensus::Param
     return *consensus.bridge_v2;
 }
 
+// -- Kind 9 ETH_STATE_OBSERVATION rendering (node changes section 8.2) ------
+
+constexpr std::array<uint8_t, node::BRIDGE_V2_OBSERVATION_SUBJECTS> BRIDGE_V2_OBSERVATION_SUBJECT_LIST{
+    bridge::ETH_OBSERVATION_SUBJECT_VERIFIER, bridge::ETH_OBSERVATION_SUBJECT_RESERVE,
+    bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS};
+
+const char* ObservationSubjectName(const uint8_t subject)
+{
+    switch (subject) {
+    case bridge::ETH_OBSERVATION_SUBJECT_VERIFIER: return "VERIFIER_E";
+    case bridge::ETH_OBSERVATION_SUBJECT_RESERVE: return "RESERVE_E";
+    case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS: return "TOKEN_FLAGS";
+    }
+    return "unknown";
+}
+
+//! The getbridgev2info "observations" key of a subject.
+const char* ObservationSubjectKey(const uint8_t subject)
+{
+    switch (subject) {
+    case bridge::ETH_OBSERVATION_SUBJECT_VERIFIER: return "verifier_e";
+    case bridge::ETH_OBSERVATION_SUBJECT_RESERVE: return "reserve_e";
+    case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS: return "token_flags";
+    }
+    return "unknown";
+}
+
+const char* VerifierStatusName(const uint8_t status)
+{
+    switch (status) {
+    case bridge::VERIFIER_STATUS_UNINITIALIZED: return "UNINITIALIZED";
+    case bridge::VERIFIER_STATUS_LIVE: return "LIVE";
+    case bridge::VERIFIER_STATUS_HALTED_CONFLICT: return "HALTED_CONFLICT";
+    case bridge::VERIFIER_STATUS_CANCELLED: return "CANCELLED";
+    }
+    return "unknown";
+}
+
+const char* BridgeV2ConflictName(const uint8_t reason)
+{
+    switch (reason) {
+    case bridge::BRIDGE_V2_CONFLICT_E5: return "E5";
+    case bridge::BRIDGE_V2_CONFLICT_E8: return "E8";
+    case bridge::BRIDGE_V2_CONFLICT_KIND13: return "kind13";
+    }
+    return "unknown";
+}
+
+/**
+ * The decoded fields of an observation of `subject`, or (nullopt) of every
+ * subject with each field optional, for buildbridgeobservationv2 whose
+ * subject is an argument. A field shared by two subjects is listed once.
+ */
+std::vector<RPCResult> ObservedValueResults(const std::optional<uint8_t> subject)
+{
+    const bool optional{!subject};
+    std::vector<RPCResult> out;
+    std::set<std::string> seen;
+    const auto add{[&](const RPCResult::Type type, const std::string& key, const std::string& description) {
+        if (seen.insert(key).second) out.emplace_back(type, key, optional, description);
+    }};
+    using T = RPCResult::Type;
+    if (!subject || *subject == bridge::ETH_OBSERVATION_SUBJECT_VERIFIER) {
+        add(T::NUM, "current_epoch", "VERIFIER_E: Liveness.currentEpoch (e_E)");
+        add(T::NUM, "last_rotation_time", "VERIFIER_E: Liveness.lastRotationTime (Unix seconds)");
+        add(T::NUM, "last_certificate_time", "VERIFIER_E: Liveness.lastCertificateTime (Unix seconds)");
+        add(T::NUM, "latest_bridge_height", "VERIFIER_E: Liveness.latestBridgeHeight");
+        add(T::NUM, "status", "VERIFIER_E: Liveness.status (0 UNINITIALIZED, 1 LIVE, 2 HALTED_CONFLICT, 3 CANCELLED)");
+        add(T::STR, "status_name", "VERIFIER_E: status by name");
+        add(T::BOOL, "deposits_closed", "VERIFIER_E: Liveness.depositsClosed");
+        add(T::STR_HEX, "current_set_hash", "VERIFIER_E: currentSetHash (slot 1, raw bytes)");
+        add(T::STR_HEX, "next_set_hash", "VERIFIER_E: nextSetHash (slot 2, raw bytes)");
+        add(T::NUM, "latest_height", "VERIFIER_E: Latest.height");
+        add(T::NUM, "latest_index", "VERIFIER_E: Latest.index");
+        add(T::NUM, "latest_init_time", "VERIFIER_E: Latest.initTime (Unix seconds)");
+        add(T::STR_HEX, "latest_cert_id", "VERIFIER_E: latestCertId (slot 6, raw bytes)");
+        add(T::STR_HEX, "verifier_code_hash", "VERIFIER_E: observed Verifier V2 extcodehash");
+    }
+    if (!subject || *subject == bridge::ETH_OBSERVATION_SUBJECT_RESERVE) {
+        add(T::NUM, "next_deposit_id", "RESERVE_E: Vault V2 nextDepositId, the cut of P_pre / P_post");
+        add(T::NUM, "locked", "RESERVE_E: Vault V2 locked (raw six-decimal units)");
+        add(T::NUM, "absorbed_total", "RESERVE_E: Vault V2 absorbedTotal (raw)");
+        add(T::NUM, "balance", "RESERVE_E: the token's balances[vault], B (raw)");
+        add(T::STR_HEX, "vault_code_hash", "RESERVE_E: observed Vault V2 extcodehash");
+    }
+    if (!subject || *subject == bridge::ETH_OBSERVATION_SUBJECT_RESERVE ||
+        *subject == bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS) {
+        add(T::STR_HEX, "token_code_hash", "RESERVE_E and TOKEN_FLAGS: observed token extcodehash (equal to its pin)");
+    }
+    if (!subject || *subject == bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS) {
+        add(T::STR_HEX, "owner", "TOKEN_FLAGS: token owner (slot 0)");
+        add(T::BOOL, "paused", "TOKEN_FLAGS: token paused (slot 0)");
+        add(T::STR_HEX, "upgraded_address", "TOKEN_FLAGS: token upgradedAddress (slot 10)");
+        add(T::BOOL, "deprecated", "TOKEN_FLAGS: token deprecated (slot 10)");
+        add(T::BOOL, "vault_blacklisted", "TOKEN_FLAGS: isBlackListed[vault]");
+    }
+    return out;
+}
+
+UniValue ObservedValuesJson(const bridge::ObservedStateV2& state)
+{
+    UniValue out{UniValue::VOBJ};
+    if (const auto* verifier{std::get_if<bridge::VerifierStateV2>(&state)}) {
+        out.pushKV("current_epoch", verifier->current_epoch);
+        out.pushKV("last_rotation_time", verifier->last_rotation_time);
+        out.pushKV("last_certificate_time", verifier->last_certificate_time);
+        out.pushKV("latest_bridge_height", verifier->latest_bridge_height);
+        out.pushKV("status", int{verifier->status});
+        out.pushKV("status_name", VerifierStatusName(verifier->status));
+        out.pushKV("deposits_closed", verifier->deposits_closed);
+        out.pushKV("current_set_hash", EvmHex(verifier->current_set_hash));
+        out.pushKV("next_set_hash", EvmHex(verifier->next_set_hash));
+        out.pushKV("latest_height", verifier->latest_height);
+        out.pushKV("latest_index", verifier->latest_index);
+        out.pushKV("latest_init_time", verifier->latest_init_time);
+        out.pushKV("latest_cert_id", EvmHex(verifier->latest_cert_id));
+        out.pushKV("verifier_code_hash", EvmHex(verifier->verifier_code_hash));
+    } else if (const auto* reserve{std::get_if<bridge::ReserveStateV2>(&state)}) {
+        out.pushKV("next_deposit_id", reserve->next_deposit_id);
+        out.pushKV("locked", reserve->locked);
+        out.pushKV("absorbed_total", reserve->absorbed_total);
+        out.pushKV("balance", reserve->balance);
+        out.pushKV("vault_code_hash", EvmHex(reserve->vault_code_hash));
+        out.pushKV("token_code_hash", EvmHex(reserve->token_code_hash));
+    } else if (const auto* token{std::get_if<bridge::TokenFlagsV2>(&state)}) {
+        out.pushKV("token_code_hash", EvmHex(token->token_code_hash));
+        out.pushKV("owner", EvmHex(token->owner));
+        out.pushKV("paused", token->paused);
+        out.pushKV("upgraded_address", EvmHex(token->upgraded_address));
+        out.pushKV("deprecated", token->deprecated);
+        out.pushKV("vault_blacklisted", token->vault_blacklisted);
+    }
+    return out;
+}
+
+//! getbridgev2info's documentation of one connected observation.
+RPCResult ObservationRecordResult(const uint8_t subject)
+{
+    return {RPCResult::Type::OBJ, ObservationSubjectKey(subject), /*optional=*/true,
+            std::string{"Latest connected "} + ObservationSubjectName(subject) + " observation (absent before the first)",
+            {
+                {RPCResult::Type::NUM, "subject", "Kind 9 subject number"},
+                {RPCResult::Type::STR, "name", "Subject name"},
+                {RPCResult::Type::NUM, "anchor_block", "Ethereum execution block of the anchor it was proven against"},
+                {RPCResult::Type::STR_HEX, "anchor_hash_evm", "That anchor's hash (raw bytes)"},
+                {RPCResult::Type::NUM, "t_obs", "The anchor's execution timestamp, the observation time the gate ages"},
+                {RPCResult::Type::NUM, "verdict", "Recorded verdict: VERIFIER_E bit 0 SETS_MISMATCH (E4), bit 1 CERT_CONFLICT (E5); 0 for the other subjects"},
+                {RPCResult::Type::NUM, "connected_height", "B3 height that connected it"},
+                {RPCResult::Type::STR_HEX, "connected_block", "B3 block that connected it"},
+                {RPCResult::Type::OBJ, "values", "Decoded storage values and observed code hashes", ObservedValueResults(subject)},
+            }};
+}
+
+UniValue ObservationRecordJson(const node::BridgeObservationRecordV2& record)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("subject", int{record.subject});
+    out.pushKV("name", ObservationSubjectName(record.subject));
+    out.pushKV("anchor_block", record.anchor_block);
+    out.pushKV("anchor_hash_evm", EvmHex(record.anchor_hash));
+    out.pushKV("t_obs", record.t_obs);
+    out.pushKV("verdict", int{record.verdict});
+    out.pushKV("connected_height", record.connected_height);
+    out.pushKV("connected_block", record.connected_block.GetHex());
+    out.pushKV("values", ObservedValuesJson(record.state));
+    return out;
+}
+
+/**
+ * getbridgev2info's observation_plan: the newest retained V2 anchor with a
+ * state root and, per subject, the eth_getProof calls (accounts and storage
+ * keys, in record order) a relayer makes at that anchor's block.
+ */
+UniValue ObservationPlanJson(const bridge::ObservationPins& pins, const node::BridgeStateIndex* index)
+{
+    UniValue plan{UniValue::VOBJ};
+    const auto anchor{index ? index->NewestStateAnchorV2() : std::nullopt};
+    if (anchor) {
+        UniValue a{UniValue::VOBJ};
+        a.pushKV("hash_evm", EvmHex(anchor->block_hash));
+        a.pushKV("number", anchor->block_number);
+        a.pushKV("timestamp", anchor->execution_timestamp);
+        a.pushKV("connected_height", anchor->connected_height);
+        a.pushKV("connected_block", anchor->connected_block.GetHex());
+        plan.pushKV("anchor", std::move(a));
+    }
+    UniValue subjects{UniValue::VARR};
+    for (const uint8_t subject : BRIDGE_V2_OBSERVATION_SUBJECT_LIST) {
+        UniValue entry{UniValue::VOBJ};
+        entry.pushKV("subject", int{subject});
+        entry.pushKV("name", ObservationSubjectName(subject));
+        const auto latest{index ? index->LatestObservationV2(subject) : std::nullopt};
+        if (latest) entry.pushKV("latest_anchor_block", latest->anchor_block);
+        if (anchor) entry.pushKV("anchor_is_newer", !latest || anchor->block_number > latest->anchor_block);
+        UniValue accounts{UniValue::VARR};
+        for (const bridge::ObservationAccountRequest& request : bridge::ObservationRequests(subject, pins)) {
+            UniValue account{UniValue::VOBJ};
+            account.pushKV("role", bridge::ObservationAccountRoleName(request.role));
+            account.pushKV("address", EvmHex(request.address));
+            UniValue slots{UniValue::VARR};
+            for (const bridge::StorageWord& slot : request.slots) slots.push_back(EvmHex(slot));
+            account.pushKV("slots", std::move(slots));
+            accounts.push_back(std::move(account));
+        }
+        entry.pushKV("accounts", std::move(accounts));
+        subjects.push_back(std::move(entry));
+    }
+    plan.pushKV("subjects", std::move(subjects));
+    return plan;
+}
+
+// -- buildbridgeobservationv2 argument parsing ------------------------------
+
+//! A hex string with an optional 0x prefix (eth_getProof's form).
+std::string EvmHexDigits(const UniValue& value, const std::string& name)
+{
+    if (!value.isStr()) {
+        throw JSONRPCError(RPC_TYPE_ERROR, name + " must be a hexadecimal string");
+    }
+    std::string hex{value.get_str()};
+    if (hex.starts_with("0x") || hex.starts_with("0X")) hex.erase(0, 2);
+    return hex;
+}
+
+uint256 ParseEvmHash(const UniValue& value, const std::string& name)
+{
+    const std::string hex{EvmHexDigits(value, name)};
+    if (hex.size() != 64 || !IsHex(hex)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, name + " must contain exactly 32 hexadecimal bytes");
+    }
+    const std::vector<unsigned char> bytes{ParseHex(hex)};
+    return uint256{std::span<const unsigned char>{bytes.data(), bytes.size()}};
+}
+
+bridge::EthAddress ParseEvmAddress(const UniValue& value, const std::string& name)
+{
+    const std::string hex{EvmHexDigits(value, name)};
+    if (hex.size() != 40 || !IsHex(hex)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, name + " must be a 20-byte hexadecimal address");
+    }
+    const std::vector<unsigned char> bytes{ParseHex(hex)};
+    bridge::EthAddress out;
+    std::copy(bytes.begin(), bytes.end(), out.begin());
+    return out;
+}
+
+//! An eth_getProof storage key: a 32-byte word, also accepted as a shorter
+//! quantity ("0x0"), which it left-pads.
+bridge::StorageWord ParseStorageKey(const UniValue& value, const std::string& name)
+{
+    std::string hex{EvmHexDigits(value, name)};
+    if (hex.empty() || hex.size() > 64) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, name + " must be a storage key of at most 32 hexadecimal bytes");
+    }
+    hex.insert(0, 64 - hex.size(), '0');
+    if (!IsHex(hex)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, name + " must be a storage key of at most 32 hexadecimal bytes");
+    }
+    const std::vector<unsigned char> bytes{ParseHex(hex)};
+    bridge::StorageWord out;
+    std::copy(bytes.begin(), bytes.end(), out.begin());
+    return out;
+}
+
+//! A proof node list (eth_getProof accountProof or storageProof[i].proof).
+std::vector<std::vector<unsigned char>> ParseProofNodes(const UniValue& value, const std::string& name)
+{
+    if (!value.isArray()) {
+        throw JSONRPCError(RPC_TYPE_ERROR, name + " must be an array of hexadecimal trie nodes");
+    }
+    if (value.size() > bridge::MAX_BRIDGE_MPT_NODES) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           strprintf("%s has %u nodes; a kind 9 node list holds at most %u", name, value.size(),
+                                     bridge::MAX_BRIDGE_MPT_NODES));
+    }
+    std::vector<std::vector<unsigned char>> nodes;
+    nodes.reserve(value.size());
+    for (size_t i{0}; i < value.size(); ++i) {
+        const std::string node_name{strprintf("%s[%u]", name, i)};
+        const std::string hex{EvmHexDigits(value[i], node_name)};
+        if (!IsHex(hex)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, node_name + " must be non-empty hexadecimal bytes");
+        }
+        nodes.push_back(ParseHex(hex));
+    }
+    return nodes;
+}
+
+/**
+ * The account proofs of a kind 9 record from eth_getProof results, which
+ * must name exactly the plan's accounts and storage keys, in order. Fields
+ * other than address, accountProof and storageProof[].{key, proof} are
+ * ignored: the record carries only the trie nodes, and the values come from
+ * verifying them.
+ */
+std::vector<bridge::BridgeEthAccountProofV2> ParseObservationProofs(
+    const UniValue& proofs, const std::vector<bridge::ObservationAccountRequest>& plan)
+{
+    if (!proofs.isArray()) {
+        throw JSONRPCError(RPC_TYPE_ERROR, "proofs must be an array of eth_getProof results");
+    }
+    if (proofs.size() != plan.size()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           strprintf("proofs holds %u eth_getProof results; this subject's plan has %u accounts",
+                                     proofs.size(), plan.size()));
+    }
+    std::vector<bridge::BridgeEthAccountProofV2> accounts;
+    for (size_t i{0}; i < plan.size(); ++i) {
+        const bridge::ObservationAccountRequest& request{plan[i]};
+        const std::string role{bridge::ObservationAccountRoleName(request.role)};
+        const std::string name{strprintf("proofs[%u]", i)};
+        const UniValue& result{proofs[i]};
+        if (!result.isObject()) {
+            throw JSONRPCError(RPC_TYPE_ERROR, name + " must be an eth_getProof result object");
+        }
+        if (ParseEvmAddress(result.find_value("address"), name + ".address") != request.address) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               strprintf("%s.address is not the plan's %s %s", name, role, EvmHex(request.address)));
+        }
+        bridge::BridgeEthAccountProofV2 account;
+        account.account_nodes = ParseProofNodes(result.find_value("accountProof"), name + ".accountProof");
+        const UniValue& storage{result.find_value("storageProof")};
+        if (!storage.isArray()) {
+            throw JSONRPCError(RPC_TYPE_ERROR, name + ".storageProof must be an array");
+        }
+        if (storage.size() != request.slots.size()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               strprintf("%s.storageProof proves %u slots; the plan's %s needs %u", name,
+                                         storage.size(), role, request.slots.size()));
+        }
+        for (size_t j{0}; j < storage.size(); ++j) {
+            const std::string slot_name{strprintf("%s.storageProof[%u]", name, j)};
+            if (!storage[j].isObject()) {
+                throw JSONRPCError(RPC_TYPE_ERROR, slot_name + " must be an object");
+            }
+            if (ParseStorageKey(storage[j].find_value("key"), slot_name + ".key") != request.slots[j]) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("%s.key is not the plan's slot %s", slot_name,
+                                                                    EvmHex(request.slots[j])));
+            }
+            account.storage_nodes.push_back(ParseProofNodes(storage[j].find_value("proof"), slot_name + ".proof"));
+        }
+        accounts.push_back(std::move(account));
+    }
+    return accounts;
+}
+
 } // namespace
 
 static RPCHelpMan getbridgev2info()
@@ -5729,11 +6080,14 @@ static RPCHelpMan getbridgev2info()
         "getbridgev2info",
         "Bridge V2 configuration and active-chain state for its one fresh Ethereum vault: V and W2, the\n"
         "vault entry, its bUSD V2 AssetId and entry id, caps, the Verifier V2 pins, the separate V2\n"
-        "light-client store, namespace-2 nullifiers, the V2 withdrawal tree and the TEMPORARY V2 burn\n"
-        "gate. Configured only by the regtest-only -b3bridgepins v2 section (every other chain returns\n"
-        "an error); getbridgeinfo keeps reporting the V1 bridge. Ethereum-facing values are 0x-prefixed\n"
-        "EVM-order bytes; B3 ids and block hashes without an _evm suffix are in ordinary display order.\n"
-        "No private key material is returned.\n",
+        "light-client store, namespace-2 nullifiers, the V2 withdrawal tree, the V2 burn gate (node\n"
+        "changes section 8.4 rows C1-C4 and E1-E8), the latest kind 9 Ethereum state observations, the\n"
+        "vault entry's reserve ledger, the sticky conflict and the eth_getProof plan for the next\n"
+        "observations (buildbridgeobservationv2). Configured only by the regtest-only -b3bridgepins v2\n"
+        "section (every other chain returns an error); getbridgeinfo keeps reporting the V1 bridge.\n"
+        "Ethereum-facing values are 0x-prefixed EVM-order bytes; B3 ids and block hashes without an _evm\n"
+        "suffix are in ordinary display order. Amounts are raw six-decimal units. No private key material\n"
+        "is returned.\n",
         {},
         RPCResult{RPCResult::Type::OBJ, "", "Bridge V2 status",
                   {
@@ -5754,6 +6108,7 @@ static RPCHelpMan getbridgev2info()
                       {RPCResult::Type::NUM, "min_bridge_validators", "Verifier V2 MIN_BRIDGE_VALIDATORS"},
                       {RPCResult::Type::NUM, "max_bridge_validators", "Verifier V2 MAX_BRIDGE_VALIDATORS"},
                       {RPCResult::Type::NUM, "min_bridge_total_weight", "Verifier V2 MIN_BRIDGE_TOTAL_WEIGHT in whole modern B3"},
+                      {RPCResult::Type::NUM, "verifier_max_epoch_lag", /*optional=*/true, "Pinned Verifier V2 MAX_EPOCH_LAG in seconds, equal to the burn gate's set expiry (absent while unpinned, see unpinned)"},
                       {RPCResult::Type::NUM, "max_deposit_raw", "Largest admitted deposit (raw six-decimal units)"},
                       {RPCResult::Type::NUM, "max_per_block", "Raw bUSD V2 mint cap per block"},
                       {RPCResult::Type::NUM, "max_per_epoch", "Raw bUSD V2 mint cap per epoch"},
@@ -5789,12 +6144,68 @@ static RPCHelpMan getbridgev2info()
                       {RPCResult::Type::NUM, "withdrawals", "Confirmed V2 burns (leaves V2 appended)"},
                       {RPCResult::Type::STR_HEX, "withdrawal_root_evm", /*optional=*/true, "V2 withdrawal-tree root at the active tip"},
                       {RPCResult::Type::STR_HEX, "empty_withdrawal_root_evm", "Root of the empty depth-32 tree (non-zero; signed from V until the first burn)"},
-                      {RPCResult::Type::OBJ, "burn_gate", "TEMPORARY V2 burn gate, evaluated as the mempool does on the fresh lineage projected for the next block; a burn also needs burns_active",
+                      {RPCResult::Type::OBJ, "burn_gate", "V2 burn gate (node changes section 8.4 rows C1-C4 and E1-E8), evaluated as the mempool does: on the fresh lineage projected for the next block, the connected kind 9 observations and the sticky conflict, at the mempool's candidate time max(now, median time past + 1). A burn also needs burns_active, the gate READY again at its position in a block (after that block's earlier kind 9 records), and the per-burn reserve and wind-down bounds (reserve), and the mempool refuses one whose gate closes within its close margin",
                        {
                            {RPCResult::Type::STR, "status", "READY, NOT_READY or UNAVAILABLE"},
-                           {RPCResult::Type::STR, "reason", "First failed condition, empty when READY"},
-                           {RPCResult::Type::BOOL, "temporary", "Always true in this slice"},
-                           {RPCResult::Type::STR, "note", "What the temporary gate checks: a configured, bootstrapped, unbroken fresh lineage whose current and next committees Verifier V2 qualifies (node changes section 8.4 rows C1/C2); the kind 9 liveness gate replaces it in a later slice"},
+                           {RPCResult::Type::STR, "row", /*optional=*/true, "NOT_READY only: the first failed row, C1-C4 or E1-E8"},
+                           {RPCResult::Type::STR, "reason", "Why that row failed, or why the gate is UNAVAILABLE; empty when READY"},
+                           {RPCResult::Type::NUM, "now_eff", /*optional=*/true, "The gate's time: max(candidate time, the V2 light client's finalized execution timestamp) (absent when no lineage context could be built)"},
+                           {RPCResult::Type::NUM, "closes_at", /*optional=*/true, "READY only: the first now_eff at which an observation age or the rotation age closes the gate"},
+                       }},
+                      {RPCResult::Type::OBJ, "observations", "Latest connected kind 9 observation per subject (empty while the bridge state is unavailable)",
+                       {
+                           ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_VERIFIER),
+                           ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_RESERVE),
+                           ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS),
+                       }},
+                      {RPCResult::Type::OBJ, "reserve", /*optional=*/true, "The vault entry's reserve ledger (node changes sections 7.1-7.2 and 7.6; absent while the bridge state is unavailable)",
+                       {
+                           {RPCResult::Type::NUM, "minted", "bUSD V2 minted against proven deposits"},
+                           {RPCResult::Type::NUM, "burned", "burned_v: leaf V2 amounts appended"},
+                           {RPCResult::Type::NUM, "credited", "C_v: migration amounts credited on proven arrival"},
+                           {RPCResult::Type::NUM, "transit", "transit_v: amounts paid toward this entry and not yet credited"},
+                           {RPCResult::Type::NUM, "reserve", /*optional=*/true, "reserve_v = minted + credited - burned, the bound of burn check 2"},
+                           {RPCResult::Type::NUM, "proven_deposits", "Number of Vault V2 deposits proven (minted)"},
+                           {RPCResult::Type::NUM, "invariant_r_margin", /*optional=*/true, "With a RESERVE_E: observed locked - (P_pre + credited - burned) on the current ledger; invariant R holds while it is at least zero (a failure when the observation connected set the sticky E8 conflict)"},
+                           {RPCResult::Type::NUM, "wind_down_headroom", /*optional=*/true, "With a RESERVE_E: the largest first burn of the next block that burn check 3 (the wind-down bound) admits; negative when the appended leaves already exceed it"},
+                       }},
+                      {RPCResult::Type::OBJ, "conflict", /*optional=*/true, "The sticky bridge V2 conflict closing the gate (row C4); absent when none is set",
+                       {
+                           {RPCResult::Type::STR, "reason", "E5 (a LIVE VERIFIER_E whose latestCertId is not B3's statement) or E8 (a RESERVE_E failing invariant R)"},
+                           {RPCResult::Type::NUM, "height", "B3 height of the block that set it"},
+                           {RPCResult::Type::STR_HEX, "block", "That B3 block"},
+                           {RPCResult::Type::NUM, "anchor_block", "Ethereum execution block of the observation that set it"},
+                       }},
+                      {RPCResult::Type::OBJ, "observation_plan", "What the next kind 9 observations prove: call eth_getProof(address, slots, anchor.number) for each account of a subject, in order, and pass the results to buildbridgeobservationv2 with anchor.hash_evm",
+                       {
+                           {RPCResult::Type::OBJ, "anchor", /*optional=*/true, "Newest retained V2 execution anchor carrying a state root (absent without one)",
+                            {
+                                {RPCResult::Type::STR_HEX, "hash_evm", "Ethereum execution block hash (raw bytes)"},
+                                {RPCResult::Type::NUM, "number", "Ethereum execution block number"},
+                                {RPCResult::Type::NUM, "timestamp", "Ethereum execution timestamp, the t_obs of observations proven against it"},
+                                {RPCResult::Type::NUM, "connected_height", "B3 height that retained the anchor"},
+                                {RPCResult::Type::STR_HEX, "connected_block", "B3 block that retained the anchor"},
+                            }},
+                           {RPCResult::Type::ARR, "subjects", "One entry per kind 9 subject",
+                            {
+                                {RPCResult::Type::OBJ, "", "",
+                                 {
+                                     {RPCResult::Type::NUM, "subject", "Kind 9 subject number (buildbridgeobservationv2 subject)"},
+                                     {RPCResult::Type::STR, "name", "VERIFIER_E, RESERVE_E or TOKEN_FLAGS"},
+                                     {RPCResult::Type::NUM, "latest_anchor_block", /*optional=*/true, "Anchor block of the subject's latest observation"},
+                                     {RPCResult::Type::BOOL, "anchor_is_newer", /*optional=*/true, "With an anchor: whether it is newer than the subject's latest observation, as a new one must be"},
+                                     {RPCResult::Type::ARR, "accounts", "eth_getProof calls, in record order",
+                                      {
+                                          {RPCResult::Type::OBJ, "", "",
+                                           {
+                                               {RPCResult::Type::STR, "role", "verifier, vault or token"},
+                                               {RPCResult::Type::STR_HEX, "address", "Account address (pinned)"},
+                                               {RPCResult::Type::ARR, "slots", "Storage keys, in order",
+                                                {{RPCResult::Type::STR_HEX, "", "32-byte storage key"}}},
+                                           }},
+                                      }},
+                                 }},
+                            }},
                        }},
                   }},
         RPCExamples{HelpExampleCli("getbridgev2info", "") + HelpExampleRpc("getbridgev2info", "")},
@@ -5823,6 +6234,9 @@ static RPCHelpMan getbridgev2info()
             result.pushKV("min_bridge_validators", v2.verifier.min_bridge_validators);
             result.pushKV("max_bridge_validators", v2.verifier.max_bridge_validators);
             result.pushKV("min_bridge_total_weight", v2.verifier.min_bridge_total_weight);
+            if (v2.verifier.max_epoch_lag_seconds) {
+                result.pushKV("verifier_max_epoch_lag", *v2.verifier.max_epoch_lag_seconds);
+            }
             result.pushKV("max_deposit_raw", entry.max_deposit_raw);
             result.pushKV("max_per_block", entry.mint_caps.max_per_block);
             result.pushKV("max_per_epoch", entry.mint_caps.max_per_epoch);
@@ -5842,6 +6256,7 @@ static RPCHelpMan getbridgev2info()
             UniValue unpinned{UniValue::VARR};
             if (!entry.vault_runtime_code_hash) unpinned.push_back("vault_runtime_code_hash");
             if (!v2.verifier.runtime_code_hash) unpinned.push_back("verifier_runtime_code_hash");
+            if (!v2.verifier.max_epoch_lag_seconds) unpinned.push_back("verifier_max_epoch_lag");
             unpinned.push_back("lineage_id");
             result.pushKV("unpinned", std::move(unpinned));
             result.pushKV("unpinned_note",
@@ -5905,26 +6320,268 @@ static RPCHelpMan getbridgev2info()
             result.pushKV("empty_withdrawal_root_evm",
                           EvmHex(modern::WithdrawalZeroHashes()[modern::WITHDRAWAL_TREE_DEPTH]));
 
-            // The mempool's TEMPORARY gate (validation.cpp): the fresh lineage
-            // projected for the next block from the synced tip.
-            std::string gate_status{"UNAVAILABLE"};
-            std::string gate_reason{"bridge or finality state is unavailable at the active tip"};
-            if (state_available) {
-                const node::BridgeStateIndex* bridge_index{nullptr};
-                const node::FinalityTracker* finality{SyncFinalityAtTip(chainstate, consensus, bridge_index)};
-                if (finality) {
-                    const node::BridgeBurnReadiness readiness{node::BridgeV2BurnReadiness(
-                        node::MakeLineageV2View(consensus, finality->Projected(next_height, consensus).fresh), v2,
-                        gate_reason)};
-                    gate_status = readiness == node::BridgeBurnReadiness::READY ? "READY" : "NOT_READY";
+            // The mempool's V2 burn gate (validation.cpp): the fresh lineage
+            // projected for the next block from the synced tip, the connected
+            // kind 9 observations and the sticky conflict, at the mempool's
+            // candidate time.
+            UniValue gate{UniValue::VOBJ};
+            {
+                std::string status{"UNAVAILABLE"};
+                std::string reason{"the bridge state is unavailable at the active tip"};
+                std::optional<node::BridgeV2GateResult> evaluated;
+                if (state_available && index) {
+                    const auto lineage{node::MakeBridgeV2LineageContext(
+                        chainstate.ModernFinality(), chainstate.m_chain, chainstate.m_blockman, consensus, *tip,
+                        *index, reason)};
+                    if (lineage) {
+                        const int64_t candidate_time{std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
+                        evaluated = node::EvaluateBridgeV2BurnGate(&*lineage, *index, consensus, next_height,
+                                                                   candidate_time);
+                        switch (evaluated->readiness) {
+                        case node::BridgeBurnReadiness::READY:
+                            status = "READY";
+                            reason.clear();
+                            break;
+                        case node::BridgeBurnReadiness::NOT_READY:
+                            status = "NOT_READY";
+                            reason = evaluated->reason;
+                            break;
+                        case node::BridgeBurnReadiness::UNAVAILABLE:
+                            reason = evaluated->reason;
+                            break;
+                        }
+                    }
+                }
+                gate.pushKV("status", status);
+                if (evaluated && evaluated->readiness == node::BridgeBurnReadiness::NOT_READY) {
+                    gate.pushKV("row", bridge::BurnGateRowName(evaluated->row));
+                }
+                gate.pushKV("reason", reason);
+                if (evaluated) {
+                    gate.pushKV("now_eff", evaluated->now_eff);
+                    if (evaluated->readiness == node::BridgeBurnReadiness::READY && evaluated->closes_at) {
+                        gate.pushKV("closes_at", *evaluated->closes_at);
+                    }
                 }
             }
-            UniValue gate{UniValue::VOBJ};
-            gate.pushKV("status", gate_status);
-            gate.pushKV("reason", gate_reason);
-            gate.pushKV("temporary", true);
-            gate.pushKV("note", "fresh lineage live only; kind 9 gate pending");
             result.pushKV("burn_gate", std::move(gate));
+
+            // Kind 9 observations, the reserve ledger and the sticky conflict
+            // (node changes sections 7.1-7.2, 7.6 and 8.2-8.5).
+            UniValue observations{UniValue::VOBJ};
+            if (index) {
+                for (const uint8_t subject : BRIDGE_V2_OBSERVATION_SUBJECT_LIST) {
+                    if (const auto record{index->LatestObservationV2(subject)}) {
+                        observations.pushKV(ObservationSubjectKey(subject), ObservationRecordJson(*record));
+                    }
+                }
+            }
+            result.pushKV("observations", std::move(observations));
+            if (index) {
+                const bridge::ReserveLedgerV2& ledger{index->ReserveLedgerV2()};
+                UniValue reserve{UniValue::VOBJ};
+                reserve.pushKV("minted", ledger.minted);
+                reserve.pushKV("burned", ledger.burned);
+                reserve.pushKV("credited", ledger.credited);
+                reserve.pushKV("transit", ledger.transit);
+                if (const auto amount{ledger.Reserve()}) reserve.pushKV("reserve", *amount);
+                reserve.pushKV("proven_deposits", static_cast<uint64_t>(index->ProvenDepositsV2().size()));
+                const auto observed{index->LatestObservationV2(bridge::ETH_OBSERVATION_SUBJECT_RESERVE)};
+                const auto* state{observed ? std::get_if<bridge::ReserveStateV2>(&observed->state) : nullptr};
+                if (state) {
+                    // The sums at the observation's cut, as burn check 3 and
+                    // invariant R take them (no deposits pending in a block).
+                    const auto sums{index->ProvenDepositSumsAtV2(state->next_deposit_id)};
+                    if (sums) {
+                        if (const auto margin{bridge::InvariantRMarginV2(state->locked, sums->below_cut, ledger)}) {
+                            reserve.pushKV("invariant_r_margin", *margin);
+                        }
+                        if (const auto terms{bridge::ComputeWindDownTerms(*state, *sums, ledger,
+                                                                          v2.gate.wind_down_margin_ppm)}) {
+                            reserve.pushKV("wind_down_headroom", terms->headroom);
+                        }
+                    }
+                }
+                result.pushKV("reserve", std::move(reserve));
+                if (const auto& conflict{index->ConflictV2()}) {
+                    UniValue c{UniValue::VOBJ};
+                    c.pushKV("reason", BridgeV2ConflictName(conflict->reason));
+                    c.pushKV("height", conflict->height);
+                    c.pushKV("block", conflict->block_hash.GetHex());
+                    c.pushKV("anchor_block", conflict->anchor_block);
+                    result.pushKV("conflict", std::move(c));
+                }
+            }
+            result.pushKV("observation_plan",
+                          ObservationPlanJson(bridge::ObservationPinsFromParams(v2), index));
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan buildbridgeobservationv2()
+{
+    return RPCHelpMan{
+        "buildbridgeobservationv2",
+        "Build the canonical bridge payload of a kind 9 ETH_STATE_OBSERVATION record (node changes\n"
+        "section 8.2) from eth_getProof results, for submitbridgecarrier. Take the subject's accounts and\n"
+        "storage keys from getbridgev2info observation_plan, call eth_getProof(address, slots, block) at\n"
+        "the anchor's execution block for each account, in order, and pass the results unchanged. The node\n"
+        "requires exactly the plan's accounts and keys, verifies every account and storage proof (zero\n"
+        "slots by exclusion) against the retained bridge V2 execution anchor's state root with the pinned\n"
+        "code hashes, records B3's VERIFIER_E verdict for the next block on the fresh lineage projected\n"
+        "from the active tip, and checks the record against the bridge state as the next block would at\n"
+        "the current time, so it refuses a record the mempool would refuse (an anchor not newer than the\n"
+        "subject's latest observation, a stale light client, an unjudgeable verifier). Addresses, slots\n"
+        "and values never travel in the record. Configured only by the regtest-only -b3bridgepins v2\n"
+        "section (every other chain returns an error). No private key is involved.\n",
+        {
+            {"subject", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "1 VERIFIER_E (Verifier V2 slots 0, 1, 2, 4, 6), 2 RESERVE_E (Vault V2 slots 0, 1, 3 and the "
+             "token's balances[vault]) or 3 TOKEN_FLAGS (token slots 0, 10 and isBlackListed[vault])"},
+            {"anchor_hash_evm", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Retained bridge V2 execution anchor carrying a state root, as a raw Ethereum block hash "
+             "(getbridgev2info observation_plan.anchor.hash_evm; optional 0x prefix)"},
+            {"proofs", RPCArg::Type::ARR, RPCArg::Optional::NO,
+             "eth_getProof results at the anchor's block, one per plan account, in plan order; other fields "
+             "of the results are ignored",
+             {
+                 {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "One eth_getProof result",
+                  {
+                      {"address", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The plan account's address"},
+                      {"accountProof", RPCArg::Type::ARR, RPCArg::Optional::NO, "State-trie nodes (1-64)",
+                       {{"node", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "RLP trie node"}}},
+                      {"storageProof", RPCArg::Type::ARR, RPCArg::Optional::NO, "One entry per plan slot, in order",
+                       {
+                           {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
+                            {
+                                {"key", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The plan slot (32 bytes, or a shorter quantity)"},
+                                {"proof", RPCArg::Type::ARR, RPCArg::Optional::NO, "Storage-trie nodes (0-64)",
+                                 {{"node", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "RLP trie node"}}},
+                            }},
+                       }},
+                  }},
+             }},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Kind 9 record",
+                  {
+                      {RPCResult::Type::STR_HEX, "payload_hex", "Canonical type-10 v1 bridge payload for submitbridgecarrier"},
+                      {RPCResult::Type::NUM, "subject", "Kind 9 subject number"},
+                      {RPCResult::Type::STR, "name", "VERIFIER_E, RESERVE_E or TOKEN_FLAGS"},
+                      {RPCResult::Type::NUM, "verdict", "Recorded verdict: for a LIVE VERIFIER_E, B3's bit 0 SETS_MISMATCH (E4) and bit 1 CERT_CONFLICT (E5, which sets the sticky conflict when the record connects); otherwise 0"},
+                      {RPCResult::Type::NUM, "anchor_block", "Ethereum execution block of the anchor"},
+                      {RPCResult::Type::STR_HEX, "anchor_hash_evm", "The anchor's hash (raw bytes)"},
+                      {RPCResult::Type::NUM, "t_obs", "The anchor's execution timestamp, the observation time the gate ages"},
+                      {RPCResult::Type::NUM, "next_height", "B3 height the record was checked for"},
+                      {RPCResult::Type::OBJ, "values", "Decoded storage values and observed code hashes (the fields of the subject)",
+                       ObservedValueResults(std::nullopt)},
+                  }},
+        RPCExamples{HelpExampleCli("buildbridgeobservationv2",
+                                   "2 \"0x<anchor_hash>\" '[{\"address\":\"0x<vault>\",\"accountProof\":[\"0x<node>\"],"
+                                   "\"storageProof\":[{\"key\":\"0x<slot>\",\"proof\":[\"0x<node>\"]}]}, ...]'")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            const Consensus::BridgeV2Params& v2{EnsureBridgeV2Configured(consensus)};
+            if (!v2.Valid()) {
+                throw JSONRPCError(RPC_MISC_ERROR, "The bridge V2 configuration is incomplete; kind 9 records stay inactive");
+            }
+            const int64_t subject_number{request.params[0].getInt<int64_t>()};
+            if (subject_number < bridge::ETH_OBSERVATION_SUBJECT_VERIFIER ||
+                subject_number > bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "subject must be 1 (VERIFIER_E), 2 (RESERVE_E) or 3 (TOKEN_FLAGS)");
+            }
+            const uint8_t subject{static_cast<uint8_t>(subject_number)};
+            const uint256 anchor_hash{ParseEvmHash(request.params[1], "anchor_hash_evm")};
+            const bridge::ObservationPins pins{bridge::ObservationPinsFromParams(v2)};
+            const std::vector<bridge::ObservationAccountRequest> plan{bridge::ObservationRequests(subject, pins)};
+            bridge::BridgeEthStateObservationV2 observation;
+            observation.subject = subject;
+            observation.anchor_hash = anchor_hash;
+            observation.accounts = ParseObservationProofs(request.params[2], plan);
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            if (tip == nullptr) throw JSONRPCError(RPC_MISC_ERROR, "The active chain has no tip");
+            const int next_height{tip->nHeight + 1};
+            if (!consensus.BridgeV2RulesActive(next_height)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   strprintf("Kind 9 records are not active for the next block (height %d; bridge V2 "
+                                             "activation height %d)",
+                                             next_height, v2.activation_height));
+            }
+            node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
+            if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) {
+                throw JSONRPCError(RPC_MISC_ERROR, "The bridge state is unavailable at the active tip");
+            }
+            const node::BridgeStateIndex& index{tracker.Index()};
+            const auto anchor{index.AnchorV2(anchor_hash)};
+            if (!anchor) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "anchor_hash_evm is not a retained bridge V2 execution anchor on the active chain");
+            }
+            if (anchor->state_root.IsNull()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "The anchor's execution header carried no state root");
+            }
+            std::string error;
+            const auto observed{bridge::VerifyEthStateObservationV2(observation, anchor->state_root, pins, error)};
+            if (!observed) {
+                throw JSONRPCError(RPC_VERIFY_ERROR, "The proofs do not verify against the anchor: " + error);
+            }
+
+            // The fresh lineage projected for the next block, as mempool
+            // admission builds it for every kind 9 record.
+            const auto lineage{node::MakeBridgeV2LineageContext(chainstate.ModernFinality(), chainstate.m_chain,
+                                                                chainstate.m_blockman, consensus, *tip, index,
+                                                                error)};
+            if (!lineage) {
+                throw JSONRPCError(RPC_MISC_ERROR, "The fresh finality lineage is unavailable at the active tip: " + error);
+            }
+            const auto* verifier{std::get_if<bridge::VerifierStateV2>(&*observed)};
+            if (verifier && verifier->status == bridge::VERIFIER_STATUS_LIVE) {
+                const auto verdict{node::VerifierVerdictV2(*verifier, *lineage, consensus, index, next_height, error)};
+                if (!verdict) {
+                    throw JSONRPCError(RPC_VERIFY_ERROR, "B3 cannot judge this VERIFIER_E observation: " + error);
+                }
+                observation.verdict = *verdict;
+            }
+
+            const bridge::BridgeRecordV1 record{bridge::BridgeRecordKindV1::ETH_STATE_OBSERVATION, observation};
+            const auto mpa{bridge::MakeBridgeMpaRecord(record, bridge::BRIDGE_MPT_LIMITS_V2)};
+            const auto binding{mpa ? modern::MakeBridgeBindingOutput(*mpa) : std::nullopt};
+            if (!mpa || !binding) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "The proofs exceed the kind 9 record limits (64 nodes of at most 1,024 bytes and "
+                                   "11,264 bytes per node list; 32 KiB per record)");
+            }
+            // The bridge state's own verdict for the next block, as wallet
+            // prevalidation runs it: a carrier-shaped probe with the binding
+            // output (its input is never looked up).
+            CMutableTransaction probe;
+            probe.version = CTransaction::CURRENT_VERSION;
+            probe.vin.resize(1);
+            probe.vin[0].prevout = COutPoint{Txid::FromUint256(uint256::ONE), 0};
+            probe.vout = {*binding};
+            probe.mpa = {*mpa};
+            const int64_t candidate_time{std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
+            node::BridgeTxAuthorization authorization;
+            if (!index.VerifyTransaction(CTransaction{probe}, next_height, candidate_time, consensus, authorization,
+                                         error, &*lineage)) {
+                throw JSONRPCError(RPC_VERIFY_REJECTED, "The next block would refuse this observation: " + error);
+            }
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("payload_hex", HexStr(mpa->payload));
+            result.pushKV("subject", int{subject});
+            result.pushKV("name", ObservationSubjectName(subject));
+            result.pushKV("verdict", int{observation.verdict});
+            result.pushKV("anchor_block", anchor->block_number);
+            result.pushKV("anchor_hash_evm", EvmHex(anchor->block_hash));
+            result.pushKV("t_obs", static_cast<int64_t>(anchor->execution_timestamp));
+            result.pushKV("next_height", next_height);
+            result.pushKV("values", ObservedValuesJson(*observed));
             return result;
         },
     };
@@ -6260,6 +6917,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getfinalitylineage},
         {"blockchain", &getfinalitylineagecertificate},
         {"blockchain", &getbridgev2info},
+        {"blockchain", &buildbridgeobservationv2},
         {"blockchain", &getbridgewithdrawalproofv2},
         {"hidden", &getfinalitylineagevotes},
         {"hidden", &submitfinalitylineagevote},

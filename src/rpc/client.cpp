@@ -184,6 +184,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getbridgewithdrawalproofv2", 0, "txid", ParamFormat::STRING },
     { "getbridgewithdrawalproofv2", 1, "burn_vout" },
     { "getbridgewithdrawalproofv2", 2, "certificate_block", ParamFormat::JSON_OR_STRING },
+    { "buildbridgeobservationv2", 0, "subject" },
+    { "buildbridgeobservationv2", 2, "proofs" },
     { "getfinalityset", 0, "epoch" },
     { "getfinalityset", 1, "offset" },
     { "getfinalityset", 2, "count" },
