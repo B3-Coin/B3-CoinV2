@@ -1,4 +1,4 @@
-# B3 Bridge V2: owner rulings of 2026-10-03/04
+# B3 Bridge V2: owner rulings of 2026-10-03 to 10-05
 
 > Record of explicit project-owner decisions given in conversation with
 > Claude on 2026-10-03 and 2026-10-04, quoted verbatim. Committed on
@@ -21,6 +21,7 @@
 | R6 | As decentralized as possible; signers, if any, rotate | "to make it fully decentralise d"; "what I mean signers can be rotated" |
 | R7 | An overcollateralized coin, if built, is a separate product with another name | "we can also make it but we will call it something else not bUSD" |
 | R8 | Proceed with stage S3 (fresh finality lineage, contracts V2, node core slice, regtest RT4) on Claude's own branch; this explicitly overrides CLAUDE.md rule 3 ("Modern PoS ... do not replace or redesign it") and the no-consensus-change line (`CLAUDE.md:12-13`) for that work and for the H1/H2 chain-health fix | "go S3" (answering: "Reply go S3 and I'll record your decision in a commit and start building" after "It changes B3's finality rules, so I need your OK to override CLAUDE.md rule 3. That OK also covers the H1 producer fix.") |
+| R9 | (2026-10-05) The K_OF_N bootstrap attestation must bind the Verifier V2 contract address and the EVM chain id, so a bootstrap signature cannot be replayed on another deployment or chain (open issue OI-12) | "yes OI-12" (answering: "bind the 4-key start message to the contract and chain (OI-12); I recommend yes") |
 
 Earlier standing authorization (owner memory, 2026-09-30/10-03): commit to
 Claude's own branch `feat/flowmeshV2-dev-claude`; never push; the owner
