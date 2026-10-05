@@ -99,6 +99,8 @@ EXTENDED_SCRIPTS = [
     'feature_b3_fresh_lineage.py',
     # Bridge V2 first round trip (anvil + forge --offline + B3_BRIDGE_TOOLS).
     'feature_b3_bridge_rt4a_round_trip.py',
+    # Bridge V2 with the K_OF_N bootstrap and the full burn gate (as RT4a).
+    'feature_b3_bridge_rt4_kofn_gate.py',
 ]
 
 # Special script to run each bench sanity check

@@ -356,8 +356,21 @@ class Anvil:
         return keccak256(self.code(address, block))
 
     def get_proof(self, address, slots, block="latest"):
-        keys = ["0x" + int(slot).to_bytes(32, "big").hex() for slot in slots]
-        return self.rpc("eth_getProof", normalize_address(address), keys, block_tag(block))
+        """eth_getProof (EIP-1186) for address and storage slots at block.
+
+        A slot is an int, 32 raw bytes or a 0x-prefixed 32-byte word (as
+        getbridgev2info's observation_plan lists them).
+        """
+        def key(slot):
+            if isinstance(slot, (bytes, bytearray)):
+                assert len(slot) == 32, "a storage key is 32 bytes"
+                return "0x" + bytes(slot).hex()
+            if isinstance(slot, str):
+                return "0x" + from_hex(slot).rjust(32, b"\0").hex()
+            return "0x" + int(slot).to_bytes(32, "big").hex()
+
+        return self.rpc("eth_getProof", normalize_address(address), [key(slot) for slot in slots],
+                        block_tag(block))
 
 
 class ArchiveCodeProxy:

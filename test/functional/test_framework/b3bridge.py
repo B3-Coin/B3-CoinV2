@@ -27,7 +27,13 @@ REGTEST ONLY. This module provides:
   V2 AssetId, leaf V2 and the V2 withdrawal tree, the -b3bridgepins v2
   writer, Verifier V2 / Vault V2 calldata encoders, a DeployV2.s.sol
   runner and FreshVoteShuttle (the fresh-lineage vote relay between
-  validators, which have no P2P transport for those votes yet).
+  validators, which have no P2P transport for those votes yet);
+- bridge V2 (second node slice, RT4): the OI-12 K_OF_N bootstrap message
+  and K_OF_N initialize calldata, a runner of the REGTEST ONLY
+  b3-bridge-regtest-certify tool, the kind 9 observation plan, a one-shot
+  run of contrib/b3bridge/b3_bridge_observe_v2.py, a light-client update
+  to the anvil head, mining under either clock and a fresh-finality lag
+  shuttle for the V2 burn gate (row C3).
 
 The relayer module is imported only as a library; its main() is never
 called in-process, only as an unchanged subprocess by run_relayer_once().
@@ -35,6 +41,7 @@ Nothing in this module contacts a non-local endpoint.
 """
 
 from collections import Counter, namedtuple
+import copy
 import hashlib
 import json
 import os
@@ -721,7 +728,7 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
                                  min_bridge_validators=4, max_bridge_validators=64,
                                  min_bridge_total_weight=4, horizon_epochs=1024,
                                  gvr=REGTEST_GVR, fork_version=REGTEST_FORK_VERSION,
-                                 check=True):
+                                 verifier_max_epoch_lag=None, check=True):
     """Write a -b3bridgepins file holding only a v2 section; return its JSON.
 
     The file must exist before the validators first start (OI-3), when the
@@ -744,6 +751,10 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
     zero and vault/verifier other than the deployer's CREATE addresses at
     nonces 2/1. check=False writes the file anyway, for node-refusal tests.
     caps may set max_per_block and/or max_per_epoch (node defaults 1e10).
+    verifier_max_epoch_lag is the Verifier V2 MAX_EPOCH_LAG DeployV2 will use
+    (default: profile R's GATE_R_SET_EXPIRY, DeployV2's R_MAX_EPOCH_LAG); the
+    node requires it to equal its burn gate's set expiry, and the writer
+    refuses any other value first.
     """
     assert os.path.isabs(path), "-b3bridgepins needs an absolute path"
     caps = dict(caps or {})
@@ -783,6 +794,11 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
                f"({block_cap}) <= max_per_epoch ({epoch_cap}) <= MAX_MONEY (check 1)")
     if not (4 <= min_bridge_validators <= max_bridge_validators <= 64 and min_bridge_total_weight > 0):
         refuse("need 4 <= min_bridge_validators <= max_bridge_validators <= 64 and a non-zero weight")
+    if verifier_max_epoch_lag is None:
+        verifier_max_epoch_lag = GATE_R_SET_EXPIRY
+    if verifier_max_epoch_lag != GATE_R_SET_EXPIRY:
+        refuse(f"verifier_max_epoch_lag {verifier_max_epoch_lag} is not the regtest gate's set expiry "
+               f"{GATE_R_SET_EXPIRY} (DeployV2 R_MAX_EPOCH_LAG)")
 
     def rpc(method, *params):
         return local_json_rpc(_anvil_url(anvil), method, list(params))
@@ -822,6 +838,7 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
         "max_bridge_validators": max_bridge_validators,
         "min_bridge_total_weight": min_bridge_total_weight,
         "activation_height": activation_height,
+        "verifier_max_epoch_lag": verifier_max_epoch_lag,
     }
     if burn_height is not None:
         v2["burn_height"] = burn_height
@@ -926,19 +943,33 @@ def encode_submit_certificate(cert, ancestry_path=None):
     ])
 
 
+def _encode_verifier_v2_initialize(fb, signing_set, start_set, successor, leaf0_path, proof):
+    return selector(VERIFIER_V2_INITIALIZE_SIGNATURE) + _abi_encode_args([
+        (False, fb_v2_abi_words(fb)),
+        (True, encode_set_header_tuple(signing_set)),
+        (True, encode_set_header_tuple(start_set)),
+        (True, encode_set_header_tuple(successor)),
+        (False, _path_words(leaf0_path)),
+        (True, abi_bytes_tail(proof)),
+    ])
+
+
 def encode_verifier_v2_initialize(cert):
     """START_CERTIFICATE initialize calldata from a getfinalitylineagecertificate
     result: signingSet = startSet = the certificate's signing set (the pinned
     start set signs its own statement), its successor and leaf0Path."""
-    signing = encode_set_header_tuple(cert["signing_set"])
-    return selector(VERIFIER_V2_INITIALIZE_SIGNATURE) + _abi_encode_args([
-        (False, fb_v2_abi_words(cert["encoded"])),
-        (True, signing),
-        (True, signing),
-        (True, encode_set_header_tuple(cert["successor_set"])),
-        (False, _path_words(cert["history"]["leaf0_path"])),
-        (True, abi_bytes_tail(cert["proof"])),
-    ])
+    return _encode_verifier_v2_initialize(cert["encoded"], cert["signing_set"], cert["signing_set"],
+                                          cert["successor_set"], cert["history"]["leaf0_path"], cert["proof"])
+
+
+def encode_verifier_v2_initialize_kofn(fb, bootstrap_header, start_set, successor, leaf0_path, proof):
+    """K_OF_N initialize calldata (contracts spec §5 step 3): signingSet is
+    the pinned bootstrap header and proof the 3-of-4 attestation over
+    bootstrap_attestation_digest_v2 (b3-bridge-regtest-certify bootstrap);
+    startSet (Set'_k), successor and leaf0Path come from B3's epoch-k
+    certificate (getfinalitylineagecertificate). Set headers are RPC or tool
+    set objects."""
+    return _encode_verifier_v2_initialize(fb, bootstrap_header, start_set, successor, leaf0_path, proof)
 
 
 def encode_withdrawal_v2_tuple(withdrawal_id, recipient, amount, b3_height):
@@ -949,6 +980,169 @@ def encode_vault_v2_release(withdrawal_id, recipient, amount, b3_height, path):
     """B3VaultV2.release(w, path) calldata (4 + 36 * 32 bytes)."""
     return (selector(VAULT_V2_RELEASE_SIGNATURE) +
             encode_withdrawal_v2_tuple(withdrawal_id, recipient, amount, b3_height) + _path_words(path))
+
+
+# -- K_OF_N bootstrap attestation (OI-12, owner ruling R9; contracts spec §5) --
+# Derived here independently of B3TypesV2.bootstrapMessage and
+# src/bridge/bootstrap_v2.h; bridge_v2_vectors.json pins all three.
+BRIDGE_BOOTSTRAP_V2_TAG = "B3/BRIDGE/BOOTSTRAP/V2"
+BRIDGE_BOOTSTRAP_V2_MESSAGE_SIZE = 301
+VERIFIER_V2_BOOTSTRAP_DIGEST_SIGNATURE = f"bootstrapDigestOf({FB_V2_TUPLE})"
+REGTEST_CERTIFY_TOOL = "b3-bridge-regtest-certify"
+
+
+def bootstrap_attestation_message_v2(domain, evm_chain_id, verifier, start_set_hash, fb):
+    """The 301-byte K_OF_N bootstrap message: chainDomain || u256 evmChainId ||
+    verifier || startSetHash || FinalizedBlockV2 (OI-12: a signature binds one
+    deployment on one chain and its start set)."""
+    encoded = fb["encoded"] if isinstance(fb, dict) else hx(fb)
+    assert_equal(len(encoded), FINALIZED_BLOCK_V2_SIZE)
+    message = (enc_bytes32(domain) + enc_uint(evm_chain_id) + hx(normalize_address(verifier)) +
+               enc_bytes32(start_set_hash) + encoded)
+    assert_equal(len(message), BRIDGE_BOOTSTRAP_V2_MESSAGE_SIZE)
+    return message
+
+
+def bootstrap_attestation_digest_v2(domain, evm_chain_id, verifier, start_set_hash, fb):
+    """sha256(tag || tag || message), tag = sha256("B3/BRIDGE/BOOTSTRAP/V2")."""
+    return TaggedHash(BRIDGE_BOOTSTRAP_V2_TAG,
+                      bootstrap_attestation_message_v2(domain, evm_chain_id, verifier, start_set_hash, fb))
+
+
+class RegtestCertifyError(AssertionError):
+    """b3-bridge-regtest-certify refused (exit 1); .message is its error text."""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(f"b3-bridge-regtest-certify refused: {message}")
+
+
+_REGTEST_CERTIFY_RUNS = Counter()
+
+
+def regtest_certify(tool, mode, input=None, *, workdir=None, args=(), timeout=300):
+    """Run the REGTEST ONLY certificate tool once and return its JSON output.
+
+    mode is bootstrap-set, keys (args: --label L --count N), bootstrap or
+    certify; input (a dict) is written to <workdir>/<mode>-<n>.json for the
+    last two. The tool never takes a secret key and refuses every chain
+    domain but the -b3modernregtest one and every EVM chain id but 31337. A
+    refusal raises RegtestCertifyError carrying its message.
+    """
+    command = [tool, mode, *args]
+    if input is not None:
+        assert workdir is not None, "an input file needs a workdir"
+        os.makedirs(workdir, exist_ok=True)
+        _REGTEST_CERTIFY_RUNS[mode] += 1
+        path = os.path.join(workdir, f"{mode}-{_REGTEST_CERTIFY_RUNS[mode]}.json")
+        with open(path, "w", encoding="utf8") as f:
+            json.dump(input, f, indent=2, sort_keys=True, default=_json_default)
+            f.write("\n")
+        command.append(path)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout,
+                            stdin=subprocess.DEVNULL, env=_local_process_env())
+    if result.returncode != 0:
+        message = result.stderr.strip()
+        assert_equal(result.returncode, 1)
+        assert message.startswith("error: "), message
+        raise RegtestCertifyError(message[len("error: "):])
+    output = json.loads(result.stdout)
+    assert_equal(output["test_keys_only"], True)
+    return output
+
+
+# -- kind 9 ETH_STATE_OBSERVATION and the V2 burn gate (node changes §8) ------
+OBSERVE_V2_SCRIPT = str(B3BRIDGE_CONTRIB_DIR / "b3_bridge_observe_v2.py")
+ETH_OBSERVATION_SUBJECTS = {1: "VERIFIER_E", 2: "RESERVE_E", 3: "TOKEN_FLAGS"}
+ETH_OBSERVATION_KEYS = {1: "verifier_e", 2: "reserve_e", 3: "token_flags"}
+# Byte of the verdict in a kind 9 payload: kind, reserved, subject, anchor hash.
+ETH_OBSERVATION_VERDICT_OFFSET = 35
+ETH_OBSERVATION_VERDICT_SETS_MISMATCH = 0x01
+# Consensus::BridgeV2GateParams::RegtestProfileR() (mainnet / 36). The set
+# expiry is also DeployV2's profile R MAX_EPOCH_LAG (R_MAX_EPOCH_LAG).
+GATE_R_SET_EXPIRY = 72_000
+GATE_R_RELEASE_MARGIN = 16_800
+GATE_R_BURN_MARGIN = 2_400
+GATE_R_ROTATION_AGE_LIMIT = GATE_R_SET_EXPIRY - GATE_R_RELEASE_MARGIN - GATE_R_BURN_MARGIN
+GATE_R_OBSERVATION_MAX_AGE = 4_800
+GATE_R_MAX_FINALITY_LAG = 30
+GATE_R_MEMPOOL_CLOSE_MARGIN = 100
+# Verifier V2 slots 0, 1, 2, 4, 6; Vault V2 slots 0, 1, 3; Tether slots 0, 10
+# and the balances (2) and isBlackListed (6) mappings (contracts spec §3.2,
+# §6.6; storage_layout_v2 in bridge_v2_vectors.json).
+VERIFIER_V2_OBSERVED_SLOTS = (0, 1, 2, 4, 6)
+VAULT_V2_OBSERVED_SLOTS = (0, 1, 3)
+TOKEN_SLOT_OWNER_PAUSED = 0
+TOKEN_SLOT_BALANCES = 2
+TOKEN_SLOT_IS_BLACK_LISTED = 6
+TOKEN_SLOT_UPGRADED_DEPRECATED = 10
+
+
+def observation_plan_v2(verifier, vault, token):
+    """{subject: [(address, [32-byte storage keys])]}: getbridgev2info's
+    observation_plan derived independently (src/bridge/state_observation.h)."""
+    vault_word = enc_address(vault)
+    return {
+        1: [(normalize_address(verifier), [enc_uint(s) for s in VERIFIER_V2_OBSERVED_SLOTS])],
+        2: [(normalize_address(vault), [enc_uint(s) for s in VAULT_V2_OBSERVED_SLOTS]),
+            (normalize_address(token), [enc_uint(mapping_slot(vault_word, TOKEN_SLOT_BALANCES))])],
+        3: [(normalize_address(token), [enc_uint(TOKEN_SLOT_OWNER_PAUSED), enc_uint(TOKEN_SLOT_UPGRADED_DEPRECATED),
+                                        enc_uint(mapping_slot(vault_word, TOKEN_SLOT_IS_BLACK_LISTED))])],
+    }
+
+
+def tamper_observation_verdict(payload_hex, flip=ETH_OBSERVATION_VERDICT_SETS_MISMATCH):
+    """A kind 9 payload with verdict bits flipped (still canonical and decodable)."""
+    payload = bytearray(hx(payload_hex))
+    assert_equal(payload[0], 9)
+    payload[ETH_OBSERVATION_VERDICT_OFFSET] ^= flip
+    return bytes(payload).hex()
+
+
+class ObserverRunError(AssertionError):
+    """b3_bridge_observe_v2.py refused (exit 1); .message is its error text."""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(f"b3_bridge_observe_v2.py refused: {message}")
+
+
+def run_observer_once(node, wallet, ethereum_url, subjects=(1, 2, 3), *, dry_run=False, timeout=600):
+    """Run contrib/b3bridge/b3_bridge_observe_v2.py once as a subprocess.
+
+    It reads getbridgev2info.observation_plan from node, calls eth_getProof
+    on the local anvil at the plan's anchor, builds each subject's kind 9
+    record with buildbridgeobservationv2 and, unless dry_run, submits it
+    with the wallet's submitbridgecarrier. Returns its stdout JSON; a refusal
+    raises ObserverRunError.
+    """
+    b3_url, auth = b3_rpc_endpoint(node)
+    command = [sys.executable, "-B", OBSERVE_V2_SCRIPT,
+               "--ethereum-rpc", assert_local_url(ethereum_url),
+               "--b3-rpc-url", b3_url, *auth,
+               "--subjects", ",".join(str(subject) for subject in subjects)]
+    if dry_run:
+        command.append("--dry-run")
+    else:
+        command += ["--wallet", wallet]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout,
+                            stdin=subprocess.DEVNULL, env=_local_process_env())
+    if result.returncode != 0:
+        message = result.stderr.strip()
+        assert message.startswith("error: "), message
+        raise ObserverRunError(message[len("error: "):])
+    output = json.loads(result.stdout)
+    assert_equal([o["subject"] for o in output["observations"]], sorted(set(subjects)))
+    assert_equal(output["dry_run"], dry_run)
+    return output
+
+
+def gate_view(info):
+    """getbridgev2info without burn_gate.now_eff, which follows each node's
+    clock (max(now, MTP + 1)) and so differs between two calls."""
+    view = copy.deepcopy(info)
+    view.get("burn_gate", {}).pop("now_eff", None)
+    return view
 
 
 # -- DeployV2.s.sol (contracts/script, regtest only) ---------------------------
@@ -1469,12 +1663,16 @@ class B3BridgeChainMixin:
         for txid in all_txids:
             source = next(node for node, pool in zip(nodes, pools) if txid in pool)
             try:
-                transactions[txid] = source.getrawtransaction(txid)
-                dependencies[txid] = set(source.getmempoolentry(txid)["depends"])
+                raw = source.getrawtransaction(txid)
+                depends = set(source.getmempoolentry(txid)["depends"])
             except JSONRPCException:
                 if txid in source.getrawmempool():
                     raise
                 continue
+            # Record a transaction only once both reads succeeded: one mined
+            # between them must not be left without its dependencies.
+            transactions[txid] = raw
+            dependencies[txid] = depends
             sources[txid] = source
 
         ordered = []
@@ -1706,6 +1904,116 @@ class B3BridgeChainMixin:
         self.evidence_step(label, getattr(self, "anvil", None), txid=txid, mined_height=height)
         return txid, height
 
+    # -- bridge V2: certificate tool, light-client head, kind 9 ----------------
+    def regtest_certify(self, mode, input=None, args=()):
+        """regtest_certify() with this build's tool and a tmpdir workdir."""
+        return regtest_certify(self.bridge_tool(REGTEST_CERTIFY_TOOL), mode, input,
+                               workdir=os.path.join(self.options.tmpdir, "regtest_certify"), args=args)
+
+    @staticmethod
+    def mined_height(node, txid, first_height):
+        """Height of txid in node's active chain at or above first_height, or None."""
+        for height in range(first_height, node.getblockcount() + 1):
+            if txid in node.getblock(node.getblockhash(height))["tx"]:
+                return height
+        return None
+
+    def mine_txids(self, txids, first_height, timeout=300):
+        """Mine txids (already in a mempool) and leave the validators frozen.
+
+        With the real clock (mock_time 0) the validators stake until each
+        txid is in a block every running node agrees on. Under mock time
+        (set_chain_time) one block at a time is produced with
+        mine_pos_blocks_mocktime(), relaying fresh-lineage votes in between
+        when the test has a FreshVoteShuttle. Returns the containing heights
+        in txid order.
+        """
+        self.synchronize_mempools()
+        if not getattr(self, "mock_time", 0):
+            self.resume()
+            heights = [self.wait_mined(txid, first_height=first_height, timeout=timeout) for txid in txids]
+            self.freeze()
+            return heights
+        n0, deadline = self.nodes[0], time.time() + timeout
+        shuttle = getattr(self, "shuttle_fresh_votes", None)
+        while True:
+            heights = [self.mined_height(n0, txid, first_height) for txid in txids]
+            if all(height is not None for height in heights):
+                self.freeze()
+                return heights
+            if time.time() >= deadline:
+                raise AssertionError(f"not mined under mock time within {timeout} s: {txids}")
+            self.mine_pos_blocks_mocktime(1, allow_overshoot=True)
+            if shuttle is not None:
+                shuttle()
+
+    def update_light_client_to_head(self, node=None, label="V2 light client finalizes the anvil head"):
+        """Finalize anvil's newest block on the bridge V2 light client.
+
+        Mines one anvil block (the attested successor of the block finalized),
+        builds the synthetic sync-committee update with the mock beacon
+        (self.beacon over self.anvil) and mines it through node's
+        submitbridgecarrier, so its execution anchor, with that block's state
+        root, is the newest one a kind 9 observation can name. The update must
+        stay in the store's sync-committee period: crossing one needs rotation
+        updates, which no bridge V2 test makes yet. Appends {"finalized_block",
+        "finalized_hash", "timestamp", "height", "txid"} to
+        self.light_client_updates_v2 and returns it; the validators stay frozen.
+        """
+        node = node or self.nodes[0]
+        anvil, beacon = self.anvil, self.beacon
+        self.freeze()
+        light = node.getbridgev2info()["light_client"]
+        assert light["bootstrapped"], "the V2 light client is not bootstrapped"
+        anvil.mine(1)
+        finalized = anvil.block_number() - 1
+        assert finalized > light["finalized_execution_block"], "no new anvil block to finalize"
+        assert beacon.slot(finalized) % PERIOD_SLOTS <= PERIOD_SLOTS - 3, "the update would leave its period"
+        assert_equal(beacon.period_of_block(finalized), light["period"])
+        header = anvil.block(finalized)
+        update = beacon.update(finalized)
+        assert_equal((update["finalized_block"], hx(update["finalized_block_hash"])),
+                     (finalized, hx(header["hash"])))
+        first_height = node.getblockcount() + 1
+        submitted = node.submitbridgecarrier(update["payload_hex"])
+        assert_equal(submitted["record_kind"], "update")
+        height, = self.mine_txids([submitted["txid"]], first_height)
+        for running in self.bridge_nodes():
+            lc = running.getbridgev2info()["light_client"]
+            assert_equal((lc["finalized_execution_block"], hx(lc["finalized_execution_hash"])),
+                         (finalized, hx(header["hash"])))
+            assert_equal(lc["connected_height"], height)
+        record = {"finalized_block": finalized, "finalized_hash": header["hash"],
+                  "timestamp": int(header["timestamp"], 16), "height": height, "txid": submitted["txid"]}
+        if not hasattr(self, "light_client_updates_v2"):
+            self.light_client_updates_v2 = []
+        self.light_client_updates_v2.append(record)
+        self.evidence_step(label, anvil, **record)
+        return record
+
+    def submit_observations_v2(self, node=None, anvil=None, subjects=(1, 2, 3), wallet=None,
+                               label="kind 9 observations mined"):
+        """Run contrib/b3bridge/b3_bridge_observe_v2.py once and mine its carriers.
+
+        The observer proves each subject at observation_plan's anchor (the
+        newest retained V2 anchor with a state root) against anvil and
+        submits the records from node's wallet. Returns its output with each
+        observation's mined_height; the validators stay frozen.
+        """
+        node = node or self.nodes[0]
+        anvil = anvil or self.anvil
+        self.freeze()
+        first_height = node.getblockcount() + 1
+        output = run_observer_once(node, wallet or self.default_wallet_name, _anvil_url(anvil), subjects)
+        txids = [observation["txid"] for observation in output["observations"]]
+        for observation, height in zip(output["observations"], self.mine_txids(txids, first_height)):
+            observation["mined_height"] = height
+        self.evidence_step(label, anvil, anchor=output["anchor"],
+                           observations=[{key: observation[key] for key in
+                                          ("name", "verdict", "txid", "mined_height", "payload_bytes")}
+                                         for observation in output["observations"]])
+        return output
+
 
 class FreshVoteShuttle:
     """Fresh-lineage (digest V2) vote relay for a B3BridgeChainMixin test.
@@ -1772,6 +2080,46 @@ class FreshVoteShuttle:
     @staticmethod
     def fresh_finalized_height(node):
         return (node.getfinalitylineage().get("finalized") or {}).get("height", -1)
+
+    def fresh_finality_lags(self):
+        """tip - fresh finalized height of every validator (None: nothing finalized)."""
+        lags = []
+        for node in self.bridge_validators():
+            finalized = self.fresh_finalized_height(node)
+            lags.append(node.getblockcount() - finalized if finalized >= 0 else None)
+        return lags
+
+    def shuttle_fresh_until_lag(self, max_lag, timeout=300):
+        """Relay fresh votes until every validator's tip is at most max_lag
+        blocks above its fresh finalized checkpoint; leave them frozen.
+
+        A V2 burn is judged with candidate height - finalized <=
+        max_finality_lag_blocks (gate row C3; 30 on profile R), so callers
+        leave a margin for the blocks until it is mined. With the real clock
+        the validators stake meanwhile; under mock time (set_chain_time) one
+        block at a time is produced. Returns the lags.
+        """
+        def within():
+            return all(lag is not None and lag <= max_lag for lag in self.fresh_finality_lags())
+
+        deadline = time.time() + timeout
+        while True:
+            if getattr(self, "mock_time", 0):
+                self.shuttle_fresh_votes()
+                if within():
+                    self.freeze()
+                    break
+                self.mine_pos_blocks_mocktime(1, allow_overshoot=True)
+            else:
+                self.resume()
+                self.shuttle_until(within, timeout=max(1, deadline - time.time()))
+                self.freeze()
+                # A block staked after the last check can raise the lag again.
+                if within():
+                    break
+            if time.time() >= deadline:
+                raise AssertionError(f"fresh finality lag above {max_lag}: {self.fresh_finality_lags()}")
+        return self.fresh_finality_lags()
 
     def fresh_certificates(self, node, first, last=None):
         """Every type-11 carrier in blocks first..last (default tip) of node.
@@ -1905,6 +2253,8 @@ class TestFrameworkB3BridgeGuards(unittest.TestCase):
         self.assert_v2_pins_refused(regtest, "min_bridge_validators", min_bridge_validators=3)
         self.assert_v2_pins_refused(regtest, "min_bridge_validators", max_bridge_validators=65)
         self.assert_v2_pins_refused(regtest, "non-zero weight", min_bridge_total_weight=0)
+        self.assert_v2_pins_refused(regtest, "is not the regtest gate's set expiry",
+                                    verifier_max_epoch_lag=GATE_R_SET_EXPIRY - 1)
         for url in ("https://ethereum-rpc.example.invalid", "http://10.0.0.1:8545"):
             with tempfile.TemporaryDirectory() as tmp, \
                     self.assertRaisesRegex(AssertionError, "Refusing non-local endpoint"):
@@ -1963,3 +2313,74 @@ class TestFrameworkB3BridgeGuards(unittest.TestCase):
         self.assertEqual(init[4 + 12 * 32:4 + 13 * 32], b"\x44" * 32)  # leaf0Path after three offsets
         release = encode_vault_v2_release(0, self.ADDRESSES[0], 10, 281, [bytes(32)] * 32)
         self.assertEqual(len(release), 4 + 36 * 32)
+
+    def test_v2_bootstrap_attestation_matches_shared_vectors(self):
+        """OI-12: the harness's 301-byte K_OF_N message and digest equal the
+        contracts' and the C++ tool's (bootstrap_attestation_v2 vectors)."""
+        with open(SRCDIR / "contracts" / "test" / "vectors" / "bridge_v2_vectors.json", encoding="utf8") as f:
+            vectors = json.load(f)
+        self.assertEqual(hashlib.sha256(BRIDGE_BOOTSTRAP_V2_TAG.encode()).digest(),
+                         hx(vectors["tags"]["bootstrap_v2"]))
+        digests = set()
+        for v in vectors["bootstrap_attestation_v2"]:
+            args = (v["chain_domain"], v["evm_chain_id"], v["verifier"], v["start_set_hash"], v["fb_encoded"])
+            self.assertEqual(bootstrap_attestation_message_v2(*args), hx(v["message"]))
+            self.assertEqual(bootstrap_attestation_digest_v2(*args), hx(v["digest"]))
+            digests.add(v["digest"])
+            # Each bound field changes the digest (no replay across them).
+            for i, other in ((1, v["evm_chain_id"] + 1), (2, "0x" + "99" * 20), (3, "0x" + "98" * 32)):
+                changed = list(args)
+                changed[i] = other
+                self.assertNotEqual(bootstrap_attestation_digest_v2(*changed), hx(v["digest"]))
+        self.assertEqual(len(digests), len(vectors["bootstrap_attestation_v2"]))
+        # The bootstrap tag differs from digest V2's, so neither statement
+        # can stand in for the other.
+        self.assertNotEqual(vectors["tags"]["bootstrap_v2"], vectors["tags"]["finality_v2"])
+
+    def test_v2_observation_plan_matches_shared_vectors(self):
+        with open(SRCDIR / "contracts" / "test" / "vectors" / "bridge_v2_vectors.json", encoding="utf8") as f:
+            layout = json.load(f)["storage_layout_v2"]
+        self.assertEqual(VERIFIER_V2_OBSERVED_SLOTS, tuple(sorted(layout["verifier"]["slots"].values())))
+        self.assertEqual(VAULT_V2_OBSERVED_SLOTS, tuple(sorted(layout["vault"]["slots"].values())))
+        token = layout["token"]["slots"]
+        self.assertEqual((token["owner_paused"], token["balances"], token["is_black_listed"],
+                          token["upgraded_deprecated"]),
+                         (TOKEN_SLOT_OWNER_PAUSED, TOKEN_SLOT_BALANCES, TOKEN_SLOT_IS_BLACK_LISTED,
+                          TOKEN_SLOT_UPGRADED_DEPRECATED))
+        keys = {m["slot"]: (m["key"], hx(m["storage_key"])) for m in layout["mapping_slots"]}
+        vault = keys[TOKEN_SLOT_BALANCES][0]
+        self.assertEqual(keys[TOKEN_SLOT_IS_BLACK_LISTED][0], vault)
+        plan = observation_plan_v2(self.ADDRESSES[2], vault, self.ADDRESSES[1])
+        self.assertEqual([len(slots) for _, slots in plan[1]], [5])
+        self.assertEqual([len(slots) for _, slots in plan[2]], [3, 1])
+        self.assertEqual([len(slots) for _, slots in plan[3]], [3])
+        self.assertEqual(plan[2][1][1][0], keys[TOKEN_SLOT_BALANCES][1])
+        self.assertEqual(plan[3][0][1][2], keys[TOKEN_SLOT_IS_BLACK_LISTED][1])
+        self.assertEqual(GATE_R_ROTATION_AGE_LIMIT, 52_800)
+
+    def test_v2_kofn_initialize_and_verdict_tamper(self):
+        header = {"epoch": 0, "ruleset_version": 2, "validator_count": 4, "total_weight": 4,
+                  "quorum_weight": 3, "aggregate_pubkey": "0x" + "a1" * 48, "members_root": "0x" + "b2" * 32}
+        start = dict(header, total_weight=100, quorum_weight=67, members_root="0x" + "c3" * 32)
+        fb = bytes(32) + (266).to_bytes(8, "big") + b"\x11" * 96 + bytes(8) + (1).to_bytes(8, "big") + \
+            b"\x22" * 32 + b"\x00"
+        leaf0 = ["0x" + "44" * 32] * 32
+        cert = {"encoded": to_0x(fb), "signing_set": start, "successor_set": dict(start, epoch=1),
+                "history": {"leaf0_path": leaf0}, "proof": "0x" + "55" * 70}
+        kofn = encode_verifier_v2_initialize_kofn(fb, header, start, cert["successor_set"], leaf0, "0x" + "66" * 90)
+        self.assertEqual(kofn[:4], selector(VERIFIER_V2_INITIALIZE_SIGNATURE))
+        head = 4 + 9 * 32
+        signing_offset = int.from_bytes(kofn[head:head + 32], "big")
+        start_offset = int.from_bytes(kofn[head + 32:head + 64], "big")
+        self.assertEqual(kofn[4 + signing_offset:4 + start_offset], encode_set_header_tuple(header))
+        # With the certificate's own set as signer it is exactly START_CERTIFICATE's calldata.
+        self.assertEqual(encode_verifier_v2_initialize_kofn(fb, start, start, cert["successor_set"], leaf0,
+                                                            cert["proof"]),
+                         encode_verifier_v2_initialize(cert))
+        payload = (bytes([9, 0, 1]) + b"\x77" * 32 + bytes([0, 1]) + b"\x88" * 10).hex()
+        tampered = hx(tamper_observation_verdict(payload))
+        self.assertEqual(tampered[ETH_OBSERVATION_VERDICT_OFFSET], ETH_OBSERVATION_VERDICT_SETS_MISMATCH)
+        self.assertEqual(tampered[:ETH_OBSERVATION_VERDICT_OFFSET], hx(payload)[:ETH_OBSERVATION_VERDICT_OFFSET])
+        self.assertEqual(tampered[ETH_OBSERVATION_VERDICT_OFFSET + 1:], hx(payload)[ETH_OBSERVATION_VERDICT_OFFSET + 1:])
+        view = gate_view({"burn_gate": {"status": "READY", "now_eff": 5, "closes_at": 9}, "x": [1]})
+        self.assertEqual(view, {"burn_gate": {"status": "READY", "closes_at": 9}, "x": [1]})

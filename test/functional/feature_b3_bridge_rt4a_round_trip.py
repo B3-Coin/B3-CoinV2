@@ -18,9 +18,11 @@ fresh lineage, so the pins name the CREATE addresses DeployV2.s.sol will use
 hash. The V1 registry stays the synthetic MANAGED_V1 bUSD. V = W2 = 281.
 
 1. Bring-up to 267; the lineage id equals a Python derivation;
-   getbridgev2info is identical on every node and equals the pins, its
-   AssetId equals the Python bUSD V2 AssetId; getbridgeinfo is still the
-   synthetic managed-v1 bUSD.
+   getbridgev2info is identical on every node (burn_gate.now_eff, which
+   follows each node's clock, aside) and equals the pins, its AssetId
+   equals the Python bUSD V2 AssetId, its burn gate is NOT_READY at row C1
+   below W2 and its kind 9 observation plan equals a
+   Python derivation; getbridgeinfo is still the synthetic managed-v1 bUSD.
 2. Fresh votes are shuttled until checkpoint 266 is finalized.
 3. DeployV2.s.sol (START_CERTIFICATE, profile R windows with
    MIN_EPOCH_DURATION = REVIEW_WINDOW = 1 s) deploys at the predicted
@@ -37,9 +39,18 @@ hash. The V1 registry stays the synthetic MANAGED_V1 bUSD. V = W2 = 281.
    namespace 2; getbridgeinfo's V1 nullifier count stays 0); a replay is
    refused. A plain burnasset of bUSD V2 is refused without
    allow_unredeemable_burn (node changes §7.5).
-8. bridgewithdraw burns 10,000,000 (decentralized-verifier-v2; the burn gate
-   is TEMPORARY: fresh lineage live only, kind 9 pending); the leaf V2 and
-   the one-leaf root equal the Python derivation.
+8. The full V2 burn gate (node changes §8.4, rows C1-C4 and E1-E8): fresh
+   votes are shuttled until every tip is within 20 blocks of its fresh
+   finalized checkpoint (row C3), any new certificate is relayed, the V2
+   light client is updated to the anvil head and
+   contrib/b3bridge/b3_bridge_observe_v2.py submits kind 9 VERIFIER_E,
+   RESERVE_E and TOKEN_FLAGS observations at that anchor. Their decoded
+   values equal anvil eth_call reads at the anchor block and Python's own
+   check of the eth_getProof proofs; latestCertId is B3's certId. The gate
+   is READY on every node and the reserve ledger shows
+   the mint. bridgewithdraw burns 10,000,000 (decentralized-verifier-v2);
+   reserve burned = burn; the leaf V2 and the one-leaf root equal the
+   Python derivation.
 9. Shuttling until a certificate covers the burn and fresh epoch 1 has
    certified, relayed in order (so the sequence includes a Verifier V2
    handover to Set'_1); acceptedRootHeight(root) is the first covering
@@ -49,10 +60,16 @@ hash. The V1 registry stays the synthetic MANAGED_V1 bUSD. V = W2 = 281.
 11. release pays the recipient exactly once; the second release reverts
     (AlreadyReleased) on chain and changes no balance. The relayer RPCs
     getbridgeproofstatus, getbridgeanchorforblock and
-    getbridgelightclientstore serve the V2 store and Vault V2 deposits.
+    getbridgelightclientstore serve the V2 store (at its newest update) and
+    Vault V2 deposits.
 12. n3 restarted with a modified v2 section is refused by the pin-file
     guard, then restarts unchanged; n0 -reindex reproduces n1's
-    getbridgev2info and fresh lineage. Evidence: bridge_evidence.json.
+    getbridgev2info (observations, reserve ledger and conflict included;
+    burn_gate.now_eff aside) and fresh lineage. Evidence:
+    bridge_evidence.json.
+
+feature_b3_bridge_rt4_kofn_gate.py (RT4) reuses this test with the default
+K_OF_N bootstrap and the gate's refusals.
 """
 
 import json
@@ -66,6 +83,13 @@ from test_framework.b3bridge import (
     DEPLOY_V2_CONTRACTS,
     EMPTY_WITHDRAWAL_ROOT,
     EPOCH_LENGTH,
+    ETH_OBSERVATION_KEYS,
+    ETH_OBSERVATION_SUBJECTS,
+    GATE_R_MAX_FINALITY_LAG,
+    GATE_R_MEMPOOL_CLOSE_MARGIN,
+    GATE_R_OBSERVATION_MAX_AGE,
+    GATE_R_ROTATION_AGE_LIMIT,
+    GATE_R_SET_EXPIRY,
     PERIOD_SLOTS,
     REGTEST_ETH_CHAIN_ID,
     REGTEST_GVR,
@@ -96,10 +120,12 @@ from test_framework.b3bridge import (
     file_sha256,
     find_deposits,
     fold_withdrawal_path,
+    gate_view,
     hx,
     keccak256,
     leaf_v2,
     leaf_v2_preimage,
+    observation_plan_v2,
     predict_create_address,
     recipient_v1,
     regtest_chain_domain,
@@ -107,6 +133,7 @@ from test_framework.b3bridge import (
     selector,
     start_refused,
     to_0x,
+    verify_account_storage_proof,
     withdrawal_root,
     withdrawal_root_and_path,
     write_regtest_bridge_pins_v2,
@@ -150,6 +177,13 @@ UNPINNED = ["vault_runtime_code_hash", "verifier_runtime_code_hash", "lineage_id
 
 # Explicit gas limits stay below EIP-7825's 2^24 per-transaction cap.
 MAX_TX_GAS = 16_000_000
+
+# Gate row C3 judges candidate height - fresh finalized <= 30 (profile R);
+# burns are created with the tip at most this far above it, which leaves
+# room for the blocks until they are mined.
+BURN_FINALITY_LAG_MARGIN = 20
+assert BURN_FINALITY_LAG_MARGIN < GATE_R_MAX_FINALITY_LAG
+VERIFIER_V2_STATUS_NAMES = {0: "UNINITIALIZED", 1: "LIVE", 2: "HALTED_CONFLICT", 3: "CANCELLED"}
 
 RPC_MISC_ERROR = -1
 RPC_INVALID_ADDRESS_OR_KEY = -5
@@ -203,6 +237,9 @@ def error_selector(name):
 
 
 class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTestFramework):
+    # Verifier V2 BootstrapMode: 1 START_CERTIFICATE here, 0 K_OF_N in RT4.
+    BOOTSTRAP_MODE = 1
+
     def set_test_params(self):
         self.num_nodes = 4
         self.setup_clean_chain = True
@@ -329,12 +366,25 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
                                 actual=info["lineage_id"], genesis_set_hash=info["genesis_set_hash"])
 
     def v2_infos(self):
-        """getbridgev2info of every running node; all must be identical (frozen)."""
+        """getbridgev2info of every running node; all must be identical (frozen)
+        apart from burn_gate.now_eff, which follows each node's clock."""
         infos = [node.getbridgev2info() for node in self.bridge_nodes()]
         for info in infos[1:]:
-            assert_equal(info, infos[0])
+            assert_equal(gate_view(info), gate_view(infos[0]))
         assert_equal(infos[0]["state_available"], True)
         return infos[0]
+
+    def check_observation_plan(self, info):
+        """getbridgev2info's eth_getProof plan equals a Python derivation."""
+        expected = observation_plan_v2(self.verifier, self.vault, self.token)
+        plan = info["observation_plan"]
+        assert_equal([(entry["subject"], entry["name"]) for entry in plan["subjects"]],
+                     sorted(ETH_OBSERVATION_SUBJECTS.items()))
+        for entry in plan["subjects"]:
+            assert_equal([(hx(account["address"]), [hx(slot) for slot in account["slots"]])
+                          for account in entry["accounts"]],
+                         [(hx(address), slots) for address, slots in expected[entry["subject"]]])
+        return plan
 
     def check_v2_info_before_activation(self):
         self.log.info("getbridgev2info equals the pins on every node; getbridgeinfo is still managed-v1")
@@ -350,8 +400,10 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         for key in ("vault", "token", "verifier", "token_runtime_code_hash"):
             assert_equal(hx(info[key]), hx(v2[key]))
         for key in ("origin_deployment_block", "max_deposit_raw", "min_bridge_validators",
-                    "max_bridge_validators", "min_bridge_total_weight"):
+                    "max_bridge_validators", "min_bridge_total_weight", "verifier_max_epoch_lag"):
             assert_equal(info[key], v2[key])
+        # The verifier window mirror is the gate's set expiry (profile R).
+        assert_equal(info["verifier_max_epoch_lag"], GATE_R_SET_EXPIRY)
         assert_equal((info["max_per_block"], info["max_per_epoch"]),
                      (BRIDGE_V2_DEFAULT_CAP_RAW, BRIDGE_V2_DEFAULT_CAP_RAW))
         assert_equal(info["epoch_length_blocks"], EPOCH_LENGTH)
@@ -369,7 +421,18 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         assert_equal((info["nullifiers"], info["withdrawals"]), (0, 0))
         assert_equal(hx(info["withdrawal_root_evm"]), EMPTY_WITHDRAWAL_ROOT)
         assert_equal(hx(info["empty_withdrawal_root_evm"]), EMPTY_WITHDRAWAL_ROOT)
-        assert_equal(info["burn_gate"]["temporary"], True)
+        # The full gate (no TEMPORARY gate any more) is closed below W2.
+        gate = info["burn_gate"]
+        assert_equal((gate["status"], gate["row"]), ("NOT_READY", "C1"))
+        assert "temporary" not in gate
+        assert_equal(gate["reason"], "bridge V2 burns are not active at this height")
+        assert_equal(info["observations"], {})
+        assert "conflict" not in info
+        assert_equal({key: info["reserve"][key] for key in ("minted", "burned", "credited", "transit",
+                                                             "reserve", "proven_deposits")},
+                     {"minted": 0, "burned": 0, "credited": 0, "transit": 0, "reserve": 0, "proven_deposits": 0})
+        plan = self.check_observation_plan(info)
+        assert "anchor" not in plan  # no light-client store yet
 
         for node in self.bridge_nodes():
             assert_equal(node.getblockhash(0), REGTEST_MODERN_GENESIS_HASH)
@@ -381,8 +444,12 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         return info
 
     # -- 3. DeployV2 --------------------------------------------------------
+    def bootstrap_deploy_env(self):
+        """DeployV2's bootstrap inputs: START_CERTIFICATE (RT4 overrides it with K_OF_N)."""
+        return {"B3V2_BOOTSTRAP_MODE": 1}
+
     def deploy_v2_stack(self):
-        self.log.info("(3) DeployV2.s.sol, START_CERTIFICATE, at the predicted addresses")
+        self.log.info(f"(3) DeployV2.s.sol, bootstrap mode {self.BOOTSTRAP_MODE}, at the predicted addresses")
         anvil, lineage = self.anvil, self.lineage
         genesis_set_hash = to_0x(hx(lineage["genesis_set_hash"]))
         env = {
@@ -393,7 +460,6 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
             "B3V2_LINEAGE_ID": to_0x(hx(lineage["lineage_id"])),
             "B3V2_START_EPOCH": 0,
             "B3V2_START_SET_HASH": genesis_set_hash,
-            "B3V2_BOOTSTRAP_MODE": 1,  # START_CERTIFICATE (K_OF_N is the next slice)
             "B3V2_BRIDGE_ACTIVATION_HEIGHT": BRIDGE_V2_HEIGHT,
             "B3V2_ORIGIN_TOKEN": self.token,
             "B3V2_MIN_BRIDGE_TOTAL_WEIGHT": MIN_BRIDGE_TOTAL_WEIGHT,
@@ -401,6 +467,8 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
             "B3V2_REVIEW_WINDOW": 1,
             "B3V2_MAX_DEPOSIT_RAW": MAX_DEPOSIT_RAW,
         }
+        env.update(self.bootstrap_deploy_env())
+        assert_equal(env["B3V2_BOOTSTRAP_MODE"], self.BOOTSTRAP_MODE)
         created = self.bridge_deploy_v2(anvil, self.deployer, env)
         for name, role in zip(DEPLOY_V2_CONTRACTS, DEPLOY_ROLES):
             assert_equal(created[name]["address"], self.predicted[role])
@@ -425,7 +493,7 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         assert_equal(call_bytes32(anvil, verifier, "CHAIN_DOMAIN()"), self.domain)
         assert_equal(call_uint(anvil, verifier, "GENESIS_HEIGHT()"), FRESH_GENESIS)
         assert_equal(call_bytes32(anvil, verifier, "START_SET_HASH()"), hx(genesis_set_hash))
-        assert_equal(call_uint(anvil, verifier, "BOOTSTRAP_MODE()"), 1)
+        assert_equal(call_uint(anvil, verifier, "BOOTSTRAP_MODE()"), self.BOOTSTRAP_MODE)
         assert_equal(call_uint(anvil, verifier, "MIN_BRIDGE_VALIDATORS()"), self.pins["v2"]["min_bridge_validators"])
         assert_equal(call_uint(anvil, verifier, "MAX_BRIDGE_VALIDATORS()"), self.pins["v2"]["max_bridge_validators"])
         assert_equal(call_uint(anvil, verifier, "MIN_BRIDGE_TOTAL_WEIGHT()"), MIN_BRIDGE_TOTAL_WEIGHT)
@@ -517,8 +585,14 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
                                 actual=observed)
         return carriers
 
+    def initialize_transaction(self, cert, fb):
+        """(calldata, gas label, evidence) of the initialize call: here the
+        START_CERTIFICATE form, the epoch-0 certificate signed by Set'_0."""
+        return (encode_verifier_v2_initialize(cert), "B3FinalityVerifierV2.initialize (START_CERTIFICATE)",
+                {"mode": "START_CERTIFICATE", "signers": cert["signer_count"], "absent": cert["absent_indices"]})
+
     def initialize_verifier(self):
-        self.log.info("(4) initialize with the epoch-0 certificate at 266 (START_CERTIFICATE)")
+        self.log.info("(4) initialize with B3's epoch-0 statement at 266")
         anvil, n0 = self.anvil, self.nodes[0]
         carriers = [c for c in self.fresh_certificates(n0, FRESH_ACTIVATION)
                     if c["fb"]["height"] < BRIDGE_V2_HEIGHT]
@@ -532,9 +606,8 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         # No certificate can land before initialize.
         assert_equal(revert_data(anvil, self.verifier, hx(cert["calldata"]), self.relayer),
                      error_selector("NotLive"))
-        self.transact(self.verifier, encode_verifier_v2_initialize(cert),
-                      "B3FinalityVerifierV2.initialize (START_CERTIFICATE)", height=fb["height"],
-                      signers=cert["signer_count"], absent=cert["absent_indices"])
+        calldata, label, init_evidence = self.initialize_transaction(cert, fb)
+        self.transact(self.verifier, calldata, label, height=fb["height"], **init_evidence)
         assert_equal(call_uint(anvil, self.verifier, "status()"), VERIFIER_V2_STATUS_LIVE)
         assert_equal(call_uint(anvil, self.verifier, "latestIndex()"), fb["checkpoint_index"])
         assert_equal(call_uint(anvil, self.verifier, "latestHeight()"), fb["height"])
@@ -549,13 +622,14 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
             "deposit(uint256,bytes32)", enc_uint(DEPOSIT_RAW), bytes(11) + b"\x01" + b"\x22" * 20),
             self.depositor)
         assert_equal(closed, error_selector("DepositClosed"))
+        assert_equal(call_bytes32(anvil, self.verifier, "latestCertId()"), hx(cert["cert_id"]))
         self.init_cert = {"inclusion": chosen["inclusion"], "height": fb["height"],
                           "checkpoint_index": fb["checkpoint_index"],
-                          "successor_set_hash": fb["validator_set_hash"]}
+                          "successor_set_hash": fb["validator_set_hash"], "cert_id": cert["cert_id"]}
         self.evidence_step("verifier initialized (LIVE, deposits closed)", anvil, **self.init_cert,
-                           cert_id=cert["cert_id"])
+                           mode=init_evidence["mode"])
 
-    def relay_certificates(self, label):
+    def relay_certificates(self, label, require_new=True):
         """Relay every carried certificate above latestIndex(), in order."""
         anvil, n0 = self.anvil, self.nodes[0]
         latest_index = call_uint(anvil, self.verifier, "latestIndex()")
@@ -580,8 +654,10 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
             relayed.append({"inclusion": carrier["inclusion"], "height": fb["height"], "epoch": fb["epoch"],
                             "checkpoint_index": fb["checkpoint_index"],
                             "withdrawal_root": to_0x(fb["withdrawal_root"]), "transition": transition,
-                            "gas_used": gas_used(receipt), "signers": cert["signer_count"]})
-        assert relayed, f"no new certificate to relay ({label})"
+                            "gas_used": gas_used(receipt), "signers": cert["signer_count"],
+                            "cert_id": cert["cert_id"]})
+            assert_equal(call_bytes32(anvil, self.verifier, "latestCertId()"), hx(cert["cert_id"]))
+        assert relayed or not require_new, f"no new certificate to relay ({label})"
         self.relayed.extend(relayed)
         self.evidence_step(f"certificates relayed ({label})", anvil, relayed=relayed,
                            recorded_inclusions=sorted(self.fresh_inclusions))
@@ -694,8 +770,12 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
             assert_equal(result["record_kind"], "update")
             return result
 
-        _, self.update_height = self.submit_and_mine("V2 update carrier mined", update)
+        update_txid, self.update_height = self.submit_and_mine("V2 update carrier mined", update)
         k = deposit["block_number"]
+        self.light_client_updates_v2 = [{
+            "finalized_block": k, "finalized_hash": deposit["block_hash"],
+            "timestamp": int(self.anvil.block(k)["timestamp"], 16), "height": self.update_height,
+            "txid": update_txid}]
         for node in self.bridge_nodes():
             lc = node.getbridgev2info()["light_client"]
             assert_equal(lc["finalized_execution_block"], k)
@@ -758,14 +838,195 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         self.evidence.assertion("plain bUSD V2 burnasset refused without the opt-in", actual=refusal,
                                 opt_in_txid=unbroadcast["txid"])
 
+    # -- 8. the V2 burn gate: kind 9 observations ------------------------------
+    def anvil_observed_values(self, block):
+        """Each kind 9 subject's values as getbridgev2info reports them, read
+        with eth_call and extcodehash at `block`."""
+        anvil, verifier, vault, token = self.anvil, self.verifier, self.vault, self.token
+
+        def uint(to, signature, *words):
+            return call_uint(anvil, to, signature, *words, block=block)
+
+        def word(to, signature):
+            return to_0x(call_bytes32(anvil, to, signature, block=block))
+
+        def address(to, signature):
+            return call_address(anvil, to, signature, block=block)
+
+        def code_hash(account):
+            return to_0x(anvil.code_hash(account, block))
+
+        status = uint(verifier, "status()")
+        return {
+            1: {"current_epoch": uint(verifier, "currentEpoch()"),
+                "last_rotation_time": uint(verifier, "lastRotationTime()"),
+                "last_certificate_time": uint(verifier, "lastCertificateTime()"),
+                "latest_bridge_height": uint(verifier, "latestBridgeHeight()"),
+                "status": status, "status_name": VERIFIER_V2_STATUS_NAMES[status],
+                "deposits_closed": bool(uint(verifier, "depositsClosed()")),
+                "current_set_hash": word(verifier, "currentSetHash()"),
+                "next_set_hash": word(verifier, "nextSetHash()"),
+                "latest_height": uint(verifier, "latestHeight()"),
+                "latest_index": uint(verifier, "latestIndex()"),
+                "latest_init_time": uint(verifier, "initTime()"),
+                "latest_cert_id": word(verifier, "latestCertId()"),
+                "verifier_code_hash": code_hash(verifier)},
+            2: {"next_deposit_id": uint(vault, "nextDepositId()"),
+                "locked": uint(vault, "locked()"),
+                "absorbed_total": uint(vault, "absorbedTotal()"),
+                "balance": uint(token, "balanceOf(address)", enc_address(vault)),
+                "vault_code_hash": code_hash(vault), "token_code_hash": code_hash(token)},
+            3: {"token_code_hash": code_hash(token),
+                "owner": address(token, "owner()"),
+                "paused": bool(uint(token, "paused()")),
+                "upgraded_address": address(token, "upgradedAddress()"),
+                "deprecated": bool(uint(token, "deprecated()")),
+                "vault_blacklisted": bool(uint(token, "isBlackListed(address)", enc_address(vault)))},
+        }
+
+    def proven_observed_values(self, block):
+        """The same values from anvil's eth_getProof at `block`, verified here
+        (EIP-1186, test_framework.b3bridge) against the block's stateRoot and
+        decoded with the storage layout of bridge_v2_vectors.json."""
+        anvil = self.anvil
+        state_root = hx(anvil.block(block)["stateRoot"])
+        plan = observation_plan_v2(self.verifier, self.vault, self.token)
+        words, code_hashes = {}, {}
+        for accounts in plan.values():
+            for account, slots in accounts:
+                proof = anvil.get_proof(account, slots, block)
+                for slot in slots:
+                    proven = verify_account_storage_proof(state_root, account, int.from_bytes(slot, "big"), proof)
+                    words[(account, slot)] = proven["value"]
+                    code_hashes[account] = to_0x(proven["code_hash"])
+        verifier, vault, token = plan[1][0][0], plan[2][0][0], plan[3][0][0]
+
+        def field(value, offset, bits):
+            return (value >> offset) & ((1 << bits) - 1)
+
+        def word(value):
+            return to_0x(value.to_bytes(32, "big"))
+
+        def address(value):
+            return to_0x(field(value, 0, 160).to_bytes(20, "big"))
+
+        liveness, latest = words[(verifier, enc_uint(0))], words[(verifier, enc_uint(4))]
+        owner_paused, upgraded = words[(token, enc_uint(0))], words[(token, enc_uint(10))]
+        status = field(liveness, 208, 8)
+        return {
+            1: {"current_epoch": field(liveness, 0, 64), "last_rotation_time": field(liveness, 64, 40),
+                "last_certificate_time": field(liveness, 104, 40), "latest_bridge_height": field(liveness, 144, 64),
+                "status": status, "status_name": VERIFIER_V2_STATUS_NAMES[status],
+                "deposits_closed": bool(field(liveness, 216, 8)),
+                "current_set_hash": word(words[(verifier, enc_uint(1))]),
+                "next_set_hash": word(words[(verifier, enc_uint(2))]),
+                "latest_height": field(latest, 0, 64), "latest_index": field(latest, 64, 64),
+                "latest_init_time": field(latest, 128, 40),
+                "latest_cert_id": word(words[(verifier, enc_uint(6))]),
+                "verifier_code_hash": code_hashes[verifier]},
+            2: {"next_deposit_id": words[(vault, enc_uint(0))], "locked": words[(vault, enc_uint(1))],
+                "absorbed_total": words[(vault, enc_uint(3))], "balance": words[plan[2][1][0], plan[2][1][1][0]],
+                "vault_code_hash": code_hashes[vault], "token_code_hash": code_hashes[token]},
+            3: {"token_code_hash": code_hashes[token], "owner": address(owner_paused),
+                "paused": bool(field(owner_paused, 160, 8)), "upgraded_address": address(upgraded),
+                "deprecated": bool(field(upgraded, 160, 8)),
+                "vault_blacklisted": bool(words[(token, plan[3][0][1][2])])},
+        }
+
+    def check_observations(self, output, light_client):
+        """The observations connected on every node equal eth_call reads and
+        Python's own proof check at the anchor block; VERIFIER_E shows B3's
+        latest relayed certificate and sets."""
+        anchor, block = output["anchor"], light_client["finalized_block"]
+        assert_equal((anchor["number"], hx(anchor["hash_evm"]), anchor["timestamp"]),
+                     (block, hx(light_client["finalized_hash"]), light_client["timestamp"]))
+        called = self.anvil_observed_values(block)
+        assert_equal(self.proven_observed_values(block), called)
+        info = self.v2_infos()
+        for observation in output["observations"]:
+            subject = observation["subject"]
+            record = info["observations"][ETH_OBSERVATION_KEYS[subject]]
+            assert_equal(observation["values"], called[subject])
+            assert_equal(record["values"], called[subject])
+            assert_equal((record["subject"], record["name"], record["anchor_block"], record["t_obs"],
+                          record["verdict"], observation["verdict"]),
+                         (subject, ETH_OBSERVATION_SUBJECTS[subject], block, light_client["timestamp"], 0, 0))
+            assert_equal(hx(record["anchor_hash_evm"]), hx(anchor["hash_evm"]))
+            assert_equal(record["connected_height"], observation["mined_height"])
+            assert_equal(record["connected_block"], self.nodes[0].getblockhash(observation["mined_height"]))
+        verifier, reserve, flags = called[1], called[2], called[3]
+        assert_equal((verifier["status_name"], verifier["deposits_closed"]), ("LIVE", False))
+        # One deposit, nothing absorbed: the vault holds exactly what it locks.
+        assert_equal((reserve["next_deposit_id"], reserve["absorbed_total"]), (FIRST_DEPOSIT_ID + 1, 0))
+        assert_equal(reserve["balance"], reserve["locked"])
+        assert_equal((flags["paused"], flags["deprecated"], flags["vault_blacklisted"]), (False, False, False))
+        assert_equal(flags["owner"], self.owner)
+        latest_cert = self.relayed[-1] if self.relayed else self.init_cert
+        assert_equal(hx(verifier["latest_cert_id"]), hx(latest_cert["cert_id"]))
+        lineage = self.nodes[0].getfinalitylineage()
+        sets = {header["epoch"]: hx(header["set_hash"]) for header in
+                (lineage.get(key) for key in ("previous_set", "current_set", "next_set")) if header}
+        epoch = verifier["current_epoch"]
+        assert_equal((hx(verifier["current_set_hash"]), hx(verifier["next_set_hash"])), (sets[epoch], sets[epoch + 1]))
+        # OI-3: the unpinned vault and verifier code hashes B3 observed are
+        # the deployed runtimes'.
+        code_hashes = {"verifier": to_0x(self.anvil.code_hash(self.verifier)),
+                       "vault": to_0x(self.anvil.code_hash(self.vault))}
+        assert_equal((verifier["verifier_code_hash"], called[2]["vault_code_hash"]),
+                     (code_hashes["verifier"], code_hashes["vault"]))
+        self.evidence.assertion("kind 9 observations equal anvil reads and Python's proof check",
+                                expected=called, actual={key: record["values"] for key, record in
+                                                         info["observations"].items()},
+                                anchor=anchor, observed_code_hashes=code_hashes,
+                                latest_cert_id=latest_cert["cert_id"])
+        return info
+
+    def check_gate_ready(self, label):
+        """burn_gate READY on every node (rows C1-C4, E1-E8), not closing soon."""
+        info = self.v2_infos()
+        gate = info["burn_gate"]
+        assert_equal((gate["status"], gate["reason"]), ("READY", ""))
+        assert "row" not in gate
+        assert "conflict" not in info
+        assert_greater_than(gate["closes_at"] - gate["now_eff"], GATE_R_MEMPOOL_CLOSE_MARGIN)
+        verifier = info["observations"]["verifier_e"]
+        assert_equal(gate["closes_at"],
+                     min(min(record["t_obs"] for record in info["observations"].values()) +
+                         GATE_R_OBSERVATION_MAX_AGE + 1,
+                         verifier["values"]["last_rotation_time"] + GATE_R_ROTATION_AGE_LIMIT + 1))
+        self.evidence.assertion(f"burn gate READY ({label})", expected="READY", actual=gate,
+                                fresh_finality_lags=self.fresh_finality_lags(), reserve=info["reserve"])
+        return info
+
+    def observe_ethereum_state(self, label):
+        """Relay new certificates, finalize the anvil head on the V2 light
+        client and connect kind 9 observations of every subject."""
+        self.relay_certificates(label, require_new=False)
+        light_client = self.update_light_client_to_head()
+        output = self.submit_observations_v2(subjects=(1, 2, 3), label=f"kind 9 observations mined ({label})")
+        return output, light_client, self.check_observations(output, light_client)
+
+    def prepare_burn_gate(self):
+        """Fresh finality near the tip (C3), current Ethereum observations
+        (E1-E8): the gate opens."""
+        self.log.info("(8) Open the full V2 burn gate: fresh finality, light-client head, kind 9 observations")
+        self.shuttle_fresh_until_lag(BURN_FINALITY_LAG_MARGIN)
+        self.observe_ethereum_state("before the burn")
+        self.shuttle_fresh_until_lag(BURN_FINALITY_LAG_MARGIN)
+        return self.check_gate_ready("before the burn")
+
     # -- 8-9. burn and its root ------------------------------------------------
     def burn(self):
-        self.log.info("(8) bridgewithdraw burns bUSD V2 into a leaf V2 (TEMPORARY gate: fresh lineage live)")
+        info = self.prepare_burn_gate()
+        self.log.info("(8) bridgewithdraw burns bUSD V2 into a leaf V2 under the full gate")
         n0 = self.nodes[0]
-        self.freeze()
-        info = self.v2_infos()
         assert_equal((info["active"], info["burns_active"]), (True, True))
-        assert_equal(info["burn_gate"]["status"], "READY")
+        reserve = info["reserve"]
+        assert_equal({key: reserve[key] for key in ("minted", "burned", "credited", "transit", "reserve",
+                                                     "proven_deposits", "invariant_r_margin",
+                                                     "wind_down_headroom")},
+                     {"minted": DEPOSIT_RAW, "burned": 0, "credited": 0, "transit": 0, "reserve": DEPOSIT_RAW,
+                      "proven_deposits": 1, "invariant_r_margin": 0, "wind_down_headroom": DEPOSIT_RAW})
         asset_id = self.v2info["asset_id"]
 
         def create():
@@ -786,14 +1047,20 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
                             ETH_RECIPIENT, BURN_RAW, self.burn_height)
         self.withdrawal_leaves.append((self.burn_height, self.leaf))
         self.root = withdrawal_root([self.leaf])
-        info = self.v2_infos()
-        assert_equal(info["withdrawals"], 1)
-        assert_equal(hx(info["withdrawal_root_evm"]), self.root)
+        after = self.v2_infos()
+        assert_equal(after["withdrawals"], 1)
+        assert_equal(hx(after["withdrawal_root_evm"]), self.root)
         assert_equal(self.wallet_asset(n0, asset_id)["confirmed"], DEPOSIT_RAW - BURN_RAW)
-        self.evidence.assertion("leaf V2 appended; one-leaf root equals Python", expected=to_0x(self.root),
-                                actual=info["withdrawal_root_evm"], burn_txid=self.burn_txid,
-                                burn_height=self.burn_height, leaf=to_0x(self.leaf),
-                                burn_gate=info["burn_gate"])
+        # The reserve ledger counts the burn (check 2); the wind-down bound
+        # now holds the leaf as unreleased (check 3).
+        assert_equal({key: after["reserve"][key] for key in ("minted", "burned", "reserve", "invariant_r_margin",
+                                                              "wind_down_headroom")},
+                     {"minted": DEPOSIT_RAW, "burned": BURN_RAW, "reserve": DEPOSIT_RAW - BURN_RAW,
+                      "invariant_r_margin": BURN_RAW, "wind_down_headroom": DEPOSIT_RAW - BURN_RAW})
+        self.evidence.assertion("leaf V2 appended under the full gate; one-leaf root equals Python",
+                                expected=to_0x(self.root), actual=after["withdrawal_root_evm"],
+                                burn_txid=self.burn_txid, burn_height=self.burn_height, leaf=to_0x(self.leaf),
+                                burn_gate=info["burn_gate"], reserve_before=reserve, reserve_after=after["reserve"])
 
     @staticmethod
     def fresh_finalized_epoch(node):
@@ -928,11 +1195,14 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
     def check_v2_relayer_rpcs(self, deposit):
         self.log.info("Relayer RPCs serve the V2 store from V: proof status, anchor, light-client store")
         k = deposit["block_number"]
+        # The store's newest update: the one finalizing the anvil head for
+        # the observations (step 8).
+        newest = self.light_client_updates_v2[-1]
         # getbridgeanchorforblock and getbridgelightclientstore answer only
         # from B3-finalized bridge state.
-        if not all(self.finalized_height(node) >= self.update_height for node in self.bridge_validators()):
+        if not all(self.finalized_height(node) >= newest["height"] for node in self.bridge_validators()):
             self.resume()
-            self.wait_until(lambda: all(self.finalized_height(node) >= self.update_height
+            self.wait_until(lambda: all(self.finalized_height(node) >= newest["height"]
                                         for node in self.bridge_validators()), timeout=300)
         self.freeze()
         observed = {}
@@ -950,12 +1220,14 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
             assert_equal(anchor["connected_height"], self.update_height)
             # The V1 store was never bootstrapped in RT4a; the V2 one is.
             store = node.getbridgelightclientstore()
-            assert_equal(store["connection"]["height"], self.update_height)
-            assert_equal(int(store["store"]["finalized_header"]["execution"]["block_number"]), k)
+            assert_equal(store["connection"]["height"], newest["height"])
+            assert_equal(int(store["store"]["finalized_header"]["execution"]["block_number"]),
+                         newest["finalized_block"])
             observed[node.index] = {"status": status, "anchor": anchor, "connection": store["connection"]}
         self.evidence.assertion("relayer RPCs serve the V2 store and Vault V2 deposits from V",
                                 expected={"anchor_block": k, "mint_height": self.mint_height,
-                                          "update_height": self.update_height},
+                                          "update_height": self.update_height,
+                                          "newest_update": newest},
                                 actual=observed)
 
     # -- 12. pin guard and reindex -------------------------------------------------
@@ -988,7 +1260,12 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         self.connect_nodes(1, 0)
         n0.syncwithvalidationinterfacequeue()
         info0, info1 = n0.getbridgev2info(), n1.getbridgev2info()
-        assert_equal(info0, info1)
+        # Field for field, the replayed observations, reserve ledger and
+        # (absent) conflict included; only burn_gate.now_eff follows the clock.
+        assert_equal(gate_view(info0), gate_view(info1))
+        assert_equal(sorted(info0["observations"]), sorted(ETH_OBSERVATION_KEYS.values()))
+        assert_equal(info0["reserve"]["burned"], BURN_RAW)
+        assert "conflict" not in info0
         assert_equal((info0["nullifiers"], info0["withdrawals"]), (1, 1))
         assert_equal(hx(info0["withdrawal_root_evm"]), self.root)
         lineage0, lineage1 = n0.getfinalitylineage(), n1.getfinalitylineage()
