@@ -16,9 +16,11 @@
 #include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
+#include <modern/bridge_v2.h>
 #include <modern/chain_domain.h>
 #include <modern/fn_pod.h>
 #include <modern/flowmesh_seat.h>
+#include <modern/withdrawal_v2.h>
 #include <random.h>
 #include <node/bridge_state.h>
 #include <rpc/protocol.h>
@@ -136,6 +138,8 @@ namespace {
 struct AssetRpcOptions {
     bool broadcast{true};
     bool market_bootstrap{false};
+    //! burnasset only: allow a plain burn of the bridge V2 bUSD asset.
+    bool allow_unredeemable_burn{false};
     CCoinControl coin_control{};
 };
 
@@ -184,19 +188,27 @@ static const char* BridgeRecordKindName(
 
 static ParsedBridgePayload ParseCanonicalBridgePayload(const UniValue& value)
 {
+    // The bridge V2 receipt-proof limits (node changes section 4: 8,192-byte
+    // terminal receipt node, 16 KiB proof) only widen V1's, and the encoding
+    // is the same, so the wallet parses with them at every height. Consensus
+    // still selects the limits by height: below V a record that needs the V2
+    // limits is malformed, and bridge prevalidation refuses it.
     const std::vector<unsigned char> payload{
         ParseHexV(value, "bridge_payload")};
-    const auto decoded{bridge::DecodeBridgeRecordV1(payload)};
+    const auto decoded{
+        bridge::DecodeBridgeRecordV1(payload, bridge::BRIDGE_MPT_LIMITS_V2)};
     if (!decoded) {
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                            "bridge_payload is not a canonical type-10 v1 payload");
     }
-    const auto canonical{bridge::EncodeBridgeRecordV1(*decoded)};
+    const auto canonical{
+        bridge::EncodeBridgeRecordV1(*decoded, bridge::BRIDGE_MPT_LIMITS_V2)};
     if (!canonical || *canonical != payload) {
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                            "bridge_payload has a non-canonical encoding");
     }
-    const auto record{bridge::MakeBridgeMpaRecord(*decoded)};
+    const auto record{
+        bridge::MakeBridgeMpaRecord(*decoded, bridge::BRIDGE_MPT_LIMITS_V2)};
     if (!record) {
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                            "bridge_payload cannot be encoded as type-10 v1");
@@ -250,7 +262,8 @@ static uint8_t AssetDecimalsFromValue(const UniValue& value)
 
 static AssetRpcOptions ParseAssetRpcOptions(const UniValue& value,
                                             const bool flowmesh_seat = false,
-                                            const bool flowmesh_deposit = false)
+                                            const bool flowmesh_deposit = false,
+                                            const bool asset_burn = false)
 {
     AssetRpcOptions parsed;
     // Asset and FN inputs are confirmed by default. A caller may explicitly
@@ -270,6 +283,7 @@ static AssetRpcOptions ParseAssetRpcOptions(const UniValue& value,
         allowed.insert("bls_pubkey");
     }
     if (flowmesh_deposit) allowed.insert("market_bootstrap");
+    if (asset_burn) allowed.insert("allow_unredeemable_burn");
     for (const std::string& key : value.getKeys()) {
         if (!allowed.contains(key)) {
             throw JSONRPCError(RPC_INVALID_PARAMETER,
@@ -280,6 +294,10 @@ static AssetRpcOptions ParseAssetRpcOptions(const UniValue& value,
     if (value.exists("broadcast")) parsed.broadcast = value["broadcast"].get_bool();
     if (value.exists("market_bootstrap")) {
         parsed.market_bootstrap = value["market_bootstrap"].get_bool();
+    }
+    if (value.exists("allow_unredeemable_burn")) {
+        parsed.allow_unredeemable_burn =
+            value["allow_unredeemable_burn"].get_bool();
     }
     if (value.exists("replaceable")) {
         parsed.coin_control.m_signal_bip125_rbf = value["replaceable"].get_bool();
@@ -975,9 +993,27 @@ static UniValue TransferOrBurnAsset(const JSONRPCRequest& request,
     const CAmount amount{AssetUnitsFromValue(request.params[1], "amount")};
     const int options_index{burn ? 2 : 3};
     const AssetRpcOptions options{
-        ParseAssetRpcOptions(request.params[options_index])};
+        ParseAssetRpcOptions(request.params[options_index],
+                             /*flowmesh_seat=*/false,
+                             /*flowmesh_deposit=*/false, /*asset_burn=*/burn)};
     const ChainSnapshot snapshot{SnapshotChainState(*wallet, false)};
     const Consensus::Params& params{Params().GetConsensus()};
+    // Node changes section 7.5: a plain burn of bUSD V2 appends no leaf V2,
+    // so it destroys the holder's claim on the Vault V2 reserve for good.
+    // bridgewithdraw is the redeeming burn; this one needs an explicit
+    // opt-in. Without a bridge V2 envelope (every shipped network) there is
+    // no bUSD V2 asset id and nothing changes.
+    if (burn && !options.allow_unredeemable_burn) {
+        const auto busd_v2{modern::ConfiguredBridgeV2AssetId(params)};
+        if (busd_v2 && asset == *busd_v2) {
+            throw JSONRPCError(
+                RPC_INVALID_PARAMETER,
+                "burnasset would destroy bridge V2 bUSD without a withdrawal "
+                "leaf, giving up its claim on the Vault V2 reserve; use "
+                "bridgewithdraw to redeem it, or set "
+                "options.allow_unredeemable_burn=true");
+        }
+    }
     const uint16_t owner_policy{
         AssetOwnerPolicy(asset, params, snapshot.next_height)};
 
@@ -1110,6 +1146,10 @@ RPCHelpMan burnasset()
                   "Minimum confirmations for selected inputs"},
                  {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false},
                   "Allow unsafe wallet inputs"},
+                 {"allow_unredeemable_burn", RPCArg::Type::BOOL, RPCArg::Default{false},
+                  "Allow a plain burn of the bridge V2 bUSD asset (regtest only). Such a burn creates no "
+                  "withdrawal leaf and gives up its claim on the Vault V2 reserve; bridgewithdraw redeems "
+                  "it instead"},
              }},
         },
         AssetTransactionResult("Created transaction", {
@@ -1851,7 +1891,10 @@ RPCHelpMan claimbridgedeposit()
         "output_index to zero and supply the canonical payload. The amount is "
         "an integer number of raw six-decimal bUSD units. This command checks "
         "the proof, finalized bridge state, replay nullifier, recipient, amount, "
-        "and mint caps before broadcast. A signed B3MC policy-9 cell binds the "
+        "and mint caps before broadcast. From the bridge V2 activation height "
+        "(regtest only) the payload must name the V2 vault entry id and the "
+        "command mints bUSD V2 for a deposit into the pinned Vault V2; below it "
+        "nothing changes. A signed B3MC policy-9 cell binds the "
         "MPA payload; no OP_RETURN is used.\n" +
             HELP_REQUIRING_PASSPHRASE,
         {
@@ -1876,7 +1919,7 @@ RPCHelpMan claimbridgedeposit()
              }},
         },
         AssetTransactionResult("Created bridge deposit-mint transaction", {
-            {RPCResult::Type::STR_HEX, "asset_id", "Configured chain-bound bUSD asset id"},
+            {RPCResult::Type::STR_HEX, "asset_id", "Configured chain-bound bUSD asset id (the vault-bound bUSD V2 asset id from the bridge V2 activation height)"},
             {RPCResult::Type::NUM, "amount", "Integer bUSD units minted"},
             {RPCResult::Type::STR, "owner_address", "Authorized B3 recipient"},
             {RPCResult::Type::NUM, "mint_vout", "Authorized bUSD output index (zero)"},
@@ -1909,20 +1952,32 @@ RPCHelpMan claimbridgedeposit()
             const AssetRpcOptions options{
                 ParseAssetRpcOptions(request.params[3])};
             const ChainSnapshot snapshot{SnapshotChainState(*wallet, false)};
+            // Bridge V2 rides on the V1 bridge tracker and gates (V >= A3).
             const Consensus::BridgeAssetParams& bridge_params{
                 RequireBridgeForNextBlock(snapshot.next_height)};
-            if (bridge_params.approval_last_height &&
+            const Consensus::Params& params{Params().GetConsensus()};
+            // From V every kind 3 record is a V2 mint (node changes section
+            // 3.4): it names the V2 vault entry id and mints the vault-bound
+            // bUSD V2 asset. The V1 approval window governs only V1 mints.
+            const bool bridge_v2{
+                params.BridgeV2RulesActive(snapshot.next_height)};
+            if (!bridge_v2 && bridge_params.approval_last_height &&
                 snapshot.next_height > *bridge_params.approval_last_height) {
                 throw JSONRPCError(RPC_MISC_ERROR,
                                    "New bridge mints are no longer approved");
             }
-            const Consensus::Params& params{Params().GetConsensus()};
-            const auto asset{modern::ConfiguredBridgeAssetId(params)};
-            const auto registry{modern::ConfiguredBridgeRegistryId(params)};
+            const auto asset{bridge_v2
+                                 ? modern::ConfiguredBridgeV2AssetId(params)
+                                 : modern::ConfiguredBridgeAssetId(params)};
+            const auto registry{bridge_v2
+                                    ? modern::ConfiguredBridgeV2EntryId(params)
+                                    : modern::ConfiguredBridgeRegistryId(params)};
             if (!asset || !registry || mint->registry_id != *registry) {
                 throw JSONRPCError(
                     RPC_INVALID_PARAMETER,
-                    "The MINT payload does not name the active bridge registry");
+                    bridge_v2
+                        ? "The MINT payload does not name the active bridge V2 vault entry"
+                        : "The MINT payload does not name the active bridge registry");
             }
 
             CreatedTransactionResult created{nullptr, 0, std::nullopt, {}};
@@ -1960,7 +2015,7 @@ RPCHelpMan claimbridgedeposit()
 
             const node::BridgeTxAuthorization authorization{
                 PrevalidateBridgeTransaction(*wallet, *created.tx, snapshot)};
-            if (!authorization.mint || authorization.withdrawal ||
+            if (!authorization.mint || authorization.HasWithdrawal() ||
                 authorization.mint->output_index != 0 ||
                 authorization.mint->authorization.asset != *asset ||
                 authorization.mint->authorization.amount != amount ||
@@ -1994,7 +2049,16 @@ RPCHelpMan bridgewithdraw()
         "confirms it. Use the returned proof RPC command after confirmation; "
         "it resolves the stable transaction id and burn output against the "
         "active chain. "
-        "In managed mode it remains a managed-v1 operator request. The burn and "
+        "In managed mode it remains a managed-v1 operator request. "
+        "From the bridge V2 activation height (regtest only) the command burns "
+        "the vault-bound bUSD V2 asset instead: the BRIDGE_BURN record names "
+        "the V2 vault entry, needs the bridge V2 burn height, and confirms as "
+        "a leaf V2 of the V2 withdrawal tree whose root fresh-lineage "
+        "certificates carry. Until the kind 9 liveness gates exist, consensus "
+        "requires only a live fresh finality lineage whose current and next "
+        "committees meet the Verifier V2 bounds (a temporary gate). Prove it "
+        "with getbridgewithdrawalproofv2 against an accepted certificate. "
+        "The burn and "
         "recipient are bound together by the canonical type-10 record and its "
         "signed B3MC policy-9 output. No OP_RETURN is used.\n" +
             HELP_REQUIRING_PASSPHRASE,
@@ -2018,15 +2082,15 @@ RPCHelpMan bridgewithdraw()
              }},
         },
         AssetTransactionResult("Created bridge withdrawal request", {
-            {RPCResult::Type::STR_HEX, "asset_id", "Configured chain-bound bUSD asset id"},
+            {RPCResult::Type::STR_HEX, "asset_id", "Configured chain-bound bUSD asset id (the vault-bound bUSD V2 asset id from the bridge V2 activation height)"},
             {RPCResult::Type::NUM, "amount", "Integer bUSD units burned"},
             {RPCResult::Type::NUM, "asset_change", "Integer bUSD units returned to this wallet"},
             {RPCResult::Type::STR_HEX, "ethereum_recipient", "Bound Ethereum recipient"},
             {RPCResult::Type::NUM, "burn_vout", "Exact bUSD BURN output index"},
             {RPCResult::Type::NUM, "binding_vout", "Signed B3MC bridge binding output index"},
-            {RPCResult::Type::STR, "withdrawal_mode", "managed-v1 or decentralized-verifier-v1"},
-            {RPCResult::Type::STR, "withdrawal_status", /*optional=*/true, "pending-confirmation for a new decentralized burn"},
-            {RPCResult::Type::STR, "proof_rpc_after_confirmation", /*optional=*/true, "Copyable authoritative proof lookup using txid and burn_vout"},
+            {RPCResult::Type::STR, "withdrawal_mode", "managed-v1, decentralized-verifier-v1, or decentralized-verifier-v2 (from the bridge V2 activation height)"},
+            {RPCResult::Type::STR, "withdrawal_status", /*optional=*/true, "pending-confirmation for a new decentralized (V1 or V2) burn"},
+            {RPCResult::Type::STR, "proof_rpc_after_confirmation", /*optional=*/true, "Copyable authoritative proof lookup using txid and burn_vout; for a V2 burn, replace <certificate_block> with the inclusion block of an accepted fresh-lineage certificate covering the burn"},
         }),
         RPCExamples{HelpExampleCli(
             "bridgewithdraw", "1000000 \"0x00112233445566778899aabbccddeeff00112233\"")},
@@ -2042,25 +2106,52 @@ RPCHelpMan bridgewithdraw()
             const AssetRpcOptions options{
                 ParseAssetRpcOptions(request.params[2])};
             const ChainSnapshot snapshot{SnapshotChainState(*wallet, false)};
+            // Bridge V2 rides on the V1 bridge tracker and gates (V >= A3).
             const Consensus::BridgeAssetParams& bridge_params{
                 RequireBridgeForNextBlock(snapshot.next_height)};
             const Consensus::BridgeWithdrawalMode withdrawal_mode{
                 *bridge_params.withdrawal_mode};
             const Consensus::Params& params{Params().GetConsensus()};
-            if (!Consensus::BridgeWithdrawalRulesActive(snapshot.next_height,
-                                                        params)) {
+            // From V every BRIDGE_BURN is a V2 burn and managed withdrawals
+            // are closed (node changes section 3.4): W2 replaces the V1
+            // withdrawal gate, the kind 6 record names the V2 vault entry and
+            // the burn is of the vault-bound bUSD V2 asset. The V1 store and
+            // withdrawal tree are frozen from V, whatever the V1 mode.
+            const bool bridge_v2{
+                params.BridgeV2RulesActive(snapshot.next_height)};
+            if (bridge_v2) {
+                if (!params.BridgeV2BurnRulesActive(snapshot.next_height)) {
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        "Bridge V2 withdrawals are disabled for the next block");
+                }
+            } else if (!Consensus::BridgeWithdrawalRulesActive(
+                           snapshot.next_height, params)) {
                 throw JSONRPCError(
                     RPC_MISC_ERROR,
                     "Bridge withdrawals are disabled for the next block");
             }
-            const auto asset{modern::ConfiguredBridgeAssetId(params)};
-            const auto registry{modern::ConfiguredBridgeRegistryId(params)};
+            const bool decentralized{
+                !bridge_v2 &&
+                withdrawal_mode ==
+                    Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1};
+            const bool managed{!bridge_v2 && !decentralized};
+            const auto asset{bridge_v2
+                                 ? modern::ConfiguredBridgeV2AssetId(params)
+                                 : modern::ConfiguredBridgeAssetId(params)};
+            const auto registry{bridge_v2
+                                    ? modern::ConfiguredBridgeV2EntryId(params)
+                                    : modern::ConfiguredBridgeRegistryId(params)};
             if (!asset || !registry) {
                 throw JSONRPCError(RPC_MISC_ERROR,
                                    "The active bridge identity is unavailable");
             }
+            // A V2 burn reuses the kind 6 BRIDGE_BURN record layout.
             const auto record{BuildBridgeWithdrawalMpaRecord(
-                withdrawal_mode, *registry, /*burn_output_index=*/0,
+                bridge_v2 ? Consensus::BridgeWithdrawalMode::
+                                DECENTRALIZED_VERIFIER_V1
+                          : withdrawal_mode,
+                *registry, /*burn_output_index=*/0,
                 static_cast<uint64_t>(amount), ethereum_recipient)};
             if (!record) {
                 throw JSONRPCError(RPC_INTERNAL_ERROR,
@@ -2116,17 +2207,42 @@ RPCHelpMan bridgewithdraw()
 
             const node::BridgeTxAuthorization authorization{
                 PrevalidateBridgeTransaction(*wallet, *created.tx, snapshot)};
-            const bool decentralized{
-                withdrawal_mode == Consensus::BridgeWithdrawalMode::
-                                       DECENTRALIZED_VERIFIER_V1};
             const auto decentralized_leaf{
                 authorization.decentralized_withdrawal
                     ? modern::BridgeWithdrawalLeafV1(
                           authorization.decentralized_withdrawal->withdrawal)
                     : std::nullopt};
+            // The consensus-derived leaf V2 must be exactly this burn: the
+            // next id is assigned at confirmation, everything else is fixed
+            // by the V2 entry, the request and the next height.
+            const std::optional<node::BridgeWithdrawalV2Request>&
+                withdrawal_v2{authorization.withdrawal_v2};
+            const auto leaf_v2{
+                withdrawal_v2
+                    ? modern::BridgeWithdrawalLeafV2(withdrawal_v2->withdrawal)
+                    : std::nullopt};
             if (authorization.mint ||
+                (bridge_v2 &&
+                 (authorization.withdrawal ||
+                  authorization.decentralized_withdrawal ||
+                  !withdrawal_v2 ||
+                  withdrawal_v2->burn_output_index != 0 ||
+                  withdrawal_v2->withdrawal.asset_id != *asset ||
+                  withdrawal_v2->withdrawal.destination_chain_id !=
+                      params.bridge_v2->vault.origin_chain_id ||
+                  withdrawal_v2->withdrawal.vault !=
+                      params.bridge_v2->vault.vault_address ||
+                  withdrawal_v2->withdrawal.token !=
+                      params.bridge_v2->vault.token_address ||
+                  withdrawal_v2->withdrawal.amount != amount ||
+                  withdrawal_v2->withdrawal.recipient != ethereum_recipient ||
+                  withdrawal_v2->withdrawal.b3_height !=
+                      static_cast<uint64_t>(snapshot.next_height) ||
+                  withdrawal_v2->transaction_id != created.tx->GetHash() ||
+                  !leaf_v2 || *leaf_v2 != withdrawal_v2->leaf)) ||
                 (decentralized &&
                  (authorization.withdrawal ||
+                  authorization.withdrawal_v2 ||
                   !authorization.decentralized_withdrawal ||
                   authorization.decentralized_withdrawal->burn_output_index !=
                       0 ||
@@ -2149,8 +2265,9 @@ RPCHelpMan bridgewithdraw()
                   !decentralized_leaf ||
                   *decentralized_leaf !=
                       authorization.decentralized_withdrawal->leaf)) ||
-                (!decentralized &&
+                (managed &&
                  (authorization.decentralized_withdrawal ||
+                  authorization.withdrawal_v2 ||
                   !authorization.withdrawal ||
                   authorization.withdrawal->burn_output_index != 0 ||
                   authorization.withdrawal->asset != *asset ||
@@ -2164,8 +2281,9 @@ RPCHelpMan bridgewithdraw()
             UniValue result{FinishAssetTransaction(
                 request, *wallet, created, options, snapshot, false,
                 /*disintegration=*/0,
-                decentralized ? "bridge-decentralized-withdrawal"
-                              : "bridge-managed-withdrawal")};
+                bridge_v2       ? "bridge-decentralized-withdrawal-v2"
+                : decentralized ? "bridge-decentralized-withdrawal"
+                                : "bridge-managed-withdrawal")};
             result.pushKV("asset_id", asset->GetHex());
             result.pushKV("amount", amount);
             result.pushKV("asset_change", asset_change);
@@ -2173,9 +2291,21 @@ RPCHelpMan bridgewithdraw()
             result.pushKV("burn_vout", 0);
             result.pushKV("binding_vout", 1);
             result.pushKV("withdrawal_mode",
-                          decentralized ? "decentralized-verifier-v1"
-                                        : "managed-v1");
-            if (authorization.decentralized_withdrawal) {
+                          bridge_v2       ? "decentralized-verifier-v2"
+                          : decentralized ? "decentralized-verifier-v1"
+                                          : "managed-v1");
+            if (withdrawal_v2) {
+                // The certificate is chosen by the relayer after the burn
+                // confirms: any accepted fresh-lineage certificate whose
+                // height covers it (getfinalitylineagecertificate).
+                result.pushKV("withdrawal_status", "pending-confirmation");
+                result.pushKV(
+                    "proof_rpc_after_confirmation",
+                    "getbridgewithdrawalproofv2 " +
+                        created.tx->GetHash().GetHex() + " " +
+                        std::to_string(withdrawal_v2->burn_output_index) +
+                        " <certificate_block>");
+            } else if (authorization.decentralized_withdrawal) {
                 result.pushKV("withdrawal_status", "pending-confirmation");
                 result.pushKV(
                     "proof_rpc_after_confirmation",
