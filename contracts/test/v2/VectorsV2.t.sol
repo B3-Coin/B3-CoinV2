@@ -36,6 +36,8 @@ contract VectorsV2Test is V2TestBase {
     uint256 private constant HISTORY_PATH_COUNT = 7;
     uint256 private constant WITHDRAWAL_LEAF_COUNT = 8;
     uint256 private constant WITHDRAWAL_PATH_COUNT = 2;
+    uint256 private constant BOOTSTRAP_ATTESTATION_COUNT = 2;
+    uint256 private constant MAPPING_SLOT_COUNT = 2;
 
     function test_SchemaAndListLengths() public view {
         string memory j = readVectorsV2();
@@ -48,6 +50,8 @@ contract VectorsV2Test is V2TestBase {
         _assertLength(j, ".leaf_v2", "", 1);
         _assertLength(j, ".withdrawal_tree_v2.paths", "", WITHDRAWAL_PATH_COUNT);
         _assertLength(j, ".asset_id_v2", "", 1);
+        _assertLength(j, ".bootstrap_attestation_v2", "", BOOTSTRAP_ATTESTATION_COUNT);
+        _assertLength(j, ".storage_layout_v2.mapping_slots", "", MAPPING_SLOT_COUNT);
     }
 
     function test_TagConstantsMatchStrings() public view {
@@ -56,11 +60,13 @@ contract VectorsV2Test is V2TestBase {
         assertEq(B3TypesV2.LINEAGE_TAG, sha256("B3/FINALITY/LINEAGE/V2"), "lineage tag");
         assertEq(B3TypesV2.ASSET_TAG, sha256("B3/BRIDGE/ASSET/V2"), "asset tag");
         assertEq(B3TypesV2.LEAF_TAG_V2, keccak256("B3/BRIDGE/WITHDRAWAL/V2"), "leaf tag");
+        assertEq(B3TypesV2.BOOTSTRAP_TAG, sha256("B3/BRIDGE/BOOTSTRAP/V2"), "bootstrap tag");
 
         assertEq(vm.parseJsonBytes32(j, ".tags.finality_v2"), B3TypesV2.FINALITY_TAG);
         assertEq(vm.parseJsonBytes32(j, ".tags.lineage_v2"), B3TypesV2.LINEAGE_TAG);
         assertEq(vm.parseJsonBytes32(j, ".tags.asset_v2"), B3TypesV2.ASSET_TAG);
         assertEq(vm.parseJsonBytes32(j, ".tags.leaf_v2"), B3TypesV2.LEAF_TAG_V2);
+        assertEq(vm.parseJsonBytes32(j, ".tags.bootstrap_v2"), B3TypesV2.BOOTSTRAP_TAG);
     }
 
     /// The generator's TaggedHash and LE64 machinery reproduces two committed
@@ -412,6 +418,56 @@ contract VectorsV2Test is V2TestBase {
         assertEq(asset, SPEC_ASSET_ID_V2, "AssetId V2 (spec)");
         // Version byte 2 separates it from V1's id for the same inputs.
         assertNotEq(asset, B3BridgeAssetId.compute(domain, originChainId, vault, token));
+    }
+
+    /// OI-12 (owner ruling R9): the 301-byte K_OF_N bootstrap message and its
+    /// digest for two deployments attesting the same statement. Every bound
+    /// field (domain, EVM chain id, verifier, start set) differs between the
+    /// cases, so the digests differ; neither equals the statement's digest V2.
+    function test_BootstrapAttestationV2() public view {
+        string memory j = readVectorsV2();
+        bytes32[2] memory expectedDomains = [_regtestChainDomain(), MAINNET_DOMAIN];
+        uint256[2] memory expectedChainIds = [uint256(31_337), 1];
+        address[2] memory expectedVerifiers =
+            [0x4444444444444444444444444444444444444444, 0x5555555555555555555555555555555555555555];
+        bytes32[2] memory digests;
+
+        for (uint256 i = 0; i < BOOTSTRAP_ATTESTATION_COUNT; ++i) {
+            string memory p = jsonKey(".bootstrap_attestation_v2", i, "");
+            bytes32 domain = vm.parseJsonBytes32(j, string.concat(p, ".chain_domain"));
+            uint256 chainId = vm.parseJsonUint(j, string.concat(p, ".evm_chain_id"));
+            address verifier = vm.parseJsonAddress(j, string.concat(p, ".verifier"));
+            uint256 startSet = vm.parseJsonUint(j, string.concat(p, ".start_set"));
+            bytes32 startSetHash = vm.parseJsonBytes32(j, string.concat(p, ".start_set_hash"));
+            uint256 fbIndex = vm.parseJsonUint(j, string.concat(p, ".finalized_block"));
+            bytes memory message = vm.parseJsonBytes(j, string.concat(p, ".message"));
+            bytes32 digest = vm.parseJsonBytes32(j, string.concat(p, ".digest"));
+            B3TypesV2.FinalizedBlockV2 memory fb = _finalizedBlock(j, jsonKey(".finalized_block_v2", fbIndex, ""));
+
+            assertEq(domain, expectedDomains[i], "chain domain");
+            assertEq(chainId, expectedChainIds[i], "EVM chain id");
+            assertEq(verifier, expectedVerifiers[i], "verifier");
+            assertEq(startSet, i, "start set");
+            assertEq(startSetHash, vm.parseJsonBytes32(j, jsonKey(".set_header_v2", startSet, ".set_hash")));
+            assertEq(fbIndex, 0, "the bootstrap-shaped statement");
+            assertEq(vm.parseJsonBytes(j, string.concat(p, ".fb_encoded")), B3TypesV2.encode(fb), "fb encoding");
+
+            assertEq(message.length, B3TypesV2.BOOTSTRAP_MESSAGE_LENGTH, "message length");
+            assertEq(
+                message,
+                abi.encodePacked(domain, chainId, verifier, startSetHash, B3TypesV2.encode(fb)),
+                "message layout"
+            );
+            assertEq(
+                B3TypesV2.bootstrapMessage(domain, chainId, verifier, startSetHash, fb), message, "library message"
+            );
+            bytes32 tag = B3TypesV2.BOOTSTRAP_TAG;
+            assertEq(sha256(abi.encodePacked(tag, tag, message)), digest, "TaggedHash");
+            assertEq(B3TypesV2.bootstrapDigest(domain, chainId, verifier, startSetHash, fb), digest, "library digest");
+            assertNotEq(digest, B3TypesV2.digest(domain, fb));
+            digests[i] = digest;
+        }
+        assertNotEq(digests[0], digests[1]);
     }
 
     /// The reference tree itself: zero table, root/path agreement at every

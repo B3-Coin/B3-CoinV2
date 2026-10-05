@@ -6,13 +6,15 @@
     "Block hashes, the vault, recipient and the 0x11 asset id are stand-ins.",
     "set_header_v2 reuses the real BLS key of contracts/test/BlsCertificateVector.t.sol with ruleset 2.",
     "history.roots[k] is the depth-32 root over leaves 0..k-1; roots[0] is the empty root zero_32.",
-    "F_d and F_x address vectors are added with the forwarder slice."
+    "F_d and F_x address vectors are added with the forwarder slice.",
+    "bootstrap_attestation_v2 verifiers and the storage_layout_v2 owner, upgraded token and vault are stand-ins."
   ],
   "tags": {
     "finality_v2": "0x0c34706d64f8869715ef48e23985b870335fe1f2afd7757587a890447d81ab73",
     "lineage_v2": "0x0e9e849914361999bf1b954c1a2ec3545fbe6d113f93b8ca21d0a45b56d8f9d3",
     "asset_v2": "0x7bf39d27dc845091cf66adcf93912e3ffeaed119a38c3d5bf4479821a90e16ce",
-    "leaf_v2": "0xc250a4de311e4369a5d75a6fdd6351f1cc8ec35929170d1374a5367a5edd10f5"
+    "leaf_v2": "0xc250a4de311e4369a5d75a6fdd6351f1cc8ec35929170d1374a5367a5edd10f5",
+    "bootstrap_v2": "0x1e12d61c624b35a72fb66b8d7c57438dbf5d9324d885ec2e9c3362668e75dd8b"
   },
   "anchors": {
     "v1_asset_id": {
@@ -711,5 +713,229 @@
       "preimage": "0x7bf39d27dc845091cf66adcf93912e3ffeaed119a38c3d5bf4479821a90e16ce7bf39d27dc845091cf66adcf93912e3ffeaed119a38c3d5bf4479821a90e16cea651262ae9031646047f290513d77ccae0fa9bd4e5afe7e07155a08d5dd1486a0201000000000000002222222222222222222222222222222222222222dac17f958d2ee523a2206206994597c13d831ec70606",
       "asset_id": "0xdb9e32397f3656fb2317c7829429f430cfefcf665c08a26774cb7b2fb3c76fcd"
     }
-  ]
+  ],
+  "bootstrap_attestation_v2": [
+    {
+      "name": "regtest",
+      "chain_domain": "0x1a3405424a805d6b95600c5b7598af38b1f8f3ba25bdb2636500c76ad3f43879",
+      "evm_chain_id": 31337,
+      "verifier": "0x4444444444444444444444444444444444444444",
+      "start_set": 0,
+      "start_set_hash": "0xc631d4251ee10b5f2f48fb4b9ad9c91fa9a3ff2bd645876b81771d80760df0d6",
+      "finalized_block": 0,
+      "fb_encoded": "0x1a963944632a75ae707940a80da3ba4625bc32d5a65f3c342ce75e379dd78446000000000000010a3eb15e38c1fe49793d90a4ed8a01f0cb39c2fd362fc0afc4d32041913bb6442e0000000000000000000000000000000000000000000000000000000000000000d577dae80a4733e62d77115a58a6f4c26339989bf8cd60c6ab0b8a42a104d425000000000000000000000000000000011243ccb653de3036ff1b508195e5b82a90ff7592a269e42cb347f901f11c476900",
+      "message": "0x1a3405424a805d6b95600c5b7598af38b1f8f3ba25bdb2636500c76ad3f438790000000000000000000000000000000000000000000000000000000000007a694444444444444444444444444444444444444444c631d4251ee10b5f2f48fb4b9ad9c91fa9a3ff2bd645876b81771d80760df0d61a963944632a75ae707940a80da3ba4625bc32d5a65f3c342ce75e379dd78446000000000000010a3eb15e38c1fe49793d90a4ed8a01f0cb39c2fd362fc0afc4d32041913bb6442e0000000000000000000000000000000000000000000000000000000000000000d577dae80a4733e62d77115a58a6f4c26339989bf8cd60c6ab0b8a42a104d425000000000000000000000000000000011243ccb653de3036ff1b508195e5b82a90ff7592a269e42cb347f901f11c476900",
+      "digest": "0x8a327426a0b105148b0229505a55b4543f85651b7d20f0c34a71e4e386a82fbe"
+    },
+    {
+      "name": "mainnet",
+      "chain_domain": "0xa651262ae9031646047f290513d77ccae0fa9bd4e5afe7e07155a08d5dd1486a",
+      "evm_chain_id": 1,
+      "verifier": "0x5555555555555555555555555555555555555555",
+      "start_set": 1,
+      "start_set_hash": "0xd577dae80a4733e62d77115a58a6f4c26339989bf8cd60c6ab0b8a42a104d425",
+      "finalized_block": 0,
+      "fb_encoded": "0x1a963944632a75ae707940a80da3ba4625bc32d5a65f3c342ce75e379dd78446000000000000010a3eb15e38c1fe49793d90a4ed8a01f0cb39c2fd362fc0afc4d32041913bb6442e0000000000000000000000000000000000000000000000000000000000000000d577dae80a4733e62d77115a58a6f4c26339989bf8cd60c6ab0b8a42a104d425000000000000000000000000000000011243ccb653de3036ff1b508195e5b82a90ff7592a269e42cb347f901f11c476900",
+      "message": "0xa651262ae9031646047f290513d77ccae0fa9bd4e5afe7e07155a08d5dd1486a00000000000000000000000000000000000000000000000000000000000000015555555555555555555555555555555555555555d577dae80a4733e62d77115a58a6f4c26339989bf8cd60c6ab0b8a42a104d4251a963944632a75ae707940a80da3ba4625bc32d5a65f3c342ce75e379dd78446000000000000010a3eb15e38c1fe49793d90a4ed8a01f0cb39c2fd362fc0afc4d32041913bb6442e0000000000000000000000000000000000000000000000000000000000000000d577dae80a4733e62d77115a58a6f4c26339989bf8cd60c6ab0b8a42a104d425000000000000000000000000000000011243ccb653de3036ff1b508195e5b82a90ff7592a269e42cb347f901f11c476900",
+      "digest": "0x914c90a8048681ac42109eba8aa27d8848fc1e3473c61c5d503bbc87147a48c7"
+    }
+  ],
+  "storage_layout_v2": {
+    "verifier": {
+      "slots": {
+        "liveness": 0,
+        "current_set_hash": 1,
+        "next_set_hash": 2,
+        "latest": 4,
+        "latest_cert_id": 6
+      },
+      "liveness_fields": [
+        {
+          "name": "current_epoch",
+          "offset": 0,
+          "bits": 64
+        },
+        {
+          "name": "last_rotation_time",
+          "offset": 64,
+          "bits": 40
+        },
+        {
+          "name": "last_certificate_time",
+          "offset": 104,
+          "bits": 40
+        },
+        {
+          "name": "latest_bridge_height",
+          "offset": 144,
+          "bits": 64
+        },
+        {
+          "name": "status",
+          "offset": 208,
+          "bits": 8
+        },
+        {
+          "name": "deposits_closed",
+          "offset": 216,
+          "bits": 8
+        }
+      ],
+      "liveness_unused_from_bit": 224,
+      "liveness_examples": [
+        {
+          "word": "0x000000000001000000000000014600684f24dc00684f238f0000000000000003",
+          "current_epoch": 3,
+          "last_rotation_time": 1750016911,
+          "last_certificate_time": 1750017244,
+          "latest_bridge_height": 326,
+          "status": 1,
+          "deposits_closed": 0
+        },
+        {
+          "word": "0x000000000103ffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "current_epoch": 18446744073709551615,
+          "last_rotation_time": 1099511627775,
+          "last_certificate_time": 1099511627775,
+          "latest_bridge_height": 18446744073709551615,
+          "status": 3,
+          "deposits_closed": 1
+        }
+      ],
+      "latest_fields": [
+        {
+          "name": "height",
+          "offset": 0,
+          "bits": 64
+        },
+        {
+          "name": "index",
+          "offset": 64,
+          "bits": 64
+        },
+        {
+          "name": "init_time",
+          "offset": 128,
+          "bits": 40
+        }
+      ],
+      "latest_unused_from_bit": 168,
+      "latest_examples": [
+        {
+          "word": "0x000000000000000000000000684ee1ef00000000000000030000000000000114",
+          "height": 276,
+          "index": 3,
+          "init_time": 1750000111
+        },
+        {
+          "word": "0x0000000000000000000000ffffffffffffffffffffffffffffffffffffffffff",
+          "height": 18446744073709551615,
+          "index": 18446744073709551615,
+          "init_time": 1099511627775
+        }
+      ]
+    },
+    "vault": {
+      "slots": {
+        "next_deposit_id": 0,
+        "locked": 1,
+        "absorbed_total": 3
+      },
+      "next_deposit_id_bits": 64,
+      "examples": [
+        {
+          "slot": 0,
+          "word": "0x0000000000000000000000000000000000000000000000000000000000000002",
+          "value": 2
+        },
+        {
+          "slot": 0,
+          "word": "0x000000000000000000000000000000000000000000000000ffffffffffffffff",
+          "value": 18446744073709551615
+        },
+        {
+          "slot": 1,
+          "word": "0x000000000000000000000000000000000000000000000000000000003dfd2400",
+          "value": 1040000000
+        },
+        {
+          "slot": 3,
+          "word": "0x0000000000000000000000000000000000000000000000000000000003938700",
+          "value": 60000000
+        }
+      ]
+    },
+    "token": {
+      "slots": {
+        "owner_paused": 0,
+        "balances": 2,
+        "is_black_listed": 6,
+        "upgraded_deprecated": 10
+      },
+      "slot0_fields": [
+        {
+          "name": "owner",
+          "offset": 0,
+          "bits": 160
+        },
+        {
+          "name": "paused",
+          "offset": 160,
+          "bits": 8
+        }
+      ],
+      "slot0_unused_from_bit": 168,
+      "slot0_examples": [
+        {
+          "word": "0x0000000000000000000000006666666666666666666666666666666666666666",
+          "owner": "0x6666666666666666666666666666666666666666",
+          "paused": 0
+        },
+        {
+          "word": "0x0000000000000000000000016666666666666666666666666666666666666666",
+          "owner": "0x6666666666666666666666666666666666666666",
+          "paused": 1
+        }
+      ],
+      "slot10_fields": [
+        {
+          "name": "upgraded_address",
+          "offset": 0,
+          "bits": 160
+        },
+        {
+          "name": "deprecated",
+          "offset": 160,
+          "bits": 8
+        }
+      ],
+      "slot10_unused_from_bit": 168,
+      "slot10_examples": [
+        {
+          "word": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "upgraded_address": "0x0000000000000000000000000000000000000000",
+          "deprecated": 0
+        },
+        {
+          "word": "0x0000000000000000000000017777777777777777777777777777777777777777",
+          "upgraded_address": "0x7777777777777777777777777777777777777777",
+          "deprecated": 1
+        }
+      ]
+    },
+    "mapping_slots": [
+      {
+        "name": "token.balances[vault]",
+        "key": "0x2222222222222222222222222222222222222222",
+        "slot": 2,
+        "storage_key": "0x74b48303b668c996c09b610daf2f53f83448dd15b9ac57e9e8fb1ff2f745c71d"
+      },
+      {
+        "name": "token.isBlackListed[vault]",
+        "key": "0x2222222222222222222222222222222222222222",
+        "slot": 6,
+        "storage_key": "0x0a3e3a135c9eb9a4f916a39edbe9cf899cba91b2a6ec56f43a0ae8ee4b3185de"
+      }
+    ]
+  }
 }

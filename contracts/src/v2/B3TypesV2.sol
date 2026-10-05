@@ -5,13 +5,14 @@ import {B3Types} from "../IB3FinalityProver.sol";
 
 /// Shared, fixed-width objects and hashes for the B3 bridge V2 contracts.
 ///
-/// doc/design/b3-bridge-v2-contracts-spec.md §2.1-§2.2, §2.5 and §6.4 are
-/// normative for every byte layout here. Integers are big-endian
-/// (abi.encodePacked) except the little-endian origin chain id inside the
-/// AssetId preimage, which mirrors B3's BridgeAssetIdV1 serialization
-/// (src/modern/bridge_asset.h). V2 reuses V1's 110-byte SetHeader
-/// (B3Types.SetHeader) with rulesetVersion 2, so every V1 header is rejected
-/// by headerShapeValid below. The V1 library is imported, never modified.
+/// doc/design/b3-bridge-v2-contracts-spec.md §2.1-§2.2, §2.5, §5 (the
+/// bootstrap digest) and §6.4 are normative for every byte layout here.
+/// Integers are big-endian (abi.encodePacked) except the little-endian
+/// origin chain id inside the AssetId preimage, which mirrors B3's
+/// BridgeAssetIdV1 serialization (src/modern/bridge_asset.h). V2 reuses V1's
+/// 110-byte SetHeader (B3Types.SetHeader) with rulesetVersion 2, so every V1
+/// header is rejected by headerShapeValid below. The V1 library is imported,
+/// never modified.
 ///
 /// Tag hashes are hard-coded so no sha256 precompile call is spent on them;
 /// test/v2/VectorsV2.t.sol checks each one against its string.
@@ -26,9 +27,13 @@ library B3TypesV2 {
     uint256 internal constant FINALIZED_BLOCK_V2_LENGTH = 185;
     uint256 internal constant ASSET_ID_PREIMAGE_LENGTH = 147;
     uint256 internal constant WITHDRAWAL_LEAF_PREIMAGE_LENGTH = 180;
+    /// chainDomain ‖ u256 evmChainId ‖ verifier ‖ startSetHash ‖ encode(fb).
+    uint256 internal constant BOOTSTRAP_MESSAGE_LENGTH = 301;
 
     /// sha256("B3/FINALITY/V2")
     bytes32 internal constant FINALITY_TAG = 0x0c34706d64f8869715ef48e23985b870335fe1f2afd7757587a890447d81ab73;
+    /// sha256("B3/BRIDGE/BOOTSTRAP/V2")
+    bytes32 internal constant BOOTSTRAP_TAG = 0x1e12d61c624b35a72fb66b8d7c57438dbf5d9324d885ec2e9c3362668e75dd8b;
     /// sha256("B3/FINALITY/LINEAGE/V2")
     bytes32 internal constant LINEAGE_TAG = 0x0e9e849914361999bf1b954c1a2ec3545fbe6d113f93b8ca21d0a45b56d8f9d3;
     /// sha256("B3/BRIDGE/ASSET/V2")
@@ -97,6 +102,38 @@ library B3TypesV2 {
     /// digestV2 = TaggedHash("B3/FINALITY/V2", chainDomain ‖ encode(fb)); the BLS message.
     function digest(bytes32 chainDomain, FinalizedBlockV2 memory fb) internal pure returns (bytes32) {
         return sha256(abi.encodePacked(FINALITY_TAG, FINALITY_TAG, chainDomain, encode(fb)));
+    }
+
+    /// The 301-byte K_OF_N bootstrap statement (open issue OI-12, owner ruling
+    /// R9 of 2026-10-05): chainDomain ‖ u256 evmChainId ‖ verifier ‖
+    /// startSetHash ‖ encode(fb). The EVM chain id is a full big-endian word,
+    /// never truncated.
+    function bootstrapMessage(
+        bytes32 chainDomain,
+        uint256 evmChainId,
+        address verifier,
+        bytes32 startSetHash,
+        FinalizedBlockV2 memory fb
+    ) internal pure returns (bytes memory) {
+        return abi.encodePacked(chainDomain, evmChainId, verifier, startSetHash, encode(fb));
+    }
+
+    /// bootstrapDigestV2 = TaggedHash("B3/BRIDGE/BOOTSTRAP/V2", bootstrapMessage(...)):
+    /// the BLS message the K_OF_N bootstrap keys sign. Its tag differs from
+    /// digest's, so a bootstrap attestation never verifies as a committee
+    /// certificate and a certificate never verifies as an attestation.
+    function bootstrapDigest(
+        bytes32 chainDomain,
+        uint256 evmChainId,
+        address verifier,
+        bytes32 startSetHash,
+        FinalizedBlockV2 memory fb
+    ) internal pure returns (bytes32) {
+        return sha256(
+            abi.encodePacked(
+                BOOTSTRAP_TAG, BOOTSTRAP_TAG, bootstrapMessage(chainDomain, evmChainId, verifier, startSetHash, fb)
+            )
+        );
     }
 
     /// certId = keccak256(encode(fb)); equal for every aggregation of one statement.

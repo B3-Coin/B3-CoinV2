@@ -7,9 +7,11 @@
 Writes one JSON file, bridge_v2_vectors.json, for the Foundry suite
 (contracts/test/v2/VectorsV2.t.sol) and the B3 C++ unit tests. It holds
 lineage ids, ruleset-2 SetHeaders, FinalizedBlockV2 encodings with digest V2
-and certId, history leaves, roots and paths, leaf V2 with a withdrawal tree
-and the bUSD V2 AssetId. F_d and F_x address vectors join with the forwarder
-slice.
+and certId, history leaves, roots and paths, leaf V2 with a withdrawal tree,
+the bUSD V2 AssetId, the OI-12 K_OF_N bootstrap attestation message and digest
+(contracts spec §5 step 3) and the storage slots B3 proves by EIP-1186
+(contracts spec §3.2, §6.6; Tether's mainnet layout). F_d and F_x address
+vectors join with the forwarder slice.
 
 This generator is independent of the Solidity code: it uses only the python3
 standard library (hashlib.sha256) and the Keccak-256 implementation below. It
@@ -155,8 +157,12 @@ TAG_FINALITY_V2 = "B3/FINALITY/V2"
 TAG_LINEAGE_V2 = "B3/FINALITY/LINEAGE/V2"
 TAG_ASSET_V2 = "B3/BRIDGE/ASSET/V2"
 TAG_LEAF_V2 = "B3/BRIDGE/WITHDRAWAL/V2"
+TAG_BOOTSTRAP_V2 = "B3/BRIDGE/BOOTSTRAP/V2"
 LEAF_TAG_V2 = keccak256(TAG_LEAF_V2.encode())
 assert hx(LEAF_TAG_V2) == "0xc250a4de311e4369a5d75a6fdd6351f1cc8ec35929170d1374a5367a5edd10f5"
+# contracts/src/v2/B3TypesV2.sol BOOTSTRAP_TAG.
+assert sha256(TAG_BOOTSTRAP_V2.encode()).hex() == "1e12d61c624b35a72fb66b8d7c57438dbf5d9324d885ec2e9c3362668e75dd8b"
+BOOTSTRAP_MESSAGE_LENGTH = 301
 
 RULESET_V2 = 2
 HISTORY_DEPTH = 32
@@ -176,6 +182,13 @@ USDT = address("dac17f958d2ee523a2206206994597c13d831ec7")
 STAND_IN_VAULT = address("22" * 20)
 STAND_IN_RECIPIENT = address("33" * 20)
 STAND_IN_ASSET_ID = b32("11" * 32)
+STAND_IN_VERIFIER_REGTEST = address("44" * 20)
+STAND_IN_VERIFIER_MAINNET = address("55" * 20)
+STAND_IN_TOKEN_OWNER = address("66" * 20)
+STAND_IN_UPGRADED_TOKEN = address("77" * 20)
+# The EVM chain ids of anvil (regtest) and Ethereum mainnet.
+REGTEST_EVM_CHAIN_ID = 31337
+MAINNET_EVM_CHAIN_ID = 1
 
 # Regtest fixture geometry (finality dependency §8 RT4 item 1: R_f = 262,
 # R_f - 1 = 261, interval 5). V is the S4 verifier fixture's G + 50.
@@ -279,6 +292,23 @@ def encode_finalized_block(fb):
 
 def digest_v2(chain_domain, fb):
     return tagged_hash(TAG_FINALITY_V2, chain_domain + encode_finalized_block(fb))
+
+
+def bootstrap_message(chain_domain, evm_chain_id, verifier, start_set_hash, fb):
+    """OI-12: chainDomain || u256 evmChainId || verifier || startSetHash || encode(fb)."""
+    message = chain_domain + u256(evm_chain_id) + verifier + start_set_hash + encode_finalized_block(fb)
+    assert len(message) == BOOTSTRAP_MESSAGE_LENGTH
+    return message
+
+
+def address_word(value):
+    """A 20-byte address as a 32-byte storage word (12 zero bytes first)."""
+    return bytes(12) + value
+
+
+def mapping_slot(key_word, slot):
+    """Solidity mapping entry: keccak256(key word || u256 slot)."""
+    return keccak256(key_word + u256(slot))
 
 
 def asset_id_preimage(tag, version, chain_domain, origin_chain_id, vault, token):
@@ -491,6 +521,165 @@ def asset_ids():
     }]
 
 
+def bootstrap_attestations(headers, finalized_objects):
+    """OI-12 (owner ruling R9): the K_OF_N bootstrap keys sign
+    TaggedHash("B3/BRIDGE/BOOTSTRAP/V2", bootstrap_message(...)). Both cases
+    attest finalized_block_v2[0] under another domain, chain id, verifier and
+    start set, so every bound field changes the digest."""
+    fb_index = 0
+    fb = finalized_objects[fb_index]
+    cases = [
+        ("regtest", regtest_chain_domain(), REGTEST_EVM_CHAIN_ID, STAND_IN_VERIFIER_REGTEST, 0),
+        ("mainnet", MAINNET_DOMAIN, MAINNET_EVM_CHAIN_ID, STAND_IN_VERIFIER_MAINNET, 1),
+    ]
+    out = []
+    for name, domain, evm_chain_id, verifier, start_set in cases:
+        start_set_hash = b32(headers[start_set]["set_hash"])
+        message = bootstrap_message(domain, evm_chain_id, verifier, start_set_hash, fb)
+        digest = tagged_hash(TAG_BOOTSTRAP_V2, message)
+        # A bootstrap attestation never equals a committee certificate's message.
+        assert digest != digest_v2(domain, fb)
+        out.append({
+            "name": name,
+            "chain_domain": hx(domain),
+            "evm_chain_id": evm_chain_id,
+            "verifier": hx(verifier),
+            "start_set": start_set,
+            "start_set_hash": hx(start_set_hash),
+            "finalized_block": fb_index,
+            "fb_encoded": hx(encode_finalized_block(fb)),
+            "message": hx(message),
+            "digest": hx(digest),
+        })
+    assert out[0]["digest"] != out[1]["digest"]
+    return out
+
+
+# Storage layouts (contracts spec §3.2, §6.6; Tether's mainnet layout as
+# contracts/regtest/MockTetherToken.sol mirrors it). Packing follows
+# declaration order, first member in the low-order bits.
+VERIFIER_SLOTS = {"liveness": 0, "current_set_hash": 1, "next_set_hash": 2, "latest": 4, "latest_cert_id": 6}
+LIVENESS_FIELDS = [
+    ("current_epoch", 0, 64),
+    ("last_rotation_time", 64, 40),
+    ("last_certificate_time", 104, 40),
+    ("latest_bridge_height", 144, 64),
+    ("status", 208, 8),
+    ("deposits_closed", 216, 8),
+]
+LATEST_FIELDS = [("height", 0, 64), ("index", 64, 64), ("init_time", 128, 40)]
+VAULT_SLOTS = {"next_deposit_id": 0, "locked": 1, "absorbed_total": 3}
+VAULT_NEXT_DEPOSIT_ID_BITS = 64
+TOKEN_SLOTS = {"owner_paused": 0, "balances": 2, "is_black_listed": 6, "upgraded_deprecated": 10}
+TOKEN_SLOT0_FIELDS = [("owner", 0, 160), ("paused", 160, 8)]
+TOKEN_SLOT10_FIELDS = [("upgraded_address", 0, 160), ("deprecated", 160, 8)]
+ADDRESS_FIELDS = {"owner", "upgraded_address"}
+
+
+def unused_from_bit(fields):
+    end = 0
+    for _, offset, bits in fields:
+        assert offset == end, "fields are contiguous from bit 0"
+        end = offset + bits
+    return end
+
+
+def packed_example(fields, values):
+    word = 0
+    entry = {}
+    for name, offset, bits in fields:
+        value = values[name]
+        number = int.from_bytes(value, "big") if name in ADDRESS_FIELDS else value
+        assert 0 <= number < (1 << bits), name
+        word |= number << offset
+        entry[name] = hx(value) if name in ADDRESS_FIELDS else value
+    assert word < (1 << unused_from_bit(fields))
+    return {"word": hx(u256(word)), **entry}
+
+
+def field_list(fields):
+    return [{"name": name, "offset": offset, "bits": bits} for name, offset, bits in fields]
+
+
+def storage_layout():
+    max40 = (1 << 40) - 1
+    max64 = (1 << 64) - 1
+    liveness_examples = [
+        packed_example(LIVENESS_FIELDS, {
+            "current_epoch": 3, "last_rotation_time": 1_750_016_911, "last_certificate_time": 1_750_017_244,
+            "latest_bridge_height": 326, "status": 1, "deposits_closed": 0,
+        }),
+        packed_example(LIVENESS_FIELDS, {
+            "current_epoch": max64, "last_rotation_time": max40, "last_certificate_time": max40,
+            "latest_bridge_height": max64, "status": 3, "deposits_closed": 1,
+        }),
+    ]
+    latest_examples = [
+        packed_example(LATEST_FIELDS, {"height": 276, "index": 3, "init_time": 1_750_000_111}),
+        packed_example(LATEST_FIELDS, {"height": max64, "index": max64, "init_time": max40}),
+    ]
+    vault_examples = [
+        {"slot": VAULT_SLOTS["next_deposit_id"], "word": hx(u256(2)), "value": 2},
+        {"slot": VAULT_SLOTS["next_deposit_id"], "word": hx(u256(max64)), "value": max64},
+        {"slot": VAULT_SLOTS["locked"], "word": hx(u256(1_040_000_000)), "value": 1_040_000_000},
+        {"slot": VAULT_SLOTS["absorbed_total"], "word": hx(u256(60_000_000)), "value": 60_000_000},
+    ]
+    token_slot0_examples = [
+        packed_example(TOKEN_SLOT0_FIELDS, {"owner": STAND_IN_TOKEN_OWNER, "paused": 0}),
+        packed_example(TOKEN_SLOT0_FIELDS, {"owner": STAND_IN_TOKEN_OWNER, "paused": 1}),
+    ]
+    token_slot10_examples = [
+        packed_example(TOKEN_SLOT10_FIELDS, {"upgraded_address": bytes(20), "deprecated": 0}),
+        packed_example(TOKEN_SLOT10_FIELDS, {"upgraded_address": STAND_IN_UPGRADED_TOKEN, "deprecated": 1}),
+    ]
+
+    balances = mapping_slot(address_word(STAND_IN_VAULT), TOKEN_SLOTS["balances"])
+    blacklisted = mapping_slot(address_word(STAND_IN_VAULT), TOKEN_SLOTS["is_black_listed"])
+    # cast 1.7.1: cast index address 0x2222222222222222222222222222222222222222 2 (and 6).
+    assert balances.hex() == "74b48303b668c996c09b610daf2f53f83448dd15b9ac57e9e8fb1ff2f745c71d"
+    assert blacklisted.hex() == "0a3e3a135c9eb9a4f916a39edbe9cf899cba91b2a6ec56f43a0ae8ee4b3185de"
+
+    return {
+        "verifier": {
+            "slots": VERIFIER_SLOTS,
+            "liveness_fields": field_list(LIVENESS_FIELDS),
+            "liveness_unused_from_bit": unused_from_bit(LIVENESS_FIELDS),
+            "liveness_examples": liveness_examples,
+            "latest_fields": field_list(LATEST_FIELDS),
+            "latest_unused_from_bit": unused_from_bit(LATEST_FIELDS),
+            "latest_examples": latest_examples,
+        },
+        "vault": {
+            "slots": VAULT_SLOTS,
+            "next_deposit_id_bits": VAULT_NEXT_DEPOSIT_ID_BITS,
+            "examples": vault_examples,
+        },
+        "token": {
+            "slots": TOKEN_SLOTS,
+            "slot0_fields": field_list(TOKEN_SLOT0_FIELDS),
+            "slot0_unused_from_bit": unused_from_bit(TOKEN_SLOT0_FIELDS),
+            "slot0_examples": token_slot0_examples,
+            "slot10_fields": field_list(TOKEN_SLOT10_FIELDS),
+            "slot10_unused_from_bit": unused_from_bit(TOKEN_SLOT10_FIELDS),
+            "slot10_examples": token_slot10_examples,
+        },
+        "mapping_slots": [
+            {
+                "name": "token.balances[vault]",
+                "key": hx(STAND_IN_VAULT),
+                "slot": TOKEN_SLOTS["balances"],
+                "storage_key": hx(balances),
+            },
+            {
+                "name": "token.isBlackListed[vault]",
+                "key": hx(STAND_IN_VAULT),
+                "slot": TOKEN_SLOTS["is_black_listed"],
+                "storage_key": hx(blacklisted),
+            },
+        ],
+    }
+
+
 def build():
     headers = set_headers()
     history_section, heights, block_hashes, roots = history()
@@ -521,6 +710,7 @@ def build():
     # certificates at exactly V and above V; the last one carries bit 0.
     cases = [(0, 1, 0, 0), (2, 10, 1, 0), (1, 11, 1, 1)]
     finalized = []
+    finalized_objects = []
     for lineage_index, index, epoch, flags in cases:
         name, domain = domains[lineage_index]
         height = heights[index]
@@ -536,6 +726,7 @@ def build():
             "bridge_flags": flags,
         }
         encoded = encode_finalized_block(fb)
+        finalized_objects.append(fb)
         finalized.append({
             "lineage": lineage_index,
             "chain_domain": hx(domain),
@@ -562,12 +753,14 @@ def build():
             "set_header_v2 reuses the real BLS key of contracts/test/BlsCertificateVector.t.sol with ruleset 2.",
             "history.roots[k] is the depth-32 root over leaves 0..k-1; roots[0] is the empty root zero_32.",
             "F_d and F_x address vectors are added with the forwarder slice.",
+            "bootstrap_attestation_v2 verifiers and the storage_layout_v2 owner, upgraded token and vault are stand-ins.",
         ],
         "tags": {
             "finality_v2": hx(sha256(TAG_FINALITY_V2.encode())),
             "lineage_v2": hx(sha256(TAG_LINEAGE_V2.encode())),
             "asset_v2": hx(sha256(TAG_ASSET_V2.encode())),
             "leaf_v2": hx(LEAF_TAG_V2),
+            "bootstrap_v2": hx(sha256(TAG_BOOTSTRAP_V2.encode())),
         },
         "anchors": v1_anchors(),
         "lineage": lineage,
@@ -577,6 +770,8 @@ def build():
         "leaf_v2": leaf_v2,
         "withdrawal_tree_v2": withdrawal_tree,
         "asset_id_v2": asset_ids(),
+        "bootstrap_attestation_v2": bootstrap_attestations(headers, finalized_objects),
+        "storage_layout_v2": storage_layout(),
     }
 
 

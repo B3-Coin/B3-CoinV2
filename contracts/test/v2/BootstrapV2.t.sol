@@ -8,9 +8,11 @@ import {B3Types} from "../../src/IB3FinalityProver.sol";
 import {B3TypesV2} from "../../src/v2/B3TypesV2.sol";
 import {B3FinalityVerifierV2} from "../../src/v2/B3FinalityVerifierV2.sol";
 
-/// B3FinalityVerifierV2 bootstrap (contracts spec §5, open issue OI-1) and the
-/// watcher cancel. K_OF_N (default, B-11) and START_CERTIFICATE (alternative,
-/// C-2) both run on real BLS signatures from the in-EVM signer.
+/// B3FinalityVerifierV2 bootstrap (contracts spec §5, open issues OI-1 and
+/// OI-12) and the watcher cancel. K_OF_N (default, B-11) and
+/// START_CERTIFICATE (alternative, C-2) both run on real BLS signatures from
+/// the in-EVM signer. Under K_OF_N the keys sign the OI-12 bootstrap digest,
+/// bound to the verifier address, the EVM chain id and START_SET_HASH.
 contract BootstrapV2Test is VerifierFixtureV2 {
     B3FinalityVerifierV2.BootstrapMode private constant K_OF_N = B3FinalityVerifierV2.BootstrapMode.K_OF_N;
     B3FinalityVerifierV2.BootstrapMode private constant START_CERT =
@@ -25,7 +27,7 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         assertEq(v.status(), B3TypesV2.STATUS_UNINITIALIZED);
         assertEq(v.START_SET_HASH(), genesisSetHash, "epoch 0 starts at Set'0");
 
-        Init memory a = initArgs(2, bootstrapKeys(), s0, s1, Signer.ids(3));
+        Init memory a = initArgs(v, 2, bootstrapKeys(), s0, s1, Signer.ids(3));
         bytes32 certId = B3TypesV2.certId(a.fb);
         vm.expectEmit(address(v));
         emit B3FinalityVerifierV2.Initialized(certId, 0, heightAt(2), s1.setHash, hex"07");
@@ -61,7 +63,7 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         Signer.TestSet memory s3 = lineageSet(3);
         B3FinalityVerifierV2 v = deploy(K_OF_N, 2, s2.setHash);
         // Any three of the four keys: here keys 0, 2 and 3.
-        doInit(v, initArgs(3, bootstrapKeys(), s2, s3, Signer.ids(1)));
+        doInit(v, initArgs(v, 3, bootstrapKeys(), s2, s3, Signer.ids(1)));
         assertEq(uint256(v.currentEpoch()), 2);
         assertEq(v.currentSetHash(), s2.setHash);
         assertEq(v.nextSetHash(), s3.setHash);
@@ -77,53 +79,22 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         assertEq(v.nextSetHash(), s4.setHash);
     }
 
-    /// Documents the K_OF_N attestation scope (reported to the owner as a
-    /// spec §5 gap). The bootstrap keys sign digestV2(fb) only, which binds
-    /// the lineage, epoch k and the successor, but not START_SET_HASH for
-    /// k > 0 nor the deployment: one published attestation initializes a
-    /// second deployment whose deployer pinned another epoch-k set, and that
-    /// set then certifies until the first handover. Only review of the pins
-    /// against getfinalitylineage catches it. At k = 0 the start set is
-    /// bound through the lineage (the constructor requires GENESIS_SET_HASH).
-    function test_KOfN_AttestationDoesNotBindStartSetOrDeployment() public {
-        Signer.TestSet memory s2 = lineageSet(2);
-        Signer.TestSet memory s3 = lineageSet(3);
-        Signer.TestSet memory pinnedElsewhere = rogueSet(2);
-        B3FinalityVerifierV2 honest = deploy(K_OF_N, 2, s2.setHash);
-        B3FinalityVerifierV2 other = deploy(K_OF_N, 2, pinnedElsewhere.setHash);
-
-        Init memory a = initArgs(3, bootstrapKeys(), s2, s3, Signer.ids(1));
-        doInit(honest, a);
-        a.startSet = Signer.copyHeader(pinnedElsewhere.header);
-        doInit(other, a);
-        assertEq(other.currentSetHash(), pinnedElsewhere.setHash);
-        assertEq(other.nextSetHash(), s3.setHash, "the successor is attested");
-        submit(other, certify(CANONICAL, 5, 3, pinnedElsewhere, s3));
-        assertEq(uint256(other.latestIndex()), 5);
-
-        // k = 0: any start set other than the lineage's genesis set is refused.
-        B3FinalityVerifierV2.Config memory c = config(K_OF_N, 0, rogueSet(0).setHash, profileR());
-        address[] memory watchers = defaultWatchers();
-        vm.expectRevert(B3FinalityVerifierV2.BadConfig.selector);
-        new B3FinalityVerifierV2(c, bootstrapHeader, watchers);
-    }
-
     function test_KOfN_FourOfFourAlsoAccepted() public {
         Signer.TestSet memory s0 = lineageSet(0);
         B3FinalityVerifierV2 v = deploy(K_OF_N, 0, s0.setHash);
-        doInit(v, initArgs(1, bootstrapKeys(), s0, lineageSet(1), Signer.none()));
+        doInit(v, initArgs(v, 1, bootstrapKeys(), s0, lineageSet(1), Signer.none()));
         assertEq(v.status(), B3TypesV2.STATUS_LIVE);
     }
 
     function test_KOfN_TwoOfFourRejected() public {
         Signer.TestSet memory s0 = lineageSet(0);
         B3FinalityVerifierV2 v = deploy(K_OF_N, 0, s0.setHash);
-        Init memory a = initArgs(2, bootstrapKeys(), s0, lineageSet(1), Signer.ids(2, 3));
+        Init memory a = initArgs(v, 2, bootstrapKeys(), s0, lineageSet(1), Signer.ids(2, 3));
         expectInitRevert(v, a, B3FinalityVerifierV2.ProofRejected.selector);
         // A two-key proof with a bitmap claiming three signers fails the pairing.
         Signer.TestSet memory keys = bootstrapKeys();
-        Signer.Parts memory p = Signer.signParts(harness, keys, digestOf(a.fb), Signer.ids(3));
-        p.signature = Signer.aggregateSignature(harness, keys, digestOf(a.fb), Signer.ids(0, 1));
+        Signer.Parts memory p = Signer.signParts(harness, keys, initMessage(v, a.fb), Signer.ids(3));
+        p.signature = Signer.aggregateSignature(harness, keys, initMessage(v, a.fb), Signer.ids(0, 1));
         a.proof = Signer.encode(p);
         expectInitRevert(v, a, B3FinalityVerifierV2.ProofRejected.selector);
         assertEq(v.status(), B3TypesV2.STATUS_UNINITIALIZED);
@@ -175,6 +146,161 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         new B3FinalityVerifierV2(c, bootstrapHeader, defaultWatchers());
     }
 
+    // ======================================== OI-12 attestation binding (R9)
+
+    /// Two deployments with identical immutables (lineage, start set,
+    /// bootstrap header, windows, watchers) differ only in address. A's
+    /// attestation is refused by B before and after A goes live, and each
+    /// verifier takes exactly the attestation signed for it.
+    function test_OI12_AttestationForOneVerifierRefusedByAnother() public {
+        Signer.TestSet memory s2 = lineageSet(2);
+        Signer.TestSet memory s3 = lineageSet(3);
+        Signer.TestSet memory keys = bootstrapKeys();
+        B3FinalityVerifierV2 a = deploy(K_OF_N, 2, s2.setHash);
+        B3FinalityVerifierV2 b = deploy(K_OF_N, 2, s2.setHash);
+        assertTrue(address(a) != address(b));
+        assertEq(a.START_SET_HASH(), b.START_SET_HASH());
+        assertEq(a.BOOTSTRAP_SET_HASH(), b.BOOTSTRAP_SET_HASH());
+        assertEq(a.LINEAGE_ID(), b.LINEAGE_ID());
+
+        Init memory forA = initArgs(a, 3, keys, s2, s3, Signer.ids(1));
+        Init memory forB = initArgs(b, 3, keys, s2, s3, Signer.ids(1));
+        assertTrue(keccak256(forA.proof) != keccak256(forB.proof), "one message per verifier");
+        expectInitRevert(b, forA, B3FinalityVerifierV2.ProofRejected.selector);
+        assertEq(b.status(), B3TypesV2.STATUS_UNINITIALIZED);
+
+        doInit(a, forA);
+        assertEq(a.status(), B3TypesV2.STATUS_LIVE);
+        expectInitRevert(b, forA, B3FinalityVerifierV2.ProofRejected.selector);
+        doInit(b, forB);
+        assertEq(b.status(), B3TypesV2.STATUS_LIVE);
+    }
+
+    /// The EVM chain id is bound. On 31337 an attestation for chain 1 is
+    /// refused; the 31337 attestation is refused once the chain id reads
+    /// 31338 (same verifier address, as a replayed deployment would have),
+    /// and the attestation signed for 31338 is accepted there.
+    function test_OI12_AttestationRefusedOnAnotherChainId() public {
+        Signer.TestSet memory s0 = lineageSet(0);
+        Signer.TestSet memory s1 = lineageSet(1);
+        Signer.TestSet memory keys = bootstrapKeys();
+        B3FinalityVerifierV2 v = deploy(K_OF_N, 0, s0.setHash);
+        assertEq(block.chainid, v.REGTEST_CHAIN_ID());
+
+        Init memory forRegtest = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
+        Init memory forMainnet = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
+        forMainnet.proof = signBootstrap(keys, address(v), 1, s0.setHash, forMainnet.fb, Signer.ids(3));
+        expectInitRevert(v, forMainnet, B3FinalityVerifierV2.ProofRejected.selector);
+
+        vm.chainId(31_338);
+        expectInitRevert(v, forRegtest, B3FinalityVerifierV2.ProofRejected.selector);
+        assertEq(v.status(), B3TypesV2.STATUS_UNINITIALIZED);
+
+        Init memory here = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
+        assertTrue(keccak256(here.proof) != keccak256(forRegtest.proof), "one message per chain id");
+        doInit(v, here);
+        assertEq(v.status(), B3TypesV2.STATUS_LIVE);
+    }
+
+    /// START_SET_HASH is bound, so at k > 0 the keys attest the epoch-k start
+    /// set itself, not only the lineage, epoch and successor. A message naming
+    /// another start set is refused at k = 2 even with this verifier's address
+    /// and chain id; a deployment that pinned another epoch-k set takes neither
+    /// the honest deployment's attestation nor one for its address that names
+    /// the honest start set. At k = 0 the constructor already ties the start
+    /// set to the lineage (GENESIS_SET_HASH).
+    function test_OI12_AttestationBindsStartSetHash() public {
+        Signer.TestSet memory s2 = lineageSet(2);
+        Signer.TestSet memory s3 = lineageSet(3);
+        Signer.TestSet memory pinnedElsewhere = rogueSet(2);
+        Signer.TestSet memory keys = bootstrapKeys();
+        B3FinalityVerifierV2 honest = deploy(K_OF_N, 2, s2.setHash);
+        B3FinalityVerifierV2 other = deploy(K_OF_N, 2, pinnedElsewhere.setHash);
+
+        Init memory a = initArgs(honest, 3, keys, s2, s3, Signer.ids(1));
+        Init memory wrongSet = initArgs(honest, 3, keys, s2, s3, Signer.ids(1));
+        wrongSet.proof =
+            signBootstrap(keys, address(honest), block.chainid, pinnedElsewhere.setHash, wrongSet.fb, Signer.ids(1));
+        expectInitRevert(honest, wrongSet, B3FinalityVerifierV2.ProofRejected.selector);
+
+        // Before OI-12 this replay initialized `other` with the rogue start set.
+        Init memory replay = initArgs(honest, 3, keys, s2, s3, Signer.ids(1));
+        replay.startSet = Signer.copyHeader(pinnedElsewhere.header);
+        expectInitRevert(other, replay, B3FinalityVerifierV2.ProofRejected.selector);
+        replay.proof = signBootstrap(keys, address(other), block.chainid, s2.setHash, replay.fb, Signer.ids(1));
+        expectInitRevert(other, replay, B3FinalityVerifierV2.ProofRejected.selector);
+        assertEq(other.status(), B3TypesV2.STATUS_UNINITIALIZED);
+
+        doInit(honest, a);
+        assertEq(honest.currentSetHash(), s2.setHash);
+
+        // k = 0: any start set other than the lineage's genesis set is refused.
+        B3FinalityVerifierV2.Config memory c = config(K_OF_N, 0, rogueSet(0).setHash, profileR());
+        address[] memory watchers = defaultWatchers();
+        vm.expectRevert(B3FinalityVerifierV2.BadConfig.selector);
+        new B3FinalityVerifierV2(c, bootstrapHeader, watchers);
+    }
+
+    /// The bootstrap digest has its own tag. The bootstrap keys signing plain
+    /// digest V2 (the pre-OI-12 message) are refused even 4-of-4, and a
+    /// committee signing the bootstrap-tagged message over a certificate's
+    /// statement is no certificate.
+    function test_OI12_PlainDigestV2ByBootstrapKeysRefused() public {
+        Signer.TestSet memory s0 = lineageSet(0);
+        Signer.TestSet memory s1 = lineageSet(1);
+        Signer.TestSet memory keys = bootstrapKeys();
+        B3FinalityVerifierV2 v = deploy(K_OF_N, 0, s0.setHash);
+
+        Init memory a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
+        Init memory plain = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
+        plain.proof = signFb(keys, plain.fb, Signer.none());
+        assertNotEq(digestOf(plain.fb), v.bootstrapDigestOf(plain.fb));
+        expectInitRevert(v, plain, B3FinalityVerifierV2.ProofRejected.selector);
+        doInit(v, a);
+
+        Cert memory c = certify(CANONICAL, 3, 2, s0, s1);
+        c.proof = Signer.sign(harness, s0, v.bootstrapDigestOf(c.fb), Signer.none());
+        expectSubmitRevert(v, c, B3FinalityVerifierV2.ProofRejected.selector);
+        resign(c, s0);
+        submit(v, c);
+        assertEq(uint256(v.latestIndex()), 3);
+    }
+
+    /// bootstrapDigestOf, the library and the 301-byte layout agree; the view
+    /// follows the chain id the call runs on and keeps the full 256-bit word.
+    function test_OI12_BootstrapDigestViewMatchesLibrary() public {
+        Signer.TestSet memory s2 = lineageSet(2);
+        B3FinalityVerifierV2 v = deploy(K_OF_N, 2, s2.setHash);
+        B3TypesV2.FinalizedBlockV2 memory fb = statement(CANONICAL, 3, 2, lineageSet(3).setHash);
+
+        bytes memory message = B3TypesV2.bootstrapMessage(DOMAIN, block.chainid, address(v), s2.setHash, fb);
+        assertEq(message.length, B3TypesV2.BOOTSTRAP_MESSAGE_LENGTH);
+        assertEq(message.length, 32 + 32 + 20 + 32 + B3TypesV2.FINALIZED_BLOCK_V2_LENGTH);
+        assertEq(message, abi.encodePacked(DOMAIN, uint256(31_337), address(v), s2.setHash, B3TypesV2.encode(fb)));
+        bytes32 expected = sha256(abi.encodePacked(B3TypesV2.BOOTSTRAP_TAG, B3TypesV2.BOOTSTRAP_TAG, message));
+        assertEq(B3TypesV2.bootstrapDigest(DOMAIN, block.chainid, address(v), s2.setHash, fb), expected);
+        assertEq(v.bootstrapDigestOf(fb), expected);
+        assertEq(initMessage(v, fb), expected);
+        assertNotEq(expected, v.digestV2(fb));
+
+        // No truncation: 2^64 + 1 is not chain 1.
+        assertNotEq(
+            B3TypesV2.bootstrapDigest(DOMAIN, (uint256(1) << 64) | 1, address(v), s2.setHash, fb),
+            B3TypesV2.bootstrapDigest(DOMAIN, 1, address(v), s2.setHash, fb)
+        );
+
+        vm.chainId(1);
+        bytes32 onMainnet = v.bootstrapDigestOf(fb);
+        assertEq(onMainnet, B3TypesV2.bootstrapDigest(DOMAIN, 1, address(v), s2.setHash, fb));
+        assertNotEq(onMainnet, expected);
+        vm.chainId(31_337);
+
+        // A START_CERTIFICATE deployment has the view but initializes on digest V2.
+        B3FinalityVerifierV2 sc = deploy(START_CERT, 2, s2.setHash);
+        assertEq(sc.bootstrapDigestOf(fb), B3TypesV2.bootstrapDigest(DOMAIN, 31_337, address(sc), s2.setHash, fb));
+        assertEq(initMessage(sc, fb), sc.digestV2(fb));
+    }
+
     // ===================================================== shared rejections
 
     function test_WrongStartOrSigningSetRejected() public {
@@ -184,13 +310,13 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         B3FinalityVerifierV2 v = deploy(K_OF_N, 0, s0.setHash);
 
         // startSet is not the pinned START_SET_HASH.
-        Init memory a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        Init memory a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         a.startSet = s1.header;
         expectInitRevert(v, a, B3FinalityVerifierV2.BadStartSet.selector);
 
         // Another epoch-0 header (shape-valid, right epoch): only the hash pin refuses it,
         // so a bootstrap cannot install a forged current-set count or weight.
-        a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         a.startSet = rogueSet(0).header;
         expectInitRevert(v, a, B3FinalityVerifierV2.BadStartSet.selector);
         a.startSet = unqualifiedSet(0).header;
@@ -201,49 +327,49 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         expectInitRevert(v, a, B3FinalityVerifierV2.BadStartSet.selector);
 
         // startSet with the pinned hash's members but another epoch field.
-        a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         a.startSet.epoch = 1;
         expectInitRevert(v, a, B3FinalityVerifierV2.BadStartSet.selector);
 
         // K_OF_N: the start set cannot sign in place of the bootstrap keys.
-        a = initArgs(2, s0, s0, s1, Signer.none());
+        a = initArgs(v, 2, s0, s0, s1, Signer.none());
         expectInitRevert(v, a, B3FinalityVerifierV2.BadSigningSet.selector);
 
         // Bootstrap header altered (hash no longer the pin).
-        a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         a.signingSet.membersRoot = keccak256("other");
         expectInitRevert(v, a, B3FinalityVerifierV2.BadSigningSet.selector);
 
         // Successor not named by fb, of the wrong epoch, or ruleset 1.
-        a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         a.successor = lineageSet(2).header;
         expectInitRevert(v, a, B3FinalityVerifierV2.BadSuccessor.selector);
         B3Types.SetHeader memory r1 = Signer.copyHeader(s1.header);
         r1.rulesetVersion = 1;
-        a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         a.successor = r1;
         a.fb.validatorSetHash = B3Types.hashSetHeader(r1);
-        a.proof = signFb(keys, a.fb, Signer.ids(3));
+        a.proof = signInit(v, keys, a.fb, Signer.ids(3));
         expectInitRevert(v, a, B3FinalityVerifierV2.BadSuccessor.selector);
 
         // Statement epoch other than START_EPOCH.
-        a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         a.fb.epoch = 1;
         expectInitRevert(v, a, B3FinalityVerifierV2.EpochNotAccepted.selector);
 
         // Other lineage; zero block hash; zero successor hash.
-        a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         a.fb.lineageId = keccak256("another lineage");
         expectInitRevert(v, a, B3FinalityVerifierV2.BadLineage.selector);
-        a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         a.fb.blockHash = bytes32(0);
         expectInitRevert(v, a, B3FinalityVerifierV2.BadFinalizedBlock.selector);
-        a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         a.fb.validatorSetHash = bytes32(0);
         expectInitRevert(v, a, B3FinalityVerifierV2.BadFinalizedBlock.selector);
 
         assertEq(v.status(), B3TypesV2.STATUS_UNINITIALIZED);
-        doInit(v, initArgs(2, keys, s0, s1, Signer.ids(3)));
+        doInit(v, initArgs(v, 2, keys, s0, s1, Signer.ids(3)));
         assertEq(v.status(), B3TypesV2.STATUS_LIVE);
     }
 
@@ -254,34 +380,34 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         B3FinalityVerifierV2 v = deploy(K_OF_N, 0, s0.setHash);
 
         // A flipped sibling.
-        Init memory a = initArgs(4, keys, s0, s1, Signer.ids(3));
+        Init memory a = initArgs(v, 4, keys, s0, s1, Signer.ids(3));
         a.leaf0Path[1] = bytes32(uint256(a.leaf0Path[1]) ^ 1);
         expectInitRevert(v, a, B3FinalityVerifierV2.BadAncestry.selector);
 
         // The path of leaf 1, not leaf 0: genesis is not at index 0 under this root.
-        a = initArgs(4, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 4, keys, s0, s1, Signer.ids(3));
         a.leaf0Path = historyPath(CANONICAL, 4, 1);
         expectInitRevert(v, a, B3FinalityVerifierV2.BadAncestry.selector);
 
         // A history whose leaf 0 is not historyLeaf(GENESIS_HEIGHT, GENESIS_BLOCK_HASH).
-        a = initArgs(4, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 4, keys, s0, s1, Signer.ids(3));
         bytes32[] memory leaves = historyLeaves(CANONICAL, 4);
         leaves[0] = B3TypesV2.historyLeaf(G + 1, genesisHash());
         a.fb.checkpointHistoryRoot = _root(leaves);
         a.leaf0Path = _path(leaves, 0);
-        a.proof = signFb(keys, a.fb, Signer.ids(3));
+        a.proof = signInit(v, keys, a.fb, Signer.ids(3));
         expectInitRevert(v, a, B3FinalityVerifierV2.BadAncestry.selector);
 
         // Index 0 (B3 never signs it) and index 2^32.
-        a = initArgs(4, keys, s0, s1, Signer.ids(3));
+        a = initArgs(v, 4, keys, s0, s1, Signer.ids(3));
         a.fb.checkpointIndex = 0;
         expectInitRevert(v, a, B3FinalityVerifierV2.BadCheckpointIndex.selector);
         a.fb.checkpointIndex = uint64(B3TypesV2.MAX_INDEX);
         expectInitRevert(v, a, B3FinalityVerifierV2.BadCheckpointIndex.selector);
 
         // A proof over another statement (index 3) under this one.
-        a = initArgs(4, keys, s0, s1, Signer.ids(3));
-        a.proof = initArgs(3, keys, s0, s1, Signer.ids(3)).proof;
+        a = initArgs(v, 4, keys, s0, s1, Signer.ids(3));
+        a.proof = initArgs(v, 3, keys, s0, s1, Signer.ids(3)).proof;
         expectInitRevert(v, a, B3FinalityVerifierV2.ProofRejected.selector);
     }
 
@@ -297,40 +423,40 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         // At V (index 10) and above, properly signed: the root is non-zero by B3's rule.
         uint64[2] memory indices = [V_INDEX, V_INDEX + 3];
         for (uint256 i = 0; i < 2; ++i) {
-            Init memory a = initArgs(indices[i], keys, s0, s1, Signer.ids(3));
+            Init memory a = initArgs(kOfN, indices[i], keys, s0, s1, Signer.ids(3));
             assertTrue(a.fb.withdrawalRoot != bytes32(0));
             expectInitRevert(kOfN, a, B3FinalityVerifierV2.BadStartHeight.selector);
-            Init memory b = initArgs(indices[i], s0, s0, s1, Signer.ids(3));
+            Init memory b = initArgs(startCert, indices[i], s0, s0, s1, Signer.ids(3));
             expectInitRevert(startCert, b, B3FinalityVerifierV2.BadStartHeight.selector);
             // Even with the root zeroed and re-signed.
             b.fb.withdrawalRoot = bytes32(0);
-            b.proof = signFb(s0, b.fb, Signer.none());
+            b.proof = signInit(startCert, s0, b.fb, Signer.none());
             expectInitRevert(startCert, b, B3FinalityVerifierV2.BadStartHeight.selector);
         }
 
         // At or below GENESIS_HEIGHT.
-        Init memory low = initArgs(1, keys, s0, s1, Signer.ids(3));
+        Init memory low = initArgs(kOfN, 1, keys, s0, s1, Signer.ids(3));
         low.fb.height = G;
-        low.proof = signFb(keys, low.fb, Signer.ids(3));
+        low.proof = signInit(kOfN, keys, low.fb, Signer.ids(3));
         expectInitRevert(kOfN, low, B3FinalityVerifierV2.BadStartHeight.selector);
 
         // Below V with a non-zero root, or with any flag bit.
-        Init memory rooted = initArgs(V_INDEX - 1, keys, s0, s1, Signer.ids(3));
+        Init memory rooted = initArgs(kOfN, V_INDEX - 1, keys, s0, s1, Signer.ids(3));
         rooted.fb.withdrawalRoot = keccak256("claimable root");
-        rooted.proof = signFb(keys, rooted.fb, Signer.ids(3));
+        rooted.proof = signInit(kOfN, keys, rooted.fb, Signer.ids(3));
         expectInitRevert(kOfN, rooted, B3FinalityVerifierV2.PrematureWithdrawalRoot.selector);
-        Init memory flagged = initArgs(V_INDEX - 1, s0, s0, s1, Signer.ids(3));
+        Init memory flagged = initArgs(startCert, V_INDEX - 1, s0, s0, s1, Signer.ids(3));
         flagged.fb.bridgeFlags = B3TypesV2.FLAG_DEPOSITS_CLOSED;
-        flagged.proof = signFb(s0, flagged.fb, Signer.none());
+        flagged.proof = signInit(startCert, s0, flagged.fb, Signer.none());
         expectInitRevert(startCert, flagged, B3FinalityVerifierV2.BadBridgeFlags.selector);
         flagged.fb.bridgeFlags = 0x80;
-        flagged.proof = signFb(s0, flagged.fb, Signer.none());
+        flagged.proof = signInit(startCert, s0, flagged.fb, Signer.none());
         expectInitRevert(startCert, flagged, B3FinalityVerifierV2.BadBridgeFlags.selector);
 
         // The last checkpoint below V is accepted in both modes; no root is recorded.
-        Init memory last = initArgs(V_INDEX - 1, keys, s0, s1, Signer.ids(3));
+        Init memory last = initArgs(kOfN, V_INDEX - 1, keys, s0, s1, Signer.ids(3));
         doInit(kOfN, last);
-        doInit(startCert, initArgs(V_INDEX - 1, s0, s0, s1, Signer.ids(3)));
+        doInit(startCert, initArgs(startCert, V_INDEX - 1, s0, s0, s1, Signer.ids(3)));
         assertEq(uint256(kOfN.latestBridgeHeight()), 0);
         assertEq(uint256(startCert.latestBridgeHeight()), 0);
         assertFalse(kOfN.depositsClosed());
@@ -343,7 +469,7 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         B3FinalityVerifierV2 v = deploy(K_OF_N, 0, s0.setHash);
         assertEq(v.INIT_DEADLINE(), T0 + INIT_WINDOW);
 
-        Init memory a = initArgs(2, keys, s0, s1, Signer.ids(3));
+        Init memory a = initArgs(v, 2, keys, s0, s1, Signer.ids(3));
         vm.warp(T0 + INIT_WINDOW + 1);
         expectInitRevert(v, a, B3FinalityVerifierV2.InitDeadlinePassed.selector);
 
@@ -353,7 +479,9 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         assertEq(uint256(v.initTime()), T0 + INIT_WINDOW);
 
         expectInitRevert(v, a, B3FinalityVerifierV2.AlreadyInitialized.selector);
-        expectInitRevert(v, initArgs(3, keys, s0, s1, Signer.ids(0)), B3FinalityVerifierV2.AlreadyInitialized.selector);
+        expectInitRevert(
+            v, initArgs(v, 3, keys, s0, s1, Signer.ids(0)), B3FinalityVerifierV2.AlreadyInitialized.selector
+        );
     }
 
     function test_DepositsWaitForOrdinaryCertificateAfterReview() public {
@@ -422,10 +550,10 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         Signer.TestSet memory s0 = lineageSet(0);
         Signer.TestSet memory s1 = lineageSet(1);
         // Keys 0 and 1 hold weight 3 = quorumWeight, but two of four fail the headcount.
-        expectInitRevert(v, initArgs(2, keys, s0, s1, Signer.ids(2, 3)), B3FinalityVerifierV2.ProofRejected.selector);
+        expectInitRevert(v, initArgs(v, 2, keys, s0, s1, Signer.ids(2, 3)), B3FinalityVerifierV2.ProofRejected.selector);
         // Keys 1, 2 and 3 are three of four but weigh 2 < 3.
-        expectInitRevert(v, initArgs(2, keys, s0, s1, Signer.ids(0)), B3FinalityVerifierV2.ProofRejected.selector);
-        doInit(v, initArgs(2, keys, s0, s1, Signer.ids(3)));
+        expectInitRevert(v, initArgs(v, 2, keys, s0, s1, Signer.ids(0)), B3FinalityVerifierV2.ProofRejected.selector);
+        doInit(v, initArgs(v, 2, keys, s0, s1, Signer.ids(3)));
         assertEq(v.status(), B3TypesV2.STATUS_LIVE);
     }
 
@@ -457,7 +585,7 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         Signer.TestSet memory s0 = lineageSet(0);
         Signer.TestSet memory u1 = unqualifiedSet(1);
         B3FinalityVerifierV2 v = deploy(K_OF_N, 0, s0.setHash);
-        doInit(v, initArgs(2, bootstrapKeys(), s0, u1, Signer.ids(3)));
+        doInit(v, initArgs(v, 2, bootstrapKeys(), s0, u1, Signer.ids(3)));
         // Set'0 (qualified) certifies a root at V; then the unqualified set takes over.
         submit(v, certify(CANONICAL, V_INDEX, 2, s0, u1));
         vm.warp(T0 + REVIEW);
@@ -474,10 +602,10 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         Signer.TestSet memory s2 = lineageSet(2);
         Signer.TestSet memory s3 = lineageSet(3);
         B3FinalityVerifierV2 v = deploy(START_CERT, 2, s3.setHash);
-        Init memory a = initArgs(4, s3, s2, s3, Signer.none());
+        Init memory a = initArgs(v, 4, s3, s2, s3, Signer.none());
         a.startSet = Signer.copyHeader(s3.header);
         a.fb.epoch = 2;
-        a.proof = signFb(s3, a.fb, Signer.none());
+        a.proof = signInit(v, s3, a.fb, Signer.none());
         expectInitRevert(v, a, B3FinalityVerifierV2.BadStartSet.selector);
     }
 
@@ -491,14 +619,14 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         assertTrue(v.BOOTSTRAP_MODE() == START_CERT);
 
         // Bootstrap keys: their header is refused, and their proof under the start header fails.
-        Init memory a = initArgs(2, bootstrapKeys(), s0, s1, Signer.ids(3));
+        Init memory a = initArgs(v, 2, bootstrapKeys(), s0, s1, Signer.ids(3));
         expectInitRevert(v, a, B3FinalityVerifierV2.BadSigningSet.selector);
         a.signingSet = s0.header;
         expectInitRevert(v, a, B3FinalityVerifierV2.ProofRejected.selector);
         // A 2-of-4 start-set proof fails the dual quorum.
-        expectInitRevert(v, initArgs(2, s0, s0, s1, Signer.ids(1, 2)), B3FinalityVerifierV2.ProofRejected.selector);
+        expectInitRevert(v, initArgs(v, 2, s0, s0, s1, Signer.ids(1, 2)), B3FinalityVerifierV2.ProofRejected.selector);
 
-        doInit(v, initArgs(2, s0, s0, s1, Signer.ids(3)));
+        doInit(v, initArgs(v, 2, s0, s0, s1, Signer.ids(3)));
         assertEq(v.status(), B3TypesV2.STATUS_LIVE);
         assertEq(v.currentSetHash(), s0.setHash);
         assertEq(v.nextSetHash(), s1.setHash);
@@ -511,8 +639,8 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         Signer.TestSet memory s3 = lineageSet(3);
         B3FinalityVerifierV2 v = deploy(START_CERT, 2, s2.setHash);
         // Set'3 (the successor) cannot start the lineage at epoch 2.
-        expectInitRevert(v, initArgs(4, s3, s2, s3, Signer.none()), B3FinalityVerifierV2.BadSigningSet.selector);
-        doInit(v, initArgs(4, s2, s2, s3, Signer.none()));
+        expectInitRevert(v, initArgs(v, 4, s3, s2, s3, Signer.none()), B3FinalityVerifierV2.BadSigningSet.selector);
+        doInit(v, initArgs(v, 4, s2, s2, s3, Signer.none()));
         assertEq(uint256(v.currentEpoch()), 2);
         assertEq(v.setHashByEpoch(2), s2.setHash);
     }
@@ -527,6 +655,26 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         B3Types.SetHeader memory empty;
         B3FinalityVerifierV2 v = new B3FinalityVerifierV2(c, empty, defaultWatchers());
         assertEq(v.BOOTSTRAP_SET_HASH(), bytes32(0));
+    }
+
+    /// OI-12 leaves START_CERTIFICATE unchanged: the start set signs plain
+    /// digest V2, and the same set signing the bootstrap digest is refused.
+    function test_StartCertificate_StillSignsDigestV2() public {
+        Signer.TestSet memory s0 = lineageSet(0);
+        Signer.TestSet memory s1 = lineageSet(1);
+        B3FinalityVerifierV2 v = deploy(START_CERT, 0, s0.setHash);
+
+        Init memory a = initArgs(v, 2, s0, s0, s1, Signer.ids(3));
+        assertEq(initMessage(v, a.fb), digestOf(a.fb));
+        assertEq(keccak256(a.proof), keccak256(signFb(s0, a.fb, Signer.ids(3))), "signed over digest V2");
+
+        Init memory tagged = initArgs(v, 2, s0, s0, s1, Signer.ids(3));
+        tagged.proof = signBootstrap(s0, address(v), block.chainid, s0.setHash, tagged.fb, Signer.ids(3));
+        expectInitRevert(v, tagged, B3FinalityVerifierV2.ProofRejected.selector);
+
+        doInit(v, a);
+        assertEq(v.status(), B3TypesV2.STATUS_LIVE);
+        assertEq(v.latestCertId(), B3TypesV2.certId(a.fb));
     }
 
     // ================================================================ cancel
@@ -549,7 +697,7 @@ contract BootstrapV2Test is VerifierFixtureV2 {
         v.cancel();
         assertEq(v.status(), B3TypesV2.STATUS_CANCELLED);
 
-        Init memory a = initArgs(2, bootstrapKeys(), s0, s1, Signer.ids(3));
+        Init memory a = initArgs(v, 2, bootstrapKeys(), s0, s1, Signer.ids(3));
         expectInitRevert(v, a, B3FinalityVerifierV2.VerifierCancelled.selector);
         vm.prank(WATCHER_A);
         vm.expectRevert(B3FinalityVerifierV2.CancelClosed.selector);

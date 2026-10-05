@@ -6,7 +6,10 @@
 > `feat/flowmeshV2-dev-claude`. Revision 8 (two vaults, LP field; this file
 > at `1d1d6da`) is withdrawn for launch; its Arbitrum parts are in Appendix
 > B. Nothing compiled or run; no RPC contacted; hashes recomputed with
-> `cast` 1.7.1.
+> `cast` 1.7.1. 2026-10-05 amendment: open issue OI-12 resolved by owner
+> ruling R9 (`doc/design/b3-bridge-v2-owner-rulings-2026-10-03.md`); the
+> K_OF_N bootstrap attestation binds the verifier address, the EVM chain id
+> and `START_SET_HASH` (§0, §2.2, §2.5, §5, §12).
 
 **Labels.** [E] verified; [I] design choice; [H] estimate. **Default** =
 provisional. Repo facts are `path:line` at `1d1d6da`; `.../study/` is
@@ -40,8 +43,9 @@ minting. Six new keyless contracts, **all on Ethereum** (chain 1; anvil
 | 6 | `B3RelayBatch` | Certificates, releases and exit forwards in one transaction (§9) |
 
 No owner, admin, pause, proxy, rescue key or fee switch; the only privileged
-acts are the one-time 3-of-4 bootstrap attestation and a watcher cancel
-before deposits open (§5). bUSD V2 is
+acts are the one-time 3-of-4 bootstrap attestation, bound to one verifier
+address, EVM chain id and start set (OI-12, owner ruling R9), and a watcher
+cancel before deposits open (§5). bUSD V2 is
 backed 1:1 by this vault only.
 
 **Not at launch** (Appendix B): an Arbitrum vault and its Outbox pins, an LP
@@ -112,6 +116,7 @@ use (`contracts/src/BlsCertificateProver.sol:158-176`;
 | `GENESIS_HEIGHT` | R_f − 1, the grid checkpoint that is history leaf 0 |
 | `lineageId` | TaggedHash("B3/FINALITY/LINEAGE/V2", chainDomain ‖ u64 GENESIS_HEIGHT ‖ blockHash(R_f − 1) ‖ setHash(Set′_0)) |
 | `digestV2` | TaggedHash("B3/FINALITY/V2", chainDomain ‖ encodePacked(FinalizedBlockV2)) |
+| `bootstrapDigestV2` (K_OF_N bootstrap only, §5) | TaggedHash("B3/BRIDGE/BOOTSTRAP/V2", chainDomain ‖ u256 evmChainId ‖ verifier ‖ startSetHash ‖ encodePacked(FinalizedBlockV2)), 301 bytes: `evmChainId` = `block.chainid` as a full big-endian word, `verifier` = the Verifier V2 address (20 bytes), `startSetHash` = `START_SET_HASH` (OI-12) |
 | `historyLeaf(h, hash)` | keccak256(u64 h ‖ hash), 40 bytes, keyed by **height** |
 | history node | keccak256(left ‖ right), zero-subtree padding, as withdrawals |
 | `certId` | keccak256(encodePacked(FinalizedBlockV2)); equal for every aggregation of one statement |
@@ -121,6 +126,10 @@ use (`contracts/src/BlsCertificateProver.sol:158-176`;
 cannot verify under V2 (tag, length and header version differ). As in V1
 (`.../study/check.md:73`) [E], the digest names no destination chain, so a
 later Arbitrum verifier could read the same certificates (Appendix B.1).
+`bootstrapDigestV2` does the opposite on purpose (OI-12): an attestation
+authorizes exactly one deployment on one chain, while a certificate states
+B3 finality for any reader. The distinct tag keeps either from verifying as
+the other [I].
 
 ### 2.3 Ancestry rule [I]
 
@@ -156,7 +165,7 @@ deposits B3 never mints.
 | Item | Normative here |
 |---|---|
 | History leaf | keccak256(u64 height ‖ blockHash) |
-| Bootstrap statement | an epoch-k statement attested 3-of-4 (§5) |
+| Bootstrap statement | an epoch-k statement attested 3-of-4 over `bootstrapDigestV2`, binding the verifier, EVM chain id and `START_SET_HASH` (§5, OI-12) |
 | Withdrawal root | zero below V (= `BRIDGE_ACTIVATION_HEIGHT`), tree root from V |
 | Bridge flags | bit 0 closes deposits for good (§3.3 step 11) |
 | Leaf V2; migration leaf | 180-byte tagged form; an ordinary leaf paying the successor (§6.4) |
@@ -166,6 +175,8 @@ deposits B3 never mints.
 `contracts/test/vectors/gen_v2_vectors.sh` [I] writes one JSON file for the
 Foundry and B3 unit tests (lineage id, digest, `certId`, history leaf and
 path, leaf V2, the bUSD V2 AssetId with the preimage of node changes §3.2,
+the OI-12 bootstrap message and `bootstrapDigestV2`, the slots, bit offsets
+and example words of §3.2, §6.6 and the token that B3 proves by EIP-1186,
 F_d and F_x addresses); RT4 waits until C++ and Solidity agree.
 
 ---
@@ -346,9 +357,22 @@ a more trust-minimized option:
 2. Prover, verifier and vault are deployed on Ethereum.
 3. Before `INIT_DEADLINE` anyone calls `initialize(fb, startSet, successor,
    leaf0Path, proof)` with an epoch-k statement the **bootstrap keys sign
-   3-of-4** over `digestV2(fb)`: `startSet` hashes to `START_SET_HASH`;
-   lineage, index ≥ 1 and §3.3 steps 5-6 hold; `leaf0Path` places
-   `historyLeaf(GENESIS_HEIGHT, GENESIS_BLOCK_HASH)` at index 0 under
+   3-of-4** over `bootstrapDigestV2` (§2.2), the 301-byte message
+   `CHAIN_DOMAIN ‖ u256 block.chainid ‖ address(this) ‖ START_SET_HASH ‖
+   encodePacked(fb)` (**OI-12, resolved by owner ruling R9 of 2026-10-05**).
+   The attestation therefore binds the start set, the verifier and the
+   chain: any other deployment, chain id or start set refuses it, and the
+   keys signing plain `digestV2(fb)` are refused. The message does not bind
+   the verifier's other immutables (windows, watchers, `PROVER`,
+   `BRIDGE_ACTIVATION_HEIGHT`, the bridge bounds, `INIT_DEADLINE`), so the
+   keys sign only **after** step 2, once each holder has checked the
+   deployed verifier's runtime code hash and every immutable against the
+   published manifest. They never sign for a predicted CREATE address: who
+   controls that deployer nonce could deploy the same code there with other
+   settings. The view `bootstrapDigestOf(fb)` and the shared vectors let
+   them check the message offline. `startSet` hashes to
+   `START_SET_HASH`; lineage, index ≥ 1 and §3.3 steps 5-6 hold; `leaf0Path`
+   places `historyLeaf(GENESIS_HEIGHT, GENESIS_BLOCK_HASH)` at index 0 under
    `fb.checkpointHistoryRoot`. Result: LIVE at epoch k, next set
    `fb.validatorSetHash`, latest = fb, steps 9 and 11 applied,
    `lastRotationTime = initTime = now`; `lastCertificateTime` stays 0, so
@@ -363,9 +387,9 @@ Never 2-of-3: any two quorums share a signer, so one Byzantine key can sign
 conflicting statements (Codex review).
 
 **Recommended alternative, START_CERTIFICATE (needs an owner ruling):** step 3 takes an
-ordinary epoch-k certificate of `startSet` (step 8); no bootstrap keys
-exist. For: no extra keys to publish, guard and retire; the pinned
-committee proves itself live before review. Against: it drops the
+ordinary epoch-k certificate of `startSet` (step 8) over `digestV2(fb)`,
+unchanged by OI-12; no bootstrap keys exist. For: no extra keys to publish,
+guard and retire; the pinned committee proves itself live before review. Against: it drops the
 attesters' independent check; in either mode the trust root is the pins
 plus public review. The owner chooses (C-2).
 
@@ -700,9 +724,9 @@ anvil 1.7.1 enforces EIP-7825 only with `--enable-tx-gas-limit` [E].
 |---|---|
 | `ProverV2.t.sol` | Real BLS vectors (extended `contracts/test/vectors/generate_bls64_proof.cpp`: ruleset 2, 64 members, 43 signers); tampered and V1 proofs fail |
 | `VerifierV2.t.sol` | Ancestry after skipped certificates; bad index, path or lineage rejected; spacing, catch-up, expiry; root history; roots on both sides of V; all three conflict forms; **a same-epoch certificate naming another successor reverts**; **a flagged certificate closes deposits for good, releases continue**; **rotations through sets sharing no key (B-37)**; relaxed windows only on 31337 |
-| `BootstrapV2.t.sol` | K_OF_N 3-of-4 at epoch 0 and k, 2-of-3 refused; wrong set hash or leaf-0 path; deadline; deposits wait for an ordinary certificate; the start-certificate alternative; cancel only in the window |
+| `BootstrapV2.t.sol` | K_OF_N 3-of-4 at epoch 0 and k, 2-of-3 refused; wrong set hash or leaf-0 path; deadline; deposits wait for an ordinary certificate; the start-certificate alternative (still over `digestV2`); cancel only in the window; **OI-12: an attestation for one verifier is refused by an identical second deployment, on another chain id and under another `START_SET_HASH`; plain `digestV2` from the bootstrap keys is refused** |
 | `VaultV2.t.sol` | Gate states; caller rule (Safe-like, bundler-like, 7702 fail); `Deposit` identical to V1; leaf vector; **release against an older root**; **a failing transfer reverts and the leaf stays payable**; double release rejected; `absorb` raises `absorbedTotal` by the increase; **migration** to a successor carrying its predecessor's id (a wrong id or token reverts) |
-| `StorageLayoutV2.t.sol` | Every slot of §3.2 and §6.6 |
+| `StorageLayoutV2.t.sol` | Every slot of §3.2 and §6.6; the shared `storage_layout_v2` vectors (verifier, vault and token slots B3 proves) |
 | `ForwarderDepositV2.t.sol`, `ForwarderExitV2.t.sol`, `RelayBatchV2.t.sol` | Only Transfer and Deposit logs; leaf size; **repeated max-fee flushes never exceed `feeCap`**; an F_x fee above `feeCap` reverts and each forward empties the account; `Published` from `publish` and `deploy`; refunds; mocked OFT credit before deployment; fuzz over D1-D6; address vectors; allowance reset; batch isolates failures and fits the cap with 64 members |
 
 `contracts/script/check-no-number-opcode.sh` fails on `NUMBER` in any V2

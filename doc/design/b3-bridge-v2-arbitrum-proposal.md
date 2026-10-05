@@ -159,10 +159,11 @@ refundable to the user's Ethereum key; optional **B3RelayBatch**.
    3-of-4** (as V1, `contracts/src/B3FinalityVerifier.sol:93-190`; accepted
    in conversation 2026-10-03, uncommitted, conditional on no more
    trust-minimized option): four published keys sign one statement of a
-   pinned recent epoch; watchers may only cancel during review. Recommended
-   alternative, needing a ruling (perhaps the option that condition
-   anticipates): any ordinary certificate of that epoch (contracts spec §5;
-   OI-1, OI-9).
+   pinned recent epoch, bound to the verifier address, the EVM chain id and
+   the pinned start set (OI-12, resolved by owner ruling R9); watchers may
+   only cancel during review. Recommended alternative, needing a ruling
+   (perhaps the option that condition anticipates): any ordinary
+   certificate of that epoch (contracts spec §5; OI-1, OI-9).
 6. **Migration (B-23)** by an ordinary leaf paying a pinned successor
    (§9.1).
 
@@ -395,7 +396,7 @@ backing** with one vault, is stranded for good. Causes (§13): a
 | **Committee > 1/3** of weight and headcount, with network-timing control | Two conflicting certificates: B3 closes burns for good, its next certificate closes deposits, and a relayed halt strands the remainder; a rotated-out set's evidence is refused (contracts spec §3.4; node changes §8.5) | Everything |
 | **Headcount Sybil** (without B-22) | Keys need 333 B3 each (`src/kernel/chainparams.cpp:274-277`); with h honest members, h/2 offline keys block headcount: for Set_2's 34, 17 keys = 5,661 B3 against 126,108,063 B3 of weight (`.../study/check.md:29`) [I computed; H until O2]; B-22 raises it to ~(h/2) × floor | Everything |
 | **Ethereum sync committee** (512) | ≥ 2/3 dishonest: false mints, ≤ 10,000 per epoch, unbounded in total | The reserve |
-| **Bootstrap; owner relayer; contracts** | Deployer pins, four keys (holders: OI-9) attest once (3-of-4), watchers only cancel; liveness (30 days with no relayer strands); new and unaudited | Everything |
+| **Bootstrap; owner relayer; contracts** | Deployer pins, four keys (holders: OI-9) attest once (3-of-4) for one verifier on one chain (OI-12), watchers only cancel; liveness (30 days with no relayer strands); new and unaudited | Everything |
 
 **Slashing is not dollar insurance** (Codex review): B3 has none
 (`src/modern/stake.h:33-37`), and a B3-paid penalty could deter, never
@@ -653,7 +654,8 @@ item 1.
 re-credit of burns above a frozen root; a ruling on B-11's alternative;
 owner acceptance of B-22, B-23's residual, the wind-down margin and the
 (d1) relay budget; B-37's rebinding schedule (finality dependency);
-`DEPOSIT_CLOSE_AFTER` against O8; OI-1 to OI-11 (§20).
+`DEPOSIT_CLOSE_AFTER` against O8; OI-1 to OI-11 open; OI-12 resolved
+(§20).
 
 **Unverified [H]:** V2 and `approve` gas; LayerZero fees and DVN depths;
 anvil EIP-2537; minutes until O8.
@@ -662,9 +664,9 @@ anvil EIP-2537; minutes until O8.
 
 ## 20. Open issues register
 
-From the 2026-10-04 review, unresolved (mechanical errors were fixed in
-place). **Critical**: can lose reserve; **High**: loses user funds or blocks
-a milestone.
+From the 2026-10-04 review, unresolved unless marked resolved (mechanical
+errors were fixed in place). **Critical**: can lose reserve; **High**: loses
+user funds or blocks a milestone.
 
 - **OI-1** (Critical; contracts spec §5 step 3). Unlike V1
   (`contracts/src/B3FinalityVerifier.sol:167-171`), nothing keeps the
@@ -708,3 +710,19 @@ a milestone.
   epochs gives 32 days, not 33; rows 10 and 10b ignore RT4's fifth wallet;
   their knob is unlisted. *Direction:* 47,480 or 1,440-block epochs; state
   the count; list the knob.
+- **OI-12** (**Resolved 2026-10-05, owner ruling R9**, "yes OI-12";
+  contracts spec §2.2, §5 step 3). The K_OF_N attestation signed
+  `digestV2(fb)` only, so it bound neither `START_SET_HASH` for k > 0 nor
+  the deployment: a published attestation could initialize another
+  verifier, on any chain, whose deployer pinned a different epoch-k set.
+  *Resolution:* the bootstrap keys sign `bootstrapDigestV2 =
+  TaggedHash("B3/BRIDGE/BOOTSTRAP/V2", CHAIN_DOMAIN ‖ u256 block.chainid ‖
+  address(this) ‖ START_SET_HASH ‖ encodePacked(fb))`, 301 bytes, so one
+  attestation initializes exactly one verifier on one chain for one start
+  set; the distinct tag keeps attestations and certificates apart, and
+  START_CERTIFICATE still signs `digestV2(fb)`. Implemented in
+  `contracts/src/v2` with replay tests (`contracts/test/v2/BootstrapV2.t.sol`)
+  and shared vectors (`bootstrap_attestation_v2`). The message binds no
+  other immutable (windows, watchers, prover, bounds), so the keys sign only
+  after deployment and after checking the deployed code hash and immutables
+  against the manifest, never for a predicted address.

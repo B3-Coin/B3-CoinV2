@@ -296,9 +296,45 @@ abstract contract VerifierFixtureV2 is V2TestBase {
 
     // ============================================================== bootstrap
 
-    /// Bootstrap arguments: the canonical epoch-k statement at `index` (below V)
-    /// signed by `signer` with `absent` members missing.
+    /// The message `v.initialize` verifies for `fb` on the current chain id:
+    /// under K_OF_N the OI-12 bootstrap digest bound to v's address, chain id
+    /// and START_SET_HASH; under START_CERTIFICATE digest V2.
+    function initMessage(B3FinalityVerifierV2 v, B3TypesV2.FinalizedBlockV2 memory fb) internal view returns (bytes32) {
+        if (v.BOOTSTRAP_MODE() == B3FinalityVerifierV2.BootstrapMode.K_OF_N) {
+            return B3TypesV2.bootstrapDigest(v.CHAIN_DOMAIN(), block.chainid, address(v), v.START_SET_HASH(), fb);
+        }
+        return B3TypesV2.digest(v.CHAIN_DOMAIN(), fb);
+    }
+
+    /// Signs initMessage(v, fb); used again after a test changes a statement.
+    function signInit(
+        B3FinalityVerifierV2 v,
+        Signer.TestSet memory signer,
+        B3TypesV2.FinalizedBlockV2 memory fb,
+        uint32[] memory absent
+    ) internal view returns (bytes memory) {
+        return Signer.sign(harness, signer, initMessage(v, fb), absent);
+    }
+
+    /// Low-level K_OF_N attestation under DOMAIN for any verifier address,
+    /// chain id and start set hash, for the OI-12 replay cases.
+    function signBootstrap(
+        Signer.TestSet memory signer,
+        address verifier,
+        uint256 chainId,
+        bytes32 startSetHash,
+        B3TypesV2.FinalizedBlockV2 memory fb,
+        uint32[] memory absent
+    ) internal view returns (bytes memory) {
+        bytes32 message = B3TypesV2.bootstrapDigest(DOMAIN, chainId, verifier, startSetHash, fb);
+        return Signer.sign(harness, signer, message, absent);
+    }
+
+    /// Bootstrap arguments for `v`: the canonical epoch-k statement at `index`
+    /// (below V) signed over initMessage(v, fb) by `signer` with `absent`
+    /// members missing.
     function initArgs(
+        B3FinalityVerifierV2 v,
         uint64 index,
         Signer.TestSet memory signer,
         Signer.TestSet memory startSet,
@@ -310,7 +346,7 @@ abstract contract VerifierFixtureV2 is V2TestBase {
         a.startSet = Signer.copyHeader(startSet.header);
         a.successor = Signer.copyHeader(successor.header);
         a.leaf0Path = historyPath(CANONICAL, index, 0);
-        a.proof = signFb(signer, a.fb, absent);
+        a.proof = signInit(v, signer, a.fb, absent);
     }
 
     function doInit(B3FinalityVerifierV2 v, Init memory a) internal {
@@ -387,6 +423,6 @@ abstract contract VerifierFixtureV2 is V2TestBase {
         s0 = lineageSet(0);
         s1 = lineageSet(1);
         v = deploy(B3FinalityVerifierV2.BootstrapMode.K_OF_N, 0, s0.setHash);
-        doInit(v, initArgs(index, bootstrapKeys(), s0, s1, Signer.ids(3)));
+        doInit(v, initArgs(v, index, bootstrapKeys(), s0, s1, Signer.ids(3)));
     }
 }

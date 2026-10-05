@@ -38,6 +38,13 @@ interface VmStorageAccessV2 {
 /// under R1, then a same-epoch certificate at checkpoint 13 with root R2 and
 /// bridgeFlags bit 0, so lastCertificateTime differs from lastRotationTime
 /// and depositsClosed is set. vm.record captures the slots each call wrote.
+///
+/// test_SlotsMatchSharedVectors ties this suite's slot numbers, bit offsets
+/// and masks to the storage_layout_v2 section of
+/// test/vectors/bridge_v2_vectors.json, which B3's observation decoder copies
+/// (node changes §7-§8), including Tether's mainnet slots that
+/// MockTetherToken mirrors: 0 owner [0] and paused [160], 2 balances,
+/// 6 isBlackListed, 10 upgradedAddress [0] and deprecated [160].
 contract StorageLayoutV2Test is RelayFixtureV2 {
     VmStorageAccessV2 private constant vmAccess =
         VmStorageAccessV2(address(uint160(uint256(keccak256("hevm cheat code")))));
@@ -59,11 +66,38 @@ contract StorageLayoutV2Test is RelayFixtureV2 {
     uint256 private constant LOCKED_SLOT = 1;
     uint256 private constant RELEASED_SLOT = 2;
     uint256 private constant ABSORBED_TOTAL_SLOT = 3;
+    // Tether slots (mainnet layout, contracts/regtest/MockTetherToken.sol).
+    uint256 private constant TOKEN_OWNER_PAUSED_SLOT = 0;
+    uint256 private constant TOKEN_BALANCES_SLOT = 2;
+    uint256 private constant TOKEN_IS_BLACK_LISTED_SLOT = 6;
+    uint256 private constant TOKEN_UPGRADED_DEPRECATED_SLOT = 10;
+
+    // Packed bit offsets, and the first bit each packed slot leaves unused.
+    uint256 private constant LIVE_CURRENT_EPOCH_BIT = 0;
+    uint256 private constant LIVE_LAST_ROTATION_BIT = 64;
+    uint256 private constant LIVE_LAST_CERTIFICATE_BIT = 104;
+    uint256 private constant LIVE_LATEST_BRIDGE_HEIGHT_BIT = 144;
+    uint256 private constant LIVE_STATUS_BIT = 208;
+    uint256 private constant LIVE_DEPOSITS_CLOSED_BIT = 216;
+    uint256 private constant LIVE_UNUSED_BIT = 224;
+    uint256 private constant LATEST_HEIGHT_BIT = 0;
+    uint256 private constant LATEST_INDEX_BIT = 64;
+    uint256 private constant LATEST_INIT_TIME_BIT = 128;
+    uint256 private constant LATEST_UNUSED_BIT = 168;
+    uint256 private constant VAULT_NEXT_DEPOSIT_ID_UNUSED_BIT = 64;
+    /// paused in token slot 0, deprecated in token slot 10, after a 160-bit address.
+    uint256 private constant TOKEN_FLAG_BIT = 160;
+    uint256 private constant TOKEN_UNUSED_BIT = 168;
 
     uint256 private constant MASK8 = type(uint8).max;
     uint256 private constant MASK32 = type(uint32).max;
     uint256 private constant MASK40 = type(uint40).max;
     uint256 private constant MASK64 = type(uint64).max;
+    uint256 private constant MASK160 = type(uint160).max;
+    /// Example list lengths in the shared vectors.
+    uint256 private constant PACKED_EXAMPLE_COUNT = 2;
+    uint256 private constant VAULT_EXAMPLE_COUNT = 4;
+    uint256 private constant MAPPING_SLOT_COUNT = 2;
 
     // Scenario.
     uint64 private constant K = 2;
@@ -126,7 +160,7 @@ contract StorageLayoutV2Test is RelayFixtureV2 {
         // 1. K_OF_N bootstrap at k = 2: 3 of the 4 bootstrap keys sign B3's
         //    epoch-2 statement at checkpoint 3 (below V), naming Set'3.
         vm.warp(INIT_TIME);
-        Init memory a = initArgs(INIT_INDEX, bootstrapKeys(), s2, s3, Signer.ids(3));
+        Init memory a = initArgs(v, INIT_INDEX, bootstrapKeys(), s2, s3, Signer.ids(3));
         initFb = a.fb;
         vmAccess.record();
         doInit(v, a);
@@ -194,12 +228,12 @@ contract StorageLayoutV2Test is RelayFixtureV2 {
     function test_BootstrapSlotsAtKEqualsTwo() public view {
         uint256 w0 = uint256(afterInit[LIVENESS_SLOT]);
         assertEq(w0 & MASK64, K, "currentEpoch @0");
-        assertEq((w0 >> 64) & MASK40, INIT_TIME, "lastRotationTime @64");
-        assertEq((w0 >> 104) & MASK40, 0, "lastCertificateTime @104 stays 0 after bootstrap");
-        assertEq((w0 >> 144) & MASK64, 0, "latestBridgeHeight @144 stays 0 (OI-1)");
-        assertEq((w0 >> 208) & MASK8, B3TypesV2.STATUS_LIVE, "status @208");
-        assertEq((w0 >> 216) & MASK8, 0, "depositsClosed @216");
-        assertEq(w0 >> 224, 0, "slot 0 above bit 224");
+        assertEq((w0 >> LIVE_LAST_ROTATION_BIT) & MASK40, INIT_TIME, "lastRotationTime @64");
+        assertEq((w0 >> LIVE_LAST_CERTIFICATE_BIT) & MASK40, 0, "lastCertificateTime @104 stays 0 after bootstrap");
+        assertEq((w0 >> LIVE_LATEST_BRIDGE_HEIGHT_BIT) & MASK64, 0, "latestBridgeHeight @144 stays 0 (OI-1)");
+        assertEq((w0 >> LIVE_STATUS_BIT) & MASK8, B3TypesV2.STATUS_LIVE, "status @208");
+        assertEq((w0 >> LIVE_DEPOSITS_CLOSED_BIT) & MASK8, 0, "depositsClosed @216");
+        assertEq(w0 >> LIVE_UNUSED_BIT, 0, "slot 0 above bit 224");
 
         assertEq(afterInit[CURRENT_SET_HASH_SLOT], s2Hash, "slot 1 currentSetHash = START_SET_HASH");
         assertEq(afterInit[NEXT_SET_HASH_SLOT], s3Hash, "slot 2 nextSetHash = fb.validatorSetHash");
@@ -209,9 +243,9 @@ contract StorageLayoutV2Test is RelayFixtureV2 {
 
         uint256 w4 = uint256(afterInit[LATEST_SLOT]);
         assertEq(w4 & MASK64, heightAt(INIT_INDEX), "latest height @0");
-        assertEq((w4 >> 64) & MASK64, INIT_INDEX, "latest index @64");
-        assertEq((w4 >> 128) & MASK40, INIT_TIME, "initTime @128");
-        assertEq(w4 >> 168, 0, "slot 4 above bit 168");
+        assertEq((w4 >> LATEST_INDEX_BIT) & MASK64, INIT_INDEX, "latest index @64");
+        assertEq((w4 >> LATEST_INIT_TIME_BIT) & MASK40, INIT_TIME, "initTime @128");
+        assertEq(w4 >> LATEST_UNUSED_BIT, 0, "slot 4 above bit 168");
 
         assertEq(afterInit[LATEST_BLOCK_HASH_SLOT], initFb.blockHash, "slot 5");
         assertEq(afterInit[LATEST_CERT_ID_SLOT], B3TypesV2.certId(initFb), "slot 6");
@@ -222,12 +256,12 @@ contract StorageLayoutV2Test is RelayFixtureV2 {
     function test_VerifierSlotsAfterCertificates() public view {
         uint256 w0 = _load(address(v), LIVENESS_SLOT);
         assertEq(w0 & MASK64, K + 1, "currentEpoch @0");
-        assertEq((w0 >> 64) & MASK40, ROTATION_TIME, "lastRotationTime @64");
-        assertEq((w0 >> 104) & MASK40, FLAG_TIME, "lastCertificateTime @104");
-        assertEq((w0 >> 144) & MASK64, heightAt(FLAG_INDEX), "latestBridgeHeight @144");
-        assertEq((w0 >> 208) & MASK8, B3TypesV2.STATUS_LIVE, "status @208");
-        assertEq((w0 >> 216) & MASK8, 1, "depositsClosed @216");
-        assertEq(w0 >> 224, 0, "slot 0 above bit 224");
+        assertEq((w0 >> LIVE_LAST_ROTATION_BIT) & MASK40, ROTATION_TIME, "lastRotationTime @64");
+        assertEq((w0 >> LIVE_LAST_CERTIFICATE_BIT) & MASK40, FLAG_TIME, "lastCertificateTime @104");
+        assertEq((w0 >> LIVE_LATEST_BRIDGE_HEIGHT_BIT) & MASK64, heightAt(FLAG_INDEX), "latestBridgeHeight @144");
+        assertEq((w0 >> LIVE_STATUS_BIT) & MASK8, B3TypesV2.STATUS_LIVE, "status @208");
+        assertEq((w0 >> LIVE_DEPOSITS_CLOSED_BIT) & MASK8, 1, "depositsClosed @216");
+        assertEq(w0 >> LIVE_UNUSED_BIT, 0, "slot 0 above bit 224");
         // The named getters read the same packed fields.
         assertEq(uint256(v.currentEpoch()), K + 1);
         assertEq(uint256(v.lastRotationTime()), ROTATION_TIME);
@@ -251,9 +285,9 @@ contract StorageLayoutV2Test is RelayFixtureV2 {
 
         uint256 w4 = _load(address(v), LATEST_SLOT);
         assertEq(w4 & MASK64, heightAt(FLAG_INDEX), "latest height @0");
-        assertEq((w4 >> 64) & MASK64, FLAG_INDEX, "latest index @64");
-        assertEq((w4 >> 128) & MASK40, INIT_TIME, "initTime @128 survives certificates");
-        assertEq(w4 >> 168, 0, "slot 4 above bit 168");
+        assertEq((w4 >> LATEST_INDEX_BIT) & MASK64, FLAG_INDEX, "latest index @64");
+        assertEq((w4 >> LATEST_INIT_TIME_BIT) & MASK40, INIT_TIME, "initTime @128 survives certificates");
+        assertEq(w4 >> LATEST_UNUSED_BIT, 0, "slot 4 above bit 168");
         assertEq(uint256(v.latestHeight()), heightAt(FLAG_INDEX));
         assertEq(uint256(v.latestIndex()), FLAG_INDEX);
         assertEq(uint256(v.initTime()), INIT_TIME);
@@ -326,7 +360,7 @@ contract StorageLayoutV2Test is RelayFixtureV2 {
     function test_VaultSlots() public view {
         uint256 w0 = _load(address(vault), NEXT_DEPOSIT_ID_SLOT);
         assertEq(w0 & MASK64, 2, "nextDepositId (uint64) @0");
-        assertEq(w0 >> 64, 0, "slot 0 above bit 64");
+        assertEq(w0 >> VAULT_NEXT_DEPOSIT_ID_UNUSED_BIT, 0, "slot 0 above bit 64");
         assertEq(uint256(vault.nextDepositId()), 2);
 
         assertEq(_load(address(vault), LOCKED_SLOT), expectedLocked, "slot 1 locked");
@@ -373,7 +407,230 @@ contract StorageLayoutV2Test is RelayFixtureV2 {
         assertEq(uint256(vault.nextDepositId()), 2, "two deposits in one transaction");
     }
 
+    // ========================================================= shared vectors
+
+    /// storage_layout_v2 of the shared vectors against this suite and the
+    /// compiled contracts: the slot numbers and bit offsets equal the
+    /// constants above, the masks decode every example word to its field
+    /// values (unused high bits zero), the fields re-pack to the word, and the
+    /// word stored into the real verifier, vault or MockTetherToken reads back
+    /// through the contract's own getters. Mapping keys are keccak(key word ‖
+    /// slot word) and reach balanceOf / isBlackListed.
+    function test_SlotsMatchSharedVectors() public {
+        string memory j = readVectorsV2();
+        _checkVerifierVectors(j);
+        _checkLivenessExamples(j);
+        _checkLatestExamples(j);
+        _checkVaultVectors(j);
+        _checkTokenVectors(j);
+        _checkMappingVectors(j);
+    }
+
+    function _checkVerifierVectors(string memory j) private {
+        string memory p = ".storage_layout_v2.verifier";
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.liveness")), LIVENESS_SLOT, "liveness slot");
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.current_set_hash")), CURRENT_SET_HASH_SLOT);
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.next_set_hash")), NEXT_SET_HASH_SLOT);
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.latest")), LATEST_SLOT, "latest slot");
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.latest_cert_id")), LATEST_CERT_ID_SLOT);
+
+        string memory live = string.concat(p, ".liveness_fields");
+        _assertField(j, live, 0, "current_epoch", LIVE_CURRENT_EPOCH_BIT, 64);
+        _assertField(j, live, 1, "last_rotation_time", LIVE_LAST_ROTATION_BIT, 40);
+        _assertField(j, live, 2, "last_certificate_time", LIVE_LAST_CERTIFICATE_BIT, 40);
+        _assertField(j, live, 3, "latest_bridge_height", LIVE_LATEST_BRIDGE_HEIGHT_BIT, 64);
+        _assertField(j, live, 4, "status", LIVE_STATUS_BIT, 8);
+        _assertField(j, live, 5, "deposits_closed", LIVE_DEPOSITS_CLOSED_BIT, 8);
+        assertFalse(vm.keyExistsJson(j, jsonKey(live, 6, "")), "six liveness fields");
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".liveness_unused_from_bit")), LIVE_UNUSED_BIT);
+
+        string memory latest = string.concat(p, ".latest_fields");
+        _assertField(j, latest, 0, "height", LATEST_HEIGHT_BIT, 64);
+        _assertField(j, latest, 1, "index", LATEST_INDEX_BIT, 64);
+        _assertField(j, latest, 2, "init_time", LATEST_INIT_TIME_BIT, 40);
+        assertFalse(vm.keyExistsJson(j, jsonKey(latest, 3, "")), "three latest fields");
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".latest_unused_from_bit")), LATEST_UNUSED_BIT);
+
+        // Full-word slots read back through their getters.
+        bytes32 word = keccak256("StorageLayoutV2Test/full word");
+        vm.store(address(v), bytes32(CURRENT_SET_HASH_SLOT), word);
+        assertEq(v.currentSetHash(), word);
+        vm.store(address(v), bytes32(NEXT_SET_HASH_SLOT), word);
+        assertEq(v.nextSetHash(), word);
+        vm.store(address(v), bytes32(LATEST_CERT_ID_SLOT), word);
+        assertEq(v.latestCertId(), word);
+    }
+
+    function _checkLivenessExamples(string memory j) private {
+        string memory p = ".storage_layout_v2.verifier.liveness_examples";
+        assertFalse(vm.keyExistsJson(j, jsonKey(p, PACKED_EXAMPLE_COUNT, "")), "liveness example count");
+        for (uint256 i = 0; i < PACKED_EXAMPLE_COUNT; ++i) {
+            string memory e = jsonKey(p, i, "");
+            uint256 word = uint256(vm.parseJsonBytes32(j, string.concat(e, ".word")));
+            uint256 epoch = vm.parseJsonUint(j, string.concat(e, ".current_epoch"));
+            uint256 rotation = vm.parseJsonUint(j, string.concat(e, ".last_rotation_time"));
+            uint256 certificate = vm.parseJsonUint(j, string.concat(e, ".last_certificate_time"));
+            uint256 bridgeHeight = vm.parseJsonUint(j, string.concat(e, ".latest_bridge_height"));
+            uint256 liveStatus = vm.parseJsonUint(j, string.concat(e, ".status"));
+            uint256 closed = vm.parseJsonUint(j, string.concat(e, ".deposits_closed"));
+
+            assertEq((word >> LIVE_CURRENT_EPOCH_BIT) & MASK64, epoch, "currentEpoch");
+            assertEq((word >> LIVE_LAST_ROTATION_BIT) & MASK40, rotation, "lastRotationTime");
+            assertEq((word >> LIVE_LAST_CERTIFICATE_BIT) & MASK40, certificate, "lastCertificateTime");
+            assertEq((word >> LIVE_LATEST_BRIDGE_HEIGHT_BIT) & MASK64, bridgeHeight, "latestBridgeHeight");
+            assertEq((word >> LIVE_STATUS_BIT) & MASK8, liveStatus, "status");
+            assertEq((word >> LIVE_DEPOSITS_CLOSED_BIT) & MASK8, closed, "depositsClosed");
+            assertEq(word >> LIVE_UNUSED_BIT, 0, "liveness unused bits");
+            assertLe(liveStatus, B3TypesV2.STATUS_CANCELLED);
+            assertLe(closed, 1);
+            uint256 repacked = (epoch << LIVE_CURRENT_EPOCH_BIT) | (rotation << LIVE_LAST_ROTATION_BIT)
+                | (certificate << LIVE_LAST_CERTIFICATE_BIT) | (bridgeHeight << LIVE_LATEST_BRIDGE_HEIGHT_BIT)
+                | (liveStatus << LIVE_STATUS_BIT) | (closed << LIVE_DEPOSITS_CLOSED_BIT);
+            assertEq(repacked, word, "liveness re-packs");
+
+            vm.store(address(v), bytes32(LIVENESS_SLOT), bytes32(word));
+            assertEq(uint256(v.currentEpoch()), epoch);
+            assertEq(uint256(v.lastRotationTime()), rotation);
+            assertEq(uint256(v.lastCertificateTime()), certificate);
+            assertEq(uint256(v.latestBridgeHeight()), bridgeHeight);
+            assertEq(uint256(v.status()), liveStatus);
+            assertEq(v.depositsClosed(), closed == 1);
+        }
+    }
+
+    function _checkLatestExamples(string memory j) private {
+        string memory p = ".storage_layout_v2.verifier.latest_examples";
+        assertFalse(vm.keyExistsJson(j, jsonKey(p, PACKED_EXAMPLE_COUNT, "")), "latest example count");
+        for (uint256 i = 0; i < PACKED_EXAMPLE_COUNT; ++i) {
+            string memory e = jsonKey(p, i, "");
+            uint256 word = uint256(vm.parseJsonBytes32(j, string.concat(e, ".word")));
+            uint256 height = vm.parseJsonUint(j, string.concat(e, ".height"));
+            uint256 index = vm.parseJsonUint(j, string.concat(e, ".index"));
+            uint256 time = vm.parseJsonUint(j, string.concat(e, ".init_time"));
+
+            assertEq((word >> LATEST_HEIGHT_BIT) & MASK64, height, "latest height");
+            assertEq((word >> LATEST_INDEX_BIT) & MASK64, index, "latest index");
+            assertEq((word >> LATEST_INIT_TIME_BIT) & MASK40, time, "initTime");
+            assertEq(word >> LATEST_UNUSED_BIT, 0, "latest unused bits");
+            uint256 repacked =
+                (height << LATEST_HEIGHT_BIT) | (index << LATEST_INDEX_BIT) | (time << LATEST_INIT_TIME_BIT);
+            assertEq(repacked, word, "latest re-packs");
+
+            vm.store(address(v), bytes32(LATEST_SLOT), bytes32(word));
+            assertEq(uint256(v.latestHeight()), height);
+            assertEq(uint256(v.latestIndex()), index);
+            assertEq(uint256(v.initTime()), time);
+        }
+    }
+
+    function _checkVaultVectors(string memory j) private {
+        string memory p = ".storage_layout_v2.vault";
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.next_deposit_id")), NEXT_DEPOSIT_ID_SLOT);
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.locked")), LOCKED_SLOT);
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.absorbed_total")), ABSORBED_TOTAL_SLOT);
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".next_deposit_id_bits")), VAULT_NEXT_DEPOSIT_ID_UNUSED_BIT);
+
+        string memory examples = string.concat(p, ".examples");
+        assertFalse(vm.keyExistsJson(j, jsonKey(examples, VAULT_EXAMPLE_COUNT, "")), "vault example count");
+        for (uint256 i = 0; i < VAULT_EXAMPLE_COUNT; ++i) {
+            string memory e = jsonKey(examples, i, "");
+            uint256 slot = vm.parseJsonUint(j, string.concat(e, ".slot"));
+            uint256 word = uint256(vm.parseJsonBytes32(j, string.concat(e, ".word")));
+            uint256 value = vm.parseJsonUint(j, string.concat(e, ".value"));
+            vm.store(address(vault), bytes32(slot), bytes32(word));
+            if (slot == NEXT_DEPOSIT_ID_SLOT) {
+                assertEq(word & MASK64, value, "nextDepositId");
+                assertEq(word >> VAULT_NEXT_DEPOSIT_ID_UNUSED_BIT, 0, "vault slot 0 unused bits");
+                assertEq(uint256(vault.nextDepositId()), value);
+            } else if (slot == LOCKED_SLOT) {
+                assertEq(word, value, "locked");
+                assertEq(vault.locked(), value);
+            } else {
+                assertEq(slot, ABSORBED_TOTAL_SLOT, "vault example slot");
+                assertEq(word, value, "absorbedTotal");
+                assertEq(vault.absorbedTotal(), value);
+            }
+        }
+    }
+
+    function _checkTokenVectors(string memory j) private {
+        string memory p = ".storage_layout_v2.token";
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.owner_paused")), TOKEN_OWNER_PAUSED_SLOT);
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.balances")), TOKEN_BALANCES_SLOT);
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.is_black_listed")), TOKEN_IS_BLACK_LISTED_SLOT);
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slots.upgraded_deprecated")), TOKEN_UPGRADED_DEPRECATED_SLOT);
+        _assertField(j, string.concat(p, ".slot0_fields"), 0, "owner", 0, 160);
+        _assertField(j, string.concat(p, ".slot0_fields"), 1, "paused", TOKEN_FLAG_BIT, 8);
+        _assertField(j, string.concat(p, ".slot10_fields"), 0, "upgraded_address", 0, 160);
+        _assertField(j, string.concat(p, ".slot10_fields"), 1, "deprecated", TOKEN_FLAG_BIT, 8);
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slot0_unused_from_bit")), TOKEN_UNUSED_BIT);
+        assertEq(vm.parseJsonUint(j, string.concat(p, ".slot10_unused_from_bit")), TOKEN_UNUSED_BIT);
+
+        for (uint256 i = 0; i < PACKED_EXAMPLE_COUNT; ++i) {
+            string memory e = jsonKey(string.concat(p, ".slot0_examples"), i, "");
+            uint256 word = uint256(vm.parseJsonBytes32(j, string.concat(e, ".word")));
+            address owner = vm.parseJsonAddress(j, string.concat(e, ".owner"));
+            uint256 paused = vm.parseJsonUint(j, string.concat(e, ".paused"));
+            assertEq(word & MASK160, uint256(uint160(owner)), "owner");
+            assertEq((word >> TOKEN_FLAG_BIT) & MASK8, paused, "paused");
+            assertEq(word >> TOKEN_UNUSED_BIT, 0, "token slot 0 unused bits");
+            vm.store(address(usdt), bytes32(TOKEN_OWNER_PAUSED_SLOT), bytes32(word));
+            assertEq(usdt.owner(), owner);
+            assertEq(usdt.paused(), paused == 1);
+
+            e = jsonKey(string.concat(p, ".slot10_examples"), i, "");
+            word = uint256(vm.parseJsonBytes32(j, string.concat(e, ".word")));
+            address upgraded = vm.parseJsonAddress(j, string.concat(e, ".upgraded_address"));
+            uint256 deprecated = vm.parseJsonUint(j, string.concat(e, ".deprecated"));
+            assertEq(word & MASK160, uint256(uint160(upgraded)), "upgradedAddress");
+            assertEq((word >> TOKEN_FLAG_BIT) & MASK8, deprecated, "deprecated");
+            assertEq(word >> TOKEN_UNUSED_BIT, 0, "token slot 10 unused bits");
+            vm.store(address(usdt), bytes32(TOKEN_UPGRADED_DEPRECATED_SLOT), bytes32(word));
+            assertEq(usdt.upgradedAddress(), upgraded);
+            assertEq(usdt.deprecated(), deprecated == 1);
+        }
+        assertFalse(vm.keyExistsJson(j, jsonKey(string.concat(p, ".slot0_examples"), PACKED_EXAMPLE_COUNT, "")));
+        assertFalse(vm.keyExistsJson(j, jsonKey(string.concat(p, ".slot10_examples"), PACKED_EXAMPLE_COUNT, "")));
+    }
+
+    function _checkMappingVectors(string memory j) private {
+        string memory p = ".storage_layout_v2.mapping_slots";
+        assertFalse(vm.keyExistsJson(j, jsonKey(p, MAPPING_SLOT_COUNT, "")), "mapping slot count");
+        uint256 value = 1_000 * UNIT;
+        for (uint256 i = 0; i < MAPPING_SLOT_COUNT; ++i) {
+            string memory e = jsonKey(p, i, "");
+            address key = vm.parseJsonAddress(j, string.concat(e, ".key"));
+            uint256 slot = vm.parseJsonUint(j, string.concat(e, ".slot"));
+            bytes32 storageKey = vm.parseJsonBytes32(j, string.concat(e, ".storage_key"));
+            assertEq(keccak256(abi.encode(key, slot)), storageKey, "keccak(address word || slot word)");
+            if (i == 0) {
+                assertEq(slot, TOKEN_BALANCES_SLOT, "balances first");
+                assertEq(usdt.balanceOf(key), 0);
+                vm.store(address(usdt), storageKey, bytes32(value));
+                assertEq(usdt.balanceOf(key), value);
+            } else {
+                assertEq(slot, TOKEN_IS_BLACK_LISTED_SLOT, "isBlackListed second");
+                assertFalse(usdt.isBlackListed(key));
+                vm.store(address(usdt), storageKey, bytes32(uint256(1)));
+                assertTrue(usdt.isBlackListed(key));
+            }
+        }
+    }
+
     // ================================================================ helpers
+
+    function _assertField(
+        string memory j,
+        string memory list,
+        uint256 i,
+        string memory name,
+        uint256 offset,
+        uint256 bits
+    ) private pure {
+        assertEq(vm.parseJsonString(j, jsonKey(list, i, ".name")), name);
+        assertEq(vm.parseJsonUint(j, jsonKey(list, i, ".offset")), offset, name);
+        assertEq(vm.parseJsonUint(j, jsonKey(list, i, ".bits")), bits, name);
+    }
 
     function _vaultOn(B3FinalityVerifierV2 target) private returns (B3VaultV2) {
         return new B3VaultV2(

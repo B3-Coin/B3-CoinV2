@@ -21,14 +21,15 @@ import {IB3FinalityVerifierV2} from "./IB3FinalityVerifierV2.sol";
 ///   withdrawal root and zero flags (open issue OI-1, architecture §20), so
 ///   the bootstrap can never install a claimable root; it sets only the
 ///   latest checkpoint and history (the latest/history part of §3.3 step 11).
-///   Attestation scope (K_OF_N): the bootstrap keys sign digestV2(fb) only, as
-///   spec §5 step 3 requires. That binds the lineage (so GENESIS_SET_HASH),
-///   epoch k and the epoch-(k+1) successor named by fb, but not
-///   START_SET_HASH when k > 0, and not this deployment's address or chain id.
-///   The epoch-k start set, which certifies until the first handover, is
-///   therefore pin-only: reviewers must check it against B3's
-///   getfinalitylineage, and a published attestation can initialize another
-///   deployment with the same lineage, bootstrap header and START_EPOCH.
+///   Attestation binding (K_OF_N; open issue OI-12, owner ruling R9 of
+///   2026-10-05): the bootstrap keys sign bootstrapDigestV2 =
+///   TaggedHash("B3/BRIDGE/BOOTSTRAP/V2", CHAIN_DOMAIN ‖ u256 block.chainid ‖
+///   address(this) ‖ START_SET_HASH ‖ encode(fb)), 301 bytes. Besides the
+///   lineage, epoch k and the epoch-(k+1) successor named by fb, it binds the
+///   epoch-k start set, this verifier and the EVM chain, so one attestation
+///   initializes exactly one deployment on one chain. Its own tag keeps it
+///   from verifying as a committee certificate, or a certificate as it.
+///   START_CERTIFICATE is unchanged: the start set signs digestV2(fb).
 /// - Certificates (spec §3.3). Anyone relays a digest-V2 certificate signed by
 ///   the dual quorum of the current set, or of the pinned next set on an epoch
 ///   handover. Each must extend the last accepted checkpoint in B3's
@@ -304,9 +305,9 @@ contract B3FinalityVerifierV2 is IB3FinalityVerifierV2 {
     /// `leaf0Path` places historyLeaf(GENESIS_HEIGHT, GENESIS_BLOCK_HASH) at
     /// index 0 under fb.checkpointHistoryRoot. Deposits still wait for the
     /// review window and an ordinary certificate (lastCertificateTime stays 0).
-    /// In K_OF_N mode the bootstrap keys attest digestV2(fb) alone; see the
-    /// contract comment for what that does not bind (START_SET_HASH for
-    /// k > 0, the deployment address).
+    /// In K_OF_N mode the proof covers bootstrapDigestOf(fb), which binds this
+    /// deployment, the chain id and START_SET_HASH (OI-12); in
+    /// START_CERTIFICATE mode it covers digestV2(fb).
     function initialize(
         B3TypesV2.FinalizedBlockV2 calldata fb,
         B3Types.SetHeader calldata signingSet,
@@ -338,11 +339,11 @@ contract B3FinalityVerifierV2 is IB3FinalityVerifierV2 {
         bytes32 genesisLeaf = B3TypesV2.historyLeaf(GENESIS_HEIGHT, GENESIS_BLOCK_HASH);
         if (B3TypesV2.rootFromPath(genesisLeaf, 0, leaf0Path) != fb.checkpointHistoryRoot) revert BadAncestry();
 
-        bytes32 signingSetHash = BOOTSTRAP_MODE == BootstrapMode.K_OF_N ? BOOTSTRAP_SET_HASH : START_SET_HASH;
+        bool kOfN = BOOTSTRAP_MODE == BootstrapMode.K_OF_N;
+        bytes32 signingSetHash = kOfN ? BOOTSTRAP_SET_HASH : START_SET_HASH;
         if (B3Types.hashSetHeader(signingSet) != signingSetHash) revert BadSigningSet();
-        if (!PROVER.verifyDigest(B3TypesV2.digest(CHAIN_DOMAIN, fb), signingSetHash, signingSet, proof)) {
-            revert ProofRejected();
-        }
+        bytes32 message = kOfN ? _bootstrapDigest(fb) : B3TypesV2.digest(CHAIN_DOMAIN, fb);
+        if (!PROVER.verifyDigest(message, signingSetHash, signingSet, proof)) revert ProofRejected();
 
         uint40 now40 = _now40();
         bytes32 certId = B3TypesV2.certId(fb);
@@ -662,6 +663,14 @@ contract B3FinalityVerifierV2 is IB3FinalityVerifierV2 {
         return B3TypesV2.digest(CHAIN_DOMAIN, fb);
     }
 
+    /// The BLS message K_OF_N bootstrap keys sign for `fb` on this deployment
+    /// (OI-12): bootstrapDigestV2 over CHAIN_DOMAIN, block.chainid,
+    /// address(this), START_SET_HASH and fb. A START_CERTIFICATE deployment
+    /// never verifies it; its initialize takes digestV2(fb).
+    function bootstrapDigestOf(B3TypesV2.FinalizedBlockV2 calldata fb) external view returns (bytes32) {
+        return _bootstrapDigest(fb);
+    }
+
     function certIdOf(B3TypesV2.FinalizedBlockV2 calldata fb) external pure returns (bytes32) {
         return B3TypesV2.certId(fb);
     }
@@ -680,6 +689,10 @@ contract B3FinalityVerifierV2 is IB3FinalityVerifierV2 {
             successor.epoch != fb.epoch + 1 || !B3TypesV2.headerShapeValid(successor)
                 || B3Types.hashSetHeader(successor) != fb.validatorSetHash
         ) revert BadSuccessor();
+    }
+
+    function _bootstrapDigest(B3TypesV2.FinalizedBlockV2 calldata fb) private view returns (bytes32) {
+        return B3TypesV2.bootstrapDigest(CHAIN_DOMAIN, block.chainid, address(this), START_SET_HASH, fb);
     }
 
     function _qualified(uint32 count, uint64 weight) private view returns (bool) {

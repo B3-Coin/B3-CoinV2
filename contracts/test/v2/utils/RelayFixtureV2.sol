@@ -77,7 +77,7 @@ abstract contract RelayFixtureV2 is VerifierFixtureV2 {
     /// 3-of-4 bootstrap keys sign B3's epoch-0 statement at checkpoint
     /// `index` (below V), naming `successor` as Set'1.
     function bootstrap(B3FinalityVerifierV2 v, uint64 index, Signer.TestSet memory successor) internal {
-        doInit(v, initArgs(index, bootstrapKeys(), lineageSet(0), successor, Signer.ids(3)));
+        doInit(v, initArgs(v, index, bootstrapKeys(), lineageSet(0), successor, Signer.ids(3)));
     }
 
     // ======================================================== certificates

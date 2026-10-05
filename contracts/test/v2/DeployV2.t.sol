@@ -252,9 +252,9 @@ contract DeployV2Test is RelayFixtureV2 {
         Signer.TestSet memory s0 = lineageSet(0);
         Signer.TestSet memory s1 = lineageSet(1);
         expectInitRevert(
-            v, initArgs(1, bootstrapKeys(), s0, s1, Signer.ids(3)), B3FinalityVerifierV2.BadSigningSet.selector
+            v, initArgs(v, 1, bootstrapKeys(), s0, s1, Signer.ids(3)), B3FinalityVerifierV2.BadSigningSet.selector
         );
-        doInit(v, initArgs(1, s0, s0, s1, Signer.ids(3)));
+        doInit(v, initArgs(v, 1, s0, s0, s1, Signer.ids(3)));
         assertEq(v.status(), B3TypesV2.STATUS_LIVE);
         assertEq(v.nextSetHash(), s1.setHash);
     }

@@ -117,7 +117,7 @@ contract VerifierV2Test is VerifierFixtureV2 {
         Signer.TestSet memory u1 = unqualifiedSet(1);
         Signer.TestSet memory s2 = lineageSet(2);
         B3FinalityVerifierV2 v = deploy(K_OF_N, 0, s0.setHash);
-        doInit(v, initArgs(2, bootstrapKeys(), s0, u1, Signer.ids(3)));
+        doInit(v, initArgs(v, 2, bootstrapKeys(), s0, u1, Signer.ids(3)));
         assertTrue(v.currentQualified());
         assertFalse(v.nextQualified(), "4 x 1 successor");
 

@@ -134,7 +134,7 @@ contract GasV2Test is RelayFixtureV2 {
 
         // 4. A fresh K_OF_N verifier (epoch 0) awaiting its bootstrap.
         initV = deploy(K_OF_N, 0, lineageSet(0).setHash);
-        Init memory a = initArgs(BOOTSTRAP_INDEX, bootstrapKeys(), lineageSet(0), s1, Signer.ids(3));
+        Init memory a = initArgs(initV, BOOTSTRAP_INDEX, bootstrapKeys(), lineageSet(0), s1, Signer.ids(3));
         initCall = abi.encodeCall(
             B3FinalityVerifierV2.initialize, (a.fb, a.signingSet, a.startSet, a.successor, a.leaf0Path, a.proof)
         );
@@ -309,13 +309,14 @@ contract GasV2Test is RelayFixtureV2 {
             )
         );
 
-        Init memory a = initArgs(BOOTSTRAP_INDEX, bootstrapKeys(), setA, setB, Signer.ids(3));
         firstV[i] = deploy(K_OF_N, START_EPOCH_K, setA.setHash);
         sameEpochV[i] = deploy(K_OF_N, START_EPOCH_K, setA.setHash);
         transitionV[i] = deploy(K_OF_N, START_EPOCH_K, setA.setHash);
-        doInit(firstV[i], a);
-        doInit(sameEpochV[i], a);
-        doInit(transitionV[i], a);
+        // OI-12: an attestation names its verifier, so each deployment gets its own.
+        Signer.TestSet memory keys = bootstrapKeys();
+        doInit(firstV[i], initArgs(firstV[i], BOOTSTRAP_INDEX, keys, setA, setB, Signer.ids(3)));
+        doInit(sameEpochV[i], initArgs(sameEpochV[i], BOOTSTRAP_INDEX, keys, setA, setB, Signer.ids(3)));
+        doInit(transitionV[i], initArgs(transitionV[i], BOOTSTRAP_INDEX, keys, setA, setB, Signer.ids(3)));
     }
 
     function _encode(Cert memory c) private pure returns (bytes memory) {
