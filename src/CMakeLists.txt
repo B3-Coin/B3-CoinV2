@@ -581,6 +581,22 @@ if(B3_BRIDGE_TOOLS)
       secp256k1
       univalue
   )
+
+  # REGTEST ONLY bridge V2 certificate tool: the OI-12-bound K_OF_N bootstrap
+  # attestation and digest-V2 test certificates from public deterministic
+  # test keys. Refuses non-regtest chain domains and EVM chain ids.
+  add_executable(b3-bridge-regtest-certify bridge/regtest_certify.cpp)
+  target_link_libraries(b3-bridge-regtest-certify
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
 endif()
 
 if(BUILD_TESTS)
