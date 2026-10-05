@@ -97,6 +97,8 @@ EXTENDED_SCRIPTS = [
     'feature_b3_bridge_rt3_v1_route_a.py --deposit-only',
     # Fresh finality lineage (digest V2, regtest-only knob); local nodes only.
     'feature_b3_fresh_lineage.py',
+    # Bridge V2 first round trip (anvil + forge --offline + B3_BRIDGE_TOOLS).
+    'feature_b3_bridge_rt4a_round_trip.py',
 ]
 
 # Special script to run each bench sanity check

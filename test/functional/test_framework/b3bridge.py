@@ -22,14 +22,19 @@ REGTEST ONLY. This module provides:
   BLS finality (plan §3.6), freeze/resume around wallet checks, and
   cleanup of local helper processes;
 - offline unit tests of the harness's regtest-only refusals
-  (TestFrameworkB3BridgeGuards, run by feature_framework_unit_tests.py).
+  (TestFrameworkB3BridgeGuards, run by feature_framework_unit_tests.py);
+- bridge V2 (first node slice, RT4a): CREATE address prediction, the bUSD
+  V2 AssetId, leaf V2 and the V2 withdrawal tree, the -b3bridgepins v2
+  writer, Verifier V2 / Vault V2 calldata encoders, a DeployV2.s.sol
+  runner and FreshVoteShuttle (the fresh-lineage vote relay between
+  validators, which have no P2P transport for those votes yet).
 
 The relayer module is imported only as a library; its main() is never
 called in-process, only as an unchanged subprocess by run_relayer_once().
 Nothing in this module contacts a non-local endpoint.
 """
 
-from collections import namedtuple
+from collections import Counter, namedtuple
 import hashlib
 import json
 import os
@@ -48,6 +53,7 @@ from test_framework.anvil import (
     Anvil,
     AnvilRPCError,
     B3BRIDGE_CONTRIB_DIR,
+    SRCDIR,
     artifact,
     assert_local_url,
     find_foundry_tool,
@@ -56,6 +62,7 @@ from test_framework.anvil import (
     import_b3bridge_contrib,
     local_json_rpc,
     normalize_address,
+    run_forge,
 )
 from test_framework.authproxy import JSONRPCException
 from test_framework.key import TaggedHash
@@ -592,6 +599,414 @@ def file_sha256(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+# -- bridge V2 identities, leaf V2 and the withdrawal tree --------------------
+# Derived here independently of src/modern/bridge_v2.h, withdrawal_v2.h and
+# contracts/src/v2/B3TypesV2.sol; contracts/test/vectors/bridge_v2_vectors.json
+# pins all three (TestFrameworkB3BridgeGuards below checks this module).
+BRIDGE_V2_ASSET_TAG = "B3/BRIDGE/ASSET/V2"
+BRIDGE_ASSET_IDENTITY_VERSION_V2 = 2  # Consensus::BRIDGE_ASSET_IDENTITY_VERSION_V2
+BRIDGE_V2_DECIMALS = 6
+WITHDRAWAL_LEAF_V2_TAG = keccak256(b"B3/BRIDGE/WITHDRAWAL/V2")
+WITHDRAWAL_LEAF_V2_PREIMAGE_SIZE = 180
+WITHDRAWAL_TREE_DEPTH = 32
+MAX_WITHDRAWAL_ID = 1 << WITHDRAWAL_TREE_DEPTH  # B3TypesV2.MAX_INDEX
+WITHDRAWAL_ZERO_HASHES = [bytes(32)]
+for _depth in range(WITHDRAWAL_TREE_DEPTH):
+    WITHDRAWAL_ZERO_HASHES.append(keccak256(WITHDRAWAL_ZERO_HASHES[-1] * 2))
+del _depth
+# Root of the empty depth-32 tree: non-zero, signed from V until the first burn.
+EMPTY_WITHDRAWAL_ROOT = WITHDRAWAL_ZERO_HASHES[WITHDRAWAL_TREE_DEPTH]
+BRIDGE_V2_DEFAULT_CAP_RAW = 10_000_000_000  # Consensus::BRIDGE_V2_DEFAULT_CAP_RAW (B-14)
+
+
+def predict_create_address(sender, nonce):
+    """The CREATE address of `sender` at `nonce`: keccak(rlp([sender, nonce]))[12:]."""
+    assert isinstance(nonce, int) and nonce >= 0, nonce
+    return "0x" + keccak256(rlp([hx(normalize_address(sender)), nonce]))[12:].hex()
+
+
+def asset_id_v2(domain, chain_id, vault, token, origin_decimals=BRIDGE_V2_DECIMALS,
+                asset_decimals=BRIDGE_V2_DECIMALS):
+    """Raw bUSD V2 AssetId bytes (node changes §3.2; Vault V2 B3_ASSET_ID).
+
+    TaggedHash("B3/BRIDGE/ASSET/V2") over chainDomain || u8 2 || u64 LE
+    chain id || vault || token || u8 origin decimals || u8 asset decimals
+    (an 83-byte message).
+    """
+    assert 0 < chain_id < 1 << 64, chain_id
+    message = (enc_bytes32(domain) + bytes([BRIDGE_ASSET_IDENTITY_VERSION_V2]) +
+               chain_id.to_bytes(8, "little") + hx(normalize_address(vault)) +
+               hx(normalize_address(token)) + bytes([origin_decimals, asset_decimals]))
+    assert_equal(len(message), 83)
+    return TaggedHash(BRIDGE_V2_ASSET_TAG, message)
+
+
+def leaf_v2_preimage(asset_id, withdrawal_id, chain_id, vault, token, recipient, amount, b3_height):
+    """The 180-byte leaf V2 preimage (contracts spec; B3TypesV2.withdrawalLeaf).
+
+    tag || AssetId || u64 id || u64 chain id || vault || token || recipient ||
+    u256 amount || u64 b3Height, integers big-endian.
+    """
+    assert 0 <= withdrawal_id < MAX_WITHDRAWAL_ID, withdrawal_id
+    assert 0 < chain_id < 1 << 64 and 0 < amount <= MAX_MONEY and 0 <= b3_height < 1 << 64
+    preimage = (WITHDRAWAL_LEAF_V2_TAG + enc_bytes32(asset_id) +
+                withdrawal_id.to_bytes(8, "big") + chain_id.to_bytes(8, "big") +
+                hx(normalize_address(vault)) + hx(normalize_address(token)) +
+                hx(normalize_address(recipient)) + amount.to_bytes(32, "big") +
+                b3_height.to_bytes(8, "big"))
+    assert_equal(len(preimage), WITHDRAWAL_LEAF_V2_PREIMAGE_SIZE)
+    return preimage
+
+
+def leaf_v2(*args, **kwargs):
+    """keccak256 of leaf_v2_preimage(...)."""
+    return keccak256(leaf_v2_preimage(*args, **kwargs))
+
+
+def withdrawal_root_and_path(leaves, index=None):
+    """Depth-32 ordered withdrawal tree with zero-subtree padding.
+
+    Returns the root and, when index is given, the 32 siblings of that leaf
+    from the leaf level up. An empty tree has EMPTY_WITHDRAWAL_ROOT.
+    """
+    leaves = [enc_bytes32(leaf) for leaf in leaves]
+    assert index is None or 0 <= index < len(leaves)
+    if not leaves:
+        return EMPTY_WITHDRAWAL_ROOT, None
+    level, path, position = leaves, [], index
+    for depth in range(WITHDRAWAL_TREE_DEPTH):
+        if len(level) % 2:
+            level.append(WITHDRAWAL_ZERO_HASHES[depth])
+        if position is not None:
+            path.append(level[position ^ 1])
+            position >>= 1
+        level = [keccak256(level[i] + level[i + 1]) for i in range(0, len(level), 2)]
+    assert_equal(len(level), 1)
+    return level[0], (path if index is not None else None)
+
+
+def withdrawal_root(leaves):
+    return withdrawal_root_and_path(leaves)[0]
+
+
+def fold_withdrawal_path(leaf, index, path):
+    """The vault's walk: index bit d = 0 hashes (node || sibling), else (sibling || node)."""
+    assert_equal(len(path), WITHDRAWAL_TREE_DEPTH)
+    node = enc_bytes32(leaf)
+    for depth, sibling in enumerate(path):
+        sibling = enc_bytes32(sibling)
+        node = keccak256(sibling + node) if (index >> depth) & 1 else keccak256(node + sibling)
+    return node
+
+
+# -- -b3bridgepins v2 section (node changes §3.1-3.4, OI-3) --------------------
+def _light_client_pins_v2(bootstrap_output, gvr, fork_version, horizon_epochs):
+    checkpoint_slot = bootstrap_output["checkpoint_slot"]
+    return {
+        "trusted_checkpoint_root": bootstrap_output["checkpoint_root"],
+        "trusted_checkpoint_slot": checkpoint_slot,
+        "checkpoint_execution_block": bootstrap_output["checkpoint_block"],
+        "genesis_validators_root": to_0x(gvr),
+        "fork_schedule": [{"activation_epoch": 0, "fork_version": to_0x(fork_version)}],
+        "fork_schedule_valid_through_epoch": checkpoint_slot // SLOTS_PER_EPOCH + horizon_epochs,
+        "electra_epoch": 0,
+        "min_sync_committee_participants": SYNC_COMMITTEE_SUPERMAJORITY,
+        "max_sync_lag_slots": MAX_SYNC_LAG_SLOTS,
+    }
+
+
+def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deployer,
+                                 deployment_block, bootstrap_output, activation_height,
+                                 max_deposit_raw, burn_height=None, caps=None,
+                                 min_bridge_validators=4, max_bridge_validators=64,
+                                 min_bridge_total_weight=4, horizon_epochs=1024,
+                                 gvr=REGTEST_GVR, fork_version=REGTEST_FORK_VERSION,
+                                 check=True):
+    """Write a -b3bridgepins file holding only a v2 section; return its JSON.
+
+    The file must exist before the validators first start (OI-3), when the
+    V2 contracts cannot be deployed yet: their constructors pin the fresh
+    lineage, which commits to blockHash(R_f - 1). So vault and verifier are
+    the addresses DeployV2.s.sol will create from `deployer`'s nonces 2 and 1
+    (prover 0, verifier 1, vault 2, relay batch 3), and the file carries no
+    vault or verifier code hash, which the node refuses as unknown keys.
+    deployment_block is a lower bound on the vault's first event block.
+
+    With check (the default) the writer refuses, before writing: a chain id
+    other than 31337 (also for a non-local endpoint, refused first); the
+    mainnet genesis validators root or a fork version outside 0xb3; vault,
+    token and verifier that are zero or not pairwise distinct; a checkpoint
+    outside deployment..deployment+20,000; an activation height below 1 or a
+    burn height below it; caps outside 0 < max_deposit_raw <= max_per_block
+    <= max_per_epoch <= MAX_MONEY; validator bounds outside 4..64 or a zero
+    weight; and, read from anvil, a checkpoint not on this chain, a codeless
+    token, code already at the vault or verifier, a deployer nonce other than
+    zero and vault/verifier other than the deployer's CREATE addresses at
+    nonces 2/1. check=False writes the file anyway, for node-refusal tests.
+    caps may set max_per_block and/or max_per_epoch (node defaults 1e10).
+    """
+    assert os.path.isabs(path), "-b3bridgepins needs an absolute path"
+    caps = dict(caps or {})
+    assert set(caps) <= {"max_per_block", "max_per_epoch"}, caps
+    vault, token, verifier, deployer = (normalize_address(a) for a in (vault, token, verifier, deployer))
+    gvr = hx(gvr)
+    fork_version = hx(fork_version)
+    checkpoint_block = bootstrap_output["checkpoint_block"]
+
+    def refuse(reason):
+        if check:
+            raise BridgePinError(f"refusing to write {path}: {reason}")
+
+    if isinstance(anvil, str):
+        chain_id = int(local_json_rpc(_anvil_url(anvil), "eth_chainId"), 16)
+    else:
+        chain_id = anvil.chain_id_rpc()
+    if chain_id != REGTEST_ETH_CHAIN_ID:
+        refuse(f"anvil chain id {chain_id} is not the regtest origin chain {REGTEST_ETH_CHAIN_ID}")
+    if gvr in (bytes(32), ETHEREUM_MAINNET_GVR):
+        refuse("the genesis validators root is zero or the Ethereum mainnet root")
+    if len(fork_version) != 4 or fork_version[0] != SYNTHETIC_FORK_NAMESPACE:
+        refuse(f"fork version 0x{fork_version.hex()} is outside the synthetic 0xb3 namespace")
+    if bytes(20) in (hx(vault), hx(token), hx(verifier)) or len({vault, token, verifier}) != 3:
+        refuse("vault, token and verifier addresses must be non-zero and pairwise distinct")
+    if not (1 <= deployment_block <= checkpoint_block <=
+            deployment_block + MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS):
+        refuse(f"checkpoint execution block {checkpoint_block} must lie within "
+               f"{MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS} blocks at or after the "
+               f"deployment block {deployment_block} (check 4)")
+    if activation_height < 1 or (burn_height is not None and burn_height < activation_height):
+        refuse(f"need 1 <= activation_height ({activation_height}) <= burn_height ({burn_height})")
+    block_cap = caps.get("max_per_block", BRIDGE_V2_DEFAULT_CAP_RAW)
+    epoch_cap = caps.get("max_per_epoch", BRIDGE_V2_DEFAULT_CAP_RAW)
+    if not 0 < max_deposit_raw <= block_cap <= epoch_cap <= MAX_MONEY:
+        refuse(f"caps must satisfy 0 < max_deposit_raw ({max_deposit_raw}) <= max_per_block "
+               f"({block_cap}) <= max_per_epoch ({epoch_cap}) <= MAX_MONEY (check 1)")
+    if not (4 <= min_bridge_validators <= max_bridge_validators <= 64 and min_bridge_total_weight > 0):
+        refuse("need 4 <= min_bridge_validators <= max_bridge_validators <= 64 and a non-zero weight")
+
+    def rpc(method, *params):
+        return local_json_rpc(_anvil_url(anvil), method, list(params))
+
+    def code(address):
+        return hx(rpc("eth_getCode", address, "latest"))
+
+    if check:
+        anchor = rpc("eth_getBlockByNumber", hex(checkpoint_block), False)
+        if (anchor is None or relayer.norm_hex(anchor["hash"], 32) !=
+                relayer.norm_hex(bootstrap_output["checkpoint_block_hash"], 32)):
+            refuse(f"checkpoint block {checkpoint_block} is not on this anvil chain")
+        for name, address in (("vault", vault), ("verifier", verifier)):
+            if code(address):
+                refuse(f"the {name} address {address} already holds code; pins must predict a "
+                       "deployment that has not happened")
+        nonce = int(rpc("eth_getTransactionCount", deployer, "latest"), 16)
+        if nonce != 0:
+            refuse(f"deployer {deployer} has nonce {nonce}; DeployV2 must start at nonce 0")
+        for name, address, deployer_nonce in (("verifier", verifier, 1), ("vault", vault, 2)):
+            if address != predict_create_address(deployer, deployer_nonce):
+                refuse(f"the {name} is not DeployV2's CREATE address at deployer nonce {deployer_nonce}")
+    token_code = code(token)
+    if not token_code:
+        refuse(f"no runtime code at the token {token}")
+
+    v2 = {
+        "origin_chain_id": REGTEST_ETH_CHAIN_ID,
+        "vault": vault,
+        "token": token,
+        "token_runtime_code_hash": to_0x(keccak256(token_code)),
+        "origin_deployment_block": deployment_block,
+        "max_deposit_raw": max_deposit_raw,
+        "light_client": _light_client_pins_v2(bootstrap_output, gvr, fork_version, horizon_epochs),
+        "verifier": verifier,
+        "min_bridge_validators": min_bridge_validators,
+        "max_bridge_validators": max_bridge_validators,
+        "min_bridge_total_weight": min_bridge_total_weight,
+        "activation_height": activation_height,
+    }
+    if burn_height is not None:
+        v2["burn_height"] = burn_height
+    v2.update(caps)
+    document = {"format": PINS_FORMAT, "v2": v2}
+    with open(path, "w", encoding="utf8") as f:
+        json.dump(document, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return document
+
+
+# -- Verifier V2 and Vault V2 calldata (contracts spec §3.3, §5, §6.4) ---------
+FINALIZED_BLOCK_V2_SIZE = 185
+FB_V2_TUPLE = "(bytes32,uint64,bytes32,bytes32,bytes32,uint64,uint64,bytes32,uint8)"
+SET_HEADER_TUPLE = "(uint64,uint16,uint32,uint64,uint64,bytes,bytes32)"
+VERIFIER_V2_SUBMIT_SIGNATURE = (f"submitCertificate({FB_V2_TUPLE},{SET_HEADER_TUPLE},"
+                                f"{SET_HEADER_TUPLE},bytes32[32],bytes)")
+VERIFIER_V2_INITIALIZE_SIGNATURE = (f"initialize({FB_V2_TUPLE},{SET_HEADER_TUPLE},{SET_HEADER_TUPLE},"
+                                    f"{SET_HEADER_TUPLE},bytes32[32],bytes)")
+VAULT_V2_WITHDRAWAL_TUPLE = "(uint64,address,uint256,uint64)"
+VAULT_V2_RELEASE_SIGNATURE = f"release({VAULT_V2_WITHDRAWAL_TUPLE},bytes32[32])"
+VAULT_V2_WITHDRAWAL_LEAF_SIGNATURE = f"withdrawalLeaf({VAULT_V2_WITHDRAWAL_TUPLE})"
+# B3TypesV2.STATUS_*.
+VERIFIER_V2_STATUS_UNINITIALIZED = 0
+VERIFIER_V2_STATUS_LIVE = 1
+
+
+def decode_finalized_block_v2(data):
+    """The 185-byte FinalizedBlockV2 as a dict (contracts spec §2)."""
+    data = hx(data)
+    assert_equal(len(data), FINALIZED_BLOCK_V2_SIZE)
+    return {
+        "lineage_id": data[0:32],
+        "height": int.from_bytes(data[32:40], "big"),
+        "block_hash": data[40:72],
+        "withdrawal_root": data[72:104],
+        "validator_set_hash": data[104:136],
+        "epoch": int.from_bytes(data[136:144], "big"),
+        "checkpoint_index": int.from_bytes(data[144:152], "big"),
+        "checkpoint_history_root": data[152:184],
+        "bridge_flags": data[184],
+        "encoded": data,
+    }
+
+
+def fb_v2_abi_words(fb):
+    """The nine static ABI words of a FinalizedBlockV2 tuple."""
+    if not isinstance(fb, dict):
+        fb = decode_finalized_block_v2(fb)
+    return b"".join([
+        fb["lineage_id"], enc_uint(fb["height"]), fb["block_hash"], fb["withdrawal_root"],
+        fb["validator_set_hash"], enc_uint(fb["epoch"]), enc_uint(fb["checkpoint_index"]),
+        fb["checkpoint_history_root"], enc_uint(fb["bridge_flags"]),
+    ])
+
+
+def abi_bytes_tail(data):
+    """A dynamic `bytes` value: length word, data, zero padding to 32."""
+    data = hx(data)
+    return enc_uint(len(data)) + data + bytes(-len(data) % 32)
+
+
+def encode_set_header_tuple(header):
+    """ABI tuple of a SetHeader from an RPC set object (one dynamic member)."""
+    pubkey = hx(header["aggregate_pubkey"])
+    head = [enc_uint(header["epoch"]), enc_uint(header["ruleset_version"]),
+            enc_uint(header["validator_count"]), enc_uint(header["total_weight"]),
+            enc_uint(header["quorum_weight"]), enc_uint(7 * 32), enc_bytes32(header["members_root"])]
+    return b"".join(head) + abi_bytes_tail(pubkey)
+
+
+def _abi_encode_args(args):
+    """args: (dynamic, bytes) pairs; static bytes go inline, dynamic ones as tails."""
+    head_size = sum(32 if dynamic else len(data) for dynamic, data in args)
+    head, tail = b"", b""
+    for dynamic, data in args:
+        if dynamic:
+            head += enc_uint(head_size + len(tail))
+            tail += data
+        else:
+            assert len(data) % 32 == 0
+            head += data
+    return head + tail
+
+
+def _path_words(path):
+    assert_equal(len(path), WITHDRAWAL_TREE_DEPTH)
+    return b"".join(enc_bytes32(word) for word in path)
+
+
+def encode_submit_certificate(cert, ancestry_path=None):
+    """B3FinalityVerifierV2.submitCertificate calldata from a
+    getfinalitylineagecertificate result (ancestry_path defaults to its own)."""
+    if ancestry_path is None:
+        ancestry_path = cert["history"]["ancestry_path"]
+    return selector(VERIFIER_V2_SUBMIT_SIGNATURE) + _abi_encode_args([
+        (False, fb_v2_abi_words(cert["encoded"])),
+        (True, encode_set_header_tuple(cert["signing_set"])),
+        (True, encode_set_header_tuple(cert["successor_set"])),
+        (False, _path_words(ancestry_path)),
+        (True, abi_bytes_tail(cert["proof"])),
+    ])
+
+
+def encode_verifier_v2_initialize(cert):
+    """START_CERTIFICATE initialize calldata from a getfinalitylineagecertificate
+    result: signingSet = startSet = the certificate's signing set (the pinned
+    start set signs its own statement), its successor and leaf0Path."""
+    signing = encode_set_header_tuple(cert["signing_set"])
+    return selector(VERIFIER_V2_INITIALIZE_SIGNATURE) + _abi_encode_args([
+        (False, fb_v2_abi_words(cert["encoded"])),
+        (True, signing),
+        (True, signing),
+        (True, encode_set_header_tuple(cert["successor_set"])),
+        (False, _path_words(cert["history"]["leaf0_path"])),
+        (True, abi_bytes_tail(cert["proof"])),
+    ])
+
+
+def encode_withdrawal_v2_tuple(withdrawal_id, recipient, amount, b3_height):
+    return enc_uint(withdrawal_id) + enc_address(recipient) + enc_uint(amount) + enc_uint(b3_height)
+
+
+def encode_vault_v2_release(withdrawal_id, recipient, amount, b3_height, path):
+    """B3VaultV2.release(w, path) calldata (4 + 36 * 32 bytes)."""
+    return (selector(VAULT_V2_RELEASE_SIGNATURE) +
+            encode_withdrawal_v2_tuple(withdrawal_id, recipient, amount, b3_height) + _path_words(path))
+
+
+# -- DeployV2.s.sol (contracts/script, regtest only) ---------------------------
+DEPLOY_V2_CONTRACTS = ("BlsDigestProver", "B3FinalityVerifierV2", "B3VaultV2", "B3RelayBatch")
+
+
+def deploy_v2(forge, srcdir, builddir, anvil_url, deployer, env, broadcast_dir, timeout=600):
+    """Run contracts/script/DeployV2.s.sol:DeployV2 once against a local anvil.
+
+    env carries the script's B3V2_* inputs (B3V2_DEPLOYER is set from
+    deployer). forge runs --offline with its build output and cache below
+    <BUILDDIR>/test/forge (run_forge) and the broadcast records in
+    broadcast_dir; no manifest is written unless env names one. The script
+    itself refuses every chain id but 31337. Returns {contract name:
+    {"address", "block", "gas_used", "tx_hash"}} for the four CREATEs: names
+    and addresses from the broadcast record, receipts from anvil itself,
+    matched by contractAddress (in one run the record's transaction hashes
+    and receipts disagreed on which hash created which contract when
+    several CREATEs shared a block, so its hash pairing is not trusted).
+    """
+    assert_local_url(anvil_url)
+    deployer = normalize_address(deployer)
+    script = os.path.join(os.path.abspath(srcdir), "contracts", "script", "DeployV2.s.sol")
+    full_env = {key: str(value) for key, value in env.items()}
+    full_env["B3V2_DEPLOYER"] = deployer
+    full_env["FOUNDRY_BROADCAST"] = os.path.abspath(broadcast_dir)
+    run_forge(forge, srcdir, builddir, "script", f"{script}:DeployV2", "--rpc-url", anvil_url,
+              "--broadcast", "--unlocked", "--sender", deployer, env=full_env, timeout=timeout)
+    record_path = os.path.join(full_env["FOUNDRY_BROADCAST"], "DeployV2.s.sol",
+                               str(REGTEST_ETH_CHAIN_ID), "run-latest.json")
+    with open(record_path, encoding="utf8") as f:
+        record = json.load(f)
+    hashes = {relayer.norm_hex(tx["hash"], 32) for tx in record["transactions"]}
+    hashes |= {relayer.norm_hex(r["transactionHash"], 32) for r in record["receipts"]}
+    by_address = {}
+    for tx_hash in sorted(hashes):
+        receipt = local_json_rpc(anvil_url, "eth_getTransactionReceipt", [tx_hash])
+        assert receipt is not None, f"anvil has no receipt for DeployV2 transaction {tx_hash}"
+        assert_equal(normalize_address(receipt["from"]), deployer)
+        assert_equal(int(receipt["status"], 16), 1)
+        if receipt.get("contractAddress"):
+            by_address[normalize_address(receipt["contractAddress"])] = receipt
+    created = {}
+    for tx in record["transactions"]:
+        if tx.get("transactionType") != "CREATE":
+            continue
+        address = normalize_address(tx["contractAddress"])
+        receipt = by_address[address]
+        created[tx["contractName"]] = {
+            "address": address,
+            "block": int(receipt["blockNumber"], 16),
+            "gas_used": int(receipt["gasUsed"], 16),
+            "tx_hash": relayer.norm_hex(receipt["transactionHash"], 32),
+        }
+    assert_equal(sorted(created), sorted(DEPLOY_V2_CONTRACTS))
+    return created
+
+
 # -- deposits and the direct mint plan (relayer library, plan §3.4) -----------
 class LocalEthRpc:
     """The relayer JsonRpc.call() interface over a local anvil, never proxied."""
@@ -632,7 +1047,7 @@ def find_deposits(anvil, vault, token, first, last=None):
 
 def build_direct_mint_plan(workdir, beacon, anvil_url, deposit, registry_id, updates,
                            *, payload_tool=None, vault=None, token=None,
-                           max_ancestry=relayer.MAX_ANCESTRY_DISTANCE):
+                           max_ancestry=relayer.MAX_ANCESTRY_DISTANCE, bridge_v2=False):
     """Bootstrap, updates and one mint for `deposit`, verified by ethcheck.
 
     updates lists finalized execution blocks (ints), tool update specs
@@ -643,6 +1058,9 @@ def build_direct_mint_plan(workdir, beacon, anvil_url, deposit, registry_id, upd
     retained B3 anchor) and relayer.emit_plan() run b3-bridge-ethcheck
     --emit-payloads (default: next to the beacon tool). Returns the plan:
     bootstrap, updates, backfills and mint records with payload_hex.
+    bridge_v2=True marks receipt_proof.json for a bridge V2 vault entry, so
+    ethcheck applies the V2 receipt rules (types up to 0x7f, 8,192-byte
+    terminal node, 16 KiB proof) when it builds the mint.
     """
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -669,9 +1087,15 @@ def build_direct_mint_plan(workdir, beacon, anvil_url, deposit, registry_id, upd
                             relayer.norm_hex(vault or deposit["vault"], 20),
                             relayer.norm_hex(token or deposit["token"], 20),
                             registry_id, max_ancestry, source_anchor=None)
+    if bridge_v2:
+        proof_path = workdir / "receipt_proof.json"
+        proof = json.loads(proof_path.read_text(encoding="utf8"))
+        proof["bridge_v2"] = True
+        proof_path.write_text(json.dumps(proof, indent=2, sort_keys=True) + "\n", encoding="utf8")
     plan = relayer.emit_plan(payload_tool, workdir)
     assert plan.get("bootstrap") is not None, "ethcheck emitted no bootstrap"
     assert plan.get("mint") is not None, "ethcheck emitted no mint"
+    assert plan["mint"].get("bridge_v2", False) == bridge_v2, "ethcheck applied the wrong receipt rules"
     return plan
 
 
@@ -938,6 +1362,18 @@ class B3BridgeChainMixin:
 
     def bridge_artifact(self, file, contract):
         return artifact(self.bridge_builddir, file, contract)
+
+    def bridge_method_ids(self, file, contract):
+        """{signature: 4-byte selector hex} from a forge artifact (methodIdentifiers)."""
+        with open(os.path.join(self.bridge_builddir, "test", "forge", "out", file, f"{contract}.json"),
+                  encoding="utf8") as f:
+            return json.load(f)["methodIdentifiers"]
+
+    def bridge_deploy_v2(self, anvil, deployer, env, name="deploy_v2"):
+        """deploy_v2() with this build and the broadcast records in the tmpdir."""
+        return deploy_v2(self.foundry["forge"], self.bridge_srcdir, self.bridge_builddir,
+                         _anvil_url(anvil), deployer, env,
+                         os.path.join(self.options.tmpdir, name, "broadcast"))
 
     def start_synthetic_beacon(self, anvil, slot_offset, base_block, name="beacon",
                                gvr=REGTEST_GVR, fork_version=REGTEST_FORK_VERSION):
@@ -1271,6 +1707,98 @@ class B3BridgeChainMixin:
         return txid, height
 
 
+class FreshVoteShuttle:
+    """Fresh-lineage (digest V2) vote relay for a B3BridgeChainMixin test.
+
+    Fresh votes have no P2P transport in this slice, so they are shuttled
+    between the running validators with the hidden vote RPCs. The shuttle
+    is feature_b3_fresh_lineage.py's (left unchanged there) without its
+    tampered-vote check. Set self.lineage_id (getfinalitylineage) first.
+    Each round also records n0's getfinalitylineage().finalized.certified_at
+    in self.fresh_inclusions; fresh_certificates() reads every type-11
+    carrier from the coinbases, so no certificate included between two
+    polls is missed when relaying.
+    """
+
+    FRESH_VOTE_SIZE = 148
+    MPA_TYPE_FINALITY_CERTIFICATE_V2 = 11
+
+    def _fresh_shuttle_state(self):
+        if not hasattr(self, "_fresh_delivered"):
+            self._fresh_delivered = set()
+            self.fresh_vote_results = Counter()
+            self.fresh_inclusions = set()
+            self._fresh_carriers = {}
+        return self._fresh_delivered
+
+    def shuttle_fresh_votes(self):
+        """Relay every verified fresh vote of each validator to the others."""
+        delivered = self._fresh_shuttle_state()
+        assert getattr(self, "lineage_id", None), "set self.lineage_id before shuttling"
+        validators = [node for node in self.bridge_validators() if node.running]
+        for source in validators:
+            try:
+                votes = source.getfinalitylineagevotes()
+            except JSONRPCException as e:
+                self.log.debug(f"getfinalitylineagevotes on node{source.index}: {e.error}")
+                continue
+            for vote in votes:
+                assert_equal(vote["lineage_id"], self.lineage_id)
+                assert_equal(len(hx(vote["hex"])), self.FRESH_VOTE_SIZE)
+                for target in validators:
+                    key = (target.index, vote["hex"])
+                    if target is source or key in delivered:
+                        continue
+                    try:
+                        result = target.submitfinalitylineagevote(vote["hex"])["result"]
+                    except JSONRPCException as e:
+                        self.log.debug(f"submitfinalitylineagevote on node{target.index}: {e.error}")
+                        result = "rpc-error"
+                    self.fresh_vote_results[result] += 1
+                    if result in ("accepted", "duplicate", "stale"):
+                        delivered.add(key)
+        try:
+            certified_at = (self.nodes[0].getfinalitylineage().get("finalized") or {}).get("certified_at")
+        except JSONRPCException:
+            certified_at = None
+        if certified_at is not None:
+            self.fresh_inclusions.add(certified_at)
+        return True
+
+    def shuttle_until(self, predicate, timeout=300):
+        self.wait_until(lambda: self.shuttle_fresh_votes() and predicate(), timeout=timeout,
+                        check_interval=0.25)
+
+    @staticmethod
+    def fresh_finalized_height(node):
+        return (node.getfinalitylineage().get("finalized") or {}).get("height", -1)
+
+    def fresh_certificates(self, node, first, last=None):
+        """Every type-11 carrier in blocks first..last (default tip) of node.
+
+        Returns [{"inclusion": height, "inclusion_block": hash, "fb": dict}]
+        in height order. Blocks already read are cached by hash, so a
+        reorganized block is read again.
+        """
+        self._fresh_shuttle_state()
+        if last is None:
+            last = node.getblockcount()
+        found = []
+        for height in range(first, last + 1):
+            block_hash = node.getblockhash(height)
+            carriers = self._fresh_carriers.get(block_hash)
+            if carriers is None:
+                coinbase = node.getblock(block_hash, 2)["tx"][0]
+                carriers = [decode_finalized_block_v2(hx(record["payload"])[:FINALIZED_BLOCK_V2_SIZE])
+                            for record in coinbase.get("mpa", [])
+                            if record["type"] == self.MPA_TYPE_FINALITY_CERTIFICATE_V2]
+                assert len(carriers) <= 1, f"block {height} carries {len(carriers)} fresh certificates"
+                self._fresh_carriers[block_hash] = carriers
+            for fb in carriers:
+                found.append({"inclusion": height, "inclusion_block": block_hash, "fb": fb})
+        return found
+
+
 class TestFrameworkB3BridgeGuards(unittest.TestCase):
     """The harness refuses non-local endpoints and real Ethereum domains.
 
@@ -1334,3 +1862,104 @@ class TestFrameworkB3BridgeGuards(unittest.TestCase):
                 assert_local_url(url)
         with self.assertRaises(AssertionError):
             LocalEthRpc("https://ethereum-rpc.example.invalid")
+
+    # -- bridge V2 ------------------------------------------------------------
+    V2_DEPLOYER = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc"  # anvil account 2
+
+    def v2_pin_kwargs(self, **overrides):
+        kwargs = {
+            "vault": predict_create_address(self.V2_DEPLOYER, 2),
+            "token": self.ADDRESSES[1],
+            "verifier": predict_create_address(self.V2_DEPLOYER, 1),
+            "deployer": self.V2_DEPLOYER,
+            "deployment_block": self.DEPLOYMENT_BLOCK,
+            "bootstrap_output": self.BOOTSTRAP,
+            "activation_height": 281,
+            "max_deposit_raw": BRIDGE_V2_DEFAULT_CAP_RAW,
+        }
+        kwargs.update(overrides)
+        return kwargs
+
+    def assert_v2_pins_refused(self, anvil, message, **overrides):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pins-v2.json")
+            with self.assertRaisesRegex(BridgePinError, message):
+                write_regtest_bridge_pins_v2(path, anvil, **self.v2_pin_kwargs(**overrides))
+            self.assertFalse(os.path.exists(path))
+
+    def test_v2_pin_writer_refusals(self):
+        for chain_id in (1, 11_155_111, 17_000):
+            self.assert_v2_pins_refused(self.FakeAnvil(chain_id), "is not the regtest origin chain 31337")
+        regtest = self.FakeAnvil(REGTEST_ETH_CHAIN_ID)
+        self.assert_v2_pins_refused(regtest, "zero or the Ethereum mainnet root", gvr=ETHEREUM_MAINNET_GVR)
+        self.assert_v2_pins_refused(regtest, "outside the synthetic 0xb3 namespace", fork_version="05000000")
+        self.assert_v2_pins_refused(regtest, "non-zero and pairwise distinct", verifier=self.ADDRESSES[1])
+        self.assert_v2_pins_refused(regtest, "non-zero and pairwise distinct", vault="0x" + "00" * 20)
+        late = dict(self.BOOTSTRAP, checkpoint_block=self.DEPLOYMENT_BLOCK +
+                    MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS + 1)
+        self.assert_v2_pins_refused(regtest, "must lie within 20000 blocks", bootstrap_output=late)
+        self.assert_v2_pins_refused(regtest, "activation_height", activation_height=0)
+        self.assert_v2_pins_refused(regtest, "activation_height", burn_height=280)
+        self.assert_v2_pins_refused(regtest, "caps must satisfy", max_deposit_raw=BRIDGE_V2_DEFAULT_CAP_RAW + 1)
+        self.assert_v2_pins_refused(regtest, "caps must satisfy", caps={"max_per_epoch": BRIDGE_V2_DEFAULT_CAP_RAW - 1})
+        self.assert_v2_pins_refused(regtest, "min_bridge_validators", min_bridge_validators=3)
+        self.assert_v2_pins_refused(regtest, "min_bridge_validators", max_bridge_validators=65)
+        self.assert_v2_pins_refused(regtest, "non-zero weight", min_bridge_total_weight=0)
+        for url in ("https://ethereum-rpc.example.invalid", "http://10.0.0.1:8545"):
+            with tempfile.TemporaryDirectory() as tmp, \
+                    self.assertRaisesRegex(AssertionError, "Refusing non-local endpoint"):
+                write_regtest_bridge_pins_v2(os.path.join(tmp, "pins-v2.json"), url, **self.v2_pin_kwargs())
+
+    def test_predict_create_address(self):
+        # anvil account 0 deploys at the well-known addresses of nonces 0, 1 and 2.
+        sender = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        token, vault = self.ADDRESSES[1], self.ADDRESSES[0]
+        verifier = self.ADDRESSES[2]
+        self.assertEqual([predict_create_address(sender, n) for n in range(3)], [token, verifier, vault])
+
+    def test_v2_helpers_match_shared_vectors(self):
+        with open(SRCDIR / "contracts" / "test" / "vectors" / "bridge_v2_vectors.json", encoding="utf8") as f:
+            vectors = json.load(f)
+        self.assertEqual(WITHDRAWAL_LEAF_V2_TAG, hx(vectors["tags"]["leaf_v2"]))
+        self.assertEqual(hashlib.sha256(BRIDGE_V2_ASSET_TAG.encode()).digest(), hx(vectors["tags"]["asset_v2"]))
+        for v in vectors["asset_id_v2"]:
+            self.assertEqual(asset_id_v2(v["chain_domain"], v["origin_chain_id"], v["vault"], v["token"]),
+                             hx(v["asset_id"]))
+        for v in vectors["leaf_v2"]:
+            args = (v["asset_id"], v["withdrawal_id"], v["chain_id"], v["vault"], v["token"],
+                    v["recipient"], v["amount"], v["b3_height"])
+            self.assertEqual(leaf_v2_preimage(*args), hx(v["preimage"]))
+            self.assertEqual(leaf_v2(*args), hx(v["leaf"]))
+        tree = vectors["withdrawal_tree_v2"]
+        leaves = [hx(leaf["leaf"]) if isinstance(leaf, dict) else hx(leaf) for leaf in tree["leaves"]]
+        self.assertEqual(len(leaves), tree["count"])
+        for i, leaf in enumerate(leaves):
+            self.assertEqual(leaf, leaf_v2(tree["asset_id"], i, tree["chain_id"], tree["vault"], tree["token"],
+                                           tree["recipient"], tree["amount"], tree["b3_height"]))
+        self.assertEqual(withdrawal_root(leaves), hx(tree["root"]))
+        for path in tree["paths"]:
+            root, siblings = withdrawal_root_and_path(leaves, path["index"])
+            self.assertEqual(siblings, [hx(s) for s in path["siblings"]])
+            self.assertEqual(fold_withdrawal_path(leaves[path["index"]], path["index"], siblings), root)
+        self.assertEqual(withdrawal_root([]), EMPTY_WITHDRAWAL_ROOT)
+        self.assertNotEqual(EMPTY_WITHDRAWAL_ROOT, bytes(32))
+
+    def test_v2_calldata_shapes(self):
+        header = {"epoch": 0, "ruleset_version": 2, "validator_count": 4, "total_weight": 100,
+                  "quorum_weight": 67, "aggregate_pubkey": "0x" + "a1" * 48, "members_root": "0x" + "b2" * 32}
+        encoded = encode_set_header_tuple(header)
+        self.assertEqual(len(encoded), 7 * 32 + 32 + 64)
+        self.assertEqual(encoded[5 * 32:6 * 32], enc_uint(7 * 32))
+        fb = bytes(range(32)) + (266).to_bytes(8, "big") + b"\x11" * 96 + bytes(8) + (1).to_bytes(8, "big") + \
+            b"\x22" * 32 + b"\x00"
+        cert = {"encoded": to_0x(fb), "signing_set": header, "successor_set": dict(header, epoch=1),
+                "history": {"ancestry_path": ["0x" + "33" * 32] * 32, "leaf0_path": ["0x" + "44" * 32] * 32},
+                "proof": "0x" + "55" * 70}
+        submit = encode_submit_certificate(cert)
+        self.assertEqual(submit[:4], selector(VERIFIER_V2_SUBMIT_SIGNATURE))
+        self.assertEqual(submit[4 + 9 * 32:4 + 10 * 32], enc_uint(44 * 32))  # signingSet follows the 44-word head
+        init = encode_verifier_v2_initialize(cert)
+        self.assertEqual(init[4 + 9 * 32:4 + 10 * 32], enc_uint(45 * 32))
+        self.assertEqual(init[4 + 12 * 32:4 + 13 * 32], b"\x44" * 32)  # leaf0Path after three offsets
+        release = encode_vault_v2_release(0, self.ADDRESSES[0], 10, 281, [bytes(32)] * 32)
+        self.assertEqual(len(release), 4 + 36 * 32)
