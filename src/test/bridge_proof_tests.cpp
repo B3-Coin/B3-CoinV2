@@ -198,6 +198,56 @@ BOOST_AUTO_TEST_CASE(all_kinds_and_components_round_trip)
         BridgeBurnV1{Hash(8), 3, 2'000'000, recipient}});
 }
 
+BOOST_AUTO_TEST_CASE(v2_record_set_adds_only_kind_9)
+{
+    // The V2 record set (from the bridge V2 height V) decodes every V1 kind
+    // byte-identically and adds only kind 9 (node changes sections 3.4 and
+    // 8.2); bridge_state_observation_tests covers kind 9 itself.
+    EthAddress recipient{};
+    recipient.back() = 1;
+    const std::vector<BridgeRecordV1> v1_records{
+        {BridgeRecordKindV1::BOOTSTRAP, BridgeBootstrapV1{Header(3), Committee(4), Branch(6, 5)}},
+        {BridgeRecordKindV1::UPDATE, BridgeUpdateV1{Update()}},
+        {BridgeRecordKindV1::MINT, Mint()},
+        {BridgeRecordKindV1::EXECUTION_BACKFILL, BridgeExecutionBackfillV1{Hash(6), 22'000'001, {{0xf8, 0x10}}}},
+        {BridgeRecordKindV1::MANAGED_WITHDRAWAL, BridgeManagedWithdrawalV1{Hash(7), 2, 1'000'000, recipient}},
+        {BridgeRecordKindV1::BRIDGE_BURN, BridgeBurnV1{Hash(8), 3, 2'000'000, recipient}},
+    };
+    for (const BridgeRecordV1& record : v1_records) {
+        const auto v1{EncodeBridgeRecordV1(record, BRIDGE_MPT_LIMITS_V1)};
+        const auto v2{EncodeBridgeRecordV1(record, BRIDGE_MPT_LIMITS_V2)};
+        BOOST_REQUIRE(v1 && v2);
+        BOOST_CHECK(*v1 == *v2);
+        BOOST_CHECK(DecodeBridgeRecordV1(*v1, BRIDGE_MPT_LIMITS_V1) == record);
+        BOOST_CHECK(DecodeBridgeRecordV1(*v1, BRIDGE_MPT_LIMITS_V2) == record);
+    }
+
+    BridgeEthStateObservationV2 observation;
+    observation.subject = ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS;
+    observation.anchor_hash = Hash(9);
+    BridgeEthAccountProofV2 token;
+    token.account_nodes.push_back({0xc1, 0x80});
+    token.storage_nodes.resize(3);
+    observation.accounts.push_back(token);
+    const BridgeRecordV1 kind9{BridgeRecordKindV1::ETH_STATE_OBSERVATION, observation};
+    BOOST_CHECK(!EncodeBridgeRecordV1(kind9, BRIDGE_MPT_LIMITS_V1));
+    const auto encoded{EncodeBridgeRecordV1(kind9, BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(encoded);
+    BOOST_CHECK_EQUAL((*encoded)[0], 9);
+    BOOST_CHECK(!DecodeBridgeRecordV1(*encoded, BRIDGE_MPT_LIMITS_V1));
+    BOOST_CHECK(DecodeBridgeRecordV1(*encoded, BRIDGE_MPT_LIMITS_V2) == kind9);
+
+    // Reserved and unknown kinds (7, 8, 10-13 and beyond) stay malformed in
+    // both sets, whatever body follows.
+    for (unsigned kind{0}; kind <= 255; ++kind) {
+        if ((kind >= 1 && kind <= 6) || kind == 9) continue;
+        auto patched{*encoded};
+        patched[0] = static_cast<unsigned char>(kind);
+        BOOST_CHECK(!DecodeBridgeRecordV1(patched, BRIDGE_MPT_LIMITS_V1));
+        BOOST_CHECK(!DecodeBridgeRecordV1(patched, BRIDGE_MPT_LIMITS_V2));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(rejects_truncation_trailing_and_noncanonical_envelopes)
 {
     const BridgeRecordV1 record{BridgeRecordKindV1::MINT, Mint()};

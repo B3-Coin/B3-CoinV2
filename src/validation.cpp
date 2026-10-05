@@ -1250,26 +1250,51 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
                                      "bridge-state-unavailable");
             }
+            const int64_t candidate_time{std::max<int64_t>(
+                args.m_accept_time, tip->GetMedianTimePast() + 1)};
             node::BridgeBurnReadiness burn_readiness{
                 node::BridgeBurnReadiness::READY};
-            if (bridge_v2 && node::HasDecentralizedBridgeBurn(tx)) {
-                // TEMPORARY V2 burn gate (node changes section 8.4 rows
-                // C1/C2 only): the projected fresh lineage must be live and
-                // its committees able to authorize a Verifier V2 root. The
-                // kind 9 liveness gate replaces this in a later slice. Block
-                // assembly and wallet prevalidation share this evaluation.
-                std::string not_ready_reason;
-                burn_readiness = node::ProjectedBridgeV2BurnReadiness(
+            // From V a burn (gate) or a kind 9 record (VERIFIER_E verdict)
+            // needs the fresh lineage projected for the next block. Block
+            // validation, block assembly and wallet prevalidation build the
+            // same context.
+            const bool bridge_v2_burn{bridge_v2 &&
+                                      node::HasDecentralizedBridgeBurn(tx)};
+            std::optional<node::BridgeV2LineageContext> bridge_lineage;
+            if (bridge_v2_burn ||
+                (bridge_v2 && node::HasBridgeV2Observation(tx))) {
+                std::string lineage_reason;
+                bridge_lineage = node::MakeBridgeV2LineageContext(
                     m_active_chainstate.ModernFinality(),
                     m_active_chainstate.m_chain,
                     m_active_chainstate.m_blockman, consensus, *tip,
-                    tracker.Index(), not_ready_reason);
+                    tracker.Index(), lineage_reason);
+                if (!bridge_lineage) {
+                    return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                         "bridge-v2-lineage-unavailable",
+                                         lineage_reason);
+                }
+            }
+            if (bridge_v2_burn) {
+                // The V2 burn gate (node changes section 8.4 rows C1-C4 and
+                // E1-E8) on that lineage and the connected kind 9
+                // observations, at this candidate's time. The mempool also
+                // refuses a burn whose gate closes within the policy margin
+                // (section 8.6), so a burn it relays stays includable for a
+                // while.
+                const node::BridgeV2GateResult gate{
+                    node::EvaluateBridgeV2BurnGate(
+                        &*bridge_lineage, tracker.Index(), consensus,
+                        next_block_height, candidate_time)};
+                burn_readiness = gate.readiness;
                 std::string readiness_error;
                 if (!node::CheckBridgeV2BurnReadiness(
                         tx, burn_readiness, readiness_error)) {
-                    if (!not_ready_reason.empty()) {
-                        readiness_error += ": " + not_ready_reason;
-                    }
+                    readiness_error += ": " +
+                                       (burn_readiness ==
+                                                node::BridgeBurnReadiness::UNAVAILABLE
+                                            ? gate.reason
+                                            : gate.Describe());
                     return state.Invalid(
                         burn_readiness ==
                                 node::BridgeBurnReadiness::UNAVAILABLE
@@ -1280,6 +1305,17 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                             ? "bridge-v2-burn-readiness-unavailable"
                             : "bridge-v2-burn-not-ready",
                         readiness_error);
+                }
+                const int64_t close_margin{
+                    consensus.bridge_v2->gate.mempool_close_margin_seconds};
+                if (gate.closes_at &&
+                    *gate.closes_at - gate.now_eff <= close_margin) {
+                    return state.Invalid(
+                        TxValidationResult::TX_MEMPOOL_POLICY,
+                        "bridge-v2-burn-gate-closing",
+                        strprintf("bridge V2 burn gate closes at %d, within %d s of %d",
+                                  *gate.closes_at, close_margin,
+                                  gate.now_eff));
                 }
             } else if (node::HasDecentralizedBridgeBurn(tx) &&
                 consensus.busd_bridge->withdrawal_mode ==
@@ -1317,11 +1353,10 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
             }
             node::BridgeTxAuthorization authorization;
             std::string bridge_error;
-            const int64_t candidate_time{std::max<int64_t>(
-                args.m_accept_time, tip->GetMedianTimePast() + 1)};
             if (!tracker.Index().VerifyTransaction(
                     tx, next_block_height, candidate_time, consensus,
-                    authorization, bridge_error)) {
+                    authorization, bridge_error,
+                    bridge_lineage ? &*bridge_lineage : nullptr)) {
                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
                                      "bad-bridge-authorization",
                                      bridge_error);
@@ -3679,29 +3714,43 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 BlockValidationResult::BLOCK_CONSENSUS,
                 "bridge-withdrawal-rules-inactive");
         }
-        if (bridge_v2 && node::HasDecentralizedBridgeBurn(block)) {
-            // TEMPORARY V2 burn gate (node changes section 8.4 rows C1/C2
-            // only), judged on the lineage projected from the exact parent.
-            // The kind 9 liveness gate replaces this in a later slice. Block
-            // assembly applies the same evaluation (node/miner.cpp).
-            std::string not_ready_reason;
-            const node::BridgeBurnReadiness readiness{
-                node::ProjectedBridgeV2BurnReadiness(
-                    ModernFinality(), m_chain, m_blockman,
-                    params.GetConsensus(), *pindex->pprev, tracker.Index(),
-                    not_ready_reason)};
-            if (readiness == node::BridgeBurnReadiness::UNAVAILABLE) {
-                return state.Error("bridge V2 burn readiness is unavailable");
+        // From V a burn (gate) or a kind 9 record (VERIFIER_E verdict) is
+        // judged on the fresh lineage projected from the exact parent. Mempool
+        // admission, block assembly and wallet prevalidation build the same
+        // context.
+        const bool bridge_v2_burn{bridge_v2 &&
+                                  node::HasDecentralizedBridgeBurn(block)};
+        std::optional<node::BridgeV2LineageContext> bridge_lineage;
+        if (bridge_v2_burn ||
+            (bridge_v2 && node::HasBridgeV2Observation(block))) {
+            std::string lineage_reason;
+            bridge_lineage = node::MakeBridgeV2LineageContext(
+                ModernFinality(), m_chain, m_blockman, params.GetConsensus(),
+                *pindex->pprev, tracker.Index(), lineage_reason);
+            if (!bridge_lineage) {
+                return state.Error("bridge V2 lineage is unavailable: " +
+                                   lineage_reason);
+            }
+        }
+        if (bridge_v2_burn) {
+            // The V2 burn gate (node changes section 8.4 rows C1-C4 and
+            // E1-E8) on that lineage and the parent's kind 9 observations at
+            // this block's time.
+            const node::BridgeV2GateResult gate{
+                node::EvaluateBridgeV2BurnGate(
+                    &*bridge_lineage, tracker.Index(), params.GetConsensus(),
+                    pindex->nHeight, block.GetBlockTime())};
+            if (gate.readiness == node::BridgeBurnReadiness::UNAVAILABLE) {
+                return state.Error("bridge V2 burn readiness is unavailable: " +
+                                   gate.reason);
             }
             std::string readiness_error;
             if (!node::CheckBridgeV2BurnReadiness(
-                    block, readiness, readiness_error)) {
-                if (!not_ready_reason.empty()) {
-                    readiness_error += ": " + not_ready_reason;
-                }
+                    block, gate.readiness, readiness_error)) {
                 return state.Invalid(
                     BlockValidationResult::BLOCK_CONSENSUS,
-                    "bridge-v2-burn-not-ready", readiness_error);
+                    "bridge-v2-burn-not-ready",
+                    readiness_error + ": " + gate.Describe());
             }
         } else if (node::HasDecentralizedBridgeBurn(block) &&
             params.GetConsensus().busd_bridge->withdrawal_mode ==
@@ -3734,7 +3783,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         std::string bridge_error;
         if (!tracker.Index().VerifyBlock(
                 block, pindex->nHeight, block_hash, params.GetConsensus(),
-                bridge_delta, bridge_error)) {
+                bridge_delta, bridge_error,
+                bridge_lineage ? &*bridge_lineage : nullptr)) {
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                  "bad-bridge-state", bridge_error);
         }

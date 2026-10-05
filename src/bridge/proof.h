@@ -80,24 +80,33 @@ static_assert(MAX_BRIDGE_MINT_WIRE_SIZE <= MAX_BRIDGE_RECORD_SIZE);
  * every node and ends on the receipt value, so the receipt-bearing leaf is
  * always the final node. Ancestry headers, backfills, the 64-node count and
  * the 32 KiB record cap are the same under every limit set.
+ *
+ * The limit set is the codec's height selector, so it also carries the
+ * record set: `v2_kinds` admits the bridge V2 record kinds (kind 9,
+ * ETH_STATE_OBSERVATION). Consensus passes the V2 set from V only, so a
+ * kind 9 record is malformed below V and on every network without bridge_v2,
+ * exactly as an unknown kind was before.
  */
 struct BridgeMptLimits {
     size_t max_node_size;
     size_t max_terminal_node_size;
     size_t max_total_bytes;
+    bool v2_kinds{false};
 };
 
-//! Today's exact receipt-proof limits, used below the bridge V2 height.
+//! Today's exact receipt-proof limits and record set, used below the bridge
+//! V2 height.
 inline constexpr BridgeMptLimits BRIDGE_MPT_LIMITS_V1{
-    MAX_BRIDGE_RLP_ITEM_SIZE, MAX_BRIDGE_RLP_ITEM_SIZE, MAX_BRIDGE_MPT_BYTES};
+    MAX_BRIDGE_RLP_ITEM_SIZE, MAX_BRIDGE_RLP_ITEM_SIZE, MAX_BRIDGE_MPT_BYTES,
+    /*v2_kinds=*/false};
 //! Bridge V2 (doc/design/b3-bridge-v2-node-changes.md section 4): a terminal
 //! receipt node up to 8,192 bytes and a receipt proof up to 16 KiB; every
-//! other node keeps the 1,024-byte limit.
+//! other node keeps the 1,024-byte limit. Kind 9 (section 8.2) is valid.
 inline constexpr size_t MAX_BRIDGE_TERMINAL_RECEIPT_NODE_SIZE_V2{8'192};
 inline constexpr size_t MAX_BRIDGE_MPT_BYTES_V2{16'384};
 inline constexpr BridgeMptLimits BRIDGE_MPT_LIMITS_V2{
     MAX_BRIDGE_RLP_ITEM_SIZE, MAX_BRIDGE_TERMINAL_RECEIPT_NODE_SIZE_V2,
-    MAX_BRIDGE_MPT_BYTES_V2};
+    MAX_BRIDGE_MPT_BYTES_V2, /*v2_kinds=*/true};
 
 // Blob lengths travel as u16, and V2 only widens V1.
 static_assert(MAX_BRIDGE_TERMINAL_RECEIPT_NODE_SIZE_V2 <= 0xffff);
@@ -117,6 +126,9 @@ enum class BridgeRecordKindV1 : uint8_t {
     EXECUTION_BACKFILL = 4,
     MANAGED_WITHDRAWAL = 5,
     BRIDGE_BURN = 6,
+    //! Bridge V2 only (node changes section 8.2): decoded under the V2
+    //! record set (BridgeMptLimits::v2_kinds), malformed otherwise.
+    ETH_STATE_OBSERVATION = 9,
 };
 
 struct BridgeBootstrapV1 {
@@ -183,10 +195,88 @@ struct BridgeBurnV1 {
     friend bool operator==(const BridgeBurnV1&, const BridgeBurnV1&) = default;
 };
 
+/**
+ * Kind 9 ETH_STATE_OBSERVATION subjects and verdict bits (node changes
+ * section 8.2; the gate rows that read them are section 8.4).
+ *
+ * - VERIFIER_E reads Verifier V2 slots 0, 1, 2, 4 and 6 (E1-E6). Its
+ *   verdict byte records the B3-side comparison: bit 0 SETS_MISMATCH (E4)
+ *   and bit 1 CERT_CONFLICT (E5). Consensus recomputes and must agree.
+ * - RESERVE_E reads Vault V2 slots 0, 1 and 3 and the token's
+ *   balances[vault] (E8, wind-down and transit crediting).
+ * - TOKEN_FLAGS reads the token's slots 0 and 10 and isBlackListed[vault]
+ *   (E7).
+ *
+ * Every other subject value is malformed, and so is a verdict with any
+ * other bit or a non-zero verdict on a subject other than VERIFIER_E.
+ */
+inline constexpr uint8_t ETH_OBSERVATION_SUBJECT_VERIFIER{1};
+inline constexpr uint8_t ETH_OBSERVATION_SUBJECT_RESERVE{2};
+inline constexpr uint8_t ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS{3};
+inline constexpr uint8_t ETH_OBSERVATION_VERDICT_SETS_MISMATCH{0x01};
+inline constexpr uint8_t ETH_OBSERVATION_VERDICT_CERT_CONFLICT{0x02};
+inline constexpr uint8_t ETH_OBSERVATION_VERDICT_MASK{0x03};
+
+namespace proof_detail {
+inline constexpr std::array<uint8_t, 1> ETH_OBSERVATION_SHAPE_VERIFIER{5};
+inline constexpr std::array<uint8_t, 2> ETH_OBSERVATION_SHAPE_RESERVE{3, 1};
+inline constexpr std::array<uint8_t, 1> ETH_OBSERVATION_SHAPE_TOKEN_FLAGS{3};
+} // namespace proof_detail
+
+/**
+ * The proof shape a subject requires: one entry per account in wire order,
+ * each the number of storage slots proved for it. VERIFIER_E is
+ * [verifier: 5]; RESERVE_E is [vault: 3, token: 1]; TOKEN_FLAGS is
+ * [token: 3]. Empty for an unknown subject.
+ */
+inline std::span<const uint8_t> EthObservationShapeV2(const uint8_t subject)
+{
+    switch (subject) {
+    case ETH_OBSERVATION_SUBJECT_VERIFIER:
+        return proof_detail::ETH_OBSERVATION_SHAPE_VERIFIER;
+    case ETH_OBSERVATION_SUBJECT_RESERVE:
+        return proof_detail::ETH_OBSERVATION_SHAPE_RESERVE;
+    case ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS:
+        return proof_detail::ETH_OBSERVATION_SHAPE_TOKEN_FLAGS;
+    }
+    return {};
+}
+
+/**
+ * One account's EIP-1186 proof: the state-trie nodes proving the account
+ * (eth_getProof accountProof, 1-64 nodes) and, per slot of the subject's
+ * shape, the storage-trie nodes proving that slot (storageProof[i].proof,
+ * 0-64 nodes; zero nodes only prove a slot of an empty storage trie). Each
+ * node is at most 1,024 bytes and each node list at most 11,264 bytes.
+ */
+struct BridgeEthAccountProofV2 {
+    std::vector<std::vector<unsigned char>> account_nodes{};
+    std::vector<std::vector<std::vector<unsigned char>>> storage_nodes{};
+
+    friend bool operator==(const BridgeEthAccountProofV2&,
+                           const BridgeEthAccountProofV2&) = default;
+};
+
+/**
+ * Kind 9 body. Addresses, slot keys and values never travel: the subject
+ * and the bridge V2 pins fix the accounts and slots, and the proofs carry
+ * the values, all checked against the state root of the retained V2
+ * execution anchor `anchor_hash` (raw EVM byte order).
+ */
+struct BridgeEthStateObservationV2 {
+    uint8_t subject{0};
+    uint256 anchor_hash{};
+    uint8_t verdict{0};
+    std::vector<BridgeEthAccountProofV2> accounts{};
+
+    friend bool operator==(const BridgeEthStateObservationV2&,
+                           const BridgeEthStateObservationV2&) = default;
+};
+
 using BridgeRecordPayloadV1 =
     std::variant<BridgeBootstrapV1, BridgeUpdateV1, BridgeMintV1,
                  BridgeExecutionBackfillV1, BridgeManagedWithdrawalV1,
-                 BridgeBurnV1>;
+                 BridgeBurnV1, BridgeEthStateObservationV2>;
 
 struct BridgeRecordV1 {
     BridgeRecordKindV1 kind{BridgeRecordKindV1::BOOTSTRAP};
@@ -568,6 +658,99 @@ inline bool AddressNonzero(const EthAddress& address)
                        [](const unsigned char byte) { return byte != 0; });
 }
 
+//! Subject, anchor and verdict rules shared by both kind 9 directions.
+inline bool EthObservationHeaderValid(const uint8_t subject,
+                                      const uint256& anchor_hash,
+                                      const uint8_t verdict)
+{
+    return !EthObservationShapeV2(subject).empty() && !anchor_hash.IsNull() &&
+           (verdict & ~ETH_OBSERVATION_VERDICT_MASK) == 0 &&
+           (subject == ETH_OBSERVATION_SUBJECT_VERIFIER || verdict == 0);
+}
+
+// One node list of an account or storage proof: the receipt-proof node
+// count, node size and byte limits (64 nodes, 1,024 bytes each, 11,264 in
+// total), the same bounds bridge/state_proof.h's verifier enforces.
+inline bool EncodeStateProofNodes(
+    Writer& writer, const std::vector<std::vector<unsigned char>>& nodes,
+    const bool require_nonempty)
+{
+    return EncodeBlobVector(writer, nodes, MAX_BRIDGE_MPT_NODES,
+                            MAX_BRIDGE_MPT_BYTES, require_nonempty);
+}
+
+inline bool DecodeStateProofNodes(
+    Reader& reader, std::vector<std::vector<unsigned char>>& nodes,
+    const bool require_nonempty)
+{
+    return DecodeBlobVector(reader, nodes, MAX_BRIDGE_MPT_NODES,
+                            MAX_BRIDGE_MPT_BYTES, require_nonempty);
+}
+
+inline bool EncodeEthStateObservation(Writer& writer,
+                                      const BridgeEthStateObservationV2& value)
+{
+    const auto shape{EthObservationShapeV2(value.subject)};
+    if (!EthObservationHeaderValid(value.subject, value.anchor_hash,
+                                   value.verdict) ||
+        value.accounts.size() != shape.size()) {
+        return false;
+    }
+    writer.U8(value.subject);
+    writer.Root(value.anchor_hash);
+    writer.U8(value.verdict);
+    writer.U8(static_cast<uint8_t>(shape.size()));
+    for (size_t i{0}; i < shape.size(); ++i) {
+        const BridgeEthAccountProofV2& account{value.accounts[i]};
+        if (account.storage_nodes.size() != shape[i] ||
+            !EncodeStateProofNodes(writer, account.account_nodes,
+                                   /*require_nonempty=*/true)) {
+            return false;
+        }
+        writer.U8(shape[i]);
+        for (const auto& slot_nodes : account.storage_nodes) {
+            if (!EncodeStateProofNodes(writer, slot_nodes,
+                                       /*require_nonempty=*/false)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+inline bool DecodeEthStateObservation(Reader& reader,
+                                      BridgeEthStateObservationV2& value)
+{
+    uint8_t account_count{0};
+    if (!reader.U8(value.subject) || !reader.Root(value.anchor_hash) ||
+        !reader.U8(value.verdict) ||
+        !EthObservationHeaderValid(value.subject, value.anchor_hash,
+                                   value.verdict) ||
+        !reader.U8(account_count)) {
+        return false;
+    }
+    const auto shape{EthObservationShapeV2(value.subject)};
+    if (account_count != shape.size()) return false;
+    value.accounts.assign(shape.size(), {});
+    for (size_t i{0}; i < shape.size(); ++i) {
+        BridgeEthAccountProofV2& account{value.accounts[i]};
+        uint8_t slot_count{0};
+        if (!DecodeStateProofNodes(reader, account.account_nodes,
+                                   /*require_nonempty=*/true) ||
+            !reader.U8(slot_count) || slot_count != shape[i]) {
+            return false;
+        }
+        account.storage_nodes.assign(slot_count, {});
+        for (auto& slot_nodes : account.storage_nodes) {
+            if (!DecodeStateProofNodes(reader, slot_nodes,
+                                       /*require_nonempty=*/false)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace proof_detail
 
 /** Standalone canonical component codec used by durable light-client state. */
@@ -617,10 +800,11 @@ inline std::optional<ssz::SyncCommittee> DecodeBridgeSyncCommitteeV1(
 }
 
 /**
- * Canonical encode. `mpt_limits` applies only to a MINT's receipt proof; the
- * V1 default keeps every pre-V2 caller byte-identical. Consensus selects the
- * limit set by height (V2 from the bridge V2 activation height), so a record
- * that only fits the V2 limits is malformed below that height.
+ * Canonical encode. `mpt_limits` applies only to a MINT's receipt proof and
+ * to whether kind 9 exists; the V1 default keeps every pre-V2 caller
+ * byte-identical. Consensus selects the limit set by height (V2 from the
+ * bridge V2 activation height), so a record that only fits the V2 limits,
+ * or any kind 9 record, is malformed below that height.
  */
 inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
     const BridgeRecordV1& record,
@@ -712,6 +896,13 @@ inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
             writer.U64(value->raw_amount);
             writer.Bytes(value->ethereum_recipient);
             valid = true;
+        }
+        break;
+    case BridgeRecordKindV1::ETH_STATE_OBSERVATION:
+        if (!mpt_limits.v2_kinds) break;
+        if (const auto* value{
+                std::get_if<BridgeEthStateObservationV2>(&record.payload)}) {
+            valid = EncodeEthStateObservation(writer, *value);
         }
         break;
     }
@@ -813,6 +1004,14 @@ inline std::optional<BridgeRecordV1> DecodeBridgeRecordV1(
             !reader.U64(value.raw_amount) || value.raw_amount == 0 ||
             !reader.Bytes(value.ethereum_recipient) ||
             !AddressNonzero(value.ethereum_recipient) || !reader.Empty()) {
+            return std::nullopt;
+        }
+        return BridgeRecordV1{kind, std::move(value)};
+    }
+    case BridgeRecordKindV1::ETH_STATE_OBSERVATION: {
+        BridgeEthStateObservationV2 value;
+        if (!mpt_limits.v2_kinds ||
+            !DecodeEthStateObservation(reader, value) || !reader.Empty()) {
             return std::nullopt;
         }
         return BridgeRecordV1{kind, std::move(value)};

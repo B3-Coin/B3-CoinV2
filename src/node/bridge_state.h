@@ -6,14 +6,19 @@
 #define B3COIN_NODE_BRIDGE_STATE_H
 
 #include <bridge/admission.h>
+#include <bridge/burn_gate_v2.h>
 #include <bridge/eth_light_client.h>
+#include <bridge/reserve_v2.h>
+#include <bridge/state_observation.h>
 #include <consensus/params.h>
 #include <modern/withdrawal_tree.h>
 #include <modern/withdrawal_v2.h>
+#include <node/finality_fresh_lineage.h>
 #include <primitives/block.h>
 #include <primitives/transaction_identifier.h>
 #include <uint256.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -34,7 +39,6 @@ namespace node {
 class BlockManager;
 class BridgeStateIndex;
 class FinalityTracker;
-struct LineageV2View;
 
 /** Parent-derived ability of B3's current and next validator sets to produce
  * a withdrawal root accepted by the pinned Ethereum verifier. UNAVAILABLE is
@@ -60,50 +64,184 @@ bool CheckBridgeBurnReadiness(const CBlock& block,
                               BridgeBurnReadiness readiness,
                               std::string& error);
 
+//! True for a transaction or block carrying a syntactically decoded kind 9
+//! ETH_STATE_OBSERVATION (decoded under the bridge V2 record set).
+bool HasBridgeV2Observation(const CTransaction& tx);
+bool HasBridgeV2Observation(const CBlock& block);
+
+/** Number of kind 9 subjects: VERIFIER_E, RESERVE_E and TOKEN_FLAGS
+ * (bridge::ETH_OBSERVATION_SUBJECT_*, values 1-3). */
+inline constexpr size_t BRIDGE_V2_OBSERVATION_SUBJECTS{3};
+
 /**
- * TEMPORARY bridge V2 burn gate (node changes section 8.4 rows C1/C2 only):
- * READY iff the V2 envelope is complete, the fresh lineage is configured,
- * bootstrapped and not broken, and its current and next committees each
- * have a member count within the Verifier V2 bounds and at least its
- * minimum total weight. Height >= W2 is the bridge verifier's rule (a kind 6
- * below W2 is invalid there). Never UNAVAILABLE: the caller reports
- * UNAVAILABLE when it cannot reconstruct the lineage view.
- * The kind 9 liveness rows (C3, C4, E1-E8), the impairment and wind-down
- * terms and the B-22 committee replace this predicate in later slices;
- * until then a V2 burn needs only a live fresh lineage. `reason` names the
- * first failed condition.
+ * One connected kind 9 observation (node changes section 8.2): the anchor
+ * it was proven against, the anchor's execution timestamp `t_obs`, the
+ * recorded verdict byte (VERIFIER_E only, else zero), the decoded state and
+ * the active B3 block that connected it.
  */
-BridgeBurnReadiness BridgeV2BurnReadiness(
-    const LineageV2View& lineage, const Consensus::BridgeV2Params& params,
+struct BridgeObservationRecordV2 {
+    uint8_t subject{0};
+    uint256 anchor_hash{};
+    uint64_t anchor_block{0};
+    int64_t t_obs{0};
+    uint8_t verdict{0};
+    bridge::ObservedStateV2 state{};
+    int connected_height{-1};
+    uint256 connected_block{};
+
+    friend bool operator==(const BridgeObservationRecordV2&,
+                           const BridgeObservationRecordV2&) = default;
+};
+
+//! The latest observation per subject, indexed by subject - 1.
+using BridgeObservationSlotsV2 =
+    std::array<std::optional<BridgeObservationRecordV2>,
+               BRIDGE_V2_OBSERVATION_SUBJECTS>;
+
+//! One proven Vault V2 deposit, minted as bUSD V2 (node changes section 7.1).
+struct BridgeProvenDepositV2 {
+    uint64_t deposit_id{0};
+    CAmount amount{0};
+
+    friend bool operator==(const BridgeProvenDepositV2&,
+                           const BridgeProvenDepositV2&) = default;
+};
+
+/**
+ * The sticky bridge V2 conflict (node changes sections 8.4-8.5): the first
+ * E5 (a LIVE VERIFIER_E whose latestCertId is not B3's certificate) or E8
+ * (a RESERVE_E failing invariant R) on the active chain. It closes the burn
+ * gate (row C4) until the block that set it is disconnected; nothing else
+ * clears it. `reason` is bridge::BRIDGE_V2_CONFLICT_E5 or _E8 (13 is
+ * reserved for conflict kind 13, a later slice).
+ */
+struct BridgeV2Conflict {
+    uint8_t reason{0};
+    int height{-1};
+    uint256 block_hash{};
+    uint64_t anchor_block{0};
+
+    friend bool operator==(const BridgeV2Conflict&,
+                           const BridgeV2Conflict&) = default;
+};
+
+/**
+ * What the bridge V2 rules read of the fresh finality lineage for one
+ * candidate block (node changes section 7.4): the fresh state projected for
+ * the candidate height and the candidate chain's block hashes (`hash_at`
+ * answers heights up to the parent).
+ *
+ * Block connection, mempool admission, block assembly and wallet
+ * prevalidation build it with MakeBridgeV2LineageContext. Replay of blocks
+ * that were already connected (BridgeStateTracker) passes REPLAY_LINEAGE
+ * instead: it carries no lineage and trusts each recorded VERIFIER_E
+ * verdict, which ConnectBlock judged with a full context before the block
+ * was stored. A context is never a burn-gate input when it trusts verdicts.
+ */
+struct BridgeV2LineageContext {
+    bool trust_recorded_verdicts{false};
+    std::optional<FreshLineageState> fresh{};
+    modern::FreshHashAtFn hash_at{};
+};
+
+//! The replay context (trust_recorded_verdicts, no lineage).
+extern const BridgeV2LineageContext REPLAY_LINEAGE;
+
+/**
+ * The lineage context for the block that would extend `parent`: syncs
+ * `finality` to `parent` with `bridge_index` (which must already be synced
+ * to `parent`) and projects the fresh lineage for parent + 1; `hash_at`
+ * walks `parent`'s ancestors. nullopt, with `reason`, without a bridge V2
+ * envelope or when the finality state cannot be reconstructed. Without a
+ * configured fresh lineage the context carries no fresh state, so the gate
+ * reports C2 and a LIVE VERIFIER_E cannot be judged. Under cs_main.
+ */
+std::optional<BridgeV2LineageContext> MakeBridgeV2LineageContext(
+    FinalityTracker& finality, const CChain& chain,
+    const BlockManager& blockman, const Consensus::Params& params,
+    const CBlockIndex& parent, const BridgeStateIndex& bridge_index,
     std::string& reason);
 
-/** CheckBridgeBurnReadiness for the V2 regime: the error text names the
- * temporary gate. Callers apply it only from the bridge V2 height. */
+/**
+ * The VERIFIER_E verdict B3 records for a LIVE verifier observation in a
+ * block at `height` (node changes section 8.4 rows E4-E5), against `index`
+ * connected at height - 1:
+ * - bit 0 SETS_MISMATCH: currentSetHash / nextSetHash differ from
+ *   setHash(Set'_{e_E}) / setHash(Set'_{e_E+1}) of the lineage;
+ * - bit 1 CERT_CONFLICT: Latest.index is 0, Latest.height is not
+ *   G + index * checkpoint_interval, or latestCertId is not
+ *   FinalityCertIdV2 of B3's canonical epoch-e_E statement at Latest.height
+ *   (ExpectedFinalizedBlockV2).
+ * nullopt, with a stable `error`, when the record cannot be judged and is
+ * therefore invalid: no bootstrapped, unbroken fresh lineage; e_E not the
+ * lineage epoch e_B3 or e_B3 - 1 (only those sets are retained, so a
+ * verifier two epochs behind cannot be observed and E1 closes the gate);
+ * Latest.height above height - 1; or B3 unable to form its statement.
+ *
+ * The e_B3 - 1 limit makes E3's effective tolerance for a newly observed
+ * verifier 1, not section 8.4's 2 (max_epoch_gap stays 2, reached only by
+ * an aged observation). Restoring 2 needs the fresh lineage to retain
+ * Set'_{e-2} (node/finality_fresh_lineage.h), outside the bridge index.
+ *
+ * Cost: ExpectedFinalizedBlockV2 builds the history root over leaves
+ * 0..Latest.index - 1. While Latest.index is below the lineage's finalized
+ * index (a verifier lagging B3, the usual case) FreshHistoryRootAt rebuilds
+ * it from leaf 0: O(Latest.index) hash_at lookups and keccak calls, one
+ * per fresh checkpoint since R_f (about 52,600 a year at mainnet's grid of
+ * ten 60-second blocks) per LIVE VERIFIER_E record, in mempool admission, block
+ * assembly, block validation and TestBlockValidity alike. Kind 9 records
+ * are bounded by the per-block weight, and a cache of roots by index in the
+ * fresh lineage would remove the rebuild (a later slice).
+ */
+std::optional<uint8_t> VerifierVerdictV2(
+    const bridge::VerifierStateV2& observed,
+    const BridgeV2LineageContext& lineage, const Consensus::Params& params,
+    const BridgeStateIndex& index, int height, std::string& error);
+
+/** One evaluation of the bridge V2 burn gate. */
+struct BridgeV2GateResult {
+    BridgeBurnReadiness readiness{BridgeBurnReadiness::UNAVAILABLE};
+    bridge::BurnGateRowV2 row{bridge::BurnGateRowV2::NONE};
+    std::string reason{};
+    //! READY only: the first now_eff at which a time row closes the gate.
+    std::optional<int64_t> closes_at{};
+    int64_t now_eff{0};
+
+    //! "ready", "<row>: <reason>" or "unavailable: <reason>".
+    std::string Describe() const;
+};
+
+/**
+ * The bridge V2 burn gate (node changes section 8.4 rows C1-C4 and E1-E8,
+ * bridge::EvaluateBurnGateV2) for a burn in the block at `height` with
+ * block time `candidate_time`, from `index` connected at height - 1:
+ * - now_eff = max(candidate_time, the V2 light client's finalized execution
+ *   timestamp);
+ * - the lineage rows read lineage->fresh (MakeLineageV2View; the finalized
+ *   checkpoint's epoch for E6);
+ * - E1-E8 read the index's latest VERIFIER_E, TOKEN_FLAGS and RESERVE_E,
+ *   and C4 its sticky conflict.
+ * UNAVAILABLE without a bridge V2 envelope, without a lineage context, with
+ * the replay context, or when `index` is not connected at height - 1.
+ * The block-level evaluation shared by mempool admission, block connection,
+ * block assembly and wallet prevalidation. VerifyBlock (with a full
+ * context) evaluates the same rows again at each burn's position, on the
+ * observations and conflict after the block's earlier records, and applies
+ * the per-burn reserve and wind-down bounds.
+ */
+BridgeV2GateResult EvaluateBridgeV2BurnGate(
+    const BridgeV2LineageContext* lineage, const BridgeStateIndex& index,
+    const Consensus::Params& params, int height, int64_t candidate_time);
+
+/** CheckBridgeBurnReadiness for the V2 regime: refuses a decoded
+ * BRIDGE_BURN unless `readiness` is READY. Callers apply it only from the
+ * bridge V2 height and append the gate's row and reason. */
 bool CheckBridgeV2BurnReadiness(const CTransaction& tx,
                                 BridgeBurnReadiness readiness,
                                 std::string& error);
 bool CheckBridgeV2BurnReadiness(const CBlock& block,
                                 BridgeBurnReadiness readiness,
                                 std::string& error);
-
-/**
- * The TEMPORARY bridge V2 burn gate for the block that would extend
- * `parent`: syncs `finality` to `parent` (with `bridge_index`, which must be
- * synced to `parent` too) and applies BridgeV2BurnReadiness to the fresh
- * lineage projected for parent + 1. UNAVAILABLE without a bridge V2
- * envelope or when the finality state cannot be reconstructed.
- *
- * The one evaluation shared by mempool admission, block connection
- * (validation.cpp), block assembly (node/miner.cpp) and wallet bridge
- * prevalidation (node/interfaces.cpp), so a V2 burn the assembler selects
- * is one the block rule accepts. W2 is checked by each caller (its own
- * refusal text); this function does not look at it. Under cs_main.
- */
-BridgeBurnReadiness ProjectedBridgeV2BurnReadiness(
-    FinalityTracker& finality, const CChain& chain,
-    const BlockManager& blockman, const Consensus::Params& params,
-    const CBlockIndex& parent, const BridgeStateIndex& bridge_index,
-    std::string& reason);
 
 /** Recent active-chain blocks whose bridge effects can be undone in memory. */
 inline constexpr size_t BRIDGE_STATE_UNDO_BLOCKS{288};
@@ -118,6 +256,12 @@ struct BridgeExecutionAnchor {
     uint64_t execution_timestamp{0};
     int connected_height{-1};
     uint256 connected_block{};
+    //! The execution header's stateRoot, recorded for EIP-1186 account and
+    //! storage proofs (bridge/state_proof.h). It is the last member so
+    //! positional initializers that predate it stay valid. No V1 rule reads
+    //! it: an anchor still needs only a non-null receipts_root. Null when the
+    //! anchor's header carried no 32-byte stateRoot.
+    uint256 state_root{};
 
     friend bool operator==(const BridgeExecutionAnchor&,
                            const BridgeExecutionAnchor&) = default;
@@ -269,6 +413,12 @@ struct BridgeEpochMintChange {
  * nullifier namespace 2, the V1 withdrawal tree is frozen and V2 burns
  * append to the V2 tree (node changes section 3.4). The V2 tree fields are
  * carried at every height; below V they stay the empty tree.
+ *
+ * The bridge V2 accounting fields (node changes sections 7.1-7.2, 7.6, 8.2
+ * and 8.4) are likewise carried at every height and change only from V:
+ * the latest observation per subject before the block and the kind 9
+ * records it connected (in order), the reserve ledger before and after, the
+ * deposits its V2 mints proved, and the sticky conflict before and after.
  */
 struct BridgeBlockDelta {
     int height{-1};
@@ -292,6 +442,13 @@ struct BridgeBlockDelta {
     std::vector<BridgeWithdrawalV2Request> withdrawals_v2_added{};
     modern::WithdrawalTreeState withdrawal_tree_v2_before{};
     modern::WithdrawalTreeState withdrawal_tree_v2_after{};
+    BridgeObservationSlotsV2 observations_v2_before{};
+    std::vector<BridgeObservationRecordV2> observations_v2_added{};
+    bridge::ReserveLedgerV2 reserve_v2_before{};
+    bridge::ReserveLedgerV2 reserve_v2_after{};
+    std::vector<BridgeProvenDepositV2> deposits_v2_added{};
+    std::optional<BridgeV2Conflict> conflict_v2_before{};
+    std::optional<BridgeV2Conflict> conflict_v2_after{};
 };
 
 /**
@@ -329,27 +486,56 @@ private:
 class BridgeStateIndex
 {
 public:
+    /**
+     * Verify a candidate block against this state (connected at height - 1).
+     * `lineage` judges kind 9 VERIFIER_E verdicts (MakeBridgeV2LineageContext
+     * for new blocks, &REPLAY_LINEAGE for blocks already connected once).
+     * Without one a LIVE VERIFIER_E fails closed ("verdict cannot be judged
+     * here").
+     *
+     * With a full context every V2 burn also passes the burn gate at its
+     * position in the block (node changes section 7.2 check 4, per record):
+     * EvaluateBridgeV2BurnGate's rows on that context, the block-level
+     * now_eff, and the kind 9 observations and sticky conflict after the
+     * block's earlier records, so an earlier record that impairs the
+     * verifier, pauses the token or sets the conflict closes the gate for
+     * every later burn of the same block. The caller still evaluates the
+     * block-level gate on the connected state (validation.cpp, miner.cpp,
+     * interfaces.cpp), so a burn needs READY both there and at its
+     * position: observations in the same block can close the gate for a
+     * burn, never open it. REPLAY_LINEAGE skips the per-burn gate (the block
+     * passed it when it first connected). Without a context the per-burn
+     * gate is left to the caller while no earlier record of the block
+     * changed an observation or the conflict, and a burn after such a
+     * change fails closed; every consensus caller passes a context whenever
+     * the block carries a burn.
+     */
     bool VerifyBlock(const CBlock& block, int height,
                      const uint256& block_hash,
                      const Consensus::Params& params,
-                     BridgeBlockDelta& out, std::string& error) const;
+                     BridgeBlockDelta& out, std::string& error,
+                     const BridgeV2LineageContext* lineage = nullptr) const;
 
     /** Mempool/miner preview against the currently connected state. */
     bool VerifyTransaction(const CTransaction& tx, int candidate_height,
                            int64_t candidate_time,
                            const Consensus::Params& params,
                            BridgeTxAuthorization& out,
-                           std::string& error) const;
+                           std::string& error,
+                           const BridgeV2LineageContext* lineage = nullptr) const;
 
     /**
      * Begin an incremental block preview against this exact connected state.
      * The index must outlive the preview and remain unchanged while it is in
-     * use (block assembly satisfies this while holding cs_main).
+     * use (block assembly satisfies this while holding cs_main). `lineage`
+     * is copied into the preview; without one, LIVE VERIFIER_E records are
+     * refused (and so skipped by the assembler).
      */
     std::unique_ptr<BridgeBlockPreview> BeginBlockPreview(
         int candidate_height, int64_t candidate_time,
         const uint256& preview_block_id, const Consensus::Params& params,
-        std::string& error) const;
+        std::string& error,
+        const BridgeV2LineageContext* lineage = nullptr) const;
 
     bool ConnectBlock(const BridgeBlockDelta& delta, std::string& error);
     bool DisconnectBlock(int height, const uint256& block_hash,
@@ -468,7 +654,50 @@ public:
     }
     size_t WithdrawalV2Count() const { return m_withdrawals_v2.size(); }
 
+    // -- Bridge V2 reserve and liveness state (node changes 7.1, 8.2-8.5) --
+    // All empty below V and on every chain without a bridge V2 envelope.
+
+    //! The latest connected observation of `subject` (1-3), if any.
+    std::optional<BridgeObservationRecordV2> LatestObservationV2(
+        uint8_t subject) const;
+    const BridgeObservationSlotsV2& ObservationsV2() const
+    {
+        return m_observations_v2;
+    }
+    //! The V2 vault entry's reserve ledger (one entry at launch).
+    const bridge::ReserveLedgerV2& ReserveLedgerV2() const
+    {
+        return m_reserve_v2;
+    }
+    //! Proven deposit amounts by Vault V2 deposit id.
+    const bridge::ProvenDepositMapV2& ProvenDepositsV2() const
+    {
+        return m_deposits_v2;
+    }
+    //! The sum of ProvenDepositsV2(), kept under undo.
+    CAmount ProvenDepositsTotalV2() const { return m_deposits_v2_total; }
+    //! P_pre and P_post of the connected deposits at `cut`
+    //! (bridge::SplitProvenDepositsAtCut).
+    std::optional<bridge::ProvenDepositSumsV2> ProvenDepositSumsAtV2(
+        const uint64_t cut) const
+    {
+        return bridge::SplitProvenDepositsAtCut(m_deposits_v2,
+                                                m_deposits_v2_total, {}, 0,
+                                                cut);
+    }
+    const std::optional<BridgeV2Conflict>& ConflictV2() const
+    {
+        return m_conflict_v2;
+    }
+    //! The highest-numbered retained V2 anchor carrying a stateRoot, the
+    //! anchor a relayer proves new observations against.
+    std::optional<BridgeExecutionAnchor> NewestStateAnchorV2() const;
+
 private:
+    //! Unit tests seed a reserve ledger with transit, which only the
+    //! migration leaf (B-23, a later slice) creates.
+    friend struct BridgeStateIndexTestAccess;
+
     std::optional<BridgeLightClientSnapshot> FinalizedSnapshot(
         int finalized_b3_height, bool v2_store) const;
 
@@ -496,6 +725,11 @@ private:
     std::map<BridgeWithdrawalId, uint64_t> m_withdrawal_v2_sources{};
     modern::WithdrawalTreeState m_withdrawal_tree_v2{};
     std::map<int, uint256> m_withdrawal_v2_roots{};
+    BridgeObservationSlotsV2 m_observations_v2{};
+    bridge::ReserveLedgerV2 m_reserve_v2{};
+    bridge::ProvenDepositMapV2 m_deposits_v2{};
+    CAmount m_deposits_v2_total{0};
+    std::optional<BridgeV2Conflict> m_conflict_v2{};
     int m_connected_height{-1};
     uint256 m_connected_hash{};
     std::deque<BridgeBlockDelta> m_history{};
@@ -528,6 +762,9 @@ std::optional<uint256> FinalityWithdrawalRootV2(
  * deterministic replay beginning at bridge activation. A production disk
  * sidecar must only replace this with a strict config-digest marker and one
  * synchronous state+undo batch; partial durability is intentionally absent.
+ * Replay verifies with REPLAY_LINEAGE: every block it applies was connected
+ * once by validation.cpp, which judged its VERIFIER_E verdicts with a full
+ * lineage context.
  */
 class BridgeStateTracker
 {

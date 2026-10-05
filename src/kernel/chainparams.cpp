@@ -1333,6 +1333,18 @@ public:
                     .max_per_epoch = v2.max_per_epoch.value_or(B3RegTestBridgePins::DEFAULT_V2_MAX_PER_EPOCH),
                     .epoch_length_blocks = static_cast<uint32_t>(b3.epoch_length),
                 };
+                // Burn gate thresholds (node changes section 8.6): regtest
+                // profile R, never a pin-file key.
+                bridge_v2.gate = Consensus::BridgeV2GateParams::RegtestProfileR();
+                // The verifier's MAX_EPOCH_LAG, when the file names it, must
+                // be the gate's set expiry (BridgeV2VerifierPins).
+                bridge_v2.verifier.max_epoch_lag_seconds = v2.verifier_max_epoch_lag;
+                if (v2.verifier_max_epoch_lag &&
+                    *v2.verifier_max_epoch_lag != bridge_v2.gate.set_expiry_seconds) {
+                    throw std::runtime_error(strprintf(
+                        "-b3bridgepins v2.verifier_max_epoch_lag (%d) must equal the regtest burn gate's set expiry (%d)",
+                        *v2.verifier_max_epoch_lag, bridge_v2.gate.set_expiry_seconds));
+                }
                 if (!bridge_v2.Valid()) {
                     throw std::runtime_error(
                         "-b3bridgepins v2 does not form a complete bridge V2 configuration");

@@ -181,10 +181,12 @@ public:
          * every V2 pin must be in the file before the chain first stores a
          * block at or above A3 (the -b3bridgepins record then refuses any
          * change, and V >= A3), so only values knowable before then are
-         * keys. The vault and verifier runtime code hashes, the lineage id
-         * and the mirrored windows commit to blockHash(R_f - 1) and are
-         * deliberately absent: BridgeV2Params leaves both code hashes unset,
-         * which BridgeV2Params::Valid() accepts only off Ethereum mainnet.
+         * keys. The vault and verifier runtime code hashes and the lineage
+         * id commit to blockHash(R_f - 1) and are deliberately absent:
+         * BridgeV2Params leaves both code hashes unset, which
+         * BridgeV2Params::Valid() accepts only off Ethereum mainnet. A
+         * window's value is a deployment parameter fixed in advance, so the
+         * verifier's MAX_EPOCH_LAG may be named (verifier_max_epoch_lag).
          */
         struct V2Section {
             //! Always the local anvil chain (31337).
@@ -207,6 +209,9 @@ public:
             int activation_height{0};
             //! W2 >= V; V when unset (B-12).
             std::optional<int> burn_height{};
+            //! The Verifier V2 MAX_EPOCH_LAG DeployV2 will use; when set it
+            //! must equal the regtest burn gate's set expiry (profile R).
+            std::optional<int64_t> verifier_max_epoch_lag{};
         };
 
         //! Whether the file carried a v1_decentralized section. True by

@@ -31,6 +31,7 @@
 #include <bridge/admission_v2.h>
 #include <bridge/deposit.h>
 #include <bridge/proof.h>
+#include <bridge/reserve_v2.h>
 #include <bridge/rlp.h>
 #include <bridge/withdrawal_v2_calldata.h>
 #include <chainparams.h>
@@ -48,6 +49,7 @@
 #include <node/finality_fresh_lineage.h>
 #include <primitives/transaction_identifier.h>
 #include <streams.h>
+#include <test/util/bridge_state_access.h>
 #include <uint256.h>
 #include <util/strencodings.h>
 
@@ -288,6 +290,7 @@ Consensus::BridgeV2Params MainnetShapedV2Params()
     out.vault.vault_runtime_code_hash = Fill(0x0b);
     out.verifier.runtime_code_hash = Fill(0x0c);
     out.verifier.min_bridge_total_weight = 900;
+    out.verifier.max_epoch_lag_seconds = out.gate.set_expiry_seconds;
     return out;
 }
 
@@ -526,6 +529,8 @@ BOOST_AUTO_TEST_CASE(bridge_v2_params_valid_refusals)
         [](P& p) { p.vault.mint_caps.max_per_epoch = 2 * p.vault.mint_caps.max_per_block; },
         [](P& p) { p.verifier.min_bridge_validators = 64; },
         [](P& p) { p.verifier.max_bridge_validators = 4; },
+        // The verifier's MAX_EPOCH_LAG mirror equal to the gate's set expiry.
+        [](P& p) { p.verifier.max_epoch_lag_seconds = p.gate.set_expiry_seconds; },
     };
     for (const auto& mutate : accepted) {
         P p{RegtestV2Params()};
@@ -570,6 +575,15 @@ BOOST_AUTO_TEST_CASE(bridge_v2_params_valid_refusals)
         [](P& p) { p.verifier.max_bridge_validators = p.verifier.min_bridge_validators - 1; },
         [](P& p) { p.verifier.max_bridge_validators = Consensus::MAX_PROVEN_BRIDGE_VALIDATORS_V1 + 1; },
         [](P& p) { p.verifier.min_bridge_total_weight = 0; },
+        [](P& p) { p.verifier.max_epoch_lag_seconds = 0; },
+        // A verifier window other than the gate's set expiry: shorter would
+        // keep burns open after the verifier stops accepting roots.
+        [](P& p) { p.verifier.max_epoch_lag_seconds = p.gate.set_expiry_seconds - 1; },
+        [](P& p) { p.verifier.max_epoch_lag_seconds = p.gate.set_expiry_seconds + 1; },
+        // gate (every BridgeV2GateParams::Valid() refusal is in
+        // bridge_v2_gate_params_profiles_and_refusals)
+        [](P& p) { p.gate.observation_max_age_seconds = 0; },
+        [](P& p) { p.gate.set_expiry_seconds = p.gate.release_margin_seconds + p.gate.burn_margin_seconds; },
     };
     for (size_t i{0}; i < refused.size(); ++i) {
         P p{RegtestV2Params()};
@@ -578,12 +592,14 @@ BOOST_AUTO_TEST_CASE(bridge_v2_params_valid_refusals)
     }
 
     // Origin chain 1 is exactly USDT under the mainnet beacon root with every
-    // code-hash pin; a fixture copied with chain id 1 fails closed.
+    // code-hash pin and the MAX_EPOCH_LAG mirror; a fixture copied with chain
+    // id 1 fails closed.
     const std::vector<std::function<void(P&)>> mainnet_refused{
         [](P& p) { p.vault.token_address = FillAddress(0x55); },
         [](P& p) { p.light_client.genesis_validators_root = Fill(0x09); },
         [](P& p) { p.vault.vault_runtime_code_hash.reset(); },
         [](P& p) { p.verifier.runtime_code_hash.reset(); },
+        [](P& p) { p.verifier.max_epoch_lag_seconds.reset(); },
     };
     for (size_t i{0}; i < mainnet_refused.size(); ++i) {
         P p{MainnetShapedV2Params()};
@@ -593,6 +609,92 @@ BOOST_AUTO_TEST_CASE(bridge_v2_params_valid_refusals)
     P copied{RegtestV2Params()};
     copied.vault.origin_chain_id = Consensus::BUSD_ETHEREUM_CHAIN_ID;
     BOOST_CHECK(!copied.Valid());
+}
+
+BOOST_AUTO_TEST_CASE(bridge_v2_gate_params_profiles_and_refusals)
+{
+    using G = Consensus::BridgeV2GateParams;
+    // Profile M (B-13): the defaults, so a default envelope carries them.
+    const G m{};
+    BOOST_CHECK(m.Valid());
+    BOOST_CHECK_EQUAL(m.set_expiry_seconds, 2'592'000);
+    BOOST_CHECK_EQUAL(m.release_margin_seconds, 604'800);
+    BOOST_CHECK_EQUAL(m.burn_margin_seconds, 86'400);
+    BOOST_CHECK_EQUAL(m.observation_max_age_seconds, 172'800);
+    BOOST_CHECK_EQUAL(m.max_epoch_gap, 2U);
+    BOOST_CHECK_EQUAL(m.max_finality_lag_blocks, 90);
+    BOOST_CHECK_EQUAL(m.wind_down_margin_ppm, 100'000U);
+    BOOST_CHECK_EQUAL(m.mempool_close_margin_seconds, 3'600);
+    // E2: 30 d - 7 d - 1 d (node changes section 8.4).
+    BOOST_CHECK_EQUAL(m.RotationAgeLimit(), 1'900'800);
+    BOOST_CHECK(Consensus::BridgeV2Params{}.gate == m);
+
+    // Profile R (regtest plan section 3.3): times / 36, lag 30.
+    const G r{G::RegtestProfileR()};
+    BOOST_CHECK(r.Valid());
+    BOOST_CHECK_EQUAL(r.set_expiry_seconds, 72'000);
+    BOOST_CHECK_EQUAL(r.release_margin_seconds, 16'800);
+    BOOST_CHECK_EQUAL(r.burn_margin_seconds, 2'400);
+    BOOST_CHECK_EQUAL(r.observation_max_age_seconds, 4'800);
+    BOOST_CHECK_EQUAL(r.mempool_close_margin_seconds, 100);
+    BOOST_CHECK_EQUAL(r.max_finality_lag_blocks, 30);
+    BOOST_CHECK_EQUAL(r.max_epoch_gap, m.max_epoch_gap);
+    BOOST_CHECK_EQUAL(r.wind_down_margin_ppm, m.wind_down_margin_ppm);
+    BOOST_CHECK_EQUAL(r.RotationAgeLimit(), 52'800);
+    BOOST_CHECK_EQUAL(r.RotationAgeLimit() * 36, m.RotationAgeLimit());
+    BOOST_CHECK(!(r == m));
+
+    const std::vector<std::function<void(G&)>> accepted{
+        [](G& g) { g.wind_down_margin_ppm = 0; },
+        [](G& g) { g.wind_down_margin_ppm = 1'000'000; },
+        [](G& g) { g.max_epoch_gap = 0; },
+        [](G& g) { g.max_finality_lag_blocks = 1; },
+        [](G& g) { g.set_expiry_seconds = g.release_margin_seconds + g.burn_margin_seconds + 1; },
+        [](G& g) { g.set_expiry_seconds = 3; g.release_margin_seconds = 1; g.burn_margin_seconds = 1; },
+    };
+    for (size_t i{0}; i < accepted.size(); ++i) {
+        G g{};
+        accepted[i](g);
+        BOOST_CHECK_MESSAGE(g.Valid(), "acceptance " << i << " refused");
+        BOOST_CHECK_GT(g.RotationAgeLimit(), 0);
+    }
+    const std::vector<std::function<void(G&)>> refused{
+        [](G& g) { g.set_expiry_seconds = 0; },
+        [](G& g) { g.set_expiry_seconds = -1; },
+        [](G& g) { g.release_margin_seconds = 0; },
+        [](G& g) { g.release_margin_seconds = -1; },
+        [](G& g) { g.burn_margin_seconds = 0; },
+        [](G& g) { g.burn_margin_seconds = -1; },
+        [](G& g) { g.observation_max_age_seconds = 0; },
+        [](G& g) { g.observation_max_age_seconds = -1; },
+        [](G& g) { g.mempool_close_margin_seconds = 0; },
+        [](G& g) { g.mempool_close_margin_seconds = -1; },
+        [](G& g) { g.wind_down_margin_ppm = 1'000'001; },
+        [](G& g) { g.max_finality_lag_blocks = 0; },
+        [](G& g) { g.max_finality_lag_blocks = -1; },
+        // E2 must be positive: set_expiry > release_margin + burn_margin.
+        [](G& g) { g.set_expiry_seconds = g.release_margin_seconds + g.burn_margin_seconds; },
+        [](G& g) { g.release_margin_seconds = g.set_expiry_seconds; },
+        [](G& g) { g.burn_margin_seconds = g.set_expiry_seconds; },
+        // Huge margins cannot overflow the comparison.
+        [](G& g) {
+            g.release_margin_seconds = std::numeric_limits<int64_t>::max();
+            g.burn_margin_seconds = std::numeric_limits<int64_t>::max();
+        },
+        [](G& g) {
+            g.set_expiry_seconds = std::numeric_limits<int64_t>::max();
+            g.release_margin_seconds = std::numeric_limits<int64_t>::max() - 1;
+            g.burn_margin_seconds = 2;
+        },
+    };
+    for (size_t i{0}; i < refused.size(); ++i) {
+        G g{};
+        refused[i](g);
+        BOOST_CHECK_MESSAGE(!g.Valid(), "refusal " << i << " accepted");
+        Consensus::BridgeV2Params p{RegtestV2Params()};
+        p.gate = g;
+        BOOST_CHECK_MESSAGE(!p.Valid(), "envelope refusal " << i << " accepted");
+    }
 }
 
 BOOST_AUTO_TEST_CASE(bridge_v2_activation_predicates)
@@ -696,6 +798,15 @@ BOOST_AUTO_TEST_CASE(bridge_v2_entry_and_registry_ids)
         [](P& p) { p.verifier.min_bridge_validators = 5; },
         [](P& p) { p.verifier.max_bridge_validators = 63; },
         [](P& p) { p.verifier.min_bridge_total_weight = 5; },
+        // Every consensus burn-gate threshold (node changes section 8.6).
+        [](P& p) { p.gate.set_expiry_seconds += 1; },
+        [](P& p) { p.gate.release_margin_seconds += 1; },
+        [](P& p) { p.gate.burn_margin_seconds += 1; },
+        [](P& p) { p.gate.observation_max_age_seconds += 1; },
+        [](P& p) { p.gate.max_epoch_gap += 1; },
+        [](P& p) { p.gate.max_finality_lag_blocks += 1; },
+        [](P& p) { p.gate.wind_down_margin_ppm += 1; },
+        [](P& p) { p.gate = Consensus::BridgeV2GateParams::RegtestProfileR(); },
     };
     for (size_t i{0}; i < renames.size(); ++i) {
         P p{base};
@@ -704,6 +815,17 @@ BOOST_AUTO_TEST_CASE(bridge_v2_entry_and_registry_ids)
         BOOST_CHECK_MESSAGE(modern::BridgeRegistryIdV2(domain, p) != registry_id,
                             "pin " << i << " does not rename the registry");
     }
+    // Field order matters: equal sums in different fields still rename.
+    P shifted{base};
+    shifted.gate.release_margin_seconds += 1;
+    shifted.gate.burn_margin_seconds -= 1;
+    BOOST_REQUIRE(shifted.Valid());
+    BOOST_CHECK(modern::BridgeRegistryIdV2(domain, shifted) != registry_id);
+    // The mempool close margin is policy only and never renames.
+    P policy{base};
+    policy.gate.mempool_close_margin_seconds = 1;
+    BOOST_REQUIRE(policy.Valid());
+    BOOST_CHECK(modern::BridgeRegistryIdV2(domain, policy) == registry_id);
 
     // An invalid envelope has no registry identity.
     P invalid{base};
@@ -1244,6 +1366,21 @@ void ConnectHookBlock(node::BridgeStateIndex& index, const Consensus::Params& pa
     delta.v2_store = params.BridgeV2RulesActive(height);
     delta.withdrawal_tree_v2_before = index.WithdrawalTreeV2();
     delta.withdrawal_tree_v2_after = index.WithdrawalTreeV2();
+    // The reserve ledger must record the burns (node changes section 7.1):
+    // fund the entry first, as the deposits this hook skips would have.
+    CAmount burned{0};
+    for (const modern::BridgeWithdrawalV2& withdrawal : withdrawals) burned += withdrawal.amount;
+    if (burned > 0) {
+        bridge::ReserveLedgerV2 funded{index.ReserveLedgerV2()};
+        funded.minted += burned;
+        node::BridgeStateIndexTestAccess::SeedReserve(index, funded, index.ProvenDepositsV2());
+    }
+    delta.reserve_v2_before = index.ReserveLedgerV2();
+    delta.reserve_v2_after = index.ReserveLedgerV2();
+    delta.reserve_v2_after.burned += burned;
+    delta.observations_v2_before = index.ObservationsV2();
+    delta.conflict_v2_before = index.ConflictV2();
+    delta.conflict_v2_after = index.ConflictV2();
     for (size_t i{0}; i < withdrawals.size(); ++i) {
         node::BridgeWithdrawalV2Request request;
         uint256 txid{Fill(0x7a)};

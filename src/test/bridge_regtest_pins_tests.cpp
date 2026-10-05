@@ -683,6 +683,13 @@ BOOST_FIXTURE_TEST_CASE(v2_only_file_applies, BridgePinsSetup)
     BOOST_CHECK_EQUAL(v2.verifier.max_bridge_validators, 64U);
     BOOST_CHECK_EQUAL(v2.verifier.min_bridge_total_weight, 4U);
 
+    // Burn gate thresholds (node changes section 8.6): always regtest
+    // profile R, which no pin-file key can change.
+    BOOST_CHECK(v2.gate == Consensus::BridgeV2GateParams::RegtestProfileR());
+    BOOST_CHECK_EQUAL(v2.gate.observation_max_age_seconds, 4'800);
+    BOOST_CHECK_EQUAL(v2.gate.max_finality_lag_blocks, 30);
+    BOOST_CHECK_EQUAL(v2.gate.RotationAgeLimit(), 52'800);
+
     const Consensus::EthereumLightClientPins& light{v2.light_client};
     BOOST_CHECK_EQUAL("0x" + HexStr(light.trusted_checkpoint_root), Repeat("c1", 32));
     BOOST_CHECK_EQUAL(light.trusted_checkpoint_slot, 8'192U * 2 + 4'096);
@@ -789,6 +796,16 @@ BOOST_AUTO_TEST_CASE(v2_schema_and_value_refusals)
     BOOST_CHECK(!v2.burn_height);
     BOOST_CHECK(!v2.max_per_block);
     BOOST_CHECK(!v2.max_per_epoch);
+    BOOST_CHECK(!v2.verifier_max_epoch_lag);
+
+    // The verifier's MAX_EPOCH_LAG mirror (optional; RegTest() compares it
+    // with the gate's set expiry).
+    BOOST_CHECK_EQUAL(*ParseB3RegTestBridgePins(WithV2("verifier_max_epoch_lag", uint64_t{72'000}))
+                           .v2->verifier_max_epoch_lag,
+                      72'000);
+    CheckRefused(WithV2("verifier_max_epoch_lag", uint64_t{0}), "v2.verifier_max_epoch_lag must be positive");
+    CheckRefused(WithV2("verifier_max_epoch_lag", uint64_t{1} << 32),
+                 "v2.verifier_max_epoch_lag must be an unsigned integer of at most 32 bits");
 
     // Real network domains are refused exactly as in v1_decentralized.
     for (const uint64_t chain_id : {uint64_t{1}, uint64_t{11'155'111}, uint64_t{17'000}}) {
@@ -880,6 +897,18 @@ BOOST_AUTO_TEST_CASE(v2_schema_and_value_refusals)
                                   "set_expiry"}) {
         CheckRefused(WithV2(key, Repeat("11", 32)), "unknown key v2." + key);
     }
+    // The burn gate is profile R by construction: neither a gate section nor
+    // any threshold is a key (node changes section 8.6).
+    {
+        UniValue gate{UniValue::VOBJ};
+        gate.pushKV("observation_max_age_seconds", uint64_t{4'800});
+        CheckRefused(WithV2("gate", gate), "unknown key v2.gate");
+    }
+    for (const std::string key : {"set_expiry_seconds", "release_margin_seconds", "burn_margin_seconds",
+                                  "observation_max_age_seconds", "max_epoch_gap", "max_finality_lag_blocks",
+                                  "wind_down_margin_ppm", "mempool_close_margin_seconds"}) {
+        CheckRefused(WithV2(key, uint64_t{1}), "unknown key v2." + key);
+    }
     CheckRefused(WithV2Light("slot", uint64_t{1}), "unknown key v2.light_client.slot");
 
     // Every required key is required.
@@ -940,6 +969,26 @@ BOOST_AUTO_TEST_CASE(kernel_v2_cross_checks)
         BOOST_REQUIRE(chain->GetConsensus().bridge_v2);
         BOOST_CHECK(chain->GetConsensus().BridgeV2RulesActive(202));
         BOOST_CHECK(!chain->GetConsensus().BridgeV2RulesActive(201));
+    }
+
+    // The verifier's MAX_EPOCH_LAG must be the gate's set expiry (profile R
+    // 72,000 s): a shorter verifier window would leave burns open after the
+    // verifier stops accepting roots.
+    {
+        const auto chain{CChainParams::RegTest(FlowMeshOptions(
+            ParseB3RegTestBridgePins(WithV2("verifier_max_epoch_lag", uint64_t{72'000}))))};
+        BOOST_REQUIRE(chain->GetConsensus().bridge_v2);
+        BOOST_CHECK_EQUAL(*chain->GetConsensus().bridge_v2->verifier.max_epoch_lag_seconds, 72'000);
+        BOOST_CHECK_EQUAL(Consensus::BridgeV2GateParams::RegtestProfileR().set_expiry_seconds, 72'000);
+        BOOST_CHECK(!CChainParams::RegTest(FlowMeshOptions(v2_pins))->GetConsensus()
+                         .bridge_v2->verifier.max_epoch_lag_seconds);
+        for (const uint64_t lag : {uint64_t{71'999}, uint64_t{72'001}, uint64_t{2'592'000}}) {
+            BOOST_CHECK_EXCEPTION(
+                CChainParams::RegTest(FlowMeshOptions(ParseB3RegTestBridgePins(WithV2("verifier_max_epoch_lag", lag)))),
+                std::runtime_error,
+                HasReason("-b3bridgepins v2.verifier_max_epoch_lag (" + std::to_string(lag) +
+                          ") must equal the regtest burn gate's set expiry (72000)"));
+        }
     }
 
     // Hand-built sections: W2 < V, and an incomplete entry.

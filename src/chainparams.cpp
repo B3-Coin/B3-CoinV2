@@ -350,8 +350,11 @@ void ParseBridgePinsV1(const UniValue& v1, CChainParams::B3RegTestBridgePins& pi
  * Vault V2 entry, its fresh light-client store and the Verifier V2 member
  * bounds, plus V and W2. OI-3: only values knowable before the chain first
  * stores a block at or above A3 are keys. The vault and verifier runtime
- * code hashes, the lineage id and the mirrored windows commit to
- * blockHash(R_f - 1), so naming them is refused as an unknown key.
+ * code hashes and the lineage id commit to blockHash(R_f - 1), so naming
+ * them is refused as an unknown key. The verifier's MAX_EPOCH_LAG is a
+ * deployment parameter fixed in advance and may be named
+ * (verifier_max_epoch_lag); RegTest() requires it to equal the gate's set
+ * expiry.
  */
 CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v2)
 {
@@ -361,7 +364,7 @@ CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v
                          "origin_deployment_block", "max_deposit_raw", "light_client",
                          "verifier", "min_bridge_validators", "max_bridge_validators",
                          "min_bridge_total_weight", "activation_height"},
-                        {"burn_height", "max_per_block", "max_per_epoch"});
+                        {"burn_height", "max_per_block", "max_per_epoch", "verifier_max_epoch_lag"});
 
     CChainParams::B3RegTestBridgePins::V2Section section;
     CheckBridgePinsChainId(v2, v2_where);
@@ -415,6 +418,11 @@ CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v
                                              v2_where, burn_height, activation_height, max_height));
         }
         section.burn_height = static_cast<int>(burn_height);
+    }
+    if (!v2.find_value("verifier_max_epoch_lag").isNull()) {
+        const uint32_t lag{GetBridgePinsUInt<uint32_t>(v2, v2_where, "verifier_max_epoch_lag")};
+        if (lag == 0) ThrowInvalidBridgePins(strprintf("%s.verifier_max_epoch_lag must be positive", v2_where));
+        section.verifier_max_epoch_lag = int64_t{lag};
     }
     return section;
 }

@@ -244,17 +244,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         }
         if (b3_consensus.BridgeV2RulesActive(nHeight)) {
             // From the bridge V2 height every BRIDGE_BURN is a V2 burn: the
-            // block rule's W2 check and TEMPORARY V2 gate (validation.cpp
-            // ConnectBlock) replace the V1 readiness, so a burn that became
-            // unready after mempool admission is skipped, never assembled.
-            std::string not_ready_reason;
-            bridge_burn_readiness =
-                b3_consensus.BridgeV2BurnRulesActive(nHeight)
-                    ? node::ProjectedBridgeV2BurnReadiness(
-                          m_chainstate.ModernFinality(), m_chainstate.m_chain,
-                          m_chainstate.m_blockman, b3_consensus, *pindexPrev,
-                          bridge.Index(), not_ready_reason)
-                    : BridgeBurnReadiness::UNAVAILABLE;
+            // block rule's W2 check and V2 burn gate (validation.cpp
+            // ConnectBlock) replace the V1 readiness. The gate reads the
+            // block time, so it is evaluated below once nTime is fixed.
+            bridge_burn_readiness = BridgeBurnReadiness::UNAVAILABLE;
         } else if (b3_bridge_withdrawals_active &&
             b3_consensus.busd_bridge->withdrawal_mode ==
                 Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
@@ -413,6 +406,33 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     }
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
 
+    // From V the fresh lineage projected for nHeight judges both the V2 burn
+    // gate and kind 9 VERIFIER_E verdicts, exactly as block validation does
+    // (validation.cpp ConnectBlock). Without it no burn is READY and the
+    // preview refuses LIVE VERIFIER_E records, so both are skipped and the
+    // template stays valid.
+    std::optional<BridgeV2LineageContext> bridge_lineage;
+    if (b3_bridge_active && b3_consensus.BridgeV2RulesActive(nHeight)) {
+        std::string lineage_reason;
+        bridge_lineage = MakeBridgeV2LineageContext(
+            m_chainstate.ModernFinality(), m_chainstate.m_chain,
+            m_chainstate.m_blockman, b3_consensus, *pindexPrev,
+            m_chainstate.ModernBridgeState().Index(), lineage_reason);
+        if (!bridge_lineage) {
+            LogDebug(BCLog::VALIDATION, "CreateNewBlock(): bridge V2 lineage is unavailable (%s)\n",
+                     lineage_reason);
+        }
+        // The V2 burn gate at the exact candidate time, so a burn that
+        // became unready after mempool admission is skipped, never
+        // assembled.
+        if (bridge_lineage && b3_consensus.BridgeV2BurnRulesActive(nHeight)) {
+            const BridgeV2GateResult gate{EvaluateBridgeV2BurnGate(
+                &*bridge_lineage, m_chainstate.ModernBridgeState().Index(),
+                b3_consensus, nHeight, pblock->GetBlockTime())};
+            bridge_burn_readiness = gate.readiness;
+        }
+    }
+
     std::unique_ptr<BridgeBlockPreview> bridge_preview;
     if (m_mempool && b3_bridge_active) {
         uint256 preview_block_id;
@@ -422,7 +442,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                              .Index()
                              .BeginBlockPreview(
                                  nHeight, pblock->GetBlockTime(),
-                                 preview_block_id, b3_consensus, error);
+                                 preview_block_id, b3_consensus, error,
+                                 bridge_lineage ? &*bridge_lineage : nullptr);
         if (!bridge_preview) {
             throw std::runtime_error(
                 "bridge preview is unavailable for block assembly: " +

@@ -104,13 +104,16 @@ inline uint256 BridgeLightClientExtensionsHashV2()
  * light-client pins follow BridgeRegistryIdV1's order. nullopt unless the
  * envelope is Valid().
  *
+ * The burn-gate thresholds (section 8.6) follow the verifier fields, in
+ * BridgeV2GateParams order; the policy-only mempool close margin is not a
+ * consensus pin and stays out.
+ *
  * Not yet an approval identity: this slice's envelope lacks several section
  * 3.1 pins, which the id gains (and so changes value) when they land: the
  * verifier's lineage id, genesis set hash, mirrored windows and
- * BRIDGE_ACTIVATION_HEIGHT mirror, the deposit and exit forwarder pins, the
- * gate thresholds (section 8.6) and, on regtest, the vault and verifier code
- * hashes (OI-3). Records never name it; nothing may treat today's value as
- * the S7 approval identity.
+ * BRIDGE_ACTIVATION_HEIGHT mirror, the deposit and exit forwarder pins and,
+ * on regtest, the vault and verifier code hashes (OI-3). Records never name
+ * it; nothing may treat today's value as the S7 approval identity.
  */
 inline std::optional<uint256> BridgeRegistryIdV2(
     const uint256& chain_domain, const Consensus::BridgeV2Params& params)
@@ -142,6 +145,12 @@ inline std::optional<uint256> BridgeRegistryIdV2(
     if (verifier.runtime_code_hash) writer << *verifier.runtime_code_hash;
     writer << verifier.min_bridge_validators << verifier.max_bridge_validators
            << verifier.min_bridge_total_weight;
+
+    const auto& gate{params.gate};
+    writer << gate.set_expiry_seconds << gate.release_margin_seconds
+           << gate.burn_margin_seconds << gate.observation_max_age_seconds
+           << gate.max_epoch_gap << gate.max_finality_lag_blocks
+           << gate.wind_down_margin_ppm;
     writer << BridgeLightClientExtensionsHashV2();
     return writer.GetSHA256();
 }

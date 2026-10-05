@@ -4,20 +4,30 @@
 
 #include <node/bridge_state.h>
 
+#include <bridge/burn_gate_v2.h>
 #include <bridge/proof.h>
+#include <bridge/reserve_v2.h>
 #include <bridge/rlp.h>
+#include <bridge/state_observation.h>
 #include <bridge/withdrawal_v2_calldata.h>
+#include <crypto/bls.h>
 #include <crypto/common.h>
 #include <crypto/keccak256.h>
 #include <modern/asset_output.h>
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
 #include <modern/bridge_v2.h>
+#include <modern/finality_types.h>
+#include <modern/finality_v2.h>
 #include <modern/mpa.h>
 #include <modern/withdrawal_v2.h>
+#include <node/finality_binding_index.h>
 #include <node/finality_fresh_lineage.h>
+#include <node/validator_set.h>
 #include <primitives/transaction.h>
 #include <test/data/eth_lc_fixture.h>
+#include <test/util/bridge_observation_world.h>
+#include <test/util/bridge_state_access.h>
 #include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
@@ -25,10 +35,15 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <limits>
+#include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -320,6 +335,27 @@ std::vector<unsigned char> ExecutionHeader(const uint256& parent,
     return bridge::RlpEncodeList(fields);
 }
 
+//! ExecutionHeader with header field [3], the stateRoot, set when given.
+std::vector<unsigned char> ExecutionHeaderWithStateRoot(
+    const uint256& parent, const uint64_t number, const uint256& receipts_root,
+    const uint64_t timestamp, const std::optional<uint256>& state_root)
+{
+    std::vector<unsigned char> encoded{
+        ExecutionHeader(parent, number, receipts_root, timestamp)};
+    if (!state_root) return encoded;
+    const auto top{bridge::RlpDecode(encoded)};
+    BOOST_REQUIRE(top);
+    const auto items{bridge::RlpChildren(*top)};
+    BOOST_REQUIRE(items);
+    std::vector<std::vector<unsigned char>> fields;
+    for (const auto& item : *items) {
+        fields.push_back(EncodedBytes(item.payload));
+    }
+    fields[3] = EncodedBytes(
+        std::span<const unsigned char>{state_root->begin(), 32});
+    return bridge::RlpEncodeList(fields);
+}
+
 struct DepositSpec {
     uint64_t id{0};
     uint64_t amount{0};
@@ -573,6 +609,7 @@ Consensus::Params V2Params(const int burn_height = BRIDGE_V2_HEIGHT,
     v2.verifier.min_bridge_validators = 4;
     v2.verifier.max_bridge_validators = 64;
     v2.verifier.min_bridge_total_weight = 900;
+    v2.verifier.max_epoch_lag_seconds = v2.gate.set_expiry_seconds;
     Consensus::BridgeV2VaultEntry& vault{v2.vault};
     vault.origin_chain_id = Consensus::BUSD_ETHEREUM_CHAIN_ID;
     vault.vault_address = FilledAddress(0x44);
@@ -653,10 +690,11 @@ void SeedVerifiedAnchorAt(node::BridgeStateIndex& index,
 
 //! VerifyBlock + ConnectBlock of one candidate at the next height (the
 //! bridge activation height on an empty index).
-node::BridgeBlockDelta ConnectNext(node::BridgeStateIndex& index,
-                                   const Consensus::Params& params,
-                                   std::vector<CTransactionRef> transactions = {},
-                                   const uint32_t time = 1'060)
+node::BridgeBlockDelta ConnectNext(
+    node::BridgeStateIndex& index, const Consensus::Params& params,
+    std::vector<CTransactionRef> transactions = {},
+    const uint32_t time = 1'060,
+    const node::BridgeV2LineageContext* lineage = nullptr)
 {
     const int height{index.ConnectedHeight() < 0
                          ? BRIDGE_HEIGHT
@@ -665,7 +703,8 @@ node::BridgeBlockDelta ConnectNext(node::BridgeStateIndex& index,
     std::string error;
     BOOST_REQUIRE_MESSAGE(
         index.VerifyBlock(Block(time, std::move(transactions)), height,
-                          V2TestBlockHash(height), params, delta, error),
+                          V2TestBlockHash(height), params, delta, error,
+                          lineage),
         error);
     BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
     return delta;
@@ -805,18 +844,335 @@ CTransactionRef FixtureUpdateTransaction()
 
 bool VerifyFails(const node::BridgeStateIndex& index, const CBlock& block,
                  const int height, const Consensus::Params& params,
-                 const std::string& expected)
+                 const std::string& expected,
+                 const node::BridgeV2LineageContext* lineage = nullptr)
 {
     node::BridgeBlockDelta ignored;
     std::string error;
     if (index.VerifyBlock(block, height, V2TestBlockHash(height), params,
-                          ignored, error)) {
+                          ignored, error, lineage)) {
         BOOST_ERROR("bridge block unexpectedly verified at height " << height);
         return false;
     }
     BOOST_CHECK_MESSAGE(error.find(expected) != std::string::npos,
                         "error '" << error << "' lacks '" << expected << "'");
     return error.find(expected) != std::string::npos;
+}
+
+// -- Bridge V2 accounting fixtures (kind 9, reserve ledger, gate) ----------
+
+constexpr uint8_t SUBJECT_VERIFIER{bridge::ETH_OBSERVATION_SUBJECT_VERIFIER};
+constexpr uint8_t SUBJECT_RESERVE{bridge::ETH_OBSERVATION_SUBJECT_RESERVE};
+constexpr uint8_t SUBJECT_TOKEN{bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS};
+constexpr uint8_t VERDICT_SETS{bridge::ETH_OBSERVATION_VERDICT_SETS_MISMATCH};
+constexpr uint8_t VERDICT_CERT{bridge::ETH_OBSERVATION_VERDICT_CERT_CONFLICT};
+
+//! A distinct Ethereum block hash for execution block `number`.
+uint256 AnchorHash(const uint64_t number)
+{
+    return TestBlockHash(static_cast<uint32_t>(70'000 + number));
+}
+
+//! Fill every field of a crafted delta that a seed does not change from the
+//! connected state, so ConnectBlock's before-state checks pass.
+void PassThrough(const node::BridgeStateIndex& index,
+                 node::BridgeBlockDelta& delta)
+{
+    delta.previous_height = index.ConnectedHeight();
+    delta.previous_block_hash = index.ConnectedHash();
+    delta.withdrawal_tree_before = index.WithdrawalTree();
+    delta.withdrawal_tree_after = index.WithdrawalTree();
+    delta.withdrawal_tree_v2_before = index.WithdrawalTreeV2();
+    delta.withdrawal_tree_v2_after = index.WithdrawalTreeV2();
+    delta.observations_v2_before = index.ObservationsV2();
+    delta.reserve_v2_before = index.ReserveLedgerV2();
+    delta.reserve_v2_after = index.ReserveLedgerV2();
+    delta.conflict_v2_before = index.ConflictV2();
+    delta.conflict_v2_after = index.ConflictV2();
+}
+
+//! One execution block retained as a V2 anchor by a fixture seed.
+struct StateAnchorSpec {
+    uint64_t block_number{0};
+    uint256 block_hash{};
+    uint64_t timestamp{0};
+    uint256 state_root{};
+    uint256 receipts_root{TestHash(0x7e)};
+};
+
+StateAnchorSpec StateAnchor(const uint64_t number, const uint64_t timestamp,
+                            const uint256& state_root)
+{
+    return {number, AnchorHash(number), timestamp, state_root};
+}
+
+/**
+ * Connect a crafted V2-store delta at the next height that retains
+ * `anchors` and, when `head` is given, makes it the V2 light client's
+ * finalized execution header (a fixture shortcut, like SeedVerifiedAnchorAt).
+ */
+node::BridgeBlockDelta SeedStateAnchorsV2(
+    node::BridgeStateIndex& index, const std::vector<StateAnchorSpec>& anchors,
+    const std::optional<StateAnchorSpec>& head = std::nullopt)
+{
+    const int height{index.ConnectedHeight() + 1};
+    node::BridgeBlockDelta seed;
+    seed.height = height;
+    seed.block_hash = V2TestBlockHash(height);
+    seed.v2_store = true;
+    PassThrough(index, seed);
+    if (head) {
+        bridge::LightClientStore store;
+        store.finalized_header.beacon.slot = 32;
+        store.finalized_header.execution.block_number = head->block_number;
+        store.finalized_header.execution.block_hash = head->block_hash;
+        store.finalized_header.execution.receipts_root = head->receipts_root;
+        store.finalized_header.execution.state_root = head->state_root;
+        store.finalized_header.execution.timestamp = head->timestamp;
+        store.period = bridge::PeriodAtSlot(32);
+        store.current.pubkeys.resize(bridge::ssz::SYNC_COMMITTEE_SIZE);
+        seed.light_client_before = index.LightClientV2();
+        seed.light_client_after = store;
+        seed.light_client_connection_before = index.LightClientV2LastConnected();
+        seed.light_client_connection_after =
+            node::BridgeStateConnection{height, seed.block_hash};
+    }
+    for (const StateAnchorSpec& spec : anchors) {
+        seed.anchors_added.push_back(node::BridgeExecutionAnchor{
+            spec.block_number, spec.block_hash, spec.receipts_root, 32,
+            spec.block_number, spec.timestamp, height, seed.block_hash,
+            spec.state_root});
+    }
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(seed, error), error);
+    return seed;
+}
+
+//! A kind 9 carrier, encoded under the V2 record set.
+CTransactionRef ObservationTransaction(
+    const bridge::BridgeEthStateObservationV2& observation)
+{
+    const auto record{bridge::MakeBridgeMpaRecord(
+        bridge::BridgeRecordV1{bridge::BridgeRecordKindV1::ETH_STATE_OBSERVATION,
+                               observation},
+        bridge::BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(record);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vout = {*binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
+}
+
+CTransactionRef Observe(const bridge_test::ObservationWorld& world,
+                        const uint8_t subject, const uint256& anchor_hash,
+                        const uint8_t verdict = 0)
+{
+    return ObservationTransaction(world.Observe(subject, anchor_hash, verdict));
+}
+
+//! A token that pays and a vault whose USDT balance covers `locked`.
+bridge_test::ObservationWorld HealthyWorld(const Consensus::Params& params,
+                                           const uint64_t next_deposit_id = 0,
+                                           const CAmount locked = 0)
+{
+    bridge_test::ObservationWorld world{
+        bridge::ObservationPinsFromParams(*params.bridge_v2)};
+    world.SetTokenFlags(false, false, false);
+    world.SetReserve(next_deposit_id, locked, 0, locked);
+    return world;
+}
+
+/**
+ * A fresh finality lineage at epoch `epoch` whose committees meet
+ * V2Params' Verifier V2 bounds (four members of weight 300, each epoch's set
+ * the same members stamped with its epoch), genesis G = 89 (R_f = 90) on the
+ * default checkpoint interval 10 (checkpoints 99, 109, 119, ... at indices
+ * 1, 2, 3, ...), finalized at 109 in epoch `epoch`, and a hash_at matching
+ * V2TestBlockHash, the block hashes ConnectNext connects.
+ */
+struct LineageFixture {
+    static constexpr int GENESIS{89};
+
+    std::vector<std::shared_ptr<const node::FreshLineageSet>> sets;
+    node::BridgeV2LineageContext context;
+
+    explicit LineageFixture(const uint64_t epoch = 1)
+    {
+        node::FinalityBindingIndex bindings;
+        std::map<node::ValidatorKey, CAmount> weights;
+        std::vector<node::FinalityBindingIndex::Transition> transitions;
+        for (unsigned char i{0}; i < 4; ++i) {
+            std::array<unsigned char, 32> ikm{};
+            ikm[0] = static_cast<unsigned char>(i + 1);
+            ikm[31] = 0x5b;
+            const auto key{bls::SecretKey::FromIKM(ikm)};
+            BOOST_REQUIRE(key);
+            modern::ValidatorKeyBytes validator{};
+            validator[0] = static_cast<unsigned char>(i + 1);
+            validator[31] = 0x5c;
+            transitions.push_back(
+                {validator, {key->GetPublicKey().Compressed(), 0, 1}});
+            weights[validator] = 300 * modern::FINALITY_WEIGHT_UNIT;
+        }
+        bindings.ConnectBlock(1, transitions);
+        const auto snapshot{node::ValidatorSetSnapshot::Build(0, weights, bindings)};
+        BOOST_REQUIRE(snapshot);
+        const auto members{
+            std::make_shared<const node::ValidatorSetSnapshot>(*snapshot)};
+        for (uint64_t e{0}; e <= epoch + 1; ++e) {
+            sets.push_back(node::MakeFreshLineageSet(members, e));
+        }
+
+        node::FreshLineageState fresh;
+        fresh.bootstrapped = true;
+        fresh.genesis_height = GENESIS;
+        fresh.genesis_block_hash = V2TestBlockHash(GENESIS);
+        fresh.lineage_id = TestHash(0x1d);
+        fresh.epoch = epoch;
+        for (uint64_t e{0}; e <= epoch; ++e) {
+            fresh.epoch_starts.push_back(GENESIS + 1 + static_cast<int>(e) * 10);
+        }
+        fresh.genesis = sets[0];
+        fresh.previous = epoch >= 1 ? sets[epoch - 1] : nullptr;
+        fresh.current = sets[epoch];
+        fresh.next = sets[epoch + 1];
+        fresh.handover_certified = true;
+        fresh.finalized = node::FreshFinalizedCheckpoint{
+            .height = 109, .block_hash = V2TestBlockHash(109), .epoch = epoch,
+            .checkpoint_index = 2, .history_root = {}, .cert_id = {},
+            .certified_at = 110};
+        context.fresh = std::move(fresh);
+        context.hash_at = [](const int h) -> std::optional<uint256> {
+            if (h < 0) return std::nullopt;
+            return V2TestBlockHash(h);
+        };
+    }
+
+    node::FreshLineageState& Fresh() { return *context.fresh; }
+
+    //! B3's canonical epoch-`e` statement at checkpoint `height`.
+    modern::FinalizedBlockV2 Statement(const uint64_t e, const int height,
+                                       const Consensus::Params& params,
+                                       const node::BridgeStateIndex& index) const
+    {
+        const auto fb{node::ExpectedFinalizedBlockV2(
+            e, height, *context.fresh, context.hash_at, params, &index)};
+        BOOST_REQUIRE(fb);
+        return *fb;
+    }
+
+    //! A LIVE verifier at epoch `e` that accepted B3's statement at
+    //! checkpoint `height` and rotated at `rotation_time`.
+    bridge::VerifierStateV2 Canonical(const uint64_t e, const int height,
+                                      const Consensus::Params& params,
+                                      const node::BridgeStateIndex& index,
+                                      const int64_t rotation_time = 1'000) const
+    {
+        const modern::FinalizedBlockV2 fb{Statement(e, height, params, index)};
+        bridge::VerifierStateV2 v;
+        v.current_epoch = e;
+        v.last_rotation_time = rotation_time;
+        v.last_certificate_time = rotation_time;
+        v.status = bridge::VERIFIER_STATUS_LIVE;
+        v.current_set_hash = sets.at(e)->set_hash;
+        v.next_set_hash = sets.at(e + 1)->set_hash;
+        v.latest_height = static_cast<uint64_t>(height);
+        v.latest_index = fb.checkpoint_index;
+        v.latest_init_time = 900;
+        v.latest_cert_id = modern::FinalityCertIdV2(fb);
+        return v;
+    }
+};
+
+//! V2Params plus a fresh-lineage configuration matching LineageFixture.
+Consensus::Params LineageParams()
+{
+    Consensus::Params params{V2Params()};
+    params.fresh_lineage = Consensus::FreshLineageParams{
+        .activation_height = LineageFixture::GENESIS + 1,
+        .max_epoch_extension = 1'000,
+        .staging_signer = false};
+    return params;
+}
+
+/**
+ * An index through V - 1 whose V2 light client (finalized at execution block
+ * 800, timestamp 1,000) retains anchor 800 carrying `state_root`.
+ */
+node::BridgeStateIndex ObservationIndex(const Consensus::Params& params,
+                                        const uint256& state_root)
+{
+    node::BridgeStateIndex index;
+    ConnectEmptyThrough(index, params, BRIDGE_V2_HEIGHT - 2);
+    const StateAnchorSpec anchor{StateAnchor(800, 1'000, state_root)};
+    SeedStateAnchorsV2(index, {anchor}, anchor);
+    return index;
+}
+
+//! Receipt fixture of the funded scenarios: deposits 0, 1, 2 of 60, 40, 30.
+ReceiptFixture FundingReceipts(const Consensus::Params& params)
+{
+    return MakeV2ReceiptFixture(params,
+                                {{0, 60, 0x31}, {1, 40, 0x32}, {2, 30, 0x33}});
+}
+
+/**
+ * An index through V - 1 whose V2 light client is finalized at the funding
+ * receipts' block (700, timestamp 1,000), retained as an anchor that also
+ * carries `state_root` for kind 9.
+ */
+node::BridgeStateIndex FundingIndex(const Consensus::Params& params,
+                                    const ReceiptFixture& receipts,
+                                    const uint256& state_root)
+{
+    node::BridgeStateIndex index;
+    ConnectEmptyThrough(index, params, BRIDGE_V2_HEIGHT - 2);
+    const StateAnchorSpec anchor{receipts.block_number, receipts.block_hash,
+                                 receipts.timestamp, state_root,
+                                 receipts.receipts_root};
+    SeedStateAnchorsV2(index, {anchor}, anchor);
+    return index;
+}
+
+//! The bridge V2 accounting of two indexes, field for field.
+void CheckSameAccounting(const node::BridgeStateIndex& a,
+                         const node::BridgeStateIndex& b)
+{
+    BOOST_CHECK(a.ObservationsV2() == b.ObservationsV2());
+    BOOST_CHECK(a.ReserveLedgerV2() == b.ReserveLedgerV2());
+    BOOST_CHECK(a.ProvenDepositsV2() == b.ProvenDepositsV2());
+    BOOST_CHECK_EQUAL(a.ProvenDepositsTotalV2(), b.ProvenDepositsTotalV2());
+    // The running total is the map's sum.
+    CAmount total{0};
+    for (const auto& [id, amount] : a.ProvenDepositsV2()) total += amount;
+    BOOST_CHECK_EQUAL(a.ProvenDepositsTotalV2(), total);
+    BOOST_CHECK(a.ConflictV2() == b.ConflictV2());
+    BOOST_CHECK_EQUAL(a.ConnectedHeight(), b.ConnectedHeight());
+    BOOST_CHECK(a.ConnectedHash() == b.ConnectedHash());
+    BOOST_CHECK(a.WithdrawalTreeV2() == b.WithdrawalTreeV2());
+}
+
+void CheckSameV2Delta(const node::BridgeBlockDelta& a,
+                      const node::BridgeBlockDelta& b)
+{
+    BOOST_CHECK(a.observations_v2_before == b.observations_v2_before);
+    BOOST_CHECK(a.observations_v2_added == b.observations_v2_added);
+    BOOST_CHECK(a.reserve_v2_before == b.reserve_v2_before);
+    BOOST_CHECK(a.reserve_v2_after == b.reserve_v2_after);
+    BOOST_CHECK(a.deposits_v2_added == b.deposits_v2_added);
+    BOOST_CHECK(a.conflict_v2_before == b.conflict_v2_before);
+    BOOST_CHECK(a.conflict_v2_after == b.conflict_v2_after);
+    BOOST_CHECK(a.withdrawals_v2_added == b.withdrawals_v2_added);
+}
+
+void Disconnect(node::BridgeStateIndex& index)
+{
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(index.ConnectedHeight(),
+                                                index.ConnectedHash(), error),
+                          error);
 }
 
 } // namespace
@@ -2368,35 +2724,51 @@ BOOST_AUTO_TEST_CASE(v2_burn_tree_roots_undo)
                 "bridge V2 burns are not active");
     BOOST_CHECK(modern::ConfiguredBridgeV2EntryId(late_burns) == entry_id);
 
-    // V: an empty block; the certificate root is the empty V2 tree.
-    const node::BridgeBlockDelta at_v{ConnectNext(index, params)};
+    // V: a seed retaining a V2 light client and the funding receipts'
+    // block (no V2 record); the certificate root is the empty V2 tree.
+    const ReceiptFixture funding{MakeV2ReceiptFixture(params, {{0, 100, 0x31}})};
+    const bridge_test::ObservationWorld world{HealthyWorld(params, 1, 100)};
+    const StateAnchorSpec funding_anchor{funding.block_number, funding.block_hash,
+                                         funding.timestamp, world.StateRoot(),
+                                         funding.receipts_root};
+    const node::BridgeBlockDelta at_v{
+        SeedStateAnchorsV2(index, {funding_anchor}, funding_anchor)};
     BOOST_CHECK(at_v.v2_store);
     BOOST_CHECK(index.WithdrawalRootV2AtHeight(BRIDGE_V2_HEIGHT) ==
                 std::optional<uint256>{empty_root});
     BOOST_CHECK(node::FinalityWithdrawalRootV2(BRIDGE_V2_HEIGHT, params,
                                                &index) ==
                 std::optional<uint256>{empty_root});
+    // A burn needs reserve (check 2) and a RESERVE_E observation (check 3).
+    VerifyFails(index, Block(1'061, {first}), BRIDGE_V2_HEIGHT + 1, params,
+                "exceeds the vault entry's reserve");
+    // V + 1: mint 100 bUSD V2 and observe the vault holding it.
+    ConnectNext(index, params,
+                {MintTransactionV2(params, funding, 0, 100),
+                 Observe(world, SUBJECT_RESERVE, funding.block_hash)},
+                1'061);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().minted, 100);
 
     // The per-transaction preview reports the V2 leaf (and so SIGHASH_ALL).
+    const int burn_height{BRIDGE_V2_HEIGHT + 2};
     node::BridgeTxAuthorization authorization;
-    BOOST_REQUIRE_MESSAGE(index.VerifyTransaction(*first, BRIDGE_V2_HEIGHT + 1,
-                                                  1'061, params,
-                                                  authorization, error),
+    BOOST_REQUIRE_MESSAGE(index.VerifyTransaction(*first, burn_height, 1'061,
+                                                  params, authorization,
+                                                  error),
                           error);
     BOOST_REQUIRE(authorization.withdrawal_v2);
     BOOST_CHECK(authorization.HasWithdrawal());
     BOOST_CHECK(!authorization.decentralized_withdrawal);
     BOOST_CHECK(!authorization.mint);
-    auto preview{index.BeginBlockPreview(BRIDGE_V2_HEIGHT + 1, 1'061,
-                                         TestHash(95), params, error)};
+    auto preview{index.BeginBlockPreview(burn_height, 1'061, TestHash(95),
+                                         params, error)};
     BOOST_REQUIRE_MESSAGE(preview != nullptr, error);
     const std::array<CTransactionRef, 1> chunk{first};
     BOOST_REQUIRE_MESSAGE(preview->TryAppend(chunk, error), error);
     BOOST_CHECK(!preview->TryAppend(chunk, error));
     BOOST_CHECK(error.find("duplicated") != std::string::npos);
 
-    // V + 1: two burns take ids 0 and 1 of the V2 tree.
-    const int burn_height{BRIDGE_V2_HEIGHT + 1};
+    // V + 2: two burns take ids 0 and 1 of the V2 tree.
     const node::BridgeBlockDelta delta{
         ConnectNext(index, params, {first, second}, 1'061)};
     BOOST_REQUIRE_EQUAL(delta.withdrawals_v2_added.size(), 2U);
@@ -2431,6 +2803,9 @@ BOOST_AUTO_TEST_CASE(v2_burn_tree_roots_undo)
                 std::optional<uint256>{expected.root});
     BOOST_CHECK(index.WithdrawalRootV2AtHeight(BRIDGE_V2_HEIGHT) ==
                 std::optional<uint256>{empty_root});
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().burned, 33);
+    BOOST_CHECK_EQUAL(delta.reserve_v2_before.burned, 0);
+    BOOST_CHECK_EQUAL(delta.reserve_v2_after.burned, 33);
     BOOST_CHECK_EQUAL(index.WithdrawalV2Count(), 2U);
     BOOST_CHECK_EQUAL(index.DecentralizedWithdrawalCount(), 0U);
     BOOST_CHECK_EQUAL(index.WithdrawalTree().count, 0U);
@@ -2491,6 +2866,8 @@ BOOST_AUTO_TEST_CASE(v2_burn_tree_roots_undo)
     BOOST_CHECK(!index.WithdrawalRootV2AtHeight(burn_height));
     BOOST_CHECK(index.WithdrawalRootV2AtHeight(BRIDGE_V2_HEIGHT) ==
                 std::optional<uint256>{empty_root});
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().burned, 0);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().minted, 100);
     const node::BridgeBlockDelta replay{
         ConnectNext(index, params, {first, second}, 1'061)};
     BOOST_CHECK(replay.withdrawals_v2_added == delta.withdrawals_v2_added);
@@ -2532,68 +2909,217 @@ BOOST_AUTO_TEST_CASE(v2_delta_store_invariants)
     BOOST_CHECK(!index.ConnectBlock(v1_leaf_from_v, error));
     BOOST_CHECK(error.find("withdrawals do not match its store") !=
                 std::string::npos);
+
+    // V2 accounting changes only on the V2 store, from a matching
+    // before-state, by the block's own records.
+    node::BridgeBlockDelta ledger_below_v;
+    ledger_below_v.height = BRIDGE_V2_HEIGHT - 1;
+    ledger_below_v.block_hash = V2TestBlockHash(BRIDGE_V2_HEIGHT - 1);
+    ledger_below_v.reserve_v2_after.minted = 5;
+    error.clear();
+    BOOST_CHECK(!index.ConnectBlock(ledger_below_v, error));
+    BOOST_CHECK(error.find("V2 accounting does not match its store") !=
+                std::string::npos);
+
+    node::BridgeBlockDelta wrong_before;
+    wrong_before.height = BRIDGE_V2_HEIGHT;
+    wrong_before.block_hash = V2TestBlockHash(BRIDGE_V2_HEIGHT);
+    wrong_before.v2_store = true;
+    wrong_before.reserve_v2_before.minted = 1;
+    wrong_before.reserve_v2_after.minted = 1;
+    error.clear();
+    BOOST_CHECK(!index.ConnectBlock(wrong_before, error));
+    BOOST_CHECK(error.find("V2 accounting before-state does not match") !=
+                std::string::npos);
+
+    node::BridgeBlockDelta unearned;
+    unearned.height = BRIDGE_V2_HEIGHT;
+    unearned.block_hash = V2TestBlockHash(BRIDGE_V2_HEIGHT);
+    unearned.v2_store = true;
+    unearned.reserve_v2_after.minted = 7; // no mint authorizes it
+    error.clear();
+    BOOST_CHECK(!index.ConnectBlock(unearned, error));
+    BOOST_CHECK(error.find("reserve ledger does not match its effects") !=
+                std::string::npos);
+    unearned.reserve_v2_after = {};
+    unearned.reserve_v2_after.transit = 3; // transit has no source yet
+    error.clear();
+    BOOST_CHECK(!index.ConnectBlock(unearned, error));
+    BOOST_CHECK(error.find("reserve ledger does not match its effects") !=
+                std::string::npos);
+
+    node::BridgeBlockDelta conjured;
+    conjured.height = BRIDGE_V2_HEIGHT;
+    conjured.block_hash = V2TestBlockHash(BRIDGE_V2_HEIGHT);
+    conjured.v2_store = true;
+    conjured.conflict_v2_after = node::BridgeV2Conflict{
+        bridge::BRIDGE_V2_CONFLICT_E8, BRIDGE_V2_HEIGHT,
+        V2TestBlockHash(BRIDGE_V2_HEIGHT), 800};
+    error.clear();
+    BOOST_CHECK(!index.ConnectBlock(conjured, error));
+    BOOST_CHECK(error.find("malformed sticky conflict") != std::string::npos);
+
+    node::BridgeBlockDelta orphan_observation;
+    orphan_observation.height = BRIDGE_V2_HEIGHT;
+    orphan_observation.block_hash = V2TestBlockHash(BRIDGE_V2_HEIGHT);
+    orphan_observation.v2_store = true;
+    node::BridgeObservationRecordV2 record;
+    record.subject = SUBJECT_TOKEN;
+    record.state = bridge::TokenFlagsV2{};
+    record.anchor_hash = AnchorHash(800);
+    record.anchor_block = 800;
+    record.connected_height = BRIDGE_V2_HEIGHT;
+    record.connected_block = orphan_observation.block_hash;
+    orphan_observation.observations_v2_added.push_back(record);
+    error.clear();
+    BOOST_CHECK(!index.ConnectBlock(orphan_observation, error));
+    BOOST_CHECK(error.find("malformed observation") != std::string::npos);
+
     BOOST_CHECK_EQUAL(index.ConnectedHeight(), -1);
     BOOST_CHECK(index.History().empty());
 }
 
-BOOST_AUTO_TEST_CASE(v2_burn_readiness)
+BOOST_AUTO_TEST_CASE(v2_burn_gate_from_index)
 {
-    const Consensus::Params params{V2Params()};
-    const Consensus::BridgeV2Params& v2{*params.bridge_v2};
-    node::LineageV2View good;
-    good.configured = true;
-    good.bootstrapped = true;
-    good.current_count = 4;
-    good.current_weight = 900;
-    good.next_count = 64;
-    good.next_weight = 5'000;
-    std::string reason;
-    BOOST_CHECK(node::BridgeV2BurnReadiness(good, v2, reason) ==
-                node::BridgeBurnReadiness::READY);
-    BOOST_CHECK(reason.empty());
+    // EvaluateBridgeV2BurnGate reads the fresh lineage from its context and
+    // E1-E8 / C4 from the connected index (node changes section 8.4). The
+    // row logic itself is bridge_burn_gate_v2_tests'; this checks the
+    // wiring: availability, now_eff, the observations and the conflict.
+    const Consensus::Params params{LineageParams()};
+    const LineageFixture lineage;
+    bridge_test::ObservationWorld world{HealthyWorld(params)};
+    node::BridgeStateIndex probe{ObservationIndex(params, world.StateRoot())};
+    world.SetVerifier(lineage.Canonical(1, 109, params, probe));
+    node::BridgeStateIndex index{ObservationIndex(params, world.StateRoot())};
+    const int height{BRIDGE_V2_HEIGHT};
+    const uint256 anchor{AnchorHash(800)};
 
-    const auto not_ready = [&](const node::LineageV2View& view,
-                               const Consensus::BridgeV2Params& pins,
-                               const std::string& expected) {
-        std::string why;
-        BOOST_CHECK(node::BridgeV2BurnReadiness(view, pins, why) ==
-                    node::BridgeBurnReadiness::NOT_READY);
-        BOOST_CHECK_MESSAGE(why.find(expected) != std::string::npos,
-                            "reason '" << why << "' lacks '" << expected << "'");
-    };
-    node::LineageV2View view{good};
-    view.configured = false;
-    not_ready(view, v2, "not configured");
-    view = good;
-    view.bootstrapped = false;
-    not_ready(view, v2, "not bootstrapped");
-    view = good;
-    view.broken = true;
-    not_ready(view, v2, "broken");
-    view = good;
-    view.current_count = 3;
-    not_ready(view, v2, "current fresh-lineage committee");
-    view = good;
-    view.next_count = 65;
-    not_ready(view, v2, "next fresh-lineage committee");
-    view = good;
-    view.current_weight = 899;
-    not_ready(view, v2, "current fresh-lineage committee");
-    view = good;
-    view.next_count = 0;
-    view.next_weight = 0;
-    not_ready(view, v2, "next fresh-lineage committee");
-    Consensus::BridgeV2Params incomplete{v2};
-    incomplete.verifier.address = {};
-    not_ready(good, incomplete, "parameters are incomplete");
+    // UNAVAILABLE: no bridge V2 envelope, no context, the replay context,
+    // or an index not at the parent.
+    {
+        Consensus::Params no_v2{params};
+        no_v2.bridge_v2.reset();
+        const auto result{node::EvaluateBridgeV2BurnGate(
+            &lineage.context, index, no_v2, height, 1'060)};
+        BOOST_CHECK(result.readiness == node::BridgeBurnReadiness::UNAVAILABLE);
+        BOOST_CHECK(result.Describe().find("not configured") != std::string::npos);
+    }
+    BOOST_CHECK(node::EvaluateBridgeV2BurnGate(nullptr, index, params, height,
+                                               1'060)
+                    .readiness == node::BridgeBurnReadiness::UNAVAILABLE);
+    BOOST_CHECK(node::EvaluateBridgeV2BurnGate(&node::REPLAY_LINEAGE, index,
+                                               params, height, 1'060)
+                    .readiness == node::BridgeBurnReadiness::UNAVAILABLE);
+    BOOST_CHECK(node::EvaluateBridgeV2BurnGate(&lineage.context, index, params,
+                                               height + 1, 1'060)
+                    .readiness == node::BridgeBurnReadiness::UNAVAILABLE);
 
-    // The temporary gate's error text, for V2 burns only.
+    // No observation yet: E1.
+    {
+        const auto result{node::EvaluateBridgeV2BurnGate(
+            &lineage.context, index, params, height, 1'060)};
+        BOOST_CHECK(result.readiness == node::BridgeBurnReadiness::NOT_READY);
+        BOOST_CHECK(result.row == bridge::BurnGateRowV2::E1);
+        BOOST_CHECK_EQUAL(result.Describe(), "E1: no VERIFIER_E observation");
+        BOOST_CHECK_EQUAL(result.now_eff, 1'060);
+    }
+    // A context without fresh state: C2 (the lineage is configured but
+    // was not projected), never READY.
+    {
+        node::BridgeV2LineageContext empty;
+        const auto result{node::EvaluateBridgeV2BurnGate(&empty, index, params,
+                                                         height, 1'060)};
+        BOOST_CHECK(result.row == bridge::BurnGateRowV2::C2);
+    }
+
+    // All three observations at anchor 800 (t_obs 1,000): READY.
+    ConnectNext(index, params,
+                {Observe(world, SUBJECT_TOKEN, anchor),
+                 Observe(world, SUBJECT_RESERVE, anchor),
+                 Observe(world, SUBJECT_VERIFIER, anchor)},
+                1'060, &lineage.context);
+    const Consensus::BridgeV2GateParams& gate{params.bridge_v2->gate};
+    {
+        const auto result{node::EvaluateBridgeV2BurnGate(
+            &lineage.context, index, params, height + 1, 1'061)};
+        BOOST_CHECK_MESSAGE(result.readiness == node::BridgeBurnReadiness::READY,
+                            result.Describe());
+        BOOST_CHECK_EQUAL(result.Describe(), "ready");
+        BOOST_CHECK_EQUAL(result.now_eff, 1'061);
+        // The observations expire before the rotation age limit.
+        BOOST_REQUIRE(result.closes_at);
+        BOOST_CHECK_EQUAL(*result.closes_at,
+                          1'000 + gate.observation_max_age_seconds + 1);
+    }
+    // now_eff takes the light client's finalized execution time when the
+    // block time lags it.
+    BOOST_CHECK_EQUAL(node::EvaluateBridgeV2BurnGate(&lineage.context, index,
+                                                     params, height + 1, 500)
+                          .now_eff,
+                      1'000);
+    // Exactly at the age limit the gate is READY; one second later every
+    // observation is stale and E1 is the first row to fail.
+    BOOST_CHECK(node::EvaluateBridgeV2BurnGate(
+                    &lineage.context, index, params, height + 1,
+                    1'000 + gate.observation_max_age_seconds)
+                    .readiness == node::BridgeBurnReadiness::READY);
+    {
+        const auto result{node::EvaluateBridgeV2BurnGate(
+            &lineage.context, index, params, height + 1,
+            1'000 + gate.observation_max_age_seconds + 1)};
+        BOOST_CHECK(result.readiness == node::BridgeBurnReadiness::NOT_READY);
+        BOOST_CHECK_EQUAL(result.Describe(), "E1: VERIFIER_E observation is stale");
+    }
+    // A broken lineage is C2; a lagging finalized checkpoint C3.
+    {
+        LineageFixture broken;
+        broken.Fresh().lineage_broken = true;
+        BOOST_CHECK(node::EvaluateBridgeV2BurnGate(&broken.context, index,
+                                                   params, height + 1, 1'061)
+                        .row == bridge::BurnGateRowV2::C2);
+        LineageFixture lagging;
+        lagging.Fresh().finalized->height =
+            height + 1 - gate.max_finality_lag_blocks - 1;
+        BOOST_CHECK(node::EvaluateBridgeV2BurnGate(&lagging.context, index,
+                                                   params, height + 1, 1'061)
+                        .row == bridge::BurnGateRowV2::C3);
+    }
+    // A recorded SETS_MISMATCH verdict closes the gate at E4.
+    {
+        bridge_test::ObservationWorld mismatched{world};
+        bridge::VerifierStateV2 other{lineage.Canonical(1, 109, params, index)};
+        other.next_set_hash = TestHash(0x5e);
+        mismatched.SetVerifier(other);
+        SeedStateAnchorsV2(index, {StateAnchor(801, 1'010, mismatched.StateRoot())});
+        ConnectNext(index, params,
+                    {Observe(mismatched, SUBJECT_VERIFIER, AnchorHash(801),
+                             VERDICT_SETS)},
+                    1'062, &lineage.context);
+        const auto result{node::EvaluateBridgeV2BurnGate(
+            &lineage.context, index, params, index.ConnectedHeight() + 1,
+            1'063)};
+        BOOST_CHECK(result.row == bridge::BurnGateRowV2::E4);
+        // A halted verifier is impaired (C1), whatever its age.
+        bridge::VerifierStateV2 halted{other};
+        halted.status = bridge::VERIFIER_STATUS_HALTED_CONFLICT;
+        mismatched.SetVerifier(halted);
+        SeedStateAnchorsV2(index, {StateAnchor(802, 1'020, mismatched.StateRoot())});
+        ConnectNext(index, params,
+                    {Observe(mismatched, SUBJECT_VERIFIER, AnchorHash(802))},
+                    1'064);
+        const auto halted_result{node::EvaluateBridgeV2BurnGate(
+            &lineage.context, index, params, index.ConnectedHeight() + 1,
+            1'065)};
+        BOOST_CHECK(halted_result.row == bridge::BurnGateRowV2::C1);
+        BOOST_CHECK(halted_result.Describe().find("halted") != std::string::npos);
+    }
+
+    // The V2 refusal text no longer names a temporary gate.
     const CTransactionRef burn{BurnTransactionV2(params, 98, 5, 0x99)};
     std::string error;
     BOOST_CHECK(!node::CheckBridgeV2BurnReadiness(
         *burn, node::BridgeBurnReadiness::NOT_READY, error));
-    BOOST_CHECK(error.find("temporary gate") != std::string::npos);
-    BOOST_CHECK(error.find("fresh finality lineage") != std::string::npos);
+    BOOST_CHECK_EQUAL(error, "bridge V2 burn gate is not ready");
     error.clear();
     BOOST_CHECK(!node::CheckBridgeV2BurnReadiness(
         Block(1'000, {burn}), node::BridgeBurnReadiness::UNAVAILABLE, error));
@@ -2604,6 +3130,12 @@ BOOST_AUTO_TEST_CASE(v2_burn_readiness)
     BOOST_CHECK(node::CheckBridgeV2BurnReadiness(
         *MintTransactionV2(params, fixture, 0, 60),
         node::BridgeBurnReadiness::NOT_READY, error));
+    // Kind 9 carriers are recognised only under the V2 record set.
+    const CTransactionRef observation{Observe(world, SUBJECT_TOKEN, anchor)};
+    BOOST_CHECK(node::HasBridgeV2Observation(*observation));
+    BOOST_CHECK(node::HasBridgeV2Observation(Block(1'000, {burn, observation})));
+    BOOST_CHECK(!node::HasBridgeV2Observation(*burn));
+    BOOST_CHECK(!node::HasDecentralizedBridgeBurn(*observation));
 }
 
 BOOST_AUTO_TEST_CASE(finality_withdrawal_root_v2)
@@ -2667,6 +3199,1120 @@ BOOST_AUTO_TEST_CASE(finality_withdrawal_root_v2)
     BOOST_CHECK(node::FinalityWithdrawalRoot(BRIDGE_V2_HEIGHT, params,
                                              &index) ==
                 std::optional<uint256>{uint256{}});
+}
+
+BOOST_AUTO_TEST_CASE(v2_anchors_record_state_roots)
+{
+    // Anchors keep their execution header's stateRoot, the root kind 9
+    // observations prove storage against. A light-client bootstrap records
+    // the SSZ-proven root; a backfill records RLP header field [3]. A header
+    // without a 32-byte stateRoot still backfills (V1 parity) and records a
+    // null root.
+    const uint64_t fixture_block{ethfx::U1_FINALIZED_EXEC.block_number};
+    const Consensus::Params params{V2Params(BRIDGE_V2_HEIGHT, fixture_block)};
+    const ReceiptFixture v1_fixture{
+        MakeReceiptFixture(params, {{1, 60, 0x71}})};
+    node::BridgeStateIndex index;
+    SeedVerifiedAnchor(index, v1_fixture);
+    ConnectEmptyThrough(index, params, BRIDGE_V2_HEIGHT - 1);
+    const node::BridgeBlockDelta boot_delta{
+        ConnectNext(index, params, {FixtureBootstrapTransaction()})};
+    BOOST_REQUIRE_EQUAL(boot_delta.anchors_added.size(), 1U);
+    const uint256 boot_state{
+        FixtureHex32(ethfx::U1_FINALIZED_EXEC.state_root)};
+    BOOST_CHECK(!boot_state.IsNull());
+    BOOST_CHECK(boot_delta.anchors_added.front().state_root == boot_state);
+    const auto boot_anchor{index.AnchorV2(
+        FixtureHex32(ethfx::U1_FINALIZED_EXEC.block_hash))};
+    BOOST_REQUIRE(boot_anchor);
+    BOOST_CHECK(boot_anchor->state_root == boot_state);
+
+    auto header = [](const uint256& parent, const uint64_t number,
+                     const uint256& receipts_root, const uint64_t timestamp,
+                     const std::optional<uint256>& state_root) {
+        std::vector<unsigned char> encoded{ExecutionHeader(
+            parent, number, receipts_root, timestamp)};
+        if (!state_root) return encoded;
+        const auto top{bridge::RlpDecode(encoded)};
+        BOOST_REQUIRE(top);
+        const auto items{bridge::RlpChildren(*top)};
+        BOOST_REQUIRE(items);
+        std::vector<std::vector<unsigned char>> fields;
+        for (const auto& item : *items) {
+            fields.push_back(EncodedBytes(item.payload));
+        }
+        fields[3] = EncodedBytes(
+            std::span<const unsigned char>{state_root->begin(), 32});
+        return bridge::RlpEncodeList(fields);
+    };
+    const uint256 state_699{TestBlockHash(1'699)};
+    const uint256 state_700{TestBlockHash(1'700)};
+    const std::vector<unsigned char> header_698{header(
+        uint256{}, 698, TestBlockHash(698), 1'698, std::nullopt)};
+    const uint256 hash_698{Keccak(header_698)};
+    const std::vector<unsigned char> header_699{header(
+        hash_698, 699, TestBlockHash(699), 1'699, state_699)};
+    const uint256 hash_699{Keccak(header_699)};
+    const std::vector<unsigned char> header_700{header(
+        hash_699, 700, TestBlockHash(700), 1'700, state_700)};
+    const uint256 hash_700{Keccak(header_700)};
+
+    const Consensus::Params backfill_params{V2Params()};
+    node::BridgeStateIndex backfill_index;
+    SeedVerifiedAnchor(backfill_index, v1_fixture);
+    ConnectEmptyThrough(backfill_index, backfill_params, BRIDGE_V2_HEIGHT - 2);
+    node::BridgeBlockDelta v2_seed;
+    v2_seed.height = BRIDGE_V2_HEIGHT - 1;
+    v2_seed.block_hash = V2TestBlockHash(v2_seed.height);
+    v2_seed.previous_height = backfill_index.ConnectedHeight();
+    v2_seed.previous_block_hash = backfill_index.ConnectedHash();
+    v2_seed.v2_store = true;
+    v2_seed.anchors_added.push_back(node::BridgeExecutionAnchor{
+        700, hash_700, TestBlockHash(700), 32, 700, 1'700, v2_seed.height,
+        v2_seed.block_hash, state_700});
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(backfill_index.ConnectBlock(v2_seed, error), error);
+
+    const node::BridgeBlockDelta with_root{ConnectNext(
+        backfill_index, backfill_params,
+        {BackfillTransaction(hash_700, 699, {header_700, header_699})})};
+    BOOST_REQUIRE_EQUAL(with_root.anchors_added.size(), 1U);
+    BOOST_CHECK(with_root.anchors_added.front().state_root == state_699);
+    const auto anchor_699{backfill_index.AnchorV2(hash_699)};
+    BOOST_REQUIRE(anchor_699);
+    BOOST_CHECK(anchor_699->state_root == state_699);
+
+    const node::BridgeBlockDelta without_root{ConnectNext(
+        backfill_index, backfill_params,
+        {BackfillTransaction(hash_699, 698, {header_699, header_698})})};
+    BOOST_REQUIRE_EQUAL(without_root.anchors_added.size(), 1U);
+    BOOST_CHECK(without_root.anchors_added.front().state_root.IsNull());
+    const auto anchor_698{backfill_index.AnchorV2(hash_698)};
+    BOOST_REQUIRE(anchor_698);
+    BOOST_CHECK(anchor_698->state_root.IsNull());
+}
+
+BOOST_AUTO_TEST_CASE(duplicate_anchor_state_root_compared_on_v2_store_only)
+{
+    // A bootstrap whose finalized execution block is already retained adds
+    // no anchor when the retained one has the same number and receipts root.
+    // On the V1 store that stays true whatever the retained stateRoot is:
+    // comparing it there would be a new refusal, and V1 acceptance must not
+    // change. On the V2 store, whose stateRoot kind 9 observations read, a
+    // different retained root is a conflict.
+    const uint64_t fixture_block{ethfx::U1_FINALIZED_EXEC.block_number};
+    const uint256 fixture_hash{
+        FixtureHex32(ethfx::U1_FINALIZED_EXEC.block_hash)};
+    const uint256 fixture_receipts{
+        FixtureHex32(ethfx::U1_FINALIZED_EXEC.receipts_root)};
+    const uint256 fixture_state{
+        FixtureHex32(ethfx::U1_FINALIZED_EXEC.state_root)};
+    const uint256 other_state{TestBlockHash(4'242)};
+    BOOST_REQUIRE(!fixture_state.IsNull());
+    BOOST_REQUIRE(other_state != fixture_state);
+
+    // The V2 envelope with the V1 pins moved to the same checkpoint, so the
+    // fixture bootstrap verifies against either store.
+    Consensus::Params params{V2Params(BRIDGE_V2_HEIGHT, fixture_block)};
+    params.busd_bridge->light_client = params.bridge_v2->light_client;
+    params.busd_bridge->origin_deployment_block = fixture_block;
+
+    // Connect a hand-built delta at the next height that retains the
+    // fixture's finalized execution block in the chosen store with
+    // `state_root`, without a light client (a fixture shortcut).
+    auto seed = [&](node::BridgeStateIndex& index, const int height,
+                    const bool v2_store, const uint256& state_root) {
+        node::BridgeBlockDelta delta;
+        delta.height = height;
+        delta.block_hash = V2TestBlockHash(height);
+        delta.previous_height = index.ConnectedHeight();
+        delta.previous_block_hash = index.ConnectedHash();
+        delta.v2_store = v2_store;
+        delta.anchors_added.push_back(node::BridgeExecutionAnchor{
+            fixture_block, fixture_hash, fixture_receipts,
+            ethfx::U1_FINALIZED_BEACON.slot, fixture_block,
+            ethfx::U1_FINALIZED_EXEC.timestamp, height, delta.block_hash,
+            state_root});
+        delta.withdrawal_tree_before = index.WithdrawalTree();
+        delta.withdrawal_tree_after = index.WithdrawalTree();
+        delta.withdrawal_tree_v2_before = index.WithdrawalTreeV2();
+        delta.withdrawal_tree_v2_after = index.WithdrawalTreeV2();
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
+    };
+
+    // V1 store, below V: the bootstrap is accepted identically whether the
+    // retained root matches, differs or is null, and the retained anchor
+    // keeps the root it was connected with.
+    std::optional<node::BridgeBlockDelta> v1_reference;
+    for (const uint256& retained : {fixture_state, other_state, uint256{}}) {
+        node::BridgeStateIndex index;
+        seed(index, BRIDGE_HEIGHT - 1, /*v2_store=*/false, retained);
+        const node::BridgeBlockDelta delta{
+            ConnectNext(index, params, {FixtureBootstrapTransaction()})};
+        BOOST_CHECK_EQUAL(delta.height, BRIDGE_HEIGHT);
+        BOOST_CHECK(!delta.v2_store);
+        BOOST_CHECK(delta.anchors_added.empty());
+        BOOST_REQUIRE(delta.light_client_after);
+        BOOST_REQUIRE(index.LightClient());
+        BOOST_CHECK(*index.LightClient() == FixtureBootstrapStore());
+        BOOST_CHECK(!index.LightClientV2());
+        BOOST_CHECK_EQUAL(index.AnchorCount(), 1U);
+        const auto anchor{index.Anchor(fixture_hash)};
+        BOOST_REQUIRE(anchor);
+        BOOST_CHECK(anchor->state_root == retained);
+        if (!v1_reference) {
+            v1_reference = delta;
+            continue;
+        }
+        BOOST_CHECK(delta.light_client_before == v1_reference->light_client_before);
+        BOOST_CHECK(delta.light_client_after == v1_reference->light_client_after);
+        BOOST_CHECK(delta.light_client_connection_after ==
+                    v1_reference->light_client_connection_after);
+        BOOST_CHECK(delta.anchors_added == v1_reference->anchors_added);
+    }
+
+    // V2 store, at V: the matching root is accepted the same way ...
+    {
+        node::BridgeStateIndex index;
+        ConnectEmptyThrough(index, params, BRIDGE_V2_HEIGHT - 2);
+        seed(index, BRIDGE_V2_HEIGHT - 1, /*v2_store=*/true, fixture_state);
+        const node::BridgeBlockDelta delta{
+            ConnectNext(index, params, {FixtureBootstrapTransaction()})};
+        BOOST_CHECK_EQUAL(delta.height, BRIDGE_V2_HEIGHT);
+        BOOST_CHECK(delta.v2_store);
+        BOOST_CHECK(delta.anchors_added.empty());
+        BOOST_REQUIRE(index.LightClientV2());
+        BOOST_CHECK(*index.LightClientV2() == FixtureBootstrapStore());
+        const auto anchor{index.AnchorV2(fixture_hash)};
+        BOOST_REQUIRE(anchor);
+        BOOST_CHECK(anchor->state_root == fixture_state);
+    }
+    // ... and a different or null retained root is refused.
+    for (const uint256& retained : {other_state, uint256{}}) {
+        node::BridgeStateIndex index;
+        ConnectEmptyThrough(index, params, BRIDGE_V2_HEIGHT - 2);
+        seed(index, BRIDGE_V2_HEIGHT - 1, /*v2_store=*/true, retained);
+        VerifyFails(index, Block(1'060, {FixtureBootstrapTransaction()}),
+                    BRIDGE_V2_HEIGHT, params,
+                    "bridge execution anchor hash conflicts with retained state");
+        BOOST_CHECK(!index.LightClientV2());
+        BOOST_CHECK_EQUAL(index.ConnectedHeight(), BRIDGE_V2_HEIGHT - 1);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_observations_connect_undo_replay)
+{
+    // One record per subject at anchor 800, connected, undone, redone, and
+    // replayed on a second index with REPLAY_LINEAGE.
+    const Consensus::Params params{V2Params()};
+    bridge_test::ObservationWorld world{HealthyWorld(params, 3, 500)};
+    world.SetReserve(3, 500, 0, 520);
+    bridge::VerifierStateV2 halted;
+    halted.current_epoch = 4;
+    halted.last_rotation_time = 900;
+    halted.last_certificate_time = 950;
+    halted.latest_bridge_height = 105;
+    halted.status = bridge::VERIFIER_STATUS_HALTED_CONFLICT;
+    halted.current_set_hash = TestHash(0x41);
+    halted.next_set_hash = TestHash(0x42);
+    halted.latest_height = 99;
+    halted.latest_index = 1;
+    halted.latest_init_time = 800;
+    halted.latest_cert_id = TestHash(0x43);
+    world.SetVerifier(halted);
+    const uint256 root{world.StateRoot()};
+    const uint256 anchor{AnchorHash(800)};
+    const CTransactionRef token{Observe(world, SUBJECT_TOKEN, anchor)};
+    const CTransactionRef reserve{Observe(world, SUBJECT_RESERVE, anchor)};
+    const CTransactionRef verifier{Observe(world, SUBJECT_VERIFIER, anchor)};
+
+    node::BridgeStateIndex index{ObservationIndex(params, root)};
+    // Each record also verifies alone, as the mempool previews it (a
+    // verifier that is not LIVE needs no lineage).
+    for (const CTransactionRef& tx : {token, reserve, verifier}) {
+        node::BridgeTxAuthorization authorization;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyTransaction(*tx, BRIDGE_V2_HEIGHT,
+                                                    1'060, params,
+                                                    authorization, error),
+                            error);
+        BOOST_CHECK(!authorization.mint && !authorization.HasWithdrawal());
+    }
+    const node::BridgeBlockDelta delta{
+        ConnectNext(index, params, {token, reserve, verifier})};
+    BOOST_CHECK(delta.v2_store);
+    BOOST_REQUIRE_EQUAL(delta.observations_v2_added.size(), 3U);
+    for (const uint8_t subject : {SUBJECT_VERIFIER, SUBJECT_RESERVE, SUBJECT_TOKEN}) {
+        const auto latest{index.LatestObservationV2(subject)};
+        BOOST_REQUIRE(latest);
+        BOOST_CHECK_EQUAL(latest->subject, subject);
+        BOOST_CHECK(latest->anchor_hash == anchor);
+        BOOST_CHECK_EQUAL(latest->anchor_block, 800U);
+        BOOST_CHECK_EQUAL(latest->t_obs, 1'000);
+        BOOST_CHECK_EQUAL(latest->verdict, 0);
+        BOOST_CHECK_EQUAL(latest->connected_height, BRIDGE_V2_HEIGHT);
+        BOOST_CHECK(latest->connected_block == V2TestBlockHash(BRIDGE_V2_HEIGHT));
+        BOOST_CHECK_EQUAL(latest->state.index(), size_t{subject} - 1);
+    }
+    BOOST_CHECK(!index.LatestObservationV2(0));
+    BOOST_CHECK(!index.LatestObservationV2(4));
+    {
+        bridge::VerifierStateV2 expected{halted};
+        expected.verifier_code_hash = *params.bridge_v2->verifier.runtime_code_hash;
+        BOOST_CHECK(std::get<bridge::VerifierStateV2>(
+                        index.LatestObservationV2(SUBJECT_VERIFIER)->state) ==
+                    expected);
+        const auto& r{std::get<bridge::ReserveStateV2>(
+            index.LatestObservationV2(SUBJECT_RESERVE)->state)};
+        BOOST_CHECK_EQUAL(r.next_deposit_id, 3U);
+        BOOST_CHECK_EQUAL(r.locked, 500);
+        BOOST_CHECK_EQUAL(r.balance, 520);
+        BOOST_CHECK_EQUAL(r.absorbed_total, 0);
+        BOOST_CHECK(r.vault_code_hash == *params.bridge_v2->vault.vault_runtime_code_hash);
+        BOOST_CHECK(r.token_code_hash == params.bridge_v2->vault.token_runtime_code_hash);
+        const auto& t{std::get<bridge::TokenFlagsV2>(
+            index.LatestObservationV2(SUBJECT_TOKEN)->state)};
+        BOOST_CHECK(!t.paused && !t.deprecated && !t.vault_blacklisted);
+    }
+    // Nothing minted or burned: the ledger is empty and invariant R holds.
+    BOOST_CHECK(index.ReserveLedgerV2() == bridge::ReserveLedgerV2{});
+    BOOST_CHECK(!index.ConflictV2());
+    BOOST_CHECK(delta.observations_v2_before == node::BridgeObservationSlotsV2{});
+
+    // Undo empties the slots; redo is identical.
+    Disconnect(index);
+    BOOST_CHECK(index.ObservationsV2() == node::BridgeObservationSlotsV2{});
+    const node::BridgeBlockDelta redo{
+        ConnectNext(index, params, {token, reserve, verifier})};
+    CheckSameV2Delta(delta, redo);
+
+    // Replay from scratch (BridgeStateTracker's path) is field-for-field
+    // the incremental index.
+    node::BridgeStateIndex replay{ObservationIndex(params, root)};
+    node::BridgeBlockDelta replayed;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(replay.VerifyBlock(Block(1'060, {token, reserve, verifier}),
+                                             BRIDGE_V2_HEIGHT,
+                                             V2TestBlockHash(BRIDGE_V2_HEIGHT),
+                                             params, replayed, error,
+                                             &node::REPLAY_LINEAGE),
+                          error);
+    BOOST_REQUIRE_MESSAGE(replay.ConnectBlock(replayed, error), error);
+    CheckSameV2Delta(delta, replayed);
+    CheckSameAccounting(index, replay);
+}
+
+BOOST_AUTO_TEST_CASE(v2_observation_refusals)
+{
+    const Consensus::Params params{V2Params()};
+    const bridge_test::ObservationWorld world{HealthyWorld(params)};
+    const uint256 root{world.StateRoot()};
+    const uint256 anchor{AnchorHash(800)};
+    const CTransactionRef token{Observe(world, SUBJECT_TOKEN, anchor)};
+    node::BridgeStateIndex index{ObservationIndex(params, root)};
+
+    // Below V, and on every chain without a bridge V2 envelope, kind 9 is
+    // not a record at all: the codec refuses it as before (as the MPA
+    // structure rule does too).
+    VerifyFails(index, Block(1'060, {token}), BRIDGE_V2_HEIGHT - 1, params,
+                "bridge record is malformed");
+    {
+        std::string mpa_error;
+        BOOST_CHECK(!modern::CheckTransactionMpa(*token, params,
+                                                 BRIDGE_V2_HEIGHT - 1,
+                                                 mpa_error));
+        BOOST_CHECK_EQUAL(mpa_error, "mpa-malformed-bridge-record");
+        mpa_error.clear();
+        BOOST_CHECK_MESSAGE(modern::CheckTransactionMpa(*token, params,
+                                                        BRIDGE_V2_HEIGHT,
+                                                        mpa_error),
+                            mpa_error);
+        Consensus::Params no_v2{params};
+        no_v2.bridge_v2.reset();
+        VerifyFails(index, Block(1'060, {token}), BRIDGE_V2_HEIGHT + 5, no_v2,
+                    "bridge record is malformed");
+        mpa_error.clear();
+        BOOST_CHECK(!modern::CheckTransactionMpa(*token, no_v2,
+                                                 BRIDGE_V2_HEIGHT + 5,
+                                                 mpa_error));
+    }
+    // An unknown anchor; no V2 light client; a stale light client.
+    VerifyFails(index, Block(1'060, {Observe(world, SUBJECT_TOKEN, TestHash(0x99))}),
+                BRIDGE_V2_HEIGHT, params, "names an unretained execution anchor");
+    {
+        node::BridgeStateIndex no_light_client;
+        ConnectEmptyThrough(no_light_client, params, BRIDGE_V2_HEIGHT - 2);
+        SeedStateAnchorsV2(no_light_client, {StateAnchor(800, 1'000, root)});
+        VerifyFails(no_light_client, Block(1'060, {token}), BRIDGE_V2_HEIGHT,
+                    params, "precedes light-client bootstrap");
+    }
+    const uint64_t lag_seconds{params.bridge_v2->light_client.max_sync_lag_slots * 12};
+    VerifyFails(index,
+                Block(static_cast<uint32_t>(1'000 + lag_seconds + 1), {token}),
+                BRIDGE_V2_HEIGHT, params, "light-client head is stale");
+    {
+        node::BridgeBlockDelta at_limit;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyBlock(
+                                Block(static_cast<uint32_t>(1'000 + lag_seconds),
+                                      {token}),
+                                BRIDGE_V2_HEIGHT, V2TestBlockHash(BRIDGE_V2_HEIGHT),
+                                params, at_limit, error),
+                            error);
+    }
+
+    // An anchor without a state root (a header lacking a 32-byte stateRoot
+    // still backfills) proves nothing.
+    {
+        node::BridgeStateIndex rootless{ObservationIndex(params, root)};
+        SeedStateAnchorsV2(rootless, {StateAnchor(801, 1'010, uint256{})});
+        VerifyFails(rootless,
+                    Block(1'060, {Observe(world, SUBJECT_TOKEN, AnchorHash(801))}),
+                    BRIDGE_V2_HEIGHT + 1, params, "anchor has no state root");
+    }
+
+    // An anchor added by the same block cannot be read; from the next block
+    // it can.
+    {
+        const uint256 receipts_799{TestBlockHash(799)};
+        const uint256 receipts_800{TestBlockHash(800)};
+        const std::vector<unsigned char> header_799{ExecutionHeaderWithStateRoot(
+            uint256{}, 799, receipts_799, 990, root)};
+        const uint256 hash_799{Keccak(header_799)};
+        const std::vector<unsigned char> header_800{ExecutionHeaderWithStateRoot(
+            hash_799, 800, receipts_800, 1'000, root)};
+        const uint256 hash_800{Keccak(header_800)};
+        node::BridgeStateIndex chain;
+        ConnectEmptyThrough(chain, params, BRIDGE_V2_HEIGHT - 2);
+        const StateAnchorSpec head{800, hash_800, 1'000, root, receipts_800};
+        SeedStateAnchorsV2(chain, {head}, head);
+        const CTransactionRef backfill{
+            BackfillTransaction(hash_800, 799, {header_800, header_799})};
+        const CTransactionRef reads_799{Observe(world, SUBJECT_TOKEN, hash_799)};
+        VerifyFails(chain, Block(1'060, {backfill, reads_799}), BRIDGE_V2_HEIGHT,
+                    params, "names an anchor connected by the same block");
+        ConnectNext(chain, params, {backfill});
+        const auto backfilled{chain.AnchorV2(hash_799)};
+        BOOST_REQUIRE(backfilled);
+        BOOST_CHECK(backfilled->state_root == root);
+        ConnectNext(chain, params, {reads_799});
+        BOOST_CHECK_EQUAL(chain.LatestObservationV2(SUBJECT_TOKEN)->anchor_block, 799U);
+        BOOST_CHECK_EQUAL(chain.LatestObservationV2(SUBJECT_TOKEN)->t_obs, 990);
+    }
+
+    // Anchors increase per subject, within one block too.
+    ConnectNext(index, params, {token});
+    VerifyFails(index, Block(1'061, {token}), BRIDGE_V2_HEIGHT + 1, params,
+                "not newer than the subject's latest observation");
+    SeedStateAnchorsV2(index, {StateAnchor(799, 990, root),
+                               StateAnchor(801, 1'010, root),
+                               StateAnchor(802, 1'020, root)});
+    const CTransactionRef at_799{Observe(world, SUBJECT_TOKEN, AnchorHash(799))};
+    const CTransactionRef at_801{Observe(world, SUBJECT_TOKEN, AnchorHash(801))};
+    const CTransactionRef at_802{Observe(world, SUBJECT_TOKEN, AnchorHash(802))};
+    const int next{index.ConnectedHeight() + 1};
+    VerifyFails(index, Block(1'062, {at_799}), next, params,
+                "not newer than the subject's latest observation");
+    VerifyFails(index, Block(1'062, {at_802, at_801}), next, params,
+                "not newer than the subject's latest observation");
+    VerifyFails(index, Block(1'062, {at_801, at_801}), next, params,
+                "not newer than the subject's latest observation");
+    // Another subject keeps its own sequence: a reserve record at anchor 800
+    // follows token records at 801 and 802.
+    ConnectNext(index, params,
+                {at_801, at_802, Observe(world, SUBJECT_RESERVE, anchor)}, 1'062);
+    BOOST_CHECK_EQUAL(index.LatestObservationV2(SUBJECT_TOKEN)->anchor_block, 802U);
+    BOOST_CHECK_EQUAL(index.LatestObservationV2(SUBJECT_TOKEN)->t_obs, 1'020);
+    BOOST_CHECK_EQUAL(index.LatestObservationV2(SUBJECT_RESERVE)->anchor_block, 800U);
+
+    // Pinned code hashes, and the OI-3 unpinned rule on 31337 only.
+    {
+        bridge_test::ObservationWorld wrong_code{world};
+        wrong_code.code[params.bridge_v2->vault.vault_address] = TestHash(0x77);
+        node::BridgeStateIndex other{ObservationIndex(params, wrong_code.StateRoot())};
+        VerifyFails(other,
+                    Block(1'060, {Observe(wrong_code, SUBJECT_RESERVE, anchor)}),
+                    BRIDGE_V2_HEIGHT, params,
+                    "bridge observation is invalid: observation vault code hash does not match its pin");
+    }
+    {
+        Consensus::Params anvil{V2Params()};
+        anvil.bridge_v2->vault.origin_chain_id = bridge::OBSERVATION_UNPINNED_CODE_CHAIN_ID;
+        anvil.bridge_v2->vault.vault_runtime_code_hash.reset();
+        anvil.bridge_v2->verifier.runtime_code_hash.reset();
+        BOOST_REQUIRE(anvil.bridge_v2->Valid());
+        bridge_test::ObservationWorld empty_vault{HealthyWorld(anvil)};
+        empty_vault.code[anvil.bridge_v2->vault.vault_address] = bridge::EMPTY_CODE_HASH;
+        node::BridgeStateIndex unpinned{ObservationIndex(anvil, empty_vault.StateRoot())};
+        VerifyFails(unpinned,
+                    Block(1'060, {Observe(empty_vault, SUBJECT_RESERVE, anchor)}),
+                    BRIDGE_V2_HEIGHT, anvil,
+                    "bridge observation is invalid: observation vault has no code");
+        const bridge_test::ObservationWorld with_code{HealthyWorld(anvil)};
+        node::BridgeStateIndex accepted{ObservationIndex(anvil, with_code.StateRoot())};
+        ConnectNext(accepted, anvil, {Observe(with_code, SUBJECT_RESERVE, anchor)});
+        BOOST_CHECK(accepted.LatestObservationV2(SUBJECT_RESERVE));
+        // The same unpinned configuration is refused off 31337.
+        Consensus::Params unpinned_mainnet_like{anvil};
+        unpinned_mainnet_like.bridge_v2->vault.origin_chain_id = 5;
+        node::BridgeStateIndex refused{ObservationIndex(unpinned_mainnet_like,
+                                                        with_code.StateRoot())};
+        VerifyFails(refused,
+                    Block(1'060, {Observe(with_code, SUBJECT_RESERVE, anchor)}),
+                    BRIDGE_V2_HEIGHT, unpinned_mainnet_like,
+                    "code hash is unpinned off the regtest chain");
+    }
+    // A proof against another state root.
+    {
+        bridge_test::ObservationWorld changed{world};
+        changed.SetReserve(9, 1, 0, 1);
+        node::BridgeStateIndex other{ObservationIndex(params, root)};
+        VerifyFails(other,
+                    Block(1'060, {Observe(changed, SUBJECT_RESERVE, anchor)}),
+                    BRIDGE_V2_HEIGHT, params, "bridge observation is invalid");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_verifier_verdicts)
+{
+    const Consensus::Params params{LineageParams()};
+    const LineageFixture lineage;
+    bridge_test::ObservationWorld world{HealthyWorld(params)};
+    node::BridgeStateIndex index{ObservationIndex(params, uint256{uint8_t{1}})};
+    const int height{BRIDGE_V2_HEIGHT};
+    const bridge::VerifierStateV2 canonical{lineage.Canonical(1, 109, params, index)};
+    const auto verdict = [&](const bridge::VerifierStateV2& v,
+                             const node::BridgeV2LineageContext& context,
+                             const int at, std::string& error) {
+        return node::VerifierVerdictV2(v, context, params, index, at, error);
+    };
+    std::string error;
+    BOOST_CHECK(verdict(canonical, lineage.context, height, error) ==
+                std::optional<uint8_t>{0});
+
+    // E4: either pinned set differs.
+    bridge::VerifierStateV2 v{canonical};
+    v.next_set_hash = TestHash(0x5e);
+    BOOST_CHECK(verdict(v, lineage.context, height, error) ==
+                std::optional<uint8_t>{VERDICT_SETS});
+    v = canonical;
+    v.current_set_hash = lineage.sets[0]->set_hash;
+    BOOST_CHECK(verdict(v, lineage.context, height, error) ==
+                std::optional<uint8_t>{VERDICT_SETS});
+    // E5: another certId, an off-grid height, an index whose grid height
+    // differs, index 0.
+    v = canonical;
+    v.latest_cert_id = TestHash(0x5f);
+    BOOST_CHECK(verdict(v, lineage.context, height, error) ==
+                std::optional<uint8_t>{VERDICT_CERT});
+    v = canonical;
+    v.latest_height = 108;
+    BOOST_CHECK(verdict(v, lineage.context, height, error) ==
+                std::optional<uint8_t>{VERDICT_CERT});
+    v = canonical;
+    v.latest_index = 1;
+    BOOST_CHECK(verdict(v, lineage.context, height, error) ==
+                std::optional<uint8_t>{VERDICT_CERT});
+    v = canonical;
+    v.latest_index = 0;
+    v.latest_height = LineageFixture::GENESIS;
+    BOOST_CHECK(verdict(v, lineage.context, height, error) ==
+                std::optional<uint8_t>{VERDICT_CERT});
+    // B3's statement at another epoch is not the one the verifier signed.
+    v = canonical;
+    v.latest_cert_id =
+        modern::FinalityCertIdV2(lineage.Statement(0, 109, params, index));
+    BOOST_CHECK(verdict(v, lineage.context, height, error) ==
+                std::optional<uint8_t>{VERDICT_CERT});
+    v.next_set_hash = TestHash(0x5e);
+    BOOST_CHECK(verdict(v, lineage.context, height, error) ==
+                std::optional<uint8_t>{VERDICT_SETS | VERDICT_CERT});
+    // A verifier one epoch behind is judged against Set'_0 / Set'_1.
+    const bridge::VerifierStateV2 behind{lineage.Canonical(0, 99, params, index)};
+    BOOST_CHECK(behind.current_set_hash == lineage.sets[0]->set_hash);
+    BOOST_CHECK(verdict(behind, lineage.context, height, error) ==
+                std::optional<uint8_t>{0});
+
+    // Records that cannot be judged are invalid.
+    const auto refused = [&](const bridge::VerifierStateV2& state,
+                             const node::BridgeV2LineageContext& context,
+                             const int at, const std::string& expected) {
+        std::string why;
+        BOOST_CHECK(!verdict(state, context, at, why));
+        BOOST_CHECK_MESSAGE(why.find(expected) != std::string::npos,
+                            "'" << why << "' lacks '" << expected << "'");
+    };
+    v = canonical;
+    v.current_epoch = 2;
+    refused(v, lineage.context, height, "neither the lineage epoch nor the one before it");
+    {
+        const LineageFixture later{3};
+        refused(canonical, later.context, height,
+                "neither the lineage epoch nor the one before it");
+    }
+    refused(canonical, lineage.context, 109, "above the parent block");
+    {
+        LineageFixture broken;
+        broken.Fresh().lineage_broken = true;
+        refused(canonical, broken.context, height, "broken fresh lineage");
+        LineageFixture unbootstrapped;
+        unbootstrapped.Fresh().bootstrapped = false;
+        refused(canonical, unbootstrapped.context, height, "bootstrapped fresh lineage");
+        refused(canonical, node::BridgeV2LineageContext{}, height,
+                "bootstrapped fresh lineage");
+    }
+    // At or above V the statement carries the indexed withdrawal root, so a
+    // checkpoint the index has not connected cannot be judged.
+    {
+        bridge::VerifierStateV2 future{canonical};
+        future.latest_height = 119;
+        future.latest_index = 3;
+        refused(future, lineage.context, 125,
+                "B3 cannot form its statement at the verifier's latest checkpoint");
+    }
+
+    // Through the index: the record's verdict must equal B3's.
+    world.SetVerifier(canonical);
+    node::BridgeStateIndex judged{ObservationIndex(params, world.StateRoot())};
+    const uint256 anchor{AnchorHash(800)};
+    VerifyFails(judged, Block(1'060, {Observe(world, SUBJECT_VERIFIER, anchor, VERDICT_SETS)}),
+                height, params, "verdict does not match B3's lineage",
+                &lineage.context);
+    VerifyFails(judged, Block(1'060, {Observe(world, SUBJECT_VERIFIER, anchor)}),
+                height, params, "verdict cannot be judged here");
+    {
+        LineageFixture later{3};
+        VerifyFails(judged, Block(1'060, {Observe(world, SUBJECT_VERIFIER, anchor)}),
+                    height, params, "neither the lineage epoch nor the one before it",
+                    &later.context);
+    }
+    ConnectNext(judged, params, {Observe(world, SUBJECT_VERIFIER, anchor)}, 1'060,
+                &lineage.context);
+    BOOST_CHECK_EQUAL(judged.LatestObservationV2(SUBJECT_VERIFIER)->verdict, 0);
+    BOOST_CHECK(!judged.ConflictV2());
+
+    // A recorded SETS_MISMATCH is accepted when B3 computes it (no
+    // conflict: E4 closes the gate, nothing sticks).
+    bridge_test::ObservationWorld mismatched{world};
+    bridge::VerifierStateV2 other{canonical};
+    other.next_set_hash = TestHash(0x5e);
+    mismatched.SetVerifier(other);
+    SeedStateAnchorsV2(judged, {StateAnchor(801, 1'010, mismatched.StateRoot())});
+    const int next{judged.ConnectedHeight() + 1};
+    VerifyFails(judged, Block(1'061, {Observe(mismatched, SUBJECT_VERIFIER, AnchorHash(801))}),
+                next, params, "verdict does not match B3's lineage", &lineage.context);
+    ConnectNext(judged, params,
+                {Observe(mismatched, SUBJECT_VERIFIER, AnchorHash(801), VERDICT_SETS)},
+                1'061, &lineage.context);
+    BOOST_CHECK_EQUAL(judged.LatestObservationV2(SUBJECT_VERIFIER)->verdict, VERDICT_SETS);
+    BOOST_CHECK(!judged.ConflictV2());
+
+    // A verifier that is not LIVE records verdict 0, judged or not.
+    bridge_test::ObservationWorld cancelled{world};
+    bridge::VerifierStateV2 gone{canonical};
+    gone.status = bridge::VERIFIER_STATUS_CANCELLED;
+    cancelled.SetVerifier(gone);
+    SeedStateAnchorsV2(judged, {StateAnchor(802, 1'020, cancelled.StateRoot())});
+    const int after{judged.ConnectedHeight() + 1};
+    VerifyFails(judged, Block(1'062, {Observe(cancelled, SUBJECT_VERIFIER, AnchorHash(802), VERDICT_CERT)}),
+                after, params, "verdict must be zero for a verifier that is not LIVE",
+                &node::REPLAY_LINEAGE);
+    ConnectNext(judged, params, {Observe(cancelled, SUBJECT_VERIFIER, AnchorHash(802))}, 1'062);
+    BOOST_CHECK_EQUAL(std::get<bridge::VerifierStateV2>(
+                          judged.LatestObservationV2(SUBJECT_VERIFIER)->state)
+                          .status,
+                      bridge::VERIFIER_STATUS_CANCELLED);
+}
+
+BOOST_AUTO_TEST_CASE(v2_replay_trusts_recorded_verdicts)
+{
+    // A LIVE VERIFIER_E whose latestCertId matches B3 but whose record says
+    // CERT_CONFLICT: a full context refuses it, no context refuses it, and
+    // only replay (which trusts what ConnectBlock already judged) applies
+    // the recorded byte, sticky conflict included.
+    const Consensus::Params params{LineageParams()};
+    const LineageFixture lineage;
+    bridge_test::ObservationWorld world{HealthyWorld(params)};
+    node::BridgeStateIndex probe{ObservationIndex(params, world.StateRoot())};
+    world.SetVerifier(lineage.Canonical(1, 109, params, probe));
+    node::BridgeStateIndex index{ObservationIndex(params, world.StateRoot())};
+    const CTransactionRef record{
+        Observe(world, SUBJECT_VERIFIER, AnchorHash(800), VERDICT_CERT)};
+    VerifyFails(index, Block(1'060, {record}), BRIDGE_V2_HEIGHT, params,
+                "verdict does not match B3's lineage", &lineage.context);
+    VerifyFails(index, Block(1'060, {record}), BRIDGE_V2_HEIGHT, params,
+                "verdict cannot be judged here");
+    const node::BridgeBlockDelta delta{
+        ConnectNext(index, params, {record}, 1'060, &node::REPLAY_LINEAGE)};
+    BOOST_CHECK_EQUAL(index.LatestObservationV2(SUBJECT_VERIFIER)->verdict, VERDICT_CERT);
+    BOOST_REQUIRE(index.ConflictV2());
+    BOOST_CHECK(*index.ConflictV2() ==
+                (node::BridgeV2Conflict{bridge::BRIDGE_V2_CONFLICT_E5, BRIDGE_V2_HEIGHT,
+                                        V2TestBlockHash(BRIDGE_V2_HEIGHT), 800}));
+    BOOST_CHECK(!delta.conflict_v2_before);
+    BOOST_CHECK(delta.conflict_v2_after == index.ConflictV2());
+}
+
+BOOST_AUTO_TEST_CASE(v2_sticky_conflict)
+{
+    const Consensus::Params params{LineageParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{FundingReceipts(params)};
+    // E5: a LIVE verifier whose latestCertId is not B3's certificate.
+    bridge_test::ObservationWorld world{HealthyWorld(params, 2, 100)};
+    node::BridgeStateIndex probe{FundingIndex(params, receipts, world.StateRoot())};
+    const bridge::VerifierStateV2 canonical{lineage.Canonical(1, 109, params, probe)};
+    bridge::VerifierStateV2 forged{canonical};
+    forged.latest_cert_id = TestHash(0x66);
+    world.SetVerifier(forged);
+    node::BridgeStateIndex index{FundingIndex(params, receipts, world.StateRoot())};
+    VerifyFails(index, Block(1'060, {Observe(world, SUBJECT_VERIFIER, receipts.block_hash)}),
+                BRIDGE_V2_HEIGHT, params, "verdict does not match B3's lineage",
+                &lineage.context);
+    const node::BridgeBlockDelta setting{ConnectNext(
+        index, params, {Observe(world, SUBJECT_VERIFIER, receipts.block_hash, VERDICT_CERT)},
+        1'060, &lineage.context)};
+    const node::BridgeV2Conflict e5{bridge::BRIDGE_V2_CONFLICT_E5, BRIDGE_V2_HEIGHT,
+                                    V2TestBlockHash(BRIDGE_V2_HEIGHT), 700};
+    BOOST_REQUIRE(index.ConflictV2());
+    BOOST_CHECK(*index.ConflictV2() == e5);
+    BOOST_CHECK(setting.conflict_v2_after == std::optional<node::BridgeV2Conflict>{e5});
+    // The gate stays closed at C4 whatever follows.
+    BOOST_CHECK(node::EvaluateBridgeV2BurnGate(&lineage.context, index, params,
+                                               BRIDGE_V2_HEIGHT + 1, 1'061)
+                    .row == bridge::BurnGateRowV2::C4);
+
+    // A later good VERIFIER_E and a later E8 failure leave it as it is.
+    bridge_test::ObservationWorld good{world};
+    good.SetVerifier(canonical);
+    good.SetReserve(2, 0, 0, 0); // locked 0 < 100 proven below the cut
+    SeedStateAnchorsV2(index, {StateAnchor(701, 1'010, good.StateRoot())});
+    ConnectNext(index, params,
+                {MintTransactionV2(params, receipts, 0, 60)}, 1'061);
+    ConnectNext(index, params,
+                {MintTransactionV2(params, receipts, 1, 40),
+                 Observe(good, SUBJECT_VERIFIER, AnchorHash(701)),
+                 Observe(good, SUBJECT_RESERVE, AnchorHash(701))},
+                1'062, &lineage.context);
+    BOOST_CHECK_EQUAL(index.LatestObservationV2(SUBJECT_VERIFIER)->verdict, 0);
+    BOOST_CHECK(index.ConflictV2() == std::optional<node::BridgeV2Conflict>{e5});
+    const node::BridgeBlockDelta last{index.History().back()};
+    BOOST_CHECK(last.conflict_v2_before == last.conflict_v2_after);
+    // Undo above the setting block keeps it; undoing that block clears it.
+    Disconnect(index);
+    Disconnect(index);
+    Disconnect(index);
+    BOOST_CHECK(index.ConflictV2() == std::optional<node::BridgeV2Conflict>{e5});
+    Disconnect(index);
+    BOOST_CHECK(!index.ConflictV2());
+    BOOST_CHECK(index.ObservationsV2() == node::BridgeObservationSlotsV2{});
+
+    // E8: proven deposits below the observed cut exceed locked. The record
+    // still connects (it is a true observation) and its block sets the
+    // conflict.
+    bridge_test::ObservationWorld drained{HealthyWorld(params, 2, 100)};
+    drained.SetReserve(2, 99, 0, 99);
+    node::BridgeStateIndex vault{FundingIndex(params, receipts, drained.StateRoot())};
+    ConnectNext(vault, params, {MintTransactionV2(params, receipts, 0, 60)});
+    ConnectNext(vault, params, {MintTransactionV2(params, receipts, 1, 40)}, 1'061);
+    BOOST_CHECK(vault.ProvenDepositsV2() ==
+                (bridge::ProvenDepositMapV2{{0, 60}, {1, 40}}));
+    const node::BridgeBlockDelta e8_delta{ConnectNext(
+        vault, params, {Observe(drained, SUBJECT_RESERVE, receipts.block_hash)}, 1'062)};
+    const node::BridgeV2Conflict e8{bridge::BRIDGE_V2_CONFLICT_E8, BRIDGE_V2_HEIGHT + 2,
+                                    V2TestBlockHash(BRIDGE_V2_HEIGHT + 2), 700};
+    BOOST_CHECK(vault.ConflictV2() == std::optional<node::BridgeV2Conflict>{e8});
+    BOOST_CHECK(e8_delta.conflict_v2_after == std::optional<node::BridgeV2Conflict>{e8});
+    BOOST_CHECK(vault.LatestObservationV2(SUBJECT_RESERVE));
+    Disconnect(vault);
+    BOOST_CHECK(!vault.ConflictV2());
+    // The honest vault (locked 100) holds invariant R.
+    bridge_test::ObservationWorld honest{HealthyWorld(params, 2, 100)};
+    node::BridgeStateIndex honest_vault{FundingIndex(params, receipts, honest.StateRoot())};
+    ConnectNext(honest_vault, params, {MintTransactionV2(params, receipts, 0, 60)});
+    ConnectNext(honest_vault, params, {MintTransactionV2(params, receipts, 1, 40),
+                                       Observe(honest, SUBJECT_RESERVE, receipts.block_hash)},
+                1'061);
+    BOOST_CHECK(!honest_vault.ConflictV2());
+}
+
+BOOST_AUTO_TEST_CASE(v2_reserve_ledger_mints_and_burns)
+{
+    // Checks 2 and 3 of node changes section 7.2 through real V2 mints and
+    // burns. Deposits 0, 1, 2 of 60, 40, 30 are in one receipt; the first
+    // RESERVE_E sees the vault after deposits 0 and 1 (cut 2, locked 100)
+    // with a USDT balance of only 80, so margin_v = ceil(80 * 10%) = 8.
+    const Consensus::Params params{V2Params()};
+    const ReceiptFixture receipts{FundingReceipts(params)};
+    bridge_test::ObservationWorld world{HealthyWorld(params, 2, 100)};
+    world.SetReserve(2, 100, 0, 80);
+    node::BridgeStateIndex index{FundingIndex(params, receipts, world.StateRoot())};
+
+    const node::BridgeBlockDelta first_mint{
+        ConnectNext(index, params, {MintTransactionV2(params, receipts, 0, 60)})};
+    BOOST_CHECK_EQUAL(first_mint.reserve_v2_before.minted, 0);
+    BOOST_CHECK_EQUAL(first_mint.reserve_v2_after.minted, 60);
+    BOOST_CHECK(first_mint.deposits_v2_added ==
+                (std::vector<node::BridgeProvenDepositV2>{{0, 60}}));
+    ConnectNext(index, params, {MintTransactionV2(params, receipts, 1, 40)}, 1'061);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().minted, 100);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().Reserve().value_or(-1), 100);
+    BOOST_CHECK(index.ProvenDepositsV2() ==
+                (bridge::ProvenDepositMapV2{{0, 60}, {1, 40}}));
+    BOOST_CHECK_EQUAL(index.ProvenDepositsTotalV2(), 100);
+    BOOST_CHECK(index.ProvenDepositSumsAtV2(1) ==
+                (std::optional<bridge::ProvenDepositSumsV2>{{1, 60, 40}}));
+
+    // Check 3 needs a RESERVE_E observation.
+    const auto burn = [&params](const uint8_t source, const CAmount amount) {
+        return BurnTransactionV2(params, source, amount, 0x90);
+    };
+    int next{index.ConnectedHeight() + 1};
+    VerifyFails(index, Block(1'062, {burn(1, 10)}), next, params,
+                "bridge V2 burn has no reserve observation");
+    ConnectNext(index, params, {Observe(world, SUBJECT_RESERVE, receipts.block_hash)}, 1'062);
+    BOOST_CHECK(!index.ConflictV2());
+
+    // Headroom = B + P_post - margin - unreleased = 80 + 0 - 8 - 0 = 72.
+    next = index.ConnectedHeight() + 1;
+    VerifyFails(index, Block(1'063, {burn(2, 101)}), next, params,
+                "exceeds the vault entry's reserve");
+    VerifyFails(index, Block(1'063, {burn(2, 73)}), next, params,
+                "exceeds the wind-down bound");
+    {
+        node::BridgeTxAuthorization authorization;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyTransaction(*burn(2, 72), next, 1'063,
+                                                    params, authorization, error),
+                            error);
+    }
+    // Earlier burns of the block count.
+    VerifyFails(index, Block(1'063, {burn(2, 50), burn(3, 23)}), next, params,
+                "exceeds the wind-down bound");
+    {
+        std::string error;
+        auto preview{index.BeginBlockPreview(next, 1'063, TestHash(97), params, error)};
+        BOOST_REQUIRE_MESSAGE(preview, error);
+        const std::array<CTransactionRef, 1> fifty{burn(2, 50)};
+        const std::array<CTransactionRef, 1> twenty_three{burn(3, 23)};
+        const std::array<CTransactionRef, 1> twenty_two{burn(4, 22)};
+        BOOST_REQUIRE_MESSAGE(preview->TryAppend(fifty, error), error);
+        BOOST_CHECK(!preview->TryAppend(twenty_three, error));
+        BOOST_CHECK(error.find("wind-down") != std::string::npos);
+        BOOST_CHECK_MESSAGE(preview->TryAppend(twenty_two, error), error);
+    }
+    const node::BridgeBlockDelta burns{
+        ConnectNext(index, params, {burn(2, 50), burn(4, 22)}, 1'063)};
+    BOOST_CHECK_EQUAL(burns.reserve_v2_before.burned, 0);
+    BOOST_CHECK_EQUAL(burns.reserve_v2_after.burned, 72);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().Reserve().value_or(-1), 28);
+
+    // The vault releases the 72: locked 28, balance 28. R_v = 100 - 28 = 72
+    // covers the burns, margin is 0 (B >= L), so the bound is the reserve.
+    world.SetReserve(2, 28, 0, 28);
+    SeedStateAnchorsV2(index, {StateAnchor(701, 1'010, world.StateRoot())});
+    ConnectNext(index, params, {Observe(world, SUBJECT_RESERVE, AnchorHash(701))}, 1'064);
+    BOOST_CHECK(!index.ConflictV2());
+    next = index.ConnectedHeight() + 1;
+    VerifyFails(index, Block(1'065, {burn(5, 29)}), next, params,
+                "exceeds the vault entry's reserve");
+    // A deposit proven at or above the cut in the same block redeems at
+    // once: P_post = 30 lifts both the reserve and the observed balance.
+    VerifyFails(index, Block(1'065, {burn(5, 58), MintTransactionV2(params, receipts, 2, 30)}),
+                next, params, "exceeds the vault entry's reserve");
+    const node::BridgeBlockDelta redeemed{ConnectNext(
+        index, params, {MintTransactionV2(params, receipts, 2, 30), burn(5, 58)}, 1'065)};
+    BOOST_CHECK(redeemed.deposits_v2_added ==
+                (std::vector<node::BridgeProvenDepositV2>{{2, 30}}));
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().minted, 130);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().burned, 130);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().Reserve().value_or(-1), 0);
+    BOOST_REQUIRE_EQUAL(index.WithdrawalV2Count(), 3U);
+    VerifyFails(index, Block(1'066, {burn(6, 1)}), index.ConnectedHeight() + 1, params,
+                "exceeds the vault entry's reserve");
+
+    // Undo restores the ledger, the deposit index and its total exactly.
+    BOOST_CHECK_EQUAL(index.ProvenDepositsTotalV2(), 130);
+    Disconnect(index);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().minted, 100);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().burned, 72);
+    BOOST_CHECK(!index.ProvenDepositsV2().contains(2));
+    BOOST_CHECK_EQUAL(index.ProvenDepositsTotalV2(), 100);
+    Disconnect(index);
+    Disconnect(index);
+    Disconnect(index);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().burned, 0);
+    BOOST_CHECK_EQUAL(index.WithdrawalV2Count(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(v2_transit_credited_on_proven_arrival)
+{
+    // Section 7.6 accounting on a ledger seeded with 50 in transit (the
+    // migration leaf that creates transit is a later slice): nothing is
+    // credited before Ethereum's absorbedTotal counts it, the credit never
+    // exceeds it or the transit, and invariant R counts only credited
+    // amounts.
+    const Consensus::Params params{V2Params()};
+    bridge_test::ObservationWorld world{HealthyWorld(params, 1, 100)};
+    node::BridgeStateIndex index{ObservationIndex(params, world.StateRoot())};
+    bridge::ReserveLedgerV2 seeded;
+    seeded.minted = 100;
+    seeded.transit = 50;
+    node::BridgeStateIndexTestAccess::SeedReserve(index, seeded, {{0, 100}});
+
+    // Anchored before absorb(): absorbedTotal 0 credits nothing; R holds
+    // (locked 100 >= P 100 + C 0).
+    const node::BridgeBlockDelta before_absorb{ConnectNext(
+        index, params, {Observe(world, SUBJECT_RESERVE, AnchorHash(800))})};
+    BOOST_CHECK(before_absorb.reserve_v2_after == seeded);
+    BOOST_CHECK(!index.ConflictV2());
+
+    // absorb() counted 30: 30 moves to credited; locked grew to 130.
+    world.SetReserve(1, 130, 30, 130);
+    SeedStateAnchorsV2(index, {StateAnchor(801, 1'010, world.StateRoot())});
+    ConnectNext(index, params, {Observe(world, SUBJECT_RESERVE, AnchorHash(801))}, 1'061);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().credited, 30);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().transit, 20);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().Reserve().value_or(-1), 130);
+    BOOST_CHECK(!index.ConflictV2());
+
+    // absorbedTotal 80 (strays absorbed too): only the 20 left in transit
+    // moves, so credited stops at 50 < 80.
+    world.SetReserve(1, 180, 80, 180);
+    SeedStateAnchorsV2(index, {StateAnchor(802, 1'020, world.StateRoot())});
+    ConnectNext(index, params, {Observe(world, SUBJECT_RESERVE, AnchorHash(802))}, 1'062);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().credited, 50);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().transit, 0);
+    BOOST_CHECK(!index.ConflictV2());
+
+    // locked below P + C - burned (100 + 50 - 0) fails invariant R: E8.
+    world.SetReserve(1, 149, 80, 149);
+    SeedStateAnchorsV2(index, {StateAnchor(803, 1'030, world.StateRoot())});
+    ConnectNext(index, params, {Observe(world, SUBJECT_RESERVE, AnchorHash(803))}, 1'063);
+    BOOST_REQUIRE(index.ConflictV2());
+    BOOST_CHECK_EQUAL(index.ConflictV2()->reason, bridge::BRIDGE_V2_CONFLICT_E8);
+    BOOST_CHECK_EQUAL(index.ConflictV2()->anchor_block, 803U);
+
+    // Undo walks the credits back.
+    Disconnect(index);
+    Disconnect(index);
+    Disconnect(index);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().credited, 30);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().transit, 20);
+    Disconnect(index);
+    Disconnect(index);
+    BOOST_CHECK(index.ReserveLedgerV2() == seeded);
+}
+
+BOOST_AUTO_TEST_CASE(v2_burn_gate_per_burn_in_block)
+{
+    // Check 4 per record (node changes section 7.2): with a full context,
+    // block validation and the block preview evaluate the burn gate again at
+    // each burn, on the observations and sticky conflict after the block's
+    // earlier records. A RESERVE_E failing invariant R or a TOKEN_FLAGS
+    // showing a paused token earlier in the block refuses every later burn;
+    // the same burn before the record passes.
+    const Consensus::Params params{LineageParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{FundingReceipts(params)};
+    bridge_test::ObservationWorld world{HealthyWorld(params, 2, 100)};
+    node::BridgeStateIndex probe{FundingIndex(params, receipts, world.StateRoot())};
+    world.SetVerifier(lineage.Canonical(1, 109, params, probe));
+    node::BridgeStateIndex index{FundingIndex(params, receipts, world.StateRoot())};
+    ConnectNext(index, params, {MintTransactionV2(params, receipts, 0, 60)});
+    ConnectNext(index, params,
+                {MintTransactionV2(params, receipts, 1, 40),
+                 Observe(world, SUBJECT_TOKEN, receipts.block_hash),
+                 Observe(world, SUBJECT_RESERVE, receipts.block_hash),
+                 Observe(world, SUBJECT_VERIFIER, receipts.block_hash)},
+                1'061, &lineage.context);
+    // Anchor 701: a drained vault (locked 25 < 100 proven below the cut).
+    // Anchor 702: a paused token.
+    bridge_test::ObservationWorld drained{world};
+    drained.SetReserve(2, 25, 0, 25);
+    bridge_test::ObservationWorld paused{world};
+    paused.SetTokenFlags(true, false, false);
+    SeedStateAnchorsV2(index, {StateAnchor(701, 1'010, drained.StateRoot()),
+                               StateAnchor(702, 1'020, paused.StateRoot())});
+    const int next{index.ConnectedHeight() + 1};
+    BOOST_REQUIRE(node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, next, 1'063).readiness ==
+                  node::BridgeBurnReadiness::READY);
+
+    const CTransactionRef burn{BurnTransactionV2(params, 1, 10, 0x91)};
+    const CTransactionRef drain{Observe(drained, SUBJECT_RESERVE, AnchorHash(701))};
+    const CTransactionRef pause{Observe(paused, SUBJECT_TOKEN, AnchorHash(702))};
+    const auto verifies{[&](const std::vector<CTransactionRef>& txs,
+                            const node::BridgeV2LineageContext* context) {
+        node::BridgeBlockDelta delta;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyBlock(Block(1'063, txs), next, V2TestBlockHash(next), params, delta,
+                                              error, context),
+                            error);
+        return delta;
+    }};
+    const std::string c4{"bridge V2 burn gate is not ready at the burn: C4: sticky E8 conflict: the vault failed invariant R"};
+    const std::string e7{"bridge V2 burn gate is not ready at the burn: E7: token is paused"};
+
+    // Alone, the burn passes the gate at its position and both bounds.
+    BOOST_CHECK_EQUAL(verifies({burn}, &lineage.context).withdrawals_v2_added.size(), 1U);
+    // After the record the burn is refused...
+    VerifyFails(index, Block(1'063, {drain, burn}), next, params, c4, &lineage.context);
+    VerifyFails(index, Block(1'063, {pause, burn}), next, params, e7, &lineage.context);
+    VerifyFails(index, Block(1'063, {drain, pause, burn}), next, params, c4, &lineage.context);
+    // ... and before it the burn passes, while the record still sets the
+    // conflict (its invariant R counts the burn: 25 + 10 < 100).
+    {
+        const node::BridgeBlockDelta delta{verifies({burn, drain}, &lineage.context)};
+        BOOST_CHECK_EQUAL(delta.withdrawals_v2_added.size(), 1U);
+        BOOST_REQUIRE(delta.conflict_v2_after);
+        BOOST_CHECK_EQUAL(delta.conflict_v2_after->reason, bridge::BRIDGE_V2_CONFLICT_E8);
+        BOOST_CHECK_EQUAL(verifies({burn, pause}, &lineage.context).withdrawals_v2_added.size(), 1U);
+    }
+    // A record that leaves every row passing does not close the gate: a
+    // second healthy RESERVE_E at anchor 703.
+    {
+        bridge_test::ObservationWorld refreshed{world};
+        refreshed.SetReserve(2, 100, 0, 100);
+        SeedStateAnchorsV2(index, {StateAnchor(703, 1'030, refreshed.StateRoot())});
+        const int later{index.ConnectedHeight() + 1};
+        node::BridgeBlockDelta delta;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyBlock(Block(1'064, {Observe(refreshed, SUBJECT_RESERVE, AnchorHash(703)), burn}),
+                                              later, V2TestBlockHash(later), params, delta, error,
+                                              &lineage.context),
+                            error);
+        BOOST_CHECK(!delta.conflict_v2_after);
+        BOOST_CHECK_EQUAL(delta.withdrawals_v2_added.size(), 1U);
+        Disconnect(index);
+    }
+
+    // Without a context a burn after an observation of its block fails
+    // closed; with no earlier observation the caller's block-level gate
+    // stands. Replay (REPLAY_LINEAGE) skips the per-burn gate: the block
+    // passed it when it first connected.
+    VerifyFails(index, Block(1'063, {pause, burn}), next, params,
+                "bridge V2 burn after a kind 9 observation of the same block needs the fresh lineage context");
+    BOOST_CHECK_EQUAL(verifies({burn}, nullptr).withdrawals_v2_added.size(), 1U);
+    BOOST_CHECK_EQUAL(verifies({pause, burn}, &node::REPLAY_LINEAGE).withdrawals_v2_added.size(), 1U);
+
+    // Block assembly: the preview takes the record and refuses the burn
+    // after it, so the assembler skips the burn.
+    for (const auto& [record, expected] : {std::pair{drain, c4}, std::pair{pause, e7}}) {
+        std::string error;
+        auto preview{index.BeginBlockPreview(next, 1'063, TestHash(98), params, error, &lineage.context)};
+        BOOST_REQUIRE_MESSAGE(preview, error);
+        const std::array<CTransactionRef, 1> record_chunk{record};
+        const std::array<CTransactionRef, 1> burn_chunk{burn};
+        BOOST_REQUIRE_MESSAGE(preview->TryAppend(record_chunk, error), error);
+        BOOST_CHECK(!preview->TryAppend(burn_chunk, error));
+        BOOST_CHECK_MESSAGE(error.find(expected) != std::string::npos, error);
+    }
+    // In the other order the preview takes both.
+    {
+        std::string error;
+        auto preview{index.BeginBlockPreview(next, 1'063, TestHash(99), params, error, &lineage.context)};
+        BOOST_REQUIRE_MESSAGE(preview, error);
+        const std::array<CTransactionRef, 1> burn_chunk{burn};
+        const std::array<CTransactionRef, 1> record_chunk{drain};
+        BOOST_REQUIRE_MESSAGE(preview->TryAppend(burn_chunk, error), error);
+        BOOST_CHECK_MESSAGE(preview->TryAppend(record_chunk, error), error);
+    }
+    // Mempool admission and wallet prevalidation judge one transaction on
+    // the connected state, where the gate is READY.
+    {
+        node::BridgeTxAuthorization authorization;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyTransaction(*burn, next, 1'063, params, authorization, error,
+                                                    &lineage.context),
+                            error);
+        BOOST_CHECK(authorization.withdrawal_v2);
+    }
+    // Once the drained RESERVE_E connects, the block-level gate (C4) and
+    // the per-burn gate refuse every burn.
+    ConnectNext(index, params, {drain}, 1'063, &lineage.context);
+    BOOST_REQUIRE(index.ConflictV2());
+    BOOST_CHECK(node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, next + 1, 1'064).row ==
+                bridge::BurnGateRowV2::C4);
+    VerifyFails(index, Block(1'064, {burn}), next + 1, params, c4, &lineage.context);
+}
+
+BOOST_AUTO_TEST_CASE(v2_incremental_equals_rebuild)
+{
+    // A V2 history with mints, every subject (a LIVE verifier judged by a
+    // full context), burns and an E8 conflict, built incrementally and
+    // rebuilt from scratch as BridgeStateTracker replays it. Every block's
+    // V2 delta and the final accounting agree field for field.
+    const Consensus::Params params{LineageParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{FundingReceipts(params)};
+    bridge_test::ObservationWorld world{HealthyWorld(params, 2, 100)};
+    node::BridgeStateIndex probe{FundingIndex(params, receipts, world.StateRoot())};
+    world.SetVerifier(lineage.Canonical(1, 109, params, probe));
+    node::BridgeStateIndex incremental{
+        FundingIndex(params, receipts, world.StateRoot())};
+    node::BridgeStateIndex rebuilt{FundingIndex(params, receipts, world.StateRoot())};
+
+    // Each step is a block (with the lineage it is judged under) or a seed.
+    struct Step {
+        std::vector<CTransactionRef> block;
+        uint32_t time{0};
+        bool judged{false};
+        std::vector<StateAnchorSpec> anchors{};
+    };
+    // The vault then shows locked 25: 25 + 72 burned < 100 proven below the
+    // cut, so invariant R fails (E8).
+    bridge_test::ObservationWorld later{world};
+    later.SetReserve(2, 25, 0, 25);
+    const std::vector<Step> steps{
+        {{MintTransactionV2(params, receipts, 0, 60)}, 1'060, false},
+        {{MintTransactionV2(params, receipts, 1, 40),
+          Observe(world, SUBJECT_TOKEN, receipts.block_hash),
+          Observe(world, SUBJECT_RESERVE, receipts.block_hash),
+          Observe(world, SUBJECT_VERIFIER, receipts.block_hash)},
+         1'061, true},
+        {{BurnTransactionV2(params, 1, 50, 0x91), BurnTransactionV2(params, 2, 22, 0x92)},
+         1'062, false},
+        {{}, 0, false, {StateAnchor(701, 1'010, later.StateRoot())}},
+        {{Observe(later, SUBJECT_RESERVE, AnchorHash(701)),
+          MintTransactionV2(params, receipts, 2, 30)},
+         1'063, false},
+    };
+    for (const Step& step : steps) {
+        if (!step.anchors.empty()) {
+            const node::BridgeBlockDelta a{SeedStateAnchorsV2(incremental, step.anchors)};
+            const node::BridgeBlockDelta b{SeedStateAnchorsV2(rebuilt, step.anchors)};
+            CheckSameV2Delta(a, b);
+            continue;
+        }
+        const node::BridgeBlockDelta a{ConnectNext(
+            incremental, params, step.block, step.time,
+            step.judged ? &lineage.context : nullptr)};
+        const node::BridgeBlockDelta b{ConnectNext(
+            rebuilt, params, step.block, step.time, &node::REPLAY_LINEAGE)};
+        CheckSameV2Delta(a, b);
+        CheckSameAccounting(incremental, rebuilt);
+    }
+    BOOST_REQUIRE(incremental.ConflictV2());
+    BOOST_CHECK_EQUAL(incremental.ConflictV2()->reason, bridge::BRIDGE_V2_CONFLICT_E8);
+    BOOST_CHECK_EQUAL(incremental.ConflictV2()->anchor_block, 701U);
+    BOOST_CHECK_EQUAL(incremental.ReserveLedgerV2().minted, 130);
+    BOOST_CHECK_EQUAL(incremental.ReserveLedgerV2().burned, 72);
+    BOOST_CHECK_EQUAL(incremental.ProvenDepositsV2().size(), 3U);
+    BOOST_CHECK(incremental.LatestObservationV2(SUBJECT_VERIFIER));
+    BOOST_CHECK(incremental.LatestObservationV2(SUBJECT_TOKEN));
+    BOOST_CHECK_EQUAL(incremental.LatestObservationV2(SUBJECT_RESERVE)->anchor_block, 701U);
+    CheckSameAccounting(incremental, rebuilt);
+
+    // Undo on both sides keeps them equal at every height.
+    while (incremental.ConnectedHeight() >= BRIDGE_V2_HEIGHT) {
+        Disconnect(incremental);
+        Disconnect(rebuilt);
+        CheckSameAccounting(incremental, rebuilt);
+    }
+    BOOST_CHECK(incremental.ReserveLedgerV2() == bridge::ReserveLedgerV2{});
+    BOOST_CHECK(incremental.ProvenDepositsV2().empty());
+    BOOST_CHECK(incremental.ObservationsV2() == node::BridgeObservationSlotsV2{});
 }
 
 BOOST_AUTO_TEST_SUITE_END()

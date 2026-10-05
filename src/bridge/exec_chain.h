@@ -34,12 +34,22 @@ struct ExecAncestor {
     uint64_t block_number{0};
     uint256 block_hash{};
     uint256 receipts_root{};
+    //! The header's stateRoot, the root for EIP-1186 account and storage
+    //! proofs (bridge/state_proof.h). Null when header field [3] is not a
+    //! 32-byte string; such a header still links (V1 parity), but nothing
+    //! can be proven against its state.
+    uint256 state_root{};
 };
 
 namespace exec_detail {
 
 //! Parse the fields we need from a full RLP execution block header:
-//! [0]=parentHash, [5]=receiptsRoot, [8]=number (canonical big-endian).
+//! [0]=parentHash, [3]=stateRoot, [5]=receiptsRoot, [8]=number (canonical
+//! big-endian). parentHash and receiptsRoot must be 32-byte strings.
+//! stateRoot is recorded only when it is a 32-byte string and is otherwise
+//! left null without refusing the header: the V1 ancestry rule never looked
+//! at field [3], and a header is only ever trusted through the keccak link to
+//! a proven block hash, so a genuine header always carries a 32-byte root.
 inline std::optional<ExecAncestor> ParseHeader(std::span<const unsigned char> rlp_bytes,
                                                uint256& parent_out)
 {
@@ -48,6 +58,7 @@ inline std::optional<ExecAncestor> ParseHeader(std::span<const unsigned char> rl
     const auto f{RlpChildren(*top)};
     if (!f || f->size() < 16) return std::nullopt; // post-London headers have >= 16 fields
     const RlpItem& parent{(*f)[0]};
+    const RlpItem& state{(*f)[3]};
     const RlpItem& receipts{(*f)[5]};
     const RlpItem& number{(*f)[8]};
     if (parent.is_list || parent.payload.size() != 32) return std::nullopt;
@@ -56,6 +67,9 @@ inline std::optional<ExecAncestor> ParseHeader(std::span<const unsigned char> rl
     if (!number.payload.empty() && number.payload[0] == 0x00) return std::nullopt;
     ExecAncestor out;
     parent_out = uint256{std::span<const unsigned char>{parent.payload}};
+    if (!state.is_list && state.payload.size() == 32) {
+        out.state_root = uint256{std::span<const unsigned char>{state.payload}};
+    }
     out.receipts_root = uint256{std::span<const unsigned char>{receipts.payload}};
     for (unsigned char b : number.payload) out.block_number = (out.block_number << 8) | b;
     uint256 h;

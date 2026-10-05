@@ -44,6 +44,7 @@ add_executable(test_bitcoin
   bridge_admission_tests.cpp
   bridge_asset_vector_tests.cpp
   bridge_bootstrap_proof_tests.cpp
+  bridge_burn_gate_v2_tests.cpp
   bridge_params_tests.cpp
   bridge_deposit_tests.cpp
   bridge_eth_light_client_tests.cpp
@@ -53,6 +54,8 @@ add_executable(test_bitcoin
   bridge_proof_tests.cpp
   bridge_regtest_beacon_tests.cpp
   bridge_regtest_pins_tests.cpp
+  bridge_state_observation_tests.cpp
+  bridge_state_proof_tests.cpp
   bridge_state_tests.cpp
   bridge_v2_gate_tests.cpp
   bridge_v2_tests.cpp

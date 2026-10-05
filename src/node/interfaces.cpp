@@ -976,25 +976,55 @@ public:
         }
 
         // From the bridge V2 height every BRIDGE_BURN is a V2 burn: the
-        // mempool's W2 check and TEMPORARY V2 gate (validation.cpp) replace
-        // the V1 withdrawal height and V1 committee readiness.
+        // mempool's W2 check and V2 burn gate (validation.cpp) replace the
+        // V1 withdrawal height and V1 committee readiness.
         const bool bridge_v2{consensus.BridgeV2RulesActive(expected_next_height)};
-        if (bridge_v2 && HasDecentralizedBridgeBurn(tx)) {
-            if (!consensus.BridgeV2BurnRulesActive(expected_next_height)) {
-                error = "Bridge V2 withdrawals are disabled for the next block";
-                return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
-            }
-            std::string not_ready_reason;
-            const BridgeBurnReadiness readiness{ProjectedBridgeV2BurnReadiness(
+        const int64_t candidate_time{
+            std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
+        const bool bridge_v2_burn{bridge_v2 && HasDecentralizedBridgeBurn(tx)};
+        if (bridge_v2_burn &&
+            !consensus.BridgeV2BurnRulesActive(expected_next_height)) {
+            error = "Bridge V2 withdrawals are disabled for the next block";
+            return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
+        }
+        // The fresh lineage projected for the next block, as mempool
+        // admission builds it: the V2 burn gate and kind 9 VERIFIER_E
+        // verdicts are judged on it.
+        std::optional<BridgeV2LineageContext> lineage;
+        if (bridge_v2_burn || (bridge_v2 && HasBridgeV2Observation(tx))) {
+            std::string lineage_reason;
+            lineage = MakeBridgeV2LineageContext(
                 chainstate.ModernFinality(), chainstate.m_chain,
                 chainstate.m_blockman, consensus, *tip, tracker.Index(),
-                not_ready_reason)};
-            if (readiness == BridgeBurnReadiness::UNAVAILABLE) {
-                error = "Bridge V2 withdrawal readiness is unavailable at the active tip";
+                lineage_reason);
+            if (!lineage) {
+                error = "The bridge V2 finality lineage is unavailable at the active tip: " +
+                        lineage_reason;
                 return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
             }
-            if (!CheckBridgeV2BurnReadiness(tx, readiness, error)) {
-                if (!not_ready_reason.empty()) error += ": " + not_ready_reason;
+        }
+        if (bridge_v2_burn) {
+            const BridgeV2GateResult gate{EvaluateBridgeV2BurnGate(
+                &*lineage, tracker.Index(), consensus, expected_next_height,
+                candidate_time)};
+            if (gate.readiness == BridgeBurnReadiness::UNAVAILABLE) {
+                error = "Bridge V2 withdrawal readiness is unavailable at the active tip: " +
+                        gate.reason;
+                return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
+            }
+            if (!CheckBridgeV2BurnReadiness(tx, gate.readiness, error)) {
+                error += ": " + gate.Describe();
+                return interfaces::BridgePrevalidationResult::REJECTED;
+            }
+            // The mempool's close margin (validation.cpp): a burn whose gate
+            // closes within it would be refused on broadcast.
+            const int64_t close_margin{
+                consensus.bridge_v2->gate.mempool_close_margin_seconds};
+            if (gate.closes_at && *gate.closes_at - gate.now_eff <= close_margin) {
+                error = strprintf(
+                    "Bridge V2 burn gate closes at %d, within the %d s mempool margin of %d; "
+                    "submit fresh bridge observations first",
+                    *gate.closes_at, close_margin, gate.now_eff);
                 return interfaces::BridgePrevalidationResult::REJECTED;
             }
         }
@@ -1028,11 +1058,9 @@ public:
             }
         }
 
-        const int64_t candidate_time{
-            std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
         if (!tracker.Index().VerifyTransaction(
                 tx, expected_next_height, candidate_time, consensus,
-                authorization, error)) {
+                authorization, error, lineage ? &*lineage : nullptr)) {
             if (error.empty()) error = "Bridge transaction prevalidation failed";
             return interfaces::BridgePrevalidationResult::REJECTED;
         }

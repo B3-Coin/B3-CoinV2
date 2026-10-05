@@ -459,6 +459,18 @@ struct BridgeV2VaultEntry {
  * weight bounds are the verifier's immutable bridge-authorizing interval, in
  * the units of BridgeDecentralizedWithdrawalPins. The code hash carries the
  * vault's OI-3 caveat.
+ *
+ * `max_epoch_lag_seconds` mirrors the verifier's immutable MAX_EPOCH_LAG,
+ * the window after a rotation in which it still accepts a root (its set
+ * expiry). The burn gate's C1 impairment and E2 rotation age read the B3
+ * side's set_expiry_seconds, so BridgeV2Params::Valid() requires the two to
+ * be equal whenever the mirror is pinned: a verifier deployed with a
+ * shorter window would otherwise see B3 keep burns open after it can no
+ * longer accept a covering root. The value is a deployment parameter known
+ * before the fresh lineage starts (unlike the code hash, OI-3), so the
+ * regtest pin file may carry it (`verifier_max_epoch_lag`); Ethereum
+ * mainnet requires it (a stage S7 pin gate). It equals a registry-id field
+ * (set_expiry) and so adds nothing to BridgeRegistryIdV2.
  */
 struct BridgeV2VerifierPins {
     BridgeEthAddress address{};
@@ -466,6 +478,7 @@ struct BridgeV2VerifierPins {
     uint32_t min_bridge_validators{0};
     uint32_t max_bridge_validators{0};
     uint64_t min_bridge_total_weight{0};
+    std::optional<int64_t> max_epoch_lag_seconds{};
 
     bool Valid() const
     {
@@ -474,8 +487,77 @@ struct BridgeV2VerifierPins {
                min_bridge_validators >= MIN_BRIDGE_VALIDATORS_V1 &&
                max_bridge_validators >= min_bridge_validators &&
                max_bridge_validators <= MAX_PROVEN_BRIDGE_VALIDATORS_V1 &&
-               min_bridge_total_weight > 0;
+               min_bridge_total_weight > 0 &&
+               (!max_epoch_lag_seconds || *max_epoch_lag_seconds > 0);
     }
+};
+
+/**
+ * Burn liveness gate thresholds (node changes sections 8.4 and 8.6; B-13).
+ * The defaults are profile M, the mainnet values: `set_expiry_seconds`,
+ * `release_margin_seconds` and `burn_margin_seconds` mirror the verifier's
+ * windows, so E2 closes burns once a rotation is older than
+ * RotationAgeLimit() (30 d - 7 d - 1 d = 1,900,800 s). Observations older
+ * than `observation_max_age_seconds` fail E1, E7 and E8; `max_epoch_gap`
+ * bounds E3 and `max_finality_lag_blocks` C3. `wind_down_margin_ppm` is
+ * margin_v of node changes section 7.2 check 3 while the observed USDT
+ * balance is below `locked` (zero margin otherwise).
+ *
+ * `mempool_close_margin_seconds` is policy only (the mempool refuses a burn
+ * whose gate closes within it); every other field is consensus, and only
+ * the consensus fields enter the registry id V2.
+ */
+struct BridgeV2GateParams {
+    int64_t set_expiry_seconds{2'592'000};
+    int64_t release_margin_seconds{604'800};
+    int64_t burn_margin_seconds{86'400};
+    int64_t observation_max_age_seconds{172'800};
+    uint32_t max_epoch_gap{2};
+    int32_t max_finality_lag_blocks{90};
+    uint32_t wind_down_margin_ppm{100'000};
+    int64_t mempool_close_margin_seconds{3'600}; // policy only
+
+    //! E2's bound: set_expiry - release_margin - burn_margin. Positive
+    //! whenever Valid().
+    int64_t RotationAgeLimit() const
+    {
+        return set_expiry_seconds - release_margin_seconds - burn_margin_seconds;
+    }
+
+    //! Every time value positive, ppm at most 1e6, a positive lag, and
+    //! set_expiry > release_margin + burn_margin (node changes section 3.4
+    //! assertion 5), evaluated without overflow.
+    bool Valid() const
+    {
+        return set_expiry_seconds > 0 && release_margin_seconds > 0 &&
+               burn_margin_seconds > 0 && observation_max_age_seconds > 0 &&
+               mempool_close_margin_seconds > 0 &&
+               wind_down_margin_ppm <= 1'000'000 &&
+               max_finality_lag_blocks > 0 &&
+               release_margin_seconds < set_expiry_seconds &&
+               burn_margin_seconds < set_expiry_seconds - release_margin_seconds;
+    }
+
+    /**
+     * Regtest profile R (regtest plan section 3.3 item 2): every time value
+     * divided by 36, a mainnet day to one 2,400 s regtest epoch, and
+     * max_finality_lag_blocks 30 (about three regtest t_fin). The epoch gap
+     * and the wind-down margin are not times and keep profile M's values.
+     */
+    static BridgeV2GateParams RegtestProfileR()
+    {
+        BridgeV2GateParams profile;
+        profile.set_expiry_seconds /= 36;           // 72,000
+        profile.release_margin_seconds /= 36;       // 16,800
+        profile.burn_margin_seconds /= 36;          // 2,400
+        profile.observation_max_age_seconds /= 36;  // 4,800
+        profile.mempool_close_margin_seconds /= 36; // 100
+        profile.max_finality_lag_blocks = 30;
+        return profile;
+    }
+
+    friend bool operator==(const BridgeV2GateParams&,
+                           const BridgeV2GateParams&) = default;
 };
 
 /**
@@ -490,25 +572,35 @@ struct BridgeV2Params {
     EthereumLightClientPins light_client{};
     BridgeV2VerifierPins verifier{};
     BridgeV2VaultEntry vault{};
+    BridgeV2GateParams gate{};
 
     bool Valid() const
     {
         if (activation_height < 1 || burn_height < activation_height ||
             !light_client.Valid() || !vault.Valid() || !verifier.Valid() ||
+            !gate.Valid() ||
             verifier.address == vault.vault_address ||
             verifier.address == vault.token_address) {
+            return false;
+        }
+        // The gate's set expiry must be the verifier's own window
+        // (BridgeV2VerifierPins::max_epoch_lag_seconds).
+        if (verifier.max_epoch_lag_seconds &&
+            *verifier.max_epoch_lag_seconds != gate.set_expiry_seconds) {
             return false;
         }
         // As BridgeMintParamsReady: an Ethereum-mainnet entry is exactly
         // USDT under the mainnet beacon root, so a testnet light client
         // copied with chain id 1 fails closed. Mainnet also needs both
-        // code-hash pins (node changes section 3.4 assertion 1); only a
-        // non-mainnet fixture may leave the OI-3 hashes unset.
+        // code-hash pins (node changes section 3.4 assertion 1) and the
+        // MAX_EPOCH_LAG mirror; only a non-mainnet fixture may leave the
+        // OI-3 hashes and the mirror unset.
         if (vault.origin_chain_id == BUSD_ETHEREUM_CHAIN_ID &&
             (vault.token_address != BUSD_ETHEREUM_USDT ||
              light_client.genesis_validators_root !=
                  ETHEREUM_MAINNET_GENESIS_VALIDATORS_ROOT ||
-             !vault.vault_runtime_code_hash || !verifier.runtime_code_hash)) {
+             !vault.vault_runtime_code_hash || !verifier.runtime_code_hash ||
+             !verifier.max_epoch_lag_seconds)) {
             return false;
         }
         return true;
