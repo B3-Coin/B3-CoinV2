@@ -3,6 +3,7 @@
 // file COPYING or https://opensource.org/license/mit/.
 
 #include <chainparams.h>
+#include <bridge/admission.h>
 #include <bridge/proof.h>
 #include <common/messages.h>
 #include <consensus/era.h>
@@ -42,6 +43,7 @@
 #include <univalue.h>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstdint>
 #include <limits>
@@ -49,6 +51,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace wallet {
@@ -184,6 +187,8 @@ static const char* BridgeRecordKindName(
         return "bridge-burn";
     case bridge::BridgeRecordKindV1::ETH_STATE_OBSERVATION:
         return "eth-state-observation";
+    case bridge::BridgeRecordKindV1::FINALITY_CONFLICT:
+        return "finality-conflict";
     }
     return "unknown";
 }
@@ -1796,7 +1801,11 @@ RPCHelpMan submitbridgecarrier()
         "Fund, sign, and optionally broadcast one canonical bridge bootstrap, "
         "Ethereum light-client update, execution-backfill, or (from the bridge "
         "V2 activation height, regtest only) Ethereum state-observation (kind "
-        "9) type-10 record. "
+        "9) or finality-conflict (kind 13) type-10 record. A finality-conflict "
+        "record is evidence of a digest-V2 certificate, signed by the fresh "
+        "lineage's current or next committee, that differs from B3's statement "
+        "at its checkpoint: once a block holds it B3 refuses bridge V2 burns "
+        "and closes deposits for good. "
         "The payload must be produced by an external bridge proof builder. "
         "Mint and managed-withdrawal records are rejected by this command. "
         "A mandatory zero-valued B3MC policy-9 output binds the exact MPA "
@@ -1820,7 +1829,7 @@ RPCHelpMan submitbridgecarrier()
              }},
         },
         AssetTransactionResult("Created bridge carrier transaction", {
-            {RPCResult::Type::STR, "record_kind", "bootstrap, update, execution-backfill, or eth-state-observation"},
+            {RPCResult::Type::STR, "record_kind", "bootstrap, update, execution-backfill, eth-state-observation, or finality-conflict"},
             {RPCResult::Type::NUM, "binding_vout", "Signed B3MC bridge binding output index"},
         }),
         RPCExamples{HelpExampleCli(
@@ -1834,11 +1843,13 @@ RPCHelpMan submitbridgecarrier()
                 parsed.decoded.kind !=
                     bridge::BridgeRecordKindV1::EXECUTION_BACKFILL &&
                 parsed.decoded.kind !=
-                    bridge::BridgeRecordKindV1::ETH_STATE_OBSERVATION) {
+                    bridge::BridgeRecordKindV1::ETH_STATE_OBSERVATION &&
+                parsed.decoded.kind !=
+                    bridge::BridgeRecordKindV1::FINALITY_CONFLICT) {
                 throw JSONRPCError(
                     RPC_INVALID_PARAMETER,
                     "submitbridgecarrier accepts only bootstrap, update, or execution-backfill records, "
-                    "and eth-state-observation records from the bridge V2 activation height");
+                    "and eth-state-observation or finality-conflict records from the bridge V2 activation height");
             }
 
             const std::shared_ptr<CWallet> wallet{
@@ -2040,6 +2051,131 @@ RPCHelpMan claimbridgedeposit()
             result.pushKV("owner_address", owner_address);
             result.pushKV("mint_vout", 0);
             result.pushKV("binding_vout", 1);
+            return result;
+        }};
+}
+
+RPCHelpMan getbridgedepositrecipient()
+{
+    return RPCHelpMan{
+        "getbridgedepositrecipient",
+        "Return the route (a) instructions for a bridge V2 deposit that "
+        "mints bUSD V2 to this wallet (regtest only, from the bridge V2 "
+        "activation height): approve the Vault V2 for the token amount, "
+        "then call its deposit(uint256 amount, bytes32 b3Recipient) from an "
+        "externally owned account with recipient_v1 as b3Recipient. A relayer "
+        "proves the Deposit event and claimbridgedeposit mints it. Refused "
+        "once B3 has closed bridge V2 deposits for good (getbridgev2info "
+        "deposits: a sticky conflict, a broken fresh lineage, or a latest "
+        "VERIFIER_E showing an impaired verifier or Verifier V2 "
+        "depositsClosed): B3 still mints every proven deposit, because the "
+        "vault cannot refund, but bUSD V2 minted after that can never be "
+        "redeemed. Nothing is signed or broadcast.\n",
+        {
+            {"address", RPCArg::Type::STR,
+             RPCArg::DefaultHint{"a new legacy address labelled b3-busd-bridge-receive"},
+             "This wallet's legacy P2PKH address that receives the bUSD V2"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Deposit instructions", {
+            {RPCResult::Type::STR, "address", "B3 P2PKH address that receives the bUSD V2"},
+            {RPCResult::Type::STR_HEX, "recipient_v1", "The deposit's b3Recipient: RECIPIENT_V1 bytes32, 0x-prefixed (11 zero bytes, version 0x01, the 20-byte P2PKH key hash)"},
+            {RPCResult::Type::STR_HEX, "vault", "Vault V2 address, 0x-prefixed: the deposit target"},
+            {RPCResult::Type::STR_HEX, "token", "Origin token address the vault takes, 0x-prefixed"},
+            {RPCResult::Type::NUM, "origin_chain_id", "Ethereum chain id of the vault"},
+            {RPCResult::Type::STR_HEX, "asset_id", "bUSD V2 AssetId minted for the deposit (display order)"},
+            {RPCResult::Type::NUM, "max_deposit_raw", "Largest admitted deposit in raw six-decimal token units"},
+            {RPCResult::Type::STR, "deposit_signature", "Vault V2 deposit function signature"},
+        }},
+        RPCExamples{HelpExampleCli("getbridgedepositrecipient", "") +
+                    HelpExampleRpc("getbridgedepositrecipient", "\"<b3_address>\"")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<CWallet> wallet{
+                GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            wallet->BlockUntilSyncedToCurrentChain();
+
+            // B3's deposit status first, so a refusal consumes no address.
+            // Only VALID continues; every other status, an unexpected one
+            // included, throws (fail closed).
+            std::string error;
+            const interfaces::BridgePrevalidationResult status{
+                wallet->chain().bridgeV2DepositStatus(error)};
+            if (status != interfaces::BridgePrevalidationResult::VALID) {
+                switch (status) {
+                case interfaces::BridgePrevalidationResult::VALID:
+                    break;
+                case interfaces::BridgePrevalidationResult::RULES_INACTIVE:
+                    throw JSONRPCError(RPC_MISC_ERROR, error);
+                case interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE:
+                    throw JSONRPCError(RPC_DATABASE_ERROR, error);
+                case interfaces::BridgePrevalidationResult::REJECTED:
+                    throw JSONRPCError(
+                        RPC_VERIFY_REJECTED,
+                        "bridge V2 deposits are closed for good: " + error +
+                            "; a deposit made now mints bUSD V2 that can never be redeemed");
+                case interfaces::BridgePrevalidationResult::TIP_CHANGED:
+                    throw JSONRPCError(RPC_VERIFY_REJECTED, error);
+                }
+                NONFATAL_UNREACHABLE();
+            }
+            const Consensus::Params& params{Params().GetConsensus()};
+            const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
+            if (!params.bridge_v2 || !asset) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Bridge V2 is not configured on this chain");
+            }
+            const Consensus::BridgeV2VaultEntry& entry{params.bridge_v2->vault};
+
+            CTxDestination destination;
+            {
+                LOCK(wallet->cs_wallet);
+                if (request.params[0].isNull()) {
+                    const auto generated{wallet->GetNewDestination(
+                        OutputType::LEGACY, "b3-busd-bridge-receive")};
+                    if (!generated) {
+                        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT,
+                                           util::ErrorString(generated).original);
+                    }
+                    destination = *generated;
+                } else {
+                    destination = DecodeDestination(request.params[0].get_str());
+                    if (!IsValidDestination(destination)) {
+                        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                           "Invalid B3 address");
+                    }
+                }
+                if (!std::holds_alternative<PKHash>(destination)) {
+                    throw JSONRPCError(
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "A bridge deposit recipient must be a legacy P2PKH address (RECIPIENT_V1)");
+                }
+                if (!wallet->IsMine(destination)) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                       "The address is not owned by this wallet");
+                }
+            }
+            const PKHash& key_hash{std::get<PKHash>(destination)};
+            bridge::RecipientV1 recipient;
+            std::copy(key_hash.begin(), key_hash.end(),
+                      recipient.pubkey_hash.begin());
+            const std::array<unsigned char, 32> recipient_word{
+                bridge::EncodeRecipientV1(recipient)};
+            // The frozen codec refuses an all-zero key hash. No wallet key
+            // has one, but never hand out a word B3 would not mint to.
+            if (!bridge::DecodeRecipientV1(recipient_word)) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                   "The address cannot be encoded as RECIPIENT_V1");
+            }
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("address", EncodeDestination(destination));
+            result.pushKV("recipient_v1", "0x" + HexStr(recipient_word));
+            result.pushKV("vault", "0x" + HexStr(entry.vault_address));
+            result.pushKV("token", "0x" + HexStr(entry.token_address));
+            result.pushKV("origin_chain_id", entry.origin_chain_id);
+            result.pushKV("asset_id", asset->GetHex());
+            result.pushKV("max_deposit_raw", entry.max_deposit_raw);
+            result.pushKV("deposit_signature", "deposit(uint256,bytes32)");
             return result;
         }};
 }

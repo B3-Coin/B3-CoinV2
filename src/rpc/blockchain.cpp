@@ -5702,7 +5702,8 @@ static RPCHelpMan getfinalitylineagecertificate()
                           "withdrawal_root is zero below the bridge V2 activation height V (and on a chain "
                           "without a bridge V2 configuration) and the V2 withdrawal-tree root from V, which is "
                           "non-zero even for the empty tree (getbridgev2info, getbridgewithdrawalproofv2); "
-                          "bridge_flags is 0.");
+                          "bridge_flags is 0, except bit 0 (deposits closed for good) from the first checkpoint "
+                          "at or after the block that set the sticky bridge V2 conflict (getbridgev2info.conflict).");
             return result;
         },
     };
@@ -6082,9 +6083,10 @@ static RPCHelpMan getbridgev2info()
         "vault entry, its bUSD V2 AssetId and entry id, caps, the Verifier V2 pins, the separate V2\n"
         "light-client store, namespace-2 nullifiers, the V2 withdrawal tree, the V2 burn gate (node\n"
         "changes section 8.4 rows C1-C4 and E1-E8), the latest kind 9 Ethereum state observations, the\n"
-        "vault entry's reserve ledger, the sticky conflict and the eth_getProof plan for the next\n"
-        "observations (buildbridgeobservationv2). Configured only by the regtest-only -b3bridgepins v2\n"
-        "section (every other chain returns an error); getbridgeinfo keeps reporting the V1 bridge.\n"
+        "vault entry's reserve ledger, the sticky conflict, whether B3 has closed deposits for good, and\n"
+        "the eth_getProof plan for the next observations (buildbridgeobservationv2). Configured only by\n"
+        "the regtest-only -b3bridgepins v2 section (every other chain returns an error); getbridgeinfo\n"
+        "keeps reporting the V1 bridge.\n"
         "Ethereum-facing values are 0x-prefixed EVM-order bytes; B3 ids and block hashes without an _evm\n"
         "suffix are in ordinary display order. Amounts are raw six-decimal units. No private key material\n"
         "is returned.\n",
@@ -6152,6 +6154,11 @@ static RPCHelpMan getbridgev2info()
                            {RPCResult::Type::NUM, "now_eff", /*optional=*/true, "The gate's time: max(candidate time, the V2 light client's finalized execution timestamp) (absent when no lineage context could be built)"},
                            {RPCResult::Type::NUM, "closes_at", /*optional=*/true, "READY only: the first now_eff at which an observation age or the rotation age closes the gate"},
                        }},
+                      {RPCResult::Type::OBJ, "deposits", "Whether B3 has closed bridge V2 deposits for good (node changes section 8.5), on the lineage the gate reads: a sticky conflict (kind 13, E5 or E8), a broken fresh lineage, or a latest VERIFIER_E showing the verifier halted, cancelled or expired at the observation, or Verifier V2 depositsClosed. B3 still mints every proven deposit (the vault cannot refund), so a deposit made after the close mints bUSD V2 that can never be redeemed; wallets (getbridgedepositrecipient) and relayers refuse deposits and flushes once it is CLOSED_FOR_GOOD. OPEN only means B3 has not closed them: it does not mean Verifier V2 depositsOpen() is true",
+                       {
+                           {RPCResult::Type::STR, "status", "OPEN, CLOSED_FOR_GOOD or UNAVAILABLE (bridge V2 rules inactive for the next block, or no bridge state or lineage at the active tip)"},
+                           {RPCResult::Type::STR, "reason", /*optional=*/true, "CLOSED_FOR_GOOD: why B3 closed deposits; UNAVAILABLE: why the status cannot be evaluated"},
+                       }},
                       {RPCResult::Type::OBJ, "observations", "Latest connected kind 9 observation per subject (empty while the bridge state is unavailable)",
                        {
                            ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_VERIFIER),
@@ -6171,10 +6178,13 @@ static RPCHelpMan getbridgev2info()
                        }},
                       {RPCResult::Type::OBJ, "conflict", /*optional=*/true, "The sticky bridge V2 conflict closing the gate (row C4); absent when none is set",
                        {
-                           {RPCResult::Type::STR, "reason", "E5 (a LIVE VERIFIER_E whose latestCertId is not B3's statement) or E8 (a RESERVE_E failing invariant R)"},
+                           {RPCResult::Type::STR, "reason", "E5 (a LIVE VERIFIER_E whose latestCertId is not B3's statement), E8 (a RESERVE_E failing invariant R) or kind13 (FINALITY_CONFLICT evidence: a digest-V2 certificate of the lineage's current or next committee differing from B3's statement)"},
                            {RPCResult::Type::NUM, "height", "B3 height of the block that set it"},
                            {RPCResult::Type::STR_HEX, "block", "That B3 block"},
-                           {RPCResult::Type::NUM, "anchor_block", "Ethereum execution block of the observation that set it"},
+                           {RPCResult::Type::NUM, "anchor_block", "Ethereum execution block of the observation that set it (0 for kind13)"},
+                           {RPCResult::Type::STR_HEX, "evidence_cert_id_evm", /*optional=*/true, "kind13 only: certId (keccak256 of the FinalizedBlockV2) of the conflicting certificate"},
+                           {RPCResult::Type::NUM, "evidence_checkpoint_index", /*optional=*/true, "kind13 only: its checkpoint index"},
+                           {RPCResult::Type::NUM, "evidence_epoch", /*optional=*/true, "kind13 only: its epoch (the signing committee's)"},
                        }},
                       {RPCResult::Type::OBJ, "observation_plan", "What the next kind 9 observations prove: call eth_getProof(address, slots, anchor.number) for each account of a subject, in order, and pass the results to buildbridgeobservationv2 with anchor.hash_evm",
                        {
@@ -6320,19 +6330,26 @@ static RPCHelpMan getbridgev2info()
             result.pushKV("empty_withdrawal_root_evm",
                           EvmHex(modern::WithdrawalZeroHashes()[modern::WITHDRAWAL_TREE_DEPTH]));
 
-            // The mempool's V2 burn gate (validation.cpp): the fresh lineage
-            // projected for the next block from the synced tip, the connected
-            // kind 9 observations and the sticky conflict, at the mempool's
-            // candidate time.
+            // The fresh lineage projected for the next block from the synced
+            // tip, as the mempool builds it; the burn gate and the deposit
+            // status read it.
+            std::string lineage_reason{"the bridge state is unavailable at the active tip"};
+            std::optional<node::BridgeV2LineageContext> lineage;
+            if (state_available && index) {
+                lineage = node::MakeBridgeV2LineageContext(chainstate.ModernFinality(), chainstate.m_chain,
+                                                           chainstate.m_blockman, consensus, *tip, *index,
+                                                           lineage_reason);
+            }
+
+            // The mempool's V2 burn gate (validation.cpp): that lineage, the
+            // connected kind 9 observations and the sticky conflict, at the
+            // mempool's candidate time.
             UniValue gate{UniValue::VOBJ};
             {
                 std::string status{"UNAVAILABLE"};
-                std::string reason{"the bridge state is unavailable at the active tip"};
+                std::string reason{lineage_reason};
                 std::optional<node::BridgeV2GateResult> evaluated;
                 if (state_available && index) {
-                    const auto lineage{node::MakeBridgeV2LineageContext(
-                        chainstate.ModernFinality(), chainstate.m_chain, chainstate.m_blockman, consensus, *tip,
-                        *index, reason)};
                     if (lineage) {
                         const int64_t candidate_time{std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
                         evaluated = node::EvaluateBridgeV2BurnGate(&*lineage, *index, consensus, next_height,
@@ -6365,6 +6382,30 @@ static RPCHelpMan getbridgev2info()
                 }
             }
             result.pushKV("burn_gate", std::move(gate));
+
+            // Whether B3 has closed deposits for good (node changes section
+            // 8.5): a closing row outranks an unavailable lineage, as in the
+            // wallet's interfaces::Chain::bridgeV2DepositStatus.
+            UniValue deposits{UniValue::VOBJ};
+            {
+                std::optional<std::string> closed;
+                if (state_available && index && active) {
+                    closed = node::BridgeV2DepositsClosedReason(*index, lineage ? &*lineage : nullptr, consensus);
+                }
+                if (closed) {
+                    deposits.pushKV("status", "CLOSED_FOR_GOOD");
+                    deposits.pushKV("reason", *closed);
+                } else if (!active) {
+                    deposits.pushKV("status", "UNAVAILABLE");
+                    deposits.pushKV("reason", "bridge V2 rules are not active for the next block");
+                } else if (!lineage) {
+                    deposits.pushKV("status", "UNAVAILABLE");
+                    deposits.pushKV("reason", lineage_reason);
+                } else {
+                    deposits.pushKV("status", "OPEN");
+                }
+            }
+            result.pushKV("deposits", std::move(deposits));
 
             // Kind 9 observations, the reserve ledger and the sticky conflict
             // (node changes sections 7.1-7.2, 7.6 and 8.2-8.5).
@@ -6409,6 +6450,11 @@ static RPCHelpMan getbridgev2info()
                     c.pushKV("height", conflict->height);
                     c.pushKV("block", conflict->block_hash.GetHex());
                     c.pushKV("anchor_block", conflict->anchor_block);
+                    if (conflict->reason == bridge::BRIDGE_V2_CONFLICT_KIND13) {
+                        c.pushKV("evidence_cert_id_evm", EvmHex(conflict->evidence_cert_id));
+                        c.pushKV("evidence_checkpoint_index", conflict->evidence_checkpoint_index);
+                        c.pushKV("evidence_epoch", conflict->evidence_epoch);
+                    }
                     result.pushKV("conflict", std::move(c));
                 }
             }
