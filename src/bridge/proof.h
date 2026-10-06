@@ -7,6 +7,7 @@
 
 #include <bridge/deposit.h>
 #include <bridge/eth_light_client.h>
+#include <consensus/bridge_params.h>
 #include <consensus/consensus.h>
 #include <modern/finality_v2_payload.h>
 #include <primitives/transaction.h>
@@ -84,10 +85,10 @@ static_assert(MAX_BRIDGE_MINT_WIRE_SIZE <= MAX_BRIDGE_RECORD_SIZE);
  *
  * The limit set is the codec's height selector, so it also carries the
  * record set: `v2_kinds` admits the bridge V2 record kinds (kind 9,
- * ETH_STATE_OBSERVATION, and kind 13, FINALITY_CONFLICT). Consensus passes
- * the V2 set from V only, so a kind 9 or kind 13 record is malformed below V
- * and on every network without bridge_v2, exactly as an unknown kind was
- * before.
+ * ETH_STATE_OBSERVATION, kind 13, FINALITY_CONFLICT, and kind 16,
+ * VAULT_SWEEP). Consensus passes the V2 set from V only, so a kind 9, 13 or
+ * 16 record is malformed below V and on every network without bridge_v2,
+ * exactly as an unknown kind was before.
  */
 struct BridgeMptLimits {
     size_t max_node_size;
@@ -103,8 +104,8 @@ inline constexpr BridgeMptLimits BRIDGE_MPT_LIMITS_V1{
     /*v2_kinds=*/false};
 //! Bridge V2 (doc/design/b3-bridge-v2-node-changes.md section 4): a terminal
 //! receipt node up to 8,192 bytes and a receipt proof up to 16 KiB; every
-//! other node keeps the 1,024-byte limit. Kinds 9 (section 8.2) and 13
-//! (section 8.5) are valid.
+//! other node keeps the 1,024-byte limit. Kinds 9 (section 8.2), 13
+//! (section 8.5) and 14 (section 7.6) are valid.
 inline constexpr size_t MAX_BRIDGE_TERMINAL_RECEIPT_NODE_SIZE_V2{8'192};
 inline constexpr size_t MAX_BRIDGE_MPT_BYTES_V2{16'384};
 inline constexpr BridgeMptLimits BRIDGE_MPT_LIMITS_V2{
@@ -135,6 +136,14 @@ enum class BridgeRecordKindV1 : uint8_t {
     //! Bridge V2 only (node changes section 8.5): decoded under the V2
     //! record set (BridgeMptLimits::v2_kinds), malformed otherwise.
     FINALITY_CONFLICT = 13,
+    //! Bridge V2 only (node changes section 7.6, B-23 migration): decoded
+    //! under the V2 record set (BridgeMptLimits::v2_kinds), malformed
+    //! otherwise. Kinds 7, 8 and 10-12 stay reserved (node changes section
+    //! 17), and so do 14 and 15, which the staker-signed fast deposit
+    //! proposal names FSD_MINT and FSD_FAULT
+    //! (doc/design/b3-bridge-v2-staker-signed-deposits.md); the sweep takes
+    //! the next free kind.
+    VAULT_SWEEP = 16,
 };
 
 struct BridgeBootstrapV1 {
@@ -212,16 +221,70 @@ struct BridgeBurnV1 {
  *   balances[vault] (E8, wind-down and transit crediting).
  * - TOKEN_FLAGS reads the token's slots 0 and 10 and isBlackListed[vault]
  *   (E7).
+ * - RESERVE_E_SUCCESSOR (0x12) and TOKEN_FLAGS_SUCCESSOR (0x13) are RESERVE_E
+ *   and TOKEN_FLAGS of the B-23 successor vault v' (node changes section
+ *   7.6): the base subject | (vault entry index << 4), with the same shape,
+ *   read with v''s pins (bridge::ObservationPinsFromParams). The verifier
+ *   is shared, so VERIFIER_E has no successor form.
  *
- * Every other subject value is malformed, and so is a verdict with any
- * other bit or a non-zero verdict on a subject other than VERIFIER_E.
+ * Every other subject value is malformed (0, 0x04-0x11 and 0x14-0xff), and
+ * so is a verdict with any other bit or a non-zero verdict on a subject
+ * other than VERIFIER_E. Whether a successor subject may appear in a block
+ * (from the migration height only) is a consensus rule, not the codec's.
  */
 inline constexpr uint8_t ETH_OBSERVATION_SUBJECT_VERIFIER{1};
 inline constexpr uint8_t ETH_OBSERVATION_SUBJECT_RESERVE{2};
 inline constexpr uint8_t ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS{3};
+//! The vault entry index of a subject sits in its high nibble.
+inline constexpr unsigned ETH_OBSERVATION_SUBJECT_ENTRY_SHIFT{4};
+inline constexpr uint8_t ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR{
+    ETH_OBSERVATION_SUBJECT_RESERVE |
+    (static_cast<uint8_t>(Consensus::BridgeV2EntryRole::SUCCESSOR)
+     << ETH_OBSERVATION_SUBJECT_ENTRY_SHIFT)};
+inline constexpr uint8_t ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR{
+    ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS |
+    (static_cast<uint8_t>(Consensus::BridgeV2EntryRole::SUCCESSOR)
+     << ETH_OBSERVATION_SUBJECT_ENTRY_SHIFT)};
+static_assert(ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR == 0x12);
+static_assert(ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR == 0x13);
 inline constexpr uint8_t ETH_OBSERVATION_VERDICT_SETS_MISMATCH{0x01};
 inline constexpr uint8_t ETH_OBSERVATION_VERDICT_CERT_CONFLICT{0x02};
 inline constexpr uint8_t ETH_OBSERVATION_VERDICT_MASK{0x03};
+
+/**
+ * The subject a kind 9 subject reads as: VERIFIER_E, RESERVE_E and
+ * TOKEN_FLAGS map to themselves, RESERVE_E_SUCCESSOR to RESERVE_E and
+ * TOKEN_FLAGS_SUCCESSOR to TOKEN_FLAGS. Zero for every other value.
+ */
+inline constexpr uint8_t EthObservationBaseSubject(const uint8_t subject)
+{
+    switch (subject) {
+    case ETH_OBSERVATION_SUBJECT_VERIFIER:
+    case ETH_OBSERVATION_SUBJECT_RESERVE:
+    case ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS:
+        return subject;
+    case ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR:
+        return ETH_OBSERVATION_SUBJECT_RESERVE;
+    case ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR:
+        return ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS;
+    }
+    return 0;
+}
+
+/**
+ * The vault entry whose pins a subject is read with: SUCCESSOR for the two
+ * successor subjects, LAUNCH for every other value (VERIFIER_E reads the
+ * shared verifier with the launch pins). Meaningful only for a subject
+ * whose EthObservationBaseSubject is non-zero.
+ */
+inline constexpr Consensus::BridgeV2EntryRole EthObservationEntryRole(
+    const uint8_t subject)
+{
+    return subject == ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR ||
+                   subject == ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR
+               ? Consensus::BridgeV2EntryRole::SUCCESSOR
+               : Consensus::BridgeV2EntryRole::LAUNCH;
+}
 
 namespace proof_detail {
 inline constexpr std::array<uint8_t, 1> ETH_OBSERVATION_SHAPE_VERIFIER{5};
@@ -232,12 +295,13 @@ inline constexpr std::array<uint8_t, 1> ETH_OBSERVATION_SHAPE_TOKEN_FLAGS{3};
 /**
  * The proof shape a subject requires: one entry per account in wire order,
  * each the number of storage slots proved for it. VERIFIER_E is
- * [verifier: 5]; RESERVE_E is [vault: 3, token: 1]; TOKEN_FLAGS is
- * [token: 3]. Empty for an unknown subject.
+ * [verifier: 5]; RESERVE_E and RESERVE_E_SUCCESSOR are [vault: 3, token: 1];
+ * TOKEN_FLAGS and TOKEN_FLAGS_SUCCESSOR are [token: 3]. Empty for an unknown
+ * subject.
  */
 inline std::span<const uint8_t> EthObservationShapeV2(const uint8_t subject)
 {
-    switch (subject) {
+    switch (EthObservationBaseSubject(subject)) {
     case ETH_OBSERVATION_SUBJECT_VERIFIER:
         return proof_detail::ETH_OBSERVATION_SHAPE_VERIFIER;
     case ETH_OBSERVATION_SUBJECT_RESERVE:
@@ -310,11 +374,34 @@ static_assert(modern::MAX_FINALITY_SET <= 0xffff);
 static_assert(4 + modern::FINALITY_CERTIFICATE_V2_RECORD_MAX <=
               MAX_BRIDGE_RECORD_SIZE);
 
+/**
+ * Kind 16 body (node changes section 7.6, B-23): a request that the block
+ * append the sweep leaf moving the retired launch vault v's reserve to the
+ * successor v'. The wire is exactly
+ *
+ *   0x10 || 0x00 || registry_id(32)
+ *
+ * with `registry_id` the launch vault entry id in raw uint256 order, as
+ * kinds 3 and 6 name an entry (the bytes of getbridgev2info
+ * `vault_entry_id_evm`). As with kind 6, the amount, the leaf id, the B3
+ * height and both vault addresses are deliberately absent: consensus
+ * derives every leaf field, so a relayer chooses none of them. The codec
+ * refuses only a null id; which entry it must name and when a sweep is
+ * valid are consensus rules.
+ */
+struct BridgeVaultSweepV2 {
+    uint256 registry_id{};
+
+    friend bool operator==(const BridgeVaultSweepV2&,
+                           const BridgeVaultSweepV2&) = default;
+};
+inline constexpr size_t BRIDGE_VAULT_SWEEP_WIRE_SIZE{2 + 32};
+
 using BridgeRecordPayloadV1 =
     std::variant<BridgeBootstrapV1, BridgeUpdateV1, BridgeMintV1,
                  BridgeExecutionBackfillV1, BridgeManagedWithdrawalV1,
                  BridgeBurnV1, BridgeEthStateObservationV2,
-                 BridgeFinalityConflictV2>;
+                 BridgeFinalityConflictV2, BridgeVaultSweepV2>;
 
 struct BridgeRecordV1 {
     BridgeRecordKindV1 kind{BridgeRecordKindV1::BOOTSTRAP};
@@ -839,10 +926,10 @@ inline std::optional<ssz::SyncCommittee> DecodeBridgeSyncCommitteeV1(
 
 /**
  * Canonical encode. `mpt_limits` applies only to a MINT's receipt proof and
- * to whether kinds 9 and 13 exist; the V1 default keeps every pre-V2 caller
- * byte-identical. Consensus selects the limit set by height (V2 from the
- * bridge V2 activation height), so a record that only fits the V2 limits,
- * or any kind 9 or kind 13 record, is malformed below that height.
+ * to whether kinds 9, 13 and 16 exist; the V1 default keeps every pre-V2
+ * caller byte-identical. Consensus selects the limit set by height (V2 from
+ * the bridge V2 activation height), so a record that only fits the V2
+ * limits, or any kind 9, 13 or 16 record, is malformed below that height.
  */
 inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
     const BridgeRecordV1& record,
@@ -950,6 +1037,15 @@ inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
             if (!value->Decode()) break;
             writer.U16(value->validator_count);
             writer.Bytes(value->certificate);
+            valid = true;
+        }
+        break;
+    case BridgeRecordKindV1::VAULT_SWEEP:
+        if (!mpt_limits.v2_kinds) break;
+        if (const auto* value{
+                std::get_if<BridgeVaultSweepV2>(&record.payload)}) {
+            if (value->registry_id.IsNull()) break;
+            writer.Root(value->registry_id);
             valid = true;
         }
         break;
@@ -1071,6 +1167,14 @@ inline std::optional<BridgeRecordV1> DecodeBridgeRecordV1(
         if (!mpt_limits.v2_kinds || !reader.U16(value.validator_count) ||
             !reader.Vector(reader.Remaining(), value.certificate) ||
             !reader.Empty() || !value.Decode()) {
+            return std::nullopt;
+        }
+        return BridgeRecordV1{kind, std::move(value)};
+    }
+    case BridgeRecordKindV1::VAULT_SWEEP: {
+        BridgeVaultSweepV2 value;
+        if (!mpt_limits.v2_kinds || !reader.Root(value.registry_id) ||
+            value.registry_id.IsNull() || !reader.Empty()) {
             return std::nullopt;
         }
         return BridgeRecordV1{kind, std::move(value)};

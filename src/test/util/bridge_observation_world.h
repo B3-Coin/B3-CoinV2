@@ -9,6 +9,7 @@
 #include <bridge/state_observation.h>
 #include <bridge/state_proof.h>
 #include <consensus/amount.h>
+#include <consensus/bridge_params.h>
 #include <test/util/bridge_eth_trie.h>
 #include <uint256.h>
 
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
@@ -26,6 +28,10 @@
  * state trie has branches. Observe() builds a kind 9 record exactly as a
  * relayer would from eth_getProof: the subject's plan (accounts and slots in
  * order, bridge::ObservationRequests), with zero words proven by exclusion.
+ * AddSuccessorVault() adds a B-23 successor vault v' to the same state, so
+ * the successor subjects (0x12, 0x13) and the launch ones verify against one
+ * state root; Observe() reads each subject with the pins of its own vault
+ * entry (bridge::EthObservationEntryRole).
  *
  * Test-only. The storage layouts are the ones bridge/state_observation.h
  * decodes (contracts spec sections 3.2 and 6.6; Tether slots 0, 2, 6, 10);
@@ -62,9 +68,13 @@ inline bridge::StorageWord HashWord(const uint256& hash)
 class ObservationWorld
 {
 public:
+    //! The launch entry's pins (entry LAUNCH).
     bridge::ObservationPins pins;
     std::map<bridge::EthAddress, EthStorageTrie> storage;
     std::map<bridge::EthAddress, uint256> code;
+    //! The successor vault v' and its code-hash pin, once added.
+    std::optional<bridge::EthAddress> successor_vault{};
+    std::optional<uint256> successor_vault_code_hash{};
 
     //! Accounts whose code hashes equal their pins (a stand-in runtime hash
     //! where a pin is unset) and whose observed slots are all zero until the
@@ -85,6 +95,36 @@ public:
             SetWord(pins.token, bridge::MappingSlot(bridge::AddressWord(other), 2),
                     bridge::SlotWord(holder * 1'000ULL));
         }
+    }
+
+    /**
+     * Add the successor vault v' at `address`: code equal to `code_hash` (a
+     * stand-in runtime hash when unset, as an unpinned OI-3 vault on 31337)
+     * and every observed slot zero until SetSuccessorReserve() and
+     * SetSuccessorBlacklisted() fill them.
+     */
+    void AddSuccessorVault(const bridge::EthAddress& address, const std::optional<uint256>& code_hash = std::nullopt)
+    {
+        if (address == pins.vault || address == pins.token || address == pins.verifier) {
+            throw std::invalid_argument("successor vault reuses an observed account");
+        }
+        successor_vault = address;
+        successor_vault_code_hash = code_hash;
+        code[address] = code_hash.value_or(EthTrie::HashOf(std::vector<unsigned char>{'s'}));
+        Set(address, 2, bridge::SlotWord(0xc2)); // storage no observation proves
+    }
+
+    //! The pins of vault entry `role`: `pins` for LAUNCH, `pins` with v''s
+    //! vault and code-hash pin for SUCCESSOR (which needs AddSuccessorVault).
+    bridge::ObservationPins PinsFor(const Consensus::BridgeV2EntryRole role) const
+    {
+        if (role == Consensus::BridgeV2EntryRole::LAUNCH) return pins;
+        if (!successor_vault) throw std::logic_error("no successor vault");
+        bridge::ObservationPins out{pins};
+        out.entry = Consensus::BridgeV2EntryRole::SUCCESSOR;
+        out.vault = *successor_vault;
+        out.vault_code_hash = successor_vault_code_hash;
+        return out;
     }
 
     void Set(const bridge::EthAddress& account, const uint64_t slot, const bridge::StorageWord& word)
@@ -126,12 +166,15 @@ public:
     void SetReserve(const uint64_t next_deposit_id, const CAmount locked, const CAmount absorbed_total,
                     const CAmount balance)
     {
-        using namespace bridge::observation_layout;
-        Set(pins.vault, VAULT_SLOT_NEXT_DEPOSIT_ID, bridge::SlotWord(next_deposit_id));
-        Set(pins.vault, VAULT_SLOT_LOCKED, bridge::SlotWord(static_cast<uint64_t>(locked)));
-        Set(pins.vault, VAULT_SLOT_ABSORBED_TOTAL, bridge::SlotWord(static_cast<uint64_t>(absorbed_total)));
-        SetWord(pins.token, bridge::MappingSlot(bridge::AddressWord(pins.vault), TOKEN_SLOT_BALANCES),
-                bridge::SlotWord(static_cast<uint64_t>(balance)));
+        SetVaultReserve(pins.vault, next_deposit_id, locked, absorbed_total, balance);
+    }
+
+    //! The same for the successor vault v' (slot 3 is v''s absorbedTotal).
+    void SetSuccessorReserve(const uint64_t next_deposit_id, const CAmount locked, const CAmount absorbed_total,
+                             const CAmount balance)
+    {
+        SetVaultReserve(PinsFor(Consensus::BridgeV2EntryRole::SUCCESSOR).vault, next_deposit_id, locked,
+                        absorbed_total, balance);
     }
 
     //! The token's slots 0 (owner 0x66.., paused) and 10 (deprecated) and
@@ -147,6 +190,15 @@ public:
             PackWord({{TOKEN_DEPRECATED.offset, TOKEN_DEPRECATED.bits, deprecated ? 1U : 0U}}));
         SetWord(pins.token, bridge::MappingSlot(bridge::AddressWord(pins.vault), TOKEN_SLOT_IS_BLACK_LISTED),
                 bridge::SlotWord(vault_blacklisted ? 1U : 0U));
+    }
+
+    //! The token's isBlackListed[v'] (slots 0 and 10 are shared with v).
+    void SetSuccessorBlacklisted(const bool blacklisted)
+    {
+        using namespace bridge::observation_layout;
+        const bridge::EthAddress vault{PinsFor(Consensus::BridgeV2EntryRole::SUCCESSOR).vault};
+        SetWord(pins.token, bridge::MappingSlot(bridge::AddressWord(vault), TOKEN_SLOT_IS_BLACK_LISTED),
+                bridge::SlotWord(blacklisted ? 1U : 0U));
     }
 
     EthTrie State() const
@@ -168,16 +220,18 @@ public:
 
     uint256 StateRoot() const { return State().Root(); }
 
-    //! The kind 9 record of `subject` against this state, naming `anchor_hash`.
+    //! The kind 9 record of `subject` against this state, naming `anchor_hash`,
+    //! planned with the pins of the subject's vault entry.
     bridge::BridgeEthStateObservationV2 Observe(const uint8_t subject, const uint256& anchor_hash,
                                                 const uint8_t verdict = 0) const
     {
         const EthTrie state{State()};
+        const bridge::ObservationPins subject_pins{PinsFor(bridge::EthObservationEntryRole(subject))};
         bridge::BridgeEthStateObservationV2 record;
         record.subject = subject;
         record.anchor_hash = anchor_hash;
         record.verdict = verdict;
-        for (const bridge::ObservationAccountRequest& request : bridge::ObservationRequests(subject, pins)) {
+        for (const bridge::ObservationAccountRequest& request : bridge::ObservationRequests(subject, subject_pins)) {
             bridge::BridgeEthAccountProofV2 account;
             account.account_nodes = state.ProofSecure(request.address);
             const auto it{storage.find(request.address)};
@@ -188,6 +242,18 @@ public:
             record.accounts.push_back(std::move(account));
         }
         return record;
+    }
+
+private:
+    void SetVaultReserve(const bridge::EthAddress& vault, const uint64_t next_deposit_id, const CAmount locked,
+                         const CAmount absorbed_total, const CAmount balance)
+    {
+        using namespace bridge::observation_layout;
+        Set(vault, VAULT_SLOT_NEXT_DEPOSIT_ID, bridge::SlotWord(next_deposit_id));
+        Set(vault, VAULT_SLOT_LOCKED, bridge::SlotWord(static_cast<uint64_t>(locked)));
+        Set(vault, VAULT_SLOT_ABSORBED_TOTAL, bridge::SlotWord(static_cast<uint64_t>(absorbed_total)));
+        SetWord(pins.token, bridge::MappingSlot(bridge::AddressWord(vault), TOKEN_SLOT_BALANCES),
+                bridge::SlotWord(static_cast<uint64_t>(balance)));
     }
 };
 

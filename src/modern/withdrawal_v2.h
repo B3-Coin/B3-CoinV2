@@ -108,6 +108,31 @@ inline std::optional<uint256> BridgeWithdrawalLeafV2(
     return WithdrawalKeccak(*encoded);
 }
 
+/**
+ * The B-23 migration (MIGRATE) and retired-vault sweep leaf (contracts spec
+ * section 6.4; node changes section 7.6): an ordinary leaf V2 that the
+ * retired vault v releases, naming v (its chain, vault and token) and paying
+ * the successor vault v' `amount` of the shared bUSD V2 asset. No new tag,
+ * function or length: v' counts the arrival through absorb(), and B3
+ * credits it only from the absorbedTotal observed at v'.
+ */
+inline BridgeWithdrawalV2 MakeVaultSweepWithdrawalV2(
+    const Consensus::BridgeV2VaultEntry& retired, const AssetId& asset,
+    const Consensus::BridgeEthAddress& successor_vault, uint64_t id,
+    CAmount amount, uint64_t b3_height)
+{
+    return BridgeWithdrawalV2{
+        .withdrawal_id = id,
+        .destination_chain_id = retired.origin_chain_id,
+        .asset_id = asset,
+        .vault = retired.vault_address,
+        .token = retired.token_address,
+        .recipient = successor_vault,
+        .amount = amount,
+        .b3_height = b3_height,
+    };
+}
+
 /** Append one leaf V2 at index == its withdrawal id; returns the leaf. */
 inline std::optional<uint256> AppendBridgeWithdrawalV2(
     WithdrawalTreeState& state, const BridgeWithdrawalV2& withdrawal)

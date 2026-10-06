@@ -166,13 +166,19 @@ struct TokenFlagsV2 {
     friend bool operator==(const TokenFlagsV2&, const TokenFlagsV2&) = default;
 };
 
-//! One decoded observation; the alternative follows the record's subject.
+//! One decoded observation; the alternative follows the record's base subject
+//! (EthObservationBaseSubject), so a successor subject decodes as its base.
 using ObservedStateV2 = std::variant<VerifierStateV2, ReserveStateV2, TokenFlagsV2>;
 
 /**
  * The accounts an observation may read and their code-hash pins. The token
  * pin is always required; the verifier and vault pins may be unset only on
  * OBSERVATION_UNPINNED_CODE_CHAIN_ID (OI-3).
+ *
+ * `entry` is the vault entry `vault` belongs to: the launch vault v, or the
+ * B-23 successor v'. A subject is planned and verified only with the pins
+ * of its own entry (EthObservationEntryRole), so a successor subject can
+ * never read v's state, nor a launch subject v''s.
  */
 struct ObservationPins {
     uint64_t origin_chain_id{0};
@@ -182,20 +188,39 @@ struct ObservationPins {
     std::optional<uint256> verifier_code_hash{};
     std::optional<uint256> vault_code_hash{};
     uint256 token_code_hash{};
+    Consensus::BridgeV2EntryRole entry{Consensus::BridgeV2EntryRole::LAUNCH};
 };
 
-//! The pins of a bridge V2 envelope's single vault entry and its verifier.
-inline ObservationPins ObservationPinsFromParams(const Consensus::BridgeV2Params& params)
+/**
+ * The pins of a bridge V2 envelope's vault entry `role` and its verifier.
+ * SUCCESSOR names v''s vault address and its optional code hash (OI-3), with
+ * the verifier, token, token code hash and chain that SuccessorValid()
+ * requires equal to v's. Without a pinned successor the SUCCESSOR pins name
+ * no vault and no token, which VerifyEthStateObservationV2 refuses for every
+ * subject of that entry.
+ */
+inline ObservationPins ObservationPinsFromParams(const Consensus::BridgeV2Params& params,
+                                                 const Consensus::BridgeV2EntryRole role)
 {
     ObservationPins pins;
+    pins.entry = role;
     pins.origin_chain_id = params.vault.origin_chain_id;
     pins.verifier = params.verifier.address;
-    pins.vault = params.vault.vault_address;
-    pins.token = params.vault.token_address;
     pins.verifier_code_hash = params.verifier.runtime_code_hash;
-    pins.vault_code_hash = params.vault.vault_runtime_code_hash;
-    pins.token_code_hash = params.vault.token_runtime_code_hash;
+    const Consensus::BridgeV2VaultEntry* entry{params.Entry(role)};
+    if (entry == nullptr) return pins;
+    pins.origin_chain_id = entry->origin_chain_id;
+    pins.vault = entry->vault_address;
+    pins.token = entry->token_address;
+    pins.vault_code_hash = entry->vault_runtime_code_hash;
+    pins.token_code_hash = entry->token_runtime_code_hash;
     return pins;
+}
+
+//! The pins of a bridge V2 envelope's launch vault entry and its verifier.
+inline ObservationPins ObservationPinsFromParams(const Consensus::BridgeV2Params& params)
+{
+    return ObservationPinsFromParams(params, Consensus::BridgeV2EntryRole::LAUNCH);
 }
 
 enum class ObservationAccountRole : uint8_t {
@@ -230,14 +255,18 @@ struct ObservationAccountRequest {
  * - VERIFIER_E: verifier slots 0, 1, 2, 4, 6.
  * - RESERVE_E: vault slots 0, 1, 3; token slot MappingSlot(vault, 2).
  * - TOKEN_FLAGS: token slots 0, 10, MappingSlot(vault, 6).
- * Empty for an unknown subject.
+ * - RESERVE_E_SUCCESSOR and TOKEN_FLAGS_SUCCESSOR: the same plans with
+ *   `pins.vault` the successor vault v'.
+ * Empty for an unknown subject and for pins of another vault entry than the
+ * subject's (EthObservationEntryRole).
  */
 inline std::vector<ObservationAccountRequest> ObservationRequests(
     const uint8_t subject, const ObservationPins& pins)
 {
     using namespace observation_layout;
+    if (EthObservationEntryRole(subject) != pins.entry) return {};
     const StorageWord vault_key{AddressWord(pins.vault)};
-    switch (subject) {
+    switch (EthObservationBaseSubject(subject)) {
     case ETH_OBSERVATION_SUBJECT_VERIFIER:
         return {{ObservationAccountRole::VERIFIER, pins.verifier,
                  {SlotWord(VERIFIER_SLOT_LIVENESS),
@@ -464,12 +493,32 @@ inline std::optional<TokenFlagsV2> DecodeTokenFlagsV2(
  * present zero leaf only on OBSERVATION_STORED_ZERO_CHAIN_ID).
  * The verdict byte is not judged here. Returns nullopt with a stable
  * `error` for any proof, pin, shape or layout failure.
+ *
+ * `pins` must be the pins of the subject's vault entry
+ * (ObservationPinsFromParams(params, EthObservationEntryRole(subject))): a
+ * successor subject decodes into the same ReserveStateV2 or TokenFlagsV2,
+ * read from v''s accounts and slots.
  */
 inline std::optional<ObservedStateV2> VerifyEthStateObservationV2(
     const BridgeEthStateObservationV2& record, const uint256& state_root,
     const ObservationPins& pins, std::string& error)
 {
     using namespace state_observation_detail;
+    const uint8_t base_subject{EthObservationBaseSubject(record.subject)};
+    if (base_subject == 0) {
+        error = "observation subject is unknown";
+        return std::nullopt;
+    }
+    if (EthObservationEntryRole(record.subject) != pins.entry) {
+        error = "observation pins belong to another vault entry";
+        return std::nullopt;
+    }
+    if (base_subject != ETH_OBSERVATION_SUBJECT_VERIFIER &&
+        (!proof_detail::AddressNonzero(pins.vault) ||
+         !proof_detail::AddressNonzero(pins.token))) {
+        error = "observation pins name no vault entry";
+        return std::nullopt;
+    }
     const auto requests{ObservationRequests(record.subject, pins)};
     if (requests.empty()) {
         error = "observation subject is unknown";
@@ -522,7 +571,7 @@ inline std::optional<ObservedStateV2> VerifyEthStateObservationV2(
         }
     }
 
-    switch (record.subject) {
+    switch (base_subject) {
     case ETH_OBSERVATION_SUBJECT_VERIFIER: {
         auto state{DecodeVerifierStateV2(words[0], code_hashes[0], error)};
         if (!state) return std::nullopt;

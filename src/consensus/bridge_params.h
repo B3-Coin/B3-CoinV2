@@ -454,6 +454,34 @@ struct BridgeV2VaultEntry {
     }
 };
 
+//! Which vault entry of the envelope a rule reads: the launch entry v, or
+//! the B-23 successor v' a migration hard fork appends (node changes
+//! sections 3.1 and 7.6). The value is the entry's index in the registry.
+enum class BridgeV2EntryRole : uint8_t {
+    LAUNCH = 0,
+    SUCCESSOR = 1,
+};
+
+/**
+ * B-23 successor vault entry v' (node changes sections 3.2 and 7.6;
+ * contracts spec sections 6.1 and 6.4). `entry` is v' itself: v's origin
+ * chain, token, decimals, token code hash, proof kind and mint caps, with
+ * its own vault address, optional vault code hash (OI-3), deployment block
+ * and MAX_DEPOSIT_RAW. `predecessor` is v's vault address and `asset_id` v's
+ * bUSD V2 AssetId as raw EVM bytes (Vault V2 `B3_ASSET_ID()`), the two
+ * constructor arguments v' checks against v; B3 checks `asset_id` against
+ * its own recomputation (modern::bridge_v2_detail::ConfiguredDomain), so v'
+ * mints and burns the same asset. From `migration_height` (h_m > V, >= W2)
+ * v retires and v' takes deposits and burns; h_m, like V and W2, is not part
+ * of the registry id.
+ */
+struct BridgeV2SuccessorEntry {
+    BridgeV2VaultEntry entry{};
+    BridgeEthAddress predecessor{};
+    uint256 asset_id{};
+    int32_t migration_height{-1};
+};
+
 /**
  * Verifier V2 pins mirrored by B3 (node changes section 3.1). The member and
  * weight bounds are the verifier's immutable bridge-authorizing interval, in
@@ -565,6 +593,9 @@ struct BridgeV2GateParams {
  * of V2 records and of the V2 withdrawal tree and equals the verifier's
  * BRIDGE_ACTIVATION_HEIGHT; W2 (`burn_height`) >= V is the first height of
  * V2 burns (B-12 default W2 = V). Neither enters the registry id.
+ *
+ * `vault` is the launch entry; `successor` is the optional B-23 successor
+ * v' (BridgeV2SuccessorEntry), unset until a migration is pinned.
  */
 struct BridgeV2Params {
     int32_t activation_height{-1};
@@ -573,6 +604,59 @@ struct BridgeV2Params {
     BridgeV2VerifierPins verifier{};
     BridgeV2VaultEntry vault{};
     BridgeV2GateParams gate{};
+    std::optional<BridgeV2SuccessorEntry> successor{};
+
+    //! The entry of `role`; nullptr for SUCCESSOR when none is pinned.
+    const BridgeV2VaultEntry* Entry(BridgeV2EntryRole role) const
+    {
+        switch (role) {
+        case BridgeV2EntryRole::LAUNCH:
+            return &vault;
+        case BridgeV2EntryRole::SUCCESSOR:
+            return successor ? &successor->entry : nullptr;
+        }
+        return nullptr;
+    }
+
+    /**
+     * The successor's own rules, given a launch envelope that is otherwise
+     * Valid(): a complete entry on v's chain and token with v's decimals,
+     * token code hash, proof kind and caps (the mint epoch counters are
+     * keyed by the shared AssetId); a vault address of its own; v as the
+     * predecessor; a non-null AssetId; h_m > V and h_m >= W2. On Ethereum
+     * mainnet v' needs its vault code hash (OI-3 leaves it unpinned only
+     * off mainnet). True without a successor.
+     */
+    bool SuccessorValid() const
+    {
+        if (!successor) return true;
+        const BridgeV2SuccessorEntry& s{*successor};
+        const BridgeV2VaultEntry& next{s.entry};
+        if (!next.Valid() || next.origin_chain_id != vault.origin_chain_id ||
+            next.token_address != vault.token_address ||
+            next.origin_decimals != vault.origin_decimals ||
+            next.asset_decimals != vault.asset_decimals ||
+            next.token_runtime_code_hash != vault.token_runtime_code_hash ||
+            next.proof_kind != vault.proof_kind ||
+            next.mint_caps.max_per_block != vault.mint_caps.max_per_block ||
+            next.mint_caps.max_per_epoch != vault.mint_caps.max_per_epoch ||
+            next.mint_caps.epoch_length_blocks !=
+                vault.mint_caps.epoch_length_blocks) {
+            return false;
+        }
+        if (next.vault_address == vault.vault_address ||
+            next.vault_address == vault.token_address ||
+            next.vault_address == verifier.address ||
+            s.predecessor != vault.vault_address || s.asset_id.IsNull()) {
+            return false;
+        }
+        if (s.migration_height <= activation_height ||
+            s.migration_height < burn_height) {
+            return false;
+        }
+        return next.origin_chain_id != BUSD_ETHEREUM_CHAIN_ID ||
+               next.vault_runtime_code_hash.has_value();
+    }
 
     bool Valid() const
     {
@@ -603,7 +687,7 @@ struct BridgeV2Params {
              !verifier.max_epoch_lag_seconds)) {
             return false;
         }
-        return true;
+        return SuccessorValid();
     }
 };
 

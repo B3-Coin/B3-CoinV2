@@ -212,6 +212,28 @@ public:
             //! The Verifier V2 MAX_EPOCH_LAG DeployV2 will use; when set it
             //! must equal the regtest burn gate's set expiry (profile R).
             std::optional<int64_t> verifier_max_epoch_lag{};
+
+            /**
+             * The optional B-23 successor vault v' (`v2.successor`; node
+             * changes section 7.6). Pinned, like v, before the chain first
+             * stores a block at or above A3 (OI-3), and applied only from
+             * migration_height h_m > V (h_m >= W2). Only v' itself is keyed:
+             * its CREATE address (a dedicated deployer at nonce 0), v as its
+             * predecessor, the bUSD V2 AssetId it carries (raw EVM bytes,
+             * Vault V2 B3_ASSET_ID, which RegTest() requires to be v's) and
+             * optionally a deployment-block lower bound (default v's). v's
+             * chain, token, token code hash, decimals, proof kind,
+             * MAX_DEPOSIT_RAW and caps are inherited; the vault code hash of
+             * v' stays unset (OI-3), so naming it is an unknown key.
+             */
+            struct SuccessorSection {
+                Consensus::BridgeEthAddress vault{};
+                Consensus::BridgeEthAddress predecessor{};
+                uint256 asset_id{};
+                int migration_height{0};
+                std::optional<uint64_t> origin_deployment_block{};
+            };
+            std::optional<SuccessorSection> successor{};
         };
 
         //! Whether the file carried a v1_decentralized section. True by

@@ -23,6 +23,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <cassert>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -219,6 +220,65 @@ CChainParams::RegTestOptions FlowMeshOptions(std::optional<CChainParams::B3RegTe
     CChainParams::RegTestOptions options;
     options.b3_modern = b3;
     return options;
+}
+
+// B-23 successor stand-ins (node changes section 7.6): v' at a fresh address
+// and h_m a few blocks above V = 200.
+const std::string SUCCESSOR_VAULT{"0x4646464646464646464646464646464646464646"};
+constexpr int MIGRATION_HEIGHT{V2_HEIGHT + 20};
+
+//! The bUSD V2 AssetId of the launch entry a successor-free pin file
+//! configures, recomputed from the chain's genesis and X (every FlowMesh
+//! regtest chain shares one modern domain).
+uint256 LaunchAssetIdOf(const std::string& launch_pins)
+{
+    const auto chain{CChainParams::RegTest(FlowMeshOptions(ParseB3RegTestBridgePins(launch_pins)))};
+    const Consensus::Params& params{chain->GetConsensus()};
+    assert(params.legacy_final_hash && params.bridge_v2 && !params.bridge_v2->successor);
+    const auto domain{modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)};
+    assert(domain);
+    return modern::BridgeAssetIdV2(*domain, params.bridge_v2->vault);
+}
+
+//! LaunchAssetIdOf the default v2 section.
+uint256 LaunchAssetIdV2()
+{
+    static const uint256 asset_id{LaunchAssetIdOf(ValidV2Pins())};
+    return asset_id;
+}
+
+//! 0x-prefixed raw bytes of a 32-byte value (Vault V2 B3_ASSET_ID order).
+std::string EvmHex(const uint256& value) { return "0x" + HexStr(value); }
+
+//! A valid v2.successor object for the default v2 section.
+UniValue ValidSuccessor(int migration_height = MIGRATION_HEIGHT)
+{
+    UniValue successor{UniValue::VOBJ};
+    successor.pushKV("vault", SUCCESSOR_VAULT);
+    successor.pushKV("predecessor", VAULT_V2);
+    successor.pushKV("asset_id", EvmHex(LaunchAssetIdV2()));
+    successor.pushKV("migration_height", static_cast<uint64_t>(migration_height));
+    return successor;
+}
+
+//! `object` with <key> replaced or added.
+UniValue With(UniValue object, const std::string& key, const UniValue& value)
+{
+    object.pushKV(key, value);
+    return object;
+}
+
+//! A v2-only file whose v2 section (default ValidV2()) carries `successor`.
+std::string SuccessorPins(const UniValue& successor = ValidSuccessor(), UniValue v2 = ValidV2())
+{
+    v2.pushKV("successor", successor);
+    return V2Root(v2).write();
+}
+
+//! The v2-only successor file with v2.successor.<key> replaced or added.
+std::string WithSuccessor(const std::string& key, const UniValue& value)
+{
+    return SuccessorPins(With(ValidSuccessor(), key, value));
 }
 
 } // namespace
@@ -1059,6 +1119,376 @@ BOOST_AUTO_TEST_CASE(kernel_v2_cross_checks)
                           HasReason("-b3bridgepins requires -b3flowmeshtest"));
 }
 
+BOOST_FIXTURE_TEST_CASE(v2_successor_applies, BridgePinsSetup)
+{
+    // The launch-only chain the successor file extends: no successor, so the
+    // migration never activates and no successor identity exists.
+    ArgsManager launch_args;
+    SetArgs(launch_args, WriteFile("v2_launch.json", ValidV2Pins()));
+    launch_args.ForceSetArg("-b3freshlineageheight", std::to_string(FRESH_HEIGHT));
+    const auto launch_chain{CreateChainParams(launch_args, ChainType::REGTEST)};
+    const Consensus::Params& launch{launch_chain->GetConsensus()};
+    BOOST_REQUIRE(launch.bridge_v2);
+    BOOST_CHECK(!launch.bridge_v2->successor);
+    BOOST_CHECK(!modern::ConfiguredBridgeV2EntryId(launch, Consensus::BridgeV2EntryRole::SUCCESSOR));
+    for (const int height : {V2_HEIGHT, MIGRATION_HEIGHT, std::numeric_limits<int>::max()}) {
+        BOOST_CHECK(!launch.BridgeV2MigrationActive(height));
+    }
+
+    // Parsed fields; the AssetId keeps raw EVM byte order.
+    const std::string contents{SuccessorPins()};
+    const auto parsed{ParseB3RegTestBridgePins(contents)};
+    BOOST_REQUIRE(parsed.v2 && parsed.v2->successor);
+    const CChainParams::B3RegTestBridgePins::V2Section::SuccessorSection& pinned{*parsed.v2->successor};
+    BOOST_CHECK_EQUAL("0x" + HexStr(pinned.vault), SUCCESSOR_VAULT);
+    BOOST_CHECK_EQUAL("0x" + HexStr(pinned.predecessor), VAULT_V2);
+    BOOST_CHECK(pinned.asset_id == LaunchAssetIdV2());
+    const std::string pinned_asset_hex{ValidSuccessor().find_value("asset_id").get_str()};
+    BOOST_CHECK_EQUAL(EvmHex(pinned.asset_id), pinned_asset_hex);
+    BOOST_CHECK_EQUAL(pinned.migration_height, MIGRATION_HEIGHT);
+    BOOST_CHECK(!pinned.origin_deployment_block);
+    BOOST_CHECK(!ParseB3RegTestBridgePins(ValidV2Pins()).v2->successor);
+
+    ArgsManager args;
+    SetArgs(args, WriteFile("v2_successor.json", contents));
+    args.ForceSetArg("-b3freshlineageheight", std::to_string(FRESH_HEIGHT));
+    const auto chain{CreateChainParams(args, ChainType::REGTEST)};
+    const Consensus::Params& params{chain->GetConsensus()};
+
+    // Pinned before first start: the record guard hashes the whole file,
+    // successor included, so it freezes with v from the first block >= A3.
+    BOOST_REQUIRE(chain->B3BridgePinsHash());
+    BOOST_CHECK(*chain->B3BridgePinsHash() == Sha256(contents));
+    BOOST_CHECK(*chain->B3BridgePinsHash() != *launch_chain->B3BridgePinsHash());
+
+    BOOST_REQUIRE(params.bridge_v2);
+    const Consensus::BridgeV2Params& v2{*params.bridge_v2};
+    BOOST_CHECK(v2.Valid());
+    BOOST_CHECK(v2.SuccessorValid());
+    BOOST_REQUIRE(v2.successor);
+    const Consensus::BridgeV2SuccessorEntry& successor{*v2.successor};
+    const Consensus::BridgeV2VaultEntry& entry{v2.vault};
+    const Consensus::BridgeV2VaultEntry& next{successor.entry};
+    BOOST_CHECK(v2.Entry(Consensus::BridgeV2EntryRole::SUCCESSOR) == &next);
+
+    // The launch envelope is exactly the launch-only file's.
+    const Consensus::BridgeV2Params& launch_v2{*launch.bridge_v2};
+    BOOST_CHECK_EQUAL(v2.activation_height, launch_v2.activation_height);
+    BOOST_CHECK_EQUAL(v2.burn_height, launch_v2.burn_height);
+    BOOST_CHECK(entry.vault_address == launch_v2.vault.vault_address);
+    BOOST_CHECK(entry.origin_deployment_block == launch_v2.vault.origin_deployment_block);
+    BOOST_CHECK(v2.verifier.address == launch_v2.verifier.address);
+    BOOST_CHECK(v2.gate == launch_v2.gate);
+
+    // Mapped successor fields.
+    BOOST_CHECK_EQUAL("0x" + HexStr(next.vault_address), SUCCESSOR_VAULT);
+    BOOST_CHECK(!next.vault_runtime_code_hash);
+    BOOST_CHECK_EQUAL(next.origin_deployment_block, DEPLOYMENT_BLOCK);
+    BOOST_CHECK(successor.predecessor == entry.vault_address);
+    BOOST_CHECK(successor.asset_id == LaunchAssetIdV2());
+    BOOST_CHECK_EQUAL(successor.migration_height, MIGRATION_HEIGHT);
+
+    // Inherited from v: chain, token, token code hash, decimals, proof kind,
+    // MAX_DEPOSIT_RAW and the mint caps.
+    BOOST_CHECK_EQUAL(next.origin_chain_id, entry.origin_chain_id);
+    BOOST_CHECK_EQUAL(next.origin_chain_id, 31'337U);
+    BOOST_CHECK(next.token_address == entry.token_address);
+    BOOST_CHECK(next.token_runtime_code_hash == entry.token_runtime_code_hash);
+    BOOST_CHECK_EQUAL(next.origin_decimals, entry.origin_decimals);
+    BOOST_CHECK_EQUAL(next.asset_decimals, entry.asset_decimals);
+    BOOST_CHECK_EQUAL(next.proof_kind, entry.proof_kind);
+    BOOST_CHECK_EQUAL(next.max_deposit_raw, entry.max_deposit_raw);
+    BOOST_CHECK_EQUAL(next.mint_caps.max_per_block, entry.mint_caps.max_per_block);
+    BOOST_CHECK_EQUAL(next.mint_caps.max_per_epoch, entry.mint_caps.max_per_epoch);
+    BOOST_CHECK_EQUAL(next.mint_caps.epoch_length_blocks, entry.mint_caps.epoch_length_blocks);
+
+    // Identities: v' carries v's AssetId (not the one its own address would
+    // give), has its own entry id, leaves the launch ids alone and extends
+    // the registry id.
+    const auto domain{modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)};
+    BOOST_REQUIRE(domain);
+    const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
+    BOOST_REQUIRE(asset);
+    BOOST_CHECK(*asset == *modern::ConfiguredBridgeV2AssetId(launch));
+    BOOST_CHECK(*asset == successor.asset_id);
+    BOOST_CHECK(*asset == modern::BridgeAssetIdV2(*domain, entry));
+    BOOST_CHECK(*asset != modern::BridgeAssetIdV2(*domain, next));
+    const auto launch_id{modern::ConfiguredBridgeV2EntryId(params)};
+    const auto successor_id{modern::ConfiguredBridgeV2EntryId(params, Consensus::BridgeV2EntryRole::SUCCESSOR)};
+    BOOST_REQUIRE(launch_id && successor_id);
+    BOOST_CHECK(*launch_id == *modern::ConfiguredBridgeV2EntryId(launch));
+    BOOST_CHECK(*successor_id == modern::BridgeVaultEntryIdV2(*domain, next));
+    BOOST_CHECK(*successor_id != *launch_id);
+    const auto registry{modern::ConfiguredBridgeV2RegistryId(params)};
+    BOOST_REQUIRE(registry);
+    BOOST_CHECK(*registry != *modern::ConfiguredBridgeV2RegistryId(launch));
+
+    // The migration activates only from h_m.
+    BOOST_CHECK(params.BridgeV2RulesActive(V2_HEIGHT));
+    for (const int height : {V2_HEIGHT - 1, V2_HEIGHT, MIGRATION_HEIGHT - 1}) {
+        BOOST_CHECK(!params.BridgeV2MigrationActive(height));
+        BOOST_CHECK(modern::ActiveBridgeV2Role(params, height) == Consensus::BridgeV2EntryRole::LAUNCH);
+        BOOST_CHECK(!modern::ResolveBridgeV2Entry(params, *successor_id, height));
+    }
+    for (const int height : {MIGRATION_HEIGHT, MIGRATION_HEIGHT + 1, std::numeric_limits<int>::max()}) {
+        BOOST_CHECK(params.BridgeV2MigrationActive(height));
+        BOOST_CHECK(modern::ActiveBridgeV2Role(params, height) == Consensus::BridgeV2EntryRole::SUCCESSOR);
+        BOOST_CHECK(modern::ResolveBridgeV2Entry(params, *successor_id, height) ==
+                    Consensus::BridgeV2EntryRole::SUCCESSOR);
+        BOOST_CHECK(modern::ResolveBridgeV2Entry(params, *launch_id, height) ==
+                    Consensus::BridgeV2EntryRole::LAUNCH);
+    }
+
+    // Optional deployment bound: committed by the registry id, not by the
+    // entry id; v's own bound is untouched.
+    {
+        const auto tuned_chain{CChainParams::RegTest(FlowMeshOptions(
+            ParseB3RegTestBridgePins(WithSuccessor("origin_deployment_block", uint64_t{7}))))};
+        const Consensus::Params& tuned{tuned_chain->GetConsensus()};
+        BOOST_REQUIRE(tuned.bridge_v2 && tuned.bridge_v2->successor);
+        BOOST_CHECK_EQUAL(tuned.bridge_v2->successor->entry.origin_deployment_block, 7U);
+        BOOST_CHECK_EQUAL(tuned.bridge_v2->vault.origin_deployment_block, DEPLOYMENT_BLOCK);
+        BOOST_CHECK(*modern::ConfiguredBridgeV2EntryId(tuned, Consensus::BridgeV2EntryRole::SUCCESSOR) == *successor_id);
+        BOOST_CHECK(*modern::ConfiguredBridgeV2RegistryId(tuned) != *registry);
+    }
+    // h_m, like V and W2, is not part of the registry id.
+    {
+        const auto moved_chain{CChainParams::RegTest(FlowMeshOptions(
+            ParseB3RegTestBridgePins(SuccessorPins(ValidSuccessor(MIGRATION_HEIGHT + 5)))))};
+        const Consensus::Params& moved{moved_chain->GetConsensus()};
+        BOOST_CHECK(*modern::ConfiguredBridgeV2RegistryId(moved) == *registry);
+        BOOST_CHECK(!moved.BridgeV2MigrationActive(MIGRATION_HEIGHT + 4));
+        BOOST_CHECK(moved.BridgeV2MigrationActive(MIGRATION_HEIGHT + 5));
+    }
+    // h_m == W2 > V applies, and v's tuned caps are inherited.
+    {
+        UniValue tuned_v2{ValidV2()};
+        tuned_v2.pushKV("burn_height", uint64_t{V2_HEIGHT + 5});
+        tuned_v2.pushKV("max_per_block", uint64_t{20'000'000'000});
+        tuned_v2.pushKV("max_per_epoch", uint64_t{40'000'000'000});
+        const auto tuned_chain{CChainParams::RegTest(FlowMeshOptions(
+            ParseB3RegTestBridgePins(SuccessorPins(ValidSuccessor(V2_HEIGHT + 5), tuned_v2))))};
+        const Consensus::Params& tuned{tuned_chain->GetConsensus()};
+        BOOST_REQUIRE(tuned.bridge_v2 && tuned.bridge_v2->successor);
+        BOOST_CHECK(tuned.bridge_v2->Valid());
+        BOOST_CHECK(!tuned.BridgeV2MigrationActive(V2_HEIGHT + 4));
+        BOOST_CHECK(tuned.BridgeV2MigrationActive(V2_HEIGHT + 5));
+        BOOST_CHECK_EQUAL(tuned.bridge_v2->successor->entry.mint_caps.max_per_block, 20'000'000'000);
+        BOOST_CHECK_EQUAL(tuned.bridge_v2->successor->entry.mint_caps.max_per_epoch, 40'000'000'000);
+    }
+    // Beside a V1 section the successor applies the same way.
+    {
+        UniValue with_successor{ValidV2()};
+        with_successor.pushKV("successor", ValidSuccessor());
+        const auto both_chain{CChainParams::RegTest(FlowMeshOptions(ParseB3RegTestBridgePins(BothPins(with_successor))))};
+        const Consensus::Params& both{both_chain->GetConsensus()};
+        BOOST_REQUIRE(both.bridge_v2 && both.bridge_v2->successor);
+        BOOST_CHECK(*both.busd_bridge->withdrawal_mode == Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1);
+        BOOST_CHECK(*modern::ConfiguredBridgeV2RegistryId(both) == *registry);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_successor_refusals)
+{
+    BOOST_CHECK_NO_THROW(ParseB3RegTestBridgePins(SuccessorPins()));
+    const std::string max_height{std::to_string(std::numeric_limits<int>::max())};
+
+    // Shape: an object holding exactly the successor keys.
+    CheckRefused(SuccessorPins(UniValue{}), "v2.successor must be a JSON object");
+    CheckRefused(SuccessorPins(UniValue{UniValue::VARR}), "v2.successor must be a JSON object");
+    CheckRefused(SuccessorPins(UniValue{UniValue::VOBJ}), "missing key v2.successor.");
+    for (const std::string key : {"vault", "predecessor", "asset_id", "migration_height"}) {
+        CheckRefused(SuccessorPins(Without(ValidSuccessor(), key)), "missing key v2.successor." + key);
+    }
+    std::string duplicate{SuccessorPins()};
+    duplicate.insert(duplicate.find("\"predecessor\""), "\"predecessor\":\"" + VAULT_V2 + "\",");
+    CheckRefused(duplicate, "duplicate key v2.successor.predecessor");
+
+    // Everything else is inherited from v, and v''s code hash commits to
+    // blockHash(R_f - 1) (OI-3): none of them is a successor key.
+    for (const std::string key : {"token", "origin_chain_id", "vault_runtime_code_hash", "token_runtime_code_hash",
+                                  "max_deposit_raw", "max_per_block", "max_per_epoch", "proof_kind",
+                                  "origin_decimals", "asset_decimals", "verifier", "activation_height",
+                                  "burn_height", "light_client"}) {
+        CheckRefused(WithSuccessor(key, Repeat("11", 32)), "unknown key v2.successor." + key);
+    }
+
+    // Addresses: 0x hex, non-zero; v' is a contract of its own and v is its
+    // predecessor.
+    CheckRefused(WithSuccessor("vault", SUCCESSOR_VAULT.substr(2)),
+                 "v2.successor.vault must be a 0x-prefixed 20-byte hex string");
+    CheckRefused(WithSuccessor("vault", "0x" + std::string(40, 'z')),
+                 "v2.successor.vault must be a 0x-prefixed 20-byte hex string");
+    CheckRefused(WithSuccessor("vault", uint64_t{1}), "v2.successor.vault must be a 0x-prefixed 20-byte hex string");
+    CheckRefused(WithSuccessor("predecessor", Repeat("46", 19)),
+                 "v2.successor.predecessor must be a 0x-prefixed 20-byte hex string");
+    CheckRefused(WithSuccessor("vault", Repeat("00", 20)), "v2.successor.vault must be non-zero");
+    CheckRefused(WithSuccessor("predecessor", Repeat("00", 20)), "v2.successor.predecessor must be non-zero");
+    for (const std::string& address : {VAULT_V2, TOKEN, VERIFIER_V2}) {
+        CheckRefused(WithSuccessor("vault", address),
+                     "v2.successor.vault must differ from v2.vault, v2.token and v2.verifier");
+    }
+    for (const std::string& address : {TOKEN, VERIFIER_V2, SUCCESSOR_VAULT, VAULT}) {
+        CheckRefused(WithSuccessor("predecessor", address),
+                     "v2.successor.predecessor must equal v2.vault (the launch vault it retires)");
+    }
+
+    // AssetId: 32 raw bytes, non-zero; RegTest() checks the value (below).
+    CheckRefused(WithSuccessor("asset_id", Repeat("00", 32)), "v2.successor.asset_id must be non-zero");
+    CheckRefused(WithSuccessor("asset_id", Repeat("11", 20)),
+                 "v2.successor.asset_id must be a 0x-prefixed 32-byte hex string");
+    BOOST_CHECK_NO_THROW(ParseB3RegTestBridgePins(WithSuccessor("asset_id", Repeat("11", 32))));
+
+    // h_m > V, h_m >= W2, h_m <= INT_MAX.
+    CheckRefused(WithSuccessor("migration_height", uint64_t{V2_HEIGHT}),
+                 "v2.successor.migration_height (200) must be above activation_height (200), "
+                 "at or above burn_height (200) and at most " + max_height);
+    CheckRefused(WithSuccessor("migration_height", uint64_t{V2_HEIGHT - 1}),
+                 "v2.successor.migration_height (199) must be above activation_height (200)");
+    CheckRefused(WithSuccessor("migration_height", uint64_t{0}),
+                 "v2.successor.migration_height (0) must be above activation_height (200)");
+    BOOST_CHECK_EQUAL(ParseB3RegTestBridgePins(WithSuccessor("migration_height", uint64_t{V2_HEIGHT + 1}))
+                          .v2->successor->migration_height,
+                      V2_HEIGHT + 1);
+    {
+        UniValue late_burn{ValidV2()};
+        late_burn.pushKV("burn_height", uint64_t{V2_HEIGHT + 5});
+        CheckRefused(SuccessorPins(ValidSuccessor(V2_HEIGHT + 4), late_burn),
+                     "v2.successor.migration_height (204) must be above activation_height (200), "
+                     "at or above burn_height (205)");
+        BOOST_CHECK_EQUAL(ParseB3RegTestBridgePins(SuccessorPins(ValidSuccessor(V2_HEIGHT + 5), late_burn))
+                              .v2->successor->migration_height,
+                          V2_HEIGHT + 5);
+    }
+    CheckRefused(WithSuccessor("migration_height", uint64_t{1} << 31),
+                 "v2.successor.migration_height (2147483648) must be above");
+    BOOST_CHECK_EQUAL(ParseB3RegTestBridgePins(WithSuccessor("migration_height",
+                                                             uint64_t{std::numeric_limits<int>::max()}))
+                          .v2->successor->migration_height,
+                      std::numeric_limits<int>::max());
+    CheckRefused(WithSuccessor("migration_height", uint64_t{1} << 32),
+                 "v2.successor.migration_height must be an unsigned integer of at most 32 bits");
+    CheckRefused(WithSuccessor("migration_height", int64_t{-1}),
+                 "v2.successor.migration_height must be an unsigned integer");
+    CheckRefused(WithSuccessor("migration_height", "220"),
+                 "v2.successor.migration_height must be an unsigned integer");
+
+    // The optional deployment bound.
+    CheckRefused(WithSuccessor("origin_deployment_block", uint64_t{0}),
+                 "v2.successor.origin_deployment_block must be at least 1");
+    BOOST_CHECK_EQUAL(*ParseB3RegTestBridgePins(WithSuccessor("origin_deployment_block", uint64_t{1}))
+                           .v2->successor->origin_deployment_block,
+                      1U);
+
+    // A refused successor fails the whole file, also beside a V1 section.
+    CheckRefused(BothPins(With(ValidV2(), "successor", Without(ValidSuccessor(), "asset_id"))),
+                 "missing key v2.successor.asset_id");
+
+    // Kernel (RegTest()): the AssetId must be v's, recomputed under this
+    // chain's domain, in raw EVM order.
+    BOOST_CHECK_NO_THROW(CChainParams::RegTest(FlowMeshOptions(ParseB3RegTestBridgePins(SuccessorPins()))));
+    const std::string asset_mismatch{
+        "-b3bridgepins v2.successor.asset_id must equal the launch vault's bUSD V2 AssetId (B-23)"};
+    const auto regtest{[](const std::string& json) {
+        return CChainParams::RegTest(FlowMeshOptions(ParseB3RegTestBridgePins(json)));
+    }};
+    BOOST_CHECK_EXCEPTION(regtest(WithSuccessor("asset_id", Repeat("11", 32))), std::runtime_error,
+                          HasReason(asset_mismatch));
+    BOOST_CHECK_EXCEPTION(regtest(WithSuccessor("asset_id", "0x" + LaunchAssetIdV2().GetHex())),
+                          std::runtime_error, HasReason(asset_mismatch));
+    {
+        // The id v''s own address would give is not v's.
+        const auto chain{regtest(SuccessorPins())};
+        const Consensus::Params& params{chain->GetConsensus()};
+        const auto domain{modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)};
+        BOOST_REQUIRE(domain);
+        const uint256 own{modern::BridgeAssetIdV2(*domain, params.bridge_v2->successor->entry)};
+        BOOST_CHECK(own != LaunchAssetIdV2());
+        BOOST_CHECK_EXCEPTION(regtest(WithSuccessor("asset_id", EvmHex(own))), std::runtime_error,
+                              HasReason(asset_mismatch));
+    }
+    {
+        // Another launch vault has another AssetId: v's id from one file
+        // does not carry over to a file whose v (and predecessor) differ.
+        const std::string other_vault{Repeat("47", 20)};
+        UniValue other_v2{ValidV2()};
+        other_v2.pushKV("vault", other_vault);
+        const uint256 other_asset{LaunchAssetIdOf(V2Root(other_v2).write())};
+        BOOST_CHECK(other_asset != LaunchAssetIdV2());
+        UniValue other_successor{With(ValidSuccessor(), "predecessor", other_vault)};
+        BOOST_CHECK_EXCEPTION(regtest(SuccessorPins(other_successor, other_v2)), std::runtime_error,
+                              HasReason(asset_mismatch));
+        BOOST_CHECK_NO_THROW(regtest(SuccessorPins(With(other_successor, "asset_id", EvmHex(other_asset)), other_v2)));
+    }
+
+    // Kernel: v' must not sit on any V1 bridge contract.
+    const std::string v1_overlap{"-b3bridgepins v2.successor.vault must differ from every V1 bridge contract"};
+    for (const std::string& address : {VAULT, VERIFIER}) {
+        UniValue v2{ValidV2()};
+        v2.pushKV("successor", With(ValidSuccessor(), "vault", address));
+        BOOST_CHECK_EXCEPTION(regtest(BothPins(v2)), std::runtime_error, HasReason(v1_overlap));
+        // Without the V1 section those addresses are not bridge contracts.
+        BOOST_CHECK_NO_THROW(regtest(SuccessorPins(With(ValidSuccessor(), "vault", address))));
+    }
+    {
+        // The V1 token, when the v2 section uses a token of its own.
+        UniValue v2{ValidV2()};
+        v2.pushKV("token", TOKEN_V2);
+        const uint256 asset{LaunchAssetIdOf(V2Root(v2).write())};
+        UniValue on_token{v2};
+        on_token.pushKV("successor", With(With(ValidSuccessor(), "vault", TOKEN), "asset_id", EvmHex(asset)));
+        BOOST_CHECK_EXCEPTION(regtest(BothPins(on_token)), std::runtime_error, HasReason(v1_overlap));
+        v2.pushKV("successor", With(ValidSuccessor(), "asset_id", EvmHex(asset)));
+        BOOST_CHECK_NO_THROW(regtest(BothPins(v2)));
+    }
+    // The synthetic MANAGED_V1 bridge's vault and authority.
+    for (const std::string& address : {"0x" + HexStr(Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY.vault_address),
+                                       Repeat("42", 20)}) {
+        BOOST_CHECK_EXCEPTION(regtest(WithSuccessor("vault", address)), std::runtime_error, HasReason(v1_overlap));
+    }
+
+    // Hand-built sections reach the kernel's own checks.
+    const auto pins{ParseB3RegTestBridgePins(SuccessorPins())};
+    {
+        auto at_v{pins};
+        at_v.v2->successor->migration_height = V2_HEIGHT;
+        BOOST_CHECK_EXCEPTION(CChainParams::RegTest(FlowMeshOptions(at_v)), std::runtime_error,
+                              HasReason("-b3bridgepins v2.successor.migration_height (200) must be above "
+                                        "v2.activation_height (200) and at or above v2.burn_height (200)"));
+        auto below_w2{pins};
+        below_w2.v2->burn_height = V2_HEIGHT + 5;
+        below_w2.v2->successor->migration_height = V2_HEIGHT + 4;
+        BOOST_CHECK_EXCEPTION(CChainParams::RegTest(FlowMeshOptions(below_w2)), std::runtime_error,
+                              HasReason("-b3bridgepins v2.successor.migration_height (204) must be above "
+                                        "v2.activation_height (200) and at or above v2.burn_height (205)"));
+        auto zero_asset{pins};
+        zero_asset.v2->successor->asset_id = uint256{};
+        BOOST_CHECK_EXCEPTION(CChainParams::RegTest(FlowMeshOptions(zero_asset)), std::runtime_error,
+                              HasReason(asset_mismatch));
+    }
+    const std::string incomplete{"-b3bridgepins v2 does not form a complete bridge V2 configuration"};
+    {
+        auto wrong_predecessor{pins};
+        wrong_predecessor.v2->successor->predecessor = pins.v2->token;
+        BOOST_CHECK_EXCEPTION(CChainParams::RegTest(FlowMeshOptions(wrong_predecessor)), std::runtime_error,
+                              HasReason(incomplete));
+        for (const Consensus::BridgeEthAddress& address : {pins.v2->vault, pins.v2->token, pins.v2->verifier}) {
+            auto reused{pins};
+            reused.v2->successor->vault = address;
+            BOOST_CHECK_EXCEPTION(CChainParams::RegTest(FlowMeshOptions(reused)), std::runtime_error,
+                                  HasReason(incomplete));
+        }
+        auto zero_vault{pins};
+        zero_vault.v2->successor->vault = Consensus::BridgeEthAddress{};
+        BOOST_CHECK_EXCEPTION(CChainParams::RegTest(FlowMeshOptions(zero_vault)), std::runtime_error,
+                              HasReason(incomplete));
+        auto zero_deployment{pins};
+        zero_deployment.v2->successor->origin_deployment_block = 0;
+        BOOST_CHECK_EXCEPTION(CChainParams::RegTest(FlowMeshOptions(zero_deployment)), std::runtime_error,
+                              HasReason(incomplete));
+    }
+}
+
 BOOST_FIXTURE_TEST_CASE(v2_pins_refused_off_regtest, BridgePinsSetup)
 {
     const std::string path{WriteFile("v2.json", ValidV2Pins())};
@@ -1094,6 +1524,39 @@ BOOST_FIXTURE_TEST_CASE(v2_pins_refused_off_regtest, BridgePinsSetup)
     ArgsManager no_fresh;
     SetArgs(no_fresh, path);
     BOOST_CHECK_EXCEPTION(CreateChainParams(no_fresh, ChainType::REGTEST), std::runtime_error,
+                          HasReason("-b3bridgepins v2 requires -b3freshlineageheight"));
+
+    // A file carrying a B-23 successor is refused the same way, so no
+    // migration can activate anywhere but FlowMesh regtest.
+    const std::string successor_path{WriteFile("v2_successor.json", SuccessorPins())};
+    for (const ChainType chain : {ChainType::MAIN, ChainType::TESTNET,
+                                  ChainType::TESTNET4, ChainType::SIGNET}) {
+        ArgsManager args;
+        SetArgs(args, successor_path);
+        args.ForceSetArg("-b3freshlineageheight", std::to_string(FRESH_HEIGHT));
+        BOOST_CHECK_EXCEPTION(CreateChainParams(args, chain), std::runtime_error,
+                              HasReason("-b3bridgepins is regtest-only"));
+        ArgsManager bare;
+        bare.ForceSetArg("-b3bridgepins", successor_path);
+        BOOST_CHECK_EXCEPTION(CreateChainParams(bare, chain), std::runtime_error,
+                              HasReason("-b3bridgepins is regtest-only"));
+        const auto params{CreateChainParams(ArgsManager{}, chain)};
+        BOOST_CHECK(!params->GetConsensus().BridgeV2MigrationActive(std::numeric_limits<int>::max()));
+    }
+    for (const auto& [modern, flowmesh] : {std::pair{false, false}, std::pair{true, false},
+                                           std::pair{false, true}}) {
+        ArgsManager args;
+        SetArgs(args, successor_path, modern, flowmesh);
+        args.ForceSetArg("-b3freshlineageheight", std::to_string(FRESH_HEIGHT));
+        BOOST_CHECK_EXCEPTION(CreateChainParams(args, ChainType::REGTEST), std::runtime_error,
+                              HasReason("-b3bridgepins requires -b3modernregtest and -b3flowmeshtest (regtest-only)"));
+    }
+    BOOST_CHECK(!CreateChainParams(ArgsManager{}, ChainType::REGTEST)
+                     ->GetConsensus()
+                     .BridgeV2MigrationActive(std::numeric_limits<int>::max()));
+    ArgsManager successor_no_fresh;
+    SetArgs(successor_no_fresh, successor_path);
+    BOOST_CHECK_EXCEPTION(CreateChainParams(successor_no_fresh, ChainType::REGTEST), std::runtime_error,
                           HasReason("-b3bridgepins v2 requires -b3freshlineageheight"));
 }
 

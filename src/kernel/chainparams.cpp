@@ -16,6 +16,7 @@
 #include <kernel/messagestartchars.h>
 #include <legacy/consensus.h>
 #include <legacy/primitives.h>
+#include <modern/bridge_v2.h>
 #include <modern/chain_domain.h>
 #include <modern/fn_genesis.h>
 #include <modern/fn_genesis_validation.h>
@@ -1265,6 +1266,8 @@ public:
             // record guard OI-3's rule: V2 pins affect no block below A3,
             // and once a block at or above A3 is stored the file can no
             // longer change. The OI-3 code hashes stay unset (31337 only).
+            // The same guard freezes an optional B-23 successor, whose rules
+            // apply only from its migration height h_m > V.
             if (b3.bridge_pins && b3.bridge_pins->v2) {
                 const B3RegTestBridgePins::V2Section& v2{*b3.bridge_pins->v2};
                 if (!consensus.fresh_lineage) {
@@ -1344,6 +1347,43 @@ public:
                     throw std::runtime_error(strprintf(
                         "-b3bridgepins v2.verifier_max_epoch_lag (%d) must equal the regtest burn gate's set expiry (%d)",
                         *v2.verifier_max_epoch_lag, bridge_v2.gate.set_expiry_seconds));
+                }
+                // B-23 successor v' (node changes section 7.6), pinned with v
+                // before the first block >= A3 and applied only from h_m: v's
+                // entry with v''s own vault address and deployment bound. Its
+                // code hash stays unset like v's (OI-3, 31337 only), and it
+                // must carry v's bUSD V2 AssetId recomputed under this
+                // chain's domain (section 3.4 assertion 6, B-23 exception).
+                if (v2.successor) {
+                    const B3RegTestBridgePins::V2Section::SuccessorSection& pinned{*v2.successor};
+                    if (is_v1_contract(pinned.vault)) {
+                        throw std::runtime_error(
+                            "-b3bridgepins v2.successor.vault must differ from every V1 bridge contract");
+                    }
+                    if (pinned.migration_height <= bridge_v2.activation_height ||
+                        pinned.migration_height < bridge_v2.burn_height) {
+                        throw std::runtime_error(strprintf(
+                            "-b3bridgepins v2.successor.migration_height (%d) must be above v2.activation_height (%d) and at or above v2.burn_height (%d)",
+                            pinned.migration_height, bridge_v2.activation_height, bridge_v2.burn_height));
+                    }
+                    Consensus::BridgeV2SuccessorEntry successor;
+                    successor.entry = bridge_v2.vault;
+                    successor.entry.vault_address = pinned.vault;
+                    successor.entry.vault_runtime_code_hash.reset();
+                    successor.entry.origin_deployment_block =
+                        pinned.origin_deployment_block.value_or(v2.origin_deployment_block);
+                    successor.predecessor = pinned.predecessor;
+                    successor.asset_id = pinned.asset_id;
+                    successor.migration_height = pinned.migration_height;
+                    assert(consensus.legacy_final_hash);
+                    const auto domain{modern::ModernChainDomain(
+                        consensus.hashGenesisBlock, *consensus.legacy_final_hash)};
+                    assert(domain.has_value());
+                    if (pinned.asset_id != modern::BridgeAssetIdV2(*domain, bridge_v2.vault)) {
+                        throw std::runtime_error(
+                            "-b3bridgepins v2.successor.asset_id must equal the launch vault's bUSD V2 AssetId (B-23)");
+                    }
+                    bridge_v2.successor = std::move(successor);
                 }
                 if (!bridge_v2.Valid()) {
                     throw std::runtime_error(

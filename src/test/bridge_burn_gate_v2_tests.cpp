@@ -9,7 +9,10 @@
 //   7.2 check 2);
 // - the wind-down bound (section 7.2 check 3);
 // - invariant R (section 8.4);
-// - transit crediting on proven arrival (section 7.6; bridge/reserve_v2.h).
+// - transit crediting on proven arrival (section 7.6; bridge/reserve_v2.h);
+// - the B-23 migration (sections 7.5 and 7.6): the C1 retirement row,
+//   transit production by the migration and sweep leaves, and supply,
+//   invariant R and the wind-down bound across a migration.
 //
 // Every row has a refusal case, and each time or height limit is tested at
 // the limit (accepted) and one second or one block past it (refused). The
@@ -720,6 +723,48 @@ BOOST_AUTO_TEST_CASE(record_mint_and_burn)
     BOOST_CHECK(!RecordBurnV2(invalid, 1));
 }
 
+BOOST_AUTO_TEST_CASE(record_transit)
+{
+    // A migration or sweep leaf adds to the successor's transit only:
+    // minted, burned, credited and the reserve are unchanged.
+    ReserveLedgerV2 ledger{.minted = 50, .burned = 20, .credited = 10, .transit = 0};
+    BOOST_CHECK(RecordTransitV2(ledger, 100));
+    BOOST_CHECK(ledger == (ReserveLedgerV2{.minted = 50, .burned = 20, .credited = 10, .transit = 100}));
+    BOOST_CHECK_EQUAL(*ledger.Reserve(), 40); // transit never counts
+    BOOST_CHECK(RecordTransitV2(ledger, 1));
+    BOOST_CHECK_EQUAL(ledger.transit, 101);
+
+    // Positive amounts only; a refusal leaves the ledger unchanged.
+    const ReserveLedgerV2 before{ledger};
+    BOOST_CHECK(!RecordTransitV2(ledger, 0));
+    BOOST_CHECK(!RecordTransitV2(ledger, -1));
+    BOOST_CHECK(!RecordTransitV2(ledger, std::numeric_limits<CAmount>::min()));
+    BOOST_CHECK(ledger == before);
+
+    // Checked overflow of transit, at the limit and one unit above.
+    ReserveLedgerV2 high{.minted = 7, .burned = 3, .credited = 2, .transit = INT64_MAX_V - 5};
+    const ReserveLedgerV2 high_before{high};
+    BOOST_CHECK(!RecordTransitV2(high, 6));
+    BOOST_CHECK(high == high_before);
+    BOOST_CHECK(RecordTransitV2(high, 5));
+    BOOST_CHECK(high == (ReserveLedgerV2{.minted = 7, .burned = 3, .credited = 2, .transit = INT64_MAX_V}));
+    BOOST_CHECK(high.Valid()); // transit is outside the backing sum
+    BOOST_CHECK(!RecordTransitV2(high, 1));
+    BOOST_CHECK_EQUAL(high.transit, INT64_MAX_V);
+
+    // An invalid ledger takes no transit: a negative reserve, a negative
+    // transit, or minted + credited out of range.
+    ReserveLedgerV2 invalid{.minted = 1, .burned = 2, .credited = 0, .transit = 0};
+    BOOST_CHECK(!RecordTransitV2(invalid, 1));
+    BOOST_CHECK_EQUAL(invalid.transit, 0);
+    ReserveLedgerV2 negative{.minted = 0, .burned = 0, .credited = 0, .transit = -1};
+    BOOST_CHECK(!RecordTransitV2(negative, 1));
+    BOOST_CHECK_EQUAL(negative.transit, -1);
+    ReserveLedgerV2 overflow{.minted = INT64_MAX_V, .burned = 0, .credited = 1, .transit = 0};
+    BOOST_CHECK(!RecordTransitV2(overflow, 1));
+    BOOST_CHECK_EQUAL(overflow.transit, 0);
+}
+
 BOOST_AUTO_TEST_CASE(burn_within_reserve_counts_block_burns_and_credit)
 {
     ReserveLedgerV2 ledger{.minted = 100, .burned = 0, .credited = 0, .transit = 0};
@@ -1076,6 +1121,415 @@ BOOST_AUTO_TEST_CASE(invariant_r_holds_and_fails)
     BOOST_CHECK(!InvariantRHolds(INT64_MAX_V, INT64_MAX_V, owed)); // short by one
     BOOST_CHECK(!InvariantRMarginV2(INT64_MAX_V, INT64_MAX_V, owed));
     BOOST_CHECK(InvariantRHolds(INT64_MAX_V, INT64_MAX_V - 1, owed));
+}
+
+// ------------------------------------------- B-23 migration (section 7.6)
+
+namespace {
+
+//! The bUSD V2 backing over both entries, the sum of reserve + transit
+//! (section 7.1). It equals the supply: a migration or sweep burns nothing,
+//! and a burn leaf lowers supply and reserve together.
+CAmount Backing(const ReserveLedgerV2& launch, const ReserveLedgerV2& successor)
+{
+    const auto launch_reserve{launch.Reserve()};
+    const auto successor_reserve{successor.Reserve()};
+    BOOST_REQUIRE(launch_reserve && successor_reserve);
+    return *launch_reserve + launch.transit + *successor_reserve + successor.transit;
+}
+
+//! One migration or sweep leaf of v's whole reserve (section 7.6), through
+//! the production accounting RecordSweepV2: the leaf names the retired
+//! entry v, so the amount counts in burned_v, and it pays v', adding the
+//! amount to transit_v'. False, with both ledgers unchanged, when v has
+//! nothing to sweep. (The wind-down cap, VaultSweepAmountV2, never binds
+//! while v holds what it locks; wind_down_across_migration covers it.)
+bool Sweep(ReserveLedgerV2& launch, ReserveLedgerV2& successor)
+{
+    const auto amount{launch.Reserve()};
+    return amount && RecordSweepV2(launch, successor, *amount);
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(migration_accounting_sequence)
+{
+    // v: deposits 0 (60) and 1 (40) proven and minted.
+    ReserveLedgerV2 v;
+    ReserveLedgerV2 vp;
+    CAmount supply{0};
+    BOOST_REQUIRE(RecordMintV2(v, 60));
+    BOOST_REQUIRE(RecordMintV2(v, 40));
+    supply += 100;
+    BOOST_CHECK_EQUAL(Backing(v, vp), supply);
+
+    // h_m: the migration leaf of reserve_v = 100. v: burned 100 and reserve
+    // 0; v': transit 100 and reserve 0. Nothing is burned.
+    BOOST_REQUIRE(Sweep(v, vp));
+    BOOST_CHECK(v == (ReserveLedgerV2{.minted = 100, .burned = 100, .credited = 0, .transit = 0}));
+    BOOST_CHECK_EQUAL(*v.Reserve(), 0);
+    BOOST_CHECK(vp == (ReserveLedgerV2{.minted = 0, .burned = 0, .credited = 0, .transit = 100}));
+    BOOST_CHECK_EQUAL(*vp.Reserve(), 0);
+    BOOST_CHECK_EQUAL(Backing(v, vp), supply);
+    // A second sweep has nothing to sweep and changes nothing.
+    {
+        const ReserveLedgerV2 v_swept{v};
+        const ReserveLedgerV2 vp_swept{vp};
+        BOOST_CHECK(!Sweep(v, vp));
+        BOOST_CHECK(v == v_swept);
+        BOOST_CHECK(vp == vp_swept);
+    }
+
+    // RESERVE_E of v' before absorb(), with the leaf unreleased (balance 0)
+    // or released (balance 100): absorbedTotal 0 credits 0, and invariant R
+    // holds with locked 0 and P 0, so no conflict.
+    for (const CAmount balance : {CAmount{0}, CAmount{100}}) {
+        const ReserveStateV2 before_absorb{Observed(0, 0, balance, 0)};
+        ReserveLedgerV2 judged{vp};
+        const auto moved{CreditTransit(judged, before_absorb.absorbed_total)};
+        BOOST_REQUIRE(moved);
+        BOOST_CHECK_EQUAL(*moved, 0);
+        BOOST_CHECK(judged == vp);
+        const CAmount p_pre{Sums(before_absorb, {}).below_cut};
+        BOOST_CHECK_EQUAL(p_pre, 0);
+        BOOST_CHECK(InvariantRHolds(before_absorb.locked, p_pre, judged));
+        BOOST_CHECK_EQUAL(*InvariantRMarginV2(before_absorb.locked, p_pre, judged), 0);
+        BOOST_CHECK_EQUAL(*judged.Reserve(), 0);
+    }
+
+    // A partial absorb(): a USDT fee of 1 leaves absorbedTotal 99. It
+    // credits 99 and leaves 1 in transit, which still backs supply.
+    {
+        ReserveLedgerV2 partial{vp};
+        const ReserveStateV2 fee{Observed(0, 99, 99, 99)};
+        BOOST_CHECK_EQUAL(*CreditTransit(partial, fee.absorbed_total), 99);
+        BOOST_CHECK(partial == (ReserveLedgerV2{.minted = 0, .burned = 0, .credited = 99, .transit = 1}));
+        BOOST_CHECK(InvariantRHolds(fee.locked, 0, partial));
+        BOOST_CHECK_EQUAL(*InvariantRMarginV2(fee.locked, 0, partial), 0);
+        BOOST_CHECK_EQUAL(Backing(v, partial), supply);
+        BOOST_CHECK_EQUAL(*CreditTransit(partial, fee.absorbed_total), 0);
+        BOOST_CHECK_EQUAL(partial.transit, 1);
+    }
+    // Absorbed strays: absorbedTotal 130 (30 sent to v' directly) credits
+    // only the transit, 100, never the strays.
+    {
+        ReserveLedgerV2 strays{vp};
+        const ReserveStateV2 extra{Observed(0, 130, 130, 130)};
+        BOOST_CHECK_EQUAL(*CreditTransit(strays, extra.absorbed_total), 100);
+        BOOST_CHECK(strays == (ReserveLedgerV2{.minted = 0, .burned = 0, .credited = 100, .transit = 0}));
+        BOOST_CHECK_EQUAL(*InvariantRMarginV2(extra.locked, 0, strays), 30);
+        BOOST_CHECK_EQUAL(Backing(v, strays), supply);
+    }
+
+    // absorb() counted the whole leaf: absorbedTotal 100 credits 100.
+    const ReserveStateV2 absorbed{Observed(0, 100, 100, 100)};
+    BOOST_CHECK_EQUAL(*CreditTransit(vp, absorbed.absorbed_total), 100);
+    BOOST_CHECK(vp == (ReserveLedgerV2{.minted = 0, .burned = 0, .credited = 100, .transit = 0}));
+    BOOST_CHECK_EQUAL(*vp.Reserve(), 100);
+    BOOST_CHECK(InvariantRHolds(absorbed.locked, 0, vp));
+    BOOST_CHECK_EQUAL(Backing(v, vp), supply);
+
+    // A late deposit into the retired v (id 2, 25) is minted after h_m and
+    // swept: the sweep moves exactly the 25 proven since the last sweep.
+    BOOST_REQUIRE(RecordMintV2(v, 25));
+    supply += 25;
+    BOOST_CHECK_EQUAL(*v.Reserve(), 25);
+    BOOST_CHECK_EQUAL(Backing(v, vp), supply);
+    BOOST_REQUIRE(Sweep(v, vp));
+    BOOST_CHECK(v == (ReserveLedgerV2{.minted = 125, .burned = 125, .credited = 0, .transit = 0}));
+    BOOST_CHECK(vp == (ReserveLedgerV2{.minted = 0, .burned = 0, .credited = 100, .transit = 25}));
+    BOOST_CHECK_EQUAL(Backing(v, vp), supply);
+    // An observation before its absorb() credits nothing more; after it,
+    // the second arrival.
+    BOOST_CHECK_EQUAL(*CreditTransit(vp, 100), 0);
+    BOOST_CHECK_EQUAL(*CreditTransit(vp, 125), 25);
+    BOOST_CHECK(vp == (ReserveLedgerV2{.minted = 0, .burned = 0, .credited = 125, .transit = 0}));
+    BOOST_CHECK_EQUAL(Backing(v, vp), supply);
+
+    // v' mints its own deposits (id 0, 50) and pays burn leaves (30), which
+    // lower supply and reserve_v' together.
+    BOOST_REQUIRE(RecordMintV2(vp, 50));
+    supply += 50;
+    BOOST_REQUIRE(RecordBurnV2(vp, 30));
+    supply -= 30;
+    BOOST_CHECK(vp == (ReserveLedgerV2{.minted = 50, .burned = 30, .credited = 125, .transit = 0}));
+    BOOST_CHECK_EQUAL(*vp.Reserve(), 145);
+    BOOST_CHECK_EQUAL(supply, 145);
+    BOOST_CHECK_EQUAL(Backing(v, vp), supply);
+}
+
+BOOST_AUTO_TEST_CASE(invariant_r_across_migration)
+{
+    // v: deposits 0 (60) and 1 (40) proven and minted, observed at cut 2.
+    ProvenDepositMapV2 v_deposits{{0, 60}, {1, 40}};
+    ReserveLedgerV2 v{.minted = 100, .burned = 0, .credited = 0, .transit = 0};
+    ReserveLedgerV2 vp;
+    const CAmount p_pre{Sums(Observed(2, 100, 100), v_deposits).below_cut};
+    BOOST_CHECK_EQUAL(p_pre, 100);
+    BOOST_CHECK(InvariantRHolds(100, p_pre, v));
+    BOOST_CHECK(!InvariantRHolds(99, p_pre, v)); // a forged drain
+
+    // The migration leaf counts in burned_v, so R holds before its release
+    // (locked 100) and after it (locked 0): paying v' never trips E8.
+    BOOST_REQUIRE(Sweep(v, vp));
+    BOOST_CHECK(InvariantRHolds(100, p_pre, v));
+    BOOST_CHECK_EQUAL(*InvariantRMarginV2(100, p_pre, v), 100);
+    BOOST_CHECK(InvariantRHolds(0, p_pre, v));
+    BOOST_CHECK_EQUAL(*InvariantRMarginV2(0, p_pre, v), 0);
+
+    // A late deposit into the retired v (id 2, 25), observed at cut 3 with
+    // locked 25: R holds and fails one unit below. Once its sweep counts in
+    // burned_v, R holds before (25) and after (0) that leaf's release.
+    v_deposits.emplace(2, 25);
+    BOOST_REQUIRE(RecordMintV2(v, 25));
+    const CAmount p_late{Sums(Observed(3, 25, 25), v_deposits).below_cut};
+    BOOST_CHECK_EQUAL(p_late, 125);
+    BOOST_CHECK(InvariantRHolds(25, p_late, v));
+    BOOST_CHECK_EQUAL(*InvariantRMarginV2(25, p_late, v), 0);
+    BOOST_CHECK(!InvariantRHolds(24, p_late, v));
+    BOOST_REQUIRE(Sweep(v, vp));
+    BOOST_CHECK(InvariantRHolds(25, p_late, v));
+    BOOST_CHECK_EQUAL(*InvariantRMarginV2(25, p_late, v), 25);
+    BOOST_CHECK(InvariantRHolds(0, p_late, v));
+    BOOST_CHECK_EQUAL(*InvariantRMarginV2(0, p_late, v), 0);
+
+    // v': transit counts in none of reserve_v', R or R_v' until credited.
+    // Before absorb() R holds whatever `locked` shows, even 0 (P 0, C 0),
+    // so an early observation cannot freeze v'.
+    BOOST_CHECK(vp == (ReserveLedgerV2{.minted = 0, .burned = 0, .credited = 0, .transit = 125}));
+    BOOST_CHECK(InvariantRHolds(0, 0, vp));
+    // After absorb() and the credit, R holds at locked 125.
+    BOOST_CHECK_EQUAL(*CreditTransit(vp, 125), 125);
+    BOOST_CHECK(InvariantRHolds(125, 0, vp));
+    BOOST_CHECK_EQUAL(*InvariantRMarginV2(125, 0, vp), 0);
+    // A v' burn leaf of 30: R holds before its release (locked 125) and
+    // after it (95).
+    BOOST_REQUIRE(RecordBurnV2(vp, 30));
+    BOOST_CHECK(InvariantRHolds(125, 0, vp));
+    BOOST_CHECK_EQUAL(*InvariantRMarginV2(125, 0, vp), 30);
+    BOOST_CHECK(InvariantRHolds(95, 0, vp));
+    BOOST_CHECK_EQUAL(*InvariantRMarginV2(95, 0, vp), 0);
+    // A release beyond the leaves after the credit fails R.
+    BOOST_CHECK(!InvariantRHolds(94, 0, vp));
+    BOOST_CHECK_EQUAL(*InvariantRMarginV2(94, 0, vp), -1);
+    // A v' deposit (id 0, 50) proven below v''s cut joins P.
+    BOOST_REQUIRE(RecordMintV2(vp, 50));
+    const ProvenDepositMapV2 vp_deposits{{0, 50}};
+    const ReserveStateV2 vp_observed{Observed(1, 145, 145, 125)};
+    const CAmount vp_p_pre{Sums(vp_observed, vp_deposits).below_cut};
+    BOOST_CHECK_EQUAL(vp_p_pre, 50);
+    BOOST_CHECK(InvariantRHolds(vp_observed.locked, vp_p_pre, vp));
+    BOOST_CHECK(!InvariantRHolds(vp_observed.locked - 1, vp_p_pre, vp));
+}
+
+BOOST_AUTO_TEST_CASE(wind_down_across_migration)
+{
+    // v: deposits 0..2 (400 + 300 + 300) proven and minted; v's RESERVE_E at
+    // cut 3 shows locked = balance = 1,000. An earlier burn of 100 is
+    // unreleased at the observation, so reserve_v = 900 = the headroom.
+    ProvenDepositMapV2 v_deposits{{0, 400}, {1, 300}, {2, 300}};
+    const ReserveStateV2 v_observed{Observed(3, 1'000, 1'000)};
+    ReserveLedgerV2 v{.minted = 1'000, .burned = 0, .credited = 0, .transit = 0};
+    BOOST_REQUIRE(RecordBurnV2(v, 100));
+    {
+        const ProvenDepositSumsV2 sums{Sums(v_observed, v_deposits)};
+        const auto terms{ComputeWindDownTerms(v_observed, sums, v, PPM)};
+        BOOST_REQUIRE(terms);
+        BOOST_CHECK_EQUAL(terms->unreleased, 100);
+        BOOST_CHECK_EQUAL(terms->headroom, 900);
+        BOOST_CHECK_EQUAL(*v.Reserve(), terms->headroom);
+        // The migration of reserve_v exactly at the headroom is accepted;
+        // headroom + 1 is refused.
+        BOOST_CHECK(WindDownAllows(*v.Reserve(), v_observed, sums, v, PPM));
+        BOOST_CHECK(!WindDownAllows(terms->headroom + 1, v_observed, sums, v, PPM));
+    }
+    // The sweep amount is reserve_v whole while v holds what it locks.
+    BOOST_CHECK_EQUAL(VaultSweepAmountV2(v, v_observed, Sums(v_observed, v_deposits), PPM).value_or(-1), 900);
+    // B < L: 100 seized (balance 900), margin 90, so the headroom is
+    // 900 - 90 - 100 = 710, below reserve_v = 900: a full migration leaf
+    // would exceed the bound, so the sweep moves the headroom, 710, and
+    // leaves 190 in reserve_v for a later sweep.
+    {
+        const ReserveStateV2 seized{Observed(3, 1'000, 900)};
+        const ProvenDepositSumsV2 sums{Sums(seized, v_deposits)};
+        const auto terms{ComputeWindDownTerms(seized, sums, v, PPM)};
+        BOOST_REQUIRE(terms);
+        BOOST_CHECK_EQUAL(terms->margin, 90);
+        BOOST_CHECK_EQUAL(terms->headroom, 710);
+        BOOST_CHECK(!WindDownAllows(*v.Reserve(), seized, sums, v, PPM));
+        BOOST_CHECK(WindDownAllows(710, seized, sums, v, PPM));
+        BOOST_CHECK(!WindDownAllows(711, seized, sums, v, PPM));
+        BOOST_CHECK_EQUAL(VaultSweepAmountV2(v, seized, sums, PPM).value_or(-1), 710);
+        ReserveLedgerV2 partial{v};
+        ReserveLedgerV2 partial_vp;
+        BOOST_REQUIRE(RecordSweepV2(partial, partial_vp, 710));
+        BOOST_CHECK_EQUAL(*partial.Reserve(), 190);
+        BOOST_CHECK_EQUAL(partial_vp.transit, 710);
+        BOOST_CHECK_EQUAL(*partial.Reserve() + partial_vp.transit, *v.Reserve());
+        // At the same observation the bound is spent: nothing more moves.
+        BOOST_CHECK(!VaultSweepAmountV2(partial, seized, sums, PPM));
+        // Invariant R holds before and after the release of the 710.
+        BOOST_CHECK(InvariantRHolds(1'000, sums.below_cut, partial));
+        BOOST_CHECK(InvariantRHolds(290, sums.below_cut, partial));
+        // After that release (locked 290, balance 190: R_v = 710 covers
+        // it, the earlier burn of 100 stays unreleased) margin_v is 19 and
+        // the headroom 190 - 19 - 100 = 71, so a second sweep moves 71.
+        // Later sweeps drain the margin the same way; only the seized
+        // shortfall stays in reserve_v.
+        const ReserveStateV2 after_release{Observed(3, 290, 190)};
+        const ProvenDepositSumsV2 after_sums{Sums(after_release, v_deposits)};
+        BOOST_CHECK_EQUAL(ComputeWindDownTerms(after_release, after_sums, partial, PPM)->headroom, 71);
+        BOOST_CHECK_EQUAL(VaultSweepAmountV2(partial, after_release, after_sums, PPM).value_or(-1), 71);
+    }
+
+    // The migration of 900 (v's leaves now 1,000, all unreleased at the
+    // observation). A late deposit into v (id 3, 50) after the cut redeems
+    // at once through P_post, so its sweep, reserve_v = 50, is exactly the
+    // headroom.
+    ReserveLedgerV2 vp;
+    BOOST_REQUIRE(Sweep(v, vp));
+    BOOST_REQUIRE(RecordMintV2(v, 50));
+    v_deposits.emplace(3, 50);
+    {
+        const ProvenDepositSumsV2 sums{Sums(v_observed, v_deposits)};
+        const auto terms{ComputeWindDownTerms(v_observed, sums, v, PPM)};
+        BOOST_REQUIRE(terms);
+        BOOST_CHECK(*terms == (WindDownTermsV2{.observed = 1'050, .released_lower_bound = 0,
+                                               .unreleased = 1'000, .margin = 0, .headroom = 50}));
+        BOOST_CHECK_EQUAL(*v.Reserve(), 50);
+        BOOST_CHECK(WindDownAllows(50, v_observed, sums, v, PPM));
+        BOOST_CHECK(!WindDownAllows(51, v_observed, sums, v, PPM));
+    }
+    BOOST_REQUIRE(Sweep(v, vp));
+    BOOST_CHECK_EQUAL(vp.transit, 950);
+
+    // v' before absorb(): the observation (leaves released, not absorbed:
+    // locked 0, balance 950) credits nothing, and check 2 refuses every
+    // burn although the wind-down terms alone would admit 950.
+    {
+        const ReserveStateV2 before_absorb{Observed(0, 0, 950, 0)};
+        BOOST_CHECK_EQUAL(*CreditTransit(vp, before_absorb.absorbed_total), 0);
+        BOOST_CHECK(!BurnWithinReserve(1, vp));
+        const auto terms{ComputeWindDownTerms(before_absorb, Sums(before_absorb, {}), vp, PPM)};
+        BOOST_REQUIRE(terms);
+        BOOST_CHECK_EQUAL(terms->headroom, 950);
+    }
+    // After absorb(): locked = balance = absorbedTotal = 950, credited 950.
+    // A v' burn at the bound passes checks 2 and 3; one unit above fails both.
+    const ReserveStateV2 absorbed{Observed(0, 950, 950, 950)};
+    BOOST_CHECK_EQUAL(*CreditTransit(vp, absorbed.absorbed_total), 950);
+    {
+        const ProvenDepositSumsV2 sums{Sums(absorbed, {})};
+        const auto terms{ComputeWindDownTerms(absorbed, sums, vp, PPM)};
+        BOOST_REQUIRE(terms);
+        BOOST_CHECK(*terms == (WindDownTermsV2{.observed = 950, .released_lower_bound = 0,
+                                               .unreleased = 0, .margin = 0, .headroom = 950}));
+        BOOST_CHECK(BurnWithinReserve(950, vp));
+        BOOST_CHECK(WindDownAllows(950, absorbed, sums, vp, PPM));
+        BOOST_CHECK(!BurnWithinReserve(951, vp));
+        BOOST_CHECK(!WindDownAllows(951, absorbed, sums, vp, PPM));
+        // An earlier v' burn of 600 in the block, unreleased: 350 at the
+        // bound, 351 refused.
+        BOOST_REQUIRE(RecordBurnV2(vp, 600));
+        BOOST_CHECK(BurnWithinReserve(350, vp));
+        BOOST_CHECK(WindDownAllows(350, absorbed, sums, vp, PPM));
+        BOOST_CHECK(!BurnWithinReserve(351, vp));
+        BOOST_CHECK(!WindDownAllows(351, absorbed, sums, vp, PPM));
+    }
+    // After that leaf's release (locked = balance = 350; absorbedTotal stays
+    // 950), R_v' = 950 - 350 = 600 covers it and the bound is unchanged.
+    {
+        const ReserveStateV2 released{Observed(0, 350, 350, 950)};
+        BOOST_CHECK_EQUAL(*CreditTransit(vp, released.absorbed_total), 0);
+        const ProvenDepositSumsV2 sums{Sums(released, {})};
+        const auto terms{ComputeWindDownTerms(released, sums, vp, PPM)};
+        BOOST_REQUIRE(terms);
+        BOOST_CHECK_EQUAL(terms->released_lower_bound, 600);
+        BOOST_CHECK_EQUAL(terms->unreleased, 0);
+        BOOST_CHECK_EQUAL(terms->headroom, 350);
+        BOOST_CHECK(WindDownAllows(350, released, sums, vp, PPM));
+        BOOST_CHECK(!WindDownAllows(351, released, sums, vp, PPM));
+        // A shortfall at v' (balance 300 < locked 350) adds margin 30.
+        const ReserveStateV2 short_of{Observed(0, 350, 300, 950)};
+        const ProvenDepositSumsV2 short_sums{Sums(short_of, {})};
+        BOOST_CHECK_EQUAL(ComputeWindDownTerms(short_of, short_sums, vp, PPM)->headroom, 270);
+        BOOST_CHECK(WindDownAllows(270, short_of, short_sums, vp, PPM));
+        BOOST_CHECK(!WindDownAllows(271, short_of, short_sums, vp, PPM));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(record_sweep_and_sweep_amount)
+{
+    // RecordSweepV2 (section 7.6): burned_v on the retired entry and
+    // transit_v' on the successor, both or neither.
+    const ReserveLedgerV2 v{.minted = 100, .burned = 20, .credited = 0, .transit = 0};
+    const ReserveLedgerV2 vp{.minted = 5, .burned = 0, .credited = 7, .transit = 3};
+    const auto backing{[](const ReserveLedgerV2& a, const ReserveLedgerV2& b) {
+        return *a.Reserve() + a.transit + *b.Reserve() + b.transit;
+    }};
+    {
+        ReserveLedgerV2 retired{v};
+        ReserveLedgerV2 successor{vp};
+        BOOST_REQUIRE(RecordSweepV2(retired, successor, 80));
+        BOOST_CHECK(retired == (ReserveLedgerV2{.minted = 100, .burned = 100, .credited = 0, .transit = 0}));
+        BOOST_CHECK(successor == (ReserveLedgerV2{.minted = 5, .burned = 0, .credited = 7, .transit = 83}));
+        // Nothing is burned: reserve + transit over both entries is unchanged.
+        BOOST_CHECK_EQUAL(backing(retired, successor), backing(v, vp));
+    }
+    const auto refused{[](ReserveLedgerV2 retired, ReserveLedgerV2 successor, const CAmount amount) {
+        const ReserveLedgerV2 retired_before{retired};
+        const ReserveLedgerV2 successor_before{successor};
+        BOOST_CHECK(!RecordSweepV2(retired, successor, amount));
+        BOOST_CHECK(retired == retired_before);
+        BOOST_CHECK(successor == successor_before);
+    }};
+    refused(v, vp, 0);
+    refused(v, vp, -1);
+    refused(v, vp, 81);                                            // above reserve_v
+    refused(ReserveLedgerV2{.minted = 1, .burned = 2}, vp, 1);     // invalid retired ledger
+    refused(v, ReserveLedgerV2{.minted = 1, .burned = 2}, 1);      // invalid successor ledger
+    refused(v, ReserveLedgerV2{.transit = INT64_MAX_V}, 1);        // transit overflow
+    {
+        // One ledger as both arguments is refused.
+        ReserveLedgerV2 same{v};
+        BOOST_CHECK(!RecordSweepV2(same, same, 10));
+        BOOST_CHECK(same == v);
+    }
+
+    // VaultSweepAmountV2: reserve_v capped by the wind-down headroom.
+    const ProvenDepositMapV2 deposits{{0, 60}, {1, 40}};
+    const ReserveLedgerV2 launch{.minted = 100, .burned = 0, .credited = 0, .transit = 0};
+    const ReserveStateV2 full{Observed(2, 100, 100)};
+    const ReserveStateV2 surplus{Observed(2, 100, 150)};
+    const ReserveStateV2 short_of{Observed(2, 100, 80)};
+    BOOST_CHECK_EQUAL(VaultSweepAmountV2(launch, full, Sums(full, deposits), PPM).value_or(-1), 100);
+    // A surplus balance never raises the amount above reserve_v.
+    BOOST_CHECK_EQUAL(VaultSweepAmountV2(launch, surplus, Sums(surplus, deposits), PPM).value_or(-1), 100);
+    // A shortfall caps it at the headroom, 80 - 8 = 72.
+    BOOST_CHECK_EQUAL(VaultSweepAmountV2(launch, short_of, Sums(short_of, deposits), PPM).value_or(-1), 72);
+    // The amount always passes both burn bounds.
+    for (const ReserveStateV2& state : {full, surplus, short_of}) {
+        const ProvenDepositSumsV2 sums{Sums(state, deposits)};
+        const auto amount{VaultSweepAmountV2(launch, state, sums, PPM)};
+        BOOST_REQUIRE(amount);
+        BOOST_CHECK(BurnWithinReserve(*amount, launch));
+        BOOST_CHECK(WindDownAllows(*amount, state, sums, launch, PPM));
+        BOOST_CHECK(!WindDownAllows(*amount + 1, state, sums, launch, PPM) || !BurnWithinReserve(*amount + 1, launch));
+    }
+    // Nothing to sweep: reserve_v 0, a headroom of 0 (balance 0) or below
+    // (unreleased leaves above the balance), sums at another cut, ppm out
+    // of range or an invalid ledger.
+    BOOST_CHECK(!VaultSweepAmountV2(ReserveLedgerV2{.minted = 100, .burned = 100}, full, Sums(full, deposits), PPM));
+    const ReserveStateV2 emptied{Observed(2, 100, 0)};
+    BOOST_CHECK_EQUAL(ComputeWindDownTerms(emptied, Sums(emptied, deposits), launch, PPM)->headroom, 0);
+    BOOST_CHECK(!VaultSweepAmountV2(launch, emptied, Sums(emptied, deposits), PPM));
+    const ReserveLedgerV2 half_burned{.minted = 100, .burned = 50, .credited = 0, .transit = 0};
+    const ReserveStateV2 drained{Observed(2, 100, 40)};
+    BOOST_CHECK_EQUAL(ComputeWindDownTerms(drained, Sums(drained, deposits), half_burned, PPM)->headroom, -14);
+    BOOST_CHECK(!VaultSweepAmountV2(half_burned, drained, Sums(drained, deposits), PPM));
+    BOOST_CHECK(!VaultSweepAmountV2(launch, full, Sums(Observed(1, 100, 100), deposits), PPM));
+    BOOST_CHECK(!VaultSweepAmountV2(launch, full, Sums(full, deposits), 1'000'001));
+    BOOST_CHECK(!VaultSweepAmountV2(ReserveLedgerV2{.minted = 1, .burned = 2}, full, Sums(full, deposits), PPM));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

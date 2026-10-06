@@ -25,6 +25,7 @@
 #include <consensus/bridge_params.h>
 #include <crypto/keccak256.h>
 #include <test/util/bridge_eth_trie.h>
+#include <test/util/bridge_observation_world.h>
 #include <uint256.h>
 #include <util/strencodings.h>
 
@@ -1134,6 +1135,342 @@ BOOST_AUTO_TEST_CASE(strict_layout_refusals)
     BOOST_CHECK_EQUAL(error, "reserve observation needs three vault storage words");
     BOOST_CHECK(!DecodeTokenFlagsV2(four, uint256{}, error));
     BOOST_CHECK_EQUAL(error, "token flags observation needs three storage words");
+}
+
+// ------------------------------------------------ B-23 successor subjects
+
+BOOST_AUTO_TEST_CASE(successor_subjects_plan_and_verify)
+{
+    using Consensus::BridgeV2EntryRole;
+    using namespace observation_layout;
+
+    // Numbering: base subject | (vault entry index << 4). Exactly five
+    // subjects exist, the verdict stays VERIFIER_E's, and 4-0x11 and
+    // 0x14-0xff stay malformed.
+    BOOST_CHECK_EQUAL(int{ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR}, 0x12);
+    BOOST_CHECK_EQUAL(int{ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR}, 0x13);
+    for (unsigned value{0}; value <= 255; ++value) {
+        const auto subject{static_cast<uint8_t>(value)};
+        const bool launch_subject{value >= 1 && value <= 3};
+        const bool successor_subject{value == 0x12 || value == 0x13};
+        BOOST_TEST_CONTEXT("subject " << value)
+        {
+            BOOST_CHECK_EQUAL(int{EthObservationBaseSubject(subject)},
+                              launch_subject ? int(value) : successor_subject ? int(value & 0x0f) : 0);
+            BOOST_CHECK(EthObservationEntryRole(subject) ==
+                        (successor_subject ? BridgeV2EntryRole::SUCCESSOR : BridgeV2EntryRole::LAUNCH));
+            BOOST_CHECK_EQUAL(EthObservationShapeV2(subject).empty(), !launch_subject && !successor_subject);
+            BOOST_CHECK_EQUAL(proof_detail::EthObservationHeaderValid(subject, Fill(0x3c), 0),
+                              launch_subject || successor_subject);
+            BOOST_CHECK_EQUAL(proof_detail::EthObservationHeaderValid(subject, Fill(0x3c),
+                                                                      ETH_OBSERVATION_VERDICT_SETS_MISMATCH),
+                              value == ETH_OBSERVATION_SUBJECT_VERIFIER);
+        }
+    }
+    BOOST_CHECK(std::ranges::equal(EthObservationShapeV2(ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR),
+                                   std::vector<uint8_t>{3, 1}));
+    BOOST_CHECK(std::ranges::equal(EthObservationShapeV2(ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR),
+                                   std::vector<uint8_t>{3}));
+
+    // An envelope with a successor: v' is the shared vectors' stand-in vault
+    // 0x2222..22, so its mapping keys are the vector's; v is 0x2121..21.
+    Consensus::BridgeV2Params params;
+    params.vault.origin_chain_id = OBSERVATION_UNPINNED_CODE_CHAIN_ID;
+    params.vault.vault_address = FillAddress(0x21);
+    params.vault.token_address = AddressOf("dac17f958d2ee523a2206206994597c13d831ec7");
+    params.vault.token_runtime_code_hash = KeccakOf("token runtime");
+    params.verifier.address = FillAddress(0x44);
+
+    // Without a successor the SUCCESSOR pins name no vault and no token.
+    const ObservationPins unpinned{ObservationPinsFromParams(params, BridgeV2EntryRole::SUCCESSOR)};
+    BOOST_CHECK(unpinned.entry == BridgeV2EntryRole::SUCCESSOR);
+    BOOST_CHECK(unpinned.vault == EthAddress{});
+    BOOST_CHECK(unpinned.token == EthAddress{});
+    BOOST_CHECK(unpinned.verifier == params.verifier.address);
+
+    Consensus::BridgeV2SuccessorEntry successor;
+    successor.entry = params.vault;
+    successor.entry.vault_address = AddressOf(STAND_IN_VAULT);
+    successor.predecessor = params.vault.vault_address;
+    successor.asset_id = Fill(0x11);
+    successor.migration_height = 400;
+    params.successor = successor;
+
+    const ObservationPins launch{ObservationPinsFromParams(params)};
+    const ObservationPins next{ObservationPinsFromParams(params, BridgeV2EntryRole::SUCCESSOR)};
+    {
+        const ObservationPins explicit_launch{ObservationPinsFromParams(params, BridgeV2EntryRole::LAUNCH)};
+        for (const ObservationPins* p : {&launch, &explicit_launch}) {
+            BOOST_CHECK(p->entry == BridgeV2EntryRole::LAUNCH);
+            BOOST_CHECK(p->vault == params.vault.vault_address);
+            BOOST_CHECK(p->vault_code_hash == params.vault.vault_runtime_code_hash);
+        }
+        BOOST_CHECK(next.entry == BridgeV2EntryRole::SUCCESSOR);
+        BOOST_CHECK(next.vault == AddressOf(STAND_IN_VAULT));
+        BOOST_CHECK(!next.vault_code_hash);
+        for (const ObservationPins* p : {&launch, &explicit_launch, &next}) {
+            BOOST_CHECK_EQUAL(p->origin_chain_id, OBSERVATION_UNPINNED_CODE_CHAIN_ID);
+            BOOST_CHECK(p->verifier == params.verifier.address);
+            BOOST_CHECK(!p->verifier_code_hash);
+            BOOST_CHECK(p->token == params.vault.token_address);
+            BOOST_CHECK(p->token_code_hash == params.vault.token_runtime_code_hash);
+        }
+        // v''s own code-hash pin, when set, is the one its pins carry.
+        Consensus::BridgeV2Params pinned{params};
+        pinned.successor->entry.vault_runtime_code_hash = Fill(0x0d);
+        pinned.vault.vault_runtime_code_hash = Fill(0x0b);
+        BOOST_CHECK(ObservationPinsFromParams(pinned, BridgeV2EntryRole::SUCCESSOR).vault_code_hash == Fill(0x0d));
+        BOOST_CHECK(ObservationPinsFromParams(pinned).vault_code_hash == Fill(0x0b));
+    }
+
+    // The plans: 0x12 reads v' slots 0, 1, 3 and balances[v']; 0x13 reads the
+    // token's slots 0, 10 and isBlackListed[v'].
+    const auto reserve_plan{ObservationRequests(ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR, next)};
+    BOOST_REQUIRE_EQUAL(reserve_plan.size(), 2U);
+    BOOST_CHECK(reserve_plan[0].role == ObservationAccountRole::VAULT);
+    BOOST_CHECK(reserve_plan[0].address == AddressOf(STAND_IN_VAULT));
+    BOOST_CHECK(reserve_plan[0].slots == (std::vector<StorageWord>{SlotWord(0), SlotWord(1), SlotWord(3)}));
+    BOOST_CHECK(reserve_plan[1].role == ObservationAccountRole::TOKEN);
+    BOOST_CHECK(reserve_plan[1].address == params.vault.token_address);
+    BOOST_CHECK(reserve_plan[1].slots == (std::vector<StorageWord>{WordOf(BALANCES_KEY)}));
+    const auto flags_plan{ObservationRequests(ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR, next)};
+    BOOST_REQUIRE_EQUAL(flags_plan.size(), 1U);
+    BOOST_CHECK(flags_plan[0].role == ObservationAccountRole::TOKEN);
+    BOOST_CHECK(flags_plan[0].address == params.vault.token_address);
+    BOOST_CHECK(flags_plan[0].slots == (std::vector<StorageWord>{SlotWord(0), SlotWord(10), WordOf(BLACKLIST_KEY)}));
+    // The launch plans read v with v's keys.
+    const StorageWord v_key{AddressWord(params.vault.vault_address)};
+    const auto launch_reserve_plan{ObservationRequests(ETH_OBSERVATION_SUBJECT_RESERVE, launch)};
+    BOOST_REQUIRE_EQUAL(launch_reserve_plan.size(), 2U);
+    BOOST_CHECK(launch_reserve_plan[0].address == params.vault.vault_address);
+    BOOST_CHECK(launch_reserve_plan[1].slots == (std::vector<StorageWord>{MappingSlot(v_key, TOKEN_SLOT_BALANCES)}));
+    BOOST_CHECK(launch_reserve_plan[1].slots[0] != WordOf(BALANCES_KEY));
+    const auto launch_flags_plan{ObservationRequests(ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS, launch)};
+    BOOST_REQUIRE_EQUAL(launch_flags_plan.size(), 1U);
+    BOOST_CHECK(launch_flags_plan[0].slots[2] == MappingSlot(v_key, TOKEN_SLOT_IS_BLACK_LISTED));
+    for (const uint8_t subject : {ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR,
+                                  ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR}) {
+        const auto plan{ObservationRequests(subject, next)};
+        const auto shape{EthObservationShapeV2(subject)};
+        BOOST_REQUIRE_EQUAL(plan.size(), shape.size());
+        for (size_t i{0}; i < plan.size(); ++i) BOOST_CHECK_EQUAL(plan[i].slots.size(), shape[i]);
+    }
+    // Pins of the other vault entry plan nothing, nor does an unknown subject.
+    for (const uint8_t subject : {ETH_OBSERVATION_SUBJECT_VERIFIER, ETH_OBSERVATION_SUBJECT_RESERVE,
+                                  ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS}) {
+        BOOST_CHECK(ObservationRequests(subject, next).empty());
+    }
+    for (const uint8_t subject : {ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR,
+                                  ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR}) {
+        BOOST_CHECK(ObservationRequests(subject, launch).empty());
+    }
+    for (const uint8_t subject : {0x10, 0x11, 0x14, 0x21, 0x22, 0x23}) {
+        BOOST_CHECK(ObservationRequests(subject, launch).empty());
+        BOOST_CHECK(ObservationRequests(subject, next).empty());
+    }
+
+    // One Ethereum state holding both vaults: v holds three deposits; v'
+    // has absorbed a release from v and is blacklisted.
+    bridge_test::ObservationWorld world{launch};
+    world.AddSuccessorVault(next.vault, next.vault_code_hash);
+    world.SetReserve(3, 1'000'000, 0, 1'000'000);
+    world.SetSuccessorReserve(0, 0, 999'000, 999'000);
+    world.SetTokenFlags(false, false, false);
+    world.SetSuccessorBlacklisted(true);
+    const uint256 root{world.StateRoot()};
+    const uint256 anchor{Fill(0x3c)};
+    std::string error;
+    const auto verify = [&](const BridgeEthStateObservationV2& record, const ObservationPins& pins) {
+        return VerifyEthStateObservationV2(record, root, pins, error);
+    };
+
+    const BridgeEthStateObservationV2 reserve_next{world.Observe(ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR, anchor)};
+    const BridgeEthStateObservationV2 flags_next{world.Observe(ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR, anchor)};
+    const BridgeEthStateObservationV2 reserve_launch{world.Observe(ETH_OBSERVATION_SUBJECT_RESERVE, anchor)};
+    const BridgeEthStateObservationV2 flags_launch{world.Observe(ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS, anchor)};
+    const BridgeEthStateObservationV2 verifier_record{world.Observe(ETH_OBSERVATION_SUBJECT_VERIFIER, anchor)};
+    {
+        const auto state{verify(reserve_next, next)};
+        BOOST_REQUIRE_MESSAGE(state, error);
+        BOOST_REQUIRE(std::holds_alternative<ReserveStateV2>(*state));
+        const ReserveStateV2& reserve{std::get<ReserveStateV2>(*state)};
+        BOOST_CHECK_EQUAL(reserve.next_deposit_id, 0U);
+        BOOST_CHECK_EQUAL(reserve.locked, 0);
+        BOOST_CHECK_EQUAL(reserve.absorbed_total, 999'000);
+        BOOST_CHECK_EQUAL(reserve.balance, 999'000);
+        BOOST_CHECK(reserve.vault_code_hash == world.code.at(next.vault));
+        BOOST_CHECK(reserve.vault_code_hash != world.code.at(launch.vault));
+        BOOST_CHECK(reserve.token_code_hash == params.vault.token_runtime_code_hash);
+    }
+    {
+        const auto state{verify(reserve_launch, launch)};
+        BOOST_REQUIRE_MESSAGE(state, error);
+        const ReserveStateV2& reserve{std::get<ReserveStateV2>(*state)};
+        BOOST_CHECK_EQUAL(reserve.next_deposit_id, 3U);
+        BOOST_CHECK_EQUAL(reserve.locked, 1'000'000);
+        BOOST_CHECK_EQUAL(reserve.absorbed_total, 0);
+        BOOST_CHECK_EQUAL(reserve.balance, 1'000'000);
+        BOOST_CHECK(reserve.vault_code_hash == world.code.at(launch.vault));
+    }
+    TokenFlagsV2 launch_flags;
+    {
+        const auto next_state{verify(flags_next, next)};
+        BOOST_REQUIRE_MESSAGE(next_state, error);
+        BOOST_REQUIRE(std::holds_alternative<TokenFlagsV2>(*next_state));
+        const auto launch_state{verify(flags_launch, launch)};
+        BOOST_REQUIRE_MESSAGE(launch_state, error);
+        const TokenFlagsV2& next_flags{std::get<TokenFlagsV2>(*next_state)};
+        launch_flags = std::get<TokenFlagsV2>(*launch_state);
+        BOOST_CHECK(next_flags.vault_blacklisted);
+        BOOST_CHECK(!launch_flags.vault_blacklisted);
+        // Slots 0 and 10 are the token's own, shared by both entries.
+        BOOST_CHECK(next_flags.owner == FillAddress(0x66));
+        BOOST_CHECK(next_flags.owner == launch_flags.owner);
+        BOOST_CHECK_EQUAL(next_flags.paused, launch_flags.paused);
+        BOOST_CHECK_EQUAL(next_flags.deprecated, launch_flags.deprecated);
+        BOOST_CHECK(next_flags.token_code_hash == launch_flags.token_code_hash);
+    }
+    BOOST_CHECK_MESSAGE(verify(verifier_record, launch), error);
+
+    // The successor records travel as kind 9 with their own subject byte,
+    // only under the V2 record set.
+    for (const BridgeEthStateObservationV2* record : {&reserve_next, &flags_next}) {
+        const auto encoded{EncodeV2(*record)};
+        BOOST_REQUIRE(encoded);
+        BOOST_CHECK_EQUAL((*encoded)[0], 9);
+        BOOST_CHECK_EQUAL((*encoded)[2], record->subject);
+        BOOST_CHECK(DecodeBridgeRecordV1(*encoded, BRIDGE_MPT_LIMITS_V2) == Kind9(*record));
+        BOOST_CHECK(!DecodeBridgeRecordV1(*encoded, BRIDGE_MPT_LIMITS_V1));
+        BOOST_CHECK(!EncodeBridgeRecordV1(Kind9(*record), BRIDGE_MPT_LIMITS_V1));
+    }
+
+    // Pins of the wrong vault entry fail before any proof is read, in both
+    // directions; VERIFIER_E is read with the launch pins only.
+    for (const auto& [record, pins] : std::vector<std::pair<const BridgeEthStateObservationV2*, const ObservationPins*>>{
+             {&reserve_next, &launch}, {&flags_next, &launch}, {&reserve_launch, &next},
+             {&flags_launch, &next}, {&verifier_record, &next}}) {
+        BOOST_CHECK(!verify(*record, *pins));
+        BOOST_CHECK_EQUAL(error, "observation pins belong to another vault entry");
+    }
+    // A record relabelled to the other entry's subject does not verify with
+    // that entry's pins: its vault account proof is of the other vault.
+    {
+        BridgeEthStateObservationV2 relabelled{reserve_next};
+        relabelled.subject = ETH_OBSERVATION_SUBJECT_RESERVE;
+        BOOST_CHECK(!verify(relabelled, launch));
+        BOOST_CHECK_EQUAL(error.rfind("observation vault account proof: ", 0), 0U);
+        relabelled = reserve_launch;
+        relabelled.subject = ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR;
+        BOOST_CHECK(!verify(relabelled, next));
+        BOOST_CHECK_EQUAL(error.rfind("observation vault account proof: ", 0), 0U);
+        // TOKEN_FLAGS shares the token account, so a relabelled record can
+        // at most prove the slots its pins name: v''s blacklisting never
+        // reads as v's. In this fixture the isBlackListed[v'] proof is no
+        // proof of isBlackListed[v] (v's key leaves the proven path for a
+        // subtree the proof omits), so the third storage proof is refused.
+        // A proof that did happen to exclude isBlackListed[v] could only
+        // read v's own value (false here, flags_launch above), as any
+        // accepted Merkle-Patricia proof reads the true value of its key.
+        BridgeEthStateObservationV2 flags_relabelled{flags_next};
+        flags_relabelled.subject = ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS;
+        BOOST_CHECK(!verify(flags_relabelled, launch));
+        BOOST_CHECK_EQUAL(error, "observation token storage proof 2: state proof node does not match its reference");
+        BOOST_CHECK(!launch_flags.vault_blacklisted);
+    }
+
+    // Unknown subjects are refused with either pins and by the codec.
+    for (const uint8_t subject : {0x11, 0x14, 0x22}) {
+        BOOST_TEST_CONTEXT("subject " << int{subject})
+        {
+            BridgeEthStateObservationV2 unknown{reserve_launch};
+            unknown.subject = subject;
+            for (const ObservationPins* pins : {&launch, &next}) {
+                BOOST_CHECK(!verify(unknown, *pins));
+                BOOST_CHECK_EQUAL(error, "observation subject is unknown");
+            }
+            BOOST_CHECK(!EncodeV2(unknown));
+            const auto encoded{EncodeV2(Skeleton(ETH_OBSERVATION_SUBJECT_RESERVE))};
+            BOOST_REQUIRE(encoded);
+            Bytes patched{*encoded};
+            patched[2] = subject;
+            BOOST_CHECK(!DecodesV2(patched));
+        }
+    }
+
+    // The wire: a RESERVE_E body under subject 0x12 decodes as 0x12, a
+    // TOKEN_FLAGS body under 0x13 as 0x13; each other shape is malformed.
+    {
+        const auto encoded{EncodeV2(Skeleton(ETH_OBSERVATION_SUBJECT_RESERVE))};
+        BOOST_REQUIRE(encoded);
+        Bytes as_successor{*encoded};
+        as_successor[2] = ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR;
+        const auto decoded{DecodeBridgeRecordV1(as_successor, BRIDGE_MPT_LIMITS_V2)};
+        BOOST_REQUIRE(decoded);
+        BridgeEthStateObservationV2 expected{Skeleton(ETH_OBSERVATION_SUBJECT_RESERVE)};
+        expected.subject = ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR;
+        BOOST_CHECK(*decoded == Kind9(expected));
+        BOOST_CHECK(EncodeV2(expected) == as_successor);
+        Bytes wrong_shape{*encoded};
+        wrong_shape[2] = ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR;
+        BOOST_CHECK(!DecodesV2(wrong_shape));
+
+        Bytes flags_wire{TokenWire().Get()};
+        flags_wire[2] = ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR;
+        BOOST_CHECK(DecodesV2(flags_wire));
+        flags_wire[2] = ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR;
+        BOOST_CHECK(!DecodesV2(flags_wire));
+    }
+
+    // A verdict on a successor subject is refused in both directions.
+    for (const uint8_t subject : {ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR,
+                                  ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR}) {
+        BridgeEthStateObservationV2 skeleton{Skeleton(subject)};
+        BOOST_REQUIRE(EncodeV2(skeleton));
+        for (const uint8_t verdict : {ETH_OBSERVATION_VERDICT_SETS_MISMATCH, ETH_OBSERVATION_VERDICT_CERT_CONFLICT,
+                                      ETH_OBSERVATION_VERDICT_MASK}) {
+            BridgeEthStateObservationV2 with_verdict{skeleton};
+            with_verdict.verdict = verdict;
+            BOOST_CHECK(!EncodeV2(with_verdict));
+            Bytes patched{*EncodeV2(skeleton)};
+            patched[35] = verdict; // kind, reserved, subject, 32-byte anchor
+            BOOST_CHECK(!DecodesV2(patched));
+        }
+    }
+
+    // v''s code-hash rules are v's (OI-3): a pin must match, an unpinned v'
+    // needs code and the regtest chain.
+    {
+        bridge_test::ObservationWorld pinned_world{launch};
+        pinned_world.AddSuccessorVault(next.vault, KeccakOf("successor runtime"));
+        const BridgeEthStateObservationV2 record{
+            pinned_world.Observe(ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR, anchor)};
+        const uint256 pinned_root{pinned_world.StateRoot()};
+        ObservationPins pins{pinned_world.PinsFor(BridgeV2EntryRole::SUCCESSOR)};
+        BOOST_CHECK_MESSAGE(VerifyEthStateObservationV2(record, pinned_root, pins, error), error);
+        pins.vault_code_hash = KeccakOf("other successor");
+        BOOST_CHECK(!VerifyEthStateObservationV2(record, pinned_root, pins, error));
+        BOOST_CHECK_EQUAL(error, "observation vault code hash does not match its pin");
+        pins.vault_code_hash.reset();
+        BOOST_CHECK_MESSAGE(VerifyEthStateObservationV2(record, pinned_root, pins, error), error);
+        pins.origin_chain_id = 1;
+        BOOST_CHECK(!VerifyEthStateObservationV2(record, pinned_root, pins, error));
+        BOOST_CHECK_EQUAL(error, "observation vault code hash is unpinned off the regtest chain");
+    }
+    {
+        bridge_test::ObservationWorld empty_world{launch};
+        empty_world.AddSuccessorVault(next.vault);
+        empty_world.code[next.vault] = EMPTY_CODE_HASH;
+        BOOST_CHECK(!VerifyEthStateObservationV2(
+            empty_world.Observe(ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR, anchor), empty_world.StateRoot(),
+            empty_world.PinsFor(BridgeV2EntryRole::SUCCESSOR), error));
+        BOOST_CHECK_EQUAL(error, "observation vault has no code");
+    }
+    // Pins of an envelope without a successor read nothing, not even the
+    // token-only 0x13 (which would otherwise read isBlackListed[0]).
+    for (const BridgeEthStateObservationV2* record : {&reserve_next, &flags_next}) {
+        BOOST_CHECK(!verify(*record, unpinned));
+        BOOST_CHECK_EQUAL(error, "observation pins name no vault entry");
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

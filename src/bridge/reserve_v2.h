@@ -20,7 +20,9 @@
  * - check 2 of a burn, the reserve bound, and check 3, the wind-down bound
  *   (section 7.2);
  * - invariant R (section 8.4);
- * - transit crediting on proven arrival (the accounting part of section 7.6).
+ * - the amount of a B-23 migration or sweep leaf, its transit production,
+ *   and transit crediting on proven arrival (the accounting part of
+ *   section 7.6).
  *
  * Pure: no chain state and no I/O. The bridge index (node::BridgeStateIndex)
  * keeps the ledger and the proven-deposit index under undo. It applies each
@@ -33,9 +35,10 @@
 namespace bridge {
 
 /**
- * One vault entry's ledger (section 7.1). At launch there is one entry.
- * Supply <= reserve + transit. A plain burn lowers supply only, and the
- * ledger never sees it.
+ * One vault entry's ledger (section 7.1). At launch there is one entry; a
+ * B-23 migration adds the successor v' with a ledger of its own. Supply <=
+ * the sum over entries of reserve + transit. A plain burn lowers supply
+ * only, and the ledger never sees it.
  */
 struct ReserveLedgerV2 {
     //! Sum of the bUSD V2 minted against this entry's proven deposits.
@@ -68,8 +71,9 @@ struct ReserveLedgerV2 {
 };
 
 /**
- * Index of proven deposit amounts by Vault V2 deposit id (section 7.1). With
- * one vault entry the id alone is the nullifier's distinguishing part.
+ * Index of proven deposit amounts by Vault V2 deposit id (section 7.1). Each
+ * vault entry keeps its own index, so within one index the id alone is the
+ * nullifier's distinguishing part.
  */
 using ProvenDepositMapV2 = std::map<uint64_t, CAmount>;
 
@@ -195,6 +199,23 @@ inline bool BurnWithinReserve(const CAmount amount, const ReserveLedgerV2& ledge
 {
     if (!BurnWithinReserve(amount, ledger)) return false;
     ledger.burned += amount; // <= minted + credited, checked above
+    return true;
+}
+
+/**
+ * transit += amount on the successor's ledger, for a migration or sweep leaf
+ * (section 7.6) that the bridge index appended: the leaf names the retired
+ * entry, whose burned_v counts it (RecordBurnV2), and pays the successor's
+ * vault, where the amount counts in none of reserve_v', invariant R or R_v'
+ * until CreditTransit moves it. False, with the ledger unchanged, for a
+ * non-positive amount, an invalid ledger or an overflow of transit.
+ */
+[[nodiscard]] inline bool RecordTransitV2(ReserveLedgerV2& ledger, const CAmount amount)
+{
+    if (amount <= 0 || !ledger.Valid()) return false;
+    const auto transit{CheckedAdd(ledger.transit, amount)};
+    if (!transit) return false;
+    ledger.transit = *transit; // transit does not enter Valid()'s backing sum
     return true;
 }
 
@@ -329,6 +350,50 @@ inline bool WindDownAllows(const CAmount amount, const ReserveStateV2& reserve,
 {
     const auto terms{ComputeWindDownTerms(reserve, sums, ledger, ppm)};
     return amount > 0 && terms && amount <= terms->headroom;
+}
+
+/**
+ * The amount of a B-23 migration or sweep leaf (section 7.6): the retired
+ * entry's reserve_v, capped by the wind-down headroom of its latest
+ * RESERVE_E (check 3 of section 7.2), so the leaf never asks the vault for
+ * more than the bound admits. With the vault holding what it locks the
+ * headroom covers reserve_v and the leaf moves all of it. After a partial
+ * seizure (balance below locked) the leaf moves what the vault can still
+ * pay and leaves only the shortfall in reserve_v, which a later sweep
+ * moves as far as a later observation allows. nullopt when nothing can be
+ * swept: reserve_v or the headroom is not positive, or ComputeWindDownTerms
+ * refuses. The result passes WindDownAllows and BurnWithinReserve.
+ */
+inline std::optional<CAmount> VaultSweepAmountV2(const ReserveLedgerV2& retired,
+                                                 const ReserveStateV2& reserve,
+                                                 const ProvenDepositSumsV2& sums,
+                                                 const uint32_t ppm)
+{
+    const auto reserve_v{retired.Reserve()};
+    const auto terms{ComputeWindDownTerms(reserve, sums, retired, ppm)};
+    if (!reserve_v || !terms || *reserve_v <= 0 || terms->headroom <= 0) return std::nullopt;
+    return std::min(*reserve_v, terms->headroom);
+}
+
+/**
+ * The accounting of one migration or sweep leaf (section 7.6), on both
+ * ledgers or on neither: the leaf names the retired entry, so `retired`'s
+ * burned_v counts the amount (RecordBurnV2: 0 < amount <= reserve_v), and
+ * it pays the successor's vault, so `successor`'s transit receives it
+ * (RecordTransitV2). Nothing is burned: the sum over both entries of
+ * reserve + transit is unchanged. False, with both ledgers unchanged, when
+ * either update refuses or both arguments are the same ledger.
+ */
+[[nodiscard]] inline bool RecordSweepV2(ReserveLedgerV2& retired, ReserveLedgerV2& successor,
+                                        const CAmount amount)
+{
+    if (&retired == &successor) return false;
+    ReserveLedgerV2 next_retired{retired};
+    ReserveLedgerV2 next_successor{successor};
+    if (!RecordBurnV2(next_retired, amount) || !RecordTransitV2(next_successor, amount)) return false;
+    retired = next_retired;
+    successor = next_successor;
+    return true;
 }
 
 } // namespace bridge

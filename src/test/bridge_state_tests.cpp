@@ -363,6 +363,9 @@ struct DepositSpec {
     uint64_t id{0};
     uint64_t amount{0};
     unsigned char recipient_fill{0};
+    //! The emitting vault when not the fixture's (a B-23 successor's
+    //! deposits in the same receipt as the launch vault's).
+    std::optional<Consensus::BridgeEthAddress> vault{};
 };
 
 struct ReceiptFixture {
@@ -409,8 +412,8 @@ ReceiptFixture MakeReceiptFixture(
         std::copy(encoded_recipient.begin(), encoded_recipient.end(),
                   data.begin() + 32);
         const std::vector<std::vector<unsigned char>> log_fields{
-            EncodedBytes(vault), bridge::RlpEncodeList(topics),
-            EncodedBytes(data)};
+            EncodedBytes(deposit.vault.value_or(vault)),
+            bridge::RlpEncodeList(topics), EncodedBytes(data)};
         encoded_logs.push_back(bridge::RlpEncodeList(log_fields));
     }
     if (padding_log_bytes > 0) {
@@ -719,14 +722,15 @@ void ConnectEmptyThrough(node::BridgeStateIndex& index,
     while (index.ConnectedHeight() < height) ConnectNext(index, params);
 }
 
-//! A kind 3 MINT naming the V2 vault entry, encoded under the V2 limits.
-CTransactionRef MintTransactionV2(const Consensus::Params& params,
-                                  const ReceiptFixture& fixture,
-                                  const uint32_t log_index,
-                                  const CAmount amount)
+//! A kind 3 MINT naming the V2 vault entry `role` (default: the launch
+//! entry), encoded under the V2 limits.
+CTransactionRef MintTransactionV2(
+    const Consensus::Params& params, const ReceiptFixture& fixture,
+    const uint32_t log_index, const CAmount amount,
+    const Consensus::BridgeV2EntryRole role = Consensus::BridgeV2EntryRole::LAUNCH)
 {
     const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
-    const auto entry{modern::ConfiguredBridgeV2EntryId(params)};
+    const auto entry{modern::ConfiguredBridgeV2EntryId(params, role)};
     BOOST_REQUIRE(asset);
     BOOST_REQUIRE(entry);
     BOOST_REQUIRE(log_index < fixture.recipient_scripts.size());
@@ -869,6 +873,11 @@ constexpr uint8_t SUBJECT_RESERVE{bridge::ETH_OBSERVATION_SUBJECT_RESERVE};
 constexpr uint8_t SUBJECT_TOKEN{bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS};
 constexpr uint8_t VERDICT_SETS{bridge::ETH_OBSERVATION_VERDICT_SETS_MISMATCH};
 constexpr uint8_t VERDICT_CERT{bridge::ETH_OBSERVATION_VERDICT_CERT_CONFLICT};
+//! The B-23 successor's RESERVE_E and TOKEN_FLAGS (0x12 and 0x13).
+constexpr uint8_t SUBJECT_RESERVE_NEXT{bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR};
+constexpr uint8_t SUBJECT_TOKEN_NEXT{bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR};
+constexpr Consensus::BridgeV2EntryRole ROLE_LAUNCH{Consensus::BridgeV2EntryRole::LAUNCH};
+constexpr Consensus::BridgeV2EntryRole ROLE_SUCCESSOR{Consensus::BridgeV2EntryRole::SUCCESSOR};
 
 //! A distinct Ethereum block hash for execution block `number`.
 uint256 AnchorHash(const uint64_t number)
@@ -892,6 +901,9 @@ void PassThrough(const node::BridgeStateIndex& index,
     delta.reserve_v2_after = index.ReserveLedgerV2();
     delta.conflict_v2_before = index.ConflictV2();
     delta.conflict_v2_after = index.ConflictV2();
+    delta.reserve_v2_successor_before =
+        index.ReserveLedgerV2(Consensus::BridgeV2EntryRole::SUCCESSOR);
+    delta.reserve_v2_successor_after = delta.reserve_v2_successor_before;
 }
 
 //! One execution block retained as a V2 anchor by a fixture seed.
@@ -1257,6 +1269,17 @@ void CheckSameAccounting(const node::BridgeStateIndex& a,
     BOOST_CHECK_EQUAL(a.ConnectedHeight(), b.ConnectedHeight());
     BOOST_CHECK(a.ConnectedHash() == b.ConnectedHash());
     BOOST_CHECK(a.WithdrawalTreeV2() == b.WithdrawalTreeV2());
+    // The B-23 successor's ledger and deposits (node changes section 7.6).
+    constexpr auto SUCCESSOR{Consensus::BridgeV2EntryRole::SUCCESSOR};
+    BOOST_CHECK(a.ReserveLedgerV2(SUCCESSOR) == b.ReserveLedgerV2(SUCCESSOR));
+    BOOST_CHECK(a.ProvenDepositsV2(SUCCESSOR) == b.ProvenDepositsV2(SUCCESSOR));
+    BOOST_CHECK_EQUAL(a.ProvenDepositsTotalV2(SUCCESSOR),
+                      b.ProvenDepositsTotalV2(SUCCESSOR));
+    CAmount successor_total{0};
+    for (const auto& [id, amount] : a.ProvenDepositsV2(SUCCESSOR)) {
+        successor_total += amount;
+    }
+    BOOST_CHECK_EQUAL(a.ProvenDepositsTotalV2(SUCCESSOR), successor_total);
 }
 
 void CheckSameV2Delta(const node::BridgeBlockDelta& a,
@@ -1271,6 +1294,9 @@ void CheckSameV2Delta(const node::BridgeBlockDelta& a,
     BOOST_CHECK(a.conflict_v2_after == b.conflict_v2_after);
     BOOST_CHECK(a.finality_conflicts_v2_added == b.finality_conflicts_v2_added);
     BOOST_CHECK(a.withdrawals_v2_added == b.withdrawals_v2_added);
+    BOOST_CHECK(a.reserve_v2_successor_before == b.reserve_v2_successor_before);
+    BOOST_CHECK(a.reserve_v2_successor_after == b.reserve_v2_successor_after);
+    BOOST_CHECK(a.deposits_v2_successor_added == b.deposits_v2_successor_added);
 }
 
 void Disconnect(node::BridgeStateIndex& index)
@@ -1279,6 +1305,166 @@ void Disconnect(node::BridgeStateIndex& index)
     BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(index.ConnectedHeight(),
                                                 index.ConnectedHash(), error),
                           error);
+}
+
+// -- B-23 migration fixtures (node changes section 7.6) ---------------------
+
+//! The migration height of the migration fixtures: V + 5, inside the
+//! LineageFixture's C3 window (finalized at 109, a lag of at most 90).
+constexpr int MIGRATION_HEIGHT{BRIDGE_V2_HEIGHT + 5};
+
+//! The successor vault v' of the migration fixtures.
+Consensus::BridgeEthAddress SuccessorVault() { return FilledAddress(0x46); }
+
+/**
+ * `params` with a B-23 successor v' (node changes section 7.6): vault
+ * 0x46.. on the launch entry's chain, token and caps, with a code hash of
+ * its own (required on chain 1), predecessor v, v's bUSD V2 AssetId under
+ * the fixture chain domain and `migration_height`. The shared per-epoch cap
+ * is raised to 1,000 so the scenarios' mints of one epoch fit.
+ */
+Consensus::Params WithSuccessor(Consensus::Params params,
+                                const int migration_height = MIGRATION_HEIGHT)
+{
+    Consensus::BridgeV2Params& v2{*params.bridge_v2};
+    v2.vault.mint_caps.max_per_epoch = 1'000;
+    Consensus::BridgeV2SuccessorEntry successor;
+    successor.entry = v2.vault;
+    successor.entry.vault_address = SuccessorVault();
+    successor.entry.vault_runtime_code_hash = TestHash(54);
+    successor.predecessor = v2.vault.vault_address;
+    successor.asset_id = modern::BridgeAssetIdV2(FixtureChainDomain(), v2.vault);
+    successor.migration_height = migration_height;
+    v2.successor = successor;
+    BOOST_REQUIRE(v2.Valid());
+    BOOST_REQUIRE(modern::ConfiguredBridgeV2AssetId(params));
+    BOOST_REQUIRE(modern::ConfiguredBridgeV2EntryId(params, ROLE_SUCCESSOR));
+    BOOST_REQUIRE(!params.BridgeV2MigrationActive(migration_height - 1));
+    BOOST_REQUIRE(params.BridgeV2MigrationActive(migration_height));
+    return params;
+}
+
+//! LineageParams with the successor.
+Consensus::Params MigrationParams() { return WithSuccessor(LineageParams()); }
+
+//! One receipt (block 700) holding v's deposits 0, 1, 2 of 60, 40, 30
+//! (logs 0-2) and v''s deposits 0, 1 of 50, 20 (logs 3-4).
+ReceiptFixture MigrationReceipts(const Consensus::Params& params)
+{
+    const Consensus::BridgeV2Params& v2{*params.bridge_v2};
+    const Consensus::BridgeEthAddress& next{v2.successor->entry.vault_address};
+    return MakeReceiptFixture(v2.vault.vault_address, v2.vault.token_address,
+                              {{0, 60, 0x31}, {1, 40, 0x32}, {2, 30, 0x33},
+                               {0, 50, 0x34, next}, {1, 20, 0x35, next}});
+}
+
+/**
+ * The migration scenarios' Ethereum state at anchor 700: v after deposits 0
+ * and 1 (cut 2, locked and balance 100), v' holding nothing and not
+ * blacklisted, a token that pays, and a LIVE verifier that accepted B3's
+ * statement at checkpoint 109.
+ */
+bridge_test::ObservationWorld MigrationWorld(const Consensus::Params& params,
+                                             const ReceiptFixture& receipts,
+                                             const LineageFixture& lineage)
+{
+    bridge_test::ObservationWorld world{HealthyWorld(params, 2, 100)};
+    world.AddSuccessorVault(SuccessorVault(), TestHash(54));
+    world.SetSuccessorReserve(0, 0, 0, 0);
+    world.SetSuccessorBlacklisted(false);
+    const node::BridgeStateIndex probe{
+        FundingIndex(params, receipts, world.StateRoot())};
+    world.SetVerifier(lineage.Canonical(1, 109, params, probe));
+    return world;
+}
+
+/**
+ * FundingIndex on `world`, then block V: v's mints of deposits 0 (60) and 1
+ * (40) and subjects 3, 2 and 1 observed at anchor 700, judged by `lineage`.
+ */
+node::BridgeStateIndex MigrationIndex(const Consensus::Params& params,
+                                      const ReceiptFixture& receipts,
+                                      const bridge_test::ObservationWorld& world,
+                                      const LineageFixture& lineage)
+{
+    node::BridgeStateIndex index{FundingIndex(params, receipts, world.StateRoot())};
+    ConnectNext(index, params,
+                {MintTransactionV2(params, receipts, 0, 60),
+                 MintTransactionV2(params, receipts, 1, 40),
+                 Observe(world, SUBJECT_TOKEN, receipts.block_hash),
+                 Observe(world, SUBJECT_RESERVE, receipts.block_hash),
+                 Observe(world, SUBJECT_VERIFIER, receipts.block_hash)},
+                1'060, &lineage.context);
+    BOOST_REQUIRE_EQUAL(index.ConnectedHeight(), BRIDGE_V2_HEIGHT);
+    BOOST_REQUIRE_EQUAL(index.ReserveLedgerV2().Reserve().value_or(-1), 100);
+    return index;
+}
+
+/**
+ * A kind 16 VAULT_SWEEP carrier naming `registry` (default: the launch
+ * entry id), shaped as submitbridgecarrier builds one: a payment at output
+ * 0 and the binding at output 1. `source_tag` makes its txid distinct.
+ */
+CTransactionRef SweepTransactionV2(const Consensus::Params& params,
+                                   const uint8_t source_tag,
+                                   const std::optional<uint256>& registry = std::nullopt)
+{
+    const auto entry{modern::ConfiguredBridgeV2EntryId(params, ROLE_LAUNCH)};
+    BOOST_REQUIRE(entry);
+    const auto record{bridge::MakeBridgeMpaRecord(
+        bridge::BridgeRecordV1{bridge::BridgeRecordKindV1::VAULT_SWEEP,
+                               bridge::BridgeVaultSweepV2{registry.value_or(*entry)}},
+        bridge::BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(record);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint{Txid::FromUint256(TestHash(source_tag)), 0};
+    tx.vout = {CTxOut{1'000, CScript{} << OP_TRUE}, *binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
+}
+
+//! The sweep leaf consensus derives: v pays v' `amount` as leaf `id` at
+//! `height` (modern::MakeVaultSweepWithdrawalV2).
+modern::BridgeWithdrawalV2 ExpectedSweep(const Consensus::Params& params,
+                                         const uint64_t id, const CAmount amount,
+                                         const int height)
+{
+    const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
+    BOOST_REQUIRE(asset);
+    return modern::MakeVaultSweepWithdrawalV2(params.bridge_v2->vault, *asset,
+                                              SuccessorVault(), id, amount,
+                                              static_cast<uint64_t>(height));
+}
+
+//! A kind 6 burn of `amount` naming the successor entry.
+CTransactionRef SuccessorBurn(const Consensus::Params& params,
+                              const uint8_t source_tag, const CAmount amount,
+                              const uint8_t recipient_tag)
+{
+    const auto entry{modern::ConfiguredBridgeV2EntryId(params, ROLE_SUCCESSOR)};
+    BOOST_REQUIRE(entry);
+    return BurnTransactionV2(params, source_tag, amount, recipient_tag, *entry);
+}
+
+//! VerifyBlock of `transactions` at the index's next height, which must
+//! pass; the index is unchanged.
+node::BridgeBlockDelta Verifies(const node::BridgeStateIndex& index,
+                                const Consensus::Params& params,
+                                std::vector<CTransactionRef> transactions,
+                                const uint32_t time,
+                                const node::BridgeV2LineageContext* lineage)
+{
+    const int height{index.ConnectedHeight() + 1};
+    node::BridgeBlockDelta delta;
+    std::string error;
+    BOOST_CHECK_MESSAGE(index.VerifyBlock(Block(time, std::move(transactions)),
+                                          height, V2TestBlockHash(height), params,
+                                          delta, error, lineage),
+                        error);
+    return delta;
 }
 
 } // namespace
@@ -5387,6 +5573,788 @@ BOOST_AUTO_TEST_CASE(v2_incremental_equals_rebuild)
         BOOST_CHECK(incremental.ReserveLedgerV2() == bridge::ReserveLedgerV2{});
         BOOST_CHECK(incremental.ProvenDepositsV2().empty());
         BOOST_CHECK(incremental.ObservationsV2() == node::BridgeObservationSlotsV2{});
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_migration_activation_and_retirement)
+{
+    // B-23 (node changes section 7.6): below h_m no record may name the
+    // successor v'. From h_m the launch entry v is retired for burns, with
+    // any context, but keeps minting (it cannot refund); v' mints, and the
+    // block-level burn gate reads v''s rows (TOKEN_FLAGS_SUCCESSOR and
+    // RESERVE_E_SUCCESSOR), whatever v's.
+    const Consensus::Params params{MigrationParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{MigrationReceipts(params)};
+    bridge_test::ObservationWorld world{MigrationWorld(params, receipts, lineage)};
+    // v' after its deposit 0: cut 1, locked and balance 50.
+    world.SetSuccessorReserve(1, 50, 0, 50);
+    node::BridgeStateIndex index{MigrationIndex(params, receipts, world, lineage)};
+    const auto launch_id{modern::ConfiguredBridgeV2EntryId(params, ROLE_LAUNCH)};
+    const auto successor_id{modern::ConfiguredBridgeV2EntryId(params, ROLE_SUCCESSOR)};
+    BOOST_REQUIRE(launch_id && successor_id);
+    BOOST_CHECK(*launch_id != *successor_id);
+    const int h_m{MIGRATION_HEIGHT};
+
+    // Below h_m: no successor mint, burn, observation or sweep.
+    {
+        const int next{index.ConnectedHeight() + 1};
+        BOOST_REQUIRE(next < h_m);
+        VerifyFails(index, Block(1'061, {MintTransactionV2(params, receipts, 3, 50, ROLE_SUCCESSOR)}), next,
+                    params, "bridge mint registry id does not match the V2 vault entry", &lineage.context);
+        VerifyFails(index, Block(1'061, {SuccessorBurn(params, 1, 10, 0x91)}), next, params,
+                    "bridge burn does not name the V2 vault entry", &lineage.context);
+        for (const uint8_t subject : {SUBJECT_RESERVE_NEXT, SUBJECT_TOKEN_NEXT}) {
+            VerifyFails(index, Block(1'061, {Observe(world, subject, receipts.block_hash)}), next, params,
+                        "bridge V2 successor observations are not active", &lineage.context);
+        }
+        VerifyFails(index, Block(1'061, {SweepTransactionV2(params, 1)}), next, params,
+                    "bridge V2 vault sweeps are not active", &lineage.context);
+        // The launch entry takes burns; no sweep gate exists yet.
+        const auto gate{node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, next, 1'061)};
+        BOOST_CHECK_MESSAGE(gate.readiness == node::BridgeBurnReadiness::READY, gate.Describe());
+        const auto sweep_gate{node::EvaluateBridgeV2SweepGate(&lineage.context, index, params, next, 1'061)};
+        BOOST_CHECK(sweep_gate.readiness == node::BridgeBurnReadiness::UNAVAILABLE);
+        BOOST_CHECK(sweep_gate.Describe().find("sweeps are not active") != std::string::npos);
+        const node::BridgeBlockDelta launch_burn{
+            Verifies(index, params, {BurnTransactionV2(params, 2, 10, 0x92)}, 1'061, &lineage.context)};
+        BOOST_REQUIRE_EQUAL(launch_burn.withdrawals_v2_added.size(), 1U);
+        BOOST_CHECK(launch_burn.withdrawals_v2_added.front().entry == 0);
+        BOOST_CHECK(launch_burn.withdrawals_v2_added.front().withdrawal.vault == params.bridge_v2->vault.vault_address);
+    }
+    ConnectEmptyThrough(index, params, h_m - 1);
+
+    // From h_m a burn naming v is refused before the gate, deterministically:
+    // with the full context, under replay and without a context.
+    const CTransactionRef launch_burn{BurnTransactionV2(params, 3, 10, 0x93)};
+    for (const node::BridgeV2LineageContext* context :
+         {&lineage.context, &node::REPLAY_LINEAGE,
+          static_cast<const node::BridgeV2LineageContext*>(nullptr)}) {
+        VerifyFails(index, Block(1'070, {launch_burn}), h_m, params,
+                    "bridge V2 burn names the retired vault entry", context);
+    }
+    // v keeps minting; v' mints from h_m, only against its own Deposit log.
+    {
+        const node::BridgeBlockDelta late{
+            Verifies(index, params, {MintTransactionV2(params, receipts, 2, 30)}, 1'070, nullptr)};
+        BOOST_CHECK(late.deposits_v2_added == (std::vector<node::BridgeProvenDepositV2>{{2, 30}}));
+        BOOST_CHECK(late.deposits_v2_successor_added.empty());
+        BOOST_CHECK_EQUAL(late.reserve_v2_after.minted, 130);
+        BOOST_CHECK(late.reserve_v2_successor_after == bridge::ReserveLedgerV2{});
+        const node::BridgeBlockDelta next_mint{Verifies(
+            index, params, {MintTransactionV2(params, receipts, 3, 50, ROLE_SUCCESSOR)}, 1'070, nullptr)};
+        BOOST_CHECK(next_mint.deposits_v2_added.empty());
+        BOOST_CHECK(next_mint.deposits_v2_successor_added == (std::vector<node::BridgeProvenDepositV2>{{0, 50}}));
+        BOOST_CHECK_EQUAL(next_mint.reserve_v2_successor_after.minted, 50);
+        BOOST_CHECK_EQUAL(next_mint.reserve_v2_after.minted, 100);
+        BOOST_REQUIRE_EQUAL(next_mint.nullifiers_added.size(), 1U);
+        BOOST_CHECK(next_mint.nullifiers_added.front().vault_address == SuccessorVault());
+        // Log 0 is v's Deposit, which v' cannot claim.
+        VerifyFails(index, Block(1'070, {MintTransactionV2(params, receipts, 0, 60, ROLE_SUCCESSOR)}), h_m,
+                    params, "does not name one exact configured-vault deposit log");
+    }
+    // The block-level gate is v''s now: v's TOKEN_FLAGS (3) is fresh, but
+    // no TOKEN_FLAGS_SUCCESSOR exists. The sweep gate (v's but for
+    // retirement) is READY.
+    {
+        const auto gate{node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, h_m, 1'070)};
+        BOOST_CHECK(gate.row == bridge::BurnGateRowV2::E7);
+        BOOST_CHECK_EQUAL(gate.Describe(), "E7: no TOKEN_FLAGS observation");
+        const auto sweep_gate{node::EvaluateBridgeV2SweepGate(&lineage.context, index, params, h_m, 1'070)};
+        BOOST_CHECK_MESSAGE(sweep_gate.readiness == node::BridgeBurnReadiness::READY, sweep_gate.Describe());
+        BOOST_CHECK(node::EvaluateBridgeV2SweepGate(nullptr, index, params, h_m, 1'070).readiness ==
+                    node::BridgeBurnReadiness::UNAVAILABLE);
+        BOOST_CHECK(node::EvaluateBridgeV2SweepGate(&node::REPLAY_LINEAGE, index, params, h_m, 1'070).readiness ==
+                    node::BridgeBurnReadiness::UNAVAILABLE);
+    }
+    ConnectNext(index, params,
+                {MintTransactionV2(params, receipts, 3, 50, ROLE_SUCCESSOR),
+                 Observe(world, SUBJECT_TOKEN_NEXT, receipts.block_hash)},
+                1'070, &lineage.context);
+    BOOST_CHECK(index.LatestObservationV2(SUBJECT_TOKEN_NEXT));
+    BOOST_CHECK(!index.LatestObservationV2(SUBJECT_RESERVE_NEXT));
+    BOOST_CHECK(index.ProvenDepositsV2(ROLE_SUCCESSOR) == (bridge::ProvenDepositMapV2{{0, 50}}));
+    BOOST_CHECK_EQUAL(index.ProvenDepositsTotalV2(ROLE_SUCCESSOR), 50);
+    BOOST_CHECK_EQUAL(index.ProvenDepositsTotalV2(ROLE_LAUNCH), 100);
+    BOOST_CHECK_EQUAL(
+        node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, h_m + 1, 1'071).Describe(),
+        "E8: no RESERVE_E observation");
+    VerifyFails(index, Block(1'071, {SuccessorBurn(params, 4, 10, 0x94)}), h_m + 1, params,
+                "bridge V2 burn gate is not ready at the burn: E8: no RESERVE_E observation", &lineage.context);
+    ConnectNext(index, params, {Observe(world, SUBJECT_RESERVE_NEXT, receipts.block_hash)}, 1'071,
+                &lineage.context);
+    BOOST_CHECK(!index.ConflictV2());
+    {
+        const auto gate{node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, h_m + 2, 1'072)};
+        BOOST_CHECK_MESSAGE(gate.readiness == node::BridgeBurnReadiness::READY, gate.Describe());
+    }
+    // A burn naming v' passes; its leaf names v' with the shared asset, and
+    // v''s ledger counts it.
+    VerifyFails(index, Block(1'072, {SuccessorBurn(params, 4, 51, 0x94)}), h_m + 2, params,
+                "bridge V2 burn exceeds the vault entry's reserve", &lineage.context);
+    const node::BridgeBlockDelta burned{
+        ConnectNext(index, params, {SuccessorBurn(params, 4, 10, 0x94)}, 1'072, &lineage.context)};
+    BOOST_REQUIRE_EQUAL(burned.withdrawals_v2_added.size(), 1U);
+    const node::BridgeWithdrawalV2Request& leaf{burned.withdrawals_v2_added.front()};
+    BOOST_CHECK(leaf.entry == 1);
+    BOOST_CHECK(!leaf.sweep);
+    BOOST_CHECK(leaf.withdrawal.vault == SuccessorVault());
+    BOOST_CHECK(leaf.withdrawal.token == params.bridge_v2->vault.token_address);
+    BOOST_CHECK(leaf.withdrawal.asset_id == *modern::ConfiguredBridgeV2AssetId(params));
+    BOOST_CHECK_EQUAL(leaf.withdrawal.destination_chain_id, params.bridge_v2->vault.origin_chain_id);
+    BOOST_CHECK(leaf.leaf == *modern::BridgeWithdrawalLeafV2(leaf.withdrawal));
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).burned, 10);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).Reserve().value_or(-1), 40);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_LAUNCH).burned, 0);
+
+    // Undo restores both ledgers and v''s deposits.
+    Disconnect(index);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).burned, 0);
+    Disconnect(index);
+    Disconnect(index);
+    BOOST_CHECK(index.ReserveLedgerV2(ROLE_SUCCESSOR) == bridge::ReserveLedgerV2{});
+    BOOST_CHECK(index.ProvenDepositsV2(ROLE_SUCCESSOR).empty());
+    BOOST_CHECK_EQUAL(index.ProvenDepositsTotalV2(ROLE_SUCCESSOR), 0);
+    BOOST_CHECK(!index.LatestObservationV2(SUBJECT_TOKEN_NEXT));
+}
+
+BOOST_AUTO_TEST_CASE(v2_migration_sweep_leaf_and_transit)
+{
+    // Kind 16 (node changes section 7.6): from h_m, with v's gate READY but
+    // for retirement, the block appends the migration leaf naming v and
+    // paying v' reserve_v, which empties reserve_v and adds the amount to
+    // transit_v'. Nothing is credited to v' yet.
+    const Consensus::Params params{MigrationParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{MigrationReceipts(params)};
+    const bridge_test::ObservationWorld world{MigrationWorld(params, receipts, lineage)};
+    node::BridgeStateIndex index{MigrationIndex(params, receipts, world, lineage)};
+    // Anchors: 701 a paused token, 704 the same healthy world as the light
+    // client's new head (t 100,000), 705 a drained v (E8), 706 a v balance
+    // of 80 short of locked 100 and 707 a v balance of 0 (all seized, so
+    // invariant R still holds). VERIFIER_E and RESERVE_E are then observed
+    // again at 704, so TOKEN_FLAGS (t 1,000) goes stale first.
+    bridge_test::ObservationWorld paused{world};
+    paused.SetTokenFlags(true, false, false);
+    bridge_test::ObservationWorld drained{world};
+    drained.SetReserve(2, 25, 0, 25);
+    bridge_test::ObservationWorld short_balance{world};
+    short_balance.SetReserve(2, 100, 0, 80);
+    bridge_test::ObservationWorld seized{world};
+    seized.SetReserve(2, 100, 0, 0);
+    const StateAnchorSpec head{StateAnchor(704, 100'000, world.StateRoot())};
+    SeedStateAnchorsV2(index,
+                       {StateAnchor(701, 1'010, paused.StateRoot()), head,
+                        StateAnchor(705, 1'020, drained.StateRoot()),
+                        StateAnchor(706, 1'030, short_balance.StateRoot()),
+                        StateAnchor(707, 1'040, seized.StateRoot())},
+                       head);
+    ConnectNext(index, params,
+                {Observe(world, SUBJECT_VERIFIER, AnchorHash(704)),
+                 Observe(world, SUBJECT_RESERVE, AnchorHash(704))},
+                100'060, &lineage.context);
+    ConnectEmptyThrough(index, params, MIGRATION_HEIGHT - 1);
+    const int h_m{MIGRATION_HEIGHT};
+    constexpr uint32_t T{100'100};
+    const CTransactionRef sweep{SweepTransactionV2(params, 1)};
+
+    // Refused without a context, naming another entry, while v's gate is
+    // closed (a stale TOKEN_FLAGS, a paused token or a sticky conflict
+    // earlier in the block), and with no wind-down headroom (a balance of
+    // 0).
+    VerifyFails(index, Block(T, {sweep}), h_m, params, "bridge V2 vault sweep cannot be judged here");
+    VerifyFails(index, Block(T, {SweepTransactionV2(params, 2, *modern::ConfiguredBridgeV2EntryId(params, ROLE_SUCCESSOR))}),
+                h_m, params, "bridge V2 vault sweep does not name the retired vault entry", &lineage.context);
+    VerifyFails(index, Block(T, {SweepTransactionV2(params, 2, TestHash(0x77))}), h_m, params,
+                "bridge V2 vault sweep does not name the retired vault entry", &lineage.context);
+    {
+        const uint32_t stale{static_cast<uint32_t>(1'000 + params.bridge_v2->gate.observation_max_age_seconds + 1)};
+        VerifyFails(index, Block(stale, {sweep}), h_m, params,
+                    "bridge V2 vault sweep gate is not ready: E7: TOKEN_FLAGS observation is stale", &lineage.context);
+        BOOST_CHECK_EQUAL(node::EvaluateBridgeV2SweepGate(&lineage.context, index, params, h_m, stale).Describe(),
+                          "E7: TOKEN_FLAGS observation is stale");
+    }
+    VerifyFails(index, Block(T, {Observe(paused, SUBJECT_TOKEN, AnchorHash(701)), sweep}), h_m, params,
+                "bridge V2 vault sweep gate is not ready: E7: token is paused", &lineage.context);
+    VerifyFails(index, Block(T, {Observe(drained, SUBJECT_RESERVE, AnchorHash(705)), sweep}), h_m, params,
+                "bridge V2 vault sweep gate is not ready: C4: sticky E8 conflict", &lineage.context);
+    VerifyFails(index, Block(T, {Observe(seized, SUBJECT_RESERVE, AnchorHash(707)), sweep}), h_m, params,
+                "bridge V2 vault sweep has no wind-down headroom at the latest reserve observation",
+                &lineage.context);
+    // Replay trusts the gate (judged when the block first connected); the
+    // deterministic checks still run.
+    BOOST_CHECK_EQUAL(Verifies(index, params, {Observe(paused, SUBJECT_TOKEN, AnchorHash(701)), sweep}, T,
+                               &node::REPLAY_LINEAGE)
+                          .withdrawals_v2_added.size(),
+                      1U);
+    VerifyFails(index, Block(T, {Observe(seized, SUBJECT_RESERVE, AnchorHash(707)), sweep}), h_m, params,
+                "has no wind-down headroom", &node::REPLAY_LINEAGE);
+    // A balance of 80 short of locked 100 raises margin_v to 8, so the
+    // wind-down headroom is 72, below reserve_v (100): the sweep moves 72
+    // (a leaf v can pay) and leaves the 28 short in reserve_v, which a later
+    // sweep moves as far as a later observation allows. A second sweep in
+    // the same block finds no headroom left.
+    {
+        const node::BridgeBlockDelta partial{Verifies(
+            index, params, {Observe(short_balance, SUBJECT_RESERVE, AnchorHash(706)), sweep}, T,
+            &lineage.context)};
+        BOOST_REQUIRE_EQUAL(partial.withdrawals_v2_added.size(), 1U);
+        BOOST_CHECK(partial.withdrawals_v2_added.front().withdrawal == ExpectedSweep(params, 0, 72, h_m));
+        BOOST_CHECK_EQUAL(partial.reserve_v2_after.burned, 72);
+        BOOST_CHECK_EQUAL(partial.reserve_v2_after.Reserve().value_or(-1), 28);
+        BOOST_CHECK_EQUAL(partial.reserve_v2_successor_after.transit, 72);
+        BOOST_CHECK(!partial.conflict_v2_after);
+        VerifyFails(index,
+                    Block(T, {Observe(short_balance, SUBJECT_RESERVE, AnchorHash(706)), sweep,
+                              SweepTransactionV2(params, 2)}),
+                    h_m, params, "bridge V2 vault sweep has no wind-down headroom at the latest reserve observation",
+                    &lineage.context);
+    }
+
+    // With the context: the migration leaf. It names v, pays v' reserve_v
+    // (100) as the next V2 id at this height; its source is the carrier's
+    // binding output (1).
+    const modern::BridgeWithdrawalV2 expected{ExpectedSweep(params, 0, 100, h_m)};
+    BOOST_CHECK(expected.recipient == SuccessorVault());
+    BOOST_CHECK(expected.vault == params.bridge_v2->vault.vault_address);
+    const node::BridgeBlockDelta swept{Verifies(index, params, {sweep}, T, &lineage.context)};
+    BOOST_REQUIRE_EQUAL(swept.withdrawals_v2_added.size(), 1U);
+    {
+        const node::BridgeWithdrawalV2Request& request{swept.withdrawals_v2_added.front()};
+        BOOST_CHECK(request.withdrawal == expected);
+        BOOST_CHECK(request.leaf == *modern::BridgeWithdrawalLeafV2(expected));
+        BOOST_CHECK(request.transaction_id == sweep->GetHash());
+        BOOST_CHECK_EQUAL(request.burn_output_index, 1U);
+        BOOST_CHECK(sweep->vout[1] == *modern::MakeBridgeBindingOutput(sweep->mpa.front()));
+        BOOST_CHECK(request.sweep);
+        BOOST_CHECK(request.entry == 0);
+        BOOST_CHECK_EQUAL(request.connected_height, h_m);
+    }
+    BOOST_CHECK_EQUAL(swept.reserve_v2_after.burned, 100);
+    BOOST_CHECK_EQUAL(swept.reserve_v2_after.Reserve().value_or(-1), 0);
+    BOOST_CHECK_EQUAL(swept.reserve_v2_successor_after.transit, 100);
+    BOOST_CHECK_EQUAL(swept.reserve_v2_successor_after.credited, 0);
+    BOOST_CHECK_EQUAL(swept.reserve_v2_successor_after.Reserve().value_or(-1), 0);
+    BOOST_CHECK(swept.mint_authorizations.empty());
+    // A second sweep in the same block has nothing to sweep.
+    VerifyFails(index, Block(T, {sweep, SweepTransactionV2(params, 2)}), h_m, params,
+                "bridge V2 vault sweep has nothing to sweep", &lineage.context);
+    const node::BridgeBlockDelta connected{ConnectNext(index, params, {sweep}, T, &lineage.context)};
+    CheckSameV2Delta(swept, connected);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_LAUNCH).Reserve().value_or(-1), 0);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).transit, 100);
+    BOOST_CHECK_EQUAL(index.WithdrawalV2Count(), 1U);
+    {
+        const auto stored{index.WithdrawalV2(node::BridgeWithdrawalId{sweep->GetHash(), 1})};
+        BOOST_REQUIRE(stored);
+        BOOST_CHECK(stored->sweep);
+        BOOST_CHECK(stored->withdrawal == expected);
+        BOOST_REQUIRE(index.WithdrawalsV2Through(h_m));
+        BOOST_CHECK_EQUAL(index.WithdrawalsV2Through(h_m)->size(), 1U);
+    }
+    // ... and so does one in a later block.
+    VerifyFails(index, Block(T + 1, {SweepTransactionV2(params, 2)}), h_m + 1, params,
+                "bridge V2 vault sweep has nothing to sweep", &lineage.context);
+
+    // Undo restores reserve_v and drops the transit and the leaf.
+    Disconnect(index);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_LAUNCH).Reserve().value_or(-1), 100);
+    BOOST_CHECK(index.ReserveLedgerV2(ROLE_SUCCESSOR) == bridge::ReserveLedgerV2{});
+    BOOST_CHECK_EQUAL(index.WithdrawalV2Count(), 0U);
+    BOOST_CHECK(!index.WithdrawalV2(node::BridgeWithdrawalId{sweep->GetHash(), 1}));
+}
+
+BOOST_AUTO_TEST_CASE(v2_migration_credit_only_after_absorb)
+{
+    // Credit on proven arrival (node changes section 7.6) for v': a
+    // RESERVE_E_SUCCESSOR anchored after the release but before absorb()
+    // credits nothing and cannot fail invariant R; absorb() credits at most
+    // what it counted and at most the transit; v' burns need the credit
+    // (check 2); a forged drain of v' fails invariant R (E8).
+    const Consensus::Params params{MigrationParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{MigrationReceipts(params)};
+    const bridge_test::ObservationWorld world{MigrationWorld(params, receipts, lineage)};
+    node::BridgeStateIndex index{MigrationIndex(params, receipts, world, lineage)};
+    ConnectEmptyThrough(index, params, MIGRATION_HEIGHT - 1);
+    // h_m: the migration leaf (transit_v' 100) and v''s TOKEN_FLAGS.
+    ConnectNext(index, params,
+                {SweepTransactionV2(params, 1), Observe(world, SUBJECT_TOKEN_NEXT, receipts.block_hash)},
+                1'070, &lineage.context);
+    BOOST_REQUIRE_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).transit, 100);
+
+    // v released the leaf: v holds nothing, v' holds 100 uncounted (701).
+    // A partial absorb() of 99, one unit lost to a USDT fee (702); a later
+    // absorb() of 31 more, strays included (703); a forged drain of v' (704).
+    bridge_test::ObservationWorld released{world};
+    released.SetReserve(2, 0, 0, 0);
+    released.SetSuccessorReserve(0, 0, 0, 100);
+    bridge_test::ObservationWorld partial{released};
+    partial.SetSuccessorReserve(0, 99, 99, 99);
+    bridge_test::ObservationWorld absorbed{released};
+    absorbed.SetSuccessorReserve(0, 130, 130, 130);
+    bridge_test::ObservationWorld forged{absorbed};
+    forged.SetSuccessorReserve(0, 50, 130, 50);
+    SeedStateAnchorsV2(index, {StateAnchor(701, 1'010, released.StateRoot()),
+                               StateAnchor(702, 1'020, partial.StateRoot()),
+                               StateAnchor(703, 1'030, absorbed.StateRoot()),
+                               StateAnchor(704, 1'040, forged.StateRoot())});
+
+    // Before absorb(): absorbedTotal 0 credits nothing; no conflict. v's
+    // RESERVE_E shows the release, and invariant R holds for v across the
+    // migration (locked 0 + burned 100 >= P 100 + C 0).
+    const node::BridgeBlockDelta before_absorb{ConnectNext(
+        index, params,
+        {Observe(released, SUBJECT_RESERVE_NEXT, AnchorHash(701)), Observe(released, SUBJECT_RESERVE, AnchorHash(701))},
+        1'071, &lineage.context)};
+    BOOST_CHECK(before_absorb.reserve_v2_successor_after == before_absorb.reserve_v2_successor_before);
+    BOOST_CHECK(before_absorb.reserve_v2_after == before_absorb.reserve_v2_before);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).transit, 100);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).credited, 0);
+    BOOST_CHECK(!index.ConflictV2());
+    BOOST_CHECK_EQUAL(bridge::InvariantRMarginV2(0, 0, index.ReserveLedgerV2(ROLE_SUCCESSOR)).value_or(-1), 0);
+    BOOST_CHECK_EQUAL(bridge::InvariantRMarginV2(0, 100, index.ReserveLedgerV2(ROLE_LAUNCH)).value_or(-1), 0);
+    // v''s gate is READY, but v' has no reserve before the credit: check 2.
+    {
+        const int next{index.ConnectedHeight() + 1};
+        const auto gate{node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, next, 1'072)};
+        BOOST_CHECK_MESSAGE(gate.readiness == node::BridgeBurnReadiness::READY, gate.Describe());
+        VerifyFails(index, Block(1'072, {SuccessorBurn(params, 1, 10, 0x91)}), next, params,
+                    "bridge V2 burn exceeds the vault entry's reserve", &lineage.context);
+    }
+
+    // A partial absorb() credits 99 and leaves 1 in transit.
+    ConnectNext(index, params, {Observe(partial, SUBJECT_RESERVE_NEXT, AnchorHash(702))}, 1'072, &lineage.context);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).credited, 99);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).transit, 1);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).Reserve().value_or(-1), 99);
+    BOOST_CHECK(!index.ConflictV2());
+    // Now a v' burn passes checks 2 and 3, up to the credit.
+    VerifyFails(index, Block(1'073, {SuccessorBurn(params, 1, 100, 0x91)}), index.ConnectedHeight() + 1, params,
+                "bridge V2 burn exceeds the vault entry's reserve", &lineage.context);
+    ConnectNext(index, params, {SuccessorBurn(params, 1, 10, 0x91)}, 1'073, &lineage.context);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).burned, 10);
+    BOOST_CHECK_EQUAL(index.WithdrawalV2Count(), 2U);
+
+    // absorb() counted 130 in all (31 more, strays included): only the 1
+    // left in transit moves, so C_v' stops at 100 < 130.
+    ConnectNext(index, params, {Observe(absorbed, SUBJECT_RESERVE_NEXT, AnchorHash(703))}, 1'074, &lineage.context);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).credited, 100);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).transit, 0);
+    BOOST_CHECK(!index.ConflictV2());
+    // Supply (100 minted - 10 burned to a leaf) equals the sum over both
+    // entries of reserve + transit.
+    {
+        const bridge::ReserveLedgerV2& v{index.ReserveLedgerV2(ROLE_LAUNCH)};
+        const bridge::ReserveLedgerV2& next{index.ReserveLedgerV2(ROLE_SUCCESSOR)};
+        BOOST_CHECK_EQUAL(*v.Reserve() + v.transit + *next.Reserve() + next.transit, 100 - 10);
+    }
+
+    // A forged drain of v' (locked 50 + burned 10 < C_v' 100) fails
+    // invariant R: the sticky E8 conflict, which closes both gates.
+    ConnectNext(index, params, {Observe(forged, SUBJECT_RESERVE_NEXT, AnchorHash(704))}, 1'075, &lineage.context);
+    BOOST_REQUIRE(index.ConflictV2());
+    BOOST_CHECK_EQUAL(index.ConflictV2()->reason, bridge::BRIDGE_V2_CONFLICT_E8);
+    BOOST_CHECK_EQUAL(index.ConflictV2()->anchor_block, 704U);
+    {
+        const int next{index.ConnectedHeight() + 1};
+        BOOST_CHECK(node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, next, 1'076).row ==
+                    bridge::BurnGateRowV2::C4);
+        BOOST_CHECK(node::EvaluateBridgeV2SweepGate(&lineage.context, index, params, next, 1'076).row ==
+                    bridge::BurnGateRowV2::C4);
+    }
+
+    // Undo walks the credits back.
+    Disconnect(index);
+    BOOST_CHECK(!index.ConflictV2());
+    Disconnect(index);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).credited, 99);
+    Disconnect(index);
+    Disconnect(index);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).credited, 0);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).transit, 100);
+}
+
+BOOST_AUTO_TEST_CASE(v2_migration_late_deposit_swept)
+{
+    // A retired v keeps taking deposits while its verifier lives (node
+    // changes section 7.6): B3 mints them and a later sweep moves exactly
+    // the amount proven since the last one to v'. Invariant R keeps judging
+    // v: a forged drain below the unswept deposits fails it.
+    const Consensus::Params params{MigrationParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{MigrationReceipts(params)};
+    const bridge_test::ObservationWorld world{MigrationWorld(params, receipts, lineage)};
+    node::BridgeStateIndex index{MigrationIndex(params, receipts, world, lineage)};
+    ConnectEmptyThrough(index, params, MIGRATION_HEIGHT - 1);
+    const int h_m{MIGRATION_HEIGHT};
+    ConnectNext(index, params, {SweepTransactionV2(params, 1)}, 1'070, &lineage.context);
+    BOOST_REQUIRE_EQUAL(index.ReserveLedgerV2().Reserve().value_or(-1), 0);
+    VerifyFails(index, Block(1'071, {SweepTransactionV2(params, 2)}), h_m + 1, params,
+                "bridge V2 vault sweep has nothing to sweep", &lineage.context);
+
+    // Deposit 2 (30) into v after h_m: minted, and swept in the same block
+    // when the sweep follows it.
+    {
+        const node::BridgeBlockDelta both{Verifies(
+            index, params, {MintTransactionV2(params, receipts, 2, 30), SweepTransactionV2(params, 2)}, 1'071,
+            &lineage.context)};
+        BOOST_REQUIRE_EQUAL(both.withdrawals_v2_added.size(), 1U);
+        BOOST_CHECK(both.withdrawals_v2_added.front().withdrawal == ExpectedSweep(params, 1, 30, h_m + 1));
+    }
+    ConnectNext(index, params, {MintTransactionV2(params, receipts, 2, 30)}, 1'071, &lineage.context);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().minted, 130);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().Reserve().value_or(-1), 30);
+    BOOST_CHECK(index.ProvenDepositsV2().contains(2));
+
+    // Invariant R still judges v after the migration: anchor 701 shows v
+    // holding the 30 (R holds exactly), anchor 702 a forged drain to 20
+    // (20 + burned 100 < P 130): E8.
+    bridge_test::ObservationWorld holding{world};
+    holding.SetReserve(3, 30, 0, 30);
+    bridge_test::ObservationWorld drained{world};
+    drained.SetReserve(3, 20, 0, 20);
+    SeedStateAnchorsV2(index, {StateAnchor(701, 1'010, holding.StateRoot()),
+                               StateAnchor(702, 1'020, drained.StateRoot())});
+    {
+        const node::BridgeBlockDelta forged{
+            Verifies(index, params, {Observe(drained, SUBJECT_RESERVE, AnchorHash(702))}, 1'072, &lineage.context)};
+        BOOST_REQUIRE(forged.conflict_v2_after);
+        BOOST_CHECK_EQUAL(forged.conflict_v2_after->reason, bridge::BRIDGE_V2_CONFLICT_E8);
+    }
+    ConnectNext(index, params, {Observe(holding, SUBJECT_RESERVE, AnchorHash(701))}, 1'072, &lineage.context);
+    BOOST_CHECK(!index.ConflictV2());
+
+    // The sweep moves exactly the late 30, as leaf 1 (wind-down headroom:
+    // B 30 + P_post 0 - margin 0 - unreleased 0 = 30).
+    const node::BridgeBlockDelta late{
+        ConnectNext(index, params, {SweepTransactionV2(params, 3)}, 1'073, &lineage.context)};
+    BOOST_REQUIRE_EQUAL(late.withdrawals_v2_added.size(), 1U);
+    const modern::BridgeWithdrawalV2 expected{ExpectedSweep(params, 1, 30, index.ConnectedHeight())};
+    BOOST_CHECK(late.withdrawals_v2_added.front().withdrawal == expected);
+    BOOST_CHECK(late.withdrawals_v2_added.front().sweep);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().burned, 130);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2().Reserve().value_or(-1), 0);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).transit, 130);
+    BOOST_CHECK_EQUAL(index.WithdrawalV2Count(), 2U);
+    // Supply (130 minted, nothing burned to a recipient) is all in transit.
+    BOOST_CHECK_EQUAL(*index.ReserveLedgerV2().Reserve() + index.ReserveLedgerV2().transit +
+                          *index.ReserveLedgerV2(ROLE_SUCCESSOR).Reserve() +
+                          index.ReserveLedgerV2(ROLE_SUCCESSOR).transit,
+                      130);
+    VerifyFails(index, Block(1'074, {SweepTransactionV2(params, 4)}), index.ConnectedHeight() + 1, params,
+                "bridge V2 vault sweep has nothing to sweep", &lineage.context);
+}
+
+BOOST_AUTO_TEST_CASE(v2_migration_delta_invariants)
+{
+    // ConnectBlock's B-23 accounting rules (node changes sections 7.1 and
+    // 7.6) need no parameters: each entry's ledger moves only by its own
+    // mints and leaves, a sweep names the launch entry and is the only
+    // source of the successor's transit, the launch transit never rises,
+    // and below V the successor fields pass through unchanged and empty.
+    const Consensus::Params params{MigrationParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{MigrationReceipts(params)};
+    const bridge_test::ObservationWorld world{MigrationWorld(params, receipts, lineage)};
+    node::BridgeStateIndex index{MigrationIndex(params, receipts, world, lineage)};
+    ConnectEmptyThrough(index, params, MIGRATION_HEIGHT - 1);
+    // A real h_m block: a v' mint (deposit 0, 50) and the migration leaf.
+    const node::BridgeBlockDelta real{Verifies(
+        index, params,
+        {MintTransactionV2(params, receipts, 3, 50, ROLE_SUCCESSOR), SweepTransactionV2(params, 1)}, 1'070,
+        &lineage.context)};
+    BOOST_REQUIRE_EQUAL(real.withdrawals_v2_added.size(), 1U);
+    BOOST_REQUIRE_EQUAL(real.deposits_v2_successor_added.size(), 1U);
+
+    const auto refused{[](node::BridgeStateIndex& target, const node::BridgeBlockDelta& delta,
+                          const std::string& expected) {
+        const int height{target.ConnectedHeight()};
+        std::string error;
+        BOOST_CHECK(!target.ConnectBlock(delta, error));
+        BOOST_CHECK_MESSAGE(error.find(expected) != std::string::npos,
+                            "error '" << error << "' lacks '" << expected << "'");
+        BOOST_CHECK_EQUAL(target.ConnectedHeight(), height);
+    }};
+    const std::string effects{"bridge delta reserve ledger does not match its effects"};
+    {
+        node::BridgeBlockDelta bad{real};
+        bad.withdrawals_v2_added.front().entry = 1; // a sweep on the successor
+        refused(index, bad, "bridge delta contains an invalid V2 withdrawal");
+        bad.withdrawals_v2_added.front().entry = 2; // no such entry
+        refused(index, bad, "bridge delta contains an invalid V2 withdrawal");
+    }
+    {
+        // Successor transit without a sweep.
+        node::BridgeBlockDelta bad{real};
+        bad.withdrawals_v2_added.front().sweep = false;
+        refused(index, bad, effects);
+    }
+    {
+        // A launch transit increase: transit only ever reaches v'.
+        node::BridgeBlockDelta bad{real};
+        bad.reserve_v2_after.transit = 3;
+        refused(index, bad, effects);
+    }
+    {
+        node::BridgeBlockDelta bad{real};
+        bad.reserve_v2_successor_after.transit += 1;
+        refused(index, bad, effects);
+        bad = real;
+        bad.reserve_v2_successor_after.credited += 1;
+        refused(index, bad, effects);
+        bad = real;
+        bad.reserve_v2_successor_after.minted -= 1;
+        refused(index, bad, effects);
+        bad = real;
+        bad.reserve_v2_after.burned -= 1; // the sweep counts in burned_v
+        refused(index, bad, effects);
+    }
+    {
+        // The v' deposit listed as v's: id 0 is already v's own deposit,
+        // and under a fresh id v's ledger does not count it.
+        node::BridgeBlockDelta bad{real};
+        std::swap(bad.deposits_v2_added, bad.deposits_v2_successor_added);
+        refused(index, bad, "bridge delta contains an invalid proven deposit");
+        bad.deposits_v2_added.front().deposit_id = 5;
+        refused(index, bad, effects);
+        // Listed twice.
+        bad = real;
+        bad.deposits_v2_successor_added.push_back(bad.deposits_v2_successor_added.front());
+        refused(index, bad, "bridge delta contains an invalid proven deposit");
+    }
+    {
+        node::BridgeBlockDelta bad{real};
+        bad.reserve_v2_successor_before.minted = 1;
+        refused(index, bad, "bridge delta V2 accounting before-state does not match");
+    }
+
+    // The real delta connects; undo restores the successor ledger and
+    // deposits.
+    {
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(index.ConnectBlock(real, error), error);
+    }
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).minted, 50);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_SUCCESSOR).transit, 100);
+    BOOST_CHECK(index.ProvenDepositsV2(ROLE_SUCCESSOR) == (bridge::ProvenDepositMapV2{{0, 50}}));
+    BOOST_CHECK_EQUAL(index.ProvenDepositsTotalV2(ROLE_SUCCESSOR), 50);
+    BOOST_CHECK(index.ProvenDepositSumsAtV2(ROLE_SUCCESSOR, 1) ==
+                (std::optional<bridge::ProvenDepositSumsV2>{{1, 50, 0}}));
+    // Each entry keeps its own ids: v's deposit 0 and v''s are distinct.
+    BOOST_CHECK(index.ProvenDepositsV2(ROLE_LAUNCH) == (bridge::ProvenDepositMapV2{{0, 60}, {1, 40}}));
+    Disconnect(index);
+    BOOST_CHECK(index.ReserveLedgerV2(ROLE_SUCCESSOR) == bridge::ReserveLedgerV2{});
+    BOOST_CHECK(index.ProvenDepositsV2(ROLE_SUCCESSOR).empty());
+    BOOST_CHECK_EQUAL(index.ProvenDepositsTotalV2(ROLE_SUCCESSOR), 0);
+    BOOST_CHECK_EQUAL(index.ReserveLedgerV2(ROLE_LAUNCH).Reserve().value_or(-1), 100);
+    BOOST_CHECK_EQUAL(index.WithdrawalV2Count(), 0U);
+
+    // Below V the successor fields stay unchanged and empty.
+    node::BridgeStateIndex empty;
+    node::BridgeBlockDelta below;
+    below.height = BRIDGE_V2_HEIGHT - 1;
+    below.block_hash = V2TestBlockHash(BRIDGE_V2_HEIGHT - 1);
+    below.reserve_v2_successor_after.minted = 5;
+    refused(empty, below, "bridge delta V2 accounting does not match its store");
+    below.reserve_v2_successor_after = {};
+    below.deposits_v2_successor_added.push_back({0, 5});
+    refused(empty, below, "bridge delta V2 accounting does not match its store");
+    below.deposits_v2_successor_added.clear();
+    below.reserve_v2_successor_before.transit = 1;
+    below.reserve_v2_successor_after.transit = 1;
+    refused(empty, below, "bridge delta V2 accounting before-state does not match");
+    BOOST_CHECK(empty.History().empty());
+}
+
+BOOST_AUTO_TEST_CASE(v2_migration_incremental_equals_rebuild)
+{
+    // A B-23 history (v mints, v' mints, the migration leaf, observations of
+    // both entries crediting v''s transit, a v' burn, a late v deposit and
+    // its sweep), built incrementally with the full context and rebuilt as
+    // BridgeStateTracker replays it (REPLAY_LINEAGE): every block's V2
+    // delta and the accounting of both entries agree field for field, and
+    // undo keeps them equal.
+    const Consensus::Params params{MigrationParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{MigrationReceipts(params)};
+    bridge_test::ObservationWorld world{MigrationWorld(params, receipts, lineage)};
+    // v' after its deposit 0 (cut 1, locked and balance 50).
+    world.SetSuccessorReserve(1, 50, 0, 50);
+    // After v released the migration leaf and v' absorbed it: v holds
+    // nothing, v' locked 150 (deposit 0 and the 100 absorbed).
+    bridge_test::ObservationWorld after{world};
+    after.SetReserve(2, 0, 0, 0);
+    after.SetSuccessorReserve(1, 150, 100, 150);
+
+    struct Step {
+        std::vector<CTransactionRef> block;
+        uint32_t time{0};
+        bool judged{false};
+        std::vector<StateAnchorSpec> anchors{};
+    };
+    std::vector<Step> steps{
+        {{MintTransactionV2(params, receipts, 0, 60), MintTransactionV2(params, receipts, 1, 40),
+          Observe(world, SUBJECT_TOKEN, receipts.block_hash), Observe(world, SUBJECT_RESERVE, receipts.block_hash),
+          Observe(world, SUBJECT_VERIFIER, receipts.block_hash)},
+         1'060, true},
+    };
+    for (int h{BRIDGE_V2_HEIGHT + 1}; h < MIGRATION_HEIGHT; ++h) steps.push_back({{}, 1'060, false});
+    steps.push_back({{MintTransactionV2(params, receipts, 3, 50, ROLE_SUCCESSOR),
+                      Observe(world, SUBJECT_TOKEN_NEXT, receipts.block_hash),
+                      Observe(world, SUBJECT_RESERVE_NEXT, receipts.block_hash), SweepTransactionV2(params, 1)},
+                     1'070, true});
+    steps.push_back({{}, 0, false, {StateAnchor(701, 1'010, after.StateRoot())}});
+    steps.push_back({{Observe(after, SUBJECT_RESERVE_NEXT, AnchorHash(701)),
+                      Observe(after, SUBJECT_RESERVE, AnchorHash(701))},
+                     1'071, true});
+    steps.push_back({{SuccessorBurn(params, 1, 20, 0x91)}, 1'072, true});
+    steps.push_back({{MintTransactionV2(params, receipts, 2, 30), MintTransactionV2(params, receipts, 4, 20, ROLE_SUCCESSOR),
+                      SweepTransactionV2(params, 2)},
+                     1'073, true});
+
+    node::BridgeStateIndex incremental{FundingIndex(params, receipts, world.StateRoot())};
+    node::BridgeStateIndex rebuilt{FundingIndex(params, receipts, world.StateRoot())};
+    for (const Step& step : steps) {
+        if (!step.anchors.empty()) {
+            const node::BridgeBlockDelta a{SeedStateAnchorsV2(incremental, step.anchors)};
+            const node::BridgeBlockDelta b{SeedStateAnchorsV2(rebuilt, step.anchors)};
+            CheckSameV2Delta(a, b);
+            continue;
+        }
+        const node::BridgeBlockDelta a{ConnectNext(incremental, params, step.block, step.time,
+                                                   step.judged ? &lineage.context : nullptr)};
+        const node::BridgeBlockDelta b{
+            ConnectNext(rebuilt, params, step.block, step.time, &node::REPLAY_LINEAGE)};
+        CheckSameV2Delta(a, b);
+        CheckSameAccounting(incremental, rebuilt);
+    }
+    BOOST_CHECK(!incremental.ConflictV2());
+    const bridge::ReserveLedgerV2& v{incremental.ReserveLedgerV2(ROLE_LAUNCH)};
+    const bridge::ReserveLedgerV2& next{incremental.ReserveLedgerV2(ROLE_SUCCESSOR)};
+    BOOST_CHECK_EQUAL(v.minted, 130);
+    BOOST_CHECK_EQUAL(v.burned, 130);
+    BOOST_CHECK_EQUAL(v.transit, 0);
+    BOOST_CHECK_EQUAL(next.minted, 70);
+    BOOST_CHECK_EQUAL(next.burned, 20);
+    BOOST_CHECK_EQUAL(next.credited, 100);
+    BOOST_CHECK_EQUAL(next.transit, 30);
+    // Supply: 200 minted, 20 burned to a recipient.
+    BOOST_CHECK_EQUAL(*v.Reserve() + v.transit + *next.Reserve() + next.transit, 200 - 20);
+    BOOST_CHECK_EQUAL(incremental.WithdrawalV2Count(), 3U);
+    BOOST_CHECK(incremental.LatestObservationV2(SUBJECT_RESERVE_NEXT));
+    BOOST_CHECK(incremental.LatestObservationV2(SUBJECT_TOKEN_NEXT));
+    BOOST_CHECK_EQUAL(incremental.ProvenDepositsV2(ROLE_SUCCESSOR).size(), 2U);
+    CheckSameAccounting(incremental, rebuilt);
+
+    while (incremental.ConnectedHeight() >= BRIDGE_V2_HEIGHT) {
+        Disconnect(incremental);
+        Disconnect(rebuilt);
+        CheckSameAccounting(incremental, rebuilt);
+    }
+    BOOST_CHECK(incremental.ReserveLedgerV2(ROLE_SUCCESSOR) == bridge::ReserveLedgerV2{});
+    BOOST_CHECK(incremental.ProvenDepositsV2(ROLE_SUCCESSOR).empty());
+    BOOST_CHECK(incremental.ObservationsV2() == node::BridgeObservationSlotsV2{});
+}
+
+BOOST_AUTO_TEST_CASE(v2_migration_preview_and_mempool)
+{
+    // A kind 16 record is a lineage record (mempool admission, block
+    // connection, assembly and wallet prevalidation build the context for
+    // it) but no burn. The preview takes it with a context and refuses it
+    // without one; VerifyTransaction yields its leaf as withdrawal_v2.
+    const Consensus::Params params{MigrationParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{MigrationReceipts(params)};
+    const bridge_test::ObservationWorld world{MigrationWorld(params, receipts, lineage)};
+    node::BridgeStateIndex index{MigrationIndex(params, receipts, world, lineage)};
+    ConnectEmptyThrough(index, params, MIGRATION_HEIGHT - 1);
+    const int h_m{MIGRATION_HEIGHT};
+    const CTransactionRef sweep{SweepTransactionV2(params, 1)};
+    const CTransactionRef burn{BurnTransactionV2(params, 9, 5, 0x99)};
+
+    BOOST_CHECK(node::HasBridgeV2LineageRecord(*sweep));
+    BOOST_CHECK(node::HasBridgeV2LineageRecord(Block(1'070, {burn, sweep})));
+    BOOST_CHECK(node::HasBridgeV2VaultSweep(*sweep));
+    BOOST_CHECK(!node::HasBridgeV2VaultSweep(*burn));
+    BOOST_CHECK(!node::HasBridgeV2FinalityConflict(*sweep));
+    BOOST_CHECK(!node::HasDecentralizedBridgeBurn(*sweep));
+    // The mempool's retirement eviction (ConnectTip at h_m - 1) matches a
+    // kind 6 burn naming the launch entry, only where the migration is
+    // active: never a v' burn, a sweep or a mint, and never on a chain
+    // without a successor.
+    {
+        const CTransactionRef successor_burn{SuccessorBurn(params, 8, 5, 0x98)};
+        const CTransactionRef mint{MintTransactionV2(params, receipts, 2, 30)};
+        BOOST_CHECK(node::HasBridgeV2RetiredEntryBurn(*burn, params, h_m));
+        BOOST_CHECK(node::HasBridgeV2RetiredEntryBurn(*burn, params, h_m + 100));
+        BOOST_CHECK(!node::HasBridgeV2RetiredEntryBurn(*burn, params, h_m - 1));
+        BOOST_CHECK(!node::HasBridgeV2RetiredEntryBurn(*successor_burn, params, h_m));
+        BOOST_CHECK(!node::HasBridgeV2RetiredEntryBurn(*sweep, params, h_m));
+        BOOST_CHECK(!node::HasBridgeV2RetiredEntryBurn(*mint, params, h_m));
+        BOOST_CHECK(!node::HasBridgeV2RetiredEntryBurn(*burn, LineageParams(), h_m));
+        Consensus::Params no_v2{params};
+        no_v2.bridge_v2.reset();
+        BOOST_CHECK(!node::HasBridgeV2RetiredEntryBurn(*burn, no_v2, h_m));
+    }
+    {
+        std::string error;
+        BOOST_CHECK(node::CheckBridgeV2BurnReadiness(*sweep, node::BridgeBurnReadiness::NOT_READY, error));
+    }
+    // Under the V1 record set kind 16 is malformed, so it is no lineage
+    // record there.
+    {
+        const auto entry{modern::ConfiguredBridgeV2EntryId(params)};
+        BOOST_CHECK(!bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{bridge::BridgeRecordKindV1::VAULT_SWEEP,
+                                                                        bridge::BridgeVaultSweepV2{*entry}}));
+    }
+
+    const std::array<CTransactionRef, 1> chunk{sweep};
+    {
+        std::string error;
+        auto preview{index.BeginBlockPreview(h_m, 1'070, TestHash(97), params, error, &lineage.context)};
+        BOOST_REQUIRE_MESSAGE(preview, error);
+        BOOST_CHECK_MESSAGE(preview->TryAppend(chunk, error), error);
+        const std::array<CTransactionRef, 1> second{SweepTransactionV2(params, 2)};
+        BOOST_CHECK(!preview->TryAppend(second, error));
+        BOOST_CHECK_MESSAGE(error.find("nothing to sweep") != std::string::npos, error);
+    }
+    {
+        std::string error;
+        auto preview{index.BeginBlockPreview(h_m, 1'070, TestHash(98), params, error)};
+        BOOST_REQUIRE_MESSAGE(preview, error);
+        BOOST_CHECK(!preview->TryAppend(chunk, error));
+        BOOST_CHECK_MESSAGE(error.find("bridge V2 vault sweep cannot be judged here") != std::string::npos, error);
+    }
+    // Mempool admission and wallet prevalidation judge one transaction on
+    // the connected state.
+    {
+        node::BridgeTxAuthorization authorization;
+        std::string error;
+        BOOST_CHECK_MESSAGE(
+            index.VerifyTransaction(*sweep, h_m, 1'070, params, authorization, error, &lineage.context), error);
+        BOOST_REQUIRE(authorization.withdrawal_v2);
+        BOOST_CHECK(authorization.withdrawal_v2->sweep);
+        BOOST_CHECK(authorization.withdrawal_v2->entry == 0);
+        BOOST_CHECK_EQUAL(authorization.withdrawal_v2->burn_output_index, 1U);
+        BOOST_CHECK(authorization.withdrawal_v2->withdrawal == ExpectedSweep(params, 0, 100, h_m));
+        BOOST_CHECK(authorization.HasWithdrawal());
+        BOOST_CHECK(!authorization.mint);
+        BOOST_CHECK(!authorization.withdrawal);
+        BOOST_CHECK(!authorization.decentralized_withdrawal);
+        BOOST_CHECK(!index.VerifyTransaction(*sweep, h_m, 1'070, params, authorization, error));
+        BOOST_CHECK_MESSAGE(error.find("cannot be judged here") != std::string::npos, error);
+    }
+    // The sweep gate: READY at h_m, UNAVAILABLE off the parent.
+    BOOST_CHECK(node::EvaluateBridgeV2SweepGate(&lineage.context, index, params, h_m, 1'070).readiness ==
+                node::BridgeBurnReadiness::READY);
+    BOOST_CHECK(node::EvaluateBridgeV2SweepGate(&lineage.context, index, params, h_m + 1, 1'070).readiness ==
+                node::BridgeBurnReadiness::UNAVAILABLE);
+    {
+        Consensus::Params no_v2{params};
+        no_v2.bridge_v2.reset();
+        BOOST_CHECK(node::EvaluateBridgeV2SweepGate(&lineage.context, index, no_v2, h_m, 1'070).readiness ==
+                    node::BridgeBurnReadiness::UNAVAILABLE);
     }
 }
 

@@ -585,8 +585,9 @@ static size_t RemoveStaleFnPodMempoolEntries(CTxMemPool& pool,
 }
 
 /** Once a block sets the sticky bridge V2 conflict (node changes sections
- * 8.4-8.5: kind 13, E5 or E8), every V2 burn (gate row C4) and every kind 13
- * record ("already set") is invalid on that chain until the block is
+ * 8.4-8.5: kind 13, E5 or E8), every V2 burn (gate row C4), every kind 13
+ * record ("already set") and every kind 16 vault sweep (the retired vault's
+ * gate, row C4, section 7.6) is invalid on that chain until the block is
  * disconnected. Remove those roots and every in-mempool descendant, as for
  * stale FN PoDs, so they do not wait for expiry and the wallet that made
  * them can abandon them. */
@@ -600,7 +601,35 @@ static size_t RemoveBridgeV2ClosedMempoolEntries(CTxMemPool& pool,
     for (const TxMempoolInfo& entry : entries) {
         if (!entry.tx || !pool.GetEntry(entry.tx->GetHash()) ||
             !(node::HasDecentralizedBridgeBurn(*entry.tx) ||
-              node::HasBridgeV2FinalityConflict(*entry.tx))) {
+              node::HasBridgeV2FinalityConflict(*entry.tx) ||
+              node::HasBridgeV2VaultSweep(*entry.tx))) {
+            continue;
+        }
+        ++roots_removed;
+        pool.removeRecursive(*entry.tx, reason);
+    }
+    return roots_removed;
+}
+
+/** From a B-23 successor's migration height h_m (node changes section 7.6)
+ * a V2 burn naming the retired launch vault entry is refused
+ * deterministically, at every height of every chain through the block
+ * below h_m. Remove such burns, admitted while the next block was below
+ * h_m, and every in-mempool descendant when the block at h_m - 1 connects
+ * (`next_height` = h_m), so they do not wait for expiry and the wallet that
+ * made them can abandon them. */
+static size_t RemoveBridgeV2RetiredEntryBurns(CTxMemPool& pool,
+                                              const Consensus::Params& params,
+                                              const int next_height,
+                                              const MemPoolRemovalReason reason)
+    EXCLUSIVE_LOCKS_REQUIRED(pool.cs)
+{
+    AssertLockHeld(pool.cs);
+    size_t roots_removed{0};
+    const auto entries{pool.infoAll()};
+    for (const TxMempoolInfo& entry : entries) {
+        if (!entry.tx || !pool.GetEntry(entry.tx->GetHash()) ||
+            !node::HasBridgeV2RetiredEntryBurn(*entry.tx, params, next_height)) {
             continue;
         }
         ++roots_removed;
@@ -5149,10 +5178,24 @@ bool Chainstate::ConnectTip(
                 conflict->block_hash == pindexNew->GetBlockHash()) {
                 const size_t closed_roots{RemoveBridgeV2ClosedMempoolEntries(
                     *m_mempool, MemPoolRemovalReason::REORG)};
-                LogInfo("Removed %zu bridge V2 burn or kind 13 mempool root(s): %s at height %d set the sticky bridge V2 conflict\n",
+                LogInfo("Removed %zu bridge V2 burn, kind 13 or kind 16 mempool root(s): %s at height %d set the sticky bridge V2 conflict\n",
                         closed_roots, pindexNew->GetBlockHash().ToString(),
                         pindexNew->nHeight);
             }
+        }
+
+        // B3 bridge V2, B-23 (regtest only while mainnet and testnet have no
+        // V2 envelope): the block below a pinned successor's migration
+        // height h_m retires the launch vault entry for the next block, so
+        // a burn naming it is invalid for good on this branch. REORG as
+        // above.
+        if (const Consensus::Params& consensus{m_chainman.GetConsensus()};
+            consensus.BridgeV2MigrationActive(pindexNew->nHeight + 1) &&
+            !consensus.BridgeV2MigrationActive(pindexNew->nHeight)) {
+            const size_t retired_roots{RemoveBridgeV2RetiredEntryBurns(
+                *m_mempool, consensus, pindexNew->nHeight + 1, MemPoolRemovalReason::REORG)};
+            LogInfo("Removed %zu bridge V2 burn mempool root(s) naming the retired launch vault entry: %s at height %d precedes the migration height\n",
+                    retired_roots, pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
         }
 
         // B3: connecting the final legacy block H flips the next-block era to

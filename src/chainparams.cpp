@@ -346,6 +346,66 @@ void ParseBridgePinsV1(const UniValue& v1, CChainParams::B3RegTestBridgePins& pi
 }
 
 /**
+ * The optional `v2.successor` object (B-23; node changes section 7.6): the
+ * successor vault v' a regtest migration drill deploys, pinned before the
+ * validators first start exactly as v is (OI-3), so the init.cpp record
+ * guard freezes it with the rest of the file. Keys are v' itself (its CREATE
+ * address), its predecessor (must be v2.vault), the bUSD V2 AssetId it
+ * carries (raw EVM bytes; RegTest() requires v's recomputed id) and h_m,
+ * plus an optional deployment-block lower bound (default v's, which is safe:
+ * v' can only be deployed once v holds code). Everything else is inherited
+ * from v, so naming the token, chain, caps or a vault code hash (OI-3) is an
+ * unknown key.
+ */
+CChainParams::B3RegTestBridgePins::V2Section::SuccessorSection ParseBridgePinsV2Successor(
+    const UniValue& successor, const CChainParams::B3RegTestBridgePins::V2Section& v2)
+{
+    const std::string where{"v2.successor"};
+    CheckBridgePinsKeys(successor, where, {"vault", "predecessor", "asset_id", "migration_height"},
+                        {"origin_deployment_block"});
+
+    CChainParams::B3RegTestBridgePins::V2Section::SuccessorSection section;
+    section.vault = GetBridgePinsHex<20>(successor, where, "vault");
+    section.predecessor = GetBridgePinsHex<20>(successor, where, "predecessor");
+    if (Consensus::BridgeAddressIsNull(section.vault)) {
+        ThrowInvalidBridgePins(strprintf("%s.vault must be non-zero", where));
+    }
+    if (Consensus::BridgeAddressIsNull(section.predecessor)) {
+        ThrowInvalidBridgePins(strprintf("%s.predecessor must be non-zero", where));
+    }
+    if (section.vault == v2.vault || section.vault == v2.token || section.vault == v2.verifier) {
+        ThrowInvalidBridgePins(strprintf("%s.vault must differ from v2.vault, v2.token and v2.verifier", where));
+    }
+    if (section.predecessor != v2.vault) {
+        ThrowInvalidBridgePins(strprintf("%s.predecessor must equal v2.vault (the launch vault it retires)", where));
+    }
+    section.asset_id = GetBridgePinsHash(successor, where, "asset_id");
+
+    // h_m > V and h_m >= W2: the migration retires an entry that has been
+    // minting and burning. RegTest() checks nothing further (V >= A3, R_f).
+    constexpr uint32_t max_height{static_cast<uint32_t>(std::numeric_limits<int>::max())};
+    const uint32_t migration_height{GetBridgePinsUInt<uint32_t>(successor, where, "migration_height")};
+    const uint32_t activation_height{static_cast<uint32_t>(v2.activation_height)};
+    const uint32_t burn_height{static_cast<uint32_t>(v2.burn_height.value_or(v2.activation_height))};
+    if (migration_height <= activation_height || migration_height < burn_height ||
+        migration_height > max_height) {
+        ThrowInvalidBridgePins(strprintf("%s.migration_height (%u) must be above activation_height (%u), "
+                                         "at or above burn_height (%u) and at most %u",
+                                         where, migration_height, activation_height, burn_height, max_height));
+    }
+    section.migration_height = static_cast<int>(migration_height);
+
+    if (!successor.find_value("origin_deployment_block").isNull()) {
+        const uint64_t deployment_block{GetBridgePinsUInt<uint64_t>(successor, where, "origin_deployment_block")};
+        if (deployment_block < 1) {
+            ThrowInvalidBridgePins(strprintf("%s.origin_deployment_block must be at least 1", where));
+        }
+        section.origin_deployment_block = deployment_block;
+    }
+    return section;
+}
+
+/**
  * The bridge V2 section (node changes sections 3.1-3.3 and 12.2): one anvil
  * Vault V2 entry, its fresh light-client store and the Verifier V2 member
  * bounds, plus V and W2. OI-3: only values knowable before the chain first
@@ -354,7 +414,8 @@ void ParseBridgePinsV1(const UniValue& v1, CChainParams::B3RegTestBridgePins& pi
  * them is refused as an unknown key. The verifier's MAX_EPOCH_LAG is a
  * deployment parameter fixed in advance and may be named
  * (verifier_max_epoch_lag); RegTest() requires it to equal the gate's set
- * expiry.
+ * expiry. An optional `successor` object pins a B-23 successor vault
+ * (ParseBridgePinsV2Successor).
  */
 CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v2)
 {
@@ -364,7 +425,8 @@ CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v
                          "origin_deployment_block", "max_deposit_raw", "light_client",
                          "verifier", "min_bridge_validators", "max_bridge_validators",
                          "min_bridge_total_weight", "activation_height"},
-                        {"burn_height", "max_per_block", "max_per_epoch", "verifier_max_epoch_lag"});
+                        {"burn_height", "max_per_block", "max_per_epoch", "verifier_max_epoch_lag",
+                         "successor"});
 
     CChainParams::B3RegTestBridgePins::V2Section section;
     CheckBridgePinsChainId(v2, v2_where);
@@ -423,6 +485,10 @@ CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v
         const uint32_t lag{GetBridgePinsUInt<uint32_t>(v2, v2_where, "verifier_max_epoch_lag")};
         if (lag == 0) ThrowInvalidBridgePins(strprintf("%s.verifier_max_epoch_lag must be positive", v2_where));
         section.verifier_max_epoch_lag = int64_t{lag};
+    }
+    // A present successor key must be an object; JSON null is not "absent".
+    if (v2.exists("successor")) {
+        section.successor = ParseBridgePinsV2Successor(v2.find_value("successor"), section);
     }
     return section;
 }

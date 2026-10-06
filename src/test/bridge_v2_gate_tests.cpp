@@ -700,11 +700,14 @@ struct BridgeV2GateFixture : public FinalityChainFixture {
     }
 
     //! A kind 6 burn of BURN_AMOUNT (non-existent) bUSD V2 naming the V2
-    //! vault entry.
-    CMutableTransaction SyntheticBurn()
+    //! vault entry of `role` (the launch entry by default), funded by fund
+    //! output `fund_output`.
+    CMutableTransaction SyntheticBurn(
+        const Consensus::BridgeV2EntryRole role = Consensus::BridgeV2EntryRole::LAUNCH,
+        const unsigned fund_output = 8)
     {
         const auto asset{modern::ConfiguredBridgeV2AssetId(Params())};
-        const auto entry{modern::ConfiguredBridgeV2EntryId(Params())};
+        const auto entry{modern::ConfiguredBridgeV2EntryId(Params(), role)};
         BOOST_REQUIRE(asset && entry);
         bridge::BridgeBurnV1 burn;
         burn.registry_id = *entry;
@@ -717,7 +720,7 @@ struct BridgeV2GateFixture : public FinalityChainFixture {
         const auto burned{modern::MakeAssetBurnOutput(*asset, BURN_AMOUNT)};
         const auto binding{modern::MakeBridgeBindingOutput(*record)};
         BOOST_REQUIRE(burned && binding);
-        return BridgeTx(8, {*burned, *binding}, *record);
+        return BridgeTx(fund_output, {*burned, *binding}, *record);
     }
 
     //! A kind 3 mint naming the V2 vault entry whose last receipt-proof node
@@ -1805,8 +1808,10 @@ BOOST_AUTO_TEST_CASE(finality_conflict_four_paths_and_bridge_flags)
 
     // Mempool entries the conflict invalidates for good, placed straight in
     // the pool on inputs the block at c does not spend: another kind 13
-    // record, a V2 burn and the burn's child. ConnectTip evicts all three
-    // once that block sets the sticky conflict.
+    // record, a V2 burn and the burn's child, and a kind 16 vault sweep
+    // (syntactic only: this chain pins no successor, but a sweep's gate is
+    // the retired vault's, closed by the same row C4). ConnectTip evicts all
+    // four once that block sets the sticky conflict.
     CTxMemPool& pool{*m_node.mempool};
     BOOST_REQUIRE_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 0U);
     const CMpaRecord pending_mpa{BridgeMpa(conflict_record(Keccak(std::vector<unsigned char>{'p'})).second)};
@@ -1819,18 +1824,31 @@ BOOST_AUTO_TEST_CASE(finality_conflict_four_paths_and_bridge_flags)
     burn_child.vin = {CTxIn{COutPoint{pending_burn->GetHash(), 2}}};
     burn_child.vout = {CTxOut{pending_burn->vout[2].nValue - 10'000, CScript() << OP_TRUE}};
     const CTransactionRef pending_child{MakeTransactionRef(burn_child)};
+    const CMpaRecord sweep_mpa{BridgeMpa({bridge::BridgeRecordKindV1::VAULT_SWEEP,
+                                          bridge::BridgeVaultSweepV2{*modern::ConfiguredBridgeV2EntryId(params)}})};
+    const auto sweep_binding{modern::MakeBridgeBindingOutput(sweep_mpa)};
+    BOOST_REQUIRE(sweep_binding);
+    CMutableTransaction sweep_carrier;
+    sweep_carrier.version = 2;
+    sweep_carrier.vin = {CTxIn{COutPoint{Txid::FromUint256(uint256{uint8_t{0x5e}}), 0}}};
+    sweep_carrier.vout = {CTxOut{10'000, CScript() << OP_TRUE}, *sweep_binding};
+    sweep_carrier.mpa = {sweep_mpa};
+    const CTransactionRef pending_sweep{MakeTransactionRef(sweep_carrier)};
     BOOST_REQUIRE(node::HasBridgeV2FinalityConflict(*pending_conflict));
     BOOST_REQUIRE(node::HasDecentralizedBridgeBurn(*pending_burn));
-    for (const CTransactionRef& tx : {pending_conflict, pending_burn, pending_child}) {
+    BOOST_REQUIRE(node::HasBridgeV2VaultSweep(*pending_sweep));
+    BOOST_REQUIRE(!node::HasBridgeV2VaultSweep(*pending_burn));
+    BOOST_REQUIRE(!node::HasDecentralizedBridgeBurn(*pending_sweep));
+    for (const CTransactionRef& tx : {pending_conflict, pending_burn, pending_child, pending_sweep}) {
         TryAddToMempool(pool, TestMemPoolEntryHelper{}.Fee(10'000).FromTx(tx));
     }
-    BOOST_REQUIRE_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 3U);
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 4U);
 
     // -- The block at c sets the sticky conflict ----------------------------
     ConnectCarriers({record});
     BOOST_REQUIRE_EQUAL(Tip()->nHeight, c);
     BOOST_CHECK_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 0U);
-    for (const CTransactionRef& tx : {pending_conflict, pending_burn, pending_child}) {
+    for (const CTransactionRef& tx : {pending_conflict, pending_burn, pending_child, pending_sweep}) {
         BOOST_CHECK(!WITH_LOCK(pool.cs, return pool.exists(tx->GetWitnessHash())));
     }
     const node::BridgeV2Conflict expected{bridge::BRIDGE_V2_CONFLICT_KIND13,
@@ -1947,6 +1965,53 @@ BOOST_AUTO_TEST_CASE(finality_conflict_four_paths_and_bridge_flags)
         BOOST_CHECK(status == interfaces::BridgePrevalidationResult::REJECTED);
         BOOST_CHECK_EQUAL(error, kind13_closed);
     }
+
+    // -- B-23 retirement (node changes section 7.6): a successor pinned on
+    // this chain at h_m = tip + 3. From h_m a burn naming the launch entry
+    // is refused for good, so ConnectTip evicts such burns, with their
+    // children, when the block at h_m - 1 connects, and not before. A burn
+    // naming the successor stays. Placed straight in the pool, as above.
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 0U);
+    {
+        const int h_m{Tip()->nHeight + 3};
+        Consensus::BridgeV2SuccessorEntry successor;
+        successor.entry = V2().vault;
+        successor.entry.vault_address = FillAddress(0x47);
+        successor.predecessor = V2().vault.vault_address;
+        successor.asset_id = *modern::ConfiguredBridgeV2AssetId(params);
+        successor.migration_height = h_m;
+        V2().successor = successor;
+        BOOST_REQUIRE(params.BridgeV2ConfigurationValid());
+        BOOST_REQUIRE(!params.BridgeV2MigrationActive(h_m - 1));
+        BOOST_REQUIRE(params.BridgeV2MigrationActive(h_m));
+    }
+    const int h_m{V2().successor->migration_height};
+    const CTransactionRef launch_burn{MakeTransactionRef(SyntheticBurn())};
+    CMutableTransaction launch_burn_child;
+    launch_burn_child.version = 2;
+    launch_burn_child.vin = {CTxIn{COutPoint{launch_burn->GetHash(), 2}}};
+    launch_burn_child.vout = {CTxOut{launch_burn->vout[2].nValue - 10'000, CScript() << OP_TRUE}};
+    const CTransactionRef launch_child{MakeTransactionRef(launch_burn_child)};
+    const CTransactionRef successor_burn{
+        MakeTransactionRef(SyntheticBurn(Consensus::BridgeV2EntryRole::SUCCESSOR, /*fund_output=*/9))};
+    BOOST_REQUIRE(!node::HasBridgeV2RetiredEntryBurn(*launch_burn, params, h_m - 1));
+    BOOST_REQUIRE(node::HasBridgeV2RetiredEntryBurn(*launch_burn, params, h_m));
+    BOOST_REQUIRE(!node::HasBridgeV2RetiredEntryBurn(*successor_burn, params, h_m));
+    for (const CTransactionRef& tx : {launch_burn, launch_child, successor_burn}) {
+        TryAddToMempool(pool, TestMemPoolEntryHelper{}.Fee(10'000).FromTx(tx));
+    }
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 3U);
+    ProduceBlock(); // h_m - 2: the next block is not yet h_m
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, h_m - 2);
+    BOOST_CHECK_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 3U);
+    ProduceBlock(); // h_m - 1: the launch entry is retired for the next block
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, h_m - 1);
+    BOOST_CHECK_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 1U);
+    BOOST_CHECK(!WITH_LOCK(pool.cs, return pool.exists(launch_burn->GetWitnessHash())));
+    BOOST_CHECK(!WITH_LOCK(pool.cs, return pool.exists(launch_child->GetWitnessHash())));
+    BOOST_CHECK(WITH_LOCK(pool.cs, return pool.exists(successor_burn->GetWitnessHash())));
+    WITH_LOCK(pool.cs, pool.removeRecursive(*successor_burn, MemPoolRemovalReason::REORG));
+    V2().successor.reset();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

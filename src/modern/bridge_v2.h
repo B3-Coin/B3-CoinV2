@@ -114,12 +114,26 @@ inline uint256 BridgeLightClientExtensionsHashV2()
  * BRIDGE_ACTIVATION_HEIGHT mirror, the deposit and exit forwarder pins and,
  * on regtest, the vault and verifier code hashes (OI-3). Records never name
  * it; nothing may treat today's value as the S7 approval identity.
+ *
+ * A pinned B-23 successor (node changes section 7.6) appends, after the gate
+ * thresholds and before the extension list's hash, a byte 1, its vault entry
+ * id (which commits its vault and optional code hash), the predecessor, the
+ * AssetId it carries, its deployment block and its MAX_DEPOSIT_RAW. The
+ * fields it shares with the launch entry (Valid() requires them equal) are
+ * not repeated, and the migration height stays out like V and W2. Without a
+ * successor nothing is appended, so every existing id is byte-identical. A
+ * successor whose AssetId is not the launch entry's under `chain_domain`
+ * has no registry identity (nullopt), as ConfiguredDomain fails closed.
  */
 inline std::optional<uint256> BridgeRegistryIdV2(
     const uint256& chain_domain, const Consensus::BridgeV2Params& params)
 {
     if (!params.Valid()) return std::nullopt;
     const auto& entry{params.vault};
+    if (params.successor &&
+        params.successor->asset_id != BridgeAssetIdV2(chain_domain, entry)) {
+        return std::nullopt;
+    }
     HashWriter writer{TaggedHash(BRIDGE_REGISTRY_V2_TAG)};
     writer << chain_domain << BridgeVaultEntryIdV2(chain_domain, entry)
            << BridgeAssetIdV2(chain_domain, entry)
@@ -151,24 +165,44 @@ inline std::optional<uint256> BridgeRegistryIdV2(
            << gate.burn_margin_seconds << gate.observation_max_age_seconds
            << gate.max_epoch_gap << gate.max_finality_lag_blocks
            << gate.wind_down_margin_ppm;
+    if (params.successor) {
+        const auto& s{*params.successor};
+        writer << uint8_t{1} << BridgeVaultEntryIdV2(chain_domain, s.entry)
+               << s.predecessor << s.asset_id << s.entry.origin_deployment_block
+               << s.entry.max_deposit_raw;
+    }
     writer << BridgeLightClientExtensionsHashV2();
     return writer.GetSHA256();
 }
 
 namespace bridge_v2_detail {
 
+/**
+ * The chain's modern domain when the configured envelope is Valid(). A
+ * pinned successor must carry the launch entry's AssetId recomputed here
+ * (node changes section 3.4 assertion 6, the B-23 exception); otherwise
+ * every configured V2 identity is unavailable, so a mismatch fails closed.
+ */
 inline std::optional<uint256> ConfiguredDomain(const Consensus::Params& params)
 {
     if (!params.bridge_v2 || !params.bridge_v2->Valid() ||
         !params.legacy_final_hash) {
         return std::nullopt;
     }
-    return ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash);
+    const auto domain{ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)};
+    if (!domain) return std::nullopt;
+    if (params.bridge_v2->successor &&
+        params.bridge_v2->successor->asset_id !=
+            BridgeAssetIdV2(*domain, params.bridge_v2->vault)) {
+        return std::nullopt;
+    }
+    return domain;
 }
 
 } // namespace bridge_v2_detail
 
-//! bUSD V2 AssetId of the configured entry; nullopt unless bridge_v2 is Valid().
+//! bUSD V2 AssetId of the configured entry; nullopt unless bridge_v2 is
+//! Valid(). A B-23 successor shares the launch entry's id.
 inline std::optional<AssetId> ConfiguredBridgeV2AssetId(const Consensus::Params& params)
 {
     const auto domain{bridge_v2_detail::ConfiguredDomain(params)};
@@ -176,12 +210,56 @@ inline std::optional<AssetId> ConfiguredBridgeV2AssetId(const Consensus::Params&
     return BridgeAssetIdV2(*domain, params.bridge_v2->vault);
 }
 
-//! Vault entry id of the configured entry; nullopt unless bridge_v2 is Valid().
-inline std::optional<uint256> ConfiguredBridgeV2EntryId(const Consensus::Params& params)
+//! Vault entry id of the configured entry of `role`; nullopt unless
+//! bridge_v2 is Valid() and pins that entry.
+inline std::optional<uint256> ConfiguredBridgeV2EntryId(const Consensus::Params& params,
+                                                        Consensus::BridgeV2EntryRole role)
 {
     const auto domain{bridge_v2_detail::ConfiguredDomain(params)};
     if (!domain) return std::nullopt;
-    return BridgeVaultEntryIdV2(*domain, params.bridge_v2->vault);
+    const Consensus::BridgeV2VaultEntry* entry{params.bridge_v2->Entry(role)};
+    if (!entry) return std::nullopt;
+    return BridgeVaultEntryIdV2(*domain, *entry);
+}
+
+//! Vault entry id of the configured launch entry; nullopt unless bridge_v2
+//! is Valid().
+inline std::optional<uint256> ConfiguredBridgeV2EntryId(const Consensus::Params& params)
+{
+    return ConfiguredBridgeV2EntryId(params, Consensus::BridgeV2EntryRole::LAUNCH);
+}
+
+/**
+ * The entry a V2 record's registry_id names at `height`: the launch entry
+ * whenever the V2 rules are active (a retired launch entry still resolves;
+ * the record kind decides what it may do), the successor only from h_m
+ * (BridgeV2MigrationActive). nullopt for any other id, below V, or when the
+ * configured identities are unavailable.
+ */
+inline std::optional<Consensus::BridgeV2EntryRole> ResolveBridgeV2Entry(
+    const Consensus::Params& params, const uint256& registry_id, int height)
+{
+    if (!params.BridgeV2RulesActive(height)) return std::nullopt;
+    if (const auto launch{ConfiguredBridgeV2EntryId(params, Consensus::BridgeV2EntryRole::LAUNCH)};
+        launch && *launch == registry_id) {
+        return Consensus::BridgeV2EntryRole::LAUNCH;
+    }
+    if (params.BridgeV2MigrationActive(height)) {
+        if (const auto next{ConfiguredBridgeV2EntryId(params, Consensus::BridgeV2EntryRole::SUCCESSOR)};
+            next && *next == registry_id) {
+            return Consensus::BridgeV2EntryRole::SUCCESSOR;
+        }
+    }
+    return std::nullopt;
+}
+
+//! The entry that takes new deposits and burns at `height`: the successor
+//! exactly when the migration is active, the launch entry otherwise.
+inline Consensus::BridgeV2EntryRole ActiveBridgeV2Role(const Consensus::Params& params,
+                                                       int height)
+{
+    return params.BridgeV2MigrationActive(height) ? Consensus::BridgeV2EntryRole::SUCCESSOR
+                                                  : Consensus::BridgeV2EntryRole::LAUNCH;
 }
 
 //! Registry id V2 of the configured envelope; nullopt unless bridge_v2 is Valid().

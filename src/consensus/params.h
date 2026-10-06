@@ -310,6 +310,15 @@ struct Params {
     {
         return BridgeV2RulesActive(height) && height >= bridge_v2->burn_height;
     }
+    //! True from h_m on a chain whose complete envelope pins a B-23
+    //! successor: the launch entry is retired and the successor takes
+    //! deposits and burns (node changes section 7.6). Never true on a
+    //! network that leaves bridge_v2 unset.
+    bool BridgeV2MigrationActive(int height) const
+    {
+        return BridgeV2RulesActive(height) && bridge_v2->successor &&
+               height >= bridge_v2->successor->migration_height;
+    }
     /**
      * TEST-ONLY override of the historical FN disintegration collateral
      * (Proof of Disintegration). Unset everywhere except regtest fixtures:

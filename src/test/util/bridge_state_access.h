@@ -11,11 +11,11 @@
 namespace node {
 
 /**
- * Test-only access to BridgeStateIndex state that no record of this slice
- * can create: a reserve ledger with transit (only the migration leaf, B-23,
- * creates it) or a funded ledger under a hand-built delta that skips the
- * deposits. The seed bypasses undo, so a test must not disconnect blocks
- * connected before it.
+ * Test-only access to BridgeStateIndex reserve state: a launch ledger with
+ * transit (which no record creates: B-23 sweep leaves add transit to the
+ * successor only) or a funded ledger under a hand-built delta that skips
+ * the deposits. The seed bypasses undo, so a test must not disconnect
+ * blocks connected before it.
  */
 struct BridgeStateIndexTestAccess {
     static void SeedReserve(BridgeStateIndex& index,

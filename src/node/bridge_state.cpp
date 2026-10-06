@@ -264,7 +264,10 @@ struct ScratchState {
         const bridge::ReserveLedgerV2& reserve_v2,
         const bridge::ProvenDepositMapV2& deposits_v2,
         const CAmount deposits_v2_total,
-        const std::optional<BridgeV2Conflict>& conflict_v2)
+        const std::optional<BridgeV2Conflict>& conflict_v2,
+        const bridge::ReserveLedgerV2& reserve_v2_successor,
+        const bridge::ProvenDepositMapV2& deposits_v2_successor,
+        const CAmount deposits_v2_successor_total)
         : light_client_base{light_client},
           anchors_base{anchors},
           anchor_by_height_base{anchor_by_height},
@@ -277,11 +280,14 @@ struct ScratchState {
           withdrawal_v2_sources_base{withdrawal_v2_sources},
           deposits_v2_base{deposits_v2},
           deposits_v2_base_total{deposits_v2_total},
+          deposits_v2_successor_base{deposits_v2_successor},
+          deposits_v2_successor_base_total{deposits_v2_successor_total},
           withdrawal_tree{withdrawal_tree},
           withdrawal_tree_v2{withdrawal_tree_v2},
           observations_v2{observations_v2},
           reserve_v2{reserve_v2},
-          conflict_v2{conflict_v2}
+          conflict_v2{conflict_v2},
+          reserve_v2_successor{reserve_v2_successor}
     {
     }
 
@@ -421,6 +427,9 @@ struct ScratchState {
     const bridge::ProvenDepositMapV2& deposits_v2_base;
     //! The sum of deposits_v2_base (the index's running total).
     CAmount deposits_v2_base_total{0};
+    //! The B-23 successor's connected deposits and their running total.
+    const bridge::ProvenDepositMapV2& deposits_v2_successor_base;
+    CAmount deposits_v2_successor_base_total{0};
 
     std::optional<bridge::LightClientStore> light_client_overlay{};
     bool light_client_changed{false};
@@ -448,36 +457,97 @@ struct ScratchState {
     //! or set the sticky conflict: the burn gate's inputs then differ from
     //! the connected state the caller's block-level gate read.
     bool gate_inputs_changed{false};
+    //! The B-23 successor v''s ledger and the deposits this block proved
+    //! into v' (node changes section 7.6), as for the launch entry above.
+    bridge::ReserveLedgerV2 reserve_v2_successor{};
+    bridge::ProvenDepositMapV2 deposits_v2_successor_overlay{};
+    CAmount deposits_v2_successor_overlay_total{0};
 
-    bool HasProvenDepositV2(const uint64_t deposit_id) const
+    static bool IsSuccessor(const Consensus::BridgeV2EntryRole role)
     {
-        return deposits_v2_base.contains(deposit_id) ||
-               deposits_v2_overlay.contains(deposit_id);
+        return role == Consensus::BridgeV2EntryRole::SUCCESSOR;
     }
 
-    //! Record a deposit this block proved. False (state unchanged) for a
-    //! non-positive amount or a total that would leave the CAmount range.
-    bool AddProvenDepositV2(const uint64_t deposit_id, const CAmount amount)
+    //! The ledger of vault entry `role`.
+    bridge::ReserveLedgerV2& Ledger(const Consensus::BridgeV2EntryRole role)
     {
-        const auto total{CheckedAdd(deposits_v2_overlay_total, amount)};
+        return IsSuccessor(role) ? reserve_v2_successor : reserve_v2;
+    }
+
+    bool HasProvenDepositV2(const Consensus::BridgeV2EntryRole role,
+                            const uint64_t deposit_id) const
+    {
+        return IsSuccessor(role)
+                   ? deposits_v2_successor_base.contains(deposit_id) ||
+                         deposits_v2_successor_overlay.contains(deposit_id)
+                   : deposits_v2_base.contains(deposit_id) ||
+                         deposits_v2_overlay.contains(deposit_id);
+    }
+
+    //! Record a deposit this block proved into entry `role`. False (state
+    //! unchanged) for a non-positive amount, an id this block already
+    //! recorded for the entry or a total that would leave the CAmount range.
+    bool AddProvenDepositV2(const Consensus::BridgeV2EntryRole role,
+                            const uint64_t deposit_id, const CAmount amount)
+    {
+        bridge::ProvenDepositMapV2& overlay{
+            IsSuccessor(role) ? deposits_v2_successor_overlay
+                              : deposits_v2_overlay};
+        CAmount& overlay_total{IsSuccessor(role)
+                                   ? deposits_v2_successor_overlay_total
+                                   : deposits_v2_overlay_total};
+        const auto total{CheckedAdd(overlay_total, amount)};
         if (amount <= 0 || !total ||
-            !deposits_v2_overlay.emplace(deposit_id, amount).second) {
+            !overlay.emplace(deposit_id, amount).second) {
             return false;
         }
-        deposits_v2_overlay_total = *total;
+        overlay_total = *total;
         return true;
     }
 
-    //! P_pre and P_post at `cut` over the connected and this block's
-    //! deposits, walking only the ids at or above the cut.
+    //! P_pre and P_post at `cut` over entry `role`'s connected and this
+    //! block's deposits, walking only the ids at or above the cut.
     std::optional<bridge::ProvenDepositSumsV2> ProvenDepositSums(
-        const uint64_t cut) const
+        const Consensus::BridgeV2EntryRole role, const uint64_t cut) const
     {
-        return bridge::SplitProvenDepositsAtCut(
-            deposits_v2_base, deposits_v2_base_total, deposits_v2_overlay,
-            deposits_v2_overlay_total, cut);
+        return IsSuccessor(role)
+                   ? bridge::SplitProvenDepositsAtCut(
+                         deposits_v2_successor_base,
+                         deposits_v2_successor_base_total,
+                         deposits_v2_successor_overlay,
+                         deposits_v2_successor_overlay_total, cut)
+                   : bridge::SplitProvenDepositsAtCut(
+                         deposits_v2_base, deposits_v2_base_total,
+                         deposits_v2_overlay, deposits_v2_overlay_total, cut);
     }
 };
+
+//! The RESERVE_E and TOKEN_FLAGS subjects of vault entry `role` (node
+//! changes sections 7.6 and 8.2): 2 and 3 for the launch entry, 0x12 and
+//! 0x13 for the B-23 successor.
+uint8_t ReserveSubjectFor(const Consensus::BridgeV2EntryRole role)
+{
+    return role == Consensus::BridgeV2EntryRole::SUCCESSOR
+               ? bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR
+               : bridge::ETH_OBSERVATION_SUBJECT_RESERVE;
+}
+
+uint8_t TokenFlagsSubjectFor(const Consensus::BridgeV2EntryRole role)
+{
+    return role == Consensus::BridgeV2EntryRole::SUCCESSOR
+               ? bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR
+               : bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS;
+}
+
+//! The latest observation of `subject` in `observations`; a reference to an
+//! empty slot for an unknown subject (callers pass known subjects only).
+const std::optional<BridgeObservationRecordV2>& ObservationSlot(
+    const BridgeObservationSlotsV2& observations, const uint8_t subject)
+{
+    static const std::optional<BridgeObservationRecordV2> none{};
+    const auto slot{BridgeObservationSlotV2(subject)};
+    return slot ? observations[*slot] : none;
+}
 
 /**
  * Retain `anchor` in the selected store, or accept it as already retained
@@ -842,6 +912,15 @@ bool VerifyMint(const CTransaction& tx, const bridge::BridgeMintV1& proof,
  * The mint also enters the reserve ledger (node changes section 7.1):
  * minted += amount, and the deposit id -> amount pair joins the proven
  * deposits that invariant R and the wind-down bound sum.
+ *
+ * With a B-23 successor (section 7.6) the record names either entry
+ * (modern::ResolveBridgeV2Entry): the launch entry v at every height from V
+ * (a retired v still takes deposits it cannot refund, which B3 mints and
+ * sweeps to v'), the successor v' only from h_m. The receipt must show a
+ * Deposit log of the named entry's vault at or after its deployment block,
+ * admission is that entry's, and the mint enters that entry's ledger and
+ * proven deposits. Both mint the one bUSD V2 AssetId, and the epoch
+ * counter, keyed by it, is shared (the caps are equal, SuccessorValid).
  */
 bool VerifyMintV2(const CTransaction& tx, const bridge::BridgeMintV1& proof,
                   const int height, const int64_t candidate_time,
@@ -850,14 +929,17 @@ bool VerifyMintV2(const CTransaction& tx, const bridge::BridgeMintV1& proof,
                   std::string& error)
 {
     const Consensus::BridgeV2Params& v2{*params.bridge_v2};
-    const auto entry_id{modern::ConfiguredBridgeV2EntryId(params)};
-    if (!entry_id || proof.registry_id != *entry_id) {
+    const auto role{
+        modern::ResolveBridgeV2Entry(params, proof.registry_id, height)};
+    const Consensus::BridgeV2VaultEntry* const entry{
+        role ? v2.Entry(*role) : nullptr};
+    if (!role || entry == nullptr) {
         error = "bridge mint registry id does not match the V2 vault entry";
         return false;
     }
     const auto event{ProveMintDeposit(
-        proof, v2.light_client, v2.vault.origin_deployment_block,
-        v2.vault.vault_address, bridge::RECEIPT_MAX_TYPE_V2, candidate_time,
+        proof, v2.light_client, entry->origin_deployment_block,
+        entry->vault_address, bridge::RECEIPT_MAX_TYPE_V2, candidate_time,
         state, error)};
     if (!event) return false;
 
@@ -873,10 +955,10 @@ bool VerifyMintV2(const CTransaction& tx, const bridge::BridgeMintV1& proof,
     const CAmount epoch_used{state.EpochMinted(epoch_key)};
     bridge::BridgeMintAuthorization authorization;
     const bridge::BridgeAdmissionResult admitted{bridge::AdmitDepositV2(
-        v2, *asset,
-        bridge::ProvenBridgeDeposit{v2.vault.origin_chain_id,
+        v2, *entry, *asset,
+        bridge::ProvenBridgeDeposit{entry->origin_chain_id,
                                     proof.target_block_number,
-                                    v2.vault.vault_address, *event},
+                                    entry->vault_address, *event},
         height, bridge::BridgeMintBudget{state.minted_this_block, epoch_used},
         authorization)};
     if (admitted != bridge::BridgeAdmissionResult::OK) {
@@ -889,25 +971,31 @@ bool VerifyMintV2(const CTransaction& tx, const bridge::BridgeMintV1& proof,
         return false;
     }
     // The nullifier set already forbids a second mint of this deposit and
-    // the proven-deposit index is keyed the same way (one vault entry), so
-    // both refusals below are defensive. A failure fails the whole block.
-    if (state.HasProvenDepositV2(event->deposit_id)) {
+    // each entry's proven-deposit index is keyed the same way (the
+    // nullifier names the entry's vault), so both refusals below are
+    // defensive. A failure fails the whole block.
+    if (state.HasProvenDepositV2(*role, event->deposit_id)) {
         error = "bridge V2 deposit id is already proven";
         return false;
     }
-    bridge::ReserveLedgerV2 ledger{state.reserve_v2};
+    bridge::ReserveLedgerV2 ledger{state.Ledger(*role)};
     if (!bridge::RecordMintV2(ledger, authorization.amount)) {
         error = "bridge V2 reserve ledger cannot record the mint";
         return false;
     }
-    if (!state.AddProvenDepositV2(event->deposit_id, authorization.amount)) {
+    if (!state.AddProvenDepositV2(*role, event->deposit_id,
+                                  authorization.amount)) {
         error = "bridge V2 proven deposits cannot record the mint";
         return false;
     }
-    state.reserve_v2 = ledger;
-    delta.deposits_v2_added.push_back(
-        BridgeProvenDepositV2{event->deposit_id, authorization.amount});
+    state.Ledger(*role) = ledger;
+    (*role == Consensus::BridgeV2EntryRole::SUCCESSOR
+         ? delta.deposits_v2_successor_added
+         : delta.deposits_v2_added)
+        .push_back(
+            BridgeProvenDepositV2{event->deposit_id, authorization.amount});
     delta.reserve_v2_after = state.reserve_v2;
+    delta.reserve_v2_successor_after = state.reserve_v2_successor;
     return true;
 }
 
@@ -1041,7 +1129,7 @@ template <typename State>
 std::optional<bridge::BurnGateObservationV2<State>> GateObservation(
     const BridgeObservationSlotsV2& observations, const uint8_t subject)
 {
-    const auto& record{observations[subject - 1]};
+    const auto& record{ObservationSlot(observations, subject)};
     if (!record || !std::holds_alternative<State>(record->state)) {
         return std::nullopt;
     }
@@ -1050,13 +1138,21 @@ std::optional<bridge::BurnGateObservationV2<State>> GateObservation(
 }
 
 /**
- * The burn gate rows (bridge::EvaluateBurnGateV2) on a full lineage context
- * and the given kind 9 observations and sticky conflict, at
- * now_eff = max(candidate_time, `light_client`'s finalized execution
- * timestamp). EvaluateBridgeV2BurnGate passes the connected index's state;
- * VerifyBridgeBurnV2 passes the block's state after its earlier records and
- * the connected light client, so both read the same now_eff. Never
- * UNAVAILABLE: the callers check availability.
+ * The burn gate rows (bridge::EvaluateBurnGateV2) of vault entry `role` on a
+ * full lineage context and the given kind 9 observations and sticky
+ * conflict, at now_eff = max(candidate_time, `light_client`'s finalized
+ * execution timestamp). EvaluateBridgeV2BurnGate passes the connected
+ * index's state; VerifyBridgeBurnV2 passes the block's state after its
+ * earlier records and the connected light client, so both read the same
+ * now_eff. Never UNAVAILABLE: the callers check availability.
+ *
+ * The entry's rows read VERIFIER_E (the verifier is shared) and the
+ * entry's own TOKEN_FLAGS and RESERVE_E (subjects 3 and 2 for the launch
+ * entry, 0x13 and 0x12 for the B-23 successor). Retirement is no row: the
+ * burn gate passes the entry that takes burns at the height, the kind 16
+ * sweep gate the retired launch entry (its gate "but for retirement",
+ * section 7.6), and a burn naming the retired entry is refused by its
+ * record check before any gate.
  */
 BridgeV2GateResult EvaluateBurnGateOn(
     const BridgeV2LineageContext& lineage,
@@ -1064,7 +1160,7 @@ BridgeV2GateResult EvaluateBurnGateOn(
     const std::optional<BridgeV2Conflict>& conflict,
     const std::optional<bridge::LightClientStore>& light_client,
     const Consensus::Params& params, const int height,
-    const int64_t candidate_time)
+    const int64_t candidate_time, const Consensus::BridgeV2EntryRole role)
 {
     BridgeV2GateResult out;
     std::optional<uint64_t> light_client_time;
@@ -1101,9 +1197,9 @@ BridgeV2GateResult EvaluateBurnGateOn(
     in.verifier = GateObservation<bridge::VerifierStateV2>(
         observations, bridge::ETH_OBSERVATION_SUBJECT_VERIFIER);
     in.token = GateObservation<bridge::TokenFlagsV2>(
-        observations, bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS);
+        observations, TokenFlagsSubjectFor(role));
     in.reserve = GateObservation<bridge::ReserveStateV2>(
-        observations, bridge::ETH_OBSERVATION_SUBJECT_RESERVE);
+        observations, ReserveSubjectFor(role));
     if (conflict) in.conflict_reason = conflict->reason;
     const bridge::BurnGateDecisionV2 decision{
         bridge::EvaluateBurnGateV2(in, v2.gate)};
@@ -1136,6 +1232,14 @@ BridgeV2GateResult EvaluateBurnGateOn(
  * REPLAY_LINEAGE skips it (judged when the block first connected). Without
  * a context the caller's evaluation stands unless an earlier record changed
  * an observation or the conflict, and then the burn fails closed.
+ *
+ * With a B-23 successor (section 7.6) a burn names the entry that takes
+ * burns at its height: v below h_m, v' from h_m. A burn naming the retired v
+ * from h_m is refused before the gate, deterministically (so under
+ * REPLAY_LINEAGE and without a context too). Checks 2-4 then read that
+ * entry: its ledger, its RESERVE_E (subject 2 or 0x12) and proven deposits,
+ * and its gate rows; the leaf names its vault and token, and its ledger
+ * counts the amount in burned_v.
  */
 bool VerifyBridgeBurnV2(
     const CTransaction& tx, const bridge::BridgeBurnV1& record,
@@ -1148,13 +1252,21 @@ bool VerifyBridgeBurnV2(
         error = "bridge V2 burns are not active";
         return false;
     }
-    const Consensus::BridgeV2VaultEntry& entry{params.bridge_v2->vault};
-    const auto entry_id{modern::ConfiguredBridgeV2EntryId(params)};
     const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
-    if (!entry_id || !asset || record.registry_id != *entry_id) {
+    const auto role{
+        modern::ResolveBridgeV2Entry(params, record.registry_id, height)};
+    const Consensus::BridgeV2VaultEntry* const resolved{
+        role ? params.bridge_v2->Entry(*role) : nullptr};
+    if (!asset || !role || resolved == nullptr) {
         error = "bridge burn does not name the V2 vault entry";
         return false;
     }
+    if (*role == Consensus::BridgeV2EntryRole::LAUNCH &&
+        params.BridgeV2MigrationActive(height)) {
+        error = "bridge V2 burn names the retired vault entry";
+        return false;
+    }
+    const Consensus::BridgeV2VaultEntry& entry{*resolved};
     if (bridge::EthAddressIsNull(record.ethereum_recipient)) {
         error = "bridge V2 burn Ethereum recipient is null";
         return false;
@@ -1183,35 +1295,37 @@ bool VerifyBridgeBurnV2(
     } else if (!lineage->trust_recorded_verdicts) {
         const BridgeV2GateResult gate{EvaluateBurnGateOn(
             *lineage, state.observations_v2, state.conflict_v2,
-            state.light_client_base, params, height, candidate_time)};
+            state.light_client_base, params, height, candidate_time, *role)};
         if (gate.readiness != BridgeBurnReadiness::READY) {
             error = "bridge V2 burn gate is not ready at the burn: " +
                     gate.Describe();
             return false;
         }
     }
-    // Check 2: state.reserve_v2.burned already holds the block's earlier
+    // Check 2: the entry ledger's burned already holds the block's earlier
     // burns.
-    bridge::ReserveLedgerV2 ledger{state.reserve_v2};
+    bridge::ReserveLedgerV2 ledger{state.Ledger(*role)};
     if (!bridge::RecordBurnV2(ledger, amount)) {
         error = "bridge V2 burn exceeds the vault entry's reserve";
         return false;
     }
     // Check 3, against the ledger before this burn.
     const auto& reserve_observation{
-        state.observations_v2[bridge::ETH_OBSERVATION_SUBJECT_RESERVE - 1]};
-    if (!reserve_observation) {
+        ObservationSlot(state.observations_v2, ReserveSubjectFor(*role))};
+    if (!reserve_observation ||
+        !std::holds_alternative<bridge::ReserveStateV2>(
+            reserve_observation->state)) {
         error = "bridge V2 burn has no reserve observation";
         return false;
     }
     const auto& reserve{
         std::get<bridge::ReserveStateV2>(reserve_observation->state)};
-    const auto sums{state.ProvenDepositSums(reserve.next_deposit_id)};
+    const auto sums{state.ProvenDepositSums(*role, reserve.next_deposit_id)};
     if (!sums) {
         error = "bridge V2 proven deposits cannot be summed";
         return false;
     }
-    if (!bridge::WindDownAllows(amount, reserve, *sums, state.reserve_v2,
+    if (!bridge::WindDownAllows(amount, reserve, *sums, state.Ledger(*role),
                                 params.bridge_v2->gate.wind_down_margin_ppm)) {
         error = "bridge V2 burn exceeds the wind-down bound of the latest reserve observation";
         return false;
@@ -1233,12 +1347,141 @@ bool VerifyBridgeBurnV2(
         error = "bridge V2 withdrawal id or burn source is duplicated";
         return false;
     }
-    state.reserve_v2 = ledger;
+    state.Ledger(*role) = ledger;
     delta.reserve_v2_after = state.reserve_v2;
+    delta.reserve_v2_successor_after = state.reserve_v2_successor;
     delta.withdrawal_tree_v2_after = state.withdrawal_tree_v2;
     BridgeWithdrawalV2Request request{
         tx.GetHash(), record.burn_output_index, withdrawal, leaf, height,
-        block_hash};
+        block_hash, static_cast<uint8_t>(*role), /*sweep=*/false};
+    delta.withdrawals_v2_added.push_back(request);
+    tx_result.withdrawal_v2 = std::move(request);
+    return true;
+}
+
+/**
+ * Kind 16 VAULT_SWEEP (node changes section 7.6, B-23): from the migration
+ * height h_m, append the leaf that moves the retired launch vault v's
+ * reserve to the successor v'. The first sweep is the migration leaf;
+ * later ones move what remains, the deposits minted into v since and any
+ * part an earlier sweep's wind-down bound held back, because a retired v
+ * takes no burns and no credit. Checks, in order:
+ *  1. the V2 rules are active (the V2 store);
+ *  2. the migration is active (BridgeV2MigrationActive);
+ *  3. the record names the launch entry, the one that is retired;
+ *  4. v's gate "but for retirement" is READY at this record's position
+ *     (EvaluateBurnGateOn for the launch entry, on the block's state after
+ *     its earlier records). It needs a full context; REPLAY_LINEAGE skips
+ *     it (judged when the block first connected), and without a context
+ *     the record is refused;
+ *  5. reserve_v after the block's earlier records is positive;
+ *  6. a launch RESERVE_E exists, and the amount is reserve_v capped by its
+ *     wind-down headroom (bridge::VaultSweepAmountV2, check 3 of section
+ *     7.2), which must be positive. After a partial seizure the sweep thus
+ *     moves what v can still pay and strands only the shortfall.
+ * The leaf (MakeVaultSweepWithdrawalV2) names v's chain, vault and token,
+ * pays v''s vault and takes the next V2 id and this height; its source is
+ * (txid, `binding_vout`), the carrier's binding output. v's burned_v counts
+ * the amount and v''s transit_v' receives it, credited to C_v' only by
+ * RESERVE_E_SUCCESSOR observations showing absorbedTotal.
+ */
+bool VerifyVaultSweepV2(
+    const CTransaction& tx, const bridge::BridgeVaultSweepV2& record,
+    const uint32_t binding_vout, const int height,
+    const int64_t candidate_time, const uint256& block_hash,
+    const Consensus::Params& params, const BridgeV2LineageContext* lineage,
+    ScratchState& state, BridgeBlockDelta& delta,
+    BridgeTxAuthorization& tx_result, std::string& error)
+{
+    using Consensus::BridgeV2EntryRole;
+    if (!params.BridgeV2RulesActive(height) || !delta.v2_store) {
+        error = "bridge V2 vault sweep records are not active";
+        return false;
+    }
+    if (!params.BridgeV2MigrationActive(height)) {
+        error = "bridge V2 vault sweeps are not active";
+        return false;
+    }
+    const Consensus::BridgeV2Params& v2{*params.bridge_v2};
+    const auto launch_id{
+        modern::ConfiguredBridgeV2EntryId(params, BridgeV2EntryRole::LAUNCH)};
+    const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
+    if (!launch_id || !asset || !v2.successor ||
+        record.registry_id != *launch_id) {
+        error = "bridge V2 vault sweep does not name the retired vault entry";
+        return false;
+    }
+    if (lineage == nullptr) {
+        error = "bridge V2 vault sweep cannot be judged here";
+        return false;
+    }
+    if (!lineage->trust_recorded_verdicts) {
+        const BridgeV2GateResult gate{EvaluateBurnGateOn(
+            *lineage, state.observations_v2, state.conflict_v2,
+            state.light_client_base, params, height, candidate_time,
+            BridgeV2EntryRole::LAUNCH)};
+        if (gate.readiness != BridgeBurnReadiness::READY) {
+            error = "bridge V2 vault sweep gate is not ready: " +
+                    gate.Describe();
+            return false;
+        }
+    }
+    const auto reserve_v{state.reserve_v2.Reserve()};
+    if (!reserve_v || *reserve_v <= 0) {
+        error = "bridge V2 vault sweep has nothing to sweep";
+        return false;
+    }
+    const auto& reserve_observation{ObservationSlot(
+        state.observations_v2, bridge::ETH_OBSERVATION_SUBJECT_RESERVE)};
+    const auto* reserve{
+        reserve_observation ? std::get_if<bridge::ReserveStateV2>(
+                                  &reserve_observation->state)
+                            : nullptr};
+    if (reserve == nullptr) {
+        error = "bridge V2 vault sweep has no reserve observation";
+        return false;
+    }
+    const auto sums{state.ProvenDepositSums(BridgeV2EntryRole::LAUNCH,
+                                            reserve->next_deposit_id)};
+    if (!sums) {
+        error = "bridge V2 proven deposits cannot be summed";
+        return false;
+    }
+    const auto amount{bridge::VaultSweepAmountV2(
+        state.reserve_v2, *reserve, *sums, v2.gate.wind_down_margin_ppm)};
+    if (!amount) {
+        error = "bridge V2 vault sweep has no wind-down headroom at the latest reserve observation";
+        return false;
+    }
+    bridge::ReserveLedgerV2 launch{state.reserve_v2};
+    bridge::ReserveLedgerV2 successor{state.reserve_v2_successor};
+    if (!bridge::RecordSweepV2(launch, successor, *amount)) {
+        error = "bridge V2 reserve ledgers cannot record the vault sweep";
+        return false;
+    }
+    if (height < 0 || binding_vout >= tx.vout.size()) {
+        error = "bridge V2 vault sweep binding output is invalid";
+        return false;
+    }
+    const modern::BridgeWithdrawalV2 withdrawal{
+        modern::MakeVaultSweepWithdrawalV2(
+            v2.vault, *asset, v2.successor->entry.vault_address,
+            state.withdrawal_tree_v2.count, *amount,
+            static_cast<uint64_t>(height))};
+    uint256 leaf;
+    const BridgeWithdrawalId source{tx.GetHash(), binding_vout};
+    if (!state.AddWithdrawalV2(source, withdrawal, leaf)) {
+        error = "bridge V2 withdrawal id or burn source is duplicated";
+        return false;
+    }
+    state.reserve_v2 = launch;
+    state.reserve_v2_successor = successor;
+    delta.reserve_v2_after = state.reserve_v2;
+    delta.reserve_v2_successor_after = state.reserve_v2_successor;
+    delta.withdrawal_tree_v2_after = state.withdrawal_tree_v2;
+    BridgeWithdrawalV2Request request{
+        tx.GetHash(), binding_vout, withdrawal, leaf, height, block_hash,
+        static_cast<uint8_t>(BridgeV2EntryRole::LAUNCH), /*sweep=*/true};
     delta.withdrawals_v2_added.push_back(request);
     tx_result.withdrawal_v2 = std::move(request);
     return true;
@@ -1265,6 +1508,13 @@ bool VerifyBridgeBurnV2(
  * - TOKEN_FLAGS: stored.
  * The record becomes the subject's latest observation (its t_obs is the
  * anchor's execution timestamp).
+ *
+ * RESERVE_E_SUCCESSOR (0x12) and TOKEN_FLAGS_SUCCESSOR (0x13) are RESERVE_E
+ * and TOKEN_FLAGS of the B-23 successor v' (section 7.6), valid only from
+ * the migration height and read with v''s pins. A RESERVE_E_SUCCESSOR
+ * credits v''s transit from v''s absorbedTotal and judges invariant R on
+ * v''s ledger and proven deposits; its failure sets the same sticky E8
+ * conflict.
  */
 bool VerifyEthStateObservation(
     const bridge::BridgeEthStateObservationV2& record, const int height,
@@ -1279,9 +1529,17 @@ bool VerifyEthStateObservation(
     }
     const Consensus::BridgeV2Params& v2{*params.bridge_v2};
     const uint8_t subject{record.subject};
-    if (subject < bridge::ETH_OBSERVATION_SUBJECT_VERIFIER ||
-        subject > BRIDGE_V2_OBSERVATION_SUBJECTS) {
+    const auto slot{BridgeObservationSlotV2(subject)};
+    const uint8_t base_subject{bridge::EthObservationBaseSubject(subject)};
+    if (!slot || base_subject == 0) {
         error = "bridge observation subject is unknown";
+        return false;
+    }
+    const Consensus::BridgeV2EntryRole role{
+        bridge::EthObservationEntryRole(subject)};
+    if (role == Consensus::BridgeV2EntryRole::SUCCESSOR &&
+        !params.BridgeV2MigrationActive(height)) {
+        error = "bridge V2 successor observations are not active";
         return false;
     }
     const bridge::LightClientStore* light_client{state.LightClient()};
@@ -1314,21 +1572,21 @@ bool VerifyEthStateObservation(
         error = "bridge observation anchor timestamp is out of range";
         return false;
     }
-    const auto& latest{state.observations_v2[subject - 1]};
+    const auto& latest{state.observations_v2[*slot]};
     if (latest && anchor->block_number <= latest->anchor_block) {
         error = "bridge observation anchor is not newer than the subject's latest observation";
         return false;
     }
     std::string detail;
     auto observed{bridge::VerifyEthStateObservationV2(
-        record, anchor->state_root, bridge::ObservationPinsFromParams(v2),
-        detail)};
+        record, anchor->state_root,
+        bridge::ObservationPinsFromParams(v2, role), detail)};
     if (!observed) {
         error = "bridge observation is invalid: " + detail;
         return false;
     }
 
-    if (subject == bridge::ETH_OBSERVATION_SUBJECT_VERIFIER) {
+    if (base_subject == bridge::ETH_OBSERVATION_SUBJECT_VERIFIER) {
         const auto& verifier{std::get<bridge::VerifierStateV2>(*observed)};
         if (verifier.status != bridge::VERIFIER_STATUS_LIVE) {
             if (record.verdict != 0) {
@@ -1356,21 +1614,21 @@ bool VerifyEthStateObservation(
                     anchor->block_number};
             }
         }
-    } else if (subject == bridge::ETH_OBSERVATION_SUBJECT_RESERVE) {
+    } else if (base_subject == bridge::ETH_OBSERVATION_SUBJECT_RESERVE) {
         const auto& reserve{std::get<bridge::ReserveStateV2>(*observed)};
-        bridge::ReserveLedgerV2 ledger{state.reserve_v2};
+        bridge::ReserveLedgerV2 ledger{state.Ledger(role)};
         if (!bridge::CreditTransit(ledger, reserve.absorbed_total)) {
             error = "bridge V2 reserve ledger cannot credit transit";
             return false;
         }
-        const auto sums{state.ProvenDepositSums(reserve.next_deposit_id)};
+        const auto sums{state.ProvenDepositSums(role, reserve.next_deposit_id)};
         if (!sums) {
             error = "bridge V2 proven deposits cannot be summed";
             return false;
         }
-        state.reserve_v2 = ledger;
+        state.Ledger(role) = ledger;
         if (!bridge::InvariantRHolds(reserve.locked, sums->below_cut,
-                                     state.reserve_v2) &&
+                                     state.Ledger(role)) &&
             !state.conflict_v2) {
             state.conflict_v2 = BridgeV2Conflict{
                 bridge::BRIDGE_V2_CONFLICT_E8, height, block_hash,
@@ -1387,10 +1645,11 @@ bool VerifyEthStateObservation(
         std::move(*observed),
         height,
         block_hash};
-    state.observations_v2[subject - 1] = stored;
+    state.observations_v2[*slot] = stored;
     state.gate_inputs_changed = true;
     delta.observations_v2_added.push_back(std::move(stored));
     delta.reserve_v2_after = state.reserve_v2;
+    delta.reserve_v2_successor_after = state.reserve_v2_successor;
     delta.conflict_v2_after = state.conflict_v2;
     return true;
 }
@@ -1560,6 +1819,25 @@ bool VerifyBridgeTransaction(
                 return VerifyFinalityConflictV2(payload, height, block_hash,
                                                 params, lineage, index, state,
                                                 delta, error);
+            } else if constexpr (
+                std::is_same_v<T, bridge::BridgeVaultSweepV2>) {
+                // The sweep leaf's source is the carrier's one binding
+                // output (CheckBridgeRecordBinding above made it exact).
+                const auto binding{
+                    modern::MakeBridgeBindingOutput(*bridge_record)};
+                const auto found{
+                    binding ? std::find(tx.vout.begin(), tx.vout.end(),
+                                        *binding)
+                            : tx.vout.end()};
+                if (found == tx.vout.end()) {
+                    error = "bridge V2 vault sweep binding output is invalid";
+                    return false;
+                }
+                return VerifyVaultSweepV2(
+                    tx, payload,
+                    static_cast<uint32_t>(found - tx.vout.begin()), height,
+                    candidate_time, block_hash, params, lineage, state, delta,
+                    tx_result, error);
             }
             error = "bridge record kind is unsupported";
             return false;
@@ -1638,7 +1916,31 @@ static bool HasBridgeV2Record(const CTransaction& tx)
 bool HasBridgeV2LineageRecord(const CTransaction& tx)
 {
     return HasBridgeV2Record<bridge::BridgeEthStateObservationV2,
-                             bridge::BridgeFinalityConflictV2>(tx);
+                             bridge::BridgeFinalityConflictV2,
+                             bridge::BridgeVaultSweepV2>(tx);
+}
+
+bool HasBridgeV2VaultSweep(const CTransaction& tx)
+{
+    return HasBridgeV2Record<bridge::BridgeVaultSweepV2>(tx);
+}
+
+bool HasBridgeV2RetiredEntryBurn(const CTransaction& tx,
+                                 const Consensus::Params& params,
+                                 const int height)
+{
+    if (!params.BridgeV2MigrationActive(height)) return false;
+    const auto launch_id{modern::ConfiguredBridgeV2EntryId(
+        params, Consensus::BridgeV2EntryRole::LAUNCH)};
+    if (!launch_id) return false;
+    for (const CMpaRecord& record : tx.mpa) {
+        if (record.payload_type != bridge::BRIDGE_MPA_TYPE) continue;
+        const auto decoded{bridge::DecodeBridgeMpaRecordV1(record)};
+        if (!decoded) continue;
+        const auto* burn{std::get_if<bridge::BridgeBurnV1>(&decoded->payload)};
+        if (burn != nullptr && burn->registry_id == *launch_id) return true;
+    }
+    return false;
 }
 
 bool HasBridgeV2LineageRecord(const CBlock& block)
@@ -1933,7 +2235,37 @@ BridgeV2GateResult EvaluateBridgeV2BurnGate(
     }
     return EvaluateBurnGateOn(*lineage, index.ObservationsV2(),
                               index.ConflictV2(), index.LightClientV2(),
-                              params, height, candidate_time);
+                              params, height, candidate_time,
+                              modern::ActiveBridgeV2Role(params, height));
+}
+
+BridgeV2GateResult EvaluateBridgeV2SweepGate(
+    const BridgeV2LineageContext* lineage, const BridgeStateIndex& index,
+    const Consensus::Params& params, const int height,
+    const int64_t candidate_time)
+{
+    BridgeV2GateResult out;
+    out.now_eff = candidate_time;
+    if (!params.bridge_v2) {
+        out.reason = "bridge V2 is not configured";
+        return out;
+    }
+    if (!params.BridgeV2MigrationActive(height)) {
+        out.reason = "bridge V2 vault sweeps are not active at this height";
+        return out;
+    }
+    if (lineage == nullptr || lineage->trust_recorded_verdicts) {
+        out.reason = "the fresh finality lineage is unavailable";
+        return out;
+    }
+    if (index.ConnectedHeight() != height - 1) {
+        out.reason = "the bridge state is not connected at the candidate's parent";
+        return out;
+    }
+    return EvaluateBurnGateOn(*lineage, index.ObservationsV2(),
+                              index.ConflictV2(), index.LightClientV2(),
+                              params, height, candidate_time,
+                              Consensus::BridgeV2EntryRole::LAUNCH);
 }
 
 std::optional<std::string> BridgeV2DepositsClosedReason(
@@ -2032,6 +2364,9 @@ struct BridgeBlockPreview::Impl {
          const bridge::ProvenDepositMapV2& deposits_v2,
          const CAmount deposits_v2_total,
          const std::optional<BridgeV2Conflict>& conflict_v2,
+         const bridge::ReserveLedgerV2& reserve_v2_successor,
+         const bridge::ProvenDepositMapV2& deposits_v2_successor,
+         const CAmount deposits_v2_successor_total,
          const int connected_height, const uint256& connected_hash,
          const BridgeStateIndex& base_index,
          const BridgeV2LineageContext* lineage_context)
@@ -2048,7 +2383,9 @@ struct BridgeBlockPreview::Impl {
               epoch_minted, withdrawals, decentralized_withdrawals,
               decentralized_sources, withdrawal_tree, withdrawals_v2,
               withdrawal_v2_sources, withdrawal_tree_v2, observations_v2,
-              reserve_v2, deposits_v2, deposits_v2_total, conflict_v2)}
+              reserve_v2, deposits_v2, deposits_v2_total, conflict_v2,
+              reserve_v2_successor, deposits_v2_successor,
+              deposits_v2_successor_total)}
     {
         delta.height = height;
         delta.block_hash = block_id;
@@ -2064,6 +2401,8 @@ struct BridgeBlockPreview::Impl {
         delta.reserve_v2_after = reserve_v2;
         delta.conflict_v2_before = conflict_v2;
         delta.conflict_v2_after = conflict_v2;
+        delta.reserve_v2_successor_before = reserve_v2_successor;
+        delta.reserve_v2_successor_after = reserve_v2_successor;
     }
 
     const int height;
@@ -2453,11 +2792,9 @@ CAmount BridgeStateIndex::EpochMinted(const modern::AssetId& asset,
 std::optional<BridgeObservationRecordV2> BridgeStateIndex::LatestObservationV2(
     const uint8_t subject) const
 {
-    if (subject < bridge::ETH_OBSERVATION_SUBJECT_VERIFIER ||
-        subject > BRIDGE_V2_OBSERVATION_SUBJECTS) {
-        return std::nullopt;
-    }
-    return m_observations_v2[subject - 1];
+    const auto slot{BridgeObservationSlotV2(subject)};
+    if (!slot) return std::nullopt;
+    return m_observations_v2[*slot];
 }
 
 std::optional<BridgeExecutionAnchor> BridgeStateIndex::NewestStateAnchorV2()
@@ -2503,7 +2840,9 @@ std::unique_ptr<BridgeBlockPreview> BridgeStateIndex::BeginBlockPreview(
         m_decentralized_withdrawal_sources, m_withdrawal_tree,
         m_withdrawals_v2, m_withdrawal_v2_sources, m_withdrawal_tree_v2,
         m_observations_v2, m_reserve_v2, m_deposits_v2, m_deposits_v2_total,
-        m_conflict_v2, m_connected_height, m_connected_hash, *this, lineage)};
+        m_conflict_v2, m_reserve_v2_successor, m_deposits_v2_successor,
+        m_deposits_v2_successor_total, m_connected_height, m_connected_hash,
+        *this, lineage)};
     return std::unique_ptr<BridgeBlockPreview>{
         new BridgeBlockPreview{std::move(impl)}};
 }
@@ -2533,6 +2872,8 @@ bool BridgeStateIndex::VerifyBlock(
     out.reserve_v2_after = m_reserve_v2;
     out.conflict_v2_before = m_conflict_v2;
     out.conflict_v2_after = m_conflict_v2;
+    out.reserve_v2_successor_before = m_reserve_v2_successor;
+    out.reserve_v2_successor_after = m_reserve_v2_successor;
 
     const auto& light_client{out.v2_store ? m_light_client_v2
                                           : m_light_client};
@@ -2549,7 +2890,9 @@ bool BridgeStateIndex::VerifyBlock(
                        m_withdrawal_tree, m_withdrawals_v2,
                        m_withdrawal_v2_sources, m_withdrawal_tree_v2,
                        m_observations_v2, m_reserve_v2, m_deposits_v2,
-                       m_deposits_v2_total, m_conflict_v2};
+                       m_deposits_v2_total, m_conflict_v2,
+                       m_reserve_v2_successor, m_deposits_v2_successor,
+                       m_deposits_v2_successor_total};
     for (const CTransactionRef& tx : block.vtx) {
         BridgeTxAuthorization ignored;
         if (!VerifyBridgeTransaction(*tx, height, block.GetBlockTime(),
@@ -2576,6 +2919,7 @@ bool BridgeStateIndex::VerifyBlock(
     out.withdrawal_tree_v2_after = state.withdrawal_tree_v2;
     out.reserve_v2_after = state.reserve_v2;
     out.conflict_v2_after = state.conflict_v2;
+    out.reserve_v2_successor_after = state.reserve_v2_successor;
     return true;
 }
 
@@ -2890,17 +3234,22 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
     // it changes only from V; below it every field passes through.
     if (!(delta.observations_v2_before == m_observations_v2) ||
         !(delta.reserve_v2_before == m_reserve_v2) ||
-        delta.conflict_v2_before != m_conflict_v2) {
+        delta.conflict_v2_before != m_conflict_v2 ||
+        !(delta.reserve_v2_successor_before == m_reserve_v2_successor)) {
         error = "bridge delta V2 accounting before-state does not match";
         return false;
     }
     BridgeObservationSlotsV2 expected_observations{m_observations_v2};
     CAmount deposits_v2_total_after{m_deposits_v2_total};
+    CAmount deposits_v2_successor_total_after{m_deposits_v2_successor_total};
     if (!delta.v2_store) {
         if (!delta.observations_v2_added.empty() ||
             !delta.deposits_v2_added.empty() ||
+            !delta.deposits_v2_successor_added.empty() ||
             !delta.finality_conflicts_v2_added.empty() ||
             !(delta.reserve_v2_after == delta.reserve_v2_before) ||
+            !(delta.reserve_v2_successor_after ==
+              delta.reserve_v2_successor_before) ||
             delta.conflict_v2_after != delta.conflict_v2_before) {
             error = "bridge delta V2 accounting does not match its store";
             return false;
@@ -2919,9 +3268,13 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
         for (const BridgeObservationRecordV2& record :
              delta.observations_v2_added) {
             const auto anchor{anchors.find(record.anchor_hash)};
-            if (record.subject < bridge::ETH_OBSERVATION_SUBJECT_VERIFIER ||
-                record.subject > BRIDGE_V2_OBSERVATION_SUBJECTS ||
-                record.state.index() != size_t{record.subject} - 1 ||
+            // The decoded state follows the base subject (RESERVE_E and
+            // RESERVE_E_SUCCESSOR both decode a ReserveStateV2).
+            const auto slot{BridgeObservationSlotV2(record.subject)};
+            const uint8_t base_subject{
+                bridge::EthObservationBaseSubject(record.subject)};
+            if (!slot || base_subject == 0 ||
+                record.state.index() != size_t{base_subject} - 1 ||
                 (record.verdict & ~bridge::ETH_OBSERVATION_VERDICT_MASK) != 0 ||
                 (record.subject != bridge::ETH_OBSERVATION_SUBJECT_VERIFIER &&
                  record.verdict != 0) ||
@@ -2937,7 +3290,7 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
                 error = "bridge delta contains a malformed observation";
                 return false;
             }
-            auto& latest{expected_observations[record.subject - 1]};
+            auto& latest{expected_observations[*slot]};
             if (latest && record.anchor_block <= latest->anchor_block) {
                 error = "bridge delta observation anchors are not increasing";
                 return false;
@@ -2957,40 +3310,85 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
             latest = record;
         }
 
-        // The ledger moves only by this block's V2 mints and burns and by
-        // transit credited on proven arrival.
+        // Each entry's ledger moves only by this block's V2 mints into its
+        // vault, the leaves naming it, the sweep leaves paying it and transit
+        // credited on proven arrival (sections 7.1 and 7.6).
+        const auto sum_deposits{
+            [](const std::vector<BridgeProvenDepositV2>& deposits,
+               const bridge::ProvenDepositMapV2& connected,
+               CAmount& deposited) {
+                deposited = 0;
+                std::set<uint64_t> ids;
+                for (const BridgeProvenDepositV2& deposit : deposits) {
+                    if (deposit.amount <= 0 || deposit.amount > MAX_MONEY ||
+                        !ids.insert(deposit.deposit_id).second ||
+                        connected.contains(deposit.deposit_id) ||
+                        deposited > MAX_MONEY - deposit.amount) {
+                        return false;
+                    }
+                    deposited += deposit.amount;
+                }
+                return true;
+            }};
         CAmount deposited{0};
-        std::set<uint64_t> deposit_ids;
-        for (const BridgeProvenDepositV2& deposit : delta.deposits_v2_added) {
-            if (deposit.amount <= 0 || deposit.amount > MAX_MONEY ||
-                !deposit_ids.insert(deposit.deposit_id).second ||
-                m_deposits_v2.contains(deposit.deposit_id) ||
-                deposited > MAX_MONEY - deposit.amount) {
-                error = "bridge delta contains an invalid proven deposit";
-                return false;
-            }
-            deposited += deposit.amount;
+        CAmount deposited_successor{0};
+        if (!sum_deposits(delta.deposits_v2_added, m_deposits_v2, deposited) ||
+            !sum_deposits(delta.deposits_v2_successor_added,
+                          m_deposits_v2_successor, deposited_successor) ||
+            deposited > MAX_MONEY - deposited_successor) {
+            error = "bridge delta contains an invalid proven deposit";
+            return false;
         }
         const auto total_after{CheckedAdd(m_deposits_v2_total, deposited)};
-        if (!total_after) {
+        const auto successor_total_after{
+            CheckedAdd(m_deposits_v2_successor_total, deposited_successor)};
+        if (!total_after || !successor_total_after) {
             error = "bridge delta contains an invalid proven deposit";
             return false;
         }
         deposits_v2_total_after = *total_after;
+        deposits_v2_successor_total_after = *successor_total_after;
+        // burned_v sums the leaves naming each entry (sweeps name the
+        // launch entry v); transit_v' receives the sweep amounts.
         CAmount burned{0};
+        CAmount burned_successor{0};
+        CAmount swept{0};
         for (const BridgeWithdrawalV2Request& request :
              delta.withdrawals_v2_added) {
-            if (request.withdrawal.amount <= 0 ||
-                burned > MAX_MONEY - request.withdrawal.amount) {
+            const CAmount amount{request.withdrawal.amount};
+            CAmount& total{request.entry ==
+                                   static_cast<uint8_t>(
+                                       Consensus::BridgeV2EntryRole::SUCCESSOR)
+                               ? burned_successor
+                               : burned};
+            if (amount <= 0 ||
+                request.entry > static_cast<uint8_t>(
+                                    Consensus::BridgeV2EntryRole::SUCCESSOR) ||
+                (request.sweep &&
+                 request.entry != static_cast<uint8_t>(
+                                      Consensus::BridgeV2EntryRole::LAUNCH)) ||
+                total > MAX_MONEY - amount ||
+                (request.sweep && swept > MAX_MONEY - amount)) {
                 error = "bridge delta contains an invalid V2 withdrawal";
                 return false;
             }
-            burned += request.withdrawal.amount;
+            total += amount;
+            if (request.sweep) swept += amount;
         }
         const bridge::ReserveLedgerV2& before{delta.reserve_v2_before};
         const bridge::ReserveLedgerV2& after{delta.reserve_v2_after};
-        if (deposit_ids.size() != delta.mint_authorizations.size() ||
-            deposited != authorized_amount || !after.Valid() ||
+        const bridge::ReserveLedgerV2& next_before{
+            delta.reserve_v2_successor_before};
+        const bridge::ReserveLedgerV2& next_after{
+            delta.reserve_v2_successor_after};
+        // The successor's transit before the block plus the swept amounts is
+        // what its credits and remaining transit share; both are in range.
+        const auto next_inflow{CheckedAdd(next_before.transit, swept)};
+        if (delta.deposits_v2_added.size() +
+                    delta.deposits_v2_successor_added.size() !=
+                delta.mint_authorizations.size() ||
+            deposited + deposited_successor != authorized_amount ||
+            !after.Valid() ||
             after.minted < before.minted ||
             after.minted - before.minted != deposited ||
             after.burned < before.burned ||
@@ -2998,7 +3396,16 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
             after.credited < before.credited ||
             after.transit > before.transit ||
             after.credited - before.credited !=
-                before.transit - after.transit) {
+                before.transit - after.transit ||
+            !next_after.Valid() || !next_inflow ||
+            next_after.minted < next_before.minted ||
+            next_after.minted - next_before.minted != deposited_successor ||
+            next_after.burned < next_before.burned ||
+            next_after.burned - next_before.burned != burned_successor ||
+            next_after.credited < next_before.credited ||
+            next_after.transit > *next_inflow ||
+            next_after.credited - next_before.credited !=
+                *next_inflow - next_after.transit) {
             error = "bridge delta reserve ledger does not match its effects";
             return false;
         }
@@ -3045,7 +3452,8 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
                                 bridge::ETH_OBSERVATION_VERDICT_CERT_CONFLICT) != 0;
                     }
                     return conflict.reason == bridge::BRIDGE_V2_CONFLICT_E8 &&
-                           r.subject == bridge::ETH_OBSERVATION_SUBJECT_RESERVE;
+                           bridge::EthObservationBaseSubject(r.subject) ==
+                               bridge::ETH_OBSERVATION_SUBJECT_RESERVE;
                 }};
                 if (!conflict.evidence_cert_id.IsNull() ||
                     conflict.evidence_checkpoint_index != 0 ||
@@ -3133,6 +3541,12 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
     }
     m_deposits_v2_total = deposits_v2_total_after;
     m_conflict_v2 = delta.conflict_v2_after;
+    m_reserve_v2_successor = delta.reserve_v2_successor_after;
+    for (const BridgeProvenDepositV2& deposit :
+         delta.deposits_v2_successor_added) {
+        m_deposits_v2_successor.emplace(deposit.deposit_id, deposit.amount);
+    }
+    m_deposits_v2_successor_total = deposits_v2_successor_total_after;
     m_connected_height = delta.height;
     m_connected_hash = delta.block_hash;
     m_history.push_back(delta);
@@ -3194,23 +3608,31 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
     BridgeObservationSlotsV2 observations_after{delta.observations_v2_before};
     for (const BridgeObservationRecordV2& record :
          delta.observations_v2_added) {
-        if (record.subject < bridge::ETH_OBSERVATION_SUBJECT_VERIFIER ||
-            record.subject > BRIDGE_V2_OBSERVATION_SUBJECTS) {
+        const auto slot{BridgeObservationSlotV2(record.subject)};
+        if (!slot) {
             error = "bridge undo V2 accounting after-state does not match";
             return false;
         }
-        observations_after[record.subject - 1] = record;
+        observations_after[*slot] = record;
     }
+    const auto deposits_missing{
+        [](const std::vector<BridgeProvenDepositV2>& deposits,
+           const bridge::ProvenDepositMapV2& connected) {
+            return std::any_of(deposits.begin(), deposits.end(),
+                               [&](const BridgeProvenDepositV2& deposit) {
+                                   const auto found{
+                                       connected.find(deposit.deposit_id)};
+                                   return found == connected.end() ||
+                                          found->second != deposit.amount;
+                               });
+        }};
     if (!(m_observations_v2 == observations_after) ||
         !(m_reserve_v2 == delta.reserve_v2_after) ||
         m_conflict_v2 != delta.conflict_v2_after ||
-        std::any_of(delta.deposits_v2_added.begin(),
-                    delta.deposits_v2_added.end(),
-                    [&](const BridgeProvenDepositV2& deposit) {
-                        const auto found{m_deposits_v2.find(deposit.deposit_id)};
-                        return found == m_deposits_v2.end() ||
-                               found->second != deposit.amount;
-                    })) {
+        !(m_reserve_v2_successor == delta.reserve_v2_successor_after) ||
+        deposits_missing(delta.deposits_v2_added, m_deposits_v2) ||
+        deposits_missing(delta.deposits_v2_successor_added,
+                         m_deposits_v2_successor)) {
         error = "bridge undo V2 accounting after-state does not match";
         return false;
     }
@@ -3328,6 +3750,12 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
         m_deposits_v2_total -= deposit.amount;
     }
     m_conflict_v2 = delta.conflict_v2_before;
+    m_reserve_v2_successor = delta.reserve_v2_successor_before;
+    for (const BridgeProvenDepositV2& deposit :
+         delta.deposits_v2_successor_added) {
+        m_deposits_v2_successor.erase(deposit.deposit_id);
+        m_deposits_v2_successor_total -= deposit.amount;
+    }
     for (auto it{delta.epoch_mint_changes.rbegin()};
          it != delta.epoch_mint_changes.rend(); ++it) {
         const auto key{std::make_pair(it->asset, it->epoch)};
@@ -3391,6 +3819,9 @@ void BridgeStateIndex::Clear()
     m_deposits_v2.clear();
     m_deposits_v2_total = 0;
     m_conflict_v2.reset();
+    m_reserve_v2_successor = {};
+    m_deposits_v2_successor.clear();
+    m_deposits_v2_successor_total = 0;
     m_connected_height = -1;
     m_connected_hash.SetNull();
     m_history.clear();

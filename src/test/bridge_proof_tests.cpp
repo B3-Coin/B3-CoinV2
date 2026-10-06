@@ -4,6 +4,7 @@
 
 #include <bridge/proof.h>
 #include <modern/finality_v2_payload.h>
+#include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -249,9 +250,10 @@ BOOST_AUTO_TEST_CASE(all_kinds_and_components_round_trip)
 BOOST_AUTO_TEST_CASE(v2_record_set_adds_only_kinds_9_and_13)
 {
     // The V2 record set (from the bridge V2 height V) decodes every V1 kind
-    // byte-identically and adds only kinds 9 and 13 (node changes sections
-    // 3.4, 8.2 and 8.5); bridge_state_observation_tests covers kind 9 itself
-    // and v2_finality_conflict_record_codec below covers kind 13.
+    // byte-identically and adds only kinds 9, 13 and 16 (node changes
+    // sections 3.4, 7.6, 8.2 and 8.5); bridge_state_observation_tests covers
+    // kind 9 itself, v2_finality_conflict_record_codec below covers kind 13
+    // and vault_sweep_codec kind 16.
     EthAddress recipient{};
     recipient.back() = 1;
     const std::vector<BridgeRecordV1> v1_records{
@@ -286,9 +288,9 @@ BOOST_AUTO_TEST_CASE(v2_record_set_adds_only_kinds_9_and_13)
     BOOST_CHECK(!DecodeBridgeRecordV1(*encoded, BRIDGE_MPT_LIMITS_V1));
     BOOST_CHECK(DecodeBridgeRecordV1(*encoded, BRIDGE_MPT_LIMITS_V2) == kind9);
 
-    // Reserved and unknown kinds (7, 8, 10-12, 14 and beyond) stay malformed
-    // in both sets, whatever body follows; kind 13 with this kind 9 body is
-    // malformed too, because its certificate has no valid shape.
+    // Reserved and unknown kinds (7, 8, 10-12, 14, 15, 17 and beyond) stay
+    // malformed in both sets, whatever body follows; kinds 13 and 16 with this kind 9
+    // body are malformed too, because neither body has a valid shape.
     for (unsigned kind{0}; kind <= 255; ++kind) {
         if ((kind >= 1 && kind <= 6) || kind == 9) continue;
         auto patched{*encoded};
@@ -451,6 +453,117 @@ BOOST_AUTO_TEST_CASE(v2_finality_conflict_record_codec)
         BRIDGE_MPT_LIMITS_V2));
     BOOST_CHECK(!EncodeBridgeRecordV1(
         {BridgeRecordKindV1::FINALITY_CONFLICT, BridgeFinalityConflictV2{}},
+        BRIDGE_MPT_LIMITS_V2));
+}
+
+BOOST_AUTO_TEST_CASE(vault_sweep_codec)
+{
+    // Kind 16 VAULT_SWEEP (node changes section 7.6, B-23): exactly
+    // 0x10 || 0x00 || registry_id(32), the launch vault entry id in raw
+    // uint256 order, decoded only under the V2 record set.
+    const uint256 entry_id{Hash(0x21)};
+    const BridgeRecordV1 record{BridgeRecordKindV1::VAULT_SWEEP,
+                                BridgeVaultSweepV2{entry_id}};
+    BOOST_CHECK_EQUAL(static_cast<unsigned>(BridgeRecordKindV1::VAULT_SWEEP), 16U);
+    BOOST_CHECK_EQUAL(BRIDGE_VAULT_SWEEP_WIRE_SIZE, 34U);
+
+    std::vector<unsigned char> expected{0x10, 0x00};
+    expected.insert(expected.end(), entry_id.begin(), entry_id.end());
+    BOOST_REQUIRE_EQUAL(expected.size(), BRIDGE_VAULT_SWEEP_WIRE_SIZE);
+    // Raw order: the id's first byte (Hash() counts up from the seed) is the
+    // record's third byte.
+    BOOST_CHECK_EQUAL(HexStr(expected),
+                      "1000"
+                      "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40");
+
+    const auto encoded{EncodeBridgeRecordV1(record, BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(encoded);
+    BOOST_CHECK(*encoded == expected);
+    const auto decoded{DecodeBridgeRecordV1(expected, BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(decoded);
+    BOOST_CHECK(*decoded == record);
+    BOOST_CHECK(decoded->kind == BridgeRecordKindV1::VAULT_SWEEP);
+    const auto* sweep{std::get_if<BridgeVaultSweepV2>(&decoded->payload)};
+    BOOST_REQUIRE(sweep);
+    BOOST_CHECK(sweep->registry_id == entry_id);
+
+    const auto mpa{MakeBridgeMpaRecord(record, BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(mpa);
+    BOOST_CHECK_EQUAL(mpa->payload_type, BRIDGE_MPA_TYPE);
+    BOOST_CHECK_EQUAL(mpa->payload_version, BRIDGE_MPA_VERSION_V1);
+    BOOST_CHECK(mpa->payload == expected);
+    BOOST_CHECK(DecodeBridgeMpaRecordV1(*mpa, BRIDGE_MPT_LIMITS_V2) == record);
+
+    // Below V, and on every network without bridge_v2, kind 16 is malformed
+    // in both directions (the V1 set is also every default argument).
+    BOOST_CHECK(!EncodeBridgeRecordV1(record, BRIDGE_MPT_LIMITS_V1));
+    BOOST_CHECK(!EncodeBridgeRecordV1(record));
+    BOOST_CHECK(!EncodeBridgeProofV1(record));
+    BOOST_CHECK(!MakeBridgeMpaRecord(record, BRIDGE_MPT_LIMITS_V1));
+    BOOST_CHECK(!DecodeBridgeRecordV1(expected, BRIDGE_MPT_LIMITS_V1));
+    BOOST_CHECK(!DecodeBridgeRecordV1(expected));
+    BOOST_CHECK(!DecodeBridgeProofV1(expected));
+    BOOST_CHECK(!DecodeBridgeMpaRecordV1(*mpa, BRIDGE_MPT_LIMITS_V1));
+
+    // A null id is refused in both directions.
+    BOOST_CHECK(!EncodeBridgeRecordV1(
+        {BridgeRecordKindV1::VAULT_SWEEP, BridgeVaultSweepV2{}}, BRIDGE_MPT_LIMITS_V2));
+    std::vector<unsigned char> null_id{0x10, 0x00};
+    null_id.resize(BRIDGE_VAULT_SWEEP_WIRE_SIZE, 0x00);
+    BOOST_CHECK(!DecodeBridgeRecordV1(null_id, BRIDGE_MPT_LIMITS_V2));
+    // One non-zero byte anywhere in the id is enough.
+    for (const size_t pos : {size_t{2}, size_t{33}}) {
+        auto one_byte{null_id};
+        one_byte[pos] = 0x01;
+        BOOST_CHECK(DecodeBridgeRecordV1(one_byte, BRIDGE_MPT_LIMITS_V2));
+    }
+
+    // The body is exactly 32 bytes: every truncation (records of 0-33
+    // bytes) and 33- and 35-byte bodies are refused.
+    for (size_t cut{0}; cut < expected.size(); ++cut) {
+        BOOST_CHECK(!DecodeBridgeRecordV1(
+            std::span<const unsigned char>{expected}.first(cut),
+            BRIDGE_MPT_LIMITS_V2));
+    }
+    for (const size_t extra : {size_t{1}, size_t{3}}) {
+        auto longer{expected};
+        longer.insert(longer.end(), extra, 0x00);
+        BOOST_CHECK(!DecodeBridgeRecordV1(longer, BRIDGE_MPT_LIMITS_V2));
+        longer.back() = 0x01;
+        BOOST_CHECK(!DecodeBridgeRecordV1(longer, BRIDGE_MPT_LIMITS_V2));
+    }
+
+    // The reserved byte must be zero.
+    for (const unsigned char reserved : {0x01, 0x80, 0xff}) {
+        auto patched{expected};
+        patched[1] = reserved;
+        BOOST_CHECK(!DecodeBridgeRecordV1(patched, BRIDGE_MPT_LIMITS_V2));
+    }
+
+    // The same 34 bytes under any other kind byte are malformed in both
+    // sets: kinds 7, 8, 10-12, 14 and 15 stay reserved (14 and 15 are the
+    // staker-signed fast deposit proposal's FSD_MINT and FSD_FAULT), and no
+    // other kind has a 32-byte body.
+    for (unsigned kind{0}; kind <= 255; ++kind) {
+        if (kind == 16) continue;
+        auto patched{expected};
+        patched[0] = static_cast<unsigned char>(kind);
+        BOOST_CHECK(!DecodeBridgeRecordV1(patched, BRIDGE_MPT_LIMITS_V1));
+        BOOST_CHECK(!DecodeBridgeRecordV1(patched, BRIDGE_MPT_LIMITS_V2));
+    }
+
+    // The kind and the body must agree.
+    EthAddress recipient{};
+    recipient.back() = 1;
+    BOOST_CHECK(!EncodeBridgeRecordV1(
+        {BridgeRecordKindV1::VAULT_SWEEP,
+         BridgeBurnV1{entry_id, 1, 2'000'000, recipient}},
+        BRIDGE_MPT_LIMITS_V2));
+    BOOST_CHECK(!EncodeBridgeRecordV1(
+        {BridgeRecordKindV1::BRIDGE_BURN, BridgeVaultSweepV2{entry_id}},
+        BRIDGE_MPT_LIMITS_V2));
+    BOOST_CHECK(!EncodeBridgeRecordV1(
+        {BridgeRecordKindV1::FINALITY_CONFLICT, BridgeVaultSweepV2{entry_id}},
         BRIDGE_MPT_LIMITS_V2));
 }
 

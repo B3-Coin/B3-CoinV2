@@ -67,11 +67,29 @@ bool CheckBridgeBurnReadiness(const CBlock& block,
 
 //! True for a transaction or block carrying a syntactically decoded record
 //! that is judged on the fresh lineage (decoded under the bridge V2 record
-//! set): kind 9 ETH_STATE_OBSERVATION (a LIVE VERIFIER_E verdict) or kind 13
-//! FINALITY_CONFLICT. Mempool admission, block connection and wallet
+//! set): kind 9 ETH_STATE_OBSERVATION (a LIVE VERIFIER_E verdict), kind 13
+//! FINALITY_CONFLICT or kind 16 VAULT_SWEEP (the retired vault's gate).
+//! Mempool admission, block connection, block assembly and wallet
 //! prevalidation build the lineage context for such a record.
 bool HasBridgeV2LineageRecord(const CTransaction& tx);
 bool HasBridgeV2LineageRecord(const CBlock& block);
+
+//! True for a transaction carrying a syntactically decoded kind 16
+//! VAULT_SWEEP (decoded under the bridge V2 record set). A sweep passes the
+//! retired vault's gate, so once a sticky conflict is set (row C4) it can
+//! never be valid again on that chain, and ConnectTip evicts it from the
+//! mempool with every V2 burn and kind 13 record.
+bool HasBridgeV2VaultSweep(const CTransaction& tx);
+
+//! True for a transaction carrying a decoded kind 6 BRIDGE_BURN that names
+//! the B-23 retired launch vault entry at `height`: the migration is active
+//! there (Consensus::Params::BridgeV2MigrationActive) and the burn's
+//! registry_id is the launch entry id. Such a burn is refused at every
+//! height from h_m (node changes section 7.6, "names the retired vault
+//! entry"), so ConnectTip evicts it from the mempool once the block below
+//! h_m connects. False on every network without a pinned successor.
+bool HasBridgeV2RetiredEntryBurn(const CTransaction& tx,
+                                 const Consensus::Params& params, int height);
 
 //! True for a transaction carrying a syntactically decoded kind 13
 //! FINALITY_CONFLICT (decoded under the bridge V2 record set). Once a
@@ -80,8 +98,25 @@ bool HasBridgeV2LineageRecord(const CBlock& block);
 bool HasBridgeV2FinalityConflict(const CTransaction& tx);
 
 /** Number of kind 9 subjects: VERIFIER_E, RESERVE_E and TOKEN_FLAGS
- * (bridge::ETH_OBSERVATION_SUBJECT_*, values 1-3). */
-inline constexpr size_t BRIDGE_V2_OBSERVATION_SUBJECTS{3};
+ * (bridge::ETH_OBSERVATION_SUBJECT_*, values 1-3) and the B-23 successor's
+ * RESERVE_E_SUCCESSOR and TOKEN_FLAGS_SUCCESSOR (0x12 and 0x13, node changes
+ * section 7.6). */
+inline constexpr size_t BRIDGE_V2_OBSERVATION_SUBJECTS{5};
+
+/** The slot of a kind 9 subject in BridgeObservationSlotsV2: 1, 2, 3, 0x12
+ * and 0x13 map to 0..4; nullopt for any other value. */
+inline constexpr std::optional<size_t> BridgeObservationSlotV2(
+    const uint8_t subject)
+{
+    switch (subject) {
+    case bridge::ETH_OBSERVATION_SUBJECT_VERIFIER: return 0;
+    case bridge::ETH_OBSERVATION_SUBJECT_RESERVE: return 1;
+    case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS: return 2;
+    case bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR: return 3;
+    case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR: return 4;
+    }
+    return std::nullopt;
+}
 
 /**
  * One connected kind 9 observation (node changes section 8.2): the anchor
@@ -103,7 +138,8 @@ struct BridgeObservationRecordV2 {
                            const BridgeObservationRecordV2&) = default;
 };
 
-//! The latest observation per subject, indexed by subject - 1.
+//! The latest observation per subject, indexed by BridgeObservationSlotV2
+//! (subject - 1 for subjects 1-3, then 0x12 and 0x13).
 using BridgeObservationSlotsV2 =
     std::array<std::optional<BridgeObservationRecordV2>,
                BRIDGE_V2_OBSERVATION_SUBJECTS>;
@@ -297,6 +333,12 @@ struct BridgeV2GateResult {
  *   checkpoint's epoch for E6);
  * - E1-E8 read the index's latest VERIFIER_E, TOKEN_FLAGS and RESERVE_E,
  *   and C4 its sticky conflict.
+ * The gate is the entry's that takes burns at `height`
+ * (modern::ActiveBridgeV2Role): the launch entry v below a B-23 migration
+ * height h_m, the successor v' from h_m, whose E7 and E8 read
+ * TOKEN_FLAGS_SUCCESSOR (0x13) and RESERVE_E_SUCCESSOR (0x12). A burn naming
+ * the retired v is refused by its record check, so the block-level gate
+ * always follows the entry burns name.
  * UNAVAILABLE without a bridge V2 envelope, without a lineage context, with
  * the replay context, or when `index` is not connected at height - 1.
  * The block-level evaluation shared by mempool admission, block connection,
@@ -306,6 +348,19 @@ struct BridgeV2GateResult {
  * the per-burn reserve and wind-down bounds.
  */
 BridgeV2GateResult EvaluateBridgeV2BurnGate(
+    const BridgeV2LineageContext* lineage, const BridgeStateIndex& index,
+    const Consensus::Params& params, int height, int64_t candidate_time);
+
+/**
+ * The gate of a kind 16 VAULT_SWEEP in the block at `height` (node changes
+ * section 7.6): the retired launch entry v's burn gate "but for
+ * retirement", i.e. EvaluateBridgeV2BurnGate's rows evaluated for v
+ * (subjects 1, 2 and 3, the shared lineage and sticky conflict) rather than
+ * for the entry that takes burns. UNAVAILABLE where EvaluateBridgeV2BurnGate
+ * is, and below the migration height h_m (no sweep exists there).
+ * VerifyBlock evaluates the same rows again at each sweep's position.
+ */
+BridgeV2GateResult EvaluateBridgeV2SweepGate(
     const BridgeV2LineageContext* lineage, const BridgeStateIndex& index,
     const Consensus::Params& params, int height, int64_t candidate_time);
 
@@ -445,6 +500,15 @@ struct BridgeDecentralizedWithdrawalRequest {
  * for V1, the kind 6 record supplies only the recipient and names the exact
  * bUSD V2 burn; the id, destination chain, asset, vault, token and B3 height
  * come from the V2 entry and the active-chain position.
+ *
+ * `entry` is the index of the vault entry whose ledger counts the leaf in
+ * burned_v (Consensus::BridgeV2EntryRole: 0 the launch entry v, 1 the B-23
+ * successor v'). `sweep` marks a kind 16 VAULT_SWEEP leaf (section 7.6):
+ * it names the retired v (entry 0), pays the successor vault v' and adds
+ * its amount to transit_v'. A sweep's `burn_output_index` is the index of
+ * the carrier's binding output, the one output that names the record. Both
+ * are trailing members, so positional initializers of a kind 6 leaf stay
+ * valid.
  */
 struct BridgeWithdrawalV2Request {
     Txid transaction_id{};
@@ -453,6 +517,8 @@ struct BridgeWithdrawalV2Request {
     uint256 leaf{};
     int connected_height{-1};
     uint256 connected_block{};
+    uint8_t entry{0};
+    bool sweep{false};
 
     friend bool operator==(const BridgeWithdrawalV2Request&,
                            const BridgeWithdrawalV2Request&) = default;
@@ -521,6 +587,12 @@ struct BridgeEpochMintChange {
  * and the certIds of the kind 13 FINALITY_CONFLICT records it accepted (at
  * most one, since the first sets the sticky conflict and every later one is
  * refused).
+ *
+ * The B-23 successor v' (section 7.6) keeps a ledger and proven deposits of
+ * its own: the trailing `reserve_v2_successor_*` and
+ * `deposits_v2_successor_added` fields, unchanged and empty below V and
+ * until the migration height. `reserve_v2_*` and `deposits_v2_added` stay
+ * the launch entry v's.
  */
 struct BridgeBlockDelta {
     int height{-1};
@@ -552,6 +624,9 @@ struct BridgeBlockDelta {
     std::optional<BridgeV2Conflict> conflict_v2_before{};
     std::optional<BridgeV2Conflict> conflict_v2_after{};
     std::vector<uint256> finality_conflicts_v2_added{};
+    bridge::ReserveLedgerV2 reserve_v2_successor_before{};
+    bridge::ReserveLedgerV2 reserve_v2_successor_after{};
+    std::vector<BridgeProvenDepositV2> deposits_v2_successor_added{};
 };
 
 /**
@@ -613,6 +688,13 @@ public:
      * changed an observation or the conflict, and a burn after such a
      * change fails closed; every consensus caller passes a context whenever
      * the block carries a burn.
+     *
+     * A kind 16 VAULT_SWEEP (B-23, node changes section 7.6) passes the
+     * retired launch entry's gate but for retirement at its position in the
+     * same way (EvaluateBridgeV2SweepGate's rows on the block's state after
+     * its earlier records). It has no block-level gate: without a context
+     * it is refused, and REPLAY_LINEAGE skips its gate. Every consensus
+     * caller builds a context for it (HasBridgeV2LineageRecord).
      */
     bool VerifyBlock(const CBlock& block, int height,
                      const uint256& block_hash,
@@ -761,33 +843,65 @@ public:
     // -- Bridge V2 reserve and liveness state (node changes 7.1, 8.2-8.5) --
     // All empty below V and on every chain without a bridge V2 envelope.
 
-    //! The latest connected observation of `subject` (1-3), if any.
+    //! The latest connected observation of `subject` (1-3, 0x12 or 0x13),
+    //! if any (BridgeObservationSlotV2).
     std::optional<BridgeObservationRecordV2> LatestObservationV2(
         uint8_t subject) const;
     const BridgeObservationSlotsV2& ObservationsV2() const
     {
         return m_observations_v2;
     }
-    //! The V2 vault entry's reserve ledger (one entry at launch).
+    //! The reserve ledger of vault entry `role`: the launch entry v, or the
+    //! B-23 successor v' (all zero until a migration moves anything).
+    const bridge::ReserveLedgerV2& ReserveLedgerV2(
+        const Consensus::BridgeV2EntryRole role) const
+    {
+        return role == Consensus::BridgeV2EntryRole::SUCCESSOR
+                   ? m_reserve_v2_successor
+                   : m_reserve_v2;
+    }
+    //! The launch entry's reserve ledger.
     const bridge::ReserveLedgerV2& ReserveLedgerV2() const
     {
         return m_reserve_v2;
     }
-    //! Proven deposit amounts by Vault V2 deposit id.
+    //! Proven deposit amounts by Vault V2 deposit id, of entry `role`.
+    const bridge::ProvenDepositMapV2& ProvenDepositsV2(
+        const Consensus::BridgeV2EntryRole role) const
+    {
+        return role == Consensus::BridgeV2EntryRole::SUCCESSOR
+                   ? m_deposits_v2_successor
+                   : m_deposits_v2;
+    }
+    //! The launch entry's proven deposits.
     const bridge::ProvenDepositMapV2& ProvenDepositsV2() const
     {
         return m_deposits_v2;
     }
+    //! The sum of ProvenDepositsV2(role), kept under undo.
+    CAmount ProvenDepositsTotalV2(const Consensus::BridgeV2EntryRole role) const
+    {
+        return role == Consensus::BridgeV2EntryRole::SUCCESSOR
+                   ? m_deposits_v2_successor_total
+                   : m_deposits_v2_total;
+    }
     //! The sum of ProvenDepositsV2(), kept under undo.
     CAmount ProvenDepositsTotalV2() const { return m_deposits_v2_total; }
-    //! P_pre and P_post of the connected deposits at `cut`
+    //! P_pre and P_post of entry `role`'s connected deposits at `cut`
     //! (bridge::SplitProvenDepositsAtCut).
+    std::optional<bridge::ProvenDepositSumsV2> ProvenDepositSumsAtV2(
+        const Consensus::BridgeV2EntryRole role, const uint64_t cut) const
+    {
+        return bridge::SplitProvenDepositsAtCut(ProvenDepositsV2(role),
+                                                ProvenDepositsTotalV2(role),
+                                                {}, 0, cut);
+    }
+    //! The launch entry's P_pre and P_post at `cut`.
     std::optional<bridge::ProvenDepositSumsV2> ProvenDepositSumsAtV2(
         const uint64_t cut) const
     {
-        return bridge::SplitProvenDepositsAtCut(m_deposits_v2,
-                                                m_deposits_v2_total, {}, 0,
-                                                cut);
+        return ProvenDepositSumsAtV2(Consensus::BridgeV2EntryRole::LAUNCH,
+                                     cut);
     }
     const std::optional<BridgeV2Conflict>& ConflictV2() const
     {
@@ -800,7 +914,9 @@ public:
      * sticky conflict was set at or below `height`, else 0. The conflict is
      * sticky and first-wins, so the flag at `height` depends only on blocks
      * at or below it, and this state answers it exactly for every connected
-     * height. One vault entry exists at launch, so every conflict covers it.
+     * height. The sticky conflict is one for the bridge: the launch entry
+     * and a B-23 successor share one verifier, whose depositsClosed the flag
+     * sets, so every conflict covers both entries.
      * FinalityBridgeFlagsV2 adds the activation and fail-closed rules.
      */
     uint8_t BridgeFlagsV2AtHeight(int height) const;
@@ -809,8 +925,8 @@ public:
     std::optional<BridgeExecutionAnchor> NewestStateAnchorV2() const;
 
 private:
-    //! Unit tests seed a reserve ledger with transit, which only the
-    //! migration leaf (B-23, a later slice) creates.
+    //! Unit tests seed reserve ledgers directly (a funded ledger under a
+    //! hand-built delta that skips the deposits, or an arbitrary transit).
     friend struct BridgeStateIndexTestAccess;
 
     std::optional<BridgeLightClientSnapshot> FinalizedSnapshot(
@@ -845,6 +961,9 @@ private:
     bridge::ProvenDepositMapV2 m_deposits_v2{};
     CAmount m_deposits_v2_total{0};
     std::optional<BridgeV2Conflict> m_conflict_v2{};
+    bridge::ReserveLedgerV2 m_reserve_v2_successor{};
+    bridge::ProvenDepositMapV2 m_deposits_v2_successor{};
+    CAmount m_deposits_v2_successor_total{0};
     int m_connected_height{-1};
     uint256 m_connected_hash{};
     std::deque<BridgeBlockDelta> m_history{};

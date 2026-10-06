@@ -9,10 +9,12 @@
 // B3VaultV2.release calldata (bridge/withdrawal_v2_calldata.h). Identities
 // follow doc/design/b3-bridge-v2-node-changes.md section 3.2; leaf V2 bytes
 // are owned by doc/design/b3-bridge-v2-contracts-spec.md section 6.4. The
+// B-23 successor entry, its identities and migration predicates, and the
+// MIGRATE (sweep) leaf follow (node changes section 7.6). The
 // V2 deposit leg's receipt-proof limits and EIP-2718 receipt types
 // (bridge/proof.h, bridge/deposit.h; node changes section 4), the nullifier
-// namespace (bridge/admission.h) and V2 admission (bridge/admission_v2.h)
-// follow the identity cases. The fresh-lineage withdrawal-root hook
+// namespace (bridge/admission.h) and V2 admission (bridge/admission_v2.h),
+// by vault entry for the B-23 successor too, follow the identity cases. The fresh-lineage withdrawal-root hook
 // (node/finality_fresh_lineage.h; node changes section 7.4) closes the file.
 //
 // Vector provenance. The asset_id_v2, leaf_v2 and withdrawal_tree_v2 values
@@ -301,6 +303,33 @@ Consensus::Params ConsensusWith(const std::optional<Consensus::BridgeV2Params>& 
     out.legacy_final_hash = Fill(0x02);
     out.bridge_v2 = v2;
     return out;
+}
+
+//! The modern chain domain of every ConsensusWith() envelope.
+uint256 FixtureDomain()
+{
+    const Consensus::Params params{ConsensusWith(std::nullopt)};
+    const auto domain{modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)};
+    BOOST_REQUIRE(domain);
+    return *domain;
+}
+
+//! `p` with a valid B-23 successor under `domain` (node changes section
+//! 7.6): vault 0x46..46 on the launch entry's chain, token and caps, its own
+//! deployment block, its vault code hash unset (OI-3, as the regtest pin file
+//! leaves it), predecessor v, v's AssetId and h_m = V + 60.
+Consensus::BridgeV2Params WithSuccessor(Consensus::BridgeV2Params p, const uint256& domain)
+{
+    Consensus::BridgeV2SuccessorEntry s;
+    s.entry = p.vault;
+    s.entry.vault_address = FillAddress(0x46);
+    s.entry.vault_runtime_code_hash.reset();
+    s.entry.origin_deployment_block = p.vault.origin_deployment_block + 10;
+    s.predecessor = p.vault.vault_address;
+    s.asset_id = modern::BridgeAssetIdV2(domain, p.vault);
+    s.migration_height = p.activation_height + 60;
+    p.successor = s;
+    return p;
 }
 
 } // namespace
@@ -877,6 +906,389 @@ BOOST_AUTO_TEST_CASE(non_regtest_networks_have_no_bridge_v2)
     }
 }
 
+// ------------------------------- B-23 successor entry (node changes 7.6)
+
+BOOST_AUTO_TEST_CASE(bridge_v2_successor_params_valid_refusals)
+{
+    using P = Consensus::BridgeV2Params;
+    using Consensus::BridgeV2EntryRole;
+    const uint256 domain{FixtureDomain()};
+    const P base{WithSuccessor(RegtestV2Params(), domain)};
+    BOOST_REQUIRE(base.successor);
+    BOOST_CHECK(base.Valid());
+    BOOST_CHECK(base.SuccessorValid());
+
+    // Entry(): the launch entry always, the successor only when pinned.
+    BOOST_CHECK(base.Entry(BridgeV2EntryRole::LAUNCH) == &base.vault);
+    BOOST_CHECK(base.Entry(BridgeV2EntryRole::SUCCESSOR) == &base.successor->entry);
+    const P launch_only{RegtestV2Params()};
+    BOOST_CHECK(launch_only.Entry(BridgeV2EntryRole::LAUNCH) == &launch_only.vault);
+    BOOST_CHECK(launch_only.Entry(BridgeV2EntryRole::SUCCESSOR) == nullptr);
+    BOOST_CHECK(launch_only.SuccessorValid());
+
+    // Without a successor Valid() is the launch envelope's verdict, valid or
+    // not; a successor never repairs an invalid launch envelope.
+    P removed{base};
+    removed.successor.reset();
+    BOOST_CHECK(removed.Valid());
+    P bad_launch{base};
+    bad_launch.vault.origin_deployment_block = 0;
+    BOOST_CHECK(bad_launch.SuccessorValid());
+    BOOST_CHECK(!bad_launch.Valid());
+    bad_launch.successor.reset();
+    BOOST_CHECK(!bad_launch.Valid());
+
+    // Mutations that keep the successor valid.
+    const std::vector<std::function<void(P&)>> accepted{
+        // v' has its own MAX_DEPOSIT_RAW (at most the shared block cap) and
+        // deployment block (a lower bound is safe).
+        [](P& p) { p.successor->entry.max_deposit_raw = 1; },
+        [](P& p) { p.successor->entry.origin_deployment_block = 1; },
+        [](P& p) { p.successor->entry.vault_runtime_code_hash = Fill(0x0f); },
+        // Its code hash may equal v's (the same build at another address).
+        [](P& p) { p.vault.vault_runtime_code_hash = Fill(0x0f); p.successor->entry.vault_runtime_code_hash = Fill(0x0f); },
+        [](P& p) { p.successor->migration_height = p.activation_height + 1; },
+        [](P& p) { p.burn_height = p.activation_height + 10; p.successor->migration_height = p.burn_height; },
+        [](P& p) { p.successor->migration_height = std::numeric_limits<int32_t>::max(); },
+    };
+    for (size_t i{0}; i < accepted.size(); ++i) {
+        P p{base};
+        accepted[i](p);
+        BOOST_CHECK_MESSAGE(p.Valid(), "acceptance " << i << " refused");
+    }
+
+    // One field broken at a time.
+    const std::vector<std::function<void(P&)>> refused{
+        // v's chain, token, decimals, token code hash and proof kind
+        [](P& p) { p.successor->entry.origin_chain_id = 31'338; },
+        [](P& p) { p.successor->entry.token_address = FillAddress(0x56); },
+        [](P& p) { p.successor->entry.origin_decimals = 18; },
+        [](P& p) { p.successor->entry.asset_decimals = 8; },
+        [](P& p) { p.successor->entry.token_runtime_code_hash = Fill(0x0e); },
+        [](P& p) { p.successor->entry.proof_kind = 2; },
+        // v's caps, each alone (the epoch counters are keyed by the shared
+        // AssetId); the first keeps MAX_DEPOSIT_RAW within the lower cap
+        [](P& p) {
+            p.successor->entry.mint_caps.max_per_block -= 1;
+            p.successor->entry.max_deposit_raw = p.successor->entry.mint_caps.max_per_block;
+        },
+        [](P& p) { p.successor->entry.mint_caps.max_per_epoch += 1; },
+        [](P& p) { p.successor->entry.mint_caps.epoch_length_blocks = 40; },
+        // an incomplete entry
+        [](P& p) { p.successor->entry.vault_address = Consensus::BridgeEthAddress{}; },
+        [](P& p) { p.successor->entry.origin_deployment_block = 0; },
+        [](P& p) { p.successor->entry.max_deposit_raw = 0; },
+        [](P& p) { p.successor->entry.max_deposit_raw = p.successor->entry.mint_caps.max_per_block + 1; },
+        [](P& p) { p.successor->entry.vault_runtime_code_hash = uint256{}; },
+        // vault reuse against v, the token and the verifier
+        [](P& p) { p.successor->entry.vault_address = p.vault.vault_address; },
+        [](P& p) { p.successor->entry.vault_address = p.vault.token_address; },
+        [](P& p) { p.successor->entry.vault_address = p.verifier.address; },
+        // predecessor and AssetId
+        [](P& p) { p.successor->predecessor = FillAddress(0x47); },
+        [](P& p) { p.successor->predecessor = p.successor->entry.vault_address; },
+        [](P& p) { p.successor->predecessor = Consensus::BridgeEthAddress{}; },
+        [](P& p) { p.successor->asset_id = uint256{}; },
+        // h_m > V and h_m >= W2
+        [](P& p) { p.successor->migration_height = p.activation_height; },
+        [](P& p) { p.successor->migration_height = p.activation_height - 1; },
+        [](P& p) { p.successor->migration_height = -1; },
+        [](P& p) { p.burn_height = p.activation_height + 10; p.successor->migration_height = p.burn_height - 1; },
+    };
+    for (size_t i{0}; i < refused.size(); ++i) {
+        P p{base};
+        refused[i](p);
+        BOOST_CHECK_MESSAGE(!p.SuccessorValid(), "refusal " << i << " accepted by SuccessorValid");
+        BOOST_CHECK_MESSAGE(!p.Valid(), "refusal " << i << " accepted");
+        // Dropping the broken successor restores the launch verdict.
+        p.successor.reset();
+        BOOST_CHECK_MESSAGE(p.Valid(), "launch envelope of refusal " << i << " refused");
+    }
+
+    // On Ethereum mainnet v' needs its vault code hash (OI-3 leaves it
+    // unpinned only off mainnet); the regtest base above has none.
+    BOOST_CHECK(!base.successor->entry.vault_runtime_code_hash);
+    P mainnet{WithSuccessor(MainnetShapedV2Params(), domain)};
+    BOOST_CHECK(!mainnet.Valid());
+    mainnet.successor->entry.vault_runtime_code_hash = Fill(0x0f);
+    BOOST_CHECK(mainnet.Valid());
+    P mainnet_wrong_token{mainnet};
+    mainnet_wrong_token.successor->entry.token_address = FillAddress(0x55);
+    BOOST_CHECK(!mainnet_wrong_token.Valid());
+}
+
+BOOST_AUTO_TEST_CASE(bridge_v2_successor_ids)
+{
+    using P = Consensus::BridgeV2Params;
+    using Consensus::BridgeV2EntryRole;
+    const uint256 domain{Fill(0x5d)};
+    const P launch{RegtestV2Params()};
+    const P mainnet{MainnetShapedV2Params()};
+
+    // Without a successor every id is byte-identical to the values the code
+    // produced before successors existed (captured from the previous build).
+    BOOST_CHECK_EQUAL(EvmHex(*modern::BridgeRegistryIdV2(domain, launch)),
+                      "06c67bdb1cfaf39a00d4e46f432aaba74ff037cd20f3f0ad0dc4e33985bbee9b");
+    BOOST_CHECK_EQUAL(EvmHex(modern::BridgeVaultEntryIdV2(domain, launch.vault)),
+                      "685a6ba3c00f7d4018cdc53b210f3e9d26525f4e35eef7c094d0b51358408233");
+    BOOST_CHECK_EQUAL(EvmHex(modern::BridgeAssetIdV2(domain, launch.vault)),
+                      "3b8151a292eb0041453b523e611e50dd6b0010a62469fc98e4dc9a6932c11162");
+    BOOST_CHECK_EQUAL(EvmHex(*modern::BridgeRegistryIdV2(domain, mainnet)),
+                      "94ad4570376efc6bb918815783e4b744cf0ea6f54acf76fc241d1a27b7a57e34");
+    BOOST_CHECK_EQUAL(EvmHex(modern::BridgeVaultEntryIdV2(domain, mainnet.vault)),
+                      "5e56ae9a9e91004a5429d9dc5f00ac0c0c787c3e04781f61a321ae61330c59aa");
+    BOOST_CHECK_EQUAL(EvmHex(modern::BridgeAssetIdV2(domain, mainnet.vault)),
+                      "667c1fef8ff5ab49642d296061bcb91cd3d5d070c99321b44efa76ffdba052bd");
+    BOOST_CHECK_EQUAL(EvmHex(*modern::ConfiguredBridgeV2RegistryId(ConsensusWith(launch))),
+                      "0a6c4f32f5d42dfd01e8588616b0b954d72f984c77fbc4b9be2ffd4c3cdf561c");
+    BOOST_CHECK_EQUAL(EvmHex(*modern::ConfiguredBridgeV2RegistryId(ConsensusWith(mainnet))),
+                      "0b2fe9037f269c7527bc15fc4455868d9a4fabd955fd2f2c4b947c894c847888");
+
+    const P with{WithSuccessor(launch, domain)};
+    BOOST_REQUIRE(with.Valid());
+    const uint256 launch_id{modern::BridgeVaultEntryIdV2(domain, with.vault)};
+    const uint256 next_id{modern::BridgeVaultEntryIdV2(domain, with.successor->entry)};
+    BOOST_CHECK(next_id != launch_id);
+    // v' carries v's AssetId, not the one its own address would derive.
+    BOOST_CHECK(with.successor->asset_id == modern::BridgeAssetIdV2(domain, with.vault));
+    BOOST_CHECK(modern::BridgeAssetIdV2(domain, with.successor->entry) != with.successor->asset_id);
+
+    // A successor renames the registry approval; h_m (like V and W2) does not.
+    const auto registry_launch{modern::BridgeRegistryIdV2(domain, launch)};
+    const auto registry_with{modern::BridgeRegistryIdV2(domain, with)};
+    BOOST_REQUIRE(registry_launch && registry_with);
+    BOOST_CHECK(*registry_with != *registry_launch);
+    P moved{with};
+    moved.successor->migration_height += 100;
+    BOOST_REQUIRE(moved.Valid());
+    BOOST_CHECK(modern::BridgeRegistryIdV2(domain, moved) == registry_with);
+    P moved_v{with};
+    moved_v.activation_height += 10;
+    moved_v.burn_height += 20;
+    BOOST_REQUIRE(moved_v.Valid());
+    BOOST_CHECK(modern::BridgeRegistryIdV2(domain, moved_v) == registry_with);
+
+    // Every successor-only pin renames it.
+    const std::vector<std::function<void(P&)>> renames{
+        [](P& p) { p.successor->entry.vault_address = FillAddress(0x48); },
+        [](P& p) { p.successor->entry.vault_runtime_code_hash = Fill(0x0f); },
+        [](P& p) { p.successor->entry.origin_deployment_block += 1; },
+        [](P& p) { p.successor->entry.max_deposit_raw = 1; },
+    };
+    for (size_t i{0}; i < renames.size(); ++i) {
+        P p{with};
+        renames[i](p);
+        BOOST_REQUIRE(p.Valid());
+        const auto renamed{modern::BridgeRegistryIdV2(domain, p)};
+        BOOST_REQUIRE(renamed);
+        BOOST_CHECK_MESSAGE(*renamed != *registry_with && *renamed != *registry_launch,
+                            "successor pin " << i << " does not rename the registry");
+    }
+
+    // A successor carrying any AssetId other than v's under this domain has
+    // no registry identity, even though Valid() cannot see the domain.
+    P wrong_asset{with};
+    wrong_asset.successor->asset_id = Fill(0x77);
+    BOOST_REQUIRE(wrong_asset.Valid());
+    BOOST_CHECK(!modern::BridgeRegistryIdV2(domain, wrong_asset));
+    BOOST_CHECK(!modern::BridgeRegistryIdV2(Fill(0x5e), with));
+
+    // Configured identities on the chain's own domain.
+    const uint256 chain_domain{FixtureDomain()};
+    const P configured{WithSuccessor(RegtestV2Params(), chain_domain)};
+    const Consensus::Params params{ConsensusWith(configured)};
+    const modern::AssetId asset{modern::BridgeAssetIdV2(chain_domain, configured.vault)};
+    BOOST_CHECK(modern::ConfiguredBridgeV2AssetId(params) == asset);
+    BOOST_CHECK(modern::ConfiguredBridgeV2EntryId(params) ==
+                modern::BridgeVaultEntryIdV2(chain_domain, configured.vault));
+    BOOST_CHECK(modern::ConfiguredBridgeV2EntryId(params, BridgeV2EntryRole::LAUNCH) ==
+                modern::ConfiguredBridgeV2EntryId(params));
+    BOOST_CHECK(modern::ConfiguredBridgeV2EntryId(params, BridgeV2EntryRole::SUCCESSOR) ==
+                modern::BridgeVaultEntryIdV2(chain_domain, configured.successor->entry));
+    BOOST_CHECK(modern::ConfiguredBridgeV2RegistryId(params) ==
+                modern::BridgeRegistryIdV2(chain_domain, configured));
+    const Consensus::Params launch_params{ConsensusWith(RegtestV2Params())};
+    BOOST_CHECK(modern::ConfiguredBridgeV2EntryId(launch_params, BridgeV2EntryRole::LAUNCH));
+    BOOST_CHECK(!modern::ConfiguredBridgeV2EntryId(launch_params, BridgeV2EntryRole::SUCCESSOR));
+    // The launch ids do not change when a successor is pinned.
+    BOOST_CHECK(modern::ConfiguredBridgeV2AssetId(launch_params) == asset);
+    BOOST_CHECK(modern::ConfiguredBridgeV2EntryId(launch_params) == modern::ConfiguredBridgeV2EntryId(params));
+
+    // A mismatched AssetId fails closed: every configured V2 identity is
+    // unavailable (node changes section 3.4 assertion 6). Both plausible
+    // mistakes: the id the successor's own address derives, and v's id on another domain.
+    for (const uint256& wrong : {modern::BridgeAssetIdV2(chain_domain, configured.successor->entry),
+                                 modern::BridgeAssetIdV2(domain, configured.vault)}) {
+        P mismatched{configured};
+        mismatched.successor->asset_id = wrong;
+        BOOST_REQUIRE(mismatched.Valid());
+        const Consensus::Params bad{ConsensusWith(mismatched)};
+        BOOST_CHECK(bad.BridgeV2ConfigurationValid());
+        BOOST_CHECK(!modern::ConfiguredBridgeV2AssetId(bad));
+        BOOST_CHECK(!modern::ConfiguredBridgeV2EntryId(bad));
+        BOOST_CHECK(!modern::ConfiguredBridgeV2EntryId(bad, BridgeV2EntryRole::LAUNCH));
+        BOOST_CHECK(!modern::ConfiguredBridgeV2EntryId(bad, BridgeV2EntryRole::SUCCESSOR));
+        BOOST_CHECK(!modern::ConfiguredBridgeV2RegistryId(bad));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(bridge_v2_migration_predicates)
+{
+    using P = Consensus::BridgeV2Params;
+    using Consensus::BridgeV2EntryRole;
+    constexpr int MAX_HEIGHT{std::numeric_limits<int>::max()};
+    P v2{WithSuccessor(RegtestV2Params(), FixtureDomain())};
+    v2.burn_height = v2.activation_height + 5;
+    BOOST_REQUIRE(v2.Valid());
+    const int v{v2.activation_height};
+    const int h_m{v2.successor->migration_height};
+    BOOST_REQUIRE_GT(h_m, v2.burn_height);
+    const Consensus::Params params{ConsensusWith(v2)};
+
+    BOOST_CHECK(!params.BridgeV2MigrationActive(v - 1));
+    BOOST_CHECK(!params.BridgeV2MigrationActive(v));
+    BOOST_CHECK(!params.BridgeV2MigrationActive(h_m - 1));
+    BOOST_CHECK(params.BridgeV2RulesActive(h_m - 1));
+    BOOST_CHECK(params.BridgeV2BurnRulesActive(h_m - 1));
+    BOOST_CHECK(params.BridgeV2MigrationActive(h_m));
+    BOOST_CHECK(params.BridgeV2MigrationActive(MAX_HEIGHT));
+
+    BOOST_CHECK(modern::ActiveBridgeV2Role(params, v - 1) == BridgeV2EntryRole::LAUNCH);
+    BOOST_CHECK(modern::ActiveBridgeV2Role(params, v) == BridgeV2EntryRole::LAUNCH);
+    BOOST_CHECK(modern::ActiveBridgeV2Role(params, h_m - 1) == BridgeV2EntryRole::LAUNCH);
+    BOOST_CHECK(modern::ActiveBridgeV2Role(params, h_m) == BridgeV2EntryRole::SUCCESSOR);
+    BOOST_CHECK(modern::ActiveBridgeV2Role(params, MAX_HEIGHT) == BridgeV2EntryRole::SUCCESSOR);
+
+    const auto launch_id{modern::ConfiguredBridgeV2EntryId(params, BridgeV2EntryRole::LAUNCH)};
+    const auto next_id{modern::ConfiguredBridgeV2EntryId(params, BridgeV2EntryRole::SUCCESSOR)};
+    BOOST_REQUIRE(launch_id && next_id);
+    using R = std::optional<BridgeV2EntryRole>;
+    // Below V nothing resolves; the successor never resolves below h_m.
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(params, *launch_id, v - 1) == R{});
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(params, *next_id, v - 1) == R{});
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(params, *launch_id, v) == R{BridgeV2EntryRole::LAUNCH});
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(params, *next_id, v) == R{});
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(params, *next_id, h_m - 1) == R{});
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(params, *next_id, h_m) == R{BridgeV2EntryRole::SUCCESSOR});
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(params, *next_id, MAX_HEIGHT) == R{BridgeV2EntryRole::SUCCESSOR});
+    // The retired launch entry still resolves; each record kind decides
+    // what it may do with it (mints and sweeps yes, burns no).
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(params, *launch_id, h_m) == R{BridgeV2EntryRole::LAUNCH});
+    // No other identity is an entry.
+    for (const uint256& other : {*modern::ConfiguredBridgeV2AssetId(params),
+                                 *modern::ConfiguredBridgeV2RegistryId(params), uint256{}, Fill(0x46)}) {
+        BOOST_CHECK(modern::ResolveBridgeV2Entry(params, other, h_m) == R{});
+    }
+
+    // Without a successor nothing migrates.
+    const Consensus::Params launch_only{ConsensusWith(RegtestV2Params())};
+    BOOST_CHECK(!launch_only.BridgeV2MigrationActive(MAX_HEIGHT));
+    BOOST_CHECK(modern::ActiveBridgeV2Role(launch_only, MAX_HEIGHT) == BridgeV2EntryRole::LAUNCH);
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(launch_only, *launch_id, MAX_HEIGHT) == R{BridgeV2EntryRole::LAUNCH});
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(launch_only, *next_id, MAX_HEIGHT) == R{});
+
+    // An invalid successor invalidates the envelope: nothing activates and
+    // init.cpp's startup assertion refuses it.
+    P invalid{v2};
+    invalid.successor->migration_height = invalid.activation_height;
+    const Consensus::Params bad{ConsensusWith(invalid)};
+    BOOST_CHECK(!bad.BridgeV2ConfigurationValid());
+    BOOST_CHECK(!bad.BridgeV2RulesActive(MAX_HEIGHT));
+    BOOST_CHECK(!bad.BridgeV2MigrationActive(MAX_HEIGHT));
+    BOOST_CHECK(modern::ResolveBridgeV2Entry(bad, *launch_id, MAX_HEIGHT) == R{});
+
+    // A mismatched AssetId leaves no entry resolvable at any height.
+    P mismatched{v2};
+    mismatched.successor->asset_id = Fill(0x77);
+    const Consensus::Params unresolvable{ConsensusWith(mismatched)};
+    for (const int h : {v, h_m - 1, h_m, MAX_HEIGHT}) {
+        BOOST_CHECK(modern::ResolveBridgeV2Entry(unresolvable, *launch_id, h) == R{});
+        BOOST_CHECK(modern::ResolveBridgeV2Entry(unresolvable, *next_id, h) == R{});
+    }
+
+    // Main, test, testnet4 and signet never set bridge_v2: no migration, at
+    // any height.
+    std::vector<std::unique_ptr<const CChainParams>> chains;
+    chains.push_back(CChainParams::Main());
+    chains.push_back(CChainParams::TestNet());
+    chains.push_back(CChainParams::TestNet4());
+    chains.push_back(CChainParams::SigNet(CChainParams::SigNetOptions{}));
+    for (const auto& chain : chains) {
+        const Consensus::Params& shipped{chain->GetConsensus()};
+        BOOST_TEST_CONTEXT(chain->GetChainTypeString())
+        {
+            BOOST_CHECK(!shipped.bridge_v2);
+            for (const int h : {0, 1, v, h_m, 810'000, 820'001, MAX_HEIGHT}) {
+                BOOST_CHECK(!shipped.BridgeV2MigrationActive(h));
+                BOOST_CHECK(modern::ActiveBridgeV2Role(shipped, h) == BridgeV2EntryRole::LAUNCH);
+                BOOST_CHECK(modern::ResolveBridgeV2Entry(shipped, *launch_id, h) == R{});
+                BOOST_CHECK(modern::ResolveBridgeV2Entry(shipped, *next_id, h) == R{});
+            }
+            BOOST_CHECK(!modern::ConfiguredBridgeV2EntryId(shipped, BridgeV2EntryRole::SUCCESSOR));
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(migration_leaf_matches_shared_vector)
+{
+    // The MIGRATE leaf is an ordinary leaf V2 (contracts spec section 6.4):
+    // the shared vector read as retired vault 0x22..22 paying successor
+    // 0x33..33 reproduces leaf_v2[0] byte for byte.
+    Consensus::BridgeV2VaultEntry retired;
+    retired.origin_chain_id = 1;
+    retired.vault_address = Address(STAND_IN_VAULT);
+    retired.token_address = Address(USDT);
+    const Consensus::BridgeEthAddress successor_vault{Address(STAND_IN_RECIPIENT)};
+    const modern::BridgeWithdrawalV2 w{
+        modern::MakeVaultSweepWithdrawalV2(retired, Fill(0x11), successor_vault, 7, 1'000'000, 900'000)};
+    BOOST_CHECK(w == VectorWithdrawal(7));
+    BOOST_CHECK(w.vault == retired.vault_address);
+    BOOST_CHECK(w.token == retired.token_address);
+    BOOST_CHECK(w.recipient == successor_vault);
+    BOOST_CHECK_EQUAL(w.destination_chain_id, retired.origin_chain_id);
+
+    const auto preimage{modern::EncodeBridgeWithdrawalV2(w)};
+    BOOST_REQUIRE(preimage);
+    BOOST_CHECK_EQUAL(preimage->size(), 180U);
+    BOOST_CHECK_EQUAL(HexStr(*preimage), LEAF_V2_PREIMAGE);
+    const auto leaf{modern::BridgeWithdrawalLeafV2(w)};
+    BOOST_REQUIRE(leaf);
+    BOOST_CHECK_EQUAL(EvmHex(*leaf), LEAF_V2);
+
+    // Only v can release it: the same fields under v' are another leaf.
+    auto at_successor{w};
+    at_successor.vault = successor_vault;
+    at_successor.recipient = retired.vault_address;
+    BOOST_CHECK(modern::BridgeWithdrawalLeafV2(at_successor) != leaf);
+
+    // It takes its place in the one global V2 tree like any other leaf.
+    const auto prefix{VectorPrefix()};
+    modern::WithdrawalTreeState tree;
+    for (size_t i{0}; i < 7; ++i) BOOST_REQUIRE(modern::AppendBridgeWithdrawalV2(tree, prefix[i]));
+    BOOST_CHECK(modern::AppendBridgeWithdrawalV2(tree, w) == leaf);
+    BOOST_CHECK_EQUAL(EvmHex(tree.root), TREE_V2_ROOT);
+
+    // From an envelope: v's entry, the shared AssetId, the successor's vault.
+    const uint256 domain{FixtureDomain()};
+    const Consensus::BridgeV2Params v2{WithSuccessor(RegtestV2Params(), domain)};
+    const auto sweep{modern::MakeVaultSweepWithdrawalV2(v2.vault, v2.successor->asset_id,
+                                                        v2.successor->entry.vault_address, 3, 5'000'000, 461)};
+    BOOST_CHECK_EQUAL(sweep.withdrawal_id, 3U);
+    BOOST_CHECK_EQUAL(sweep.destination_chain_id, 31'337U);
+    BOOST_CHECK(sweep.asset_id == modern::BridgeAssetIdV2(domain, v2.vault));
+    BOOST_CHECK(sweep.vault == v2.vault.vault_address);
+    BOOST_CHECK(sweep.token == v2.vault.token_address);
+    BOOST_CHECK(sweep.recipient == FillAddress(0x46));
+    BOOST_CHECK_EQUAL(sweep.amount, 5'000'000);
+    BOOST_CHECK_EQUAL(sweep.b3_height, 461U);
+    BOOST_CHECK(modern::BridgeWithdrawalLeafV2(sweep));
+    // Nothing to sweep, or more than Vault V2 could hold, is no leaf.
+    for (const CAmount bad : {CAmount{0}, CAmount{-1}, MAX_MONEY + 1}) {
+        BOOST_CHECK(!modern::BridgeWithdrawalLeafV2(modern::MakeVaultSweepWithdrawalV2(
+            v2.vault, v2.successor->asset_id, v2.successor->entry.vault_address, 3, bad, 461)));
+    }
+}
+
 // ------------------------------------------ V2 deposit leg (node changes 4)
 
 namespace {
@@ -1330,6 +1742,180 @@ BOOST_AUTO_TEST_CASE(admit_deposit_v2)
     BOOST_CHECK(AdmitDepositV2(mainnet, asset, mainnet_deposit, v, none, mint) == R::OK);
     BOOST_CHECK(mint.nullifier == (BridgeDepositKey{1, mainnet.vault.vault_address, 17, BRIDGE_NULLIFIER_NAMESPACE_V2}));
     expect(mainnet, asset, deposit, v, none, R::ORIGIN_MISMATCH);
+}
+
+BOOST_AUTO_TEST_CASE(admit_deposit_v2_successor_entry)
+{
+    // AdmitDepositV2 by vault entry (node changes sections 4 and 7.6): the
+    // B-23 successor v' admits its own vault's deposits from h_m, under its
+    // own nullifier vault, minting v's bUSD V2 AssetId within the caps the
+    // two entries share.
+    using namespace bridge;
+    using R = BridgeAdmissionResult;
+    using Consensus::BridgeV2EntryRole;
+    const uint256 domain{FixtureDomain()};
+    const Consensus::BridgeV2Params params{WithSuccessor(RegtestV2Params(), domain)};
+    BOOST_REQUIRE(params.Valid());
+    const Consensus::BridgeV2VaultEntry& launch{*params.Entry(BridgeV2EntryRole::LAUNCH)};
+    const Consensus::BridgeV2VaultEntry& next{*params.Entry(BridgeV2EntryRole::SUCCESSOR)};
+    BOOST_REQUIRE(&launch == &params.vault);
+    BOOST_REQUIRE(&next == &params.successor->entry);
+    const modern::AssetId asset{modern::BridgeAssetIdV2(domain, params.vault)};
+    BOOST_REQUIRE(asset == params.successor->asset_id);
+    const int32_t v{params.activation_height};
+    const int32_t h_m{params.successor->migration_height};
+    BOOST_REQUIRE(h_m > v);
+    const BridgeMintBudget none{};
+    constexpr CAmount AMOUNT{1'250'000};
+
+    // The same deposit id (17) into each vault, each at its deployment block.
+    const ProvenBridgeDeposit launch_deposit{MatchingV2Deposit(params)};
+    ProvenBridgeDeposit successor_deposit{launch_deposit};
+    successor_deposit.vault_address = next.vault_address;
+    successor_deposit.execution_block_number = next.origin_deployment_block;
+    BOOST_REQUIRE(next.origin_deployment_block > launch.origin_deployment_block);
+
+    const auto expect{[&](const Consensus::BridgeV2Params& p, const Consensus::BridgeV2VaultEntry& e,
+                          const ProvenBridgeDeposit& d, const int32_t height,
+                          const BridgeMintBudget& used, const R want) {
+        BridgeMintAuthorization out;
+        out.amount = 99; // stale output must be cleared on refusal
+        const R got{AdmitDepositV2(p, e, asset, d, height, used, out)};
+        BOOST_CHECK(got == want);
+        if (want != R::OK) CheckClearedAuthorization(out);
+    }};
+
+    // From h_m a v' deposit is admitted: the shared asset, nullifier vault v'.
+    BridgeMintAuthorization successor_mint;
+    BOOST_REQUIRE(AdmitDepositV2(params, next, asset, successor_deposit, h_m, none, successor_mint) == R::OK);
+    BOOST_CHECK(successor_mint.asset == asset);
+    BOOST_CHECK_EQUAL(successor_mint.amount, AMOUNT);
+    BOOST_CHECK(successor_mint.recipient_script == RecipientV1Script(Recipient(0x80)));
+    BOOST_CHECK(successor_mint.nullifier ==
+                (BridgeDepositKey{31'337, next.vault_address, 17, BRIDGE_NULLIFIER_NAMESPACE_V2}));
+    expect(params, next, successor_deposit, std::numeric_limits<int32_t>::max(), none, R::OK);
+
+    // The retired launch entry still admits v deposits after h_m (v cannot
+    // refund; B3 mints and sweeps them), under v's nullifier: the same id in
+    // the two vaults gives two distinct nullifiers. The launch overload is
+    // exactly the launch entry.
+    BridgeMintAuthorization launch_mint;
+    BOOST_REQUIRE(AdmitDepositV2(params, launch, asset, launch_deposit, h_m, none, launch_mint) == R::OK);
+    BOOST_CHECK(launch_mint.asset == asset);
+    BOOST_CHECK(launch_mint.nullifier ==
+                (BridgeDepositKey{31'337, launch.vault_address, 17, BRIDGE_NULLIFIER_NAMESPACE_V2}));
+    BOOST_CHECK(launch_mint.nullifier != successor_mint.nullifier);
+    BridgeMintAuthorization overload_mint;
+    BOOST_REQUIRE(AdmitDepositV2(params, asset, launch_deposit, h_m, none, overload_mint) == R::OK);
+    BOOST_CHECK(overload_mint.asset == launch_mint.asset);
+    BOOST_CHECK_EQUAL(overload_mint.amount, launch_mint.amount);
+    BOOST_CHECK(overload_mint.recipient_script == launch_mint.recipient_script);
+    BOOST_CHECK(overload_mint.nullifier == launch_mint.nullifier);
+
+    // The successor entry is inactive below h_m (and below V), while the
+    // launch entry is active from V.
+    expect(params, next, successor_deposit, h_m - 1, none, R::REGISTRY_INACTIVE);
+    expect(params, next, successor_deposit, v, none, R::REGISTRY_INACTIVE);
+    expect(params, next, successor_deposit, v - 1, none, R::REGISTRY_INACTIVE);
+    expect(params, launch, launch_deposit, v, none, R::OK);
+    expect(params, launch, launch_deposit, v - 1, none, R::REGISTRY_INACTIVE);
+
+    // A launch-vault event is refused for the successor entry, and a
+    // successor-vault event for the launch entry (either overload).
+    ProvenBridgeDeposit late_launch{launch_deposit};
+    late_launch.execution_block_number = next.origin_deployment_block;
+    expect(params, next, late_launch, h_m, none, R::VAULT_MISMATCH);
+    expect(params, launch, successor_deposit, h_m, none, R::VAULT_MISMATCH);
+    BridgeMintAuthorization refused;
+    BOOST_CHECK(AdmitDepositV2(params, asset, successor_deposit, h_m, none, refused) == R::VAULT_MISMATCH);
+    CheckClearedAuthorization(refused);
+    // v' has its own deployment block (v's + 10), and v's chain and token.
+    expect(params, next, launch_deposit, h_m, none, R::BEFORE_DEPLOYMENT);
+    ProvenBridgeDeposit changed{successor_deposit};
+    --changed.execution_block_number;
+    expect(params, next, changed, h_m, none, R::BEFORE_DEPLOYMENT);
+    changed = successor_deposit;
+    changed.origin_chain_id = 1;
+    expect(params, next, changed, h_m, none, R::ORIGIN_MISMATCH);
+    changed = successor_deposit;
+    changed.event.token[0] ^= 1;
+    expect(params, next, changed, h_m, none, R::TOKEN_MISMATCH);
+    changed = successor_deposit;
+    changed.event.b3_recipient = {};
+    expect(params, next, changed, h_m, none, R::RECIPIENT_INVALID);
+    BridgeMintAuthorization unnamed;
+    BOOST_CHECK(AdmitDepositV2(params, next, uint256{}, successor_deposit, h_m, none, unnamed) ==
+                R::CONFIGURATION_INCOMPLETE);
+    CheckClearedAuthorization(unnamed);
+
+    // Caps are shared: one budget, keyed by the shared AssetId, covers both
+    // entries' mints in a block or epoch, and the caps are equal.
+    const CAmount block_cap{next.mint_caps.max_per_block};
+    BOOST_REQUIRE_EQUAL(block_cap, launch.mint_caps.max_per_block);
+    // A launch mint has used block_cap - AMOUNT of the block: a v' mint of
+    // AMOUNT fills it exactly, one more raw unit is refused for either entry.
+    expect(params, next, successor_deposit, h_m, {block_cap - AMOUNT, 0}, R::OK);
+    expect(params, next, successor_deposit, h_m, {block_cap - AMOUNT + 1, 0}, R::BLOCK_CAP_EXCEEDED);
+    expect(params, launch, launch_deposit, h_m, {block_cap - AMOUNT + 1, 0}, R::BLOCK_CAP_EXCEEDED);
+    // Widening the epoch cap needs both entries (SuccessorValid refuses one
+    // entry alone, and an invalid envelope admits nothing).
+    Consensus::BridgeV2Params lopsided{params};
+    lopsided.successor->entry.mint_caps.max_per_epoch = 2 * block_cap;
+    BOOST_CHECK(!lopsided.Valid());
+    expect(lopsided, *lopsided.Entry(BridgeV2EntryRole::SUCCESSOR), successor_deposit, h_m, none,
+           R::REGISTRY_INACTIVE);
+    Consensus::BridgeV2Params wide{params};
+    wide.vault.mint_caps.max_per_epoch = 2 * block_cap;
+    wide.successor->entry.mint_caps.max_per_epoch = 2 * block_cap;
+    BOOST_REQUIRE(wide.Valid());
+    const CAmount epoch_cap{2 * block_cap};
+    const Consensus::BridgeV2VaultEntry& wide_next{*wide.Entry(BridgeV2EntryRole::SUCCESSOR)};
+    expect(wide, wide_next, successor_deposit, h_m, {0, epoch_cap - AMOUNT}, R::OK);
+    expect(wide, wide_next, successor_deposit, h_m, {0, epoch_cap - AMOUNT + 1}, R::EPOCH_CAP_EXCEEDED);
+    expect(wide, wide.vault, launch_deposit, h_m, {0, epoch_cap - AMOUNT + 1}, R::EPOCH_CAP_EXCEEDED);
+
+    // The entry must be one of the envelope's own: an equal copy, another
+    // envelope's successor and a launch-only envelope's absent successor are
+    // refused as inactive.
+    const Consensus::BridgeV2VaultEntry copy{next};
+    expect(params, copy, successor_deposit, h_m, none, R::REGISTRY_INACTIVE);
+    expect(params, wide_next, successor_deposit, h_m, none, R::REGISTRY_INACTIVE);
+    expect(wide, next, successor_deposit, h_m, none, R::REGISTRY_INACTIVE);
+    const Consensus::BridgeV2Params launch_only{RegtestV2Params()};
+    BOOST_REQUIRE(launch_only.Valid());
+    BOOST_CHECK(!launch_only.Entry(BridgeV2EntryRole::SUCCESSOR));
+    expect(launch_only, next, successor_deposit, h_m, none, R::REGISTRY_INACTIVE);
+    expect(launch_only, launch_only.vault, launch_deposit, h_m, none, R::OK);
+
+    // Without a successor the entry form is the launch overload, result for
+    // result and output for output.
+    std::vector<ProvenBridgeDeposit> cases{launch_deposit, successor_deposit};
+    for (const auto& mutate : std::vector<std::function<void(ProvenBridgeDeposit&)>>{
+             [](ProvenBridgeDeposit& d) { --d.execution_block_number; },
+             [](ProvenBridgeDeposit& d) { d.origin_chain_id = 1; },
+             [](ProvenBridgeDeposit& d) { d.event.token[0] ^= 1; },
+             [](ProvenBridgeDeposit& d) { d.event.amount = {}; },
+             [](ProvenBridgeDeposit& d) { d.event.b3_recipient = {}; },
+         }) {
+        ProvenBridgeDeposit d{launch_deposit};
+        mutate(d);
+        cases.push_back(d);
+    }
+    for (const auto& d : cases) {
+        for (const int32_t height : {v - 1, v, h_m}) {
+            for (const BridgeMintBudget& used : {none, BridgeMintBudget{block_cap - AMOUNT + 1, 0}}) {
+                BridgeMintAuthorization by_entry;
+                BridgeMintAuthorization by_overload;
+                const R a{AdmitDepositV2(launch_only, launch_only.vault, asset, d, height, used, by_entry)};
+                const R b{AdmitDepositV2(launch_only, asset, d, height, used, by_overload)};
+                BOOST_CHECK(a == b);
+                BOOST_CHECK(by_entry.asset == by_overload.asset);
+                BOOST_CHECK_EQUAL(by_entry.amount, by_overload.amount);
+                BOOST_CHECK(by_entry.recipient_script == by_overload.recipient_script);
+                BOOST_CHECK(by_entry.nullifier == by_overload.nullifier);
+            }
+        }
+    }
 }
 
 // ---------------------------- fresh-lineage root hook (node changes 7.4)

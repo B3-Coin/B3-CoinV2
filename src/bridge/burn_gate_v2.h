@@ -231,7 +231,10 @@ inline std::optional<std::string> VerifierImpairmentV2(
  *   latest VERIFIER_E (status HALTED_CONFLICT or CANCELLED, or
  *   t_obs - lastRotationTime > set_expiry: the verifier had expired, I-4;
  *   VerifierImpairmentV2). Impairment is permanent on Ethereum, so it reads
- *   the latest observation at any age.
+ *   the latest observation at any age. A B-23 retirement (node changes
+ *   section 7.6) is no gate row: the gate is evaluated for the entry that
+ *   takes burns at the height, and a burn naming the retired entry is
+ *   refused by its record check before any gate.
  * - C2: lineage configured, bootstrapped, not broken; current and next
  *   committee counts within [min, max] and weights >= min.
  * - C3: a finalized checkpoint at most max_finality_lag_blocks below the
