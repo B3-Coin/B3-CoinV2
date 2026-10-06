@@ -406,11 +406,14 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     }
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
 
-    // From V the fresh lineage projected for nHeight judges both the V2 burn
-    // gate and kind 9 VERIFIER_E verdicts, exactly as block validation does
-    // (validation.cpp ConnectBlock). Without it no burn is READY and the
-    // preview refuses LIVE VERIFIER_E records, so both are skipped and the
-    // template stays valid.
+    // From V the fresh lineage projected for nHeight judges the V2 burn
+    // gate, kind 9 VERIFIER_E verdicts and kind 13 FINALITY_CONFLICT
+    // records, exactly as block validation does (validation.cpp
+    // ConnectBlock). Without it no burn is READY and the preview refuses LIVE
+    // VERIFIER_E and kind 13 records, so all are skipped and the template
+    // stays valid. With it the preview takes at most one kind 13 record: the
+    // first sets the sticky conflict, which refuses every later kind 13 and,
+    // at C4, every later burn of the template.
     std::optional<BridgeV2LineageContext> bridge_lineage;
     if (b3_bridge_active && b3_consensus.BridgeV2RulesActive(nHeight)) {
         std::string lineage_reason;

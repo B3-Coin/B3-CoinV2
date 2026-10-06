@@ -15,6 +15,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <utility>
 
 /**
  * Bridge V2 burn liveness gate (doc/design/b3-bridge-v2-node-changes.md
@@ -28,7 +29,8 @@
  * connection, block assembly and wallet prevalidation then apply the one
  * decision. The reserve and wind-down bounds (section 7.2 checks 2-3) are
  * per burn and live in bridge/reserve_v2.h. Invariant R and the E5 verdict
- * are judged when an observation connects, and they reach this gate as the
+ * are judged when an observation connects, and kind 13 FINALITY_CONFLICT
+ * evidence when its record connects; all three reach this gate as the
  * sticky conflict (C4).
  *
  * Rows are evaluated in the order C1, C2, C3, C4, E1, ..., E8, and the first
@@ -41,7 +43,9 @@ namespace bridge {
 /** Sticky-conflict reasons (node changes section 8.5). */
 inline constexpr uint8_t BRIDGE_V2_CONFLICT_E5{5};
 inline constexpr uint8_t BRIDGE_V2_CONFLICT_E8{8};
-//! Reserved for conflict kind 13 (FINALITY_CONFLICT), a later slice.
+//! A connected kind 13 FINALITY_CONFLICT record: a digest-V2 certificate of
+//! the lineage's current or next committee that differs from B3's canonical
+//! statement (node::JudgeFinalityConflictV2).
 inline constexpr uint8_t BRIDGE_V2_CONFLICT_KIND13{13};
 
 /** The gate row a decision names; NONE when the gate is READY. */
@@ -189,30 +193,59 @@ inline std::optional<int64_t> FirstPastLimit(const int64_t base, const int64_t l
 } // namespace burn_gate_detail
 
 /**
+ * C1's impairment of the vault entry by its latest VERIFIER_E (section 8.4
+ * row C1, section 7.5): status HALTED_CONFLICT or CANCELLED, or a signing
+ * set that had already expired at the observation (t_obs - lastRotationTime
+ * > set_expiry, contracts spec I-4). Each is permanent on Ethereum, so it is
+ * read at any age. nullopt when the observation shows no impairment. The
+ * reasons are EvaluateBurnGateV2's stable C1 strings, and
+ * node::BridgeV2DepositsClosedReason reads the same rows to report deposits
+ * closed for good. EvaluateBurnGateV2 refuses a negative time earlier
+ * ("burn gate inputs are out of range"); here a negative time skips the
+ * expiry comparison, so the subtraction cannot overflow.
+ */
+inline std::optional<std::string> VerifierImpairmentV2(
+    const BurnGateObservationV2<VerifierStateV2>& verifier,
+    const Consensus::BridgeV2GateParams& gate)
+{
+    const VerifierStateV2& v{verifier.state};
+    if (v.status == VERIFIER_STATUS_HALTED_CONFLICT) {
+        return "verifier is halted by a conflict";
+    }
+    if (v.status == VERIFIER_STATUS_CANCELLED) {
+        return "verifier is cancelled";
+    }
+    if (verifier.t_obs >= 0 && v.last_rotation_time >= 0 &&
+        verifier.t_obs - v.last_rotation_time > gate.set_expiry_seconds) {
+        return "verifier signing set had expired at the observation";
+    }
+    return std::nullopt;
+}
+
+/**
  * The gate (section 8.4 rows; the order and stable reasons below are part
  * of the interface the RPC reports):
  *
  * - C1: inputs in range (now_eff and every observation time non-negative),
  *   valid gate parameters, height >= W2, and the entry not impaired by its
  *   latest VERIFIER_E (status HALTED_CONFLICT or CANCELLED, or
- *   t_obs - lastRotationTime > set_expiry: the verifier had expired, I-4).
- *   Impairment is permanent on Ethereum, so it reads the latest observation
- *   at any age.
+ *   t_obs - lastRotationTime > set_expiry: the verifier had expired, I-4;
+ *   VerifierImpairmentV2). Impairment is permanent on Ethereum, so it reads
+ *   the latest observation at any age.
  * - C2: lineage configured, bootstrapped, not broken; current and next
  *   committee counts within [min, max] and weights >= min.
  * - C3: a finalized checkpoint at most max_finality_lag_blocks below the
  *   candidate height.
- * - C4: no sticky conflict (E5, E8 or later kind 13).
+ * - C4: no sticky conflict (E5, E8 or kind 13).
  * - E1: a VERIFIER_E observation, 0 <= now_eff - t_obs <= max age, status LIVE.
  * - E2: now_eff - lastRotationTime <= RotationAgeLimit().
  * - E3: 0 <= e_B3 - e_E <= max_epoch_gap. A new LIVE VERIFIER_E is judged
- *   only for e_E in {e_B3, e_B3 - 1} (node::VerifierVerdictV2: the fresh
- *   lineage retains only those sets), so a gap of 2 is reached only by an
- *   observation judged at gap 1 and aged by a later B3 rotation. A verifier
- *   kept two epochs behind therefore cannot refresh its observation, and the
- *   gate closes at E1 once the last one is stale (reported deviation from
- *   section 8.4's effective tolerance of 2; retaining Set'_{e-2} in the fresh
- *   lineage would restore it).
+ *   for e_E in [e_B3 - 2, e_B3] (node::VerifierVerdictV2: the fresh lineage
+ *   retains Set'_{e-2}, node::FRESH_LINEAGE_RETAINED_PAST_EPOCHS), so a
+ *   verifier two epochs behind can refresh its observation and the gate
+ *   keeps section 8.4's tolerance of 2. A max_epoch_gap above 2 does not
+ *   widen what B3 can judge: a verifier further behind cannot be observed,
+ *   and the gate closes at E1 once its last observation is stale.
  * - E4: the verdict has no SETS_MISMATCH bit and no unknown bit.
  * - E5: the verdict has no CERT_CONFLICT bit. The index also turns that bit
  *   into the sticky conflict (C4).
@@ -268,15 +301,8 @@ inline BurnGateDecisionV2 EvaluateBurnGateV2(const BurnGateInputsV2& in,
         return fail(BurnGateRowV2::C1, "bridge V2 burns are not active at this height");
     }
     if (in.verifier) {
-        const VerifierStateV2& v{in.verifier->state};
-        if (v.status == VERIFIER_STATUS_HALTED_CONFLICT) {
-            return fail(BurnGateRowV2::C1, "verifier is halted by a conflict");
-        }
-        if (v.status == VERIFIER_STATUS_CANCELLED) {
-            return fail(BurnGateRowV2::C1, "verifier is cancelled");
-        }
-        if (in.verifier->t_obs - v.last_rotation_time > gate.set_expiry_seconds) {
-            return fail(BurnGateRowV2::C1, "verifier signing set had expired at the observation");
+        if (auto impairment{VerifierImpairmentV2(*in.verifier, gate)}) {
+            return fail(BurnGateRowV2::C1, std::move(*impairment));
         }
     }
 

@@ -71,6 +71,7 @@
 #include <modern/pos_v1.h>
 #include <node/bridge_state.h>
 #include <node/finality_fresh_lineage.h>
+#include <node/finality_tracker.h>
 #include <node/miner.h>
 #include <primitives/transaction.h>
 #include <rpc/client.h>
@@ -509,23 +510,32 @@ struct BridgeV2GateFixture : public FinalityChainFixture {
         });
     }
 
-    /**
-     * The type-11 certificate the next block may carry for fresh checkpoint
-     * `checkpoint`: B3's canonical statement signed by every member of the
-     * committee the next block's projected lineage assigns to its epoch.
-     */
-    CMpaRecord FreshCertificate(const int checkpoint)
+    //! B3's canonical statement at fresh checkpoint `checkpoint`, in the
+    //! epoch the next block's projected lineage assigns to it.
+    modern::FinalizedBlockV2 CheckpointStatement(const int checkpoint)
     {
-        return WithLineage([&](const node::BridgeV2LineageContext& context, const node::BridgeStateIndex& index) {
+        const uint64_t e{WithLineage([&](const node::BridgeV2LineageContext& context, const node::BridgeStateIndex&) {
             BOOST_REQUIRE(context.fresh && context.fresh->bootstrapped);
-            const node::FreshLineageState& fresh{*context.fresh};
-            const auto e{modern::EpochOfHeight(fresh.epoch_starts, checkpoint)};
-            BOOST_REQUIRE(e);
-            const auto fb{node::ExpectedFinalizedBlockV2(*e, checkpoint, fresh, context.hash_at, Params(), &index)};
-            BOOST_REQUIRE(fb);
-            const auto set{fresh.SetForEpoch(fb->epoch)};
+            const auto epoch{modern::EpochOfHeight(context.fresh->epoch_starts, checkpoint)};
+            BOOST_REQUIRE(epoch);
+            return *epoch;
+        })};
+        return Statement(e, checkpoint);
+    }
+
+    /**
+     * `fb` signed by every member of Set'_`e` (e in {epoch, epoch - 1} of the
+     * next block's projected lineage), whatever the statement says, with
+     * that committee's size.
+     */
+    std::pair<modern::FinalityCertificate, uint32_t> CommitteeSigned(const modern::FinalizedBlockV2& fb,
+                                                                     const uint64_t e)
+    {
+        return WithLineage([&](const node::BridgeV2LineageContext& context, const node::BridgeStateIndex&) {
+            BOOST_REQUIRE(context.fresh && context.fresh->bootstrapped);
+            const auto set{context.fresh->SetForEpoch(e)};
             BOOST_REQUIRE(set);
-            const uint256 digest{modern::FinalityDigestV2(m_domain, *fb)};
+            const uint256 digest{modern::FinalityDigestV2(m_domain, fb)};
             modern::FinalityCertificate cert;
             cert.signer_bitmap.assign(modern::SignerBitmapBytes(set->Size()), 0);
             std::vector<bls::Signature> signatures;
@@ -539,13 +549,26 @@ struct BridgeV2GateFixture : public FinalityChainFixture {
             }
             BOOST_REQUIRE_EQUAL(signatures.size(), set->Size());
             cert.aggregate_sig = bls::AggregateSignatures(signatures)->Compressed();
-            CMpaRecord record;
-            record.payload_type = modern::MPA_TYPE_FINALITY_CERTIFICATE_V2;
-            record.payload_version = modern::MPA_VERSION_V1;
-            record.payload = modern::EncodeCertificatePayloadV2(*fb, cert);
-            return record;
+            return std::pair{cert, static_cast<uint32_t>(set->Size())};
         });
     }
+
+    //! The type-11 record of `fb` signed by every member of Set'_{fb.epoch}.
+    CMpaRecord CertificateRecord(const modern::FinalizedBlockV2& fb)
+    {
+        CMpaRecord record;
+        record.payload_type = modern::MPA_TYPE_FINALITY_CERTIFICATE_V2;
+        record.payload_version = modern::MPA_VERSION_V1;
+        record.payload = modern::EncodeCertificatePayloadV2(fb, CommitteeSigned(fb, fb.epoch).first);
+        return record;
+    }
+
+    /**
+     * The type-11 certificate the next block may carry for fresh checkpoint
+     * `checkpoint`: B3's canonical statement signed by every member of the
+     * committee the next block's projected lineage assigns to its epoch.
+     */
+    CMpaRecord FreshCertificate(const int checkpoint) { return CertificateRecord(CheckpointStatement(checkpoint)); }
 
     //! The certificate the next block carries so C3 never fails by accident:
     //! fresh checkpoints G + 5, G + 15, G + 25, ... at the certificate depth.
@@ -903,6 +926,15 @@ struct BridgeV2GateFixture : public FinalityChainFixture {
         const CBlockIndex* tip{Tip()};
         return m_node.chain->prevalidateBridgeTransaction(CTransaction{tx}, tip->GetBlockHash(),
                                                           tip->nHeight + 1, authorization, error);
+    }
+
+    //! node::interfaces wallet deposit status (getbridgedepositrecipient):
+    //! the result and its error text.
+    std::pair<interfaces::BridgePrevalidationResult, std::string> DepositStatus()
+    {
+        std::string error;
+        const interfaces::BridgePrevalidationResult result{m_node.chain->bridgeV2DepositStatus(error)};
+        return {result, error};
     }
 
     /**
@@ -1281,6 +1313,11 @@ BOOST_AUTO_TEST_CASE(gate_observations_and_receipt_limits_in_mempool_blocks_asse
         BOOST_CHECK(gate_info.find_value("closes_at").isNull());
         BOOST_CHECK(gate_info.find_value("temporary").isNull());
         BOOST_CHECK(gate_info.find_value("note").isNull());
+        // B3 has not closed deposits: OPEN, even though burns wait at E1.
+        const UniValue& deposits{info.find_value("deposits")};
+        BOOST_CHECK_EQUAL(deposits.find_value("status").get_str(), "OPEN");
+        BOOST_CHECK(deposits.find_value("reason").isNull());
+        BOOST_CHECK(DepositStatus().first == interfaces::BridgePrevalidationResult::VALID);
         BOOST_CHECK(info.find_value("observations").empty());
         BOOST_CHECK(info.find_value("conflict").isNull());
         const UniValue& reserve{info.find_value("reserve")};
@@ -1651,10 +1688,21 @@ BOOST_AUTO_TEST_CASE(gate_observations_and_receipt_limits_in_mempool_blocks_asse
         BOOST_CHECK_EQUAL(conflict.find_value("height").getInt<int>(), Tip()->nHeight);
         BOOST_CHECK_EQUAL(conflict.find_value("block").get_str(), Tip()->GetBlockHash().GetHex());
         BOOST_CHECK_EQUAL(conflict.find_value("anchor_block").getInt<uint64_t>(), EXEC_FIRST + 7);
+        BOOST_CHECK(conflict.find_value("evidence_cert_id_evm").isNull());
+        BOOST_CHECK(conflict.find_value("evidence_checkpoint_index").isNull());
+        BOOST_CHECK(conflict.find_value("evidence_epoch").isNull());
         const UniValue& gate_info{info.find_value("burn_gate")};
         BOOST_CHECK_EQUAL(gate_info.find_value("status").get_str(), "NOT_READY");
         BOOST_CHECK_EQUAL(gate_info.find_value("row").get_str(), "C4");
         BOOST_CHECK_EQUAL(gate_info.find_value("reason").get_str(), "sticky E8 conflict: the vault failed invariant R");
+        // The E8 conflict closes deposits for good too.
+        const std::string e8_closed{"sticky E8 conflict at height " + util::ToString(Tip()->nHeight)};
+        const UniValue& deposits{info.find_value("deposits")};
+        BOOST_CHECK_EQUAL(deposits.find_value("status").get_str(), "CLOSED_FOR_GOOD");
+        BOOST_CHECK_EQUAL(deposits.find_value("reason").get_str(), e8_closed);
+        const auto [status, error] = DepositStatus();
+        BOOST_CHECK(status == interfaces::BridgePrevalidationResult::REJECTED);
+        BOOST_CHECK_EQUAL(error, e8_closed);
         const UniValue& reserve{info.find_value("reserve")};
         BOOST_CHECK_EQUAL(reserve.find_value("invariant_r_margin").getInt<int64_t>(), 10 - DEPOSIT_AMOUNT);
         BOOST_CHECK_EQUAL(reserve.find_value("wind_down_headroom").getInt<int64_t>(), 10);
@@ -1668,6 +1716,237 @@ BOOST_AUTO_TEST_CASE(gate_observations_and_receipt_limits_in_mempool_blocks_asse
     ExpectObservationAccepted(Carrier(ObservationRecord(*m_impaired, SUBJECT_VERIFIER, EXEC_FIRST + 7)));
     ConnectCarriers({ObservationRecord(*m_impaired, SUBJECT_VERIFIER, EXEC_FIRST + 7)});
     ExpectBurnClosed("C1: verifier is cancelled");
+}
+
+BOOST_AUTO_TEST_CASE(finality_conflict_four_paths_and_bridge_flags)
+{
+    // Kind 13 FINALITY_CONFLICT (node changes section 8.5) on the real chain:
+    // a digest-V2 statement of another branch signed by the lineage's current
+    // committee is valid evidence in all four paths; its block sets the
+    // sticky conflict, which closes burns for good (C4) in all four paths and
+    // turns on bridgeFlags bit 0 (sections 7.4 and 8.5) from the first fresh
+    // checkpoint at or after that block, which B3 then signs and requires.
+    Prepare();
+    const Consensus::Params& params{Params()};
+    // Below V the wallet's deposit status is RULES_INACTIVE and
+    // getbridgev2info cannot evaluate deposits.
+    {
+        BOOST_REQUIRE(!params.BridgeV2RulesActive(Tip()->nHeight + 1));
+        const auto [status, error] = DepositStatus();
+        BOOST_CHECK(status == interfaces::BridgePrevalidationResult::RULES_INACTIVE);
+        BOOST_CHECK_EQUAL(error, "Bridge V2 rules are not active for the next block");
+        const UniValue deposits{Cli("getbridgev2info").find_value("deposits")};
+        BOOST_CHECK_EQUAL(deposits.find_value("status").get_str(), "UNAVAILABLE");
+        BOOST_CHECK_EQUAL(deposits.find_value("reason").get_str(),
+                          "bridge V2 rules are not active for the next block");
+    }
+    ProduceBlocksTo(m_G + SCALED_INTERVAL + SCALED_DEPTH);
+    BOOST_REQUIRE_EQUAL(FreshFinalizedHeight(), m_G + SCALED_INTERVAL);
+    // The conflict block c follows the four carrier blocks below. Place it
+    // where the grid checkpoint c - depth is one CertificateDue skips
+    // (G + 10k), so a delayed certificate below c can still be included
+    // after c, before the next due checkpoint c + 2 >= c.
+    constexpr int CARRIER_BLOCKS{4};
+    while ((Tip()->nHeight + 1 + CARRIER_BLOCKS - SCALED_DEPTH - m_G) % (2 * SCALED_INTERVAL) != 0) ProduceBlock();
+
+    // -- A READY gate: light client, deposit and three observations ---------
+    BuildEthereum();
+    ConnectCarriers({BootstrapRecord()});
+    ConnectCarriers({UpdateRecord(EXEC_FIRST + 1)});
+    ConnectCarriers({ObservationRecord(*m_healthy, SUBJECT_VERIFIER, EXEC_FIRST + 1)}, {DepositMint()});
+    ConnectCarriers({ObservationRecord(*m_healthy, SUBJECT_TOKEN, EXEC_FIRST + 1),
+                     ObservationRecord(*m_healthy, SUBJECT_RESERVE, EXEC_FIRST + 1)});
+    BOOST_REQUIRE(!BridgeIndex().ConflictV2());
+    ExpectBurnPassesGate();
+    BOOST_REQUIRE(GateAt(NextBlockTime()).readiness == node::BridgeBurnReadiness::READY);
+    // Deposits are open: the wallet hands out deposit instructions.
+    BOOST_CHECK(DepositStatus().first == interfaces::BridgePrevalidationResult::VALID);
+    BOOST_CHECK_EQUAL(Cli("getbridgev2info").find_value("deposits").find_value("status").get_str(), "OPEN");
+
+    const int c{Tip()->nHeight + 1};
+    const int delayed_checkpoint{c - SCALED_DEPTH};
+    const int flagged_checkpoint{delayed_checkpoint + SCALED_INTERVAL};
+    const int finalized{FreshFinalizedHeight()};
+    BOOST_REQUIRE_EQUAL(finalized, delayed_checkpoint - SCALED_INTERVAL);
+    BOOST_REQUIRE(flagged_checkpoint >= c);
+    const uint64_t e{WithLineage([](const node::BridgeV2LineageContext& context, const node::BridgeStateIndex&) {
+        return context.fresh->epoch;
+    })};
+
+    // -- Kind 13 evidence: Set'_e signs B3's epoch-e statement at the
+    // finalized checkpoint with another block hash -------------------------
+    const auto conflict_record{[&](const uint256& block_hash) {
+        modern::FinalizedBlockV2 fb{Statement(e, finalized)};
+        fb.block_hash = block_hash;
+        const auto [cert, size] = CommitteeSigned(fb, e);
+        BOOST_REQUIRE_EQUAL(size, 4U);
+        return std::pair{fb, bridge::BridgeRecordV1{bridge::BridgeRecordKindV1::FINALITY_CONFLICT,
+                                                    bridge::BridgeFinalityConflictV2{
+                                                        static_cast<uint16_t>(size),
+                                                        modern::EncodeCertificatePayloadV2(fb, cert)}}};
+    }};
+    const auto [evidence, record] = conflict_record(Keccak(std::vector<unsigned char>{'o', 't', 'h', 'e', 'r'}));
+    BOOST_REQUIRE(evidence.block_hash != Statement(e, finalized).block_hash);
+    // Wallet prevalidation (submitbridgecarrier) is VALID, the mempool takes
+    // it, a block holding it is valid and block assembly carries it. Until a
+    // block holds it, deposits stay open.
+    ExpectObservationAccepted(Carrier(record));
+    BOOST_CHECK(DepositStatus().first == interfaces::BridgePrevalidationResult::VALID);
+    // B3's own statement re-signed is not evidence, in any path.
+    {
+        const modern::FinalizedBlockV2 canonical{Statement(e, finalized)};
+        const auto [cert, size] = CommitteeSigned(canonical, e);
+        ExpectObservationRefused(
+            Carrier({bridge::BridgeRecordKindV1::FINALITY_CONFLICT,
+                     bridge::BridgeFinalityConflictV2{static_cast<uint16_t>(size),
+                                                      modern::EncodeCertificatePayloadV2(canonical, cert)}}),
+            "bridge finality conflict equals B3's canonical statement");
+    }
+
+    // Mempool entries the conflict invalidates for good, placed straight in
+    // the pool on inputs the block at c does not spend: another kind 13
+    // record, a V2 burn and the burn's child. ConnectTip evicts all three
+    // once that block sets the sticky conflict.
+    CTxMemPool& pool{*m_node.mempool};
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 0U);
+    const CMpaRecord pending_mpa{BridgeMpa(conflict_record(Keccak(std::vector<unsigned char>{'p'})).second)};
+    const auto pending_binding{modern::MakeBridgeBindingOutput(pending_mpa)};
+    BOOST_REQUIRE(pending_binding);
+    const CTransactionRef pending_conflict{MakeTransactionRef(BridgeTx(9, {*pending_binding}, pending_mpa))};
+    const CTransactionRef pending_burn{MakeTransactionRef(SyntheticBurn())};
+    CMutableTransaction burn_child;
+    burn_child.version = 2;
+    burn_child.vin = {CTxIn{COutPoint{pending_burn->GetHash(), 2}}};
+    burn_child.vout = {CTxOut{pending_burn->vout[2].nValue - 10'000, CScript() << OP_TRUE}};
+    const CTransactionRef pending_child{MakeTransactionRef(burn_child)};
+    BOOST_REQUIRE(node::HasBridgeV2FinalityConflict(*pending_conflict));
+    BOOST_REQUIRE(node::HasDecentralizedBridgeBurn(*pending_burn));
+    for (const CTransactionRef& tx : {pending_conflict, pending_burn, pending_child}) {
+        TryAddToMempool(pool, TestMemPoolEntryHelper{}.Fee(10'000).FromTx(tx));
+    }
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 3U);
+
+    // -- The block at c sets the sticky conflict ----------------------------
+    ConnectCarriers({record});
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, c);
+    BOOST_CHECK_EQUAL(WITH_LOCK(pool.cs, return pool.size()), 0U);
+    for (const CTransactionRef& tx : {pending_conflict, pending_burn, pending_child}) {
+        BOOST_CHECK(!WITH_LOCK(pool.cs, return pool.exists(tx->GetWitnessHash())));
+    }
+    const node::BridgeV2Conflict expected{bridge::BRIDGE_V2_CONFLICT_KIND13,
+                                          c,
+                                          Tip()->GetBlockHash(),
+                                          0,
+                                          modern::FinalityCertIdV2(evidence),
+                                          evidence.checkpoint_index,
+                                          e};
+    BOOST_CHECK(BridgeIndex().ConflictV2() == std::optional<node::BridgeV2Conflict>{expected});
+    const std::string kind13_closed{"sticky kind 13 conflict at height " + util::ToString(c)};
+    {
+        const UniValue info{Cli("getbridgev2info")};
+        const UniValue& conflict{info.find_value("conflict")};
+        BOOST_CHECK_EQUAL(conflict.find_value("reason").get_str(), "kind13");
+        BOOST_CHECK_EQUAL(conflict.find_value("height").getInt<int>(), c);
+        BOOST_CHECK_EQUAL(conflict.find_value("block").get_str(), Tip()->GetBlockHash().GetHex());
+        BOOST_CHECK_EQUAL(conflict.find_value("anchor_block").getInt<uint64_t>(), 0U);
+        BOOST_CHECK_EQUAL(conflict.find_value("evidence_cert_id_evm").get_str(),
+                          EvmHexOf(modern::FinalityCertIdV2(evidence)));
+        BOOST_CHECK_EQUAL(conflict.find_value("evidence_cert_id_evm").get_str(),
+                          EvmHexOf(Keccak(evidence.Encode())));
+        BOOST_CHECK_EQUAL(conflict.find_value("evidence_checkpoint_index").getInt<uint64_t>(),
+                          evidence.checkpoint_index);
+        BOOST_CHECK_EQUAL(conflict.find_value("evidence_epoch").getInt<uint64_t>(), e);
+        const UniValue& gate_info{info.find_value("burn_gate")};
+        BOOST_CHECK_EQUAL(gate_info.find_value("status").get_str(), "NOT_READY");
+        BOOST_CHECK_EQUAL(gate_info.find_value("row").get_str(), "C4");
+        BOOST_CHECK_EQUAL(gate_info.find_value("reason").get_str(), "sticky conflict: finality conflict evidence");
+        // B3 closed deposits for good: getbridgev2info says so and the
+        // wallet's deposit status refuses with the same reason.
+        const UniValue& deposits{info.find_value("deposits")};
+        BOOST_CHECK_EQUAL(deposits.find_value("status").get_str(), "CLOSED_FOR_GOOD");
+        BOOST_CHECK_EQUAL(deposits.find_value("reason").get_str(), kind13_closed);
+        const auto [status, error] = DepositStatus();
+        BOOST_CHECK(status == interfaces::BridgePrevalidationResult::REJECTED);
+        BOOST_CHECK_EQUAL(error, kind13_closed);
+    }
+
+    // -- Burns are refused for good in all four paths, and so is a second
+    // conflict of any kind ---------------------------------------------------
+    ExpectBurnClosed("C4: sticky conflict: finality conflict evidence");
+    ExpectObservationRefused(Carrier(conflict_record(Keccak(std::vector<unsigned char>{'t', 'w', 'o'})).second),
+                             "bridge V2 sticky conflict is already set");
+
+    // -- bridgeFlags: 0 below c, bit 0 from c -------------------------------
+    {
+        const node::BridgeStateIndex& index{BridgeIndex()};
+        BOOST_CHECK(node::FinalityBridgeFlagsV2(c - 1, params, &index) == std::optional<uint8_t>{0});
+        BOOST_CHECK(node::FinalityBridgeFlagsV2(c, params, &index) ==
+                    std::optional<uint8_t>{modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED});
+    }
+    // The block at c + 1 carries the delayed certificate for the skipped
+    // checkpoint c - depth < c: flags 0. The same statement with bit 0,
+    // re-signed by the committee, is refused.
+    const auto block_with = [&](const CMpaRecord& certificate) {
+        const CBlock block{BuildBlock({}, certificate)};
+        if (block.GetBlockTime() > GetTime()) SetMockTime(block.GetBlockTime());
+        return std::pair{block, Probe(block)};
+    };
+    {
+        const modern::FinalizedBlockV2 delayed{CheckpointStatement(delayed_checkpoint)};
+        BOOST_CHECK_EQUAL(delayed.bridge_flags, 0);
+        modern::FinalizedBlockV2 flagged{delayed};
+        flagged.bridge_flags = modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED;
+        Has(block_with(CertificateRecord(flagged)).second, "fresh-bridge-flags-mismatch");
+        const auto [block, probe] = block_with(CertificateRecord(delayed));
+        BOOST_REQUIRE_MESSAGE(probe.empty(), probe);
+        BOOST_REQUIRE(Submit(block));
+        BOOST_REQUIRE_EQUAL(FreshFinalizedHeight(), delayed_checkpoint);
+    }
+    // The next due checkpoint is at or after c: B3's statement carries bit 0
+    // (byte 184), the flags-0 variant re-signed by the committee is refused,
+    // and the canonical certificate connects.
+    ProduceBlocksTo(flagged_checkpoint + SCALED_DEPTH - 1);
+    BOOST_REQUIRE_EQUAL(FreshFinalizedHeight(), delayed_checkpoint);
+    BOOST_REQUIRE(CertificateDue().has_value());
+    {
+        const modern::FinalizedBlockV2 flagged{CheckpointStatement(flagged_checkpoint)};
+        BOOST_CHECK_EQUAL(flagged.bridge_flags, modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED);
+        BOOST_CHECK_EQUAL(flagged.Encode()[184], 0x01);
+        modern::FinalizedBlockV2 unflagged{flagged};
+        unflagged.bridge_flags = 0;
+        Has(block_with(CertificateRecord(unflagged)).second, "fresh-bridge-flags-mismatch");
+        ProduceBlock(); // carries CertificateDue(): B3's flagged certificate
+        BOOST_REQUIRE_EQUAL(FreshFinalizedHeight(), flagged_checkpoint);
+        const auto cert_id{WithLineage([](const node::BridgeV2LineageContext& context, const node::BridgeStateIndex&) {
+            return context.fresh->finalized->cert_id;
+        })};
+        BOOST_CHECK(cert_id == modern::FinalityCertIdV2(flagged));
+        BOOST_CHECK(cert_id != modern::FinalityCertIdV2(unflagged));
+    }
+    ExpectBurnClosed("C4: sticky conflict: finality conflict evidence");
+
+    // -- Replay: both trackers rebuilt from the blocks keep the conflict and
+    // re-verify every certificate, the flagged one included ----------------
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        const CBlockIndex& tip{*chainstate.m_chain.Tip()};
+        node::BridgeStateTracker& bridge{chainstate.ModernBridgeState()};
+        bridge.MarkDirty();
+        BOOST_REQUIRE(bridge.Sync(chainstate.m_chain, chainstate.m_blockman, params, tip));
+        BOOST_CHECK(bridge.Index().ConflictV2() == std::optional<node::BridgeV2Conflict>{expected});
+        node::FinalityTracker& finality{chainstate.ModernFinality()};
+        finality.MarkDirty();
+        BOOST_REQUIRE(finality.Sync(chainstate.m_chain, chainstate.m_blockman, params, tip, &bridge.Index()));
+        BOOST_REQUIRE(finality.Current().fresh && finality.Current().fresh->finalized);
+        BOOST_CHECK_EQUAL(finality.Current().fresh->finalized->height, flagged_checkpoint);
+    }
+    ExpectBurnClosed("C4: sticky conflict: finality conflict evidence");
+    {
+        const auto [status, error] = DepositStatus();
+        BOOST_CHECK(status == interfaces::BridgePrevalidationResult::REJECTED);
+        BOOST_CHECK_EQUAL(error, kind13_closed);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

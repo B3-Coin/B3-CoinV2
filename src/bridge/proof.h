@@ -8,6 +8,7 @@
 #include <bridge/deposit.h>
 #include <bridge/eth_light_client.h>
 #include <consensus/consensus.h>
+#include <modern/finality_v2_payload.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
 
@@ -83,9 +84,10 @@ static_assert(MAX_BRIDGE_MINT_WIRE_SIZE <= MAX_BRIDGE_RECORD_SIZE);
  *
  * The limit set is the codec's height selector, so it also carries the
  * record set: `v2_kinds` admits the bridge V2 record kinds (kind 9,
- * ETH_STATE_OBSERVATION). Consensus passes the V2 set from V only, so a
- * kind 9 record is malformed below V and on every network without bridge_v2,
- * exactly as an unknown kind was before.
+ * ETH_STATE_OBSERVATION, and kind 13, FINALITY_CONFLICT). Consensus passes
+ * the V2 set from V only, so a kind 9 or kind 13 record is malformed below V
+ * and on every network without bridge_v2, exactly as an unknown kind was
+ * before.
  */
 struct BridgeMptLimits {
     size_t max_node_size;
@@ -101,7 +103,8 @@ inline constexpr BridgeMptLimits BRIDGE_MPT_LIMITS_V1{
     /*v2_kinds=*/false};
 //! Bridge V2 (doc/design/b3-bridge-v2-node-changes.md section 4): a terminal
 //! receipt node up to 8,192 bytes and a receipt proof up to 16 KiB; every
-//! other node keeps the 1,024-byte limit. Kind 9 (section 8.2) is valid.
+//! other node keeps the 1,024-byte limit. Kinds 9 (section 8.2) and 13
+//! (section 8.5) are valid.
 inline constexpr size_t MAX_BRIDGE_TERMINAL_RECEIPT_NODE_SIZE_V2{8'192};
 inline constexpr size_t MAX_BRIDGE_MPT_BYTES_V2{16'384};
 inline constexpr BridgeMptLimits BRIDGE_MPT_LIMITS_V2{
@@ -129,6 +132,9 @@ enum class BridgeRecordKindV1 : uint8_t {
     //! Bridge V2 only (node changes section 8.2): decoded under the V2
     //! record set (BridgeMptLimits::v2_kinds), malformed otherwise.
     ETH_STATE_OBSERVATION = 9,
+    //! Bridge V2 only (node changes section 8.5): decoded under the V2
+    //! record set (BridgeMptLimits::v2_kinds), malformed otherwise.
+    FINALITY_CONFLICT = 13,
 };
 
 struct BridgeBootstrapV1 {
@@ -273,10 +279,42 @@ struct BridgeEthStateObservationV2 {
                            const BridgeEthStateObservationV2&) = default;
 };
 
+/**
+ * Kind 13 body (node changes section 8.5): one digest-V2 quorum certificate
+ * of the fresh finality lineage, offered as evidence that the lineage's
+ * committee signed a statement other than B3's canonical one. The wire is
+ *
+ *   0x0d || 0x00 || u16 n || FinalizedBlockV2(185) || bitmap(ceil(n/8)) || aggSig(96)
+ *
+ * with n the signing committee's size (1..MAX_FINALITY_SET, big-endian) and
+ * the certificate exactly modern::EncodeCertificatePayloadV2's bytes: 286
+ * bytes at n = 4, at most 293 within the bridge bound of 64 validators and
+ * at most 1,309 at n = 8,192. The codec checks only the shape
+ * (DecodeCertificatePayloadV2: n in range, exact length, zero bitmap
+ * padding, bridge-flag bits limited to bit 0); which committee signed, the
+ * signature and the difference from B3's statement are consensus rules.
+ */
+struct BridgeFinalityConflictV2 {
+    uint16_t validator_count{0};              // n of the signing committee, 1..MAX_FINALITY_SET
+    std::vector<unsigned char> certificate{}; // modern certificate payload V2: FinalizedBlockV2(185) || bitmap(ceil(n/8)) || aggSig(96)
+
+    friend bool operator==(const BridgeFinalityConflictV2&,
+                           const BridgeFinalityConflictV2&) = default;
+
+    std::optional<std::pair<modern::FinalizedBlockV2, modern::FinalityCertificate>> Decode() const
+    {
+        return modern::DecodeCertificatePayloadV2(certificate, validator_count);
+    }
+};
+static_assert(modern::MAX_FINALITY_SET <= 0xffff);
+static_assert(4 + modern::FINALITY_CERTIFICATE_V2_RECORD_MAX <=
+              MAX_BRIDGE_RECORD_SIZE);
+
 using BridgeRecordPayloadV1 =
     std::variant<BridgeBootstrapV1, BridgeUpdateV1, BridgeMintV1,
                  BridgeExecutionBackfillV1, BridgeManagedWithdrawalV1,
-                 BridgeBurnV1, BridgeEthStateObservationV2>;
+                 BridgeBurnV1, BridgeEthStateObservationV2,
+                 BridgeFinalityConflictV2>;
 
 struct BridgeRecordV1 {
     BridgeRecordKindV1 kind{BridgeRecordKindV1::BOOTSTRAP};
@@ -801,10 +839,10 @@ inline std::optional<ssz::SyncCommittee> DecodeBridgeSyncCommitteeV1(
 
 /**
  * Canonical encode. `mpt_limits` applies only to a MINT's receipt proof and
- * to whether kind 9 exists; the V1 default keeps every pre-V2 caller
+ * to whether kinds 9 and 13 exist; the V1 default keeps every pre-V2 caller
  * byte-identical. Consensus selects the limit set by height (V2 from the
  * bridge V2 activation height), so a record that only fits the V2 limits,
- * or any kind 9 record, is malformed below that height.
+ * or any kind 9 or kind 13 record, is malformed below that height.
  */
 inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
     const BridgeRecordV1& record,
@@ -903,6 +941,16 @@ inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
         if (const auto* value{
                 std::get_if<BridgeEthStateObservationV2>(&record.payload)}) {
             valid = EncodeEthStateObservation(writer, *value);
+        }
+        break;
+    case BridgeRecordKindV1::FINALITY_CONFLICT:
+        if (!mpt_limits.v2_kinds) break;
+        if (const auto* value{
+                std::get_if<BridgeFinalityConflictV2>(&record.payload)}) {
+            if (!value->Decode()) break;
+            writer.U16(value->validator_count);
+            writer.Bytes(value->certificate);
+            valid = true;
         }
         break;
     }
@@ -1012,6 +1060,17 @@ inline std::optional<BridgeRecordV1> DecodeBridgeRecordV1(
         BridgeEthStateObservationV2 value;
         if (!mpt_limits.v2_kinds ||
             !DecodeEthStateObservation(reader, value) || !reader.Empty()) {
+            return std::nullopt;
+        }
+        return BridgeRecordV1{kind, std::move(value)};
+    }
+    case BridgeRecordKindV1::FINALITY_CONFLICT: {
+        // The certificate is everything after n; its exact length is a
+        // function of n, so no length prefix travels.
+        BridgeFinalityConflictV2 value;
+        if (!mpt_limits.v2_kinds || !reader.U16(value.validator_count) ||
+            !reader.Vector(reader.Remaining(), value.certificate) ||
+            !reader.Empty() || !value.Decode()) {
             return std::nullopt;
         }
         return BridgeRecordV1{kind, std::move(value)};

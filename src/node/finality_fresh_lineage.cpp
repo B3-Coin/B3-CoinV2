@@ -102,11 +102,32 @@ std::optional<uint32_t> FreshLineageState::SetSize(const uint64_t e) const
     return static_cast<uint32_t>(set->Size());
 }
 
+static_assert(FRESH_LINEAGE_RETAINED_PAST_EPOCHS == 2, "the state retains previous (e-1) and previous2 (e-2)");
+
+std::optional<uint256> FreshLineageState::SetHashForEpoch(const uint64_t k) const
+{
+    if (!bootstrapped) return std::nullopt;
+    // Written without epoch + 1 / epoch - 2, which could wrap.
+    std::shared_ptr<const FreshLineageSet> set;
+    if (k == epoch) {
+        set = current;
+    } else if (k > epoch && k - epoch == 1) {
+        set = next;
+    } else if (k < epoch && epoch - k == 1) {
+        set = previous;
+    } else if (k < epoch && epoch - k == 2) {
+        set = previous2;
+    }
+    if (!set) return std::nullopt;
+    return set->set_hash;
+}
+
 std::optional<uint256> FreshLineageState::SuccessorHashForEpoch(const uint64_t e) const
 {
     if (!bootstrapped) return std::nullopt;
     if (e == epoch && next) return next->set_hash;
     if (epoch >= 1 && e == epoch - 1 && previous && current) return current->set_hash;
+    if (epoch >= 2 && e == epoch - 2 && previous2 && previous) return previous->set_hash;
     return std::nullopt;
 }
 
@@ -146,11 +167,13 @@ std::optional<uint256> FreshLineageWithdrawalRoot(const int height, const Consen
     return FinalityWithdrawalRootV2(height, params, bridge_index);
 }
 
-std::optional<uint8_t> FreshLineageBridgeFlags(const int /*height*/, const Consensus::Params& /*params*/,
-                                               const BridgeStateIndex* /*bridge_index*/)
+std::optional<uint8_t> FreshLineageBridgeFlags(const int height, const Consensus::Params& params,
+                                               const BridgeStateIndex* bridge_index)
 {
-    // No sticky FINALITY_CONFLICT (conflict kind 13) exists in this slice.
-    return uint8_t{0};
+    // 0 below V (and wherever bridge_v2 is unset), bit 0 from the first
+    // checkpoint at or after the sticky conflict; nullopt when the index
+    // cannot answer (header comment).
+    return FinalityBridgeFlagsV2(height, params, bridge_index);
 }
 
 // --------------------------------------------------------------- history
@@ -211,6 +234,7 @@ void ProjectFreshLineage(std::optional<FreshLineageState>& fresh, const int heig
 
     // Handover-gated rotation (V1's rule, V1's E).
     if (s.handover_certified && height >= s.epoch_starts.back() + E) {
+        s.previous2 = s.previous; // Set'_{e-2}, for the bridge V2 verifier judgement
         s.previous = s.current;
         s.current = s.next;
         s.epoch += 1;

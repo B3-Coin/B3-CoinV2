@@ -71,6 +71,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -136,7 +137,8 @@ bool SameFreshState(const std::optional<FreshLineageState>& a, const std::option
     return a->bootstrapped == b->bootstrapped && a->genesis_height == b->genesis_height &&
            a->genesis_block_hash == b->genesis_block_hash && a->lineage_id == b->lineage_id &&
            a->epoch == b->epoch && a->epoch_starts == b->epoch_starts &&
-           SetHashOf(a->genesis) == SetHashOf(b->genesis) && SetHashOf(a->previous) == SetHashOf(b->previous) &&
+           SetHashOf(a->genesis) == SetHashOf(b->genesis) && SetHashOf(a->previous2) == SetHashOf(b->previous2) &&
+           SetHashOf(a->previous) == SetHashOf(b->previous) &&
            SetHashOf(a->current) == SetHashOf(b->current) && SetHashOf(a->next) == SetHashOf(b->next) &&
            a->handover_certified == b->handover_certified && a->lineage_broken == b->lineage_broken &&
            a->finalized == b->finalized && a->history == b->history;
@@ -708,9 +710,13 @@ BOOST_FIXTURE_TEST_CASE(unbootstrapped_lineage_fails_closed, BasicTestingSetup)
     BOOST_CHECK_EQUAL(error, "fresh-cert-inactive");
     BOOST_CHECK(!node::MakeLineageV2View(no_knob, fresh).configured);
 
-    // The bridge hooks of this slice: zero withdrawal root, no flags.
+    // The bridge hooks without a bridge V2 envelope (this chain has none, as
+    // mainnet and testnet): zero withdrawal root and flags 0 even without an
+    // index. From V they follow node::FinalityWithdrawalRootV2 and
+    // node::FinalityBridgeFlagsV2 (bridge_state_tests).
+    BOOST_REQUIRE(!params.bridge_v2);
     BOOST_CHECK(*node::FreshLineageWithdrawalRoot(1'000, params, nullptr) == uint256{});
-    BOOST_CHECK_EQUAL(*node::FreshLineageBridgeFlags(1'000, params, nullptr), 0);
+    BOOST_CHECK(node::FreshLineageBridgeFlags(1'000, params, nullptr) == std::optional<uint8_t>{0});
 }
 
 // ------------------------------------------------------------ chain cases
@@ -785,7 +791,12 @@ BOOST_FIXTURE_TEST_CASE(bootstrap_carrier_rules_rebuild_and_reorg, FreshLineageF
         BOOST_CHECK_EQUAL(fresh->lineage_id.GetHex(), lineage_id.GetHex());
         BOOST_CHECK_EQUAL(fresh->epoch, 0U);
         BOOST_CHECK(fresh->epoch_starts == std::vector<int>{Rf});
-        BOOST_REQUIRE(fresh->genesis && fresh->current && fresh->next && !fresh->previous);
+        BOOST_REQUIRE(fresh->genesis && fresh->current && fresh->next && !fresh->previous && !fresh->previous2);
+        // Epoch 0 retains Set'_0 and Set'_1 only.
+        BOOST_CHECK(fresh->SetHashForEpoch(0) == std::optional<uint256>{set0_hash});
+        BOOST_CHECK(fresh->SetHashForEpoch(1) == std::optional<uint256>{fresh->next->set_hash});
+        BOOST_CHECK(!fresh->SetHashForEpoch(2));
+        BOOST_CHECK(!fresh->SetHashForEpoch(std::numeric_limits<uint64_t>::max()));
         BOOST_CHECK(fresh->current->header == set0_header);
         BOOST_CHECK_EQUAL(fresh->current->header.ruleset_version, modern::FINALITY_RULESET_V2);
         BOOST_CHECK_EQUAL(fresh->current->set_hash.GetHex(), set0_hash.GetHex());
@@ -1012,6 +1023,7 @@ BOOST_FIXTURE_TEST_CASE(rotation_carry_over_break_and_v1_independence, FreshLine
         BOOST_REQUIRE(fresh.has_value());
         BOOST_CHECK_EQUAL(fresh->epoch, 1U);
         BOOST_CHECK(fresh->epoch_starts == (std::vector<int>{Rf, start1}));
+        BOOST_CHECK(!fresh->previous2); // no Set'_{-1}
         BOOST_CHECK_EQUAL(SetHashOf(fresh->previous).GetHex(), set0->set_hash.GetHex());
         BOOST_CHECK_EQUAL(SetHashOf(fresh->current).GetHex(), set1->set_hash.GetHex());
         BOOST_REQUIRE(fresh->next);
@@ -1029,8 +1041,9 @@ BOOST_FIXTURE_TEST_CASE(rotation_carry_over_break_and_v1_independence, FreshLine
     const int cp0{G + 30};
     BOOST_REQUIRE_EQUAL(cp0, start1 - 1);
     ProduceTo(cp0 + SCALED_DEPTH - 1, m_vk_a);
+    const FinalizedBlockV2 carried_cp0{FreshFbForNext(cp0)};
     {
-        const auto fb{FreshFbForNext(cp0)};
+        const auto& fb{carried_cp0};
         BOOST_CHECK_EQUAL(fb.epoch, 0U);
         BOOST_CHECK_EQUAL(fb.checkpoint_index, 6U);
         BOOST_CHECK(fb.validator_set_hash == set1->set_hash); // Set'_0 attests Set'_1
@@ -1075,9 +1088,33 @@ BOOST_FIXTURE_TEST_CASE(rotation_carry_over_break_and_v1_independence, FreshLine
         const auto fresh{Fresh()};
         BOOST_CHECK_EQUAL(fresh->epoch, 2U);
         BOOST_CHECK(fresh->epoch_starts == (std::vector<int>{Rf, start1, start2}));
+        // Set'_0 stays retained as Set'_{e-2} for the bridge V2 verifier
+        // judgement, while the certificate paths keep {e, e-1}.
+        BOOST_CHECK_EQUAL(SetHashOf(fresh->previous2).GetHex(), set0->set_hash.GetHex());
         BOOST_CHECK_EQUAL(SetHashOf(fresh->previous).GetHex(), set1->set_hash.GetHex());
         BOOST_CHECK_EQUAL(SetHashOf(fresh->current).GetHex(), set2->set_hash.GetHex());
         BOOST_REQUIRE(fresh->next);
+        BOOST_CHECK(!fresh->SetForEpoch(0));
+        BOOST_CHECK(!fresh->SetSize(0));
+        BOOST_CHECK_EQUAL(SetHashOf(fresh->SetForEpoch(1)).GetHex(), set1->set_hash.GetHex());
+        BOOST_CHECK_EQUAL(SetHashOf(fresh->SetForEpoch(2)).GetHex(), set2->set_hash.GetHex());
+        BOOST_CHECK(!fresh->SetForEpoch(3));
+        BOOST_CHECK(fresh->SuccessorHashForEpoch(0) == std::optional<uint256>{set1->set_hash});
+        BOOST_CHECK(fresh->SuccessorHashForEpoch(1) == std::optional<uint256>{set2->set_hash});
+        BOOST_CHECK(fresh->SuccessorHashForEpoch(2) == std::optional<uint256>{fresh->next->set_hash});
+        BOOST_CHECK(!fresh->SuccessorHashForEpoch(3));
+        BOOST_CHECK(fresh->SetHashForEpoch(0) == std::optional<uint256>{set0->set_hash});
+        BOOST_CHECK(fresh->SetHashForEpoch(1) == std::optional<uint256>{set1->set_hash});
+        BOOST_CHECK(fresh->SetHashForEpoch(2) == std::optional<uint256>{set2->set_hash});
+        BOOST_CHECK(fresh->SetHashForEpoch(3) == std::optional<uint256>{fresh->next->set_hash});
+        BOOST_CHECK(!fresh->SetHashForEpoch(4));
+        // B3 still forms the canonical epoch-0 statement (E5 for a verifier
+        // two epochs behind): exactly the delayed certificate carried above.
+        const auto epoch0{node::ExpectedFinalizedBlockV2(0, cp0, *fresh, ChainHashFn(),
+                                                         m_node.chainman->GetConsensus(), nullptr)};
+        BOOST_REQUIRE(epoch0.has_value());
+        BOOST_CHECK(*epoch0 == carried_cp0);
+        BOOST_CHECK(modern::FinalityCertIdV2(*epoch0) == modern::FinalityCertIdV2(carried_cp0));
         BOOST_CHECK_EQUAL(fresh->next->Size(), 2U);
         BOOST_CHECK(fresh->next->members == set2->members); // the same members, shared
         BOOST_CHECK(fresh->next->header == modern::RulesetV2Header(set2->members->Header(), 3));
@@ -1085,6 +1122,9 @@ BOOST_FIXTURE_TEST_CASE(rotation_carry_over_break_and_v1_independence, FreshLine
             BOOST_CHECK(fresh->epoch_starts[i] > fresh->epoch_starts[i - 1]);
         }
     }
+    // The carrier still serves {e, e-1} only: an epoch-0 certificate is
+    // refused by the matcher although Set'_0 is retained.
+    CheckRejected({FreshRecordForNext(carried_cp0)}, "fresh-cert-unknown-epoch-set");
 
     // No fresh epoch-2 handover: the fresh lineage breaks at start2 + E +
     // extension while V1 (handover certified, epoch 3 from M+90) continues.

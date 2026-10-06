@@ -20,6 +20,10 @@
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
 #include <modern/bridge_v2.h>
+#include <modern/chain_domain.h>
+#include <modern/finality_certificate.h>
+#include <modern/finality_schedule.h>
+#include <modern/finality_v2.h>
 #include <node/blockstorage.h>
 #include <node/finality_fresh_lineage.h>
 #include <node/finality_tracker.h>
@@ -1391,6 +1395,61 @@ bool VerifyEthStateObservation(
     return true;
 }
 
+/**
+ * Kind 13 FINALITY_CONFLICT from V (node changes section 8.5): valid only
+ * while no sticky conflict is set (the first conflict wins, whether E5, E8
+ * or kind 13, so a block accepts at most one kind 13 record), and only with
+ * a lineage context. A full context judges it (JudgeFinalityConflictV2:
+ * current or next committee, a valid quorum certificate, a statement other
+ * than B3's). REPLAY_LINEAGE trusts it, as it trusts recorded verdicts: the
+ * block was judged with a full context when it first connected.
+ *
+ * The record sets the sticky conflict (reason kind 13, anchor_block 0, the
+ * evidence certId, checkpoint index and epoch), so the burn gate refuses
+ * every later burn of the same block at C4 and every burn after it.
+ */
+bool VerifyFinalityConflictV2(
+    const bridge::BridgeFinalityConflictV2& record, const int height,
+    const uint256& block_hash, const Consensus::Params& params,
+    const BridgeV2LineageContext* lineage, const BridgeStateIndex& index,
+    ScratchState& state, BridgeBlockDelta& delta, std::string& error)
+{
+    if (!params.BridgeV2RulesActive(height) || !delta.v2_store) {
+        error = "bridge V2 conflict records are not active";
+        return false;
+    }
+    if (state.conflict_v2) {
+        error = "bridge V2 sticky conflict is already set";
+        return false;
+    }
+    if (lineage == nullptr) {
+        error = "bridge finality conflict cannot be judged here";
+        return false;
+    }
+    std::optional<modern::FinalizedBlockV2> evidence;
+    if (lineage->trust_recorded_verdicts) {
+        const auto decoded{record.Decode()};
+        if (!decoded) {
+            error = "bridge finality conflict certificate is malformed";
+            return false;
+        }
+        evidence = decoded->first;
+    } else {
+        evidence = JudgeFinalityConflictV2(record, *lineage, params, index,
+                                           height, error);
+        if (!evidence) return false;
+    }
+    const uint256 cert_id{modern::FinalityCertIdV2(*evidence)};
+    state.conflict_v2 = BridgeV2Conflict{
+        bridge::BRIDGE_V2_CONFLICT_KIND13, height, block_hash,
+        /*anchor_block=*/0, cert_id, evidence->checkpoint_index,
+        evidence->epoch};
+    state.gate_inputs_changed = true;
+    delta.conflict_v2_after = state.conflict_v2;
+    delta.finality_conflicts_v2_added.push_back(cert_id);
+    return true;
+}
+
 bool VerifyBridgeTransaction(
     const CTransaction& tx, const int height, const int64_t candidate_time,
     const uint256& block_hash, const Consensus::Params& params,
@@ -1496,6 +1555,11 @@ bool VerifyBridgeTransaction(
                 return VerifyEthStateObservation(
                     payload, height, candidate_time, block_hash, params,
                     lineage, index, state, delta, error);
+            } else if constexpr (
+                std::is_same_v<T, bridge::BridgeFinalityConflictV2>) {
+                return VerifyFinalityConflictV2(payload, height, block_hash,
+                                                params, lineage, index, state,
+                                                delta, error);
             }
             error = "bridge record kind is unsupported";
             return false;
@@ -1554,26 +1618,40 @@ bool CheckBridgeBurnReadiness(const CBlock& block,
     return false;
 }
 
-bool HasBridgeV2Observation(const CTransaction& tx)
+//! Whether `tx` carries a bridge record, decoded under the bridge V2 record
+//! set, of one of the payload types `Kinds`.
+template <typename... Kinds>
+static bool HasBridgeV2Record(const CTransaction& tx)
 {
     for (const CMpaRecord& record : tx.mpa) {
         if (record.payload_type != bridge::BRIDGE_MPA_TYPE) continue;
         const auto decoded{bridge::DecodeBridgeMpaRecordV1(
             record, bridge::BRIDGE_MPT_LIMITS_V2)};
-        if (decoded && std::holds_alternative<bridge::BridgeEthStateObservationV2>(
-                           decoded->payload)) {
+        if (decoded &&
+            (std::holds_alternative<Kinds>(decoded->payload) || ...)) {
             return true;
         }
     }
     return false;
 }
 
-bool HasBridgeV2Observation(const CBlock& block)
+bool HasBridgeV2LineageRecord(const CTransaction& tx)
+{
+    return HasBridgeV2Record<bridge::BridgeEthStateObservationV2,
+                             bridge::BridgeFinalityConflictV2>(tx);
+}
+
+bool HasBridgeV2LineageRecord(const CBlock& block)
 {
     return std::any_of(
         block.vtx.begin(), block.vtx.end(), [](const CTransactionRef& tx) {
-            return tx && HasBridgeV2Observation(*tx);
+            return tx && HasBridgeV2LineageRecord(*tx);
         });
+}
+
+bool HasBridgeV2FinalityConflict(const CTransaction& tx)
+{
+    return HasBridgeV2Record<bridge::BridgeFinalityConflictV2>(tx);
 }
 
 const BridgeV2LineageContext REPLAY_LINEAGE{
@@ -1626,32 +1704,40 @@ std::optional<uint8_t> VerifierVerdictV2(
     if (fresh.lineage_broken) {
         return refuse("bridge observation verdict cannot be judged on a broken fresh lineage");
     }
+    // E3's window (node changes sections 8.4 and 8.6): the lineage retains
+    // Set'_{e-2} .. Set'_{e+1}, so a verifier up to two epochs behind is
+    // judged. A wider max_epoch_gap does not widen it.
     const uint64_t e_b3{fresh.epoch};
     const uint64_t e_e{observed.current_epoch};
-    if (e_e != e_b3 && !(e_b3 >= 1 && e_e == e_b3 - 1)) {
-        return refuse("bridge observation verifier epoch is neither the lineage epoch nor the one before it");
+    if (e_e > e_b3 || e_b3 - e_e > FRESH_LINEAGE_RETAINED_PAST_EPOCHS) {
+        return refuse("bridge observation verifier epoch is outside the lineage's retained epochs (e_B3 - 2 .. e_B3)");
     }
     if (height < 1 ||
         observed.latest_height > static_cast<uint64_t>(height - 1)) {
         return refuse("bridge observation verifier checkpoint is above the parent block");
     }
-    const auto set{fresh.SetForEpoch(e_e)};
-    const auto successor_hash{fresh.SuccessorHashForEpoch(e_e)};
-    if (!set || !successor_hash) {
+    // e_e + 1 cannot wrap: e_e <= e_b3, a count of rotations.
+    const auto set_hash{fresh.SetHashForEpoch(e_e)};
+    const auto successor_hash{fresh.SetHashForEpoch(e_e + 1)};
+    if (!set_hash || !successor_hash) {
         return refuse("bridge observation verdict lacks the lineage sets of the verifier epoch");
     }
 
     uint8_t verdict{0};
     // E4: the verifier's pinned pair must be Set'_{e_E} and Set'_{e_E+1}.
-    if (observed.current_set_hash != set->set_hash ||
+    if (observed.current_set_hash != *set_hash ||
         observed.next_set_hash != *successor_hash) {
         verdict |= bridge::ETH_OBSERVATION_VERDICT_SETS_MISMATCH;
     }
     // E5: Latest must sit on the checkpoint grid at its index, and its
-    // certId must be B3's canonical epoch-e_E statement there. The verifier
+    // certId must be CertIdAt(index), B3's own certId there. The verifier
     // refuses index 0 (initialize and submitCertificate), so index 0 while
     // LIVE is a conflict too. After any accepted statement the verifier's
-    // currentEpoch is that statement's epoch, so e_E is its epoch.
+    // currentEpoch is that statement's epoch, so e_E is its epoch. B3 signs
+    // a checkpoint only in the epoch of its height (the signer and
+    // JudgeFinalityConflictV2 check 9 apply the same rule), so a Latest whose
+    // epoch e_E is not the epoch of Latest.height is not B3's certificate,
+    // whatever its other fields.
     const uint64_t interval{
         static_cast<uint64_t>(params.modern_pos->checkpoint_interval)};
     const bool on_grid{
@@ -1663,18 +1749,154 @@ std::optional<uint8_t> VerifierVerdictV2(
                 interval == observed.latest_index};
     if (!on_grid) {
         verdict |= bridge::ETH_OBSERVATION_VERDICT_CERT_CONFLICT;
-    } else {
-        const auto canonical{ExpectedFinalizedBlockV2(
-            e_e, static_cast<int>(observed.latest_height), fresh,
-            lineage.hash_at, params, &index)};
-        if (!canonical) {
-            return refuse("bridge observation verdict: B3 cannot form its statement at the verifier's latest checkpoint");
-        }
-        if (modern::FinalityCertIdV2(*canonical) != observed.latest_cert_id) {
-            verdict |= bridge::ETH_OBSERVATION_VERDICT_CERT_CONFLICT;
-        }
+        return verdict;
+    }
+    // Latest.height <= height - 1 fits an int (checked above).
+    const int latest_height{static_cast<int>(observed.latest_height)};
+    const auto checkpoint_epoch{
+        modern::EpochOfHeight(fresh.epoch_starts, latest_height)};
+    if (!checkpoint_epoch) {
+        return refuse("bridge observation verdict: B3 cannot form its statement at the verifier's latest checkpoint");
+    }
+    if (*checkpoint_epoch != e_e) {
+        verdict |= bridge::ETH_OBSERVATION_VERDICT_CERT_CONFLICT;
+        return verdict;
+    }
+    const auto canonical{ExpectedFinalizedBlockV2(
+        e_e, latest_height, fresh, lineage.hash_at, params, &index)};
+    if (!canonical) {
+        return refuse("bridge observation verdict: B3 cannot form its statement at the verifier's latest checkpoint");
+    }
+    if (modern::FinalityCertIdV2(*canonical) != observed.latest_cert_id) {
+        verdict |= bridge::ETH_OBSERVATION_VERDICT_CERT_CONFLICT;
     }
     return verdict;
+}
+
+std::optional<modern::FinalizedBlockV2> JudgeFinalityConflictV2(
+    const bridge::BridgeFinalityConflictV2& record,
+    const BridgeV2LineageContext& lineage, const Consensus::Params& params,
+    const BridgeStateIndex& index, const int height, std::string& error)
+{
+    const auto refuse{
+        [&error](std::string why) -> std::optional<modern::FinalizedBlockV2> {
+            error = std::move(why);
+            return std::nullopt;
+        }};
+    // 1. Parameters and the chain domain the certificate is signed under.
+    if (!params.modern_pos || params.modern_pos->checkpoint_interval <= 0) {
+        return refuse("bridge finality conflict needs modern PoS checkpoint parameters");
+    }
+    const auto domain{
+        params.legacy_final_hash
+            ? modern::ModernChainDomain(params.hashGenesisBlock,
+                                        *params.legacy_final_hash)
+            : std::nullopt};
+    if (!domain) {
+        return refuse("bridge finality conflict needs a pinned chain domain");
+    }
+    // 2. A lineage that can still be judged.
+    if (!lineage.fresh || !lineage.fresh->bootstrapped || !lineage.hash_at) {
+        return refuse("bridge finality conflict needs a bootstrapped fresh lineage");
+    }
+    const FreshLineageState& fresh{*lineage.fresh};
+    if (fresh.lineage_broken) {
+        return refuse("bridge finality conflict cannot be judged on a broken fresh lineage");
+    }
+    // 3. The certificate (the codec already checked its shape).
+    const auto decoded{record.Decode()};
+    if (!decoded) {
+        return refuse("bridge finality conflict certificate is malformed");
+    }
+    const modern::FinalizedBlockV2& fb{decoded->first};
+    const modern::FinalityCertificate& cert{decoded->second};
+    // 4. This lineage.
+    if (fb.lineage_id != fresh.lineage_id) {
+        return refuse("bridge finality conflict names another lineage");
+    }
+    // 5. The current or next committee only (written without epoch + 1,
+    // which could wrap); Set'_{e-1} and older are refused, as Verifier V2's
+    // reportConflict refuses rotated-out sets.
+    std::shared_ptr<const FreshLineageSet> committee;
+    if (fb.epoch == fresh.epoch) {
+        committee = fresh.current;
+    } else if (fb.epoch > fresh.epoch && fb.epoch - fresh.epoch == 1) {
+        committee = fresh.next;
+    }
+    if (!committee || !committee->members) {
+        return refuse("bridge finality conflict is not signed by the lineage's current or next committee");
+    }
+    // 6. The bitmap is sized for that committee.
+    if (record.validator_count != committee->Size()) {
+        return refuse("bridge finality conflict bitmap does not match the signing committee");
+    }
+    // 7. The checkpoint the index names, at or below the parent block.
+    const int interval{params.modern_pos->checkpoint_interval};
+    if (fb.checkpoint_index == 0 ||
+        fb.checkpoint_index >= modern::MAX_FINALITY_CHECKPOINT_INDEX ||
+        fresh.genesis_height < 0 ||
+        fb.checkpoint_index >
+            static_cast<uint64_t>(std::numeric_limits<int>::max() -
+                                  fresh.genesis_height) /
+                static_cast<uint64_t>(interval)) {
+        return refuse("bridge finality conflict checkpoint index is out of range");
+    }
+    const int checkpoint{fresh.genesis_height +
+                         static_cast<int>(fb.checkpoint_index) * interval};
+    if (height < 1 || checkpoint > height - 1) {
+        return refuse("bridge finality conflict checkpoint is above the parent block");
+    }
+    // 8. A quorum of that committee signed it. The statement's own successor
+    // hash is passed, so the successor field is not checked: a wrong one is
+    // just another way to differ from B3's statement.
+    const modern::CertificateCheck check{modern::VerifyFinalityCertificateV2(
+        *domain, fb, cert, committee->View(), fb.validator_set_hash)};
+    if (check != modern::CertificateCheck::OK) {
+        return refuse(std::string{"bridge finality conflict certificate does not verify: "} +
+                      modern::CertificateCheckName(check));
+    }
+    // 9. It differs from B3's canonical statement at that checkpoint
+    // (ExpectedFinalizedBlockV2, field for field): B3 signs index k only in
+    // the epoch of its height, so another epoch differs by construction.
+    const auto cannot_form{[&refuse] {
+        return refuse("bridge finality conflict: B3 cannot form its statement at the evidence checkpoint");
+    }};
+    const auto checkpoint_epoch{
+        modern::EpochOfHeight(fresh.epoch_starts, checkpoint)};
+    if (!checkpoint_epoch) return cannot_form();
+    if (fb.epoch != *checkpoint_epoch) return fb;
+    // Every field but the history root is cheap to form, and any difference
+    // proves the conflict. Only a statement equal in all of them (such as a
+    // canonical certificate wrapped as kind 13) reads B3's history root: the
+    // finalized checkpoint's recorded root at its index, else
+    // FreshHistoryRootAt (an O(index) rebuild below the lineage's
+    // accumulator; header cost note).
+    const auto block_hash{lineage.hash_at(checkpoint)};
+    const auto successor{fresh.SuccessorHashForEpoch(fb.epoch)};
+    const auto withdrawal_root{
+        FreshLineageWithdrawalRoot(checkpoint, params, &index)};
+    const auto bridge_flags{FreshLineageBridgeFlags(checkpoint, params, &index)};
+    if (!block_hash || !successor || !withdrawal_root || !bridge_flags) {
+        return cannot_form();
+    }
+    if (fb.height != static_cast<uint64_t>(checkpoint) ||
+        fb.block_hash != *block_hash ||
+        fb.withdrawal_root != *withdrawal_root ||
+        fb.validator_set_hash != *successor ||
+        fb.bridge_flags != *bridge_flags) {
+        return fb;
+    }
+    const auto history_root{
+        fresh.finalized &&
+                fresh.finalized->checkpoint_index == fb.checkpoint_index
+            ? std::optional<uint256>{fresh.finalized->history_root}
+            : FreshHistoryRootAt(fresh, fb.checkpoint_index, lineage.hash_at,
+                                 interval)};
+    if (!history_root) return cannot_form();
+    if (fb.checkpoint_history_root == *history_root) {
+        return refuse("bridge finality conflict equals B3's canonical statement");
+    }
+    return fb;
 }
 
 std::string BridgeV2GateResult::Describe() const
@@ -1712,6 +1934,48 @@ BridgeV2GateResult EvaluateBridgeV2BurnGate(
     return EvaluateBurnGateOn(*lineage, index.ObservationsV2(),
                               index.ConflictV2(), index.LightClientV2(),
                               params, height, candidate_time);
+}
+
+std::optional<std::string> BridgeV2DepositsClosedReason(
+    const BridgeStateIndex& index, const BridgeV2LineageContext* lineage,
+    const Consensus::Params& params)
+{
+    if (!params.bridge_v2) return std::nullopt;
+    // C4: the sticky conflict, first wins.
+    if (const auto& conflict{index.ConflictV2()}) {
+        const char* kind{"unknown"};
+        switch (conflict->reason) {
+        case bridge::BRIDGE_V2_CONFLICT_E5: kind = "E5"; break;
+        case bridge::BRIDGE_V2_CONFLICT_E8: kind = "E8"; break;
+        case bridge::BRIDGE_V2_CONFLICT_KIND13: kind = "kind 13"; break;
+        }
+        return std::string{"sticky "} + kind + " conflict at height " +
+               std::to_string(conflict->height);
+    }
+    // C2's permanent case: the fresh lineage's extension is exhausted.
+    if (lineage != nullptr && lineage->fresh && lineage->fresh->lineage_broken) {
+        return std::string{"the fresh finality lineage is broken"};
+    }
+    // C1, and Ethereum's own close, from the latest VERIFIER_E at any age.
+    const auto observed{
+        index.LatestObservationV2(bridge::ETH_OBSERVATION_SUBJECT_VERIFIER)};
+    const auto* verifier{
+        observed ? std::get_if<bridge::VerifierStateV2>(&observed->state)
+                 : nullptr};
+    if (verifier != nullptr) {
+        const std::string seen{"the latest VERIFIER_E (anchor block " +
+                               std::to_string(observed->anchor_block) +
+                               ") shows "};
+        if (const auto impairment{bridge::VerifierImpairmentV2(
+                {observed->t_obs, *verifier, observed->verdict},
+                params.bridge_v2->gate)}) {
+            return seen + "the " + *impairment;
+        }
+        if (verifier->deposits_closed) {
+            return seen + "Verifier V2 depositsClosed";
+        }
+    }
+    return std::nullopt;
 }
 
 namespace {
@@ -2156,6 +2420,27 @@ std::optional<uint256> FinalityWithdrawalRootV2(
     if (!params.BridgeV2RulesActive(height)) return uint256{};
     if (bridge_index == nullptr) return std::nullopt;
     return bridge_index->WithdrawalRootV2AtHeight(height);
+}
+
+uint8_t BridgeStateIndex::BridgeFlagsV2AtHeight(const int height) const
+{
+    return m_conflict_v2 && m_conflict_v2->height <= height
+               ? modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED
+               : uint8_t{0};
+}
+
+std::optional<uint8_t> FinalityBridgeFlagsV2(
+    const int height, const Consensus::Params& params,
+    const BridgeStateIndex* bridge_index)
+{
+    if (!params.BridgeV2RulesActive(height)) return uint8_t{0};
+    // A V2 root marks a height the index has connected; fail closed
+    // otherwise, exactly as FinalityWithdrawalRootV2.
+    if (bridge_index == nullptr ||
+        !bridge_index->WithdrawalRootV2AtHeight(height)) {
+        return std::nullopt;
+    }
+    return bridge_index->BridgeFlagsV2AtHeight(height);
 }
 
 CAmount BridgeStateIndex::EpochMinted(const modern::AssetId& asset,
@@ -2614,12 +2899,22 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
     if (!delta.v2_store) {
         if (!delta.observations_v2_added.empty() ||
             !delta.deposits_v2_added.empty() ||
+            !delta.finality_conflicts_v2_added.empty() ||
             !(delta.reserve_v2_after == delta.reserve_v2_before) ||
             delta.conflict_v2_after != delta.conflict_v2_before) {
             error = "bridge delta V2 accounting does not match its store";
             return false;
         }
     } else {
+        // Kind 13 evidence: at most one accepted record per block (the first
+        // sets the sticky conflict and refuses every later one), never null.
+        if (delta.finality_conflicts_v2_added.size() > 1 ||
+            std::any_of(delta.finality_conflicts_v2_added.begin(),
+                        delta.finality_conflicts_v2_added.end(),
+                        [](const uint256& id) { return id.IsNull(); })) {
+            error = "bridge delta contains a malformed finality conflict";
+            return false;
+        }
         bool cert_conflict_added{false};
         for (const BridgeObservationRecordV2& record :
              delta.observations_v2_added) {
@@ -2709,35 +3004,72 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
         }
 
         // The sticky conflict is set at most once, by this block's E5
-        // verdict or E8 observation, and never cleared by a later block.
+        // verdict, E8 observation or kind 13 record, and never cleared by a
+        // later block. Kind 13 evidence is accepted only when it sets it.
         if (delta.conflict_v2_before) {
             if (delta.conflict_v2_after != delta.conflict_v2_before) {
                 error = "bridge delta clears or replaces the sticky conflict";
                 return false;
             }
+            if (!delta.finality_conflicts_v2_added.empty()) {
+                error = "bridge delta contains a malformed finality conflict";
+                return false;
+            }
         } else if (delta.conflict_v2_after) {
             const BridgeV2Conflict& conflict{*delta.conflict_v2_after};
-            const auto sets_conflict{[&](const BridgeObservationRecordV2& r) {
-                if (r.anchor_block != conflict.anchor_block) return false;
-                if (conflict.reason == bridge::BRIDGE_V2_CONFLICT_E5) {
-                    return r.subject == bridge::ETH_OBSERVATION_SUBJECT_VERIFIER &&
-                           (r.verdict &
-                            bridge::ETH_OBSERVATION_VERDICT_CERT_CONFLICT) != 0;
-                }
-                return conflict.reason == bridge::BRIDGE_V2_CONFLICT_E8 &&
-                       r.subject == bridge::ETH_OBSERVATION_SUBJECT_RESERVE;
-            }};
             if (conflict.height != delta.height ||
-                conflict.block_hash != delta.block_hash ||
-                std::none_of(delta.observations_v2_added.begin(),
-                             delta.observations_v2_added.end(),
-                             sets_conflict)) {
+                conflict.block_hash != delta.block_hash) {
                 error = "bridge delta contains a malformed sticky conflict";
                 return false;
             }
-        } else if (cert_conflict_added) {
-            error = "bridge delta omits the sticky conflict of a CERT_CONFLICT verdict";
-            return false;
+            if (conflict.reason == bridge::BRIDGE_V2_CONFLICT_KIND13) {
+                // Set by the block's one accepted kind 13 record.
+                if (conflict.anchor_block != 0 ||
+                    conflict.evidence_cert_id.IsNull() ||
+                    conflict.evidence_checkpoint_index == 0 ||
+                    conflict.evidence_checkpoint_index >=
+                        modern::MAX_FINALITY_CHECKPOINT_INDEX ||
+                    delta.finality_conflicts_v2_added !=
+                        std::vector<uint256>{conflict.evidence_cert_id}) {
+                    error = "bridge delta contains a malformed sticky conflict";
+                    return false;
+                }
+            } else {
+                // E5 or E8: set by one of the block's observations, carrying
+                // no kind 13 evidence.
+                const auto sets_conflict{[&](const BridgeObservationRecordV2& r) {
+                    if (r.anchor_block != conflict.anchor_block) return false;
+                    if (conflict.reason == bridge::BRIDGE_V2_CONFLICT_E5) {
+                        return r.subject == bridge::ETH_OBSERVATION_SUBJECT_VERIFIER &&
+                               (r.verdict &
+                                bridge::ETH_OBSERVATION_VERDICT_CERT_CONFLICT) != 0;
+                    }
+                    return conflict.reason == bridge::BRIDGE_V2_CONFLICT_E8 &&
+                           r.subject == bridge::ETH_OBSERVATION_SUBJECT_RESERVE;
+                }};
+                if (!conflict.evidence_cert_id.IsNull() ||
+                    conflict.evidence_checkpoint_index != 0 ||
+                    conflict.evidence_epoch != 0 ||
+                    std::none_of(delta.observations_v2_added.begin(),
+                                 delta.observations_v2_added.end(),
+                                 sets_conflict)) {
+                    error = "bridge delta contains a malformed sticky conflict";
+                    return false;
+                }
+                if (!delta.finality_conflicts_v2_added.empty()) {
+                    error = "bridge delta contains a malformed finality conflict";
+                    return false;
+                }
+            }
+        } else {
+            if (!delta.finality_conflicts_v2_added.empty()) {
+                error = "bridge delta contains a malformed finality conflict";
+                return false;
+            }
+            if (cert_conflict_added) {
+                error = "bridge delta omits the sticky conflict of a CERT_CONFLICT verdict";
+                return false;
+            }
         }
     }
 

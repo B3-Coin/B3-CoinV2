@@ -1474,23 +1474,32 @@ BOOST_AUTO_TEST_CASE(fresh_hook_signs_v2_root_from_v)
     BOOST_CHECK(node::FreshLineageWithdrawalRoot(v, params, &index) == std::optional<uint256>{empty_root});
     BOOST_CHECK_EQUAL(index.WithdrawalV2Count(), 0U);
 
-    // bridgeFlags stays 0 on both sides of V in this slice.
-    for (const int h : {v - 1, v, burn_height}) {
-        BOOST_CHECK(node::FreshLineageBridgeFlags(h, params, &index) == std::optional<uint8_t>{0});
-        BOOST_CHECK(node::FreshLineageBridgeFlags(h, params, nullptr) == std::optional<uint8_t>{0});
-    }
+    // bridgeFlags is 0 on both sides of V without a sticky conflict, and
+    // fails closed from V like the root (the conflict cases are in
+    // bridge_state_tests/finality_bridge_flags_v2).
+    BOOST_CHECK(node::FreshLineageBridgeFlags(v - 1, params, &index) == std::optional<uint8_t>{0});
+    BOOST_CHECK(node::FreshLineageBridgeFlags(v - 1, params, nullptr) == std::optional<uint8_t>{0});
+    BOOST_CHECK(node::FreshLineageBridgeFlags(v, params, &index) == std::optional<uint8_t>{0});
+    BOOST_CHECK(!node::FreshLineageBridgeFlags(v, params, nullptr));
+    BOOST_CHECK(!node::FreshLineageBridgeFlags(burn_height, params, &index)); // disconnected above
 
     // Without a complete bridge V2 envelope (mainnet, testnet, and regtest
-    // without a v2 pin section) every height signs zero, index or not.
+    // without a v2 pin section) every height signs zero root and flags 0,
+    // index or not.
     Consensus::BridgeV2Params incomplete_v2{v2};
     incomplete_v2.vault.token_runtime_code_hash = uint256{};
     const Consensus::Params incomplete{ConsensusWith(incomplete_v2)};
     const Consensus::Params unset{ConsensusWith(std::nullopt)};
+    const std::optional<uint8_t> no_flags{uint8_t{0}};
     for (const int h : {v - 1, v, burn_height, std::numeric_limits<int>::max()}) {
         BOOST_CHECK(node::FreshLineageWithdrawalRoot(h, unset, &index) == zero);
         BOOST_CHECK(node::FreshLineageWithdrawalRoot(h, unset, nullptr) == zero);
         BOOST_CHECK(node::FreshLineageWithdrawalRoot(h, incomplete, &index) == zero);
         BOOST_CHECK(node::FreshLineageWithdrawalRoot(h, incomplete, nullptr) == zero);
+        BOOST_CHECK(node::FreshLineageBridgeFlags(h, unset, &index) == no_flags);
+        BOOST_CHECK(node::FreshLineageBridgeFlags(h, unset, nullptr) == no_flags);
+        BOOST_CHECK(node::FreshLineageBridgeFlags(h, incomplete, &index) == no_flags);
+        BOOST_CHECK(node::FreshLineageBridgeFlags(h, incomplete, nullptr) == no_flags);
     }
 
     // Shared vector: the vector's lineage-2 FinalizedBlockV2 at the bridge

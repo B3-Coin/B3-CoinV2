@@ -113,7 +113,7 @@ std::array<unsigned char, N> Fixed(const UniValue& object, const std::string& na
     return out;
 }
 
-uint256 Hash(const UniValue& object, const std::string& name)
+uint256 HashField(const UniValue& object, const std::string& name)
 {
     const auto bytes{Fixed<32>(object, name)};
     return uint256{std::span<const unsigned char>{bytes}};
@@ -160,12 +160,12 @@ ssz::ExecutionPayloadHeader ExecutionHeader(const UniValue& rpc)
 {
     if (!rpc.isObject()) throw std::runtime_error("execution header must be a JSON object");
     ssz::ExecutionPayloadHeader out;
-    out.parent_hash = Hash(rpc, "parentHash");
+    out.parent_hash = HashField(rpc, "parentHash");
     out.fee_recipient = Fixed<20>(rpc, "miner");
-    out.state_root = Hash(rpc, "stateRoot");
-    out.receipts_root = Hash(rpc, "receiptsRoot");
+    out.state_root = HashField(rpc, "stateRoot");
+    out.receipts_root = HashField(rpc, "receiptsRoot");
     out.logs_bloom = Fixed<256>(rpc, "logsBloom");
-    out.prev_randao = Hash(rpc, "mixHash");
+    out.prev_randao = HashField(rpc, "mixHash");
     out.block_number = Quantity64(rpc, "number");
     out.gas_limit = Quantity64(rpc, "gasLimit");
     out.gas_used = Quantity64(rpc, "gasUsed");
@@ -177,9 +177,9 @@ ssz::ExecutionPayloadHeader ExecutionHeader(const UniValue& rpc)
     std::array<unsigned char, 32> base_fee_le{};
     std::reverse_copy(base_fee.begin(), base_fee.end(), base_fee_le.begin());
     out.base_fee_per_gas = uint256{std::span<const unsigned char>{base_fee_le}};
-    out.block_hash = Hash(rpc, "hash");
-    out.transactions_root = Hash(rpc, "transactionsRoot");
-    if (!rpc.find_value("withdrawalsRoot").isNull()) out.withdrawals_root = Hash(rpc, "withdrawalsRoot");
+    out.block_hash = HashField(rpc, "hash");
+    out.transactions_root = HashField(rpc, "transactionsRoot");
+    if (!rpc.find_value("withdrawalsRoot").isNull()) out.withdrawals_root = HashField(rpc, "withdrawalsRoot");
     out.blob_gas_used = OptionalQuantity64(rpc, "blobGasUsed");
     out.excess_blob_gas = OptionalQuantity64(rpc, "excessBlobGas");
     return out;
@@ -233,7 +233,7 @@ UniValue UpdateOutput(const regtest_beacon::SyntheticBeacon& beacon, const UniVa
         options.slot_shift = Number(request, "slot_shift");
     }
     if (!request.find_value("sign_genesis_validators_root").isNull()) {
-        options.sign_genesis_validators_root = Hash(request, "sign_genesis_validators_root");
+        options.sign_genesis_validators_root = HashField(request, "sign_genesis_validators_root");
     }
     if (!request.find_value("sign_fork_version").isNull()) {
         options.sign_fork_version = Fixed<4>(request, "sign_fork_version");
@@ -275,7 +275,7 @@ int main(int argc, char** argv)
                                        "outputs"});
         if (Number(request, "version") != 1) throw std::runtime_error("unsupported request version");
         regtest_beacon::SyntheticDomain domain;
-        domain.genesis_validators_root = Hash(request, "genesis_validators_root");
+        domain.genesis_validators_root = HashField(request, "genesis_validators_root");
         domain.fork_version = Fixed<4>(request, "fork_version");
         domain.electra_epoch = Number(request, "electra_epoch");
         // Refuse a real-network domain before reading anything else.

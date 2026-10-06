@@ -48,7 +48,10 @@ class BridgeStateIndex;
  *              first h >= epoch_start[e] + E with an epoch-e V2 certificate
  *              already included below h; Set'_{e+2} := Snapshot(h-1) stamped
  *              e+2, or (carry-over) Set'_{e+1}'s members re-stamped e+2 when
- *              the snapshot has fewer than min_finality_set members.
+ *              the snapshot has fewer than min_finality_set members. The two
+ *              committees before the current one stay retained (previous2,
+ *              previous) so the bridge V2 gate can judge a verifier up to
+ *              FRESH_LINEAGE_RETAINED_PAST_EPOCHS epochs behind (E3, E4, E5).
  *   break      without the handover, the first h with h - epoch_start[e] >=
  *              E + fresh_lineage->max_epoch_extension (FD-7, the fresh
  *              lineage's own extension) breaks the lineage for good: no
@@ -113,6 +116,18 @@ struct FreshFinalizedCheckpoint {
     friend bool operator==(const FreshFinalizedCheckpoint&, const FreshFinalizedCheckpoint&) = default;
 };
 
+/**
+ * How many committees before Set'_e the fresh lineage retains: Set'_{e-1}
+ * (previous) and Set'_{e-2} (previous2). Node changes sections 8.4 and 8.6
+ * let a LIVE Verifier V2 trail B3 by up to max_epoch_gap = 2 epochs, and B3
+ * judges that verifier's pinned pair (E4: Set'_{e_E}, Set'_{e_E+1}) and its
+ * latest statement (E5: B3's canonical epoch-e_E statement) against these
+ * sets (node::VerifierVerdictV2). The window does not grow with a larger
+ * max_epoch_gap: a verifier further behind cannot be judged, so no new
+ * observation of it is valid and the gate closes at E1.
+ */
+inline constexpr uint64_t FRESH_LINEAGE_RETAINED_PAST_EPOCHS{2};
+
 //! Derived fresh-lineage state of the active chain.
 struct FreshLineageState {
     //! Set'_0 exists (bootstrap floor met at R_f, chain domain pinned).
@@ -123,10 +138,14 @@ struct FreshLineageState {
     uint64_t epoch{0};
     //! epoch_starts[e] for every e <= epoch; [0] == R_f.
     std::vector<int> epoch_starts;
-    std::shared_ptr<const FreshLineageSet> genesis;  // Set'_0, retained for the verifier bootstrap
-    std::shared_ptr<const FreshLineageSet> previous; // Set'_{e-1}
-    std::shared_ptr<const FreshLineageSet> current;  // Set'_e
-    std::shared_ptr<const FreshLineageSet> next;     // Set'_{e+1}
+    std::shared_ptr<const FreshLineageSet> genesis;   // Set'_0, retained for the verifier bootstrap
+    //! Set'_{e-2}, null before epoch 2. Read only by the bridge V2 verifier
+    //! judgement (SetHashForEpoch, SuccessorHashForEpoch); no certificate of
+    //! epoch e-2 is carried, pooled or signed any more (SetForEpoch).
+    std::shared_ptr<const FreshLineageSet> previous2;
+    std::shared_ptr<const FreshLineageSet> previous;  // Set'_{e-1}
+    std::shared_ptr<const FreshLineageSet> current;   // Set'_e
+    std::shared_ptr<const FreshLineageSet> next;      // Set'_{e+1}
     bool handover_certified{false};
     bool lineage_broken{false};
     std::optional<FreshFinalizedCheckpoint> finalized;
@@ -139,20 +158,38 @@ struct FreshLineageState {
     modern::FreshLineageEpochView View() const;
     //! Size of Set'_e (e in {epoch, epoch-1}), for the coinbase matcher.
     std::optional<uint32_t> SetSize(uint64_t e) const;
-    //! Set'_e for e in {epoch, epoch-1}; null otherwise.
+    //! Set'_e for e in {epoch, epoch-1}, the committees that may still sign
+    //! a carried certificate (carrier matcher, judge, signer, pool, RPC);
+    //! null otherwise.
     std::shared_ptr<const FreshLineageSet> SetForEpoch(uint64_t e) const;
-    //! The ruleset-2 hash an epoch-e certificate must name as successor
-    //! (hash(Set'_{e+1})), for e in {epoch, epoch-1}.
+    //! setHash(Set'_k) for every retained committee, k in [epoch-2, epoch+1]
+    //! (previous2, previous, current, next); nullopt otherwise or when not
+    //! bootstrapped.
+    std::optional<uint256> SetHashForEpoch(uint64_t k) const;
+    //! The ruleset-2 hash an epoch-e statement must name as successor
+    //! (hash(Set'_{e+1})), for e in {epoch, epoch-1, epoch-2}. Only the
+    //! bridge V2 verifier judgement asks for epoch-2 (through
+    //! ExpectedFinalizedBlockV2). The signer and the pool's builder first
+    //! require SetForEpoch(e); the pool's slots and the finalized checkpoint
+    //! are never of epoch-2, since rotation into `epoch` needs an included
+    //! epoch-(epoch-1) handover certificate, which finalizes a height above
+    //! every epoch-(epoch-2) checkpoint (the pool prunes up to it first).
     std::optional<uint256> SuccessorHashForEpoch(uint64_t e) const;
 };
 
 /**
  * Node-changes section 7.4 interface: what the bridge V2 regime reads of the
  * fresh lineage (bootstrapped, broken, epoch, set summaries, finalized
- * height, handover status). Consumed by the TEMPORARY bridge V2 burn gate
- * (node::BridgeV2BurnReadiness, node/bridge_state.h: section 8.4 rows C1/C2
- * only). The kind 9 liveness rows that replace that gate in a later slice
- * also need the section's CertIdAt(index) (not provided yet).
+ * height, handover status). It feeds the full bridge V2 burn gate
+ * (node::EvaluateBridgeV2BurnGate, node/bridge_state.h: section 8.4 rows C2
+ * and C3, and E3 and E6 against the observed verifier) and getbridgev2info.
+ * The section's CertIdAt(index), B3's own certId for a grid checkpoint, is
+ * not a view member: it is realized as
+ * FinalityCertIdV2(ExpectedFinalizedBlockV2(e, G + index * interval)) with e
+ * the epoch of that height (B3 signs a checkpoint only in that epoch; a
+ * statement of any other epoch is not B3's), inside node::VerifierVerdictV2
+ * (the VERIFIER_E verdict, rows E4/E5) and node::JudgeFinalityConflictV2
+ * (kind 13 FINALITY_CONFLICT, section 8.5).
  */
 struct LineageV2View {
     bool configured{false};
@@ -194,11 +231,21 @@ LineageV2View MakeLineageV2View(const Consensus::Params& params, const std::opti
 std::optional<uint256> FreshLineageWithdrawalRoot(int height, const Consensus::Params& params,
                                                   const BridgeStateIndex* bridge_index);
 /**
- * bridgeFlags a fresh-lineage certificate must carry at `height`. This
- * slice signs 0 at every height: no sticky FINALITY_CONFLICT exists yet, and
- * conflict kind 13 is a later slice. That slice replaces this hook with
- * BridgeFlagsV2 (node changes sections 7.4 and 8.5), which is 0 below V like
- * the withdrawal root.
+ * bridgeFlags a fresh-lineage certificate must carry at `height`:
+ * node::FinalityBridgeFlagsV2 (node/bridge_state.h; node changes sections 7.4
+ * and 8.5, contracts spec section 2.1). That is 0 below V and at every height
+ * without a complete bridge V2 envelope (mainnet and testnet), like the
+ * withdrawal root. From V it is bit 0 (FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED)
+ * from the first checkpoint at or after the block that set the sticky bridge
+ * V2 conflict (kind 13, E5 or E8), and 0 before it; a Verifier V2 that
+ * accepts a certificate carrying the bit closes deposits for good. The carrier
+ * rule (placement check 14), the signer, the vote pool and the certificate
+ * export all read it through this hook. From V, a missing index or an index
+ * lacking `height` fails closed (nullopt) at exactly the heights where the
+ * withdrawal root does, so the judge reports
+ * fresh-withdrawal-root-unavailable (check 13) first. The flag depends only
+ * on blocks at or below `height` (the conflict is sticky and first-wins), so
+ * every node that has connected `height` signs and requires the same value.
  */
 std::optional<uint8_t> FreshLineageBridgeFlags(int height, const Consensus::Params& params,
                                                const BridgeStateIndex* bridge_index);

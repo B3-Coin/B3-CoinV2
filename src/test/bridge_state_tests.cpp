@@ -10,6 +10,8 @@
 #include <bridge/rlp.h>
 #include <bridge/state_observation.h>
 #include <bridge/withdrawal_v2_calldata.h>
+#include <chainparams.h>
+#include <common/args.h>
 #include <crypto/bls.h>
 #include <crypto/common.h>
 #include <crypto/keccak256.h>
@@ -28,6 +30,7 @@
 #include <test/data/eth_lc_fixture.h>
 #include <test/util/bridge_observation_world.h>
 #include <test/util/bridge_state_access.h>
+#include <util/chaintype.h>
 #include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
@@ -992,28 +995,54 @@ bridge_test::ObservationWorld HealthyWorld(const Consensus::Params& params,
  * 1, 2, 3, ...), finalized at 109 in epoch `epoch`, and a hash_at matching
  * V2TestBlockHash, the block hashes ConnectNext connects.
  */
+//! The chain domain of every fixture (BridgeParams' genesis and X hashes).
+uint256 FixtureChainDomain()
+{
+    const auto domain{modern::ModernChainDomain(TestHash(1), TestHash(2))};
+    BOOST_REQUIRE(domain);
+    return *domain;
+}
+
+//! Four BLS keys from IKM byte 0 = 1..4 and byte 31 = `tag` (0x5b: the
+//! LineageFixture members; any other tag: keys no committee holds).
+std::vector<bls::SecretKey> FixtureBlsKeys(const unsigned char tag)
+{
+    std::vector<bls::SecretKey> keys;
+    for (unsigned char i{0}; i < 4; ++i) {
+        std::array<unsigned char, 32> ikm{};
+        ikm[0] = static_cast<unsigned char>(i + 1);
+        ikm[31] = tag;
+        const auto key{bls::SecretKey::FromIKM(ikm)};
+        BOOST_REQUIRE(key);
+        keys.push_back(*key);
+    }
+    return keys;
+}
+
 struct LineageFixture {
     static constexpr int GENESIS{89};
+    //! LineageParams' checkpoint interval: checkpoints 99, 109, 119, ...
+    static constexpr int INTERVAL{10};
+    //! Every committee is the same four members.
+    static constexpr uint16_t MEMBERS{4};
 
     std::vector<std::shared_ptr<const node::FreshLineageSet>> sets;
     node::BridgeV2LineageContext context;
+    //! keys[i] is member i's BLS key (members sort by validator key, and
+    //! member i's key byte 0 is i + 1).
+    std::vector<bls::SecretKey> keys{FixtureBlsKeys(0x5b)};
 
     explicit LineageFixture(const uint64_t epoch = 1)
     {
         node::FinalityBindingIndex bindings;
         std::map<node::ValidatorKey, CAmount> weights;
         std::vector<node::FinalityBindingIndex::Transition> transitions;
-        for (unsigned char i{0}; i < 4; ++i) {
-            std::array<unsigned char, 32> ikm{};
-            ikm[0] = static_cast<unsigned char>(i + 1);
-            ikm[31] = 0x5b;
-            const auto key{bls::SecretKey::FromIKM(ikm)};
-            BOOST_REQUIRE(key);
+        for (unsigned char i{0}; i < MEMBERS; ++i) {
             modern::ValidatorKeyBytes validator{};
             validator[0] = static_cast<unsigned char>(i + 1);
             validator[31] = 0x5c;
             transitions.push_back(
-                {validator, {key->GetPublicKey().Compressed(), 0, 1}});
+                {validator, {keys[i].GetPublicKey().Compressed(), 0, 1}});
             weights[validator] = 300 * modern::FINALITY_WEIGHT_UNIT;
         }
         bindings.ConnectBlock(1, transitions);
@@ -1035,6 +1064,7 @@ struct LineageFixture {
             fresh.epoch_starts.push_back(GENESIS + 1 + static_cast<int>(e) * 10);
         }
         fresh.genesis = sets[0];
+        fresh.previous2 = epoch >= 2 ? sets[epoch - 2] : nullptr;
         fresh.previous = epoch >= 1 ? sets[epoch - 1] : nullptr;
         fresh.current = sets[epoch];
         fresh.next = sets[epoch + 1];
@@ -1048,6 +1078,13 @@ struct LineageFixture {
             if (h < 0) return std::nullopt;
             return V2TestBlockHash(h);
         };
+        // The finalized checkpoint records B3's history root at its index,
+        // as ApplyFreshCertificate does (JudgeFinalityConflictV2 reads it).
+        const auto finalized_root{node::FreshHistoryRootAt(
+            *context.fresh, context.fresh->finalized->checkpoint_index,
+            context.hash_at, INTERVAL)};
+        BOOST_REQUIRE(finalized_root);
+        context.fresh->finalized->history_root = *finalized_root;
     }
 
     node::FreshLineageState& Fresh() { return *context.fresh; }
@@ -1084,7 +1121,75 @@ struct LineageFixture {
         v.latest_cert_id = modern::FinalityCertIdV2(fb);
         return v;
     }
+
+    //! A digest-V2 certificate over `fb` for a committee of MEMBERS: member
+    //! i of `signers` signs with signing_keys[i] (the fixture's own keys
+    //! sign as the committee, other keys forge).
+    static modern::FinalityCertificate Certificate(
+        const modern::FinalizedBlockV2& fb, const std::vector<uint32_t>& signers,
+        const std::vector<bls::SecretKey>& signing_keys)
+    {
+        const uint256 digest{modern::FinalityDigestV2(FixtureChainDomain(), fb)};
+        modern::FinalityCertificate cert;
+        cert.signer_bitmap.assign(modern::SignerBitmapBytes(MEMBERS), 0);
+        std::vector<bls::Signature> signatures;
+        for (const uint32_t i : signers) {
+            BOOST_REQUIRE(i < MEMBERS);
+            cert.signer_bitmap[i / 8] |= static_cast<unsigned char>(1U << (i % 8));
+            signatures.push_back(signing_keys.at(i).Sign(
+                std::span<const unsigned char>(digest.begin(), 32)));
+        }
+        const auto aggregate{bls::AggregateSignatures(signatures)};
+        BOOST_REQUIRE(aggregate);
+        std::copy(aggregate->Compressed().begin(), aggregate->Compressed().end(),
+                  cert.aggregate_sig.begin());
+        return cert;
+    }
+
+    //! Certificate() by all four members.
+    modern::FinalityCertificate Signed(const modern::FinalizedBlockV2& fb) const
+    {
+        return Certificate(fb, {0, 1, 2, 3}, keys);
+    }
 };
+
+//! A kind 13 body: `fb` and `cert` for a committee of `validator_count`.
+bridge::BridgeFinalityConflictV2 ConflictRecord(
+    const modern::FinalizedBlockV2& fb, const modern::FinalityCertificate& cert,
+    const uint16_t validator_count = LineageFixture::MEMBERS)
+{
+    return {validator_count, modern::EncodeCertificatePayloadV2(fb, cert)};
+}
+
+//! A kind 13 carrier, encoded under the V2 record set.
+CTransactionRef ConflictTransaction(
+    const bridge::BridgeFinalityConflictV2& conflict)
+{
+    const auto record{bridge::MakeBridgeMpaRecord(
+        bridge::BridgeRecordV1{bridge::BridgeRecordKindV1::FINALITY_CONFLICT,
+                               conflict},
+        bridge::BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(record);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vout = {*binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
+}
+
+//! B3's epoch-`epoch` statement at checkpoint `height` with another block
+//! hash (a statement of another branch), as `lineage` would sign it.
+modern::FinalizedBlockV2 OtherBranch(const LineageFixture& lineage,
+                                     const uint64_t epoch, const int height,
+                                     const Consensus::Params& params,
+                                     const node::BridgeStateIndex& index,
+                                     const uint8_t tag = 0xbb)
+{
+    modern::FinalizedBlockV2 fb{lineage.Statement(epoch, height, params, index)};
+    fb.block_hash = TestHash(tag);
+    return fb;
+}
 
 //! V2Params plus a fresh-lineage configuration matching LineageFixture.
 Consensus::Params LineageParams()
@@ -1164,6 +1269,7 @@ void CheckSameV2Delta(const node::BridgeBlockDelta& a,
     BOOST_CHECK(a.deposits_v2_added == b.deposits_v2_added);
     BOOST_CHECK(a.conflict_v2_before == b.conflict_v2_before);
     BOOST_CHECK(a.conflict_v2_after == b.conflict_v2_after);
+    BOOST_CHECK(a.finality_conflicts_v2_added == b.finality_conflicts_v2_added);
     BOOST_CHECK(a.withdrawals_v2_added == b.withdrawals_v2_added);
 }
 
@@ -3132,9 +3238,10 @@ BOOST_AUTO_TEST_CASE(v2_burn_gate_from_index)
         node::BridgeBurnReadiness::NOT_READY, error));
     // Kind 9 carriers are recognised only under the V2 record set.
     const CTransactionRef observation{Observe(world, SUBJECT_TOKEN, anchor)};
-    BOOST_CHECK(node::HasBridgeV2Observation(*observation));
-    BOOST_CHECK(node::HasBridgeV2Observation(Block(1'000, {burn, observation})));
-    BOOST_CHECK(!node::HasBridgeV2Observation(*burn));
+    BOOST_CHECK(node::HasBridgeV2LineageRecord(*observation));
+    BOOST_CHECK(node::HasBridgeV2LineageRecord(Block(1'000, {burn, observation})));
+    BOOST_CHECK(!node::HasBridgeV2LineageRecord(*burn));
+    BOOST_CHECK(!node::HasBridgeV2FinalityConflict(*observation));
     BOOST_CHECK(!node::HasDecentralizedBridgeBurn(*observation));
 }
 
@@ -3728,11 +3835,76 @@ BOOST_AUTO_TEST_CASE(v2_verifier_verdicts)
     v.next_set_hash = TestHash(0x5e);
     BOOST_CHECK(verdict(v, lineage.context, height, error) ==
                 std::optional<uint8_t>{VERDICT_SETS | VERDICT_CERT});
+    // CertIdAt(index) is B3's statement in the epoch of the checkpoint's
+    // height only (as kind 13's check 9): a Latest whose epoch is another
+    // one conflicts even when every other field is B3's. An epoch-0 verifier
+    // (Set'_0 / Set'_1 pinned, E4 clean) at index 2 (H = 109, epoch 1)
+    // holding B3's epoch-0 rebuild there, and an epoch-1 verifier at index 1
+    // (H = 99, epoch 0) holding B3's epoch-1 rebuild there.
+    {
+        bridge::VerifierStateV2 wrong_epoch{canonical};
+        wrong_epoch.current_epoch = 0;
+        wrong_epoch.current_set_hash = lineage.sets[0]->set_hash;
+        wrong_epoch.next_set_hash = lineage.sets[1]->set_hash;
+        wrong_epoch.latest_cert_id =
+            modern::FinalityCertIdV2(lineage.Statement(0, 109, params, index));
+        BOOST_CHECK(verdict(wrong_epoch, lineage.context, height, error) ==
+                    std::optional<uint8_t>{VERDICT_CERT});
+        wrong_epoch = canonical;
+        wrong_epoch.latest_height = 99;
+        wrong_epoch.latest_index = 1;
+        wrong_epoch.latest_cert_id =
+            modern::FinalityCertIdV2(lineage.Statement(1, 99, params, index));
+        BOOST_CHECK(verdict(wrong_epoch, lineage.context, height, error) ==
+                    std::optional<uint8_t>{VERDICT_CERT});
+        // The same checkpoint in its own epoch is B3's certificate.
+        wrong_epoch.latest_cert_id =
+            modern::FinalityCertIdV2(lineage.Statement(0, 99, params, index));
+        wrong_epoch.current_epoch = 0;
+        wrong_epoch.current_set_hash = lineage.sets[0]->set_hash;
+        wrong_epoch.next_set_hash = lineage.sets[1]->set_hash;
+        BOOST_CHECK(wrong_epoch == lineage.Canonical(0, 99, params, index));
+        BOOST_CHECK(verdict(wrong_epoch, lineage.context, height, error) ==
+                    std::optional<uint8_t>{0});
+    }
     // A verifier one epoch behind is judged against Set'_0 / Set'_1.
     const bridge::VerifierStateV2 behind{lineage.Canonical(0, 99, params, index)};
     BOOST_CHECK(behind.current_set_hash == lineage.sets[0]->set_hash);
     BOOST_CHECK(verdict(behind, lineage.context, height, error) ==
                 std::optional<uint8_t>{0});
+    // Two epochs behind (E3's max_epoch_gap = 2, section 8.6): the lineage
+    // retains Set'_{e-2}, so the epoch-1 verifier is judged at e_B3 = 3
+    // against Set'_1 / Set'_2 and B3's canonical epoch-1 statement.
+    {
+        const LineageFixture later{3};
+        BOOST_REQUIRE(later.context.fresh->previous2);
+        BOOST_CHECK(later.context.fresh->previous2->set_hash == lineage.sets[1]->set_hash);
+        BOOST_CHECK(verdict(canonical, later.context, height, error) ==
+                    std::optional<uint8_t>{0});
+        BOOST_CHECK(later.Canonical(1, 109, params, index) == canonical);
+        bridge::VerifierStateV2 gap2{canonical};
+        gap2.next_set_hash = TestHash(0x5e);
+        BOOST_CHECK(verdict(gap2, later.context, height, error) ==
+                    std::optional<uint8_t>{VERDICT_SETS});
+        // The pair one epoch on (Set'_2 / Set'_3) is not the epoch-1 pair.
+        gap2 = canonical;
+        gap2.current_set_hash = later.sets[2]->set_hash;
+        gap2.next_set_hash = later.sets[3]->set_hash;
+        BOOST_CHECK(verdict(gap2, later.context, height, error) ==
+                    std::optional<uint8_t>{VERDICT_SETS});
+        // B3's epoch-2 statement at the same checkpoint is another certId.
+        gap2 = canonical;
+        gap2.latest_cert_id =
+            modern::FinalityCertIdV2(later.Statement(2, 109, params, index));
+        BOOST_CHECK(verdict(gap2, later.context, height, error) ==
+                    std::optional<uint8_t>{VERDICT_CERT});
+        // Gap 2 down to the genesis committee: e_B3 = 2, e_E = 0.
+        const LineageFixture second{2};
+        const bridge::VerifierStateV2 genesis_verifier{second.Canonical(0, 99, params, index)};
+        BOOST_CHECK(genesis_verifier == behind);
+        BOOST_CHECK(verdict(genesis_verifier, second.context, height, error) ==
+                    std::optional<uint8_t>{0});
+    }
 
     // Records that cannot be judged are invalid.
     const auto refused = [&](const bridge::VerifierStateV2& state,
@@ -3745,11 +3917,20 @@ BOOST_AUTO_TEST_CASE(v2_verifier_verdicts)
     };
     v = canonical;
     v.current_epoch = 2;
-    refused(v, lineage.context, height, "neither the lineage epoch nor the one before it");
+    refused(v, lineage.context, height,
+            "bridge observation verifier epoch is outside the lineage's retained epochs (e_B3 - 2 .. e_B3)");
     {
-        const LineageFixture later{3};
-        refused(canonical, later.context, height,
-                "neither the lineage epoch nor the one before it");
+        // Gap 3: Set'_1 is no longer retained at e_B3 = 4, whatever the
+        // gate's max_epoch_gap.
+        const LineageFixture gap3{4};
+        BOOST_CHECK(!gap3.context.fresh->SetHashForEpoch(1));
+        refused(canonical, gap3.context, height,
+                "bridge observation verifier epoch is outside the lineage's retained epochs (e_B3 - 2 .. e_B3)");
+        Consensus::Params wide{params};
+        wide.bridge_v2->gate.max_epoch_gap = 3;
+        std::string why;
+        BOOST_CHECK(!node::VerifierVerdictV2(canonical, gap3.context, wide, index, height, why));
+        BOOST_CHECK(why.find("outside the lineage's retained epochs") != std::string::npos);
     }
     refused(canonical, lineage.context, 109, "above the parent block");
     {
@@ -3782,10 +3963,36 @@ BOOST_AUTO_TEST_CASE(v2_verifier_verdicts)
     VerifyFails(judged, Block(1'060, {Observe(world, SUBJECT_VERIFIER, anchor)}),
                 height, params, "verdict cannot be judged here");
     {
-        LineageFixture later{3};
+        LineageFixture gap3{4};
         VerifyFails(judged, Block(1'060, {Observe(world, SUBJECT_VERIFIER, anchor)}),
-                    height, params, "neither the lineage epoch nor the one before it",
-                    &later.context);
+                    height, params, "outside the lineage's retained epochs (e_B3 - 2 .. e_B3)",
+                    &gap3.context);
+    }
+    // Gap 2 connects with verdict 0, and the gate passes E3 (READY with
+    // fresh token and reserve observations). Once B3 rotates again the same
+    // observation trails by 3 and E3 closes the gate.
+    {
+        const LineageFixture later{3};
+        node::BridgeStateIndex gap2{ObservationIndex(params, world.StateRoot())};
+        VerifyFails(gap2, Block(1'060, {Observe(world, SUBJECT_VERIFIER, anchor, VERDICT_SETS)}),
+                    height, params, "verdict does not match B3's lineage", &later.context);
+        ConnectNext(gap2, params,
+                    {Observe(world, SUBJECT_TOKEN, anchor),
+                     Observe(world, SUBJECT_RESERVE, anchor),
+                     Observe(world, SUBJECT_VERIFIER, anchor)},
+                    1'060, &later.context);
+        BOOST_CHECK_EQUAL(gap2.LatestObservationV2(SUBJECT_VERIFIER)->verdict, 0);
+        BOOST_CHECK(!gap2.ConflictV2());
+        const auto ready{node::EvaluateBridgeV2BurnGate(
+            &later.context, gap2, params, gap2.ConnectedHeight() + 1, 1'061)};
+        BOOST_CHECK_MESSAGE(ready.readiness == node::BridgeBurnReadiness::READY,
+                            ready.Describe());
+        const LineageFixture rotated{4};
+        const auto aged{node::EvaluateBridgeV2BurnGate(
+            &rotated.context, gap2, params, gap2.ConnectedHeight() + 1, 1'061)};
+        BOOST_CHECK(aged.readiness == node::BridgeBurnReadiness::NOT_READY);
+        BOOST_CHECK_EQUAL(aged.Describe(),
+                          "E3: verifier epoch trails the lineage epoch by more than the limit");
     }
     ConnectNext(judged, params, {Observe(world, SUBJECT_VERIFIER, anchor)}, 1'060,
                 &lineage.context);
@@ -3935,6 +4142,852 @@ BOOST_AUTO_TEST_CASE(v2_sticky_conflict)
                                        Observe(honest, SUBJECT_RESERVE, receipts.block_hash)},
                 1'061);
     BOOST_CHECK(!honest_vault.ConflictV2());
+}
+
+BOOST_AUTO_TEST_CASE(v2_finality_conflict_judge)
+{
+    // Kind 13 (node changes section 8.5): a digest-V2 certificate of the
+    // lineage's CURRENT or NEXT committee that differs from B3's canonical
+    // statement at its checkpoint. LineageFixture is at e_B3 = 1 (Set'_1
+    // current, Set'_2 next, the same four members), epoch_starts {90, 100},
+    // checkpoints 99 (index 1, epoch 0), 109 (index 2, epoch 1), ...; the
+    // index is connected at V - 1 = 109, so a record in the block at V can
+    // name index 2 (H = 109) but not index 3 (H = 119).
+    const Consensus::Params params{LineageParams()};
+    BOOST_REQUIRE(modern::ModernChainDomain(params.hashGenesisBlock,
+                                            *params.legacy_final_hash) ==
+                  FixtureChainDomain());
+    BOOST_REQUIRE_EQUAL(params.modern_pos->checkpoint_interval, LineageFixture::INTERVAL);
+    const LineageFixture lineage;
+    node::BridgeStateIndex index{ObservationIndex(params, uint256{uint8_t{1}})};
+    const int height{BRIDGE_V2_HEIGHT};
+    BOOST_REQUIRE_EQUAL(index.ConnectedHeight(), height - 1);
+    const auto judge = [&](const bridge::BridgeFinalityConflictV2& record,
+                           const node::BridgeV2LineageContext& context,
+                           const int at, std::string& error) {
+        return node::JudgeFinalityConflictV2(record, context, params, index, at,
+                                             error);
+    };
+    const auto refused = [&](const bridge::BridgeFinalityConflictV2& record,
+                             const node::BridgeV2LineageContext& context,
+                             const int at, const std::string& expected) {
+        std::string why;
+        BOOST_CHECK(!judge(record, context, at, why));
+        BOOST_CHECK_MESSAGE(why == expected || why.find(expected) != std::string::npos,
+                            "'" << why << "' lacks '" << expected << "'");
+    };
+    const auto signed_record = [&](const modern::FinalizedBlockV2& fb) {
+        return ConflictRecord(fb, lineage.Signed(fb));
+    };
+
+    // Accepted: the current committee's epoch-1 statement of another branch
+    // at index 2, by all four members or by a quorum of three.
+    const modern::FinalizedBlockV2 other{OtherBranch(lineage, 1, 109, params, index)};
+    std::string error;
+    {
+        const auto accepted{judge(signed_record(other), lineage.context, height, error)};
+        BOOST_REQUIRE_MESSAGE(accepted, error);
+        BOOST_CHECK(*accepted == other);
+        BOOST_CHECK(judge(ConflictRecord(other, LineageFixture::Certificate(
+                                                    other, {0, 1, 3}, lineage.keys)),
+                          lineage.context, height, error));
+    }
+    // Accepted: the next committee (Set'_2) at the same checkpoint. B3 signs
+    // index 2 only in epoch 1, so an epoch-2 statement differs whatever its
+    // other fields, even the canonical block hash.
+    {
+        modern::FinalizedBlockV2 next_epoch{lineage.Statement(1, 109, params, index)};
+        next_epoch.epoch = 2;
+        const auto accepted{judge(signed_record(next_epoch), lineage.context, height, error)};
+        BOOST_REQUIRE_MESSAGE(accepted, error);
+        BOOST_CHECK_EQUAL(accepted->epoch, 2U);
+    }
+    // Accepted: the canonical statement with another successor hash (the
+    // successor field is deliberately unchecked), and a current-committee
+    // statement at an index of epoch 0 (H = 99), which B3 signs in epoch 0.
+    {
+        modern::FinalizedBlockV2 successor{lineage.Statement(1, 109, params, index)};
+        successor.validator_set_hash = TestHash(0x5e);
+        BOOST_CHECK_MESSAGE(judge(signed_record(successor), lineage.context, height, error), error);
+        modern::FinalizedBlockV2 earlier{lineage.Statement(0, 99, params, index)};
+        earlier.epoch = 1;
+        BOOST_CHECK_MESSAGE(judge(signed_record(earlier), lineage.context, height, error), error);
+    }
+
+    // Refused: B3's canonical statement itself, however aggregated.
+    {
+        const modern::FinalizedBlockV2 canonical{lineage.Statement(1, 109, params, index)};
+        refused(signed_record(canonical), lineage.context, height,
+                "bridge finality conflict equals B3's canonical statement");
+        refused(ConflictRecord(canonical, LineageFixture::Certificate(
+                                              canonical, {1, 2, 3}, lineage.keys)),
+                lineage.context, height,
+                "bridge finality conflict equals B3's canonical statement");
+    }
+    // Check 9 field by field. Index 2 is the fixture's finalized index, so
+    // B3's history root there is the finalized checkpoint's recorded root;
+    // without a finalized checkpoint it is rebuilt (FreshHistoryRootAt),
+    // with the same verdicts. Each field B3 forms, changed alone, is a
+    // conflict; the canonical statement is refused on both paths.
+    {
+        const modern::FinalizedBlockV2 canonical{lineage.Statement(1, 109, params, index)};
+        BOOST_CHECK(lineage.context.fresh->finalized->checkpoint_index == canonical.checkpoint_index);
+        BOOST_CHECK(lineage.context.fresh->finalized->history_root == canonical.checkpoint_history_root);
+        LineageFixture unfinalized;
+        unfinalized.Fresh().finalized.reset();
+        refused(signed_record(canonical), unfinalized.context, height,
+                "bridge finality conflict equals B3's canonical statement");
+        std::vector<modern::FinalizedBlockV2> changed(5, canonical);
+        changed[0].height = 110;
+        changed[1].block_hash = TestHash(0xbd);
+        changed[2].withdrawal_root = TestHash(0xbe);
+        changed[3].bridge_flags = modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED;
+        changed[4].checkpoint_history_root = TestHash(0xbf);
+        for (const modern::FinalizedBlockV2& fb : changed) {
+            for (const node::BridgeV2LineageContext* context :
+                 std::initializer_list<const node::BridgeV2LineageContext*>{&lineage.context,
+                                                                            &unfinalized.context}) {
+                const auto accepted{judge(signed_record(fb), *context, height, error)};
+                BOOST_CHECK_MESSAGE(accepted && *accepted == fb, error);
+            }
+        }
+    }
+    // Refused: older committees and committees beyond the next one, with a
+    // valid quorum of the same members: Set'_0 (e - 1), Set'_3 (e + 2), and
+    // at e_B3 = 3 the epoch-1 statement of Set'_1 (e - 2).
+    {
+        const modern::FinalizedBlockV2 previous{OtherBranch(lineage, 0, 99, params, index)};
+        refused(signed_record(previous), lineage.context, height,
+                "bridge finality conflict is not signed by the lineage's current or next committee");
+        modern::FinalizedBlockV2 beyond{other};
+        beyond.epoch = 3;
+        refused(signed_record(beyond), lineage.context, height,
+                "bridge finality conflict is not signed by the lineage's current or next committee");
+        const LineageFixture later{3};
+        refused(signed_record(other), later.context, height,
+                "bridge finality conflict is not signed by the lineage's current or next committee");
+        modern::FinalizedBlockV2 wrapped{other};
+        wrapped.epoch = std::numeric_limits<uint64_t>::max();
+        refused(signed_record(wrapped), lineage.context, height,
+                "bridge finality conflict is not signed by the lineage's current or next committee");
+    }
+    // Refused: another lineage.
+    {
+        modern::FinalizedBlockV2 foreign{other};
+        foreign.lineage_id = TestHash(0x1e);
+        refused(signed_record(foreign), lineage.context, height,
+                "bridge finality conflict names another lineage");
+    }
+    // Refused: a bitmap sized for another committee (n = 5 decodes with the
+    // same one-byte bitmap as n = 4).
+    refused(ConflictRecord(other, lineage.Signed(other), 5), lineage.context, height,
+            "bridge finality conflict bitmap does not match the signing committee");
+    // Refused: index 0, index 2^32, an index whose height leaves the int
+    // range, and checkpoints at or above the including block.
+    {
+        modern::FinalizedBlockV2 zero{other};
+        zero.checkpoint_index = 0;
+        refused(signed_record(zero), lineage.context, height,
+                "bridge finality conflict checkpoint index is out of range");
+        modern::FinalizedBlockV2 huge{other};
+        huge.checkpoint_index = modern::MAX_FINALITY_CHECKPOINT_INDEX;
+        refused(signed_record(huge), lineage.context, height,
+                "bridge finality conflict checkpoint index is out of range");
+        modern::FinalizedBlockV2 beyond_int{other};
+        beyond_int.checkpoint_index = 300'000'000; // H = 3,000,000,089
+        refused(signed_record(beyond_int), lineage.context, height,
+                "bridge finality conflict checkpoint index is out of range");
+        // H = 109 in the block at 109 (H = height), and index 3 (H = 119) in
+        // the block at V.
+        refused(signed_record(other), lineage.context, 109,
+                "bridge finality conflict checkpoint is above the parent block");
+        modern::FinalizedBlockV2 ahead{other};
+        ahead.checkpoint_index = 3;
+        ahead.height = 119;
+        refused(signed_record(ahead), lineage.context, height,
+                "bridge finality conflict checkpoint is above the parent block");
+        // An index is valid once its checkpoint is at or below the parent:
+        // index 3 of epoch 1 in the block at 125, where B3 cannot form its
+        // own statement (the index has not connected 119 >= V), is not
+        // judged, while an epoch-2 statement there differs by its epoch.
+        refused(signed_record(ahead), lineage.context, 125,
+                "bridge finality conflict: B3 cannot form its statement at the evidence checkpoint");
+        modern::FinalizedBlockV2 ahead_next{ahead};
+        ahead_next.epoch = 2;
+        BOOST_CHECK_MESSAGE(judge(signed_record(ahead_next), lineage.context, 125, error), error);
+    }
+    // Refused by the BLS check: two of four members (no quorum), keys no
+    // committee holds, and a statement changed after it was signed.
+    {
+        std::string why;
+        BOOST_CHECK(!judge(ConflictRecord(other, LineageFixture::Certificate(
+                                                     other, {0, 1}, lineage.keys)),
+                           lineage.context, height, why));
+        BOOST_CHECK_MESSAGE(why.starts_with("bridge finality conflict certificate does not verify: insufficient-"),
+                            why);
+        const std::vector<bls::SecretKey> rogue{FixtureBlsKeys(0x6b)};
+        refused(ConflictRecord(other, LineageFixture::Certificate(other, {0, 1, 2, 3}, rogue)),
+                lineage.context, height,
+                "bridge finality conflict certificate does not verify: bad-signature");
+        modern::FinalizedBlockV2 tampered{other};
+        tampered.block_hash = TestHash(0xbc);
+        refused(ConflictRecord(tampered, lineage.Signed(other)), lineage.context, height,
+                "bridge finality conflict certificate does not verify: bad-signature");
+        // The cheap checks run first: a forged record naming a checkpoint
+        // above the parent is refused for its checkpoint.
+        refused(ConflictRecord(other, LineageFixture::Certificate(other, {0, 1, 2, 3}, rogue)),
+                lineage.context, 109,
+                "bridge finality conflict checkpoint is above the parent block");
+    }
+    // Refused: a certificate that does not decode for its count (only a
+    // record built in memory can carry one; the codec refuses it).
+    {
+        bridge::BridgeFinalityConflictV2 truncated{signed_record(other)};
+        truncated.certificate.pop_back();
+        refused(truncated, lineage.context, height,
+                "bridge finality conflict certificate is malformed");
+    }
+    // Refused: no lineage to judge on.
+    {
+        LineageFixture broken;
+        broken.Fresh().lineage_broken = true;
+        refused(signed_record(other), broken.context, height,
+                "bridge finality conflict cannot be judged on a broken fresh lineage");
+        LineageFixture unbootstrapped;
+        unbootstrapped.Fresh().bootstrapped = false;
+        refused(signed_record(other), unbootstrapped.context, height,
+                "bridge finality conflict needs a bootstrapped fresh lineage");
+        refused(signed_record(other), node::BridgeV2LineageContext{}, height,
+                "bridge finality conflict needs a bootstrapped fresh lineage");
+        refused(signed_record(other), node::REPLAY_LINEAGE, height,
+                "bridge finality conflict needs a bootstrapped fresh lineage");
+    }
+    // Refused: no chain domain or no checkpoint grid.
+    {
+        Consensus::Params no_domain{params};
+        no_domain.legacy_final_hash.reset();
+        std::string why;
+        BOOST_CHECK(!node::JudgeFinalityConflictV2(signed_record(other), lineage.context,
+                                                   no_domain, index, height, why));
+        BOOST_CHECK_EQUAL(why, "bridge finality conflict needs a pinned chain domain");
+        Consensus::Params no_pos{params};
+        no_pos.modern_pos.reset();
+        BOOST_CHECK(!node::JudgeFinalityConflictV2(signed_record(other), lineage.context,
+                                                   no_pos, index, height, why));
+        BOOST_CHECK_EQUAL(why, "bridge finality conflict needs modern PoS checkpoint parameters");
+    }
+
+    // Through the index: a full context judges the record, no context
+    // refuses it, and below V it is not a record at all.
+    const CTransactionRef conflict{ConflictTransaction(signed_record(other))};
+    BOOST_CHECK(node::HasBridgeV2LineageRecord(*conflict));
+    BOOST_CHECK(node::HasBridgeV2LineageRecord(Block(1'060, {conflict})));
+    BOOST_CHECK(node::HasBridgeV2FinalityConflict(*conflict));
+    BOOST_CHECK(!node::HasDecentralizedBridgeBurn(*conflict));
+    BOOST_CHECK(!node::HasBridgeV2LineageRecord(*BurnTransactionV2(params, 1, 10, 0x91)));
+    BOOST_CHECK(!node::HasBridgeV2FinalityConflict(*BurnTransactionV2(params, 1, 10, 0x91)));
+    {
+        bridge_test::ObservationWorld world{HealthyWorld(params)};
+        const CTransactionRef observation{Observe(world, SUBJECT_TOKEN, AnchorHash(800))};
+        BOOST_CHECK(node::HasBridgeV2LineageRecord(*observation));
+        BOOST_CHECK(!node::HasBridgeV2FinalityConflict(*observation));
+    }
+    VerifyFails(index, Block(1'060, {conflict}), height, params,
+                "bridge finality conflict cannot be judged here");
+    VerifyFails(index, Block(1'060, {conflict}), height - 1, params,
+                "bridge record is malformed", &lineage.context);
+    VerifyFails(index, Block(1'060, {ConflictTransaction(signed_record(
+                           lineage.Statement(1, 109, params, index)))}),
+                height, params, "equals B3's canonical statement", &lineage.context);
+    {
+        node::BridgeBlockDelta delta;
+        BOOST_CHECK_MESSAGE(index.VerifyBlock(Block(1'060, {conflict}), height,
+                                              V2TestBlockHash(height), params, delta,
+                                              error, &lineage.context),
+                            error);
+        BOOST_CHECK(delta.finality_conflicts_v2_added ==
+                    std::vector<uint256>{modern::FinalityCertIdV2(other)});
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_finality_conflict_sticky)
+{
+    // Kind 13 through the index: the record sets the sticky conflict, which
+    // closes the burn gate at C4 for good (a burn after the record in the
+    // same block is refused at its position), refuses every later conflict
+    // of any kind, is reproduced by replay and is cleared only by the
+    // disconnect of its block.
+    const Consensus::Params params{LineageParams()};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{FundingReceipts(params)};
+    bridge_test::ObservationWorld world{HealthyWorld(params, 2, 100)};
+    node::BridgeStateIndex probe{FundingIndex(params, receipts, world.StateRoot())};
+    world.SetVerifier(lineage.Canonical(1, 109, params, probe));
+    // Anchor 701: a drained vault (locked 25 < 100 proven below the cut).
+    bridge_test::ObservationWorld drained{world};
+    drained.SetReserve(2, 25, 0, 25);
+
+    const modern::FinalizedBlockV2 other{OtherBranch(lineage, 1, 109, params, probe)};
+    const uint256 cert_id{modern::FinalityCertIdV2(other)};
+    const CTransactionRef conflict{
+        ConflictTransaction(ConflictRecord(other, lineage.Signed(other)))};
+    modern::FinalizedBlockV2 next_epoch{other};
+    next_epoch.epoch = 2;
+    const CTransactionRef second{
+        ConflictTransaction(ConflictRecord(next_epoch, lineage.Signed(next_epoch)))};
+    const modern::FinalizedBlockV2 canonical{lineage.Statement(1, 109, params, probe)};
+    const CTransactionRef identical{
+        ConflictTransaction(ConflictRecord(canonical, lineage.Signed(canonical)))};
+    const CTransactionRef burn{BurnTransactionV2(params, 1, 10, 0x91)};
+    const CTransactionRef drain{Observe(drained, SUBJECT_RESERVE, AnchorHash(701))};
+    const std::string c4{"C4: sticky conflict: finality conflict evidence"};
+    const std::string burn_refused{"bridge V2 burn gate is not ready at the burn: " + c4};
+
+    // One E5 conflict first: a later kind 13 is refused, in a later block or
+    // in the same one.
+    {
+        bridge_test::ObservationWorld forged_world{world};
+        bridge::VerifierStateV2 forged{lineage.Canonical(1, 109, params, probe)};
+        forged.latest_cert_id = TestHash(0x66);
+        forged_world.SetVerifier(forged);
+        const CTransactionRef e5{
+            Observe(forged_world, SUBJECT_VERIFIER, receipts.block_hash, VERDICT_CERT)};
+        node::BridgeStateIndex e5_index{FundingIndex(params, receipts, forged_world.StateRoot())};
+        VerifyFails(e5_index, Block(1'060, {e5, conflict}), BRIDGE_V2_HEIGHT, params,
+                    "bridge V2 sticky conflict is already set", &lineage.context);
+        ConnectNext(e5_index, params, {e5}, 1'060, &lineage.context);
+        BOOST_REQUIRE(e5_index.ConflictV2());
+        BOOST_CHECK_EQUAL(e5_index.ConflictV2()->reason, bridge::BRIDGE_V2_CONFLICT_E5);
+        VerifyFails(e5_index, Block(1'061, {conflict}), BRIDGE_V2_HEIGHT + 1, params,
+                    "bridge V2 sticky conflict is already set", &lineage.context);
+    }
+
+    // `index` judges with the full context, `replayed` replays the same
+    // blocks with REPLAY_LINEAGE, as BridgeStateTracker does.
+    node::BridgeStateIndex index{FundingIndex(params, receipts, world.StateRoot())};
+    node::BridgeStateIndex replayed{FundingIndex(params, receipts, world.StateRoot())};
+    const auto connect_both = [&](const std::vector<CTransactionRef>& txs,
+                                  const uint32_t time) {
+        const node::BridgeBlockDelta a{ConnectNext(index, params, txs, time, &lineage.context)};
+        const node::BridgeBlockDelta b{ConnectNext(replayed, params, txs, time, &node::REPLAY_LINEAGE)};
+        CheckSameV2Delta(a, b);
+        CheckSameAccounting(index, replayed);
+        return a;
+    };
+    connect_both({MintTransactionV2(params, receipts, 0, 60)}, 1'060);
+    connect_both({MintTransactionV2(params, receipts, 1, 40),
+                  Observe(world, SUBJECT_TOKEN, receipts.block_hash),
+                  Observe(world, SUBJECT_RESERVE, receipts.block_hash),
+                  Observe(world, SUBJECT_VERIFIER, receipts.block_hash)},
+                 1'061);
+    SeedStateAnchorsV2(index, {StateAnchor(701, 1'010, drained.StateRoot())});
+    SeedStateAnchorsV2(replayed, {StateAnchor(701, 1'010, drained.StateRoot())});
+    const int next{index.ConnectedHeight() + 1};
+    BOOST_REQUIRE(node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, next, 1'063)
+                      .readiness == node::BridgeBurnReadiness::READY);
+
+    // Without a context the record cannot be judged; the identical
+    // statement is refused by the judge, while replay only decodes it.
+    VerifyFails(index, Block(1'063, {conflict}), next, params,
+                "bridge finality conflict cannot be judged here");
+    VerifyFails(index, Block(1'063, {identical}), next, params,
+                "bridge finality conflict equals B3's canonical statement", &lineage.context);
+    {
+        node::BridgeBlockDelta trusted;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyBlock(Block(1'063, {identical}), next, V2TestBlockHash(next),
+                                              params, trusted, error, &node::REPLAY_LINEAGE),
+                            error);
+        BOOST_REQUIRE(trusted.conflict_v2_after);
+        BOOST_CHECK(trusted.conflict_v2_after->evidence_cert_id ==
+                    modern::FinalityCertIdV2(canonical));
+    }
+    // A burn after the record in the same block is refused at its position;
+    // before it the burn passes and the record still sets the conflict. An
+    // E8 RESERVE_E after the record leaves the kind 13 conflict in place; a
+    // kind 13 after an E8 RESERVE_E is refused.
+    VerifyFails(index, Block(1'063, {conflict, burn}), next, params, burn_refused,
+                &lineage.context);
+    VerifyFails(index, Block(1'063, {drain, conflict}), next, params,
+                "bridge V2 sticky conflict is already set", &lineage.context);
+    VerifyFails(index, Block(1'063, {conflict, second}), next, params,
+                "bridge V2 sticky conflict is already set", &lineage.context);
+    {
+        node::BridgeBlockDelta delta;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyBlock(Block(1'063, {burn, conflict, drain}), next,
+                                              V2TestBlockHash(next), params, delta, error,
+                                              &lineage.context),
+                            error);
+        BOOST_CHECK_EQUAL(delta.withdrawals_v2_added.size(), 1U);
+        BOOST_CHECK_EQUAL(delta.observations_v2_added.size(), 1U);
+        BOOST_REQUIRE(delta.conflict_v2_after);
+        BOOST_CHECK_EQUAL(delta.conflict_v2_after->reason, bridge::BRIDGE_V2_CONFLICT_KIND13);
+        BOOST_CHECK(delta.finality_conflicts_v2_added == std::vector<uint256>{cert_id});
+    }
+    // Block assembly: the preview takes the record, then refuses the burn
+    // and a second kind 13 after it, so the assembler skips both. Without a
+    // context the preview refuses the record itself.
+    {
+        std::string error;
+        auto preview{index.BeginBlockPreview(next, 1'063, TestHash(98), params, error, &lineage.context)};
+        BOOST_REQUIRE_MESSAGE(preview, error);
+        const std::array<CTransactionRef, 1> record_chunk{conflict};
+        const std::array<CTransactionRef, 1> burn_chunk{burn};
+        const std::array<CTransactionRef, 1> second_chunk{second};
+        BOOST_REQUIRE_MESSAGE(preview->TryAppend(record_chunk, error), error);
+        BOOST_CHECK(!preview->TryAppend(burn_chunk, error));
+        BOOST_CHECK_MESSAGE(error.find(burn_refused) != std::string::npos, error);
+        BOOST_CHECK(!preview->TryAppend(second_chunk, error));
+        BOOST_CHECK_EQUAL(error, "bridge V2 sticky conflict is already set");
+        auto blind{index.BeginBlockPreview(next, 1'063, TestHash(99), params, error)};
+        BOOST_REQUIRE_MESSAGE(blind, error);
+        BOOST_CHECK(!blind->TryAppend(record_chunk, error));
+        BOOST_CHECK_EQUAL(error, "bridge finality conflict cannot be judged here");
+    }
+    // Mempool admission and wallet prevalidation: one transaction on the
+    // connected state, judged only with the context.
+    {
+        node::BridgeTxAuthorization authorization;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyTransaction(*conflict, next, 1'063, params, authorization,
+                                                    error, &lineage.context),
+                            error);
+        BOOST_CHECK(!authorization.mint && !authorization.HasWithdrawal());
+        BOOST_CHECK(!index.VerifyTransaction(*conflict, next, 1'063, params, authorization, error));
+        BOOST_CHECK_EQUAL(error, "bridge finality conflict cannot be judged here");
+    }
+
+    // The exact delta, and every malformed variant of it refused atomically.
+    node::BridgeBlockDelta good;
+    {
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(index.VerifyBlock(Block(1'063, {conflict}), next, V2TestBlockHash(next),
+                                                params, good, error, &lineage.context),
+                              error);
+    }
+    const node::BridgeV2Conflict kind13{bridge::BRIDGE_V2_CONFLICT_KIND13, next,
+                                        V2TestBlockHash(next), 0, cert_id, 2, 1};
+    BOOST_CHECK(!good.conflict_v2_before);
+    BOOST_CHECK(good.conflict_v2_after == std::optional<node::BridgeV2Conflict>{kind13});
+    BOOST_CHECK(good.finality_conflicts_v2_added == std::vector<uint256>{cert_id});
+    BOOST_CHECK(good.observations_v2_added.empty());
+    const auto refused_delta = [&](const node::BridgeBlockDelta& delta,
+                                   const std::string& expected) {
+        std::string error;
+        BOOST_CHECK(!index.ConnectBlock(delta, error));
+        BOOST_CHECK_MESSAGE(error.find(expected) != std::string::npos,
+                            "'" << error << "' lacks '" << expected << "'");
+        BOOST_CHECK_EQUAL(index.ConnectedHeight(), next - 1);
+        BOOST_CHECK(!index.ConflictV2());
+    };
+    {
+        node::BridgeBlockDelta d{good};
+        d.finality_conflicts_v2_added.push_back(TestHash(0x77));
+        refused_delta(d, "malformed finality conflict");
+        d = good;
+        d.finality_conflicts_v2_added = {uint256{}};
+        refused_delta(d, "malformed finality conflict");
+        // Evidence without a newly set conflict.
+        d = good;
+        d.conflict_v2_after.reset();
+        refused_delta(d, "malformed finality conflict");
+        // Evidence on a non-V2 store.
+        d.v2_store = false;
+        refused_delta(d, "V2 accounting does not match its store");
+        // A kind 13 conflict that its evidence does not set.
+        d = good;
+        d.conflict_v2_after->anchor_block = 800;
+        refused_delta(d, "malformed sticky conflict");
+        d = good;
+        d.conflict_v2_after->height = next + 1;
+        refused_delta(d, "malformed sticky conflict");
+        d = good;
+        d.conflict_v2_after->block_hash = TestHash(0x78);
+        refused_delta(d, "malformed sticky conflict");
+        d = good;
+        d.conflict_v2_after->evidence_cert_id = TestHash(0x77);
+        refused_delta(d, "malformed sticky conflict");
+        d = good;
+        d.conflict_v2_after->evidence_cert_id.SetNull();
+        refused_delta(d, "malformed sticky conflict");
+        d = good;
+        d.conflict_v2_after->evidence_checkpoint_index = 0;
+        refused_delta(d, "malformed sticky conflict");
+        d = good;
+        d.finality_conflicts_v2_added.clear();
+        refused_delta(d, "malformed sticky conflict");
+        // The evidence cannot be relabelled as an E5 conflict.
+        d = good;
+        d.conflict_v2_after->reason = bridge::BRIDGE_V2_CONFLICT_E5;
+        refused_delta(d, "malformed sticky conflict");
+    }
+    {
+        // An E8 conflict carries no kind 13 evidence.
+        node::BridgeBlockDelta e8;
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(index.VerifyBlock(Block(1'063, {drain}), next, V2TestBlockHash(next),
+                                                params, e8, error, &lineage.context),
+                              error);
+        BOOST_REQUIRE(e8.conflict_v2_after);
+        BOOST_REQUIRE_EQUAL(e8.conflict_v2_after->reason, bridge::BRIDGE_V2_CONFLICT_E8);
+        node::BridgeBlockDelta d{e8};
+        d.finality_conflicts_v2_added = {cert_id};
+        refused_delta(d, "malformed finality conflict");
+        d = e8;
+        d.conflict_v2_after->evidence_cert_id = cert_id;
+        refused_delta(d, "malformed sticky conflict");
+        d = e8;
+        d.conflict_v2_after->evidence_epoch = 1;
+        refused_delta(d, "malformed sticky conflict");
+    }
+
+    // Connect: the exact conflict on both indexes; the gate is closed at C4.
+    const node::BridgeBlockDelta setting{connect_both({conflict}, 1'063)};
+    BOOST_CHECK(setting.finality_conflicts_v2_added == std::vector<uint256>{cert_id});
+    BOOST_CHECK(index.ConflictV2() == std::optional<node::BridgeV2Conflict>{kind13});
+    BOOST_CHECK(replayed.ConflictV2() == index.ConflictV2());
+    {
+        const auto gate{node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, next + 1, 1'064)};
+        BOOST_CHECK(gate.readiness == node::BridgeBurnReadiness::NOT_READY);
+        BOOST_CHECK(gate.row == bridge::BurnGateRowV2::C4);
+        BOOST_CHECK_EQUAL(gate.Describe(), c4);
+    }
+    // For good: burns, and a second conflict of any kind under any context.
+    VerifyFails(index, Block(1'064, {burn}), next + 1, params, burn_refused, &lineage.context);
+    for (const node::BridgeV2LineageContext* context :
+         {&lineage.context, &node::REPLAY_LINEAGE,
+          static_cast<const node::BridgeV2LineageContext*>(nullptr)}) {
+        VerifyFails(index, Block(1'064, {second}), next + 1, params,
+                    "bridge V2 sticky conflict is already set", context);
+    }
+    {
+        // Evidence after an existing conflict is malformed.
+        node::BridgeBlockDelta later;
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(index.VerifyBlock(Block(1'064, {}), next + 1, V2TestBlockHash(next + 1),
+                                                params, later, error, &lineage.context),
+                              error);
+        BOOST_CHECK(later.conflict_v2_before == later.conflict_v2_after);
+        later.finality_conflicts_v2_added = {cert_id};
+        BOOST_CHECK(!index.ConnectBlock(later, error));
+        BOOST_CHECK_MESSAGE(error.find("malformed finality conflict") != std::string::npos, error);
+    }
+    // A later E8 RESERVE_E connects and leaves the conflict as it is.
+    connect_both({drain}, 1'064);
+    BOOST_CHECK(index.ConflictV2() == std::optional<node::BridgeV2Conflict>{kind13});
+    BOOST_CHECK_EQUAL(index.LatestObservationV2(SUBJECT_RESERVE)->anchor_block, 701U);
+    // Undo above the setting block keeps it; undoing that block clears it,
+    // and the same record then sets it again.
+    Disconnect(index);
+    Disconnect(replayed);
+    BOOST_CHECK(index.ConflictV2() == std::optional<node::BridgeV2Conflict>{kind13});
+    Disconnect(index);
+    Disconnect(replayed);
+    BOOST_CHECK(!index.ConflictV2());
+    BOOST_CHECK(!replayed.ConflictV2());
+    CheckSameAccounting(index, replayed);
+    BOOST_CHECK(node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, next, 1'063)
+                    .readiness == node::BridgeBurnReadiness::READY);
+    connect_both({conflict}, 1'063);
+    BOOST_CHECK(index.ConflictV2() == std::optional<node::BridgeV2Conflict>{kind13});
+}
+
+BOOST_AUTO_TEST_CASE(finality_bridge_flags_v2)
+{
+    // bridgeFlags of B3's fresh-lineage statement (node changes sections 7.4
+    // and 8.5): 0 below V and on every chain without a complete bridge V2
+    // envelope; from V it fails closed for a height the index has not
+    // connected, is 0 before the sticky conflict and bit 0 from the
+    // conflict's block on, and only the disconnect of that block clears it.
+    const std::optional<uint8_t> open{uint8_t{0}};
+    const std::optional<uint8_t> closed{
+        modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED};
+    BOOST_REQUIRE_EQUAL(int{modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED}, 1);
+
+    // Mainnet and testnet keep bridge_v2 unset: 0 at every height.
+    for (const ChainType chain : {ChainType::MAIN, ChainType::TESTNET}) {
+        const auto chain_params{CreateChainParams(ArgsManager{}, chain)};
+        const Consensus::Params& consensus{chain_params->GetConsensus()};
+        BOOST_REQUIRE(!consensus.bridge_v2);
+        for (const int height : {0, 1'000'000, std::numeric_limits<int>::max()}) {
+            BOOST_CHECK(node::FinalityBridgeFlagsV2(height, consensus, nullptr) == open);
+            BOOST_CHECK(node::FreshLineageBridgeFlags(height, consensus, nullptr) == open);
+        }
+    }
+    // A V1-only test chain and an incomplete envelope: 0 too, index or not.
+    {
+        const Consensus::Params v1_only{FullyActiveBridgeParams(true)};
+        node::BridgeStateIndex v1_index;
+        ConnectEmptyThrough(v1_index, v1_only, BRIDGE_V2_HEIGHT + 2);
+        Consensus::Params incomplete{V2Params()};
+        incomplete.bridge_v2->vault.token_runtime_code_hash.SetNull();
+        for (const int height : {BRIDGE_HEIGHT, BRIDGE_V2_HEIGHT, BRIDGE_V2_HEIGHT + 5}) {
+            BOOST_CHECK(node::FinalityBridgeFlagsV2(height, v1_only, nullptr) == open);
+            BOOST_CHECK(node::FinalityBridgeFlagsV2(height, v1_only, &v1_index) == open);
+            BOOST_CHECK(node::FinalityBridgeFlagsV2(height, incomplete, nullptr) == open);
+        }
+    }
+
+    const Consensus::Params params{LineageParams()};
+    const LineageFixture lineage;
+    // Connected at V - 1 = 109.
+    node::BridgeStateIndex index{ObservationIndex(params, uint256{uint8_t{1}})};
+    BOOST_REQUIRE_EQUAL(index.ConnectedHeight(), BRIDGE_V2_HEIGHT - 1);
+    // Below V: 0 with or without the index.
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(BRIDGE_V2_HEIGHT - 1, params, nullptr) == open);
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(BRIDGE_V2_HEIGHT - 1, params, &index) == open);
+    // From V: nullopt without an index or for a height not connected yet.
+    BOOST_CHECK(!node::FinalityBridgeFlagsV2(BRIDGE_V2_HEIGHT, params, nullptr));
+    BOOST_CHECK(!node::FinalityBridgeFlagsV2(BRIDGE_V2_HEIGHT, params, &index));
+
+    // V .. 125 without a conflict: 0 at every connected height, including
+    // the grid checkpoint 119 (index 3, epoch 1).
+    const int pre_checkpoint{LineageFixture::GENESIS + 3 * 10};
+    const int post_checkpoint{pre_checkpoint + 10};
+    ConnectEmptyThrough(index, params, pre_checkpoint + 6);
+    for (int height{BRIDGE_V2_HEIGHT}; height <= index.ConnectedHeight(); ++height) {
+        BOOST_CHECK(node::FinalityBridgeFlagsV2(height, params, &index) == open);
+        BOOST_CHECK_EQUAL(index.BridgeFlagsV2AtHeight(height), 0);
+    }
+    const modern::FinalizedBlockV2 before{lineage.Statement(1, pre_checkpoint, params, index)};
+    BOOST_CHECK_EQUAL(before.bridge_flags, 0);
+
+    // A kind 13 record in block c = 126 sets the sticky conflict.
+    const modern::FinalizedBlockV2 other{OtherBranch(lineage, 1, 109, params, index)};
+    ConnectNext(index, params, {ConflictTransaction(ConflictRecord(other, lineage.Signed(other)))},
+                1'061, &lineage.context);
+    const int c{index.ConnectedHeight()};
+    BOOST_REQUIRE(index.ConflictV2());
+    BOOST_REQUIRE_EQUAL(index.ConflictV2()->reason, bridge::BRIDGE_V2_CONFLICT_KIND13);
+    BOOST_REQUIRE_EQUAL(index.ConflictV2()->height, c);
+    BOOST_REQUIRE(c < post_checkpoint);
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(c - 1, params, &index) == open);
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(c, params, &index) == closed);
+    BOOST_CHECK(!node::FinalityBridgeFlagsV2(c + 1, params, &index));
+    ConnectEmptyThrough(index, params, std::max(post_checkpoint, c + 5));
+    for (int height{BRIDGE_V2_HEIGHT}; height <= index.ConnectedHeight(); ++height) {
+        const std::optional<uint8_t> expected{height >= c ? closed : open};
+        BOOST_CHECK(node::FinalityBridgeFlagsV2(height, params, &index) == expected);
+        BOOST_CHECK(node::FreshLineageBridgeFlags(height, params, &index) == expected);
+    }
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(c - 1, params, &index) == open);
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(c, params, &index) == closed);
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(c + 5, params, &index) == closed);
+    BOOST_CHECK(!node::FinalityBridgeFlagsV2(index.ConnectedHeight() + 1, params, &index));
+
+    // B3's statement at the first grid checkpoint at or after c carries bit
+    // 0 (byte 184 of the 185-byte FinalizedBlockV2); a delayed statement
+    // below c keeps 0.
+    const modern::FinalizedBlockV2 flagged{lineage.Statement(1, post_checkpoint, params, index)};
+    BOOST_CHECK_EQUAL(flagged.bridge_flags, modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED);
+    const auto encoded{flagged.Encode()};
+    BOOST_REQUIRE_EQUAL(encoded.size(), 185U);
+    BOOST_CHECK_EQUAL(encoded[184], 0x01);
+    BOOST_CHECK(modern::FinalityCertIdV2(flagged) ==
+                Keccak(std::vector<unsigned char>(encoded.begin(), encoded.end())));
+    modern::FinalizedBlockV2 unflagged{flagged};
+    unflagged.bridge_flags = 0;
+    BOOST_CHECK(modern::FinalityCertIdV2(unflagged) != modern::FinalityCertIdV2(flagged));
+    BOOST_CHECK(lineage.Statement(1, pre_checkpoint, params, index) == before);
+
+    // Undo down to c keeps the flag; undoing c clears it, and an empty block
+    // at c then signs 0 there.
+    while (index.ConnectedHeight() > c) Disconnect(index);
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(c, params, &index) == closed);
+    Disconnect(index);
+    BOOST_CHECK(!index.ConflictV2());
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(c - 1, params, &index) == open);
+    BOOST_CHECK(!node::FinalityBridgeFlagsV2(c, params, &index));
+    ConnectNext(index, params, {}, 1'061, &lineage.context);
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(c, params, &index) == open);
+
+    // An E8 conflict closes deposits from its block the same way.
+    const ReceiptFixture receipts{FundingReceipts(params)};
+    bridge_test::ObservationWorld drained{HealthyWorld(params, 2, 100)};
+    drained.SetReserve(2, 99, 0, 99);
+    node::BridgeStateIndex vault{FundingIndex(params, receipts, drained.StateRoot())};
+    ConnectNext(vault, params, {MintTransactionV2(params, receipts, 0, 60)});
+    ConnectNext(vault, params, {MintTransactionV2(params, receipts, 1, 40)}, 1'061);
+    ConnectNext(vault, params, {Observe(drained, SUBJECT_RESERVE, receipts.block_hash)}, 1'062);
+    BOOST_REQUIRE(vault.ConflictV2());
+    BOOST_REQUIRE_EQUAL(vault.ConflictV2()->reason, bridge::BRIDGE_V2_CONFLICT_E8);
+    const int e8{vault.ConflictV2()->height};
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(e8 - 1, params, &vault) == open);
+    BOOST_CHECK(node::FinalityBridgeFlagsV2(e8, params, &vault) == closed);
+}
+
+BOOST_AUTO_TEST_CASE(v2_deposits_closed_reason)
+{
+    // node::BridgeV2DepositsClosedReason (node changes sections 7.5 and 8.5,
+    // "Deposits stop too"): B3 closes deposits for good on the sticky
+    // conflict (row C4), a broken fresh lineage (C2's permanent case), or a
+    // latest VERIFIER_E showing an impaired verifier (C1) or Verifier V2
+    // depositsClosed, in that order. Nothing else closes them, and only the
+    // disconnect of the closing block reopens them.
+    const Consensus::Params params{LineageParams()};
+    const LineageFixture lineage;
+    const int64_t expiry{params.bridge_v2->gate.set_expiry_seconds};
+    const node::BridgeStateIndex probe{ObservationIndex(params, uint256{uint8_t{1}})};
+    const bridge::VerifierStateV2 canonical{lineage.Canonical(1, 109, params, probe)};
+    BOOST_REQUIRE_EQUAL(canonical.last_rotation_time, 1'000);
+    LineageFixture broken;
+    broken.Fresh().lineage_broken = true;
+
+    // An index whose V2 light client retains anchor 800 at `t_obs` for
+    // `world`, connected at V - 1.
+    const auto index_at{[&](const bridge_test::ObservationWorld& world, const uint64_t t_obs) {
+        node::BridgeStateIndex index;
+        ConnectEmptyThrough(index, params, BRIDGE_V2_HEIGHT - 2);
+        const StateAnchorSpec anchor{StateAnchor(800, t_obs, world.StateRoot())};
+        SeedStateAnchorsV2(index, {anchor}, anchor);
+        return index;
+    }};
+    // The reason after the block at V connects a VERIFIER_E showing `v`,
+    // proven at anchor 800 (t_obs); the same without a lineage context; and
+    // open again once that block is disconnected.
+    const auto closed_by_verifier{[&](const bridge::VerifierStateV2& v, const uint64_t t_obs = 1'000,
+                                      const uint8_t verdict = 0) {
+        bridge_test::ObservationWorld world{HealthyWorld(params)};
+        world.SetVerifier(v);
+        node::BridgeStateIndex index{index_at(world, t_obs)};
+        BOOST_CHECK(!node::BridgeV2DepositsClosedReason(index, &lineage.context, params));
+        ConnectNext(index, params, {Observe(world, SUBJECT_VERIFIER, AnchorHash(800), verdict)},
+                    static_cast<uint32_t>(t_obs + 60), &lineage.context);
+        BOOST_REQUIRE(index.LatestObservationV2(SUBJECT_VERIFIER));
+        const auto reason{node::BridgeV2DepositsClosedReason(index, &lineage.context, params)};
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, nullptr, params) == reason);
+        // Mainnet and testnet keep bridge_v2 unset: never closed.
+        for (const ChainType chain : {ChainType::MAIN, ChainType::TESTNET}) {
+            const auto chain_params{CreateChainParams(ArgsManager{}, chain)};
+            BOOST_CHECK(!node::BridgeV2DepositsClosedReason(index, &lineage.context,
+                                                            chain_params->GetConsensus()));
+        }
+        Disconnect(index);
+        BOOST_CHECK(!index.LatestObservationV2(SUBJECT_VERIFIER));
+        BOOST_CHECK(!node::BridgeV2DepositsClosedReason(index, &lineage.context, params));
+        return reason;
+    }};
+    const std::string seen{"the latest VERIFIER_E (anchor block 800) shows "};
+
+    // Open: no observation, and a LIVE verifier whose deposits are open.
+    {
+        const node::BridgeStateIndex empty{ObservationIndex(params, uint256{uint8_t{1}})};
+        BOOST_CHECK(!node::BridgeV2DepositsClosedReason(empty, &lineage.context, params));
+        BOOST_CHECK(!node::BridgeV2DepositsClosedReason(empty, nullptr, params));
+    }
+    BOOST_CHECK(!closed_by_verifier(canonical));
+
+    // C1: halted, cancelled, and expired at the observation (one second past
+    // set_expiry; exactly at it the set is still live).
+    {
+        bridge::VerifierStateV2 halted{canonical};
+        halted.status = bridge::VERIFIER_STATUS_HALTED_CONFLICT;
+        BOOST_CHECK(closed_by_verifier(halted) ==
+                    std::optional<std::string>{seen + "the verifier is halted by a conflict"});
+        bridge::VerifierStateV2 cancelled{canonical};
+        cancelled.status = bridge::VERIFIER_STATUS_CANCELLED;
+        // Impairment is reported ahead of depositsClosed.
+        cancelled.deposits_closed = true;
+        BOOST_CHECK(closed_by_verifier(cancelled) ==
+                    std::optional<std::string>{seen + "the verifier is cancelled"});
+        BOOST_CHECK(!closed_by_verifier(canonical, static_cast<uint64_t>(1'000 + expiry)));
+        BOOST_CHECK(closed_by_verifier(canonical, static_cast<uint64_t>(1'000 + expiry + 1)) ==
+                    std::optional<std::string>{seen + "the verifier signing set had expired at the observation"});
+    }
+    // Ethereum's own close: a LIVE verifier showing depositsClosed.
+    {
+        bridge::VerifierStateV2 closed{canonical};
+        closed.deposits_closed = true;
+        BOOST_CHECK(closed_by_verifier(closed) ==
+                    std::optional<std::string>{seen + "Verifier V2 depositsClosed"});
+    }
+
+    // C2's permanent case: a broken fresh lineage, ahead of the verifier and
+    // read only from a lineage context.
+    {
+        bridge::VerifierStateV2 halted{canonical};
+        halted.status = bridge::VERIFIER_STATUS_HALTED_CONFLICT;
+        bridge_test::ObservationWorld world{HealthyWorld(params)};
+        world.SetVerifier(halted);
+        node::BridgeStateIndex index{index_at(world, 1'000)};
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, &broken.context, params) ==
+                    std::optional<std::string>{"the fresh finality lineage is broken"});
+        BOOST_CHECK(!node::BridgeV2DepositsClosedReason(index, nullptr, params));
+        ConnectNext(index, params, {Observe(world, SUBJECT_VERIFIER, AnchorHash(800))}, 1'060,
+                    &lineage.context);
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, &broken.context, params) ==
+                    std::optional<std::string>{"the fresh finality lineage is broken"});
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, nullptr, params) ==
+                    std::optional<std::string>{seen + "the verifier is halted by a conflict"});
+    }
+
+    // C4: the sticky conflict, ahead of everything, from E5 ...
+    {
+        bridge::VerifierStateV2 forged{canonical};
+        forged.latest_cert_id = TestHash(0x66);
+        const std::string e5{"sticky E5 conflict at height " + std::to_string(BRIDGE_V2_HEIGHT)};
+        BOOST_CHECK(closed_by_verifier(forged, 1'000, VERDICT_CERT) == std::optional<std::string>{e5});
+        // A conflict outranks a broken lineage and a later VERIFIER_E
+        // showing a halted verifier.
+        bridge_test::ObservationWorld world{HealthyWorld(params)};
+        world.SetVerifier(forged);
+        node::BridgeStateIndex index{index_at(world, 1'000)};
+        ConnectNext(index, params, {Observe(world, SUBJECT_VERIFIER, AnchorHash(800), VERDICT_CERT)}, 1'060,
+                    &lineage.context);
+        bridge::VerifierStateV2 halted{canonical};
+        halted.status = bridge::VERIFIER_STATUS_HALTED_CONFLICT;
+        bridge_test::ObservationWorld halted_world{world};
+        halted_world.SetVerifier(halted);
+        SeedStateAnchorsV2(index, {StateAnchor(801, 1'010, halted_world.StateRoot())});
+        ConnectNext(index, params, {Observe(halted_world, SUBJECT_VERIFIER, AnchorHash(801))}, 1'062,
+                    &lineage.context);
+        BOOST_REQUIRE_EQUAL(index.LatestObservationV2(SUBJECT_VERIFIER)->anchor_block, 801U);
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, &broken.context, params) ==
+                    std::optional<std::string>{e5});
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, nullptr, params) ==
+                    std::optional<std::string>{e5});
+    }
+    // ... kind 13 FINALITY_CONFLICT evidence ...
+    {
+        node::BridgeStateIndex index{ObservationIndex(params, uint256{uint8_t{1}})};
+        const modern::FinalizedBlockV2 other{OtherBranch(lineage, 1, 109, params, index)};
+        ConnectNext(index, params, {ConflictTransaction(ConflictRecord(other, lineage.Signed(other)))}, 1'061,
+                    &lineage.context);
+        BOOST_REQUIRE(index.ConflictV2());
+        BOOST_REQUIRE_EQUAL(index.ConflictV2()->reason, bridge::BRIDGE_V2_CONFLICT_KIND13);
+        const std::optional<std::string> kind13{"sticky kind 13 conflict at height " +
+                                                std::to_string(BRIDGE_V2_HEIGHT)};
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, &lineage.context, params) == kind13);
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, &broken.context, params) == kind13);
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, nullptr, params) == kind13);
+        // Later empty blocks keep it; only the disconnect of its block
+        // reopens deposits.
+        ConnectNext(index, params, {}, 1'062, &lineage.context);
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, &lineage.context, params) == kind13);
+        Disconnect(index);
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(index, &lineage.context, params) == kind13);
+        Disconnect(index);
+        BOOST_CHECK(!index.ConflictV2());
+        BOOST_CHECK(!node::BridgeV2DepositsClosedReason(index, &lineage.context, params));
+    }
+    // ... and E8 (a RESERVE_E failing invariant R).
+    {
+        const ReceiptFixture receipts{FundingReceipts(params)};
+        bridge_test::ObservationWorld drained{HealthyWorld(params, 2, 100)};
+        drained.SetReserve(2, 99, 0, 99);
+        node::BridgeStateIndex vault{FundingIndex(params, receipts, drained.StateRoot())};
+        ConnectNext(vault, params, {MintTransactionV2(params, receipts, 0, 60)});
+        ConnectNext(vault, params, {MintTransactionV2(params, receipts, 1, 40)}, 1'061);
+        BOOST_CHECK(!node::BridgeV2DepositsClosedReason(vault, &lineage.context, params));
+        ConnectNext(vault, params, {Observe(drained, SUBJECT_RESERVE, receipts.block_hash)}, 1'062);
+        BOOST_REQUIRE(vault.ConflictV2());
+        BOOST_CHECK(node::BridgeV2DepositsClosedReason(vault, &lineage.context, params) ==
+                    std::optional<std::string>{"sticky E8 conflict at height " +
+                                               std::to_string(vault.ConnectedHeight())});
+        Disconnect(vault);
+        BOOST_CHECK(!node::BridgeV2DepositsClosedReason(vault, &lineage.context, params));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(v2_reserve_ledger_mints_and_burns)
@@ -4242,16 +5295,19 @@ BOOST_AUTO_TEST_CASE(v2_incremental_equals_rebuild)
     // A V2 history with mints, every subject (a LIVE verifier judged by a
     // full context), burns and an E8 conflict, built incrementally and
     // rebuilt from scratch as BridgeStateTracker replays it. Every block's
-    // V2 delta and the final accounting agree field for field.
+    // V2 delta and the final accounting agree field for field. A second run
+    // adds a kind 13 FINALITY_CONFLICT block (judged by the full context,
+    // trusted on replay) after the burns: it sets the sticky conflict, and
+    // the RESERVE_E failing invariant R later leaves it in place.
     const Consensus::Params params{LineageParams()};
     const LineageFixture lineage;
     const ReceiptFixture receipts{FundingReceipts(params)};
     bridge_test::ObservationWorld world{HealthyWorld(params, 2, 100)};
     node::BridgeStateIndex probe{FundingIndex(params, receipts, world.StateRoot())};
     world.SetVerifier(lineage.Canonical(1, 109, params, probe));
-    node::BridgeStateIndex incremental{
-        FundingIndex(params, receipts, world.StateRoot())};
-    node::BridgeStateIndex rebuilt{FundingIndex(params, receipts, world.StateRoot())};
+    const modern::FinalizedBlockV2 other{OtherBranch(lineage, 1, 109, params, probe)};
+    const CTransactionRef conflict{
+        ConflictTransaction(ConflictRecord(other, lineage.Signed(other)))};
 
     // Each step is a block (with the lineage it is judged under) or a seed.
     struct Step {
@@ -4264,55 +5320,74 @@ BOOST_AUTO_TEST_CASE(v2_incremental_equals_rebuild)
     // cut, so invariant R fails (E8).
     bridge_test::ObservationWorld later{world};
     later.SetReserve(2, 25, 0, 25);
-    const std::vector<Step> steps{
-        {{MintTransactionV2(params, receipts, 0, 60)}, 1'060, false},
-        {{MintTransactionV2(params, receipts, 1, 40),
-          Observe(world, SUBJECT_TOKEN, receipts.block_hash),
-          Observe(world, SUBJECT_RESERVE, receipts.block_hash),
-          Observe(world, SUBJECT_VERIFIER, receipts.block_hash)},
-         1'061, true},
-        {{BurnTransactionV2(params, 1, 50, 0x91), BurnTransactionV2(params, 2, 22, 0x92)},
-         1'062, false},
-        {{}, 0, false, {StateAnchor(701, 1'010, later.StateRoot())}},
-        {{Observe(later, SUBJECT_RESERVE, AnchorHash(701)),
-          MintTransactionV2(params, receipts, 2, 30)},
-         1'063, false},
-    };
-    for (const Step& step : steps) {
-        if (!step.anchors.empty()) {
-            const node::BridgeBlockDelta a{SeedStateAnchorsV2(incremental, step.anchors)};
-            const node::BridgeBlockDelta b{SeedStateAnchorsV2(rebuilt, step.anchors)};
-            CheckSameV2Delta(a, b);
-            continue;
+    for (const bool with_kind13 : {false, true}) {
+        BOOST_TEST_MESSAGE("kind 13 block: " << with_kind13);
+        node::BridgeStateIndex incremental{
+            FundingIndex(params, receipts, world.StateRoot())};
+        node::BridgeStateIndex rebuilt{FundingIndex(params, receipts, world.StateRoot())};
+        std::vector<Step> steps{
+            {{MintTransactionV2(params, receipts, 0, 60)}, 1'060, false},
+            {{MintTransactionV2(params, receipts, 1, 40),
+              Observe(world, SUBJECT_TOKEN, receipts.block_hash),
+              Observe(world, SUBJECT_RESERVE, receipts.block_hash),
+              Observe(world, SUBJECT_VERIFIER, receipts.block_hash)},
+             1'061, true},
+            {{BurnTransactionV2(params, 1, 50, 0x91), BurnTransactionV2(params, 2, 22, 0x92)},
+             1'062, false},
+            {{}, 0, false, {StateAnchor(701, 1'010, later.StateRoot())}},
+            {{Observe(later, SUBJECT_RESERVE, AnchorHash(701)),
+              MintTransactionV2(params, receipts, 2, 30)},
+             1'063, false},
+        };
+        if (with_kind13) {
+            steps.insert(steps.begin() + 3, Step{{conflict}, 1'062, true});
         }
-        const node::BridgeBlockDelta a{ConnectNext(
-            incremental, params, step.block, step.time,
-            step.judged ? &lineage.context : nullptr)};
-        const node::BridgeBlockDelta b{ConnectNext(
-            rebuilt, params, step.block, step.time, &node::REPLAY_LINEAGE)};
-        CheckSameV2Delta(a, b);
+        for (const Step& step : steps) {
+            if (!step.anchors.empty()) {
+                const node::BridgeBlockDelta a{SeedStateAnchorsV2(incremental, step.anchors)};
+                const node::BridgeBlockDelta b{SeedStateAnchorsV2(rebuilt, step.anchors)};
+                CheckSameV2Delta(a, b);
+                continue;
+            }
+            const node::BridgeBlockDelta a{ConnectNext(
+                incremental, params, step.block, step.time,
+                step.judged ? &lineage.context : nullptr)};
+            const node::BridgeBlockDelta b{ConnectNext(
+                rebuilt, params, step.block, step.time, &node::REPLAY_LINEAGE)};
+            CheckSameV2Delta(a, b);
+            CheckSameAccounting(incremental, rebuilt);
+        }
+        BOOST_REQUIRE(incremental.ConflictV2());
+        if (with_kind13) {
+            BOOST_CHECK_EQUAL(incremental.ConflictV2()->reason, bridge::BRIDGE_V2_CONFLICT_KIND13);
+            BOOST_CHECK_EQUAL(incremental.ConflictV2()->anchor_block, 0U);
+            BOOST_CHECK(incremental.ConflictV2()->evidence_cert_id == modern::FinalityCertIdV2(other));
+            BOOST_CHECK_EQUAL(incremental.ConflictV2()->evidence_checkpoint_index, 2U);
+            BOOST_CHECK_EQUAL(incremental.ConflictV2()->evidence_epoch, 1U);
+        } else {
+            BOOST_CHECK_EQUAL(incremental.ConflictV2()->reason, bridge::BRIDGE_V2_CONFLICT_E8);
+            BOOST_CHECK_EQUAL(incremental.ConflictV2()->anchor_block, 701U);
+            BOOST_CHECK(incremental.ConflictV2()->evidence_cert_id.IsNull());
+        }
+        BOOST_CHECK_EQUAL(incremental.ReserveLedgerV2().minted, 130);
+        BOOST_CHECK_EQUAL(incremental.ReserveLedgerV2().burned, 72);
+        BOOST_CHECK_EQUAL(incremental.ProvenDepositsV2().size(), 3U);
+        BOOST_CHECK(incremental.LatestObservationV2(SUBJECT_VERIFIER));
+        BOOST_CHECK(incremental.LatestObservationV2(SUBJECT_TOKEN));
+        BOOST_CHECK_EQUAL(incremental.LatestObservationV2(SUBJECT_RESERVE)->anchor_block, 701U);
         CheckSameAccounting(incremental, rebuilt);
-    }
-    BOOST_REQUIRE(incremental.ConflictV2());
-    BOOST_CHECK_EQUAL(incremental.ConflictV2()->reason, bridge::BRIDGE_V2_CONFLICT_E8);
-    BOOST_CHECK_EQUAL(incremental.ConflictV2()->anchor_block, 701U);
-    BOOST_CHECK_EQUAL(incremental.ReserveLedgerV2().minted, 130);
-    BOOST_CHECK_EQUAL(incremental.ReserveLedgerV2().burned, 72);
-    BOOST_CHECK_EQUAL(incremental.ProvenDepositsV2().size(), 3U);
-    BOOST_CHECK(incremental.LatestObservationV2(SUBJECT_VERIFIER));
-    BOOST_CHECK(incremental.LatestObservationV2(SUBJECT_TOKEN));
-    BOOST_CHECK_EQUAL(incremental.LatestObservationV2(SUBJECT_RESERVE)->anchor_block, 701U);
-    CheckSameAccounting(incremental, rebuilt);
 
-    // Undo on both sides keeps them equal at every height.
-    while (incremental.ConnectedHeight() >= BRIDGE_V2_HEIGHT) {
-        Disconnect(incremental);
-        Disconnect(rebuilt);
-        CheckSameAccounting(incremental, rebuilt);
+        // Undo on both sides keeps them equal at every height.
+        while (incremental.ConnectedHeight() >= BRIDGE_V2_HEIGHT) {
+            Disconnect(incremental);
+            Disconnect(rebuilt);
+            CheckSameAccounting(incremental, rebuilt);
+        }
+        BOOST_CHECK(!incremental.ConflictV2());
+        BOOST_CHECK(incremental.ReserveLedgerV2() == bridge::ReserveLedgerV2{});
+        BOOST_CHECK(incremental.ProvenDepositsV2().empty());
+        BOOST_CHECK(incremental.ObservationsV2() == node::BridgeObservationSlotsV2{});
     }
-    BOOST_CHECK(incremental.ReserveLedgerV2() == bridge::ReserveLedgerV2{});
-    BOOST_CHECK(incremental.ProvenDepositsV2().empty());
-    BOOST_CHECK(incremental.ObservationsV2() == node::BridgeObservationSlotsV2{});
 }
 
 BOOST_AUTO_TEST_SUITE_END()

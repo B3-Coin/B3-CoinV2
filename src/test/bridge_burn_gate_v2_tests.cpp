@@ -222,6 +222,57 @@ BOOST_AUTO_TEST_CASE(c1_inputs_parameters_w2_and_impairment)
     }
 }
 
+BOOST_AUTO_TEST_CASE(verifier_impairment_is_c1s_reason)
+{
+    // VerifierImpairmentV2, which node::BridgeV2DepositsClosedReason also
+    // reads, returns exactly the gate's C1 impairment strings, and the gate
+    // refuses with them unchanged.
+    const BurnGateInputsV2 ready{ReadyInputs()};
+    BOOST_CHECK(!VerifierImpairmentV2(*ready.verifier, GATE_M));
+    const auto same_as_gate{[](const BurnGateInputsV2& in, const std::string_view reason) {
+        const auto impairment{VerifierImpairmentV2(*in.verifier, GATE_M)};
+        BOOST_REQUIRE(impairment);
+        BOOST_CHECK_EQUAL(*impairment, reason);
+        CheckRefused(in, BurnGateRowV2::C1, reason);
+    }};
+    BurnGateInputsV2 in{ready};
+    in.verifier->state.status = VERIFIER_STATUS_HALTED_CONFLICT;
+    same_as_gate(in, "verifier is halted by a conflict");
+    in.verifier->state.status = VERIFIER_STATUS_CANCELLED;
+    in.verifier->state.deposits_closed = true;
+    same_as_gate(in, "verifier is cancelled");
+    // Expiry: at set_expiry not impaired, one second more impaired.
+    in = ready;
+    in.verifier->state.last_rotation_time = in.verifier->t_obs - GATE_M.set_expiry_seconds;
+    BOOST_CHECK(!VerifierImpairmentV2(*in.verifier, GATE_M));
+    in.verifier->state.last_rotation_time -= 1;
+    same_as_gate(in, "verifier signing set had expired at the observation");
+    // depositsClosed, UNINITIALIZED and a stale observation are not C1
+    // impairments (E1 reads the last two).
+    in = ready;
+    in.verifier->state.deposits_closed = true;
+    BOOST_CHECK(!VerifierImpairmentV2(*in.verifier, GATE_M));
+    in.verifier->state.status = VERIFIER_STATUS_UNINITIALIZED;
+    BOOST_CHECK(!VerifierImpairmentV2(*in.verifier, GATE_M));
+    in = ready;
+    in.verifier->t_obs = T - 10 * GATE_M.observation_max_age_seconds;
+    in.verifier->state.last_rotation_time = in.verifier->t_obs;
+    BOOST_CHECK(!VerifierImpairmentV2(*in.verifier, GATE_M));
+    // A negative time skips the expiry comparison (no overflow); the gate
+    // refuses it first as out of range.
+    in = ready;
+    in.verifier->state.last_rotation_time = std::numeric_limits<int64_t>::min();
+    BOOST_CHECK(!VerifierImpairmentV2(*in.verifier, GATE_M));
+    CheckRefused(in, BurnGateRowV2::C1, "burn gate inputs are out of range");
+    in = ready;
+    in.verifier->t_obs = -1;
+    BOOST_CHECK(!VerifierImpairmentV2(*in.verifier, GATE_M));
+    CheckRefused(in, BurnGateRowV2::C1, "burn gate inputs are out of range");
+    in.verifier->t_obs = INT64_MAX_V;
+    in.verifier->state.last_rotation_time = 0;
+    same_as_gate(in, "verifier signing set had expired at the observation");
+}
+
 BOOST_AUTO_TEST_CASE(c2_lineage_and_committees)
 {
     {
@@ -399,9 +450,8 @@ BOOST_AUTO_TEST_CASE(e3_epoch_gap)
     in.verifier->state.current_epoch = 6;
     CheckRefused(in, BurnGateRowV2::E3, "verifier epoch is ahead of the lineage epoch");
     // Gap 2 passes (the handover into epoch 5 is certified: E6), gap 3 fails.
-    // On a chain, gap 2 is reached only by a VERIFIER_E judged at gap 1 and
-    // aged by a later rotation: node::VerifierVerdictV2 judges a new LIVE
-    // observation only at e_E in {e_B3, e_B3 - 1}.
+    // On a chain, node::VerifierVerdictV2 judges a new LIVE observation at
+    // e_E in [e_B3 - 2, e_B3] (bridge_state_tests: v2_verifier_verdicts).
     in.verifier->state.current_epoch = 3;
     CheckReady(in);
     in.verifier->state.current_epoch = 2;

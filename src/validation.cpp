@@ -584,6 +584,31 @@ static size_t RemoveStaleFnPodMempoolEntries(CTxMemPool& pool,
     return roots_removed;
 }
 
+/** Once a block sets the sticky bridge V2 conflict (node changes sections
+ * 8.4-8.5: kind 13, E5 or E8), every V2 burn (gate row C4) and every kind 13
+ * record ("already set") is invalid on that chain until the block is
+ * disconnected. Remove those roots and every in-mempool descendant, as for
+ * stale FN PoDs, so they do not wait for expiry and the wallet that made
+ * them can abandon them. */
+static size_t RemoveBridgeV2ClosedMempoolEntries(CTxMemPool& pool,
+                                                 const MemPoolRemovalReason reason)
+    EXCLUSIVE_LOCKS_REQUIRED(pool.cs)
+{
+    AssertLockHeld(pool.cs);
+    size_t roots_removed{0};
+    const auto entries{pool.infoAll()};
+    for (const TxMempoolInfo& entry : entries) {
+        if (!entry.tx || !pool.GetEntry(entry.tx->GetHash()) ||
+            !(node::HasDecentralizedBridgeBurn(*entry.tx) ||
+              node::HasBridgeV2FinalityConflict(*entry.tx))) {
+            continue;
+        }
+        ++roots_removed;
+        pool.removeRecursive(*entry.tx, reason);
+    }
+    return roots_removed;
+}
+
 //! The modern (deployment-derived) branch of GetBlockScriptFlags.
 static script_verify_flags GetModernBlockScriptFlags(const CBlockIndex& block_index, const ChainstateManager& chainman);
 
@@ -1254,15 +1279,15 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 args.m_accept_time, tip->GetMedianTimePast() + 1)};
             node::BridgeBurnReadiness burn_readiness{
                 node::BridgeBurnReadiness::READY};
-            // From V a burn (gate) or a kind 9 record (VERIFIER_E verdict)
-            // needs the fresh lineage projected for the next block. Block
-            // validation, block assembly and wallet prevalidation build the
-            // same context.
+            // From V a burn (gate), a kind 9 record (VERIFIER_E verdict) or
+            // a kind 13 record (FINALITY_CONFLICT judgement) needs the fresh
+            // lineage projected for the next block. Block validation, block
+            // assembly and wallet prevalidation build the same context.
             const bool bridge_v2_burn{bridge_v2 &&
                                       node::HasDecentralizedBridgeBurn(tx)};
             std::optional<node::BridgeV2LineageContext> bridge_lineage;
             if (bridge_v2_burn ||
-                (bridge_v2 && node::HasBridgeV2Observation(tx))) {
+                (bridge_v2 && node::HasBridgeV2LineageRecord(tx))) {
                 std::string lineage_reason;
                 bridge_lineage = node::MakeBridgeV2LineageContext(
                     m_active_chainstate.ModernFinality(),
@@ -3714,15 +3739,15 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 BlockValidationResult::BLOCK_CONSENSUS,
                 "bridge-withdrawal-rules-inactive");
         }
-        // From V a burn (gate) or a kind 9 record (VERIFIER_E verdict) is
-        // judged on the fresh lineage projected from the exact parent. Mempool
-        // admission, block assembly and wallet prevalidation build the same
-        // context.
+        // From V a burn (gate), a kind 9 record (VERIFIER_E verdict) or a
+        // kind 13 record (FINALITY_CONFLICT judgement) is judged on the
+        // fresh lineage projected from the exact parent. Mempool admission,
+        // block assembly and wallet prevalidation build the same context.
         const bool bridge_v2_burn{bridge_v2 &&
                                   node::HasDecentralizedBridgeBurn(block)};
         std::optional<node::BridgeV2LineageContext> bridge_lineage;
         if (bridge_v2_burn ||
-            (bridge_v2 && node::HasBridgeV2Observation(block))) {
+            (bridge_v2 && node::HasBridgeV2LineageRecord(block))) {
             std::string lineage_reason;
             bridge_lineage = node::MakeBridgeV2LineageContext(
                 ModernFinality(), m_chain, m_blockman, params.GetConsensus(),
@@ -5112,6 +5137,22 @@ bool Chainstate::ConnectTip(
                     stale_fn_roots, pindexNew->GetBlockHash().ToString(),
                     pindexNew->nHeight,
                     fn_pod_issued ? strprintf("%u", *fn_pod_issued) : "unavailable");
+        }
+
+        // B3 bridge V2 (regtest only while mainnet and testnet have no V2
+        // envelope): the block that set the sticky conflict closes V2 burns
+        // and kind 13 for good on this branch. REORG as above.
+        if (m_bridge_state && m_bridge_state->Synced(pindexNew->GetBlockHash()) &&
+            m_chainman.GetConsensus().BridgeV2RulesActive(pindexNew->nHeight)) {
+            const auto& conflict{m_bridge_state->Index().ConflictV2()};
+            if (conflict && conflict->height == pindexNew->nHeight &&
+                conflict->block_hash == pindexNew->GetBlockHash()) {
+                const size_t closed_roots{RemoveBridgeV2ClosedMempoolEntries(
+                    *m_mempool, MemPoolRemovalReason::REORG)};
+                LogInfo("Removed %zu bridge V2 burn or kind 13 mempool root(s): %s at height %d set the sticky bridge V2 conflict\n",
+                        closed_roots, pindexNew->GetBlockHash().ToString(),
+                        pindexNew->nHeight);
+            }
         }
 
         // B3: connecting the final legacy block H flips the next-block era to

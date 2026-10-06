@@ -405,6 +405,86 @@ BOOST_AUTO_TEST_CASE(asymmetric_vectors_pin_byte_order)
                       "1e250f522a8066b0a29859b588804d5ddfb574fb7f7436937d43fe36577f0c16");
 }
 
+BOOST_AUTO_TEST_CASE(finalized_block_v2_flags_vector)
+{
+    // finalized_block_v2[2] of the shared vectors file: the mainnet chain
+    // domain, the eight-leaf withdrawal root, epoch 1, index 11 (height 316)
+    // over leaves 0..10 and bridgeFlags bit 0, the statement B3 signs from
+    // the first checkpoint at or after a sticky conflict (node changes
+    // section 8.5) and Verifier V2 turns into depositsClosed (contracts spec
+    // section 3.3 step 11). Pins byte 184 and its effect on certId and the
+    // digest. Values copied from contracts/test/vectors/bridge_v2_vectors.json
+    // (see the provenance note at the top of this file).
+    const uint256 mainnet_domain{Evm("a651262ae9031646047f290513d77ccae0fa9bd4e5afe7e07155a08d5dd1486a")};
+    const uint256 genesis_hash{Evm("fa563b7b2b4bcc75cadc13fd8ea8f1a5b631700480730e20ffdb72941a6ee3f4")};
+    const ValidatorSetHeader v1{StandInHeaderV1(0)};
+    const uint256 set0{modern::ValidatorSetHash(modern::RulesetV2Header(v1, 0))};
+    const uint256 lineage{modern::FinalityLineageIdV2(mainnet_domain, 261, genesis_hash, set0)};
+    BOOST_CHECK_EQUAL(EvmHex(lineage), "85c07cad6344ff441cd0515aed266e0b1a116684ff99c4b38552620e1a9df29f");
+    const std::array<std::string_view, 12> grid_hashes{
+        "fa563b7b2b4bcc75cadc13fd8ea8f1a5b631700480730e20ffdb72941a6ee3f4", // 261
+        "3eb15e38c1fe49793d90a4ed8a01f0cb39c2fd362fc0afc4d32041913bb6442e", // 266
+        "5bc77028bff2710500506b584d72eb0b7ace2a6b7f259e21fa2faee06011c2f4", // 271
+        "9acce4f0475155d779394c25c31eb5a7446e91a4d6bca9e630b9b80e22a1684f", // 276
+        "73736192039f036c5dd8e98370ffe24f2effc3ccfa3b8f09026fc064d87a7b6d", // 281
+        "2b296f0b926fa2db63d332bbd28fc85445f0ea7bf64e73ac174b86ab31785e79", // 286
+        "7279a345a305d6e9b6c3ce1b77692c398d191c476dcd25bc73f8b30264dea964", // 291
+        "87e91fe7737b012fab0967ba4574b3dbddaf2ee8a53b104a1f26c34d7f63dc60", // 296
+        "c3cf63c20df794b427750c4b7675443cc29dda3e1feef23bf9800bc7f1d5cc99", // 301
+        "e0b40c08d7041b3ceb68255187ef02effc75ee224200ba721aac95489b5fc0b4", // 306
+        "501b43b36bcf95465ad96973918744260549166c3d9264647c1e78360d197479", // 311
+        "83a5be6d241644877a3d9ef8563cc15c190fc5fff279e42098f642c2c74101a9", // 316
+    };
+    std::vector<uint256> leaves11;
+    for (uint64_t i{0}; i < 11; ++i) leaves11.push_back(modern::FinalityHistoryLeaf(261 + 5 * i, Evm(grid_hashes[i])));
+    const auto root11{modern::FinalityHistoryRoot(leaves11)};
+    BOOST_REQUIRE(root11);
+    BOOST_CHECK_EQUAL(EvmHex(*root11), "6b93a456c4b9eeac87c4d4cc597a0536d2f658ea45e4f4d0db3b0a567afac2e5");
+
+    FinalizedBlockV2 fb;
+    fb.lineage_id = lineage;
+    fb.height = 316;
+    fb.block_hash = Evm(grid_hashes[11]);
+    fb.withdrawal_root = Evm("e2b107af8daa890eec0fef52f0f558733348e1cadf982fb8eec04124eb44d79a");
+    fb.validator_set_hash = modern::ValidatorSetHash(modern::RulesetV2Header(v1, 2));
+    fb.epoch = 1;
+    fb.checkpoint_index = 11;
+    fb.checkpoint_history_root = *root11;
+    fb.bridge_flags = modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED;
+    BOOST_CHECK_EQUAL(EvmHex(fb.validator_set_hash),
+                      "0a4058e802574e1406a3305205d4ccac56aba330908794d6b8509b77443fd9b9");
+    const std::string encoded_hex{
+        "85c07cad6344ff441cd0515aed266e0b1a116684ff99c4b38552620e1a9df29f"
+        "000000000000013c"
+        "83a5be6d241644877a3d9ef8563cc15c190fc5fff279e42098f642c2c74101a9"
+        "e2b107af8daa890eec0fef52f0f558733348e1cadf982fb8eec04124eb44d79a"
+        "0a4058e802574e1406a3305205d4ccac56aba330908794d6b8509b77443fd9b9"
+        "0000000000000001"
+        "000000000000000b"
+        "6b93a456c4b9eeac87c4d4cc597a0536d2f658ea45e4f4d0db3b0a567afac2e5"
+        "01"};
+    const auto enc{fb.Encode()};
+    BOOST_CHECK_EQUAL(HexStr(enc), encoded_hex);
+    BOOST_CHECK_EQUAL(enc[184], 0x01);
+    BOOST_CHECK_EQUAL(EvmHex(modern::FinalityDigestV2(mainnet_domain, fb)),
+                      "927834785ecf269ea326fed29f5ab511733c30b65361a0a16b82c7e422722a16");
+    BOOST_CHECK_EQUAL(EvmHex(modern::FinalityCertIdV2(fb)),
+                      "d3452183c28cb5ff730df9693a609f9c5a2923bf2f4ecfdce57f684a4f98d363");
+    // The decoder reads the flag back; bit 0 is the only known flag.
+    const auto decoded{FinalizedBlockV2::Decode(ParseHex(encoded_hex))};
+    BOOST_REQUIRE(decoded);
+    BOOST_CHECK(*decoded == fb);
+    BOOST_CHECK_EQUAL(decoded->bridge_flags, 0x01);
+
+    // The same fields with flags 0 give another digest and certId, so a
+    // quorum's flags-0 signature never stands for the flagged statement.
+    FinalizedBlockV2 open{fb};
+    open.bridge_flags = 0;
+    BOOST_CHECK_EQUAL(HexStr(open.Encode()), encoded_hex.substr(0, 2 * 184) + "00");
+    BOOST_CHECK(modern::FinalityDigestV2(mainnet_domain, open) != modern::FinalityDigestV2(mainnet_domain, fb));
+    BOOST_CHECK(modern::FinalityCertIdV2(open) != modern::FinalityCertIdV2(fb));
+}
+
 BOOST_AUTO_TEST_CASE(history_paths_fold_to_root)
 {
     // (c) Asymmetric leaves at the regtest grid 261 + 5i.
