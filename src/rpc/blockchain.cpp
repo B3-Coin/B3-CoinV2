@@ -4689,7 +4689,9 @@ static RPCHelpMan getbridgeproofstatus()
         "order returned by Ethereum JSON-RPC). A query never changes bridge "
         "state and exposes no wallet data. From the bridge V2 activation height "
         "(regtest only) anchors come from the bridge V2 store and deposit ids "
-        "name the Vault V2 entry (nullifier namespace 2).\n",
+        "name the Vault V2 entry (nullifier namespace 2); with a pinned B-23 "
+        "successor the same id is also reported for the successor vault, "
+        "whose deposit ids count separately.\n",
         {
             {"execution_hash", RPCArg::Type::STR_HEX,
              RPCArg::Optional::OMITTED,
@@ -4715,6 +4717,13 @@ static RPCHelpMan getbridgeproofstatus()
                       {RPCResult::Type::OBJ, "deposit", /*optional=*/true, "Requested configured-vault deposit",
                        {
                            {RPCResult::Type::NUM, "deposit_id", "Ethereum vault deposit id"},
+                           {RPCResult::Type::BOOL, "claimed", "Whether B3 has already minted this deposit"},
+                           {RPCResult::Type::NUM, "claimed_height", /*optional=*/true, "B3 height that claimed the deposit"},
+                           {RPCResult::Type::STR_HEX, "claimed_block", /*optional=*/true, "B3 block that claimed the deposit"},
+                       }},
+                      {RPCResult::Type::OBJ, "successor_deposit", /*optional=*/true, "From the bridge V2 activation height with a pinned B-23 successor only: the same deposit id of the successor Vault V2 (its own nullifiers in namespace 2)",
+                       {
+                           {RPCResult::Type::NUM, "deposit_id", "Successor vault deposit id"},
                            {RPCResult::Type::BOOL, "claimed", "Whether B3 has already minted this deposit"},
                            {RPCResult::Type::NUM, "claimed_height", /*optional=*/true, "B3 height that claimed the deposit"},
                            {RPCResult::Type::STR_HEX, "claimed_block", /*optional=*/true, "B3 block that claimed the deposit"},
@@ -4806,9 +4815,25 @@ static RPCHelpMan getbridgeproofstatus()
                 }
                 result.pushKV("anchor", std::move(anchor_json));
             }
-            if (deposit_id) {
+            // One deposit id's mint status under `key`.
+            const auto deposit_status{[&](const bridge::BridgeDepositKey& key) {
                 UniValue deposit_json{UniValue::VOBJ};
-                deposit_json.pushKV("deposit_id", *deposit_id);
+                deposit_json.pushKV("deposit_id", key.deposit_id);
+                const bool claimed{
+                    index && consensus.busd_bridge && index->IsNullified(key)};
+                deposit_json.pushKV("claimed", claimed);
+                if (claimed) {
+                    if (const auto connection{
+                            index->NullifierConnection(key)}) {
+                        deposit_json.pushKV("claimed_height",
+                                            connection->height);
+                        deposit_json.pushKV("claimed_block",
+                                            connection->block_hash.GetHex());
+                    }
+                }
+                return deposit_json;
+            }};
+            if (deposit_id) {
                 const bridge::BridgeDepositKey key{
                     v2_store
                         ? bridge::BridgeDepositKey{
@@ -4824,19 +4849,18 @@ static RPCHelpMan getbridgeproofstatus()
                                   ? consensus.busd_bridge->asset.vault_address
                                   : bridge::EthAddress{},
                               *deposit_id}};
-                const bool claimed{
-                    index && consensus.busd_bridge && index->IsNullified(key)};
-                deposit_json.pushKV("claimed", claimed);
-                if (claimed) {
-                    if (const auto connection{
-                            index->NullifierConnection(key)}) {
-                        deposit_json.pushKV("claimed_height",
-                                            connection->height);
-                        deposit_json.pushKV("claimed_block",
-                                            connection->block_hash.GetHex());
-                    }
+                result.pushKV("deposit", deposit_status(key));
+                // B-23 (node changes section 7.6): the successor vault keeps
+                // its own deposit ids, so the same id names another deposit.
+                if (v2_store && consensus.bridge_v2->successor) {
+                    const Consensus::BridgeV2VaultEntry& next{
+                        consensus.bridge_v2->successor->entry};
+                    result.pushKV("successor_deposit",
+                                  deposit_status(bridge::BridgeDepositKey{
+                                      next.origin_chain_id, next.vault_address,
+                                      *deposit_id,
+                                      bridge::BRIDGE_NULLIFIER_NAMESPACE_V2}));
                 }
-                result.pushKV("deposit", std::move(deposit_json));
             }
             return result;
         },
@@ -5729,9 +5753,27 @@ const Consensus::BridgeV2Params& EnsureBridgeV2Configured(const Consensus::Param
 
 // -- Kind 9 ETH_STATE_OBSERVATION rendering (node changes section 8.2) ------
 
+//! Every kind 9 subject, in slot order: VERIFIER_E, RESERVE_E, TOKEN_FLAGS
+//! and the B-23 successor's RESERVE_E_SUCCESSOR and TOKEN_FLAGS_SUCCESSOR
+//! (node changes section 7.6). Written out in full: a list shorter than the
+//! array would zero-fill, and subject 0 has no slot.
 constexpr std::array<uint8_t, node::BRIDGE_V2_OBSERVATION_SUBJECTS> BRIDGE_V2_OBSERVATION_SUBJECT_LIST{
     bridge::ETH_OBSERVATION_SUBJECT_VERIFIER, bridge::ETH_OBSERVATION_SUBJECT_RESERVE,
-    bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS};
+    bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS, bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR,
+    bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR};
+static_assert([] {
+    for (size_t i{0}; i < BRIDGE_V2_OBSERVATION_SUBJECT_LIST.size(); ++i) {
+        if (node::BridgeObservationSlotV2(BRIDGE_V2_OBSERVATION_SUBJECT_LIST[i]) != i) return false;
+    }
+    return true;
+}());
+
+//! Whether a kind 9 subject reads the B-23 successor vault v'.
+bool IsSuccessorObservationSubject(const uint8_t subject)
+{
+    return bridge::EthObservationBaseSubject(subject) != 0 &&
+           bridge::EthObservationEntryRole(subject) == Consensus::BridgeV2EntryRole::SUCCESSOR;
+}
 
 const char* ObservationSubjectName(const uint8_t subject)
 {
@@ -5739,6 +5781,8 @@ const char* ObservationSubjectName(const uint8_t subject)
     case bridge::ETH_OBSERVATION_SUBJECT_VERIFIER: return "VERIFIER_E";
     case bridge::ETH_OBSERVATION_SUBJECT_RESERVE: return "RESERVE_E";
     case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS: return "TOKEN_FLAGS";
+    case bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR: return "RESERVE_E_SUCCESSOR";
+    case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR: return "TOKEN_FLAGS_SUCCESSOR";
     }
     return "unknown";
 }
@@ -5750,6 +5794,8 @@ const char* ObservationSubjectKey(const uint8_t subject)
     case bridge::ETH_OBSERVATION_SUBJECT_VERIFIER: return "verifier_e";
     case bridge::ETH_OBSERVATION_SUBJECT_RESERVE: return "reserve_e";
     case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS: return "token_flags";
+    case bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR: return "reserve_e_successor";
+    case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR: return "token_flags_successor";
     }
     return "unknown";
 }
@@ -5783,13 +5829,16 @@ const char* BridgeV2ConflictName(const uint8_t reason)
 std::vector<RPCResult> ObservedValueResults(const std::optional<uint8_t> subject)
 {
     const bool optional{!subject};
+    // A successor subject decodes as its base subject, read from v'.
+    const std::optional<uint8_t> base{subject ? std::optional<uint8_t>{bridge::EthObservationBaseSubject(*subject)}
+                                              : std::nullopt};
     std::vector<RPCResult> out;
     std::set<std::string> seen;
     const auto add{[&](const RPCResult::Type type, const std::string& key, const std::string& description) {
         if (seen.insert(key).second) out.emplace_back(type, key, optional, description);
     }};
     using T = RPCResult::Type;
-    if (!subject || *subject == bridge::ETH_OBSERVATION_SUBJECT_VERIFIER) {
+    if (!base || *base == bridge::ETH_OBSERVATION_SUBJECT_VERIFIER) {
         add(T::NUM, "current_epoch", "VERIFIER_E: Liveness.currentEpoch (e_E)");
         add(T::NUM, "last_rotation_time", "VERIFIER_E: Liveness.lastRotationTime (Unix seconds)");
         add(T::NUM, "last_certificate_time", "VERIFIER_E: Liveness.lastCertificateTime (Unix seconds)");
@@ -5805,18 +5854,18 @@ std::vector<RPCResult> ObservedValueResults(const std::optional<uint8_t> subject
         add(T::STR_HEX, "latest_cert_id", "VERIFIER_E: latestCertId (slot 6, raw bytes)");
         add(T::STR_HEX, "verifier_code_hash", "VERIFIER_E: observed Verifier V2 extcodehash");
     }
-    if (!subject || *subject == bridge::ETH_OBSERVATION_SUBJECT_RESERVE) {
+    if (!base || *base == bridge::ETH_OBSERVATION_SUBJECT_RESERVE) {
         add(T::NUM, "next_deposit_id", "RESERVE_E: Vault V2 nextDepositId, the cut of P_pre / P_post");
         add(T::NUM, "locked", "RESERVE_E: Vault V2 locked (raw six-decimal units)");
         add(T::NUM, "absorbed_total", "RESERVE_E: Vault V2 absorbedTotal (raw)");
         add(T::NUM, "balance", "RESERVE_E: the token's balances[vault], B (raw)");
         add(T::STR_HEX, "vault_code_hash", "RESERVE_E: observed Vault V2 extcodehash");
     }
-    if (!subject || *subject == bridge::ETH_OBSERVATION_SUBJECT_RESERVE ||
-        *subject == bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS) {
+    if (!base || *base == bridge::ETH_OBSERVATION_SUBJECT_RESERVE ||
+        *base == bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS) {
         add(T::STR_HEX, "token_code_hash", "RESERVE_E and TOKEN_FLAGS: observed token extcodehash (equal to its pin)");
     }
-    if (!subject || *subject == bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS) {
+    if (!base || *base == bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS) {
         add(T::STR_HEX, "owner", "TOKEN_FLAGS: token owner (slot 0)");
         add(T::BOOL, "paused", "TOKEN_FLAGS: token paused (slot 0)");
         add(T::STR_HEX, "upgraded_address", "TOKEN_FLAGS: token upgradedAddress (slot 10)");
@@ -5898,9 +5947,13 @@ UniValue ObservationRecordJson(const node::BridgeObservationRecordV2& record)
 /**
  * getbridgev2info's observation_plan: the newest retained V2 anchor with a
  * state root and, per subject, the eth_getProof calls (accounts and storage
- * keys, in record order) a relayer makes at that anchor's block.
+ * keys, in record order) a relayer makes at that anchor's block. The B-23
+ * successor subjects (0x12 and 0x13) are listed only when `migration_active`
+ * (the next block may carry them), each planned with the pins of its own
+ * vault entry.
  */
-UniValue ObservationPlanJson(const bridge::ObservationPins& pins, const node::BridgeStateIndex* index)
+UniValue ObservationPlanJson(const Consensus::BridgeV2Params& v2, const bool migration_active,
+                             const node::BridgeStateIndex* index)
 {
     UniValue plan{UniValue::VOBJ};
     const auto anchor{index ? index->NewestStateAnchorV2() : std::nullopt};
@@ -5915,6 +5968,9 @@ UniValue ObservationPlanJson(const bridge::ObservationPins& pins, const node::Br
     }
     UniValue subjects{UniValue::VARR};
     for (const uint8_t subject : BRIDGE_V2_OBSERVATION_SUBJECT_LIST) {
+        if (IsSuccessorObservationSubject(subject) && !migration_active) continue;
+        const bridge::ObservationPins pins{
+            bridge::ObservationPinsFromParams(v2, bridge::EthObservationEntryRole(subject))};
         UniValue entry{UniValue::VOBJ};
         entry.pushKV("subject", int{subject});
         entry.pushKV("name", ObservationSubjectName(subject));
@@ -5936,6 +5992,153 @@ UniValue ObservationPlanJson(const bridge::ObservationPins& pins, const node::Br
     }
     plan.pushKV("subjects", std::move(subjects));
     return plan;
+}
+
+//! getbridgev2info's documentation of a vault entry's reserve ledger (the
+//! launch entry's "reserve" and the successor's "successor.reserve").
+std::vector<RPCResult> ReserveLedgerResults()
+{
+    return {
+        {RPCResult::Type::NUM, "minted", "bUSD V2 minted against proven deposits"},
+        {RPCResult::Type::NUM, "burned", "burned_v: leaf V2 amounts appended"},
+        {RPCResult::Type::NUM, "credited", "C_v: migration amounts credited on proven arrival"},
+        {RPCResult::Type::NUM, "transit", "transit_v: amounts paid toward this entry and not yet credited"},
+        {RPCResult::Type::NUM, "reserve", /*optional=*/true, "reserve_v = minted + credited - burned, the bound of burn check 2"},
+        {RPCResult::Type::NUM, "proven_deposits", "Number of Vault V2 deposits proven (minted)"},
+        {RPCResult::Type::NUM, "invariant_r_margin", /*optional=*/true, "With a RESERVE_E: observed locked - (P_pre + credited - burned) on the current ledger; invariant R holds while it is at least zero (a failure when the observation connected set the sticky E8 conflict)"},
+        {RPCResult::Type::NUM, "wind_down_headroom", /*optional=*/true, "With a RESERVE_E: the largest first burn of the next block that burn check 3 (the wind-down bound) admits; negative when the appended leaves already exceed it"},
+    };
+}
+
+/**
+ * The reserve ledger of vault entry `role` and, given that entry's latest
+ * RESERVE_E (RESERVE_E_SUCCESSOR for v'), its invariant R margin and
+ * wind-down headroom at that observation's cut, as burn check 3 and
+ * invariant R take them (no deposits pending in a block).
+ */
+UniValue ReserveLedgerJson(const node::BridgeStateIndex& index, const Consensus::BridgeV2Params& v2,
+                           const Consensus::BridgeV2EntryRole role)
+{
+    const bridge::ReserveLedgerV2& ledger{index.ReserveLedgerV2(role)};
+    UniValue reserve{UniValue::VOBJ};
+    reserve.pushKV("minted", ledger.minted);
+    reserve.pushKV("burned", ledger.burned);
+    reserve.pushKV("credited", ledger.credited);
+    reserve.pushKV("transit", ledger.transit);
+    if (const auto amount{ledger.Reserve()}) reserve.pushKV("reserve", *amount);
+    reserve.pushKV("proven_deposits", static_cast<uint64_t>(index.ProvenDepositsV2(role).size()));
+    const uint8_t subject{role == Consensus::BridgeV2EntryRole::SUCCESSOR
+                              ? bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR
+                              : bridge::ETH_OBSERVATION_SUBJECT_RESERVE};
+    const auto observed{index.LatestObservationV2(subject)};
+    const auto* state{observed ? std::get_if<bridge::ReserveStateV2>(&observed->state) : nullptr};
+    if (state) {
+        const auto sums{index.ProvenDepositSumsAtV2(role, state->next_deposit_id)};
+        if (sums) {
+            if (const auto margin{bridge::InvariantRMarginV2(state->locked, sums->below_cut, ledger)}) {
+                reserve.pushKV("invariant_r_margin", *margin);
+            }
+            if (const auto terms{bridge::ComputeWindDownTerms(*state, *sums, ledger, v2.gate.wind_down_margin_ppm)}) {
+                reserve.pushKV("wind_down_headroom", terms->headroom);
+            }
+        }
+    }
+    return reserve;
+}
+
+/**
+ * getbridgev2info successor.sweep.amount: what a kind 16 sweep in the next
+ * block would move on the connected state, the launch entry's reserve
+ * capped by the wind-down headroom of its latest RESERVE_E
+ * (bridge::VaultSweepAmountV2, as VerifyVaultSweepV2 takes it). 0 when the
+ * reserve or the headroom is not positive (nothing to sweep now); nullopt
+ * while the reserve is positive but no launch RESERVE_E is connected.
+ */
+std::optional<CAmount> VaultSweepAmountJson(const node::BridgeStateIndex& index,
+                                            const Consensus::BridgeV2Params& v2)
+{
+    const bridge::ReserveLedgerV2& ledger{index.ReserveLedgerV2(Consensus::BridgeV2EntryRole::LAUNCH)};
+    const auto reserve{ledger.Reserve()};
+    if (!reserve) return std::nullopt;
+    if (*reserve <= 0) return CAmount{0};
+    const auto observed{index.LatestObservationV2(bridge::ETH_OBSERVATION_SUBJECT_RESERVE)};
+    const auto* state{observed ? std::get_if<bridge::ReserveStateV2>(&observed->state) : nullptr};
+    if (!state) return std::nullopt;
+    const auto sums{index.ProvenDepositSumsAtV2(Consensus::BridgeV2EntryRole::LAUNCH, state->next_deposit_id)};
+    if (!sums) return std::nullopt;
+    return bridge::VaultSweepAmountV2(ledger, *state, *sums, v2.gate.wind_down_margin_ppm).value_or(0);
+}
+
+//! getbridgev2info's documentation of one gate evaluation (burn_gate and
+//! successor.sweep.gate).
+std::vector<RPCResult> BridgeV2GateResults()
+{
+    return {
+        {RPCResult::Type::STR, "status", "READY, NOT_READY or UNAVAILABLE"},
+        {RPCResult::Type::STR, "row", /*optional=*/true, "NOT_READY only: the first failed row, C1-C4 or E1-E8"},
+        {RPCResult::Type::STR, "reason", "Why that row failed, or why the gate is UNAVAILABLE; empty when READY"},
+        {RPCResult::Type::NUM, "now_eff", /*optional=*/true, "The gate's time: max(candidate time, the V2 light client's finalized execution timestamp) (absent when no lineage context could be built)"},
+        {RPCResult::Type::NUM, "closes_at", /*optional=*/true, "READY only: the first now_eff at which an observation age or the rotation age closes the gate"},
+    };
+}
+
+/**
+ * One gate evaluation as getbridgev2info renders it: UNAVAILABLE with
+ * `unavailable_reason` when none could run (no bridge state or lineage
+ * context), otherwise its status, first failed row, reason, now_eff and,
+ * when READY, closes_at.
+ */
+UniValue BridgeV2GateJson(const std::optional<node::BridgeV2GateResult>& evaluated,
+                          const std::string& unavailable_reason)
+{
+    std::string status{"UNAVAILABLE"};
+    std::string reason{unavailable_reason};
+    if (evaluated) {
+        switch (evaluated->readiness) {
+        case node::BridgeBurnReadiness::READY:
+            status = "READY";
+            reason.clear();
+            break;
+        case node::BridgeBurnReadiness::NOT_READY:
+            status = "NOT_READY";
+            reason = evaluated->reason;
+            break;
+        case node::BridgeBurnReadiness::UNAVAILABLE:
+            reason = evaluated->reason;
+            break;
+        }
+    }
+    UniValue gate{UniValue::VOBJ};
+    gate.pushKV("status", status);
+    if (evaluated && evaluated->readiness == node::BridgeBurnReadiness::NOT_READY) {
+        gate.pushKV("row", bridge::BurnGateRowName(evaluated->row));
+    }
+    gate.pushKV("reason", reason);
+    if (evaluated) {
+        gate.pushKV("now_eff", evaluated->now_eff);
+        if (evaluated->readiness == node::BridgeBurnReadiness::READY && evaluated->closes_at) {
+            gate.pushKV("closes_at", *evaluated->closes_at);
+        }
+    }
+    return gate;
+}
+
+/**
+ * The canonical type-10 payload of the one kind 16 VAULT_SWEEP record a
+ * migration takes (node changes section 7.6): exactly 0x10 || 0x00 ||
+ * the launch vault entry id. Every sweep is the same record; consensus
+ * derives its amount, leaf id and both vaults. nullopt when the configured
+ * identities are unavailable.
+ */
+std::optional<std::vector<unsigned char>> VaultSweepPayload(const Consensus::Params& consensus)
+{
+    const auto launch_id{modern::ConfiguredBridgeV2EntryId(consensus, Consensus::BridgeV2EntryRole::LAUNCH)};
+    if (!launch_id) return std::nullopt;
+    const bridge::BridgeRecordV1 record{bridge::BridgeRecordKindV1::VAULT_SWEEP,
+                                        bridge::BridgeVaultSweepV2{*launch_id}};
+    const auto mpa{bridge::MakeBridgeMpaRecord(record, bridge::BRIDGE_MPT_LIMITS_V2)};
+    if (!mpa) return std::nullopt;
+    return mpa->payload;
 }
 
 // -- buildbridgeobservationv2 argument parsing ------------------------------
@@ -6066,7 +6269,15 @@ std::vector<bridge::BridgeEthAccountProofV2> ParseObservationProofs(
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("%s.key is not the plan's slot %s", slot_name,
                                                                     EvmHex(request.slots[j])));
             }
-            account.storage_nodes.push_back(ParseProofNodes(storage[j].find_value("proof"), slot_name + ".proof"));
+            std::vector<std::vector<unsigned char>> nodes{
+                ParseProofNodes(storage[j].find_value("proof"), slot_name + ".proof")};
+            // An account without storage: some clients (anvil among them)
+            // prove a slot with the empty trie's only node, 0x80, whose hash
+            // is the empty root. Consensus takes only the canonical empty
+            // proof there (bridge/state_proof.h refuses nodes for the empty
+            // root), and 0x80 alone can prove nothing else, so it is dropped.
+            if (nodes.size() == 1 && nodes[0] == std::vector<unsigned char>{0x80}) nodes.clear();
+            account.storage_nodes.push_back(std::move(nodes));
         }
         accounts.push_back(std::move(account));
     }
@@ -6084,7 +6295,10 @@ static RPCHelpMan getbridgev2info()
         "light-client store, namespace-2 nullifiers, the V2 withdrawal tree, the V2 burn gate (node\n"
         "changes section 8.4 rows C1-C4 and E1-E8), the latest kind 9 Ethereum state observations, the\n"
         "vault entry's reserve ledger, the sticky conflict, whether B3 has closed deposits for good, and\n"
-        "the eth_getProof plan for the next observations (buildbridgeobservationv2). Configured only by\n"
+        "the eth_getProof plan for the next observations (buildbridgeobservationv2). A pinned B-23\n"
+        "successor vault entry (node changes section 7.6) adds retired, deposit_vault and successor:\n"
+        "from its migration height the launch entry is retired and the successor takes deposits and\n"
+        "burns, and kind 16 VAULT_SWEEP records move the launch entry's reserve to it. Configured only by\n"
         "the regtest-only -b3bridgepins v2 section (every other chain returns an error); getbridgeinfo\n"
         "keeps reporting the V1 bridge.\n"
         "Ethereum-facing values are 0x-prefixed EVM-order bytes; B3 ids and block hashes without an _evm\n"
@@ -6099,6 +6313,8 @@ static RPCHelpMan getbridgev2info()
                       {RPCResult::Type::NUM, "next_height", "Height evaluated by active, burns_active, mint_epoch and burn_gate"},
                       {RPCResult::Type::BOOL, "active", "Whether V2 rules are active for the next block"},
                       {RPCResult::Type::BOOL, "burns_active", "Whether V2 burns are active for the next block (height >= W2)"},
+                      {RPCResult::Type::BOOL, "retired", /*optional=*/true, "With a pinned successor only: whether the launch vault entry is retired for the next block (next_height >= successor.migration_height); a retired entry takes no new burns, and its later proven deposits are swept to the successor"},
+                      {RPCResult::Type::STR_HEX, "deposit_vault", /*optional=*/true, "With a pinned successor only: the Vault V2 address that takes new deposits for the next block (vault below successor.migration_height, successor.vault from it), as getbridgedepositrecipient returns it"},
                       {RPCResult::Type::NUM, "origin_chain_id", "Ethereum chain id of the vault entry"},
                       {RPCResult::Type::STR_HEX, "vault", "Vault V2 address"},
                       {RPCResult::Type::STR_HEX, "vault_runtime_code_hash", /*optional=*/true, "Pinned Vault V2 extcodehash (absent while unpinned, see unpinned)"},
@@ -6146,14 +6362,8 @@ static RPCHelpMan getbridgev2info()
                       {RPCResult::Type::NUM, "withdrawals", "Confirmed V2 burns (leaves V2 appended)"},
                       {RPCResult::Type::STR_HEX, "withdrawal_root_evm", /*optional=*/true, "V2 withdrawal-tree root at the active tip"},
                       {RPCResult::Type::STR_HEX, "empty_withdrawal_root_evm", "Root of the empty depth-32 tree (non-zero; signed from V until the first burn)"},
-                      {RPCResult::Type::OBJ, "burn_gate", "V2 burn gate (node changes section 8.4 rows C1-C4 and E1-E8), evaluated as the mempool does: on the fresh lineage projected for the next block, the connected kind 9 observations and the sticky conflict, at the mempool's candidate time max(now, median time past + 1). A burn also needs burns_active, the gate READY again at its position in a block (after that block's earlier kind 9 records), and the per-burn reserve and wind-down bounds (reserve), and the mempool refuses one whose gate closes within its close margin",
-                       {
-                           {RPCResult::Type::STR, "status", "READY, NOT_READY or UNAVAILABLE"},
-                           {RPCResult::Type::STR, "row", /*optional=*/true, "NOT_READY only: the first failed row, C1-C4 or E1-E8"},
-                           {RPCResult::Type::STR, "reason", "Why that row failed, or why the gate is UNAVAILABLE; empty when READY"},
-                           {RPCResult::Type::NUM, "now_eff", /*optional=*/true, "The gate's time: max(candidate time, the V2 light client's finalized execution timestamp) (absent when no lineage context could be built)"},
-                           {RPCResult::Type::NUM, "closes_at", /*optional=*/true, "READY only: the first now_eff at which an observation age or the rotation age closes the gate"},
-                       }},
+                      {RPCResult::Type::OBJ, "burn_gate", "V2 burn gate (node changes section 8.4 rows C1-C4 and E1-E8), evaluated as the mempool does: on the fresh lineage projected for the next block, the connected kind 9 observations and the sticky conflict, at the mempool's candidate time max(now, median time past + 1). It is the gate of the entry that takes burns: the launch entry, or from a successor's migration height the successor, whose E7 and E8 read TOKEN_FLAGS_SUCCESSOR and RESERVE_E_SUCCESSOR. A burn also needs burns_active, the gate READY again at its position in a block (after that block's earlier kind 9 records), and the per-burn reserve and wind-down bounds (reserve, or successor.reserve), and the mempool refuses one whose gate closes within its close margin",
+                       BridgeV2GateResults()},
                       {RPCResult::Type::OBJ, "deposits", "Whether B3 has closed bridge V2 deposits for good (node changes section 8.5), on the lineage the gate reads: a sticky conflict (kind 13, E5 or E8), a broken fresh lineage, or a latest VERIFIER_E showing the verifier halted, cancelled or expired at the observation, or Verifier V2 depositsClosed. B3 still mints every proven deposit (the vault cannot refund), so a deposit made after the close mints bUSD V2 that can never be redeemed; wallets (getbridgedepositrecipient) and relayers refuse deposits and flushes once it is CLOSED_FOR_GOOD. OPEN only means B3 has not closed them: it does not mean Verifier V2 depositsOpen() is true",
                        {
                            {RPCResult::Type::STR, "status", "OPEN, CLOSED_FOR_GOOD or UNAVAILABLE (bridge V2 rules inactive for the next block, or no bridge state or lineage at the active tip)"},
@@ -6164,17 +6374,32 @@ static RPCHelpMan getbridgev2info()
                            ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_VERIFIER),
                            ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_RESERVE),
                            ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS),
+                           ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR),
+                           ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR),
                        }},
-                      {RPCResult::Type::OBJ, "reserve", /*optional=*/true, "The vault entry's reserve ledger (node changes sections 7.1-7.2 and 7.6; absent while the bridge state is unavailable)",
+                      {RPCResult::Type::OBJ, "reserve", /*optional=*/true, "The launch vault entry's reserve ledger (node changes sections 7.1-7.2 and 7.6; absent while the bridge state is unavailable); a vault sweep counts in its burned",
+                       ReserveLedgerResults()},
+                      {RPCResult::Type::OBJ, "successor", /*optional=*/true, "The B-23 successor vault entry v' (node changes sections 3.2 and 7.6), present only when the envelope pins one. It shares the launch entry's chain, token, decimals, caps and bUSD V2 AssetId; from migration_height the launch entry is retired and v' takes deposits and burns",
                        {
-                           {RPCResult::Type::NUM, "minted", "bUSD V2 minted against proven deposits"},
-                           {RPCResult::Type::NUM, "burned", "burned_v: leaf V2 amounts appended"},
-                           {RPCResult::Type::NUM, "credited", "C_v: migration amounts credited on proven arrival"},
-                           {RPCResult::Type::NUM, "transit", "transit_v: amounts paid toward this entry and not yet credited"},
-                           {RPCResult::Type::NUM, "reserve", /*optional=*/true, "reserve_v = minted + credited - burned, the bound of burn check 2"},
-                           {RPCResult::Type::NUM, "proven_deposits", "Number of Vault V2 deposits proven (minted)"},
-                           {RPCResult::Type::NUM, "invariant_r_margin", /*optional=*/true, "With a RESERVE_E: observed locked - (P_pre + credited - burned) on the current ledger; invariant R holds while it is at least zero (a failure when the observation connected set the sticky E8 conflict)"},
-                           {RPCResult::Type::NUM, "wind_down_headroom", /*optional=*/true, "With a RESERVE_E: the largest first burn of the next block that burn check 3 (the wind-down bound) admits; negative when the appended leaves already exceed it"},
+                           {RPCResult::Type::STR_HEX, "vault", "Successor Vault V2 address"},
+                           {RPCResult::Type::STR_HEX, "vault_runtime_code_hash", /*optional=*/true, "Pinned successor Vault V2 extcodehash (absent while unpinned, see unpinned)"},
+                           {RPCResult::Type::STR_HEX, "predecessor", "The launch vault the successor names as its predecessor (vault)"},
+                           {RPCResult::Type::STR_HEX, "asset_id_evm", "Raw bUSD V2 AssetId bytes the successor carries (its B3_ASSET_ID, equal to asset_id_evm)"},
+                           {RPCResult::Type::STR_HEX, "vault_entry_id", /*optional=*/true, "Successor vault entry id (display order): the registry_id kind 3 mint and kind 6 burn records name for it from migration_height"},
+                           {RPCResult::Type::STR_HEX, "vault_entry_id_evm", /*optional=*/true, "Raw successor vault entry id bytes as carried by the records"},
+                           {RPCResult::Type::NUM, "origin_deployment_block", "First Ethereum block relayers must scan for the successor's events"},
+                           {RPCResult::Type::NUM, "max_deposit_raw", "Largest deposit into the successor that B3 admits (raw six-decimal units)"},
+                           {RPCResult::Type::NUM, "migration_height", "h_m: first height at which the launch entry is retired and the successor takes deposits, burns and its kind 9 subjects"},
+                           {RPCResult::Type::BOOL, "active", "Whether the migration is active for the next block (next_height >= migration_height)"},
+                           {RPCResult::Type::OBJ, "reserve", /*optional=*/true, "The successor's reserve ledger (absent while the bridge state is unavailable): a sweep adds to its transit, which a RESERVE_E_SUCCESSOR observation credits only up to the successor's observed absorbedTotal",
+                            ReserveLedgerResults()},
+                           {RPCResult::Type::OBJ, "sweep", "The kind 16 VAULT_SWEEP record (node changes section 7.6): one leaf V2 naming the launch vault and paying the successor vault the launch entry's reserve, capped by the wind-down headroom of the launch entry's latest RESERVE_E (the migration leaf first, later whatever remains: deposits proven into the retired vault since, or a part an earlier headroom held back), allowed only from migration_height while the launch entry's gate would be READY but for retirement; submit it with submitbridgecarrier and prove its leaf with getbridgewithdrawalproofv2 at the carrier's binding output",
+                            {
+                                {RPCResult::Type::STR_HEX, "payload_hex", /*optional=*/true, "Canonical type-10 v1 payload for submitbridgecarrier (34 bytes: kind 16, 0, the launch vault_entry_id_evm); every sweep is this same record"},
+                                {RPCResult::Type::NUM, "amount", /*optional=*/true, "With the migration active and the bridge state available: what a sweep in the next block would move, the launch entry's reserve capped by the wind-down headroom of its latest RESERVE_E (0: the reserve or the headroom is not positive, nothing to sweep now; absent while the reserve is positive and no launch RESERVE_E is connected)"},
+                                {RPCResult::Type::OBJ, "gate", /*optional=*/true, "With the migration active: the launch entry's burn gate but for retirement (subjects 1, 2 and 3, the shared lineage and sticky conflict), evaluated as burn_gate is; a sweep also needs it READY at its position in a block and a positive amount",
+                                 BridgeV2GateResults()},
+                            }},
                        }},
                       {RPCResult::Type::OBJ, "conflict", /*optional=*/true, "The sticky bridge V2 conflict closing the gate (row C4); absent when none is set",
                        {
@@ -6196,12 +6421,12 @@ static RPCHelpMan getbridgev2info()
                                 {RPCResult::Type::NUM, "connected_height", "B3 height that retained the anchor"},
                                 {RPCResult::Type::STR_HEX, "connected_block", "B3 block that retained the anchor"},
                             }},
-                           {RPCResult::Type::ARR, "subjects", "One entry per kind 9 subject",
+                           {RPCResult::Type::ARR, "subjects", "One entry per kind 9 subject the next block may carry: 1-3, and from a successor's migration height also 18 (RESERVE_E_SUCCESSOR) and 19 (TOKEN_FLAGS_SUCCESSOR), planned with the successor vault",
                             {
                                 {RPCResult::Type::OBJ, "", "",
                                  {
                                      {RPCResult::Type::NUM, "subject", "Kind 9 subject number (buildbridgeobservationv2 subject)"},
-                                     {RPCResult::Type::STR, "name", "VERIFIER_E, RESERVE_E or TOKEN_FLAGS"},
+                                     {RPCResult::Type::STR, "name", "VERIFIER_E, RESERVE_E, TOKEN_FLAGS, RESERVE_E_SUCCESSOR or TOKEN_FLAGS_SUCCESSOR"},
                                      {RPCResult::Type::NUM, "latest_anchor_block", /*optional=*/true, "Anchor block of the subject's latest observation"},
                                      {RPCResult::Type::BOOL, "anchor_is_newer", /*optional=*/true, "With an anchor: whether it is newer than the subject's latest observation, as a new one must be"},
                                      {RPCResult::Type::ARR, "accounts", "eth_getProof calls, in record order",
@@ -6267,6 +6492,9 @@ static RPCHelpMan getbridgev2info()
             if (!entry.vault_runtime_code_hash) unpinned.push_back("vault_runtime_code_hash");
             if (!v2.verifier.runtime_code_hash) unpinned.push_back("verifier_runtime_code_hash");
             if (!v2.verifier.max_epoch_lag_seconds) unpinned.push_back("verifier_max_epoch_lag");
+            if (v2.successor && !v2.successor->entry.vault_runtime_code_hash) {
+                unpinned.push_back("successor_vault_runtime_code_hash");
+            }
             unpinned.push_back("lineage_id");
             result.pushKV("unpinned", std::move(unpinned));
             result.pushKV("unpinned_note",
@@ -6281,9 +6509,18 @@ static RPCHelpMan getbridgev2info()
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
             const int next_height{tip ? tip->nHeight + 1 : 0};
             const bool active{consensus.BridgeV2RulesActive(next_height)};
+            // B-23 (node changes section 7.6): from h_m the launch entry is
+            // retired and the successor takes deposits and burns.
+            const bool migration_active{consensus.BridgeV2MigrationActive(next_height)};
             result.pushKV("next_height", next_height);
             result.pushKV("active", active);
             result.pushKV("burns_active", consensus.BridgeV2BurnRulesActive(next_height));
+            if (v2.successor) {
+                result.pushKV("retired", migration_active);
+                const Consensus::BridgeV2VaultEntry* deposit_entry{
+                    v2.Entry(modern::ActiveBridgeV2Role(consensus, next_height))};
+                result.pushKV("deposit_vault", EvmHex(deposit_entry->vault_address));
+            }
 
             bool state_available{false};
             const node::BridgeStateIndex* index{nullptr};
@@ -6343,45 +6580,16 @@ static RPCHelpMan getbridgev2info()
 
             // The mempool's V2 burn gate (validation.cpp): that lineage, the
             // connected kind 9 observations and the sticky conflict, at the
-            // mempool's candidate time.
-            UniValue gate{UniValue::VOBJ};
-            {
-                std::string status{"UNAVAILABLE"};
-                std::string reason{lineage_reason};
-                std::optional<node::BridgeV2GateResult> evaluated;
-                if (state_available && index) {
-                    if (lineage) {
-                        const int64_t candidate_time{std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
-                        evaluated = node::EvaluateBridgeV2BurnGate(&*lineage, *index, consensus, next_height,
-                                                                   candidate_time);
-                        switch (evaluated->readiness) {
-                        case node::BridgeBurnReadiness::READY:
-                            status = "READY";
-                            reason.clear();
-                            break;
-                        case node::BridgeBurnReadiness::NOT_READY:
-                            status = "NOT_READY";
-                            reason = evaluated->reason;
-                            break;
-                        case node::BridgeBurnReadiness::UNAVAILABLE:
-                            reason = evaluated->reason;
-                            break;
-                        }
-                    }
-                }
-                gate.pushKV("status", status);
-                if (evaluated && evaluated->readiness == node::BridgeBurnReadiness::NOT_READY) {
-                    gate.pushKV("row", bridge::BurnGateRowName(evaluated->row));
-                }
-                gate.pushKV("reason", reason);
-                if (evaluated) {
-                    gate.pushKV("now_eff", evaluated->now_eff);
-                    if (evaluated->readiness == node::BridgeBurnReadiness::READY && evaluated->closes_at) {
-                        gate.pushKV("closes_at", *evaluated->closes_at);
-                    }
-                }
+            // mempool's candidate time. It is the gate of the entry that
+            // takes burns (the successor from h_m).
+            const bool gate_evaluable{state_available && index && lineage};
+            const int64_t candidate_time{
+                gate_evaluable ? std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1) : 0};
+            std::optional<node::BridgeV2GateResult> burn_gate;
+            if (gate_evaluable) {
+                burn_gate = node::EvaluateBridgeV2BurnGate(&*lineage, *index, consensus, next_height, candidate_time);
             }
-            result.pushKV("burn_gate", std::move(gate));
+            result.pushKV("burn_gate", BridgeV2GateJson(burn_gate, lineage_reason));
 
             // Whether B3 has closed deposits for good (node changes section
             // 8.5): a closing row outranks an unavailable lineage, as in the
@@ -6419,31 +6627,7 @@ static RPCHelpMan getbridgev2info()
             }
             result.pushKV("observations", std::move(observations));
             if (index) {
-                const bridge::ReserveLedgerV2& ledger{index->ReserveLedgerV2()};
-                UniValue reserve{UniValue::VOBJ};
-                reserve.pushKV("minted", ledger.minted);
-                reserve.pushKV("burned", ledger.burned);
-                reserve.pushKV("credited", ledger.credited);
-                reserve.pushKV("transit", ledger.transit);
-                if (const auto amount{ledger.Reserve()}) reserve.pushKV("reserve", *amount);
-                reserve.pushKV("proven_deposits", static_cast<uint64_t>(index->ProvenDepositsV2().size()));
-                const auto observed{index->LatestObservationV2(bridge::ETH_OBSERVATION_SUBJECT_RESERVE)};
-                const auto* state{observed ? std::get_if<bridge::ReserveStateV2>(&observed->state) : nullptr};
-                if (state) {
-                    // The sums at the observation's cut, as burn check 3 and
-                    // invariant R take them (no deposits pending in a block).
-                    const auto sums{index->ProvenDepositSumsAtV2(state->next_deposit_id)};
-                    if (sums) {
-                        if (const auto margin{bridge::InvariantRMarginV2(state->locked, sums->below_cut, ledger)}) {
-                            reserve.pushKV("invariant_r_margin", *margin);
-                        }
-                        if (const auto terms{bridge::ComputeWindDownTerms(*state, *sums, ledger,
-                                                                          v2.gate.wind_down_margin_ppm)}) {
-                            reserve.pushKV("wind_down_headroom", terms->headroom);
-                        }
-                    }
-                }
-                result.pushKV("reserve", std::move(reserve));
+                result.pushKV("reserve", ReserveLedgerJson(*index, v2, Consensus::BridgeV2EntryRole::LAUNCH));
                 if (const auto& conflict{index->ConflictV2()}) {
                     UniValue c{UniValue::VOBJ};
                     c.pushKV("reason", BridgeV2ConflictName(conflict->reason));
@@ -6458,8 +6642,50 @@ static RPCHelpMan getbridgev2info()
                     result.pushKV("conflict", std::move(c));
                 }
             }
-            result.pushKV("observation_plan",
-                          ObservationPlanJson(bridge::ObservationPinsFromParams(v2), index));
+            if (v2.successor) {
+                // The B-23 successor v' (node changes section 7.6).
+                const Consensus::BridgeV2SuccessorEntry& s{*v2.successor};
+                UniValue successor{UniValue::VOBJ};
+                successor.pushKV("vault", EvmHex(s.entry.vault_address));
+                if (s.entry.vault_runtime_code_hash) {
+                    successor.pushKV("vault_runtime_code_hash", EvmHex(*s.entry.vault_runtime_code_hash));
+                }
+                successor.pushKV("predecessor", EvmHex(s.predecessor));
+                successor.pushKV("asset_id_evm", EvmHex(s.asset_id));
+                if (const auto successor_id{
+                        modern::ConfiguredBridgeV2EntryId(consensus, Consensus::BridgeV2EntryRole::SUCCESSOR)}) {
+                    successor.pushKV("vault_entry_id", successor_id->GetHex());
+                    successor.pushKV("vault_entry_id_evm", EvmHex(*successor_id));
+                }
+                successor.pushKV("origin_deployment_block", s.entry.origin_deployment_block);
+                successor.pushKV("max_deposit_raw", s.entry.max_deposit_raw);
+                successor.pushKV("migration_height", s.migration_height);
+                successor.pushKV("active", migration_active);
+                if (index) {
+                    successor.pushKV("reserve",
+                                     ReserveLedgerJson(*index, v2, Consensus::BridgeV2EntryRole::SUCCESSOR));
+                }
+                UniValue sweep{UniValue::VOBJ};
+                if (const auto payload{VaultSweepPayload(consensus)}) sweep.pushKV("payload_hex", HexStr(*payload));
+                if (migration_active) {
+                    // A sweep in the next block moves the launch entry's
+                    // reserve capped by the wind-down headroom of its
+                    // latest RESERVE_E (bridge::VaultSweepAmountV2), past
+                    // its gate but for retirement.
+                    if (index) {
+                        if (const auto amount{VaultSweepAmountJson(*index, v2)}) sweep.pushKV("amount", *amount);
+                    }
+                    std::optional<node::BridgeV2GateResult> sweep_gate;
+                    if (gate_evaluable) {
+                        sweep_gate = node::EvaluateBridgeV2SweepGate(&*lineage, *index, consensus, next_height,
+                                                                     candidate_time);
+                    }
+                    sweep.pushKV("gate", BridgeV2GateJson(sweep_gate, lineage_reason));
+                }
+                successor.pushKV("sweep", std::move(sweep));
+                result.pushKV("successor", std::move(successor));
+            }
+            result.pushKV("observation_plan", ObservationPlanJson(v2, migration_active, index));
             return result;
         },
     };
@@ -6479,12 +6705,16 @@ static RPCHelpMan buildbridgeobservationv2()
         "from the active tip, and checks the record against the bridge state as the next block would at\n"
         "the current time, so it refuses a record the mempool would refuse (an anchor not newer than the\n"
         "subject's latest observation, a stale light client, an unjudgeable verifier). Addresses, slots\n"
-        "and values never travel in the record. Configured only by the regtest-only -b3bridgepins v2\n"
-        "section (every other chain returns an error). No private key is involved.\n",
+        "and values never travel in the record. The B-23 successor subjects 18 and 19 are accepted only\n"
+        "from the successor's migration height (getbridgev2info successor). Configured only by the\n"
+        "regtest-only -b3bridgepins v2 section (every other chain returns an error). No private key is\n"
+        "involved.\n",
         {
             {"subject", RPCArg::Type::NUM, RPCArg::Optional::NO,
              "1 VERIFIER_E (Verifier V2 slots 0, 1, 2, 4, 6), 2 RESERVE_E (Vault V2 slots 0, 1, 3 and the "
-             "token's balances[vault]) or 3 TOKEN_FLAGS (token slots 0, 10 and isBlackListed[vault])"},
+             "token's balances[vault]), 3 TOKEN_FLAGS (token slots 0, 10 and isBlackListed[vault]), or, from "
+             "a B-23 successor's migration height, 18 RESERVE_E_SUCCESSOR and 19 TOKEN_FLAGS_SUCCESSOR (the "
+             "same reads of the successor vault)"},
             {"anchor_hash_evm", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
              "Retained bridge V2 execution anchor carrying a state root, as a raw Ethereum block hash "
              "(getbridgev2info observation_plan.anchor.hash_evm; optional 0x prefix)"},
@@ -6502,7 +6732,7 @@ static RPCHelpMan buildbridgeobservationv2()
                            {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
                             {
                                 {"key", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The plan slot (32 bytes, or a shorter quantity)"},
-                                {"proof", RPCArg::Type::ARR, RPCArg::Optional::NO, "Storage-trie nodes (0-64)",
+                                {"proof", RPCArg::Type::ARR, RPCArg::Optional::NO, "Storage-trie nodes (0-64); for an account without storage the empty proof, or the empty trie's single node 0x80 as some clients return it (the record carries the empty proof)",
                                  {{"node", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "RLP trie node"}}},
                             }},
                        }},
@@ -6513,7 +6743,7 @@ static RPCHelpMan buildbridgeobservationv2()
                   {
                       {RPCResult::Type::STR_HEX, "payload_hex", "Canonical type-10 v1 bridge payload for submitbridgecarrier"},
                       {RPCResult::Type::NUM, "subject", "Kind 9 subject number"},
-                      {RPCResult::Type::STR, "name", "VERIFIER_E, RESERVE_E or TOKEN_FLAGS"},
+                      {RPCResult::Type::STR, "name", "VERIFIER_E, RESERVE_E, TOKEN_FLAGS, RESERVE_E_SUCCESSOR or TOKEN_FLAGS_SUCCESSOR"},
                       {RPCResult::Type::NUM, "verdict", "Recorded verdict: for a LIVE VERIFIER_E, B3's bit 0 SETS_MISMATCH (E4) and bit 1 CERT_CONFLICT (E5, which sets the sticky conflict when the record connects); otherwise 0"},
                       {RPCResult::Type::NUM, "anchor_block", "Ethereum execution block of the anchor"},
                       {RPCResult::Type::STR_HEX, "anchor_hash_evm", "The anchor's hash (raw bytes)"},
@@ -6533,14 +6763,36 @@ static RPCHelpMan buildbridgeobservationv2()
                 throw JSONRPCError(RPC_MISC_ERROR, "The bridge V2 configuration is incomplete; kind 9 records stay inactive");
             }
             const int64_t subject_number{request.params[0].getInt<int64_t>()};
-            if (subject_number < bridge::ETH_OBSERVATION_SUBJECT_VERIFIER ||
-                subject_number > bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS) {
+            if (subject_number < 0 || subject_number > std::numeric_limits<uint8_t>::max() ||
+                !node::BridgeObservationSlotV2(static_cast<uint8_t>(subject_number))) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER,
-                                   "subject must be 1 (VERIFIER_E), 2 (RESERVE_E) or 3 (TOKEN_FLAGS)");
+                                   "subject must be 1 (VERIFIER_E), 2 (RESERVE_E) or 3 (TOKEN_FLAGS), or from a "
+                                   "successor's migration height 18 (RESERVE_E_SUCCESSOR) or 19 "
+                                   "(TOKEN_FLAGS_SUCCESSOR)");
             }
             const uint8_t subject{static_cast<uint8_t>(subject_number)};
+            // B-23 successor subjects (node changes section 7.6) exist only
+            // from h_m; refuse them before reading proofs planned against a
+            // vault that is not active yet. The block check below repeats it
+            // at the definitive next height.
+            const bool successor_subject{IsSuccessorObservationSubject(subject)};
+            const auto require_successor_active{[&](const int next_height) {
+                if (!consensus.BridgeV2MigrationActive(next_height)) {
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        v2.successor ? strprintf("Successor observations are not active for the next block (height "
+                                                 "%d; successor migration height %d)",
+                                                 next_height, v2.successor->migration_height)
+                                     : std::string{"Successor observations are not active for the next block (no "
+                                                   "successor vault entry is pinned)"});
+                }
+            }};
+            if (successor_subject) {
+                require_successor_active(WITH_LOCK(cs_main, return chainman.ActiveChain().Height() + 1));
+            }
             const uint256 anchor_hash{ParseEvmHash(request.params[1], "anchor_hash_evm")};
-            const bridge::ObservationPins pins{bridge::ObservationPinsFromParams(v2)};
+            const bridge::ObservationPins pins{
+                bridge::ObservationPinsFromParams(v2, bridge::EthObservationEntryRole(subject))};
             const std::vector<bridge::ObservationAccountRequest> plan{bridge::ObservationRequests(subject, pins)};
             bridge::BridgeEthStateObservationV2 observation;
             observation.subject = subject;
@@ -6558,6 +6810,7 @@ static RPCHelpMan buildbridgeobservationv2()
                                              "activation height %d)",
                                              next_height, v2.activation_height));
             }
+            if (successor_subject) require_successor_active(next_height);
             node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
             if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) {
                 throw JSONRPCError(RPC_MISC_ERROR, "The bridge state is unavailable at the active tip");
@@ -6645,14 +6898,17 @@ static RPCHelpMan getbridgewithdrawalproofv2()
         "carry the active V2 withdrawal root and be signed by a committee the Verifier V2 pins qualify\n"
         "to record a root. Relay that certificate first (getfinalitylineagecertificate); the vault then\n"
         "pays under any root the verifier accepted at or above b3_height, once per withdrawal id. Every\n"
-        "leaf of the prefix, its active-chain connection and the root are recomputed. Configured only\n"
+        "leaf of the prefix, its active-chain connection and the root are recomputed. With a B-23\n"
+        "successor (node changes section 7.6) a leaf names the launch vault or the successor vault, and a\n"
+        "kind 16 VAULT_SWEEP leaf names the launch vault and pays the successor vault. Configured only\n"
         "by the regtest-only -b3bridgepins v2 section. This RPC handles no Ethereum private key; the\n"
         "account that submits the calldata pays gas.\n",
         {
             {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
-             "Confirmed B3 bridge V2 burn transaction id"},
+             "Confirmed B3 bridge V2 burn (or kind 16 vault-sweep carrier) transaction id"},
             {"burn_vout", RPCArg::Type::NUM, RPCArg::Optional::NO,
-             "Exact bUSD V2 BURN output index returned by bridgewithdraw"},
+             "Exact bUSD V2 BURN output index returned by bridgewithdraw; for a kind 16 vault sweep, the "
+             "carrier's binding output (binding_vout of submitbridgecarrier, 1)"},
             {"certificate_block", RPCArg::Type::NUM, RPCArg::Optional::NO,
              "Active-chain block (hash or height) whose coinbase carries the fresh-lineage certificate",
              RPCArgOptions{.skip_type_check = true, .type_str = {"", "string or numeric"}}},
@@ -6661,7 +6917,7 @@ static RPCHelpMan getbridgewithdrawalproofv2()
                   {
                       {RPCResult::Type::NUM, "withdrawal_id", "Consensus-assigned V2 withdrawal id"},
                       {RPCResult::Type::STR_HEX, "source_txid", "B3 burn transaction id"},
-                      {RPCResult::Type::NUM, "burn_output_index", "Exact bUSD V2 BURN output"},
+                      {RPCResult::Type::NUM, "burn_output_index", "Exact bUSD V2 BURN output (a vault sweep's binding output)"},
                       {RPCResult::Type::NUM, "b3_height", "B3 burn height (leaf b3Height)"},
                       {RPCResult::Type::STR_HEX, "b3_block", "Active-chain burn block (display order)"},
                       {RPCResult::Type::STR_HEX, "asset_id", "bUSD V2 AssetId (display order)"},
@@ -6671,6 +6927,7 @@ static RPCHelpMan getbridgewithdrawalproofv2()
                       {RPCResult::Type::STR_HEX, "token", "Origin token the leaf names"},
                       {RPCResult::Type::STR_HEX, "recipient", "Ethereum recipient"},
                       {RPCResult::Type::NUM, "amount_raw", "Raw six-decimal token amount"},
+                      {RPCResult::Type::BOOL, "sweep", /*optional=*/true, "With a pinned B-23 successor only: whether the leaf is a kind 16 vault sweep (it names the launch vault and pays the successor vault, which counts it once absorb() runs)"},
                       {RPCResult::Type::STR_HEX, "leaf_preimage", "The 180-byte leaf V2 preimage"},
                       {RPCResult::Type::STR_HEX, "withdrawal_leaf", "keccak256(leaf_preimage)"},
                       {RPCResult::Type::STR_HEX, "withdrawal_root", "V2 withdrawal root the certificate carries"},
@@ -6782,10 +7039,22 @@ static RPCHelpMan getbridgewithdrawalproofv2()
                 const CBlockIndex* connected{prefix_request.connected_height < 0
                                                  ? nullptr
                                                  : chainstate.m_chain[prefix_request.connected_height]};
+                // A leaf names the vault entry whose ledger counts it: the
+                // launch vault, or from a B-23 migration the successor (same
+                // chain, token and AssetId). A sweep names the launch vault
+                // and pays the successor vault.
+                const Consensus::BridgeV2VaultEntry* named{
+                    prefix_request.entry <= static_cast<uint8_t>(Consensus::BridgeV2EntryRole::SUCCESSOR)
+                        ? v2.Entry(static_cast<Consensus::BridgeV2EntryRole>(prefix_request.entry))
+                        : nullptr};
+                const bool sweep_consistent{
+                    !prefix_request.sweep ||
+                    (prefix_request.entry == static_cast<uint8_t>(Consensus::BridgeV2EntryRole::LAUNCH) &&
+                     v2.successor && w.recipient == v2.successor->entry.vault_address)};
                 if (!leaf || *leaf != prefix_request.leaf || !connected ||
-                    connected->GetBlockHash() != prefix_request.connected_block ||
-                    w.destination_chain_id != v2.vault.origin_chain_id || w.asset_id != *asset ||
-                    w.vault != v2.vault.vault_address || w.token != v2.vault.token_address) {
+                    connected->GetBlockHash() != prefix_request.connected_block || !named || !sweep_consistent ||
+                    w.destination_chain_id != named->origin_chain_id || w.asset_id != *asset ||
+                    w.vault != named->vault_address || w.token != named->token_address) {
                     throw JSONRPCError(RPC_MISC_ERROR,
                                        "Withdrawal V2 prefix contains mismatched active-chain or vault-entry data");
                 }
@@ -6808,6 +7077,7 @@ static RPCHelpMan getbridgewithdrawalproofv2()
             result.pushKV("token", EvmHex(proof->withdrawal.token));
             result.pushKV("recipient", EvmHex(proof->withdrawal.recipient));
             result.pushKV("amount_raw", proof->withdrawal.amount);
+            if (v2.successor) result.pushKV("sweep", burn.sweep);
             result.pushKV("leaf_preimage", EvmHex(proof->leaf_preimage));
             result.pushKV("withdrawal_leaf", EvmHex(proof->leaf));
             result.pushKV("withdrawal_root", EvmHex(proof->root));
