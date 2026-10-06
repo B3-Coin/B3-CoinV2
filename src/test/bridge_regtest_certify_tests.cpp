@@ -6,6 +6,7 @@
 
 #include <bridge/bootstrap_proof.h>
 #include <bridge/bootstrap_v2.h>
+#include <bridge/proof.h>
 #include <chainparams.h>
 #include <crypto/bls.h>
 #include <crypto/common.h>
@@ -472,6 +473,69 @@ BOOST_AUTO_TEST_CASE(test_certificate_builds_and_verifies)
         BOOST_CHECK(FoldMember(witness) == wide.committee.header.members_root);
     }
     BOOST_CHECK_EQUAL(wide.payload.size(), modern::FinalizedBlockV2::SIZE + 2 + modern::BLS_SIGNATURE_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(finality_conflict_record_wraps_the_certificate)
+{
+    // certify's finality_conflict_record: the kind 13 FINALITY_CONFLICT record
+    // (node changes section 8.5) 0d 00 || u16 n || the certificate payload,
+    // which submitbridgecarrier takes as is.
+    const uint256 domain{RegtestModernChainDomain()};
+    modern::FinalizedBlockV2 fb{VectorBlock()};
+    const std::vector<uint64_t> weights{5, 3, 2, 1};
+    const TestCertificate four{
+        BuildTestCertificate(domain, fb, "conflict", weights, std::vector<uint32_t>{0, 1, 3}, std::nullopt)};
+    const std::vector<unsigned char> record{FinalityConflictRecord(four)};
+    BOOST_REQUIRE_EQUAL(record.size(), 286U);
+    BOOST_CHECK(std::vector<unsigned char>(record.begin(), record.begin() + 4) ==
+                (std::vector<unsigned char>{0x0d, 0x00, 0x00, 0x04}));
+    BOOST_CHECK(std::equal(record.begin() + 4, record.end(), four.payload.begin(), four.payload.end()));
+
+    // It decodes, under the V2 record set only, to the same statement, bitmap
+    // and aggregate signature, and the certificate still verifies.
+    const auto decoded{DecodeBridgeRecordV1(record, BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(decoded);
+    BOOST_CHECK(decoded->kind == BridgeRecordKindV1::FINALITY_CONFLICT);
+    const auto* conflict{std::get_if<BridgeFinalityConflictV2>(&decoded->payload)};
+    BOOST_REQUIRE(conflict);
+    BOOST_CHECK_EQUAL(conflict->validator_count, 4U);
+    const auto evidence{conflict->Decode()};
+    BOOST_REQUIRE(evidence);
+    BOOST_CHECK(evidence->first == fb);
+    BOOST_CHECK(modern::FinalityCertIdV2(evidence->first) == four.cert_id);
+    BOOST_CHECK(evidence->second.signer_bitmap == four.signed_digest.bitmap);
+    BOOST_CHECK(evidence->second.signer_bitmap == (std::vector<unsigned char>{0x0b}));
+    BOOST_CHECK(evidence->second.aggregate_sig == four.signed_digest.aggregate_signature.Compressed());
+    BOOST_CHECK(evidence->second.aggregate_sig == four.certificate.aggregate_sig);
+    BOOST_CHECK(modern::VerifyFinalityCertificateV2(domain, evidence->first, evidence->second, four.committee.View(),
+                                                    fb.validator_set_hash) == modern::CertificateCheck::OK);
+    BOOST_CHECK(!DecodeBridgeRecordV1(record, BRIDGE_MPT_LIMITS_V1));
+    // Canonical, and it travels unchanged in the type-10 MPA record.
+    BOOST_CHECK(EncodeBridgeRecordV1(*decoded, BRIDGE_MPT_LIMITS_V2) == record);
+    const auto mpa{MakeBridgeMpaRecord(*decoded, BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(mpa);
+    BOOST_CHECK(mpa->payload == record);
+    BOOST_CHECK(DecodeBridgeMpaRecordV1(*mpa, BRIDGE_MPT_LIMITS_V2) == decoded);
+
+    // n = 9 (two bitmap bytes) over a statement carrying bridgeFlags bit 0.
+    fb.bridge_flags = modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED;
+    const TestCertificate nine{BuildTestCertificate(domain, fb, "rogue", std::vector<uint64_t>(9, 1),
+                                                    std::vector<uint32_t>{0, 1, 2, 3, 4, 5, 8}, std::nullopt)};
+    std::vector<unsigned char> wide{FinalityConflictRecord(nine)};
+    BOOST_REQUIRE_EQUAL(wide.size(), 4 + modern::FinalizedBlockV2::SIZE + 2 + modern::BLS_SIGNATURE_SIZE);
+    BOOST_CHECK(std::vector<unsigned char>(wide.begin(), wide.begin() + 4) ==
+                (std::vector<unsigned char>{0x0d, 0x00, 0x00, 0x09}));
+    BOOST_CHECK_EQUAL(int{wide[4 + 184]}, int{modern::FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED});
+    const auto wide_decoded{DecodeBridgeRecordV1(wide, BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(wide_decoded);
+    const auto wide_evidence{std::get<BridgeFinalityConflictV2>(wide_decoded->payload).Decode()};
+    BOOST_REQUIRE(wide_evidence);
+    BOOST_CHECK(wide_evidence->first == fb);
+    BOOST_CHECK(wide_evidence->second.signer_bitmap == (std::vector<unsigned char>{0x3f, 0x01}));
+    BOOST_CHECK(wide_evidence->second.aggregate_sig == nine.signed_digest.aggregate_signature.Compressed());
+    // The header's n fixes the bitmap length: the same bytes under n = 8 are malformed.
+    wide[3] = 0x08;
+    BOOST_CHECK(!DecodeBridgeRecordV1(wide, BRIDGE_MPT_LIMITS_V2));
 }
 
 BOOST_AUTO_TEST_CASE(test_certificate_refusals)

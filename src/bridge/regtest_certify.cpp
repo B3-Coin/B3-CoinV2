@@ -28,7 +28,9 @@
 //   certify <input.json>
 //       {"chain_domain", "fb_encoded", "label", "weights", optional
 //        "signers", optional "expected_set_hash"}
-//       -> a digest-V2 certificate: B3 carrier payload and prover proof.
+//       -> a digest-V2 certificate: B3 carrier payload, prover proof and
+//          the kind 13 FINALITY_CONFLICT record (finality_conflict_record,
+//          submitbridgecarrier's input; node changes section 8.5).
 // Hashes and addresses are 0x-prefixed raw (EVM byte order) hex.
 
 #include <bridge/bootstrap_v2.h>
@@ -338,6 +340,7 @@ UniValue Certify(const UniValue& input)
     out.pushKV("expected_set_hash_checked", expected_set_hash.has_value());
     PushSigned(out, c.signed_digest);
     out.pushKV("payload", EvmHex(c.payload));
+    out.pushKV("finality_conflict_record", EvmHex(FinalityConflictRecord(c)));
     out.pushKV("test_keys_only", true);
     return out;
 }

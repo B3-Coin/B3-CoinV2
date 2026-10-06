@@ -8,6 +8,7 @@
 #include <bridge/bootstrap_proof.h>
 #include <bridge/bootstrap_v2.h>
 #include <bridge/deposit.h>
+#include <bridge/proof.h>
 #include <crypto/bls.h>
 #include <crypto/common.h>
 #include <crypto/sha256.h>
@@ -44,7 +45,9 @@
  *    OI-12, owner ruling R9 of 2026-10-05; bridge/bootstrap_v2.h);
  *  - digest-V2 committee certificates from any labelled test committee, for
  *    the later forged (rogue committee) and conflicting (keys imported into
- *    B3 wallets with importfinalitykey) drills.
+ *    B3 wallets with importfinalitykey) drills, each also wrapped as the
+ *    kind 13 FINALITY_CONFLICT record B3 accepts as conflict evidence
+ *    (node changes section 8.5).
  *
  * Test keys: secret(label, i) = KeyGen(SHA256(TEST_KEY_TAG || u8 len(label)
  * || label || LE32 i)), labels [a-z0-9-]{1,32}. They are public and
@@ -448,6 +451,28 @@ inline TestCertificate BuildTestCertificate(const uint256& chain_domain, const m
                            std::move(signed_digest),
                            std::move(certificate),
                            std::move(payload)};
+}
+
+/**
+ * The certificate as a kind 13 FINALITY_CONFLICT record (node changes
+ * section 8.5): EncodeBridgeRecordV1 under the bridge V2 record set, i.e.
+ * 0x0d || 0x00 || u16 n (big-endian) || payload, the bytes
+ * submitbridgecarrier takes. The codec only checks the shape; B3 accepts the
+ * record only when the signing committee is the fresh lineage's current or
+ * next one and the statement differs from its own, so the conflicting drill
+ * signs with expected_set_hash set to that committee's Set'.
+ */
+inline std::vector<unsigned char> FinalityConflictRecord(const TestCertificate& certificate)
+{
+    const uint32_t n{certificate.committee.Size()};
+    if (n == 0 || n > modern::MAX_FINALITY_SET || n > std::numeric_limits<uint16_t>::max()) {
+        throw std::logic_error("test certificate committee size is out of range");
+    }
+    const BridgeRecordV1 record{BridgeRecordKindV1::FINALITY_CONFLICT,
+                                BridgeFinalityConflictV2{static_cast<uint16_t>(n), certificate.payload}};
+    const auto encoded{EncodeBridgeRecordV1(record, BRIDGE_MPT_LIMITS_V2)};
+    if (!encoded) throw std::runtime_error("the test certificate does not encode as a kind 13 record");
+    return *encoded;
 }
 
 } // namespace regtest_certify
