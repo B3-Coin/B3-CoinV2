@@ -654,8 +654,8 @@ item 1.
 re-credit of burns above a frozen root; a ruling on B-11's alternative;
 owner acceptance of B-22, B-23's residual, the wind-down margin and the
 (d1) relay budget; B-37's rebinding schedule (finality dependency);
-`DEPOSIT_CLOSE_AFTER` against O8; OI-1 to OI-11 open; OI-12 resolved
-(§20).
+`DEPOSIT_CLOSE_AFTER` against O8; OI-1 to OI-7 and OI-9 to OI-11 open;
+OI-8 and OI-12 resolved (§20).
 
 **Unverified [H]:** V2 and `approve` gas; LayerZero fees and DVN depths;
 anvil EIP-2537; minutes until O8.
@@ -682,7 +682,17 @@ user funds or blocks a milestone.
   (`src/init.cpp:1409-1415`, `:2107` at `e2a4b6c`;
   `src/kernel/chainparams.cpp:1122-1128`, `:1145`); V2 pins need
   blockHash(261). *Direction:* per-section activation with an append-only
-  hash record, or all V2 pins before first start.
+  hash record, or all V2 pins before first start. *Regtest approach taken*
+  (`1ef5212`, `9b5faad`, `834101a`; RT4a `af70f03`): a pin file with only
+  a `v2` section, written before first start, names the CREATE addresses
+  `DeployV2.s.sol` will use (deployer nonces 0-3). The Vault V2 and
+  Verifier V2 runtime code hashes and the lineage id, which commit to
+  blockHash(R_f − 1), are left unpinned on 31337 only:
+  `getbridgev2info.unpinned` lists them, kind 9 code-hash checks waive the
+  two hashes only on 31337 (`src/bridge/state_observation.h`), and
+  `BridgeV2Params::Valid()` requires them on Ethereum mainnet. V ≥ A3 is
+  asserted at startup, so `init.cpp`'s pin record refuses any later change
+  of the file (RT4a step 12). The mainnet direction stays open.
 - **OI-4** (Medium; node changes §3.1, §7.6). One `verifier` pin: a
   successor inherits its expiry and bugs, yet §13 rows 3 and 11 offer
   migration. *Direction:* per-entry verifier pins; narrow those rows.
@@ -697,9 +707,14 @@ user funds or blocks a milestone.
   Snapshot(start − 1); P3-R1 snapshots at the terminal checkpoint
   (`doc/design/v2-stage0-r1-consensus.md:336-347`). *Direction:* restate
   them for P3-R1; amend BuildV1Snapshot in §9.2.
-- **OI-8** (Medium; node changes §16; §8.4). bUSD-only users lack native
-  B3 for burns until N-3 is ruled. *Direction:* make N-3 a withdrawal
-  launch prerequisite, or disclose.
+- **OI-8** (**Resolved 2026-10-05, owner ruling R10**, option B, sponsored
+  fees; node changes §16; §8.4). bUSD-only users lack native B3 for burns
+  until N-3 is ruled. *Resolution:* the user signs the burn (or exit) with a
+  small bUSD tip to a relayer, under a signature mode that lets others only
+  add inputs; the relayer adds the native-B3 fee input and later buys B3
+  with the accumulated bUSD (e.g. on FlowMesh). No consensus fee-in-bUSD
+  change: burns still pay native B3 (B-17). Wallet and relayer support is
+  not built yet.
 - **OI-9** (Medium; §10; contracts spec §5). Bootstrap key holders and their
   independence are unstated. *Direction:* name them or the rule; if
   owner-held, drop the independent-check argument.

@@ -297,7 +297,12 @@ release carrying V cannot activate by V, the verifier is abandoned before
 deposits open and redeployed (human intervention). In return this document
 reads a `LineageV2View` (bootstrapped, broken, epoch, sets by epoch,
 finalized height, handover status) and `CertIdAt(index)`, B3's own `certId`
-(contracts spec §2.2) for a grid checkpoint.
+(contracts spec §2.2) for a grid checkpoint. *Realized:* `CertIdAt(index)`
+is no view member but `FinalityCertIdV2(ExpectedFinalizedBlockV2(e, G +
+index × interval))` with e the epoch of that height (B3 signs a checkpoint
+only in that epoch, so a statement of any other epoch is not B3's), built
+inside `VerifierVerdictV2` (E5) and `JudgeFinalityConflictV2` (§8.5);
+`BridgeFlagsV2` is `FinalityBridgeFlagsV2` (`src/node/bridge_state.h`).
 
 ### 7.5 Plain burns and impairment
 
@@ -370,10 +375,30 @@ never affects mints or past burns.
 
 ### 8.2 Kind 9, ETH_STATE_OBSERVATION [I]
 
-Body: `subject` (u8), `anchor_hash`, then account and storage proofs
-(EIP-1186) against one retained V2 anchor's `state_root`; `t_obs` is its
-execution timestamp, and each subject's anchor block must exceed the stored
-one. Account code hashes are pinned.
+Body: `subject` (u8), `anchor_hash`, a `verdict` byte, then account and
+storage proofs (EIP-1186) against one retained V2 anchor's `state_root`;
+`t_obs` is its execution timestamp, and each subject's anchor block must
+exceed the stored one. Account code hashes are pinned (OI-3: the verifier's
+and vault's may stay unset on 31337 only).
+
+**Wire [E, `src/bridge/proof.h`].** `09 00 || subject u8 || anchor_hash 32
+(raw EVM order) || verdict u8 || account_count u8 ||` per account: its
+account-proof node list `(u8 count || (u16 len || node)*)`, 1-64 nodes,
+≤ 1,024 B each, ≤ 11,264 B in all, then `u8 slot_count` and per slot a
+storage-proof node list of 0-64 nodes under the same bounds; lengths are
+big-endian and the record is at most 32 KiB. The subject fixes the shape:
+VERIFIER_E [verifier: 5], RESERVE_E [vault: 3, token: 1], TOKEN_FLAGS
+[token: 3]; any other subject, account count or slot count is malformed.
+Values, addresses and slot keys never travel: the pins and the subject fix
+the accounts and slots, the proofs carry the values. The **verdict** byte
+applies to VERIFIER_E only: bit 0 SETS_MISMATCH (E4), bit 1 CERT_CONFLICT
+(E5), any other bit malformed. Consensus recomputes it and it must match
+(replay trusts the recorded byte); it is zero for the other subjects and
+for a verifier that is not LIVE. A LIVE verifier is judged for e_E in
+[e_B3 − 2, e_B3], the fresh lineage retaining Set′_{e−2} for E3's
+`max_epoch_gap` of 2; one outside that window is refused, so the gate stays
+closed. Kind 9 decodes only under the V2 record set: below V and without
+`bridge_v2` it is malformed.
 
 | Subject | Slots |
 |---|---|
@@ -433,14 +458,47 @@ committee assumption and P3 (architecture §10).
 
 ### 8.5 Kind 13, FINALITY_CONFLICT [I]
 
-One digest-V2 quorum certificate (~5.4 KB [H]) signed by the lineage's
-**current or next** committee at the including block, valid and differing
-from B3's canonical statement at its index (an index above the tip is
+One digest-V2 quorum certificate signed by the lineage's **current or
+next** committee at the including block, valid and differing from B3's
+canonical statement at its index (a checkpoint above the parent block is
 invalid until reached). Older sets are refused, as `reportConflict`
 refuses them (contracts spec §3.4): with no unbonding or
 slashing a rotated-out quorum can be cheap to buy and B-37 erasure is
 unenforceable; an older conflict that matters reaches Ethereum, where E1 and
 E5 catch it. Effect: a sticky conflict closing the gate.
+
+**Wire [E, `src/bridge/proof.h`].** `0d 00 || u16 n || FinalizedBlockV2
+(185) || bitmap (ceil(n/8)) || aggSig (96)`, n big-endian and the signing
+committee's size, the rest exactly `EncodeCertificatePayloadV2`'s bytes:
+4 + 185 + ceil(n/8) + 96, so **286 bytes at n = 4**, at most 293 within the
+bridge bound of 64 and 1,309 at n = 8,192 [computed] (replacing revision
+11's ~5.4 KB [H] estimate). The codec checks shape only (n in 1-8,192,
+exact length, zero bitmap padding, no `bridgeFlags` bit above bit 0) and
+decodes only under the V2 record set, so kind 13 is malformed below V and
+without `bridge_v2`.
+
+**Judge order [E, `JudgeFinalityConflictV2`, `src/node/bridge_state.cpp`]**,
+cheap checks before BLS and BLS before the O(k) canonical rebuild:
+(1) modern PoS checkpoint parameters and a pinned chain domain; (2) a
+bootstrapped, unbroken fresh lineage; (3) the certificate decodes; (4) its
+lineage id is this lineage's; (5) its epoch is e (current committee) or
+e + 1 (next): e − 1 and older, and e + 2 or later, are refused; (6) n is
+that committee's size; (7) 1 ≤ index < 2³² and H = G + index × interval
+fits and is at or below the parent block; (8) a quorum of that committee
+signed it (`VerifyFinalityCertificateV2`; the successor field is not
+checked, a wrong one being one more way to differ); (9) it differs from
+B3's statement (`ExpectedFinalizedBlockV2` at H): an epoch other than that
+of H differs by construction; otherwise height, block hash, withdrawal
+root, successor and `bridgeFlags` are compared first, and only a statement
+equal in all of them reads B3's history root (the finalized checkpoint's
+recorded root at its index, else the O(k) rebuild), an equal root being
+B3's own statement and refused. The record is valid from V only while no
+sticky conflict is set (the first of kind 13, E5 and E8 wins, so a chain
+holds at most one) and only with a lineage context (mempool, ConnectBlock,
+wallet prevalidation, block assembly); replay trusts the recorded record as
+it trusts kind 9 verdicts. The conflict records kind 13, its `certId`,
+checkpoint index and epoch, and C4 refuses every later burn, in the same
+block too.
 
 **Deposits stop too [I].** B3 never refuses a proven deposit (the vault
 cannot refund), so a sticky conflict (kind 13, E5 or E8) stops deposits:
@@ -454,7 +512,21 @@ disclosed; (3) the owner relayer submits `reportConflict` once every earlier
 leaf is under an accepted root, or at once if the verifier can accept no
 canonical certificate (permanence: FD-15). Residual: a captured quorum may
 sign neither flag nor evidence and keep deposits open while it relays; it
-could drain the vault anyway (architecture §10).
+could drain the vault anyway (architecture §10). *Realized on regtest:* bit
+0 from the first checkpoint at or after the closing block
+(`FinalityBridgeFlagsV2`); `getbridgev2info.deposits` reads
+`CLOSED_FOR_GOOD`, the wallet's `getbridgedepositrecipient` refuses and
+`contrib/b3bridge/b3_bridge_deposit_guard_v2.py` exits non-zero; RT4c
+drills it. The closing block also evicts every pending V2 burn and kind 13
+record (with descendants) from the mempool; a wallet then frees a burn's
+bUSD V2 input with `abandontransaction`. The F_d paths come with S4.
+*Implementation choices pending owner review (S3 slice n2b):* bit 0 at a
+checkpoint at or after, not strictly after, the closing block (block c's
+statement already reflects c's state); wallets and relayers also refuse
+deposits on a broken fresh lineage, an impaired verifier (halted,
+cancelled or expired) and Verifier V2's own `depositsClosed`, each as
+permanent as the sticky conflict; the Wire and Judge order paragraphs above
+record the implementation, not an owner ruling.
 
 ### 8.6 Where evaluated, and thresholds
 
@@ -624,7 +696,7 @@ refused (same-block burns counted), a late proof below the cut, a deposit
 after it, margin 0 then 10%, migration and sweeps in `burned_v` and
 `transit_v′`, **an observation of v′ between the leaf and `absorb()`
 crediting nothing and setting no conflict**, credit after it; the
-`bridgeFlags` bit from the checkpoint after a sticky conflict;
+`bridgeFlags` bit from the first checkpoint at or after a sticky conflict;
 legacy bUSD transfers after V; fork extension from its height; incremental
 equals reindex.
 
@@ -671,7 +743,7 @@ LP; none, §6).
 
 | ID | Status | Node default |
 |---|---|---|
-| **N-3** | Open | First native B3 for a bUSD-only newcomer: treasury drop with the mint (default, off-consensus) or a FlowMesh USER_DEPOSIT mint (consensus; stable-quote "no-gas onboarding", architecture §16 item 13) |
+| **N-3** | Ruled 2026-10-05 (R10; architecture OI-8) | Native B3 for a bUSD-only user's burn: sponsored fees, a bUSD tip to a relayer that adds the native-B3 fee input (off-consensus; no fee-in-bUSD change), chosen over a starter drop (the earlier default) and fees in bUSD; R10 did not address the FlowMesh USER_DEPOSIT mint (architecture §16 item 13) |
 | **N-4** | Narrowed | Kind 13 in consensus (yes); the kind 12 queue withdrawn |
 | **N-5** | Open | At least one fork-extension hard fork per Ethereum fork, 60 days ahead |
 | **B-37** (new) | Default yes | Signer records outside the wallet file; erasure per §7.7 |
@@ -703,7 +775,7 @@ Each needs its own ruling (architecture §17); revision 10 holds the full rules.
 ## 18. Open items
 
 1. Owner adoption: the wind-down margin (B-13), B-22's approval, B-23's
-   residual, N-3 to N-5.
+   residual, N-4, N-5 (N-3 ruled by R10).
 2. **F_d intake** (contracts spec §7.4): a user without Ethereum ETH needs a
    relayer to accept p; endpoints are relayer configuration, not consensus.
 3. Recipient pre-check endpoint (§11.2); re-credit of burns above a frozen
@@ -711,4 +783,4 @@ Each needs its own ruling (architecture §17); revision 10 holds the full rules.
 4. B-37's rebinding schedule and §7.7's signer store (finality dependency).
 5. Owner reads O2, O8, O9, O11 (O10, O12 only with §17 item 1).
 6. Unverified [H]: anvil `eth_getProof` and EIP-2537; old-block proof
-   retention; kind 9 and 13 sizes; effort.
+   retention; kind 9 sizes (kind 13: 286 bytes at n = 4, §8.5); effort.

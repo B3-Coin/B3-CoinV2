@@ -117,7 +117,7 @@ ids, so F_x's `DST_EID` check runs unchanged [I] (RP-5).
 |---|---|---|
 | anvil helper (*landed*) | `test/functional/test_framework/anvil.py` | Start (`--enable-tx-gas-limit`), mine, warp, snapshot, forge deploy; skip if tools missing |
 | Bridge helper (*landed*) | `test/functional/test_framework/b3bridge.py` | keccak/RLP/MPT; pin writer; clock; evidence |
-| Certificate tool | `src/bridge/regtest_certify.cpp` | Digest V2 bootstrap attestations, conflicting or forged certificates with per-epoch keys; refuses non-test keys |
+| Certificate tool (*landed* `6aa3c26`) | `src/bridge/regtest_certify.cpp` | K_OF_N bootstrap attestations over `bootstrapDigestV2` (OI-12: verifier address, EVM chain id 31337, START_SET_HASH); digest-V2 conflicting or forged certificates from public test keys, each also as a kind 13 record (this slice); never takes a secret key; refuses other chain domains and EVM chain ids |
 | Committee tool; mock beacon (*landed*) | `src/bridge/regtest_beacon.cpp`; `contrib/b3bridge/regtest/mock_beacon.py` | §3.4; finalize, rotate, k-of-512, fork switch |
 | Submitter | relayer V2 | Certificates, `reportConflict`, releases, `flush`, `forward` |
 | Deploy script; stack driver | `contracts/script/RegtestDeploy.s.sol`; `contrib/b3bridge/regtest/run_local_bridge.py` | Mocks and stacks, manifest; bring-up (§7) |
@@ -212,8 +212,8 @@ to the producer schedule [I].
    stay, so V1 keeps certifying on fixture I); for each k ≥ 1, between
    Snapshot(start_(k−1) − 1) and Snapshot(start_k − 1), a fresh key for
    epoch k+1. Deploy the V2 contracts against epoch k's set hash (k = 0, or
-   k ≥ 2); `initialize` with a 3-of-4 attestation of an epoch-k statement
-   plus `leaf0Path`.
+   k ≥ 2); `initialize` with a 3-of-4 attestation over `bootstrapDigestV2`
+   (OI-12) of an epoch-k statement plus `leaf0Path`.
 5. Add the V2 section with V above the tip; restart; start the mock beacon
    and both relayers.
 6. RT4 and RT6 each end with n4 syncing from genesis and n0 run with
@@ -259,7 +259,7 @@ Written from scratch in `contracts/regtest/`, each Foundry-tested [I].
 | RT1 | S1 | `h1_producer_rotation.py` + C++ | S0; H1 |
 | RT2 | S2 | `bridge_rt2_light_client.py` | Pin file; tools |
 | RT3 | S2 | `bridge_rt3_v1_route_a.py` (`--deposit-only` = RT3a) | RT2; submitter |
-| RT4 | S3 | `bridge_rt4_v2_route_a.py --fixture=I\|B` | S0; vectors; lineage with B-22, B-23, B-37; contracts V2; node core V2 |
+| RT4 | S3 | `bridge_rt4_v2_route_a.py --fixture=I\|B`; landed on fixture I: `bridge_rt4a_round_trip.py`, `bridge_rt4_kofn_gate.py`, `bridge_rt4c_conflict.py` | S0; vectors; lineage with B-22, B-23, B-37; contracts V2; node core V2 |
 | RT5 | — | **Retired** (2026-10-03 ruling); cases moved to RT4, RT6 | — |
 | RT6 | S4 | `bridge_rt6_route_b_d3.py`; `bridge_rt6_legacy_closure.py` | RT4; forwarders; OFT mocks |
 | RT7 | — | **Withdrawn for launch**; returns only with §11 item 1 | — |
@@ -309,8 +309,9 @@ relayer variants (architecture §8.1); FlowMesh V1 credit
   honest binding the copy's key is seated (the disclosed limit). A member
   without a fresh binding sits out; certificates continue (a fifth staked
   wallet keeps 4 [I]).
-- Bootstrap (B-11): K_OF_N with 3-of-4 regtest keys over an epoch-0
-  statement, and k ≥ 2 on a second deployment; wrong set hash, bad
+- Bootstrap (B-11): K_OF_N with 3-of-4 regtest keys over
+  `bootstrapDigestV2` (OI-12: verifier, chain 31337, START_SET_HASH) of an
+  epoch-0 statement, and k ≥ 2 on a second deployment; wrong set hash, bad
   `leaf0Path`, 2-of-3 and late calls revert; deposits wait for an ordinary
   certificate; watcher `cancel`; a third deployment runs START_CERTIFICATE.
   `getfinalitylineage` matches every pin before any deposit.

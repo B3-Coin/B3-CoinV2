@@ -107,8 +107,10 @@ days to prove; optional LP fast-fill); **staker-signed fast deposits**
   beyond caps.
 - **Tether** can freeze the reserve; deposits are not refunded.
 - **Unproven:** unaudited; figures estimated.
-- **Open issues:** OI-1 to OI-11 (architecture §20), unresolved, including
-  a bootstrap that could install a permanent root.
+- **Open issues:** OI-1 to OI-12 (architecture §20): OI-8 resolved by owner
+  ruling R10 (sponsored native-B3 fees), OI-12 by R9 (bootstrap binding);
+  the rest unresolved, including a bootstrap that could install a
+  permanent root (OI-1).
 
 ## Documents
 
