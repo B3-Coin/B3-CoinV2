@@ -538,7 +538,8 @@ them are `feature_b3_bridge_rt0_toolchain.py`,
 their harness lives in `test/functional/test_framework/{anvil,b3bridge}.py`.
 The regtest-only refusals of the Python pieces are unit-tested offline by
 `contrib/b3bridge/test_regtest_mock_beacon.py`,
-`contrib/b3bridge/test_b3_bridge_observe_v2.py` (run `python3 -m unittest`
+`contrib/b3bridge/test_b3_bridge_observe_v2.py`,
+`contrib/b3bridge/test_b3_bridge_deposit_guard_v2.py` (run `python3 -m unittest`
 here) and by `TestFrameworkB3BridgeGuards` in
 `test/functional/test_framework/b3bridge.py` (run by
 `feature_framework_unit_tests.py`).
@@ -650,6 +651,26 @@ python3 contrib/b3bridge/b3_bridge_observe_v2.py --ethereum-rpc http://127.0.0.1
 - It prints one JSON object (anchor, decoded values, verdicts, payloads and
   txids); a refusal prints `error: ...` and exits 1. The B3 wallet signs; no
   key is handled here.
+
+### `b3_bridge_deposit_guard_v2.py` (bridge V2 deposit and flush guard)
+
+Once B3 has closed bridge V2 burns for good (node changes rev 11 section
+8.5: a sticky kind 13, E5 or E8 conflict, a broken fresh lineage, or a latest
+VERIFIER_E showing the verifier halted, cancelled, expired or
+`depositsClosed`), it still mints every proven Vault V2 deposit, but that
+bUSD V2 can never be redeemed, so a relayer runs this one-shot,
+standard-library guard (`python3 contrib/b3bridge/b3_bridge_deposit_guard_v2.py
+--b3-rpc-url http://127.0.0.1:P --b3-cookie <datadir>/regtest/.cookie`, or
+`deposit_guard(node)` from a deposit or flush path) before it deposits or
+flushes. It refuses every endpoint but plain http on 127.0.0.1 or localhost,
+a B3 chain other than regtest, and a node whose `getbridgev2info` is not
+configured and active; then `getbridgev2info.deposits.status` OPEN prints
+`{"deposits":"OPEN","next_height":n}` and exits 0, while CLOSED_FOR_GOOD
+prints `error: bridge V2 deposits are closed for good: <reason>; this
+relayer refuses deposits and flushes` and UNAVAILABLE (or anything else)
+fails closed, both with exit 1. OPEN only means B3 has not closed deposits,
+not that Verifier V2 `depositsOpen()` is true; the wallet-side counterpart
+is `getbridgedepositrecipient`.
 
 ### Pin file (`-b3bridgepins=<absolute path>`)
 
