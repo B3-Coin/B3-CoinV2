@@ -638,7 +638,14 @@ python3 contrib/b3bridge/b3_bridge_observe_v2.py --ethereum-rpc http://127.0.0.1
 - Subjects: 1 VERIFIER_E (Verifier V2 liveness, set hashes, latest
   certificate), 2 RESERVE_E (Vault V2 `nextDepositId`, `locked`,
   `absorbedTotal` and the token's balance of the vault), 3 TOKEN_FLAGS
-  (paused, deprecated, vault blacklisted).
+  (paused, deprecated, vault blacklisted). From a B-23 successor's migration
+  height (node changes section 7.6) the plan also lists 18
+  RESERVE_E_SUCCESSOR and 19 TOKEN_FLAGS_SUCCESSOR, the same reads of the
+  successor vault. Without `--subjects` the observer submits every subject
+  the plan lists, so 18 and 19 join 1-3 from the migration height without a
+  flag (from then on the burn gate reads 1, 18 and 19, and a sweep's gate 1-3);
+  `--subjects` narrows a round. A RESERVE_E_SUCCESSOR credits a vault sweep
+  only once the successor's `absorb()` has counted it.
 - The plan's anchor is the newest retained V2 execution anchor with a state
   root, so relay a light-client update for a recent block first; a record
   must name an anchor newer than its subject's latest observation.

@@ -10,9 +10,14 @@ V2 burn gate (section 8.4, rows E1-E8):
 
 1. getbridgev2info gives observation_plan: the newest retained V2 execution
    anchor that carries a state root and, per subject, the accounts and
-   storage keys to prove (1 VERIFIER_E, 2 RESERVE_E, 3 TOKEN_FLAGS).
-2. For each requested subject, eth_getProof(address, slots, anchor.number)
-   is called for every account of the plan, in plan order.
+   storage keys to prove (1 VERIFIER_E, 2 RESERVE_E, 3 TOKEN_FLAGS and, from
+   a B-23 successor's migration height, 18 RESERVE_E_SUCCESSOR and 19
+   TOKEN_FLAGS_SUCCESSOR, the same reads of the successor vault; node
+   changes section 7.6).
+2. For each requested subject (by default every subject the plan lists, so
+   18 and 19 join 1-3 from the migration height without a flag),
+   eth_getProof(address, slots, anchor.number) is called for every account
+   of the plan, in plan order.
 3. buildbridgeobservationv2(subject, anchor.hash_evm, proofs) verifies the
    proofs against the anchor's state root and returns the canonical payload
    (with B3's own VERIFIER_E verdict).
@@ -30,6 +35,8 @@ carriers already broadcast). Fail closed:
 - the plan must carry an anchor, its block on the Ethereum endpoint must have
   the anchor's hash, and the anchor must be newer than each requested
   subject's latest observation (a record naming an older anchor is invalid);
+- a requested subject must be in the plan (the successor subjects are listed
+  only once the migration is active for the next block);
 - every eth_getProof result must answer for the plan's account and keys, in
   order (the node checks this again and verifies every proof);
 - each built record must name the requested subject and the plan's anchor,
@@ -52,7 +59,8 @@ import urllib.request
 
 LOCAL_HOSTS = ("127.0.0.1", "localhost")
 REGTEST_CHAIN = "regtest"
-SUBJECTS = {1: "VERIFIER_E", 2: "RESERVE_E", 3: "TOKEN_FLAGS"}
+SUBJECTS = {1: "VERIFIER_E", 2: "RESERVE_E", 3: "TOKEN_FLAGS",
+            18: "RESERVE_E_SUCCESSOR", 19: "TOKEN_FLAGS_SUCCESSOR"}
 SUBJECT_ALIASES = {name.lower(): number for number, name in SUBJECTS.items()}
 RECORD_KIND = "eth-state-observation"
 USER_AGENT = "b3-bridge-observe-v2/1"
@@ -171,7 +179,7 @@ def quantity(value, name):
 
 
 def parse_subjects(text):
-    """'1,2,3' or names (verifier_e, reserve_e, token_flags), deduplicated, ascending."""
+    """'1,2,3' (18, 19 for the successor) or names (verifier_e, ...), deduplicated, ascending."""
     chosen = set()
     for item in text.split(","):
         item = item.strip().lower()
@@ -180,7 +188,8 @@ def parse_subjects(text):
         elif item.isdigit() and int(item) in SUBJECTS:
             chosen.add(int(item))
         else:
-            raise ObserverError(f"unknown subject {item!r}: expected 1-3 or one of "
+            raise ObserverError(f"unknown subject {item!r}: expected one of "
+                                f"{', '.join(str(n) for n in sorted(SUBJECTS))} or "
                                 f"{', '.join(sorted(SUBJECT_ALIASES))}")
     if not chosen:
         raise ObserverError("no subject requested")
@@ -223,10 +232,25 @@ def load_plan(node, eth):
                         "timestamp": anchor.get("timestamp")}
 
 
+def planned_subjects(plan):
+    """The default subjects: every subject the plan lists that this observer
+    knows, ascending. getbridgev2info lists 1-3 and, once a B-23 successor's
+    migration is active for the next block, 18 and 19, whose observations
+    the successor's burn gate (rows E7 and E8) reads."""
+    listed = sorted({entry.get("subject") for entry in plan.get("subjects") or []
+                     if isinstance(entry, dict) and type(entry.get("subject")) is int
+                     and entry.get("subject") in SUBJECTS})
+    if not listed:
+        raise ObserverError("observation_plan lists no subject")
+    return listed
+
+
 def subject_plan(plan, subject):
     entries = [entry for entry in plan.get("subjects") or [] if entry.get("subject") == subject]
     if len(entries) != 1:
-        raise ObserverError(f"observation_plan has no single entry for subject {subject}")
+        hint = (" (the successor subjects exist only from the B-23 migration height)"
+                if subject in (18, 19) and not entries else "")
+        raise ObserverError(f"observation_plan has no single entry for subject {subject}{hint}")
     entry = entries[0]
     if entry.get("name") != SUBJECTS[subject]:
         raise ObserverError(f"observation_plan names subject {subject} {entry.get('name')!r}, "
@@ -298,9 +322,12 @@ def build_observation(node, eth, plan, anchor, subject):
     }
 
 
-def observe(node, wallet, eth, subjects, dry_run=False):
-    """One observation round; returns the stdout result object."""
+def observe(node, wallet, eth, subjects=None, dry_run=False):
+    """One observation round; returns the stdout result object. `subjects`
+    None observes every subject the plan lists (planned_subjects)."""
     info, plan, anchor = load_plan(node, eth)
+    if subjects is None:
+        subjects = planned_subjects(plan)
     built = [build_observation(node, eth, plan, anchor, subject) for subject in subjects]
     if not dry_run:
         if wallet is None:
@@ -334,8 +361,11 @@ def parse_args(argv=None):
     p.add_argument("--b3-rpc-password")
     p.add_argument("--b3-cookie")
     p.add_argument("--wallet", help="B3 wallet that funds the carriers (required unless --dry-run)")
-    p.add_argument("--subjects", default="1,2,3",
-                   help="comma list of 1/verifier_e, 2/reserve_e, 3/token_flags (default all)")
+    p.add_argument("--subjects",
+                   help="comma list of 1/verifier_e, 2/reserve_e, 3/token_flags and, from a B-23 "
+                        "successor's migration height, 18/reserve_e_successor, "
+                        "19/token_flags_successor (default: every subject getbridgev2info's "
+                        "observation_plan lists, i.e. 1,2,3 and, from the migration height, 18,19)")
     p.add_argument("--dry-run", action="store_true", help="build and print the records, submit nothing")
     p.add_argument("--timeout", type=float, default=120)
     args = p.parse_args(argv)
@@ -346,7 +376,7 @@ def parse_args(argv=None):
     if not args.dry_run and not args.wallet:
         p.error("--wallet is required unless --dry-run")
     try:
-        args.subject_list = parse_subjects(args.subjects)
+        args.subject_list = None if args.subjects is None else parse_subjects(args.subjects)
     except ObserverError as e:
         p.error(str(e))
     return args

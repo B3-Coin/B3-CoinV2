@@ -16,6 +16,7 @@ import b3_bridge_observe_v2 as observer  # noqa: E402
 
 VERIFIER = "0x" + "a1" * 20
 VAULT = "0x" + "b2" * 20
+SUCCESSOR_VAULT = "0x" + "b7" * 20
 TOKEN = "0x" + "c3" * 20
 ANCHOR_HASH = "0x" + "d4" * 32
 ANCHOR_NUMBER = 1234
@@ -27,17 +28,25 @@ def word(n):
 
 BALANCE_SLOT = "0x" + "e5" * 32
 BLACKLIST_SLOT = "0x" + "f6" * 32
+SUCCESSOR_BALANCE_SLOT = "0x" + "e7" * 32
+SUCCESSOR_BLACKLIST_SLOT = "0x" + "f8" * 32
 PLAN_ACCOUNTS = {
     1: [{"role": "verifier", "address": VERIFIER, "slots": [word(0), word(1), word(2), word(4), word(6)]}],
     2: [{"role": "vault", "address": VAULT, "slots": [word(0), word(1), word(3)]},
         {"role": "token", "address": TOKEN, "slots": [BALANCE_SLOT]}],
     3: [{"role": "token", "address": TOKEN, "slots": [word(0), word(10), BLACKLIST_SLOT]}],
+    # The B-23 successor subjects read the successor vault v' (node changes section 7.6).
+    18: [{"role": "vault", "address": SUCCESSOR_VAULT, "slots": [word(0), word(1), word(3)]},
+         {"role": "token", "address": TOKEN, "slots": [SUCCESSOR_BALANCE_SLOT]}],
+    19: [{"role": "token", "address": TOKEN, "slots": [word(0), word(10), SUCCESSOR_BLACKLIST_SLOT]}],
 }
 
 
-def bridge_v2_info(**overrides):
+def bridge_v2_info(migration_active=True, **overrides):
     subjects = []
     for subject, name in observer.SUBJECTS.items():
+        if subject in (18, 19) and not migration_active:
+            continue  # getbridgev2info lists the successor subjects only from h_m.
         subjects.append({"subject": subject, "name": name, "anchor_is_newer": True,
                          "accounts": [dict(a, slots=list(a["slots"])) for a in PLAN_ACCOUNTS[subject]]})
     info = {
@@ -156,9 +165,63 @@ class ObserverTests(unittest.TestCase):
     def test_parse_subjects(self):
         self.assertEqual(observer.parse_subjects("3,1"), [1, 3])
         self.assertEqual(observer.parse_subjects("verifier_e, RESERVE_E,2"), [1, 2])
-        for bad in ("0", "4", "", "kind9", "1,,2"):
+        self.assertEqual(observer.parse_subjects("19,18,1"), [1, 18, 19])
+        self.assertEqual(observer.parse_subjects("reserve_e_successor,TOKEN_FLAGS_SUCCESSOR"), [18, 19])
+        for bad in ("0", "4", "", "kind9", "1,,2", "17", "20", "0x12", "34"):
             with self.assertRaises(observer.ObserverError, msg=bad):
                 observer.parse_subjects(bad)
+        with self.assertRaisesRegex(observer.ObserverError, "1, 2, 3, 18, 19"):
+            observer.parse_subjects("4")
+
+    def test_successor_subjects(self):
+        result = self.observe(subjects=(18, 19))
+        proofs = [params for method, params in self.eth.calls if method == "eth_getProof"]
+        # v' and its balance slot for 18, the token and isBlackListed[v'] for 19.
+        self.assertEqual(proofs, [
+            [SUCCESSOR_VAULT, PLAN_ACCOUNTS[18][0]["slots"], hex(ANCHOR_NUMBER)],
+            [TOKEN, [SUCCESSOR_BALANCE_SLOT], hex(ANCHOR_NUMBER)],
+            [TOKEN, PLAN_ACCOUNTS[19][0]["slots"], hex(ANCHOR_NUMBER)],
+        ])
+        builds = [params for method, params in self.node.calls if method == "buildbridgeobservationv2"]
+        self.assertEqual([(b[0], len(b[2])) for b in builds], [(18, 2), (19, 1)])
+        self.assertEqual([o["name"] for o in result["observations"]],
+                         ["RESERVE_E_SUCCESSOR", "TOKEN_FLAGS_SUCCESSOR"])
+        self.assertEqual(len(self.wallet.calls), 2)
+
+    def test_default_subjects_follow_the_plan(self):
+        # No --subjects: every planned subject, so from h_m the successor
+        # subjects 18 and 19 (rows E7 and E8 of v''s gate) join 1-3.
+        result = observer.observe(self.node, self.wallet, self.eth, None)
+        self.assertEqual([o["subject"] for o in result["observations"]], [1, 2, 3, 18, 19])
+        self.assertEqual(len(self.wallet.calls), 5)
+        # Below h_m the plan lists 1-3 only, and so does the default.
+        self.node.replies["getbridgev2info"] = lambda _: bridge_v2_info(migration_active=False)
+        self.wallet.calls.clear()
+        result = observer.observe(self.node, self.wallet, self.eth, None, dry_run=True)
+        self.assertEqual([o["subject"] for o in result["observations"]], [1, 2, 3])
+        self.assertEqual(self.wallet.calls, [])
+        # Subjects this observer does not know are skipped; a plan without a
+        # known subject is refused before any proof is fetched.
+        info = bridge_v2_info(migration_active=False)
+        info["observation_plan"]["subjects"].append({"subject": 0x22, "name": "FUTURE", "accounts": []})
+        self.node.replies["getbridgev2info"] = lambda _: info
+        result = observer.observe(self.node, self.wallet, self.eth, None, dry_run=True)
+        self.assertEqual([o["subject"] for o in result["observations"]], [1, 2, 3])
+        for subjects in ([], [{"subject": 0x22}], [{"subject": True}], ["1"]):
+            empty = bridge_v2_info()
+            empty["observation_plan"]["subjects"] = subjects
+            self.node.replies["getbridgev2info"] = lambda _, e=empty: e
+            proofs_before = len([m for m, _ in self.eth.calls if m == "eth_getProof"])
+            with self.assertRaisesRegex(observer.ObserverError, "observation_plan lists no subject"):
+                observer.observe(self.node, self.wallet, self.eth, None)
+            self.assertEqual(len([m for m, _ in self.eth.calls if m == "eth_getProof"]), proofs_before)
+
+    def test_successor_subjects_refused_before_migration(self):
+        self.node.replies["getbridgev2info"] = lambda _: bridge_v2_info(migration_active=False)
+        for subjects in ((18,), (19,), (1, 2, 3, 18)):
+            self.assert_refused("exist only from the B-23 migration height", subjects=subjects)
+        # The launch subjects alone still work.
+        self.observe()
 
     # -- refusals ---------------------------------------------------------------
     def test_refuses_non_regtest_chain(self):
@@ -286,6 +349,14 @@ class ObserverTests(unittest.TestCase):
         args = observer.parse_args(["--ethereum-rpc", "http://127.0.0.1:1", "--b3-rpc-url", "http://127.0.0.1:2",
                                     "--dry-run", "--subjects", "token_flags,1"])
         self.assertEqual(args.subject_list, [1, 3])
+        # Without --subjects the observer takes every subject the plan lists
+        # (test_default_subjects_follow_the_plan).
+        args = observer.parse_args(["--ethereum-rpc", "http://127.0.0.1:1", "--b3-rpc-url", "http://127.0.0.1:2",
+                                    "--dry-run"])
+        self.assertIsNone(args.subject_list)
+        args = observer.parse_args(["--ethereum-rpc", "http://127.0.0.1:1", "--b3-rpc-url", "http://127.0.0.1:2",
+                                    "--dry-run", "--subjects", "1,2,3,18,19"])
+        self.assertEqual(args.subject_list, [1, 2, 3, 18, 19])
         # A non-local endpoint is refused before any request (exit 1, "error: ...").
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
