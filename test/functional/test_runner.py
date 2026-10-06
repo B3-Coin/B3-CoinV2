@@ -103,6 +103,8 @@ EXTENDED_SCRIPTS = [
     'feature_b3_bridge_rt4_kofn_gate.py',
     # Bridge V2 kind 13 finality conflict: B3 and Verifier V2 close for good (as RT4a).
     'feature_b3_bridge_rt4c_conflict.py',
+    # Bridge V2 B-23 vault migration to a pinned successor vault (as RT4a).
+    'feature_b3_bridge_rt4d_migration.py',
 ]
 
 # Special script to run each bench sanity check

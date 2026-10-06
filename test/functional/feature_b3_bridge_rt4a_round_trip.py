@@ -71,7 +71,9 @@ hash. The V1 registry stays the synthetic MANAGED_V1 bUSD. V = W2 = 281.
 feature_b3_bridge_rt4_kofn_gate.py (RT4) reuses this test with the default
 K_OF_N bootstrap and the gate's refusals; feature_b3_bridge_rt4c_conflict.py
 (RT4c) with a kind 13 finality conflict, after which carried certificates
-set bridgeFlags bit 0 (expected_bridge_flags).
+set bridgeFlags bit 0 (expected_bridge_flags);
+feature_b3_bridge_rt4d_migration.py (RT4d) with a B-23 successor vault
+pinned in the same file (bridge_pins_successor) and migrated to.
 """
 
 import json
@@ -279,17 +281,17 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         self.bootstrap = self.beacon.bootstrap()
         assert_equal(self.bootstrap["checkpoint_block"], checkpoint_block)
         assert_equal(self.bootstrap["checkpoint_slot"] % PERIOD_SLOTS, PERIOD_SLOTS // 2)
+        self.domain = regtest_chain_domain()
+        self.asset_id_raw = asset_id_v2(self.domain, REGTEST_ETH_CHAIN_ID, self.vault, self.token)
         self.pins_path = os.path.join(self.options.tmpdir, "b3bridgepins-v2.json")
         self.pins = write_regtest_bridge_pins_v2(
             self.pins_path, anvil, vault=self.vault, token=self.token, verifier=self.verifier,
             deployer=self.deployer, deployment_block=self.origin_deployment_block,
             bootstrap_output=self.bootstrap, activation_height=BRIDGE_V2_HEIGHT,
             burn_height=BRIDGE_V2_BURN_HEIGHT, max_deposit_raw=MAX_DEPOSIT_RAW,
-            min_bridge_total_weight=MIN_BRIDGE_TOTAL_WEIGHT)
+            min_bridge_total_weight=MIN_BRIDGE_TOTAL_WEIGHT, successor=self.bridge_pins_successor())
         assert_equal(sorted(self.pins), ["format", "v2"])
         assert_equal(hx(self.pins["v2"]["token_runtime_code_hash"]), self.token_code_hash)
-        self.domain = regtest_chain_domain()
-        self.asset_id_raw = asset_id_v2(self.domain, REGTEST_ETH_CHAIN_ID, self.vault, self.token)
         self.evidence.step("ethereum token deployed and v2 pins written", eth_block=anvil.block_number(),
                            token=self.token, token_block=token_block, predicted=self.predicted,
                            checkpoint_block=checkpoint_block,
@@ -298,6 +300,14 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
                            pins_sha256=file_sha256(self.pins_path),
                            asset_id_v2=to_0x(self.asset_id_raw))
         self.start_bridge_validators(self.pins_path, extra_args=FRESH_ARGS)
+
+    def bridge_pins_successor(self):
+        """The v2.successor pins (a B-23 successor vault, RT4d); none here."""
+        return None
+
+    def expected_unpinned(self):
+        """getbridgev2info's unpinned list for these pins (OI-3)."""
+        return list(UNPINNED)
 
     # -- test ---------------------------------------------------------------
     def run_test(self):
@@ -413,7 +423,7 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
                      (BRIDGE_V2_DEFAULT_CAP_RAW, BRIDGE_V2_DEFAULT_CAP_RAW))
         assert_equal(info["epoch_length_blocks"], EPOCH_LENGTH)
         assert "vault_runtime_code_hash" not in info and "verifier_runtime_code_hash" not in info
-        assert_equal(info["unpinned"], UNPINNED)
+        assert_equal(info["unpinned"], self.expected_unpinned())
         assert_equal(hx(info["asset_id_evm"]), self.asset_id_raw)
         assert_equal(info["asset_id"], self.asset_id_raw[::-1].hex())
         assert_equal(info["vault_entry_id"], hx(info["vault_entry_id_evm"])[::-1].hex())
@@ -1280,16 +1290,20 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         # Field for field, the replayed observations, reserve ledger and
         # (absent) conflict included; only burn_gate.now_eff follows the clock.
         assert_equal(gate_view(info0), gate_view(info1))
-        assert_equal(sorted(info0["observations"]), sorted(ETH_OBSERVATION_KEYS.values()))
-        assert_equal(info0["reserve"]["burned"], BURN_RAW)
-        assert "conflict" not in info0
-        assert_equal((info0["nullifiers"], info0["withdrawals"]), (1, 1))
-        assert_equal(hx(info0["withdrawal_root_evm"]), self.root)
+        self.check_reindexed_v2_info(info0)
         lineage0, lineage1 = n0.getfinalitylineage(), n1.getfinalitylineage()
         for key in LINEAGE_VIEW_KEYS:
             assert_equal(lineage0.get(key), lineage1.get(key))
         self.evidence_step("n0 reindexed and agrees with n1", self.anvil,
                            tip=n0.getbestblockhash(), fresh_finalized=lineage0.get("finalized"))
+
+    def check_reindexed_v2_info(self, info):
+        """RT4a's bridge V2 state as n0 rebuilt it (RT4d checks its own)."""
+        assert_equal(sorted(info["observations"]), sorted(ETH_OBSERVATION_KEYS.values()))
+        assert_equal(info["reserve"]["burned"], BURN_RAW)
+        assert "conflict" not in info
+        assert_equal((info["nullifiers"], info["withdrawals"]), (1, 1))
+        assert_equal(hx(info["withdrawal_root_evm"]), self.root)
 
 
 if __name__ == '__main__':

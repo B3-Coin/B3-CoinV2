@@ -38,7 +38,10 @@ REGTEST ONLY. This module provides:
   test keys (bring_up_validators(finality_key_label=...)), the
   FinalizedBlockV2 encoder, digest V2, history leaves, the kind 13
   FINALITY_CONFLICT record, Verifier V2 reportConflict calldata and a
-  one-shot run of contrib/b3bridge/b3_bridge_deposit_guard_v2.py.
+  one-shot run of contrib/b3bridge/b3_bridge_deposit_guard_v2.py;
+- bridge V2 (fourth node slice, RT4d): the B-23 successor vault pins, the
+  kind 16 VAULT_SWEEP record, the successor kind 9 subjects 18 and 19 and
+  their observation plan, and the B3VaultV2 constructor Config encoder.
 
 The relayer module is imported only as a library; its main() is never
 called in-process, only as an unchanged subprocess by run_relayer_once().
@@ -733,7 +736,7 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
                                  min_bridge_validators=4, max_bridge_validators=64,
                                  min_bridge_total_weight=4, horizon_epochs=1024,
                                  gvr=REGTEST_GVR, fork_version=REGTEST_FORK_VERSION,
-                                 verifier_max_epoch_lag=None, check=True):
+                                 verifier_max_epoch_lag=None, successor=None, check=True):
     """Write a -b3bridgepins file holding only a v2 section; return its JSON.
 
     The file must exist before the validators first start (OI-3), when the
@@ -760,11 +763,33 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
     (default: profile R's GATE_R_SET_EXPIRY, DeployV2's R_MAX_EPOCH_LAG); the
     node requires it to equal its burn gate's set expiry, and the writer
     refuses any other value first.
+
+    successor, when given, pins a B-23 successor vault v' (node changes §7.6)
+    in the same file, so it too exists before the validators first start and
+    the record guard freezes it with v; its rules apply only from h_m. It is
+    a dict with "vault" (v', the CREATE address of a dedicated "deployer" at
+    nonce 0, since v' can only be deployed once v holds code), "asset_id" (v's
+    bUSD V2 AssetId, raw bytes as asset_id_v2 returns them; the node refuses
+    any other value), "migration_height" (h_m) and optionally
+    "origin_deployment_block" (node default: v's). The writer emits v as the
+    predecessor and every other field is inherited from v by the node. With
+    check it also refuses: a successor deployer equal to `deployer` (whose
+    nonce 0 DeployV2 uses), a v' other than predict_create_address(successor
+    deployer, 0), a v' equal to vault, token or verifier, a zero or non-32-byte
+    AssetId, h_m <= V or h_m < W2, a deployment bound below 1, and, read from
+    anvil, a successor deployer nonce other than zero or code already at v'.
     """
     assert os.path.isabs(path), "-b3bridgepins needs an absolute path"
     caps = dict(caps or {})
     assert set(caps) <= {"max_per_block", "max_per_epoch"}, caps
     vault, token, verifier, deployer = (normalize_address(a) for a in (vault, token, verifier, deployer))
+    if successor is not None:
+        successor = dict(successor)
+        assert {"vault", "deployer", "asset_id", "migration_height"} <= set(successor) <= {
+            "vault", "deployer", "asset_id", "migration_height", "origin_deployment_block"}, successor
+        successor["vault"] = normalize_address(successor["vault"])
+        successor["deployer"] = normalize_address(successor["deployer"])
+        successor["asset_id"] = hx(successor["asset_id"])
     gvr = hx(gvr)
     fork_version = hx(fork_version)
     checkpoint_block = bootstrap_output["checkpoint_block"]
@@ -804,6 +829,25 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
     if verifier_max_epoch_lag != GATE_R_SET_EXPIRY:
         refuse(f"verifier_max_epoch_lag {verifier_max_epoch_lag} is not the regtest gate's set expiry "
                f"{GATE_R_SET_EXPIRY} (DeployV2 R_MAX_EPOCH_LAG)")
+    if successor is not None:
+        successor_vault, successor_deployer = successor["vault"], successor["deployer"]
+        effective_burn = activation_height if burn_height is None else burn_height
+        migration_height = successor["migration_height"]
+        if hx(successor_vault) == bytes(20) or successor_vault in (vault, token, verifier):
+            refuse("the successor vault must be non-zero and differ from vault, token and verifier")
+        if successor_deployer == deployer:
+            refuse("the successor deployer must differ from the V2 deployer, whose nonce 0 DeployV2 uses")
+        if successor_vault != predict_create_address(successor_deployer, 0):
+            refuse(f"the successor vault {successor_vault} is not the CREATE address of its deployer "
+                   f"{successor_deployer} at nonce 0")
+        if len(successor["asset_id"]) != 32 or successor["asset_id"] == bytes(32):
+            refuse("the successor asset_id must be v's non-zero 32-byte bUSD V2 AssetId")
+        if not (isinstance(migration_height, int) and activation_height < migration_height and
+                effective_burn <= migration_height <= 2**31 - 1):
+            refuse(f"the successor migration_height ({migration_height}) must be above activation_height "
+                   f"({activation_height}), at or above burn_height ({effective_burn}) and at most {2**31 - 1}")
+        if successor.get("origin_deployment_block", 1) < 1:
+            refuse("the successor origin_deployment_block must be at least 1")
 
     def rpc(method, *params):
         return local_json_rpc(_anvil_url(anvil), method, list(params))
@@ -826,6 +870,14 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
         for name, address, deployer_nonce in (("verifier", verifier, 1), ("vault", vault, 2)):
             if address != predict_create_address(deployer, deployer_nonce):
                 refuse(f"the {name} is not DeployV2's CREATE address at deployer nonce {deployer_nonce}")
+        if successor is not None:
+            if code(successor["vault"]):
+                refuse(f"the successor vault address {successor['vault']} already holds code; pins must "
+                       "predict a deployment that has not happened")
+            successor_nonce = int(rpc("eth_getTransactionCount", successor["deployer"], "latest"), 16)
+            if successor_nonce != 0:
+                refuse(f"successor deployer {successor['deployer']} has nonce {successor_nonce}; "
+                       "v' must be its first deployment")
     token_code = code(token)
     if not token_code:
         refuse(f"no runtime code at the token {token}")
@@ -848,6 +900,15 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
     if burn_height is not None:
         v2["burn_height"] = burn_height
     v2.update(caps)
+    if successor is not None:
+        v2["successor"] = {
+            "vault": successor["vault"],
+            "predecessor": vault,
+            "asset_id": to_0x(successor["asset_id"]),
+            "migration_height": successor["migration_height"],
+        }
+        if "origin_deployment_block" in successor:
+            v2["successor"]["origin_deployment_block"] = successor["origin_deployment_block"]
     document = {"format": PINS_FORMAT, "v2": v2}
     with open(path, "w", encoding="utf8") as f:
         json.dump(document, f, indent=2, sort_keys=True)
@@ -1151,6 +1212,38 @@ def encode_finality_conflict_record(validator_count, payload):
     return bytes([FINALITY_CONFLICT_RECORD_KIND, 0]) + validator_count.to_bytes(2, "big") + payload
 
 
+# -- B-23 vault migration (node changes §7.6, contracts spec §6.4) --------------
+VAULT_SWEEP_RECORD_KIND = 16
+
+
+def encode_vault_sweep_record(entry_id_evm):
+    """The kind 16 VAULT_SWEEP bridge record submitbridgecarrier takes:
+    exactly 34 bytes, 0x10 || 0x00 || the launch vault entry id in raw
+    order (getbridgev2info vault_entry_id_evm, as kinds 3 and 6 carry a
+    registry id). Derived independently of src/bridge/proof.h; consensus
+    derives the amount, the leaf id and both vaults, so every sweep of one
+    migration is this same record."""
+    entry_id = hx(entry_id_evm)
+    assert_equal(len(entry_id), 32)
+    assert entry_id != bytes(32), "the vault entry id is null"
+    return bytes([VAULT_SWEEP_RECORD_KIND, 0]) + entry_id
+
+
+def encode_vault_v2_config(*, verifier, verifier_code_hash, chain_domain, token, token_code_hash,
+                           forwarder_factory, max_deposit_raw, predecessor=None, predecessor_asset_id=None):
+    """B3VaultV2's constructor argument, the static Config tuple
+    (contracts/src/v2/B3VaultV2.sol): nine words in declaration order. A
+    B-23 successor names the vault it replaces and that vault's
+    B3_ASSET_ID; the launch vault leaves both zero."""
+    assert (predecessor is None) == (predecessor_asset_id is None), "a successor needs both fields"
+    words = [enc_address(verifier), enc_bytes32(verifier_code_hash), enc_bytes32(chain_domain),
+             enc_address(token), enc_bytes32(token_code_hash), enc_address(forwarder_factory),
+             enc_uint(max_deposit_raw),
+             enc_address(predecessor or "0x" + "00" * 20),
+             enc_bytes32(predecessor_asset_id if predecessor_asset_id is not None else bytes(32))]
+    return b"".join(words)
+
+
 # -- relayer deposit guard (node changes §8.5) ------------------------------------
 DEPOSIT_GUARD_V2_SCRIPT = str(B3BRIDGE_CONTRIB_DIR / "b3_bridge_deposit_guard_v2.py")
 
@@ -1186,6 +1279,11 @@ def run_deposit_guard(node, timeout=120):
 OBSERVE_V2_SCRIPT = str(B3BRIDGE_CONTRIB_DIR / "b3_bridge_observe_v2.py")
 ETH_OBSERVATION_SUBJECTS = {1: "VERIFIER_E", 2: "RESERVE_E", 3: "TOKEN_FLAGS"}
 ETH_OBSERVATION_KEYS = {1: "verifier_e", 2: "reserve_e", 3: "token_flags"}
+# B-23 successor subjects (node changes §7.6): the base subject | (vault entry
+# index 1 << 4), RESERVE_E and TOKEN_FLAGS read from the successor vault v'.
+# The next block may carry them only from the migration height.
+ETH_OBSERVATION_SUBJECTS_SUCCESSOR = {0x12: "RESERVE_E_SUCCESSOR", 0x13: "TOKEN_FLAGS_SUCCESSOR"}
+ETH_OBSERVATION_KEYS_SUCCESSOR = {0x12: "reserve_e_successor", 0x13: "token_flags_successor"}
 # Byte of the verdict in a kind 9 payload: kind, reserved, subject, anchor hash.
 ETH_OBSERVATION_VERDICT_OFFSET = 35
 ETH_OBSERVATION_VERDICT_SETS_MISMATCH = 0x01
@@ -1209,17 +1307,32 @@ TOKEN_SLOT_IS_BLACK_LISTED = 6
 TOKEN_SLOT_UPGRADED_DEPRECATED = 10
 
 
-def observation_plan_v2(verifier, vault, token):
-    """{subject: [(address, [32-byte storage keys])]}: getbridgev2info's
-    observation_plan derived independently (src/bridge/state_observation.h)."""
+def _reserve_and_flags_plan(vault, token):
+    """(RESERVE_E plan, TOKEN_FLAGS plan) of one vault entry."""
     vault_word = enc_address(vault)
-    return {
+    reserve = [(normalize_address(vault), [enc_uint(s) for s in VAULT_V2_OBSERVED_SLOTS]),
+               (normalize_address(token), [enc_uint(mapping_slot(vault_word, TOKEN_SLOT_BALANCES))])]
+    flags = [(normalize_address(token), [enc_uint(TOKEN_SLOT_OWNER_PAUSED), enc_uint(TOKEN_SLOT_UPGRADED_DEPRECATED),
+                                         enc_uint(mapping_slot(vault_word, TOKEN_SLOT_IS_BLACK_LISTED))])]
+    return reserve, flags
+
+
+def observation_plan_v2(verifier, vault, token, successor_vault=None):
+    """{subject: [(address, [32-byte storage keys])]}: getbridgev2info's
+    observation_plan derived independently (src/bridge/state_observation.h).
+
+    With successor_vault (a B-23 v', node changes §7.6) it also holds
+    subjects 0x12 and 0x13: the RESERVE_E and TOKEN_FLAGS reads of v' (vault
+    slots 0, 1, 3 and balances[v']; token slots 0, 10 and isBlackListed[v'])."""
+    reserve, flags = _reserve_and_flags_plan(vault, token)
+    plan = {
         1: [(normalize_address(verifier), [enc_uint(s) for s in VERIFIER_V2_OBSERVED_SLOTS])],
-        2: [(normalize_address(vault), [enc_uint(s) for s in VAULT_V2_OBSERVED_SLOTS]),
-            (normalize_address(token), [enc_uint(mapping_slot(vault_word, TOKEN_SLOT_BALANCES))])],
-        3: [(normalize_address(token), [enc_uint(TOKEN_SLOT_OWNER_PAUSED), enc_uint(TOKEN_SLOT_UPGRADED_DEPRECATED),
-                                        enc_uint(mapping_slot(vault_word, TOKEN_SLOT_IS_BLACK_LISTED))])],
+        2: reserve,
+        3: flags,
     }
+    if successor_vault is not None:
+        plan[0x12], plan[0x13] = _reserve_and_flags_plan(successor_vault, token)
+    return plan
 
 
 def tamper_observation_verdict(payload_hex, flip=ETH_OBSERVATION_VERDICT_SETS_MISMATCH):
@@ -1269,10 +1382,12 @@ def run_observer_once(node, wallet, ethereum_url, subjects=(1, 2, 3), *, dry_run
 
 
 def gate_view(info):
-    """getbridgev2info without burn_gate.now_eff, which follows each node's
-    clock (max(now, MTP + 1)) and so differs between two calls."""
+    """getbridgev2info without burn_gate.now_eff and, with a B-23 successor,
+    successor.sweep.gate.now_eff, which follow each node's clock
+    (max(now, MTP + 1)) and so differ between two calls."""
     view = copy.deepcopy(info)
     view.get("burn_gate", {}).pop("now_eff", None)
+    view.get("successor", {}).get("sweep", {}).get("gate", {}).pop("now_eff", None)
     return view
 
 
@@ -1661,10 +1776,13 @@ class B3BridgeChainMixin:
         self._bridge_processes.append(process)
         return process
 
-    def start_anvil(self, name="anvil", chain_id=REGTEST_ETH_CHAIN_ID):
-        """Start a local anvil that shutdown() stops even on failure."""
+    def start_anvil(self, name="anvil", chain_id=REGTEST_ETH_CHAIN_ID, accounts=4):
+        """Start a local anvil that shutdown() stops even on failure.
+
+        accounts: the number of unlocked dev accounts (anvil's deterministic
+        mnemonic, so account i is the same address in every run)."""
         anvil = Anvil(self.foundry["anvil"], os.path.join(self.options.tmpdir, name),
-                      chain_id=chain_id)
+                      chain_id=chain_id, accounts=accounts)
         self.register_bridge_process(anvil)
         return anvil.start()
 
@@ -2429,6 +2547,44 @@ class TestFrameworkB3BridgeGuards(unittest.TestCase):
                     self.assertRaisesRegex(AssertionError, "Refusing non-local endpoint"):
                 write_regtest_bridge_pins_v2(os.path.join(tmp, "pins-v2.json"), url, **self.v2_pin_kwargs())
 
+    V2_SUCCESSOR_DEPLOYER = "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65"  # anvil account 4
+
+    def v2_successor(self, **overrides):
+        successor = {
+            "vault": predict_create_address(self.V2_SUCCESSOR_DEPLOYER, 0),
+            "deployer": self.V2_SUCCESSOR_DEPLOYER,
+            "asset_id": "0x" + "11" * 32,
+            "migration_height": 341,
+        }
+        successor.update(overrides)
+        return successor
+
+    def test_v2_pin_writer_successor_refusals(self):
+        regtest = self.FakeAnvil(REGTEST_ETH_CHAIN_ID)
+
+        def refused(message, pin_overrides=None, **successor_overrides):
+            self.assert_v2_pins_refused(regtest, message, **(pin_overrides or {}),
+                                        successor=self.v2_successor(**successor_overrides))
+
+        vault, token, verifier = (self.v2_pin_kwargs()[key] for key in ("vault", "token", "verifier"))
+        for address in (vault, token, verifier, "0x" + "00" * 20):
+            refused("successor vault must be non-zero and differ from vault, token and verifier", vault=address)
+        refused("must differ from the V2 deployer", deployer=self.V2_DEPLOYER,
+                vault=predict_create_address(self.V2_DEPLOYER, 0))
+        refused("is not the CREATE address of its deployer", vault=predict_create_address(self.V2_SUCCESSOR_DEPLOYER, 1))
+        refused("is not the CREATE address of its deployer", deployer=self.ADDRESSES[0])
+        for asset_id in ("0x" + "00" * 32, "0x" + "11" * 20, b"\x01" * 31):
+            refused("asset_id must be v's non-zero 32-byte bUSD V2 AssetId", asset_id=asset_id)
+        for height in (0, 280, 281, 2**31):
+            refused(f"migration_height \\({height}\\) must be above activation_height \\(281\\)",
+                    migration_height=height)
+        refused("at or above burn_height \\(300\\)", pin_overrides={"burn_height": 300}, migration_height=299)
+        refused("origin_deployment_block must be at least 1", origin_deployment_block=0)
+        # Keys the node inherits from v are not successor inputs.
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(AssertionError):
+            write_regtest_bridge_pins_v2(os.path.join(tmp, "pins-v2.json"), regtest,
+                                         **self.v2_pin_kwargs(successor=self.v2_successor(token=token)))
+
     def test_predict_create_address(self):
         # anvil account 0 deploys at the well-known addresses of nonces 0, 1 and 2.
         sender = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
@@ -2616,3 +2772,55 @@ class TestFrameworkB3BridgeGuards(unittest.TestCase):
         self.assertEqual(words[44], enc_uint(head_words * 32 + len(set_tuple)))
         self.assertEqual(report[4 + head_words * 32:4 + head_words * 32 + len(set_tuple)], set_tuple)
         self.assertEqual(report[4 + head_words * 32 + len(set_tuple):], abi_bytes_tail("0x" + "55" * 70))
+
+    def test_v2_migration_helpers(self):
+        """RT4d: the kind 16 VAULT_SWEEP record, the successor subjects' plan,
+        the B3VaultV2 Config words and gate_view's successor sweep gate."""
+        entry_id = b"\x5a" * 31 + b"\x01"
+        record = encode_vault_sweep_record("0x" + entry_id.hex())
+        self.assertEqual((record[:2], record[2:], len(record)), (bytes([16, 0]), entry_id, 34))
+        for bad in ("0x" + "00" * 32, "0x" + "11" * 31, b"\x22" * 33):
+            with self.assertRaises(AssertionError):
+                encode_vault_sweep_record(bad)
+
+        vault, token, verifier = self.ADDRESSES
+        successor = predict_create_address(self.V2_SUCCESSOR_DEPLOYER, 0)
+        plain = observation_plan_v2(verifier, vault, token)
+        plan = observation_plan_v2(verifier, vault, token, successor_vault=successor)
+        self.assertEqual(sorted(plain), [1, 2, 3])
+        self.assertEqual(sorted(plan), [1, 2, 3, 0x12, 0x13])
+        self.assertEqual({subject: plan[subject] for subject in (1, 2, 3)}, plain)
+        # 0x12 / 0x13 are RESERVE_E / TOKEN_FLAGS with v' in place of v.
+        self.assertEqual((plan[0x12], plan[0x13]),
+                         (observation_plan_v2(verifier, successor, token)[2],
+                          observation_plan_v2(verifier, successor, token)[3]))
+        self.assertEqual([account for account, _ in plan[0x12]], [successor, normalize_address(token)])
+        self.assertEqual(plan[0x13][0][1][2], enc_uint(mapping_slot(enc_address(successor), TOKEN_SLOT_IS_BLACK_LISTED)))
+        self.assertEqual(sorted(ETH_OBSERVATION_SUBJECTS_SUCCESSOR), [18, 19])
+        self.assertEqual({subject & 0x0f for subject in ETH_OBSERVATION_SUBJECTS_SUCCESSOR}, {2, 3})
+        self.assertEqual(sorted(ETH_OBSERVATION_KEYS_SUCCESSOR), sorted(ETH_OBSERVATION_SUBJECTS_SUCCESSOR))
+
+        common = {"verifier": verifier, "verifier_code_hash": b"\x01" * 32, "chain_domain": b"\x02" * 32,
+                  "token": token, "token_code_hash": b"\x03" * 32, "forwarder_factory": self.ADDRESSES[0],
+                  "max_deposit_raw": BRIDGE_V2_DEFAULT_CAP_RAW}
+        launch = encode_vault_v2_config(**common)
+        config = encode_vault_v2_config(**common, predecessor=vault, predecessor_asset_id=b"\x04" * 32)
+        words = [config[32 * i:32 * (i + 1)] for i in range(len(config) // 32)]
+        self.assertEqual(len(config), 9 * 32)
+        self.assertEqual(words[:7], [launch[32 * i:32 * (i + 1)] for i in range(7)])
+        self.assertEqual(words, [enc_address(verifier), b"\x01" * 32, b"\x02" * 32, enc_address(token), b"\x03" * 32,
+                                 enc_address(self.ADDRESSES[0]), enc_uint(BRIDGE_V2_DEFAULT_CAP_RAW),
+                                 enc_address(vault), b"\x04" * 32])
+        self.assertEqual(launch[7 * 32:], bytes(64))
+        with self.assertRaises(AssertionError):
+            encode_vault_v2_config(**common, predecessor=vault)
+
+        info = {"burn_gate": {"status": "READY", "now_eff": 5},
+                "successor": {"sweep": {"payload_hex": "1000", "gate": {"status": "READY", "now_eff": 7,
+                                                                         "closes_at": 9}}}}
+        self.assertEqual(gate_view(info), {"burn_gate": {"status": "READY"},
+                                           "successor": {"sweep": {"payload_hex": "1000",
+                                                                   "gate": {"status": "READY", "closes_at": 9}}}})
+        # Before the migration height the sweep carries no gate.
+        self.assertEqual(gate_view({"successor": {"sweep": {"payload_hex": "1000"}}}),
+                         {"successor": {"sweep": {"payload_hex": "1000"}}})
