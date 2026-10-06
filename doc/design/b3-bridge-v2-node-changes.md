@@ -164,6 +164,21 @@ W2 and from W2 follows §7.2; kind 9 (§8.2) and kind 13 (§8.5) are new; kinds
 tree freeze at V; the V2 store starts empty, with the second-bootstrap guard
 (`src/node/bridge_state.cpp:407-410`) per store. A fresh store is needed
 because the V1 pins end today and changing them would rename V1 ids.
+*Realized on regtest (S3 slice n2c):* kind 16, VAULT_SWEEP (§7.6), is
+`10 00 || registry_id 32`, exactly 34 bytes, the id in raw uint256 order as
+kinds 3 and 6 name an entry (`getbridgev2info.vault_entry_id_evm` of the
+launch entry); the codec refuses a null id. Like kinds 9 and 13 it decodes
+only under the V2 record set, and consensus accepts it only from a pinned
+successor's migration height h_m ("bridge V2 vault sweeps are not active"
+below it, and on every network without a successor). The sweep takes kind
+16 because the staker-signed fast deposit proposal
+([FSD](b3-bridge-v2-staker-signed-deposits.md) §4.3-§4.5, §17 item 4)
+already names kind 14 FSD_MINT and kind 15 FSD_FAULT: kinds 7, 8, 10-12,
+14 and 15 stay reserved and malformed in both record sets. Assertion 6 for a
+successor: one whose carried AssetId differs from the launch AssetId
+recomputed under the chain domain makes every configured V2 identity
+unavailable (fail closed), and the regtest pin file refuses it at startup
+(§12.2).
 
 Checked at startup, failing closed like `src/kernel/chainparams.cpp:271-273`,
 and in unit tests:
@@ -343,6 +358,126 @@ derive F_d against v′; relayers stop flushing into v's forwarders, whose
 funds stay refundable. A deposit whose sweep leaf is never certified before
 v's verifier stops is stranded, disclosed in the release notes.
 
+*Realized on regtest (S3 slice n2c).* **Record.** The migration leaf and
+every later sweep come from one explicit, permissionless record, kind 16
+VAULT_SWEEP (§3.4); ConnectBlock does not append them by itself. The reason:
+whether v's gate is READY depends on the fresh lineage, which a replay
+(restart or `-reindex`, `REPLAY_LINEAGE`) does not rebuild. So, as with kind 9
+verdicts and kind 13, the decision travels in the block. It is judged with a
+full lineage context when the block first connects (mempool, ConnectBlock,
+wallet prevalidation, block assembly), trusted on replay, and refused without
+a context. Anyone may submit it: `submitbridgecarrier` with
+`getbridgev2info.successor.sweep.payload_hex`, fees in native B3. It names
+only the launch entry id, and consensus derives every leaf field.
+
+**Checks** (`VerifyVaultSweepV2`, `src/node/bridge_state.cpp`), in order:
+
+1. The V2 rules and h_m are active.
+2. The record names v.
+3. v's gate is READY but for retirement: the rows C1-C4 and E1-E8
+   evaluated for v, with subjects 1, 2 and 3 (`EvaluateBridgeV2SweepGate`;
+   `getbridgev2info.successor.sweep.gate`).
+4. `reserve_v` after the block's earlier records is positive ("has
+   nothing to sweep" otherwise).
+5. **amount = `reserve_v` capped by the wind-down headroom** of v's latest
+   RESERVE_E (§7.2 check 3; `bridge::VaultSweepAmountV2`), which must be
+   positive ("has no wind-down headroom" otherwise). While v holds what it
+   locks the headroom covers `reserve_v`, so the first sweep is the
+   migration leaf of the whole reserve, and each later one moves the
+   deposits minted into v since. After a partial seizure (balance below
+   `locked`) a sweep moves what v can still pay and leaves only the
+   shortfall in `reserve_v`; later sweeps move the rest as far as later
+   observations allow, so only the seized amount stays stranded. A retired
+   v takes no burns and no credit, so "proven since the last sweep" and the
+   remaining `reserve_v` agree.
+
+**Leaf.** `MakeVaultSweepWithdrawalV2` (`src/modern/withdrawal_v2.h`) builds
+an ordinary 180-byte leaf V2: v's chain, vault and token, recipient v′'s
+vault, the next id and this height. It reproduces the shared vector
+`0x1cb9…ad64` (§7.3). **Its source vout is the carrier's binding output**
+(the exact zero-value output beside every type-10 record, index 1 for
+`submitbridgecarrier`), because a sweep has no burn output.
+`getbridgewithdrawalproofv2` proves it at that index and reports
+`sweep: true`. No bUSD V2 is destroyed. The amount counts in v's `burned_v`
+(a leaf naming v, §7.1) and moves into `transit_v′`. Supply ≤ Σ (reserve_v +
+transit_v) therefore still holds, and so does v's invariant R, with the sweep
+in `burned_v`, before and after the release.
+
+**Retirement from h_m.** A kind 6 burn naming v is refused before the gate
+("bridge V2 burn names the retired vault entry"). That check is
+deterministic, so it also applies under replay and without a context.
+Retirement is no gate row: the burn gate is always v′'s from h_m, the sweep
+gate is v's rows, and `getbridgev2info.retired` reports it. v still mints:
+a late deposit names the launch entry id at any height ≥ V and is then
+swept.
+
+**Mempool.** Two kinds of pending transaction become invalid for good on
+their branch, so ConnectTip removes them, with their in-mempool
+descendants, as it removes closed V2 burns (§8.5): a kind 6 burn naming v
+admitted while the next block was below h_m, when the block at h_m − 1
+connects (`HasBridgeV2RetiredEntryBurn`), and a kind 16 sweep, when a block
+sets the sticky conflict (row C4 closes v's gate too;
+`HasBridgeV2VaultSweep`). The wallet can then abandon them.
+
+**Successor gate and credit.** From h_m the burn gate is v′'s. E1-E6 read
+the shared VERIFIER_E, E7 reads TOKEN_FLAGS_SUCCESSOR and E8 reads
+RESERVE_E_SUCCESSOR (§8.2); before h_m those subjects are refused. The wallet
+follows the active entry:
+
+- `bridgewithdraw` names v′'s entry.
+- `getbridgedepositrecipient` and `getbridgev2info.deposit_vault` return v′.
+- `claimbridgedeposit` accepts v's entry id, and v′'s from h_m.
+
+v′ shares v's AssetId, so its caps must equal v's and the epoch counters
+stay shared; its nullifiers are keyed by its own address. A
+RESERVE_E_SUCCESSOR moves `min(transit_v′, absorbedTotal − C_v′)` into
+C_v′ and judges invariant R on v′'s ledger, where a failure sets the E8
+sticky conflict. So an observation before `absorb()` credits 0 and sets no
+conflict. Transit counts in no reserve, so check 2 bounds v′ burns by v′'s
+minted deposits plus its credit. The F_d and relayer paths stay with S4.
+
+**Pins.** v′ is pinned in `v2.successor` before the validators first start,
+as v is (OI-3), and its rules apply only from h_m > V, h_m ≥ W2 (§12.2).
+RegTest() recomputes v's AssetId under `ModernChainDomain(genesis, X)` and
+refuses a file whose `asset_id` differs (B-23). When a successor is set,
+registry id V2 appends, before the extension-list hash: byte 1, v′'s entry
+id, the predecessor, the AssetId, v′'s deployment block and
+`MAX_DEPOSIT_RAW`. h_m is excluded, as V and W2 are. Without a successor
+every id is byte-identical. Mainnet and testnet never set `bridge_v2`, so
+`BridgeV2MigrationActive` is false there at every height.
+
+*Implementation choices pending owner review (S3 slice n2c):*
+
+- The explicit record in place of a leaf that ConnectBlock appends by itself.
+- The amount: the whole reserve, capped by the wind-down headroom, so a
+  partial seizure strands only the shortfall. (The first n2c revision made
+  the sweep all or nothing against the bound, which after a partial
+  seizure would have stranded v's whole remaining reserve, since v takes
+  no burns from h_m.)
+- Kind 16 for the record (kinds 14 and 15 are FSD's).
+- The binding output as the leaf source.
+- Pinning before first start, rather than activating a pin above the tip.
+- The mempool's `-bridgeburnmarginsecs` close margin applies to burns only,
+  not to sweeps.
+
+The Checks, Leaf and Retirement paragraphs above record the implementation,
+not an owner ruling.
+
+*Open issues this slice leaves open (architecture §20):* OI-4 and OI-5 stay
+open. `SuccessorValid` gives v′ no verifier field, so v′ shares v's
+verifier pin, and with it its expiry and bugs, by construction; a later
+per-entry verifier pin changes the registry id. v′ keeps v's AssetId
+against contract §21 and OD-8, awaiting the OI-5 ruling. OI-3's unpinned
+code residual now also covers v′ on 31337: its vault code hash is
+unpinned there, so B3 trusts the predicted CREATE address for v′'s Deposit
+logs and kind 9 reads as it does for v. `SuccessorValid` requires v′'s
+code hash on chain 1.
+
+*Relayer.* `contrib/b3bridge/b3_bridge_observe_v2.py` without `--subjects`
+submits every subject `getbridgev2info.observation_plan` lists, so from h_m
+the successor subjects 18 and 19, which v′'s gate rows E7 and E8 read, join
+1-3 (still read by the sweep gate) without a flag.
+
 ### 7.7 Per-epoch committee keys (B-37)
 
 Today's finality key comes from the identity secret or one imported wallet
@@ -412,6 +547,31 @@ USDT slots come from the verified source
 in a new `src/bridge/state_proof.h` returns zero only for the empty-trie root
 with no nodes, an empty branch child, or a diverging path; every node must be
 consumed and a present zero is malformed.
+
+*Realized on regtest (S3 slice n2c):* a B-23 successor (§7.6) adds two
+subjects, numbered base subject | (vault entry index << 4) with the
+successor at index 1:
+
+| Subject | Shape | Reads |
+|---|---|---|
+| 0x12 RESERVE_E_SUCCESSOR | [vault′: 3, token: 1] | Vault′ slots 0, 1 and 3, and `balances[vault′]` |
+| 0x13 TOKEN_FLAGS_SUCCESSOR | [token: 3] | Token flags with `isBlackListed[vault′]` |
+
+Both read with v′'s pins: the same verifier, token, token code hash and
+chain, and v′'s vault code hash, which may stay unset on 31337 (OI-3). The
+codec admits them under the V2 record set. Consensus accepts them only from
+h_m ("bridge V2 successor observations are not active" below it). Subjects
+0x04-0x11 and 0x14-0xff stay malformed, and the verdict byte is still
+VERIFIER_E-only. Each subject keeps its own latest observation (five
+slots), so "the anchor block must exceed the stored one" applies per subject.
+
+RPCs and the observer write them as 18 and 19 (`reserve_e_successor`,
+`token_flags_successor`). The observation plan in `getbridgev2info` lists
+them, and `buildbridgeobservationv2` accepts them, only when the next block
+is at or above h_m. An
+account without storage (v′ before its first release) is proved by anvil
+with the empty trie's single node 0x80, and `buildbridgeobservationv2`
+records that as the canonical empty proof.
 
 ### 8.3 No Arbitrum heartbeat at launch
 
@@ -668,6 +828,33 @@ until the verifier accepts a root at or above V (contracts spec §3.5).
 `v2` section with every §3.1 field for anvil 31337. Without the file
 MANAGED_V1 defaults stay (`src/test/bridge_params_tests.cpp:497-540`).
 
+*Realized on regtest (S3 slice n2c):* an optional `v2.successor` object
+pins a B-23 successor v′ (§7.6) before the validators first start. The
+`init.cpp` record guard hashes the whole file and freezes it from the first
+stored block at or above A3, so it covers the successor unchanged.
+
+Keys:
+
+- `vault`: v′, the CREATE address of a dedicated deployer at nonce 0.
+- `predecessor`: must equal `v2.vault`.
+- `asset_id`: raw EVM order. It must equal v's bUSD V2 AssetId, which
+  RegTest() recomputes ("-b3bridgepins v2.successor.asset_id must equal the
+  launch vault's bUSD V2 AssetId (B-23)").
+- `migration_height`: h_m, above V, at or above W2, and at most INT_MAX.
+- `origin_deployment_block` (optional): at least 1; defaults to v's.
+
+Everything else is inherited from v: chain, token, token code hash,
+decimals, proof kind, `max_deposit_raw` and caps. Any other key is refused
+as unknown, including `token`, `origin_chain_id`, `vault_runtime_code_hash`
+and the caps. A v′ equal to v, the token, the verifier or any V1 bridge
+contract is refused, and a file carrying a successor is refused off regtest
+as any pin file is.
+
+`write_regtest_bridge_pins_v2(successor=...)` in
+`test/functional/test_framework/b3bridge.py` emits the object with
+`predecessor` = v. It refuses a v′ that is not the deployer's nonce-0 CREATE
+address, code already at v′, and a deployer nonce other than 0.
+
 ### 12.3 Height-versioned light-client pins and standing operations [I]
 
 - **Horizon.** The fresh pins end at the last epoch of the fork schedule
@@ -710,6 +897,43 @@ after `absorb()` and a later deposit into v swept; RT6: (b) and (d3), p from
 `getbridgewithdrawals`, an F_d refund, a blacklisted forwarder; RT8 both
 under P3; RT9 architecture §13 drills, a partial seizure bounding burns to
 the unit; RT10 deploy and pin flow.
+
+*Realized on regtest (S3 slice n2c):* **RT4d**,
+`test/functional/feature_b3_bridge_rt4d_migration.py`, drills the migration
+in RT4a's environment (fixture I, h_m = V + 60). The drill:
+
+1. Deploys v′ in successor mode at its pinned address. B3_ASSET_ID equals the
+   node's AssetId and PREDECESSOR is v; a Config naming another AssetId
+   reverts BadConfig.
+2. Before h_m, refuses the successor subjects and the sweep.
+3. At h_m: v is retired, deposits target v′, and `bridgewithdraw` stays
+   refused until v′'s gate is READY and v′ holds credit.
+4. Mines the sweep and releases its leaf on v to v′ exactly once.
+5. Observes v′ before `absorb()`: nothing is credited and no conflict is set.
+   After `absorb()` the full amount is credited.
+6. Mints a late deposit into v and sweeps it.
+7. Releases a v′ burn exactly once.
+8. Proves a deposit into v′ against v′'s logs and claims it under v′'s
+   entry id; a RESERVE_E_SUCCESSOR at v′'s cut counts it in P_pre and
+   invariant R holds.
+9. Checks that wallet supply equals Σ (reserve + transit), and that replay
+   and `-reindex` reproduce `getbridgev2info`, successor included.
+
+Unit cases cover:
+
+- successor validation and ids;
+- the migration leaf vector;
+- the kind 16 and 0x12/0x13 codecs and plans;
+- `RecordTransitV2`, `RecordSweepV2`, `VaultSweepAmountV2`, and credit only
+  on `absorbedTotal`;
+- retirement, and both mempool evictions (`bridge_v2_gate_tests`);
+- invariant R and wind-down across a migration;
+- sweep, retirement and delta rules;
+- incremental equals rebuild.
+
+They live in `bridge_v2_tests`, `bridge_regtest_pins_tests`,
+`bridge_proof_tests`, `bridge_state_observation_tests`,
+`bridge_burn_gate_v2_tests` and `bridge_state_tests`.
 
 ---
 
@@ -766,7 +990,9 @@ Each needs its own ruling (architecture §17); revision 10 holds the full rules.
    exception or a swap [I].
 3. **LP fast-fill (kind 10) and mint queue (kind 12)**, only with item 1.
 4. **Staker-signed fast deposits** ([FSD](b3-bridge-v2-staker-signed-deposits.md),
-   B-25 to B-36): item 1, penalties, P3 and a B-25 ruling.
+   B-25 to B-36): item 1, penalties, P3 and a B-25 ruling. FSD names
+   record kinds 14 and 15, which stay reserved; the B-23 sweep of slice
+   n2c took kind 16 (§3.4).
 5. **An overcollateralized coin:** another product, never bUSD; no node
    change.
 
