@@ -33,7 +33,12 @@ REGTEST ONLY. This module provides:
   b3-bridge-regtest-certify tool, the kind 9 observation plan, a one-shot
   run of contrib/b3bridge/b3_bridge_observe_v2.py, a light-client update
   to the anvil head, mining under either clock and a fresh-finality lag
-  shuttle for the V2 burn gate (row C3).
+  shuttle for the V2 burn gate (row C3);
+- bridge V2 (third node slice, RT4c): validators bound to the tool's public
+  test keys (bring_up_validators(finality_key_label=...)), the
+  FinalizedBlockV2 encoder, digest V2, history leaves, the kind 13
+  FINALITY_CONFLICT record, Verifier V2 reportConflict calldata and a
+  one-shot run of contrib/b3bridge/b3_bridge_deposit_guard_v2.py.
 
 The relayer module is imported only as a library; its main() is never
 called in-process, only as an unchanged subprocess by run_relayer_once().
@@ -864,6 +869,18 @@ VAULT_V2_WITHDRAWAL_LEAF_SIGNATURE = f"withdrawalLeaf({VAULT_V2_WITHDRAWAL_TUPLE
 # B3TypesV2.STATUS_*.
 VERIFIER_V2_STATUS_UNINITIALIZED = 0
 VERIFIER_V2_STATUS_LIVE = 1
+VERIFIER_V2_STATUS_HALTED_CONFLICT = 2
+# reportConflict (contracts spec §3.4) and its earlier-index form
+# (B3FinalityVerifierV2.CONFLICT_EARLIER_INDEX).
+VERIFIER_V2_REPORT_CONFLICT_SIGNATURE = (f"reportConflict({FB_V2_TUPLE},{SET_HEADER_TUPLE},uint64,bytes32,"
+                                         f"bytes32[32],bytes)")
+VERIFIER_V2_CONFLICT_EARLIER_INDEX = 3
+# FinalizedBlockV2.bridgeFlags bit 0 (B3TypesV2.FLAG_DEPOSITS_CLOSED): B3
+# closed burns for good, so Verifier V2 closes deposits for good.
+FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED = 0x01
+FINALITY_V2_DIGEST_TAG = "B3/FINALITY/V2"
+BLS_SIGNATURE_SIZE = 96
+MAX_FINALITY_SET = 8192
 
 
 def decode_finalized_block_v2(data):
@@ -882,6 +899,51 @@ def decode_finalized_block_v2(data):
         "bridge_flags": data[184],
         "encoded": data,
     }
+
+
+def encode_finalized_block_v2(fb):
+    """The 185-byte FinalizedBlockV2 of a decode_finalized_block_v2() dict
+    (its inverse; "encoded" is ignored): lineageId || u64 height ||
+    blockHash || withdrawalRoot || validatorSetHash || u64 epoch || u64
+    checkpointIndex || checkpointHistoryRoot || u8 bridgeFlags."""
+    for key in ("height", "epoch", "checkpoint_index"):
+        assert isinstance(fb[key], int) and 0 <= fb[key] < 1 << 64, (key, fb[key])
+    assert isinstance(fb["bridge_flags"], int) and 0 <= fb["bridge_flags"] <= 0xff
+    encoded = (enc_bytes32(fb["lineage_id"]) + fb["height"].to_bytes(8, "big") + enc_bytes32(fb["block_hash"]) +
+               enc_bytes32(fb["withdrawal_root"]) + enc_bytes32(fb["validator_set_hash"]) +
+               fb["epoch"].to_bytes(8, "big") + fb["checkpoint_index"].to_bytes(8, "big") +
+               enc_bytes32(fb["checkpoint_history_root"]) + bytes([fb["bridge_flags"]]))
+    assert_equal(len(encoded), FINALIZED_BLOCK_V2_SIZE)
+    return encoded
+
+
+def finality_digest_v2(domain, fb):
+    """The BLS message of a fresh-lineage certificate: TaggedHash("B3/FINALITY/V2",
+    chainDomain || FinalizedBlockV2), derived independently of
+    modern::FinalityDigestV2 and B3TypesV2.digest."""
+    encoded = encode_finalized_block_v2(fb) if isinstance(fb, dict) else hx(fb)
+    assert_equal(len(encoded), FINALIZED_BLOCK_V2_SIZE)
+    return TaggedHash(FINALITY_V2_DIGEST_TAG, enc_bytes32(domain) + encoded)
+
+
+def history_leaf_v2(height, block_hash):
+    """Checkpoint-history leaf keccak256(u64 height || blockHash) (B3TypesV2.historyLeaf).
+
+    The history tree is the depth-32 withdrawal tree, so withdrawal_root(),
+    withdrawal_root_and_path() and fold_withdrawal_path() apply unchanged.
+    """
+    assert isinstance(height, int) and 0 <= height < 1 << 64, height
+    return keccak256(height.to_bytes(8, "big") + enc_bytes32(block_hash))
+
+
+def encode_certificate_payload_v2(fb, signer_bitmap, aggregate_signature):
+    """Certificate payload V2 (the type-11 carrier body and the body of a
+    kind 13 record): FinalizedBlockV2 || bitmap || 96-byte aggregate signature."""
+    encoded = encode_finalized_block_v2(fb) if isinstance(fb, dict) else hx(fb)
+    signature = hx(aggregate_signature)
+    assert_equal(len(encoded), FINALIZED_BLOCK_V2_SIZE)
+    assert_equal(len(signature), BLS_SIGNATURE_SIZE)
+    return encoded + hx(signer_bitmap) + signature
 
 
 def fb_v2_abi_words(fb):
@@ -982,6 +1044,27 @@ def encode_vault_v2_release(withdrawal_id, recipient, amount, b3_height, path):
             encode_withdrawal_v2_tuple(withdrawal_id, recipient, amount, b3_height) + _path_words(path))
 
 
+def encode_report_conflict(fb, signing_set, leaf_height, leaf_hash, path, proof):
+    """B3FinalityVerifierV2.reportConflict(fb, signingSet, leafHeight,
+    leafHash, path, proof) calldata (contracts spec §3.4).
+
+    fb is a FinalizedBlockV2 (185 bytes or a decoded dict), signing_set an
+    RPC or b3-bridge-regtest-certify set object of the verifier's current or
+    next set, (leaf_height, leaf_hash) the history leaf `path` places (at
+    fb's index under latestHistoryRoot in the earlier-index form) and proof
+    the BlsDigestProver witness over fb's digest V2.
+    """
+    encoded = encode_finalized_block_v2(fb) if isinstance(fb, dict) else hx(fb)
+    return selector(VERIFIER_V2_REPORT_CONFLICT_SIGNATURE) + _abi_encode_args([
+        (False, fb_v2_abi_words(encoded)),
+        (True, encode_set_header_tuple(signing_set)),
+        (False, enc_uint(leaf_height, 64)),
+        (False, enc_bytes32(leaf_hash)),
+        (False, _path_words(path)),
+        (True, abi_bytes_tail(proof)),
+    ])
+
+
 # -- K_OF_N bootstrap attestation (OI-12, owner ruling R9; contracts spec §5) --
 # Derived here independently of B3TypesV2.bootstrapMessage and
 # src/bridge/bootstrap_v2.h; bridge_v2_vectors.json pins all three.
@@ -1049,6 +1132,54 @@ def regtest_certify(tool, mode, input=None, *, workdir=None, args=(), timeout=30
     output = json.loads(result.stdout)
     assert_equal(output["test_keys_only"], True)
     return output
+
+
+# -- kind 13 FINALITY_CONFLICT (node changes §8.5) ------------------------------
+FINALITY_CONFLICT_RECORD_KIND = 13
+FINALITY_CONFLICT_RECORD_HEADER_SIZE = 4
+
+
+def encode_finality_conflict_record(validator_count, payload):
+    """The kind 13 FINALITY_CONFLICT bridge record submitbridgecarrier takes:
+    0x0d || 0x00 || u16 n (big-endian) || certificate payload V2
+    (FinalizedBlockV2 || bitmap(ceil(n/8)) || aggSig(96)), 286 bytes at
+    n = 4. Derived independently of src/bridge/proof.h; B3 accepts it only
+    from the fresh lineage's current or next committee (n is that size)."""
+    payload = hx(payload)
+    assert isinstance(validator_count, int) and 1 <= validator_count <= MAX_FINALITY_SET, validator_count
+    assert_equal(len(payload), FINALIZED_BLOCK_V2_SIZE + (validator_count + 7) // 8 + BLS_SIGNATURE_SIZE)
+    return bytes([FINALITY_CONFLICT_RECORD_KIND, 0]) + validator_count.to_bytes(2, "big") + payload
+
+
+# -- relayer deposit guard (node changes §8.5) ------------------------------------
+DEPOSIT_GUARD_V2_SCRIPT = str(B3BRIDGE_CONTRIB_DIR / "b3_bridge_deposit_guard_v2.py")
+
+
+class DepositGuardError(AssertionError):
+    """b3_bridge_deposit_guard_v2.py refused (exit 1); .message is its error text."""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(f"b3_bridge_deposit_guard_v2.py refused: {message}")
+
+
+def run_deposit_guard(node, timeout=120):
+    """Run contrib/b3bridge/b3_bridge_deposit_guard_v2.py once as a subprocess.
+
+    It asks node's getbridgev2info whether B3 has closed bridge V2 deposits
+    for good. Returns its stdout JSON ({"deposits": "OPEN", "next_height"})
+    on exit 0; a refusal (exit 1) raises DepositGuardError with its message.
+    """
+    b3_url, auth = b3_rpc_endpoint(node)
+    command = [sys.executable, "-B", DEPOSIT_GUARD_V2_SCRIPT, "--b3-rpc-url", b3_url, *auth]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout,
+                            stdin=subprocess.DEVNULL, env=_local_process_env())
+    if result.returncode != 0:
+        message = result.stderr.strip()
+        assert_equal(result.returncode, 1)
+        assert message.startswith("error: "), message
+        raise DepositGuardError(message[len("error: "):])
+    return json.loads(result.stdout)
 
 
 # -- kind 9 ETH_STATE_OBSERVATION and the V2 burn gate (node changes §8) ------
@@ -1783,7 +1914,7 @@ class B3BridgeChainMixin:
                                     for node in self.bridge_validators()),
                         timeout=timeout)
 
-    def bring_up_validators(self, target_height, stakes=VALIDATOR_STAKES, timeout=600):
+    def bring_up_validators(self, target_height, stakes=VALIDATOR_STAKES, timeout=600, finality_key_label=None):
         """Corridor, four stakes with finality keys, then live real-time PoS.
 
         The corridor runs under mock time from now-300 so its 1 s blocks stay
@@ -1791,6 +1922,10 @@ class B3BridgeChainMixin:
         and stake continuously (feature_b3_finality_soak.py:120-152), so BLS
         finality is live. Returns once n0 is at or above target_height and
         every validator has finalized at least M+5.
+
+        With finality_key_label the validators bind the public test keys of
+        that label instead of their derived keys (import_test_finality_keys),
+        so b3-bridge-regtest-certify can sign as B3's own committees.
         """
         validators = self.bridge_validators()
         assert_equal(len(validators), VALIDATOR_COUNT)
@@ -1808,9 +1943,12 @@ class B3BridgeChainMixin:
             n0.sendtoaddress(node.get_deterministic_priv_key().address, 120)
         self.synchronize_mempools()
         self.mine_corridor(1)
-        for node, amount in zip(validators, stakes):
-            node.createstake(amount)
-            node.bindfinalitykey()
+        if finality_key_label is None:
+            for node, amount in zip(validators, stakes):
+                node.createstake(amount)
+                node.bindfinalitykey()
+        else:
+            self.import_test_finality_keys(validators, stakes, finality_key_label)
         self.synchronize_mempools()
         self.mine_corridor(1)
         self.mine_corridor(CORRIDOR_END - n0.getblockcount())
@@ -1833,6 +1971,37 @@ class B3BridgeChainMixin:
         self.wait_for_finalized(MODERN_START + 5, timeout=timeout)
         for node in validators:
             assert_equal(node.getfinalitystatus()["lineage_broken"], False)
+
+    def import_test_finality_keys(self, validators, stakes, label):
+        """Stake on every validator, then bind test keys 0..n-1 of `label`.
+
+        REGTEST ONLY: the keys are the public deterministic test keys of
+        b3-bridge-regtest-certify (keys --with-secrets), worthless anywhere
+        else. B3 orders set members by ascending validator_key bytes
+        (node/validator_set.h), so the validator of rank i imports test key i
+        (importfinalitykey) before every validator binds (bindfinalitykey):
+        member i of every later B3 set is then the tool's member i. The
+        transactions are left in the wallets' mempools. Returns and keeps in
+        self.finality_test_keys {"label", "members": [{"index", "node",
+        "validator_key", "bls_pubkey"}]} in member order.
+        """
+        staked = [node.createstake(amount) for node, amount in zip(validators, stakes)]
+        keys = self.regtest_certify("keys", args=("--label", label, "--count", str(len(validators)),
+                                                  "--with-secrets"))["keys"]
+        assert_equal([key["index"] for key in keys], list(range(len(validators))))
+        ranked = sorted(zip(validators, staked), key=lambda pair: bytes.fromhex(pair[1]["validator_key"]))
+        members = []
+        for rank, (node, stake) in enumerate(ranked):
+            imported = node.importfinalitykey(keys[rank]["blssecret"])
+            assert_equal((imported["imported"], hx(imported["bls_pubkey"])), (True, hx(keys[rank]["pubkey"])))
+            members.append({"index": rank, "node": node.index, "validator_key": stake["validator_key"],
+                            "bls_pubkey": to_0x(hx(keys[rank]["pubkey"]))})
+        for member in members:
+            bound = self.nodes[member["node"]].bindfinalitykey()
+            assert_equal((bound["action"], bound["validator_key"], hx(bound["bls_pubkey"])),
+                         ("bind", member["validator_key"], hx(member["bls_pubkey"])))
+        self.finality_test_keys = {"label": label, "members": members}
+        return self.finality_test_keys
 
     def freeze(self):
         """Stop every staker and agree on one tip.
@@ -2384,3 +2553,66 @@ class TestFrameworkB3BridgeGuards(unittest.TestCase):
         self.assertEqual(tampered[ETH_OBSERVATION_VERDICT_OFFSET + 1:], hx(payload)[ETH_OBSERVATION_VERDICT_OFFSET + 1:])
         view = gate_view({"burn_gate": {"status": "READY", "now_eff": 5, "closes_at": 9}, "x": [1]})
         self.assertEqual(view, {"burn_gate": {"status": "READY", "closes_at": 9}, "x": [1]})
+
+    def test_v2_conflict_encoders_match_shared_vectors(self):
+        """RT4c: FinalizedBlockV2 (bridgeFlags bit 0 included), digest V2,
+        history leaves and paths equal bridge_v2_vectors.json; the kind 13
+        record and reportConflict calldata have their normative shapes."""
+        with open(SRCDIR / "contracts" / "test" / "vectors" / "bridge_v2_vectors.json", encoding="utf8") as f:
+            vectors = json.load(f)
+        self.assertEqual(hashlib.sha256(FINALITY_V2_DIGEST_TAG.encode()).digest(), hx(vectors["tags"]["finality_v2"]))
+        flagged = []
+        for v in vectors["finalized_block_v2"]:
+            fb = decode_finalized_block_v2(v["encoded"])
+            self.assertEqual(encode_finalized_block_v2(fb), hx(v["encoded"]))
+            self.assertEqual((fb["height"], fb["epoch"], fb["checkpoint_index"], fb["bridge_flags"]),
+                             (v["height"], v["epoch"], v["checkpoint_index"], v["bridge_flags"]))
+            self.assertEqual(finality_digest_v2(v["chain_domain"], fb), hx(v["digest_v2"]))
+            self.assertEqual(keccak256(encode_finalized_block_v2(fb)), hx(v["cert_id"]))
+            if fb["bridge_flags"]:
+                flagged.append(fb)
+        self.assertEqual([fb["encoded"][184] for fb in flagged], [FINALITY_BRIDGE_FLAG_DEPOSITS_CLOSED])
+        # The same statement without the flag is another digest and certId.
+        unflagged = dict(flagged[0], bridge_flags=0)
+        self.assertNotEqual(keccak256(encode_finalized_block_v2(unflagged)), keccak256(flagged[0]["encoded"]))
+
+        history = vectors["history"]
+        leaves = []
+        for entry in history["leaves"]:
+            self.assertEqual(entry["height"], history["genesis_height"] + entry["index"] * history["interval"])
+            leaves.append(history_leaf_v2(entry["height"], entry["block_hash"]))
+            self.assertEqual(leaves[-1], hx(entry["leaf"]))
+        for count, root in enumerate(history["roots"]):
+            self.assertEqual(withdrawal_root(leaves[:count]), hx(root))
+        for path in history["paths"]:
+            root, siblings = withdrawal_root_and_path(leaves[:path["count"]], path["index"])
+            self.assertEqual((root, siblings), (hx(path["root"]), [hx(s) for s in path["siblings"]]))
+
+        # Kind 13: 0d 00 || u16 n || FinalizedBlockV2 || bitmap || aggSig.
+        payload = encode_certificate_payload_v2(flagged[0], "0x0f", "0x" + "a5" * 96)
+        record = encode_finality_conflict_record(4, payload)
+        self.assertEqual((record[:4], len(record)), (bytes.fromhex("0d000004"), 286))
+        self.assertEqual(record[4:4 + FINALIZED_BLOCK_V2_SIZE], flagged[0]["encoded"])
+        wide = encode_certificate_payload_v2(flagged[0], bytes(8), bytes(96))
+        self.assertEqual(len(encode_finality_conflict_record(64, wide)), 293)
+        for count, body in ((0, payload), (9, payload), (MAX_FINALITY_SET + 1, payload), (4, payload + b"\x00")):
+            with self.assertRaises(AssertionError):
+                encode_finality_conflict_record(count, body)
+
+        # reportConflict: fb (9 words), signingSet offset, leafHeight,
+        # leafHash, 32 path words, proof offset; then the two tails.
+        header = {"epoch": 2, "ruleset_version": 2, "validator_count": 4, "total_weight": 100,
+                  "quorum_weight": 67, "aggregate_pubkey": "0x" + "a1" * 48, "members_root": "0x" + "b2" * 32}
+        path = ["0x" + "33" * 32] * 32
+        report = encode_report_conflict(flagged[0], header, 316, "0x" + "44" * 32, path, "0x" + "55" * 70)
+        self.assertEqual(report[:4], selector(VERIFIER_V2_REPORT_CONFLICT_SIGNATURE))
+        words = [report[4 + 32 * i:4 + 32 * (i + 1)] for i in range((len(report) - 4) // 32)]
+        self.assertEqual(b"".join(words[:9]), fb_v2_abi_words(flagged[0]["encoded"]))
+        head_words = 9 + 1 + 1 + 1 + 32 + 1
+        self.assertEqual(words[9], enc_uint(head_words * 32))
+        self.assertEqual((words[10], words[11]), (enc_uint(316), b"\x44" * 32))
+        self.assertEqual(words[12:44], [b"\x33" * 32] * 32)
+        set_tuple = encode_set_header_tuple(header)
+        self.assertEqual(words[44], enc_uint(head_words * 32 + len(set_tuple)))
+        self.assertEqual(report[4 + head_words * 32:4 + head_words * 32 + len(set_tuple)], set_tuple)
+        self.assertEqual(report[4 + head_words * 32 + len(set_tuple):], abi_bytes_tail("0x" + "55" * 70))

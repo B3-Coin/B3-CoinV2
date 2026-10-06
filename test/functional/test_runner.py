@@ -101,6 +101,8 @@ EXTENDED_SCRIPTS = [
     'feature_b3_bridge_rt4a_round_trip.py',
     # Bridge V2 with the K_OF_N bootstrap and the full burn gate (as RT4a).
     'feature_b3_bridge_rt4_kofn_gate.py',
+    # Bridge V2 kind 13 finality conflict: B3 and Verifier V2 close for good (as RT4a).
+    'feature_b3_bridge_rt4c_conflict.py',
 ]
 
 # Special script to run each bench sanity check

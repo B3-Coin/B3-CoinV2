@@ -69,7 +69,9 @@ hash. The V1 registry stays the synthetic MANAGED_V1 bUSD. V = W2 = 281.
     bridge_evidence.json.
 
 feature_b3_bridge_rt4_kofn_gate.py (RT4) reuses this test with the default
-K_OF_N bootstrap and the gate's refusals.
+K_OF_N bootstrap and the gate's refusals; feature_b3_bridge_rt4c_conflict.py
+(RT4c) with a kind 13 finality conflict, after which carried certificates
+set bridgeFlags bit 0 (expected_bridge_flags).
 """
 
 import json
@@ -301,6 +303,9 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
     def run_test(self):
         self.withdrawal_leaves = []  # (b3 height, leaf V2) in id order
         self.relayed = []
+        # B3 height of the block that set the sticky bridge V2 conflict (RT4c);
+        # None while there is none, so every certificate carries bridgeFlags 0.
+        self.conflict_height = None
 
         self.log.info("(1) Corridor, stakes and live V1 finality past the fresh genesis")
         self.bring_up_validators(BRING_UP_HEIGHT)
@@ -570,6 +575,13 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
             return bytes(32)
         return withdrawal_root([leaf for burned_at, leaf in self.withdrawal_leaves if burned_at <= height])
 
+    def expected_bridge_flags(self, height):
+        """bridgeFlags of B3's statement at checkpoint `height`: bit 0 (deposits
+        closed for good) from the first checkpoint at or after the block that
+        set the sticky conflict (node changes §8.5), else 0."""
+        conflict_height = getattr(self, "conflict_height", None)
+        return 1 if conflict_height is not None and height >= conflict_height else 0
+
     def check_carried_roots(self):
         carriers = self.fresh_certificates(self.nodes[0], FRESH_ACTIVATION)
         observed = []
@@ -577,7 +589,7 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
             fb = carrier["fb"]
             assert_equal(fb["lineage_id"], hx(self.lineage_id))
             assert_equal(fb["withdrawal_root"], self.expected_withdrawal_root(fb["height"]))
-            assert_equal(fb["bridge_flags"], 0)
+            assert_equal(fb["bridge_flags"], self.expected_bridge_flags(fb["height"]))
             observed.append((carrier["inclusion"], fb["height"], fb["epoch"], to_0x(fb["withdrawal_root"])))
         assert any(fb_height >= BRIDGE_V2_HEIGHT for _, fb_height, _, _ in observed)
         self.evidence.assertion("carried certificates: root zero below V, V2 tree root from V",
@@ -642,6 +654,7 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
             assert_equal(hx(cert["encoded"]), fb["encoded"])
             assert_equal(cert["history"]["prev_index"], latest_index)
             assert_equal(fb["withdrawal_root"], self.expected_withdrawal_root(fb["height"]))
+            assert_equal(fb["bridge_flags"], self.expected_bridge_flags(fb["height"]))
             epoch_before = call_uint(anvil, self.verifier, "currentEpoch()")
             transition = fb["epoch"] == epoch_before + 1
             receipt = self.transact(self.verifier, hx(cert["calldata"]), "B3FinalityVerifierV2.submitCertificate",
@@ -679,10 +692,14 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
                                                  enc_bytes32(EMPTY_WITHDRAWAL_ROOT)))
 
     # -- 6-7. deposit and mint ------------------------------------------------
+    def deposit_recipient(self):
+        """n0's address the deposit mints to (RT4c asks getbridgedepositrecipient)."""
+        return self.nodes[0].getnewaddress()
+
     def make_deposit(self):
         self.log.info("(6) anvil: approve and deposit 25,000,000 raw units to n0's RECIPIENT_V1")
         anvil = self.anvil
-        self.recipient = self.nodes[0].getnewaddress()
+        self.recipient = self.deposit_recipient()
         anvil.send(self.depositor, self.token, abi_call(
             "approve(address,uint256)", enc_address(self.vault), enc_uint(TOKEN_SUPPLY)))
         receipt = self.transact(self.vault, abi_call("deposit(uint256,bytes32)", enc_uint(DEPOSIT_RAW),
