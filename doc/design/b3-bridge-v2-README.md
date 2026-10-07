@@ -1,9 +1,11 @@
 # B3 Bridge V2: overview
 
 > **PROPOSAL, no governing authority.** 2026-10-04, the **simpler plan**,
-> base `1d1d6da`, branch `feat/flowmeshV2-dev-claude`. Nothing built,
-> audited, deployed or activated; no node or chain contacted. Minutes assume
-> computed ~78 s blocks (O8); [H] = estimate.
+> base `1d1d6da`, branch `feat/flowmeshV2-dev-claude`. Minutes assume
+> computed ~78 s blocks (O8); [H] = estimate. The subsequently implemented
+> Ethereum regtest slice and its review limits are recorded in the
+> [integration milestone](b3-bridge-v2-milestone-rt4d.md). No production
+> deployment or activation is approved by this proposal or milestone.
 
 **Owner ruling, 2026-10-03** (relayed, uncommitted): "ok then I think
 simpler plan , and its without LP ? I have no issue from LP, but just doesnt
@@ -109,8 +111,9 @@ days to prove; optional LP fast-fill); **staker-signed fast deposits**
 - **Unproven:** unaudited; figures estimated.
 - **Open issues:** OI-1 to OI-12 (architecture §20): OI-8 resolved by owner
   ruling R10 (sponsored native-B3 fees), OI-12 by R9 (bootstrap binding);
-  the rest unresolved, including a bootstrap that could install a
-  permanent root (OI-1).
+  other unresolved design and production gates remain. In the implemented
+  regtest verifier, the OI-1 bootstrap-withdrawal-root path is rejected:
+  initialization requires a zero withdrawal root below bridge activation.
 
 ## Documents
 
