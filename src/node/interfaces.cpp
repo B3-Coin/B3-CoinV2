@@ -975,13 +975,66 @@ public:
             return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
         }
 
-        if (HasDecentralizedBridgeBurn(tx) &&
+        // From the bridge V2 height every BRIDGE_BURN is a V2 burn: the
+        // mempool's W2 check and V2 burn gate (validation.cpp) replace the
+        // V1 withdrawal height and V1 committee readiness.
+        const bool bridge_v2{consensus.BridgeV2RulesActive(expected_next_height)};
+        const int64_t candidate_time{
+            std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
+        const bool bridge_v2_burn{bridge_v2 && HasDecentralizedBridgeBurn(tx)};
+        if (bridge_v2_burn &&
+            !consensus.BridgeV2BurnRulesActive(expected_next_height)) {
+            error = "Bridge V2 withdrawals are disabled for the next block";
+            return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
+        }
+        // The fresh lineage projected for the next block, as mempool
+        // admission builds it: the V2 burn gate, kind 9 VERIFIER_E verdicts
+        // and kind 13 FINALITY_CONFLICT records are judged on it.
+        std::optional<BridgeV2LineageContext> lineage;
+        if (bridge_v2_burn || (bridge_v2 && HasBridgeV2LineageRecord(tx))) {
+            std::string lineage_reason;
+            lineage = MakeBridgeV2LineageContext(
+                chainstate.ModernFinality(), chainstate.m_chain,
+                chainstate.m_blockman, consensus, *tip, tracker.Index(),
+                lineage_reason);
+            if (!lineage) {
+                error = "The bridge V2 finality lineage is unavailable at the active tip: " +
+                        lineage_reason;
+                return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
+            }
+        }
+        if (bridge_v2_burn) {
+            const BridgeV2GateResult gate{EvaluateBridgeV2BurnGate(
+                &*lineage, tracker.Index(), consensus, expected_next_height,
+                candidate_time)};
+            if (gate.readiness == BridgeBurnReadiness::UNAVAILABLE) {
+                error = "Bridge V2 withdrawal readiness is unavailable at the active tip: " +
+                        gate.reason;
+                return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
+            }
+            if (!CheckBridgeV2BurnReadiness(tx, gate.readiness, error)) {
+                error += ": " + gate.Describe();
+                return interfaces::BridgePrevalidationResult::REJECTED;
+            }
+            // The mempool's close margin (validation.cpp): a burn whose gate
+            // closes within it would be refused on broadcast.
+            const int64_t close_margin{
+                consensus.bridge_v2->gate.mempool_close_margin_seconds};
+            if (gate.closes_at && *gate.closes_at - gate.now_eff <= close_margin) {
+                error = strprintf(
+                    "Bridge V2 burn gate closes at %d, within the %d s mempool margin of %d; "
+                    "submit fresh bridge observations first",
+                    *gate.closes_at, close_margin, gate.now_eff);
+                return interfaces::BridgePrevalidationResult::REJECTED;
+            }
+        }
+        if (!bridge_v2 && HasDecentralizedBridgeBurn(tx) &&
             !Consensus::BridgeWithdrawalRulesActive(expected_next_height,
                                                      consensus)) {
             error = "Bridge withdrawals are disabled for the next block";
             return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
         }
-        if (HasDecentralizedBridgeBurn(tx) &&
+        if (!bridge_v2 && HasDecentralizedBridgeBurn(tx) &&
             consensus.busd_bridge->withdrawal_mode ==
                 Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
             consensus.busd_bridge->decentralized_withdrawal) {
@@ -1005,13 +1058,50 @@ public:
             }
         }
 
-        const int64_t candidate_time{
-            std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
         if (!tracker.Index().VerifyTransaction(
                 tx, expected_next_height, candidate_time, consensus,
-                authorization, error)) {
+                authorization, error, lineage ? &*lineage : nullptr)) {
             if (error.empty()) error = "Bridge transaction prevalidation failed";
             return interfaces::BridgePrevalidationResult::REJECTED;
+        }
+        error.clear();
+        return interfaces::BridgePrevalidationResult::VALID;
+    }
+    interfaces::BridgePrevalidationResult bridgeV2DepositStatus(std::string& error) override
+    {
+        const Consensus::Params& consensus{chainman().GetConsensus()};
+
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman().ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        if (tip == nullptr || !consensus.BridgeV2RulesActive(tip->nHeight + 1)) {
+            error = "Bridge V2 rules are not active for the next block";
+            return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
+        }
+        node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
+        if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus,
+                          *tip)) {
+            error = "The bridge state index is unavailable at the active tip";
+            return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
+        }
+        // The fresh lineage projected for the next block, as the burn gate
+        // reads it. A closing row that needs no lineage (the sticky conflict,
+        // the latest VERIFIER_E) still refuses when the context cannot be
+        // built: closed for good outranks unavailable.
+        std::string lineage_reason;
+        const auto lineage{MakeBridgeV2LineageContext(
+            chainstate.ModernFinality(), chainstate.m_chain,
+            chainstate.m_blockman, consensus, *tip, tracker.Index(),
+            lineage_reason)};
+        if (const auto closed{BridgeV2DepositsClosedReason(
+                tracker.Index(), lineage ? &*lineage : nullptr, consensus)}) {
+            error = *closed;
+            return interfaces::BridgePrevalidationResult::REJECTED;
+        }
+        if (!lineage) {
+            error = "The bridge V2 finality lineage is unavailable at the active tip: " +
+                    lineage_reason;
+            return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
         }
         error.clear();
         return interfaces::BridgePrevalidationResult::VALID;

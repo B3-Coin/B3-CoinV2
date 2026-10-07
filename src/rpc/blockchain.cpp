@@ -8,6 +8,7 @@
 #include <blockfilter.h>
 #include <bridge/ethereum_calldata.h>
 #include <bridge/lc_json.h>
+#include <bridge/withdrawal_v2_calldata.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
@@ -30,11 +31,17 @@
 #include <logging/timer.h>
 #include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
+#include <modern/bridge_binding.h>
+#include <modern/bridge_v2.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
 #include <modern/fn_pod.h>
+#include <modern/withdrawal_tree.h>
+#include <modern/withdrawal_v2.h>
 #include <net.h>
 #include <net_processing.h>
+#include <node/finality_fresh_export.h>
+#include <node/finality_fresh_lineage.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
 #include <consensus/era.h>
@@ -61,11 +68,14 @@
 #include <util/fs.h>
 #include <util/strencodings.h>
 #include <util/syserror.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <versionbits.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 
 #include <condition_variable>
@@ -74,6 +84,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -4160,7 +4171,7 @@ static RPCHelpMan getbridgeinfo()
             {RPCResult::Type::NUM, "finalized_execution_block", /*optional=*/true, "Latest finalized Ethereum execution block"},
             {RPCResult::Type::STR_HEX, "finalized_execution_hash", /*optional=*/true, "Latest finalized execution hash"},
             {RPCResult::Type::NUM, "anchors", "Retained finalized/backfilled execution anchors"},
-            {RPCResult::Type::NUM, "nullifiers", "Deposits already minted"},
+            {RPCResult::Type::NUM, "nullifiers", "Deposits already minted as V1 bUSD (bUSD V2 mints are counted by getbridgev2info)"},
             {RPCResult::Type::NUM, "managed_withdrawals", "Confirmed bUSD burn requests"},
             {RPCResult::Type::NUM, "mint_epoch", /*optional=*/true, "Current B3 bridge mint-cap epoch"},
             {RPCResult::Type::NUM, "minted_this_epoch", /*optional=*/true, "Raw bUSD units minted in the current epoch"},
@@ -4347,8 +4358,15 @@ static RPCHelpMan getbridgeinfo()
                           index && index->LightClient().has_value());
             result.pushKV("anchors",
                           index ? static_cast<uint64_t>(index->AnchorCount()) : 0);
-            result.pushKV("nullifiers",
-                          index ? static_cast<uint64_t>(index->NullifierCount()) : 0);
+            // Only V1 keys: from V bUSD V2 mints add namespace-2 keys, which
+            // exist only on a chain with a bridge V2 envelope.
+            result.pushKV(
+                "nullifiers",
+                !index ? uint64_t{0}
+                : consensus.bridge_v2
+                    ? static_cast<uint64_t>(index->NullifierCount(
+                          bridge::BRIDGE_NULLIFIER_NAMESPACE_V1))
+                    : static_cast<uint64_t>(index->NullifierCount()));
             result.pushKV(
                 "managed_withdrawals",
                 index ? static_cast<uint64_t>(index->WithdrawalCount()) : 0);
@@ -4414,7 +4432,10 @@ static RPCHelpMan getbridgelightclientstore()
         "Export the newest retained exact Ethereum LightClientStore whose B3 "
         "connection is covered by B3 finality. The result can be saved directly as "
         "store.json for b3-bridge-ethcheck. This RPC fails closed while the "
-        "store, its active-chain connection, or B3 finality is unavailable.\n",
+        "store, its active-chain connection, or B3 finality is unavailable. "
+        "From the bridge V2 activation height (regtest only) every light-client "
+        "record updates the separate bridge V2 store and the V1 store is frozen, "
+        "so the V2 store is exported.\n",
         {},
         RPCResult{RPCResult::Type::OBJ, "", "Finalized light-client store snapshot",
                   {
@@ -4431,10 +4452,13 @@ static RPCHelpMan getbridgelightclientstore()
                        }},
                       {RPCResult::Type::OBJ, "store", "Exact Ethereum light-client store",
                        {
-                           {RPCResult::Type::OBJ, "finalized_header", "Beacon header, execution header, and execution branch"},
+                           // The nested objects are the b3-bridge-ethcheck store.json
+                           // shape (bridge::lcjson::StoreSnapshotJson); their keys are
+                           // not listed here, so -rpcdoccheck must not type-check them.
+                           {RPCResult::Type::OBJ, "finalized_header", "Beacon header, execution header, and execution branch", {}, /*skip_type_check=*/true},
                            {RPCResult::Type::NUM, "period", "Current Ethereum sync-committee period"},
-                           {RPCResult::Type::OBJ, "current_sync_committee", "All 512 current public keys and aggregate key"},
-                           {RPCResult::Type::OBJ, "next_sync_committee", /*optional=*/true, "All 512 next public keys and aggregate key"},
+                           {RPCResult::Type::OBJ, "current_sync_committee", "All 512 current public keys and aggregate key", {}, /*skip_type_check=*/true},
+                           {RPCResult::Type::OBJ, "next_sync_committee", /*optional=*/true, "All 512 next public keys and aggregate key", {}, /*skip_type_check=*/true},
                        }},
                   }},
         RPCExamples{HelpExampleCli("getbridgelightclientstore", "") +
@@ -4464,7 +4488,13 @@ static RPCHelpMan getbridgelightclientstore()
                                    "Bridge state is unavailable at the active tip");
             }
             const node::BridgeStateIndex& index{bridge_tracker.Index()};
-            if (!index.LightClient() || !index.LightClientLastConnected()) {
+            // From V the next record updates the V2 store (node changes
+            // section 3.4); the frozen V1 store would plan nothing valid.
+            const bool v2_store{
+                consensus.BridgeV2RulesActive(tip->nHeight + 1)};
+            if (!(v2_store ? index.LightClientV2() : index.LightClient()) ||
+                !(v2_store ? index.LightClientV2LastConnected()
+                           : index.LightClientLastConnected())) {
                 throw JSONRPCError(RPC_MISC_ERROR,
                                    "Ethereum light client is not connected on B3");
             }
@@ -4483,8 +4513,10 @@ static RPCHelpMan getbridgelightclientstore()
                     RPC_MISC_ERROR,
                     "B3 has not finalized the light-client connection");
             }
-            const auto snapshot{index.FinalizedLightClientSnapshot(
-                finalized->height)};
+            const auto snapshot{
+                v2_store
+                    ? index.FinalizedLightClientSnapshotV2(finalized->height)
+                    : index.FinalizedLightClientSnapshot(finalized->height)};
             if (!snapshot) {
                 throw JSONRPCError(
                     RPC_MISC_ERROR,
@@ -4524,7 +4556,9 @@ static RPCHelpMan getbridgeanchorforblock()
         "anchor can start a bounded historical ancestry proof, allowing a "
         "fresh relayer to recover older deposits without trusting its local "
         "cursor. Ethereum hashes use ordinary Ethereum byte order. This RPC "
-        "fails closed unless bridge state and B3 finality are both available.\n",
+        "fails closed unless bridge state and B3 finality are both available. "
+        "From the bridge V2 activation height (regtest only) anchors come from "
+        "the bridge V2 store, which every mint then names.\n",
         {
             {"target_block", RPCArg::Type::NUM, RPCArg::Optional::NO,
              "Ethereum execution block that the ancestry proof must reach"},
@@ -4533,6 +4567,7 @@ static RPCHelpMan getbridgeanchorforblock()
                   {
                       {RPCResult::Type::NUM, "target_block", "Requested Ethereum execution block"},
                       {RPCResult::Type::BOOL, "found", "Whether a suitable retained anchor exists"},
+                      {RPCResult::Type::STR, "store", /*optional=*/true, "Light-client store searched when a bridge V2 envelope is configured (regtest only): v1 below its activation height, v2 from it"},
                       {RPCResult::Type::NUM, "b3_finalized_height", "B3 height covering the selection"},
                       {RPCResult::Type::STR_HEX, "b3_finalized_block", "Active finalized B3 block hash"},
                       {RPCResult::Type::NUM, "block_number", /*optional=*/true, "Selected Ethereum execution block number"},
@@ -4599,13 +4634,22 @@ static RPCHelpMan getbridgeanchorforblock()
                     "B3 finality checkpoint is not on the active chain");
             }
 
+            // From V every mint names a V2-store anchor (node changes
+            // section 3.4); the frozen V1 anchors would plan invalid mints.
+            const bool v2_store{
+                consensus.BridgeV2RulesActive(tip->nHeight + 1)};
             UniValue result{UniValue::VOBJ};
             result.pushKV("target_block", target_block);
+            if (consensus.bridge_v2) {
+                result.pushKV("store", v2_store ? "v2" : "v1");
+            }
             result.pushKV("b3_finalized_height", finalized->height);
             result.pushKV("b3_finalized_block",
                           finalized->block_hash.GetHex());
             const auto anchor{
-                index.AnchorForTarget(target_block, finalized->height)};
+                v2_store
+                    ? index.AnchorForTargetV2(target_block, finalized->height)
+                    : index.AnchorForTarget(target_block, finalized->height)};
             result.pushKV("found", anchor.has_value());
             if (!anchor) return result;
 
@@ -4643,7 +4687,11 @@ static RPCHelpMan getbridgeproofstatus()
         "Query the active-chain bridge state needed for safe relayer crash "
         "recovery. Ethereum hashes use their ordinary byte order (the same "
         "order returned by Ethereum JSON-RPC). A query never changes bridge "
-        "state and exposes no wallet data.\n",
+        "state and exposes no wallet data. From the bridge V2 activation height "
+        "(regtest only) anchors come from the bridge V2 store and deposit ids "
+        "name the Vault V2 entry (nullifier namespace 2); with a pinned B-23 "
+        "successor the same id is also reported for the successor vault, "
+        "whose deposit ids count separately.\n",
         {
             {"execution_hash", RPCArg::Type::STR_HEX,
              RPCArg::Optional::OMITTED,
@@ -4654,6 +4702,7 @@ static RPCHelpMan getbridgeproofstatus()
         RPCResult{RPCResult::Type::OBJ, "", "Bridge proof status",
                   {
                       {RPCResult::Type::BOOL, "state_available", "Whether the bridge index is synced to the active tip"},
+                      {RPCResult::Type::STR, "store", /*optional=*/true, "Bridge store queried when a bridge V2 envelope is configured (regtest only): v1 below its activation height, v2 (V2 anchors, Vault V2 deposits) from it"},
                       {RPCResult::Type::OBJ, "anchor", /*optional=*/true, "Requested execution anchor",
                        {
                            {RPCResult::Type::STR_HEX, "hash", "Requested Ethereum execution hash"},
@@ -4668,6 +4717,13 @@ static RPCHelpMan getbridgeproofstatus()
                       {RPCResult::Type::OBJ, "deposit", /*optional=*/true, "Requested configured-vault deposit",
                        {
                            {RPCResult::Type::NUM, "deposit_id", "Ethereum vault deposit id"},
+                           {RPCResult::Type::BOOL, "claimed", "Whether B3 has already minted this deposit"},
+                           {RPCResult::Type::NUM, "claimed_height", /*optional=*/true, "B3 height that claimed the deposit"},
+                           {RPCResult::Type::STR_HEX, "claimed_block", /*optional=*/true, "B3 block that claimed the deposit"},
+                       }},
+                      {RPCResult::Type::OBJ, "successor_deposit", /*optional=*/true, "From the bridge V2 activation height with a pinned B-23 successor only: the same deposit id of the successor Vault V2 (its own nullifiers in namespace 2)",
+                       {
+                           {RPCResult::Type::NUM, "deposit_id", "Successor vault deposit id"},
                            {RPCResult::Type::BOOL, "claimed", "Whether B3 has already minted this deposit"},
                            {RPCResult::Type::NUM, "claimed_height", /*optional=*/true, "B3 height that claimed the deposit"},
                            {RPCResult::Type::STR_HEX, "claimed_block", /*optional=*/true, "B3 block that claimed the deposit"},
@@ -4727,12 +4783,22 @@ static RPCHelpMan getbridgeproofstatus()
                 if (state_available) index = &tracker.Index();
             }
             result.pushKV("state_available", state_available);
+            // From V mints use the V2 store and the Vault V2 entry under
+            // nullifier namespace 2 (node changes section 3.4); the V1 store
+            // and keys are frozen and would report V2 work as unknown.
+            const bool v2_store{
+                tip && consensus.BridgeV2RulesActive(tip->nHeight + 1)};
+            if (consensus.bridge_v2) {
+                result.pushKV("store", v2_store ? "v2" : "v1");
+            }
 
             if (requested_hash) {
                 UniValue anchor_json{UniValue::VOBJ};
                 anchor_json.pushKV("hash", HexStr(*requested_hash));
                 const auto anchor{
-                    index ? index->Anchor(*requested_hash) : std::nullopt};
+                    !index      ? std::nullopt
+                    : v2_store ? index->AnchorV2(*requested_hash)
+                               : index->Anchor(*requested_hash)};
                 anchor_json.pushKV("known", anchor.has_value());
                 if (anchor) {
                     anchor_json.pushKV("block_number", anchor->block_number);
@@ -4749,17 +4815,10 @@ static RPCHelpMan getbridgeproofstatus()
                 }
                 result.pushKV("anchor", std::move(anchor_json));
             }
-            if (deposit_id) {
+            // One deposit id's mint status under `key`.
+            const auto deposit_status{[&](const bridge::BridgeDepositKey& key) {
                 UniValue deposit_json{UniValue::VOBJ};
-                deposit_json.pushKV("deposit_id", *deposit_id);
-                const bridge::BridgeDepositKey key{
-                    consensus.busd_bridge
-                        ? consensus.busd_bridge->asset.origin_chain_id
-                        : 0,
-                    consensus.busd_bridge
-                        ? consensus.busd_bridge->asset.vault_address
-                        : bridge::EthAddress{},
-                    *deposit_id};
+                deposit_json.pushKV("deposit_id", key.deposit_id);
                 const bool claimed{
                     index && consensus.busd_bridge && index->IsNullified(key)};
                 deposit_json.pushKV("claimed", claimed);
@@ -4772,7 +4831,36 @@ static RPCHelpMan getbridgeproofstatus()
                                             connection->block_hash.GetHex());
                     }
                 }
-                result.pushKV("deposit", std::move(deposit_json));
+                return deposit_json;
+            }};
+            if (deposit_id) {
+                const bridge::BridgeDepositKey key{
+                    v2_store
+                        ? bridge::BridgeDepositKey{
+                              consensus.bridge_v2->vault.origin_chain_id,
+                              consensus.bridge_v2->vault.vault_address,
+                              *deposit_id,
+                              bridge::BRIDGE_NULLIFIER_NAMESPACE_V2}
+                        : bridge::BridgeDepositKey{
+                              consensus.busd_bridge
+                                  ? consensus.busd_bridge->asset.origin_chain_id
+                                  : 0,
+                              consensus.busd_bridge
+                                  ? consensus.busd_bridge->asset.vault_address
+                                  : bridge::EthAddress{},
+                              *deposit_id}};
+                result.pushKV("deposit", deposit_status(key));
+                // B-23 (node changes section 7.6): the successor vault keeps
+                // its own deposit ids, so the same id names another deposit.
+                if (v2_store && consensus.bridge_v2->successor) {
+                    const Consensus::BridgeV2VaultEntry& next{
+                        consensus.bridge_v2->successor->entry};
+                    result.pushKV("successor_deposit",
+                                  deposit_status(bridge::BridgeDepositKey{
+                                      next.origin_chain_id, next.vault_address,
+                                      *deposit_id,
+                                      bridge::BRIDGE_NULLIFIER_NAMESPACE_V2}));
+                }
             }
             return result;
         },
@@ -5143,6 +5231,1969 @@ static RPCHelpMan getbridgewithdrawalproof()
     };
 }
 
+// ------------------------------------------------------------------------
+// Fresh finality lineage (bridge V2 stage S3, regtest-only knob): status,
+// Verifier V2 calldata export and the hidden vote relay. Every value
+// consumed by Ethereum is "0x"-prefixed raw (EVM-order) bytes, as in
+// getbridgefinalityproof; B3 block hashes without an _evm suffix are in
+// ordinary display order.
+
+namespace {
+
+std::optional<uint256> FreshLineageChainDomain(const Consensus::Params& consensus)
+{
+    if (!consensus.legacy_final_hash) return std::nullopt;
+    return modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash);
+}
+
+void EnsureFreshLineageConfigured(const Consensus::Params& consensus)
+{
+    if (!consensus.fresh_lineage || !consensus.modern_pos) {
+        throw JSONRPCError(RPC_MISC_ERROR,
+                           "The fresh finality lineage is not configured on this chain "
+                           "(regtest-only -b3freshlineageheight)");
+    }
+}
+
+/** Bring the live bridge index (when its rules are active at the tip) and the
+ *  live finality tracker to the active tip; nullptr when unavailable. */
+node::FinalityTracker* SyncFinalityAtTip(Chainstate& chainstate, const Consensus::Params& consensus,
+                                         const node::BridgeStateIndex*& bridge_index)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    bridge_index = nullptr;
+    const CBlockIndex* tip{chainstate.m_chain.Tip()};
+    if (!tip) return nullptr;
+    if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+        node::BridgeStateTracker& bridge{chainstate.ModernBridgeState()};
+        if (!bridge.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) return nullptr;
+        bridge_index = &bridge.Index();
+    }
+    node::FinalityTracker& tracker{chainstate.ModernFinality()};
+    if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip, bridge_index)) return nullptr;
+    return &tracker;
+}
+
+std::vector<RPCResult> FreshSetHeaderDoc()
+{
+    return {
+        {RPCResult::Type::NUM, "epoch", "Fresh-lineage epoch stamped in the header"},
+        {RPCResult::Type::NUM, "ruleset_version", "Always 2 (V1's 110-byte header layout)"},
+        {RPCResult::Type::NUM, "validator_count", "Committee member count"},
+        {RPCResult::Type::NUM, "total_weight", "Whole modern B3"},
+        {RPCResult::Type::NUM, "quorum_weight", "Required signed weight, floor(2W/3)+1"},
+        {RPCResult::Type::STR_HEX, "aggregate_pubkey", "Compressed aggregate BLS public key"},
+        {RPCResult::Type::STR_HEX, "members_root", "Depth-13 ordered member-tree root"},
+        {RPCResult::Type::STR_HEX, "set_hash", "keccak256(encoded_header)"},
+        {RPCResult::Type::STR_HEX, "encoded_header", "Canonical 110-byte header"},
+    };
+}
+
+UniValue FreshSetHeaderToJSON(const modern::ValidatorSetHeader& header, const uint256& set_hash)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("epoch", header.epoch);
+    out.pushKV("ruleset_version", header.ruleset_version);
+    out.pushKV("validator_count", header.validator_count);
+    out.pushKV("total_weight", header.total_weight);
+    out.pushKV("quorum_weight", header.quorum_weight);
+    out.pushKV("aggregate_pubkey", EvmHex(header.aggregate_pubkey));
+    out.pushKV("members_root", EvmHex(header.members_root));
+    out.pushKV("set_hash", EvmHex(set_hash));
+    out.pushKV("encoded_header", EvmHex(header.Encode()));
+    return out;
+}
+
+UniValue FreshHistoryPathToJSON(const modern::FinalityHistoryPathV2& path)
+{
+    UniValue out{UniValue::VARR};
+    for (const uint256& sibling : path) out.push_back(EvmHex(sibling));
+    return out;
+}
+
+struct FreshCertificateContext {
+    node::FreshLineageRelayArtifacts artifacts;
+    int inclusion_height{-1};
+    uint256 inclusion_hash{};
+    int genesis_height{-1};
+    uint256 genesis_block_hash{};
+    int prev_height{-1};
+    uint256 prev_block_hash{};
+    uint256 digest{};
+    uint256 cert_id{};
+};
+
+/** Reconstruct the exact parent-derived fresh-lineage state for a historical
+ *  block, re-judge its type-11 record and build the Verifier V2 artifacts
+ *  (the fresh counterpart of BuildBridgeCertificateContext). */
+std::optional<FreshCertificateContext> BuildFreshCertificateContext(
+    Chainstate& chainstate, const Consensus::Params& consensus, const CBlockIndex& inclusion,
+    const std::optional<uint64_t> requested_prev_index, std::string& error) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    auto fail{[&](std::string message) -> std::optional<FreshCertificateContext> {
+        error = std::move(message);
+        return std::nullopt;
+    }};
+    if (!consensus.fresh_lineage || !consensus.modern_pos) return fail("fresh finality lineage is not configured");
+    const Consensus::FreshLineageParams& fl{*consensus.fresh_lineage};
+    const int interval{consensus.modern_pos->checkpoint_interval};
+    if (!inclusion.pprev || chainstate.m_chain[inclusion.nHeight] != &inclusion) {
+        return fail("certificate block is not on the active chain");
+    }
+    const auto chain_domain{FreshLineageChainDomain(consensus)};
+    if (!chain_domain) return fail("the finality chain domain is not pinned");
+    if (inclusion.nHeight < fl.activation_height) {
+        return fail("certificate block is below the fresh lineage activation height");
+    }
+
+    CBlock block;
+    if (!chainstate.m_blockman.ReadBlock(block, inclusion)) {
+        return fail("certificate block data is unavailable (possibly pruned)");
+    }
+    if (block.vtx.empty()) return fail("certificate block has no coinbase");
+
+    // Replay the public indexes to the inclusion parent (as for V1): old
+    // certificates stay reproducible after their committees leave the
+    // retained window, and a block from another fork is rejected.
+    node::BridgeStateTracker bridge_history;
+    const node::BridgeStateIndex* bridge_index{nullptr};
+    if (Consensus::BridgeRulesActive(inclusion.pprev->nHeight, consensus)) {
+        if (!bridge_history.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *inclusion.pprev)) {
+            return fail("historical bridge state is unavailable at certificate parent");
+        }
+        bridge_index = &bridge_history.Index();
+    }
+    node::FinalityTracker finality_history;
+    if (!finality_history.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *inclusion.pprev,
+                               bridge_index)) {
+        return fail("historical finality state is unavailable at certificate parent");
+    }
+    const node::FinalityTracker::State projected{finality_history.Projected(inclusion.nHeight, consensus)};
+    if (!projected.fresh || !projected.fresh->bootstrapped) {
+        return fail("the fresh lineage is not bootstrapped at the certificate block");
+    }
+    const node::FreshLineageState& fresh{*projected.fresh};
+    std::optional<modern::FinalityCertificateV2Record> record;
+    if (!modern::MatchFinalityCertificateV2ForEpoch(
+            *block.vtx.at(0), [&fresh](const uint64_t epoch) { return fresh.SetSize(epoch); }, record, error)) {
+        return std::nullopt;
+    }
+    if (!record) return fail("selected block contains no fresh-lineage certificate");
+    if (!finality_history.CheckBlockCertificate(block, inclusion, consensus, error, bridge_index)) {
+        return std::nullopt;
+    }
+    const modern::FinalizedBlockV2& fb{record->finalized_block};
+    const auto signing{fresh.SetForEpoch(fb.epoch)};
+    const auto successor{fb.epoch == fresh.epoch ? fresh.next : fresh.current};
+    if (!signing || !successor) return fail("certificate signing or successor committee is unavailable");
+
+    // History leaves 0..k-1 of this chain (leaf i at G + i * interval).
+    const uint64_t k{fb.checkpoint_index};
+    std::vector<uint256> leaves;
+    leaves.reserve(k);
+    for (uint64_t i{0}; i < k; ++i) {
+        const int64_t h{int64_t{fresh.genesis_height} + static_cast<int64_t>(i) * interval};
+        const CBlockIndex* ancestor{h <= inclusion.nHeight ? inclusion.GetAncestor(static_cast<int>(h)) : nullptr};
+        if (!ancestor) return fail("a checkpoint history block is unavailable");
+        leaves.push_back(modern::FinalityHistoryLeaf(static_cast<uint64_t>(h), ancestor->GetBlockHash()));
+    }
+    // The verifier's latest accepted checkpoint, by default the previous
+    // fresh-finalized checkpoint of this chain (index 0 = GENESIS_HEIGHT).
+    const uint64_t prev_index{requested_prev_index.value_or(fresh.finalized ? fresh.finalized->checkpoint_index : 0)};
+    if (prev_index >= k) {
+        return fail(strprintf("prev_index %u must be below the certificate's checkpoint index %u", prev_index, k));
+    }
+    auto artifacts{node::BuildFreshLineageRelayArtifacts(*chain_domain, fb, record->certificate, *signing,
+                                                         *successor, leaves, prev_index, error)};
+    if (!artifacts) return std::nullopt;
+
+    FreshCertificateContext out;
+    out.artifacts = std::move(*artifacts);
+    out.inclusion_height = inclusion.nHeight;
+    out.inclusion_hash = inclusion.GetBlockHash();
+    out.genesis_height = fresh.genesis_height;
+    out.genesis_block_hash = fresh.genesis_block_hash;
+    out.prev_height = fresh.genesis_height + static_cast<int>(prev_index) * interval;
+    out.prev_block_hash = inclusion.GetAncestor(out.prev_height)->GetBlockHash();
+    out.digest = modern::FinalityDigestV2(*chain_domain, fb);
+    out.cert_id = modern::FinalityCertIdV2(fb);
+    error.clear();
+    return out;
+}
+
+} // namespace
+
+static RPCHelpMan getfinalitylineage()
+{
+    return RPCHelpMan{
+        "getfinalitylineage",
+        "B3 fresh finality lineage (digest V2) status for the active chain: configuration, lineage id,\n"
+        "genesis checkpoint R_f-1, committee headers by fresh epoch, the finalized V2 checkpoint and the\n"
+        "checkpoint-history frontier. Configured only by the regtest-only -b3freshlineageheight knob;\n"
+        "otherwise only configured=false is returned. Ethereum-facing values are 0x-prefixed EVM-order\n"
+        "bytes; block hashes without an _evm suffix are in ordinary B3 display order.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "",
+                  {
+                      {RPCResult::Type::BOOL, "configured", "Whether this chain configures a fresh finality lineage"},
+                      {RPCResult::Type::BOOL, "staging_signer", /*optional=*/true, "Whether the V1 single-vote signer also signs digest V2 (regtest staging, V1 binding keys)"},
+                      {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "R_f, the first block that can carry a fresh-lineage certificate"},
+                      {RPCResult::Type::NUM, "genesis_height", /*optional=*/true, "GENESIS_HEIGHT = R_f-1, history leaf 0"},
+                      {RPCResult::Type::NUM, "max_epoch_extension", /*optional=*/true, "Blocks a fresh epoch may run past E before the lineage breaks"},
+                      {RPCResult::Type::NUM, "checkpoint_interval", /*optional=*/true, "Checkpoint grid spacing"},
+                      {RPCResult::Type::STR_HEX, "chain_domain", /*optional=*/true, "B3 modern chain domain"},
+                      {RPCResult::Type::NUM, "tip_height", /*optional=*/true, "Active tip height"},
+                      {RPCResult::Type::BOOL, "state_available", /*optional=*/true, "Whether the finality state could be derived at the tip"},
+                      {RPCResult::Type::BOOL, "bootstrapped", /*optional=*/true, "Whether Set'_0 exists on this chain"},
+                      {RPCResult::Type::STR_HEX, "genesis_block_hash", /*optional=*/true, "Block hash at R_f-1 (display order)"},
+                      {RPCResult::Type::STR_HEX, "genesis_block_hash_evm", /*optional=*/true, "Block hash at R_f-1 as signed (raw bytes)"},
+                      {RPCResult::Type::STR_HEX, "genesis_leaf", /*optional=*/true, "historyLeaf(R_f-1, its hash)"},
+                      {RPCResult::Type::STR_HEX, "lineage_id", /*optional=*/true, "TaggedHash(\"B3/FINALITY/LINEAGE/V2\", chain_domain || R_f-1 || hash || genesis_set_hash)"},
+                      {RPCResult::Type::STR_HEX, "genesis_set_hash", /*optional=*/true, "setHash(Set'_0)"},
+                      {RPCResult::Type::NUM, "epoch", /*optional=*/true, "Current fresh-lineage epoch"},
+                      {RPCResult::Type::ARR, "epoch_starts", /*optional=*/true, "First height of every fresh epoch",
+                       {{RPCResult::Type::NUM, "", "Epoch start height"}}},
+                      {RPCResult::Type::BOOL, "handover_certified", /*optional=*/true, "Whether the current epoch's handover certificate is included"},
+                      {RPCResult::Type::BOOL, "lineage_broken", /*optional=*/true, "Whether the lineage broke for good (no further V2 certificate is valid)"},
+                      {RPCResult::Type::NUM, "break_height", /*optional=*/true, "First height at which the current epoch breaks without a handover"},
+                      {RPCResult::Type::OBJ, "genesis_set", /*optional=*/true, "Set'_0 (epoch 0)", FreshSetHeaderDoc()},
+                      {RPCResult::Type::OBJ, "previous_set", /*optional=*/true, "Set'_{epoch-1}", FreshSetHeaderDoc()},
+                      {RPCResult::Type::OBJ, "current_set", /*optional=*/true, "Set'_epoch", FreshSetHeaderDoc()},
+                      {RPCResult::Type::OBJ, "next_set", /*optional=*/true, "Set'_{epoch+1}", FreshSetHeaderDoc()},
+                      {RPCResult::Type::OBJ, "finalized", /*optional=*/true, "The latest fresh-finalized checkpoint",
+                       {
+                           {RPCResult::Type::NUM, "height", "Certified height"},
+                           {RPCResult::Type::STR_HEX, "block_hash", "Certified hash (display order)"},
+                           {RPCResult::Type::STR_HEX, "block_hash_evm", "Certified hash as signed (raw bytes)"},
+                           {RPCResult::Type::NUM, "epoch", "Signing epoch"},
+                           {RPCResult::Type::NUM, "checkpoint_index", "History index"},
+                           {RPCResult::Type::STR_HEX, "checkpoint_history_root", "Root over history leaves 0..checkpoint_index-1"},
+                           {RPCResult::Type::STR_HEX, "cert_id", "keccak256(FinalizedBlockV2)"},
+                           {RPCResult::Type::NUM, "certified_at", "Height of the block that carried the certificate"},
+                       }},
+                      {RPCResult::Type::OBJ, "history", /*optional=*/true, "Checkpoint-history frontier at the tip",
+                       {
+                           {RPCResult::Type::NUM, "checkpoint_count", "Grid checkpoints from R_f-1 through the tip (history leaves 0..count-1)"},
+                           {RPCResult::Type::NUM, "last_checkpoint_height", "Height of leaf checkpoint_count-1"},
+                           {RPCResult::Type::STR_HEX, "root", "Depth-32 root over leaves 0..checkpoint_count-1"},
+                           {RPCResult::Type::NUM, "finalized_leaf_count", "Leaves held by the consensus accumulator (through the finalized index)"},
+                       }},
+                      {RPCResult::Type::NUM, "pool_checkpoints", /*optional=*/true, "Checkpoints tracked by the local fresh-lineage vote pool (finalized ones are reclaimed on the next submission, as in the V1 pool)"},
+                      {RPCResult::Type::OBJ, "local_signer", /*optional=*/true, "Node-local staging signer status, present once this node's finality signer ran a fresh-lineage pass (the staking status reports the V1 signer only; fresh votes have no P2P relay and are moved with getfinalitylineagevotes / submitfinalitylineagevote)",
+                       {
+                           {RPCResult::Type::NUM, "last_signed_height", "Anti-repeat watermark: the highest fresh checkpoint this node's signer recorded, or -1"},
+                           {RPCResult::Type::STR, "last_error", "Why fresh-lineage signing is currently disabled (absent journal, orphan lock, journal failure), or empty"},
+                       }},
+                  }},
+        RPCExamples{HelpExampleCli("getfinalitylineage", "") + HelpExampleRpc("getfinalitylineage", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            UniValue result{UniValue::VOBJ};
+            const bool configured{consensus.fresh_lineage.has_value() && consensus.modern_pos.has_value()};
+            result.pushKV("configured", configured);
+            if (!configured) return result;
+            const Consensus::FreshLineageParams& fl{*consensus.fresh_lineage};
+            const int interval{consensus.modern_pos->checkpoint_interval};
+            result.pushKV("staging_signer", fl.staging_signer);
+            result.pushKV("activation_height", fl.activation_height);
+            result.pushKV("genesis_height", fl.GenesisHeight());
+            result.pushKV("max_epoch_extension", fl.max_epoch_extension);
+            result.pushKV("checkpoint_interval", interval);
+            if (const auto domain{FreshLineageChainDomain(consensus)}) result.pushKV("chain_domain", EvmHex(*domain));
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            result.pushKV("tip_height", tip ? tip->nHeight : -1);
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            const node::FinalityTracker* tracker{SyncFinalityAtTip(chainstate, consensus, bridge_index)};
+            result.pushKV("state_available", tracker != nullptr);
+            if (tracker) {
+                const std::optional<node::FreshLineageState>& fresh{tracker->Current().fresh};
+                result.pushKV("bootstrapped", fresh.has_value() && fresh->bootstrapped);
+                if (fresh) {
+                    result.pushKV("genesis_block_hash", fresh->genesis_block_hash.GetHex());
+                    result.pushKV("genesis_block_hash_evm", EvmHex(fresh->genesis_block_hash));
+                    result.pushKV("genesis_leaf",
+                                  EvmHex(modern::FinalityHistoryLeaf(static_cast<uint64_t>(fresh->genesis_height),
+                                                                     fresh->genesis_block_hash)));
+                }
+                if (fresh && fresh->bootstrapped) {
+                    result.pushKV("lineage_id", EvmHex(fresh->lineage_id));
+                    if (fresh->genesis) result.pushKV("genesis_set_hash", EvmHex(fresh->genesis->set_hash));
+                    result.pushKV("epoch", fresh->epoch);
+                    UniValue starts{UniValue::VARR};
+                    for (const int start : fresh->epoch_starts) starts.push_back(start);
+                    result.pushKV("epoch_starts", std::move(starts));
+                    result.pushKV("handover_certified", fresh->handover_certified);
+                    result.pushKV("lineage_broken", fresh->lineage_broken);
+                    if (!fresh->epoch_starts.empty()) {
+                        result.pushKV("break_height", int64_t{fresh->epoch_starts.back()} +
+                                                          consensus.modern_pos->finality_epoch_blocks +
+                                                          fl.max_epoch_extension);
+                    }
+                    const auto push_set{[&result](const std::string& key,
+                                                  const std::shared_ptr<const node::FreshLineageSet>& set) {
+                        if (set) result.pushKV(key, FreshSetHeaderToJSON(set->header, set->set_hash));
+                    }};
+                    push_set("genesis_set", fresh->genesis);
+                    push_set("previous_set", fresh->previous);
+                    push_set("current_set", fresh->current);
+                    push_set("next_set", fresh->next);
+                    if (fresh->finalized) {
+                        const node::FreshFinalizedCheckpoint& f{*fresh->finalized};
+                        UniValue fin{UniValue::VOBJ};
+                        fin.pushKV("height", f.height);
+                        fin.pushKV("block_hash", f.block_hash.GetHex());
+                        fin.pushKV("block_hash_evm", EvmHex(f.block_hash));
+                        fin.pushKV("epoch", f.epoch);
+                        fin.pushKV("checkpoint_index", f.checkpoint_index);
+                        fin.pushKV("checkpoint_history_root", EvmHex(f.history_root));
+                        fin.pushKV("cert_id", EvmHex(f.cert_id));
+                        fin.pushKV("certified_at", f.certified_at);
+                        result.pushKV("finalized", std::move(fin));
+                    }
+                    if (tip && tip->nHeight >= fresh->genesis_height && interval > 0) {
+                        const uint64_t count{static_cast<uint64_t>((tip->nHeight - fresh->genesis_height) / interval) + 1};
+                        const auto hash_at{[&chainstate](const int h) -> std::optional<uint256> {
+                            const CBlockIndex* index{chainstate.m_chain[h]};
+                            if (!index) return std::nullopt;
+                            return index->GetBlockHash();
+                        }};
+                        if (const auto root{node::FreshHistoryRootAt(*fresh, count, hash_at, interval)}) {
+                            UniValue history{UniValue::VOBJ};
+                            history.pushKV("checkpoint_count", count);
+                            history.pushKV("last_checkpoint_height",
+                                           fresh->genesis_height + static_cast<int>(count - 1) * interval);
+                            history.pushKV("root", EvmHex(*root));
+                            history.pushKV("finalized_leaf_count", fresh->history.count);
+                            result.pushKV("history", std::move(history));
+                        }
+                    }
+                }
+            }
+            const node::FreshLineageSignaturePool& fresh_pool{chainstate.FinalitySignatures().Fresh()};
+            result.pushKV("pool_checkpoints", static_cast<uint64_t>(fresh_pool.TrackedCheckpoints()));
+            if (const auto& signer{fresh_pool.LocalSigner()}) {
+                UniValue local{UniValue::VOBJ};
+                local.pushKV("last_signed_height", signer->last_signed_height);
+                local.pushKV("last_error", signer->last_error);
+                result.pushKV("local_signer", std::move(local));
+            }
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan getfinalitylineagecertificate()
+{
+    return RPCHelpMan{
+        "getfinalitylineagecertificate",
+        "Export the fresh-lineage (digest V2) certificate carried by an active-chain block as the exact\n"
+        "permissionless B3FinalityVerifierV2.submitCertificate calldata, with the finalized block V2\n"
+        "fields, both ruleset-2 set headers, the BLS proof witness and the checkpoint-history paths.\n"
+        "Historical state is reconstructed from validated block data; pruned, non-active, malformed or\n"
+        "mismatched certificates fail closed. Configured only by the regtest-only -b3freshlineageheight\n"
+        "knob. This RPC handles no Ethereum private key.\n",
+        {
+            {"hash_or_height", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Active-chain block whose coinbase carries the fresh-lineage certificate",
+             RPCArgOptions{.skip_type_check = true, .type_str = {"", "string or numeric"}}},
+            {"prev_index", RPCArg::Type::NUM,
+             RPCArg::DefaultHint{"the previous fresh-finalized checkpoint index on this chain, or 0"},
+             "History index of the verifier's latest accepted checkpoint, placed by ancestry_path "
+             "(below checkpoint_index; 0 is R_f-1)"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Verifier V2 relay artifacts",
+                  {
+                      {RPCResult::Type::NUM, "inclusion_height", "B3 certificate inclusion height"},
+                      {RPCResult::Type::STR_HEX, "inclusion_block", "Inclusion hash (display order)"},
+                      {RPCResult::Type::STR_HEX, "inclusion_block_evm", "Inclusion hash (raw bytes)"},
+                      {RPCResult::Type::STR_HEX, "lineage_id", "FinalizedBlockV2.lineageId"},
+                      {RPCResult::Type::NUM, "height", "FinalizedBlockV2.height, the certified checkpoint"},
+                      {RPCResult::Type::STR_HEX, "block_hash", "Certified hash (display order)"},
+                      {RPCResult::Type::STR_HEX, "block_hash_evm", "FinalizedBlockV2.blockHash (raw bytes)"},
+                      {RPCResult::Type::STR_HEX, "withdrawal_root", "FinalizedBlockV2.withdrawalRoot"},
+                      {RPCResult::Type::STR_HEX, "validator_set_hash", "FinalizedBlockV2.validatorSetHash (successor set hash)"},
+                      {RPCResult::Type::NUM, "epoch", "FinalizedBlockV2.epoch (signing epoch)"},
+                      {RPCResult::Type::NUM, "checkpoint_index", "FinalizedBlockV2.checkpointIndex"},
+                      {RPCResult::Type::STR_HEX, "checkpoint_history_root", "FinalizedBlockV2.checkpointHistoryRoot"},
+                      {RPCResult::Type::NUM, "bridge_flags", "FinalizedBlockV2.bridgeFlags"},
+                      {RPCResult::Type::STR_HEX, "encoded", "The 185-byte FinalizedBlockV2"},
+                      {RPCResult::Type::STR_HEX, "digest_v2", "TaggedHash(\"B3/FINALITY/V2\", chain_domain || encoded), the BLS message"},
+                      {RPCResult::Type::STR_HEX, "cert_id", "keccak256(encoded)"},
+                      {RPCResult::Type::OBJ, "signing_set", "SetHeader signingSet", FreshSetHeaderDoc()},
+                      {RPCResult::Type::OBJ, "successor_set", "SetHeader successor", FreshSetHeaderDoc()},
+                      {RPCResult::Type::NUM, "validator_count", "Signing-committee member count"},
+                      {RPCResult::Type::STR_HEX, "signer_bitmap", "LSB-first signer bitmap"},
+                      {RPCResult::Type::NUM, "signer_count", "Bitmap signer count"},
+                      {RPCResult::Type::NUM, "signed_weight", "Signed weight in whole modern B3"},
+                      {RPCResult::Type::ARR, "absent_indices", "Non-signer indices carried as membership witnesses",
+                       {{RPCResult::Type::NUM, "", "Absent member index"}}},
+                      {RPCResult::Type::STR_HEX, "proof", "ABI-encoded BlsDigestProver proof"},
+                      {RPCResult::Type::OBJ, "history", "Checkpoint-history paths under checkpoint_history_root",
+                       {
+                           {RPCResult::Type::NUM, "prev_index", "Index placed by ancestry_path"},
+                           {RPCResult::Type::NUM, "prev_height", "Checkpoint height of prev_index"},
+                           {RPCResult::Type::STR_HEX, "prev_block_hash", "Hash at prev_height (display order)"},
+                           {RPCResult::Type::STR_HEX, "prev_block_hash_evm", "Hash at prev_height (raw bytes)"},
+                           {RPCResult::Type::STR_HEX, "prev_leaf", "historyLeaf(prev_height, prev_block_hash_evm)"},
+                           {RPCResult::Type::ARR, "ancestry_path", "bytes32[32] ancestryPath (leaf level first)",
+                            {{RPCResult::Type::STR_HEX, "", "Sibling"}}},
+                           {RPCResult::Type::NUM, "genesis_height", "R_f-1, history index 0"},
+                           {RPCResult::Type::STR_HEX, "genesis_leaf", "historyLeaf(R_f-1, its hash)"},
+                           {RPCResult::Type::ARR, "leaf0_path", "Path of the genesis leaf (index 0), the K_OF_N bootstrap's leaf0Path",
+                            {{RPCResult::Type::STR_HEX, "", "Sibling"}}},
+                       }},
+                      {RPCResult::Type::STR, "function", "Solidity signature of the encoded call"},
+                      {RPCResult::Type::STR_HEX, "calldata", "Exact B3FinalityVerifierV2.submitCertificate calldata"},
+                      {RPCResult::Type::BOOL, "private_key_required_by_rpc", "Always false"},
+                      {RPCResult::Type::STR, "abi_note", "How the calldata is assembled"},
+                  }},
+        RPCExamples{HelpExampleCli("getfinalitylineagecertificate", "272") +
+                    HelpExampleCli("getfinalitylineagecertificate", "272 1")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            EnsureFreshLineageConfigured(consensus);
+            std::optional<uint64_t> prev_index;
+            if (!request.params[1].isNull()) {
+                const int64_t raw{request.params[1].getInt<int64_t>()};
+                if (raw < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "prev_index must be nonnegative");
+                prev_index = static_cast<uint64_t>(raw);
+            }
+            const CBlockIndex* inclusion{ParseHashOrHeight(request.params[0], chainman)};
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            if (!inclusion || chainstate.m_chain[inclusion->nHeight] != inclusion) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Certificate block is not on the active chain");
+            }
+            std::string error;
+            const auto context{BuildFreshCertificateContext(chainstate, consensus, *inclusion, prev_index, error)};
+            if (!context) throw JSONRPCError(RPC_MISC_ERROR, error);
+            const node::FreshLineageRelayArtifacts& a{context->artifacts};
+            const modern::FinalizedBlockV2& fb{a.fb};
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("inclusion_height", context->inclusion_height);
+            result.pushKV("inclusion_block", context->inclusion_hash.GetHex());
+            result.pushKV("inclusion_block_evm", EvmHex(context->inclusion_hash));
+            result.pushKV("lineage_id", EvmHex(fb.lineage_id));
+            result.pushKV("height", fb.height);
+            result.pushKV("block_hash", fb.block_hash.GetHex());
+            result.pushKV("block_hash_evm", EvmHex(fb.block_hash));
+            result.pushKV("withdrawal_root", EvmHex(fb.withdrawal_root));
+            result.pushKV("validator_set_hash", EvmHex(fb.validator_set_hash));
+            result.pushKV("epoch", fb.epoch);
+            result.pushKV("checkpoint_index", fb.checkpoint_index);
+            result.pushKV("checkpoint_history_root", EvmHex(fb.checkpoint_history_root));
+            result.pushKV("bridge_flags", fb.bridge_flags);
+            result.pushKV("encoded", EvmHex(fb.Encode()));
+            result.pushKV("digest_v2", EvmHex(context->digest));
+            result.pushKV("cert_id", EvmHex(context->cert_id));
+            result.pushKV("signing_set", FreshSetHeaderToJSON(a.signing_header, a.signing_set_hash));
+            result.pushKV("successor_set", FreshSetHeaderToJSON(a.successor_header, a.successor_set_hash));
+            result.pushKV("validator_count", a.signing_header.validator_count);
+            result.pushKV("signer_bitmap", EvmHex(a.bitmap));
+            result.pushKV("signer_count", a.signer_count);
+            result.pushKV("signed_weight", a.signed_weight);
+            UniValue absent{UniValue::VARR};
+            for (const bridge::BootstrapAbsentWitness& witness : a.absent) absent.push_back(witness.index);
+            result.pushKV("absent_indices", std::move(absent));
+            result.pushKV("proof", EvmHex(a.proof_abi));
+            UniValue history{UniValue::VOBJ};
+            history.pushKV("prev_index", a.prev_index);
+            history.pushKV("prev_height", context->prev_height);
+            history.pushKV("prev_block_hash", context->prev_block_hash.GetHex());
+            history.pushKV("prev_block_hash_evm", EvmHex(context->prev_block_hash));
+            history.pushKV("prev_leaf", EvmHex(a.prev_leaf));
+            history.pushKV("ancestry_path", FreshHistoryPathToJSON(a.ancestry_path));
+            history.pushKV("genesis_height", context->genesis_height);
+            history.pushKV("genesis_leaf", EvmHex(a.leaf0));
+            history.pushKV("leaf0_path", FreshHistoryPathToJSON(a.leaf0_path));
+            result.pushKV("history", std::move(history));
+            result.pushKV("function", std::string{node::FRESH_SUBMIT_CERTIFICATE_SIGNATURE});
+            result.pushKV("calldata", EvmHex(a.submit_calldata));
+            result.pushKV("private_key_required_by_rpc", false);
+            result.pushKV("abi_note",
+                          "submitCertificate(fb, signingSet, successor, ancestryPath, proof) on "
+                          "B3FinalityVerifierV2 (contracts spec section 3.3): 4-byte selector, a 44-word head "
+                          "(9 fb words, signingSet offset, successor offset, 32 ancestryPath words, proof "
+                          "offset), then both SetHeader tuples and the proof bytes. ancestry_path places "
+                          "history.prev_index, which must be the verifier's latest accepted index; when the "
+                          "verifier holds a different checkpoint pass its index as prev_index. "
+                          "withdrawal_root is zero below the bridge V2 activation height V (and on a chain "
+                          "without a bridge V2 configuration) and the V2 withdrawal-tree root from V, which is "
+                          "non-zero even for the empty tree (getbridgev2info, getbridgewithdrawalproofv2); "
+                          "bridge_flags is 0, except bit 0 (deposits closed for good) from the first checkpoint "
+                          "at or after the block that set the sticky bridge V2 conflict (getbridgev2info.conflict).");
+            return result;
+        },
+    };
+}
+
+// ------------------------------------------------------------------------
+// Bridge V2 relayer RPCs (node changes section 11.1, first slice: one fresh
+// Ethereum vault). A separate getbridgev2info keeps the V1 getbridgeinfo
+// and its tests byte-for-byte unchanged. Hex conventions as for the fresh
+// lineage above: Ethereum-facing values are "0x"-prefixed raw bytes, B3 ids
+// and block hashes without an _evm suffix are in ordinary display order.
+
+namespace {
+
+const Consensus::BridgeV2Params& EnsureBridgeV2Configured(const Consensus::Params& consensus)
+{
+    if (!consensus.bridge_v2) {
+        throw JSONRPCError(RPC_MISC_ERROR,
+                           "Bridge V2 is not configured on this chain (regtest-only -b3bridgepins v2 section)");
+    }
+    return *consensus.bridge_v2;
+}
+
+// -- Kind 9 ETH_STATE_OBSERVATION rendering (node changes section 8.2) ------
+
+//! Every kind 9 subject, in slot order: VERIFIER_E, RESERVE_E, TOKEN_FLAGS
+//! and the B-23 successor's RESERVE_E_SUCCESSOR and TOKEN_FLAGS_SUCCESSOR
+//! (node changes section 7.6). Written out in full: a list shorter than the
+//! array would zero-fill, and subject 0 has no slot.
+constexpr std::array<uint8_t, node::BRIDGE_V2_OBSERVATION_SUBJECTS> BRIDGE_V2_OBSERVATION_SUBJECT_LIST{
+    bridge::ETH_OBSERVATION_SUBJECT_VERIFIER, bridge::ETH_OBSERVATION_SUBJECT_RESERVE,
+    bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS, bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR,
+    bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR};
+static_assert([] {
+    for (size_t i{0}; i < BRIDGE_V2_OBSERVATION_SUBJECT_LIST.size(); ++i) {
+        if (node::BridgeObservationSlotV2(BRIDGE_V2_OBSERVATION_SUBJECT_LIST[i]) != i) return false;
+    }
+    return true;
+}());
+
+//! Whether a kind 9 subject reads the B-23 successor vault v'.
+bool IsSuccessorObservationSubject(const uint8_t subject)
+{
+    return bridge::EthObservationBaseSubject(subject) != 0 &&
+           bridge::EthObservationEntryRole(subject) == Consensus::BridgeV2EntryRole::SUCCESSOR;
+}
+
+const char* ObservationSubjectName(const uint8_t subject)
+{
+    switch (subject) {
+    case bridge::ETH_OBSERVATION_SUBJECT_VERIFIER: return "VERIFIER_E";
+    case bridge::ETH_OBSERVATION_SUBJECT_RESERVE: return "RESERVE_E";
+    case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS: return "TOKEN_FLAGS";
+    case bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR: return "RESERVE_E_SUCCESSOR";
+    case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR: return "TOKEN_FLAGS_SUCCESSOR";
+    }
+    return "unknown";
+}
+
+//! The getbridgev2info "observations" key of a subject.
+const char* ObservationSubjectKey(const uint8_t subject)
+{
+    switch (subject) {
+    case bridge::ETH_OBSERVATION_SUBJECT_VERIFIER: return "verifier_e";
+    case bridge::ETH_OBSERVATION_SUBJECT_RESERVE: return "reserve_e";
+    case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS: return "token_flags";
+    case bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR: return "reserve_e_successor";
+    case bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR: return "token_flags_successor";
+    }
+    return "unknown";
+}
+
+const char* VerifierStatusName(const uint8_t status)
+{
+    switch (status) {
+    case bridge::VERIFIER_STATUS_UNINITIALIZED: return "UNINITIALIZED";
+    case bridge::VERIFIER_STATUS_LIVE: return "LIVE";
+    case bridge::VERIFIER_STATUS_HALTED_CONFLICT: return "HALTED_CONFLICT";
+    case bridge::VERIFIER_STATUS_CANCELLED: return "CANCELLED";
+    }
+    return "unknown";
+}
+
+const char* BridgeV2ConflictName(const uint8_t reason)
+{
+    switch (reason) {
+    case bridge::BRIDGE_V2_CONFLICT_E5: return "E5";
+    case bridge::BRIDGE_V2_CONFLICT_E8: return "E8";
+    case bridge::BRIDGE_V2_CONFLICT_KIND13: return "kind13";
+    }
+    return "unknown";
+}
+
+/**
+ * The decoded fields of an observation of `subject`, or (nullopt) of every
+ * subject with each field optional, for buildbridgeobservationv2 whose
+ * subject is an argument. A field shared by two subjects is listed once.
+ */
+std::vector<RPCResult> ObservedValueResults(const std::optional<uint8_t> subject)
+{
+    const bool optional{!subject};
+    // A successor subject decodes as its base subject, read from v'.
+    const std::optional<uint8_t> base{subject ? std::optional<uint8_t>{bridge::EthObservationBaseSubject(*subject)}
+                                              : std::nullopt};
+    std::vector<RPCResult> out;
+    std::set<std::string> seen;
+    const auto add{[&](const RPCResult::Type type, const std::string& key, const std::string& description) {
+        if (seen.insert(key).second) out.emplace_back(type, key, optional, description);
+    }};
+    using T = RPCResult::Type;
+    if (!base || *base == bridge::ETH_OBSERVATION_SUBJECT_VERIFIER) {
+        add(T::NUM, "current_epoch", "VERIFIER_E: Liveness.currentEpoch (e_E)");
+        add(T::NUM, "last_rotation_time", "VERIFIER_E: Liveness.lastRotationTime (Unix seconds)");
+        add(T::NUM, "last_certificate_time", "VERIFIER_E: Liveness.lastCertificateTime (Unix seconds)");
+        add(T::NUM, "latest_bridge_height", "VERIFIER_E: Liveness.latestBridgeHeight");
+        add(T::NUM, "status", "VERIFIER_E: Liveness.status (0 UNINITIALIZED, 1 LIVE, 2 HALTED_CONFLICT, 3 CANCELLED)");
+        add(T::STR, "status_name", "VERIFIER_E: status by name");
+        add(T::BOOL, "deposits_closed", "VERIFIER_E: Liveness.depositsClosed");
+        add(T::STR_HEX, "current_set_hash", "VERIFIER_E: currentSetHash (slot 1, raw bytes)");
+        add(T::STR_HEX, "next_set_hash", "VERIFIER_E: nextSetHash (slot 2, raw bytes)");
+        add(T::NUM, "latest_height", "VERIFIER_E: Latest.height");
+        add(T::NUM, "latest_index", "VERIFIER_E: Latest.index");
+        add(T::NUM, "latest_init_time", "VERIFIER_E: Latest.initTime (Unix seconds)");
+        add(T::STR_HEX, "latest_cert_id", "VERIFIER_E: latestCertId (slot 6, raw bytes)");
+        add(T::STR_HEX, "verifier_code_hash", "VERIFIER_E: observed Verifier V2 extcodehash");
+    }
+    if (!base || *base == bridge::ETH_OBSERVATION_SUBJECT_RESERVE) {
+        add(T::NUM, "next_deposit_id", "RESERVE_E: Vault V2 nextDepositId, the cut of P_pre / P_post");
+        add(T::NUM, "locked", "RESERVE_E: Vault V2 locked (raw six-decimal units)");
+        add(T::NUM, "absorbed_total", "RESERVE_E: Vault V2 absorbedTotal (raw)");
+        add(T::NUM, "balance", "RESERVE_E: the token's balances[vault], B (raw)");
+        add(T::STR_HEX, "vault_code_hash", "RESERVE_E: observed Vault V2 extcodehash");
+    }
+    if (!base || *base == bridge::ETH_OBSERVATION_SUBJECT_RESERVE ||
+        *base == bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS) {
+        add(T::STR_HEX, "token_code_hash", "RESERVE_E and TOKEN_FLAGS: observed token extcodehash (equal to its pin)");
+    }
+    if (!base || *base == bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS) {
+        add(T::STR_HEX, "owner", "TOKEN_FLAGS: token owner (slot 0)");
+        add(T::BOOL, "paused", "TOKEN_FLAGS: token paused (slot 0)");
+        add(T::STR_HEX, "upgraded_address", "TOKEN_FLAGS: token upgradedAddress (slot 10)");
+        add(T::BOOL, "deprecated", "TOKEN_FLAGS: token deprecated (slot 10)");
+        add(T::BOOL, "vault_blacklisted", "TOKEN_FLAGS: isBlackListed[vault]");
+    }
+    return out;
+}
+
+UniValue ObservedValuesJson(const bridge::ObservedStateV2& state)
+{
+    UniValue out{UniValue::VOBJ};
+    if (const auto* verifier{std::get_if<bridge::VerifierStateV2>(&state)}) {
+        out.pushKV("current_epoch", verifier->current_epoch);
+        out.pushKV("last_rotation_time", verifier->last_rotation_time);
+        out.pushKV("last_certificate_time", verifier->last_certificate_time);
+        out.pushKV("latest_bridge_height", verifier->latest_bridge_height);
+        out.pushKV("status", int{verifier->status});
+        out.pushKV("status_name", VerifierStatusName(verifier->status));
+        out.pushKV("deposits_closed", verifier->deposits_closed);
+        out.pushKV("current_set_hash", EvmHex(verifier->current_set_hash));
+        out.pushKV("next_set_hash", EvmHex(verifier->next_set_hash));
+        out.pushKV("latest_height", verifier->latest_height);
+        out.pushKV("latest_index", verifier->latest_index);
+        out.pushKV("latest_init_time", verifier->latest_init_time);
+        out.pushKV("latest_cert_id", EvmHex(verifier->latest_cert_id));
+        out.pushKV("verifier_code_hash", EvmHex(verifier->verifier_code_hash));
+    } else if (const auto* reserve{std::get_if<bridge::ReserveStateV2>(&state)}) {
+        out.pushKV("next_deposit_id", reserve->next_deposit_id);
+        out.pushKV("locked", reserve->locked);
+        out.pushKV("absorbed_total", reserve->absorbed_total);
+        out.pushKV("balance", reserve->balance);
+        out.pushKV("vault_code_hash", EvmHex(reserve->vault_code_hash));
+        out.pushKV("token_code_hash", EvmHex(reserve->token_code_hash));
+    } else if (const auto* token{std::get_if<bridge::TokenFlagsV2>(&state)}) {
+        out.pushKV("token_code_hash", EvmHex(token->token_code_hash));
+        out.pushKV("owner", EvmHex(token->owner));
+        out.pushKV("paused", token->paused);
+        out.pushKV("upgraded_address", EvmHex(token->upgraded_address));
+        out.pushKV("deprecated", token->deprecated);
+        out.pushKV("vault_blacklisted", token->vault_blacklisted);
+    }
+    return out;
+}
+
+//! getbridgev2info's documentation of one connected observation.
+RPCResult ObservationRecordResult(const uint8_t subject)
+{
+    return {RPCResult::Type::OBJ, ObservationSubjectKey(subject), /*optional=*/true,
+            std::string{"Latest connected "} + ObservationSubjectName(subject) + " observation (absent before the first)",
+            {
+                {RPCResult::Type::NUM, "subject", "Kind 9 subject number"},
+                {RPCResult::Type::STR, "name", "Subject name"},
+                {RPCResult::Type::NUM, "anchor_block", "Ethereum execution block of the anchor it was proven against"},
+                {RPCResult::Type::STR_HEX, "anchor_hash_evm", "That anchor's hash (raw bytes)"},
+                {RPCResult::Type::NUM, "t_obs", "The anchor's execution timestamp, the observation time the gate ages"},
+                {RPCResult::Type::NUM, "verdict", "Recorded verdict: VERIFIER_E bit 0 SETS_MISMATCH (E4), bit 1 CERT_CONFLICT (E5); 0 for the other subjects"},
+                {RPCResult::Type::NUM, "connected_height", "B3 height that connected it"},
+                {RPCResult::Type::STR_HEX, "connected_block", "B3 block that connected it"},
+                {RPCResult::Type::OBJ, "values", "Decoded storage values and observed code hashes", ObservedValueResults(subject)},
+            }};
+}
+
+UniValue ObservationRecordJson(const node::BridgeObservationRecordV2& record)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("subject", int{record.subject});
+    out.pushKV("name", ObservationSubjectName(record.subject));
+    out.pushKV("anchor_block", record.anchor_block);
+    out.pushKV("anchor_hash_evm", EvmHex(record.anchor_hash));
+    out.pushKV("t_obs", record.t_obs);
+    out.pushKV("verdict", int{record.verdict});
+    out.pushKV("connected_height", record.connected_height);
+    out.pushKV("connected_block", record.connected_block.GetHex());
+    out.pushKV("values", ObservedValuesJson(record.state));
+    return out;
+}
+
+/**
+ * getbridgev2info's observation_plan: the newest retained V2 anchor with a
+ * state root and, per subject, the eth_getProof calls (accounts and storage
+ * keys, in record order) a relayer makes at that anchor's block. The B-23
+ * successor subjects (0x12 and 0x13) are listed only when `migration_active`
+ * (the next block may carry them), each planned with the pins of its own
+ * vault entry.
+ */
+UniValue ObservationPlanJson(const Consensus::BridgeV2Params& v2, const bool migration_active,
+                             const node::BridgeStateIndex* index)
+{
+    UniValue plan{UniValue::VOBJ};
+    const auto anchor{index ? index->NewestStateAnchorV2() : std::nullopt};
+    if (anchor) {
+        UniValue a{UniValue::VOBJ};
+        a.pushKV("hash_evm", EvmHex(anchor->block_hash));
+        a.pushKV("number", anchor->block_number);
+        a.pushKV("timestamp", anchor->execution_timestamp);
+        a.pushKV("connected_height", anchor->connected_height);
+        a.pushKV("connected_block", anchor->connected_block.GetHex());
+        plan.pushKV("anchor", std::move(a));
+    }
+    UniValue subjects{UniValue::VARR};
+    for (const uint8_t subject : BRIDGE_V2_OBSERVATION_SUBJECT_LIST) {
+        if (IsSuccessorObservationSubject(subject) && !migration_active) continue;
+        const bridge::ObservationPins pins{
+            bridge::ObservationPinsFromParams(v2, bridge::EthObservationEntryRole(subject))};
+        UniValue entry{UniValue::VOBJ};
+        entry.pushKV("subject", int{subject});
+        entry.pushKV("name", ObservationSubjectName(subject));
+        const auto latest{index ? index->LatestObservationV2(subject) : std::nullopt};
+        if (latest) entry.pushKV("latest_anchor_block", latest->anchor_block);
+        if (anchor) entry.pushKV("anchor_is_newer", !latest || anchor->block_number > latest->anchor_block);
+        UniValue accounts{UniValue::VARR};
+        for (const bridge::ObservationAccountRequest& request : bridge::ObservationRequests(subject, pins)) {
+            UniValue account{UniValue::VOBJ};
+            account.pushKV("role", bridge::ObservationAccountRoleName(request.role));
+            account.pushKV("address", EvmHex(request.address));
+            UniValue slots{UniValue::VARR};
+            for (const bridge::StorageWord& slot : request.slots) slots.push_back(EvmHex(slot));
+            account.pushKV("slots", std::move(slots));
+            accounts.push_back(std::move(account));
+        }
+        entry.pushKV("accounts", std::move(accounts));
+        subjects.push_back(std::move(entry));
+    }
+    plan.pushKV("subjects", std::move(subjects));
+    return plan;
+}
+
+//! getbridgev2info's documentation of a vault entry's reserve ledger (the
+//! launch entry's "reserve" and the successor's "successor.reserve").
+std::vector<RPCResult> ReserveLedgerResults()
+{
+    return {
+        {RPCResult::Type::NUM, "minted", "bUSD V2 minted against proven deposits"},
+        {RPCResult::Type::NUM, "burned", "burned_v: leaf V2 amounts appended"},
+        {RPCResult::Type::NUM, "credited", "C_v: migration amounts credited on proven arrival"},
+        {RPCResult::Type::NUM, "transit", "transit_v: amounts paid toward this entry and not yet credited"},
+        {RPCResult::Type::NUM, "reserve", /*optional=*/true, "reserve_v = minted + credited - burned, the bound of burn check 2"},
+        {RPCResult::Type::NUM, "proven_deposits", "Number of Vault V2 deposits proven (minted)"},
+        {RPCResult::Type::NUM, "invariant_r_margin", /*optional=*/true, "With a RESERVE_E: observed locked - (P_pre + credited - burned) on the current ledger; invariant R holds while it is at least zero (a failure when the observation connected set the sticky E8 conflict)"},
+        {RPCResult::Type::NUM, "wind_down_headroom", /*optional=*/true, "With a RESERVE_E: the largest first burn of the next block that burn check 3 (the wind-down bound) admits; negative when the appended leaves already exceed it"},
+    };
+}
+
+/**
+ * The reserve ledger of vault entry `role` and, given that entry's latest
+ * RESERVE_E (RESERVE_E_SUCCESSOR for v'), its invariant R margin and
+ * wind-down headroom at that observation's cut, as burn check 3 and
+ * invariant R take them (no deposits pending in a block).
+ */
+UniValue ReserveLedgerJson(const node::BridgeStateIndex& index, const Consensus::BridgeV2Params& v2,
+                           const Consensus::BridgeV2EntryRole role)
+{
+    const bridge::ReserveLedgerV2& ledger{index.ReserveLedgerV2(role)};
+    UniValue reserve{UniValue::VOBJ};
+    reserve.pushKV("minted", ledger.minted);
+    reserve.pushKV("burned", ledger.burned);
+    reserve.pushKV("credited", ledger.credited);
+    reserve.pushKV("transit", ledger.transit);
+    if (const auto amount{ledger.Reserve()}) reserve.pushKV("reserve", *amount);
+    reserve.pushKV("proven_deposits", static_cast<uint64_t>(index.ProvenDepositsV2(role).size()));
+    const uint8_t subject{role == Consensus::BridgeV2EntryRole::SUCCESSOR
+                              ? bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR
+                              : bridge::ETH_OBSERVATION_SUBJECT_RESERVE};
+    const auto observed{index.LatestObservationV2(subject)};
+    const auto* state{observed ? std::get_if<bridge::ReserveStateV2>(&observed->state) : nullptr};
+    if (state) {
+        const auto sums{index.ProvenDepositSumsAtV2(role, state->next_deposit_id)};
+        if (sums) {
+            if (const auto margin{bridge::InvariantRMarginV2(state->locked, sums->below_cut, ledger)}) {
+                reserve.pushKV("invariant_r_margin", *margin);
+            }
+            if (const auto terms{bridge::ComputeWindDownTerms(*state, *sums, ledger, v2.gate.wind_down_margin_ppm)}) {
+                reserve.pushKV("wind_down_headroom", terms->headroom);
+            }
+        }
+    }
+    return reserve;
+}
+
+/**
+ * getbridgev2info successor.sweep.amount: what a kind 16 sweep in the next
+ * block would move on the connected state, the launch entry's reserve
+ * capped by the wind-down headroom of its latest RESERVE_E
+ * (bridge::VaultSweepAmountV2, as VerifyVaultSweepV2 takes it). 0 when the
+ * reserve or the headroom is not positive (nothing to sweep now); nullopt
+ * while the reserve is positive but no launch RESERVE_E is connected.
+ */
+std::optional<CAmount> VaultSweepAmountJson(const node::BridgeStateIndex& index,
+                                            const Consensus::BridgeV2Params& v2)
+{
+    const bridge::ReserveLedgerV2& ledger{index.ReserveLedgerV2(Consensus::BridgeV2EntryRole::LAUNCH)};
+    const auto reserve{ledger.Reserve()};
+    if (!reserve) return std::nullopt;
+    if (*reserve <= 0) return CAmount{0};
+    const auto observed{index.LatestObservationV2(bridge::ETH_OBSERVATION_SUBJECT_RESERVE)};
+    const auto* state{observed ? std::get_if<bridge::ReserveStateV2>(&observed->state) : nullptr};
+    if (!state) return std::nullopt;
+    const auto sums{index.ProvenDepositSumsAtV2(Consensus::BridgeV2EntryRole::LAUNCH, state->next_deposit_id)};
+    if (!sums) return std::nullopt;
+    return bridge::VaultSweepAmountV2(ledger, *state, *sums, v2.gate.wind_down_margin_ppm).value_or(0);
+}
+
+//! getbridgev2info's documentation of one gate evaluation (burn_gate and
+//! successor.sweep.gate).
+std::vector<RPCResult> BridgeV2GateResults()
+{
+    return {
+        {RPCResult::Type::STR, "status", "READY, NOT_READY or UNAVAILABLE"},
+        {RPCResult::Type::STR, "row", /*optional=*/true, "NOT_READY only: the first failed row, C1-C4 or E1-E8"},
+        {RPCResult::Type::STR, "reason", "Why that row failed, or why the gate is UNAVAILABLE; empty when READY"},
+        {RPCResult::Type::NUM, "now_eff", /*optional=*/true, "The gate's time: max(candidate time, the V2 light client's finalized execution timestamp) (absent when no lineage context could be built)"},
+        {RPCResult::Type::NUM, "closes_at", /*optional=*/true, "READY only: the first now_eff at which an observation age or the rotation age closes the gate"},
+    };
+}
+
+/**
+ * One gate evaluation as getbridgev2info renders it: UNAVAILABLE with
+ * `unavailable_reason` when none could run (no bridge state or lineage
+ * context), otherwise its status, first failed row, reason, now_eff and,
+ * when READY, closes_at.
+ */
+UniValue BridgeV2GateJson(const std::optional<node::BridgeV2GateResult>& evaluated,
+                          const std::string& unavailable_reason)
+{
+    std::string status{"UNAVAILABLE"};
+    std::string reason{unavailable_reason};
+    if (evaluated) {
+        switch (evaluated->readiness) {
+        case node::BridgeBurnReadiness::READY:
+            status = "READY";
+            reason.clear();
+            break;
+        case node::BridgeBurnReadiness::NOT_READY:
+            status = "NOT_READY";
+            reason = evaluated->reason;
+            break;
+        case node::BridgeBurnReadiness::UNAVAILABLE:
+            reason = evaluated->reason;
+            break;
+        }
+    }
+    UniValue gate{UniValue::VOBJ};
+    gate.pushKV("status", status);
+    if (evaluated && evaluated->readiness == node::BridgeBurnReadiness::NOT_READY) {
+        gate.pushKV("row", bridge::BurnGateRowName(evaluated->row));
+    }
+    gate.pushKV("reason", reason);
+    if (evaluated) {
+        gate.pushKV("now_eff", evaluated->now_eff);
+        if (evaluated->readiness == node::BridgeBurnReadiness::READY && evaluated->closes_at) {
+            gate.pushKV("closes_at", *evaluated->closes_at);
+        }
+    }
+    return gate;
+}
+
+/**
+ * The canonical type-10 payload of the one kind 16 VAULT_SWEEP record a
+ * migration takes (node changes section 7.6): exactly 0x10 || 0x00 ||
+ * the launch vault entry id. Every sweep is the same record; consensus
+ * derives its amount, leaf id and both vaults. nullopt when the configured
+ * identities are unavailable.
+ */
+std::optional<std::vector<unsigned char>> VaultSweepPayload(const Consensus::Params& consensus)
+{
+    const auto launch_id{modern::ConfiguredBridgeV2EntryId(consensus, Consensus::BridgeV2EntryRole::LAUNCH)};
+    if (!launch_id) return std::nullopt;
+    const bridge::BridgeRecordV1 record{bridge::BridgeRecordKindV1::VAULT_SWEEP,
+                                        bridge::BridgeVaultSweepV2{*launch_id}};
+    const auto mpa{bridge::MakeBridgeMpaRecord(record, bridge::BRIDGE_MPT_LIMITS_V2)};
+    if (!mpa) return std::nullopt;
+    return mpa->payload;
+}
+
+// -- buildbridgeobservationv2 argument parsing ------------------------------
+
+//! A hex string with an optional 0x prefix (eth_getProof's form).
+std::string EvmHexDigits(const UniValue& value, const std::string& name)
+{
+    if (!value.isStr()) {
+        throw JSONRPCError(RPC_TYPE_ERROR, name + " must be a hexadecimal string");
+    }
+    std::string hex{value.get_str()};
+    if (hex.starts_with("0x") || hex.starts_with("0X")) hex.erase(0, 2);
+    return hex;
+}
+
+uint256 ParseEvmHash(const UniValue& value, const std::string& name)
+{
+    const std::string hex{EvmHexDigits(value, name)};
+    if (hex.size() != 64 || !IsHex(hex)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, name + " must contain exactly 32 hexadecimal bytes");
+    }
+    const std::vector<unsigned char> bytes{ParseHex(hex)};
+    return uint256{std::span<const unsigned char>{bytes.data(), bytes.size()}};
+}
+
+bridge::EthAddress ParseEvmAddress(const UniValue& value, const std::string& name)
+{
+    const std::string hex{EvmHexDigits(value, name)};
+    if (hex.size() != 40 || !IsHex(hex)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, name + " must be a 20-byte hexadecimal address");
+    }
+    const std::vector<unsigned char> bytes{ParseHex(hex)};
+    bridge::EthAddress out;
+    std::copy(bytes.begin(), bytes.end(), out.begin());
+    return out;
+}
+
+//! An eth_getProof storage key: a 32-byte word, also accepted as a shorter
+//! quantity ("0x0"), which it left-pads.
+bridge::StorageWord ParseStorageKey(const UniValue& value, const std::string& name)
+{
+    std::string hex{EvmHexDigits(value, name)};
+    if (hex.empty() || hex.size() > 64) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, name + " must be a storage key of at most 32 hexadecimal bytes");
+    }
+    hex.insert(0, 64 - hex.size(), '0');
+    if (!IsHex(hex)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, name + " must be a storage key of at most 32 hexadecimal bytes");
+    }
+    const std::vector<unsigned char> bytes{ParseHex(hex)};
+    bridge::StorageWord out;
+    std::copy(bytes.begin(), bytes.end(), out.begin());
+    return out;
+}
+
+//! A proof node list (eth_getProof accountProof or storageProof[i].proof).
+std::vector<std::vector<unsigned char>> ParseProofNodes(const UniValue& value, const std::string& name)
+{
+    if (!value.isArray()) {
+        throw JSONRPCError(RPC_TYPE_ERROR, name + " must be an array of hexadecimal trie nodes");
+    }
+    if (value.size() > bridge::MAX_BRIDGE_MPT_NODES) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           strprintf("%s has %u nodes; a kind 9 node list holds at most %u", name, value.size(),
+                                     bridge::MAX_BRIDGE_MPT_NODES));
+    }
+    std::vector<std::vector<unsigned char>> nodes;
+    nodes.reserve(value.size());
+    for (size_t i{0}; i < value.size(); ++i) {
+        const std::string node_name{strprintf("%s[%u]", name, i)};
+        const std::string hex{EvmHexDigits(value[i], node_name)};
+        if (!IsHex(hex)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, node_name + " must be non-empty hexadecimal bytes");
+        }
+        nodes.push_back(ParseHex(hex));
+    }
+    return nodes;
+}
+
+/**
+ * The account proofs of a kind 9 record from eth_getProof results, which
+ * must name exactly the plan's accounts and storage keys, in order. Fields
+ * other than address, accountProof and storageProof[].{key, proof} are
+ * ignored: the record carries only the trie nodes, and the values come from
+ * verifying them.
+ */
+std::vector<bridge::BridgeEthAccountProofV2> ParseObservationProofs(
+    const UniValue& proofs, const std::vector<bridge::ObservationAccountRequest>& plan)
+{
+    if (!proofs.isArray()) {
+        throw JSONRPCError(RPC_TYPE_ERROR, "proofs must be an array of eth_getProof results");
+    }
+    if (proofs.size() != plan.size()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           strprintf("proofs holds %u eth_getProof results; this subject's plan has %u accounts",
+                                     proofs.size(), plan.size()));
+    }
+    std::vector<bridge::BridgeEthAccountProofV2> accounts;
+    for (size_t i{0}; i < plan.size(); ++i) {
+        const bridge::ObservationAccountRequest& request{plan[i]};
+        const std::string role{bridge::ObservationAccountRoleName(request.role)};
+        const std::string name{strprintf("proofs[%u]", i)};
+        const UniValue& result{proofs[i]};
+        if (!result.isObject()) {
+            throw JSONRPCError(RPC_TYPE_ERROR, name + " must be an eth_getProof result object");
+        }
+        if (ParseEvmAddress(result.find_value("address"), name + ".address") != request.address) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               strprintf("%s.address is not the plan's %s %s", name, role, EvmHex(request.address)));
+        }
+        bridge::BridgeEthAccountProofV2 account;
+        account.account_nodes = ParseProofNodes(result.find_value("accountProof"), name + ".accountProof");
+        const UniValue& storage{result.find_value("storageProof")};
+        if (!storage.isArray()) {
+            throw JSONRPCError(RPC_TYPE_ERROR, name + ".storageProof must be an array");
+        }
+        if (storage.size() != request.slots.size()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               strprintf("%s.storageProof proves %u slots; the plan's %s needs %u", name,
+                                         storage.size(), role, request.slots.size()));
+        }
+        for (size_t j{0}; j < storage.size(); ++j) {
+            const std::string slot_name{strprintf("%s.storageProof[%u]", name, j)};
+            if (!storage[j].isObject()) {
+                throw JSONRPCError(RPC_TYPE_ERROR, slot_name + " must be an object");
+            }
+            if (ParseStorageKey(storage[j].find_value("key"), slot_name + ".key") != request.slots[j]) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("%s.key is not the plan's slot %s", slot_name,
+                                                                    EvmHex(request.slots[j])));
+            }
+            std::vector<std::vector<unsigned char>> nodes{
+                ParseProofNodes(storage[j].find_value("proof"), slot_name + ".proof")};
+            // An account without storage: some clients (anvil among them)
+            // prove a slot with the empty trie's only node, 0x80, whose hash
+            // is the empty root. Consensus takes only the canonical empty
+            // proof there (bridge/state_proof.h refuses nodes for the empty
+            // root), and 0x80 alone can prove nothing else, so it is dropped.
+            if (nodes.size() == 1 && nodes[0] == std::vector<unsigned char>{0x80}) nodes.clear();
+            account.storage_nodes.push_back(std::move(nodes));
+        }
+        accounts.push_back(std::move(account));
+    }
+    return accounts;
+}
+
+} // namespace
+
+static RPCHelpMan getbridgev2info()
+{
+    return RPCHelpMan{
+        "getbridgev2info",
+        "Bridge V2 configuration and active-chain state for its one fresh Ethereum vault: V and W2, the\n"
+        "vault entry, its bUSD V2 AssetId and entry id, caps, the Verifier V2 pins, the separate V2\n"
+        "light-client store, namespace-2 nullifiers, the V2 withdrawal tree, the V2 burn gate (node\n"
+        "changes section 8.4 rows C1-C4 and E1-E8), the latest kind 9 Ethereum state observations, the\n"
+        "vault entry's reserve ledger, the sticky conflict, whether B3 has closed deposits for good, and\n"
+        "the eth_getProof plan for the next observations (buildbridgeobservationv2). A pinned B-23\n"
+        "successor vault entry (node changes section 7.6) adds retired, deposit_vault and successor:\n"
+        "from its migration height the launch entry is retired and the successor takes deposits and\n"
+        "burns, and kind 16 VAULT_SWEEP records move the launch entry's reserve to it. Configured only by\n"
+        "the regtest-only -b3bridgepins v2 section (every other chain returns an error); getbridgeinfo\n"
+        "keeps reporting the V1 bridge.\n"
+        "Ethereum-facing values are 0x-prefixed EVM-order bytes; B3 ids and block hashes without an _evm\n"
+        "suffix are in ordinary display order. Amounts are raw six-decimal units. No private key material\n"
+        "is returned.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "Bridge V2 status",
+                  {
+                      {RPCResult::Type::BOOL, "configured", "Whether the bridge V2 envelope is complete (V2 rules stay inactive otherwise)"},
+                      {RPCResult::Type::NUM, "activation_height", "V: first height of V2 records, the V2 light-client store and the V2 withdrawal tree (the Verifier V2 BRIDGE_ACTIVATION_HEIGHT)"},
+                      {RPCResult::Type::NUM, "burn_height", "W2 (>= V): first height of V2 burns"},
+                      {RPCResult::Type::NUM, "next_height", "Height evaluated by active, burns_active, mint_epoch and burn_gate"},
+                      {RPCResult::Type::BOOL, "active", "Whether V2 rules are active for the next block"},
+                      {RPCResult::Type::BOOL, "burns_active", "Whether V2 burns are active for the next block (height >= W2)"},
+                      {RPCResult::Type::BOOL, "retired", /*optional=*/true, "With a pinned successor only: whether the launch vault entry is retired for the next block (next_height >= successor.migration_height); a retired entry takes no new burns, and its later proven deposits are swept to the successor"},
+                      {RPCResult::Type::STR_HEX, "deposit_vault", /*optional=*/true, "With a pinned successor only: the Vault V2 address that takes new deposits for the next block (vault below successor.migration_height, successor.vault from it), as getbridgedepositrecipient returns it"},
+                      {RPCResult::Type::NUM, "origin_chain_id", "Ethereum chain id of the vault entry"},
+                      {RPCResult::Type::STR_HEX, "vault", "Vault V2 address"},
+                      {RPCResult::Type::STR_HEX, "vault_runtime_code_hash", /*optional=*/true, "Pinned Vault V2 extcodehash (absent while unpinned, see unpinned)"},
+                      {RPCResult::Type::STR_HEX, "token", "Origin token address"},
+                      {RPCResult::Type::STR_HEX, "token_runtime_code_hash", "Pinned origin-token extcodehash"},
+                      {RPCResult::Type::NUM, "origin_deployment_block", "First Ethereum block relayers must scan for vault events"},
+                      {RPCResult::Type::STR_HEX, "verifier", "B3FinalityVerifierV2 address"},
+                      {RPCResult::Type::STR_HEX, "verifier_runtime_code_hash", /*optional=*/true, "Pinned Verifier V2 extcodehash (absent while unpinned, see unpinned)"},
+                      {RPCResult::Type::NUM, "min_bridge_validators", "Verifier V2 MIN_BRIDGE_VALIDATORS"},
+                      {RPCResult::Type::NUM, "max_bridge_validators", "Verifier V2 MAX_BRIDGE_VALIDATORS"},
+                      {RPCResult::Type::NUM, "min_bridge_total_weight", "Verifier V2 MIN_BRIDGE_TOTAL_WEIGHT in whole modern B3"},
+                      {RPCResult::Type::NUM, "verifier_max_epoch_lag", /*optional=*/true, "Pinned Verifier V2 MAX_EPOCH_LAG in seconds, equal to the burn gate's set expiry (absent while unpinned, see unpinned)"},
+                      {RPCResult::Type::NUM, "max_deposit_raw", "Largest admitted deposit (raw six-decimal units)"},
+                      {RPCResult::Type::NUM, "max_per_block", "Raw bUSD V2 mint cap per block"},
+                      {RPCResult::Type::NUM, "max_per_epoch", "Raw bUSD V2 mint cap per epoch"},
+                      {RPCResult::Type::NUM, "epoch_length_blocks", "B3 blocks per V2 mint-cap epoch, counted from V"},
+                      {RPCResult::Type::STR_HEX, "asset_id", /*optional=*/true, "bUSD V2 AssetId (display order)"},
+                      {RPCResult::Type::STR_HEX, "asset_id_evm", /*optional=*/true, "Raw bUSD V2 AssetId bytes (Vault V2 B3_ASSET_ID)"},
+                      {RPCResult::Type::STR_HEX, "vault_entry_id", /*optional=*/true, "Vault entry id (display order): the registry_id that kind 3 mint and kind 6 burn records name"},
+                      {RPCResult::Type::STR_HEX, "vault_entry_id_evm", /*optional=*/true, "Raw vault entry id bytes as carried by the records"},
+                      {RPCResult::Type::STR_HEX, "registry_id_evm", /*optional=*/true, "Raw registry id V2 bytes (approval identity over every pin but V and W2; records never name it)"},
+                      {RPCResult::Type::ARR, "unpinned", "Pins this envelope leaves unset (OI-3)",
+                       {{RPCResult::Type::STR, "", "Pin name"}}},
+                      {RPCResult::Type::STR, "unpinned_note", "Why those pins are unset"},
+                      {RPCResult::Type::BOOL, "state_available", "Whether the bridge index is synced to the active tip"},
+                      {RPCResult::Type::OBJ, "light_client", "V2 light-client pins and the separate V2 store (empty below V)",
+                       {
+                           {RPCResult::Type::STR_HEX, "trusted_checkpoint_root", "Pinned Ethereum beacon checkpoint root"},
+                           {RPCResult::Type::NUM, "trusted_checkpoint_slot", "Pinned Ethereum beacon checkpoint slot"},
+                           {RPCResult::Type::STR_HEX, "genesis_validators_root", "Pinned Ethereum genesis validators root"},
+                           {RPCResult::Type::NUM, "fork_schedule_valid_through_epoch", "Last Ethereum epoch covered by the pinned fork schedule"},
+                           {RPCResult::Type::BOOL, "bootstrapped", "Whether a kind 1 bootstrap connected the V2 store"},
+                           {RPCResult::Type::NUM, "period", /*optional=*/true, "Current Ethereum sync-committee period"},
+                           {RPCResult::Type::NUM, "finalized_beacon_slot", /*optional=*/true, "Latest finalized Ethereum beacon slot"},
+                           {RPCResult::Type::STR_HEX, "finalized_beacon_root", /*optional=*/true, "SSZ root of the latest finalized beacon header"},
+                           {RPCResult::Type::NUM, "finalized_execution_block", /*optional=*/true, "Latest finalized Ethereum execution block"},
+                           {RPCResult::Type::STR_HEX, "finalized_execution_hash", /*optional=*/true, "Latest finalized Ethereum execution hash"},
+                           {RPCResult::Type::NUM, "connected_height", /*optional=*/true, "B3 height of the latest V2 store change"},
+                           {RPCResult::Type::STR_HEX, "connected_block", /*optional=*/true, "B3 block of the latest V2 store change"},
+                           {RPCResult::Type::NUM, "anchors", "Retained V2 execution anchors"},
+                       }},
+                      {RPCResult::Type::NUM, "nullifiers", "Deposits minted as bUSD V2 (nullifier namespace 2)"},
+                      {RPCResult::Type::NUM, "mint_epoch", /*optional=*/true, "V2 mint-cap epoch of the next block, (next_height - V) / epoch_length_blocks"},
+                      {RPCResult::Type::NUM, "epoch_minted", /*optional=*/true, "Raw bUSD V2 minted in mint_epoch so far"},
+                      {RPCResult::Type::NUM, "withdrawals", "Confirmed V2 burns (leaves V2 appended)"},
+                      {RPCResult::Type::STR_HEX, "withdrawal_root_evm", /*optional=*/true, "V2 withdrawal-tree root at the active tip"},
+                      {RPCResult::Type::STR_HEX, "empty_withdrawal_root_evm", "Root of the empty depth-32 tree (non-zero; signed from V until the first burn)"},
+                      {RPCResult::Type::OBJ, "burn_gate", "V2 burn gate (node changes section 8.4 rows C1-C4 and E1-E8), evaluated as the mempool does: on the fresh lineage projected for the next block, the connected kind 9 observations and the sticky conflict, at the mempool's candidate time max(now, median time past + 1). It is the gate of the entry that takes burns: the launch entry, or from a successor's migration height the successor, whose E7 and E8 read TOKEN_FLAGS_SUCCESSOR and RESERVE_E_SUCCESSOR. A burn also needs burns_active, the gate READY again at its position in a block (after that block's earlier kind 9 records), and the per-burn reserve and wind-down bounds (reserve, or successor.reserve), and the mempool refuses one whose gate closes within its close margin",
+                       BridgeV2GateResults()},
+                      {RPCResult::Type::OBJ, "deposits", "Whether B3 has closed bridge V2 deposits for good (node changes section 8.5), on the lineage the gate reads: a sticky conflict (kind 13, E5 or E8), a broken fresh lineage, or a latest VERIFIER_E showing the verifier halted, cancelled or expired at the observation, or Verifier V2 depositsClosed. B3 still mints every proven deposit (the vault cannot refund), so a deposit made after the close mints bUSD V2 that can never be redeemed; wallets (getbridgedepositrecipient) and relayers refuse deposits and flushes once it is CLOSED_FOR_GOOD. OPEN only means B3 has not closed them: it does not mean Verifier V2 depositsOpen() is true",
+                       {
+                           {RPCResult::Type::STR, "status", "OPEN, CLOSED_FOR_GOOD or UNAVAILABLE (bridge V2 rules inactive for the next block, or no bridge state or lineage at the active tip)"},
+                           {RPCResult::Type::STR, "reason", /*optional=*/true, "CLOSED_FOR_GOOD: why B3 closed deposits; UNAVAILABLE: why the status cannot be evaluated"},
+                       }},
+                      {RPCResult::Type::OBJ, "observations", "Latest connected kind 9 observation per subject (empty while the bridge state is unavailable)",
+                       {
+                           ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_VERIFIER),
+                           ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_RESERVE),
+                           ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS),
+                           ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_RESERVE_SUCCESSOR),
+                           ObservationRecordResult(bridge::ETH_OBSERVATION_SUBJECT_TOKEN_FLAGS_SUCCESSOR),
+                       }},
+                      {RPCResult::Type::OBJ, "reserve", /*optional=*/true, "The launch vault entry's reserve ledger (node changes sections 7.1-7.2 and 7.6; absent while the bridge state is unavailable); a vault sweep counts in its burned",
+                       ReserveLedgerResults()},
+                      {RPCResult::Type::OBJ, "successor", /*optional=*/true, "The B-23 successor vault entry v' (node changes sections 3.2 and 7.6), present only when the envelope pins one. It shares the launch entry's chain, token, decimals, caps and bUSD V2 AssetId; from migration_height the launch entry is retired and v' takes deposits and burns",
+                       {
+                           {RPCResult::Type::STR_HEX, "vault", "Successor Vault V2 address"},
+                           {RPCResult::Type::STR_HEX, "vault_runtime_code_hash", /*optional=*/true, "Pinned successor Vault V2 extcodehash (absent while unpinned, see unpinned)"},
+                           {RPCResult::Type::STR_HEX, "predecessor", "The launch vault the successor names as its predecessor (vault)"},
+                           {RPCResult::Type::STR_HEX, "asset_id_evm", "Raw bUSD V2 AssetId bytes the successor carries (its B3_ASSET_ID, equal to asset_id_evm)"},
+                           {RPCResult::Type::STR_HEX, "vault_entry_id", /*optional=*/true, "Successor vault entry id (display order): the registry_id kind 3 mint and kind 6 burn records name for it from migration_height"},
+                           {RPCResult::Type::STR_HEX, "vault_entry_id_evm", /*optional=*/true, "Raw successor vault entry id bytes as carried by the records"},
+                           {RPCResult::Type::NUM, "origin_deployment_block", "First Ethereum block relayers must scan for the successor's events"},
+                           {RPCResult::Type::NUM, "max_deposit_raw", "Largest deposit into the successor that B3 admits (raw six-decimal units)"},
+                           {RPCResult::Type::NUM, "migration_height", "h_m: first height at which the launch entry is retired and the successor takes deposits, burns and its kind 9 subjects"},
+                           {RPCResult::Type::BOOL, "active", "Whether the migration is active for the next block (next_height >= migration_height)"},
+                           {RPCResult::Type::OBJ, "reserve", /*optional=*/true, "The successor's reserve ledger (absent while the bridge state is unavailable): a sweep adds to its transit, which a RESERVE_E_SUCCESSOR observation credits only up to the successor's observed absorbedTotal",
+                            ReserveLedgerResults()},
+                           {RPCResult::Type::OBJ, "sweep", "The kind 16 VAULT_SWEEP record (node changes section 7.6): one leaf V2 naming the launch vault and paying the successor vault the launch entry's reserve, capped by the wind-down headroom of the launch entry's latest RESERVE_E (the migration leaf first, later whatever remains: deposits proven into the retired vault since, or a part an earlier headroom held back), allowed only from migration_height while the launch entry's gate would be READY but for retirement; submit it with submitbridgecarrier and prove its leaf with getbridgewithdrawalproofv2 at the carrier's binding output",
+                            {
+                                {RPCResult::Type::STR_HEX, "payload_hex", /*optional=*/true, "Canonical type-10 v1 payload for submitbridgecarrier (34 bytes: kind 16, 0, the launch vault_entry_id_evm); every sweep is this same record"},
+                                {RPCResult::Type::NUM, "amount", /*optional=*/true, "With the migration active and the bridge state available: what a sweep in the next block would move, the launch entry's reserve capped by the wind-down headroom of its latest RESERVE_E (0: the reserve or the headroom is not positive, nothing to sweep now; absent while the reserve is positive and no launch RESERVE_E is connected)"},
+                                {RPCResult::Type::OBJ, "gate", /*optional=*/true, "With the migration active: the launch entry's burn gate but for retirement (subjects 1, 2 and 3, the shared lineage and sticky conflict), evaluated as burn_gate is; a sweep also needs it READY at its position in a block and a positive amount",
+                                 BridgeV2GateResults()},
+                            }},
+                       }},
+                      {RPCResult::Type::OBJ, "conflict", /*optional=*/true, "The sticky bridge V2 conflict closing the gate (row C4); absent when none is set",
+                       {
+                           {RPCResult::Type::STR, "reason", "E5 (a LIVE VERIFIER_E whose latestCertId is not B3's statement), E8 (a RESERVE_E failing invariant R) or kind13 (FINALITY_CONFLICT evidence: a digest-V2 certificate of the lineage's current or next committee differing from B3's statement)"},
+                           {RPCResult::Type::NUM, "height", "B3 height of the block that set it"},
+                           {RPCResult::Type::STR_HEX, "block", "That B3 block"},
+                           {RPCResult::Type::NUM, "anchor_block", "Ethereum execution block of the observation that set it (0 for kind13)"},
+                           {RPCResult::Type::STR_HEX, "evidence_cert_id_evm", /*optional=*/true, "kind13 only: certId (keccak256 of the FinalizedBlockV2) of the conflicting certificate"},
+                           {RPCResult::Type::NUM, "evidence_checkpoint_index", /*optional=*/true, "kind13 only: its checkpoint index"},
+                           {RPCResult::Type::NUM, "evidence_epoch", /*optional=*/true, "kind13 only: its epoch (the signing committee's)"},
+                       }},
+                      {RPCResult::Type::OBJ, "observation_plan", "What the next kind 9 observations prove: call eth_getProof(address, slots, anchor.number) for each account of a subject, in order, and pass the results to buildbridgeobservationv2 with anchor.hash_evm",
+                       {
+                           {RPCResult::Type::OBJ, "anchor", /*optional=*/true, "Newest retained V2 execution anchor carrying a state root (absent without one)",
+                            {
+                                {RPCResult::Type::STR_HEX, "hash_evm", "Ethereum execution block hash (raw bytes)"},
+                                {RPCResult::Type::NUM, "number", "Ethereum execution block number"},
+                                {RPCResult::Type::NUM, "timestamp", "Ethereum execution timestamp, the t_obs of observations proven against it"},
+                                {RPCResult::Type::NUM, "connected_height", "B3 height that retained the anchor"},
+                                {RPCResult::Type::STR_HEX, "connected_block", "B3 block that retained the anchor"},
+                            }},
+                           {RPCResult::Type::ARR, "subjects", "One entry per kind 9 subject the next block may carry: 1-3, and from a successor's migration height also 18 (RESERVE_E_SUCCESSOR) and 19 (TOKEN_FLAGS_SUCCESSOR), planned with the successor vault",
+                            {
+                                {RPCResult::Type::OBJ, "", "",
+                                 {
+                                     {RPCResult::Type::NUM, "subject", "Kind 9 subject number (buildbridgeobservationv2 subject)"},
+                                     {RPCResult::Type::STR, "name", "VERIFIER_E, RESERVE_E, TOKEN_FLAGS, RESERVE_E_SUCCESSOR or TOKEN_FLAGS_SUCCESSOR"},
+                                     {RPCResult::Type::NUM, "latest_anchor_block", /*optional=*/true, "Anchor block of the subject's latest observation"},
+                                     {RPCResult::Type::BOOL, "anchor_is_newer", /*optional=*/true, "With an anchor: whether it is newer than the subject's latest observation, as a new one must be"},
+                                     {RPCResult::Type::ARR, "accounts", "eth_getProof calls, in record order",
+                                      {
+                                          {RPCResult::Type::OBJ, "", "",
+                                           {
+                                               {RPCResult::Type::STR, "role", "verifier, vault or token"},
+                                               {RPCResult::Type::STR_HEX, "address", "Account address (pinned)"},
+                                               {RPCResult::Type::ARR, "slots", "Storage keys, in order",
+                                                {{RPCResult::Type::STR_HEX, "", "32-byte storage key"}}},
+                                           }},
+                                      }},
+                                 }},
+                            }},
+                       }},
+                  }},
+        RPCExamples{HelpExampleCli("getbridgev2info", "") + HelpExampleRpc("getbridgev2info", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            const Consensus::BridgeV2Params& v2{EnsureBridgeV2Configured(consensus)};
+            const Consensus::BridgeV2VaultEntry& entry{v2.vault};
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("configured", v2.Valid());
+            result.pushKV("activation_height", v2.activation_height);
+            result.pushKV("burn_height", v2.burn_height);
+            result.pushKV("origin_chain_id", entry.origin_chain_id);
+            result.pushKV("vault", EvmHex(entry.vault_address));
+            if (entry.vault_runtime_code_hash) {
+                result.pushKV("vault_runtime_code_hash", EvmHex(*entry.vault_runtime_code_hash));
+            }
+            result.pushKV("token", EvmHex(entry.token_address));
+            result.pushKV("token_runtime_code_hash", EvmHex(entry.token_runtime_code_hash));
+            result.pushKV("origin_deployment_block", entry.origin_deployment_block);
+            result.pushKV("verifier", EvmHex(v2.verifier.address));
+            if (v2.verifier.runtime_code_hash) {
+                result.pushKV("verifier_runtime_code_hash", EvmHex(*v2.verifier.runtime_code_hash));
+            }
+            result.pushKV("min_bridge_validators", v2.verifier.min_bridge_validators);
+            result.pushKV("max_bridge_validators", v2.verifier.max_bridge_validators);
+            result.pushKV("min_bridge_total_weight", v2.verifier.min_bridge_total_weight);
+            if (v2.verifier.max_epoch_lag_seconds) {
+                result.pushKV("verifier_max_epoch_lag", *v2.verifier.max_epoch_lag_seconds);
+            }
+            result.pushKV("max_deposit_raw", entry.max_deposit_raw);
+            result.pushKV("max_per_block", entry.mint_caps.max_per_block);
+            result.pushKV("max_per_epoch", entry.mint_caps.max_per_epoch);
+            result.pushKV("epoch_length_blocks", entry.mint_caps.epoch_length_blocks);
+            const auto asset{modern::ConfiguredBridgeV2AssetId(consensus)};
+            if (asset) {
+                result.pushKV("asset_id", asset->GetHex());
+                result.pushKV("asset_id_evm", EvmHex(*asset));
+            }
+            if (const auto entry_id{modern::ConfiguredBridgeV2EntryId(consensus)}) {
+                result.pushKV("vault_entry_id", entry_id->GetHex());
+                result.pushKV("vault_entry_id_evm", EvmHex(*entry_id));
+            }
+            if (const auto registry_id{modern::ConfiguredBridgeV2RegistryId(consensus)}) {
+                result.pushKV("registry_id_evm", EvmHex(*registry_id));
+            }
+            UniValue unpinned{UniValue::VARR};
+            if (!entry.vault_runtime_code_hash) unpinned.push_back("vault_runtime_code_hash");
+            if (!v2.verifier.runtime_code_hash) unpinned.push_back("verifier_runtime_code_hash");
+            if (!v2.verifier.max_epoch_lag_seconds) unpinned.push_back("verifier_max_epoch_lag");
+            if (v2.successor && !v2.successor->entry.vault_runtime_code_hash) {
+                unpinned.push_back("successor_vault_runtime_code_hash");
+            }
+            unpinned.push_back("lineage_id");
+            result.pushKV("unpinned", std::move(unpinned));
+            result.pushKV("unpinned_note",
+                          "OI-3: the Vault V2 and Verifier V2 runtime code and the fresh lineage id commit to "
+                          "blockHash(R_f - 1), which does not exist before the first block at or above A, so a "
+                          "regtest pin file supplied before first start cannot carry them. B3 checks the "
+                          "contracts through the certificates and leaves they accept; every one of these pins "
+                          "is required before any non-regtest activation.");
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            const int next_height{tip ? tip->nHeight + 1 : 0};
+            const bool active{consensus.BridgeV2RulesActive(next_height)};
+            // B-23 (node changes section 7.6): from h_m the launch entry is
+            // retired and the successor takes deposits and burns.
+            const bool migration_active{consensus.BridgeV2MigrationActive(next_height)};
+            result.pushKV("next_height", next_height);
+            result.pushKV("active", active);
+            result.pushKV("burns_active", consensus.BridgeV2BurnRulesActive(next_height));
+            if (v2.successor) {
+                result.pushKV("retired", migration_active);
+                const Consensus::BridgeV2VaultEntry* deposit_entry{
+                    v2.Entry(modern::ActiveBridgeV2Role(consensus, next_height))};
+                result.pushKV("deposit_vault", EvmHex(deposit_entry->vault_address));
+            }
+
+            bool state_available{false};
+            const node::BridgeStateIndex* index{nullptr};
+            if (tip != nullptr) {
+                node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
+                state_available = tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip);
+                if (state_available) index = &tracker.Index();
+            }
+            result.pushKV("state_available", state_available);
+
+            UniValue light{UniValue::VOBJ};
+            light.pushKV("trusted_checkpoint_root", EvmHex(v2.light_client.trusted_checkpoint_root));
+            light.pushKV("trusted_checkpoint_slot", v2.light_client.trusted_checkpoint_slot);
+            light.pushKV("genesis_validators_root", EvmHex(v2.light_client.genesis_validators_root));
+            light.pushKV("fork_schedule_valid_through_epoch", v2.light_client.fork_schedule_valid_through_epoch);
+            light.pushKV("bootstrapped", index && index->LightClientV2().has_value());
+            if (index && index->LightClientV2()) {
+                const bridge::LightClientStore& store{*index->LightClientV2()};
+                const bridge::LightClientHeader& finalized{store.finalized_header};
+                light.pushKV("period", store.period);
+                light.pushKV("finalized_beacon_slot", finalized.beacon.slot);
+                light.pushKV("finalized_beacon_root", EvmHex(finalized.beacon.HashTreeRoot()));
+                light.pushKV("finalized_execution_block", finalized.execution.block_number);
+                light.pushKV("finalized_execution_hash", EvmHex(finalized.execution.block_hash));
+                if (const auto& connection{index->LightClientV2LastConnected()}) {
+                    light.pushKV("connected_height", connection->height);
+                    light.pushKV("connected_block", connection->block_hash.GetHex());
+                }
+            }
+            light.pushKV("anchors", index ? static_cast<uint64_t>(index->AnchorCountV2()) : 0);
+            result.pushKV("light_client", std::move(light));
+
+            result.pushKV("nullifiers",
+                          index ? static_cast<uint64_t>(index->NullifierCount(bridge::BRIDGE_NULLIFIER_NAMESPACE_V2))
+                                : 0);
+            if (index && active && asset && entry.mint_caps.epoch_length_blocks > 0) {
+                const uint64_t epoch{static_cast<uint64_t>(next_height - v2.activation_height) /
+                                     entry.mint_caps.epoch_length_blocks};
+                result.pushKV("mint_epoch", epoch);
+                result.pushKV("epoch_minted", index->EpochMinted(*asset, epoch));
+            }
+            result.pushKV("withdrawals", index ? static_cast<uint64_t>(index->WithdrawalV2Count()) : 0);
+            if (index) result.pushKV("withdrawal_root_evm", EvmHex(index->WithdrawalTreeV2().root));
+            result.pushKV("empty_withdrawal_root_evm",
+                          EvmHex(modern::WithdrawalZeroHashes()[modern::WITHDRAWAL_TREE_DEPTH]));
+
+            // The fresh lineage projected for the next block from the synced
+            // tip, as the mempool builds it; the burn gate and the deposit
+            // status read it.
+            std::string lineage_reason{"the bridge state is unavailable at the active tip"};
+            std::optional<node::BridgeV2LineageContext> lineage;
+            if (state_available && index) {
+                lineage = node::MakeBridgeV2LineageContext(chainstate.ModernFinality(), chainstate.m_chain,
+                                                           chainstate.m_blockman, consensus, *tip, *index,
+                                                           lineage_reason);
+            }
+
+            // The mempool's V2 burn gate (validation.cpp): that lineage, the
+            // connected kind 9 observations and the sticky conflict, at the
+            // mempool's candidate time. It is the gate of the entry that
+            // takes burns (the successor from h_m).
+            const bool gate_evaluable{state_available && index && lineage};
+            const int64_t candidate_time{
+                gate_evaluable ? std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1) : 0};
+            std::optional<node::BridgeV2GateResult> burn_gate;
+            if (gate_evaluable) {
+                burn_gate = node::EvaluateBridgeV2BurnGate(&*lineage, *index, consensus, next_height, candidate_time);
+            }
+            result.pushKV("burn_gate", BridgeV2GateJson(burn_gate, lineage_reason));
+
+            // Whether B3 has closed deposits for good (node changes section
+            // 8.5): a closing row outranks an unavailable lineage, as in the
+            // wallet's interfaces::Chain::bridgeV2DepositStatus.
+            UniValue deposits{UniValue::VOBJ};
+            {
+                std::optional<std::string> closed;
+                if (state_available && index && active) {
+                    closed = node::BridgeV2DepositsClosedReason(*index, lineage ? &*lineage : nullptr, consensus);
+                }
+                if (closed) {
+                    deposits.pushKV("status", "CLOSED_FOR_GOOD");
+                    deposits.pushKV("reason", *closed);
+                } else if (!active) {
+                    deposits.pushKV("status", "UNAVAILABLE");
+                    deposits.pushKV("reason", "bridge V2 rules are not active for the next block");
+                } else if (!lineage) {
+                    deposits.pushKV("status", "UNAVAILABLE");
+                    deposits.pushKV("reason", lineage_reason);
+                } else {
+                    deposits.pushKV("status", "OPEN");
+                }
+            }
+            result.pushKV("deposits", std::move(deposits));
+
+            // Kind 9 observations, the reserve ledger and the sticky conflict
+            // (node changes sections 7.1-7.2, 7.6 and 8.2-8.5).
+            UniValue observations{UniValue::VOBJ};
+            if (index) {
+                for (const uint8_t subject : BRIDGE_V2_OBSERVATION_SUBJECT_LIST) {
+                    if (const auto record{index->LatestObservationV2(subject)}) {
+                        observations.pushKV(ObservationSubjectKey(subject), ObservationRecordJson(*record));
+                    }
+                }
+            }
+            result.pushKV("observations", std::move(observations));
+            if (index) {
+                result.pushKV("reserve", ReserveLedgerJson(*index, v2, Consensus::BridgeV2EntryRole::LAUNCH));
+                if (const auto& conflict{index->ConflictV2()}) {
+                    UniValue c{UniValue::VOBJ};
+                    c.pushKV("reason", BridgeV2ConflictName(conflict->reason));
+                    c.pushKV("height", conflict->height);
+                    c.pushKV("block", conflict->block_hash.GetHex());
+                    c.pushKV("anchor_block", conflict->anchor_block);
+                    if (conflict->reason == bridge::BRIDGE_V2_CONFLICT_KIND13) {
+                        c.pushKV("evidence_cert_id_evm", EvmHex(conflict->evidence_cert_id));
+                        c.pushKV("evidence_checkpoint_index", conflict->evidence_checkpoint_index);
+                        c.pushKV("evidence_epoch", conflict->evidence_epoch);
+                    }
+                    result.pushKV("conflict", std::move(c));
+                }
+            }
+            if (v2.successor) {
+                // The B-23 successor v' (node changes section 7.6).
+                const Consensus::BridgeV2SuccessorEntry& s{*v2.successor};
+                UniValue successor{UniValue::VOBJ};
+                successor.pushKV("vault", EvmHex(s.entry.vault_address));
+                if (s.entry.vault_runtime_code_hash) {
+                    successor.pushKV("vault_runtime_code_hash", EvmHex(*s.entry.vault_runtime_code_hash));
+                }
+                successor.pushKV("predecessor", EvmHex(s.predecessor));
+                successor.pushKV("asset_id_evm", EvmHex(s.asset_id));
+                if (const auto successor_id{
+                        modern::ConfiguredBridgeV2EntryId(consensus, Consensus::BridgeV2EntryRole::SUCCESSOR)}) {
+                    successor.pushKV("vault_entry_id", successor_id->GetHex());
+                    successor.pushKV("vault_entry_id_evm", EvmHex(*successor_id));
+                }
+                successor.pushKV("origin_deployment_block", s.entry.origin_deployment_block);
+                successor.pushKV("max_deposit_raw", s.entry.max_deposit_raw);
+                successor.pushKV("migration_height", s.migration_height);
+                successor.pushKV("active", migration_active);
+                if (index) {
+                    successor.pushKV("reserve",
+                                     ReserveLedgerJson(*index, v2, Consensus::BridgeV2EntryRole::SUCCESSOR));
+                }
+                UniValue sweep{UniValue::VOBJ};
+                if (const auto payload{VaultSweepPayload(consensus)}) sweep.pushKV("payload_hex", HexStr(*payload));
+                if (migration_active) {
+                    // A sweep in the next block moves the launch entry's
+                    // reserve capped by the wind-down headroom of its
+                    // latest RESERVE_E (bridge::VaultSweepAmountV2), past
+                    // its gate but for retirement.
+                    if (index) {
+                        if (const auto amount{VaultSweepAmountJson(*index, v2)}) sweep.pushKV("amount", *amount);
+                    }
+                    std::optional<node::BridgeV2GateResult> sweep_gate;
+                    if (gate_evaluable) {
+                        sweep_gate = node::EvaluateBridgeV2SweepGate(&*lineage, *index, consensus, next_height,
+                                                                     candidate_time);
+                    }
+                    sweep.pushKV("gate", BridgeV2GateJson(sweep_gate, lineage_reason));
+                }
+                successor.pushKV("sweep", std::move(sweep));
+                result.pushKV("successor", std::move(successor));
+            }
+            result.pushKV("observation_plan", ObservationPlanJson(v2, migration_active, index));
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan buildbridgeobservationv2()
+{
+    return RPCHelpMan{
+        "buildbridgeobservationv2",
+        "Build the canonical bridge payload of a kind 9 ETH_STATE_OBSERVATION record (node changes\n"
+        "section 8.2) from eth_getProof results, for submitbridgecarrier. Take the subject's accounts and\n"
+        "storage keys from getbridgev2info observation_plan, call eth_getProof(address, slots, block) at\n"
+        "the anchor's execution block for each account, in order, and pass the results unchanged. The node\n"
+        "requires exactly the plan's accounts and keys, verifies every account and storage proof (zero\n"
+        "slots by exclusion) against the retained bridge V2 execution anchor's state root with the pinned\n"
+        "code hashes, records B3's VERIFIER_E verdict for the next block on the fresh lineage projected\n"
+        "from the active tip, and checks the record against the bridge state as the next block would at\n"
+        "the current time, so it refuses a record the mempool would refuse (an anchor not newer than the\n"
+        "subject's latest observation, a stale light client, an unjudgeable verifier). Addresses, slots\n"
+        "and values never travel in the record. The B-23 successor subjects 18 and 19 are accepted only\n"
+        "from the successor's migration height (getbridgev2info successor). Configured only by the\n"
+        "regtest-only -b3bridgepins v2 section (every other chain returns an error). No private key is\n"
+        "involved.\n",
+        {
+            {"subject", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "1 VERIFIER_E (Verifier V2 slots 0, 1, 2, 4, 6), 2 RESERVE_E (Vault V2 slots 0, 1, 3 and the "
+             "token's balances[vault]), 3 TOKEN_FLAGS (token slots 0, 10 and isBlackListed[vault]), or, from "
+             "a B-23 successor's migration height, 18 RESERVE_E_SUCCESSOR and 19 TOKEN_FLAGS_SUCCESSOR (the "
+             "same reads of the successor vault)"},
+            {"anchor_hash_evm", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Retained bridge V2 execution anchor carrying a state root, as a raw Ethereum block hash "
+             "(getbridgev2info observation_plan.anchor.hash_evm; optional 0x prefix)"},
+            {"proofs", RPCArg::Type::ARR, RPCArg::Optional::NO,
+             "eth_getProof results at the anchor's block, one per plan account, in plan order; other fields "
+             "of the results are ignored",
+             {
+                 {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "One eth_getProof result",
+                  {
+                      {"address", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The plan account's address"},
+                      {"accountProof", RPCArg::Type::ARR, RPCArg::Optional::NO, "State-trie nodes (1-64)",
+                       {{"node", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "RLP trie node"}}},
+                      {"storageProof", RPCArg::Type::ARR, RPCArg::Optional::NO, "One entry per plan slot, in order",
+                       {
+                           {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
+                            {
+                                {"key", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The plan slot (32 bytes, or a shorter quantity)"},
+                                {"proof", RPCArg::Type::ARR, RPCArg::Optional::NO, "Storage-trie nodes (0-64); for an account without storage the empty proof, or the empty trie's single node 0x80 as some clients return it (the record carries the empty proof)",
+                                 {{"node", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "RLP trie node"}}},
+                            }},
+                       }},
+                  }},
+             }},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Kind 9 record",
+                  {
+                      {RPCResult::Type::STR_HEX, "payload_hex", "Canonical type-10 v1 bridge payload for submitbridgecarrier"},
+                      {RPCResult::Type::NUM, "subject", "Kind 9 subject number"},
+                      {RPCResult::Type::STR, "name", "VERIFIER_E, RESERVE_E, TOKEN_FLAGS, RESERVE_E_SUCCESSOR or TOKEN_FLAGS_SUCCESSOR"},
+                      {RPCResult::Type::NUM, "verdict", "Recorded verdict: for a LIVE VERIFIER_E, B3's bit 0 SETS_MISMATCH (E4) and bit 1 CERT_CONFLICT (E5, which sets the sticky conflict when the record connects); otherwise 0"},
+                      {RPCResult::Type::NUM, "anchor_block", "Ethereum execution block of the anchor"},
+                      {RPCResult::Type::STR_HEX, "anchor_hash_evm", "The anchor's hash (raw bytes)"},
+                      {RPCResult::Type::NUM, "t_obs", "The anchor's execution timestamp, the observation time the gate ages"},
+                      {RPCResult::Type::NUM, "next_height", "B3 height the record was checked for"},
+                      {RPCResult::Type::OBJ, "values", "Decoded storage values and observed code hashes (the fields of the subject)",
+                       ObservedValueResults(std::nullopt)},
+                  }},
+        RPCExamples{HelpExampleCli("buildbridgeobservationv2",
+                                   "2 \"0x<anchor_hash>\" '[{\"address\":\"0x<vault>\",\"accountProof\":[\"0x<node>\"],"
+                                   "\"storageProof\":[{\"key\":\"0x<slot>\",\"proof\":[\"0x<node>\"]}]}, ...]'")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            const Consensus::BridgeV2Params& v2{EnsureBridgeV2Configured(consensus)};
+            if (!v2.Valid()) {
+                throw JSONRPCError(RPC_MISC_ERROR, "The bridge V2 configuration is incomplete; kind 9 records stay inactive");
+            }
+            const int64_t subject_number{request.params[0].getInt<int64_t>()};
+            if (subject_number < 0 || subject_number > std::numeric_limits<uint8_t>::max() ||
+                !node::BridgeObservationSlotV2(static_cast<uint8_t>(subject_number))) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "subject must be 1 (VERIFIER_E), 2 (RESERVE_E) or 3 (TOKEN_FLAGS), or from a "
+                                   "successor's migration height 18 (RESERVE_E_SUCCESSOR) or 19 "
+                                   "(TOKEN_FLAGS_SUCCESSOR)");
+            }
+            const uint8_t subject{static_cast<uint8_t>(subject_number)};
+            // B-23 successor subjects (node changes section 7.6) exist only
+            // from h_m; refuse them before reading proofs planned against a
+            // vault that is not active yet. The block check below repeats it
+            // at the definitive next height.
+            const bool successor_subject{IsSuccessorObservationSubject(subject)};
+            const auto require_successor_active{[&](const int next_height) {
+                if (!consensus.BridgeV2MigrationActive(next_height)) {
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        v2.successor ? strprintf("Successor observations are not active for the next block (height "
+                                                 "%d; successor migration height %d)",
+                                                 next_height, v2.successor->migration_height)
+                                     : std::string{"Successor observations are not active for the next block (no "
+                                                   "successor vault entry is pinned)"});
+                }
+            }};
+            if (successor_subject) {
+                require_successor_active(WITH_LOCK(cs_main, return chainman.ActiveChain().Height() + 1));
+            }
+            const uint256 anchor_hash{ParseEvmHash(request.params[1], "anchor_hash_evm")};
+            const bridge::ObservationPins pins{
+                bridge::ObservationPinsFromParams(v2, bridge::EthObservationEntryRole(subject))};
+            const std::vector<bridge::ObservationAccountRequest> plan{bridge::ObservationRequests(subject, pins)};
+            bridge::BridgeEthStateObservationV2 observation;
+            observation.subject = subject;
+            observation.anchor_hash = anchor_hash;
+            observation.accounts = ParseObservationProofs(request.params[2], plan);
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            if (tip == nullptr) throw JSONRPCError(RPC_MISC_ERROR, "The active chain has no tip");
+            const int next_height{tip->nHeight + 1};
+            if (!consensus.BridgeV2RulesActive(next_height)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   strprintf("Kind 9 records are not active for the next block (height %d; bridge V2 "
+                                             "activation height %d)",
+                                             next_height, v2.activation_height));
+            }
+            if (successor_subject) require_successor_active(next_height);
+            node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
+            if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) {
+                throw JSONRPCError(RPC_MISC_ERROR, "The bridge state is unavailable at the active tip");
+            }
+            const node::BridgeStateIndex& index{tracker.Index()};
+            const auto anchor{index.AnchorV2(anchor_hash)};
+            if (!anchor) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "anchor_hash_evm is not a retained bridge V2 execution anchor on the active chain");
+            }
+            if (anchor->state_root.IsNull()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "The anchor's execution header carried no state root");
+            }
+            std::string error;
+            const auto observed{bridge::VerifyEthStateObservationV2(observation, anchor->state_root, pins, error)};
+            if (!observed) {
+                throw JSONRPCError(RPC_VERIFY_ERROR, "The proofs do not verify against the anchor: " + error);
+            }
+
+            // The fresh lineage projected for the next block, as mempool
+            // admission builds it for every kind 9 record.
+            const auto lineage{node::MakeBridgeV2LineageContext(chainstate.ModernFinality(), chainstate.m_chain,
+                                                                chainstate.m_blockman, consensus, *tip, index,
+                                                                error)};
+            if (!lineage) {
+                throw JSONRPCError(RPC_MISC_ERROR, "The fresh finality lineage is unavailable at the active tip: " + error);
+            }
+            const auto* verifier{std::get_if<bridge::VerifierStateV2>(&*observed)};
+            if (verifier && verifier->status == bridge::VERIFIER_STATUS_LIVE) {
+                const auto verdict{node::VerifierVerdictV2(*verifier, *lineage, consensus, index, next_height, error)};
+                if (!verdict) {
+                    throw JSONRPCError(RPC_VERIFY_ERROR, "B3 cannot judge this VERIFIER_E observation: " + error);
+                }
+                observation.verdict = *verdict;
+            }
+
+            const bridge::BridgeRecordV1 record{bridge::BridgeRecordKindV1::ETH_STATE_OBSERVATION, observation};
+            const auto mpa{bridge::MakeBridgeMpaRecord(record, bridge::BRIDGE_MPT_LIMITS_V2)};
+            const auto binding{mpa ? modern::MakeBridgeBindingOutput(*mpa) : std::nullopt};
+            if (!mpa || !binding) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "The proofs exceed the kind 9 record limits (64 nodes of at most 1,024 bytes and "
+                                   "11,264 bytes per node list; 32 KiB per record)");
+            }
+            // The bridge state's own verdict for the next block, as wallet
+            // prevalidation runs it: a carrier-shaped probe with the binding
+            // output (its input is never looked up).
+            CMutableTransaction probe;
+            probe.version = CTransaction::CURRENT_VERSION;
+            probe.vin.resize(1);
+            probe.vin[0].prevout = COutPoint{Txid::FromUint256(uint256::ONE), 0};
+            probe.vout = {*binding};
+            probe.mpa = {*mpa};
+            const int64_t candidate_time{std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
+            node::BridgeTxAuthorization authorization;
+            if (!index.VerifyTransaction(CTransaction{probe}, next_height, candidate_time, consensus, authorization,
+                                         error, &*lineage)) {
+                throw JSONRPCError(RPC_VERIFY_REJECTED, "The next block would refuse this observation: " + error);
+            }
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("payload_hex", HexStr(mpa->payload));
+            result.pushKV("subject", int{subject});
+            result.pushKV("name", ObservationSubjectName(subject));
+            result.pushKV("verdict", int{observation.verdict});
+            result.pushKV("anchor_block", anchor->block_number);
+            result.pushKV("anchor_hash_evm", EvmHex(anchor->block_hash));
+            result.pushKV("t_obs", static_cast<int64_t>(anchor->execution_timestamp));
+            result.pushKV("next_height", next_height);
+            result.pushKV("values", ObservedValuesJson(*observed));
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan getbridgewithdrawalproofv2()
+{
+    return RPCHelpMan{
+        "getbridgewithdrawalproofv2",
+        "Build the exact B3VaultV2.release artifacts for a confirmed bUSD V2 burn, identified by its\n"
+        "stable transaction id and BURN output, under the fresh-lineage (digest V2) certificate carried\n"
+        "by certificate_block. The withdrawal id and leaf V2 come only from active-chain state, so an\n"
+        "unconfirmed or reorganized burn fails closed. The certificate is re-judged from validated block\n"
+        "data (as getfinalitylineagecertificate does) and must certify a height at or above the burn,\n"
+        "carry the active V2 withdrawal root and be signed by a committee the Verifier V2 pins qualify\n"
+        "to record a root. Relay that certificate first (getfinalitylineagecertificate); the vault then\n"
+        "pays under any root the verifier accepted at or above b3_height, once per withdrawal id. Every\n"
+        "leaf of the prefix, its active-chain connection and the root are recomputed. With a B-23\n"
+        "successor (node changes section 7.6) a leaf names the launch vault or the successor vault, and a\n"
+        "kind 16 VAULT_SWEEP leaf names the launch vault and pays the successor vault. Configured only\n"
+        "by the regtest-only -b3bridgepins v2 section. This RPC handles no Ethereum private key; the\n"
+        "account that submits the calldata pays gas.\n",
+        {
+            {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Confirmed B3 bridge V2 burn (or kind 16 vault-sweep carrier) transaction id"},
+            {"burn_vout", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Exact bUSD V2 BURN output index returned by bridgewithdraw; for a kind 16 vault sweep, the "
+             "carrier's binding output (binding_vout of submitbridgecarrier, 1)"},
+            {"certificate_block", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Active-chain block (hash or height) whose coinbase carries the fresh-lineage certificate",
+             RPCArgOptions{.skip_type_check = true, .type_str = {"", "string or numeric"}}},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "B3VaultV2 release artifacts",
+                  {
+                      {RPCResult::Type::NUM, "withdrawal_id", "Consensus-assigned V2 withdrawal id"},
+                      {RPCResult::Type::STR_HEX, "source_txid", "B3 burn transaction id"},
+                      {RPCResult::Type::NUM, "burn_output_index", "Exact bUSD V2 BURN output (a vault sweep's binding output)"},
+                      {RPCResult::Type::NUM, "b3_height", "B3 burn height (leaf b3Height)"},
+                      {RPCResult::Type::STR_HEX, "b3_block", "Active-chain burn block (display order)"},
+                      {RPCResult::Type::STR_HEX, "asset_id", "bUSD V2 AssetId (display order)"},
+                      {RPCResult::Type::STR_HEX, "asset_id_evm", "Raw AssetId bytes (Vault V2 B3_ASSET_ID)"},
+                      {RPCResult::Type::NUM, "destination_chain_id", "Ethereum chain id the leaf names"},
+                      {RPCResult::Type::STR_HEX, "vault", "Vault V2 address the leaf names"},
+                      {RPCResult::Type::STR_HEX, "token", "Origin token the leaf names"},
+                      {RPCResult::Type::STR_HEX, "recipient", "Ethereum recipient"},
+                      {RPCResult::Type::NUM, "amount_raw", "Raw six-decimal token amount"},
+                      {RPCResult::Type::BOOL, "sweep", /*optional=*/true, "With a pinned B-23 successor only: whether the leaf is a kind 16 vault sweep (it names the launch vault and pays the successor vault, which counts it once absorb() runs)"},
+                      {RPCResult::Type::STR_HEX, "leaf_preimage", "The 180-byte leaf V2 preimage"},
+                      {RPCResult::Type::STR_HEX, "withdrawal_leaf", "keccak256(leaf_preimage)"},
+                      {RPCResult::Type::STR_HEX, "withdrawal_root", "V2 withdrawal root the certificate carries"},
+                      {RPCResult::Type::ARR_FIXED, "path", "32 ordered siblings, leaf level first",
+                       {{RPCResult::Type::STR_HEX, "", "Sibling hash"}}},
+                      {RPCResult::Type::OBJ, "certificate", "The selected fresh-lineage certificate",
+                       {
+                           {RPCResult::Type::NUM, "inclusion_height", "B3 certificate inclusion height"},
+                           {RPCResult::Type::STR_HEX, "inclusion_block", "Inclusion hash (display order)"},
+                           {RPCResult::Type::NUM, "height", "FinalizedBlockV2.height, the certified checkpoint"},
+                           {RPCResult::Type::STR_HEX, "block_hash", "Certified hash (display order)"},
+                           {RPCResult::Type::NUM, "epoch", "FinalizedBlockV2.epoch (signing epoch)"},
+                           {RPCResult::Type::NUM, "checkpoint_index", "FinalizedBlockV2.checkpointIndex"},
+                           {RPCResult::Type::STR_HEX, "cert_id", "keccak256(FinalizedBlockV2)"},
+                           {RPCResult::Type::NUM, "signing_validator_count", "Signing-committee member count"},
+                           {RPCResult::Type::NUM, "signing_total_weight", "Signing-committee weight in whole modern B3"},
+                       }},
+                      {RPCResult::Type::STR, "function", "Solidity signature of the encoded call"},
+                      {RPCResult::Type::STR_HEX, "calldata", "Exact B3VaultV2.release calldata"},
+                      {RPCResult::Type::BOOL, "private_key_required_by_rpc", "Always false"},
+                      {RPCResult::Type::STR, "gas_payer", "Who pays Ethereum transaction gas"},
+                  }},
+        RPCExamples{HelpExampleCli(
+            "getbridgewithdrawalproofv2",
+            "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" 0 300")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const Txid source_txid{Txid::FromUint256(ParseHashV(request.params[0], "txid"))};
+            const uint64_t raw_burn_output_index{request.params[1].getInt<uint64_t>()};
+            if (raw_burn_output_index > std::numeric_limits<uint32_t>::max()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "burn_vout exceeds uint32");
+            }
+            const uint32_t burn_output_index{static_cast<uint32_t>(raw_burn_output_index)};
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            const Consensus::BridgeV2Params& v2{EnsureBridgeV2Configured(consensus)};
+            EnsureFreshLineageConfigured(consensus);
+            const CBlockIndex* inclusion{ParseHashOrHeight(request.params[2], chainman)};
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            const auto asset{modern::ConfiguredBridgeV2AssetId(consensus)};
+            if (!tip || !asset) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Bridge V2 consensus pins are incomplete");
+            }
+            node::BridgeStateTracker& bridge_tracker{chainstate.ModernBridgeState()};
+            if (!bridge_tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Bridge state is unavailable at the active tip");
+            }
+            const node::BridgeStateIndex& index{bridge_tracker.Index()};
+            const auto confirmed{index.WithdrawalV2(node::BridgeWithdrawalId{source_txid, burn_output_index})};
+            if (!confirmed) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                   "Burn source is not a confirmed V2 withdrawal on the active chain");
+            }
+            if (!inclusion || chainstate.m_chain[inclusion->nHeight] != inclusion) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Certificate block is not on the active chain");
+            }
+
+            std::string error;
+            const auto context{BuildFreshCertificateContext(chainstate, consensus, *inclusion, std::nullopt, error)};
+            if (!context) throw JSONRPCError(RPC_MISC_ERROR, error);
+            const node::FreshLineageRelayArtifacts& artifacts{context->artifacts};
+            const modern::FinalizedBlockV2& fb{artifacts.fb};
+            if (fb.height < static_cast<uint64_t>(v2.activation_height)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Selected certificate is below the bridge V2 activation height and carries no "
+                                   "withdrawal root");
+            }
+            if (fb.height < confirmed->withdrawal.b3_height) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Selected certificate does not cover the withdrawal");
+            }
+            if (fb.height > static_cast<uint64_t>(tip->nHeight)) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Certificate finalizes beyond the active tip");
+            }
+            const int certified_height{static_cast<int>(fb.height)};
+            const CBlockIndex* certified_index{chainstate.m_chain[certified_height]};
+            if (!certified_index || certified_index->GetBlockHash() != fb.block_hash) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Certificate finalized block is not on the active chain");
+            }
+            // Verifier V2 step 9 records a root only from a qualified signing
+            // committee; any other certificate would leave the leaf unpayable.
+            const modern::ValidatorSetHeader& signing{artifacts.signing_header};
+            if (signing.validator_count < v2.verifier.min_bridge_validators ||
+                signing.validator_count > v2.verifier.max_bridge_validators ||
+                signing.total_weight < v2.verifier.min_bridge_total_weight) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Selected certificate cannot authorize a Verifier V2 root");
+            }
+            const auto expected_root{index.WithdrawalRootV2AtHeight(certified_height)};
+            if (!expected_root || *expected_root != fb.withdrawal_root) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Certificate withdrawal root disagrees with active bridge V2 state");
+            }
+            const uint64_t withdrawal_id{confirmed->withdrawal.withdrawal_id};
+            const auto requests{index.WithdrawalsV2Through(certified_height)};
+            if (!requests || withdrawal_id >= requests->size()) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                   "Withdrawal is not present in the selected certificate's root");
+            }
+            if (!(requests->at(withdrawal_id) == *confirmed)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Confirmed burn source does not match the certified withdrawal prefix");
+            }
+            std::vector<modern::BridgeWithdrawalV2> withdrawals;
+            withdrawals.reserve(requests->size());
+            for (const node::BridgeWithdrawalV2Request& prefix_request : *requests) {
+                const modern::BridgeWithdrawalV2& w{prefix_request.withdrawal};
+                const auto leaf{modern::BridgeWithdrawalLeafV2(w)};
+                const CBlockIndex* connected{prefix_request.connected_height < 0
+                                                 ? nullptr
+                                                 : chainstate.m_chain[prefix_request.connected_height]};
+                // A leaf names the vault entry whose ledger counts it: the
+                // launch vault, or from a B-23 migration the successor (same
+                // chain, token and AssetId). A sweep names the launch vault
+                // and pays the successor vault.
+                const Consensus::BridgeV2VaultEntry* named{
+                    prefix_request.entry <= static_cast<uint8_t>(Consensus::BridgeV2EntryRole::SUCCESSOR)
+                        ? v2.Entry(static_cast<Consensus::BridgeV2EntryRole>(prefix_request.entry))
+                        : nullptr};
+                const bool sweep_consistent{
+                    !prefix_request.sweep ||
+                    (prefix_request.entry == static_cast<uint8_t>(Consensus::BridgeV2EntryRole::LAUNCH) &&
+                     v2.successor && w.recipient == v2.successor->entry.vault_address)};
+                if (!leaf || *leaf != prefix_request.leaf || !connected ||
+                    connected->GetBlockHash() != prefix_request.connected_block || !named || !sweep_consistent ||
+                    w.destination_chain_id != named->origin_chain_id || w.asset_id != *asset ||
+                    w.vault != named->vault_address || w.token != named->token_address) {
+                    throw JSONRPCError(RPC_MISC_ERROR,
+                                       "Withdrawal V2 prefix contains mismatched active-chain or vault-entry data");
+                }
+                withdrawals.push_back(w);
+            }
+            const auto proof{bridge::BuildWithdrawalV2RelayArtifacts(withdrawals, withdrawal_id, *expected_root, error)};
+            if (!proof) throw JSONRPCError(RPC_MISC_ERROR, error);
+            const node::BridgeWithdrawalV2Request& burn{requests->at(withdrawal_id)};
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("withdrawal_id", withdrawal_id);
+            result.pushKV("source_txid", burn.transaction_id.GetHex());
+            result.pushKV("burn_output_index", burn.burn_output_index);
+            result.pushKV("b3_height", proof->withdrawal.b3_height);
+            result.pushKV("b3_block", burn.connected_block.GetHex());
+            result.pushKV("asset_id", asset->GetHex());
+            result.pushKV("asset_id_evm", EvmHex(*asset));
+            result.pushKV("destination_chain_id", proof->withdrawal.destination_chain_id);
+            result.pushKV("vault", EvmHex(proof->withdrawal.vault));
+            result.pushKV("token", EvmHex(proof->withdrawal.token));
+            result.pushKV("recipient", EvmHex(proof->withdrawal.recipient));
+            result.pushKV("amount_raw", proof->withdrawal.amount);
+            if (v2.successor) result.pushKV("sweep", burn.sweep);
+            result.pushKV("leaf_preimage", EvmHex(proof->leaf_preimage));
+            result.pushKV("withdrawal_leaf", EvmHex(proof->leaf));
+            result.pushKV("withdrawal_root", EvmHex(proof->root));
+            UniValue path{UniValue::VARR};
+            for (const uint256& sibling : proof->path) path.push_back(EvmHex(sibling));
+            result.pushKV("path", std::move(path));
+            UniValue certificate{UniValue::VOBJ};
+            certificate.pushKV("inclusion_height", context->inclusion_height);
+            certificate.pushKV("inclusion_block", context->inclusion_hash.GetHex());
+            certificate.pushKV("height", fb.height);
+            certificate.pushKV("block_hash", fb.block_hash.GetHex());
+            certificate.pushKV("epoch", fb.epoch);
+            certificate.pushKV("checkpoint_index", fb.checkpoint_index);
+            certificate.pushKV("cert_id", EvmHex(context->cert_id));
+            certificate.pushKV("signing_validator_count", signing.validator_count);
+            certificate.pushKV("signing_total_weight", signing.total_weight);
+            result.pushKV("certificate", std::move(certificate));
+            result.pushKV("function", std::string{bridge::VAULT_V2_RELEASE_SIGNATURE});
+            result.pushKV("calldata", EvmHex(proof->release_calldata));
+            result.pushKV("private_key_required_by_rpc", false);
+            result.pushKV("gas_payer", "permissionless Ethereum submitter");
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan getfinalitylineagevotes()
+{
+    return RPCHelpMan{
+        "getfinalitylineagevotes",
+        "Return the verified fresh-lineage votes held by the local pool that are still useful on the\n"
+        "active chain (regtest staging relay; there is no P2P transport for them).\n",
+        {},
+        RPCResult{RPCResult::Type::ARR, "", "Votes, newest checkpoint first",
+                  {{RPCResult::Type::OBJ, "", "Vote",
+                    {
+                        {RPCResult::Type::STR_HEX, "lineage_id", "Fresh lineage id"},
+                        {RPCResult::Type::NUM, "epoch", "Signing fresh epoch"},
+                        {RPCResult::Type::NUM, "height", "Checkpoint height"},
+                        {RPCResult::Type::NUM, "index", "Member index in Set'_epoch"},
+                        {RPCResult::Type::STR_HEX, "signature", "Compressed BLS signature over digest V2"},
+                        {RPCResult::Type::STR_HEX, "hex", "The 148-byte serialized vote for submitfinalitylineagevote"},
+                    }}}},
+        RPCExamples{HelpExampleCli("getfinalitylineagevotes", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            EnsureFreshLineageConfigured(consensus);
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            const node::FinalityTracker* tracker{SyncFinalityAtTip(chainstate, consensus, bridge_index)};
+            if (!tracker) throw JSONRPCError(RPC_MISC_ERROR, "Finality state is unavailable at the active tip");
+            UniValue out{UniValue::VARR};
+            for (const node::FreshLineageSig& sig : chainstate.FinalitySignatures().Fresh().VerifiedSignatures(
+                     *tracker, chainstate.m_chain, consensus, bridge_index)) {
+                DataStream ss;
+                ss << sig;
+                UniValue vote{UniValue::VOBJ};
+                vote.pushKV("lineage_id", EvmHex(sig.lineage_id));
+                vote.pushKV("epoch", sig.epoch);
+                vote.pushKV("height", sig.height);
+                vote.pushKV("index", sig.index);
+                vote.pushKV("signature", HexStr(sig.signature));
+                vote.pushKV("hex", HexStr(ss));
+                out.push_back(std::move(vote));
+            }
+            return out;
+        },
+    };
+}
+
+static RPCHelpMan submitfinalitylineagevote()
+{
+    return RPCHelpMan{
+        "submitfinalitylineagevote",
+        "Submit one serialized fresh-lineage vote to the local pool (regtest staging relay). The vote is\n"
+        "fully verified (lineage id, grid, depth, epoch, member index, BLS over digest V2) before it is kept.\n",
+        {
+            {"hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "The 148-byte serialized vote (getfinalitylineagevotes \"hex\")"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "",
+                  {
+                      {RPCResult::Type::STR, "result",
+                       "accepted, duplicate, stale, unconfigured, lineage-mismatch, unknown-epoch, not-checkpoint, "
+                       "too-shallow, bad-index, pool-full or bad-signature"},
+                  }},
+        RPCExamples{HelpExampleCli("submitfinalitylineagevote", "\"hex\"")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            EnsureFreshLineageConfigured(consensus);
+            const std::vector<unsigned char> bytes{ParseHexV(request.params[0], "hex")};
+            if (bytes.size() != node::FreshLineageSig::SERIALIZED_SIZE) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
+                                   strprintf("A fresh-lineage vote is exactly %u bytes",
+                                             node::FreshLineageSig::SERIALIZED_SIZE));
+            }
+            node::FreshLineageSig sig;
+            DataStream ss{bytes};
+            ss >> sig;
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            const node::FinalityTracker* tracker{SyncFinalityAtTip(chainstate, consensus, bridge_index)};
+            if (!tracker) throw JSONRPCError(RPC_MISC_ERROR, "Finality state is unavailable at the active tip");
+            const auto accept{chainstate.FinalitySignatures().Fresh().Submit(sig, *tracker, chainstate.m_chain,
+                                                                             consensus, bridge_index)};
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("result", node::FreshLineageSignaturePool::AcceptName(accept));
+            return result;
+        },
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -5179,6 +7230,13 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getbridgeproofstatus},
         {"blockchain", &getbridgefinalityproof},
         {"blockchain", &getbridgewithdrawalproof},
+        {"blockchain", &getfinalitylineage},
+        {"blockchain", &getfinalitylineagecertificate},
+        {"blockchain", &getbridgev2info},
+        {"blockchain", &buildbridgeobservationv2},
+        {"blockchain", &getbridgewithdrawalproofv2},
+        {"hidden", &getfinalitylineagevotes},
+        {"hidden", &submitfinalitylineagevote},
         {"hidden", &invalidateblock},
         {"hidden", &reconsiderblock},
         {"blockchain", &waitfornewblock},

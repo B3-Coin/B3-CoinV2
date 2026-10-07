@@ -307,3 +307,351 @@ python3 eth_live_test.py /tmp/b3-deposit-proof     --tool ../../build/bin/b3-bri
 
 Success ends with `DEPOSIT PROVEN: id 0, token 0x00..00, amount 1000000000000000 wei,
 b3_recipient 0x<yours>` followed by `ALL VERIFIED`.
+
+## Bridge V2 (S3, regtest-first; not deployed)
+
+Stage S3 of the bridge V2 plan (owner ruling R8 in
+[`doc/design/b3-bridge-v2-owner-rulings-2026-10-03.md`](../doc/design/b3-bridge-v2-owner-rulings-2026-10-03.md))
+adds the launch contracts under `src/v2/`. They implement
+[`doc/design/b3-bridge-v2-contracts-spec.md`](../doc/design/b3-bridge-v2-contracts-spec.md)
+§2-§6 and §9, together with the directions of open issues OI-1 and OI-10
+and the owner's resolution of OI-12 (ruling R9, 2026-10-05; architecture
+§20, `doc/design/b3-bridge-v2-arbitrum-proposal.md`). No V2
+contract is deployed on any public network, no B3 pin names one, and nothing
+here activates the bridge. The V1 contracts, tests, deployment record and
+scripts described above are unchanged.
+
+### Contracts
+
+| Contract | Role |
+|---|---|
+| `src/v2/B3TypesV2.sol` | Library for digest V2, the OI-12 bootstrap digest, lineage id, `certId`, history leaf and root-from-path, the ruleset-2 header shape, AssetId V2 and leaf V2. The tag hashes are hard-coded; the vector test recomputes each one from its string. |
+| `src/v2/BlsDigestProver.sol` | V1's EIP-2537 prover (`src/BlsCertificateProver.sol`) behind `verifyDigest(digest, signingSetHash, signingSet, proof)`. It takes a precomputed digest and accepts only ruleset-2 headers. The witness ABI, POP DST, ordered depth-13 absent-member paths and dual quorum are V1's: headcount `floor(2n/3)+1` and stake `quorumWeight`. |
+| `src/v2/B3FinalityVerifierV2.sol` | Keyless mirror of B3's fresh finality lineage. It covers the one-time bootstrap, certificates checked by checkpoint-history ancestry (so relayers may skip certificates), epoch rotation, the expiry and spacing windows, accepted-root history, the conflict halt, the watcher `cancel` and the deposit gate. |
+| `src/v2/B3VaultV2.sol` | Keyless single-token vault. It keeps V1's `deposit(uint256,bytes32)` ABI and V1's `Deposit` event byte for byte, and applies the caller rule (a codeless top-level EOA, or an account of `FORWARDER_FACTORY`). It releases a leaf V2 under any accepted root at or above the leaf's height, exactly once per id. It also has `absorb()`/`absorbedTotal` and a B-23 successor mode. |
+| `src/v2/B3RelayBatch.sol` | Stateless batch. It tries the certificates in order, then each release not yet released, and reports each failure in an event without stopping the batch. Each try forwards at most a caller-chosen gas cap (`certGas`, `releaseGas`), because a malformed BLS witness makes an EIP-2537 precompile burn all gas forwarded to it. It has no storage, no owner and no payable entry. |
+| `src/v2/IBlsDigestProver.sol`, `src/v2/IB3FinalityVerifierV2.sol` | The interfaces the verifier, vault and batch use. |
+| `script/DeployV2.s.sol` | Regtest-only deployment of the four contracts, with post-checks and an optional gitignored manifest. |
+
+Not in this stage: the deposit forwarder F_d, the exit forwarder F_x (spec
+§7-§8), and the batch's `ExitForward` items and ETH refund (spec §9). The
+vault already pins `FORWARDER_FACTORY`. Until the forwarder slice lands,
+DeployV2 sets it to the deployer's predicted, still codeless next CREATE
+address (nonce n+4), so only top-level EOAs can deposit. This is a latent
+deployer privilege, not only an empty slot: whatever `B3V2_DEPLOYER` later
+deploys at nonce n+4 answers the vault's `isAccount()` caller check. A
+factory answering true for every address would let contract wallets make
+deposits whose receipts B3 cannot prove, so those deposits could never be
+minted; spending nonce n+4 on anything else loses the slot for good. The
+vault only staticcalls the factory, so no theft path exists. The manifest
+records the state (`forwarder_factory_code_hash`,
+`forwarder_factory_latent_deployer_privilege`). Before any non-regtest
+deployment (S7) the reviewed F_d factory must be deployed in the same
+sequence and its code hash pinned in the manifest and by B3. Tokens sent to
+the vault by plain transfer create no B3 claim (OI-6); `absorb()` only
+counts them as reserve.
+
+### Byte layouts
+
+The normative definitions are the contracts spec §2.2 (hashes) and §6.4
+(leaf V2 and the migration leaf). Spec §3.2 and §6.6 fix the storage slots
+that B3 proves, and `test/v2/StorageLayoutV2.t.sol` checks them. Here,
+TaggedHash(t, m) = sha256(sha256(t) ‖ sha256(t) ‖ m), and integers are
+big-endian unless stated otherwise.
+
+- `FinalizedBlockV2` packs to 185 bytes in field order: `lineageId`,
+  `height`, `blockHash`, `withdrawalRoot`, `validatorSetHash`, `epoch`,
+  `checkpointIndex`, `checkpointHistoryRoot`, `bridgeFlags`.
+- `digestV2 = TaggedHash("B3/FINALITY/V2", chainDomain ‖ encode(fb))` and
+  `certId = keccak256(encode(fb))`.
+- `bootstrapDigestV2 = TaggedHash("B3/BRIDGE/BOOTSTRAP/V2", chainDomain ‖
+  u256 evmChainId ‖ verifier ‖ startSetHash ‖ encode(fb))`, over 301 bytes
+  (OI-12). The verifier view `bootstrapDigestOf(fb)` returns it for its own
+  domain, `block.chainid`, address and `START_SET_HASH`.
+- `lineageId = TaggedHash("B3/FINALITY/LINEAGE/V2", chainDomain ‖ u64
+  GENESIS_HEIGHT ‖ genesisBlockHash ‖ genesisSetHash)`.
+- `historyLeaf(h, hash) = keccak256(u64 h ‖ hash)`. The depth-32 history
+  and withdrawal trees hash `keccak256(left ‖ right)`, and bit l of the
+  index orders level l.
+- Leaf V2 is the keccak256 of a 180-byte preimage: `LEAF_TAG_V2 ‖
+  B3_ASSET_ID ‖ u64 withdrawalId ‖ u64 chainid ‖ vault ‖ token ‖ recipient ‖
+  u256 amount ‖ u64 b3Height`. A B-23 migration leaf is an ordinary leaf V2
+  naming the old vault, with the successor vault as recipient.
+- AssetId V2 is V1's `BridgeAssetIdV1` serialization with version byte 2:
+  a 147-byte tagged preimage that carries the origin chain id
+  little-endian.
+- SetHeader keeps V1's 110-byte layout with `rulesetVersion = 2`. Every V1
+  header, and therefore every V1 signature, is refused.
+
+### Bootstrap and certificates
+
+The verifier constructor pins:
+
+- the lineage: `GENESIS_*` and `LINEAGE_ID`, which must match the library
+  value;
+- `START_EPOCH = k` and `START_SET_HASH`;
+- the bootstrap mode;
+- the prover and its code hash;
+- `BRIDGE_ACTIVATION_HEIGHT = V`;
+- the bridge qualification bounds (4-64 members and a minimum total
+  weight);
+- the windows, `INIT_DEADLINE` and `REVIEW_WINDOW`;
+- up to five watchers.
+
+The bootstrap runs in one of two modes:
+
+- **K_OF_N (default, B-11).** The constructor takes a ruleset-2 bootstrap
+  header with four members, weight 4 and quorum 3, hashing to
+  `BOOTSTRAP_SET_HASH`. It refuses any other shape, including 2-of-3.
+  Before `INIT_DEADLINE` anyone may call `initialize(fb, signingSet,
+  startSet, successor, leaf0Path, proof)` with an epoch-k statement that
+  the bootstrap keys sign 3-of-4 over `bootstrapDigestV2` (below).
+- **START_CERTIFICATE (alternative).** `BOOTSTRAP_SET_HASH` must be zero.
+  The same `initialize` call takes an ordinary certificate signed by the
+  pinned start set itself, and a bootstrap-key proof is refused.
+
+**What the K_OF_N attestation binds (OI-12, owner ruling R9, 2026-10-05).**
+The bootstrap keys sign `bootstrapDigestV2 = TaggedHash("B3/BRIDGE/BOOTSTRAP/V2",
+CHAIN_DOMAIN ‖ u256 block.chainid ‖ address(this) ‖ START_SET_HASH ‖
+encode(fb))`, 301 bytes. Besides the lineage (and through it
+`GENESIS_SET_HASH`), epoch k and the epoch-(k+1) successor that `fb` names,
+the attestation binds the epoch-k start set, the verifier's address and the
+EVM chain id. One attestation therefore initializes exactly one deployment on
+one chain: it is refused by a second deployment with identical immutables, on
+another chain id, and by a deployment that pinned another start set
+(`test_OI12_*` in `test/v2/BootstrapV2.t.sol`). The chain id is a full
+256-bit word. The tag differs from digest V2's, so a bootstrap attestation
+never verifies as a committee certificate and a certificate never verifies as
+an attestation; the keys signing plain digest V2 are refused. Signers can
+check the message offline against `bootstrapDigestOf(fb)` and the shared
+vectors (`bootstrap_attestation_v2`). The message does not bind the
+verifier's other immutables (windows, watchers, prover, activation height,
+bridge bounds, init deadline), so the keys sign only after deployment, once
+each holder has checked the deployed runtime code hash and every immutable
+against the published manifest, and never for a predicted CREATE address.
+START_CERTIFICATE is unchanged: the start set signs `digestV2(fb)`.
+
+In both modes `initialize` checks that:
+
+- `startSet` hashes to `START_SET_HASH` and has epoch k;
+- `successor` is the epoch-(k+1) set that `fb.validatorSetHash` names;
+- `leaf0Path` places `historyLeaf(GENESIS_HEIGHT, GENESIS_BLOCK_HASH)` at
+  index 0 under `fb.checkpointHistoryRoot`;
+- **(OI-1)** `GENESIS_HEIGHT < fb.height < V`, with a zero withdrawal root
+  and zero flags. Bootstrap therefore never installs a claimable root; it
+  sets only the latest checkpoint and the history.
+
+Initialization starts the rotation clock and the review window. Deposits
+open only after the review window, once a bridge-qualified set has
+certified a root at or above V (`latestBridgeHeight` ≥ V) and every term of
+`depositsOpen()` (spec §3.5) holds: status LIVE, deposits never closed by
+B3's flag, a qualified current and next set, a rotation younger than
+`DEPOSIT_CLOSE_AFTER` and a certificate younger than `MAX_CERTIFICATE_AGE`
+(`lastCertificateTime` stays 0 until the first ordinary certificate). A
+watcher may `cancel()` before initialization or during the review window.
+CANCELLED is final; it strands nothing, because deposits never opened.
+
+After initialization, only certificates count:
+
+- A certificate must be signed by the current set (same epoch) or by the
+  pinned next set (handover to epoch+1), and it must extend the stored
+  checkpoint through its ancestry path.
+- A root certified at or above V by a bridge-qualified set stays claimable
+  for good. `acceptedRootHeight` is written once per root.
+- `bridgeFlags` bit 0 closes deposits for good. Later certificates are
+  still accepted.
+- `reportConflict` halts the verifier on a certificate from the current or
+  next set that contradicts the stored history. Rotated-out sets cannot
+  halt it. Evidence is refused after the current set expires
+  (`MAX_EPOCH_LAG` after the last rotation), like certificates (I-4); an
+  expired verifier that never halted still reads status 1. The vault keeps
+  paying under roots accepted before the halt.
+- `nextSetHash` is never zero while LIVE: `initialize` and every rotation
+  pin a non-zero successor, and nothing clears it. The zero-next-set
+  branches of spec §3.3 steps 2 and 10 and the `nextSetHash != 0` term of
+  §3.5 are therefore always settled and not coded.
+
+### Time windows
+
+| Immutable | Chain 1 (B-10; `DeployV2.validateMainnetPins`) | Regtest profile R (DeployV2 defaults) |
+|---|---|---|
+| `MIN_EPOCH_DURATION` | 21,600 s | 600 s |
+| `MAX_EPOCH_LAG` | 2,592,000 s | 72,000 s |
+| `DEPOSIT_CLOSE_AFTER` | 259,200 s | 7,200 s |
+| `MAX_CERTIFICATE_AGE` | 86,400 s | 2,400 s |
+| `REVIEW_WINDOW` | 7 days | 16,800 s |
+| `INIT_DEADLINE` | at most 7 days after deployment | deployment + 16,800 s |
+
+Profile R is B-10 scaled by 1/36 (regtest plan §3.3).
+
+The verifier constructor checks the windows by chain id. On every chain id
+except 31337 it requires:
+
+- `MIN_EPOCH_DURATION` ≥ 3,600 s and `MIN_EPOCH_DURATION` ≤
+  `MAX_EPOCH_LAG`;
+- `MAX_EPOCH_LAG` ≥ `DEPOSIT_CLOSE_AFTER` + 7 days;
+- `DEPOSIT_CLOSE_AFTER` > `MAX_CERTIFICATE_AGE` > 0;
+- `REVIEW_WINDOW` ≥ 7 days, and at least one watcher in K_OF_N mode. The
+  K_OF_N trust argument rests on the review window plus a watcher `cancel`,
+  so neither is left to manifest review alone. START_CERTIFICATE may run
+  without watchers.
+
+Profile R breaks the fixed 7-day term (OI-10), so on 31337 only the
+orderings apply:
+
+- 0 < `MAX_CERTIFICATE_AGE` < `DEPOSIT_CLOSE_AFTER` < `MAX_EPOCH_LAG`;
+- 0 < `MIN_EPOCH_DURATION` ≤ `MAX_EPOCH_LAG`.
+
+Both cases also need now < `INIT_DEADLINE` ≤ now + `MAX_EPOCH_LAG` and
+0 < `REVIEW_WINDOW` < `MAX_EPOCH_LAG`. The tests show that profile R is
+accepted on 31337 and refused on chain ids 1 and 11155111, and that the
+B-10 values are accepted on chain 1.
+
+### Shared vectors
+
+`test/vectors/gen_v2_vectors.py` writes `test/vectors/bridge_v2_vectors.json`
+(schema `b3-bridge-v2-vectors/1`). It uses only the python3 standard library
+plus its own Keccak-256, never touches the network, and always produces the
+same output. The file feeds `test/v2/VectorsV2.t.sol` and the B3 C++ tests.
+It holds:
+
+- lineage ids for three chain domains;
+- ruleset-2 SetHeaders;
+- `FinalizedBlockV2` encodings with digest V2 and `certId`;
+- history leaves, roots and paths;
+- leaf V2 with a withdrawal tree;
+- the bUSD V2 AssetId;
+- two OI-12 bootstrap attestation messages (301 bytes) and digests
+  (`bootstrap_attestation_v2`);
+- the storage slots, bit offsets and example words that B3 proves by
+  EIP-1186 for the verifier, the vault and Tether, with the token's
+  `balances` and `isBlackListed` mapping keys for a stand-in vault
+  (`storage_layout_v2`). `StorageLayoutV2.test_SlotsMatchSharedVectors`
+  checks them against the compiled contracts and MockTetherToken.
+
+The generator asserts the documented leaf V2 (`0x1cb905…ad64`) and AssetId
+V2 (`0xdb9e32…6fcd`). The F_d and F_x address vectors will be added with the
+forwarder slice.
+
+BLS vectors (deviation from spec §12). The spec asks for real blst vectors
+from an extended `generate_bls64_proof.cpp` (ruleset 2, 64 members, 43
+signers). Stage S3 has none signed over digest V2. `test/v2/ProverV2.t.sol`
+instead runs the unedited V1 blst vectors (`bls64_proof.bin`,
+`bls64_bootstrap_proof.bin` and the 1-member vector) through `verifyDigest`
+with their V1 digests and the headers relabelled to ruleset 2, and drives
+digest V2 through the in-EVM signer (`test/v2/utils/BlsTestSignerV2.sol`).
+The composition is sound: a BLS signature covers only the 32-byte message
+and hash-to-G2 does not depend on what the message encodes, while the
+digest-V2 bytes themselves are pinned by the Python generator and the C++
+`finality_v2_tests`. A C++-signed digest-V2 proof is left to RT4, where the
+node's staging signer produces real digest-V2 certificates.
+
+```
+test/vectors/gen_v2_vectors.sh            # rewrite bridge_v2_vectors.json
+test/vectors/gen_v2_vectors.sh --check    # exit 1 unless the committed file is current
+```
+
+### Build, test and gas
+
+`--offline` keeps forge from downloading a compiler; solc 0.8.35 must
+already be cached. `foundry.toml` sets `src = "."`, so every command
+compiles every `.sol` file under `contracts/`, V1 included. Add `--out
+<dir> --cache-path <dir>` to keep build artifacts outside the tree.
+
+```
+cd contracts
+forge build --offline
+forge test --offline                                   # V1 and V2 suites
+forge test --offline --match-path 'test/v2/*'          # V2 suites only
+forge test --offline --match-contract GasV2Test -vv    # gas table and runtime sizes
+```
+
+Gas measured at this revision on Osaka, by `test/v2/GasV2.t.sol` except
+the batch row, which `test/v2/RelayBatchV2.t.sol` measures. The called
+contracts are cooled first; certificates run at the minimum headcount
+quorum (1, 11 and 21 absent members) with member weights of 250, 100 and
+100.
+Each cell gives execution gas, then a conservative transaction figure of
+21,000 + 40 × calldata bytes + execution. Every conservative figure is
+asserted below EIP-7825's 16,777,216.
+
+| Call | n = 4 | n = 34 | n = 64 |
+|---|---|---|---|
+| `submitCertificate`, same epoch, new root | 792,279 / 956,799 | 3,070,334 / 3,567,654 | 5,360,815 / 6,190,935 |
+| `submitCertificate`, transition, new root | 823,362 / 987,882 | 3,104,428 / 3,601,748 | 5,391,229 / 6,221,349 |
+| `submitCertificate`, first transition after bootstrap | 840,492 / 1,005,012 | 3,118,547 / 3,615,867 | 5,409,028 / 6,239,148 |
+
+| Call | Execution | Conservative |
+|---|---|---|
+| `initialize`, K_OF_N 3-of-4 | 936,531 | 1,115,131 |
+| `release` (cold slots, fresh recipient) | 86,468 | 153,708 |
+| `deposit` | 62,457 | 86,177 |
+| `absorb` (first, after a migration leaf) | 55,679 | 76,839 |
+| batch: one 64-member transition plus one release (`RelayBatchV2.t.sol`) | 5,497,348 | 6,385,068 |
+
+Relayers size the batch caps from this table: `RelayFixtureV2` uses
+`certGas` = 6,000,000 (above the 64-member worst case) and `releaseGas` =
+250,000. An off-curve absent-member witness under a 6,000,000 cap costs the
+batch 5,845,908 gas and the later items still apply; with all gas forwarded
+the same 12,000,000-gas batch runs out of gas
+(`test_GasCapContainsAPrecompileGasBurn`).
+
+The runtime sizes are 7,512 bytes (BlsDigestProver), 13,929 bytes
+(B3FinalityVerifierV2), 4,315 bytes (B3VaultV2) and 1,884 bytes
+(B3RelayBatch). All four are below EIP-170's 24,576 bytes and asserted in
+`GasV2`. `script/check-deployable-sizes.sh` still covers only the three V1
+runtimes. Spec §12's `check-no-number-opcode.sh` is not created in this
+stage; `GasV2.test_RuntimesHaveNoNumberOpcode` stands in for it and scans all
+four runtimes (skipping PUSH data and metadata) for NUMBER, DELEGATECALL,
+CALLCODE, CREATE, CREATE2 and SELFDESTRUCT, and the prover and batch for
+storage writes.
+
+### Regtest deployment (`DeployV2.s.sol`)
+
+`DeployV2` deploys, in order, the prover, the verifier (pinned to the
+prover's code hash), the vault (pinned to the verifier's code hash) and the
+batch. All four are CREATEs by `B3V2_DEPLOYER` at nonces n to n+3. The
+script then reads back every immutable. `run()` and `deploy()` refuse every
+chain id except 31337 before they read the environment. Integers may be
+decimal or 0x-hex.
+
+| Variables | Meaning |
+|---|---|
+| `B3V2_DEPLOYER`, `B3V2_CHAIN_DOMAIN`, `B3V2_GENESIS_HEIGHT`, `B3V2_GENESIS_BLOCK_HASH`, `B3V2_GENESIS_SET_HASH`, `B3V2_START_EPOCH`, `B3V2_START_SET_HASH`, `B3V2_BOOTSTRAP_MODE` (0 = K_OF_N, 1 = START_CERTIFICATE), `B3V2_BRIDGE_ACTIVATION_HEIGHT`, `B3V2_ORIGIN_TOKEN` | Required. |
+| `B3V2_BOOTSTRAP_AGGREGATE_PUBKEY` (48 bytes), `B3V2_BOOTSTRAP_MEMBERS_ROOT`, `B3V2_BOOTSTRAP_SET_HASH` | Required for K_OF_N only. The 4-member header they form must hash to `B3V2_BOOTSTRAP_SET_HASH`. START_CERTIFICATE refuses a non-zero `B3V2_BOOTSTRAP_SET_HASH`. |
+| `B3V2_LINEAGE_ID` | Optional cross-check; by default it is recomputed. |
+| `B3V2_MIN_BRIDGE_VALIDATORS` (4), `B3V2_MAX_BRIDGE_VALIDATORS` (64), `B3V2_MIN_BRIDGE_TOTAL_WEIGHT` (900) | Optional bridge qualification bounds. |
+| `B3V2_MIN_EPOCH_DURATION` (600), `B3V2_MAX_EPOCH_LAG` (72000), `B3V2_DEPOSIT_CLOSE_AFTER` (7200), `B3V2_MAX_CERTIFICATE_AGE` (2400), `B3V2_INIT_WINDOW` (16800; `INIT_DEADLINE` = now + window), `B3V2_REVIEW_WINDOW` (16800) | Optional windows; the defaults are profile R. |
+| `B3V2_WATCHERS` | Optional comma-separated list of up to five addresses (default none). |
+| `B3V2_TOKEN_CODE_HASH` (default: the token's code hash), `B3V2_MAX_DEPOSIT_RAW` (10,000,000,000), `B3V2_FORWARDER_FACTORY` (default: the deployer's nonce n+4 CREATE address) | Optional vault pins. |
+| `B3V2_MANIFEST_PATH` | Optional. It must be `deployments/local-<name>.json`, which `.gitignore` covers. The manifest records addresses, code hashes, the AssetId and every pin, with `status: "regtest_candidate"` and `production_approved: false`. |
+
+Against a local anvil only (no public RPC):
+
+```
+anvil --host 127.0.0.1 --chain-id 31337
+# in contracts/, with the B3V2_* variables exported:
+forge script script/DeployV2.s.sol:DeployV2 --offline \
+    --rpc-url http://127.0.0.1:8545 --broadcast --unlocked --sender "$B3V2_DEPLOYER"
+```
+
+Forge writes its broadcast record under `broadcast/` and its cache under
+`cache/`; both are gitignored. Set `FOUNDRY_BROADCAST` and `--cache-path` to
+keep them outside the tree.
+
+### Not enabled
+
+- **Mainnet deployment and activation are not enabled.** `DeployV2` refuses
+  every chain id except 31337. Its chain-1 policy (`validateWindows`,
+  `validateMainnetPins`) is exercised by unit tests only. A chain-1
+  deployment waits for a later stage and an explicit owner ruling.
+- No V2 address, code hash or AssetId is pinned in any B3 build. These
+  contracts do not change B3 consensus.
+- There has been no external cryptography or contract audit of V2.
+  `BlsDigestProver` reuses V1's BLS code, which is also unaudited.
+- The open issues in architecture §20 still apply, notably OI-6
+  (plain transfers to the vault) and OI-9 (the bootstrap key holders are
+  not yet named).
+- Open for an owner ruling: the forwarder-factory deployer privilege until
+  the F_d slice (see "Contracts"). The K_OF_N attestation scope is settled
+  by OI-12 (see "Bootstrap and certificates").

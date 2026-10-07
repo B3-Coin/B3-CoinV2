@@ -130,6 +130,13 @@ public:
     const ChainTxData& TxData() const { return chainTxData; }
 
     /**
+     * SHA256 of the raw -b3bridgepins file bytes this regtest chain applied,
+     * or nullopt when no pin file is in use (always nullopt outside the
+     * -b3modernregtest -b3flowmeshtest regtest configuration).
+     */
+    const std::optional<uint256>& B3BridgePinsHash() const { return m_b3_bridge_pins_sha256; }
+
+    /**
      * SigNetOptions holds configurations for creating a signet CChainParams.
      */
     struct SigNetOptions {
@@ -144,6 +151,109 @@ public:
         int64_t start_time;
         int64_t timeout;
         int min_activation_height;
+    };
+
+    /**
+     * External V1 decentralized-bridge pins read from a -b3bridgepins file
+     * (REGTEST ONLY, and only with -b3modernregtest -b3flowmeshtest). They
+     * point the synthetic flowmesh-test bUSD at a local anvil deployment and
+     * a synthetic beacon checkpoint. The origin chain stays 31337 and the
+     * activation heights stay at A3, so every pin takes effect from the
+     * bridge activation height.
+     *
+     * A file may instead (or also) carry a bridge V2 section (`v2`): one
+     * fresh anvil Vault V2 entry, its fresh light-client store and the
+     * Verifier V2 bounds, applied from V >= A3 (consensus.bridge_v2). With
+     * no V1 section the synthetic MANAGED_V1 bUSD stays as without a file.
+     */
+    struct B3RegTestBridgePins {
+        //! Synthetic flowmesh-test mint caps (raw bUSD units), used whenever
+        //! a pin file does not override them.
+        static constexpr CAmount DEFAULT_MAX_PER_BLOCK{1'000'000'000};
+        static constexpr CAmount DEFAULT_MAX_PER_EPOCH{10'000'000'000};
+        //! B-14 bridge V2 caps (10,000 bUSD per block and per mint epoch),
+        //! used whenever the v2 section does not override them.
+        static constexpr CAmount DEFAULT_V2_MAX_PER_BLOCK{10'000'000'000};
+        static constexpr CAmount DEFAULT_V2_MAX_PER_EPOCH{10'000'000'000};
+
+        /**
+         * The v2 section (node changes sections 3.1-3.3 and 12.2). OI-3:
+         * every V2 pin must be in the file before the chain first stores a
+         * block at or above A3 (the -b3bridgepins record then refuses any
+         * change, and V >= A3), so only values knowable before then are
+         * keys. The vault and verifier runtime code hashes and the lineage
+         * id commit to blockHash(R_f - 1) and are deliberately absent:
+         * BridgeV2Params leaves both code hashes unset, which
+         * BridgeV2Params::Valid() accepts only off Ethereum mainnet. A
+         * window's value is a deployment parameter fixed in advance, so the
+         * verifier's MAX_EPOCH_LAG may be named (verifier_max_epoch_lag).
+         */
+        struct V2Section {
+            //! Always the local anvil chain (31337).
+            uint64_t origin_chain_id{0};
+            Consensus::BridgeEthAddress vault{};
+            Consensus::BridgeEthAddress token{};
+            Consensus::BridgeEthAddress verifier{};
+            //! Lower bound of the first anvil block that may hold vault
+            //! events (Vault V2 is deployed after R_f - 1).
+            uint64_t origin_deployment_block{0};
+            uint256 token_runtime_code_hash{};
+            CAmount max_deposit_raw{0};
+            std::optional<CAmount> max_per_block{};
+            std::optional<CAmount> max_per_epoch{};
+            Consensus::EthereumLightClientPins light_client{};
+            uint32_t min_bridge_validators{0};
+            uint32_t max_bridge_validators{0};
+            uint64_t min_bridge_total_weight{0};
+            //! V: first height of V2 records and of the V2 withdrawal tree.
+            int activation_height{0};
+            //! W2 >= V; V when unset (B-12).
+            std::optional<int> burn_height{};
+            //! The Verifier V2 MAX_EPOCH_LAG DeployV2 will use; when set it
+            //! must equal the regtest burn gate's set expiry (profile R).
+            std::optional<int64_t> verifier_max_epoch_lag{};
+
+            /**
+             * The optional B-23 successor vault v' (`v2.successor`; node
+             * changes section 7.6). Pinned, like v, before the chain first
+             * stores a block at or above A3 (OI-3), and applied only from
+             * migration_height h_m > V (h_m >= W2). Only v' itself is keyed:
+             * its CREATE address (a dedicated deployer at nonce 0), v as its
+             * predecessor, the bUSD V2 AssetId it carries (raw EVM bytes,
+             * Vault V2 B3_ASSET_ID, which RegTest() requires to be v's) and
+             * optionally a deployment-block lower bound (default v's). v's
+             * chain, token, token code hash, decimals, proof kind,
+             * MAX_DEPOSIT_RAW and caps are inherited; the vault code hash of
+             * v' stays unset (OI-3), so naming it is an unknown key.
+             */
+            struct SuccessorSection {
+                Consensus::BridgeEthAddress vault{};
+                Consensus::BridgeEthAddress predecessor{};
+                uint256 asset_id{};
+                int migration_height{0};
+                std::optional<uint64_t> origin_deployment_block{};
+            };
+            std::optional<SuccessorSection> successor{};
+        };
+
+        //! Whether the file carried a v1_decentralized section. True by
+        //! default so hand-built pins keep their V1 meaning.
+        bool has_v1{true};
+        Consensus::BridgeEthAddress vault{};
+        Consensus::BridgeEthAddress token{};
+        uint64_t origin_deployment_block{0};
+        uint256 vault_runtime_code_hash{};
+        //! Origin-token runtime code hash: the direct-token adapter v1
+        //! meaning of BridgeAssetParams::implementation_or_adapter.
+        uint256 token_runtime_code_hash{};
+        std::optional<CAmount> max_per_block{};
+        std::optional<CAmount> max_per_epoch{};
+        Consensus::EthereumLightClientPins light_client{};
+        Consensus::BridgeDecentralizedWithdrawalPins withdrawal{};
+        //! The bridge V2 section, when the file carried one.
+        std::optional<V2Section> v2{};
+        //! SHA256 of the raw pin file bytes.
+        uint256 file_sha256{};
     };
 
     /**
@@ -189,6 +299,17 @@ public:
         int64_t halving_interval{0};
         int64_t treasury_percent{0};
         std::vector<unsigned char> treasury_script{};
+        //! Parsed -b3bridgepins file; applied only together with
+        //! flowmesh_test.
+        std::optional<B3RegTestBridgePins> bridge_pins{};
+        //! -b3freshlineageheight (R_f) and -b3freshmaxepochextension: the
+        //! fresh finality lineage with the B-7 staging signer (bridge V2
+        //! regtest plan section 3.3). Applied only together with
+        //! flowmesh_test; R_f - 1 must lie on the V1 checkpoint grid.
+        std::optional<int> fresh_lineage_height{};
+        std::optional<int> fresh_max_epoch_extension{};
+        //! B-23's fresh-lineage extension on regtest profile R.
+        static constexpr int DEFAULT_FRESH_MAX_EPOCH_EXTENSION{1'280};
     };
 
     struct RegTestOptions {
@@ -226,6 +347,7 @@ protected:
     std::vector<AssumeutxoData> m_assumeutxo_data;
     ChainTxData chainTxData;
     HeadersSyncParams m_headers_sync_params;
+    std::optional<uint256> m_b3_bridge_pins_sha256{};
 };
 
 std::optional<ChainType> GetNetworkForMagic(const MessageStartChars& pchMessageStart);

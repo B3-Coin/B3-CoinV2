@@ -44,6 +44,7 @@ add_executable(test_bitcoin
   bridge_admission_tests.cpp
   bridge_asset_vector_tests.cpp
   bridge_bootstrap_proof_tests.cpp
+  bridge_burn_gate_v2_tests.cpp
   bridge_params_tests.cpp
   bridge_deposit_tests.cpp
   bridge_eth_light_client_tests.cpp
@@ -51,7 +52,14 @@ add_executable(test_bitcoin
   bridge_exec_chain_tests.cpp
   bridge_mpt_tests.cpp
   bridge_proof_tests.cpp
+  bridge_regtest_beacon_tests.cpp
+  bridge_regtest_certify_tests.cpp
+  bridge_regtest_pins_tests.cpp
+  bridge_state_observation_tests.cpp
+  bridge_state_proof_tests.cpp
   bridge_state_tests.cpp
+  bridge_v2_gate_tests.cpp
+  bridge_v2_tests.cpp
   update_downloader_tests.cpp
   update_manager_tests.cpp
   legacy_wallet_send_tests.cpp
@@ -175,6 +183,9 @@ add_executable(test_bitcoin
   finality_operations_tests.cpp
   finality_activation_tests.cpp
   finality_qualification_tests.cpp
+  finality_fresh_params_tests.cpp
+  finality_v2_tests.cpp
+  finality_fresh_lineage_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp

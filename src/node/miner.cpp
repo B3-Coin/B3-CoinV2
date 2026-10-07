@@ -242,7 +242,13 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
             throw std::runtime_error(
                 "bridge state is unavailable for block assembly");
         }
-        if (b3_bridge_withdrawals_active &&
+        if (b3_consensus.BridgeV2RulesActive(nHeight)) {
+            // From the bridge V2 height every BRIDGE_BURN is a V2 burn: the
+            // block rule's W2 check and V2 burn gate (validation.cpp
+            // ConnectBlock) replace the V1 readiness. The gate reads the
+            // block time, so it is evaluated below once nTime is fixed.
+            bridge_burn_readiness = BridgeBurnReadiness::UNAVAILABLE;
+        } else if (b3_bridge_withdrawals_active &&
             b3_consensus.busd_bridge->withdrawal_mode ==
                 Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
             b3_consensus.busd_bridge->decentralized_withdrawal) {
@@ -400,6 +406,36 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     }
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
 
+    // From V the fresh lineage projected for nHeight judges the V2 burn
+    // gate, kind 9 VERIFIER_E verdicts and kind 13 FINALITY_CONFLICT
+    // records, exactly as block validation does (validation.cpp
+    // ConnectBlock). Without it no burn is READY and the preview refuses LIVE
+    // VERIFIER_E and kind 13 records, so all are skipped and the template
+    // stays valid. With it the preview takes at most one kind 13 record: the
+    // first sets the sticky conflict, which refuses every later kind 13 and,
+    // at C4, every later burn of the template.
+    std::optional<BridgeV2LineageContext> bridge_lineage;
+    if (b3_bridge_active && b3_consensus.BridgeV2RulesActive(nHeight)) {
+        std::string lineage_reason;
+        bridge_lineage = MakeBridgeV2LineageContext(
+            m_chainstate.ModernFinality(), m_chainstate.m_chain,
+            m_chainstate.m_blockman, b3_consensus, *pindexPrev,
+            m_chainstate.ModernBridgeState().Index(), lineage_reason);
+        if (!bridge_lineage) {
+            LogDebug(BCLog::VALIDATION, "CreateNewBlock(): bridge V2 lineage is unavailable (%s)\n",
+                     lineage_reason);
+        }
+        // The V2 burn gate at the exact candidate time, so a burn that
+        // became unready after mempool admission is skipped, never
+        // assembled.
+        if (bridge_lineage && b3_consensus.BridgeV2BurnRulesActive(nHeight)) {
+            const BridgeV2GateResult gate{EvaluateBridgeV2BurnGate(
+                &*bridge_lineage, m_chainstate.ModernBridgeState().Index(),
+                b3_consensus, nHeight, pblock->GetBlockTime())};
+            bridge_burn_readiness = gate.readiness;
+        }
+    }
+
     std::unique_ptr<BridgeBlockPreview> bridge_preview;
     if (m_mempool && b3_bridge_active) {
         uint256 preview_block_id;
@@ -409,7 +445,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                              .Index()
                              .BeginBlockPreview(
                                  nHeight, pblock->GetBlockTime(),
-                                 preview_block_id, b3_consensus, error);
+                                 preview_block_id, b3_consensus, error,
+                                 bridge_lineage ? &*bridge_lineage : nullptr);
         if (!bridge_preview) {
             throw std::runtime_error(
                 "bridge preview is unavailable for block assembly: " +
@@ -584,6 +621,14 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                     LogDebug(BCLog::VALIDATION, "CreateNewBlock(): pooled certificate not includable (%s)\n",
                              cert_error);
                 }
+            }
+            // Fresh finality lineage (bridge V2 S3, regtest knob only): a
+            // judged MPA type-11 record next to the unchanged V1 one. No cell;
+            // the MODERN_PAYLOAD_ROOT commitment below binds it.
+            if (b3_consensus.fresh_lineage) {
+                node::AppendFreshLineageCertificate(finality, m_chainstate.FinalitySignatures().Fresh(),
+                                                    m_chainstate.m_chain, b3_consensus, *pindexPrev,
+                                                    bridge_index, coinbaseTx);
             }
             if (production_plan.action == RegtestFinalityProduction::REQUIRE_HANDOVER &&
                 !included_current_epoch_certificate) {

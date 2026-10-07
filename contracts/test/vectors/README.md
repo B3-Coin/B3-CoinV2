@@ -62,3 +62,15 @@ calldata byte at the EIP-7623 40-gas nonzero rate:
 That is below EIP-7825's 16,777,216 per-transaction cap. Constructor validation
 rejects any configured bridge cap above 64, and `bridgeReady` closes if either
 the current set or known successor exceeds the deployment-pinned cap.
+
+# Bridge V2 shared vectors
+
+`bridge_v2_vectors.json` is written by `gen_v2_vectors.sh` (python3 stdlib
+only; `--check` exits 1 unless the committed file is current) and read by
+`contracts/test/v2/VectorsV2.t.sol` and `contracts/test/v2/StorageLayoutV2.t.sol`;
+B3's C++ bridge tests copy its values. Besides lineage ids, SetHeaders, digest V2, history
+and withdrawal trees and the bUSD V2 AssetId, it holds
+`bootstrap_attestation_v2` (the 301-byte OI-12 K_OF_N bootstrap message and
+its digest for two stand-in deployments) and `storage_layout_v2` (the
+verifier, vault and Tether slots, bit offsets, example words and mapping keys
+that B3 proves by EIP-1186).

@@ -283,6 +283,48 @@ inline UniValue CommitteeJson(const ssz::SyncCommittee& committee)
     return out;
 }
 
+inline UniValue BranchJson(const std::vector<uint256>& branch)
+{
+    UniValue out{UniValue::VARR};
+    for (const uint256& node : branch) {
+        out.push_back(EthereumHex(node));
+    }
+    return out;
+}
+
+//! The `data` object of a beacon-API light-client bootstrap: the shape
+//! b3-bridge-ethcheck reads from bootstrap.json.
+inline UniValue BootstrapJson(const LightClientHeader& header,
+                              const ssz::SyncCommittee& committee,
+                              const std::vector<uint256>& branch)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("header", HeaderJson(header));
+    out.pushKV("current_sync_committee", CommitteeJson(committee));
+    out.pushKV("current_sync_committee_branch", BranchJson(branch));
+    return out;
+}
+
+//! The `data` object of a beacon-API light-client update (a finality update
+//! when it carries no next committee); the inverse of ParseUpdate.
+inline UniValue UpdateJson(const LightClientUpdate& update)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("attested_header", HeaderJson(update.attested));
+    if (update.has_next) {
+        out.pushKV("next_sync_committee", CommitteeJson(update.next_committee));
+        out.pushKV("next_sync_committee_branch", BranchJson(update.next_branch));
+    }
+    out.pushKV("finalized_header", HeaderJson(update.finalized));
+    out.pushKV("finality_branch", BranchJson(update.finality_branch));
+    UniValue aggregate{UniValue::VOBJ};
+    aggregate.pushKV("sync_committee_bits", EthereumHex(update.sync_aggregate.bits));
+    aggregate.pushKV("sync_committee_signature", EthereumHex(update.sync_aggregate.signature));
+    out.pushKV("sync_aggregate", std::move(aggregate));
+    out.pushKV("signature_slot", update.signature_slot);
+    return out;
+}
+
 inline UniValue StoreJson(const LightClientStore& store)
 {
     UniValue out{UniValue::VOBJ};

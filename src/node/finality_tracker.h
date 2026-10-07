@@ -8,6 +8,7 @@
 #include <modern/finality_schedule.h>
 #include <modern/finality_types.h>
 #include <node/finality_binding_index.h>
+#include <node/finality_fresh_lineage.h>
 #include <node/stake_tracker.h>
 #include <node/validator_set.h>
 #include <primitives/block.h>
@@ -17,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 class CBlockIndex;
@@ -91,6 +93,14 @@ struct FinalizedCheckpoint {
  * re-verification of every certificate and binding) is O(modern span); a
  * persisted snapshot is the recorded follow-up.
  *
+ * Fresh lineage (bridge V2, regtest-only knob): when
+ * Consensus::Params::fresh_lineage is set, State::fresh carries the fresh
+ * lineage's own epochs, committees, history accumulator and finalized tip
+ * (node/finality_fresh_lineage.h), projected after the V1 rules and judged
+ * from the same coinbase (MPA type 11). It never feeds back into the V1
+ * fields or into SetInForceAt (block producers are unchanged by R_f); with
+ * the knob absent State::fresh stays empty and V1 behaves exactly as before.
+ *
  * All calls under cs_main; the tracker adds no locking.
  */
 class FinalityTracker
@@ -114,6 +124,9 @@ public:
         bool handover_certified{false};
         bool lineage_broken{false};
         std::optional<FinalizedCheckpoint> finalized;
+        //! Fresh finality lineage (digest V2); empty unless params configure
+        //! it and the height reached R_f. Independent of every field above.
+        std::optional<FreshLineageState> fresh;
         //! The epoch view the pure rules consume (pointers into this state).
         modern::FinalityEpochView View() const;
         //! Size of Set_epoch on this chain, for the coinbase matcher.
@@ -138,7 +151,8 @@ public:
      * Consensus judgement of the certificate (if any) carried by `block`,
      * whose parent is the synced tip: projects the epoch state for
      * index.nHeight (rotation / lineage rules), matches the coinbase cell
-     * and record for the certificate's own epoch, and judges it. Does not
+     * and record for the certificate's own epoch, and judges it; then the
+     * same for the fresh-lineage record (MPA type 11), if any. Does not
      * mutate the tracker. False with a stable reason on failure.
      */
     bool CheckBlockCertificate(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params,
@@ -154,11 +168,30 @@ public:
                                    const CBlockIndex& parent, const Consensus::Params& params,
                                    std::string& error,
                                    const BridgeStateIndex* bridge_index = nullptr) const;
+    /**
+     * Fresh-lineage counterpart of JudgeCandidateCertificate: the identical
+     * type-11 consensus rule for a candidate V2 certificate in the block that
+     * would extend `parent` (the tracker must be synced to `parent`).
+     */
+    bool JudgeCandidateCertificateV2(const modern::FinalizedBlockV2& fb, const modern::FinalityCertificate& cert,
+                                     const CBlockIndex& parent, const Consensus::Params& params,
+                                     std::string& error,
+                                     const BridgeStateIndex* bridge_index = nullptr) const;
 
     //! The state as of the synced tip.
     const State& Current() const { return m_state; }
+    /**
+     * The checkpoint the included certificates pin against reorgs (the
+     * finality anchor, validation.cpp): V1's finalized checkpoint, or the
+     * fresh lineage's when that is higher, since an included V2 certificate
+     * pins exactly like a V1 one. State::fresh exists only under the regtest
+     * -b3freshlineageheight knob, so without it this is V1's finalized
+     * checkpoint. Both lie on the synced chain: the higher implies the lower.
+     */
+    std::optional<std::pair<int, uint256>> PinnedCheckpoint() const;
     //! The state projected for the block at `height` == SyncedHeight() + 1
-    //! (rotation and lineage rules applied; no certificate yet).
+    //! (rotation and lineage rules applied; no certificate yet), including
+    //! the fresh lineage's projection when params configure it.
     State Projected(int height, const Consensus::Params& params) const;
     //! The set whose weights govern the block at `height` == SyncedHeight()+1
     //! (Commit 14 reads block-production weights here): Set_{e+1} when the
@@ -166,6 +199,8 @@ public:
     std::shared_ptr<const ValidatorSetSnapshot> SetInForceAt(int height, const Consensus::Params& params) const;
 
 private:
+    //! The V1 projection alone (bootstrap, gated rotation, break).
+    State ProjectedV1(int height, const Consensus::Params& params) const;
     //! Advance the state with one modern-PoS block (h >= M); false on a
     //! certificate that fails (a connected block cannot carry one: corruption).
     bool ApplyModern(const CBlock& block, const CBlockIndex& index,

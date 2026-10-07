@@ -794,6 +794,16 @@ public:
         int expected_next_height, node::BridgeTxAuthorization& authorization,
         std::string& error) = 0;
 
+    //! Whether B3 still takes bridge V2 deposits at the active tip (node
+    //! changes section 8.5, node::BridgeV2DepositsClosedReason): VALID while
+    //! open; REJECTED, with the reason, once B3 closed them for good (sticky
+    //! conflict, broken fresh lineage, an impaired verifier or Verifier V2
+    //! depositsClosed); RULES_INACTIVE unless bridge V2 rules are active for
+    //! the next block; STATE_UNAVAILABLE when the bridge index or the
+    //! lineage context cannot be built. Wallets refuse deposit instructions
+    //! unless VALID; B3 itself still mints every proven deposit.
+    virtual BridgePrevalidationResult bridgeV2DepositStatus(std::string& error) = 0;
+
     //! Return true if an assumed-valid snapshot is in use. Note that this
     //! returns true even after the snapshot is validated, until the next node
     //! restart.

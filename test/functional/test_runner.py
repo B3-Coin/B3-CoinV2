@@ -90,6 +90,21 @@ EXTENDED_SCRIPTS = [
     'feature_pruning.py',
     'feature_dbcrash.py',
     'feature_index_prune.py',
+    # Regtest bridge harness (local anvil + forge --offline); skips without foundry.
+    'feature_b3_bridge_rt0_toolchain.py',
+    # RT2 and RT3a also skip without the B3_BRIDGE_TOOLS executables.
+    'feature_b3_bridge_rt2_light_client.py',
+    'feature_b3_bridge_rt3_v1_route_a.py --deposit-only',
+    # Fresh finality lineage (digest V2, regtest-only knob); local nodes only.
+    'feature_b3_fresh_lineage.py',
+    # Bridge V2 first round trip (anvil + forge --offline + B3_BRIDGE_TOOLS).
+    'feature_b3_bridge_rt4a_round_trip.py',
+    # Bridge V2 with the K_OF_N bootstrap and the full burn gate (as RT4a).
+    'feature_b3_bridge_rt4_kofn_gate.py',
+    # Bridge V2 kind 13 finality conflict: B3 and Verifier V2 close for good (as RT4a).
+    'feature_b3_bridge_rt4c_conflict.py',
+    # Bridge V2 B-23 vault migration to a pinned successor vault (as RT4a).
+    'feature_b3_bridge_rt4d_migration.py',
 ]
 
 # Special script to run each bench sanity check

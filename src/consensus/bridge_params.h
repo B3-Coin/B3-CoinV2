@@ -397,6 +397,300 @@ inline bool BridgeMintParamsReady(const BridgeAssetParams& params)
     return false;
 }
 
+// ---------------------------------------------------------------- bridge V2
+//
+// Height-activated bridge V2 regime (doc/design/b3-bridge-v2-node-changes.md
+// sections 3.1-3.3): one fresh Ethereum vault entry minting bUSD V2, a fresh
+// light-client store and the Verifier V2 pins. BridgeAssetParams above stays
+// byte-for-byte unchanged, so every V1 identity keeps validating history.
+// Unset on every shipped network; only the regtest pin file's v2 section
+// populates it until a reviewed release pins every value (stage S7).
+
+//! Serialization version byte of the bUSD V2 AssetId preimage (node changes
+//! section 3.2): BridgeAssetIdV1's field order with version 2.
+inline constexpr uint8_t BRIDGE_ASSET_IDENTITY_VERSION_V2{2};
+//! Vault entry proof kind 1: Ethereum receipt proofs through the finalized
+//! light client, minted by record kind 3 (node changes section 3.3).
+inline constexpr uint8_t BRIDGE_V2_PROOF_KIND_ETHEREUM_RECEIPT{1};
+//! B-14: 10,000 bUSD (raw, six decimals) per block, per mint epoch and per
+//! deposit (Vault V2 MAX_DEPOSIT_RAW).
+inline constexpr CAmount BRIDGE_V2_DEFAULT_CAP_RAW{10'000'000'000};
+
+/** One Vault V2 entry (node changes section 3.3). */
+struct BridgeV2VaultEntry {
+    uint64_t origin_chain_id{0};
+    BridgeEthAddress vault_address{};
+    BridgeEthAddress token_address{};
+    uint8_t origin_decimals{BUSD_ORIGIN_DECIMALS};
+    uint8_t asset_decimals{BUSD_ASSET_DECIMALS};
+    // OI-3: the vault's extcodehash commits to blockHash(R_f - 1) through
+    // its verifier and lineage immutables, so a regtest fixture cannot know
+    // it before the first block >= A. Required before any non-regtest
+    // activation: BridgeV2Params::Valid() refuses origin chain 1 without it
+    // (stage S7 pins it).
+    std::optional<uint256> vault_runtime_code_hash{};
+    uint256 token_runtime_code_hash{};
+    uint8_t proof_kind{BRIDGE_V2_PROOF_KIND_ETHEREUM_RECEIPT};
+    // First Ethereum block that may hold vault events; the relayer's first
+    // log scan. A lower bound is safe; zero is an incomplete pin.
+    uint64_t origin_deployment_block{0};
+    CAmount max_deposit_raw{0};
+    BridgeMintCaps mint_caps{};
+
+    bool Valid() const
+    {
+        return origin_chain_id != 0 && !BridgeAddressIsNull(vault_address) &&
+               !BridgeAddressIsNull(token_address) &&
+               vault_address != token_address &&
+               origin_decimals == BUSD_ORIGIN_DECIMALS &&
+               asset_decimals == BUSD_ASSET_DECIMALS &&
+               (!vault_runtime_code_hash ||
+                !vault_runtime_code_hash->IsNull()) &&
+               !token_runtime_code_hash.IsNull() &&
+               proof_kind == BRIDGE_V2_PROOF_KIND_ETHEREUM_RECEIPT &&
+               origin_deployment_block > 0 && mint_caps.Valid() &&
+               max_deposit_raw > 0 &&
+               max_deposit_raw <= mint_caps.max_per_block;
+    }
+};
+
+//! Which vault entry of the envelope a rule reads: the launch entry v, or
+//! the B-23 successor v' a migration hard fork appends (node changes
+//! sections 3.1 and 7.6). The value is the entry's index in the registry.
+enum class BridgeV2EntryRole : uint8_t {
+    LAUNCH = 0,
+    SUCCESSOR = 1,
+};
+
+/**
+ * B-23 successor vault entry v' (node changes sections 3.2 and 7.6;
+ * contracts spec sections 6.1 and 6.4). `entry` is v' itself: v's origin
+ * chain, token, decimals, token code hash, proof kind and mint caps, with
+ * its own vault address, optional vault code hash (OI-3), deployment block
+ * and MAX_DEPOSIT_RAW. `predecessor` is v's vault address and `asset_id` v's
+ * bUSD V2 AssetId as raw EVM bytes (Vault V2 `B3_ASSET_ID()`), the two
+ * constructor arguments v' checks against v; B3 checks `asset_id` against
+ * its own recomputation (modern::bridge_v2_detail::ConfiguredDomain), so v'
+ * mints and burns the same asset. From `migration_height` (h_m > V, >= W2)
+ * v retires and v' takes deposits and burns; h_m, like V and W2, is not part
+ * of the registry id.
+ */
+struct BridgeV2SuccessorEntry {
+    BridgeV2VaultEntry entry{};
+    BridgeEthAddress predecessor{};
+    uint256 asset_id{};
+    int32_t migration_height{-1};
+};
+
+/**
+ * Verifier V2 pins mirrored by B3 (node changes section 3.1). The member and
+ * weight bounds are the verifier's immutable bridge-authorizing interval, in
+ * the units of BridgeDecentralizedWithdrawalPins. The code hash carries the
+ * vault's OI-3 caveat.
+ *
+ * `max_epoch_lag_seconds` mirrors the verifier's immutable MAX_EPOCH_LAG,
+ * the window after a rotation in which it still accepts a root (its set
+ * expiry). The burn gate's C1 impairment and E2 rotation age read the B3
+ * side's set_expiry_seconds, so BridgeV2Params::Valid() requires the two to
+ * be equal whenever the mirror is pinned: a verifier deployed with a
+ * shorter window would otherwise see B3 keep burns open after it can no
+ * longer accept a covering root. The value is a deployment parameter known
+ * before the fresh lineage starts (unlike the code hash, OI-3), so the
+ * regtest pin file may carry it (`verifier_max_epoch_lag`); Ethereum
+ * mainnet requires it (a stage S7 pin gate). It equals a registry-id field
+ * (set_expiry) and so adds nothing to BridgeRegistryIdV2.
+ */
+struct BridgeV2VerifierPins {
+    BridgeEthAddress address{};
+    std::optional<uint256> runtime_code_hash{};
+    uint32_t min_bridge_validators{0};
+    uint32_t max_bridge_validators{0};
+    uint64_t min_bridge_total_weight{0};
+    std::optional<int64_t> max_epoch_lag_seconds{};
+
+    bool Valid() const
+    {
+        return !BridgeAddressIsNull(address) &&
+               (!runtime_code_hash || !runtime_code_hash->IsNull()) &&
+               min_bridge_validators >= MIN_BRIDGE_VALIDATORS_V1 &&
+               max_bridge_validators >= min_bridge_validators &&
+               max_bridge_validators <= MAX_PROVEN_BRIDGE_VALIDATORS_V1 &&
+               min_bridge_total_weight > 0 &&
+               (!max_epoch_lag_seconds || *max_epoch_lag_seconds > 0);
+    }
+};
+
+/**
+ * Burn liveness gate thresholds (node changes sections 8.4 and 8.6; B-13).
+ * The defaults are profile M, the mainnet values: `set_expiry_seconds`,
+ * `release_margin_seconds` and `burn_margin_seconds` mirror the verifier's
+ * windows, so E2 closes burns once a rotation is older than
+ * RotationAgeLimit() (30 d - 7 d - 1 d = 1,900,800 s). Observations older
+ * than `observation_max_age_seconds` fail E1, E7 and E8; `max_epoch_gap`
+ * bounds E3 and `max_finality_lag_blocks` C3. `wind_down_margin_ppm` is
+ * margin_v of node changes section 7.2 check 3 while the observed USDT
+ * balance is below `locked` (zero margin otherwise).
+ *
+ * `mempool_close_margin_seconds` is policy only (the mempool refuses a burn
+ * whose gate closes within it); every other field is consensus, and only
+ * the consensus fields enter the registry id V2.
+ */
+struct BridgeV2GateParams {
+    int64_t set_expiry_seconds{2'592'000};
+    int64_t release_margin_seconds{604'800};
+    int64_t burn_margin_seconds{86'400};
+    int64_t observation_max_age_seconds{172'800};
+    uint32_t max_epoch_gap{2};
+    int32_t max_finality_lag_blocks{90};
+    uint32_t wind_down_margin_ppm{100'000};
+    int64_t mempool_close_margin_seconds{3'600}; // policy only
+
+    //! E2's bound: set_expiry - release_margin - burn_margin. Positive
+    //! whenever Valid().
+    int64_t RotationAgeLimit() const
+    {
+        return set_expiry_seconds - release_margin_seconds - burn_margin_seconds;
+    }
+
+    //! Every time value positive, ppm at most 1e6, a positive lag, and
+    //! set_expiry > release_margin + burn_margin (node changes section 3.4
+    //! assertion 5), evaluated without overflow.
+    bool Valid() const
+    {
+        return set_expiry_seconds > 0 && release_margin_seconds > 0 &&
+               burn_margin_seconds > 0 && observation_max_age_seconds > 0 &&
+               mempool_close_margin_seconds > 0 &&
+               wind_down_margin_ppm <= 1'000'000 &&
+               max_finality_lag_blocks > 0 &&
+               release_margin_seconds < set_expiry_seconds &&
+               burn_margin_seconds < set_expiry_seconds - release_margin_seconds;
+    }
+
+    /**
+     * Regtest profile R (regtest plan section 3.3 item 2): every time value
+     * divided by 36, a mainnet day to one 2,400 s regtest epoch, and
+     * max_finality_lag_blocks 30 (about three regtest t_fin). The epoch gap
+     * and the wind-down margin are not times and keep profile M's values.
+     */
+    static BridgeV2GateParams RegtestProfileR()
+    {
+        BridgeV2GateParams profile;
+        profile.set_expiry_seconds /= 36;           // 72,000
+        profile.release_margin_seconds /= 36;       // 16,800
+        profile.burn_margin_seconds /= 36;          // 2,400
+        profile.observation_max_age_seconds /= 36;  // 4,800
+        profile.mempool_close_margin_seconds /= 36; // 100
+        profile.max_finality_lag_blocks = 30;
+        return profile;
+    }
+
+    friend bool operator==(const BridgeV2GateParams&,
+                           const BridgeV2GateParams&) = default;
+};
+
+/**
+ * Complete bridge V2 envelope. V (`activation_height`) is the first height
+ * of V2 records and of the V2 withdrawal tree and equals the verifier's
+ * BRIDGE_ACTIVATION_HEIGHT; W2 (`burn_height`) >= V is the first height of
+ * V2 burns (B-12 default W2 = V). Neither enters the registry id.
+ *
+ * `vault` is the launch entry; `successor` is the optional B-23 successor
+ * v' (BridgeV2SuccessorEntry), unset until a migration is pinned.
+ */
+struct BridgeV2Params {
+    int32_t activation_height{-1};
+    int32_t burn_height{-1};
+    EthereumLightClientPins light_client{};
+    BridgeV2VerifierPins verifier{};
+    BridgeV2VaultEntry vault{};
+    BridgeV2GateParams gate{};
+    std::optional<BridgeV2SuccessorEntry> successor{};
+
+    //! The entry of `role`; nullptr for SUCCESSOR when none is pinned.
+    const BridgeV2VaultEntry* Entry(BridgeV2EntryRole role) const
+    {
+        switch (role) {
+        case BridgeV2EntryRole::LAUNCH:
+            return &vault;
+        case BridgeV2EntryRole::SUCCESSOR:
+            return successor ? &successor->entry : nullptr;
+        }
+        return nullptr;
+    }
+
+    /**
+     * The successor's own rules, given a launch envelope that is otherwise
+     * Valid(): a complete entry on v's chain and token with v's decimals,
+     * token code hash, proof kind and caps (the mint epoch counters are
+     * keyed by the shared AssetId); a vault address of its own; v as the
+     * predecessor; a non-null AssetId; h_m > V and h_m >= W2. On Ethereum
+     * mainnet v' needs its vault code hash (OI-3 leaves it unpinned only
+     * off mainnet). True without a successor.
+     */
+    bool SuccessorValid() const
+    {
+        if (!successor) return true;
+        const BridgeV2SuccessorEntry& s{*successor};
+        const BridgeV2VaultEntry& next{s.entry};
+        if (!next.Valid() || next.origin_chain_id != vault.origin_chain_id ||
+            next.token_address != vault.token_address ||
+            next.origin_decimals != vault.origin_decimals ||
+            next.asset_decimals != vault.asset_decimals ||
+            next.token_runtime_code_hash != vault.token_runtime_code_hash ||
+            next.proof_kind != vault.proof_kind ||
+            next.mint_caps.max_per_block != vault.mint_caps.max_per_block ||
+            next.mint_caps.max_per_epoch != vault.mint_caps.max_per_epoch ||
+            next.mint_caps.epoch_length_blocks !=
+                vault.mint_caps.epoch_length_blocks) {
+            return false;
+        }
+        if (next.vault_address == vault.vault_address ||
+            next.vault_address == vault.token_address ||
+            next.vault_address == verifier.address ||
+            s.predecessor != vault.vault_address || s.asset_id.IsNull()) {
+            return false;
+        }
+        if (s.migration_height <= activation_height ||
+            s.migration_height < burn_height) {
+            return false;
+        }
+        return next.origin_chain_id != BUSD_ETHEREUM_CHAIN_ID ||
+               next.vault_runtime_code_hash.has_value();
+    }
+
+    bool Valid() const
+    {
+        if (activation_height < 1 || burn_height < activation_height ||
+            !light_client.Valid() || !vault.Valid() || !verifier.Valid() ||
+            !gate.Valid() ||
+            verifier.address == vault.vault_address ||
+            verifier.address == vault.token_address) {
+            return false;
+        }
+        // The gate's set expiry must be the verifier's own window
+        // (BridgeV2VerifierPins::max_epoch_lag_seconds).
+        if (verifier.max_epoch_lag_seconds &&
+            *verifier.max_epoch_lag_seconds != gate.set_expiry_seconds) {
+            return false;
+        }
+        // As BridgeMintParamsReady: an Ethereum-mainnet entry is exactly
+        // USDT under the mainnet beacon root, so a testnet light client
+        // copied with chain id 1 fails closed. Mainnet also needs both
+        // code-hash pins (node changes section 3.4 assertion 1) and the
+        // MAX_EPOCH_LAG mirror; only a non-mainnet fixture may leave the
+        // OI-3 hashes and the mirror unset.
+        if (vault.origin_chain_id == BUSD_ETHEREUM_CHAIN_ID &&
+            (vault.token_address != BUSD_ETHEREUM_USDT ||
+             light_client.genesis_validators_root !=
+                 ETHEREUM_MAINNET_GENESIS_VALIDATORS_ROOT ||
+             !vault.vault_runtime_code_hash || !verifier.runtime_code_hash ||
+             !verifier.max_epoch_lag_seconds)) {
+            return false;
+        }
+        return SuccessorValid();
+    }
+};
+
 } // namespace Consensus
 
 #endif // B3COIN_CONSENSUS_BRIDGE_PARAMS_H

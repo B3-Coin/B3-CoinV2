@@ -584,6 +584,60 @@ static size_t RemoveStaleFnPodMempoolEntries(CTxMemPool& pool,
     return roots_removed;
 }
 
+/** Once a block sets the sticky bridge V2 conflict (node changes sections
+ * 8.4-8.5: kind 13, E5 or E8), every V2 burn (gate row C4), every kind 13
+ * record ("already set") and every kind 16 vault sweep (the retired vault's
+ * gate, row C4, section 7.6) is invalid on that chain until the block is
+ * disconnected. Remove those roots and every in-mempool descendant, as for
+ * stale FN PoDs, so they do not wait for expiry and the wallet that made
+ * them can abandon them. */
+static size_t RemoveBridgeV2ClosedMempoolEntries(CTxMemPool& pool,
+                                                 const MemPoolRemovalReason reason)
+    EXCLUSIVE_LOCKS_REQUIRED(pool.cs)
+{
+    AssertLockHeld(pool.cs);
+    size_t roots_removed{0};
+    const auto entries{pool.infoAll()};
+    for (const TxMempoolInfo& entry : entries) {
+        if (!entry.tx || !pool.GetEntry(entry.tx->GetHash()) ||
+            !(node::HasDecentralizedBridgeBurn(*entry.tx) ||
+              node::HasBridgeV2FinalityConflict(*entry.tx) ||
+              node::HasBridgeV2VaultSweep(*entry.tx))) {
+            continue;
+        }
+        ++roots_removed;
+        pool.removeRecursive(*entry.tx, reason);
+    }
+    return roots_removed;
+}
+
+/** From a B-23 successor's migration height h_m (node changes section 7.6)
+ * a V2 burn naming the retired launch vault entry is refused
+ * deterministically, at every height of every chain through the block
+ * below h_m. Remove such burns, admitted while the next block was below
+ * h_m, and every in-mempool descendant when the block at h_m - 1 connects
+ * (`next_height` = h_m), so they do not wait for expiry and the wallet that
+ * made them can abandon them. */
+static size_t RemoveBridgeV2RetiredEntryBurns(CTxMemPool& pool,
+                                              const Consensus::Params& params,
+                                              const int next_height,
+                                              const MemPoolRemovalReason reason)
+    EXCLUSIVE_LOCKS_REQUIRED(pool.cs)
+{
+    AssertLockHeld(pool.cs);
+    size_t roots_removed{0};
+    const auto entries{pool.infoAll()};
+    for (const TxMempoolInfo& entry : entries) {
+        if (!entry.tx || !pool.GetEntry(entry.tx->GetHash()) ||
+            !node::HasBridgeV2RetiredEntryBurn(*entry.tx, params, next_height)) {
+            continue;
+        }
+        ++roots_removed;
+        pool.removeRecursive(*entry.tx, reason);
+    }
+    return roots_removed;
+}
+
 //! The modern (deployment-derived) branch of GetBlockScriptFlags.
 static script_verify_flags GetModernBlockScriptFlags(const CBlockIndex& block_index, const ChainstateManager& chainman);
 
@@ -1225,7 +1279,16 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
                                      "bridge-rules-inactive");
             }
-            if (node::HasDecentralizedBridgeBurn(tx) &&
+            // From the bridge V2 height V every BRIDGE_BURN is a V2 burn
+            // (node changes section 3.4): W2 replaces the V1 withdrawal gate.
+            const bool bridge_v2{
+                consensus.BridgeV2RulesActive(next_block_height)};
+            if (bridge_v2 && node::HasDecentralizedBridgeBurn(tx) &&
+                !consensus.BridgeV2BurnRulesActive(next_block_height)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                     "bridge-v2-burn-rules-inactive");
+            }
+            if (node::HasDecentralizedBridgeBurn(tx) && !bridge_v2 &&
                 !Consensus::BridgeWithdrawalRulesActive(next_block_height,
                                                         consensus)) {
                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
@@ -1241,9 +1304,74 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
                                      "bridge-state-unavailable");
             }
+            const int64_t candidate_time{std::max<int64_t>(
+                args.m_accept_time, tip->GetMedianTimePast() + 1)};
             node::BridgeBurnReadiness burn_readiness{
                 node::BridgeBurnReadiness::READY};
-            if (node::HasDecentralizedBridgeBurn(tx) &&
+            // From V a burn (gate), a kind 9 record (VERIFIER_E verdict) or
+            // a kind 13 record (FINALITY_CONFLICT judgement) needs the fresh
+            // lineage projected for the next block. Block validation, block
+            // assembly and wallet prevalidation build the same context.
+            const bool bridge_v2_burn{bridge_v2 &&
+                                      node::HasDecentralizedBridgeBurn(tx)};
+            std::optional<node::BridgeV2LineageContext> bridge_lineage;
+            if (bridge_v2_burn ||
+                (bridge_v2 && node::HasBridgeV2LineageRecord(tx))) {
+                std::string lineage_reason;
+                bridge_lineage = node::MakeBridgeV2LineageContext(
+                    m_active_chainstate.ModernFinality(),
+                    m_active_chainstate.m_chain,
+                    m_active_chainstate.m_blockman, consensus, *tip,
+                    tracker.Index(), lineage_reason);
+                if (!bridge_lineage) {
+                    return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                         "bridge-v2-lineage-unavailable",
+                                         lineage_reason);
+                }
+            }
+            if (bridge_v2_burn) {
+                // The V2 burn gate (node changes section 8.4 rows C1-C4 and
+                // E1-E8) on that lineage and the connected kind 9
+                // observations, at this candidate's time. The mempool also
+                // refuses a burn whose gate closes within the policy margin
+                // (section 8.6), so a burn it relays stays includable for a
+                // while.
+                const node::BridgeV2GateResult gate{
+                    node::EvaluateBridgeV2BurnGate(
+                        &*bridge_lineage, tracker.Index(), consensus,
+                        next_block_height, candidate_time)};
+                burn_readiness = gate.readiness;
+                std::string readiness_error;
+                if (!node::CheckBridgeV2BurnReadiness(
+                        tx, burn_readiness, readiness_error)) {
+                    readiness_error += ": " +
+                                       (burn_readiness ==
+                                                node::BridgeBurnReadiness::UNAVAILABLE
+                                            ? gate.reason
+                                            : gate.Describe());
+                    return state.Invalid(
+                        burn_readiness ==
+                                node::BridgeBurnReadiness::UNAVAILABLE
+                            ? TxValidationResult::TX_MEMPOOL_POLICY
+                            : TxValidationResult::TX_CONSENSUS,
+                        burn_readiness ==
+                                node::BridgeBurnReadiness::UNAVAILABLE
+                            ? "bridge-v2-burn-readiness-unavailable"
+                            : "bridge-v2-burn-not-ready",
+                        readiness_error);
+                }
+                const int64_t close_margin{
+                    consensus.bridge_v2->gate.mempool_close_margin_seconds};
+                if (gate.closes_at &&
+                    *gate.closes_at - gate.now_eff <= close_margin) {
+                    return state.Invalid(
+                        TxValidationResult::TX_MEMPOOL_POLICY,
+                        "bridge-v2-burn-gate-closing",
+                        strprintf("bridge V2 burn gate closes at %d, within %d s of %d",
+                                  *gate.closes_at, close_margin,
+                                  gate.now_eff));
+                }
+            } else if (node::HasDecentralizedBridgeBurn(tx) &&
                 consensus.busd_bridge->withdrawal_mode ==
                     Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
                 consensus.busd_bridge->decentralized_withdrawal) {
@@ -1279,11 +1407,10 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
             }
             node::BridgeTxAuthorization authorization;
             std::string bridge_error;
-            const int64_t candidate_time{std::max<int64_t>(
-                args.m_accept_time, tip->GetMedianTimePast() + 1)};
             if (!tracker.Index().VerifyTransaction(
                     tx, next_block_height, candidate_time, consensus,
-                    authorization, bridge_error)) {
+                    authorization, bridge_error,
+                    bridge_lineage ? &*bridge_lineage : nullptr)) {
                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
                                      "bad-bridge-authorization",
                                      bridge_error);
@@ -2526,9 +2653,11 @@ bool Chainstate::RefreshFinalityAnchor()
     node::FinalityTracker& finality{ModernFinality()};
     if (!finality.Sync(m_chain, m_blockman, consensus, *tip,
                        bridge_index)) return true;
-    if (const auto& fin{finality.Current().finalized}) {
+    // V1's finalized checkpoint, or an included fresh-lineage (V2)
+    // certificate's when higher (regtest -b3freshlineageheight only).
+    if (const auto pin{finality.PinnedCheckpoint()}) {
         BlockValidationState state;
-        return RaiseFinalityAnchorDurably(state, fin->height, fin->block_hash);
+        return RaiseFinalityAnchorDurably(state, pin->first, pin->second);
     }
     return true;
 }
@@ -3621,14 +3750,63 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                           *pindex->pprev)) {
             return state.Error("bridge state is unavailable");
         }
-        if (node::HasDecentralizedBridgeBurn(block) &&
+        // From the bridge V2 height V every BRIDGE_BURN is a V2 burn (node
+        // changes section 3.4): W2 replaces the V1 withdrawal gate.
+        const bool bridge_v2{
+            params.GetConsensus().BridgeV2RulesActive(pindex->nHeight)};
+        if (bridge_v2 && node::HasDecentralizedBridgeBurn(block) &&
+            !params.GetConsensus().BridgeV2BurnRulesActive(
+                pindex->nHeight)) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_CONSENSUS,
+                "bridge-v2-burn-rules-inactive");
+        }
+        if (node::HasDecentralizedBridgeBurn(block) && !bridge_v2 &&
             !Consensus::BridgeWithdrawalRulesActive(
                 pindex->nHeight, params.GetConsensus())) {
             return state.Invalid(
                 BlockValidationResult::BLOCK_CONSENSUS,
                 "bridge-withdrawal-rules-inactive");
         }
-        if (node::HasDecentralizedBridgeBurn(block) &&
+        // From V a burn (gate), a kind 9 record (VERIFIER_E verdict) or a
+        // kind 13 record (FINALITY_CONFLICT judgement) is judged on the
+        // fresh lineage projected from the exact parent. Mempool admission,
+        // block assembly and wallet prevalidation build the same context.
+        const bool bridge_v2_burn{bridge_v2 &&
+                                  node::HasDecentralizedBridgeBurn(block)};
+        std::optional<node::BridgeV2LineageContext> bridge_lineage;
+        if (bridge_v2_burn ||
+            (bridge_v2 && node::HasBridgeV2LineageRecord(block))) {
+            std::string lineage_reason;
+            bridge_lineage = node::MakeBridgeV2LineageContext(
+                ModernFinality(), m_chain, m_blockman, params.GetConsensus(),
+                *pindex->pprev, tracker.Index(), lineage_reason);
+            if (!bridge_lineage) {
+                return state.Error("bridge V2 lineage is unavailable: " +
+                                   lineage_reason);
+            }
+        }
+        if (bridge_v2_burn) {
+            // The V2 burn gate (node changes section 8.4 rows C1-C4 and
+            // E1-E8) on that lineage and the parent's kind 9 observations at
+            // this block's time.
+            const node::BridgeV2GateResult gate{
+                node::EvaluateBridgeV2BurnGate(
+                    &*bridge_lineage, tracker.Index(), params.GetConsensus(),
+                    pindex->nHeight, block.GetBlockTime())};
+            if (gate.readiness == node::BridgeBurnReadiness::UNAVAILABLE) {
+                return state.Error("bridge V2 burn readiness is unavailable: " +
+                                   gate.reason);
+            }
+            std::string readiness_error;
+            if (!node::CheckBridgeV2BurnReadiness(
+                    block, gate.readiness, readiness_error)) {
+                return state.Invalid(
+                    BlockValidationResult::BLOCK_CONSENSUS,
+                    "bridge-v2-burn-not-ready",
+                    readiness_error + ": " + gate.Describe());
+            }
+        } else if (node::HasDecentralizedBridgeBurn(block) &&
             params.GetConsensus().busd_bridge->withdrawal_mode ==
                 Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
             params.GetConsensus().busd_bridge->decentralized_withdrawal) {
@@ -3659,7 +3837,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         std::string bridge_error;
         if (!tracker.Index().VerifyBlock(
                 block, pindex->nHeight, block_hash, params.GetConsensus(),
-                bridge_delta, bridge_error)) {
+                bridge_delta, bridge_error,
+                bridge_lineage ? &*bridge_lineage : nullptr)) {
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                  "bad-bridge-state", bridge_error);
         }
@@ -3681,6 +3860,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         }
         for (const node::BridgeDecentralizedWithdrawalRequest& withdrawal :
              bridge_delta.decentralized_withdrawals_added) {
+            bridge_withdrawal_transactions.insert(withdrawal.transaction_id);
+        }
+        for (const node::BridgeWithdrawalV2Request& withdrawal :
+             bridge_delta.withdrawals_v2_added) {
             bridge_withdrawal_transactions.insert(withdrawal.transaction_id);
         }
     }
@@ -4938,10 +5121,11 @@ bool Chainstate::ConnectTip(
             *block_to_connect, *pindexNew, m_chainman.GetConsensus(),
             m_bridge_state ? &m_bridge_state->Index() : nullptr);
         // The finality pin: a certificate connected on the active chain pins
-        // its checkpoint for the life of the process (monotone).
+        // its checkpoint for the life of the process (monotone); a fresh-
+        // lineage (V2) certificate pins like V1 (regtest knob only).
         if (m_finality_tracker->Synced(pindexNew->GetBlockHash())) {
-            if (const auto& fin{m_finality_tracker->Current().finalized}) {
-                if (!RaiseFinalityAnchorDurably(state, fin->height, fin->block_hash)) return false;
+            if (const auto pin{m_finality_tracker->PinnedCheckpoint()}) {
+                if (!RaiseFinalityAnchorDurably(state, pin->first, pin->second)) return false;
             }
         }
     }
@@ -4982,6 +5166,36 @@ bool Chainstate::ConnectTip(
                     stale_fn_roots, pindexNew->GetBlockHash().ToString(),
                     pindexNew->nHeight,
                     fn_pod_issued ? strprintf("%u", *fn_pod_issued) : "unavailable");
+        }
+
+        // B3 bridge V2 (regtest only while mainnet and testnet have no V2
+        // envelope): the block that set the sticky conflict closes V2 burns
+        // and kind 13 for good on this branch. REORG as above.
+        if (m_bridge_state && m_bridge_state->Synced(pindexNew->GetBlockHash()) &&
+            m_chainman.GetConsensus().BridgeV2RulesActive(pindexNew->nHeight)) {
+            const auto& conflict{m_bridge_state->Index().ConflictV2()};
+            if (conflict && conflict->height == pindexNew->nHeight &&
+                conflict->block_hash == pindexNew->GetBlockHash()) {
+                const size_t closed_roots{RemoveBridgeV2ClosedMempoolEntries(
+                    *m_mempool, MemPoolRemovalReason::REORG)};
+                LogInfo("Removed %zu bridge V2 burn, kind 13 or kind 16 mempool root(s): %s at height %d set the sticky bridge V2 conflict\n",
+                        closed_roots, pindexNew->GetBlockHash().ToString(),
+                        pindexNew->nHeight);
+            }
+        }
+
+        // B3 bridge V2, B-23 (regtest only while mainnet and testnet have no
+        // V2 envelope): the block below a pinned successor's migration
+        // height h_m retires the launch vault entry for the next block, so
+        // a burn naming it is invalid for good on this branch. REORG as
+        // above.
+        if (const Consensus::Params& consensus{m_chainman.GetConsensus()};
+            consensus.BridgeV2MigrationActive(pindexNew->nHeight + 1) &&
+            !consensus.BridgeV2MigrationActive(pindexNew->nHeight)) {
+            const size_t retired_roots{RemoveBridgeV2RetiredEntryBurns(
+                *m_mempool, consensus, pindexNew->nHeight + 1, MemPoolRemovalReason::REORG)};
+            LogInfo("Removed %zu bridge V2 burn mempool root(s) naming the retired launch vault entry: %s at height %d precedes the migration height\n",
+                    retired_roots, pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
         }
 
         // B3: connecting the final legacy block H flips the next-block era to

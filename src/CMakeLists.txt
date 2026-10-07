@@ -287,6 +287,8 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/fn_seat_index.cpp
   node/legacy_fn_issuance.cpp
   node/finality_binding_index.cpp
+  node/finality_fresh_lineage.cpp
+  node/finality_fresh_signature.cpp
   node/finality_pin.cpp
   node/finality_signer_store.cpp
   node/finality_signature.cpp
@@ -553,6 +555,38 @@ if(B3_BRIDGE_TOOLS)
   # B3FinalityVerifier.initialize. Public manifests and signatures only.
   add_executable(b3-bridge-bootstrap-proof bridge/bootstrap_proof.cpp)
   target_link_libraries(b3-bridge-bootstrap-proof
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+
+  # REGTEST ONLY synthetic sync-committee tool: Beacon-API light-client
+  # objects over local anvil headers, signed by public deterministic keys.
+  # Refuses Ethereum mainnet and non-0xb3 fork domains.
+  add_executable(b3-bridge-regtest-beacon bridge/regtest_beacon.cpp)
+  target_link_libraries(b3-bridge-regtest-beacon
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+
+  # REGTEST ONLY bridge V2 certificate tool: the OI-12-bound K_OF_N bootstrap
+  # attestation and digest-V2 test certificates from public deterministic
+  # test keys. Refuses non-regtest chain domains and EVM chain ids.
+  add_executable(b3-bridge-regtest-certify bridge/regtest_certify.cpp)
+  target_link_libraries(b3-bridge-regtest-certify
     PRIVATE
       core_interface
       b3_blst

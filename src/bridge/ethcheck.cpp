@@ -21,6 +21,13 @@
 // consensus-sized backfills followed by one mint. Exit code 0 = every step
 // verified; nonzero otherwise. NOT part of the node; test/tooling only (option
 // B3_BRIDGE_TOOLS).
+//
+// receipt_proof.json may set "bridge_v2": true for a deposit into a bridge V2
+// vault entry (doc/design/b3-bridge-v2-node-changes.md section 4): the
+// receipt then decodes with EIP-2718 types up to 0x7f and the mint is encoded
+// under the V2 receipt-proof limits (8,192-byte terminal node, 16 KiB proof),
+// as consensus applies them from the bridge V2 height. Without it every rule
+// is V1's.
 
 #include <bridge/admission.h>
 #include <bridge/deposit.h>
@@ -96,9 +103,10 @@ void Require(LcResult r, const std::string& what)
     Info("  [ok] %s\n", what.c_str());
 }
 
-std::string PayloadHex(const BridgeRecordV1& record)
+std::string PayloadHex(const BridgeRecordV1& record,
+                       const BridgeMptLimits& mpt_limits = BRIDGE_MPT_LIMITS_V1)
 {
-    const auto encoded{EncodeBridgeRecordV1(record)};
+    const auto encoded{EncodeBridgeRecordV1(record, mpt_limits)};
     if (!encoded) {
         throw std::runtime_error("record exceeds the canonical type-10 limits");
     }
@@ -110,11 +118,12 @@ std::string EthereumHex(const uint256& value)
     return "0x" + HexStr(value);
 }
 
-UniValue RecordJson(const char* kind, const BridgeRecordV1& record)
+UniValue RecordJson(const char* kind, const BridgeRecordV1& record,
+                    const BridgeMptLimits& mpt_limits = BRIDGE_MPT_LIMITS_V1)
 {
     UniValue out{UniValue::VOBJ};
     out.pushKV("kind", kind);
-    out.pushKV("payload_hex", PayloadHex(record));
+    out.pushKV("payload_hex", PayloadHex(record, mpt_limits));
     return out;
 }
 
@@ -327,6 +336,17 @@ int main(int argc, char** argv)
         if (rp_probe.good()) {
             rp_probe.close();
             const UniValue rp{LoadJson(dir + "receipt_proof.json")};
+            const UniValue& bridge_v2_json{rp.find_value("bridge_v2")};
+            if (!bridge_v2_json.isNull() && !bridge_v2_json.isBool()) {
+                throw std::runtime_error("bridge_v2 is not a boolean");
+            }
+            const bool bridge_v2{bridge_v2_json.isBool() && bridge_v2_json.get_bool()};
+            const BridgeMptLimits& mint_limits{
+                bridge_v2 ? BRIDGE_MPT_LIMITS_V2 : BRIDGE_MPT_LIMITS_V1};
+            if (bridge_v2) {
+                Info("  bridge V2 receipt rules: EIP-2718 types up to 0x7f, terminal node <= %zu bytes, proof <= %zu bytes\n",
+                     mint_limits.max_terminal_node_size, mint_limits.max_total_bytes);
+            }
             const uint64_t block{lcjson::Num(lcjson::Field(rp, "block_number"), "block_number")};
             const uint64_t tx_index{
                 lcjson::Num(lcjson::Field(rp, "index"), "index")};
@@ -460,7 +480,8 @@ int main(int argc, char** argv)
             Info("  [ok] receipt %llu proven against the receipts_root (%zu proof nodes)\n",
                  (unsigned long long)tx_index, proof.size());
 
-            const auto receipt{DecodeReceipt(*got)};
+            const auto receipt{DecodeReceipt(
+                *got, bridge_v2 ? RECEIPT_MAX_TYPE_V2 : RECEIPT_MAX_TYPE_V1)};
             if (!receipt) throw std::runtime_error("receipt decode failed");
             size_t transfers{0};
             const uint256 transfer_topic{[] {
@@ -578,8 +599,9 @@ int main(int argc, char** argv)
                 mint.mpt_nodes = proof;
                 const BridgeRecordV1 mint_record{
                     BridgeRecordKindV1::MINT, mint};
-                UniValue mint_json{RecordJson("mint", mint_record)};
+                UniValue mint_json{RecordJson("mint", mint_record, mint_limits)};
                 mint_json.pushKV("registry_id", registry_id.GetHex());
+                mint_json.pushKV("bridge_v2", bridge_v2);
                 mint_json.pushKV("origin_amount",
                                  RawAmount64(deposit->amount));
                 mint_json.pushKV("origin_token",

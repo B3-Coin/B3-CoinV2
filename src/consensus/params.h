@@ -87,6 +87,33 @@ struct BIP9Deployment {
 };
 
 /**
+ * The fresh finality lineage (bridge V2, B-8; finality-dependency doc
+ * section 6): a re-bootstrap of BLS finality at height R_f whose genesis
+ * committee comes from Snapshot(R_f - 1) and whose certificates sign the
+ * B3/FINALITY/V2 digest under their own lineage id, journal namespace and
+ * tracker state. The V1 lineage is unaffected by it.
+ *
+ * Unset on every shipped network: mainnet and test networks have no
+ * activation height until a reviewed hard fork pins one, and mainnet digest
+ * V2 only ever comes from V2 P3 (B-7). Regtest sets it solely through the
+ * -b3freshlineageheight startup knob.
+ */
+struct FreshLineageParams {
+    //! R_f: first height whose blocks may carry fresh-lineage certificates.
+    //! GenesisHeight() = R_f - 1 is a V1-grid checkpoint and history leaf 0
+    //! (the contracts' GENESIS_HEIGHT).
+    int activation_height{0};
+    //! FD-7: the fresh lineage's own maximum epoch extension (blocks); the
+    //! V1 lineage keeps ModernPosParams::max_epoch_extension.
+    int max_epoch_extension{0};
+    //! B-7 staging signer: the V1 single-vote signer additionally signs
+    //! digest V2 for this lineage. Regtest only; never true on mainnet.
+    bool staging_signer{false};
+
+    constexpr int GenesisHeight() const { return activation_height - 1; }
+};
+
+/**
  * Parameters that influence chain consensus.
  */
 struct Params {
@@ -246,6 +273,52 @@ struct Params {
      * bridge_withdrawal_activation_height must also be ratified and pinned.
      */
     std::optional<BridgeAssetParams> busd_bridge;
+    /**
+     * Fresh finality lineage (FreshLineageParams above). Unset means no
+     * fresh lineage exists and every fresh-lineage rule stays inactive;
+     * only regtest's -b3freshlineageheight knob sets it.
+     */
+    std::optional<FreshLineageParams> fresh_lineage;
+    //! True from R_f on a chain that configures the fresh lineage.
+    bool FreshLineageRulesActive(int height) const
+    {
+        return fresh_lineage && height >= fresh_lineage->activation_height;
+    }
+    /**
+     * Bridge V2 regime (BridgeV2Params in consensus/bridge_params.h). Unset
+     * on every shipped network, which keeps every V2 rule inactive; only the
+     * regtest pin file's v2 section sets it until a reviewed release pins
+     * every value. A set envelope must be complete: the node refuses to
+     * start otherwise (BridgeV2ConfigurationValid, checked in init.cpp on
+     * every network), so the Valid() test below is defensive only and never
+     * lets the V1 rules continue silently past V on a running node.
+     */
+    std::optional<BridgeV2Params> bridge_v2;
+    //! True from V on a chain whose bridge V2 envelope is complete.
+    bool BridgeV2RulesActive(int height) const
+    {
+        return bridge_v2 && bridge_v2->Valid() &&
+               height >= bridge_v2->activation_height;
+    }
+    //! Node changes section 3.4 startup assertion: unset, or complete.
+    bool BridgeV2ConfigurationValid() const
+    {
+        return !bridge_v2 || bridge_v2->Valid();
+    }
+    //! True from W2 (>= V): V2 burns may append leaf V2.
+    bool BridgeV2BurnRulesActive(int height) const
+    {
+        return BridgeV2RulesActive(height) && height >= bridge_v2->burn_height;
+    }
+    //! True from h_m on a chain whose complete envelope pins a B-23
+    //! successor: the launch entry is retired and the successor takes
+    //! deposits and burns (node changes section 7.6). Never true on a
+    //! network that leaves bridge_v2 unset.
+    bool BridgeV2MigrationActive(int height) const
+    {
+        return BridgeV2RulesActive(height) && bridge_v2->successor &&
+               height >= bridge_v2->successor->migration_height;
+    }
     /**
      * TEST-ONLY override of the historical FN disintegration collateral
      * (Proof of Disintegration). Unset everywhere except regtest fixtures:

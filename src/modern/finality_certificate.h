@@ -202,7 +202,9 @@ inline bool MatchFinalityCertificate(const CTransaction& coinbase, const uint32_
 }
 
 //! Block-level structural rule: FINALITY_CERT cells and type-4 records may
-//! exist only in the coinbase (and at most one pair there).
+//! exist only in the coinbase (and at most one pair there). Fresh-lineage
+//! type-11 records are coinbase-only too; at most one per coinbase is a
+//! fresh-lineage judging rule, not checked here.
 inline bool CheckFinalityCertificatePlacement(const CBlock& block, std::string& error)
 {
     for (size_t t = 1; t < block.vtx.size(); ++t) {
@@ -217,6 +219,14 @@ inline bool CheckFinalityCertificatePlacement(const CBlock& block, std::string& 
         for (const auto& rec : tx.mpa) {
             if (rec.payload_type == MPA_TYPE_FINALITY_CERTIFICATE) {
                 error = "finality-cert-record-not-in-coinbase";
+                return false;
+            }
+        }
+        // Fresh-lineage carrier (type 11, digest V2): coinbase-only as well.
+        // It has no metadata cell, so the record is the only thing to place.
+        for (const auto& rec : tx.mpa) {
+            if (rec.payload_type == MPA_TYPE_FINALITY_CERTIFICATE_V2) {
+                error = "fresh-cert-record-not-in-coinbase";
                 return false;
             }
         }

@@ -96,6 +96,18 @@ void FinalityTracker::Reset()
 
 FinalityTracker::State FinalityTracker::Projected(const int height, const Consensus::Params& params) const
 {
+    State s{ProjectedV1(height, params)};
+    // Fresh lineage (regtest knob only): projected after V1 and from the same
+    // private trackers (Snapshot(height - 1)); it never touches V1 fields.
+    if (params.fresh_lineage && m_synced_height == height - 1) {
+        ProjectFreshLineage(s.fresh, height, m_synced_tip, params,
+                            [this](const int h) { return SnapshotAt(0, h); });
+    }
+    return s;
+}
+
+FinalityTracker::State FinalityTracker::ProjectedV1(const int height, const Consensus::Params& params) const
+{
     State s{m_state};
     const std::optional<int> modern_start{Consensus::ModernPosStartHeight(params)};
     if (!modern_start || !params.modern_pos || height < *modern_start) return s;
@@ -161,11 +173,11 @@ std::shared_ptr<const ValidatorSetSnapshot> FinalityTracker::SetInForceAt(const 
 
 namespace {
 
-bool JudgeCoinbaseCertificate(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params,
-                              const FinalityTracker::State& projected,
-                              std::optional<modern::FinalityCertificatePair>& pair,
-                              std::string& error,
-                              const BridgeStateIndex* bridge_index)
+bool JudgeCoinbaseCertificateV1(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params,
+                                const FinalityTracker::State& projected,
+                                std::optional<modern::FinalityCertificatePair>& pair,
+                                std::string& error,
+                                const BridgeStateIndex* bridge_index)
 {
     pair.reset();
     if (block.vtx.empty()) { error = "finality-cert-no-coinbase"; return false; }
@@ -194,6 +206,25 @@ bool JudgeCoinbaseCertificate(const CBlock& block, const CBlockIndex& index, con
                                             withdrawal_root_at);
 }
 
+//! The V1 record first (unchanged), then the fresh-lineage record (type 11).
+bool JudgeCoinbaseCertificate(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params,
+                              const FinalityTracker::State& projected,
+                              std::optional<modern::FinalityCertificatePair>& pair,
+                              std::optional<modern::FinalityCertificateV2Record>& fresh_record,
+                              std::string& error,
+                              const BridgeStateIndex* bridge_index)
+{
+    fresh_record.reset();
+    if (!JudgeCoinbaseCertificateV1(block, index, params, projected, pair, error, bridge_index)) return false;
+    const auto hash_at{[&index](const int h) -> std::optional<uint256> {
+        const CBlockIndex* anc{index.GetAncestor(h)};
+        if (!anc) return std::nullopt;
+        return anc->GetBlockHash();
+    }};
+    return JudgeFreshCoinbaseCertificate(block, index, params, projected.fresh, hash_at, bridge_index,
+                                         fresh_record, error);
+}
+
 } // namespace
 
 bool FinalityTracker::CheckBlockCertificate(const CBlock& block, const CBlockIndex& index,
@@ -207,7 +238,8 @@ bool FinalityTracker::CheckBlockCertificate(const CBlock& block, const CBlockInd
     }
     const State projected{Projected(index.nHeight, params)};
     std::optional<modern::FinalityCertificatePair> pair;
-    return JudgeCoinbaseCertificate(block, index, params, projected, pair,
+    std::optional<modern::FinalityCertificateV2Record> fresh_record;
+    return JudgeCoinbaseCertificate(block, index, params, projected, pair, fresh_record,
                                     error, bridge_index);
 }
 
@@ -247,14 +279,45 @@ bool FinalityTracker::JudgeCandidateCertificate(const modern::FinalizedBlock& fb
                                             error, withdrawal_root_at);
 }
 
+std::optional<std::pair<int, uint256>> FinalityTracker::PinnedCheckpoint() const
+{
+    std::optional<std::pair<int, uint256>> pin;
+    if (m_state.finalized) pin = std::make_pair(m_state.finalized->height, m_state.finalized->block_hash);
+    if (m_state.fresh && m_state.fresh->finalized && (!pin || m_state.fresh->finalized->height > pin->first)) {
+        pin = std::make_pair(m_state.fresh->finalized->height, m_state.fresh->finalized->block_hash);
+    }
+    return pin;
+}
+
+bool FinalityTracker::JudgeCandidateCertificateV2(const modern::FinalizedBlockV2& fb,
+                                                  const modern::FinalityCertificate& cert,
+                                                  const CBlockIndex& parent, const Consensus::Params& params,
+                                                  std::string& error,
+                                                  const BridgeStateIndex* bridge_index) const
+{
+    if (!Synced(parent.GetBlockHash())) {
+        error = "finality-state-unavailable";
+        return false;
+    }
+    const State projected{Projected(parent.nHeight + 1, params)};
+    const auto hash_at{[&parent](const int h) -> std::optional<uint256> {
+        const CBlockIndex* anc{parent.GetAncestor(h)};
+        if (!anc) return std::nullopt;
+        return anc->GetBlockHash();
+    }};
+    return JudgeFreshCertificate(fb, cert, parent.nHeight + 1, params, projected.fresh, hash_at, bridge_index,
+                                 error);
+}
+
 bool FinalityTracker::ApplyModern(const CBlock& block, const CBlockIndex& index,
                                   const Consensus::Params& params,
                                   const BridgeStateIndex* bridge_index)
 {
     State s{Projected(index.nHeight, params)};
     std::optional<modern::FinalityCertificatePair> pair;
+    std::optional<modern::FinalityCertificateV2Record> fresh_record;
     std::string error;
-    if (!JudgeCoinbaseCertificate(block, index, params, s, pair, error,
+    if (!JudgeCoinbaseCertificate(block, index, params, s, pair, fresh_record, error,
                                   bridge_index)) {
         LogWarning("FinalityTracker: connected block %s (height %d) carries an invalid certificate (%s)",
                    index.GetBlockHash().ToString(), index.nHeight, error);
@@ -264,6 +327,20 @@ bool FinalityTracker::ApplyModern(const CBlock& block, const CBlockIndex& index,
         const auto& fb{pair->finalized_block};
         s.finalized = FinalizedCheckpoint{static_cast<int>(fb.height), fb.block_hash, fb.epoch, index.nHeight};
         if (fb.epoch == s.epoch) s.handover_certified = true;
+    }
+    if (fresh_record) {
+        const auto hash_at{[&index](const int h) -> std::optional<uint256> {
+            const CBlockIndex* anc{index.GetAncestor(h)};
+            if (!anc) return std::nullopt;
+            return anc->GetBlockHash();
+        }};
+        if (!s.fresh || !params.modern_pos ||
+            !ApplyFreshCertificate(*s.fresh, *fresh_record, index.nHeight, hash_at,
+                                   params.modern_pos->checkpoint_interval)) {
+            LogWarning("FinalityTracker: connected block %s (height %d): fresh-lineage history unavailable",
+                       index.GetBlockHash().ToString(), index.nHeight);
+            return false;
+        }
     }
     m_state = std::move(s);
     return true;

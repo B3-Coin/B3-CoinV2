@@ -12,9 +12,15 @@
 #include <bridge/relayer_plan.h>
 #include <bridge/rlp.h>
 #include <crypto/keccak256.h>
+#include <crypto/sha256.h>
+#include <test/data/eth_lc_fixture.h>
+#include <test/data/eth_receipts_proof_fixture.h>
 #include <uint256.h>
+#include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <optional>
 
 using namespace bridge;
 
@@ -23,10 +29,12 @@ BOOST_AUTO_TEST_SUITE(bridge_exec_chain_tests)
 namespace {
 
 //! Build a minimal post-London execution header (16 fields) with the given
-//! parent hash, number and receipts root.
+//! parent hash, number and receipts root. `state_item` replaces the encoded
+//! stateRoot field (default: 32 bytes of 0x11).
 std::vector<unsigned char> MakeHeader(const uint256& parent, uint64_t number,
                                       const uint256& receipts_root,
-                                      const size_t extra_data_size = 0)
+                                      const size_t extra_data_size = 0,
+                                      const std::optional<std::vector<unsigned char>>& state_item = std::nullopt)
 {
     std::vector<std::vector<unsigned char>> f;
     f.push_back(RlpEncodeBytes({parent.begin(), 32}));                    // parentHash
@@ -34,7 +42,7 @@ std::vector<unsigned char> MakeHeader(const uint256& parent, uint64_t number,
     const std::vector<unsigned char> addr(20, 0x22);
     f.push_back(RlpEncodeBytes(zero32));                                   // sha3Uncles
     f.push_back(RlpEncodeBytes(addr));                                     // miner
-    f.push_back(RlpEncodeBytes(zero32));                                   // stateRoot
+    f.push_back(state_item ? *state_item : RlpEncodeBytes(zero32));        // stateRoot
     f.push_back(RlpEncodeBytes(zero32));                                   // transactionsRoot
     f.push_back(RlpEncodeBytes({receipts_root.begin(), 32}));              // receiptsRoot
     f.push_back(RlpEncodeBytes(std::vector<unsigned char>(256, 0x00)));    // logsBloom
@@ -143,6 +151,105 @@ BOOST_AUTO_TEST_CASE(forgeries_rejected)
         const std::vector<std::vector<unsigned char>> junk{{0x83, 0x64, 0x6f, 0x67}};
         BOOST_CHECK(!VerifyExecAncestry(KeccakOf(junk[0]), 110, junk));
     }
+}
+
+BOOST_AUTO_TEST_CASE(state_root_is_recorded)
+{
+    const auto [chain, tip]{MakeChain(100, 110)};
+    const auto target{VerifyExecAncestry(tip, 100, chain)};
+    BOOST_REQUIRE(target);
+    const std::vector<unsigned char> expected(32, 0x11);
+    BOOST_CHECK(target->state_root == uint256{expected});
+
+    // V1 parity: a header whose field [3] is not a 32-byte string still
+    // links, but records no state root to prove anything against.
+    const std::vector<std::vector<unsigned char>> odd_items{
+        RlpEncodeBytes(std::span<const unsigned char>{}),
+        RlpEncodeBytes(std::vector<unsigned char>(31, 0x11)),
+        RlpEncodeBytes(std::vector<unsigned char>(33, 0x11)),
+        RlpEncodeList({RlpEncodeBytes(std::vector<unsigned char>(32, 0x11))}),
+    };
+    for (const auto& item : odd_items) {
+        const auto header{MakeHeader(uint256{}, 7, RootFor(7), 0, item)};
+        uint256 parent;
+        const auto parsed{exec_detail::ParseHeader(header, parent)};
+        BOOST_REQUIRE(parsed);
+        BOOST_CHECK(parsed->state_root.IsNull());
+        BOOST_CHECK(parsed->receipts_root == RootFor(7));
+        BOOST_CHECK(VerifyExecAncestry(KeccakOf(header), 7, {header}));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(state_root_from_mainnet_execution_fields)
+{
+    // Ethereum mainnet block 25811248 (the receipts-fixture block), from the
+    // captured light-client fixture. Its execution payload header fields are
+    // verbatim mainnet data, SSZ-proven against the beacon block in
+    // bridge_eth_light_client_tests. The full 21-field Prague/Fulu RLP header
+    // is rebuilt from them, with parentBeaconBlockRoot = the beacon block's
+    // parent_root. The fixture did not capture requestsHash (EIP-7685; it is
+    // not in the payload header), so the empty-requests value stands in for
+    // it and the rebuilt header's keccak is not the mainnet block hash. Every
+    // field ParseHeader reads is mainnet data.
+    using namespace eth_lc_fixture;
+    const ExecHeaderHex& e{U2_FINALIZED_EXEC};
+    const BeaconHeaderHex& b{U2_FINALIZED_BEACON};
+    auto hex = [](const std::string& h) {
+        auto v{TryParseHex<unsigned char>(h)};
+        BOOST_REQUIRE(v.has_value());
+        return *v;
+    };
+    auto raw = [&](const std::string& h) {
+        const auto v{hex(h)};
+        BOOST_REQUIRE_EQUAL(v.size(), 32U);
+        return uint256{v};
+    };
+    const auto base_fee_le{hex(e.base_fee_le)};
+    uint64_t base_fee{0};
+    for (size_t i = 0; i < base_fee_le.size(); ++i) {
+        if (i >= 8) {
+            BOOST_REQUIRE_EQUAL(base_fee_le[i], 0);
+            continue;
+        }
+        base_fee |= static_cast<uint64_t>(base_fee_le[i]) << (8 * i);
+    }
+    unsigned char empty_requests[CSHA256::OUTPUT_SIZE];
+    CSHA256().Finalize(empty_requests);
+    const std::vector<std::vector<unsigned char>> fields{
+        RlpEncodeBytes(hex(e.parent_hash)),
+        RlpEncodeBytes(hex("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347")), // ommersHash
+        RlpEncodeBytes(hex(e.fee_recipient)),
+        RlpEncodeBytes(hex(e.state_root)),
+        RlpEncodeBytes(hex(e.transactions_root)),
+        RlpEncodeBytes(hex(e.receipts_root)),
+        RlpEncodeBytes(hex(e.logs_bloom)),
+        RlpEncodeUint64(0), // difficulty
+        RlpEncodeUint64(e.block_number),
+        RlpEncodeUint64(e.gas_limit),
+        RlpEncodeUint64(e.gas_used),
+        RlpEncodeUint64(e.timestamp),
+        RlpEncodeBytes(hex(e.extra_data)),
+        RlpEncodeBytes(hex(e.prev_randao)), // mixHash
+        RlpEncodeBytes(std::vector<unsigned char>(8, 0x00)), // nonce
+        RlpEncodeUint64(base_fee),
+        RlpEncodeBytes(hex(e.withdrawals_root)),
+        RlpEncodeUint64(e.blob_gas_used),
+        RlpEncodeUint64(e.excess_blob_gas),
+        RlpEncodeBytes(hex(b.parent_root)), // parentBeaconBlockRoot
+        RlpEncodeBytes(std::span<const unsigned char>{empty_requests}), // requestsHash stand-in
+    };
+    const auto header{RlpEncodeList(fields)};
+    uint256 parent;
+    const auto parsed{exec_detail::ParseHeader(header, parent)};
+    BOOST_REQUIRE(parsed);
+    BOOST_CHECK_EQUAL(parsed->block_number, eth_receipts_fixture::BLOCK_NUMBER);
+    BOOST_CHECK(parent == raw(e.parent_hash));
+    BOOST_CHECK(parsed->state_root == raw(e.state_root));
+    BOOST_CHECK(parsed->state_root ==
+                raw("60bfc2e5324a94442dc0af36abc9901d1850c7434548bbcc6c59b7d1b275b01a"));
+    BOOST_CHECK(parsed->receipts_root == raw(eth_receipts_fixture::RECEIPTS_ROOT_HEX));
+    BOOST_CHECK(parsed->state_root != parsed->receipts_root);
+    BOOST_CHECK(parsed->block_hash == KeccakOf(header));
 }
 
 BOOST_AUTO_TEST_CASE(relayer_plan_chunks_with_one_header_overlap)
