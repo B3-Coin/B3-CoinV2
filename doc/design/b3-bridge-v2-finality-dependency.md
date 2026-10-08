@@ -760,3 +760,449 @@ brackets.
 - Unmeasured [H]: PBFT round time, verifier V2 gas, accumulator cost,
   escape fork choice.
 - Social: Set_3 cooperation for H1; committee liveness.
+
+---
+
+## 18. Implementation notes (S3 fresh-lineage hardening)
+
+This section records what the S3 fresh-lineage hardening slice built on
+`feat/flowmeshV2-dev-claude` on top of `965e23c`. It is regtest-only and
+implements §6.4, §6.5 and architecture B-37. It is not an owner ruling and
+changes no text above. §18.10 lists, as *pending owner review*, every
+choice that the sections above leave open and every departure from a
+sibling document (solve-and-report). References name files and symbols,
+not lines.
+
+### 18.1 Opt-in knob; what stays unchanged
+
+- **`-b3freshkeyheight=<R_key>`** (`src/chainparams.cpp`,
+  `src/chainparamsbase.cpp`, `src/kernel/chainparams.cpp`) sets
+  `Consensus::FreshLineageParams::key_height`, and
+  `Params::FreshKeyRulesActive(h)` holds from R_key. The knob requires
+  `-b3freshlineageheight`, and through it `-b3modernregtest -b3flowmeshtest`.
+  Every other chain refuses it as "regtest-only". R_key must satisfy
+  1 ≤ R_key ≤ R_f − 2 and lie above the legacy final height, so the genesis
+  window [R_key, R_f − 1] holds at least two blocks.
+- **Unset, the default:** the staging lineage of `965e23c` is unchanged.
+  Its committees carry the V1 FINALITY_KEY keys and the fresh key index is
+  never stepped. Mainnet and testnet set no `fresh_lineage`, so
+  `FreshKeyRulesActive` is false at every height there. On a chain without
+  R_key, a policy-version-2 cell is still an "inactive metadata policy". A
+  type-12 record is now refused as `mpa-inactive-type` (before:
+  `mpa-unknown-type`), so both stay invalid.
+- V1 bindings, the V1 signer, the V1 journals and the producer snapshots are
+  untouched. `MatchFinalityKeyPairs` skips policy-version-2 cells, and the
+  V1 binding index never reads the fresh one.
+
+### 18.2 Byte layouts
+
+| Object | Layout |
+|---|---|
+| Binding cell | Metadata cell, policy type 7 (FINALITY_KEY), **policy version 2**, zero value. Commitment = validator_key (x-only, 32). Params (56) = bls_pubkey 48 ‖ target_epoch u64 BE. V1 keeps policy version 1 |
+| Evidence | **MPA type 12** FRESH_FINALITY_KEY_EVIDENCE, version 1, exactly 248 bytes: validator_key 32 ‖ bls_pubkey 48 ‖ target_epoch u64 BE ‖ bip340_sig 64 ‖ pop 96 (the identity-bound proof of possession below). Verify cost 700, the same as type 5 (`src/modern/payload_cost.h`). Type 12 is an MPA record only (never a standalone creation action); its number is frozen and append-only (`src/modern/creation_action.h`) |
+| Bind digest | TaggedHash(`B3/FINALITY/FRESHBIND/V1`) over chain_domain 32 ‖ validator_key 32 ‖ bls_pubkey 48 ‖ target_epoch u64 BE, BIP340-signed by validator_key. V1's tag is `B3/FINALITY/BIND/V1`, so a signature of one kind never authorizes the other. The digest binds no lineage id (unknown before R_f), and there is no sequence and no revocation |
+| PoP digest | TaggedHash(`B3/FINALITY/FRESHPOP/V1`) over the same four fields, signed by the **fresh BLS key itself** with the signature suite (`bls::SIG_DST`): `pop` = BLS signature over this digest. The message contains the key, so it proves possession of the secret as the IETF PoP does (rogue-key safety for the committee aggregates; no vote digest uses this tag). Unlike the IETF PoP (sign(sk, pk) under `POP_DST`, which V1's type-5 evidence carries) it names the validator, the chain and the epoch, so no copy serves another claim (§18.3) |
+| Key store | `<datadir>/<net>/finality_signer/finality_fresh_keys_<chain_domain hex>_<validator hex>.dat`, integers LE: magic `B3FKEYS1` 8 ‖ version u8 = 1 ‖ chain_domain 32 ‖ validator 32 ‖ count u32 (≤ 4,096) ‖ count × {target_epoch u64 ‖ state u8 (1 HELD, 2 ERASED) ‖ bls_pubkey 48 ‖ secret 32 (big-endian scalar, zero when ERASED) ‖ bind_txid 32 (null until recorded)} ‖ SHA256 of all preceding bytes 32. Header 77 bytes, record 121 |
+| `finsigv2` | Exactly 148 bytes, the `FreshLineageSig` serialization: lineage_id 32 ‖ epoch u64 LE ‖ height u64 LE ‖ member index u32 LE ‖ BLS signature 96 over digest V2 |
+
+`MatchFreshFinalityKeyPairs` (`src/modern/finality_fresh_key.h`) pairs
+cells and records one-to-one by (validator_key, bls_pubkey, target_epoch).
+It fails closed with one of `fresh-key-cell-params`,
+`fresh-key-duplicate-cell`, `fresh-key-duplicate-evidence`,
+`fresh-key-orphan-evidence`, `fresh-key-cell-without-evidence` or
+`fresh-key-evidence-malformed`. `CheckFreshKeyTransition` then checks, in
+order: the fields agree, the key is nonzero, the BIP340 signature verifies,
+the key decodes canonically, and the identity-bound PoP verifies.
+
+### 18.3 Consensus checks structure; reuse is inert; the mempool refuses
+
+- **Consensus** (`src/validation.cpp`, gated). ContextualCheckBlock,
+  ConnectBlock and mempool PreChecks run the matcher
+  (`bad-fresh-finality-key-binding`). With R_key configured, ConnectBlock
+  also runs `VerifyFreshKeyBindingsInBlock`
+  (`bad-fresh-finality-key-evidence`), and the mempool runs
+  `CheckFreshKeyTransition` (`fresh-key-<check>`, TX_CONSENSUS). No other
+  property of a binding invalidates a block.
+- **Ever-bound index** (`FreshKeyBindingIndex`,
+  `src/node/finality_fresh_key_index.*`). `FinalityTracker` keeps it in key
+  mode only. It is stepped and rebuilt together with the tracker's stake and
+  V1 binding trackers from the first modern block, and every fresh pair is
+  re-verified. It keeps no undo trail: a disconnect marks the tracker dirty
+  and the next sync rebuilds all three from H+1. Every nonzero key claimed
+  under either kind is recorded once, and **the first claim wins**, in block
+  and transaction order. Inside one transaction, V1 pairs come first (in V1
+  matcher order) and fresh pairs follow in matcher key order, which is not
+  output order. A V1 key that its validator later moved off or revoked stays
+  bound.
+- **Inert reuse.** A fresh claim of an already bound key is recorded
+  nowhere and seats nobody. So neither a V1 key nor an earlier fresh key
+  ever enters a fresh committee. A V1 claim of a fresh-bound key follows the
+  unchanged V1 rules.
+- **No front-running (Codex review, blocking).** The first draft carried
+  the bare IETF PoP, a signature over the 48 key bytes only. Once an honest
+  binding was in the mempool, anyone could copy its key and PoP into a
+  fresh binding under any BIP340 key, or into a V1 FINALITY_KEY binding,
+  get it mined first, and burn the key (first claim wins): the member sat
+  out, without an alert. Front-running every genesis binding would have
+  kept the lineage from bootstrapping; front-running later ones would have
+  forced carry-over forever, or concentrated committee weight. The fix is
+  the identity-bound PoP (§18.2): the key signs (chain, validator, key,
+  epoch). A fresh copy under another identity, epoch or chain fails
+  `fresh-key-bad-pop` (consensus); a V1 copy fails V1's `bad-pop`, because
+  no fresh binding publishes the bare IETF PoP that V1 demands. So only a
+  holder of the key's secret can claim a fresh key, under either kind.
+  Tests: `pop_digest_layout_and_separation`,
+  `front_running_copies_of_a_pending_binding_are_refused` and the chain
+  copies (fresh and V1) in `mempool_and_block_wiring`
+  (`finality_fresh_key_tests`). A key claimed first elsewhere anyway (a
+  leaked secret) is alerted and replaceable (§18.6, §18.7).
+- **Mempool policy** (TX_NOT_STANDARD, key mode only,
+  `CheckFreshKeyBindingPolicy`). It refuses with `fresh-key-ever-bound` (the
+  key was bound before under either kind, or the transaction claims it
+  twice), `fresh-key-binding-outside-window`,
+  `fresh-key-lineage-unavailable` or `fresh-key-state-unavailable`. It does
+  not consult bindings still waiting in the mempool; with identity-bound
+  proofs a pending binding can only compete with another claim by the
+  key's own holder.
+- **Why inert rather than invalid.** The only context a binding's validity
+  depends on is the activation height R_key. No in-block conflict can arise,
+  so block assembly (`src/node/miner.cpp`) is unchanged. Type-11 certificates are
+  judged against the committees, and every node derives those committees
+  deterministically from the same blocks.
+
+### 18.4 Binding windows
+
+A block at height n counts a binding for exactly one target epoch
+(`FreshBindingWindowAt`). The committee rule reads the same windows
+(`FreshSeatWindow`).
+
+| Target | Counted if included in | Fixes |
+|---|---|---|
+| 0 (genesis) | [R_key, R_f − 1] | Set′_0 and Set′_1 (§6.4 rule (3)) |
+| 1 | Never | Nothing: Set′_1 shares the genesis binding |
+| t ≥ 2 | [start_(t−2), start_(t−1) − 1], i.e. during fresh epoch t − 2 | Set′_t, at the rotation into t − 1 (rule (2) with k + 1 = t) |
+
+Below R_key the window is `not-active`. From R_f, it is
+`lineage-unavailable` unless the lineage is bootstrapped and unbroken. A
+binding included outside its window is not counted, yet its key is still
+burned (ever bound).
+
+### 18.5 Committee(Snapshot) filter, void and carry-over
+
+`BuildFreshCommittee` and `FinalityTracker::FreshCommitteeAt` implement
+this. `ProjectFreshLineage` applies them only when the tracker passes
+`committee_at`, which it does in key mode.
+
+- Snapshot(h) membership is V1's, unchanged: positive whole stake weight and
+  a non-revoked V1 FINALITY_KEY binding. A member sits **on its fresh key,
+  with its stake weight**, only if exactly one counted binding names the
+  committee's epoch inside the window. With no such binding it sits out;
+  with two or more, its seat is **void** for that epoch (`FreshSeatFor`).
+  The committee is built over a temporary binding index that holds only
+  the seated fresh keys, so `ValidatorSetSnapshot::Build` and
+  `src/node/validator_set.*` are unchanged.
+- Genesis uses the request {snapshot R_f − 1, target 0, window from R_key}.
+  Set′_1 is Set′_0's members stamped 1. Below `min_finality_set` the lineage
+  stays unbootstrapped, with no fallback to V1 keys.
+- Rotation into epoch e at height h uses the request {h − 1, e + 1, window
+  from start_(e−1)}. Below the floor the existing carry-over applies with
+  Set′_e's members **and keys** (rule (4)), and bindings for the skipped
+  epoch go unused.
+- B3 still does not enforce the bridge's qualification of 4-64 members and
+  weight ≥ 900 (B-22 is out of scope, §18.11).
+
+### 18.6 Signer, store and erasure
+
+- **Keys.** Each key comes from 32 bytes of `GetStrongRandBytes` through the
+  IETF KeyGen (`bls::SecretKey::FromIKM`). Nothing reads the wallet
+  identity secret, so a wallet backup cannot regenerate a fresh key, unlike
+  `DeriveFinalityBlsKey`. The store (`FreshKeyStore`,
+  `src/node/finality_fresh_key_store.*`) refuses to generate a second HELD
+  key for a target epoch, because a second binding would void the seat.
+  - It fails closed on any byte it cannot verify: magic, version, checksum,
+    length, chain domain, validator, state, a non-canonical or duplicate
+    key, a HELD secret that does not match its key, or an ERASED record with
+    a nonzero secret byte.
+  - Each write runs under a process-wide mutex and first re-reads the file
+    it replaces. It then writes a temporary file (mode 0600) and runs
+    FileCommit, RenameOver and DirectoryCommit.
+  - Secrets live in locked memory and are cleansed when freed. Records are
+    never removed.
+- **Signing.** In key mode `FinalitySigner::SignFresh` takes a seat's
+  secret only from fresh keys, never from a V1 key. A persistent signer
+  re-opens its store on every pass, so keys the wallet bound meanwhile
+  appear. An offline or test signer uses `SetFreshKeys`, which takes at most
+  16 keys. Without key mode, signing uses the V1 keys as before.
+- **Erasure condition** (`FreshKeyRetiredSince`, `FreshKeyErasable`). Take
+  a tip in fresh epoch e of a bootstrapped lineage and a HELD key for target
+  t. The key is erased when all three hold: t ≤ e + 1; neither Set′_e nor
+  Set′_(e+1) seats it; and tip − since ≥ horizon. Here since =
+  start_(e−1) when e ≥ 1, t ≤ e and Set′_(e−1) does not seat the key
+  either; otherwise since = start_e.
+  - Why this matches §6.4: each epoch start lies above the inclusion of the
+    certificate that handed over out of the previous epoch. So the rule is
+    §6.4's "certified on B3 and deep", with the depth counted from the start
+    of the epoch whose entry retired the key.
+  - horizon is the modern reorg horizon (`FreshKeyErasureHorizon`: 1,440 on
+    mainnet, `-b3reorghorizon` on regtest), else E.
+  - Consequences: the genesis key goes at start_2 + horizon. A key that was
+    never seated (no counted binding, a void seat, or a skipped carry-over
+    epoch) goes once its committee is fixed and deep. A carried-over key
+    stays while a committee seats it, and a key for a later epoch stays.
+  - Erasure zeroes the secret in the rewritten file. Filesystem remnants and
+    snapshots are outside the node's control.
+- **Status and alerts.** Every pass computes them before the journal safety
+  check: the signer's keys with their seated epochs, and the seats in
+  Set′_(e−1), Set′_e or Set′_(e+1) without a held secret (a Set′_(e−1) key
+  that the policy erased does not count as missing). It raises an alert
+  for each counted chain binding of this validator whose key the store
+  neither holds nor erased (an old backup or a leaked identity key), and for
+  each void seat. Each alert is logged once while it persists. A current
+  seat without a held secret, or a store that cannot be read, is reported
+  as a recoverable `last_error`. A held key that the chain recorded under
+  another first claim (`FreshKeyBindingIndex::EverBound` without
+  `OwnFreshEpoch`: another validator's binding of either kind) raises its
+  own alert: this validator's binding of it is inert, and only a holder of
+  the secret could have made the claim.
+- **Unavailable committees.** `FinalityTracker::FreshCommitteeAt` reports
+  a request whose inputs are not at the snapshot height (a tracker bug) as
+  UNAVAILABLE, never as "nobody seated". `ProjectFreshLineage` then resets
+  the fresh state and returns false, `Projected()` sets
+  `fresh_unavailable`, `ApplyModern` fails (the tracker stays dirty and
+  rebuilds), and `CheckBlockCertificate` / `JudgeCandidateCertificateV2`
+  answer `finality-state-unavailable`, so no certificate is ever judged
+  against a guessed (carry-over or unbootstrapped) committee.
+- **Journal catch-up** (`FinalitySignerStore::CommitLineageCatchUp`).
+  It applies to FRESH_LINEAGE_V2 journals only; V1 journals refuse it. The
+  problem it solves: a member that sat out an epoch signed nothing in it, so
+  its ancestry lock still names its last seated epoch, and its next seat
+  would not follow that lock's successor set. The fix: when the lock's block
+  is on the active chain and an included fresh certificate of a later epoch
+  lies above it, the lock moves to that certificate. The certificate is
+  rebuilt and matched against its certificate id first, and the last actual
+  vote is kept.
+
+### 18.7 Wallet and RPC
+
+- **`bindfreshfinalitykey`**, called as
+  `bindfreshfinalitykey ( epoch {"broadcast":bool,"reuse_key":"v1"|"epoch:<n>"} )`
+  (`src/wallet/rpc/staking.cpp`).
+  - It refuses before touching the wallet: without key mode (every shipped
+    network) nothing is created or written, and a wallet without a
+    validator identity is refused rather than given one. It then needs an
+    unlocked wallet and the epoch that the next block's window counts; any
+    other epoch is refused.
+  - It is refused while this node's store holds a HELD key for that epoch,
+    unless that key can never seat this validator: no binding transaction
+    was ever recorded for it (the RPC records the txid before broadcasting
+    or returning hex, and publishes nothing if it cannot, so such a key
+    was never published), or the chain recorded another first claim of its
+    key (the chain interface probes the store's keys). Such a key is
+    erased first and listed under `replaced`.
+  - It generates the key durably in the node's store, which it finds in
+    the signer directory through `interfaces::Chain::freshFinalityKeyStatus`.
+  - It signs the bind digest with the wallet's validator secret, adds the
+    PoP, builds the cell plus the type-12 record, and records the txid in
+    the store.
+  - It warns when the validator has no active V1 binding. It erases a
+    generated key whose transaction cannot be built or recorded (reopening
+    the store once if a signer pass rewrote it).
+  - `broadcast=false` returns the hex. `reuse_key` serves regtest drills
+    only and needs `broadcast=false`: it rebinds the wallet's V1 key or a
+    stored fresh key to show `fresh-key-ever-bound`.
+- **`getfreshfinalitykeys`** joins the store's public records with the chain
+  bindings and seats, and returns `foreign_bindings`, `missing_seats` and
+  `alerts`; a store key claimed first elsewhere carries
+  `claimed_elsewhere_height` and an alert. Without the knob it returns only
+  `configured: false`.
+- **`getfinalitylineage`** gains a `fresh_keys` object in key mode only. It
+  holds R_key, `next_binding_window`, `next_binding_epoch`, `window_start`,
+  the bindings with `counted` and `void`, and Set′_(e−1), Set′_e and
+  Set′_(e+1) on their fresh keys. `local_signer` gains `fresh_keys`,
+  `missing_seats` and `alerts`.
+- The V1 RPCs `bindfinalitykey`, `importfinalitykey` and `startstaking` are
+  unchanged. The wallet file holds no fresh secret: a restored backup can
+  still bind a key (§6.4's limit), but it cannot sign for any epoch.
+
+### 18.8 P2P transport (`finsigv2`)
+
+- **Gate.** A node handles and sends `finsigv2` only where its chain
+  configures a fresh lineage (regtest `-b3freshlineageheight`, with or
+  without R_key). Every other node ignores the message before deserializing
+  it, applies no penalty and sends nothing. The type is appended to
+  `ALL_NET_MESSAGE_TYPES`, so `getpeerinfo` counts it by name. There is no
+  protocol-version gate.
+- **Receive path,** in order:
+  1. A size other than 148 bytes is ignored.
+  2. The vote takes a token from both the peer and the global wire bucket,
+     or from neither.
+  3. The vote is deserialized.
+  4. Under cs_main the bridge and finality trackers sync, as for `finsig`.
+  5. `pool.Fresh().Submit` charges the peer and global verify buckets once,
+     immediately before BLS decoding and verification. It never charges a
+     cheap reject or a known duplicate. A refused charge returns
+     `verification-deferred`.
+  6. On ACCEPTED, the vote floods once to every other connected, unpaused
+     peer.
+
+  There is no holding area. A vote that is too shallow, not on this tip's
+  grid or over budget is dropped, and the sender's replay retries it.
+- **Buckets** (`src/node/finality_fresh_transport.h`). They are separate
+  from V1 `finsig`'s buckets but repeat V1's values, because committees are
+  still full snapshots (MAX_FINALITY_SET = 8,192). A refusal costs nothing
+  and never disconnects, and a refill never moves the clock backwards.
+
+| Bucket | Rate per second | Capacity |
+|---|---|---|
+| Per-peer wire | 128 | 2 × MAX_FINALITY_SET |
+| Global wire | 512 | 4 × MAX_FINALITY_SET |
+| Per-peer verify | 32 | MAX_FINALITY_SET |
+| Global verify | 128 | 2 × MAX_FINALITY_SET |
+
+- **Replay** (`FreshVoteReplay`, one per connection).
+  - Each connection gets at most one batch per TICK = 1 s, of at most 64
+    votes, newest checkpoint first.
+  - Batches come from one shared export of the pool's verified votes
+    (`FreshVoteExport`, which hashes each vote id once per refresh, not per
+    peer per tick). The export is refreshed on every tip-hash change,
+    otherwise at most once a second.
+  - A vote goes out unless it was sent on this connection less than
+    RESEND = 15 s ago.
+  - The source (after ACCEPTED or DUPLICATE) and every flood recipient are
+    marked as sent, so no vote echoes back before RESEND.
+  - A remembered id is pruned only once its vote is out of the export AND
+    it was sent or marked at least RESEND ago. So a vote a peer relayed to
+    us is not echoed back even while the lagging export does not contain it
+    yet (the first draft dropped the mark at the next stale export). Memory
+    stays near two full pools; `MarkSent` stops at 8 checkpoints ×
+    MAX_FINALITY_SET.
+  - Votes from the local signer and from the hidden RPC go out within one
+    TICK. `src/node/staking.cpp` is unchanged.
+- **Hidden RPCs.** `getfinalitylineagevotes` and `submitfinalitylineagevote`
+  stay hidden, for drills. The functional harness (`FreshVoteShuttle` in
+  `test/functional/test_framework/b3bridge.py`) uses gossip by default and
+  keeps an `rpc` transport for drills. RT4, RT4a, RT4c, RT4d and
+  `feature_b3_fresh_lineage.py` move votes by gossip and assert `finsigv2`
+  traffic; `feature_b3_fresh_lineage.py` keeps one hidden-RPC drill.
+
+### 18.9 Tests
+
+- **Unit suites:**
+  - `finality_fresh_params_tests`: the knob.
+  - `finality_fresh_key_tests`: codec, matcher, checks, registry, ever-bound
+    index, windows, mempool policy, seat rules, committees, store, erasure
+    truth table, journal catch-up, signers and RPC status on chain fixtures.
+  - `finality_fresh_transport_tests`: message layout, buckets, replay
+    (including a stale export), and the `finsigv2` path through a real
+    PeerManager, with and without the lineage; on a frozen clock the gate
+    charges no budget, the per-peer wire bucket drops a valid vote after
+    its capacity of cheap ones, and the per-peer verification bucket defers
+    one after its capacity of BLS failures until a refill.
+  - The wallet suite `finality_fresh_key_wallet_tests`: keys are independent
+    of the wallet and its backups.
+  - `finality_v2_tests`: updated for type 12.
+- **Functional:** the new `feature_b3_fresh_lineage_keys.py` (extended
+  list). It runs five validators staking 40/30/20/10/10 with
+  `-b3minfinalityset=4`, R_f = 262, R_key = 241 and horizon 40, plus a sixth
+  node holding a restored backup of n0's wallet. It covers rotation to new
+  keys, an old backup that cannot sign, a void seat, erasure, restart and
+  `-reindex`, with no vote moved by RPC. `feature_b3_bridge_rt4a_round_trip.py
+  --freshkeys` (its own test_runner entry) runs the bridge V2 round trip on
+  genesis fresh keys bound between R_key = 241 and R_f − 1, so Verifier V2
+  is initialized with, and follows the handover to, a fresh-key committee.
+
+### 18.10 Implementation choices pending owner review
+
+1. **The knob is opt-in.** The regtest plan's startup line and knob row give
+   RT4 `-b3freshkeyheight=241`, but RT4, RT4a, RT4c, RT4d and
+   `feature_b3_fresh_lineage.py` run without it. The reason is RT4c: its
+   validators bind the certify tool's public test keys as V1 keys, so that
+   the tool can sign as B3's committees. Per-epoch keys run in
+   `feature_b3_fresh_lineage_keys.py` and in the extra RT4a entry
+   `--freshkeys`, which takes Verifier V2 through a fresh-key genesis and
+   handover (§18.9); no RT4 run yet relays a rotation to newly bound keys or
+   a void-seat member-count change to the verifier.
+2. **Never-bound-twice is not a validity rule.** §6.4 rule (1) ("refuse any
+   key ever bound") is implemented as mempool policy plus consensus
+   inertness, not as block invalidity (§18.3).
+3. **Claim order inside one transaction:** V1 pairs first, then fresh pairs
+   in matcher key order.
+4. **A fresh binding supplies only the key.** The seat still requires
+   Snapshot(h) membership, through a live V1 binding and active stake.
+5. **No V1-key fallback at genesis.** A genesis committee below the floor
+   leaves the lineage unbootstrapped.
+6. **Erasure depth.** It counts from the start of the epoch that retired the
+   key, not from the current epoch's start. Counting from the current start
+   would never reach the depth on a timely chain whose horizon is not below
+   E (on mainnet, E = horizon = 1,440).
+7. **The store's keying.** It is keyed by (chain domain, validator), not by
+   lineage id, because genesis keys exist before the lineage id does. It
+   does not store the proof of possession that node changes §7.7 lists:
+   the PoP is on chain in the type-12 record and can be recomputed.
+8. **The journal catch-up** across epochs a member sat out (§18.6).
+9. **`finsigv2` design.** Its budgets repeat V1's, and it floods once plus
+   replays, with no holding area.
+10. **Identity-bound proof of possession** (§18.2, §18.3). The type-12
+    `pop` is the fresh key's BLS signature over TaggedHash(
+    `B3/FINALITY/FRESHPOP/V1`, chain_domain ‖ validator_key ‖ bls_pubkey ‖
+    target_epoch) with the signature suite, not a dedicated DST: the frozen
+    BLS wrapper (`src/crypto/bls.h`) exposes no DST parameter and is
+    outside this slice, and the unique tag separates it from every vote
+    digest. The layout stays 248 bytes. A V1 claim of a fresh key is not
+    tracked per validator: it is impossible without the key's secret, since
+    no fresh binding publishes the bare IETF PoP.
+11. **Journal keying.** §6.4 "Journals" asks for a store keyed by (lineage
+    id, key). In key mode the fresh journal stays keyed by (lineage id,
+    validator) across all of a validator's per-epoch keys, with the
+    cross-epoch catch-up (`CommitLineageCatchUp`, §18.6). One watermark per
+    validator is stricter than one per key (it also orders votes across
+    that validator's keys), so it is safe.
+12. **Replacing a held key** (§18.7). `bindfreshfinalitykey` replaces a
+    held key for the window's epoch only when it was never published or its
+    key was claimed first elsewhere. A deep reorg that removed that other
+    claim after the replacement could make both of the validator's
+    bindings count and void its seat; that needs the key's secret to have
+    leaked first, which already calls for a new identity.
+
+### 18.11 What stays open
+
+- **B-22**, the bounded committee and forwarders, is out of scope. Fresh
+  committees are full snapshots, and the buckets are sized for 8,192
+  members.
+- **B-37 and B-22 together.** Under B-37 who is seated depends on every
+  member binding again each epoch by hand (no automatic rebinding), so
+  seated committees shrink and vary more than V1 snapshots. Carry-over
+  applies only below `min_finality_set`, not below the bridge's
+  qualification (4-64 members, weight ≥ 900). A seated committee that B3
+  accepts but Verifier V2 does not qualify is therefore more likely: it
+  stalls withdrawals, and strands them if the verifier's set expires.
+  Proposed before S5 (not implemented, it changes the committee rule):
+  on chains with bridge V2, carry over also when the seated set would not
+  be bridge-qualified (regtest-gated first), or land automatic rebinding
+  together with B-22.
+- **Automatic rebinding.** An operator calls `bindfreshfinalitykey` once
+  per window; the staking loop never binds.
+  - A member that misses a window sits out that epoch, unless a carry-over
+    keeps its seat.
+  - A binding still in the mempool when its window closes is not evicted.
+    If it is mined later, it is inert and burns its key.
+- **Encryption at rest.** The store holds raw secrets in a 0600 file,
+  outside wallet encryption and wallet backups. Moving a validator to
+  another datadir moves no fresh key: the operator either copies the store,
+  or binds anew and sits out meanwhile.
+- **OI-7 for P3-R1.** The windows and the erasure condition use V1's
+  handover-gated staging epochs and Snapshot(start − 1), whereas P3-R1
+  snapshots at the terminal checkpoint
+  (`doc/design/v2-stage0-r1-consensus.md:336-347`). Rules (2)-(4) and the
+  erasure condition need restating for P3-R1 (§9.2) before S5.
+- **B-37's limits, unchanged.**
+  - The identity key in every backup can bind a key for a coming epoch. If
+    the member also binds, the seat is void; if not, the backup holder takes
+    the seat.
+  - The alerts detect this but do not prevent it; a leak calls for restaking
+    under a new identity.
+  - Sit-outs cost committee weight, which the S5 liveness rehearsal must
+    measure.
+  - Erasure protects past epochs only, and only where the signer runs.
+- **Mainnet.** No shipped network sets R_key. Mainnet gets per-epoch keys
+  only with P3 (B-7), after OI-7, a reviewed hard fork and an owner ruling.
