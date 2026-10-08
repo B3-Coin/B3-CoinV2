@@ -1357,6 +1357,52 @@ BOOST_AUTO_TEST_CASE(gate_observations_and_receipt_limits_in_mempool_blocks_asse
         BOOST_CHECK_EQUAL(subjects[0].find_value("name").get_str(), "VERIFIER_E");
         BOOST_CHECK_EQUAL(subjects[1].find_value("accounts")[1].find_value("role").get_str(), "token");
     }
+    // getbridgev2info's forwarders object (route b and d3 factory pins,
+    // -rpcdoccheck on): absent without a pin, then exactly the pins, each
+    // hash in raw EVM order. The pins move registry_id_evm and never join
+    // `unpinned`; the entry id records name stays.
+    {
+        const UniValue before{Cli("getbridgev2info")};
+        BOOST_CHECK(before.find_value("forwarders").isNull());
+        const Consensus::BridgeV2Params saved{V2()};
+        BOOST_REQUIRE(!saved.deposit_forwarder && !saved.exit_forwarder);
+        const uint256 init_code_hash{uint8_t{0x77}};
+        const std::string init_code_hash_evm{"0x77" + std::string(62, '0')};
+        const Consensus::BridgeV2DepositForwarderPins deposit_pins{FillAddress(0x71), init_code_hash};
+        const Consensus::BridgeV2ExitForwarderPins exit_pins{FillAddress(0x72), init_code_hash, 30'110};
+        V2().deposit_forwarder = deposit_pins;
+        V2().exit_forwarder = exit_pins;
+        BOOST_REQUIRE(V2().Valid());
+        const UniValue info{Cli("getbridgev2info")};
+        const UniValue& forwarders{info.find_value("forwarders")};
+        BOOST_REQUIRE(forwarders.isObject());
+        BOOST_CHECK_EQUAL(forwarders.size(), 2U);
+        const UniValue& deposit{forwarders.find_value("deposit")};
+        BOOST_CHECK_EQUAL(deposit.size(), 2U);
+        BOOST_CHECK_EQUAL(deposit.find_value("factory").get_str(), EvmHexOf(FillAddress(0x71)));
+        BOOST_CHECK_EQUAL(deposit.find_value("init_code_hash").get_str(), init_code_hash_evm);
+        const UniValue& exit_json{forwarders.find_value("exit")};
+        BOOST_CHECK_EQUAL(exit_json.size(), 3U);
+        BOOST_CHECK_EQUAL(exit_json.find_value("factory").get_str(), EvmHexOf(FillAddress(0x72)));
+        BOOST_CHECK_EQUAL(exit_json.find_value("init_code_hash").get_str(), init_code_hash_evm);
+        BOOST_CHECK_EQUAL(exit_json.find_value("dst_eid").getInt<uint32_t>(), 30'110U);
+        BOOST_CHECK_EQUAL(info.find_value("unpinned").write(), before.find_value("unpinned").write());
+        BOOST_CHECK_EQUAL(info.find_value("vault_entry_id_evm").get_str(),
+                          before.find_value("vault_entry_id_evm").get_str());
+        BOOST_CHECK(info.find_value("registry_id_evm").get_str() != before.find_value("registry_id_evm").get_str());
+        // Each pin is optional on its own.
+        V2().deposit_forwarder.reset();
+        const UniValue exit_only{Cli("getbridgev2info").find_value("forwarders")};
+        BOOST_CHECK(exit_only.find_value("deposit").isNull());
+        BOOST_CHECK_EQUAL(exit_only.find_value("exit").write(), exit_json.write());
+        V2().deposit_forwarder = deposit_pins;
+        V2().exit_forwarder.reset();
+        const UniValue deposit_only{Cli("getbridgev2info").find_value("forwarders")};
+        BOOST_CHECK(deposit_only.find_value("exit").isNull());
+        BOOST_CHECK_EQUAL(deposit_only.find_value("deposit").write(), deposit.write());
+        V2() = saved;
+        BOOST_CHECK(Cli("getbridgev2info").find_value("forwarders").isNull());
+    }
     // Each subject built from eth_getProof results at anchor 101 is exactly
     // the record the consensus checks below connect, with B3's verdict (0).
     for (const uint8_t subject : {SUBJECT_VERIFIER, SUBJECT_RESERVE, SUBJECT_TOKEN}) {

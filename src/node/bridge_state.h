@@ -51,7 +51,9 @@ enum class BridgeBurnReadiness {
     READY,
 };
 
-//! True only for a syntactically decoded decentralized BRIDGE_BURN record.
+//! True only for a syntactically decoded decentralized BRIDGE_BURN record,
+//! decoded under the bridge V2 record set, so a burn carrying a route (d3)
+//! exit block counts as well.
 bool HasDecentralizedBridgeBurn(const CTransaction& tx);
 bool HasDecentralizedBridgeBurn(const CBlock& block);
 
@@ -506,9 +508,14 @@ struct BridgeDecentralizedWithdrawalRequest {
  * successor v'). `sweep` marks a kind 16 VAULT_SWEEP leaf (section 7.6):
  * it names the retired v (entry 0), pays the successor vault v' and adds
  * its amount to transit_v'. A sweep's `burn_output_index` is the index of
- * the carrier's binding output, the one output that names the record. Both
- * are trailing members, so positional initializers of a kind 6 leaf stay
- * valid.
+ * the carrier's binding output, the one output that names the record.
+ *
+ * `exit` is the route (d3) exit block of a kind 6 burn that carried one
+ * (node changes section 7.2 item 5, C-7): the exit forwarder parameters p
+ * that check 5 verified, stored with the leaf and undone with it, so
+ * getbridgewithdrawals and getbridgewithdrawalproofv2 return p without
+ * reading the burn block. Never set on a sweep. All three are trailing
+ * members, so positional initializers of a kind 6 leaf stay valid.
  */
 struct BridgeWithdrawalV2Request {
     Txid transaction_id{};
@@ -519,6 +526,7 @@ struct BridgeWithdrawalV2Request {
     uint256 connected_block{};
     uint8_t entry{0};
     bool sweep{false};
+    std::optional<modern::ExitForwarderParamsV2> exit{};
 
     friend bool operator==(const BridgeWithdrawalV2Request&,
                            const BridgeWithdrawalV2Request&) = default;

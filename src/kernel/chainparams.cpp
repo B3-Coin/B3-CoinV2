@@ -1287,7 +1287,8 @@ public:
             // and once a block at or above A3 is stored the file can no
             // longer change. The OI-3 code hashes stay unset (31337 only).
             // The same guard freezes an optional B-23 successor, whose rules
-            // apply only from its migration height h_m > V.
+            // apply only from its migration height h_m > V, and the optional
+            // deposit and exit forwarder pins.
             if (b3.bridge_pins && b3.bridge_pins->v2) {
                 const B3RegTestBridgePins::V2Section& v2{*b3.bridge_pins->v2};
                 if (!consensus.fresh_lineage) {
@@ -1405,6 +1406,19 @@ public:
                     }
                     bridge_v2.successor = std::move(successor);
                 }
+                // Route (b) and (d3) forwarder factories (node changes
+                // section 3.1), pinned with v before the first block >= A3:
+                // the DeployV2 deployer's CREATE addresses at nonces n+4 and
+                // n+5 and B3Forwarder's init-code hash are known before the
+                // fresh lineage starts. Neither may sit on a V1 contract;
+                // Valid() keeps them off every V2 contract and apart.
+                if ((v2.deposit_forwarder && is_v1_contract(v2.deposit_forwarder->factory)) ||
+                    (v2.exit_forwarder && is_v1_contract(v2.exit_forwarder->factory))) {
+                    throw std::runtime_error(
+                        "-b3bridgepins v2 forwarder factories must differ from every V1 bridge contract");
+                }
+                bridge_v2.deposit_forwarder = v2.deposit_forwarder;
+                bridge_v2.exit_forwarder = v2.exit_forwarder;
                 if (!bridge_v2.Valid()) {
                     throw std::runtime_error(
                         "-b3bridgepins v2 does not form a complete bridge V2 configuration");

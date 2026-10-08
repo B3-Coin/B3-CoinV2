@@ -18,6 +18,7 @@
 #include <modern/asset_output.h>
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
+#include <modern/bridge_forwarder.h>
 #include <modern/bridge_v2.h>
 #include <modern/finality_types.h>
 #include <modern/finality_v2.h>
@@ -1465,6 +1466,73 @@ node::BridgeBlockDelta Verifies(const node::BridgeStateIndex& index,
                                           delta, error, lineage),
                         error);
     return delta;
+}
+
+// -- Route (d3) exit burns (node changes section 7.2 item 5) ----------------
+
+//! The exit forwarder pin of the exit-burn fixtures: factory 0x4e.., a
+//! stand-in init-code hash and Arbitrum's LayerZero endpoint id.
+Consensus::BridgeV2ExitForwarderPins ExitForwarderPins()
+{
+    return {FilledAddress(0x4e), TestHash(0x4f), 30'110};
+}
+
+//! `params` with ExitForwarderPins pinned.
+Consensus::Params WithExitForwarder(Consensus::Params params)
+{
+    params.bridge_v2->exit_forwarder = ExitForwarderPins();
+    BOOST_REQUIRE(params.bridge_v2->Valid());
+    return params;
+}
+
+//! Valid F_x parameters: Arbitrum `to` 0x7a.., the 0.5% bridge fee bound,
+//! a 3 USDT fee cap and refund EOA 0x7b...
+modern::ExitForwarderParamsV2 ExitParams()
+{
+    modern::ExitForwarderParamsV2 exit;
+    exit.dst_eid = ExitForwarderPins().dst_eid;
+    exit.to = modern::ForwarderAddressWord(FilledAddress(0x7a));
+    exit.max_bridge_fee_bps = modern::FORWARDER_MAX_BRIDGE_FEE_BPS;
+    exit.fee_cap = 3'000'000;
+    exit.refund_eoa = FilledAddress(0x7b);
+    return exit;
+}
+
+//! F_x of `exit` under ExitForwarderPins.
+Consensus::BridgeEthAddress ExitForwarderOf(const modern::ExitForwarderParamsV2& exit)
+{
+    return modern::ExitForwarderAddressV2(ExitForwarderPins(), exit);
+}
+
+//! BurnTransactionV2 to `recipient` with an optional exit block, encoded
+//! under the V2 record set (the only set with the block), naming the
+//! launch entry.
+CTransactionRef ExitBurnTransactionV2(
+    const Consensus::Params& params, const uint8_t source_tag,
+    const CAmount amount,
+    const std::optional<modern::ExitForwarderParamsV2>& exit,
+    const Consensus::BridgeEthAddress& recipient)
+{
+    const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
+    const auto entry{modern::ConfiguredBridgeV2EntryId(params)};
+    BOOST_REQUIRE(asset);
+    BOOST_REQUIRE(entry);
+    const bridge::BridgeBurnV1 burn_record{
+        *entry, 0, static_cast<uint64_t>(amount), recipient, exit};
+    const auto record{bridge::MakeBridgeMpaRecord(
+        bridge::BridgeRecordV1{bridge::BridgeRecordKindV1::BRIDGE_BURN, burn_record},
+        bridge::BRIDGE_MPT_LIMITS_V2)};
+    const auto burn{modern::MakeAssetBurnOutput(*asset, amount)};
+    BOOST_REQUIRE(record);
+    BOOST_REQUIRE(burn);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint{Txid::FromUint256(TestHash(source_tag)), 0};
+    tx.vout = {*burn, *binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
 }
 
 } // namespace
@@ -6083,6 +6151,9 @@ BOOST_AUTO_TEST_CASE(v2_migration_delta_invariants)
         refused(index, bad, "bridge delta contains an invalid V2 withdrawal");
         bad.withdrawals_v2_added.front().entry = 2; // no such entry
         refused(index, bad, "bridge delta contains an invalid V2 withdrawal");
+        bad.withdrawals_v2_added.front().entry = 0;
+        bad.withdrawals_v2_added.front().exit = ExitParams(); // a sweep never carries one
+        refused(index, bad, "bridge delta contains an invalid V2 withdrawal");
     }
     {
         // Successor transit without a sweep.
@@ -6355,6 +6426,263 @@ BOOST_AUTO_TEST_CASE(v2_migration_preview_and_mempool)
         no_v2.bridge_v2.reset();
         BOOST_CHECK(node::EvaluateBridgeV2SweepGate(&lineage.context, index, no_v2, h_m, 1'070).readiness ==
                     node::BridgeBurnReadiness::UNAVAILABLE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_burn_exit_block)
+{
+    // Route (d3) (node changes section 7.2 item 5; contracts spec section
+    // 8): a kind 6 burn may carry an exit block naming the F_x parameters p.
+    // It is valid only with a pinned exit forwarder, p valid against it
+    // (B3OftExitFactory.isValid except EOA-ness) and a recipient equal to
+    // F_x(p). The check is deterministic and runs before the gate, so a
+    // context-free caller and replay (REPLAY_LINEAGE) apply it too. The leaf
+    // is an ordinary V2 leaf naming F_x.
+    const Consensus::Params params{WithExitForwarder(LineageParams())};
+    const LineageFixture lineage;
+    const ReceiptFixture receipts{FundingReceipts(params)};
+    bridge_test::ObservationWorld world{HealthyWorld(params, 2, 100)};
+    node::BridgeStateIndex probe{FundingIndex(params, receipts, world.StateRoot())};
+    world.SetVerifier(lineage.Canonical(1, 109, params, probe));
+    node::BridgeStateIndex index{FundingIndex(params, receipts, world.StateRoot())};
+    ConnectNext(index, params, {MintTransactionV2(params, receipts, 0, 60)});
+    ConnectNext(index, params,
+                {MintTransactionV2(params, receipts, 1, 40),
+                 Observe(world, SUBJECT_TOKEN, receipts.block_hash),
+                 Observe(world, SUBJECT_RESERVE, receipts.block_hash),
+                 Observe(world, SUBJECT_VERIFIER, receipts.block_hash)},
+                1'061, &lineage.context);
+    const int next{index.ConnectedHeight() + 1};
+    BOOST_REQUIRE(node::EvaluateBridgeV2BurnGate(&lineage.context, index, params, next, 1'063).readiness ==
+                  node::BridgeBurnReadiness::READY);
+
+    const modern::ExitForwarderParamsV2 exit{ExitParams()};
+    const Consensus::BridgeEthAddress f_x{ExitForwarderOf(exit)};
+    const CTransactionRef burn{ExitBurnTransactionV2(params, 1, 10, exit, f_x)};
+    // The same burn to F_x without the block.
+    const CTransactionRef plain{ExitBurnTransactionV2(params, 1, 10, std::nullopt, f_x)};
+    BOOST_REQUIRE(burn->GetHash() != plain->GetHash());
+
+    // The gate paths, the closing-block eviction (HasDecentralizedBridgeBurn)
+    // and the retirement eviction see it as a burn: they decode with the V2
+    // record set, under which alone the block exists.
+    BOOST_CHECK(!bridge::DecodeBridgeMpaRecordV1(burn->mpa.front()));
+    BOOST_CHECK(node::HasDecentralizedBridgeBurn(*burn));
+    BOOST_CHECK(node::HasDecentralizedBridgeBurn(Block(1'063, {burn})));
+    BOOST_CHECK(!node::HasBridgeV2LineageRecord(*burn));
+    BOOST_CHECK(!node::HasBridgeV2VaultSweep(*burn));
+    {
+        std::string error;
+        BOOST_CHECK(!node::CheckBridgeV2BurnReadiness(*burn, node::BridgeBurnReadiness::NOT_READY, error));
+        BOOST_CHECK(node::CheckBridgeV2BurnReadiness(*burn, node::BridgeBurnReadiness::READY, error));
+    }
+    {
+        const Consensus::Params migration{WithSuccessor(params)};
+        const CTransactionRef launch_burn{ExitBurnTransactionV2(migration, 2, 10, exit, f_x)};
+        BOOST_CHECK(node::HasBridgeV2RetiredEntryBurn(*launch_burn, migration, MIGRATION_HEIGHT));
+        BOOST_CHECK(!node::HasBridgeV2RetiredEntryBurn(*launch_burn, migration, MIGRATION_HEIGHT - 1));
+    }
+
+    const auto verifies{[&](const std::vector<CTransactionRef>& txs,
+                            const node::BridgeV2LineageContext* context,
+                            const Consensus::Params& with = Consensus::Params{}) {
+        node::BridgeBlockDelta delta;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyBlock(Block(1'063, txs), next, V2TestBlockHash(next),
+                                              with.bridge_v2 ? with : params, delta, error, context),
+                            error);
+        return delta;
+    }};
+
+    // Accepted: block validation with the fresh context, without one and
+    // on replay, and mempool admission / wallet prevalidation.
+    {
+        const node::BridgeBlockDelta delta{verifies({burn}, &lineage.context)};
+        BOOST_REQUIRE_EQUAL(delta.withdrawals_v2_added.size(), 1U);
+        const node::BridgeWithdrawalV2Request& request{delta.withdrawals_v2_added.front()};
+        BOOST_CHECK(request.transaction_id == burn->GetHash());
+        BOOST_CHECK(request.withdrawal.recipient == f_x);
+        // p is stored with the leaf (C-7), never on a plain burn.
+        BOOST_CHECK(request.exit == exit);
+        BOOST_CHECK(!request.sweep);
+        BOOST_CHECK_EQUAL(request.withdrawal.amount, 10);
+        BOOST_CHECK(request.withdrawal.vault == params.bridge_v2->vault.vault_address);
+        BOOST_CHECK(request.withdrawal.token == params.bridge_v2->vault.token_address);
+        // The block adds no leaf field: the plain burn to F_x yields the
+        // same withdrawal and leaf.
+        const node::BridgeBlockDelta plain_delta{verifies({plain}, &lineage.context)};
+        BOOST_REQUIRE_EQUAL(plain_delta.withdrawals_v2_added.size(), 1U);
+        BOOST_CHECK(plain_delta.withdrawals_v2_added.front().withdrawal == request.withdrawal);
+        BOOST_CHECK(plain_delta.withdrawals_v2_added.front().leaf == request.leaf);
+        BOOST_CHECK(!plain_delta.withdrawals_v2_added.front().exit);
+        BOOST_CHECK(plain_delta.withdrawal_tree_v2_after == delta.withdrawal_tree_v2_after);
+    }
+    BOOST_CHECK_EQUAL(verifies({burn}, nullptr).withdrawals_v2_added.size(), 1U);
+    BOOST_CHECK_EQUAL(verifies({burn}, &node::REPLAY_LINEAGE).withdrawals_v2_added.size(), 1U);
+    {
+        node::BridgeTxAuthorization authorization;
+        std::string error;
+        BOOST_CHECK_MESSAGE(index.VerifyTransaction(*burn, next, 1'063, params, authorization, error,
+                                                    &lineage.context),
+                            error);
+        BOOST_REQUIRE(authorization.withdrawal_v2);
+        BOOST_CHECK(authorization.withdrawal_v2->withdrawal.recipient == f_x);
+        BOOST_CHECK(authorization.withdrawal_v2->exit == exit);
+    }
+
+    // Refused, with the stable strings, by every caller: a wrong recipient
+    // (any address, F_x of other parameters, F_x under another factory),
+    // invalid parameters (a foreign or zero dst_eid, bps 51, a `to` with an
+    // upper byte set or a zero address, a null refund EOA) and a refund EOA
+    // holding a bridge V2 role (OI-6: it could never call withdrawOnEthereum).
+    const std::string not_fx{"bridge V2 burn recipient is not the exit forwarder of its exit parameters"};
+    const std::string invalid{"bridge V2 burn exit parameters are invalid"};
+    const std::string reserved{"bridge V2 burn exit refund EOA holds a bridge V2 role"};
+    const std::string no_pin{"bridge V2 burn exit block needs a pinned exit forwarder"};
+    struct Refusal {
+        modern::ExitForwarderParamsV2 exit;
+        std::optional<Consensus::BridgeEthAddress> recipient;
+        const std::string& expected;
+    };
+    std::vector<Refusal> refusals;
+    refusals.push_back({exit, FilledAddress(0x91), not_fx});
+    refusals.push_back({exit, params.bridge_v2->vault.vault_address, not_fx});
+    {
+        modern::ExitForwarderParamsV2 other{exit};
+        ++other.fee_cap;
+        refusals.push_back({exit, ExitForwarderOf(other), not_fx});
+        Consensus::BridgeV2ExitForwarderPins other_factory{ExitForwarderPins()};
+        other_factory.factory = FilledAddress(0x4d);
+        refusals.push_back({exit, modern::ExitForwarderAddressV2(other_factory, exit), not_fx});
+        Consensus::BridgeV2ExitForwarderPins other_code{ExitForwarderPins()};
+        other_code.init_code_hash = TestHash(0x50);
+        refusals.push_back({exit, modern::ExitForwarderAddressV2(other_code, exit), not_fx});
+    }
+    for (const uint32_t dst_eid : {uint32_t{30'101}, uint32_t{0}, uint32_t{30'111}}) {
+        modern::ExitForwarderParamsV2 bad{exit};
+        bad.dst_eid = dst_eid;
+        refusals.push_back({bad, std::nullopt, invalid});
+    }
+    {
+        modern::ExitForwarderParamsV2 bad{exit};
+        bad.max_bridge_fee_bps = modern::FORWARDER_MAX_BRIDGE_FEE_BPS + 1;
+        refusals.push_back({bad, std::nullopt, invalid});
+        bad.max_bridge_fee_bps = 0xffff;
+        refusals.push_back({bad, std::nullopt, invalid});
+    }
+    for (const size_t upper : {size_t{0}, size_t{11}}) {
+        modern::ExitForwarderParamsV2 bad{exit};
+        bad.to[upper] = 0x01;
+        refusals.push_back({bad, std::nullopt, invalid});
+    }
+    {
+        modern::ExitForwarderParamsV2 bad{exit};
+        bad.to = modern::ForwarderWord{};
+        refusals.push_back({bad, std::nullopt, invalid});
+        bad = exit;
+        bad.refund_eoa = Consensus::BridgeEthAddress{};
+        refusals.push_back({bad, std::nullopt, invalid});
+    }
+    for (const Consensus::BridgeEthAddress& role :
+         {params.bridge_v2->vault.vault_address, params.bridge_v2->vault.token_address,
+          params.bridge_v2->verifier.address, ExitForwarderPins().factory}) {
+        BOOST_REQUIRE(modern::BridgeV2ReservedEthAddressReason(*params.bridge_v2, role));
+        modern::ExitForwarderParamsV2 bad{exit};
+        bad.refund_eoa = role;
+        refusals.push_back({bad, std::nullopt, reserved});
+    }
+    uint8_t source{0x30};
+    for (const Refusal& refusal : refusals) {
+        const CTransactionRef tx{ExitBurnTransactionV2(
+            params, source++, 10, refusal.exit, refusal.recipient.value_or(ExitForwarderOf(refusal.exit)))};
+        BOOST_CHECK(node::HasDecentralizedBridgeBurn(*tx));
+        VerifyFails(index, Block(1'063, {tx}), next, params, refusal.expected, &lineage.context);
+        VerifyFails(index, Block(1'063, {tx}), next, params, refusal.expected);
+        VerifyFails(index, Block(1'063, {tx}), next, params, refusal.expected, &node::REPLAY_LINEAGE);
+        // After a valid exit burn of the same block too.
+        VerifyFails(index, Block(1'063, {burn, tx}), next, params, refusal.expected, &lineage.context);
+        node::BridgeTxAuthorization authorization;
+        std::string error;
+        BOOST_CHECK(!index.VerifyTransaction(*tx, next, 1'063, params, authorization, error, &lineage.context));
+        BOOST_CHECK_MESSAGE(error.find(refusal.expected) != std::string::npos, error);
+    }
+
+    // Without a pinned exit forwarder the block refuses the burn, whatever
+    // its parameters; a burn without the block is unaffected.
+    {
+        const Consensus::Params unpinned{LineageParams()};
+        BOOST_REQUIRE(!unpinned.bridge_v2->exit_forwarder);
+        BOOST_REQUIRE(modern::ConfiguredBridgeV2EntryId(unpinned) == modern::ConfiguredBridgeV2EntryId(params));
+        VerifyFails(index, Block(1'063, {burn}), next, unpinned, no_pin, &lineage.context);
+        VerifyFails(index, Block(1'063, {burn}), next, unpinned, no_pin, &node::REPLAY_LINEAGE);
+        node::BridgeTxAuthorization authorization;
+        std::string error;
+        BOOST_CHECK(!index.VerifyTransaction(*burn, next, 1'063, unpinned, authorization, error, &lineage.context));
+        BOOST_CHECK_MESSAGE(error.find(no_pin) != std::string::npos, error);
+        BOOST_CHECK_EQUAL(verifies({plain}, &node::REPLAY_LINEAGE, unpinned).withdrawals_v2_added.size(), 1U);
+    }
+
+    // The exit burn connects and disconnects like any burn; the index keeps
+    // p with the leaf, by id and by source, and drops it on disconnect.
+    {
+        const node::BridgeBlockDelta delta{ConnectNext(index, params, {burn}, 1'063, &lineage.context)};
+        BOOST_REQUIRE_EQUAL(delta.withdrawals_v2_added.size(), 1U);
+        BOOST_CHECK(index.WithdrawalTreeV2() == delta.withdrawal_tree_v2_after);
+        const uint64_t id{delta.withdrawals_v2_added.front().withdrawal.withdrawal_id};
+        const auto by_id{index.WithdrawalV2(id)};
+        BOOST_REQUIRE(by_id);
+        BOOST_CHECK(by_id->exit == exit);
+        const auto by_source{index.WithdrawalV2(node::BridgeWithdrawalId{burn->GetHash(), 0})};
+        BOOST_REQUIRE(by_source);
+        BOOST_CHECK(by_source->exit == exit);
+        const auto through{index.WithdrawalsV2Through(index.ConnectedHeight())};
+        BOOST_REQUIRE(through);
+        BOOST_CHECK(through->back().exit == exit);
+        Disconnect(index);
+        BOOST_CHECK(index.WithdrawalTreeV2() == delta.withdrawal_tree_v2_before);
+        BOOST_CHECK(!index.WithdrawalV2(id));
+    }
+
+    // Below V, and on every chain without a bridge V2 envelope, the block
+    // does not exist: the record is malformed, as the MPA structure rule
+    // finds too.
+    {
+        node::BridgeStateIndex below;
+        ConnectEmptyThrough(below, params, BRIDGE_V2_HEIGHT - 2);
+        VerifyFails(below, Block(1'060, {burn}), BRIDGE_V2_HEIGHT - 1, params, "bridge record is malformed");
+        std::string mpa_error;
+        BOOST_CHECK(!modern::CheckTransactionMpa(*burn, params, BRIDGE_V2_HEIGHT - 1, mpa_error));
+        BOOST_CHECK_EQUAL(mpa_error, "mpa-malformed-bridge-record");
+        mpa_error.clear();
+        BOOST_CHECK_MESSAGE(modern::CheckTransactionMpa(*burn, params, BRIDGE_V2_HEIGHT, mpa_error), mpa_error);
+
+        Consensus::Params no_v2{params};
+        no_v2.bridge_v2.reset();
+        VerifyFails(index, Block(1'063, {burn}), next, no_v2, "bridge record is malformed");
+        mpa_error.clear();
+        BOOST_CHECK(!modern::CheckTransactionMpa(*burn, no_v2, next, mpa_error));
+        BOOST_CHECK_EQUAL(mpa_error, "mpa-malformed-bridge-record");
+    }
+    // Mainnet and testnet keep bridge_v2 unset, so their consensus selects
+    // the V1 record set at every height: on mainnet (live bridge V1) the
+    // exit block makes the record malformed while the same burn without it
+    // passes the structure rule; testnet has no modern objects at all.
+    for (const ChainType chain : {ChainType::MAIN, ChainType::TESTNET}) {
+        const auto chain_params{CreateChainParams(ArgsManager{}, chain)};
+        const Consensus::Params& consensus{chain_params->GetConsensus()};
+        BOOST_REQUIRE(!consensus.bridge_v2);
+        for (const int height : {811'001, 1'000'000, 10'000'000}) {
+            BOOST_CHECK(!consensus.BridgeV2RulesActive(height));
+            std::string mpa_error;
+            BOOST_CHECK(!modern::CheckTransactionMpa(*burn, consensus, height, mpa_error));
+            BOOST_CHECK_EQUAL(mpa_error, chain == ChainType::MAIN ? "mpa-malformed-bridge-record"
+                                                                  : "mpa-not-active");
+            if (chain == ChainType::MAIN) {
+                mpa_error.clear();
+                BOOST_CHECK_MESSAGE(modern::CheckTransactionMpa(*plain, consensus, height, mpa_error),
+                                    mpa_error);
+            }
+        }
     }
 }
 

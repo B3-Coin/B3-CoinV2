@@ -43,6 +43,7 @@
 #include <crypto/sha256.h>
 #include <kernel/chainparams.h>
 #include <modern/bridge_asset.h>
+#include <modern/bridge_forwarder.h>
 #include <modern/bridge_v2.h>
 #include <modern/chain_domain.h>
 #include <modern/withdrawal_tree.h>
@@ -904,6 +905,282 @@ BOOST_AUTO_TEST_CASE(non_regtest_networks_have_no_bridge_v2)
             BOOST_CHECK(!modern::ConfiguredBridgeV2RegistryId(params));
         }
     }
+}
+
+// ------------------------- forwarder pins (node changes 3.1; routes b, d3)
+
+namespace {
+
+//! Stand-in F_d / F_x pins: factories 0x71..71 and 0x73..73, init-code
+//! hashes 0x72..72 and 0x74..74, dst_eid 30110 (Arbitrum).
+Consensus::BridgeV2DepositForwarderPins DepositForwarderPins()
+{
+    return {.factory = FillAddress(0x71), .init_code_hash = Fill(0x72)};
+}
+
+Consensus::BridgeV2ExitForwarderPins ExitForwarderPins()
+{
+    return {.factory = FillAddress(0x73), .init_code_hash = Fill(0x74), .dst_eid = 30'110};
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(bridge_v2_forwarder_pins_valid_refusals)
+{
+    using P = Consensus::BridgeV2Params;
+    const uint256 domain{FixtureDomain()};
+    BOOST_CHECK(DepositForwarderPins().Valid());
+    BOOST_CHECK(ExitForwarderPins().Valid());
+    BOOST_CHECK(!Consensus::BridgeV2DepositForwarderPins{}.Valid());
+    BOOST_CHECK(!Consensus::BridgeV2ExitForwarderPins{}.Valid());
+
+    // Unset on a plain envelope, where ForwardersValid() is vacuous.
+    const P base{RegtestV2Params()};
+    BOOST_CHECK(!base.deposit_forwarder && !base.exit_forwarder);
+    BOOST_CHECK(base.ForwardersValid());
+
+    // Either pin, both, and both beside a successor keep the envelope valid;
+    // the two factories may share one init-code hash (one B3Forwarder).
+    const std::vector<std::function<void(P&)>> accepted{
+        [](P& p) { p.deposit_forwarder = DepositForwarderPins(); },
+        [](P& p) { p.exit_forwarder = ExitForwarderPins(); },
+        [](P& p) { p.deposit_forwarder = DepositForwarderPins(); p.exit_forwarder = ExitForwarderPins(); },
+        [](P& p) {
+            p.deposit_forwarder = DepositForwarderPins();
+            p.exit_forwarder = ExitForwarderPins();
+            p.exit_forwarder->init_code_hash = p.deposit_forwarder->init_code_hash;
+        },
+        [](P& p) { p.exit_forwarder = ExitForwarderPins(); p.exit_forwarder->dst_eid = 30'101; },
+        [](P& p) { p.exit_forwarder = ExitForwarderPins(); p.exit_forwarder->dst_eid = std::numeric_limits<uint32_t>::max(); },
+    };
+    for (size_t i{0}; i < accepted.size(); ++i) {
+        P p{base};
+        accepted[i](p);
+        BOOST_CHECK_MESSAGE(p.ForwardersValid() && p.Valid(), "acceptance " << i << " refused");
+        P with_successor{WithSuccessor(base, domain)};
+        accepted[i](with_successor);
+        BOOST_CHECK_MESSAGE(with_successor.Valid(), "acceptance " << i << " refused beside a successor");
+    }
+
+    // One mutation per ForwardersValid() rule.
+    const std::vector<std::function<void(P&)>> refused{
+        // incomplete pins
+        [](P& p) { p.deposit_forwarder = DepositForwarderPins(); p.deposit_forwarder->factory = {}; },
+        [](P& p) { p.deposit_forwarder = DepositForwarderPins(); p.deposit_forwarder->init_code_hash = uint256{}; },
+        [](P& p) { p.exit_forwarder = ExitForwarderPins(); p.exit_forwarder->factory = {}; },
+        [](P& p) { p.exit_forwarder = ExitForwarderPins(); p.exit_forwarder->init_code_hash = uint256{}; },
+        [](P& p) { p.exit_forwarder = ExitForwarderPins(); p.exit_forwarder->dst_eid = 0; },
+        // a factory on a bridge V2 contract
+        [](P& p) { p.deposit_forwarder = DepositForwarderPins(); p.deposit_forwarder->factory = p.vault.vault_address; },
+        [](P& p) { p.deposit_forwarder = DepositForwarderPins(); p.deposit_forwarder->factory = p.vault.token_address; },
+        [](P& p) { p.deposit_forwarder = DepositForwarderPins(); p.deposit_forwarder->factory = p.verifier.address; },
+        [](P& p) { p.exit_forwarder = ExitForwarderPins(); p.exit_forwarder->factory = p.vault.vault_address; },
+        [](P& p) { p.exit_forwarder = ExitForwarderPins(); p.exit_forwarder->factory = p.vault.token_address; },
+        [](P& p) { p.exit_forwarder = ExitForwarderPins(); p.exit_forwarder->factory = p.verifier.address; },
+        // one factory for both routes
+        [](P& p) {
+            p.deposit_forwarder = DepositForwarderPins();
+            p.exit_forwarder = ExitForwarderPins();
+            p.exit_forwarder->factory = p.deposit_forwarder->factory;
+        },
+    };
+    for (size_t i{0}; i < refused.size(); ++i) {
+        P p{base};
+        refused[i](p);
+        BOOST_CHECK_MESSAGE(!p.ForwardersValid(), "refusal " << i << " accepted");
+        BOOST_CHECK_MESSAGE(!p.Valid(), "envelope refusal " << i << " accepted");
+        BOOST_CHECK_MESSAGE(!modern::BridgeRegistryIdV2(domain, p), "refusal " << i << " has a registry id");
+        // Dropping the pins restores the launch verdict.
+        p.deposit_forwarder.reset();
+        p.exit_forwarder.reset();
+        BOOST_CHECK(p.Valid());
+    }
+
+    // Neither factory may sit on a pinned successor vault.
+    const P with_successor{WithSuccessor(base, domain)};
+    BOOST_REQUIRE(with_successor.Valid());
+    {
+        P p{with_successor};
+        p.deposit_forwarder = DepositForwarderPins();
+        p.deposit_forwarder->factory = p.successor->entry.vault_address;
+        BOOST_CHECK(!p.ForwardersValid());
+        BOOST_CHECK(!p.Valid());
+        P q{with_successor};
+        q.exit_forwarder = ExitForwarderPins();
+        q.exit_forwarder->factory = q.successor->entry.vault_address;
+        BOOST_CHECK(!q.ForwardersValid());
+        BOOST_CHECK(!q.Valid());
+        // The same address is fine once no successor is pinned.
+        q.successor.reset();
+        BOOST_CHECK(q.Valid());
+    }
+
+    // Valid forwarder pins never repair an invalid launch envelope.
+    P bad_launch{base};
+    bad_launch.vault.origin_deployment_block = 0;
+    bad_launch.deposit_forwarder = DepositForwarderPins();
+    bad_launch.exit_forwarder = ExitForwarderPins();
+    BOOST_CHECK(bad_launch.ForwardersValid());
+    BOOST_CHECK(!bad_launch.Valid());
+}
+
+BOOST_AUTO_TEST_CASE(bridge_v2_forwarder_pins_registry_id)
+{
+    using P = Consensus::BridgeV2Params;
+    const uint256 domain{Fill(0x5d)};
+    const P base{RegtestV2Params()};
+    P deposit_only{base};
+    deposit_only.deposit_forwarder = DepositForwarderPins();
+    P exit_only{base};
+    exit_only.exit_forwarder = ExitForwarderPins();
+    P both{deposit_only};
+    both.exit_forwarder = ExitForwarderPins();
+
+    // Golden values, independently re-derived with Python hashlib from the
+    // Bitcoin serialization of BridgeRegistryIdV2 (LE integers, raw bytes):
+    // the forwarder-free id predates the forwarder pins, so a forwarder-free
+    // envelope keeps its id byte for byte; the tails are u8 2 || factory ||
+    // init_code_hash and u8 3 || factory || init_code_hash || LE32 dst_eid,
+    // after the gate thresholds and before the extension list's hash.
+    const auto none_id{modern::BridgeRegistryIdV2(domain, base)};
+    const auto deposit_id{modern::BridgeRegistryIdV2(domain, deposit_only)};
+    const auto exit_id{modern::BridgeRegistryIdV2(domain, exit_only)};
+    const auto both_id{modern::BridgeRegistryIdV2(domain, both)};
+    BOOST_REQUIRE(none_id && deposit_id && exit_id && both_id);
+    BOOST_CHECK_EQUAL(EvmHex(*none_id), "06c67bdb1cfaf39a00d4e46f432aaba74ff037cd20f3f0ad0dc4e33985bbee9b");
+    BOOST_CHECK_EQUAL(EvmHex(*deposit_id), "2fa3cd957c53f836e46f55ab76f0a48429eed2653b0b6fd35a3c7d45cf7896f8");
+    BOOST_CHECK_EQUAL(EvmHex(*exit_id), "7cf0eb62402a02203d25d60ebb6682fdaef6546d0562508fba86dcb6a230a365");
+    BOOST_CHECK_EQUAL(EvmHex(*both_id), "81ff7faf9d0c857ac1085ac9e4fb63477a48d943b1e1f529f5905816922aa0d4");
+
+    // Each pin, and each of its fields, renames the registry approval.
+    const std::vector<std::pair<P, std::function<void(P&)>>> renames{
+        {deposit_only, [](P& p) { p.deposit_forwarder->factory = FillAddress(0x75); }},
+        {deposit_only, [](P& p) { p.deposit_forwarder->init_code_hash = Fill(0x76); }},
+        {exit_only, [](P& p) { p.exit_forwarder->factory = FillAddress(0x75); }},
+        {exit_only, [](P& p) { p.exit_forwarder->init_code_hash = Fill(0x76); }},
+        {exit_only, [](P& p) { p.exit_forwarder->dst_eid = 30'101; }},
+        {both, [](P& p) { p.deposit_forwarder->factory = FillAddress(0x75); }},
+        {both, [](P& p) { p.exit_forwarder->dst_eid = 30'111; }},
+    };
+    for (size_t i{0}; i < renames.size(); ++i) {
+        const auto& [start, mutate] = renames[i];
+        const auto before{modern::BridgeRegistryIdV2(domain, start)};
+        P p{start};
+        mutate(p);
+        BOOST_REQUIRE(p.Valid());
+        const auto after{modern::BridgeRegistryIdV2(domain, p)};
+        BOOST_REQUIRE(before && after);
+        BOOST_CHECK_MESSAGE(*after != *before, "forwarder field " << i << " does not rename the registry");
+        BOOST_CHECK_MESSAGE(*after != *none_id, "forwarder field " << i << " collides with the forwarder-free id");
+    }
+
+    // The role byte separates the routes: the same factory and hash pinned as
+    // a deposit or as an exit forwarder give different ids.
+    P deposit_like{base};
+    deposit_like.deposit_forwarder = Consensus::BridgeV2DepositForwarderPins{
+        .factory = ExitForwarderPins().factory, .init_code_hash = ExitForwarderPins().init_code_hash};
+    BOOST_REQUIRE(deposit_like.Valid());
+    BOOST_CHECK(*modern::BridgeRegistryIdV2(domain, deposit_like) != *exit_id);
+
+    // Forwarder pins are derivation and burn-check pins only: the AssetId and
+    // the vault entry id that records name are unchanged.
+    BOOST_CHECK(modern::BridgeAssetIdV2(domain, both.vault) == modern::BridgeAssetIdV2(domain, base.vault));
+    BOOST_CHECK(modern::BridgeVaultEntryIdV2(domain, both.vault) == modern::BridgeVaultEntryIdV2(domain, base.vault));
+
+    // Beside a successor the forwarder tail follows the successor's block;
+    // the successor-only id stays as it was.
+    const P successor_base{WithSuccessor(base, domain)};
+    P successor_both{successor_base};
+    successor_both.deposit_forwarder = DepositForwarderPins();
+    successor_both.exit_forwarder = ExitForwarderPins();
+    const auto successor_id{modern::BridgeRegistryIdV2(domain, successor_base)};
+    const auto successor_both_id{modern::BridgeRegistryIdV2(domain, successor_both)};
+    BOOST_REQUIRE(successor_id && successor_both_id);
+    BOOST_CHECK(*successor_both_id != *successor_id);
+    BOOST_CHECK(*successor_both_id != *both_id);
+
+    // V, W2 and the policy margin still stay out with forwarders pinned.
+    P moved{both};
+    moved.activation_height = 900;
+    moved.burn_height = 950;
+    moved.gate.mempool_close_margin_seconds = 1;
+    BOOST_CHECK(modern::BridgeRegistryIdV2(domain, moved) == both_id);
+
+    // The configured id follows the chain's envelope.
+    const Consensus::Params params{ConsensusWith(both)};
+    const auto chain_domain{modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)};
+    BOOST_REQUIRE(chain_domain);
+    BOOST_CHECK(modern::ConfiguredBridgeV2RegistryId(params) == modern::BridgeRegistryIdV2(*chain_domain, both));
+    BOOST_CHECK(*modern::ConfiguredBridgeV2RegistryId(params) != *modern::ConfiguredBridgeV2RegistryId(ConsensusWith(base)));
+}
+
+// The wallets' static and height refusals of the forwarder routes
+// (bridgeforwarderaddress and bridgewithdraw options.arbitrum): the exact
+// texts the RPCs throw with RPC_MISC_ERROR, on every network.
+BOOST_AUTO_TEST_CASE(bridge_v2_forwarder_route_availability)
+{
+    using P = Consensus::BridgeV2Params;
+    const auto deposit_reason{[](const Consensus::Params& params, const int height) {
+        return std::string{modern::DepositForwarderUnavailableReasonV2(params, height).value_or("")};
+    }};
+    const auto exit_reason{[](const Consensus::Params& params, const int height) {
+        return std::string{modern::ExitForwarderRouteUnavailableReasonV2(params, height).value_or("")};
+    }};
+    const std::string not_configured{"Bridge V2 is not configured on this chain"};
+    const std::string no_deposit_pin{"Bridge V2 pins no deposit forwarder (route b) on this chain"};
+    const std::string retired{
+        "The bridge V2 launch vault is retired for deposits and the deposit forwarder factory deposits only "
+        "into it; use getbridgedepositrecipient for the successor vault"};
+    const std::string no_exit_pin{
+        "options.arbitrum (route d3) needs a pinned bridge V2 exit forwarder; this chain pins none"};
+    const std::string no_burns{"options.arbitrum (route d3) needs bridge V2 burn rules for the next block"};
+
+    // No bridge V2, and an envelope without forwarder pins.
+    for (const Consensus::Params& params : {ConsensusWith(std::nullopt), ConsensusWith(RegtestV2Params())}) {
+        const bool configured{params.bridge_v2.has_value()};
+        BOOST_CHECK_EQUAL(deposit_reason(params, 500), configured ? no_deposit_pin : not_configured);
+        BOOST_CHECK_EQUAL(exit_reason(params, 500), no_exit_pin);
+    }
+
+    // Both pins, V = W2 = 400 (and W2 = 410).
+    P both{RegtestV2Params()};
+    both.deposit_forwarder = DepositForwarderPins();
+    both.exit_forwarder = ExitForwarderPins();
+    const Consensus::Params pinned{ConsensusWith(both)};
+    // The deposit route has no height refusal of its own below V: the RPC
+    // then refuses on B3's deposit status ("Bridge V2 rules are not active").
+    BOOST_CHECK_EQUAL(deposit_reason(pinned, 399), "");
+    BOOST_CHECK_EQUAL(deposit_reason(pinned, 400), "");
+    BOOST_CHECK_EQUAL(exit_reason(pinned, 399), no_burns);
+    BOOST_CHECK_EQUAL(exit_reason(pinned, 400), "");
+    P late_burns{both};
+    late_burns.burn_height = 410;
+    BOOST_CHECK_EQUAL(exit_reason(ConsensusWith(late_burns), 409), no_burns);
+    BOOST_CHECK_EQUAL(exit_reason(ConsensusWith(late_burns), 410), "");
+
+    // Either pin alone.
+    P deposit_only{both};
+    deposit_only.exit_forwarder.reset();
+    BOOST_CHECK_EQUAL(deposit_reason(ConsensusWith(deposit_only), 400), "");
+    BOOST_CHECK_EQUAL(exit_reason(ConsensusWith(deposit_only), 400), no_exit_pin);
+    P exit_only{both};
+    exit_only.deposit_forwarder.reset();
+    BOOST_CHECK_EQUAL(deposit_reason(ConsensusWith(exit_only), 400), no_deposit_pin);
+    BOOST_CHECK_EQUAL(exit_reason(ConsensusWith(exit_only), 400), "");
+
+    // A B-23 successor (h_m = V + 60): the launch vault is retired for the
+    // deposit factory from h_m; route (d3) burns go on, naming the successor.
+    const Consensus::Params migrating{ConsensusWith(WithSuccessor(both, FixtureDomain()))};
+    BOOST_CHECK_EQUAL(deposit_reason(migrating, 459), "");
+    BOOST_CHECK_EQUAL(deposit_reason(migrating, 460), retired);
+    BOOST_CHECK_EQUAL(exit_reason(migrating, 460), "");
+
+    // An incomplete envelope configures neither route.
+    P broken{both};
+    broken.verifier.address = {};
+    BOOST_REQUIRE(!broken.Valid());
+    BOOST_CHECK_EQUAL(deposit_reason(ConsensusWith(broken), 500), not_configured);
+    BOOST_CHECK_EQUAL(exit_reason(ConsensusWith(broken), 500), no_burns);
 }
 
 // ------------------------------- B-23 successor entry (node changes 7.6)

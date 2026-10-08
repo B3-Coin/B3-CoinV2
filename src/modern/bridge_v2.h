@@ -111,9 +111,9 @@ inline uint256 BridgeLightClientExtensionsHashV2()
  * Not yet an approval identity: this slice's envelope lacks several section
  * 3.1 pins, which the id gains (and so changes value) when they land: the
  * verifier's lineage id, genesis set hash, mirrored windows and
- * BRIDGE_ACTIVATION_HEIGHT mirror, the deposit and exit forwarder pins and,
- * on regtest, the vault and verifier code hashes (OI-3). Records never name
- * it; nothing may treat today's value as the S7 approval identity.
+ * BRIDGE_ACTIVATION_HEIGHT mirror and, on regtest, the vault and verifier
+ * code hashes (OI-3). Records never name it; nothing may treat today's value
+ * as the S7 approval identity.
  *
  * A pinned B-23 successor (node changes section 7.6) appends, after the gate
  * thresholds and before the extension list's hash, a byte 1, its vault entry
@@ -124,6 +124,14 @@ inline uint256 BridgeLightClientExtensionsHashV2()
  * successor nothing is appended, so every existing id is byte-identical. A
  * successor whose AssetId is not the launch entry's under `chain_domain`
  * has no registry identity (nullopt), as ConfiguredDomain fails closed.
+ *
+ * The forwarder pins (section 3.1) follow the successor, still before the
+ * extension list's hash: a pinned deposit forwarder appends a byte 2, its
+ * factory and its init-code hash; a pinned exit forwarder appends a byte 3,
+ * its factory, its init-code hash and its dst_eid (LE32). The exit tag is a
+ * protocol constant (modern/bridge_forwarder.h) and is not repeated. Each
+ * block is appended only when its pin is set, so every forwarder-free id is
+ * byte-identical to the one before these pins existed.
  */
 inline std::optional<uint256> BridgeRegistryIdV2(
     const uint256& chain_domain, const Consensus::BridgeV2Params& params)
@@ -170,6 +178,14 @@ inline std::optional<uint256> BridgeRegistryIdV2(
         writer << uint8_t{1} << BridgeVaultEntryIdV2(chain_domain, s.entry)
                << s.predecessor << s.asset_id << s.entry.origin_deployment_block
                << s.entry.max_deposit_raw;
+    }
+    if (params.deposit_forwarder) {
+        const auto& f{*params.deposit_forwarder};
+        writer << uint8_t{2} << f.factory << f.init_code_hash;
+    }
+    if (params.exit_forwarder) {
+        const auto& f{*params.exit_forwarder};
+        writer << uint8_t{3} << f.factory << f.init_code_hash << f.dst_eid;
     }
     writer << BridgeLightClientExtensionsHashV2();
     return writer.GetSHA256();

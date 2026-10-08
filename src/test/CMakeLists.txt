@@ -50,6 +50,7 @@ add_executable(test_bitcoin
   bridge_eth_light_client_tests.cpp
   bridge_ethereum_calldata_tests.cpp
   bridge_exec_chain_tests.cpp
+  bridge_forwarder_v2_tests.cpp
   bridge_mpt_tests.cpp
   bridge_proof_tests.cpp
   bridge_regtest_beacon_tests.cpp

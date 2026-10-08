@@ -234,6 +234,21 @@ public:
                 std::optional<uint64_t> origin_deployment_block{};
             };
             std::optional<SuccessorSection> successor{};
+
+            /**
+             * The optional route (b) and (d3) forwarder factories
+             * (`v2.deposit_forwarder`, `v2.exit_forwarder`; node changes
+             * section 3.1, contracts spec sections 7-8). Knowable before
+             * the first start, so pinned with v (OI-3): each factory is the
+             * DeployV2 deployer's CREATE address (nonces n+4 and n+5) and
+             * the init-code hash is keccak256 of B3Forwarder's creation
+             * code from the forge artifact (raw EVM bytes). The sections
+             * are the consensus pins themselves.
+             */
+            using DepositForwarderSection = Consensus::BridgeV2DepositForwarderPins;
+            using ExitForwarderSection = Consensus::BridgeV2ExitForwarderPins;
+            std::optional<DepositForwarderSection> deposit_forwarder{};
+            std::optional<ExitForwarderSection> exit_forwarder{};
         };
 
         //! Whether the file carried a v1_decentralized section. True by
