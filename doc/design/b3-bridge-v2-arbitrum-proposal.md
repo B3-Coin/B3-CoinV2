@@ -654,8 +654,9 @@ item 1.
 re-credit of burns above a frozen root; a ruling on B-11's alternative;
 owner acceptance of B-22, B-23's residual, the wind-down margin and the
 (d1) relay budget; B-37's rebinding schedule (finality dependency);
-`DEPOSIT_CLOSE_AFTER` against O8; OI-1 to OI-7 and OI-9 to OI-11 open;
-OI-8 and OI-12 resolved (§20).
+`DEPOSIT_CLOSE_AFTER` against O8; OI-1 to OI-7 and OI-9 to OI-11 open
+(OI-2 and OI-6 have implementation choices pending owner review); OI-8 and
+OI-12 resolved (§20).
 
 **Unverified [H]:** V2 and `approve` gas; LayerZero fees and DVN depths;
 anvil EIP-2537; minutes until O8.
@@ -677,6 +678,22 @@ user funds or blocks a milestone.
   flushes, so a (b) delivery above 20,000 strands its remainder.
   *Direction:* size `feeCap` per ceil(amount / `MAX_DEPOSIT_RAW`), or cap
   (b) at 20,000 per F_d.
+  *Implementation choice (regtest forwarder slice, 2026-10-08; pending
+  owner review):* the second direction, in the wallet.
+  - `bridgeforwarderaddress` refuses an expected delivery above
+    `MAX_DEPOSIT_RAW` and keeps the spec's `feeCap = 4 × fee_per_tx`. One
+    flush then moves the whole delivery, whatever fee within the cap its
+    flusher takes. No contract changed.
+  - The first direction was implemented first and dropped: `flush` lets
+    any codeless EOA take the whole remaining cap at once, so a ceil-sized
+    cap protects only against cooperative flushers. Bounding each flush's
+    fee in p would need a salt-layout ruling.
+  - Residuals: an over-delivery the wallet did not derive for, and a repeat
+    arrival after a greedy first flush, wait for a zero-fee flush, a refund
+    or `returnToOwner(p, 0)`; a front-runner can take the first flush fee
+    from the relayer that paid for the deploy.
+  - Details are in contracts spec §7.4. Tests: `test_OI2_*` in
+    `contracts/test/v2/ForwarderDepositV2.t.sol`.
 - **OI-3** (High; regtest plan §3.3, §3.6, RP-1). `815bcbf` refuses a
   changed pin file on reindex or once blocks reach bUSD activation, ~162
   (`src/init.cpp:1409-1415`, `:2107` at `e2a4b6c`;
@@ -703,6 +720,29 @@ user funds or blocks a milestone.
 - **OI-6** (High; §3, §10; contracts spec §6.2). Plain transfers or (b)
   sends to Vault V2 are lost, undisclosed. *Direction:* disclose; wallets
   refuse `to` = Vault V2; no F_d derivation yields it.
+  *Implementation choice (regtest forwarder slice, 2026-10-08; pending
+  owner review):* wallet policy, plus one consensus refusal.
+  - **Reserved addresses.** `modern::BridgeV2ReservedEthAddressReason`
+    lists every address with a bridge V2 role: the launch vault, the
+    successor vault, the origin token, the verifier, and the F_d and F_x
+    factories.
+  - **What the wallets refuse.** `bridgewithdraw` and
+    `bridgeforwarderaddress` refuse a reserved address as:
+    - the (d1) burn recipient;
+    - the (d3) Arbitrum `to`;
+    - a `refundEOA`.
+  - **Derivations.** An F_d or F_x derivation that yields a reserved address
+    fails closed.
+  - **Warnings.** `bridgeforwarderaddress` warns that USDT or USDT0 sent by
+    plain transfer to the vault, its token or a factory mints nothing and is
+    lost.
+  - **On-chain checks.** The F_d factory refuses such a `refundEOA` (vault,
+    token, factory). It also refuses a `refund` to the vault, the account or
+    the factory (contracts spec §7.3).
+  - **Consensus.** A route (d3) exit block with a reserved `refundEOA` is
+    invalid (check 5): F_x's `withdrawOnEthereum` escape needs a caller.
+  - **Still missing.** The §10 disclosure text is not written yet. Details
+    are in contracts spec §6.2.
 - **OI-7** (Medium; finality §6.4, §9.2). B-37's windows use
   Snapshot(start − 1); P3-R1 snapshots at the terminal checkpoint
   (`doc/design/v2-stage0-r1-consensus.md:336-347`). *Direction:* restate
