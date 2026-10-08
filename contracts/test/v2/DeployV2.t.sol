@@ -1,12 +1,24 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import {VmV2} from "./V2TestBase.sol";
 import {RelayFixtureV2} from "./utils/RelayFixtureV2.sol";
+import {LzPacketsV2} from "./utils/ForwarderFixtureV2.sol";
 import {BlsTestSignerV2 as Signer} from "./utils/BlsTestSignerV2.sol";
 import {B3Types} from "../../src/IB3FinalityProver.sol";
 import {B3TypesV2} from "../../src/v2/B3TypesV2.sol";
 import {B3FinalityVerifierV2} from "../../src/v2/B3FinalityVerifierV2.sol";
 import {B3VaultV2} from "../../src/v2/B3VaultV2.sol";
+import {B3RelayBatch} from "../../src/v2/B3RelayBatch.sol";
+import {B3Forwarder} from "../../src/v2/B3Forwarder.sol";
+import {B3ForwarderTypesV2} from "../../src/v2/B3ForwarderTypesV2.sol";
+import {B3DepositForwarderFactory} from "../../src/v2/B3DepositForwarderFactory.sol";
+import {B3OftExitFactory} from "../../src/v2/B3OftExitFactory.sol";
+import {IOFTV2} from "../../src/v2/IOFTV2.sol";
+import {MockTetherToken} from "../../regtest/MockTetherToken.sol";
+import {MockLzEndpoint} from "../../regtest/MockLzEndpoint.sol";
+import {MockOFTAdapter} from "../../regtest/MockOFTAdapter.sol";
+import {MockUSDT0} from "../../regtest/MockUSDT0.sol";
 import {DeployV2} from "../../script/DeployV2.s.sol";
 
 /// Cheat codes this suite needs beyond VmV2.
@@ -26,7 +38,15 @@ interface DeployCheatsV2 {
 ///
 /// A constructor revert inside the script's broadcast leaves Foundry's
 /// broadcast open, so such a case is always the last call of its test.
+///
+/// Forwarder factories (B3V2_DEPLOY_FORWARDERS; contracts spec §7-§8) are
+/// tested through deploy(Params) only: setting the flag in the shared
+/// environment would turn every parallel run() into a six-CREATE deployment.
+/// One in-process EVM stands for both anvils (31337 and 31338), with the
+/// regtest LayerZero mocks and LzPacketsV2 as the harness relayer.
 contract DeployV2Test is RelayFixtureV2 {
+    using LzPacketsV2 for LzPacketsV2.Packet;
+
     DeployCheatsV2 private constant CHEATS = DeployCheatsV2(address(uint160(uint256(keccak256("hevm cheat code")))));
 
     address private constant DEPLOYER = address(0xDE9107E2);
@@ -34,6 +54,32 @@ contract DeployV2Test is RelayFixtureV2 {
     uint256 private constant NOW_MAINNET = 1_800_000_000;
     B3FinalityVerifierV2.BootstrapMode private constant START_CERT =
     B3FinalityVerifierV2.BootstrapMode.START_CERTIFICATE;
+
+    uint32 private constant ETH_EID = 30101;
+    uint32 private constant ARB_EID = 30110;
+    /// Opaque executor options F_x passes through (a type-3 lzReceive gas option).
+    bytes private constant EXTRA_OPTIONS = hex"00030100110100000000000000000000000000030d40";
+    /// Relayer fee per flush and per forward (1 USDT).
+    uint256 private constant FWD_FEE = 1_000_000;
+    /// F_d lifetime fee cap and F_x per-forward fee cap.
+    uint96 private constant DEPOSIT_FEE_CAP = 4_000_000;
+    uint96 private constant EXIT_FEE_CAP = 5_000_000;
+    /// Per-item gas cap for forwards: above a first forward (deploys F_x).
+    uint256 private constant FORWARD_GAS = 600_000;
+    address private constant RELAYER = address(0x5E1A7E01);
+    address private constant FEE_SINK = address(0xFEE51C);
+    address private constant REFUND_TO = address(0x7EF0D0);
+    address private constant ARB_USER = address(0xA4B1);
+
+    /// The LayerZero mocks: endpoint 30101 with MockOFTAdapter over the
+    /// fixture's USDT (Ethereum), endpoint 30110 with MockUSDT0 (Arbitrum),
+    /// peered.
+    struct LzMocks {
+        MockLzEndpoint endpointEth;
+        MockLzEndpoint endpointArb;
+        MockOFTAdapter adapter;
+        MockUSDT0 usdt0;
+    }
 
     DeployV2 private script;
 
@@ -762,6 +808,359 @@ contract DeployV2Test is RelayFixtureV2 {
         assertFalse(vm.parseJsonBool(json, ".forwarder_factory_latent_deployer_privilege"));
     }
 
+    // ============================================================= forwarders
+
+    function test_ReadParams_ForwardersOffByDefault() public view {
+        DeployV2.Params memory p = script.readParams();
+        assertFalse(p.deployForwarders);
+        assertEq(p.oftAdapter, address(0));
+        assertEq(uint256(p.exitDstEid), ARB_EID, "Arbitrum One by default");
+        assertEq(uint256(script.DEFAULT_EXIT_DST_EID()), ARB_EID);
+        assertEq(p.exitExtraOptions.length, 0);
+    }
+
+    function test_ParseDeployForwarders() public {
+        assertFalse(script.parseDeployForwarders(0));
+        assertTrue(script.parseDeployForwarders(1));
+        vm.expectRevert(abi.encodeWithSelector(DeployV2.BadParam.selector, "B3V2_DEPLOY_FORWARDERS"));
+        script.parseDeployForwarders(2);
+        vm.expectRevert(abi.encodeWithSelector(DeployV2.BadParam.selector, "B3V2_DEPLOY_FORWARDERS"));
+        script.parseDeployForwarders(type(uint256).max);
+    }
+
+    /// The default keeps the four CREATEs: nonce 4 (the F_d slot) and nonce 5
+    /// (RT4's OTHER_VERIFIER_NONCE) stay codeless, `d` names no forwarder
+    /// factory, and the manifest's forwarder keys are present and zero.
+    function test_Deploy_DefaultLeavesForwarderSlotsEmpty() public {
+        DeployV2.Params memory p = script.readParams();
+        DeployV2.Deployment memory d = script.deploy(p);
+        assertEq(uint256(CHEATS.getNonce(DEPLOYER)), 4, "exactly four deployments");
+        assertEq(CHEATS.computeCreateAddress(DEPLOYER, 4).code.length, 0);
+        assertEq(CHEATS.computeCreateAddress(DEPLOYER, 5).code.length, 0);
+        assertEq(address(d.depositFactory), address(0));
+        assertEq(d.depositFactoryCodeHash, bytes32(0));
+        assertEq(address(d.exitFactory), address(0));
+        assertEq(d.exitFactoryCodeHash, bytes32(0));
+        assertEq(d.forwarderInitCodeHash, bytes32(0));
+
+        string memory json = script.manifestJson(p, d);
+        assertFalse(vm.parseJsonBool(json, ".deploy_forwarders"));
+        assertEq(vm.parseJsonAddress(json, ".exit_forwarder_factory"), address(0));
+        assertEq(vm.parseJsonBytes32(json, ".exit_forwarder_factory_code_hash"), bytes32(0));
+        assertEq(vm.parseJsonBytes32(json, ".forwarder_init_code_hash"), bytes32(0));
+        assertEq(vm.parseJsonAddress(json, ".oft_adapter"), address(0));
+        assertEq(vm.parseJsonUint(json, ".exit_dst_eid"), 0);
+        assertTrue(vm.keyExistsJson(json, ".exit_extra_options"));
+        assertEq(vm.parseJsonBytes(json, ".exit_extra_options").length, 0);
+        assertEq(vm.parseJsonBytes32(json, ".forwarder_factory_code_hash"), bytes32(0));
+        assertTrue(vm.parseJsonBool(json, ".forwarder_factory_latent_deployer_privilege"));
+    }
+
+    /// B3V2_DEPLOY_FORWARDERS: the same broadcast adds the F_d factory at
+    /// nonce 4, the vault's predicted FORWARDER_FACTORY, and the F_x factory
+    /// at nonce 5, each with its pinned immutables and the shared B3Forwarder
+    /// init code hash; the four core contracts keep their nonces and code.
+    function test_Deploy_WithForwarders_AddressesAndImmutables() public {
+        LzMocks memory m = _lzMocks();
+        DeployV2.Params memory p = _forwarderParams(address(m.adapter));
+        DeployV2.Deployment memory d = script.deploy(p);
+
+        assertEq(uint256(CHEATS.getNonce(DEPLOYER)), 6, "six deployments");
+        assertEq(address(d.prover), CHEATS.computeCreateAddress(DEPLOYER, 0));
+        assertEq(address(d.verifier), CHEATS.computeCreateAddress(DEPLOYER, 1));
+        assertEq(address(d.vault), CHEATS.computeCreateAddress(DEPLOYER, 2));
+        assertEq(address(d.batch), CHEATS.computeCreateAddress(DEPLOYER, 3));
+        assertTrue(d.forwarderFactoryPredicted);
+        assertEq(address(d.depositFactory), CHEATS.computeCreateAddress(DEPLOYER, 4));
+        assertEq(address(d.depositFactory), d.forwarderFactory);
+        assertEq(d.vault.FORWARDER_FACTORY(), address(d.depositFactory), "the vault's predicted factory is F_d");
+        assertEq(address(d.exitFactory), CHEATS.computeCreateAddress(DEPLOYER, 5));
+        assertEq(d.depositFactoryCodeHash, address(d.depositFactory).codehash);
+        assertEq(d.exitFactoryCodeHash, address(d.exitFactory).codehash);
+        assertEq(d.proverCodeHash, address(prover).codehash, "BlsDigestProver runtime");
+        assertEq(d.batchCodeHash, address(batch).codehash, "B3RelayBatch runtime");
+
+        bytes32 initCodeHash = keccak256(type(B3Forwarder).creationCode);
+        assertEq(d.forwarderInitCodeHash, initCodeHash);
+
+        B3DepositForwarderFactory fd = d.depositFactory;
+        assertEq(fd.VAULT(), address(d.vault));
+        assertEq(fd.TOKEN(), address(usdt));
+        assertEq(fd.MAX_DEPOSIT_RAW(), CAP);
+        assertEq(fd.MIN_FLUSH_RAW(), 1_000_000);
+        assertEq(fd.MIN_FLUSH_RAW(), script.FORWARDER_MIN_FLUSH_RAW());
+        assertEq(fd.FORWARDER_INIT_CODE_HASH(), initCodeHash);
+
+        B3OftExitFactory fx = d.exitFactory;
+        assertEq(fx.TOKEN(), address(usdt));
+        assertEq(fx.ADAPTER(), address(m.adapter));
+        assertEq(uint256(fx.DST_EID()), ARB_EID);
+        assertEq(fx.extraOptions(), EXTRA_OPTIONS);
+        assertEq(fx.FORWARDER_INIT_CODE_HASH(), initCodeHash);
+
+        script.verifyDeployment(p, d);
+    }
+
+    /// The scripted stack carries routes (b) and (d3) end to end. USDT0 sent
+    /// from Arbitrum to a fresh F_d address is delivered by the harness
+    /// relayer before F_d exists, then deployed and flushed into the vault
+    /// as one Deposit, the vault admitting F_d through its nonce-4 factory.
+    /// A B3 withdrawal naming F_x is released and forwarded to Arbitrum in
+    /// one relayWithForwards call of the deployed batch, the F_x fee paying
+    /// the relayer, and the delivery mints USDT0 once.
+    function test_Deploy_WithForwarders_CarriesRoutesBAndD3() public {
+        LzMocks memory m = _lzMocks();
+        DeployV2.Deployment memory d = script.deploy(_forwarderParams(address(m.adapter)));
+        B3FinalityVerifierV2 v = d.verifier;
+
+        B3ForwarderTypesV2.ExitParams memory ep = B3ForwarderTypesV2.ExitParams({
+            dstEid: ARB_EID, to: _word(BOB), maxBridgeFeeBps: 50, feeCap: EXIT_FEE_CAP, refundEOA: ALICE
+        });
+        address exitAccount = d.exitFactory.accountOf(ep);
+        B3TypesV2.WithdrawalV2[] memory ws = new B3TypesV2.WithdrawalV2[](1);
+        ws[0] = withdrawal(0, exitAccount, 400 * UNIT, V);
+        bytes32[] memory leaves = treeOf(d.vault, ws);
+
+        bootstrap(v, 1, lineageSet(1));
+        vm.warp(T0 + REVIEW);
+        submit(v, canonicalCert(V_INDEX, 1, lineageSet(1), lineageSet(2), rootOf(leaves, 1)));
+        assertTrue(d.vault.depositGateOpen());
+
+        // Route (b): Arbitrum -> undeployed F_d -> deploy -> flush (PR-1: Transfer and Deposit only).
+        B3ForwarderTypesV2.DepositParams memory dp = B3ForwarderTypesV2.DepositParams({
+            vault: address(d.vault),
+            b3Recipient: B3_RECIPIENT,
+            refundEOA: ALICE,
+            feeCap: DEPOSIT_FEE_CAP,
+            // forge-lint: disable-next-line(unsafe-typecast)
+            notAfter: uint64(block.timestamp + 30 days)
+        });
+        address depositAccount = d.depositFactory.accountOf(dp);
+        _bridgeFromArbitrum(m, ARB_USER, depositAccount, 500 * UNIT);
+        assertEq(usdt.balanceOf(depositAccount), 500 * UNIT);
+        assertEq(depositAccount.code.length, 0, "credited before deployment");
+        d.depositFactory.deploy(dp);
+        vm.recordLogs();
+        vm.prank(RELAYER, RELAYER);
+        assertEq(d.depositFactory.flush(dp, FWD_FEE), 500 * UNIT - FWD_FEE);
+        VmV2.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 2, "token Transfer and vault Deposit only");
+        assertEq(logs[0].emitter, address(usdt));
+        assertEq(logs[1].emitter, address(d.vault));
+        assertEq(logs[1].topics[0], DEPOSIT_TOPIC);
+        assertEq(d.vault.locked(), 500 * UNIT - FWD_FEE);
+        assertEq(d.depositFactory.owed(depositAccount, RELAYER), FWD_FEE);
+
+        // Route (d3): release to F_x and forward it in one batch call.
+        uint256 q = m.endpointEth.quote();
+        B3RelayBatch.ExitForward[] memory forwards = new B3RelayBatch.ExitForward[](1);
+        forwards[0] = B3RelayBatch.ExitForward({p: ep, fee: FWD_FEE, feeRecipient: FEE_SINK, nativeFee: q});
+        B3RelayBatch.ReleaseItem[] memory releases = items(item(leaves, 1, ws[0]));
+        B3RelayBatch.CertInput[] memory certs = noCerts();
+        vm.deal(RELAYER, q);
+        vm.recordLogs();
+        vm.prank(RELAYER, RELAYER);
+        (uint256 certsAccepted, uint256 releasesPaid, uint256 forwardsSent) = d.batch.relayWithForwards{value: q}(
+            v,
+            certs,
+            CERT_GAS,
+            address(d.vault),
+            releases,
+            RELEASE_GAS,
+            address(d.exitFactory),
+            forwards,
+            FORWARD_GAS,
+            REFUND_TO
+        );
+        LzPacketsV2.Packet memory pk = LzPacketsV2.only(vm.getRecordedLogs(), address(m.endpointEth));
+        assertEq(certsAccepted, 0);
+        assertEq(releasesPaid, 1);
+        assertEq(forwardsSent, 1);
+        assertTrue(d.vault.released(0));
+        assertEq(d.vault.locked(), 100 * UNIT - FWD_FEE);
+        assertEq(usdt.balanceOf(exitAccount), 0, "the forward empties F_x");
+        assertEq(usdt.balanceOf(FEE_SINK), FWD_FEE, "the F_x fee pays the relayer");
+        assertEq(usdt.balanceOf(address(d.batch)), 0);
+        assertEq(address(d.batch).balance, 0);
+        assertEq(RELAYER.balance, 0, "exactly the quote spent");
+
+        assertEq(pk.to(), _word(BOB));
+        assertEq(pk.amount(), 400 * UNIT - FWD_FEE);
+        pk.deliver(m.endpointArb);
+        assertEq(m.usdt0.balanceOf(BOB), 400 * UNIT - FWD_FEE);
+    }
+
+    /// The forwarder pre-broadcast checks: the adapter must exist and name
+    /// the origin token, the F_d factory takes the predicted slot (an
+    /// explicit B3V2_FORWARDER_FACTORY is refused, even the predicted
+    /// address), the destination endpoint id is non-zero and the cap admits
+    /// a minimum flush. Without forwarders, forwarder inputs are refused.
+    function test_Deploy_ForwarderPreBroadcastChecks() public {
+        LzMocks memory m = _lzMocks();
+        DeployV2.Params memory p;
+        bytes memory badAdapter = abi.encodeWithSelector(DeployV2.BadParam.selector, "B3V2_OFT_ADAPTER");
+
+        p = _forwarderParams(address(0)); // B3V2_OFT_ADAPTER missing
+        _expectDeployRevert(p, badAdapter);
+        p = _forwarderParams(address(0xADA9732)); // codeless
+        _expectDeployRevert(p, badAdapter);
+        p = _forwarderParams(address(usdt)); // code, but no token()
+        _expectDeployRevert(p, badAdapter);
+        MockTetherToken otherToken = new MockTetherToken();
+        p = _forwarderParams(address(new MockOFTAdapter(address(otherToken), address(m.endpointEth))));
+        _expectDeployRevert(p, badAdapter); // token() is not the origin token
+
+        p = _forwarderParams(address(m.adapter));
+        p.forwarderFactory = FD_FACTORY;
+        _expectDeployRevert(p, abi.encodeWithSelector(DeployV2.BadParam.selector, "B3V2_FORWARDER_FACTORY"));
+        p.forwarderFactory = CHEATS.computeCreateAddress(DEPLOYER, 4);
+        _expectDeployRevert(p, abi.encodeWithSelector(DeployV2.BadParam.selector, "B3V2_FORWARDER_FACTORY"));
+
+        p = _forwarderParams(address(m.adapter));
+        p.exitDstEid = 0;
+        _expectDeployRevert(p, abi.encodeWithSelector(DeployV2.BadParam.selector, "B3V2_EXIT_DST_EID"));
+
+        p = _forwarderParams(address(m.adapter));
+        p.maxDepositRaw = script.FORWARDER_MIN_FLUSH_RAW() - 1;
+        _expectDeployRevert(p, abi.encodeWithSelector(DeployV2.BadParam.selector, "B3V2_MAX_DEPOSIT_RAW"));
+
+        // Without forwarders, an adapter or option bytes is a mixed-up environment.
+        p = script.readParams();
+        p.oftAdapter = address(m.adapter);
+        _expectDeployRevert(p, badAdapter);
+        p = script.readParams();
+        p.exitExtraOptions = EXTRA_OPTIONS;
+        _expectDeployRevert(p, abi.encodeWithSelector(DeployV2.BadParam.selector, "B3V2_EXIT_EXTRA_OPTIONS"));
+
+        assertEq(uint256(CHEATS.getNonce(DEPLOYER)), 0, "nothing deployed");
+
+        // The minimum cap itself is admitted.
+        p = _forwarderParams(address(m.adapter));
+        p.maxDepositRaw = script.FORWARDER_MIN_FLUSH_RAW();
+        DeployV2.Deployment memory d = script.deploy(p);
+        assertEq(d.depositFactory.MAX_DEPOSIT_RAW(), 1_000_000);
+    }
+
+    function test_ManifestJson_WithForwarders() public {
+        LzMocks memory m = _lzMocks();
+        DeployV2.Params memory p = _forwarderParams(address(m.adapter));
+        DeployV2.Deployment memory d = script.deploy(p);
+        string memory json = script.manifestJson(p, d);
+
+        assertTrue(vm.parseJsonBool(json, ".deploy_forwarders"));
+        assertEq(vm.parseJsonAddress(json, ".forwarder_factory"), CHEATS.computeCreateAddress(DEPLOYER, 4));
+        assertEq(vm.parseJsonAddress(json, ".forwarder_factory"), address(d.depositFactory));
+        assertEq(vm.parseJsonUint(json, ".forwarder_factory_create_nonce"), 4);
+        assertTrue(vm.parseJsonBool(json, ".forwarder_factory_predicted"));
+        bytes32 depositFactoryCodeHash = vm.parseJsonBytes32(json, ".forwarder_factory_code_hash");
+        assertEq(depositFactoryCodeHash, address(d.depositFactory).codehash);
+        assertNotEq(depositFactoryCodeHash, bytes32(0));
+        assertFalse(vm.parseJsonBool(json, ".forwarder_factory_latent_deployer_privilege"), "no latent privilege");
+
+        assertEq(vm.parseJsonAddress(json, ".exit_forwarder_factory"), CHEATS.computeCreateAddress(DEPLOYER, 5));
+        assertEq(vm.parseJsonAddress(json, ".exit_forwarder_factory"), address(d.exitFactory));
+        assertEq(vm.parseJsonBytes32(json, ".exit_forwarder_factory_code_hash"), address(d.exitFactory).codehash);
+        assertEq(vm.parseJsonBytes32(json, ".forwarder_init_code_hash"), keccak256(type(B3Forwarder).creationCode));
+        assertEq(vm.parseJsonAddress(json, ".oft_adapter"), address(m.adapter));
+        assertEq(vm.parseJsonUint(json, ".exit_dst_eid"), ARB_EID);
+        assertEq(vm.parseJsonBytes(json, ".exit_extra_options"), EXTRA_OPTIONS);
+
+        // The core keys are unchanged by the two extra CREATEs.
+        assertEq(vm.parseJsonUint(json, ".deployer_nonce"), 0);
+        assertEq(vm.parseJsonAddress(json, ".vault"), address(d.vault));
+        assertEq(vm.parseJsonAddress(json, ".relay_batch"), address(d.batch));
+    }
+
+    function test_VerifyDeployment_CatchesForwarderMismatch() public {
+        LzMocks memory m = _lzMocks();
+        DeployV2.Params memory p = _forwarderParams(address(m.adapter));
+        DeployV2.Deployment memory d = script.deploy(p);
+        script.verifyDeployment(p, d);
+
+        // Addresses: F_d is the vault's predicted nonce-4 factory, F_x the nonce-5 CREATE.
+        B3OftExitFactory exitFactory = d.exitFactory;
+        d.exitFactory = new B3OftExitFactory(address(usdt), address(m.adapter), ARB_EID, EXTRA_OPTIONS);
+        _expectPostCheck(p, d, "exit forwarder factory address");
+        d.exitFactory = exitFactory;
+
+        B3DepositForwarderFactory depositFactory = d.depositFactory;
+        d.depositFactory = B3DepositForwarderFactory(FD_FACTORY);
+        _expectPostCheck(p, d, "deposit forwarder factory address");
+        d.depositFactory = depositFactory;
+
+        d.forwarderFactory = FD_FACTORY;
+        _expectPostCheck(p, d, "deposit forwarder factory address");
+        d.forwarderFactory = address(depositFactory);
+        d.forwarderFactoryPredicted = false;
+        _expectPostCheck(p, d, "deposit forwarder factory address");
+        d.forwarderFactoryPredicted = true;
+
+        // Recorded hashes.
+        d.forwarderInitCodeHash = keccak256("another forwarder");
+        _expectPostCheck(p, d, "forwarder init code hash");
+        d.forwarderInitCodeHash = keccak256(type(B3Forwarder).creationCode);
+        bytes32 codeHash = d.depositFactoryCodeHash;
+        d.depositFactoryCodeHash = keccak256("another F_d runtime");
+        _expectPostCheck(p, d, "deposit forwarder factory code");
+        d.depositFactoryCodeHash = codeHash;
+        codeHash = d.exitFactoryCodeHash;
+        d.exitFactoryCodeHash = keccak256("another F_x runtime");
+        _expectPostCheck(p, d, "exit forwarder factory code");
+        d.exitFactoryCodeHash = codeHash;
+
+        // F_x immutables against the inputs.
+        address adapter = p.oftAdapter;
+        p.oftAdapter = address(new MockOFTAdapter(address(usdt), address(m.endpointEth)));
+        _expectPostCheck(p, d, "F_x ADAPTER");
+        p.oftAdapter = adapter;
+        p.exitDstEid = ETH_EID;
+        _expectPostCheck(p, d, "F_x DST_EID");
+        p.exitDstEid = ARB_EID;
+        p.exitExtraOptions = hex"0003";
+        _expectPostCheck(p, d, "F_x extraOptions");
+        p.exitExtraOptions = EXTRA_OPTIONS;
+
+        // Immutables are read from the code at the factory addresses: an F_d
+        // of another vault etched over the nonce-4 factory is caught, as is
+        // an F_x with another destination over the nonce-5 one.
+        bytes memory runtime = address(depositFactory).code;
+        vm.etch(address(depositFactory), address(_otherDepositFactory(d)).code);
+        d.depositFactoryCodeHash = address(depositFactory).codehash;
+        _expectPostCheck(p, d, "F_d VAULT");
+        vm.etch(address(depositFactory), runtime);
+        d.depositFactoryCodeHash = address(depositFactory).codehash;
+
+        runtime = address(exitFactory).code;
+        vm.etch(
+            address(exitFactory),
+            address(new B3OftExitFactory(address(usdt), address(m.adapter), ETH_EID, EXTRA_OPTIONS)).code
+        );
+        d.exitFactoryCodeHash = address(exitFactory).codehash;
+        _expectPostCheck(p, d, "F_x DST_EID");
+        vm.etch(address(exitFactory), runtime);
+        d.exitFactoryCodeHash = address(exitFactory).codehash;
+
+        // A deployment naming factories fails the post-check without forwarders.
+        p.deployForwarders = false;
+        _expectPostCheck(p, d, "no forwarder factories");
+        p.deployForwarders = true;
+
+        script.verifyDeployment(p, d);
+    }
+
+    /// A default deployment whose record names a factory fails as well.
+    function test_VerifyDeployment_DefaultRefusesForwarderFields() public {
+        DeployV2.Params memory p = script.readParams();
+        DeployV2.Deployment memory d = script.deploy(p);
+        d.exitFactory = B3OftExitFactory(address(0xF0F0));
+        _expectPostCheck(p, d, "no forwarder factories");
+        d.exitFactory = B3OftExitFactory(address(0));
+        d.forwarderInitCodeHash = keccak256(type(B3Forwarder).creationCode);
+        _expectPostCheck(p, d, "no forwarder factories");
+        d.forwarderInitCodeHash = bytes32(0);
+        script.verifyDeployment(p, d);
+    }
+
     // ================================================================ helpers
 
     function _expectDeployRevert(DeployV2.Params memory p, bytes memory reason) private {
@@ -782,6 +1181,75 @@ contract DeployV2Test is RelayFixtureV2 {
     function _expectPin(DeployV2.MainnetPins memory m, string memory name) private {
         vm.expectRevert(abi.encodeWithSelector(DeployV2.BadMainnetPin.selector, name));
         script.validateMainnetPins(m);
+    }
+
+    function _word(address a) private pure returns (bytes32) {
+        return bytes32(uint256(uint160(a)));
+    }
+
+    function _lzMocks() private returns (LzMocks memory m) {
+        m.endpointEth = new MockLzEndpoint(ETH_EID);
+        m.endpointArb = new MockLzEndpoint(ARB_EID);
+        m.adapter = new MockOFTAdapter(address(usdt), address(m.endpointEth));
+        m.usdt0 = new MockUSDT0(address(m.endpointArb));
+        m.adapter.setPeer(ARB_EID, _word(address(m.usdt0)));
+        m.usdt0.setPeer(ETH_EID, _word(address(m.adapter)));
+    }
+
+    /// The environment's parameters plus forwarders over `adapter`, with the
+    /// default DST_EID (30110) and EXTRA_OPTIONS.
+    function _forwarderParams(address adapter) private view returns (DeployV2.Params memory p) {
+        p = script.readParams();
+        p.deployForwarders = true;
+        p.oftAdapter = adapter;
+        p.exitExtraOptions = EXTRA_OPTIONS;
+    }
+
+    /// Route (b) on the mocks: `user` sends `amount` USDT0 from Arbitrum to
+    /// `to` on Ethereum (minAmountLD = amountLD, no compose); the harness
+    /// relayer delivers it and the adapter, seeded with the backing, pays
+    /// `to` in USDT by plain transfer.
+    function _bridgeFromArbitrum(LzMocks memory m, address user, address to, uint256 amount) private {
+        usdt.issue(amount);
+        usdt.transfer(address(m.adapter), amount);
+        m.usdt0.mint(user, amount);
+        uint256 nativeFee = m.endpointArb.quote();
+        vm.deal(user, nativeFee);
+        IOFTV2.SendParam memory sp = IOFTV2.SendParam({
+            dstEid: ETH_EID,
+            to: _word(to),
+            amountLD: amount,
+            minAmountLD: amount,
+            extraOptions: "",
+            composeMsg: "",
+            oftCmd: ""
+        });
+        vm.recordLogs();
+        vm.prank(user, user);
+        m.usdt0.send{value: nativeFee}(sp, IOFTV2.MessagingFee(nativeFee, 0), user);
+        LzPacketsV2.only(vm.getRecordedLogs(), address(m.endpointArb)).deliver(m.endpointEth);
+    }
+
+    /// An F_d factory of a second vault on the same verifier and token,
+    /// deployed by this contract at its predicted address.
+    function _otherDepositFactory(DeployV2.Deployment memory d) private returns (B3DepositForwarderFactory) {
+        address predicted = CHEATS.computeCreateAddress(address(this), uint256(CHEATS.getNonce(address(this))) + 1);
+        B3VaultV2 other = new B3VaultV2(
+            B3VaultV2.Config({
+                verifier: d.verifier,
+                verifierCodeHash: d.verifierCodeHash,
+                b3ChainDomain: DOMAIN,
+                originToken: address(usdt),
+                tokenCodeHash: address(usdt).codehash,
+                forwarderFactory: predicted,
+                maxDepositRaw: CAP,
+                predecessor: address(0),
+                predecessorAssetId: bytes32(0)
+            })
+        );
+        B3DepositForwarderFactory fd = new B3DepositForwarderFactory(address(other), address(other).codehash);
+        require(address(fd) == predicted, "F_d factory at the predicted address");
+        return fd;
     }
 
     function _profileRWindows() private pure returns (DeployV2.Windows memory) {

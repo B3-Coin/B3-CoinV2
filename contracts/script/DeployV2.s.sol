@@ -7,6 +7,10 @@ import {BlsDigestProver} from "../src/v2/BlsDigestProver.sol";
 import {B3FinalityVerifierV2} from "../src/v2/B3FinalityVerifierV2.sol";
 import {B3VaultV2} from "../src/v2/B3VaultV2.sol";
 import {B3RelayBatch} from "../src/v2/B3RelayBatch.sol";
+import {B3Forwarder} from "../src/v2/B3Forwarder.sol";
+import {B3DepositForwarderFactory} from "../src/v2/B3DepositForwarderFactory.sol";
+import {B3OftExitFactory} from "../src/v2/B3OftExitFactory.sol";
+import {IOFTV2} from "../src/v2/IOFTV2.sol";
 
 /// Foundry cheat codes used by DeployV2. Declared locally, like V1's
 /// ScriptBase.sol (which stays untouched), so the script needs neither
@@ -20,6 +24,7 @@ interface ScriptVmV2 {
     function envOr(string calldata name, address defaultValue) external view returns (address value);
     function envOr(string calldata name, bytes32 defaultValue) external view returns (bytes32 value);
     function envOr(string calldata name, string calldata defaultValue) external view returns (string memory value);
+    function envOr(string calldata name, bytes calldata defaultValue) external view returns (bytes memory value);
     function envOr(string calldata name, string calldata delim, address[] calldata defaultValue)
         external
         view
@@ -57,17 +62,28 @@ interface ScriptVmV2 {
 /// to the prover's code hash) -> B3VaultV2 (pinned to the verifier's code
 /// hash) -> B3RelayBatch. All four are CREATEs by B3V2_DEPLOYER at nonces
 /// n .. n+3, so the vault's forwarder factory defaults to the deployer's next
-/// CREATE address (nonce n+4), reserved for the later F_d factory slice.
+/// CREATE address (nonce n+4), the F_d factory's slot.
 ///
-/// Latent deployer privilege: until that slice deploys the reviewed F_d
-/// factory at nonce n+4, whatever B3V2_DEPLOYER deploys there answers the
-/// vault's isAccount() caller check (C-13). A factory answering true for
-/// every address would let contract wallets deposit receipts B3 cannot
-/// prove (unmintable deposits); a nonce n+4 spent on any other transaction
-/// loses the slot for good. The vault only staticcalls the factory, so no
-/// theft path exists. Regtest only; before any non-regtest deployment (S7)
-/// the factory must be deployed in the same reviewed sequence and its code
-/// hash pinned in the manifest and by B3. The manifest records the state
+/// Forwarder factories (spec §7-§8; routes (b) and (d3)): with
+/// B3V2_DEPLOY_FORWARDERS=1 the same broadcast continues with
+/// B3DepositForwarderFactory(vault, vault code hash) at nonce n+4, the
+/// vault's predicted factory, and B3OftExitFactory(origin token,
+/// B3V2_OFT_ADAPTER, B3V2_EXIT_DST_EID, B3V2_EXIT_EXTRA_OPTIONS) at n+5.
+/// Both derive accounts with keccak256(type(B3Forwarder).creationCode), which
+/// the manifest records (forwarder_init_code_hash) for B3's
+/// deposit_forwarder / exit_forwarder pins. The default (0) keeps the four
+/// CREATEs, so earlier harnesses keep their nonces.
+///
+/// Latent deployer privilege: until the reviewed F_d factory is deployed at
+/// nonce n+4, whatever B3V2_DEPLOYER deploys there answers the vault's
+/// isAccount() caller check (C-13). A factory answering true for every
+/// address would let contract wallets deposit receipts B3 cannot prove
+/// (unmintable deposits); a nonce n+4 spent on any other transaction loses
+/// the slot for good. The vault only staticcalls the factory, so no theft
+/// path exists. B3V2_DEPLOY_FORWARDERS=1 closes the window in the same
+/// reviewed sequence. Regtest only; before any non-regtest deployment (S7)
+/// the factory must be deployed that way and its code hash pinned in the
+/// manifest and by B3. The manifest records the state
 /// (forwarder_factory_code_hash, forwarder_factory_latent_deployer_privilege).
 ///
 /// REGTEST ONLY in stage S3: run() and deploy() refuse every chain id but
@@ -96,12 +112,19 @@ interface ScriptVmV2 {
 ///   B3V2_MAX_DEPOSIT_RAW (10,000,000,000), B3V2_FORWARDER_FACTORY (default
 ///   the predicted nonce-n+4 address), B3V2_MANIFEST_PATH (optional; must be
 ///   deployments/local-<name>.json, which .gitignore covers).
+/// - Forwarders: B3V2_DEPLOY_FORWARDERS (0 or 1; default 0). With 1:
+///   B3V2_OFT_ADAPTER (required; code, token() == B3V2_ORIGIN_TOKEN),
+///   B3V2_EXIT_DST_EID (30110, Arbitrum One), B3V2_EXIT_EXTRA_OPTIONS
+///   (default empty), and B3V2_FORWARDER_FACTORY must stay unset. With 0,
+///   a set B3V2_OFT_ADAPTER or B3V2_EXIT_EXTRA_OPTIONS is refused as a
+///   mixed-up environment.
 ///
 /// The manifest records addresses, code hashes, the AssetId, every pin and
-/// window and the forwarder factory. It omits the deployment block, which the
-/// harness takes from receipts or the broadcast output. Forge writes it during
-/// its simulation, before broadcasting, so it stays a candidate
-/// ("regtest_candidate") until the harness sees code at the four addresses.
+/// window and the forwarder factories (zero when not deployed). It omits the
+/// deployment block, which the harness takes from receipts or the broadcast
+/// output. Forge writes it during its simulation, before broadcasting, so it
+/// stays a candidate ("regtest_candidate") until the harness sees code at the
+/// four (six with forwarders) addresses.
 contract DeployV2 {
     ScriptVmV2 internal constant vm = ScriptVmV2(address(uint160(uint256(keccak256("hevm cheat code")))));
 
@@ -139,6 +162,10 @@ contract DeployV2 {
         uint256 maxDepositRaw;
         address forwarderFactory; // zero: the deployer's nonce-n+4 CREATE address
         string manifestPath; // empty: no manifest
+        bool deployForwarders; // F_d factory at n+4 and F_x factory at n+5
+        address oftAdapter; // forwarders only: the USDT0 OFT adapter
+        uint32 exitDstEid; // forwarders only: the F_x destination endpoint id
+        bytes exitExtraOptions; // forwarders only: F_x executor options
     }
 
     struct Deployment {
@@ -156,6 +183,12 @@ contract DeployV2 {
         bool forwarderFactoryPredicted;
         uint64 deployerNonce; // the deployer's nonce before the four CREATEs
         uint256 initDeadline;
+        // Zero unless p.deployForwarders.
+        B3DepositForwarderFactory depositFactory; // nonce n+4, == forwarderFactory
+        bytes32 depositFactoryCodeHash;
+        B3OftExitFactory exitFactory; // nonce n+5
+        bytes32 exitFactoryCodeHash;
+        bytes32 forwarderInitCodeHash; // keccak256(type(B3Forwarder).creationCode)
     }
 
     /// Chain-1 values for S7 (spec §3.1, §4, §5; C-9, C-14). Unit-tested only.
@@ -183,6 +216,13 @@ contract DeployV2 {
     string public constant MANIFEST_SCHEMA = "b3-bridge-v2-deployment/1";
     /// The forwarder factory is the deployer's CREATE right after the four contracts.
     uint256 public constant FORWARDER_FACTORY_NONCE_OFFSET = 4;
+    /// With forwarders, the F_x factory is the CREATE after the F_d factory.
+    uint256 public constant EXIT_FORWARDER_FACTORY_NONCE_OFFSET = 5;
+    /// LayerZero endpoint id of Arbitrum One, F_x's destination (spec §8).
+    uint32 public constant DEFAULT_EXIT_DST_EID = 30_110;
+    /// The F_d factory's smallest flush (spec §7.3): the vault cap must admit
+    /// it, and the deployed factory must report it.
+    uint256 public constant FORWARDER_MIN_FLUSH_RAW = 1_000_000;
 
     // Regtest profile R defaults (regtest plan §3.3; OI-10).
     uint256 public constant R_MIN_EPOCH_DURATION = 600;
@@ -228,9 +268,10 @@ contract DeployV2 {
 
     // ===================================================================== run
 
-    /// Reads the environment, deploys the four contracts as B3V2_DEPLOYER,
-    /// checks every immutable and, if B3V2_MANIFEST_PATH is set, writes the
-    /// manifest. Refuses every chain but 31337 before reading anything.
+    /// Reads the environment, deploys the four contracts (six with
+    /// forwarders) as B3V2_DEPLOYER, checks every immutable and, if
+    /// B3V2_MANIFEST_PATH is set, writes the manifest. Refuses every chain
+    /// but 31337 before reading anything.
     function run() external returns (Deployment memory d) {
         _requireRegtest();
         Params memory p = readParams();
@@ -282,6 +323,12 @@ contract DeployV2 {
         p.forwarderFactory = vm.envOr("B3V2_FORWARDER_FACTORY", address(0));
         string memory none = "";
         p.manifestPath = vm.envOr("B3V2_MANIFEST_PATH", none);
+
+        p.deployForwarders = parseDeployForwarders(vm.envOr("B3V2_DEPLOY_FORWARDERS", uint256(0)));
+        p.oftAdapter = vm.envOr("B3V2_OFT_ADAPTER", address(0));
+        p.exitDstEid = _envOrUint32("B3V2_EXIT_DST_EID", DEFAULT_EXIT_DST_EID);
+        bytes memory noOptions = "";
+        p.exitExtraOptions = vm.envOr("B3V2_EXIT_EXTRA_OPTIONS", noOptions);
     }
 
     /// Deploys and post-checks the stack for `p` (regtest only). Public so a
@@ -299,8 +346,10 @@ contract DeployV2 {
             : p.forwarderFactory;
         d.initDeadline = block.timestamp + p.windows.initWindow;
 
-        // Only the four CREATEs are broadcast: code hashes are read by opcode, and
-        // every external call (the post-checks) comes after stopBroadcast.
+        // Only the CREATEs (four, six with forwarders) are broadcast: code hashes
+        // are read by opcode, and every external call (the post-checks) comes
+        // after stopBroadcast. The factories' constructors read the vault and
+        // the adapter inside their own CREATE.
         vm.startBroadcast(p.deployer);
         d.prover = new BlsDigestProver();
         d.proverCodeHash = address(d.prover).codehash;
@@ -322,7 +371,16 @@ contract DeployV2 {
         d.vaultCodeHash = address(d.vault).codehash;
         d.batch = new B3RelayBatch();
         d.batchCodeHash = address(d.batch).codehash;
+        if (p.deployForwarders) {
+            // Nonce n+4: the address the vault already names as FORWARDER_FACTORY.
+            d.depositFactory = new B3DepositForwarderFactory(address(d.vault), d.vaultCodeHash);
+            d.depositFactoryCodeHash = address(d.depositFactory).codehash;
+            // Nonce n+5.
+            d.exitFactory = new B3OftExitFactory(p.originToken, p.oftAdapter, p.exitDstEid, p.exitExtraOptions);
+            d.exitFactoryCodeHash = address(d.exitFactory).codehash;
+        }
         vm.stopBroadcast();
+        if (p.deployForwarders) d.forwarderInitCodeHash = keccak256(type(B3Forwarder).creationCode);
 
         // forge-lint: disable-next-line(unsafe-typecast)
         d.assetId = B3TypesV2.assetId(p.chainDomain, uint64(block.chainid), address(d.vault), p.originToken);
@@ -350,6 +408,36 @@ contract DeployV2 {
         } else if (p.bootstrapSetHash != bytes32(0)) {
             revert BadParam("B3V2_BOOTSTRAP_SET_HASH");
         }
+        checkForwarderParams(p);
+    }
+
+    /// Forwarder inputs (spec §7.3, §8). With p.deployForwarders the F_d
+    /// factory takes the predicted nonce-n+4 slot, so B3V2_FORWARDER_FACTORY
+    /// must be unset; the adapter has code and its token() is the origin
+    /// token; the destination endpoint id is non-zero; and the vault's cap
+    /// admits a minimum flush. These are the factories' constructor rules,
+    /// checked before anything is broadcast. Without forwarders a set adapter
+    /// or option bytes means a mixed-up environment and is refused.
+    function checkForwarderParams(Params memory p) public view {
+        if (!p.deployForwarders) {
+            if (p.oftAdapter != address(0)) revert BadParam("B3V2_OFT_ADAPTER");
+            if (p.exitExtraOptions.length != 0) revert BadParam("B3V2_EXIT_EXTRA_OPTIONS");
+            return;
+        }
+        if (p.forwarderFactory != address(0)) revert BadParam("B3V2_FORWARDER_FACTORY");
+        if (p.oftAdapter.code.length == 0) revert BadParam("B3V2_OFT_ADAPTER");
+        (bool ok, bytes memory data) = p.oftAdapter.staticcall(abi.encodeCall(IOFTV2.token, ()));
+        if (!ok || data.length != 32 || abi.decode(data, (bytes32)) != bytes32(uint256(uint160(p.originToken)))) {
+            revert BadParam("B3V2_OFT_ADAPTER");
+        }
+        if (p.exitDstEid == 0) revert BadParam("B3V2_EXIT_DST_EID");
+        if (p.maxDepositRaw < FORWARDER_MIN_FLUSH_RAW) revert BadParam("B3V2_MAX_DEPOSIT_RAW");
+    }
+
+    /// B3V2_DEPLOY_FORWARDERS: 0 (default) or 1.
+    function parseDeployForwarders(uint256 flag) public pure returns (bool) {
+        if (flag > 1) revert BadParam("B3V2_DEPLOY_FORWARDERS");
+        return flag == 1;
     }
 
     /// The K_OF_N bootstrap header (spec §3.1, §5): epoch 0, ruleset 2, four
@@ -466,7 +554,9 @@ contract DeployV2 {
 
     /// Reads every immutable back and compares it with `p` and `d`; also
     /// checks the four addresses are the deployer's CREATEs at nonces n..n+3,
-    /// so a predicted forwarder factory (nonce n+4) is still reachable.
+    /// so a predicted forwarder factory (nonce n+4) is still reachable. With
+    /// forwarders, the F_d factory is that n+4 CREATE and the F_x factory the
+    /// n+5 one; without them, `d` names no forwarder factory.
     function verifyDeployment(Params memory p, Deployment memory d) public view {
         _check(address(d.prover).code.length != 0 && address(d.prover).codehash == d.proverCodeHash, "prover code");
         _check(
@@ -479,17 +569,37 @@ contract DeployV2 {
         _check(address(d.verifier) == vm.computeCreateAddress(p.deployer, n + 1), "verifier address");
         _check(address(d.vault) == vm.computeCreateAddress(p.deployer, n + 2), "vault address");
         _check(address(d.batch) == vm.computeCreateAddress(p.deployer, n + 3), "batch address");
-        if (d.forwarderFactoryPredicted) {
+        if (p.deployForwarders) {
             _check(
-                d.forwarderFactory == vm.computeCreateAddress(p.deployer, n + FORWARDER_FACTORY_NONCE_OFFSET)
-                    && d.forwarderFactory.code.length == 0,
-                "predicted forwarder factory"
+                d.forwarderFactoryPredicted
+                    && d.forwarderFactory == vm.computeCreateAddress(p.deployer, n + FORWARDER_FACTORY_NONCE_OFFSET)
+                    && address(d.depositFactory) == d.forwarderFactory,
+                "deposit forwarder factory address"
+            );
+            _check(
+                address(d.exitFactory) == vm.computeCreateAddress(p.deployer, n + EXIT_FORWARDER_FACTORY_NONCE_OFFSET),
+                "exit forwarder factory address"
             );
         } else {
-            _check(d.forwarderFactory == p.forwarderFactory, "forwarder factory");
+            _check(
+                address(d.depositFactory) == address(0) && d.depositFactoryCodeHash == bytes32(0)
+                    && address(d.exitFactory) == address(0) && d.exitFactoryCodeHash == bytes32(0)
+                    && d.forwarderInitCodeHash == bytes32(0),
+                "no forwarder factories"
+            );
+            if (d.forwarderFactoryPredicted) {
+                _check(
+                    d.forwarderFactory == vm.computeCreateAddress(p.deployer, n + FORWARDER_FACTORY_NONCE_OFFSET)
+                        && d.forwarderFactory.code.length == 0,
+                    "predicted forwarder factory"
+                );
+            } else {
+                _check(d.forwarderFactory == p.forwarderFactory, "forwarder factory");
+            }
         }
         _verifyVerifier(p, d);
         _verifyVault(p, d);
+        if (p.deployForwarders) _verifyForwarders(p, d);
     }
 
     // ================================================================ manifest
@@ -558,7 +668,20 @@ contract DeployV2 {
         vm.serializeBytes32(
             k, "forwarder_factory_code_hash", factoryCodeless ? bytes32(0) : d.forwarderFactory.codehash
         );
-        json = vm.serializeBool(k, "forwarder_factory_latent_deployer_privilege", factoryCodeless);
+        vm.serializeBool(k, "forwarder_factory_latent_deployer_privilege", factoryCodeless);
+
+        // Forwarder factories (routes (b), (d3)): every key is written, zero
+        // when not deployed. B3's deposit_forwarder pin is forwarder_factory
+        // with forwarder_init_code_hash; its exit_forwarder pin is
+        // exit_forwarder_factory with the same hash and exit_dst_eid.
+        bool fwd = p.deployForwarders;
+        vm.serializeBool(k, "deploy_forwarders", fwd);
+        vm.serializeAddress(k, "exit_forwarder_factory", address(d.exitFactory));
+        vm.serializeBytes32(k, "exit_forwarder_factory_code_hash", d.exitFactoryCodeHash);
+        vm.serializeBytes32(k, "forwarder_init_code_hash", d.forwarderInitCodeHash);
+        vm.serializeAddress(k, "oft_adapter", fwd ? p.oftAdapter : address(0));
+        vm.serializeUint(k, "exit_dst_eid", fwd ? p.exitDstEid : uint32(0));
+        json = vm.serializeBytes(k, "exit_extra_options", fwd ? p.exitExtraOptions : bytes(""));
     }
 
     // =============================================================== internals
@@ -641,6 +764,32 @@ contract DeployV2 {
         _check(vault.B3_ASSET_ID() == d.assetId, "B3_ASSET_ID");
         _check(vault.PREDECESSOR() == address(0), "PREDECESSOR");
         _check(vault.nextDepositId() == 0 && vault.locked() == 0 && vault.absorbedTotal() == 0, "vault state");
+    }
+
+    function _verifyForwarders(Params memory p, Deployment memory d) private view {
+        bytes32 initCodeHash = keccak256(type(B3Forwarder).creationCode);
+        _check(d.forwarderInitCodeHash == initCodeHash, "forwarder init code hash");
+
+        B3DepositForwarderFactory fd = d.depositFactory;
+        _check(
+            address(fd).code.length != 0 && address(fd).codehash == d.depositFactoryCodeHash,
+            "deposit forwarder factory code"
+        );
+        _check(fd.VAULT() == address(d.vault), "F_d VAULT");
+        _check(fd.TOKEN() == p.originToken, "F_d TOKEN");
+        _check(fd.MAX_DEPOSIT_RAW() == p.maxDepositRaw, "F_d MAX_DEPOSIT_RAW");
+        _check(fd.MIN_FLUSH_RAW() == FORWARDER_MIN_FLUSH_RAW, "F_d MIN_FLUSH_RAW");
+        _check(fd.FORWARDER_INIT_CODE_HASH() == initCodeHash, "F_d FORWARDER_INIT_CODE_HASH");
+
+        B3OftExitFactory fx = d.exitFactory;
+        _check(
+            address(fx).code.length != 0 && address(fx).codehash == d.exitFactoryCodeHash, "exit forwarder factory code"
+        );
+        _check(fx.TOKEN() == p.originToken, "F_x TOKEN");
+        _check(fx.ADAPTER() == p.oftAdapter, "F_x ADAPTER");
+        _check(fx.DST_EID() == p.exitDstEid, "F_x DST_EID");
+        _check(keccak256(fx.extraOptions()) == keccak256(p.exitExtraOptions), "F_x extraOptions");
+        _check(fx.FORWARDER_INIT_CODE_HASH() == initCodeHash, "F_x FORWARDER_INIT_CODE_HASH");
     }
 
     function _check(bool ok, string memory what) private pure {

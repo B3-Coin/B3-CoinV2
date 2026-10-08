@@ -314,12 +314,16 @@ Stage S3 of the bridge V2 plan (owner ruling R8 in
 [`doc/design/b3-bridge-v2-owner-rulings-2026-10-03.md`](../doc/design/b3-bridge-v2-owner-rulings-2026-10-03.md))
 adds the launch contracts under `src/v2/`. They implement
 [`doc/design/b3-bridge-v2-contracts-spec.md`](../doc/design/b3-bridge-v2-contracts-spec.md)
-§2-§6 and §9, together with the directions of open issues OI-1 and OI-10
-and the owner's resolution of OI-12 (ruling R9, 2026-10-05; architecture
-§20, `doc/design/b3-bridge-v2-arbitrum-proposal.md`). No V2
-contract is deployed on any public network, no B3 pin names one, and nothing
-here activates the bridge. The V1 contracts, tests, deployment record and
-scripts described above are unchanged.
+§2-§9, including the route (b) and (d3) forwarders of §7-§8. They also
+follow the directions of open issues OI-1 and OI-10, the implementation
+choices for OI-2 and OI-6 (pending owner review), and the owner's resolution
+of OI-12 (ruling R9, 2026-10-05). The open issues are listed in
+architecture §20, `doc/design/b3-bridge-v2-arbitrum-proposal.md`.
+
+No V2 contract is deployed on any public network, and nothing here
+activates the bridge. No B3 build pins a V2 contract: only regtest pin files
+name the local anvil deployments. The V1 contracts, tests, deployment record
+and scripts described above are unchanged.
 
 ### Contracts
 
@@ -329,27 +333,181 @@ scripts described above are unchanged.
 | `src/v2/BlsDigestProver.sol` | V1's EIP-2537 prover (`src/BlsCertificateProver.sol`) behind `verifyDigest(digest, signingSetHash, signingSet, proof)`. It takes a precomputed digest and accepts only ruleset-2 headers. The witness ABI, POP DST, ordered depth-13 absent-member paths and dual quorum are V1's: headcount `floor(2n/3)+1` and stake `quorumWeight`. |
 | `src/v2/B3FinalityVerifierV2.sol` | Keyless mirror of B3's fresh finality lineage. It covers the one-time bootstrap, certificates checked by checkpoint-history ancestry (so relayers may skip certificates), epoch rotation, the expiry and spacing windows, accepted-root history, the conflict halt, the watcher `cancel` and the deposit gate. |
 | `src/v2/B3VaultV2.sol` | Keyless single-token vault. It keeps V1's `deposit(uint256,bytes32)` ABI and V1's `Deposit` event byte for byte, and applies the caller rule (a codeless top-level EOA, or an account of `FORWARDER_FACTORY`). It releases a leaf V2 under any accepted root at or above the leaf's height, exactly once per id. It also has `absorb()`/`absorbedTotal` and a B-23 successor mode. |
-| `src/v2/B3RelayBatch.sol` | Stateless batch. It tries the certificates in order, then each release not yet released, and reports each failure in an event without stopping the batch. Each try forwards at most a caller-chosen gas cap (`certGas`, `releaseGas`), because a malformed BLS witness makes an EIP-2537 precompile burn all gas forwarded to it. It has no storage, no owner and no payable entry. |
+| `src/v2/B3RelayBatch.sol` | Stateless batch. `relay` (the S3 ABI, not payable) tries the certificates in order, then each release not yet released. `relayWithForwards` (payable) does the same and then tries each exit forward through a `B3OftExitFactory`, spending at most its `nativeFee` from `msg.value` and returning the unspent ETH (spec §9). A failure is reported in an event without stopping the batch. Each try forwards at most a caller-chosen gas cap (`certGas`, `releaseGas`, `forwardGas`), because a malformed BLS witness makes an EIP-2537 precompile burn all gas forwarded to it. It has no storage, no owner, no `receive` and no fallback. |
+| `src/v2/B3ForwarderTypesV2.sol` | Library for the forwarder tags, the `DepositParams` and `ExitParams` structs, the salts, the CREATE2 address and the parameter checks (spec §7.2). It is separate from `B3TypesV2`, so the vault's and the verifier's code hashes did not change. |
+| `src/v2/B3Forwarder.sol` | The forwarder account, deployed by CREATE2 under F_d and F_x alike. It has only `exec(target, value, data)`, which only its deploying factory may call, and no storage, `receive` or fallback. |
+| `src/v2/B3DepositForwarderFactory.sol` | F_d factory (route (b), spec §7.3). It is the vault's `FORWARDER_FACTORY`. It provides `deploy`, `publish`, `flush` (one `vault.deposit` per call, from a codeless top-level EOA only), `collectFee`, `refund` (by `refundEOA`) and `returnToOwner` (after `notAfter`). Each account's lifetime fees are capped at `feeCap`. |
+| `src/v2/B3OftExitFactory.sol` | F_x factory (route (d3), spec §8). It pins the token, the USDT0 OFT adapter, `DST_EID` and the executor options. `forward` pays the fee, at most `feeCap`, and sends the rest through the adapter. `withdrawOnEthereum` (by `refundEOA`) is the escape. |
+| `src/v2/IOFTV2.sol` | The subset of LayerZero's IOFT (`send`, `quoteSend`, `token`) that F_x and the mocks use. |
 | `src/v2/IBlsDigestProver.sol`, `src/v2/IB3FinalityVerifierV2.sol` | The interfaces the verifier, vault and batch use. |
-| `script/DeployV2.s.sol` | Regtest-only deployment of the four contracts, with post-checks and an optional gitignored manifest. |
+| `script/DeployV2.s.sol` | Regtest-only deployment of the four contracts, optionally followed by the two forwarder factories, with post-checks and an optional gitignored manifest. |
 
-Not in this stage: the deposit forwarder F_d, the exit forwarder F_x (spec
-§7-§8), and the batch's `ExitForward` items and ETH refund (spec §9). The
-vault already pins `FORWARDER_FACTORY`. Until the forwarder slice lands,
-DeployV2 sets it to the deployer's predicted, still codeless next CREATE
-address (nonce n+4), so only top-level EOAs can deposit. This is a latent
-deployer privilege, not only an empty slot: whatever `B3V2_DEPLOYER` later
-deploys at nonce n+4 answers the vault's `isAccount()` caller check. A
-factory answering true for every address would let contract wallets make
-deposits whose receipts B3 cannot prove, so those deposits could never be
-minted; spending nonce n+4 on anything else loses the slot for good. The
-vault only staticcalls the factory, so no theft path exists. The manifest
-records the state (`forwarder_factory_code_hash`,
+The vault pins `FORWARDER_FACTORY` to the deployer's CREATE address at nonce
+n+4. With `B3V2_DEPLOY_FORWARDERS=1`, DeployV2 deploys the reviewed F_d
+factory there in the same broadcast, and the F_x factory at n+5 (see
+"Regtest deployment").
+
+The default deployment leaves nonce n+4 codeless, so only top-level EOAs can
+deposit. This is a latent deployer privilege, not only an empty slot:
+
+- Whatever `B3V2_DEPLOYER` later deploys at nonce n+4 answers the vault's
+  `isAccount()` caller check. A factory answering true for every address
+  would let contract wallets make deposits whose receipts B3 cannot prove,
+  so those deposits could never be minted.
+- Spending nonce n+4 on anything else loses the slot for good.
+- The vault only staticcalls the factory, so no theft path exists.
+
+The manifest records the state (`forwarder_factory_code_hash`,
 `forwarder_factory_latent_deployer_privilege`). Before any non-regtest
-deployment (S7) the reviewed F_d factory must be deployed in the same
-sequence and its code hash pinned in the manifest and by B3. Tokens sent to
-the vault by plain transfer create no B3 claim (OI-6); `absorb()` only
-counts them as reserve.
+deployment (S7), the F_d factory must be deployed in the same sequence, and
+its code hash pinned in the manifest and by B3.
+
+Tokens sent to the vault by plain transfer create no B3 claim (OI-6), and
+`absorb()` only counts them as reserve.
+
+### Forwarders (routes (b) and (d3))
+
+Contracts spec §7-§9 describes the forwarders. This section records the
+implementation choices beyond it, all pending owner review; the choices for
+open issues OI-2 and OI-6 are in spec §7.4 and §6.2 and in architecture §20.
+An account is the CREATE2 address of `B3Forwarder` under its factory, salt
+and `FORWARDER_INIT_CODE_HASH`. It can therefore be paid before it exists. B3
+pins each factory with that hash (`v2.deposit_forwarder` and
+`v2.exit_forwarder`), and the wallets derive the same address
+(`src/modern/bridge_forwarder.h`).
+
+**Route (b), Arbitrum to bUSD V2.**
+
+1. `bridgeforwarderaddress` derives a fresh F_d for a B3 address of the
+   wallet and returns p. It refuses once B3 has closed bridge V2 deposits
+   for good, and within 7 days of the light-client horizon; `notAfter` is
+   at most 30 days out and ends 24 hours before the horizon.
+2. On Arbitrum, the user sends USDT0 to F_d through the OFT
+   (`dstEid` 30101, no compose).
+3. On Ethereum, the USDT0 adapter pays F_d in USDT by plain transfer.
+4. A relayer, or anyone from a codeless EOA, sends `deploy(p)` and then
+   `flush(p, fee)`. That is two transactions, because `flush` never deploys:
+   deployment emits the token's `Approval` and `Published`, which PR-1
+   forbids in a flush receipt, and PR-2 rules out one wrapping call.
+5. Each flush is one `vault.deposit(amount, b3Recipient)` with
+   `amount = min(free − fee, MAX_DEPOSIT_RAW)`. Its receipt carries only
+   the token `Transfer` and the vault `Deposit`.
+6. B3 mints the proven `Deposit` exactly as for a direct deposit.
+
+F_d factory choices:
+
+- `deploy` charges no fee; the first flush's fee recoups it.
+- `deploy`, `publish`, `flush` and `returnToOwner` refuse a `refundEOA`
+  equal to `VAULT`, `TOKEN` or the factory (`BadRefundEOA`, OI-6).
+- `returnToOwner` requires a valid p; `refund` accepts any p.
+- `flush` works while `block.timestamp ≤ notAfter`, `returnToOwner` only
+  after it.
+
+Escapes from F_d:
+
+- `refund` by `refundEOA`, at any time;
+- `returnToOwner` by anyone after `notAfter`, which pays `refundEOA`.
+
+Fees are capped for the account's lifetime by `feeCap`. The wallet derives
+an F_d only for a delivery of at most `MAX_DEPOSIT_RAW`, which one flush
+moves whatever fee within the cap is taken, and sets `feeCap = 4 ×
+fee_per_tx` (OI-2).
+
+**PR-3 receipt model** (`test/v2/utils/ReceiptSizeV2.sol`,
+`contrib/b3bridge/b3_bridge_forwarders_v2.py`). The leaf is
+`rlp([hexPrefix(key), receipt])` of an EIP-2718 type 2 receipt, with every
+field the transaction cannot choose at its worst: status 1, an 8-byte
+`cumulativeGasUsed`, the 256-byte bloom and the 3-byte key `rlp(0xffff)`.
+PR-1's logs are the token `Transfer` (3 topics, 32 data bytes) and the vault
+`Deposit` (3 topics, 64 data bytes). The leaf is 634 bytes (spec §7.1 models
+629 [H]). PR-1 and PR-2 fix the shape, so the prediction is constant and the
+relayer has nothing to skip before sending; it checks each actual receipt
+against 7,168 bytes afterwards.
+
+**Route (d3), bUSD V2 to Arbitrum.**
+
+1. `bridgewithdraw` with `options.arbitrum` burns bUSD V2.
+2. The burn's recipient is F_x = `accountOf(p)`. Its kind 6 record carries
+   p in a 67-byte exit block, which B3 consensus checks against the pinned
+   exit factory and stores with the leaf (`getbridgewithdrawals`,
+   `getbridgewithdrawalproofv2`).
+3. A relayer calls `B3RelayBatch.relayWithForwards`. In one transaction this
+   releases the leaf to F_x and calls `forward(p, fee, feeRecipient,
+   nativeRefundTo)`.
+4. `forward` takes at most `feeCap`, approves the adapter through zero and
+   sends the rest to `p.to` on `DST_EID`, within `maxBridgeFeeBps` of
+   slippage.
+
+`withdrawOnEthereum` by `refundEOA` is F_x's escape.
+
+F_x factory choices (`src/v2/B3OftExitFactory.sol`, with `IOFTV2.sol` as
+the IOFT subset):
+
+- `EXTRA_OPTIONS` is the storage `extraOptions`, written once by the
+  constructor, because `bytes` cannot be immutable.
+- `isValid` requires only a non-zero `refundEOA`; the wallet proves
+  EOA-ness, and B3 consensus refuses a `refundEOA` with a bridge V2 role.
+- `forward` sends exactly the quote and returns the rest of `msg.value` to
+  `nativeRefundTo`.
+- `withdrawOnEthereum` refuses `to` ∈ {0, account, factory}.
+- The salt keeps `feeCap` as uint96, but a B3 burn can name only an F_x
+  whose `feeCap` is below 2^64 (the exit block's u64).
+
+**Batch.** The S3 entry `relay(verifier, certs, certGas, vault, releases,
+releaseGas)` keeps its ABI and stays non-payable. Exit forwards use a new
+payable entry:
+
+```
+relayWithForwards(verifier, certs, certGas, vault, releases, releaseGas,
+                  exitFactory, ExitForward[] forwards, forwardGas,
+                  nativeRefundTo) returns (certsAccepted, releasesPaid, forwardsSent)
+ExitForward { ExitParams p; uint256 fee; address feeRecipient; uint256 nativeFee }
+```
+
+- Certificates run first, then releases, then forwards, each item under its
+  own gas cap.
+- `msg.value` is the native-fee budget, counted per call. A forward whose
+  `nativeFee` exceeds the budget left emits `ForwardSkipped`; one that
+  reverts emits `ForwardFailed`, and its ETH returns to the budget.
+- The factory returns change above the quote to `nativeRefundTo`, and the
+  batch returns the unspent budget there at the end. A failed refund
+  reverts the call (`RefundFailed`).
+- A call reverts `NoCode` when it has forwards and a codeless
+  `exitFactory`, and also when `msg.value` is non-zero and `nativeRefundTo`
+  is zero.
+
+**Refund EOA.** It must be an Ethereum EOA the user controls. The wallet
+checks an EIP-191 `personal_sign` signature (`src/bridge/eip191.h`) of this
+exact text, lines separated by `\n` with no trailing newline, 159 bytes:
+
+```
+B3 bridge V2 refund EOA
+chain domain: 0x<64 hex of B3's raw modern chain-domain bytes>
+refund EOA: 0x<40 lowercase hex>
+```
+
+The digest is `keccak256("\x19Ethereum Signed Message:\n159" ‖ message)`; the
+65-byte signature r ‖ s ‖ v, v ∈ {27, 28, 0, 1}, must recover exactly the
+refund EOA. The chain domain keeps a regtest proof from serving mainnet.
+`bridgewithdraw`'s route (d3) refund EOA uses the same proof; the vectors
+are `forwarder_v2.refund_eoa_message`. The contracts check only that the
+refund EOA is non-zero; the F_d factory also refuses the vault, the token
+and the factory itself.
+
+**OI-6.** The wallets refuse every bridge V2 contract (vaults, token,
+verifier, both factories) as:
+
+- a burn recipient;
+- an Arbitrum `to`;
+- a refund EOA;
+- a derived forwarder.
+
+B3 consensus refuses such a refund EOA in a route (d3) exit block.
+
+The off-chain relayer is `contrib/b3bridge/b3_bridge_forwarders_v2.py`
+(`flush`, `forward`, `published`). Functional test RT6
+(`test/functional/feature_b3_bridge_rt6_route_b_d3.py`) runs both routes over
+two anvils.
 
 ### Byte layouts
 
@@ -382,6 +540,21 @@ big-endian unless stated otherwise.
   little-endian.
 - SetHeader keeps V1's 110-byte layout with `rulesetVersion = 2`. Every V1
   header, and therefore every V1 signature, is refused.
+- Forwarder salts (spec §7.2) are each `keccak256(abi.encode(TAG,
+  fields…))` over 192 bytes, every field a left-padded 32-byte word:
+  - `depositSalt`: `TAG = keccak256("B3/FWD/DEPOSIT/V2")`, then `vault,
+    b3Recipient, refundEOA, uint96 feeCap, uint64 notAfter`;
+  - `exitSalt`: `TAG = keccak256("B3/FWD/EXIT/OFT/V2")`, then `uint32
+    dstEid, to, uint16 maxBridgeFeeBps, uint96 feeCap, refundEOA`.
+- An account is `keccak256(0xff ‖ factory ‖ salt ‖
+  FORWARDER_INIT_CODE_HASH)[12:]`, an 85-byte preimage.
+  `FORWARDER_INIT_CODE_HASH = keccak256(type(B3Forwarder).creationCode)`
+  includes the metadata, so any edit of `B3Forwarder.sol`, a comment
+  included, changes every account. Pins and manifests therefore take it
+  from the build, never from a hard-coded value.
+- The route (d3) exit block is a B3 record field, not a contract layout:
+  67 bytes, `u8 1 ‖ u32 dstEid ‖ to ‖ u16 maxBridgeFeeBps ‖ u64 feeCap ‖
+  refundEOA` (`src/bridge/proof.h`). No contract reads it.
 
 ### Bootstrap and certificates
 
@@ -511,9 +684,10 @@ B-10 values are accepted on chain 1.
 
 `test/vectors/gen_v2_vectors.py` writes `test/vectors/bridge_v2_vectors.json`
 (schema `b3-bridge-v2-vectors/1`). It uses only the python3 standard library
-plus its own Keccak-256, never touches the network, and always produces the
-same output. The file feeds `test/v2/VectorsV2.t.sol` and the B3 C++ tests.
-It holds:
+plus its own Keccak-256 and secp256k1 recovery, never touches the network,
+handles no private key, and always produces the same output. The file feeds
+`test/v2/VectorsV2.t.sol`, `test/v2/ForwarderVectorsV2.t.sol` and the B3 C++
+tests. It holds:
 
 - lineage ids for three chain domains;
 - ruleset-2 SetHeaders;
@@ -527,11 +701,16 @@ It holds:
   EIP-1186 for the verifier, the vault and Tether, with the token's
   `balances` and `isBlackListed` mapping keys for a stand-in vault
   (`storage_layout_v2`). `StorageLayoutV2.test_SlotsMatchSharedVectors`
-  checks them against the compiled contracts and MockTetherToken.
+  checks them against the compiled contracts and MockTetherToken;
+- the forwarder section (`forwarder_v2`, contracts spec §7.2, §8): F_d and
+  F_x salt preimages, salts and CREATE2 accounts over a stand-in init-code
+  hash, the EIP-191 refund-EOA messages with digests and signatures by anvil
+  dev accounts 0 and 1, the 67-byte kind 6 burn exit blocks and the OI-2
+  deposit fee caps. `ForwarderVectorsV2.t.sol` checks them against
+  `B3ForwarderTypesV2`, `abi.encode`, `abi.encodePacked` and `ecrecover`.
 
 The generator asserts the documented leaf V2 (`0x1cb905…ad64`) and AssetId
-V2 (`0xdb9e32…6fcd`). The F_d and F_x address vectors will be added with the
-forwarder slice.
+V2 (`0xdb9e32…6fcd`).
 
 BLS vectors (deviation from spec §12). The spec asks for real blst vectors
 from an extended `generate_bls64_proof.cpp` (ruleset 2, 64 members, 43
@@ -564,10 +743,13 @@ forge build --offline
 forge test --offline                                   # V1 and V2 suites
 forge test --offline --match-path 'test/v2/*'          # V2 suites only
 forge test --offline --match-contract GasV2Test -vv    # gas table and runtime sizes
+forge test --offline --match-path 'test/v2/Forwarder*' # F_d, F_x and their vectors
+forge test --offline --match-path 'test/v2/RelayBatch*' -vv  # batch, incl. exit forwards
 ```
 
 Gas measured at this revision on Osaka, by `test/v2/GasV2.t.sol` except
-the batch row, which `test/v2/RelayBatchV2.t.sol` measures. The called
+the batch rows, which `test/v2/RelayBatchV2.t.sol` and
+`test/v2/RelayBatchExitV2.t.sol` measure. The called
 contracts are cooled first; certificates run at the minimum headcount
 quorum (1, 11 and 21 absent members) with member weights of 250, 100 and
 100.
@@ -587,33 +769,78 @@ asserted below EIP-7825's 16,777,216.
 | `release` (cold slots, fresh recipient) | 86,468 | 153,708 |
 | `deposit` | 62,457 | 86,177 |
 | `absorb` (first, after a migration leaf) | 55,679 | 76,839 |
-| batch: one 64-member transition plus one release (`RelayBatchV2.t.sol`) | 5,497,348 | 6,385,068 |
+| batch: one 64-member transition plus one release (`RelayBatchV2.t.sol`) | 5,497,621 | 6,385,341 |
+| batch: one release plus a first forward, which deploys F_x (`RelayBatchExitV2.t.sol`) | 421,062 | 515,182 |
+| batch: one release plus a later forward to the same F_x | 219,011 | 313,131 |
+| batch: one 64-member transition, one release and a first forward | 5,832,261 | 6,736,621 |
 
-Relayers size the batch caps from this table: `RelayFixtureV2` uses
-`certGas` = 6,000,000 (above the 64-member worst case) and `releaseGas` =
-250,000. An off-curve absent-member witness under a 6,000,000 cap costs the
-batch 5,845,908 gas and the later items still apply; with all gas forwarded
-the same 12,000,000-gas batch runs out of gas
+Relayers size the batch caps from this table:
+
+- `RelayFixtureV2` uses `certGas` = 6,000,000, above the 64-member worst
+  case, and `releaseGas` = 250,000.
+- `RelayBatchExitV2` uses `forwardGas` = 600,000.
+- The contrib relayer defaults to 500,000 for `releaseGas` and 1,500,000
+  for `forwardGas`.
+
+An off-curve absent-member witness under a 6,000,000 cap costs the batch
+5,846,200 gas, and the later items still apply. With all gas forwarded, the
+same 12,000,000-gas batch runs out of gas
 (`test_GasCapContainsAPrecompileGasBurn`).
 
-The runtime sizes are 7,512 bytes (BlsDigestProver), 13,929 bytes
-(B3FinalityVerifierV2), 4,315 bytes (B3VaultV2) and 1,884 bytes
-(B3RelayBatch). All four are below EIP-170's 24,576 bytes and asserted in
-`GasV2`. `script/check-deployable-sizes.sh` still covers only the three V1
-runtimes. Spec §12's `check-no-number-opcode.sh` is not created in this
-stage; `GasV2.test_RuntimesHaveNoNumberOpcode` stands in for it and scans all
-four runtimes (skipping PUSH data and metadata) for NUMBER, DELEGATECALL,
-CALLCODE, CREATE, CREATE2 and SELFDESTRUCT, and the prover and batch for
-storage writes.
+A flush's worst-case receipt leaf is 634 bytes
+(`ForwarderDepositV2.test_PR3_FlushReceiptLeafWithinBudget`). F_d `deploy`
+and `flush` gas is not yet measured.
+
+The runtime sizes are:
+
+| Contract | Runtime bytes |
+|---|---|
+| BlsDigestProver | 7,512 |
+| B3FinalityVerifierV2 | 13,929 |
+| B3VaultV2 | 4,315 |
+| B3RelayBatch | 2,850 |
+| B3DepositForwarderFactory | 6,525 |
+| B3OftExitFactory | 5,686 |
+| B3Forwarder | 524 |
+
+All are below EIP-170's 24,576 bytes. `GasV2` asserts the first four, and
+the forwarder suites assert the rest. `script/check-deployable-sizes.sh`
+still covers only the three V1 runtimes.
+
+Spec §12's `check-no-number-opcode.sh` is not created in this stage. Instead,
+`GasV2.test_RuntimesHaveNoNumberOpcode` scans the first four runtimes,
+skipping PUSH data and metadata. It checks for NUMBER, DELEGATECALL,
+CALLCODE, CREATE, CREATE2 and SELFDESTRUCT, and in the prover and batch also
+for storage writes.
+
+The forwarder suites run the same scan on both factories and on
+`B3Forwarder`. Each factory embeds `B3Forwarder`'s creation code as data for
+CREATE2, so its scan stops where that copy starts; a linear scan would read
+the copy's metadata bytes as opcodes. The scan admits CREATE2 in the
+factories.
 
 ### Regtest deployment (`DeployV2.s.sol`)
 
 `DeployV2` deploys, in order, the prover, the verifier (pinned to the
 prover's code hash), the vault (pinned to the verifier's code hash) and the
-batch. All four are CREATEs by `B3V2_DEPLOYER` at nonces n to n+3. The
-script then reads back every immutable. `run()` and `deploy()` refuse every
-chain id except 31337 before they read the environment. Integers may be
-decimal or 0x-hex.
+batch. All four are CREATEs by `B3V2_DEPLOYER` at nonces n to n+3.
+
+With `B3V2_DEPLOY_FORWARDERS=1`, the same broadcast continues with two more
+CREATEs:
+
+- `B3DepositForwarderFactory(vault, vault code hash)` at n+4, the address
+  the vault already names as `FORWARDER_FACTORY`;
+- `B3OftExitFactory(origin token, adapter, dstEid, extraOptions)` at n+5.
+
+The default (0) keeps the four CREATEs, so harnesses that predict nonces
+(RT4a, RT4, RT4c, RT4d) are unaffected.
+
+The script then reads back every immutable. That includes the factories'
+`VAULT`, `TOKEN`, `MAX_DEPOSIT_RAW`, `MIN_FLUSH_RAW`, `ADAPTER`, `DST_EID`,
+`extraOptions` and `FORWARDER_INIT_CODE_HASH`, which must equal
+`keccak256(type(B3Forwarder).creationCode)`. `run()` and `deploy()` refuse
+every chain id except 31337 before they read the environment. Integers may
+be decimal or 0x-hex.
 
 | Variables | Meaning |
 |---|---|
@@ -624,7 +851,27 @@ decimal or 0x-hex.
 | `B3V2_MIN_EPOCH_DURATION` (600), `B3V2_MAX_EPOCH_LAG` (72000), `B3V2_DEPOSIT_CLOSE_AFTER` (7200), `B3V2_MAX_CERTIFICATE_AGE` (2400), `B3V2_INIT_WINDOW` (16800; `INIT_DEADLINE` = now + window), `B3V2_REVIEW_WINDOW` (16800) | Optional windows; the defaults are profile R. |
 | `B3V2_WATCHERS` | Optional comma-separated list of up to five addresses (default none). |
 | `B3V2_TOKEN_CODE_HASH` (default: the token's code hash), `B3V2_MAX_DEPOSIT_RAW` (10,000,000,000), `B3V2_FORWARDER_FACTORY` (default: the deployer's nonce n+4 CREATE address) | Optional vault pins. |
+| `B3V2_DEPLOY_FORWARDERS` (0 or 1; default 0) | Optional. 1 deploys the F_d and F_x factories at n+4 and n+5. `B3V2_FORWARDER_FACTORY` must then stay unset, and `B3V2_MAX_DEPOSIT_RAW` must be at least the F_d minimum flush (1,000,000). |
+| `B3V2_OFT_ADAPTER`, `B3V2_EXIT_DST_EID` (30110, Arbitrum One), `B3V2_EXIT_EXTRA_OPTIONS` (hex bytes; default empty) | Used only with forwarders. The adapter is required: it must have code, and its `token()` must be `B3V2_ORIGIN_TOKEN`. `dstEid` must be non-zero. With `B3V2_DEPLOY_FORWARDERS=0`, a set adapter or options value is refused as a mixed-up environment. |
 | `B3V2_MANIFEST_PATH` | Optional. It must be `deployments/local-<name>.json`, which `.gitignore` covers. The manifest records addresses, code hashes, the AssetId and every pin, with `status: "regtest_candidate"` and `production_approved: false`. |
+
+The manifest always carries the forwarder keys, which are zero or false when
+the factories are not deployed:
+
+- `deploy_forwarders`;
+- `forwarder_factory` and `forwarder_factory_code_hash`;
+- `exit_forwarder_factory` and `exit_forwarder_factory_code_hash`;
+- `forwarder_init_code_hash`;
+- `oft_adapter`, `exit_dst_eid` and `exit_extra_options`;
+- `forwarder_factory_latent_deployer_privilege`, which is false once the
+  F_d factory is deployed.
+
+B3's regtest pin file names the factories before the first start (OI-3):
+
+- `v2.deposit_forwarder` = {`factory`, `init_code_hash`} is
+  `forwarder_factory` with `forwarder_init_code_hash`;
+- `v2.exit_forwarder` = {`factory`, `init_code_hash`, `dst_eid`} is
+  `exit_forwarder_factory` with the same hash and `exit_dst_eid`.
 
 Against a local anvil only (no public RPC):
 
@@ -639,19 +886,49 @@ Forge writes its broadcast record under `broadcast/` and its cache under
 `cache/`; both are gitignored. Set `FOUNDRY_BROADCAST` and `--cache-path` to
 keep them outside the tree.
 
+### Regtest mocks (`regtest/`)
+
+These are test doubles for local anvils only. Every file in `regtest/` carries
+the line `// REGTEST ONLY, never imported by src/ or script/.`, and RT0
+checks that no file under `src/` or `script/` names that directory.
+
+| Mock | Chain | Stands in for |
+|---|---|---|
+| `MockTetherToken.sol` | 31337 | Tether USDT with mainnet's storage layout: no-return transfers, pause, blacklist, `deprecate` |
+| `MockDepositVerifier.sol` | 31337 | The V1 verifier's deposit views (RT2, RT3a) |
+| `MockLzEndpoint.sol` | both | A LayerZero endpoint under the mainnet endpoint ids, 30101 on 31337 and 30110 on 31338. `send` emits `PacketSent`; `deliver` runs the receiver's `lzReceive` exactly once and stays retryable after a revert. Owner-set native fee and pause. DVNs, executor options and compose are not modelled. |
+| `MockOFTBase.sol` | both | Shared OApp/OFT core. The message is `abi.encodePacked(bytes32 to, uint64 amount)`, with no compose. LayerZero's exact native fee rule applies, plus slippage against `minAmountLD` and an owner-set bridge fee. |
+| `MockOFTAdapter.sol` | 31337 | The USDT0 OFT adapter. It locks USDT on `send` and pays the packet's `to` by plain transfer on delivery, so an undeployed F_d is credited like any address. The harness seeds it with locked USDT. |
+| `MockUSDT0.sol` | 31338 | The Arbitrum USDT0 token and OFT in one 6-decimal ERC20. `send` burns and delivery mints. Its blocklist checks only `from`, so a delivery to a blocked `to` arrives frozen; it also has `destroyBlockedFunds`. |
+
+`contrib/b3bridge/regtest/mock_lz_relayer.py` is the harness LayerZero
+relayer. It copies each `PacketSent` to the endpoint of its `dstEid` and
+calls `deliver`. It talks only to plain-http endpoints on 127.0.0.1 or
+localhost. Test-only mocks such as `MockVerifierV2` live under
+`test/v2/mocks/`.
+
 ### Not enabled
 
 - **Mainnet deployment and activation are not enabled.** `DeployV2` refuses
   every chain id except 31337. Its chain-1 policy (`validateWindows`,
   `validateMainnetPins`) is exercised by unit tests only. A chain-1
   deployment waits for a later stage and an explicit owner ruling.
-- No V2 address, code hash or AssetId is pinned in any B3 build. These
-  contracts do not change B3 consensus.
-- There has been no external cryptography or contract audit of V2.
-  `BlsDigestProver` reuses V1's BLS code, which is also unaudited.
-- The open issues in architecture §20 still apply, notably OI-6
-  (plain transfers to the vault) and OI-9 (the bootstrap key holders are
-  not yet named).
-- Open for an owner ruling: the forwarder-factory deployer privilege until
-  the F_d slice (see "Contracts"). The K_OF_N attestation scope is settled
-  by OI-12 (see "Bootstrap and certificates").
+- No V2 address, code hash or AssetId is pinned in any B3 build. Only
+  regtest pin files name local deployments.
+- The route (d3) exit-block check is a B3 consensus rule, but it applies
+  only under a pinned `exit_forwarder`. Mainnet and testnet pin no bridge
+  V2, so they are unchanged.
+- There has been no external cryptography or contract audit of V2,
+  forwarders included. `BlsDigestProver` reuses V1's BLS code, which is
+  also unaudited.
+- The LayerZero and USDT0 behaviour the forwarders rely on is exercised only
+  against the mocks above. Still unverified [H]: real DVNs, executor options
+  (`B3V2_EXIT_EXTRA_OPTIONS`, O11), fees and USDT0's executor retries.
+- The open issues in architecture §20 still apply. OI-2 (F_d fee cap) and
+  OI-6 (plain transfers to the vault; wallet refusals) have implementation
+  choices that are pending owner review. Under OI-9, the bootstrap key
+  holders are not yet named.
+- Open for an owner ruling: the forwarder-factory deployer privilege of a
+  default deployment (see "Contracts"). `B3V2_DEPLOY_FORWARDERS=1` closes
+  it on regtest. The K_OF_N attestation scope is settled by OI-12 (see
+  "Bootstrap and certificates").

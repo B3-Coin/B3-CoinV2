@@ -9,13 +9,16 @@ Writes one JSON file, bridge_v2_vectors.json, for the Foundry suite
 lineage ids, ruleset-2 SetHeaders, FinalizedBlockV2 encodings with digest V2
 and certId, history leaves, roots and paths, leaf V2 with a withdrawal tree,
 the bUSD V2 AssetId, the OI-12 K_OF_N bootstrap attestation message and digest
-(contracts spec §5 step 3) and the storage slots B3 proves by EIP-1186
-(contracts spec §3.2, §6.6; Tether's mainnet layout). F_d and F_x address
-vectors join with the forwarder slice.
+(contracts spec §5 step 3), the storage slots B3 proves by EIP-1186
+(contracts spec §3.2, §6.6; Tether's mainnet layout) and the forwarder
+section "forwarder_v2" (contracts spec §7.2, §8): F_d and F_x salts and
+CREATE2 addresses, the EIP-191 refund-EOA message, the 67-byte kind 6 exit
+block and the OI-2 deposit fee caps.
 
 This generator is independent of the Solidity code: it uses only the python3
-standard library (hashlib.sha256) and the Keccak-256 implementation below. It
-never touches the network and is deterministic.
+standard library (hashlib.sha256), the Keccak-256 implementation and the
+secp256k1 public-key recovery below. It never touches the network, handles no
+private key and is deterministic.
 
   gen_v2_vectors.py                 print the JSON to stdout
   gen_v2_vectors.py --out FILE      write FILE
@@ -99,6 +102,69 @@ def keccak256(data):
 # Self-check against published values before anything depends on it.
 assert keccak256(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
 assert keccak256(b"abc").hex() == "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
+
+
+# -- secp256k1 public-key recovery (Ethereum ecrecover), affine arithmetic -----
+_SECP_P = 2**256 - 2**32 - 977
+_SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_SECP_G = (
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+)
+
+
+def _ec_add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0]:
+        if (a[1] + b[1]) % _SECP_P == 0:
+            return None
+        slope = 3 * a[0] * a[0] * pow(2 * a[1], -1, _SECP_P) % _SECP_P
+    else:
+        slope = (b[1] - a[1]) * pow(b[0] - a[0], -1, _SECP_P) % _SECP_P
+    x = (slope * slope - a[0] - b[0]) % _SECP_P
+    return (x, (slope * (a[0] - x) - a[1]) % _SECP_P)
+
+
+def _ec_mul(point, scalar):
+    result = None
+    while scalar:
+        if scalar & 1:
+            result = _ec_add(result, point)
+        point = _ec_add(point, point)
+        scalar >>= 1
+    return result
+
+
+def eth_address_of(point):
+    """keccak256(X ‖ Y)[12:] of an uncompressed public key."""
+    return keccak256(point[0].to_bytes(32, "big") + point[1].to_bytes(32, "big"))[12:]
+
+
+def ecrecover(digest, signature):
+    """The address that signed `digest` with the 65-byte r ‖ s ‖ v signature
+    (v 27 or 28, low s as EIP-2 and cast produce)."""
+    assert len(signature) == 65
+    r = int.from_bytes(signature[:32], "big")
+    s = int.from_bytes(signature[32:64], "big")
+    v = signature[64]
+    assert v in (27, 28) and 0 < r < _SECP_N and 0 < s <= _SECP_N // 2
+    y_squared = (pow(r, 3, _SECP_P) + 7) % _SECP_P
+    y = pow(y_squared, (_SECP_P + 1) // 4, _SECP_P)
+    assert y * y % _SECP_P == y_squared
+    if (y & 1) != v - 27:
+        y = _SECP_P - y
+    r_inverse = pow(r, -1, _SECP_N)
+    e = int.from_bytes(digest, "big") % _SECP_N
+    public_key = _ec_add(_ec_mul((r, y), s * r_inverse % _SECP_N), _ec_mul(_SECP_G, -e * r_inverse % _SECP_N))
+    assert public_key is not None
+    return eth_address_of(public_key)
+
+
+# Self-check: private key 1 controls 0x7e5f…5bdf (a published value).
+assert eth_address_of(_SECP_G).hex() == "7e5f4552091a69125d5dfcb7b8c2659029395bdf"
 
 
 # -- encoding helpers ---------------------------------------------------------
@@ -680,6 +746,258 @@ def storage_layout():
     }
 
 
+# -- forwarders (contracts spec §7.2, §8; node changes §7.2, §11.2) -----------
+TAG_FWD_DEPOSIT = "B3/FWD/DEPOSIT/V2"
+TAG_FWD_EXIT = "B3/FWD/EXIT/OFT/V2"
+FWD_DEPOSIT_TAG = keccak256(TAG_FWD_DEPOSIT.encode())
+FWD_EXIT_TAG = keccak256(TAG_FWD_EXIT.encode())
+# contracts/src/v2/B3ForwarderTypesV2.sol DEPOSIT_TAG and EXIT_TAG (cast keccak).
+assert hx(FWD_DEPOSIT_TAG) == "0xcc2b88b5788e6a3d2f51c52fcb908e55a5386859799df6e4878912fdb1b01d2a"
+assert hx(FWD_EXIT_TAG) == "0x0fdc29b9af6b10d38ef4781cb890c8a6d762464db73cc2f5800457cdf07b4c87"
+# A stand-in: the real FORWARDER_INIT_CODE_HASH commits to B3Forwarder's
+# metadata and is read from the build (DeployV2 manifest), never from here.
+FWD_INIT_CODE_HASH_LABEL = "B3-VECTORS/forwarder-init-code"
+FWD_INIT_CODE_HASH = keccak256(FWD_INIT_CODE_HASH_LABEL.encode())
+FWD_SALT_PREIMAGE_LENGTH = 192
+FWD_CREATE2_PREIMAGE_LENGTH = 85
+FWD_MAX_BRIDGE_FEE_BPS = 50
+# LayerZero endpoint ids: Ethereum (regtest anvil 31337), Arbitrum (regtest anvil 31338).
+EID_ETHEREUM = 30101
+EID_ARBITRUM = 30110
+# Burn record exit block (node changes §7.2 item 5): u8 exit_version ‖ u32
+# dst_eid ‖ to word ‖ u16 max_bridge_fee_bps ‖ u64 fee_cap ‖ refund_eoa.
+EXIT_BLOCK_VERSION = 1
+EXIT_BLOCK_LENGTH = 67
+# contracts/script/DeployV2.s.sol DEFAULT_MAX_DEPOSIT_RAW (10,000 USDT).
+MAX_DEPOSIT_RAW = 10_000_000_000
+U64_MAX = (1 << 64) - 1
+# Anvil's dev accounts 0 and 1 (public test keys of the "test … junk"
+# mnemonic); the refund-EOA vectors carry their EIP-191 signatures.
+ANVIL_ACCOUNT_0 = address("f39fd6e51aad88f6f4ce6ab8827279cfffb92266")
+ANVIL_ACCOUNT_1 = address("70997970c51812dc3a010c7d01b50e0d17dc79c8")
+REFUND_EOA_MESSAGE_PREFIX = "B3 bridge V2 refund EOA"
+# cast 1.7.1, offline: cast wallet sign --mnemonic "test test test test test
+# test test test test test test junk" --mnemonic-index <0|1> "<message>",
+# over the refund_eoa_message of each case; ecrecover below checks them.
+REFUND_EOA_SIGNATURES = {
+    "regtest": "0xa3000ca3798b9de067a8f029e2ff2420a16a790042a9f67d7c166d583782316c"
+    "2f08e9f568da67c99585920b84935688a44357bf0cce08a77a17f1de9e332c751b",
+    "mainnet": "0x8f7e5401ac3a4170c62f5c573f4bca418d25da232d07d00ea87b5ac6c67e98e2"
+    "1b61fd792cc0bda0ed6ab2dbddf3270be53f3876ca7ea97cadfbfc8cd97d1c8f1c",
+}
+
+
+def fwd_stand_in(label):
+    """A non-symmetric stand-in address, so byte-order mistakes show."""
+    return keccak256(("B3-VECTORS/forwarder/" + label).encode())[12:]
+
+
+def uint_word(value, bits):
+    assert 0 <= value < (1 << bits), (value, bits)
+    return u256(value)
+
+
+def recipient_v1(key_hash):
+    """RECIPIENT_V1: 11 zero bytes, version 1 (P2PKH), the 20-byte key hash."""
+    assert len(key_hash) == 20 and any(key_hash)
+    return bytes(11) + u8(1) + key_hash
+
+
+def deposit_salt_preimage(vault, b3_recipient, refund_eoa, fee_cap, not_after):
+    """abi.encode(DEPOSIT_TAG, address vault, bytes32 b3Recipient, address
+    refundEOA, uint96 feeCap, uint64 notAfter)."""
+    preimage = (
+        FWD_DEPOSIT_TAG + address_word(vault) + b3_recipient + address_word(refund_eoa) + uint_word(fee_cap, 96)
+        + uint_word(not_after, 64)
+    )
+    assert len(preimage) == FWD_SALT_PREIMAGE_LENGTH
+    return preimage
+
+
+def exit_salt_preimage(dst_eid, to, max_bridge_fee_bps, fee_cap, refund_eoa):
+    """abi.encode(EXIT_TAG, uint32 dstEid, bytes32 to, uint16 maxBridgeFeeBps,
+    uint96 feeCap, address refundEOA)."""
+    preimage = (
+        FWD_EXIT_TAG + uint_word(dst_eid, 32) + to + uint_word(max_bridge_fee_bps, 16) + uint_word(fee_cap, 96)
+        + address_word(refund_eoa)
+    )
+    assert len(preimage) == FWD_SALT_PREIMAGE_LENGTH
+    return preimage
+
+
+def create2_address(factory, salt, init_code_hash):
+    """EIP-1014: keccak256(0xff ‖ factory ‖ salt ‖ initCodeHash)[12:]."""
+    preimage = b"\xff" + factory + salt + init_code_hash
+    assert len(preimage) == FWD_CREATE2_PREIMAGE_LENGTH
+    return keccak256(preimage)[12:]
+
+
+def exit_params_valid(dst_eid, to, max_bridge_fee_bps, refund_eoa, pinned_dst_eid):
+    """B3OftExitFactory.isValid without EOA-ness (contracts spec §8)."""
+    to_value = int.from_bytes(to, "big")
+    return (
+        pinned_dst_eid != 0 and dst_eid == pinned_dst_eid and to_value >> 160 == 0 and to_value != 0
+        and max_bridge_fee_bps <= FWD_MAX_BRIDGE_FEE_BPS and any(refund_eoa)
+    )
+
+
+def refund_eoa_message(chain_domain, refund_eoa):
+    """The text a wallet asks the refund EOA to sign (EIP-191 personal_sign):
+    the raw chain-domain bytes and the lowercase address, both 0x-prefixed."""
+    return f"{REFUND_EOA_MESSAGE_PREFIX}\nchain domain: {hx(chain_domain)}\nrefund EOA: {hx(refund_eoa)}"
+
+
+def eip191_digest(message):
+    data = message.encode()
+    return keccak256(b"\x19Ethereum Signed Message:\n" + str(len(data)).encode() + data)
+
+
+def encode_exit_block(dst_eid, to, max_bridge_fee_bps, fee_cap, refund_eoa):
+    encoded = u8(EXIT_BLOCK_VERSION) + u32(dst_eid) + to + u16(max_bridge_fee_bps) + u64(fee_cap) + refund_eoa
+    assert len(encoded) == EXIT_BLOCK_LENGTH
+    return encoded
+
+
+DEPOSIT_FEE_CAP_TXS = 4
+
+
+def deposit_fee_cap(fee_per_tx):
+    """OI-2 (P7 DepositForwarderFeeCapV2): the wallet caps a route (b)
+    delivery at MAX_DEPOSIT_RAW per forwarder, so one flush deposits all of
+    it, and fee_per_tx × 4 pays deploy, two flushes (one for a repeat
+    arrival) and returnToOwner; it must fit uint64."""
+    assert fee_per_tx > 0
+    fee_cap = fee_per_tx * DEPOSIT_FEE_CAP_TXS
+    assert fee_cap <= U64_MAX
+    return fee_cap
+
+
+def forwarders():
+    """F_d and F_x salts and accounts, refund-EOA messages, exit blocks and the
+    OI-2 fee caps. Factories, vaults, recipients, EOAs (except the anvil dev
+    accounts) and the init-code hash are stand-ins."""
+    deposit_factory = fwd_stand_in("deposit-factory")
+    deposit_factory_successor = fwd_stand_in("deposit-factory-successor")
+    vault = fwd_stand_in("vault")
+    vault_successor = fwd_stand_in("vault-successor")
+    exit_factory = fwd_stand_in("exit-factory")
+    exit_factory_other = fwd_stand_in("exit-factory-ethereum")
+
+    deposit_cases = [
+        # (name, factory, vault, recipient key hash, refund EOA, feeCap, notAfter);
+        # the feeCaps are stand-ins, not wallet derivations.
+        ("launch_default", deposit_factory, vault, fwd_stand_in("b3-key-0"), ANVIL_ACCOUNT_0,
+         15_000_000, 1_794_000_000),
+        ("u64_max_fee_cap", deposit_factory, vault, fwd_stand_in("b3-key-1"), fwd_stand_in("refund-eoa-1"),
+         U64_MAX, 1),
+        ("successor_zero_fee_cap", deposit_factory_successor, vault_successor, fwd_stand_in("b3-key-2"),
+         fwd_stand_in("refund-eoa-2"), 0, U64_MAX),
+    ]
+    deposit = []
+    for name, factory, case_vault, key_hash, refund_eoa, fee_cap, not_after in deposit_cases:
+        b3_recipient = recipient_v1(key_hash)
+        preimage = deposit_salt_preimage(case_vault, b3_recipient, refund_eoa, fee_cap, not_after)
+        salt = keccak256(preimage)
+        account = create2_address(factory, salt, FWD_INIT_CODE_HASH)
+        # OI-6: no derivation yields the vault (or the factory).
+        assert account not in (case_vault, factory)
+        deposit.append({
+            "name": name,
+            "factory": hx(factory),
+            "vault": hx(case_vault),
+            "b3_recipient": hx(b3_recipient),
+            "refund_eoa": hx(refund_eoa),
+            "fee_cap": fee_cap,
+            "not_after": not_after,
+            "salt_preimage": hx(preimage),
+            "salt": hx(salt),
+            "account": hx(account),
+        })
+
+    exit_cases = [
+        # (name, factory, dstEid, `to` address, maxBridgeFeeBps, feeCap, refund EOA)
+        ("arbitrum_default", exit_factory, EID_ARBITRUM, fwd_stand_in("arbitrum-to-0"), 0, 3_000_000,
+         ANVIL_ACCOUNT_0),
+        ("arbitrum_max_bps_u64_fee_cap", exit_factory, EID_ARBITRUM, fwd_stand_in("arbitrum-to-1"),
+         FWD_MAX_BRIDGE_FEE_BPS, U64_MAX, fwd_stand_in("refund-eoa-3")),
+        ("ethereum_eid_zero_fee_cap", exit_factory_other, EID_ETHEREUM, fwd_stand_in("ethereum-to-2"), 25, 0,
+         fwd_stand_in("refund-eoa-4")),
+    ]
+    exits = []
+    burn_exit_blocks = []
+    for index, (name, factory, dst_eid, to_address, bps, fee_cap, refund_eoa) in enumerate(exit_cases):
+        to = address_word(to_address)
+        preimage = exit_salt_preimage(dst_eid, to, bps, fee_cap, refund_eoa)
+        salt = keccak256(preimage)
+        account = create2_address(factory, salt, FWD_INIT_CODE_HASH)
+        exits.append({
+            "name": name,
+            "factory": hx(factory),
+            "dst_eid": dst_eid,
+            "to": hx(to),
+            "max_bridge_fee_bps": bps,
+            "fee_cap": fee_cap,
+            "refund_eoa": hx(refund_eoa),
+            "is_valid": exit_params_valid(dst_eid, to, bps, refund_eoa, EID_ARBITRUM),
+            "salt_preimage": hx(preimage),
+            "salt": hx(salt),
+            "account": hx(account),
+        })
+        burn_exit_blocks.append({
+            "exit_case": index,
+            "recipient": hx(account),
+            "fields": {
+                "exit_version": EXIT_BLOCK_VERSION,
+                "dst_eid": dst_eid,
+                "to": hx(to),
+                "max_bridge_fee_bps": bps,
+                "fee_cap": fee_cap,
+                "refund_eoa": hx(refund_eoa),
+            },
+            "encoded": hx(encode_exit_block(dst_eid, to, bps, fee_cap, refund_eoa)),
+        })
+    assert [e["is_valid"] for e in exits] == [True, True, False]
+
+    refund_messages = []
+    for name, domain, refund_eoa in (
+        ("regtest", regtest_chain_domain(), ANVIL_ACCOUNT_0),
+        ("mainnet", MAINNET_DOMAIN, ANVIL_ACCOUNT_1),
+    ):
+        message = refund_eoa_message(domain, refund_eoa)
+        digest = eip191_digest(message)
+        signature = bytes.fromhex(REFUND_EOA_SIGNATURES[name].removeprefix("0x"))
+        assert ecrecover(digest, signature) == refund_eoa, name
+        refund_messages.append({
+            "name": name,
+            "chain_domain": hx(domain),
+            "refund_eoa": hx(refund_eoa),
+            "message": message,
+            "eip191_digest": hx(digest),
+            "signature": hx(signature),
+        })
+
+    fee_cap_cases = [
+        1,
+        1_000_000,  # the wallet default
+        2_500_000,
+        # The uint64 boundary: the largest fee_per_tx whose × 4 fits.
+        U64_MAX // DEPOSIT_FEE_CAP_TXS,
+    ]
+    fee_caps = [{"fee_per_tx": fee_per_tx, "fee_cap": deposit_fee_cap(fee_per_tx)} for fee_per_tx in fee_cap_cases]
+    assert (fee_caps[-1]["fee_per_tx"] + 1) * DEPOSIT_FEE_CAP_TXS > U64_MAX
+
+    return {
+        "tags": {"deposit": hx(FWD_DEPOSIT_TAG), "exit": hx(FWD_EXIT_TAG)},
+        "init_code_hash": hx(FWD_INIT_CODE_HASH),
+        "pinned_dst_eid": EID_ARBITRUM,
+        "deposit": deposit,
+        "exit": exits,
+        "refund_eoa_message": refund_messages,
+        "burn_exit_block": burn_exit_blocks,
+        "deposit_fee_cap": fee_caps,
+    }
+
+
 def build():
     headers = set_headers()
     history_section, heights, block_hashes, roots = history()
@@ -752,7 +1070,8 @@ def build():
             "Block hashes, the vault, recipient and the 0x11 asset id are stand-ins.",
             "set_header_v2 reuses the real BLS key of contracts/test/BlsCertificateVector.t.sol with ruleset 2.",
             "history.roots[k] is the depth-32 root over leaves 0..k-1; roots[0] is the empty root zero_32.",
-            "F_d and F_x address vectors are added with the forwarder slice.",
+            "forwarder_v2 factories, vaults, recipients, init_code_hash (keccak256 of "
+            "\"B3-VECTORS/forwarder-init-code\") and EOAs other than anvil dev accounts 0 and 1 are stand-ins.",
             "bootstrap_attestation_v2 verifiers and the storage_layout_v2 owner, upgraded token and vault are stand-ins.",
         ],
         "tags": {
@@ -772,6 +1091,7 @@ def build():
         "asset_id_v2": asset_ids(),
         "bootstrap_attestation_v2": bootstrap_attestations(headers, finalized_objects),
         "storage_layout_v2": storage_layout(),
+        "forwarder_v2": forwarders(),
     }
 
 
