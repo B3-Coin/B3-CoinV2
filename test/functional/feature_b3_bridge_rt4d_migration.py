@@ -8,7 +8,9 @@ REGTEST ONLY, the environment of RT4a (feature_b3_bridge_rt4a_round_trip.py):
 four B3 regtest validators linked only to each other, one anvil on
 127.0.0.1 (chain 31337, never forked, five dev accounts), the synthetic
 sync-committee tool, forge --offline with its output outside the source
-tree, fresh datadirs. Fixture I, START_CERTIFICATE.
+tree, fresh datadirs. Fixture I, START_CERTIFICATE. Fresh votes gossip over
+the P2P message finsigv2 as in RT4a; no phase partitions the validators, so
+no fresh vote is submitted by RPC.
 
 The pin file is written before the validators first start and holds, with
 v's v2 section, the successor v' (v2.successor): the CREATE address of anvil
@@ -26,7 +28,7 @@ migration height h_m = V + 60 = 341. Everything else v' inherits from v.
 3. RT4a deposit, carriers and mint into v, below h_m. Before h_m
    buildbridgeobservationv2 18 and 19, the observer (dry run, subject 18)
    and submitbridgecarrier of successor.sweep.payload_hex are refused.
-4. Shuttled to tip >= h_m - 1 within the C3 margin: v is retired,
+4. Staked to tip >= h_m - 1 within the C3 margin: v is retired,
    deposit_vault and getbridgedepositrecipient name v', the observation plan
    lists 18 and 19; with no launch RESERVE_E yet the sweep amount (v's
    reserve capped by its wind-down headroom) is not reported; with no
@@ -238,6 +240,8 @@ class B3BridgeRT4dMigrationTest(B3BridgeRT4aRoundTripTest):
         self.shuttle_until(lambda: all(self.fresh_finalized_height(node) >= INIT_CHECKPOINT
                                        for node in self.bridge_validators()))
         self.freeze()
+        self.evidence_step("fresh checkpoint 266 finalized by gossip", self.anvil,
+                           finsigv2_bytes_received=self.assert_fresh_gossip(self.bridge_validators()))
         self.deploy_v2_stack()
         self.initialize_verifier()
         self.resume()
@@ -264,8 +268,10 @@ class B3BridgeRT4dMigrationTest(B3BridgeRT4aRoundTripTest):
         self.release_late_sweep_and_burn()
         self.successor_deposit()
         self.check_final_accounting()
+        gossip = self.assert_fresh_gossip(self.bridge_validators())
         self.check_pin_guard_and_reindex()
         self.evidence_step("RT4d complete", self.anvil, fresh_votes=dict(self.fresh_vote_results),
+                           fresh_vote_transport=self.fresh_vote_transport, finsigv2_bytes_received=gossip,
                            relayed=len(self.relayed), withdrawals=len(self.withdrawal_leaves))
 
     # -- 1. the successor before activation ----------------------------------------
@@ -557,7 +563,7 @@ class B3BridgeRT4dMigrationTest(B3BridgeRT4aRoundTripTest):
 
     # -- 4. h_m ----------------------------------------------------------------------------------
     def reach_migration_height(self):
-        self.log.info("(4) Shuttle to h_m - 1: v retired, deposits target v', burns wait for the v' gate")
+        self.log.info("(4) Stake to h_m - 1: v retired, deposits target v', burns wait for the v' gate")
         n0 = self.nodes[0]
         self.resume()
         self.shuttle_until(lambda: all(node.getblockcount() >= MIGRATION_HEIGHT - 1 for node in self.bridge_validators()),
@@ -653,8 +659,9 @@ class B3BridgeRT4dMigrationTest(B3BridgeRT4aRoundTripTest):
         return [leaf for burned_at, leaf in self.withdrawal_leaves if burned_at <= height]
 
     def relay_covering(self, height, label):
-        """Shuttle until a carried certificate covers `height`, relay every
-        certificate in order; returns the first covering one."""
+        """Stake while fresh votes gossip until a carried certificate covers
+        `height`, relay every certificate in order; returns the first
+        covering one."""
         n0 = self.nodes[0]
         self.resume()
         self.shuttle_until(lambda: any(carrier["fb"]["height"] >= height

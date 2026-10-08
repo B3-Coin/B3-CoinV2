@@ -23,13 +23,14 @@ hash. The V1 registry stays the synthetic MANAGED_V1 bUSD. V = W2 = 281.
    equals the Python bUSD V2 AssetId, its burn gate is NOT_READY at row C1
    below W2 and its kind 9 observation plan equals a
    Python derivation; getbridgeinfo is still the synthetic managed-v1 bUSD.
-2. Fresh votes are shuttled until checkpoint 266 is finalized.
+2. Fresh votes gossip over the P2P message finsigv2 (no vote RPC) until
+   checkpoint 266 is finalized; every validator received finsigv2 traffic.
 3. DeployV2.s.sol (START_CERTIFICATE, profile R windows with
    MIN_EPOCH_DURATION = REVIEW_WINDOW = 1 s) deploys at the predicted
    addresses; the vault's B3_ASSET_ID is the node's AssetId.
 4. initialize with the epoch-0 certificate at 266 (below V): LIVE, deposits
    still closed.
-5. Shuttling past V: every carried certificate signs withdrawalRoot 0 below
+5. Gossiping past V: every carried certificate signs withdrawalRoot 0 below
    V and the empty-tree root from V. All of them are relayed in order with
    prev_index = latestIndex(); the empty root is accepted and deposits open.
 6. approve + deposit of 25,000,000 raw units to n0's RECIPIENT_V1.
@@ -40,7 +41,7 @@ hash. The V1 registry stays the synthetic MANAGED_V1 bUSD. V = W2 = 281.
    refused. A plain burnasset of bUSD V2 is refused without
    allow_unredeemable_burn (node changes §7.5).
 8. The full V2 burn gate (node changes §8.4, rows C1-C4 and E1-E8): fresh
-   votes are shuttled until every tip is within 20 blocks of its fresh
+   votes gossip until every tip is within 20 blocks of its fresh
    finalized checkpoint (row C3), any new certificate is relayed, the V2
    light client is updated to the anvil head and
    contrib/b3bridge/b3_bridge_observe_v2.py submits kind 9 VERIFIER_E,
@@ -51,7 +52,7 @@ hash. The V1 registry stays the synthetic MANAGED_V1 bUSD. V = W2 = 281.
    the mint. bridgewithdraw burns 10,000,000 (decentralized-verifier-v2);
    reserve burned = burn; the leaf V2 and the one-leaf root equal the
    Python derivation.
-9. Shuttling until a certificate covers the burn and fresh epoch 1 has
+9. Gossiping until a certificate covers the burn and fresh epoch 1 has
    certified, relayed in order (so the sequence includes a Verifier V2
    handover to Set'_1); acceptedRootHeight(root) is the first covering
    certificate's height.
@@ -65,8 +66,19 @@ hash. The V1 registry stays the synthetic MANAGED_V1 bUSD. V = W2 = 281.
 12. n3 restarted with a modified v2 section is refused by the pin-file
     guard, then restarts unchanged; n0 -reindex reproduces n1's
     getbridgev2info (observations, reserve ledger and conflict included;
-    burn_gate.now_eff aside) and fresh lineage. Evidence:
+    burn_gate.now_eff aside) and fresh lineage. No fresh vote was submitted
+    by RPC (FreshVoteShuttle's default "p2p" transport). Evidence:
     bridge_evidence.json.
+
+--freshkeys (registered as its own test_runner entry) runs the same round
+trip on B-37 per-epoch committee keys (finality dependency section 6.4):
+-b3freshkeyheight=241 (R_key), and in step 1 the bring-up pauses between R_key
+and R_f - 1 while every validator binds a genesis fresh key
+(bindfreshfinalitykey, generated into its node's fresh key store); Set'_0 and
+Set'_1 then seat the four validators on those keys, disjoint from their V1
+FINALITY_KEY keys, so Verifier V2 is initialized with, and hands over to, a
+fresh-key committee signed with fresh keys (step 9 checks Set'_1's set hash
+on the verifier against the node's fresh-key committee).
 
 feature_b3_bridge_rt4_kofn_gate.py (RT4) reuses this test with the default
 K_OF_N bootstrap and the gate's refusals; feature_b3_bridge_rt4c_conflict.py
@@ -158,6 +170,9 @@ FRESH_ARGS = [
     f"-b3freshlineageheight={FRESH_ACTIVATION}",
     f"-b3freshmaxepochextension={FRESH_EXTENSION}",
 ]
+# --freshkeys: B-37 per-epoch committee keys (regtest -b3freshkeyheight).
+FRESH_KEY_HEIGHT = 241  # R_key: genesis bindings count in [R_key, R_f - 1]
+assert FRESH_KEY_HEIGHT < FRESH_GENESIS
 LINEAGE_V2_TAG = "B3/FINALITY/LINEAGE/V2"
 INIT_CHECKPOINT = FRESH_GENESIS + CHECKPOINT_INTERVAL  # 266, checkpoint index 1
 BRING_UP_HEIGHT = INIT_CHECKPOINT + 1
@@ -244,9 +259,20 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
     # Verifier V2 BootstrapMode: 1 START_CERTIFICATE here, 0 K_OF_N in RT4.
     BOOTSTRAP_MODE = 1
 
+    def add_options(self, parser):
+        parser.add_argument("--freshkeys", dest="freshkeys", default=False, action="store_true",
+                            help="Run on B-37 per-epoch fresh committee keys (-b3freshkeyheight; RT4a only)")
+
     def set_test_params(self):
         self.num_nodes = 4
         self.setup_clean_chain = True
+
+    def fresh_keys_mode(self):
+        """--freshkeys: B-37 per-epoch committee keys (RT4a only)."""
+        return bool(getattr(self.options, "freshkeys", False))
+
+    def fresh_args(self):
+        return FRESH_ARGS + ([f"-b3freshkeyheight={FRESH_KEY_HEIGHT}"] if self.fresh_keys_mode() else [])
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -299,7 +325,7 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
                            checkpoint_root=self.bootstrap["checkpoint_root"],
                            pins_sha256=file_sha256(self.pins_path),
                            asset_id_v2=to_0x(self.asset_id_raw))
-        self.start_bridge_validators(self.pins_path, extra_args=FRESH_ARGS)
+        self.start_bridge_validators(self.pins_path, extra_args=self.fresh_args())
 
     def bridge_pins_successor(self):
         """The v2.successor pins (a B-23 successor vault, RT4d); none here."""
@@ -318,22 +344,26 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         self.conflict_height = None
 
         self.log.info("(1) Corridor, stakes and live V1 finality past the fresh genesis")
-        self.bring_up_validators(BRING_UP_HEIGHT)
+        if self.fresh_keys_mode():
+            self.bring_up_with_genesis_fresh_keys()
+        else:
+            self.bring_up_validators(BRING_UP_HEIGHT)
         self.check_lineage()
         self.v2info = self.check_v2_info_before_activation()
 
-        self.log.info("(2) Shuttle fresh votes until checkpoint 266 is finalized")
+        self.log.info("(2) Fresh votes gossip (finsigv2) until checkpoint 266 is finalized")
         self.resume()
         self.shuttle_until(lambda: all(self.fresh_finalized_height(node) >= INIT_CHECKPOINT
                                        for node in self.bridge_validators()))
         self.freeze()
         self.evidence_step("fresh checkpoint 266 finalized", self.anvil,
-                           fresh_finalized=self.nodes[0].getfinalitylineage()["finalized"])
+                           fresh_finalized=self.nodes[0].getfinalitylineage()["finalized"],
+                           finsigv2_bytes_received=self.assert_fresh_gossip(self.bridge_validators()))
 
         self.deploy_v2_stack()
         self.initialize_verifier()
 
-        self.log.info("(5) Shuttle past V and relay every certificate in order")
+        self.log.info("(5) Gossip past V and relay every certificate in order")
         self.resume()
         self.shuttle_until(lambda: all(self.fresh_finalized_height(node) >= BRIDGE_V2_HEIGHT
                                        for node in self.bridge_validators()))
@@ -351,11 +381,45 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         proof = self.check_withdrawal_proof(covering)
         self.release(proof)
         self.check_v2_relayer_rpcs(deposit)
+        gossip = self.assert_fresh_gossip(self.bridge_validators())
         self.check_pin_guard_and_reindex()
         self.evidence_step("RT4a complete", self.anvil, fresh_votes=dict(self.fresh_vote_results),
-                           relayed=len(self.relayed))
+                           fresh_vote_transport=self.fresh_vote_transport, finsigv2_bytes_received=gossip,
+                           relayed=len(self.relayed), fresh_keys=self.fresh_keys_mode())
 
     # -- 1. bring-up --------------------------------------------------------
+    def bring_up_with_genesis_fresh_keys(self):
+        """--freshkeys: bring up below R_key, then every validator binds its
+        genesis fresh key (epoch 0, serving Set'_0 and Set'_1) between R_key
+        and R_f - 1, and staking continues to BRING_UP_HEIGHT."""
+        n0 = self.nodes[0]
+        self.log.info("--freshkeys: bring-up below R_key, then genesis fresh keys between R_key and R_f - 1")
+        self.bring_up_validators(FRESH_KEY_HEIGHT - 20)
+        self.wait_until(lambda: n0.getblockcount() + 1 >= FRESH_KEY_HEIGHT, timeout=300, check_interval=0.25)
+        self.freeze()
+        tip = n0.getblockcount()
+        assert FRESH_KEY_HEIGHT <= tip + 1 <= FRESH_GENESIS - 10, tip
+        results = self.bind_fresh_keys(self.bridge_validators(), 0)
+        heights = self.mine_txids([result["txid"] for result in results], tip + 1)
+        assert max(heights) <= FRESH_GENESIS, heights
+        self.fresh_genesis_keys = {result["validator_key"]: result["bls_pubkey"] for result in results}
+        v1_keys = {member["validator_key"]: member["bls_pubkey"] for member in n0.getfinalityset()["members"]}
+        assert_equal(set(self.fresh_genesis_keys), set(v1_keys))
+        assert not set(self.fresh_genesis_keys.values()) & set(v1_keys.values())
+        self.evidence.assertion("genesis fresh keys bound between R_key and R_f - 1", actual={
+            "heights": heights, "fresh_keys": self.fresh_genesis_keys, "v1_keys": v1_keys})
+        self.log.info(f"Genesis fresh keys of all {len(results)} validators bound at heights {heights}, "
+                      "disjoint from their V1 keys")
+        self.resume()
+        self.wait_until(lambda: n0.getblockcount() >= BRING_UP_HEIGHT, timeout=300)
+
+    def fresh_committee(self, info, epoch):
+        """{validator_key: bls_pubkey} of Set'_epoch from getfinalitylineage's fresh_keys."""
+        for committee in info["fresh_keys"]["committees"]:
+            if committee["epoch"] == epoch:
+                return {member["validator_key"]: member["bls_pubkey"] for member in committee["members"]}
+        raise AssertionError(f"no fresh committee for epoch {epoch}")
+
     def check_lineage(self):
         self.log.info("The fresh lineage id equals an independent Python derivation")
         validators = self.bridge_validators()
@@ -379,6 +443,16 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         self.lineage = info
         self.evidence.assertion("fresh lineage id derived independently", expected=to_0x(expected),
                                 actual=info["lineage_id"], genesis_set_hash=info["genesis_set_hash"])
+        if self.fresh_keys_mode():
+            # B-37: Set'_0 = Set'_1 seat every validator on its genesis fresh key.
+            assert_equal(info["fresh_keys"]["key_height"], FRESH_KEY_HEIGHT)
+            for epoch in (0, 1):
+                assert_equal(self.fresh_committee(info, epoch), self.fresh_genesis_keys)
+            self.evidence.assertion("Set'_0 and Set'_1 seat the genesis fresh keys",
+                                    actual=self.fresh_committee(info, 0))
+            self.log.info("Set'_0 and Set'_1 seat every validator on its genesis fresh key")
+        else:
+            assert "fresh_keys" not in info
 
     def v2_infos(self):
         """getbridgev2info of every running node; all must be identical (frozen)
@@ -1094,7 +1168,7 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
         return (node.getfinalitylineage().get("finalized") or {}).get("epoch", -1)
 
     def relay_withdrawal_root(self):
-        self.log.info("(9) Shuttle until a certificate covers the burn and Set'_1 certifies; relay in order")
+        self.log.info("(9) Gossip until a certificate covers the burn and Set'_1 certifies; relay in order")
         self.resume()
         # Waiting for fresh epoch 1 as well puts a Verifier V2 handover
         # (signed by the pinned next set) into the relayed sequence.
@@ -1117,6 +1191,18 @@ class B3BridgeRT4aRoundTripTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTes
                      self.init_cert["successor_set_hash"])
         assert_equal(call_bytes32(anvil, self.verifier, "currentSetHash()"),
                      call_bytes32(anvil, self.verifier, "setHashByEpoch(uint64)", enc_uint(epoch)))
+        if self.fresh_keys_mode():
+            # The handover the verifier followed is the node's fresh-key
+            # committee: Set'_1 (the genesis fresh keys) by set hash.
+            info = self.nodes[0].getfinalitylineage()
+            set1 = next(entry for entry in (info.get("previous_set"), info.get("current_set"))
+                        if entry and entry["epoch"] == 1)
+            assert_equal(hx(call_bytes32(anvil, self.verifier, "setHashByEpoch(uint64)", enc_uint(1))),
+                         hx(set1["set_hash"]))
+            assert_equal(self.fresh_committee(info, 1), self.fresh_genesis_keys)
+            self.evidence.assertion("Verifier V2 followed the fresh-key handover to Set'_1",
+                                    actual=set1["set_hash"], members=self.fresh_committee(info, 1))
+            self.log.info(f"Verifier V2 followed the handover to the fresh-key Set'_1 ({set1['set_hash']})")
         self.evidence.assertion("the burn's V2 root accepted at the covering certificate; handover relayed",
                                 expected=covering["height"],
                                 actual=call_uint(anvil, self.verifier, "acceptedRootHeight(bytes32)",

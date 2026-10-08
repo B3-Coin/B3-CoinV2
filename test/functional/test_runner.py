@@ -97,8 +97,12 @@ EXTENDED_SCRIPTS = [
     'feature_b3_bridge_rt3_v1_route_a.py --deposit-only',
     # Fresh finality lineage (digest V2, regtest-only knob); local nodes only.
     'feature_b3_fresh_lineage.py',
+    # Fresh-lineage per-epoch committee keys (B-37, regtest-only knob); local nodes only.
+    'feature_b3_fresh_lineage_keys.py',
     # Bridge V2 first round trip (anvil + forge --offline + B3_BRIDGE_TOOLS).
     'feature_b3_bridge_rt4a_round_trip.py',
+    # The same round trip on B-37 per-epoch fresh committee keys (-b3freshkeyheight).
+    'feature_b3_bridge_rt4a_round_trip.py --freshkeys',
     # Bridge V2 with the K_OF_N bootstrap and the full burn gate (as RT4a).
     'feature_b3_bridge_rt4_kofn_gate.py',
     # Bridge V2 kind 13 finality conflict: B3 and Verifier V2 close for good (as RT4a).

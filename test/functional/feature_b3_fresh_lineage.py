@@ -22,11 +22,19 @@ keys B-37 are out of this slice). The test checks:
 4. Set'_0 = Snapshot(261) under ruleset 2 and the lineage id are identical
    on every validator and equal an independent Python derivation
    (TaggedHash over chainDomain || u64 261 || blockHash(261) || setHash).
-5. Fresh votes have no P2P transport: they are shuttled between nodes with
-   the hidden vote RPCs until a V2 certificate is included and finalized
-   (and, since V1 votes travel over P2P unordered with the shuttle, until
-   V1 has finalized the same checkpoint). getfinalitylineage's node-local
-   local_signer shows every staging signer healthy.
+5. Fresh votes travel only over the P2P message finsigv2 (flood on first
+   acceptance, replay of each node's verified pool) along the line
+   n0-n1-n2-n3, without any vote RPC, until a V2 certificate is included
+   and finalized (and, since V1 and V2 votes gossip unordered, until V1 has
+   finalized the same checkpoint). Every validator received finsigv2
+   traffic. getfinalitylineage's node-local local_signer shows every staging
+   signer healthy. Hidden-RPC drill, frozen with votes pending: once gossip
+   settles getfinalitylineagevotes exports the same votes on every
+   validator, each field equal to its 148 serialized bytes, and
+   submitfinalitylineagevote of any of them is a duplicate everywhere
+   (gossip already pooled it); a vote with a flipped signature byte is
+   bad-signature, one naming another lineage id lineage-mismatch, and
+   neither changes any export.
 6. getfinalitylineagecertificate is identical on every node, and Python
    re-derives every byte: the 185-byte FinalizedBlockV2, the history root
    from getblockhash leaves, both history paths, digestV2, certId, both
@@ -38,13 +46,15 @@ keys B-37 are out of this slice). The test checks:
 9. A restart and a -reindex restart of n3, and n4 syncing from genesis,
    reproduce the lineage id, epoch, sets and finalized checkpoint.
 10. Every validator holds a V1 journal and a separate V2 lineage journal.
+    With staking resumed, n4 (linked to n0 only, never a validator) and every
+    validator, n3 after its restarts included, receive finsigv2 traffic on
+    their current connections.
 """
 
 from collections import Counter
 import hashlib
 import os
 
-from test_framework.authproxy import JSONRPCException
 from test_framework.b3bridge import (
     B3_BRIDGE_ARGS,
     CHECKPOINT_INTERVAL,
@@ -52,6 +62,7 @@ from test_framework.b3bridge import (
     MODERN_START,
     VALIDATOR_COUNT,
     B3BridgeChainMixin,
+    FreshVoteShuttle,
     hx,
     keccak256,
     regtest_chain_domain,
@@ -337,7 +348,7 @@ def sets_by_epoch(view):
     return out
 
 
-class B3FreshLineageTest(B3BridgeChainMixin, BitcoinTestFramework):
+class B3FreshLineageTest(FreshVoteShuttle, B3BridgeChainMixin, BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 5
         self.setup_clean_chain = True
@@ -371,8 +382,9 @@ class B3FreshLineageTest(B3BridgeChainMixin, BitcoinTestFramework):
 
     # -- test ---------------------------------------------------------------
     def run_test(self):
+        # Hidden-RPC drill results only: the fresh votes themselves gossip
+        # (fresh_vote_transport "p2p", so fresh_vote_results stays empty).
         self.vote_results = Counter()
-        self.delivered = set()
         self.domain = regtest_chain_domain()
 
         self.check_before_activation()
@@ -383,10 +395,10 @@ class B3FreshLineageTest(B3BridgeChainMixin, BitcoinTestFramework):
                            v1_epoch=self.v1_start["epoch"])
         self.check_bootstrap()
 
-        self.log.info("Shuttle fresh votes until a V2 certificate is finalized on every node")
-        # V2 votes move through the shuttle and V1 votes over P2P, with no
-        # ordering between them: wait for both lineages (and for every
-        # staging signer to have signed the checkpoint) before freezing.
+        self.log.info("Fresh votes gossip (finsigv2) until a V2 certificate is finalized on every node")
+        # V2 votes (finsigv2) and V1 votes (finsig) gossip with no ordering
+        # between them: wait for both lineages (and for every staging signer
+        # to have signed the checkpoint) before freezing.
         self.shuttle_until(lambda: all(self.first_checkpoint_settled(node) for node in self.bridge_validators()))
         self.freeze()
         view = self.agreed_view()
@@ -394,10 +406,12 @@ class B3FreshLineageTest(B3BridgeChainMixin, BitcoinTestFramework):
         self.first = self.check_certificate_export(view)
         self.check_export_refusals(view, self.first)
         self.check_v1_status(min_finalized=FIRST_FRESH_CHECKPOINT)
+        gossip = self.assert_fresh_gossip(self.bridge_validators())
         self.evidence_step("first fresh certificate exported", fresh_finalized=view["finalized"],
-                           votes=dict(self.vote_results))
+                           finsigv2_bytes_received=gossip, vote_rpc_calls=dict(self.fresh_vote_results))
+        self.hidden_rpc_drill()
 
-        self.log.info("Keep shuttling until the lineage rotates and Set'_1 certifies")
+        self.log.info("Fresh votes keep gossiping until the lineage rotates and Set'_1 certifies")
         self.resume()
         self.shuttle_until(lambda: all(self.epoch1_settled(node) for node in self.bridge_validators()),
                            timeout=600)
@@ -411,13 +425,18 @@ class B3FreshLineageTest(B3BridgeChainMixin, BitcoinTestFramework):
         self.check_carriers(view)
         self.check_v1_status(min_finalized=FIRST_FRESH_CHECKPOINT + 1, epoch_advanced=True)
         self.evidence_step("fresh epoch 1 certified", fresh_finalized=view["finalized"],
-                           epoch_starts=view["epoch_starts"], votes=dict(self.vote_results))
+                           epoch_starts=view["epoch_starts"], vote_rpc_calls=dict(self.fresh_vote_results))
 
         self.check_restart_and_reindex(view)
         self.check_sync_from_genesis(view)
         self.check_signer_journals(view)
-        assert_equal(self.vote_results["lineage-mismatch"], 1)  # Only the tampered vote below.
-        self.evidence_step("fresh lineage checks complete", votes=dict(self.vote_results))
+        self.check_gossip_reaches_every_node()
+        # Only the drill submitted votes by RPC: its duplicates and its two
+        # tampered votes.
+        assert_equal(set(self.vote_results), {"duplicate", "bad-signature", "lineage-mismatch"})
+        assert_equal((self.vote_results["bad-signature"], self.vote_results["lineage-mismatch"]), (1, 1))
+        self.evidence_step("fresh lineage checks complete", drill_results=dict(self.vote_results),
+                           vote_rpc_calls=dict(self.fresh_vote_results))
 
     # -- 2. before R_f --------------------------------------------------------
     def check_before_activation(self):
@@ -490,52 +509,81 @@ class B3FreshLineageTest(B3BridgeChainMixin, BitcoinTestFramework):
                                 actual=self.lineage_id, genesis_block_hash=info["genesis_block_hash"],
                                 genesis_set_hash=info["genesis_set_hash"])
 
-    # -- 5. vote shuttle ------------------------------------------------------
-    def shuttle_fresh_votes(self):
-        """Relay every verified fresh vote of each validator to the others."""
-        validators = [node for node in self.bridge_validators() if node.running]
-        for source in validators:
-            try:
-                votes = source.getfinalitylineagevotes()
-            except JSONRPCException as e:
-                self.log.debug(f"getfinalitylineagevotes on node{source.index}: {e.error}")
-                continue
-            for vote in votes:
-                assert_equal(vote["lineage_id"], self.lineage_id)
-                assert_equal(len(hx(vote["hex"])), VOTE_SIZE)
-                if not self.vote_results["lineage-mismatch"]:
-                    self.check_tampered_vote(validators, vote)
-                for target in validators:
-                    key = (target.index, vote["hex"])
-                    if target is source or key in self.delivered:
-                        continue
-                    try:
-                        result = target.submitfinalitylineagevote(vote["hex"])["result"]
-                    except JSONRPCException as e:
-                        self.log.debug(f"submitfinalitylineagevote on node{target.index}: {e.error}")
-                        result = "rpc-error"
-                    self.vote_results[result] += 1
-                    if result in ("accepted", "duplicate", "stale"):
-                        self.delivered.add(key)
-        return True
-
-    def check_tampered_vote(self, validators, vote):
-        """A vote naming another lineage id is refused before any BLS work."""
-        raw = bytearray(hx(vote["hex"]))
-        raw[0] ^= 0x01  # lineage_id is the first serialized field.
-        result = validators[0].submitfinalitylineagevote(raw.hex())["result"]
-        assert_equal(result, "lineage-mismatch")
-        self.vote_results[result] += 1
-        self.evidence.assertion("vote with another lineage id refused", expected="lineage-mismatch",
-                                actual=result)
-
-    def shuttle_until(self, predicate, timeout=300):
-        self.wait_until(lambda: self.shuttle_fresh_votes() and predicate(), timeout=timeout,
-                        check_interval=0.25)
-
+    # -- 5. gossip and the hidden-RPC drill ------------------------------------
     @staticmethod
-    def fresh_finalized_height(node):
-        return node.getfinalitylineage().get("finalized", {}).get("height", -1)
+    def decode_vote(vote):
+        """A getfinalitylineagevotes entry checked against its 148 bytes:
+        lineage id || u64 epoch || u64 height || u32 index (little-endian,
+        like finsig) || 96-byte signature."""
+        raw = hx(vote["hex"])
+        assert_equal(len(raw), VOTE_SIZE)
+        assert_equal(raw[0:32], hx(vote["lineage_id"]))
+        assert_equal(int.from_bytes(raw[32:40], "little"), vote["epoch"])
+        assert_equal(int.from_bytes(raw[40:48], "little"), vote["height"])
+        assert_equal(int.from_bytes(raw[48:52], "little"), vote["index"])
+        assert_equal(raw[52:], hx(vote["signature"]))
+        assert_equal(len(raw[52:]), BLS_SIGNATURE_SIZE)
+        return raw
+
+    def settled_exports(self, validators, timeout=60):
+        """Frozen: wait until gossip gives every validator the same verified
+        votes; return them as {hex: vote}."""
+        exports = []
+
+        def agreed():
+            exports[:] = [{vote["hex"]: vote for vote in node.getfinalitylineagevotes()} for node in validators]
+            return all(set(export) == set(exports[0]) for export in exports)
+
+        self.wait_until(agreed, timeout=timeout)
+        return exports[0]
+
+    def hidden_rpc_drill(self, attempts=20):
+        """The hidden vote RPCs as a drill: export, re-submission, tampering."""
+        self.log.info("Hidden-RPC drill: the gossiped pools export the same votes; tampered votes are refused")
+        validators = self.bridge_validators()
+        n0 = self.nodes[0]
+        for attempt in range(1, attempts + 1):
+            # Votes are pending only between a checkpoint becoming signable
+            # and the block that carries its certificate: freeze inside that
+            # window (a block in flight can still close it, so retry).
+            self.resume()
+            self.wait_until(lambda: len(n0.getfinalitylineagevotes()) > 0, timeout=120, check_interval=0.05)
+            self.freeze()
+            pooled = self.settled_exports(validators)
+            if pooled:
+                break
+        else:
+            raise AssertionError(f"no fresh vote was pending at a freeze in {attempts} attempts")
+        for vote in pooled.values():
+            assert_equal(vote["lineage_id"], self.lineage_id)
+            self.decode_vote(vote)
+        # Gossip already pooled every vote everywhere: the RPC adds nothing.
+        resubmitted = Counter()
+        for target in validators:
+            for vote_hex in pooled:
+                result = target.submitfinalitylineagevote(vote_hex)["result"]
+                assert_equal(result, "duplicate")
+                resubmitted[result] += 1
+        self.vote_results.update(resubmitted)
+
+        sample = next(iter(pooled.values()))
+        raw = bytearray(hx(sample["hex"]))
+        raw[-1] ^= 0x01  # A signature byte: other bytes for a pooled member.
+        bad_signature = validators[1].submitfinalitylineagevote(raw.hex())["result"]
+        raw = bytearray(hx(sample["hex"]))
+        raw[0] ^= 0x01  # lineage_id is the first serialized field.
+        lineage_mismatch = validators[0].submitfinalitylineagevote(raw.hex())["result"]
+        assert_equal((bad_signature, lineage_mismatch), ("bad-signature", "lineage-mismatch"))
+        self.vote_results.update([bad_signature, lineage_mismatch])
+        assert_equal(self.settled_exports(validators, timeout=10), pooled)
+        self.evidence.assertion(
+            "hidden-RPC drill: one gossiped export on every validator; tampered votes refused",
+            expected={"resubmitted": "duplicate", "flipped signature byte": "bad-signature",
+                      "flipped lineage id byte": "lineage-mismatch"},
+            actual={"resubmitted": dict(resubmitted), "flipped signature byte": bad_signature,
+                    "flipped lineage id byte": lineage_mismatch},
+            attempts=attempt, tip=n0.getblockcount(),
+            votes=sorted((vote["epoch"], vote["height"], vote["index"]) for vote in pooled.values()))
 
     @staticmethod
     def fresh_epoch1_certified(node):
@@ -848,6 +896,33 @@ class B3FreshLineageTest(B3BridgeChainMixin, BitcoinTestFramework):
         assert_equal(self.node_state(n4), self.node_state(self.nodes[0]))
         assert_equal(lineage_view(n4), view)
         self.evidence_step("n4 synced from genesis and agrees", fresh_finalized=view["finalized"])
+
+    # -- 10. gossip on every current connection -------------------------------
+    def check_gossip_reaches_every_node(self):
+        """n4 (linked to n0 only, no vote RPC ever) and every validator,
+        restarted n3 included, receive finsigv2; n4 pools verified votes."""
+        self.log.info("Staking resumed: finsigv2 reaches n4 and every validator on their current connections")
+        nodes = self.bridge_nodes()
+        n4 = self.nodes[4]
+        assert_equal([node.index for node in nodes], list(range(self.num_nodes)))
+        before = {f"node{node.index}": self.fresh_gossip_bytes(node) for node in nodes}
+        n4_pooled = []
+
+        def reached():
+            if not n4_pooled:
+                n4_pooled.extend(n4.getfinalitylineagevotes())
+            return n4_pooled and all(self.fresh_gossip_bytes(node) > before[f"node{node.index}"] for node in nodes)
+
+        self.resume()
+        self.wait_until(reached, timeout=300)
+        self.freeze()
+        after = self.assert_fresh_gossip(nodes)
+        for vote in n4_pooled:
+            assert_equal(vote["lineage_id"], self.lineage_id)
+            self.decode_vote(vote)
+        self.evidence.assertion("finsigv2 reaches n4 and every validator", expected="more bytes on every node",
+                                actual={"before": before, "after": after},
+                                n4_pooled=sorted((vote["epoch"], vote["height"], vote["index"]) for vote in n4_pooled))
 
     # -- 10. journals ---------------------------------------------------------
     def check_signer_journals(self, view):

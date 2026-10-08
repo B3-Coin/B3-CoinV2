@@ -13,7 +13,9 @@ b3-bridge-regtest-certify tool (B3_BRIDGE_TOOLS), which never reads a
 secret key and refuses every other chain domain and EVM chain id.
 
 RT4a's round trip (node changes rev 11 sections 7-8; owner ruling R9 on
-OI-12) with these differences:
+OI-12), its fresh votes gossiping over the P2P message finsigv2 with no vote
+RPC (the transport runs on the steady clock, so it also works under the
+stale drill's mock time), with these differences:
 
 3. DeployV2.s.sol deploys with B3V2_BOOTSTRAP_MODE = 0 (K_OF_N) and the
    bootstrap committee of `b3-bridge-regtest-certify bootstrap-set` (four
@@ -276,8 +278,10 @@ class B3BridgeRT4KofNGateTest(B3BridgeRT4aRoundTripTest):
     def run_test(self):
         super().run_test()
         self.stale_drill()
+        # Gossip only, also under mock time: the shuttle submitted no vote.
+        assert_equal((self.fresh_vote_transport, dict(self.fresh_vote_results)), ("p2p", {}))
         self.evidence_step("RT4 complete", self.anvil, fresh_votes=dict(self.fresh_vote_results),
-                           relayed=len(self.relayed))
+                           fresh_vote_transport=self.fresh_vote_transport, relayed=len(self.relayed))
 
     def gate_on_every_node(self):
         info = self.v2_infos()

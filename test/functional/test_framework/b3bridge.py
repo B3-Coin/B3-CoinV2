@@ -26,8 +26,8 @@ REGTEST ONLY. This module provides:
 - bridge V2 (first node slice, RT4a): CREATE address prediction, the bUSD
   V2 AssetId, leaf V2 and the V2 withdrawal tree, the -b3bridgepins v2
   writer, Verifier V2 / Vault V2 calldata encoders, a DeployV2.s.sol
-  runner and FreshVoteShuttle (the fresh-lineage vote relay between
-  validators, which have no P2P transport for those votes yet);
+  runner and FreshVoteShuttle (waits on fresh-lineage votes, which travel
+  over the P2P message finsigv2; its RPC relay remains for drills);
 - bridge V2 (second node slice, RT4): the OI-12 K_OF_N bootstrap message
   and K_OF_N initialize calldata, a runner of the REGTEST ONLY
   b3-bridge-regtest-certify tool, the kind 9 observation plan, a one-shot
@@ -41,7 +41,11 @@ REGTEST ONLY. This module provides:
   one-shot run of contrib/b3bridge/b3_bridge_deposit_guard_v2.py;
 - bridge V2 (fourth node slice, RT4d): the B-23 successor vault pins, the
   kind 16 VAULT_SWEEP record, the successor kind 9 subjects 18 and 19 and
-  their observation plan, and the B3VaultV2 constructor Config encoder.
+  their observation plan, and the B3VaultV2 constructor Config encoder;
+- fresh-lineage per-epoch keys (B-37): a validator count other than four
+  (B3BridgeChainMixin.bridge_validator_count), bind_fresh_keys() and an
+  independent parser of a node's fresh key store file
+  (parse_fresh_key_store, src/node/finality_fresh_key_store.h).
 
 The relayer module is imported only as a library; its main() is never
 called in-process, only as an unchanged subprocess by run_relayer_once().
@@ -1728,11 +1732,15 @@ class B3BridgeChainMixin:
     """Bridge fixture helpers for a BitcoinTestFramework subclass.
 
     Use as `class Test(B3BridgeChainMixin, BitcoinTestFramework)`. Nodes 0-3
-    are the validators. Any further node (e.g. a sync checker that is not
-    started) is ignored by the helpers below, which act only on running
-    nodes. The corridor/stake helpers are copied from
-    feature_flowmesh_release.py:79-199, which is left unchanged.
+    are the validators (nodes 0 to bridge_validator_count - 1 when a test
+    overrides that class attribute, with as many stakes). Any further node
+    (e.g. a sync checker that is not started) is ignored by the helpers
+    below, which act only on running nodes. The corridor/stake helpers are
+    copied from feature_flowmesh_release.py:79-199, which is left unchanged.
     """
+
+    #: Nodes 0 .. bridge_validator_count - 1 are the validators.
+    bridge_validator_count = VALIDATOR_COUNT
 
     # -- configuration, tools and local processes --------------------------
     @property
@@ -1856,22 +1864,23 @@ class B3BridgeChainMixin:
         return [node for node in self.nodes if node.running]
 
     def bridge_validators(self):
-        return self.nodes[:VALIDATOR_COUNT]
+        return self.nodes[:self.bridge_validator_count]
 
     def start_bridge_validators(self, pins_path=None, extra_args=()):
         """Add every node with the bridge arguments; start and link n0-n3.
 
         The validators link only to each other, in the framework's default
-        chain topology. Nodes past n3 are added but not started.
+        chain topology (a line). Nodes past n3 (past the last validator with
+        bridge_validator_count) are added but not started.
         """
         args = b3_bridge_args(pins_path) + list(extra_args)
         if not self.nodes:
             self.add_nodes(self.num_nodes, [list(args) for _ in range(self.num_nodes)])
-        for i in range(VALIDATOR_COUNT):
+        for i in range(self.bridge_validator_count):
             self.start_node(i, extra_args=args)
             if self.uses_wallet:
                 self.init_wallet(node=i)
-        for i in range(VALIDATOR_COUNT - 1):
+        for i in range(self.bridge_validator_count - 1):
             self.connect_nodes(i + 1, i)
 
     def sync_bridge_blocks(self, timeout=120):
@@ -2039,14 +2048,16 @@ class B3BridgeChainMixin:
         behind the wall clock. From M-1 the nodes return to the real clock
         and stake continuously (feature_b3_finality_soak.py:120-152), so BLS
         finality is live. Returns once n0 is at or above target_height and
-        every validator has finalized at least M+5.
+        every validator has finalized at least M+5. A test that overrides
+        bridge_validator_count passes one stake per validator (len(stakes)
+        validators); -b3minfinalityset stays its own choice.
 
         With finality_key_label the validators bind the public test keys of
         that label instead of their derived keys (import_test_finality_keys),
         so b3-bridge-regtest-certify can sign as B3's own committees.
         """
         validators = self.bridge_validators()
-        assert_equal(len(validators), VALIDATOR_COUNT)
+        assert_equal(len(validators), len(stakes))
         assert all(node.running for node in validators)
         assert target_height >= MODERN_START
         n0 = validators[0]
@@ -2055,7 +2066,7 @@ class B3BridgeChainMixin:
         self.pos_running = False
         self.set_chain_time(int(time.time()) - 300)
 
-        self.log.info("Corridor funding and four independent finality stakes")
+        self.log.info(f"Corridor funding and {len(stakes)} independent finality stakes")
         self.mine_corridor(101)
         for node in validators[1:]:
             n0.sendtoaddress(node.get_deterministic_priv_key().address, 120)
@@ -2076,7 +2087,7 @@ class B3BridgeChainMixin:
                             timeout=60)
             preview = node.getfinalitystatus()["set0_preview"]
             assert_equal(preview["ready"], True)
-            assert_equal(preview["size"], VALIDATOR_COUNT)
+            assert_equal(preview["size"], len(stakes))
         # The Python domain derivation must equal the node's own.
         assert_equal(n0.getfinalityset()["chain_domain"], regtest_chain_domain().hex())
 
@@ -2120,6 +2131,24 @@ class B3BridgeChainMixin:
                          ("bind", member["validator_key"], hx(member["bls_pubkey"])))
         self.finality_test_keys = {"label": label, "members": members}
         return self.finality_test_keys
+
+    def bind_fresh_keys(self, wallets, epoch=None):
+        """bindfreshfinalitykey on each wallet (a node or a wallet RPC) for
+        `epoch` (default: the next block's window) while frozen; REGTEST ONLY
+        (-b3freshkeyheight). Each key is generated into that node's fresh key
+        store and its binding broadcast from the wallet; the transactions are
+        left in the mempools (mine_txids). Returns the results in order.
+        """
+        results = []
+        for wallet in wallets:
+            result = wallet.bindfreshfinalitykey() if epoch is None else wallet.bindfreshfinalitykey(epoch)
+            if epoch is not None:
+                assert_equal(result["epoch"], epoch)
+            assert_equal((result["key_source"], result["status"]), ("generated", "UNCONFIRMED"))
+            assert "warnings" not in result, result["warnings"]
+            assert_equal(len(hx(result["bls_pubkey"])), 48)
+            results.append(result)
+        return results
 
     def freeze(self):
         """Stop every staker and agree on one tip.
@@ -2211,9 +2240,9 @@ class B3BridgeChainMixin:
         With the real clock (mock_time 0) the validators stake until each
         txid is in a block every running node agrees on. Under mock time
         (set_chain_time) one block at a time is produced with
-        mine_pos_blocks_mocktime(), relaying fresh-lineage votes in between
-        when the test has a FreshVoteShuttle. Returns the containing heights
-        in txid order.
+        mine_pos_blocks_mocktime(), calling the FreshVoteShuttle round in
+        between when the test has one (fresh votes gossip meanwhile).
+        Returns the containing heights in txid order.
         """
         self.synchronize_mempools()
         if not getattr(self, "mock_time", 0):
@@ -2302,21 +2331,103 @@ class B3BridgeChainMixin:
         return output
 
 
-class FreshVoteShuttle:
-    """Fresh-lineage (digest V2) vote relay for a B3BridgeChainMixin test.
+# -- B-37 fresh key store (src/node/finality_fresh_key_store.h) ---------------
+FRESH_KEY_STORE_MAGIC = b"B3FKEYS1"
+FRESH_KEY_STORE_VERSION = 1
+FRESH_KEY_STORE_HEADER_SIZE = 8 + 1 + 32 + 32 + 4
+FRESH_KEY_STORE_RECORD_SIZE = 8 + 1 + 48 + 32 + 32
+FRESH_KEY_STORE_CHECKSUM_SIZE = 32
+FRESH_KEY_STORE_MAX_RECORDS = 4096
+FRESH_KEY_STATES = {1: "held", 2: "erased"}
 
-    Fresh votes have no P2P transport in this slice, so they are shuttled
-    between the running validators with the hidden vote RPCs. The shuttle
-    is feature_b3_fresh_lineage.py's (left unchanged there) without its
-    tampered-vote check. Set self.lineage_id (getfinalitylineage) first.
-    Each round also records n0's getfinalitylineage().finalized.certified_at
-    in self.fresh_inclusions; fresh_certificates() reads every type-11
-    carrier from the coinbases, so no certificate included between two
-    polls is missed when relaying.
+
+class FreshKeyStoreError(AssertionError):
+    pass
+
+
+def parse_fresh_key_store(data):
+    """Decode one fresh key store file independently of the node.
+
+    Layout (FreshKeyStore, integers little-endian): magic "B3FKEYS1",
+    version 1, chain domain (uint256 bytes), x-only validator key, u32 count,
+    count x {u64 target epoch, u8 state (1 held, 2 erased), 48-byte BLS
+    public key, 32-byte secret (all zero once erased), bind txid (uint256
+    bytes, null until recorded)}, then SHA256 of every preceding byte.
+    Returns {"chain_domain": bytes, "validator_key": hex, "records": [...]}
+    with each record {"epoch", "state", "bls_pubkey" (hex), "secret"
+    (bytes), "bind_txid" (display hex or None)}; raises FreshKeyStoreError
+    on anything that does not verify.
+    """
+    def refuse(reason):
+        raise FreshKeyStoreError(f"fresh key store: {reason}")
+
+    minimum = FRESH_KEY_STORE_HEADER_SIZE + FRESH_KEY_STORE_CHECKSUM_SIZE
+    if len(data) < minimum:
+        refuse(f"{len(data)} bytes, at least {minimum} expected")
+    if data[:8] != FRESH_KEY_STORE_MAGIC:
+        refuse("bad magic")
+    if data[8] != FRESH_KEY_STORE_VERSION:
+        refuse(f"unknown version {data[8]}")
+    if hashlib.sha256(data[:-FRESH_KEY_STORE_CHECKSUM_SIZE]).digest() != data[-FRESH_KEY_STORE_CHECKSUM_SIZE:]:
+        refuse("checksum mismatch")
+    count = int.from_bytes(data[73:77], "little")
+    if count > FRESH_KEY_STORE_MAX_RECORDS:
+        refuse(f"{count} records, maximum {FRESH_KEY_STORE_MAX_RECORDS}")
+    if len(data) != minimum + count * FRESH_KEY_STORE_RECORD_SIZE:
+        refuse(f"{len(data)} bytes do not hold {count} records")
+    records, seen = [], set()
+    for i in range(count):
+        offset = FRESH_KEY_STORE_HEADER_SIZE + i * FRESH_KEY_STORE_RECORD_SIZE
+        record = data[offset:offset + FRESH_KEY_STORE_RECORD_SIZE]
+        state = FRESH_KEY_STATES.get(record[8])
+        pubkey, secret, txid = record[9:57], record[57:89], record[89:121]
+        if state is None:
+            refuse(f"record {i}: unknown state {record[8]}")
+        if (state == "erased") == any(secret):
+            refuse(f"record {i}: {state} with {'a' if any(secret) else 'no'} secret")
+        if pubkey in seen:
+            refuse(f"record {i}: duplicate public key")
+        seen.add(pubkey)
+        records.append({"epoch": int.from_bytes(record[0:8], "little"), "state": state,
+                        "bls_pubkey": pubkey.hex(), "secret": secret,
+                        "bind_txid": txid[::-1].hex() if any(txid) else None})
+    return {"chain_domain": data[9:41], "validator_key": data[41:73].hex(), "records": records}
+
+
+def read_fresh_key_store(path):
+    """parse_fresh_key_store() of the file at path, plus its raw bytes."""
+    with open(path, "rb") as f:
+        data = f.read()
+    store = parse_fresh_key_store(data)
+    store["raw"] = data
+    return store
+
+
+class FreshVoteShuttle:
+    """Fresh-lineage (digest V2) vote transport for a B3BridgeChainMixin test.
+
+    Fresh votes travel over the lineage-naming P2P message finsigv2
+    (net_processing.cpp, only on a chain with a fresh lineage): a node floods
+    a vote once on first acceptance and replays its verified pool to every
+    connection, so the line n0-n1-n2-n3 of start_bridge_validators() reaches
+    every validator. With fresh_vote_transport "p2p" (the default) a round
+    of shuttle_fresh_votes() calls no vote RPC: shuttle_until() and
+    shuttle_fresh_until_lag() only wait while the nodes gossip. "rpc" adds
+    the former relay through the hidden vote RPCs (getfinalitylineagevotes /
+    submitfinalitylineagevote) for drills or a phase whose validators are
+    not linked; set self.lineage_id (getfinalitylineage) first. Every
+    submission is counted in self.fresh_vote_results, which stays empty
+    with gossip (assert_fresh_gossip). Each round also records n0's
+    getfinalitylineage().finalized.certified_at in self.fresh_inclusions;
+    fresh_certificates() reads every type-11 carrier from the coinbases, so
+    no certificate included between two polls is missed when relaying.
     """
 
     FRESH_VOTE_SIZE = 148
+    FRESH_VOTE_MESSAGE = "finsigv2"
+    FRESH_VOTE_TRANSPORTS = ("p2p", "rpc")
     MPA_TYPE_FINALITY_CERTIFICATE_V2 = 11
+    fresh_vote_transport = "p2p"
 
     def _fresh_shuttle_state(self):
         if not hasattr(self, "_fresh_delivered"):
@@ -2327,7 +2438,23 @@ class FreshVoteShuttle:
         return self._fresh_delivered
 
     def shuttle_fresh_votes(self):
-        """Relay every verified fresh vote of each validator to the others."""
+        """One round: relay votes by RPC if fresh_vote_transport is "rpc"
+        (gossip needs nothing), then record n0's newest fresh inclusion."""
+        self._fresh_shuttle_state()
+        assert self.fresh_vote_transport in self.FRESH_VOTE_TRANSPORTS, self.fresh_vote_transport
+        if self.fresh_vote_transport == "rpc":
+            self.relay_fresh_votes_by_rpc()
+        try:
+            certified_at = (self.nodes[0].getfinalitylineage().get("finalized") or {}).get("certified_at")
+        except JSONRPCException:
+            certified_at = None
+        if certified_at is not None:
+            self.fresh_inclusions.add(certified_at)
+        return True
+
+    def relay_fresh_votes_by_rpc(self):
+        """Relay every verified fresh vote of each validator to the others
+        with the hidden vote RPCs (drills only; gossip does this unasked)."""
         delivered = self._fresh_shuttle_state()
         assert getattr(self, "lineage_id", None), "set self.lineage_id before shuttling"
         validators = [node for node in self.bridge_validators() if node.running]
@@ -2352,15 +2479,28 @@ class FreshVoteShuttle:
                     self.fresh_vote_results[result] += 1
                     if result in ("accepted", "duplicate", "stale"):
                         delivered.add(key)
-        try:
-            certified_at = (self.nodes[0].getfinalitylineage().get("finalized") or {}).get("certified_at")
-        except JSONRPCException:
-            certified_at = None
-        if certified_at is not None:
-            self.fresh_inclusions.add(certified_at)
-        return True
+
+    @classmethod
+    def fresh_gossip_bytes(cls, node):
+        """finsigv2 bytes node received, summed over its current connections
+        (getpeerinfo counters restart with a node or a connection)."""
+        return sum(peer["bytesrecv_per_msg"].get(cls.FRESH_VOTE_MESSAGE, 0) for peer in node.getpeerinfo())
+
+    def assert_fresh_gossip(self, nodes):
+        """Every node in `nodes` received finsigv2 traffic from its peers and,
+        with the default "p2p" transport, the shuttle submitted no vote by RPC.
+        Returns {"nodeN": bytes received}."""
+        self._fresh_shuttle_state()
+        observed = {f"node{node.index}": self.fresh_gossip_bytes(node) for node in nodes}
+        silent = [name for name, received in observed.items() if received <= 0]
+        assert not silent, f"no {self.FRESH_VOTE_MESSAGE} received by {silent}: {observed}"
+        if self.fresh_vote_transport == "p2p":
+            assert_equal(dict(self.fresh_vote_results), {})
+        return observed
 
     def shuttle_until(self, predicate, timeout=300):
+        """Poll predicate, one shuttle_fresh_votes() round before each check
+        (with gossip only n0's newest inclusion is recorded)."""
         self.wait_until(lambda: self.shuttle_fresh_votes() and predicate(), timeout=timeout,
                         check_interval=0.25)
 
@@ -2377,8 +2517,9 @@ class FreshVoteShuttle:
         return lags
 
     def shuttle_fresh_until_lag(self, max_lag, timeout=300):
-        """Relay fresh votes until every validator's tip is at most max_lag
-        blocks above its fresh finalized checkpoint; leave them frozen.
+        """Let fresh votes gossip (or relay them, transport "rpc") until every
+        validator's tip is at most max_lag blocks above its fresh finalized
+        checkpoint; leave them frozen.
 
         A V2 burn is judged with candidate height - finalized <=
         max_finality_lag_blocks (gate row C3; 30 on profile R), so callers
@@ -2824,3 +2965,45 @@ class TestFrameworkB3BridgeGuards(unittest.TestCase):
         # Before the migration height the sweep carries no gate.
         self.assertEqual(gate_view({"successor": {"sweep": {"payload_hex": "1000"}}}),
                          {"successor": {"sweep": {"payload_hex": "1000"}}})
+
+    def test_fresh_key_store_parser(self):
+        """parse_fresh_key_store against a hand-built file and its refusals."""
+        domain, validator = bytes(range(32)), bytes(range(32, 64))
+
+        def record(epoch, state, pubkey, secret=bytes(32), txid=bytes(32)):
+            return epoch.to_bytes(8, "little") + bytes([state]) + pubkey + secret + txid
+
+        def store(records, count=None, magic=FRESH_KEY_STORE_MAGIC, version=FRESH_KEY_STORE_VERSION):
+            body = (magic + bytes([version]) + domain + validator +
+                    (len(records) if count is None else count).to_bytes(4, "little") + b"".join(records))
+            return body + hashlib.sha256(body).digest()
+
+        held = record(2, 1, b"\xa1" * 48, b"\x5a" * 32, bytes(range(1, 33)))
+        erased = record(0, 2, b"\xa2" * 48)
+        parsed = parse_fresh_key_store(store([erased, held]))
+        self.assertEqual(parsed["chain_domain"], domain)
+        self.assertEqual(parsed["validator_key"], validator.hex())
+        self.assertEqual(parsed["records"], [
+            {"epoch": 0, "state": "erased", "bls_pubkey": "a2" * 48, "secret": bytes(32), "bind_txid": None},
+            {"epoch": 2, "state": "held", "bls_pubkey": "a1" * 48, "secret": b"\x5a" * 32,
+             "bind_txid": bytes(range(1, 33))[::-1].hex()},
+        ])
+        self.assertEqual(len(store([held])), FRESH_KEY_STORE_HEADER_SIZE + FRESH_KEY_STORE_RECORD_SIZE + 32)
+        self.assertEqual(parse_fresh_key_store(store([]))["records"], [])
+
+        good = store([held])
+        for data, reason in (
+            (good[:-1], "checksum"),
+            (good[:40], "at least"),
+            (good[:100] + bytes([good[100] ^ 1]) + good[101:], "checksum"),
+            (store([held], magic=b"B3FKEYS2"), "bad magic"),
+            (store([held], version=2), "unknown version"),
+            (store([held], count=2), "do not hold"),
+            (store([], count=FRESH_KEY_STORE_MAX_RECORDS + 1), "maximum"),
+            (store([record(1, 3, b"\xa3" * 48, b"\x01" * 32)]), "unknown state"),
+            (store([record(1, 2, b"\xa3" * 48, b"\x01" * 32)]), "erased with a secret"),
+            (store([record(1, 1, b"\xa3" * 48)]), "held with no secret"),
+            (store([held, held]), "duplicate public key"),
+        ):
+            with self.assertRaisesRegex(FreshKeyStoreError, reason):
+                parse_fresh_key_store(data)
