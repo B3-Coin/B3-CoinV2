@@ -186,6 +186,8 @@ add_executable(test_bitcoin
   finality_fresh_params_tests.cpp
   finality_v2_tests.cpp
   finality_fresh_lineage_tests.cpp
+  finality_fresh_transport_tests.cpp
+  finality_fresh_key_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp

@@ -44,8 +44,10 @@
 #include <modern/mpa.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
+#include <modern/finality_fresh_key.h>
 #include <modern/payload_root.h>
 #include <node/finality_binding_index.h>
+#include <node/finality_fresh_key_index.h>
 #include <node/flowmesh_vault_index.h>
 #include <node/flowmesh_checkpoint_index.h>
 #include <node/fn_seat_index.h>
@@ -1072,6 +1074,17 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-finality-key-binding", bind_error);
             }
         }
+        // B-37 fresh per-epoch key bindings (FINALITY_KEY policy version 2 +
+        // MPA type 12): the same exact bijection, on their own objects. A
+        // transaction without them is untouched; on a chain without R_key
+        // they were already refused above as an inactive cell / MPA type.
+        std::vector<modern::FreshFinalityKeyPair> fresh_pairs;
+        {
+            std::string bind_error;
+            if (!modern::MatchFreshFinalityKeyPairs(tx, fresh_pairs, bind_error)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-fresh-finality-key-binding", bind_error);
+            }
+        }
         if (tx.HasMpa()) {
             // Relayable MPA: FINALITY_KEY evidence, activated asset/FN
             // declarations, and activated FlowMesh seat bindings have a
@@ -1101,7 +1114,9 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                     !(rec.payload_type == bridge::BRIDGE_MPA_TYPE &&
                       Consensus::BridgeRulesActive(
                           next_block_height,
-                          m_active_chainstate.m_chainman.GetConsensus()))) {
+                          m_active_chainstate.m_chainman.GetConsensus())) &&
+                    !(rec.payload_type == modern::MPA_TYPE_FRESH_FINALITY_KEY_EVIDENCE &&
+                      m_active_chainstate.m_chainman.GetConsensus().FreshKeyRulesActive(next_block_height))) {
                     return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "mpa-mempool-unsupported");
                 }
             }
@@ -1132,6 +1147,63 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                     if (check != modern::FinalityKeyCheck::OK) {
                         return state.Invalid(TxValidationResult::TX_NOT_STANDARD,
                                              std::string{"finality-key-"} + modern::FinalityKeyCheckName(check));
+                    }
+                }
+            }
+            if (!fresh_pairs.empty()) {
+                // B-37 fresh bindings: structure + cryptography only, the
+                // same context-free rule ConnectBlock enforces, so a failure
+                // can never be mined (TX_CONSENSUS). Key reuse, binding
+                // windows and seats are not block-invalidating and are left
+                // to the node-side fresh key index.
+                const Consensus::Params& consensus{m_active_chainstate.m_chainman.GetConsensus()};
+                const auto domain{consensus.legacy_final_hash
+                                      ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+                                      : std::nullopt};
+                if (!domain) {
+                    return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "finality-key-domain-unpinned");
+                }
+                for (const auto& pair : fresh_pairs) {
+                    const auto check{modern::CheckFreshKeyTransition(*domain, pair.commitment, pair.params,
+                                                                     pair.evidence)};
+                    if (check != modern::FreshKeyCheck::OK) {
+                        return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                             std::string{"fresh-key-"} + modern::FreshKeyCheckName(check));
+                    }
+                }
+                // B-37 node policy (finality dependency section 6.4 rules
+                // (1)-(3); regtest -b3freshkeyheight only): a key ever bound
+                // under either kind, or a target the next block's window does
+                // not count, would be mined inert. Not block-invalidating, so
+                // TX_NOT_STANDARD, like the V1 semantic pre-check.
+                if (node::FreshKeyModeConfigured(consensus)) {
+                    const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
+                    const node::BridgeStateIndex* bridge_index{nullptr};
+                    bool available{tip != nullptr};
+                    if (available && Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+                        node::BridgeStateTracker& bridge{m_active_chainstate.ModernBridgeState()};
+                        available = bridge.Sync(m_active_chainstate.m_chain, m_active_chainstate.m_blockman,
+                                                consensus, *tip);
+                        if (available) bridge_index = &bridge.Index();
+                    }
+                    node::FinalityTracker& finality{m_active_chainstate.ModernFinality()};
+                    const node::FreshKeyBindingIndex* fresh_keys{
+                        available && finality.Sync(m_active_chainstate.m_chain, m_active_chainstate.m_blockman,
+                                                   consensus, *tip, bridge_index)
+                            ? finality.FreshKeys(consensus)
+                            : nullptr};
+                    if (!fresh_keys) {
+                        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "fresh-key-state-unavailable");
+                    }
+                    std::optional<node::FreshLineageState> projected;
+                    if (consensus.FreshLineageRulesActive(next_block_height)) {
+                        projected = finality.Projected(next_block_height, consensus).fresh;
+                    }
+                    const node::FreshBindingWindow window{
+                        node::FreshBindingWindowAt(next_block_height, consensus, projected)};
+                    if (std::string policy_reason;
+                        !node::CheckFreshKeyBindingPolicy(tx, fresh_pairs, *fresh_keys, window, policy_reason)) {
+                        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, policy_reason);
                     }
                 }
             }
@@ -3693,6 +3765,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                      strprintf("%s in transaction %s", bind_error,
                                                tx->GetHash().ToString()));
             }
+            // B-37 fresh key bindings: their own exact bijection.
+            std::vector<modern::FreshFinalityKeyPair> fresh_pairs;
+            if (!modern::MatchFreshFinalityKeyPairs(*tx, fresh_pairs, bind_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-fresh-finality-key-binding",
+                                     strprintf("%s in transaction %s", bind_error,
+                                               tx->GetHash().ToString()));
+            }
         }
         if (std::string fn_error;
             !modern::CheckFnGenesisBlock(block, pindex->nHeight, params.GetConsensus(),
@@ -4015,6 +4095,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             if (!node::VerifyBlockFinalityBindings(block, pindex->nHeight, *domain, consensus, tracker.Index(),
                                                    transitions, bind_error)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-key-evidence", bind_error);
+            }
+            // B-37 fresh per-epoch key bindings (regtest -b3freshkeyheight
+            // only): structure + cryptography of every pair. Context-free on
+            // purpose: a reused key, a binding outside its window or a
+            // double binding is inert at consensus (the fresh key index and
+            // committee rule decide it), so no in-block conflict exists.
+            if (consensus.fresh_lineage && consensus.fresh_lineage->FreshKeysEnabled() &&
+                !modern::VerifyFreshKeyBindingsInBlock(block, *domain, bind_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-fresh-finality-key-evidence",
+                                     bind_error);
             }
             // FINALITY_CERTIFICATE (coinbase, <= 1): judged against the epoch
             // state derived from the chain below this block -- schedule,
@@ -7009,6 +7099,12 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
                 std::string bind_error;
                 if (!modern::MatchFinalityKeyPairs(*tx, pairs, bind_error)) {
                     return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-key-binding",
+                                         strprintf("%s in transaction %s", bind_error, tx->GetHash().ToString()));
+                }
+                // B-37 fresh key bindings: their own exact bijection.
+                std::vector<modern::FreshFinalityKeyPair> fresh_pairs;
+                if (!modern::MatchFreshFinalityKeyPairs(*tx, fresh_pairs, bind_error)) {
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-fresh-finality-key-binding",
                                          strprintf("%s in transaction %s", bind_error, tx->GetHash().ToString()));
                 }
             }

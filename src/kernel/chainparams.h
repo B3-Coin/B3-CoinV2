@@ -308,6 +308,11 @@ public:
         //! flowmesh_test; R_f - 1 must lie on the V1 checkpoint grid.
         std::optional<int> fresh_lineage_height{};
         std::optional<int> fresh_max_epoch_extension{};
+        //! -b3freshkeyheight (R_key): B-37 per-epoch committee keys for the
+        //! fresh lineage from this height (finality dependency section
+        //! 6.4). Requires fresh_lineage_height; 1 <= R_key <= R_f - 2.
+        //! Unset keeps the staging lineage on the V1 keys.
+        std::optional<int> fresh_key_height{};
         //! B-23's fresh-lineage extension on regtest profile R.
         static constexpr int DEFAULT_FRESH_MAX_EPOCH_EXTENSION{1'280};
     };

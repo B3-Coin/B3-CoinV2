@@ -109,8 +109,18 @@ struct FreshLineageParams {
     //! B-7 staging signer: the V1 single-vote signer additionally signs
     //! digest V2 for this lineage. Regtest only; never true on mainnet.
     bool staging_signer{false};
+    //! R_key (B-37; finality dependency section 6.4): from this height the
+    //! fresh lineage's committees sit only on independent per-epoch BLS keys
+    //! bound under their own binding kind, never on V1 FINALITY_KEY
+    //! bindings. Unset means the staging lineage keeps signing with the V1
+    //! keys (the pre-B-37 behaviour). When set, 1 <= R_key <= R_f - 2 and
+    //! R_key lies above the legacy final height. Regtest's
+    //! -b3freshkeyheight is the only setter.
+    std::optional<int> key_height;
 
     constexpr int GenesisHeight() const { return activation_height - 1; }
+    //! True when the lineage uses B-37 per-epoch keys.
+    bool FreshKeysEnabled() const { return key_height.has_value(); }
 };
 
 /**
@@ -283,6 +293,14 @@ struct Params {
     bool FreshLineageRulesActive(int height) const
     {
         return fresh_lineage && height >= fresh_lineage->activation_height;
+    }
+    //! True from R_key on a chain whose fresh lineage uses B-37 per-epoch
+    //! keys: the fresh binding kind is valid and counts from here. False at
+    //! every height on every shipped network.
+    bool FreshKeyRulesActive(int height) const
+    {
+        return fresh_lineage && fresh_lineage->key_height &&
+               height >= *fresh_lineage->key_height;
     }
     /**
      * Bridge V2 regime (BridgeV2Params in consensus/bridge_params.h). Unset

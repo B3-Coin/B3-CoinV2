@@ -41,6 +41,7 @@
 #include <net.h>
 #include <net_processing.h>
 #include <node/finality_fresh_export.h>
+#include <node/finality_fresh_key_index.h>
 #include <node/finality_fresh_lineage.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
@@ -5436,7 +5437,7 @@ static RPCHelpMan getfinalitylineage()
         RPCResult{RPCResult::Type::OBJ, "", "",
                   {
                       {RPCResult::Type::BOOL, "configured", "Whether this chain configures a fresh finality lineage"},
-                      {RPCResult::Type::BOOL, "staging_signer", /*optional=*/true, "Whether the V1 single-vote signer also signs digest V2 (regtest staging, V1 binding keys)"},
+                      {RPCResult::Type::BOOL, "staging_signer", /*optional=*/true, "Whether the V1 single-vote signer also signs digest V2 (regtest staging): with the V1 binding keys, or in key mode (-b3freshkeyheight, fresh_keys present) only with this node's fresh per-epoch keys"},
                       {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "R_f, the first block that can carry a fresh-lineage certificate"},
                       {RPCResult::Type::NUM, "genesis_height", /*optional=*/true, "GENESIS_HEIGHT = R_f-1, history leaf 0"},
                       {RPCResult::Type::NUM, "max_epoch_extension", /*optional=*/true, "Blocks a fresh epoch may run past E before the lineage breaks"},
@@ -5479,10 +5480,57 @@ static RPCHelpMan getfinalitylineage()
                            {RPCResult::Type::NUM, "finalized_leaf_count", "Leaves held by the consensus accumulator (through the finalized index)"},
                        }},
                       {RPCResult::Type::NUM, "pool_checkpoints", /*optional=*/true, "Checkpoints tracked by the local fresh-lineage vote pool (finalized ones are reclaimed on the next submission, as in the V1 pool)"},
-                      {RPCResult::Type::OBJ, "local_signer", /*optional=*/true, "Node-local staging signer status, present once this node's finality signer ran a fresh-lineage pass (the staking status reports the V1 signer only; fresh votes have no P2P relay and are moved with getfinalitylineagevotes / submitfinalitylineagevote)",
+                      {RPCResult::Type::OBJ, "local_signer", /*optional=*/true, "Node-local staging signer status, present once this node's finality signer ran a fresh-lineage pass (the staking status reports the V1 signer only; fresh votes travel over the P2P message finsigv2, and the hidden getfinalitylineagevotes / submitfinalitylineagevote remain for drills)",
                        {
                            {RPCResult::Type::NUM, "last_signed_height", "Anti-repeat watermark: the highest fresh checkpoint this node's signer recorded, or -1"},
-                           {RPCResult::Type::STR, "last_error", "Why fresh-lineage signing is currently disabled (absent journal, orphan lock, journal failure), or empty"},
+                           {RPCResult::Type::STR, "last_error", "Why fresh-lineage signing is currently disabled (absent journal, orphan lock, journal failure; in key mode also an unreadable fresh key store or a current seat without a held key), or empty"},
+                           {RPCResult::Type::ARR, "fresh_keys", /*optional=*/true, "Key mode only: the signer's fresh keys (its fresh key store's records, in creation order)",
+                            {{RPCResult::Type::OBJ, "", "",
+                              {
+                                  {RPCResult::Type::NUM, "epoch", /*optional=*/true, "Target fresh epoch (absent for an offline key the chain has not bound)"},
+                                  {RPCResult::Type::STR_HEX, "bls_pubkey", "BLS public key"},
+                                  {RPCResult::Type::BOOL, "held", "Whether the signer still holds the secret (false once erased)"},
+                                  {RPCResult::Type::ARR, "seated_epochs", "Retained committees (epoch-2 .. epoch+1) that seat this validator on this key",
+                                   {{RPCResult::Type::NUM, "", "Fresh epoch"}}},
+                              }}}},
+                           {RPCResult::Type::ARR, "missing_seats", /*optional=*/true, "Key mode only: seats of this validator in Set'_{epoch-1}, Set'_epoch and Set'_{epoch+1} without a held key",
+                            {{RPCResult::Type::OBJ, "", "",
+                              {
+                                  {RPCResult::Type::NUM, "epoch", "Fresh epoch of the committee"},
+                                  {RPCResult::Type::STR_HEX, "bls_pubkey", "The seated key"},
+                              }}}},
+                           {RPCResult::Type::ARR, "alerts", /*optional=*/true, "Key mode only: chain bindings of this validator the signer's store does not hold, held keys claimed first by another binding, and void seats",
+                            {{RPCResult::Type::STR, "", "Alert"}}},
+                       }},
+                      {RPCResult::Type::OBJ, "fresh_keys", /*optional=*/true, "B-37 per-epoch committee keys, present only in key mode (regtest-only -b3freshkeyheight)",
+                       {
+                           {RPCResult::Type::NUM, "key_height", "R_key, the first height that accepts a fresh binding"},
+                           {RPCResult::Type::BOOL, "state_available", "Whether the fresh key index could be derived at the tip"},
+                           {RPCResult::Type::STR, "next_binding_window", "open, not-active (below R_key) or lineage-unavailable (from R_f without an intact lineage): the window of the next block"},
+                           {RPCResult::Type::NUM, "next_binding_epoch", /*optional=*/true, "The one target epoch a binding included in the next block counts for (0 from R_key to R_f-1, then epoch+2)"},
+                           {RPCResult::Type::NUM, "window_start", /*optional=*/true, "First height of that window"},
+                           {RPCResult::Type::ARR, "bindings", "Fresh bindings naming epoch-2 or later (every epoch before the lineage), each the first claim of its key; ordered by validator, epoch, height",
+                            {{RPCResult::Type::OBJ, "", "",
+                              {
+                                  {RPCResult::Type::STR_HEX, "validator_key", "x-only validator key"},
+                                  {RPCResult::Type::NUM, "epoch", "Target fresh epoch"},
+                                  {RPCResult::Type::STR_HEX, "bls_pubkey", "Bound BLS public key"},
+                                  {RPCResult::Type::NUM, "height", "Including block"},
+                                  {RPCResult::Type::BOOL, "counted", "Included inside the window that counts its epoch"},
+                                  {RPCResult::Type::BOOL, "void", "Two or more counted bindings of this validator name this epoch: no seat for it"},
+                              }}}},
+                           {RPCResult::Type::ARR, "committees", "Set'_{epoch-1}, Set'_epoch and Set'_{epoch+1} on their fresh keys (empty before the lineage)",
+                            {{RPCResult::Type::OBJ, "", "",
+                              {
+                                  {RPCResult::Type::NUM, "epoch", "Fresh epoch"},
+                                  {RPCResult::Type::ARR, "members", "Seated members in committee order",
+                                   {{RPCResult::Type::OBJ, "", "",
+                                     {
+                                         {RPCResult::Type::STR_HEX, "validator_key", "x-only validator key"},
+                                         {RPCResult::Type::STR_HEX, "bls_pubkey", "Fresh BLS public key of the seat"},
+                                         {RPCResult::Type::NUM, "weight", "Whole modern B3"},
+                                     }}}},
+                              }}}},
                        }},
                   }},
         RPCExamples{HelpExampleCli("getfinalitylineage", "") + HelpExampleRpc("getfinalitylineage", "")},
@@ -5575,11 +5623,80 @@ static RPCHelpMan getfinalitylineage()
             }
             const node::FreshLineageSignaturePool& fresh_pool{chainstate.FinalitySignatures().Fresh()};
             result.pushKV("pool_checkpoints", static_cast<uint64_t>(fresh_pool.TrackedCheckpoints()));
+            const bool key_mode{node::FreshKeyModeConfigured(consensus)};
             if (const auto& signer{fresh_pool.LocalSigner()}) {
                 UniValue local{UniValue::VOBJ};
                 local.pushKV("last_signed_height", signer->last_signed_height);
                 local.pushKV("last_error", signer->last_error);
+                if (key_mode) {
+                    UniValue keys{UniValue::VARR};
+                    for (const node::FreshSignerKeyEntry& key : signer->fresh_keys) {
+                        UniValue entry{UniValue::VOBJ};
+                        if (key.epoch) entry.pushKV("epoch", *key.epoch);
+                        entry.pushKV("bls_pubkey", HexStr(key.bls_pubkey));
+                        entry.pushKV("held", key.held);
+                        UniValue seated{UniValue::VARR};
+                        for (const uint64_t e : key.seated_epochs) seated.push_back(e);
+                        entry.pushKV("seated_epochs", std::move(seated));
+                        keys.push_back(std::move(entry));
+                    }
+                    local.pushKV("fresh_keys", std::move(keys));
+                    UniValue missing{UniValue::VARR};
+                    for (const node::FreshMissingSeat& seat : signer->missing_seats) {
+                        UniValue entry{UniValue::VOBJ};
+                        entry.pushKV("epoch", seat.epoch);
+                        entry.pushKV("bls_pubkey", HexStr(seat.bls_pubkey));
+                        missing.push_back(std::move(entry));
+                    }
+                    local.pushKV("missing_seats", std::move(missing));
+                    UniValue alerts{UniValue::VARR};
+                    for (const std::string& alert : signer->alerts) alerts.push_back(alert);
+                    local.pushKV("alerts", std::move(alerts));
+                }
                 result.pushKV("local_signer", std::move(local));
+            }
+            if (key_mode) {
+                // B-37 key status (FreshKeyStatusAt reports only the
+                // configuration when the tracker could not be synced).
+                const node::FreshKeyChainStatus status{node::FreshKeyStatusAt(
+                    chainstate.ModernFinality(), chainstate.m_chain, consensus, /*validator_key=*/std::nullopt)};
+                UniValue keys{UniValue::VOBJ};
+                keys.pushKV("key_height", status.key_height.value_or(-1));
+                keys.pushKV("state_available", status.available);
+                keys.pushKV("next_binding_window", node::FreshBindingWindowStatusName(status.window_status));
+                if (status.next_binding_epoch) keys.pushKV("next_binding_epoch", *status.next_binding_epoch);
+                if (status.window_start) keys.pushKV("window_start", *status.window_start);
+                UniValue bindings{UniValue::VARR};
+                for (const node::FreshKeyChainStatus::Binding& binding : status.bindings) {
+                    UniValue entry{UniValue::VOBJ};
+                    entry.pushKV("validator_key", HexStr(binding.validator_key));
+                    entry.pushKV("epoch", binding.epoch);
+                    entry.pushKV("bls_pubkey", HexStr(binding.bls_pubkey));
+                    entry.pushKV("height", binding.height);
+                    entry.pushKV("counted", binding.counted);
+                    entry.pushKV("void", binding.voided);
+                    bindings.push_back(std::move(entry));
+                }
+                keys.pushKV("bindings", std::move(bindings));
+                UniValue committees{UniValue::VARR};
+                for (size_t i{0}; i < status.seats.size();) {
+                    const uint64_t epoch{status.seats[i].epoch};
+                    UniValue members{UniValue::VARR};
+                    for (; i < status.seats.size() && status.seats[i].epoch == epoch; ++i) {
+                        const node::FreshKeyChainStatus::Seat& seat{status.seats[i]};
+                        UniValue member{UniValue::VOBJ};
+                        member.pushKV("validator_key", HexStr(seat.validator_key));
+                        member.pushKV("bls_pubkey", HexStr(seat.bls_pubkey));
+                        member.pushKV("weight", seat.weight);
+                        members.push_back(std::move(member));
+                    }
+                    UniValue committee{UniValue::VOBJ};
+                    committee.pushKV("epoch", epoch);
+                    committee.pushKV("members", std::move(members));
+                    committees.push_back(std::move(committee));
+                }
+                keys.pushKV("committees", std::move(committees));
+                result.pushKV("fresh_keys", std::move(keys));
             }
             return result;
         },
@@ -7109,7 +7226,7 @@ static RPCHelpMan getfinalitylineagevotes()
     return RPCHelpMan{
         "getfinalitylineagevotes",
         "Return the verified fresh-lineage votes held by the local pool that are still useful on the\n"
-        "active chain (regtest staging relay; there is no P2P transport for them).\n",
+        "active chain (regtest drill: the same votes are gossiped over the P2P message finsigv2).\n",
         {},
         RPCResult{RPCResult::Type::ARR, "", "Votes, newest checkpoint first",
                   {{RPCResult::Type::OBJ, "", "Vote",
@@ -7154,8 +7271,9 @@ static RPCHelpMan submitfinalitylineagevote()
 {
     return RPCHelpMan{
         "submitfinalitylineagevote",
-        "Submit one serialized fresh-lineage vote to the local pool (regtest staging relay). The vote is\n"
-        "fully verified (lineage id, grid, depth, epoch, member index, BLS over digest V2) before it is kept.\n",
+        "Submit one serialized fresh-lineage vote to the local pool (regtest drill; votes normally travel\n"
+        "over the P2P message finsigv2, and an accepted vote is replayed to peers from the pool). The vote\n"
+        "is fully verified (lineage id, grid, depth, epoch, member index, BLS over digest V2) before it is kept.\n",
         {
             {"hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
              "The 148-byte serialized vote (getfinalitylineagevotes \"hex\")"},
@@ -7164,7 +7282,8 @@ static RPCHelpMan submitfinalitylineagevote()
                   {
                       {RPCResult::Type::STR, "result",
                        "accepted, duplicate, stale, unconfigured, lineage-mismatch, unknown-epoch, not-checkpoint, "
-                       "too-shallow, bad-index, pool-full or bad-signature"},
+                       "too-shallow, bad-index, pool-full, verification-deferred (P2P budget only, never returned "
+                       "here) or bad-signature"},
                   }},
         RPCExamples{HelpExampleCli("submitfinalitylineagevote", "\"hex\"")},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {

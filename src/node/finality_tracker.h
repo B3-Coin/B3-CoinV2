@@ -8,6 +8,7 @@
 #include <modern/finality_schedule.h>
 #include <modern/finality_types.h>
 #include <node/finality_binding_index.h>
+#include <node/finality_fresh_key_index.h>
 #include <node/finality_fresh_lineage.h>
 #include <node/stake_tracker.h>
 #include <node/validator_set.h>
@@ -101,6 +102,15 @@ struct FinalizedCheckpoint {
  * fields or into SetInForceAt (block producers are unchanged by R_f); with
  * the knob absent State::fresh stays empty and V1 behaves exactly as before.
  *
+ * Fresh keys (B-37, regtest -b3freshkeyheight only): when the fresh lineage
+ * also sets R_key, a private FreshKeyBindingTracker (ever-bound keys and
+ * counted fresh bindings, node/finality_fresh_key_index.h) is stepped in
+ * lockstep with the stake and V1 binding trackers and rebuilt with them, and
+ * the fresh committees follow the B-37 seat rules (FreshCommitteeAt,
+ * node/finality_fresh_lineage.h): Committee(Snapshot(h)) seats only members
+ * holding exactly one counted fresh binding for the committee's epoch, on
+ * that key. It never feeds a V1 field; without R_key it is never stepped.
+ *
  * All calls under cs_main; the tracker adds no locking.
  */
 class FinalityTracker
@@ -127,6 +137,11 @@ public:
         //! Fresh finality lineage (digest V2); empty unless params configure
         //! it and the height reached R_f. Independent of every field above.
         std::optional<FreshLineageState> fresh;
+        //! Projected() only: a B-37 committee was unavailable (a tracker
+        //! inconsistency), so `fresh` was reset rather than guessed. Every
+        //! consumer that judges or stores fresh state fails instead
+        //! ("finality-state-unavailable"; ApplyModern leaves the tracker dirty).
+        bool fresh_unavailable{false};
         //! The epoch view the pure rules consume (pointers into this state).
         modern::FinalityEpochView View() const;
         //! Size of Set_epoch on this chain, for the coinbase matcher.
@@ -197,6 +212,12 @@ public:
     //! (Commit 14 reads block-production weights here): Set_{e+1} when the
     //! rotation fires at `height`, else Set_e; null when no set exists.
     std::shared_ptr<const ValidatorSetSnapshot> SetInForceAt(int height, const Consensus::Params& params) const;
+    /**
+     * The B-37 fresh key index as of the synced tip: every key ever bound
+     * under either kind and the counted fresh bindings. Null unless `params`
+     * configure fresh keys (FreshKeyModeConfigured) and the tracker is synced.
+     */
+    const FreshKeyBindingIndex* FreshKeys(const Consensus::Params& params) const;
 
 private:
     //! The V1 projection alone (bootstrap, gated rotation, break).
@@ -206,11 +227,18 @@ private:
     bool ApplyModern(const CBlock& block, const CBlockIndex& index,
                      const Consensus::Params& params,
                      const BridgeStateIndex* bridge_index);
-    //! Step the private stake / binding trackers with one modern-era block.
+    //! Step the private stake / binding trackers (and, in fresh-key mode,
+    //! the fresh key tracker) with one modern-era block.
     bool StepTrackers(const CBlock& block, const CBlockIndex& index, const CChain* chain, const BlockManager* blockman,
                       const Consensus::Params& params);
     //! Snapshot(height) from the private trackers (which must be synced to `height`), stamped `epoch`.
     std::optional<ValidatorSetSnapshot> SnapshotAt(uint64_t epoch, int height) const;
+    //! B-37 Committee(Snapshot(request.snapshot_height)) from the private
+    //! trackers, which must be synced to that height (node::BuildFreshCommittee:
+    //! stake weights and V1 bindings define Snapshot(h), the fresh key index
+    //! the seats). Fresh-key mode only; UNAVAILABLE (never "nobody seated")
+    //! if the trackers are not there.
+    FreshCommittee FreshCommitteeAt(const FreshCommitteeRequest& request) const;
     //! Set_{e+1} for the state whose boundary is `boundary_height`: snapshot or carry-over.
     std::shared_ptr<const ValidatorSetSnapshot> SuccessorSet(const State& s, int boundary_height,
                                                              const Consensus::ModernPosParams& pos) const;
@@ -219,6 +247,8 @@ private:
     State m_state;
     StakeTracker m_stakes;
     FinalityBindingTracker m_bindings;
+    //! B-37 fresh key bindings; stepped only in fresh-key mode.
+    FreshKeyBindingTracker m_fresh_keys;
     uint256 m_synced_tip{};
     int m_synced_height{-1};
     bool m_dirty{true};

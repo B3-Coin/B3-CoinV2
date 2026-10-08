@@ -359,8 +359,60 @@ bool FinalitySigner::SetKeys(
     m_fresh_last_signed = -1;
     m_fresh_error.clear();
     m_fresh_permanent_error = false;
+    ClearFreshKeys();
     error.clear();
     return true;
+}
+
+void FinalitySigner::ClearFreshKeys()
+{
+    m_fresh_keys.clear();
+    m_fresh_key_store.reset();
+    m_fresh_key_status = FreshSignerKeyStatus{};
+    m_fresh_key_error.clear();
+    m_fresh_alerts.clear();
+}
+
+bool FinalitySigner::SetFreshKeys(const std::vector<bls::SecretKey>& keys, std::string& error)
+{
+    if (!m_store_directory.empty()) {
+        error = "a persistent finality signer reads its fresh keys only from its fresh key store";
+        return false;
+    }
+    if (m_keys.empty()) {
+        error = "set the validator identity (SetKeys) before its fresh keys";
+        return false;
+    }
+    if (keys.size() > MAX_FRESH_KEYS) {
+        error = strprintf("finality signer takes at most %u fresh keys", MAX_FRESH_KEYS);
+        return false;
+    }
+    std::vector<SigningKey> selected;
+    for (const auto& key : keys) {
+        const auto pubkey{key.GetPublicKey().Compressed()};
+        if (std::none_of(selected.begin(), selected.end(), [&](const SigningKey& entry) {
+                return entry.pubkey == pubkey;
+            })) {
+            selected.push_back({key, pubkey});
+        }
+    }
+    m_fresh_keys = std::move(selected);
+    error.clear();
+    return true;
+}
+
+std::optional<bls::SecretKey> FinalitySigner::FreshKeyFor(
+    const std::array<unsigned char, bls::PUBKEY_SIZE>& pubkey) const
+{
+    if (!m_store_directory.empty()) {
+        if (!m_fresh_key_store || !m_fresh_key_store->IsOpen()) return std::nullopt;
+        return m_fresh_key_store->SecretFor(pubkey);
+    }
+    const auto found{std::find_if(m_fresh_keys.begin(), m_fresh_keys.end(), [&](const SigningKey& entry) {
+        return entry.pubkey == pubkey;
+    })};
+    if (found == m_fresh_keys.end()) return std::nullopt;
+    return found->secret;
 }
 
 const bls::SecretKey* FinalitySigner::KeyFor(
@@ -413,6 +465,9 @@ bool FinalitySigner::SetKeysPersistent(
     m_fresh_last_signed = -1;
     m_fresh_error.clear();
     m_fresh_permanent_error = false;
+    // Fresh keys (B-37 mode) come from the fresh key store in the same
+    // directory, reloaded on every pass.
+    ClearFreshKeys();
     return true;
 }
 
@@ -1169,6 +1224,44 @@ bool FinalitySigner::EnsureFreshPersistentSafety(const FreshLineageState& state,
     }
     const CBlockIndex* locked{chain[persisted.lock_height]};
     if (locked && locked->GetBlockHash() == persisted.lock_block_hash) {
+        // B-37 key mode: a member that no committee seated for an epoch (no
+        // counted binding, a void seat) signed nothing in it, so its lock
+        // still names its last seated epoch and its next seat would not
+        // follow that lock's successor set (CommitSignedCheckpoint). The
+        // lock is an ancestor of the active chain: move it forward to the
+        // newest included fresh-lineage certificate of a later epoch, which
+        // descends from it, so votes continue from the committee chain
+        // consensus validated on this chain (finality dependency section
+        // 6.4). Without key mode the staging lineage keeps V1's rule.
+        const auto& finalized{state.finalized};
+        if (FreshKeyModeConfigured(params) && finalized && finalized->epoch > persisted.lock_epoch &&
+            finalized->height > persisted.lock_height && finalized->certified_at > finalized->height &&
+            chain[finalized->certified_at] != nullptr) {
+            const int old_height{persisted.lock_height};
+            const uint64_t old_epoch{persisted.lock_epoch};
+            const auto hash_at{[&chain](const int h) -> std::optional<uint256> {
+                const CBlockIndex* index{chain[h]};
+                if (!index) return std::nullopt;
+                return index->GetBlockHash();
+            }};
+            const auto fb{ExpectedFinalizedBlockV2(finalized->epoch, finalized->height, state, hash_at, params,
+                                                   bridge_index)};
+            const auto finalized_set{state.SetForEpoch(finalized->epoch)};
+            if (!fb || modern::FinalityCertIdV2(*fb) != finalized->cert_id || !finalized_set) {
+                FailFresh("cannot reconstruct the included fresh-lineage certificate needed to move the ancestry lock past the epochs this validator sat out",
+                          /*permanent=*/false);
+                return false;
+            }
+            std::string error;
+            if (!m_fresh_store.CommitLineageCatchUp(finalized->height, finalized->block_hash,
+                                                    modern::FinalityDigestV2(*domain, *fb), finalized->epoch,
+                                                    finalized_set->set_hash, fb->validator_set_hash, error)) {
+                FailFresh(strprintf("cannot persist the fresh-lineage ancestry lock catch-up: %s", error));
+                return false;
+            }
+            LogInfo("finality signer (fresh lineage): moved the ancestry lock from fresh checkpoint %d (epoch %u) to the included certificate for fresh checkpoint %d (epoch %u); this validator signed nothing in between",
+                    old_height, old_epoch, finalized->height, finalized->epoch);
+        }
         m_fresh_error.clear();
         return true;
     }
@@ -1231,10 +1324,100 @@ std::vector<FreshLineageSig> FinalitySigner::MaybeSignFresh(const FinalityTracke
         return {};
     }
     std::vector<FreshLineageSig> out{SignFresh(tracker, chain, params, pool, bridge_index)};
-    // The V1 staking status shows V1 only: leave the fresh watermark and
-    // refusal where getfinalitylineage reads them (node-local).
-    pool.ReportLocalSigner(m_fresh_last_signed, m_fresh_error);
+    // The V1 staking status shows V1 only: leave the fresh watermark,
+    // refusal and (fresh-key mode) key status where getfinalitylineage
+    // reads them (node-local).
+    FreshLineageSignaturePool::LocalSignerStatus status;
+    status.last_signed_height = m_fresh_last_signed;
+    status.last_error = FreshLastError();
+    status.fresh_keys = m_fresh_key_status.fresh_keys;
+    status.missing_seats = m_fresh_key_status.missing_seats;
+    status.alerts = m_fresh_key_status.alerts;
+    pool.ReportLocalSigner(std::move(status));
     return out;
+}
+
+void FinalitySigner::RefreshFreshKeys(const FinalityTracker& tracker, const Consensus::Params& params,
+                                      const uint256& chain_domain, const FreshLineageState* state,
+                                      const int tip_height)
+{
+    std::string key_error;
+    std::vector<std::string> store_alerts;
+    std::vector<FreshSignerKeyEntry> keys;
+    if (!m_store_directory.empty()) {
+        // Reloaded on every pass: keys generated meanwhile (wallet RPC) are
+        // picked up, and a store changed on disk is never written from a
+        // stale view (FreshKeyStore re-verifies before every write).
+        if (!m_fresh_key_store) m_fresh_key_store = std::make_unique<FreshKeyStore>();
+        std::string error;
+        if (!m_fresh_key_store->Open(m_store_directory, chain_domain, m_validator_key, error)) {
+            key_error = strprintf("cannot open the fresh key store: %s", error);
+        } else {
+            // Erasure policy (finality dependency section 6.4): a key whose
+            // committee is fixed, that neither the current nor the next
+            // committee seats, goes once the start of the epoch that retired
+            // it is `horizon` deep (FreshKeyRetiredSince).
+            const int horizon{FreshKeyErasureHorizon(params)};
+            for (const FreshKeyRecord& record : m_fresh_key_store->Records()) {
+                if (!state || !record.Held() ||
+                    !FreshKeyErasable(*state, record.bls_pubkey, record.target_epoch, tip_height, horizon)) {
+                    continue;
+                }
+                if (!m_fresh_key_store->Erase(record.bls_pubkey, error)) {
+                    // Signing does not depend on erasure; the next pass reopens and retries.
+                    store_alerts.push_back(strprintf("cannot erase fresh key %s of fresh epoch %u: %s",
+                                                     HexStr(record.bls_pubkey), record.target_epoch, error));
+                    break;
+                }
+                const int since{FreshKeyRetiredSince(*state, record.bls_pubkey, record.target_epoch).value_or(tip_height)};
+                LogInfo("finality signer (fresh lineage): erased fresh key %s of fresh epoch %u at height %d: in fresh epoch %u neither the current nor the next committee seats it, and it was retired at height %d, %d blocks ago (horizon %d)",
+                        HexStr(record.bls_pubkey), record.target_epoch, tip_height, state->epoch, since,
+                        tip_height - since, horizon);
+            }
+            for (const FreshKeyRecord& record : m_fresh_key_store->Records()) {
+                FreshSignerKeyEntry entry;
+                entry.epoch = record.target_epoch;
+                entry.bls_pubkey = record.bls_pubkey;
+                entry.held = record.Held();
+                keys.push_back(std::move(entry));
+            }
+        }
+    } else {
+        for (const SigningKey& key : m_fresh_keys) {
+            FreshSignerKeyEntry entry;
+            entry.bls_pubkey = key.pubkey;
+            entry.held = true;
+            keys.push_back(std::move(entry));
+        }
+    }
+    m_fresh_key_status = ComputeFreshSignerKeyStatus(m_validator_key, std::move(keys), tracker.FreshKeys(params),
+                                                     state, params, tip_height);
+    m_fresh_key_status.alerts.insert(m_fresh_key_status.alerts.end(), store_alerts.begin(), store_alerts.end());
+
+    // A seat in the current committee without a held secret is V1's
+    // "missing key" case: recoverable, re-evaluated every pass.
+    if (key_error.empty() && state && state->bootstrapped) {
+        for (const FreshMissingSeat& seat : m_fresh_key_status.missing_seats) {
+            if (seat.epoch != state->epoch) continue;
+            key_error = strprintf(
+                "missing fresh-lineage key for current fresh epoch %u committee BLS public key %s; this signer's fresh key store does not hold it (it was bound elsewhere, or the store was lost or erased)",
+                seat.epoch, HexStr(seat.bls_pubkey));
+            break;
+        }
+    }
+    if (!key_error.empty() && key_error != m_fresh_key_error) {
+        LogError("finality signer (fresh lineage, regtest staging): %s", key_error);
+    }
+    m_fresh_key_error = std::move(key_error);
+
+    // Each alert is logged once while it persists (and again if it returns).
+    std::set<std::string> alerts{m_fresh_key_status.alerts.begin(), m_fresh_key_status.alerts.end()};
+    for (const std::string& alert : alerts) {
+        if (!m_fresh_alerts.contains(alert)) {
+            LogWarning("finality signer (fresh lineage, regtest staging): ALERT: %s", alert);
+        }
+    }
+    m_fresh_alerts = std::move(alerts);
 }
 
 std::vector<FreshLineageSig> FinalitySigner::SignFresh(const FinalityTracker& tracker, const CChain& chain,
@@ -1261,6 +1444,10 @@ std::vector<FreshLineageSig> FinalitySigner::SignFresh(const FinalityTracker& tr
         projected = tracker.Projected(tip->nHeight + 1, params).fresh;
         if (projected && projected->bootstrapped) state = &*projected;
     }
+    // B-37 fresh-key mode: keys, erasure and status come first, so they are
+    // current (and reported) whatever the lineage or the journal says.
+    const bool key_mode{FreshKeyModeConfigured(params)};
+    if (key_mode) RefreshFreshKeys(tracker, params, *domain, state, tip->nHeight);
     if (!state || state->lineage_broken) return out;
     if (!EnsureFreshPersistentSafety(*state, chain, params, bridge_index)) return out;
 
@@ -1290,9 +1477,19 @@ std::vector<FreshLineageSig> FinalitySigner::SignFresh(const FinalityTracker& tr
         if (!set) continue;
         const auto index{set->IndexOf(m_validator_key)};
         if (!index) continue;
-        // B-37 (per-epoch fresh keys) is out of this slice: the committee
-        // records the V1 FINALITY_KEY binding key, so the V1 key signs.
-        const bls::SecretKey* key{KeyFor(set->members->Members()[*index].bls_pubkey)};
+        // Without fresh-key mode the committee records the V1 FINALITY_KEY
+        // binding key, so the V1 key signs. In fresh-key mode (B-37) only a
+        // fresh key of this validator can match its seat: never fall back
+        // to a V1 key.
+        const auto& seat_key{set->members->Members()[*index].bls_pubkey};
+        std::optional<bls::SecretKey> fresh_key;
+        const bls::SecretKey* key{nullptr};
+        if (key_mode) {
+            fresh_key = FreshKeyFor(seat_key);
+            if (fresh_key) key = &*fresh_key;
+        } else {
+            key = KeyFor(seat_key);
+        }
         if (!key) continue;
         const auto fb{ExpectedFinalizedBlockV2(*epoch, h, *state, hash_at, params, bridge_index)};
         if (!fb) continue;

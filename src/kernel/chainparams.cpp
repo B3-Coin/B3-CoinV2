@@ -1228,6 +1228,9 @@ public:
             if (b3.fresh_max_epoch_extension && !b3.fresh_lineage_height) {
                 throw std::runtime_error("-b3freshmaxepochextension requires -b3freshlineageheight");
             }
+            if (b3.fresh_key_height && !b3.fresh_lineage_height) {
+                throw std::runtime_error("-b3freshkeyheight requires -b3freshlineageheight");
+            }
             if (b3.fresh_lineage_height) {
                 if (!b3.flowmesh_test) {
                     throw std::runtime_error("-b3freshlineageheight requires -b3flowmeshtest");
@@ -1254,6 +1257,23 @@ public:
                     .max_epoch_extension = extension,
                     .staging_signer = true,
                 };
+                // B-37 per-epoch keys (finality dependency section 6.4):
+                // fresh bindings start at R_key, above the legacy era, and
+                // the genesis binding window [R_key, R_f - 1] that fixes
+                // Set'_0 = Set'_1 must hold at least two blocks, so
+                // R_key < R_f - 1 (regtest plan section 3.3).
+                if (b3.fresh_key_height) {
+                    const int key_height{*b3.fresh_key_height};
+                    const int legacy_final{Consensus::LegacyFinalHeight(consensus).value_or(0)};
+                    const int lowest{std::max(1, legacy_final + 1)};
+                    const int highest{fresh_height - 2};
+                    if (key_height < lowest || key_height > highest) {
+                        throw std::runtime_error(strprintf(
+                            "Invalid value for -b3freshkeyheight: %d must be in [%d, %d] (above the legacy final height %d and below R_f - 1 = %d)",
+                            key_height, lowest, highest, legacy_final, genesis_height));
+                    }
+                    consensus.fresh_lineage->key_height = key_height;
+                }
             }
 
             // Bridge V2 (node changes sections 3.1-3.4; regtest plan section

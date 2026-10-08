@@ -545,7 +545,7 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
     }
     // Fresh finality lineage knobs (bridge V2 regtest plan section 3.3):
     // like -b3bridgepins they only ever apply to the FlowMesh regtest.
-    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension"}) {
+    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension", "-b3freshkeyheight"}) {
         if (args.IsArgSet(knob) &&
             !(args.GetBoolArg("-b3modernregtest", false) &&
               args.GetBoolArg("-b3flowmeshtest", false))) {
@@ -609,6 +609,8 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
         }};
         read_fresh("-b3freshlineageheight", 2, b3.fresh_lineage_height);
         read_fresh("-b3freshmaxepochextension", 1, b3.fresh_max_epoch_extension);
+        // B-37 per-epoch keys from R_key; RegTest() bounds it by R_f.
+        read_fresh("-b3freshkeyheight", 1, b3.fresh_key_height);
         options.b3_modern = b3;
     }
     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
@@ -691,7 +693,7 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
     }
     // The fresh finality lineage knobs likewise configure the regtest
     // staging lineage only; every other network leaves fresh_lineage unset.
-    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension"}) {
+    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension", "-b3freshkeyheight"}) {
         if (chain != ChainType::REGTEST && args.IsArgSet(knob)) {
             throw std::runtime_error(strprintf("%s is regtest-only", knob));
         }

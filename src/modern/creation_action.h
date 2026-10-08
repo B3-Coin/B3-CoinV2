@@ -94,6 +94,17 @@ inline constexpr uint16_t BRIDGE_ACTION_VERSION_V1{1};
 //! height (Consensus::Params::fresh_lineage), which no shipped network sets.
 //! The number is frozen and append-only.
 inline constexpr uint16_t CREATION_ACTION_FINALITY_CERTIFICATE_V2{11};
+//! Type 12 is the fresh finality lineage's per-epoch key binding evidence
+//! (FRESH_FINALITY_KEY_EVIDENCE, B-37; b3-bridge-v2-finality-dependency.md
+//! section 6.4; modern/finality_fresh_key.h): validator_key || bls_pubkey ||
+//! u64 target_epoch || bip340_sig || pop, exactly 248 bytes under record
+//! version 1, bound one-to-one to a FINALITY_KEY metadata cell of policy
+//! version 2. Like finality types 4/5/11 it is an MPA record, never a
+//! standalone CreationAction, so the registry below does not admit it. Active
+//! only from a configured fresh-key height (Consensus::Params::fresh_lineage
+//! key_height), which no shipped network sets. The number is frozen and
+//! append-only.
+inline constexpr uint16_t CREATION_ACTION_FRESH_FINALITY_KEY_EVIDENCE{12};
 
 //! Whether a (type, version) pair is a registered creation action.
 //! Registration keeps a pair DECODABLE at the framing layer (so

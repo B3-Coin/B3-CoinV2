@@ -288,6 +288,15 @@ inline constexpr const char* FMAGREE{"fmagree"};
  * see node/finality_signature.h.
  */
 inline constexpr const char* FINSIG{"finsig"};
+/**
+ * B3 fresh finality lineage vote gossip (bridge V2 stage S3, regtest
+ * -b3freshlineageheight only; liveness only, never consensus): 32-byte
+ * lineage id || u64 epoch || u64 checkpoint height || u32 member index ||
+ * 96-byte BLS signature over digest V2 (fixed 148 bytes, integers
+ * little-endian like `finsig`). Ignored, without penalty, by every node whose
+ * chain configures no fresh lineage; see node/finality_fresh_transport.h.
+ */
+inline constexpr const char* FINSIGV2{"finsigv2"};
 }; // namespace NetMsgType
 
 /** FlowMesh traffic is always lower scheduling priority than ordinary B3. */
@@ -359,6 +368,7 @@ inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
     NetMsgType::FMENTRIES,
     NetMsgType::FMAGREE,
     NetMsgType::FINSIG,
+    NetMsgType::FINSIGV2,
 })};
 
 /** nServices flags */

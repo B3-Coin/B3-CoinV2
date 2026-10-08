@@ -547,6 +547,43 @@ bool FinalitySignerStore::CommitCertifiedAnchor(
     return Commit(next, error);
 }
 
+bool FinalitySignerStore::CommitLineageCatchUp(
+    const int height, const uint256& block_hash, const uint256& digest,
+    const uint64_t epoch, const uint256& signing_set_hash,
+    const uint256& successor_set_hash, std::string& error)
+{
+    if (!m_open || !m_state) {
+        error = "finality signer state is not durably initialized";
+        return false;
+    }
+    if (m_namespace != FinalitySignerNamespace::FRESH_LINEAGE_V2) {
+        error = "an ancestry-lock catch-up across epochs applies to the fresh-lineage journal only";
+        return false;
+    }
+    if (height < 0 || block_hash.IsNull() || digest.IsNull() ||
+        signing_set_hash.IsNull() || successor_set_hash.IsNull()) {
+        error = "invalid certified checkpoint";
+        return false;
+    }
+    const FinalitySignerState& current{*m_state};
+    if (current.lock_height < 0) {
+        error = "no durable ancestry lock to catch up from";
+        return false;
+    }
+    if (height <= current.lock_height || epoch <= current.lock_epoch) {
+        error = "certified checkpoint does not advance the durable ancestry lock to a later epoch";
+        return false;
+    }
+    FinalitySignerState next{current};
+    next.lock_height = height;
+    next.lock_block_hash = block_hash;
+    next.lock_digest = digest;
+    next.lock_epoch = epoch;
+    next.lock_signing_set_hash = signing_set_hash;
+    next.lock_successor_set_hash = successor_set_hash;
+    return Commit(next, error);
+}
+
 bool FinalitySignerStore::CommitPinnedRecoveryAnchor(
     const Consensus::FinalitySignerRecovery& recovery,
     const uint256& anchor_digest, std::string& error)

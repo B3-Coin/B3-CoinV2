@@ -69,6 +69,24 @@ std::optional<ValidatorSetSnapshot> FinalityTracker::SnapshotAt(const uint64_t e
     return ValidatorSetSnapshot::BuildAt(epoch, m_stakes, height, m_bindings.Index());
 }
 
+FreshCommittee FinalityTracker::FreshCommitteeAt(const FreshCommitteeRequest& request) const
+{
+    // Projected() asks only for Snapshot(height - 1) == the synced height,
+    // and Sync / BlockConnected keep the fresh key tracker at the synced tip
+    // in fresh-key mode; anything else is a bug, reported as UNAVAILABLE
+    // (the projection then fails), never as a smaller committee.
+    if (!Assume(request.snapshot_height == m_synced_height) || !Assume(m_fresh_keys.Synced(m_synced_tip))) {
+        LogError("FinalityTracker: B-37 committee for fresh epoch %u at snapshot %d unavailable (synced height %d, "
+                 "fresh key index %s)",
+                 request.target_epoch, request.snapshot_height, m_synced_height,
+                 m_fresh_keys.Synced(m_synced_tip) ? "in step" : "out of step");
+        return FreshCommittee::Unavailable();
+    }
+    CAmount total{0};
+    return FreshCommittee{BuildFreshCommittee(m_stakes.ActiveWeights(request.snapshot_height, total),
+                                              m_bindings.Index(), m_fresh_keys.Index(), request)};
+}
+
 std::shared_ptr<const ValidatorSetSnapshot> FinalityTracker::SuccessorSet(const State& s, const int boundary_height,
                                                                           const Consensus::ModernPosParams& pos) const
 {
@@ -87,6 +105,7 @@ void FinalityTracker::Reset()
     m_state = State{};
     m_stakes.MarkDirty();
     m_bindings.MarkDirty();
+    m_fresh_keys.MarkDirty();
     m_synced_tip.SetNull();
     m_synced_height = -1;
     m_dirty = true;
@@ -99,9 +118,16 @@ FinalityTracker::State FinalityTracker::Projected(const int height, const Consen
     State s{ProjectedV1(height, params)};
     // Fresh lineage (regtest knob only): projected after V1 and from the same
     // private trackers (Snapshot(height - 1)); it never touches V1 fields.
+    // In fresh-key mode (R_key) the committees follow the B-37 seat rules.
     if (params.fresh_lineage && m_synced_height == height - 1) {
-        ProjectFreshLineage(s.fresh, height, m_synced_tip, params,
-                            [this](const int h) { return SnapshotAt(0, h); });
+        FreshCommitteeAtFn committee_at;
+        if (FreshKeyModeConfigured(params)) {
+            committee_at = [this](const FreshCommitteeRequest& request) { return FreshCommitteeAt(request); };
+        }
+        if (!ProjectFreshLineage(s.fresh, height, m_synced_tip, params,
+                                 [this](const int h) { return SnapshotAt(0, h); }, committee_at)) {
+            s.fresh_unavailable = true;
+        }
     }
     return s;
 }
@@ -237,6 +263,10 @@ bool FinalityTracker::CheckBlockCertificate(const CBlock& block, const CBlockInd
         return false;
     }
     const State projected{Projected(index.nHeight, params)};
+    if (projected.fresh_unavailable) {
+        error = "finality-state-unavailable";
+        return false;
+    }
     std::optional<modern::FinalityCertificatePair> pair;
     std::optional<modern::FinalityCertificateV2Record> fresh_record;
     return JudgeCoinbaseCertificate(block, index, params, projected, pair, fresh_record,
@@ -300,6 +330,10 @@ bool FinalityTracker::JudgeCandidateCertificateV2(const modern::FinalizedBlockV2
         return false;
     }
     const State projected{Projected(parent.nHeight + 1, params)};
+    if (projected.fresh_unavailable) {
+        error = "finality-state-unavailable";
+        return false;
+    }
     const auto hash_at{[&parent](const int h) -> std::optional<uint256> {
         const CBlockIndex* anc{parent.GetAncestor(h)};
         if (!anc) return std::nullopt;
@@ -314,6 +348,13 @@ bool FinalityTracker::ApplyModern(const CBlock& block, const CBlockIndex& index,
                                   const BridgeStateIndex* bridge_index)
 {
     State s{Projected(index.nHeight, params)};
+    if (s.fresh_unavailable) {
+        // Never store a guessed fresh state: the caller marks the tracker
+        // dirty and the next Sync() rebuilds it.
+        LogWarning("FinalityTracker: connected block %s (height %d): fresh-lineage committee unavailable",
+                   index.GetBlockHash().ToString(), index.nHeight);
+        return false;
+    }
     std::optional<modern::FinalityCertificatePair> pair;
     std::optional<modern::FinalityCertificateV2Record> fresh_record;
     std::string error;
@@ -361,14 +402,31 @@ bool FinalityTracker::StepTrackers(const CBlock& block, const CBlockIndex& index
             return false;
         }
     }
+    // B-37 fresh keys (regtest -b3freshkeyheight only): the same in-step /
+    // rebuild discipline; never stepped without the knob.
+    if (FreshKeyModeConfigured(params)) {
+        if (index.pprev && m_fresh_keys.Synced(parent)) {
+            m_fresh_keys.BlockConnected(block, index, params);
+        } else if (!chain || !blockman || !m_fresh_keys.Sync(*chain, *blockman, params, index)) {
+            return false;
+        }
+        if (!m_fresh_keys.Synced(index.GetBlockHash())) return false;
+    }
     return m_stakes.Synced(index.GetBlockHash()) && m_bindings.Synced(index.GetBlockHash());
+}
+
+const FreshKeyBindingIndex* FinalityTracker::FreshKeys(const Consensus::Params& params) const
+{
+    if (!FreshKeyModeConfigured(params) || m_dirty || !m_fresh_keys.Synced(m_synced_tip)) return nullptr;
+    return &m_fresh_keys.Index();
 }
 
 bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, const Consensus::Params& params,
                            const CBlockIndex& target,
                            const BridgeStateIndex* bridge_index)
 {
-    if (Synced(target.GetBlockHash())) return true;
+    const bool fresh_keys{FreshKeyModeConfigured(params)};
+    if (Synced(target.GetBlockHash()) && (!fresh_keys || m_fresh_keys.Synced(target.GetBlockHash()))) return true;
     if (chain[target.nHeight] != &target) return false; // Target must lie on the chain.
 
     const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
@@ -379,6 +437,15 @@ bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, co
     if (!m_dirty && m_synced_height >= *final_height && m_synced_height <= target.nHeight &&
         chain[m_synced_height] != nullptr && chain[m_synced_height]->GetBlockHash() == m_synced_tip) {
         start = m_synced_height + 1;
+        // Fresh-key mode: the B-37 committees of the next projection read the
+        // fresh key index at the resumed tip, so bring it there first (a knob
+        // configured after the last walk leaves it behind the other trackers).
+        if (fresh_keys && !m_fresh_keys.Synced(m_synced_tip) &&
+            !m_fresh_keys.Sync(chain, blockman, params, *chain[m_synced_height])) {
+            LogWarning("FinalityTracker: fresh key state unavailable at height %d", m_synced_height);
+            Reset();
+            return false;
+        }
     } else {
         Reset();
         // Empty state "as of H": the first modern-era block extends it.
@@ -407,6 +474,15 @@ bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, co
         m_synced_tip = pindex->GetBlockHash();
         m_synced_height = height;
     }
+    // Fresh-key mode: an empty span (target == H) steps nothing, and a knob
+    // configured after the last walk leaves the fresh key index behind the
+    // other trackers; bring it to the target on its own.
+    if (fresh_keys && !m_fresh_keys.Synced(target.GetBlockHash()) &&
+        !m_fresh_keys.Sync(chain, blockman, params, target)) {
+        LogWarning("FinalityTracker: fresh key state unavailable at height %d", target.nHeight);
+        Reset();
+        return false;
+    }
     m_synced_tip = target.GetBlockHash();
     m_synced_height = target.nHeight;
     m_dirty = false;
@@ -420,6 +496,12 @@ void FinalityTracker::BlockConnected(const CBlock& block,
 {
     if (Consensus::GetB3Era(index.nHeight, params) != Consensus::B3Era::MODERN) return;
     if (m_dirty || index.pprev == nullptr || m_synced_tip != index.pprev->GetBlockHash()) {
+        m_dirty = true;
+        return;
+    }
+    // Fresh-key mode: the B-37 committees projected for this block read the
+    // fresh key index at the parent; out of step, rebuild through Sync().
+    if (FreshKeyModeConfigured(params) && !m_fresh_keys.Synced(m_synced_tip)) {
         m_dirty = true;
         return;
     }

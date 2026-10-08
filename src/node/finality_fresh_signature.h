@@ -14,6 +14,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -47,13 +48,12 @@ class BridgeStateIndex;
  * successor hash, checkpoint index and history root), and the signer is
  * member `index` of Set'_epoch.
  *
- * Transport gap (deviation from section 6.5, which asks for a P2P message
- * naming the lineage): this slice carries the message over the hidden RPCs
- * getfinalitylineagevotes / submitfinalitylineagevote only, so a regtest
- * network aggregates a V2 certificate only while a harness shuttles votes
- * between nodes. A lineage-naming message mirroring `finsig` in
- * net_processing.cpp, feeding FreshLineageSignaturePool::Submit, is an open
- * item before RT4 (or an explicit ruling that the RT4 harness shuttles).
+ * Transport (section 6.5): these exact 148 bytes are the payload of the
+ * lineage-naming P2P message `finsigv2` (NetMsgType::FINSIGV2), handled in
+ * net_processing.cpp only on a chain that configures a fresh lineage, with
+ * its own wire and verification budgets and a per-connection replay of the
+ * verified pool (node/finality_fresh_transport.h). The hidden RPCs
+ * getfinalitylineagevotes / submitfinalitylineagevote remain for drills.
  */
 struct FreshLineageSig {
     static constexpr size_t SERIALIZED_SIZE{32 + 8 + 8 + 4 + modern::BLS_SIGNATURE_SIZE};
@@ -75,6 +75,68 @@ struct FreshLineageSig {
     }
 };
 static_assert(FreshLineageSig::SERIALIZED_SIZE == 148);
+
+/**
+ * B-37 key status of one validator's fresh-lineage signer (node-local, never
+ * consensus, never relayed; finality dependency section 6.4 "Erasure and its
+ * limit"). Only in fresh-key mode (regtest -b3freshkeyheight).
+ */
+struct FreshSignerKeyEntry {
+    //! Target epoch: the store record's (a persistent signer generates every
+    //! key for one epoch), or for an offline signer's key the target of its
+    //! chain binding; nullopt for an offline key the chain has not bound.
+    std::optional<uint64_t> epoch;
+    modern::BlsPubkeyBytes bls_pubkey{};
+    //! The signer holds the secret; false once the store ERASED it.
+    bool held{false};
+    //! The retained committees (Set'_k, k in [e-2, e+1]) that seat this
+    //! validator on this key, ascending.
+    std::vector<uint64_t> seated_epochs;
+    friend bool operator==(const FreshSignerKeyEntry&, const FreshSignerKeyEntry&) = default;
+};
+//! Set'_epoch seats this validator on `bls_pubkey`, whose secret the signer
+//! does not hold.
+struct FreshMissingSeat {
+    uint64_t epoch{0};
+    modern::BlsPubkeyBytes bls_pubkey{};
+    friend bool operator==(const FreshMissingSeat&, const FreshMissingSeat&) = default;
+};
+struct FreshSignerKeyStatus {
+    //! Every key of the signer, in its order (store records: creation order).
+    std::vector<FreshSignerKeyEntry> fresh_keys;
+    //! Seats in Set'_{e-1}, Set'_e and Set'_{e+1} without a held secret
+    //! (ascending epoch). A Set'_{e-1} key the store erased is not missing:
+    //! the erasure policy removes it only once the handover into e is deep.
+    std::vector<FreshMissingSeat> missing_seats;
+    /**
+     * Human-readable alerts, in order:
+     *  - every counted chain binding of this validator (target >= e-2, or
+     *    any target before the lineage exists) whose key the signer neither
+     *    holds nor erased: someone else holds this validator's identity key
+     *    (an old wallet backup, or a leak) and binds keys with it;
+     *  - every held key of the signer that the chain recorded under
+     *    another first claim (FreshKeyBindingIndex::EverBound without
+     *    OwnFreshEpoch): this validator's binding of it is inert; under
+     *    identity-bound proofs of possession only a holder of the secret
+     *    can make such a claim;
+     *  - every target in [e-2, e+2] (target 0 before the lineage exists)
+     *    with two or more counted bindings of this validator in its window
+     *    (FreshSeatWindow): the seat for that epoch is VOID.
+     */
+    std::vector<std::string> alerts;
+};
+
+/**
+ * Compute FreshSignerKeyStatus for `validator_key` from the signer's `keys`
+ * (seated_epochs is recomputed; a missing epoch is filled from the key's
+ * chain binding), the fresh key index (null: no binding facts), and the fresh
+ * state of the tip (null: before the lineage; the projected state for R_f
+ * at R_f - 1). Pure.
+ */
+FreshSignerKeyStatus ComputeFreshSignerKeyStatus(const modern::ValidatorKeyBytes& validator_key,
+                                                 std::vector<FreshSignerKeyEntry> keys,
+                                                 const FreshKeyBindingIndex* index, const FreshLineageState* state,
+                                                 const Consensus::Params& params, int tip_height);
 
 /**
  * Collects verified fresh-lineage votes per (fresh epoch, checkpoint height)
@@ -108,6 +170,7 @@ public:
         TOO_SHALLOW,      //!< tip - height < CHECKPOINT_DEPTH: not signable yet
         BAD_INDEX,        //!< member index >= n
         POOL_FULL,        //!< bounded pool is full of checkpoints newer than this one
+        VERIFICATION_DEFERRED, //!< caller declined the expensive verification budget; retry is permitted
         BAD_SIGNATURE,    //!< BLS verification failed (wrong branch, wrong key, V1 digest, garbage)
     };
     static const char* AcceptName(Accept a);
@@ -115,10 +178,16 @@ public:
     /**
      * Validate and store one vote. `tracker` must be synced to the active
      * tip of `chain`; the caller holds cs_main. Cheap checks precede the BLS
-     * verification.
+     * verification. If supplied, consume_verification_budget is called once,
+     * immediately before BLS decoding/verification (after the DUPLICATE and
+     * POOL_FULL checks), never for cheap rejects or exact verified
+     * duplicates; a false result returns VERIFICATION_DEFERRED and stores
+     * nothing (the P2P path charges its verification bucket here; RPC and
+     * the local signer pass none).
      */
     Accept Submit(const FreshLineageSig& sig, const FinalityTracker& tracker, const CChain& chain,
-                  const Consensus::Params& params, const BridgeStateIndex* bridge_index = nullptr);
+                  const Consensus::Params& params, const BridgeStateIndex* bridge_index = nullptr,
+                  const std::function<bool()>& consume_verification_budget = {});
 
     /**
      * The highest tracked checkpoint whose collected votes meet both quorums
@@ -156,16 +225,18 @@ public:
      * refusal here, so getfinalitylineage shows a fresh signer that is
      * disabled (absent journal, orphan lock, journal failure) while the V1
      * staking status stays healthy. The last reporting signer wins; a node
-     * runs one signer.
+     * runs one signer. In fresh-key mode (B-37, regtest -b3freshkeyheight)
+     * the signer also reports its keys, its seats without a held secret and
+     * its alerts (FreshSignerKeyStatus); they stay empty otherwise.
      */
     struct LocalSignerStatus {
         int last_signed_height{-1};
         std::string last_error;
+        std::vector<FreshSignerKeyEntry> fresh_keys;
+        std::vector<FreshMissingSeat> missing_seats;
+        std::vector<std::string> alerts;
     };
-    void ReportLocalSigner(int last_signed_height, std::string last_error)
-    {
-        m_local_signer = LocalSignerStatus{last_signed_height, std::move(last_error)};
-    }
+    void ReportLocalSigner(LocalSignerStatus status) { m_local_signer = std::move(status); }
     //! nullopt until a signer has run a fresh-lineage pass into this pool.
     const std::optional<LocalSignerStatus>& LocalSigner() const { return m_local_signer; }
 
