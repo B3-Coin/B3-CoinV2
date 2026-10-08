@@ -351,6 +351,26 @@ class Anvil:
     def code(self, address, block="latest"):
         return from_hex(self.rpc("eth_getCode", normalize_address(address), block_tag(block)))
 
+    def get_logs(self, address, topics=(), from_block=0, to_block="latest"):
+        """eth_getLogs of one address, in chain order (block, then log index).
+
+        Each topic position is a 32-byte value (bytes or a 0x-prefixed
+        string), a list of alternatives or None (any value).
+        """
+        def topic(value):
+            if value is None:
+                return None
+            if isinstance(value, (list, tuple)):
+                return [topic(v) for v in value]
+            data = bytes(value) if isinstance(value, (bytes, bytearray)) else from_hex(value)
+            assert len(data) == 32, "a log topic is 32 bytes"
+            return to_hex(data)
+
+        logs = self.rpc("eth_getLogs", {"address": normalize_address(address),
+                                        "topics": [topic(t) for t in topics],
+                                        "fromBlock": block_tag(from_block), "toBlock": block_tag(to_block)})
+        return sorted(logs, key=lambda log: (int(log["blockNumber"], 16), int(log["logIndex"], 16)))
+
     def code_hash(self, address, block="latest"):
         """keccak256 of the deployed runtime code, computed here."""
         return keccak256(self.code(address, block))

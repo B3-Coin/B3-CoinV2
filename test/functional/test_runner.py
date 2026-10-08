@@ -109,6 +109,8 @@ EXTENDED_SCRIPTS = [
     'feature_b3_bridge_rt4c_conflict.py',
     # Bridge V2 B-23 vault migration to a pinned successor vault (as RT4a).
     'feature_b3_bridge_rt4d_migration.py',
+    # Bridge V2 routes (b) and (d3) through the forwarders, two anvils and mock LayerZero (as RT4c).
+    'feature_b3_bridge_rt6_route_b_d3.py',
 ]
 
 # Special script to run each bench sanity check
