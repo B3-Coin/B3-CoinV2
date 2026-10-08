@@ -77,6 +77,8 @@ class RpcError(ObserverError):
         self.method = method
         self.code = error.get("code") if isinstance(error, dict) else None
         self.message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        # An Ethereum node's revert data (eth_call "execution reverted"), if any.
+        self.data = error.get("data") if isinstance(error, dict) else None
         super().__init__(f"{method}: RPC {self.code}: {self.message}")
 
 

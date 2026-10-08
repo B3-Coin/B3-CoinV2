@@ -539,7 +539,9 @@ their harness lives in `test/functional/test_framework/{anvil,b3bridge}.py`.
 The regtest-only refusals of the Python pieces are unit-tested offline by
 `contrib/b3bridge/test_regtest_mock_beacon.py`,
 `contrib/b3bridge/test_b3_bridge_observe_v2.py`,
-`contrib/b3bridge/test_b3_bridge_deposit_guard_v2.py` (run `python3 -m unittest`
+`contrib/b3bridge/test_b3_bridge_deposit_guard_v2.py`,
+`contrib/b3bridge/test_b3_bridge_forwarders_v2.py`,
+`contrib/b3bridge/test_regtest_mock_lz_relayer.py` (run `python3 -m unittest`
 here) and by `TestFrameworkB3BridgeGuards` in
 `test/functional/test_framework/b3bridge.py` (run by
 `feature_framework_unit_tests.py`).
@@ -678,6 +680,127 @@ relayer refuses deposits and flushes` and UNAVAILABLE (or anything else)
 fails closed, both with exit 1. OPEN only means B3 has not closed deposits,
 not that Verifier V2 `depositsOpen()` is true; the wallet-side counterpart
 is `getbridgedepositrecipient`.
+
+### `b3_bridge_forwarders_v2.py` (bridge V2 forwarder relayer, routes (b) and (d3))
+
+**REGTEST ONLY.** A one-shot, standard-library relayer for the forwarder
+routes of contracts spec sections 7 to 9. It holds no key: it sends Ethereum
+transactions with `eth_sendTransaction` from an account the local anvil
+holds unlocked (`--from`), which must be a codeless EOA (PR-2), and it
+simulates every transaction with `eth_call` before sending it.
+
+```sh
+# Route (b): deploy (if codeless) and flush one deposit forwarder F_d.
+python3 contrib/b3bridge/b3_bridge_forwarders_v2.py flush \
+  --ethereum-rpc http://127.0.0.1:8545 --b3-rpc-url http://127.0.0.1:P \
+  --b3-cookie <datadir>/regtest/.cookie --from 0x<anvil account> \
+  --factory 0x<deposit factory> (--params '<bridgeforwarderaddress result>' | --account 0x<F_d>) \
+  --fee 250000
+# Route (d3): release a burn's leaf V2 to its exit forwarder F_x and forward it.
+python3 contrib/b3bridge/b3_bridge_forwarders_v2.py forward \
+  --ethereum-rpc http://127.0.0.1:8545 --b3-rpc-url http://127.0.0.1:P \
+  --b3-cookie <datadir>/regtest/.cookie --from 0x<anvil account> \
+  --batch 0x<B3RelayBatch> --txid <burn txid> --vout <burn vout> \
+  --certificate-block <relayed certificate block> --fee 1000000 [--native-margin WEI]
+# Decoded Published events of a deposit or exit factory.
+python3 contrib/b3bridge/b3_bridge_forwarders_v2.py published \
+  --ethereum-rpc http://127.0.0.1:8545 --factory 0x<factory> [--from-block N]
+```
+
+- `flush`, in order:
+  1. runs `deposit_guard` first: once B3 has closed bridge V2 deposits for
+     good it exits 1 with the guard's message and sends nothing;
+  2. refuses a retired launch vault entry (`getbridgev2info.retired`), since
+     the factory deposits only into the launch vault;
+  3. requires `--factory` to be the pinned `forwarders.deposit.factory`,
+     `p.vault` the pinned vault, `p` valid for the factory, and
+     `factory.accountOf(p)` equal to the CREATE2 derivation under the pinned
+     init-code hash. `--params` takes the wallet's `bridgeforwarderaddress`
+     result (or its `params` object, inline or as a file); `--account` reads
+     `p` from the factory's `Published` events instead (`--from-block`,
+     default `origin_deployment_block`), so a relayer that was not handed `p`
+     can still serve the forwarder;
+  4. requires Vault V2 `depositGateOpen()`;
+  5. refuses an expired forwarder and a fee above what is left of the
+     lifetime `feeCap`, and reports `"status": "nothing-to-flush"` without
+     sending when the free balance is below `MIN_FLUSH_RAW + fee`;
+  6. refuses, sending nothing, unless B3 can mint the flush promptly (node
+     changes §11.3): once the V2 light client is bootstrapped it must be
+     fresh at B3 (`getbridgev2info` `light_client.fresh`) and its horizon
+     (`light_client.horizon_time`) at least 7 days after the latest
+     Ethereum block (§12.3); the amount must fit `max_per_block` and the
+     mint epoch's `epoch_mint_headroom`. Before the bootstrap every mint
+     waits for it anyway, so only the caps apply;
+  7. otherwise deploys if codeless, flushes, and checks the flush receipt:
+     exactly the token `Transfer` (F_d to the vault) and the vault `Deposit`
+     (PR-1, D1), with a worst-case leaf within 7,168 bytes (PR-3). PR-1 and
+     PR-2 fix the flush's log shape, so the predicted leaf is a constant 634
+     bytes (the Foundry suite's figure) and there is nothing to skip before
+     sending.
+
+  It prints `account`, `deploy_tx`, `flush_tx`, `deposit_id`, `amount`,
+  `fee`, `leaf_size` (the receipt's own fields under its full key) and
+  `leaf_size_worst_case`. One flush deposits at most `MAX_DEPOSIT_RAW`;
+  `remaining_free` says whether to run again. B3 mints the `Deposit` once it
+  is proven (`claimbridgedeposit`).
+- `forward` reads `getbridgewithdrawalproofv2`, which must carry the burn's
+  `exit` block. F_x derived here from `exit` and the pinned
+  `forwarders.exit` must equal the proof's recipient and
+  `exitFactory.accountOf(p)`. It then sends one
+  `B3RelayBatch.relayWithForwards` with no certificates (relay the covering
+  certificate first), the release (left out when the leaf is already
+  released) and one `ExitForward` carrying `quoteForward + --native-margin`
+  wei; the factory and the batch return unspent ETH to `--native-refund-to`
+  (default `--from`).
+  - The fee goes to `--fee-recipient` (default `--from`), at most `p.feeCap`.
+  - The batch is simulated first and must pay the release and send the
+    forward; otherwise the failing item is simulated alone for its reason and
+    nothing is sent.
+  - The gas limit is sized from `--release-gas` and `--forward-gas`, because
+    estimation under-sizes a batch whose items are caught.
+  - The receipt must carry the vault's `Withdrawn` (or `ReleaseSkipped` after
+    a race) and one `Forwarded`, and no `CertificateFailed`, `ReleaseFailed`,
+    `ForwardFailed` or `ForwardSkipped`.
+  - A released withdrawal whose F_x holds nothing is refused.
+  - The deposit guard is deliberately not applied: releases continue after B3
+    closes deposits (C-1).
+- Every subcommand refuses every endpoint but plain http on 127.0.0.1 or
+  localhost (read without any proxy), an Ethereum chain id other than 31337
+  (and other than `getbridgev2info.origin_chain_id`) and a B3 chain other
+  than regtest. A refusal prints `error: ...` and exits 1; success prints one
+  JSON object.
+- The library part (salts and CREATE2 addresses equal to
+  `contracts/test/vectors/bridge_v2_vectors.json` `forwarder_v2`, the OI-2
+  `deposit_fee_cap` (`fee_per_tx` × 4), a minimal ABI codec, `Published` decoding and the
+  receipt-leaf size model) is importable.
+
+### `regtest/mock_lz_relayer.py` (LayerZero test relayer)
+
+**REGTEST ONLY.** Moves `contracts/regtest/MockLzEndpoint.sol` packets
+between the Ethereum anvil (31337, endpoint id 30101: `MockOFTAdapter` over
+`MockTetherToken`) and the Arbitrum anvil (31338, endpoint id 30110:
+`MockUSDT0`). Route (b) runs 31338 to 31337, route (d3) 31337 to 31338.
+
+```sh
+python3 contrib/b3bridge/regtest/mock_lz_relayer.py deliver \
+  --src-url http://127.0.0.1:8546 --src-endpoint 0x<endpoint on 31338> \
+  --dst-url http://127.0.0.1:8545 --dst-endpoint 0x<endpoint on 31337> \
+  --from 0x<unlocked destination account> [--from-block N]
+```
+
+- It reads the source endpoint's `PacketSent` logs whose `dstEid` is the
+  destination endpoint's `eid()`, skips packets the destination reports
+  `isDelivered`, and calls `deliver` for the rest, after an `eth_call`
+  simulation. Repeated runs therefore deliver each packet exactly once.
+- A simulated or mined revert (an adapter without locked USDT, a paused
+  endpoint, a receiver that refuses) is reported as `"status": "failed"`,
+  `"retryable": true`; the packet stays undelivered for a later run. A
+  receiver that is not an address word is `undeliverable`.
+- Exit 0 when nothing failed, 2 when a packet failed, 1 with `error: ...`
+  for a refusal: a non-local endpoint, a chain id outside {31337, 31338},
+  equal chain ids, equal eids or a codeless endpoint.
+- DVNs, executor options and compose are not modelled; the harness decides
+  when to run it. `relay_packets()` is importable.
 
 ### Pin file (`-b3bridgepins=<absolute path>`)
 
