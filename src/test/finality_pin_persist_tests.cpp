@@ -19,6 +19,7 @@
 #include <txdb.h>
 #include <util/fs.h>
 #include <validation.h>
+#include <validationinterface.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -36,13 +37,24 @@ std::optional<std::pair<int, uint256>> Anchor(const node::NodeContext& node)
     return node.chainman->m_blockman.FinalityAnchor();
 }
 
+// Drop the chain manager (a crash or shutdown) only after the scheduler has
+// run every queued validation callback: a queued BlockConnected event still
+// logs its CBlockIndex, which the reset frees. On a loaded machine the
+// scheduler thread lags behind and that read hits freed memory (assertion
+// phashBlock != nullptr in CBlockIndex::GetBlockHash).
+void ResetChainman(node::NodeContext& node)
+{
+    if (node.validation_signals) node.validation_signals->SyncWithValidationInterfaceQueue();
+    node.chainman.reset();
+}
+
 // ModernPosSetup uses ChainTestingSetup directly, whose coins flag defaults
 // to memory-only. Explicitly reopen a disk coins database for this additional
 // coverage without changing the shared legacy/finality fixtures.
 struct FinalityPinDiskCoinsFixture : FinalityChainDiskFixture {
     FinalityPinDiskCoinsFixture()
     {
-        m_node.chainman.reset();
+        ResetChainman(m_node);
         m_coins_db_in_memory = false;
         m_make_chainman();
         LoadVerifyActivateChainstate();
@@ -184,7 +196,7 @@ BOOST_FIXTURE_TEST_CASE(pin_survives_carrier_reorg_restart_and_reindex, Finality
             LOCK(cs_main);
             m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
         }
-        m_node.chainman.reset();
+        ResetChainman(m_node);
         if (reindex_chainstate) m_args.ForceSetArg("-reindex-chainstate", "1");
         m_make_chainman();
         LoadVerifyActivateChainstate();
@@ -247,7 +259,7 @@ BOOST_FIXTURE_TEST_CASE(pin_survives_carrier_reorg_restart_and_reindex, Finality
         LOCK(cs_main);
         m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
     }
-    m_node.chainman.reset();
+    ResetChainman(m_node);
     {
         FILE* f{fsbridge::fopen(pin_path, "r+b")};
         BOOST_REQUIRE(f != nullptr);
@@ -257,7 +269,7 @@ BOOST_FIXTURE_TEST_CASE(pin_survives_carrier_reorg_restart_and_reindex, Finality
         std::fclose(f);
     }
     BOOST_CHECK_THROW(m_make_chainman(), std::runtime_error);
-    m_node.chainman.reset();
+    ResetChainman(m_node);
     // Operator restores the file from backup: startup succeeds and the pin holds.
     {
         FILE* f{fsbridge::fopen(pin_path, "wb")};
@@ -295,7 +307,7 @@ BOOST_FIXTURE_TEST_CASE(restart_with_tip_below_persisted_pin, FinalityChainDiskF
         BOOST_REQUIRE(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.ReadBlock(block, *IndexAt(h))));
         blocks.push_back(block);
     }
-    m_node.chainman.reset();
+    ResetChainman(m_node);
     BOOST_REQUIRE(node::WriteFinalityPin(pin_path, magic, {M + 5, pin_hash}));
     m_make_chainman();
     LoadVerifyActivateChainstate();
@@ -347,7 +359,7 @@ BOOST_FIXTURE_TEST_CASE(pin_raise_writes_chainstate_first, FinalityChainDiskFixt
 
     // Crash-style chain manager reload, without an explicit final flush:
     // pin persistence must not outrun the block index holding its carrier.
-    m_node.chainman.reset();
+    ResetChainman(m_node);
     m_make_chainman();
     LoadVerifyActivateChainstate();
     BOOST_REQUIRE_GE(Tip()->nHeight, M + 8);
@@ -377,7 +389,7 @@ BOOST_FIXTURE_TEST_CASE(pin_raise_reopens_disk_coins_at_carrier, FinalityPinDisk
     BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChainstate().CoinsDB().GetBestBlock().GetHex()), carrier_hash.GetHex());
     // Later unflushed blocks must not be needed to recover the pinned carrier.
     ProduceTo(M + 12, m_vk_a);
-    m_node.chainman.reset();
+    ResetChainman(m_node);
     m_make_chainman();
     LoadVerifyActivateChainstate();
     BOOST_REQUIRE_GE(Tip()->nHeight, M + 8);
