@@ -1108,6 +1108,34 @@ public:
         error.clear();
         return interfaces::BridgePrevalidationResult::VALID;
     }
+    interfaces::BridgePrevalidationResult bridgeV2LightClientHead(
+        std::optional<interfaces::BridgeV2LightClientHead>& head, std::string& error) override
+    {
+        head.reset();
+        const Consensus::Params& consensus{chainman().GetConsensus()};
+
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman().ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        if (tip == nullptr || !consensus.BridgeV2RulesActive(tip->nHeight + 1)) {
+            error = "Bridge V2 rules are not active for the next block";
+            return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
+        }
+        node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
+        if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus,
+                          *tip)) {
+            error = "The bridge state index is unavailable at the active tip";
+            return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
+        }
+        if (const auto& store{tracker.Index().LightClientV2()}) {
+            head = interfaces::BridgeV2LightClientHead{
+                .finalized_slot = store->finalized_header.beacon.slot,
+                .finalized_execution_timestamp = store->finalized_header.execution.timestamp,
+            };
+        }
+        error.clear();
+        return interfaces::BridgePrevalidationResult::VALID;
+    }
     bool hasAssumedValidChain() override
     {
         LOCK(::cs_main);

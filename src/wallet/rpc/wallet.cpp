@@ -898,6 +898,7 @@ RPCHelpMan createfncoin();
 RPCHelpMan submitbridgecarrier();
 RPCHelpMan claimbridgedeposit();
 RPCHelpMan getbridgedepositrecipient();
+RPCHelpMan bridgeforwarderaddress();
 RPCHelpMan bridgewithdraw();
 RPCHelpMan importflowmeshkey();
 RPCHelpMan exportflowmeshkey();
@@ -961,6 +962,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &abandontransaction},
         {"wallet", &abortrescan},
         {"wallet", &backupwallet},
+        {"wallet", &bridgeforwarderaddress},
         {"wallet", &bridgewithdraw},
         {"wallet", &burnasset},
         {"wallet", &bumpfee},

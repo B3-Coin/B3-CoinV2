@@ -4,6 +4,7 @@
 
 #include <chainparams.h>
 #include <bridge/admission.h>
+#include <bridge/eip191.h>
 #include <bridge/proof.h>
 #include <common/messages.h>
 #include <consensus/era.h>
@@ -17,6 +18,7 @@
 #include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
+#include <modern/bridge_forwarder.h>
 #include <modern/bridge_v2.h>
 #include <modern/chain_domain.h>
 #include <modern/fn_pod.h>
@@ -31,6 +33,7 @@
 #include <util/check.h>
 #include <util/moneystr.h>
 #include <util/strencodings.h>
+#include <util/time.h>
 #include <support/cleanse.h>
 #include <wallet/coincontrol.h>
 #include <wallet/receive.h>
@@ -105,6 +108,34 @@ std::optional<CMpaRecord> BuildBridgeWithdrawalMpaRecord(
                                  ethereum_recipient}});
     }
     return std::nullopt;
+}
+
+/** BuildBridgeWithdrawalMpaRecord with the optional route (d3) exit block of
+ * a bridge V2 burn (node changes section 7.2 item 5). Without `exit` it is
+ * the five-argument builder, byte for byte. With it the record is a kind 6
+ * BRIDGE_BURN only, encoded under the V2 record set, the only one that
+ * carries an exit block; consensus checks the block and that
+ * ethereum_recipient is its exit forwarder. */
+static std::optional<CMpaRecord> BuildBridgeWithdrawalMpaRecord(
+    const Consensus::BridgeWithdrawalMode mode, const uint256& registry_id,
+    const uint32_t burn_output_index, const uint64_t raw_amount,
+    const bridge::EthAddress& ethereum_recipient,
+    const std::optional<modern::ExitForwarderParamsV2>& exit)
+{
+    if (!exit) {
+        return BuildBridgeWithdrawalMpaRecord(mode, registry_id,
+                                              burn_output_index, raw_amount,
+                                              ethereum_recipient);
+    }
+    if (mode != Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1) {
+        return std::nullopt;
+    }
+    return bridge::MakeBridgeMpaRecord(
+        bridge::BridgeRecordV1{
+            bridge::BridgeRecordKindV1::BRIDGE_BURN,
+            bridge::BridgeBurnV1{registry_id, burn_output_index, raw_amount,
+                                 ethereum_recipient, *exit}},
+        bridge::BRIDGE_MPT_LIMITS_V2);
 }
 
 FlowMeshDepositAdmission CheckFlowMeshDepositAdmission(
@@ -225,29 +256,35 @@ static ParsedBridgePayload ParseCanonicalBridgePayload(const UniValue& value)
     return ParsedBridgePayload{*decoded, *record};
 }
 
-static bridge::EthAddress ParseEthereumRecipient(const UniValue& value)
+//! A non-zero 20-byte EVM address, hex with an optional 0x prefix; `name`
+//! names the field in the errors.
+static bridge::EthAddress ParseEthAddressField(const UniValue& value,
+                                               const std::string& name)
 {
     if (!value.isStr()) {
-        throw JSONRPCError(RPC_TYPE_ERROR,
-                           "ethereum_recipient must be a hex address");
+        throw JSONRPCError(RPC_TYPE_ERROR, name + " must be a hex address");
     }
     std::string encoded{value.get_str()};
     if (encoded.starts_with("0x") || encoded.starts_with("0X")) {
         encoded.erase(0, 2);
     }
     if (encoded.size() != 40 || !IsHex(encoded)) {
-        throw JSONRPCError(
-            RPC_INVALID_ADDRESS_OR_KEY,
-            "ethereum_recipient must be exactly 20 bytes of hexadecimal");
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                           name + " must be exactly 20 bytes of hexadecimal");
     }
     const std::vector<unsigned char> bytes{ParseHex(encoded)};
     bridge::EthAddress address{};
     std::copy(bytes.begin(), bytes.end(), address.begin());
     if (bridge::EthAddressIsNull(address)) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
-                           "ethereum_recipient cannot be the zero address");
+                           name + " cannot be the zero address");
     }
     return address;
+}
+
+static bridge::EthAddress ParseEthereumRecipient(const UniValue& value)
+{
+    return ParseEthAddressField(value, "ethereum_recipient");
 }
 
 static uint8_t AssetDecimalsFromValue(const UniValue& value)
@@ -269,10 +306,13 @@ static uint8_t AssetDecimalsFromValue(const UniValue& value)
     }
 }
 
+//! `bridge_withdraw` admits bridgewithdraw's `arbitrum` key; its route (d3)
+//! object is parsed by ParseArbitrumExitRoute, not here.
 static AssetRpcOptions ParseAssetRpcOptions(const UniValue& value,
                                             const bool flowmesh_seat = false,
                                             const bool flowmesh_deposit = false,
-                                            const bool asset_burn = false)
+                                            const bool asset_burn = false,
+                                            const bool bridge_withdraw = false)
 {
     AssetRpcOptions parsed;
     // Asset and FN inputs are confirmed by default. A caller may explicitly
@@ -293,6 +333,7 @@ static AssetRpcOptions ParseAssetRpcOptions(const UniValue& value,
     }
     if (flowmesh_deposit) allowed.insert("market_bootstrap");
     if (asset_burn) allowed.insert("allow_unredeemable_burn");
+    if (bridge_withdraw) allowed.insert("arbitrum");
     for (const std::string& key : value.getKeys()) {
         if (!allowed.contains(key)) {
             throw JSONRPCError(RPC_INVALID_PARAMETER,
@@ -847,6 +888,300 @@ static CRecipient BridgeSelfPayment(CWallet& wallet,
                             wallet.chain().relayDustFee()))};
     return CRecipient{*destination, amount,
                       /*fSubtractFeeFromAmount=*/false};
+}
+
+/**
+ * B3's bridge V2 deposit status (interfaces::Chain::bridgeV2DepositStatus):
+ * returns only on VALID; every other status, an unexpected one included,
+ * throws (fail closed). A sticky conflict, a broken fresh lineage or a
+ * latest VERIFIER_E showing an impaired verifier closes deposits for good;
+ * `closed_consequence` tells the caller what a deposit made then would mean.
+ */
+static void RequireBridgeV2DepositsOpen(CWallet& wallet,
+                                        const std::string& closed_consequence)
+{
+    std::string error;
+    const interfaces::BridgePrevalidationResult status{
+        wallet.chain().bridgeV2DepositStatus(error)};
+    switch (status) {
+    case interfaces::BridgePrevalidationResult::VALID:
+        return;
+    case interfaces::BridgePrevalidationResult::RULES_INACTIVE:
+        throw JSONRPCError(RPC_MISC_ERROR, error);
+    case interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE:
+        throw JSONRPCError(RPC_DATABASE_ERROR, error);
+    case interfaces::BridgePrevalidationResult::REJECTED:
+        throw JSONRPCError(RPC_VERIFY_REJECTED,
+                           "bridge V2 deposits are closed for good: " + error +
+                               "; " + closed_consequence);
+    case interfaces::BridgePrevalidationResult::TIP_CHANGED:
+        throw JSONRPCError(RPC_VERIFY_REJECTED, error);
+    }
+    NONFATAL_UNREACHABLE();
+}
+
+/**
+ * The RECIPIENT_V1 word of this wallet's legacy P2PKH `address`, or of a new
+ * legacy address labelled `label` when `address` is null; `destination`
+ * receives the address. Every bUSD V2 deposit route mints to this word.
+ */
+static std::array<unsigned char, 32> WalletBridgeRecipientV1(
+    CWallet& wallet, const UniValue& address, const std::string& label,
+    CTxDestination& destination)
+{
+    {
+        LOCK(wallet.cs_wallet);
+        if (address.isNull()) {
+            const auto generated{
+                wallet.GetNewDestination(OutputType::LEGACY, label)};
+            if (!generated) {
+                throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT,
+                                   util::ErrorString(generated).original);
+            }
+            destination = *generated;
+        } else {
+            destination = DecodeDestination(address.get_str());
+            if (!IsValidDestination(destination)) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                   "Invalid B3 address");
+            }
+        }
+        if (!std::holds_alternative<PKHash>(destination)) {
+            throw JSONRPCError(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "A bridge deposit recipient must be a legacy P2PKH address (RECIPIENT_V1)");
+        }
+        if (!wallet.IsMine(destination)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                               "The address is not owned by this wallet");
+        }
+    }
+    const PKHash& key_hash{std::get<PKHash>(destination)};
+    bridge::RecipientV1 recipient;
+    std::copy(key_hash.begin(), key_hash.end(),
+              recipient.pubkey_hash.begin());
+    const std::array<unsigned char, 32> recipient_word{
+        bridge::EncodeRecipientV1(recipient)};
+    // The frozen codec refuses an all-zero key hash. No wallet key has one,
+    // but never hand out a word B3 would not mint to.
+    if (!bridge::DecodeRecipientV1(recipient_word)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                           "The address cannot be encoded as RECIPIENT_V1");
+    }
+    return recipient_word;
+}
+
+// ------------------------------------------------- bridge V2 forwarders
+//
+// Wallet policy for the route (b) deposit forwarder F_d and the route (d3)
+// exit forwarder F_x (contracts spec sections 7 and 8; node changes section
+// 11.2). Consensus checks only a burn's exit block against the pinned exit
+// forwarder; F_d is never a mint condition.
+
+//! B3DepositForwarderFactory.MIN_FLUSH_RAW: the smallest flush (1 USDT).
+static constexpr uint64_t BRIDGE_FORWARDER_MIN_FLUSH_RAW{1'000'000};
+//! Default relayer fee per forwarder transaction, raw six-decimal units
+//! (provisional [I]).
+static constexpr uint64_t BRIDGE_FORWARDER_DEFAULT_FEE_PER_TX{1'000'000};
+//! LayerZero endpoint id of Ethereum: the dstEid of a route (b) OFT send.
+static constexpr uint32_t BRIDGE_FORWARDER_ETHEREUM_EID{30101};
+//! Default F_x feeCap: release and forward in one B3RelayBatch call, the F_x
+//! fee paying both (B-15; provisional [I]).
+static constexpr uint64_t BRIDGE_EXIT_DEFAULT_FEE_CAP{
+    2 * BRIDGE_FORWARDER_DEFAULT_FEE_PER_TX};
+
+//! A canonical unsigned integer in [min, max]: a JSON number or a string,
+//! AssetUnitsFromValue's grammar (no sign, fraction, exponent or leading
+//! zero) except that zero is admitted when `min` is zero.
+static uint64_t BridgeUnsignedFromValue(const UniValue& value,
+                                        const std::string& name,
+                                        const uint64_t min, const uint64_t max)
+{
+    if (!value.isNum() && !value.isStr()) {
+        throw JSONRPCError(RPC_TYPE_ERROR,
+                           name + " must be an integer number or string");
+    }
+    const std::string& text{value.getValStr()};
+    if (text.empty() || (text.size() > 1 && text.front() == '0') ||
+        !std::all_of(text.begin(), text.end(), [](const char digit) {
+            return digit >= '0' && digit <= '9';
+        })) {
+        throw JSONRPCError(RPC_TYPE_ERROR,
+                           name + " must contain only canonical integer digits, without a sign, fraction, or exponent");
+    }
+    uint64_t out{0};
+    const auto [end, error]{
+        std::from_chars(text.data(), text.data() + text.size(), out)};
+    if (error != std::errc{} || end != text.data() + text.size() ||
+        out < min || out > max) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           strprintf("%s must be in the range [%u, %u]", name,
+                                     min, max));
+    }
+    return out;
+}
+
+/**
+ * OI-6 (arbitrum proposal section 20): an address holding a bridge V2 role
+ * (launch or successor vault, origin token, verifier, forwarder factory) is
+ * never a withdrawal recipient, an exit `to`, a refund EOA or a derived
+ * forwarder, because those contracts give nothing back for funds sent to
+ * them.
+ */
+static void RequireUnreservedBridgeV2Address(
+    const Consensus::BridgeV2Params& v2, const Consensus::BridgeEthAddress& address,
+    const std::string& name)
+{
+    if (const auto reason{modern::BridgeV2ReservedEthAddressReason(v2, address)}) {
+        throw JSONRPCError(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            strprintf("%s is %s: funds sent there are lost, the bridge V2 contracts give no claim back (OI-6)",
+                      name, std::string{*reason}));
+    }
+}
+
+/**
+ * The EIP-191 proof that `refund_eoa` is an Ethereum EOA the user controls
+ * (contracts spec section 7.3; bridge/eip191.h): `signature` must be the
+ * 65-byte r || s || v personal_sign signature of RefundEoaMessageV2 under
+ * this chain's modern domain, recovering exactly `refund_eoa`. Returns the
+ * message; every error ends with it, verbatim, so the user can sign it.
+ */
+static std::string RequireRefundEoaProof(const Consensus::Params& params,
+                                         const Consensus::BridgeEthAddress& refund_eoa,
+                                         const UniValue& signature,
+                                         const std::string& name)
+{
+    const auto domain{modern::ModernChainDomain(
+        params.hashGenesisBlock, params.legacy_final_hash.value_or(uint256{}))};
+    if (!domain) {
+        throw JSONRPCError(RPC_MISC_ERROR,
+                           "The modern chain domain is not pinned");
+    }
+    const std::string message{bridge::RefundEoaMessageV2(*domain, refund_eoa)};
+    const std::string how{
+        " Sign exactly this text (lines separated by \\n, no trailing newline) "
+        "as an EIP-191 personal_sign message with the refund EOA's key; a Safe "
+        "or an ERC-4337 account cannot:\n" + message};
+    if (!signature.isStr()) {
+        throw JSONRPCError(RPC_TYPE_ERROR,
+                           name + " must be a hex string." + how);
+    }
+    std::string encoded{signature.get_str()};
+    if (encoded.starts_with("0x") || encoded.starts_with("0X")) {
+        encoded.erase(0, 2);
+    }
+    if (encoded.size() != 2 * bridge::EIP191_SIGNATURE_SIZE || !IsHex(encoded)) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            name + " must be exactly 65 bytes of hexadecimal (r || s || v)." + how);
+    }
+    const std::vector<unsigned char> bytes{ParseHex(encoded)};
+    const auto signer{bridge::RecoverEip191SignerV2(message, bytes)};
+    if (!signer || *signer != refund_eoa) {
+        throw JSONRPCError(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            name + " is not the refund EOA's EIP-191 signature of the refund EOA message." + how);
+    }
+    return message;
+}
+
+static UniValue ExitForwarderParamsJson(const modern::ExitForwarderParamsV2& p)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("dst_eid", p.dst_eid);
+    out.pushKV("to", "0x" + HexStr(p.to));
+    out.pushKV("max_bridge_fee_bps", p.max_bridge_fee_bps);
+    out.pushKV("fee_cap", p.fee_cap);
+    out.pushKV("refund_eoa", "0x" + HexStr(p.refund_eoa));
+    return out;
+}
+
+//! bridgewithdraw's route (d3): the exit forwarder F_x of options.arbitrum.
+struct ArbitrumExitRoute {
+    modern::ExitForwarderParamsV2 params{};
+    Consensus::BridgeEthAddress recipient{}; // the Arbitrum address
+    Consensus::BridgeEthAddress account{};   // F_x, the burn's recipient
+    uint256 salt{};
+};
+
+/**
+ * Parses options.arbitrum of a bridge V2 burn of `amount` raw units: p =
+ * {pinned dst_eid, word(recipient), max_bridge_fee_bps, fee_cap,
+ * refund_eoa}, its F_x under the pinned exit forwarder, and the wallet's
+ * refusals (a reserved recipient, refund EOA or F_x, an unproven refund EOA,
+ * an amount a forward at the full fee would empty). Consensus re-checks p
+ * and F_x (bridge_state.cpp, VerifyBridgeBurnV2).
+ */
+static ArbitrumExitRoute ParseArbitrumExitRoute(const Consensus::Params& params,
+                                                const UniValue& value,
+                                                const uint64_t amount)
+{
+    // The caller checked ExitForwarderRouteUnavailableReasonV2.
+    const Consensus::BridgeV2Params& v2{*Assert(params.bridge_v2)};
+    const Consensus::BridgeV2ExitForwarderPins& pins{*Assert(v2.exit_forwarder)};
+    if (!value.isObject()) {
+        throw JSONRPCError(RPC_TYPE_ERROR, "options.arbitrum must be an object");
+    }
+    const std::set<std::string> allowed{"recipient", "refund_eoa",
+                                        "refund_eoa_signature", "fee_cap",
+                                        "max_bridge_fee_bps"};
+    for (const std::string& key : value.getKeys()) {
+        if (!allowed.contains(key)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               strprintf("Unknown arbitrum option '%s'", key));
+        }
+    }
+    for (const char* key : {"recipient", "refund_eoa", "refund_eoa_signature"}) {
+        if (!value.exists(key)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               strprintf("options.arbitrum.%s is required", key));
+        }
+    }
+    ArbitrumExitRoute out;
+    out.recipient = ParseEthAddressField(value["recipient"], "arbitrum.recipient");
+    const Consensus::BridgeEthAddress refund_eoa{
+        ParseEthAddressField(value["refund_eoa"], "arbitrum.refund_eoa")};
+    const uint64_t fee_cap{
+        value.exists("fee_cap")
+            ? BridgeUnsignedFromValue(value["fee_cap"], "arbitrum.fee_cap", 0,
+                                      std::numeric_limits<uint64_t>::max())
+            : BRIDGE_EXIT_DEFAULT_FEE_CAP};
+    const uint64_t max_bridge_fee_bps{
+        value.exists("max_bridge_fee_bps")
+            ? BridgeUnsignedFromValue(value["max_bridge_fee_bps"],
+                                      "arbitrum.max_bridge_fee_bps", 0,
+                                      modern::FORWARDER_MAX_BRIDGE_FEE_BPS)
+            : 0};
+    // forward() sends balance - fee and needs it non-zero: at the full fee
+    // a release of `amount` must still leave something to send.
+    if (amount <= fee_cap) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "amount must exceed arbitrum.fee_cap: a forward at the full fee must still send something");
+    }
+    RequireUnreservedBridgeV2Address(v2, out.recipient, "arbitrum.recipient");
+    RequireUnreservedBridgeV2Address(v2, refund_eoa, "arbitrum.refund_eoa");
+    RequireRefundEoaProof(params, refund_eoa, value["refund_eoa_signature"],
+                          "arbitrum.refund_eoa_signature");
+
+    out.params = modern::ExitForwarderParamsV2{
+        .dst_eid = pins.dst_eid,
+        .to = modern::ForwarderAddressWord(out.recipient),
+        .max_bridge_fee_bps = static_cast<uint16_t>(max_bridge_fee_bps),
+        .fee_cap = fee_cap,
+        .refund_eoa = refund_eoa,
+    };
+    if (!modern::ExitForwarderParamsValidV2(out.params, pins.dst_eid)) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "The arbitrum exit parameters are invalid for the pinned exit forwarder");
+    }
+    out.account = modern::ExitForwarderAddressV2(pins, out.params);
+    out.salt = modern::ExitForwarderSaltV2(out.params);
+    RequireUnreservedBridgeV2Address(v2, out.account,
+                                     "The derived exit forwarder");
+    return out;
 }
 
 } // namespace
@@ -2143,27 +2478,9 @@ RPCHelpMan getbridgedepositrecipient()
             // B3's deposit status first, so a refusal consumes no address.
             // Only VALID continues; every other status, an unexpected one
             // included, throws (fail closed).
-            std::string error;
-            const interfaces::BridgePrevalidationResult status{
-                wallet->chain().bridgeV2DepositStatus(error)};
-            if (status != interfaces::BridgePrevalidationResult::VALID) {
-                switch (status) {
-                case interfaces::BridgePrevalidationResult::VALID:
-                    break;
-                case interfaces::BridgePrevalidationResult::RULES_INACTIVE:
-                    throw JSONRPCError(RPC_MISC_ERROR, error);
-                case interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE:
-                    throw JSONRPCError(RPC_DATABASE_ERROR, error);
-                case interfaces::BridgePrevalidationResult::REJECTED:
-                    throw JSONRPCError(
-                        RPC_VERIFY_REJECTED,
-                        "bridge V2 deposits are closed for good: " + error +
-                            "; a deposit made now mints bUSD V2 that can never be redeemed");
-                case interfaces::BridgePrevalidationResult::TIP_CHANGED:
-                    throw JSONRPCError(RPC_VERIFY_REJECTED, error);
-                }
-                NONFATAL_UNREACHABLE();
-            }
+            RequireBridgeV2DepositsOpen(
+                *wallet,
+                "a deposit made now mints bUSD V2 that can never be redeemed");
             const Consensus::Params& params{Params().GetConsensus()};
             const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
             if (!params.bridge_v2 || !asset) {
@@ -2184,45 +2501,10 @@ RPCHelpMan getbridgedepositrecipient()
             const Consensus::BridgeV2VaultEntry& entry{*entry_ptr};
 
             CTxDestination destination;
-            {
-                LOCK(wallet->cs_wallet);
-                if (request.params[0].isNull()) {
-                    const auto generated{wallet->GetNewDestination(
-                        OutputType::LEGACY, "b3-busd-bridge-receive")};
-                    if (!generated) {
-                        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT,
-                                           util::ErrorString(generated).original);
-                    }
-                    destination = *generated;
-                } else {
-                    destination = DecodeDestination(request.params[0].get_str());
-                    if (!IsValidDestination(destination)) {
-                        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
-                                           "Invalid B3 address");
-                    }
-                }
-                if (!std::holds_alternative<PKHash>(destination)) {
-                    throw JSONRPCError(
-                        RPC_INVALID_ADDRESS_OR_KEY,
-                        "A bridge deposit recipient must be a legacy P2PKH address (RECIPIENT_V1)");
-                }
-                if (!wallet->IsMine(destination)) {
-                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
-                                       "The address is not owned by this wallet");
-                }
-            }
-            const PKHash& key_hash{std::get<PKHash>(destination)};
-            bridge::RecipientV1 recipient;
-            std::copy(key_hash.begin(), key_hash.end(),
-                      recipient.pubkey_hash.begin());
             const std::array<unsigned char, 32> recipient_word{
-                bridge::EncodeRecipientV1(recipient)};
-            // The frozen codec refuses an all-zero key hash. No wallet key
-            // has one, but never hand out a word B3 would not mint to.
-            if (!bridge::DecodeRecipientV1(recipient_word)) {
-                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
-                                   "The address cannot be encoded as RECIPIENT_V1");
-            }
+                WalletBridgeRecipientV1(*wallet, request.params[0],
+                                        "b3-busd-bridge-receive",
+                                        destination)};
 
             UniValue result{UniValue::VOBJ};
             result.pushKV("address", EncodeDestination(destination));
@@ -2233,6 +2515,297 @@ RPCHelpMan getbridgedepositrecipient()
             result.pushKV("asset_id", asset->GetHex());
             result.pushKV("max_deposit_raw", entry.max_deposit_raw);
             result.pushKV("deposit_signature", "deposit(uint256,bytes32)");
+            return result;
+        }};
+}
+
+RPCHelpMan bridgeforwarderaddress()
+{
+    return RPCHelpMan{
+        "bridgeforwarderaddress",
+        "Derive a fresh route (b) deposit forwarder F_d for a bridge V2 deposit "
+        "that mints bUSD V2 to this wallet (regtest only, from the bridge V2 "
+        "activation height, with a pinned deposit forwarder factory; contracts "
+        "spec section 7). The user sends USDT0 on Arbitrum with the OFT send() "
+        "of oft_send, amountLD the delivery and minAmountLD = amountLD; "
+        "LayerZero credits the forwarder with USDT on Ethereum by plain "
+        "transfer. A relayer, or anyone from a codeless externally owned "
+        "account, then deploys it (deploy(params)) and flushes it "
+        "(flush(params, fee)) into the launch Vault V2 with exactly one "
+        "deposit(amount, b3Recipient) per flush, every fee within the "
+        "lifetime fee_cap; claimbridgedeposit mints the proven Deposit. The "
+        "forwarder is the CREATE2 address of B3Forwarder under the pinned "
+        "factory and init-code hash, so it can be paid before it exists. "
+        "Before not_after only refund_eoa can take funds back "
+        "(refund(params, token, to, amount)); after it anyone may "
+        "returnToOwner(params, fee) them to refund_eoa. refund_eoa must be an "
+        "Ethereum externally owned account this user controls, proven by an "
+        "EIP-191 personal_sign signature of refund_eoa_message (an error names "
+        "the exact text): Safes and ERC-4337 accounts cannot sign it. One "
+        "forwarder carries at most the vault's max_deposit_raw (OI-2), so its "
+        "first flush deposits the whole delivery whatever fee within fee_cap "
+        "the flusher takes; fee_cap = fee_per_tx x 4 pays deploy, two flushes "
+        "(one for a repeat arrival) and a returnToOwner. A larger delivery "
+        "waits for a zero-fee flush, a refund or returnToOwner after "
+        "not_after: split it across forwarders. not_after is at most 30 days "
+        "out and, once the bridge V2 light client is bootstrapped, ends 24 "
+        "hours before its horizon (getbridgev2info light_client.horizon_time); "
+        "within 7 days of the horizon no forwarder is derived (node changes "
+        "section 12.3). Each call takes a new address and a fresh not_after by "
+        "default, hence a fresh forwarder: never reuse one once flushed. Hand "
+        "params to the relayer, or call publish(params) on the factory. "
+        "Refused, like getbridgedepositrecipient, once B3 has closed bridge V2 "
+        "deposits for good, and from a pinned B-23 successor's migration "
+        "height (the factory deposits only into the launch vault). Never send "
+        "USDT or USDT0 to the vault directly (OI-6). Nothing is signed or "
+        "broadcast.\n",
+        {
+            {"refund_eoa", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Ethereum externally owned account this user controls, 20 bytes with optional 0x prefix: the only account that may refund the forwarder, and the one returnToOwner pays"},
+            {"refund_eoa_signature", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "65-byte r || s || v EIP-191 personal_sign signature by refund_eoa of refund_eoa_message, with optional 0x prefix"},
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
+             "Derivation options", {
+                 {"address", RPCArg::Type::STR,
+                  RPCArg::DefaultHint{"a new legacy address labelled b3-busd-bridge-forwarder"},
+                  "This wallet's legacy P2PKH address that receives the bUSD V2"},
+                 {"amount", RPCArg::Type::NUM,
+                  RPCArg::DefaultHint{"the vault's max_deposit_raw"},
+                  "Raw six-decimal USDT the user expects to deliver: at least 1000000 (MIN_FLUSH_RAW) and at most the vault's max_deposit_raw (OI-2)"},
+                 {"fee_per_tx", RPCArg::Type::NUM,
+                  RPCArg::Default{BRIDGE_FORWARDER_DEFAULT_FEE_PER_TX},
+                  "Relayer fee per forwarder transaction in raw six-decimal units (provisional)"},
+                 {"not_after", RPCArg::Type::NUM,
+                  RPCArg::DefaultHint{"now + 30 days"},
+                  "Unix time in seconds until which the forwarder may be flushed: after now, at most now + 30 days and, with a bootstrapped light client, at most its horizon - 24 hours"},
+             }},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Deposit forwarder instructions", {
+            {RPCResult::Type::STR, "address", "B3 P2PKH address that receives the bUSD V2"},
+            {RPCResult::Type::STR_HEX, "recipient_v1", "params.b3_recipient: RECIPIENT_V1 bytes32, 0x-prefixed (11 zero bytes, version 0x01, the 20-byte P2PKH key hash)"},
+            {RPCResult::Type::STR_HEX, "forwarder", "The deposit forwarder F_d = factory.accountOf(params), 0x-prefixed: the OFT send's recipient"},
+            {RPCResult::Type::STR_HEX, "factory", "Pinned B3DepositForwarderFactory address, 0x-prefixed"},
+            {RPCResult::Type::STR_HEX, "init_code_hash", "Pinned FORWARDER_INIT_CODE_HASH, keccak256 of the B3Forwarder creation code (raw bytes)"},
+            {RPCResult::Type::STR_HEX, "vault", "Launch Vault V2 address the forwarder deposits into, 0x-prefixed"},
+            {RPCResult::Type::STR_HEX, "token", "Origin token address the forwarder flushes (USDT on Ethereum), 0x-prefixed"},
+            {RPCResult::Type::OBJ, "params", "DepositParams p for deploy, flush, refund, returnToOwner and publish", {
+                {RPCResult::Type::STR_HEX, "vault", "p.vault"},
+                {RPCResult::Type::STR_HEX, "b3_recipient", "p.b3Recipient (RECIPIENT_V1)"},
+                {RPCResult::Type::STR_HEX, "refund_eoa", "p.refundEOA"},
+                {RPCResult::Type::NUM, "fee_cap", "p.feeCap: lifetime bound on every fee the forwarder pays (raw six-decimal units)"},
+                {RPCResult::Type::NUM, "not_after", "p.notAfter: Unix time until which flush works; returnToOwner only after it"},
+            }},
+            {RPCResult::Type::STR_HEX, "salt", "depositSalt(p), the CREATE2 salt (raw bytes)"},
+            {RPCResult::Type::NUM, "amount_raw", "The expected delivery, at most max_deposit_raw"},
+            {RPCResult::Type::NUM, "fee_per_tx", "The fee per forwarder transaction fee_cap is sized for"},
+            {RPCResult::Type::NUM, "max_deposit_raw", "Largest delivery one forwarder carries: the vault's MAX_DEPOSIT_RAW, which one flush deposits"},
+            {RPCResult::Type::NUM, "min_flush_raw", "Smallest flush (the factory's MIN_FLUSH_RAW)"},
+            {RPCResult::Type::NUM, "horizon_time", /*optional=*/true, "With a bootstrapped bridge V2 light client: its estimated horizon (getbridgev2info light_client.horizon_time), which caps not_after at horizon_time - 24 hours"},
+            {RPCResult::Type::OBJ, "oft_send", "Route (b) SendParam fields for the Arbitrum USDT0 OFT send(): amountLD is the delivery and minAmountLD = amountLD", {
+                {RPCResult::Type::NUM, "dst_eid", "LayerZero endpoint id of Ethereum (30101)"},
+                {RPCResult::Type::STR_HEX, "to", "The forwarder as a bytes32 word, 0x-prefixed"},
+                {RPCResult::Type::STR, "compose_msg", "Empty: route (b) never composes"},
+                {RPCResult::Type::STR, "oft_cmd", "Empty"},
+            }},
+            {RPCResult::Type::STR, "refund_eoa_message", "The exact EIP-191 text refund_eoa signed"},
+            {RPCResult::Type::ARR, "warnings", "What this forwarder must never be used for", {
+                {RPCResult::Type::STR, "", "Warning"},
+            }},
+        }},
+        RPCExamples{HelpExampleCli("bridgeforwarderaddress",
+                                   "\"0x<refund_eoa>\" \"0x<signature>\"") +
+                    HelpExampleRpc("bridgeforwarderaddress",
+                                   "\"0x<refund_eoa>\", \"0x<signature>\", {\"amount\": 25000000000}")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<CWallet> wallet{
+                GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            wallet->BlockUntilSyncedToCurrentChain();
+
+            const UniValue& options{request.params[2]};
+            if (!options.isNull()) {
+                if (!options.isObject()) {
+                    throw JSONRPCError(RPC_TYPE_ERROR, "options must be an object");
+                }
+                const std::set<std::string> allowed{"address", "amount",
+                                                    "fee_per_tx", "not_after"};
+                for (const std::string& key : options.getKeys()) {
+                    if (!allowed.contains(key)) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                           strprintf("Unknown option '%s'", key));
+                    }
+                }
+            }
+
+            // Every refusal comes before step 8, so none consumes an address.
+            // 1. A pinned deposit forwarder whose vault takes deposits for
+            // the next block. The factory's VAULT is the launch vault; a
+            // B-23 successor pins no factory of its own.
+            const Consensus::Params& params{Params().GetConsensus()};
+            const std::optional<int> tip_height{wallet->chain().getHeight()};
+            if (const auto reason{modern::DepositForwarderUnavailableReasonV2(
+                    params, tip_height ? *tip_height + 1 : 0)}) {
+                throw JSONRPCError(RPC_MISC_ERROR, std::string{*reason});
+            }
+            const Consensus::BridgeV2Params& v2{*params.bridge_v2};
+            const Consensus::BridgeV2DepositForwarderPins& pins{*v2.deposit_forwarder};
+            const Consensus::BridgeV2VaultEntry& entry{v2.vault};
+            const uint64_t max_deposit_raw{
+                static_cast<uint64_t>(entry.max_deposit_raw)};
+
+            // 2. B3's deposit status.
+            RequireBridgeV2DepositsOpen(
+                *wallet,
+                "a forwarder deposit made now mints bUSD V2 that can never be redeemed");
+
+            // 3. The light-client horizon (node changes section 12.3): no
+            // forwarder within 7 days of it; notAfter ends 24 hours before
+            // it. Unknown until the V2 store is bootstrapped.
+            const int64_t now{GetTime()};
+            if (now <= 0) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "The node clock is unset");
+            }
+            std::optional<interfaces::BridgeV2LightClientHead> head;
+            {
+                std::string error;
+                switch (wallet->chain().bridgeV2LightClientHead(head, error)) {
+                case interfaces::BridgePrevalidationResult::VALID:
+                    break;
+                case interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE:
+                    throw JSONRPCError(RPC_DATABASE_ERROR, error);
+                case interfaces::BridgePrevalidationResult::RULES_INACTIVE:
+                case interfaces::BridgePrevalidationResult::REJECTED:
+                case interfaces::BridgePrevalidationResult::TIP_CHANGED:
+                    throw JSONRPCError(RPC_MISC_ERROR, error);
+                }
+            }
+            const std::optional<int64_t> horizon_time{
+                head ? std::optional{modern::BridgeV2LightClientHorizonTime(
+                           v2.light_client.fork_schedule_valid_through_epoch,
+                           head->finalized_slot, head->finalized_execution_timestamp)}
+                     : std::nullopt};
+            const auto latest_not_after{
+                modern::DepositForwarderLatestNotAfterV2(now, horizon_time)};
+            if (!latest_not_after) {
+                throw JSONRPCError(
+                    RPC_VERIFY_REJECTED,
+                    strprintf("The bridge V2 light-client horizon (estimated at %d) is less than 7 days away: a forwarder deposit made now could wait for the extension hard fork, so none is derived (node changes section 12.3)",
+                              horizon_time.value_or(0)));
+            }
+
+            // 4. The refund EOA: never a bridge V2 contract (OI-6).
+            const Consensus::BridgeEthAddress refund_eoa{
+                ParseEthAddressField(request.params[0], "refund_eoa")};
+            RequireUnreservedBridgeV2Address(v2, refund_eoa, "refund_eoa");
+
+            // 5. ... and an EOA the user controls (EIP-191).
+            const std::string message{RequireRefundEoaProof(
+                params, refund_eoa, request.params[1], "refund_eoa_signature")};
+
+            // 6. One delivery of at most max_deposit_raw (OI-2), so a single
+            // flush deposits it whatever fee within the cap is taken, and the
+            // lifetime fee cap fee_per_tx x 4.
+            const uint64_t amount{
+                options["amount"].isNull()
+                    ? max_deposit_raw
+                    : BridgeUnsignedFromValue(options["amount"], "amount",
+                                              BRIDGE_FORWARDER_MIN_FLUSH_RAW,
+                                              static_cast<uint64_t>(MAX_MONEY))};
+            if (amount > max_deposit_raw) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    strprintf("amount exceeds max_deposit_raw (%u): one forwarder carries one vault deposit, so a larger delivery would wait for a zero-fee flush, a refund or returnToOwner (OI-2); split it across several forwarders",
+                              max_deposit_raw));
+            }
+            const uint64_t fee_per_tx{
+                options["fee_per_tx"].isNull()
+                    ? BRIDGE_FORWARDER_DEFAULT_FEE_PER_TX
+                    : BridgeUnsignedFromValue(options["fee_per_tx"], "fee_per_tx",
+                                              1, static_cast<uint64_t>(MAX_MONEY))};
+            // fee_per_tx <= MAX_MONEY, so fee_per_tx x 4 always fits uint64.
+            const uint64_t fee_cap{
+                *CHECK_NONFATAL(modern::DepositForwarderFeeCapV2(fee_per_tx))};
+
+            // 7. notAfter: a fresh one per derivation, at most the latest.
+            const uint64_t latest{static_cast<uint64_t>(*latest_not_after)};
+            const uint64_t not_after{
+                options["not_after"].isNull()
+                    ? latest
+                    : BridgeUnsignedFromValue(options["not_after"], "not_after",
+                                              static_cast<uint64_t>(now) + 1,
+                                              latest)};
+
+            // 8. The B3 recipient: a new address by default, so a fresh F_d.
+            CTxDestination destination;
+            const std::array<unsigned char, 32> recipient_word{
+                WalletBridgeRecipientV1(*wallet, options["address"],
+                                        "b3-busd-bridge-forwarder",
+                                        destination)};
+
+            // 9. F_d = accountOf(p) under the pinned factory.
+            const modern::DepositForwarderParamsV2 p{
+                .vault = entry.vault_address,
+                .b3_recipient = recipient_word,
+                .refund_eoa = refund_eoa,
+                .fee_cap = fee_cap,
+                .not_after = not_after,
+            };
+            if (!modern::DepositForwarderParamsValidV2(
+                    p, entry.vault_address, entry.token_address, pins.factory)) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "The deposit forwarder parameters are invalid for the pinned factory");
+            }
+            const Consensus::BridgeEthAddress forwarder{
+                modern::DepositForwarderAddressV2(pins, p)};
+            RequireUnreservedBridgeV2Address(v2, forwarder,
+                                             "The derived deposit forwarder");
+
+            UniValue params_json{UniValue::VOBJ};
+            params_json.pushKV("vault", "0x" + HexStr(p.vault));
+            params_json.pushKV("b3_recipient", "0x" + HexStr(p.b3_recipient));
+            params_json.pushKV("refund_eoa", "0x" + HexStr(p.refund_eoa));
+            params_json.pushKV("fee_cap", p.fee_cap);
+            params_json.pushKV("not_after", p.not_after);
+
+            UniValue oft_send{UniValue::VOBJ};
+            oft_send.pushKV("dst_eid", BRIDGE_FORWARDER_ETHEREUM_EID);
+            oft_send.pushKV("to", "0x" + HexStr(modern::ForwarderAddressWord(forwarder)));
+            oft_send.pushKV("compose_msg", "");
+            oft_send.pushKV("oft_cmd", "");
+
+            UniValue warnings{UniValue::VARR};
+            warnings.push_back(
+                "Never send USDT or USDT0 to Vault V2, its token or a forwarder factory directly: a plain transfer mints nothing and is lost (OI-6). Only an OFT send to the forwarder, or a vault deposit(amount, b3Recipient) call, mints bUSD V2");
+            warnings.push_back(
+                "Use this forwarder for one deposit of at most max_deposit_raw and derive a fresh one for the next. Its fee cap pays deploy, two flushes (one for a repeat arrival) and a returnToOwner; what no paid flush moves before not_after returns to refund_eoa after it (OI-2)");
+            if (!horizon_time) {
+                warnings.push_back(
+                    "The bridge V2 light client is not bootstrapped yet, so not_after is not capped at its horizon; B3 mints the flushed deposit once the light client covers it");
+            }
+            if (amount < BRIDGE_FORWARDER_MIN_FLUSH_RAW + fee_per_tx) {
+                warnings.push_back(
+                    "A delivery of amount_raw leaves less than min_flush_raw after a fee_per_tx fee, so a relayer cannot flush it at that fee; flush it yourself with a lower fee, refund it, or wait for returnToOwner");
+            }
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("address", EncodeDestination(destination));
+            result.pushKV("recipient_v1", "0x" + HexStr(recipient_word));
+            result.pushKV("forwarder", "0x" + HexStr(forwarder));
+            result.pushKV("factory", "0x" + HexStr(pins.factory));
+            result.pushKV("init_code_hash", "0x" + HexStr(pins.init_code_hash));
+            result.pushKV("vault", "0x" + HexStr(entry.vault_address));
+            result.pushKV("token", "0x" + HexStr(entry.token_address));
+            result.pushKV("params", std::move(params_json));
+            result.pushKV("salt", "0x" + HexStr(modern::DepositForwarderSaltV2(p)));
+            result.pushKV("amount_raw", amount);
+            result.pushKV("fee_per_tx", fee_per_tx);
+            result.pushKV("max_deposit_raw", max_deposit_raw);
+            result.pushKV("min_flush_raw", BRIDGE_FORWARDER_MIN_FLUSH_RAW);
+            if (horizon_time) result.pushKV("horizon_time", *horizon_time);
+            result.pushKV("oft_send", std::move(oft_send));
+            result.pushKV("refund_eoa_message", message);
+            result.pushKV("warnings", std::move(warnings));
             return result;
         }};
 }
@@ -2267,15 +2840,25 @@ RPCHelpMan bridgewithdraw()
         "the mempool refuses a burn whose gate closes within its margin. "
         "getbridgev2info burn_gate names the row that refuses a burn. Prove "
         "it with getbridgewithdrawalproofv2 against an accepted certificate. "
-        "The burn and "
+        "Under bridge V2 the recipient is never a bridge V2 contract (OI-6). "
+        "Route (d3), bridge V2 with a pinned exit forwarder only: "
+        "options.arbitrum replaces ethereum_recipient, and the leaf pays the "
+        "exit forwarder F_x = accountOf(p) of p = {pinned dst_eid, "
+        "word(arbitrum.recipient), max_bridge_fee_bps, fee_cap, refund_eoa}, "
+        "which the burn record's exit block carries and consensus checks. A "
+        "relayer releases and forwards it through the USDT0 OFT adapter in "
+        "one B3RelayBatch call, taking at most fee_cap; only refund_eoa can "
+        "withdraw an unforwarded balance on Ethereum. USDT0 delivers to a "
+        "blocked Arbitrum address frozen: check isBlocked(recipient) on "
+        "Arbitrum first. The burn and "
         "recipient are bound together by the canonical type-10 record and its "
         "signed B3MC policy-9 output. No OP_RETURN is used.\n" +
             HELP_REQUIRING_PASSPHRASE,
         {
             {"amount", RPCArg::Type::NUM, RPCArg::Optional::NO,
              "Integer raw bUSD units to burn (six decimal places)"},
-            {"ethereum_recipient", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
-             "Exact 20-byte Ethereum recipient, with optional 0x prefix"},
+            {"ethereum_recipient", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED,
+             "Exact 20-byte Ethereum recipient, with optional 0x prefix (route d1). Required unless options.arbitrum is given, and refused with it except as null or \"\" (omitted)"},
             {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
              "Transaction options", {
                  {"broadcast", RPCArg::Type::BOOL, RPCArg::Default{true},
@@ -2288,33 +2871,111 @@ RPCHelpMan bridgewithdraw()
                   "Minimum confirmations for selected inputs"},
                  {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false},
                   "Allow unsafe wallet inputs"},
-             }},
+                 {"arbitrum", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
+                  "Route (d3): withdraw to USDT0 on Arbitrum through the exit forwarder F_x (bridge V2 with a pinned exit forwarder only)", {
+                      {"recipient", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                       "20-byte Arbitrum address that receives the USDT0, with optional 0x prefix"},
+                      {"refund_eoa", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                       "Ethereum externally owned account this user controls: the only account that may withdraw an unforwarded F_x balance on Ethereum"},
+                      {"refund_eoa_signature", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                       "65-byte r || s || v EIP-191 personal_sign signature by refund_eoa of the refund EOA message (bridgeforwarderaddress refund_eoa_message; an error names the exact text)"},
+                      {"fee_cap", RPCArg::Type::NUM, RPCArg::Default{BRIDGE_EXIT_DEFAULT_FEE_CAP},
+                       "Largest relayer fee the forward may take, raw six-decimal units; it pays the release and the forward (provisional). amount must exceed it"},
+                      {"max_bridge_fee_bps", RPCArg::Type::NUM, RPCArg::Default{0},
+                       "OFT slippage bound in basis points, at most 50: minAmountLD = amount - amount x bps / 10000"},
+                  }},
+             },
+             // The nested arbitrum object has no one-line rendering.
+             RPCArgOptions{.oneline_description = "options"}},
         },
         AssetTransactionResult("Created bridge withdrawal request", {
             {RPCResult::Type::STR_HEX, "asset_id", "Configured chain-bound bUSD asset id (the vault-bound bUSD V2 asset id from the bridge V2 activation height)"},
             {RPCResult::Type::NUM, "amount", "Integer bUSD units burned"},
             {RPCResult::Type::NUM, "asset_change", "Integer bUSD units returned to this wallet"},
-            {RPCResult::Type::STR_HEX, "ethereum_recipient", "Bound Ethereum recipient"},
+            {RPCResult::Type::STR_HEX, "ethereum_recipient", "Bound Ethereum recipient (route d3: the exit forwarder F_x)"},
+            {RPCResult::Type::STR, "route", "ethereum (route d1: the leaf pays ethereum_recipient) or arbitrum (route d3: the leaf pays the exit forwarder F_x)"},
+            {RPCResult::Type::OBJ, "exit", /*optional=*/true, "Route d3 only: the exit block the burn record carries",
+             {
+                 {RPCResult::Type::OBJ, "params", "ExitParams p for B3OftExitFactory.forward and withdrawOnEthereum",
+                  {
+                      {RPCResult::Type::NUM, "dst_eid", "p.dstEid: the pinned exit factory's DST_EID"},
+                      {RPCResult::Type::STR_HEX, "to", "p.to: the Arbitrum recipient as a bytes32 word"},
+                      {RPCResult::Type::NUM, "max_bridge_fee_bps", "p.maxBridgeFeeBps"},
+                      {RPCResult::Type::NUM, "fee_cap", "p.feeCap: largest relayer fee one forward may take (raw six-decimal units)"},
+                      {RPCResult::Type::STR_HEX, "refund_eoa", "p.refundEOA"},
+                  }},
+                 {RPCResult::Type::STR_HEX, "recipient", "The Arbitrum recipient"},
+                 {RPCResult::Type::STR_HEX, "factory", "Pinned B3OftExitFactory address"},
+                 {RPCResult::Type::STR_HEX, "account", "F_x = factory.accountOf(p), equal to ethereum_recipient"},
+                 {RPCResult::Type::STR_HEX, "salt", "exitSalt(p), the CREATE2 salt (raw bytes)"},
+             }},
             {RPCResult::Type::NUM, "burn_vout", "Exact bUSD BURN output index"},
             {RPCResult::Type::NUM, "binding_vout", "Signed B3MC bridge binding output index"},
             {RPCResult::Type::STR, "withdrawal_mode", "managed-v1, decentralized-verifier-v1, or decentralized-verifier-v2 (from the bridge V2 activation height)"},
             {RPCResult::Type::STR, "withdrawal_status", /*optional=*/true, "pending-confirmation for a new decentralized (V1 or V2) burn"},
             {RPCResult::Type::STR, "proof_rpc_after_confirmation", /*optional=*/true, "Copyable authoritative proof lookup using txid and burn_vout; for a V2 burn, replace <certificate_block> with the inclusion block of an accepted fresh-lineage certificate covering the burn"},
         }),
-        RPCExamples{HelpExampleCli(
-            "bridgewithdraw", "1000000 \"0x00112233445566778899aabbccddeeff00112233\"")},
+        RPCExamples{
+            HelpExampleCli(
+                "bridgewithdraw", "1000000 \"0x00112233445566778899aabbccddeeff00112233\"") +
+            "Route (d3), with named arguments (positionally, pass \"\" as ethereum_recipient):\n" +
+            HelpExampleCliNamed(
+                "bridgewithdraw",
+                {{"amount", 25000000},
+                 {"options", UniValue{[] {
+                      UniValue arbitrum{UniValue::VOBJ};
+                      arbitrum.pushKV("recipient", "0x<arbitrum address>");
+                      arbitrum.pushKV("refund_eoa", "0x<ethereum EOA>");
+                      arbitrum.pushKV("refund_eoa_signature", "0x<65-byte signature>");
+                      UniValue options{UniValue::VOBJ};
+                      options.pushKV("arbitrum", std::move(arbitrum));
+                      return options;
+                  }()}}})},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
             const CAmount amount{
                 AssetUnitsFromValue(request.params[0], "amount")};
-            const bridge::EthAddress ethereum_recipient{
-                ParseEthereumRecipient(request.params[1])};
+            // Route (d1) names ethereum_recipient; route (d3) names
+            // options.arbitrum and its exit forwarder becomes the recipient.
+            // With options.arbitrum an empty ethereum_recipient counts as
+            // omitted: the CLI passes that argument as a string, so
+            // positionally "" is the only way to skip it.
+            const bool arbitrum{request.params[2].isObject() &&
+                                request.params[2].exists("arbitrum")};
+            const bool recipient_omitted{
+                request.params[1].isNull() ||
+                (arbitrum && request.params[1].isStr() &&
+                 request.params[1].get_str().empty())};
+            if (arbitrum && !recipient_omitted) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "ethereum_recipient and options.arbitrum are mutually exclusive: route (d3) pays its exit forwarder");
+            }
+            if (!arbitrum && recipient_omitted) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "ethereum_recipient is required unless options.arbitrum is given");
+            }
+            bridge::EthAddress ethereum_recipient{};
+            if (!arbitrum) {
+                ethereum_recipient = ParseEthereumRecipient(request.params[1]);
+            }
             const std::shared_ptr<CWallet> wallet{
                 GetWalletForJSONRPCRequest(request)};
             if (!wallet) return UniValue::VNULL;
             wallet->BlockUntilSyncedToCurrentChain();
-            const AssetRpcOptions options{
-                ParseAssetRpcOptions(request.params[2])};
+            const AssetRpcOptions options{ParseAssetRpcOptions(
+                request.params[2], /*flowmesh_seat=*/false,
+                /*flowmesh_deposit=*/false, /*asset_burn=*/false,
+                /*bridge_withdraw=*/true)};
             const ChainSnapshot snapshot{SnapshotChainState(*wallet, false)};
+            // Route (d3) needs a pinned exit forwarder and V2 burn rules for
+            // the next block; refused before anything else is read.
+            if (arbitrum) {
+                if (const auto reason{modern::ExitForwarderRouteUnavailableReasonV2(
+                        Params().GetConsensus(), snapshot.next_height)}) {
+                    throw JSONRPCError(RPC_MISC_ERROR, std::string{*reason});
+                }
+            }
             // Bridge V2 rides on the V1 bridge tracker and gates (V >= A3).
             const Consensus::BridgeAssetParams& bridge_params{
                 RequireBridgeForNextBlock(snapshot.next_height)};
@@ -2362,13 +3023,30 @@ RPCHelpMan bridgewithdraw()
                 throw JSONRPCError(RPC_MISC_ERROR,
                                    "The active bridge identity is unavailable");
             }
-            // A V2 burn reuses the kind 6 BRIDGE_BURN record layout.
+            // Route (d3) exists only under bridge V2 (W2 reached, checked
+            // above) with a pinned exit forwarder; its F_x is the burn's
+            // recipient. Under V2 neither route may pay a bridge V2 contract
+            // (OI-6).
+            std::optional<ArbitrumExitRoute> exit_route;
+            if (arbitrum) {
+                CHECK_NONFATAL(bridge_v2);
+                exit_route = ParseArbitrumExitRoute(
+                    params, request.params[2]["arbitrum"],
+                    static_cast<uint64_t>(amount));
+                ethereum_recipient = exit_route->account;
+            } else if (bridge_v2) {
+                RequireUnreservedBridgeV2Address(
+                    *params.bridge_v2, ethereum_recipient, "ethereum_recipient");
+            }
+            // A V2 burn reuses the kind 6 BRIDGE_BURN record layout; a route
+            // (d3) burn appends its exit block (V2 record set).
             const auto record{BuildBridgeWithdrawalMpaRecord(
                 bridge_v2 ? Consensus::BridgeWithdrawalMode::
                                 DECENTRALIZED_VERIFIER_V1
                           : withdrawal_mode,
                 *registry, /*burn_output_index=*/0,
-                static_cast<uint64_t>(amount), ethereum_recipient)};
+                static_cast<uint64_t>(amount), ethereum_recipient,
+                exit_route ? std::optional{exit_route->params} : std::nullopt)};
             if (!record) {
                 throw JSONRPCError(RPC_INTERNAL_ERROR,
                                    "Unable to encode the withdrawal record");
@@ -2506,6 +3184,16 @@ RPCHelpMan bridgewithdraw()
             result.pushKV("amount", amount);
             result.pushKV("asset_change", asset_change);
             result.pushKV("ethereum_recipient", HexStr(ethereum_recipient));
+            result.pushKV("route", exit_route ? "arbitrum" : "ethereum");
+            if (exit_route) {
+                UniValue exit_json{UniValue::VOBJ};
+                exit_json.pushKV("params", ExitForwarderParamsJson(exit_route->params));
+                exit_json.pushKV("recipient", "0x" + HexStr(exit_route->recipient));
+                exit_json.pushKV("factory", "0x" + HexStr(params.bridge_v2->exit_forwarder->factory));
+                exit_json.pushKV("account", "0x" + HexStr(exit_route->account));
+                exit_json.pushKV("salt", "0x" + HexStr(exit_route->salt));
+                result.pushKV("exit", std::move(exit_json));
+            }
             result.pushKV("burn_vout", 0);
             result.pushKV("binding_vout", 1);
             result.pushKV("withdrawal_mode",

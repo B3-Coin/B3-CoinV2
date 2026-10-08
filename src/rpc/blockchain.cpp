@@ -8,6 +8,7 @@
 #include <blockfilter.h>
 #include <bridge/ethereum_calldata.h>
 #include <bridge/lc_json.h>
+#include <bridge/proof.h>
 #include <bridge/withdrawal_v2_calldata.h>
 #include <chain.h>
 #include <chainparams.h>
@@ -32,6 +33,7 @@
 #include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
+#include <modern/bridge_forwarder.h>
 #include <modern/bridge_v2.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
@@ -6415,7 +6417,8 @@ static RPCHelpMan getbridgev2info()
         "the eth_getProof plan for the next observations (buildbridgeobservationv2). A pinned B-23\n"
         "successor vault entry (node changes section 7.6) adds retired, deposit_vault and successor:\n"
         "from its migration height the launch entry is retired and the successor takes deposits and\n"
-        "burns, and kind 16 VAULT_SWEEP records move the launch entry's reserve to it. Configured only by\n"
+        "burns, and kind 16 VAULT_SWEEP records move the launch entry's reserve to it. Pinned route (b)\n"
+        "and (d3) forwarder factories (contracts spec sections 7 and 8) add forwarders. Configured only by\n"
         "the regtest-only -b3bridgepins v2 section (every other chain returns an error); getbridgeinfo\n"
         "keeps reporting the V1 bridge.\n"
         "Ethereum-facing values are 0x-prefixed EVM-order bytes; B3 ids and block hashes without an _evm\n"
@@ -6453,6 +6456,20 @@ static RPCHelpMan getbridgev2info()
                       {RPCResult::Type::STR_HEX, "vault_entry_id", /*optional=*/true, "Vault entry id (display order): the registry_id that kind 3 mint and kind 6 burn records name"},
                       {RPCResult::Type::STR_HEX, "vault_entry_id_evm", /*optional=*/true, "Raw vault entry id bytes as carried by the records"},
                       {RPCResult::Type::STR_HEX, "registry_id_evm", /*optional=*/true, "Raw registry id V2 bytes (approval identity over every pin but V and W2; records never name it)"},
+                      {RPCResult::Type::OBJ, "forwarders", /*optional=*/true, "Route (b) and (d3) forwarder factory pins (contracts spec sections 7 and 8), present only when the envelope pins one; each enters registry_id_evm. A forwarder account is the CREATE2 address of B3Forwarder under its factory, so wallets derive it offline from these pins",
+                       {
+                           {RPCResult::Type::OBJ, "deposit", /*optional=*/true, "Deposit forwarder F_d factory (route b): derivation only, never a mint condition",
+                            {
+                                {RPCResult::Type::STR_HEX, "factory", "B3DepositForwarderFactory address"},
+                                {RPCResult::Type::STR_HEX, "init_code_hash", "Its FORWARDER_INIT_CODE_HASH, keccak256 of the B3Forwarder creation code (raw bytes)"},
+                            }},
+                           {RPCResult::Type::OBJ, "exit", /*optional=*/true, "Exit forwarder F_x factory (route d3): a burn's exit block must name an F_x under it",
+                            {
+                                {RPCResult::Type::STR_HEX, "factory", "B3OftExitFactory address"},
+                                {RPCResult::Type::STR_HEX, "init_code_hash", "Its FORWARDER_INIT_CODE_HASH, keccak256 of the B3Forwarder creation code (raw bytes)"},
+                                {RPCResult::Type::NUM, "dst_eid", "Its DST_EID: the LayerZero destination endpoint id every exit block names"},
+                            }},
+                       }},
                       {RPCResult::Type::ARR, "unpinned", "Pins this envelope leaves unset (OI-3)",
                        {{RPCResult::Type::STR, "", "Pin name"}}},
                       {RPCResult::Type::STR, "unpinned_note", "Why those pins are unset"},
@@ -6469,6 +6486,10 @@ static RPCHelpMan getbridgev2info()
                            {RPCResult::Type::STR_HEX, "finalized_beacon_root", /*optional=*/true, "SSZ root of the latest finalized beacon header"},
                            {RPCResult::Type::NUM, "finalized_execution_block", /*optional=*/true, "Latest finalized Ethereum execution block"},
                            {RPCResult::Type::STR_HEX, "finalized_execution_hash", /*optional=*/true, "Latest finalized Ethereum execution hash"},
+                           {RPCResult::Type::NUM, "finalized_execution_timestamp", /*optional=*/true, "Unix timestamp of the latest finalized Ethereum execution block"},
+                           {RPCResult::Type::NUM, "stale_after", /*optional=*/true, "finalized_execution_timestamp + max_sync_lag_slots x 12: from a candidate time beyond it the mint rules refuse mints and kind 9 observations as stale until a light-client update connects"},
+                           {RPCResult::Type::BOOL, "fresh", /*optional=*/true, "Whether the mempool's candidate time max(now, median time past + 1) is at most stale_after"},
+                           {RPCResult::Type::NUM, "horizon_time", /*optional=*/true, "Estimated Unix time at which the pinned fork schedule ends (the first slot after fork_schedule_valid_through_epoch, extrapolated from the finalized head at 12 seconds per slot; untimed on a regtest synthetic beacon). Mints stop beyond it until an extension hard fork; wallets refuse route (b) forwarders within 7 days of it and end their not_after 24 hours before it (node changes section 12.3)"},
                            {RPCResult::Type::NUM, "connected_height", /*optional=*/true, "B3 height of the latest V2 store change"},
                            {RPCResult::Type::STR_HEX, "connected_block", /*optional=*/true, "B3 block of the latest V2 store change"},
                            {RPCResult::Type::NUM, "anchors", "Retained V2 execution anchors"},
@@ -6476,6 +6497,7 @@ static RPCHelpMan getbridgev2info()
                       {RPCResult::Type::NUM, "nullifiers", "Deposits minted as bUSD V2 (nullifier namespace 2)"},
                       {RPCResult::Type::NUM, "mint_epoch", /*optional=*/true, "V2 mint-cap epoch of the next block, (next_height - V) / epoch_length_blocks"},
                       {RPCResult::Type::NUM, "epoch_minted", /*optional=*/true, "Raw bUSD V2 minted in mint_epoch so far"},
+                      {RPCResult::Type::NUM, "epoch_mint_headroom", /*optional=*/true, "max_per_epoch - epoch_minted: the largest mint mint_epoch still admits (a single mint is also bounded by max_per_block); relayers refuse a flush above it"},
                       {RPCResult::Type::NUM, "withdrawals", "Confirmed V2 burns (leaves V2 appended)"},
                       {RPCResult::Type::STR_HEX, "withdrawal_root_evm", /*optional=*/true, "V2 withdrawal-tree root at the active tip"},
                       {RPCResult::Type::STR_HEX, "empty_withdrawal_root_evm", "Root of the empty depth-32 tree (non-zero; signed from V until the first burn)"},
@@ -6605,6 +6627,26 @@ static RPCHelpMan getbridgev2info()
             if (const auto registry_id{modern::ConfiguredBridgeV2RegistryId(consensus)}) {
                 result.pushKV("registry_id_evm", EvmHex(*registry_id));
             }
+            // Route (b) and (d3) factories. They are knowable before the
+            // first start (DeployV2 nonces n+4 and n+5), so they never join
+            // `unpinned`; an envelope without them omits the object.
+            if (v2.deposit_forwarder || v2.exit_forwarder) {
+                UniValue forwarders{UniValue::VOBJ};
+                if (v2.deposit_forwarder) {
+                    UniValue deposit{UniValue::VOBJ};
+                    deposit.pushKV("factory", EvmHex(v2.deposit_forwarder->factory));
+                    deposit.pushKV("init_code_hash", EvmHex(v2.deposit_forwarder->init_code_hash));
+                    forwarders.pushKV("deposit", std::move(deposit));
+                }
+                if (v2.exit_forwarder) {
+                    UniValue exit_pins{UniValue::VOBJ};
+                    exit_pins.pushKV("factory", EvmHex(v2.exit_forwarder->factory));
+                    exit_pins.pushKV("init_code_hash", EvmHex(v2.exit_forwarder->init_code_hash));
+                    exit_pins.pushKV("dst_eid", v2.exit_forwarder->dst_eid);
+                    forwarders.pushKV("exit", std::move(exit_pins));
+                }
+                result.pushKV("forwarders", std::move(forwarders));
+            }
             UniValue unpinned{UniValue::VARR};
             if (!entry.vault_runtime_code_hash) unpinned.push_back("vault_runtime_code_hash");
             if (!v2.verifier.runtime_code_hash) unpinned.push_back("verifier_runtime_code_hash");
@@ -6662,6 +6704,26 @@ static RPCHelpMan getbridgev2info()
                 light.pushKV("finalized_beacon_root", EvmHex(finalized.beacon.HashTreeRoot()));
                 light.pushKV("finalized_execution_block", finalized.execution.block_number);
                 light.pushKV("finalized_execution_hash", EvmHex(finalized.execution.block_hash));
+                // The mint rules' freshness bound (FinalizedHeadFresh, which
+                // admits no lag at all when max_sync_lag_slots x 12 overflows)
+                // and the wallets' horizon estimate
+                // (modern::BridgeV2LightClientHorizonTime).
+                const uint64_t finalized_time{finalized.execution.timestamp};
+                const uint64_t lag_slots{v2.light_client.max_sync_lag_slots};
+                const uint64_t lag_seconds{
+                    lag_slots > std::numeric_limits<uint64_t>::max() / modern::BRIDGE_ETHEREUM_SECONDS_PER_SLOT
+                        ? 0
+                        : lag_slots * modern::BRIDGE_ETHEREUM_SECONDS_PER_SLOT};
+                const uint64_t stale_after{finalized_time > std::numeric_limits<uint64_t>::max() - lag_seconds
+                                               ? std::numeric_limits<uint64_t>::max()
+                                               : finalized_time + lag_seconds};
+                const int64_t candidate_time{tip ? std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1) : 0};
+                light.pushKV("finalized_execution_timestamp", finalized_time);
+                light.pushKV("stale_after", stale_after);
+                light.pushKV("fresh", candidate_time >= 0 && static_cast<uint64_t>(candidate_time) <= stale_after);
+                light.pushKV("horizon_time", modern::BridgeV2LightClientHorizonTime(
+                                                 v2.light_client.fork_schedule_valid_through_epoch,
+                                                 finalized.beacon.slot, finalized_time));
                 if (const auto& connection{index->LightClientV2LastConnected()}) {
                     light.pushKV("connected_height", connection->height);
                     light.pushKV("connected_block", connection->block_hash.GetHex());
@@ -6676,8 +6738,10 @@ static RPCHelpMan getbridgev2info()
             if (index && active && asset && entry.mint_caps.epoch_length_blocks > 0) {
                 const uint64_t epoch{static_cast<uint64_t>(next_height - v2.activation_height) /
                                      entry.mint_caps.epoch_length_blocks};
+                const CAmount minted{index->EpochMinted(*asset, epoch)};
                 result.pushKV("mint_epoch", epoch);
-                result.pushKV("epoch_minted", index->EpochMinted(*asset, epoch));
+                result.pushKV("epoch_minted", minted);
+                result.pushKV("epoch_mint_headroom", std::max<CAmount>(0, entry.mint_caps.max_per_epoch - minted));
             }
             result.pushKV("withdrawals", index ? static_cast<uint64_t>(index->WithdrawalV2Count()) : 0);
             if (index) result.pushKV("withdrawal_root_evm", EvmHex(index->WithdrawalTreeV2().root));
@@ -7003,6 +7067,135 @@ static RPCHelpMan buildbridgeobservationv2()
     };
 }
 
+//! RPC result fields of a stored route (d3) exit block (node changes section
+//! 7.2 item 5): ExitParams p, the pinned factory, F_x and its salt.
+static std::vector<RPCResult> BridgeExitParamsResultsV2()
+{
+    return {
+        {RPCResult::Type::NUM, "version", "Exit block version (1)"},
+        {RPCResult::Type::NUM, "dst_eid", "ExitParams.dstEid: LayerZero destination endpoint id, the pinned exit factory's DST_EID"},
+        {RPCResult::Type::STR_HEX, "to", "ExitParams.to: 32-byte destination address word (raw bytes)"},
+        {RPCResult::Type::NUM, "max_bridge_fee_bps", "ExitParams.maxBridgeFeeBps: OFT slippage bound in basis points (at most 50)"},
+        {RPCResult::Type::NUM, "fee_cap", "ExitParams.feeCap: largest relayer fee one forward may take (raw six-decimal units)"},
+        {RPCResult::Type::STR_HEX, "refund_eoa", "ExitParams.refundEOA: the only account that may withdraw an unforwarded balance on Ethereum"},
+        {RPCResult::Type::STR_HEX, "factory", "Pinned B3OftExitFactory address"},
+        {RPCResult::Type::STR_HEX, "account", "F_x = factory.accountOf(p), the leaf's recipient"},
+        {RPCResult::Type::STR_HEX, "salt", "exitSalt(p), the CREATE2 salt (raw bytes)"},
+    };
+}
+
+static UniValue BridgeExitParamsJsonV2(const Consensus::BridgeV2ExitForwarderPins& pins,
+                                       const modern::ExitForwarderParamsV2& p)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("version", modern::EXIT_FORWARDER_BLOCK_VERSION_V1);
+    out.pushKV("dst_eid", p.dst_eid);
+    out.pushKV("to", EvmHex(p.to));
+    out.pushKV("max_bridge_fee_bps", p.max_bridge_fee_bps);
+    out.pushKV("fee_cap", p.fee_cap);
+    out.pushKV("refund_eoa", EvmHex(p.refund_eoa));
+    out.pushKV("factory", EvmHex(pins.factory));
+    out.pushKV("account", EvmHex(modern::ExitForwarderAddressV2(pins, p)));
+    out.pushKV("salt", EvmHex(modern::ExitForwarderSaltV2(p)));
+    return out;
+}
+
+static RPCHelpMan getbridgewithdrawals()
+{
+    return RPCHelpMan{
+        "getbridgewithdrawals",
+        "List the confirmed bridge V2 withdrawals (leaves V2) of the active chain in withdrawal id order,\n"
+        "from from_id, at most count of them (node changes section 11.1). A route (d3) burn's exit block,\n"
+        "stored with its leaf, is returned as exit, so the exit parameters p of its exit forwarder F_x stay\n"
+        "recoverable without the burning wallet (C-7): refund_eoa can withdrawOnEthereum(p, ...) a balance\n"
+        "no forward sent. Prove a leaf with getbridgewithdrawalproofv2 (source_txid, burn_output_index).\n"
+        "Configured only by the regtest-only -b3bridgepins v2 section.\n",
+        {
+            {"from_id", RPCArg::Type::NUM, RPCArg::Default{0}, "First withdrawal id"},
+            {"count", RPCArg::Type::NUM, RPCArg::Default{100}, "Most withdrawals returned, 1 to 1000"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Bridge V2 withdrawals",
+                  {
+                      {RPCResult::Type::NUM, "withdrawals_total", "Confirmed V2 withdrawals on the active chain"},
+                      {RPCResult::Type::ARR, "withdrawals", "From from_id, in id order",
+                       {
+                           {RPCResult::Type::OBJ, "", "",
+                            {
+                                {RPCResult::Type::NUM, "withdrawal_id", "Leaf V2 id"},
+                                {RPCResult::Type::STR_HEX, "source_txid", "Burn transaction id (a sweep: its carrier)"},
+                                {RPCResult::Type::NUM, "burn_output_index", "Burn output index (a sweep: the carrier's binding output)"},
+                                {RPCResult::Type::NUM, "b3_height", "B3 height of the leaf"},
+                                {RPCResult::Type::STR_HEX, "b3_block", "B3 block that connected the leaf"},
+                                {RPCResult::Type::STR, "entry", "Vault entry whose ledger counts the leaf: launch or successor"},
+                                {RPCResult::Type::BOOL, "sweep", "Whether the leaf is a kind 16 vault sweep"},
+                                {RPCResult::Type::STR_HEX, "vault", "Vault the leaf names"},
+                                {RPCResult::Type::STR_HEX, "token", "Origin token"},
+                                {RPCResult::Type::STR_HEX, "recipient", "Ethereum recipient (route d3: F_x)"},
+                                {RPCResult::Type::NUM, "amount_raw", "Raw six-decimal token amount"},
+                                {RPCResult::Type::STR_HEX, "withdrawal_leaf", "keccak256 of the 180-byte leaf V2 preimage"},
+                                {RPCResult::Type::OBJ, "exit", /*optional=*/true, "Route (d3) only: the burn's exit block", BridgeExitParamsResultsV2()},
+                            }},
+                       }},
+                  }},
+        RPCExamples{HelpExampleCli("getbridgewithdrawals", "") + HelpExampleCli("getbridgewithdrawals", "0 10") +
+                    HelpExampleRpc("getbridgewithdrawals", "0, 10")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const uint64_t from_id{request.params[0].isNull() ? 0 : request.params[0].getInt<uint64_t>()};
+            const int count{request.params[1].isNull() ? 100 : request.params[1].getInt<int>()};
+            if (count < 1 || count > 1000) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "count must be in the range [1, 1000]");
+            }
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            const Consensus::BridgeV2Params& v2{EnsureBridgeV2Configured(consensus)};
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
+            if (!tip || !tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Bridge state is unavailable at the active tip");
+            }
+            const node::BridgeStateIndex& index{tracker.Index()};
+            const uint64_t total{index.WithdrawalV2Count()};
+            UniValue withdrawals{UniValue::VARR};
+            for (uint64_t id{from_id}; id < total && id - from_id < static_cast<uint64_t>(count); ++id) {
+                const auto confirmed{index.WithdrawalV2(id)};
+                if (!confirmed) {
+                    throw JSONRPCError(RPC_MISC_ERROR, "Bridge V2 withdrawal ids are not contiguous");
+                }
+                const modern::BridgeWithdrawalV2& w{confirmed->withdrawal};
+                UniValue item{UniValue::VOBJ};
+                item.pushKV("withdrawal_id", w.withdrawal_id);
+                item.pushKV("source_txid", confirmed->transaction_id.GetHex());
+                item.pushKV("burn_output_index", confirmed->burn_output_index);
+                item.pushKV("b3_height", w.b3_height);
+                item.pushKV("b3_block", confirmed->connected_block.GetHex());
+                item.pushKV("entry", confirmed->entry == static_cast<uint8_t>(Consensus::BridgeV2EntryRole::SUCCESSOR)
+                                         ? "successor"
+                                         : "launch");
+                item.pushKV("sweep", confirmed->sweep);
+                item.pushKV("vault", EvmHex(w.vault));
+                item.pushKV("token", EvmHex(w.token));
+                item.pushKV("recipient", EvmHex(w.recipient));
+                item.pushKV("amount_raw", w.amount);
+                item.pushKV("withdrawal_leaf", EvmHex(confirmed->leaf));
+                if (confirmed->exit) {
+                    if (!v2.exit_forwarder) {
+                        throw JSONRPCError(RPC_MISC_ERROR, "A stored exit block has no pinned exit forwarder");
+                    }
+                    item.pushKV("exit", BridgeExitParamsJsonV2(*v2.exit_forwarder, *confirmed->exit));
+                }
+                withdrawals.push_back(std::move(item));
+            }
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("withdrawals_total", total);
+            result.pushKV("withdrawals", std::move(withdrawals));
+            return result;
+        },
+    };
+}
+
 static RPCHelpMan getbridgewithdrawalproofv2()
 {
     return RPCHelpMan{
@@ -7017,8 +7210,11 @@ static RPCHelpMan getbridgewithdrawalproofv2()
         "pays under any root the verifier accepted at or above b3_height, once per withdrawal id. Every\n"
         "leaf of the prefix, its active-chain connection and the root are recomputed. With a B-23\n"
         "successor (node changes section 7.6) a leaf names the launch vault or the successor vault, and a\n"
-        "kind 16 VAULT_SWEEP leaf names the launch vault and pays the successor vault. Configured only\n"
-        "by the regtest-only -b3bridgepins v2 section. This RPC handles no Ethereum private key; the\n"
+        "kind 16 VAULT_SWEEP leaf names the launch vault and pays the successor vault. A route (d3) burn's\n"
+        "exit block, stored with its leaf by the bridge index (no block is read), is returned as exit: the\n"
+        "leaf pays its exit forwarder F_x, which B3OftExitFactory.forward then sends through the OFT\n"
+        "adapter (B3RelayBatch.relayWithForwards releases and forwards in one call). Configured\n"
+        "only by the regtest-only -b3bridgepins v2 section. This RPC handles no Ethereum private key; the\n"
         "account that submits the calldata pays gas.\n",
         {
             {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
@@ -7045,6 +7241,8 @@ static RPCHelpMan getbridgewithdrawalproofv2()
                       {RPCResult::Type::STR_HEX, "recipient", "Ethereum recipient"},
                       {RPCResult::Type::NUM, "amount_raw", "Raw six-decimal token amount"},
                       {RPCResult::Type::BOOL, "sweep", /*optional=*/true, "With a pinned B-23 successor only: whether the leaf is a kind 16 vault sweep (it names the launch vault and pays the successor vault, which counts it once absorb() runs)"},
+                      {RPCResult::Type::OBJ, "exit", /*optional=*/true, "Only when the burn's kind 6 record carries a route (d3) exit block (node changes section 7.2 item 5): its ExitParams p, as the bridge index stores them with the leaf. The recipient is F_x = accountOf(p); forward it with B3OftExitFactory.forward(p, fee, feeRecipient, nativeRefundTo), fee <= fee_cap, or B3RelayBatch.relayWithForwards",
+                       BridgeExitParamsResultsV2()},
                       {RPCResult::Type::STR_HEX, "leaf_preimage", "The 180-byte leaf V2 preimage"},
                       {RPCResult::Type::STR_HEX, "withdrawal_leaf", "keccak256(leaf_preimage)"},
                       {RPCResult::Type::STR_HEX, "withdrawal_root", "V2 withdrawal root the certificate carries"},
@@ -7180,6 +7378,15 @@ static RPCHelpMan getbridgewithdrawalproofv2()
             const auto proof{bridge::BuildWithdrawalV2RelayArtifacts(withdrawals, withdrawal_id, *expected_root, error)};
             if (!proof) throw JSONRPCError(RPC_MISC_ERROR, error);
             const node::BridgeWithdrawalV2Request& burn{requests->at(withdrawal_id)};
+            // Route (d3): the exit block check 5 verified, stored with the
+            // leaf (consensus admits one only under a pinned exit forwarder).
+            const std::optional<modern::ExitForwarderParamsV2>& exit_params{burn.exit};
+            if (exit_params &&
+                (!v2.exit_forwarder ||
+                 modern::ExitForwarderAddressV2(*v2.exit_forwarder, *exit_params) != proof->withdrawal.recipient)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Burn exit forwarder does not match the withdrawal recipient");
+            }
 
             UniValue result{UniValue::VOBJ};
             result.pushKV("withdrawal_id", withdrawal_id);
@@ -7195,6 +7402,7 @@ static RPCHelpMan getbridgewithdrawalproofv2()
             result.pushKV("recipient", EvmHex(proof->withdrawal.recipient));
             result.pushKV("amount_raw", proof->withdrawal.amount);
             if (v2.successor) result.pushKV("sweep", burn.sweep);
+            if (exit_params) result.pushKV("exit", BridgeExitParamsJsonV2(*v2.exit_forwarder, *exit_params));
             result.pushKV("leaf_preimage", EvmHex(proof->leaf_preimage));
             result.pushKV("withdrawal_leaf", EvmHex(proof->leaf));
             result.pushKV("withdrawal_root", EvmHex(proof->root));
@@ -7354,6 +7562,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getbridgev2info},
         {"blockchain", &buildbridgeobservationv2},
         {"blockchain", &getbridgewithdrawalproofv2},
+        {"blockchain", &getbridgewithdrawals},
         {"hidden", &getfinalitylineagevotes},
         {"hidden", &submitfinalitylineagevote},
         {"hidden", &invalidateblock},

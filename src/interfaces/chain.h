@@ -532,6 +532,12 @@ enum class BridgePrevalidationResult {
     REJECTED,
 };
 
+//! The finalized head of the bridge V2 light client (Chain::bridgeV2LightClientHead).
+struct BridgeV2LightClientHead {
+    uint64_t finalized_slot{0};
+    uint64_t finalized_execution_timestamp{0};
+};
+
 //! Interface giving clients (wallet processes, maybe other analysis tools in
 //! the future) ability to access to the chain state, receive notifications,
 //! estimate fees, and submit transactions.
@@ -867,6 +873,15 @@ public:
     //! lineage context cannot be built. Wallets refuse deposit instructions
     //! unless VALID; B3 itself still mints every proven deposit.
     virtual BridgePrevalidationResult bridgeV2DepositStatus(std::string& error) = 0;
+
+    //! The bridge V2 light client's finalized head at the active tip, for
+    //! the wallets' horizon policy (node changes section 12.3): VALID with
+    //! `head` set to its beacon slot and execution timestamp, or VALID with
+    //! `head` unset while no kind 1 bootstrap has connected the V2 store;
+    //! RULES_INACTIVE unless bridge V2 rules are active for the next block;
+    //! STATE_UNAVAILABLE when the bridge index cannot be synced.
+    virtual BridgePrevalidationResult bridgeV2LightClientHead(
+        std::optional<BridgeV2LightClientHead>& head, std::string& error) = 0;
 
     //! Return true if an assumed-valid snapshot is in use. Note that this
     //! returns true even after the snapshot is validated, until the next node
