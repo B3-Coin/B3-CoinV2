@@ -3,6 +3,7 @@
 // file COPYING or https://opensource.org/license/mit/.
 
 #include <addresstype.h>
+#include <chainparams.h>
 #include <consensus/amount.h>
 #include <core_io.h>
 #include <interfaces/chain.h>
@@ -13,10 +14,12 @@
 #include <rpc/util.h>
 #include <script/script.h>
 #include <script/solver.h>
+#include <util/chaintype.h>
 #include <util/moneystr.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <wallet/coincontrol.h>
+#include <wallet/rpc/finality_fresh_key.h>
 #include <wallet/rpc/finality_recovery.h>
 #include <wallet/rpc/finality_recovery_status.h>
 #include <wallet/rpc/util.h>
@@ -33,6 +36,7 @@
 #include <univalue.h>
 
 #include <array>
+#include <map>
 #include <optional>
 #include <span>
 
@@ -513,6 +517,548 @@ RPCHelpMan revokefinalitykey()
             if (!identity) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(identity).original);
             return SubmitFinalityKeyTx(*pwallet, *identity, ctx.vk, /*bls_key=*/nullptr, ctx.status.binding_seq + 1,
                                        ctx.status.chain_domain, "revoke");
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// B-37 per-epoch fresh-lineage keys (bridge V2 stage S3, regtest-only knob
+// -b3freshkeyheight; b3-bridge-v2-finality-dependency.md section 6.4). The
+// wallet signs bindings with the validator identity; the BLS secrets live in
+// the node's fresh key store (wallet/rpc/finality_fresh_key.h).
+
+namespace {
+
+//! The chain's fresh key status for this wallet's validator (and the first
+//! claims of `probe_keys`); refuses unless fresh-key mode is configured and
+//! derivable at the tip.
+interfaces::FreshFinalityKeyStatus RequireFreshKeyStatus(CWallet& wallet, const std::array<unsigned char, 32>& vk,
+                                                         const std::vector<std::array<unsigned char, 48>>& probe_keys = {})
+{
+    interfaces::FreshFinalityKeyStatus status{wallet.chain().freshFinalityKeyStatus(vk, probe_keys)};
+    if (!status.configured) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Fresh-lineage per-epoch keys (B-37) are not configured on this chain "
+                                           "(regtest-only -b3freshkeyheight)");
+    }
+    if (status.chain_domain.IsNull()) {
+        throw JSONRPCError(RPC_MISC_ERROR, "The modern chain domain is not derivable (boundary unpinned)");
+    }
+    if (!status.available) {
+        throw JSONRPCError(RPC_MISC_ERROR, "The fresh key state is unavailable at the tip (finality state not derivable)");
+    }
+    return status;
+}
+
+//! The probed claim of `pk` in `status` (FreshFinalityKeyStatus::probe_claims).
+const interfaces::FreshFinalityKeyClaim* ProbedClaim(const interfaces::FreshFinalityKeyStatus& status,
+                                                     const modern::BlsPubkeyBytes& pk)
+{
+    for (const interfaces::FreshFinalityKeyClaim& claim : status.probe_claims) {
+        if (claim.bls_pubkey == pk) return &claim;
+    }
+    return nullptr;
+}
+
+//! The height at which `pk` was claimed first by a binding other than this
+//! validator's own fresh binding (so this validator's binding is inert).
+std::optional<int> ClaimedElsewhereAt(const interfaces::FreshFinalityKeyStatus& status,
+                                      const modern::BlsPubkeyBytes& pk)
+{
+    const interfaces::FreshFinalityKeyClaim* claim{ProbedClaim(status, pk)};
+    if (!claim || !claim->first_height || claim->own_epoch) return std::nullopt;
+    return claim->first_height;
+}
+
+//! "epoch:<n>" -> n.
+std::optional<uint64_t> ParseStoredKeyEpoch(const std::string& reuse_key)
+{
+    constexpr std::string_view prefix{"epoch:"};
+    if (reuse_key.size() <= prefix.size() || reuse_key.compare(0, prefix.size(), prefix) != 0) return std::nullopt;
+    return ToIntegral<uint64_t>(std::string_view{reuse_key}.substr(prefix.size()));
+}
+
+} // namespace
+
+RPCHelpMan bindfreshfinalitykey()
+{
+    return RPCHelpMan{
+        "bindfreshfinalitykey",
+        "Bind a fresh-lineage committee key for the next binding window (bridge V2 per-epoch keys, B-37;\n"
+        "regtest only: -b3freshkeyheight). The BLS key is generated from fresh randomness into this node's\n"
+        "fresh key store (<datadir>/<net>/finality_signer, outside the wallet file): no wallet backup holds it\n"
+        "or can re-derive it. The staking loop's finality signer signs fresh-lineage votes only with these keys\n"
+        "and erases each one once its committees are done and deep. The transaction carries a FINALITY_KEY\n"
+        "policy-version-2 cell and the MPA type-12 evidence (BIP340 identity authorization and BLS proof of\n"
+        "possession). The next block's window counts exactly one target epoch: 0 (the genesis binding, serving\n"
+        "Set'_0 and Set'_1) from R_key to R_f-1, then e+2 during fresh epoch e. Refused when this node's store\n"
+        "already holds a key for that epoch: two bindings of one validator for one epoch void its seat. A seat\n"
+        "also needs the validator's V1 FINALITY_KEY binding and active stake. A held key for that epoch is\n"
+        "replaced (erased first) only when it can never seat this validator anyway: no binding transaction was\n"
+        "ever recorded for it (so it was never published), or its key was claimed first by another binding (this\n"
+        "validator's binding of it is inert). Requires an unlocked wallet and an existing validator key.\n",
+        {
+            {"epoch", RPCArg::Type::NUM, RPCArg::DefaultHint{"the next binding window's epoch"},
+             "The target fresh epoch; any value other than the one the next block's window counts is refused"},
+            {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
+             {
+                 {"broadcast", RPCArg::Type::BOOL, RPCArg::Default{true},
+                  "Commit and broadcast the transaction; false returns the signed hex instead (a generated key stays "
+                  "in the store with this binding transaction recorded)"},
+                 {"reuse_key", RPCArg::Type::STR, RPCArg::Optional::OMITTED,
+                  "Regtest drills only, requires broadcast=false: bind an existing key instead of a new one, \"v1\" "
+                  "(this wallet's key of its V1 FINALITY_KEY binding) or \"epoch:<n>\" (the key this node's store "
+                  "holds for fresh epoch n). The mempool refuses either once that key is on chain "
+                  "(fresh-key-ever-bound)"},
+             }},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "",
+                  {
+                      {RPCResult::Type::STR_HEX, "txid", "the binding transaction"},
+                      {RPCResult::Type::STR_HEX, "ptxid", "its full-evidence identifier"},
+                      {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "the signed transaction (broadcast=false only)"},
+                      {RPCResult::Type::STR_HEX, "validator_key", "this wallet's x-only validator key"},
+                      {RPCResult::Type::NUM, "epoch", "the target fresh epoch"},
+                      {RPCResult::Type::STR_HEX, "bls_pubkey", "the fresh BLS public key being bound"},
+                      {RPCResult::Type::STR, "key_source", "generated (a new key in this node's fresh key store), v1 or stored (reuse_key drills)"},
+                      {RPCResult::Type::NUM, "window_start", "first height of the binding window that counts this epoch"},
+                      {RPCResult::Type::STR, "status", "UNCONFIRMED (in the local mempool), NOT_IN_MEMPOOL (committed to the wallet, refused by the local mempool for now) or NOT_BROADCAST"},
+                      {RPCResult::Type::ARR, "replaced", /*optional=*/true, "held keys for this epoch that were erased and replaced",
+                       {{RPCResult::Type::STR, "", "<bls_pubkey>: <why it could never seat this validator>"}}},
+                      {RPCResult::Type::ARR, "warnings", /*optional=*/true, "",
+                       {{RPCResult::Type::STR, "", "a condition the binding alone does not cure"}}},
+                  }},
+        RPCExamples{HelpExampleCli("bindfreshfinalitykey", "") +
+                    HelpExampleCli("-named bindfreshfinalitykey", "broadcast=false") +
+                    HelpExampleRpc("bindfreshfinalitykey", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+            if (!pwallet) return UniValue::VNULL;
+            pwallet->BlockUntilSyncedToCurrentChain();
+            LOCK(pwallet->cs_wallet);
+            EnsureWalletIsUnlocked(*pwallet);
+
+            bool broadcast{true};
+            std::optional<std::string> reuse_key;
+            if (!request.params[1].isNull()) {
+                const UniValue& options{request.params[1].get_obj()};
+                RPCTypeCheckObj(options,
+                                {
+                                    {"broadcast", UniValueType(UniValue::VBOOL)},
+                                    {"reuse_key", UniValueType(UniValue::VSTR)},
+                                },
+                                /*fAllowNull=*/true, /*fStrict=*/true);
+                if (options.exists("broadcast")) broadcast = options["broadcast"].get_bool();
+                if (options.exists("reuse_key")) reuse_key = options["reuse_key"].get_str();
+            }
+            if (reuse_key) {
+                if (Params().GetChainType() != ChainType::REGTEST) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "reuse_key is regtest-only");
+                }
+                if (broadcast) throw JSONRPCError(RPC_INVALID_PARAMETER, "reuse_key requires broadcast=false");
+            }
+
+            // Refuse before touching the wallet: on a chain without key mode
+            // (every shipped network) nothing is created or written, and a
+            // missing validator key is not created here (a seat needs a
+            // stake and a V1 binding made with it anyway).
+            const std::optional<CPubKey> validator{pwallet->GetValidatorPubKey()};
+            const std::array<unsigned char, 32> vk{validator ? XOnlyBytes(*validator) : std::array<unsigned char, 32>{}};
+            interfaces::FreshFinalityKeyStatus status{RequireFreshKeyStatus(*pwallet, vk)};
+            if (!validator) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                                   "This wallet has no validator key yet (createstake or startstaking creates one)");
+            }
+            const auto identity{pwallet->GetValidatorSecret()};
+            if (!identity) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(identity).original);
+            if (!status.next_binding_epoch || !status.window_start) {
+                const std::string why{status.next_binding_window == "not-active"
+                                          ? strprintf("fresh bindings start at height %d (R_key)", status.key_height.value_or(-1))
+                                          : std::string{"the fresh lineage is not bootstrapped or is broken"}};
+                throw JSONRPCError(RPC_MISC_ERROR, strprintf("No fresh binding window is open for the next block "
+                                                             "(height %d, %s): %s",
+                                                             status.tip_height + 1, status.next_binding_window, why));
+            }
+            const uint64_t epoch{*status.next_binding_epoch};
+            if (!request.params[0].isNull()) {
+                const int64_t requested{request.params[0].getInt<int64_t>()};
+                if (requested < 0 || static_cast<uint64_t>(requested) != epoch) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                       strprintf("epoch %d is not the next binding window: a binding included in the "
+                                                 "next block (height %d) counts only for fresh epoch %u",
+                                                 requested, status.tip_height + 1, epoch));
+                }
+            }
+
+            // The key: a new one in the fresh key store, or (drills) an existing one.
+            node::FreshKeyStore store;
+            std::optional<bls::SecretKey> key;
+            std::string key_source;
+            std::vector<std::string> replaced;
+            if (!reuse_key) {
+                // A held key for this epoch blocks a new one (two bindings
+                // void the seat) unless it can never seat this validator:
+                // never published (no binding transaction was recorded: this
+                // RPC records it before anything leaves the node), or its key
+                // was claimed first elsewhere (this validator's binding of it
+                // is inert, and only a holder of its secret could have made
+                // that claim). Probe the chain for the held keys' claims.
+                std::vector<std::array<unsigned char, 48>> held_keys;
+                {
+                    node::FreshKeyStore probe;
+                    std::string error;
+                    if (probe.Open(status.signer_directory, status.chain_domain, vk, error)) {
+                        for (const node::FreshKeyRecord& record : probe.Records()) {
+                            if (record.Held() && record.target_epoch == epoch) held_keys.push_back(record.bls_pubkey);
+                        }
+                    }
+                }
+                if (!held_keys.empty()) {
+                    status = RequireFreshKeyStatus(*pwallet, vk, held_keys);
+                    if (status.next_binding_epoch != epoch) {
+                        throw JSONRPCError(RPC_MISC_ERROR, "The binding window moved while this call ran; retry");
+                    }
+                }
+                const FreshKeyReplacePolicy replace{[&status](const node::FreshKeyRecord& record) -> std::optional<std::string> {
+                    if (record.bind_txid.IsNull()) {
+                        return std::string{"no binding transaction was ever recorded for it, so it was never published"};
+                    }
+                    if (const auto height{ClaimedElsewhereAt(status, record.bls_pubkey)}) {
+                        return strprintf("its key was claimed first by another binding at height %d, so binding "
+                                         "transaction %s can never seat this validator",
+                                         *height, record.bind_txid.GetHex());
+                    }
+                    return std::nullopt;
+                }};
+                auto generated{GenerateFreshFinalityKey(store, status.signer_directory, status.chain_domain, vk, epoch,
+                                                        replace, &replaced)};
+                if (!generated) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(generated).original);
+                for (const std::string& line : replaced) {
+                    pwallet->WalletLogPrintf("bindfreshfinalitykey: replaced fresh key %s\n", line);
+                }
+                key = std::move(*generated);
+                key_source = "generated";
+            } else if (*reuse_key == "v1") {
+                const interfaces::FinalityStatus v1{pwallet->chain().finalityStatus(vk)};
+                if (!v1.bound || v1.revoked) {
+                    throw JSONRPCError(RPC_MISC_ERROR, "This validator has no active V1 FINALITY_KEY binding to reuse");
+                }
+                auto resolved{pwallet->ResolveFinalityBlsKey(v1.binding_seq, &v1.binding_bls_pubkey)};
+                if (!resolved) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(resolved).original);
+                key = std::move(*resolved);
+                key_source = "v1";
+            } else if (const auto stored_epoch{ParseStoredKeyEpoch(*reuse_key)}) {
+                std::string error;
+                if (!store.Open(status.signer_directory, status.chain_domain, vk, error)) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, strprintf("cannot open the fresh key store: %s", error));
+                }
+                for (const node::FreshKeyRecord& record : store.Records()) {
+                    if (record.target_epoch != *stored_epoch || !record.Held()) continue;
+                    key = store.SecretFor(record.bls_pubkey);
+                    if (key) break;
+                }
+                if (!key) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                       strprintf("this node's fresh key store holds no key for fresh epoch %u",
+                                                 *stored_epoch));
+                }
+                key_source = "stored";
+            } else {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "reuse_key must be \"v1\" or \"epoch:<n>\"");
+            }
+            const modern::BlsPubkeyBytes pubkey{key->GetPublicKey().Compressed()};
+            // A generated key that never reaches a transaction is useless:
+            // erase it, so that a retry may generate another for this epoch.
+            // A signer pass may have rewritten the store meanwhile: reopen
+            // once and retry. If it still fails, the key stays HELD without a
+            // binding transaction, which the next call replaces anyway.
+            const auto erase_unused{[&] {
+                std::string error;
+                if (key_source != "generated" || store.Erase(pubkey, error)) return;
+                if (store.Open(status.signer_directory, status.chain_domain, vk, error) && store.Erase(pubkey, error)) {
+                    return;
+                }
+                pwallet->WalletLogPrintf("bindfreshfinalitykey: cannot erase unused fresh key %s: %s\n",
+                                         HexStr(pubkey), error);
+            }};
+
+            auto parts{MakeFreshFinalityKeyBinding(*identity, status.chain_domain, *key, epoch)};
+            if (!parts) {
+                erase_unused();
+                throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(parts).original);
+            }
+            // As for V1 bindings: the MPA evidence sits outside the txid but
+            // must be present while funding so its verification-cost vsize is paid.
+            std::vector<CRecipient> recipients{{CNoDestination{parts->cell}, 0, /*fSubtractFeeFromAmount=*/false}};
+            CCoinControl coin_control;
+            const ModernTransactionOptions modern_options{
+                .mpa = {parts->record},
+                .native_disintegration = 0};
+            auto res{CreateTransaction(*pwallet, recipients, /*change_pos=*/std::nullopt, coin_control, /*sign=*/true,
+                                       modern_options)};
+            if (!res) {
+                erase_unused();
+                throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
+            }
+            const CTransactionRef tx{res->tx};
+
+            UniValue warnings{UniValue::VARR};
+            if (key_source == "generated") {
+                // Recorded before anything is public (broadcast or hex), so a
+                // held key without a binding transaction was never published
+                // and may be replaced. A signer pass may have rewritten the
+                // store meanwhile: reopen once and retry; otherwise publish
+                // nothing.
+                std::string error;
+                const uint256 txid{tx->GetHash().ToUint256()};
+                if (!store.SetBindTxid(pubkey, txid, error) &&
+                    !(store.Open(status.signer_directory, status.chain_domain, vk, error) &&
+                      store.SetBindTxid(pubkey, txid, error))) {
+                    const std::string record_error{error};
+                    erase_unused();
+                    throw JSONRPCError(RPC_WALLET_ERROR,
+                                       strprintf("cannot record the binding transaction in the fresh key store (%s); "
+                                                 "nothing was broadcast",
+                                                 record_error));
+                }
+            }
+            {
+                const interfaces::FinalityStatus v1{pwallet->chain().finalityStatus(vk)};
+                if (!v1.bound || v1.revoked) {
+                    warnings.push_back("this validator has no active V1 FINALITY_KEY binding: a fresh binding seats "
+                                       "it only together with one (bindfinalitykey) and active stake");
+                }
+            }
+
+            UniValue obj(UniValue::VOBJ);
+            obj.pushKV("txid", tx->GetHash().GetHex());
+            obj.pushKV("ptxid", tx->GetPtxid().GetHex());
+            std::string tx_status{"NOT_BROADCAST"};
+            if (broadcast) {
+                pwallet->CommitTransaction(tx, {{"b3", "fresh-finality-key"}}, /*orderForm=*/{});
+                tx_status = pwallet->chain().isInMempool(tx->GetHash()) ? "UNCONFIRMED" : "NOT_IN_MEMPOOL";
+            } else {
+                obj.pushKV("hex", EncodeHexTx(*tx));
+            }
+            obj.pushKV("validator_key", HexStr(vk));
+            obj.pushKV("epoch", epoch);
+            obj.pushKV("bls_pubkey", HexStr(pubkey));
+            obj.pushKV("key_source", key_source);
+            obj.pushKV("window_start", *status.window_start);
+            obj.pushKV("status", tx_status);
+            if (!replaced.empty()) {
+                UniValue replaced_arr{UniValue::VARR};
+                for (const std::string& line : replaced) replaced_arr.push_back(line);
+                obj.pushKV("replaced", std::move(replaced_arr));
+            }
+            if (!warnings.empty()) obj.pushKV("warnings", std::move(warnings));
+            return obj;
+        },
+    };
+}
+
+RPCHelpMan getfreshfinalitykeys()
+{
+    const std::vector<RPCResult> binding_doc{
+        {RPCResult::Type::NUM, "epoch", "target fresh epoch"},
+        {RPCResult::Type::STR_HEX, "bls_pubkey", "the bound BLS public key"},
+        {RPCResult::Type::NUM, "height", "including block"},
+        {RPCResult::Type::BOOL, "counted", "included inside the window that counts its epoch"},
+        {RPCResult::Type::BOOL, "void", "two or more counted bindings of this validator name this epoch: no seat"},
+    };
+    return RPCHelpMan{
+        "getfreshfinalitykeys",
+        "This wallet validator's fresh-lineage per-epoch keys (bridge V2 B-37; regtest -b3freshkeyheight): the\n"
+        "records of this node's fresh key store (public data only; a secret never leaves the store) joined with\n"
+        "the chain's fresh bindings and committees, the chain bindings of this validator that the store does not\n"
+        "hold, committee seats without a held key, and alerts. A binding the store does not hold means someone\n"
+        "else holds this validator's identity key (an old wallet backup, or a leak). Returns only\n"
+        "configured=false without the knob.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "",
+                  {
+                      {RPCResult::Type::BOOL, "configured", "Whether fresh-lineage per-epoch keys are configured on this chain"},
+                      {RPCResult::Type::STR_HEX, "validator_key", /*optional=*/true, "this wallet's x-only validator key"},
+                      {RPCResult::Type::NUM, "key_height", /*optional=*/true, "R_key, the first height that accepts a fresh binding"},
+                      {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "R_f, the fresh lineage's first block"},
+                      {RPCResult::Type::STR_HEX, "chain_domain", /*optional=*/true, "the modern chain domain"},
+                      {RPCResult::Type::NUM, "tip_height", /*optional=*/true, "active tip height"},
+                      {RPCResult::Type::BOOL, "state_available", /*optional=*/true, "whether the fresh key state is derivable at the tip"},
+                      {RPCResult::Type::STR, "next_binding_window", /*optional=*/true, "open, not-active (below R_key) or lineage-unavailable: the next block's binding window"},
+                      {RPCResult::Type::NUM, "next_binding_epoch", /*optional=*/true, "the target epoch a binding in the next block counts for"},
+                      {RPCResult::Type::NUM, "window_start", /*optional=*/true, "first height of that window"},
+                      {RPCResult::Type::BOOL, "bootstrapped", /*optional=*/true, "whether the fresh lineage exists at the tip"},
+                      {RPCResult::Type::NUM, "epoch", /*optional=*/true, "current fresh epoch"},
+                      {RPCResult::Type::BOOL, "lineage_broken", /*optional=*/true, "whether the fresh lineage broke for good"},
+                      {RPCResult::Type::STR, "store_path", /*optional=*/true, "this validator's fresh key store file"},
+                      {RPCResult::Type::STR, "store_error", /*optional=*/true, "why the fresh key store cannot be read"},
+                      {RPCResult::Type::ARR, "keys", /*optional=*/true, "the store's keys, in creation order",
+                       {{RPCResult::Type::OBJ, "", "",
+                         {
+                             {RPCResult::Type::NUM, "epoch", "target fresh epoch"},
+                             {RPCResult::Type::STR_HEX, "bls_pubkey", "BLS public key"},
+                             {RPCResult::Type::STR, "state", "held, or erased (the secret is gone for good)"},
+                             {RPCResult::Type::STR_HEX, "bind_txid", /*optional=*/true, "the binding transaction recorded by bindfreshfinalitykey"},
+                             {RPCResult::Type::NUM, "confirmations", /*optional=*/true, "confirmations of that transaction (when this wallet has it)"},
+                             {RPCResult::Type::NUM, "binding_height", /*optional=*/true, "height of the chain binding of this key (target epoch >= epoch-2)"},
+                             {RPCResult::Type::BOOL, "counted", /*optional=*/true, "that binding is inside its window"},
+                             {RPCResult::Type::BOOL, "void", /*optional=*/true, "another counted binding of this validator names the same epoch"},
+                             {RPCResult::Type::NUM, "claimed_elsewhere_height", /*optional=*/true, "the key was claimed first by another binding (another validator's, or a V1 FINALITY_KEY binding) at this height: this validator's binding of it is inert"},
+                             {RPCResult::Type::ARR, "seated_epochs", "retained committees (epoch-1 .. epoch+1) that seat this validator on this key",
+                              {{RPCResult::Type::NUM, "", "fresh epoch"}}},
+                         }}}},
+                      {RPCResult::Type::ARR, "foreign_bindings", /*optional=*/true, "chain bindings of this validator (target epoch >= epoch-2) whose key the store does not hold",
+                       {{RPCResult::Type::OBJ, "", "", binding_doc}}},
+                      {RPCResult::Type::ARR, "missing_seats", /*optional=*/true, "seats of this validator in Set'_{epoch-1}, Set'_epoch and Set'_{epoch+1} whose key the store does not hold (a Set'_{epoch-1} key erased by policy is not missing)",
+                       {{RPCResult::Type::OBJ, "", "",
+                         {
+                             {RPCResult::Type::NUM, "epoch", "fresh epoch of the committee"},
+                             {RPCResult::Type::STR_HEX, "bls_pubkey", "the seated key"},
+                         }}}},
+                      {RPCResult::Type::ARR, "alerts", /*optional=*/true, "",
+                       {{RPCResult::Type::STR, "", "a foreign binding, a void seat, a store key claimed first elsewhere or an unreadable store"}}},
+                  }},
+        RPCExamples{HelpExampleCli("getfreshfinalitykeys", "") + HelpExampleRpc("getfreshfinalitykeys", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+            if (!pwallet) return UniValue::VNULL;
+            pwallet->BlockUntilSyncedToCurrentChain();
+            LOCK(pwallet->cs_wallet);
+            const auto validator{pwallet->GetValidatorPubKey()};
+            if (!validator) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                                   "This wallet has no validator key yet (createstake or startstaking creates one)");
+            }
+            const std::array<unsigned char, 32> vk{XOnlyBytes(*validator)};
+            interfaces::FreshFinalityKeyStatus status{pwallet->chain().freshFinalityKeyStatus(vk, {})};
+            UniValue obj(UniValue::VOBJ);
+            obj.pushKV("configured", status.configured);
+            if (!status.configured) return obj;
+            // The store first (public records only), then the chain view once
+            // more with the store's keys probed for a first claim elsewhere.
+            std::vector<node::FreshKeyRecord> records;
+            std::string store_error;
+            if (status.chain_domain.IsNull()) {
+                store_error = "the modern chain domain is not derivable";
+            } else {
+                node::FreshKeyStore store;
+                if (store.Open(status.signer_directory, status.chain_domain, vk, store_error)) records = store.Records();
+            }
+            if (!records.empty()) {
+                std::vector<std::array<unsigned char, 48>> probe;
+                for (const node::FreshKeyRecord& record : records) probe.push_back(record.bls_pubkey);
+                status = pwallet->chain().freshFinalityKeyStatus(vk, probe);
+            }
+            obj.pushKV("validator_key", HexStr(vk));
+            if (status.key_height) obj.pushKV("key_height", *status.key_height);
+            obj.pushKV("activation_height", status.activation_height);
+            if (!status.chain_domain.IsNull()) obj.pushKV("chain_domain", status.chain_domain.GetHex());
+            obj.pushKV("tip_height", status.tip_height);
+            obj.pushKV("state_available", status.available);
+            obj.pushKV("next_binding_window", status.next_binding_window);
+            if (status.next_binding_epoch) obj.pushKV("next_binding_epoch", *status.next_binding_epoch);
+            if (status.window_start) obj.pushKV("window_start", *status.window_start);
+            obj.pushKV("bootstrapped", status.bootstrapped);
+            if (status.bootstrapped) {
+                obj.pushKV("epoch", status.epoch);
+                obj.pushKV("lineage_broken", status.broken);
+            }
+
+            if (!status.chain_domain.IsNull()) {
+                obj.pushKV("store_path", fs::PathToString(node::FreshKeyStore::StatePath(
+                                             status.signer_directory, status.chain_domain, vk)));
+            }
+            UniValue alerts{UniValue::VARR};
+            if (!store_error.empty()) {
+                obj.pushKV("store_error", store_error);
+                alerts.push_back(strprintf("cannot read the fresh key store: %s", store_error));
+            }
+            const auto record_of{[&records](const modern::BlsPubkeyBytes& pk) -> const node::FreshKeyRecord* {
+                for (const node::FreshKeyRecord& record : records) {
+                    if (record.bls_pubkey == pk) return &record;
+                }
+                return nullptr;
+            }};
+            const auto binding_of{[&status](const modern::BlsPubkeyBytes& pk) -> const interfaces::FreshFinalityKeyBinding* {
+                for (const interfaces::FreshFinalityKeyBinding& binding : status.bindings) {
+                    if (binding.bls_pubkey == pk) return &binding;
+                }
+                return nullptr;
+            }};
+
+            UniValue keys{UniValue::VARR};
+            for (const node::FreshKeyRecord& record : records) {
+                UniValue entry(UniValue::VOBJ);
+                entry.pushKV("epoch", record.target_epoch);
+                entry.pushKV("bls_pubkey", HexStr(record.bls_pubkey));
+                entry.pushKV("state", node::FreshKeyStateName(record.state));
+                if (!record.bind_txid.IsNull()) {
+                    entry.pushKV("bind_txid", record.bind_txid.GetHex());
+                    if (const CWalletTx* wtx{pwallet->GetWalletTx(Txid::FromUint256(record.bind_txid))}) {
+                        entry.pushKV("confirmations", pwallet->GetTxDepthInMainChain(*wtx));
+                    }
+                }
+                if (const interfaces::FreshFinalityKeyBinding* binding{binding_of(record.bls_pubkey)}) {
+                    entry.pushKV("binding_height", binding->height);
+                    entry.pushKV("counted", binding->counted);
+                    entry.pushKV("void", binding->voided);
+                }
+                if (const auto elsewhere{ClaimedElsewhereAt(status, record.bls_pubkey)}) {
+                    entry.pushKV("claimed_elsewhere_height", *elsewhere);
+                    if (record.Held()) alerts.push_back(strprintf(
+                        "fresh key %s of fresh epoch %u was claimed first by another binding at height %d: this validator's binding of it is inert (it seats nothing), and only a holder of the key's secret could have made that claim; bindfreshfinalitykey replaces it while that epoch's binding window is open",
+                        HexStr(record.bls_pubkey), record.target_epoch, *elsewhere));
+                }
+                UniValue seated{UniValue::VARR};
+                for (const interfaces::FreshFinalityKeySeat& seat : status.seats) {
+                    if (seat.bls_pubkey == record.bls_pubkey) seated.push_back(seat.epoch);
+                }
+                entry.pushKV("seated_epochs", std::move(seated));
+                keys.push_back(std::move(entry));
+            }
+            obj.pushKV("keys", std::move(keys));
+
+            UniValue foreign{UniValue::VARR};
+            std::map<uint64_t, std::vector<modern::BlsPubkeyBytes>> voided;
+            for (const interfaces::FreshFinalityKeyBinding& binding : status.bindings) {
+                if (binding.voided) voided[binding.epoch].push_back(binding.bls_pubkey);
+                if (!store_error.empty() || record_of(binding.bls_pubkey)) continue;
+                UniValue entry(UniValue::VOBJ);
+                entry.pushKV("epoch", binding.epoch);
+                entry.pushKV("bls_pubkey", HexStr(binding.bls_pubkey));
+                entry.pushKV("height", binding.height);
+                entry.pushKV("counted", binding.counted);
+                entry.pushKV("void", binding.voided);
+                foreign.push_back(std::move(entry));
+                alerts.push_back(strprintf(
+                    "fresh key %s bound for fresh epoch %u at height %d under this validator's identity is not in this node's fresh key store: an old wallet backup or a leaked identity key is binding keys (consider restaking under a new identity)",
+                    HexStr(binding.bls_pubkey), binding.epoch, binding.height));
+            }
+            for (const auto& [voided_epoch, pubkeys] : voided) {
+                std::string keys_text;
+                for (const modern::BlsPubkeyBytes& pk : pubkeys) keys_text += (keys_text.empty() ? "" : ", ") + HexStr(pk);
+                alerts.push_back(strprintf(
+                    "fresh-lineage seat for fresh epoch %u is void: %u fresh bindings of this validator name it (%s); an old wallet backup or a leaked identity key may be binding keys",
+                    voided_epoch, pubkeys.size(), keys_text));
+            }
+            obj.pushKV("foreign_bindings", std::move(foreign));
+
+            // Seats this node must be able to sign for (the signer's rule):
+            // a Set'_{e-1} key the store erased went by policy; not missing.
+            UniValue missing{UniValue::VARR};
+            if (store_error.empty()) {
+                for (const interfaces::FreshFinalityKeySeat& seat : status.seats) {
+                    const node::FreshKeyRecord* record{record_of(seat.bls_pubkey)};
+                    if (record && record->Held()) continue;
+                    if (record && seat.epoch + 1 == status.epoch) continue;
+                    UniValue entry(UniValue::VOBJ);
+                    entry.pushKV("epoch", seat.epoch);
+                    entry.pushKV("bls_pubkey", HexStr(seat.bls_pubkey));
+                    missing.push_back(std::move(entry));
+                }
+            }
+            obj.pushKV("missing_seats", std::move(missing));
+            obj.pushKV("alerts", std::move(alerts));
+            return obj;
         },
     };
 }

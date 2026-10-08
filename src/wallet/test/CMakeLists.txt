@@ -14,6 +14,7 @@ target_sources(test_bitcoin
     coinselector_tests.cpp
     coinselection_tests.cpp
     feebumper_tests.cpp
+    finality_fresh_key_wallet_tests.cpp
     finality_recovery_status_tests.cpp
     finality_recovery_rpc_tests.cpp
     group_outputs_tests.cpp

@@ -19,6 +19,7 @@
 #include <modern/flowmesh_checkpoint.h>
 #include <node/types.h>
 #include <primitives/transaction.h>
+#include <util/fs.h>
 #include <util/result.h>
 
 #include <array>
@@ -154,6 +155,69 @@ struct FinalityStatus {
     //! Current, previous and prepared next snapshot keys for this validator.
     //! May differ from the latest on-chain binding after a pending rotation.
     std::vector<FinalitySigningKey> signing_keys;
+};
+
+//! One fresh-lineage key binding of a validator (B-37; see
+//! Chain::freshFinalityKeyStatus). The first claim of its key.
+struct FreshFinalityKeyBinding {
+    uint64_t epoch{0}; //!< target fresh epoch
+    std::array<unsigned char, 48> bls_pubkey{};
+    int height{-1}; //!< including block
+    //! Included inside its target's window: it seats the validator (or,
+    //! with another counted one, voids the seat) for that epoch.
+    bool counted{false};
+    //! Two or more counted bindings of the validator name this epoch.
+    bool voided{false};
+};
+//! A seat of the validator in a retained fresh committee (Set'_{e-1},
+//! Set'_e, Set'_{e+1}).
+struct FreshFinalityKeySeat {
+    uint64_t epoch{0};
+    std::array<unsigned char, 48> bls_pubkey{};
+    uint64_t weight{0};
+};
+//! The first on-chain claim of a probed BLS key (B-37 ever-bound keys, any
+//! epoch, either binding kind; see Chain::freshFinalityKeyStatus).
+struct FreshFinalityKeyClaim {
+    std::array<unsigned char, 48> bls_pubkey{};
+    //! Height of the first claim; nullopt when the key was never claimed.
+    std::optional<int> first_height;
+    //! Set when that first claim is the validator's own fresh binding (its
+    //! target epoch). A claimed key without it was taken first elsewhere:
+    //! the validator's own binding of it is inert.
+    std::optional<uint64_t> own_epoch;
+};
+//! B-37 per-epoch fresh-lineage keys of one validator, as the chain sees
+//! them (regtest -b3freshkeyheight only; everything is public). The secrets
+//! live only in the node's fresh key store under `signer_directory`, keyed by
+//! (chain_domain, validator key) -- never in a wallet file.
+struct FreshFinalityKeyStatus {
+    //! Fresh-key mode is configured on this chain; nothing else is set otherwise.
+    bool configured{false};
+    //! The finality state and its fresh key index are derivable at the tip.
+    bool available{false};
+    std::optional<int> key_height; //!< R_key
+    int activation_height{-1};     //!< R_f
+    uint256 chain_domain{};        //!< null when the boundary is unpinned
+    int tip_height{-1};
+    //! The binding window of the next block: "open", "not-active" (below
+    //! R_key) or "lineage-unavailable" (from R_f without an intact lineage).
+    std::string next_binding_window{"not-active"};
+    //! Set only while the window is open: the one target epoch a binding in
+    //! the next block counts for, and the window's first height.
+    std::optional<uint64_t> next_binding_epoch;
+    std::optional<int> window_start;
+    bool bootstrapped{false};
+    bool broken{false};
+    uint64_t epoch{0}; //!< current fresh epoch (bootstrapped only)
+    //! The validator's bindings naming epoch >= e-2 (all before the lineage).
+    std::vector<FreshFinalityKeyBinding> bindings;
+    std::vector<FreshFinalityKeySeat> seats;
+    //! One entry per probed key, in order (only while available).
+    std::vector<FreshFinalityKeyClaim> probe_claims;
+    //! <datadir>/<net>/finality_signer: the staking loop's signer journals
+    //! and fresh key stores (node/finality_fresh_key_store.h).
+    fs::path signer_directory;
 };
 
 //! Public, read-only observation of the existing running signer's journal and
@@ -841,6 +905,13 @@ public:
     //! B3: finality diagnostics (epoch state, finalized checkpoint, pin,
     //! signature pool; binding/membership of `validator_key` when given).
     virtual FinalityStatus finalityStatus(const std::optional<std::array<unsigned char, 32>>& validator_key) = 0;
+    //! B3 bridge V2 (B-37, regtest -b3freshkeyheight only): the chain's view of
+    //! `validator_key`'s per-epoch fresh-lineage keys and where the node keeps
+    //! their secrets (configured = false on every shipped network), plus the
+    //! first on-chain claim of each of `probe_keys` (the wallet probes its
+    //! fresh key store's keys).
+    virtual FreshFinalityKeyStatus freshFinalityKeyStatus(const std::array<unsigned char, 32>& validator_key,
+                                                          const std::vector<std::array<unsigned char, 48>>& probe_keys) = 0;
     //! B3: arm the staking loop's finality signer with a BLS consensus key
     //! (refused while the loop runs; the key stays in node memory only).
     virtual bool armFinalitySigner(const bls::SecretKey& key, const std::array<unsigned char, 32>& validator_key, std::string& error) = 0;
