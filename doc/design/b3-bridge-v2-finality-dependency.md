@@ -1206,3 +1206,459 @@ this. `ProjectFreshLineage` applies them only when the tracker passes
   - Erasure protects past epochs only, and only where the signer runs.
 - **Mainnet.** No shipped network sets R_key. Mainnet gets per-epoch keys
   only with P3 (B-7), after OI-7, a reviewed hard fork and an owner ruling.
+
+---
+
+## 19. Implementation notes (S1 H1/H2, regtest)
+
+This section records what the H1/H2 chain-health slice built on
+`feat/flowmeshV2-dev-claude` on top of `8e3081b`, under owner ruling R8
+(`doc/design/b3-bridge-v2-owner-rulings-2026-10-03.md`). It is regtest-only
+and implements §5.1-§5.3 and FD-1 to FD-4 as far as regtest can. It is
+**not an owner ruling** and changes no text above. §19.8 lists, as *pending
+owner review*, every choice §5 leaves open and every departure from the
+regtest plan (solve-and-report). References name files and symbols, not
+lines.
+
+### 19.1 Knobs, guards and what stays unchanged
+
+| Knob | Sets | Guards |
+|---|---|---|
+| `-b3h1height=<R_h>` | `Consensus::Params::h1` = `H1Params{R_h, R_escape}`; `H1RulesActive(h)` holds from R_h | Integer ≥ 2; R_h > M ("must be above the first modern-PoS height M=…") |
+| `-b3h1escaperounds=<n>` | R_escape; default `H1Params::DEFAULT_ESCAPE_ROUNDS` = 2,880 (24 h at 30 s rounds); `H1EscapeRound(h, round)` | 1 ≤ n ≤ 99,999; needs `-b3h1height` |
+| `-b3h2checkpoint=<height>:<hash>` | Repeatable; each pin joins `Consensus::Params::modern_checkpoints` | Height in the MODERN era (above the legacy final height); 64 hex digits in display order, as `getblockhash` prints; a duplicate height is refused |
+
+- **Common guards.** All three knobs need `-b3modernregtest -b3flowmeshtest`
+  (`ReadRegTestArgs`, and again in the kernel's `RegTest()`), as regtest
+  plan §3.3 requires of its startup knobs. Every other chain refuses each
+  one as "regtest-only" (`CreateChainParams`). Negation is refused, and the
+  knobs are DEBUG_ONLY (`src/chainparamsbase.cpp`). Files:
+  `src/consensus/params.h`, `src/kernel/chainparams.{h,cpp}`,
+  `src/chainparams.cpp`, `src/chainparamsbase.cpp`.
+- **Not provided.** The regtest plan's `-b3regtestwithholdcertificates`
+  is not in this build; the argument parser refuses it as an unknown
+  parameter (§19.8 item 1).
+- **E** is not a new parameter. It is `ModernPosParams::finality_epoch_blocks`
+  (1,440 on mainnet, `-b3epochlength` on regtest).
+- **Unchanged.** Mainnet, testnet, testnet4 and signet set no `h1`, so
+  `H1RulesActive` is false at every height. Mainnet's `modern_checkpoints`
+  is exactly {810,001, 811,641} with their hashes, and the other networks'
+  tables stay empty. A regtest node without `-b3h1height` has no `h1`
+  either: `State::producers` is never set, and every producer path is V1's
+  byte for byte (H1-R1).
+- **Nothing new on disk or on the wire.** There is no new byte layout, P2P
+  message, persisted file or index. The H1 state lives in memory and is
+  rebuilt from blocks, like the V1 tracker. BLS, digests, journals,
+  carriers, certificates, the fresh lineage, the bridge and the Ethereum
+  code are untouched (H1-R6). FlowMesh reads no producer set and is
+  unchanged.
+
+### 19.2 The rule as implemented
+
+`node::FinalityTracker` (`src/node/finality_tracker.{h,cpp}`) keeps a
+`ProducerSchedule` {epoch, epoch_start, current, next, last_escape_height,
+escapes} in `State::producers`. It is set only from R_h and is never
+written into, or read from, a V1 field (H1-R3). `ProjectProducers(h, round)`
+derives it for the block at h = synced height + 1:
+
+```text
+ProjectProducers(h, round):            # H1 active at h
+  require ProducerInputsReady(h)                    # else nullopt (fail closed):
+                                                    # R_h > M, synced_height == h - 1,
+                                                    # a stored schedule above R_h
+  if h == R_h:                                      # bootstrap
+    p = {epoch 0, start R_h, last_escape -1, escapes 0}
+    p.current = SetOrCarry(0, V1 State::current after block R_h - 1, min_finality_set)
+    p.next    = p.current re-stamped 1
+  else:
+    p = stored schedule
+    if h >= p.start + E:                            # rotation, no certificate
+      p.epoch += 1; p.start = h
+      p.current = p.next
+      p.next    = SetOrCarry(p.epoch + 1, p.current, min_finality_set)
+  if round >= R_escape:                             # escape (FD-2), applied last
+    s = SetOrCarry(p.epoch + 1, p.current, 1)       # no floor: Snapshot(h - 1) if non-empty
+    p.epoch += 1; p.start = h
+    p.current = s; p.next = s re-stamped p.epoch + 1
+    p.last_escape = h; p.escapes += 1
+  return p
+
+SetOrCarry(epoch, fallback, floor):
+  Snapshot(h - 1) stamped epoch,  if it has >= max(floor, 1) members
+  else fallback re-stamped epoch  (carry-over; V1's with floor = min_finality_set);
+  null if no fallback
+```
+
+- **Snapshot.** This is V1's rule, unchanged: ACTIVE stake joined with a
+  non-revoked FINALITY_KEY binding. `src/node/validator_set.*` is not
+  touched. `SyncedTipSnapshot` memoizes Snapshot(h − 1) per synced tip, so
+  validation, the assembler, the staking loop and the RPC build and
+  BLS-decode it once per parent.
+- **`Projected(h, params, round)`** runs V1's projection unchanged, then
+  sets `producers` from R_h, then runs the fresh lineage's projection
+  unchanged.
+- **`SetInForceAt(h, params, round)`.** Below R_h, or without `h1`, it runs
+  the V1 body byte for byte and ignores the round. From R_h it returns
+  `ProjectProducers(h, round)->current`, or null.
+- **The escape has no floor.** §5.1 gives the escape Snapshot(parent);
+  the implementation takes it whatever its size and carries the set
+  otherwise in force over only when the snapshot is empty. Bootstrap and
+  rotation keep V1's `min_finality_set` carry-over (§19.8 item 2).
+- **`ProducerScheduleAvailable(h)`** is `ProducerInputsReady(h)`, the same
+  private predicate `ProjectProducers` checks, so the two cannot drift. It
+  returns false only when H1 is active at h and one of these holds: the
+  tracker is not at h − 1, a height above R_h has no stored schedule, or
+  R_h ≤ M. In that case
+  `Chainstate::ModernEligibilityWeights` returns nullopt, and validation
+  reports `state.Error("modern-PoS validator set is unavailable")`, never
+  `bad-pos-ineligible`.
+- **Escapes come from block data only (H1-R4).** The round is
+  `modern::DecodeModernPosRound(parent time, block time)`.
+  - `ConnectBlock` passes it to `ModernEligibilityWeights`. A block time
+    that is not exact for a round gives no round: the normal set is read,
+    and `CheckModernPosBlock` refuses the block with `bad-pos-time`, as
+    before.
+  - `ApplyModern` decodes the same round. It fails, leaving the tracker
+    dirty for `Sync` to rebuild, when a connected block has no exact round
+    or the schedule is unavailable. It never stores a guessed schedule.
+  - So restart, `-reindex-chainstate` and `-reindex` reproduce every
+    rotation and escape.
+- **Order within one height.** The bootstrap or rotation applies first,
+  then the escape. An escape at a rotation height therefore advances the
+  epoch twice, and the escape set replaces the rotation's next set. Both
+  come from the same snapshot.
+- **V1 from R_h.** The V1 tracker keeps computing epochs, handovers,
+  certificates, the break, the finalized checkpoint and reorg pins exactly
+  as before.
+  - Under an intact lineage, V1 certificates stay the checkpoint authority
+    while producers follow the schedule.
+  - On a broken lineage, V1 stays frozen.
+    `BridgeWithdrawalValidatorSetsReady` reads only V1 fields, so burns
+    stay closed.
+
+### 19.3 Call sites (H1-R2)
+
+Every path that decides who may produce reads
+`Chainstate::ModernEligibilityWeights` or `FinalityTracker::SetInForceAt`.
+Both are H1-aware, so these paths change together.
+
+| Caller | What it decides | From R_h |
+|---|---|---|
+| `Chainstate::ModernEligibilityWeights` (`src/validation.{h,cpp}`) | (w, W) for a key at parent + 1 | Checks `ProducerScheduleAvailable`, then calls `SetInForceAt(parent + 1, round)`. `round` is a new defaulted parameter |
+| `Chainstate::ConnectBlock`, modern-PoS branch | Block validity | Passes the block's decoded round, so an escape block is judged against the escape set |
+| `BlockAssembler::CreateNewBlock` (`src/node/miner.cpp`) | Template eligibility and round search | Reads the normal pair and the escape pair (round = R_escape), and uses the escape pair for rounds ≥ R_escape. Throws "not in the active validator set" only when both weights are 0. An explicit `modern_pos_round` needs w > 0 in that round |
+| `StakingLoop::ThreadLoop` (`src/node/staking.cpp`) | Coordination and the preferred-proposer slot | Reads both weight pairs and both sets: `SetInForceAt(next)` and `SetInForceAt(next, R_escape)`. Ranks each round over the set that governs it. With no set for a round, it waits for the next round |
+| `StakingLoop::FillChainFacts` | `getstakinginfo` `active_weight` and `total_active_weight`, and through them the Qt validator page | Normal-round weights. The escape weight is not reported (§19.8 item 9) |
+| `getfinalitystatus.producers` (`src/rpc/blockchain.cpp`) | The H1-R5 report | Reads `Projected(tip + 1).producers`, `SetInForceAt(tip + 1)` and `SetInForceAt(tip + 1, R_escape)` |
+| `getfinalitystatus.set0_preview`, `getfinalityset` and `ChainImpl::finalityStatus` (`src/node/interfaces.cpp`) | The V1 Set_0 hand-off through `SetInForceAt(M)` | Unchanged. R_h > M is enforced, so `SetInForceAt(M)` is always V1's |
+| V1 readers of `Projected()` and `Current()`: the V1 signer, certificate judging, bridge burn readiness (`src/validation.cpp`, `src/node/miner.cpp`, `src/node/interfaces.cpp`, `src/node/bridge_state.cpp`), `getfinalityset`, `getfinalitystatus.validator_set` and the Qt finality-membership fields | V1 finality only, never production | Unchanged. They read V1 fields only, never `producers` |
+
+The regtest production pause (`preserve_regtest_finality` in
+`CreateNewBlock`) also changes: from R_h the V1 lineage never pauses local
+production, because producers no longer depend on it (regtest plan §3.6).
+
+- A LINEAGE_BROKEN plan becomes ALLOW.
+- A REQUIRE_HANDOVER plan (an intact lineage's last carrier) becomes ALLOW
+  too. The assembler still includes a pooled current-epoch certificate,
+  as it does at every height, but with none it builds the carrier anyway
+  and the V1 lineage breaks one height later, as it would on a network
+  without this regtest-only policy. Below R_h both pauses are unchanged.
+- Consequence: a regtest staker no longer waits at the carrier for a slow
+  quorum after R_h. A fixture that needs an intact lineage after R_h must
+  keep its signers live, which fixture I does (certificates arrive tens of
+  blocks before the carrier).
+- `src/node/regtest_finality_policy.h` is unchanged.
+
+### 19.4 RPC (H1-R5)
+
+`getfinalitystatus` gains a `producers` object. It is present only when
+`h1` is configured, so never on a shipped network. Every field is
+documented in its RPCResult.
+
+| Field | Before R_h (`active` false) | From R_h |
+|---|---|---|
+| `activation_height`, `escape_rounds` | R_h, R_escape | Same |
+| `active` | false | true (tip + 1 ≥ R_h) |
+| `epoch`, `epoch_start` | Absent | The producer epoch of tip + 1 and its first height |
+| `next_rotation` | R_h | epoch_start + E |
+| `snapshot_height` | R_h − 1 | next_rotation − 1 |
+| `stake_enters_at` | R_h | next_rotation + E. A stake that is ACTIVE and bound by `snapshot_height` produces from here, unless an escape comes first |
+| `last_escape_height`, `escapes` | Absent | −1 and 0 until the first escape |
+| `escape_time` | Absent | tip time + block interval + R_escape × round seconds: the exact time of an escape block on this tip |
+| `set` {epoch, size, total_weight, set_hash} | The V1 set in force for tip + 1 | The producer set for tip + 1 in a normal round |
+| `next_set`, `escape_set` | Absent | The next epoch's set, and the escape set on this tip |
+
+- `validator_set` now reads "the V1 finality set in force (block
+  producers: see producers when H1 is configured)".
+- No RPC lists producer-set members: `getfinalityset` returns V1 sets only.
+- Without `-b3h1height` the output is unchanged.
+
+### 19.5 H2
+
+- **No new mechanism.** An H2 pin is an entry in
+  `Consensus::Params::modern_checkpoints`, with `Consensus::ModernCheckpointAllows`
+  (`src/consensus/boundary.h`) as the only predicate. Three checks already
+  enforce that table:
+  1. Header admission (`ContextualCheckBlockHeader`) refuses a different
+     block at a pinned height with `bad-modern-checkpoint`.
+  2. `ConnectBlock` checks again, which also covers `-reindex-chainstate`.
+  3. At startup, `src/node/chainstate.cpp` refuses an active chain that
+     does not match: "does not match the hardened modern checkpoint at
+     height …".
+- **Effect.** Every branch that reaches a pinned height must contain the
+  pinned block, so no branch that passes the pin can rewrite anything at or
+  below it. It does not bound reorgs above the pin (§5.3).
+- **Regtest.** `-b3h2checkpoint` adds pins at any modern height, including
+  at or above R_h. RT1 pins 300 with R_h = 220; unit case (n) pins
+  R_h + 1 from the knob's display-order hash.
+- **Mainnet.** No entry was added. The §5.3 entry for the H1 release needs
+  a recent block hash, observed independently and reviewed at release
+  time, added beside 810,001 and 811,641 in `src/kernel/chainparams.cpp`. A
+  follow-up release above R_h adds one past activation.
+- 811,641 must stay in the table, because mainnet's finality signer
+  recovery pin anchors there. Regtest configures no recovery pin, so an H2
+  pin never anchors one.
+
+### 19.6 Late upgraders (FD-4)
+
+§5.4's guidance stands: upgrade before R_h; otherwise run `-reindex`, or
+`invalidateblock` on the node's first block after R_h.
+
+RT1 fixture B reproduces the `-reindex` path with `-b3reorghorizon=40`:
+
+1. n6 runs without H1 and stops at 219. It then restores the wallet of n3,
+   whose stake is spent but which is still a frozen V1 member, and alone
+   produces its own blocks 220..265 under the frozen V1 set.
+2. n6 restarts with the H1 knobs. Nothing re-judges stored blocks, and
+   n0's branch would need a 46-block reorg against a horizon of 40, so the
+   switch is refused (`modern-reorg-too-deep`) and n6 keeps its tip.
+3. n6 restarts with `-reindex` and the H1 knobs. Its own block 220 fails
+   (`bad-pos-ineligible`); n6 then syncs to n0 and agrees with every node.
+
+The `invalidateblock` path is not exercised [H].
+
+### 19.7 Tests
+
+**Unit suite `finality_h1_tests`** (`src/test/finality_h1_tests.cpp`,
+registered in `src/test/CMakeLists.txt`):
+
+- Params cases:
+  - (a) `h1_knobs_refused_outside_regtest`
+  - (b) `h1_knobs_require_flowmesh_regtest`
+  - (c) `h1_knob_values_are_checked`
+  - (d) `h1_valid_regtest_configuration`
+- Chain cases. They run on `H1ChainFixture`, built on
+  `FinalityChainFixture` with E = 30 and R_escape = 12, which is above
+  every round the fixture's own search reaches.
+  - (e) `below_rh_bit_identical`: V1 byte for byte below R_h at every
+    height; R_h falls inside V1 epoch 2, and a binding change between V1's
+    snapshot and R_h − 1 makes the producer set differ from V1's set in
+    force, so at R_h the member only V1 admits is refused and the member
+    only H1 admits connects
+  - (f) `broken_lineage_frozen_then_rotates`, which also checks that the
+    bridge burn gate stays closed
+  - (g) `carry_over_and_bootstrap_fallback`
+  - (h) `rebuild_reproduces_schedule`
+  - (i) `escape_restarts_schedule`
+  - (j) `escape_at_activation`
+  - (j′) `escape_takes_snapshot_below_floor`: an empty snapshot carries
+    the set in force over; with the set in force offline and one bound,
+    ACTIVE staker below `min_finality_set`, that staker's escape block
+    connects; rotations keep V1's carry-over
+  - (k) `rebuild_and_reload_reproduce_escape`: a disk fixture with restart
+    and `-reindex-chainstate`
+  - (l) `assembler_escape_round`
+  - (m) `regtest_broken_pause_lifted_from_rh`
+  - (m′) `regtest_handover_best_effort_under_h1`
+  - (n) `h2_pin_above_rh_refuses_competitor`, with the pin parsed from the
+    knob line (display order; internal order pins another identity)
+- **Runtime.** About 2.5 minutes per chain case, almost all of it the
+  shared `ModernPosSetup::BuildLegacy` scrypt grinding of the legacy prefix
+  (`src/test/util/modern_pos_setup.h`, profiled); the chain walks add
+  little. The same per-case cost explains the other finality suites' times.
+
+**Functional RT1** is `test/functional/feature_b3_h1_producer_rotation.py`,
+with two extended `test_runner.py` entries, `--fixture=B` and
+`--fixture=I`.
+
+- **Setup.** Eight local nodes: no anvil, no bridge pins and no fresh
+  lineage. M = 131, R_h = 220, R_escape = 60, E = 40, minimum set 4.
+- **Fixture B** (mock time):
+  - Before R_h: the V1 lineage breaks and its set stays frozen; a new
+    staker is excluded, and a member that spent its stake still produces.
+  - Bootstrap at 220 from Snapshot(219).
+  - Rotations at 260 (with the spent member's residual) and at 300 (with a
+    carry-over below the minimum, while the escape set at 300 is the
+    three-member snapshot itself).
+  - Escape drill: n3 alone produces in round ≥ 60, and the next rotation is
+    at h_e + 40.
+  - A coinbase scan checks who produced where.
+  - Restart, `-reindex`, and a fresh sync with the H2 pin at 300.
+  - H2 failures: a wrong pin refuses to start; a wrong pin with `-reindex`
+    stops at 299; the right pin with `-reindex` returns to the tip.
+  - The late upgrader (§19.6).
+- **Fixture I** (real time, live V1 BLS):
+  - Before R_h the producer set is V1's set in force.
+  - n4 stakes in exactly block 198 (mock time), so its stake is ACTIVE from
+    218: in Snapshot(219) but not in V1's snapshot for its set in force at
+    220. At 219 the producer set for 220 (5 members, W 115) differs from
+    V1's (4 members, W 100, without n4), and n4 produces 220 alone, a block
+    only the H1 schedule admits.
+  - From R_h producer epochs start at 220 + 40k with no escape, while V1
+    keeps certifying: finalized above 290, its epoch advanced, not broken.
+  - Restart, `-reindex` and a fresh sync all agree.
+
+**How §5.5's five items are covered.**
+
+| Item | Where |
+|---|---|
+| (1) Broken lineage: frozen producers | Fixture B |
+| (2) Rotations, carry-over, agreement across paths | Fixture B |
+| (3) Intact lineage | Fixture I |
+| (4) Escape | Fixture B's drill. Activation with no upgraded member of Snapshot(R_h − 1) is unit-only: case (j) |
+| (5) Late upgrader | Fixture B |
+
+The regtest plan's "burns stay invalid while broken" is also unit-only:
+case (f).
+
+**Regression set for this slice:**
+
+- Every `finality_*` suite, `modern_pos_tests` and the PoS suites.
+- `feature_b3_finality_mempool.py` and `feature_b3_fresh_lineage.py`.
+- RT4a (`feature_b3_bridge_rt4a_round_trip.py`) and RT4
+  (`feature_b3_bridge_rt4_kofn_gate.py`).
+
+### 19.8 Implementation choices pending owner review
+
+1. **Certificate withholding: not provided.**
+   - *What the plan asks.* Regtest plan §3.6 and §7 break fixture B's V1
+     lineage with `-b3regtestwithholdcertificates=131-211`: local
+     block-assembly policy, never consensus, under which this node's
+     assembler includes no V1 certificate in [a, b] while every signer
+     stays live.
+   - *Why it is absent.* A permission check refused the `CChainParams`
+     accessor the assembler needs, and the `src/node/miner.cpp` hunk that
+     depends on it was never applied. An earlier draft still registered,
+     parsed and range-checked the knob, so it was accepted and did
+     nothing. That draft was removed rather than left as a silent no-op:
+     the argument parser now refuses the knob as an unknown parameter
+     (unit case (c)). Wiring it needs the lead, after the owner, to apply
+     the refused hunk.
+   - *What RT1 fixture B does instead.* It keeps every V1 signer silent:
+     the journal path is a regular file, so signing is "disabled safely".
+     Its producers run with `-b3maxepochextension=1000` until 219, so the
+     regtest pause cannot stop them before R_h. Restarted at 219 with the
+     fixture's 40, every node derives the break at 211 from block data.
+   - *What that misses.* It reproduces the frozen chain, but not "every
+     signer live while broken". That drill needs the knob wired.
+   - *Replay rule.* The extension differs between nodes and changes at the
+     restart, against regtest plan §3.3 ("no parameter may change how a
+     connected block is judged"). It is harmless only because fixture B
+     never has a certificate or a burn: the extension then decides nothing
+     but when V1 counts as broken and the local production pause, and
+     every node agrees on the break after the restart. A wired knob would
+     let fixture B use one extension throughout.
+2. **The escape has no minimum-set floor.**
+   - §5.1 gives the escape "its eligibility weights from Snapshot(parent)
+     ... with both sets = Snapshot(parent)"; its carry-over row is written
+     for the rotation. The implementation follows the escape row: it takes
+     Snapshot(parent) whatever its size and carries the set otherwise in
+     force over only when the snapshot is empty. Bootstrap and rotation
+     keep V1's `min_finality_set` carry-over.
+   - Why: the escape exists for liveness when the set in force is offline.
+     With V1's floor (2 on mainnet), every in-force producer offline and
+     a single bound, ACTIVE staker, the escape would re-select the offline
+     set and the chain would stay halted, since no block could add stake.
+     Case (j′) builds exactly that and the staker's escape block connects.
+   - Cost: such an escape set can have one member. That member holds all
+     bound, ACTIVE stake at the parent, so no honest staker is excluded,
+     but a single key then produces until the snapshot grows (the next
+     rotation keeps V1's carry-over, so it stays the only producer until
+     the snapshot reaches the floor). An earlier draft kept the floor for
+     escapes; the choice is the owner's.
+3. **Bootstrap fallback reading.**
+   - "The V1 set in force at R_h − 1" is read as the V1 set that governed
+     block R_h − 1, even if V1 would have rotated at R_h.
+   - ProducerSet_1 is ProducerSet_0 re-stamped 1.
+   - With neither a snapshot nor a V1 set, the result is null: no
+     producer, as under V1 without Set_0.
+4. **Escape epoch numbering.**
+   - An escape starts producer epoch k + 1 at its own height. Epochs
+     therefore count rotations plus escapes, and epoch_start − R_h is a
+     multiple of E only until the first escape.
+   - At a rotation height the epoch advances twice (§19.2).
+   - Producer epochs are numbered independently of V1 epochs, and set
+     hashes carry the producer-epoch stamp.
+5. **`SetInForceAt` is the single H1-aware helper.**
+   - There is no separate producer-set helper. From R_h, `SetInForceAt`
+     means the producer set, no longer V1's set.
+   - Every caller is audited in §19.3. A future caller that wants V1's set
+     at h ≥ R_h must read `Projected().current`.
+6. **The knobs need `-b3flowmeshtest`.** This is not a deviation: regtest
+   plan §3.3 says its startup knobs and the pin file "Both need
+   `-b3modernregtest -b3flowmeshtest`", as `-b3bridgepins` and the
+   fresh-lineage knobs already do.
+7. **R_escape bound.** The range is [1, 99,999], not the planned 100,000:
+   the assembler's round search tries only rounds below 100,000, so a
+   bound of 100,000 could never be produced locally.
+8. **The regtest pause is lifted in the assembler.** The regtest plan says
+   H1 switches `PlanRegtestFinalityProduction` to the producer schedule.
+   Instead, the override lives in `CreateNewBlock` (§19.3), and the policy
+   header is unchanged. From R_h it lifts both pauses: LINEAGE_BROKEN and
+   REQUIRE_HANDOVER (best effort: a pooled certificate is still included).
+   An earlier draft kept REQUIRE_HANDOVER, which would stop every regtest
+   staking loop for good at the last carrier whenever an intact lineage
+   lost its quorum after R_h, even past R_escape (case (m′)).
+9. **Escape weight and wallet text (follow-up, outside this slice).**
+   - H1-R5 asks the wallet to report escape status. It does not yet:
+     `getstakinginfo.active_weight` is the normal-round weight, so a
+     validator that is only in the escape set shows 0 there while its
+     staking loop runs and waits for escape rounds. The escape status is
+     reported only in `getfinalitystatus.producers` (`escape_set`,
+     `escape_time`).
+   - The fix needs `interfaces::StakingStatus` and the wallet RPC
+     (`src/wallet/rpc/staking.cpp`), both outside this slice: report the
+     escape-round weight from the `ModernEligibilityWeights(key, tip,
+     R_escape)` call the staking loop already makes, and R_escape or the
+     escape time. The `getstakinginfo` help text there still says newly
+     ACTIVE stake enters "only through a later certified rotation", which
+     is wrong from R_h.
+   - The Qt page's finality-membership fields stay V1's (H1-R3), while its
+     eligible weight follows H1.
+10. **Escape races and stale parents, unmodelled.**
+    - An escape block cannot come early (exact timestamps). Its race with a
+      late in-force block on the same parent, and the fork choice between
+      them, are still for the §13 model check (H-H1) [H]. No test builds
+      such a competing pair.
+    - Escape status depends only on a block's timestamp relative to its
+      parent. So any block built now on a parent older than R_escape ×
+      round seconds is an escape block weighted by Snapshot(parent). On
+      mainnet that is 24 h, about 1,100 blocks at 78 s, inside the
+      1,440-block reorg horizon. Such a stale-parent fork can be signed by
+      every bound, ACTIVE staker at that parent, including keys whose stake
+      was later spent and sold, not only by the producers in force, and it
+      restarts the schedule. Equal per-block work and the future-time bound
+      should keep it from overtaking the honest chain, but nothing checks
+      that. Before any mainnet R_h ruling the §13 model check should add an
+      escape on a parent deeper than R_escape, with its interaction with
+      the reorg horizon and the H2 pin [H].
+11. **How RT1 differs from the regtest plan.**
+    - RT1 runs without bridge pins and without the fresh lineage.
+    - RT1's fixture I adds `-b3h1height=220` to the plan's fixture I. That
+      fixture's table row says no H1, and RT3, RT4 and RT6 still run it
+      without H1.
+
+### 19.9 What stays open
+
+- **FD-4**: R_h, the adoption window and the exchange notice are the
+  owner's, after O2. No shipped network sets R_h.
+- **The mainnet H2 entry**: a release step (§19.5).
+- **Governing text** (§16): `doc/design/b3-cross-chain-finality-v1.md:172-173`
+  still describes handover-gated production and one stake universe.
+- **The §13 model check** of H-H1, including the stale-parent escape
+  (§19.8 item 10).
+- **The withholding knob** (§19.8 item 1) and **wallet escape status**
+  (§19.8 item 9): both need hunks outside this slice.
+- **The `invalidateblock` path** for late upgraders.
+- **Unchanged by H1**: an unstaked member's residual of up to 2E blocks
+  (§5.4).
