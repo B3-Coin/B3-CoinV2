@@ -111,6 +111,8 @@ EXTENDED_SCRIPTS = [
     'feature_b3_bridge_rt4d_migration.py',
     # Bridge V2 routes (b) and (d3) through the forwarders, two anvils and mock LayerZero (as RT4c).
     'feature_b3_bridge_rt6_route_b_d3.py',
+    # Owner ruling R10: a bUSD-only wallet burns to routes (d1) and (d3) with a relayer-sponsored fee (as RT6).
+    'feature_b3_bridge_rt7s_sponsored_fees.py',
 ]
 
 # Special script to run each bench sanity check

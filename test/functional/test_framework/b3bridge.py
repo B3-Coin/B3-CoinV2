@@ -57,6 +57,9 @@ REGTEST ONLY. This module provides:
   contrib/b3bridge/regtest/mock_lz_relayer.py. Salts, CREATE2 addresses,
   the OI-2 fee cap and the parameter checks are the contrib module's,
   imported here, so Python has one implementation of them.
+- sponsored native-B3 fees (owner ruling R10, RT7s): a one-shot run of
+  contrib/b3bridge/b3_bridge_sponsor.py (fee-coin pool refill, status and
+  completion of a user's partial burn) against a relayer wallet.
 
 The relayer module is imported only as a library; its main() is never
 called in-process, only as an unchanged subprocess by run_relayer_once().
@@ -819,7 +822,7 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
                                  min_bridge_total_weight=4, horizon_epochs=1024,
                                  gvr=REGTEST_GVR, fork_version=REGTEST_FORK_VERSION,
                                  verifier_max_epoch_lag=None, successor=None, forwarders=None,
-                                 check=True):
+                                 sponsored_sighash_height=None, check=True):
     """Write a -b3bridgepins file holding only a v2 section; return its JSON.
 
     The file must exist before the validators first start (OI-3), when the
@@ -877,6 +880,12 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
     that is zero or not 32 bytes, two different hashes (both factories
     CREATE2 the same B3Forwarder), a dst_eid other than LZ_EID_ARBITRUM and,
     read from anvil, code already at either factory.
+
+    sponsored_sighash_height, when given, pins owner ruling R10's sponsored
+    sighash rule (v2.sponsored_sighash_height, >= V): from that height a
+    kind 6 burn's owner may sign SIGHASH_ALL|ANYONECANPAY. Without it the
+    node keeps the rule off. With check the writer refuses a height below
+    activation_height.
     """
     assert os.path.isabs(path), "-b3bridgepins needs an absolute path"
     caps = dict(caps or {})
@@ -925,6 +934,10 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
                f"deployment block {deployment_block} (check 4)")
     if activation_height < 1 or (burn_height is not None and burn_height < activation_height):
         refuse(f"need 1 <= activation_height ({activation_height}) <= burn_height ({burn_height})")
+    if sponsored_sighash_height is not None and not (
+            activation_height <= sponsored_sighash_height <= 2**31 - 1):
+        refuse(f"the sponsored_sighash_height ({sponsored_sighash_height}) must be at or above "
+               f"activation_height ({activation_height})")
     block_cap = caps.get("max_per_block", BRIDGE_V2_DEFAULT_CAP_RAW)
     epoch_cap = caps.get("max_per_epoch", BRIDGE_V2_DEFAULT_CAP_RAW)
     if not 0 < max_deposit_raw <= block_cap <= epoch_cap <= MAX_MONEY:
@@ -1027,6 +1040,8 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
     }
     if burn_height is not None:
         v2["burn_height"] = burn_height
+    if sponsored_sighash_height is not None:
+        v2["sponsored_sighash_height"] = sponsored_sighash_height
     v2.update(caps)
     if successor is not None:
         v2["successor"] = {
@@ -1040,6 +1055,25 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
     for role, pin in sorted((forwarders or {}).items()):
         v2[f"{role}_forwarder"] = dict(pin, init_code_hash=to_0x(pin["init_code_hash"]))
     document = {"format": PINS_FORMAT, "v2": v2}
+    with open(path, "w", encoding="utf8") as f:
+        json.dump(document, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return document
+
+
+def pin_sponsored_sighash_v2(path, height):
+    """Add owner ruling R10's v2.sponsored_sighash_height to the
+    -b3bridgepins file at path, written as write_regtest_bridge_pins_v2
+    writes it, and return the new JSON. Only before the nodes first start
+    with the file: the record guard refuses a changed file afterwards. The
+    height must be at or above the file's activation_height (V)."""
+    with open(path, encoding="utf8") as f:
+        document = json.load(f)
+    v2 = document["v2"]
+    if not (isinstance(height, int) and v2["activation_height"] <= height <= 2**31 - 1):
+        raise BridgePinError(f"refusing to pin sponsored_sighash_height {height!r} below activation_height "
+                             f"{v2['activation_height']}")
+    v2["sponsored_sighash_height"] = height
     with open(path, "w", encoding="utf8") as f:
         json.dump(document, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -1999,6 +2033,56 @@ def run_mock_lz_relayer(src, src_endpoint, dst, dst_endpoint, sender, *, from_bl
     if result.returncode != 1 or not message.startswith("error: "):
         raise AssertionError(f"mock_lz_relayer.py exited {result.returncode}: {message}")
     raise MockLzRelayerError(message[len("error: "):])
+
+
+# -- R10 sponsored native-B3 fees: the relayer's contrib tool -----------------
+SPONSOR_SCRIPT = str(B3BRIDGE_CONTRIB_DIR / "b3_bridge_sponsor.py")
+SPONSOR_TOOL_COMMANDS = ("refill", "status", "complete", "release")
+
+
+class SponsorToolError(AssertionError):
+    """b3_bridge_sponsor.py refused (exit 1); .message is its error text."""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(f"b3_bridge_sponsor.py refused: {message}")
+
+
+def run_sponsor_tool(command, node, wallet, *, timeout=300, **options):
+    """Run contrib/b3bridge/b3_bridge_sponsor.py <command> once as a subprocess.
+
+    command is "refill", "status", "complete" or "release"; node is the running B3
+    node hosting the relayer's `wallet` (its RPC endpoint and auth are
+    passed with --wallet). options become the subcommand's flags as in
+    run_forwarder_tool (tool_timeout -> --timeout, any other name with "_"
+    as "-"; min_tip -> --min-tip, max_fee -> --max-fee): True passes a bare
+    flag (no_broadcast -> --no-broadcast), False and None omit it, and a
+    Decimal goes as its exact decimal text. timeout bounds the subprocess.
+    Returns its stdout JSON on exit 0, with fractional numbers as Decimal
+    (the tool prints B3 amounts as exact decimal strings); a refusal (exit
+    1, "error: ..." on stderr) raises SponsorToolError.
+    """
+    assert command in SPONSOR_TOOL_COMMANDS, command
+    b3_url, auth = b3_rpc_endpoint(node)
+    args = [sys.executable, "-B", SPONSOR_SCRIPT, command, "--b3-rpc-url", b3_url, *auth, "--wallet", wallet]
+    for name, value in options.items():
+        if value is None or value is False:
+            continue
+        flag = _TOOL_FLAGS.get(name, "--" + name.replace("_", "-"))
+        if value is True:
+            args.append(flag)
+        elif isinstance(value, Decimal):
+            args += [flag, format(value, "f")]
+        else:
+            args += [flag, str(value)]
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                            stdin=subprocess.DEVNULL, env=_local_process_env())
+    if result.returncode != 0:
+        message = result.stderr.strip()
+        if result.returncode != 1 or not message.startswith("error: "):
+            raise AssertionError(f"b3_bridge_sponsor.py {command} exited {result.returncode}: {message}")
+        raise SponsorToolError(message[len("error: "):])
+    return json.loads(result.stdout, parse_float=Decimal)
 
 
 # -- observed refusals ----------------------------------------------------------
@@ -3482,6 +3566,43 @@ class TestFrameworkB3BridgeGuards(unittest.TestCase):
                                                             "holds code"):
                     write_regtest_bridge_pins_v2(path, regtest, **kwargs, forwarders={role: pins[role]})
                 coded.discard(pins[role]["factory"])
+
+    def test_v2_sponsored_sighash_pin_written(self):
+        """Owner ruling R10's v2.sponsored_sighash_height: absent by
+        default, written by the writer or added by pin_sponsored_sighash_v2
+        (the same bytes either way), never below V."""
+        from unittest import mock
+        kwargs = self.v2_pin_kwargs()
+        token = kwargs["token"]
+
+        def fake_rpc(url, method, params=None, timeout=120):
+            if method == "eth_getBlockByNumber":
+                return {"hash": self.BOOTSTRAP["checkpoint_block_hash"]}
+            if method == "eth_getTransactionCount":
+                return "0x0"
+            if method == "eth_getCode":
+                return "0x6001" if normalize_address(params[0]) == token else "0x"
+            raise AssertionError(f"unexpected request {method}")
+
+        regtest = self.FakeAnvil(REGTEST_ETH_CHAIN_ID)
+        activation = kwargs["activation_height"]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("test_framework.b3bridge.local_json_rpc", side_effect=fake_rpc):
+            path = os.path.join(tmp, "pins-v2.json")
+            plain = write_regtest_bridge_pins_v2(path, regtest, **kwargs)
+            self.assertNotIn("sponsored_sighash_height", plain["v2"])
+            added = pin_sponsored_sighash_v2(path, activation + 3)
+            with open(path, encoding="utf8") as f:
+                added_bytes = f.read()
+            self.assertEqual(added["v2"], {**plain["v2"], "sponsored_sighash_height": activation + 3})
+            written = write_regtest_bridge_pins_v2(path, regtest, **kwargs, sponsored_sighash_height=activation + 3)
+            with open(path, encoding="utf8") as f:
+                self.assertEqual(f.read(), added_bytes)
+            self.assertEqual(written, added)
+            with self.assertRaisesRegex(BridgePinError, "sponsored_sighash_height"):
+                write_regtest_bridge_pins_v2(path, regtest, **kwargs, sponsored_sighash_height=activation - 1)
+            with self.assertRaisesRegex(BridgePinError, "below activation_height"):
+                pin_sponsored_sighash_v2(path, activation - 1)
 
     def test_v2_forwarder_helpers_match_shared_vectors(self):
         """The contrib derivations the harness imports, its refund EOA
