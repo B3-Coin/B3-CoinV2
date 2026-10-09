@@ -38,6 +38,7 @@
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
 #include <modern/fn_pod.h>
+#include <modern/pos_v1.h>
 #include <modern/withdrawal_tree.h>
 #include <modern/withdrawal_v2.h>
 #include <net.h>
@@ -3536,6 +3537,27 @@ return RPCHelpMan{
 
 
 
+//! One H1 producer set in getfinalitystatus.producers (doc and JSON).
+static std::vector<RPCResult> ProducerSetDoc()
+{
+    return {
+        {RPCResult::Type::NUM, "epoch", "epoch stamped in the set (producer epoch from R_h, V1 epoch before)"},
+        {RPCResult::Type::NUM, "size", "producer count"},
+        {RPCResult::Type::NUM, "total_weight", "whole modern B3 (the W of the eligibility rule)"},
+        {RPCResult::Type::STR_HEX, "set_hash", ""},
+    };
+}
+
+static UniValue ProducerSetToJSON(const node::ValidatorSetSnapshot& set)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("epoch", set.Epoch());
+    out.pushKV("size", static_cast<uint64_t>(set.Size()));
+    out.pushKV("total_weight", set.TotalWeight());
+    out.pushKV("set_hash", set.SetHash().GetHex());
+    return out;
+}
+
 static RPCHelpMan getfinalitystatus()
 {
     return RPCHelpMan{
@@ -3566,13 +3588,42 @@ static RPCHelpMan getfinalitystatus()
                            {RPCResult::Type::NUM, "quorum_weight", /*optional=*/true, ""},
                            {RPCResult::Type::STR_HEX, "set_hash", /*optional=*/true, ""},
                        }},
-                      {RPCResult::Type::OBJ, "validator_set", /*optional=*/true, "the set in force",
+                      {RPCResult::Type::OBJ, "validator_set", /*optional=*/true,
+                       "the V1 finality set in force (block producers: see producers when H1 is configured)",
                        {
                            {RPCResult::Type::NUM, "size", ""},
                            {RPCResult::Type::NUM, "total_weight", "whole modern B3"},
                            {RPCResult::Type::NUM, "quorum_weight", ""},
                            {RPCResult::Type::STR_HEX, "set_hash", ""},
                            {RPCResult::Type::STR_HEX, "next_set_hash", ""},
+                       }},
+                      {RPCResult::Type::OBJ, "producers", /*optional=*/true,
+                       "the H1 block-producer schedule for the next block (tip+1), present only when H1 is "
+                       "configured (regtest -b3h1height); from R_h producers rotate every epoch-length blocks "
+                       "with no certificate, and an escape block (round >= escape_rounds) restarts the schedule",
+                       {
+                           {RPCResult::Type::NUM, "activation_height", "R_h, the first height whose producers follow the H1 schedule"},
+                           {RPCResult::Type::NUM, "escape_rounds", "R_escape, the smallest round of an escape block"},
+                           {RPCResult::Type::BOOL, "active", "true when tip+1 >= R_h"},
+                           {RPCResult::Type::NUM, "epoch", /*optional=*/true, "producer epoch of tip+1 (active only)"},
+                           {RPCResult::Type::NUM, "epoch_start", /*optional=*/true, "first height of that producer epoch (active only)"},
+                           {RPCResult::Type::NUM, "next_rotation", /*optional=*/true,
+                            "next height whose producer set changes without an escape: epoch_start + epoch length (R_h before activation)"},
+                           {RPCResult::Type::NUM, "snapshot_height", /*optional=*/true,
+                            "next_rotation - 1, the height of the next producer snapshot (R_h - 1 before activation)"},
+                           {RPCResult::Type::NUM, "stake_enters_at", /*optional=*/true,
+                            "first height at which a stake that is ACTIVE and bound by snapshot_height produces, unless an "
+                            "escape comes first: next_rotation + epoch length (R_h before activation)"},
+                           {RPCResult::Type::NUM, "last_escape_height", /*optional=*/true, "height of the latest escape block, -1 when none (active only)"},
+                           {RPCResult::Type::NUM, "escapes", /*optional=*/true, "escape blocks since R_h (active only)"},
+                           {RPCResult::Type::NUM_TIME, "escape_time", /*optional=*/true,
+                            "exact timestamp of an escape block on the current tip: tip time + block interval + "
+                            "escape_rounds * round seconds (active only)"},
+                           {RPCResult::Type::OBJ, "set", /*optional=*/true,
+                            "the producer set for tip+1 in a normal round (the V1 set in force before R_h)", ProducerSetDoc()},
+                           {RPCResult::Type::OBJ, "next_set", /*optional=*/true, "the producer set of the next producer epoch (active only)", ProducerSetDoc()},
+                           {RPCResult::Type::OBJ, "escape_set", /*optional=*/true,
+                            "the producer set of an escape block on the current tip (active only)", ProducerSetDoc()},
                        }},
                       {RPCResult::Type::OBJ, "finalized", /*optional=*/true, "the latest finalized checkpoint",
                        {
@@ -3673,6 +3724,52 @@ static RPCHelpMan getfinalitystatus()
                         set.pushKV("set_hash", state.current->SetHash().GetHex());
                         set.pushKV("next_set_hash", state.next ? state.next->SetHash().GetHex() : "");
                         obj.pushKV("validator_set", set);
+                    }
+                    if (consensus.h1 && consensus.modern_pos) {
+                        // H1 (regtest -b3h1height only): the producer
+                        // schedule as seen by the next block, from the same
+                        // tracker helpers that validation and production use.
+                        const Consensus::H1Params& h1{*consensus.h1};
+                        const int E{consensus.modern_pos->finality_epoch_blocks};
+                        const int next_height{tip->nHeight + 1};
+                        const bool h1_active{consensus.H1RulesActive(next_height)};
+                        UniValue producers(UniValue::VOBJ);
+                        producers.pushKV("activation_height", h1.activation_height);
+                        producers.pushKV("escape_rounds", h1.escape_rounds);
+                        producers.pushKV("active", h1_active);
+                        // Normal-round schedule of tip+1 (nullopt below R_h,
+                        // and only on a tracker inconsistency from R_h).
+                        const std::optional<node::ProducerSchedule> schedule{
+                            h1_active ? tracker.Projected(next_height, consensus).producers : std::nullopt};
+                        if (!h1_active) {
+                            producers.pushKV("next_rotation", h1.activation_height);
+                            producers.pushKV("snapshot_height", h1.activation_height - 1);
+                            producers.pushKV("stake_enters_at", h1.activation_height);
+                        } else if (schedule) {
+                            const int next_rotation{schedule->epoch_start + E};
+                            producers.pushKV("epoch", schedule->epoch);
+                            producers.pushKV("epoch_start", schedule->epoch_start);
+                            producers.pushKV("next_rotation", next_rotation);
+                            producers.pushKV("snapshot_height", next_rotation - 1);
+                            producers.pushKV("stake_enters_at", next_rotation + E);
+                            producers.pushKV("last_escape_height", schedule->last_escape_height);
+                            producers.pushKV("escapes", schedule->escapes);
+                            producers.pushKV("escape_time",
+                                             modern::ModernPosBlockTime(tip->GetBlockTime(), h1.escape_rounds,
+                                                                        *consensus.modern_pos));
+                        }
+                        if (const auto set{tracker.SetInForceAt(next_height, consensus)}) {
+                            producers.pushKV("set", ProducerSetToJSON(*set));
+                        }
+                        if (h1_active) {
+                            if (schedule && schedule->next) {
+                                producers.pushKV("next_set", ProducerSetToJSON(*schedule->next));
+                            }
+                            if (const auto set{tracker.SetInForceAt(next_height, consensus, h1.escape_rounds)}) {
+                                producers.pushKV("escape_set", ProducerSetToJSON(*set));
+                            }
+                        }
+                        obj.pushKV("producers", producers);
                     }
                     if (state.finalized) {
                         UniValue fin(UniValue::VOBJ);
