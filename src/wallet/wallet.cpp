@@ -2351,16 +2351,15 @@ void MaybeResendWalletTxs(WalletContext& context)
 }
 
 
-bool CWallet::SignTransaction(CMutableTransaction& tx) const
+std::map<COutPoint, Coin> CWallet::CoinsForInputs(const CMutableTransaction& tx) const
 {
     AssertLockHeld(cs_wallet);
 
-    // Build coins map
     std::map<COutPoint, Coin> coins;
-    for (auto& input : tx.vin) {
+    for (const CTxIn& input : tx.vin) {
         const auto mi = mapWallet.find(input.prevout.hash);
-        if(mi == mapWallet.end() || input.prevout.n >= mi->second.tx->vout.size()) {
-            return false;
+        if (mi == mapWallet.end() || input.prevout.n >= mi->second.tx->vout.size()) {
+            continue;
         }
         const CWalletTx& wtx = mi->second;
         int prev_height{0};
@@ -2371,7 +2370,19 @@ bool CWallet::SignTransaction(CMutableTransaction& tx) const
             // future block, and MEMPOOL_HEIGHT remains strictly above H.
             prev_height = MEMPOOL_HEIGHT;
         }
-        coins[input.prevout] = Coin(wtx.tx->vout[input.prevout.n], prev_height, wtx.IsCoinBase());
+        coins.insert_or_assign(input.prevout, Coin(wtx.tx->vout[input.prevout.n], prev_height, wtx.IsCoinBase()));
+    }
+    return coins;
+}
+
+bool CWallet::SignTransaction(CMutableTransaction& tx) const
+{
+    AssertLockHeld(cs_wallet);
+
+    // Build coins map: every input must be this wallet's.
+    const std::map<COutPoint, Coin> coins{CoinsForInputs(tx)};
+    for (const CTxIn& input : tx.vin) {
+        if (!coins.contains(input.prevout)) return false;
     }
     std::map<int, bilingual_str> input_errors;
     return SignTransaction(tx, coins, SIGHASH_DEFAULT, input_errors);
