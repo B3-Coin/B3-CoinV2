@@ -631,9 +631,11 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
           args.GetBoolArg("-b3flowmeshtest", false))) {
         throw std::runtime_error("-b3bridgepins requires -b3modernregtest and -b3flowmeshtest (regtest-only)");
     }
-    // Fresh finality lineage knobs (bridge V2 regtest plan section 3.3):
-    // like -b3bridgepins they only ever apply to the FlowMesh regtest.
-    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension", "-b3freshkeyheight"}) {
+    // Fresh finality lineage knobs (bridge V2 regtest plan section 3.3) and
+    // the H1/H2 chain-health knobs (finality dependency section 5): like
+    // -b3bridgepins they only ever apply to the FlowMesh regtest.
+    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension", "-b3freshkeyheight",
+                             "-b3h1height", "-b3h1escaperounds", "-b3h2checkpoint"}) {
         if (args.IsArgSet(knob) &&
             !(args.GetBoolArg("-b3modernregtest", false) &&
               args.GetBoolArg("-b3flowmeshtest", false))) {
@@ -699,6 +701,24 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
         read_fresh("-b3freshmaxepochextension", 1, b3.fresh_max_epoch_extension);
         // B-37 per-epoch keys from R_key; RegTest() bounds it by R_f.
         read_fresh("-b3freshkeyheight", 1, b3.fresh_key_height);
+        // H1 producer rotation from R_h with the R_escape escape (finality
+        // dependency section 5.1, FD-2); RegTest() requires R_h > M and
+        // bounds R_escape.
+        read_fresh("-b3h1height", 2, b3.h1_height);
+        if (args.IsArgSet("-b3h1escaperounds")) {
+            b3.h1_escape_rounds = args.GetIntArg("-b3h1escaperounds", 0);
+        }
+        // H2 hardened modern checkpoints (finality dependency section 5.3):
+        // repeatable <height>:<block hash>, the hash in display order.
+        for (const std::string& pin : args.GetArgs("-b3h2checkpoint")) {
+            const auto colon{pin.find(':')};
+            const auto height{colon == std::string::npos ? std::nullopt : ToIntegral<int>(std::string_view{pin}.substr(0, colon))};
+            const auto hash{colon == std::string::npos ? std::nullopt : uint256::FromHex(std::string_view{pin}.substr(colon + 1))};
+            if (!height || *height < 1 || !hash) {
+                throw std::runtime_error(strprintf("Invalid -b3h2checkpoint=%s: expected <height>:<block hash>", pin));
+            }
+            b3.h2_checkpoints.emplace_back(*height, *hash);
+        }
         options.b3_modern = b3;
     }
     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
@@ -781,7 +801,10 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
     }
     // The fresh finality lineage knobs likewise configure the regtest
     // staging lineage only; every other network leaves fresh_lineage unset.
-    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension", "-b3freshkeyheight"}) {
+    // The H1/H2 chain-health knobs too: no other network sets h1 or adds a
+    // modern checkpoint through them.
+    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension", "-b3freshkeyheight",
+                             "-b3h1height", "-b3h1escaperounds", "-b3h2checkpoint"}) {
         if (chain != ChainType::REGTEST && args.IsArgSet(knob)) {
             throw std::runtime_error(strprintf("%s is regtest-only", knob));
         }

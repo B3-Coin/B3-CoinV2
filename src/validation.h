@@ -695,10 +695,20 @@ public:
      * unreadable).
      * Validation, block assembly and the staking loop all read here; there
      * is no other weight path for modern-PoS blocks.
+     *
+     * H1 (bridge V2 finality dependency section 5.1, FD-2; regtest
+     * -b3h1height only): from R_h the set is the H1 producer set
+     * (node::FinalityTracker::SetInForceAt), no longer the V1 set, and
+     * `round` is the block's consensus-checked modern-PoS round: a round at
+     * or above R_escape selects the escape set Snapshot(parent) (carried
+     * over only when that snapshot is empty). No round means a normal round. `round` is
+     * ignored below R_h and on a chain without H1. Under H1, nullopt also
+     * when the producer schedule cannot be derived (an error, never w = 0).
      */
     std::optional<std::pair<CAmount, CAmount>> ModernEligibilityWeights(
         const std::optional<std::array<unsigned char, 32>>& validator_key,
-        const CBlockIndex& parent) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+        const CBlockIndex& parent,
+        std::optional<int64_t> round = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Return path to chainstate leveldb directory.
     fs::path StoragePath() const;

@@ -333,6 +333,17 @@ public:
         std::optional<int> fresh_key_height{};
         //! B-23's fresh-lineage extension on regtest profile R.
         static constexpr int DEFAULT_FRESH_MAX_EPOCH_EXTENSION{1'280};
+        //! -b3h1height (R_h) and -b3h1escaperounds (R_escape): H1 producer
+        //! rotation (finality dependency section 5.1, FD-2). Applied only
+        //! together with flowmesh_test; R_h > M. The escape rounds need R_h.
+        std::optional<int> h1_height{};
+        std::optional<int64_t> h1_escape_rounds{};
+        //! The largest R_escape the block assembler's round search reaches
+        //! (it tries rounds below its 100,000-round bound).
+        static constexpr int64_t MAX_H1_ESCAPE_ROUNDS{99'999};
+        //! -b3h2checkpoint=HEIGHT:HASH (H2, finality dependency section
+        //! 5.3): extra hardened modern checkpoints, in modern_checkpoints.
+        std::vector<std::pair<int, uint256>> h2_checkpoints{};
     };
 
     struct RegTestOptions {

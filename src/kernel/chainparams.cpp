@@ -1276,6 +1276,62 @@ public:
                 }
             }
 
+            // H1 producer rotation (finality dependency section 5.1, FD-2;
+            // owner ruling R8): REGTEST ONLY and only with -b3flowmeshtest;
+            // no other network sets consensus.h1. R_h > M keeps every
+            // SetInForceAt(M) Set_0 preview on the V1 rule, and R_escape is
+            // bounded by the block assembler's round search.
+            if (b3.h1_escape_rounds && !b3.h1_height) {
+                throw std::runtime_error("-b3h1escaperounds requires -b3h1height");
+            }
+            if (b3.h1_height) {
+                if (!b3.flowmesh_test) {
+                    throw std::runtime_error("-b3h1height requires -b3flowmeshtest");
+                }
+                const int h1_height{*b3.h1_height};
+                const int modern_start{*Consensus::ModernPosStartHeight(consensus)};
+                if (h1_height <= modern_start) {
+                    throw std::runtime_error(strprintf(
+                        "Invalid value for -b3h1height: %d must be above the first modern-PoS height M=%d",
+                        h1_height, modern_start));
+                }
+                const int64_t escape_rounds{b3.h1_escape_rounds.value_or(
+                    Consensus::H1Params::DEFAULT_ESCAPE_ROUNDS)};
+                if (escape_rounds < 1 ||
+                    escape_rounds > B3ModernRegTestOptions::MAX_H1_ESCAPE_ROUNDS) {
+                    throw std::runtime_error(strprintf(
+                        "Invalid value for -b3h1escaperounds: %d must be in [1, %d]",
+                        escape_rounds, B3ModernRegTestOptions::MAX_H1_ESCAPE_ROUNDS));
+                }
+                consensus.h1 = Consensus::H1Params{
+                    .activation_height = h1_height,
+                    .escape_rounds = escape_rounds,
+                };
+            }
+
+            // H2 hardened checkpoints (finality dependency section 5.3):
+            // REGTEST ONLY and only with -b3flowmeshtest. They join the
+            // existing modern checkpoint table, so header admission and
+            // ConnectBlock refuse a different block at a pinned height
+            // (bad-modern-checkpoint) and startup checks the active chain.
+            if (!b3.h2_checkpoints.empty()) {
+                if (!b3.flowmesh_test) {
+                    throw std::runtime_error("-b3h2checkpoint requires -b3flowmeshtest");
+                }
+                const int legacy_final{Consensus::LegacyFinalHeight(consensus).value_or(0)};
+                for (const auto& [height, hash] : b3.h2_checkpoints) {
+                    if (Consensus::GetB3Era(height, consensus) != Consensus::B3Era::MODERN) {
+                        throw std::runtime_error(strprintf(
+                            "Invalid -b3h2checkpoint height %d: must be above the legacy final height %d",
+                            height, legacy_final));
+                    }
+                    if (!consensus.modern_checkpoints.emplace(height, hash).second) {
+                        throw std::runtime_error(strprintf(
+                            "Duplicate -b3h2checkpoint height %d", height));
+                    }
+                }
+            }
+
             // Bridge V2 (node changes sections 3.1-3.4; regtest plan section
             // 3.3): REGTEST ONLY, from the pin file's v2 section, and the
             // only place any network sets bridge_v2. V2 rides on the V1

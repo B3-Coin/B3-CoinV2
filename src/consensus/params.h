@@ -124,6 +124,31 @@ struct FreshLineageParams {
 };
 
 /**
+ * H1 producer rotation (bridge V2 finality dependency section 5.1, FD-2;
+ * owner ruling R8). From R_h the block-producer set no longer follows V1
+ * certificate handovers: it rotates every E = ModernPosParams::
+ * finality_epoch_blocks blocks on a fixed schedule from R_h, using V1's
+ * Snapshot rule, binding requirement and minimum-set carry-over, with no
+ * certificate needed. A block whose consensus-checked round is at least
+ * R_escape takes its weights from Snapshot(parent) and restarts the
+ * schedule at its height (the 24 h escape). The V1 finality lineage,
+ * certificates and checkpoint authority are unchanged.
+ *
+ * Unset on every shipped network: mainnet and test networks have no R_h
+ * until a reviewed release pins one after the owner's ruling. Regtest sets
+ * it solely through the -b3h1height and -b3h1escaperounds startup knobs.
+ */
+struct H1Params {
+    //! R_escape on mainnet's 30 s rounds: 24 hours (FD-2).
+    static constexpr int64_t DEFAULT_ESCAPE_ROUNDS{2'880};
+    //! R_h: first height whose producer set comes from the H1 schedule.
+    //! Always above the first modern-PoS height M.
+    int activation_height{0};
+    //! R_escape: the smallest consensus-checked round of an escape block.
+    int64_t escape_rounds{DEFAULT_ESCAPE_ROUNDS};
+};
+
+/**
  * Parameters that influence chain consensus.
  */
 struct Params {
@@ -301,6 +326,25 @@ struct Params {
     {
         return fresh_lineage && fresh_lineage->key_height &&
                height >= *fresh_lineage->key_height;
+    }
+    /**
+     * H1 producer rotation (H1Params above). Unset means producers follow
+     * the V1 finality set at every height; only regtest's -b3h1height knob
+     * sets it.
+     */
+    std::optional<H1Params> h1;
+    //! True from R_h on a chain that configures H1. False at every height
+    //! on every shipped network.
+    bool H1RulesActive(int height) const
+    {
+        return h1 && height >= h1->activation_height;
+    }
+    //! True when a block at `height` with consensus-checked round `round`
+    //! is an H1 escape block (round >= R_escape from R_h). A missing round
+    //! is never an escape.
+    bool H1EscapeRound(int height, std::optional<int64_t> round) const
+    {
+        return H1RulesActive(height) && round && *round >= h1->escape_rounds;
     }
     /**
      * Bridge V2 regime (BridgeV2Params in consensus/bridge_params.h). Unset

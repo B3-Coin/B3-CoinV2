@@ -35,6 +35,8 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 
 namespace node {
@@ -441,7 +443,10 @@ void StakingLoop::FillChainFacts(interfaces::StakingStatus& status, const std::o
     // One stake universe: the epoch-frozen weights the validation rule will
     // apply to the next block (whole modern B3). Once an epoch set is in
     // force, newly ACTIVE stake is picked up only by a later certified set
-    // rotation, never mid-epoch.
+    // rotation, never mid-epoch. From R_h (H1, regtest -b3h1height only)
+    // these are the H1 producer set's weights for a normal round; the FD-2
+    // escape set that governs rounds at or above R_escape is not reported
+    // here.
     const auto weights{chainstate.ModernEligibilityWeights(key, *tip)};
     if (!weights) return;
     status.active_weight = weights->first;
@@ -627,6 +632,12 @@ void StakingLoop::ThreadLoop()
         // local scheduling state only; received blocks still pass through the
         // unchanged consensus validation and fork-choice paths.
         std::shared_ptr<const ValidatorSetSnapshot> set;
+        // H1 (bridge V2 finality dependency section 5.1, FD-2; regtest
+        // -b3h1height only): from R_h every round at or above R_escape is
+        // judged against the escape set, so both sets are read. Unset below
+        // R_h and without H1, where `set` governs every round as before.
+        std::optional<int64_t> escape_round;
+        std::shared_ptr<const ValidatorSetSnapshot> escape_set;
         uint256 chain_domain;
         uint256 seed;
         int64_t parent_time{0};
@@ -661,16 +672,30 @@ void StakingLoop::ThreadLoop()
                     // the exact frozen set the assembler already uses.
                     const auto weights{
                         chainstate.ModernEligibilityWeights(validator, *tip)};
-                    if (!weights) {
+                    std::optional<std::pair<CAmount, CAmount>> escape_weights;
+                    if (params.H1RulesActive(next_height)) {
+                        escape_round = params.h1->escape_rounds;
+                        escape_weights = chainstate.ModernEligibilityWeights(
+                            validator, *tip, *escape_round);
+                    }
+                    if (!weights || (escape_round && !escape_weights)) {
                         coordination_error =
                             "modern-PoS validator set is unavailable";
-                    } else if (weights->first <= 0) {
+                    } else if (weights->first <= 0 &&
+                               (!escape_weights || escape_weights->first <= 0)) {
                         coordination_error =
                             "validator is not in the active validator set (no bound, active stake)";
                     } else {
                         set = chainstate.ModernFinality().SetInForceAt(
                             next_height, params);
-                        if (!set) {
+                        // Read whenever H1 is active, also when this
+                        // validator is not in it: every validator must rank
+                        // an escape round over the same set.
+                        if (escape_round) {
+                            escape_set = chainstate.ModernFinality().SetInForceAt(
+                                next_height, params, *escape_round);
+                        }
+                        if (!set && !escape_set) {
                             coordination_error =
                                 "modern-PoS validator set is unavailable";
                         }
@@ -690,7 +715,7 @@ void StakingLoop::ThreadLoop()
             if (!SleepUnlessStopped(std::chrono::seconds{1})) break;
             continue;
         }
-        if (!coordination_error.empty() || !set || seed.IsNull()) {
+        if (!coordination_error.empty() || (!set && !escape_set) || seed.IsNull()) {
             if (coordination_error.empty()) {
                 coordination_error = "modern-PoS eligibility seed is unavailable";
             }
@@ -736,10 +761,19 @@ void StakingLoop::ThreadLoop()
             continue;
         }
 
-        PreferredProposerPlan proposer_plan;
+        // The set that governs this round: from R_h (H1) the escape set at
+        // or above R_escape, else the set in force. With no set for this
+        // round there is no proposer slot in it: wait for the next round.
+        const std::shared_ptr<const ValidatorSetSnapshot>& round_set{
+            escape_round && round >= *escape_round ? escape_set : set};
+        PreferredProposerPlan proposer_plan{
+            PreferredProposerAction::WAIT_NEXT_ROUND};
         try {
-            proposer_plan = ComputePreferredProposerPlan(
-                chain_domain, seed, next_height, round, *set, validator, pos);
+            if (round_set) {
+                proposer_plan = ComputePreferredProposerPlan(
+                    chain_domain, seed, next_height, round, *round_set,
+                    validator, pos);
+            }
         } catch (const std::exception& e) {
             SetState(strprintf("waiting: proposer coordination failed: %s",
                                e.what()),

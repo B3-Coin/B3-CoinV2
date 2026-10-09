@@ -2774,7 +2774,8 @@ bool Chainstate::ReorgFromForkViolatesFinality(const int fork_height) const
 
 std::optional<std::pair<CAmount, CAmount>> Chainstate::ModernEligibilityWeights(
     const std::optional<std::array<unsigned char, 32>>& validator_key,
-    const CBlockIndex& parent)
+    const CBlockIndex& parent,
+    const std::optional<int64_t> round)
 {
     AssertLockHeld(::cs_main);
     const Consensus::Params& consensus{m_chainman.GetConsensus()};
@@ -2789,7 +2790,12 @@ std::optional<std::pair<CAmount, CAmount>> Chainstate::ModernEligibilityWeights(
     node::FinalityTracker& finality{ModernFinality()};
     if (!finality.Sync(m_chain, m_blockman, consensus, parent,
                        bridge_index)) return std::nullopt;
-    const auto set{finality.SetInForceAt(parent.nHeight + 1, consensus)};
+    // H1 (regtest knob only): a producer schedule the tracker cannot derive
+    // is an error, never an ineligible validator.
+    if (!finality.ProducerScheduleAvailable(parent.nHeight + 1, consensus)) return std::nullopt;
+    // From R_h a round >= R_escape selects the escape set Snapshot(parent);
+    // below R_h (and without H1) the round is ignored.
+    const auto set{finality.SetInForceAt(parent.nHeight + 1, consensus, round)};
     if (!set) return std::make_pair(CAmount{0}, CAmount{0});
     const auto index{validator_key ? set->IndexOf(*validator_key) : std::nullopt};
     const CAmount w{index ? static_cast<CAmount>(set->Members()[*index].weight) : CAmount{0}};
@@ -4614,8 +4620,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                 // validator set in force at this height -- ACTIVE
                                 // stake joined with a non-revoked FINALITY_KEY
                                 // binding, in whole modern B3 -- the same snapshot
-                                // that defines the finality quorum.
-                                const auto weights{ModernEligibilityWeights(*key, *pindex->pprev)};
+                                // that defines the finality quorum. From R_h (H1,
+                                // regtest knob only) they come from the H1 producer
+                                // schedule instead, and the block's own round
+                                // selects the escape set when it is at least
+                                // R_escape. A non-exact time has no round: the
+                                // normal set is read and CheckModernPosBlock
+                                // refuses the block (bad-pos-time) as before.
+                                const auto round{modern::DecodeModernPosRound(ctx.parent_time, block.GetBlockTime(),
+                                                                              *consensus.modern_pos)};
+                                const auto weights{ModernEligibilityWeights(*key, *pindex->pprev, round)};
                                 if (!weights) {
                                     state.Error("modern-PoS validator set is unavailable");
                                 } else {

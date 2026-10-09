@@ -9,10 +9,12 @@
 #include <logging.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
+#include <modern/pos_v1.h>
 #include <node/blockstorage.h>
 #include <node/bridge_state.h>
 #include <util/check.h>
 
+#include <algorithm>
 #include <limits>
 
 namespace node {
@@ -100,8 +102,35 @@ std::shared_ptr<const ValidatorSetSnapshot> FinalityTracker::SuccessorSet(const 
     return std::make_shared<const ValidatorSetSnapshot>(s.current->WithEpoch(successor_epoch));
 }
 
+std::shared_ptr<const ValidatorSetSnapshot> FinalityTracker::SyncedTipSnapshot() const
+{
+    if (!m_tip_snapshot.filled || m_tip_snapshot.tip != m_synced_tip) {
+        const auto snap{SnapshotAt(0, m_synced_height)};
+        m_tip_snapshot.filled = true;
+        m_tip_snapshot.tip = m_synced_tip;
+        m_tip_snapshot.snapshot = snap ? std::make_shared<const ValidatorSetSnapshot>(*snap) : nullptr;
+    }
+    return m_tip_snapshot.snapshot;
+}
+
+std::shared_ptr<const ValidatorSetSnapshot> FinalityTracker::ProducerSetOrCarry(
+    const uint64_t epoch, const std::shared_ptr<const ValidatorSetSnapshot>& fallback,
+    const size_t min_size) const
+{
+    // V1's Snapshot rule (ACTIVE stake joined with a non-revoked
+    // FINALITY_KEY binding); below min_size the fallback is carried over
+    // (V1's carry-over when min_size is MIN_FINALITY_SET).
+    const auto snap{SyncedTipSnapshot()};
+    if (snap && snap->Size() >= std::max<size_t>(min_size, 1)) {
+        return std::make_shared<const ValidatorSetSnapshot>(snap->WithEpoch(epoch));
+    }
+    if (fallback) return std::make_shared<const ValidatorSetSnapshot>(fallback->WithEpoch(epoch));
+    return nullptr;
+}
+
 void FinalityTracker::Reset()
 {
+    m_tip_snapshot = TipSnapshotMemo{};
     m_state = State{};
     m_stakes.MarkDirty();
     m_bindings.MarkDirty();
@@ -113,9 +142,14 @@ void FinalityTracker::Reset()
 
 // ------------------------------------------------------------ projection
 
-FinalityTracker::State FinalityTracker::Projected(const int height, const Consensus::Params& params) const
+FinalityTracker::State FinalityTracker::Projected(const int height, const Consensus::Params& params,
+                                                 const std::optional<int64_t> round) const
 {
     State s{ProjectedV1(height, params)};
+    // H1 (regtest knob only): the producer schedule, from the same private
+    // trackers; it never touches a V1 field. Below R_h `producers` stays
+    // m_state's, which is empty there.
+    if (params.H1RulesActive(height)) s.producers = ProjectProducers(height, params, round);
     // Fresh lineage (regtest knob only): projected after V1 and from the same
     // private trackers (Snapshot(height - 1)); it never touches V1 fields.
     // In fresh-key mode (R_key) the committees follow the B-37 seat rules.
@@ -176,9 +210,81 @@ FinalityTracker::State FinalityTracker::ProjectedV1(const int height, const Cons
     return s;
 }
 
-std::shared_ptr<const ValidatorSetSnapshot> FinalityTracker::SetInForceAt(const int height,
-                                                                          const Consensus::Params& params) const
+bool FinalityTracker::ProducerInputsReady(const int height, const Consensus::Params& params) const
 {
+    if (!params.H1RulesActive(height) || !params.modern_pos) return false;
+    // Chain parameters keep R_h above the first modern-PoS height M (the
+    // V1 Set_0 bootstrap at M stays V1); anything else fails closed.
+    const std::optional<int> modern_start{Consensus::ModernPosStartHeight(params)};
+    const int activation{params.h1->activation_height};
+    if (!modern_start || activation <= *modern_start) return false;
+    // The private trackers (and m_state) hold the chain exactly as of height - 1.
+    if (m_synced_height != height - 1) return false;
+    // Above R_h the schedule stored for height - 1 is the input.
+    return height == activation || m_state.producers.has_value();
+}
+
+std::optional<ProducerSchedule> FinalityTracker::ProjectProducers(const int height, const Consensus::Params& params,
+                                                                 const std::optional<int64_t> round) const
+{
+    if (!ProducerInputsReady(height, params)) return std::nullopt;
+    const Consensus::ModernPosParams& pos{*params.modern_pos};
+    const int E{pos.finality_epoch_blocks};
+    const size_t min_set{static_cast<size_t>(pos.min_finality_set)};
+
+    ProducerSchedule p;
+    if (height == params.h1->activation_height) {
+        // Bootstrap: ProducerSet_0 = ProducerSet_1 = Snapshot(R_h - 1), or the
+        // V1 set in force at R_h - 1 when that snapshot is below the floor.
+        p.epoch = 0;
+        p.epoch_start = height;
+        p.current = ProducerSetOrCarry(0, m_state.current, min_set);
+        p.next = p.current ? std::make_shared<const ValidatorSetSnapshot>(p.current->WithEpoch(1)) : nullptr;
+    } else {
+        p = *m_state.producers;
+        // Fixed rotation, no certificate needed: ProducerSet_(k+1) takes
+        // force and ProducerSet_(k+2) = Snapshot(height - 1) (or carry-over).
+        if (height >= p.epoch_start + E) {
+            p.epoch += 1;
+            p.epoch_start = height;
+            p.current = p.next;
+            p.next = ProducerSetOrCarry(p.epoch + 1, p.current, min_set);
+        }
+    }
+    // Escape (FD-2): a block in round >= R_escape takes its weights from
+    // Snapshot(parent), whatever its size, and restarts the schedule at its
+    // own height with both sets equal to it. No minimum-set floor: the
+    // escape exists for liveness when the set in force is offline, and the
+    // snapshot already holds every bound, ACTIVE staker. Only an empty
+    // snapshot carries the set otherwise in force over.
+    if (params.H1EscapeRound(height, round)) {
+        auto set{ProducerSetOrCarry(p.epoch + 1, p.current, /*min_size=*/1)};
+        p.epoch += 1;
+        p.epoch_start = height;
+        p.next = set ? std::make_shared<const ValidatorSetSnapshot>(set->WithEpoch(p.epoch + 1)) : nullptr;
+        p.current = std::move(set);
+        p.last_escape_height = height;
+        ++p.escapes;
+    }
+    return p;
+}
+
+bool FinalityTracker::ProducerScheduleAvailable(const int height, const Consensus::Params& params) const
+{
+    // Exactly ProjectProducers' preconditions (ProducerInputsReady).
+    return !params.H1RulesActive(height) || ProducerInputsReady(height, params);
+}
+
+std::shared_ptr<const ValidatorSetSnapshot> FinalityTracker::SetInForceAt(const int height,
+                                                                          const Consensus::Params& params,
+                                                                          const std::optional<int64_t> round) const
+{
+    // H1 (regtest knob only): from R_h block producers follow the producer
+    // schedule; `round` selects the escape set. Below R_h, V1 unchanged.
+    if (params.H1RulesActive(height)) {
+        const auto producers{ProjectProducers(height, params, round)};
+        return producers ? producers->current : nullptr;
+    }
     // Cheap form of Projected(): the set governing `height` is Set_{e+1}
     // when the rotation fires there, else Set_e (Set_{e+2} need not be built).
     const std::optional<int> modern_start{Consensus::ModernPosStartHeight(params)};
@@ -347,7 +453,29 @@ bool FinalityTracker::ApplyModern(const CBlock& block, const CBlockIndex& index,
                                   const Consensus::Params& params,
                                   const BridgeStateIndex* bridge_index)
 {
-    State s{Projected(index.nHeight, params)};
+    // H1: the block's own consensus-checked round decides whether it is an
+    // escape block (block data only: the exact timestamps of the block and
+    // its parent). A connected block always has an exact round.
+    const bool h1_active{params.H1RulesActive(index.nHeight)};
+    std::optional<int64_t> round;
+    if (h1_active) {
+        if (index.pprev && params.modern_pos) {
+            round = modern::DecodeModernPosRound(index.pprev->GetBlockTime(), block.GetBlockTime(),
+                                                 *params.modern_pos);
+        }
+        if (!round) {
+            LogWarning("FinalityTracker: connected block %s (height %d) has no exact modern-PoS round",
+                       index.GetBlockHash().ToString(), index.nHeight);
+            return false;
+        }
+    }
+    State s{Projected(index.nHeight, params, round)};
+    if (h1_active && !s.producers) {
+        // Never store a guessed producer schedule: rebuild through Sync().
+        LogWarning("FinalityTracker: connected block %s (height %d): H1 producer schedule unavailable",
+                   index.GetBlockHash().ToString(), index.nHeight);
+        return false;
+    }
     if (s.fresh_unavailable) {
         // Never store a guessed fresh state: the caller marks the tracker
         // dirty and the next Sync() rebuilds it.
