@@ -113,6 +113,9 @@ EXTENDED_SCRIPTS = [
     'feature_b3_bridge_rt6_route_b_d3.py',
     # Owner ruling R10: a bUSD-only wallet burns to routes (d1) and (d3) with a relayer-sponsored fee (as RT6).
     'feature_b3_bridge_rt7s_sponsored_fees.py',
+    # RT1: H1 producer rotation, escape and H2 checkpoint (regtest-only knobs); local nodes only.
+    'feature_b3_h1_producer_rotation.py --fixture=B',
+    'feature_b3_h1_producer_rotation.py --fixture=I',
 ]
 
 # Special script to run each bench sanity check
