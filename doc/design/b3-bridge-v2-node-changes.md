@@ -54,8 +54,9 @@ This document adds a height-activated **bridge V2 regime**
 
 **Numbers.** Architecture §8 owns every figure; this document uses only its
 block legs (t_chain 2-4 blocks, t_fin 22-32, t_fm 31-32). Burns need native B3
-(B-17; N-3); inflow above the caps (~7,700 bUSD a day at 78 s [computed:
-10,000 per 1,440 blocks]) waits.
+(B-17; N-3), which a relayer may pay for a bUSD-only user (R10, §11.4);
+inflow above the caps (~7,700 bUSD a day at 78 s [computed: 10,000 per
+1,440 blocks]) waits.
 
 ---
 
@@ -771,7 +772,9 @@ nothing may clear the V1 `lineage_broken` flag before V. The smoke vault
 
 - `bridgewithdraw` (`src/wallet/rpc/assets.cpp:1985-2190`): `ethereum` (d1)
   or `arbitrum` (d3: recipient F_x plus exit block); shows gate reason,
-  `closes_at`, catch-up delay; refuses legacy bUSD.
+  `closes_at`, catch-up delay; refuses legacy bUSD. With `options.sponsor`
+  (R10) it returns a signed, unbroadcast partial for a relayer to complete
+  with a native-B3 fee input (§11.4).
 - `claimbridgedeposit` (`:1845`): kind 3, V2 store. `submitbridgecarrier`
   (`:1750`): kinds 1-4, 6, 9, 13, V1 or V2 by height (`:780-795`).
 - New `bridgeforwarderaddress`: F_d or F_x address and p by the contracts
@@ -800,6 +803,344 @@ nothing may clear the V1 `lineage_broken` flag before V. The smoke vault
   **default chaining**: dependent records go out once each source is on the
   active chain; `--wait-b3-final` keeps today's behaviour (`:1744-1761`)
   (B-16).
+- Sponsored burn fees (R10) are not part of this relayer: the wallet RPC
+  `bridgesponsorburn` and `contrib/b3bridge/b3_bridge_sponsor.py` complete
+  a user's partial with a native-B3 fee input (§11.4).
+
+### 11.4 Sponsored native-B3 fees (R10) [I]
+
+*Realized on regtest (slice n4b, after `239c27f`; pending owner review).*
+Owner ruling R10 (architecture OI-8; N-3, §16) lets a wallet that holds
+bUSD V2 and no native B3 withdraw by a bridge V2 burn, routes (d1) and
+(d3). The user's wallet signs the burn with a small bUSD tip to a named
+relayer, and the relayer adds the native-B3 fee input. Burns still pay
+native B3 (B-17): consensus gains no fee-in-bUSD rule. Code paths below
+name files and functions; line numbers are at `239c27f` and only for
+files this slice did not change.
+
+**Why SIGHASH_ALL|ANYONECANPAY binds a V2 burn [E].**
+
+1. *Where SIGHASH_ALL came from.* `SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL`
+   (`src/script/interpreter.h`) is set for every transaction that carries
+   any bridge withdrawal. In the mempool the source is
+   `authorization.HasWithdrawal()` (`MemPoolAccept::PreChecks`); in blocks,
+   `bridge_withdrawal_transactions` in `ConnectBlock`, filled from the
+   managed-V1, decentralized-V1 and V2 withdrawals. V2 burns and kind 16
+   sweeps inherited the managed-V1 rule unchanged.
+2. *Why it was required.* The type-10 record sits outside the txid and the
+   sighash. Its zero-value BRIDGE_RECORD output carries
+   `TaggedHash("B3/BRIDGE/RECORD/V1", record frame)`
+   (`src/modern/bridge_binding.h:23-29`), so the owner's signature must
+   commit that output.
+   - NONE commits no output.
+   - SINGLE commits only the output at the signing input's index, so every
+     other output stays mutable: the binding (and with it the recipient),
+     or the burn, tip and change.
+   - ALL|ANYONECANPAY was refused only because it leaves the input set
+     unsigned (`src/test/asset_authorization_tests.cpp:371-421`). That
+     matters for txid-keyed managed-V1 operator requests, not for V2.
+3. *What ALL|ANYONECANPAY still signs.* The legacy, BIP143 and BIP341
+   sighashes are Core's. The only B3 difference is the legacy nTime, which
+   a post-H modern transaction does not carry. ANYONECANPAY drops only the
+   other inputs (prevouts, amounts, scripts, sequences). It keeps nVersion,
+   nLockTime, the input's own prevout, script code, amount and nSequence,
+   and every output, so it signs the binding output.
+4. *The signed outputs fix the record.* The type-10 record must be the
+   transaction's only MPA record, with exactly one binding output equal to
+   it (`src/modern/mpa.h:276-287`). The signed outputs therefore fix every
+   record field: registry id, burn index, amount, Ethereum recipient or
+   F_x, and the (d3) exit block p.
+5. *What others can change: inputs only.* Non-native assets are conserved
+   exactly (`src/modern/asset.h:321-343`); no issuance or mint can ride
+   beside the sole kind 6 record. With the outputs fixed, an added input
+   that carries only native B3 can only pay fee. Each user signature
+   commits only its own input, though (none of the three sighashes commits
+   the input index or the other inputs). With more than one user input, a
+   third party can therefore also drop or replace a user input, supplying
+   the same bUSD itself: a partial with user inputs A and B can confirm as
+   both {A, X} and {B, Y}, two burns with the same outputs and two leaves.
+   Neither the user (outputs fixed; each user input is spent once) nor the
+   bridge (each leaf is a real burn) is harmed, but wallets and relayers
+   must not assume at most one burn per partial (see *Txid malleability*).
+6. *Nothing V2 needs is lost.*
+   - The leaf V2 holds no B3 txid (`src/modern/withdrawal_v2.h:57-69`); its
+     id and height are assigned when the block connects.
+   - No bridge code reads `tx.vin`.
+   - What is lost is input-set and txid stability before confirmation.
+     Neither matters to a V2 claim, and both are what sponsorship needs.
+7. *Policy needs no change.* Core's `IsDefinedHashtypeSignature` already
+   accepts 0x81 under STRICTENC, and `src/policy/` has no B3 sighash rule.
+
+**Consensus rule.**
+
+- **Flag.** `SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS`
+  (`src/script/interpreter.h`), checked by `BridgeSighashTypeAllowed` in
+  `src/script/interpreter.cpp`.
+  - Accepted: ECDSA 0x01 and 0x81; Schnorr 64-byte, 0x01 and 0x81.
+  - Refused: NONE, SINGLE, NONE|ACP and SINGLE|ACP
+    (`SCRIPT_ERR_SIG_HASHTYPE`, `SCRIPT_ERR_SCHNORR_SIG_HASHTYPE`).
+  - It only restricts, like `SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL`; with both
+    set, only ALL passes. A restricting flag keeps script-flag
+    monotonicity, which fuzz/script_flags relies on, so the R10 form is a
+    second flag rather than a relaxing modifier of the first.
+- **Pin.** `BridgeV2Params::sponsored_sighash_height`
+  (`src/consensus/bridge_params.h`), a pin of its own at or above V;
+  `Consensus::Params::BridgeV2SponsoredSighashActive(height)` is true from
+  it on a chain whose complete envelope sets it. Unset by default and on
+  every shipped network; only the regtest `-b3bridgepins` `v2` key
+  `sponsored_sighash_height` sets it (parser and `Valid()` refuse a value
+  below V; the record guard's file hash covers it; it enters no identity).
+  A complete envelope without the pin keeps every V2 burn at SIGHASH_ALL.
+- **Selection.** `node::BridgeV2SponsoredSighashAllowed`
+  (`src/node/bridge_state.h`) is true for a bridge V2 leaf that is not a
+  sweep, with no mint, managed-V1 or decentralized-V1 withdrawal beside it,
+  and only while `BridgeV2SponsoredSighashActive(height)` holds.
+- **Where it applies** (`src/validation.cpp`):
+  - mempool: `PreChecks` sets `m_bridge_sponsored_sighash` (at the next
+    block's height), and `PolicyScriptChecks` and `ConsensusScriptChecks`
+    add the flag;
+  - blocks: `ConnectBlock` collects `bridge_sponsored_sighash_transactions`
+    from the V2 withdrawals (at the block's height) and adds the flag at
+    both script-check calls. Assembly, `TestBlockValidity` and reindex all
+    run through `ConnectBlock`;
+  - per input: in `CheckInputScriptsWithFlowMeshVaults` the flag alone
+    selects the R10 form, with or without `require_bridge_sighash_all`, in
+    place of `SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL`. The bridge bits `flags`
+    carries bind every input, a frozen pre-H fee input included, so the
+    script-cache key, which commits `flags`, fully determines the rule.
+- **What stays at ALL.**
+  - Managed-V1 and decentralized-V1 withdrawals: mainnet behaviour.
+  - Kind 16 sweeps. `VerifyVaultSweepV2` is permissionless, the sweep
+    spends no bUSD owner input and the submitter pays the native fee, so
+    there is nothing to sponsor.
+  - Every V2 burn on a chain without the pin, and below the pin.
+- **Gate.** Mainnet, testnet, testnet4 and signet set neither the envelope
+  (`Consensus::Params::bridge_v2`, §12.2) nor the pin, so the rule is
+  false there at every height (unit-tested). Pinning `bridge_v2` in a
+  future release does not turn it on: that needs the separate pin.
+
+**Wallet: `bridgewithdraw` `options.sponsor`**
+(`src/wallet/rpc/assets.cpp`).
+
+- **Arguments.** `{"tip_address": <B3 address>, "tip_amount": <integer raw
+  bUSD>}`; any other key is refused. `tip_address` resolves as any owner
+  address does, so an invalid or inactive-witness address is refused.
+- **Refusals specific to the sponsor option:**
+  - bridge V2 burns or the sponsored sighash rule are not active for the
+    next block (`RPC_MISC_ERROR`);
+  - `broadcast` is true;
+  - `fee_rate` is given;
+  - `amount + tip_amount` exceeds MAX_MONEY.
+- **The partial.**
+  - Inputs: bUSD only, `amount + tip_amount`, in outpoint order.
+  - Outputs: `[0]` the BURN, `[1]` the BRIDGE_RECORD binding, `[2]` the bUSD
+    tip to `tip_address`, `[3]` bUSD change if any. There is no native input
+    or output.
+  - nLockTime: anti-fee-sniping.
+  - Signing: every input `SIGHASH_ALL|SIGHASH_ANYONECANPAY`.
+  - Checks: the same prevalidation and authorization cross-checks as an
+    unsponsored burn.
+- **What it does with the partial.** Nothing is committed or broadcast.
+  The bUSD inputs are locked in memory so this wallet does not spend them
+  meanwhile.
+- **A shared partial is irrevocable until an input is spent.**
+  `lockunspent true` (or a restart) only lets this wallet spend the inputs
+  again; it does not withdraw the partial, which anyone holding it may
+  still complete. Revoking it needs a spend of one of its inputs, which a
+  bUSD-only user cannot fund without native B3 or another sponsor. Funds
+  are not at risk: the outputs are fixed, and a late completion fails
+  closed once the gate closes, at the B-23 migration height h_m, or when
+  an input is gone.
+- **Result.** `hex`, `sponsored`, `withdrawal_status: awaiting-sponsor`,
+  `sponsor {tip_address, tip_amount, tip_vout: 2, sighash}` and
+  `locked_inputs`.
+- **Without `options.sponsor`** behaviour is unchanged: a bUSD-only wallet
+  fails with `RPC_WALLET_INSUFFICIENT_FUNDS`.
+- **Helpers** (`src/wallet/bridge_sponsor.{h,cpp}`):
+  `SPONSORED_BURN_SIGHASH`, `CheckSponsoredBurnPartial`,
+  `VerifySponsoredUserInputs` and `SelectSponsorFeeCoin`. The coin map the
+  wallet signs with is `CWallet::CoinsForInputs` (`src/wallet/wallet.cpp`),
+  which `CWallet::SignTransaction(tx)` also uses, so both keep one
+  creation-height rule for the asset signing context.
+
+**Relayer: `bridgesponsorburn "hexstring" min_tip max_fee ( {"fee_rate",
+"fee_label", "minconf": 1, "broadcast": true} )`** (wallet RPC,
+`src/wallet/rpc/assets.cpp`; registered in `src/wallet/rpc/wallet.cpp` and
+`src/rpc/client.cpp`). `max_fee` is required and at most `-maxtxfee`.
+Checks, in order:
+
+1. Every input is an unspent coin, not spent in the mempool, and none
+   belongs to the relayer wallet.
+2. `CheckSponsoredBurnPartial`, with stable error prefixes:
+   - `sponsor-no-inputs`;
+   - `sponsor-not-a-bridge-burn`: not exactly one kind 6 record under the V2
+     record set with its exact, sole binding output;
+   - `sponsor-input-unsigned`;
+   - `sponsor-native-output`: the partial may pay no native B3;
+   - `sponsor-tip-missing` or `sponsor-tip-ambiguous`: not exactly one
+     output pays this wallet;
+   - `sponsor-tip-not-busd`: that output is not a bUSD V2 owner output;
+   - `sponsor-tip-below-minimum`: the tip is below `min_tip`.
+3. Node prevalidation accepts it as a bridge V2 burn that is not a sweep
+   (entry, gate and reserve), and `node::BridgeV2SponsoredSighashAllowed`
+   holds for the next block.
+4. **Fee coin** (`SelectSponsorFeeCoin`): the smallest spendable, solvable,
+   unlocked native coin, not spent in the mempool, on an address labelled
+   `fee_label` when given, between the needed fee and `max_fee`. The
+   needed fee is the upper-bound vsize at `fee_rate`, or at the wallet
+   estimate. If no coin fits: `RPC_WALLET_INSUFFICIENT_FUNDS`, "refill the
+   fee pool".
+5. The fee input is appended (nSequence `MAX_BIP125_RBF_SEQUENCE`) and only
+   it is signed, `SIGHASH_ALL`. The signing map holds every spent coin, as
+   a BIP341 (taproot) fee input needs; the relayer cannot sign the user's
+   inputs, whose scripts are restored byte for byte.
+6. `VerifySponsoredUserInputs` re-verifies every user input over the
+   completed transaction under `STANDARD_SCRIPT_VERIFY_FLAGS |
+   SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS`.
+   - A changed output fails as `sponsor-signature-invalid: input N`.
+   - A pre-H coin fails as `sponsor-legacy-input`; bUSD never predates H.
+   - The fee must be at least `fee_rate` × vsize and at most `max_fee`.
+7. The fee coin is locked in memory, with or without broadcast. The
+   transaction is then broadcast while `cs_wallet` is held, as
+   `CWallet::CommitTransaction` does; the coin is unlocked if the broadcast
+   fails.
+
+The result has `txid`, `ptxid`, `hex`, `broadcast`, `network_fee`, `vsize`,
+`fee_input`, `tip`, `burn` and `proof_rpc_after_confirmation`. Once the user
+has signed, the relayer cannot raise or lower the tip, redirect the change
+or change the recipient. Re-signing its own input does not help either:
+the mempool refuses the transaction on the user's input 0.
+
+**Fee pool: `contrib/b3bridge/b3_bridge_sponsor.py`** (stdlib, regtest only;
+local endpoint only, read without a proxy; its transport is
+`b3_bridge_observe_v2.JsonRpc` with Decimal hooks).
+
+- `refill` keeps `--count` coins of exactly `--value` B3 on fresh legacy
+  (P2PKH) addresses labelled `b3-sponsor-fee`, created in one `sendmany`.
+- `complete` calls `bridgesponsorburn` with the required `--max-fee` (pass
+  the pool value: each fee coin is then spent whole as the fee, and no
+  change output is needed) and `fee_label` = `--label` (default the pool
+  label), so no coin outside the pool can pay the fee.
+- `release` unlocks stale fee-coin locks: every locked coin on a pool
+  address that is still unspent and not spent in the mempool, that is,
+  whose completion lost to another one or was never broadcast. Spent and
+  non-pool locked coins stay locked.
+- `status` reports the pool, the bUSD V2 tips and the market note below.
+- The operator guide is in `contrib/b3bridge/README.md`.
+
+**Txid malleability until confirmation.**
+
+- The txid changes when the relayer adds its input.
+- Until the burn confirms, anyone holding the partial, or seeing a
+  broadcast completion, can build a competing completion with another fee
+  input and replace it by RBF.
+  - The outputs cannot change, so the user is unharmed, and the tip still
+    pays the named relayer.
+  - Completions that spend the same user inputs conflict, so at most one
+    of them confirms. With more than one user input, completions that
+    split the user inputs (point 5 above) do not conflict, and
+    `getbridgewithdrawals` may then list more than one leaf for one
+    partial. The withdrawal id (`BridgeWithdrawalId{txid, burn index}`) is
+    each confirmed one's.
+  - A relayer whose completion lost keeps its fee coin locked in memory
+    until `lockunspent`, a restart or the contrib `release`; `refill` does
+    not count a locked coin, so release first.
+- Wallets and tools find the confirmed burn with `getbridgewithdrawals` or
+  the wallet's transaction list before calling `getbridgewithdrawalproofv2`.
+  Both RPCs' help text says so.
+
+**Tips and the missing market.** Tips accrue as bUSD V2 in the relayer
+wallet. R10's "later buys B3" needs a bridge V2 B3/bUSD FlowMesh market,
+which does not exist yet and is not built here. Until it exists, relayers
+fund the pool with native B3 from elsewhere. `bridgesponsorburn`'s help and
+the contrib `status` output both say this.
+
+**Not built.**
+
+- Sponsored `sendasset` and other bUSD transfers. They carry no bridge
+  flag, so ALL|ACP is already consensus-valid and standard for them; only
+  wallet support is missing.
+- The pre-agreed change output named in the user's outputs. The partial
+  pays no native output (`sponsor-native-output`), so the fee coin is
+  spent whole.
+- Consolidating a multi-input partial into one bUSD input (it would need a
+  native fee of its own).
+- PSBT: the partial travels as raw hex.
+- Kind 16 sweeps (above); forwarders, H1 and B-22 (outside this slice);
+  the FlowMesh USER_DEPOSIT mint (architecture §16 item 13).
+
+**For owner review.**
+
+1. The rule has its own pin (`sponsored_sighash_height`), unset on every
+   shipped network. A release that pins `bridge_v2` on mainnet leaves R10's
+   sighash relaxation off unless the owner also pins that height.
+2. The tip goes to the relayer the user names. There is no relayer
+   discovery, no price feed for the tip and no fee-in-bUSD fallback.
+3. Fee coins are spent whole, without change. A relayer's cost per burn is
+   its pool value, bounded by the required `max_fee` (at most `-maxtxfee`).
+4. A multi-input partial may confirm as more than one burn (point 5).
+
+**Tests.**
+
+- Unit `bridge_sponsored_fee_tests` (`src/test/bridge_sponsored_fee_tests.cpp`):
+  - `bridge_sighash_flags_ecdsa` and `bridge_sighash_flags_schnorr`: the
+    sighash bytes each flag set admits;
+  - `owner_all_anyonecanpay_commits_every_output`: tip, change, recipient,
+    nLockTime and version are all committed; added inputs are allowed;
+    NONE|ACP and SINGLE|ACP are refused;
+  - `sponsored_sighash_gate_regtest_only`: false below V and below the pin;
+    false for a complete envelope without the pin, for a pin below V, for
+    sweeps, V1 withdrawals, mints and an invalid envelope; false at every
+    height on MAIN, TESTNET, TESTNET4, SIGNET and regtest without a pin
+    file;
+  - `check_input_scripts_selects_sponsored_rule`: the rule selected through
+    `CheckInputScripts`, with cache separation, including a frozen pre-H
+    fee input, and the flag selecting the rule with or without
+    `require_bridge_sighash_all`.
+- Unit `bridge_v2_gate_tests` `sponsored_sighash_in_mempool_and_blocks`: a
+  real burn of minted bUSD V2 signed ALL|ACP through mempool admission and
+  block validation (`TestBlockValidity`, then a connected block): refused
+  without the pin and below it, accepted from it, never for NONE or
+  SINGLE; plain ALL accepted throughout.
+- Unit `bridge_regtest_pins_tests`: the `sponsored_sighash_height` key
+  (absent means off; below V, too large or not an integer refused; mapped
+  into `bridge_v2`; no identity changes).
+- Existing cases that pass unchanged: `asset_authorization_tests`
+  `managed_bridge_withdrawal_requires_full_transaction_sighash` and
+  `bridge_sighash_flag_accepts_only_full_schnorr_modes`.
+- Wallet unit `bridge_sponsor_tests` (`src/wallet/test/bridge_sponsor_tests.cpp`):
+  - `sponsored_partial_accepted_and_completed`;
+  - `partial_structure_refusals`;
+  - `relayer_cannot_change_outputs`: the tip raised or lowered, the change
+    redirected, the recipient rebuilt;
+  - `user_input_sighash_and_provenance`;
+  - `select_sponsor_fee_coin`;
+  - `wallet_coins_for_inputs_and_sponsored_signing`: `CoinsForInputs` and
+    `SignTransaction(tx)` refusing an unknown input.
+- Offline contrib tests: `contrib/b3bridge/test_b3_bridge_sponsor.py`
+  (refill, status, complete with the required `--max-fee` and the pool
+  label, release).
+- Functional RT7s (`test/functional/feature_b3_bridge_rt7s_sponsored_fees.py`,
+  an extended script after RT6), in RT6's two-anvil environment with
+  `sponsored_sighash_height` = V added to the pin file. A non-validator
+  node hosts a "user" wallet with bUSD V2 and zero native B3, and a
+  "relayer" wallet with a contrib fee pool. RT7s checks that:
+  - the sponsor option is refused below V;
+  - an unsponsored burn fails for lack of fee, and the partial alone is
+    refused only for its zero fee (`min relay fee not met`);
+  - `bridgesponsorburn` refuses a low minimum, a foreign tip, a raised tip,
+    a lowered tip (by the minimum, and with a lower minimum by the
+    signature check), redirected change and a `max_fee` above `-maxtxfee`;
+  - a tip raised in the completed transaction, with the relayer's own input
+    re-signed, is refused by the mempool;
+  - the contrib `release` unlocks the fee coin of an unsent completion and
+    nothing once it is in the mempool;
+  - (d1) and (d3) complete and are mined;
+  - the user still holds no native B3;
+  - Vault V2 releases to ETH_RECIPIENT, and USDT0 reaches the user on the
+    Arbitrum stand-in;
+  - `status` reports 2 × TIP in tips;
+  - `-reindex` replays both sponsored burns.
 
 ---
 
@@ -967,7 +1308,7 @@ LP; none, §6).
 
 | ID | Status | Node default |
 |---|---|---|
-| **N-3** | Ruled 2026-10-05 (R10; architecture OI-8) | Native B3 for a bUSD-only user's burn: sponsored fees, a bUSD tip to a relayer that adds the native-B3 fee input (off-consensus; no fee-in-bUSD change), chosen over a starter drop (the earlier default) and fees in bUSD; R10 did not address the FlowMesh USER_DEPOSIT mint (architecture §16 item 13) |
+| **N-3** | Ruled 2026-10-05 (R10; architecture OI-8); implemented on regtest (slice n4b), pending owner review | Native B3 for a bUSD-only user's burn: sponsored fees, a bUSD tip to a relayer that adds the native-B3 fee input (no fee-in-bUSD change; the only consensus change is the `SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS` rule admitting the user's SIGHASH_ALL\|ANYONECANPAY on V2 burns, gated by its own `sponsored_sighash_height` pin, §11.4), chosen over a starter drop (the earlier default) and fees in bUSD; R10 did not address the FlowMesh USER_DEPOSIT mint (architecture §16 item 13) |
 | **N-4** | Narrowed | Kind 13 in consensus (yes); the kind 12 queue withdrawn |
 | **N-5** | Open | At least one fork-extension hard fork per Ethereum fork, 60 days ahead |
 | **B-37** (new) | Default yes | Signer records outside the wallet file; erasure per §7.7 |
@@ -1001,7 +1342,8 @@ Each needs its own ruling (architecture §17); revision 10 holds the full rules.
 ## 18. Open items
 
 1. Owner adoption: the wind-down margin (B-13), B-22's approval, B-23's
-   residual, N-4, N-5 (N-3 ruled by R10).
+   residual, N-4, N-5 (N-3 ruled by R10; its regtest implementation
+   choices are listed for review in §11.4).
 2. **F_d intake** (contracts spec §7.4): a user without Ethereum ETH needs a
    relayer to accept p; endpoints are relayer configuration, not consensus.
 3. Recipient pre-check endpoint (§11.2); re-credit of burns above a frozen

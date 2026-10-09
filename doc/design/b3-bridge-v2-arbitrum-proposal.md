@@ -320,7 +320,8 @@ https://docs.usdt0.to/overview/the-legacy-mesh) and then (b), or an exchange.
 
 Starting in FlowMesh V1 adds t_fm and a checkpoint wait (69-92+ min [H]).
 Burns need native B3 fees (`src/wallet/rpc/assets.cpp:1985-2020`; B-17;
-OI-8). At an epoch start a burn needs the new rotation relayed, normally
+OI-8), which a relayer may pay for a bUSD tip (R10; node changes §11.4).
+At an epoch start a burn needs the new rotation relayed, normally
 within one t_fin [H]; after a relay outage, catch-up runs ~3.2 epochs a day.
 "Prompt" assumes the treasury relays every certificate and (d1) release,
 and a relayer batches (d3)'s `release` and `forward` for the F_x fee (§11).
@@ -656,7 +657,7 @@ owner acceptance of B-22, B-23's residual, the wind-down margin and the
 (d1) relay budget; B-37's rebinding schedule (finality dependency);
 `DEPOSIT_CLOSE_AFTER` against O8; OI-1 to OI-7 and OI-9 to OI-11 open
 (OI-2 and OI-6 have implementation choices pending owner review); OI-8 and
-OI-12 resolved (§20).
+OI-12 resolved (§20; OI-8's implementation choice is pending owner review).
 
 **Unverified [H]:** V2 and `approve` gas; LayerZero fees and DVN depths;
 anvil EIP-2537; minutes until O8.
@@ -753,8 +754,61 @@ user funds or blocks a milestone.
   small bUSD tip to a relayer, under a signature mode that lets others only
   add inputs; the relayer adds the native-B3 fee input and later buys B3
   with the accumulated bUSD (e.g. on FlowMesh). No consensus fee-in-bUSD
-  change: burns still pay native B3 (B-17). Wallet and relayer support is
-  not built yet.
+  change: burns still pay native B3 (B-17).
+  *Implementation choice (slice n4b; pending owner review):* regtest only;
+  details, reasoning and tests are in node changes §11.4.
+  - **Signature mode.** The user signs every bUSD input
+    SIGHASH_ALL|ANYONECANPAY. That still commits every output, including
+    the BRIDGE_RECORD binding and therefore the whole kind 6 record, so
+    no one can change the outputs. Each signature commits only its own
+    input: others can add inputs and, with more than one user input,
+    drop or replace a user input by supplying its bUSD themselves, so one
+    such partial may confirm as more than one burn with the same outputs.
+  - **Consensus.** A restricting script flag,
+    `SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS`, admits 0x01 and 0x81 (and
+    the 64-byte Schnorr default). It
+    applies only to bridge V2 kind 6 burns, routes (d1) and (d3), from
+    its own pin `sponsored_sighash_height` (>= V).
+    - NONE, SINGLE and their ANYONECANPAY forms stay refused.
+    - Managed-V1 and decentralized-V1 withdrawals keep plain
+      SIGHASH_ALL, and so do kind 16 sweeps, which have nothing to
+      sponsor.
+    - Only the regtest `-b3bridgepins` file sets the envelope and the
+      pin. Pinning V2 on mainnet would not turn this rule on; that needs
+      the separate pin, an owner decision of its own.
+  - **Wallet.** `bridgewithdraw` `options.sponsor {tip_address,
+    tip_amount}` returns a signed partial and does not broadcast it.
+    - The partial spends bUSD only and has no native output. Its outputs
+      are the burn, the binding, the tip and the change.
+    - The partial's bUSD inputs are locked in memory. Unlocking them does
+      not withdraw a shared partial: it stays valid until an input is
+      spent.
+  - **Relayer.** The wallet RPC `bridgesponsorburn hexstring min_tip
+    max_fee` (max_fee required, at most `-maxtxfee`) completes the partial
+    with one pre-sized fee coin, from the labelled pool that
+    `contrib/b3bridge/b3_bridge_sponsor.py` keeps (`fee_label`), and
+    broadcasts it. It refuses the partial unless:
+    - the tip is present, unique, in bUSD V2 and at least `min_tip`;
+    - the partial has no native output;
+    - node prevalidation accepts it as a V2 burn under the sponsored
+      sighash rule;
+    - each user signature still verifies over the completed transaction's
+      unchanged outputs.
+    The contrib `release` unlocks fee coins of completions that never
+    confirmed.
+  - **Limits.**
+    - The txid is malleable until confirmation, so the confirmed burn is
+      found with `getbridgewithdrawals`; a multi-input partial may list
+      more than one leaf.
+    - Tips accrue as bUSD V2. Converting them to native B3 needs a bridge
+      V2 B3/bUSD FlowMesh market, which does not exist yet and is not
+      built.
+    - Not built: sponsored `sendasset`, a pre-agreed change output and
+      PSBT.
+  - **Tests.** Unit suites `bridge_sponsored_fee_tests`,
+    `bridge_sponsor_tests` and `bridge_v2_gate_tests`
+    `sponsored_sighash_in_mempool_and_blocks`; functional
+    `feature_b3_bridge_rt7s_sponsored_fees.py` (RT7s).
 - **OI-9** (Medium; §10; contracts spec §5). Bootstrap key holders and their
   independence are unstated. *Direction:* name them or the rule; if
   owner-held, drop the independent-check argument.
