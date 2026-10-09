@@ -564,6 +564,36 @@ struct BridgeTxAuthorization {
     }
 };
 
+/**
+ * Owner ruling R10 (open issue OI-8): sponsored native-B3 fees. True when a
+ * transaction carrying this bridge V2 leaf at `height` is script-checked
+ * under SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS instead of
+ * SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL: the owner may sign SIGHASH_ALL or
+ * SIGHASH_ALL|SIGHASH_ANYONECANPAY (both commit every output, so the
+ * BRIDGE_RECORD binding and with it the whole record), which lets a relayer
+ * add a native fee input; NONE and SINGLE stay refused.
+ *
+ * Only a kind 6 burn (routes d1 and d3) qualifies, and only from the
+ * envelope's own sponsored sighash pin (BridgeV2Params::
+ * sponsored_sighash_height >= V; Consensus::Params::
+ * BridgeV2SponsoredSighashActive) on a chain whose bridge_v2 envelope is set
+ * and Valid(). A complete envelope without that pin never selects the rule,
+ * so pinning bridge V2 alone does not turn it on. Only the regtest
+ * -b3bridgepins v2 section sets the envelope and the pin, so this is false
+ * at every height on mainnet, testnet, testnet4 and signet. It never applies
+ * to a kind 16 sweep (permissionless, no bUSD owner input, native fee paid
+ * by the submitter: nothing to sponsor) or to a managed-V1 or
+ * decentralized-V1 withdrawal, which keep plain SIGHASH_ALL.
+ */
+bool BridgeV2SponsoredSighashAllowed(const BridgeWithdrawalV2Request& withdrawal,
+                                     const Consensus::Params& params,
+                                     int height);
+//! The same for a transaction's whole bridge result: true only for a
+//! bridge V2 leaf with no mint and no managed or V1 withdrawal beside it.
+bool BridgeV2SponsoredSighashAllowed(const BridgeTxAuthorization& authorization,
+                                     const Consensus::Params& params,
+                                     int height);
+
 /** Exact before/after accounting for one configured asset epoch. */
 struct BridgeEpochMintChange {
     modern::AssetId asset{};

@@ -650,6 +650,13 @@ struct BridgeV2Params {
     // Route (b) and (d3) forwarder factories; unset on every shipped network.
     std::optional<BridgeV2DepositForwarderPins> deposit_forwarder{};
     std::optional<BridgeV2ExitForwarderPins> exit_forwarder{};
+    // Owner ruling R10 (OI-8): the first height at which a kind 6 burn is
+    // script-checked under SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS, so a
+    // relayer may add the native fee input. A pin of its own, at or above
+    // V: pinning the rest of the envelope never turns the sponsored sighash
+    // rule on. Unset by default and on every shipped network; only the
+    // regtest pin file's v2 section sets it.
+    std::optional<int32_t> sponsored_sighash_height{};
 
     //! The entry of `role`; nullptr for SUCCESSOR when none is pinned.
     const BridgeV2VaultEntry* Entry(BridgeV2EntryRole role) const
@@ -744,6 +751,11 @@ struct BridgeV2Params {
         // (BridgeV2VerifierPins::max_epoch_lag_seconds).
         if (verifier.max_epoch_lag_seconds &&
             *verifier.max_epoch_lag_seconds != gate.set_expiry_seconds) {
+            return false;
+        }
+        // R10's sponsored sighash rule starts at or after V.
+        if (sponsored_sighash_height &&
+            *sponsored_sighash_height < activation_height) {
             return false;
         }
         // As BridgeMintParamsReady: an Ethereum-mainnet entry is exactly

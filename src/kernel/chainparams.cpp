@@ -1340,6 +1340,9 @@ public:
                 Consensus::BridgeV2Params bridge_v2;
                 bridge_v2.activation_height = v2.activation_height;
                 bridge_v2.burn_height = burn_height;
+                // Owner ruling R10: off unless the file names its height
+                // (>= V, checked by the parser and by Valid()).
+                bridge_v2.sponsored_sighash_height = v2.sponsored_sighash_height;
                 bridge_v2.light_client = v2.light_client;
                 bridge_v2.verifier.address = v2.verifier;
                 bridge_v2.verifier.min_bridge_validators = v2.min_bridge_validators;

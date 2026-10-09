@@ -199,14 +199,33 @@ bool static IsDefinedHashtypeSignature(const valtype &vchSig) {
     return true;
 }
 
+// The sighash byte a bridge withdrawal flag permits. Each flag only
+// restricts: SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL admits SIGHASH_ALL, and
+// SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS (R10 sponsored bridge V2 burns)
+// admits SIGHASH_ALL and SIGHASH_ALL|SIGHASH_ANYONECANPAY, the two modes that
+// commit every output. With both set only SIGHASH_ALL passes.
+static bool BridgeSighashTypeAllowed(const unsigned char hash_type,
+                                     const script_verify_flags flags)
+{
+    if ((flags & SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL) != 0 &&
+        hash_type != SIGHASH_ALL) {
+        return false;
+    }
+    if ((flags & SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS) != 0 &&
+        hash_type != SIGHASH_ALL &&
+        hash_type != (SIGHASH_ALL | SIGHASH_ANYONECANPAY)) {
+        return false;
+    }
+    return true;
+}
+
 bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, script_verify_flags flags, ScriptError* serror) {
     // Empty signature. Not strictly DER encoded, but allowed to provide a
     // compact way to provide an invalid signature for use with CHECK(MULTI)SIG
     if (vchSig.size() == 0) {
         return true;
     }
-    if ((flags & SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL) != 0 &&
-        vchSig.back() != SIGHASH_ALL) {
+    if (!BridgeSighashTypeAllowed(vchSig.back(), flags)) {
         return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
     }
     if ((flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC | SCRIPT_VERIFY_LEGACY_B3_STRICTENC)) != 0 && !IsValidSignatureEncoding(vchSig)) {
@@ -224,13 +243,14 @@ static bool CheckBridgeSchnorrSighash(const std::span<const unsigned char> sig,
                                       const script_verify_flags flags,
                                       ScriptError* serror)
 {
-    if ((flags & SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL) == 0 ||
+    if ((flags & (SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL |
+                  SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS)) == 0 ||
         sig.size() == 64) {
         // A 64-byte Schnorr signature uses SIGHASH_DEFAULT, which is
         // equivalent to SIGHASH_ALL and commits every input and output.
         return true;
     }
-    if (sig.size() == 65 && sig.back() != SIGHASH_ALL) {
+    if (sig.size() == 65 && !BridgeSighashTypeAllowed(sig.back(), flags)) {
         return set_error(serror, SCRIPT_ERR_SCHNORR_SIG_HASHTYPE);
     }
     // Preserve the ordinary size error for malformed signatures.
@@ -2248,6 +2268,7 @@ const std::map<std::string, script_verify_flag_name>& ScriptFlagNamesToEnum()
         FLAG_NAME(DISCOURAGE_OP_SUCCESS),
         FLAG_NAME(DISCOURAGE_UPGRADABLE_TAPROOT_VERSION),
         FLAG_NAME(BRIDGE_SIGHASH_ALL),
+        FLAG_NAME(BRIDGE_SIGHASH_ALL_OUTPUTS),
     };
 #undef FLAG_NAME
     return g_names_to_enum;

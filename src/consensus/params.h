@@ -337,6 +337,17 @@ struct Params {
         return BridgeV2RulesActive(height) && bridge_v2->successor &&
                height >= bridge_v2->successor->migration_height;
     }
+    //! Owner ruling R10 (OI-8): true from the sponsored sighash pin (>= V)
+    //! on a chain whose complete envelope sets it; a bridge V2 kind 6 burn
+    //! is then script-checked under SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS
+    //! (node::BridgeV2SponsoredSighashAllowed). Never true on a network that
+    //! leaves bridge_v2 or the pin unset.
+    bool BridgeV2SponsoredSighashActive(int height) const
+    {
+        return BridgeV2RulesActive(height) &&
+               bridge_v2->sponsored_sighash_height &&
+               height >= *bridge_v2->sponsored_sighash_height;
+    }
     /**
      * TEST-ONLY override of the historical FN disintegration collateral
      * (Proof of Disintegration). Unset everywhere except regtest fixtures:

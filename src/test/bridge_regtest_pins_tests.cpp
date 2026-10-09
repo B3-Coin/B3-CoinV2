@@ -766,6 +766,12 @@ BOOST_FIXTURE_TEST_CASE(v2_only_file_applies, BridgePinsSetup)
     BOOST_CHECK(params.BridgeV2RulesActive(V2_HEIGHT));
     BOOST_CHECK(!params.BridgeV2BurnRulesActive(V2_HEIGHT - 1));
     BOOST_CHECK(params.BridgeV2BurnRulesActive(V2_HEIGHT));
+    // Owner ruling R10: without its own pin the sponsored sighash rule stays
+    // off at every height, although V2 burns are active.
+    BOOST_CHECK(!v2.sponsored_sighash_height);
+    for (const int height : {V2_HEIGHT - 1, V2_HEIGHT, V2_HEIGHT + 1, std::numeric_limits<int>::max()}) {
+        BOOST_CHECK(!params.BridgeV2SponsoredSighashActive(height));
+    }
 
     // Section 3.2 identities under this chain's domain; the bUSD V2 AssetId
     // is bound to the vault and differs from the V1 bUSD AssetId.
@@ -805,6 +811,29 @@ BOOST_FIXTURE_TEST_CASE(v2_only_file_applies, BridgePinsSetup)
     BOOST_CHECK(*modern::ConfiguredBridgeV2AssetId(tuned_params) == *asset_v2);
     BOOST_CHECK(*modern::ConfiguredBridgeV2EntryId(tuned_params) == *entry_id);
     BOOST_CHECK(*modern::ConfiguredBridgeV2RegistryId(tuned_params) != *registry_v2);
+
+    // Owner ruling R10's own pin: the sponsored sighash rule from its height
+    // (>= V) only. It enters no identity, and the record guard's file hash
+    // covers it like every other key.
+    UniValue sponsored{ValidV2()};
+    sponsored.pushKV("sponsored_sighash_height", uint64_t{V2_HEIGHT + 7});
+    const std::string sponsored_contents{V2Root(sponsored).write()};
+    ArgsManager sponsored_args;
+    SetArgs(sponsored_args, WriteFile("v2_sponsored.json", sponsored_contents));
+    sponsored_args.ForceSetArg("-b3freshlineageheight", std::to_string(FRESH_HEIGHT));
+    const auto sponsored_chain{CreateChainParams(sponsored_args, ChainType::REGTEST)};
+    const Consensus::Params& sponsored_params{sponsored_chain->GetConsensus()};
+    BOOST_REQUIRE(sponsored_params.bridge_v2);
+    BOOST_CHECK(sponsored_params.bridge_v2->sponsored_sighash_height == std::optional<int32_t>{V2_HEIGHT + 7});
+    BOOST_CHECK(sponsored_params.BridgeV2BurnRulesActive(V2_HEIGHT));
+    BOOST_CHECK(!sponsored_params.BridgeV2SponsoredSighashActive(V2_HEIGHT));
+    BOOST_CHECK(!sponsored_params.BridgeV2SponsoredSighashActive(V2_HEIGHT + 6));
+    BOOST_CHECK(sponsored_params.BridgeV2SponsoredSighashActive(V2_HEIGHT + 7));
+    BOOST_CHECK(*sponsored_chain->B3BridgePinsHash() == Sha256(sponsored_contents));
+    BOOST_CHECK(*sponsored_chain->B3BridgePinsHash() != Sha256(contents));
+    BOOST_CHECK(*modern::ConfiguredBridgeV2AssetId(sponsored_params) == *asset_v2);
+    BOOST_CHECK(*modern::ConfiguredBridgeV2EntryId(sponsored_params) == *entry_id);
+    BOOST_CHECK(*modern::ConfiguredBridgeV2RegistryId(sponsored_params) == *registry_v2);
 }
 
 BOOST_FIXTURE_TEST_CASE(v1_and_v2_file_applies_both, BridgePinsSetup)
@@ -950,6 +979,20 @@ BOOST_AUTO_TEST_CASE(v2_schema_and_value_refusals)
                  "v2.burn_height (199) must be between activation_height (200) and " + max_height);
     CheckRefused(WithV2("burn_height", uint64_t{1} << 31), "v2.burn_height (2147483648) must be between");
     BOOST_CHECK_EQUAL(*ParseB3RegTestBridgePins(WithV2("burn_height", uint64_t{V2_HEIGHT})).v2->burn_height, V2_HEIGHT);
+    // Owner ruling R10's sponsored sighash pin: absent means off; when
+    // present, at or above V.
+    BOOST_CHECK(!ParseB3RegTestBridgePins(ValidV2Pins()).v2->sponsored_sighash_height);
+    CheckRefused(WithV2("sponsored_sighash_height", uint64_t{V2_HEIGHT - 1}),
+                 "v2.sponsored_sighash_height (199) must be between activation_height (200) and " + max_height);
+    CheckRefused(WithV2("sponsored_sighash_height", uint64_t{1} << 31),
+                 "v2.sponsored_sighash_height (2147483648) must be between");
+    CheckRefused(WithV2("sponsored_sighash_height", int64_t{-1}),
+                 "v2.sponsored_sighash_height must be an unsigned integer");
+    CheckRefused(WithV2("sponsored_sighash_height", "300"),
+                 "v2.sponsored_sighash_height must be an unsigned integer");
+    BOOST_CHECK_EQUAL(*ParseB3RegTestBridgePins(WithV2("sponsored_sighash_height", uint64_t{V2_HEIGHT}))
+                           .v2->sponsored_sighash_height,
+                      V2_HEIGHT);
 
     // OI-3: values that commit to blockHash(R_f - 1), and V1-only pins, are
     // not keys of the v2 section.

@@ -212,6 +212,9 @@ public:
             //! The Verifier V2 MAX_EPOCH_LAG DeployV2 will use; when set it
             //! must equal the regtest burn gate's set expiry (profile R).
             std::optional<int64_t> verifier_max_epoch_lag{};
+            //! Owner ruling R10: the first height (>= V) of the sponsored
+            //! sighash rule for kind 6 burns; the rule stays off when unset.
+            std::optional<int> sponsored_sighash_height{};
 
             /**
              * The optional B-23 successor vault v' (`v2.successor`; node

@@ -159,6 +159,20 @@ enum class script_verify_flag_name : uint8_t {
     // blanket rule for ordinary spends.
     SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL,
 
+    // R10 (OI-8) form of the bridge rule, selected transaction-by-transaction
+    // by modern validation for a bridge V2 kind 6 burn from the envelope's
+    // own sponsored sighash pin (>= V; regtest pin file only), so a relayer
+    // can add a native-B3 fee input to a bUSD-only user's burn. Every
+    // evaluated signature must still commit every output, including the
+    // BRIDGE_RECORD binding: ECDSA SIGHASH_ALL or SIGHASH_ALL|ANYONECANPAY
+    // (0x81); Schnorr 64-byte DEFAULT, 0x01 or 0x81. NONE, SINGLE and their
+    // ANYONECANPAY forms stay refused. Like SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL
+    // it only restricts (both set means ALL only), so adding a flag never
+    // turns a failing script into a passing one, the monotonicity that
+    // fuzz/script_flags and the script tests rely on. A relaxing modifier of
+    // SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL would break that and is not used.
+    SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS,
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER

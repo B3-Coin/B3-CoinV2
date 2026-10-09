@@ -41,6 +41,11 @@
 // check 4), and block assembly then carries the record and skips the burn.
 // The block-assembly cases put a transaction straight into the mempool, as
 // if it had been admitted earlier.
+//
+// sponsored_sighash_in_mempool_and_blocks pays the deposit to a key the test
+// holds and burns real bUSD V2: owner ruling R10's sponsored sighash rule
+// (SIGHASH_ALL|ANYONECANPAY on a kind 6 burn, from the envelope's own pin)
+// through mempool admission and block validation.
 
 #include <addresstype.h>
 #include <bridge/admission.h>
@@ -79,6 +84,9 @@
 #include <rpc/request.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
+#include <script/interpreter.h>
+#include <script/sign.h>
+#include <script/signingprovider.h>
 #include <test/util/bridge_observation_world.h>
 #include <test/util/finality_fixture.h>
 #include <test/util/setup_common.h>
@@ -291,7 +299,8 @@ struct DepositReceipt {
 };
 
 DepositReceipt MakeDepositReceipt(const Consensus::BridgeV2VaultEntry& entry, const uint64_t deposit_id,
-                                  const uint64_t amount, const unsigned char recipient_fill)
+                                  const uint64_t amount, const unsigned char recipient_fill,
+                                  const std::optional<bridge::RecipientV1>& recipient_override = std::nullopt)
 {
     std::array<unsigned char, 32> deposit_topic{};
     WriteBE64(deposit_topic.data() + 24, deposit_id);
@@ -302,6 +311,7 @@ DepositReceipt MakeDepositReceipt(const Consensus::BridgeV2VaultEntry& entry, co
 
     bridge::RecipientV1 recipient;
     recipient.pubkey_hash.fill(recipient_fill);
+    if (recipient_override) recipient = *recipient_override;
     const auto encoded_recipient{bridge::EncodeRecipientV1(recipient)};
     std::array<unsigned char, 64> data{};
     WriteBE64(data.data() + 24, amount);
@@ -419,6 +429,9 @@ struct BridgeV2GateFixture : public FinalityChainFixture {
     //! verifier, each the subject of one gate row.
     std::optional<bridge_test::ObservationWorld> m_impaired{};
     DepositReceipt m_deposit{};
+    //! When set (before BuildEthereum), the deposit pays this recipient
+    //! instead of the fill-0x31 key hash nobody holds.
+    std::optional<bridge::RecipientV1> m_deposit_recipient{};
     ExecChain m_exec{};
     std::optional<bridge::regtest_beacon::SyntheticBeacon> m_beacon{};
 
@@ -812,7 +825,7 @@ struct BridgeV2GateFixture : public FinalityChainFixture {
         cancelled.status = bridge::VERIFIER_STATUS_CANCELLED;
         m_impaired->SetVerifier(cancelled);
 
-        m_deposit = MakeDepositReceipt(v2.vault, DEPOSIT_ID, DEPOSIT_AMOUNT, 0x31);
+        m_deposit = MakeDepositReceipt(v2.vault, DEPOSIT_ID, DEPOSIT_AMOUNT, 0x31, m_deposit_recipient);
         const uint256 healthy{m_healthy->StateRoot()};
         const uint256 impaired{m_impaired->StateRoot()};
         const uint256 no_receipts{Keccak(std::vector<unsigned char>{'r'})};
@@ -2058,6 +2071,134 @@ BOOST_AUTO_TEST_CASE(finality_conflict_four_paths_and_bridge_flags)
     BOOST_CHECK(WITH_LOCK(pool.cs, return pool.exists(successor_burn->GetWitnessHash())));
     WITH_LOCK(pool.cs, pool.removeRecursive(*successor_burn, MemPoolRemovalReason::REORG));
     V2().successor.reset();
+}
+
+BOOST_AUTO_TEST_CASE(sponsored_sighash_in_mempool_and_blocks)
+{
+    // Owner ruling R10 through validation.cpp itself: mempool admission
+    // (PreChecks, PolicyScriptChecks, ConsensusScriptChecks) and block
+    // validation (ConnectBlock through TestBlockValidity, then a connected
+    // block). A real kind 6 burn spends the minted bUSD V2, whose owner key
+    // this test holds, plus a sealed-era native fee input (anyone-can-spend,
+    // so only the owner's signature byte matters). Its owner may sign
+    // SIGHASH_ALL|ANYONECANPAY only while the envelope's own sponsored
+    // sighash pin covers the next block; plain ALL is valid either way, and
+    // NONE and SINGLE (with or without ANYONECANPAY) never are.
+    CKey owner_key;
+    owner_key.MakeNewKey(/*fCompressed=*/true);
+    FillableSigningProvider owner_provider;
+    BOOST_REQUIRE(owner_provider.AddKey(owner_key));
+    bridge::RecipientV1 owner;
+    const CKeyID owner_id{owner_key.GetPubKey().GetID()};
+    std::copy(owner_id.begin(), owner_id.end(), owner.pubkey_hash.begin());
+    m_deposit_recipient = owner;
+
+    Prepare();
+    ProduceBlocksTo(m_G + SCALED_INTERVAL + SCALED_DEPTH);
+    BOOST_REQUIRE_EQUAL(FreshFinalizedHeight(), m_G + SCALED_INTERVAL);
+    BuildEthereum();
+    BOOST_REQUIRE(m_deposit.recipient_script == GetScriptForDestination(PKHash{owner_key.GetPubKey()}));
+    ConnectCarriers({BootstrapRecord()});
+    ConnectCarriers({UpdateRecord(EXEC_FIRST + 1)});
+    const CMutableTransaction mint{DepositMint()};
+    ConnectCarriers({ObservationRecord(*m_healthy, SUBJECT_VERIFIER, EXEC_FIRST + 1)}, {mint});
+    ConnectCarriers({ObservationRecord(*m_healthy, SUBJECT_TOKEN, EXEC_FIRST + 1),
+                     ObservationRecord(*m_healthy, SUBJECT_RESERVE, EXEC_FIRST + 1)});
+    BOOST_REQUIRE(GateAt(NextBlockTime()).readiness == node::BridgeBurnReadiness::READY);
+
+    // The burn: [0] BURN, [1] BRIDGE_RECORD binding, [2] bUSD change to the
+    // owner, [3] native change; inputs [0] the minted bUSD, [1] fund output 8.
+    const Consensus::Params& params{Params()};
+    const auto asset{modern::ConfiguredBridgeV2AssetId(params)};
+    const auto entry{modern::ConfiguredBridgeV2EntryId(params)};
+    BOOST_REQUIRE(asset && entry);
+    bridge::BridgeBurnV1 burn;
+    burn.registry_id = *entry;
+    burn.burn_output_index = 0;
+    burn.raw_amount = BURN_AMOUNT;
+    burn.ethereum_recipient.fill(0x99);
+    const CMpaRecord record{BridgeMpa({bridge::BridgeRecordKindV1::BRIDGE_BURN, burn})};
+    const auto burned{modern::MakeAssetBurnOutput(*asset, BURN_AMOUNT)};
+    const auto binding{modern::MakeBridgeBindingOutput(record)};
+    const auto change{modern::MakeAssetOwnerOutput(*asset, DEPOSIT_AMOUNT - BURN_AMOUNT, m_deposit.recipient_script)};
+    BOOST_REQUIRE(burned && binding && change);
+    const CTxOut busd_previous{mint.vout.at(0)};
+    const CTxOut fee_previous{m_fund_value / 16, CScript() << OP_TRUE};
+    CMutableTransaction unsigned_burn;
+    unsigned_burn.version = 2;
+    unsigned_burn.vin = {CTxIn{COutPoint{mint.GetHash(), 0}}, CTxIn{COutPoint{m_fund_txid, 8}}};
+    unsigned_burn.vout = {*burned, *binding, *change, CTxOut{fee_previous.nValue - CARRIER_FEE, CScript() << OP_TRUE}};
+    unsigned_burn.mpa = {record};
+    const auto signed_with = [&](const int hash_type) {
+        CMutableTransaction spend{unsigned_burn};
+        PrecomputedTransactionData txdata;
+        txdata.Init(spend, std::vector<CTxOut>{busd_previous, fee_previous}, /*force=*/true);
+        const MutableTransactionSignatureCreator creator{spend, 0, busd_previous.nValue, &txdata, hash_type};
+        SignatureData sigdata;
+        BOOST_REQUIRE(ProduceSignature(owner_provider, creator, busd_previous.scriptPubKey, sigdata,
+                                       AssetSigningContext::OWNER_SUFFIX));
+        UpdateInput(spend.vin[0], sigdata);
+        return spend;
+    };
+    constexpr int ACP_ALL{SIGHASH_ALL | SIGHASH_ANYONECANPAY};
+    const CMutableTransaction all{signed_with(SIGHASH_ALL)};
+    const CMutableTransaction acp_all{signed_with(ACP_ALL)};
+    const std::string hashtype_error{"Signature hash type missing or not understood"};
+    //! Mempool admission and block validity both accept `tx`, or both
+    //! refuse it on the owner's signature byte.
+    const auto expect = [&](const CMutableTransaction& tx, const bool valid) {
+        AlignClock();
+        const std::string admitted{Admit(tx)};
+        const std::string block{BlockWith(tx)};
+        if (valid) {
+            BOOST_CHECK_MESSAGE(admitted.empty(), admitted);
+            BOOST_CHECK_MESSAGE(block.empty(), block);
+        } else {
+            Has(admitted, "script-verify-flag-failed");
+            Has(admitted, hashtype_error);
+            Has(block, "script-verify-flag-failed");
+            Has(block, hashtype_error);
+        }
+    };
+
+    // Without the pin (this fixture's envelope, as a reviewed mainnet one
+    // would be) V2 burns are live but the burn keeps the managed-V1 rule:
+    // ALL only.
+    BOOST_REQUIRE(!V2().sponsored_sighash_height);
+    BOOST_REQUIRE(params.BridgeV2BurnRulesActive(Tip()->nHeight + 1));
+    expect(all, /*valid=*/true);
+    expect(acp_all, /*valid=*/false);
+
+    // A pin above the next block: still ALL only. A pin at the next block:
+    // ALL|ANYONECANPAY passes in both paths.
+    V2().sponsored_sighash_height = Tip()->nHeight + 2;
+    BOOST_REQUIRE(params.BridgeV2ConfigurationValid());
+    expect(acp_all, /*valid=*/false);
+    V2().sponsored_sighash_height = Tip()->nHeight + 1;
+    BOOST_REQUIRE(params.BridgeV2SponsoredSighashActive(Tip()->nHeight + 1));
+    expect(acp_all, /*valid=*/true);
+    expect(all, /*valid=*/true);
+    // NONE and SINGLE leave outputs unsigned: refused under the R10 form too.
+    for (const int weak : {int{SIGHASH_NONE}, int{SIGHASH_SINGLE}, int{SIGHASH_NONE | SIGHASH_ANYONECANPAY},
+                           int{SIGHASH_SINGLE | SIGHASH_ANYONECANPAY}}) {
+        BOOST_TEST_CONTEXT("hash type " << weak)
+        {
+            expect(signed_with(weak), /*valid=*/false);
+        }
+    }
+    // Unpinned again, the approvals cached above do not carry over: the
+    // selection is part of the script-cache key.
+    V2().sponsored_sighash_height.reset();
+    expect(acp_all, /*valid=*/false);
+
+    // Pinned, the ALL|ANYONECANPAY burn connects and appends one leaf V2.
+    V2().sponsored_sighash_height = Tip()->nHeight + 1;
+    const size_t leaves_before{BridgeIndex().WithdrawalV2Count()};
+    const int burn_height{Tip()->nHeight + 1};
+    ProduceBlock({acp_all});
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, burn_height);
+    BOOST_CHECK_EQUAL(BridgeIndex().WithdrawalV2Count(), leaves_before + 1);
+    V2().sponsored_sighash_height.reset();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

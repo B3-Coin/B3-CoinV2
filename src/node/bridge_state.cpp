@@ -1890,6 +1890,25 @@ bool VerifyBridgeTransaction(
 
 } // namespace
 
+bool BridgeV2SponsoredSighashAllowed(const BridgeWithdrawalV2Request& withdrawal,
+                                     const Consensus::Params& params,
+                                     const int height)
+{
+    return !withdrawal.sweep && params.BridgeV2SponsoredSighashActive(height);
+}
+
+bool BridgeV2SponsoredSighashAllowed(const BridgeTxAuthorization& authorization,
+                                     const Consensus::Params& params,
+                                     const int height)
+{
+    if (!authorization.withdrawal_v2 || authorization.mint ||
+        authorization.withdrawal || authorization.decentralized_withdrawal) {
+        return false;
+    }
+    return BridgeV2SponsoredSighashAllowed(*authorization.withdrawal_v2,
+                                           params, height);
+}
+
 bool HasDecentralizedBridgeBurn(const CTransaction& tx)
 {
     for (const CMpaRecord& record : tx.mpa) {

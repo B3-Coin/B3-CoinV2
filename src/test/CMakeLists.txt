@@ -56,6 +56,7 @@ add_executable(test_bitcoin
   bridge_regtest_beacon_tests.cpp
   bridge_regtest_certify_tests.cpp
   bridge_regtest_pins_tests.cpp
+  bridge_sponsored_fee_tests.cpp
   bridge_state_observation_tests.cpp
   bridge_state_proof_tests.cpp
   bridge_state_tests.cpp

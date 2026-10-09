@@ -480,7 +480,9 @@ CChainParams::B3RegTestBridgePins::V2Section::ExitForwarderSection ParseBridgePi
  * expiry. An optional `successor` object pins a B-23 successor vault
  * (ParseBridgePinsV2Successor); optional `deposit_forwarder` and
  * `exit_forwarder` objects pin the route (b) and (d3) forwarder factories
- * (ParseBridgePinsV2DepositForwarder, ParseBridgePinsV2ExitForwarder).
+ * (ParseBridgePinsV2DepositForwarder, ParseBridgePinsV2ExitForwarder). An
+ * optional `sponsored_sighash_height` (>= V) turns on owner ruling R10's
+ * sponsored sighash rule for kind 6 burns; without it the rule stays off.
  */
 CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v2)
 {
@@ -491,7 +493,7 @@ CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v
                          "verifier", "min_bridge_validators", "max_bridge_validators",
                          "min_bridge_total_weight", "activation_height"},
                         {"burn_height", "max_per_block", "max_per_epoch", "verifier_max_epoch_lag",
-                         "successor", "deposit_forwarder", "exit_forwarder"});
+                         "successor", "deposit_forwarder", "exit_forwarder", "sponsored_sighash_height"});
 
     CChainParams::B3RegTestBridgePins::V2Section section;
     CheckBridgePinsChainId(v2, v2_where);
@@ -545,6 +547,15 @@ CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v
                                              v2_where, burn_height, activation_height, max_height));
         }
         section.burn_height = static_cast<int>(burn_height);
+    }
+    if (!v2.find_value("sponsored_sighash_height").isNull()) {
+        const uint32_t sponsored{GetBridgePinsUInt<uint32_t>(v2, v2_where, "sponsored_sighash_height")};
+        if (sponsored < activation_height || sponsored > max_height) {
+            ThrowInvalidBridgePins(strprintf(
+                "%s.sponsored_sighash_height (%u) must be between activation_height (%u) and %u",
+                v2_where, sponsored, activation_height, max_height));
+        }
+        section.sponsored_sighash_height = static_cast<int>(sponsored);
     }
     if (!v2.find_value("verifier_max_epoch_lag").isNull()) {
         const uint32_t lag{GetBridgePinsUInt<uint32_t>(v2, v2_where, "verifier_max_epoch_lag")};

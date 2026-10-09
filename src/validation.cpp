@@ -878,6 +878,11 @@ private:
         std::vector<bool> m_flowmesh_vault_authorized;
         /** Exact managed-v1 bridge authorization was established in PreChecks. */
         bool m_bridge_withdrawal{false};
+        /** Owner ruling R10: the bridge withdrawal is a bridge V2 kind 6 burn
+         * from the sponsored sighash pin (>= V), checked under
+         * SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS
+         * (node::BridgeV2SponsoredSighashAllowed). Implies m_bridge_withdrawal. */
+        bool m_bridge_sponsored_sighash{false};
     };
 
     // Run the policy checks on a given transaction, excluding any script checks.
@@ -1493,6 +1498,9 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                     authorization.mint->authorization.amount};
             }
             ws.m_bridge_withdrawal = authorization.HasWithdrawal();
+            ws.m_bridge_sponsored_sighash =
+                node::BridgeV2SponsoredSighashAllowed(
+                    authorization, consensus, next_block_height);
         }
         std::optional<uint32_t> fn_pod_issued;
         if (modern::HasModernFnPodDeclaration(tx)) {
@@ -1859,7 +1867,12 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     const CTransaction& tx = *ws.m_ptx;
     TxValidationState& state = ws.m_state;
 
-    constexpr script_verify_flags scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
+    // Owner ruling R10: a bridge V2 burn from the sponsored sighash pin is
+    // checked under the sponsored form of the bridge sighash rule.
+    const script_verify_flags scriptVerifyFlags{
+        ws.m_bridge_sponsored_sighash
+            ? STANDARD_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS
+            : STANDARD_SCRIPT_VERIFY_FLAGS};
 
     // MODERN-era admission may spend pre-H legacy coins: frozen legacy rules
     // for exactly those inputs, at policy time as well, so a spend that is
@@ -1932,9 +1945,13 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     const bool next_block_legacy{
         Consensus::GetB3Era(m_active_chainstate.m_chain.Height() + 1, m_active_chainstate.m_chainman.GetConsensus()) ==
         Consensus::B3Era::LEGACY};
-    const script_verify_flags currentBlockScriptVerifyFlags{
+    script_verify_flags currentBlockScriptVerifyFlags{
         next_block_legacy ? LEGACY_BLOCK_SCRIPT_FLAGS
                           : GetModernBlockScriptFlags(*m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman)};
+    if (ws.m_bridge_sponsored_sighash) {
+        // Owner ruling R10, as in PolicyScriptChecks and ConnectBlock.
+        currentBlockScriptVerifyFlags |= SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS;
+    }
     std::optional<LegacyLockSpendContext> legacy_lock_context;
     if (!next_block_legacy && m_active_chainstate.m_chainman.GetConsensus().legacy_b3coin) {
         if (const std::optional<int> H{Consensus::LegacyFinalHeight(m_active_chainstate.m_chainman.GetConsensus())}) {
@@ -3035,12 +3052,26 @@ static bool CheckInputScriptsWithFlowMeshVaults(
     const bool require_bridge_sighash_all)
 {
     if (tx.IsCoinBase()) return true;
-    if (require_bridge_sighash_all) {
+    // Owner ruling R10 (OI-8): a caller selects the sponsored form of the
+    // bridge rule for a bridge V2 kind 6 burn by passing
+    // SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS in `flags`
+    // (node::BridgeV2SponsoredSighashAllowed). Every signature must then
+    // still commit every output (SIGHASH_ALL or
+    // SIGHASH_ALL|SIGHASH_ANYONECANPAY). That flag alone selects it, with or
+    // without require_bridge_sighash_all, so the cache key below, which
+    // commits `flags`, fully determines the rule applied to every input.
+    if (require_bridge_sighash_all &&
+        !(flags & SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS)) {
         // This marker participates in the full-script cache key below. The
         // transaction-specific bridge rule can therefore never reuse an
         // ordinary-spend cache approval for the same witness transaction.
         flags |= SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL;
     }
+    // The bridge rule `flags` now carries binds every input, a frozen
+    // legacy-lock input included.
+    const script_verify_flags bridge_rule{
+        flags & (SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL |
+                 SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS)};
     if (flowmesh_vault_authorized != nullptr &&
         flowmesh_vault_authorized->size() != tx.vin.size()) {
         return state.Invalid(TxValidationResult::TX_CONSENSUS,
@@ -3133,12 +3164,11 @@ static bool CheckInputScriptsWithFlowMeshVaults(
         // rule set, every other input the caller's flags.
         script_verify_flags input_flags{
             (legacy_lock && legacy_input[i]) ? legacy_lock->legacy_flags : flags};
-        if (require_bridge_sighash_all) {
-            // A managed withdrawal may also use a sealed-era native input for
-            // fees. Keep its frozen script rules, but never let that selection
-            // remove the withdrawal's full-transaction signature binding.
-            input_flags |= SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL;
-        }
+        // A bridge withdrawal may also use a sealed-era native input for
+        // fees. Keep its frozen script rules, but never let that selection
+        // remove the withdrawal's signature binding (the managed-V1 or the
+        // R10 form, whichever `flags` carries).
+        input_flags |= bridge_rule;
         // B3A1 did not exist in the sealed era.  Only a coin created after H
         // may execute the owner suffix instead of its complete stored script.
         const bool enable_asset_owner{legacy_lock && !legacy_input[i]};
@@ -3725,6 +3755,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     std::map<Ptxid, modern::AuthorizedAssetMint>
         bridge_mint_authorizations;
     std::set<Txid> bridge_withdrawal_transactions;
+    // Owner ruling R10: the bridge V2 kind 6 burns of this block, checked
+    // under SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS.
+    std::set<Txid> bridge_sponsored_sighash_transactions;
     if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin) {
         // Repeated here (not only ContextualCheckBlock), because
         // -reindex-chainstate connects blocks without invoking that function.
@@ -3945,6 +3978,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         for (const node::BridgeWithdrawalV2Request& withdrawal :
              bridge_delta.withdrawals_v2_added) {
             bridge_withdrawal_transactions.insert(withdrawal.transaction_id);
+            if (node::BridgeV2SponsoredSighashAllowed(
+                    withdrawal, params.GetConsensus(), pindex->nHeight)) {
+                bridge_sponsored_sighash_transactions.insert(
+                    withdrawal.transaction_id);
+            }
         }
     }
 
@@ -4360,7 +4398,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             if (control) {
                 std::vector<CScriptCheck> vChecks;
                 tx_ok = CheckInputScriptsWithFlowMeshVaults(
-                    tx, tx_state, view, flags, fCacheResults, fCacheResults,
+                    tx, tx_state, view,
+                    bridge_sponsored_sighash_transactions.contains(tx.GetHash())
+                        ? flags | SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS
+                        : flags,
+                    fCacheResults, fCacheResults,
                     txsdata[i], m_chainman.m_validation_cache, &vChecks,
                     legacy_lock_context,
                     flowmesh_vault_authorized.empty()
@@ -4370,7 +4412,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 if (tx_ok) control->Add(std::move(vChecks));
             } else {
                 tx_ok = CheckInputScriptsWithFlowMeshVaults(
-                    tx, tx_state, view, flags, fCacheResults, fCacheResults,
+                    tx, tx_state, view,
+                    bridge_sponsored_sighash_transactions.contains(tx.GetHash())
+                        ? flags | SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS
+                        : flags,
+                    fCacheResults, fCacheResults,
                     txsdata[i], m_chainman.m_validation_cache, nullptr,
                     legacy_lock_context,
                     flowmesh_vault_authorized.empty()
