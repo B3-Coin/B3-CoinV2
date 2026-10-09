@@ -99,7 +99,21 @@ def check_local_url(url):
 
 
 class JsonRpc:
-    """JSON-RPC 2.0 over a local endpoint, never through a proxy."""
+    """JSON-RPC 2.0 over a local endpoint, never through a proxy.
+
+    params is a list, or a dict for named arguments. A subclass (such as
+    b3_bridge_sponsor.LocalRpc) may set user_agent; error, the ObserverError
+    subclass raised for a local or transport failure; reply_json_options,
+    json.loads keyword arguments for replies (parse_float=Decimal, say); and
+    json_default, a staticmethod used as json.dumps' default for request
+    values. The endpoint check and the proxy-free opener (_DIRECT_OPENER)
+    are not hooks.
+    """
+
+    user_agent = USER_AGENT
+    error = ObserverError
+    reply_json_options = {}
+    json_default = None
 
     def __init__(self, url, user=None, password=None, cookie=None, timeout=120):
         self.url = check_local_url(url).rstrip("/")
@@ -108,37 +122,38 @@ class JsonRpc:
         self.next_id = 0
 
     def wallet(self, name):
-        return JsonRpc(self.url + "/wallet/" + urllib.parse.quote(name, safe=""),
-                       self.user, self.password, self.cookie, self.timeout)
+        return type(self)(self.url + "/wallet/" + urllib.parse.quote(name, safe=""),
+                          self.user, self.password, self.cookie, self.timeout)
 
     def call(self, method, params=()):
         self.next_id += 1
-        headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
+        headers = {"Content-Type": "application/json", "User-Agent": self.user_agent}
         auth = None
         if self.cookie:
             try:
                 auth = Path(self.cookie).read_text().strip()
             except OSError as e:
-                raise ObserverError(f"cannot read the B3 RPC cookie: {e}") from None
+                raise self.error(f"cannot read the B3 RPC cookie: {e}") from None
         elif self.user is not None:
             auth = f"{self.user}:{self.password}"
         if auth is not None:
             headers["Authorization"] = "Basic " + base64.b64encode(auth.encode()).decode()
         body = json.dumps({"jsonrpc": "2.0", "id": self.next_id, "method": method,
-                           "params": list(params)}).encode()
+                           "params": dict(params) if isinstance(params, dict) else list(params)},
+                          default=self.json_default).encode()
         request = urllib.request.Request(self.url, data=body, headers=headers)
         try:
             with _DIRECT_OPENER.open(request, timeout=self.timeout) as response:
-                reply = json.load(response)
+                reply = json.loads(response.read(), **self.reply_json_options)
         except urllib.error.HTTPError as e:
             try:
-                reply = json.loads(e.read())
+                reply = json.loads(e.read(), **self.reply_json_options)
             except (ValueError, OSError):
-                raise ObserverError(f"{method}: HTTP {e.code} from {self.url}") from None
+                raise self.error(f"{method}: HTTP {e.code} from {self.url}") from None
         except (OSError, ValueError) as e:
-            raise ObserverError(f"{method}: transport failure ({type(e).__name__})") from None
+            raise self.error(f"{method}: transport failure ({type(e).__name__})") from None
         if not isinstance(reply, dict):
-            raise ObserverError(f"{method}: malformed JSON-RPC reply")
+            raise self.error(f"{method}: malformed JSON-RPC reply")
         if reply.get("error") is not None:
             raise RpcError(method, reply["error"])
         return reply.get("result")

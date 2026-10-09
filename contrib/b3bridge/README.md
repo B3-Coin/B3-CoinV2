@@ -534,13 +534,15 @@ nothing they sign means anything outside regtest. The regtest plan is in
 them are `feature_b3_bridge_rt0_toolchain.py`,
 `feature_b3_bridge_rt2_light_client.py`,
 `feature_b3_bridge_rt3_v1_route_a.py --deposit-only` and, for bridge V2,
-`feature_b3_bridge_rt4a_round_trip.py` and `feature_b3_bridge_rt4_kofn_gate.py`;
+`feature_b3_bridge_rt4a_round_trip.py` and `feature_b3_bridge_rt4_kofn_gate.py`,
+and for sponsored fees (owner ruling R10) `feature_b3_bridge_rt7s_sponsored_fees.py`;
 their harness lives in `test/functional/test_framework/{anvil,b3bridge}.py`.
 The regtest-only refusals of the Python pieces are unit-tested offline by
 `contrib/b3bridge/test_regtest_mock_beacon.py`,
 `contrib/b3bridge/test_b3_bridge_observe_v2.py`,
 `contrib/b3bridge/test_b3_bridge_deposit_guard_v2.py`,
 `contrib/b3bridge/test_b3_bridge_forwarders_v2.py`,
+`contrib/b3bridge/test_b3_bridge_sponsor.py`,
 `contrib/b3bridge/test_regtest_mock_lz_relayer.py` (run `python3 -m unittest`
 here) and by `TestFrameworkB3BridgeGuards` in
 `test/functional/test_framework/b3bridge.py` (run by
@@ -773,6 +775,111 @@ python3 contrib/b3bridge/b3_bridge_forwarders_v2.py published \
   `contracts/test/vectors/bridge_v2_vectors.json` `forwarder_v2`, the OI-2
   `deposit_fee_cap` (`fee_per_tx` × 4), a minimal ABI codec, `Published` decoding and the
   receipt-leaf size model) is importable.
+
+### `b3_bridge_sponsor.py` (bridge V2 sponsored fees, owner ruling R10)
+
+**REGTEST ONLY.** Owner ruling R10 (open issue OI-8) lets a wallet that
+holds only bUSD V2, and no native B3, withdraw through a bridge V2 burn on
+route (d1) to Ethereum or route (d3) to Arbitrum. A relayer pays the native
+network fee and takes a small bUSD tip. Consensus has no fee-in-bUSD rule.
+
+User flow:
+
+1. The user's wallet calls `bridgewithdraw` with `options.sponsor =
+   {"tip_address": <relayer address>, "tip_amount": <raw bUSD>}`. The
+   chain must pin the rule (`-b3bridgepins` `v2.sponsored_sighash_height`,
+   at or above V) for the next block. The wallet spends bUSD inputs only.
+   Its outputs are `[0]` the BURN, `[1]` the BRIDGE_RECORD binding, `[2]`
+   the tip and `[3]` the bUSD change (if any); there is no native output.
+   It signs every input `SIGHASH_ALL|ANYONECANPAY`.
+2. It returns the partial (`hex`, `withdrawal_status: awaiting-sponsor`)
+   instead of broadcasting it. The bUSD inputs stay locked in memory so
+   the wallet does not spend them meanwhile. A partial you have shared
+   cannot be withdrawn: `lockunspent true` only lets your wallet spend
+   those inputs again, and anyone holding the partial may still complete
+   it until one of them is spent (which a bUSD-only wallet cannot fund).
+   Your funds are not at risk, since the outputs are fixed and a late
+   completion fails once the gate closes.
+3. Those signatures commit every output, the binding included, so no one
+   can change the burn, the recipient, the tip or the change. Each
+   signature commits only its own input, so anyone can add inputs and,
+   with more than one bUSD input, drop or replace one of them by supplying
+   its bUSD (one partial may then confirm as more than one burn). The txid
+   changes when the fee input is added, and until the burn confirms anyone
+   holding the partial may complete it with a different fee input. Find
+   the confirmed burn with `getbridgewithdrawals` (or the wallet's
+   transaction list) and pass that txid to `getbridgewithdrawalproofv2`.
+
+Relayer flow, with a dedicated relayer wallet:
+
+```sh
+# Advertise a tip address (a legacy address is always accepted).
+b3coin-cli -rpcwallet=relayer getnewaddress b3-sponsor-tip legacy
+# Keep a pool of N fee coins of exactly V B3 (one sendmany for the deficit).
+python3 contrib/b3bridge/b3_bridge_sponsor.py refill \
+  --b3-rpc-url http://127.0.0.1:P --b3-cookie <datadir>/regtest/.cookie \
+  --wallet relayer --count 20 --value 0.0004 [--fee-rate R] [--minconf 0]
+# Complete a user's partial with one pool coin and broadcast it.
+python3 contrib/b3bridge/b3_bridge_sponsor.py complete \
+  --b3-rpc-url http://127.0.0.1:P --b3-cookie <datadir>/regtest/.cookie \
+  --wallet relayer --hex <partial hex> --min-tip 50000 --max-fee 0.0004 \
+  [--label b3-sponsor-fee] [--fee-rate R] [--minconf 1] [--no-broadcast]
+# Unlock fee coins whose completion never confirmed.
+python3 contrib/b3bridge/b3_bridge_sponsor.py release \
+  --b3-rpc-url http://127.0.0.1:P --b3-cookie <datadir>/regtest/.cookie \
+  --wallet relayer [--label b3-sponsor-fee]
+# Pool, tips and the market note.
+python3 contrib/b3bridge/b3_bridge_sponsor.py status \
+  --b3-rpc-url http://127.0.0.1:P --b3-cookie <datadir>/regtest/.cookie \
+  --wallet relayer [--value 0.0004]
+```
+
+- `complete` calls the wallet RPC `bridgesponsorburn hex min_tip max_fee
+  {fee_label, ...}`.
+  - Before adding anything, the node refuses a partial that spends a relayer
+    coin or an unknown or spent coin, that is not a bridge V2 kind 6 burn
+    with its exact binding output, or that pays any native output. It also
+    refuses a partial without exactly one bUSD V2 owner output to this
+    wallet of at least `--min-tip`, one that node prevalidation (entry,
+    gate, reserve) refuses, and one the sponsored sighash rule does not
+    cover for the next block.
+  - It then appends the smallest spendable native coin on a `--label`
+    address between the needed fee and `--max-fee`, signs only that input
+    (`SIGHASH_ALL`), and verifies every user input over the unchanged
+    outputs. A partial whose outputs changed after the user signed is
+    refused (`sponsor-signature-invalid`).
+  - The whole fee coin is the network fee and no change output is added.
+    `--max-fee` is required (and at most `-maxtxfee`): pass the pool
+    value, so a larger coin is never spent as fee; `--label` keeps every
+    coin outside the pool out. Once the user has signed, the relayer cannot
+    raise or lower the tip.
+- Pool:
+  - `refill` counts the pool as the safe, solvable, unlocked coins of
+    exactly `--value` on addresses labelled `--label` (default
+    `b3-sponsor-fee`), with at least `--minconf` confirmations. The default
+    0 counts a refill still in the mempool, so it is not repeated.
+  - It sends the deficit to fresh legacy (P2PKH) addresses of that label in
+    one `sendmany`, at most 500 coins per run (`remaining_deficit`). With no
+    deficit it sends nothing (`txid` null).
+  - Every labelled coin is locked in memory around the `sendmany` and
+    unlocked afterwards, so a refill never spends the pool it refills.
+  - A fee coin used by `complete` is locked in memory, with or without
+    broadcast. `complete` needs a confirmed pool coin by default.
+  - `release` unlocks the fee coin of every completion that never
+    confirmed: a locked coin on a `--label` address that is still unspent
+    and not spent in the mempool (another completion of the same partial
+    won, or it was run with `--no-broadcast` and never sent; broadcast such
+    a completion first if you still want it). `refill` does not count
+    locked coins, so release before refilling.
+- Tips accrue as bUSD V2 in the relayer wallet; `status` reports them as
+  `tips`. Turning them back into native B3 needs a bridge V2 B3/bUSD market
+  on FlowMesh, which does not exist yet and is not built here. Until it
+  exists, fund the pool with native B3 from elsewhere.
+- Every subcommand refuses an endpoint other than plain http on 127.0.0.1
+  or localhost (read without any proxy), and a B3 chain other than regtest.
+  A refusal prints `error: ...` and exits 1. Success prints one JSON
+  object, with B3 amounts as exact decimal strings. The wallet signs; no key
+  is handled here.
 
 ### `regtest/mock_lz_relayer.py` (LayerZero test relayer)
 
