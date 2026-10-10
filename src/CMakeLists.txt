@@ -287,8 +287,11 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/fn_seat_index.cpp
   node/legacy_fn_issuance.cpp
   node/finality_binding_index.cpp
+  node/finality_fresh_key_index.cpp
+  node/finality_fresh_key_store.cpp
   node/finality_fresh_lineage.cpp
   node/finality_fresh_signature.cpp
+  node/finality_fresh_transport.cpp
   node/finality_pin.cpp
   node/finality_signer_store.cpp
   node/finality_signature.cpp

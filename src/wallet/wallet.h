@@ -705,6 +705,13 @@ public:
 
     OutputType TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const;
 
+    /**
+     * The coins of tx's inputs that this wallet holds, each at the creation
+     * height that selects its asset signing context: the map
+     * SignTransaction(tx) signs with. A prevout the wallet does not know is
+     * left out.
+     */
+    std::map<COutPoint, Coin> CoinsForInputs(const CMutableTransaction& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Fetch the inputs and sign with SIGHASH_ALL. */
     bool SignTransaction(CMutableTransaction& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Sign the tx given the input coins and sighash. */

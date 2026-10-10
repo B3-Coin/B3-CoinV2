@@ -369,8 +369,10 @@ contract RelayBatchV2Test is RelayFixtureV2 {
         assertEq(vm.getRecordedLogs().length, 0);
     }
 
-    /// No payable entry, no receive or fallback: the batch can never take
-    /// ETH by a call. The vault pays recipients directly, never the batch.
+    /// relay is not payable; relayWithForwards is, and returns every wei it
+    /// does not spend (RelayBatchExitV2.t.sol). No receive or fallback: the
+    /// batch takes ETH only as that budget. The vault pays recipients
+    /// directly, never the batch.
     function test_RefusesEthAndHoldsNothing() public {
         vm.deal(address(this), 1 ether);
         bytes memory call =

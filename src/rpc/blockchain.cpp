@@ -8,6 +8,7 @@
 #include <blockfilter.h>
 #include <bridge/ethereum_calldata.h>
 #include <bridge/lc_json.h>
+#include <bridge/proof.h>
 #include <bridge/withdrawal_v2_calldata.h>
 #include <chain.h>
 #include <chainparams.h>
@@ -32,15 +33,18 @@
 #include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
+#include <modern/bridge_forwarder.h>
 #include <modern/bridge_v2.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
 #include <modern/fn_pod.h>
+#include <modern/pos_v1.h>
 #include <modern/withdrawal_tree.h>
 #include <modern/withdrawal_v2.h>
 #include <net.h>
 #include <net_processing.h>
 #include <node/finality_fresh_export.h>
+#include <node/finality_fresh_key_index.h>
 #include <node/finality_fresh_lineage.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
@@ -3533,6 +3537,27 @@ return RPCHelpMan{
 
 
 
+//! One H1 producer set in getfinalitystatus.producers (doc and JSON).
+static std::vector<RPCResult> ProducerSetDoc()
+{
+    return {
+        {RPCResult::Type::NUM, "epoch", "epoch stamped in the set (producer epoch from R_h, V1 epoch before)"},
+        {RPCResult::Type::NUM, "size", "producer count"},
+        {RPCResult::Type::NUM, "total_weight", "whole modern B3 (the W of the eligibility rule)"},
+        {RPCResult::Type::STR_HEX, "set_hash", ""},
+    };
+}
+
+static UniValue ProducerSetToJSON(const node::ValidatorSetSnapshot& set)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("epoch", set.Epoch());
+    out.pushKV("size", static_cast<uint64_t>(set.Size()));
+    out.pushKV("total_weight", set.TotalWeight());
+    out.pushKV("set_hash", set.SetHash().GetHex());
+    return out;
+}
+
 static RPCHelpMan getfinalitystatus()
 {
     return RPCHelpMan{
@@ -3563,13 +3588,42 @@ static RPCHelpMan getfinalitystatus()
                            {RPCResult::Type::NUM, "quorum_weight", /*optional=*/true, ""},
                            {RPCResult::Type::STR_HEX, "set_hash", /*optional=*/true, ""},
                        }},
-                      {RPCResult::Type::OBJ, "validator_set", /*optional=*/true, "the set in force",
+                      {RPCResult::Type::OBJ, "validator_set", /*optional=*/true,
+                       "the V1 finality set in force (block producers: see producers when H1 is configured)",
                        {
                            {RPCResult::Type::NUM, "size", ""},
                            {RPCResult::Type::NUM, "total_weight", "whole modern B3"},
                            {RPCResult::Type::NUM, "quorum_weight", ""},
                            {RPCResult::Type::STR_HEX, "set_hash", ""},
                            {RPCResult::Type::STR_HEX, "next_set_hash", ""},
+                       }},
+                      {RPCResult::Type::OBJ, "producers", /*optional=*/true,
+                       "the H1 block-producer schedule for the next block (tip+1), present only when H1 is "
+                       "configured (regtest -b3h1height); from R_h producers rotate every epoch-length blocks "
+                       "with no certificate, and an escape block (round >= escape_rounds) restarts the schedule",
+                       {
+                           {RPCResult::Type::NUM, "activation_height", "R_h, the first height whose producers follow the H1 schedule"},
+                           {RPCResult::Type::NUM, "escape_rounds", "R_escape, the smallest round of an escape block"},
+                           {RPCResult::Type::BOOL, "active", "true when tip+1 >= R_h"},
+                           {RPCResult::Type::NUM, "epoch", /*optional=*/true, "producer epoch of tip+1 (active only)"},
+                           {RPCResult::Type::NUM, "epoch_start", /*optional=*/true, "first height of that producer epoch (active only)"},
+                           {RPCResult::Type::NUM, "next_rotation", /*optional=*/true,
+                            "next height whose producer set changes without an escape: epoch_start + epoch length (R_h before activation)"},
+                           {RPCResult::Type::NUM, "snapshot_height", /*optional=*/true,
+                            "next_rotation - 1, the height of the next producer snapshot (R_h - 1 before activation)"},
+                           {RPCResult::Type::NUM, "stake_enters_at", /*optional=*/true,
+                            "first height at which a stake that is ACTIVE and bound by snapshot_height produces, unless an "
+                            "escape comes first: next_rotation + epoch length (R_h before activation)"},
+                           {RPCResult::Type::NUM, "last_escape_height", /*optional=*/true, "height of the latest escape block, -1 when none (active only)"},
+                           {RPCResult::Type::NUM, "escapes", /*optional=*/true, "escape blocks since R_h (active only)"},
+                           {RPCResult::Type::NUM_TIME, "escape_time", /*optional=*/true,
+                            "exact timestamp of an escape block on the current tip: tip time + block interval + "
+                            "escape_rounds * round seconds (active only)"},
+                           {RPCResult::Type::OBJ, "set", /*optional=*/true,
+                            "the producer set for tip+1 in a normal round (the V1 set in force before R_h)", ProducerSetDoc()},
+                           {RPCResult::Type::OBJ, "next_set", /*optional=*/true, "the producer set of the next producer epoch (active only)", ProducerSetDoc()},
+                           {RPCResult::Type::OBJ, "escape_set", /*optional=*/true,
+                            "the producer set of an escape block on the current tip (active only)", ProducerSetDoc()},
                        }},
                       {RPCResult::Type::OBJ, "finalized", /*optional=*/true, "the latest finalized checkpoint",
                        {
@@ -3670,6 +3724,52 @@ static RPCHelpMan getfinalitystatus()
                         set.pushKV("set_hash", state.current->SetHash().GetHex());
                         set.pushKV("next_set_hash", state.next ? state.next->SetHash().GetHex() : "");
                         obj.pushKV("validator_set", set);
+                    }
+                    if (consensus.h1 && consensus.modern_pos) {
+                        // H1 (regtest -b3h1height only): the producer
+                        // schedule as seen by the next block, from the same
+                        // tracker helpers that validation and production use.
+                        const Consensus::H1Params& h1{*consensus.h1};
+                        const int E{consensus.modern_pos->finality_epoch_blocks};
+                        const int next_height{tip->nHeight + 1};
+                        const bool h1_active{consensus.H1RulesActive(next_height)};
+                        UniValue producers(UniValue::VOBJ);
+                        producers.pushKV("activation_height", h1.activation_height);
+                        producers.pushKV("escape_rounds", h1.escape_rounds);
+                        producers.pushKV("active", h1_active);
+                        // Normal-round schedule of tip+1 (nullopt below R_h,
+                        // and only on a tracker inconsistency from R_h).
+                        const std::optional<node::ProducerSchedule> schedule{
+                            h1_active ? tracker.Projected(next_height, consensus).producers : std::nullopt};
+                        if (!h1_active) {
+                            producers.pushKV("next_rotation", h1.activation_height);
+                            producers.pushKV("snapshot_height", h1.activation_height - 1);
+                            producers.pushKV("stake_enters_at", h1.activation_height);
+                        } else if (schedule) {
+                            const int next_rotation{schedule->epoch_start + E};
+                            producers.pushKV("epoch", schedule->epoch);
+                            producers.pushKV("epoch_start", schedule->epoch_start);
+                            producers.pushKV("next_rotation", next_rotation);
+                            producers.pushKV("snapshot_height", next_rotation - 1);
+                            producers.pushKV("stake_enters_at", next_rotation + E);
+                            producers.pushKV("last_escape_height", schedule->last_escape_height);
+                            producers.pushKV("escapes", schedule->escapes);
+                            producers.pushKV("escape_time",
+                                             modern::ModernPosBlockTime(tip->GetBlockTime(), h1.escape_rounds,
+                                                                        *consensus.modern_pos));
+                        }
+                        if (const auto set{tracker.SetInForceAt(next_height, consensus)}) {
+                            producers.pushKV("set", ProducerSetToJSON(*set));
+                        }
+                        if (h1_active) {
+                            if (schedule && schedule->next) {
+                                producers.pushKV("next_set", ProducerSetToJSON(*schedule->next));
+                            }
+                            if (const auto set{tracker.SetInForceAt(next_height, consensus, h1.escape_rounds)}) {
+                                producers.pushKV("escape_set", ProducerSetToJSON(*set));
+                            }
+                        }
+                        obj.pushKV("producers", producers);
                     }
                     if (state.finalized) {
                         UniValue fin(UniValue::VOBJ);
@@ -5436,7 +5536,7 @@ static RPCHelpMan getfinalitylineage()
         RPCResult{RPCResult::Type::OBJ, "", "",
                   {
                       {RPCResult::Type::BOOL, "configured", "Whether this chain configures a fresh finality lineage"},
-                      {RPCResult::Type::BOOL, "staging_signer", /*optional=*/true, "Whether the V1 single-vote signer also signs digest V2 (regtest staging, V1 binding keys)"},
+                      {RPCResult::Type::BOOL, "staging_signer", /*optional=*/true, "Whether the V1 single-vote signer also signs digest V2 (regtest staging): with the V1 binding keys, or in key mode (-b3freshkeyheight, fresh_keys present) only with this node's fresh per-epoch keys"},
                       {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "R_f, the first block that can carry a fresh-lineage certificate"},
                       {RPCResult::Type::NUM, "genesis_height", /*optional=*/true, "GENESIS_HEIGHT = R_f-1, history leaf 0"},
                       {RPCResult::Type::NUM, "max_epoch_extension", /*optional=*/true, "Blocks a fresh epoch may run past E before the lineage breaks"},
@@ -5479,10 +5579,57 @@ static RPCHelpMan getfinalitylineage()
                            {RPCResult::Type::NUM, "finalized_leaf_count", "Leaves held by the consensus accumulator (through the finalized index)"},
                        }},
                       {RPCResult::Type::NUM, "pool_checkpoints", /*optional=*/true, "Checkpoints tracked by the local fresh-lineage vote pool (finalized ones are reclaimed on the next submission, as in the V1 pool)"},
-                      {RPCResult::Type::OBJ, "local_signer", /*optional=*/true, "Node-local staging signer status, present once this node's finality signer ran a fresh-lineage pass (the staking status reports the V1 signer only; fresh votes have no P2P relay and are moved with getfinalitylineagevotes / submitfinalitylineagevote)",
+                      {RPCResult::Type::OBJ, "local_signer", /*optional=*/true, "Node-local staging signer status, present once this node's finality signer ran a fresh-lineage pass (the staking status reports the V1 signer only; fresh votes travel over the P2P message finsigv2, and the hidden getfinalitylineagevotes / submitfinalitylineagevote remain for drills)",
                        {
                            {RPCResult::Type::NUM, "last_signed_height", "Anti-repeat watermark: the highest fresh checkpoint this node's signer recorded, or -1"},
-                           {RPCResult::Type::STR, "last_error", "Why fresh-lineage signing is currently disabled (absent journal, orphan lock, journal failure), or empty"},
+                           {RPCResult::Type::STR, "last_error", "Why fresh-lineage signing is currently disabled (absent journal, orphan lock, journal failure; in key mode also an unreadable fresh key store or a current seat without a held key), or empty"},
+                           {RPCResult::Type::ARR, "fresh_keys", /*optional=*/true, "Key mode only: the signer's fresh keys (its fresh key store's records, in creation order)",
+                            {{RPCResult::Type::OBJ, "", "",
+                              {
+                                  {RPCResult::Type::NUM, "epoch", /*optional=*/true, "Target fresh epoch (absent for an offline key the chain has not bound)"},
+                                  {RPCResult::Type::STR_HEX, "bls_pubkey", "BLS public key"},
+                                  {RPCResult::Type::BOOL, "held", "Whether the signer still holds the secret (false once erased)"},
+                                  {RPCResult::Type::ARR, "seated_epochs", "Retained committees (epoch-2 .. epoch+1) that seat this validator on this key",
+                                   {{RPCResult::Type::NUM, "", "Fresh epoch"}}},
+                              }}}},
+                           {RPCResult::Type::ARR, "missing_seats", /*optional=*/true, "Key mode only: seats of this validator in Set'_{epoch-1}, Set'_epoch and Set'_{epoch+1} without a held key",
+                            {{RPCResult::Type::OBJ, "", "",
+                              {
+                                  {RPCResult::Type::NUM, "epoch", "Fresh epoch of the committee"},
+                                  {RPCResult::Type::STR_HEX, "bls_pubkey", "The seated key"},
+                              }}}},
+                           {RPCResult::Type::ARR, "alerts", /*optional=*/true, "Key mode only: chain bindings of this validator the signer's store does not hold, held keys claimed first by another binding, and void seats",
+                            {{RPCResult::Type::STR, "", "Alert"}}},
+                       }},
+                      {RPCResult::Type::OBJ, "fresh_keys", /*optional=*/true, "B-37 per-epoch committee keys, present only in key mode (regtest-only -b3freshkeyheight)",
+                       {
+                           {RPCResult::Type::NUM, "key_height", "R_key, the first height that accepts a fresh binding"},
+                           {RPCResult::Type::BOOL, "state_available", "Whether the fresh key index could be derived at the tip"},
+                           {RPCResult::Type::STR, "next_binding_window", "open, not-active (below R_key) or lineage-unavailable (from R_f without an intact lineage): the window of the next block"},
+                           {RPCResult::Type::NUM, "next_binding_epoch", /*optional=*/true, "The one target epoch a binding included in the next block counts for (0 from R_key to R_f-1, then epoch+2)"},
+                           {RPCResult::Type::NUM, "window_start", /*optional=*/true, "First height of that window"},
+                           {RPCResult::Type::ARR, "bindings", "Fresh bindings naming epoch-2 or later (every epoch before the lineage), each the first claim of its key; ordered by validator, epoch, height",
+                            {{RPCResult::Type::OBJ, "", "",
+                              {
+                                  {RPCResult::Type::STR_HEX, "validator_key", "x-only validator key"},
+                                  {RPCResult::Type::NUM, "epoch", "Target fresh epoch"},
+                                  {RPCResult::Type::STR_HEX, "bls_pubkey", "Bound BLS public key"},
+                                  {RPCResult::Type::NUM, "height", "Including block"},
+                                  {RPCResult::Type::BOOL, "counted", "Included inside the window that counts its epoch"},
+                                  {RPCResult::Type::BOOL, "void", "Two or more counted bindings of this validator name this epoch: no seat for it"},
+                              }}}},
+                           {RPCResult::Type::ARR, "committees", "Set'_{epoch-1}, Set'_epoch and Set'_{epoch+1} on their fresh keys (empty before the lineage)",
+                            {{RPCResult::Type::OBJ, "", "",
+                              {
+                                  {RPCResult::Type::NUM, "epoch", "Fresh epoch"},
+                                  {RPCResult::Type::ARR, "members", "Seated members in committee order",
+                                   {{RPCResult::Type::OBJ, "", "",
+                                     {
+                                         {RPCResult::Type::STR_HEX, "validator_key", "x-only validator key"},
+                                         {RPCResult::Type::STR_HEX, "bls_pubkey", "Fresh BLS public key of the seat"},
+                                         {RPCResult::Type::NUM, "weight", "Whole modern B3"},
+                                     }}}},
+                              }}}},
                        }},
                   }},
         RPCExamples{HelpExampleCli("getfinalitylineage", "") + HelpExampleRpc("getfinalitylineage", "")},
@@ -5575,11 +5722,80 @@ static RPCHelpMan getfinalitylineage()
             }
             const node::FreshLineageSignaturePool& fresh_pool{chainstate.FinalitySignatures().Fresh()};
             result.pushKV("pool_checkpoints", static_cast<uint64_t>(fresh_pool.TrackedCheckpoints()));
+            const bool key_mode{node::FreshKeyModeConfigured(consensus)};
             if (const auto& signer{fresh_pool.LocalSigner()}) {
                 UniValue local{UniValue::VOBJ};
                 local.pushKV("last_signed_height", signer->last_signed_height);
                 local.pushKV("last_error", signer->last_error);
+                if (key_mode) {
+                    UniValue keys{UniValue::VARR};
+                    for (const node::FreshSignerKeyEntry& key : signer->fresh_keys) {
+                        UniValue entry{UniValue::VOBJ};
+                        if (key.epoch) entry.pushKV("epoch", *key.epoch);
+                        entry.pushKV("bls_pubkey", HexStr(key.bls_pubkey));
+                        entry.pushKV("held", key.held);
+                        UniValue seated{UniValue::VARR};
+                        for (const uint64_t e : key.seated_epochs) seated.push_back(e);
+                        entry.pushKV("seated_epochs", std::move(seated));
+                        keys.push_back(std::move(entry));
+                    }
+                    local.pushKV("fresh_keys", std::move(keys));
+                    UniValue missing{UniValue::VARR};
+                    for (const node::FreshMissingSeat& seat : signer->missing_seats) {
+                        UniValue entry{UniValue::VOBJ};
+                        entry.pushKV("epoch", seat.epoch);
+                        entry.pushKV("bls_pubkey", HexStr(seat.bls_pubkey));
+                        missing.push_back(std::move(entry));
+                    }
+                    local.pushKV("missing_seats", std::move(missing));
+                    UniValue alerts{UniValue::VARR};
+                    for (const std::string& alert : signer->alerts) alerts.push_back(alert);
+                    local.pushKV("alerts", std::move(alerts));
+                }
                 result.pushKV("local_signer", std::move(local));
+            }
+            if (key_mode) {
+                // B-37 key status (FreshKeyStatusAt reports only the
+                // configuration when the tracker could not be synced).
+                const node::FreshKeyChainStatus status{node::FreshKeyStatusAt(
+                    chainstate.ModernFinality(), chainstate.m_chain, consensus, /*validator_key=*/std::nullopt)};
+                UniValue keys{UniValue::VOBJ};
+                keys.pushKV("key_height", status.key_height.value_or(-1));
+                keys.pushKV("state_available", status.available);
+                keys.pushKV("next_binding_window", node::FreshBindingWindowStatusName(status.window_status));
+                if (status.next_binding_epoch) keys.pushKV("next_binding_epoch", *status.next_binding_epoch);
+                if (status.window_start) keys.pushKV("window_start", *status.window_start);
+                UniValue bindings{UniValue::VARR};
+                for (const node::FreshKeyChainStatus::Binding& binding : status.bindings) {
+                    UniValue entry{UniValue::VOBJ};
+                    entry.pushKV("validator_key", HexStr(binding.validator_key));
+                    entry.pushKV("epoch", binding.epoch);
+                    entry.pushKV("bls_pubkey", HexStr(binding.bls_pubkey));
+                    entry.pushKV("height", binding.height);
+                    entry.pushKV("counted", binding.counted);
+                    entry.pushKV("void", binding.voided);
+                    bindings.push_back(std::move(entry));
+                }
+                keys.pushKV("bindings", std::move(bindings));
+                UniValue committees{UniValue::VARR};
+                for (size_t i{0}; i < status.seats.size();) {
+                    const uint64_t epoch{status.seats[i].epoch};
+                    UniValue members{UniValue::VARR};
+                    for (; i < status.seats.size() && status.seats[i].epoch == epoch; ++i) {
+                        const node::FreshKeyChainStatus::Seat& seat{status.seats[i]};
+                        UniValue member{UniValue::VOBJ};
+                        member.pushKV("validator_key", HexStr(seat.validator_key));
+                        member.pushKV("bls_pubkey", HexStr(seat.bls_pubkey));
+                        member.pushKV("weight", seat.weight);
+                        members.push_back(std::move(member));
+                    }
+                    UniValue committee{UniValue::VOBJ};
+                    committee.pushKV("epoch", epoch);
+                    committee.pushKV("members", std::move(members));
+                    committees.push_back(std::move(committee));
+                }
+                keys.pushKV("committees", std::move(committees));
+                result.pushKV("fresh_keys", std::move(keys));
             }
             return result;
         },
@@ -6298,7 +6514,8 @@ static RPCHelpMan getbridgev2info()
         "the eth_getProof plan for the next observations (buildbridgeobservationv2). A pinned B-23\n"
         "successor vault entry (node changes section 7.6) adds retired, deposit_vault and successor:\n"
         "from its migration height the launch entry is retired and the successor takes deposits and\n"
-        "burns, and kind 16 VAULT_SWEEP records move the launch entry's reserve to it. Configured only by\n"
+        "burns, and kind 16 VAULT_SWEEP records move the launch entry's reserve to it. Pinned route (b)\n"
+        "and (d3) forwarder factories (contracts spec sections 7 and 8) add forwarders. Configured only by\n"
         "the regtest-only -b3bridgepins v2 section (every other chain returns an error); getbridgeinfo\n"
         "keeps reporting the V1 bridge.\n"
         "Ethereum-facing values are 0x-prefixed EVM-order bytes; B3 ids and block hashes without an _evm\n"
@@ -6336,6 +6553,20 @@ static RPCHelpMan getbridgev2info()
                       {RPCResult::Type::STR_HEX, "vault_entry_id", /*optional=*/true, "Vault entry id (display order): the registry_id that kind 3 mint and kind 6 burn records name"},
                       {RPCResult::Type::STR_HEX, "vault_entry_id_evm", /*optional=*/true, "Raw vault entry id bytes as carried by the records"},
                       {RPCResult::Type::STR_HEX, "registry_id_evm", /*optional=*/true, "Raw registry id V2 bytes (approval identity over every pin but V and W2; records never name it)"},
+                      {RPCResult::Type::OBJ, "forwarders", /*optional=*/true, "Route (b) and (d3) forwarder factory pins (contracts spec sections 7 and 8), present only when the envelope pins one; each enters registry_id_evm. A forwarder account is the CREATE2 address of B3Forwarder under its factory, so wallets derive it offline from these pins",
+                       {
+                           {RPCResult::Type::OBJ, "deposit", /*optional=*/true, "Deposit forwarder F_d factory (route b): derivation only, never a mint condition",
+                            {
+                                {RPCResult::Type::STR_HEX, "factory", "B3DepositForwarderFactory address"},
+                                {RPCResult::Type::STR_HEX, "init_code_hash", "Its FORWARDER_INIT_CODE_HASH, keccak256 of the B3Forwarder creation code (raw bytes)"},
+                            }},
+                           {RPCResult::Type::OBJ, "exit", /*optional=*/true, "Exit forwarder F_x factory (route d3): a burn's exit block must name an F_x under it",
+                            {
+                                {RPCResult::Type::STR_HEX, "factory", "B3OftExitFactory address"},
+                                {RPCResult::Type::STR_HEX, "init_code_hash", "Its FORWARDER_INIT_CODE_HASH, keccak256 of the B3Forwarder creation code (raw bytes)"},
+                                {RPCResult::Type::NUM, "dst_eid", "Its DST_EID: the LayerZero destination endpoint id every exit block names"},
+                            }},
+                       }},
                       {RPCResult::Type::ARR, "unpinned", "Pins this envelope leaves unset (OI-3)",
                        {{RPCResult::Type::STR, "", "Pin name"}}},
                       {RPCResult::Type::STR, "unpinned_note", "Why those pins are unset"},
@@ -6352,6 +6583,10 @@ static RPCHelpMan getbridgev2info()
                            {RPCResult::Type::STR_HEX, "finalized_beacon_root", /*optional=*/true, "SSZ root of the latest finalized beacon header"},
                            {RPCResult::Type::NUM, "finalized_execution_block", /*optional=*/true, "Latest finalized Ethereum execution block"},
                            {RPCResult::Type::STR_HEX, "finalized_execution_hash", /*optional=*/true, "Latest finalized Ethereum execution hash"},
+                           {RPCResult::Type::NUM, "finalized_execution_timestamp", /*optional=*/true, "Unix timestamp of the latest finalized Ethereum execution block"},
+                           {RPCResult::Type::NUM, "stale_after", /*optional=*/true, "finalized_execution_timestamp + max_sync_lag_slots x 12: from a candidate time beyond it the mint rules refuse mints and kind 9 observations as stale until a light-client update connects"},
+                           {RPCResult::Type::BOOL, "fresh", /*optional=*/true, "Whether the mempool's candidate time max(now, median time past + 1) is at most stale_after"},
+                           {RPCResult::Type::NUM, "horizon_time", /*optional=*/true, "Estimated Unix time at which the pinned fork schedule ends (the first slot after fork_schedule_valid_through_epoch, extrapolated from the finalized head at 12 seconds per slot; untimed on a regtest synthetic beacon). Mints stop beyond it until an extension hard fork; wallets refuse route (b) forwarders within 7 days of it and end their not_after 24 hours before it (node changes section 12.3)"},
                            {RPCResult::Type::NUM, "connected_height", /*optional=*/true, "B3 height of the latest V2 store change"},
                            {RPCResult::Type::STR_HEX, "connected_block", /*optional=*/true, "B3 block of the latest V2 store change"},
                            {RPCResult::Type::NUM, "anchors", "Retained V2 execution anchors"},
@@ -6359,6 +6594,7 @@ static RPCHelpMan getbridgev2info()
                       {RPCResult::Type::NUM, "nullifiers", "Deposits minted as bUSD V2 (nullifier namespace 2)"},
                       {RPCResult::Type::NUM, "mint_epoch", /*optional=*/true, "V2 mint-cap epoch of the next block, (next_height - V) / epoch_length_blocks"},
                       {RPCResult::Type::NUM, "epoch_minted", /*optional=*/true, "Raw bUSD V2 minted in mint_epoch so far"},
+                      {RPCResult::Type::NUM, "epoch_mint_headroom", /*optional=*/true, "max_per_epoch - epoch_minted: the largest mint mint_epoch still admits (a single mint is also bounded by max_per_block); relayers refuse a flush above it"},
                       {RPCResult::Type::NUM, "withdrawals", "Confirmed V2 burns (leaves V2 appended)"},
                       {RPCResult::Type::STR_HEX, "withdrawal_root_evm", /*optional=*/true, "V2 withdrawal-tree root at the active tip"},
                       {RPCResult::Type::STR_HEX, "empty_withdrawal_root_evm", "Root of the empty depth-32 tree (non-zero; signed from V until the first burn)"},
@@ -6488,6 +6724,26 @@ static RPCHelpMan getbridgev2info()
             if (const auto registry_id{modern::ConfiguredBridgeV2RegistryId(consensus)}) {
                 result.pushKV("registry_id_evm", EvmHex(*registry_id));
             }
+            // Route (b) and (d3) factories. They are knowable before the
+            // first start (DeployV2 nonces n+4 and n+5), so they never join
+            // `unpinned`; an envelope without them omits the object.
+            if (v2.deposit_forwarder || v2.exit_forwarder) {
+                UniValue forwarders{UniValue::VOBJ};
+                if (v2.deposit_forwarder) {
+                    UniValue deposit{UniValue::VOBJ};
+                    deposit.pushKV("factory", EvmHex(v2.deposit_forwarder->factory));
+                    deposit.pushKV("init_code_hash", EvmHex(v2.deposit_forwarder->init_code_hash));
+                    forwarders.pushKV("deposit", std::move(deposit));
+                }
+                if (v2.exit_forwarder) {
+                    UniValue exit_pins{UniValue::VOBJ};
+                    exit_pins.pushKV("factory", EvmHex(v2.exit_forwarder->factory));
+                    exit_pins.pushKV("init_code_hash", EvmHex(v2.exit_forwarder->init_code_hash));
+                    exit_pins.pushKV("dst_eid", v2.exit_forwarder->dst_eid);
+                    forwarders.pushKV("exit", std::move(exit_pins));
+                }
+                result.pushKV("forwarders", std::move(forwarders));
+            }
             UniValue unpinned{UniValue::VARR};
             if (!entry.vault_runtime_code_hash) unpinned.push_back("vault_runtime_code_hash");
             if (!v2.verifier.runtime_code_hash) unpinned.push_back("verifier_runtime_code_hash");
@@ -6545,6 +6801,26 @@ static RPCHelpMan getbridgev2info()
                 light.pushKV("finalized_beacon_root", EvmHex(finalized.beacon.HashTreeRoot()));
                 light.pushKV("finalized_execution_block", finalized.execution.block_number);
                 light.pushKV("finalized_execution_hash", EvmHex(finalized.execution.block_hash));
+                // The mint rules' freshness bound (FinalizedHeadFresh, which
+                // admits no lag at all when max_sync_lag_slots x 12 overflows)
+                // and the wallets' horizon estimate
+                // (modern::BridgeV2LightClientHorizonTime).
+                const uint64_t finalized_time{finalized.execution.timestamp};
+                const uint64_t lag_slots{v2.light_client.max_sync_lag_slots};
+                const uint64_t lag_seconds{
+                    lag_slots > std::numeric_limits<uint64_t>::max() / modern::BRIDGE_ETHEREUM_SECONDS_PER_SLOT
+                        ? 0
+                        : lag_slots * modern::BRIDGE_ETHEREUM_SECONDS_PER_SLOT};
+                const uint64_t stale_after{finalized_time > std::numeric_limits<uint64_t>::max() - lag_seconds
+                                               ? std::numeric_limits<uint64_t>::max()
+                                               : finalized_time + lag_seconds};
+                const int64_t candidate_time{tip ? std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1) : 0};
+                light.pushKV("finalized_execution_timestamp", finalized_time);
+                light.pushKV("stale_after", stale_after);
+                light.pushKV("fresh", candidate_time >= 0 && static_cast<uint64_t>(candidate_time) <= stale_after);
+                light.pushKV("horizon_time", modern::BridgeV2LightClientHorizonTime(
+                                                 v2.light_client.fork_schedule_valid_through_epoch,
+                                                 finalized.beacon.slot, finalized_time));
                 if (const auto& connection{index->LightClientV2LastConnected()}) {
                     light.pushKV("connected_height", connection->height);
                     light.pushKV("connected_block", connection->block_hash.GetHex());
@@ -6559,8 +6835,10 @@ static RPCHelpMan getbridgev2info()
             if (index && active && asset && entry.mint_caps.epoch_length_blocks > 0) {
                 const uint64_t epoch{static_cast<uint64_t>(next_height - v2.activation_height) /
                                      entry.mint_caps.epoch_length_blocks};
+                const CAmount minted{index->EpochMinted(*asset, epoch)};
                 result.pushKV("mint_epoch", epoch);
-                result.pushKV("epoch_minted", index->EpochMinted(*asset, epoch));
+                result.pushKV("epoch_minted", minted);
+                result.pushKV("epoch_mint_headroom", std::max<CAmount>(0, entry.mint_caps.max_per_epoch - minted));
             }
             result.pushKV("withdrawals", index ? static_cast<uint64_t>(index->WithdrawalV2Count()) : 0);
             if (index) result.pushKV("withdrawal_root_evm", EvmHex(index->WithdrawalTreeV2().root));
@@ -6886,6 +7164,135 @@ static RPCHelpMan buildbridgeobservationv2()
     };
 }
 
+//! RPC result fields of a stored route (d3) exit block (node changes section
+//! 7.2 item 5): ExitParams p, the pinned factory, F_x and its salt.
+static std::vector<RPCResult> BridgeExitParamsResultsV2()
+{
+    return {
+        {RPCResult::Type::NUM, "version", "Exit block version (1)"},
+        {RPCResult::Type::NUM, "dst_eid", "ExitParams.dstEid: LayerZero destination endpoint id, the pinned exit factory's DST_EID"},
+        {RPCResult::Type::STR_HEX, "to", "ExitParams.to: 32-byte destination address word (raw bytes)"},
+        {RPCResult::Type::NUM, "max_bridge_fee_bps", "ExitParams.maxBridgeFeeBps: OFT slippage bound in basis points (at most 50)"},
+        {RPCResult::Type::NUM, "fee_cap", "ExitParams.feeCap: largest relayer fee one forward may take (raw six-decimal units)"},
+        {RPCResult::Type::STR_HEX, "refund_eoa", "ExitParams.refundEOA: the only account that may withdraw an unforwarded balance on Ethereum"},
+        {RPCResult::Type::STR_HEX, "factory", "Pinned B3OftExitFactory address"},
+        {RPCResult::Type::STR_HEX, "account", "F_x = factory.accountOf(p), the leaf's recipient"},
+        {RPCResult::Type::STR_HEX, "salt", "exitSalt(p), the CREATE2 salt (raw bytes)"},
+    };
+}
+
+static UniValue BridgeExitParamsJsonV2(const Consensus::BridgeV2ExitForwarderPins& pins,
+                                       const modern::ExitForwarderParamsV2& p)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("version", modern::EXIT_FORWARDER_BLOCK_VERSION_V1);
+    out.pushKV("dst_eid", p.dst_eid);
+    out.pushKV("to", EvmHex(p.to));
+    out.pushKV("max_bridge_fee_bps", p.max_bridge_fee_bps);
+    out.pushKV("fee_cap", p.fee_cap);
+    out.pushKV("refund_eoa", EvmHex(p.refund_eoa));
+    out.pushKV("factory", EvmHex(pins.factory));
+    out.pushKV("account", EvmHex(modern::ExitForwarderAddressV2(pins, p)));
+    out.pushKV("salt", EvmHex(modern::ExitForwarderSaltV2(p)));
+    return out;
+}
+
+static RPCHelpMan getbridgewithdrawals()
+{
+    return RPCHelpMan{
+        "getbridgewithdrawals",
+        "List the confirmed bridge V2 withdrawals (leaves V2) of the active chain in withdrawal id order,\n"
+        "from from_id, at most count of them (node changes section 11.1). A route (d3) burn's exit block,\n"
+        "stored with its leaf, is returned as exit, so the exit parameters p of its exit forwarder F_x stay\n"
+        "recoverable without the burning wallet (C-7): refund_eoa can withdrawOnEthereum(p, ...) a balance\n"
+        "no forward sent. Prove a leaf with getbridgewithdrawalproofv2 (source_txid, burn_output_index).\n"
+        "Configured only by the regtest-only -b3bridgepins v2 section.\n",
+        {
+            {"from_id", RPCArg::Type::NUM, RPCArg::Default{0}, "First withdrawal id"},
+            {"count", RPCArg::Type::NUM, RPCArg::Default{100}, "Most withdrawals returned, 1 to 1000"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Bridge V2 withdrawals",
+                  {
+                      {RPCResult::Type::NUM, "withdrawals_total", "Confirmed V2 withdrawals on the active chain"},
+                      {RPCResult::Type::ARR, "withdrawals", "From from_id, in id order",
+                       {
+                           {RPCResult::Type::OBJ, "", "",
+                            {
+                                {RPCResult::Type::NUM, "withdrawal_id", "Leaf V2 id"},
+                                {RPCResult::Type::STR_HEX, "source_txid", "Burn transaction id (a sweep: its carrier)"},
+                                {RPCResult::Type::NUM, "burn_output_index", "Burn output index (a sweep: the carrier's binding output)"},
+                                {RPCResult::Type::NUM, "b3_height", "B3 height of the leaf"},
+                                {RPCResult::Type::STR_HEX, "b3_block", "B3 block that connected the leaf"},
+                                {RPCResult::Type::STR, "entry", "Vault entry whose ledger counts the leaf: launch or successor"},
+                                {RPCResult::Type::BOOL, "sweep", "Whether the leaf is a kind 16 vault sweep"},
+                                {RPCResult::Type::STR_HEX, "vault", "Vault the leaf names"},
+                                {RPCResult::Type::STR_HEX, "token", "Origin token"},
+                                {RPCResult::Type::STR_HEX, "recipient", "Ethereum recipient (route d3: F_x)"},
+                                {RPCResult::Type::NUM, "amount_raw", "Raw six-decimal token amount"},
+                                {RPCResult::Type::STR_HEX, "withdrawal_leaf", "keccak256 of the 180-byte leaf V2 preimage"},
+                                {RPCResult::Type::OBJ, "exit", /*optional=*/true, "Route (d3) only: the burn's exit block", BridgeExitParamsResultsV2()},
+                            }},
+                       }},
+                  }},
+        RPCExamples{HelpExampleCli("getbridgewithdrawals", "") + HelpExampleCli("getbridgewithdrawals", "0 10") +
+                    HelpExampleRpc("getbridgewithdrawals", "0, 10")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const uint64_t from_id{request.params[0].isNull() ? 0 : request.params[0].getInt<uint64_t>()};
+            const int count{request.params[1].isNull() ? 100 : request.params[1].getInt<int>()};
+            if (count < 1 || count > 1000) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "count must be in the range [1, 1000]");
+            }
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            const Consensus::BridgeV2Params& v2{EnsureBridgeV2Configured(consensus)};
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
+            if (!tip || !tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Bridge state is unavailable at the active tip");
+            }
+            const node::BridgeStateIndex& index{tracker.Index()};
+            const uint64_t total{index.WithdrawalV2Count()};
+            UniValue withdrawals{UniValue::VARR};
+            for (uint64_t id{from_id}; id < total && id - from_id < static_cast<uint64_t>(count); ++id) {
+                const auto confirmed{index.WithdrawalV2(id)};
+                if (!confirmed) {
+                    throw JSONRPCError(RPC_MISC_ERROR, "Bridge V2 withdrawal ids are not contiguous");
+                }
+                const modern::BridgeWithdrawalV2& w{confirmed->withdrawal};
+                UniValue item{UniValue::VOBJ};
+                item.pushKV("withdrawal_id", w.withdrawal_id);
+                item.pushKV("source_txid", confirmed->transaction_id.GetHex());
+                item.pushKV("burn_output_index", confirmed->burn_output_index);
+                item.pushKV("b3_height", w.b3_height);
+                item.pushKV("b3_block", confirmed->connected_block.GetHex());
+                item.pushKV("entry", confirmed->entry == static_cast<uint8_t>(Consensus::BridgeV2EntryRole::SUCCESSOR)
+                                         ? "successor"
+                                         : "launch");
+                item.pushKV("sweep", confirmed->sweep);
+                item.pushKV("vault", EvmHex(w.vault));
+                item.pushKV("token", EvmHex(w.token));
+                item.pushKV("recipient", EvmHex(w.recipient));
+                item.pushKV("amount_raw", w.amount);
+                item.pushKV("withdrawal_leaf", EvmHex(confirmed->leaf));
+                if (confirmed->exit) {
+                    if (!v2.exit_forwarder) {
+                        throw JSONRPCError(RPC_MISC_ERROR, "A stored exit block has no pinned exit forwarder");
+                    }
+                    item.pushKV("exit", BridgeExitParamsJsonV2(*v2.exit_forwarder, *confirmed->exit));
+                }
+                withdrawals.push_back(std::move(item));
+            }
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("withdrawals_total", total);
+            result.pushKV("withdrawals", std::move(withdrawals));
+            return result;
+        },
+    };
+}
+
 static RPCHelpMan getbridgewithdrawalproofv2()
 {
     return RPCHelpMan{
@@ -6900,8 +7307,11 @@ static RPCHelpMan getbridgewithdrawalproofv2()
         "pays under any root the verifier accepted at or above b3_height, once per withdrawal id. Every\n"
         "leaf of the prefix, its active-chain connection and the root are recomputed. With a B-23\n"
         "successor (node changes section 7.6) a leaf names the launch vault or the successor vault, and a\n"
-        "kind 16 VAULT_SWEEP leaf names the launch vault and pays the successor vault. Configured only\n"
-        "by the regtest-only -b3bridgepins v2 section. This RPC handles no Ethereum private key; the\n"
+        "kind 16 VAULT_SWEEP leaf names the launch vault and pays the successor vault. A route (d3) burn's\n"
+        "exit block, stored with its leaf by the bridge index (no block is read), is returned as exit: the\n"
+        "leaf pays its exit forwarder F_x, which B3OftExitFactory.forward then sends through the OFT\n"
+        "adapter (B3RelayBatch.relayWithForwards releases and forwards in one call). Configured\n"
+        "only by the regtest-only -b3bridgepins v2 section. This RPC handles no Ethereum private key; the\n"
         "account that submits the calldata pays gas.\n",
         {
             {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
@@ -6928,6 +7338,8 @@ static RPCHelpMan getbridgewithdrawalproofv2()
                       {RPCResult::Type::STR_HEX, "recipient", "Ethereum recipient"},
                       {RPCResult::Type::NUM, "amount_raw", "Raw six-decimal token amount"},
                       {RPCResult::Type::BOOL, "sweep", /*optional=*/true, "With a pinned B-23 successor only: whether the leaf is a kind 16 vault sweep (it names the launch vault and pays the successor vault, which counts it once absorb() runs)"},
+                      {RPCResult::Type::OBJ, "exit", /*optional=*/true, "Only when the burn's kind 6 record carries a route (d3) exit block (node changes section 7.2 item 5): its ExitParams p, as the bridge index stores them with the leaf. The recipient is F_x = accountOf(p); forward it with B3OftExitFactory.forward(p, fee, feeRecipient, nativeRefundTo), fee <= fee_cap, or B3RelayBatch.relayWithForwards",
+                       BridgeExitParamsResultsV2()},
                       {RPCResult::Type::STR_HEX, "leaf_preimage", "The 180-byte leaf V2 preimage"},
                       {RPCResult::Type::STR_HEX, "withdrawal_leaf", "keccak256(leaf_preimage)"},
                       {RPCResult::Type::STR_HEX, "withdrawal_root", "V2 withdrawal root the certificate carries"},
@@ -7063,6 +7475,15 @@ static RPCHelpMan getbridgewithdrawalproofv2()
             const auto proof{bridge::BuildWithdrawalV2RelayArtifacts(withdrawals, withdrawal_id, *expected_root, error)};
             if (!proof) throw JSONRPCError(RPC_MISC_ERROR, error);
             const node::BridgeWithdrawalV2Request& burn{requests->at(withdrawal_id)};
+            // Route (d3): the exit block check 5 verified, stored with the
+            // leaf (consensus admits one only under a pinned exit forwarder).
+            const std::optional<modern::ExitForwarderParamsV2>& exit_params{burn.exit};
+            if (exit_params &&
+                (!v2.exit_forwarder ||
+                 modern::ExitForwarderAddressV2(*v2.exit_forwarder, *exit_params) != proof->withdrawal.recipient)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Burn exit forwarder does not match the withdrawal recipient");
+            }
 
             UniValue result{UniValue::VOBJ};
             result.pushKV("withdrawal_id", withdrawal_id);
@@ -7078,6 +7499,7 @@ static RPCHelpMan getbridgewithdrawalproofv2()
             result.pushKV("recipient", EvmHex(proof->withdrawal.recipient));
             result.pushKV("amount_raw", proof->withdrawal.amount);
             if (v2.successor) result.pushKV("sweep", burn.sweep);
+            if (exit_params) result.pushKV("exit", BridgeExitParamsJsonV2(*v2.exit_forwarder, *exit_params));
             result.pushKV("leaf_preimage", EvmHex(proof->leaf_preimage));
             result.pushKV("withdrawal_leaf", EvmHex(proof->leaf));
             result.pushKV("withdrawal_root", EvmHex(proof->root));
@@ -7109,7 +7531,7 @@ static RPCHelpMan getfinalitylineagevotes()
     return RPCHelpMan{
         "getfinalitylineagevotes",
         "Return the verified fresh-lineage votes held by the local pool that are still useful on the\n"
-        "active chain (regtest staging relay; there is no P2P transport for them).\n",
+        "active chain (regtest drill: the same votes are gossiped over the P2P message finsigv2).\n",
         {},
         RPCResult{RPCResult::Type::ARR, "", "Votes, newest checkpoint first",
                   {{RPCResult::Type::OBJ, "", "Vote",
@@ -7154,8 +7576,9 @@ static RPCHelpMan submitfinalitylineagevote()
 {
     return RPCHelpMan{
         "submitfinalitylineagevote",
-        "Submit one serialized fresh-lineage vote to the local pool (regtest staging relay). The vote is\n"
-        "fully verified (lineage id, grid, depth, epoch, member index, BLS over digest V2) before it is kept.\n",
+        "Submit one serialized fresh-lineage vote to the local pool (regtest drill; votes normally travel\n"
+        "over the P2P message finsigv2, and an accepted vote is replayed to peers from the pool). The vote\n"
+        "is fully verified (lineage id, grid, depth, epoch, member index, BLS over digest V2) before it is kept.\n",
         {
             {"hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
              "The 148-byte serialized vote (getfinalitylineagevotes \"hex\")"},
@@ -7164,7 +7587,8 @@ static RPCHelpMan submitfinalitylineagevote()
                   {
                       {RPCResult::Type::STR, "result",
                        "accepted, duplicate, stale, unconfigured, lineage-mismatch, unknown-epoch, not-checkpoint, "
-                       "too-shallow, bad-index, pool-full or bad-signature"},
+                       "too-shallow, bad-index, pool-full, verification-deferred (P2P budget only, never returned "
+                       "here) or bad-signature"},
                   }},
         RPCExamples{HelpExampleCli("submitfinalitylineagevote", "\"hex\"")},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
@@ -7235,6 +7659,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getbridgev2info},
         {"blockchain", &buildbridgeobservationv2},
         {"blockchain", &getbridgewithdrawalproofv2},
+        {"blockchain", &getbridgewithdrawals},
         {"hidden", &getfinalitylineagevotes},
         {"hidden", &submitfinalitylineagevote},
         {"hidden", &invalidateblock},

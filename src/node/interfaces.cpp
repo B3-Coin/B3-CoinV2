@@ -38,6 +38,8 @@
 #include <modern/fn_pod.h>
 #include <node/context.h>
 #include <node/finality_binding_index.h>
+#include <node/finality_fresh_key_index.h>
+#include <node/finality_fresh_key_store.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
 #include <node/flowmesh_service.h>
@@ -1106,6 +1108,34 @@ public:
         error.clear();
         return interfaces::BridgePrevalidationResult::VALID;
     }
+    interfaces::BridgePrevalidationResult bridgeV2LightClientHead(
+        std::optional<interfaces::BridgeV2LightClientHead>& head, std::string& error) override
+    {
+        head.reset();
+        const Consensus::Params& consensus{chainman().GetConsensus()};
+
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman().ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        if (tip == nullptr || !consensus.BridgeV2RulesActive(tip->nHeight + 1)) {
+            error = "Bridge V2 rules are not active for the next block";
+            return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
+        }
+        node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
+        if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus,
+                          *tip)) {
+            error = "The bridge state index is unavailable at the active tip";
+            return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
+        }
+        if (const auto& store{tracker.Index().LightClientV2()}) {
+            head = interfaces::BridgeV2LightClientHead{
+                .finalized_slot = store->finalized_header.beacon.slot,
+                .finalized_execution_timestamp = store->finalized_header.execution.timestamp,
+            };
+        }
+        error.clear();
+        return interfaces::BridgePrevalidationResult::VALID;
+    }
     bool hasAssumedValidChain() override
     {
         LOCK(::cs_main);
@@ -1267,6 +1297,58 @@ public:
             out.finalized_height = state.finalized->height;
             out.finalized_hash = state.finalized->block_hash;
             out.finalized_epoch = state.finalized->epoch;
+        }
+        return out;
+    }
+    interfaces::FreshFinalityKeyStatus freshFinalityKeyStatus(
+        const std::array<unsigned char, 32>& validator_key,
+        const std::vector<std::array<unsigned char, 48>>& probe_keys) override
+    {
+        // B-37 (regtest -b3freshkeyheight only): the public chain view; the
+        // wallet opens the fresh key store in the signer directory itself.
+        interfaces::FreshFinalityKeyStatus out;
+        const Consensus::Params& consensus{chainman().GetConsensus()};
+        out.signer_directory = args().GetDataDirNet() / fs::u8path(node::FINALITY_SIGNER_DIRNAME);
+        if (!node::FreshKeyModeConfigured(consensus)) return out;
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman().ActiveChainstate()};
+        node::FinalityTracker& tracker{chainstate.ModernFinality()};
+        if (const CBlockIndex* tip{chainstate.m_chain.Tip()}) {
+            // The same sync as finalityStatus; on failure the status reports
+            // the configuration only (available = false).
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            bool bridge_ok{true};
+            if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+                node::BridgeStateTracker& bridge{chainstate.ModernBridgeState()};
+                bridge_ok = bridge.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip);
+                if (bridge_ok) bridge_index = &bridge.Index();
+            }
+            if (bridge_ok) tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip, bridge_index);
+        }
+        const node::FreshKeyChainStatus status{
+            node::FreshKeyStatusAt(tracker, chainstate.m_chain, consensus, validator_key, probe_keys)};
+        out.configured = status.configured;
+        out.available = status.available;
+        out.key_height = status.key_height;
+        out.activation_height = status.activation_height;
+        if (status.chain_domain) out.chain_domain = *status.chain_domain;
+        out.tip_height = status.tip_height;
+        out.next_binding_window = node::FreshBindingWindowStatusName(status.window_status);
+        out.next_binding_epoch = status.next_binding_epoch;
+        out.window_start = status.window_start;
+        out.bootstrapped = status.bootstrapped;
+        out.broken = status.broken;
+        out.epoch = status.epoch;
+        for (const auto& binding : status.bindings) {
+            out.bindings.push_back(interfaces::FreshFinalityKeyBinding{
+                binding.epoch, binding.bls_pubkey, binding.height, binding.counted, binding.voided});
+        }
+        for (const auto& seat : status.seats) {
+            out.seats.push_back(interfaces::FreshFinalityKeySeat{seat.epoch, seat.bls_pubkey, seat.weight});
+        }
+        for (const auto& claim : status.probe_claims) {
+            out.probe_claims.push_back(
+                interfaces::FreshFinalityKeyClaim{claim.bls_pubkey, claim.first_height, claim.own_epoch});
         }
         return out;
     }

@@ -212,6 +212,9 @@ public:
             //! The Verifier V2 MAX_EPOCH_LAG DeployV2 will use; when set it
             //! must equal the regtest burn gate's set expiry (profile R).
             std::optional<int64_t> verifier_max_epoch_lag{};
+            //! Owner ruling R10: the first height (>= V) of the sponsored
+            //! sighash rule for kind 6 burns; the rule stays off when unset.
+            std::optional<int> sponsored_sighash_height{};
 
             /**
              * The optional B-23 successor vault v' (`v2.successor`; node
@@ -234,6 +237,21 @@ public:
                 std::optional<uint64_t> origin_deployment_block{};
             };
             std::optional<SuccessorSection> successor{};
+
+            /**
+             * The optional route (b) and (d3) forwarder factories
+             * (`v2.deposit_forwarder`, `v2.exit_forwarder`; node changes
+             * section 3.1, contracts spec sections 7-8). Knowable before
+             * the first start, so pinned with v (OI-3): each factory is the
+             * DeployV2 deployer's CREATE address (nonces n+4 and n+5) and
+             * the init-code hash is keccak256 of B3Forwarder's creation
+             * code from the forge artifact (raw EVM bytes). The sections
+             * are the consensus pins themselves.
+             */
+            using DepositForwarderSection = Consensus::BridgeV2DepositForwarderPins;
+            using ExitForwarderSection = Consensus::BridgeV2ExitForwarderPins;
+            std::optional<DepositForwarderSection> deposit_forwarder{};
+            std::optional<ExitForwarderSection> exit_forwarder{};
         };
 
         //! Whether the file carried a v1_decentralized section. True by
@@ -308,8 +326,24 @@ public:
         //! flowmesh_test; R_f - 1 must lie on the V1 checkpoint grid.
         std::optional<int> fresh_lineage_height{};
         std::optional<int> fresh_max_epoch_extension{};
+        //! -b3freshkeyheight (R_key): B-37 per-epoch committee keys for the
+        //! fresh lineage from this height (finality dependency section
+        //! 6.4). Requires fresh_lineage_height; 1 <= R_key <= R_f - 2.
+        //! Unset keeps the staging lineage on the V1 keys.
+        std::optional<int> fresh_key_height{};
         //! B-23's fresh-lineage extension on regtest profile R.
         static constexpr int DEFAULT_FRESH_MAX_EPOCH_EXTENSION{1'280};
+        //! -b3h1height (R_h) and -b3h1escaperounds (R_escape): H1 producer
+        //! rotation (finality dependency section 5.1, FD-2). Applied only
+        //! together with flowmesh_test; R_h > M. The escape rounds need R_h.
+        std::optional<int> h1_height{};
+        std::optional<int64_t> h1_escape_rounds{};
+        //! The largest R_escape the block assembler's round search reaches
+        //! (it tries rounds below its 100,000-round bound).
+        static constexpr int64_t MAX_H1_ESCAPE_ROUNDS{99'999};
+        //! -b3h2checkpoint=HEIGHT:HASH (H2, finality dependency section
+        //! 5.3): extra hardened modern checkpoints, in modern_checkpoints.
+        std::vector<std::pair<int, uint256>> h2_checkpoints{};
     };
 
     struct RegTestOptions {

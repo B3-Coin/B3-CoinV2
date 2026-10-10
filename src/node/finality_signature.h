@@ -7,6 +7,7 @@
 #include <consensus/params.h>
 #include <crypto/bls.h>
 #include <modern/finality_types.h>
+#include <node/finality_fresh_key_store.h>
 #include <node/finality_fresh_signature.h>
 #include <node/finality_signer_store.h>
 #include <node/finality_signing_policy.h>
@@ -17,7 +18,9 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -219,6 +222,17 @@ public:
                            const uint256& chain_domain,
                            const fs::path& store_directory,
                            std::string& error);
+    //! Most fresh-lineage keys an offline signer takes (SetFreshKeys).
+    static constexpr size_t MAX_FRESH_KEYS{16};
+    /** Offline/test signers only (B-37 fresh-key mode, regtest
+     * -b3freshkeyheight): the fresh-lineage BLS keys this validator may sign
+     * fresh votes with, replacing any earlier set (empty clears it). Call
+     * after SetKeys(), which names the validator and clears them. A
+     * persistent signer refuses: it reads its fresh keys only from its
+     * FreshKeyStore (node/finality_fresh_key_store.h), so erasure is real.
+     * Oversized collections leave the signer unchanged. Neither the V1
+     * signing pass nor the fresh lineage without fresh-key mode reads them. */
+    bool SetFreshKeys(const std::vector<bls::SecretKey>& keys, std::string& error);
     /** Explicit, local operator trust for one exact, intact orphan-vote
      * journal. This is NOT a quorum proof and does not revoke an old vote or
      * enforce a block checkpoint. The validator target is mandatory. No
@@ -262,25 +276,43 @@ public:
      * dependency section 8, B-7): the V1 single-vote logic, unchanged, over
      * the fresh state and digest V2. Signs each fresh checkpoint on the grid
      * above GENESIS_HEIGHT once the depth is reached, strictly increasing,
-     * with the BLS key the fresh committee records for this validator (the
-     * V1 FINALITY_KEY binding keys: per-epoch keys, B-37, are a later slice).
+     * with the BLS key the fresh committee records for this validator.
+     * Without fresh-key mode that is the V1 FINALITY_KEY binding key (a
+     * SetKeys/SetKeysPersistent key). In fresh-key mode (B-37, regtest
+     * -b3freshkeyheight; finality dependency section 6.4) it is ONLY one of
+     * this validator's own fresh keys, never a V1 key: a persistent signer
+     * reloads its FreshKeyStore (in its journal directory, keyed by chain
+     * domain and validator) on every pass, an offline signer uses
+     * SetFreshKeys(). Before signing, a persistent signer erases every held
+     * key the erasure policy allows (node::FreshKeyErasable at the tip, with
+     * node::FreshKeyErasureHorizon), and every pass computes the key status
+     * (FreshKeyStatus(): keys, seats without a held secret, alerts; each
+     * alert is logged once while it persists) before the journal safety
+     * check, so it is reported even when the journal refuses. A seat in the
+     * current committee without a held secret, or an unreadable key store,
+     * is reported through FreshLastError() as a recoverable key error.
      * A persistent signer first records every vote in its own
      * FRESH_LINEAGE_V2 journal keyed by the lineage id, never the V1 one.
      * Failures are reported through FreshLastError() and, with the
-     * watermark, into pool.ReportLocalSigner() for getfinalitylineage (the
-     * V1 LastError() and staking status are unchanged). No-op unless the
-     * staging signer is configured. Returns the votes submitted to `pool`;
-     * they have no P2P relay in this slice (see FreshLineageSig).
+     * watermark and the key status, into pool.ReportLocalSigner() for
+     * getfinalitylineage (the V1 LastError() and staking status are
+     * unchanged). No-op unless the staging signer is configured. Returns the
+     * votes submitted to `pool`; net_processing relays the pool's verified
+     * votes over `finsigv2` (see FreshLineageSig).
      */
     std::vector<FreshLineageSig> MaybeSignFresh(const FinalityTracker& tracker, const CChain& chain,
                                                 const Consensus::Params& params,
                                                 FreshLineageSignaturePool& pool,
                                                 const BridgeStateIndex* bridge_index = nullptr);
     int FreshLastSignedHeight() const { return m_fresh_last_signed; }
-    const std::string& FreshLastError() const { return m_fresh_error; }
+    //! The fresh journal's refusal, else the recoverable fresh key error.
+    const std::string& FreshLastError() const { return m_fresh_error.empty() ? m_fresh_key_error : m_fresh_error; }
     //! The fresh-lineage journal (open only for a persistent signer once the
     //! fresh lineage id is known).
     const FinalitySignerStore& FreshStore() const { return m_fresh_store; }
+    //! The B-37 key status of the last fresh-lineage pass (empty without
+    //! fresh-key mode).
+    const FreshSignerKeyStatus& FreshKeyStatus() const { return m_fresh_key_status; }
 
 private:
     //! The V1 signing pass (the pre-S3 MaybeSign body, unchanged).
@@ -305,6 +337,19 @@ private:
                                      const Consensus::Params& params,
                                      const BridgeStateIndex* bridge_index);
     void FailFresh(std::string error, bool permanent = true);
+    /**
+     * Fresh-key mode, once per pass before the journal safety check: reload
+     * a persistent signer's FreshKeyStore, erase what the policy allows at
+     * `tip_height` on `state` (null: nothing yet to erase), then recompute
+     * m_fresh_key_status, m_fresh_key_error and log new alerts.
+     */
+    void RefreshFreshKeys(const FinalityTracker& tracker, const Consensus::Params& params,
+                          const uint256& chain_domain, const FreshLineageState* state, int tip_height);
+    //! The fresh-key-mode secret for `pubkey`: from the store of a
+    //! persistent signer, else from SetFreshKeys(); never a V1 key.
+    std::optional<bls::SecretKey> FreshKeyFor(const std::array<unsigned char, bls::PUBKEY_SIZE>& pubkey) const;
+    //! Forget every fresh key, the store instance, the key status and alerts.
+    void ClearFreshKeys();
     bool EnsurePersistentSafety(const FinalityTracker& tracker,
                                 const CChain& chain,
                                 const Consensus::Params& params,
@@ -376,6 +421,18 @@ private:
     int m_fresh_last_signed{-1};
     std::string m_fresh_error;
     bool m_fresh_permanent_error{false};
+
+    //! B-37 fresh-key mode (regtest -b3freshkeyheight only). An offline
+    //! signer's fresh keys (SetFreshKeys); a persistent signer keeps none here.
+    std::vector<SigningKey> m_fresh_keys;
+    //! A persistent signer's fresh key store, reopened (re-read) every pass.
+    std::unique_ptr<FreshKeyStore> m_fresh_key_store;
+    FreshSignerKeyStatus m_fresh_key_status;
+    //! Recoverable fresh key availability (unreadable store, current seat
+    //! without a held secret); separate from the journal's m_fresh_error.
+    std::string m_fresh_key_error;
+    //! Alerts of the previous pass: each is logged once while it persists.
+    std::set<std::string> m_fresh_alerts;
 };
 
 } // namespace node

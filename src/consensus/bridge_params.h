@@ -589,6 +589,46 @@ struct BridgeV2GateParams {
 };
 
 /**
+ * Deposit forwarder F_d pins (node changes section 3.1; contracts spec
+ * section 7.2): the B3DepositForwarderFactory address and its
+ * FORWARDER_INIT_CODE_HASH (raw EVM bytes, from the DeployV2 manifest).
+ * Derivation only (modern/bridge_forwarder.h), never a mint condition.
+ */
+struct BridgeV2DepositForwarderPins {
+    BridgeEthAddress factory{};
+    uint256 init_code_hash{};
+
+    bool Valid() const
+    {
+        return !BridgeAddressIsNull(factory) && !init_code_hash.IsNull();
+    }
+
+    friend bool operator==(const BridgeV2DepositForwarderPins&,
+                           const BridgeV2DepositForwarderPins&) = default;
+};
+
+/**
+ * Exit forwarder F_x pins (node changes sections 3.1 and 7.2; contracts spec
+ * section 8): the B3OftExitFactory address, its FORWARDER_INIT_CODE_HASH and
+ * its immutable DST_EID (LayerZero endpoint id, Arbitrum 30110). A burn's
+ * exit block is checked against them.
+ */
+struct BridgeV2ExitForwarderPins {
+    BridgeEthAddress factory{};
+    uint256 init_code_hash{};
+    uint32_t dst_eid{0};
+
+    bool Valid() const
+    {
+        return !BridgeAddressIsNull(factory) && !init_code_hash.IsNull() &&
+               dst_eid != 0;
+    }
+
+    friend bool operator==(const BridgeV2ExitForwarderPins&,
+                           const BridgeV2ExitForwarderPins&) = default;
+};
+
+/**
  * Complete bridge V2 envelope. V (`activation_height`) is the first height
  * of V2 records and of the V2 withdrawal tree and equals the verifier's
  * BRIDGE_ACTIVATION_HEIGHT; W2 (`burn_height`) >= V is the first height of
@@ -596,6 +636,8 @@ struct BridgeV2GateParams {
  *
  * `vault` is the launch entry; `successor` is the optional B-23 successor
  * v' (BridgeV2SuccessorEntry), unset until a migration is pinned.
+ * `deposit_forwarder` and `exit_forwarder` are the optional route (b) and
+ * (d3) factory pins (ForwardersValid()); both enter the registry id.
  */
 struct BridgeV2Params {
     int32_t activation_height{-1};
@@ -605,6 +647,16 @@ struct BridgeV2Params {
     BridgeV2VaultEntry vault{};
     BridgeV2GateParams gate{};
     std::optional<BridgeV2SuccessorEntry> successor{};
+    // Route (b) and (d3) forwarder factories; unset on every shipped network.
+    std::optional<BridgeV2DepositForwarderPins> deposit_forwarder{};
+    std::optional<BridgeV2ExitForwarderPins> exit_forwarder{};
+    // Owner ruling R10 (OI-8): the first height at which a kind 6 burn is
+    // script-checked under SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS, so a
+    // relayer may add the native fee input. A pin of its own, at or above
+    // V: pinning the rest of the envelope never turns the sponsored sighash
+    // rule on. Unset by default and on every shipped network; only the
+    // regtest pin file's v2 section sets it.
+    std::optional<int32_t> sponsored_sighash_height{};
 
     //! The entry of `role`; nullptr for SUCCESSOR when none is pinned.
     const BridgeV2VaultEntry* Entry(BridgeV2EntryRole role) const
@@ -658,6 +710,34 @@ struct BridgeV2Params {
                next.vault_runtime_code_hash.has_value();
     }
 
+    /**
+     * The forwarder pins' own rules (node changes section 3.1): each pinned
+     * factory is complete (a non-null address and init-code hash; the exit
+     * pin also a non-zero dst_eid) and is a contract of its own, distinct
+     * from the launch vault, the token, the verifier, a pinned successor
+     * vault and the other factory. True when neither is pinned, so every
+     * forwarder-free envelope keeps its verdict.
+     */
+    bool ForwardersValid() const
+    {
+        const auto is_bridge_contract{[&](const BridgeEthAddress& address) {
+            return address == vault.vault_address ||
+                   address == vault.token_address ||
+                   address == verifier.address ||
+                   (successor && address == successor->entry.vault_address);
+        }};
+        if (deposit_forwarder && (!deposit_forwarder->Valid() ||
+                                  is_bridge_contract(deposit_forwarder->factory))) {
+            return false;
+        }
+        if (exit_forwarder && (!exit_forwarder->Valid() ||
+                               is_bridge_contract(exit_forwarder->factory))) {
+            return false;
+        }
+        return !(deposit_forwarder && exit_forwarder &&
+                 deposit_forwarder->factory == exit_forwarder->factory);
+    }
+
     bool Valid() const
     {
         if (activation_height < 1 || burn_height < activation_height ||
@@ -671,6 +751,11 @@ struct BridgeV2Params {
         // (BridgeV2VerifierPins::max_epoch_lag_seconds).
         if (verifier.max_epoch_lag_seconds &&
             *verifier.max_epoch_lag_seconds != gate.set_expiry_seconds) {
+            return false;
+        }
+        // R10's sponsored sighash rule starts at or after V.
+        if (sponsored_sighash_height &&
+            *sponsored_sighash_height < activation_height) {
             return false;
         }
         // As BridgeMintParamsReady: an Ethereum-mainnet entry is exactly
@@ -687,7 +772,7 @@ struct BridgeV2Params {
              !verifier.max_epoch_lag_seconds)) {
             return false;
         }
-        return SuccessorValid();
+        return SuccessorValid() && ForwardersValid();
     }
 };
 

@@ -58,7 +58,8 @@ static bool g_bare_multi{DEFAULT_PERMIT_BAREMULTISIG};
 static const auto GENERIC_SCRIPT_VERIFY_FLAGS = script_verify_flags::from_int(
     MAX_SCRIPT_VERIFY_FLAGS &
     ~script_verify_flags{SCRIPT_VERIFY_LEGACY_B3_STRICTENC}.as_int() &
-    ~script_verify_flags{SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL}.as_int());
+    ~script_verify_flags{SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL}.as_int() &
+    ~script_verify_flags{SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS}.as_int());
 
 static const std::map<std::string, script_verify_flag_name>& mapFlagNames = ScriptFlagNamesToEnum();
 

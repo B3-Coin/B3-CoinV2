@@ -8,12 +8,14 @@ target_sources(test_bitcoin
   PRIVATE
     asset_amount_rpc_tests.cpp
     asset_metadata_tests.cpp
+    bridge_sponsor_tests.cpp
     init_test_fixture.cpp
     wallet_test_fixture.cpp
     db_tests.cpp
     coinselector_tests.cpp
     coinselection_tests.cpp
     feebumper_tests.cpp
+    finality_fresh_key_wallet_tests.cpp
     finality_recovery_status_tests.cpp
     finality_recovery_rpc_tests.cpp
     group_outputs_tests.cpp

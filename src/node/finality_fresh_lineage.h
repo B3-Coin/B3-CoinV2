@@ -47,7 +47,8 @@ class BridgeStateIndex;
  *   rotation   V1's handover-gated rule with V1's E: epoch e+1 begins at the
  *              first h >= epoch_start[e] + E with an epoch-e V2 certificate
  *              already included below h; Set'_{e+2} := Snapshot(h-1) stamped
- *              e+2, or (carry-over) Set'_{e+1}'s members re-stamped e+2 when
+ *              e+2 (Committee(Snapshot(h-1)) under the B-37 seat rules), or
+ *              (carry-over) Set'_{e+1}'s members re-stamped e+2 when
  *              the snapshot has fewer than min_finality_set members. The two
  *              committees before the current one stay retained (previous2,
  *              previous) so the bridge V2 gate can judge a verifier up to
@@ -70,8 +71,31 @@ class BridgeStateIndex;
  *    than 64 members or total weight below 900 yields certificates that B3
  *    accepts but Verifier V2 treats as not bridge-qualified; RT4 fixtures
  *    stay within 4-64 members and weight >= 900 until B-22 lands.
- *  - Per-epoch keys (B-37) are out of this slice, so the snapshots carry the
- *    V1 FINALITY_KEY binding keys.
+ *  - Per-epoch keys (B-37) apply only when the regtest -b3freshkeyheight
+ *    knob sets R_key (Consensus::FreshLineageParams::key_height). Without it
+ *    the snapshots carry the V1 FINALITY_KEY binding keys (the staging
+ *    lineage). With it, the committees follow the seat rules below.
+ *
+ * B-37 seat rules (finality dependency section 6.4, rules (2)-(4); only when
+ * the caller passes a FreshCommitteeAtFn and params set R_key):
+ *   Committee(Snapshot(h)) seats a member of Snapshot(h) (positive weight,
+ *   non-revoked V1 binding) only with exactly ONE counted fresh binding (MPA
+ *   type 12, node/finality_fresh_key_index.h) naming the committee's epoch
+ *   and included in the committee's window, and seats it on that fresh key.
+ *   No such binding: the member sits out. Two or more: the seat is VOID for
+ *   that epoch (an old backup or leaked identity key can deny a seat, never
+ *   share one). A reused key never counts (first claim wins), so no V1 key
+ *   ever enters a fresh committee.
+ *   genesis   Set'_0 = Committee(Snapshot(R_f - 1)) over bindings naming 0
+ *             in [R_key, R_f - 1]; Set'_1 = the same members stamped 1 (one
+ *             genesis binding serves both; a binding naming 1 never counts).
+ *             Below the floor the lineage stays unbootstrapped: there is no
+ *             fallback to the V1 keys.
+ *   rotation  entering epoch e at h, Set'_{e+1} = Committee(Snapshot(h - 1))
+ *             over bindings naming e+1 in [start_{e-1}, start_e - 1]; below
+ *             the floor the carry-over applies unchanged (Set'_e's members
+ *             and keys re-stamped e+1; bindings naming the skipped epoch go
+ *             unused).
  *  - An included V2 certificate pins its checkpoint against reorgs exactly
  *    as a V1 certificate does (Chainstate::RefreshFinalityAnchor and the
  *    connect-time raise in validation.cpp).
@@ -80,8 +104,43 @@ class BridgeStateIndex;
 using FreshHashAtFn = modern::FreshHashAtFn;
 using FreshSnapshotAtFn = std::function<std::optional<ValidatorSetSnapshot>(int)>;
 
-//! One fresh-lineage committee: V1 snapshot members under a ruleset-2
-//! header stamped with the fresh epoch. The snapshot is shared, never edited.
+/**
+ * One B-37 committee request (seat rules above): Set'_{target_epoch} =
+ * Committee(Snapshot(snapshot_height)) over the fresh bindings naming
+ * target_epoch included at window_lo <= height <= snapshot_height (the
+ * window's upper end IS the snapshot height).
+ */
+struct FreshCommitteeRequest {
+    int snapshot_height{-1};
+    uint64_t target_epoch{0};
+    int window_lo{-1};
+    friend bool operator==(const FreshCommitteeRequest&, const FreshCommitteeRequest&) = default;
+};
+/**
+ * The answer to a FreshCommitteeRequest: the committee (stamped epoch 0, like
+ * FreshSnapshotAtFn's snapshots), nullopt members when no member is seated,
+ * or UNAVAILABLE when the seat inputs are not at the requested snapshot
+ * height. Unavailable is never read as "nobody seated": that would yield a
+ * different committee (an unbootstrapped lineage or a carry-over).
+ * Implicitly built from the members, so a plain committee function
+ * returning std::optional<ValidatorSetSnapshot> converts.
+ */
+struct FreshCommittee {
+    bool available{true};
+    std::optional<ValidatorSetSnapshot> members;
+    FreshCommittee(std::optional<ValidatorSetSnapshot> m) : members{std::move(m)} {}
+    static FreshCommittee Unavailable()
+    {
+        FreshCommittee c{std::nullopt};
+        c.available = false;
+        return c;
+    }
+};
+using FreshCommitteeAtFn = std::function<FreshCommittee(const FreshCommitteeRequest&)>;
+
+//! One fresh-lineage committee: V1 snapshot members (or, under the B-37 seat
+//! rules, the seated members on their fresh keys) under a ruleset-2 header
+//! stamped with the fresh epoch. The snapshot is shared, never edited.
 struct FreshLineageSet {
     std::shared_ptr<const ValidatorSetSnapshot> members;
     modern::ValidatorSetHeader header{}; // ruleset 2, fresh epoch
@@ -269,9 +328,21 @@ std::optional<uint256> FreshHistoryRootAt(const FreshLineageState& state, uint64
  * h == height - 1 (the tracker's private stake/binding trackers are synced
  * there). No-op when the fresh lineage is not configured; resets the state
  * below R_f.
+ *
+ * `committee_at` selects the B-37 seat rules (header comment): when it is
+ * given and params set R_key, the genesis and successor committees come
+ * from it (requests {R_f - 1, 0, R_key} and {h - 1, e + 1, start_{e-1}})
+ * and `snapshot_at` is not called. Absent (the default), or without R_key,
+ * the committees are the V1-key snapshots exactly as before. The tracker
+ * passes it exactly in fresh-key mode (node::FreshKeyModeConfigured).
+ *
+ * Returns false (and resets `fresh`, so no committee is ever guessed) when
+ * `committee_at` reports a committee UNAVAILABLE; the caller must treat the
+ * projection as unavailable (FinalityTracker::State::fresh_unavailable).
  */
-void ProjectFreshLineage(std::optional<FreshLineageState>& fresh, int height, const uint256& parent_hash,
-                         const Consensus::Params& params, const FreshSnapshotAtFn& snapshot_at);
+bool ProjectFreshLineage(std::optional<FreshLineageState>& fresh, int height, const uint256& parent_hash,
+                         const Consensus::Params& params, const FreshSnapshotAtFn& snapshot_at,
+                         const FreshCommitteeAtFn& committee_at = {});
 
 /**
  * The fresh carrier rule for one candidate certificate included at

@@ -26,6 +26,7 @@
 #include <cassert>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <string>
@@ -765,6 +766,12 @@ BOOST_FIXTURE_TEST_CASE(v2_only_file_applies, BridgePinsSetup)
     BOOST_CHECK(params.BridgeV2RulesActive(V2_HEIGHT));
     BOOST_CHECK(!params.BridgeV2BurnRulesActive(V2_HEIGHT - 1));
     BOOST_CHECK(params.BridgeV2BurnRulesActive(V2_HEIGHT));
+    // Owner ruling R10: without its own pin the sponsored sighash rule stays
+    // off at every height, although V2 burns are active.
+    BOOST_CHECK(!v2.sponsored_sighash_height);
+    for (const int height : {V2_HEIGHT - 1, V2_HEIGHT, V2_HEIGHT + 1, std::numeric_limits<int>::max()}) {
+        BOOST_CHECK(!params.BridgeV2SponsoredSighashActive(height));
+    }
 
     // Section 3.2 identities under this chain's domain; the bUSD V2 AssetId
     // is bound to the vault and differs from the V1 bUSD AssetId.
@@ -804,6 +811,29 @@ BOOST_FIXTURE_TEST_CASE(v2_only_file_applies, BridgePinsSetup)
     BOOST_CHECK(*modern::ConfiguredBridgeV2AssetId(tuned_params) == *asset_v2);
     BOOST_CHECK(*modern::ConfiguredBridgeV2EntryId(tuned_params) == *entry_id);
     BOOST_CHECK(*modern::ConfiguredBridgeV2RegistryId(tuned_params) != *registry_v2);
+
+    // Owner ruling R10's own pin: the sponsored sighash rule from its height
+    // (>= V) only. It enters no identity, and the record guard's file hash
+    // covers it like every other key.
+    UniValue sponsored{ValidV2()};
+    sponsored.pushKV("sponsored_sighash_height", uint64_t{V2_HEIGHT + 7});
+    const std::string sponsored_contents{V2Root(sponsored).write()};
+    ArgsManager sponsored_args;
+    SetArgs(sponsored_args, WriteFile("v2_sponsored.json", sponsored_contents));
+    sponsored_args.ForceSetArg("-b3freshlineageheight", std::to_string(FRESH_HEIGHT));
+    const auto sponsored_chain{CreateChainParams(sponsored_args, ChainType::REGTEST)};
+    const Consensus::Params& sponsored_params{sponsored_chain->GetConsensus()};
+    BOOST_REQUIRE(sponsored_params.bridge_v2);
+    BOOST_CHECK(sponsored_params.bridge_v2->sponsored_sighash_height == std::optional<int32_t>{V2_HEIGHT + 7});
+    BOOST_CHECK(sponsored_params.BridgeV2BurnRulesActive(V2_HEIGHT));
+    BOOST_CHECK(!sponsored_params.BridgeV2SponsoredSighashActive(V2_HEIGHT));
+    BOOST_CHECK(!sponsored_params.BridgeV2SponsoredSighashActive(V2_HEIGHT + 6));
+    BOOST_CHECK(sponsored_params.BridgeV2SponsoredSighashActive(V2_HEIGHT + 7));
+    BOOST_CHECK(*sponsored_chain->B3BridgePinsHash() == Sha256(sponsored_contents));
+    BOOST_CHECK(*sponsored_chain->B3BridgePinsHash() != Sha256(contents));
+    BOOST_CHECK(*modern::ConfiguredBridgeV2AssetId(sponsored_params) == *asset_v2);
+    BOOST_CHECK(*modern::ConfiguredBridgeV2EntryId(sponsored_params) == *entry_id);
+    BOOST_CHECK(*modern::ConfiguredBridgeV2RegistryId(sponsored_params) == *registry_v2);
 }
 
 BOOST_FIXTURE_TEST_CASE(v1_and_v2_file_applies_both, BridgePinsSetup)
@@ -949,6 +979,20 @@ BOOST_AUTO_TEST_CASE(v2_schema_and_value_refusals)
                  "v2.burn_height (199) must be between activation_height (200) and " + max_height);
     CheckRefused(WithV2("burn_height", uint64_t{1} << 31), "v2.burn_height (2147483648) must be between");
     BOOST_CHECK_EQUAL(*ParseB3RegTestBridgePins(WithV2("burn_height", uint64_t{V2_HEIGHT})).v2->burn_height, V2_HEIGHT);
+    // Owner ruling R10's sponsored sighash pin: absent means off; when
+    // present, at or above V.
+    BOOST_CHECK(!ParseB3RegTestBridgePins(ValidV2Pins()).v2->sponsored_sighash_height);
+    CheckRefused(WithV2("sponsored_sighash_height", uint64_t{V2_HEIGHT - 1}),
+                 "v2.sponsored_sighash_height (199) must be between activation_height (200) and " + max_height);
+    CheckRefused(WithV2("sponsored_sighash_height", uint64_t{1} << 31),
+                 "v2.sponsored_sighash_height (2147483648) must be between");
+    CheckRefused(WithV2("sponsored_sighash_height", int64_t{-1}),
+                 "v2.sponsored_sighash_height must be an unsigned integer");
+    CheckRefused(WithV2("sponsored_sighash_height", "300"),
+                 "v2.sponsored_sighash_height must be an unsigned integer");
+    BOOST_CHECK_EQUAL(*ParseB3RegTestBridgePins(WithV2("sponsored_sighash_height", uint64_t{V2_HEIGHT}))
+                           .v2->sponsored_sighash_height,
+                      V2_HEIGHT);
 
     // OI-3: values that commit to blockHash(R_f - 1), and V1-only pins, are
     // not keys of the v2 section.
@@ -1557,6 +1601,374 @@ BOOST_FIXTURE_TEST_CASE(v2_pins_refused_off_regtest, BridgePinsSetup)
     ArgsManager successor_no_fresh;
     SetArgs(successor_no_fresh, successor_path);
     BOOST_CHECK_EXCEPTION(CreateChainParams(successor_no_fresh, ChainType::REGTEST), std::runtime_error,
+                          HasReason("-b3bridgepins v2 requires -b3freshlineageheight"));
+}
+
+// ------------------------- forwarder pins (node changes 3.1; routes b, d3)
+
+namespace {
+
+// Stand-ins: anvil's default deployer at nonces 6 and 7 (DeployV2 places the
+// factories at its nonces n+4 and n+5) and an asymmetric init-code hash, so
+// the raw EVM byte order is visible.
+const std::string DEPOSIT_FACTORY{"0x0165878a594ca255338adfa4d48449f69242eb8f"};
+const std::string EXIT_FACTORY{"0xa513e6e4b8f2a923d98304ec87f64353c4d5c853"};
+const std::string FORWARDER_INIT_CODE_HASH{"0xea331de4dceed5e35c277c300018c413571f89f3d116bdbf57e8c5fc1c8ee43c"};
+constexpr uint64_t ARBITRUM_EID{30'110};
+
+UniValue ValidDepositForwarder()
+{
+    UniValue forwarder{UniValue::VOBJ};
+    forwarder.pushKV("factory", DEPOSIT_FACTORY);
+    forwarder.pushKV("init_code_hash", FORWARDER_INIT_CODE_HASH);
+    return forwarder;
+}
+
+UniValue ValidExitForwarder()
+{
+    UniValue forwarder{UniValue::VOBJ};
+    forwarder.pushKV("factory", EXIT_FACTORY);
+    forwarder.pushKV("init_code_hash", FORWARDER_INIT_CODE_HASH);
+    forwarder.pushKV("dst_eid", ARBITRUM_EID);
+    return forwarder;
+}
+
+//! `v2` (default ValidV2()) with both forwarder objects.
+UniValue ForwarderV2(const UniValue& deposit = ValidDepositForwarder(),
+                     const UniValue& exit = ValidExitForwarder(), UniValue v2 = ValidV2())
+{
+    v2.pushKV("deposit_forwarder", deposit);
+    v2.pushKV("exit_forwarder", exit);
+    return v2;
+}
+
+//! A v2-only file with both forwarder objects.
+std::string ForwarderPins(const UniValue& deposit = ValidDepositForwarder(),
+                          const UniValue& exit = ValidExitForwarder())
+{
+    return V2Root(ForwarderV2(deposit, exit)).write();
+}
+
+//! A v2-only file whose v2.<section> is `value`, without the other forwarder.
+std::string OneForwarderPins(const std::string& section, const UniValue& value)
+{
+    return V2Root(With(ValidV2(), section, value)).write();
+}
+
+std::string WithDepositForwarder(const std::string& key, const UniValue& value)
+{
+    return OneForwarderPins("deposit_forwarder", With(ValidDepositForwarder(), key, value));
+}
+
+std::string WithExitForwarder(const std::string& key, const UniValue& value)
+{
+    return OneForwarderPins("exit_forwarder", With(ValidExitForwarder(), key, value));
+}
+
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(v2_forwarders_apply, BridgePinsSetup)
+{
+    // Parsed fields; the init-code hash keeps raw EVM byte order.
+    const std::string contents{ForwarderPins()};
+    const auto parsed{ParseB3RegTestBridgePins(contents)};
+    BOOST_REQUIRE(parsed.v2 && parsed.v2->deposit_forwarder && parsed.v2->exit_forwarder);
+    const auto& deposit{*parsed.v2->deposit_forwarder};
+    const auto& exit_pins{*parsed.v2->exit_forwarder};
+    BOOST_CHECK_EQUAL("0x" + HexStr(deposit.factory), DEPOSIT_FACTORY);
+    BOOST_CHECK_EQUAL(EvmHex(deposit.init_code_hash), FORWARDER_INIT_CODE_HASH);
+    BOOST_CHECK_NE("0x" + deposit.init_code_hash.GetHex(), FORWARDER_INIT_CODE_HASH);
+    BOOST_CHECK_EQUAL("0x" + HexStr(exit_pins.factory), EXIT_FACTORY);
+    BOOST_CHECK_EQUAL(EvmHex(exit_pins.init_code_hash), FORWARDER_INIT_CODE_HASH);
+    BOOST_CHECK_EQUAL(exit_pins.dst_eid, ARBITRUM_EID);
+    BOOST_CHECK(!parsed.v2->successor);
+
+    // Both keys are optional and independent.
+    {
+        const auto none{ParseB3RegTestBridgePins(ValidV2Pins())};
+        BOOST_CHECK(!none.v2->deposit_forwarder && !none.v2->exit_forwarder);
+        const auto deposit_only{ParseB3RegTestBridgePins(OneForwarderPins("deposit_forwarder", ValidDepositForwarder()))};
+        BOOST_CHECK(deposit_only.v2->deposit_forwarder == deposit && !deposit_only.v2->exit_forwarder);
+        const auto exit_only{ParseB3RegTestBridgePins(OneForwarderPins("exit_forwarder", ValidExitForwarder()))};
+        BOOST_CHECK(!exit_only.v2->deposit_forwarder && exit_only.v2->exit_forwarder == exit_pins);
+        // Any non-zero dst_eid, and one init-code hash per factory.
+        BOOST_CHECK_EQUAL(ParseB3RegTestBridgePins(WithExitForwarder("dst_eid", uint64_t{30'101}))
+                              .v2->exit_forwarder->dst_eid,
+                          30'101U);
+        BOOST_CHECK_EQUAL(ParseB3RegTestBridgePins(WithExitForwarder("dst_eid", uint64_t{std::numeric_limits<uint32_t>::max()}))
+                              .v2->exit_forwarder->dst_eid,
+                          std::numeric_limits<uint32_t>::max());
+        BOOST_CHECK_NO_THROW(ParseB3RegTestBridgePins(ForwarderPins(
+            ValidDepositForwarder(), With(ValidExitForwarder(), "init_code_hash", Repeat("f8", 32)))));
+    }
+
+    // The launch-only chain these pins extend.
+    ArgsManager launch_args;
+    SetArgs(launch_args, WriteFile("v2_launch.json", ValidV2Pins()));
+    launch_args.ForceSetArg("-b3freshlineageheight", std::to_string(FRESH_HEIGHT));
+    const auto launch_chain{CreateChainParams(launch_args, ChainType::REGTEST)};
+    const Consensus::Params& launch{launch_chain->GetConsensus()};
+    BOOST_REQUIRE(launch.bridge_v2);
+    BOOST_CHECK(!launch.bridge_v2->deposit_forwarder && !launch.bridge_v2->exit_forwarder);
+
+    ArgsManager args;
+    SetArgs(args, WriteFile("v2_forwarders.json", contents));
+    args.ForceSetArg("-b3freshlineageheight", std::to_string(FRESH_HEIGHT));
+    const auto chain{CreateChainParams(args, ChainType::REGTEST)};
+    const Consensus::Params& params{chain->GetConsensus()};
+
+    // Pinned before first start: the record guard hashes the whole file,
+    // forwarders included, so they freeze with v from the first block >= A3.
+    BOOST_REQUIRE(chain->B3BridgePinsHash());
+    BOOST_CHECK(*chain->B3BridgePinsHash() == Sha256(contents));
+    BOOST_CHECK(*chain->B3BridgePinsHash() != *launch_chain->B3BridgePinsHash());
+
+    BOOST_REQUIRE(params.bridge_v2);
+    const Consensus::BridgeV2Params& v2{*params.bridge_v2};
+    BOOST_CHECK(v2.Valid());
+    BOOST_CHECK(v2.ForwardersValid());
+    BOOST_REQUIRE(v2.deposit_forwarder && v2.exit_forwarder);
+    BOOST_CHECK(*v2.deposit_forwarder == deposit);
+    BOOST_CHECK(*v2.exit_forwarder == exit_pins);
+
+    // The launch envelope is exactly the launch-only file's.
+    BOOST_CHECK_EQUAL(v2.activation_height, launch.bridge_v2->activation_height);
+    BOOST_CHECK(v2.vault.vault_address == launch.bridge_v2->vault.vault_address);
+    BOOST_CHECK(v2.verifier.address == launch.bridge_v2->verifier.address);
+    BOOST_CHECK(v2.gate == launch.bridge_v2->gate);
+    BOOST_CHECK(!v2.successor);
+
+    // Identities: the AssetId and the entry id records name are unchanged;
+    // the registry id commits to each forwarder pin.
+    BOOST_CHECK(*modern::ConfiguredBridgeV2AssetId(params) == *modern::ConfiguredBridgeV2AssetId(launch));
+    BOOST_CHECK(*modern::ConfiguredBridgeV2EntryId(params) == *modern::ConfiguredBridgeV2EntryId(launch));
+    const auto registry{modern::ConfiguredBridgeV2RegistryId(params)};
+    const auto launch_registry{modern::ConfiguredBridgeV2RegistryId(launch)};
+    BOOST_REQUIRE(registry && launch_registry);
+    BOOST_CHECK(*registry != *launch_registry);
+    {
+        const auto regtest{[](const std::string& json) {
+            return CChainParams::RegTest(FlowMeshOptions(ParseB3RegTestBridgePins(json)));
+        }};
+        const auto deposit_only{regtest(OneForwarderPins("deposit_forwarder", ValidDepositForwarder()))};
+        const auto exit_only{regtest(OneForwarderPins("exit_forwarder", ValidExitForwarder()))};
+        const auto other_eid{regtest(ForwarderPins(ValidDepositForwarder(),
+                                                   With(ValidExitForwarder(), "dst_eid", uint64_t{30'101})))};
+        const auto deposit_registry{modern::ConfiguredBridgeV2RegistryId(deposit_only->GetConsensus())};
+        const auto exit_registry{modern::ConfiguredBridgeV2RegistryId(exit_only->GetConsensus())};
+        const auto other_eid_registry{modern::ConfiguredBridgeV2RegistryId(other_eid->GetConsensus())};
+        BOOST_REQUIRE(deposit_registry && exit_registry && other_eid_registry);
+        for (const uint256& id : {*deposit_registry, *exit_registry, *other_eid_registry}) {
+            BOOST_CHECK(id != *launch_registry);
+            BOOST_CHECK(id != *registry);
+        }
+        BOOST_CHECK(*deposit_registry != *exit_registry);
+        BOOST_CHECK(*exit_only->GetConsensus().bridge_v2->exit_forwarder == exit_pins);
+        BOOST_CHECK(!exit_only->GetConsensus().bridge_v2->deposit_forwarder);
+    }
+
+    // Beside a successor, and beside a V1 section, the forwarders apply the
+    // same way.
+    {
+        UniValue with_successor{ForwarderV2()};
+        with_successor.pushKV("successor", ValidSuccessor());
+        const auto successor_chain{CChainParams::RegTest(
+            FlowMeshOptions(ParseB3RegTestBridgePins(V2Root(with_successor).write())))};
+        const Consensus::Params& both{successor_chain->GetConsensus()};
+        BOOST_REQUIRE(both.bridge_v2 && both.bridge_v2->successor);
+        BOOST_CHECK(*both.bridge_v2->deposit_forwarder == deposit);
+        BOOST_CHECK(*both.bridge_v2->exit_forwarder == exit_pins);
+        BOOST_CHECK(both.bridge_v2->Valid());
+        const auto successor_only{CChainParams::RegTest(FlowMeshOptions(ParseB3RegTestBridgePins(SuccessorPins())))};
+        BOOST_CHECK(*modern::ConfiguredBridgeV2RegistryId(both) !=
+                    *modern::ConfiguredBridgeV2RegistryId(successor_only->GetConsensus()));
+
+        const auto v1_chain{CChainParams::RegTest(FlowMeshOptions(ParseB3RegTestBridgePins(BothPins(ForwarderV2()))))};
+        const Consensus::Params& with_v1{v1_chain->GetConsensus()};
+        BOOST_REQUIRE(with_v1.bridge_v2);
+        BOOST_CHECK(*with_v1.busd_bridge->withdrawal_mode == Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1);
+        BOOST_CHECK(*modern::ConfiguredBridgeV2RegistryId(with_v1) == *registry);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_forwarder_refusals)
+{
+    BOOST_CHECK_NO_THROW(ParseB3RegTestBridgePins(ForwarderPins()));
+    const std::vector<std::pair<std::string, UniValue>> sections{
+        {"deposit_forwarder", ValidDepositForwarder()},
+        {"exit_forwarder", ValidExitForwarder()},
+    };
+    for (const auto& entry : sections) {
+        const std::string& section{entry.first};
+        const UniValue& valid{entry.second};
+        const std::string where{"v2." + section};
+        const auto with_key{[&](const std::string& key, const UniValue& value) {
+            return OneForwarderPins(section, With(valid, key, value));
+        }};
+        BOOST_TEST_CONTEXT(where)
+        {
+            // Shape: an object holding exactly the section's keys; JSON null
+            // is not "absent".
+            CheckRefused(OneForwarderPins(section, UniValue{}), where + " must be a JSON object");
+            CheckRefused(OneForwarderPins(section, UniValue{UniValue::VARR}), where + " must be a JSON object");
+            CheckRefused(OneForwarderPins(section, UniValue{"0x00"}), where + " must be a JSON object");
+            CheckRefused(OneForwarderPins(section, UniValue{UniValue::VOBJ}), "missing key " + where + ".");
+            for (const std::string& key : valid.getKeys()) {
+                CheckRefused(OneForwarderPins(section, Without(valid, key)), "missing key " + where + "." + key);
+            }
+            // The tag is a protocol constant; accounts, salts and the vault
+            // are derived, never pinned.
+            for (const std::string key : {"tag", "vault", "token", "account", "salt", "refund_eoa", "to",
+                                          "max_bridge_fee_bps", "fee_cap", "not_after", "code_hash"}) {
+                CheckRefused(with_key(key, Repeat("11", 32)), "unknown key " + where + "." + key);
+            }
+            std::string duplicate{OneForwarderPins(section, valid)};
+            duplicate.insert(duplicate.find("\"factory\""), "\"factory\":\"" + DEPOSIT_FACTORY + "\",");
+            CheckRefused(duplicate, "duplicate key " + where + ".factory");
+
+            // The factory: 0x hex, non-zero, a contract of its own.
+            const std::string bad_factory{where + ".factory must be a 0x-prefixed 20-byte hex string"};
+            CheckRefused(with_key("factory", DEPOSIT_FACTORY.substr(2)), bad_factory);
+            CheckRefused(with_key("factory", Repeat("71", 19)), bad_factory);
+            CheckRefused(with_key("factory", Repeat("71", 32)), bad_factory);
+            CheckRefused(with_key("factory", "0x" + std::string(40, 'z')), bad_factory);
+            CheckRefused(with_key("factory", uint64_t{1}), bad_factory);
+            CheckRefused(with_key("factory", Repeat("00", 20)), where + ".factory must be non-zero");
+            const std::string on_contract{where + ".factory must differ from v2.vault, v2.token, v2.verifier "
+                                                  "and v2.successor.vault"};
+            for (const std::string& address : {VAULT_V2, TOKEN, VERIFIER_V2}) {
+                CheckRefused(with_key("factory", address), on_contract);
+            }
+            {
+                UniValue v2{ValidV2()};
+                v2.pushKV("successor", ValidSuccessor());
+                v2.pushKV(section, With(valid, "factory", SUCCESSOR_VAULT));
+                CheckRefused(V2Root(v2).write(), on_contract);
+                // Without a successor that address is any other contract.
+                BOOST_CHECK_NO_THROW(ParseB3RegTestBridgePins(with_key("factory", SUCCESSOR_VAULT)));
+            }
+
+            // The init-code hash: 32 raw bytes, non-zero.
+            CheckRefused(with_key("init_code_hash", Repeat("00", 32)), where + ".init_code_hash must be non-zero");
+            CheckRefused(with_key("init_code_hash", Repeat("f7", 20)),
+                         where + ".init_code_hash must be a 0x-prefixed 32-byte hex string");
+            CheckRefused(with_key("init_code_hash", uint64_t{1}),
+                         where + ".init_code_hash must be a 0x-prefixed 32-byte hex string");
+
+            // A refused forwarder fails the whole file, also beside a V1
+            // section.
+            CheckRefused(BothPins(With(ValidV2(), section, Without(valid, "factory"))),
+                         "missing key " + where + ".factory");
+        }
+    }
+
+    // dst_eid: an unsigned 32-bit LayerZero endpoint id, non-zero.
+    CheckRefused(WithExitForwarder("dst_eid", uint64_t{0}), "v2.exit_forwarder.dst_eid must be non-zero");
+    CheckRefused(WithExitForwarder("dst_eid", uint64_t{1} << 32),
+                 "v2.exit_forwarder.dst_eid must be an unsigned integer of at most 32 bits");
+    CheckRefused(WithExitForwarder("dst_eid", int64_t{-1}), "v2.exit_forwarder.dst_eid must be an unsigned integer");
+    CheckRefused(WithExitForwarder("dst_eid", "30110"), "v2.exit_forwarder.dst_eid must be an unsigned integer");
+    // The deposit factory takes no dst_eid.
+    CheckRefused(WithDepositForwarder("dst_eid", ARBITRUM_EID), "unknown key v2.deposit_forwarder.dst_eid");
+
+    // One factory per route.
+    CheckRefused(ForwarderPins(ValidDepositForwarder(), With(ValidExitForwarder(), "factory", DEPOSIT_FACTORY)),
+                 "v2.deposit_forwarder.factory and v2.exit_forwarder.factory must differ");
+
+    // Kernel (RegTest()): neither factory may sit on a V1 bridge contract.
+    const auto regtest{[](const std::string& json) {
+        return CChainParams::RegTest(FlowMeshOptions(ParseB3RegTestBridgePins(json)));
+    }};
+    BOOST_CHECK_NO_THROW(regtest(ForwarderPins()));
+    BOOST_CHECK_NO_THROW(regtest(BothPins(ForwarderV2())));
+    const std::string v1_overlap{"-b3bridgepins v2 forwarder factories must differ from every V1 bridge contract"};
+    for (const std::string& address : {VAULT, TOKEN, VERIFIER}) {
+        // The v2 section uses a token of its own, so the V1 token is only a
+        // V1 contract.
+        UniValue v2{ValidV2()};
+        v2.pushKV("token", TOKEN_V2);
+        BOOST_CHECK_EXCEPTION(regtest(BothPins(ForwarderV2(With(ValidDepositForwarder(), "factory", address),
+                                                           ValidExitForwarder(), v2))),
+                              std::runtime_error, HasReason(v1_overlap));
+        BOOST_CHECK_EXCEPTION(regtest(BothPins(ForwarderV2(ValidDepositForwarder(),
+                                                           With(ValidExitForwarder(), "factory", address), v2))),
+                              std::runtime_error, HasReason(v1_overlap));
+    }
+    // Without the V1 section the V1 vault and verifier are not bridge
+    // contracts (the synthetic MANAGED_V1 bridge's vault and authority are).
+    BOOST_CHECK_NO_THROW(regtest(ForwarderPins(With(ValidDepositForwarder(), "factory", VAULT),
+                                               With(ValidExitForwarder(), "factory", VERIFIER))));
+    for (const std::string& address : {"0x" + HexStr(Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY.vault_address),
+                                       Repeat("42", 20)}) {
+        BOOST_CHECK_EXCEPTION(regtest(ForwarderPins(With(ValidDepositForwarder(), "factory", address))),
+                              std::runtime_error, HasReason(v1_overlap));
+        BOOST_CHECK_EXCEPTION(regtest(ForwarderPins(ValidDepositForwarder(),
+                                                    With(ValidExitForwarder(), "factory", address))),
+                              std::runtime_error, HasReason(v1_overlap));
+    }
+
+    // Hand-built sections reach BridgeV2Params::Valid().
+    const std::string incomplete{"-b3bridgepins v2 does not form a complete bridge V2 configuration"};
+    const auto pins{ParseB3RegTestBridgePins(ForwarderPins())};
+    using Mutation = std::function<void(CChainParams::B3RegTestBridgePins::V2Section&)>;
+    const std::vector<Mutation> refused{
+        [](auto& v2) { v2.deposit_forwarder->factory = {}; },
+        [](auto& v2) { v2.deposit_forwarder->init_code_hash = uint256{}; },
+        [](auto& v2) { v2.exit_forwarder->factory = {}; },
+        [](auto& v2) { v2.exit_forwarder->init_code_hash = uint256{}; },
+        [](auto& v2) { v2.exit_forwarder->dst_eid = 0; },
+        [](auto& v2) { v2.deposit_forwarder->factory = v2.vault; },
+        [](auto& v2) { v2.deposit_forwarder->factory = v2.token; },
+        [](auto& v2) { v2.exit_forwarder->factory = v2.verifier; },
+        [](auto& v2) { v2.exit_forwarder->factory = v2.deposit_forwarder->factory; },
+    };
+    for (size_t i{0}; i < refused.size(); ++i) {
+        auto hand_built{pins};
+        refused[i](*hand_built.v2);
+        BOOST_CHECK_EXCEPTION(CChainParams::RegTest(FlowMeshOptions(hand_built)), std::runtime_error,
+                              HasReason(incomplete));
+    }
+    {
+        // A hand-built factory on a pinned successor vault.
+        auto on_successor{ParseB3RegTestBridgePins(V2Root(With(ForwarderV2(), "successor", ValidSuccessor())).write())};
+        on_successor.v2->exit_forwarder->factory = on_successor.v2->successor->vault;
+        BOOST_CHECK_EXCEPTION(CChainParams::RegTest(FlowMeshOptions(on_successor)), std::runtime_error,
+                              HasReason(incomplete));
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(v2_forwarder_pins_refused_off_regtest, BridgePinsSetup)
+{
+    // A pin file carrying forwarder pins is refused off FlowMesh regtest like
+    // any other, so no network but FlowMesh regtest ever derives a forwarder
+    // or checks an exit block against one.
+    const std::string path{WriteFile("v2_forwarders.json", ForwarderPins())};
+    for (const ChainType chain : {ChainType::MAIN, ChainType::TESTNET,
+                                  ChainType::TESTNET4, ChainType::SIGNET}) {
+        ArgsManager args;
+        SetArgs(args, path);
+        args.ForceSetArg("-b3freshlineageheight", std::to_string(FRESH_HEIGHT));
+        BOOST_CHECK_EXCEPTION(CreateChainParams(args, chain), std::runtime_error,
+                              HasReason("-b3bridgepins is regtest-only"));
+        ArgsManager bare;
+        bare.ForceSetArg("-b3bridgepins", path);
+        BOOST_CHECK_EXCEPTION(CreateChainParams(bare, chain), std::runtime_error,
+                              HasReason("-b3bridgepins is regtest-only"));
+        const auto params{CreateChainParams(ArgsManager{}, chain)};
+        BOOST_CHECK(!params->GetConsensus().bridge_v2);
+    }
+    for (const auto& [modern, flowmesh] : {std::pair{false, false}, std::pair{true, false},
+                                           std::pair{false, true}}) {
+        ArgsManager args;
+        SetArgs(args, path, modern, flowmesh);
+        args.ForceSetArg("-b3freshlineageheight", std::to_string(FRESH_HEIGHT));
+        BOOST_CHECK_EXCEPTION(CreateChainParams(args, ChainType::REGTEST), std::runtime_error,
+                              HasReason("-b3bridgepins requires -b3modernregtest and -b3flowmeshtest (regtest-only)"));
+    }
+    BOOST_CHECK(!CreateChainParams(ArgsManager{}, ChainType::REGTEST)->GetConsensus().bridge_v2);
+    ArgsManager no_fresh;
+    SetArgs(no_fresh, path);
+    BOOST_CHECK_EXCEPTION(CreateChainParams(no_fresh, ChainType::REGTEST), std::runtime_error,
                           HasReason("-b3bridgepins v2 requires -b3freshlineageheight"));
 }
 

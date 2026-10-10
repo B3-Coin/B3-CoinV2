@@ -332,24 +332,43 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         // One stake universe: the same (w, W) validation will apply, from the
         // validator set in force at this height (bound + ACTIVE stake).
         const auto weights{m_chainstate.ModernEligibilityWeights(*m_options.modern_pos_validator_key, *pindexPrev)};
-        if (!weights) {
+        // H1 (bridge V2 finality dependency section 5.1, FD-2; regtest
+        // -b3h1height only): from R_h every round at or above R_escape is
+        // judged against the escape set Snapshot(parent), so validation's
+        // (w, W) depends on the round. Below R_h and without H1 one pair
+        // governs every round, exactly as before.
+        const bool h1_active{b3_consensus.H1RulesActive(nHeight)};
+        const int64_t escape_rounds{h1_active ? b3_consensus.h1->escape_rounds : 0};
+        std::optional<std::pair<CAmount, CAmount>> escape_weights;
+        if (h1_active) {
+            escape_weights = m_chainstate.ModernEligibilityWeights(*m_options.modern_pos_validator_key, *pindexPrev,
+                                                                   escape_rounds);
+        }
+        if (!weights || (h1_active && !escape_weights)) {
             throw std::runtime_error("modern-PoS validator set is unavailable");
         }
-        const auto [w, W]{*weights};
-        if (w <= 0) {
+        const auto weights_for{[&](const int64_t round) -> const std::pair<CAmount, CAmount>& {
+            return h1_active && round >= escape_rounds ? *escape_weights : *weights;
+        }};
+        if (weights->first <= 0 && (!escape_weights || escape_weights->first <= 0)) {
             throw std::runtime_error("validator is not in the active validator set (no bound, active stake)");
         }
         bool eligible{false};
         if (m_options.modern_pos_round) {
             pos_round = *m_options.modern_pos_round;
+            const auto [w, W]{weights_for(pos_round)};
             const uint256 digest{modern::ModernPosEligibilityDigest(
                 *domain, seed, static_cast<uint32_t>(nHeight), static_cast<uint32_t>(pos_round),
                 *m_options.modern_pos_validator_key)};
-            eligible = modern::ModernPosEligible(
-                digest, w, W, pos_round, *b3_consensus.modern_pos);
+            eligible = w > 0 && modern::ModernPosEligible(
+                                    digest, w, W, pos_round, *b3_consensus.modern_pos);
         } else {
             constexpr int64_t MAX_PRODUCTION_ROUNDS{100'000};
             for (; pos_round < MAX_PRODUCTION_ROUNDS; ++pos_round) {
+                // Under H1 a validator that is only in the escape set has
+                // w = 0 in every round below R_escape.
+                const auto [w, W]{weights_for(pos_round)};
+                if (w <= 0) continue;
                 const uint256 digest{modern::ModernPosEligibilityDigest(
                     *domain, seed, static_cast<uint32_t>(nHeight), static_cast<uint32_t>(pos_round),
                     *m_options.modern_pos_validator_key)};
@@ -587,11 +606,25 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         }
         if (finality.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
                           b3_consensus, *pindexPrev, bridge_index)) {
-            const RegtestFinalityPlan production_plan{
+            RegtestFinalityPlan production_plan{
                 preserve_finality ? PlanRegtestFinalityProduction(
                                         chainparams.GetChainType(), finality.Projected(nHeight, b3_consensus),
                                         *b3_consensus.modern_pos, nHeight)
                                   : RegtestFinalityPlan{}};
+            // H1 (bridge V2 finality dependency section 5.1; regtest plan
+            // section 3.6; regtest -b3h1height only): from R_h block
+            // producers follow the producer schedule and no longer depend on
+            // the V1 lineage, so the lineage never pauses local production.
+            // A broken lineage is ALLOW; at the last handover carrier
+            // (REQUIRE_HANDOVER) a pooled current-epoch certificate is still
+            // included below, but without one the block is built anyway and
+            // the V1 lineage breaks, as it would on a network without this
+            // regtest-only policy.
+            if ((production_plan.action == RegtestFinalityProduction::LINEAGE_BROKEN ||
+                 production_plan.action == RegtestFinalityProduction::REQUIRE_HANDOVER) &&
+                b3_consensus.H1RulesActive(nHeight)) {
+                production_plan.action = RegtestFinalityProduction::ALLOW;
+            }
             if (production_plan.action == RegtestFinalityProduction::LINEAGE_BROKEN) {
                 throw std::runtime_error("regtest finality lineage is already broken; local production paused; explicit recovery review required");
             }

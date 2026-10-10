@@ -26,8 +26,8 @@ REGTEST ONLY. This module provides:
 - bridge V2 (first node slice, RT4a): CREATE address prediction, the bUSD
   V2 AssetId, leaf V2 and the V2 withdrawal tree, the -b3bridgepins v2
   writer, Verifier V2 / Vault V2 calldata encoders, a DeployV2.s.sol
-  runner and FreshVoteShuttle (the fresh-lineage vote relay between
-  validators, which have no P2P transport for those votes yet);
+  runner and FreshVoteShuttle (waits on fresh-lineage votes, which travel
+  over the P2P message finsigv2; its RPC relay remains for drills);
 - bridge V2 (second node slice, RT4): the OI-12 K_OF_N bootstrap message
   and K_OF_N initialize calldata, a runner of the REGTEST ONLY
   b3-bridge-regtest-certify tool, the kind 9 observation plan, a one-shot
@@ -41,10 +41,29 @@ REGTEST ONLY. This module provides:
   one-shot run of contrib/b3bridge/b3_bridge_deposit_guard_v2.py;
 - bridge V2 (fourth node slice, RT4d): the B-23 successor vault pins, the
   kind 16 VAULT_SWEEP record, the successor kind 9 subjects 18 and 19 and
-  their observation plan, and the B3VaultV2 constructor Config encoder.
+  their observation plan, and the B3VaultV2 constructor Config encoder;
+- fresh-lineage per-epoch keys (B-37): a validator count other than four
+  (B3BridgeChainMixin.bridge_validator_count), bind_fresh_keys() and an
+  independent parser of a node's fresh key store file
+  (parse_fresh_key_store, src/node/finality_fresh_key_store.h);
+- bridge V2 forwarders (routes (b) and (d3), RT6; contracts spec sections
+  7-9): the Arbitrum anvil's chain id and both LayerZero endpoint ids, the
+  -b3bridgepins v2 deposit_forwarder / exit_forwarder pins, DeployV2 with
+  its forwarder factories (deployer nonces 4 and 5), the init-code hash of
+  a forge artifact, the EIP-191 refund EOA message signed by an anvil dev
+  account (anvil personal_sign, recovered here independently and checked
+  by `cast wallet verify` when cast is present), IOFT send calldata and
+  one-shot runs of contrib/b3bridge/b3_bridge_forwarders_v2.py and
+  contrib/b3bridge/regtest/mock_lz_relayer.py. Salts, CREATE2 addresses,
+  the OI-2 fee cap and the parameter checks are the contrib module's,
+  imported here, so Python has one implementation of them.
+- sponsored native-B3 fees (owner ruling R10, RT7s): a one-shot run of
+  contrib/b3bridge/b3_bridge_sponsor.py (fee-coin pool refill, status and
+  completion of a user's partial burn) against a relayer wallet.
 
 The relayer module is imported only as a library; its main() is never
 called in-process, only as an unchanged subprocess by run_relayer_once().
+The forwarder and LayerZero tools likewise run only as subprocesses.
 Nothing in this module contacts a non-local endpoint.
 """
 
@@ -68,6 +87,7 @@ from test_framework.anvil import (
     Anvil,
     AnvilRPCError,
     B3BRIDGE_CONTRIB_DIR,
+    B3BRIDGE_REGTEST_DIR,
     SRCDIR,
     artifact,
     assert_local_url,
@@ -80,6 +100,7 @@ from test_framework.anvil import (
     run_forge,
 )
 from test_framework.authproxy import JSONRPCException
+from test_framework.crypto.secp256k1 import G, GE
 from test_framework.key import TaggedHash
 from test_framework.test_framework import SkipTest
 from test_framework.test_node import ErrorMatch
@@ -97,6 +118,10 @@ mock_beacon = import_b3bridge_contrib("mock_beacon")
 SyntheticBeacon = mock_beacon.SyntheticBeacon
 MockBeaconError = mock_beacon.MockBeaconError
 RELAYER_SCRIPT = str(B3BRIDGE_CONTRIB_DIR / "b3_bridge_relayer.py")
+# Library use only (salts, CREATE2 addresses, the OI-2 fee cap, its ABI
+# codec): its main() runs only as a subprocess, in run_forwarder_tool().
+forwarders_v2 = import_b3bridge_contrib("b3_bridge_forwarders_v2")
+observe_v2 = import_b3bridge_contrib("b3_bridge_observe_v2")
 
 # The fixture module derives a default PUBLIC endpoint from sys.argv when it
 # is imported. The harness never calls its fetchers; clearing the endpoint
@@ -714,6 +739,66 @@ def fold_withdrawal_path(leaf, index, path):
     return node
 
 
+# -- bridge V2 forwarders: chains, nonces, identities (contracts spec §7-§9) ----
+# The second anvil stands in for Arbitrum One only as the USDT0 chain (RP-5).
+ARBITRUM_REGTEST_CHAIN_ID = 31338
+# LayerZero V2 endpoint ids of Ethereum and Arbitrum One. The regtest mock
+# endpoints use the same ids; Arbitrum's is B3OftExitFactory's DST_EID.
+LZ_EID_ETHEREUM = 30101
+LZ_EID_ARBITRUM = 30110
+# DeployV2 with B3V2_DEPLOY_FORWARDERS=1 continues its four CREATEs (deployer
+# nonces n..n+3) with the F_d factory at n+4, the address the vault already
+# names as FORWARDER_FACTORY, and the F_x factory at n+5. The pin writer
+# requires n = 0, so these are absolute nonces there.
+DEPLOY_V2_FORWARDER_CONTRACTS = ("B3DepositForwarderFactory", "B3OftExitFactory")
+FORWARDER_FACTORY_NONCE = 4
+EXIT_FACTORY_NONCE = 5
+# forge artifact (file, contract) whose creation code both factories CREATE2.
+FORWARDER_ARTIFACT = ("B3Forwarder.sol", "B3Forwarder")
+FORWARDERS_V2_SCRIPT = str(B3BRIDGE_CONTRIB_DIR / "b3_bridge_forwarders_v2.py")
+MOCK_LZ_RELAYER_SCRIPT = str(B3BRIDGE_REGTEST_DIR / "mock_lz_relayer.py")
+
+# One Python implementation: the contrib module's derivations (spec §7.2).
+DepositParams = forwarders_v2.DepositParams
+ExitParams = forwarders_v2.ExitParams
+address_word = forwarders_v2.address_word
+deposit_forwarder_address = forwarders_v2.deposit_forwarder_address
+exit_forwarder_address = forwarders_v2.exit_forwarder_address
+deposit_fee_cap = forwarders_v2.deposit_fee_cap
+assert forwarders_v2.REGTEST_ETH_CHAIN_ID == REGTEST_ETH_CHAIN_ID
+
+
+def forwarder_init_code_hash(contract_artifact):
+    """FORWARDER_INIT_CODE_HASH: keccak256 of B3Forwarder's creation code.
+
+    contract_artifact is artifact()'s dict for FORWARDER_ARTIFACT, or the raw
+    creation code. Never hard-code the result: any byte of B3Forwarder.sol,
+    comments included, changes its metadata and so this hash. The pins must
+    name the value the deployed factories report.
+    """
+    code = contract_artifact["bytecode"] if isinstance(contract_artifact, dict) else bytes(contract_artifact)
+    assert code, "B3Forwarder creation code is empty"
+    return keccak256(code)
+
+
+def forwarder_pins_v2(deployer, init_code_hash, *, dst_eid=LZ_EID_ARBITRUM, roles=("deposit", "exit")):
+    """write_regtest_bridge_pins_v2's `forwarders` for a DeployV2 run with
+    B3V2_DEPLOY_FORWARDERS=1 from `deployer`'s nonce 0: the deposit factory
+    at nonce FORWARDER_FACTORY_NONCE, the exit factory at EXIT_FACTORY_NONCE,
+    both with init_code_hash, and the exit pin's dst_eid. roles selects the
+    pins written (the node accepts either one alone)."""
+    assert roles and set(roles) <= {"deposit", "exit"}, roles
+    init_code_hash = to_0x(enc_bytes32(init_code_hash))
+    pins = {}
+    if "deposit" in roles:
+        pins["deposit"] = {"factory": predict_create_address(deployer, FORWARDER_FACTORY_NONCE),
+                           "init_code_hash": init_code_hash}
+    if "exit" in roles:
+        pins["exit"] = {"factory": predict_create_address(deployer, EXIT_FACTORY_NONCE),
+                        "init_code_hash": init_code_hash, "dst_eid": dst_eid}
+    return pins
+
+
 # -- -b3bridgepins v2 section (node changes §3.1-3.4, OI-3) --------------------
 def _light_client_pins_v2(bootstrap_output, gvr, fork_version, horizon_epochs):
     checkpoint_slot = bootstrap_output["checkpoint_slot"]
@@ -736,7 +821,8 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
                                  min_bridge_validators=4, max_bridge_validators=64,
                                  min_bridge_total_weight=4, horizon_epochs=1024,
                                  gvr=REGTEST_GVR, fork_version=REGTEST_FORK_VERSION,
-                                 verifier_max_epoch_lag=None, successor=None, check=True):
+                                 verifier_max_epoch_lag=None, successor=None, forwarders=None,
+                                 sponsored_sighash_height=None, check=True):
     """Write a -b3bridgepins file holding only a v2 section; return its JSON.
 
     The file must exist before the validators first start (OI-3), when the
@@ -778,6 +864,28 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
     deployer, 0), a v' equal to vault, token or verifier, a zero or non-32-byte
     AssetId, h_m <= V or h_m < W2, a deployment bound below 1, and, read from
     anvil, a successor deployer nonce other than zero or code already at v'.
+
+    forwarders, when given, pins the route (b) and (d3) forwarder factories
+    (node changes §3.1; contracts spec §7-§8) as v2.deposit_forwarder and
+    v2.exit_forwarder, so they too exist before the validators first start
+    and the record guard freezes them with v. It is a dict with "deposit"
+    ({"factory", "init_code_hash"}) and/or "exit" ({"factory",
+    "init_code_hash", "dst_eid"}), as forwarder_pins_v2() builds it: the
+    factories are DeployV2's CREATEs at deployer nonces 4 and 5
+    (B3V2_DEPLOY_FORWARDERS=1) and the hash is forwarder_init_code_hash() of
+    the forge artifact, all knowable before the deployment. With check it
+    also refuses: a deposit factory other than
+    predict_create_address(deployer, FORWARDER_FACTORY_NONCE), an exit
+    factory other than the EXIT_FACTORY_NONCE address, an init-code hash
+    that is zero or not 32 bytes, two different hashes (both factories
+    CREATE2 the same B3Forwarder), a dst_eid other than LZ_EID_ARBITRUM and,
+    read from anvil, code already at either factory.
+
+    sponsored_sighash_height, when given, pins owner ruling R10's sponsored
+    sighash rule (v2.sponsored_sighash_height, >= V): from that height a
+    kind 6 burn's owner may sign SIGHASH_ALL|ANYONECANPAY. Without it the
+    node keeps the rule off. With check the writer refuses a height below
+    activation_height.
     """
     assert os.path.isabs(path), "-b3bridgepins needs an absolute path"
     caps = dict(caps or {})
@@ -790,6 +898,15 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
         successor["vault"] = normalize_address(successor["vault"])
         successor["deployer"] = normalize_address(successor["deployer"])
         successor["asset_id"] = hx(successor["asset_id"])
+    if forwarders is not None:
+        forwarder_keys = {"deposit": {"factory", "init_code_hash"},
+                          "exit": {"factory", "init_code_hash", "dst_eid"}}
+        assert forwarders and set(forwarders) <= set(forwarder_keys), forwarders
+        forwarders = {role: dict(pin) for role, pin in forwarders.items()}
+        for role, pin in forwarders.items():
+            assert set(pin) == forwarder_keys[role], (role, pin)
+            pin["factory"] = normalize_address(pin["factory"])
+            pin["init_code_hash"] = hx(pin["init_code_hash"])
     gvr = hx(gvr)
     fork_version = hx(fork_version)
     checkpoint_block = bootstrap_output["checkpoint_block"]
@@ -817,6 +934,10 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
                f"deployment block {deployment_block} (check 4)")
     if activation_height < 1 or (burn_height is not None and burn_height < activation_height):
         refuse(f"need 1 <= activation_height ({activation_height}) <= burn_height ({burn_height})")
+    if sponsored_sighash_height is not None and not (
+            activation_height <= sponsored_sighash_height <= 2**31 - 1):
+        refuse(f"the sponsored_sighash_height ({sponsored_sighash_height}) must be at or above "
+               f"activation_height ({activation_height})")
     block_cap = caps.get("max_per_block", BRIDGE_V2_DEFAULT_CAP_RAW)
     epoch_cap = caps.get("max_per_epoch", BRIDGE_V2_DEFAULT_CAP_RAW)
     if not 0 < max_deposit_raw <= block_cap <= epoch_cap <= MAX_MONEY:
@@ -848,6 +969,22 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
                    f"({activation_height}), at or above burn_height ({effective_burn}) and at most {2**31 - 1}")
         if successor.get("origin_deployment_block", 1) < 1:
             refuse("the successor origin_deployment_block must be at least 1")
+    if forwarders is not None:
+        for role, nonce in (("deposit", FORWARDER_FACTORY_NONCE), ("exit", EXIT_FACTORY_NONCE)):
+            pin = forwarders.get(role)
+            if pin is None:
+                continue
+            if pin["factory"] != predict_create_address(deployer, nonce):
+                refuse(f"the {role} forwarder factory {pin['factory']} is not DeployV2's CREATE address at "
+                       f"deployer nonce {nonce} (B3V2_DEPLOY_FORWARDERS=1)")
+            if len(pin["init_code_hash"]) != 32 or pin["init_code_hash"] == bytes(32):
+                refuse(f"the {role} forwarder init_code_hash must be B3Forwarder's non-zero 32-byte "
+                       "creation code hash")
+        if len({bytes(pin["init_code_hash"]) for pin in forwarders.values()}) != 1:
+            refuse("the deposit and exit forwarder init_code_hash differ; both factories CREATE2 B3Forwarder")
+        if "exit" in forwarders and forwarders["exit"]["dst_eid"] != LZ_EID_ARBITRUM:
+            refuse(f"the exit forwarder dst_eid {forwarders['exit']['dst_eid']} is not Arbitrum's LayerZero "
+                   f"endpoint id {LZ_EID_ARBITRUM}")
 
     def rpc(method, *params):
         return local_json_rpc(_anvil_url(anvil), method, list(params))
@@ -878,6 +1015,10 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
             if successor_nonce != 0:
                 refuse(f"successor deployer {successor['deployer']} has nonce {successor_nonce}; "
                        "v' must be its first deployment")
+        for role, pin in sorted((forwarders or {}).items()):
+            if code(pin["factory"]):
+                refuse(f"the {role} forwarder factory address {pin['factory']} already holds code; pins "
+                       "must predict a deployment that has not happened")
     token_code = code(token)
     if not token_code:
         refuse(f"no runtime code at the token {token}")
@@ -899,6 +1040,8 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
     }
     if burn_height is not None:
         v2["burn_height"] = burn_height
+    if sponsored_sighash_height is not None:
+        v2["sponsored_sighash_height"] = sponsored_sighash_height
     v2.update(caps)
     if successor is not None:
         v2["successor"] = {
@@ -909,7 +1052,28 @@ def write_regtest_bridge_pins_v2(path, anvil, *, vault, token, verifier, deploye
         }
         if "origin_deployment_block" in successor:
             v2["successor"]["origin_deployment_block"] = successor["origin_deployment_block"]
+    for role, pin in sorted((forwarders or {}).items()):
+        v2[f"{role}_forwarder"] = dict(pin, init_code_hash=to_0x(pin["init_code_hash"]))
     document = {"format": PINS_FORMAT, "v2": v2}
+    with open(path, "w", encoding="utf8") as f:
+        json.dump(document, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return document
+
+
+def pin_sponsored_sighash_v2(path, height):
+    """Add owner ruling R10's v2.sponsored_sighash_height to the
+    -b3bridgepins file at path, written as write_regtest_bridge_pins_v2
+    writes it, and return the new JSON. Only before the nodes first start
+    with the file: the record guard refuses a changed file afterwards. The
+    height must be at or above the file's activation_height (V)."""
+    with open(path, encoding="utf8") as f:
+        document = json.load(f)
+    v2 = document["v2"]
+    if not (isinstance(height, int) and v2["activation_height"] <= height <= 2**31 - 1):
+        raise BridgePinError(f"refusing to pin sponsored_sighash_height {height!r} below activation_height "
+                             f"{v2['activation_height']}")
+    v2["sponsored_sighash_height"] = height
     with open(path, "w", encoding="utf8") as f:
         json.dump(document, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -1382,17 +1546,28 @@ def run_observer_once(node, wallet, ethereum_url, subjects=(1, 2, 3), *, dry_run
 
 
 def gate_view(info):
-    """getbridgev2info without burn_gate.now_eff and, with a B-23 successor,
-    successor.sweep.gate.now_eff, which follow each node's clock
-    (max(now, MTP + 1)) and so differ between two calls."""
+    """getbridgev2info without burn_gate.now_eff, light_client.fresh and,
+    with a B-23 successor, successor.sweep.gate.now_eff, which follow each
+    node's clock (max(now, MTP + 1)) and so may differ between two calls."""
     view = copy.deepcopy(info)
     view.get("burn_gate", {}).pop("now_eff", None)
+    view.get("light_client", {}).pop("fresh", None)
     view.get("successor", {}).get("sweep", {}).get("gate", {}).pop("now_eff", None)
     return view
 
 
 # -- DeployV2.s.sol (contracts/script, regtest only) ---------------------------
 DEPLOY_V2_CONTRACTS = ("BlsDigestProver", "B3FinalityVerifierV2", "B3VaultV2", "B3RelayBatch")
+
+
+def deploy_v2_contracts(effective_env):
+    """The contract names one DeployV2 run CREATEs, in deployer nonce order:
+    DEPLOY_V2_CONTRACTS, plus DEPLOY_V2_FORWARDER_CONTRACTS when the
+    environment forge sees sets B3V2_DEPLOY_FORWARDERS to 1 (the script's
+    default 0 keeps the four)."""
+    flag = str(effective_env.get("B3V2_DEPLOY_FORWARDERS", "0")).strip()
+    assert flag in ("0", "1"), f"B3V2_DEPLOY_FORWARDERS must be 0 or 1, not {flag!r}"
+    return DEPLOY_V2_CONTRACTS + (DEPLOY_V2_FORWARDER_CONTRACTS if flag == "1" else ())
 
 
 def deploy_v2(forge, srcdir, builddir, anvil_url, deployer, env, broadcast_dir, timeout=600):
@@ -1408,6 +1583,12 @@ def deploy_v2(forge, srcdir, builddir, anvil_url, deployer, env, broadcast_dir, 
     matched by contractAddress (in one run the record's transaction hashes
     and receipts disagreed on which hash created which contract when
     several CREATEs shared a block, so its hash pairing is not trusted).
+
+    With B3V2_DEPLOY_FORWARDERS=1 (env, B3V2_OFT_ADAPTER required) the run
+    also CREATEs B3DepositForwarderFactory and B3OftExitFactory, returned
+    the same way and checked here to be the deployer's CREATE addresses at
+    its starting nonce + FORWARDER_FACTORY_NONCE and + EXIT_FACTORY_NONCE.
+    The default path is unchanged: four contracts and no extra request.
     """
     assert_local_url(anvil_url)
     deployer = normalize_address(deployer)
@@ -1415,6 +1596,11 @@ def deploy_v2(forge, srcdir, builddir, anvil_url, deployer, env, broadcast_dir, 
     full_env = {key: str(value) for key, value in env.items()}
     full_env["B3V2_DEPLOYER"] = deployer
     full_env["FOUNDRY_BROADCAST"] = os.path.abspath(broadcast_dir)
+    # run_forge lays env over os.environ; judge the flag as forge will see it.
+    expected = deploy_v2_contracts({**os.environ, **full_env})
+    with_forwarders = len(expected) > len(DEPLOY_V2_CONTRACTS)
+    if with_forwarders:
+        start_nonce = int(local_json_rpc(anvil_url, "eth_getTransactionCount", [deployer, "latest"]), 16)
     run_forge(forge, srcdir, builddir, "script", f"{script}:DeployV2", "--rpc-url", anvil_url,
               "--broadcast", "--unlocked", "--sender", deployer, env=full_env, timeout=timeout)
     record_path = os.path.join(full_env["FOUNDRY_BROADCAST"], "DeployV2.s.sol",
@@ -1443,7 +1629,10 @@ def deploy_v2(forge, srcdir, builddir, anvil_url, deployer, env, broadcast_dir, 
             "gas_used": int(receipt["gasUsed"], 16),
             "tx_hash": relayer.norm_hex(receipt["transactionHash"], 32),
         }
-    assert_equal(sorted(created), sorted(DEPLOY_V2_CONTRACTS))
+    assert_equal(sorted(created), sorted(expected))
+    if with_forwarders:
+        for name, offset in zip(DEPLOY_V2_FORWARDER_CONTRACTS, (FORWARDER_FACTORY_NONCE, EXIT_FACTORY_NONCE)):
+            assert_equal(created[name]["address"], predict_create_address(deployer, start_nonce + offset))
     return created
 
 
@@ -1610,6 +1799,292 @@ def run_relayer_once(node, wallet, state, beacon_url, *, ethereum_url, payload_t
     return RelayerRun(result.returncode, events, result.stderr)
 
 
+# -- bridge V2 forwarders: refund EOA proof, OFT calldata, contrib tools -------
+# The refund EOA proof (contracts spec §7.3; src/bridge/eip191.h): a route (b)
+# forwarder pays refundEOA on refund and returnToOwner, so the wallet derives
+# F_d (and bridgewithdraw's arbitrum route F_x) only for an EOA whose key
+# personal_signed refund_eoa_message() under this chain's domain.
+REFUND_EOA_MESSAGE_PREFIX_V2 = "B3 bridge V2 refund EOA"
+EIP191_PREFIX = b"\x19Ethereum Signed Message:\n"
+EIP191_SIGNATURE_SIZE = 65
+
+
+def refund_eoa_message(domain, eoa):
+    """The exact text a refund EOA signs (bridge::RefundEoaMessageV2): three
+    lines, no trailing newline, with the raw 32-byte chain domain (wire order,
+    as regtest_chain_domain() returns it) and the lower-case EOA."""
+    return (f"{REFUND_EOA_MESSAGE_PREFIX_V2}\nchain domain: {to_0x(enc_bytes32(domain))}\n"
+            f"refund EOA: {normalize_address(eoa)}")
+
+
+def _message_bytes(message):
+    return message.encode() if isinstance(message, str) else bytes(message)
+
+
+def eip191_digest(message):
+    """keccak256("\\x19Ethereum Signed Message:\\n" || decimal(len) || message)."""
+    data = _message_bytes(message)
+    return keccak256(EIP191_PREFIX + str(len(data)).encode() + data)
+
+
+def recover_eip191_signer(message, signature):
+    """ecrecover of a 65-byte r || s || v personal_sign signature (v 27 or 28,
+    or the raw recovery id 0 or 1) over `message`, computed here with
+    test_framework.crypto.secp256k1, independently of the node
+    (bridge::RecoverEip191SignerV2) and of cast. Returns the lower-case 0x
+    address, or None for a malformed signature or a failed recovery."""
+    sig = hx(signature)
+    if len(sig) != EIP191_SIGNATURE_SIZE:
+        return None
+    r, s, v = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:64], "big"), sig[64]
+    recid = v - 27 if v in (27, 28) else v if v in (0, 1) else None
+    if recid is None or not (0 < r < GE.ORDER and 0 < s < GE.ORDER):
+        return None
+    # R's x is r (r < ORDER < p; recovery ids 2 and 3, x = r + ORDER, are not
+    # produced by personal_sign); the recovery id's low bit is R's y parity.
+    point = GE.lift_x(r)
+    if point is None:
+        return None
+    if recid & 1:
+        point = -point
+    e = int.from_bytes(eip191_digest(message), "big") % GE.ORDER
+    r_inv = pow(r, -1, GE.ORDER)
+    public = GE.mul((s * r_inv, point), (-e * r_inv, G))
+    if public.infinity:
+        return None
+    return normalize_address(keccak256(public.x.to_bytes() + public.y.to_bytes())[12:])
+
+
+def personal_sign(anvil, account, message, *, check_with_cast=True):
+    """EIP-191 personal_sign of `message` (text or bytes) by an unlocked anvil
+    dev account, through anvil's own personal_sign: anvil holds the key and
+    none is handled here. Returns the 65-byte r || s || v signature after two
+    checks: recover_eip191_signer() must give `account` and, when cast is
+    found (find_foundry_tool; never installed here) and check_with_cast,
+    `cast wallet verify` (offline) must accept it too."""
+    account = normalize_address(account)
+    data = _message_bytes(message)
+    signature = hx(local_json_rpc(_anvil_url(anvil), "personal_sign", [to_0x(data), account]))
+    assert_equal(len(signature), EIP191_SIGNATURE_SIZE)
+    assert_equal(recover_eip191_signer(data, signature), account)
+    cast = find_foundry_tool("cast") if check_with_cast else None
+    if cast is not None:
+        # A 0x-prefixed message is read as raw bytes, so the text passes exactly.
+        result = subprocess.run([cast, "wallet", "verify", "--address", account, to_0x(data), to_0x(signature)],
+                                capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+                                env=_local_process_env())
+        if result.returncode != 0:
+            raise AssertionError(f"cast wallet verify refused {account}'s personal_sign signature: "
+                                 f"{(result.stderr or result.stdout).strip()}")
+    return signature
+
+
+# IOFT (contracts/src/v2/IOFTV2.sol; LayerZero's struct layouts and selectors).
+OFT_SEND_PARAM_TUPLE = "(uint32,bytes32,uint256,uint256,bytes,bytes,bytes)"
+OFT_MESSAGING_FEE_TUPLE = "(uint256,uint256)"
+OFT_SEND_SIGNATURE = f"send({OFT_SEND_PARAM_TUPLE},{OFT_MESSAGING_FEE_TUPLE},address)"
+OFT_QUOTE_SEND_SIGNATURE = f"quoteSend({OFT_SEND_PARAM_TUPLE},bool)"
+# The mocks' packet: abi.encodePacked(bytes32 to, uint64 amount) (MockOFTBase).
+OFT_MESSAGE_SIZE = 40
+
+
+def _evm_word(to):
+    """A 32-byte recipient word from an EVM address (left-padded) or a word."""
+    data = bytes(to) if isinstance(to, (bytes, bytearray)) else hx(to)
+    if len(data) == 20:
+        return bytes(12) + data
+    assert len(data) == 32, "an OFT recipient is a 20-byte address or a 32-byte word"
+    return data
+
+
+def oft_send_param(dst_eid, to, amount_ld, min_amount_ld=None, extra_options=b"", compose_msg=b"", oft_cmd=b""):
+    """IOFTV2.SendParam as the tuple encode_oft_send() takes. `to` is an EVM
+    address (left-padded to its word) or a 32-byte word; min_amount_ld
+    defaults to amount_ld (no bridge fee accepted)."""
+    return (dst_eid, _evm_word(to), amount_ld, amount_ld if min_amount_ld is None else min_amount_ld,
+            hx(extra_options), hx(compose_msg), hx(oft_cmd))
+
+
+def encode_oft_send(send_param, fee, refund):
+    """Calldata of IOFT send(SendParam, MessagingFee, refundAddress), the
+    dynamic tuple LayerZero's OFT and OFT adapter take. send_param is
+    oft_send_param()'s tuple or a dict of its keyword arguments; fee is the
+    native fee (lzTokenFee 0) or a (nativeFee, lzTokenFee) pair. The sender
+    attaches msg.value == nativeFee (LayerZero's exact-fee rule)."""
+    if isinstance(send_param, dict):
+        send_param = oft_send_param(**send_param)
+    fee = (fee, 0) if isinstance(fee, int) else tuple(fee)
+    return forwarders_v2.encode_call(OFT_SEND_SIGNATURE, tuple(send_param), fee, normalize_address(refund))
+
+
+def encode_oft_quote_send(send_param, pay_in_lz_token=False):
+    """Calldata of IOFT quoteSend(SendParam, bool); it returns (nativeFee, lzTokenFee)."""
+    if isinstance(send_param, dict):
+        send_param = oft_send_param(**send_param)
+    return forwarders_v2.encode_call(OFT_QUOTE_SEND_SIGNATURE, tuple(send_param), pay_in_lz_token)
+
+
+def decode_oft_message(message):
+    """(recipient word, amount) of a mock OFT packet message."""
+    data = hx(message)
+    assert_equal(len(data), OFT_MESSAGE_SIZE)
+    return data[:32], int.from_bytes(data[32:], "big")
+
+
+def forwarder_eth_rpc(anvil):
+    """The contrib forwarder library's JSON-RPC client over a local anvil,
+    for in-process use of its helpers (forwarders_v2.view and eth_call,
+    whose revert raises CallReverted with a decoded reason, get_logs and
+    decode_published)."""
+    return observe_v2.JsonRpc(_anvil_url(anvil))
+
+
+class ForwarderToolError(AssertionError):
+    """b3_bridge_forwarders_v2.py refused (exit 1); .message is its error text."""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(f"b3_bridge_forwarders_v2.py refused: {message}")
+
+
+FORWARDER_TOOL_COMMANDS = ("flush", "forward", "published")
+_TOOL_FLAGS = {"sender": "--from", "tool_timeout": "--timeout"}
+
+
+def _tool_arguments(options):
+    args = []
+    for name, value in options.items():
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, sort_keys=True)
+        elif isinstance(value, (bytes, bytearray)):
+            text = to_0x(value)
+        else:
+            text = str(value)
+        args += [_TOOL_FLAGS.get(name, "--" + name.replace("_", "-")), text]
+    return args
+
+
+def run_forwarder_tool(command, ethereum, *, node=None, timeout=300, **options):
+    """Run contrib/b3bridge/b3_bridge_forwarders_v2.py <command> once as a subprocess.
+
+    command is "flush" or "forward", which need node (its RPC endpoint and
+    auth are passed), or "published", which reads Ethereum only. ethereum
+    is the Ethereum anvil or its local URL. options become the subcommand's
+    flags: sender -> --from, tool_timeout -> --timeout (the tool's receipt
+    wait), any other name with "_" as "-" (fee_recipient -> --fee-recipient,
+    certificate_block -> --certificate-block); a dict or list value goes as
+    JSON (flush's params: the wallet's bridgeforwarderaddress result or its
+    params object), bytes as 0x hex, and None omits the flag. timeout
+    bounds the subprocess. Returns its stdout JSON on exit 0; a refusal
+    (exit 1, "error: ..." on stderr) raises ForwarderToolError.
+    """
+    assert command in FORWARDER_TOOL_COMMANDS, command
+    args = [sys.executable, "-B", FORWARDERS_V2_SCRIPT, command, "--ethereum-rpc", _anvil_url(ethereum)]
+    if command == "published":
+        assert node is None, "published reads Ethereum only"
+    else:
+        assert node is not None, f"{command} needs the B3 node"
+        b3_url, auth = b3_rpc_endpoint(node)
+        args += ["--b3-rpc-url", b3_url, *auth]
+    args += _tool_arguments(options)
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                            stdin=subprocess.DEVNULL, env=_local_process_env())
+    if result.returncode != 0:
+        message = result.stderr.strip()
+        if result.returncode != 1 or not message.startswith("error: "):
+            raise AssertionError(f"b3_bridge_forwarders_v2.py {command} exited {result.returncode}: {message}")
+        raise ForwarderToolError(message[len("error: "):])
+    return json.loads(result.stdout)
+
+
+class MockLzRelayerError(AssertionError):
+    """mock_lz_relayer.py refused (exit 1); .message is its error text."""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(f"mock_lz_relayer.py refused: {message}")
+
+
+def run_mock_lz_relayer(src, src_endpoint, dst, dst_endpoint, sender, *, from_block=0, timeout=300):
+    """Run contrib/b3bridge/regtest/mock_lz_relayer.py deliver once as a subprocess.
+
+    It delivers every packet src_endpoint (a MockLzEndpoint on anvil src)
+    sent to dst_endpoint's eid and dst_endpoint has not delivered yet,
+    sending deliver() on anvil dst from `sender`, an unlocked dev account
+    there. src and dst are anvils or local URLs; the tool itself refuses
+    chain ids outside {31337, 31338}. Returns its stdout JSON on exit 0
+    (nothing failed) and on exit 2 (a packet failed and stays undelivered
+    for a later run: "failed" > 0, each such packet with its "error"); a
+    refusal (exit 1) raises MockLzRelayerError.
+    """
+    command = [sys.executable, "-B", MOCK_LZ_RELAYER_SCRIPT, "deliver",
+               "--src-url", _anvil_url(src), "--src-endpoint", normalize_address(src_endpoint),
+               "--dst-url", _anvil_url(dst), "--dst-endpoint", normalize_address(dst_endpoint),
+               "--from", normalize_address(sender), "--from-block", str(from_block)]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout,
+                            stdin=subprocess.DEVNULL, env=_local_process_env())
+    if result.returncode in (0, 2):
+        output = json.loads(result.stdout)
+        assert_equal(result.returncode == 2, output["failed"] > 0)
+        return output
+    message = result.stderr.strip()
+    if result.returncode != 1 or not message.startswith("error: "):
+        raise AssertionError(f"mock_lz_relayer.py exited {result.returncode}: {message}")
+    raise MockLzRelayerError(message[len("error: "):])
+
+
+# -- R10 sponsored native-B3 fees: the relayer's contrib tool -----------------
+SPONSOR_SCRIPT = str(B3BRIDGE_CONTRIB_DIR / "b3_bridge_sponsor.py")
+SPONSOR_TOOL_COMMANDS = ("refill", "status", "complete", "release")
+
+
+class SponsorToolError(AssertionError):
+    """b3_bridge_sponsor.py refused (exit 1); .message is its error text."""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(f"b3_bridge_sponsor.py refused: {message}")
+
+
+def run_sponsor_tool(command, node, wallet, *, timeout=300, **options):
+    """Run contrib/b3bridge/b3_bridge_sponsor.py <command> once as a subprocess.
+
+    command is "refill", "status", "complete" or "release"; node is the running B3
+    node hosting the relayer's `wallet` (its RPC endpoint and auth are
+    passed with --wallet). options become the subcommand's flags as in
+    run_forwarder_tool (tool_timeout -> --timeout, any other name with "_"
+    as "-"; min_tip -> --min-tip, max_fee -> --max-fee): True passes a bare
+    flag (no_broadcast -> --no-broadcast), False and None omit it, and a
+    Decimal goes as its exact decimal text. timeout bounds the subprocess.
+    Returns its stdout JSON on exit 0, with fractional numbers as Decimal
+    (the tool prints B3 amounts as exact decimal strings); a refusal (exit
+    1, "error: ..." on stderr) raises SponsorToolError.
+    """
+    assert command in SPONSOR_TOOL_COMMANDS, command
+    b3_url, auth = b3_rpc_endpoint(node)
+    args = [sys.executable, "-B", SPONSOR_SCRIPT, command, "--b3-rpc-url", b3_url, *auth, "--wallet", wallet]
+    for name, value in options.items():
+        if value is None or value is False:
+            continue
+        flag = _TOOL_FLAGS.get(name, "--" + name.replace("_", "-"))
+        if value is True:
+            args.append(flag)
+        elif isinstance(value, Decimal):
+            args += [flag, format(value, "f")]
+        else:
+            args += [flag, str(value)]
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                            stdin=subprocess.DEVNULL, env=_local_process_env())
+    if result.returncode != 0:
+        message = result.stderr.strip()
+        if result.returncode != 1 or not message.startswith("error: "):
+            raise AssertionError(f"b3_bridge_sponsor.py {command} exited {result.returncode}: {message}")
+        raise SponsorToolError(message[len("error: "):])
+    return json.loads(result.stdout, parse_float=Decimal)
+
+
 # -- observed refusals ----------------------------------------------------------
 def rpc_refusal(code, message, fun, *args, **kwds):
     """assert_raises_rpc_error() that returns the error message it observed."""
@@ -1728,11 +2203,15 @@ class B3BridgeChainMixin:
     """Bridge fixture helpers for a BitcoinTestFramework subclass.
 
     Use as `class Test(B3BridgeChainMixin, BitcoinTestFramework)`. Nodes 0-3
-    are the validators. Any further node (e.g. a sync checker that is not
-    started) is ignored by the helpers below, which act only on running
-    nodes. The corridor/stake helpers are copied from
-    feature_flowmesh_release.py:79-199, which is left unchanged.
+    are the validators (nodes 0 to bridge_validator_count - 1 when a test
+    overrides that class attribute, with as many stakes). Any further node
+    (e.g. a sync checker that is not started) is ignored by the helpers
+    below, which act only on running nodes. The corridor/stake helpers are
+    copied from feature_flowmesh_release.py:79-199, which is left unchanged.
     """
+
+    #: Nodes 0 .. bridge_validator_count - 1 are the validators.
+    bridge_validator_count = VALIDATOR_COUNT
 
     # -- configuration, tools and local processes --------------------------
     @property
@@ -1818,6 +2297,15 @@ class B3BridgeChainMixin:
                          _anvil_url(anvil), deployer, env,
                          os.path.join(self.options.tmpdir, name, "broadcast"))
 
+    def start_arbitrum_anvil(self, name="anvil-arbitrum", accounts=4):
+        """start_anvil() for the USDT0 chain standing in for Arbitrum (31338)."""
+        return self.start_anvil(name, chain_id=ARBITRUM_REGTEST_CHAIN_ID, accounts=accounts)
+
+    def bridge_forwarder_init_code_hash(self):
+        """forwarder_init_code_hash() of this build's B3Forwarder artifact
+        (needs a prior bridge_forge_build())."""
+        return forwarder_init_code_hash(self.bridge_artifact(*FORWARDER_ARTIFACT))
+
     def start_synthetic_beacon(self, anvil, slot_offset, base_block, name="beacon",
                                gvr=REGTEST_GVR, fork_version=REGTEST_FORK_VERSION):
         """A SyntheticBeacon over anvil whose server shutdown() stops.
@@ -1856,22 +2344,23 @@ class B3BridgeChainMixin:
         return [node for node in self.nodes if node.running]
 
     def bridge_validators(self):
-        return self.nodes[:VALIDATOR_COUNT]
+        return self.nodes[:self.bridge_validator_count]
 
     def start_bridge_validators(self, pins_path=None, extra_args=()):
         """Add every node with the bridge arguments; start and link n0-n3.
 
         The validators link only to each other, in the framework's default
-        chain topology. Nodes past n3 are added but not started.
+        chain topology (a line). Nodes past n3 (past the last validator with
+        bridge_validator_count) are added but not started.
         """
         args = b3_bridge_args(pins_path) + list(extra_args)
         if not self.nodes:
             self.add_nodes(self.num_nodes, [list(args) for _ in range(self.num_nodes)])
-        for i in range(VALIDATOR_COUNT):
+        for i in range(self.bridge_validator_count):
             self.start_node(i, extra_args=args)
             if self.uses_wallet:
                 self.init_wallet(node=i)
-        for i in range(VALIDATOR_COUNT - 1):
+        for i in range(self.bridge_validator_count - 1):
             self.connect_nodes(i + 1, i)
 
     def sync_bridge_blocks(self, timeout=120):
@@ -2039,14 +2528,16 @@ class B3BridgeChainMixin:
         behind the wall clock. From M-1 the nodes return to the real clock
         and stake continuously (feature_b3_finality_soak.py:120-152), so BLS
         finality is live. Returns once n0 is at or above target_height and
-        every validator has finalized at least M+5.
+        every validator has finalized at least M+5. A test that overrides
+        bridge_validator_count passes one stake per validator (len(stakes)
+        validators); -b3minfinalityset stays its own choice.
 
         With finality_key_label the validators bind the public test keys of
         that label instead of their derived keys (import_test_finality_keys),
         so b3-bridge-regtest-certify can sign as B3's own committees.
         """
         validators = self.bridge_validators()
-        assert_equal(len(validators), VALIDATOR_COUNT)
+        assert_equal(len(validators), len(stakes))
         assert all(node.running for node in validators)
         assert target_height >= MODERN_START
         n0 = validators[0]
@@ -2055,7 +2546,7 @@ class B3BridgeChainMixin:
         self.pos_running = False
         self.set_chain_time(int(time.time()) - 300)
 
-        self.log.info("Corridor funding and four independent finality stakes")
+        self.log.info(f"Corridor funding and {len(stakes)} independent finality stakes")
         self.mine_corridor(101)
         for node in validators[1:]:
             n0.sendtoaddress(node.get_deterministic_priv_key().address, 120)
@@ -2076,7 +2567,7 @@ class B3BridgeChainMixin:
                             timeout=60)
             preview = node.getfinalitystatus()["set0_preview"]
             assert_equal(preview["ready"], True)
-            assert_equal(preview["size"], VALIDATOR_COUNT)
+            assert_equal(preview["size"], len(stakes))
         # The Python domain derivation must equal the node's own.
         assert_equal(n0.getfinalityset()["chain_domain"], regtest_chain_domain().hex())
 
@@ -2120,6 +2611,24 @@ class B3BridgeChainMixin:
                          ("bind", member["validator_key"], hx(member["bls_pubkey"])))
         self.finality_test_keys = {"label": label, "members": members}
         return self.finality_test_keys
+
+    def bind_fresh_keys(self, wallets, epoch=None):
+        """bindfreshfinalitykey on each wallet (a node or a wallet RPC) for
+        `epoch` (default: the next block's window) while frozen; REGTEST ONLY
+        (-b3freshkeyheight). Each key is generated into that node's fresh key
+        store and its binding broadcast from the wallet; the transactions are
+        left in the mempools (mine_txids). Returns the results in order.
+        """
+        results = []
+        for wallet in wallets:
+            result = wallet.bindfreshfinalitykey() if epoch is None else wallet.bindfreshfinalitykey(epoch)
+            if epoch is not None:
+                assert_equal(result["epoch"], epoch)
+            assert_equal((result["key_source"], result["status"]), ("generated", "UNCONFIRMED"))
+            assert "warnings" not in result, result["warnings"]
+            assert_equal(len(hx(result["bls_pubkey"])), 48)
+            results.append(result)
+        return results
 
     def freeze(self):
         """Stop every staker and agree on one tip.
@@ -2211,9 +2720,9 @@ class B3BridgeChainMixin:
         With the real clock (mock_time 0) the validators stake until each
         txid is in a block every running node agrees on. Under mock time
         (set_chain_time) one block at a time is produced with
-        mine_pos_blocks_mocktime(), relaying fresh-lineage votes in between
-        when the test has a FreshVoteShuttle. Returns the containing heights
-        in txid order.
+        mine_pos_blocks_mocktime(), calling the FreshVoteShuttle round in
+        between when the test has one (fresh votes gossip meanwhile).
+        Returns the containing heights in txid order.
         """
         self.synchronize_mempools()
         if not getattr(self, "mock_time", 0):
@@ -2302,21 +2811,103 @@ class B3BridgeChainMixin:
         return output
 
 
-class FreshVoteShuttle:
-    """Fresh-lineage (digest V2) vote relay for a B3BridgeChainMixin test.
+# -- B-37 fresh key store (src/node/finality_fresh_key_store.h) ---------------
+FRESH_KEY_STORE_MAGIC = b"B3FKEYS1"
+FRESH_KEY_STORE_VERSION = 1
+FRESH_KEY_STORE_HEADER_SIZE = 8 + 1 + 32 + 32 + 4
+FRESH_KEY_STORE_RECORD_SIZE = 8 + 1 + 48 + 32 + 32
+FRESH_KEY_STORE_CHECKSUM_SIZE = 32
+FRESH_KEY_STORE_MAX_RECORDS = 4096
+FRESH_KEY_STATES = {1: "held", 2: "erased"}
 
-    Fresh votes have no P2P transport in this slice, so they are shuttled
-    between the running validators with the hidden vote RPCs. The shuttle
-    is feature_b3_fresh_lineage.py's (left unchanged there) without its
-    tampered-vote check. Set self.lineage_id (getfinalitylineage) first.
-    Each round also records n0's getfinalitylineage().finalized.certified_at
-    in self.fresh_inclusions; fresh_certificates() reads every type-11
-    carrier from the coinbases, so no certificate included between two
-    polls is missed when relaying.
+
+class FreshKeyStoreError(AssertionError):
+    pass
+
+
+def parse_fresh_key_store(data):
+    """Decode one fresh key store file independently of the node.
+
+    Layout (FreshKeyStore, integers little-endian): magic "B3FKEYS1",
+    version 1, chain domain (uint256 bytes), x-only validator key, u32 count,
+    count x {u64 target epoch, u8 state (1 held, 2 erased), 48-byte BLS
+    public key, 32-byte secret (all zero once erased), bind txid (uint256
+    bytes, null until recorded)}, then SHA256 of every preceding byte.
+    Returns {"chain_domain": bytes, "validator_key": hex, "records": [...]}
+    with each record {"epoch", "state", "bls_pubkey" (hex), "secret"
+    (bytes), "bind_txid" (display hex or None)}; raises FreshKeyStoreError
+    on anything that does not verify.
+    """
+    def refuse(reason):
+        raise FreshKeyStoreError(f"fresh key store: {reason}")
+
+    minimum = FRESH_KEY_STORE_HEADER_SIZE + FRESH_KEY_STORE_CHECKSUM_SIZE
+    if len(data) < minimum:
+        refuse(f"{len(data)} bytes, at least {minimum} expected")
+    if data[:8] != FRESH_KEY_STORE_MAGIC:
+        refuse("bad magic")
+    if data[8] != FRESH_KEY_STORE_VERSION:
+        refuse(f"unknown version {data[8]}")
+    if hashlib.sha256(data[:-FRESH_KEY_STORE_CHECKSUM_SIZE]).digest() != data[-FRESH_KEY_STORE_CHECKSUM_SIZE:]:
+        refuse("checksum mismatch")
+    count = int.from_bytes(data[73:77], "little")
+    if count > FRESH_KEY_STORE_MAX_RECORDS:
+        refuse(f"{count} records, maximum {FRESH_KEY_STORE_MAX_RECORDS}")
+    if len(data) != minimum + count * FRESH_KEY_STORE_RECORD_SIZE:
+        refuse(f"{len(data)} bytes do not hold {count} records")
+    records, seen = [], set()
+    for i in range(count):
+        offset = FRESH_KEY_STORE_HEADER_SIZE + i * FRESH_KEY_STORE_RECORD_SIZE
+        record = data[offset:offset + FRESH_KEY_STORE_RECORD_SIZE]
+        state = FRESH_KEY_STATES.get(record[8])
+        pubkey, secret, txid = record[9:57], record[57:89], record[89:121]
+        if state is None:
+            refuse(f"record {i}: unknown state {record[8]}")
+        if (state == "erased") == any(secret):
+            refuse(f"record {i}: {state} with {'a' if any(secret) else 'no'} secret")
+        if pubkey in seen:
+            refuse(f"record {i}: duplicate public key")
+        seen.add(pubkey)
+        records.append({"epoch": int.from_bytes(record[0:8], "little"), "state": state,
+                        "bls_pubkey": pubkey.hex(), "secret": secret,
+                        "bind_txid": txid[::-1].hex() if any(txid) else None})
+    return {"chain_domain": data[9:41], "validator_key": data[41:73].hex(), "records": records}
+
+
+def read_fresh_key_store(path):
+    """parse_fresh_key_store() of the file at path, plus its raw bytes."""
+    with open(path, "rb") as f:
+        data = f.read()
+    store = parse_fresh_key_store(data)
+    store["raw"] = data
+    return store
+
+
+class FreshVoteShuttle:
+    """Fresh-lineage (digest V2) vote transport for a B3BridgeChainMixin test.
+
+    Fresh votes travel over the lineage-naming P2P message finsigv2
+    (net_processing.cpp, only on a chain with a fresh lineage): a node floods
+    a vote once on first acceptance and replays its verified pool to every
+    connection, so the line n0-n1-n2-n3 of start_bridge_validators() reaches
+    every validator. With fresh_vote_transport "p2p" (the default) a round
+    of shuttle_fresh_votes() calls no vote RPC: shuttle_until() and
+    shuttle_fresh_until_lag() only wait while the nodes gossip. "rpc" adds
+    the former relay through the hidden vote RPCs (getfinalitylineagevotes /
+    submitfinalitylineagevote) for drills or a phase whose validators are
+    not linked; set self.lineage_id (getfinalitylineage) first. Every
+    submission is counted in self.fresh_vote_results, which stays empty
+    with gossip (assert_fresh_gossip). Each round also records n0's
+    getfinalitylineage().finalized.certified_at in self.fresh_inclusions;
+    fresh_certificates() reads every type-11 carrier from the coinbases, so
+    no certificate included between two polls is missed when relaying.
     """
 
     FRESH_VOTE_SIZE = 148
+    FRESH_VOTE_MESSAGE = "finsigv2"
+    FRESH_VOTE_TRANSPORTS = ("p2p", "rpc")
     MPA_TYPE_FINALITY_CERTIFICATE_V2 = 11
+    fresh_vote_transport = "p2p"
 
     def _fresh_shuttle_state(self):
         if not hasattr(self, "_fresh_delivered"):
@@ -2327,7 +2918,23 @@ class FreshVoteShuttle:
         return self._fresh_delivered
 
     def shuttle_fresh_votes(self):
-        """Relay every verified fresh vote of each validator to the others."""
+        """One round: relay votes by RPC if fresh_vote_transport is "rpc"
+        (gossip needs nothing), then record n0's newest fresh inclusion."""
+        self._fresh_shuttle_state()
+        assert self.fresh_vote_transport in self.FRESH_VOTE_TRANSPORTS, self.fresh_vote_transport
+        if self.fresh_vote_transport == "rpc":
+            self.relay_fresh_votes_by_rpc()
+        try:
+            certified_at = (self.nodes[0].getfinalitylineage().get("finalized") or {}).get("certified_at")
+        except JSONRPCException:
+            certified_at = None
+        if certified_at is not None:
+            self.fresh_inclusions.add(certified_at)
+        return True
+
+    def relay_fresh_votes_by_rpc(self):
+        """Relay every verified fresh vote of each validator to the others
+        with the hidden vote RPCs (drills only; gossip does this unasked)."""
         delivered = self._fresh_shuttle_state()
         assert getattr(self, "lineage_id", None), "set self.lineage_id before shuttling"
         validators = [node for node in self.bridge_validators() if node.running]
@@ -2352,15 +2959,28 @@ class FreshVoteShuttle:
                     self.fresh_vote_results[result] += 1
                     if result in ("accepted", "duplicate", "stale"):
                         delivered.add(key)
-        try:
-            certified_at = (self.nodes[0].getfinalitylineage().get("finalized") or {}).get("certified_at")
-        except JSONRPCException:
-            certified_at = None
-        if certified_at is not None:
-            self.fresh_inclusions.add(certified_at)
-        return True
+
+    @classmethod
+    def fresh_gossip_bytes(cls, node):
+        """finsigv2 bytes node received, summed over its current connections
+        (getpeerinfo counters restart with a node or a connection)."""
+        return sum(peer["bytesrecv_per_msg"].get(cls.FRESH_VOTE_MESSAGE, 0) for peer in node.getpeerinfo())
+
+    def assert_fresh_gossip(self, nodes):
+        """Every node in `nodes` received finsigv2 traffic from its peers and,
+        with the default "p2p" transport, the shuttle submitted no vote by RPC.
+        Returns {"nodeN": bytes received}."""
+        self._fresh_shuttle_state()
+        observed = {f"node{node.index}": self.fresh_gossip_bytes(node) for node in nodes}
+        silent = [name for name, received in observed.items() if received <= 0]
+        assert not silent, f"no {self.FRESH_VOTE_MESSAGE} received by {silent}: {observed}"
+        if self.fresh_vote_transport == "p2p":
+            assert_equal(dict(self.fresh_vote_results), {})
+        return observed
 
     def shuttle_until(self, predicate, timeout=300):
+        """Poll predicate, one shuttle_fresh_votes() round before each check
+        (with gossip only n0's newest inclusion is recorded)."""
         self.wait_until(lambda: self.shuttle_fresh_votes() and predicate(), timeout=timeout,
                         check_interval=0.25)
 
@@ -2377,8 +2997,9 @@ class FreshVoteShuttle:
         return lags
 
     def shuttle_fresh_until_lag(self, max_lag, timeout=300):
-        """Relay fresh votes until every validator's tip is at most max_lag
-        blocks above its fresh finalized checkpoint; leave them frozen.
+        """Let fresh votes gossip (or relay them, transport "rpc") until every
+        validator's tip is at most max_lag blocks above its fresh finalized
+        checkpoint; leave them frozen.
 
         A V2 burn is judged with candidate height - finalized <=
         max_finality_lag_blocks (gate row C3; 30 on profile R), so callers
@@ -2824,3 +3445,276 @@ class TestFrameworkB3BridgeGuards(unittest.TestCase):
         # Before the migration height the sweep carries no gate.
         self.assertEqual(gate_view({"successor": {"sweep": {"payload_hex": "1000"}}}),
                          {"successor": {"sweep": {"payload_hex": "1000"}}})
+
+    def test_fresh_key_store_parser(self):
+        """parse_fresh_key_store against a hand-built file and its refusals."""
+        domain, validator = bytes(range(32)), bytes(range(32, 64))
+
+        def record(epoch, state, pubkey, secret=bytes(32), txid=bytes(32)):
+            return epoch.to_bytes(8, "little") + bytes([state]) + pubkey + secret + txid
+
+        def store(records, count=None, magic=FRESH_KEY_STORE_MAGIC, version=FRESH_KEY_STORE_VERSION):
+            body = (magic + bytes([version]) + domain + validator +
+                    (len(records) if count is None else count).to_bytes(4, "little") + b"".join(records))
+            return body + hashlib.sha256(body).digest()
+
+        held = record(2, 1, b"\xa1" * 48, b"\x5a" * 32, bytes(range(1, 33)))
+        erased = record(0, 2, b"\xa2" * 48)
+        parsed = parse_fresh_key_store(store([erased, held]))
+        self.assertEqual(parsed["chain_domain"], domain)
+        self.assertEqual(parsed["validator_key"], validator.hex())
+        self.assertEqual(parsed["records"], [
+            {"epoch": 0, "state": "erased", "bls_pubkey": "a2" * 48, "secret": bytes(32), "bind_txid": None},
+            {"epoch": 2, "state": "held", "bls_pubkey": "a1" * 48, "secret": b"\x5a" * 32,
+             "bind_txid": bytes(range(1, 33))[::-1].hex()},
+        ])
+        self.assertEqual(len(store([held])), FRESH_KEY_STORE_HEADER_SIZE + FRESH_KEY_STORE_RECORD_SIZE + 32)
+        self.assertEqual(parse_fresh_key_store(store([]))["records"], [])
+
+        good = store([held])
+        for data, reason in (
+            (good[:-1], "checksum"),
+            (good[:40], "at least"),
+            (good[:100] + bytes([good[100] ^ 1]) + good[101:], "checksum"),
+            (store([held], magic=b"B3FKEYS2"), "bad magic"),
+            (store([held], version=2), "unknown version"),
+            (store([held], count=2), "do not hold"),
+            (store([], count=FRESH_KEY_STORE_MAX_RECORDS + 1), "maximum"),
+            (store([record(1, 3, b"\xa3" * 48, b"\x01" * 32)]), "unknown state"),
+            (store([record(1, 2, b"\xa3" * 48, b"\x01" * 32)]), "erased with a secret"),
+            (store([record(1, 1, b"\xa3" * 48)]), "held with no secret"),
+            (store([held, held]), "duplicate public key"),
+        ):
+            with self.assertRaisesRegex(FreshKeyStoreError, reason):
+                parse_fresh_key_store(data)
+
+    # -- bridge V2 forwarders (routes (b) and (d3)) ---------------------------
+    V2_INIT_CODE_HASH = "0x" + "e1" * 32
+
+    def test_v2_forwarder_pin_writer_refusals(self):
+        regtest = self.FakeAnvil(REGTEST_ETH_CHAIN_ID)
+        pins = forwarder_pins_v2(self.V2_DEPLOYER, self.V2_INIT_CODE_HASH)
+        self.assertEqual(pins, {
+            "deposit": {"factory": predict_create_address(self.V2_DEPLOYER, 4),
+                        "init_code_hash": self.V2_INIT_CODE_HASH},
+            "exit": {"factory": predict_create_address(self.V2_DEPLOYER, 5),
+                     "init_code_hash": self.V2_INIT_CODE_HASH, "dst_eid": 30110}})
+        self.assertEqual(list(forwarder_pins_v2(self.V2_DEPLOYER, self.V2_INIT_CODE_HASH, roles=("exit",))),
+                         ["exit"])
+
+        def refused(message, **changes):
+            changed = copy.deepcopy(pins)
+            for role, fields in changes.items():
+                changed[role].update(fields)
+            self.assert_v2_pins_refused(regtest, message, forwarders=changed)
+
+        nonce = "is not DeployV2's CREATE address at deployer nonce"
+        refused(f"deposit forwarder factory 0x[0-9a-f]{{40}} {nonce} 4",
+                deposit={"factory": predict_create_address(self.V2_DEPLOYER, 3)})
+        refused(f"exit forwarder factory 0x[0-9a-f]{{40}} {nonce} 5", exit={"factory": pins["deposit"]["factory"]})
+        refused(f"deposit forwarder factory 0x[0-9a-f]{{40}} {nonce} 4",
+                deposit={"factory": predict_create_address(self.V2_SUCCESSOR_DEPLOYER, 4)})
+        refused("deposit forwarder init_code_hash must be", deposit={"init_code_hash": "0x" + "00" * 32})
+        refused("exit forwarder init_code_hash must be", exit={"init_code_hash": "0x" + "e1" * 31})
+        refused("init_code_hash differ", exit={"init_code_hash": "0x" + "e2" * 32})
+        for dst_eid in (LZ_EID_ETHEREUM, 0, 30111):
+            refused(f"dst_eid {dst_eid} is not Arbitrum's LayerZero endpoint id 30110", exit={"dst_eid": dst_eid})
+        # Missing or unknown keys and roles are harness bugs, refused even without check.
+        for bad in ({}, {"other": {}}, {"deposit": {"factory": pins["deposit"]["factory"]}},
+                    {"exit": dict(pins["exit"], extra=1)}):
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(AssertionError):
+                write_regtest_bridge_pins_v2(os.path.join(tmp, "pins-v2.json"), regtest,
+                                             **self.v2_pin_kwargs(forwarders=bad, check=False))
+
+    def test_v2_forwarder_pins_written(self):
+        """The v2.deposit_forwarder / v2.exit_forwarder keys the node parses,
+        the anvil code checks, and no forwarder key without forwarders.
+        Every request goes to a fake local_json_rpc."""
+        from unittest import mock
+        kwargs = self.v2_pin_kwargs()
+        token = kwargs["token"]
+        coded = {token}
+
+        def fake_rpc(url, method, params=None, timeout=120):
+            if method == "eth_getBlockByNumber":
+                return {"hash": self.BOOTSTRAP["checkpoint_block_hash"]}
+            if method == "eth_getTransactionCount":
+                return "0x0"
+            if method == "eth_getCode":
+                return "0x6001" if normalize_address(params[0]) in coded else "0x"
+            raise AssertionError(f"unexpected request {method}")
+
+        regtest = self.FakeAnvil(REGTEST_ETH_CHAIN_ID)
+        pins = forwarder_pins_v2(self.V2_DEPLOYER, self.V2_INIT_CODE_HASH)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("test_framework.b3bridge.local_json_rpc", side_effect=fake_rpc):
+            path = os.path.join(tmp, "pins-v2.json")
+            plain = write_regtest_bridge_pins_v2(path, regtest, **kwargs)["v2"]
+            self.assertFalse({"deposit_forwarder", "exit_forwarder"} & set(plain))
+            document = write_regtest_bridge_pins_v2(path, regtest, **kwargs, forwarders=pins)
+            with open(path, encoding="utf8") as f:
+                self.assertEqual(json.load(f), document)
+            v2 = document["v2"]
+            self.assertEqual(v2["deposit_forwarder"], pins["deposit"])
+            self.assertEqual(v2["exit_forwarder"], pins["exit"])
+            self.assertEqual({key: value for key, value in v2.items() if not key.endswith("_forwarder")}, plain)
+            only_exit = write_regtest_bridge_pins_v2(path, regtest, **kwargs, forwarders={"exit": pins["exit"]})
+            self.assertEqual(sorted(k for k in only_exit["v2"] if k.endswith("_forwarder")), ["exit_forwarder"])
+            for role in ("deposit", "exit"):
+                coded.add(pins[role]["factory"])
+                with self.assertRaisesRegex(BridgePinError, f"the {role} forwarder factory address .* already "
+                                                            "holds code"):
+                    write_regtest_bridge_pins_v2(path, regtest, **kwargs, forwarders={role: pins[role]})
+                coded.discard(pins[role]["factory"])
+
+    def test_v2_sponsored_sighash_pin_written(self):
+        """Owner ruling R10's v2.sponsored_sighash_height: absent by
+        default, written by the writer or added by pin_sponsored_sighash_v2
+        (the same bytes either way), never below V."""
+        from unittest import mock
+        kwargs = self.v2_pin_kwargs()
+        token = kwargs["token"]
+
+        def fake_rpc(url, method, params=None, timeout=120):
+            if method == "eth_getBlockByNumber":
+                return {"hash": self.BOOTSTRAP["checkpoint_block_hash"]}
+            if method == "eth_getTransactionCount":
+                return "0x0"
+            if method == "eth_getCode":
+                return "0x6001" if normalize_address(params[0]) == token else "0x"
+            raise AssertionError(f"unexpected request {method}")
+
+        regtest = self.FakeAnvil(REGTEST_ETH_CHAIN_ID)
+        activation = kwargs["activation_height"]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("test_framework.b3bridge.local_json_rpc", side_effect=fake_rpc):
+            path = os.path.join(tmp, "pins-v2.json")
+            plain = write_regtest_bridge_pins_v2(path, regtest, **kwargs)
+            self.assertNotIn("sponsored_sighash_height", plain["v2"])
+            added = pin_sponsored_sighash_v2(path, activation + 3)
+            with open(path, encoding="utf8") as f:
+                added_bytes = f.read()
+            self.assertEqual(added["v2"], {**plain["v2"], "sponsored_sighash_height": activation + 3})
+            written = write_regtest_bridge_pins_v2(path, regtest, **kwargs, sponsored_sighash_height=activation + 3)
+            with open(path, encoding="utf8") as f:
+                self.assertEqual(f.read(), added_bytes)
+            self.assertEqual(written, added)
+            with self.assertRaisesRegex(BridgePinError, "sponsored_sighash_height"):
+                write_regtest_bridge_pins_v2(path, regtest, **kwargs, sponsored_sighash_height=activation - 1)
+            with self.assertRaisesRegex(BridgePinError, "below activation_height"):
+                pin_sponsored_sighash_v2(path, activation - 1)
+
+    def test_v2_forwarder_helpers_match_shared_vectors(self):
+        """The contrib derivations the harness imports, its refund EOA
+        message, EIP-191 digest and independent ecrecover reproduce the
+        forwarder_v2 vectors (the C++ and Foundry suites read the same file)."""
+        with open(SRCDIR / "contracts" / "test" / "vectors" / "bridge_v2_vectors.json", encoding="utf8") as f:
+            vectors = json.load(f)["forwarder_v2"]
+        self.assertEqual(forwarders_v2.DEPOSIT_TAG, hx(vectors["tags"]["deposit"]))
+        self.assertEqual(forwarders_v2.EXIT_TAG, hx(vectors["tags"]["exit"]))
+        self.assertEqual(vectors["pinned_dst_eid"], LZ_EID_ARBITRUM)
+        init_code_hash = vectors["init_code_hash"]
+        for v in vectors["deposit"]:
+            p = DepositParams(v["vault"], v["b3_recipient"], v["refund_eoa"], v["fee_cap"], v["not_after"])
+            self.assertEqual(forwarders_v2.deposit_salt_preimage(p), hx(v["salt_preimage"]))
+            self.assertEqual(forwarders_v2.deposit_salt(p), hx(v["salt"]))
+            self.assertEqual(deposit_forwarder_address(v["factory"], init_code_hash, p), hx(v["account"]))
+        for v in vectors["exit"]:
+            p = ExitParams(v["dst_eid"], v["to"], v["max_bridge_fee_bps"], v["fee_cap"], v["refund_eoa"])
+            self.assertEqual(forwarders_v2.exit_salt_preimage(p), hx(v["salt_preimage"]))
+            self.assertEqual(forwarders_v2.exit_salt(p), hx(v["salt"]))
+            self.assertEqual(exit_forwarder_address(v["factory"], init_code_hash, p), hx(v["account"]))
+            self.assertEqual(forwarders_v2.exit_params_valid(p, vectors["pinned_dst_eid"]), v["is_valid"])
+        for v in vectors["deposit_fee_cap"]:
+            self.assertEqual(deposit_fee_cap(v["fee_per_tx"]), v["fee_cap"])
+
+        names = []
+        for v in vectors["refund_eoa_message"]:
+            names.append(v["name"])
+            message = refund_eoa_message(v["chain_domain"], v["refund_eoa"])
+            self.assertEqual(message, v["message"])
+            self.assertEqual(eip191_digest(message), hx(v["eip191_digest"]))
+            self.assertEqual(recover_eip191_signer(message, v["signature"]), normalize_address(v["refund_eoa"]))
+            sig = hx(v["signature"])
+            self.assertEqual(recover_eip191_signer(message, sig[:64] + bytes([sig[64] - 27])),
+                             normalize_address(v["refund_eoa"]))
+            # Another message, the other parity or another chain recovers someone else.
+            other_parity = sig[:64] + bytes([55 - sig[64]])
+            for text, signature in ((message + "\n", sig), (message, other_parity),
+                                    (refund_eoa_message(bytes(32), v["refund_eoa"]), sig)):
+                self.assertNotEqual(recover_eip191_signer(text, signature), normalize_address(v["refund_eoa"]))
+            for bad in (sig[:64], sig + b"\x00", sig[:64] + b"\x1d", bytes(32) + sig[32:], sig[:32] + bytes(32) +
+                        sig[64:], b"\xff" * 32 + sig[32:]):
+                self.assertIsNone(recover_eip191_signer(message, bad))
+            if v["name"] == "regtest":
+                self.assertEqual(hx(v["chain_domain"]), regtest_chain_domain())
+        self.assertIn("regtest", names)
+        self.assertEqual(refund_eoa_message("0x" + "ab" * 32, "0x" + "CD" * 20),
+                         "B3 bridge V2 refund EOA\nchain domain: 0x" + "ab" * 32 + "\nrefund EOA: 0x" + "cd" * 20)
+
+    def test_v2_oft_calldata(self):
+        to = "0x" + "ab" * 20
+        sp = oft_send_param(LZ_EID_ETHEREUM, to, 25_000_000, extra_options=b"\x00\x03")
+        self.assertEqual(sp, (30101, bytes(12) + b"\xab" * 20, 25_000_000, 25_000_000, b"\x00\x03", b"", b""))
+        data = encode_oft_send(sp, 10**14, "0x" + "cd" * 20)
+        self.assertEqual(data[:4].hex(), "c7c7f5b3")  # LayerZero IOFT send
+        self.assertEqual(data, encode_oft_send({"dst_eid": LZ_EID_ETHEREUM, "to": bytes(12) + b"\xab" * 20,
+                                                "amount_ld": 25_000_000, "extra_options": "0x0003"},
+                                               (10**14, 0), "0x" + "cd" * 20))
+        # Head: SendParam offset, fee (2 words), refund; then SendParam's 7 head
+        # words and its three bytes tails (1 + 1 words, 1 word, 1 word).
+        self.assertEqual(len(data), 4 + 32 * (4 + 7 + 2 + 1 + 1))
+        self.assertEqual(data[4:36], enc_uint(4 * 32))
+        decoded = forwarders_v2.decode_abi([OFT_SEND_PARAM_TUPLE, OFT_MESSAGING_FEE_TUPLE, "address"], data[4:])
+        self.assertEqual(decoded, [sp, (10**14, 0), "0x" + "cd" * 20])
+        slippage = oft_send_param(LZ_EID_ARBITRUM, "0x" + "11" * 32, 1_000, min_amount_ld=995)
+        self.assertEqual(slippage[3], forwarders_v2.min_amount_after_fee(1_000, 50))
+        self.assertEqual(encode_oft_quote_send(sp)[:4].hex(), "3b6f743b")  # quoteSend
+        self.assertEqual(decode_oft_message(b"\x22" * 32 + (7).to_bytes(8, "big")), (b"\x22" * 32, 7))
+        for bad_to in ("0x" + "ab" * 19, b"\x01" * 31):
+            with self.assertRaises(AssertionError):
+                oft_send_param(LZ_EID_ETHEREUM, bad_to, 1)
+
+    def test_v2_forwarder_deploy_and_tool_guards(self):
+        """DeployV2's forwarder flag and nonces, and the tool wrappers'
+        refusals, all before any process starts."""
+        self.assertEqual(deploy_v2_contracts({}), DEPLOY_V2_CONTRACTS)
+        self.assertEqual(deploy_v2_contracts({"B3V2_DEPLOY_FORWARDERS": "0"}), DEPLOY_V2_CONTRACTS)
+        self.assertEqual(deploy_v2_contracts({"B3V2_DEPLOY_FORWARDERS": 1}),
+                         DEPLOY_V2_CONTRACTS + ("B3DepositForwarderFactory", "B3OftExitFactory"))
+        for flag in ("2", "yes", ""):
+            with self.assertRaises(AssertionError):
+                deploy_v2_contracts({"B3V2_DEPLOY_FORWARDERS": flag})
+        # The harness's nonces and endpoint id are DeployV2's.
+        self.assertEqual((FORWARDER_FACTORY_NONCE, EXIT_FACTORY_NONCE, LZ_EID_ARBITRUM), (4, 5, 30110))
+        with open(SRCDIR / "contracts" / "script" / "DeployV2.s.sol", encoding="utf8") as f:
+            script = f.read()
+        for constant in ("FORWARDER_FACTORY_NONCE_OFFSET = 4;", "EXIT_FORWARDER_FACTORY_NONCE_OFFSET = 5;",
+                         "DEFAULT_EXIT_DST_EID = 30_110;"):
+            self.assertIn(constant, script)
+        self.assertEqual(forwarder_init_code_hash({"bytecode": b"\x60\x00"}), keccak256(b"\x60\x00"))
+        self.assertEqual(forwarder_init_code_hash(b"\x60\x00"), keccak256(b"\x60\x00"))
+
+        self.assertEqual(_tool_arguments({"sender": "0x" + "aa" * 20, "fee_recipient": "0x" + "bb" * 20,
+                                          "params": {"vault": "0x1", "fee_cap": 2}, "fee": 5, "account": None,
+                                          "certificate_block": 300, "tool_timeout": 30, "salt": b"\x01\x02"}),
+                         ["--from", "0x" + "aa" * 20, "--fee-recipient", "0x" + "bb" * 20,
+                          "--params", '{"fee_cap": 2, "vault": "0x1"}', "--fee", "5",
+                          "--certificate-block", "300", "--timeout", "30", "--salt", "0x0102"])
+        local = "http://127.0.0.1:9"
+        for command, kwargs in (("published", {"node": object()}), ("flush", {}), ("forward", {}),
+                                ("deploy", {})):
+            with self.assertRaises(AssertionError):
+                run_forwarder_tool(command, local, **kwargs)
+        for url in ("https://ethereum-rpc.example.invalid", "http://10.0.0.1:8545"):
+            with self.assertRaisesRegex(AssertionError, "Refusing non-local endpoint"):
+                run_forwarder_tool("published", url, factory="0x" + "aa" * 20)
+            with self.assertRaisesRegex(AssertionError, "Refusing non-local endpoint"):
+                run_mock_lz_relayer(url, "0x" + "aa" * 20, local, "0x" + "bb" * 20, "0x" + "cc" * 20)
+            with self.assertRaisesRegex(AssertionError, "Refusing non-local endpoint"):
+                run_mock_lz_relayer(local, "0x" + "aa" * 20, url, "0x" + "bb" * 20, "0x" + "cc" * 20)
+            with self.assertRaisesRegex(AssertionError, "Refusing non-local endpoint"):
+                personal_sign(url, "0x" + "aa" * 20, "m")
+            with self.assertRaisesRegex(AssertionError, "Refusing non-local endpoint"):
+                forwarder_eth_rpc(url)
+        self.assertEqual((ARBITRUM_REGTEST_CHAIN_ID, LZ_EID_ETHEREUM, LZ_EID_ARBITRUM), (31338, 30101, 30110))

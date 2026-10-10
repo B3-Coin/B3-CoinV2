@@ -19,6 +19,7 @@
 #include <modern/asset_output.h>
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
+#include <modern/bridge_forwarder.h>
 #include <modern/bridge_v2.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
@@ -1240,6 +1241,22 @@ BridgeV2GateResult EvaluateBurnGateOn(
  * entry: its ledger, its RESERVE_E (subject 2 or 0x12) and proven deposits,
  * and its gate rows; the leaf names its vault and token, and its ledger
  * counts the amount in burned_v.
+ *
+ * A burn with a route (d3) exit block (check 5, section 7.2 item 5) also
+ * needs the pinned exit forwarder, parameters valid against it
+ * (modern::ExitForwarderParamsValidV2), a refund EOA that holds no bridge V2
+ * role (modern::BridgeV2ReservedEthAddressReason, OI-6: none of those
+ * contracts can call withdrawOnEthereum, so F_x would lose its escape) and a
+ * recipient equal to their F_x (modern::ExitForwarderAddressV2). The leaf is
+ * unchanged: it names F_x as its recipient like any other burn. The
+ * parameters are stored with the leaf (BridgeWithdrawalV2Request::exit).
+ *
+ * The exit forwarder is one height-less pin, valid only while it never
+ * changes; on regtest the pin file is frozen from A3. Spec section 8's
+ * coordinated re-pin (an adapter, OFT or endpoint change) must first make it
+ * an append-only, height-versioned list checked against the pin active at
+ * each burn's height, or a replay would refuse every earlier route (d3)
+ * burn.
  */
 bool VerifyBridgeBurnV2(
     const CTransaction& tx, const bridge::BridgeBurnV1& record,
@@ -1270,6 +1287,32 @@ bool VerifyBridgeBurnV2(
     if (bridge::EthAddressIsNull(record.ethereum_recipient)) {
         error = "bridge V2 burn Ethereum recipient is null";
         return false;
+    }
+    // Check 5, the optional route (d3) exit block (section 7.2 item 5): the
+    // recipient is the exit forwarder F_x of the block's parameters under
+    // the pinned exit factory. Deterministic and before the gate, so it
+    // holds under REPLAY_LINEAGE and without a context too.
+    if (record.exit) {
+        const auto& exit_pins{params.bridge_v2->exit_forwarder};
+        if (!exit_pins) {
+            error = "bridge V2 burn exit block needs a pinned exit forwarder";
+            return false;
+        }
+        if (!modern::ExitForwarderParamsValidV2(*record.exit,
+                                                exit_pins->dst_eid)) {
+            error = "bridge V2 burn exit parameters are invalid";
+            return false;
+        }
+        if (modern::BridgeV2ReservedEthAddressReason(*params.bridge_v2,
+                                                     record.exit->refund_eoa)) {
+            error = "bridge V2 burn exit refund EOA holds a bridge V2 role";
+            return false;
+        }
+        if (modern::ExitForwarderAddressV2(*exit_pins, *record.exit) !=
+            record.ethereum_recipient) {
+            error = "bridge V2 burn recipient is not the exit forwarder of its exit parameters";
+            return false;
+        }
     }
     if (record.raw_amount == 0 ||
         record.raw_amount > static_cast<uint64_t>(MAX_MONEY)) {
@@ -1353,7 +1396,7 @@ bool VerifyBridgeBurnV2(
     delta.withdrawal_tree_v2_after = state.withdrawal_tree_v2;
     BridgeWithdrawalV2Request request{
         tx.GetHash(), record.burn_output_index, withdrawal, leaf, height,
-        block_hash, static_cast<uint8_t>(*role), /*sweep=*/false};
+        block_hash, static_cast<uint8_t>(*role), /*sweep=*/false, record.exit};
     delta.withdrawals_v2_added.push_back(request);
     tx_result.withdrawal_v2 = std::move(request);
     return true;
@@ -1847,11 +1890,35 @@ bool VerifyBridgeTransaction(
 
 } // namespace
 
+bool BridgeV2SponsoredSighashAllowed(const BridgeWithdrawalV2Request& withdrawal,
+                                     const Consensus::Params& params,
+                                     const int height)
+{
+    return !withdrawal.sweep && params.BridgeV2SponsoredSighashActive(height);
+}
+
+bool BridgeV2SponsoredSighashAllowed(const BridgeTxAuthorization& authorization,
+                                     const Consensus::Params& params,
+                                     const int height)
+{
+    if (!authorization.withdrawal_v2 || authorization.mint ||
+        authorization.withdrawal || authorization.decentralized_withdrawal) {
+        return false;
+    }
+    return BridgeV2SponsoredSighashAllowed(*authorization.withdrawal_v2,
+                                           params, height);
+}
+
 bool HasDecentralizedBridgeBurn(const CTransaction& tx)
 {
     for (const CMpaRecord& record : tx.mpa) {
         if (record.payload_type != bridge::BRIDGE_MPA_TYPE) continue;
-        const auto decoded{bridge::DecodeBridgeMpaRecordV1(record)};
+        // The V2 record set, so a burn with a route (d3) exit block counts
+        // for the gate paths and the closing-block eviction. For kind 6 it
+        // differs from the V1 set only by that block, which is malformed
+        // below V, so such a transaction is refused there either way.
+        const auto decoded{bridge::DecodeBridgeMpaRecordV1(
+            record, bridge::BRIDGE_MPT_LIMITS_V2)};
         if (decoded &&
             std::holds_alternative<bridge::BridgeBurnV1>(decoded->payload)) {
             return true;
@@ -1935,7 +2002,9 @@ bool HasBridgeV2RetiredEntryBurn(const CTransaction& tx,
     if (!launch_id) return false;
     for (const CMpaRecord& record : tx.mpa) {
         if (record.payload_type != bridge::BRIDGE_MPA_TYPE) continue;
-        const auto decoded{bridge::DecodeBridgeMpaRecordV1(record)};
+        // The V2 record set: a burn with an exit block is a burn too.
+        const auto decoded{bridge::DecodeBridgeMpaRecordV1(
+            record, bridge::BRIDGE_MPT_LIMITS_V2)};
         if (!decoded) continue;
         const auto* burn{std::get_if<bridge::BridgeBurnV1>(&decoded->payload)};
         if (burn != nullptr && burn->registry_id == *launch_id) return true;
@@ -3365,8 +3434,9 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
                 request.entry > static_cast<uint8_t>(
                                     Consensus::BridgeV2EntryRole::SUCCESSOR) ||
                 (request.sweep &&
-                 request.entry != static_cast<uint8_t>(
-                                      Consensus::BridgeV2EntryRole::LAUNCH)) ||
+                 (request.entry != static_cast<uint8_t>(
+                                       Consensus::BridgeV2EntryRole::LAUNCH) ||
+                  request.exit)) ||
                 total > MAX_MONEY - amount ||
                 (request.sweep && swept > MAX_MONEY - amount)) {
                 error = "bridge delta contains an invalid V2 withdrawal";

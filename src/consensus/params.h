@@ -109,8 +109,43 @@ struct FreshLineageParams {
     //! B-7 staging signer: the V1 single-vote signer additionally signs
     //! digest V2 for this lineage. Regtest only; never true on mainnet.
     bool staging_signer{false};
+    //! R_key (B-37; finality dependency section 6.4): from this height the
+    //! fresh lineage's committees sit only on independent per-epoch BLS keys
+    //! bound under their own binding kind, never on V1 FINALITY_KEY
+    //! bindings. Unset means the staging lineage keeps signing with the V1
+    //! keys (the pre-B-37 behaviour). When set, 1 <= R_key <= R_f - 2 and
+    //! R_key lies above the legacy final height. Regtest's
+    //! -b3freshkeyheight is the only setter.
+    std::optional<int> key_height;
 
     constexpr int GenesisHeight() const { return activation_height - 1; }
+    //! True when the lineage uses B-37 per-epoch keys.
+    bool FreshKeysEnabled() const { return key_height.has_value(); }
+};
+
+/**
+ * H1 producer rotation (bridge V2 finality dependency section 5.1, FD-2;
+ * owner ruling R8). From R_h the block-producer set no longer follows V1
+ * certificate handovers: it rotates every E = ModernPosParams::
+ * finality_epoch_blocks blocks on a fixed schedule from R_h, using V1's
+ * Snapshot rule, binding requirement and minimum-set carry-over, with no
+ * certificate needed. A block whose consensus-checked round is at least
+ * R_escape takes its weights from Snapshot(parent) and restarts the
+ * schedule at its height (the 24 h escape). The V1 finality lineage,
+ * certificates and checkpoint authority are unchanged.
+ *
+ * Unset on every shipped network: mainnet and test networks have no R_h
+ * until a reviewed release pins one after the owner's ruling. Regtest sets
+ * it solely through the -b3h1height and -b3h1escaperounds startup knobs.
+ */
+struct H1Params {
+    //! R_escape on mainnet's 30 s rounds: 24 hours (FD-2).
+    static constexpr int64_t DEFAULT_ESCAPE_ROUNDS{2'880};
+    //! R_h: first height whose producer set comes from the H1 schedule.
+    //! Always above the first modern-PoS height M.
+    int activation_height{0};
+    //! R_escape: the smallest consensus-checked round of an escape block.
+    int64_t escape_rounds{DEFAULT_ESCAPE_ROUNDS};
 };
 
 /**
@@ -284,6 +319,33 @@ struct Params {
     {
         return fresh_lineage && height >= fresh_lineage->activation_height;
     }
+    //! True from R_key on a chain whose fresh lineage uses B-37 per-epoch
+    //! keys: the fresh binding kind is valid and counts from here. False at
+    //! every height on every shipped network.
+    bool FreshKeyRulesActive(int height) const
+    {
+        return fresh_lineage && fresh_lineage->key_height &&
+               height >= *fresh_lineage->key_height;
+    }
+    /**
+     * H1 producer rotation (H1Params above). Unset means producers follow
+     * the V1 finality set at every height; only regtest's -b3h1height knob
+     * sets it.
+     */
+    std::optional<H1Params> h1;
+    //! True from R_h on a chain that configures H1. False at every height
+    //! on every shipped network.
+    bool H1RulesActive(int height) const
+    {
+        return h1 && height >= h1->activation_height;
+    }
+    //! True when a block at `height` with consensus-checked round `round`
+    //! is an H1 escape block (round >= R_escape from R_h). A missing round
+    //! is never an escape.
+    bool H1EscapeRound(int height, std::optional<int64_t> round) const
+    {
+        return H1RulesActive(height) && round && *round >= h1->escape_rounds;
+    }
     /**
      * Bridge V2 regime (BridgeV2Params in consensus/bridge_params.h). Unset
      * on every shipped network, which keeps every V2 rule inactive; only the
@@ -318,6 +380,17 @@ struct Params {
     {
         return BridgeV2RulesActive(height) && bridge_v2->successor &&
                height >= bridge_v2->successor->migration_height;
+    }
+    //! Owner ruling R10 (OI-8): true from the sponsored sighash pin (>= V)
+    //! on a chain whose complete envelope sets it; a bridge V2 kind 6 burn
+    //! is then script-checked under SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS
+    //! (node::BridgeV2SponsoredSighashAllowed). Never true on a network that
+    //! leaves bridge_v2 or the pin unset.
+    bool BridgeV2SponsoredSighashActive(int height) const
+    {
+        return BridgeV2RulesActive(height) &&
+               bridge_v2->sponsored_sighash_height &&
+               height >= *bridge_v2->sponsored_sighash_height;
     }
     /**
      * TEST-ONLY override of the historical FN disintegration collateral

@@ -406,6 +406,69 @@ CChainParams::B3RegTestBridgePins::V2Section::SuccessorSection ParseBridgePinsV2
 }
 
 /**
+ * A forwarder factory address (`v2.deposit_forwarder.factory` or
+ * `v2.exit_forwarder.factory`): non-zero and a contract of its own, never
+ * v2.vault, v2.token, v2.verifier or a pinned successor vault.
+ */
+Consensus::BridgeEthAddress GetBridgePinsForwarderFactory(
+    const UniValue& object, const std::string& where,
+    const CChainParams::B3RegTestBridgePins::V2Section& v2)
+{
+    const Consensus::BridgeEthAddress factory{GetBridgePinsHex<20>(object, where, "factory")};
+    if (Consensus::BridgeAddressIsNull(factory)) {
+        ThrowInvalidBridgePins(strprintf("%s.factory must be non-zero", where));
+    }
+    if (factory == v2.vault || factory == v2.token || factory == v2.verifier ||
+        (v2.successor && factory == v2.successor->vault)) {
+        ThrowInvalidBridgePins(strprintf("%s.factory must differ from v2.vault, v2.token, v2.verifier "
+                                         "and v2.successor.vault", where));
+    }
+    return factory;
+}
+
+/**
+ * The optional `v2.deposit_forwarder` object (route (b); node changes
+ * section 3.1, contracts spec section 7): the B3DepositForwarderFactory
+ * address and its FORWARDER_INIT_CODE_HASH, raw EVM bytes as
+ * token_runtime_code_hash. Both are DeployV2 outputs knowable before the
+ * first start (the factory is the deployer's CREATE address at nonce n+4,
+ * the hash comes from the forge artifact), so the init.cpp record guard
+ * freezes them with v (OI-3). Derivation only, never a mint condition.
+ */
+CChainParams::B3RegTestBridgePins::V2Section::DepositForwarderSection ParseBridgePinsV2DepositForwarder(
+    const UniValue& object, const CChainParams::B3RegTestBridgePins::V2Section& v2)
+{
+    const std::string where{"v2.deposit_forwarder"};
+    CheckBridgePinsKeys(object, where, {"factory", "init_code_hash"});
+    CChainParams::B3RegTestBridgePins::V2Section::DepositForwarderSection section;
+    section.factory = GetBridgePinsForwarderFactory(object, where, v2);
+    section.init_code_hash = GetBridgePinsHash(object, where, "init_code_hash");
+    return section;
+}
+
+/**
+ * The optional `v2.exit_forwarder` object (route (d3); node changes
+ * sections 3.1 and 7.2, contracts spec section 8): the B3OftExitFactory
+ * address (deployer nonce n+5), its FORWARDER_INIT_CODE_HASH (raw EVM bytes)
+ * and its immutable DST_EID, the LayerZero endpoint id every exit block must
+ * name. The EXIT_TAG is a protocol constant, not a key.
+ */
+CChainParams::B3RegTestBridgePins::V2Section::ExitForwarderSection ParseBridgePinsV2ExitForwarder(
+    const UniValue& object, const CChainParams::B3RegTestBridgePins::V2Section& v2)
+{
+    const std::string where{"v2.exit_forwarder"};
+    CheckBridgePinsKeys(object, where, {"factory", "init_code_hash", "dst_eid"});
+    CChainParams::B3RegTestBridgePins::V2Section::ExitForwarderSection section;
+    section.factory = GetBridgePinsForwarderFactory(object, where, v2);
+    section.init_code_hash = GetBridgePinsHash(object, where, "init_code_hash");
+    section.dst_eid = GetBridgePinsUInt<uint32_t>(object, where, "dst_eid");
+    if (section.dst_eid == 0) {
+        ThrowInvalidBridgePins(strprintf("%s.dst_eid must be non-zero", where));
+    }
+    return section;
+}
+
+/**
  * The bridge V2 section (node changes sections 3.1-3.3 and 12.2): one anvil
  * Vault V2 entry, its fresh light-client store and the Verifier V2 member
  * bounds, plus V and W2. OI-3: only values knowable before the chain first
@@ -415,7 +478,11 @@ CChainParams::B3RegTestBridgePins::V2Section::SuccessorSection ParseBridgePinsV2
  * deployment parameter fixed in advance and may be named
  * (verifier_max_epoch_lag); RegTest() requires it to equal the gate's set
  * expiry. An optional `successor` object pins a B-23 successor vault
- * (ParseBridgePinsV2Successor).
+ * (ParseBridgePinsV2Successor); optional `deposit_forwarder` and
+ * `exit_forwarder` objects pin the route (b) and (d3) forwarder factories
+ * (ParseBridgePinsV2DepositForwarder, ParseBridgePinsV2ExitForwarder). An
+ * optional `sponsored_sighash_height` (>= V) turns on owner ruling R10's
+ * sponsored sighash rule for kind 6 burns; without it the rule stays off.
  */
 CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v2)
 {
@@ -426,7 +493,7 @@ CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v
                          "verifier", "min_bridge_validators", "max_bridge_validators",
                          "min_bridge_total_weight", "activation_height"},
                         {"burn_height", "max_per_block", "max_per_epoch", "verifier_max_epoch_lag",
-                         "successor"});
+                         "successor", "deposit_forwarder", "exit_forwarder", "sponsored_sighash_height"});
 
     CChainParams::B3RegTestBridgePins::V2Section section;
     CheckBridgePinsChainId(v2, v2_where);
@@ -481,6 +548,15 @@ CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v
         }
         section.burn_height = static_cast<int>(burn_height);
     }
+    if (!v2.find_value("sponsored_sighash_height").isNull()) {
+        const uint32_t sponsored{GetBridgePinsUInt<uint32_t>(v2, v2_where, "sponsored_sighash_height")};
+        if (sponsored < activation_height || sponsored > max_height) {
+            ThrowInvalidBridgePins(strprintf(
+                "%s.sponsored_sighash_height (%u) must be between activation_height (%u) and %u",
+                v2_where, sponsored, activation_height, max_height));
+        }
+        section.sponsored_sighash_height = static_cast<int>(sponsored);
+    }
     if (!v2.find_value("verifier_max_epoch_lag").isNull()) {
         const uint32_t lag{GetBridgePinsUInt<uint32_t>(v2, v2_where, "verifier_max_epoch_lag")};
         if (lag == 0) ThrowInvalidBridgePins(strprintf("%s.verifier_max_epoch_lag must be positive", v2_where));
@@ -489,6 +565,18 @@ CChainParams::B3RegTestBridgePins::V2Section ParseBridgePinsV2(const UniValue& v
     // A present successor key must be an object; JSON null is not "absent".
     if (v2.exists("successor")) {
         section.successor = ParseBridgePinsV2Successor(v2.find_value("successor"), section);
+    }
+    // Forwarder factories, after the successor so that neither may sit on
+    // v'; present keys must be objects as well.
+    if (v2.exists("deposit_forwarder")) {
+        section.deposit_forwarder = ParseBridgePinsV2DepositForwarder(v2.find_value("deposit_forwarder"), section);
+    }
+    if (v2.exists("exit_forwarder")) {
+        section.exit_forwarder = ParseBridgePinsV2ExitForwarder(v2.find_value("exit_forwarder"), section);
+    }
+    if (section.deposit_forwarder && section.exit_forwarder &&
+        section.deposit_forwarder->factory == section.exit_forwarder->factory) {
+        ThrowInvalidBridgePins("v2.deposit_forwarder.factory and v2.exit_forwarder.factory must differ");
     }
     return section;
 }
@@ -543,9 +631,11 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
           args.GetBoolArg("-b3flowmeshtest", false))) {
         throw std::runtime_error("-b3bridgepins requires -b3modernregtest and -b3flowmeshtest (regtest-only)");
     }
-    // Fresh finality lineage knobs (bridge V2 regtest plan section 3.3):
-    // like -b3bridgepins they only ever apply to the FlowMesh regtest.
-    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension"}) {
+    // Fresh finality lineage knobs (bridge V2 regtest plan section 3.3) and
+    // the H1/H2 chain-health knobs (finality dependency section 5): like
+    // -b3bridgepins they only ever apply to the FlowMesh regtest.
+    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension", "-b3freshkeyheight",
+                             "-b3h1height", "-b3h1escaperounds", "-b3h2checkpoint"}) {
         if (args.IsArgSet(knob) &&
             !(args.GetBoolArg("-b3modernregtest", false) &&
               args.GetBoolArg("-b3flowmeshtest", false))) {
@@ -609,6 +699,26 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
         }};
         read_fresh("-b3freshlineageheight", 2, b3.fresh_lineage_height);
         read_fresh("-b3freshmaxepochextension", 1, b3.fresh_max_epoch_extension);
+        // B-37 per-epoch keys from R_key; RegTest() bounds it by R_f.
+        read_fresh("-b3freshkeyheight", 1, b3.fresh_key_height);
+        // H1 producer rotation from R_h with the R_escape escape (finality
+        // dependency section 5.1, FD-2); RegTest() requires R_h > M and
+        // bounds R_escape.
+        read_fresh("-b3h1height", 2, b3.h1_height);
+        if (args.IsArgSet("-b3h1escaperounds")) {
+            b3.h1_escape_rounds = args.GetIntArg("-b3h1escaperounds", 0);
+        }
+        // H2 hardened modern checkpoints (finality dependency section 5.3):
+        // repeatable <height>:<block hash>, the hash in display order.
+        for (const std::string& pin : args.GetArgs("-b3h2checkpoint")) {
+            const auto colon{pin.find(':')};
+            const auto height{colon == std::string::npos ? std::nullopt : ToIntegral<int>(std::string_view{pin}.substr(0, colon))};
+            const auto hash{colon == std::string::npos ? std::nullopt : uint256::FromHex(std::string_view{pin}.substr(colon + 1))};
+            if (!height || *height < 1 || !hash) {
+                throw std::runtime_error(strprintf("Invalid -b3h2checkpoint=%s: expected <height>:<block hash>", pin));
+            }
+            b3.h2_checkpoints.emplace_back(*height, *hash);
+        }
         options.b3_modern = b3;
     }
     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
@@ -691,7 +801,10 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
     }
     // The fresh finality lineage knobs likewise configure the regtest
     // staging lineage only; every other network leaves fresh_lineage unset.
-    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension"}) {
+    // The H1/H2 chain-health knobs too: no other network sets h1 or adds a
+    // modern checkpoint through them.
+    for (const char* knob : {"-b3freshlineageheight", "-b3freshmaxepochextension", "-b3freshkeyheight",
+                             "-b3h1height", "-b3h1escaperounds", "-b3h2checkpoint"}) {
         if (chain != ChainType::REGTEST && args.IsArgSet(knob)) {
             throw std::runtime_error(strprintf("%s is regtest-only", knob));
         }

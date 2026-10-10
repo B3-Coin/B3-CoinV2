@@ -6,7 +6,7 @@
     "Block hashes, the vault, recipient and the 0x11 asset id are stand-ins.",
     "set_header_v2 reuses the real BLS key of contracts/test/BlsCertificateVector.t.sol with ruleset 2.",
     "history.roots[k] is the depth-32 root over leaves 0..k-1; roots[0] is the empty root zero_32.",
-    "F_d and F_x address vectors are added with the forwarder slice.",
+    "forwarder_v2 factories, vaults, recipients, init_code_hash (keccak256 of \"B3-VECTORS/forwarder-init-code\") and EOAs other than anvil dev accounts 0 and 1 are stand-ins.",
     "bootstrap_attestation_v2 verifiers and the storage_layout_v2 owner, upgraded token and vault are stand-ins."
   ],
   "tags": {
@@ -935,6 +935,170 @@
         "key": "0x2222222222222222222222222222222222222222",
         "slot": 6,
         "storage_key": "0x0a3e3a135c9eb9a4f916a39edbe9cf899cba91b2a6ec56f43a0ae8ee4b3185de"
+      }
+    ]
+  },
+  "forwarder_v2": {
+    "tags": {
+      "deposit": "0xcc2b88b5788e6a3d2f51c52fcb908e55a5386859799df6e4878912fdb1b01d2a",
+      "exit": "0x0fdc29b9af6b10d38ef4781cb890c8a6d762464db73cc2f5800457cdf07b4c87"
+    },
+    "init_code_hash": "0x6278af86459e0481b5e9f1f02566368936967234f7930022c721a1b3ae94bf57",
+    "pinned_dst_eid": 30110,
+    "deposit": [
+      {
+        "name": "launch_default",
+        "factory": "0xc28c473e2372beff1aea4815f8e834cd432ce26b",
+        "vault": "0xf501296ff4a14d49fd013ed3b2bbcbe58835ac20",
+        "b3_recipient": "0x000000000000000000000001c715244f7680c260cb1c281abb084f83e4f80619",
+        "refund_eoa": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "fee_cap": 15000000,
+        "not_after": 1794000000,
+        "salt_preimage": "0xcc2b88b5788e6a3d2f51c52fcb908e55a5386859799df6e4878912fdb1b01d2a000000000000000000000000f501296ff4a14d49fd013ed3b2bbcbe58835ac20000000000000000000000001c715244f7680c260cb1c281abb084f83e4f80619000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb922660000000000000000000000000000000000000000000000000000000000e4e1c0000000000000000000000000000000000000000000000000000000006aee4480",
+        "salt": "0xa00ff3a3bc3fab361627ddbf9c79432bba8e17343461d76c97a77b9ffe48557f",
+        "account": "0xe0003afdc9d2314620c6ca0c332fc684db971e10"
+      },
+      {
+        "name": "u64_max_fee_cap",
+        "factory": "0xc28c473e2372beff1aea4815f8e834cd432ce26b",
+        "vault": "0xf501296ff4a14d49fd013ed3b2bbcbe58835ac20",
+        "b3_recipient": "0x000000000000000000000001f6e92f31603af95b13935011c487dfb0cc586d3b",
+        "refund_eoa": "0x2346ee195ebe1e77a97e34cf8203325d43861b07",
+        "fee_cap": 18446744073709551615,
+        "not_after": 1,
+        "salt_preimage": "0xcc2b88b5788e6a3d2f51c52fcb908e55a5386859799df6e4878912fdb1b01d2a000000000000000000000000f501296ff4a14d49fd013ed3b2bbcbe58835ac20000000000000000000000001f6e92f31603af95b13935011c487dfb0cc586d3b0000000000000000000000002346ee195ebe1e77a97e34cf8203325d43861b07000000000000000000000000000000000000000000000000ffffffffffffffff0000000000000000000000000000000000000000000000000000000000000001",
+        "salt": "0x1f61b798c865a5acfe399f39021969732f687209855256975dbd094947e29f29",
+        "account": "0x926002b611b2f51cfd92d7dba6cd71a646432454"
+      },
+      {
+        "name": "successor_zero_fee_cap",
+        "factory": "0xce5df53b7cd69e70fe7fc79ac5bfcb3d660d9472",
+        "vault": "0x80837dc936abb39a4fb447a067499c088860c336",
+        "b3_recipient": "0x0000000000000000000000011098a898cea7532efbc986de32fff315660013fe",
+        "refund_eoa": "0x42ce6d213350f9ddc34c77ecad375d9225821781",
+        "fee_cap": 0,
+        "not_after": 18446744073709551615,
+        "salt_preimage": "0xcc2b88b5788e6a3d2f51c52fcb908e55a5386859799df6e4878912fdb1b01d2a00000000000000000000000080837dc936abb39a4fb447a067499c088860c3360000000000000000000000011098a898cea7532efbc986de32fff315660013fe00000000000000000000000042ce6d213350f9ddc34c77ecad375d92258217810000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffffffffffffffff",
+        "salt": "0x6618ecab3fba5571cfac1ead40a87c10913da3fe2f51e5a0ba1eabf1852e81f3",
+        "account": "0xd89fa4675a3dafc8dc699e213f53b35bf2d3941b"
+      }
+    ],
+    "exit": [
+      {
+        "name": "arbitrum_default",
+        "factory": "0xffaa7bb40fa5d2ef12e5f9e78a3817155e15610c",
+        "dst_eid": 30110,
+        "to": "0x000000000000000000000000944db6d25977dbda8cbb4694b85a9e568d62dbfd",
+        "max_bridge_fee_bps": 0,
+        "fee_cap": 3000000,
+        "refund_eoa": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "is_valid": true,
+        "salt_preimage": "0x0fdc29b9af6b10d38ef4781cb890c8a6d762464db73cc2f5800457cdf07b4c87000000000000000000000000000000000000000000000000000000000000759e000000000000000000000000944db6d25977dbda8cbb4694b85a9e568d62dbfd000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002dc6c0000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "salt": "0x071ac7ffa96bacd92528bfd633ded7ef85daca529f36b4502b69af45bb331090",
+        "account": "0x1b7a56fb16009b1c9d27edc96452e1ac2241f118"
+      },
+      {
+        "name": "arbitrum_max_bps_u64_fee_cap",
+        "factory": "0xffaa7bb40fa5d2ef12e5f9e78a3817155e15610c",
+        "dst_eid": 30110,
+        "to": "0x000000000000000000000000502190d499de05e0f75db1bf02a34b42a608b0b1",
+        "max_bridge_fee_bps": 50,
+        "fee_cap": 18446744073709551615,
+        "refund_eoa": "0xd51b1155903e20ac5f9d666951c317dfed630f41",
+        "is_valid": true,
+        "salt_preimage": "0x0fdc29b9af6b10d38ef4781cb890c8a6d762464db73cc2f5800457cdf07b4c87000000000000000000000000000000000000000000000000000000000000759e000000000000000000000000502190d499de05e0f75db1bf02a34b42a608b0b10000000000000000000000000000000000000000000000000000000000000032000000000000000000000000000000000000000000000000ffffffffffffffff000000000000000000000000d51b1155903e20ac5f9d666951c317dfed630f41",
+        "salt": "0x0c0d12cd8a15a9ccf3b66c41d4ce661e86d3773bff04cb3adb0229bd8327685c",
+        "account": "0xb2ca5b929a0de10381784fa9f849b0f66ad4cd98"
+      },
+      {
+        "name": "ethereum_eid_zero_fee_cap",
+        "factory": "0x3960797ff693c2cdff0248b779ea7010d0859b02",
+        "dst_eid": 30101,
+        "to": "0x000000000000000000000000fcdb59f9cc095bc1c5809fa648f91bde103347ad",
+        "max_bridge_fee_bps": 25,
+        "fee_cap": 0,
+        "refund_eoa": "0xe0dc39242a2b335954701a70534232bf7b0ac46e",
+        "is_valid": false,
+        "salt_preimage": "0x0fdc29b9af6b10d38ef4781cb890c8a6d762464db73cc2f5800457cdf07b4c870000000000000000000000000000000000000000000000000000000000007595000000000000000000000000fcdb59f9cc095bc1c5809fa648f91bde103347ad00000000000000000000000000000000000000000000000000000000000000190000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e0dc39242a2b335954701a70534232bf7b0ac46e",
+        "salt": "0x9394f5b2118c8fe787fcb3171cdbdadb197fad4d18d3ff70bbae4ec5b7e84f16",
+        "account": "0x379d29ea09d786e4c5ca010780212357cedb0345"
+      }
+    ],
+    "refund_eoa_message": [
+      {
+        "name": "regtest",
+        "chain_domain": "0x1a3405424a805d6b95600c5b7598af38b1f8f3ba25bdb2636500c76ad3f43879",
+        "refund_eoa": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "message": "B3 bridge V2 refund EOA\nchain domain: 0x1a3405424a805d6b95600c5b7598af38b1f8f3ba25bdb2636500c76ad3f43879\nrefund EOA: 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "eip191_digest": "0x1028445d867b38ad8f5cd49033551ba8db6f985be984cefb38e36cc57dadda59",
+        "signature": "0xa3000ca3798b9de067a8f029e2ff2420a16a790042a9f67d7c166d583782316c2f08e9f568da67c99585920b84935688a44357bf0cce08a77a17f1de9e332c751b"
+      },
+      {
+        "name": "mainnet",
+        "chain_domain": "0xa651262ae9031646047f290513d77ccae0fa9bd4e5afe7e07155a08d5dd1486a",
+        "refund_eoa": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+        "message": "B3 bridge V2 refund EOA\nchain domain: 0xa651262ae9031646047f290513d77ccae0fa9bd4e5afe7e07155a08d5dd1486a\nrefund EOA: 0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+        "eip191_digest": "0xe22a982f59ce436654b7a0b3769bcf5683149bbc3ed65639d22f4c86c74dfebb",
+        "signature": "0x8f7e5401ac3a4170c62f5c573f4bca418d25da232d07d00ea87b5ac6c67e98e21b61fd792cc0bda0ed6ab2dbddf3270be53f3876ca7ea97cadfbfc8cd97d1c8f1c"
+      }
+    ],
+    "burn_exit_block": [
+      {
+        "exit_case": 0,
+        "recipient": "0x1b7a56fb16009b1c9d27edc96452e1ac2241f118",
+        "fields": {
+          "exit_version": 1,
+          "dst_eid": 30110,
+          "to": "0x000000000000000000000000944db6d25977dbda8cbb4694b85a9e568d62dbfd",
+          "max_bridge_fee_bps": 0,
+          "fee_cap": 3000000,
+          "refund_eoa": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        },
+        "encoded": "0x010000759e000000000000000000000000944db6d25977dbda8cbb4694b85a9e568d62dbfd000000000000002dc6c0f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+      },
+      {
+        "exit_case": 1,
+        "recipient": "0xb2ca5b929a0de10381784fa9f849b0f66ad4cd98",
+        "fields": {
+          "exit_version": 1,
+          "dst_eid": 30110,
+          "to": "0x000000000000000000000000502190d499de05e0f75db1bf02a34b42a608b0b1",
+          "max_bridge_fee_bps": 50,
+          "fee_cap": 18446744073709551615,
+          "refund_eoa": "0xd51b1155903e20ac5f9d666951c317dfed630f41"
+        },
+        "encoded": "0x010000759e000000000000000000000000502190d499de05e0f75db1bf02a34b42a608b0b10032ffffffffffffffffd51b1155903e20ac5f9d666951c317dfed630f41"
+      },
+      {
+        "exit_case": 2,
+        "recipient": "0x379d29ea09d786e4c5ca010780212357cedb0345",
+        "fields": {
+          "exit_version": 1,
+          "dst_eid": 30101,
+          "to": "0x000000000000000000000000fcdb59f9cc095bc1c5809fa648f91bde103347ad",
+          "max_bridge_fee_bps": 25,
+          "fee_cap": 0,
+          "refund_eoa": "0xe0dc39242a2b335954701a70534232bf7b0ac46e"
+        },
+        "encoded": "0x0100007595000000000000000000000000fcdb59f9cc095bc1c5809fa648f91bde103347ad00190000000000000000e0dc39242a2b335954701a70534232bf7b0ac46e"
+      }
+    ],
+    "deposit_fee_cap": [
+      {
+        "fee_per_tx": 1,
+        "fee_cap": 4
+      },
+      {
+        "fee_per_tx": 1000000,
+        "fee_cap": 4000000
+      },
+      {
+        "fee_per_tx": 2500000,
+        "fee_cap": 10000000
+      },
+      {
+        "fee_per_tx": 4611686018427387903,
+        "fee_cap": 18446744073709551612
       }
     ]
   }

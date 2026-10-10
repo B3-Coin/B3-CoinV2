@@ -44,8 +44,10 @@
 #include <modern/mpa.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
+#include <modern/finality_fresh_key.h>
 #include <modern/payload_root.h>
 #include <node/finality_binding_index.h>
+#include <node/finality_fresh_key_index.h>
 #include <node/flowmesh_vault_index.h>
 #include <node/flowmesh_checkpoint_index.h>
 #include <node/fn_seat_index.h>
@@ -876,6 +878,11 @@ private:
         std::vector<bool> m_flowmesh_vault_authorized;
         /** Exact managed-v1 bridge authorization was established in PreChecks. */
         bool m_bridge_withdrawal{false};
+        /** Owner ruling R10: the bridge withdrawal is a bridge V2 kind 6 burn
+         * from the sponsored sighash pin (>= V), checked under
+         * SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS
+         * (node::BridgeV2SponsoredSighashAllowed). Implies m_bridge_withdrawal. */
+        bool m_bridge_sponsored_sighash{false};
     };
 
     // Run the policy checks on a given transaction, excluding any script checks.
@@ -1072,6 +1079,17 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-finality-key-binding", bind_error);
             }
         }
+        // B-37 fresh per-epoch key bindings (FINALITY_KEY policy version 2 +
+        // MPA type 12): the same exact bijection, on their own objects. A
+        // transaction without them is untouched; on a chain without R_key
+        // they were already refused above as an inactive cell / MPA type.
+        std::vector<modern::FreshFinalityKeyPair> fresh_pairs;
+        {
+            std::string bind_error;
+            if (!modern::MatchFreshFinalityKeyPairs(tx, fresh_pairs, bind_error)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-fresh-finality-key-binding", bind_error);
+            }
+        }
         if (tx.HasMpa()) {
             // Relayable MPA: FINALITY_KEY evidence, activated asset/FN
             // declarations, and activated FlowMesh seat bindings have a
@@ -1101,7 +1119,9 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                     !(rec.payload_type == bridge::BRIDGE_MPA_TYPE &&
                       Consensus::BridgeRulesActive(
                           next_block_height,
-                          m_active_chainstate.m_chainman.GetConsensus()))) {
+                          m_active_chainstate.m_chainman.GetConsensus())) &&
+                    !(rec.payload_type == modern::MPA_TYPE_FRESH_FINALITY_KEY_EVIDENCE &&
+                      m_active_chainstate.m_chainman.GetConsensus().FreshKeyRulesActive(next_block_height))) {
                     return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "mpa-mempool-unsupported");
                 }
             }
@@ -1132,6 +1152,63 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                     if (check != modern::FinalityKeyCheck::OK) {
                         return state.Invalid(TxValidationResult::TX_NOT_STANDARD,
                                              std::string{"finality-key-"} + modern::FinalityKeyCheckName(check));
+                    }
+                }
+            }
+            if (!fresh_pairs.empty()) {
+                // B-37 fresh bindings: structure + cryptography only, the
+                // same context-free rule ConnectBlock enforces, so a failure
+                // can never be mined (TX_CONSENSUS). Key reuse, binding
+                // windows and seats are not block-invalidating and are left
+                // to the node-side fresh key index.
+                const Consensus::Params& consensus{m_active_chainstate.m_chainman.GetConsensus()};
+                const auto domain{consensus.legacy_final_hash
+                                      ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+                                      : std::nullopt};
+                if (!domain) {
+                    return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "finality-key-domain-unpinned");
+                }
+                for (const auto& pair : fresh_pairs) {
+                    const auto check{modern::CheckFreshKeyTransition(*domain, pair.commitment, pair.params,
+                                                                     pair.evidence)};
+                    if (check != modern::FreshKeyCheck::OK) {
+                        return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                             std::string{"fresh-key-"} + modern::FreshKeyCheckName(check));
+                    }
+                }
+                // B-37 node policy (finality dependency section 6.4 rules
+                // (1)-(3); regtest -b3freshkeyheight only): a key ever bound
+                // under either kind, or a target the next block's window does
+                // not count, would be mined inert. Not block-invalidating, so
+                // TX_NOT_STANDARD, like the V1 semantic pre-check.
+                if (node::FreshKeyModeConfigured(consensus)) {
+                    const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
+                    const node::BridgeStateIndex* bridge_index{nullptr};
+                    bool available{tip != nullptr};
+                    if (available && Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+                        node::BridgeStateTracker& bridge{m_active_chainstate.ModernBridgeState()};
+                        available = bridge.Sync(m_active_chainstate.m_chain, m_active_chainstate.m_blockman,
+                                                consensus, *tip);
+                        if (available) bridge_index = &bridge.Index();
+                    }
+                    node::FinalityTracker& finality{m_active_chainstate.ModernFinality()};
+                    const node::FreshKeyBindingIndex* fresh_keys{
+                        available && finality.Sync(m_active_chainstate.m_chain, m_active_chainstate.m_blockman,
+                                                   consensus, *tip, bridge_index)
+                            ? finality.FreshKeys(consensus)
+                            : nullptr};
+                    if (!fresh_keys) {
+                        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "fresh-key-state-unavailable");
+                    }
+                    std::optional<node::FreshLineageState> projected;
+                    if (consensus.FreshLineageRulesActive(next_block_height)) {
+                        projected = finality.Projected(next_block_height, consensus).fresh;
+                    }
+                    const node::FreshBindingWindow window{
+                        node::FreshBindingWindowAt(next_block_height, consensus, projected)};
+                    if (std::string policy_reason;
+                        !node::CheckFreshKeyBindingPolicy(tx, fresh_pairs, *fresh_keys, window, policy_reason)) {
+                        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, policy_reason);
                     }
                 }
             }
@@ -1421,6 +1498,9 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                     authorization.mint->authorization.amount};
             }
             ws.m_bridge_withdrawal = authorization.HasWithdrawal();
+            ws.m_bridge_sponsored_sighash =
+                node::BridgeV2SponsoredSighashAllowed(
+                    authorization, consensus, next_block_height);
         }
         std::optional<uint32_t> fn_pod_issued;
         if (modern::HasModernFnPodDeclaration(tx)) {
@@ -1787,7 +1867,12 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     const CTransaction& tx = *ws.m_ptx;
     TxValidationState& state = ws.m_state;
 
-    constexpr script_verify_flags scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
+    // Owner ruling R10: a bridge V2 burn from the sponsored sighash pin is
+    // checked under the sponsored form of the bridge sighash rule.
+    const script_verify_flags scriptVerifyFlags{
+        ws.m_bridge_sponsored_sighash
+            ? STANDARD_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS
+            : STANDARD_SCRIPT_VERIFY_FLAGS};
 
     // MODERN-era admission may spend pre-H legacy coins: frozen legacy rules
     // for exactly those inputs, at policy time as well, so a spend that is
@@ -1860,9 +1945,13 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     const bool next_block_legacy{
         Consensus::GetB3Era(m_active_chainstate.m_chain.Height() + 1, m_active_chainstate.m_chainman.GetConsensus()) ==
         Consensus::B3Era::LEGACY};
-    const script_verify_flags currentBlockScriptVerifyFlags{
+    script_verify_flags currentBlockScriptVerifyFlags{
         next_block_legacy ? LEGACY_BLOCK_SCRIPT_FLAGS
                           : GetModernBlockScriptFlags(*m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman)};
+    if (ws.m_bridge_sponsored_sighash) {
+        // Owner ruling R10, as in PolicyScriptChecks and ConnectBlock.
+        currentBlockScriptVerifyFlags |= SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS;
+    }
     std::optional<LegacyLockSpendContext> legacy_lock_context;
     if (!next_block_legacy && m_active_chainstate.m_chainman.GetConsensus().legacy_b3coin) {
         if (const std::optional<int> H{Consensus::LegacyFinalHeight(m_active_chainstate.m_chainman.GetConsensus())}) {
@@ -2685,7 +2774,8 @@ bool Chainstate::ReorgFromForkViolatesFinality(const int fork_height) const
 
 std::optional<std::pair<CAmount, CAmount>> Chainstate::ModernEligibilityWeights(
     const std::optional<std::array<unsigned char, 32>>& validator_key,
-    const CBlockIndex& parent)
+    const CBlockIndex& parent,
+    const std::optional<int64_t> round)
 {
     AssertLockHeld(::cs_main);
     const Consensus::Params& consensus{m_chainman.GetConsensus()};
@@ -2700,7 +2790,12 @@ std::optional<std::pair<CAmount, CAmount>> Chainstate::ModernEligibilityWeights(
     node::FinalityTracker& finality{ModernFinality()};
     if (!finality.Sync(m_chain, m_blockman, consensus, parent,
                        bridge_index)) return std::nullopt;
-    const auto set{finality.SetInForceAt(parent.nHeight + 1, consensus)};
+    // H1 (regtest knob only): a producer schedule the tracker cannot derive
+    // is an error, never an ineligible validator.
+    if (!finality.ProducerScheduleAvailable(parent.nHeight + 1, consensus)) return std::nullopt;
+    // From R_h a round >= R_escape selects the escape set Snapshot(parent);
+    // below R_h (and without H1) the round is ignored.
+    const auto set{finality.SetInForceAt(parent.nHeight + 1, consensus, round)};
     if (!set) return std::make_pair(CAmount{0}, CAmount{0});
     const auto index{validator_key ? set->IndexOf(*validator_key) : std::nullopt};
     const CAmount w{index ? static_cast<CAmount>(set->Members()[*index].weight) : CAmount{0}};
@@ -2963,12 +3058,26 @@ static bool CheckInputScriptsWithFlowMeshVaults(
     const bool require_bridge_sighash_all)
 {
     if (tx.IsCoinBase()) return true;
-    if (require_bridge_sighash_all) {
+    // Owner ruling R10 (OI-8): a caller selects the sponsored form of the
+    // bridge rule for a bridge V2 kind 6 burn by passing
+    // SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS in `flags`
+    // (node::BridgeV2SponsoredSighashAllowed). Every signature must then
+    // still commit every output (SIGHASH_ALL or
+    // SIGHASH_ALL|SIGHASH_ANYONECANPAY). That flag alone selects it, with or
+    // without require_bridge_sighash_all, so the cache key below, which
+    // commits `flags`, fully determines the rule applied to every input.
+    if (require_bridge_sighash_all &&
+        !(flags & SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS)) {
         // This marker participates in the full-script cache key below. The
         // transaction-specific bridge rule can therefore never reuse an
         // ordinary-spend cache approval for the same witness transaction.
         flags |= SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL;
     }
+    // The bridge rule `flags` now carries binds every input, a frozen
+    // legacy-lock input included.
+    const script_verify_flags bridge_rule{
+        flags & (SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL |
+                 SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS)};
     if (flowmesh_vault_authorized != nullptr &&
         flowmesh_vault_authorized->size() != tx.vin.size()) {
         return state.Invalid(TxValidationResult::TX_CONSENSUS,
@@ -3061,12 +3170,11 @@ static bool CheckInputScriptsWithFlowMeshVaults(
         // rule set, every other input the caller's flags.
         script_verify_flags input_flags{
             (legacy_lock && legacy_input[i]) ? legacy_lock->legacy_flags : flags};
-        if (require_bridge_sighash_all) {
-            // A managed withdrawal may also use a sealed-era native input for
-            // fees. Keep its frozen script rules, but never let that selection
-            // remove the withdrawal's full-transaction signature binding.
-            input_flags |= SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL;
-        }
+        // A bridge withdrawal may also use a sealed-era native input for
+        // fees. Keep its frozen script rules, but never let that selection
+        // remove the withdrawal's signature binding (the managed-V1 or the
+        // R10 form, whichever `flags` carries).
+        input_flags |= bridge_rule;
         // B3A1 did not exist in the sealed era.  Only a coin created after H
         // may execute the owner suffix instead of its complete stored script.
         const bool enable_asset_owner{legacy_lock && !legacy_input[i]};
@@ -3653,6 +3761,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     std::map<Ptxid, modern::AuthorizedAssetMint>
         bridge_mint_authorizations;
     std::set<Txid> bridge_withdrawal_transactions;
+    // Owner ruling R10: the bridge V2 kind 6 burns of this block, checked
+    // under SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS.
+    std::set<Txid> bridge_sponsored_sighash_transactions;
     if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin) {
         // Repeated here (not only ContextualCheckBlock), because
         // -reindex-chainstate connects blocks without invoking that function.
@@ -3690,6 +3801,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             if (!modern::MatchFinalityKeyPairs(*tx, pairs, bind_error)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                      "bad-finality-key-binding",
+                                     strprintf("%s in transaction %s", bind_error,
+                                               tx->GetHash().ToString()));
+            }
+            // B-37 fresh key bindings: their own exact bijection.
+            std::vector<modern::FreshFinalityKeyPair> fresh_pairs;
+            if (!modern::MatchFreshFinalityKeyPairs(*tx, fresh_pairs, bind_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-fresh-finality-key-binding",
                                      strprintf("%s in transaction %s", bind_error,
                                                tx->GetHash().ToString()));
             }
@@ -3865,6 +3984,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         for (const node::BridgeWithdrawalV2Request& withdrawal :
              bridge_delta.withdrawals_v2_added) {
             bridge_withdrawal_transactions.insert(withdrawal.transaction_id);
+            if (node::BridgeV2SponsoredSighashAllowed(
+                    withdrawal, params.GetConsensus(), pindex->nHeight)) {
+                bridge_sponsored_sighash_transactions.insert(
+                    withdrawal.transaction_id);
+            }
         }
     }
 
@@ -4015,6 +4139,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             if (!node::VerifyBlockFinalityBindings(block, pindex->nHeight, *domain, consensus, tracker.Index(),
                                                    transitions, bind_error)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-key-evidence", bind_error);
+            }
+            // B-37 fresh per-epoch key bindings (regtest -b3freshkeyheight
+            // only): structure + cryptography of every pair. Context-free on
+            // purpose: a reused key, a binding outside its window or a
+            // double binding is inert at consensus (the fresh key index and
+            // committee rule decide it), so no in-block conflict exists.
+            if (consensus.fresh_lineage && consensus.fresh_lineage->FreshKeysEnabled() &&
+                !modern::VerifyFreshKeyBindingsInBlock(block, *domain, bind_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-fresh-finality-key-evidence",
+                                     bind_error);
             }
             // FINALITY_CERTIFICATE (coinbase, <= 1): judged against the epoch
             // state derived from the chain below this block -- schedule,
@@ -4270,7 +4404,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             if (control) {
                 std::vector<CScriptCheck> vChecks;
                 tx_ok = CheckInputScriptsWithFlowMeshVaults(
-                    tx, tx_state, view, flags, fCacheResults, fCacheResults,
+                    tx, tx_state, view,
+                    bridge_sponsored_sighash_transactions.contains(tx.GetHash())
+                        ? flags | SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS
+                        : flags,
+                    fCacheResults, fCacheResults,
                     txsdata[i], m_chainman.m_validation_cache, &vChecks,
                     legacy_lock_context,
                     flowmesh_vault_authorized.empty()
@@ -4280,7 +4418,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 if (tx_ok) control->Add(std::move(vChecks));
             } else {
                 tx_ok = CheckInputScriptsWithFlowMeshVaults(
-                    tx, tx_state, view, flags, fCacheResults, fCacheResults,
+                    tx, tx_state, view,
+                    bridge_sponsored_sighash_transactions.contains(tx.GetHash())
+                        ? flags | SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL_OUTPUTS
+                        : flags,
+                    fCacheResults, fCacheResults,
                     txsdata[i], m_chainman.m_validation_cache, nullptr,
                     legacy_lock_context,
                     flowmesh_vault_authorized.empty()
@@ -4478,8 +4620,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                 // validator set in force at this height -- ACTIVE
                                 // stake joined with a non-revoked FINALITY_KEY
                                 // binding, in whole modern B3 -- the same snapshot
-                                // that defines the finality quorum.
-                                const auto weights{ModernEligibilityWeights(*key, *pindex->pprev)};
+                                // that defines the finality quorum. From R_h (H1,
+                                // regtest knob only) they come from the H1 producer
+                                // schedule instead, and the block's own round
+                                // selects the escape set when it is at least
+                                // R_escape. A non-exact time has no round: the
+                                // normal set is read and CheckModernPosBlock
+                                // refuses the block (bad-pos-time) as before.
+                                const auto round{modern::DecodeModernPosRound(ctx.parent_time, block.GetBlockTime(),
+                                                                              *consensus.modern_pos)};
+                                const auto weights{ModernEligibilityWeights(*key, *pindex->pprev, round)};
                                 if (!weights) {
                                     state.Error("modern-PoS validator set is unavailable");
                                 } else {
@@ -7009,6 +7159,12 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
                 std::string bind_error;
                 if (!modern::MatchFinalityKeyPairs(*tx, pairs, bind_error)) {
                     return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-key-binding",
+                                         strprintf("%s in transaction %s", bind_error, tx->GetHash().ToString()));
+                }
+                // B-37 fresh key bindings: their own exact bijection.
+                std::vector<modern::FreshFinalityKeyPair> fresh_pairs;
+                if (!modern::MatchFreshFinalityKeyPairs(*tx, fresh_pairs, bind_error)) {
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-fresh-finality-key-binding",
                                          strprintf("%s in transaction %s", bind_error, tx->GetHash().ToString()));
                 }
             }

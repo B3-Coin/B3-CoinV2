@@ -1228,6 +1228,9 @@ public:
             if (b3.fresh_max_epoch_extension && !b3.fresh_lineage_height) {
                 throw std::runtime_error("-b3freshmaxepochextension requires -b3freshlineageheight");
             }
+            if (b3.fresh_key_height && !b3.fresh_lineage_height) {
+                throw std::runtime_error("-b3freshkeyheight requires -b3freshlineageheight");
+            }
             if (b3.fresh_lineage_height) {
                 if (!b3.flowmesh_test) {
                     throw std::runtime_error("-b3freshlineageheight requires -b3flowmeshtest");
@@ -1254,6 +1257,79 @@ public:
                     .max_epoch_extension = extension,
                     .staging_signer = true,
                 };
+                // B-37 per-epoch keys (finality dependency section 6.4):
+                // fresh bindings start at R_key, above the legacy era, and
+                // the genesis binding window [R_key, R_f - 1] that fixes
+                // Set'_0 = Set'_1 must hold at least two blocks, so
+                // R_key < R_f - 1 (regtest plan section 3.3).
+                if (b3.fresh_key_height) {
+                    const int key_height{*b3.fresh_key_height};
+                    const int legacy_final{Consensus::LegacyFinalHeight(consensus).value_or(0)};
+                    const int lowest{std::max(1, legacy_final + 1)};
+                    const int highest{fresh_height - 2};
+                    if (key_height < lowest || key_height > highest) {
+                        throw std::runtime_error(strprintf(
+                            "Invalid value for -b3freshkeyheight: %d must be in [%d, %d] (above the legacy final height %d and below R_f - 1 = %d)",
+                            key_height, lowest, highest, legacy_final, genesis_height));
+                    }
+                    consensus.fresh_lineage->key_height = key_height;
+                }
+            }
+
+            // H1 producer rotation (finality dependency section 5.1, FD-2;
+            // owner ruling R8): REGTEST ONLY and only with -b3flowmeshtest;
+            // no other network sets consensus.h1. R_h > M keeps every
+            // SetInForceAt(M) Set_0 preview on the V1 rule, and R_escape is
+            // bounded by the block assembler's round search.
+            if (b3.h1_escape_rounds && !b3.h1_height) {
+                throw std::runtime_error("-b3h1escaperounds requires -b3h1height");
+            }
+            if (b3.h1_height) {
+                if (!b3.flowmesh_test) {
+                    throw std::runtime_error("-b3h1height requires -b3flowmeshtest");
+                }
+                const int h1_height{*b3.h1_height};
+                const int modern_start{*Consensus::ModernPosStartHeight(consensus)};
+                if (h1_height <= modern_start) {
+                    throw std::runtime_error(strprintf(
+                        "Invalid value for -b3h1height: %d must be above the first modern-PoS height M=%d",
+                        h1_height, modern_start));
+                }
+                const int64_t escape_rounds{b3.h1_escape_rounds.value_or(
+                    Consensus::H1Params::DEFAULT_ESCAPE_ROUNDS)};
+                if (escape_rounds < 1 ||
+                    escape_rounds > B3ModernRegTestOptions::MAX_H1_ESCAPE_ROUNDS) {
+                    throw std::runtime_error(strprintf(
+                        "Invalid value for -b3h1escaperounds: %d must be in [1, %d]",
+                        escape_rounds, B3ModernRegTestOptions::MAX_H1_ESCAPE_ROUNDS));
+                }
+                consensus.h1 = Consensus::H1Params{
+                    .activation_height = h1_height,
+                    .escape_rounds = escape_rounds,
+                };
+            }
+
+            // H2 hardened checkpoints (finality dependency section 5.3):
+            // REGTEST ONLY and only with -b3flowmeshtest. They join the
+            // existing modern checkpoint table, so header admission and
+            // ConnectBlock refuse a different block at a pinned height
+            // (bad-modern-checkpoint) and startup checks the active chain.
+            if (!b3.h2_checkpoints.empty()) {
+                if (!b3.flowmesh_test) {
+                    throw std::runtime_error("-b3h2checkpoint requires -b3flowmeshtest");
+                }
+                const int legacy_final{Consensus::LegacyFinalHeight(consensus).value_or(0)};
+                for (const auto& [height, hash] : b3.h2_checkpoints) {
+                    if (Consensus::GetB3Era(height, consensus) != Consensus::B3Era::MODERN) {
+                        throw std::runtime_error(strprintf(
+                            "Invalid -b3h2checkpoint height %d: must be above the legacy final height %d",
+                            height, legacy_final));
+                    }
+                    if (!consensus.modern_checkpoints.emplace(height, hash).second) {
+                        throw std::runtime_error(strprintf(
+                            "Duplicate -b3h2checkpoint height %d", height));
+                    }
+                }
             }
 
             // Bridge V2 (node changes sections 3.1-3.4; regtest plan section
@@ -1267,7 +1343,8 @@ public:
             // and once a block at or above A3 is stored the file can no
             // longer change. The OI-3 code hashes stay unset (31337 only).
             // The same guard freezes an optional B-23 successor, whose rules
-            // apply only from its migration height h_m > V.
+            // apply only from its migration height h_m > V, and the optional
+            // deposit and exit forwarder pins.
             if (b3.bridge_pins && b3.bridge_pins->v2) {
                 const B3RegTestBridgePins::V2Section& v2{*b3.bridge_pins->v2};
                 if (!consensus.fresh_lineage) {
@@ -1319,6 +1396,9 @@ public:
                 Consensus::BridgeV2Params bridge_v2;
                 bridge_v2.activation_height = v2.activation_height;
                 bridge_v2.burn_height = burn_height;
+                // Owner ruling R10: off unless the file names its height
+                // (>= V, checked by the parser and by Valid()).
+                bridge_v2.sponsored_sighash_height = v2.sponsored_sighash_height;
                 bridge_v2.light_client = v2.light_client;
                 bridge_v2.verifier.address = v2.verifier;
                 bridge_v2.verifier.min_bridge_validators = v2.min_bridge_validators;
@@ -1385,6 +1465,19 @@ public:
                     }
                     bridge_v2.successor = std::move(successor);
                 }
+                // Route (b) and (d3) forwarder factories (node changes
+                // section 3.1), pinned with v before the first block >= A3:
+                // the DeployV2 deployer's CREATE addresses at nonces n+4 and
+                // n+5 and B3Forwarder's init-code hash are known before the
+                // fresh lineage starts. Neither may sit on a V1 contract;
+                // Valid() keeps them off every V2 contract and apart.
+                if ((v2.deposit_forwarder && is_v1_contract(v2.deposit_forwarder->factory)) ||
+                    (v2.exit_forwarder && is_v1_contract(v2.exit_forwarder->factory))) {
+                    throw std::runtime_error(
+                        "-b3bridgepins v2 forwarder factories must differ from every V1 bridge contract");
+                }
+                bridge_v2.deposit_forwarder = v2.deposit_forwarder;
+                bridge_v2.exit_forwarder = v2.exit_forwarder;
                 if (!bridge_v2.Valid()) {
                     throw std::runtime_error(
                         "-b3bridgepins v2 does not form a complete bridge V2 configuration");

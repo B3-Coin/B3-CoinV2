@@ -3,6 +3,7 @@
 // file COPYING or https://opensource.org/license/mit/.
 
 #include <bridge/proof.h>
+#include <modern/bridge_forwarder.h>
 #include <modern/finality_v2_payload.h>
 #include <util/strencodings.h>
 
@@ -11,8 +12,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <variant>
 #include <vector>
@@ -251,9 +254,10 @@ BOOST_AUTO_TEST_CASE(v2_record_set_adds_only_kinds_9_and_13)
 {
     // The V2 record set (from the bridge V2 height V) decodes every V1 kind
     // byte-identically and adds only kinds 9, 13 and 16 (node changes
-    // sections 3.4, 7.6, 8.2 and 8.5); bridge_state_observation_tests covers
-    // kind 9 itself, v2_finality_conflict_record_codec below covers kind 13
-    // and vault_sweep_codec kind 16.
+    // sections 3.4, 7.6, 8.2 and 8.5) and the optional kind 6 exit block
+    // (section 7.2 item 5); bridge_state_observation_tests covers kind 9
+    // itself, v2_finality_conflict_record_codec below covers kind 13,
+    // vault_sweep_codec kind 16 and burn_exit_block_codec the exit block.
     EthAddress recipient{};
     recipient.back() = 1;
     const std::vector<BridgeRecordV1> v1_records{
@@ -565,6 +569,198 @@ BOOST_AUTO_TEST_CASE(vault_sweep_codec)
     BOOST_CHECK(!EncodeBridgeRecordV1(
         {BridgeRecordKindV1::FINALITY_CONFLICT, BridgeVaultSweepV2{entry_id}},
         BRIDGE_MPT_LIMITS_V2));
+}
+
+BOOST_AUTO_TEST_CASE(burn_exit_block_codec)
+{
+    // Route (d3) exit block of a kind 6 burn (node changes section 7.2 item
+    // 5): after the V1 body, under the V2 record set only, u8 exit_version
+    // = 1 || u32 dst_eid || to(32) || u16 max_bridge_fee_bps || u64 fee_cap
+    // || refund_eoa(20), big-endian, 67 bytes. The cases are the shared
+    // vectors' "forwarder_v2" burn_exit_block entries
+    // (contracts/test/vectors/bridge_v2_vectors.json), whose recipient is
+    // the F_x of the matching "exit" case.
+    BOOST_CHECK_EQUAL(modern::EXIT_FORWARDER_BLOCK_SIZE, 67U);
+    const auto fixed_address{[](const std::string_view hex) {
+        const auto bytes{ParseHex(hex)};
+        BOOST_REQUIRE_EQUAL(bytes.size(), 20U);
+        EthAddress out{};
+        std::copy(bytes.begin(), bytes.end(), out.begin());
+        return out;
+    }};
+    const auto fixed_word{[](const std::string_view hex) {
+        const auto bytes{ParseHex(hex)};
+        BOOST_REQUIRE_EQUAL(bytes.size(), 32U);
+        modern::ForwarderWord out{};
+        std::copy(bytes.begin(), bytes.end(), out.begin());
+        return out;
+    }};
+    const auto init_code_hash_bytes{ParseHex(
+        "6278af86459e0481b5e9f1f02566368936967234f7930022c721a1b3ae94bf57")};
+    const uint256 init_code_hash{std::span<const unsigned char>{init_code_hash_bytes}};
+
+    struct Vector {
+        uint32_t dst_eid;
+        std::string_view to;
+        uint16_t bps;
+        uint64_t fee_cap;
+        std::string_view refund_eoa;
+        std::string_view factory;
+        std::string_view recipient;
+        std::string_view encoded;
+    };
+    const std::array<Vector, 3> vectors{{
+        {30'110, "000000000000000000000000944db6d25977dbda8cbb4694b85a9e568d62dbfd", 0,
+         3'000'000, "f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+         "ffaa7bb40fa5d2ef12e5f9e78a3817155e15610c", "1b7a56fb16009b1c9d27edc96452e1ac2241f118",
+         "010000759e000000000000000000000000944db6d25977dbda8cbb4694b85a9e568d62dbfd"
+         "000000000000002dc6c0f39fd6e51aad88f6f4ce6ab8827279cfffb92266"},
+        {30'110, "000000000000000000000000502190d499de05e0f75db1bf02a34b42a608b0b1", 50,
+         std::numeric_limits<uint64_t>::max(), "d51b1155903e20ac5f9d666951c317dfed630f41",
+         "ffaa7bb40fa5d2ef12e5f9e78a3817155e15610c", "b2ca5b929a0de10381784fa9f849b0f66ad4cd98",
+         "010000759e000000000000000000000000502190d499de05e0f75db1bf02a34b42a608b0b1"
+         "0032ffffffffffffffffd51b1155903e20ac5f9d666951c317dfed630f41"},
+        {30'101, "000000000000000000000000fcdb59f9cc095bc1c5809fa648f91bde103347ad", 25,
+         0, "e0dc39242a2b335954701a70534232bf7b0ac46e",
+         "3960797ff693c2cdff0248b779ea7010d0859b02", "379d29ea09d786e4c5ca010780212357cedb0345",
+         "0100007595000000000000000000000000fcdb59f9cc095bc1c5809fa648f91bde103347ad"
+         "00190000000000000000e0dc39242a2b335954701a70534232bf7b0ac46e"},
+    }};
+
+    for (const Vector& v : vectors) {
+        modern::ExitForwarderParamsV2 exit;
+        exit.dst_eid = v.dst_eid;
+        exit.to = fixed_word(v.to);
+        exit.max_bridge_fee_bps = v.bps;
+        exit.fee_cap = v.fee_cap;
+        exit.refund_eoa = fixed_address(v.refund_eoa);
+        const std::vector<unsigned char> block{ParseHex(v.encoded)};
+        BOOST_REQUIRE_EQUAL(block.size(), modern::EXIT_FORWARDER_BLOCK_SIZE);
+        // The record codec and the forwarder helper write the same bytes.
+        const auto helper{modern::EncodeExitForwarderBlockV2(exit)};
+        BOOST_CHECK(std::equal(helper.begin(), helper.end(), block.begin(), block.end()));
+        // The vector recipient is the F_x of these parameters.
+        const EthAddress recipient{fixed_address(v.recipient)};
+        const Consensus::BridgeV2ExitForwarderPins pins{fixed_address(v.factory), init_code_hash,
+                                                        v.dst_eid};
+        BOOST_CHECK(modern::ExitForwarderAddressV2(pins, exit) == recipient);
+
+        const BridgeBurnV1 burn{Hash(8), 3, 2'000'000, recipient, exit};
+        const BridgeRecordV1 record{BridgeRecordKindV1::BRIDGE_BURN, burn};
+        // 06 00 || registry_id || u32 3 || u64 2,000,000 || recipient || block.
+        std::vector<unsigned char> expected{0x06, 0x00};
+        const uint256 registry{Hash(8)};
+        expected.insert(expected.end(), registry.begin(), registry.end());
+        for (const unsigned char byte : {0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x1e, 0x84, 0x80}) {
+            expected.push_back(byte);
+        }
+        expected.insert(expected.end(), recipient.begin(), recipient.end());
+        const size_t v1_size{expected.size()};
+        BOOST_CHECK_EQUAL(v1_size, 66U);
+        expected.insert(expected.end(), block.begin(), block.end());
+        BOOST_REQUIRE_EQUAL(expected.size(), 133U);
+
+        const auto encoded{EncodeBridgeRecordV1(record, BRIDGE_MPT_LIMITS_V2)};
+        BOOST_REQUIRE(encoded);
+        BOOST_CHECK_EQUAL(HexStr(*encoded), HexStr(expected));
+        const auto decoded{DecodeBridgeRecordV1(expected, BRIDGE_MPT_LIMITS_V2)};
+        BOOST_REQUIRE(decoded);
+        BOOST_CHECK(*decoded == record);
+        const auto* decoded_burn{std::get_if<BridgeBurnV1>(&decoded->payload)};
+        BOOST_REQUIRE(decoded_burn && decoded_burn->exit);
+        BOOST_CHECK(*decoded_burn->exit == exit);
+        // Canonical: the decoded record re-encodes to the same bytes.
+        const auto reencoded{EncodeBridgeRecordV1(*decoded, BRIDGE_MPT_LIMITS_V2)};
+        BOOST_REQUIRE(reencoded);
+        BOOST_CHECK(*reencoded == expected);
+        const auto mpa{MakeBridgeMpaRecord(record, BRIDGE_MPT_LIMITS_V2)};
+        BOOST_REQUIRE(mpa);
+        BOOST_CHECK(mpa->payload == expected);
+        BOOST_CHECK(DecodeBridgeMpaRecordV1(*mpa, BRIDGE_MPT_LIMITS_V2) == record);
+
+        // Below V, and on every network without bridge_v2, the block does
+        // not exist in either direction (the V1 set is also every default
+        // argument): trailing bytes after the V1 body stay malformed.
+        BOOST_CHECK(!EncodeBridgeRecordV1(record, BRIDGE_MPT_LIMITS_V1));
+        BOOST_CHECK(!EncodeBridgeRecordV1(record));
+        BOOST_CHECK(!EncodeBridgeProofV1(record));
+        BOOST_CHECK(!MakeBridgeMpaRecord(record));
+        BOOST_CHECK(!DecodeBridgeRecordV1(expected, BRIDGE_MPT_LIMITS_V1));
+        BOOST_CHECK(!DecodeBridgeRecordV1(expected));
+        BOOST_CHECK(!DecodeBridgeProofV1(expected));
+        BOOST_CHECK(!DecodeBridgeMpaRecordV1(*mpa, BRIDGE_MPT_LIMITS_V1));
+
+        // Without the block the wire is the V1 body, the same in both sets.
+        const std::span<const unsigned char> v1_body{expected.data(), v1_size};
+        BridgeBurnV1 plain{burn};
+        plain.exit.reset();
+        const BridgeRecordV1 plain_record{BridgeRecordKindV1::BRIDGE_BURN, plain};
+        BOOST_CHECK(DecodeBridgeRecordV1(v1_body, BRIDGE_MPT_LIMITS_V1) == plain_record);
+        BOOST_CHECK(DecodeBridgeRecordV1(v1_body, BRIDGE_MPT_LIMITS_V2) == plain_record);
+        BOOST_CHECK(record != plain_record);
+
+        // The version must be 1.
+        for (const unsigned char version : {0x00, 0x02, 0x80, 0xff}) {
+            auto patched{expected};
+            patched[v1_size] = version;
+            BOOST_CHECK(!DecodeBridgeRecordV1(patched, BRIDGE_MPT_LIMITS_V2));
+            BOOST_CHECK(!DecodeBridgeRecordV1(patched, BRIDGE_MPT_LIMITS_V1));
+        }
+        // Exactly 67 bytes: every short block (1-66 bytes) and a block with
+        // trailing bytes are refused.
+        for (size_t cut{v1_size + 1}; cut < expected.size(); ++cut) {
+            BOOST_CHECK(!DecodeBridgeRecordV1(
+                std::span<const unsigned char>{expected}.first(cut),
+                BRIDGE_MPT_LIMITS_V2));
+        }
+        for (const size_t extra : {size_t{1}, size_t{3}, size_t{67}}) {
+            auto longer{expected};
+            longer.insert(longer.end(), extra, 0x00);
+            BOOST_CHECK(!DecodeBridgeRecordV1(longer, BRIDGE_MPT_LIMITS_V2));
+            longer.back() = 0x01;
+            BOOST_CHECK(!DecodeBridgeRecordV1(longer, BRIDGE_MPT_LIMITS_V2));
+        }
+        // The block belongs to kind 6 only: the same bytes under any other
+        // kind byte are malformed in both sets.
+        for (unsigned kind{0}; kind <= 255; ++kind) {
+            if (kind == 6) continue;
+            auto patched{expected};
+            patched[0] = static_cast<unsigned char>(kind);
+            BOOST_CHECK(!DecodeBridgeRecordV1(patched, BRIDGE_MPT_LIMITS_V1));
+            BOOST_CHECK(!DecodeBridgeRecordV1(patched, BRIDGE_MPT_LIMITS_V2));
+        }
+        // The V1 body's own rules still hold with a block.
+        BridgeBurnV1 null_registry{burn};
+        null_registry.registry_id.SetNull();
+        BridgeBurnV1 zero_amount{burn};
+        zero_amount.raw_amount = 0;
+        BridgeBurnV1 null_recipient{burn};
+        null_recipient.ethereum_recipient = EthAddress{};
+        for (const BridgeBurnV1& bad : {null_registry, zero_amount, null_recipient}) {
+            BOOST_CHECK(!EncodeBridgeRecordV1({BridgeRecordKindV1::BRIDGE_BURN, bad},
+                                              BRIDGE_MPT_LIMITS_V2));
+        }
+    }
+
+    // The codec checks only the version and the length: parameters that
+    // consensus refuses (a zero or foreign dst_eid, a `to` with upper bytes,
+    // bps above 50, a null refund EOA) still round-trip, so the refusal is
+    // the burn check's (bridge_state_tests/v2_burn_exit_block), never a
+    // malformed record.
+    modern::ExitForwarderParamsV2 odd;
+    odd.dst_eid = 0;
+    odd.to.fill(0xff);
+    odd.max_bridge_fee_bps = 0xffff;
+    odd.fee_cap = 0;
+    EthAddress recipient{};
+    recipient.back() = 1;
+    const BridgeRecordV1 odd_record{BridgeRecordKindV1::BRIDGE_BURN,
+                                    BridgeBurnV1{Hash(8), 0, 1, recipient, odd}};
+    const auto odd_encoded{EncodeBridgeRecordV1(odd_record, BRIDGE_MPT_LIMITS_V2)};
+    BOOST_REQUIRE(odd_encoded);
+    BOOST_CHECK_EQUAL(odd_encoded->size(), 133U);
+    BOOST_CHECK(DecodeBridgeRecordV1(*odd_encoded, BRIDGE_MPT_LIMITS_V2) == odd_record);
 }
 
 BOOST_AUTO_TEST_CASE(rejects_truncation_trailing_and_noncanonical_envelopes)

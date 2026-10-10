@@ -9,7 +9,10 @@
 > `cast` 1.7.1. 2026-10-05 amendment: open issue OI-12 resolved by owner
 > ruling R9 (`doc/design/b3-bridge-v2-owner-rulings-2026-10-03.md`); the
 > K_OF_N bootstrap attestation binds the verifier address, the EVM chain id
-> and `START_SET_HASH` (§0, §2.2, §2.5, §5, §12).
+> and `START_SET_HASH` (§0, §2.2, §2.5, §5, §12). 2026-10-08: the regtest
+> forwarder slice (routes (b) and (d3)) records implementation choices for
+> open issues OI-6 (§6.2) and OI-2 (§7.4) (architecture §20), each pending
+> owner review. No normative byte layout changed.
 
 **Labels.** [E] verified; [I] design choice; [H] estimate. **Default** =
 provisional. Repo facts are `path:line` at `1d1d6da`; `.../study/` is
@@ -440,6 +443,31 @@ to count a migration, which B3 credits only from that slot (§6.4); stray
 transfers it counts create no claim. A transient reentrancy lock guards every
 entry point.
 
+*OI-6 implementation choice (regtest forwarder slice, 2026-10-08; [I],
+pending owner review).* Plain transfers to the vault stay lost; the slice
+keeps users from making them through B3's own tools:
+
+- **Reserved addresses.** `modern::BridgeV2ReservedEthAddressReason`
+  (`src/modern/bridge_forwarder.h`) lists every address with a bridge V2
+  role: the launch vault, a successor vault, the origin token, the verifier
+  and the F_d and F_x factories.
+- **Wallets.** `bridgewithdraw` and `bridgeforwarderaddress` refuse a
+  reserved address as the (d1) burn recipient, the (d3) Arbitrum `to` and
+  any `refundEOA`. A forwarder derivation that yields one fails closed.
+  `bridgeforwarderaddress` warns that USDT or USDT0 sent by plain transfer
+  to the vault, its token or a factory mints nothing.
+- **Contracts.** The F_d factory refuses a `refundEOA` equal to `VAULT`,
+  `TOKEN` or itself, and a `refund` to the vault, the account or itself
+  (§7.3).
+- **Consensus.** A route (d3) exit block whose `refundEOA` is reserved makes
+  the burn invalid (node changes §7.2 item 5, check 5; bridge V2 is
+  regtest-only). None of those contracts can call `withdrawOnEthereum`, so
+  F_x would lose its escape.
+- **Not done.** `B3OftExitFactory.isValid` does not refuse `TOKEN`,
+  `ADAPTER` or itself as `refundEOA`. F_x never pays `refundEOA`, so such a
+  refusal would only block `forward` for a burn already made, and B3
+  consensus refuses those burns. The §10 disclosure text is not written.
+
 ### 6.3 Arbitrum messages: not at launch
 
 The launch vault sends none; revision 8's Deposit message, Heartbeat and
@@ -607,6 +635,33 @@ D2 tokens leave F_d only to the vault, a payee (its accrued fees) or as
 `refundEOA` directs; D3 `balance ≥ reserved`; D4 a flush and a refund never
 spend the same unit; D5 `feesCharged ≤ feeCap` for ever; D6 a flush deposits
 `min(free − fee, MAX_DEPOSIT_RAW)`.
+
+*OI-2 implementation choice (regtest forwarder slice, 2026-10-08; [I],
+pending owner review): OI-2's second direction, in the wallet.*
+
+- **Rule.** `bridgeforwarderaddress` refuses an expected delivery above the
+  vault's `MAX_DEPOSIT_RAW`, so one F_d carries one vault deposit, and sets
+  `feeCap = 4 × fee_per_tx` (deploy, two flushes, `returnToOwner`), as
+  specified above. A single flush then deposits the whole delivery,
+  whatever fee within `feeCap` its flusher takes. `fee_per_tx` defaults to
+  1,000,000 raw (provisional). No contract changed.
+- **Why not the first direction.** Sizing `feeCap` per ceil(amount /
+  `MAX_DEPOSIT_RAW`) holds only for cooperative flushers. `flush` lets any
+  codeless EOA charge the whole remaining lifetime cap in one call, so a
+  greedy first flusher leaves every later chunk to a zero-fee flush, a
+  refund or `returnToOwner(p, 0)`: the stranding OI-2 describes. A
+  per-flush fee bound carried in p would enforce it, but it changes the
+  normative salt layout (§7.2) and needs an owner ruling.
+- **Residuals.**
+  - A user who sends more than `MAX_DEPOSIT_RAW` anyway leaves the excess to
+    an unpaid move: a zero-fee flush until `notAfter`, a refund by
+    `refundEOA`, or `returnToOwner(p, 0)` after it.
+  - After a greedy first flush, a repeat arrival moves only the same ways.
+  - `deploy` and `flush` are two transactions, so a front-runner can take
+    the first flush's fee from the relayer that paid for the deploy. This is
+    relayer economics; no user funds are at risk.
+- **Tests.** `test_OI2_*` in `contracts/test/v2/ForwarderDepositV2.t.sol`,
+  a greedy first flusher included, and `forwarder_v2.deposit_fee_cap`.
 
 ---
 

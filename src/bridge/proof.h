@@ -9,6 +9,7 @@
 #include <bridge/eth_light_client.h>
 #include <consensus/bridge_params.h>
 #include <consensus/consensus.h>
+#include <modern/bridge_forwarder.h>
 #include <modern/finality_v2_payload.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
@@ -86,9 +87,11 @@ static_assert(MAX_BRIDGE_MINT_WIRE_SIZE <= MAX_BRIDGE_RECORD_SIZE);
  * The limit set is the codec's height selector, so it also carries the
  * record set: `v2_kinds` admits the bridge V2 record kinds (kind 9,
  * ETH_STATE_OBSERVATION, kind 13, FINALITY_CONFLICT, and kind 16,
- * VAULT_SWEEP). Consensus passes the V2 set from V only, so a kind 9, 13 or
- * 16 record is malformed below V and on every network without bridge_v2,
- * exactly as an unknown kind was before.
+ * VAULT_SWEEP) and the optional exit block of a kind 6 BRIDGE_BURN (route
+ * d3, BridgeBurnV1::exit). Consensus passes the V2 set from V only, so a
+ * kind 9, 13 or 16 record, or a kind 6 record with an exit block, is
+ * malformed below V and on every network without bridge_v2, exactly as an
+ * unknown kind or trailing bytes were before.
  */
 struct BridgeMptLimits {
     size_t max_node_size;
@@ -129,6 +132,8 @@ enum class BridgeRecordKindV1 : uint8_t {
     MINT = 3,
     EXECUTION_BACKFILL = 4,
     MANAGED_WITHDRAWAL = 5,
+    //! Under the V2 record set the body may end with the route (d3) exit
+    //! block (BridgeBurnV1::exit).
     BRIDGE_BURN = 6,
     //! Bridge V2 only (node changes section 8.2): decoded under the V2
     //! record set (BridgeMptLimits::v2_kinds), malformed otherwise.
@@ -200,12 +205,24 @@ struct BridgeManagedWithdrawalV1 {
  * height, origin chain/token and chain-bound asset id are deliberately absent:
  * consensus derives them while connecting the exact named burn. A relayer
  * therefore cannot choose any field of the Ethereum withdrawal leaf.
+ *
+ * `exit` is the optional route (d3) exit block of a bridge V2 burn
+ * (doc/design/b3-bridge-v2-node-changes.md section 7.2 item 5): the exit
+ * forwarder F_x parameters the recipient must derive from. It travels after
+ * the V1 body and only under the V2 record set (BridgeMptLimits::v2_kinds):
+ * u8 exit_version = 1 || u32 dst_eid || 32-byte `to` word ||
+ * u16 max_bridge_fee_bps || u64 fee_cap || 20-byte refund_eoa, big-endian,
+ * 67 bytes (modern::EXIT_FORWARDER_BLOCK_SIZE). The codec checks only the
+ * version and the exact length; consensus checks the parameters and the
+ * recipient against the pinned exit forwarder. Without it the wire is the
+ * V1 body byte for byte.
  */
 struct BridgeBurnV1 {
     uint256 registry_id{};
     uint32_t burn_output_index{0};
     uint64_t raw_amount{0};
     EthAddress ethereum_recipient{};
+    std::optional<modern::ExitForwarderParamsV2> exit{};
 
     friend bool operator==(const BridgeBurnV1&, const BridgeBurnV1&) = default;
 };
@@ -876,6 +893,28 @@ inline bool DecodeEthStateObservation(Reader& reader,
     return true;
 }
 
+//! The kind 6 exit block (BridgeBurnV1::exit): the 67 bytes of
+//! modern::EncodeExitForwarderBlockV2, the one codec of the block.
+inline void EncodeBurnExitBlock(Writer& writer,
+                                const modern::ExitForwarderParamsV2& exit)
+{
+    writer.Bytes(modern::EncodeExitForwarderBlockV2(exit));
+}
+
+//! Reads one exit block, 67 bytes, through modern::DecodeExitForwarderBlockV2
+//! (version 1). The caller requires the reader to be empty afterwards (exact
+//! length).
+inline bool DecodeBurnExitBlock(Reader& reader,
+                                modern::ExitForwarderParamsV2& exit)
+{
+    std::array<unsigned char, modern::EXIT_FORWARDER_BLOCK_SIZE> bytes{};
+    if (!reader.Bytes(bytes)) return false;
+    const auto decoded{modern::DecodeExitForwarderBlockV2(bytes)};
+    if (!decoded) return false;
+    exit = *decoded;
+    return true;
+}
+
 } // namespace proof_detail
 
 /** Standalone canonical component codec used by durable light-client state. */
@@ -926,10 +965,11 @@ inline std::optional<ssz::SyncCommittee> DecodeBridgeSyncCommitteeV1(
 
 /**
  * Canonical encode. `mpt_limits` applies only to a MINT's receipt proof and
- * to whether kinds 9, 13 and 16 exist; the V1 default keeps every pre-V2
- * caller byte-identical. Consensus selects the limit set by height (V2 from
- * the bridge V2 activation height), so a record that only fits the V2
- * limits, or any kind 9, 13 or 16 record, is malformed below that height.
+ * to whether kinds 9, 13 and 16 and a kind 6 exit block exist; the V1
+ * default keeps every pre-V2 caller byte-identical. Consensus selects the
+ * limit set by height (V2 from the bridge V2 activation height), so a record
+ * that only fits the V2 limits, any kind 9, 13 or 16 record, or a kind 6
+ * record with an exit block, is malformed below that height.
  */
 inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
     const BridgeRecordV1& record,
@@ -1016,10 +1056,13 @@ inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
                 !AddressNonzero(value->ethereum_recipient)) {
                 break;
             }
+            // The exit block exists only under the V2 record set.
+            if (value->exit && !mpt_limits.v2_kinds) break;
             writer.Root(value->registry_id);
             writer.U32(value->burn_output_index);
             writer.U64(value->raw_amount);
             writer.Bytes(value->ethereum_recipient);
+            if (value->exit) EncodeBurnExitBlock(writer, *value->exit);
             valid = true;
         }
         break;
@@ -1147,8 +1190,18 @@ inline std::optional<BridgeRecordV1> DecodeBridgeRecordV1(
             !reader.U32(value.burn_output_index) ||
             !reader.U64(value.raw_amount) || value.raw_amount == 0 ||
             !reader.Bytes(value.ethereum_recipient) ||
-            !AddressNonzero(value.ethereum_recipient) || !reader.Empty()) {
+            !AddressNonzero(value.ethereum_recipient)) {
             return std::nullopt;
+        }
+        // Anything after the V1 body is the exit block: V2 record set only,
+        // version 1, exactly 67 bytes. The V1 set refuses trailing bytes.
+        if (!reader.Empty()) {
+            if (!mpt_limits.v2_kinds) return std::nullopt;
+            modern::ExitForwarderParamsV2 exit;
+            if (!DecodeBurnExitBlock(reader, exit) || !reader.Empty()) {
+                return std::nullopt;
+            }
+            value.exit = exit;
         }
         return BridgeRecordV1{kind, std::move(value)};
     }

@@ -51,6 +51,7 @@
 #include <node/flowmesh_action_wait.h>
 #include <node/flowmesh_client.h>
 #include <node/asset_metadata.h>
+#include <node/finality_fresh_key_store.h>
 #include <node/finality_recovery_options.h>
 #include <node/staking.h>
 #include <node/warnings.h>
@@ -2128,7 +2129,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // (startstaking) and until the next block is a modern-PoS block.
     node.staking = std::make_unique<node::StakingLoop>(
         *node.chainman, node.mempool.get(),
-        args.GetDataDirNet() / "finality_signer", std::move(operator_recovery));
+        args.GetDataDirNet() / fs::u8path(node::FINALITY_SIGNER_DIRNAME), std::move(operator_recovery));
 
     // This one opt-in controls only the optional operator engine. Mandatory B3
     // FN/checkpoint/vault indexes and validation are never conditional on it.

@@ -39,6 +39,7 @@
 #include <node/blockstorage.h>
 #include <node/bridge_state.h>
 #include <node/connection_types.h>
+#include <node/finality_fresh_transport.h>
 #include <node/finality_transport.h>
 #include <node/legacy_orphanage.h>
 #include <node/protocol_version.h>
@@ -467,6 +468,13 @@ struct Peer {
     double m_finality_wire_token_bucket GUARDED_BY(NetEventsInterface::g_msgproc_mutex){MAX_FINALITY_WIRE_TOKEN_BUCKET};
     std::chrono::microseconds m_finality_wire_token_timestamp GUARDED_BY(NetEventsInterface::g_msgproc_mutex){FinalityTransportNow()};
     node::FinalityRelayCursor m_finality_relay_cursor GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    /** Fresh-lineage vote (`finsigv2`) budgets and replay, separate from the
+     * V1 `finsig` ones (regtest fresh lineage only). */
+    node::FreshVoteTokenBucket m_fresh_vote_wire GUARDED_BY(NetEventsInterface::g_msgproc_mutex){
+        node::FullFreshVoteBucket(node::FRESH_VOTE_PEER_WIRE, FinalityTransportNow())};
+    node::FreshVoteTokenBucket m_fresh_vote_verify GUARDED_BY(NetEventsInterface::g_msgproc_mutex){
+        node::FullFreshVoteBucket(node::FRESH_VOTE_PEER_VERIFY, FinalityTransportNow())};
+    node::FreshVoteReplay m_fresh_vote_replay GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
 
     /** Whether we've sent this peer a getheaders in response to an inv prior to initial-headers-sync completing */
     bool m_inv_triggered_getheaders_before_sync GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
@@ -1114,6 +1122,19 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
     void MaybeFinalityTransport(CNode& node, Peer& peer, std::chrono::microseconds now)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex);
+
+    /** Whole-node `finsigv2` budgets (fresh lineage only). */
+    node::FreshVoteTokenBucket m_fresh_vote_global_wire GUARDED_BY(g_msgproc_mutex){
+        node::FullFreshVoteBucket(node::FRESH_VOTE_GLOBAL_WIRE, FinalityTransportNow())};
+    node::FreshVoteTokenBucket m_fresh_vote_global_verify GUARDED_BY(g_msgproc_mutex){
+        node::FullFreshVoteBucket(node::FRESH_VOTE_GLOBAL_VERIFY, FinalityTransportNow())};
+    /** One verified fresh-pool export shared by every peer's replay, never
+     * reused across tip hashes and refreshed at most once per second. */
+    node::FreshVoteExport m_fresh_relay_cache GUARDED_BY(g_msgproc_mutex);
+    uint256 m_fresh_relay_tip GUARDED_BY(g_msgproc_mutex);
+    std::chrono::microseconds m_next_fresh_relay_refresh GUARDED_BY(g_msgproc_mutex){0};
+    void MaybeFreshLineageTransport(CNode& node, Peer& peer, std::chrono::microseconds now)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
     /** Next time to check for stale tip */
     std::chrono::seconds m_stale_tip_check_time GUARDED_BY(cs_main){0s};
@@ -2872,6 +2893,51 @@ void PeerManagerImpl::MaybeFinalityTransport(CNode& node, Peer& peer,
         });
     }
     for (const node::FinalitySig& sig : replay) MakeAndPushMessage(node, NetMsgType::FINSIG, sig);
+}
+
+void PeerManagerImpl::MaybeFreshLineageTransport(CNode& node, Peer& peer,
+                                                 const std::chrono::microseconds now)
+{
+    // Fresh-lineage votes exist only where the regtest knob configures the
+    // lineage; nothing is ever sent on any other chain.
+    const Consensus::Params& consensus{m_chainparams.GetConsensus()};
+    if (!consensus.legacy_b3coin || !consensus.modern_pos || !consensus.fresh_lineage) return;
+    if (node.fPauseSend || !peer.m_fresh_vote_replay.Due(now)) return;
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_chainman.ActiveChainstate()};
+        const CChain& chain{chainstate.m_chain};
+        const CBlockIndex* tip{chain.Tip()};
+        if (!tip) return;
+        // The signer and the hidden RPC insert into the pool without telling
+        // the transport, so the export is refreshed on a timer: on every tip
+        // HASH change (no replay of an old branch after an equal-height
+        // reorg) and at most once per second otherwise.
+        if (m_fresh_relay_tip != tip->GetBlockHash() || now >= m_next_fresh_relay_refresh) {
+            m_fresh_relay_cache.Clear();
+            m_fresh_relay_tip = tip->GetBlockHash();
+            m_next_fresh_relay_refresh = now + 1s;
+            const auto modern_start{Consensus::ModernPosStartHeight(consensus)};
+            if (modern_start && tip->nHeight >= *modern_start) {
+                const node::BridgeStateIndex* bridge_index{nullptr};
+                bool synced{true};
+                if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+                    node::BridgeStateTracker& bridge{chainstate.ModernBridgeState()};
+                    synced = bridge.Sync(chain, chainstate.m_blockman, consensus, *tip);
+                    if (synced) bridge_index = &bridge.Index();
+                }
+                node::FinalityTracker& tracker{chainstate.ModernFinality()};
+                if (synced && tracker.Sync(chain, chainstate.m_blockman, consensus, *tip, bridge_index)) {
+                    // Vote ids are hashed once here, not by every peer's replay.
+                    m_fresh_relay_cache = node::FreshVoteExport{chainstate.FinalitySignatures().Fresh().VerifiedSignatures(
+                        tracker, chain, consensus, bridge_index)};
+                }
+            }
+        }
+    }
+    for (const node::FreshLineageSig& sig : peer.m_fresh_vote_replay.Take(m_fresh_relay_cache, now)) {
+        MakeAndPushMessage(node, NetMsgType::FINSIGV2, sig);
+    }
 }
 
 node::FlowMeshRelayResult PeerManagerImpl::RelayFlowMeshMessage(
@@ -6702,6 +6768,77 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         return;
     }
 
+    if (msg_type == NetMsgType::FINSIGV2) {
+        // B3 fresh finality lineage vote gossip (bridge V2 stage S3; liveness
+        // only, consensus acceptance happens exclusively through type-11
+        // records in blocks). A chain without a fresh lineage (mainnet,
+        // testnet, regtest without -b3freshlineageheight) ignores the
+        // message before deserializing it, without penalty, exactly as an
+        // older node ignores an unknown message type. Fixed 148 bytes; any
+        // other size is ignored. Cheap wire admission and the single BLS
+        // verification (charged by the pool immediately before it, never for
+        // a cheap reject or a known duplicate) use budgets separate from V1
+        // `finsig`. There is no holding area: a vote that is too shallow,
+        // not yet on this tip's grid or over budget is dropped and the
+        // sender's replay retries it (node/finality_fresh_transport.h).
+        const Consensus::Params& consensus{m_chainparams.GetConsensus()};
+        if (!consensus.legacy_b3coin || !consensus.modern_pos || !consensus.fresh_lineage) return;
+        if (vRecv.size() != node::FreshLineageSig::SERIALIZED_SIZE) return;
+        const auto now{FinalityTransportNow()};
+        if (!node::ConsumeFreshVoteToken(peer.m_fresh_vote_wire, node::FRESH_VOTE_PEER_WIRE,
+                                         m_fresh_vote_global_wire, node::FRESH_VOTE_GLOBAL_WIRE, now)) {
+            return;
+        }
+        node::FreshLineageSig vote;
+        vRecv >> vote;
+        bool relay{false};
+        {
+            LOCK(cs_main);
+            Chainstate& chainstate{m_chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            if (!tip) return;
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+                node::BridgeStateTracker& bridge{chainstate.ModernBridgeState()};
+                if (!bridge.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) return;
+                bridge_index = &bridge.Index();
+            }
+            node::FinalityTracker& tracker{chainstate.ModernFinality()};
+            if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip, bridge_index)) return;
+            const auto accept{chainstate.FinalitySignatures().Fresh().Submit(
+                vote, tracker, chainstate.m_chain, consensus, bridge_index,
+                [&]() EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) {
+                    return node::ConsumeFreshVoteToken(peer.m_fresh_vote_verify, node::FRESH_VOTE_PEER_VERIFY,
+                                                       m_fresh_vote_global_verify, node::FRESH_VOTE_GLOBAL_VERIFY,
+                                                       now);
+                })};
+            LogDebug(BCLog::NET, "finsigv2 lineage=%s epoch=%d height=%d index=%d peer=%d: %s\n",
+                     vote.lineage_id.ToString(), vote.epoch, vote.height, vote.index, pfrom.GetId(),
+                     node::FreshLineageSignaturePool::AcceptName(accept));
+            relay = accept == node::FreshLineageSignaturePool::Accept::ACCEPTED;
+            // The sender has this verified vote: do not echo it back before
+            // RESEND. Unverified bytes are never remembered.
+            if (relay || accept == node::FreshLineageSignaturePool::Accept::DUPLICATE) {
+                peer.m_fresh_vote_replay.MarkSent(vote, now);
+            }
+        }
+        // Flood once on first acceptance; duplicates terminate the relay.
+        // Each recipient's replay remembers the vote so it is not echoed to
+        // the same connection again before RESEND.
+        if (relay) {
+            std::vector<NodeId> flooded;
+            m_connman.ForEachNode([&](CNode* pnode) {
+                if (pnode->GetId() == pfrom.GetId() || !pnode->fSuccessfullyConnected || pnode->fDisconnect || pnode->fPauseSend) return;
+                MakeAndPushMessage(*pnode, NetMsgType::FINSIGV2, vote);
+                flooded.push_back(pnode->GetId());
+            });
+            for (const NodeId id : flooded) {
+                if (const PeerRef other{GetPeerRef(id)}) other->m_fresh_vote_replay.MarkSent(vote, now);
+            }
+        }
+        return;
+    }
+
     if (msg_type == NetMsgType::NOTFOUND) {
         std::vector<CInv> vInv;
         vRecv >> vInv;
@@ -7361,6 +7498,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     MaybeSendSendHeaders(node, peer);
 
     MaybeFinalityTransport(node, peer, FinalityTransportNow());
+    MaybeFreshLineageTransport(node, peer, FinalityTransportNow());
 
     {
         LOCK(cs_main);

@@ -97,14 +97,25 @@ EXTENDED_SCRIPTS = [
     'feature_b3_bridge_rt3_v1_route_a.py --deposit-only',
     # Fresh finality lineage (digest V2, regtest-only knob); local nodes only.
     'feature_b3_fresh_lineage.py',
+    # Fresh-lineage per-epoch committee keys (B-37, regtest-only knob); local nodes only.
+    'feature_b3_fresh_lineage_keys.py',
     # Bridge V2 first round trip (anvil + forge --offline + B3_BRIDGE_TOOLS).
     'feature_b3_bridge_rt4a_round_trip.py',
+    # The same round trip on B-37 per-epoch fresh committee keys (-b3freshkeyheight).
+    'feature_b3_bridge_rt4a_round_trip.py --freshkeys',
     # Bridge V2 with the K_OF_N bootstrap and the full burn gate (as RT4a).
     'feature_b3_bridge_rt4_kofn_gate.py',
     # Bridge V2 kind 13 finality conflict: B3 and Verifier V2 close for good (as RT4a).
     'feature_b3_bridge_rt4c_conflict.py',
     # Bridge V2 B-23 vault migration to a pinned successor vault (as RT4a).
     'feature_b3_bridge_rt4d_migration.py',
+    # Bridge V2 routes (b) and (d3) through the forwarders, two anvils and mock LayerZero (as RT4c).
+    'feature_b3_bridge_rt6_route_b_d3.py',
+    # Owner ruling R10: a bUSD-only wallet burns to routes (d1) and (d3) with a relayer-sponsored fee (as RT6).
+    'feature_b3_bridge_rt7s_sponsored_fees.py',
+    # RT1: H1 producer rotation, escape and H2 checkpoint (regtest-only knobs); local nodes only.
+    'feature_b3_h1_producer_rotation.py --fixture=B',
+    'feature_b3_h1_producer_rotation.py --fixture=I',
 ]
 
 # Special script to run each bench sanity check

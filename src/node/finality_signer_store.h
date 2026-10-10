@@ -130,6 +130,25 @@ public:
                                const uint256& successor_set_hash,
                                std::string& error);
 
+    /** FRESH_LINEAGE_V2 only (B-37 per-epoch keys, finality dependency
+     * section 6.4): move only the ancestry lock forward across fresh epochs
+     * in which this validator signed nothing because no committee seated it
+     * (no counted binding, a void seat). The target is a strictly newer,
+     * already validated and included fresh-lineage certificate of a strictly
+     * later epoch than the lock. The caller checks that the old lock is an
+     * ancestor of the active chain and that the certificate is included on
+     * it above the lock: the new lock then descends from the old one, and the
+     * committees between the two epochs are the ones consensus validated on
+     * that chain. No vote of this validator conflicts with that chain, so
+     * unlike CommitCertifiedAnchor (an orphaned lock) the epoch and set may
+     * differ. The last actual vote is retained. A CHAIN_DOMAIN_V1 journal
+     * refuses it: V1 keeps its exact-lineage rule. */
+    bool CommitLineageCatchUp(int height, const uint256& block_hash,
+                              const uint256& digest, uint64_t epoch,
+                              const uint256& signing_set_hash,
+                              const uint256& successor_set_hash,
+                              std::string& error);
+
     /** The exact-incident one-time recovery of an orphaned vote (see
      * Consensus::FinalitySignerRecovery). Refuses unless the durable state is
      * EXACTLY the pinned incident: the same checkpoint as both the last vote

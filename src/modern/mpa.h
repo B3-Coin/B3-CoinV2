@@ -10,6 +10,7 @@
 #include <consensus/params.h>
 #include <modern/creation_action.h>
 #include <modern/bridge_binding.h>
+#include <modern/finality_fresh_key.h>
 #include <modern/finality_key.h>
 #include <modern/finality_types.h>
 #include <modern/flowmesh_checkpoint.h>
@@ -52,6 +53,11 @@ namespace modern {
  *      (fresh finality lineage, digest V2; coinbase-only, no metadata cell;
  *      the fresh-lineage activation height is unset on every shipped network
  *      and only regtest's -b3freshlineageheight knob sets it)
+ *  12  FRESH_FINALITY_KEY_EVIDENCE         known; fresh-key-height-gated
+ *      (B-37 per-epoch committee key binding of the fresh lineage, 248 bytes,
+ *      bound to a FINALITY_KEY cell of policy version 2, modern/
+ *      finality_fresh_key.h; R_key is unset on every shipped network and only
+ *      regtest's -b3freshkeyheight knob sets it)
  * Every other (type, version) is UNKNOWN. Unknown -> invalid; known but not
  * activated -> invalid; known and activated -> parsed with that type's exact
  * grammar. There is no generic/user-data record type.
@@ -73,16 +79,20 @@ namespace modern {
  * same key, duplicate evidence, orphan evidence, cells without evidence, and
  * any field mismatch are invalid. Matched pairs are then passed through
  * modern::CheckFinalityKeyTransition (Commit 4) by the caller, in block order,
- * against the derived binding index plus an in-block overlay.
+ * against the derived binding index plus an in-block overlay. FINALITY_KEY
+ * cells of policy version 2 and type-12 records are the fresh lineage's
+ * separate binding kind (modern/finality_fresh_key.h,
+ * MatchFreshFinalityKeyPairs) and are skipped here.
  */
 
-//! Frozen record type numbers (see creation_action.h for 1-11).
+//! Frozen record type numbers (see creation_action.h for 1-12).
 inline constexpr uint16_t MPA_TYPE_FINALITY_CERTIFICATE{CREATION_ACTION_FINALITY_CERTIFICATE};
 inline constexpr uint16_t MPA_TYPE_FINALITY_KEY_EVIDENCE{CREATION_ACTION_FINALITY_KEY_EVIDENCE};
 inline constexpr uint16_t MPA_TYPE_FLOWMESH_CHECKPOINT{CREATION_ACTION_FLOWMESH_CHECKPOINT};
 inline constexpr uint16_t MPA_TYPE_FLOWMESH_VAULT_PROOF{CREATION_ACTION_FLOWMESH_VAULT_PROOF};
 inline constexpr uint16_t MPA_TYPE_BRIDGE{CREATION_ACTION_BRIDGE};
 inline constexpr uint16_t MPA_TYPE_FINALITY_CERTIFICATE_V2{CREATION_ACTION_FINALITY_CERTIFICATE_V2};
+inline constexpr uint16_t MPA_TYPE_FRESH_FINALITY_KEY_EVIDENCE{CREATION_ACTION_FRESH_FINALITY_KEY_EVIDENCE};
 inline constexpr uint16_t MPA_VERSION_V1{1};
 
 enum class PayloadTypeStatus { UNKNOWN, INACTIVE, ACTIVE };
@@ -136,6 +146,15 @@ inline PayloadTypeStatus GetPayloadTypeStatus(const uint16_t type, const uint16_
                        params.FreshLineageRulesActive(*height)
                    ? PayloadTypeStatus::ACTIVE
                    : PayloadTypeStatus::INACTIVE;
+    case MPA_TYPE_FRESH_FINALITY_KEY_EVIDENCE:
+        // B-37 fresh key binding: live from R_key on a chain whose fresh
+        // lineage uses per-epoch keys, on top of the X-pin configuration. No
+        // shipped network configures it, and a caller without a height fails
+        // closed.
+        return height && Consensus::ModernObjectRulesActive(params) &&
+                       params.FreshKeyRulesActive(*height)
+                   ? PayloadTypeStatus::ACTIVE
+                   : PayloadTypeStatus::INACTIVE;
     default:
         return PayloadTypeStatus::UNKNOWN;
     }
@@ -171,6 +190,8 @@ inline bool PayloadSizeAllowed(const uint16_t type, const size_t size)
         // exact width is checked when the payload is decoded for the epoch's n.
         return size >= FINALITY_CERTIFICATE_V2_RECORD_MIN &&
                size <= FINALITY_CERTIFICATE_V2_RECORD_MAX;
+    case MPA_TYPE_FRESH_FINALITY_KEY_EVIDENCE:
+        return size == FRESH_FINALITY_KEY_EVIDENCE_SIZE;
     default:
         return false;
     }
@@ -342,6 +363,9 @@ inline bool MatchFinalityKeyPairs(const CTransaction& tx, std::vector<FinalityKe
     for (size_t i = 0; i < tx.vout.size(); ++i) {
         const auto cell{ParseMetadataCell(tx.vout[i].scriptPubKey)};
         if (!cell || cell->policy_type != static_cast<uint16_t>(PolicyType::FINALITY_KEY)) continue;
+        // Policy version 2 is the fresh lineage's own binding kind (B-37),
+        // matched by MatchFreshFinalityKeyPairs; V1 bindings never see it.
+        if (cell->policy_version == FRESH_FINALITY_KEY_POLICY_VERSION) continue;
         if (cell->policy_version != POLICY_VERSION_V1) {
             error = "finality-key-cell-version";
             return false;

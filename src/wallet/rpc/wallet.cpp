@@ -898,6 +898,8 @@ RPCHelpMan createfncoin();
 RPCHelpMan submitbridgecarrier();
 RPCHelpMan claimbridgedeposit();
 RPCHelpMan getbridgedepositrecipient();
+RPCHelpMan bridgeforwarderaddress();
+RPCHelpMan bridgesponsorburn();
 RPCHelpMan bridgewithdraw();
 RPCHelpMan importflowmeshkey();
 RPCHelpMan exportflowmeshkey();
@@ -934,6 +936,8 @@ RPCHelpMan startstaking();
 RPCHelpMan bindfinalitykey();
 RPCHelpMan importfinalitykey();
 RPCHelpMan revokefinalitykey();
+RPCHelpMan bindfreshfinalitykey();
+RPCHelpMan getfreshfinalitykeys();
 RPCHelpMan getfinalityinfo();
 RPCHelpMan getfinalityrecoveryinfo();
 RPCHelpMan setfinalityrecovery();
@@ -959,6 +963,8 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &abandontransaction},
         {"wallet", &abortrescan},
         {"wallet", &backupwallet},
+        {"wallet", &bridgeforwarderaddress},
+        {"wallet", &bridgesponsorburn},
         {"wallet", &bridgewithdraw},
         {"wallet", &burnasset},
         {"wallet", &bumpfee},
@@ -973,6 +979,8 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &importflowmeshkey},
         {"wallet", &exportflowmeshkey},
         {"wallet", &revokefinalitykey},
+        {"wallet", &bindfreshfinalitykey},
+        {"wallet", &getfreshfinalitykeys},
         {"wallet", &getfinalityinfo},
         {"wallet", &getfinalityrecoveryinfo},
         {"wallet", &setfinalityrecovery},

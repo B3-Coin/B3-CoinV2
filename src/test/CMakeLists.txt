@@ -50,11 +50,13 @@ add_executable(test_bitcoin
   bridge_eth_light_client_tests.cpp
   bridge_ethereum_calldata_tests.cpp
   bridge_exec_chain_tests.cpp
+  bridge_forwarder_v2_tests.cpp
   bridge_mpt_tests.cpp
   bridge_proof_tests.cpp
   bridge_regtest_beacon_tests.cpp
   bridge_regtest_certify_tests.cpp
   bridge_regtest_pins_tests.cpp
+  bridge_sponsored_fee_tests.cpp
   bridge_state_observation_tests.cpp
   bridge_state_proof_tests.cpp
   bridge_state_tests.cpp
@@ -186,6 +188,9 @@ add_executable(test_bitcoin
   finality_fresh_params_tests.cpp
   finality_v2_tests.cpp
   finality_fresh_lineage_tests.cpp
+  finality_fresh_transport_tests.cpp
+  finality_fresh_key_tests.cpp
+  finality_h1_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp

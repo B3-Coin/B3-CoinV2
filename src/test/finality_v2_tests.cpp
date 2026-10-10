@@ -975,10 +975,23 @@ BOOST_AUTO_TEST_CASE(carrier_registry_type_11)
     BOOST_CHECK(status(1, fresh, R_F + 1) == PayloadTypeStatus::ACTIVE);
     BOOST_CHECK(status(1, fresh, std::numeric_limits<int>::max()) == PayloadTypeStatus::ACTIVE);
     BOOST_CHECK(status(1, fresh, std::nullopt) == PayloadTypeStatus::INACTIVE); // no height: fail closed
-    // Neighbours are unaffected: type 4 stays X-pin gated, 12 stays unknown.
+    // Neighbours are unaffected: type 4 stays X-pin gated; type 12 (B-37
+    // fresh key evidence) is INACTIVE without a fresh-key height and ACTIVE
+    // from it, which leaves type 11 as it was; 13 stays unknown.
     BOOST_CHECK(modern::GetPayloadTypeStatus(4, 1, fresh, R_F - 1) == PayloadTypeStatus::ACTIVE);
     BOOST_CHECK(modern::GetPayloadTypeStatus(4, 1, xpin) == PayloadTypeStatus::ACTIVE);
-    BOOST_CHECK(modern::GetPayloadTypeStatus(12, 1, fresh, R_F) == PayloadTypeStatus::UNKNOWN);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(12, 1, fresh, R_F) == PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(13, 1, fresh, R_F) == PayloadTypeStatus::UNKNOWN);
+    {
+        Consensus::Params keyed{fresh};
+        keyed.fresh_lineage->key_height = R_F - 20;
+        BOOST_CHECK(modern::GetPayloadTypeStatus(12, 1, keyed, R_F - 21) == PayloadTypeStatus::INACTIVE);
+        BOOST_CHECK(modern::GetPayloadTypeStatus(12, 1, keyed, R_F - 20) == PayloadTypeStatus::ACTIVE);
+        BOOST_CHECK(modern::GetPayloadTypeStatus(12, 1, keyed, R_F) == PayloadTypeStatus::ACTIVE);
+        BOOST_CHECK(modern::GetPayloadTypeStatus(12, 1, keyed) == PayloadTypeStatus::INACTIVE);
+        BOOST_CHECK(status(1, keyed, R_F - 1) == PayloadTypeStatus::INACTIVE);
+        BOOST_CHECK(status(1, keyed, R_F) == PayloadTypeStatus::ACTIVE);
+    }
 
     // Shipped networks configure no fresh lineage: type 11 is INACTIVE at
     // every height, including on mainnet where the X-pin types 4/5 are live.

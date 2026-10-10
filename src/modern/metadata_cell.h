@@ -57,6 +57,8 @@ namespace modern {
  *   - ACTIVATION: finality policies 6/7/8 use the F = M plumbing
  *     (Consensus::ModernObjectRulesActive). BRIDGE_RECORD policy 9 is stricter:
  *     it activates only at the separately complete bridge height at/after A3.
+ *     FINALITY_KEY policy version 2 (the fresh lineage's B-37 binding kind)
+ *     activates only from a configured R_key (regtest knob only).
  *     Every incomplete production configuration remains fail closed.
  *   - The legacy era (height <= H) is untouched: the exclusion is applied
  *     only where Consensus::GetB3Era() == MODERN.
@@ -84,13 +86,25 @@ inline constexpr bool IsMetadataCellPolicyType(const uint16_t policy_type)
            policy_type == static_cast<uint16_t>(PolicyType::BRIDGE_RECORD);
 }
 
+//! FINALITY_KEY policy version 2: the fresh lineage's per-epoch key binding
+//! (B-37, modern/finality_fresh_key.h); commitment = validator_key, params =
+//! bls_pubkey || u64 target_epoch. Version 1 stays V1's FINALITY_KEY.
+inline constexpr uint16_t FRESH_FINALITY_KEY_POLICY_VERSION{2};
+
 //! Activation of the metadata carrier for (type, version). Finality cells use
 //! the Modern-object gate; the bridge binding additionally requires its exact
-//! height and complete independently pinned bridge envelope.
+//! height and complete independently pinned bridge envelope. The fresh
+//! FINALITY_KEY cell (7, 2) is active only from R_key on a chain whose fresh
+//! lineage uses B-37 keys (Consensus::Params::FreshKeyRulesActive), which no
+//! shipped network configures; a caller without a height fails closed.
 inline bool IsMetadataCellActive(const uint16_t policy_type, const uint16_t policy_version,
                                  const Consensus::Params& params,
                                  const std::optional<int> height = std::nullopt)
 {
+    if (policy_type == static_cast<uint16_t>(PolicyType::FINALITY_KEY) &&
+        policy_version == FRESH_FINALITY_KEY_POLICY_VERSION) {
+        return height && Consensus::ModernObjectRulesActive(params) && params.FreshKeyRulesActive(*height);
+    }
     if (policy_version != POLICY_VERSION_V1 || !IsMetadataCellPolicyType(policy_type)) return false;
     if (policy_type == static_cast<uint16_t>(PolicyType::BRIDGE_RECORD)) {
         return height && Consensus::BridgeRulesActive(*height, params);

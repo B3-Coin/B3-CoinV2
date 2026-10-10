@@ -8,12 +8,14 @@
 #include <modern/finality_schedule.h>
 #include <modern/finality_types.h>
 #include <node/finality_binding_index.h>
+#include <node/finality_fresh_key_index.h>
 #include <node/finality_fresh_lineage.h>
 #include <node/stake_tracker.h>
 #include <node/validator_set.h>
 #include <primitives/block.h>
 #include <uint256.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -40,6 +42,25 @@ struct FinalizedCheckpoint {
     {
         return a.height == b.height && a.block_hash == b.block_hash && a.epoch == b.epoch && a.certified_at == b.certified_at;
     }
+};
+
+/**
+ * H1 block-producer schedule (bridge V2 finality dependency section 5.1,
+ * FD-2; owner ruling R8), derived from block data alone and only from R_h
+ * (Consensus::Params::h1). Never set below R_h or on a chain without H1.
+ */
+struct ProducerSchedule {
+    //! Producer epoch k (0 at R_h; +1 per rotation and per escape).
+    uint64_t epoch{0};
+    //! First height of producer epoch k (R_h, a rotation or an escape).
+    int epoch_start{-1};
+    //! ProducerSet_k: the weights of every block of epoch k.
+    std::shared_ptr<const ValidatorSetSnapshot> current;
+    //! ProducerSet_(k+1): fixed at the start of epoch k.
+    std::shared_ptr<const ValidatorSetSnapshot> next;
+    //! Height of the latest escape block (-1: none) and the escape count.
+    int last_escape_height{-1};
+    uint64_t escapes{0};
 };
 
 /**
@@ -101,6 +122,46 @@ struct FinalizedCheckpoint {
  * fields or into SetInForceAt (block producers are unchanged by R_f); with
  * the knob absent State::fresh stays empty and V1 behaves exactly as before.
  *
+ * H1 producer rotation (bridge V2 finality dependency section 5.1, FD-2;
+ * owner ruling R8; regtest -b3h1height only): when Consensus::Params::h1 is
+ * set, from R_h the block-producer set is State::producers, no longer the V1
+ * set above, and needs no certificate (E = finality_epoch_blocks):
+ *
+ *   bootstrap   at h = R_h: epoch 0 starts; ProducerSet_0 = Snapshot(R_h-1)
+ *               stamped 0, or, when that snapshot has fewer than
+ *               MIN_FINALITY_SET members, the V1 set in force at R_h-1
+ *               re-stamped 0 (null when neither exists);
+ *               ProducerSet_1 = ProducerSet_0 re-stamped 1.
+ *   rotation    at h = epoch_start + E: ProducerSet_(k+1) becomes current and
+ *               ProducerSet_(k+2) := Snapshot(h-1) stamped k+2, or ProducerSet_
+ *               (k+1) re-stamped (carry-over, as V1's) when the snapshot is
+ *               below MIN_FINALITY_SET. V1's one-epoch lag: a stake change takes
+ *               force within E to 2E blocks.
+ *   escape      a block at h >= R_h whose consensus-checked round is at least
+ *               R_escape (Consensus::Params::H1EscapeRound) takes its weights
+ *               from Snapshot(h-1) whatever its size (no MIN_FINALITY_SET
+ *               floor; only an empty snapshot carries the set otherwise in
+ *               force over) and starts producer epoch k+1 at h with both sets
+ *               equal to it; the next rotation is then at h + E. Applied
+ *               after the bootstrap or rotation at h.
+ *
+ * SetInForceAt is the single "producer set at h" helper; from R_h it answers
+ * from this schedule (and the block's round, for the escape). The V1 fields
+ * (lineage, certificates, checkpoint authority, bridge readiness) are never
+ * read or changed by it (H1-R3). The schedule depends only on heights and
+ * exact block timestamps (H1-R4), so Sync's walk reproduces every rotation
+ * and escape after restart or reindex. Without H1 State::producers stays
+ * empty and V1 decides block producers exactly as before (H1-R1).
+ *
+ * Fresh keys (B-37, regtest -b3freshkeyheight only): when the fresh lineage
+ * also sets R_key, a private FreshKeyBindingTracker (ever-bound keys and
+ * counted fresh bindings, node/finality_fresh_key_index.h) is stepped in
+ * lockstep with the stake and V1 binding trackers and rebuilt with them, and
+ * the fresh committees follow the B-37 seat rules (FreshCommitteeAt,
+ * node/finality_fresh_lineage.h): Committee(Snapshot(h)) seats only members
+ * holding exactly one counted fresh binding for the committee's epoch, on
+ * that key. It never feeds a V1 field; without R_key it is never stepped.
+ *
  * All calls under cs_main; the tracker adds no locking.
  */
 class FinalityTracker
@@ -127,6 +188,14 @@ public:
         //! Fresh finality lineage (digest V2); empty unless params configure
         //! it and the height reached R_f. Independent of every field above.
         std::optional<FreshLineageState> fresh;
+        //! Projected() only: a B-37 committee was unavailable (a tracker
+        //! inconsistency), so `fresh` was reset rather than guessed. Every
+        //! consumer that judges or stores fresh state fails instead
+        //! ("finality-state-unavailable"; ApplyModern leaves the tracker dirty).
+        bool fresh_unavailable{false};
+        //! H1 producer schedule; set only from R_h (Consensus::Params::h1).
+        //! Independent of every V1 field above (H1-R3).
+        std::optional<ProducerSchedule> producers;
         //! The epoch view the pure rules consume (pointers into this state).
         modern::FinalityEpochView View() const;
         //! Size of Set_epoch on this chain, for the coinbase matcher.
@@ -191,12 +260,35 @@ public:
     std::optional<std::pair<int, uint256>> PinnedCheckpoint() const;
     //! The state projected for the block at `height` == SyncedHeight() + 1
     //! (rotation and lineage rules applied; no certificate yet), including
-    //! the fresh lineage's projection when params configure it.
-    State Projected(int height, const Consensus::Params& params) const;
+    //! the fresh lineage's projection when params configure it and, from
+    //! R_h, the H1 producer schedule for a block in `round` (an escape when
+    //! `round` >= R_escape; no round = not an escape). `round` is ignored
+    //! below R_h.
+    State Projected(int height, const Consensus::Params& params,
+                    std::optional<int64_t> round = std::nullopt) const;
     //! The set whose weights govern the block at `height` == SyncedHeight()+1
-    //! (Commit 14 reads block-production weights here): Set_{e+1} when the
-    //! rotation fires at `height`, else Set_e; null when no set exists.
-    std::shared_ptr<const ValidatorSetSnapshot> SetInForceAt(int height, const Consensus::Params& params) const;
+    //! (Commit 14 reads block-production weights here): below R_h (and on a
+    //! chain without H1) Set_{e+1} when the rotation fires at `height`, else
+    //! Set_e; from R_h the H1 producer set for a block in `round` (the
+    //! escape set when `round` >= R_escape). Null when no set exists or the
+    //! tracker is not synced to height - 1 under H1.
+    std::shared_ptr<const ValidatorSetSnapshot> SetInForceAt(int height, const Consensus::Params& params,
+                                                             std::optional<int64_t> round = std::nullopt) const;
+    /**
+     * False when H1 is active at `height` and the producer schedule for it
+     * cannot be derived: the tracker is not synced to height - 1, a height
+     * above R_h has no schedule (a tracker inconsistency), or R_h is not
+     * above M (a configuration the chain parameters refuse). Callers
+     * report an error then, never an ineligible validator. Always true
+     * below R_h and without H1.
+     */
+    bool ProducerScheduleAvailable(int height, const Consensus::Params& params) const;
+    /**
+     * The B-37 fresh key index as of the synced tip: every key ever bound
+     * under either kind and the counted fresh bindings. Null unless `params`
+     * configure fresh keys (FreshKeyModeConfigured) and the tracker is synced.
+     */
+    const FreshKeyBindingIndex* FreshKeys(const Consensus::Params& params) const;
 
 private:
     //! The V1 projection alone (bootstrap, gated rotation, break).
@@ -206,19 +298,57 @@ private:
     bool ApplyModern(const CBlock& block, const CBlockIndex& index,
                      const Consensus::Params& params,
                      const BridgeStateIndex* bridge_index);
-    //! Step the private stake / binding trackers with one modern-era block.
+    //! Step the private stake / binding trackers (and, in fresh-key mode,
+    //! the fresh key tracker) with one modern-era block.
     bool StepTrackers(const CBlock& block, const CBlockIndex& index, const CChain* chain, const BlockManager* blockman,
                       const Consensus::Params& params);
     //! Snapshot(height) from the private trackers (which must be synced to `height`), stamped `epoch`.
     std::optional<ValidatorSetSnapshot> SnapshotAt(uint64_t epoch, int height) const;
+    //! B-37 Committee(Snapshot(request.snapshot_height)) from the private
+    //! trackers, which must be synced to that height (node::BuildFreshCommittee:
+    //! stake weights and V1 bindings define Snapshot(h), the fresh key index
+    //! the seats). Fresh-key mode only; UNAVAILABLE (never "nobody seated")
+    //! if the trackers are not there.
+    FreshCommittee FreshCommitteeAt(const FreshCommitteeRequest& request) const;
     //! Set_{e+1} for the state whose boundary is `boundary_height`: snapshot or carry-over.
     std::shared_ptr<const ValidatorSetSnapshot> SuccessorSet(const State& s, int boundary_height,
                                                              const Consensus::ModernPosParams& pos) const;
+    //! The H1 producer schedule for the block at `height` == SyncedHeight()+1
+    //! in `round` (bootstrap, rotation, escape); nullopt when H1 is not
+    //! active at `height` or the tracker cannot derive it.
+    std::optional<ProducerSchedule> ProjectProducers(int height, const Consensus::Params& params,
+                                                     std::optional<int64_t> round) const;
+    //! ProjectProducers' preconditions: H1 active at `height`, R_h above M,
+    //! the trackers at height - 1 and, above R_h, a stored schedule.
+    //! ProducerScheduleAvailable() is exactly this (or true without H1).
+    bool ProducerInputsReady(int height, const Consensus::Params& params) const;
+    //! Snapshot(SyncedHeight()) stamped `epoch` when it has at least
+    //! `min_size` members (and at least one), else `fallback` re-stamped
+    //! `epoch` (carry-over), else null. Bootstrap and rotation pass
+    //! MIN_FINALITY_SET (V1's carry-over); the escape passes 1.
+    std::shared_ptr<const ValidatorSetSnapshot> ProducerSetOrCarry(uint64_t epoch,
+                                                                   const std::shared_ptr<const ValidatorSetSnapshot>& fallback,
+                                                                   size_t min_size) const;
+    //! Snapshot(SyncedHeight()) stamped 0 (null: no snapshot), memoized per
+    //! synced tip so repeated projections for one parent (validation,
+    //! assembler, staking loop, RPC) build and BLS-decode it once.
+    std::shared_ptr<const ValidatorSetSnapshot> SyncedTipSnapshot() const;
     void Reset();
+
+    //! SyncedTipSnapshot()'s memo; `filled` with a null `snapshot` means
+    //! "no snapshot at that tip". Cleared by Reset().
+    struct TipSnapshotMemo {
+        bool filled{false};
+        uint256 tip{};
+        std::shared_ptr<const ValidatorSetSnapshot> snapshot;
+    };
+    mutable TipSnapshotMemo m_tip_snapshot;
 
     State m_state;
     StakeTracker m_stakes;
     FinalityBindingTracker m_bindings;
+    //! B-37 fresh key bindings; stepped only in fresh-key mode.
+    FreshKeyBindingTracker m_fresh_keys;
     uint256 m_synced_tip{};
     int m_synced_height{-1};
     bool m_dirty{true};

@@ -12,7 +12,9 @@ validators bind the public deterministic test keys of label rt4c-committee
 from the REGTEST ONLY b3-bridge-regtest-certify tool (importfinalitykey
 before bindfinalitykey), so the tool can sign as B3's own fresh committees.
 The tool refuses every chain domain but the -b3modernregtest one and never
-reads a key from a node.
+reads a key from a node. Fresh votes gossip over the P2P message finsigv2 as
+in RT4a; no phase partitions the validators, so no fresh vote is submitted
+by RPC.
 
 1. Bring-up with the test keys: getfinalityset's members are the tool's
    keys, in order; their weights are the committee weights the tool signs
@@ -163,6 +165,8 @@ class B3BridgeRT4cConflictTest(B3BridgeRT4aRoundTripTest):
         self.shuttle_until(lambda: all(self.fresh_finalized_height(node) >= INIT_CHECKPOINT
                                        for node in self.bridge_validators()))
         self.freeze()
+        self.evidence_step("fresh checkpoint 266 finalized by gossip", self.anvil,
+                           finsigv2_bytes_received=self.assert_fresh_gossip(self.bridge_validators()))
         self.deploy_v2_stack()
         self.initialize_verifier()
         self.resume()
@@ -192,8 +196,10 @@ class B3BridgeRT4cConflictTest(B3BridgeRT4aRoundTripTest):
         self.report_conflict(frozen, conflict)
         self.burns_stay_refused(conflict, prebuilt)
         self.release(proof)
+        gossip = self.assert_fresh_gossip(self.bridge_validators())
         self.check_replay_and_reindex(conflict)
         self.evidence_step("RT4c complete", self.anvil, fresh_votes=dict(self.fresh_vote_results),
+                           fresh_vote_transport=self.fresh_vote_transport, finsigv2_bytes_received=gossip,
                            relayed=len(self.relayed), conflict_height=conflict["height"])
 
     # -- 1. the test committee ---------------------------------------------------
@@ -279,7 +285,8 @@ class B3BridgeRT4cConflictTest(B3BridgeRT4aRoundTripTest):
         return True
 
     def settle_fresh_lineage(self, max_lag, timeout=600):
-        """Shuttle fresh votes until fresh_lineage_settled(); leave the validators frozen."""
+        """Stake while fresh votes gossip until fresh_lineage_settled(); leave
+        the validators frozen."""
         deadline = time.time() + timeout
         while True:
             self.resume()

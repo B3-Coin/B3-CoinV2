@@ -190,20 +190,30 @@ std::optional<uint256> FreshHistoryRootAt(const FreshLineageState& state, const 
 
 // ------------------------------------------------------------ projection
 
-void ProjectFreshLineage(std::optional<FreshLineageState>& fresh, const int height, const uint256& parent_hash,
-                         const Consensus::Params& params, const FreshSnapshotAtFn& snapshot_at)
+bool ProjectFreshLineage(std::optional<FreshLineageState>& fresh, const int height, const uint256& parent_hash,
+                         const Consensus::Params& params, const FreshSnapshotAtFn& snapshot_at,
+                         const FreshCommitteeAtFn& committee_at)
 {
     if (!params.fresh_lineage || !params.modern_pos) {
         fresh.reset();
-        return;
+        return true;
     }
     const Consensus::FreshLineageParams& fl{*params.fresh_lineage};
     const Consensus::ModernPosParams& pos{*params.modern_pos};
     if (height < fl.activation_height) {
         fresh.reset();
-        return;
+        return true;
     }
     const int E{pos.finality_epoch_blocks};
+    // B-37 seat rules (header comment) replace the V1-key snapshots only
+    // when the caller supplies them and params set R_key.
+    const bool seat_rules{committee_at && fl.key_height.has_value()};
+    // One committee for `request`: the seat rules' (an unavailable answer
+    // ends the projection, never a guessed committee) or the V1 snapshot.
+    const auto committee{[&](const FreshCommitteeRequest& request) -> FreshCommittee {
+        if (!seat_rules) return FreshCommittee{snapshot_at(request.snapshot_height)};
+        return committee_at(request);
+    }};
 
     if (height == fl.activation_height) {
         // Genesis: the release itself authorizes Set'_0 (no old-set vote),
@@ -214,7 +224,15 @@ void ProjectFreshLineage(std::optional<FreshLineageState>& fresh, const int heig
         s.epoch = 0;
         s.epoch_starts = {height};
         const auto domain{ChainDomain(params)};
-        const auto snap{snapshot_at(height - 1)};
+        // Rule (3): one genesis binding (naming 0, included in [R_key,
+        // R_f - 1]) serves Set'_0 and Set'_1. Below the floor there is no
+        // fallback to the V1 keys: the lineage stays unbootstrapped.
+        const FreshCommittee genesis{committee(FreshCommitteeRequest{height - 1, 0, fl.key_height.value_or(-1)})};
+        if (!genesis.available) {
+            fresh.reset();
+            return false;
+        }
+        const auto& snap{genesis.members};
         if (domain && snap && snap->Size() >= static_cast<size_t>(pos.min_finality_set) && !parent_hash.IsNull()) {
             const auto members{std::make_shared<const ValidatorSetSnapshot>(*snap)};
             s.current = MakeFreshLineageSet(members, 0);
@@ -227,13 +245,16 @@ void ProjectFreshLineage(std::optional<FreshLineageState>& fresh, const int heig
                 s.history, modern::FinalityHistoryLeaf(static_cast<uint64_t>(s.genesis_height), parent_hash));
         }
         fresh = std::move(s);
-        return;
+        return true;
     }
-    if (!fresh || !fresh->bootstrapped || fresh->epoch_starts.empty()) return;
+    if (!fresh || !fresh->bootstrapped || fresh->epoch_starts.empty()) return true;
     FreshLineageState& s{*fresh};
 
     // Handover-gated rotation (V1's rule, V1's E).
     if (s.handover_certified && height >= s.epoch_starts.back() + E) {
+        // start_{e-1} for the epoch e entered here: the B-37 window of the
+        // bindings that fix Set'_{e+1} opens there.
+        const int window_lo{s.epoch_starts.back()};
         s.previous2 = s.previous; // Set'_{e-2}, for the bridge V2 verifier judgement
         s.previous = s.current;
         s.current = s.next;
@@ -241,11 +262,18 @@ void ProjectFreshLineage(std::optional<FreshLineageState>& fresh, const int heig
         s.epoch_starts.push_back(height);
         s.handover_certified = false;
         const uint64_t successor_epoch{s.epoch + 1};
-        const auto snap{snapshot_at(height - 1)};
+        // Rule (2): bindings naming e+1 included in [start_{e-1}, start_e - 1].
+        const FreshCommittee successor{committee(FreshCommitteeRequest{height - 1, successor_epoch, window_lo})};
+        if (!successor.available) {
+            fresh.reset();
+            return false;
+        }
+        const auto& snap{successor.members};
         if (snap && snap->Size() >= static_cast<size_t>(pos.min_finality_set)) {
             s.next = MakeFreshLineageSet(std::make_shared<const ValidatorSetSnapshot>(*snap), successor_epoch);
         } else {
-            // Carry-over: the committee in force serves another epoch.
+            // Carry-over (rule (4) under B-37): the committee in force
+            // serves another epoch with its members and keys.
             s.next = MakeFreshLineageSet(s.current->members, successor_epoch);
         }
     }
@@ -254,6 +282,7 @@ void ProjectFreshLineage(std::optional<FreshLineageState>& fresh, const int heig
         static_cast<int64_t>(height) - s.epoch_starts.back() >= int64_t{E} + fl.max_epoch_extension) {
         s.lineage_broken = true;
     }
+    return true;
 }
 
 // ------------------------------------------------------------- judgement
