@@ -338,6 +338,47 @@ BOOST_AUTO_TEST_CASE(fresh_keys_are_independent_of_the_wallet_and_its_backups)
     TestUnloadWallet(std::move(wallet));
 }
 
+BOOST_AUTO_TEST_CASE(replacement_refuses_a_key_bound_after_the_policy_read)
+{
+    CKey identity;
+    identity.MakeNewKey(/*fCompressed=*/true);
+    const modern::ValidatorKeyBytes vk{XOnly(identity.GetPubKey())};
+    const fs::path signer_dir{gArgs.GetDataDirNet() / "replacement-race"};
+    node::FreshKeyStore store;
+    const auto original{GenerateFreshFinalityKey(store, signer_dir, CHAIN_DOMAIN, vk, 5)};
+    BOOST_REQUIRE_MESSAGE(original, util::ErrorString(original).original);
+    const auto original_pubkey{Pk(*original)};
+    const uint256 txid{uint256{"7777777777777777777777777777777777777777777777777777777777777777"}};
+    std::string error;
+    unsigned int policy_calls{0};
+    const FreshKeyReplacePolicy stale_policy{[&](const node::FreshKeyRecord& record) -> std::optional<std::string> {
+        ++policy_calls;
+        BOOST_REQUIRE(record.bind_txid.IsNull());
+        // Another loaded wallet with the same validator publishes the exact
+        // key after this caller observed it as unbound. No threads or timing
+        // assumptions are needed to reproduce the interleaving.
+        node::FreshKeyStore publisher;
+        BOOST_REQUIRE_MESSAGE(publisher.Open(signer_dir, CHAIN_DOMAIN, vk, error), error);
+        BOOST_REQUIRE_MESSAGE(publisher.SetBindTxid(original_pubkey, txid, error), error);
+        return "never published";
+    }};
+    std::vector<std::string> replaced;
+    const auto replacement{GenerateFreshFinalityKey(store, signer_dir, CHAIN_DOMAIN, vk, 5,
+                                                    stale_policy, &replaced)};
+    BOOST_CHECK(!replacement);
+    BOOST_CHECK_EQUAL(policy_calls, 1U);
+    BOOST_CHECK(replaced.empty());
+
+    node::FreshKeyStore reopened;
+    BOOST_REQUIRE_MESSAGE(reopened.Open(signer_dir, CHAIN_DOMAIN, vk, error), error);
+    const auto record{reopened.RecordFor(original_pubkey)};
+    BOOST_REQUIRE(record);
+    BOOST_CHECK(record->Held());
+    BOOST_CHECK(record->bind_txid == txid);
+    BOOST_CHECK(reopened.SecretFor(original_pubkey).has_value());
+    BOOST_CHECK_EQUAL(reopened.Records().size(), 1U);
+}
+
 BOOST_AUTO_TEST_CASE(rpcs_refuse_or_report_without_key_mode)
 {
     // Regtest without -b3freshkeyheight (as on every shipped network): the
