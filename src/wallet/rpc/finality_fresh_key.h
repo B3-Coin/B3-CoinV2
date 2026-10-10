@@ -114,8 +114,10 @@ using FreshKeyReplacePolicy = std::function<std::optional<std::string>(const nod
  * generate a new random key for `target_epoch` in it: durable before this
  * returns. A HELD key for that epoch refuses (a second binding would void
  * the seat) unless `replace` gives a reason to replace it; such a key is
- * erased first (reopening the store once if a signer pass rewrote it
- * meanwhile) and "<pubkey>: <reason>" is appended to `replaced`. The store
+ * erased first only if the observed store state is still current. A stale
+ * store refuses: replacement eligibility must be re-evaluated by a new
+ * call, never carried across a reopen. "<pubkey>: <reason>" is appended
+ * to `replaced`. The store
  * instance is returned open so the caller can record the binding
  * transaction (SetBindTxid).
  */
@@ -142,9 +144,7 @@ inline util::Result<bls::SecretKey> GenerateFreshFinalityKey(node::FreshKeyStore
                 record.bind_txid.IsNull() ? std::string{}
                                           : strprintf(" (binding transaction %s)", record.bind_txid.GetHex())))};
         }
-        if (!store.Erase(record.bls_pubkey, error) &&
-            !(store.Open(signer_directory, chain_domain, validator_key, error) &&
-              store.Erase(record.bls_pubkey, error))) {
+        if (!store.Erase(record.bls_pubkey, error)) {
             return util::Error{Untranslated(strprintf("cannot erase the replaceable fresh key %s (%s): %s",
                                                       HexStr(record.bls_pubkey), *reason, error))};
         }
