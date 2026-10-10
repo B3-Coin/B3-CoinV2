@@ -1,7 +1,17 @@
 // Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see COPYING.
 
+// Windows headers define SERVICE_STOPPED. Exercise that macro environment
+// even on non-Windows builders so public health vocabulary stays portable.
+#ifndef SERVICE_STOPPED
+#define SERVICE_STOPPED 0x00000001
+#define B3_HEALTH_TEST_SERVICE_STOPPED
+#endif
 #include <node/flowmesh_health.h>
+#ifdef B3_HEALTH_TEST_SERVICE_STOPPED
+#undef SERVICE_STOPPED
+#undef B3_HEALTH_TEST_SERVICE_STOPPED
+#endif
 
 #include <univalue.h>
 
