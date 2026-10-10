@@ -382,7 +382,7 @@ BOOST_AUTO_TEST_CASE(market_readiness_is_market_scoped_and_labels_one_state)
     BOOST_CHECK_EQUAL(evaluate({}, &paused, T0).state, "idle");
 
     // Service reasons apply to every market and label its state first.
-    readiness = evaluate({FlowMeshNotReady::SERVICE_STOPPED}, &halted, T0);
+    readiness = evaluate({FlowMeshNotReady::SERVICE_IS_STOPPED}, &halted, T0);
     BOOST_CHECK(Names(readiness.not_ready) == (Names_t{"service_stopped", "market_halted"}));
     BOOST_CHECK_EQUAL(readiness.state, "stopped");
     BOOST_CHECK_EQUAL(evaluate({FlowMeshNotReady::BELOW_ACTIVATION}, &market, T0).state, "inactive");

@@ -56,7 +56,7 @@ const char* FlowMeshGateReasonName(FlowMeshGateReason reason);
 //! Closed vocabulary of reasons an endpoint reports itself not ready.
 enum class FlowMeshNotReady : uint8_t {
     // Service level: they apply to every market this node serves.
-    SERVICE_STOPPED = 0,
+    SERVICE_IS_STOPPED = 0,
     INITIAL_BLOCK_DOWNLOAD,
     BELOW_ACTIVATION,
     RECONCILING_PROLONGED,

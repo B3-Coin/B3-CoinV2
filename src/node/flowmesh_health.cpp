@@ -62,7 +62,7 @@ const char* FlowMeshGateReasonName(const FlowMeshGateReason reason)
 const char* FlowMeshNotReadyName(const FlowMeshNotReady reason)
 {
     switch (reason) {
-    case FlowMeshNotReady::SERVICE_STOPPED: return "service_stopped";
+    case FlowMeshNotReady::SERVICE_IS_STOPPED: return "service_stopped";
     case FlowMeshNotReady::INITIAL_BLOCK_DOWNLOAD: return "initial_block_download";
     case FlowMeshNotReady::BELOW_ACTIVATION: return "below_activation";
     case FlowMeshNotReady::RECONCILING_PROLONGED: return "reconciling_prolonged";
@@ -233,7 +233,7 @@ std::vector<FlowMeshNotReady> EvaluateFlowMeshServiceReadiness(
 {
     std::vector<FlowMeshNotReady> out;
     if (state != FlowMeshServiceState::RUNNING) {
-        Add(out, FlowMeshNotReady::SERVICE_STOPPED);
+        Add(out, FlowMeshNotReady::SERVICE_IS_STOPPED);
         return out;
     }
     if (gate.closed) {
@@ -280,7 +280,7 @@ FlowMeshMarketReadiness EvaluateFlowMeshMarketReadiness(
     }
     out.ready = out.not_ready.empty();
     const auto has = [&](const FlowMeshNotReady reason) { return Contains(out.not_ready, reason); };
-    if (has(FlowMeshNotReady::SERVICE_STOPPED)) {
+    if (has(FlowMeshNotReady::SERVICE_IS_STOPPED)) {
         out.state = "stopped";
     } else if (!market) {
         out.state = "not_installed";
