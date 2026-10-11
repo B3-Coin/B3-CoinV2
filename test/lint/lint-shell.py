@@ -69,8 +69,13 @@ def main():
     files = get_files(files_cmd)
     reg = re.compile(r'src/[leveldb,secp256k1,minisketch]')
 
+    def is_zsh(fname: str) -> bool:
+        # ShellCheck cannot parse zsh (the macOS packaging and demo scripts).
+        with open(fname, 'rb') as f:
+            return f.readline().strip() in (b'#!/bin/zsh', b'#!/usr/bin/env zsh')
+
     def should_exclude(fname: str) -> bool:
-        return bool(reg.match(fname))
+        return bool(reg.match(fname)) or is_zsh(fname)
 
     # remove everything that doesn't match this regex
     files[:] = [file for file in files if not should_exclude(file)]
