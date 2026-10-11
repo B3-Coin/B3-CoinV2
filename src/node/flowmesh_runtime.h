@@ -701,6 +701,10 @@ private:
     bool InitializeMarket(const FlowMeshRuntimeMarketConfig& config,
                           std::string& error);
     void WorkerLoop();
+    //! Halt the market a failed work item belonged to, or every market when
+    //! the item was not market-scoped. Never lets the exception leave the worker.
+    void ContainWorkerException(const std::optional<flowmesh::MarketId>& market_id,
+                                const std::string& what);
     //! EnqueueWireMessage, with the frame marked counted (QueuedWireMessage).
     flowmesh::QueueResult Enqueue(flowmesh::WirePeerId peer, flowmesh::WireMessage message, bool counted);
     void ProcessMessage(const flowmesh::QueuedWireMessage& queued, uint64_t dequeued_us);
