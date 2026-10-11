@@ -28,7 +28,7 @@ class SessionTests(unittest.TestCase):
 
     def test_expired_and_exact_expiry_refused(self):
         end = SESSION.utc(self.window["maintenance_ends_at"])
-        for now in (end, end + timedelta(seconds=1), SESSION.utc("2026-10-13T00:00:00Z")):
+        for now in (end, end + timedelta(seconds=1), end + timedelta(days=2)):
             with self.subTest(now=now), self.assertRaisesRegex(RuntimeError, "window has ended"):
                 SESSION.check_window(self.window, now)
 
@@ -64,7 +64,8 @@ class SessionTests(unittest.TestCase):
             SESSION.check_window(self.window, self.now.replace(tzinfo=None))
 
     def test_window_cannot_outlive_leaf(self):
-        changed = {**self.window, "maintenance_ends_at": "2026-10-13T00:00:00Z"}
+        beyond_leaf = SESSION.utc(self.window["recorded_leaf_expires_at"]) + timedelta(seconds=1)
+        changed = {**self.window, "maintenance_ends_at": beyond_leaf.strftime("%Y-%m-%dT%H:%M:%SZ")}
         with self.assertRaisesRegex(RuntimeError, "cannot outlive"):
             SESSION.parse_window(json.dumps(changed).encode(), self.raw)
 

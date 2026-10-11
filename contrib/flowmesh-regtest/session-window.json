@@ -2,6 +2,6 @@
   "format": "b3-regtest-session-window-v1",
   "profile_id": "vps-regtest-20260928-test5",
   "profile_sha256": "de4061353cdcc4e94079638a582328f9ea5978df9cc1dd6f4b61fc5152e20f09",
-  "maintenance_ends_at": "2026-10-11T00:00:00Z",
-  "recorded_leaf_expires_at": "2026-10-12T14:59:29Z"
+  "maintenance_ends_at": "2026-10-18T00:00:00Z",
+  "recorded_leaf_expires_at": "2026-10-21T14:02:47Z"
 }

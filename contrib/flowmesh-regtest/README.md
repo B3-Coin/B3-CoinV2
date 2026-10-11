@@ -3,10 +3,15 @@
 This is a temporary, valueless test network. It is NOT a mainnet upgrade or
 finished FlowMesh V2. Do not import any real wallet, seed, private key or FN key.
 
+October 11 coordinator status: HTTPS has been renewed under the same CA, but
+the existing test checkpoint manager remains stopped pending a separately
+reviewed maintenance-helper correction. Build artifacts are not yet a trading
+readiness announcement. Wait for the coordinator's network-ready confirmation.
+
 ## Start
 
-1. Download the archive for your platform from this prerelease and check its
-   SHA256 against the release's checksum file.
+1. Use the coordinator's verified archive for your platform and check its
+   SHA256 against the supplied checksum file. CI artifacts are not a public release.
 2. Extract the whole archive. Windows: run `B3FlowMeshRegtest.exe`.
    Mac: open `B3 FlowMesh REGTEST.app`.
 3. The app accepts **no extra arguments**. Do not edit your normal
@@ -102,14 +107,17 @@ handling; do not promise automatic liquidity or
 immediate payout. A saved/submitted action is not necessarily certified or filled.
 Do not press Retry repeatedly or replace an uncertain instruction.
 
-Maintenance ends by 2026-10-11 00:00 UTC or the bounded checkpoint/sweep budget.
-The TLS leaf expires 2026-10-12 14:59:29 UTC. Stop if trust or synchronization
+The renewed session window ends by 2026-10-18 00:00 UTC or the existing bounded
+checkpoint/sweep budget. The renewed TLS leaf expires 2026-10-21 14:02:47 UTC.
+Renewal does not resolve the stopped manager described above. Stop if trust or synchronization
 fails; do not weaken verification. Services may be unavailable before that time.
 
 ## Release session checks
 
-The historical window above has ended. It is not renewed by a successful build.
-New packaging now refuses this expired session before producing handoff archives.
+The immutable embedded profile's availability text records the historical
+October 11 window. The coordinator authorized renewal on October 11; the
+separate versioned session window records the new dates without rewriting the
+profile's storage identity. Packaging refuses an expired session before producing handoff archives.
 The existing embedded profile, public CA and storage identity remain unchanged;
 do not delete or rewrite tester data to bypass the refusal.
 
@@ -133,8 +141,9 @@ python3 -B contrib/flowmesh-regtest/session_preflight.py --probe-tls
 The last command, only after a valid declared window, performs one verified TLS
 handshake to the fixed approved endpoint. It sends no HTTP, wallet or trading
 request and retains CA and hostname verification. An offline window pass alone
-does not verify live TLS or service readiness. Current expired-window refusal
-occurs before any connection.
+does not verify live TLS or service readiness. Expired-window refusal occurs
+before any connection. The renewed leaf was independently verified through
+the unchanged pinned CA and IP-name checks; chain progress remains a separate gate.
 
 CI runs the offline window gate before expensive platform builds. Source fixes
 in the native node and Qt now trigger the guarded build workflow, not only

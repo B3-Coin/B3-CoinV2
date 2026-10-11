@@ -1,5 +1,46 @@
 # Regtest release gates and local qualification
 
+## October 11 renewal update
+
+The owner authorized renewal of the isolated regtest service and certificate,
+with no mainnet changes or data reset. Its HTTPS leaf now expires October 21
+at 14:02:47 UTC and verifies under the unchanged pinned public CA. The declared
+session ends October 18 at 00:00 UTC; the lifetime 128-operation limit remains
+unchanged, with two operations already completed. This is a bounded renewal,
+not an indefinite service promise.
+
+Only the API-owning regtest node was cleanly restarted, using the same binary,
+configuration and data directory. All four finality signer journal files were
+byte-identical before and after restart. Data-directory identities, CA, existing
+server key, CSR and all four node configurations were preserved. The old leaf
+and maintenance script remain archived on the VPS. Mainnet's process identity,
+executable hash, configuration hash and restart count were unchanged.
+
+Renewal inspection found a separate operational blocker before starting the
+checkpoint manager. Its unchanged helper broadcasts a checkpoint and then
+calls `confirm()`, which calls `mine_to()` with the current height plus missing
+confirmations. `mine_to()` has a bootstrap-only upper bound of 10,000, while
+the preserved test chain is at 100,837. Starting the manager would therefore
+risk an avoidable failure after broadcast. It remains stopped, with no new
+checkpoint attempt, transaction, manual signer action or data repair. All four
+replicas agreed on the existing tip; native finality lineage was unbroken.
+Read-only pre-arm checks passed, but they do not repair the confirmation bound.
+
+The renewed leaf's DER SHA256 is
+`33466d27abd4ae34bf0574a4991b652070570676382997e8563f10327e935454`.
+The existing profile and CA bytes remain unchanged. Forty-six packaging,
+session and workflow checks passed after making negative date tests relative
+to the declared window instead of assuming October 13 is always expired.
+The live TLS preflight returned `WINDOW_VALID_TLS_VERIFIED` on October 11
+at 14:03:40 UTC. It explicitly reports `full_release_qualified: false`.
+
+GitHub builds may produce review artifacts, not a public release or proof of
+network trading readiness. Maintenance recovery, tester-network trading and
+the existing unresolved limits below remain gates. No binary upgrade, mainnet
+activation, wallet funding or data migration is part of this renewal.
+
+## Earlier frozen qualification
+
 The local trading round trip and Mac guarded-client checks pass. Tester
 distribution remains blocked by the expired declared service window and the
 remaining platform and tester-network qualification. The VPS is unchanged;
