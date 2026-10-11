@@ -156,6 +156,7 @@ BASE_SCRIPTS = [
     # vv Tests less than 60s vv
     'rpc_psbt.py',
     'wallet_mpa_funding.py',
+    'wallet_releasestake.py',
     'wallet_fundrawtransaction.py',
     'wallet_bumpfee.py',
     'wallet_v3_txs.py',
