@@ -481,7 +481,7 @@ static RPCResult HealthResult()
         {Type::OBJ, "service", "", {
             {Type::STR, "state", "running, stopped or dormant (the A2/A3 schedule is incomplete)"},
             {Type::STR, "chain_gate", /*optional=*/true, "B3 reconciliation gate while running: open or closed"},
-            {Type::STR, "chain_gate_reason", /*optional=*/true, "open, starting, initial_block_download, below_activation, reconciling, idle_wait_timeout, store_reconciliation_failed, market_refresh_failed, checkpoint_reconciliation_failed or tip_changed"},
+            {Type::STR, "chain_gate_reason", /*optional=*/true, "open, starting, initial_block_download, below_activation, reconciling, idle_wait_timeout, store_reconciliation_failed, market_refresh_failed, checkpoint_reconciliation_failed, tip_changed or reconciliation_exception"},
             {Type::NUM, "chain_gate_closed_ms", /*optional=*/true, "Local milliseconds the gate has been continuously closed"},
             {Type::NUM, "worker_observation_age_ms", /*optional=*/true, "Local milliseconds since the runtime worker last published an observation; grows while the worker is stalled"},
             {Type::NUM, "flowmesh_peers", /*optional=*/true, "Connected FlowMesh peers (operator detail)"},

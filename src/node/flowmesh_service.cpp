@@ -404,8 +404,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         std::lock_guard<std::mutex> lock{mutex};
         return running && !stopping;
     }
-    //! Callers hold reconcile_mutex.
+    //! Callers hold reconcile_mutex. Never throws: an exception fails
+    //! closed (see ContainReconcileException).
     void ReconcileAtTip(const CBlockIndex* new_tip, bool initial_download);
+    void ReconcileAtTipOnce(const CBlockIndex* new_tip, bool initial_download);
+    void ContainReconcileException(const std::string& what);
     void ReconcileCurrentTip();
 
     // Health observation only: no gate predicate, admission or runtime
@@ -486,6 +489,8 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     mutable std::atomic<uint64_t> pending_checkpoint_lookups{0}, pending_checkpoint_scans{0};
     // Test observation only (ClientOutcomeReadsForTest); relaxed, never a gate.
     mutable std::atomic<uint64_t> client_outcome_reads{0};
+    // Test fault injection only (ThrowOnReconciliationsForTest).
+    std::atomic<unsigned> reconcile_throws_for_test{0};
 
     //! NextCheckpointMpa's inputs, behind its gates in its order: the
     //! reconciled tip, the running market's store, its marker (with the
@@ -1381,27 +1386,36 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
             if (stopping) break;
             std::shared_ptr<FlowMeshRuntime> active{runtime};
             lock.unlock();
-            // Maintenance must continue while B3 reconciliation closes the
-            // signing gate: expire deferred ingress and cancel stale queued
-            // copies. Runtime production/retries still check chain validity.
-            if (active) {
-                active->NotifyTick();
-            }
-            // A failed reconciliation is retried at the current tip, at a
-            // bounded rate, never alongside a tip callback's reconciliation.
-            // A persistent failure backs off to one retry per minute.
-            if (!reconcile_retry_wanted.load(std::memory_order_acquire)) {
-                reconcile_retry_backoff = FLOWMESH_RECONCILE_RETRY_INTERVAL;
-            } else if (std::chrono::steady_clock::now() >= next_reconcile_retry) {
-                std::unique_lock<std::mutex> reconcile{reconcile_mutex, std::try_to_lock};
-                if (reconcile.owns_lock()) {
-                    ReconcileCurrentTip();
-                    if (reconcile_retry_wanted.load(std::memory_order_acquire)) {
-                        reconcile_retry_backoff = std::min(reconcile_retry_backoff * 2,
-                                                           FLOWMESH_RECONCILE_RETRY_MAX_INTERVAL);
-                    }
+            // An exception escaping this thread would terminate the node.
+            // Reconciliation contains its own; anything else is logged and
+            // the next tick tries again.
+            try {
+                // Maintenance must continue while B3 reconciliation closes the
+                // signing gate: expire deferred ingress and cancel stale queued
+                // copies. Runtime production/retries still check chain validity.
+                if (active) {
+                    active->NotifyTick();
                 }
-                next_reconcile_retry = std::chrono::steady_clock::now() + reconcile_retry_backoff;
+                // A failed reconciliation is retried at the current tip, at a
+                // bounded rate, never alongside a tip callback's reconciliation.
+                // A persistent failure backs off to one retry per minute.
+                if (!reconcile_retry_wanted.load(std::memory_order_acquire)) {
+                    reconcile_retry_backoff = FLOWMESH_RECONCILE_RETRY_INTERVAL;
+                } else if (std::chrono::steady_clock::now() >= next_reconcile_retry) {
+                    std::unique_lock<std::mutex> reconcile{reconcile_mutex, std::try_to_lock};
+                    if (reconcile.owns_lock()) {
+                        ReconcileCurrentTip();
+                        if (reconcile_retry_wanted.load(std::memory_order_acquire)) {
+                            reconcile_retry_backoff = std::min(reconcile_retry_backoff * 2,
+                                                               FLOWMESH_RECONCILE_RETRY_MAX_INTERVAL);
+                        }
+                    }
+                    next_reconcile_retry = std::chrono::steady_clock::now() + reconcile_retry_backoff;
+                }
+            } catch (const std::exception& e) {
+                LogError("FlowMesh ticker caught an exception: %s\n", e.what());
+            } catch (...) {
+                LogError("FlowMesh ticker caught an unknown exception\n");
             }
             lock.lock();
         }
@@ -2606,6 +2620,11 @@ FlowMeshObservedTimeStore& FlowMeshService::ObservedTimeStoreForTest() const
     return *m_impl->observed_store;
 }
 
+void FlowMeshService::ThrowOnReconciliationsForTest(const unsigned count)
+{
+    m_impl->reconcile_throws_for_test.store(count, std::memory_order_release);
+}
+
 FlowMeshServiceMemoCounts FlowMeshService::MemoCountsForTest() const
 {
     const auto& s{*m_impl};
@@ -3153,6 +3172,33 @@ void FlowMeshService::Impl::ReconcileCurrentTip()
 
 void FlowMeshService::Impl::ReconcileAtTip(const CBlockIndex* new_tip, const bool initial_download)
 {
+    // Runs on the validation-interface thread for a tip callback and on the
+    // ticker for a retry; an exception escaping either terminates the node.
+    try {
+        ReconcileAtTipOnce(new_tip, initial_download);
+    } catch (const std::exception& e) {
+        ContainReconcileException(e.what());
+    } catch (...) {
+        ContainReconcileException("unknown exception");
+    }
+}
+
+void FlowMeshService::Impl::ContainReconcileException(const std::string& what)
+{
+    // Fail closed: the gate stays (or is again) shut, so nothing is signed or
+    // admitted against a partly reconciled view. The retry redoes the whole
+    // reconciliation from durable state, as for any other failure.
+    reconcile_retry_wanted.store(true, std::memory_order_release);
+    try {
+        SetChainReconciling(true, FlowMeshGateReason::RECONCILIATION_EXCEPTION);
+        LogError("FlowMesh remains paused: B3 checkpoint reconciliation threw: %s\n", what);
+    } catch (...) {
+        // The gate's own atomic stores precede anything in it that can throw.
+    }
+}
+
+void FlowMeshService::Impl::ReconcileAtTipOnce(const CBlockIndex* new_tip, const bool initial_download)
+{
     if (!RunningNow()) return;
     // A tip callback supersedes any pending retry; a retryable failure
     // below re-arms it.
@@ -3184,6 +3230,11 @@ void FlowMeshService::Impl::ReconcileAtTip(const CBlockIndex* new_tip, const boo
         return;
     }
     ReconciliationTrace("idle_wait_completed", DeliveryGeneration(), callback_tip);
+    for (unsigned throws{reconcile_throws_for_test.load(std::memory_order_acquire)}; throws > 0;) {
+        if (reconcile_throws_for_test.compare_exchange_weak(throws, throws - 1, std::memory_order_acq_rel)) {
+            throw std::runtime_error{"injected reconciliation fault"};
+        }
+    }
 
     std::string error;
     if (!ReconcileAllStoreConnections(error)) {

@@ -50,6 +50,7 @@ enum class FlowMeshGateReason : uint8_t {
     MARKET_REFRESH_FAILED,
     CHECKPOINT_RECONCILIATION_FAILED,
     TIP_CHANGED,
+    RECONCILIATION_EXCEPTION,
 };
 const char* FlowMeshGateReasonName(FlowMeshGateReason reason);
 

@@ -55,6 +55,7 @@ const char* FlowMeshGateReasonName(const FlowMeshGateReason reason)
     case FlowMeshGateReason::MARKET_REFRESH_FAILED: return "market_refresh_failed";
     case FlowMeshGateReason::CHECKPOINT_RECONCILIATION_FAILED: return "checkpoint_reconciliation_failed";
     case FlowMeshGateReason::TIP_CHANGED: return "tip_changed";
+    case FlowMeshGateReason::RECONCILIATION_EXCEPTION: return "reconciliation_exception";
     }
     return "unknown";
 }
