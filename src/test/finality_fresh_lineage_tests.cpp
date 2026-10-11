@@ -2484,6 +2484,270 @@ BOOST_FIXTURE_TEST_CASE(staging_signer_restarts_after_two_certified_epochs, Fres
     }
 }
 
+BOOST_FIXTURE_TEST_CASE(staging_orphan_recovers_from_archived_same_epoch_authority, FreshLineageFixture)
+{
+    // Two isolated journal scenarios share one real fork fixture: B's old
+    // vote is X/G+5 in one, X/G+15 in the other. The latter must stay blocked
+    // when Y's only included epoch-0 certificate is the lower G+10. These
+    // are alternative test histories, not simultaneous production signers.
+    PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/200,
+                         /*with_unbound_c=*/false, /*with_bound_c=*/true,
+                         /*with_bound_d=*/true);
+    m_G = m_M + 10;
+    m_Rf = m_G + 1;
+    MutableConsensus().fresh_lineage = Consensus::FreshLineageParams{
+        .activation_height = m_Rf, .max_epoch_extension = FRESH_EXTENSION, .staging_signer = true};
+    const Consensus::Params& consensus{m_node.chainman->GetConsensus()};
+    const int G{m_G};
+    std::string error;
+    const fs::path dir{m_path_root / "fresh-archived-orphan-low"};
+    const fs::path high_dir{m_path_root / "fresh-archived-orphan-high"};
+
+    // A/C/D sign genuine certificates: 33/34 weight and 3/4 seats. B's
+    // absent/orphaned key is never used to manufacture canonical authority.
+    const auto peer_certificate{[&](const node::ValidatorSetSnapshot& signing, const uint256& digest) {
+        modern::FinalityCertificate cert;
+        cert.signer_bitmap.assign(modern::SignerBitmapBytes(signing.Size()), 0);
+        std::vector<bls::Signature> sigs;
+        for (uint32_t i{0}; i < signing.Size(); ++i) {
+            const auto& pk{signing.Members()[i].bls_pubkey};
+            const bls::SecretKey* key{nullptr};
+            if (pk == m_bls_a.GetPublicKey().Compressed()) key = &m_bls_a;
+            if (pk == m_bls_c.GetPublicKey().Compressed()) key = &m_bls_c;
+            if (pk == m_bls_d.GetPublicKey().Compressed()) key = &m_bls_d;
+            if (!key) continue;
+            cert.signer_bitmap[i / 8] |= static_cast<unsigned char>(1U << (i % 8));
+            sigs.push_back(key->Sign(std::span<const unsigned char>(digest.begin(), 32)));
+        }
+        BOOST_REQUIRE_EQUAL(sigs.size(), 3U);
+        const auto aggregate{bls::AggregateSignatures(sigs)};
+        BOOST_REQUIRE(aggregate.has_value());
+        cert.aggregate_sig = aggregate->Compressed();
+        return cert;
+    }};
+    const auto peer_v1{[&](const int checkpoint) {
+        const auto projected{ProjectedNext()};
+        const auto epoch{modern::EpochOfHeight(projected.epoch_starts, checkpoint)};
+        BOOST_REQUIRE(epoch.has_value());
+        const bool delayed{*epoch != projected.epoch};
+        const auto signing{delayed ? projected.previous : projected.current};
+        BOOST_REQUIRE(signing && projected.current && projected.next);
+        modern::FinalizedBlock fb;
+        fb.height = static_cast<uint64_t>(checkpoint);
+        fb.block_hash = ChainHashAt(checkpoint);
+        fb.validator_set_hash = delayed ? projected.current->SetHash() : projected.next->SetHash();
+        fb.epoch = *epoch;
+        const auto [payload, cell]{modern::BuildFinalityCertificate(
+            fb, peer_certificate(*signing, modern::FinalityDigest(m_domain, fb)))};
+        CMpaRecord record;
+        record.payload_type = modern::MPA_TYPE_FINALITY_CERTIFICATE;
+        record.payload_version = modern::MPA_VERSION_V1;
+        record.payload = payload;
+        return std::make_pair(cell, std::move(record));
+    }};
+    const auto peer_v2{[&](const int checkpoint) {
+        const auto fb{FreshFbForNext(checkpoint)};
+        const auto projected{ProjectedNext()};
+        BOOST_REQUIRE(projected.fresh);
+        const auto signing{projected.fresh->SetForEpoch(fb.epoch)};
+        BOOST_REQUIRE(signing && signing->members);
+        CMpaRecord record;
+        record.payload_type = modern::MPA_TYPE_FINALITY_CERTIFICATE_V2;
+        record.payload_version = modern::MPA_VERSION_V1;
+        record.payload = modern::EncodeCertificatePayloadV2(
+            fb, peer_certificate(*signing->members, modern::FinalityDigestV2(m_domain, fb)));
+        return record;
+    }};
+
+    node::FinalitySigner original, high_original;
+    BOOST_REQUIRE_MESSAGE(original.SetKeysPersistent({m_bls_b}, m_vk_b, m_domain, dir, error), error);
+    BOOST_REQUIRE_MESSAGE(high_original.SetKeysPersistent({m_bls_b}, m_vk_b, m_domain, high_dir, error), error);
+    node::FinalitySignaturePool original_pool, high_pool;
+    ProduceTo(G, m_vk_a);
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        BOOST_CHECK(original.MaybeSignFresh(Finality(), chainstate.m_chain, consensus,
+                                            original_pool.Fresh()).empty());
+        BOOST_CHECK(high_original.MaybeSignFresh(Finality(), chainstate.m_chain, consensus,
+                                                 high_pool.Fresh()).empty());
+    }
+    ProduceTo(G + 8, m_vk_a);
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        const auto votes{original.MaybeSignFresh(Finality(), chainstate.m_chain, consensus,
+                                                 original_pool.Fresh())};
+        BOOST_REQUIRE_EQUAL(votes.size(), 1U);
+        BOOST_CHECK_EQUAL(votes[0].height, static_cast<uint64_t>(G + 5));
+        BOOST_CHECK_EQUAL(votes[0].epoch, 0U);
+    }
+    BOOST_REQUIRE(original.FreshStore().State());
+    const auto before{*original.FreshStore().State()};
+    const auto original_bytes{FileBytes(original.FreshStore().Path())};
+    ProduceTo(G + 18, m_vk_a);
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        const auto votes{high_original.MaybeSignFresh(Finality(), chainstate.m_chain, consensus,
+                                                      high_pool.Fresh())};
+        BOOST_REQUIRE_EQUAL(votes.size(), 3U);
+        BOOST_CHECK_EQUAL(votes.back().height, static_cast<uint64_t>(G + 15));
+    }
+    BOOST_REQUIRE(high_original.FreshStore().State());
+    const auto high_before{*high_original.FreshStore().State()};
+    const auto high_bytes{FileBytes(high_original.FreshStore().Path())};
+
+    // Reorg after the common genesis G. X contains actual signed blocks but
+    // no included certificate above G; Y keeps the exact same lineage id.
+    const uint256 lineage{Fresh()->lineage_id};
+    CBlockIndex* fork_root{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[G + 1])};
+    BOOST_REQUIRE(fork_root);
+    {
+        BlockValidationState state;
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().InvalidateBlock(state, fork_root));
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().ActivateBestChain(state));
+    }
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, G);
+    const CBlock replacement{BuildFreshBlock({}, {}, {}, /*extra=*/1)};
+    BOOST_REQUIRE(Probe(replacement).empty());
+    BOOST_REQUIRE(Submit(replacement));
+    ProduceTo(G + 13, m_vk_a);
+    BOOST_CHECK(Fresh()->lineage_id == lineage);
+    BOOST_CHECK(ChainHashAt(before.lock_height) != before.lock_block_hash);
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        BOOST_CHECK(original.MaybeSignFresh(Finality(), chainstate.m_chain, consensus,
+                                            original_pool.Fresh()).empty());
+        BOOST_CHECK(!original.FreshLastError().empty());
+        BOOST_CHECK(*original.FreshStore().State() == before);
+        BOOST_CHECK(FileBytes(original.FreshStore().Path()) == original_bytes);
+    }
+
+    const auto authority{FreshFbForNext(G + 10)};
+    ProduceFresh({peer_v1(G + 10)}, {peer_v2(G + 10)});
+    ProduceTo(m_M + 32, m_vk_a);
+    ProduceFresh({peer_v1(m_M + 30)}, {});
+    ProduceTo(G + 37, m_vk_a);
+    ProduceFresh({}, {peer_v2(G + 35)});
+    ProduceTo(m_M + 62, m_vk_a);
+    ProduceFresh({peer_v1(m_M + 60)}, {});
+    ProduceTo(G + 67, m_vk_a);
+    ProduceFresh({}, {peer_v2(G + 65)});
+    ProduceTo(G + 73, m_vk_a);
+    const auto current{Fresh()};
+    BOOST_REQUIRE(current && current->finalized && current->handover_history);
+    BOOST_REQUIRE_EQUAL(current->epoch, 2U);
+    BOOST_REQUIRE_EQUAL(current->handover_history->size(), 2U);
+    BOOST_CHECK((*current->handover_history)[0].finalized_block == authority);
+    BOOST_CHECK_EQUAL(current->finalized->height, G + 65);
+
+    node::FinalitySigner no_authority;
+    BOOST_REQUIRE_MESSAGE(no_authority.SetKeysPersistent({m_bls_b}, m_vk_b, m_domain, high_dir, error), error);
+    node::FinalitySignaturePool recovery_pool;
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        BOOST_CHECK(no_authority.MaybeSignFresh(Finality(), chainstate.m_chain, consensus,
+                                                recovery_pool.Fresh()).empty());
+        BOOST_CHECK(!no_authority.FreshLastError().empty());
+        BOOST_REQUIRE(no_authority.FreshStore().State());
+        BOOST_CHECK(*no_authority.FreshStore().State() == high_before);
+        BOOST_CHECK(FileBytes(no_authority.FreshStore().Path()) == high_bytes);
+    }
+
+    node::FinalitySigner recovering;
+    BOOST_REQUIRE_MESSAGE(recovering.SetKeysPersistent({m_bls_b}, m_vk_b, m_domain, dir, error), error);
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        auto& tracker{Finality()};
+        const FreshLineageState pristine{*tracker.Current().fresh};
+        // Corrupt only trusted DERIVED evidence in test memory. No journal,
+        // block, certificate or real signature is edited or manufactured.
+        const auto refuse_without_write{[&](const auto& damage) {
+            FreshLineageState damaged{pristine};
+            auto history{std::make_shared<std::vector<node::FreshHandoverEvidence>>(*pristine.handover_history)};
+            damage(*history);
+            damaged.handover_history = history;
+            auto& derived{const_cast<FinalityTracker::State&>(tracker.Current())};
+            derived.fresh = damaged;
+            const auto votes{recovering.MaybeSignFresh(tracker, chainstate.m_chain, consensus,
+                                                      recovery_pool.Fresh())};
+            derived.fresh = pristine;
+            BOOST_CHECK(votes.empty());
+            BOOST_CHECK(!recovering.FreshLastError().empty());
+            BOOST_REQUIRE(recovering.FreshStore().State());
+            BOOST_CHECK(*recovering.FreshStore().State() == before);
+            BOOST_CHECK(FileBytes(recovering.FreshStore().Path()) == original_bytes);
+        }};
+        refuse_without_write([](auto& history) { history.clear(); });
+        refuse_without_write([](auto& history) { history[0].certified_at_hash = uint256::ONE; });
+        refuse_without_write([&](auto& history) { history[0].certified_at = Tip()->nHeight + 1; });
+        refuse_without_write([](auto& history) { history[0].signing_set_hash = uint256::ONE; });
+        refuse_without_write([](auto& history) { history[0].finalized_block.epoch = 1; });
+        refuse_without_write([](auto& history) { history[0].finalized_block.lineage_id = uint256::ONE; });
+        refuse_without_write([](auto& history) { history[0].finalized_block.validator_set_hash = uint256::ONE; });
+        refuse_without_write([](auto& history) { history[0].finalized_block.block_hash = uint256::ONE; });
+        refuse_without_write([&](auto& history) { history[0].finalized_block.height = G + 5; });
+        refuse_without_write([&](auto& history) { history[0].finalized_block.height = G + 11; });
+        refuse_without_write([](auto& history) { history[0].finalized_block.checkpoint_index = 0; });
+
+        // Existing same-epoch authority repairs ONLY the lock on this first
+        // pass. A deliberately reopened signer performs later catch-up.
+        BOOST_CHECK(recovering.MaybeSignFresh(tracker, chainstate.m_chain, consensus,
+                                             recovery_pool.Fresh()).empty());
+        BOOST_REQUIRE(recovering.FreshStore().State());
+        const auto& anchored{*recovering.FreshStore().State()};
+        BOOST_CHECK_EQUAL(anchored.lock_epoch, 0U);
+        BOOST_CHECK_EQUAL(anchored.lock_height, G + 10);
+        BOOST_CHECK(anchored.lock_block_hash == authority.block_hash);
+        BOOST_CHECK(anchored.lock_digest == modern::FinalityDigestV2(m_domain, authority));
+        BOOST_CHECK_EQUAL(anchored.last_signed_height, before.last_signed_height);
+        BOOST_CHECK(anchored.last_signed_block_hash == before.last_signed_block_hash);
+        BOOST_CHECK(anchored.last_signed_digest == before.last_signed_digest);
+    }
+
+    node::FinalitySigner reopened;
+    BOOST_REQUIRE_MESSAGE(reopened.SetKeysPersistent({m_bls_b}, m_vk_b, m_domain, dir, error), error);
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        auto& tracker{Finality()};
+        const FreshLineageState pristine{*tracker.Current().fresh};
+        auto& derived{const_cast<FinalityTracker::State&>(tracker.Current())};
+        derived.fresh->finalized_evidence.reset();
+        BOOST_CHECK(reopened.MaybeSignFresh(tracker, chainstate.m_chain, consensus,
+                                           recovery_pool.Fresh()).empty());
+        derived.fresh = pristine;
+        BOOST_REQUIRE(reopened.FreshStore().State());
+        BOOST_CHECK_EQUAL(reopened.FreshStore().State()->lock_epoch, 1U);
+        BOOST_CHECK_EQUAL(reopened.FreshStore().State()->lock_height, G + 35);
+        BOOST_CHECK_EQUAL(reopened.FreshStore().State()->last_signed_height, before.last_signed_height);
+        BOOST_CHECK(reopened.FreshStore().State()->last_signed_block_hash == before.last_signed_block_hash);
+        BOOST_CHECK(reopened.FreshStore().State()->last_signed_digest == before.last_signed_digest);
+    }
+
+    node::FinalitySigner finished;
+    BOOST_REQUIRE_MESSAGE(finished.SetKeysPersistent({m_bls_b}, m_vk_b, m_domain, dir, error), error);
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        const auto votes{finished.MaybeSignFresh(Finality(), chainstate.m_chain, consensus,
+                                                recovery_pool.Fresh())};
+        BOOST_CHECK_MESSAGE(finished.FreshLastError().empty(), finished.FreshLastError());
+        BOOST_REQUIRE_EQUAL(votes.size(), 1U);
+        BOOST_CHECK_EQUAL(votes[0].height, static_cast<uint64_t>(G + 70));
+        BOOST_CHECK_EQUAL(votes[0].epoch, 2U);
+        BOOST_REQUIRE(finished.FreshStore().State());
+        BOOST_CHECK_EQUAL(finished.FreshStore().State()->last_signed_height, G + 70);
+        BOOST_CHECK_EQUAL(finished.FreshStore().State()->lock_epoch, 2U);
+        BOOST_CHECK(finished.MaybeSignFresh(Finality(), chainstate.m_chain, consensus,
+                                           recovery_pool.Fresh()).empty());
+    }
+}
+
 // ---------------------------------------------------------- Verifier V2 export
 
 BOOST_FIXTURE_TEST_CASE(relay_artifacts_v2_calldata_layout_paths_and_refusals, BasicTestingSetup)
