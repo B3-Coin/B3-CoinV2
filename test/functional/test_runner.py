@@ -116,6 +116,8 @@ EXTENDED_SCRIPTS = [
     # RT1: H1 producer rotation, escape and H2 checkpoint (regtest-only knobs); local nodes only.
     'feature_b3_h1_producer_rotation.py --fixture=B',
     'feature_b3_h1_producer_rotation.py --fixture=I',
+    # Real-P2P four-validator workload; observed latencies, no timing threshold.
+    'feature_flowmesh_speed.py',
 ]
 
 # Special script to run each bench sanity check
@@ -127,6 +129,7 @@ BASE_SCRIPTS = [
     # Scripts that are run by default.
     # Longest test should go first, to favor running tests in parallel
     # vv Tests less than 5m vv
+    'feature_flowmesh_reverse_client.py',
     'feature_fee_estimation.py',
     'feature_taproot.py',
     'feature_block.py',
@@ -151,6 +154,7 @@ BASE_SCRIPTS = [
     'feature_flowmesh_independent.py',
     'feature_flowmesh_remote_client.py',
     'feature_flowmesh_client_join.py',
+    'feature_flowmesh_client_poll.py',
     'mempool_updatefromblock.py',
     'mempool_persist.py',
     # vv Tests less than 60s vv
