@@ -576,6 +576,11 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
                 raise AssertionError(
                     "Deposit actions produced repeated zero-effect entries"
                 )
+            # The balances below come from two nodes, and each deposit may
+            # commit in its own entry. In independent mode convergence only
+            # waits for n0's head, so wait for n0 to apply both effects too.
+            if status["next_effect_index"] < 2:
+                return False
             seller = n0.getflowmeshbalance(market_id)["account"]
             buyer = n1.getflowmeshbalance(market_id)["account"]
             return (seller["base_available"] == TEST_ASSET_DEPOSIT and
