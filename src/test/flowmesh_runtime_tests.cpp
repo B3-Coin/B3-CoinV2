@@ -10025,8 +10025,8 @@ BOOST_AUTO_TEST_CASE(local_submit_answers_from_certified_state_and_notices_only_
     const auto edge{SignedAction(key, f.domain, config, 1 + 64, flowmesh::ActionType::CANCEL_ASK)};
     const auto edge_result{runtime.SubmitLocalActionChecked(f.market, edge)};
     BOOST_CHECK(edge_result.queued && *edge_result.queued == flowmesh::QueueResult::ACCEPTED);
-    const auto far{SignedAction(key, f.domain, config, 1 + 65, flowmesh::ActionType::CANCEL_ASK)};
-    const auto far_result{runtime.SubmitLocalActionChecked(f.market, far)};
+    const auto far_seq{SignedAction(key, f.domain, config, 1 + 65, flowmesh::ActionType::CANCEL_ASK)};
+    const auto far_result{runtime.SubmitLocalActionChecked(f.market, far_seq)};
     BOOST_CHECK(!far_result.queued);
     BOOST_CHECK(far_result.admission.code == flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE);
     f.Drain();
@@ -10196,13 +10196,13 @@ BOOST_AUTO_TEST_CASE(remote_frames_have_no_local_sequence_window)
     const auto config{f.initial.ConfigId()};
     // remote_frame_at_next_plus_1023_still_admitted: a relayed action far
     // beyond the local window is pooled exactly as before.
-    const auto far{SignedAction(key, f.domain, config, 1023, flowmesh::ActionType::CANCEL_ASK)};
+    const auto far_seq{SignedAction(key, f.domain, config, 1023, flowmesh::ActionType::CANCEL_ASK)};
     const flowmesh::WireHeader header{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1};
     BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(2, {flowmesh::WireMessageKind::ACTION, header,
-        *flowmesh::EncodeProductionActionPayload(far)}) == flowmesh::QueueResult::ACCEPTED);
+        *flowmesh::EncodeProductionActionPayload(far_seq)}) == flowmesh::QueueResult::ACCEPTED);
     f.Drain();
     BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 1U);
-    BOOST_CHECK(!f.runtimes[0]->NewestClientNotice(f.market, far.Id()));
+    BOOST_CHECK(!f.runtimes[0]->NewestClientNotice(f.market, far_seq.Id()));
 
     // A contiguous run far beyond 64, relayed to every node, is proposed,
     // validated by followers and certified: proposal evidence has no window.
@@ -10225,7 +10225,7 @@ BOOST_AUTO_TEST_CASE(remote_frames_have_no_local_sequence_window)
     const bool settled{Settle(f, [&] {
         for (const auto& runtime : f.runtimes) {
             const auto state{runtime->StateSnapshot(f.market)};
-            if (!state || state->NextSequence(far.signer) != RUN) return false;
+            if (!state || state->NextSequence(far_seq.signer) != RUN) return false;
         }
         return true;
     })};
@@ -10363,8 +10363,8 @@ BOOST_AUTO_TEST_CASE(public_notice_flood_from_other_identities_keeps_a_remote_cl
     flood.MakeNewKey(true);
     uint64_t sequence{1000};
     const auto attempt = [&](const std::string& who) {
-        const auto far{SignedAction(flood, f.domain, config, sequence++, flowmesh::ActionType::CANCEL_ASK)};
-        BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, far, flowmesh::ClientNoticeOrigin::PUBLIC, who)
+        const auto far_seq{SignedAction(flood, f.domain, config, sequence++, flowmesh::ActionType::CANCEL_ASK)};
+        BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, far_seq, flowmesh::ClientNoticeOrigin::PUBLIC, who)
                           .admission.code == flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE);
     };
     for (size_t n{0}; n < flowmesh::CLIENT_NOTICE_CAPACITY + 64; ++n) attempt("203.0.113.9");
@@ -10695,19 +10695,19 @@ BOOST_AUTO_TEST_CASE(public_submission_notices_never_evict_node_notices)
     // itself, oldest first; its per-identity shares alone never would.
     CKey flood;
     flood.MakeNewKey(true);
-    const auto far = [&](const uint32_t n) {
+    const auto far_seq = [&](const uint32_t n) {
         return SignedAction(flood, f.domain, config, 1000 + n, flowmesh::ActionType::CANCEL_ASK);
     };
     constexpr uint32_t FLOOD{flowmesh::CLIENT_NOTICE_CAPACITY + flowmesh::CLIENT_NOTICE_PER_SUBMITTER};
     for (uint32_t n{0}; n < FLOOD; ++n) {
         const auto who{strprintf("ipv6/64:%016x", n / flowmesh::CLIENT_NOTICE_PER_SUBMITTER)};
-        BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, far(n), flowmesh::ClientNoticeOrigin::PUBLIC, who)
+        BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, far_seq(n), flowmesh::ClientNoticeOrigin::PUBLIC, who)
                           .admission.code == flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE);
     }
-    BOOST_CHECK(!runtime.NewestClientNotice(f.market, far(0).Id())); // evicted
-    BOOST_CHECK(!runtime.NewestClientNotice(f.market, far(FLOOD - flowmesh::CLIENT_NOTICE_CAPACITY - 1).Id()));
-    BOOST_CHECK(runtime.NewestClientNotice(f.market, far(FLOOD - flowmesh::CLIENT_NOTICE_CAPACITY).Id()));
-    BOOST_CHECK(runtime.NewestClientNotice(f.market, far(FLOOD - 1).Id()));
+    BOOST_CHECK(!runtime.NewestClientNotice(f.market, far_seq(0).Id())); // evicted
+    BOOST_CHECK(!runtime.NewestClientNotice(f.market, far_seq(FLOOD - flowmesh::CLIENT_NOTICE_CAPACITY - 1).Id()));
+    BOOST_CHECK(runtime.NewestClientNotice(f.market, far_seq(FLOOD - flowmesh::CLIENT_NOTICE_CAPACITY).Id()));
+    BOOST_CHECK(runtime.NewestClientNotice(f.market, far_seq(FLOOD - 1).Id()));
     const auto kept{runtime.NewestClientNotice(f.market, loser.Id())};
     BOOST_REQUIRE(kept);
     BOOST_CHECK(kept->code == flowmesh::ActionReasonCode::STALE_SEQUENCE);
@@ -10771,10 +10771,10 @@ BOOST_AUTO_TEST_CASE(local_submit_of_pooled_bytes_keeps_duplicate_answer_before_
     key.MakeNewKey(true);
     // Relayed by a peer, which has neither the local sequence window nor the
     // deposit facts check: both are pooled here.
-    const auto far{SignedAction(key, f.domain, f.initial.ConfigId(), 1023, flowmesh::ActionType::CANCEL_ASK)};
+    const auto far_seq{SignedAction(key, f.domain, f.initial.ConfigId(), 1023, flowmesh::ActionType::CANCEL_ASK)};
     const auto factless{Deposit(COutPoint{f.outpoint.hash, 91})};
     const flowmesh::WireHeader header{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1};
-    for (const auto& action : {far, factless}) {
+    for (const auto& action : {far_seq, factless}) {
         BOOST_REQUIRE(runtime.EnqueueWireMessage(3, {flowmesh::WireMessageKind::ACTION, header,
             *flowmesh::EncodeProductionActionPayload(action)}) == flowmesh::QueueResult::ACCEPTED);
     }
@@ -10783,7 +10783,7 @@ BOOST_AUTO_TEST_CASE(local_submit_of_pooled_bytes_keeps_duplicate_answer_before_
     // The same exact bytes through this node's API: a pooled action may still
     // execute, so neither the sequence window nor the facts check refuses it
     // (either would read "rejected"); it is queued and gets today's answer.
-    for (const auto& action : {far, factless}) {
+    for (const auto& action : {far_seq, factless}) {
         const auto before{runtime.ClientEventCursor()};
         const auto submitted{runtime.SubmitLocalActionChecked(f.market, action)};
         BOOST_CHECK(submitted.admission.kind == node::FlowMeshLocalAdmission::Kind::ENQUEUE);
