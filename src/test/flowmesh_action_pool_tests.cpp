@@ -151,6 +151,27 @@ BOOST_AUTO_TEST_CASE(action_pool_move_preserves_add_select_prune_behaviour)
     BOOST_CHECK(g.pool.Add(PoolFixture::Deposit(1001), node::FLOWMESH_LOCAL_ACTION_PEER, g.now) == Code::ADMITTED);
 }
 
+BOOST_AUTO_TEST_CASE(health_probe_counts_only_includable_signed_actions)
+{
+    using Code = flowmesh::ActionReasonCode;
+    PoolFixture f;
+    BOOST_CHECK(!f.pool.HasEligibleSignedAction(f.state));
+    // A deposit can wait for its anchor depth: Select would include it, but
+    // the stall probe leaves deposits out.
+    BOOST_REQUIRE(f.pool.Add(PoolFixture::Deposit(0), 9, f.now) == Code::ADMITTED);
+    BOOST_CHECK(!f.pool.Select(f.state, 1).empty());
+    BOOST_CHECK(!f.pool.HasEligibleSignedAction(f.state));
+    // A gap (sequence 3 while the account expects 0) is not includable.
+    BOOST_REQUIRE(f.pool.Add(f.Signed(0, 3), 7, f.now) == Code::ADMITTED);
+    BOOST_CHECK(!f.pool.HasEligibleSignedAction(f.state));
+    // The account's next sequence is includable, exactly as Select sees it.
+    const auto next{f.Signed(1, 0)};
+    BOOST_REQUIRE(f.pool.Add(next, 8, f.now) == Code::ADMITTED);
+    BOOST_CHECK(f.pool.HasEligibleSignedAction(f.state));
+    const auto selected{Ids(f.pool.Select(f.state, 1024))};
+    BOOST_CHECK(std::find(selected.begin(), selected.end(), next.Id()) != selected.end());
+}
+
 BOOST_AUTO_TEST_CASE(action_pool_add_reports_typed_results)
 {
     using Code = flowmesh::ActionReasonCode;

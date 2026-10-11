@@ -372,6 +372,9 @@ struct FlowMeshRuntime::Market {
     // this process last applied a head, and verified catch-up lag.
     std::string pause_reason;
     std::optional<flowmesh::WireClock::time_point> head_advanced_at;
+    //! Since when the pool has held an includable signed action (sampled
+    //! when health is published).
+    std::optional<flowmesh::WireClock::time_point> eligible_work_since;
     FlowMeshLagTracker lag;
     std::optional<flowmesh::AnchorRef> previous_anchor;
     std::map<std::pair<int32_t, uint256>, uint64_t> committed_anchors;
@@ -4748,6 +4751,12 @@ void FlowMeshRuntime::PublishHealth(const flowmesh::WireClock::time_point now, c
         row.error = market.error.substr(0, 1024);
         if (market.proposal_wait_sequence == market.next_sequence) row.proposal_wait_reason = market.proposal_wait_reason;
         row.head_advanced_at = market.head_advanced_at;
+        if (market.ready && market.pool.HasEligibleSignedAction(market.state)) {
+            if (!market.eligible_work_since) market.eligible_work_since = now;
+        } else {
+            market.eligible_work_since.reset();
+        }
+        row.eligible_work_since = market.eligible_work_since;
         row.local_observed_at = market.local_observed_at;
         row.lag = market.lag.Summary();
         row.seat_evidence_recorded = market.seat_evidence_recorded;
