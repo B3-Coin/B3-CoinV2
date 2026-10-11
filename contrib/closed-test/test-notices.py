@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Synthetic notice transport checks; no credentials or network required."""
 import importlib.util
+import hashlib
 import io
+import json
 from pathlib import Path
 import ssl
+import tarfile
+import tempfile
 import unittest
 from unittest import mock
 import urllib.error
@@ -84,6 +88,8 @@ class NoticeTransportTests(unittest.TestCase):
             API + '#fragment',
             API.replace('/git/trees/', '/git/%74rees/'),
             'https://example.invalid/notice.txt',
+            'https://raw.githubusercontent.com/Homebrew/homebrew-core/' + '1' * 40 + '/Formula/g/glib.rb',
+            'https://download.gnome.org/sources/glib/2.88/glib-2.88.3.tar.xz',
         )
         for url in urls:
             with self.subTest(url=url):
@@ -187,6 +193,171 @@ class NoticeTransportTests(unittest.TestCase):
                 NOTICES.get(API, 1024)
             build.assert_not_called()
             plain.assert_not_called()
+
+
+class GlibSourceTests(unittest.TestCase):
+    VERSION = '2.88.3'
+    URL = 'https://download.gnome.org/sources/glib/2.88/glib-2.88.3.tar.xz'
+    LICENSE = b'Synthetic license test data, not a distributed license.\n'
+
+    def archive(self, rows=None):
+        rows = rows if rows is not None else [
+            ('glib-2.88.3/LICENSES/LGPL-2.1-or-later.txt', self.LICENSE, None),
+            ('glib-2.88.3/COPYING', b'', 'LICENSES/LGPL-2.1-or-later.txt'),
+            ('glib-2.88.3/subprojects/example/LICENSES/MIT.txt', b'Synthetic MIT fixture', None),
+            ('glib-2.88.3/unrelated.c', b'not executed', None)]
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode='w:xz') as archive:
+            for name, data, target in rows:
+                member = tarfile.TarInfo(name)
+                if target:
+                    member.type, member.linkname = tarfile.SYMTYPE, target
+                else:
+                    member.size = len(data)
+                archive.addfile(member, io.BytesIO(data) if not target else None)
+        return output.getvalue()
+
+    def installation(self, directory, *, version='2.88.3', receipt_version='2.88.3', url=None, sha='a' * 64):
+        installed = Path(directory) / 'glib-2.88.3'
+        (installed / '.brew').mkdir(parents=True)
+        (installed / 'lib/pkgconfig').mkdir(parents=True)
+        (installed / '.brew/glib.rb').write_text(
+            f'class Glib < Formula\n  url "{url or self.URL}"\n  sha256 "{sha}"\n  depends_on "pcre2"\nend\n')
+        (installed / 'INSTALL_RECEIPT.json').write_text(json.dumps({'source': {'versions': {'stable': receipt_version}}}))
+        (installed / 'lib/pkgconfig/glib-2.0.pc').write_text(f'Version: {version}\n')
+        return installed
+
+    def test_license_and_copying_symlink_are_read_without_extraction(self):
+        rows = NOTICES.glib_archive_notices(self.archive(), self.VERSION)
+        self.assertEqual(rows['COPYING'], (self.LICENSE, {'source_symlink_target': 'LICENSES/LGPL-2.1-or-later.txt'}))
+        self.assertIn('subprojects/example/LICENSES/MIT.txt', rows)
+        self.assertNotIn('unrelated.c', rows)
+
+    def test_wrong_root_traversal_duplicate_or_external_copying_refused(self):
+        for rows in (
+                [('other/LICENSES/LGPL-2.1-or-later.txt', self.LICENSE, None)],
+                [('glib-2.88.3/../escaped', b'x', None)],
+                [('glib-2.88.3/COPYING', b'', '/outside')],
+                [('glib-2.88.3/COPYING', b'', '../outside')],
+                [('glib-2.88.3/COPYING', b'x', None)] * 2):
+            with self.subTest(rows=rows), self.assertRaises(RuntimeError):
+                NOTICES.glib_archive_notices(self.archive(rows), self.VERSION)
+
+    def test_non_regular_notice_and_missing_lgpl_refused(self):
+        with self.assertRaisesRegex(RuntimeError, 'Unsafe GLib notice'):
+            NOTICES.glib_archive_notices(self.archive([
+                ('glib-2.88.3/LICENSES/LGPL-2.1-or-later.txt', b'', 'elsewhere')]), self.VERSION)
+        with self.assertRaisesRegex(RuntimeError, 'LGPL license missing'):
+            NOTICES.glib_archive_notices(self.archive([]), self.VERSION)
+
+    def test_notice_size_bound(self):
+        with self.assertRaisesRegex(RuntimeError, 'Unsafe GLib notice'):
+            NOTICES.glib_archive_notices(self.archive([
+                ('glib-2.88.3/LICENSES/LGPL-2.1-or-later.txt', b'x' * (2 * 1024 * 1024 + 1), None)]), self.VERSION)
+
+    def test_installed_recipe_receipt_and_pkgconfig_agree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installed = self.installation(directory)
+            identity, recipe = NOTICES.glib_source_identity(installed)
+        self.assertEqual(identity, {'version': self.VERSION, 'url': self.URL, 'sha256': 'a' * 64})
+        self.assertIn(b'class Glib', recipe)
+
+    def test_installed_version_and_origin_mismatch_refused(self):
+        for kwargs in ({'receipt_version': '2.90.0'}, {'version': 'bogus'},
+                       {'url': 'https://example.invalid/source.tar.xz'}, {'sha': 'bad'}):
+            with self.subTest(kwargs=kwargs), tempfile.TemporaryDirectory() as directory:
+                installed = self.installation(directory, **kwargs)
+                with self.assertRaises(RuntimeError):
+                    NOTICES.glib_source_identity(installed)
+
+    def test_redirected_provenance_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installed = self.installation(directory)
+            (installed / 'INSTALL_RECEIPT.json').unlink()
+            (installed / 'INSTALL_RECEIPT.json').symlink_to('.brew/glib.rb')
+            with self.assertRaisesRegex(RuntimeError, 'unsafe installed GLib provenance'):
+                NOTICES.glib_source_identity(installed)
+
+    def collector_inputs(self, directory):
+        source = self.archive()
+        installed = self.installation(directory, sha=hashlib.sha256(source).hexdigest())
+        recipe = (installed / '.brew/glib.rb').read_bytes()
+        public_recipe = recipe.replace(b'  depends_on', b'  bottle do\n    rebuild 1\n  end\n\n  depends_on')
+        patch, introspection = b'synthetic patch, never executed', b'synthetic build resource'
+        pin = {'homebrew_commit': '1' * 40,
+               'formula_sha256': hashlib.sha256(public_recipe).hexdigest(),
+               'patch_sha256': hashlib.sha256(patch).hexdigest(),
+               'introspection_url': 'https://download.gnome.org/synthetic-resource.tar.xz',
+               'introspection_sha256': hashlib.sha256(introspection).hexdigest()}
+        base = 'https://raw.githubusercontent.com/Homebrew/homebrew-core/' + '1' * 40 + '/'
+        inputs = {base + 'Formula/g/glib.rb': public_recipe,
+                  base + 'Patches/glib/hardcoded-paths.diff': patch,
+                  self.URL: source, pin['introspection_url']: introspection}
+        return installed, pin, inputs
+
+    def test_exact_source_patch_recipe_and_resource_are_retained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installed, pin, inputs = self.collector_inputs(directory)
+            retained = {}
+            with mock.patch.dict(NOTICES.GLIB_SOURCE, {self.VERSION: pin}, clear=True), \
+                    mock.patch.object(NOTICES, 'get', side_effect=lambda url, maximum: inputs[url]):
+                self.assertIsNone(NOTICES.collect_glib_source(installed, lambda path, data, provenance: retained.update({path: (data, provenance)})))
+        prefix = 'installed/glib/source/'
+        self.assertIn(prefix + 'glib-2.88.3.tar.xz', retained)
+        self.assertIn(prefix + 'homebrew-core/Patches/glib/hardcoded-paths.diff', retained)
+        self.assertIn(prefix + 'gobject-introspection-1.86.0.tar.xz', retained)
+        self.assertIn(prefix + 'BUILD-PROVENANCE.json', retained)
+        self.assertEqual(retained['installed/glib/COPYING'][0], self.LICENSE)
+        self.assertNotIn(b'tmp', retained[prefix + 'BUILD-PROVENANCE.json'][0])
+
+    def test_bad_source_recipe_patch_or_resource_checksum_retains_nothing(self):
+        for position, expected in ((0, 'recipe checksum'), (1, 'patch checksum'),
+                                   (2, 'recipe checksum'), (3, 'resource checksum')):
+            with self.subTest(position=position), tempfile.TemporaryDirectory() as directory:
+                installed, pin, inputs = self.collector_inputs(directory)
+                inputs[list(inputs)[position]] += b'changed'
+                retained = mock.Mock()
+                with mock.patch.dict(NOTICES.GLIB_SOURCE, {self.VERSION: pin}, clear=True), \
+                        mock.patch.object(NOTICES, 'get', side_effect=lambda url, maximum: inputs[url]), \
+                        self.assertRaisesRegex(RuntimeError, expected):
+                    NOTICES.collect_glib_source(installed, retained)
+                retained.assert_not_called()
+
+    def test_matching_hash_does_not_excuse_different_installed_recipe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installed, pin, inputs = self.collector_inputs(directory)
+            with (installed / '.brew/glib.rb').open('ab') as stream:
+                stream.write(b'# different installed recipe\n')
+            retained = mock.Mock()
+            with mock.patch.dict(NOTICES.GLIB_SOURCE, {self.VERSION: pin}, clear=True), \
+                    mock.patch.object(NOTICES, 'get', side_effect=lambda url, maximum: inputs[url]), \
+                    self.assertRaisesRegex(RuntimeError, 'build recipe differs'):
+                NOTICES.collect_glib_source(installed, retained)
+            retained.assert_not_called()
+
+    def test_unknown_version_refuses_without_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installed = self.installation(directory, version='2.90.0', receipt_version='2.90.0',
+                                          url=self.URL.replace('2.88', '2.90').replace('.3.tar', '.0.tar'))
+            with mock.patch.object(NOTICES, 'get') as fetch, self.assertRaisesRegex(RuntimeError, 'pin review'):
+                NOTICES.collect_glib_source(installed, mock.Mock())
+            fetch.assert_not_called()
+
+    def test_archive_count_and_total_declared_bytes_are_bounded(self):
+        archive = mock.MagicMock()
+        archive.__enter__.return_value = archive
+        for byte_overflow in (False, True):
+            def members():
+                for i in range(1 if byte_overflow else 50001):
+                    member = tarfile.TarInfo('glib-2.88.3/source-' + str(i))
+                    member.size = 512 * 1024 * 1024 + 1 if byte_overflow else 0
+                    yield member
+            archive.__iter__.side_effect = members
+            with self.subTest(byte_overflow=byte_overflow), \
+                    mock.patch.object(NOTICES.tarfile, 'open', return_value=archive), \
+                    self.assertRaisesRegex(RuntimeError, 'unbounded GLib source'):
+                NOTICES.glib_archive_notices(b'synthetic', self.VERSION)
+        archive.extractfile.assert_not_called()
 
 
 if __name__ == '__main__':

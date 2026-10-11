@@ -350,6 +350,7 @@ def main():
             + "https://github.com/B3-Coin/B3-CoinV2/tree/" + commit + "\n"
             + "Workflow: .github/workflows/flowmesh-regtest-build.yml\n"
             + "Qt source and license notices: licenses/NOTICE-MANIFEST.json\n"
+            + "Mac GLib exact upstream source, Homebrew build recipe, patch and build resource: licenses/installed/glib/source/\n"
             + "Windows exact dependencies and local Qt patches: depends/packages and depends/patches in source.\n"
             + "No restriction on modifying/rebuilding these open-source components for personal use.\n")
     identity = {"format": "b3-regtest-package-v1", "version": VERSION, "source_commit": commit,

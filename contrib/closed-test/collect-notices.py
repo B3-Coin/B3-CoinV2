@@ -7,12 +7,14 @@ directory outside source. Collection is not a legal/compliance certification.
 """
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import ssl
+import tarfile
 import urllib.error
 import urllib.request
 
@@ -21,6 +23,19 @@ FORMULAS = ('openssl@3', 'libevent', 'qrencode', 'libb2', 'brotli', 'dbus',
             'double-conversion', 'freetype', 'glib', 'graphite2', 'harfbuzz',
             'icu4c@78', 'gettext', 'jpeg-turbo', 'md4c', 'pcre2', 'libpng', 'zstd')
 TREE_API = re.compile(r'https://api\.github\.com/repos/qt/(?:qtbase|qtsvg)/git/trees/v6\.[0-9]+\.[0-9]+\?recursive=1')
+# This is the GLib version in both reviewed Mac tester artifacts. Pins are
+# deliberately narrow: a later Homebrew recipe/version needs a new review,
+# not an inferred "latest" corresponding-source claim. The installed recipe
+# must equal the pinned public recipe after removing only its bottle table.
+GLIB_SOURCE = {
+    '2.88.3': {
+        'homebrew_commit': '190a6fa77b81b8ffbeeee1022b852063d55d71cc',
+        'formula_sha256': '18ec76babcd6aebbdfeca6f09f9bfb24b3694d4e432c926c7f9612ee53515742',
+        'patch_sha256': 'd846efd0bf62918350da94f850db33b0f8727fece9bfaf8164566e3094e80c97',
+        'introspection_url': 'https://download.gnome.org/sources/gobject-introspection/1.86/gobject-introspection-1.86.0.tar.xz',
+        'introspection_sha256': '920d1a3fcedeadc32acff95c2e203b319039dd4b4a08dd1a2dfd283d19c0b9ae',
+    },
+}
 
 
 class RefuseCredentialRedirect(urllib.request.HTTPRedirectHandler):
@@ -66,6 +81,121 @@ def read_attribution(data):
     if not all(isinstance(entry, dict) for entry in entries):
         raise ValueError('Attribution must be an object or array of objects')
     return entries
+
+
+def glib_source_identity(installed):
+    """Read data, never execute the installed Homebrew Ruby recipe.
+
+    A version inferred from today's upstream release would not describe the
+    bundled bottle. Require the installed pkg-config, receipt and exact
+    source URL in its retained recipe to agree instead.
+    """
+    recipe_path = installed / '.brew/glib.rb'
+    receipt_path = installed / 'INSTALL_RECEIPT.json'
+    pc_path = installed / 'lib/pkgconfig/glib-2.0.pc'
+    for path in (recipe_path, receipt_path, pc_path):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+            raise RuntimeError('Missing/unsafe installed GLib provenance')
+    recipe = recipe_path.read_bytes()
+    receipt = json.loads(receipt_path.read_bytes())
+    pc = pc_path.read_text()
+    match = re.search(r'^Version: (2\.[0-9]+\.[0-9]+)$', pc, re.M)
+    if not match or receipt.get('source', {}).get('versions', {}).get('stable') != match[1]:
+        raise RuntimeError('Installed GLib version evidence differs')
+    version = match[1]
+    # Only the main source declaration, before dependency resources/bottles.
+    declaration = re.split(r'^  (?:resource|bottle|head|depends_on)\b', recipe.decode(), maxsplit=1, flags=re.M)[0]
+    urls = re.findall(r'^  url "([^"]+)"$', declaration, re.M)
+    hashes = re.findall(r'^  sha256 "([0-9a-f]{64})"$', declaration, re.M)
+    expected = 'https://download.gnome.org/sources/glib/' + '.'.join(version.split('.')[:2]) + '/glib-' + version + '.tar.xz'
+    if urls != [expected] or len(hashes) != 1:
+        raise RuntimeError('Unsupported installed GLib source declaration')
+    return {'version': version, 'url': expected, 'sha256': hashes[0]}, recipe
+
+
+def glib_archive_notices(data, version):
+    """Read bounded notice members; never extract or execute archive paths."""
+    root = 'glib-' + version + '/'
+    notices, seen, total = {}, set(), 0
+    copying_target = None
+    with tarfile.open(fileobj=io.BytesIO(data), mode='r|xz') as archive:
+        for count, member in enumerate(archive, 1):
+            path = PurePosixPath(member.name)
+            if count > 50000 or path.is_absolute() or '..' in path.parts or member.name in seen:
+                raise RuntimeError('Unsafe/unbounded GLib source archive')
+            seen.add(member.name)
+            total += member.size
+            if member.name == root.rstrip('/') and member.isdir():
+                continue
+            if total > 512 * 1024 * 1024 or not member.name.startswith(root):
+                raise RuntimeError('Unsafe/unbounded GLib source archive')
+            relative = member.name[len(root):]
+            if relative == 'COPYING' and member.issym():
+                if member.linkname != 'LICENSES/LGPL-2.1-or-later.txt':
+                    raise RuntimeError('Unexpected GLib COPYING reference')
+                copying_target = member.linkname
+                continue
+            selected = (('/LICENSES/' in '/' + relative and relative.endswith('.txt')) or
+                        ('/' not in relative and re.match(r'^(COPYING|LICENSE|LICENCE|NOTICE|COPYRIGHT|AUTHORS)(\.|$|[-_])', relative, re.I)))
+            if not selected or member.isdir():
+                continue
+            if not member.isfile() or member.size > 2 * 1024 * 1024:
+                raise RuntimeError('Unsafe GLib notice member')
+            content = archive.extractfile(member).read(2 * 1024 * 1024 + 1)
+            if len(content) != member.size:
+                raise RuntimeError('Incomplete GLib notice member')
+            notices[relative] = (content, {})
+    license_path = 'LICENSES/LGPL-2.1-or-later.txt'
+    if license_path not in notices:
+        raise RuntimeError('Exact GLib LGPL license missing')
+    if copying_target:
+        notices['COPYING'] = (notices[copying_target][0], {'source_symlink_target': copying_target})
+    return notices
+
+
+def collect_glib_source(installed, retain):
+    identity, recipe = glib_source_identity(installed)
+    pin = GLIB_SOURCE.get(identity['version'])
+    if pin is None:
+        raise RuntimeError('Installed GLib version needs corresponding-source pin review')
+    base = 'https://raw.githubusercontent.com/Homebrew/homebrew-core/' + pin['homebrew_commit'] + '/'
+    public_recipe = get(base + 'Formula/g/glib.rb', 1024 * 1024)
+    if hashlib.sha256(public_recipe).hexdigest() != pin['formula_sha256']:
+        raise RuntimeError('Pinned Homebrew GLib recipe checksum differs')
+    normalized_recipe = re.sub(rb'(?ms)^  bottle do\n.*?^  end\n\n', b'', public_recipe, count=1)
+    if normalized_recipe != recipe:
+        raise RuntimeError('Installed GLib build recipe differs from pinned source recipe')
+    patch = get(base + 'Patches/glib/hardcoded-paths.diff', 1024 * 1024)
+    if hashlib.sha256(patch).hexdigest() != pin['patch_sha256']:
+        raise RuntimeError('Pinned Homebrew GLib patch checksum differs')
+    data = get(identity['url'], 32 * 1024 * 1024)
+    if hashlib.sha256(data).hexdigest() != identity['sha256']:
+        raise RuntimeError('GLib source differs from installed recipe checksum')
+    notices = glib_archive_notices(data, identity['version'])
+    introspection = get(pin['introspection_url'], 32 * 1024 * 1024)
+    if hashlib.sha256(introspection).hexdigest() != pin['introspection_sha256']:
+        raise RuntimeError('GLib introspection build resource checksum differs')
+    provenance = {'installed_component': 'glib', 'installed_version': installed.name,
+                  'upstream_source': identity, 'homebrew_commit': pin['homebrew_commit']}
+    retain('installed/glib/source/glib-' + identity['version'] + '.tar.xz', data, provenance)
+    retain('installed/glib/source/homebrew-glib.rb', recipe, provenance)
+    retain('installed/glib/source/homebrew-core/Formula/g/glib.rb', public_recipe,
+           {**provenance, 'url': base + 'Formula/g/glib.rb'})
+    retain('installed/glib/source/homebrew-core/Patches/glib/hardcoded-paths.diff', patch,
+           {**provenance, 'url': base + 'Patches/glib/hardcoded-paths.diff'})
+    retain('installed/glib/source/gobject-introspection-1.86.0.tar.xz', introspection,
+           {**provenance, 'url': pin['introspection_url']})
+    receipt = json.loads((installed / 'INSTALL_RECEIPT.json').read_bytes())
+    # Preserve public build facts, not developer-local receipt paths.
+    build_facts = {key: receipt.get(key) for key in (
+        'homebrew_version', 'used_options', 'unused_options', 'built_as_bottle',
+        'poured_from_bottle', 'compiler', 'arch', 'built_on')}
+    retain('installed/glib/source/BUILD-PROVENANCE.json',
+           (json.dumps(build_facts, indent=2, sort_keys=True) + '\n').encode(), provenance)
+    for path, (content, extra) in sorted(notices.items()):
+        retain('installed/glib/' + path, content, {**provenance, **extra})
+    # Preserve the actual patch and recipe, not only upstream source. This
+    # closes this specific missing-input gap, not every distribution duty.
 
 
 def main():
@@ -152,15 +282,20 @@ def main():
                 installed = installed.resolve(strict=True)
                 candidates = [path for path in installed.iterdir() if path.is_file() and
                               re.match(r'^(COPYING|LICENSE|LICENCE|NOTICE|COPYRIGHT|AUTHORS)(\.|$|[-_])', path.name, re.I)]
-                if not candidates:
+                if formula == 'glib':
+                    collect_glib_source(installed, retain)
+                    # Upstream COPYING can be a symlink, omitted by Homebrew.
+                    # Its exact target license is now retained independently.
+                elif not candidates:
                     gaps.append({'component': formula, 'reason': 'Bottle contains no top-level notice; source review required'})
-                for path in candidates:
+                for path in candidates if formula != 'glib' else ():
                     retain('installed/' + formula + '/' + path.name, path.read_bytes(),
                            {'installed_component': formula, 'installed_version': installed.name,
                             'source_filename': path.name})
         retain('NOTICE-SCOPE.txt', (
             'Exact upstream Qt/QtSvg license and third-party attribution texts are retained with hashes.\n'
             'Installed dependency notices are retained where supplied by the declared build bottles.\n'
+            'GLib includes checksum-pinned upstream source, its matching installed/public Homebrew recipe, patch and introspection build resource.\n'
             'This is not a complete source-code offer or external-distribution compliance certification.\n'
             'Inspect the manifest gaps against actual bundled libraries before external handoff.\n'
             'Qt source: https://code.qt.io/cgit/qt/qtbase.git/ and https://code.qt.io/cgit/qt/qtsvg.git/\n'
