@@ -120,6 +120,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   flowmesh/bls_certificate.cpp
   flowmesh/p2p.cpp
   flowmesh/outcome_evidence.cpp
+  flowmesh/observed_time.cpp
   flowmesh/production_engine.cpp
   flowmesh/production_wire.cpp
   flowmesh/seat_evidence.cpp
@@ -278,7 +279,6 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/flowmesh_https.cpp
   flowmesh/client_evidence.cpp
   flowmesh/market_view.cpp
-  flowmesh/observed_time.cpp
   node/flowmesh_net.cpp
   node/flowmesh_store.cpp
   node/flowmesh_vault_index.cpp
