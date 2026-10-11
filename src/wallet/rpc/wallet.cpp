@@ -920,6 +920,7 @@ RPCHelpMan signmessage();
 
 // staking (B3 Modern PoS validator UX)
 RPCHelpMan createstake();
+RPCHelpMan releasestake();
 RPCHelpMan getstakinginfo();
 RPCHelpMan startstaking();
 RPCHelpMan bindfinalitykey();
@@ -955,6 +956,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &bumpfee},
         {"wallet", &psbtbumpfee},
         {"wallet", &createstake},
+        {"wallet", &releasestake},
         {"wallet", &bindfinalitykey},
         {"wallet", &bindflowmeshseat},
         {"wallet", &cancelflowmeshorder},

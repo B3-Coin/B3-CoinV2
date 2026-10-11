@@ -32,6 +32,7 @@
 
 #include <univalue.h>
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <span>
@@ -139,6 +140,129 @@ RPCHelpMan createstake()
             obj.pushKV("owner_address", EncodeDestination(*owner));
             obj.pushKV("status", "UNCONFIRMED");
             obj.pushKV("activation_depth", modern::STAKE_ACTIVATION_DEPTH);
+            return obj;
+        },
+    };
+}
+
+RPCHelpMan releasestake()
+{
+    return RPCHelpMan{
+        "releasestake",
+        "Release STAKE outputs back into ordinary spendable B3 (unstake).\n"
+        "Spends the given STAKE outputs of this wallet, or all of its confirmed ones when none are\n"
+        "given, to one address of this wallet, paying the fee from the released amount. Nothing is\n"
+        "restaked. Weight already frozen in an epoch snapshot can stay in force until that snapshot\n"
+        "is replaced. Unconfirmed stakes cannot be released yet. Requires an unlocked wallet.\n",
+        {
+            {"outpoints", RPCArg::Type::ARR, RPCArg::DefaultHint{"every confirmed STAKE output of this wallet"}, "The STAKE outputs to release",
+                {
+                    {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
+                        {
+                            {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The stake transaction id"},
+                            {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "The STAKE output index"},
+                        },
+                    },
+                },
+            },
+            {"address", RPCArg::Type::STR, RPCArg::DefaultHint{"a new legacy address of this wallet"}, "The wallet address that receives the released B3"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "txid", "the release transaction id"},
+                {RPCResult::Type::NUM, "released_outputs", "the number of STAKE outputs spent"},
+                {RPCResult::Type::STR_AMOUNT, "principal", "the total staked principal released"},
+                {RPCResult::Type::STR_AMOUNT, "fee", "the fee paid from the principal"},
+                {RPCResult::Type::STR_AMOUNT, "amount", "the ordinary B3 received"},
+                {RPCResult::Type::STR, "address", "the wallet address that received it"},
+            }},
+        RPCExamples{HelpExampleCli("releasestake", "") +
+                    HelpExampleCli("releasestake", "'[{\"txid\":\"mytxid\",\"vout\":0}]'") +
+                    HelpExampleRpc("releasestake", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+            if (!pwallet) return UniValue::VNULL;
+            pwallet->BlockUntilSyncedToCurrentChain();
+
+            LOCK(pwallet->cs_wallet);
+            EnsureWalletIsUnlocked(*pwallet);
+
+            // The wallet's unspent, well-formed STAKE outputs and their depth.
+            std::map<COutPoint, std::pair<CAmount, int>> stakes;
+            for (const auto& [txid, wtx] : pwallet->mapWallet) {
+                for (size_t i{0}; i < wtx.tx->vout.size(); ++i) {
+                    const CTxOut& out{wtx.tx->vout[i]};
+                    if (!modern::ClaimsStakeMagic(out.scriptPubKey) || !pwallet->IsMine(out)) continue;
+                    const COutPoint outpoint{txid, static_cast<uint32_t>(i)};
+                    if (pwallet->IsSpent(outpoint)) continue;
+                    std::string error;
+                    if (!modern::ParseStakeOutput(out, error)) continue;
+                    stakes.emplace(outpoint, std::make_pair(out.nValue, pwallet->GetTxDepthInMainChain(wtx)));
+                }
+            }
+
+            std::vector<COutPoint> selected;
+            if (request.params[0].isNull() || request.params[0].empty()) {
+                for (const auto& [outpoint, value] : stakes) {
+                    if (value.second > 0 && !pwallet->IsLockedCoin(outpoint)) selected.push_back(outpoint);
+                }
+                if (selected.empty()) throw JSONRPCError(RPC_WALLET_ERROR, "This wallet has no confirmed STAKE outputs to release");
+            } else {
+                for (const UniValue& item : request.params[0].getValues()) {
+                    const COutPoint outpoint{Txid::FromUint256(ParseHashO(item, "txid")), item.find_value("vout").getInt<uint32_t>()};
+                    const auto found{stakes.find(outpoint)};
+                    if (found == stakes.end()) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("%s is not an unspent STAKE output of this wallet", outpoint.ToString()));
+                    }
+                    if (found->second.second <= 0) {
+                        throw JSONRPCError(RPC_WALLET_ERROR, strprintf("STAKE output %s is not confirmed yet", outpoint.ToString()));
+                    }
+                    if (pwallet->IsLockedCoin(outpoint)) {
+                        throw JSONRPCError(RPC_WALLET_ERROR, strprintf("STAKE output %s is locked; unlock it first (lockunspent)", outpoint.ToString()));
+                    }
+                    if (std::find(selected.begin(), selected.end(), outpoint) != selected.end()) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("STAKE output %s is listed twice", outpoint.ToString()));
+                    }
+                    selected.push_back(outpoint);
+                }
+            }
+
+            CTxDestination destination;
+            if (!request.params[1].isNull()) {
+                destination = DecodeDestination(request.params[1].get_str());
+                if (!IsValidDestination(destination)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
+                // Releasing returns principal to this wallet; sending it elsewhere is an ordinary send.
+                if (!pwallet->IsMine(destination)) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "The address does not belong to this wallet");
+                }
+            } else {
+                const auto fresh{pwallet->GetNewDestination(OutputType::LEGACY, "b3-stake-release")};
+                if (!fresh) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(fresh).original);
+                destination = *fresh;
+            }
+
+            CAmount principal{0};
+            CCoinControl coin_control;
+            coin_control.m_include_stake = true;
+            coin_control.m_allow_other_inputs = false;
+            for (const COutPoint& outpoint : selected) {
+                principal += stakes.at(outpoint).first;
+                coin_control.Select(outpoint);
+            }
+            std::vector<CRecipient> recipients{{destination, principal, /*fSubtractFeeFromAmount=*/true}};
+            auto res{CreateTransaction(*pwallet, recipients, /*change_pos=*/std::nullopt, coin_control, /*sign=*/true)};
+            if (!res) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(res).original);
+            const CTransactionRef& tx{res->tx};
+            pwallet->CommitTransaction(tx, {{"b3", "unstake"}}, /*orderForm=*/{});
+
+            UniValue obj(UniValue::VOBJ);
+            obj.pushKV("txid", tx->GetHash().GetHex());
+            obj.pushKV("released_outputs", static_cast<int>(selected.size()));
+            obj.pushKV("principal", ValueFromAmount(principal));
+            obj.pushKV("fee", ValueFromAmount(res->fee));
+            obj.pushKV("amount", ValueFromAmount(principal - res->fee));
+            obj.pushKV("address", EncodeDestination(destination));
             return obj;
         },
     };
