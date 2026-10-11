@@ -157,8 +157,9 @@ class CleanupTests(unittest.TestCase):
         fault.snapshot.return_value = {"bulk_held": False}
         subject = SimpleNamespace(
             fault=fault, returning_rpc=None, scheduler_stop=Mock(), worker_stop=Mock(),
-            workers=[], threads=[thread], end_b3_workload=Mock(), log=Mock(),
-            options=SimpleNamespace(tmpdir="unused-mocked-report-directory", performance_public_trace=False),
+            workers=[], threads=[thread], end_b3_workload=Mock(), log=Mock(), memory_capture_nodes=[],
+            options=SimpleNamespace(tmpdir="unused-mocked-report-directory", performance_public_trace=False,
+                                    performance_rpc_trace=False),
             performance_report={"correctness_pass": True, "fault_scenario_pass": True, "read_consistency_pass": True})
         subject.invalidate_final_result = lambda: faults.FlowMeshPerformanceTest.invalidate_final_result(subject)
         subject.finalize_public_trace = lambda: faults.FlowMeshPerformanceTest.finalize_public_trace(subject)

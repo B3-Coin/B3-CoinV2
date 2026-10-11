@@ -295,8 +295,11 @@ class RpcObservationTests(unittest.TestCase):
     def subject(self):
         local = threading.local()
         local.sample = {"sample_id": 3, "market_id": "m", "account_id": "a"}
+        # Public tracing on: ObservedClientRPC records only while a trace or
+        # an RPC capture window is active.
         return SimpleNamespace(trace_local=local, report_lock=threading.Lock(), rpc_calls=[],
-                               rpc_trace_dropped=0, rpc_trace_bytes=0, drain_relay_observations=Mock())
+                               rpc_trace_dropped=0, rpc_trace_bytes=0, drain_relay_observations=Mock(),
+                               options=SimpleNamespace(performance_public_trace=True), rpc_capture_active=False)
 
     def test_rpc_end_precedes_capture_work(self):
         owner = self.subject()
