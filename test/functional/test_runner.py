@@ -190,6 +190,10 @@ BASE_SCRIPTS = [
     'wallet_listtransactions.py',
     'wallet_miniscript.py',
     # vv Tests less than 30s vv
+    'wallet_readonly_reconcile.py',
+    'feature_flowmesh_offline_unit_tests.py',
+    # Default-build negative control; fails if BUILD_FLOWMESH_P2FV_REGTEST_GATE=ON.
+    'feature_flowmesh_p2fv_build_gate.py',
     'p2p_invalid_messages.py',
     'rpc_createmultisig.py',
     'p2p_timeouts.py --v1transport',
@@ -454,6 +458,25 @@ NON_SCRIPTS = [
     "feature_flowmesh_client_watch.py",
     "feature_flowmesh_market_views.py",
     "feature_flowmesh_observed_time.py",
+    # Opt-in performance, fault, crash and delivery campaigns; run directly.
+    "feature_flowmesh_client_crash.py",
+    "feature_flowmesh_delivery_review.py",
+    "feature_flowmesh_performance.py",
+    "feature_flowmesh_performance_faults.py",
+    "feature_flowmesh_persistent_trades.py",
+    # Needs BUILD_FLOWMESH_P2FV_REGTEST_GATE=ON; deliberately outside the runner.
+    "feature_flowmesh_p2fv_bootstrap.py",
+    # Report analyzers used by the campaigns above, not tests.
+    "flowmesh_performance_analyze.py",
+    "flowmesh_performance_worker_analyze.py",
+    "flowmesh_public_consistency_analyze.py",
+    # Offline unittest modules, run by feature_flowmesh_offline_unit_tests.py.
+    "flowmesh_performance_fault_metrics_test.py",
+    "flowmesh_performance_metrics_test.py",
+    "flowmesh_performance_worker_analyze_test.py",
+    "flowmesh_public_consistency_analyze_test.py",
+    "flowmesh_public_trace_test.py",
+    "flowmesh_relay_read_failure_test.py",
 ]
 
 def main():
