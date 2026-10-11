@@ -19,13 +19,19 @@
 
 #include <consensus/amount.h>
 
+#include <algorithm>
+
+#include <QCheckBox>
 #include <QClipboard>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QFrame>
 #include <QGridLayout>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
+#include <QListWidget>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -228,6 +234,11 @@ B3StakePage::B3StakePage(QWidget* parent)
         stake_row->addWidget(m_create_stake);
         controls_layout->addLayout(stake_row);
 
+        m_release_stake = new QPushButton(tr("Release stake…"), m_controls_card);
+        m_release_stake->setObjectName(QStringLiteral("stakeRelease"));
+        m_release_stake->setToolTip(tr("Unstake: return staked B3 to ordinary spendable B3 in this wallet."));
+        controls_layout->addWidget(m_release_stake);
+
         m_start_stop = new QPushButton(tr("Start staking"), m_controls_card);
         m_start_stop->setObjectName(QStringLiteral("stakeStartStop"));
         controls_layout->addWidget(m_start_stop);
@@ -294,6 +305,7 @@ B3StakePage::B3StakePage(QWidget* parent)
             this, &B3StakePage::operationFailed);
     connect(m_bind_finality, &QPushButton::clicked, this, &B3StakePage::bindFinalityKey);
     connect(m_create_stake, &QPushButton::clicked, this, &B3StakePage::createStake);
+    connect(m_release_stake, &QPushButton::clicked, this, &B3StakePage::releaseStake);
     connect(m_start_stop, &QPushButton::clicked, this, &B3StakePage::toggleStaking);
     connect(m_corridor_mining, &QPushButton::clicked, this, &B3StakePage::toggleCorridorMining);
     connect(m_backup, &QPushButton::clicked, this, &B3StakePage::backupRequested);
@@ -635,6 +647,8 @@ void B3StakePage::updateControls()
     m_backup->setEnabled(have_wallet && !m_operation_busy);
     m_stake_amount->setEnabled(can_prepare);
     m_create_stake->setEnabled(can_prepare);
+    m_release_stake->setEnabled(ready && std::any_of(m_status.stakes.begin(), m_status.stakes.end(),
+        [](const B3StakeOutput& stake) { return stake.status != QLatin1String("UNCONFIRMED"); }));
 
     const auto encryption_status{have_wallet ? m_wallet_model->getEncryptionStatus() : WalletModel::NoKeys};
     m_start_stop->setText(StakingActionText(encryption_status, m_status));
@@ -686,6 +700,91 @@ void B3StakePage::createStake()
     setOperationMessage(tr("Creating the stake transaction…"), QStringLiteral("accent"));
     updateControls();
     m_controller->createStake(amount);
+}
+
+void B3StakePage::releaseStake()
+{
+    if (!m_wallet_model || !m_release_stake->isEnabled()) return;
+
+    QDialog dialog{this};
+    dialog.setObjectName(QStringLiteral("stakeReleaseDialog"));
+    dialog.setWindowTitle(tr("Release stake"));
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* intro = new QLabel(
+        tr("Return staked B3 to ordinary spendable B3 in this wallet. The transaction fee is paid from the released amount. "
+           "Weight already frozen in the current epoch can stay in force until that epoch's snapshot is replaced."),
+        &dialog);
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto* list = new QListWidget(&dialog);
+    list->setObjectName(QStringLiteral("stakeReleaseList"));
+    QList<B3StakeOutput> confirmed;
+    for (const B3StakeOutput& stake : m_status.stakes) {
+        const bool releasable{stake.status != QLatin1String("UNCONFIRMED")};
+        auto* item = new QListWidgetItem(
+            tr("%1 · %2 · %3:%4")
+                .arg(BitcoinUnits::formatWithUnit(BitcoinUnit::BTC, stake.amount), stake.status,
+                     stake.txid.left(16) + QStringLiteral("…"), QString::number(stake.vout)),
+            list);
+        item->setFlags(releasable ? Qt::ItemFlags{Qt::ItemIsUserCheckable | Qt::ItemIsEnabled} : Qt::ItemFlags{Qt::NoItemFlags});
+        item->setCheckState(releasable ? Qt::Checked : Qt::Unchecked);
+        if (!releasable) item->setToolTip(tr("Wait for this stake to be confirmed before releasing it."));
+        // Index into `confirmed`, or -1 for a stake that cannot be released yet.
+        item->setData(Qt::UserRole, releasable ? static_cast<int>(confirmed.size()) : -1);
+        if (releasable) confirmed.push_back(stake);
+    }
+    layout->addWidget(list);
+
+    auto* stop = new QCheckBox(tr("Also stop staking"), &dialog);
+    stop->setObjectName(QStringLiteral("stakeReleaseStopStaking"));
+    stop->setVisible(m_status.staking_uses_this_wallet);
+    stop->setChecked(m_status.staking_uses_this_wallet);
+    layout->addWidget(stop);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
+    auto* release = buttons->addButton(tr("Release"), QDialogButtonBox::AcceptRole);
+    release->setObjectName(QStringLiteral("stakeReleaseConfirm"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    const auto chosen = [&] {
+        QList<B3StakeOutput> result;
+        for (int row{0}; row < list->count(); ++row) {
+            const QListWidgetItem* item{list->item(row)};
+            const int index{item->data(Qt::UserRole).toInt()};
+            if (index >= 0 && item->checkState() == Qt::Checked) result.push_back(confirmed.at(index));
+        }
+        return result;
+    };
+    // Stopping fits releasing everything; keep the user's choice otherwise.
+    connect(list, &QListWidget::itemChanged, &dialog, [&] {
+        const auto selected{chosen()};
+        release->setEnabled(!selected.isEmpty());
+        if (m_status.staking_uses_this_wallet) stop->setChecked(selected.size() == confirmed.size());
+    });
+    release->setEnabled(!confirmed.isEmpty());
+
+    if (dialog.exec() != QDialog::Accepted) return;
+    const QList<B3StakeOutput> selected{chosen()};
+    if (selected.isEmpty()) return;
+    CAmount total{0};
+    for (const B3StakeOutput& stake : selected) total += stake.amount;
+    const auto answer = QMessageBox::question(
+        this, tr("Release stake"),
+        tr("Release %n stake output(s) totalling %1 back to ordinary B3 in this wallet? The fee is paid from this amount.",
+           nullptr, static_cast<int>(selected.size()))
+            .arg(BitcoinUnits::formatWithUnit(BitcoinUnit::BTC, total)));
+    if (answer != QMessageBox::Yes) return;
+
+    // The dialog is closed now, so its widgets are never visible; ask whether
+    // the option was offered at all.
+    m_stop_after_release = !stop->isHidden() && stop->isChecked();
+    m_operation_busy = true;
+    setOperationMessage(tr("Creating the release transaction…"), QStringLiteral("accent"));
+    updateControls();
+    m_controller->releaseStakes(selected);
 }
 
 void B3StakePage::toggleStaking()
@@ -741,6 +840,19 @@ void B3StakePage::operationSucceeded(const QString& operation, const QVariantMap
     } else if (operation == QLatin1String("create_stake")) {
         setOperationMessage(tr("Stake transaction submitted: %1").arg(DetailString(details, "txid")),
                             QStringLiteral("positive"));
+    } else if (operation == QLatin1String("release_stake")) {
+        setOperationMessage(
+            tr("Released %1 B3 (fee %2 B3) to %3. Transaction: %4")
+                .arg(DetailString(details, "amount"), DetailString(details, "fee"),
+                     DetailString(details, "address"), DetailString(details, "txid")),
+            QStringLiteral("positive"));
+        if (m_stop_after_release) {
+            m_stop_after_release = false;
+            m_operation_busy = true;
+            updateLockState();
+            m_controller->stopStaking();
+            return;
+        }
     } else if (operation == QLatin1String("start_staking")) {
         const auto encryption_status{m_wallet_model ? m_wallet_model->getEncryptionStatus() : WalletModel::NoKeys};
         if (encryption_status == WalletModel::Locked) {
@@ -770,6 +882,8 @@ void B3StakePage::operationSucceeded(const QString& operation, const QVariantMap
 void B3StakePage::operationFailed(const QString& operation, const QString& error)
 {
     m_operation_busy = false;
+    // A failed release must not stop staking afterwards.
+    if (operation == QLatin1String("release_stake")) m_stop_after_release = false;
     // Read the actual post-attempt lock state before a modal warning runs its
     // event loop; queued wallet notifications need not have arrived yet.
     updateLockState();
