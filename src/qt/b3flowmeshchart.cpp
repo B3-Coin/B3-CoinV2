@@ -155,7 +155,7 @@ std::vector<int64_t> B3FlowMeshChart::AxisLabelOpens(const int64_t left, const i
 }
 QString B3FlowMeshChart::TimeAxisLabel(const int64_t open_ms, const flowmesh::CandleInterval interval)
 {
-    const auto time{QDateTime::fromMSecsSinceEpoch(open_ms, QTimeZone::UTC)};
+    const auto time{QDateTime::fromMSecsSinceEpoch(open_ms, QTimeZone::utc())};
     switch (interval) {
     case flowmesh::CandleInterval::M1:
     case flowmesh::CandleInterval::M5:
@@ -620,7 +620,7 @@ void B3FlowMeshChart::paintTime(QPainter& p, const QRectF& plot, const int axis_
         if (selected->flags & flowmesh::CANDLE_CLOCK) notes << tr("observer clock adjusted");
         Candle volume_only; volume_only.base_volume = selected->base_volume;
         const QString info{tr("%1 UTC · Vol %2 %3 · %4 auction(s), %5 matched%6")
-            .arg(QDateTime::fromMSecsSinceEpoch(selected->open_ms, QTimeZone::UTC).toString(QStringLiteral("yyyy-MM-dd HH:mm")),
+            .arg(QDateTime::fromMSecsSinceEpoch(selected->open_ms, QTimeZone::utc()).toString(QStringLiteral("yyyy-MM-dd HH:mm")),
                  FormatCandleVolume(volume_only, units.decimals, m_inverted), units.ticker)
             .arg(selected->entries).arg(selected->clearings)
             .arg(notes.isEmpty() ? QString{} : QStringLiteral(" · ") + notes.join(QStringLiteral(" · ")))};
