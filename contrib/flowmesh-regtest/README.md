@@ -106,6 +106,43 @@ Maintenance ends by 2026-10-11 00:00 UTC or the bounded checkpoint/sweep budget.
 The TLS leaf expires 2026-10-12 14:59:29 UTC. Stop if trust or synchronization
 fails; do not weaken verification. Services may be unavailable before that time.
 
+## Release session checks
+
+The historical window above has ended. It is not renewed by a successful build.
+New packaging now refuses this expired session before producing handoff archives.
+The existing embedded profile, public CA and storage identity remain unchanged;
+do not delete or rewrite tester data to bypass the refusal.
+
+[session-window.json](session-window.json) records the declared window and leaf
+expiry separately, bound to the exact embedded profile bytes. Its hash binding
+is an identity check, not proof of operator authorization. Any extension requires
+explicit coordinator approval of the service window, operation budget and
+certificate/trust configuration. Editing a date cannot renew a server certificate
+or establish chain synchronization, validator quorum or trading readiness.
+Packaging requires at least one hour remaining; this is a tooling handoff margin,
+not a consensus or staking parameter.
+
+For coordinators building from source:
+
+```sh
+python3 -B contrib/flowmesh-regtest/test_session_preflight.py -v
+python3 -B contrib/flowmesh-regtest/session_preflight.py
+python3 -B contrib/flowmesh-regtest/session_preflight.py --probe-tls
+```
+
+The last command, only after a valid declared window, performs one verified TLS
+handshake to the fixed approved endpoint. It sends no HTTP, wallet or trading
+request and retains CA and hostname verification. An offline window pass alone
+does not verify live TLS or service readiness. Current expired-window refusal
+occurs before any connection.
+
+CI runs the offline window gate before expensive platform builds. Source fixes
+in the native node and Qt now trigger the guarded build workflow, not only
+packaging changes. The workflow creates CI artifacts only; no automatic release
+or deployment is enabled. Check the command exit status and exact successful
+revision before handoff. Private staging is not a tester package; a failed copy
+may leave partial output that must not be distributed.
+
 ## Private bug report
 
 Send privately to the coordinator who invited you; no separate public bug inbox
