@@ -13,17 +13,43 @@ from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import ssl
+import urllib.error
 import urllib.request
 
 SOURCE = Path(__file__).resolve().parents[2]
 FORMULAS = ('openssl@3', 'libevent', 'qrencode', 'libb2', 'brotli', 'dbus',
             'double-conversion', 'freetype', 'glib', 'graphite2', 'harfbuzz',
             'icu4c@78', 'gettext', 'jpeg-turbo', 'md4c', 'pcre2', 'libpng', 'zstd')
+TREE_API = re.compile(r'https://api\.github\.com/repos/qt/(?:qtbase|qtsvg)/git/trees/v6\.[0-9]+\.[0-9]+\?recursive=1')
+
+
+class RefuseCredentialRedirect(urllib.request.HTTPRedirectHandler):
+    """Do not forward the CI credential, even to another GitHub API URL."""
+
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        raise urllib.error.HTTPError(request.full_url, code,
+                                     'Authenticated notice requests refuse redirects', headers, fp)
 
 
 def get(url, maximum):
-    request = urllib.request.Request(url, headers={'User-Agent': 'B3-closed-test-notice-collector'})
-    with urllib.request.urlopen(request, context=ssl.create_default_context(), timeout=30) as response:
+    headers = {'User-Agent': 'B3-closed-test-notice-collector'}
+    # This optional, step-scoped read-only CI token is only for the two exact
+    # public tree API requests. It is never used on raw notice downloads,
+    # other API paths, alternate authorities/ports, or redirected requests.
+    token = os.environ.get('B3_NOTICE_GITHUB_TOKEN') if TREE_API.fullmatch(url) else None
+    if token:
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,4096}', token):
+            raise RuntimeError('Malformed CI notice token')
+        headers['Authorization'] = 'Bearer ' + token
+    request = urllib.request.Request(url, headers=headers)
+    context = ssl.create_default_context()
+    if token:
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context),
+                                             RefuseCredentialRedirect())
+        response = opener.open(request, timeout=30)
+    else:
+        response = urllib.request.urlopen(request, context=context, timeout=30)
+    with response:
         data = response.read(maximum + 1)
     if len(data) > maximum:
         raise RuntimeError('Public notice input exceeds bound: ' + url)

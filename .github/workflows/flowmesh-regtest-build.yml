@@ -26,6 +26,7 @@ on:
       - 'COPYING'
       - 'contrib/flowmesh-regtest/**'
       - 'contrib/closed-test/collect-notices.py'
+      - 'contrib/closed-test/test-notices.py'
       - 'contrib/windeploy/package_portable.py'
       - 'contrib/macdeploy/normalize_bundled_libraries.rb'
 
@@ -51,6 +52,8 @@ jobs:
         run: python3 -B contrib/flowmesh-regtest/test_workflow.py -v
       - name: Verify session-window regressions
         run: python3 -B contrib/flowmesh-regtest/test_session_preflight.py -v
+      - name: Verify notice download credential isolation
+        run: python3 -B contrib/closed-test/test-notices.py -v
       - name: Refuse expired test-session packaging before platform builds
         run: python3 -B contrib/flowmesh-regtest/session_preflight.py
       - name: Verify profile and package guard invariants
@@ -100,6 +103,8 @@ jobs:
           if [[ "$RUN_POLICY_TESTS" == ON ]]; then targets+=(test_b3_flowmeshclosed-policy test_b3_createwalletdialog-qt b3coind b3coin-cli); fi
           cmake --build build -j"$(nproc)" --target "${targets[@]}"
       - name: Collect pinned public Qt dependency notices
+        env:
+          B3_NOTICE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           qt_version=$(sed -nE 's/^qt_details_version := ([0-9.]+)/\1/p' depends/packages/qt_details.mk)
           python3 -B contrib/closed-test/collect-notices.py --qt-version "$qt_version" --output-dir "$RUNNER_TEMP/regtest-notices"
@@ -288,6 +293,8 @@ jobs:
           build/bin/test_b3_flowmeshclosed-policy -o build/policy-results.txt,txt
           QT_QPA_PLATFORM=minimal build/bin/test_b3_createwalletdialog-qt -o build/dialog-results.txt,txt
       - name: Collect exact-version public dependency notices
+        env:
+          B3_NOTICE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           qt_version=$(sed -nE 's/^set\(PACKAGE_VERSION "([0-9.]+)"\)/\1/p' "$(brew --prefix qt@6)/lib/cmake/Qt6/Qt6ConfigVersionImpl.cmake")
           python3 -B contrib/closed-test/collect-notices.py --qt-version "$qt_version" --homebrew-prefix "$(brew --prefix)" --output-dir "$RUNNER_TEMP/regtest-notices"

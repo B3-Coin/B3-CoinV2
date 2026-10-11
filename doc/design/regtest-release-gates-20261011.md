@@ -39,6 +39,25 @@ network trading readiness. Maintenance recovery, tester-network trading and
 the existing unresolved limits below remain gates. No binary upgrade, mainnet
 activation, wallet funding or data migration is part of this renewal.
 
+### Dependency notice download repair
+
+The preceding GitHub run `38048288692` failed on Windows and Intel Mac when
+unauthenticated public Qt tree requests returned HTTP 403 rate-limit errors.
+Compilation had completed; dependency notice collection blocked packaging.
+The collector now accepts the build's step-scoped read-only token only for
+the exact HTTPS QtBase/QtSvg versioned tree API paths. It never attaches that
+credential to raw notice downloads or alternate authorities, ports, paths or
+queries. Authenticated redirects are refused before a second request.
+
+Default CA and hostname verification, the 30-second timeout, bounded reads,
+Git blob hashes, required license files and incomplete-manifest refusal remain
+unchanged. API rejection or TLS failure does not silently fall back or skip
+notices. Eleven synthetic transport tests, including the actual urllib opener
+redirect chain, pass with resource warnings treated as errors. The complete
+focused packaging set now has 58 passing tests: 10 session, 28 packaging,
+9 workflow and 11 notice transport checks. These tests do not establish an
+actual GitHub build result; select artifacts only from the exact successful run.
+
 ## Earlier frozen qualification
 
 The local trading round trip and Mac guarded-client checks pass. Tester

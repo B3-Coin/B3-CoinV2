@@ -80,6 +80,7 @@ class WorkflowTests(unittest.TestCase):
             "contrib/flowmesh-regtest/session3-ca.pem",
             "contrib/flowmesh-regtest/README.md",
             "contrib/closed-test/collect-notices.py",
+            "contrib/closed-test/test-notices.py",
             "contrib/windeploy/package_portable.py",
             "contrib/macdeploy/normalize_bundled_libraries.rb",
         ))
@@ -125,6 +126,13 @@ class WorkflowTests(unittest.TestCase):
         for script in ("test_session_preflight.py", "session_preflight.py"):
             pattern = r"(?m)^      - name: [^\n]+\n        run: python3 -B contrib/flowmesh-regtest/" + script.replace(".", r"\.") + r"(?: -v)?$"
             self.assertRegex(profile, pattern)
+
+    def test_notice_credentials_are_step_scoped_and_read_only(self):
+        self.assertEqual(self.text.count("B3_NOTICE_GITHUB_TOKEN: ${{ github.token }}"), 2)
+        for title in ("Collect pinned public Qt dependency notices", "Collect exact-version public dependency notices"):
+            self.assertIn("      - name: " + title + "\n        env:\n          B3_NOTICE_GITHUB_TOKEN: ${{ github.token }}\n        run: |", self.text)
+        profile = self.text.split("  profile:\n", 1)[1].split("  windows-cross:\n", 1)[0]
+        self.assertRegex(profile, r"(?m)^      - name: Verify notice download credential isolation\n        run: python3 -B contrib/closed-test/test-notices.py -v$")
 
 
 if __name__ == "__main__":
