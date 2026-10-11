@@ -339,6 +339,20 @@ struct FlowMeshRuntimeMarketStatus {
     std::string error;
 };
 
+//! Queued wire messages the worker may take ahead of a pending tick.
+inline constexpr size_t FLOWMESH_MESSAGES_PER_TICK{8};
+
+/** Local scheduling only: whether the worker runs a pending tick before the
+ * next queued message. Every admitted action on an agreement market requests
+ * a tick, so preferring ticks outright ran one full maintenance pass over all
+ * markets per message during a burst. A tick now waits behind at most
+ * FLOWMESH_MESSAGES_PER_TICK messages, and runs at once when none are queued. */
+inline bool FlowMeshWorkerRunsTickFirst(const bool tick_pending, const bool messages_queued,
+                                        const size_t messages_since_tick)
+{
+    return tick_pending && (!messages_queued || messages_since_tick >= FLOWMESH_MESSAGES_PER_TICK);
+}
+
 /** Local scheduling only: a fully applied page could fit any further entry,
  * so a greedy honest sender would have included it. This is not a tip proof. */
 inline bool FlowMeshCatchupPageHasTailSlack(
@@ -882,6 +896,8 @@ private:
     std::deque<FlowMeshDeliveryEvent> m_delivery_events;
     std::atomic<uint64_t> m_delivery_event_overflows{0};
     bool m_tick_pending{false};
+    //! Wire messages taken since the last tick (FlowMeshWorkerRunsTickFirst).
+    size_t m_messages_since_tick{0};
     //! Observation of the first coalesced tick request; never a timer input.
     uint64_t m_tick_requested_us{0};
     bool m_discovery_refresh{false};

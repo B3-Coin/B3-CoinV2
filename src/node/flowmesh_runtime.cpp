@@ -4189,12 +4189,14 @@ void FlowMeshRuntime::WorkerLoop()
             } else if (!m_catchup_commands.empty()) {
                 catchup = m_catchup_commands.front();
                 m_catchup_commands.pop_front();
-            } else if (m_tick_pending) {
+            } else if (FlowMeshWorkerRunsTickFirst(m_tick_pending, !m_queue.Empty(), m_messages_since_tick)) {
                 tick = true;
                 tick_requested_us = m_tick_requested_us;
                 m_tick_pending = false;
+                m_messages_since_tick = 0;
             } else {
                 message = m_queue.Pop();
+                if (message) ++m_messages_since_tick;
             }
             dequeued_us = TraceNow(*m_config.clock);
             if (trace.enabled) {
