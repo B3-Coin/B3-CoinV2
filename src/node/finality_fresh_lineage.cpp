@@ -131,6 +131,17 @@ std::optional<uint256> FreshLineageState::SuccessorHashForEpoch(const uint64_t e
     return std::nullopt;
 }
 
+const FreshHandoverEvidence* FreshLineageState::HandoverForEpoch(const uint64_t e) const
+{
+    if (!bootstrapped) return nullptr;
+    if (e == epoch) return current_handover ? &*current_handover : nullptr;
+    if (e < epoch && handover_history && e < handover_history->size()) {
+        const auto& evidence{(*handover_history)[e]};
+        if (evidence.finalized_block.epoch == e) return &evidence;
+    }
+    return nullptr;
+}
+
 LineageV2View MakeLineageV2View(const Consensus::Params& params, const std::optional<FreshLineageState>& state)
 {
     LineageV2View v;
@@ -252,6 +263,20 @@ bool ProjectFreshLineage(std::optional<FreshLineageState>& fresh, const int heig
 
     // Handover-gated rotation (V1's rule, V1's E).
     if (s.handover_certified && height >= s.epoch_starts.back() + E) {
+        // Capture the actual accepted statement and old signing committee
+        // BEFORE rotating pointers. Merely setting handover_certified (e.g.
+        // a synthetic projection fixture) cannot fabricate recovery evidence.
+        const size_t retained{s.handover_history ? s.handover_history->size() : 0};
+        if (s.current_handover && retained == s.epoch && s.current && s.next &&
+            s.current_handover->finalized_block.epoch == s.epoch &&
+            s.current_handover->signing_set_hash == s.current->set_hash &&
+            s.current_handover->finalized_block.validator_set_hash == s.next->set_hash) {
+            auto history{std::make_shared<std::vector<FreshHandoverEvidence>>()};
+            if (s.handover_history) *history = *s.handover_history;
+            history->push_back(*s.current_handover);
+            s.handover_history = std::move(history);
+        }
+        s.current_handover.reset();
         // start_{e-1} for the epoch e entered here: the B-37 window of the
         // bindings that fix Set'_{e+1} opens there.
         const int window_lo{s.epoch_starts.back()};
@@ -366,6 +391,9 @@ bool ApplyFreshCertificate(FreshLineageState& state, const modern::FinalityCerti
         !AppendHistoryLeaves(tree, fb.checkpoint_index + 1, state.genesis_height, interval, hash_at)) {
         return false;
     }
+    const auto carrier_hash{hash_at(including_height)};
+    const auto signing_set{state.SetForEpoch(fb.epoch)};
+    if (!carrier_hash || carrier_hash->IsNull() || !signing_set) return false;
     state.history = tree;
     state.finalized = FreshFinalizedCheckpoint{
         .height = static_cast<int>(fb.height),
@@ -376,7 +404,16 @@ bool ApplyFreshCertificate(FreshLineageState& state, const modern::FinalityCerti
         .cert_id = modern::FinalityCertIdV2(fb),
         .certified_at = including_height,
     };
-    if (fb.epoch == state.epoch) state.handover_certified = true;
+    state.finalized_evidence = FreshHandoverEvidence{
+        .finalized_block = fb,
+        .certified_at = including_height,
+        .certified_at_hash = *carrier_hash,
+        .signing_set_hash = signing_set->set_hash,
+    };
+    if (fb.epoch == state.epoch) {
+        state.handover_certified = true;
+        state.current_handover = state.finalized_evidence;
+    }
     return true;
 }
 

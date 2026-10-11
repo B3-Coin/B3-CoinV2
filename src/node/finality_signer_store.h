@@ -130,19 +130,17 @@ public:
                                const uint256& successor_set_hash,
                                std::string& error);
 
-    /** FRESH_LINEAGE_V2 only (B-37 per-epoch keys, finality dependency
-     * section 6.4): move only the ancestry lock forward across fresh epochs
-     * in which this validator signed nothing because no committee seated it
-     * (no counted binding, a void seat). The target is a strictly newer,
-     * already validated and included fresh-lineage certificate of a strictly
-     * later epoch than the lock. The caller checks that the old lock is an
-     * ancestor of the active chain and that the certificate is included on
-     * it above the lock: the new lock then descends from the old one, and the
-     * committees between the two epochs are the ones consensus validated on
-     * that chain. No vote of this validator conflicts with that chain, so
-     * unlike CommitCertifiedAnchor (an orphaned lock) the epoch and set may
-     * differ. The last actual vote is retained. A CHAIN_DOMAIN_V1 journal
-     * refuses it: V1 keeps its exact-lineage rule. */
+    /** FRESH_LINEAGE_V2 only: advance only the ancestry lock by exactly one
+     * fresh epoch, to a strictly higher, already validated and included
+     * checkpoint whose signing set is the durable lock's exact successor.
+     * The caller must establish that the old lock is canonical and validate
+     * the historical handover and descendant certificate evidence before
+     * each step; this store cannot validate that evidence itself. An orphaned
+     * lock still requires CommitCertifiedAnchor's exact-same-epoch/set rule.
+     * No last_signed_* field is changed, so the last actual vote survives
+     * every catch-up step and restart. Skipped epochs, duplicate transitions
+     * and a changed on-disk predecessor are refused. CHAIN_DOMAIN_V1 refuses
+     * this helper entirely; its existing lineage rules are unchanged. */
     bool CommitLineageCatchUp(int height, const uint256& block_hash,
                               const uint256& digest, uint64_t epoch,
                               const uint256& signing_set_hash,

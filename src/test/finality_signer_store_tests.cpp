@@ -10,6 +10,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <cstdio>
+#include <limits>
 
 BOOST_AUTO_TEST_SUITE(finality_signer_store_tests)
 
@@ -182,6 +183,186 @@ BOOST_FIXTURE_TEST_CASE(corrupt_foreign_and_unwritable_state_fail_closed,
     BOOST_CHECK(!error.empty());
     BOOST_REQUIRE(readonly.State().has_value());
     BOOST_CHECK_EQUAL(readonly.State()->last_signed_height, -1);
+}
+
+BOOST_FIXTURE_TEST_CASE(lineage_catchup_is_sequential_durable_and_preserves_the_actual_vote,
+                        BasicTestingSetup)
+{
+    const fs::path dir{m_path_root / "fresh-sequential-store"};
+    const uint256 lineage{m_rng.rand256()};
+    modern::ValidatorKeyBytes validator{};
+    validator.fill(0x61);
+    const uint256 set0{m_rng.rand256()};
+    const uint256 set1{m_rng.rand256()};
+    const uint256 set2{m_rng.rand256()};
+    const uint256 set3{m_rng.rand256()};
+    std::string error;
+
+    node::FinalitySignerStore store;
+    BOOST_REQUIRE_MESSAGE(store.Open(dir, lineage, validator, error,
+                                    node::FinalitySignerNamespace::FRESH_LINEAGE_V2), error);
+    BOOST_REQUIRE_MESSAGE(store.InitializeEmpty(error), error);
+    BOOST_REQUIRE_MESSAGE(store.CommitSignedCheckpoint(10, m_rng.rand256(), m_rng.rand256(),
+                                                       0, set0, set1, error), error);
+    const node::FinalitySignerState actual_vote{*store.State()};
+    node::FinalitySignerState expected{actual_vote};
+    expected.lock_height = 20;
+    expected.lock_block_hash = m_rng.rand256();
+    expected.lock_digest = m_rng.rand256();
+    expected.lock_epoch = 1;
+    expected.lock_signing_set_hash = set1;
+    expected.lock_successor_set_hash = set2;
+    BOOST_REQUIRE_MESSAGE(store.CommitLineageCatchUp(expected.lock_height, expected.lock_block_hash,
+                                                    expected.lock_digest, expected.lock_epoch,
+                                                    set1, set2, error), error);
+    BOOST_CHECK(*store.State() == expected);
+
+    // A restart between steps resumes from the durable successor, not the
+    // epoch of the last vote. None of that vote's fields are rewritten.
+    node::FinalitySignerStore restarted;
+    BOOST_REQUIRE_MESSAGE(restarted.Open(dir, lineage, validator, error,
+                                        node::FinalitySignerNamespace::FRESH_LINEAGE_V2), error);
+    BOOST_REQUIRE(restarted.State().has_value());
+    BOOST_CHECK(*restarted.State() == expected);
+    expected.lock_height = 30;
+    expected.lock_block_hash = m_rng.rand256();
+    expected.lock_digest = m_rng.rand256();
+    expected.lock_epoch = 2;
+    expected.lock_signing_set_hash = set2;
+    expected.lock_successor_set_hash = set3;
+    BOOST_REQUIRE_MESSAGE(restarted.CommitLineageCatchUp(expected.lock_height, expected.lock_block_hash,
+                                                        expected.lock_digest, expected.lock_epoch,
+                                                        set2, set3, error), error);
+    BOOST_CHECK(*restarted.State() == expected);
+
+    node::FinalitySignerStore reopened;
+    BOOST_REQUIRE_MESSAGE(reopened.Open(dir, lineage, validator, error,
+                                       node::FinalitySignerNamespace::FRESH_LINEAGE_V2), error);
+    BOOST_REQUIRE(reopened.State().has_value());
+    BOOST_CHECK(*reopened.State() == expected);
+    BOOST_CHECK_EQUAL(reopened.State()->last_signed_height, actual_vote.last_signed_height);
+    BOOST_CHECK(reopened.State()->last_signed_block_hash == actual_vote.last_signed_block_hash);
+    BOOST_CHECK(reopened.State()->last_signed_digest == actual_vote.last_signed_digest);
+
+    // An exact catch-up retry is not a second transition. The caller must
+    // resume at the next epoch rather than treating duplicate input as new.
+    error.clear();
+    BOOST_CHECK(!reopened.CommitLineageCatchUp(expected.lock_height, expected.lock_block_hash,
+                                              expected.lock_digest, expected.lock_epoch,
+                                              set2, set3, error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(*reopened.State() == expected);
+}
+
+BOOST_FIXTURE_TEST_CASE(lineage_catchup_rejects_skipped_epochs_wrong_successors_and_invalid_targets,
+                        BasicTestingSetup)
+{
+    const fs::path dir{m_path_root / "fresh-refusal-store"};
+    const uint256 lineage{m_rng.rand256()};
+    modern::ValidatorKeyBytes validator{};
+    validator.fill(0x62);
+    const uint256 set0{m_rng.rand256()};
+    const uint256 set1{m_rng.rand256()};
+    const uint256 set2{m_rng.rand256()};
+    const uint256 foreign_set{m_rng.rand256()};
+    const uint256 block{m_rng.rand256()};
+    const uint256 digest{m_rng.rand256()};
+    std::string error;
+    node::FinalitySignerStore store;
+    BOOST_REQUIRE_MESSAGE(store.Open(dir, lineage, validator, error,
+                                    node::FinalitySignerNamespace::FRESH_LINEAGE_V2), error);
+    BOOST_REQUIRE_MESSAGE(store.InitializeEmpty(error), error);
+    BOOST_CHECK(!store.CommitLineageCatchUp(20, block, digest, 1, set1, set2, error));
+    BOOST_REQUIRE_MESSAGE(store.CommitSignedCheckpoint(10, m_rng.rand256(), m_rng.rand256(),
+                                                       0, set0, set1, error), error);
+    const node::FinalitySignerState before{*store.State()};
+    const auto refuses = [&](const int height, const uint64_t epoch,
+                             const uint256& signing, const uint256& successor,
+                             const uint256& target_block, const uint256& target_digest) {
+        error.clear();
+        BOOST_CHECK(!store.CommitLineageCatchUp(height, target_block, target_digest,
+                                                epoch, signing, successor, error));
+        BOOST_CHECK(!error.empty());
+        BOOST_CHECK(*store.State() == before);
+        node::FinalitySignerStore disk;
+        BOOST_REQUIRE_MESSAGE(disk.Open(dir, lineage, validator, error,
+                                       node::FinalitySignerNamespace::FRESH_LINEAGE_V2), error);
+        BOOST_REQUIRE(disk.State().has_value());
+        BOOST_CHECK(*disk.State() == before);
+    };
+    refuses(20, 2, set1, set2, block, digest); // skipped an epoch
+    refuses(20, 0, set1, set2, block, digest); // same epoch
+    refuses(20, 1, foreign_set, set2, block, digest); // wrong predecessor's successor
+    refuses(20, 1, set0, set2, block, digest); // predecessor's current set is not enough
+    refuses(10, 1, set1, set2, block, digest); // height did not advance
+    refuses(9, 1, set1, set2, block, digest);
+    refuses(-1, 1, set1, set2, block, digest);
+    refuses(20, 1, set1, set2, uint256{}, digest);
+    refuses(20, 1, set1, set2, block, uint256{});
+    refuses(20, 1, uint256{}, set2, block, digest);
+    refuses(20, 1, set1, uint256{}, block, digest);
+
+    // The helper never relaxes the V1 journal's existing lineage predicate.
+    node::FinalitySignerStore v1;
+    BOOST_REQUIRE_MESSAGE(v1.Open(dir, lineage, validator, error), error);
+    BOOST_REQUIRE_MESSAGE(v1.InitializeEmpty(error), error);
+    BOOST_REQUIRE_MESSAGE(v1.CommitSignedCheckpoint(10, block, digest, 0, set0, set1, error), error);
+    const node::FinalitySignerState v1_before{*v1.State()};
+    BOOST_CHECK(!v1.CommitLineageCatchUp(20, block, digest, 1, set1, set2, error));
+    BOOST_CHECK(*v1.State() == v1_before);
+}
+
+BOOST_FIXTURE_TEST_CASE(lineage_catchup_refuses_epoch_overflow_and_a_changed_disk_predecessor,
+                        BasicTestingSetup)
+{
+    const fs::path dir{m_path_root / "fresh-stale-store"};
+    const uint256 lineage{m_rng.rand256()};
+    modern::ValidatorKeyBytes validator{};
+    validator.fill(0x63);
+    const uint256 set0{m_rng.rand256()};
+    const uint256 set1{m_rng.rand256()};
+    const uint256 set2{m_rng.rand256()};
+    std::string error;
+    node::FinalitySignerStore store;
+    BOOST_REQUIRE_MESSAGE(store.Open(dir, lineage, validator, error,
+                                    node::FinalitySignerNamespace::FRESH_LINEAGE_V2), error);
+    BOOST_REQUIRE_MESSAGE(store.InitializeEmpty(error), error);
+    BOOST_REQUIRE_MESSAGE(store.CommitSignedCheckpoint(10, m_rng.rand256(), m_rng.rand256(),
+                                                       0, set0, set1, error), error);
+    const node::FinalitySignerState before{*store.State()};
+    node::FinalitySignerStore stale;
+    BOOST_REQUIRE_MESSAGE(stale.Open(dir, lineage, validator, error,
+                                    node::FinalitySignerNamespace::FRESH_LINEAGE_V2), error);
+    BOOST_REQUIRE_MESSAGE(store.CommitLineageCatchUp(20, m_rng.rand256(), m_rng.rand256(),
+                                                    1, set1, set2, error), error);
+    const node::FinalitySignerState advanced{*store.State()};
+    error.clear();
+    // Valid against stale's in-memory predecessor, but that exact predecessor
+    // is no longer on disk. The normal compare-before-write must still refuse.
+    BOOST_CHECK(!stale.CommitLineageCatchUp(25, m_rng.rand256(), m_rng.rand256(),
+                                           1, set1, set2, error));
+    BOOST_CHECK(error.find("predecessor changed") != std::string::npos);
+    BOOST_CHECK(*stale.State() == before);
+    node::FinalitySignerStore disk;
+    BOOST_REQUIRE_MESSAGE(disk.Open(dir, lineage, validator, error,
+                                   node::FinalitySignerNamespace::FRESH_LINEAGE_V2), error);
+    BOOST_REQUIRE(disk.State().has_value());
+    BOOST_CHECK(*disk.State() == advanced);
+
+    const fs::path overflow_dir{m_path_root / "fresh-overflow-store"};
+    node::FinalitySignerStore overflow;
+    BOOST_REQUIRE_MESSAGE(overflow.Open(overflow_dir, lineage, validator, error,
+                                       node::FinalitySignerNamespace::FRESH_LINEAGE_V2), error);
+    BOOST_REQUIRE_MESSAGE(overflow.InitializeEmpty(error), error);
+    const uint64_t last_epoch{std::numeric_limits<uint64_t>::max() - 1};
+    BOOST_REQUIRE_MESSAGE(overflow.CommitSignedCheckpoint(10, m_rng.rand256(), m_rng.rand256(),
+                                                          last_epoch, set0, set1, error), error);
+    const node::FinalitySignerState overflow_before{*overflow.State()};
+    BOOST_CHECK(!overflow.CommitLineageCatchUp(20, m_rng.rand256(), m_rng.rand256(),
+                                              0, set1, set2, error));
+    BOOST_CHECK(!overflow.CommitLineageCatchUp(20, m_rng.rand256(), m_rng.rand256(),
+                                              std::numeric_limits<uint64_t>::max(), set1, set2, error));
+    BOOST_CHECK(*overflow.State() == overflow_before);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -175,6 +175,18 @@ struct FreshFinalizedCheckpoint {
     friend bool operator==(const FreshFinalizedCheckpoint&, const FreshFinalizedCheckpoint&) = default;
 };
 
+/** Exact statement and carrier retained only after consensus judgement.
+ * This is derived recovery evidence, not another certificate acceptance rule
+ * or a signer journal. Rebuilds/reorgs reconstruct it from connected blocks.
+ */
+struct FreshHandoverEvidence {
+    modern::FinalizedBlockV2 finalized_block{};
+    int certified_at{-1};
+    uint256 certified_at_hash{};
+    uint256 signing_set_hash{};
+    friend bool operator==(const FreshHandoverEvidence&, const FreshHandoverEvidence&) = default;
+};
+
 /**
  * How many committees before Set'_e the fresh lineage retains: Set'_{e-1}
  * (previous) and Set'_{e-2} (previous2). Node changes sections 8.4 and 8.6
@@ -208,6 +220,17 @@ struct FreshLineageState {
     bool handover_certified{false};
     bool lineage_broken{false};
     std::optional<FreshFinalizedCheckpoint> finalized;
+    //! One actual included handover per completed epoch, indexed by epoch.
+    //! Immutable/shared across per-block projections; copied only on rotation.
+    //! Unlike the two-committee live window this history must survive an
+    //! arbitrarily long canonical outage. It grants no authority over orphans.
+    std::shared_ptr<const std::vector<FreshHandoverEvidence>> handover_history;
+    //! Latest accepted current-epoch statement; archived BEFORE sets rotate.
+    std::optional<FreshHandoverEvidence> current_handover;
+    //! Exact newest included certificate, including a delayed previous-epoch
+    //! certificate received after rotation (not necessarily the archived
+    //! statement which authorized that rotation).
+    std::optional<FreshHandoverEvidence> finalized_evidence;
     //! History accumulator over leaves 0..k (k = the finalized index, or 0
     //! before the first certificate): count == k + 1. Leaves above k are
     //! derived from the chain when a root is needed (FreshHistoryRootAt).
@@ -234,6 +257,9 @@ struct FreshLineageState {
     //! epoch-(epoch-1) handover certificate, which finalizes a height above
     //! every epoch-(epoch-2) checkpoint (the pool prunes up to it first).
     std::optional<uint256> SuccessorHashForEpoch(uint64_t e) const;
+    //! O(1) access to exact, validated historical/current handover evidence.
+    //! Missing evidence never authorizes a lock transition.
+    const FreshHandoverEvidence* HandoverForEpoch(uint64_t e) const;
 };
 
 /**
@@ -370,7 +396,8 @@ bool JudgeFreshCoinbaseCertificate(const CBlock& block, const CBlockIndex& index
  * Apply an accepted certificate to the projected state of its including
  * block: finalized tip (with certId), history accumulator through the
  * certificate's index, and the handover when fb.epoch == the current epoch.
- * False (state untouched) when a history leaf cannot be derived.
+ * False (state untouched) when a history leaf, carrier hash or signing set
+ * cannot be derived. Retains the exact accepted statement for local recovery.
  */
 bool ApplyFreshCertificate(FreshLineageState& state, const modern::FinalityCertificateV2Record& record,
                            int including_height, const FreshHashAtFn& hash_at, int interval);

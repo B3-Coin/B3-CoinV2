@@ -1224,43 +1224,90 @@ bool FinalitySigner::EnsureFreshPersistentSafety(const FreshLineageState& state,
     }
     const CBlockIndex* locked{chain[persisted.lock_height]};
     if (locked && locked->GetBlockHash() == persisted.lock_block_hash) {
-        // B-37 key mode: a member that no committee seated for an epoch (no
-        // counted binding, a void seat) signed nothing in it, so its lock
-        // still names its last seated epoch and its next seat would not
-        // follow that lock's successor set (CommitSignedCheckpoint). The
-        // lock is an ancestor of the active chain: move it forward to the
-        // newest included fresh-lineage certificate of a later epoch, which
-        // descends from it, so votes continue from the committee chain
-        // consensus validated on this chain (finality dependency section
-        // 6.4). Without key mode the staging lineage keeps V1's rule.
+        // The lock is still an ancestor, but the signer may have missed
+        // multiple certified epochs (offline, or no fresh-key seat). Follow
+        // each exact, consensus-validated handover, never an arbitrary epoch
+        // jump. This is local regtest recovery, not a new certificate rule.
         const auto& finalized{state.finalized};
-        if (FreshKeyModeConfigured(params) && finalized && finalized->epoch > persisted.lock_epoch &&
-            finalized->height > persisted.lock_height && finalized->certified_at > finalized->height &&
-            chain[finalized->certified_at] != nullptr) {
-            const int old_height{persisted.lock_height};
-            const uint64_t old_epoch{persisted.lock_epoch};
-            const auto hash_at{[&chain](const int h) -> std::optional<uint256> {
-                const CBlockIndex* index{chain[h]};
-                if (!index) return std::nullopt;
-                return index->GetBlockHash();
+        if (finalized && finalized->epoch > persisted.lock_epoch) {
+            // Constant-time epoch membership: do not rescan the full epoch
+            // table for every step of a long outage. Both checkpoint and its
+            // carrier must still be on this exact active chain.
+            const auto in_epoch{[&state](const uint64_t e, const int h) {
+                return e < state.epoch_starts.size() && h >= state.epoch_starts[e] &&
+                       (e + 1 == state.epoch_starts.size() || h < state.epoch_starts[e + 1]);
             }};
-            const auto fb{ExpectedFinalizedBlockV2(finalized->epoch, finalized->height, state, hash_at, params,
-                                                   bridge_index)};
-            const auto finalized_set{state.SetForEpoch(finalized->epoch)};
-            if (!fb || modern::FinalityCertIdV2(*fb) != finalized->cert_id || !finalized_set) {
-                FailFresh("cannot reconstruct the included fresh-lineage certificate needed to move the ancestry lock past the epochs this validator sat out",
+            const auto valid_evidence{[&](const FreshHandoverEvidence* evidence, const uint64_t e) {
+                if (!evidence) return false;
+                const auto& fb{evidence->finalized_block};
+                if (fb.epoch != e || fb.lineage_id != state.lineage_id ||
+                    fb.height > static_cast<uint64_t>(std::numeric_limits<int>::max())) return false;
+                const int h{static_cast<int>(fb.height)};
+                if (h <= genesis || pos.checkpoint_interval <= 0 ||
+                    (h - genesis) % pos.checkpoint_interval != 0 || !in_epoch(e, h) ||
+                    fb.checkpoint_index != static_cast<uint64_t>((h - genesis) / pos.checkpoint_interval) ||
+                    evidence->certified_at <= h) return false;
+                auto successor{state.SetHashForEpoch(e + 1)};
+                if (!successor) {
+                    const auto* next{state.HandoverForEpoch(e + 1)};
+                    if (next) successor = next->signing_set_hash;
+                }
+                if (!successor || *successor != fb.validator_set_hash) return false;
+                const CBlockIndex* checkpoint{chain[h]};
+                const CBlockIndex* carrier{chain[evidence->certified_at]};
+                return checkpoint && checkpoint->GetBlockHash() == fb.block_hash && carrier &&
+                       carrier->GetBlockHash() == evidence->certified_at_hash &&
+                       !evidence->signing_set_hash.IsNull() && !fb.validator_set_hash.IsNull();
+            }};
+            const auto* predecessor{state.HandoverForEpoch(persisted.lock_epoch)};
+            if (!valid_evidence(predecessor, persisted.lock_epoch) ||
+                !in_epoch(persisted.lock_epoch, persisted.lock_height) ||
+                persisted.lock_height <= genesis || (persisted.lock_height - genesis) % pos.checkpoint_interval != 0 ||
+                predecessor->signing_set_hash != persisted.lock_signing_set_hash ||
+                predecessor->finalized_block.validator_set_hash != persisted.lock_successor_set_hash) {
+                FailFresh("canonical fresh-lineage signer lock lacks matching validated historical handover evidence; refusing catch-up",
                           /*permanent=*/false);
                 return false;
             }
-            std::string error;
-            if (!m_fresh_store.CommitLineageCatchUp(finalized->height, finalized->block_hash,
-                                                    modern::FinalityDigestV2(*domain, *fb), finalized->epoch,
-                                                    finalized_set->set_hash, fb->validator_set_hash, error)) {
-                FailFresh(strprintf("cannot persist the fresh-lineage ancestry lock catch-up: %s", error));
+            for (size_t step{0}; step < MAX_FRESH_CATCH_UP_STEPS; ++step) {
+                // Copy: Commit replaces the store state. Never keep a stale
+                // reference as the predecessor of the next durable write.
+                const FinalitySignerState before{*m_fresh_store.State()};
+                if (before.lock_epoch >= finalized->epoch) break;
+                const uint64_t next_epoch{before.lock_epoch + 1};
+                // A delayed previous-epoch certificate can be newer than
+                // that epoch's archived rotation handover. The final step
+                // uses the exact newest included statement, not a guessed
+                // reconstruction or the older rotation statement.
+                const auto* evidence{next_epoch == finalized->epoch
+                                         ? (state.finalized_evidence ? &*state.finalized_evidence : nullptr)
+                                         : state.HandoverForEpoch(next_epoch)};
+                if (!valid_evidence(evidence, next_epoch) ||
+                    evidence->finalized_block.height <= static_cast<uint64_t>(before.lock_height) ||
+                    evidence->signing_set_hash != before.lock_successor_set_hash ||
+                    (next_epoch == finalized->epoch &&
+                     (modern::FinalityCertIdV2(evidence->finalized_block) != finalized->cert_id ||
+                      evidence->finalized_block.block_hash != finalized->block_hash ||
+                      evidence->finalized_block.height != static_cast<uint64_t>(finalized->height) ||
+                      evidence->certified_at != finalized->certified_at))) {
+                    FailFresh("missing or noncanonical fresh-lineage handover evidence for the next durable catch-up step; refusing to vote",
+                              /*permanent=*/false);
+                    return false;
+                }
+                const auto& fb{evidence->finalized_block};
+                std::string error;
+                if (!m_fresh_store.CommitLineageCatchUp(static_cast<int>(fb.height), fb.block_hash,
+                                                        modern::FinalityDigestV2(*domain, fb), next_epoch,
+                                                        evidence->signing_set_hash, fb.validator_set_hash, error)) {
+                    FailFresh(strprintf("cannot persist the sequential fresh-lineage ancestry lock catch-up: %s", error));
+                    return false;
+                }
+            }
+            if (m_fresh_store.State()->lock_epoch < finalized->epoch) {
+                FailFresh("fresh-lineage ancestry lock catch-up is incomplete; continuing on the next normal signer pass without voting",
+                          /*permanent=*/false);
                 return false;
             }
-            LogInfo("finality signer (fresh lineage): moved the ancestry lock from fresh checkpoint %d (epoch %u) to the included certificate for fresh checkpoint %d (epoch %u); this validator signed nothing in between",
-                    old_height, old_epoch, finalized->height, finalized->epoch);
         }
         m_fresh_error.clear();
         return true;

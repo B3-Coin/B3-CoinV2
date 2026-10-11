@@ -570,8 +570,16 @@ bool FinalitySignerStore::CommitLineageCatchUp(
         error = "no durable ancestry lock to catch up from";
         return false;
     }
-    if (height <= current.lock_height || epoch <= current.lock_epoch) {
-        error = "certified checkpoint does not advance the durable ancestry lock to a later epoch";
+    if (height <= current.lock_height) {
+        error = "certified checkpoint does not advance the durable ancestry lock";
+        return false;
+    }
+    // UINT64_MAX is the empty-epoch sentinel, never a valid target. Check
+    // before adding so neither the sentinel nor wraparound can be a step.
+    if (current.lock_epoch >= std::numeric_limits<uint64_t>::max() - 1 ||
+        epoch != current.lock_epoch + 1 ||
+        signing_set_hash != current.lock_successor_set_hash) {
+        error = "certified checkpoint does not follow the durable validator-set lineage by exactly one epoch";
         return false;
     }
     FinalitySignerState next{current};

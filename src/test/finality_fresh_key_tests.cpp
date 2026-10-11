@@ -442,7 +442,10 @@ bool SameFreshState(const std::optional<node::FreshLineageState>& a, const std::
            FreshSetHashOf(a->previous) == FreshSetHashOf(b->previous) &&
            FreshSetHashOf(a->current) == FreshSetHashOf(b->current) &&
            FreshSetHashOf(a->next) == FreshSetHashOf(b->next) && a->handover_certified == b->handover_certified &&
-           a->lineage_broken == b->lineage_broken && a->finalized == b->finalized && a->history == b->history;
+           a->lineage_broken == b->lineage_broken && a->finalized == b->finalized && a->history == b->history &&
+           a->current_handover == b->current_handover && a->finalized_evidence == b->finalized_evidence &&
+           ((!a->handover_history && !b->handover_history) ||
+            (a->handover_history && b->handover_history && *a->handover_history == *b->handover_history));
 }
 
 //! The key `vk` sits on in `snap` (nullopt when not a member).

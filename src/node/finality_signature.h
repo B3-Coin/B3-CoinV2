@@ -201,6 +201,10 @@ public:
     //! staking explicitly supplies its additional local signing wait.
     explicit FinalitySigner(FinalitySigningPolicy policy = {}) : m_signing_policy{policy} {}
 
+    //! Bound durable ancestry-lock writes per staging signer pass. An
+    //! incomplete walk suppresses all votes until a later normal pass.
+    static constexpr size_t MAX_FRESH_CATCH_UP_STEPS{16};
+
     void SetKey(const bls::SecretKey& key, const modern::ValidatorKeyBytes& validator_key)
     {
         std::string error;
