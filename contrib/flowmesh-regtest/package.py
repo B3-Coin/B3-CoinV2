@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Package ONLY the guarded regtest GUI. Never launch, deploy, or publish it."""
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
@@ -60,6 +61,25 @@ def validate_profile(raw, ca):
             "Public CA mismatch")
     require(b"PRIVATE KEY" not in raw and len(raw) <= 32768, "Private or oversized profile")
     return profile
+
+def validate_session_window(profile_raw):
+    # Keep the embedded profile/storage hash unchanged. This independent
+    # declaration cannot renew the server's certificate or service budget.
+    spec = importlib.util.spec_from_file_location("regtest_session_window", SOURCE / "contrib/flowmesh-regtest/session_preflight.py")
+    session = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(session)
+    return session.inspect_session(profile_raw,
+        (SOURCE / "contrib/flowmesh-regtest/session-window.json").read_bytes(), datetime.now(timezone.utc))
+
+def finalize_output(staged, destination, profile_raw, commit):
+    # Never leave apparently complete archives in the requested handoff
+    # directory when bundling crosses the window or source identity changes.
+    # Failed private staging is retained for diagnosis, not for distribution.
+    validate_session_window(profile_raw)
+    require(run("git", "rev-parse", "HEAD").strip() == commit and
+            not run("git", "status", "--porcelain", "--untracked-files=all").strip(), "Source changed during packaging")
+    require(not destination.exists() and not destination.is_symlink(), "Output already exists; do not overwrite a frozen package")
+    shutil.copytree(staged, destination)  # Exclusive destination; no merge/overwrite.
 
 def version_tuple(value):
     require(bool(re.fullmatch(r"\d+(?:\.\d+){0,3}", value)), "Invalid minimum OS version")
@@ -253,6 +273,7 @@ def main():
     profile_path = PROFILE_PATH
     ca_path = CA_PATH
     profile = validate_profile(profile_path.read_bytes(), ca_path.read_bytes())
+    session_window = validate_session_window(profile_path.read_bytes())
     notices = args.notices.resolve(strict=True)
     notice_manifest = json.loads((notices / "NOTICE-MANIFEST.json").read_text())
     require(notice_manifest.get("collection_complete") is True, "Notice collection incomplete")
@@ -261,9 +282,11 @@ def main():
         require(path.resolve().is_relative_to(notices) and not path.is_symlink() and sha(path) == row["sha256"],
                 "Unsafe or changed public notice input")
     require(any("LGPL-3.0" in row["path"] for row in notice_manifest["files"]), "Qt license missing")
-    output.mkdir(parents=True)
     # Build-local staging is not a repository/runtime input and is preserved.
     stage = Path(tempfile.mkdtemp(prefix="regtest-package-", dir=build))
+    final_output = output
+    output = stage / "checked-output"
+    output.mkdir()
     payload = stage / "payload"
     payload.mkdir()
     original = build / "bin" / (TARGET + ".exe" if args.platform == "win64" else TARGET + ".app/Contents/MacOS/" + TARGET)
@@ -339,6 +362,7 @@ def main():
         "full_v2": False, "futures_trading": False, "performance_qualified": False,
         "signing": "unsigned; macOS ad-hoc integrity seal only, not notarized",
         "availability": profile["availability"], "original_accessibility_crash": "OPEN / UNRESOLVED",
+        "session_window": session_window, "live_tls_verified_by_packaging": False,
         "native_ui_qualification": "not established by compilation or policy tests"}
     save(payload / "BUILD-INFO.json", identity)
     save(output / ("BUILD-INFO." + args.platform + ".json"), identity)
@@ -362,8 +386,7 @@ def main():
         for path in sorted(output.iterdir()):
             if path.suffix in (".zip", ".json"):
                 stream.write(sha(path) + "  " + path.name + "\n")
-    require(run("git", "rev-parse", "HEAD").strip() == commit and
-            not run("git", "status", "--porcelain", "--untracked-files=all").strip(), "Source changed during packaging")
+    finalize_output(output, final_output, profile_path.read_bytes(), commit)
     print(json.dumps(identity, sort_keys=True))
 
 if __name__ == "__main__":

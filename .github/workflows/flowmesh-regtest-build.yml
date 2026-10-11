@@ -15,12 +15,19 @@ on:
     branches: [flowmeshV2-dev]
     paths:
       - '.github/workflows/flowmesh-regtest-build.yml'
+      # The guarded Qt client links the node, wallet, consensus, networking and
+      # FlowMesh libraries. A small Qt-only allowlist silently omitted repairs
+      # to those prerequisites (including stale-tip staking restart recovery).
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'depends/**'
+      - 'share/**'
+      - 'COPYING'
       - 'contrib/flowmesh-regtest/**'
-      - 'src/qt/test/flowmeshclosedtest*'
-      - 'src/qt/createwalletdialog.*'
-      - 'src/qt/walletcontroller.cpp'
-      - 'src/qt/test/b3createwalletdialogtests.cpp'
-      - 'src/qt/test/CMakeLists.txt'
+      - 'contrib/closed-test/collect-notices.py'
+      - 'contrib/windeploy/package_portable.py'
+      - 'contrib/macdeploy/normalize_bundled_libraries.rb'
 
 permissions:
   contents: read
@@ -40,6 +47,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Verify artifact workflow trigger contract
+        run: python3 -B contrib/flowmesh-regtest/test_workflow.py -v
+      - name: Verify session-window regressions
+        run: python3 -B contrib/flowmesh-regtest/test_session_preflight.py -v
+      - name: Refuse expired test-session packaging before platform builds
+        run: python3 -B contrib/flowmesh-regtest/session_preflight.py
       - name: Verify profile and package guard invariants
         if: github.event_name != 'workflow_dispatch' || inputs.run_tests
         run: python3 -B contrib/flowmesh-regtest/test_package.py -v

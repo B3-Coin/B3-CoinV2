@@ -25,6 +25,44 @@ class PackageTests(unittest.TestCase):
     def test_approved_profile_and_ca(self):
         self.assertEqual(PACKAGE.validate_profile(self.raw, self.ca)["profile_id"], PACKAGE.PROFILE)
 
+    def output_fixture(self, path):
+        staged = Path(path) / "private-stage"
+        staged.mkdir()
+        (staged / "candidate.zip").write_bytes(b"synthetic archive")
+        (staged / "BUILD-INFO.json").write_text('{"synthetic": true}\n')
+        return staged, Path(path) / "handoff"
+
+    def test_crossed_session_window_leaves_no_handoff_archive(self):
+        with tempfile.TemporaryDirectory() as path:
+            staged, destination = self.output_fixture(path)
+            with mock.patch.object(PACKAGE, "validate_session_window", side_effect=RuntimeError("window has ended")), \
+                 mock.patch.object(PACKAGE, "run") as run:
+                with self.assertRaisesRegex(RuntimeError, "window has ended"):
+                    PACKAGE.finalize_output(staged, destination, self.raw, "synthetic-commit")
+                run.assert_not_called()
+            self.assertFalse(destination.exists())
+            self.assertEqual((staged / "candidate.zip").read_bytes(), b"synthetic archive")
+
+    def test_changed_source_refuses_before_handoff_copy(self):
+        with tempfile.TemporaryDirectory() as path:
+            staged, destination = self.output_fixture(path)
+            with mock.patch.object(PACKAGE, "validate_session_window"), \
+                 mock.patch.object(PACKAGE, "run", return_value="other-commit"):
+                with self.assertRaisesRegex(RuntimeError, "Source changed"):
+                    PACKAGE.finalize_output(staged, destination, self.raw, "synthetic-commit")
+            self.assertFalse(destination.exists())
+
+    def test_checked_output_copy_preserves_bytes_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as path:
+            staged, destination = self.output_fixture(path)
+            with mock.patch.object(PACKAGE, "validate_session_window"), \
+                 mock.patch.object(PACKAGE, "run", side_effect=lambda *args: "synthetic-commit" if args[1] == "rev-parse" else ""):
+                PACKAGE.finalize_output(staged, destination, self.raw, "synthetic-commit")
+                self.assertEqual((destination / "candidate.zip").read_bytes(), b"synthetic archive")
+                with self.assertRaisesRegex(RuntimeError, "Output already exists"):
+                    PACKAGE.finalize_output(staged, destination, self.raw, "synthetic-commit")
+            self.assertEqual((destination / "candidate.zip").read_bytes(), b"synthetic archive")
+
     def test_legacy_fixtures_preserved_and_refused_for_new_package(self):
         raw = (HERE / "profile-vps-20260926.json").read_bytes()
         ca = (HERE / "regtest-ca.pem").read_bytes()
