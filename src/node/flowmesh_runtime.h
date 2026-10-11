@@ -160,6 +160,9 @@ enum class FlowMeshRuntimeHalt : uint8_t {
     SIGNING_CONFLICT,
     CERTIFICATE_CONFLICT,
     ANCHOR_INVALIDATED,
+    /** An unexpected exception escaped a worker handler. The market's
+     * in-memory state may be partially updated, so it stops for good. */
+    INTERNAL_ERROR,
 };
 
 enum class FlowMeshRuntimeMarketReadiness : uint8_t {

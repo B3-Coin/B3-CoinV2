@@ -1818,6 +1818,7 @@ const char* FlowMeshRuntimeHaltName(const FlowMeshRuntimeHalt halt)
     case FlowMeshRuntimeHalt::CERTIFICATE_CONFLICT:
         return "certificate-conflict";
     case FlowMeshRuntimeHalt::ANCHOR_INVALIDATED: return "anchor-invalidated";
+    case FlowMeshRuntimeHalt::INTERNAL_ERROR: return "internal-error";
     }
     return "unknown";
 }

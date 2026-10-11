@@ -113,6 +113,10 @@ class RuntimeChain final : public node::FlowMeshRuntimeChain
 public:
     void SetReconciled(const bool reconciled) { m_reconciled = reconciled; }
 
+    // Model an unexpected failure inside a worker handler (for example an
+    // allocation or a broken invariant deep in the chain view).
+    void SetThrowOnAcceptable(const bool fail) { m_throw_on_acceptable = fail; }
+
     uint64_t DeliveryGeneration() const override { return m_delivery_generation.load(); }
 
     // A reconciliation that started and finished while the worker was idle:
@@ -139,6 +143,7 @@ public:
 
     bool Acceptable(const flowmesh::AnchorRef& anchor) const override
     {
+        if (m_throw_on_acceptable.load()) throw std::runtime_error{"injected chain failure"};
         if (!m_reconciled.load()) return false;
         {
             std::lock_guard<std::mutex> lock{m_mutex};
@@ -302,6 +307,7 @@ public:
 
 private:
     mutable std::atomic<bool> m_reconciled{true};
+    std::atomic<bool> m_throw_on_acceptable{false};
     mutable std::atomic<uint64_t> m_delivery_generation{0};
     mutable std::optional<flowmesh::AnchorRef> m_reconcile_once_anchor;
     mutable size_t m_reconcile_after_checks{0};
@@ -2146,6 +2152,46 @@ BOOST_AUTO_TEST_CASE(critical_certificate_append_store_failure_still_halts)
     BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
     BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 0U);
     BOOST_CHECK_EQUAL(f.Snapshot().deferred_objects, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(worker_handler_exception_halts_market_not_process)
+{
+    DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_worker_exception",
+                            node::FlowMeshDeliveryAdmission::ADMITTED};
+    const auto original{f.Sent()};
+    const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
+        return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
+    })};
+    BOOST_REQUIRE(proposal != original.end());
+    const auto decoded{flowmesh::DecodeProductionProposalPayload(proposal->message.payload)};
+    BOOST_REQUIRE(decoded);
+    const auto payload{flowmesh::EncodeProductionCertifiedPayload(
+        {decoded->entry, Certify(decoded->entry, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(payload);
+    const flowmesh::WireMessage certificate{flowmesh::WireMessageKind::CERTIFICATE,
+                                            proposal->message.header, *payload};
+
+    // An exception escaping a handler used to leave the worker thread and
+    // terminate the whole node. It must instead halt only this market.
+    f.chain.SetThrowOnAcceptable(true);
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER, certificate) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    const auto halted{f.runtime->MarketStatus(f.market)};
+    BOOST_REQUIRE(halted);
+    BOOST_CHECK(halted->halt == node::FlowMeshRuntimeHalt::INTERNAL_ERROR);
+    BOOST_CHECK(halted->error.find("injected chain failure") != std::string::npos);
+    BOOST_CHECK_EQUAL(std::string{node::FlowMeshRuntimeHaltName(halted->halt)}, "internal-error");
+
+    // The halt fails closed: the worker keeps serving, but the market does
+    // not resume or apply anything once the fault clears.
+    f.chain.SetThrowOnAcceptable(false);
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER, certificate) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::INTERNAL_ERROR);
+    BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
+    BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 0U);
 }
 
 BOOST_AUTO_TEST_CASE(critical_durable_certificate_retries_after_candidate_cleanup_and_disarm)
