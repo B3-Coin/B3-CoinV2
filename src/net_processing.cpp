@@ -43,6 +43,7 @@
 #include <node/finality_transport.h>
 #include <node/legacy_orphanage.h>
 #include <node/protocol_version.h>
+#include <node/regtest_staking_tip_sync.h>
 #include <node/timeoffsets.h>
 #include <node/txdownloadman.h>
 #include <node/txorphanage.h>
@@ -620,6 +621,8 @@ struct CNodeState {
     const CBlockIndex* pindexBestHeaderSent{nullptr};
     //! Whether we've started headers synchronization with this peer.
     bool fSyncStarted{false};
+    //! One bounded request/reply hint; lost with this connection, never persisted.
+    node::RegtestStakingTipSync m_regtest_staking_tip_sync;
     //! Since when we're stalling block download progress (in microseconds), or 0.
     std::chrono::microseconds m_stalling_since{0us};
     std::list<QueuedBlock> vBlocksInFlight;
@@ -709,6 +712,8 @@ public:
     util::Expected<void, std::string> FetchBlock(NodeId peer_id, const CBlockIndex& block_index) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+    bool HasRegtestStakingTipSync(const CBlockIndex& tip) const override
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     std::vector<node::TxOrphanage::OrphanInfo> GetOrphanTransactions() override EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
     PeerManagerInfo GetInfo() const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     std::vector<PrivateBroadcast::TxBroadcastInfo> GetPrivateBroadcastInfo() const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
@@ -888,6 +893,7 @@ private:
      * This returns true if a getheaders is actually sent, and false otherwise.
      */
     bool MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    const CBlockIndex* RegtestStakingTip() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Potentially fetch blocks from this peer upon receipt of a new headers tip */
     void HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, const CBlockIndex& last_header);
     /** Update peer state based on received headers message */
@@ -1531,6 +1537,13 @@ static void AddKnownTx(Peer& peer, const uint256& hash)
 static bool CanServeBlocks(const Peer& peer)
 {
     return peer.m_their_services & (NODE_NETWORK|NODE_NETWORK_LIMITED);
+}
+
+static bool CanProbeRegtestStakingTip(const CNode& node, const Peer& peer)
+{
+    return !node.fDisconnect && node.fSuccessfullyConnected &&
+           (node.IsOutboundOrBlockRelayConn() || node.IsManualConn()) &&
+           !peer.m_legacy_protocol && CanServeBlocks(peer);
 }
 
 /** Whether this peer can only serve limited recent blocks (e.g. because
@@ -2305,6 +2318,37 @@ bool PeerManagerImpl::GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) c
     stats.time_offset = peer->m_time_offset;
 
     return true;
+}
+
+const CBlockIndex* PeerManagerImpl::RegtestStakingTip() const
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
+    if (m_chainparams.GetChainType() != ChainType::REGTEST || !tip ||
+        tip->nHeight == std::numeric_limits<int>::max() ||
+        !m_chainparams.GetConsensus().H1RulesActive(tip->nHeight + 1) ||
+        !m_chainman.IsInitialBlockDownload() ||
+        m_chainman.m_blockman.LoadingBlocks() ||
+        m_chainman.m_best_header != tip) return nullptr;
+    return tip;
+}
+
+bool PeerManagerImpl::HasRegtestStakingTipSync(const CBlockIndex& tip) const
+{
+    AssertLockHeld(::cs_main);
+    if (RegtestStakingTip() != &tip) return false;
+    bool found{false};
+    const auto now{NodeClock::now()};
+    m_connman.ForEachNode([&](CNode* pnode) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        AssertLockHeld(::cs_main);
+        const CNodeState* state{State(pnode->GetId())};
+        if (found || !state || !state->vBlocksInFlight.empty() ||
+            state->pindexBestKnownBlock != &tip ||
+            !state->m_regtest_staking_tip_sync.Fresh(tip.GetBlockHash(), now)) return;
+        const PeerRef peer{GetPeerRef(pnode->GetId())};
+        if (peer && CanProbeRegtestStakingTip(*pnode, *peer)) found = true;
+    });
+    return found;
 }
 
 std::vector<node::TxOrphanage::OrphanInfo> PeerManagerImpl::GetOrphanTransactions()
@@ -3745,6 +3789,17 @@ bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& loc
     if (current_time - peer.m_last_getheaders_timestamp > HEADERS_RESPONSE_TIME) {
         MakeAndPushMessage(pfrom, NetMsgType::GETHEADERS, locator, uint256());
         peer.m_last_getheaders_timestamp = current_time;
+        LOCK(cs_main);
+        const CBlockIndex* tip{RegtestStakingTip()};
+        // Initial sync deliberately asks from the parent to obtain a nonempty
+        // reply. A tip/parent locator is never a request for arbitrary history.
+        if (tip && CanProbeRegtestStakingTip(pfrom, peer) && !locator.vHave.empty() &&
+            (locator.vHave.front() == tip->GetBlockHash() ||
+             (tip->pprev && locator.vHave.front() == tip->pprev->GetBlockHash()))) {
+            if (CNodeState* state{State(pfrom.GetId())}) {
+                state->m_regtest_staking_tip_sync.Requested(tip->GetBlockHash(), current_time);
+            }
+        }
         return true;
     }
     return false;
@@ -3876,6 +3931,17 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
                                             bool via_compact_block)
 {
     size_t nCount = headers.size();
+
+    // HEADERS has no request nonce; this establishes only a bounded, fresh
+    // peer availability hint. An unsolicited announcement cannot arm it.
+    const auto staking_response_time{NodeClock::now()};
+    std::optional<uint256> staking_request_tip;
+    if (!via_compact_block) {
+        LOCK(cs_main);
+        if (CNodeState* state{State(pfrom.GetId())}) {
+            staking_request_tip = state->m_regtest_staking_tip_sync.TakeRequest(staking_response_time);
+        }
+    }
 
     if (nCount == 0) {
         // Nothing interesting. Stop asking this peers for more headers.
@@ -4036,6 +4102,18 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
     }
 
     UpdatePeerStateForReceivedHeaders(pfrom, peer, *pindexLast, received_new_header, nCount == m_opts.max_headers_result);
+
+    if (processed && staking_request_tip && nCount < m_opts.max_headers_result &&
+        !have_headers_sync && CanProbeRegtestStakingTip(pfrom, peer)) {
+        LOCK(cs_main);
+        const CBlockIndex* tip{RegtestStakingTip()};
+        if (tip && pindexLast == tip && tip->GetBlockHash() == *staking_request_tip) {
+            if (CNodeState* state{State(pfrom.GetId())}) {
+                state->m_regtest_staking_tip_sync.Confirmed(*staking_request_tip, staking_response_time);
+                LogDebug(BCLog::NET, "Regtest H1 staking tip probe completed at height %d peer=%d\n", tip->nHeight, pfrom.GetId());
+            }
+        }
+    }
 
     // Consider immediately downloading blocks.
     HeadersDirectFetchBlocks(pfrom, peer, *pindexLast);
@@ -7604,6 +7682,17 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                     nSyncStarted++;
                 }
             }
+        }
+
+        // A stale restart can remain in IBD after initial headers sync has
+        // completed. Refresh its connection-local hint at most once per two
+        // minutes per eligible peer, independent of unsolicited reply traffic.
+        // No change to shipped-network synchronization or finality authority.
+        if (const CBlockIndex* tip{RegtestStakingTip()}; tip && tip->pprev &&
+            state.fSyncStarted && CanProbeRegtestStakingTip(node, peer) &&
+            !state.m_regtest_staking_tip_sync.Fresh(tip->GetBlockHash(), NodeClock::now()) &&
+            state.m_regtest_staking_tip_sync.ShouldProbe(NodeClock::now())) {
+            (void)MaybeSendGetHeaders(node, GetLocator(tip->pprev), peer);
         }
 
         //

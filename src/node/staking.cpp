@@ -83,6 +83,45 @@ bool ShouldWaitForRegtestBlockDownload(
            best_header->nChainWork > active_tip->nChainWork;
 }
 
+bool CanResumeRegtestStakingAfterOutage(
+    const ChainType network, const Consensus::Params& params,
+    const RegtestStakingRestartInputs& facts)
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex* tip{facts.active_tip};
+    if (network != ChainType::REGTEST || !params.legacy_b3coin ||
+        !Consensus::LegacyBoundaryPinned(params) || !params.modern_pos ||
+        !params.modern_pos->Valid() || !tip || tip->nHeight <= 0 ||
+        tip->nHeight == std::numeric_limits<int>::max() ||
+        !params.H1RulesActive(tip->nHeight + 1) ||
+        params.h1->escape_rounds <= 0 ||
+        Consensus::GetConsensusPhase(tip->nHeight + 1, params) !=
+            Consensus::ConsensusPhase::MODERN_POS ||
+        facts.loading_blocks || !facts.chainstate_validated ||
+        !facts.minimum_work_met || !facts.peer_tip_synced ||
+        facts.best_header != tip || !tip->IsValid(BLOCK_VALID_SCRIPTS) ||
+        !(tip->nStatus & BLOCK_HAVE_DATA) || !tip->HaveNumChainTxs() ||
+        facts.max_tip_age.count() < 0) {
+        return false;
+    }
+    // Require age to be the actual remaining IBD cause. Refuse timestamp
+    // overflow rather than deriving an unrepresentable block/round.
+    constexpr int64_t MAX_HEADER_TIME{std::numeric_limits<uint32_t>::max()};
+    const int64_t parent_time{tip->GetBlockTime()};
+    const auto& pos{*params.modern_pos};
+    if (facts.now <= parent_time || facts.now > MAX_HEADER_TIME ||
+        facts.now - parent_time <= facts.max_tip_age.count() ||
+        pos.block_interval_seconds > MAX_HEADER_TIME - parent_time ||
+        pos.round_seconds > MAX_HEADER_TIME) {
+        return false;
+    }
+    const int64_t first_round_time{parent_time + pos.block_interval_seconds};
+    if (facts.now < first_round_time) return false;
+    const int64_t round{(facts.now - first_round_time) / pos.round_seconds};
+    return round <= std::numeric_limits<uint32_t>::max() &&
+           params.H1EscapeRound(tip->nHeight + 1, round);
+}
+
 PreferredProposerPlan ComputePreferredProposerPlan(
     const uint256& chain_domain, const uint256& seed, const int height,
     const int64_t round, const ValidatorSetSnapshot& set,
@@ -529,10 +568,29 @@ void StakingLoop::ThreadLoop()
     }
     const Consensus::Params& params{m_chainman.GetConsensus()};
 
+    // A stale but fully validated H1 regtest chain needs block production to
+    // become recent again. Do not clear IBD or let this policy authorize BLS
+    // finality votes/recovery. Re-read all facts during candidate checks.
+    const auto can_resume_after_outage = [&]() EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        Chainstate& chainstate{m_chainman.ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        return CanResumeRegtestStakingAfterOutage(
+            m_chainman.GetParams().GetChainType(), params,
+            {.active_tip = tip,
+             .best_header = m_chainman.m_best_header,
+             .loading_blocks = m_chainman.m_blockman.LoadingBlocks(),
+             .chainstate_validated = chainstate.m_assumeutxo == Assumeutxo::VALIDATED,
+             .minimum_work_met = tip && tip->nChainWork >= m_chainman.MinimumChainWork(),
+             .peer_tip_synced = tip && m_peerman && m_peerman->HasRegtestStakingTipSync(*tip),
+             .now = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now()),
+             .max_tip_age = m_chainman.m_options.max_tip_age});
+    };
+
     while (true) {
         if (WITH_LOCK(m_mutex, return m_stop)) break;
 
-        if (m_chainman.IsInitialBlockDownload()) {
+        if (m_chainman.IsInitialBlockDownload() &&
+            !WITH_LOCK(::cs_main, return can_resume_after_outage())) {
             SetState("waiting: initial block download");
             if (!SleepUnlessStopped(std::chrono::seconds{5})) break;
             continue;
@@ -562,7 +620,8 @@ void StakingLoop::ThreadLoop()
         // A rejected explicit plan must not silently fall back to normal
         // signing merely because key loading succeeded. Block staking remains
         // independent; restarting staking is required after fixing the plan.
-        if (finality_startup_ready && signer.HasKey()) {
+        if (!m_chainman.IsInitialBlockDownload() &&
+            finality_startup_ready && signer.HasKey()) {
             std::vector<FinalitySig> sigs;
             std::optional<interfaces::FinalityRecoveryStatus> recovery;
             {
@@ -650,7 +709,9 @@ void StakingLoop::ThreadLoop()
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
             if (!tip || tip->GetBlockHash() != tip_hash) {
                 tip_changed = true;
-            } else if (ShouldWaitForRegtestBlockDownload(
+            } else if ((m_chainman.IsInitialBlockDownload() &&
+                        !can_resume_after_outage()) ||
+                       ShouldWaitForRegtestBlockDownload(
                            m_chainman.GetParams().GetChainType(), tip,
                            m_chainman.m_best_header)) {
                 waiting_for_blocks = true;
@@ -790,6 +851,8 @@ void StakingLoop::ThreadLoop()
                 ::cs_main,
                 const CBlockIndex* current{m_chainman.ActiveChain().Tip()};
                 return current && current->GetBlockHash() == tip_hash &&
+                       (!m_chainman.IsInitialBlockDownload() ||
+                        can_resume_after_outage()) &&
                        !ShouldWaitForRegtestBlockDownload(
                            m_chainman.GetParams().GetChainType(), current,
                            m_chainman.m_best_header));

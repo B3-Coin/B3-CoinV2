@@ -7,6 +7,7 @@
 #define BITCOIN_NET_PROCESSING_H
 
 #include <consensus/amount.h>
+#include <kernel/cs_main.h>
 #include <net.h>
 #include <node/finality_signature.h>
 #include <node/flowmesh_delivery.h>
@@ -123,6 +124,13 @@ public:
 
     /** Get statistics from node state */
     virtual bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const = 0;
+
+    /** Regtest H1 only: recent solicited header reply for the exact validated
+     * tip from a live modern outbound/manual block-serving peer. This is an
+     * availability hint, NOT global-sync, eclipse or finality proof.
+     */
+    virtual bool HasRegtestStakingTipSync(const CBlockIndex& tip) const
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) = 0;
 
     virtual std::vector<node::TxOrphanage::OrphanInfo> GetOrphanTransactions() = 0;
 

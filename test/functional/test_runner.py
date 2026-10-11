@@ -116,6 +116,8 @@ EXTENDED_SCRIPTS = [
     # RT1: H1 producer rotation, escape and H2 checkpoint (regtest-only knobs); local nodes only.
     'feature_b3_h1_producer_rotation.py --fixture=B',
     'feature_b3_h1_producer_rotation.py --fixture=I',
+    # H1 age-only IBD restart recovery; two local nodes, no external chains.
+    'feature_b3_staking_outage_restart.py',
 ]
 
 # Special script to run each bench sanity check

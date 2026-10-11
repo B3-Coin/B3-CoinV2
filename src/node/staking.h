@@ -31,6 +31,7 @@ enum class ChainType;
 
 namespace Consensus {
 struct ModernPosParams;
+struct Params;
 }
 
 namespace node {
@@ -77,6 +78,26 @@ bool ShouldWaitForRegtestBlockDownload(
     ChainType network, const CBlockIndex* active_tip,
     const CBlockIndex* best_header) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
+/** Facts re-read at every candidate check. This never clears global IBD. */
+struct RegtestStakingRestartInputs {
+    const CBlockIndex* active_tip{nullptr};
+    const CBlockIndex* best_header{nullptr};
+    bool loading_blocks{true};
+    bool chainstate_validated{false};
+    bool minimum_work_met{false};
+    bool peer_tip_synced{false};
+    int64_t now{0};
+    std::chrono::seconds max_tip_age{0};
+};
+
+/** Regtest H1 block-production-only exception to age-only startup IBD.
+ * No finality signing, recovery pass or consensus permission is granted.
+ * A fresh outbound peer reply is an availability hint, not eclipse proof.
+ */
+bool CanResumeRegtestStakingAfterOutage(
+    ChainType network, const Consensus::Params& params,
+    const RegtestStakingRestartInputs& facts) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
 /**
  * The automatic Modern PoS staking loop (release-v1 validator UX, owner
  * ruling 2026-08-23: "automatic staking loop ... nothing more advanced in
@@ -93,7 +114,9 @@ bool ShouldWaitForRegtestBlockDownload(
  *
  * It produces nothing while the next block is not a modern-PoS block
  * (legacy era, corridor, unpinned boundary, unconfigured rules), during
- * initial block download, while regtest is catching up to a higher-work
+ * initial block download (except the guarded regtest H1 age-only restart
+ * policy, which permits block production but never finality signing),
+ * while regtest is catching up to a higher-work
  * best header, or while this validator has no ACTIVE stake.
  * Everything consensus-relevant lives in the assembler and validation; this
  * class only schedules.

@@ -20,6 +20,7 @@
 #include <node/finality_tracker.h>
 #include <node/miner.h>
 #include <node/regtest_finality_policy.h>
+#include <node/regtest_staking_tip_sync.h>
 #include <node/stake_registry.h>
 #include <node/staking.h>
 #include <node/validator_set.h>
@@ -103,6 +104,44 @@ const uint256 COORDINATION_SEED{CoordinationHash(0x5e, 0xed)};
 constexpr int COORDINATION_HEIGHT{1'234};
 constexpr int64_t SATURATED_ROUND{128};
 
+//! Synthetic availability fixtures, not activation or economics defaults.
+Consensus::Params StakingRestartTestParams()
+{
+    Consensus::Params params{};
+    params.legacy_b3coin = true;
+    params.hard_fork_height = 1;
+    params.legacy_final_hash = CoordinationHash(0x51, 0x01);
+    params.transition_pow_length = 100; // Modern PoS begins at 101.
+    params.modern_pos = Consensus::ModernPosParams{};
+    params.h1 = Consensus::H1Params{150, Consensus::H1Params::DEFAULT_ESCAPE_ROUNDS};
+    return params;
+}
+
+void SetStakingRestartTestTip(CBlockIndex& tip) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    tip.nHeight = 200;
+    tip.nTime = 1'000'000;
+    tip.nChainWork = arith_uint256{200};
+    tip.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA;
+    tip.nTx = 1;
+    tip.m_chain_tx_count = 201;
+}
+
+node::RegtestStakingRestartInputs StakingRestartTestFacts(const CBlockIndex& tip)
+{
+    node::RegtestStakingRestartInputs facts;
+    facts.active_tip = &tip;
+    facts.best_header = &tip;
+    facts.loading_blocks = false;
+    facts.chainstate_validated = true;
+    facts.minimum_work_met = true;
+    facts.peer_tip_synced = true;
+    // Default H1 escape: parent + 60 + 2880 * 30 = 24 h + 60 s.
+    facts.now = tip.GetBlockTime() + 86'460;
+    facts.max_tip_age = std::chrono::hours{24};
+    return facts;
+}
+
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(modern_pos_tests, BasicTestingSetup)
@@ -143,6 +182,277 @@ BOOST_AUTO_TEST_CASE(regtest_block_download_producer_policy)
     BOOST_CHECK(!should_wait());
     header.nStatus = BLOCK_VALID_TREE | BLOCK_FAILED_VALID;
     BOOST_CHECK(!should_wait());
+}
+
+BOOST_AUTO_TEST_CASE(regtest_staking_restart_context_gates)
+{
+    LOCK(cs_main);
+    auto params{StakingRestartTestParams()};
+    CBlockIndex tip;
+    SetStakingRestartTestTip(tip);
+    auto facts{StakingRestartTestFacts(tip)};
+    const auto allowed = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        return node::CanResumeRegtestStakingAfterOutage(ChainType::REGTEST, params, facts);
+    };
+    BOOST_REQUIRE(params.modern_pos->Valid());
+    BOOST_REQUIRE(allowed());
+    for (const auto network : {ChainType::MAIN, ChainType::TESTNET,
+                               ChainType::TESTNET4, ChainType::SIGNET}) {
+        BOOST_CHECK(!node::CanResumeRegtestStakingAfterOutage(network, params, facts));
+    }
+    BOOST_CHECK(!node::CanResumeRegtestStakingAfterOutage(
+        ChainType::REGTEST, params, node::RegtestStakingRestartInputs{}));
+
+    const auto original_params{params};
+    params.legacy_b3coin = false;
+    BOOST_CHECK(!allowed());
+    params = original_params;
+    params.hard_fork_height.reset();
+    BOOST_CHECK(!allowed());
+    params = original_params;
+    params.legacy_final_hash.reset();
+    BOOST_CHECK(!allowed());
+    params = original_params;
+    params.modern_pos.reset();
+    BOOST_CHECK(!allowed());
+    params = original_params;
+    params.modern_pos->round_seconds = 0;
+    BOOST_CHECK(!allowed());
+    params = original_params;
+    params.h1.reset();
+    BOOST_CHECK(!allowed());
+    params = original_params;
+    params.h1->activation_height = tip.nHeight + 2;
+    BOOST_CHECK(!allowed());
+    params.h1->activation_height = tip.nHeight + 1;
+    BOOST_CHECK(allowed()); // H1 applies to the next candidate, not the parent.
+    params.h1->escape_rounds = 0;
+    BOOST_CHECK(!allowed());
+    params.h1->escape_rounds = -1;
+    BOOST_CHECK(!allowed());
+    params = original_params;
+    params.transition_pow_length = 300;
+    BOOST_CHECK(!allowed()); // H1 alone cannot enable staking in the PoW corridor.
+    params = original_params;
+    facts.active_tip = nullptr;
+    BOOST_CHECK(!allowed());
+    facts.active_tip = &tip;
+    tip.nHeight = 0;
+    BOOST_CHECK(!allowed());
+    tip.nHeight = std::numeric_limits<int>::max();
+    BOOST_CHECK(!allowed()); // No overflowing next-height calculation.
+}
+
+BOOST_AUTO_TEST_CASE(regtest_staking_restart_requires_validated_exact_tip)
+{
+    LOCK(cs_main);
+    const auto params{StakingRestartTestParams()};
+    CBlockIndex tip;
+    SetStakingRestartTestTip(tip);
+    auto facts{StakingRestartTestFacts(tip)};
+    const auto allowed = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        return node::CanResumeRegtestStakingAfterOutage(ChainType::REGTEST, params, facts);
+    };
+    BOOST_REQUIRE(allowed());
+    const auto original_facts{facts};
+    facts.loading_blocks = true;
+    BOOST_CHECK(!allowed());
+    facts = original_facts;
+    facts.chainstate_validated = false;
+    BOOST_CHECK(!allowed());
+    facts = original_facts;
+    facts.minimum_work_met = false;
+    BOOST_CHECK(!allowed());
+    facts = original_facts;
+    facts.peer_tip_synced = false;
+    BOOST_CHECK(!allowed());
+    facts = original_facts;
+    facts.best_header = nullptr;
+    BOOST_CHECK(!allowed());
+    CBlockIndex other_header;
+    SetStakingRestartTestTip(other_header);
+    facts.best_header = &other_header;
+    BOOST_CHECK(!allowed()); // Same height/work/time is not the exact active tip.
+    other_header.nHeight += 1;
+    other_header.nChainWork += arith_uint256{1};
+    BOOST_CHECK(!allowed()); // Real outstanding header download stays in IBD.
+    facts = original_facts;
+    for (const uint32_t status : {uint32_t{BLOCK_VALID_TREE | BLOCK_HAVE_DATA},
+                                  uint32_t{BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA},
+                                  uint32_t{BLOCK_VALID_SCRIPTS},
+                                  uint32_t{BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_FAILED_VALID}}) {
+        tip.nStatus = status;
+        BOOST_CHECK(!allowed());
+    }
+    SetStakingRestartTestTip(tip);
+    tip.m_chain_tx_count = 0;
+    BOOST_CHECK(!allowed()); // A body alone does not establish downloaded ancestry.
+    tip.m_chain_tx_count = 201;
+    BOOST_CHECK(allowed());
+}
+
+BOOST_AUTO_TEST_CASE(regtest_staking_restart_age_escape_and_overflow_boundaries)
+{
+    LOCK(cs_main);
+    auto params{StakingRestartTestParams()};
+    CBlockIndex tip;
+    SetStakingRestartTestTip(tip);
+    auto facts{StakingRestartTestFacts(tip)};
+    const auto allowed = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        return node::CanResumeRegtestStakingAfterOutage(ChainType::REGTEST, params, facts);
+    };
+    BOOST_REQUIRE(allowed());
+    facts.now = tip.GetBlockTime() + 86'400;
+    BOOST_CHECK(!allowed()); // Exactly max-tip-age is not age-only IBD.
+    facts.now = tip.GetBlockTime() + 86'459;
+    BOOST_CHECK(!allowed()); // A stale tip still must reach the escape round.
+    facts.now += 1;
+    BOOST_CHECK(allowed());
+    facts.max_tip_age = std::chrono::seconds{86'460};
+    BOOST_CHECK(!allowed());
+    facts.max_tip_age = std::chrono::seconds{86'459};
+    BOOST_CHECK(allowed());
+    facts.max_tip_age = std::chrono::seconds{-1};
+    BOOST_CHECK(!allowed());
+
+    facts.max_tip_age = std::chrono::seconds{0};
+    params.h1->escape_rounds = 1; // Explicit synthetic one-round fixture.
+    facts.now = tip.GetBlockTime() - 1;
+    BOOST_CHECK(!allowed());
+    facts.now += 1;
+    BOOST_CHECK(!allowed());
+    facts.now = tip.GetBlockTime() + 59;
+    BOOST_CHECK(!allowed()); // Before the first representable candidate time.
+    facts.now += 1;
+    BOOST_CHECK(!allowed()); // Round zero is not the configured escape round.
+    facts.now = tip.GetBlockTime() + 89;
+    BOOST_CHECK(!allowed());
+    facts.now += 1;
+    BOOST_CHECK(allowed());
+    facts.now = -1;
+    BOOST_CHECK(!allowed());
+    facts.now = std::numeric_limits<int64_t>::max();
+    BOOST_CHECK(!allowed());
+
+    constexpr int64_t MAX_HEADER_TIME{std::numeric_limits<uint32_t>::max()};
+    params = StakingRestartTestParams();
+    tip.nTime = static_cast<uint32_t>(MAX_HEADER_TIME - 86'460);
+    facts = StakingRestartTestFacts(tip);
+    BOOST_CHECK_EQUAL(facts.now, MAX_HEADER_TIME);
+    BOOST_CHECK(allowed());
+    facts.now += 1;
+    BOOST_CHECK(!allowed()); // Header time cannot represent this wall clock.
+    tip.nTime = static_cast<uint32_t>(MAX_HEADER_TIME - 30);
+    facts.now = MAX_HEADER_TIME;
+    facts.max_tip_age = std::chrono::seconds{0};
+    BOOST_CHECK(!allowed()); // parent + block interval cannot wrap.
+    SetStakingRestartTestTip(tip);
+    facts = StakingRestartTestFacts(tip);
+    params.modern_pos->block_interval_seconds = MAX_HEADER_TIME + 1;
+    BOOST_CHECK(!allowed());
+    params = StakingRestartTestParams();
+    params.modern_pos->round_seconds = MAX_HEADER_TIME + 1;
+    BOOST_CHECK(!allowed());
+}
+
+BOOST_AUTO_TEST_CASE(regtest_staking_tip_sync_request_consumption)
+{
+    using namespace std::chrono_literals;
+    using Marker = node::RegtestStakingTipSync;
+    const NodeClock::time_point now{10'000s};
+    const auto tip{CoordinationHash(0x61, 0x01)};
+    const auto other_tip{CoordinationHash(0x61, 0x02)};
+    Marker marker;
+    BOOST_CHECK(!marker.TakeRequest(now)); // Unsolicited reply has no authority.
+    BOOST_CHECK(!marker.Fresh(tip, now));
+    marker.Requested(tip, now);
+    BOOST_CHECK(!marker.Fresh(tip, now)); // Sending a probe proves nothing.
+    const auto requested{marker.TakeRequest(now + 1s)};
+    BOOST_REQUIRE(requested);
+    BOOST_CHECK(*requested == tip);
+    BOOST_CHECK(!marker.TakeRequest(now + 1s)); // One request, at most one reply.
+    // Model the caller's normal validation and exact-tip match before confirming.
+    marker.Confirmed(*requested, now + 1s);
+    BOOST_CHECK(marker.Fresh(tip, now + 1s));
+    BOOST_CHECK(!marker.Fresh(other_tip, now + 1s));
+    marker.TakeRequest(now + 2s);
+    BOOST_CHECK(!marker.Fresh(tip, now + 2s)); // Invalid/unsolicited reply clears a prior hint.
+    marker.Requested(other_tip, now + 3s);
+    const auto replacement{marker.TakeRequest(now + 4s)};
+    BOOST_REQUIRE(replacement);
+    BOOST_CHECK(*replacement == other_tip);
+    marker.Confirmed(*replacement, now + 4s);
+    BOOST_CHECK(marker.Fresh(other_tip, now + 4s));
+    marker.Requested(tip, now + 5s);
+    BOOST_CHECK(!marker.Fresh(other_tip, now + 5s)); // New request invalidates old reply.
+}
+
+BOOST_AUTO_TEST_CASE(regtest_staking_tip_sync_lifetimes_clock_and_connection)
+{
+    using namespace std::chrono_literals;
+    using Marker = node::RegtestStakingTipSync;
+    const NodeClock::time_point now{10'000s};
+    const auto tip{CoordinationHash(0x62, 0x01)};
+    Marker marker;
+    marker.Requested(tip, now);
+    BOOST_REQUIRE(marker.TakeRequest(now + Marker::REQUEST_TIMEOUT));
+    marker.Requested(tip, now);
+    BOOST_CHECK(!marker.TakeRequest(now + Marker::REQUEST_TIMEOUT + 1s));
+    BOOST_CHECK(!marker.TakeRequest(now + 1s)); // Expiry consumed the request.
+    marker.Requested(tip, now);
+    BOOST_CHECK(!marker.TakeRequest(now - 1s));
+    BOOST_CHECK(!marker.TakeRequest(now)); // Clock rollback also consumes it.
+    marker.Requested(tip, now);
+    const auto requested{marker.TakeRequest(now)};
+    BOOST_REQUIRE(requested);
+    marker.Confirmed(*requested, now);
+    BOOST_CHECK(!marker.Fresh(tip, now - 1s));
+    BOOST_CHECK(marker.Fresh(tip, now));
+    BOOST_CHECK(marker.Fresh(tip, now + Marker::REPLY_LIFETIME));
+    BOOST_CHECK(!marker.Fresh(tip, now + Marker::REPLY_LIFETIME + 1s));
+    // A disconnected/restarted connection constructs a fresh marker. Neither
+    // the pending request nor the reply is a durable synchronization proof.
+    auto connection{std::make_unique<Marker>()};
+    connection->Requested(tip, now);
+    BOOST_REQUIRE(connection->TakeRequest(now));
+    connection->Confirmed(tip, now);
+    BOOST_REQUIRE(connection->Fresh(tip, now));
+    connection.reset();
+    connection = std::make_unique<Marker>();
+    BOOST_CHECK(!connection->Fresh(tip, now));
+    BOOST_CHECK(!connection->TakeRequest(now));
+    BOOST_CHECK(connection->ShouldProbe(now));
+    connection->Requested(tip, now);
+    connection.reset();
+    connection = std::make_unique<Marker>();
+    BOOST_CHECK(!connection->TakeRequest(now));
+}
+
+BOOST_AUTO_TEST_CASE(regtest_staking_tip_sync_unsolicited_traffic_cannot_accelerate_probes)
+{
+    using namespace std::chrono_literals;
+    using Marker = node::RegtestStakingTipSync;
+    const NodeClock::time_point now{10'000s};
+    const auto tip{CoordinationHash(0x63, 0x01)};
+    Marker marker;
+    BOOST_CHECK(marker.ShouldProbe(now));
+    marker.Requested(tip, now);
+    BOOST_CHECK(!marker.ShouldProbe(now - 1s));
+    BOOST_CHECK(!marker.ShouldProbe(now));
+    // Receiving/consuming responses cannot clear the independent probe clock.
+    for (int elapsed = 1; elapsed < 120; ++elapsed) {
+        const auto arrival{now + std::chrono::seconds{elapsed}};
+        marker.TakeRequest(arrival);
+        BOOST_CHECK(!marker.ShouldProbe(arrival));
+        BOOST_CHECK(!marker.Fresh(tip, arrival));
+    }
+    BOOST_CHECK(marker.ShouldProbe(now + Marker::PROBE_INTERVAL));
+    marker.Requested(tip, now + Marker::PROBE_INTERVAL);
+    const auto requested{marker.TakeRequest(now + Marker::PROBE_INTERVAL + 1s)};
+    BOOST_REQUIRE(requested);
+    marker.Confirmed(*requested, now + Marker::PROBE_INTERVAL + 1s);
+    BOOST_CHECK(!marker.ShouldProbe(now + Marker::PROBE_INTERVAL + 1s));
+    BOOST_CHECK(marker.ShouldProbe(now + 2 * Marker::PROBE_INTERVAL));
 }
 
 BOOST_AUTO_TEST_CASE(regtest_finality_carrier_policy_boundaries)
