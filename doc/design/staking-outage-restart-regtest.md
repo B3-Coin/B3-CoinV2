@@ -165,7 +165,7 @@ historical authority, changing membership, bridge compatibility or machine
 power-loss recovery. No journal was deleted and no quorum or certificate rule
 was relaxed.
 
-## Preserved pre-H1 regtest extension — qualification pending
+## Preserved pre-H1 regtest extension
 
 An existing regtest datadir may never have configured H1. The producer-only
 predicate now covers that exact case without setting a fork height or changing
@@ -209,5 +209,33 @@ python3 test/functional/feature_b3_staking_outage_restart.py \
   --nocleanup --randomseed=20261012 --portseed=128
 ```
 
-These are reproduction commands, not claimed passing results. Testing and a
-separate source review remain required before a regtest-only binary update.
+### Executed successor qualification
+
+The native implementation and functional framework were frozen at
+`a82ebbeef618db505834b0275fd0721da285ef8b`. The clean exported build's `src`
+and functional tree were compared against that exact commit, excluding the
+unrelated unfinished prototype and CMake edit. The macOS arm64 configuration
+used AppleClang 17, RelWithDebInfo, wallet support on, GUI and IPC off.
+
+The targeted native group above passed **44 cases and 2,596 assertions** with
+seed `20261012` and exit zero. Both functional profiles passed independently
+with that seed, port seeds 127 (pre-H1) and 128 (H1), and exit zero. In both,
+the persisted height was 145, the signing watermark remained 136 throughout
+the blocked phases, and it reached 141 only after the accepted recovery block
+and ordinary IBD exit. Both also exercised same-connection probe renewal.
+The pre-H1 case explicitly reported no H1 activation or producer schedule.
+
+The negative control used the earlier frozen H1-only daemon, whose native
+source is equivalent to `66701513201a47d36c06aec260f98f01bf63c6ab`, with the
+new pre-H1 functional profile. No-peer and missing-body safeguards preserved
+the original test journals, but the solicited exact-tip probe timed out after
+10 seconds because the old networking gate required H1. The test exited one;
+its failure is retained, not counted as a passing recovery campaign.
+
+A separate read-only source context inspected the complete six-file repair
+and its probe, repeated producer checks, ordinary eligibility/validation and
+finality interactions. It found no concrete defect within this bounded
+REGTEST-only scope and executed no tests. These results do not qualify
+production synchronization, machine power loss, permanent split-lock recovery
+or a live network update. Linux build/qualification, exact binary-transition
+checks and preserved-server verification remain separate operational gates.
