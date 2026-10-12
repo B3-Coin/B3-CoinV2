@@ -278,22 +278,66 @@ class GlibSourceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'unsafe installed GLib provenance'):
                 NOTICES.glib_source_identity(installed)
 
-    def collector_inputs(self, directory):
+    def collector_inputs(self, directory, *, variant=0):
         source = self.archive()
         installed = self.installation(directory, sha=hashlib.sha256(source).hexdigest())
         recipe = (installed / '.brew/glib.rb').read_bytes()
+        # Synthetic exact-byte fixtures exercise the three recipe choices;
+        # these are not claimed to be corresponding GLib source recipes.
+        if variant:
+            recipe += b'# synthetic post-install template variant\n'
+        if variant == 2:
+            recipe += b'# synthetic network sandbox variant\n'
+        (installed / '.brew/glib.rb').write_bytes(recipe)
         public_recipe = recipe.replace(b'  depends_on', b'  bottle do\n    rebuild 1\n  end\n\n  depends_on')
         patch, introspection = b'synthetic patch, never executed', b'synthetic build resource'
-        pin = {'homebrew_commit': '1' * 40,
-               'formula_sha256': hashlib.sha256(public_recipe).hexdigest(),
+        commit = str(variant + 1) * 40
+        pin = {'recipes': {hashlib.sha256(recipe).hexdigest(): {
+                   'homebrew_commit': commit,
+                   'formula_sha256': hashlib.sha256(public_recipe).hexdigest()}},
                'patch_sha256': hashlib.sha256(patch).hexdigest(),
                'introspection_url': 'https://download.gnome.org/synthetic-resource.tar.xz',
                'introspection_sha256': hashlib.sha256(introspection).hexdigest()}
-        base = 'https://raw.githubusercontent.com/Homebrew/homebrew-core/' + '1' * 40 + '/'
+        base = 'https://raw.githubusercontent.com/Homebrew/homebrew-core/' + commit + '/'
         inputs = {base + 'Formula/g/glib.rb': public_recipe,
                   base + 'Patches/glib/hardcoded-paths.diff': patch,
                   self.URL: source, pin['introspection_url']: introspection}
         return installed, pin, inputs
+
+    def test_three_reviewed_recipe_hashes_select_exact_public_pins(self):
+        expected = {
+            'd2ebed597d64ab5518ea78604840e28fb9839fa923bd3917bef5f50b76d369be': (
+                '190a6fa77b81b8ffbeeee1022b852063d55d71cc',
+                '18ec76babcd6aebbdfeca6f09f9bfb24b3694d4e432c926c7f9612ee53515742'),
+            '1c0b615f2c23a2340eda0a52581e9157631c3dfd55227edcf3e14ea565e0a36f': (
+                '222fed87fa0d1a1a847a2b610a808a48d5afb526',
+                '658003a495be4141e3f5856ff34a1334c58fe7a0fc745afbc84258394472a6db'),
+            '0105d4552c1cc68b38cdcd23c4df05c2cb0d93ce44929f581204a6d33dd16d59': (
+                '11758a37429b3c8830127b550146c95b2c7ac1c9',
+                'd28135a54cacf6e9016a97a412c7cb74b124865d883115dcbf07106237d4aaef'),
+        }
+        self.assertEqual(set(NOTICES.GLIB_SOURCE[self.VERSION]['recipes']), set(expected))
+        for digest, (commit, formula_sha) in expected.items():
+            with self.subTest(digest=digest):
+                selected = NOTICES.glib_source_pin(self.VERSION, digest)
+                self.assertEqual(selected['homebrew_commit'], commit)
+                self.assertEqual(selected['formula_sha256'], formula_sha)
+                self.assertEqual(selected['patch_sha256'],
+                                 'd846efd0bf62918350da94f850db33b0f8727fece9bfaf8164566e3094e80c97')
+
+    def test_each_exact_recipe_variant_collects_only_its_selected_public_inputs(self):
+        for variant in range(3):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                installed, pin, inputs = self.collector_inputs(directory, variant=variant)
+                retained = {}
+                with mock.patch.dict(NOTICES.GLIB_SOURCE, {self.VERSION: pin}, clear=True), \
+                        mock.patch.object(NOTICES, 'get', side_effect=lambda url, maximum: inputs[url]) as fetch:
+                    NOTICES.collect_glib_source(installed, lambda path, data, provenance: retained.update({path: (data, provenance)}))
+                self.assertEqual(fetch.call_count, 4)
+                self.assertEqual(retained['installed/glib/source/homebrew-glib.rb'][0],
+                                 (installed / '.brew/glib.rb').read_bytes())
+                self.assertEqual(retained['installed/glib/source/homebrew-glib.rb'][1]['homebrew_commit'],
+                                 str(variant + 1) * 40)
 
     def test_exact_source_patch_recipe_and_resource_are_retained(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -323,16 +367,38 @@ class GlibSourceTests(unittest.TestCase):
                     NOTICES.collect_glib_source(installed, retained)
                 retained.assert_not_called()
 
-    def test_matching_hash_does_not_excuse_different_installed_recipe(self):
+    def test_one_byte_recipe_mutation_refuses_before_download_or_retention_with_hash_only(self):
         with tempfile.TemporaryDirectory() as directory:
             installed, pin, inputs = self.collector_inputs(directory)
             with (installed / '.brew/glib.rb').open('ab') as stream:
-                stream.write(b'# different installed recipe\n')
+                stream.write(b'\n')
+            changed_sha = hashlib.sha256((installed / '.brew/glib.rb').read_bytes()).hexdigest()
             retained = mock.Mock()
             with mock.patch.dict(NOTICES.GLIB_SOURCE, {self.VERSION: pin}, clear=True), \
-                    mock.patch.object(NOTICES, 'get', side_effect=lambda url, maximum: inputs[url]), \
+                    mock.patch.object(NOTICES, 'get') as fetch, \
+                    self.assertRaises(RuntimeError) as error:
+                NOTICES.collect_glib_source(installed, retained)
+            self.assertEqual(str(error.exception),
+                             'Installed GLib build recipe needs pin review; sha256=' + changed_sha)
+            fetch.assert_not_called()
+            retained.assert_not_called()
+
+    def test_selected_digest_does_not_replace_exact_public_recipe_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installed, pin, inputs = self.collector_inputs(directory)
+            original_pin = next(iter(pin['recipes'].values()))
+            with (installed / '.brew/glib.rb').open('ab') as stream:
+                stream.write(b'# different installed build context\n')
+            changed_sha = hashlib.sha256((installed / '.brew/glib.rb').read_bytes()).hexdigest()
+            # Even a wrongly configured selector entry must not bypass the
+            # separate byte comparison. No hash collision is simulated.
+            pin['recipes'][changed_sha] = original_pin
+            retained = mock.Mock()
+            with mock.patch.dict(NOTICES.GLIB_SOURCE, {self.VERSION: pin}, clear=True), \
+                    mock.patch.object(NOTICES, 'get', side_effect=lambda url, maximum: inputs[url]) as fetch, \
                     self.assertRaisesRegex(RuntimeError, 'build recipe differs'):
                 NOTICES.collect_glib_source(installed, retained)
+            self.assertEqual(fetch.call_count, 1)
             retained.assert_not_called()
 
     def test_unknown_version_refuses_without_download(self):

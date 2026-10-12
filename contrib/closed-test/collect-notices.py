@@ -23,19 +23,44 @@ FORMULAS = ('openssl@3', 'libevent', 'qrencode', 'libb2', 'brotli', 'dbus',
             'double-conversion', 'freetype', 'glib', 'graphite2', 'harfbuzz',
             'icu4c@78', 'gettext', 'jpeg-turbo', 'md4c', 'pcre2', 'libpng', 'zstd')
 TREE_API = re.compile(r'https://api\.github\.com/repos/qt/(?:qtbase|qtsvg)/git/trees/v6\.[0-9]+\.[0-9]+\?recursive=1')
-# This is the GLib version in both reviewed Mac tester artifacts. Pins are
-# deliberately narrow: a later Homebrew recipe/version needs a new review,
-# not an inferred "latest" corresponding-source claim. The installed recipe
-# must equal the pinned public recipe after removing only its bottle table.
+# Same upstream versions can have different Homebrew build recipes. Select
+# only an independently reviewed installed-recipe SHA256, never a version-only
+# fallback or today's "latest" recipe. The selected pinned public recipe must
+# still equal the installed bytes after removing only its bottle table.
 GLIB_SOURCE = {
     '2.88.3': {
-        'homebrew_commit': '190a6fa77b81b8ffbeeee1022b852063d55d71cc',
-        'formula_sha256': '18ec76babcd6aebbdfeca6f09f9bfb24b3694d4e432c926c7f9612ee53515742',
+        'recipes': {
+            'd2ebed597d64ab5518ea78604840e28fb9839fa923bd3917bef5f50b76d369be': {
+                'homebrew_commit': '190a6fa77b81b8ffbeeee1022b852063d55d71cc',
+                'formula_sha256': '18ec76babcd6aebbdfeca6f09f9bfb24b3694d4e432c926c7f9612ee53515742',
+            },
+            # August 3: post-install path uses a Homebrew template token.
+            '1c0b615f2c23a2340eda0a52581e9157631c3dfd55227edcf3e14ea565e0a36f': {
+                'homebrew_commit': '222fed87fa0d1a1a847a2b610a808a48d5afb526',
+                'formula_sha256': '658003a495be4141e3f5856ff34a1334c58fe7a0fc745afbc84258394472a6db',
+            },
+            # August 17: same build inputs, plus build network sandboxing.
+            '0105d4552c1cc68b38cdcd23c4df05c2cb0d93ce44929f581204a6d33dd16d59': {
+                'homebrew_commit': '11758a37429b3c8830127b550146c95b2c7ac1c9',
+                'formula_sha256': 'd28135a54cacf6e9016a97a412c7cb74b124865d883115dcbf07106237d4aaef',
+            },
+        },
         'patch_sha256': 'd846efd0bf62918350da94f850db33b0f8727fece9bfaf8164566e3094e80c97',
         'introspection_url': 'https://download.gnome.org/sources/gobject-introspection/1.86/gobject-introspection-1.86.0.tar.xz',
         'introspection_sha256': '920d1a3fcedeadc32acff95c2e203b319039dd4b4a08dd1a2dfd283d19c0b9ae',
     },
 }
+
+
+def glib_source_pin(version, recipe_sha256):
+    version_pin = GLIB_SOURCE.get(version)
+    if version_pin is None:
+        raise RuntimeError('Installed GLib version needs corresponding-source pin review')
+    recipe_pin = version_pin['recipes'].get(recipe_sha256)
+    if recipe_pin is None:
+        # Hash only: do not expose an installed recipe, receipt or local path.
+        raise RuntimeError('Installed GLib build recipe needs pin review; sha256=' + recipe_sha256)
+    return {**version_pin, **recipe_pin}
 
 
 class RefuseCredentialRedirect(urllib.request.HTTPRedirectHandler):
@@ -155,9 +180,8 @@ def glib_archive_notices(data, version):
 
 def collect_glib_source(installed, retain):
     identity, recipe = glib_source_identity(installed)
-    pin = GLIB_SOURCE.get(identity['version'])
-    if pin is None:
-        raise RuntimeError('Installed GLib version needs corresponding-source pin review')
+    recipe_sha256 = hashlib.sha256(recipe).hexdigest()
+    pin = glib_source_pin(identity['version'], recipe_sha256)
     base = 'https://raw.githubusercontent.com/Homebrew/homebrew-core/' + pin['homebrew_commit'] + '/'
     public_recipe = get(base + 'Formula/g/glib.rb', 1024 * 1024)
     if hashlib.sha256(public_recipe).hexdigest() != pin['formula_sha256']:
@@ -176,7 +200,8 @@ def collect_glib_source(installed, retain):
     if hashlib.sha256(introspection).hexdigest() != pin['introspection_sha256']:
         raise RuntimeError('GLib introspection build resource checksum differs')
     provenance = {'installed_component': 'glib', 'installed_version': installed.name,
-                  'upstream_source': identity, 'homebrew_commit': pin['homebrew_commit']}
+                  'upstream_source': identity, 'homebrew_commit': pin['homebrew_commit'],
+                  'installed_recipe_sha256': recipe_sha256, 'public_recipe_sha256': pin['formula_sha256']}
     retain('installed/glib/source/glib-' + identity['version'] + '.tar.xz', data, provenance)
     retain('installed/glib/source/homebrew-glib.rb', recipe, provenance)
     retain('installed/glib/source/homebrew-core/Formula/g/glib.rb', public_recipe,
