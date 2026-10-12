@@ -8,6 +8,7 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <common/system.h>
 #include <consensus/block_codec.h>
 #include <consensus/boundary.h>
 #include <consensus/era.h>
@@ -50,6 +51,7 @@
 #include <util/translation.h>
 #include <validation.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <compare>
 #include <cstddef>
@@ -61,7 +63,9 @@
 #include <span>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace kernel {
 static constexpr uint8_t DB_BLOCK_FILES{'f'};
@@ -177,41 +181,69 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
     std::unique_ptr<CDBIterator> pcursor(NewIterator());
     pcursor->Seek(std::make_pair(DB_BLOCK_INDEX, uint256()));
 
-    // Load m_block_index
+    // Load m_block_index. A legacy B3 identity is the scrypt hash of the stored
+    // header (~0.2 ms each, ~810k legacy headers on mainnet), which made this
+    // loop the bulk of startup on one core. Every record is still hashed from
+    // its stored header exactly as before; only the hashing of each batch is
+    // spread over worker threads. Records are inserted in the same order, on
+    // this thread, under cs_main.
+    constexpr size_t BATCH_SIZE{16384};
+    const size_t workers{std::clamp<size_t>(GetNumCores(), 1, 16)};
+    std::vector<CDiskBlockIndex> batch;
+    std::vector<uint256> hashes;
+    batch.reserve(BATCH_SIZE);
+    const auto insert_batch{[&] {
+        hashes.assign(batch.size(), uint256{});
+        const size_t threads{std::min(workers, (batch.size() + 255) / 256)};
+        const auto hash_range{[&](const size_t first) {
+            for (size_t i{first}; i < batch.size(); i += threads) {
+                hashes[i] = batch[i].ConstructBlockHash(consensusParams);
+            }
+        }};
+        std::vector<std::thread> pool;
+        for (size_t t{1}; t < threads; ++t) pool.emplace_back(hash_range, t);
+        hash_range(0);
+        for (std::thread& thread : pool) thread.join();
+        for (size_t i{0}; i < batch.size(); ++i) {
+            const CDiskBlockIndex& diskindex{batch[i]};
+            // Construct block index object
+            CBlockIndex* pindexNew = insertBlockIndex(hashes[i]);
+            pindexNew->pprev          = insertBlockIndex(diskindex.hashPrev);
+            pindexNew->nHeight        = diskindex.nHeight;
+            pindexNew->nFile          = diskindex.nFile;
+            pindexNew->nDataPos       = diskindex.nDataPos;
+            pindexNew->nUndoPos       = diskindex.nUndoPos;
+            pindexNew->nVersion       = diskindex.nVersion;
+            pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
+            pindexNew->nTime          = diskindex.nTime;
+            pindexNew->nBits          = diskindex.nBits;
+            pindexNew->nNonce         = diskindex.nNonce;
+            pindexNew->m_legacy_proof_of_stake = diskindex.m_legacy_proof_of_stake;
+            pindexNew->m_legacy_stake_modifier_generated = diskindex.m_legacy_stake_modifier_generated;
+            pindexNew->m_legacy_stake_modifier = diskindex.m_legacy_stake_modifier;
+            pindexNew->m_legacy_hash_proof = diskindex.m_legacy_hash_proof;
+            pindexNew->m_legacy_money_supply = diskindex.m_legacy_money_supply;
+            pindexNew->m_legacy_fn_integrated = diskindex.m_legacy_fn_integrated;
+            // The cached modern-PoS eligibility digest is the NEXT
+            // height's seed: without it a restarted node can neither
+            // produce nor connect further modern blocks ("modern-PoS
+            // seed for the parent is unavailable"). It is persisted by
+            // CDiskBlockIndex and must be restored here (found by the
+            // multi-node finality soak's restart scenario).
+            pindexNew->m_modern_pos_digest = diskindex.m_modern_pos_digest;
+            pindexNew->nStatus        = diskindex.nStatus;
+            pindexNew->nTx            = diskindex.nTx;
+        }
+        batch.clear();
+    }};
     while (pcursor->Valid()) {
         if (interrupt) return false;
         std::pair<uint8_t, uint256> key;
         if (pcursor->GetKey(key) && key.first == DB_BLOCK_INDEX) {
             CDiskBlockIndex diskindex;
             if (pcursor->GetValue(diskindex)) {
-                // Construct block index object
-                CBlockIndex* pindexNew = insertBlockIndex(diskindex.ConstructBlockHash(consensusParams));
-                pindexNew->pprev          = insertBlockIndex(diskindex.hashPrev);
-                pindexNew->nHeight        = diskindex.nHeight;
-                pindexNew->nFile          = diskindex.nFile;
-                pindexNew->nDataPos       = diskindex.nDataPos;
-                pindexNew->nUndoPos       = diskindex.nUndoPos;
-                pindexNew->nVersion       = diskindex.nVersion;
-                pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
-                pindexNew->nTime          = diskindex.nTime;
-                pindexNew->nBits          = diskindex.nBits;
-                pindexNew->nNonce         = diskindex.nNonce;
-                pindexNew->m_legacy_proof_of_stake = diskindex.m_legacy_proof_of_stake;
-                pindexNew->m_legacy_stake_modifier_generated = diskindex.m_legacy_stake_modifier_generated;
-                pindexNew->m_legacy_stake_modifier = diskindex.m_legacy_stake_modifier;
-                pindexNew->m_legacy_hash_proof = diskindex.m_legacy_hash_proof;
-                pindexNew->m_legacy_money_supply = diskindex.m_legacy_money_supply;
-                pindexNew->m_legacy_fn_integrated = diskindex.m_legacy_fn_integrated;
-                // The cached modern-PoS eligibility digest is the NEXT
-                // height's seed: without it a restarted node can neither
-                // produce nor connect further modern blocks ("modern-PoS
-                // seed for the parent is unavailable"). It is persisted by
-                // CDiskBlockIndex and must be restored here (found by the
-                // multi-node finality soak's restart scenario).
-                pindexNew->m_modern_pos_digest = diskindex.m_modern_pos_digest;
-                pindexNew->nStatus        = diskindex.nStatus;
-                pindexNew->nTx            = diskindex.nTx;
-
+                batch.push_back(std::move(diskindex));
+                if (batch.size() == BATCH_SIZE) insert_batch();
                 pcursor->Next();
             } else {
                 LogError("%s: failed to read value\n", __func__);
@@ -221,6 +253,7 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
             break;
         }
     }
+    insert_batch();
 
     // Load the optional FN issuance sidecars only after every regular block
     // index entry has been materialized. Calling insertBlockIndex now therefore
