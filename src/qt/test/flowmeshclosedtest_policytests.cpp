@@ -612,25 +612,50 @@ private Q_SLOTS:
             QProcess daemon;
             QString cli;
             QStringList rpc_arguments;
-            bool rpc(const QStringList& command, QByteArray& output, QString& error)
+            QString log_path;
+            QByteArray logTail() const
+            {
+                QFile log{log_path};
+                if (!log.open(QIODevice::ReadOnly)) return "[daemon log unavailable]";
+                if (!log.seek(qMax<qint64>(0, log.size() - 4096))) return "[daemon log seek failed]";
+                return log.read(4096);
+            }
+            QString diagnostics() const
+            {
+                return QStringLiteral("daemon state=%1, exit=%2, status=%3; log: %4")
+                    .arg(daemon.state()).arg(daemon.exitCode()).arg(daemon.exitStatus())
+                    .arg(QString::fromUtf8(logTail()));
+            }
+            bool rpc(const QStringList& command, QByteArray& output, QString& error, int timeout_seconds = 3)
             {
                 QProcess process;
-                process.start(cli, rpc_arguments + command);
-                if (!process.waitForStarted(5000) || !process.waitForFinished(5000)) {
+                QElapsedTimer elapsed; elapsed.start();
+                process.start(cli, rpc_arguments + QStringList{"-rpcclienttimeout=" + QString::number(timeout_seconds)} + command);
+                const int finish_timeout_ms{timeout_seconds == 3 ? 5000 : timeout_seconds * 1000 + 5000};
+                if (!process.waitForStarted(5000) || !process.waitForFinished(finish_timeout_ms)) {
                     process.kill(); process.waitForFinished(5000);
-                    error = QStringLiteral("Generated-wallet RPC process failed or timed out: ") + process.errorString(); return false;
+                    error = QStringLiteral("Generated-wallet RPC process failed after %1ms (HTTP budget=%2s): %3; %4")
+                        .arg(elapsed.elapsed()).arg(timeout_seconds).arg(process.errorString()).arg(diagnostics()); return false;
                 }
                 output = process.readAllStandardOutput().trimmed();
                 if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-                    error = QStringLiteral("Generated-wallet RPC exit=%1, status=%2: %3")
-                        .arg(process.exitCode()).arg(process.exitStatus()).arg(QString::fromUtf8(process.readAllStandardError()));
+                    error = QStringLiteral("Generated-wallet RPC exit=%1, status=%2, elapsed=%3ms (HTTP budget=%4s): %5; %6")
+                        .arg(process.exitCode()).arg(process.exitStatus()).arg(elapsed.elapsed()).arg(timeout_seconds)
+                        .arg(QString::fromUtf8(process.readAllStandardError())).arg(diagnostics());
                     return false;
                 }
+                if (timeout_seconds > 3) qInfo("Generated-wallet cold operation: elapsed=%lldms; HTTP budget=%ds; no retry.",
+                    static_cast<long long>(elapsed.elapsed()), timeout_seconds);
                 error.clear(); return true;
             }
             bool start(const QString& executable, const QStringList& arguments, QString& error)
             {
+                // Do not leave daemon output in a pipe while waiting synchronously
+                // for a different process (the CLI). A full pipe can block the
+                // daemon independently of wallet correctness. Generated test log
+                // only; each child start truncates it and failures retain its tail.
                 daemon.setProcessChannelMode(QProcess::MergedChannels);
+                daemon.setStandardOutputFile(log_path, QIODevice::Truncate);
                 daemon.start(executable, arguments);
                 if (!daemon.waitForStarted(5000)) { error = daemon.errorString(); return false; }
                 QElapsedTimer deadline; deadline.start(); QByteArray output;
@@ -640,7 +665,7 @@ private Q_SLOTS:
                 }
                 error = QStringLiteral("Generated-wallet daemon did not become ready; exit=%1, status=%2; RPC: %3; log: %4")
                     .arg(daemon.exitCode()).arg(daemon.exitStatus()).arg(error)
-                    .arg(QString::fromUtf8(daemon.readAllStandardOutput().right(4096)));
+                    .arg(QString::fromUtf8(logTail()));
                 return false;
             }
             bool stop(QString& error)
@@ -650,7 +675,7 @@ private Q_SLOTS:
                 if (daemon.state() != QProcess::NotRunning && !daemon.waitForFinished(30000)) {
                     error = QStringLiteral("Generated-wallet daemon did not stop within 30 seconds."); return false;
                 }
-                const auto log{daemon.readAllStandardOutput()};
+                const auto log{logTail()};
                 if (daemon.exitStatus() != QProcess::NormalExit || daemon.exitCode() != 0 || !log.contains("Shutdown done")) {
                     error = QStringLiteral("Generated-wallet daemon exit=%1, status=%2, shutdown marker=%3; log: %4")
                         .arg(daemon.exitCode()).arg(daemon.exitStatus()).arg(log.contains("Shutdown done"))
@@ -672,6 +697,7 @@ private Q_SLOTS:
             }
         } core;
         core.cli = cli_path;
+        core.log_path = temp.path() + "/generated-daemon.log";
         QString root, node, wallets;
         {
             Storage old; QVERIFY2(PrepareStorage(LegacyParsed(), Base(temp), old, error), qPrintable(error));
@@ -682,7 +708,7 @@ private Q_SLOTS:
         const auto wallet_path{wallets + "/test/wallet.dat"};
         const auto cookie_path{node + "/regtest/roundtrip.cookie"};
         core.rpc_arguments = {"-regtest", "-noconf", "-datadir=" + node, "-rpcconnect=127.0.0.1",
-            "-rpcport=" + port, "-rpccookiefile=" + cookie_path, "-rpcclienttimeout=3"};
+            "-rpcport=" + port, "-rpccookiefile=" + cookie_path};
         const QStringList isolated{
             "-regtest=1", "-noconf", "-noincludeconf", "-datadir=" + node, "-walletdir=" + wallets,
             "-settings=" + settings_path, "-disablewallet=0", "-nowallet", "-keypool=1",
@@ -695,7 +721,9 @@ private Q_SLOTS:
         QVERIFY2(core.rpc({"getnetworkinfo"}, output, error), qPrintable(error));
         const auto network = QJsonDocument::fromJson(output).object();
         QVERIFY(!network["networkactive"].toBool(true)); QCOMPARE(network["connections"].toInt(-1), 0);
-        QVERIFY2(core.rpc({"-named", "createwallet", "wallet_name=test", "descriptors=true", "load_on_startup=true"}, output, error), qPrintable(error));
+        // Cold wallet creation is setup, not the trading-latency target. Keep a
+        // finite budget and send this mutation exactly once, including on timeout.
+        QVERIFY2(core.rpc({"-named", "createwallet", "wallet_name=test", "descriptors=true", "load_on_startup=true"}, output, error, 30), qPrintable(error));
         QCOMPARE(QJsonDocument::fromJson(output).object()["name"].toString(), QStringLiteral("test"));
         QVERIFY2(core.rpc({"-rpcwallet=test", "getnewaddress", "guarded-roundtrip"}, output, error), qPrintable(error));
         const auto address{QString::fromUtf8(output)}; QVERIFY(!address.isEmpty());
