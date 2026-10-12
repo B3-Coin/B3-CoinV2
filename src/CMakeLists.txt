@@ -186,6 +186,9 @@ if(ENABLE_WALLET)
     target_link_libraries(b3coin-wallet
       core_interface
       bitcoin_wallet
+      # Wallet RPC code reaches FlowMesh, bridge and finality key helpers
+      # that live in the node library.
+      bitcoin_node
       bitcoin_common
       bitcoin_util
       Boost::headers
