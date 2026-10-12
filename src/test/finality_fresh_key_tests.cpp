@@ -3150,7 +3150,6 @@ BOOST_AUTO_TEST_CASE(fresh_key_erasure_policy_truth_table)
 
     const auto erasable{[&](const node::FreshLineageState& s, const bls::SecretKey& sk, const uint64_t target,
                             const int tip, const std::optional<int> horizon = std::nullopt) {
-        // GCC rejects a local (H) as a default argument; no value selects H.
         return node::FreshKeyErasable(s, Pk(sk), target, tip, horizon.value_or(H));
     }};
     constexpr int FAR_TIP{1'000'000};
