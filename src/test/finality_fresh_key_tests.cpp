@@ -3152,8 +3152,8 @@ BOOST_AUTO_TEST_CASE(fresh_key_erasure_policy_truth_table)
     e2.next = set3;
 
     const auto erasable{[&](const node::FreshLineageState& s, const bls::SecretKey& sk, const uint64_t target,
-                            const int tip, const int horizon = H) {
-        return node::FreshKeyErasable(s, Pk(sk), target, tip, horizon);
+                            const int tip, const std::optional<int> horizon = std::nullopt) {
+        return node::FreshKeyErasable(s, Pk(sk), target, tip, horizon.value_or(H));
     }};
     constexpr int FAR{1'000'000};
 
