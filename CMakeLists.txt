@@ -551,6 +551,12 @@ endif()
 
 include(AddBoostIfNeeded)
 add_boost_if_needed()
+if(MSVC AND TARGET Boost::headers)
+  # MSVC has no __int128, so util/int128.h falls back to Boost.Multiprecision,
+  # and interfaces/chain.h carries it into nearly every target. vcpkg does not
+  # put Boost on the global include path the way depends does for MinGW.
+  target_link_libraries(core_interface INTERFACE Boost::headers)
+endif()
 
 if(BUILD_DAEMON OR BUILD_GUI OR BUILD_CLI OR BUILD_TESTS OR BUILD_BENCH OR BUILD_FUZZ_BINARY)
   find_package(Libevent 2.1.8 MODULE REQUIRED)
