@@ -3120,12 +3120,9 @@ BOOST_AUTO_TEST_CASE(fresh_key_store_max_records)
     CheckOpenFails(dir, CHAIN_DOMAIN, a.vk, "maximum 4096");
 }
 
-// At namespace scope so GCC accepts it as a default argument below.
-constexpr int ERASURE_TEST_HORIZON{40};
-
 BOOST_AUTO_TEST_CASE(fresh_key_erasure_policy_truth_table)
 {
-    constexpr int H{ERASURE_TEST_HORIZON}; // horizon
+    constexpr int H{40}; // horizon
     const Validator a{1}, b{2}, c{3}, d{4};
     const auto g_a{BlsKey(101)}, g_b{BlsKey(102)}, g_c{BlsKey(103)}, g_d{BlsKey(104)}; // genesis (target 0)
     const auto k2_a{BlsKey(121)}, k2_b{BlsKey(122)}, k2_c{BlsKey(123)}, k2_d{BlsKey(124)};
@@ -3155,8 +3152,9 @@ BOOST_AUTO_TEST_CASE(fresh_key_erasure_policy_truth_table)
     e2.next = set3;
 
     const auto erasable{[&](const node::FreshLineageState& s, const bls::SecretKey& sk, const uint64_t target,
-                            const int tip, const int horizon = ERASURE_TEST_HORIZON) {
-        return node::FreshKeyErasable(s, Pk(sk), target, tip, horizon);
+                            const int tip, const std::optional<int> horizon = std::nullopt) {
+        // GCC rejects a local (H) as a default argument; no value selects H.
+        return node::FreshKeyErasable(s, Pk(sk), target, tip, horizon.value_or(H));
     }};
     constexpr int FAR_TIP{1'000'000};
 
