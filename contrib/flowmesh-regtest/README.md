@@ -3,10 +3,12 @@
 This is a temporary, valueless test network. It is NOT a mainnet upgrade or
 finished FlowMesh V2. Do not import any real wallet, seed, private key or FN key.
 
-October 11 coordinator status: HTTPS has been renewed under the same CA, but
-the existing test checkpoint manager remains stopped pending a separately
-reviewed maintenance-helper correction. Build artifacts are not yet a trading
-readiness announcement. Wait for the coordinator's network-ready confirmation.
+October 12 build update: HTTPS was renewed under the same CA, and the preserved
+regtest nodes received the locally tested long-outage staking restart repair.
+The separately reviewed checkpoint/sweep helper retains its operation budget
+and safety refusals. A build does not establish its current availability: see
+the dated prerelease notes for the coordinator's actual network observations.
+Wait for network-ready confirmation before depositing or trading.
 
 ## Start
 
@@ -109,8 +111,9 @@ Do not press Retry repeatedly or replace an uncertain instruction.
 
 The renewed session window ends by 2026-10-18 00:00 UTC or the existing bounded
 checkpoint/sweep budget. The renewed TLS leaf expires 2026-10-21 14:02:47 UTC.
-Renewal does not resolve the stopped manager described above. Stop if trust or synchronization
-fails; do not weaken verification. Services may be unavailable before that time.
+Renewal does not guarantee continuous checkpoint/sweep handling. Stop if trust or
+synchronization fails; do not weaken verification. Services may be unavailable
+before that time, including after a maintenance safety refusal.
 
 ## Release session checks
 
