@@ -19,6 +19,14 @@ function(add_b3_blst)
       ${PROJECT_SOURCE_DIR}/src/blst/src/server.c
     )
     target_compile_definitions(b3_blst PRIVATE __BLST_NO_ASM__)
+  elseif(MSVC)
+    # Upstream build.bat: every build/win64/*-x86_64.asm through ml64.
+    file(GLOB b3_blst_masm ${PROJECT_SOURCE_DIR}/src/blst/build/win64/*-x86_64.asm)
+    add_library(b3_blst STATIC EXCLUDE_FROM_ALL
+      ${PROJECT_SOURCE_DIR}/src/blst/src/server.c
+      ${b3_blst_masm}
+    )
+    target_compile_definitions(b3_blst PRIVATE __BLST_PORTABLE__)
   else()
     add_library(b3_blst STATIC EXCLUDE_FROM_ALL
       ${PROJECT_SOURCE_DIR}/src/blst/src/server.c
@@ -31,6 +39,10 @@ function(add_b3_blst)
   )
   # Upstream code is compiled with its own conventions; do not apply the
   # project's warning set to it.
-  target_compile_options(b3_blst PRIVATE -w -fno-builtin -fPIC)
-  set_target_properties(b3_blst PROPERTIES C_VISIBILITY_PRESET hidden)
+  if(MSVC)
+    target_compile_options(b3_blst PRIVATE $<$<COMPILE_LANGUAGE:C>:/w>)
+  else()
+    target_compile_options(b3_blst PRIVATE -w -fno-builtin -fPIC)
+    set_target_properties(b3_blst PROPERTIES C_VISIBILITY_PRESET hidden)
+  endif()
 endfunction()

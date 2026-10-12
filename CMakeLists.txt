@@ -300,7 +300,13 @@ endif()
 # Both compute identical results; only speed differs. The selection is not a
 # user option because upstream does not support the pure-C path on
 # x86_64/aarch64 (its 64-bit-limb headers assume the assembly).
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
+# MSVC cannot assemble the GNU-syntax file; on x86_64 it takes upstream's own
+# Windows path instead (build.bat): the same routines as MASM (build/win64),
+# assembled by ml64 with the same __BLST_PORTABLE__ define.
+if(MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  set(B3_BLST_NO_ASM OFF)
+  enable_language(ASM_MASM)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
   set(B3_BLST_NO_ASM OFF)
   enable_language(ASM)
 else()
