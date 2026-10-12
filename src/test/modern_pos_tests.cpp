@@ -220,10 +220,10 @@ BOOST_AUTO_TEST_CASE(regtest_staking_restart_context_gates)
     BOOST_CHECK(!allowed());
     params = original_params;
     params.h1.reset();
-    BOOST_CHECK(!allowed());
+    BOOST_CHECK(allowed()); // Pre-H1 uses existing V1 eligibility saturation.
     params = original_params;
     params.h1->activation_height = tip.nHeight + 2;
-    BOOST_CHECK(!allowed());
+    BOOST_CHECK(allowed()); // A future H1 height is not activated early.
     params.h1->activation_height = tip.nHeight + 1;
     BOOST_CHECK(allowed()); // H1 applies to the next candidate, not the parent.
     params.h1->escape_rounds = 0;
@@ -351,6 +351,158 @@ BOOST_AUTO_TEST_CASE(regtest_staking_restart_age_escape_and_overflow_boundaries)
     params.modern_pos->block_interval_seconds = MAX_HEADER_TIME + 1;
     BOOST_CHECK(!allowed());
     params = StakingRestartTestParams();
+    params.modern_pos->round_seconds = MAX_HEADER_TIME + 1;
+    BOOST_CHECK(!allowed());
+}
+
+BOOST_AUTO_TEST_CASE(regtest_staking_restart_pre_h1_context_and_exact_tip_gates)
+{
+    LOCK(cs_main);
+    for (const bool future_h1 : {false, true}) {
+        auto params{StakingRestartTestParams()};
+        CBlockIndex tip;
+        SetStakingRestartTestTip(tip);
+        if (future_h1) {
+            params.h1->activation_height = tip.nHeight + 2;
+        } else {
+            params.h1.reset();
+        }
+        auto facts{StakingRestartTestFacts(tip)};
+        const auto allowed = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+            return node::CanResumeRegtestStakingAfterOutage(ChainType::REGTEST, params, facts);
+        };
+        BOOST_REQUIRE(!params.H1RulesActive(tip.nHeight + 1));
+        BOOST_REQUIRE(allowed());
+        for (const auto network : {ChainType::MAIN, ChainType::TESTNET,
+                                   ChainType::TESTNET4, ChainType::SIGNET}) {
+            BOOST_CHECK(!node::CanResumeRegtestStakingAfterOutage(network, params, facts));
+        }
+
+        const auto original_params{params};
+        params.legacy_b3coin = false;
+        BOOST_CHECK(!allowed());
+        params = original_params;
+        params.hard_fork_height.reset();
+        BOOST_CHECK(!allowed());
+        params = original_params;
+        params.legacy_final_hash.reset();
+        BOOST_CHECK(!allowed());
+        params = original_params;
+        params.modern_pos.reset();
+        BOOST_CHECK(!allowed());
+        params = original_params;
+        params.modern_pos->round_seconds = 0;
+        BOOST_CHECK(!allowed());
+        params = original_params;
+        params.transition_pow_length = 300;
+        BOOST_CHECK(!allowed());
+        params = original_params;
+
+        const auto original_facts{facts};
+        facts.loading_blocks = true;
+        BOOST_CHECK(!allowed());
+        facts = original_facts;
+        facts.chainstate_validated = false;
+        BOOST_CHECK(!allowed());
+        facts = original_facts;
+        facts.minimum_work_met = false;
+        BOOST_CHECK(!allowed());
+        facts = original_facts;
+        facts.peer_tip_synced = false;
+        BOOST_CHECK(!allowed());
+        facts = original_facts;
+        facts.best_header = nullptr;
+        BOOST_CHECK(!allowed());
+        CBlockIndex other_header;
+        SetStakingRestartTestTip(other_header);
+        facts.best_header = &other_header;
+        BOOST_CHECK(!allowed());
+        other_header.nHeight += 1;
+        other_header.nChainWork += arith_uint256{1};
+        BOOST_CHECK(!allowed());
+        facts = original_facts;
+        for (const uint32_t status : {uint32_t{BLOCK_VALID_TREE | BLOCK_HAVE_DATA},
+                                      uint32_t{BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA},
+                                      uint32_t{BLOCK_VALID_SCRIPTS},
+                                      uint32_t{BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_FAILED_VALID}}) {
+            tip.nStatus = status;
+            BOOST_CHECK(!allowed());
+        }
+        SetStakingRestartTestTip(tip);
+        tip.m_chain_tx_count = 0;
+        BOOST_CHECK(!allowed());
+        tip.m_chain_tx_count = 201;
+        facts.active_tip = nullptr;
+        BOOST_CHECK(!allowed());
+        facts.active_tip = &tip;
+        tip.nHeight = 0;
+        BOOST_CHECK(!allowed());
+        tip.nHeight = std::numeric_limits<int>::max();
+        BOOST_CHECK(!allowed());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(regtest_staking_restart_pre_h1_saturation_age_and_overflow)
+{
+    LOCK(cs_main);
+    auto params{StakingRestartTestParams()};
+    params.h1.reset();
+    CBlockIndex tip;
+    SetStakingRestartTestTip(tip);
+    auto facts{StakingRestartTestFacts(tip)};
+    const auto allowed = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        return node::CanResumeRegtestStakingAfterOutage(ChainType::REGTEST, params, facts);
+    };
+    BOOST_REQUIRE(allowed());
+    facts.now = tip.GetBlockTime() + 86'400;
+    BOOST_CHECK(!allowed());
+    facts.now += 1;
+    BOOST_CHECK(allowed());
+    facts.max_tip_age = std::chrono::seconds{-1};
+    BOOST_CHECK(!allowed());
+    facts.max_tip_age = std::chrono::seconds{0};
+    const auto& pos{*params.modern_pos};
+    facts.now = tip.GetBlockTime() + pos.block_interval_seconds + 128 * pos.round_seconds - 1;
+    BOOST_CHECK(!allowed());
+    facts.now += 1;
+    BOOST_CHECK(allowed());
+    // The policy's universal bound is already consensus-eligible even for
+    // the smallest positive weight and the greatest possible digest.
+    BOOST_CHECK(modern::ModernPosEligible(ArithToUint256(~arith_uint256{0}), 1,
+                                          std::numeric_limits<CAmount>::max(), 128, pos));
+    params.h1 = Consensus::H1Params{tip.nHeight + 2, 1};
+    facts.now -= 1;
+    BOOST_CHECK(!allowed()); // Future H1 does not lower the pre-H1 bound.
+    params.h1->activation_height = tip.nHeight + 1;
+    BOOST_CHECK(allowed()); // At activation the configured H1 rule applies.
+    params.h1->escape_rounds = 129;
+    BOOST_CHECK(!allowed());
+    facts.now += 1;
+    BOOST_CHECK(!allowed()); // V1 saturation cannot bypass an active H1 gate.
+    facts.now += pos.round_seconds;
+    BOOST_CHECK(allowed());
+    params.h1.reset();
+    facts.now = tip.GetBlockTime() - 1;
+    BOOST_CHECK(!allowed());
+    facts.now += 1;
+    BOOST_CHECK(!allowed());
+    facts.now = std::numeric_limits<int64_t>::max();
+    BOOST_CHECK(!allowed());
+    constexpr int64_t MAX_HEADER_TIME{std::numeric_limits<uint32_t>::max()};
+    tip.nTime = static_cast<uint32_t>(MAX_HEADER_TIME - 86'460);
+    facts = StakingRestartTestFacts(tip);
+    BOOST_CHECK(allowed());
+    facts.now += 1;
+    BOOST_CHECK(!allowed());
+    tip.nTime = static_cast<uint32_t>(MAX_HEADER_TIME - 30);
+    facts.now = MAX_HEADER_TIME;
+    facts.max_tip_age = std::chrono::seconds{0};
+    BOOST_CHECK(!allowed());
+    SetStakingRestartTestTip(tip);
+    facts = StakingRestartTestFacts(tip);
+    params.modern_pos->block_interval_seconds = MAX_HEADER_TIME + 1;
+    BOOST_CHECK(!allowed());
+    params.modern_pos->block_interval_seconds = 60;
     params.modern_pos->round_seconds = MAX_HEADER_TIME + 1;
     BOOST_CHECK(!allowed());
 }

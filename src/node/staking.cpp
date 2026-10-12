@@ -93,8 +93,6 @@ bool CanResumeRegtestStakingAfterOutage(
         !Consensus::LegacyBoundaryPinned(params) || !params.modern_pos ||
         !params.modern_pos->Valid() || !tip || tip->nHeight <= 0 ||
         tip->nHeight == std::numeric_limits<int>::max() ||
-        !params.H1RulesActive(tip->nHeight + 1) ||
-        params.h1->escape_rounds <= 0 ||
         Consensus::GetConsensusPhase(tip->nHeight + 1, params) !=
             Consensus::ConsensusPhase::MODERN_POS ||
         facts.loading_blocks || !facts.chainstate_validated ||
@@ -118,8 +116,15 @@ bool CanResumeRegtestStakingAfterOutage(
     const int64_t first_round_time{parent_time + pos.block_interval_seconds};
     if (facts.now < first_round_time) return false;
     const int64_t round{(facts.now - first_round_time) / pos.round_seconds};
-    return round <= std::numeric_limits<uint32_t>::max() &&
-           params.H1EscapeRound(tip->nHeight + 1, round);
+    if (round > std::numeric_limits<uint32_t>::max()) return false;
+    if (params.H1RulesActive(tip->nHeight + 1)) {
+        return params.h1->escape_rounds > 0 &&
+               params.H1EscapeRound(tip->nHeight + 1, round);
+    }
+    // Pre-H1 V1 already permits these exact-time blocks. Wait until its
+    // existing eligibility comparison saturates for every positive stake;
+    // this is local production policy, not a new round or validity rule.
+    return round >= 128;
 }
 
 PreferredProposerPlan ComputePreferredProposerPlan(
@@ -568,7 +573,7 @@ void StakingLoop::ThreadLoop()
     }
     const Consensus::Params& params{m_chainman.GetConsensus()};
 
-    // A stale but fully validated H1 regtest chain needs block production to
+    // A stale but fully validated Modern-PoS regtest chain needs production to
     // become recent again. Do not clear IBD or let this policy authorize BLS
     // finality votes/recovery. Re-read all facts during candidate checks.
     const auto can_resume_after_outage = [&]() EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {

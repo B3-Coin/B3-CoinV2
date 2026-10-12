@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The B3Coin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Age-only IBD cannot permanently strand H1 staking after a long outage.
+"""Age-only IBD cannot permanently strand regtest staking after a long outage.
 
 REGTEST ONLY: two local modern-regtest nodes, independent 80/20 stakes,
 real BLS checkpoint votes and unchanged on-disk signing journals. No bridge
@@ -15,7 +15,8 @@ false first. The ordinary default tip-age limit is never widened.
 The recovery exception is production-only. With an eligible unfinalized
 checkpoint already on disk, no peer and a known missing higher block must
 both leave the actual signing watermark and journal unchanged. A genuine
-outbound peer's solicited header reply may allow an H1 escape block, but
+outbound peer's solicited header reply may allow an H1 escape block (default)
+or a V1 block at universal eligibility saturation (--pre-h1), but
 new checkpoint signing must occur only after that block makes the tip
 recent and ordinary IBD exit is logged.
 
@@ -64,17 +65,22 @@ class HeaderOnlyModernPeer(P2PInterface):
 class B3StakingOutageRestartTest(B3BridgeChainMixin, BitcoinTestFramework):
     bridge_validator_count = len(STAKES)
 
+    def add_options(self, parser):
+        parser.add_argument("--pre-h1", action="store_true",
+                            help="Exercise preserved V1 Modern PoS without activating H1")
+
     def set_test_params(self):
         self.num_nodes = len(STAKES)
         self.setup_clean_chain = True
         args = [arg for arg in B3_BRIDGE_ARGS if not arg.startswith("-b3minfinalityset=")]
         self.b3_args = args + [
             "-b3minfinalityset=2",
-            f"-b3h1height={H1_HEIGHT}",
-            f"-b3h1escaperounds={ESCAPE_ROUNDS}",
             "-debug=net",
             "-debug=validation",
         ]
+        if not self.options.pre_h1:
+            self.b3_args += [f"-b3h1height={H1_HEIGHT}",
+                             f"-b3h1escaperounds={ESCAPE_ROUNDS}"]
         self.extra_args = [list(self.b3_args) for _ in range(self.num_nodes)]
 
     def skip_test_if_missing_module(self):
@@ -160,10 +166,17 @@ class B3StakingOutageRestartTest(B3BridgeChainMixin, BitcoinTestFramework):
         self.pos_running = False
         self.mock_time = 0
 
-        self.log.info("Bootstrap two independent signers and activate H1")
+        self.log.info("Bootstrap two independent signers (%s)",
+                      "pre-H1 V1" if self.options.pre_h1 else "H1")
         self.bring_up_validators(MODERN_START + 12, stakes=STAKES, timeout=180)
         self.freeze()
         assert_greater_than_or_equal(n0.getblockcount(), H1_HEIGHT)
+        for node in self.nodes:
+            producers = node.getfinalitystatus().get("producers")
+            if self.options.pre_h1:
+                assert producers is None, "pre-H1 profile unexpectedly configured H1"
+            else:
+                assert_equal(producers["active"], True)
         assert_equal(n0.getblockchaininfo()["initialblockdownload"], False)
         before_watermark = self.watermark(n0)
         assert_greater_than_or_equal(before_watermark, MODERN_START)
@@ -249,7 +262,7 @@ class B3StakingOutageRestartTest(B3BridgeChainMixin, BitcoinTestFramework):
         # an unsolicited inbound announcement must not be sufficient.
         n0.stopstaking()
         self.connect_nodes(0, 1)
-        probe_text = f"Regtest H1 staking tip probe completed at height {persisted_height + 1} "
+        probe_text = f"Regtest staking tip probe completed at height {persisted_height + 1} "
         self.wait_until(lambda: probe_text in self.log_since(n0, restart_offset), timeout=10)
         # Let the initial hint expire without disconnecting. An already-started
         # sync session must perform another bounded query, not strand recovery
@@ -263,7 +276,7 @@ class B3StakingOutageRestartTest(B3BridgeChainMixin, BitcoinTestFramework):
         while n0.getblockcount() == persisted_height + 1:
             if time.monotonic() >= recovery_deadline:
                 raise AssertionError(
-                    "stale H1 tip did not recover after an outbound header round trip: "
+                    "stale regtest tip did not recover after an outbound header round trip: "
                     f"{n0.getstakinginfo()['staking']}"
                 )
             parent_time = withheld_header.nTime
@@ -271,7 +284,7 @@ class B3StakingOutageRestartTest(B3BridgeChainMixin, BitcoinTestFramework):
             if self.round_passed(n0.getstakinginfo()["staking"]["state"], round_number,
                                  persisted_height + 2):
                 # A fixed mock clock must advance if the 20% validator owns
-                # this ordinary escape round; the disabled peer never stakes.
+                # this ordinary recovery round; the disabled peer never stakes.
                 self.set_chain_time(self.mock_time + 1)
             time.sleep(0.05)
         n0.stopstaking()
@@ -279,6 +292,10 @@ class B3StakingOutageRestartTest(B3BridgeChainMixin, BitcoinTestFramework):
         first_recovery_hash = n0.getblockhash(persisted_height + 2)
         first_recovery_header = n0.getblockheader(first_recovery_hash)
         assert_greater_than_or_equal(first_recovery_header["time"], stale_now)
+        if self.options.pre_h1:
+            # This fixture has a one-second block interval and round duration.
+            assert_greater_than_or_equal(first_recovery_header["time"] - withheld_header.nTime - 1, 128)
+            assert "producers" not in n0.getfinalitystatus()
         self.sync_blocks(self.nodes)
         assert_equal(n1.getblockchaininfo()["initialblockdownload"], False)
 
@@ -292,7 +309,7 @@ class B3StakingOutageRestartTest(B3BridgeChainMixin, BitcoinTestFramework):
 
         recovery_log = self.log_since(n0, restart_offset)
         probe = recovery_log.index(
-            f"Regtest H1 staking tip probe completed at height {persisted_height + 1} "
+            f"Regtest staking tip probe completed at height {persisted_height + 1} "
         )
         produced = recovery_log.index(f"staking: produced modern-PoS block {first_recovery_hash}")
         ibd_exit = recovery_log.index("Leaving InitialBlockDownload (latching to false)")
@@ -304,7 +321,10 @@ class B3StakingOutageRestartTest(B3BridgeChainMixin, BitcoinTestFramework):
         # Retain a compact, secret-free record beside the ordinary framework
         # logs. The journal is compared as bytes, but only hashes are reported.
         evidence = {
-            "profile": "b3-h1-age-only-outage-restart-v1",
+            "profile": ("b3-pre-h1-age-only-outage-restart-v1" if self.options.pre_h1
+                        else "b3-h1-age-only-outage-restart-v1"),
+            "h1_activation_height": None if self.options.pre_h1 else H1_HEIGHT,
+            "production_round_gate": 128 if self.options.pre_h1 else ESCAPE_ROUNDS,
             "stakes": list(STAKES),
             "minimum_finality_set": 2,
             "outage_seconds": OUTAGE_SECONDS,

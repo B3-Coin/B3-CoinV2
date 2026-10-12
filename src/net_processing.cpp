@@ -2324,9 +2324,13 @@ const CBlockIndex* PeerManagerImpl::RegtestStakingTip() const
 {
     AssertLockHeld(::cs_main);
     const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
+    const auto& params{m_chainparams.GetConsensus()};
     if (m_chainparams.GetChainType() != ChainType::REGTEST || !tip ||
         tip->nHeight == std::numeric_limits<int>::max() ||
-        !m_chainparams.GetConsensus().H1RulesActive(tip->nHeight + 1) ||
+        !params.legacy_b3coin || !Consensus::LegacyBoundaryPinned(params) ||
+        !params.modern_pos || !params.modern_pos->Valid() ||
+        Consensus::GetConsensusPhase(tip->nHeight + 1, params) !=
+            Consensus::ConsensusPhase::MODERN_POS ||
         !m_chainman.IsInitialBlockDownload() ||
         m_chainman.m_blockman.LoadingBlocks() ||
         m_chainman.m_best_header != tip) return nullptr;
@@ -4110,7 +4114,7 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
         if (tip && pindexLast == tip && tip->GetBlockHash() == *staking_request_tip) {
             if (CNodeState* state{State(pfrom.GetId())}) {
                 state->m_regtest_staking_tip_sync.Confirmed(*staking_request_tip, staking_response_time);
-                LogDebug(BCLog::NET, "Regtest H1 staking tip probe completed at height %d peer=%d\n", tip->nHeight, pfrom.GetId());
+                LogDebug(BCLog::NET, "Regtest staking tip probe completed at height %d peer=%d\n", tip->nHeight, pfrom.GetId());
             }
         }
     }

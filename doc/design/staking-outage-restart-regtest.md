@@ -1,14 +1,16 @@
 # Regtest staking restart after a long outage
 
-The guarded H1 regtest staking loop can resume block production after a
+The guarded Modern-PoS regtest staking loop can resume block production after a
 restart on a fully validated but stale tip. It does not clear initial block
 download (IBD), permit finality votes during IBD or change block validity.
 Mainnet and the other shipped networks retain their existing behavior.
 
-The frozen implementation and test revision is
+The original H1-only frozen implementation and test revision is
 `66701513201a47d36c06aec260f98f01bf63c6ab`, on `flowmeshV2-dev`, following
 `9c7f6a8168b74a5b46af27960c6d6457df0541b5`. These are local commits; this
-slice includes no push, release, activation or VPS update.
+slice included no push, release, activation or VPS update. The pre-H1 extension
+below is a separate local change; the historical results below apply only to
+the original H1 profile, not to an unexecuted extension.
 
 ## Cause and correction
 
@@ -20,15 +22,17 @@ was also needed to produce that block.
 [CanResumeRegtestStakingAfterOutage](../../src/node/staking.cpp) grants only
 local block-production scheduling permission when all these facts hold:
 
-- REGTEST, a pinned legacy boundary, valid Modern PoS parameters and H1
-  active for the next height.
+- REGTEST, a pinned legacy boundary and valid Modern PoS parameters for the
+  next height. H1-active candidates retain the configured H1 escape rule;
+  pre-H1 candidates instead require V1's existing universal eligibility
+  saturation at round 128.
 - No import or reindex, a fully validated chainstate, a script-validated
   active tip with its body and downloaded ancestry, and sufficient configured
   minimum work.
 - The exact best header equals the active tip. A known branch awaiting its
   body cannot satisfy this condition.
-- Tip age is genuinely beyond the configured limit, and the existing H1
-  escape round has been reached without overflowing height or timestamp.
+- Tip age is genuinely beyond the configured limit, and the applicable
+  recovery-round gate has been reached without overflowing height or timestamp.
 - A live modern outbound, block-relay or manual block-serving peer has
   recently answered a solicited header query for that exact tip, with no
   outstanding body download from that peer.
@@ -68,6 +72,9 @@ production synchronization qualification. Without an eligible peer, recovery
 remains safely blocked.
 
 ## Executed qualification
+
+This section records only the original H1 qualification at the frozen revision
+above. New pre-H1 results must be recorded separately after execution.
 
 The versioned functional profile is `b3-h1-age-only-outage-restart-v1` in
 [feature_b3_staking_outage_restart.py](../../test/functional/feature_b3_staking_outage_restart.py).
@@ -152,8 +159,55 @@ No external chain, Anvil, deployed contract or VPS is used.
 A separate read-only source review confirmed the exact frozen commit and
 found no concrete defect in this bounded repair. That review executed no
 tests and is not production approval. Production synchronization/eclipsing
-assumptions and a reviewed activation remain separate gates. This slice does
-not repair non-H1 or mainnet restart behavior, permanent split locks, missing
+assumptions and a reviewed activation remain separate gates. The original slice
+did not repair pre-H1 or mainnet restart behavior, permanent split locks, missing
 historical authority, changing membership, bridge compatibility or machine
 power-loss recovery. No journal was deleted and no quorum or certificate rule
 was relaxed.
+
+## Preserved pre-H1 regtest extension — qualification pending
+
+An existing regtest datadir may never have configured H1. The producer-only
+predicate now covers that exact case without setting a fork height or changing
+historical state. The existing V1 `ModernPosEligible` comparison already makes
+every positive-weight validator eligible at round 128. Local recovery waits
+for that conservative universal bound, in addition to every unchanged context,
+body/ancestry, exact-best-header, minimum-work, age and solicited-peer guard.
+When H1 is active at the next height, its configured escape rule still applies;
+the V1 bound cannot bypass it. A future H1 height is not activated early.
+
+The exact-tip peer query is available for both Modern-PoS profiles. It still
+does not prove global synchronization or change IBD, consensus eligibility,
+quorum, finality recovery or journal rules. No non-regtest network is enabled.
+
+The explicit functional profile is `b3-pre-h1-age-only-outage-restart-v1`,
+selected with `--pre-h1`. It uses the same two disposable 80/20 validators,
+minimum finality set two, one-second block/round timing, normal tip-age limit,
+real signatures and persisted signer journals as the original profile. It
+omits both H1 arguments and asserts the absence of an H1 producer schedule.
+Startup mock time models an outage only in this isolated test; operational
+recovery must use the real clock. No reset, clock override or imported journal
+is part of the repair.
+
+The intended pre-H1 assertions mirror the H1 case: no peer, a withheld body,
+or an inbound body alone cannot allow production or signing; a fresh solicited
+outbound exact-tip reply can authorize normal V1 production; IBD must exit
+normally before any new finality signature. Existing journals are compared
+byte-for-byte throughout the blocked phases. The unit matrix independently
+covers absent/future H1, the exact round 127/128 boundary, active H1 retaining
+a larger escape threshold, missing body/ancestry, imports, insufficient work,
+no peer, exact-header mismatch, all non-regtest networks and overflow refusal.
+
+Run both functional profiles against the exact rebuilt tree, separately:
+
+```sh
+python3 test/functional/feature_b3_staking_outage_restart.py \
+  --configfile=build-staking-outage/test/config.ini \
+  --nocleanup --randomseed=20261012 --portseed=127 --pre-h1
+python3 test/functional/feature_b3_staking_outage_restart.py \
+  --configfile=build-staking-outage/test/config.ini \
+  --nocleanup --randomseed=20261012 --portseed=128
+```
+
+These are reproduction commands, not claimed passing results. Testing and a
+separate source review remain required before a regtest-only binary update.

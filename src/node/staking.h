@@ -90,7 +90,9 @@ struct RegtestStakingRestartInputs {
     std::chrono::seconds max_tip_age{0};
 };
 
-/** Regtest H1 block-production-only exception to age-only startup IBD.
+/** Regtest Modern-PoS block-production-only exception to age-only startup IBD.
+ * H1 uses its configured escape round; pre-H1 waits for V1's universal
+ * eligibility saturation at round 128. Neither activates H1 early.
  * No finality signing, recovery pass or consensus permission is granted.
  * A fresh outbound peer reply is an availability hint, not eclipse proof.
  */
@@ -114,7 +116,7 @@ bool CanResumeRegtestStakingAfterOutage(
  *
  * It produces nothing while the next block is not a modern-PoS block
  * (legacy era, corridor, unpinned boundary, unconfigured rules), during
- * initial block download (except the guarded regtest H1 age-only restart
+ * initial block download (except the guarded regtest age-only restart
  * policy, which permits block production but never finality signing),
  * while regtest is catching up to a higher-work
  * best header, or while this validator has no ACTIVE stake.
