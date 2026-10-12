@@ -120,6 +120,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   flowmesh/bls_certificate.cpp
   flowmesh/p2p.cpp
   flowmesh/outcome_evidence.cpp
+  flowmesh/market_view.cpp
   flowmesh/observed_time.cpp
   flowmesh/production_engine.cpp
   flowmesh/production_wire.cpp
@@ -136,6 +137,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   netaddress.cpp
   netbase.cpp
   # Shared with wallet RPC; the standalone wallet tool does not link bitcoin_node.
+  node/finality_fresh_key_store.cpp
   node/flowmesh_client_json.cpp
   outputtype.cpp
   policy/feerate.cpp
@@ -278,7 +280,6 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/flowmesh_observed_time_log.cpp
   node/flowmesh_https.cpp
   flowmesh/client_evidence.cpp
-  flowmesh/market_view.cpp
   node/flowmesh_net.cpp
   node/flowmesh_store.cpp
   node/flowmesh_vault_index.cpp
@@ -288,7 +289,6 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/legacy_fn_issuance.cpp
   node/finality_binding_index.cpp
   node/finality_fresh_key_index.cpp
-  node/finality_fresh_key_store.cpp
   node/finality_fresh_lineage.cpp
   node/finality_fresh_signature.cpp
   node/finality_fresh_transport.cpp
