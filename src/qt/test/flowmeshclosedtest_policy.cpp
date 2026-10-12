@@ -411,6 +411,11 @@ QStringList NodeArguments(const Profile& profile, const Storage& storage)
         QStringLiteral("-regtest=1"), QStringLiteral("-enableflowmeshvalidator=0"), QStringLiteral("-flowmeshapi=0"),
         QStringLiteral("-server=0"), QStringLiteral("-listen=0"), QStringLiteral("-listenonion=0"),
         QStringLiteral("-discover=0"), QStringLiteral("-dnsseed=0"), QStringLiteral("-fixedseeds=0"),
+        // Regtest normally scans the entire block index after every header and
+        // block for developer assertions. Do not impose that quadratic debug
+        // workload on a syncing tester; ordinary validity and finality checks
+        // and durable finality-pin writes are unaffected.
+        QStringLiteral("-checkblockindex=0"),
         QStringLiteral("-noconf"), QStringLiteral("-noincludeconf"),
         QStringLiteral("-settings=") + QDir{storage.root}.filePath(QStringLiteral("node-settings.json")),
         QStringLiteral("-choosedatadir=0"), QStringLiteral("-disablewallet=0"),

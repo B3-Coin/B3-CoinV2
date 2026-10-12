@@ -254,7 +254,7 @@ private Q_SLOTS:
             "-regtest=1", "-b3modernregtest=1", "-b3flowmeshtest=1", "-b3corridorlength=130",
             "-b3corridorreward=2000000000000", "-b3blockinterval=1", "-b3roundseconds=1", "-b3epochlength=200",
             "-b3checkpointinterval=5", "-b3checkpointdepth=3", "-b3maxepochextension=200", "-b3minfinalityset=4",
-            "-enableflowmeshvalidator=0", "-flowmeshapi=0", "-server=0", "-listen=0", "-noconf", "-noincludeconf",
+            "-enableflowmeshvalidator=0", "-flowmeshapi=0", "-server=0", "-listen=0", "-noconf", "-noincludeconf", "-checkblockindex=0",
             "-nowallet", "-wallet=closed-test", "-connect=88.216.63.161:19547", "-flowmeshendpoint=https://88.216.63.161:19580/flowmesh/v1"};
         for (const auto& arg : fixed) QCOMPARE(values.count(arg), 1);
         ArgsManager args; QVERIFY2(ConfigureArgs(args, values, error), qPrintable(error));
@@ -264,11 +264,13 @@ private Q_SLOTS:
             settings.rw_settings["walletdir"] = "/external/wallets";
             settings.rw_settings["conf"] = "/external/bitcoin.conf";
             settings.rw_settings["includeconf"] = "/external/included.conf";
+            settings.rw_settings["checkblockindex"] = 1;
         });
         QVERIFY(args.GetBoolArg("-regtest", false));
         QCOMPARE(args.GetArg("-datadir", ""), storage.node.toStdString());
         QCOMPARE(args.GetArg("-walletdir", ""), storage.wallets.toStdString());
         QVERIFY(args.IsArgNegated("-conf")); QVERIFY(args.IsArgNegated("-includeconf"));
+        QCOMPARE(args.GetIntArg("-checkblockindex", -1), int64_t{0});
     }
     void invalidPublicProfile_data()
     {
@@ -1002,6 +1004,7 @@ private Q_SLOTS:
         QTest::newRow("duplicate-wallet") << QByteArray{"{\"wallet\":[\"closed-test\",\"closed-test\"]}"} << false;
         QTest::newRow("wrong-wallet") << QByteArray{"{\"wallet\":[\"other\"]}"} << false;
         QTest::newRow("wallet-string") << QByteArray{"{\"wallet\":\"closed-test\"}"} << false;
+        QTest::newRow("debug-check-override") << QByteArray{"{\"wallet\":[\"closed-test\"],\"checkblockindex\":0}"} << false;
     }
     void persistedWalletArrayShape()
     {
