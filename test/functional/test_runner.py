@@ -90,6 +90,8 @@ EXTENDED_SCRIPTS = [
     'feature_pruning.py',
     'feature_dbcrash.py',
     'feature_index_prune.py',
+    # Real-P2P four-validator workload; observed latencies, no timing threshold.
+    'feature_flowmesh_speed.py',
     # Regtest bridge harness (local anvil + forge --offline); skips without foundry.
     'feature_b3_bridge_rt0_toolchain.py',
     # RT2 and RT3a also skip without the B3_BRIDGE_TOOLS executables.
@@ -116,8 +118,6 @@ EXTENDED_SCRIPTS = [
     # RT1: H1 producer rotation, escape and H2 checkpoint (regtest-only knobs); local nodes only.
     'feature_b3_h1_producer_rotation.py --fixture=B',
     'feature_b3_h1_producer_rotation.py --fixture=I',
-    # Real-P2P four-validator workload; observed latencies, no timing threshold.
-    'feature_flowmesh_speed.py',
 ]
 
 # Special script to run each bench sanity check
