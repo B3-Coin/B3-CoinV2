@@ -33,6 +33,7 @@
 #include <qt/utilitydialog.h>
 #include <qt/winshutdownmonitor.h>
 #include <uint256.h>
+#include <util/crash_report.h>
 #include <util/exception.h>
 #include <util/string.h>
 #include <util/threadnames.h>
@@ -51,15 +52,18 @@
 #include <memory>
 
 #include <QApplication>
+#include <QDesktopServices>
 #include <QDebug>
 #include <QLatin1String>
 #include <QLibraryInfo>
 #include <QLocale>
 #include <QMessageBox>
+#include <QPushButton>
 #include <QSettings>
 #include <QThread>
 #include <QTimer>
 #include <QTranslator>
+#include <QUrl>
 #include <QWindow>
 
 // Declare meta types used for QMetaObject::invokeMethod
@@ -425,6 +429,23 @@ void BitcoinApplication::initializeResult(bool success, interfaces::BlockAndHead
         window->showMinimized();
     }
     Q_EMIT windowShown(window);
+
+    // The previous run crashed: say where its report is (each report once).
+    const std::vector<fs::path> crash_reports{crash_report::PreviousReports()};
+    if (!crash_reports.empty()) {
+        const fs::path& report{crash_reports.back()};
+        QMessageBox box(QMessageBox::Information, HIVE_NAME,
+                        tr("%1 closed unexpectedly last time. A crash report was saved to:\n\n%2\n\n"
+                           "It contains no keys, addresses, balances or log contents. "
+                           "Please attach it when you report the problem.")
+                            .arg(HIVE_NAME, GUIUtil::PathToQString(report)),
+                        QMessageBox::Ok, window);
+        const QPushButton* open_folder{box.addButton(tr("Open folder"), QMessageBox::ActionRole)};
+        box.exec();
+        if (box.clickedButton() == open_folder) {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(GUIUtil::PathToQString(report.parent_path())));
+        }
+    }
 
 #ifdef ENABLE_WALLET
     // Now that initialization/startup is done, process any command-line
