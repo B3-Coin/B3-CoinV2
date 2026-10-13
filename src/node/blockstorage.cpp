@@ -67,6 +67,17 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <sys/resource.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+#endif
+
 namespace kernel {
 static constexpr uint8_t DB_BLOCK_FILES{'f'};
 static constexpr uint8_t DB_BLOCK_INDEX{'b'};
@@ -81,6 +92,20 @@ static constexpr uint8_t DB_FN_POD_ISSUED_TOTAL{'N'};
 // BlockTreeDB::DB_TXINDEX{'t'}
 
 namespace {
+
+//! Drop the calling thread to the lowest normal scheduling priority, so the
+//! startup hashing workers only get CPU time interactive programs leave idle.
+void LowerStartupWorkerPriority()
+{
+#if defined(WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#elif defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#elif defined(__linux__)
+    // Linux applies nice values per thread.
+    setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
+#endif
+}
 
 struct FnPodIssuedTotalKey {
     uint32_t height{0};
@@ -187,8 +212,12 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
     // its stored header exactly as before; only the hashing of each batch is
     // spread over worker threads. Records are inserted in the same order, on
     // this thread, under cs_main.
+    //
+    // Starting the wallet must never make the machine unresponsive: the
+    // workers leave one core untouched and run at the lowest normal priority,
+    // so they only use CPU time other programs leave idle.
     constexpr size_t BATCH_SIZE{16384};
-    const size_t workers{std::clamp<size_t>(GetNumCores(), 1, 16)};
+    const size_t workers{std::clamp<size_t>(GetNumCores() - 1, 1, 16)};
     std::vector<CDiskBlockIndex> batch;
     std::vector<uint256> hashes;
     batch.reserve(BATCH_SIZE);
@@ -196,13 +225,13 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
         hashes.assign(batch.size(), uint256{});
         const size_t threads{std::min(workers, (batch.size() + 255) / 256)};
         const auto hash_range{[&](const size_t first) {
+            LowerStartupWorkerPriority();
             for (size_t i{first}; i < batch.size(); i += threads) {
                 hashes[i] = batch[i].ConstructBlockHash(consensusParams);
             }
         }};
         std::vector<std::thread> pool;
-        for (size_t t{1}; t < threads; ++t) pool.emplace_back(hash_range, t);
-        hash_range(0);
+        for (size_t t{0}; t < threads; ++t) pool.emplace_back(hash_range, t);
         for (std::thread& thread : pool) thread.join();
         for (size_t i{0}; i < batch.size(); ++i) {
             const CDiskBlockIndex& diskindex{batch[i]};
