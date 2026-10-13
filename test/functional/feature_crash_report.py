@@ -42,6 +42,11 @@ class CrashReportTest(BitcoinTestFramework):
             raise SkipTest("POSIX signal exit codes")
         node = self.nodes[0]
 
+        self.log.info("A run that does not crash leaves no report directory")
+        self.start_node(0)
+        self.stop_node(0)
+        assert not (node.chain_path / "crash_reports").exists()
+
         cases = [
             ("segv", signal.SIGSEGV, "", ["reason: fatal signal", "signal: 11 (SIGSEGV)", "fault_address: 0x0", "thread: init"]),
             ("abort", signal.SIGABRT, "", ["reason: abort", "signal: 6 (SIGABRT)", "thread: init"]),

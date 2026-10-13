@@ -33,6 +33,7 @@
 #include <compat/compat.h>
 #else
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 #if defined(__linux__) || defined(__APPLE__)
@@ -149,6 +150,7 @@ void WriteCommon(Writer& w, const char* reason, const char* thread_name)
 
 #ifdef WIN32
 
+wchar_t g_directory_path[MAX_PATH * 4];
 wchar_t g_report_path[MAX_PATH * 4];
 wchar_t g_stderr_path[MAX_PATH * 4];
 bool g_stderr_captured{false};
@@ -243,6 +245,9 @@ void AppendStderrTail(HANDLE file)
 DWORD WINAPI ReportThread(LPVOID)
 {
     WaitForSingleObject(g_request_event, INFINITE);
+    // The directory is made on the first crash, so a datadir that never
+    // crashed has none. This fails harmlessly if it exists.
+    CreateDirectoryW(g_directory_path, nullptr);
     HANDLE file{CreateFileW(g_report_path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL, nullptr)};
     if (file != INVALID_HANDLE_VALUE) {
@@ -364,16 +369,21 @@ std::string OsDescription()
 bool InstallPlatform(const fs::path& report, const fs::path& directory)
 {
     const std::wstring wide{report.wstring()};
-    if (wide.size() + 1 > std::size(g_report_path)) return false;
+    const std::wstring wide_directory{directory.wstring()};
+    if (wide.size() + 1 > std::size(g_report_path) || wide_directory.size() + 1 > std::size(g_directory_path)) return false;
     std::copy(wide.begin(), wide.end(), g_report_path);
     g_report_path[wide.size()] = L'\0';
+    std::copy(wide_directory.begin(), wide_directory.end(), g_directory_path);
+    g_directory_path[wide_directory.size()] = L'\0';
 
     // A GUI process has no console, so an assertion message written to
     // stderr is lost. Keep it in a file the report can quote.
     const HANDLE err{GetStdHandle(STD_ERROR_HANDLE)};
     if (err == nullptr || err == INVALID_HANDLE_VALUE) {
         const std::wstring err_path{(directory / "stderr.log").wstring()};
-        if (err_path.size() + 1 <= std::size(g_stderr_path) && _wfreopen(err_path.c_str(), L"w", stderr) != nullptr) {
+        std::error_code ec;
+        fs::create_directories(directory, ec);
+        if (!ec && err_path.size() + 1 <= std::size(g_stderr_path) && _wfreopen(err_path.c_str(), L"w", stderr) != nullptr) {
             std::copy(err_path.begin(), err_path.end(), g_stderr_path);
             g_stderr_path[err_path.size()] = L'\0';
             setvbuf(stderr, nullptr, _IONBF, 0);
@@ -400,6 +410,7 @@ bool InstallPlatform(const fs::path& report, const fs::path& directory)
 
 #else // WIN32
 
+char g_directory_path[4096];
 char g_report_path[4096];
 alignas(16) char g_alt_stack[64 * 1024];
 
@@ -430,6 +441,9 @@ void WriteAll(int fd, const Writer& w)
 void SignalHandler(int sig, siginfo_t* info, void*)
 {
     if (!g_reporting.test_and_set()) {
+        // The directory is made on the first crash (mkdir is
+        // async-signal-safe and fails harmlessly if it exists).
+        mkdir(g_directory_path, 0700);
         const int fd{open(g_report_path, O_WRONLY | O_CREAT | O_TRUNC, 0600)};
         if (fd >= 0) {
             Writer w{g_report, sizeof(g_report)};
@@ -473,11 +487,13 @@ std::string OsDescription()
     return strprintf("%s %s %s", name.sysname, name.release, name.machine);
 }
 
-bool InstallPlatform(const fs::path& report, const fs::path&)
+bool InstallPlatform(const fs::path& report, const fs::path& directory)
 {
     const std::string narrow{fs::PathToString(report)};
-    if (narrow.size() + 1 > sizeof(g_report_path)) return false;
+    const std::string narrow_directory{fs::PathToString(directory)};
+    if (narrow.size() + 1 > sizeof(g_report_path) || narrow_directory.size() + 1 > sizeof(g_directory_path)) return false;
     std::memcpy(g_report_path, narrow.c_str(), narrow.size() + 1);
+    std::memcpy(g_directory_path, narrow_directory.c_str(), narrow_directory.size() + 1);
 
 #ifdef B3_CRASH_BACKTRACE
     // The first backtrace() call may load libgcc; never do that in a handler.
@@ -569,10 +585,6 @@ int Recurse(volatile int depth)
 
 std::optional<std::vector<fs::path>> Install(const fs::path& directory)
 {
-    std::error_code ec;
-    fs::create_directories(directory, ec);
-    if (ec) return std::nullopt;
-
     std::vector<fs::path> previous{TakeNewReports(directory)};
 
     g_start_time = static_cast<int64_t>(std::time(nullptr));
