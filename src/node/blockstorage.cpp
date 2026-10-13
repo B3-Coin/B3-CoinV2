@@ -52,6 +52,7 @@
 #include <validation.h>
 
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <compare>
 #include <cstddef>
@@ -71,6 +72,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sched.h>
 #include <sys/resource.h>
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -105,6 +107,26 @@ void LowerStartupWorkerPriority()
     // Linux applies nice values per thread.
     setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
 #endif
+}
+
+//! Number of CPUs this process may run on. GetNumCores() reports every CPU
+//! in the machine, even when the process is restricted to fewer of them
+//! (CPU affinity, some VMs and containers); one hashing thread per reported
+//! core would then crowd onto the allowed ones.
+int AvailableCores()
+{
+#if defined(WIN32)
+    DWORD_PTR process_mask{0};
+    DWORD_PTR system_mask{0};
+    if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) && process_mask != 0) {
+        return std::popcount(static_cast<uint64_t>(process_mask));
+    }
+#elif defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) return CPU_COUNT(&set);
+#endif
+    return GetNumCores();
 }
 
 struct FnPodIssuedTotalKey {
@@ -218,7 +240,7 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
     // so they only use CPU time other programs leave idle. A single-core (or
     // unknown, reported as 0) machine still gets one worker.
     constexpr size_t BATCH_SIZE{16384};
-    const size_t workers{static_cast<size_t>(std::clamp(GetNumCores() - 1, 1, 16))};
+    const size_t workers{static_cast<size_t>(std::clamp(AvailableCores() - 1, 1, 16))};
     std::vector<CDiskBlockIndex> batch;
     std::vector<uint256> hashes;
     batch.reserve(BATCH_SIZE);
