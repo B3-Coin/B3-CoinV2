@@ -215,9 +215,10 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
     //
     // Starting the wallet must never make the machine unresponsive: the
     // workers leave one core untouched and run at the lowest normal priority,
-    // so they only use CPU time other programs leave idle.
+    // so they only use CPU time other programs leave idle. A single-core (or
+    // unknown, reported as 0) machine still gets one worker.
     constexpr size_t BATCH_SIZE{16384};
-    const size_t workers{std::clamp<size_t>(GetNumCores() - 1, 1, 16)};
+    const size_t workers{static_cast<size_t>(std::clamp(GetNumCores() - 1, 1, 16))};
     std::vector<CDiskBlockIndex> batch;
     std::vector<uint256> hashes;
     batch.reserve(BATCH_SIZE);
