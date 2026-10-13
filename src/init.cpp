@@ -84,6 +84,7 @@
 #include <util/batchpriority.h>
 #include <util/chaintype.h>
 #include <util/check.h>
+#include <util/crash_report.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
 #include <util/moneystr.h>
@@ -519,6 +520,10 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blocksonly", strprintf("Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transactions, unless the source peer has the 'forcerelay' permission. RPC transactions are not affected. (default: %u)", DEFAULT_BLOCKSONLY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-coinstatsindex", strprintf("Maintain coinstats index used by the gettxoutsetinfo RPC (default: %u)", DEFAULT_COINSTATSINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-conf=<file>", strprintf("Specify path to read-only configuration file. Relative paths will be prefixed by datadir location (only useable from command line, not configuration file) (default: %s)", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-crashreports", strprintf("Write a crash report to the %s directory inside the data directory if the program crashes. "
+                                              "Reports contain no keys, wallet data, memory or log contents and are never sent anywhere (default: %u)",
+                                              crash_report::DIRECTORY_NAME, DEFAULT_CRASH_REPORTS),
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-datadir=<dir>", "Specify data directory", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::OPTIONS);
     argsman.AddArg("-finalityrecoveryfile=<path>", "Read one public operator-trusted finality recovery manifest at startup (off by default; relative paths use the network datadir). Requires -acceptfinalityrecovery. This local emergency trust exception is not a quorum proof and does not revoke old signatures.", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION | ArgsManager::DISALLOW_ELISION, OptionsCategory::OPTIONS);
     argsman.AddArg("-acceptfinalityrecovery=<anchor-hash>", "Explicitly accept the exact 64-hex anchor hash in -finalityrecoveryfile. Both options are required; no block-validity or bridge-verifier rules change.", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION | ArgsManager::DISALLOW_ELISION, OptionsCategory::OPTIONS);
@@ -666,7 +671,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-checkpoints", "", ArgsManager::ALLOW_ANY, OptionsCategory::HIDDEN);
     argsman.AddArg("-deprecatedrpc=<method>", "Allows deprecated RPC method(s) to be used", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-stopafterblockimport", strprintf("Stop running after importing blocks from disk (default: %u)", DEFAULT_STOPAFTERBLOCKIMPORT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-stopatheight", strprintf("Stop running after reaching the given height in the main chain (default: %u). Blocks after target height may be processed during shutdown.", DEFAULT_STOPATHEIGHT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-crashreporttest=<kind>", "Crash deliberately right after installing the crash reporter (segv, abort, assert, check, throw or overflow)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-stopatheight",strprintf("Stop running after reaching the given height in the main chain (default: %u). Blocks after target height may be processed during shutdown.", DEFAULT_STOPATHEIGHT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-limitancestorcount=<n>", strprintf("Deprecated setting to not accept transactions if number of in-mempool ancestors is <n> or more (default: %u); replaced by cluster limits (see -limitclustercount) and only used by wallet for coin selection", DEFAULT_ANCESTOR_LIMIT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     // Ancestor and descendant size limits were removed. We keep
     // -limitancestorsize/-limitdescendantsize as hidden args to display a more
@@ -1507,6 +1513,20 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (!init::StartLogging(args)) {
         // Detailed error printed inside StartLogging().
         return false;
+    }
+
+    if (args.GetBoolArg("-crashreports", DEFAULT_CRASH_REPORTS)) {
+        const fs::path crash_directory{args.GetDataDirNet() / fs::u8path(std::string{crash_report::DIRECTORY_NAME})};
+        if (const auto previous{crash_report::Install(crash_directory)}) {
+            for (const fs::path& report : *previous) {
+                LogWarning("The previous run ended in a crash; its report is %s", fs::PathToString(report));
+            }
+        } else {
+            LogWarning("Crash reports are unavailable: cannot prepare %s", fs::PathToString(crash_directory));
+        }
+    }
+    if (args.IsArgSet("-crashreporttest")) {
+        crash_report::TriggerTestCrash(args.GetArg("-crashreporttest", ""));
     }
 
     if (operator_recovery) {
