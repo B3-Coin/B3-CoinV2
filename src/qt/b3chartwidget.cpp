@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace {
 constexpr double kMinVisible{5.0};
@@ -226,16 +227,22 @@ void B3ChartWidget::paintEvent(QPaintEvent*)
     if (max_price == min_price) {
         // One-point/flat data: give the scale artificial headroom so the
         // candle is drawable.
-        max_price += 1;
+        if (max_price < std::numeric_limits<qint64>::max()) max_price += 1;
         min_price -= (min_price > 0 ? 1 : 0);
     }
+    // Distances above min_price, in unsigned arithmetic: exact for any
+    // prices, where a signed difference or product can overflow.
+    const auto above_min = [&](qint64 price) {
+        return static_cast<quint64>(price) - static_cast<quint64>(min_price);
+    };
+    const quint64 price_range{above_min(max_price)};
 
     const double candle_width = static_cast<double>(plot.width()) / m_visible;
     const auto xAt = [&](int index) {
         return (index - m_start) * candle_width + candle_width / 2.0;
     };
     const auto yAt = [&](qint64 price) {
-        const double t = static_cast<double>(price - min_price) / static_cast<double>(max_price - min_price);
+        const double t = static_cast<double>(above_min(price)) / static_cast<double>(price_range);
         return price_area.bottom() - t * (price_area.height() - 8) - 4;
     };
 
@@ -244,7 +251,8 @@ void B3ChartWidget::paintEvent(QPaintEvent*)
     const QFontMetrics fm = painter.fontMetrics();
     const int grid_lines = 4;
     for (int g = 0; g <= grid_lines; ++g) {
-        const qint64 price = min_price + (max_price - min_price) * g / grid_lines;
+        const quint64 offset{price_range / grid_lines * g + price_range % grid_lines * g / grid_lines};
+        const qint64 price = static_cast<qint64>(static_cast<quint64>(min_price) + offset);
         const int y = static_cast<int>(yAt(price));
         painter.setPen(QColor(B3Theme::kBorder));
         painter.drawLine(0, y, plot.width(), y);
