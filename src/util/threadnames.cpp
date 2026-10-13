@@ -43,6 +43,7 @@ static void SetThreadName(const char* name)
  */
 static thread_local char g_thread_name[128]{'\0'};
 std::string util::ThreadGetInternalName() { return g_thread_name; }
+const char* util::ThreadGetInternalNameRaw() { return g_thread_name; }
 //! Set the in-memory internal name for this thread. Does not affect the process
 //! name.
 static void SetInternalName(const std::string& name)

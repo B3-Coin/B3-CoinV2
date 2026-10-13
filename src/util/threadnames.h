@@ -21,6 +21,10 @@ void ThreadSetInternalName(const std::string&);
 //! logging.
 std::string ThreadGetInternalName();
 
+//! The same name without copying, for crash handlers that must not allocate.
+//! Valid while the calling thread lives.
+const char* ThreadGetInternalNameRaw();
+
 } // namespace util
 
 #endif // BITCOIN_UTIL_THREADNAMES_H
