@@ -9,6 +9,7 @@ add_library(bitcoin_util STATIC EXCLUDE_FROM_ALL
   bytevectorhash.cpp
   chaintype.cpp
   check.cpp
+  crash_report.cpp
   exec.cpp
   exception.cpp
   feefrac.cpp
@@ -45,4 +46,5 @@ target_link_libraries(bitcoin_util
     $<$<PLATFORM_ID:Windows>:ws2_32>
     $<$<PLATFORM_ID:Windows>:iphlpapi>
     $<$<PLATFORM_ID:Windows>:bcrypt>
+    ${CMAKE_DL_LIBS}
 )

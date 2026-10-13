@@ -9,8 +9,10 @@
 #include <clientversion.h>
 #include <tinyformat.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <source_location>
 #include <string>
 #include <string_view>
@@ -31,12 +33,21 @@ NonFatalCheckError::NonFatalCheckError(std::string_view msg, const std::source_l
 
 bool g_detail_test_only_CheckFailuresAreExceptionsNotAborts{false};
 
+namespace {
+char g_assertion_failure[1024];
+} // namespace
+
+const char* AssertionFailureMessage() { return g_assertion_failure; }
+
 void assertion_fail(const std::source_location& loc, std::string_view assertion)
 {
     if (g_detail_test_only_CheckFailuresAreExceptionsNotAborts) {
         throw NonFatalCheckError{assertion, loc};
     }
     auto str = strprintf("%s:%s %s: Assertion `%s' failed.\n", loc.file_name(), loc.line(), loc.function_name(), assertion);
+    // Keep the message, without its newline, for a crash report.
+    const size_t len{std::min(str.size() - 1, sizeof(g_assertion_failure) - 1)};
+    std::memcpy(g_assertion_failure, str.data(), len);
     fwrite(str.data(), 1, str.size(), stderr);
     std::abort();
 }

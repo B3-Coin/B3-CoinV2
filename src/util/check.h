@@ -64,6 +64,10 @@ public:
 /** Internal helper */
 void assertion_fail(const std::source_location& loc, std::string_view assertion);
 
+/** The message of the failed assertion that is aborting the process, or an
+ *  empty string. Read by the crash reporter, which must not allocate. */
+const char* AssertionFailureMessage();
+
 /** Helper for CHECK_NONFATAL() */
 template <typename T>
 T&& inline_check_non_fatal(LIFETIMEBOUND T&& val, const std::source_location& loc, std::string_view assertion)
