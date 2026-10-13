@@ -29,10 +29,10 @@ namespace crash_report {
 inline constexpr std::string_view DIRECTORY_NAME{"crash_reports"};
 
 /**
- * Prepare `directory` and install the process-wide handlers. Returns the
- * reports earlier runs left that were not announced yet (each is announced
- * once), or std::nullopt if the directory cannot be prepared, in which case
- * no handler is installed.
+ * Install the process-wide handlers. They write into `directory`, which is
+ * created on the first crash. Returns the reports earlier runs left that
+ * were not announced yet (each is announced once), or std::nullopt if the
+ * handlers cannot be prepared, in which case none is installed.
  */
 std::optional<std::vector<fs::path>> Install(const fs::path& directory);
 
