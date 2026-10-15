@@ -123,7 +123,7 @@ BOOST_AUTO_TEST_CASE(integer_and_identifier_bounds)
         BOOST_CHECK(!node::ParseFlowMeshAssetMetadata(changed, domain, asset, error));
     }
     for (const auto* field : {"domain", "asset_id", "issuance_txid"}) {
-        for (const std::string bad_id : {std::string(63, 'a'), std::string(64, 'g'), std::string(64, '0')}) {
+        for (const std::string& bad_id : {std::string(63, 'a'), std::string(64, 'g'), std::string(64, '0')}) {
             auto changed{record};
             changed.pushKV(field, bad_id);
             BOOST_CHECK(!node::ParseFlowMeshAssetMetadata(changed, domain, asset, error));
@@ -147,7 +147,7 @@ BOOST_AUTO_TEST_CASE(catalog_load_is_atomic_and_bounded)
 
     auto invalid{record};
     invalid.pushKV("ticker", "cUSD");
-    for (const std::string contents : {
+    for (const std::string& contents : {
              "[" + record.write() + "," + invalid.write() + "]",
              "[" + record.write() + "," + record.write() + "]",
              std::string{"{\"private_data\":\"must not appear in errors\"}"},
