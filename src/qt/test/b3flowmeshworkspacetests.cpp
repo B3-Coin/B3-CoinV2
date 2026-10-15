@@ -11,6 +11,7 @@
 #include <interfaces/wallet.h>
 #include <key_io.h>
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_client_join.h>
 #include <node/flowmesh_client_work.h>
 #include <rpc/server.h>
 #include <qt/clientmodel.h>
@@ -69,6 +70,7 @@
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 const std::function<void(const std::string&)> G_TEST_LOG_FUN{};
@@ -514,6 +516,128 @@ struct FundingReadProbe {
     }
     ~FundingReadProbe() { for (const auto& command : commands) tableRPC.removeCommand(command->name, command.get()); }
 };
+
+// Isolated Qt dispatch/scheduling fixture, NOT a native RemoteBackend join or
+// certificate-verification test. Core RPC handlers are preserved in a scoped
+// table, rather than appending a mock behind the real getblockchaininfo actor.
+// Only synthetic reads and a mutation trap are reachable while it is active.
+// Its owner MUST drain every panel worker before destruction/table restoration.
+struct SelectedReadCommandProbe {
+    struct ScopedRpcTable {
+        CRPCTable preserved;
+        ScopedRpcTable()
+        {
+            if (IsRPCRunning()) throw std::runtime_error{"Offline dispatcher requires a stopped RPC server"};
+            std::swap(tableRPC, preserved);
+        }
+        ~ScopedRpcTable() { std::swap(tableRPC, preserved); }
+        ScopedRpcTable(const ScopedRpcTable&) = delete;
+        ScopedRpcTable& operator=(const ScopedRpcTable&) = delete;
+    };
+    const bool candles, join_policy_eligible;
+    std::vector<std::unique_ptr<CRPCCommand>> commands;
+    QSemaphore read_entered, read_release, command_entered, command_release, successor_entered, successor_release;
+    std::atomic_int data_calls{0}, candle_calls{0}, sync_calls{0}, preflights{0}, mutation_attempts{0};
+    std::mutex mutex;
+    std::vector<std::pair<std::string, UniValue>> mutations;
+    UniValue data{RemoteDataWithTimes()};
+    // Default-off controls for late-after-command regressions. These values
+    // are configured before a worker starts and never changed concurrently.
+    bool fail_first_data{false};
+    UniValue mutation_response, successor_data;
+    // Constructed last and destroyed first: restore even if registration
+    // throws, and remove dispatcher references before deleting their actors.
+    ScopedRpcTable rpc_table;
+
+    static bool JoinPolicy(const bool eligible)
+    {
+        // Real pure policy, predetermined clocks. These rows do not claim
+        // that a native TLS read lease or JoinFresh has been exercised.
+        const auto started{std::chrono::steady_clock::time_point{std::chrono::seconds{100}}};
+        const auto validated{started + std::chrono::milliseconds{10}};
+        const auto now{validated + std::chrono::milliseconds{eligible ? 1 : 51}};
+        return node::FlowMeshCanJoinFreshPreflight(now, started, validated, 2, 8,
+                                                  std::nullopt, std::span<const node::FlowMeshJoinOwnAction>{});
+    }
+    UniValue Market() const
+    {
+        const auto snapshot{Parse(data)};
+        UniValue row{UniValue::VOBJ};
+        for (const auto* key : {"market_id", "base_asset_id", "domain", "execution_config_id", "quote_asset", "verification"}) row.pushKV(key, data[key]);
+        row.pushKV("vault_id", flowmesh::ComputeFlowMeshVaultId(H(1), *uint256::FromHex(snapshot.market.toStdString()))->GetHex());
+        row.pushKV("available", true); row.pushKV("checkpoint_pending", false);
+        for (const auto* key : {"running", "paused", "pending_handoff", "halt", "error"}) row.pushKV(key, data["snapshot"][key]);
+        auto account{data["account"]};
+        account.pushKV("b3_available", FormatAmount(snapshot.b3_available, 9).toStdString());
+        account.pushKV("b3_reserved", FormatAmount(snapshot.b3_reserved, 9).toStdString());
+        row.pushKV("account", account);
+        return row;
+    }
+    SelectedReadCommandProbe(const bool hold_candles, const bool eligible)
+        : candles{hold_candles}, join_policy_eligible{eligible}
+    {
+        if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+        const auto add = [&](const char* method, const std::function<UniValue(const JSONRPCRequest&)>& run) {
+            auto command{std::make_unique<CRPCCommand>("hidden", method,
+                [run](const JSONRPCRequest& request, UniValue& result, bool) { result = run(request); return true; },
+                std::vector<std::pair<std::string, bool>>{}, 998940 + commands.size())};
+            tableRPC.appendCommand(command->name, command.get()); commands.push_back(std::move(command));
+        };
+        add("getflowmeshclientinfo", [](const JSONRPCRequest&) { return ConnectionInfo("https://operator.invalid:18443"); });
+        add("listflowmeshactions", [](const JSONRPCRequest&) {
+            UniValue saved{UniValue::VOBJ}; saved.pushKV("source", "local-retained-outbox");
+            saved.pushKV("actions", UniValue{UniValue::VARR}); return saved;
+        });
+        add("listflowmeshmarkets", [this](const JSONRPCRequest&) {
+            UniValue rows{UniValue::VARR}; rows.push_back(Market()); return rows;
+        });
+        add("getblockchaininfo", [this](const JSONRPCRequest&) {
+            ++sync_calls;
+            UniValue result{UniValue::VOBJ}; result.pushKV("initialblockdownload", false);
+            result.pushKV("headers", 0); result.pushKV("blocks", 0); return result;
+        });
+        add("getflowmeshbalance", [this](const JSONRPCRequest&) {
+            ++preflights; command_entered.release();
+            if (!command_release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic command preflight exceeded its bound"};
+            if (!JoinPolicy(join_policy_eligible)) throw std::runtime_error{"Synthetic expired join policy: no command authority"};
+            return Market();
+        });
+        add("getflowmeshmarketdata", [this](const JSONRPCRequest&) {
+            const int call{++data_calls};
+            if (call > 1 && successor_data.isObject()) {
+                successor_entered.release();
+                if (!successor_release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic post-command read exceeded its bound"};
+                return successor_data;
+            }
+            if (!candles) {
+                read_entered.release();
+                if (!read_release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic selected-account read exceeded its bound"};
+            }
+            if (call == 1 && fail_first_data) throw std::runtime_error{"Synthetic pre-command selected read failed late"};
+            return data;
+        });
+        add("getflowmeshcandles", [this](const JSONRPCRequest&) {
+            const int call{++candle_calls};
+            if (call == 1 || !successor_data.isObject()) {
+                read_entered.release();
+                if (!read_release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic candles read exceeded its bound"};
+            }
+            return CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 300,
+                {CandleJson(OBSERVED_T0, 1, 1, 1000, 1000, 1000, 1000, 250'000)});
+        });
+        // The real panel marks write_attempted and reaches this dispatcher,
+        // but no production signer, durable outbox or network is reachable.
+        for (const auto* method : {"submitflowmeshorder", "submitflowmeshladder", "cancelflowmeshorder", "flowmeshdeposit",
+                                  "submitflowmeshdeposit", "requestflowmeshwithdrawal", "sendrawtransaction", "retryflowmeshaction"}) {
+            add(method, [this](const JSONRPCRequest& request) -> UniValue {
+                { std::lock_guard lock{mutex}; mutations.emplace_back(request.URI, request.params); }
+                ++mutation_attempts;
+                if (mutation_response.isObject()) return mutation_response;
+                throw std::runtime_error{"Offline mutation trap before signing, saving or network"};
+            });
+        }
+    }
+};
 }
 
 class B3FlowMeshWorkspaceTests : public QObject
@@ -910,6 +1034,250 @@ class B3FlowMeshWorkspaceTests : public QObject
         s.depth = Aggregate(s.curves);
         return WithLevels(s, {}, H(5));
     }
+
+    void CheckSelectedReadCommandIsolation(const bool candles, const bool eligible, const bool other_account = false)
+    {
+        auto offline{MakeOfflineWallet(candles ? "qt-read-lane-candles" : "qt-read-lane-account")};
+        B3FlowMeshTradingPanel panel;
+        AttachOfflineWallet(panel, *offline.model, offline.wallet);
+        Observe(panel, Parse(RemoteDataWithTimes()));
+        panel.m_timer->stop(); panel.m_rearm->stop();
+        // BEFORE replacing the process-wide dispatcher, prove this fresh
+        // panel cannot issue work. setup_net=false starts no RPC server, and
+        // this mock wallet is not registered for external wallet discovery.
+        QVERIFY(!IsRPCRunning());
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_watch_thread);
+        for (const auto* timer : panel.findChildren<QTimer*>()) QVERIFY(!timer->isActive());
+        for (const auto* worker : panel.findChildren<QThread*>()) QVERIFY(!worker->isRunning());
+        // The generated empty unencrypted mock wallet has no spending unlock
+        // to perform. All mutation RPCs are trapped before a real signer.
+        QVERIFY(!panel.m_backend->isCrypted());
+        QVERIFY(!panel.m_backend->isLocked());
+        QVERIFY(!panel.m_backend->privateKeysDisabled());
+        QSignalSpy unlock{offline.model.get(), &WalletModel::requireUnlock};
+        SelectedReadCommandProbe probe{candles, eligible};
+        struct Cleanup {
+            SelectedReadCommandProbe& probe;
+            B3FlowMeshTradingPanel& panel;
+            ~Cleanup()
+            {
+                panel.m_closing = true; // Closing joins watch/late-cancel work too.
+                panel.m_timer->stop(); panel.m_rearm->stop(); panel.m_cancel->store(true);
+                probe.read_release.release(8); probe.command_release.release(8);
+                panel.cancelAndWait();
+                // Include any separately owned read worker added by the
+                // successor. No actor may outlive the probe/table swap, even
+                // after a QTest assertion returns early. Do not process GUI
+                // events here or start a replacement request during teardown.
+                for (auto* worker : panel.findChildren<QThread*>()) {
+                    QObject::disconnect(worker, nullptr, &panel, nullptr);
+                    worker->wait();
+                }
+            }
+        } cleanup{probe, panel};
+        QCOMPARE(SelectedReadCommandProbe::JoinPolicy(eligible), eligible);
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None;
+        panel.m_catalog_age.start();
+        if (candles) {
+            panel.m_candle_interval = flowmesh::CandleInterval::M1;
+            QVERIFY(panel.candlesDue());
+        } else {
+            // This case holds only Data; a candle request would be a different
+            // obstruction. Keep it not due without changing authority age.
+            panel.m_snapshot->observed.reset();
+        }
+        B3FlowMeshTrading::Action action;
+        action.operation = B3FlowMeshTrading::Operation::Order;
+        action.market = *panel.market();
+        action.side = QStringLiteral("bid"); action.price = 1000; action.amount = 1'000'000;
+        action.display_decimals = 6; action.display_ticker = QStringLiteral("tUSD");
+        const auto expected{B3FlowMeshTrading::Parameters(action)};
+        QCOMPARE(expected.method, std::string{"submitflowmeshorder"});
+        panel.startJob();
+        QVERIFY(probe.read_entered.tryAcquire(1, 1000));
+        QCOMPARE(probe.data_calls.load(), 1);
+        QCOMPARE(probe.candle_calls.load(), candles ? 1 : 0);
+        QVERIFY(!panel.m_busy); QCOMPARE(probe.preflights.load(), 0); QCOMPARE(probe.mutation_attempts.load(), 0);
+        const auto workers{panel.findChildren<QThread*>()};
+        QCOMPARE(workers.size(), 1);
+        QPointer<QThread> held_read{workers.front()};
+        QVERIFY(held_read->isRunning());
+        // This is an already approved synthetic action on the real command
+        // dispatcher, not a UI review click or a never-started marker thread.
+        panel.startJob(action);
+        QTRY_COMPARE_WITH_TIMEOUT(probe.preflights.load(), 1, 1000);
+        // Failing-before point: m_thread's guard never starts the command.
+        // The read semaphore has not been released, so reaching here proves
+        // independent command progress, not waiting for a read timeout.
+        QCOMPARE(probe.sync_calls.load(), 1);
+        QVERIFY(panel.m_busy);
+        const auto command{panel.m_active_result};
+        const auto command_cancel{panel.m_cancel};
+        QVERIFY(command && command->action);
+        QVERIFY(command_cancel && !command_cancel->load());
+        QCOMPARE(command->action->market.account, action.market.account);
+        QCOMPARE(probe.mutation_attempts.load(), 0);
+
+        // A newer verified GUI observation arrives before the old read. It
+        // may belong to the new selected account; the captured command stays
+        // bound to its original account and never receives a replacement.
+        auto newer{*panel.m_snapshot};
+        newer.head = QString::fromStdString(H(109).GetHex()); newer.next_sequence = 4;
+        if (other_account) newer.account = QString::fromStdString(H(110).GetHex());
+        Observe(panel, newer);
+        panel.m_certificate_age.start();
+        const auto response_time{panel.m_response_age.msecsSinceReference()};
+        const auto certificate_time{panel.m_certificate_age.msecsSinceReference()};
+        probe.read_release.release();
+        QTRY_VERIFY_WITH_TIMEOUT(held_read.isNull(), 1000); // Read completion/cleanup actually ran.
+        QVERIFY(panel.m_busy); QCOMPARE(panel.m_active_result, command);
+        QCOMPARE(panel.m_cancel, command_cancel); QVERIFY(!command_cancel->load());
+        QCOMPARE(panel.m_snapshot->head, newer.head); QCOMPARE(panel.m_snapshot->account, newer.account);
+        QCOMPARE(panel.market()->account, newer.account);
+        QCOMPARE(panel.m_response_age.msecsSinceReference(), response_time);
+        QCOMPARE(panel.m_certificate_age.msecsSinceReference(), certificate_time);
+        QVERIFY(!panel.m_read_failed);
+        QCOMPARE(probe.mutation_attempts.load(), 0);
+
+        probe.command_release.release();
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 1000);
+        QCOMPARE(probe.mutation_attempts.load(), eligible ? 1 : 0);
+        QCOMPARE(command->write_attempted, eligible);
+        if (eligible) {
+            std::lock_guard lock{probe.mutex};
+            QCOMPARE(probe.mutations.size(), size_t{1});
+            QCOMPARE(probe.mutations.front().first, std::string{"/wallet/"} + offline.model->getWalletName().toStdString());
+            QCOMPARE(probe.mutations.front().second.write(), expected.params.write());
+            QVERIFY(command->error.contains(QStringLiteral("Offline mutation trap")));
+        } else {
+            QVERIFY(command->error.contains(QStringLiteral("Synthetic expired join policy")));
+            QVERIFY(!panel.m_uncertain); // A refused preflight did not attempt an economic operation.
+        }
+        QCOMPARE(unlock.count(), 0);
+        QVERIFY(!panel.m_unlock);
+        QCoreApplication::processEvents();
+        QCOMPARE(probe.mutation_attempts.load(), eligible ? 1 : 0); // No automatic economic retry.
+        QVERIFY(m_wallet->IsLocked());
+    }
+
+    void CheckSelectedReadLateAfterCompletedCommand(const bool candles)
+    {
+        auto offline{MakeOfflineWallet(candles ? "qt-late-candles-command" : "qt-late-failed-read-command")};
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel, *offline.model, offline.wallet);
+        Observe(panel, Parse(RemoteDataWithTimes()));
+        panel.m_timer->stop(); panel.m_rearm->stop();
+        panel.m_certificate_age.start();
+        QVERIFY(!IsRPCRunning()); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_watch_thread);
+        for (const auto* timer : panel.findChildren<QTimer*>()) QVERIFY(!timer->isActive());
+        QVERIFY(!panel.m_backend->isCrypted()); QVERIFY(!panel.m_backend->isLocked());
+        QVERIFY(!panel.m_backend->privateKeysDisabled());
+        QSignalSpy unlock{offline.model.get(), &WalletModel::requireUnlock};
+        SelectedReadCommandProbe probe{candles, true};
+        probe.fail_first_data = !candles;
+        if (candles) {
+            // The selected Data response is already captured and parsed before
+            // candles block. Its head precedes the later command receipt, but
+            // the GUI has not yet received either this head or its balances.
+            auto snapshot{probe.data["snapshot"]};
+            snapshot.pushKV("next_microblock_sequence", 4);
+            snapshot.pushKV("last_microblock_hash", H(10).GetHex());
+            probe.data.pushKV("snapshot", snapshot);
+            panel.m_candle_interval = flowmesh::CandleInterval::M1;
+            QVERIFY(panel.candlesDue());
+        } else panel.m_snapshot->observed.reset();
+        const auto initial{*panel.m_snapshot};
+        const auto initial_market{*panel.market()};
+        const auto generation{panel.m_generation};
+        const auto read_generation{panel.m_selected_read_generation};
+        probe.mutation_response = CertifiedStatus(initial.market, 117);
+        probe.mutation_response.pushKV("account_id", initial.account.toStdString());
+        probe.mutation_response.pushKV("sequence", initial.account_sequence);
+        // This is a synthetic dispatch reply, not native certificate checking,
+        // signing or sending. A separately held full read is the only source
+        // allowed to update the post-command selected account and balances.
+        probe.successor_data = NewerRemoteData();
+        auto successor_snapshot{probe.successor_data["snapshot"]};
+        successor_snapshot.pushKV("next_microblock_sequence", 7);
+        successor_snapshot.pushKV("last_microblock_hash", H(118).GetHex());
+        probe.successor_data.pushKV("snapshot", successor_snapshot);
+        auto successor_account{probe.successor_data["account"]};
+        successor_account.pushKV("base_available", 1'500'000);
+        successor_account.pushKV("b3_available_atoms", 1'234'000'000);
+        probe.successor_data.pushKV("account", successor_account);
+        const auto successor{Parse(probe.successor_data)};
+        struct Cleanup {
+            SelectedReadCommandProbe& probe; B3FlowMeshTradingPanel& panel;
+            ~Cleanup()
+            {
+                panel.m_closing = true; panel.m_timer->stop(); panel.m_rearm->stop();
+                probe.read_release.release(8); probe.command_release.release(8); probe.successor_release.release(8);
+                panel.cancelAndWait();
+            }
+        } cleanup{probe, panel};
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
+        // Distinguish the original GUI receipt clock from the worker's later
+        // captured Data receipt without making a scheduling-speed assertion.
+        QTRY_VERIFY_WITH_TIMEOUT(panel.m_response_age.elapsed() > 1, 1000);
+        panel.startJob(); QVERIFY(probe.read_entered.tryAcquire(1, 1000));
+        QCOMPARE(probe.data_calls.load(), 1); QCOMPARE(probe.candle_calls.load(), candles ? 1 : 0);
+        QVERIFY(panel.m_selected_read_thread); QPointer<QThread> old_read{panel.m_selected_read_thread};
+        QVERIFY(old_read->isRunning());
+        B3FlowMeshTrading::Action action;
+        action.operation = B3FlowMeshTrading::Operation::Order; action.market = initial_market;
+        action.side = QStringLiteral("bid"); action.price = 1000; action.amount = 1'000'000;
+        action.display_decimals = 6; action.display_ticker = QStringLiteral("tUSD");
+        const auto expected{B3FlowMeshTrading::Parameters(action)};
+        panel.startJob(action); QTRY_COMPARE_WITH_TIMEOUT(probe.preflights.load(), 1, 1000);
+        const auto command{panel.m_active_result}; QVERIFY(command && command->action); QVERIFY(panel.m_busy);
+        probe.command_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 1000);
+        // Critical ordering: the real command completion ran before the old
+        // read is released, while its captured GUI head and identity stayed
+        // unchanged. Actor presence/head comparison alone cannot fence it.
+        QVERIFY(!panel.m_busy); QVERIFY(!panel.m_active_result); QVERIFY(old_read && old_read->isRunning());
+        QVERIFY(command->error.isEmpty()); QVERIFY(command->write_attempted);
+        QCOMPARE(probe.mutation_attempts.load(), 1); QCOMPARE(probe.preflights.load(), 1);
+        QVERIFY(panel.m_receipt && panel.m_receipt->Included()); QVERIFY(panel.m_receipt->no_resubmit);
+        QVERIFY(!panel.m_uncertain); QCOMPARE(panel.m_snapshot->head, initial.head);
+        QCOMPARE(panel.m_generation, generation); QCOMPARE(panel.m_selected_read_generation, read_generation);
+        QVERIFY(panel.m_selected_read_pending); // One value-only read requested by command completion.
+        const auto response_time{panel.m_response_age.msecsSinceReference()};
+        const auto certificate_time{panel.m_certificate_age.msecsSinceReference()};
+        const auto receipt_id{panel.m_receipt->action_id};
+        const auto initial_pending{panel.m_snapshot->pending_actions};
+        QVERIFY(!panel.m_read_failed); QCOMPARE(panel.m_read_failures, 0U);
+        {
+            std::lock_guard lock{probe.mutex}; QCOMPARE(probe.mutations.size(), size_t{1});
+            QCOMPARE(probe.mutations.front().first, std::string{"/wallet/"} + offline.model->getWalletName().toStdString());
+            QCOMPARE(probe.mutations.front().second.write(), expected.params.write());
+        }
+        probe.read_release.release(); QTRY_VERIFY_WITH_TIMEOUT(old_read.isNull(), 1000);
+        // Desired availability/safety: a pre-command completion is obsolete
+        // even after the command owner is gone. It cannot add stale backoff,
+        // publish an old account/book or renew an authority receipt clock.
+        QVERIFY2(!panel.m_read_failed, "A pre-command read failure poisoned the completed command's selected account");
+        QCOMPARE(panel.m_read_failures, 0U); QVERIFY(panel.m_read_error.isEmpty());
+        QCOMPARE(panel.m_snapshot->head, initial.head); QCOMPARE(panel.m_snapshot->account, initial.account);
+        QCOMPARE(panel.m_snapshot->base_available, initial.base_available);
+        QCOMPARE(panel.m_snapshot->b3_available, initial.b3_available);
+        QCOMPARE(panel.m_snapshot->pending_actions, initial_pending);
+        QCOMPARE(panel.market()->base_available, initial_market.base_available);
+        QCOMPARE(panel.market()->b3_available, initial_market.b3_available);
+        QCOMPARE(panel.m_response_age.msecsSinceReference(), response_time);
+        QCOMPARE(panel.m_certificate_age.msecsSinceReference(), certificate_time);
+        QCOMPARE(panel.m_receipt->action_id, receipt_id); QVERIFY(panel.m_receipt->Included());
+        QVERIFY(!panel.m_uncertain); QVERIFY(!panel.m_busy); QVERIFY(!panel.m_thread);
+        QTRY_COMPARE_WITH_TIMEOUT(probe.data_calls.load(), 2, 1000);
+        QVERIFY(probe.successor_entered.tryAcquire(1, 1000));
+        QVERIFY(panel.m_selected_read_thread); QVERIFY(!panel.m_selected_read_pending);
+        QCOMPARE(probe.mutation_attempts.load(), 1); // No economic replay/retry.
+        probe.successor_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_selected_read_thread, 1000);
+        QCOMPARE(panel.m_snapshot->head, successor.head);
+        QCOMPARE(panel.market()->base_available, successor.base_available);
+        QCOMPARE(panel.market()->b3_available, successor.b3_available);
+        QCOMPARE(panel.m_receipt->action_id, receipt_id); QVERIFY(panel.m_receipt->Included());
+        QCOMPARE(probe.data_calls.load(), 2); QCOMPARE(probe.mutation_attempts.load(), 1);
+        QCOMPARE(unlock.count(), 0); QVERIFY(!panel.m_unlock); QVERIFY(m_wallet->IsLocked());
+    }
 private Q_SLOTS:
     void initTestCase()
     {
@@ -948,6 +1316,253 @@ private Q_SLOTS:
     {
         QVERIFY(m_model->setWalletLocked(true));
         QVERIFY(m_wallet->IsLocked());
+    }
+
+    void selectedAccountReadCannotHoldForegroundCommand_data()
+    {
+        QTest::addColumn<bool>("join_policy_eligible"); QTest::addColumn<bool>("other_account");
+        QTest::newRow("eligible-pure-policy-old-head") << true << false;
+        QTest::newRow("expired-pure-policy-no-mutation") << false << false;
+        QTest::newRow("eligible-pure-policy-old-account") << true << true;
+    }
+    void selectedAccountReadCannotHoldForegroundCommand()
+    {
+        QFETCH(bool, join_policy_eligible); QFETCH(bool, other_account);
+        CheckSelectedReadCommandIsolation(false, join_policy_eligible, other_account);
+    }
+    void selectedCandlesReadCannotHoldForegroundCommand_data()
+    {
+        QTest::addColumn<bool>("join_policy_eligible");
+        QTest::newRow("eligible-pure-policy-old-head") << true;
+        QTest::newRow("expired-pure-policy-no-mutation") << false;
+    }
+    void selectedCandlesReadCannotHoldForegroundCommand()
+    {
+        QFETCH(bool, join_policy_eligible);
+        CheckSelectedReadCommandIsolation(true, join_policy_eligible);
+    }
+
+    void selectedReadFailureAfterCompletedCommandCannotPoisonItsObservation()
+    {
+        CheckSelectedReadLateAfterCompletedCommand(false);
+    }
+
+    void selectedReadSuccessDelayedByCandlesCannotPublishAcrossCompletedCommand()
+    {
+        CheckSelectedReadLateAfterCompletedCommand(true);
+    }
+
+    void selectedReadHasOneOwnerOneCoalescedScopeAndPrivateCancellation()
+    {
+        auto offline{MakeOfflineWallet("qt-read-coalescing")};
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel, *offline.model, offline.wallet);
+        Observe(panel, Parse(RemoteDataWithTimes())); panel.m_snapshot->observed.reset();
+        panel.m_timer->stop(); panel.m_rearm->stop();
+        SelectedReadCommandProbe probe{false, true};
+        probe.data = RemoteData(); // Keep this count/cancel fixture candle-free.
+        struct Cleanup {
+            SelectedReadCommandProbe& probe; B3FlowMeshTradingPanel& panel;
+            ~Cleanup() { panel.m_closing = true; probe.read_release.release(8); probe.command_release.release(8); panel.cancelAndWait(); }
+        } cleanup{probe, panel};
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
+        panel.startJob(); QVERIFY(probe.read_entered.tryAcquire(1, 1000));
+        QVERIFY(panel.m_selected_read_thread); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result);
+        const auto cancel{panel.m_selected_read_result->cancel};
+        for (int n{0}; n < 64; ++n) panel.startJob();
+        QCOMPARE(probe.data_calls.load(), 1); QVERIFY(panel.m_selected_read_pending);
+        QVERIFY(!panel.m_busy); QVERIFY(!cancel->load());
+        probe.read_release.release();
+        QTRY_COMPARE_WITH_TIMEOUT(probe.data_calls.load(), 2, 1000);
+        QVERIFY(probe.read_entered.tryAcquire(1, 1000));
+        QVERIFY(panel.m_selected_read_thread); QVERIFY(!panel.m_selected_read_pending);
+        probe.read_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_selected_read_thread, 1000);
+        QCoreApplication::processEvents(); QCOMPARE(probe.data_calls.load(), 2);
+        panel.startJob(); QVERIFY(probe.read_entered.tryAcquire(1, 1000));
+        const auto retired{panel.m_selected_read_result->cancel};
+        const auto response_time{panel.m_response_age.msecsSinceReference()};
+        panel.stopSelectedReadWorker(false);
+        QVERIFY(retired->load());
+        panel.m_cancel->store(false); // Command ownership cannot revive this read.
+        QVERIFY(retired->load());
+        probe.read_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_selected_read_thread, 1000);
+        QCOMPARE(panel.m_response_age.msecsSinceReference(), response_time);
+        QCOMPARE(probe.data_calls.load(), 3); QCOMPARE(probe.preflights.load(), 0); QCOMPARE(probe.mutation_attempts.load(), 0);
+    }
+
+    void selectedReadUncertainRefreshRequiresCurrentFullIdleIdentity_data()
+    {
+        QTest::addColumn<int>("condition"); QTest::addColumn<bool>("acknowledge");
+        QTest::newRow("current-full-idle-proof") << 0 << true;
+        QTest::newRow("busy-display-only") << 1 << false;
+        QTest::newRow("superseded-head") << 2 << false;
+        QTest::newRow("new-uncertain-instruction") << 3 << false;
+        QTest::newRow("unchanged-account-omission") << 4 << false;
+        QTest::newRow("different-uncertain-account") << 5 << false;
+    }
+
+    void selectedReadWalletSwitchDrainsWithoutOwningTheOldBackend()
+    {
+        auto original{MakeOfflineWallet("qt-value-read-original")};
+        auto replacement{MakeOfflineWallet("qt-value-read-replacement")};
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel, *original.model, original.wallet);
+        Observe(panel, Parse(RemoteData())); panel.m_timer->stop(); panel.m_rearm->stop();
+        SelectedReadCommandProbe probe{false, true}; probe.data = RemoteData();
+        struct Cleanup {
+            SelectedReadCommandProbe& probe; B3FlowMeshTradingPanel& panel;
+            ~Cleanup() { panel.m_closing = true; probe.read_release.release(8); probe.command_release.release(8); panel.cancelAndWait(); }
+        } cleanup{probe, panel};
+        const std::weak_ptr<interfaces::Wallet> backend{panel.m_backend};
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
+        panel.startJob(); QVERIFY(probe.read_entered.tryAcquire(1, 1000));
+        const auto old_scope{panel.m_selected_read_result->scope};
+        const auto cancelled{panel.m_selected_read_result->cancel};
+        QElapsedTimer switched; switched.start(); panel.cancelAndWait();
+        QVERIFY(switched.elapsed() < 1000); QVERIFY(panel.m_selected_read_thread);
+        QVERIFY(cancelled->load()); QVERIFY(backend.expired());
+        AttachOfflineWallet(panel, *replacement.model, replacement.wallet);
+        Observe(panel, Parse(NewerRemoteData())); panel.m_certificate_age.start();
+        const auto head{panel.m_snapshot->head}; const auto age{panel.m_response_age.msecsSinceReference()};
+        const auto certified{panel.m_certificate_age.msecsSinceReference()};
+        QVERIFY(!panel.selectedReadScopeValid(old_scope)); QVERIFY(cancelled->load());
+        probe.read_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_selected_read_thread, 1000);
+        QCOMPARE(panel.m_snapshot->head, head); QCOMPARE(panel.m_response_age.msecsSinceReference(), age);
+        QCOMPARE(panel.m_certificate_age.msecsSinceReference(), certified);
+        QCOMPARE(panel.m_wallet.data(), replacement.model.get()); QVERIFY(!panel.m_read_failed);
+        QCOMPARE(probe.data_calls.load(), 1); QCOMPARE(probe.mutation_attempts.load(), 0);
+    }
+
+    void selectedReviewHandoffRejectsSupersessionCancellationAndCommandOwner_data()
+    {
+        QTest::addColumn<int>("condition");
+        QTest::newRow("newer-head-consumes-review") << 0;
+        QTest::newRow("actual-command-keeps-its-owner") << 1;
+        QTest::newRow("private-cancellation-consumes-review") << 2;
+    }
+    void selectedReadPanelCloseJoinsItsOutstandingValueActor()
+    {
+        auto offline{MakeOfflineWallet("qt-value-read-close")};
+        SelectedReadCommandProbe probe{false, true}; probe.data = RemoteData();
+        auto panel{std::make_unique<B3FlowMeshTradingPanel>()};
+        AttachOfflineWallet(*panel, *offline.model, offline.wallet); Observe(*panel, Parse(RemoteData()));
+        struct Cleanup {
+            SelectedReadCommandProbe& probe; std::unique_ptr<B3FlowMeshTradingPanel>& panel;
+            ~Cleanup() { probe.read_release.release(8); if (panel) { panel->m_closing = true; panel->cancelAndWait(); } }
+        } cleanup{probe, panel};
+        panel->m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel->m_catalog_age.start();
+        panel->startJob(); QVERIFY(probe.read_entered.tryAcquire(1, 1000));
+        QVERIFY(panel->m_selected_read_thread); QVERIFY(panel->m_selected_read_thread->isRunning());
+        std::thread release{[&] { std::this_thread::sleep_for(std::chrono::milliseconds{300}); probe.read_release.release(); }};
+        struct Join { std::thread& thread; ~Join() { if (thread.joinable()) thread.join(); } } join{release};
+        QElapsedTimer closing; closing.start(); panel.reset();
+        QVERIFY(closing.elapsed() >= 250); // Destruction did not leave a live actor behind.
+        QCOMPARE(probe.data_calls.load(), 1); QCOMPARE(probe.mutation_attempts.load(), 0);
+    }
+    void selectedReviewHandoffRejectsSupersessionCancellationAndCommandOwner()
+    {
+        QFETCH(int, condition);
+        auto offline{MakeOfflineWallet("qt-exact-read-review-handoff")};
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel, *offline.model, offline.wallet);
+        Observe(panel, Parse(RemoteData())); panel.m_timer->stop(); panel.m_rearm->stop();
+        SelectedReadCommandProbe probe{false, true}; probe.data = RemoteData();
+        struct Cleanup {
+            SelectedReadCommandProbe& probe; B3FlowMeshTradingPanel& panel;
+            ~Cleanup() { panel.m_closing = true; probe.read_release.release(8); probe.command_release.release(8); panel.cancelAndWait(); }
+        } cleanup{probe, panel};
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
+        panel.m_price->setText(QStringLiteral("0.5")); panel.m_quantity->setText(QStringLiteral("1.25"));
+        bool opened{false}; QTimer reject_review;
+        connect(&reject_review, &QTimer::timeout, &panel, [&] {
+            if (panel.m_confirmation) { opened = true; panel.m_confirmation->done(QMessageBox::Cancel); }
+        }); reject_review.start(1);
+        panel.startJob(); QVERIFY(probe.read_entered.tryAcquire(1, 1000));
+        panel.m_order->click();
+        QVERIFY(panel.m_deferred_review); QVERIFY(panel.m_busy);
+        QCOMPARE(panel.m_selected_read_review.lock(), panel.m_selected_read_result);
+        std::shared_ptr<B3FlowMeshTradingPanel::Result> command;
+        if (condition == 0) Observe(panel, Parse(NewerRemoteData()));
+        if (condition == 1) {
+            // Real command dispatcher, synthetic prior approval and the same
+            // offline mutation trap as the unchanged BEFORE controls.
+            B3FlowMeshTrading::Action action; action.operation = B3FlowMeshTrading::Operation::Order;
+            action.market = *panel.market(); action.side = QStringLiteral("bid"); action.price = 1000; action.amount = 1'000'000;
+            action.display_decimals = 6; action.display_ticker = QStringLiteral("tUSD");
+            panel.startJob(action); QTRY_COMPARE_WITH_TIMEOUT(probe.preflights.load(), 1, 1000);
+            command = panel.m_active_result; QVERIFY(command && command->action);
+            QVERIFY(panel.m_selected_read_review.expired()); QVERIFY(!panel.m_deferred_review);
+        }
+        if (condition == 2) panel.stopSelectedReadWorker(false);
+        const auto head{panel.m_snapshot->head}; const auto received{panel.m_response_age.msecsSinceReference()};
+        const auto certified{panel.m_certificate_age.msecsSinceReference()};
+        probe.read_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_selected_read_thread, 1000);
+        QCOMPARE(panel.m_snapshot->head, head); QCOMPARE(panel.m_response_age.msecsSinceReference(), received);
+        QCOMPARE(panel.m_certificate_age.msecsSinceReference(), certified);
+        QVERIFY(!opened); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_deferred_review);
+        QCOMPARE(probe.data_calls.load(), 1); QCOMPARE(probe.mutation_attempts.load(), 0);
+        if (condition == 1) {
+            QVERIFY(panel.m_busy); QCOMPARE(panel.m_active_result, command); QVERIFY(!panel.m_cancel->load());
+            probe.command_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 1000);
+            QCOMPARE(probe.mutation_attempts.load(), 1); QVERIFY(command->write_attempted);
+            QVERIFY(command->error.contains(QStringLiteral("Offline mutation trap")));
+        } else { QVERIFY(!panel.m_busy); QCOMPARE(probe.preflights.load(), 0); }
+        reject_review.stop();
+    }
+
+    void coalescedSelectedReadsDoNotStarveTrackedReceiptMaintenance()
+    {
+        FundingReadProbe probe; probe.hold = true;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        struct Cleanup {
+            FundingReadProbe& probe; B3FlowMeshTradingPanel& panel;
+            ~Cleanup() { panel.m_closing = true; probe.release.release(8); probe.auxiliary_release.release(8); panel.cancelAndWait(); }
+        } cleanup{probe, panel};
+        panel.m_timer->stop(); panel.m_rearm->stop();
+        TrackUnknown(panel); panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(probe.entered.available() > 0, 1000); QVERIFY(probe.entered.tryAcquire());
+        QCOMPARE(probe.receipts.load(), 1); QCOMPARE(probe.snapshots.load(), 1);
+        QVERIFY(panel.m_selected_read_thread); QVERIFY(!panel.m_thread);
+        for (int n{0}; n < 64; ++n) panel.startJob();
+        QVERIFY(panel.m_selected_read_pending); QCOMPARE(probe.receipts.load(), 1);
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(probe.entered.available() > 0, 1000); QVERIFY(probe.entered.tryAcquire());
+        QCOMPARE(probe.receipts.load(), 2); QCOMPARE(probe.snapshots.load(), 2);
+        QVERIFY(panel.m_selected_read_thread); QVERIFY(!panel.m_selected_read_pending);
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_selected_read_thread && !panel.m_thread, 1000);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+
+    void selectedReadUncertainRefreshRequiresCurrentFullIdleIdentity()
+    {
+        QFETCH(int, condition); QFETCH(bool, acknowledge);
+        auto offline{MakeOfflineWallet("qt-read-uncertain-identity")};
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel, *offline.model, offline.wallet);
+        Observe(panel, Parse(RemoteDataWithTimes())); panel.m_snapshot->observed.reset();
+        panel.m_timer->stop(); panel.m_rearm->stop();
+        panel.m_certificate_age.start();
+        panel.m_uncertain = true; panel.m_uncertain_refreshed = false; panel.m_uncertain_wallet = panel.m_wallet;
+        panel.m_uncertain_market = panel.m_snapshot->market; panel.m_uncertain_account = panel.m_snapshot->account;
+        panel.m_uncertain_action_id = QString::fromStdString(H(115).GetHex());
+        if (condition == 5) panel.m_uncertain_account = QString::fromStdString(H(116).GetHex());
+        SelectedReadCommandProbe probe{false, true};
+        probe.data = RemoteData();
+        if (condition == 4) probe.data.pushKV("unchanged", true);
+        struct Cleanup {
+            SelectedReadCommandProbe& probe; B3FlowMeshTradingPanel& panel;
+            ~Cleanup() { panel.m_closing = true; probe.read_release.release(8); probe.command_release.release(8); panel.cancelAndWait(); }
+        } cleanup{probe, panel};
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
+        panel.startJob(); QVERIFY(probe.read_entered.tryAcquire(1, 1000));
+        if (condition == 1) panel.m_busy = true;
+        if (condition == 2) Observe(panel, Parse(NewerRemoteData()));
+        if (condition == 3) { ++panel.m_uncertain_generation; panel.m_uncertain_action_id = QString::fromStdString(H(117).GetHex()); }
+        const auto response_time{panel.m_response_age.msecsSinceReference()};
+        const auto certificate_time{panel.m_certificate_age.msecsSinceReference()};
+        probe.read_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_selected_read_thread, 1000);
+        QCOMPARE(panel.m_uncertain_refreshed, acknowledge);
+        QVERIFY(panel.m_uncertain); // A read never acknowledges or clears the warning itself.
+        if (condition == 1 || condition == 2) {
+            QCOMPARE(panel.m_response_age.msecsSinceReference(), response_time);
+            QCOMPARE(panel.m_certificate_age.msecsSinceReference(), certificate_time);
+        }
+        QCOMPARE(probe.preflights.load(), 0); QCOMPARE(probe.mutation_attempts.load(), 0);
     }
 
     void tokenUnitsAreExactAndReadable()
@@ -2125,7 +2740,7 @@ private Q_SLOTS:
         Q_EMIT combo->activated(step);
         // Until then the other grouping's levels are not shown as these.
         QVERIFY(!panel.m_order_book->showsVerifiedLevels());
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QVERIFY(!probe.market_options.empty());
         const auto asked{probe.market_options.back()["levels"]};
         QCOMPARE(asked["group"]["orientation"].get_str(), std::string{"canonical"});
@@ -3611,7 +4226,7 @@ private Q_SLOTS:
             {CandleJson(OBSERVED_T0, 1, 1, 1000, 1000, 1000, 1000, 250'000), CandleJson(OBSERVED_T0 + 60'000, 2, 2, 1000, 1000, 1000, 1000, 250'000)});
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         panel.m_candle_interval = flowmesh::CandleInterval::M1;
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.market_options.size(), size_t{1});
         QVERIFY(probe.market_options[0]["observed_time"].isTrue());
         // Nothing observed was displayed before that read: no candles yet.
@@ -3619,13 +4234,13 @@ private Q_SLOTS:
         QVERIFY(panel.m_snapshot->observed && panel.m_snapshot->observed->available);
         QCOMPARE(panel.m_tick_times.size(), size_t{2});
         // The next job reads a whole window.
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.candle_options.size(), size_t{1});
         QCOMPARE(probe.candle_options[0]["interval"].get_str(), std::string{"1m"});
         QCOMPARE(probe.candle_options[0]["limit"].getInt<int>(), 300);
         QVERIFY(panel.m_candles && panel.m_candles->available); QCOMPARE(panel.m_candles->candles.size(), size_t{2});
         // Within ten seconds nothing more; afterwards only the newest few.
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.candle_options.size(), size_t{1});
         QVERIFY(!panel.candlesDue());
         // A page of the newest intervals replaces only what the window held there.
@@ -3649,7 +4264,7 @@ private Q_SLOTS:
         QVERIFY(due); QCOMPARE(due->second, size_t{300});
         // A failed candles read never fails the job or the market read.
         probe.candles_response = UniValue{};
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QVERIFY(!panel.m_read_failed);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
@@ -3666,12 +4281,12 @@ private Q_SLOTS:
         QVERIFY(panel.candlesDue());
         panel.startJob(std::nullopt, std::nullopt, false, false, std::nullopt, {}, /*foreground_read=*/true);
         QVERIFY(panel.m_active_result && !panel.m_active_result->passive && panel.m_active_result->foreground_read);
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         // The review's market read ran, without a candles read.
         QCOMPARE(probe.market_options.size(), size_t{1});
         QVERIFY(probe.candle_options.empty());
         QVERIFY(panel.candlesDue());
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.candle_options.size(), size_t{1});
         QCOMPARE(probe.candle_options[0]["limit"].getInt<int>(), 300);
         QVERIFY(panel.m_candles && panel.m_candles->available);
@@ -3692,7 +4307,7 @@ private Q_SLOTS:
         panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
         // No page held: the window is due, so this tick reads it.
         QVERIFY(panel.candlesDue()); QVERIFY(!panel.liveSkipsPoll());
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.candle_options.size(), size_t{1});
         QVERIFY(!panel.m_read_failed);
         // Failed: not due again for 2 s; meanwhile live updates supply the read.
@@ -3709,7 +4324,7 @@ private Q_SLOTS:
         // waits twice as long.
         panel.m_candles_failure->retry_at = panel.m_watch_clock.elapsed();
         QVERIFY(panel.candlesDue()); QCOMPARE(panel.candlesDue()->second, size_t{300});
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.candle_options.size(), size_t{2});
         QCOMPARE(panel.m_candles_failure->failures, 2);
         QVERIFY(panel.m_candles_failure->retry_at - panel.m_watch_clock.elapsed() > 3500);
@@ -3724,7 +4339,7 @@ private Q_SLOTS:
         probe.candles_response = CandlesJson("1m", 60'000, OBSERVED_T0 + 120'000, 300,
             {CandleJson(OBSERVED_T0, 1, 1, 1000, 1000, 1000, 1000, 250'000), CandleJson(OBSERVED_T0 + 60'000, 2, 2, 1000, 1000, 1000, 1000, 250'000)});
         panel.m_candles_failure->retry_at = panel.m_watch_clock.elapsed();
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.candle_options.size(), size_t{3});
         QVERIFY(panel.m_candles && panel.m_candles->available);
         QVERIFY(!panel.m_candles_failure);
@@ -4491,7 +5106,7 @@ private Q_SLOTS:
         FundingReadProbe probe; probe.live_ms = 0;
         probe.data = RemoteData(); probe.data.pushKV("book_levels", LevelsJson(Parse(RemoteData()).curves, H(4)));
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.market_options.size(), size_t{1});
         const auto first{probe.market_options[0]["levels"]};
         QCOMPARE(first["depth"].getInt<int>(), 50);
@@ -4500,7 +5115,7 @@ private Q_SLOTS:
         QVERIFY(first["include_unchanged"].isTrue());
         QVERIFY(panel.m_snapshot->levels && panel.m_snapshot->levels->available);
         // Held for this head in this grouping: an unchanged read computes nothing.
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.market_options.size(), size_t{2});
         QVERIFY(!probe.market_options[1]["levels"].exists("include_unchanged"));
         // The indicative for the ticket's draft is its own section: the book
@@ -4515,7 +5130,7 @@ private Q_SLOTS:
         // Nothing held yet; the ticket's order awaits its first read.
         QVERIFY(panel.m_clearing_strip->isHidden());
         QVERIFY(panel.m_indicative->text().contains(QStringLiteral("updating")));
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.market_options.size(), size_t{1});
         const auto first{probe.market_options[0]};
         QVERIFY(first["ticks"].isObject() && !first["ticks"].exists("after_sequence"));
@@ -4534,7 +5149,7 @@ private Q_SLOTS:
         // The chart draws the held ticks.
         QCOMPARE(panel.m_chart->candles().size(), size_t{1});
         // The next read asks only for the ticks after the last one held.
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.market_options.size(), size_t{2});
         QCOMPARE(probe.market_options[1]["ticks"]["after_sequence"].getInt<int>(), 2);
         // Another order in the ticket: its what-if is not claimed until read.
@@ -4543,7 +5158,7 @@ private Q_SLOTS:
         // Without an order nothing is shown, and reads ask for no indicative.
         panel.m_price->clear(); panel.updateTicket();
         QVERIFY(panel.m_indicative->isHidden());
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.market_options.size(), size_t{3});
         QVERIFY(!probe.market_options[2].exists("indicative")); QVERIFY(probe.market_options[2].exists("ticks"));
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
@@ -4713,7 +5328,7 @@ private Q_SLOTS:
         panel.requestConnect(); QCOMPARE(probe.count.load(), 1); // Coalesced while running.
         panel.m_endpoint->setText(QStringLiteral("https://still-typing.invalid"));
         panel.m_endpoint->setCursorPosition(8); const int cursor{panel.m_endpoint->cursorPosition()};
-        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.count.load(), 1); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
         QVERIFY(!active->write_attempted); QVERIFY(!panel.m_uncertain); QVERIFY(!panel.m_confirmation);
         QCOMPARE(panel.m_endpoint->text(), QStringLiteral("https://still-typing.invalid"));
@@ -4740,7 +5355,7 @@ private Q_SLOTS:
         auto failed{std::make_shared<B3FlowMeshTradingPanel::Result>()}; failed->error = QStringLiteral("Synthetic passive read failed");
         panel.finishJob(failed); QVERIFY(probe.entered.tryAcquire(1, 1000));
         QVERIFY(!panel.m_deferred_connect); QCOMPARE(panel.m_active_result->connect_url, QStringLiteral("https://queued.invalid"));
-        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.count.load(), 1); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
         QCOMPARE(panel.m_endpoint->text(), QStringLiteral("https://edited-after-click.invalid"));
     }
@@ -4751,7 +5366,7 @@ private Q_SLOTS:
         struct Cleanup { ConnectionProbe& probe; B3FlowMeshTradingPanel& panel; ~Cleanup() { probe.release.release(8); panel.cancelAndWait(); } } cleanup{probe, panel};
         panel.m_client_info = ConnectionInfo(); panel.m_endpoint->setText(QStringLiteral("https://rejected.invalid")); panel.updateControls();
         panel.m_connect->click(); QVERIFY(probe.entered.tryAcquire(1, 1000));
-        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QVERIFY(panel.m_client_info); QVERIFY(panel.m_connection_error.isEmpty());
         QCOMPARE(panel.m_connect_error, QStringLiteral("Synthetic endpoint configuration rejected"));
         panel.updateMarketText(); QVERIFY(panel.m_connection_status->text().contains(panel.m_connect_error));
@@ -5647,7 +6262,7 @@ private Q_SLOTS:
         for (int i{0}; i < 10; ++i) panel.m_check_receipt->click();
         QVERIFY(panel.m_deferred_status); QCOMPARE(panel.m_thread, worker);
         probe.auxiliary_release.release();
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.receipts.load(), 1);
         QCOMPARE(probe.snapshots.load(), 0); // The queued explicit read goes next.
         QCOMPARE(panel.m_response_age.msecsSinceReference(), age);
@@ -5679,7 +6294,7 @@ private Q_SLOTS:
         for (unsigned i{0}; i < B3FlowMeshTradingPanel::MAX_REFRESH_YIELDS; ++i) {
             panel.startJob(); QVERIFY(probe.auxiliary_entered.tryAcquire(1, 2000)); QCoreApplication::processEvents();
             SavedReadFixture(panel); panel.m_check_receipt->click(); QVERIFY(panel.m_yield_refresh->load());
-            probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
             QCOMPARE(panel.m_refresh_yields, i + 1); QCOMPARE(panel.m_refresh_phase, Phase::Catalog);
             QCOMPARE(probe.snapshots.load(), 0); QCOMPARE(probe.receipts.load(), static_cast<int>(i + 1));
             QCOMPARE(panel.m_response_age.msecsSinceReference(), age);
@@ -5690,7 +6305,7 @@ private Q_SLOTS:
         SavedReadFixture(panel);
         for (int i{0}; i < 10; ++i) panel.m_check_receipt->click();
         QVERIFY(panel.m_deferred_status); QVERIFY(!panel.m_yield_refresh->load());
-        probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(panel.m_refresh_phase, Phase::Status);
         QCOMPARE(panel.m_refresh_yields, 0U);
         QCOMPARE(probe.receipts.load(), static_cast<int>(B3FlowMeshTradingPanel::MAX_REFRESH_YIELDS + 1));
@@ -5698,7 +6313,7 @@ private Q_SLOTS:
         probe.held_method = "getflowmeshbalance";
         panel.startJob(); QVERIFY(probe.auxiliary_entered.tryAcquire(1, 2000)); QCoreApplication::processEvents();
         SavedReadFixture(panel); panel.m_check_receipt->click(); QVERIFY(panel.m_yield_refresh->load());
-        probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(panel.m_refresh_phase, Phase::Status); QCOMPARE(panel.m_refresh_yields, 1U);
         QCOMPARE(probe.writes.load(), 0); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
     }
@@ -5719,7 +6334,7 @@ private Q_SLOTS:
         review_guard.start(1);
         panel.startJob(); QVERIFY(probe.auxiliary_entered.tryAcquire(1, 2000)); QCoreApplication::processEvents();
         const auto passive{panel.m_active_result}; panel.m_order->click(); QVERIFY(panel.m_yield_refresh->load());
-        probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); review_guard.stop();
+        probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000); review_guard.stop();
         // RPC_MISC_ERROR triggers ReadEffectsForRefresh's snapshot fallback.
         // Yield is cached by snapshot_rpc, but cannot mask that original error.
         QVERIFY(!passive->refresh_yielded); QVERIFY(!passive->write_attempted); QVERIFY(panel.m_read_failed);
@@ -5762,7 +6377,7 @@ private Q_SLOTS:
         if (change_selection) QVERIFY(panel.m_receipt_error.isEmpty());
         else QVERIFY(panel.m_receipt_error.contains(QStringLiteral("Synthetic saved status unavailable")));
         QCOMPARE(panel.m_response_age.msecsSinceReference(), age); QCOMPARE(probe.snapshots.load(), 0);
-        probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.receipts.load(), 2); QCOMPARE(probe.writes.load(), 0); QVERIFY(!passive->write_attempted);
         QCOMPARE(panel.m_saved_actions.actions[0].signed_bytes_sha256, saved.actions[0].signed_bytes_sha256);
         QVERIFY(panel.m_saved_actions.actions[0].receipt.no_resubmit); QVERIFY(m_wallet->IsLocked());
@@ -5806,7 +6421,7 @@ private Q_SLOTS:
         QVERIFY(panel.m_yield_refresh->load()); QVERIFY(review.isEmpty()); QCOMPARE(probe.snapshots.load(), 0);
         probe.auxiliary_release.release();
         if (auxiliary_failed) {
-            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); review_guard.stop();
+            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000); review_guard.stop();
             QVERIFY(!passive->refresh_yielded); QVERIFY(!passive->write_attempted);
             QVERIFY(panel.m_read_failed); QVERIFY(panel.m_read_error.contains(QStringLiteral("Synthetic auxiliary failed")));
             QVERIFY(review.isEmpty()); QVERIFY(!panel.m_deferred_review); QVERIFY(!panel.m_confirmation);
@@ -5822,7 +6437,7 @@ private Q_SLOTS:
         QVERIFY(panel.m_active_result != passive); QVERIFY(review.isEmpty());
         QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(panel.m_response_age.msecsSinceReference(), observed);
         QCOMPARE(unlock.count(), 0); QCOMPARE(probe.writes.load(), 0);
-        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); review_guard.stop();
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000); review_guard.stop();
         QVERIFY2(review.contains(QStringLiteral("Account sequence: 9")), qPrintable(panel.m_log->toPlainText()));
         QVERIFY(review.contains(QStringLiteral("1.25 tUSD"))); QVERIFY(review.contains(QStringLiteral("at 0.5 B3 / tUSD")));
         QCOMPARE(panel.m_refresh_phase, phases[phase_index]); // Preflight does not consume auxiliary maintenance.
@@ -5850,7 +6465,7 @@ private Q_SLOTS:
         panel.m_check_receipt->click(); QVERIFY(panel.m_deferred_status); QVERIFY(panel.m_yield_refresh->load());
         panel.m_saved_selector->setCurrentIndex(1); const auto second_card{panel.m_receipt_card->text()};
         QCOMPARE(panel.m_receipt->action_id, second.receipt.action_id); QVERIFY(!panel.m_deferred_status);
-        probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.auxiliary_release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(panel.m_receipt_card->text(), second_card); QCOMPARE(panel.m_receipt->action_id, second.receipt.action_id);
         QCOMPARE(panel.m_response_age.msecsSinceReference(), observed);
         QCOMPARE(probe.receipts.load(), 0); QCOMPARE(probe.snapshots.load(), 0); QCOMPARE(probe.writes.load(), 0);
@@ -5968,7 +6583,7 @@ private Q_SLOTS:
             QCOMPARE(probe.requests[0].second[0].get_str(), saved.actions[0].market.toStdString());
             QCOMPARE(probe.requests[0].second[1].get_str(), saved.actions[0].receipt.action_id.toStdString());
         }
-        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.count.load(), 1); QVERIFY(!active->write_attempted);
         QCOMPARE(panel.m_receipt->account, saved.account); QVERIFY(panel.m_receipt->no_resubmit);
         QCOMPARE(panel.m_saved_actions.actions[0].sequence, saved.actions[0].sequence);
@@ -6044,7 +6659,7 @@ private Q_SLOTS:
         if (!failure && !wrong_account) {
             QVERIFY(first_result->receipt); QCOMPARE(first_result->receipt->account, saved.account);
         } else QVERIFY(!first_result->receipt);
-        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.count.load(), 2); QVERIFY(!first_result->write_attempted); QVERIFY(!second_result->write_attempted);
         QCOMPARE(panel.m_receipt->market, second.market); QVERIFY(panel.m_receipt->no_resubmit);
         QCOMPARE(panel.m_saved_actions.actions[0].signed_bytes_sha256, saved.actions[0].signed_bytes_sha256);
@@ -6089,7 +6704,7 @@ private Q_SLOTS:
             // Terminal, verified already, or no transport to wait on: only
             // the ordinary refresh, and no second request for the receipt.
             QVERIFY(!panel.m_active_result || !panel.m_active_result->receipt_wait);
-            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
             QCOMPARE(probe.count.load(), 0);
             return;
         }
@@ -6107,7 +6722,7 @@ private Q_SLOTS:
         }
         probe.release.release();
         // The ordinary refresh follows; it has no saved-action source here.
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 3000);
         QCOMPARE(probe.count.load(), 1); QVERIFY(!waited->write_attempted);
         QVERIFY(panel.m_receipt); QCOMPARE(panel.m_receipt->action_id, receipt.action_id);
         QCOMPARE(panel.m_receipt->account, action.market.account);
@@ -6241,17 +6856,24 @@ private Q_SLOTS:
         const bool reuse{outcome == 0 && !inverse && buy};
         if (reuse) { panel.startJob(); QVERIFY(probe.entered.tryAcquire(1, 2000)); }
         QVERIFY(panel.m_order->isEnabled()); panel.m_order->click();
-        QVERIFY(panel.m_thread); QVERIFY(panel.m_deferred_review && panel.m_deferred_review->order_context);
+        if (reuse) {
+            QVERIFY(panel.m_selected_read_thread); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result);
+            QCOMPARE(panel.m_selected_read_review.lock(), panel.m_selected_read_result);
+        } else { QVERIFY(panel.m_thread); }
+        QVERIFY(panel.m_deferred_review && panel.m_deferred_review->order_context);
         QVERIFY(!panel.m_deferred_review->order_context->needs_market_read);
-        QVERIFY(panel.m_active_result && !panel.m_active_result->action && !panel.m_active_result->write_attempted);
+        const auto result{reuse ? std::shared_ptr<B3FlowMeshTradingPanel::Result>{panel.m_selected_read_result, &panel.m_selected_read_result->data} : panel.m_active_result};
+        QVERIFY(result && !result->action && !result->write_attempted);
         QVERIFY(!panel.m_price->isEnabled()); QVERIFY(!panel.m_quantity->isEnabled()); QVERIFY(!panel.m_orientation->isEnabled());
-        const auto result{panel.m_active_result}; panel.m_order->click(); panel.requestOrderReview(); // Coalesce, never replace the intent.
-        QCOMPARE(panel.m_active_result, result); QCOMPARE(unlock.count(), 0); QCOMPARE(probe.writes.load(), 0);
+        panel.m_order->click(); panel.requestOrderReview(); // Coalesce, never replace the intent.
+        if (reuse) QCOMPARE(panel.m_selected_read_review.lock(), panel.m_selected_read_result);
+        else QCOMPARE(panel.m_active_result, result);
+        QCOMPARE(unlock.count(), 0); QCOMPARE(probe.writes.load(), 0);
         QVERIFY(review.isEmpty()); QVERIFY(!panel.m_unlock);
         if (!reuse) QVERIFY(probe.entered.tryAcquire(1, 2000));
         probe.release.release();
         if (outcome == 5) { QVERIFY(panel.m_thread->wait(2000)); QTest::qSleep(3050); }
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); review_guard.stop();
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000); review_guard.stop();
         QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.catalogs.load(), 0);
         QCOMPARE(!review.isEmpty(), outcome == 0); QCOMPARE(cancel_default, outcome == 0);
         if (outcome == 0) {
@@ -6314,7 +6936,7 @@ private Q_SLOTS:
         QVERIFY(!reviewed); QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(unlock.count(), 0); QCOMPARE(probe.writes.load(), 0);
         probe.release.release();
         if (outcome == 2) panel.setWalletModel(nullptr);
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); review_guard.stop();
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000); review_guard.stop();
         QVERIFY2(reviewed == (outcome == 0), qPrintable(panel.m_log->toPlainText())); QCOMPARE(probe.receipts.load(), 1); QCOMPARE(probe.snapshots.load(), 1);
         if (outcome != 2) {
             QCOMPARE(panel.m_saved_actions.actions.size(), saved.actions.size());
@@ -6474,7 +7096,7 @@ private Q_SLOTS:
             else panel.m_withdrawal_draft_amount = QStringLiteral("2");
             probe.release.release();
         }
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); review_guard.stop();
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000); review_guard.stop();
         const bool success{outcome == 2 || outcome == 5};
         QCOMPARE(reviewed, success); QCOMPARE(cancel_default, success); QCOMPARE(exact_destination, success);
         QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.writes.load(), 0); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
@@ -6515,7 +7137,7 @@ private Q_SLOTS:
         FundingReadProbe probe;
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         for (int phase{0}; phase < 4; ++phase) {
-            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
             QVERIFY2(!panel.m_read_failed, qPrintable(panel.m_read_error));
             QCOMPARE(probe.snapshots.load(), phase + 1);
             QCOMPARE(probe.catalogs.load(), 1);
@@ -6538,7 +7160,7 @@ private Q_SLOTS:
                 QVERIFY(probe.auxiliary_entered.tryAcquire(1, 2000)); QCOMPARE(probe.snapshots.load(), 0);
                 probe.auxiliary_release.release();
             }
-            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
             std::vector<std::string> remote;
             for (const auto& method : probe.methods) if (method != "getflowmeshclientinfo" && method != "listflowmeshactions") remote.push_back(method);
             const std::array<const char*, 4> expected{"listflowmeshmarkets", "getflowmeshbalance", "listflowmeshvaultoperations", "getflowmeshactionstatus"};
@@ -6562,7 +7184,7 @@ private Q_SLOTS:
                 panel.m_uncertain_action_id = QString::fromStdString(H(95).GetHex());
                 panel.m_uncertain_market = panel.m_snapshot->market; panel.m_uncertain_account = panel.m_snapshot->account;
             }
-            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
             // The later, full selected-account proof is fresh independently of
             // the failed operator-status read. Neither result invents a fill.
             QVERIFY2(!panel.m_read_failed, qPrintable(panel.m_read_error));
@@ -6617,7 +7239,7 @@ private Q_SLOTS:
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Status;
         const auto observed{panel.m_response_age.msecsSinceReference()}; const auto head{panel.m_snapshot->head};
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QVERIFY(panel.m_read_failed); QVERIFY(!panel.orderReady());
         QCOMPARE(panel.m_snapshot->head, head); QCOMPARE(panel.m_response_age.msecsSinceReference(), observed);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
@@ -6650,7 +7272,7 @@ private Q_SLOTS:
         }
         const auto prior_receipt{panel.m_receipt};
         QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QVERIFY2(!panel.m_read_failed, qPrintable(panel.m_read_error));
         QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.writes.load(), 0); QCOMPARE(unlock.count(), 0);
         QCOMPARE(panel.m_snapshot->head, Parse(probe.data).head);
@@ -6704,7 +7326,7 @@ private Q_SLOTS:
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Effects;
         const auto observed{panel.m_response_age.msecsSinceReference()}; const auto head{panel.m_snapshot->head};
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QVERIFY(panel.m_read_failed); QVERIFY(!panel.orderReady());
         QCOMPARE(panel.m_snapshot->head, head); QCOMPARE(panel.m_response_age.msecsSinceReference(), observed);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
@@ -6722,11 +7344,11 @@ private Q_SLOTS:
             B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
             panel.m_refresh_phase = phase;
             const auto observed{panel.m_response_age.msecsSinceReference()};
-            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
             QVERIFY(panel.m_read_failed); QCOMPARE(probe.snapshots.load(), 1);
             QCOMPARE(panel.m_response_age.msecsSinceReference(), observed); QCOMPARE(panel.m_refresh_phase, next);
             probe.failed_method.clear(); probe.data = RemoteData(); panel.m_catalog_age.invalidate();
-            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
             QVERIFY(!panel.m_read_failed); QCOMPARE(probe.snapshots.load(), 2);
             QVERIFY(panel.m_refresh_phase != Phase::Catalog); QCOMPARE(probe.writes.load(), 0);
         }
@@ -6740,7 +7362,7 @@ private Q_SLOTS:
             }
             B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
             panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Effects;
-            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
             QCOMPARE(probe.effects.load(), 1); QCOMPARE(probe.snapshots.load(), 1);
             QCOMPARE(panel.m_read_failed, condition == 2);
             if (condition == 0) QVERIFY(panel.m_snapshot->chain_reconciling);
@@ -6765,7 +7387,7 @@ private Q_SLOTS:
                 probe.held_method = "getflowmeshbalance"; // First selection immediately starts its next read.
             }
             panel.startJob();
-            if (existing) { QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); }
+            if (existing) { QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000); }
             else { QTRY_VERIFY_WITH_TIMEOUT(probe.auxiliary_entered.available() > 0, 1000); }
             QVERIFY(!panel.m_read_failed); QVERIFY(panel.market()); QVERIFY(panel.market()->has_account);
             QCOMPARE(panel.market()->account, Parse(probe.data).account);
@@ -6773,27 +7395,29 @@ private Q_SLOTS:
             QCOMPARE(panel.market()->checkpoint, existing ? QString::fromStdString(H(70).GetHex()) : QString{});
             if (existing) panel.startJob();
             else probe.auxiliary_release.release();
-            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
             QVERIFY(panel.market()->checkpoint_pending); QCOMPARE(panel.market()->checkpoint, QString::fromStdString(H(80).GetHex()));
         }
         FundingReadProbe probe; probe.discovery_unproven = true;
         auto account{probe.data["account"]}; account.pushKV("account_id", H(99).GetHex()); account.pushKV("curves", UniValue{UniValue::VARR}); probe.data.pushKV("account", account);
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
-        const auto original{panel.market()->account}; panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        const auto original{panel.market()->account}; panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QVERIFY(panel.m_read_failed); QCOMPARE(panel.market()->account, original); QCOMPARE(panel.m_snapshot->account, original);
         QCOMPARE(probe.writes.load(), 0);
     }
     void snapshotReceiptClockSurvivesDelayedUiDelivery()
     {
-        FundingReadProbe probe; probe.hold = true;
+        FundingReadProbe probe; probe.hold = true; probe.data = NewerRemoteData();
         auto status{probe.data["snapshot"]}; status.pushKV("pending_actions", 1); probe.data.pushKV("snapshot", status);
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
-        panel.m_snapshot->head = QString::fromStdString(H(98).GetHex()); // Observe a newly received certified head.
-        panel.startJob(); const auto result{panel.m_active_result};
-        QVERIFY(probe.entered.tryAcquire(1, 2000)); probe.release.release(); QVERIFY(panel.m_thread->wait(2000));
-        const auto received{result->snapshot_age.msecsSinceReference()};
+        // A real successor head, not two conflicting synthetic hashes at the
+        // same height. Drain the auxiliary phase before holding Data itself.
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(probe.entered.available() > 0, 2000); QVERIFY(probe.entered.tryAcquire());
+        QVERIFY(panel.m_selected_read_thread); const auto result{panel.m_selected_read_result};
+        probe.release.release(); QVERIFY(panel.m_selected_read_thread->wait(2000));
+        const auto received{result->data.snapshot_age.msecsSinceReference()};
         QTest::qSleep(3050); // Bounded blocked GUI delivery: do not process the queued finish before the freshness limit.
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(panel.m_response_age.msecsSinceReference(), received); QCOMPARE(panel.m_certificate_age.msecsSinceReference(), received); QCOMPARE(panel.m_queue_age.msecsSinceReference(), received);
         QVERIFY(panel.m_response_age.elapsed() > 3000); QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady()); QVERIFY(!panel.depositReady());
         QVERIFY(panel.m_status->text().contains(QStringLiteral("Updates delayed"))); QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.writes.load(), 0);
@@ -6856,7 +7480,7 @@ private Q_SLOTS:
         QVERIFY(draft_opened); QVERIFY(panel.m_thread); QVERIFY(panel.m_deferred_review);
         QVERIFY(!panel.m_deferred_review->funding); QVERIFY(panel.m_deferred_review->funding_context);
         QVERIFY(panel.m_active_result && !panel.m_active_result->action);
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         review_guard.stop();
         QCOMPARE(probe.catalogs.load(), 1); QCOMPARE(probe.snapshots.load(), 1);
         QCOMPARE(reviewed, outcome == 2); QCOMPARE(cancel_default, outcome == 2);
@@ -7357,7 +7981,7 @@ private Q_SLOTS:
         QCOMPARE(probe.watches.load(), 0);
         QVERIFY(panel.liveUpdateText().contains(QStringLiteral("offers no live updates")));
         // Today's passive job still ends with the market read.
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.watches.load(), 0); QCOMPARE(probe.writes.load(), 0);
     }
     void liveWatchAppliesAChangedHeadAndStaysLive()
@@ -7404,7 +8028,7 @@ private Q_SLOTS:
         QVERIFY(probe.watches.load() >= 1);
         panel.m_timer->stop();
         panel.m_watch.Disable(); AwaitWatchWorker(panel);
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 3000);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void probeWaitsForAnInFlightReadAndHoldsTheNextPoll()
@@ -7687,7 +8311,7 @@ private Q_SLOTS:
         Live(panel, probe);
         QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Polling);
         // The head's own reply, then (next job) the candles window.
-        for (int i{0}; i < 2; ++i) { panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 5000); }
+        for (int i{0}; i < 2; ++i) { panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 5000); }
         QVERIFY(panel.m_candles && panel.m_candles->available);
         const auto observed{panel.m_snapshot->observed};
         QVERIFY(observed && observed->rows.size() == 2);
@@ -7701,7 +8325,7 @@ private Q_SLOTS:
         const auto builds{panel.m_view_builds};
         const auto candle_reads{probe.candle_options.size()};
         const int reads{probe.snapshots.load()};
-        for (int i{0}; i < 3; ++i) { panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 5000); QCoreApplication::processEvents(); }
+        for (int i{0}; i < 3; ++i) { panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 5000); QCoreApplication::processEvents(); }
         QCOMPARE(probe.snapshots.load(), reads + 3);
         QCOMPARE(probe.candle_options.size(), candle_reads);
         QVERIFY(!panel.m_read_failed);
@@ -7819,7 +8443,7 @@ private Q_SLOTS:
         panel.m_receipt = B3FlowMeshTrading::Receipt{}; panel.m_receipt->action_id = QString::fromStdString(H(42).GetHex());
         panel.m_receipt_wallet = panel.m_wallet; panel.m_pending_market = panel.m_snapshot->market; panel.m_pending_account = panel.m_snapshot->account;
         for (int phase{0}; phase < 4; ++phase) {
-            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         }
         QCOMPARE(probe.catalogs.load(), 1); QCOMPARE(probe.balances.load(), 1); QCOMPARE(probe.effects.load(), 1); QCOMPARE(probe.receipts.load(), 1);
         QCOMPARE(probe.snapshots.load(), 0);
@@ -7974,17 +8598,17 @@ private Q_SLOTS:
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         TrackUnknown(panel); panel.m_catalog_age.start(); panel.m_refresh_phase = Phase::Status;
         probe.fail = true; // The selected-market read itself fails.
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QVERIFY(panel.m_read_failed); QVERIFY(panel.m_reconcile_pending); QCOMPARE(panel.m_refresh_phase, Phase::Effects);
         // The next passive job reads the tracked request before its market
         // read, replacing (not advancing) the scheduled phase: same read count.
         probe.fail = false; probe.receipt_response = CertifiedStatus(panel.m_snapshot->market); probe.methods.clear();
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(Remote(probe), (std::vector<std::string>{"getflowmeshactionstatus", "getflowmeshmarketdata"}));
         QVERIFY(!panel.m_read_failed); QVERIFY(!panel.m_reconcile_pending);
         QVERIFY(panel.m_receipt->Included()); QCOMPARE(panel.m_refresh_phase, Phase::Effects);
         // The scheduled phase runs next, and no second override follows.
-        probe.methods.clear(); panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.methods.clear(); panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(Remote(probe).front(), std::string{"listflowmeshvaultoperations"});
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
@@ -7994,7 +8618,7 @@ private Q_SLOTS:
         FundingReadProbe probe; probe.failed_method = "getflowmeshbalance";
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         TrackUnknown(panel); panel.m_catalog_age.start(); panel.m_refresh_phase = Phase::Status;
-        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         // The later full account read succeeded: nothing was lost. It does
         // not prove the independently tracked instruction's outcome.
         QVERIFY(!panel.m_read_failed); QCOMPARE(probe.snapshots.load(), 1);
@@ -8011,7 +8635,7 @@ private Q_SLOTS:
         TrackUnknown(panel); panel.m_catalog_age.start(); panel.m_refresh_phase = Phase::Status;
         std::vector<std::string> first;
         const auto run = [&] {
-            probe.methods.clear(); panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            probe.methods.clear(); panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
             const auto remote{Remote(probe)}; first.push_back(remote.empty() ? std::string{} : remote.front());
         };
         run(); QVERIFY(panel.m_reconcile_pending);
@@ -8099,7 +8723,7 @@ private Q_SLOTS:
         panel.startJob(action); QVERIFY(panel.m_thread);
         QCOMPARE(RowText(view, 0).first(), QStringLiteral("Buy 1 tUSD @ 1.000 B3/tUSD"));
         QCOMPARE(view->item(0, 6)->text(), QStringLiteral("Checking, signing and sending…"));
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QVERIFY(!panel.m_inflight_action); QVERIFY(view->isHidden());
         QVERIFY(!panel.m_uncertain); QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
@@ -8275,7 +8899,7 @@ private Q_SLOTS:
         FundingReadProbe probe;
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         panel.m_catalog_age.start(); panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None;
-        const auto run = [&] { panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); };
+        const auto run = [&] { panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000); };
         probe.fail = true; run(); run();
         QCOMPARE(panel.m_toasts->texts().size(), 1);
         QVERIFY(panel.m_toasts->texts().front().startsWith(QStringLiteral("Connection lost")));
@@ -8344,7 +8968,7 @@ private Q_SLOTS:
         review_guard.start(1);
         panel.m_order->click(); QVERIFY(panel.m_deferred_review && panel.m_deferred_review->order_context->marketable);
         QVERIFY(probe.entered.tryAcquire(1, 2000)); probe.release.release();
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); QTRY_VERIFY_WITH_TIMEOUT(!review.isEmpty(), 2000); review_guard.stop();
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000); QTRY_VERIFY_WITH_TIMEOUT(!review.isEmpty(), 2000); review_guard.stop();
         // Re-priced from the fresh read, never refused as changed input.
         QVERIFY2(review.contains(QStringLiteral("at 1.111 B3 / tUSD")), qPrintable(review));
         QVERIFY(review.contains(QStringLiteral("best certified opposite order at 1.1 B3 / tUSD with at most 1.00% slippage")));
@@ -8444,14 +9068,14 @@ private Q_SLOTS:
         panel.m_own_view->selectRow(0); panel.updateControls(); QVERIFY(panel.m_edit_order->isEnabled());
         QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
         // A passive read is in flight: Edit stays enabled and a click prefills.
-        panel.startJob(); QVERIFY(probe.entered.tryAcquire(1, 2000));
-        QVERIFY(panel.m_thread); QVERIFY(panel.m_active_result && panel.m_active_result->passive);
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(probe.entered.available() > 0, 2000); QVERIFY(probe.entered.tryAcquire());
+        QVERIFY(panel.m_selected_read_thread); QVERIFY(panel.m_selected_read_result && panel.m_selected_read_result->data.passive);
         QVERIFY(panel.m_edit_order->isEnabled());
         panel.m_edit_order->click();
         QCOMPARE(panel.m_price->text(), QStringLiteral("1")); QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.75"));
         QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Nothing was signed or sent")));
         QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_busy);
-        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(Remote(probe), (std::vector<std::string>{"getflowmeshactionstatus", "getflowmeshmarketdata"}));
         // The read keeps the prefilled replacement and the selection.
         QCOMPARE(panel.m_price->text(), QStringLiteral("1")); QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.75"));
@@ -8472,7 +9096,7 @@ private Q_SLOTS:
         B3FlowMeshTrading::Receipt receipt; receipt.action_id = QString::fromStdString(H(99).GetHex()); receipt.market = action.market.id;
         receipt.state = QStringLiteral("queued"); result->receipt = receipt;
         panel.m_busy = true; panel.finishJob(result);
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         const auto log{panel.m_log->toPlainText()};
         QVERIFY(log.contains(QStringLiteral("No automatic retry"))); QVERIFY(log.contains(QStringLiteral("Your orders")));
         QVERIFY(!log.contains(QStringLiteral("getflowmeshactionstatus"))); QVERIFY(!log.contains(QStringLiteral("retryflowmeshaction")));
@@ -8514,7 +9138,7 @@ private Q_SLOTS:
         panel.hide(); QVERIFY(QMetaObject::invokeMethod(panel.m_timer, "timeout")); QVERIFY(!panel.m_polling_since.isValid());
         panel.show(); QCoreApplication::processEvents(); QVERIFY(QMetaObject::invokeMethod(panel.m_timer, "timeout"));
         QVERIFY(panel.m_polling_since.isValid());
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread, 2000);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
     void bannerLiveFollowsFreshDataDespiteSelectedEndpointFailure()

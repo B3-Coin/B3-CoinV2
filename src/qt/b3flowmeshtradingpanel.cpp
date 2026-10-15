@@ -426,6 +426,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         // (an RPC already under way still completes); the new market is
         // then read at once. User-paced, like a review click.
         if (m_active_result && m_active_result->passive) m_yield_refresh->store(true);
+        stopSelectedReadWorker(false);
         resetRefreshSchedule();
         m_deferred_status.reset(); // A queued click never follows a market switch.
         // The ticket was typed for the market left: its prices and quantities
@@ -1563,6 +1564,13 @@ std::optional<B3FlowMeshMarketData::MarketableLimit> B3FlowMeshTradingPanel::mar
 void B3FlowMeshTradingPanel::requestOrderReview()
 {
     if (!orderReviewAvailable()) return;
+    if (!m_thread && !m_active_result && m_selected_read_thread && m_selected_read_result &&
+        !m_selected_read_result->data.candles_interval && m_selected_read_result->scope.auxiliary_error.isEmpty() &&
+        selectedReadScopeValid(m_selected_read_result->scope)) {
+        if (deferReview(Operation::Order))
+            notice(tr("Checking current market readiness for this exact order. Nothing is approved, signed or sent; if the check fails, review again. There is no automatic retry."));
+        return;
+    }
     // The stable entry requests only a read. Approval still requires current
     // readiness; a paused or failed refresh consumes this intent, not retries it.
     if (!m_thread) startJob(std::nullopt, std::nullopt, false, false, std::nullopt, {}, true);
@@ -1689,6 +1697,8 @@ void B3FlowMeshTradingPanel::requestConnect()
     if (!m_connect->isEnabled() || !m_wallet || !m_backend || m_busy || m_cancel->load()) return;
     if (m_active_result && !m_active_result->connect_url.isEmpty()) return;
     m_deferred_review.reset(); // A reviewed market choice never follows an endpoint change.
+    stopSelectedReadWorker(false);
+    stopWatchWorker(false);
     resetRefreshSchedule();
     m_connection_error.clear(); m_connect_error.clear();
     m_deferred_connect = DeferredConnect{m_wallet, m_generation, &m_wallet->node(), m_endpoint->text().trimmed()};
@@ -1897,7 +1907,10 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
 bool B3FlowMeshTradingPanel::deferReview(Operation operation, bool funding)
 {
     const auto selected{market()};
-    if (!m_thread || m_busy || !m_wallet || !m_backend || !selected || m_uncertain || !m_security_warning.isEmpty()) return false;
+    const bool selected_handoff{!m_thread && !m_active_result && operation == Operation::Order && !funding &&
+        m_selected_read_thread && m_selected_read_result && !m_selected_read_result->data.candles_interval &&
+        m_selected_read_result->scope.auxiliary_error.isEmpty() && selectedReadScopeValid(m_selected_read_result->scope)};
+    if ((!m_thread && !selected_handoff) || m_busy || !m_wallet || !m_backend || !selected || m_uncertain || !m_security_warning.isEmpty()) return false;
     if (operation == Operation::Order && !orderReviewAvailable()) return false;
     // Save only an intent to OPEN a review. No action is approved, signed or
     // sent here. Freeze inputs so the pending click cannot change underneath it.
@@ -1907,6 +1920,7 @@ bool B3FlowMeshTradingPanel::deferReview(Operation operation, bool funding)
             m_price->text(), m_quantity->text(), m_side->currentIndex(), inverted(), m_active_result && m_active_result->receipt_only,
             m_marketable->isChecked(), m_slippage->text(), m_ladder->isChecked(), ladderText()};
     if (m_active_result && m_active_result->passive && m_refresh_yields < MAX_REFRESH_YIELDS) m_yield_refresh->store(true);
+    if (selected_handoff) m_selected_read_review = m_selected_read_result;
     m_busy = true; updateControls(); return true;
 }
 
@@ -2083,10 +2097,276 @@ void B3FlowMeshTradingPanel::updateStatusReadState()
     if (m_status_read_state->text() != text) m_status_read_state->setText(text);
 }
 
+auto B3FlowMeshTradingPanel::selectedReadScope() const -> std::optional<SelectedReadScope>
+{
+    const auto selected{market()};
+    if (!m_wallet || !m_backend || !selected || m_closing) return std::nullopt;
+    const bool matched{m_snapshot && m_snapshot->market == selected->id};
+    return SelectedReadScope{m_wallet, &m_wallet->node(), m_generation, m_selected_read_generation,
+        m_selected_read_command_observation, *selected,
+        matched ? m_snapshot->head : QString{}, matched ? m_snapshot->next_sequence : 0,
+        m_uncertain, m_uncertain_generation, m_uncertain_wallet, m_uncertain_market, m_uncertain_account, m_uncertain_action_id,
+        {}, {}};
+}
+
+bool B3FlowMeshTradingPanel::selectedReadScopeValid(const SelectedReadScope& scope, const bool same_head) const
+{
+    if (!m_wallet || !m_backend || m_closing || m_cancel->load() || scope.wallet != m_wallet ||
+        scope.node != &m_wallet->node() || scope.generation != m_generation || scope.read_generation != m_selected_read_generation ||
+        scope.command_observation != m_selected_read_command_observation) return false;
+    const auto selected{market()};
+    const auto& old{scope.market};
+    if (!selected || selected->id != old.id || selected->base != old.base || selected->vault != old.vault ||
+        selected->domain != old.domain || selected->config != old.config || selected->account != old.account ||
+        selected->has_account != old.has_account || selected->remote != old.remote) return false;
+    if (!same_head) return true; // A queued READ may capture the newer head at dispatch.
+    const bool matched{m_snapshot && m_snapshot->market == old.id};
+    return matched ? m_snapshot->head == scope.known_head && m_snapshot->next_sequence == scope.next_sequence
+                   : scope.known_head.isEmpty() && scope.next_sequence == 0;
+}
+
+void B3FlowMeshTradingPanel::startSelectedRead(const QString& auxiliary_error, const std::optional<RefreshPhase> auxiliary_phase)
+{
+    auto scope{selectedReadScope()};
+    if (!scope || m_cancel->load()) return;
+    scope->auxiliary_error = auxiliary_error; scope->auxiliary_phase = auxiliary_phase;
+    if (m_selected_read_thread || m_watch_thread || m_thread || m_busy) {
+        m_selected_read_pending = scope;
+        return;
+    }
+    m_selected_read_pending.reset();
+    auto result{std::make_shared<SelectedReadResult>()};
+    result->scope = *scope;
+    result->cancel = std::make_shared<std::atomic_bool>(false);
+    auto& data{result->data};
+    data.passive = true;
+    data.views_market = data.read_market = scope->market.id;
+    data.basis_head = scope->known_head; data.basis_sequence = scope->next_sequence;
+    data.ticks_after = ticksAfter(scope->market.id); data.draft = indicativeDraft(); data.levels = levelsRequest();
+    if (const auto due{candlesDue()}) { data.candles_interval = due->first; data.candles_limit = due->second; }
+    const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())};
+    m_selected_read_result = result;
+    m_attempt_age.restart();
+    m_loading = !m_snapshot; m_chart->setLoading(m_loading);
+    m_selected_read_thread = QThread::create([result, uri] {
+        const node::FlowMeshClientWorkScope priority{node::FlowMeshClientWorkPriority::PASSIVE, node::FlowMeshClientWorkLinger::NONE};
+        auto& data{result->data};
+        auto* node{result->scope.node};
+        const auto cancelled = [&] { return result->cancel->load() || node->shutdownRequested(); };
+        const auto rpc = [&](const std::string& method, const UniValue& params) {
+            if (cancelled()) throw std::runtime_error{"Selected market read cancelled."};
+            return node->executeRpc(method, params, uri);
+        };
+        try {
+            UniValue params{UniValue::VARR}; params.push_back(result->scope.market.id.toStdString());
+            UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
+            AddMarketViews(options, data.ticks_after, data.draft, data.levels);
+            if (!data.basis_head.isEmpty()) options.pushKV("known_head", data.basis_head.toStdString());
+            params.push_back(options);
+            const auto response{rpc("getflowmeshmarketdata", params)};
+            data.snapshot_age.restart(); // Actual receipt, before parse/candles/GUI delivery.
+            data.snapshot = B3FlowMeshMarketData::Parse(response);
+            const auto& fresh{*data.snapshot};
+            const auto& pinned{result->scope.market};
+            if (fresh.market != pinned.id || fresh.base != pinned.base || fresh.domain != pinned.domain || fresh.config != pinned.config || fresh.remote != pinned.remote ||
+                (!fresh.unchanged && pinned.has_account && fresh.account != pinned.account)) {
+                throw std::runtime_error{"Selected read changed its pinned market or wallet account."};
+            }
+            if (result->scope.next_sequence && (fresh.next_sequence < result->scope.next_sequence ||
+                (fresh.next_sequence == result->scope.next_sequence && fresh.head != result->scope.known_head))) {
+                throw std::runtime_error{"Selected read returned an older or conflicting captured head."};
+            }
+            // Preserve the earlier combined job's conservative exception:
+            // only a full fresh remote account proof can supersede failed
+            // operator status/effects. Catalog failure or an omitted account
+            // must not become a successful refresh through this handoff.
+            if (!result->scope.auxiliary_error.isEmpty() &&
+                ((result->scope.auxiliary_phase != RefreshPhase::Status && result->scope.auxiliary_phase != RefreshPhase::Effects) ||
+                 fresh.unchanged || !fresh.remote || !fresh.certified || !fresh.certificate_verified || !fresh.account_state_verified ||
+                 !pinned.has_account || fresh.account.isEmpty() || fresh.account != pinned.account ||
+                 !data.snapshot_age.isValid() || data.snapshot_age.elapsed() > B3FlowMeshMarketData::LINK_FRESH_MS)) {
+                throw std::runtime_error{result->scope.auxiliary_error.toStdString()};
+            }
+            if (data.candles_interval) {
+                try {
+                    UniValue params{UniValue::VARR}; params.push_back(pinned.id.toStdString());
+                    UniValue options{UniValue::VOBJ}; options.pushKV("interval", flowmesh::CandleIntervalName(*data.candles_interval));
+                    options.pushKV("limit", static_cast<uint64_t>(data.candles_limit)); params.push_back(options);
+                    data.candles = B3FlowMeshMarketData::ParseCandles(rpc("getflowmeshcandles", params), *data.candles_interval);
+                } catch (const UniValue& error) { data.candles_error = RpcError(error); }
+                catch (const std::exception& error) { data.candles_error = QString::fromUtf8(error.what()).left(500); }
+                catch (...) { data.candles_error = QStringLiteral("Candles unavailable."); }
+            }
+        } catch (const UniValue& error) { data.error = RpcError(error); data.snapshot.reset(); }
+        catch (const std::exception& error) { data.error = QString::fromUtf8(error.what()).left(500); data.snapshot.reset(); }
+        catch (...) { data.error = QStringLiteral("Selected market read failed."); data.snapshot.reset(); }
+    });
+    m_selected_read_thread->setParent(this);
+    connect(m_selected_read_thread, &QThread::finished, this, [this, result] { finishSelectedRead(result); });
+    m_selected_read_thread->start();
+    updateControls();
+}
+
+void B3FlowMeshTradingPanel::resumeSelectedRead()
+{
+    if (!m_selected_read_pending || m_selected_read_thread || m_watch_thread || m_thread || m_busy) return;
+    if (m_read_failures && m_attempt_age.isValid() && m_attempt_age.elapsed() < readBackoffMs()) return;
+    const auto scope{*m_selected_read_pending};
+    m_selected_read_pending.reset();
+    if (!selectedReadScopeValid(scope, false)) return;
+    // A stream of coalesced display requests must not jump ahead of saved
+    // receipt reconciliation or the existing fair auxiliary cycle forever.
+    // Auxiliary Calls remain idle-only on the legacy command owner.
+    if (nextPassivePhase() != RefreshPhase::None) startJob();
+    else startSelectedRead(scope.auxiliary_error, scope.auxiliary_phase);
+}
+
+void B3FlowMeshTradingPanel::finishSelectedRead(const std::shared_ptr<SelectedReadResult>& result)
+{
+    if (m_selected_read_result != result) return;
+    if (m_selected_read_thread) {
+        m_selected_read_thread->wait();
+        m_selected_read_thread->deleteLater();
+        m_selected_read_thread = nullptr;
+    }
+    m_selected_read_result.reset();
+    auto& data{result->data};
+    const bool current{!result->cancel->load() && selectedReadScopeValid(result->scope)};
+    const bool review_handoff{m_selected_read_review.lock() == result};
+    if (review_handoff) m_selected_read_review.reset();
+    if (review_handoff && !m_thread && !m_active_result && m_deferred_review &&
+        m_deferred_review->generation == result->scope.generation && m_deferred_review->market == result->scope.market.id &&
+        m_deferred_review->operation == Operation::Order && m_deferred_review->order_context) {
+        if (!current || m_uncertain || !m_busy) {
+            m_deferred_review.reset(); m_busy = false;
+            notice(tr("The selected read changed before the order review. Nothing was approved, signed or sent; review again."));
+            updateControls(); resumeSelectedRead(); return;
+        }
+        // Explicitly captured read-only Review, not passive promotion: reuse
+        // its one exact Data response and ORIGINAL receipt age. The existing
+        // foreground confirmation path still checks pins, inputs, readiness
+        // and age; there is no command owner or uncertain instruction here.
+        auto foreground{std::make_shared<Result>(std::move(data))};
+        foreground->passive = false; foreground->foreground_read = true;
+        foreground->markets = m_market_data; foreground->effects = m_effect_data;
+        const int index{m_market->currentIndex()};
+        if (foreground->snapshot && index >= 0 && static_cast<size_t>(index) < foreground->markets.size())
+            DeriveRowFromSnapshot(foreground->markets[index], *foreground->snapshot);
+        const QPointer<B3FlowMeshTradingPanel> self{this};
+        applyJobResult(foreground);
+        if (!self) return;
+        resumeConnect(); resumeStatusRead(); updateStatusReadState(); resumeSelectedRead();
+        return;
+    }
+    bool open_routed_funding{false};
+    bool follow_new_selection{false};
+    if (current && data.snapshot) {
+        if (m_busy || m_thread) {
+            // A command/review owns gates, balances and uncertainty. Only
+            // the already-verified display may move; no join/receipt stamp.
+            applyDisplayOnly(std::move(*data.snapshot), data.snapshot_age);
+        } else {
+            auto row{result->scope.market};
+            DeriveRowFromSnapshot(row, *data.snapshot);
+            if (!result->scope.auxiliary_error.isEmpty()) {
+                row.publish_ready = false; row.checkpoint_pending = false; row.checkpoint.clear();
+            }
+            const auto read_next{data.snapshot->next_sequence};
+            const bool first_account{!m_snapshot || m_snapshot->market != data.snapshot->market};
+            const bool new_head{!m_snapshot || m_snapshot->head != data.snapshot->head};
+            const auto pending_actions{data.snapshot->pending_actions};
+            const bool same_uncertain{result->scope.uncertain && m_uncertain &&
+                result->scope.uncertain_generation == m_uncertain_generation && result->scope.uncertain_wallet == m_uncertain_wallet &&
+                result->scope.uncertain_market == m_uncertain_market && result->scope.uncertain_account == m_uncertain_account &&
+                result->scope.uncertain_action == m_uncertain_action_id && (uncertainWalletSelected() || !m_uncertain_wallet)};
+            const bool refreshed_uncertain{same_uncertain && !data.snapshot->unchanged && data.snapshot->certified &&
+                (!data.snapshot->remote || (data.snapshot->certificate_verified && data.snapshot->account_state_verified)) &&
+                !data.snapshot->account.isEmpty() && data.snapshot->account == result->scope.market.account &&
+                m_uncertain_market == result->scope.market.id && (m_uncertain_account.isEmpty() || m_uncertain_account == data.snapshot->account) &&
+                data.snapshot_age.isValid() && data.snapshot_age.elapsed() <= B3FlowMeshMarketData::LINK_FRESH_MS};
+            if (applySelectedSnapshot(std::move(*data.snapshot), data.snapshot_age, data.basis_head) == SnapshotApply::APPLIED) {
+                const int index{m_market->currentIndex()};
+                if (index >= 0 && static_cast<size_t>(index) < m_market_data.size()) m_market_data[index] = std::move(row);
+                m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_read_error.clear(); m_loading = false;
+                if (!pending_actions) m_queue_age.invalidate();
+                else if (new_head || !m_queue_age.isValid()) m_queue_age = data.snapshot_age;
+                if (same_uncertain) m_uncertain_refreshed = refreshed_uncertain;
+                if (!result->scope.auxiliary_error.isEmpty()) {
+                    notice((result->scope.auxiliary_phase == RefreshPhase::Effects
+                        ? tr("Operator settlement refresh failed: %1. A later certified account read succeeded; checkpoint and payout tools require fresh operator metadata. Pending payouts remain unknown.")
+                        : tr("Operator status refresh failed: %1. A later certified account read succeeded; checkpoint and payout tools require fresh operator metadata."))
+                        .arg(result->scope.auxiliary_error));
+                }
+                linkToast(true);
+                if (data.candles && data.candles->interval == m_candle_interval) {
+                    applyCandles(*data.candles, data.candles_limit, read_next); updateDataViews();
+                } else if (!data.candles_error.isEmpty() && data.candles_interval && *data.candles_interval == m_candle_interval) {
+                    noteCandlesFailure(data.candles_error); updateDataViews();
+                }
+                if (m_route_pending) {
+                    m_asset->setCurrentIndex(m_requested_base.isEmpty() ? 1 : 0);
+                    m_route_pending = false; open_routed_funding = true;
+                }
+                follow_new_selection = first_account;
+            }
+        }
+    } else if (current && !data.error.isEmpty() && !m_busy && !m_thread) {
+        if (!m_read_failed) { notice(tr("Market refresh failed: %1. Certified data is retained; nothing was resent.").arg(data.error)); linkToast(false); }
+        m_read_failed = true; m_read_error = data.error; m_read_failures = std::min(5U, m_read_failures + 1);
+        m_link_attempts = std::min(9999U, m_link_attempts + 1); m_loading = false;
+        if (m_receipt && !m_receipt->Included()) m_reconcile_pending = true;
+    }
+    // Ordinary passive completion never calls applyJobResult: it owns command
+    // completion, unlock and saved instructions. Only the explicit, current
+    // read-only Review handoff above may enter that path. Stale reads do not.
+    if (!m_busy && !m_thread) { m_chart->setLoading(m_loading); updateMarketText(); }
+    if (open_routed_funding) {
+        const QPointer<B3FlowMeshTradingPanel> self{this};
+        openFunding(m_requested_withdrawal);
+        if (!self) return;
+    } else if (follow_new_selection) refresh(); // Preserve immediate new-selection maintenance.
+    resumeSelectedRead();
+}
+
+void B3FlowMeshTradingPanel::stopSelectedReadWorker(const bool join)
+{
+    ++m_selected_read_generation;
+    m_selected_read_pending.reset();
+    if (!m_selected_read_review.expired()) {
+        m_selected_read_review.reset();
+        if (!m_thread && !m_active_result && m_deferred_review && m_deferred_review->operation == Operation::Order) {
+            m_deferred_review.reset(); m_busy = false;
+        }
+    }
+    if (m_selected_read_result) m_selected_read_result->cancel->store(true);
+    if (!m_selected_read_thread || !join) return;
+    disconnect(m_selected_read_thread, nullptr, this, nullptr);
+    m_selected_read_thread->wait();
+    delete m_selected_read_thread;
+    m_selected_read_thread = nullptr;
+    m_selected_read_result.reset();
+}
+
 void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optional<B3AssetTransfer::Prepared> prepared, bool exact_retry, bool receipt_only,
                                     std::optional<StatusRead> status_read, const QString& connect_url, bool foreground_read, bool receipt_wait)
 {
     if (!m_wallet || !m_backend || m_thread) return;
+    const bool passive{!action && !exact_retry && !receipt_only && !receipt_wait && connect_url.isEmpty() && !foreground_read};
+    if (!passive && !m_selected_read_review.expired()) {
+        m_selected_read_review.reset(); m_deferred_review.reset();
+    }
+    if (passive && m_busy) return;
+    if (passive && (m_selected_read_thread || m_watch_thread)) {
+        // One coalesced scope, not a queued RPC or economic command. An
+        // auxiliary Call still owns the native work gate, so do not start
+        // one while the selected read is outstanding.
+        if (!watchSuppliesRead() || candlesDue()) m_selected_read_pending = selectedReadScope();
+        return;
+    }
+    if (passive && nextPassivePhase() == RefreshPhase::None) {
+        if (!watchSuppliesRead() || candlesDue()) startSelectedRead();
+        return;
+    }
     if (receipt_only) {
         if (!status_read) status_read = selectedStatusRead();
         if (!status_read || !statusReadValid(*status_read, true)) return;
@@ -2103,6 +2383,15 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     if (watch_queue && queue_watch.elapsed() >= 30'000) {
         restoreLock(); m_busy = false; notice(tr("Queued requests have not certified for 30 seconds. No new request was submitted. Refresh and inspect the market; existing requests are not canceled.")); updateControls(); return;
     }
+    if (!passive) {
+        // A pre-command Data/candles result cannot become a new account
+        // observation merely because this command completes first. Keep the
+        // one post-command read request, without moving a body, signing,
+        // resending, joining its actor or extending any freshness clock.
+        ++m_selected_read_command_observation;
+        if (m_selected_read_thread) m_selected_read_pending = selectedReadScope();
+    }
+
     // The in-flight request row is captured here, on the GUI thread.
     m_inflight_action = action && SignedAction(action->operation) ? action : std::nullopt;
     m_inflight_market = action ? action->market.id : QString{};
@@ -2111,6 +2400,11 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     result->connect_url = connect_url;
     result->exact_retry = exact_retry; result->receipt_only = receipt_only; result->receipt_wait = receipt_wait;
     result->passive = !action && !exact_retry && !receipt_only && !receipt_wait && connect_url.isEmpty() && !foreground_read;
+    // At the existing exhausted-yield fairness turn, retain the one legacy
+    // auxiliary+Data completion before a queued status can take its place.
+    // Ordinary selected reads remain isolated; this exceptional turn can
+    // still delay a command, like an already-running auxiliary RPC.
+    result->auxiliary_only = result->passive && m_refresh_yields < MAX_REFRESH_YIELDS;
     result->foreground_read = foreground_read;
     m_yield_refresh->store(false);
     result->receipt_scope = receipt_only ? status_read : !action && !exact_retry && !receipt_wait ? selectedStatusRead() : std::nullopt;
@@ -2123,7 +2417,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     // receipt, connect or action job, which a user waits for. They stay
     // due, so the next passive job reads them (liveSkipsPoll() is false
     // while they are due).
-    if (result->passive) {
+    if (result->passive && !result->auxiliary_only) {
         if (const auto due{candlesDue()}) { result->candles_interval = due->first; result->candles_limit = due->second; }
     }
     const auto phase{foreground_read ? (m_route_pending || m_market_data.empty() || !m_catalog_age.isValid() ? RefreshPhase::Catalog : RefreshPhase::None)
@@ -2136,7 +2430,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     m_last_job_was_reconcile = result->reconcile_first;
     // Live updates supply the selected market's read: a passive job then runs
     // only its auxiliary phase. Foreground, review and action reads always read.
-    result->live = result->passive && watchSuppliesRead();
+    result->live = result->auxiliary_only || (result->passive && watchSuppliesRead());
     const auto refresh_basis{m_snapshot};
     result->markets = m_market_data; result->effects = m_effect_data;
     if (m_snapshot && m_snapshot->market == selected_id) result->basis_sequence = m_snapshot->next_sequence;
@@ -2238,6 +2532,11 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                 bool snapshot_attempted{false}; std::exception_ptr snapshot_error;
                 const B3FlowMeshTrading::RpcCall snapshot_rpc = [&](const std::string& method, const UniValue& params) {
                     if (method != "getflowmeshmarketdata") return rpc(method, params);
+                    // The exceptional Effects reconciliation fallback must
+                    // retain its original one-response/yield semantics. It
+                    // remains on the legacy auxiliary owner (and may delay a
+                    // command); do not issue a second isolated snapshot.
+                    if (result->auxiliary_only) { result->auxiliary_only = false; result->live = false; }
                     if (!snapshot_attempted) {
                         snapshot_attempted = true;
                         try {
@@ -2298,7 +2597,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                             result->effects = ReadEffectsForRefresh(snapshot_rpc, selected->id, basis);
                         }
                     });
-                    if (!result->live || selected->id != selected_id) {
+                    if (!result->auxiliary_only && (!result->live || selected->id != selected_id)) {
                         UniValue params{UniValue::VARR}; params.push_back(selected->id.toStdString()); UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
                         // The held ticks and the ticket belong to the displayed market only.
                         AddMarketViews(options, selected->id == result->views_market ? result->ticks_after : std::nullopt,
@@ -2331,6 +2630,11 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                         catch (...) { result->candles_error = QStringLiteral("Candles unavailable."); }
                     }
                 }
+                // Splitting Data onto its own actor removed the next RPC's
+                // normal yield check. A click/switch during this phase's last
+                // RPC must still leave that auxiliary phase due. The existing
+                // catch below preserves a real auxiliary failure over yield.
+                if (result->auxiliary_only && yield_refresh->load()) throw PassiveRefreshYield{};
                 if (auxiliary_error) {
                     // Operator status and connected-settlement discovery are
                     // not the trading-account proof. Retain their exact error
@@ -2401,6 +2705,30 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
         result->receipt_market.clear(); result->receipt_account.clear(); result->receipt_action_id.clear();
         if (result->receipt_only) result->error = tr("Captured status scope changed; the late result was not applied.");
     }
+    if (result->auxiliary_only) {
+        const bool yielded_to_foreground{m_yield_refresh->load()};
+        if (result->refresh_yielded || !result->error.isEmpty()) {
+            // Original failure/yield handling preserves captured review and
+            // receipt semantics. No fresh selected account has arrived yet.
+            const QPointer<B3FlowMeshTradingPanel> self{this};
+            applyJobResult(result);
+            if (!self) return;
+            if (!result->error.isEmpty()) {
+                const int index{m_market->currentIndex()};
+                if (index >= 0 && static_cast<size_t>(index) < m_market_data.size()) {
+                    auto& row{m_market_data[index]}; row.publish_ready = false; row.checkpoint_pending = false; row.checkpoint.clear();
+                }
+                m_effect_data.clear(); m_effect->clear();
+            }
+        } else {
+            applyAuxiliaryResult(*result);
+        }
+        resumeConnect(); resumeStatusRead(); updateStatusReadState();
+        if (!result->refresh_yielded && !yielded_to_foreground && !m_thread && !m_busy &&
+            (!watchSuppliesRead() || candlesDue()))
+            startSelectedRead(result->error, result->refresh_phase);
+        return;
+    }
     // Applying an economic result can enter an existing modal review, whose
     // event loop may destroy the panel. Never drain a read through that owner.
     const QPointer<B3FlowMeshTradingPanel> self{this};
@@ -2410,6 +2738,66 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
     // existing worker must be destroyed before another read can be started.
     resumeConnect(); resumeStatusRead();
     updateStatusReadState();
+    resumeSelectedRead();
+}
+
+void B3FlowMeshTradingPanel::applyAuxiliaryResult(const Result& result)
+{
+    if (!m_wallet || m_cancel->load()) return;
+    if (!result.refresh_yielded && result.refresh_phase && result.refresh_epoch == m_refresh_epoch && !result.reconcile_first) {
+        m_refresh_yields = 0;
+        switch (*result.refresh_phase) {
+        case RefreshPhase::Catalog: m_refresh_phase = RefreshPhase::Status; break;
+        case RefreshPhase::Status: m_refresh_phase = RefreshPhase::Effects; break;
+        case RefreshPhase::Effects: m_refresh_phase = RefreshPhase::Receipt; break;
+        case RefreshPhase::Receipt: case RefreshPhase::None: m_refresh_phase = RefreshPhase::None; break;
+        }
+    }
+    if (result.refresh_yielded && result.refresh_epoch == m_refresh_epoch && m_refresh_yields < MAX_REFRESH_YIELDS) ++m_refresh_yields;
+    if (result.client_info) {
+        m_client_info = result.client_info;
+        const auto& selected{m_client_info->find_value("selected_endpoint")};
+        if (selected.isStr() && m_endpoint->text().isEmpty() && !m_endpoint->isModified() && !m_endpoint->hasFocus())
+            m_endpoint->setText(QString::fromStdString(selected.get_str()));
+        m_connection_error.clear();
+    }
+    if (!result.client_error.isEmpty()) m_connection_error = result.client_error;
+    if (result.receipt) { applyReceipt(*result.receipt); applyReceiptError(result, {}); }
+    if (!result.receipt_error.isEmpty()) applyReceiptError(result, result.receipt_error);
+    if (result.refresh_phase == RefreshPhase::Receipt && !result.receipt_action_id.isEmpty() &&
+        (result.receipt || (!result.receipt_error.isEmpty() && result.error.isEmpty()))) m_reconcile_pending = false;
+    if (!result.refresh_yielded && result.catalog) applyMarketCatalog(result);
+    if (!result.refresh_yielded && result.refresh_phase == RefreshPhase::Status) {
+        const auto selected{market()};
+        const auto status{std::find_if(result.markets.begin(), result.markets.end(), [&](const auto& row) {
+            return selected && row.id == selected->id && row.base == selected->base && row.vault == selected->vault &&
+                row.domain == selected->domain && row.config == selected->config && row.account == selected->account;
+        })};
+        const int index{m_market->currentIndex()};
+        if (status != result.markets.end() && index >= 0 && static_cast<size_t>(index) < m_market_data.size()) {
+            auto& row{m_market_data[index]};
+            row.publish_ready = status->publish_ready; row.checkpoint_pending = status->checkpoint_pending; row.checkpoint = status->checkpoint;
+        }
+    } else if (!result.refresh_yielded && result.refresh_phase == RefreshPhase::Effects) {
+        m_effect_data = result.effects;
+        std::vector<Choice> choices;
+        const auto selected{market()};
+        for (size_t i{0}; selected && i < m_effect_data.size(); ++i) {
+            const auto& value{m_effect_data[i]};
+            if (value.find_value("market_id").get_str() != selected->id.toStdString()) continue;
+            const auto& kind{value.find_value("kind")}; const auto& id{value.find_value("effect_id")};
+            if (kind.isStr() && id.isStr()) choices.push_back({QString::fromStdString(kind.get_str()) + QStringLiteral(" — ") +
+                QString::fromStdString(id.get_str()).left(20), static_cast<int>(i), QString::fromStdString(id.get_str())});
+        }
+        SetChoices(m_effect, choices, m_effect->currentData(Qt::UserRole + 1).toString(), true);
+    }
+    // Deliberately not an account-read completion: no response/certificate
+    // age, command busy/cancel state, unlock or uncertainty is changed.
+    updateMarketText();
+    if (m_deferred_review) {
+        startJob(std::nullopt, std::nullopt, false, false, std::nullopt, {}, true);
+        if (m_thread) { m_busy = true; updateControls(); }
+    }
 }
 
 void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& result)
@@ -2819,7 +3207,7 @@ void B3FlowMeshTradingPanel::updateWatchState()
 
 void B3FlowMeshTradingPanel::armWatch(const bool release)
 {
-    if (!m_wallet || !m_backend || m_watch_thread || m_cancel->load() || m_closing) return;
+    if (!m_wallet || !m_backend || m_watch_thread || m_selected_read_thread || m_selected_read_pending || m_cancel->load() || m_closing) return;
     const auto selected{market()};
     const auto& basis{watchBasis()};
     if (!selected || !basis || basis->market != selected->id) {
@@ -2829,19 +3217,21 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
     if (!release) {
         // A probe starts only with no job in flight: an ordinary market read
         // already on its way would move the client's cursor under it.
-        if (m_thread && m_watch.mode != B3FlowMeshWatch::Mode::Live) return;
+        if (m_thread) return;
         // While busy only for display, during a review with nothing in
         // flight (the local engine; see liveWhileBusy).
         if ((m_busy && !liveWhileBusy()) || !isVisible() || !m_security_warning.isEmpty() || m_read_failed || !m_watch.MayArm(m_watch_clock.elapsed())) return;
         m_watch.Armed(m_watch_clock.elapsed());
     }
     auto result{std::make_shared<WatchResult>()};
+    result->cancel = std::make_shared<std::atomic_bool>(false);
+    m_active_watch_result = result;
     result->scope = {m_wallet, m_generation, m_watch_generation, selected->id, selected->account, basis->head};
     result->release = release;
     result->ticks_after = ticksAfter(selected->id); result->draft = indicativeDraft(); result->levels = levelsRequest();
     auto* node{&m_wallet->node()};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())};
-    const auto cancel{m_cancel};
+    const auto cancel{result->cancel};
     // Captures values only: no panel, wallet object or backend. The RPC holds
     // the wallet for at most the watch plus 5 s.
     m_watch_thread = QThread::create([node, uri, cancel, result] {
@@ -2880,13 +3270,19 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
 
 void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& result)
 {
+    // A queued finished signal from a joined/replaced owner must not wait
+    // for, delete or retire the next watch worker. Direct policy fixtures
+    // have no worker/cancel token; every actual worker has both.
+    if ((m_active_watch_result && m_active_watch_result != result) || (!m_active_watch_result && result->cancel)) return;
     if (m_watch_thread) {
         m_watch_thread->wait(); // Already finished: this is its finished signal.
         m_watch_thread->deleteLater();
         m_watch_thread = nullptr;
     }
+    m_active_watch_result.reset();
     if (result->release) {
         m_watch_release_pending = false;
+        resumeSelectedRead();
         return;
     }
     using Outcome = B3FlowMeshWatch::Outcome;
@@ -2900,9 +3296,10 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
     // silently: never a failure, and never renewed freshness.
     const auto& basis{watchBasis()};
     if (!m_wallet || scope.wallet != m_wallet || scope.generation != m_generation || scope.watch_generation != m_watch_generation ||
-        m_cancel->load() || (m_busy && !liveWhileBusy()) || !selected || selected->id != scope.market || selected->account != scope.account ||
+        m_cancel->load() || (result->cancel && result->cancel->load()) || (m_busy && !liveWhileBusy()) || !selected || selected->id != scope.market || selected->account != scope.account ||
         !basis || basis->market != scope.market || basis->head != scope.known_head) {
         m_watch.Dropped();
+        resumeSelectedRead();
         scheduleRearm();
         return;
     }
@@ -2959,6 +3356,7 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
     // reads the tracked request's status first, so a missed event cannot
     // hide its outcome, without discarding the scheduled phase.
     updateMarketText();
+    resumeSelectedRead();
     armWatch();
     if (!m_watch_thread) scheduleRearm();
 }
@@ -3018,12 +3416,14 @@ void B3FlowMeshTradingPanel::dropCaughtUpDisplay()
 void B3FlowMeshTradingPanel::stopWatchWorker(const bool join)
 {
     ++m_watch_generation;
+    if (m_active_watch_result && m_active_watch_result->cancel) m_active_watch_result->cancel->store(true);
     m_watch.Dropped();
     if (!m_watch_thread || !join) return;
     disconnect(m_watch_thread, nullptr, this, nullptr);
     m_watch_thread->wait();
     delete m_watch_thread;
     m_watch_thread = nullptr;
+    m_active_watch_result.reset();
 }
 
 QString B3FlowMeshTradingPanel::liveUpdateText() const
@@ -3188,8 +3588,12 @@ void B3FlowMeshTradingPanel::cancelAndWait()
     if (m_confirmation) m_confirmation->reject();
     if (m_funding_dialog) m_funding_dialog->reject();
     stopWorker();
-    // A wallet switch never waits for an outstanding live-update read: its
-    // result is dropped by generation. Only closing the panel joins it.
+    // Read actors own only value requests/results and the longer-lived Node,
+    // not the wallet model/backend or unlock context. A wallet switch fences
+    // and cancels their exact scopes, then drains asynchronously; closing
+    // must join both before panel/Node lifetime ends. The command above owns
+    // wallet resources and therefore always joins before their teardown.
+    stopSelectedReadWorker(m_closing);
     stopWatchWorker(m_closing);
     m_watch.Disable(); m_watch_key.clear(); m_watch_watchdog = false; m_watch_release_pending = false;
     m_reconcile_pending = false; m_last_job_was_reconcile = false;
@@ -3215,6 +3619,7 @@ void B3FlowMeshTradingPanel::cancelAndWait()
 }
 void B3FlowMeshTradingPanel::markUncertain(const std::shared_ptr<Result>& result)
 {
+    ++m_uncertain_generation;
     m_uncertain = true; m_uncertain_refreshed = false; m_uncertain_wallet = m_wallet;
     m_uncertain_action_id = result->receipt ? result->receipt->action_id : result->exact_retry && m_receipt ? m_receipt->action_id : QString{};
     m_uncertain_market = result->action ? result->action->market.id : result->exact_retry ? m_pending_market : QString{};

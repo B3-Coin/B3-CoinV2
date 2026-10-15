@@ -86,7 +86,7 @@ private:
         // Foreground read-only status of the tracked receipt right after its
         // signed action was sent, waiting briefly for certified inclusion.
         bool receipt_wait{false};
-        bool passive{false}, foreground_read{false}, refresh_yielded{false};
+        bool passive{false}, foreground_read{false}, refresh_yielded{false}, auxiliary_only{false};
         // A passive job while live updates supply the market read: only its
         // auxiliary phase runs, never the final selected-market read.
         bool live{false};
@@ -126,6 +126,28 @@ private:
         uint64_t generation{0}, watch_generation{0};
         QString market, account, known_head;
     };
+    //! Value-only attribution. Neither the in-flight read nor its one
+    //! coalesced successor owns a wallet/backend or an economic instruction.
+    struct SelectedReadScope {
+        QPointer<WalletModel> wallet;
+        interfaces::Node* node{nullptr};
+        uint64_t generation{0}, read_generation{0};
+        uint64_t command_observation{0};
+        B3FlowMeshTrading::Market market;
+        QString known_head;
+        uint64_t next_sequence{0};
+        bool uncertain{false};
+        uint64_t uncertain_generation{0};
+        QPointer<WalletModel> uncertain_wallet;
+        QString uncertain_market, uncertain_account, uncertain_action;
+        QString auxiliary_error;
+        std::optional<RefreshPhase> auxiliary_phase;
+    };
+    struct SelectedReadResult {
+        SelectedReadScope scope;
+        std::shared_ptr<std::atomic_bool> cancel;
+        Result data;
+    };
     struct WatchResult {
         WatchResult() { snapshot_age.start(); }
         WatchScope scope;
@@ -137,6 +159,7 @@ private:
         //! As Result's, for the watched market.
         std::optional<uint64_t> ticks_after;
         UniValue draft, levels;
+        std::shared_ptr<std::atomic_bool> cancel;
     };
     struct DeferredReview {
         B3FlowMeshTrading::Operation operation;
@@ -341,6 +364,13 @@ private:
         B3FlowMeshMarketData::Snapshot& snapshot);
     void finishJob(const std::shared_ptr<Result>& result);
     void applyJobResult(const std::shared_ptr<Result>& result);
+    void applyAuxiliaryResult(const Result& result);
+    std::optional<SelectedReadScope> selectedReadScope() const;
+    bool selectedReadScopeValid(const SelectedReadScope& scope, bool same_head = true) const;
+    void startSelectedRead(const QString& auxiliary_error = {}, std::optional<RefreshPhase> auxiliary_phase = {});
+    void resumeSelectedRead();
+    void finishSelectedRead(const std::shared_ptr<SelectedReadResult>& result);
+    void stopSelectedReadWorker(bool join);
     void applyMarketCatalog(const Result& result);
     //! The passive phase the next refresh would run (None: market read only),
     //! including a due reconcile-first override.
@@ -445,10 +475,23 @@ private:
     QPointer<QMessageBox> m_confirmation;
     QPointer<QDialog> m_funding_dialog;
     QThread* m_thread{nullptr};
+    // ONE selected Data/candles owner plus ONE coalesced value-only scope.
+    // Independent from command cancellation, unlock and uncertain actions.
+    QThread* m_selected_read_thread{nullptr};
+    std::shared_ptr<SelectedReadResult> m_selected_read_result;
+    // Only a user-clicked Order Review may consume this exact pending Data
+    // as its read-only preflight. Never candles, Watch or a command result.
+    std::weak_ptr<SelectedReadResult> m_selected_read_review;
+    std::optional<SelectedReadScope> m_selected_read_pending;
+    uint64_t m_selected_read_generation{0};
+    // Fence pre-command reads even after the command owner has completed.
+    // This never grants freshness or changes a retained economic instruction.
+    uint64_t m_selected_read_command_observation{0};
     QTimer* m_timer{nullptr};
     // Live updates: a second worker keeps at most one bounded watch read
     // outstanding for the selected market (see B3FlowMeshWatch::Policy).
     QThread* m_watch_thread{nullptr};
+    std::shared_ptr<WatchResult> m_active_watch_result;
     //! Single-shot, Qt::PreciseTimer: a coarse timer may fire early.
     QTimer* m_rearm{nullptr};
     B3FlowMeshWatch::Policy m_watch;
@@ -480,6 +523,7 @@ private:
     bool m_closing{false};
     bool m_busy{false}, m_restore_locked{false}, m_uncertain{false};
     bool m_uncertain_refreshed{false};
+    uint64_t m_uncertain_generation{0};
     bool m_route_pending{false}, m_requested_withdrawal{false};
     uint64_t m_generation{0};
     RefreshPhase m_refresh_phase{RefreshPhase::Catalog};
