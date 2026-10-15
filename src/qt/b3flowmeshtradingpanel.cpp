@@ -2331,7 +2331,32 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                         catch (...) { result->candles_error = QStringLiteral("Candles unavailable."); }
                     }
                 }
-                if (auxiliary_error) std::rethrow_exception(auxiliary_error); // Conservative failure; no new display freshness.
+                if (auxiliary_error) {
+                    // A status read also carries operator checkpoint metadata.
+                    // Its failure cannot negate a later, independently verified
+                    // full account read, but that read cannot refresh metadata
+                    // which it does not carry. No omitted/unchanged account,
+                    // live-only job, other auxiliary error or stale response
+                    // receives this exception to conservative failure handling.
+                    const auto* fresh{result->snapshot ? &*result->snapshot : nullptr};
+                    if (!result->passive || phase != RefreshPhase::Status || selected == result->markets.end() ||
+                        !fresh || fresh->unchanged || !fresh->remote || !fresh->certified ||
+                        !fresh->certificate_verified || !fresh->account_state_verified ||
+                        !selected->has_account || fresh->account.isEmpty() || fresh->account != selected->account ||
+                        fresh->market != selected->id || fresh->base != selected->base ||
+                        fresh->domain != selected->domain || fresh->config != selected->config ||
+                        fresh->next_sequence < result->basis_sequence ||
+                        (fresh->next_sequence == result->basis_sequence && !known_head.isEmpty() && fresh->head != known_head) ||
+                        !result->snapshot_age.isValid() || result->snapshot_age.elapsed() > B3FlowMeshMarketData::LINK_FRESH_MS) {
+                        std::rethrow_exception(auxiliary_error);
+                    }
+                    selected->checkpoint_pending = false; selected->checkpoint.clear(); selected->publish_ready = false;
+                    result->effects.clear();
+                    try { std::rethrow_exception(auxiliary_error); }
+                    catch (const UniValue& error) { result->auxiliary_error = RpcError(error); }
+                    catch (const std::exception& error) { result->auxiliary_error = QString::fromUtf8(error.what()).left(500); }
+                    catch (...) { result->auxiliary_error = QStringLiteral("Operator status unavailable."); }
+                }
                 read_client_info(); // Include observations from this market read.
                 timing.Mark("completed_us");
                 return;
@@ -2509,6 +2534,9 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
     }
     if (!result->action) {
         m_loading = false; m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_read_error.clear();
+        if (!result->auxiliary_error.isEmpty()) {
+            notice(tr("Operator status refresh failed: %1. A later certified account read succeeded; checkpoint and payout tools require fresh operator metadata.").arg(result->auxiliary_error));
+        }
         linkToast(true);
         if (!result->refresh_phase || *result->refresh_phase == RefreshPhase::Receipt) applyReceiptError(*result, result->receipt_error);
         if (result->receipt) applyReceipt(*result->receipt);

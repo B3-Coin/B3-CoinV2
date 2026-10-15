@@ -6547,11 +6547,86 @@ private Q_SLOTS:
         QCOMPARE(probe.catalogs.load(), 1); QCOMPARE(probe.receipts.load(), 1); QCOMPARE(probe.snapshots.load(), 4);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
+    void newerCertifiedDataSupersedesFailedPassiveStatusOnly()
+    {
+        using Phase = B3FlowMeshTradingPanel::RefreshPhase;
+        for (const bool uncertain : {false, true}) {
+            FundingReadProbe probe; probe.failed_method = "getflowmeshbalance"; probe.data = NewerRemoteData();
+            B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+            panel.m_refresh_phase = Phase::Status;
+            panel.m_market_data.front().checkpoint_pending = true;
+            panel.m_market_data.front().checkpoint = QString::fromStdString(H(70).GetHex());
+            panel.m_effect_data.push_back(UniValue{UniValue::VOBJ}); panel.m_effect->addItem(QStringLiteral("Old payout"));
+            if (uncertain) {
+                panel.m_uncertain = true; panel.m_uncertain_wallet = panel.m_wallet;
+                panel.m_uncertain_action_id = QString::fromStdString(H(95).GetHex());
+                panel.m_uncertain_market = panel.m_snapshot->market; panel.m_uncertain_account = panel.m_snapshot->account;
+            }
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            // The later, full selected-account proof is fresh independently of
+            // the failed operator-status read. Neither result invents a fill.
+            QVERIFY2(!panel.m_read_failed, qPrintable(panel.m_read_error));
+            QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.writes.load(), 0);
+            QCOMPARE(panel.m_snapshot->head, QString::fromStdString(H(10).GetHex()));
+            QCOMPARE(panel.market()->sequence, uint64_t{9});
+            QVERIFY(panel.m_response_age.isValid()); QVERIFY(panel.m_response_age.elapsed() < LINK_FRESH_MS);
+            QVERIFY(panel.market()->ready); QCOMPARE(panel.orderReady(), !uncertain);
+            // Status failure cannot refresh retained checkpoint/payout claims.
+            QVERIFY(!panel.market()->checkpoint_pending); QVERIFY(panel.market()->checkpoint.isEmpty());
+            QVERIFY(!panel.market()->publish_ready); QVERIFY(panel.m_effect_data.empty());
+            QVERIFY(!panel.m_checkpoint->isEnabled()); QVERIFY(!panel.m_publish->isEnabled());
+            QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Operator status refresh failed: Synthetic auxiliary failed")));
+            QCOMPARE(panel.m_uncertain, uncertain);
+            if (uncertain) QCOMPARE(panel.m_uncertain_action_id, QString::fromStdString(H(95).GetHex()));
+            QCOMPARE(panel.m_refresh_phase, Phase::Effects); QVERIFY(m_wallet->IsLocked());
+        }
+    }
+    void failedStatusRequiresFullFreshVerifiedSelectedAccount_data()
+    {
+        QTest::addColumn<int>("condition");
+        QTest::newRow("selected read failed") << 0;
+        QTest::newRow("unchanged account omitted") << 1;
+        QTest::newRow("certificate not verified") << 2;
+        QTest::newRow("account proof not verified") << 3;
+        QTest::newRow("different account") << 4;
+        QTest::newRow("local engine not remote proof") << 5;
+        QTest::newRow("older selected head") << 6;
+        QTest::newRow("conflicting equal-height head") << 7;
+    }
+    void failedStatusRequiresFullFreshVerifiedSelectedAccount()
+    {
+        QFETCH(int, condition);
+        FundingReadProbe probe; probe.failed_method = "getflowmeshbalance"; probe.data = NewerRemoteData();
+        if (condition == 0) probe.fail = true;
+        if (condition == 1) probe.data.pushKV("unchanged", true);
+        if (condition == 2 || condition == 3) {
+            auto proof{probe.data["verification"]};
+            proof.pushKV(condition == 2 ? "certificate_verified" : "account_state_verified", false);
+            probe.data.pushKV("verification", proof);
+        }
+        if (condition == 4) {
+            auto account{probe.data["account"]}; account.pushKV("account_id", H(99).GetHex());
+            account.pushKV("curves", UniValue{UniValue::VARR}); probe.data.pushKV("account", account);
+        }
+        if (condition == 5) probe.data = Data();
+        if (condition == 6 || condition == 7) {
+            auto snapshot{probe.data["snapshot"]}; snapshot.pushKV("next_microblock_sequence", condition == 6 ? 2 : 3);
+            probe.data.pushKV("snapshot", snapshot);
+            auto history{probe.data["history"]}; history.pushKV("entries", UniValue{UniValue::VARR}); probe.data.pushKV("history", history);
+        }
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Status;
+        const auto observed{panel.m_response_age.msecsSinceReference()}; const auto head{panel.m_snapshot->head};
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QVERIFY(panel.m_read_failed); QVERIFY(!panel.orderReady());
+        QCOMPARE(panel.m_snapshot->head, head); QCOMPARE(panel.m_response_age.msecsSinceReference(), observed);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
     void passiveAuxiliaryFailureAdvancesWithoutRenewingFreshness()
     {
         using Phase = B3FlowMeshTradingPanel::RefreshPhase;
         for (const auto& [phase, method, next] : {std::tuple{Phase::Catalog, "listflowmeshmarkets", Phase::Status},
-                 std::tuple{Phase::Status, "getflowmeshbalance", Phase::Effects}, std::tuple{Phase::Effects, "listflowmeshvaultoperations", Phase::Receipt}}) {
+                 std::tuple{Phase::Effects, "listflowmeshvaultoperations", Phase::Receipt}}) {
             FundingReadProbe probe; probe.failed_method = method;
             B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
             panel.m_refresh_phase = phase;
@@ -7823,9 +7898,12 @@ private Q_SLOTS:
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
         TrackUnknown(panel); panel.m_catalog_age.start(); panel.m_refresh_phase = Phase::Status;
         panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
-        // The market read itself succeeded: nothing was lost.
-        QVERIFY(panel.m_read_failed); QCOMPARE(probe.snapshots.load(), 1);
+        // The later full account read succeeded: nothing was lost. It does
+        // not prove the independently tracked instruction's outcome.
+        QVERIFY(!panel.m_read_failed); QCOMPARE(probe.snapshots.load(), 1);
         QVERIFY(!panel.m_reconcile_pending); QCOMPARE(panel.nextPassivePhase(), Phase::Effects);
+        QVERIFY(panel.m_receipt); QCOMPARE(panel.m_receipt->action_id, QString::fromStdString(H(42).GetHex()));
+        QCOMPARE(panel.m_receipt->state, QStringLiteral("unknown")); QVERIFY(!panel.m_receipt->certificate_verified);
         QCOMPARE(probe.writes.load(), 0);
     }
     void reconcileFirstIsOneShotAndNeverStarvesCatalog()

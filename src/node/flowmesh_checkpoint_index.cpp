@@ -378,6 +378,19 @@ bool FlowMeshCheckpointIndex::VerifyVaultProof(
     return true;
 }
 
+std::optional<size_t> FlowMeshCheckpointIndex::HistoryPosition(
+    const int height, FlowMeshSettlementScanWork* work) const
+{
+    if (m_history.empty() || height < m_history.front().height) return std::nullopt;
+    const uint64_t offset{static_cast<uint64_t>(
+        static_cast<int64_t>(height) - m_history.front().height)};
+    if (offset >= m_history.size()) return std::nullopt;
+    const size_t position{static_cast<size_t>(offset)};
+    if (work) ++work->anchor_records;
+    if (m_history[position].height != height) return std::nullopt;
+    return position;
+}
+
 bool FlowMeshCheckpointIndex::WithdrawalSettlementsBetween(
     const flowmesh::MarketId& market_id,
     const CBlockIndex& after_exclusive,
@@ -385,6 +398,18 @@ bool FlowMeshCheckpointIndex::WithdrawalSettlementsBetween(
     std::vector<flowmesh::WithdrawalSettlementFactV1>& out,
     std::string& error) const
 {
+    return WithdrawalSettlementsBetween(market_id, after_exclusive,
+                                       through_inclusive, out, error, nullptr);
+}
+
+bool FlowMeshCheckpointIndex::WithdrawalSettlementsBetween(
+    const flowmesh::MarketId& market_id,
+    const CBlockIndex& after_exclusive,
+    const CBlockIndex& through_inclusive,
+    std::vector<flowmesh::WithdrawalSettlementFactV1>& out,
+    std::string& error, FlowMeshSettlementScanWork* work) const
+{
+    if (work) *work = {};
     out.clear();
     if (market_id.IsNull() || after_exclusive.nHeight < 0 ||
         through_inclusive.nHeight <= after_exclusive.nHeight ||
@@ -393,14 +418,8 @@ bool FlowMeshCheckpointIndex::WithdrawalSettlementsBetween(
         error = "FlowMesh settlement interval is not one forward chain range";
         return false;
     }
-    const auto indexed_anchor = [&](const CBlockIndex& index) {
-        const auto it{std::find_if(
-            m_history.begin(), m_history.end(), [&](const auto& delta) {
-                return delta.height == index.nHeight;
-            })};
-        return it != m_history.end() &&
-               it->block_hash == index.GetBlockHash();
-    };
+    const auto after_position{HistoryPosition(after_exclusive.nHeight, work)};
+    const auto through_position{HistoryPosition(through_inclusive.nHeight, work)};
     // The complete checkpoint history starts at A3. A caller scanning a
     // mixed A2/A3 interval clamps its known-empty pre-A3 prefix to the exact
     // A3-1 predecessor. That predecessor has no checkpoint delta by design,
@@ -412,16 +431,21 @@ bool FlowMeshCheckpointIndex::WithdrawalSettlementsBetween(
         through_inclusive.GetAncestor(m_history.front().height) != nullptr &&
         through_inclusive.GetAncestor(m_history.front().height)
                 ->GetBlockHash() == m_history.front().block_hash};
-    if ((!indexed_anchor(after_exclusive) &&
+    if (((!after_position ||
+          m_history[*after_position].block_hash != after_exclusive.GetBlockHash()) &&
          !retained_history_predecessor) ||
-        !indexed_anchor(through_inclusive)) {
+        !through_position ||
+        m_history[*through_position].block_hash != through_inclusive.GetBlockHash()) {
         error = "FlowMesh settlement interval is outside retained indexed history";
         return false;
     }
 
-    for (const FlowMeshCheckpointBlockDelta& delta : m_history) {
-        if (delta.height <= after_exclusive.nHeight) continue;
-        if (delta.height > through_inclusive.nHeight) break;
+    // The endpoints are exact and the retained history is contiguous. Visit
+    // every included block, never all of the already-excluded prefix.
+    for (size_t position{after_position ? *after_position + 1 : 0};
+         position <= *through_position; ++position) {
+        const FlowMeshCheckpointBlockDelta& delta{m_history[position]};
+        if (work) ++work->range_records;
         const CBlockIndex* canonical{
             through_inclusive.GetAncestor(delta.height)};
         if (canonical == nullptr ||
@@ -470,6 +494,20 @@ bool FlowMeshCheckpointIndex::WithdrawalSettlementCatchupHeight(
     int& selected_height, size_t& selected_count,
     std::string& error) const
 {
+    return WithdrawalSettlementCatchupHeight(market_id, after_exclusive,
+                                            through_inclusive, max_count,
+                                            selected_height, selected_count,
+                                            error, nullptr);
+}
+
+bool FlowMeshCheckpointIndex::WithdrawalSettlementCatchupHeight(
+    const flowmesh::MarketId& market_id,
+    const CBlockIndex& after_exclusive,
+    const CBlockIndex& through_inclusive, const size_t max_count,
+    int& selected_height, size_t& selected_count,
+    std::string& error, FlowMeshSettlementScanWork* work) const
+{
+    if (work) *work = {};
     selected_height = -1;
     selected_count = 0;
     if (market_id.IsNull() || max_count == 0 ||
@@ -480,30 +518,27 @@ bool FlowMeshCheckpointIndex::WithdrawalSettlementCatchupHeight(
         error = "FlowMesh settlement catch-up interval is not one forward chain range";
         return false;
     }
-    const auto indexed_anchor = [&](const CBlockIndex& index) {
-        const auto it{std::find_if(
-            m_history.begin(), m_history.end(), [&](const auto& delta) {
-                return delta.height == index.nHeight;
-            })};
-        return it != m_history.end() &&
-               it->block_hash == index.GetBlockHash();
-    };
+    const auto after_position{HistoryPosition(after_exclusive.nHeight, work)};
+    const auto through_position{HistoryPosition(through_inclusive.nHeight, work)};
     const bool retained_history_predecessor{
         !m_history.empty() &&
         after_exclusive.nHeight + 1 == m_history.front().height &&
         through_inclusive.GetAncestor(m_history.front().height) != nullptr &&
         through_inclusive.GetAncestor(m_history.front().height)
                 ->GetBlockHash() == m_history.front().block_hash};
-    if ((!indexed_anchor(after_exclusive) &&
+    if (((!after_position ||
+          m_history[*after_position].block_hash != after_exclusive.GetBlockHash()) &&
          !retained_history_predecessor) ||
-        !indexed_anchor(through_inclusive)) {
+        !through_position ||
+        m_history[*through_position].block_hash != through_inclusive.GetBlockHash()) {
         error = "FlowMesh settlement catch-up interval is outside retained indexed history";
         return false;
     }
 
-    for (const FlowMeshCheckpointBlockDelta& delta : m_history) {
-        if (delta.height <= after_exclusive.nHeight) continue;
-        if (delta.height > through_inclusive.nHeight) break;
+    for (size_t position{after_position ? *after_position + 1 : 0};
+         position <= *through_position; ++position) {
+        const FlowMeshCheckpointBlockDelta& delta{m_history[position]};
+        if (work) ++work->range_records;
         const CBlockIndex* canonical{
             through_inclusive.GetAncestor(delta.height)};
         if (canonical == nullptr ||

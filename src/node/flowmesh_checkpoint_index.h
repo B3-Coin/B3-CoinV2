@@ -83,6 +83,14 @@ struct FlowMeshVaultAuthorization {
     std::optional<FlowMeshEffectNullifier> nullifier;
 };
 
+/** Optional per-call work observation, never an authorization or query bound.
+ * Counts candidate endpoint records and range records examined, excluding
+ * constant front-height/bounds metadata reads; not heap bytes or wall time. */
+struct FlowMeshSettlementScanWork {
+    size_t anchor_records{0};
+    size_t range_records{0};
+};
+
 /**
  * Rebuildable chain authorization state for type 8 and the proof-replay part
  * of type 9. Candidate verification operates on scratch maps and produces a
@@ -153,6 +161,13 @@ public:
         const CBlockIndex& through_inclusive,
         std::vector<flowmesh::WithdrawalSettlementFactV1>& out,
         std::string& error) const;
+    /** Same query with an optional work observation; no extra authority. */
+    bool WithdrawalSettlementsBetween(
+        const flowmesh::MarketId& market_id,
+        const CBlockIndex& after_exclusive,
+        const CBlockIndex& through_inclusive,
+        std::vector<flowmesh::WithdrawalSettlementFactV1>& out,
+        std::string& error, FlowMeshSettlementScanWork* work) const;
 
     /**
      * Choose the furthest block boundary in `(after, through]` containing no
@@ -166,8 +181,22 @@ public:
         const CBlockIndex& through_inclusive, size_t max_count,
         int& selected_height, size_t& selected_count,
         std::string& error) const;
+    /** Same query with an optional work observation; no extra authority. */
+    bool WithdrawalSettlementCatchupHeight(
+        const flowmesh::MarketId& market_id,
+        const CBlockIndex& after_exclusive,
+        const CBlockIndex& through_inclusive, size_t max_count,
+        int& selected_height, size_t& selected_count,
+        std::string& error, FlowMeshSettlementScanWork* work) const;
 
 private:
+    /** ConnectBlock retains every contiguous height, including empty blocks;
+     * DisconnectBlock removes only its tip and Clear removes all of it. A
+     * validated height offset therefore locates one record without scanning
+     * the unrelated prefix. Hash/canonical-chain checks remain with callers. */
+    std::optional<size_t> HistoryPosition(
+        int height, FlowMeshSettlementScanWork* work) const;
+
     bool VerifyRecords(const CTransaction& tx, int candidate_height,
                        const uint256& candidate_block, const CChain& chain,
                        const Consensus::Params& params,

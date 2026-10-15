@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -614,6 +615,133 @@ BOOST_AUTO_TEST_CASE(settlement_scan_accepts_exact_pre_activation_boundary)
     BOOST_CHECK(!index.WithdrawalSettlementsBetween(
         fixture.market, fixture.chain.indexes[A3 - 2],
         fixture.chain.indexes[A3 + 2], settlements, error));
+
+    int selected_height{-1};
+    size_t selected_count{0};
+    BOOST_REQUIRE_MESSAGE(index.WithdrawalSettlementCatchupHeight(
+                              fixture.market, fixture.chain.indexes[A3 - 1],
+                              fixture.chain.indexes[A3 + 2], 1,
+                              selected_height, selected_count, error), error);
+    BOOST_CHECK_EQUAL(selected_height, A3 + 2);
+    BOOST_CHECK_EQUAL(selected_count, 0U);
+    BOOST_CHECK(!index.WithdrawalSettlementCatchupHeight(
+        fixture.market, fixture.chain.indexes[A3 - 2],
+        fixture.chain.indexes[A3 + 2], 1, selected_height,
+        selected_count, error));
+}
+
+BOOST_AUTO_TEST_CASE(settlement_short_tail_work_is_independent_of_retained_prefix)
+{
+    constexpr int FIRST{100};
+    constexpr int BLOCKS{300'000};
+    constexpr int LAST{FIRST + BLOCKS - 1};
+    constexpr int INTERVAL{3};
+    SyntheticChain chain{LAST};
+    for (int height{0}; height <= LAST; ++height) {
+        chain.hashes[height] = NumberedId(0xe8, height);
+        chain.indexes[height].BuildSkip();
+    }
+    node::FlowMeshCheckpointIndex index;
+    std::string error;
+    for (int height{FIRST}; height <= LAST; ++height) {
+        node::FlowMeshCheckpointBlockDelta delta;
+        delta.height = height;
+        delta.block_hash = chain.hashes[height];
+        BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
+    }
+    const auto market{Filled(0xe5)};
+    std::vector<flowmesh::WithdrawalSettlementFactV1> settlements;
+    node::FlowMeshSettlementScanWork work;
+    const auto& after{chain.indexes[LAST - INTERVAL]};
+    const auto& through{chain.indexes[LAST]};
+    BOOST_REQUIRE_MESSAGE(index.WithdrawalSettlementsBetween(
+                              market, after, through, settlements, error,
+                              &work), error);
+    BOOST_CHECK(settlements.empty());
+    BOOST_TEST_MESSAGE("settlement tail: anchors=" << work.anchor_records
+                       << ", range=" << work.range_records);
+    BOOST_CHECK_EQUAL(work.anchor_records, 2U);
+    BOOST_CHECK_EQUAL(work.range_records, INTERVAL);
+
+    int selected_height{-1};
+    size_t selected_count{0};
+    BOOST_REQUIRE_MESSAGE(index.WithdrawalSettlementCatchupHeight(
+                              market, after, through, 1, selected_height,
+                              selected_count, error, &work), error);
+    BOOST_CHECK_EQUAL(selected_height, LAST);
+    BOOST_CHECK_EQUAL(selected_count, 0U);
+    BOOST_TEST_MESSAGE("catch-up tail: anchors=" << work.anchor_records
+                       << ", range=" << work.range_records);
+    BOOST_CHECK_EQUAL(work.anchor_records, 2U);
+    BOOST_CHECK_EQUAL(work.range_records, INTERVAL);
+
+    // A bounded microbenchmark is descriptive only. Work counts above, not
+    // scheduling-sensitive wall time, are this regression's assertions.
+    constexpr size_t REPEATS{100};
+    const auto started{std::chrono::steady_clock::now()};
+    for (size_t repeat{0}; repeat < REPEATS; ++repeat) {
+        BOOST_REQUIRE(index.WithdrawalSettlementsBetween(
+            market, after, through, settlements, error));
+        BOOST_REQUIRE(index.WithdrawalSettlementCatchupHeight(
+            market, after, through, 1, selected_height, selected_count, error));
+    }
+    const auto elapsed{std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count()};
+    BOOST_TEST_MESSAGE("300000 retained / 3-block tail / 100 query pairs: "
+                       << elapsed << " us (not a performance threshold)");
+
+    // Exact endpoint identity and reorg handling still apply at a large
+    // offset, and Disconnect/Connect must not leave stale offset state.
+    BOOST_REQUIRE(index.DisconnectBlock(LAST, chain.hashes[LAST], error));
+    BOOST_CHECK(!index.WithdrawalSettlementsBetween(
+        market, after, through, settlements, error));
+    node::FlowMeshCheckpointBlockDelta replacement;
+    replacement.height = LAST;
+    replacement.block_hash = NumberedId(0xe6, LAST);
+    BOOST_REQUIRE(index.ConnectBlock(replacement, error));
+    BOOST_CHECK(!index.WithdrawalSettlementCatchupHeight(
+        market, after, through, 1, selected_height, selected_count, error));
+    chain.hashes[LAST] = replacement.block_hash;
+    BOOST_REQUIRE(index.WithdrawalSettlementsBetween(
+        market, after, through, settlements, error, &work));
+    BOOST_CHECK_EQUAL(work.anchor_records, 2U);
+    BOOST_CHECK_EQUAL(work.range_records, INTERVAL);
+
+    index.Clear();
+    BOOST_CHECK(!index.WithdrawalSettlementsBetween(
+        market, after, through, settlements, error));
+    BOOST_CHECK(!index.WithdrawalSettlementCatchupHeight(
+        market, after, through, 1, selected_height, selected_count, error));
+}
+
+BOOST_AUTO_TEST_CASE(settlement_range_checks_every_interior_canonical_block)
+{
+    constexpr int FIRST{100};
+    constexpr int LAST{FIRST + 5};
+    SyntheticChain chain{LAST};
+    node::FlowMeshCheckpointIndex index;
+    std::string error;
+    for (int height{FIRST}; height <= LAST; ++height) {
+        node::FlowMeshCheckpointBlockDelta delta;
+        delta.height = height;
+        delta.block_hash = chain.hashes[height];
+        BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
+    }
+    // Endpoints still match, but one interior canonical identity differs.
+    // Empty blocks cannot be skipped merely because they hold no receipts.
+    chain.hashes[FIRST + 2] = Filled(0xe7);
+    const auto market{Filled(0xe5)};
+    std::vector<flowmesh::WithdrawalSettlementFactV1> settlements;
+    BOOST_CHECK(!index.WithdrawalSettlementsBetween(
+        market, chain.indexes[FIRST], chain.indexes[LAST], settlements, error));
+    BOOST_CHECK(settlements.empty());
+    BOOST_CHECK_EQUAL(error, "FlowMesh settlement interval does not match indexed history");
+    int selected_height{-1};
+    size_t selected_count{0};
+    BOOST_CHECK(!index.WithdrawalSettlementCatchupHeight(
+        market, chain.indexes[FIRST], chain.indexes[LAST], 1,
+        selected_height, selected_count, error));
+    BOOST_CHECK_EQUAL(error, "FlowMesh settlement catch-up interval does not match indexed history");
 }
 
 BOOST_AUTO_TEST_CASE(offline_settlement_backlog_uses_bounded_block_anchors)
