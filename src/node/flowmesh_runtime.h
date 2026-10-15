@@ -590,6 +590,12 @@ public:
 
     std::optional<FlowMeshRuntimeMarketStatus> MarketStatus(
         const flowmesh::MarketId& market_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
+    /** Synchronous, advisory key-change observation. Call after releasing the
+     * key provider's mutex, without cs_main or a runtime relay callback.
+     * Updates published observer metadata only: never signs, schedules work
+     * or grants authority. Before Start/from Stop it does nothing. Concurrent
+     * replacements are sampled from the live provider, not a caller's keys. */
+    void RefreshSeatKeyObservation() EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     std::optional<flowmesh::FlowMeshState> StateSnapshot(
         const flowmesh::MarketId& market_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     //! Same committed state, shared and immutable; no market/store/chain lock.
@@ -701,7 +707,8 @@ private:
     std::shared_ptr<const ReadView> LoadReadView(const flowmesh::MarketId& market_id) const
         EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     //! Writer-owned calls only. No authority decision reads the published view.
-    void PublishReadLocked(Market& market, const flowmesh::ProductionEntryCore* committed = nullptr)
+    void PublishReadLocked(Market& market, const flowmesh::ProductionEntryCore* committed = nullptr,
+                          std::vector<std::shared_ptr<const ReadView>>* local_retired = nullptr)
         EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     void PublishReadViewsLocked() EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     //! Called outside m_market_mutex; old states can be expensive to destroy.

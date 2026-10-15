@@ -13,6 +13,7 @@
 #include <flowmesh/market_view.h>
 #include <flowmesh/observed_time.h>
 #include <hash.h>
+#include <kernel/cs_main.h>
 #include <logging.h>
 #include <random.h>
 #include <serialize.h>
@@ -3751,7 +3752,8 @@ std::shared_ptr<const FlowMeshRuntime::ReadView> FlowMeshRuntime::LoadReadView(
     return it == m_read_views.end() ? nullptr : it->second;
 }
 
-void FlowMeshRuntime::PublishReadLocked(Market& market, const flowmesh::ProductionEntryCore* committed)
+void FlowMeshRuntime::PublishReadLocked(Market& market, const flowmesh::ProductionEntryCore* committed,
+                                       std::vector<std::shared_ptr<const ReadView>>* local_retired)
 {
     const auto previous{LoadReadView(market.market_id)};
     auto out{std::make_shared<ReadView>()};
@@ -3810,8 +3812,31 @@ void FlowMeshRuntime::PublishReadLocked(Market& market, const flowmesh::Producti
     // Keep replaced handles until the writer has released m_market_mutex.
     LOCK(m_read_mutex);
     auto& slot{m_read_views[market.market_id]};
-    if (slot) m_retired_read_views.push_back(std::move(slot));
+    if (slot) {
+        auto& retired{local_retired ? *local_retired : m_retired_read_views};
+        retired.push_back(std::move(slot));
+    }
     slot = std::move(out);
+}
+
+void FlowMeshRuntime::RefreshSeatKeyObservation()
+{
+    AssertLockNotHeld(::cs_main);
+    if (m_client_waits_closed.load()) return;
+    // Do not share retirement ownership with the worker: its outside-lock
+    // drain could otherwise release this publisher's old view too early.
+    std::vector<std::shared_ptr<const ReadView>> retired;
+    {
+        std::lock_guard lock{m_market_mutex};
+        if (m_client_waits_closed.load()) return;
+        for (auto& [id, market] : m_markets) {
+            (void)id;
+            market->read_observer_only = !market->ready || LocalSeatKeys(*market).empty();
+            if (m_client_waits_closed.load()) return;
+            PublishReadLocked(*market, nullptr, &retired);
+        }
+    }
+    // Potentially expensive last destruction is after the writer lock.
 }
 
 void FlowMeshRuntime::PublishReadViewsLocked()

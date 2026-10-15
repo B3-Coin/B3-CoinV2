@@ -29,6 +29,26 @@ annotated `Mutex` with precise negative preconditions and guarded fields.
 These annotations are not a claim that existing trading code cannot acquire
 `cs_main`.
 
+### Synchronous administrative key observation
+
+The later observer-metadata correction handles successful arm/disarm without
+waiting for the next worker tick. The service releases its mutex before asking
+the runtime writer to sample the live key provider and publish advisory
+`observer_only` metadata. This is not signing permission or a new vote. Before
+Start and during/after Stop the helper refuses publication. Its replaced read
+views have a private retirement batch, destroyed after the writer lock so a
+concurrent worker cannot drain them prematurely. Public readers still call no
+provider, chain or store. Administrative arm/disarm itself can wait for those
+existing writer/provider locks; it is not a latency or chain-facts isolation fix.
+
+The deterministic predecessor control failed its immediate armed-observation
+assertion: 32 of 33 assertions passed, exit 201. The corrected case, including
+disarm, unrelated keys, closed authority and unchanged certified state/events,
+passed in the 131-case runtime suite and the integrated 398-case ordinary macOS
+qualification. Separate source review accepted this bounded correction. The
+earlier full release/reindex failure remains evidence, not a claim that that
+entire functional campaign has now been rerun.
+
 Internal historical evidence lookup retains its existing blocking fallback.
 Public callers must explicitly request `allow_history=false`; older evidence
 outside the retained window yields `history_busy`, not false nonexecution or

@@ -7685,6 +7685,86 @@ BOOST_AUTO_TEST_CASE(certified_reads_do_not_wait_for_a_blocked_market_worker)
     BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
 }
 
+BOOST_AUTO_TEST_CASE(seat_key_observation_publishes_without_a_tick_or_certified_state_change)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_seat_key_observation"};
+    const auto refresh = [&] {
+#ifndef FLOWMESH_SEAT_OBSERVATION_BASELINE_TEST
+        f.runtime->RefreshSeatKeyObservation();
+#endif
+        // The test-only baseline adapter deliberately omits the new
+        // notification: the preceding implementation only scheduled a tick.
+        // The immediate observer assertion below must fail on that control.
+    };
+    refresh(); // Before Start: no view or key-provider observation is created.
+    BOOST_CHECK(!f.runtime->MarketStatus(f.market));
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    f.Certificate(8, 0);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    const auto before{f.runtime->MarketStatus(f.market)};
+    const auto state{f.runtime->StateView(f.market)};
+    const auto evidence{f.runtime->ClientSnapshot(f.market, error)};
+    const auto cursor{f.runtime->ClientEventCursor()};
+    const auto clock{f.clock.Now()};
+    const auto health{f.runtime->HealthSnapshot()};
+    BOOST_REQUIRE(before && state && evidence);
+    BOOST_REQUIRE(before->observer_only);
+
+    // The provider changes only while idle. No queued work, NotifyTick,
+    // clock advance or new signature can hide stale observer metadata.
+    f.keys.m_keys[f.market] = {f.seats.secrets[1]};
+    refresh();
+    BOOST_REQUIRE(!f.runtime->MarketStatus(f.market)->observer_only);
+    const auto armed_data{f.runtime->MarketData(f.market, std::nullopt, {}, error)};
+    BOOST_REQUIRE_MESSAGE(armed_data, error);
+    BOOST_CHECK(!armed_data->snapshot.observer_only);
+    f.keys.m_keys.clear();
+    refresh();
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->observer_only);
+    f.keys.m_keys[f.market] = {Key(42, 91)}; // Armed is not membership.
+    refresh();
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->observer_only);
+
+    f.keys.m_keys[f.market] = {f.seats.secrets[1]};
+    f.keys.m_visibility_chain = &f.chain;
+    f.chain.SetReconciled(false);
+    refresh();
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->observer_only);
+    f.chain.SetReconciled(true);
+    refresh();
+    BOOST_CHECK(!f.runtime->MarketStatus(f.market)->observer_only);
+
+    const auto after{f.runtime->MarketStatus(f.market)};
+    const auto after_evidence{f.runtime->ClientSnapshot(f.market, error)};
+    BOOST_REQUIRE(after && after_evidence);
+    BOOST_CHECK_EQUAL(after->epoch, before->epoch);
+    BOOST_CHECK_EQUAL(after->round, before->round);
+    BOOST_CHECK_EQUAL(after->next_sequence, before->next_sequence);
+    BOOST_CHECK_EQUAL(after->next_effect_index, before->next_effect_index);
+    BOOST_CHECK_EQUAL(after->pending_actions, before->pending_actions);
+    BOOST_CHECK(after->last_microblock_hash == before->last_microblock_hash);
+    BOOST_CHECK(after->state_root == before->state_root);
+    BOOST_CHECK(after->halt == before->halt);
+    BOOST_CHECK_EQUAL(after->paused, before->paused);
+    BOOST_CHECK(f.runtime->StateView(f.market) == state);
+    BOOST_CHECK(after_evidence->certified_payload == evidence->certified_payload);
+    BOOST_CHECK(after_evidence->state_bytes == evidence->state_bytes);
+    BOOST_CHECK(f.runtime->ClientEventCursor().instance_id == cursor.instance_id);
+    BOOST_CHECK_EQUAL(f.runtime->ClientEventCursor().event_id, cursor.event_id);
+    BOOST_CHECK(f.clock.Now() == clock);
+    BOOST_CHECK(f.runtime->HealthSnapshot() == health);
+    std::optional<uint256> lock;
+    BOOST_REQUIRE(f.store.ReadLock({f.seats.seats.epoch, before->next_sequence}, lock, error));
+    BOOST_CHECK(!lock); // Updating display capability cannot issue a vote.
+
+    f.runtime->Stop();
+    f.keys.m_keys.clear();
+    refresh(); // Closed runtime: no new view or provider sampling.
+    BOOST_CHECK(!f.runtime->MarketStatus(f.market)->observer_only);
+    BOOST_CHECK(f.runtime->StateView(f.market) == state);
+}
+
 BOOST_AUTO_TEST_CASE(certified_read_versions_are_immutable_and_survive_rejected_certificate_and_restart)
 {
     HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_certified_read_versions"};

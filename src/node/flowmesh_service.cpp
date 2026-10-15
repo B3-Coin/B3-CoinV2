@@ -2632,8 +2632,11 @@ bool FlowMeshService::ArmSeatKeys(std::vector<bls::SecretKey> keys,
         if (result) *result = m_impl->SeatKeyStatusLocked();
         runtime = m_impl->runtime;
     }
-    if (runtime && m_impl->ReconciledAtTip()) {
-        runtime->NotifyTick();
+    if (runtime) {
+        // The provider takes service/chain locks. Never call it while the
+        // service mutex is held, and do not defer metadata to an async tick.
+        runtime->RefreshSeatKeyObservation();
+        if (m_impl->ReconciledAtTip()) runtime->NotifyTick();
     }
     return true;
 }
@@ -2648,16 +2651,21 @@ bool FlowMeshService::DisarmSeatKeys(
     std::string& error, const std::optional<uint256>& expected_fingerprint,
     FlowMeshSeatKeyStatus* result)
 {
-    std::lock_guard<std::mutex> lock{m_impl->mutex};
-    if (expected_fingerprint &&
-        m_impl->local_key_fingerprint != *expected_fingerprint) {
-        error = "FlowMesh armed keys changed; refresh and explicitly confirm the node-global operation again";
-        return false;
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard<std::mutex> lock{m_impl->mutex};
+        if (expected_fingerprint &&
+            m_impl->local_key_fingerprint != *expected_fingerprint) {
+            error = "FlowMesh armed keys changed; refresh and explicitly confirm the node-global operation again";
+            return false;
+        }
+        m_impl->local_keys.clear();
+        m_impl->local_public_keys.clear();
+        m_impl->local_key_fingerprint = FlowMeshSeatKeysFingerprint({});
+        if (result) *result = m_impl->SeatKeyStatusLocked();
+        runtime = m_impl->runtime;
     }
-    m_impl->local_keys.clear();
-    m_impl->local_public_keys.clear();
-    m_impl->local_key_fingerprint = FlowMeshSeatKeysFingerprint({});
-    if (result) *result = m_impl->SeatKeyStatusLocked();
+    if (runtime) runtime->RefreshSeatKeyObservation();
     return true;
 }
 
