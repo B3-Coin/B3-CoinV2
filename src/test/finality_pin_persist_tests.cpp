@@ -412,7 +412,8 @@ BOOST_FIXTURE_TEST_CASE(block_flush_refusal_does_not_publish_pin, FinalityChainD
     BOOST_REQUIRE(!Anchor(m_node));
     const auto pin_hash{ChainHashAt(m_M + 5)};
     const auto pin_path{m_node.chainman->m_blockman.FinalityPinPath()};
-    const auto block_path{m_node.chainman->m_blockman.GetBlockPosFilename(Tip()->GetBlockPos())};
+    const auto block_position{WITH_LOCK(cs_main, return Tip()->GetBlockPos())};
+    const auto block_path{m_node.chainman->m_blockman.GetBlockPosFilename(block_position)};
     {
         FileOpenRefusal obstruction{block_path};
         BlockValidationState state;
