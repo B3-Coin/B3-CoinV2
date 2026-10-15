@@ -9,6 +9,7 @@
 #include <node/flowmesh_client_outcome.h>
 #include <node/flowmesh_client_poll.h>
 #include <node/flowmesh_client_readiness.h>
+#include <node/flowmesh_client_read_admission.h>
 #include <node/flowmesh_client_work.h>
 #include <node/flowmesh_client_settlement.h>
 #include <node/flowmesh_client_ticks.h>
@@ -1328,10 +1329,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // back under m_work; meanwhile m_https holds the lane's previous session
     // and opens its own connection if ordinary work needs one.
     FlowMeshHttpsClient m_https;
-    // Ordinary market reads own a separate connection. The atomic lease
-    // bounds the whole operation (including a completed reply awaiting
-    // application), not just its socket. No queued reads or retained bodies.
-    std::atomic_flag m_read_in_flight = ATOMIC_FLAG_INIT;
+    // Ordinary reads retain one owner through body application, not just
+    // socket completion. Only direct authenticated FOREGROUND Market/Data
+    // may wait: eight stack waiters, original-entry 5s QUEUE-only deadline.
+    // Passive, null-account and Watch paths remain immediate; no body queue.
+    FlowMeshClientReadAdmission m_read_admission;
     std::mutex m_read_lane;
     FlowMeshHttpsClient m_read_https;
     std::atomic<bool> m_read_reset{false};
@@ -1360,17 +1362,17 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             cache.revision = AdvanceRevision(m_cache_revision);
         }
     }
-    class ReadLease {
-        std::atomic_flag& m_flag;
-    public:
-        explicit ReadLease(std::atomic_flag& flag) : m_flag{flag}
-        {
-            if (m_flag.test_and_set(std::memory_order_acquire)) Fail("Ordinary market read already in progress; retained data is not a fresh response");
-        }
-        ~ReadLease() { m_flag.clear(std::memory_order_release); }
-        ReadLease(const ReadLease&) = delete;
-        ReadLease& operator=(const ReadLease&) = delete;
+    struct ReadRequest {
+        FlowMeshReadAdmission policy;
+        std::chrono::steady_clock::time_point started;
     };
+    static ReadRequest DirectReadRequest(const std::optional<uint256>& account,
+                                         const std::chrono::steady_clock::time_point started)
+    {
+        return {account && FlowMeshClientWorkScope::Current() == FlowMeshClientWorkPriority::FOREGROUND
+                    ? FlowMeshReadAdmission::FOREGROUND_ACCOUNT : FlowMeshReadAdmission::IMMEDIATE,
+                started};
+    }
     // Waited status reads use their own TLS connection so that m_work is not
     // held across a server-side wait. m_wait_lane is only ever try-locked, and
     // never while holding m_work; a busy lane means an ordinary status read.
@@ -2752,7 +2754,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 std::string failure;
                 {
                     // No lane mutex is retained when taking m_work to apply.
-                    // The outer ReadLease still bounds the parsed body.
+                    // The outer admission lease still bounds the parsed body.
                     std::unique_lock lane{m_read_lane, std::try_to_lock};
                     if (!lane.owns_lock()) Fail("Ordinary market read lane is busy");
                     if (m_read_reset.exchange(false)) m_read_https.Reset();
@@ -2828,11 +2830,15 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     //! Entire ordinary read, including updates -> snapshot, owns one lease.
     //! finish is called only under m_work and must return values, not refs.
     void RefreshRead(const uint256& id, const std::optional<uint256>& account, const flowmesh::MarketDataQuery& query,
-                     const std::function<void(Cache&)>& finish,
+                     const ReadRequest& request, const std::function<void(Cache&)>& finish,
+                     const bool join_after_admission = false,
                      const std::optional<SnapshotContinuation>& continuation = std::nullopt)
     {
-        ReadLease lease{m_read_in_flight};
-        const auto started{continuation ? continuation->started : std::chrono::steady_clock::now()};
+        // No m_work/lane lock, captured authority, params or body before this
+        // reservation. Its wait is queue-only: HTTPS keeps its existing cap.
+        FlowMeshClientReadAdmission::Lease lease{m_read_admission, request.policy,
+            request.started + FlowMeshClientReadAdmission::QUEUE_TIMEOUT};
+        const auto started{continuation ? continuation->started : request.started};
         ReadContext context;
         bool context_captured{false};
         TickRequest ticks;
@@ -2845,6 +2851,12 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         try {
         {
             WorkLock lock{*this};
+            if (join_after_admission) {
+                // A current new observation may have completed while queued.
+                // Keep its ORIGINAL stamp; do not renew freshness or recurse
+                // into another admission reservation when a join is refused.
+                if (auto* cache{JoinFresh(id, account)}) { finish(*cache); return; }
+            }
             if (continuation) CheckReadContext(continuation->context);
             const auto it{m_cache.find(id)};
             // Pending I/O does not erase a still-valid ORIGINAL join stamp.
@@ -3932,6 +3944,7 @@ public:
     }
     std::optional<MarketStatus> Market(const uint256& id, const std::optional<uint256>& account) override
     {
+        const auto request{DirectReadRequest(account, std::chrono::steady_clock::now())};
         FlowMeshTimingSpan timing_lock_1215{__func__};
         timing_lock_1215.Field("lock_name", std::string{"client_work"});
         timing_lock_1215.Mark("lock_requested_us");
@@ -3962,8 +3975,8 @@ public:
             };
             bool joined{false};
             if (FlowMeshSigningPreflightScope::Active()) {
-                // A local join needs no read reservation. Never queue a
-                // family of network reads before the one-flight admission.
+                // A current no-network join needs no reservation. Admission
+                // FIFO applies only to callers that need an ordinary owner.
                 WorkLock lock{*this, std::try_to_lock};
                 if (lock.owns_lock()) {
                     MarkWorkAcquired(timing_lock_1215);
@@ -3971,18 +3984,20 @@ public:
                 }
             }
             if (FlowMeshSigningPreflightScope::Active()) timing_lock_1215.Field("preflight", std::string{joined ? "joined" : "refreshed"});
-            if (!joined) RefreshRead(id, account, {}, project);
+            if (!joined) RefreshRead(id, account, {}, request, project, FlowMeshSigningPreflightScope::Active());
         } catch (const std::exception& e) { status.error = e.what(); status.paused = true; status.running = false; }
         return status;
     }
-    std::optional<flowmesh::MarketData> Data(const uint256& id, const std::optional<uint256>& account,
-                                          const flowmesh::MarketDataQuery& query, std::string& error) override
+private:
+    std::optional<flowmesh::MarketData> DataImpl(const uint256& id, const std::optional<uint256>& account,
+                                              const flowmesh::MarketDataQuery& query, std::string& error,
+                                              const ReadRequest& request)
     {
-        FlowMeshTimingSpan timing_lock_1245{__func__};
+        FlowMeshTimingSpan timing_lock_1245{"Data"}; // Preserve the public read's diagnostic label.
         timing_lock_1245.Field("read_lane", std::string{"ordinary"});
         std::optional<flowmesh::MarketData> out;
         try {
-            RefreshRead(id, account, query, [&](Cache& cache) {
+            RefreshRead(id, account, query, request, [&](Cache& cache) {
                 out = Project(cache, account, query);
                 if (query.indicative || flowmesh::LevelsWanted(*out, query)) out->book = CachedBook(cache, timing_lock_1245);
             });
@@ -3994,6 +4009,13 @@ public:
         // released, so no signing preflight or action waits for them.
         flowmesh::ComputeMarketViews(*out, query);
         return out;
+    }
+public:
+    std::optional<flowmesh::MarketData> Data(const uint256& id, const std::optional<uint256>& account,
+                                          const flowmesh::MarketDataQuery& query, std::string& error) override
+    {
+        const auto request{DirectReadRequest(account, std::chrono::steady_clock::now())};
+        return DataImpl(id, account, query, error, request);
     }
     /** The endpoint serving this market's data, asked for one page of its
      * observed-time candles, only when it advertises them. Endpoint-reported
@@ -4126,10 +4148,12 @@ public:
             watch.status = std::string{status};
             timing.Field("watch_status", watch.status);
         };
-        // A fresh, bounded, non-waiting read, exactly Data().
+        // The same verified ordinary data, but Watch explicitly remains
+        // immediate even for an authenticated foreground caller.
         const auto ordinary = [&](const std::string_view status) {
             label(status);
-            return Data(id, account, query, error);
+            return DataImpl(id, account, query, error,
+                {FlowMeshReadAdmission::IMMEDIATE, std::chrono::steady_clock::now()});
         };
         std::unique_lock lane{m_watch_lane, std::try_to_lock};
         if (!lane.owns_lock()) return ordinary("lane_busy");
@@ -4359,7 +4383,7 @@ public:
         }
         if (continuation) {
             try {
-                RefreshRead(id, account, query, [&](Cache& cache) {
+                RefreshRead(id, account, query, {FlowMeshReadAdmission::IMMEDIATE, continuation->started}, [&](Cache& cache) {
                     watch.supported = true;
                     watch.waited = FlowMeshWatchWaited(server_status);
                     { std::lock_guard status{m_status_mutex}; watch.gap = m_status.event_gaps > snapshot_gaps; }
@@ -4367,7 +4391,7 @@ public:
                     label(server_status);
                     applied = Project(cache, account, query);
                     if (query.indicative || flowmesh::LevelsWanted(*applied, query)) applied->book = CachedBook(cache, timing);
-                }, continuation);
+                }, false, continuation);
             } catch (const std::exception& e) {
                 label("invalid");
                 error = e.what();
