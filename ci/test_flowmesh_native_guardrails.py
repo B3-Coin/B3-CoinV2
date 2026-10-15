@@ -50,6 +50,30 @@ def xml_report(suite, cases):
     return document
 
 
+# Exact bounded health profile, independent of RUNNER's mandatory manifest.
+HEALTH_REQUIRED_CASES = {
+    "flowmesh_https_tests": {
+        "https_generic_unconfigured_two_handler_saturation_explicitly_refuses_health_tls",
+        "https_reserved_health_declares_slow_reserve_and_full_admission_refusal_limits",
+        "https_reserved_health_has_separate_capacity_with_fourteen_sleepers_and_two_active",
+        "https_reserved_health_overflow_only_leaves_unloaded_submits_on_ordinary_workers",
+        "https_reserved_health_preserves_http_bounds_and_tls_authentication",
+        "https_reserved_health_preserves_ordinary_resumer_priority",
+        "https_reserved_health_reclassifies_keepalive_and_never_dispatches_nonhealth",
+        "https_reserved_health_small_reply_bound_refuses_invalid_profile_and_fallback_closes",
+        "https_reserved_health_stop_joins_its_partial_body_owner_and_restart_is_clean",
+    },
+    "flowmesh_api_health_tests": {
+        "api_reserved_and_ordinary_health_share_exactly_once_existing_budgets",
+        "api_reserved_health_strict_decoded_envelope_never_dispatches_other_methods",
+    },
+    "flowmesh_client_watch_lane_tests": {
+        "public_health_https_uses_leaf_observations_while_cs_main_is_held",
+        "synthetic_cs_main_handler_saturation_must_not_starve_public_health_tls",
+    },
+}
+
+
 class DiscoveryTests(unittest.TestCase):
     def test_exact_enabled_manifest(self):
         self.assertEqual(RUNNER.parse_discovery(listing()), expected_inventory())
@@ -163,6 +187,50 @@ class XMLTests(unittest.TestCase):
         for text in ("", "<TestResult>", "<NotBoost/>", "no test cases matching filter"):
             with self.subTest(text=text), self.assertRaises(RUNNER.GuardrailError):
                 RUNNER.check_xml(text, self.suite, self.cases)
+
+
+class ReservedHealthRegressionTests(unittest.TestCase):
+    def test_health_positive_discovery_and_exact_execution(self):
+        self.assertEqual(sum(map(len, HEALTH_REQUIRED_CASES.values())), 13)
+        discovered = RUNNER.parse_discovery(listing())
+        for suite, mandatory in HEALTH_REQUIRED_CASES.items():
+            with self.subTest(suite=suite):
+                self.assertTrue(mandatory.issubset(RUNNER.REQUIRED_CASES[suite]))
+                self.assertTrue(mandatory.issubset(discovered[suite]))
+                self.assertEqual(RUNNER.check_xml(
+                    ET.tostring(xml_report(suite, discovered[suite]), encoding="unicode"),
+                    suite, discovered[suite]), len(discovered[suite]))
+
+    def test_each_health_case_cannot_be_undiscovered_or_disabled(self):
+        for suite, mandatory in HEALTH_REQUIRED_CASES.items():
+            for case in mandatory:
+                inventory = expected_inventory()
+                inventory[suite].remove(case)
+                with self.subTest(suite=suite, case=case, fault="undiscovered"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "missing required regression"):
+                    RUNNER.parse_discovery(listing(inventory))
+                disabled = listing().replace(f"    {case}*\n", f"    {case} \n", 1)
+                self.assertNotEqual(disabled, listing())
+                with self.subTest(suite=suite, case=case, fault="disabled"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "selected case"):
+                    RUNNER.parse_discovery(disabled)
+
+    def test_each_health_case_cannot_be_unexecuted_or_skipped(self):
+        for suite, mandatory in HEALTH_REQUIRED_CASES.items():
+            expected = expected_inventory()[suite]
+            for case in mandatory:
+                missing = xml_report(suite, expected - {case})
+                with self.subTest(suite=suite, case=case, fault="unexecuted"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "case mismatch"):
+                    RUNNER.check_xml(ET.tostring(missing, encoding="unicode"), suite, expected)
+                skipped = xml_report(suite, expected)
+                row = next(row for row in skipped.iter("TestCase") if row.get("name") == case)
+                row.set("result", "skipped")
+                # Even apparently all-passed counters cannot conceal one
+                # omitted execution behind a skipped selected leaf.
+                with self.subTest(suite=suite, case=case, fault="skipped"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "Selected case/suite skipped or failed"):
+                    RUNNER.check_xml(ET.tostring(skipped, encoding="unicode"), suite, expected)
 
 
 class BuildFixture(unittest.TestCase):
@@ -344,7 +412,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, artifact)
 
     def test_profile_is_versioned_and_excludes_prototype(self):
-        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v3")
+        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v4")
         self.assertEqual(len(RUNNER.SUITE_SOURCES), 27)
         self.assertTrue(set(RUNNER.REQUIRED_CASES).issubset(RUNNER.SUITE_SOURCES))
         self.assertFalse(any("v2_market" in source or "/v2/" in source for source in RUNNER.NATIVE_SOURCES))
@@ -368,7 +436,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_each_ordinary_read_regression_is_mandatory(self):
         suites = ("flowmesh_client_watch_lane_tests", "flowmesh_client_market_view_tests")
-        self.assertEqual(sum(len(RUNNER.REQUIRED_CASES[suite]) for suite in suites), 13)
+        self.assertEqual(sum(len(RUNNER.REQUIRED_CASES[suite]) for suite in suites), 15) # Frozen13 ordinary +2 health.
         self.assertIn("src/node/flowmesh_https.cpp", RUNNER.NATIVE_SOURCES)
         for suite in suites:
             for case in RUNNER.REQUIRED_CASES[suite]:

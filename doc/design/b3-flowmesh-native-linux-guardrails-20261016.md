@@ -1,6 +1,6 @@
 # FlowMesh Linux native CI guardrails
 
-Date: 2026-10-16. Profile: `native-guardrails-v3`.
+Date: 2026-10-16. Profile: `native-guardrails-v4`.
 
 This headless Linux profile checks selected native FlowMesh concurrency and
 recovery regressions. Its source and runner controls are prepared; Linux native
@@ -46,7 +46,10 @@ case and synchronous seat-key observation. Version 2 adds the native market-view
 suite and thirteen named ordinary-read/freshness regressions: twelve watch-lane
 cases and the stale tick-advertisement case. Version 3 additionally selects the
 native agreement suite and requires all seven exact-publication runtime cases
-plus both durable-local-callback cases. Missing prerequisites fail discovery.
+plus both durable-local-callback cases. Version 4 additionally requires all
+thirteen restricted-health overflow cases: the two original chain-lock and
+saturation controls and eleven explicit reserve, budget and refusal controls.
+Missing prerequisites fail discovery.
 The workflow must contain their reviewed source revisions before qualification;
 it cannot substitute a prototype or silently omit a missing case. Do not publish
 this workflow ahead of its mutation-fence, retention and metadata prerequisite
@@ -80,6 +83,10 @@ and in separate review. Its extended retention, metadata and P2P manifest passes
 31 controls locally. Version 2 passes 32 controls, including rejection when any
 one of its thirteen new required cases is missing. Version 3 passes 33 controls,
 including individual rejection of each of its nine added publication cases.
+Version 4 passes **36 controls**, including per-case positive checks and
+missing, disabled, unexecuted or skipped rejection for all thirteen health
+cases. Root ran the shared suite with exit 0 (0.174 seconds); a separate
+reviewer ran the private identical future files with exit 0 (0.176 seconds).
 These exercise missing/disabled suites, missing regressions,
 empty or inconsistent XML, selected skips, wrong build flags, timeout and
 sanitizer failure, process-group termination and bounded output. They do not
@@ -177,3 +184,14 @@ campaigns remain separate historical results, not a combined population. Its
 nine added mandatory cases depend on the
 [exact-publication repair](b3-flowmesh-exact-publication-recovery-20261016.md);
 do not publish this manifest without that implementation and its tests.
+
+Version 4's exact local selection passed **473 cases in 27 suites**, all child
+exits 0, no selected skips, using ordinary macOS native executable
+`b2fa60f95d76fc5019362ab86fefbac5f966b511e8abc656a9ebb5f47d3000ec`.
+This includes the [health-overflow implementation and all thirteen controls](b3-flowmesh-health-overflow-admission-20261016.md)
+plus the separately qualified [aggregate-save stage](b3-flowmesh-snapshot-aggregate-save-20261016.md).
+The native host profile is explicitly `host-local-macos-ci-selection-v4`;
+it neither validates Linux build flags nor spoofs sanitizer execution. The
+workflow remains unchanged: no push, remote CI run, Linux/DEBUG_LOCKORDER or
+TSan success is claimed. Preserve the earlier 398/428/460-case campaigns as
+their own historical freezes, not one combined result.

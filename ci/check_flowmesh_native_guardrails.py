@@ -4,7 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Strict, bounded Linux native-test guardrails; never a performance gate.
 
-Version native-guardrails-v3 selects exact compiled Boost suites, not CTest's
+Version native-guardrails-v4 selects exact compiled Boost suites, not CTest's
 skip-on-empty filters. Discovery and detailed XML must agree on every selected
 leaf case. TSan covers instrumented native code, not all system libraries; the
 existing repository suppression file includes a ConnectTip deadlock suppression.
@@ -32,7 +32,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-PROFILE_VERSION = "native-guardrails-v3"
+PROFILE_VERSION = "native-guardrails-v4"
 CONTROL_TIMEOUT = 30
 SUITE_TIMEOUT = 600
 TOTAL_TEST_TIMEOUT = 1800
@@ -69,11 +69,28 @@ SUITE_SOURCES = {
     "validation_chainstatemanager_tests": "src/test/validation_chainstatemanager_tests.cpp",
 }
 REQUIRED_CASES = {
+    "flowmesh_https_tests": {
+        "https_generic_unconfigured_two_handler_saturation_explicitly_refuses_health_tls",
+        "https_reserved_health_declares_slow_reserve_and_full_admission_refusal_limits",
+        "https_reserved_health_has_separate_capacity_with_fourteen_sleepers_and_two_active",
+        "https_reserved_health_overflow_only_leaves_unloaded_submits_on_ordinary_workers",
+        "https_reserved_health_preserves_http_bounds_and_tls_authentication",
+        "https_reserved_health_preserves_ordinary_resumer_priority",
+        "https_reserved_health_reclassifies_keepalive_and_never_dispatches_nonhealth",
+        "https_reserved_health_small_reply_bound_refuses_invalid_profile_and_fallback_closes",
+        "https_reserved_health_stop_joins_its_partial_body_owner_and_restart_is_clean",
+    },
+    "flowmesh_api_health_tests": {
+        "api_reserved_and_ordinary_health_share_exactly_once_existing_budgets",
+        "api_reserved_health_strict_decoded_envelope_never_dispatches_other_methods",
+    },
     "flowmesh_agreement_tests": {
         "local_signature_publication_callback_excludes_received_evidence",
         "local_signature_callback_never_runs_before_signed_sync",
     },
     "flowmesh_client_watch_lane_tests": {
+        "public_health_https_uses_leaf_observations_while_cs_main_is_held",
+        "synthetic_cs_main_handler_saturation_must_not_starve_public_health_tls",
         "ordinary_snapshot_and_updates_leave_work_free_while_https_is_held",
         "ordinary_read_busy_has_no_queue_and_reconnect_fences_the_held_reply",
         "ordinary_read_endpoint_observations_do_not_starve_a_valid_held_body",
