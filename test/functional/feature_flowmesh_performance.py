@@ -312,18 +312,33 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                         "returncode": process.poll(), "observed_host_us": host_us()}) + "\n")
 
     def end_memory_capture(self):
-        for index in self.memory_capture_nodes:
+        # Stop every owned capture exactly once, even when the first process
+        # overflowed. Raising inside the loop used to lose all later nodes'
+        # evidence and repeat the first stop during exceptional cleanup.
+        pending, self.memory_capture_nodes = self.memory_capture_nodes, []
+        failures = []
+        for index in pending:
             node = self.client if index == self.client.index else self.nodes[index]
-            result = node.flowmeshtiming("stop")
-            path = Path(self.options.tmpdir, f"memory-timing-node{index}.json")
-            path.write_text(json.dumps(result, indent=2) + "\n")
-            limited = sum(row["event"].get("stage") == "trace_limit_reached" for row in result["events"])
-            self.performance_report["memory_capture"][str(index)].update(
-                file=path.name, count=len(result["events"]), dropped=result["dropped"], limit_markers=limited)
-            if result["dropped"] or limited:
-                self.invalidate_final_result()
-                raise AssertionError("Incomplete bounded timing capture; retain partial evidence")
-        self.memory_capture_nodes.clear()
+            try:
+                captures = self.performance_report.setdefault("memory_capture", {})
+                missing_start = str(index) not in captures
+                observation = captures.setdefault(str(index), {})
+                if missing_start:
+                    observation["start_metadata_missing"] = True
+                result = node.flowmeshtiming("stop")
+                path = Path(self.options.tmpdir, f"memory-timing-node{index}.json")
+                path.write_text(json.dumps(result, indent=2) + "\n")
+                limited = sum(row["event"].get("stage") == "trace_limit_reached" for row in result["events"])
+                observation.update(file=path.name, count=len(result["events"]),
+                                   dropped=result["dropped"], limit_markers=limited)
+                if missing_start or result["dropped"] or limited:
+                    failures.append(index)
+            except Exception as error:
+                observation["capture_error"] = compact_error(error)
+                failures.append(index)
+        if failures:
+            self.invalidate_final_result()
+            raise AssertionError(f"Incomplete bounded timing capture on nodes {failures}; retain partial evidence")
 
     def shutdown(self):
         process = self.client.process if self.client is not None else None

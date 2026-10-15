@@ -4,9 +4,12 @@
 """Offline checks for benchmark bookkeeping; never starts a node."""
 
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 
-from feature_flowmesh_performance import arrival_offsets, expected_balance, submit_context, summarize_window
+from feature_flowmesh_performance import FlowMeshPerformanceTest, arrival_offsets, expected_balance, submit_context, summarize_window
 from feature_flowmesh_release import TRADE_PRICE
 from flowmesh_performance_analyze import runtime_spans, stats
 
@@ -93,6 +96,83 @@ class PerformanceMetricsTest(unittest.TestCase):
         # Do not hide changed bytes within the SAME market by selecting a hash.
         selected = [row for row in rows if submit_context(row) == ("market-A", "same-semantic-id")]
         self.assertEqual(len({row["action_hex"] for row in selected}), 2)
+
+
+class CaptureCleanupTest(unittest.TestCase):
+    def collect(self, results):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        calls = []
+        def node(index):
+            def stop(command):
+                calls.append((index, command))
+                result = results[index]
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            return SimpleNamespace(index=index, flowmeshtiming=stop)
+        client_index = len(results) - 1
+        invalidations = []
+        owner = SimpleNamespace(
+            nodes=[node(index) for index in range(client_index)], client=node(client_index),
+            memory_capture_nodes=list(range(len(results))),
+            options=SimpleNamespace(tmpdir=temporary.name),
+            performance_report={"memory_capture": {str(index): {} for index in range(len(results))}},
+            invalidate_final_result=lambda: invalidations.append(True))
+        return owner, calls, invalidations, Path(temporary.name)
+
+    def test_overflow_preserves_every_child_capture(self):
+        owner, calls, invalidations, path = self.collect([
+            {"events": [], "dropped": 1}, {"events": [], "dropped": 0},
+            {"events": [], "dropped": 0}])
+        with self.assertRaisesRegex(AssertionError, "Incomplete bounded timing capture"):
+            FlowMeshPerformanceTest.end_memory_capture(owner)
+        self.assertEqual(calls, [(0, "stop"), (1, "stop"), (2, "stop")])
+        self.assertEqual(owner.memory_capture_nodes, [])
+        self.assertEqual(invalidations, [True])
+        for index in range(3):
+            self.assertTrue((path / f"memory-timing-node{index}.json").exists())
+        FlowMeshPerformanceTest.end_memory_capture(owner)
+        self.assertEqual(len(calls), 3)
+
+    def test_stop_failure_does_not_hide_other_nodes(self):
+        owner, calls, invalidations, path = self.collect([
+            RuntimeError("synthetic stop failure"), {"events": [], "dropped": 0}])
+        with self.assertRaisesRegex(AssertionError, "Incomplete bounded timing capture"):
+            FlowMeshPerformanceTest.end_memory_capture(owner)
+        self.assertEqual(calls, [(0, "stop"), (1, "stop")])
+        self.assertEqual(invalidations, [True])
+        self.assertEqual(owner.performance_report["memory_capture"]["0"]["capture_error"],
+                         {"type": "RuntimeError"})
+        self.assertTrue((path / "memory-timing-node1.json").exists())
+
+    def test_stream_limit_invalidates_complete_attribution(self):
+        marker = {"events": [{"event": {"stage": "trace_limit_reached"}}], "dropped": 0}
+        owner, calls, invalidations, _ = self.collect([marker])
+        with self.assertRaisesRegex(AssertionError, "Incomplete bounded timing capture"):
+            FlowMeshPerformanceTest.end_memory_capture(owner)
+        self.assertEqual(calls, [(0, "stop")])
+        self.assertEqual(invalidations, [True])
+        self.assertEqual(owner.performance_report["memory_capture"]["0"]["limit_markers"], 1)
+
+    def test_complete_captures_are_not_invalidated(self):
+        owner, calls, invalidations, _ = self.collect([
+            {"events": [], "dropped": 0}, {"events": [], "dropped": 0}])
+        FlowMeshPerformanceTest.end_memory_capture(owner)
+        self.assertEqual(calls, [(0, "stop"), (1, "stop")])
+        self.assertEqual(invalidations, [])
+
+    def test_interrupted_start_metadata_does_not_skip_child_stop(self):
+        owner, calls, invalidations, path = self.collect([
+            {"events": [], "dropped": 0}, {"events": [], "dropped": 0}])
+        del owner.performance_report["memory_capture"]["0"]
+        with self.assertRaisesRegex(AssertionError, "Incomplete bounded timing capture"):
+            FlowMeshPerformanceTest.end_memory_capture(owner)
+        self.assertEqual(calls, [(0, "stop"), (1, "stop")])
+        self.assertEqual(owner.memory_capture_nodes, [])
+        self.assertEqual(invalidations, [True])
+        self.assertTrue(owner.performance_report["memory_capture"]["0"]["start_metadata_missing"])
+        self.assertTrue((path / "memory-timing-node1.json").exists())
 
 
 if __name__ == "__main__":
