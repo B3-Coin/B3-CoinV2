@@ -37,6 +37,7 @@ class FlowMeshClientCrashTest(FlowMeshRemoteClientTest):
         self.crash_thread = None
         self.crash_rpc_result = None
         self.crash_evidence = None
+        self.crash_cases = ["A", "B", "C"]
         self.price_atoms = 1
 
     def run_test(self):
@@ -58,10 +59,16 @@ class FlowMeshClientCrashTest(FlowMeshRemoteClientTest):
         assert all(row["token"] == self.crash_token for row in rows)
         return rows
 
-    def configure_hook(self, case, *, pause=False):
+    def configure_hook(self, case, *, pause=False, fail_inclusion=None, hold_lane=False, release_lane=False):
         marker = {"token": self.crash_token, "case": case,
                   "chain_dir": str(self.client.chain_path.resolve()),
                   "fresh_generated_client": True, "pause_before_first_send": pause}
+        if fail_inclusion is not None:
+            assert len(fail_inclusion) == 64 and all(c in "0123456789abcdef" for c in fail_inclusion)
+            marker["fail_new_inclusion_save_for"] = fail_inclusion
+        if hold_lane:
+            marker["hold_lane_before_apply"] = True
+            marker["release_lane_before_apply"] = release_lane
         # Parent-owned fixture marker, not a wallet or signing journal.
         temporary = self.client.datadir_path / "flowmesh-client-crash-guard.next"
         temporary.write_text(json.dumps(marker), encoding="utf-8")
@@ -132,7 +139,7 @@ class FlowMeshClientCrashTest(FlowMeshRemoteClientTest):
         self.operator_pids = [node.process.pid for node in self.nodes]
         self.bootstrap_submit_count = len(self.submissions())
         self.write_evidence("PLAN-AND-INPUTS.json", {
-            "cases_preselected": ["A", "B", "C"], "attempts_per_case": 1,
+            "cases_preselected": self.crash_cases, "attempts_per_case": 1,
             "ordinary_binary": self.nodes[0].args[0],
             "ordinary_binary_sha256": hashlib.sha256(Path(self.nodes[0].args[0]).read_bytes()).hexdigest(),
             "crash_client_binary": str(crash_binary), "crash_client_binary_sha256": hashlib.sha256(crash_binary.read_bytes()).hexdigest(),

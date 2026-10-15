@@ -85,5 +85,53 @@ inline void ClientCrashBeforeFirstSend(const fs::path& journal, const uint256& a
     throw std::runtime_error("Crash-test before-first-send hold expired; instruction remains retained");
 }
 
+/** Inject only BEFORE the actual journal write, for one generated fixture
+ * action whose new no-resubmit marker is about to become durable. This is a
+ * pre-write failure test, not an uncertain-write or power-loss simulation. */
+inline void ClientCrashBeforeJournalSave(const fs::path& journal, const UniValue& root)
+{
+    const auto guard{ClientCrashGuard(journal)};
+    if (guard.isNull() || !guard.exists("fail_new_inclusion_save_for")) return;
+    if (!guard["fail_new_inclusion_save_for"].isStr() ||
+        guard["fail_new_inclusion_save_for"].get_str().size() != 64 ||
+        !IsHex(guard["fail_new_inclusion_save_for"].get_str()) || !root["actions"].isArray())
+        throw std::runtime_error("Invalid isolated inclusion-save fault target");
+    const auto target{guard["fail_new_inclusion_save_for"].get_str()};
+    for (const auto& row : root["actions"].getValues()) {
+        if (row["action_id"].isStr() && row["action_id"].get_str() == target &&
+            row["previously_certified"].isTrue()) {
+            ClientCrashRecord(journal, "new_inclusion_save_failed_before_write", root);
+            throw std::runtime_error("Injected isolated new-inclusion journal save failure");
+        }
+    }
+}
+
+/** Hold a completed lane reply BEFORE it reacquires m_work. The parent may
+ * perform an ordinary snapshot meanwhile, then release this exact reply.
+ * A missing parent ends by refusal, never by a resend or fresh signature. */
+inline void ClientCrashBeforeLaneApply(const fs::path& journal, const uint256& action_id)
+{
+    auto guard{ClientCrashGuard(journal)};
+    if (guard.isNull() || !guard.exists("hold_lane_before_apply")) return;
+    if (!guard["hold_lane_before_apply"].isBool())
+        throw std::runtime_error("Invalid isolated lane hold");
+    if (!guard["hold_lane_before_apply"].get_bool()) return;
+    UniValue data{UniValue::VOBJ};
+    data.pushKV("action_id", action_id.GetHex());
+    ClientCrashRecord(journal, "lane_reply_before_apply_held", data);
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+    while (std::chrono::steady_clock::now() < deadline) {
+        guard = ClientCrashGuard(journal);
+        if (guard.isNull()) throw std::runtime_error("Isolated lane hold lost its fixture guard");
+        if (guard.exists("release_lane_before_apply")) {
+            if (!guard["release_lane_before_apply"].isBool())
+                throw std::runtime_error("Invalid isolated lane release");
+            if (guard["release_lane_before_apply"].get_bool()) return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    throw std::runtime_error("Isolated lane hold expired; original instruction remains retained");
+}
+
 } // namespace node::test
 #endif // BITCOIN_TEST_FLOWMESH_CLIENT_CRASH_HOOK_H

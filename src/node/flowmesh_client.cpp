@@ -2104,6 +2104,21 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         }
         Save();
     }
+    // A different read may have verified inclusion in memory before its
+    // no-resubmit marker could be saved. No early return may expose that
+    // verification until restart-relevant state is durable. Pure outcome
+    // text changes no digest and causes no additional synchronous write.
+    void SaveVerifiedRestartState(Pending& p)
+    {
+        if (!p.receipt.certificate_verified && !ProvenNotExecuted(p)) return;
+        try {
+            SaveRestartState();
+        } catch (...) {
+            WithdrawVerifiedLabels(p.receipt);
+            // Exact bytes and previously_certified stay binding in memory.
+            throw;
+        }
+    }
     void Save()
     {
         FlowMeshTimingSpan timing{"client_outbox_save"};
@@ -2138,6 +2153,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (blob.json.size() > 8 * 1024 * 1024) Fail("Client outbox exceeds its durable bound");
         OpenJournal();
         timing.Mark("sync_started_us");
+#ifdef FLOWMESH_CLIENT_CRASH_TEST_HOOKS
+        test::ClientCrashBeforeJournalSave(m_path, root);
+#endif
         m_db->Write(std::string{"public-client-v1"}, blob, true); // throws on failed synchronous write
         timing.Mark("sync_completed_us");
         m_durable_restart_digest = RestartDigest();
@@ -2312,12 +2330,23 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             }
             m_cache.insert_or_assign(id, Cache{pins, std::move(*verified), cursor, value["status"], value["reported_data"], endpoint, gap, account});
             if (lost_cursor || skipped) { std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps; }
-            for (auto& [key, pending] : m_pending) {
-                if (pending.market != id) continue;
-                if (std::any_of(entry.actions.begin(), entry.actions.end(), [&](const auto& action) { return action.Id() == pending.action.Id(); }))
-                    Inclusion(pending, m_cache.at(id).verified.certified, endpoint, evidence.certified_payload);
+            std::vector<Pending*> included;
+            included.reserve(m_pending.size());
+            try {
+                for (auto& [key, pending] : m_pending) {
+                    if (pending.market != id) continue;
+                    if (std::any_of(entry.actions.begin(), entry.actions.end(), [&](const auto& action) { return action.Id() == pending.action.Id(); })) {
+                        included.push_back(&pending);
+                        Inclusion(pending, m_cache.at(id).verified.certified, endpoint, evidence.certified_payload);
+                    }
+                }
+                SaveRestartState();
+            } catch (...) {
+                // No asynchronous lane/status call may inherit a verified
+                // label whose new no-resubmit marker failed persistence.
+                for (Pending* pending : included) WithdrawVerifiedLabels(pending->receipt);
+                throw;
             }
-            SaveRestartState();
             LearnMetadata(value["status"], pins, endpoint);
             LearnActionWait(value["status"], endpoint);
             LearnReadiness(FlowMeshAdvertisedReadinessOf(value["status"]), endpoint, id);
@@ -2808,7 +2837,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     Receipt QueryAction(Pending& p, bool automatic = false)
     {
         const auto pins{RecheckActionAuthority(p)};
-        if (p.receipt.certificate_verified || ProvenNotExecuted(p)) return p.receipt;
+        if (p.receipt.certificate_verified || ProvenNotExecuted(p)) {
+            SaveVerifiedRestartState(p);
+            return p.receipt;
+        }
         if (p.not_executed) {
             ReproveNotExecuted(p, pins);
             if (ProvenNotExecuted(p)) return p.receipt;
@@ -2841,6 +2873,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (p.lane_in_flight) {
             // Another call's waited submission of these exact bytes is in
             // flight: nothing is sent again until its outcome is applied.
+            SaveVerifiedRestartState(p);
             Receipt out{p.receipt};
             out.reason = "A waited submission of this exact action is in flight; its outcome is not known yet";
             return out;
@@ -2948,12 +2981,16 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                         }
                     } catch (const std::exception&) {}
                 }
+                applied = true; // The verified return also requires durability.
+                SaveVerifiedRestartState(p);
                 label = "already_verified";
                 return p.receipt;
             }
             if (ProvenNotExecuted(p)) {
                 // Proven not executed meanwhile: final, never replaced.
                 m_action_polls.Remove(key);
+                applied = true;
+                SaveVerifiedRestartState(p);
                 label = "already_verified";
                 return p.receipt;
             }
@@ -3150,6 +3187,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
 
         // Test only: an unwind here must still release the flight (above).
         if (m_lane_submission_fault_for_test) m_lane_submission_fault_for_test();
+#ifdef FLOWMESH_CLIENT_CRASH_TEST_HOOKS
+        test::ClientCrashBeforeLaneApply(m_path, s.key.second);
+#endif
         timing.Mark("apply_lock_requested_us");
         WorkLock lock{*this};
         timing.Mark("apply_lock_acquired_us");
@@ -4052,10 +4092,12 @@ public:
             if (it->second.receipt.certificate_verified) {
                 m_action_polls.Remove(it->first);
                 UpgradeOutcome(it->second);
+                SaveVerifiedRestartState(it->second);
                 return it->second.receipt;
             }
             if (ProvenNotExecuted(it->second)) {
                 m_action_polls.Remove(it->first);
+                SaveVerifiedRestartState(it->second);
                 return it->second.receipt;
             }
             auto refresh = [&](Pending& pending, bool automatic) {
