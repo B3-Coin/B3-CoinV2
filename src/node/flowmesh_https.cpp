@@ -988,6 +988,7 @@ struct FlowMeshHttpsServer::Impl {
     };
     Options options;
     Handler handler;
+    Handler restricted_health_handler;
     SslContext context{nullptr, SSL_CTX_free};
     std::shared_ptr<Sock> listener;
     std::shared_ptr<Sock> wake_reader;
@@ -1008,13 +1009,17 @@ struct FlowMeshHttpsServer::Impl {
     size_t resuming{0};
     std::thread accept_thread;
     std::vector<std::thread> workers;
+    // Never consumes an ordinary permit or executes its general handler.
+    // This one exclusive owner is its own bounded transport permit.
+    std::thread reserved_health_worker;
     // Empty in production. Test observation occurs only after immutable
     // cleanup has completed; it cannot alter the operation being measured.
     std::function<void(size_t, size_t)> rejected_cleanup_observer;
     // Empty in production. Reads back socket options only, after they are set.
     std::function<void(bool)> connection_observer;
 
-    Impl(Options opts, Handler fn) : options{std::move(opts)}, handler{std::move(fn)} {}
+    Impl(Options opts, Handler fn, Handler health_fn)
+        : options{std::move(opts)}, handler{std::move(fn)}, restricted_health_handler{std::move(health_fn)} {}
 
     void Wake()
     {
@@ -1049,13 +1054,16 @@ struct FlowMeshHttpsServer::Impl {
         condition.wait(lock, [&] { return stopping.load() || active < permits; });
         --resuming;
         ++active; // While stopping this may exceed permits; nothing new starts.
+        lock.unlock();
+        if (restricted_health_handler) condition.notify_all();
     }
 
-    bool Serve(Connection& pending, bool& permit_held)
+    bool Serve(Connection& pending, bool& permit_held, bool restricted_health = false)
     {
         FlowMeshTimingSpan timing{"https_server_serve"};
         timing.Field("enqueued_us", pending.enqueued_us);
         timing.Field("connection_request_index", pending.requests + 1);
+        if (restricted_health) timing.Field("restricted_health_worker", uint64_t{1});
         if (stopping.load() || Clock::now() >= pending.deadline) return false;
         const bool first{!pending.ssl};
         if (first) {
@@ -1087,17 +1095,20 @@ struct FlowMeshHttpsServer::Impl {
         Request request;
         request.remote_address = pending.peer;
         request.deadline = pending.deadline;
-        // Valid only during the handler call below.
-        request.suspend = [this, &permit_held] {
-            if (!permit_held) return;
-            ReleasePermit();
-            permit_held = false;
-        };
-        request.resume = [this, &permit_held] {
-            if (permit_held) return;
-            ResumePermit();
-            permit_held = true;
-        };
+        if (!restricted_health) {
+            // Valid only on this final worker's stack during the handler call.
+            // Nothing with these references is migrated or queued.
+            request.suspend = [this, &permit_held] {
+                if (!permit_held) return;
+                ReleasePermit();
+                permit_held = false;
+            };
+            request.resume = [this, &permit_held] {
+                if (permit_held) return;
+                ResumePermit();
+                permit_held = true;
+            };
+        }
         Response response;
         int failure{400};
         bool keep_alive{false};
@@ -1107,20 +1118,26 @@ struct FlowMeshHttpsServer::Impl {
             response = {failure, "{\"error\":\"invalid-http-request\"}"};
         } else if (!io.Alive()) return false;
         else {
-            try { response = handler(request); }
-            catch (...) { response = {500, "{\"error\":\"handler-failed\"}"}; }
+            try { response = restricted_health ? restricted_health_handler(request) : handler(request); }
+            catch (...) {
+                response = restricted_health
+                    ? Response{503, std::string{FLOWMESH_HTTPS_RESERVED_BUSY_BODY}, true}
+                    : Response{500, "{\"error\":\"handler-failed\"}"};
+            }
             // The reply is checked and written under a permit even when the
             // handler returned, or threw, while suspended.
-            request.resume();
+            if (request.resume) request.resume();
         }
         timing.Mark("handler_completed_us");
         if (!io.Alive()) return false; // Handler may have admitted; caller must treat timeout as unknown.
         if (response.status < 200 || response.status > 599 || response.body.size() > options.max_reply_bytes) {
-            response = {500, "{\"error\":\"reply-out-of-bounds\"}"};
+            response = restricted_health
+                ? Response{503, std::string{FLOWMESH_HTTPS_RESERVED_BUSY_BODY}, true}
+                : Response{500, "{\"error\":\"reply-out-of-bounds\"}", response.close_connection};
         }
         ++pending.requests;
         bool subsequent_input{!rejected && io.PendingInput()};
-        keep_alive = keep_alive && options.keep_alive && !rejected && !subsequent_input &&
+        keep_alive = keep_alive && options.keep_alive && !response.close_connection && !rejected && !subsequent_input &&
             pending.requests < options.max_requests_per_connection && Clock::now() < pending.expires;
         std::string head{"HTTP/1.1 " + std::to_string(response.status) +
             " Response\r\nContent-Type: application/json\r\nContent-Length: " +
@@ -1164,6 +1181,9 @@ struct FlowMeshHttpsServer::Impl {
                 queue.pop_front();
                 ++active;
             }
+            // A second ordinary owner may have filled the permits after the
+            // reserve checked its predicate. Do not strand already queued work.
+            if (restricted_health_handler) condition.notify_all();
             bool permit_held{true};
             try {
                 if (Serve(*pending, permit_held)) {
@@ -1177,6 +1197,37 @@ struct FlowMeshHttpsServer::Impl {
             } catch (...) { /* Close, never expose an exception body. */ }
             pending.reset(); // Close (TLS and socket release) under the permit.
             if (permit_held) ReleasePermit();
+        }
+    }
+
+    void ReservedHealthWorker()
+    {
+        while (true) {
+            std::unique_ptr<Connection> pending;
+            {
+                std::unique_lock lock{mutex};
+                condition.wait(lock, [&] {
+                    return stopping.load() || (!queue.empty() && active + resuming >= permits);
+                });
+                if (stopping.load()) return;
+                pending = std::move(queue.front());
+                queue.pop_front();
+            }
+            // The exclusive reserve may finish TLS/read/health-or-busy/write
+            // while two ordinary owners are blocked. It never waits for or
+            // releases an ordinary permit, and never queues a parsed body.
+            bool permit_held{false};
+            try {
+                if (Serve(*pending, permit_held, /*restricted_health=*/true)) {
+                    std::lock_guard lock{mutex};
+                    if (!stopping.load() && Clock::now() < pending->expires) {
+                        pending->idle_deadline = std::min(pending->expires, Clock::now() + options.idle_timeout);
+                        idle.push_back(std::move(pending));
+                        Wake();
+                    }
+                }
+            } catch (...) { /* Close under the exclusive reserve owner. */ }
+            pending.reset();
         }
     }
 
@@ -1230,7 +1281,8 @@ struct FlowMeshHttpsServer::Impl {
                             connection->deadline = std::min(connection->expires, now + options.request_timeout);
                             connection->enqueued_us = EnqueuedTime();
                             queue.push_back(std::move(connection));
-                            condition.notify_one();
+                            if (restricted_health_handler) condition.notify_all();
+                            else condition.notify_one();
                         }
                         it = idle.erase(it); // Queue overflow closes this owner.
                     } else ++it;
@@ -1250,20 +1302,21 @@ struct FlowMeshHttpsServer::Impl {
             auto pending{std::make_unique<Connection>(connections, std::move(socket), NumericPeer(address), accepted, options)};
             pending->enqueued_us = EnqueuedTime();
             queue.push_back(std::move(pending));
-            condition.notify_one();
+            if (restricted_health_handler) condition.notify_all();
+            else condition.notify_one();
         }
     }
 };
 
-FlowMeshHttpsServer::FlowMeshHttpsServer(Options options, Handler handler)
-    : m_impl{std::make_unique<Impl>(std::move(options), std::move(handler))} {}
+FlowMeshHttpsServer::FlowMeshHttpsServer(Options options, Handler handler, Handler restricted_health_handler)
+    : m_impl{std::make_unique<Impl>(std::move(options), std::move(handler), std::move(restricted_health_handler))} {}
 FlowMeshHttpsServer::~FlowMeshHttpsServer() { Stop(); }
 
 bool FlowMeshHttpsServer::SetRejectedCleanupObserverForTest(std::function<void(size_t, size_t)> observer)
 {
     // Start/Stop and this private test setup are externally serialized. Never
     // replace an observer while a worker can be executing it.
-    if (!m_impl->stopping.load() || !m_impl->workers.empty() || m_impl->accept_thread.joinable()) return false;
+    if (!m_impl->stopping.load() || !m_impl->workers.empty() || m_impl->reserved_health_worker.joinable() || m_impl->accept_thread.joinable()) return false;
     m_impl->rejected_cleanup_observer = std::move(observer);
     return true;
 }
@@ -1271,9 +1324,15 @@ bool FlowMeshHttpsServer::SetRejectedCleanupObserverForTest(std::function<void(s
 bool FlowMeshHttpsServer::SetConnectionObserverForTest(std::function<void(bool)> observer)
 {
     // Same externally serialized, stopped-only rule as the cleanup observer.
-    if (!m_impl->stopping.load() || !m_impl->workers.empty() || m_impl->accept_thread.joinable()) return false;
+    if (!m_impl->stopping.load() || !m_impl->workers.empty() || m_impl->reserved_health_worker.joinable() || m_impl->accept_thread.joinable()) return false;
     m_impl->connection_observer = std::move(observer);
     return true;
+}
+
+std::array<size_t, 4> FlowMeshHttpsServer::AdmissionCountsForTest()
+{
+    std::lock_guard lock{m_impl->mutex};
+    return {m_impl->connections.load(), m_impl->queue.size(), m_impl->active, m_impl->resuming};
 }
 
 bool FlowMeshHttpsServer::Start(std::string& error)
@@ -1286,6 +1345,7 @@ bool FlowMeshHttpsServer::Start(std::string& error)
     if (!state.handler || !NumericAddress(options.bind_host, options.port, address, size) ||
         options.max_request_bytes == 0 || options.max_request_bytes > MAX_REQUEST ||
         options.max_reply_bytes < 64 || options.max_reply_bytes > MAX_REPLY ||
+        (state.restricted_health_handler && options.max_reply_bytes < FLOWMESH_HTTPS_RESERVED_BUSY_BODY.size()) ||
         options.max_connections == 0 || options.max_connections > 256 ||
         options.worker_threads == 0 || options.worker_threads > FLOWMESH_HTTPS_MAX_WORKER_THREADS ||
         options.active_permits > options.worker_threads ||
@@ -1352,6 +1412,8 @@ bool FlowMeshHttpsServer::Start(std::string& error)
     }
     try {
         for (size_t i{0}; i < options.worker_threads; ++i) state.workers.emplace_back([&state] { state.Worker(); });
+        if (state.restricted_health_handler)
+            state.reserved_health_worker = std::thread{[&state] { state.ReservedHealthWorker(); }};
         state.accept_thread = std::thread{[&state] { state.Accept(); }};
     } catch (...) {
         Stop();
@@ -1385,6 +1447,7 @@ void FlowMeshHttpsServer::Stop()
     // completion contract is unchanged by persistence.
     for (auto& worker : state.workers) if (worker.joinable()) worker.join();
     state.workers.clear();
+    if (state.reserved_health_worker.joinable()) state.reserved_health_worker.join();
     state.wake_reader.reset();
     state.wake_writer.reset();
     state.listener.reset();

@@ -130,8 +130,10 @@ inline constexpr std::chrono::milliseconds FLOWMESH_API_ACTION_WAIT_MAX{2500};
 inline constexpr std::chrono::milliseconds FLOWMESH_API_ACTION_WAIT_DEFAULT{2000};
 inline constexpr size_t FLOWMESH_API_ACTION_WAITERS_DEFAULT{4};
 inline constexpr size_t FLOWMESH_API_ACTION_WAITERS_MAX{12};
-//! Connections doing HTTPS work at once, as with the API's two workers before
-//! waits existed; each wait slot adds a worker that only sleeps in a wait.
+//! Ordinary connections doing HTTPS work at once, as with the API's two
+//! workers before waits existed; each wait slot adds a sleeping worker.
+//! Enabled restricted health has one separate TLS/classify/health-or-busy
+//! worker/permit; it never takes an ordinary permit or action/wait slot.
 inline constexpr size_t FLOWMESH_API_ACTIVE_PERMITS{2};
 //! Action-wait and watch slots together: each adds a sleeping worker, and the
 //! HTTPS server's worker bound is never raised for them.

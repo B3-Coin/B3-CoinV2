@@ -947,6 +947,26 @@ class TradingApi {
         out.pushKV("wait_status", wait_status);
         timing.Field("submit_wait_status", wait_status);
     }
+    UniValue HealthReply(const UniValue& params, const FlowMeshHttpsServer::Request& http)
+    {
+        // A local, advisory observation, never evidence. Cheap: leaf
+        // mutexes only, never cs_main, a market lock, the store, a wait
+        // slot or a suspend.
+        Keys(params, {"market_id"});
+        const std::optional<uint256> market{params.exists("market_id") ? std::optional{Id(params, "market_id")} : std::nullopt};
+        std::lock_guard lock{m_health_mutex};
+        if (!ChargeHealth(http.remote_address)) throw HealthBudgetExhausted{};
+        if (market) {
+            const auto health{m_service.Health(*market)};
+            if (!health.Find(*market)) Fail("Unknown market");
+            return FlowMeshServiceHealthJson(health, /*operator_detail=*/false);
+        }
+        const auto now{std::chrono::steady_clock::now()};
+        if (!m_health_cache || now - m_health_cache->first >= FLOWMESH_API_HEALTH_CACHE) {
+            m_health_cache.emplace(now, FlowMeshServiceHealthJson(m_service.Health(), /*operator_detail=*/false));
+        }
+        return m_health_cache->second;
+    }
 public:
     explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
                         const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome,
@@ -1205,26 +1225,41 @@ public:
             page->source = "endpoint_operator";
             return FlowMeshObservedCandlePageJson(*page);
         }
-        if (method == "health" && m_health) {
-            // A local, advisory observation, never evidence. Cheap: leaf
-            // mutexes only, never cs_main, a market lock, the store, a wait
-            // slot or a suspend.
-            Keys(params, {"market_id"});
-            const std::optional<uint256> market{params.exists("market_id") ? std::optional{Id(params, "market_id")} : std::nullopt};
-            std::lock_guard lock{m_health_mutex};
-            if (!ChargeHealth(http.remote_address)) throw HealthBudgetExhausted{};
-            if (market) {
-                const auto health{m_service.Health(*market)};
-                if (!health.Find(*market)) Fail("Unknown market");
-                return FlowMeshServiceHealthJson(health, /*operator_detail=*/false);
-            }
-            const auto now{std::chrono::steady_clock::now()};
-            if (!m_health_cache || now - m_health_cache->first >= FLOWMESH_API_HEALTH_CACHE) {
-                m_health_cache.emplace(now, FlowMeshServiceHealthJson(m_service.Health(), /*operator_detail=*/false));
-            }
-            return m_health_cache->second;
-        }
+        if (method == "health" && m_health) return HealthReply(params, http);
         Fail("This method is not exposed by the public trading API");
+    }
+    FlowMeshHttpsServer::Response HandleReservedHealth(const FlowMeshHttpsServer::Request& request)
+    {
+        const auto busy = [] { return FlowMeshHttpsServer::Response{
+            503, std::string{FLOWMESH_HTTPS_RESERVED_BUSY_BODY}, true}; };
+        if (!m_health) return busy();
+        try {
+            // Same API instance/budget as ordinary Handle; one pre-parse
+            // charge, including malformed/nonhealth requests refused here.
+            if (m_admission.Admit(request.remote_address, ClassifyFlowMeshApiRequest(request.body),
+                                  std::chrono::steady_clock::now()) != FlowMeshApiAdmission::Result::ADMITTED)
+                return {429, std::string{FLOWMESH_API_BUDGET_EXHAUSTED_BODY}, true};
+            UniValue parsed;
+            if (!parsed.read(request.body)) return busy();
+            Keys(parsed, {"method", "params"});
+            if (Text(parsed, "method", 32) != "health") return busy();
+            // Decoded values, not a prefix: reordered keys are fine, unknown
+            // or duplicate fields and nonempty/null/array params are not.
+            Keys(parsed["params"], {});
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("ok", true);
+            out.pushKV("result", HealthReply(parsed["params"], request));
+            auto body{out.write()};
+            if (body.size() > CLIENT_MAX_REPLY) return busy();
+            return {200, std::move(body)};
+        } catch (const HealthBudgetExhausted& e) {
+            UniValue out{UniValue::VOBJ}; out.pushKV("ok", false); out.pushKV("error", e.what());
+            return {429, out.write(), true};
+        } catch (...) {
+            // No general Call/Handle, action authentication/admission or wait
+            // is ever entered from the reserve, including parse failures.
+            return busy();
+        }
     }
     FlowMeshHttpsServer::Response Handle(const FlowMeshHttpsServer::Request& request)
     {
@@ -4751,6 +4786,11 @@ std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(FlowMeshService& ser
     Assert(options.worker_threads <= FLOWMESH_HTTPS_MAX_WORKER_THREADS);
     options.on_start = [api] { api->Reopen(); };
     options.on_stop = [api] { api->Interrupt(); };
-    return std::make_unique<FlowMeshHttpsServer>(std::move(options), [api](const auto& request) { return api->Handle(request); });
+    // An explicitly restricted health handler alone enables the separate
+    // one-worker transport reserve (16 ordinary + 1 reserved maximum).
+    FlowMeshHttpsServer::Handler restricted_health;
+    if (health.enabled) restricted_health = [api](const auto& request) { return api->HandleReservedHealth(request); };
+    return std::make_unique<FlowMeshHttpsServer>(std::move(options),
+        [api](const auto& request) { return api->Handle(request); }, std::move(restricted_health));
 }
 } // namespace node

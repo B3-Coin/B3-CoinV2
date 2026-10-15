@@ -85,6 +85,10 @@ struct FlowMeshHttpsTestAccess {
     {
         return server.SetConnectionObserverForTest(std::move(observer));
     }
+    static std::array<size_t, 4> AdmissionCounts(FlowMeshHttpsServer& server)
+    {
+        return server.AdmissionCountsForTest();
+    }
 };
 } // namespace node
 
@@ -92,6 +96,67 @@ namespace {
 
 constexpr size_t REJECTION_BYTE_BUDGET{1024 * 1024 + 8192};
 constexpr std::string_view REJECTION_BODY{"{\"error\":\"invalid-http-request\"}"};
+
+//! Transport fixtures alone: production uses TradingApi's shared-budget validator.
+bool EmptyHealthForTest(const std::string& body)
+{
+    UniValue parsed;
+    if (!parsed.read(body) || !parsed.isObject() || parsed.size() != 2 ||
+        !parsed["method"].isStr() || parsed["method"].get_str() != "health" ||
+        !parsed["params"].isObject() || parsed["params"].size() != 0) return false;
+    const auto& keys{parsed.getKeys()};
+    return std::set<std::string>(keys.begin(), keys.end()) == std::set<std::string>{"method", "params"};
+}
+
+node::FlowMeshHttpsServer::Response ReservedBusyForTest()
+{
+    return {503, std::string{node::FLOWMESH_HTTPS_RESERVED_BUSY_BODY}, true};
+}
+
+std::string PostForTest(const std::string_view body)
+{
+    return "POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + std::string{body};
+}
+
+struct ReservedHealthGate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    size_t entered{0};
+    bool released{false};
+
+    bool Await(size_t count)
+    {
+        std::unique_lock lock{mutex};
+        return changed.wait_for(lock, std::chrono::seconds{2}, [&] { return entered >= count; });
+    }
+    void Release()
+    {
+        { std::lock_guard lock{mutex}; released = true; }
+        changed.notify_all();
+    }
+    void Hold(const node::FlowMeshHttpsServer::Request& request, bool suspended = false)
+    {
+        if (suspended && request.suspend) request.suspend();
+        {
+            std::unique_lock lock{mutex};
+            ++entered;
+            changed.notify_all();
+            changed.wait_until(lock, request.deadline - std::chrono::milliseconds{100}, [&] { return released; });
+        }
+        if (suspended && request.resume) request.resume();
+    }
+};
+
+bool AwaitAdmissionForTest(node::FlowMeshHttpsServer& server, const std::function<bool(const std::array<size_t, 4>&)>& matches)
+{
+    const auto until{std::chrono::steady_clock::now() + std::chrono::seconds{2}};
+    do {
+        if (matches(node::FlowMeshHttpsTestAccess::AdmissionCounts(server))) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    } while (std::chrono::steady_clock::now() < until);
+    return false;
+}
 
 struct CleanupObservation {
     std::mutex mutex;
@@ -1079,6 +1144,426 @@ BOOST_AUTO_TEST_CASE(https_start_and_stop_hooks_bracket_workers_and_release_a_wa
     BOOST_CHECK_EQUAL(started_before_handler.load(), 1U);
     BOOST_REQUIRE_MESSAGE(server.Start(error), error);
     BOOST_CHECK_EQUAL(starts.load(), 2U);
+    server.Stop();
+    BOOST_CHECK_EQUAL(stops.load(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(https_generic_unconfigured_two_handler_saturation_explicitly_refuses_health_tls)
+{
+    using namespace std::chrono_literals;
+    ReservedHealthGate gate;
+    std::atomic<unsigned> health_calls{0};
+    auto options{Options()};
+    options.worker_threads = 6;
+    options.active_permits = 2;
+    options.request_timeout = 4s;
+    options.on_stop = [&] { gate.Release(); };
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+        if (request.body == "slow") gate.Hold(request);
+        else ++health_calls;
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }}; // Deliberately no restricted handler: the BEFORE profile is unchanged.
+    ConnectionObservation observed;
+    BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(server, [&](bool value) { observed.Record(value); }));
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    auto first{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 5s, 1024); })};
+    auto second{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 5s, 1024); })};
+    BOOST_REQUIRE(gate.Await(2));
+    const auto refused{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", R"({"method":"health","params":{}})", 150ms, 1024)};
+    BOOST_CHECK(!refused.response_received);
+    BOOST_CHECK(!refused.tls_handshake_performed);
+    BOOST_CHECK_EQUAL(observed.Count(), 2U);
+    BOOST_CHECK_EQUAL(health_calls.load(), 0U);
+    gate.Release();
+    BOOST_CHECK(first.get().response_received);
+    BOOST_CHECK(second.get().response_received);
+    const auto recovered{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "health", 2s, 1024)};
+    BOOST_CHECK(recovered.response_received);
+    BOOST_CHECK_EQUAL(recovered.status, 200);
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_reserved_health_overflow_only_leaves_unloaded_submits_on_ordinary_workers)
+{
+    using namespace std::chrono_literals;
+    std::atomic<unsigned> ordinary{0}, reserve{0};
+    auto options{Options()};
+    options.active_permits = 2;
+    node::FlowMeshHttpsServer server{options, [&](const auto&) {
+        ++ordinary;
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }, [&](const auto&) {
+        ++reserve;
+        return ReservedBusyForTest();
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    node::FlowMeshHttpsClient client;
+    for (unsigned i{0}; i < 24; ++i) {
+        BOOST_REQUIRE(AwaitAdmissionForTest(server, [](const auto& counts) { return counts[2] == 0 && counts[3] == 0; }));
+        const auto reply{client.Request(Endpoint(server), "/flowmesh/v1", R"({"method":"submit","params":{}})", 1s, 1024)};
+        BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+        BOOST_CHECK_EQUAL(reply.status, 200);
+    }
+    BOOST_CHECK_EQUAL(ordinary.load(), 24U);
+    BOOST_CHECK_EQUAL(reserve.load(), 0U);
+    client.Reset();
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_reserved_health_reclassifies_keepalive_and_never_dispatches_nonhealth)
+{
+    using namespace std::chrono_literals;
+    ReservedHealthGate gate;
+    std::atomic<unsigned> ordinary{0}, reserved{0}, callbacks{0};
+    auto options{Options()};
+    options.active_permits = 2;
+    options.request_timeout = 5s;
+    options.on_stop = [&] { gate.Release(); };
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+        ++ordinary;
+        gate.Hold(request);
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }, [&](const auto& request) {
+        ++reserved;
+        callbacks += bool(request.suspend) || bool(request.resume);
+        if (!EmptyHealthForTest(request.body)) return ReservedBusyForTest();
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    auto first{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 6s, 1024); })};
+    auto second{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 6s, 1024); })};
+    BOOST_REQUIRE(gate.Await(2));
+    node::FlowMeshHttpsClient client;
+    const auto health{client.Request(endpoint, "/flowmesh/v1", R"({"params":{},"method":"health"})", 1s, 1024)};
+    BOOST_REQUIRE_MESSAGE(health.response_received, health.error);
+    BOOST_CHECK_EQUAL(health.status, 200);
+    BOOST_CHECK(!health.connection_reused);
+    const auto busy{client.Request(endpoint, "/flowmesh/v1", R"({"method":"submit","params":{}})", 1s, 1024)};
+    BOOST_REQUIRE_MESSAGE(busy.response_received, busy.error);
+    BOOST_CHECK_EQUAL(busy.status, 503);
+    BOOST_CHECK(busy.connection_reused); // Same TLS socket, newly classified body.
+    BOOST_CHECK_EQUAL(busy.body, std::string{node::FLOWMESH_HTTPS_RESERVED_BUSY_BODY});
+    const auto again{client.Request(endpoint, "/flowmesh/v1", R"({"method":"health","params":{}})", 1s, 1024)};
+    BOOST_REQUIRE_MESSAGE(again.response_received, again.error);
+    BOOST_CHECK_EQUAL(again.status, 200);
+    BOOST_CHECK(!again.connection_reused); // Explicit busy forced the prior close.
+    BOOST_CHECK_EQUAL(ordinary.load(), 2U);
+    BOOST_CHECK_EQUAL(reserved.load(), 3U);
+    BOOST_CHECK_EQUAL(callbacks.load(), 0U);
+    BOOST_CHECK(first.wait_for(0ms) != std::future_status::ready);
+    BOOST_CHECK(second.wait_for(0ms) != std::future_status::ready);
+    gate.Release();
+    BOOST_CHECK(first.get().response_received);
+    BOOST_CHECK(second.get().response_received);
+    client.Reset();
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_reserved_health_has_separate_capacity_with_fourteen_sleepers_and_two_active)
+{
+    using namespace std::chrono_literals;
+    BOOST_CHECK_EQUAL(node::FLOWMESH_HTTPS_MAX_WORKER_THREADS, 16U);
+    BOOST_CHECK_EQUAL(node::FLOWMESH_HTTPS_MAX_RESERVED_HEALTH_THREADS, 1U);
+    BOOST_CHECK_EQUAL(node::FLOWMESH_HTTPS_MAX_TOTAL_WORKER_THREADS, 17U);
+    BOOST_CHECK_EQUAL(node::FLOWMESH_API_MAX_WAIT_SLOTS, 14U);
+    ReservedHealthGate sleepers, active;
+    auto options{Options()};
+    options.worker_threads = 16;
+    options.active_permits = 2;
+    options.request_timeout = 8s;
+    options.on_stop = [&] { active.Release(); sleepers.Release(); };
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+        if (request.body == "sleep") sleepers.Hold(request, /*suspended=*/true);
+        else active.Hold(request);
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }, [&](const auto& request) {
+        if (!EmptyHealthForTest(request.body)) return ReservedBusyForTest();
+        BOOST_CHECK(!request.suspend && !request.resume);
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    std::vector<std::future<node::HttpsRequestResult>> waiting;
+    for (size_t i{0}; i < 14; ++i) {
+        waiting.push_back(std::async(std::launch::async, [&] {
+            return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "sleep", 9s, 1024);
+        }));
+        BOOST_REQUIRE(sleepers.Await(i + 1));
+    }
+    auto first{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 9s, 1024); })};
+    auto second{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 9s, 1024); })};
+    BOOST_REQUIRE(active.Await(2));
+    BOOST_REQUIRE(AwaitAdmissionForTest(server, [](const auto& counts) { return counts[0] == 16 && counts[2] == 2; }));
+    const auto health{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", R"({"method":"health","params":{}})", 1s, 1024)};
+    BOOST_REQUIRE_MESSAGE(health.response_received, health.error);
+    BOOST_CHECK_EQUAL(health.status, 200);
+    BOOST_CHECK(first.wait_for(0ms) != std::future_status::ready);
+    BOOST_CHECK(second.wait_for(0ms) != std::future_status::ready);
+    for (auto& pending : waiting) BOOST_CHECK(pending.wait_for(0ms) != std::future_status::ready);
+    active.Release();
+    sleepers.Release();
+    BOOST_CHECK(first.get().response_received);
+    BOOST_CHECK(second.get().response_received);
+    for (auto& pending : waiting) BOOST_CHECK(pending.get().response_received);
+    server.Stop();
+    const auto counts{node::FlowMeshHttpsTestAccess::AdmissionCounts(server)};
+    BOOST_CHECK((counts == std::array<size_t, 4>{0, 0, 0, 0}));
+}
+
+BOOST_AUTO_TEST_CASE(https_reserved_health_declares_slow_reserve_and_full_admission_refusal_limits)
+{
+    using namespace std::chrono_literals;
+    for (const bool connection_cap : {true, false}) {
+        BOOST_TEST_CONTEXT("connection_cap=" << connection_cap) {
+            ReservedHealthGate gate;
+            auto options{Options()};
+            options.active_permits = 2;
+            options.max_connections = connection_cap ? 3 : 8;
+            options.max_queue = 1;
+            options.request_timeout = 5s;
+            options.on_stop = [&] { gate.Release(); };
+            std::atomic<unsigned> reserve_calls{0};
+            node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+                gate.Hold(request);
+                return node::FlowMeshHttpsServer::Response{200, "{}"};
+            }, [&](const auto& request) {
+                ++reserve_calls;
+                if (!EmptyHealthForTest(request.body)) return ReservedBusyForTest();
+                return node::FlowMeshHttpsServer::Response{200, "{}"};
+            }};
+            std::string error;
+            BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+            const auto endpoint{Endpoint(server)};
+            auto first{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 6s, 1024); })};
+            BOOST_REQUIRE(gate.Await(1)); // A one-owner queue must not race setup.
+            auto second{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 6s, 1024); })};
+            BOOST_REQUIRE(gate.Await(2));
+            SplitHttpsPeer slow_reserve{server.Port(), cert};
+            BOOST_REQUIRE(slow_reserve.SendHeaders("2")); // Deliberately never send its body.
+            BOOST_REQUIRE(AwaitAdmissionForTest(server, [](const auto& counts) { return counts[0] == 3 && counts[2] == 2; }));
+            std::future<node::HttpsRequestResult> queued;
+            if (!connection_cap) {
+                queued = std::async(std::launch::async, [&] {
+                    return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", R"({"method":"health","params":{}})", 1s, 1024);
+                });
+                BOOST_REQUIRE(AwaitAdmissionForTest(server, [](const auto& counts) { return counts[0] == 4 && counts[1] == 1; }));
+            }
+            const auto refused{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", R"({"method":"health","params":{}})", 150ms, 1024)};
+            BOOST_CHECK(!refused.response_received);
+            BOOST_CHECK(!refused.tls_handshake_performed);
+            BOOST_CHECK_EQUAL(reserve_calls.load(), 0U); // Sole reserve is still reading a bounded body.
+            const auto full{node::FlowMeshHttpsTestAccess::AdmissionCounts(server)};
+            BOOST_CHECK_LE(full[0], options.max_connections);
+            BOOST_CHECK_LE(full[1], options.max_queue);
+            BOOST_CHECK_EQUAL(full[2], 2U);
+            slow_reserve.NotifyClose();
+            if (queued.valid()) (void)queued.get();
+            BOOST_REQUIRE(AwaitAdmissionForTest(server, [](const auto& counts) { return counts[0] == 2 && counts[1] == 0; }));
+            const auto recovered{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", R"({"method":"health","params":{}})", 1s, 1024)};
+            BOOST_REQUIRE_MESSAGE(recovered.response_received, recovered.error);
+            BOOST_CHECK_EQUAL(recovered.status, 200);
+            gate.Release();
+            BOOST_CHECK(first.get().response_received);
+            BOOST_CHECK(second.get().response_received);
+            server.Stop();
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(https_reserved_health_small_reply_bound_refuses_invalid_profile_and_fallback_closes)
+{
+    using namespace std::chrono_literals;
+    auto options{Options()};
+    options.max_reply_bytes = 64;
+    std::string error;
+    node::FlowMeshHttpsServer ordinary{options, [](const auto&) { return node::FlowMeshHttpsServer::Response{200, "{}"}; }};
+    BOOST_REQUIRE_MESSAGE(ordinary.Start(error), error); // Existing generic minimum unchanged.
+    ordinary.Stop();
+    node::FlowMeshHttpsServer invalid{options,
+        [](const auto&) { return node::FlowMeshHttpsServer::Response{200, "{}"}; },
+        [](const auto&) { return ReservedBusyForTest(); }};
+    BOOST_CHECK(!invalid.Start(error));
+    BOOST_CHECK_EQUAL(error, "https-server-invalid-options");
+    ReservedHealthGate gate;
+    options.active_permits = 2;
+    options.request_timeout = 4s;
+    options.max_reply_bytes = node::FLOWMESH_HTTPS_RESERVED_BUSY_BODY.size();
+    options.on_stop = [&] { gate.Release(); };
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+        gate.Hold(request);
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }, [&](const auto&) {
+        // A faulty restricted health reply cannot turn its refusal fallback
+        // into a reusable 500 or escape the configured byte bound.
+        return node::FlowMeshHttpsServer::Response{200, std::string(options.max_reply_bytes + 1, 'x')};
+    }};
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    auto first{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 5s, 1024); })};
+    auto second{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 5s, 1024); })};
+    BOOST_REQUIRE(gate.Await(2));
+    node::FlowMeshHttpsClient client;
+    for (unsigned i{0}; i < 2; ++i) {
+        const auto reply{client.Request(endpoint, "/flowmesh/v1", R"({"method":"health","params":{}})", 1s, 1024)};
+        BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+        BOOST_CHECK_EQUAL(reply.status, 503);
+        BOOST_CHECK_EQUAL(reply.body, std::string{node::FLOWMESH_HTTPS_RESERVED_BUSY_BODY});
+        BOOST_CHECK_LE(reply.body.size(), options.max_reply_bytes);
+        BOOST_CHECK(!reply.connection_reused);
+    }
+    gate.Release();
+    BOOST_CHECK(first.get().response_received);
+    BOOST_CHECK(second.get().response_received);
+    client.Reset();
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_reserved_health_preserves_http_bounds_and_tls_authentication)
+{
+    using namespace std::chrono_literals;
+    ReservedHealthGate gate;
+    std::atomic<unsigned> reserve_calls{0};
+    auto options{Options()};
+    options.active_permits = 2;
+    options.max_request_bytes = 64;
+    options.request_timeout = 6s;
+    options.on_stop = [&] { gate.Release(); };
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+        gate.Hold(request);
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }, [&](const auto& request) {
+        ++reserve_calls;
+        if (!EmptyHealthForTest(request.body)) return ReservedBusyForTest();
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    auto first{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 7s, 1024); })};
+    auto second{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 7s, 1024); })};
+    BOOST_REQUIRE(gate.Await(2));
+    {
+        SplitHttpsPeer oversized{server.Port(), cert};
+        BOOST_REQUIRE(oversized.SendHeaders("65"));
+        BOOST_CHECK(oversized.ReadRejection().starts_with("HTTP/1.1 413 "));
+        oversized.NotifyClose();
+    }
+    {
+        SplitHttpsPeer pipelined{server.Port(), cert};
+        BOOST_REQUIRE(pipelined.Send(PostForTest("{}") + PostForTest("{}")));
+        BOOST_CHECK(pipelined.ReadRejection().starts_with("HTTP/1.1 400 "));
+        pipelined.NotifyClose();
+    }
+    auto untrusted{endpoint};
+    untrusted.certificate_sha256 = std::string(64, '0');
+    const auto refused{node::FlowMeshHttpsRequest(untrusted, "/flowmesh/v1", R"({"method":"health","params":{}})", 1s, 1024)};
+    BOOST_CHECK(!refused.response_received);
+    BOOST_CHECK_EQUAL(reserve_calls.load(), 0U);
+    const auto health{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", R"({"method":"health","params":{}})", 1s, 1024)};
+    BOOST_REQUIRE_MESSAGE(health.response_received, health.error);
+    BOOST_CHECK_EQUAL(health.status, 200);
+    gate.Release();
+    BOOST_CHECK(first.get().response_received);
+    BOOST_CHECK(second.get().response_received);
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_reserved_health_preserves_ordinary_resumer_priority)
+{
+    using namespace std::chrono_literals;
+    ReservedHealthGate sleeping, slow;
+    std::mutex order_mutex;
+    std::vector<std::string> order;
+    const auto record = [&](const std::string& item) { std::lock_guard lock{order_mutex}; order.push_back(item); };
+    auto options{Options()};
+    options.active_permits = 1;
+    options.worker_threads = 3;
+    options.request_timeout = 5s;
+    options.on_stop = [&] { slow.Release(); sleeping.Release(); };
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+        if (request.body == "sleep") {
+            sleeping.Hold(request, /*suspended=*/true);
+            record("resumed");
+        } else if (request.body == "slow") {
+            slow.Hold(request);
+            record("slow");
+        } else record("queued");
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }, [&](const auto& request) {
+        if (!EmptyHealthForTest(request.body)) return ReservedBusyForTest();
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    auto waiter{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "sleep", 6s, 1024); })};
+    BOOST_REQUIRE(sleeping.Await(1));
+    auto holder{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 6s, 1024); })};
+    BOOST_REQUIRE(slow.Await(1));
+    // Occupy only the reserved transport owner; it must not take the sole
+    // ordinary permit or change an ordinary resumer's priority.
+    SplitHttpsPeer reserve{server.Port(), cert};
+    BOOST_REQUIRE(reserve.SendHeaders("2"));
+    sleeping.Release();
+    BOOST_REQUIRE(AwaitAdmissionForTest(server, [](const auto& counts) { return counts[2] == 1 && counts[3] == 1; }));
+    auto queued{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "queued", 6s, 1024); })};
+    BOOST_REQUIRE(AwaitAdmissionForTest(server, [](const auto& counts) { return counts[1] == 1; }));
+    slow.Release();
+    BOOST_CHECK(holder.get().response_received);
+    BOOST_CHECK(waiter.get().response_received);
+    BOOST_CHECK(queued.get().response_received);
+    {
+        std::lock_guard lock{order_mutex};
+        const std::vector<std::string> expected{"slow", "resumed", "queued"};
+        BOOST_CHECK_EQUAL_COLLECTIONS(order.begin(), order.end(), expected.begin(), expected.end());
+    }
+    reserve.NotifyClose();
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_reserved_health_stop_joins_its_partial_body_owner_and_restart_is_clean)
+{
+    using namespace std::chrono_literals;
+    ReservedHealthGate gate;
+    std::atomic<unsigned> reserve_calls{0}, stops{0};
+    auto options{Options()};
+    options.active_permits = 2;
+    options.request_timeout = 5s;
+    options.on_stop = [&] { ++stops; gate.Release(); };
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+        if (request.body == "slow") gate.Hold(request);
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }, [&](const auto& request) {
+        ++reserve_calls;
+        if (!EmptyHealthForTest(request.body)) return ReservedBusyForTest();
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto endpoint{Endpoint(server)};
+    auto first{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 6s, 1024); })};
+    auto second{std::async(std::launch::async, [&] { return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", "slow", 6s, 1024); })};
+    BOOST_REQUIRE(gate.Await(2));
+    SplitHttpsPeer partial{server.Port(), cert};
+    BOOST_REQUIRE(partial.SendHeaders("2"));
+    BOOST_REQUIRE(AwaitAdmissionForTest(server, [](const auto& counts) { return counts[0] == 3; }));
+    const auto stop_started{std::chrono::steady_clock::now()};
+    server.Stop();
+    BOOST_CHECK(std::chrono::steady_clock::now() - stop_started < 1s);
+    (void)first.get();
+    (void)second.get();
+    BOOST_CHECK_EQUAL(reserve_calls.load(), 0U);
+    BOOST_CHECK((node::FlowMeshHttpsTestAccess::AdmissionCounts(server) == std::array<size_t, 4>{0, 0, 0, 0}));
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto healthy{node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "health", 1s, 1024)};
+    BOOST_REQUIRE_MESSAGE(healthy.response_received, healthy.error);
+    BOOST_CHECK_EQUAL(healthy.status, 200);
     server.Stop();
     BOOST_CHECK_EQUAL(stops.load(), 2U);
 }
@@ -4281,6 +4766,109 @@ BOOST_AUTO_TEST_CASE(api_health_is_cached_and_rate_limited_per_client)
     service.Stop();
 }
 
+BOOST_AUTO_TEST_CASE(api_reserved_health_strict_decoded_envelope_never_dispatches_other_methods)
+{
+    using namespace std::chrono_literals;
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-health-reserve-strict"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    auto options{Options()};
+    options.request_timeout = 10s;
+    auto api{node::MakeFlowMeshTradingApi(service, options, {}, {}, {true})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    // Two complete TLS sessions, deliberately no HTTP body: the actual
+    // ordinary transport permits are held, not synthetic API/action work.
+    SplitHttpsPeer first{api->Port(), cert}, second{api->Port(), cert};
+    BOOST_REQUIRE(AwaitAdmissionForTest(*api, [](const auto& counts) { return counts[2] == 2; }));
+    node::FlowMeshHttpsClient client;
+    const std::vector<std::string> refused{
+        R"({"method":"health","method":"submit","params":{}})",
+        R"({"method":"health","params":{},"params":{}})",
+        R"({"method":"health","params":{},"extra":0})",
+        R"({"method":"health"})", R"({"params":{}})",
+        R"({"method":"health","params":null})", R"({"method":"health","params":[]})",
+        R"({"method":"health","params":{"unexpected":true}})",
+        R"({"method":"submit","params":{}})", R"({"method":"action","params":{}})",
+        std::string{R"({"method":"health","params":{}})"} + " trailing", "not-json",
+        "{\"method\":\"health\",\"params\":{\"market_id\":\"" + market.GetHex() + "\"}}"};
+    for (const auto& body : refused) {
+        const auto reply{client.Request(endpoint, "/flowmesh/v1", body, 1s, 1 << 20)};
+        BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+        BOOST_CHECK_EQUAL(reply.status, 503);
+        BOOST_CHECK_EQUAL(reply.body, std::string{node::FLOWMESH_HTTPS_RESERVED_BUSY_BODY});
+        BOOST_CHECK(!reply.connection_reused); // Every before-admission refusal closes.
+    }
+    const auto valid{client.Request(endpoint, "/flowmesh/v1", " { \"params\" : { }, \"method\" : \"health\" } ", 1s, 1 << 20)};
+    BOOST_REQUIRE_MESSAGE(valid.response_received, valid.error);
+    BOOST_REQUIRE_EQUAL(valid.status, 200);
+    UniValue parsed;
+    BOOST_REQUIRE(parsed.read(valid.body));
+    BOOST_CHECK(parsed["ok"].isTrue());
+    BOOST_CHECK_EQUAL(parsed["result"]["observation"].get_str(), "local-node");
+    client.Reset();
+    first.NotifyClose(); second.NotifyClose();
+    BOOST_REQUIRE(AwaitAdmissionForTest(*api, [](const auto& counts) { return counts[0] == 0; }));
+    // Filtered health remains valid on the ordinary path; only its reserve
+    // eligibility is narrower, never a new protocol parameter rule.
+    BOOST_CHECK_EQUAL(ApiCall(endpoint, "health", "{\"market_id\":\"" + market.GetHex() + "\"}").first, 200);
+    api->Stop();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(api_reserved_and_ordinary_health_share_exactly_once_existing_budgets)
+{
+    using namespace std::chrono_literals;
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-health-reserve-shared-budget"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    auto options{Options()};
+    options.request_timeout = 10s;
+    auto api{node::MakeFlowMeshTradingApi(service, options, {}, {}, {true})};
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    SplitHttpsPeer first{api->Port(), cert}, second{api->Port(), cert};
+    BOOST_REQUIRE(AwaitAdmissionForTest(*api, [](const auto& counts) { return counts[2] == 2; }));
+    node::FlowMeshHttpsClient client;
+    const std::string health{R"({"method":"health","params":{}})"};
+    const auto started{std::chrono::steady_clock::now()};
+    const auto reserved{client.Request(endpoint, "/flowmesh/v1", health, 1s, 1 << 20)};
+    BOOST_REQUIRE_MESSAGE(reserved.response_received, reserved.error);
+    BOOST_REQUIRE_EQUAL(reserved.status, 200); // Reserve, while both ordinary reads remain held.
+    BOOST_REQUIRE(first.Send(PostForTest(health)));
+    BOOST_REQUIRE(first.ReadRecord().starts_with("HTTP/1.1 200 ")); // Ordinary owner 1.
+    BOOST_REQUIRE(second.Send(PostForTest(health)));
+    BOOST_REQUIRE(second.ReadRecord().starts_with("HTTP/1.1 200 ")); // Ordinary owner 2.
+    const auto fourth{client.Request(endpoint, "/flowmesh/v1", health, 1s, 1 << 20)};
+    BOOST_REQUIRE_EQUAL(fourth.status, 200);
+    const auto fifth{client.Request(endpoint, "/flowmesh/v1", health, 1s, 1 << 20)};
+    BOOST_REQUIRE_EQUAL(fifth.status, 429);
+    UniValue refused;
+    BOOST_REQUIRE(refused.read(fifth.body));
+    BOOST_CHECK_EQUAL(refused["error"].get_str(), node::FLOWMESH_API_HEALTH_BUDGET_ERROR);
+    first.NotifyClose(); second.NotifyClose();
+    // All five health requests charged ONE ordinary read token each, even
+    // the health-budget refusal. Exactly 23 more reach the peer-read cap28.
+    const std::string markets{R"({"method":"markets","params":{}})"};
+    for (unsigned i{0}; i < 23; ++i) {
+        const auto reply{client.Request(endpoint, "/flowmesh/v1", markets, 1s, 1 << 20)};
+        BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+        BOOST_REQUIRE_EQUAL(reply.status, 200);
+    }
+    const auto spent{client.Request(endpoint, "/flowmesh/v1", markets, 1s, 1 << 20)};
+    BOOST_REQUIRE_EQUAL(spent.status, 429);
+    BOOST_REQUIRE(refused.read(spent.body));
+    BOOST_CHECK_EQUAL(refused["error"].get_str(), "Public trading request budget exhausted before admission");
+    // No skip/retry at a clock boundary: a slow fixture is insufficient
+    // evidence and fails instead of silently dropping its budget controls.
+    BOOST_REQUIRE_MESSAGE(std::chrono::steady_clock::now() - started < 1s, "Shared-budget fixture exceeded its single preselected window");
+    client.Reset();
+    api->Stop();
+    service.Stop();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_api_budget_tests, ClientLaneFixture)
@@ -5492,6 +6080,189 @@ flowmesh::MarketDataQuery Page()
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_client_watch_lane_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(public_health_https_uses_leaf_observations_while_cs_main_is_held)
+{
+    using namespace std::chrono_literals;
+    LiveMarket live{*this, m_path_root / "health-chain-lock-service"};
+    auto api{node::MakeFlowMeshTradingApi(*live.service, Options(), {}, {}, {true})};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto endpoint{Endpoint(api->Port())};
+    node::FlowMeshServiceHealth before;
+    const auto published_by{std::chrono::steady_clock::now() + 3s};
+    do {
+        before = live.service->Health(market);
+        if (before.rows.size() == 1 && before.rows.front().observation &&
+            before.rows.front().observation->next_sequence == 1) break;
+        std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < published_by);
+    BOOST_REQUIRE_EQUAL(before.rows.size(), 1U);
+    BOOST_REQUIRE(before.rows.front().observation);
+    const auto sequence{before.rows.front().observation->next_sequence};
+    const auto head{before.rows.front().observation->last_hash};
+    BOOST_REQUIRE_EQUAL(sequence, 1U);
+    BOOST_REQUIRE(!head.IsNull());
+    const std::string body{"{\"method\":\"health\",\"params\":{\"market_id\":\"" + market.GetHex() + "\"}}"};
+    std::future<node::HttpsRequestResult> pending;
+    bool answered_while_held{false};
+    {
+        // The real chain lock is deliberately held by a different thread
+        // from the actual public HTTPS handler. No application proxy or
+        // synthetic health response participates in this positive control.
+        LOCK(::cs_main);
+        pending = std::async(std::launch::async, [&] {
+            return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", body, 2s, 1 << 20);
+        });
+        answered_while_held = pending.wait_for(1s) == std::future_status::ready;
+    } // Always release cs_main before future destruction, joining or Stop.
+    const auto reply{pending.get()};
+    BOOST_CHECK_MESSAGE(answered_while_held, "Public health waited for the real chain lock");
+    BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+    BOOST_REQUIRE_EQUAL(reply.status, 200);
+    BOOST_CHECK(reply.tls_handshake_performed);
+    UniValue parsed;
+    BOOST_REQUIRE(parsed.read(reply.body));
+    BOOST_REQUIRE(parsed["ok"].isTrue());
+    const auto& health{parsed["result"]};
+    BOOST_CHECK_EQUAL(health["observation"].get_str(), "local-node");
+    BOOST_CHECK_EQUAL(health["health_version"].getInt<int>(), 1);
+    BOOST_REQUIRE_EQUAL(health["markets"].size(), 1U);
+    const auto& row{health["markets"][0]};
+    BOOST_CHECK_EQUAL(row["market_id"].get_str(), market.GetHex());
+    BOOST_CHECK_EQUAL(row["next_microblock_sequence"].getInt<uint64_t>(), sequence);
+    BOOST_CHECK_EQUAL(row["last_microblock_hash"].get_str(), head.GetHex());
+    BOOST_CHECK(!row.exists("error"));
+    BOOST_CHECK(!row.exists("proposal_wait_reason"));
+    // This is an advisory local observation of one captured head, not a
+    // current quorum, chain-authority or certified-account proof.
+    BOOST_CHECK(!health.exists("certificate_verified"));
+    BOOST_CHECK(!health.exists("account_state_verified"));
+    api->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(synthetic_cs_main_handler_saturation_must_not_starve_public_health_tls)
+{
+    using namespace std::chrono_literals;
+    LiveMarket live{*this, m_path_root / "health-permit-service"};
+    auto api{node::MakeFlowMeshTradingApi(*live.service, Options(), {}, {}, {true})};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+    const auto upstream{Endpoint(api->Port())};
+    struct Entered {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::set<std::string> slow_methods;
+        unsigned health_handlers{0};
+    } entered;
+    auto options{Options()};
+    options.active_permits = node::FLOWMESH_API_ACTIVE_PERMITS;
+    options.worker_threads = 6; // Four spare workers cannot create a permit.
+    options.request_timeout = 6s;
+    ConnectionObservation connections;
+    node::FlowMeshHttpsServer front{options, [&](const auto& request) {
+        UniValue parsed;
+        if (!parsed.read(request.body) || !parsed["method"].isStr()) {
+            return node::FlowMeshHttpsServer::Response{400, R"({"ok":false,"error":"synthetic front parse"})"};
+        }
+        const auto method{parsed["method"].get_str()};
+        if (method == "snapshot" || method == "markets") {
+            {
+                std::lock_guard lock{entered.mutex};
+                entered.slow_methods.insert(method);
+            }
+            entered.changed.notify_all();
+            {
+                // SYNTHETIC transport holder: the production TradingApi has
+                // no entry-before-chain-lock observation seam. This proves
+                // permit starvation, NOT that both production handlers or
+                // real chain validation reached this exact point.
+                LOCK(::cs_main);
+            }
+        } else if (method == "health") {
+            std::lock_guard lock{entered.mutex};
+            ++entered.health_handlers;
+        }
+        // No network operation holds cs_main. Responses, including health,
+        // come from the real restricted API after the synthetic hold ends.
+        const auto remaining{std::chrono::duration_cast<std::chrono::milliseconds>(
+            request.deadline - std::chrono::steady_clock::now())};
+        const auto reply{node::FlowMeshHttpsRequest(upstream, "/flowmesh/v1", request.body,
+            std::min(remaining, std::chrono::milliseconds{2000}), 1 << 20)};
+        if (!reply.response_received) return node::FlowMeshHttpsServer::Response{502, R"({"ok":false,"error":"synthetic upstream unavailable"})"};
+        return node::FlowMeshHttpsServer::Response{reply.status, reply.body};
+    }, [&](const auto& request) {
+        // AFTER profile only: explicitly configure the restricted reserve.
+        // The retained BEFORE TU a1abd251 used the generic constructor.
+        if (!EmptyHealthForTest(request.body)) return ReservedBusyForTest();
+        {
+            std::lock_guard lock{entered.mutex};
+            ++entered.health_handlers;
+        }
+        const auto remaining{std::chrono::duration_cast<std::chrono::milliseconds>(
+            request.deadline - std::chrono::steady_clock::now())};
+        const auto reply{node::FlowMeshHttpsRequest(upstream, "/flowmesh/v1", request.body,
+            std::min(remaining, std::chrono::milliseconds{2000}), 1 << 20)};
+        if (!reply.response_received) return node::FlowMeshHttpsServer::Response{502, R"({"ok":false,"error":"synthetic upstream unavailable"})"};
+        return node::FlowMeshHttpsServer::Response{reply.status, reply.body};
+    }};
+    BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(front,
+        [&](bool nodelay) { connections.Record(nodelay); }));
+    BOOST_REQUIRE_MESSAGE(front.Start(error), error);
+    const auto endpoint{Endpoint(front.Port())};
+    const std::string snapshot{"{\"method\":\"snapshot\",\"params\":{\"market_id\":\"" + market.GetHex() + "\"}}"};
+    const std::string markets{R"({"method":"markets","params":{}})"};
+    const std::string health{R"({"method":"health","params":{}})"};
+    std::future<node::HttpsRequestResult> first, second;
+    node::HttpsRequestResult blocked_health;
+    {
+        LOCK(::cs_main);
+        first = std::async(std::launch::async, [&] {
+            return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", snapshot, 5s, 1 << 20);
+        });
+        second = std::async(std::launch::async, [&] {
+            return node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", markets, 5s, 1 << 20);
+        });
+        {
+            std::unique_lock lock{entered.mutex};
+            BOOST_REQUIRE(entered.changed.wait_for(lock, 2s, [&] { return entered.slow_methods.size() == 2; }));
+        }
+        BOOST_REQUIRE_EQUAL(connections.Count(), 2U);
+        BOOST_REQUIRE(first.wait_for(0ms) != std::future_status::ready);
+        BOOST_REQUIRE(second.wait_for(0ms) != std::future_status::ready);
+        blocked_health = node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", health, 1s, 1 << 20);
+        // Same barriers/deadline assertion as the retained red BEFORE TU;
+        // this successor explicitly enables the restricted overflow profile.
+        BOOST_CHECK_MESSAGE(blocked_health.response_received,
+            "Desired public-health availability failed: two synthetic chain-lock handlers consumed both HTTPS permits; health error=" << blocked_health.error);
+        if (!blocked_health.response_received) {
+            BOOST_CHECK(!blocked_health.tls_handshake_performed);
+            BOOST_CHECK_EQUAL(connections.Count(), 2U);
+            std::lock_guard lock{entered.mutex};
+            BOOST_CHECK_EQUAL(entered.health_handlers, 0U);
+        } else {
+            BOOST_CHECK_EQUAL(blocked_health.status, 200);
+            BOOST_CHECK_EQUAL(connections.Count(), 3U);
+            std::lock_guard lock{entered.mutex};
+            BOOST_CHECK_EQUAL(entered.health_handlers, 1U);
+        }
+    } // Release the real lock before any future joins or server shutdown.
+    const auto first_reply{first.get()};
+    const auto second_reply{second.get()};
+    BOOST_REQUIRE_MESSAGE(first_reply.response_received, first_reply.error);
+    BOOST_REQUIRE_MESSAGE(second_reply.response_received, second_reply.error);
+    BOOST_CHECK_EQUAL(first_reply.status, 200);
+    BOOST_CHECK_EQUAL(second_reply.status, 200);
+    const auto recovered{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", health, 2s, 1 << 20)};
+    BOOST_REQUIRE_MESSAGE(recovered.response_received, recovered.error);
+    BOOST_REQUIRE_EQUAL(recovered.status, 200);
+    UniValue parsed;
+    BOOST_REQUIRE(parsed.read(recovered.body));
+    BOOST_REQUIRE(parsed["ok"].isTrue());
+    BOOST_CHECK_EQUAL(parsed["result"]["observation"].get_str(), "local-node");
+    front.Stop();
+    api->Stop();
+}
 
 BOOST_AUTO_TEST_CASE(event_gap_is_raised_only_when_a_snapshot_skips_events)
 {

@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace node {
 
@@ -26,6 +27,13 @@ inline constexpr std::chrono::seconds FLOWMESH_HTTPS_DEFAULT_IDLE_TIMEOUT{30};
 inline constexpr std::chrono::minutes FLOWMESH_HTTPS_DEFAULT_CONNECTION_LIFETIME{5};
 //! FlowMeshHttpsServer::Options::worker_threads bound.
 inline constexpr size_t FLOWMESH_HTTPS_MAX_WORKER_THREADS{16};
+//! Only a configured restricted health handler adds this separate worker.
+inline constexpr size_t FLOWMESH_HTTPS_MAX_RESERVED_HEALTH_THREADS{1};
+inline constexpr size_t FLOWMESH_HTTPS_MAX_TOTAL_WORKER_THREADS{
+    FLOWMESH_HTTPS_MAX_WORKER_THREADS + FLOWMESH_HTTPS_MAX_RESERVED_HEALTH_THREADS};
+//! A reserve refusal is before action admission, not proof about earlier requests.
+inline constexpr std::string_view FLOWMESH_HTTPS_RESERVED_BUSY_BODY{
+    R"({"ok":false,"error":"Public trading handler capacity busy before admission"})"};
 
 struct HttpsEndpoint {
     /** An HTTPS origin, optionally ending in /flowmesh/v1. No userinfo,
@@ -152,11 +160,13 @@ public:
         std::chrono::milliseconds idle_timeout{FLOWMESH_HTTPS_DEFAULT_IDLE_TIMEOUT};
         std::chrono::milliseconds connection_lifetime{FLOWMESH_HTTPS_DEFAULT_CONNECTION_LIFETIME};
         size_t max_requests_per_connection{128};
-        /** Connections at once in TLS handshake, request read, handler work,
+        /** Ordinary connections at once in TLS handshake, request read, handler work,
          * reply write or close; 0 means worker_threads, at most that. Extra
          * workers only serve while a handler has suspended its permit, so
          * handshake CPU, buffered replies and handler concurrency stay within
-         * this bound however many handlers sleep in bounded waits. */
+         * this bound however many handlers sleep in bounded waits. A configured
+         * restricted health handler has one separate transport permit/worker;
+         * it never increases ordinary handler or wait/watch capacity. */
         size_t active_permits{0};
         /** Optional; must not block and should not throw (exceptions are
          * swallowed). on_start runs in Start just before the workers spawn.
@@ -186,10 +196,23 @@ public:
     struct Response {
         int status{200};
         std::string body;
+        //! Explicit pre-admission busy replies on the reserve never persist.
+        bool close_connection{false};
     };
     using Handler = std::function<Response(const Request&)>;
 
-    FlowMeshHttpsServer(Options options, Handler handler);
+    /** Optional restricted handler: exactly one additional worker/transport
+     * permit may serve a queued connection while ordinary permits are full.
+     * It receives no suspend/resume callbacks. It MUST fully validate and
+     * budget health requests itself, never run a general/action/wait handler,
+     * and refuse every other request before action admission with an explicit
+     * busy response and close_connection=true. Queue/connection/body/reply
+     * limits and original deadlines remain shared; this is not availability
+     * under full admission, slow TLS/body input or exhausted API budgets.
+     * Idle keepalive connections are reclassified on EVERY readable request.
+     * Its configured reply bound must fit FLOWMESH_HTTPS_RESERVED_BUSY_BODY.
+     * Generic two-argument callers retain their existing worker/permit bound. */
+    FlowMeshHttpsServer(Options options, Handler handler, Handler restricted_health_handler = {});
     ~FlowMeshHttpsServer();
     FlowMeshHttpsServer(const FlowMeshHttpsServer&) = delete;
     FlowMeshHttpsServer& operator=(const FlowMeshHttpsServer&) = delete;
@@ -205,6 +228,8 @@ private:
     // Test-only observation, configured before Start. Reports the read-back
     // TCP_NODELAY state once per admitted connection, before its handshake.
     bool SetConnectionObserverForTest(std::function<void(bool tcp_nodelay)> observer);
+    //! Leaf observation only: counted owners, queued owners, ordinary active/resuming.
+    std::array<size_t, 4> AdmissionCountsForTest();
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };
