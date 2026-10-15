@@ -146,6 +146,10 @@ public:
     ~CDBIterator();
 
     bool Valid() const;
+    //! Encoded lengths without allocating/copying/deserializing the record.
+    //! Caller must first check Valid(). Obfuscation preserves value length.
+    size_t KeySize() const;
+    size_t ValueSize() const;
 
     //! Exact-consumption key read: deserializes and additionally
     //! requires the key bytes to be COMPLETELY consumed — canonical

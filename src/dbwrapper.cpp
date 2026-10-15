@@ -403,6 +403,8 @@ std::span<const std::byte> CDBIterator::GetValueImpl() const
 
 CDBIterator::~CDBIterator() = default;
 bool CDBIterator::Valid() const { return m_impl_iter->iter->Valid(); }
+size_t CDBIterator::KeySize() const { return GetKeyImpl().size(); }
+size_t CDBIterator::ValueSize() const { return GetValueImpl().size(); }
 bool CDBIterator::StatusOK() const { return m_impl_iter->iter->status().ok(); }
 void CDBIterator::SeekToFirst() { m_impl_iter->iter->SeekToFirst(); }
 void CDBIterator::Next() { m_impl_iter->iter->Next(); }

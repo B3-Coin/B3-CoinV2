@@ -11,10 +11,27 @@
 
 #include <memory>
 #include <ranges>
+#include <vector>
 
 #include <boost/test/unit_test.hpp>
 
 using util::ToString;
+
+namespace {
+struct RawIteratorBytes {
+    std::vector<std::byte> bytes;
+    template <typename Stream> void Serialize(Stream& stream) const { stream.write(bytes); }
+};
+struct IteratorDecodeSpy {
+    size_t& calls;
+    uint256 value;
+    template <typename Stream> void Unserialize(Stream& stream)
+    {
+        ++calls;
+        ::Unserialize(stream, value);
+    }
+};
+} // namespace
 
 BOOST_FIXTURE_TEST_SUITE(dbwrapper_tests, BasicTestingSetup)
 
@@ -234,6 +251,8 @@ BOOST_AUTO_TEST_CASE(dbwrapper_iterator)
 
         BOOST_REQUIRE(it->GetKey(key_res));
         BOOST_REQUIRE(it->GetValue(val_res));
+        BOOST_CHECK_EQUAL(it->KeySize(), 1U);
+        BOOST_CHECK_EQUAL(it->ValueSize(), 32U);
         BOOST_CHECK_EQUAL(key_res, key);
         BOOST_CHECK_EQUAL(val_res.ToString(), in.ToString());
 
@@ -241,11 +260,50 @@ BOOST_AUTO_TEST_CASE(dbwrapper_iterator)
 
         BOOST_REQUIRE(it->GetKey(key_res));
         BOOST_REQUIRE(it->GetValue(val_res));
+        BOOST_CHECK_EQUAL(it->KeySize(), 1U);
+        BOOST_CHECK_EQUAL(it->ValueSize(), 32U);
         BOOST_CHECK_EQUAL(key_res, key2);
         BOOST_CHECK_EQUAL(val_res.ToString(), in2.ToString());
 
         it->Next();
         BOOST_CHECK_EQUAL(it->Valid(), false);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(iterator_raw_sizes_allow_rejection_before_deserialization)
+{
+    for (const bool obfuscate : {false, true}) {
+        CDBWrapper dbw({.path = m_args.GetDataDirBase() / "iterator_raw_sizes",
+            .cache_bytes = 1 << 20, .memory_only = true, .obfuscate = obfuscate});
+        // A malformed short value and an oversized encoded value, neither
+        // required to fit the expected decoder. Lengths are encoded bytes,
+        // not GetSerializeSize guesses or post-decode memory measurements.
+        constexpr size_t limit{8U * 1024 * 1024};
+        dbw.Write(uint8_t{'j'}, RawIteratorBytes{{std::byte{0}}});
+        dbw.Write(uint8_t{'k'}, RawIteratorBytes{std::vector<std::byte>(limit + 1)});
+        dbw.Write(RawIteratorBytes{std::vector<std::byte>(33, std::byte{'z'})}, uint256{});
+        std::unique_ptr<CDBIterator> it{dbw.NewIterator()};
+        size_t calls{0};
+        IteratorDecodeSpy spy{calls, {}};
+        it->Seek(uint8_t{'j'});
+        BOOST_REQUIRE(it->Valid());
+        BOOST_CHECK_EQUAL(it->KeySize(), 1U);
+        BOOST_CHECK_EQUAL(it->ValueSize(), 1U);
+        BOOST_CHECK(!it->GetValueExact(spy));
+        BOOST_CHECK_EQUAL(calls, 1U); // attempted small malformed decode is visible
+        it->Next();
+        BOOST_REQUIRE(it->Valid());
+        BOOST_CHECK_EQUAL(it->KeySize(), 1U);
+        BOOST_CHECK_EQUAL(it->ValueSize(), limit + 1);
+        if (it->ValueSize() <= limit) it->GetValueExact(spy);
+        BOOST_CHECK_EQUAL(calls, 1U); // no deserializer invoked for refusal
+        it->Next();
+        BOOST_REQUIRE(it->Valid());
+        BOOST_CHECK_EQUAL(it->KeySize(), 33U);
+        BOOST_CHECK_EQUAL(it->ValueSize(), 32U);
+        uint8_t key{0};
+        BOOST_CHECK(!it->GetKeyExact(key));
+        BOOST_CHECK(it->StatusOK());
     }
 }
 

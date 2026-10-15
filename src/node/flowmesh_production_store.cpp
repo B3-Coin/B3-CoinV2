@@ -212,6 +212,18 @@ constexpr size_t MAX_DISK_ENTRY_BYTES{
     flowmesh::FLOWMESH_MAX_WITHDRAWAL_SETTLEMENTS_PER_ENTRY *
         (modern::FLOWMESH_WITHDRAWAL_RECEIPT_V1_SIZE + 32 + 32 + 4 + 32 + 3) +
     64};
+constexpr size_t MAX_ADVISORY_MARKER_BYTES{1024};
+static_assert(MAX_DISK_ENTRY_BYTES + MAX_ADVISORY_MARKER_BYTES + 10 <=
+              FlowMeshProductionStore::CheckpointScanBudget::DEFAULT_BYTES);
+static_assert(FlowMeshProductionStore::CheckpointScanBudget::DEFAULT_RECORDS >= 2);
+
+bool CheckpointEligible(const flowmesh::ProductionEntryCore& entry, const bool has_settlements,
+                        const std::optional<uint64_t> last_connection)
+{
+    return (!last_connection && entry.sequence == 0) ||
+           entry.kind == static_cast<uint8_t>(flowmesh::ProductionEntryKind::EPOCH_HANDOFF) ||
+           entry.effect_count != 0 || has_settlements;
+}
 constexpr size_t MAX_DISK_CONNECTION_BYTES{
     modern::FLOWMESH_CHECKPOINT_RECORD_MAX_SIZE + 16 + 4 + 32};
 constexpr size_t MAX_DISK_LOCKED_CANDIDATE_BYTES{
@@ -773,14 +785,16 @@ std::optional<std::vector<modern::FlowMeshEffectV1>> DecodeDiskEffects(
 }
 
 std::optional<StoredProductionEntry> DecodeDiskEntry(
-    const DiskEntry& disk, const flowmesh::ActiveFnBlsSeatSet& seats)
+    const DiskEntry& disk, const flowmesh::ActiveFnBlsSeatSet& seats,
+    size_t* certificate_checks = nullptr)
 {
     const auto entry{DecodeDiskEntryShape(disk)};
     if (!entry) return std::nullopt;
     const auto certificate{flowmesh::DecodeBlsMicroblockCertificate(
         disk.certificate_bytes, seats.Size())};
-    if (!certificate ||
-        flowmesh::CheckProductionEntryCertificate(*entry, seats, *certificate) !=
+    if (!certificate) return std::nullopt;
+    if (certificate_checks) ++*certificate_checks;
+    if (flowmesh::CheckProductionEntryCertificate(*entry, seats, *certificate) !=
             flowmesh::BlsCertificateCheck::OK) {
         return std::nullopt;
     }
@@ -1099,7 +1113,8 @@ bool ValidateLockedCandidateNamespace(
 
 bool ValidateStorage(CDBWrapper& db,
                      const FlowMeshProductionStore::Marker& marker,
-                     std::string& error)
+                     std::string& error,
+                     std::optional<uint64_t>* last_connection_out = nullptr)
 {
     if (!MarkerShapeIsValid(marker)) {
         error = "FlowMesh production marker is malformed or has an unsupported format";
@@ -1146,6 +1161,7 @@ bool ValidateStorage(CDBWrapper& db,
     std::optional<flowmesh::AnchorRef> active_anchor_from_handoff;
     bool have_active_context{false};
     bool pending_handoff{false};
+    std::optional<uint64_t> last_connection;
 
     std::unique_ptr<CDBIterator> it{db.NewIterator()};
     for (it->Seek(uint8_t{KEY_ENTRY}); it->Valid(); it->Next()) {
@@ -1196,6 +1212,7 @@ bool ValidateStorage(CDBWrapper& db,
                 return false;
             }
             checkpoint_head = next_checkpoint;
+            last_connection = expected_sequence;
         }
 
         const bool handoff{
@@ -1245,9 +1262,10 @@ bool ValidateStorage(CDBWrapper& db,
         error = "FlowMesh v3 marker disagrees with its durable history";
         return false;
     }
-    return ValidateLockNamespace(db, marker, pending_handoff, error) &&
-           ValidateLockedCandidateNamespace(db, marker, pending_handoff,
-                                            error);
+    if (!ValidateLockNamespace(db, marker, pending_handoff, error) ||
+        !ValidateLockedCandidateNamespace(db, marker, pending_handoff, error)) return false;
+    if (last_connection_out) *last_connection_out = last_connection;
+    return true;
 }
 
 bool ReadLastEntryShape(CDBWrapper& db,
@@ -1461,13 +1479,17 @@ bool FlowMeshProductionStore::ReadMarkerAndReadiness(std::optional<Marker>& out,
     ready = m_open && m_ready;
     Marker marker;
     switch (ReadMarkerStrict(m_db, marker, m_preagreement)) {
-    case ReadResult::NOT_FOUND: return true;
+    case ReadResult::NOT_FOUND:
+        if (m_open) InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::INVALID_RECORD);
+        return true;
     case ReadResult::ERROR:
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::STORAGE_ERROR);
         error = "FlowMesh production marker is unreadable or mode differs from configuration; migration is unsupported";
         return false;
     case ReadResult::FOUND: break;
     }
     if (!MarkerShapeIsValid(marker)) {
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::INVALID_RECORD);
         error = "FlowMesh production marker is malformed";
         return false;
     }
@@ -1495,10 +1517,12 @@ bool FlowMeshProductionStore::MarkAgreementBootstrapComplete(
         m_db.WriteBatch(batch, /*fSync=*/true);
     } catch (const std::exception& e) {
         m_ready = false;
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::STORAGE_ERROR);
         error = std::string{"FlowMesh agreement bootstrap completion failed: "} + e.what();
         return false;
     }
     m_ready = true; // An incomplete bootstrap is necessarily an empty log.
+    ResetCheckpointAdvisoryLocked(marker, std::nullopt);
     return true;
 }
 
@@ -1536,9 +1560,11 @@ bool FlowMeshProductionStore::ReconcileCheckpointConnections(
     const std::lock_guard<std::mutex> guard{m_mutex};
     rolled_back = false;
     const bool ready_before{m_ready};
+    std::optional<uint64_t> validated_last_connection;
     Marker marker;
     const ReadResult marker_result{ReadMarkerStrict(m_db, marker, m_preagreement)};
     if (marker_result == ReadResult::NOT_FOUND) {
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::INVALID_RECORD);
         if (!NamespaceIsEmpty(m_db, error)) {
             m_ready = false;
             return false;
@@ -1546,8 +1572,9 @@ bool FlowMeshProductionStore::ReconcileCheckpointConnections(
         return true;
     }
     if (marker_result == ReadResult::ERROR ||
-        !ValidateStorage(m_db, marker, error)) {
+        !ValidateStorage(m_db, marker, error, &validated_last_connection)) {
         m_ready = false;
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::INVALID_RECORD);
         if (error.empty()) error = "FlowMesh v3 marker is corrupt or unreadable";
         return false;
     }
@@ -1555,6 +1582,7 @@ bool FlowMeshProductionStore::ReconcileCheckpointConnections(
     std::vector<ConnectionRecord> records;
     if (!ReadConnectionRecords(m_db, records, error)) {
         m_ready = false;
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::INVALID_RECORD);
         return false;
     }
     std::optional<size_t> first_disconnected;
@@ -1563,6 +1591,7 @@ bool FlowMeshProductionStore::ReconcileCheckpointConnections(
             records[i].disk.connected_height)};
         if (observed == canonical_blocks.end()) {
             m_ready = false;
+            InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::INVALID_RECORD);
             error = "FlowMesh v3 canonical B3 snapshot is incomplete";
             return false;
         }
@@ -1573,6 +1602,9 @@ bool FlowMeshProductionStore::ReconcileCheckpointConnections(
     }
     if (!first_disconnected) {
         m_ready = ready_before;
+        if (!m_checkpoint_advisory_base_known || m_checkpoint_advisory.marker != marker) {
+            ResetCheckpointAdvisoryLocked(marker, validated_last_connection);
+        }
         return true;
     }
 
@@ -1593,6 +1625,7 @@ bool FlowMeshProductionStore::ReconcileCheckpointConnections(
                 static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) ||
             core.anchor.block_hash.IsNull() || core.seat_set_hash.IsNull()) {
             m_ready = false;
+            InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::INVALID_RECORD);
             error = "FlowMesh v3 cannot safely roll back a handoff after incoming-epoch entries";
             return false;
         }
@@ -1612,12 +1645,14 @@ bool FlowMeshProductionStore::ReconcileCheckpointConnections(
         m_db.WriteBatch(batch, /*fSync=*/true);
     } catch (const std::exception& e) {
         m_ready = false;
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::STORAGE_ERROR);
         error = std::string{"FlowMesh v3 checkpoint rollback failed: "} +
                 e.what();
         return false;
     }
-    if (!ValidateStorage(m_db, next, error)) {
+    if (!ValidateStorage(m_db, next, error, &validated_last_connection)) {
         m_ready = false;
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::INVALID_RECORD);
         if (error.empty()) {
             error = "FlowMesh v3 checkpoint rollback produced invalid storage";
         }
@@ -1625,6 +1660,7 @@ bool FlowMeshProductionStore::ReconcileCheckpointConnections(
     }
     rolled_back = true;
     m_ready = ready_before;
+    ResetCheckpointAdvisoryLocked(next, validated_last_connection);
     return true;
 }
 
@@ -1668,6 +1704,7 @@ bool FlowMeshProductionStore::OpenForMarket(
     const std::lock_guard<std::mutex> guard{m_mutex};
     m_open = false;
     m_ready = false;
+    InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::NOT_READY);
     if (domain.IsNull() || market_id.IsNull() || initial_state_root.IsNull()) {
         error = "FlowMesh v3 refused a null initial binding";
         return false;
@@ -1709,6 +1746,7 @@ bool FlowMeshProductionStore::OpenForMarket(
         }
         m_open = true;
         m_ready = !m_preagreement;
+        ResetCheckpointAdvisoryLocked(marker, std::nullopt);
         return true;
     }
     if (marker.version != (m_preagreement ? PREAGREEMENT_FORMAT_VERSION : FORMAT_VERSION)) {
@@ -1729,6 +1767,7 @@ bool FlowMeshProductionStore::OpenForMarket(
     m_open = true;
     m_ready = marker.next_sequence == 0 &&
               (!m_preagreement || marker.agreement_bootstrap_complete);
+    if (m_ready) ResetCheckpointAdvisoryLocked(marker, std::nullopt);
     return true;
 }
 
@@ -1831,6 +1870,7 @@ bool FlowMeshProductionStore::AppendExecution(
         m_db.WriteBatch(batch, /*fSync=*/true);
         trace.Mark(trace.sync_completed_us);
     } catch (const std::exception& e) {
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::STORAGE_ERROR);
         error = std::string{"FlowMesh v3 execution append failed: "} + e.what();
         return false;
     }
@@ -1843,6 +1883,7 @@ bool FlowMeshProductionStore::AppendExecution(
         *outcome_out = MakeProductionOutcomeRecord(entry.sequence, next.last_microblock_hash,
                                                    std::move(executed->result), std::move(executed->effects));
     }
+    AppendCheckpointAdvisoryLocked(marker, next, entry, certificate, active_seats, !executed->settlements.empty());
     return true;
 }
 
@@ -1937,11 +1978,13 @@ bool FlowMeshProductionStore::AppendHandoff(
         m_db.WriteBatch(batch, /*fSync=*/true);
         trace.Mark(trace.sync_completed_us);
     } catch (const std::exception& e) {
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::STORAGE_ERROR);
         error = std::string{"FlowMesh v3 handoff append failed: "} + e.what();
         return false;
     }
     CacheMarketHistory(m_market_history, handoff, nullptr, nullptr);
     m_history_snapshot.reset();
+    AppendCheckpointAdvisoryLocked(marker, next, handoff, certificate, outgoing_seats, false);
     return true;
 }
 
@@ -2003,9 +2046,11 @@ bool FlowMeshProductionStore::MarkExecutionCheckpointConnected(
         batch.Write(KEY_MARKER, next);
         m_db.WriteBatch(batch, /*fSync=*/true);
     } catch (const std::exception& e) {
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::STORAGE_ERROR);
         error = std::string{"FlowMesh v3 checkpoint commit failed: "} + e.what();
         return false;
     }
+    ResetCheckpointAdvisoryLocked(next, checkpoint.core.sequence);
     return true;
 }
 
@@ -2092,9 +2137,11 @@ bool FlowMeshProductionStore::MarkHandoffCheckpointConnected(
         batch.Write(KEY_MARKER, next);
         m_db.WriteBatch(batch, /*fSync=*/true);
     } catch (const std::exception& e) {
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::STORAGE_ERROR);
         error = std::string{"FlowMesh v3 handoff transition failed: "} + e.what();
         return false;
     }
+    ResetCheckpointAdvisoryLocked(next, checkpoint.core.sequence);
     return true;
 }
 
@@ -2120,6 +2167,209 @@ bool FlowMeshProductionStore::ReadEntry(
     StoredProductionEntry stored;
     if (!ReadStoredEntry(m_db, sequence, active_seats, stored, error)) return false;
     out = std::move(stored);
+    return true;
+}
+
+FlowMeshProductionStore::CheckpointAdvisory FlowMeshProductionStore::ReadCheckpointAdvisory() const
+{
+    const std::lock_guard guard{m_checkpoint_advisory_mutex};
+    return m_published_checkpoint_advisory;
+}
+
+void FlowMeshProductionStore::PublishCheckpointAdvisoryLocked()
+{
+    if (m_checkpoint_advisory.revision == std::numeric_limits<uint64_t>::max()) {
+        m_checkpoint_advisory.state = CheckpointAdvisoryState::INVALID;
+        m_checkpoint_advisory.reason = CheckpointAdvisoryReason::VERSION_EXHAUSTED;
+        m_checkpoint_advisory.candidate.reset();
+        m_checkpoint_advisory_base_known = false;
+    } else {
+        ++m_checkpoint_advisory.revision;
+    }
+    const std::lock_guard guard{m_checkpoint_advisory_mutex};
+    m_published_checkpoint_advisory = m_checkpoint_advisory;
+}
+
+void FlowMeshProductionStore::InvalidateCheckpointAdvisoryLocked(
+    const CheckpointAdvisoryReason reason, const bool forget_base)
+{
+    m_checkpoint_advisory.state = CheckpointAdvisoryState::INVALID;
+    m_checkpoint_advisory.reason = reason;
+    m_checkpoint_advisory.candidate.reset();
+    m_checkpoint_advisory.next_scan_sequence = m_checkpoint_advisory.last_connection
+        ? *m_checkpoint_advisory.last_connection + 1 : 0;
+    if (forget_base) m_checkpoint_advisory_base_known = false;
+    PublishCheckpointAdvisoryLocked();
+}
+
+void FlowMeshProductionStore::ResetCheckpointAdvisoryLocked(
+    const Marker& marker, const std::optional<uint64_t> last_connection)
+{
+    m_checkpoint_advisory.marker = marker;
+    m_checkpoint_advisory.last_connection = last_connection;
+    m_checkpoint_advisory.next_scan_sequence = last_connection ? *last_connection + 1 : 0;
+    m_checkpoint_advisory.candidate.reset();
+    m_checkpoint_advisory_base_known = m_open && m_ready &&
+        (!last_connection || *last_connection < marker.next_sequence);
+    if (!m_checkpoint_advisory_base_known) {
+        m_checkpoint_advisory.state = CheckpointAdvisoryState::INVALID;
+        m_checkpoint_advisory.reason = CheckpointAdvisoryReason::NOT_READY;
+    } else {
+        m_checkpoint_advisory.state = m_checkpoint_advisory.next_scan_sequence == marker.next_sequence
+            ? CheckpointAdvisoryState::KNOWN_NONE : CheckpointAdvisoryState::REBUILDING;
+        m_checkpoint_advisory.reason = CheckpointAdvisoryReason::NONE;
+    }
+    PublishCheckpointAdvisoryLocked();
+}
+
+void FlowMeshProductionStore::SetCheckpointAdvisoryCandidateLocked(
+    const flowmesh::ProductionEntryCore& entry,
+    const flowmesh::BlsMicroblockCertificate& certificate,
+    const flowmesh::ActiveFnBlsSeatSet& seats)
+{
+    try {
+        // Reuse the existing canonical builder, including certificate and the
+        // SEAT anchor checks. The production anchor is a distinct field.
+        const auto record{flowmesh::BuildProductionCheckpointRecord(
+            entry, certificate, seats, m_checkpoint_advisory.marker.last_b3_checkpoint)};
+        const auto id{record ? modern::FlowMeshCheckpointIdV1(record->core) : std::nullopt};
+        auto payload{record ? modern::EncodeFlowMeshCheckpointRecordV1(*record, seats.Size()) : std::nullopt};
+        if (id && payload && payload->size() <= modern::FLOWMESH_CHECKPOINT_RECORD_MAX_SIZE) {
+            m_checkpoint_advisory.candidate = CheckpointAdvisoryCandidate{
+                *id, entry.sequence, entry.effect_count,
+                std::make_shared<const std::vector<unsigned char>>(std::move(*payload))};
+            m_checkpoint_advisory.next_scan_sequence = entry.sequence + 1;
+            m_checkpoint_advisory.state = CheckpointAdvisoryState::KNOWN_CANDIDATE;
+            m_checkpoint_advisory.reason = CheckpointAdvisoryReason::NONE;
+            PublishCheckpointAdvisoryLocked();
+            return;
+        }
+    } catch (const std::exception&) {
+        // Advisory failure never rolls back, retries or changes a durable
+        // append. The fixed-size published result explicitly becomes unknown.
+    }
+    InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::BUILD_FAILED);
+}
+
+void FlowMeshProductionStore::AppendCheckpointAdvisoryLocked(
+    const Marker& before, const Marker& after,
+    const flowmesh::ProductionEntryCore& entry,
+    const flowmesh::BlsMicroblockCertificate& certificate,
+    const flowmesh::ActiveFnBlsSeatSet& seats, const bool has_settlements)
+{
+    if (!m_checkpoint_advisory_base_known || m_checkpoint_advisory.marker != before) {
+        InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::BASE_UNAVAILABLE);
+        return;
+    }
+    const bool proven_empty{m_checkpoint_advisory.state == CheckpointAdvisoryState::KNOWN_NONE &&
+                            m_checkpoint_advisory.next_scan_sequence == entry.sequence};
+    m_checkpoint_advisory.marker = after;
+    if (proven_empty) {
+        if (CheckpointEligible(entry, has_settlements, m_checkpoint_advisory.last_connection)) {
+            SetCheckpointAdvisoryCandidateLocked(entry, certificate, seats);
+            return;
+        }
+        m_checkpoint_advisory.next_scan_sequence = after.next_sequence;
+    }
+    // A newly appended eligible entry must never leap an unscanned prefix.
+    PublishCheckpointAdvisoryLocked();
+}
+
+bool FlowMeshProductionStore::AdvanceCheckpointAdvisory(
+    const flowmesh::ActiveFnBlsSeatSet& seats, CheckpointScanBudget budget,
+    CheckpointAdvanceResult& result, std::string& error)
+{
+    result = {};
+    budget.max_records = std::min(budget.max_records, CheckpointScanBudget::DEFAULT_RECORDS);
+    budget.max_encoded_bytes = std::min(budget.max_encoded_bytes, CheckpointScanBudget::DEFAULT_BYTES);
+    const std::lock_guard guard{m_mutex};
+    const auto refuse = [&](const CheckpointAdvisoryReason reason, const char* message, const bool forget_base = true) {
+        InvalidateCheckpointAdvisoryLocked(reason, forget_base);
+        result.state = CheckpointAdvisoryState::INVALID;
+        error = message;
+        return false;
+    };
+    if (!m_open || !m_ready) return refuse(CheckpointAdvisoryReason::NOT_READY, "FlowMesh checkpoint advisory needs completed replay");
+    if (!budget.max_records || !budget.max_encoded_bytes) {
+        error = "FlowMesh checkpoint advisory budget cannot inspect a marker";
+        result.budget_exhausted = true;
+        return false;
+    }
+    auto marker_it{std::unique_ptr<CDBIterator>{m_db.NewIterator()}};
+    marker_it->Seek(KEY_MARKER);
+    ++result.records_inspected;
+    if (!marker_it->Valid() || !marker_it->StatusOK() || marker_it->KeySize() != 1 ||
+        marker_it->ValueSize() > MAX_ADVISORY_MARKER_BYTES) {
+        return refuse(CheckpointAdvisoryReason::INVALID_RECORD, "FlowMesh checkpoint advisory marker is missing, oversized or malformed");
+    }
+    const size_t marker_bytes{marker_it->KeySize() + marker_it->ValueSize()};
+    if (marker_bytes > budget.max_encoded_bytes) {
+        error = "FlowMesh checkpoint advisory budget cannot decode a marker";
+        result.budget_exhausted = true;
+        return false;
+    }
+    result.encoded_bytes_decoded += marker_bytes;
+    uint8_t marker_key{0};
+    Marker marker;
+    if (!marker_it->GetKeyExact(marker_key) || marker_key != KEY_MARKER ||
+        !marker_it->GetValueExact(marker) || !MarkerShapeIsValid(marker) ||
+        marker.version != (m_preagreement ? PREAGREEMENT_FORMAT_VERSION : FORMAT_VERSION)) {
+        return refuse(CheckpointAdvisoryReason::INVALID_RECORD, "FlowMesh checkpoint advisory marker failed strict decoding");
+    }
+    ++result.seat_context_checks;
+    if (!MarkerMatchesSeatSet(marker, seats)) {
+        return refuse(CheckpointAdvisoryReason::STALE_CONTEXT, "FlowMesh checkpoint advisory seat context is unavailable or stale", false);
+    }
+    if (!m_checkpoint_advisory_base_known || m_checkpoint_advisory.marker != marker) {
+        return refuse(CheckpointAdvisoryReason::BASE_UNAVAILABLE, "FlowMesh checkpoint advisory needs a validated connection watermark");
+    }
+    if (m_checkpoint_advisory.state == CheckpointAdvisoryState::KNOWN_CANDIDATE ||
+        m_checkpoint_advisory.state == CheckpointAdvisoryState::KNOWN_NONE) {
+        result.state = m_checkpoint_advisory.state;
+        return true;
+    }
+    auto it{std::unique_ptr<CDBIterator>{m_db.NewIterator()}};
+    it->Seek(EntryKey(m_checkpoint_advisory.next_scan_sequence));
+    while (m_checkpoint_advisory.next_scan_sequence < marker.next_sequence &&
+           result.records_inspected < budget.max_records) {
+        ++result.records_inspected;
+        if (!it->Valid() || !it->StatusOK() || it->KeySize() != 9 || it->ValueSize() > MAX_DISK_ENTRY_BYTES) {
+            return refuse(CheckpointAdvisoryReason::INVALID_RECORD, "FlowMesh checkpoint advisory entry is missing, oversized or malformed");
+        }
+        const size_t encoded_bytes{it->KeySize() + it->ValueSize()};
+        if (encoded_bytes > budget.max_encoded_bytes - result.encoded_bytes_decoded) {
+            result.budget_exhausted = true;
+            break;
+        }
+        result.encoded_bytes_decoded += encoded_bytes;
+        EntryKeyType key;
+        DiskEntry disk;
+        if (!it->GetKeyExact(key) || key != EntryKey(m_checkpoint_advisory.next_scan_sequence) ||
+            !it->GetValueExact(disk)) {
+            return refuse(CheckpointAdvisoryReason::INVALID_RECORD, "FlowMesh checkpoint advisory entry failed strict decoding");
+        }
+        const auto stored{DecodeDiskEntry(disk, seats, &result.certificate_checks)};
+        if (!stored || stored->entry.sequence != m_checkpoint_advisory.next_scan_sequence ||
+            stored->entry.domain != marker.domain || stored->entry.market_id != marker.market_id) {
+            return refuse(CheckpointAdvisoryReason::INVALID_RECORD, "FlowMesh checkpoint advisory entry or certificate is invalid");
+        }
+        ++m_checkpoint_advisory.next_scan_sequence;
+        if (CheckpointEligible(stored->entry, !stored->settlements.empty(), m_checkpoint_advisory.last_connection)) {
+            ++result.certificate_checks; // the canonical checkpoint builder rechecks the certificate
+            SetCheckpointAdvisoryCandidateLocked(stored->entry, stored->certificate, seats);
+            result.state = m_checkpoint_advisory.state;
+            if (result.state == CheckpointAdvisoryState::INVALID) error = "FlowMesh checkpoint advisory cannot build its candidate";
+            return result.state != CheckpointAdvisoryState::INVALID;
+        }
+        it->Next();
+    }
+    if (!it->StatusOK()) return refuse(CheckpointAdvisoryReason::STORAGE_ERROR, "FlowMesh checkpoint advisory iterator failed");
+    m_checkpoint_advisory.state = m_checkpoint_advisory.next_scan_sequence == marker.next_sequence
+        ? CheckpointAdvisoryState::KNOWN_NONE : CheckpointAdvisoryState::REBUILDING;
+    m_checkpoint_advisory.reason = CheckpointAdvisoryReason::NONE;
+    result.state = m_checkpoint_advisory.state;
+    result.budget_exhausted |= result.state == CheckpointAdvisoryState::REBUILDING;
+    PublishCheckpointAdvisoryLocked();
     return true;
 }
 
@@ -2182,9 +2432,13 @@ bool FlowMeshProductionStore::Replay(
     m_market_history.clear();
     m_history_snapshot.reset();
     m_replay_outcomes.clear();
+    InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason::NOT_READY);
     std::deque<flowmesh::MarketHistoryEntry> history;
     std::deque<std::shared_ptr<const ProductionOutcomeRecord>> outcomes;
     size_t outcome_bytes{0};
+    std::optional<uint64_t> advisory_last_connection;
+    std::optional<StoredProductionEntry> advisory_candidate;
+    std::optional<flowmesh::ActiveFnBlsSeatSet> advisory_candidate_seats;
     Marker marker;
     if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !ValidateStorage(m_db, marker, error)) {
@@ -2227,6 +2481,7 @@ bool FlowMeshProductionStore::Replay(
             error = "FlowMesh v3 replay certificate is invalid";
             return false;
         }
+        bool connected_checkpoint{false};
 
         flowmesh::ProductionEpochGate gate{marker.domain, marker.market_id,
                                            *active_seats};
@@ -2305,6 +2560,7 @@ bool FlowMeshProductionStore::Replay(
                     return false;
                 }
                 checkpoint_head = *next_checkpoint;
+                connected_checkpoint = true;
                 active_seats = *next_seats;
             } else if (sequence + 1 != marker.next_sequence) {
                 error = "FlowMesh v3 replay found an unconnected historical handoff";
@@ -2337,7 +2593,20 @@ bool FlowMeshProductionStore::Replay(
                     return false;
                 }
                 checkpoint_head = *id;
+                connected_checkpoint = true;
             }
+        }
+        // Piggyback this already verified traversal. A later connection
+        // intentionally supersedes any earlier unconnected candidate, exactly
+        // as legacy NextCheckpointCandidate starts after the LAST connection.
+        if (connected_checkpoint) {
+            advisory_last_connection = sequence;
+            advisory_candidate.reset();
+            advisory_candidate_seats.reset();
+        } else if (!advisory_candidate &&
+                   CheckpointEligible(stored->entry, !stored->settlements.empty(), advisory_last_connection)) {
+            advisory_candidate = *stored;
+            advisory_candidate_seats = *active_seats;
         }
         running_hash = stored->entry.GetHash();
         next_effect_index += stored->entry.effect_count;
@@ -2362,6 +2631,17 @@ bool FlowMeshProductionStore::Replay(
     m_market_history = std::move(history);
     m_replay_outcomes = std::move(outcomes);
     m_ready = !m_preagreement || marker.agreement_bootstrap_complete;
+    ResetCheckpointAdvisoryLocked(marker, advisory_last_connection);
+    if (m_checkpoint_advisory_base_known) {
+        if (advisory_candidate && advisory_candidate_seats) {
+            SetCheckpointAdvisoryCandidateLocked(advisory_candidate->entry,
+                advisory_candidate->certificate, *advisory_candidate_seats);
+        } else {
+            m_checkpoint_advisory.next_scan_sequence = marker.next_sequence;
+            m_checkpoint_advisory.state = CheckpointAdvisoryState::KNOWN_NONE;
+            PublishCheckpointAdvisoryLocked();
+        }
+    }
     return true;
 }
 

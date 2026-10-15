@@ -177,6 +177,8 @@ public:
         uint256 agreement_identity;
         bool agreement_bootstrap_complete{false};
 
+        friend bool operator==(const Marker&, const Marker&) = default;
+
         SERIALIZE_METHODS(Marker, obj)
         {
             READWRITE(obj.version, obj.domain, obj.market_id,
@@ -190,6 +192,61 @@ public:
             }
         }
     };
+
+    /** Memory-only derived information. None of these states grants signing,
+     * custody, execution, checkpoint-publication or chain authority. */
+    enum class CheckpointAdvisoryState { INVALID, REBUILDING, KNOWN_NONE, KNOWN_CANDIDATE };
+    enum class CheckpointAdvisoryReason {
+        NONE, NOT_READY, BASE_UNAVAILABLE, STALE_CONTEXT, STORAGE_ERROR,
+        INVALID_RECORD, BUILD_FAILED, VERSION_EXHAUSTED,
+    };
+    struct CheckpointAdvisoryCandidate {
+        modern::FlowMeshCheckpointId checkpoint_id;
+        uint64_t sequence{0};
+        uint32_t effect_count{0};
+        //! Exact canonical contract-compatible bytes, never full entry/history.
+        //! Bounded by FLOWMESH_CHECKPOINT_RECORD_MAX_SIZE; shared immutable copy.
+        std::shared_ptr<const std::vector<unsigned char>> payload;
+        friend bool operator==(const CheckpointAdvisoryCandidate& a, const CheckpointAdvisoryCandidate& b)
+        {
+            return a.checkpoint_id == b.checkpoint_id && a.sequence == b.sequence &&
+                a.effect_count == b.effect_count && bool(a.payload) == bool(b.payload) &&
+                (!a.payload || *a.payload == *b.payload);
+        }
+    };
+    struct CheckpointAdvisory {
+        CheckpointAdvisoryState state{CheckpointAdvisoryState::INVALID};
+        CheckpointAdvisoryReason reason{CheckpointAdvisoryReason::NOT_READY};
+        Marker marker{};
+        uint64_t revision{0};
+        std::optional<uint64_t> last_connection;
+        uint64_t next_scan_sequence{0};
+        std::optional<CheckpointAdvisoryCandidate> candidate;
+    };
+    /** Local maintenance policy, not consensus/economic parameters. Counts
+     * include the marker and every inspected entry, including a refused one;
+     * bytes count decoded key+value input, not heap, disk I/O or wall time. */
+    struct CheckpointScanBudget {
+        static constexpr size_t DEFAULT_RECORDS{8};
+        static constexpr size_t DEFAULT_BYTES{8 * 1024 * 1024};
+        size_t max_records{DEFAULT_RECORDS};
+        size_t max_encoded_bytes{DEFAULT_BYTES};
+    };
+    struct CheckpointAdvanceResult {
+        CheckpointAdvisoryState state{CheckpointAdvisoryState::INVALID};
+        size_t records_inspected{0}, encoded_bytes_decoded{0};
+        size_t certificate_checks{0}, seat_context_checks{0};
+        bool budget_exhausted{false};
+    };
+    /** Fixed-size leaf-lock copy; never takes the durable-store mutex, reads
+     * disk/chain, searches history or invokes cryptography. */
+    CheckpointAdvisory ReadCheckpointAdvisory() const;
+    /** Resumable off-public maintenance. No hidden FindLastConnectionSequence
+     * scan; a validated replay/connection traversal supplies that watermark.
+     * False is unavailable/invalid, never proof that nothing is pending. */
+    bool AdvanceCheckpointAdvisory(const flowmesh::ActiveFnBlsSeatSet& seats,
+                                  CheckpointScanBudget budget,
+                                  CheckpointAdvanceResult& result, std::string& error);
 
     explicit FlowMeshProductionStore(DBParams db_params, bool preagreement = false);
 
@@ -411,6 +468,19 @@ public:
     bool ReadSeatEvidence(SeatEvidenceLog& out, std::string& error);
 
 private:
+    //! Defined only by the native regression test TU; no runtime fault API.
+    friend struct FlowMeshProductionStoreTestAccess;
+    void PublishCheckpointAdvisoryLocked();
+    void InvalidateCheckpointAdvisoryLocked(CheckpointAdvisoryReason reason, bool forget_base = true);
+    void ResetCheckpointAdvisoryLocked(const Marker& marker, std::optional<uint64_t> last_connection);
+    void AppendCheckpointAdvisoryLocked(const Marker& before, const Marker& after,
+                                       const flowmesh::ProductionEntryCore& entry,
+                                       const flowmesh::BlsMicroblockCertificate& certificate,
+                                       const flowmesh::ActiveFnBlsSeatSet& seats,
+                                       bool has_settlements);
+    void SetCheckpointAdvisoryCandidateLocked(const flowmesh::ProductionEntryCore& entry,
+                                             const flowmesh::BlsMicroblockCertificate& certificate,
+                                             const flowmesh::ActiveFnBlsSeatSet& seats);
     CDBWrapper m_db;
     const bool m_preagreement;
     std::mutex m_mutex;
@@ -419,6 +489,12 @@ private:
     //! and, for V4, the matching agreement journal bootstrap is complete.
     //! A reopened nonempty store becomes ready only after full replay.
     bool m_ready{false};
+    //! The writer fields below are owned by m_mutex; only the fixed published
+    //! copy uses its own leaf mutex. At most one candidate, never a backlog.
+    bool m_checkpoint_advisory_base_known{false};
+    CheckpointAdvisory m_checkpoint_advisory;
+    mutable std::mutex m_checkpoint_advisory_mutex;
+    CheckpointAdvisory m_published_checkpoint_advisory;
     std::deque<flowmesh::MarketHistoryEntry> m_market_history;
     std::shared_ptr<const HistorySnapshot> m_history_snapshot;
     std::deque<std::shared_ptr<const ProductionOutcomeRecord>> m_replay_outcomes;

@@ -5,6 +5,9 @@
 #include <node/flowmesh_production_store.h>
 
 #include <node/flowmesh_store.h>
+#include <leveldb/env.h>
+#include <leveldb/helpers/memenv/memenv.h>
+#include <leveldb/status.h>
 #include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
 
@@ -12,7 +15,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <deque>
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
@@ -20,7 +26,67 @@
 #include <variant>
 #include <vector>
 
+namespace node {
+struct FlowMeshProductionStoreTestAccess {
+    static CDBWrapper& DB(FlowMeshProductionStore& store) { return store.m_db; }
+    static std::mutex& Mutex(FlowMeshProductionStore& store) { return store.m_mutex; }
+};
+} // namespace node
+
 namespace {
+
+using AdvisoryState = node::FlowMeshProductionStore::CheckpointAdvisoryState;
+using AdvisoryReason = node::FlowMeshProductionStore::CheckpointAdvisoryReason;
+
+//! A raw serialized value: no CompactSize prefix or implicit normalization.
+struct AdvisoryRawBytes {
+    std::vector<std::byte> value;
+    template <typename Stream> void Serialize(Stream& stream) const { stream.write(value); }
+};
+
+//! Test-only failed WAL Sync. This exercises ambiguous write refusal, not
+//! machine power loss; no production storage or signing configuration changes.
+class AdvisorySyncFailureEnv final : public leveldb::EnvWrapper
+{
+public:
+    explicit AdvisorySyncFailureEnv(leveldb::Env* backing) : EnvWrapper(backing) {}
+    std::atomic<bool> fail_sync{false};
+    std::atomic<size_t> failures{0};
+    leveldb::Status NewWritableFile(const std::string& name, leveldb::WritableFile** result) override
+    {
+        leveldb::WritableFile* file{nullptr};
+        auto status{target()->NewWritableFile(name, &file)};
+        if (status.ok()) *result = new File{*this, file};
+        return status;
+    }
+    leveldb::Status NewAppendableFile(const std::string& name, leveldb::WritableFile** result) override
+    {
+        leveldb::WritableFile* file{nullptr};
+        auto status{target()->NewAppendableFile(name, &file)};
+        if (status.ok()) *result = new File{*this, file};
+        return status;
+    }
+private:
+    class File final : public leveldb::WritableFile {
+    public:
+        File(AdvisorySyncFailureEnv& env, leveldb::WritableFile* file) : m_env{env}, m_file{file} {}
+        leveldb::Status Append(const leveldb::Slice& data) override { return m_file->Append(data); }
+        leveldb::Status Close() override { return m_file->Close(); }
+        leveldb::Status Flush() override { return m_file->Flush(); }
+        leveldb::Status Sync() override
+        {
+            if (m_env.fail_sync) {
+                ++m_env.failures;
+                return leveldb::Status::IOError("injected advisory test sync failure");
+            }
+            return m_file->Sync();
+        }
+        std::string GetName() const override { return m_file->GetName(); }
+    private:
+        AdvisorySyncFailureEnv& m_env;
+        std::unique_ptr<leveldb::WritableFile> m_file;
+    };
+};
 
 uint256 Filled(const unsigned char value)
 {
@@ -277,6 +343,50 @@ modern::FlowMeshCheckpointRecordV1 Checkpoint(
     return *out;
 }
 
+//! Compare exact candidate identity AND payload with the unchanged, exhaustive
+//! legacy query. Advancement is deliberately separate from the memory getter.
+void CheckAdvisoryMatchesLegacy(node::FlowMeshProductionStore& store,
+                                const flowmesh::ActiveFnBlsSeatSet& seats)
+{
+    std::string error;
+    for (size_t step{0}; step < 1024; ++step) {
+        const auto advisory{store.ReadCheckpointAdvisory()};
+        if (advisory.state != AdvisoryState::REBUILDING) break;
+        node::FlowMeshProductionStore::CheckpointAdvanceResult work;
+        BOOST_REQUIRE_MESSAGE(store.AdvanceCheckpointAdvisory(seats, {}, work, error), error);
+        BOOST_CHECK_LE(work.records_inspected, 8U);
+        BOOST_CHECK_LE(work.encoded_bytes_decoded, 8U * 1024 * 1024);
+    }
+    const auto advisory{store.ReadCheckpointAdvisory()};
+    BOOST_REQUIRE(advisory.state == AdvisoryState::KNOWN_NONE ||
+                  advisory.state == AdvisoryState::KNOWN_CANDIDATE);
+    std::optional<node::FlowMeshProductionStore::Marker> marker;
+    BOOST_REQUIRE_MESSAGE(store.ReadMarker(marker, error), error);
+    BOOST_REQUIRE(marker);
+    BOOST_CHECK(advisory.marker == *marker);
+    std::optional<node::ProductionCheckpointCandidate> legacy;
+    BOOST_REQUIRE_MESSAGE(store.NextCheckpointCandidate(seats, legacy, error), error);
+    BOOST_CHECK(bool(advisory.candidate) == bool(legacy));
+    if (!legacy) {
+        BOOST_CHECK(advisory.state == AdvisoryState::KNOWN_NONE);
+        BOOST_CHECK_EQUAL(advisory.next_scan_sequence, marker->next_sequence);
+        return;
+    }
+    BOOST_REQUIRE(advisory.candidate);
+    BOOST_REQUIRE(advisory.candidate->payload);
+    const auto record{Checkpoint(legacy->stored.entry, legacy->stored.certificate,
+                                 seats, legacy->previous_checkpoint_id)};
+    const auto id{modern::FlowMeshCheckpointIdV1(record.core)};
+    const auto payload{modern::EncodeFlowMeshCheckpointRecordV1(record, seats.Size())};
+    BOOST_REQUIRE(id);
+    BOOST_REQUIRE(payload);
+    BOOST_CHECK(advisory.candidate->checkpoint_id == *id);
+    BOOST_CHECK_EQUAL(advisory.candidate->sequence, legacy->stored.entry.sequence);
+    BOOST_CHECK_EQUAL(advisory.candidate->effect_count, legacy->stored.entry.effect_count);
+    BOOST_CHECK(*advisory.candidate->payload == *payload);
+    BOOST_CHECK_LE(payload->size(), modern::FLOWMESH_CHECKPOINT_RECORD_MAX_SIZE);
+}
+
 struct Scenario {
     uint256 domain{Filled(0x11)};
     modern::AssetId asset{Filled(0x31)};
@@ -393,6 +503,36 @@ struct TestSequenceKey {
     }
 };
 
+struct AdvisoryEmptyEntry {
+    flowmesh::ProductionEntryCore entry;
+    flowmesh::BlsMicroblockCertificate certificate;
+};
+
+AdvisoryEmptyEntry AppendAdvisoryEmpty(node::FlowMeshProductionStore& store,
+                                     Scenario& scenario, flowmesh::FlowMeshState& state,
+                                     uint64_t sequence, const uint256& parent)
+{
+    const flowmesh::AnchorRef anchor{200, Filled(0x74)};
+    flowmesh::ProductionEpochGate gate{scenario.domain, scenario.market, scenario.seats0.seats};
+    flowmesh::ProductionEntryCheck check;
+    const std::vector<flowmesh::Action> no_actions;
+    const auto entry{flowmesh::BuildProductionExecutionEntry(
+        state, scenario.domain, scenario.market, scenario.seats0.seats, gate,
+        sequence, 0, parent, anchor, {300, anchor, &scenario.anchors},
+        scenario.treasury, no_actions, &scenario.chain_facts, check)};
+    BOOST_REQUIRE_MESSAGE(entry, flowmesh::ProductionEntryCheckName(check));
+    BOOST_REQUIRE(entry->effects.empty());
+    const auto certificate{Certify(entry->entry, scenario.seats0)};
+    std::string error;
+    flowmesh::FlowMeshState output{state};
+    BOOST_REQUIRE_MESSAGE(store.AppendExecution(
+        entry->entry, certificate, scenario.seats0.seats, state,
+        {300, anchor, &scenario.anchors}, scenario.treasury,
+        &scenario.chain_facts, output, error), error);
+    state = std::move(output);
+    return {entry->entry, certificate};
+}
+
 //! Canonically shaped seat evidence. The store checks only the encoding: its
 //! caller verifies the signatures first (CheckSeatEvidence).
 flowmesh::SeatEvidence ShapeOnlySeatEvidence(const Scenario& scenario, const uint64_t sequence)
@@ -466,6 +606,7 @@ BOOST_AUTO_TEST_CASE(preagreement_mode_bootstrap_identity_restart_and_downgrade_
         BOOST_CHECK(!marker->agreement_identity.IsNull());
         BOOST_CHECK(!marker->agreement_bootstrap_complete);
         identity = marker->agreement_identity;
+        BOOST_CHECK(store.ReadCheckpointAdvisory().state == AdvisoryState::INVALID);
         BOOST_CHECK(store.LockCandidate(scenario.execution0.entry, evidence) ==
                     flowmesh::ProductionLockResult::STORAGE_FAILURE);
         flowmesh::FlowMeshState output{scenario.state0};
@@ -495,6 +636,7 @@ BOOST_AUTO_TEST_CASE(preagreement_mode_bootstrap_identity_restart_and_downgrade_
         // The caller has durably initialized the matching agreement journal.
         BOOST_REQUIRE(store.MarkAgreementBootstrapComplete(identity, error));
         BOOST_REQUIRE(store.MarkAgreementBootstrapComplete(identity, error));
+        CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
         BOOST_CHECK(store.LockCandidate(scenario.execution0.entry, evidence) ==
                     flowmesh::ProductionLockResult::LOCKED);
     }
@@ -652,6 +794,7 @@ BOOST_AUTO_TEST_CASE(atomic_execution_handoff_connection_and_epoch_replay)
                     scenario.execution0.entry.GetHash());
         BOOST_CHECK(candidate->stored.effects == scenario.execution0.effects);
         BOOST_CHECK(candidate->previous_checkpoint_id.IsNull());
+        CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
         BOOST_REQUIRE_MESSAGE(store.MarkExecutionCheckpointConnected(
                                   execution_checkpoint, scenario.seats0.seats,
                                   {240, Filled(0xa0)},
@@ -674,6 +817,13 @@ BOOST_AUTO_TEST_CASE(atomic_execution_handoff_connection_and_epoch_replay)
         BOOST_CHECK(candidate->stored.effects.empty());
         BOOST_CHECK(candidate->previous_checkpoint_id ==
                     *execution_checkpoint_id);
+        CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
+        const auto before_handoff_connect{store.ReadCheckpointAdvisory()};
+        BOOST_REQUIRE(before_handoff_connect.candidate);
+        const auto outgoing_payload{modern::DecodeFlowMeshCheckpointEnvelopeV1(*before_handoff_connect.candidate->payload)};
+        BOOST_REQUIRE(outgoing_payload);
+        BOOST_CHECK_EQUAL(outgoing_payload->core.anchor.height, 100U);
+        BOOST_CHECK_EQUAL(outgoing_payload->core.production_anchor.height, 210U);
 
         std::optional<node::FlowMeshProductionStore::Marker> marker;
         BOOST_REQUIRE(store.ReadMarker(marker, error));
@@ -702,6 +852,7 @@ BOOST_AUTO_TEST_CASE(atomic_execution_handoff_connection_and_epoch_replay)
         BOOST_REQUIRE(store.ReadMarker(marker, error));
         BOOST_REQUIRE(marker.has_value());
         BOOST_CHECK_EQUAL(marker->current_epoch, 8U);
+        CheckAdvisoryMatchesLegacy(store, scenario.seats1.seats);
         BOOST_CHECK((marker->current_anchor ==
                      flowmesh::AnchorRef{220, Filled(0x72)}));
         BOOST_CHECK(marker->current_seat_set_hash == scenario.seats1.seats.set_hash);
@@ -760,6 +911,7 @@ BOOST_AUTO_TEST_CASE(atomic_execution_handoff_connection_and_epoch_replay)
                           error);
     BOOST_CHECK(replayed.Root() == scenario.execution2.next_state.Root());
     BOOST_CHECK(last_hash == scenario.execution2.entry.GetHash());
+    CheckAdvisoryMatchesLegacy(reopened, scenario.seats1.seats);
     const auto replayed_history{reopened.ReadMarketHistory(3, 50)};
     BOOST_REQUIRE(replayed_history.available);
     BOOST_REQUIRE_EQUAL(replayed_history.entries.size(), 3U);
@@ -979,6 +1131,8 @@ BOOST_AUTO_TEST_CASE(genesis_and_ordinary_checkpoint_reorgs_republish_and_restar
             scenario.seats0.seats, candidate, error));
         BOOST_REQUIRE(candidate.has_value());
         BOOST_CHECK_EQUAL(candidate->stored.entry.sequence, 0U);
+        BOOST_CHECK(store.ReadCheckpointAdvisory().state == AdvisoryState::REBUILDING);
+        CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
         BOOST_REQUIRE_MESSAGE(store.MarkExecutionCheckpointConnected(
                                   checkpoint0, scenario.seats0.seats,
                                   {240, replacement0}, error),
@@ -1035,6 +1189,7 @@ BOOST_AUTO_TEST_CASE(genesis_and_ordinary_checkpoint_reorgs_republish_and_restar
             scenario.seats0.seats, candidate, error));
         BOOST_REQUIRE(candidate.has_value());
         BOOST_CHECK_EQUAL(candidate->stored.entry.sequence, 1U);
+        CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
         BOOST_REQUIRE_MESSAGE(store.MarkExecutionCheckpointConnected(
                                   checkpoint1, scenario.seats0.seats,
                                   {241, replacement1}, error),
@@ -1065,6 +1220,7 @@ BOOST_AUTO_TEST_CASE(genesis_and_ordinary_checkpoint_reorgs_republish_and_restar
                           error);
     BOOST_CHECK(replayed.Root() == state2.Root());
     BOOST_CHECK(last_hash == checkpoint1.core.microblock_hash);
+    CheckAdvisoryMatchesLegacy(reopened, scenario.seats0.seats);
 }
 
 BOOST_AUTO_TEST_CASE(handoff_reorg_restores_outgoing_committee_across_restart)
@@ -1126,6 +1282,7 @@ BOOST_AUTO_TEST_CASE(handoff_reorg_restores_outgoing_committee_across_restart)
         BOOST_CHECK(marker->current_seat_set_hash ==
                     scenario.seats0.seats.set_hash);
         BOOST_CHECK(marker->last_b3_checkpoint == checkpoint0_id);
+        CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
     }
 
     // Startup sees the already-rolled-back outgoing marker, replays the
@@ -1156,6 +1313,7 @@ BOOST_AUTO_TEST_CASE(handoff_reorg_restores_outgoing_committee_across_restart)
         scenario.seats0.seats, candidate, error));
     BOOST_REQUIRE(candidate.has_value());
     BOOST_CHECK_EQUAL(candidate->stored.entry.sequence, 1U);
+    CheckAdvisoryMatchesLegacy(reopened, scenario.seats0.seats);
     BOOST_REQUIRE_MESSAGE(reopened.MarkHandoffCheckpointConnected(
                               handoff_checkpoint, scenario.seats0.seats,
                               scenario.seats1.seats, {242, replacement1}, 300,
@@ -1166,6 +1324,7 @@ BOOST_AUTO_TEST_CASE(handoff_reorg_restores_outgoing_committee_across_restart)
     BOOST_REQUIRE(marker.has_value());
     BOOST_CHECK_EQUAL(marker->current_epoch, scenario.seats1.seats.epoch);
     BOOST_CHECK(marker->current_seat_set_hash == scenario.seats1.seats.set_hash);
+    CheckAdvisoryMatchesLegacy(reopened, scenario.seats1.seats);
 }
 
 BOOST_AUTO_TEST_CASE(handoff_waits_for_depth_and_republishes_after_shallow_reorg)
@@ -1305,6 +1464,323 @@ BOOST_AUTO_TEST_CASE(handoff_reorg_after_incoming_entry_fails_closed)
                 flowmesh::ProductionLockResult::STORAGE_FAILURE);
 }
 
+BOOST_AUTO_TEST_CASE(checkpoint_advisory_resumes_bounded_suffix_and_retains_exact_candidate)
+{
+    Scenario scenario;
+    node::FlowMeshProductionStore store{DBParams{
+        .path = m_args.GetDataDirBase() / "flowmesh_advisory_bounded",
+        .cache_bytes = size_t{1} << 20, .memory_only = true}};
+    std::string error;
+    BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market,
+        scenario.seats0.seats, scenario.state0.Root(), error));
+    CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
+    flowmesh::FlowMeshState state{scenario.state0};
+    const auto genesis{AppendAdvisoryEmpty(store, scenario, state, 0, {})};
+    const auto pinned{store.ReadCheckpointAdvisory()};
+    BOOST_REQUIRE(pinned.candidate);
+    const auto pinned_payload{pinned.candidate->payload};
+    uint256 parent{genesis.entry.GetHash()};
+    for (uint64_t sequence{1}; sequence <= 13; ++sequence) {
+        parent = AppendAdvisoryEmpty(store, scenario, state, sequence, parent).entry.GetHash();
+        const auto updated{store.ReadCheckpointAdvisory()};
+        BOOST_REQUIRE(updated.candidate);
+        BOOST_CHECK(updated.candidate->payload == pinned_payload); // no candidate rebuild/copy
+        BOOST_CHECK(updated.revision > pinned.revision);
+    }
+    CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
+    const auto checkpoint{Checkpoint(genesis.entry, genesis.certificate, scenario.seats0.seats, {})};
+    BOOST_REQUIRE(store.MarkExecutionCheckpointConnected(checkpoint, scenario.seats0.seats,
+                                                         {240, Filled(0xa0)}, error));
+    auto advisory{store.ReadCheckpointAdvisory()};
+    BOOST_CHECK(advisory.state == AdvisoryState::REBUILDING);
+    BOOST_CHECK(advisory.last_connection == std::optional<uint64_t>{0});
+    BOOST_CHECK_EQUAL(advisory.next_scan_sequence, 1U);
+    BOOST_CHECK(!advisory.candidate);
+    node::FlowMeshProductionStore::CheckpointAdvanceResult work;
+    for (const auto budget : {node::FlowMeshProductionStore::CheckpointScanBudget{0, 8U << 20},
+                              node::FlowMeshProductionStore::CheckpointScanBudget{8, 0}}) {
+        BOOST_CHECK(!store.AdvanceCheckpointAdvisory(scenario.seats0.seats, budget, work, error));
+        BOOST_CHECK_EQUAL(work.records_inspected, 0U);
+        BOOST_CHECK(work.budget_exhausted);
+        BOOST_CHECK_EQUAL(store.ReadCheckpointAdvisory().revision, advisory.revision);
+    }
+
+    // A marker-only count budget never secretly scans the entire zero-effect
+    // suffix. The legacy query is an exhaustive correctness oracle, not this
+    // maintenance implementation: it already reports no candidate here.
+    std::optional<node::ProductionCheckpointCandidate> legacy;
+    BOOST_REQUIRE(store.NextCheckpointCandidate(scenario.seats0.seats, legacy, error));
+    BOOST_CHECK(!legacy);
+    BOOST_REQUIRE(store.AdvanceCheckpointAdvisory(scenario.seats0.seats, {1, 8U << 20}, work, error));
+    BOOST_CHECK_EQUAL(work.records_inspected, 1U);
+    BOOST_CHECK_EQUAL(work.certificate_checks, 0U);
+    BOOST_CHECK(work.state == AdvisoryState::REBUILDING);
+    BOOST_CHECK_EQUAL(store.ReadCheckpointAdvisory().next_scan_sequence, 1U);
+
+    size_t marker_bytes{0}, entry_bytes{0};
+    {
+        const std::lock_guard guard{node::FlowMeshProductionStoreTestAccess::Mutex(store)};
+        std::unique_ptr<CDBIterator> it{node::FlowMeshProductionStoreTestAccess::DB(store).NewIterator()};
+        it->Seek(uint8_t{'m'});
+        marker_bytes = it->KeySize() + it->ValueSize();
+        it->Seek(TestSequenceKey{'e', 1});
+        entry_bytes = it->KeySize() + it->ValueSize();
+    }
+    BOOST_REQUIRE(entry_bytes > 0);
+    BOOST_REQUIRE(store.AdvanceCheckpointAdvisory(scenario.seats0.seats,
+        {8, marker_bytes + entry_bytes - 1}, work, error));
+    BOOST_CHECK_EQUAL(work.records_inspected, 2U); // refused entry is charged as inspected
+    BOOST_CHECK_EQUAL(work.encoded_bytes_decoded, marker_bytes);
+    BOOST_CHECK_EQUAL(work.certificate_checks, 0U);
+    BOOST_CHECK(work.budget_exhausted);
+    BOOST_CHECK_EQUAL(store.ReadCheckpointAdvisory().next_scan_sequence, 1U);
+    BOOST_REQUIRE(store.AdvanceCheckpointAdvisory(scenario.seats0.seats,
+        {2, marker_bytes + entry_bytes}, work, error));
+    BOOST_CHECK_EQUAL(work.records_inspected, 2U);
+    BOOST_CHECK_EQUAL(work.encoded_bytes_decoded, marker_bytes + entry_bytes);
+    BOOST_CHECK_EQUAL(work.certificate_checks, 1U);
+    BOOST_CHECK_EQUAL(store.ReadCheckpointAdvisory().next_scan_sequence, 2U);
+
+    // A new eligible append cannot leap this unscanned prefix. Nor can an
+    // incoming stale committee turn incomplete knowledge into KNOWN_NONE.
+    flowmesh::ProductionEpochGate gate{scenario.domain, scenario.market, scenario.seats0.seats};
+    flowmesh::ProductionEntryCheck check;
+    const std::vector<flowmesh::Action> actions{Withdraw(scenario.withdrawer, 0, scenario.asset, 10, Filled(0xe0))};
+    const auto eligible{flowmesh::BuildProductionExecutionEntry(state, scenario.domain,
+        scenario.market, scenario.seats0.seats, gate, 14, 0, parent,
+        {200, Filled(0x74)}, {300, flowmesh::AnchorRef{200, Filled(0x74)}, &scenario.anchors},
+        scenario.treasury, actions, &scenario.chain_facts, check)};
+    BOOST_REQUIRE_MESSAGE(eligible, flowmesh::ProductionEntryCheckName(check));
+    BOOST_REQUIRE(!eligible->effects.empty());
+    const auto certificate{Certify(eligible->entry, scenario.seats0)};
+    flowmesh::FlowMeshState output{state};
+    BOOST_REQUIRE(store.AppendExecution(eligible->entry, certificate, scenario.seats0.seats,
+        state, {300, flowmesh::AnchorRef{200, Filled(0x74)}, &scenario.anchors},
+        scenario.treasury, &scenario.chain_facts, output, error));
+    BOOST_CHECK(store.ReadCheckpointAdvisory().state == AdvisoryState::REBUILDING);
+    BOOST_CHECK(!store.AdvanceCheckpointAdvisory(scenario.seats1.seats, {}, work, error));
+    BOOST_CHECK(store.ReadCheckpointAdvisory().reason == AdvisoryReason::STALE_CONTEXT);
+    BOOST_CHECK(!store.ReadCheckpointAdvisory().candidate);
+    BOOST_REQUIRE(store.AdvanceCheckpointAdvisory(scenario.seats0.seats, {2, 8U << 20}, work, error));
+    BOOST_CHECK(work.state == AdvisoryState::REBUILDING);
+    CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
+    BOOST_REQUIRE(store.ReadCheckpointAdvisory().candidate);
+    BOOST_CHECK_EQUAL(store.ReadCheckpointAdvisory().candidate->sequence, 14U);
+    BOOST_CHECK_EQUAL(pinned.candidate->sequence, 0U); // earlier immutable copy stays exact
+    BOOST_CHECK(pinned.candidate->payload == pinned_payload);
+}
+
+BOOST_AUTO_TEST_CASE(checkpoint_advisory_leaf_getter_and_connection_jump_replay)
+{
+    Scenario scenario;
+    const auto path{m_args.GetDataDirBase() / "flowmesh_advisory_jump"};
+    std::string error;
+    {
+        node::FlowMeshProductionStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market,
+            scenario.seats0.seats, scenario.state0.Root(), error));
+        flowmesh::FlowMeshState state{scenario.state0};
+        const auto genesis{AppendAdvisoryEmpty(store, scenario, state, 0, {})};
+        const auto second{AppendAdvisoryEmpty(store, scenario, state, 1, genesis.entry.GetHash())};
+        BOOST_CHECK_EQUAL(store.ReadCheckpointAdvisory().candidate->sequence, 0U);
+        const auto later{Checkpoint(second.entry, second.certificate, scenario.seats0.seats, {})};
+        BOOST_REQUIRE(store.MarkExecutionCheckpointConnected(later, scenario.seats0.seats,
+                                                             {240, Filled(0xa0)}, error));
+        CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
+        BOOST_CHECK(store.ReadCheckpointAdvisory().last_connection == std::optional<uint64_t>{1});
+        // No hidden durable lock, iterator, crypto or history query in getter.
+        std::unique_lock held{node::FlowMeshProductionStoreTestAccess::Mutex(store)};
+        auto read{std::async(std::launch::async, [&] { return store.ReadCheckpointAdvisory(); })};
+        const auto status{read.wait_for(std::chrono::seconds{5})};
+        held.unlock(); // guarantee cleanup even if an erroneous getter blocked
+        BOOST_REQUIRE(status == std::future_status::ready);
+        BOOST_CHECK(read.get().state == AdvisoryState::KNOWN_NONE);
+    }
+    node::FlowMeshProductionStore reopened{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+    BOOST_REQUIRE(reopened.OpenForMarket(scenario.domain, scenario.market,
+        scenario.seats0.seats, scenario.state0.Root(), error));
+    BOOST_CHECK(reopened.ReadCheckpointAdvisory().state == AdvisoryState::INVALID);
+    node::FlowMeshProductionStore::CheckpointAdvanceResult work;
+    BOOST_CHECK(!reopened.AdvanceCheckpointAdvisory(scenario.seats0.seats, {}, work, error));
+    BOOST_CHECK_EQUAL(work.records_inspected, 0U);
+    SeatSource source;
+    source.m_domain = scenario.domain;
+    source.m_market = scenario.market;
+    source.Add(scenario.seats0.seats);
+    flowmesh::FlowMeshState replayed{scenario.state0};
+    uint256 hash;
+    BOOST_REQUIRE(reopened.Replay(replayed, hash, source,
+        {300, flowmesh::AnchorRef{190, Filled(0x73)}, &scenario.anchors},
+        scenario.treasury, &scenario.chain_facts, error));
+    CheckAdvisoryMatchesLegacy(reopened, scenario.seats0.seats);
+    BOOST_CHECK(reopened.ReadCheckpointAdvisory().last_connection == std::optional<uint64_t>{1});
+}
+
+BOOST_AUTO_TEST_CASE(checkpoint_advisory_discovers_corruption_without_decoding_oversized_records)
+{
+    Scenario scenario;
+    for (int corruption{0}; corruption < 5; ++corruption) {
+        node::FlowMeshProductionStore store{DBParams{
+            .path = m_args.GetDataDirBase() / fs::PathFromString("flowmesh_advisory_corrupt_" + std::to_string(corruption)),
+            .cache_bytes = size_t{1} << 20, .memory_only = true}};
+        std::string error;
+        BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market,
+            scenario.seats0.seats, scenario.state0.Root(), error));
+        flowmesh::FlowMeshState state{scenario.state0};
+        const auto genesis{AppendAdvisoryEmpty(store, scenario, state, 0, {})};
+        AppendAdvisoryEmpty(store, scenario, state, 1, genesis.entry.GetHash());
+        BOOST_REQUIRE(store.MarkExecutionCheckpointConnected(
+            Checkpoint(genesis.entry, genesis.certificate, scenario.seats0.seats, {}),
+            scenario.seats0.seats, {240, Filled(0xa0)}, error));
+        const auto before{store.ReadCheckpointAdvisory()};
+        BOOST_CHECK(before.state == AdvisoryState::REBUILDING);
+        {
+            const std::lock_guard guard{node::FlowMeshProductionStoreTestAccess::Mutex(store)};
+            auto& db{node::FlowMeshProductionStoreTestAccess::DB(store)};
+            if (corruption == 0) {
+                db.Write(TestSequenceKey{'e', 1}, AdvisoryRawBytes{std::vector<std::byte>(8U * 1024 * 1024 + 1)}, true);
+            } else if (corruption == 1) {
+                db.Write(TestSequenceKey{'e', 1}, AdvisoryRawBytes{{std::byte{0x00}}}, true);
+            } else if (corruption == 2) {
+                db.Write(uint8_t{'m'}, AdvisoryRawBytes{std::vector<std::byte>(1025)}, true);
+            } else if (corruption == 3) {
+                db.Erase(TestSequenceKey{'e', 1}, true);
+                DataStream bytes;
+                bytes << TestSequenceKey{'e', 1};
+                std::vector<std::byte> key{bytes.begin(), bytes.end()};
+                key.push_back(std::byte{0});
+                db.Write(AdvisoryRawBytes{key}, AdvisoryRawBytes{{std::byte{0}}}, true);
+            } else {
+                auto marker{before.marker};
+                marker.state_root = Filled(0xf0); // internally shaped, but not validated binding
+                db.Write(uint8_t{'m'}, marker, true);
+            }
+        }
+        // Memory-only reads do not magically discover latent disk corruption.
+        BOOST_CHECK_EQUAL(store.ReadCheckpointAdvisory().revision, before.revision);
+        node::FlowMeshProductionStore::CheckpointAdvanceResult work;
+        BOOST_CHECK(!store.AdvanceCheckpointAdvisory(scenario.seats0.seats, {}, work, error));
+        const auto after{store.ReadCheckpointAdvisory()};
+        BOOST_CHECK(after.state == AdvisoryState::INVALID);
+        BOOST_CHECK(!after.candidate);
+        BOOST_CHECK(after.reason == (corruption == 4 ? AdvisoryReason::BASE_UNAVAILABLE : AdvisoryReason::INVALID_RECORD));
+        BOOST_CHECK_EQUAL(work.certificate_checks, 0U);
+        BOOST_CHECK_LE(work.records_inspected, 2U);
+        BOOST_CHECK_LE(work.encoded_bytes_decoded, 1024U + 9U + 1U);
+        BOOST_CHECK_EQUAL(after.next_scan_sequence, 1U);
+        // Neither unavailable evidence nor a budget is a false KNOWN_NONE.
+        BOOST_CHECK(!store.AdvanceCheckpointAdvisory(scenario.seats0.seats, {}, work, error));
+        BOOST_CHECK(store.ReadCheckpointAdvisory().state == AdvisoryState::INVALID);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(checkpoint_advisory_failed_sync_invalidates_without_retrying_unknown_write)
+{
+    Scenario scenario;
+    for (const bool fail_connection : {false, true}) {
+        std::unique_ptr<leveldb::Env> backing{leveldb::NewMemEnv(leveldb::Env::Default())};
+        AdvisorySyncFailureEnv env{backing.get()};
+        node::FlowMeshProductionStore store{DBParams{
+            .path = m_args.GetDataDirBase() / (fail_connection ? "flowmesh_advisory_fail_connection" : "flowmesh_advisory_fail_append"),
+            .cache_bytes = size_t{1} << 20, .env_for_test = &env}};
+        std::string error;
+        BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market,
+            scenario.seats0.seats, scenario.state0.Root(), error));
+        flowmesh::FlowMeshState output{scenario.state0};
+        if (fail_connection) {
+            BOOST_REQUIRE(store.AppendExecution(scenario.execution0.entry, scenario.certificate0,
+                scenario.seats0.seats, scenario.state0,
+                {300, flowmesh::AnchorRef{190, Filled(0x73)}, &scenario.anchors},
+                scenario.treasury, &scenario.chain_facts, output, error));
+            BOOST_REQUIRE(store.ReadCheckpointAdvisory().candidate);
+        }
+        env.fail_sync = true;
+        if (fail_connection) {
+            BOOST_CHECK(!store.MarkExecutionCheckpointConnected(Checkpoint(scenario.execution0.entry,
+                scenario.certificate0, scenario.seats0.seats, {}), scenario.seats0.seats,
+                {240, Filled(0xa0)}, error));
+        } else {
+            BOOST_CHECK(!store.AppendExecution(scenario.execution0.entry, scenario.certificate0,
+                scenario.seats0.seats, scenario.state0,
+                {300, flowmesh::AnchorRef{190, Filled(0x73)}, &scenario.anchors},
+                scenario.treasury, &scenario.chain_facts, output, error));
+            BOOST_CHECK(output.Root() == scenario.state0.Root());
+        }
+        BOOST_CHECK_GT(env.failures.load(), 0U);
+        BOOST_CHECK(store.ReadCheckpointAdvisory().state == AdvisoryState::INVALID);
+        BOOST_CHECK(store.ReadCheckpointAdvisory().reason == AdvisoryReason::STORAGE_ERROR);
+        BOOST_CHECK(!store.ReadCheckpointAdvisory().candidate);
+        const auto failed_syncs{env.failures.load()};
+        node::FlowMeshProductionStore::CheckpointAdvanceResult work;
+        BOOST_CHECK(!store.AdvanceCheckpointAdvisory(scenario.seats0.seats, {}, work, error));
+        BOOST_CHECK(store.ReadCheckpointAdvisory().state == AdvisoryState::INVALID);
+        BOOST_CHECK_EQUAL(env.failures.load(), failed_syncs); // no retry/write from maintenance
+    }
+}
+
+BOOST_AUTO_TEST_CASE(checkpoint_advisory_failed_replay_and_missing_marker_never_publish_empty)
+{
+    Scenario scenario;
+    node::FlowMeshProductionStore store{DBParams{
+        .path = m_args.GetDataDirBase() / "flowmesh_advisory_failed_replay",
+        .cache_bytes = size_t{1} << 20, .memory_only = true}};
+    std::string error;
+    BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market,
+        scenario.seats0.seats, scenario.state0.Root(), error));
+    flowmesh::FlowMeshState state{scenario.state0};
+    AppendAdvisoryEmpty(store, scenario, state, 0, {});
+    BOOST_REQUIRE(store.ReadCheckpointAdvisory().candidate);
+    SeatSource missing_seats;
+    missing_seats.m_domain = scenario.domain;
+    missing_seats.m_market = scenario.market;
+    flowmesh::FlowMeshState replayed{scenario.state0};
+    uint256 hash;
+    BOOST_CHECK(!store.Replay(replayed, hash, missing_seats,
+        {300, flowmesh::AnchorRef{190, Filled(0x73)}, &scenario.anchors},
+        scenario.treasury, &scenario.chain_facts, error));
+    BOOST_CHECK(store.ReadCheckpointAdvisory().state == AdvisoryState::INVALID);
+    BOOST_CHECK(!store.ReadCheckpointAdvisory().candidate);
+    BOOST_CHECK(replayed.Root() == scenario.state0.Root());
+    missing_seats.Add(scenario.seats0.seats);
+    BOOST_REQUIRE(store.Replay(replayed, hash, missing_seats,
+        {300, flowmesh::AnchorRef{190, Filled(0x73)}, &scenario.anchors},
+        scenario.treasury, &scenario.chain_facts, error));
+    CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
+    {
+        const std::lock_guard guard{node::FlowMeshProductionStoreTestAccess::Mutex(store)};
+        node::FlowMeshProductionStoreTestAccess::DB(store).Erase(uint8_t{'m'}, true);
+    }
+    std::optional<node::FlowMeshProductionStore::Marker> marker;
+    bool ready{false};
+    BOOST_REQUIRE(store.ReadMarkerAndReadiness(marker, ready, error));
+    BOOST_CHECK(!marker);
+    BOOST_CHECK(store.ReadCheckpointAdvisory().state == AdvisoryState::INVALID);
+    BOOST_CHECK(!store.ReadCheckpointAdvisory().candidate);
+
+    // Discovery through the existing reconciliation path must invalidate too,
+    // even when the entire namespace has vanished and legacy reconcile returns
+    // success for a genuinely empty namespace. No instant-corruption claim.
+    node::FlowMeshProductionStore emptied{DBParams{
+        .path = m_args.GetDataDirBase() / "flowmesh_advisory_emptied_namespace",
+        .cache_bytes = size_t{1} << 20, .memory_only = true}};
+    BOOST_REQUIRE(emptied.OpenForMarket(scenario.domain, scenario.market,
+        scenario.seats0.seats, scenario.state0.Root(), error));
+    flowmesh::FlowMeshState empty_state{scenario.state0};
+    AppendAdvisoryEmpty(emptied, scenario, empty_state, 0, {});
+    BOOST_REQUIRE(emptied.ReadCheckpointAdvisory().candidate);
+    {
+        const std::lock_guard guard{node::FlowMeshProductionStoreTestAccess::Mutex(emptied)};
+        auto& db{node::FlowMeshProductionStoreTestAccess::DB(emptied)};
+        db.Erase(TestSequenceKey{'e', 0}, true);
+        db.Erase(uint8_t{'m'}, true);
+    }
+    bool rolled_back{false};
+    BOOST_REQUIRE(emptied.ReconcileCheckpointConnections({}, rolled_back, error));
+    BOOST_CHECK(!rolled_back);
+    BOOST_CHECK(emptied.ReadCheckpointAdvisory().state == AdvisoryState::INVALID);
+    BOOST_CHECK(!emptied.ReadCheckpointAdvisory().candidate);
+}
+
 BOOST_AUTO_TEST_CASE(zero_effect_market_genesis_is_mandatory_then_empty_entries_skip)
 {
     Scenario scenario;
@@ -1349,6 +1825,7 @@ BOOST_AUTO_TEST_CASE(zero_effect_market_genesis_is_mandatory_then_empty_entries_
     BOOST_REQUIRE(candidate.has_value());
     BOOST_CHECK_EQUAL(candidate->stored.entry.sequence, 0U);
     BOOST_CHECK(candidate->stored.effects.empty());
+    CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
 
     const auto checkpoint{Checkpoint(first->entry, first_certificate,
                                      scenario.seats0.seats, {})};
@@ -1378,6 +1855,7 @@ BOOST_AUTO_TEST_CASE(zero_effect_market_genesis_is_mandatory_then_empty_entries_
                               scenario.seats0.seats, candidate, error),
                           error);
     BOOST_CHECK(!candidate);
+    CheckAdvisoryMatchesLegacy(store, scenario.seats0.seats);
 }
 
 BOOST_AUTO_TEST_CASE(settlement_only_execution_is_durable_mandatory_and_replayable)
@@ -1525,6 +2003,7 @@ BOOST_AUTO_TEST_CASE(settlement_only_execution_is_durable_mandatory_and_replayab
     BOOST_REQUIRE(candidate.has_value());
     BOOST_CHECK_EQUAL(candidate->stored.entry.sequence, 1U);
     BOOST_CHECK(candidate->stored.settlements == facts.settlements);
+    CheckAdvisoryMatchesLegacy(reopened, scenario.seats0.seats);
 }
 
 BOOST_AUTO_TEST_CASE(permanent_epoch_sequence_lock_survives_restart)
