@@ -1,0 +1,34 @@
+name: FlowMesh lock annotation contracts
+
+# Compiler diagnostics only. Native lock-order and ThreadSanitizer runs are
+# separate qualification; this workflow neither builds nor deploys a node.
+on:
+  workflow_dispatch:
+  push:
+    branches: [flowmeshV2-dev]
+    paths:
+      - '.github/workflows/flowmesh-lock-contracts.yml'
+      - 'ci/check_flowmesh_lock_contracts.py'
+      - 'test/flowmesh_lock_contracts/**'
+      - 'src/threadsafety.h'
+      - 'src/sync.h'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flowmesh-lock-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  annotation-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify compiler contracts and expected diagnostics
+        run: python3 -B ci/check_flowmesh_lock_contracts.py --compiler clang++
+      - name: Verify discovery and rejection controls
+        run: python3 -B test/flowmesh_lock_contracts/test_runner.py
