@@ -88,3 +88,12 @@ Run distinct fresh directories sequentially, never loop until green. Use
 Do not run heavy builds/tests during the measured windows. Preserve raw reports,
 all partial traces and actual child exits privately; do not publish generated
 wallets, TLS keys, credentials or private logs.
+
+## Subsequent bounded-retention repair
+
+The lost-work scheduling repair was subsequently qualified and committed at
+`f1744e5`. Its [fresh diagnostic pair](b3-flowmesh-retention-native-diagnostics-20261016.md)
+completed 9/9 applied-result observations in each arm, with no capture drops.
+Those separate results do not replace the six historical rows or qualify the
+200 ms target; the new report retains their still-slow burst timings and exact
+remaining attribution gaps.
