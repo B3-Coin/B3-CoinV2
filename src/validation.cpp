@@ -2828,6 +2828,7 @@ const CBlockIndex* Chainstate::TargetBlock() const
 
 void Chainstate::SetTargetBlock(CBlockIndex* block)
 {
+    const auto mutation{m_chainman.ObserveChainMutation(kernel::ChainMutationKind::TARGET_CHANGE)};
     if (block) {
         m_target_blockhash = block->GetBlockHash();
     } else {
@@ -2838,6 +2839,7 @@ void Chainstate::SetTargetBlock(CBlockIndex* block)
 
 void Chainstate::SetTargetBlockHash(uint256 block_hash)
 {
+    const auto mutation{m_chainman.ObserveChainMutation(kernel::ChainMutationKind::TARGET_CHANGE)};
     m_target_blockhash = block_hash;
     m_cached_target_block = nullptr;
 }
@@ -2847,6 +2849,7 @@ void Chainstate::InitCoinsDB(
     bool in_memory,
     bool should_wipe)
 {
+    const auto mutation{m_chainman.ObserveChainMutation(kernel::ChainMutationKind::COINS_VIEW)};
     m_coins_views = std::make_unique<CoinsViews>(
         DBParams{
             .path = StoragePath(),
@@ -2863,9 +2866,16 @@ void Chainstate::InitCoinsDB(
 void Chainstate::InitCoinsCache(size_t cache_size_bytes)
 {
     AssertLockHeld(::cs_main);
+    const auto mutation{m_chainman.ObserveChainMutation(kernel::ChainMutationKind::COINS_VIEW)};
     assert(m_coins_views != nullptr);
     m_coinstip_cache_size_bytes = cache_size_bytes;
     m_coins_views->InitCache();
+}
+
+void Chainstate::ResetCoinsViews()
+{
+    const auto mutation{m_chainman.ObserveChainMutation(kernel::ChainMutationKind::COINS_VIEW)};
+    m_coins_views.reset();
 }
 
 // Lock-free: depends on `m_cached_is_ibd`, which is latched by `UpdateIBDStatus()`.
@@ -5063,6 +5073,7 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     }
     // Apply the block atomically to the chain state.
     const auto time_start{SteadyClock::now()};
+    const auto mutation{m_chainman.ObserveChainMutation(kernel::ChainMutationKind::DISCONNECT_TIP)};
     {
         CCoinsViewCache view(&CoinsTip());
         assert(view.GetBestBlock() == pindexDelete->GetBlockHash());
@@ -5204,6 +5215,7 @@ bool Chainstate::ConnectTip(
         LogDebug(BCLog::BENCH, "  - Using cached block\n");
     }
     // Apply the block atomically to the chain state.
+    const auto mutation{m_chainman.ObserveChainMutation(kernel::ChainMutationKind::CONNECT_TIP)};
     const auto time_2{SteadyClock::now()};
     SteadyClock::time_point time_3;
     // When adding aggregate statistics in the future, keep in mind that
@@ -7740,6 +7752,7 @@ bool Chainstate::LoadChainTip()
     if (tip == pindex) {
         return true;
     }
+    const auto mutation{m_chainman.ObserveChainMutation(kernel::ChainMutationKind::LOAD_TIP)};
     m_chain.SetTip(*pindex);
     m_chainman.UpdateIBDStatus();
     tip = m_chain.Tip();
@@ -8758,6 +8771,7 @@ Chainstate& ChainstateManager::InitializeChainstate(CTxMemPool* mempool)
 {
     AssertLockHeld(::cs_main);
     assert(m_chainstates.empty());
+    const auto mutation{ObserveChainMutation(kernel::ChainMutationKind::INITIALIZE)};
     m_chainstates.emplace_back(std::make_unique<Chainstate>(mempool, m_blockman, *this));
     return *m_chainstates.back();
 }
@@ -9255,6 +9269,7 @@ SnapshotCompletionResult ChainstateManager::MaybeValidateSnapshot(Chainstate& va
         // Reset chainstate target to network tip instead of snapshot block.
         validated_cs.SetTargetBlock(nullptr);
 
+        const auto mutation{ObserveChainMutation(kernel::ChainMutationKind::VALIDATION_MODE)};
         unvalidated_cs.m_assumeutxo = Assumeutxo::INVALID;
 
         auto rename_result = unvalidated_cs.InvalidateCoinsDBOnDisk();
@@ -9317,6 +9332,7 @@ SnapshotCompletionResult ChainstateManager::MaybeValidateSnapshot(Chainstate& va
     LogInfo("[snapshot] snapshot beginning at %s has been fully validated",
         unvalidated_cs.m_from_snapshot_blockhash->ToString());
 
+    const auto mutation{ObserveChainMutation(kernel::ChainMutationKind::VALIDATION_MODE)};
     unvalidated_cs.m_assumeutxo = Assumeutxo::VALIDATED;
     validated_cs.m_target_utxohash = AssumeutxoHash{validated_cs_stats->hashSerialized};
     this->MaybeRebalanceCaches();
@@ -9364,6 +9380,7 @@ void ChainstateManager::MaybeRebalanceCaches()
 
 void ChainstateManager::ResetChainstates()
 {
+    const auto mutation{ObserveChainMutation(kernel::ChainMutationKind::RESET)};
     m_chainstates.clear();
 }
 
@@ -9392,7 +9409,7 @@ ChainstateManager::ChainstateManager(const util::SignalInterrupt& interrupt, Opt
 ChainstateManager::~ChainstateManager()
 {
     LOCK(::cs_main);
-
+    const auto mutation{ObserveChainMutation(kernel::ChainMutationKind::DESTROY)};
     m_versionbitscache.Clear();
 }
 
@@ -9421,6 +9438,7 @@ Chainstate& ChainstateManager::AddChainstate(std::unique_ptr<Chainstate> chainst
     assert(prev_chainstate.m_assumeutxo == Assumeutxo::VALIDATED);
     // Set target block for historical chainstate to snapshot block.
     assert(!prev_chainstate.m_target_blockhash);
+    const auto mutation{ObserveChainMutation(kernel::ChainMutationKind::ADD)};
     prev_chainstate.m_target_blockhash = chainstate->m_from_snapshot_blockhash;
     m_chainstates.push_back(std::move(chainstate));
     Chainstate& curr_chainstate{CurrentChainstate()};
@@ -9482,6 +9500,7 @@ bool ChainstateManager::DeleteChainstate(Chainstate& chainstate)
 {
     AssertLockHeld(::cs_main);
     assert(!chainstate.m_coins_views);
+    const auto mutation{ObserveChainMutation(kernel::ChainMutationKind::REMOVE)};
     const fs::path db_path{chainstate.StoragePath()};
     if (!DeleteCoinsDBFromDisk(db_path, /*is_snapshot=*/bool{chainstate.m_from_snapshot_blockhash})) {
         LogError("Deletion of %s failed. Please remove it manually to continue reindexing.",

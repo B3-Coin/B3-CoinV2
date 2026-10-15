@@ -25,6 +25,7 @@
 #include <util/vector.h>
 
 #include <functional>
+#include <memory>
 #include <type_traits>
 #include <vector>
 
@@ -34,6 +35,9 @@ class Chainstate;
 class FastRandomContext;
 class uint160;
 class uint256;
+namespace kernel {
+class ChainMutationFence;
+}
 
 /** This is connected to the logger. Can be used to redirect logs to any other log */
 extern const std::function<void(const std::string&)> G_TEST_LOG_FUN;
@@ -56,6 +60,8 @@ struct TestOpts {
     bool setup_net{true};
     bool setup_validation_interface{true};
     bool min_validation_cache{false}; // Equivalent of -maxsigcachebytes=0
+    //! Optional native generation observer; never enables a signing gate.
+    std::shared_ptr<kernel::ChainMutationFence> chain_mutation_observer{};
 };
 
 /** Basic testing setup.

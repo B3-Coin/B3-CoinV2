@@ -7,6 +7,7 @@
 
 #include <kernel/notifications_interface.h>
 #include <kernel/lock_timing.h>
+#include <kernel/chain_mutation.h>
 
 #include <arith_uint256.h>
 #include <dbwrapper.h>
@@ -17,6 +18,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 
 class CChainParams;
@@ -51,6 +53,9 @@ struct ChainstateManagerOpts {
     size_t signature_cache_bytes{DEFAULT_SIGNATURE_CACHE_BYTES};
     //! Optional diagnostics only; default-null preserves standalone kernel behavior.
     LockTimingCallbacks lock_timing{};
+    //! Default-null local publication invalidation observer, not authority.
+    //! Owned final atomic-only implementation; cannot call into node services.
+    std::shared_ptr<ChainMutationFence> chain_mutation_observer{};
 };
 
 } // namespace kernel

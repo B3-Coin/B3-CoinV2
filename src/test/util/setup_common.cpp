@@ -278,6 +278,7 @@ ChainTestingSetup::ChainTestingSetup(const ChainType chainType, TestOpts opts)
             .signals = m_node.validation_signals.get(),
             // Use no worker threads while fuzzing to avoid non-determinism
             .worker_threads_num = EnableFuzzDeterminism() ? 0 : 2,
+            .chain_mutation_observer = opts.chain_mutation_observer,
         };
         if (opts.min_validation_cache) {
             chainman_opts.script_execution_cache_bytes = 0;

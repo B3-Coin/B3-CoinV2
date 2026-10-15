@@ -834,7 +834,7 @@ public:
     }
 
     //! Destructs all objects related to accessing the UTXO set.
-    void ResetCoinsViews() { m_coins_views.reset(); }
+    void ResetCoinsViews();
 
     //! The cache size of the on-disk coins view.
     size_t m_coinsdb_cache_size_bytes{0};
@@ -1205,6 +1205,12 @@ public:
 
     const util::SignalInterrupt& m_interrupt;
     const Options m_options;
+    //! Optional process-local bookkeeping only; no callback into node code.
+    //! Conservative: historical-chain mutations may invalidate tickets too.
+    kernel::ChainMutationScope ObserveChainMutation(kernel::ChainMutationKind kind) const noexcept
+    {
+        return kernel::ChainMutationScope{m_options.chain_mutation_observer, kind};
+    }
     //! A single BlockManager instance is shared across each constructed
     //! chainstate to avoid duplicating block metadata.
     node::BlockManager m_blockman;
@@ -1321,6 +1327,7 @@ public:
     {
         auto it{std::find_if(m_chainstates.begin(), m_chainstates.end(), [&](auto& cs) { return cs.get() == &chainstate; })};
         if (it != m_chainstates.end()) {
+            const auto mutation{ObserveChainMutation(kernel::ChainMutationKind::REMOVE)};
             auto ret{std::move(*it)};
             m_chainstates.erase(it);
             return ret;

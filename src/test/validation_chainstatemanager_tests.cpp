@@ -4,6 +4,7 @@
 //
 #include <chainparams.h>
 #include <consensus/validation.h>
+#include <kernel/chain_mutation.h>
 #include <kernel/disconnected_transactions.h>
 #include <node/chainstatemanager_args.h>
 #include <node/kernel_notifications.h>
@@ -26,6 +27,11 @@
 #include <tinyformat.h>
 
 #include <vector>
+#include <chrono>
+#include <future>
+#include <memory>
+#include <optional>
+#include <stdexcept>
 
 #include <boost/test/unit_test.hpp>
 
@@ -33,7 +39,325 @@ using node::BlockManager;
 using node::KernelNotifications;
 using node::SnapshotMetadata;
 
+namespace kernel {
+struct ChainMutationFenceTestAccess {
+    static void NearExhaustion(ChainMutationFence& fence) noexcept
+    {
+        fence.m_word.store((ChainMutationFence::MAX_GENERATION - 1) | ChainMutationFence::FENCED_BIT);
+    }
+    static void MaxActiveDepth(ChainMutationFence& fence) noexcept
+    {
+        fence.m_word.store(ChainMutationFence::FENCED_BIT | ChainMutationFence::ACTIVE_MASK);
+    }
+};
+} // namespace kernel
+
+namespace {
+using MutationKind = kernel::ChainMutationKind;
+using PublicationCheck = kernel::ChainPublicationCheck;
+using MutationFence = kernel::ChainMutationFence;
+
+struct MutationFenceSetup : TestChain100Setup {
+    MutationFenceSetup()
+        : TestChain100Setup{ChainType::REGTEST,
+            TestOpts{.chain_mutation_observer = std::make_shared<MutationFence>()}} {}
+    std::shared_ptr<MutationFence> Observer() const { return m_node.chainman->m_options.chain_mutation_observer; }
+};
+struct MutationFenceColdSetup : ChainTestingSetup {
+    MutationFenceColdSetup()
+        : ChainTestingSetup{ChainType::REGTEST,
+            TestOpts{.setup_net = false, .chain_mutation_observer = std::make_shared<MutationFence>()}} {}
+};
+
+class PreConnectFenceRecorder final : public CValidationInterface {
+    ChainstateManager& m_chainman;
+    std::shared_ptr<MutationFence> m_observer;
+    kernel::ChainPublicationTicket m_before;
+    uint256 m_old_tip;
+public:
+    size_t checked{0};
+    bool fenced_before_flush{true};
+    bool tip_still_old{true};
+    bool recursive_capture_refused{true};
+    bool recursive_complete_refused{true};
+    PreConnectFenceRecorder(ChainstateManager& chainman, std::shared_ptr<MutationFence> observer,
+                            const kernel::ChainPublicationTicket& before, const uint256& old_tip)
+        : m_chainman{chainman}, m_observer{std::move(observer)}, m_before{before}, m_old_tip{old_tip} {}
+    void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState& state) override
+    {
+        if (!state.IsValid()) return;
+        ++checked;
+        fenced_before_flush &= m_observer->Check(m_before) == PublicationCheck::SUPERSEDED;
+        recursive_capture_refused &= !MutationFence::Capture(m_observer);
+        recursive_complete_refused &= m_observer->CompletePublication(m_before) != PublicationCheck::CURRENT;
+        // This synchronous event is inside ConnectTip, after ConnectBlock but
+        // before its view flush, derived indexes and selected-tip publication.
+        LOCK(::cs_main);
+        tip_still_old &= m_chainman.ActiveTip()->GetBlockHash() == m_old_tip;
+    }
+};
+
+//! Always release blocked background callbacks before referenced promises die.
+struct ReleaseMutationCallbacks {
+    std::promise<void>& release;
+    ValidationSignals& signals;
+    ~ReleaseMutationCallbacks()
+    {
+        release.set_value();
+        signals.SyncWithValidationInterfaceQueue();
+    }
+};
+} // namespace
+
 BOOST_FIXTURE_TEST_SUITE(validation_chainstatemanager_tests, TestingSetup)
+
+BOOST_FIXTURE_TEST_CASE(chain_mutation_manager_destruction_invalidates_owned_ticket, MutationFenceColdSetup)
+{
+    BOOST_REQUIRE(MutationFence::SUPPORTED);
+    const auto observer{m_node.chainman->m_options.chain_mutation_observer};
+    BOOST_REQUIRE(observer);
+    const auto ticket{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(ticket);
+    BOOST_REQUIRE(observer->CompletePublication(*ticket) == PublicationCheck::CURRENT);
+    m_node.chainman.reset(); // this cold fixture has no consumers or loaded chain
+    BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::DESTROY), 1U);
+    BOOST_CHECK(observer->Check(*ticket) == PublicationCheck::STOPPED);
+    BOOST_CHECK(observer->CompletePublication(*ticket) == PublicationCheck::STOPPED);
+    BOOST_CHECK(!MutationFence::Capture(observer));
+}
+
+BOOST_AUTO_TEST_CASE(chain_mutation_ticket_supersession_ownership_and_exhaustion)
+{
+    BOOST_REQUIRE(MutationFence::SUPPORTED); // optional facility unsupported != passing qualification
+    BOOST_CHECK(!m_node.chainman->m_options.chain_mutation_observer); // production default is null
+    BOOST_CHECK(!MutationFence::Capture({}));
+    auto observer{std::make_shared<MutationFence>()};
+    const auto first{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(first);
+    BOOST_CHECK(observer->Check(*first) == PublicationCheck::FENCED);
+    BOOST_CHECK(observer->CompletePublication(*first) == PublicationCheck::CURRENT);
+    BOOST_CHECK(observer->Check(*first) == PublicationCheck::CURRENT);
+    { const kernel::ChainMutationScope mutation{observer, MutationKind::CONNECT_TIP}; }
+    BOOST_CHECK(observer->Check(*first) == PublicationCheck::SUPERSEDED);
+    BOOST_CHECK(observer->CompletePublication(*first) == PublicationCheck::SUPERSEDED);
+    auto fresh{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(fresh);
+    BOOST_CHECK(observer->Check(*fresh) == PublicationCheck::FENCED);
+    BOOST_CHECK(observer->CompletePublication(*fresh) == PublicationCheck::CURRENT);
+    auto other{std::make_shared<MutationFence>()};
+    BOOST_CHECK(other->Check(*fresh) == PublicationCheck::SUPERSEDED);
+    BOOST_CHECK(other->CompletePublication(*fresh) == PublicationCheck::SUPERSEDED);
+    std::weak_ptr<const MutationFence> retained{other};
+    auto owned_ticket{MutationFence::Capture(other)};
+    BOOST_REQUIRE(owned_ticket);
+    other.reset();
+    BOOST_CHECK(!retained.expired());
+    owned_ticket.reset();
+    BOOST_CHECK(retained.expired());
+
+    kernel::ChainMutationFenceTestAccess::NearExhaustion(*observer);
+    auto near{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(near);
+    { const kernel::ChainMutationScope mutation{observer, MutationKind::RESET}; }
+    BOOST_CHECK(observer->Check(*near) == PublicationCheck::SUPERSEDED);
+    const auto last{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(last);
+    BOOST_CHECK_EQUAL(last->Generation(), MutationFence::MAX_GENERATION);
+    BOOST_CHECK(observer->CompletePublication(*last) == PublicationCheck::CURRENT);
+    { const kernel::ChainMutationScope mutation{observer, MutationKind::RESET}; }
+    BOOST_CHECK(observer->Check(*last) == PublicationCheck::EXHAUSTED);
+    BOOST_CHECK(observer->CompletePublication(*last) == PublicationCheck::EXHAUSTED);
+    BOOST_CHECK(!MutationFence::Capture(observer));
+    { const kernel::ChainMutationScope mutation{observer, MutationKind::CONNECT_TIP}; }
+    BOOST_CHECK(observer->Check(*last) == PublicationCheck::EXHAUSTED); // no counter wrap/ABA
+
+    auto depth{std::make_shared<MutationFence>()};
+    const auto initial_depth{MutationFence::Capture(depth)};
+    BOOST_REQUIRE(initial_depth);
+    kernel::ChainMutationFenceTestAccess::MaxActiveDepth(*depth);
+    { const kernel::ChainMutationScope mutation{depth, MutationKind::RESET}; }
+    BOOST_CHECK(depth->Check(*initial_depth) == PublicationCheck::EXHAUSTED);
+    BOOST_CHECK(!MutationFence::Capture(depth));
+}
+
+BOOST_AUTO_TEST_CASE(chain_mutation_nested_scopes_refuse_reentrant_publication_and_unwind)
+{
+    BOOST_REQUIRE(MutationFence::SUPPORTED);
+    auto observer{std::make_shared<MutationFence>()};
+    const auto before{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(before);
+    BOOST_REQUIRE(observer->CompletePublication(*before) == PublicationCheck::CURRENT);
+    try {
+        const kernel::ChainMutationScope outer{observer, MutationKind::CONNECT_TIP};
+        BOOST_CHECK(!MutationFence::Capture(observer));
+        {
+            const kernel::ChainMutationScope inner{observer, MutationKind::VALIDATION_MODE};
+            BOOST_CHECK(!MutationFence::Capture(observer));
+            BOOST_CHECK(observer->CompletePublication(*before) == PublicationCheck::SUPERSEDED);
+        }
+        BOOST_CHECK(!MutationFence::Capture(observer)); // inner end cannot expose outer mutation
+        throw std::runtime_error{"synthetic mutation interruption"};
+    } catch (const std::runtime_error&) {
+    }
+    const auto after{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(after); // lexical unwind released active depth, not the fence
+    BOOST_CHECK(observer->Check(*after) == PublicationCheck::FENCED);
+    BOOST_CHECK(observer->CompletePublication(*before) == PublicationCheck::SUPERSEDED);
+    BOOST_CHECK(observer->CompletePublication(*after) == PublicationCheck::CURRENT);
+}
+
+BOOST_FIXTURE_TEST_CASE(chain_mutation_fences_connect_before_flush_with_background_callbacks_delayed,
+                        MutationFenceSetup)
+{
+    BOOST_REQUIRE(MutationFence::SUPPORTED);
+    auto observer{Observer()};
+    BOOST_REQUIRE(observer);
+    BOOST_CHECK_GT(observer->MutationCalls(MutationKind::INITIALIZE), 0U);
+    BOOST_CHECK_GT(observer->MutationCalls(MutationKind::CONNECT_TIP), 0U);
+    auto& chainman{*m_node.chainman};
+    auto before{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(before);
+    BOOST_REQUIRE(observer->CompletePublication(*before) == PublicationCheck::CURRENT);
+    const auto old_tip{WITH_LOCK(::cs_main, return chainman.ActiveTip()->GetBlockHash())};
+    auto recorder{std::make_shared<PreConnectFenceRecorder>(chainman, observer, *before, old_tip)};
+    m_node.validation_signals->RegisterSharedValidationInterface(recorder);
+    // Block only the async validation queue. The synchronous BlockChecked
+    // observation and generation invalidation must not depend on servicing it.
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    std::promise<void> started, release;
+    auto released{release.get_future().share()};
+    m_node.validation_signals->CallFunctionInValidationInterfaceQueue([&] {
+        started.set_value();
+        released.wait();
+    });
+    ReleaseMutationCallbacks release_on_exit{release, *m_node.validation_signals};
+    BOOST_REQUIRE(started.get_future().wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    const auto connects{observer->MutationCalls(MutationKind::CONNECT_TIP)};
+    mineBlocks(1);
+    BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::CONNECT_TIP), connects + 1);
+    BOOST_CHECK_GT(recorder->checked, 0U);
+    BOOST_CHECK(recorder->fenced_before_flush);
+    BOOST_CHECK(recorder->tip_still_old);
+    BOOST_CHECK(recorder->recursive_capture_refused);
+    BOOST_CHECK(recorder->recursive_complete_refused);
+    BOOST_CHECK(observer->Check(*before) == PublicationCheck::SUPERSEDED);
+    BOOST_CHECK(observer->CompletePublication(*before) == PublicationCheck::SUPERSEDED);
+    const auto during{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(during);
+    BOOST_CHECK(observer->Check(*during) == PublicationCheck::FENCED);
+    m_node.validation_signals->UnregisterSharedValidationInterface(recorder);
+}
+
+BOOST_FIXTURE_TEST_CASE(chain_mutation_fences_disconnect_and_leaf_reads_do_not_take_chain_lock,
+                        MutationFenceSetup)
+{
+    BOOST_REQUIRE(MutationFence::SUPPORTED);
+    const auto observer{Observer()};
+    BOOST_REQUIRE(observer);
+    auto before{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(before);
+    BOOST_REQUIRE(observer->CompletePublication(*before) == PublicationCheck::CURRENT);
+    auto& chainman{*m_node.chainman};
+    CBlockIndex* tip{WITH_LOCK(::cs_main, return chainman.ActiveTip())};
+    const auto disconnects{observer->MutationCalls(MutationKind::DISCONNECT_TIP)};
+    BlockValidationState state;
+    BOOST_REQUIRE(chainman.ActiveChainstate().InvalidateBlock(state, tip));
+    BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::DISCONNECT_TIP), disconnects + 1);
+    BOOST_CHECK(observer->Check(*before) == PublicationCheck::SUPERSEDED);
+    BOOST_CHECK(observer->CompletePublication(*before) == PublicationCheck::SUPERSEDED);
+    auto fresh{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(fresh);
+    BOOST_CHECK(observer->Check(*fresh) == PublicationCheck::FENCED);
+    std::future<PublicationCheck> leaf;
+    std::future_status leaf_status;
+    {
+        LOCK(::cs_main);
+        leaf = std::async(std::launch::async, [&] {
+            return observer->Check(*fresh);
+        });
+        leaf_status = leaf.wait_for(std::chrono::seconds{5});
+    }
+    // Unlock before asserting/destroying the future, even on a regression.
+    BOOST_REQUIRE(leaf_status == std::future_status::ready);
+    BOOST_CHECK(leaf.get() == PublicationCheck::FENCED);
+}
+
+BOOST_FIXTURE_TEST_CASE(chain_mutation_fences_snapshot_switch_load_targets_remove_and_reset,
+                        MutationFenceSetup)
+{
+    BOOST_REQUIRE(MutationFence::SUPPORTED);
+    auto observer{Observer()};
+    BOOST_REQUIRE(observer);
+    mineBlocks(10); // existing regtest assumeutxo fixture height
+    auto& manager{*m_node.chainman};
+    auto before{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(before);
+    BOOST_REQUIRE(observer->CompletePublication(*before) == PublicationCheck::CURRENT);
+    {
+        LOCK(::cs_main);
+        auto& original{manager.CurrentChainstate()};
+        const auto* tip{original.m_chain.Tip()};
+        BOOST_REQUIRE(tip);
+        const auto hash{tip->GetBlockHash()};
+        const auto adds{observer->MutationCalls(MutationKind::ADD)};
+        auto& snapshot{manager.AddChainstate(std::make_unique<Chainstate>(
+            nullptr, manager.m_blockman, manager, hash))};
+        BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::ADD), adds + 1);
+        BOOST_CHECK(observer->Check(*before) == PublicationCheck::SUPERSEDED);
+        const auto views{observer->MutationCalls(MutationKind::COINS_VIEW)};
+        auto view_ticket{MutationFence::Capture(observer)};
+        BOOST_REQUIRE(view_ticket);
+        BOOST_REQUIRE(observer->CompletePublication(*view_ticket) == PublicationCheck::CURRENT);
+        snapshot.InitCoinsDB(1 << 23, true, false);
+        snapshot.InitCoinsCache(1 << 23);
+        BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::COINS_VIEW), views + 2);
+        BOOST_CHECK(observer->Check(*view_ticket) == PublicationCheck::SUPERSEDED);
+        snapshot.CoinsTip().SetBestBlock(hash);
+        for (const auto& cs : manager.m_chainstates) cs->ClearBlockIndexCandidates();
+        const auto loads{observer->MutationCalls(MutationKind::LOAD_TIP)};
+        auto load_ticket{MutationFence::Capture(observer)};
+        BOOST_REQUIRE(load_ticket);
+        BOOST_REQUIRE(observer->CompletePublication(*load_ticket) == PublicationCheck::CURRENT);
+        BOOST_REQUIRE(snapshot.LoadChainTip());
+        BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::LOAD_TIP), loads + 1);
+        BOOST_CHECK(observer->Check(*load_ticket) == PublicationCheck::SUPERSEDED);
+        for (const auto& cs : manager.m_chainstates) cs->PopulateBlockIndexCandidates();
+
+        auto target_ticket{MutationFence::Capture(observer)};
+        BOOST_REQUIRE(target_ticket);
+        BOOST_REQUIRE(observer->CompletePublication(*target_ticket) == PublicationCheck::CURRENT);
+        const auto targets{observer->MutationCalls(MutationKind::TARGET_CHANGE)};
+        original.SetTargetBlockHash(hash);
+        original.SetTargetBlock(nullptr);
+        BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::TARGET_CHANGE), targets + 2);
+        BOOST_CHECK(observer->Check(*target_ticket) == PublicationCheck::SUPERSEDED);
+        const auto removes{observer->MutationCalls(MutationKind::REMOVE)};
+        auto removed{manager.RemoveChainstate(snapshot)};
+        BOOST_REQUIRE(removed);
+        BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::REMOVE), removes + 1);
+        // This fixture never populated the snapshot with spendable coins.
+        // Removing it restores the original; no migration/custody is tested.
+    }
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    {
+        LOCK(::cs_main);
+        auto views_ticket{MutationFence::Capture(observer)};
+        BOOST_REQUIRE(views_ticket);
+        BOOST_REQUIRE(observer->CompletePublication(*views_ticket) == PublicationCheck::CURRENT);
+        const auto views{observer->MutationCalls(MutationKind::COINS_VIEW)};
+        manager.CurrentChainstate().ResetCoinsViews();
+        BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::COINS_VIEW), views + 1);
+        BOOST_CHECK(observer->Check(*views_ticket) == PublicationCheck::SUPERSEDED);
+        const auto resets{observer->MutationCalls(MutationKind::RESET)};
+        auto ticket{MutationFence::Capture(observer)};
+        BOOST_REQUIRE(ticket);
+        BOOST_REQUIRE(observer->CompletePublication(*ticket) == PublicationCheck::CURRENT);
+        manager.ResetChainstates();
+        BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::RESET), resets + 1);
+        BOOST_CHECK(observer->Check(*ticket) == PublicationCheck::SUPERSEDED);
+        manager.InitializeChainstate(m_node.mempool.get()); // keep normal fixture teardown valid
+    }
+}
 
 struct ChainstateManager100Setup : TestChain100Setup {
     explicit ChainstateManager100Setup(TestOpts opts = {})
@@ -249,10 +573,11 @@ struct SnapshotTestSetup : ChainstateManager100Setup {
     // Note that this means the tests run considerably slower than in-memory DB
     // tests, but we can't otherwise test this functionality since it relies on
     // destructive filesystem operations.
-    SnapshotTestSetup()
+    explicit SnapshotTestSetup(bool observe_mutations = false)
         : ChainstateManager100Setup{TestOpts{
               .coins_db_in_memory = false,
               .block_tree_db_in_memory = false,
+              .chain_mutation_observer = observe_mutations ? std::make_shared<MutationFence>() : nullptr,
           }}
     {
     }
@@ -482,6 +807,62 @@ struct SnapshotTestSetup : ChainstateManager100Setup {
         return *Assert(m_node.chainman);
     }
 };
+
+struct MutationSnapshotSetup : SnapshotTestSetup {
+    MutationSnapshotSetup() : SnapshotTestSetup{true} {}
+};
+
+BOOST_FIXTURE_TEST_CASE(chain_mutation_fences_snapshot_validation_success, MutationSnapshotSetup)
+{
+    BOOST_REQUIRE(MutationFence::SUPPORTED);
+    const auto chainstates{SetupSnapshot()};
+    auto& manager{*m_node.chainman};
+    const auto observer{manager.m_options.chain_mutation_observer};
+    BOOST_REQUIRE(observer);
+    const auto ticket{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(ticket);
+    BOOST_REQUIRE(observer->CompletePublication(*ticket) == PublicationCheck::CURRENT);
+    const auto changes{observer->MutationCalls(MutationKind::VALIDATION_MODE)};
+    const auto result{WITH_LOCK(::cs_main, return manager.MaybeValidateSnapshot(
+        *std::get<0>(chainstates), *std::get<1>(chainstates)))};
+    BOOST_REQUIRE(result == SnapshotCompletionResult::SUCCESS);
+    BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::VALIDATION_MODE), changes + 1);
+    BOOST_CHECK(observer->CompletePublication(*ticket) == PublicationCheck::SUPERSEDED);
+    const auto stable{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(stable);
+    BOOST_REQUIRE(observer->CompletePublication(*stable) == PublicationCheck::CURRENT);
+    const auto skipped{WITH_LOCK(::cs_main, return manager.MaybeValidateSnapshot(
+        *std::get<0>(chainstates), *std::get<1>(chainstates)))};
+    BOOST_CHECK(skipped == SnapshotCompletionResult::SKIPPED);
+    BOOST_CHECK(observer->Check(*stable) == PublicationCheck::CURRENT);
+}
+
+BOOST_FIXTURE_TEST_CASE(chain_mutation_fences_invalid_snapshot_mode, MutationSnapshotSetup)
+{
+    BOOST_REQUIRE(MutationFence::SUPPORTED);
+    const auto chainstates{SetupSnapshot()};
+    auto& manager{*m_node.chainman};
+    const auto observer{manager.m_options.chain_mutation_observer};
+    BOOST_REQUIRE(observer);
+    m_node.notifications->m_shutdown_on_fatal_error = false;
+    const auto ticket{MutationFence::Capture(observer)};
+    BOOST_REQUIRE(ticket);
+    BOOST_REQUIRE(observer->CompletePublication(*ticket) == PublicationCheck::CURRENT);
+    const auto changes{observer->MutationCalls(MutationKind::VALIDATION_MODE)};
+    {
+        LOCK(::cs_main);
+        Coin synthetic;
+        synthetic.out.nValue = 1;
+        synthetic.nHeight = 1;
+        synthetic.out.scriptPubKey = CScript() << OP_TRUE;
+        std::get<0>(chainstates)->CoinsTip().AddCoin(
+            COutPoint{Txid::FromUint256(m_rng.rand256()), 0}, std::move(synthetic), false);
+        const auto result{manager.MaybeValidateSnapshot(*std::get<0>(chainstates), *std::get<1>(chainstates))};
+        BOOST_REQUIRE(result == SnapshotCompletionResult::HASH_MISMATCH);
+    }
+    BOOST_CHECK_EQUAL(observer->MutationCalls(MutationKind::VALIDATION_MODE), changes + 1);
+    BOOST_CHECK(observer->CompletePublication(*ticket) == PublicationCheck::SUPERSEDED);
+}
 
 //! Test basic snapshot activation.
 BOOST_FIXTURE_TEST_CASE(chainstatemanager_activate_snapshot, SnapshotTestSetup)
