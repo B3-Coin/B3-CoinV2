@@ -7,11 +7,13 @@
 
 #include <util/fs.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace node {
@@ -49,6 +51,15 @@ struct HttpsRequestResult {
     bool tls_handshake_performed{false};
     /** TCP_NODELAY was set on the socket this request used (latency only). */
     bool tcp_nodelay{false};
+    /** The configured CA material validated for this response's TLS session.
+     * Invalid on early/transport/TLS failure; null digest with valid=true
+     * means default CA paths, whose reload requires explicit Reset. This is
+     * transport context, never an admission or consensus proof. */
+    struct TrustStamp {
+        bool valid{false};
+        HttpsEndpoint endpoint;
+        std::optional<std::array<unsigned char, 32>> ca_fingerprint;
+    } trust;
 };
 
 /** Syntax and pin validation only: no DNS, filesystem or network access. */
@@ -59,6 +70,14 @@ bool NormalizeFlowMeshHttpsEndpoint(HttpsEndpoint& endpoint, std::string& error)
 /** Load configured CA material to catch missing/malformed trust files at
  * startup. Does not contact an endpoint or read a TLS private key. */
 bool ValidateFlowMeshHttpsTrust(const HttpsEndpoint& endpoint, std::string& error);
+/** Compare an owned response's validated trust context with its current
+ * configured public CA material. Read-only, bounded buffering, no network;
+ * call outside client/chain/wallet locks. Like Request's existing pre/post
+ * CA-load checks this observes file contents, not arbitrary filesystem ABA
+ * or atomic exclusion of administrator changes. Default-path reloads must
+ * be fenced by the caller's explicit-reset generation. */
+bool FlowMeshHttpsTrustCurrent(const HttpsEndpoint& endpoint, const HttpsRequestResult::TrustStamp& stamp,
+                              std::chrono::milliseconds timeout, std::string& error);
 
 /** One externally serialized HTTPS session, retaining at most one connection.
  * Requests are sequential, bounded, and never automatically replayed. Endpoint,

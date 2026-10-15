@@ -738,6 +738,24 @@ FlowMeshHttpsClient::FlowMeshHttpsClient(bool keep_alive) : m_impl{std::make_uni
 FlowMeshHttpsClient::~FlowMeshHttpsClient() = default;
 void FlowMeshHttpsClient::Reset() { m_impl->Reset(); }
 
+bool FlowMeshHttpsTrustCurrent(const HttpsEndpoint& endpoint, const HttpsRequestResult::TrustStamp& stamp,
+                              Milliseconds timeout, std::string& error)
+{
+    HttpsEndpoint normalized{endpoint};
+    if (!stamp.valid || timeout <= Milliseconds{0} || timeout > MAX_TIMEOUT ||
+        !NormalizeFlowMeshHttpsEndpoint(normalized, error) || normalized.url != stamp.endpoint.url ||
+        normalized.ca_file != stamp.endpoint.ca_file || normalized.certificate_sha256 != stamp.endpoint.certificate_sha256) {
+        error = "https-response-trust-context-changed";
+        return false;
+    }
+    std::optional<std::array<unsigned char, 32>> current;
+    if (!FingerprintCa(normalized.ca_file, Clock::now() + timeout, current) || current != stamp.ca_fingerprint) {
+        error = "https-response-ca-material-changed";
+        return false;
+    }
+    return true;
+}
+
 bool FlowMeshHttpsClient::Warm(const HttpsEndpoint& endpoint)
 {
     try {
@@ -919,6 +937,10 @@ HttpsRequestResult FlowMeshHttpsClient::Request(const HttpsEndpoint& endpoint, c
     if (!call.complete && call.result.error.empty()) call.result.error = "https-transport-failed";
     ++state.requests;
     state.last_used = Clock::now();
+    if (call.result.response_received && call.result.error.empty() && state.session.handshake_done &&
+        !state.session.pin_failed && !state.session.tls_failed) {
+        call.result.trust = {true, state.endpoint, state.ca_fingerprint};
+    }
     // An application-level 4xx/5xx is a complete, exactly framed reply and keeps
     // the verified connection. Redirects and transport errors still reset, and
     // server-side transport rejections always close.

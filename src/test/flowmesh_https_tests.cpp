@@ -5,6 +5,8 @@
 #include <node/flowmesh_https.h>
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_client_action_wait.h>
+#include <node/flowmesh_client_join.h>
+#include <node/flowmesh_client_work.h>
 #include <node/flowmesh_client_outcome.h>
 #include <node/flowmesh_client_ticks.h>
 #include <node/flowmesh_service.h>
@@ -728,11 +730,17 @@ BOOST_AUTO_TEST_CASE(https_warm_pin_and_replaced_ca_revalidate_before_dispatch)
     BOOST_REQUIRE_MESSAGE(server.Start(error), error);
     node::FlowMeshHttpsClient client;
     const auto endpoint{Endpoint(server)};
-    BOOST_REQUIRE(client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024).response_received);
+    const auto trusted{client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE(trusted.response_received);
+    BOOST_REQUIRE(trusted.trust.valid);
+    BOOST_REQUIRE(trusted.trust.ca_fingerprint);
+    BOOST_CHECK(node::FlowMeshHttpsTrustCurrent(endpoint, trusted.trust, std::chrono::seconds{2}, error));
+    BOOST_CHECK(!node::FlowMeshHttpsTrustCurrent(endpoint, {}, std::chrono::seconds{2}, error));
     auto wrong_pin{endpoint}; wrong_pin.certificate_sha256 = std::string(64, '0');
     const auto rejected{client.Request(wrong_pin, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
     BOOST_CHECK(!rejected.response_received);
     BOOST_CHECK(!rejected.request_may_have_been_sent);
+    BOOST_CHECK(!rejected.trust.valid);
     BOOST_CHECK_EQUAL(handled.load(), 1U);
     BOOST_REQUIRE(client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024).response_received);
     // Same CA path and restored timestamp, but a different generated CA. A
@@ -741,6 +749,7 @@ BOOST_AUTO_TEST_CASE(https_warm_pin_and_replaced_ca_revalidate_before_dispatch)
     std::string changed_pin;
     CreateCertificate(cert, m_path_root / "replacement-test-key.pem", changed_pin, true);
     fs::last_write_time(cert, previous_time);
+    BOOST_CHECK(!node::FlowMeshHttpsTrustCurrent(endpoint, trusted.trust, std::chrono::seconds{2}, error));
     const auto changed_ca{client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
     BOOST_CHECK(!changed_ca.response_received);
     BOOST_CHECK(!changed_ca.request_may_have_been_sent);
@@ -5525,14 +5534,26 @@ struct WatchProxy {
     std::mutex mutex;
     std::condition_variable changed;
     bool hold{false}, drop{false}, corrupt_snapshot{false}, inject_advert{false};
+    std::atomic<bool> corrupt_updates{false};
+    std::string held_read;
     unsigned watched{0}, held{0};
     std::vector<std::string> methods;
+    std::vector<uint64_t> watch_waits;
 
     void Hold(const bool value)
     {
         {
             std::lock_guard lock{mutex};
             hold = value;
+        }
+        changed.notify_all();
+    }
+    void HoldRead(std::string method)
+    {
+        {
+            std::lock_guard lock{mutex};
+            held_read = std::move(method);
+            hold = !held_read.empty();
         }
         changed.notify_all();
     }
@@ -5551,23 +5572,38 @@ struct WatchProxy {
             std::lock_guard lock{mutex};
             methods.push_back(method);
             watched += is_watch;
+            if (is_watch) watch_waits.push_back(json["params"]["watch_ms"].getInt<uint64_t>());
         }
         const auto reply{node::FlowMeshHttpsRequest(upstream, "/flowmesh/v1", request.body, std::chrono::seconds{10}, 32 << 20)};
         if (!reply.response_received) return {502, R"({"ok":false,"error":"proxy upstream failed"})"};
         std::string body{reply.body};
-        if (is_watch) {
+        bool hold_read{false};
+        {
+            std::lock_guard lock{mutex};
+            hold_read = !is_watch && held_read == method;
+        }
+        if (is_watch || hold_read) {
             std::unique_lock lock{mutex};
             ++held;
             changed.notify_all();
-            changed.wait_for(lock, std::chrono::seconds{5}, [&] { return !hold; });
+            if (!changed.wait_for(lock, std::chrono::seconds{5}, [&] { return !hold || (is_watch && !held_read.empty()); })) {
+                // The overlap assertion must not mistake this bounded
+                // fixture's automatic timeout for a still-held HTTP reply.
+                hold = false;
+            }
             if (drop) {
                 lock.unlock();
                 std::this_thread::sleep_until(request.deadline + std::chrono::milliseconds{200});
             }
         }
         UniValue parsed;
-        if ((corrupt_snapshot || inject_advert) && parsed.read(body) && parsed["ok"].isTrue()) {
+        if ((corrupt_snapshot || corrupt_updates || inject_advert) && parsed.read(body) && parsed["ok"].isTrue()) {
             UniValue result{parsed["result"]};
+            if (corrupt_updates && method == "updates" && !is_watch) {
+                UniValue status{result["status"]};
+                status.pushKV("domain", uint256::ONE.GetHex());
+                result.pushKV("status", std::move(status));
+            }
             if (corrupt_snapshot && method == "snapshot") {
                 auto state{result["state_bytes"].get_str()};
                 state[state.size() - 2] = state[state.size() - 2] == '0' ? '1' : '0';
@@ -5617,6 +5653,500 @@ Watched WatchRead(node::FlowMeshTradingBackend& client, const uint256& market, s
     return {std::move(data), watch};
 }
 } // namespace
+
+BOOST_AUTO_TEST_CASE(ordinary_snapshot_and_updates_leave_work_free_while_https_is_held)
+{
+    LiveMarket live{*this, m_path_root / "ordinary-held-service"};
+    uint64_t sequence{0};
+    for (const char* const method_name : {"snapshot", "updates"}) {
+        const std::string method{method_name};
+        WatchProxy proxy{.upstream = live.Endpoint()};
+        auto front{Proxy(*this, proxy)};
+        std::string error;
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())},
+            m_path_root / fs::PathFromString("ordinary-held-client-" + method), error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        if (method == "updates") BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+        proxy.HoldRead(method);
+        std::future<std::optional<flowmesh::MarketData>> read;
+        std::future<interfaces::FlowMeshActionReceipt> status, submit;
+        // Declared after the futures: release the real held HTTP reply before
+        // unwinding/joining, including a failing-before assertion or exception.
+        struct Release {
+            WatchProxy& proxy;
+            ~Release() { proxy.HoldRead({}); proxy.Hold(false); }
+        } const release{proxy};
+        std::string read_error;
+        read = std::async(std::launch::async, [&] { return client->Data(market, std::nullopt, Page(), read_error); });
+        BOOST_REQUIRE(proxy.AwaitHeld(1));
+        status = std::async(std::launch::async, [&] { return client->ActionStatus(market, uint256::ONE, false); });
+        const bool status_during_hold{status.wait_for(std::chrono::seconds{1}) == std::future_status::ready};
+        const auto action{SignedCancel(sequence++)};
+        submit = std::async(std::launch::async, [&, action] { return client->Submit(market, action); });
+        const bool submit_during_hold{submit.wait_for(std::chrono::seconds{1}) == std::future_status::ready};
+        bool still_held;
+        {
+            std::lock_guard lock{proxy.mutex};
+            still_held = proxy.hold;
+        }
+        proxy.HoldRead({});
+        proxy.Hold(false);
+        const auto local_status{status.get()};
+        const auto delivered{submit.get()};
+        (void)read.get(); // A concurrent submit may legitimately supersede the read.
+        BOOST_CHECK(still_held);
+        BOOST_CHECK_MESSAGE(status_during_hold, "a local-only action status waited for ordinary HTTPS " + method);
+        BOOST_CHECK_MESSAGE(submit_during_hold, "a submission waited for ordinary HTTPS " + method);
+        BOOST_CHECK(!local_status.certificate_verified);
+        BOOST_CHECK(local_status.reason.find("No retained local signed object") != std::string::npos);
+        BOOST_CHECK_MESSAGE(delivered.state != "rejected", delivered.reason);
+        BOOST_CHECK(live.WaitSequence(sequence + 1));
+        const auto saved{client->SavedActions(action.signer, market)};
+        BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+        BOOST_CHECK(saved.front().receipt.action_id == action.Id());
+        {
+            std::lock_guard lock{proxy.mutex};
+            BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "submit"), 1);
+        }
+        client.reset();
+        front->Stop();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(signing_preflight_can_join_only_the_original_stamp_during_passive_https)
+{
+    LiveMarket live{*this, m_path_root / "preflight-held-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    // Explicit fixture windows, not production defaults. The second
+    // preflight is beyond this ORIGINAL completion window, not its last join.
+    constexpr auto completion{std::chrono::milliseconds{500}};
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "preflight-held-client",
+        error, {completion, std::chrono::milliseconds{1000}})};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto account{SignedCancel(0).signer};
+    const auto original{client->Data(market, account, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(original, error);
+    const auto returned{std::chrono::steady_clock::now()};
+    proxy.HoldRead("updates");
+    std::future<std::optional<flowmesh::MarketData>> read;
+    struct Release { WatchProxy& proxy; ~Release() { proxy.HoldRead({}); proxy.Hold(false); } } const release{proxy};
+    std::string read_error;
+    read = std::async(std::launch::async, [&] {
+        node::FlowMeshClientWorkScope passive{node::FlowMeshClientWorkPriority::PASSIVE, node::FlowMeshClientWorkLinger::NONE};
+        return client->Data(market, account, Page(), read_error);
+    });
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    BOOST_REQUIRE_LT(Elapsed(returned), 400U); // establish the fixture's original-window premise
+    size_t requests{0};
+    { std::lock_guard lock{proxy.mutex}; requests = proxy.methods.size(); }
+    {
+        node::FlowMeshClientWorkScope foreground{node::FlowMeshClientWorkPriority::FOREGROUND};
+        node::FlowMeshSigningPreflightScope preflight;
+        const auto joined{client->Market(market, account)};
+        BOOST_REQUIRE(joined);
+        BOOST_CHECK_MESSAGE(joined->available && joined->certificate_verified && joined->account_state_verified, joined->error);
+        if (joined->certificate_verified) BOOST_CHECK(joined->last_microblock_hash == original->snapshot.last_microblock_hash);
+    }
+    { std::lock_guard lock{proxy.mutex}; BOOST_CHECK_EQUAL(proxy.methods.size(), requests); }
+    std::this_thread::sleep_until(returned + completion + std::chrono::milliseconds{100});
+    {
+        node::FlowMeshClientWorkScope foreground{node::FlowMeshClientWorkPriority::FOREGROUND};
+        node::FlowMeshSigningPreflightScope preflight;
+        const auto expired{client->Market(market, account)};
+        BOOST_REQUIRE(expired);
+        BOOST_CHECK(!expired->available && !expired->certificate_verified);
+        BOOST_CHECK(expired->error.find("already in progress") != std::string::npos);
+    }
+    { std::lock_guard lock{proxy.mutex}; BOOST_CHECK_EQUAL(proxy.methods.size(), requests); }
+    proxy.HoldRead({});
+    proxy.Hold(false);
+    BOOST_REQUIRE_MESSAGE(read.get(), read_error);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(current_failed_refresh_withdraws_its_original_preflight_join)
+{
+    LiveMarket live{*this, m_path_root / "preflight-failed-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "preflight-failed-client",
+        error, {std::chrono::milliseconds{1500}, std::chrono::milliseconds{2000}})};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto account{SignedCancel(0).signer};
+    BOOST_REQUIRE_MESSAGE(client->Data(market, account, Page(), error), error);
+    const auto returned{std::chrono::steady_clock::now()};
+    proxy.corrupt_updates = true;
+    BOOST_CHECK(!client->Data(market, account, Page(), error));
+    BOOST_CHECK(error.find("domain/configuration") != std::string::npos);
+    proxy.corrupt_updates = false;
+    BOOST_REQUIRE_LT(Elapsed(returned), 1000U); // failure, not age, must withdraw the original stamp
+    size_t requests{0};
+    { std::lock_guard lock{proxy.mutex}; requests = proxy.methods.size(); }
+    {
+        node::FlowMeshClientWorkScope foreground{node::FlowMeshClientWorkPriority::FOREGROUND};
+        node::FlowMeshSigningPreflightScope preflight;
+        const auto renewed{client->Market(market, account)};
+        BOOST_REQUIRE(renewed);
+        BOOST_CHECK_MESSAGE(renewed->available && renewed->certificate_verified, renewed->error);
+    }
+    { std::lock_guard lock{proxy.mutex}; BOOST_CHECK_EQUAL(proxy.methods.size(), requests + 1); }
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(explicit_connect_and_reconnect_fence_an_original_preflight_join)
+{
+    LiveMarket live{*this, m_path_root / "preflight-reset-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    unsigned held{0};
+    for (const bool reconnect : {false, true}) {
+        std::string error;
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())},
+            m_path_root / (reconnect ? "preflight-reconnect-client" : "preflight-connect-client"),
+            error, {std::chrono::milliseconds{1500}, std::chrono::milliseconds{2000}})};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        const auto account{SignedCancel(0).signer};
+        BOOST_REQUIRE_MESSAGE(client->Data(market, account, Page(), error), error);
+        const auto returned{std::chrono::steady_clock::now()};
+        proxy.HoldRead("updates");
+        std::future<std::optional<flowmesh::MarketData>> read;
+        struct Release { WatchProxy& proxy; ~Release() { proxy.HoldRead({}); proxy.Hold(false); } } const release{proxy};
+        std::string read_error;
+        read = std::async(std::launch::async, [&] {
+            node::FlowMeshClientWorkScope passive{node::FlowMeshClientWorkPriority::PASSIVE, node::FlowMeshClientWorkLinger::NONE};
+            return client->Data(market, account, Page(), read_error);
+        });
+        BOOST_REQUIRE(proxy.AwaitHeld(++held));
+        if (reconnect) BOOST_REQUIRE(client->Reconnect().endpoint_available);
+        else BOOST_REQUIRE_MESSAGE(client->Connect(Endpoint(front->Port()).url, error), error);
+        BOOST_REQUIRE_LT(Elapsed(returned), 1000U); // establish an otherwise unexpired stamp
+        size_t requests{0};
+        { std::lock_guard lock{proxy.mutex}; requests = proxy.methods.size(); }
+        {
+            node::FlowMeshClientWorkScope foreground{node::FlowMeshClientWorkPriority::FOREGROUND};
+            node::FlowMeshSigningPreflightScope preflight;
+            const auto refused{client->Market(market, account)};
+            BOOST_REQUIRE(refused);
+            BOOST_CHECK(!refused->available && !refused->certificate_verified);
+            BOOST_CHECK(refused->error.find("already in progress") != std::string::npos);
+        }
+        { std::lock_guard lock{proxy.mutex}; BOOST_CHECK_EQUAL(proxy.methods.size(), requests); }
+        proxy.HoldRead({});
+        proxy.Hold(false);
+        BOOST_CHECK(!read.get());
+        BOOST_CHECK(read_error.find("superseded") != std::string::npos);
+        client.reset();
+    }
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(ordinary_read_busy_has_no_queue_and_reconnect_fences_the_held_reply)
+{
+    LiveMarket live{*this, m_path_root / "ordinary-busy-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "ordinary-busy-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    proxy.HoldRead("snapshot");
+    std::future<std::optional<flowmesh::MarketData>> read;
+    struct Release { WatchProxy& proxy; ~Release() { proxy.HoldRead({}); proxy.Hold(false); } } const release{proxy};
+    std::string read_error;
+    read = std::async(std::launch::async, [&] { return client->Data(market, std::nullopt, Page(), read_error); });
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    const auto started{std::chrono::steady_clock::now()};
+    for (int attempt{0}; attempt < 16; ++attempt) {
+        std::string busy_error;
+        BOOST_CHECK(!client->Data(market, std::nullopt, Page(), busy_error));
+        BOOST_CHECK(busy_error.find("already in progress") != std::string::npos);
+    }
+    BOOST_CHECK_LT(Elapsed(started), 500U);
+    {
+        std::lock_guard lock{proxy.mutex};
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "snapshot"), 1);
+    }
+    const auto reconnected{client->Reconnect()};
+    BOOST_REQUIRE_MESSAGE(reconnected.endpoint_available, reconnected.error);
+    const auto newer{client->Status()};
+    proxy.HoldRead({});
+    proxy.Hold(false);
+    BOOST_CHECK(!read.get());
+    BOOST_CHECK(read_error.find("superseded") != std::string::npos);
+    const auto after{client->Status()};
+    BOOST_CHECK_EQUAL(after.active_endpoint, newer.active_endpoint);
+    BOOST_CHECK_EQUAL(after.endpoints.at(0).last_attempt_ms, newer.endpoints.at(0).last_attempt_ms);
+    BOOST_CHECK(after.endpoints.at(0).last_error.empty());
+    error.clear();
+    const auto recovered{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(recovered, error);
+    BOOST_CHECK(recovered->certificate_verified && recovered->account_state_verified);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(ordinary_read_endpoint_observations_do_not_starve_a_valid_held_body)
+{
+    LiveMarket live{*this, m_path_root / "ordinary-observed-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "ordinary-observed-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    proxy.HoldRead("snapshot");
+    std::future<std::optional<flowmesh::MarketData>> read;
+    struct Release { WatchProxy& proxy; ~Release() { proxy.HoldRead({}); proxy.Hold(false); } } const release{proxy};
+    std::string read_error;
+    read = std::async(std::launch::async, [&] { return client->Data(market, std::nullopt, Page(), read_error); });
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    for (int attempt{0}; attempt < 4; ++attempt) BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto observed{client->Status()};
+    proxy.HoldRead({});
+    proxy.Hold(false);
+    const auto data{read.get()};
+    BOOST_REQUIRE_MESSAGE(data, read_error);
+    BOOST_CHECK(data->certificate_verified && data->account_state_verified);
+    BOOST_CHECK_EQUAL(data->snapshot.next_microblock_sequence, 1U);
+    const auto after{client->Status()};
+    // The valid body is applied, but cannot overwrite newer transport rows.
+    BOOST_CHECK_EQUAL(after.endpoints.at(0).last_attempt_ms, observed.endpoints.at(0).last_attempt_ms);
+    BOOST_CHECK_EQUAL(after.active_endpoint, observed.active_endpoint);
+    {
+        std::lock_guard lock{proxy.mutex};
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "submit"), 0);
+    }
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(ordinary_snapshot_rechecks_connected_authority_before_publication)
+{
+    LiveMarket live{*this, m_path_root / "ordinary-authority-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "ordinary-authority-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    proxy.HoldRead("snapshot");
+    std::future<std::optional<flowmesh::MarketData>> read;
+    struct Release { WatchProxy& proxy; ~Release() { proxy.HoldRead({}); proxy.Hold(false); } } const release{proxy};
+    std::string read_error;
+    read = std::async(std::launch::async, [&] { return client->Data(market, std::nullopt, Page(), read_error); });
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    live.Deposit();
+    const auto checkpoint{live.service->NextCheckpointMpa(market, error)};
+    BOOST_REQUIRE_MESSAGE(checkpoint, error);
+    BOOST_REQUIRE_EQUAL(checkpoint->sequence, 1U);
+    ConnectMpaBlock({checkpoint->record});
+    proxy.HoldRead({});
+    proxy.Hold(false);
+    BOOST_CHECK(!read.get());
+    BOOST_CHECK(read_error.find("checkpoint") != std::string::npos);
+    error.clear();
+    const auto recovered{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(recovered, error);
+    BOOST_CHECK_EQUAL(recovered->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(recovered->b3_checkpoint_confirmed);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(superseded_ordinary_updates_do_not_clear_a_newer_watch_join)
+{
+    LiveMarket live{*this, m_path_root / "ordinary-superseded-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    // Disclosed test windows make the post-release join deterministic; no
+    // production freshness window or polling policy changes.
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "ordinary-superseded-client",
+        error, {std::chrono::milliseconds{5000}, std::chrono::milliseconds{5000}})};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto account{SignedCancel(0).signer};
+    BOOST_REQUIRE_MESSAGE(client->Data(market, account, Page(), error), error);
+    proxy.HoldRead("updates");
+    std::future<std::optional<flowmesh::MarketData>> read;
+    struct Release { WatchProxy& proxy; ~Release() { proxy.HoldRead({}); proxy.Hold(false); } } const release{proxy};
+    std::string read_error;
+    read = std::async(std::launch::async, [&] { return client->Data(market, account, Page(), read_error); });
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    interfaces::FlowMeshMarketWatch watch;
+    const auto newer{client->Watch(market, account, Page(), std::chrono::milliseconds{300}, watch, error)};
+    BOOST_REQUIRE_MESSAGE(newer, error);
+    BOOST_REQUIRE(watch.supported && watch.waited);
+    proxy.HoldRead({});
+    proxy.Hold(false);
+    BOOST_CHECK(!read.get());
+    BOOST_CHECK(read_error.find("superseded") != std::string::npos);
+    size_t requests{0};
+    { std::lock_guard lock{proxy.mutex}; requests = proxy.methods.size(); }
+    {
+        node::FlowMeshClientWorkScope foreground{node::FlowMeshClientWorkPriority::FOREGROUND};
+        node::FlowMeshSigningPreflightScope preflight;
+        const auto joined{client->Market(market, account)};
+        BOOST_REQUIRE(joined);
+        BOOST_CHECK_MESSAGE(joined->available && joined->certificate_verified, joined->error);
+    }
+    { std::lock_guard lock{proxy.mutex}; BOOST_CHECK_EQUAL(proxy.methods.size(), requests); }
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(ordinary_read_refuses_a_same_path_ca_replaced_while_reply_is_held)
+{
+    LiveMarket live{*this, m_path_root / "ordinary-ca-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    const auto original_ca{m_path_root / "ordinary-original-public-ca.pem"};
+    fs::copy_file(cert, original_ca, fs::copy_options::none);
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "ordinary-ca-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    proxy.HoldRead("snapshot");
+    std::future<std::optional<flowmesh::MarketData>> read;
+    struct Release {
+        WatchProxy& proxy;
+        const fs::path ca, original;
+        ~Release() {
+            proxy.HoldRead({}); proxy.Hold(false);
+            try { fs::copy_file(original, ca, fs::copy_options::overwrite_existing); } catch (...) {}
+        }
+    } const release{proxy, cert, original_ca};
+    std::string read_error;
+    read = std::async(std::launch::async, [&] { return client->Data(market, std::nullopt, Page(), read_error); });
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    const auto previous_time{fs::last_write_time(cert)};
+    std::string replacement_pin;
+    HttpsFixture::CreateCertificate(cert, m_path_root / "ordinary-replacement-test-key.pem", replacement_pin, true);
+    fs::last_write_time(cert, previous_time);
+    proxy.HoldRead({});
+    proxy.Hold(false);
+    BOOST_CHECK(!read.get());
+    BOOST_CHECK(read_error.find("ca-material-changed") != std::string::npos);
+    fs::copy_file(original_ca, cert, fs::copy_options::overwrite_existing);
+    const auto recovered{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(recovered, error);
+    BOOST_CHECK(recovered->certificate_verified);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(ordinary_snapshot_failed_save_never_publishes_or_joins_an_older_head)
+{
+#ifdef WIN32
+    BOOST_TEST_MESSAGE("Needs RLIMIT_FSIZE to fail the outbox write; native guarded fault fixture covers the separate second save");
+#else
+    LiveMarket live{*this, m_path_root / "ordinary-save-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "ordinary-save-client",
+        error, {std::chrono::milliseconds{5000}, std::chrono::milliseconds{5000}})};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto action{SignedCancel(0)};
+    const auto initial{client->Data(market, action.signer, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(initial, error);
+    BOOST_REQUIRE_EQUAL(initial->snapshot.next_microblock_sequence, 1U);
+    const auto submitted{client->Submit(market, action)};
+    BOOST_REQUIRE_MESSAGE(submitted.state != "rejected", submitted.reason);
+    BOOST_REQUIRE(live.WaitSequence(2));
+    {
+        ScopedFailedFileWrites full_disk;
+        BOOST_CHECK(!client->Data(market, action.signer, Page(), error));
+        BOOST_CHECK(error.find("LevelDB") != std::string::npos);
+        node::FlowMeshClientWorkScope foreground{node::FlowMeshClientWorkPriority::FOREGROUND};
+        node::FlowMeshSigningPreflightScope preflight;
+        const auto refused{client->Market(market, action.signer)};
+        BOOST_REQUIRE(refused);
+        BOOST_CHECK(!refused->available && !refused->certificate_verified);
+        BOOST_CHECK(refused->error.find("LevelDB") != std::string::npos);
+    }
+    error.clear();
+    const auto recovered{client->Data(market, action.signer, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(recovered, error);
+    BOOST_CHECK_EQUAL(recovered->snapshot.next_microblock_sequence, 2U);
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved.front().previously_certified && saved.front().receipt.certificate_verified);
+    BOOST_CHECK(client->ActionStatus(market, action.Id(), true).certificate_verified);
+    { std::lock_guard lock{proxy.mutex}; BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "submit"), 1); }
+    client.reset();
+    front->Stop();
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(watch_head_change_snapshot_leaves_work_free_and_busy_reads_refuse)
+{
+    LiveMarket live{*this, m_path_root / "watch-snapshot-held-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-snapshot-held-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    live.Deposit();
+    proxy.HoldRead("snapshot");
+    std::future<Watched> read;
+    std::future<interfaces::FlowMeshActionReceipt> status;
+    struct Release { WatchProxy& proxy; ~Release() { proxy.HoldRead({}); proxy.Hold(false); } } const release{proxy};
+    std::string read_error;
+    read = std::async(std::launch::async, [&] { return WatchRead(*client, market, std::chrono::milliseconds{1500}, read_error); });
+    BOOST_REQUIRE(proxy.AwaitHeld(2)); // one watched page, then its snapshot
+    status = std::async(std::launch::async, [&] { return client->ActionStatus(market, uint256::ONE, false); });
+    const bool status_during_hold{status.wait_for(std::chrono::seconds{1}) == std::future_status::ready};
+    std::string busy;
+    BOOST_CHECK(!client->Data(market, std::nullopt, Page(), busy));
+    BOOST_CHECK(busy.find("already in progress") != std::string::npos);
+    proxy.HoldRead({});
+    proxy.Hold(false);
+    (void)status.get();
+    const auto [data, watch]{read.get()};
+    BOOST_CHECK(status_during_hold);
+    BOOST_REQUIRE_MESSAGE(data, read_error);
+    BOOST_CHECK_EQUAL(data->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(watch.supported && watch.waited);
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(superseded_watch_timeout_does_not_shrink_the_next_watch_budget)
+{
+    LiveMarket live{*this, m_path_root / "watch-stale-overhead-service", {std::chrono::milliseconds{2000}, 8}};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "watch-stale-overhead-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    proxy.Hold(true);
+    std::future<Watched> read;
+    struct Release { WatchProxy& proxy; ~Release() { proxy.Hold(false); } } const release{proxy};
+    std::string read_error;
+    read = std::async(std::launch::async, [&] { return WatchRead(*client, market, std::chrono::milliseconds{300}, read_error); });
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    // A complete newer read supersedes this watch's cache and endpoint
+    // observations. The deliberately late old timeout is not a lane sample.
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
+    std::this_thread::sleep_for(std::chrono::milliseconds{2600});
+    size_t requests{0};
+    { std::lock_guard lock{proxy.mutex}; requests = proxy.methods.size(); }
+    proxy.Hold(false);
+    const auto [stale, stale_watch]{read.get()};
+    BOOST_CHECK(!stale);
+    BOOST_CHECK_EQUAL(stale_watch.status, "superseded");
+    BOOST_CHECK(read_error.find("superseded") != std::string::npos);
+    { std::lock_guard lock{proxy.mutex}; BOOST_CHECK_EQUAL(proxy.methods.size(), requests); }
+    const auto [current, current_watch]{WatchRead(*client, market, std::chrono::milliseconds{1500}, error)};
+    BOOST_REQUIRE_MESSAGE(current, error);
+    BOOST_CHECK_EQUAL(current_watch.status, "timeout");
+    { std::lock_guard lock{proxy.mutex}; BOOST_REQUIRE_EQUAL(proxy.watch_waits.size(), 2U); BOOST_CHECK_EQUAL(proxy.watch_waits.back(), 1500U); }
+    client.reset();
+    front->Stop();
+}
 
 BOOST_AUTO_TEST_CASE(watch_applies_a_commit_through_the_verified_snapshot)
 {
@@ -5688,11 +6218,15 @@ BOOST_AUTO_TEST_CASE(watch_lane_leaves_work_gate_free_and_times_out_quietly)
     BOOST_CHECK(!second_watch.supported && !second_watch.waited);
     BOOST_CHECK_LT(Elapsed(second_start), 800U);
     const auto [data, watch]{pending.get()};
-    BOOST_REQUIRE(data);
-    BOOST_CHECK_EQUAL(watch.status, "timeout");
-    BOOST_CHECK(watch.supported && watch.waited && !watch.gap);
+    // The ordinary reads superseded this post-flight response. Refusal is
+    // explicit, and it starts no extra ordinary network walk.
+    BOOST_CHECK(!data);
+    BOOST_CHECK_EQUAL(watch.status, "superseded");
+    BOOST_CHECK(!watch.supported && !watch.waited && !watch.gap);
     BOOST_CHECK_GE(Elapsed(start), 1150U);
-    BOOST_CHECK(data->snapshot.last_microblock_hash == before->snapshot.last_microblock_hash);
+    const auto current{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(current, error);
+    BOOST_CHECK(current->snapshot.last_microblock_hash == before->snapshot.last_microblock_hash);
     client.reset();
 }
 
@@ -5768,13 +6302,18 @@ BOOST_AUTO_TEST_CASE(watch_superseded_cursor_is_not_applied)
     const auto ordinary{client->Data(market, std::nullopt, Page(), error)};
     BOOST_REQUIRE_MESSAGE(ordinary, error);
     BOOST_CHECK_EQUAL(ordinary->snapshot.next_microblock_sequence, 2U);
+    size_t requests{0};
+    { std::lock_guard lock{proxy.mutex}; requests = proxy.methods.size(); }
     proxy.Hold(false);
     const auto [data, watch]{pending.get()};
-    BOOST_REQUIRE(data);
+    BOOST_CHECK(!data);
     BOOST_CHECK_EQUAL(watch.status, "superseded");
     BOOST_CHECK(!watch.supported && !watch.waited);
-    BOOST_CHECK(data->snapshot.last_microblock_hash == ordinary->snapshot.last_microblock_hash);
-    BOOST_CHECK(!data->event_gap);
+    { std::lock_guard lock{proxy.mutex}; BOOST_CHECK_EQUAL(proxy.methods.size(), requests); }
+    const auto current{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(current, error);
+    BOOST_CHECK(current->snapshot.last_microblock_hash == ordinary->snapshot.last_microblock_hash);
+    BOOST_CHECK(!current->event_gap);
     client.reset();
     front->Stop();
 }
@@ -5864,14 +6403,20 @@ BOOST_AUTO_TEST_CASE(watch_rechecks_local_authority_after_its_wait)
     BOOST_REQUIRE_MESSAGE(checkpoint, error);
     BOOST_REQUIRE_EQUAL(checkpoint->sequence, 1U);
     ConnectMpaBlock({checkpoint->record});
+    size_t requests{0};
+    { std::lock_guard lock{proxy.mutex}; requests = proxy.methods.size(); }
     proxy.Hold(false);
     const auto [data, watch]{pending.get()};
-    BOOST_REQUIRE(data);
+    BOOST_CHECK(!data);
     BOOST_CHECK_EQUAL(watch.status, "revalidate");
     BOOST_CHECK(!watch.supported);
-    // The ordinary read re-verified, reported the gap and moved past the checkpoint.
-    BOOST_CHECK_EQUAL(data->snapshot.next_microblock_sequence, 2U);
-    BOOST_CHECK(data->event_gap);
+    { std::lock_guard lock{proxy.mutex}; BOOST_CHECK_EQUAL(proxy.methods.size(), requests); }
+    // A separately requested read re-verifies, reports the gap and moves
+    // past the checkpoint; the old watch cannot perform it implicitly.
+    const auto current{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(current, error);
+    BOOST_CHECK_EQUAL(current->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(current->event_gap);
     client.reset();
     front->Stop();
 }
@@ -6318,6 +6863,8 @@ struct TickProxy {
     //! 10 s: a head refresh made on behalf of that page.
     bool hold_refresh_after_candles{false}, candles_served{false}, released{false};
     size_t held{0};
+    bool reject_ticks_once{false}, hold_tick_rejection{false};
+    size_t tick_rejections{0};
     //! The last sequence of the newest candle of the last page served, as
     //! the endpoint served it.
     std::optional<uint64_t> served_newest;
@@ -6336,6 +6883,16 @@ struct TickProxy {
             inject = advert;
             corrupt = tamper;
             ahead = candles_ahead;
+            if (method == "updates" && json["params"].exists("ticks") && reject_ticks_once) {
+                reject_ticks_once = false;
+                ++tick_rejections;
+                changed.notify_all();
+                if (hold_tick_rejection) changed.wait_for(lock, std::chrono::seconds{5}, [&] { return released; });
+                UniValue rejection{UniValue::VOBJ};
+                rejection.pushKV("ok", false);
+                rejection.pushKV("error", node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+                return {400, rejection.write()};
+            }
             if ((method == "updates" || method == "snapshot") && hold_refresh_after_candles && candles_served && !released) {
                 ++held;
                 changed.notify_all();
@@ -6434,6 +6991,39 @@ flowmesh::MarketDataQuery TickPage()
     return query;
 }
 } // namespace
+
+BOOST_AUTO_TEST_CASE(stale_tick_rejection_cannot_withdraw_a_newer_advertisement)
+{
+    LiveMarket live{*this, m_path_root / "ticks-stale-rejection-service", {}, {16}};
+    TickProxy proxy{.upstream = live.Endpoint()};
+    auto front{TickProxyServer(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())}, m_path_root / "ticks-stale-rejection-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, TickPage(), error), error);
+    { std::lock_guard lock{proxy.mutex}; proxy.reject_ticks_once = true; proxy.hold_tick_rejection = true; }
+    std::future<std::optional<flowmesh::MarketData>> read;
+    struct Release {
+        TickProxy& proxy;
+        ~Release() { { std::lock_guard lock{proxy.mutex}; proxy.released = true; } proxy.changed.notify_all(); }
+    } const release{proxy};
+    std::string read_error;
+    read = std::async(std::launch::async, [&] { return client->Data(market, std::nullopt, TickPage(), read_error); });
+    { std::unique_lock lock{proxy.mutex}; BOOST_REQUIRE(proxy.changed.wait_for(lock, std::chrono::seconds{5}, [&] { return proxy.tick_rejections == 1; })); }
+    // A newer successful response advertises ticks before the old unknown-
+    // field reply arrives. The local undecorated retry is still allowed.
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    { std::lock_guard lock{proxy.mutex}; proxy.released = true; }
+    proxy.changed.notify_all();
+    BOOST_REQUIRE_MESSAGE(read.get(), read_error);
+    const auto before{proxy.TickParams().size()};
+    BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, TickPage(), error), error);
+    BOOST_CHECK_EQUAL(proxy.TickParams().size(), before + 1);
+    { std::lock_guard lock{proxy.mutex}; BOOST_CHECK_EQUAL(proxy.tick_rejections, 1U); }
+    client.reset();
+    front->Stop();
+}
 
 namespace {
 //! A remote candles page within `head`: no candle goes past it, and the page
