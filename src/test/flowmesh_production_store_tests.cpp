@@ -813,6 +813,9 @@ BOOST_AUTO_TEST_CASE(market_history_records_the_rationed_side_across_handoff_and
                                   scenario.domain, scenario.market,
                                   scenario.seats0.seats, initial_root, error),
                               error);
+        const auto empty_history{store.ReadHistorySnapshot()};
+        BOOST_REQUIRE(empty_history);
+        BOOST_CHECK(empty_history->entries.empty());
         flowmesh::FlowMeshState committed{scenario.state0};
         BOOST_REQUIRE_MESSAGE(store.AppendExecution(
                                   scenario.execution0.entry,
@@ -823,6 +826,11 @@ BOOST_AUTO_TEST_CASE(market_history_records_the_rationed_side_across_handoff_and
                                   scenario.treasury, &scenario.chain_facts,
                                   committed, error),
                               error);
+        const auto first_history{store.ReadHistorySnapshot()};
+        BOOST_REQUIRE(first_history);
+        BOOST_REQUIRE_EQUAL(first_history->entries.size(), 1U);
+        BOOST_CHECK(empty_history->entries.empty());
+        BOOST_CHECK(first_history->entries.front().microblock_hash == scenario.execution0.entry.GetHash());
         BOOST_REQUIRE_MESSAGE(store.MarkExecutionCheckpointConnected(
                                   execution_checkpoint, scenario.seats0.seats,
                                   {240, Filled(0xa0)}, error),
@@ -851,6 +859,12 @@ BOOST_AUTO_TEST_CASE(market_history_records_the_rationed_side_across_handoff_and
                                   next, error),
                               error);
         check_sides(store.ReadMarketHistory(3, 50));
+        const auto frozen_history{store.ReadHistorySnapshot()};
+        BOOST_REQUIRE(frozen_history);
+        BOOST_CHECK(frozen_history == store.ReadHistorySnapshot());
+        check_sides(frozen_history->Page(3, 50));
+        BOOST_CHECK_EQUAL(first_history->entries.size(), 1U);
+        BOOST_CHECK_LE(frozen_history->entries.size(), flowmesh::MARKET_DATA_HISTORY_CAPACITY);
         // The same cache as consecutive clearing ticks, oldest first.
         const auto ticks{store.ReadClearingTicks({})};
         BOOST_REQUIRE(ticks.available);
@@ -883,6 +897,7 @@ BOOST_AUTO_TEST_CASE(market_history_records_the_rationed_side_across_handoff_and
                           error);
     // Nothing before the replay that rebuilds the cache.
     const auto early{reopened.ReadClearingTicks({})};
+    BOOST_CHECK(!reopened.ReadHistorySnapshot());
     BOOST_CHECK(!early.available);
     BOOST_CHECK_EQUAL(early.unavailable_reason, "history_not_ready");
     SeatSource source;
@@ -899,6 +914,9 @@ BOOST_AUTO_TEST_CASE(market_history_records_the_rationed_side_across_handoff_and
                               scenario.treasury, &scenario.chain_facts, error),
                           error);
     check_sides(reopened.ReadMarketHistory(3, 50));
+    const auto replay_history{reopened.ReadHistorySnapshot()};
+    BOOST_REQUIRE(replay_history);
+    check_sides(replay_history->Page(3, 50));
     BOOST_CHECK_EQUAL(reopened.ReadClearingTicks({}).ticks.size(), 3U);
 }
 
@@ -1768,10 +1786,14 @@ BOOST_AUTO_TEST_CASE(append_returns_outcome_record_from_its_own_reexecution)
     auto bad_certificate{scenario.certificate0};
     bad_certificate.aggregate_signature[0] ^= 1;
     auto outcome{node::MakeProductionOutcomeRecord(9, Filled(1), {}, {})};
+    const auto before{store.ReadHistorySnapshot()};
+    BOOST_REQUIRE(before);
     BOOST_CHECK(!store.AppendExecution(scenario.execution0.entry, bad_certificate, scenario.seats0.seats,
                                        scenario.state0, anchors, scenario.treasury, &scenario.chain_facts,
                                        output, error, nullptr, &outcome));
     BOOST_CHECK(!outcome); // reset on entry, never set by a refused append
+    BOOST_CHECK(store.ReadHistorySnapshot() == before);
+    BOOST_CHECK(before->entries.empty());
     BOOST_REQUIRE_MESSAGE(store.AppendExecution(scenario.execution0.entry, scenario.certificate0,
                                                 scenario.seats0.seats, scenario.state0, anchors,
                                                 scenario.treasury, &scenario.chain_facts, output, error,

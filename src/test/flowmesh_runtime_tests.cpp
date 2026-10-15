@@ -9,6 +9,7 @@
 #include <flowmesh/market_view.h>
 #include <flowmesh/outcome_evidence.h>
 #include <hash.h>
+#include <kernel/cs_main.h>
 #include <logging.h>
 #include <node/flowmesh_action_pool.h>
 #include <node/flowmesh_client.h>
@@ -37,6 +38,23 @@
 #include <vector>
 
 namespace {
+
+// Apple's C++20 library here does not yet provide std::jthread. Keep the
+// exception-safe join guarantee, including failure to construct a sibling.
+class JoiningTestThread {
+    std::function<void()> m_before_join;
+    std::thread m_thread;
+public:
+    template <typename Fn>
+    explicit JoiningTestThread(Fn&& fn, std::function<void()> before_join = {})
+        : m_before_join{std::move(before_join)}, m_thread{std::forward<Fn>(fn)} {}
+    ~JoiningTestThread()
+    {
+        if (m_before_join) m_before_join();
+        join();
+    }
+    void join() { if (m_thread.joinable()) m_thread.join(); }
+};
 
 node::FlowMeshRelayResult LegacyRelayResult()
 {
@@ -2123,6 +2141,8 @@ BOOST_AUTO_TEST_CASE(critical_certificate_append_store_failure_still_halts)
 {
     DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_append_store_failure",
                             node::FlowMeshDeliveryAdmission::ADMITTED};
+    const auto before_state{f.runtime->StateView(f.market)};
+    BOOST_REQUIRE(before_state);
     const auto original{f.Sent()};
     const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
         return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
@@ -2146,6 +2166,17 @@ BOOST_AUTO_TEST_CASE(critical_certificate_append_store_failure_still_halts)
     BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
     BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 0U);
     BOOST_CHECK_EQUAL(f.Snapshot().deferred_objects, 0U);
+    BOOST_CHECK(f.runtime->StateView(f.market) == before_state);
+    const auto data{f.runtime->MarketData(f.market, std::nullopt, {}, error)};
+    BOOST_REQUIRE(data);
+    BOOST_CHECK(!data->snapshot.certified);
+    BOOST_CHECK(data->snapshot.state_root == before_state->Root());
+    BOOST_CHECK(!f.runtime->ClientSnapshot(f.market, error));
+    const auto events{f.runtime->ClientEvents(std::nullopt, f.market, std::nullopt)};
+    BOOST_CHECK(std::none_of(events.events.begin(), events.events.end(), [](const auto& event) {
+        return event.kind == flowmesh::ClientEventKind::CERTIFIED_HEAD ||
+               event.kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED;
+    }));
 }
 
 BOOST_AUTO_TEST_CASE(critical_durable_certificate_retries_after_candidate_cleanup_and_disarm)
@@ -2803,8 +2834,9 @@ BOOST_AUTO_TEST_CASE(market_data_reads_ticks_and_copies_curves_on_an_unchanged_h
         flowmesh::QueueResult::ACCEPTED);
     BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
     BOOST_REQUIRE_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 2U);
-    // Any read drops the copy of a head that is no longer current.
-    BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 1U);
+    // Publication drops the current cache slot for the old head immediately;
+    // the caller's retained immutable first->book remains valid.
+    BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 0U);
     BOOST_REQUIRE(f.runtime->MarketData(f.market, std::nullopt, {}, error));
     BOOST_CHECK_EQUAL(f.runtime->BookCapturesForTest(), 0U);
     const auto moved{f.runtime->MarketData(f.market, std::nullopt, views, error)};
@@ -6953,7 +6985,8 @@ class HealthRuntimeFixture
 public:
     explicit HealthRuntimeFixture(const fs::path& path,
                                   std::shared_ptr<node::FlowMeshObservedTimeLog> observed = nullptr,
-                                  const size_t entry_count = 3)
+                                  const size_t entry_count = 3,
+                                  const node::FlowMeshRecentWindowLimits recent = {})
         : store{DBParams{.path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}}
     {
         chain.m_domain = domain;
@@ -6964,15 +6997,17 @@ public:
         config.chain = &chain;
         config.keys = &keys;
         config.clock = &clock;
+        config.recent_window = recent;
         config.relay = [this](node::FlowMeshRuntimeRelay relay) {
             std::unique_lock<std::mutex> lock{relay_mutex};
             if (relay.message.kind == flowmesh::WireMessageKind::GET) {
                 gets.push_back(relay);
-                if (block_gets) {
-                    relay_blocked = true;
-                    relay_cv.notify_all();
-                    relay_cv.wait(lock, [&] { return !block_gets; });
-                }
+            }
+            if ((relay.message.kind == flowmesh::WireMessageKind::GET && block_gets) ||
+                (relay.message.kind == flowmesh::WireMessageKind::CERTIFICATE && block_certificates)) {
+                relay_blocked = true;
+                relay_cv.notify_all();
+                relay_cv.wait(lock, [&] { return !block_gets && !block_certificates; });
             }
             return LegacyRelayResult();
         };
@@ -7005,6 +7040,7 @@ public:
         {
             std::lock_guard<std::mutex> lock{relay_mutex};
             block_gets = false;
+            block_certificates = false;
         }
         relay_cv.notify_all();
         runtime->Stop();
@@ -7071,7 +7107,7 @@ public:
     std::vector<std::vector<unsigned char>> payloads;
     std::mutex relay_mutex;
     std::condition_variable relay_cv;
-    bool block_gets{false}, relay_blocked{false};
+    bool block_gets{false}, block_certificates{false}, relay_blocked{false};
     std::vector<node::FlowMeshRuntimeRelay> gets;
     std::unique_ptr<node::FlowMeshRuntime> runtime;
 };
@@ -7560,6 +7596,247 @@ BOOST_AUTO_TEST_CASE(health_snapshot_is_readable_while_the_worker_is_blocked)
     }
     f.relay_cv.notify_all();
     BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+}
+
+BOOST_AUTO_TEST_CASE(health_snapshot_is_readable_while_chain_lock_is_held)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_health_chain_blocked"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    const auto before{f.Health()};
+
+    std::promise<void> held;
+    auto held_future{held.get_future()};
+    std::promise<void> read_completed;
+    auto read_completed_future{read_completed.get_future()};
+    bool observed_before_release{false};
+    JoiningTestThread chain_owner{[&] {
+        LOCK(::cs_main);
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{3}};
+        held.set_value();
+        // Observe completion WHILE the real chain lock is held. Merely
+        // observing a ready future on the caller could run after release.
+        observed_before_release = read_completed_future.wait_until(deadline) == std::future_status::ready;
+        std::this_thread::sleep_until(deadline);
+    }};
+    held_future.wait();
+    std::shared_ptr<const node::FlowMeshRuntimeHealthSnapshot> health;
+    JoiningTestThread reader{[&] {
+        health = f.runtime->HealthSnapshot();
+        read_completed.set_value();
+    }};
+    // RAII also joins if construction of the second thread throws.
+    chain_owner.join();
+    reader.join();
+    BOOST_CHECK(observed_before_release);
+    BOOST_REQUIRE(health);
+    BOOST_CHECK(health == before);
+    BOOST_CHECK(health->published_at == before->published_at);
+}
+
+BOOST_AUTO_TEST_CASE(certified_reads_do_not_wait_for_a_blocked_market_worker)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_certified_read_blocked"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    f.Certificate(8, 0);
+    const auto before{f.runtime->ClientSnapshot(f.market, error)};
+    BOOST_REQUIRE_MESSAGE(before, error);
+    {
+        std::lock_guard lock{f.relay_mutex};
+        f.block_gets = true;
+    }
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(8, {flowmesh::WireMessageKind::HELLO,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 4},
+        flowmesh::EncodeMarketHello({f.domain, Filled(0x7a)})}) == flowmesh::QueueResult::ACCEPTED);
+    {
+        std::unique_lock lock{f.relay_mutex};
+        BOOST_REQUIRE(f.relay_cv.wait_for(lock, std::chrono::seconds{5}, [&] { return f.relay_blocked; }));
+    }
+    // The GET relay holds m_market_mutex. All readers below must answer from
+    // one already-durable version, without consulting the blocked worker.
+    auto reader{std::async(std::launch::async, [&] {
+        std::string read_error;
+        const auto status{f.runtime->MarketStatus(f.market)};
+        const auto state{f.runtime->StateSnapshot(f.market)};
+        flowmesh::MarketDataQuery query;
+        query.ticks = flowmesh::ClearingTickQuery{};
+        query.indicative = flowmesh::IndicativeQuery{};
+        const auto data{f.runtime->MarketData(f.market, std::nullopt, query, read_error)};
+        const auto snapshot{f.runtime->ClientSnapshotView(f.market, std::nullopt, read_error)};
+        const auto payload{f.runtime->ClientCertifiedEntry(f.market, 0, read_error)};
+        return status && state && data && snapshot && payload &&
+            status->next_sequence == 1 && status->last_microblock_hash == f.entries[0].GetHash() &&
+            status->state_root == state->Root() && data->snapshot.state_root == state->Root() &&
+            data->snapshot.next_microblock_sequence == 1 &&
+            snapshot->reported.snapshot.last_microblock_hash == f.entries[0].GetHash() &&
+            snapshot->evidence.certified_payload == before->certified_payload &&
+            snapshot->evidence.state_bytes == before->state_bytes && *payload == before->certified_payload;
+    })};
+    const bool answered_while_blocked{reader.wait_for(std::chrono::seconds{1}) == std::future_status::ready};
+    {
+        std::lock_guard lock{f.relay_mutex};
+        f.block_gets = false;
+    }
+    f.relay_cv.notify_all();
+    const bool coherent{reader.get()};
+    BOOST_CHECK_MESSAGE(answered_while_blocked, "certified read waited for the worker's market lock");
+    BOOST_CHECK(coherent);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+}
+
+BOOST_AUTO_TEST_CASE(certified_read_versions_are_immutable_and_survive_rejected_certificate_and_restart)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_certified_read_versions"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    f.Certificate(8, 0);
+    const auto first{f.runtime->StateView(f.market)};
+    BOOST_REQUIRE(first);
+    const auto first_root{first->Root()};
+    const auto first_bytes{flowmesh::EncodeClientState(*first, error)};
+    const auto first_evidence{f.runtime->ClientSnapshot(f.market, error)};
+    BOOST_REQUIRE(first_bytes && first_evidence);
+
+    auto invalid{f.payloads[1]};
+    invalid.back() ^= 1;
+    f.Send(8, {flowmesh::WireMessageKind::CERTIFICATE,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, invalid});
+    BOOST_CHECK(f.runtime->StateView(f.market) == first);
+    const auto after_invalid{f.runtime->ClientSnapshot(f.market, error)};
+    BOOST_REQUIRE(after_invalid);
+    BOOST_CHECK(after_invalid->certified_payload == first_evidence->certified_payload);
+
+    f.Certificate(8, 1);
+    const auto second{f.runtime->StateView(f.market)};
+    const auto second_evidence{f.runtime->ClientSnapshot(f.market, error)};
+    BOOST_REQUIRE(second && second_evidence);
+    BOOST_CHECK(second != first);
+    BOOST_CHECK(first->Root() == first_root);
+    BOOST_CHECK(flowmesh::EncodeClientState(*first, error) == first_bytes);
+    BOOST_CHECK(second->Root() == f.entries[1].state_root);
+    f.runtime->Stop();
+    node::FlowMeshRuntimeConfig config;
+    config.chain = &f.chain; config.keys = &f.keys; config.clock = &f.clock;
+    config.relay = [](node::FlowMeshRuntimeRelay) { return LegacyRelayResult(); };
+    auto restored{MarketConfig(f.domain, f.market, f.treasury, f.seats.seats, *second, f.store, nullptr)};
+    restored.next_sequence = 2;
+    restored.next_effect_index = f.entries[1].effect_start + f.entries[1].effect_count;
+    restored.last_microblock_hash = f.entries[1].GetHash();
+    f.runtime = std::make_unique<node::FlowMeshRuntime>(config,
+        std::vector<node::FlowMeshRuntimeMarketConfig>{std::move(restored)});
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    const auto reopened{f.runtime->ClientSnapshot(f.market, error)};
+    BOOST_REQUIRE_MESSAGE(reopened, error);
+    BOOST_CHECK(reopened->certified_payload == second_evidence->certified_payload);
+    BOOST_CHECK(reopened->state_bytes == second_evidence->state_bytes);
+    BOOST_CHECK(first->Root() == first_root);
+}
+
+BOOST_AUTO_TEST_CASE(certified_read_publication_precedes_events_and_never_mixes_heads)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_certified_read_events", nullptr, 12};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    f.Certificate(8, 0);
+    std::atomic<bool> stop{false}, coherent{true};
+    std::atomic<size_t> reads{0};
+    JoiningTestThread reader{[&] {
+        const flowmesh::ClientEvidencePins pins{f.domain, f.market, f.asset, f.vault, f.initial.ConfigId()};
+        while (!stop.load()) {
+            std::string read_error;
+            const auto events{f.runtime->ClientEvents(std::nullopt, f.market, std::nullopt)};
+            const auto view{f.runtime->ClientSnapshotView(f.market, std::nullopt, read_error)};
+            if (!view) { coherent = false; break; }
+            const auto verified{flowmesh::VerifyClientStateEvidence(pins, view->evidence, f.seats.seats,
+                [&](const flowmesh::AnchorRef& anchor) { return f.chain.StillCanonical(anchor); }, read_error)};
+            if (!verified || verified->certified.entry.GetHash() != view->reported.snapshot.last_microblock_hash ||
+                verified->state.Root() != view->reported.snapshot.state_root ||
+                verified->certified.entry.sequence + 1 != view->reported.snapshot.next_microblock_sequence) {
+                coherent = false; break;
+            }
+            for (const auto& event : events.events) {
+                if (event.kind == flowmesh::ClientEventKind::CERTIFIED_HEAD &&
+                    event.microblock_sequence >= view->reported.snapshot.next_microblock_sequence) coherent = false;
+            }
+            ++reads;
+        }
+    }, [&] { stop = true; }};
+    BOOST_REQUIRE(WaitUntil([&] { return reads.load() > 0 || !coherent.load(); }));
+    // No client request is needed to move these observer replicas: each
+    // entry is an independently checked prebuilt quorum certificate.
+    for (uint64_t sequence{1}; sequence < 12; ++sequence) f.Certificate(8, sequence);
+    stop = true;
+    reader.join();
+    BOOST_CHECK(coherent.load());
+    BOOST_CHECK_GT(reads.load(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(certified_read_public_history_refusal_preserves_exact_durable_entry)
+{
+    node::FlowMeshRecentWindowLimits recent;
+    recent.payload_entries = 1;
+    recent.outcome_entries = 0;
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_certified_read_history", nullptr, 3, recent};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    f.Certificate(8, 0);
+    std::weak_ptr<const flowmesh::FlowMeshState> old_state{f.runtime->StateView(f.market)};
+    BOOST_CHECK(!old_state.expired());
+    f.Certificate(8, 1);
+    // Retired views do not form an unbounded chain. After this unit ends,
+    // only a caller that deliberately retained the old state can pin it.
+    BOOST_CHECK(old_state.expired());
+    const auto reads_before{f.runtime->ClientEntryStoreReadsForTest()};
+    BOOST_CHECK(!f.runtime->ClientCertifiedEntry(f.market, 0, error, false));
+    BOOST_CHECK_EQUAL(error, "FlowMesh certified entry history unavailable: history_busy");
+    BOOST_CHECK_EQUAL(f.runtime->ClientEntryStoreReadsForTest(), reads_before);
+    error.clear();
+    const auto current{f.runtime->ClientCertifiedEntry(f.market, 1, error, false)};
+    BOOST_REQUIRE_MESSAGE(current, error);
+    BOOST_CHECK(*current == f.payloads[1]);
+    BOOST_CHECK_EQUAL(f.runtime->ClientEntryStoreReadsForTest(), reads_before);
+    // The public refusal neither deletes history nor invents nonexecution.
+    // The unchanged internal historical path still returns exact bytes.
+    const auto historical{f.runtime->ClientCertifiedEntry(f.market, 0, error)};
+    BOOST_REQUIRE_MESSAGE(historical, error);
+    BOOST_CHECK(*historical == f.payloads[0]);
+    BOOST_CHECK_EQUAL(f.runtime->ClientEntryStoreReadsForTest(), reads_before + 1);
+}
+
+BOOST_AUTO_TEST_CASE(idempotent_start_does_not_drain_a_busy_writers_retired_views)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_read_retirement_start"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    f.Certificate(8, 0);
+    std::weak_ptr<const flowmesh::FlowMeshState> old_state{f.runtime->StateView(f.market)};
+    {
+        std::lock_guard lock{f.relay_mutex};
+        f.block_certificates = true;
+    }
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(8, {flowmesh::WireMessageKind::CERTIFICATE,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1},
+        f.payloads[1]}) == flowmesh::QueueResult::ACCEPTED);
+    {
+        std::unique_lock lock{f.relay_mutex};
+        BOOST_REQUIRE(f.relay_cv.wait_for(lock, std::chrono::seconds{5}, [&] { return f.relay_blocked; }));
+    }
+    // The new version was durably published, but its worker is still holding
+    // m_market_mutex in the relay. Its retired handles remain its obligation.
+    const bool retained_before_start{!old_state.expired()};
+    const bool started_again{f.runtime->Start(error)};
+    const bool retained_after_start{!old_state.expired()};
+    {
+        std::lock_guard lock{f.relay_mutex};
+        f.block_certificates = false;
+    }
+    f.relay_cv.notify_all();
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK(retained_before_start);
+    BOOST_CHECK_MESSAGE(started_again, error);
+    BOOST_CHECK_MESSAGE(retained_after_start, "idempotent Start drained a busy writer's retired view");
+    BOOST_CHECK(old_state.expired());
 }
 
 BOOST_AUTO_TEST_CASE(seat_misbehaviour_evidence_is_recorded_restored_and_changes_nothing)

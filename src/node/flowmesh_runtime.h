@@ -13,6 +13,7 @@
 #include <node/flowmesh_health.h>
 #include <node/flowmesh_local_admission.h>
 #include <node/flowmesh_production_store.h>
+#include <sync.h>
 
 #include <atomic>
 #include <chrono>
@@ -334,6 +335,10 @@ struct FlowMeshRuntimeMarketStatus {
     bool pending_handoff{false};
     FlowMeshRuntimeHalt halt{FlowMeshRuntimeHalt::NONE};
     std::string error;
+    //! Writer-sampled current seat context (not the last entry's old set).
+    //! Internal advisory cache pins only; never grants signing authority.
+    uint256 current_seat_set_hash;
+    std::optional<flowmesh::AnchorRef> current_seat_anchor;
 };
 
 /** Local scheduling only: a fully applied page could fit any further entry,
@@ -520,7 +525,7 @@ public:
     FlowMeshRuntime(const FlowMeshRuntime&) = delete;
     FlowMeshRuntime& operator=(const FlowMeshRuntime&) = delete;
 
-    bool Start(std::string& error);
+    bool Start(std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex, !m_health_mutex);
     void Stop();
 
     flowmesh::QueueResult EnqueueWireMessage(
@@ -584,49 +589,55 @@ public:
         const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
     std::optional<FlowMeshRuntimeMarketStatus> MarketStatus(
-        const flowmesh::MarketId& market_id) const;
+        const flowmesh::MarketId& market_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     std::optional<flowmesh::FlowMeshState> StateSnapshot(
-        const flowmesh::MarketId& market_id) const;
+        const flowmesh::MarketId& market_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
+    //! Same committed state, shared and immutable; no market/store/chain lock.
+    std::shared_ptr<const flowmesh::FlowMeshState> StateView(
+        const flowmesh::MarketId& market_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
 
     /** One bounded snapshot of certified curves, account state and history.
      * No whole-state copy, state hashing, log scanning or execution on reads. */
     std::optional<flowmesh::MarketData> MarketData(
         const flowmesh::MarketId& market_id,
         const std::optional<flowmesh::AccountId>& account,
-        const flowmesh::MarketDataQuery& query, std::string& error) const;
+        const flowmesh::MarketDataQuery& query, std::string& error) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
 
-    /** Exact current certificate and state captured at one locked head.
-     * Serialization stops at the client cap; no execution or network I/O. */
+    /** Exact current certificate and immutable state at one published head.
+     * Serialization stops at the client cap, outside runtime locks. */
     std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
-        const flowmesh::MarketId& market_id, std::string& error) const;
-    /** Certificate/state and bounded reported history captured under ONE market
-     * lock. A later publication cannot mix two heads into this response.
+        const flowmesh::MarketId& market_id, std::string& error) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
+    /** Certificate/state and bounded reported history from ONE immutable view.
+     * A later publication cannot mix two heads into this response.
      * `reported_query` shapes only the reported (unauthenticated) part. */
     std::optional<FlowMeshClientSnapshotView> ClientSnapshotView(
         const flowmesh::MarketId& market_id,
         const std::optional<flowmesh::AccountId>& account, std::string& error,
-        const flowmesh::MarketDataQuery& reported_query = {}) const;
+        const flowmesh::MarketDataQuery& reported_query = {}) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     /** One certified entry as a client payload. Entries in the recent window
      * (the head included) are encoded from memory outside the market lock;
-     * only older sequences read the store. */
+     * only older sequences read the store. allow_history=false never takes
+     * a market/chain/store lock; absent old evidence is history_busy, not
+     * expired or proof of nonexecution. */
     std::optional<std::vector<unsigned char>> ClientCertifiedEntry(
-        const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error) const;
+        const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error,
+        bool allow_history = true) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     /** Memory-only: the retained certified entry that includes this exact
      * action (a decisive disposition first, else the newest), if any. */
     std::optional<std::pair<uint64_t, uint256>> ClientRecentInclusion(
-        const flowmesh::MarketId& market_id, const uint256& action_id) const;
+        const flowmesh::MarketId& market_id, const uint256& action_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     /** Memory-only: shared parts of one retained (sequence, hash). Never
      * reads the store, encodes or verifies under the lock. */
     FlowMeshClientOutcomeParts ClientOutcomeParts(
         const flowmesh::MarketId& market_id, uint64_t sequence, const uint256& hash,
-        bool want_payload) const;
+        bool want_payload) const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     /** Test-only: ClientCertifiedEntry calls that read the store. */
     uint64_t ClientEntryStoreReadsForTest() const;
     //! A display view's curve copy unused for this long is dropped by the
     //! next market-data read.
     static constexpr std::chrono::seconds BOOK_CAPTURE_IDLE{30};
     /** Test-only: display-view curve copies retained (one per market at most). */
-    size_t BookCapturesForTest() const;
+    size_t BookCapturesForTest() const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     flowmesh::ClientEventPage ClientEvents(
         const std::optional<flowmesh::ClientEventCursor>& after,
         const std::optional<flowmesh::MarketId>& market,
@@ -671,7 +682,8 @@ public:
      * mutex (never the market or queue mutex, cs_main or the store), so it
      * answers while the worker is busy or wedged; the snapshot's age is then
      * itself the signal. Null before the first Start. Never evidence. */
-    std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> HealthSnapshot() const;
+    std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> HealthSnapshot() const
+        EXCLUSIVE_LOCKS_REQUIRED(!m_health_mutex);
 
     /** Test-only: how many frames' bytes admission has hashed so far. */
     uint64_t AdmissionHashCountForTest() const;
@@ -685,6 +697,15 @@ public:
 
 private:
     struct Market;
+    struct ReadView;
+    std::shared_ptr<const ReadView> LoadReadView(const flowmesh::MarketId& market_id) const
+        EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
+    //! Writer-owned calls only. No authority decision reads the published view.
+    void PublishReadLocked(Market& market, const flowmesh::ProductionEntryCore* committed = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
+    void PublishReadViewsLocked() EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
+    //! Called outside m_market_mutex; old states can be expensive to destroy.
+    void ReleaseRetiredReadViews() EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     struct CatchupCommand {
         flowmesh::WirePeerId peer{0};
         flowmesh::MarketId market_id;
@@ -694,14 +715,16 @@ private:
         std::shared_ptr<std::promise<std::pair<bool, std::string>>> completion;
     };
 
-    bool InitializeMarkets(std::string& error);
+    bool InitializeMarkets(std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     bool InitializeMarket(const FlowMeshRuntimeMarketConfig& config,
-                          std::string& error);
-    void WorkerLoop();
+                          std::string& error,
+                          std::deque<flowmesh::ClientEvent>* startup_events = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
+    void WorkerLoop() EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex, !m_health_mutex);
     //! EnqueueWireMessage, with the frame marked counted (QueuedWireMessage).
     flowmesh::QueueResult Enqueue(flowmesh::WirePeerId peer, flowmesh::WireMessage message, bool counted);
     void ProcessMessage(const flowmesh::QueuedWireMessage& queued, uint64_t dequeued_us);
-    void ProcessTick(uint64_t requested_us, uint64_t dequeued_us);
+    void ProcessTick(uint64_t requested_us, uint64_t dequeued_us) EXCLUSIVE_LOCKS_REQUIRED(!m_health_mutex);
     struct PendingDelivery;
     void RelayMessage(Market& market, flowmesh::WireMessage message,
                       std::optional<flowmesh::WirePeerId> peer,
@@ -724,17 +747,16 @@ private:
     bool TryRequestCatchup(Market& market, flowmesh::WirePeerId peer);
     void ExpireCatchup(flowmesh::WirePeerId peer, const flowmesh::MarketId& market_id);
     void ProcessCatchupCommand(const CatchupCommand& command);
-    void ProcessAddMarketCommand(AddMarketCommand command);
+    void ProcessAddMarketCommand(AddMarketCommand command) EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex, !m_health_mutex);
     void RemovePeerOnWorker(flowmesh::WirePeerId peer);
-    //! Caller holds m_market_mutex. The market's observed-time log, if any.
-    std::shared_ptr<FlowMeshObservedTimeLog> ObservedLogLocked(const flowmesh::MarketId& market_id) const;
     //! Caller holds m_market_mutex. Display-only observed-time upkeep of
     //! every market that records it; decides nothing.
     void ObserveTimeMaintenance(size_t connected_peers);
     //! Caller holds m_market_mutex. Copies values the worker already owns;
     //! never reads the store, signs, executes or calls LocalSeatKeys.
     void PublishHealth(flowmesh::WireClock::time_point now, size_t connected_peers,
-                       std::optional<flowmesh::WireClock::time_point> no_peers_since, bool force);
+                       std::optional<flowmesh::WireClock::time_point> no_peers_since, bool force)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_health_mutex);
 
     void HandleAction(Market& market, flowmesh::WirePeerId peer,
                       const flowmesh::WireMessage& message);
@@ -775,40 +797,20 @@ private:
     std::vector<FlowMeshRuntimeMarketConfig> m_market_configs;
 
     mutable std::mutex m_market_mutex;
-    // Caller holds m_market_mutex. Shared by ordinary reads and the atomic
-    // public-client view; these helpers never execute a market transition.
-    std::optional<flowmesh::MarketData> MarketDataLocked(
-        const flowmesh::MarketId& market_id,
-        const std::optional<flowmesh::AccountId>& account,
+    std::optional<flowmesh::MarketData> ProjectReadView(
+        const ReadView& view, const std::optional<flowmesh::AccountId>& account,
         const flowmesh::MarketDataQuery& query, std::string& error) const;
-    std::optional<flowmesh::ClientStateEvidence> ClientSnapshotLocked(
-        const flowmesh::MarketId& market_id, std::string& error) const;
-    //! Caller holds m_market_mutex: the other markets' counted recent-window
-    //! payload and outcome bytes (their global caps' remaining room).
+    std::optional<flowmesh::ClientStateEvidence> SnapshotReadView(
+        const ReadView& view, const flowmesh::ClientEventCursor& cursor, std::string& error) const;
+    //! Caller holds m_market_mutex: other markets' counted recent-window bytes.
     std::pair<size_t, size_t> RecentWindowOthers(const Market& self) const;
-    //! A display view's copy of one market's standing curves (see BookCopy).
-    struct BookCapture {
-        std::shared_ptr<const flowmesh::BookCurves> book;
-        flowmesh::WireClock::time_point used;
-    };
-    //! Guarded by m_market_mutex. Per market, the standing curves copied once
-    //! for the certified head a display view (indicative clearing) last asked
-    //! about, so repeated reads at one head copy nothing. Views are computed
-    //! from it outside every lock. Every market-data read drops (freeing
-    //! them after the lock) captures of a head that is no longer current and
-    //! captures unused for BOOK_CAPTURE_IDLE.
-    mutable std::map<flowmesh::MarketId, BookCapture> m_book_captures;
-    //! Caller holds m_market_mutex: moves stale captures into `dropped`.
-    void PruneBookCaptures(std::vector<std::shared_ptr<const flowmesh::BookCurves>>& dropped) const;
-    /** The standing curves of `head` for display views: the retained capture,
-     * or a copy taken one bounded page (MARKET_DATA_MAX_CURVES curves) per
-     * m_market_mutex hold (flowmesh::CopyBookCurves), as a curve-paging read
-     * takes it, so no hold copies the whole book. Takes the lock itself; the
-     * caller must not hold it. A book over MARKET_VIEW_MAX_BOOK_CURVES is not
-     * copied ("work_budget"), and a head that moves between holds ends the
-     * copy ("head_changed"). */
-    std::shared_ptr<const flowmesh::BookCurves> BookCopy(const flowmesh::MarketId& market_id, const uint256& head,
-                                                         FlowMeshTimingSpan& timing) const;
+    std::shared_ptr<const flowmesh::BookCurves> BookCopy(
+        const std::shared_ptr<const ReadView>& view, FlowMeshTimingSpan& timing) const;
+    void PruneBookCaptures() const EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
+    //! Leaf publication lock. Never held for projection, encoding or destruction.
+    mutable Mutex m_read_mutex;
+    std::map<flowmesh::MarketId, std::shared_ptr<const ReadView>> m_read_views GUARDED_BY(m_read_mutex);
+    std::vector<std::shared_ptr<const ReadView>> m_retired_read_views GUARDED_BY(m_read_mutex);
     std::map<flowmesh::MarketId, std::unique_ptr<Market>> m_markets;
     //! ClientCertifiedEntry store reads (test observation only).
     mutable std::atomic<uint64_t> m_client_entry_store_reads{0};
@@ -885,8 +887,8 @@ private:
     bool m_worker_waiting{false};
     std::thread m_worker;
     //! Leaf: acquired after m_market_mutex, never before it.
-    mutable std::mutex m_health_mutex;
-    std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> m_health;
+    mutable Mutex m_health_mutex;
+    std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> m_health GUARDED_BY(m_health_mutex);
     //! Worker-owned (under m_market_mutex): the next tick that publishes.
     flowmesh::WireClock::time_point m_next_health_publish{};
     //! Observed-time upkeep (display only) samples an open chain gate at

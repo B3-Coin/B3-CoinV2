@@ -325,6 +325,17 @@ public:
      * before startup replay completes or for a limit outside 1..MAX_TICKS. */
     flowmesh::ClearingTickPage ReadClearingTicks(const flowmesh::ClearingTickQuery& query);
 
+    /** Immutable derived history, at most HISTORY_CAPACITY entries and
+     * MAX_FILL_ACCOUNTS fills per entry. No durable records are removed.
+     * Runtime publication captures this once per changed certified head;
+     * subsequent paging never acquires the store's durability mutex. */
+    struct HistorySnapshot {
+        std::deque<flowmesh::MarketHistoryEntry> entries;
+        flowmesh::MarketHistoryPage Page(uint64_t before_sequence, size_t limit) const;
+        flowmesh::ClearingTickPage Ticks(const flowmesh::ClearingTickQuery& query) const;
+    };
+    std::shared_ptr<const HistorySnapshot> ReadHistorySnapshot();
+
     /**
      * Return the earliest entry after the last connected type-8 that must be
      * published: sequence-zero market genesis, every handoff, or the first
@@ -409,6 +420,7 @@ private:
     //! A reopened nonempty store becomes ready only after full replay.
     bool m_ready{false};
     std::deque<flowmesh::MarketHistoryEntry> m_market_history;
+    std::shared_ptr<const HistorySnapshot> m_history_snapshot;
     std::deque<std::shared_ptr<const ProductionOutcomeRecord>> m_replay_outcomes;
 };
 

@@ -1835,6 +1835,7 @@ bool FlowMeshProductionStore::AppendExecution(
         return false;
     }
     CacheMarketHistory(m_market_history, entry, &executed->result, &executed->next_state);
+    m_history_snapshot.reset();
     next_state_out = executed->next_state;
     // After the durable write and after MakeDiskEntry consumed the effects:
     // hand the caller this exact re-execution by move. Nothing is encoded.
@@ -1940,6 +1941,7 @@ bool FlowMeshProductionStore::AppendHandoff(
         return false;
     }
     CacheMarketHistory(m_market_history, handoff, nullptr, nullptr);
+    m_history_snapshot.reset();
     return true;
 }
 
@@ -2178,6 +2180,7 @@ bool FlowMeshProductionStore::Replay(
     // leaves the store fail-closed until a complete replay succeeds.
     m_ready = false;
     m_market_history.clear();
+    m_history_snapshot.reset();
     m_replay_outcomes.clear();
     std::deque<flowmesh::MarketHistoryEntry> history;
     std::deque<std::shared_ptr<const ProductionOutcomeRecord>> outcomes;
@@ -2371,17 +2374,17 @@ std::vector<std::shared_ptr<const ProductionOutcomeRecord>> FlowMeshProductionSt
     return out;
 }
 
-flowmesh::MarketHistoryPage FlowMeshProductionStore::ReadMarketHistory(
+flowmesh::MarketHistoryPage FlowMeshProductionStore::HistorySnapshot::Page(
     const uint64_t before_sequence, const size_t limit)
+    const
 {
-    const std::lock_guard<std::mutex> guard{m_mutex};
     flowmesh::MarketHistoryPage out;
-    if (!m_open || !m_ready || limit == 0 || limit > flowmesh::MARKET_DATA_MAX_HISTORY) return out;
+    if (limit == 0 || limit > flowmesh::MARKET_DATA_MAX_HISTORY) return out;
     out.available = true;
-    if (m_market_history.empty()) return out;
-    out.oldest_retained_sequence = m_market_history.front().sequence;
+    if (entries.empty()) return out;
+    out.oldest_retained_sequence = entries.front().sequence;
     out.truncated = *out.oldest_retained_sequence != 0;
-    for (auto it{m_market_history.rbegin()}; it != m_market_history.rend(); ++it) {
+    for (auto it{entries.rbegin()}; it != entries.rend(); ++it) {
         if (it->sequence >= before_sequence) continue;
         if (out.entries.size() == limit) {
             out.next_before_sequence = out.entries.back().sequence;
@@ -2392,15 +2395,38 @@ flowmesh::MarketHistoryPage FlowMeshProductionStore::ReadMarketHistory(
     return out;
 }
 
-flowmesh::ClearingTickPage FlowMeshProductionStore::ReadClearingTicks(const flowmesh::ClearingTickQuery& query)
+flowmesh::ClearingTickPage FlowMeshProductionStore::HistorySnapshot::Ticks(
+    const flowmesh::ClearingTickQuery& query) const
+{
+    return flowmesh::PageClearingTicks(entries, query);
+}
+
+std::shared_ptr<const FlowMeshProductionStore::HistorySnapshot> FlowMeshProductionStore::ReadHistorySnapshot()
 {
     const std::lock_guard<std::mutex> guard{m_mutex};
-    if (!m_open || !m_ready) {
+    if (!m_open || !m_ready) return {};
+    if (!m_history_snapshot) {
+        m_history_snapshot = std::make_shared<const HistorySnapshot>(HistorySnapshot{m_market_history});
+    }
+    return m_history_snapshot;
+}
+
+flowmesh::MarketHistoryPage FlowMeshProductionStore::ReadMarketHistory(
+    const uint64_t before_sequence, const size_t limit)
+{
+    const auto history{ReadHistorySnapshot()};
+    return history ? history->Page(before_sequence, limit) : flowmesh::MarketHistoryPage{};
+}
+
+flowmesh::ClearingTickPage FlowMeshProductionStore::ReadClearingTicks(const flowmesh::ClearingTickQuery& query)
+{
+    const auto history{ReadHistorySnapshot()};
+    if (!history) {
         flowmesh::ClearingTickPage out;
         out.unavailable_reason = "history_not_ready";
         return out;
     }
-    return flowmesh::PageClearingTicks(m_market_history, query);
+    return history->Ticks(query);
 }
 
 flowmesh::ProductionLockResult FlowMeshProductionStore::LockCandidate(
