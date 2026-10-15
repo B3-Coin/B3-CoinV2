@@ -106,6 +106,49 @@ inline void ClientCrashBeforeJournalSave(const fs::path& journal, const UniValue
     }
 }
 
+/** A deliberately COMMITTED write, followed by a fixture throw or hold before
+ * Save updates its successful digest or the snapshot publishes its cache.
+ * This is not a simulation of an unknown physical write or power loss. */
+inline void ClientCrashAfterJournalSyncBeforeDigest(const fs::path& journal, const UniValue& root)
+{
+    auto guard{ClientCrashGuard(journal)};
+    if (guard.isNull() || !guard.exists("after_sync_fault_action_id")) return;
+    if (!guard["after_sync_fault_action_id"].isStr() ||
+        guard["after_sync_fault_action_id"].get_str().size() != 64 || !IsHex(guard["after_sync_fault_action_id"].get_str()) ||
+        !guard["after_sync_fault_market_id"].isStr() ||
+        guard["after_sync_fault_market_id"].get_str().size() != 64 || !IsHex(guard["after_sync_fault_market_id"].get_str()) ||
+        !guard["after_sync_fault_mode"].isStr() || !root["actions"].isArray())
+        throw std::runtime_error("Invalid isolated post-sync fault target");
+    const auto action{guard["after_sync_fault_action_id"].get_str()};
+    const auto market{guard["after_sync_fault_market_id"].get_str()};
+    const auto mode{guard["after_sync_fault_mode"].get_str()};
+    if (mode != "throw" && mode != "hold") throw std::runtime_error("Invalid isolated post-sync fault mode");
+    bool matched{false};
+    for (const auto& row : root["actions"].getValues()) {
+        if (row["action_id"].isStr() && row["action_id"].get_str() == action &&
+            row["market_id"].isStr() && row["market_id"].get_str() == market && row["previously_certified"].isTrue())
+            matched = true;
+    }
+    if (!matched) return;
+    if (mode == "throw") {
+        ClientCrashRecord(journal, "committed_journal_test_throw_before_digest", root);
+        throw std::runtime_error("Injected test throw AFTER committed synchronous journal write, BEFORE digest/publication");
+    }
+    ClientCrashRecord(journal, "committed_journal_before_digest_held", root);
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+    while (std::chrono::steady_clock::now() < deadline) {
+        guard = ClientCrashGuard(journal);
+        if (guard.isNull()) throw std::runtime_error("Isolated post-sync hold lost its fixture guard");
+        if (guard.exists("release_after_sync_before_digest")) {
+            if (!guard["release_after_sync_before_digest"].isBool())
+                throw std::runtime_error("Invalid isolated post-sync release");
+            if (guard["release_after_sync_before_digest"].get_bool()) return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    throw std::runtime_error("Isolated post-sync hold expired; committed journal preserved without publication");
+}
+
 /** Hold a completed lane reply BEFORE it reacquires m_work. The parent may
  * perform an ordinary snapshot meanwhile, then release this exact reply.
  * A missing parent ends by refusal, never by a resend or fresh signature. */

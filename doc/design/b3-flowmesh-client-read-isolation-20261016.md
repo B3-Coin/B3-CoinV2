@@ -6,6 +6,12 @@ writes, change agreement or make Qt's sequential worker concurrent.
 The final ordinary native, Qt workspace and unchanged crash/reopen successor
 selections pass within their declared local test boundaries.
 
+Historical boundary: this stage's frozen revision `c0b9e9f` retains the two
+conditional snapshot saves described below. The later separately reviewed
+[aggregate-save stage](b3-flowmesh-snapshot-aggregate-save-20261016.md) replaces
+that storage sequence with one complete-blob transition. Its new interruption
+evidence does not relabel this stage's earlier captures or test results.
+
 ## Cause and bounded correction
 
 The [captured native campaign](b3-flowmesh-retention-native-diagnostics-20261016.md)

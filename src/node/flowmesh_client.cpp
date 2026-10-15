@@ -2193,6 +2193,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         test::ClientCrashBeforeJournalSave(m_path, root);
 #endif
         m_db->Write(std::string{"public-client-v1"}, blob, true); // throws on failed synchronous write
+#ifdef FLOWMESH_CLIENT_CRASH_TEST_HOOKS
+        test::ClientCrashAfterJournalSyncBeforeDigest(m_path, root);
+#endif
         timing.Mark("sync_completed_us");
         m_durable_restart_digest = RestartDigest();
 #ifdef FLOWMESH_CLIENT_CRASH_TEST_HOOKS
@@ -2343,7 +2346,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             if (m_highwater.size() >= CLIENT_MAX_MARKETS && previous == m_highwater.end()) Fail("Client retained market limit reached");
             const bool lost_cursor{previous != m_highwater.end() && !m_cache.contains(id)};
             const auto revision{AdvanceRevision(m_cache_revision)};
-            m_highwater[id] = {entry.sequence, entry.GetHash()};
+            const auto head_hash{entry.GetHash()};
             // The snapshot's cursor is its endpoint's log position when the
             // state was captured, at or after the page that asked for it.
             // Resume from the page within the same log, so the events in
@@ -2362,48 +2365,70 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             const bool gap{forced_gap || lost_cursor || skipped || (m_cache.contains(id) && m_cache.at(id).event_gap)};
             std::vector<Pending*> included;
             included.reserve(m_pending.size());
+            for (auto& [key, pending] : m_pending) {
+                if (pending.market == id &&
+                    std::any_of(entry.actions.begin(), entry.actions.end(), [&](const auto& action) { return action.Id() == pending.action.Id(); }))
+                    included.push_back(&pending);
+            }
+            // Prepare a newly observed market's map node privately, before
+            // binding any live obligation. Its later insertion cannot allocate.
+            decltype(m_highwater) prepared_head;
+            if (previous == m_highwater.end()) prepared_head.emplace(id, std::pair{entry.sequence, head_hash});
+            auto head_node{prepared_head.extract(id)};
             try {
-                // Two existing conditional saves, in their original order.
-                // The candidate cache/status is not installed between them.
-                SaveRestartState();
-                for (auto& [key, pending] : m_pending) {
-                    if (pending.market != id) continue;
-                    if (std::any_of(entry.actions.begin(), entry.actions.end(), [&](const auto& action) { return action.Id() == pending.action.Id(); })) {
-                        included.push_back(&pending);
-                        Inclusion(pending, verified->certified, endpoint, evidence.certified_payload);
-                    }
+                // Bind EVERY matched original before receipt/proof work can
+                // throw. Record is noexcept: allocation failure marks its
+                // volatile floor incomplete, which disables all joins.
+                for (Pending* pending : included) pending->previously_certified = true;
+                if (!included.empty()) m_own_certified_through.Record(id, entry.sequence);
+                if (head_node) {
+                    m_highwater.insert(std::move(head_node));
+                } else {
+                    previous->second = {entry.sequence, head_hash};
                 }
+                // Candidate construction/copies may throw too: binding flags,
+                // floor and head already cover every match before that work.
+                Cache candidate{pins, std::move(*verified), cursor, value["status"], value["reported_data"], endpoint, gap, account};
+                candidate.revision = revision;
+                for (Pending* pending : included)
+                    Inclusion(*pending, candidate.verified.certified, endpoint, evidence.certified_payload);
+                // One aggregate blob contains both the head and all restart
+                // no-resubmit markers. There is no head-only durable prefix.
+                // Cache, labels and endpoint metadata remain private until
+                // this existing synchronous barrier successfully returns.
                 SaveRestartState();
+                if (m_cache.size() >= CLIENT_MAX_CACHED_MARKETS && !m_cache.contains(id)) {
+                    m_ticks.erase(m_cache.begin()->first);
+                    m_cache.erase(m_cache.begin());
+                }
+                m_cache.insert_or_assign(id, std::move(candidate));
+                if (prior_gaps || lost_cursor || skipped) {
+                    std::lock_guard lock{m_status_mutex};
+                    m_status.event_gaps += prior_gaps + uint64_t{lost_cursor || skipped};
+                }
+                if (learn_endpoint) {
+                    ApplyTickWithdrawals(withdrawn);
+                    LearnMetadata(value["status"], pins, endpoint);
+                    LearnActionWait(value["status"], endpoint);
+                    LearnReadiness(FlowMeshAdvertisedReadinessOf(value["status"]), endpoint, id);
+                }
+                KeepTickPage(ticks, value, endpoint);
             } catch (...) {
-                // No asynchronous lane/status call may inherit a verified
-                // label whose new no-resubmit marker failed persistence.
+                // Binding flags/floors/head never roll back, including those
+                // of matched originals Inclusion had not yet processed.
+                // An ambiguous write must not earn a skipped later save.
+                m_durable_restart_digest.reset();
                 for (Pending* pending : included) WithdrawVerifiedLabels(pending->receipt);
-                // A successful first save is irreversible. An older cache
-                // must not feed JoinFresh after the second save fails.
                 if (const auto old{m_cache.find(id)}; old != m_cache.end()) {
                     old->second.fresh.reset();
                     old->second.revision = AdvanceRevision(m_cache_revision);
                 }
+                // Also fence a same-head failure with no old cache/floor
+                // change: OrdinaryReadCall must not walk another endpoint
+                // over these already-bound in-memory obligations.
+                AdvanceRevision(m_read_epoch);
                 throw;
             }
-            if (m_cache.size() >= CLIENT_MAX_CACHED_MARKETS && !m_cache.contains(id)) {
-                m_ticks.erase(m_cache.begin()->first);
-                m_cache.erase(m_cache.begin());
-            }
-            Cache candidate{pins, std::move(*verified), cursor, value["status"], value["reported_data"], endpoint, gap, account};
-            candidate.revision = revision;
-            m_cache.insert_or_assign(id, std::move(candidate));
-            if (prior_gaps || lost_cursor || skipped) {
-                std::lock_guard lock{m_status_mutex};
-                m_status.event_gaps += prior_gaps + uint64_t{lost_cursor || skipped};
-            }
-            if (learn_endpoint) {
-                ApplyTickWithdrawals(withdrawn);
-                LearnMetadata(value["status"], pins, endpoint);
-                LearnActionWait(value["status"], endpoint);
-                LearnReadiness(FlowMeshAdvertisedReadinessOf(value["status"]), endpoint, id);
-            }
-            KeepTickPage(ticks, value, endpoint);
     }
     enum class CacheCheck { CURRENT, SCOPE, CHECKPOINT, AUTHORITY, ANCHOR, RETAINED };
     // Local checks that a cached verified state still applies to this account
