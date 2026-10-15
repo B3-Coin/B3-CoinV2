@@ -3,7 +3,9 @@
 # Distributed under the MIT software license.
 """Offline checks for benchmark bookkeeping; never starts a node."""
 
+import argparse
 import copy
+import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -99,6 +101,108 @@ class PerformanceMetricsTest(unittest.TestCase):
         # Do not hide changed bytes within the SAME market by selecting a hash.
         selected = [row for row in rows if submit_context(row) == ("market-A", "same-semantic-id")]
         self.assertEqual(len({row["action_hex"] for row in selected}), 2)
+
+
+class SubmitWaitProbeTest(unittest.TestCase):
+    def parser(self):
+        parser = argparse.ArgumentParser()
+        owner = object.__new__(FlowMeshPerformanceTest)
+        owner.add_options(parser)
+        return parser
+
+    def test_submit_wait_option_defaults_to_zero_and_rejects_outside_client_bound(self):
+        parser = self.parser()
+        self.assertEqual(parser.parse_args([]).performance_submit_wait_ms, 0)
+        for value in ("0", "1", "2000", "2500"):
+            with self.subTest(value=value):
+                parsed = parser.parse_args(["--performance-submit-wait-ms", value])
+                self.assertEqual(parsed.performance_submit_wait_ms, int(value))
+        for value in ("-1", "2501", "1.5", "nan", "inf", "true"):
+            with self.subTest(value=value), patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+                parser.parse_args(["--performance-submit-wait-ms", value])
+
+    def test_nonzero_wait_requires_explicit_native_result_profile_before_setup(self):
+        for profile, outcome in (("ladder", False), ("ladder", True), ("matched-repair", True), ("native-queue", False)):
+            with self.subTest(profile=profile, outcome=outcome):
+                owner = object.__new__(FlowMeshPerformanceTest)
+                owner.options = SimpleNamespace(performance_profile=profile,
+                    performance_submit_wait_ms=2000, performance_require_outcome=outcome)
+                with patch.object(performance.FlowMeshLatencyTest, "set_test_params") as setup:
+                    with self.assertRaisesRegex(ValueError, "native-queue.*require-outcome"):
+                        owner.set_test_params()
+                    setup.assert_not_called()
+
+    def execute_probe(self, kind, wait=None):
+        class ProbeStopped(RuntimeError):
+            pass
+        clock = [1_000_000]
+        observed_delay_us = 275_000
+        submitted = []
+        identity = "a" * 64
+        status = {**ExecutionOutcomeMeasurementTest().status(), "action_id": identity}
+        if kind == "cancel":
+            del status["outcome"]["fill"]
+        elif kind == "resting_bid":
+            status["outcome"]["fill"].update(quantity=0, quote_atoms=0, fee_atoms=0, net_quote_atoms=0)
+        class RPC:
+            def submitflowmeshorder(self, *args):
+                submitted.append(("submitflowmeshorder", args))
+                clock[0] += observed_delay_us
+                return copy.deepcopy(status)
+            def cancelflowmeshorder(self, *args):
+                submitted.append(("cancelflowmeshorder", args))
+                clock[0] += observed_delay_us
+                return copy.deepcopy(status)
+            def retryflowmeshaction(self, *args):
+                raise AssertionError("A completed probe must not resend")
+            def getflowmeshactionstatus(self, *args):
+                raise AssertionError("A verified result needs no status poll")
+        options = SimpleNamespace(performance_action_timeout=60, performance_require_outcome=True)
+        if wait is not None:
+            options.performance_submit_wait_ms = wait
+        def followup(*args):
+            raise ProbeStopped()
+        owner = SimpleNamespace(options=options, stop_requested=lambda deadline: None,
+            observed_rpc_return_us=lambda: clock[0], followup_account_read=followup)
+        worker = {"market_id": "market", "account": {"next_sequence": 7, "account_id": "account",
+            "base_available": 0, "base_reserved": 0, "b3_available_atoms": 2_000_000_000, "b3_reserved_atoms": 0}}
+        sample = {"kind": kind, "enqueued_host_us": clock[0], "scheduled_host_us": clock[0],
+            "attempts": [], "receipt_observations": []}
+        with patch.object(performance, "host_us", side_effect=lambda: clock[0]), \
+             patch.object(performance.time, "monotonic", side_effect=lambda: clock[0] / 1_000_000):
+            with self.assertRaises(ProbeStopped):
+                FlowMeshPerformanceTest.execute_action(owner, worker, RPC(), [], sample)
+        return sample, submitted
+
+    def test_default_and_explicit_zero_preserve_exact_order_and_cancel_arguments(self):
+        for wait in (None, 0):
+            for kind in ("fill_bid", "resting_bid", "cancel"):
+                with self.subTest(kind=kind, wait=wait):
+                    sample, submitted = self.execute_probe(kind, wait)
+                    expected = ("market", "bid", 7) if kind == "cancel" else (
+                        "market", "bid", TRADE_PRICE if kind == "fill_bid" else TRADE_PRICE // 2, 1, 7)
+                    self.assertEqual(submitted[0][1], expected)
+                    self.assertEqual(len(submitted), 1)
+
+    def test_wait_appends_exact_trailing_argument_without_changing_original_identity(self):
+        for kind in ("fill_bid", "cancel"):
+            with self.subTest(kind=kind):
+                sample, submitted = self.execute_probe(kind, 2000)
+                expected = ("market", "bid", 7, 2000) if kind == "cancel" else (
+                    "market", "bid", TRADE_PRICE, 1, 7, 2000)
+                self.assertEqual(submitted[0][1], expected)
+                self.assertEqual(len(submitted), 1)
+                self.assertEqual(sample["action_id"], "a" * 64)
+                self.assertEqual(sample["attempts"], [])
+                self.assertEqual(sample["submit_wait_ms"], 2000)
+
+    def test_result_clock_includes_the_original_submission_wait(self):
+        sample, _ = self.execute_probe("fill_bid", 2000)
+        self.assertEqual(sample["initial_submission_host_us"], 1_000_000)
+        self.assertEqual(sample["initial_response_ms"], 275)
+        self.assertEqual(sample["client_certified_ms"], 275)
+        self.assertEqual(sample["execution_outcome_verified_ms"], 275)
+        self.assertEqual(sample["execution_outcome_verified_from_offer_ms"], 275)
 
 
 class CaptureCleanupTest(unittest.TestCase):

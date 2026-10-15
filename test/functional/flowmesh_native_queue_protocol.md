@@ -87,6 +87,28 @@ For an outcome-observation pair, add `--performance-require-outcome` to both
 fresh-fixture commands above and retain both reports under their own profile.
 Do not compare its clock with legacy inclusion medians as a speed improvement.
 
+## Opt-in waited-submission comparison
+
+Ordinary signed-action RPCs default to zero wait. Qt already requests up to
+2,000 ms on an eligible remote submission (or a later foreground read-only
+status wait after relocking). Therefore the default native-queue probe is not
+the opted-in Qt submission path.
+
+`--performance-submit-wait-ms=2000` selects the separate
+`native-result-submit-wait-v1` diagnostic. Values must be integer 0..2,500;
+nonzero requires `--performance-profile=native-queue` and
+`--performance-require-outcome` before fixture setup. Zero/omission preserves
+the exact original RPC argument tuple. Nonzero appends the existing wait
+argument to the first order/cancel request; it does not change signed bytes,
+the ActionId, exact-retry policy or result predicates. All submission wait is
+inside the original measurement clock, not removed from latency.
+
+Run sequential capture-off/on fresh fixtures with the same explicit wait.
+Report the profile and request wait, not a relabelled default-path median.
+The fixture has four validators, of which two serve HTTPS; the report records
+both counts. This remains one engine-off client process and nine diagnostic
+samples, not a Qt UI, durable-client-result, WAN or 200 ms qualification.
+
 Capture cleanup stops every owned child once and retains its complete or
 partial trace before aggregating errors. Drops, stream-limit markers, malformed
 stop replies and interrupted start metadata invalidate complete attribution.

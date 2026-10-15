@@ -48,6 +48,8 @@ MAX_RPC_TRACE_BYTES = 256 * 1024 * 1024
 MAX_RPC_CONTEXT_BYTES = 32 * 1024
 READ_RECOVERY_DELAYS = (.5, 1.0, 2.0, 4.0)
 PUBLIC_TRACE_QUIESCENCE_SECONDS = 15
+# Mirrors node::FLOWMESH_CLIENT_ACTION_WAIT_MAX; a latency request only.
+PERFORMANCE_SUBMIT_WAIT_MAX_MS = 2500
 
 
 def bounded_seconds(value):
@@ -55,6 +57,16 @@ def bounded_seconds(value):
     if not math.isfinite(value) or not 1 <= value <= 60:
         raise argparse.ArgumentTypeError("must be finite and in 1..60 seconds")
     return value
+
+
+def bounded_submit_wait_ms(value):
+    try:
+        parsed = int(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError("must be an integer in 0..2500 milliseconds") from None
+    if not 0 <= parsed <= PERFORMANCE_SUBMIT_WAIT_MAX_MS:
+        raise argparse.ArgumentTypeError("must be an integer in 0..2500 milliseconds")
+    return parsed
 
 
 def arrival_offsets(count, rate):
@@ -269,10 +281,17 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                             help="Bounded in-memory RPC observations after setup, without public-body disk capture")
         parser.add_argument("--performance-require-outcome", action="store_true",
                             help="Require verified applied/fill outcomes, not only inclusion; not durable-outcome qualification")
+        parser.add_argument("--performance-submit-wait-ms", type=bounded_submit_wait_ms, default=0,
+                            help="Opt-in native-queue result probe only: append 0..2500ms to the original submission RPC; "
+                                 "requires --performance-require-outcome. Default 0 preserves ordinary RPC arguments. "
+                                 "The wait counts in total latency; this is not a Qt or durability qualification")
         parser.add_argument("--performance-read-recovery", action="store_true",
                             help="Optional bounded read-only follow-up recovery; preserves read failure and fails final exit")
 
     def set_test_params(self):
+        if self.options.performance_submit_wait_ms and (
+                self.options.performance_profile != "native-queue" or not self.options.performance_require_outcome):
+            raise ValueError("Nonzero submit wait requires --performance-profile=native-queue and --performance-require-outcome")
         if self.options.performance_profile == "matched-repair":
             self.options.performance_markets = 2
             self.options.performance_window_seconds = 20
@@ -622,6 +641,9 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         deadline = time.monotonic() + self.options.performance_action_timeout
         params = (market, "bid", sequence) if kind == "cancel" else (
             market, "bid", TRADE_PRICE if kind == "fill_bid" else TRADE_PRICE // 2, 1, sequence)
+        sample["submit_wait_ms"] = getattr(self.options, "performance_submit_wait_ms", 0)
+        if sample["submit_wait_ms"]:
+            params += (sample["submit_wait_ms"],)
         method = "cancelflowmeshorder" if kind == "cancel" else "submitflowmeshorder"
         response = None
         while response is None:
@@ -1065,7 +1087,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         self.performance_report = {
             "format_version": 1, "fixture": "bounded_open_loop_four_validator_https",
             "logging_mode": "detailed_bench" if self.options.performance_diagnostic else "production_debug_disabled",
-            "scope": {"operators": 4, "ordinary_client_processes": 1, "buyer_accounts": BUYERS,
+            "scope": {"operators": 4, "https_api_operators": len(self.api_ports), "ordinary_client_processes": 1, "buyer_accounts": BUYERS,
                 "markets": self.options.performance_markets, "transport": "independent TCP + ordinary HTTPS via TLS relay",
                 "scheduled_offer_clock": "Python monotonic; fixed deadlines independent of completion",
                 "primary_gate_clock": ("original client submission RPC call to client verified applied execution outcome"
@@ -1078,7 +1100,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 "fill_evidence": "authenticated buyer/maker balance deltas plus exact fees; endpoint history reported separately",
                 "execution_outcomes_required": self.options.performance_require_outcome,
                 "durable_client_outcome_qualified": False, "faults_injected": False,
-                "not_qualified": ["WAN", "multiple client processes", "power-loss durability", "fault recovery"]},
+                "not_qualified": ["Qt UI end to end", "WAN", "multiple client processes", "power-loss durability", "fault recovery"]},
             "samples": [], "windows": [], "logging_checks": [], "clock_offsets": {},
             "correctness_pass": False, "performance_pass": False,
             "campaign": {"profile": self.options.performance_profile, "rates": list(self.performance_rates),
@@ -1090,6 +1112,8 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 "read_recovery_delays_seconds": list(READ_RECOVERY_DELAYS) if self.options.performance_read_recovery else [],
                 "read_recovery_never_converts_first_read_failure_to_success": True,
                 "public_trace_enabled": self.options.performance_public_trace,
+                "submit_wait_ms": self.options.performance_submit_wait_ms,
+                "submission_measurement_profile": "native-result-submit-wait-v1" if self.options.performance_submit_wait_ms else "ordinary-submit-v1",
                 "outcome_measurement_profile": "native-result-observation-v1" if self.options.performance_require_outcome else "legacy-inclusion-v1"}}
         self.latency_report = self.performance_report
         if self.options.performance_profile == "native-queue":
