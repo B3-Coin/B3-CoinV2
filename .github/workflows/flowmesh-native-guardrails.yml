@@ -1,0 +1,104 @@
+name: FlowMesh Linux native guardrails
+run-name: FlowMesh native lock-order and TSan — ${{ github.sha }}
+
+# Native unit tests only: no node processes, live data, packaging or deployment.
+# DEBUG_LOCKORDER covers Bitcoin lock wrappers, not all plain std::mutex paths.
+# TSan uses system libraries (not instrumented libc++); the existing repository
+# suppression file includes Chainstate::ConnectTip deadlock suppression. This
+# lane does not replace the broader upstream instrumented-libc++ CI profile.
+on:
+  workflow_dispatch:
+  push:
+    branches: [flowmeshV2-dev]
+    paths:
+      - '.github/workflows/flowmesh-native-guardrails.yml'
+      - 'ci/check_flowmesh_native_guardrails.py'
+      - 'ci/test_flowmesh_native_guardrails.py'
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'test/sanitizer_suppressions/tsan'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flowmesh-native-guardrails-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    if: github.ref == 'refs/heads/flowmeshV2-dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [lockorder, tsan]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify strict runner rejection controls (no native tests)
+        timeout-minutes: 2
+        run: python3 -B ci/test_flowmesh_native_guardrails.py -v
+      - name: Install headless native build dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build pkgconf python3 clang-18 libclang-rt-18-dev libevent-dev libboost-dev libsqlite3-dev libssl-dev
+      - name: Set supported sanitizer shadow-mapping entropy on disposable runner
+        if: matrix.profile == 'tsan'
+        timeout-minutes: 1
+        # Same Linux CI prerequisite as the existing full TSan workflow.
+        # It changes only this ephemeral runner, never a project/live node.
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Record exact source and toolchain (no environment/credentials dump)
+        timeout-minutes: 1
+        run: |
+          git rev-parse HEAD
+          clang++-18 --version
+          cmake --version
+          uname -srmo
+          lscpu
+      - name: Configure exact headless native profile
+        timeout-minutes: 5
+        env:
+          GUARDRAIL_PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          build_type=Debug
+          sanitizers=
+          if [[ "$GUARDRAIL_PROFILE" == tsan ]]; then build_type=RelWithDebInfo; sanitizers=thread; fi
+          timeout --signal=TERM --kill-after=10s 4m cmake -S . -B build-native -G Ninja \
+            -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_BUILD_TYPE="$build_type" -DSANITIZERS="$sanitizers" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON \
+            -DBUILD_TESTS=ON -DENABLE_WALLET=ON -DBUILD_GUI=OFF -DBUILD_GUI_TESTS=OFF \
+            -DBUILD_DAEMON=OFF -DBUILD_CLI=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF \
+            -DBUILD_TX=OFF -DBUILD_UTIL=OFF -DBUILD_WALLET_TOOL=OFF -DBUILD_UTIL_CHAINSTATE=OFF \
+            -DBUILD_KERNEL_LIB=OFF -DBUILD_KERNEL_TEST=OFF -DENABLE_IPC=OFF \
+            -DENABLE_EXTERNAL_SIGNER=OFF -DWITH_ZMQ=OFF -DWITH_USDT=OFF \
+            -DBUILD_FLOWMESH_REGTEST_CLIENT=OFF -DB3_REQUIRE_UPDATE_CHANNEL=OFF
+      - name: Build only the native unit-test executable (bounded two jobs)
+        timeout-minutes: 72
+        run: timeout --signal=TERM --kill-after=30s 70m cmake --build build-native --parallel 2 --target test_bitcoin
+      - name: Verify discovery and execute exact native suites once
+        timeout-minutes: 33
+        env:
+          GUARDRAIL_PROFILE: ${{ matrix.profile }}
+        run: |
+          timeout --signal=TERM --kill-after=10s 32m python3 -B ci/check_flowmesh_native_guardrails.py \
+            --profile "$GUARDRAIL_PROFILE" --build-dir build-native \
+            --output-dir "$RUNNER_TEMP/flowmesh-native-$GUARDRAIL_PROFILE"
+      - name: Preserve compact results only (never generated test data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowmesh-native-${{ matrix.profile }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/flowmesh-native-${{ matrix.profile }}/summary.json
+            ${{ runner.temp }}/flowmesh-native-${{ matrix.profile }}/*.xml
+            ${{ runner.temp }}/flowmesh-native-${{ matrix.profile }}/discovery.txt
+          if-no-files-found: warn
+          retention-days: 7
