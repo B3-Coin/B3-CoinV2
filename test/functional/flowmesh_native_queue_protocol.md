@@ -60,3 +60,35 @@ The initial diagnostic pair used the inherited public-body disk capture in
 both arms. Preserve it separately; it is not the memory-only comparison.
 The harness successor includes the ordinary client (which is not a member of
 the four-operator node list) in memory capture and child-exit observations.
+
+## Verified execution outcome observation
+
+The optional `--performance-require-outcome` selects the explicit
+`native-result-observation-v1` measurement profile. It preserves the original
+inclusion timestamp separately and continues bounded read-only status queries
+until the native client verifies the including entry's applied result. A
+matched-fill sample requires the exact quantity, price, quote paid and fee of
+this existing asset/B3 test profile. Resting orders and cancellations must not
+claim a fill. Endpoint history and a certified inclusion alone are insufficient.
+
+Once any verified inclusion has been observed, the harness never retries that
+instruction, even if a later fresh status becomes unknown. Later certified
+evidence must identify the same entry. Missing/invalid results remain failures
+in the denominator. The legacy inclusion profile keeps its former acceptance
+checks and clock; its numbers cannot be silently relabelled as this profile.
+
+This observes client verification, not durable client outcome qualification.
+The current client intentionally discards receipt labels on restore, and all
+verified-return persistence paths still need their separate durability review.
+The stronger redesign R1/R2 contract also includes the required durable client
+boundary; neither a nine-sample diagnostic nor this flag establishes that gate.
+
+For an outcome-observation pair, add `--performance-require-outcome` to both
+fresh-fixture commands above and retain both reports under their own profile.
+Do not compare its clock with legacy inclusion medians as a speed improvement.
+
+Capture cleanup stops every owned child once and retains its complete or
+partial trace before aggregating errors. Drops, stream-limit markers, malformed
+stop replies and interrupted start metadata invalidate complete attribution.
+An early overflowing child must not hide later children or convert failure into
+successful qualification.

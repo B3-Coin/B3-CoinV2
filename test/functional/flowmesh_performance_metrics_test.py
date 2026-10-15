@@ -3,13 +3,16 @@
 # Distributed under the MIT software license.
 """Offline checks for benchmark bookkeeping; never starts a node."""
 
+import copy
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from feature_flowmesh_performance import FlowMeshPerformanceTest, arrival_offsets, expected_balance, submit_context, summarize_window
+import feature_flowmesh_performance as performance
+from feature_flowmesh_performance import FlowMeshPerformanceTest, arrival_offsets, checked_execution_outcome, expected_balance, submit_context, summarize_window
 from feature_flowmesh_release import TRADE_PRICE
 from flowmesh_performance_analyze import runtime_spans, stats
 
@@ -173,6 +176,132 @@ class CaptureCleanupTest(unittest.TestCase):
         self.assertEqual(invalidations, [True])
         self.assertTrue(owner.performance_report["memory_capture"]["0"]["start_metadata_missing"])
         self.assertTrue((path / "memory-timing-node1.json").exists())
+
+
+class ExecutionOutcomeMeasurementTest(unittest.TestCase):
+    def status(self):
+        return {"receipt_state": "certified_inclusion", "certificate_verified": True,
+            "microblock_hash": "entry", "microblock_sequence": 12, "outcome_verified": True,
+            "outcome": {"status": "applied", "final": True, "evidence": "certified_result_preimage",
+                "microblock_hash": "entry", "microblock_sequence": 12,
+                "fill": {"side": "bid", "superseded_in_entry": False, "quantity": 1,
+                    "cleared": True, "price": TRADE_PRICE, "quote_atoms": TRADE_PRICE,
+                    "fee_atoms": 0, "net_quote_atoms": TRADE_PRICE}}}
+
+    def test_inclusion_is_not_an_execution_result(self):
+        status = self.status()
+        status["outcome_verified"] = False
+        del status["outcome"]
+        self.assertIsNone(checked_execution_outcome(status, "fill_bid"))
+
+    def test_matched_fill_has_exact_certified_quantity_price_and_fee(self):
+        status = self.status()
+        self.assertEqual(checked_execution_outcome(status, "fill_bid"), status["outcome"])
+        for field, value in (("side", "ask"), ("quantity", 0), ("cleared", False),
+                             ("price", TRADE_PRICE - 1), ("fee_atoms", 1),
+                             ("quote_atoms", TRADE_PRICE + 1), ("superseded_in_entry", True)):
+            with self.subTest(field=field):
+                bad = copy.deepcopy(status)
+                bad["outcome"]["fill"][field] = value
+                with self.assertRaises(AssertionError):
+                    checked_execution_outcome(bad, "fill_bid")
+
+    def test_rejected_unverified_and_different_entry_claims_fail(self):
+        status = self.status()
+        for field, value in (("status", "rejected"), ("final", False),
+                             ("evidence", "endpoint_history"), ("microblock_hash", "other"),
+                             ("microblock_sequence", 13)):
+            with self.subTest(field=field):
+                bad = copy.deepcopy(status)
+                bad["outcome"][field] = value
+                with self.assertRaises(AssertionError):
+                    checked_execution_outcome(bad, "fill_bid")
+        status["certificate_verified"] = False
+        with self.assertRaises(AssertionError):
+            checked_execution_outcome(status, "fill_bid")
+
+    def test_resting_order_and_cancel_do_not_claim_a_fill(self):
+        status = self.status()
+        status["outcome"]["fill"].update(quantity=0, quote_atoms=0, fee_atoms=0, net_quote_atoms=0)
+        self.assertIsNotNone(checked_execution_outcome(status, "resting_bid"))
+        with self.assertRaises(AssertionError):
+            checked_execution_outcome(status, "cancel")
+        del status["outcome"]["fill"]
+        self.assertIsNotNone(checked_execution_outcome(status, "cancel"))
+
+    def test_missing_result_never_passes_stronger_gate(self):
+        sample = PerformanceMetricsTest().sample(150)
+        result = summarize_window([sample], [], 1, 1, require_outcomes=True)
+        self.assertFalse(result["correctness_pass"])
+        self.assertFalse(result["performance_pass"])
+        self.assertFalse(result["offer_inclusive_target_pass"])
+
+    def test_outcome_clock_not_faster_inclusion_clock_controls_stronger_gate(self):
+        sample = PerformanceMetricsTest().sample(150)
+        sample.update(execution_outcome_verified_host_us=1000,
+                      execution_outcome_verified_ms=250, execution_outcome_verified_from_offer_ms=270)
+        result = summarize_window([sample], [], 1, 1, require_outcomes=True)
+        self.assertTrue(result["correctness_pass"])
+        self.assertFalse(result["performance_pass"])
+        self.assertEqual(result["execution_outcome_verified_count"], 1)
+        sample.update(execution_outcome_verified_ms=180, execution_outcome_verified_from_offer_ms=190)
+        self.assertTrue(summarize_window([sample], [], 1, 1, require_outcomes=True)["performance_pass"])
+
+    def probe(self, *, require_outcome, included):
+        class ProbeStopped(RuntimeError):
+            pass
+        identity = "a" * 64
+        included = {**included, "action_id": identity}
+        unknown = {"action_id": identity, "receipt_state": "unknown",
+                   "certificate_verified": False, "outcome_verified": False}
+        calls, polls = [], []
+        class RPC:
+            def submitflowmeshorder(self, *args):
+                return copy.deepcopy(included)
+            def getflowmeshactionstatus(self, *args):
+                polls.append(True)
+                return dict(unknown)
+            def retryflowmeshaction(self, *args):
+                calls.append("retry after verified inclusion")
+                return dict(unknown)
+        def stop(deadline):
+            if len(polls) + len(calls) >= 3:
+                raise ProbeStopped()
+        def followup(*args):
+            raise ProbeStopped()
+        owner = SimpleNamespace(
+            options=SimpleNamespace(performance_action_timeout=100, performance_require_outcome=require_outcome),
+            stop_requested=stop, observed_rpc_return_us=lambda: 1_000_000, followup_account_read=followup)
+        worker = {"market_id": "market", "account": {"next_sequence": 0, "account_id": "account",
+            "base_available": 0, "base_reserved": 0, "b3_available_atoms": 2_000_000_000, "b3_reserved_atoms": 0}}
+        sample = {"kind": "fill_bid", "enqueued_host_us": 1_000_000, "scheduled_host_us": 1_000_000,
+                  "attempts": [], "receipt_observations": []}
+        clock = iter(range(10, 1000, 10))
+        with patch.object(performance, "host_us", return_value=1_000_000), \
+             patch.object(performance.time, "monotonic", side_effect=lambda: next(clock)), \
+             patch.object(performance.time, "sleep"):
+            with self.assertRaises(ProbeStopped):
+                FlowMeshPerformanceTest.execute_action(owner, worker, RPC(), [], sample)
+        return sample, calls, polls
+
+    def test_observed_inclusion_permanently_disables_harness_retry(self):
+        included = self.status()
+        included["outcome_verified"] = False
+        del included["outcome"]
+        sample, calls, polls = self.probe(require_outcome=True, included=included)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(polls), 3)
+        self.assertEqual(sample["client_certified_host_us"], 1_000_000)
+        self.assertNotIn("execution_outcome", sample)
+
+    def test_legacy_profile_does_not_gain_stronger_result_assertions(self):
+        included = self.status()
+        included["outcome"]["fill"]["quantity"] = 123
+        sample, calls, polls = self.probe(require_outcome=False, included=included)
+        self.assertEqual(calls, [])
+        self.assertEqual(polls, [])
+        self.assertIn("client_certified_host_us", sample)
+        self.assertNotIn("execution_outcome", sample)
 
 
 if __name__ == "__main__":

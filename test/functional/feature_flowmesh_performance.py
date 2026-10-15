@@ -91,6 +91,38 @@ def compact_error(error):
     return result
 
 
+def checked_execution_outcome(status, kind):
+    """Require the client's certified result, not inclusion or history claims.
+
+    This observes verification by the native client. It does not establish
+    that its outcome receipt was synchronously saved on every return path.
+    Fee/price assertions are the existing asset/B3 test profile, not V2 rules.
+    """
+    assert_equal(status["outcome_verified"], "outcome" in status)
+    if not status["outcome_verified"]:
+        return None
+    assert_equal(status["receipt_state"], "certified_inclusion")
+    assert_equal(status["certificate_verified"], True)
+    outcome = status["outcome"]
+    assert_equal((outcome["status"], outcome["final"], outcome["evidence"]),
+                 ("applied", True, "certified_result_preimage"))
+    assert_equal(outcome["microblock_hash"], status["microblock_hash"])
+    assert_equal(outcome["microblock_sequence"], status["microblock_sequence"])
+    if kind == "cancel":
+        assert "fill" not in outcome, outcome
+    else:
+        assert kind in {"fill_bid", "resting_bid"}, kind
+        fill = outcome["fill"]
+        assert_equal((fill["side"], fill["superseded_in_entry"]), ("bid", False))
+        assert_equal(fill["quantity"], 1 if kind == "fill_bid" else 0)
+        quote_atoms = TRADE_PRICE if kind == "fill_bid" else 0
+        assert_equal((fill["quote_atoms"], fill["fee_atoms"], fill["net_quote_atoms"]),
+                     (quote_atoms, 0, quote_atoms))
+        if kind == "fill_bid":
+            assert_equal((fill["cleared"], fill["price"]), (True, TRADE_PRICE))
+    return outcome
+
+
 class ObservedClientRPC:
     """Measure existing wallet RPC calls; never inject API fields or headers."""
     def __init__(self, owner, rpc, wallet):
@@ -159,15 +191,18 @@ def submit_context(record):
     return params["market_id"], params["action_id"]
 
 
-def summarize_window(samples, backlog, duration, elapsed_to_drain=None):
+def summarize_window(samples, backlog, duration, elapsed_to_drain=None, *, require_outcomes=False):
     complete = [row for row in samples if row["status"] == "complete"]
     metrics = {}
     for field in ("client_certified_ms", "client_certified_from_offer_ms", "admitted_observed_ms",
                   "account_state_verified_ms", "account_state_verified_from_offer_ms",
                   "every_replica_observed_ms", "initial_response_ms", "worker_queue_ms",
-                  "scheduler_lateness_ms"):
+                  "scheduler_lateness_ms", "execution_outcome_verified_ms",
+                  "execution_outcome_verified_from_offer_ms"):
         metrics[field] = distribution([row[field] for row in samples if field in row], 600)
-    certification = metrics["client_certified_ms"]
+    certification = metrics["execution_outcome_verified_ms" if require_outcomes else "client_certified_ms"]
+    offer_metric = metrics["execution_outcome_verified_from_offer_ms" if require_outcomes else "client_certified_from_offer_ms"]
+    required_outcomes_present = not require_outcomes or certification["count"] == len(samples)
     edge = max(1, min(30, len(backlog) // 4))
     early = statistics.median([row["outstanding"] for row in backlog[:edge]]) if backlog else 0
     late = statistics.median([row["outstanding"] for row in backlog[-edge:]]) if backlog else 0
@@ -178,6 +213,8 @@ def summarize_window(samples, backlog, duration, elapsed_to_drain=None):
     return {
         "offered": len(samples), "completed": len(complete),
         "certified_inclusion_count": sum("client_certified_host_us" in row for row in samples),
+        "execution_outcome_verified_count": sum("execution_outcome_verified_host_us" in row for row in samples),
+        "execution_outcomes_required": require_outcomes,
         "read_consistency_pass": read_consistency,
         "failed_followup_read_count": sum(len(row.get("read_consistency_failures", [])) for row in samples),
         "read_recovered_action_count": sum(row.get("account_read_recovered", False) for row in samples),
@@ -203,12 +240,11 @@ def summarize_window(samples, backlog, duration, elapsed_to_drain=None):
         "metrics": metrics, "queue_growth": queue_growth,
         "early_outstanding_median": early, "late_outstanding_median": late,
         "workload_completion_pass": len(complete) == len(samples) and bool(samples),
-        "correctness_pass": len(complete) == len(samples) and bool(samples) and read_consistency,
-        "performance_pass": bool(samples) and len(complete) == len(samples) and read_consistency and not queue_growth and
+        "correctness_pass": len(complete) == len(samples) and bool(samples) and read_consistency and required_outcomes_present,
+        "performance_pass": bool(samples) and len(complete) == len(samples) and read_consistency and required_outcomes_present and not queue_growth and
             certification["p50_ms"] <= 200 and certification["p95_ms"] <= 600,
-        "offer_inclusive_target_pass": bool(samples) and len(complete) == len(samples) and
-            metrics["client_certified_from_offer_ms"]["p50_ms"] <= 200 and
-            metrics["client_certified_from_offer_ms"]["p95_ms"] <= 600,
+        "offer_inclusive_target_pass": bool(samples) and len(complete) == len(samples) and required_outcomes_present and
+            offer_metric["p50_ms"] <= 200 and offer_metric["p95_ms"] <= 600,
     }
 
 
@@ -231,6 +267,8 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                             help="Start bounded regtest-only memory timing after setup; freeze after measured work")
         parser.add_argument("--performance-rpc-trace", action="store_true",
                             help="Bounded in-memory RPC observations after setup, without public-body disk capture")
+        parser.add_argument("--performance-require-outcome", action="store_true",
+                            help="Require verified applied/fill outcomes, not only inclusion; not durable-outcome qualification")
         parser.add_argument("--performance-read-recovery", action="store_true",
                             help="Optional bounded read-only follow-up recovery; preserves read failure and fails final exit")
 
@@ -625,11 +663,31 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 sample["admitted_observed_host_us"] = status_observed
                 sample["admitted_observed_ms"] = (status_observed - started) / 1000
             if state == "certified_inclusion":
-                break
+                assert_equal(status["certificate_verified"], True)
+                if "client_certified_host_us" not in sample:
+                    sample.update(client_certified_host_us=status_observed,
+                        certified_entry=(status["microblock_sequence"], status["microblock_hash"]),
+                        client_certified_ms=(status_observed - started) / 1000,
+                        client_certified_from_offer_ms=(status_observed - sample["scheduled_host_us"]) / 1000)
+                assert_equal((status["microblock_sequence"], status["microblock_hash"]), sample["certified_entry"])
+                # Keep the legacy inclusion experiment's checks unchanged.
+                # The strict applied-result assertions belong only to the new
+                # explicitly selected observation profile.
+                assert_equal(status["outcome_verified"], "outcome" in status)
+                assert "outcome" not in status or status["outcome"]["microblock_hash"] == status.get("microblock_hash"), status
+                outcome = checked_execution_outcome(status, kind) if self.options.performance_require_outcome else None
+                if outcome is not None:
+                    sample.update(execution_outcome=outcome, execution_outcome_verified_host_us=status_observed,
+                        execution_outcome_verified_ms=(status_observed - started) / 1000,
+                        execution_outcome_verified_from_offer_ms=(status_observed - sample["scheduled_host_us"]) / 1000)
+                if not self.options.performance_require_outcome or outcome is not None:
+                    break
             self.stop_requested(deadline)
             assert_equal(status["action_id"], action_id)
-            retryable = status["receipt_state"] == "unknown" or (
-                status["receipt_state"] == "rejected" and status.get("reason") in PRE_ADMISSION_REJECTIONS)
+            # Inclusion is sticky for retry policy even if a later fresh
+            # status is unknown. Outcome discovery is read-only from here.
+            retryable = "client_certified_host_us" not in sample and (status["receipt_state"] == "unknown" or (
+                status["receipt_state"] == "rejected" and status.get("reason") in PRE_ADMISSION_REJECTIONS))
             assert status["receipt_state"] != "rejected" or retryable, status
             if retryable and time.monotonic() >= next_retry:
                 retry = rpc.retryflowmeshaction(market, action_id)
@@ -642,14 +700,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             time.sleep(.005)
             status = rpc.getflowmeshactionstatus(market, action_id)
             status_observed = self.observed_rpc_return_us()
-        certified = status_observed
-        assert_equal(status["certificate_verified"], True)
-        # A verified outcome, when present, is the including entry's own.
-        assert_equal(status["outcome_verified"], "outcome" in status)
-        assert "outcome" not in status or status["outcome"]["microblock_hash"] == status.get("microblock_hash"), status
-        sample.update(certified_status=status, client_certified_host_us=certified,
-                      client_certified_ms=(certified - started) / 1000,
-                      client_certified_from_offer_ms=(certified - sample["scheduled_host_us"]) / 1000)
+        sample["certified_status"] = status
         expected = expected_balance(before, kind)
         while True:
             self.stop_requested(deadline)
@@ -668,7 +719,9 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                       account_state_verified_from_offer_ms=(account_observed - sample["scheduled_host_us"]) / 1000,
                       account_after=expected, certified_account_state_checked=True,
                       fill_evidence={"expected_fill_units": 1 if kind == "fill_bid" else 0,
-                          "authenticated_balance_delta_checked": True, "execution_result_verified": False,
+                          "authenticated_balance_delta_checked": True,
+                          "execution_result_verified": "execution_outcome" in sample,
+                          "durable_client_outcome_qualified": False,
                           "history_endpoint_reported": True,
                           "reported_matching_entries": [row for row in data["history"]["entries"]
                               if row["microblock_hash"] == status["microblock_hash"]]})
@@ -718,6 +771,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                     worker["failed"] = True
                     sample.update(status="failed", error=compact_error(error), failed_host_us=host_us())
                     sample["failed_stage"] = ("before_certificate_inclusion" if "client_certified_host_us" not in sample else
+                                              "verified_execution_outcome" if self.options.performance_require_outcome and "execution_outcome" not in sample else
                                               "followup_account_read" if "account_state_verified_host_us" not in sample else
                                               "replica_or_retained_action_observation")
                 finally:
@@ -802,7 +856,8 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         window["heights"] = {"before": heights, "after": [node.getblockcount() for node in self.nodes]}
         window["drained_host_us"] = host_us()
         window["summary"] = summarize_window(window["samples"], window["backlog"], duration,
-                                              (window["drained_host_us"] - window["start_host_us"]) / 1_000_000)
+            (window["drained_host_us"] - window["start_host_us"]) / 1_000_000,
+            require_outcomes=self.options.performance_require_outcome)
         window["summary"]["planned_offers_preserved"] = len(window["samples"]) == count
         window["summary"]["b3_advanced"] = all(after > before for before, after in
                                                zip(heights, window["heights"]["after"]))
@@ -1013,13 +1068,16 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             "scope": {"operators": 4, "ordinary_client_processes": 1, "buyer_accounts": BUYERS,
                 "markets": self.options.performance_markets, "transport": "independent TCP + ordinary HTTPS via TLS relay",
                 "scheduled_offer_clock": "Python monotonic; fixed deadlines independent of completion",
-                "primary_gate_clock": "original client submission RPC call to client verified certificate inclusion",
+                "primary_gate_clock": ("original client submission RPC call to client verified applied execution outcome"
+                    if self.options.performance_require_outcome else
+                    "original client submission RPC call to client verified certificate inclusion"),
                 "primary_gate": {"p50_ms": 200, "p95_ms": 600},
                 "account_sequencing": "one unresolved instruction per account/market; bounded queue preserves offered arrivals",
                 "client_serialization": "wallets share one daemon backend and its existing m_work mutex",
                 "replica_times": "serial observer upper bounds, not disk-append timestamps",
                 "fill_evidence": "authenticated buyer/maker balance deltas plus exact fees; endpoint history reported separately",
-                "execution_result_verified": False, "faults_injected": False,
+                "execution_outcomes_required": self.options.performance_require_outcome,
+                "durable_client_outcome_qualified": False, "faults_injected": False,
                 "not_qualified": ["WAN", "multiple client processes", "power-loss durability", "fault recovery"]},
             "samples": [], "windows": [], "logging_checks": [], "clock_offsets": {},
             "correctness_pass": False, "performance_pass": False,
@@ -1031,7 +1089,8 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 "burst_actions": 8, "read_recovery_enabled": self.options.performance_read_recovery,
                 "read_recovery_delays_seconds": list(READ_RECOVERY_DELAYS) if self.options.performance_read_recovery else [],
                 "read_recovery_never_converts_first_read_failure_to_success": True,
-                "public_trace_enabled": self.options.performance_public_trace}}
+                "public_trace_enabled": self.options.performance_public_trace,
+                "outcome_measurement_profile": "native-result-observation-v1" if self.options.performance_require_outcome else "legacy-inclusion-v1"}}
         self.latency_report = self.performance_report
         if self.options.performance_profile == "native-queue":
             self.performance_report["campaign"].update(planned_windows=["isolated_fill", "burst_8"],
