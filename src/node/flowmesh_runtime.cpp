@@ -374,8 +374,16 @@ struct FlowMeshRuntime::Market {
         public_submissions.erase(it);
     }
     //! A queued action's notice: its ring and, for PUBLIC, its submitter.
+    //! While an accepted source is processed, its own immutable attribution
+    //! wins over a bounded map entry that may since have been recycled.
+    std::optional<flowmesh::ClientActionNotice> local_notice_origin;
     void TagNotice(flowmesh::ClientActionNotice& notice) const
     {
+        if (local_notice_origin && local_notice_origin->action_id == notice.action_id) {
+            notice.origin = local_notice_origin->origin;
+            notice.submitter = local_notice_origin->submitter;
+            return;
+        }
         notice.origin = NoticeOrigin(notice.action_id);
         notice.submitter.clear();
         if (notice.origin != flowmesh::ClientNoticeOrigin::PUBLIC) return;
@@ -2238,8 +2246,11 @@ void FlowMeshRuntime::DeferMessage(Market& market, const flowmesh::QueuedWireMes
     const size_t bytes{queued.message.MemoryUsage()};
     const auto peer_count{std::count_if(m_deferred_messages.begin(), m_deferred_messages.end(),
         [&](const auto& item) { return item.second.peer == queued.peer; })};
-    if (m_deferred_messages.size() >= 128 || bytes > 16 * 1024 * 1024 - m_deferred_bytes ||
-        market.delivery.deferred_objects >= 16 || peer_count >= 8) {
+    const size_t local_reserved_market{static_cast<size_t>(std::count_if(m_local_action_sources.begin(), m_local_action_sources.end(),
+        [&](const auto& item) { return item.second.queued.message.header.market_id == market.market_id && !item.second.deferred; }))};
+    if (m_deferred_messages.size() + m_local_action_sources.size() >= 128 ||
+        bytes > 16 * 1024 * 1024 - m_deferred_bytes - m_local_action_source_bytes ||
+        market.delivery.deferred_objects + local_reserved_market >= 16 || peer_count >= 8) {
         CountObservation(market.delivery.receive_refused);
         market.delivery.current_reason = "receive_retention_full";
         DeliveryEvent(market, "receive_discarded", queued.message.kind, key,
@@ -2266,7 +2277,7 @@ void FlowMeshRuntime::DeferMessage(Market& market, const flowmesh::QueuedWireMes
 
 void FlowMeshRuntime::RetryDeferredMessages()
 {
-    if (m_deferred_messages.empty() && m_receive_recovery.empty()) return;
+    if (m_deferred_messages.empty() && m_receive_recovery.empty() && m_local_action_sources.empty()) return;
     const auto now{m_config.clock->Now()};
     // Every market shares this one chain gate; sample it once per pass. The
     // requeued copy passes the gate again in ProcessMessage, so a gate that
@@ -2283,8 +2294,11 @@ void FlowMeshRuntime::RetryDeferredMessages()
     if (open && !reopened && now < m_next_deferred_retry) return;
     if (open) m_next_deferred_retry = now + DEFERRED_RETRY_INTERVAL;
     const size_t budget{reopened ? DEFERRED_REOPEN_BUDGET : DEFERRED_PASS_BUDGET};
+    // Reserve a fair share for accepted originals, but keep the SAME total
+    // 8/32 inspected-record bound. No local source means the old full budget.
+    const size_t local_scanned{RetryLocalActionAdmissions(open, reopened ? budget : std::min<size_t>(2, budget), reopened)};
     auto it{m_deferred_messages.upper_bound(m_deferred_cursor)};
-    for (size_t scanned{0}, maximum{std::min<size_t>(m_deferred_messages.size(), budget)};
+    for (size_t scanned{0}, maximum{std::min<size_t>(m_deferred_messages.size(), budget - local_scanned)};
          scanned < maximum && !m_deferred_messages.empty(); ++scanned) {
         if (it == m_deferred_messages.end()) it = m_deferred_messages.begin();
         const auto current{it++};
@@ -3113,14 +3127,20 @@ bool FlowMeshRuntime::Start(std::string& error)
         LOCK(m_read_mutex);
         initialization_retired.swap(m_retired_read_views);
     };
-    std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
+    std::unique_lock<std::mutex> queue_lock{m_queue_mutex};
     if (m_started) return true;
+    // Keep the live idempotent path queue-only. Initialization and producer
+    // reservations use market -> queue, never the inverse: a concurrent
+    // first Start must not deadlock an accepted-source enqueue or maintenance.
+    queue_lock.unlock();
     {
         FlowMeshTimingSpan timing_lock_2761{__func__};
         timing_lock_2761.Field("lock_name", std::string{"market_mutex"});
         timing_lock_2761.Mark("lock_requested_us");
         std::lock_guard<std::mutex> market_lock{m_market_mutex};
         timing_lock_2761.Mark("lock_acquired_us");
+        queue_lock.lock();
+        if (m_started) return true; // Another initializer won while unlocked.
         m_client_events.Reset(GetRandHash());
         if (!InitializeMarkets(error)) {
             detach_initialization();
@@ -3186,6 +3206,9 @@ void FlowMeshRuntime::Stop()
         std::lock_guard<std::mutex> market_lock{m_market_mutex};
         timing_lock_2801.Mark("lock_acquired_us");
         while (!m_deliveries.empty()) EraseDelivery(m_deliveries.begin()->first, "stopped");
+        // The queue may still contain token copies. Tokens never reset, so
+        // those copies cannot claim any source after a later Start.
+        while (!m_local_action_sources.empty()) ReleaseLocalAction(m_local_action_sources.begin()->first);
         m_deferred_messages.clear();
         m_deferred_deadlines.clear();
         m_deferred_bytes = 0;
@@ -3217,8 +3240,12 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
 }
 
 flowmesh::QueueResult FlowMeshRuntime::Enqueue(
-    const flowmesh::WirePeerId peer, flowmesh::WireMessage message, const bool counted)
+    const flowmesh::WirePeerId peer, flowmesh::WireMessage message, const bool counted,
+    const uint64_t local_retention_id)
 {
+    if (local_retention_id && (peer != LOCAL_ACTION_PEER || message.kind != flowmesh::WireMessageKind::ACTION)) {
+        return flowmesh::QueueResult::MALFORMED;
+    }
     WorkerTrace trace{*m_config.clock, "wire_enqueue"};
     trace.Wire(message, peer);
     if (message.kind == flowmesh::WireMessageKind::AGREEMENT &&
@@ -3401,7 +3428,7 @@ flowmesh::QueueResult FlowMeshRuntime::Enqueue(
     }
     if (trace.enabled) trace.enqueue_started_us = TraceNow(*m_config.clock);
     const auto result{m_queue.Push(peer, std::move(message),
-                                   m_config.clock->Now(), counted)};
+                                   m_config.clock->Now(), counted, local_retention_id)};
     if (trace.enabled) {
         trace.enqueued_us = TraceNow(*m_config.clock);
         trace.result = result;
@@ -3600,12 +3627,24 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
     }
     flowmesh::WireMessage message;
     TraceContext trace;
+    // Never renew the wrapper's original retention window after deposit
+    // facts, queue contention or subsequent retry work.
+    const auto original_deadline{m_config.clock->Now() + DELIVERY_PAUSE_MAX_AGE};
     std::optional<flowmesh::ClientActionNotice> notice;
     uint256 domain, config_id;
     const flowmesh::DepositVerifier* deposits{nullptr};
     bool pooled{false};
-    // A queued frame counted towards its public submitter (NotePublicFrame).
-    bool counted{false};
+    struct PreflightSource {
+        FlowMeshRuntime& runtime;
+        uint64_t id{0};
+        bool transferred{false};
+        ~PreflightSource()
+        {
+            if (!id || transferred) return;
+            std::lock_guard lock{runtime.m_market_mutex};
+            runtime.ReleaseLocalAction(id);
+        }
+    } source{*this};
     {
         FlowMeshTimingSpan timing_lock_3034{__func__};
         timing_lock_3034.Field("lock_name", std::string{"market_mutex"});
@@ -3636,6 +3675,8 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
             domain = it->second->domain;
             config_id = it->second->State().ConfigId();
         } else {
+            domain = it->second->domain;
+            config_id = it->second->State().ConfigId();
             message.kind = flowmesh::WireMessageKind::ACTION;
             message.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market_id,
                               it->second->seats.epoch,
@@ -3652,13 +3693,22 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
                 notice = LocalNotice(*it->second, action, out.admission, *payload);
                 tag(*notice);
             }
-            // Its later worker and drop notices keep this origin's ring and,
-            // for PUBLIC, the submitter's share of it while it is live here.
+            // Node refusals keep their origin. Public frame ownership is
+            // reserved below, before any potentially blocking deposit facts.
             if (origin == flowmesh::ClientNoticeOrigin::NODE) {
                 it->second->NoteNodeOrigin(action.Id());
-            } else {
-                counted = it->second->NotePublicFrame(action.Id(), submitter);
             }
+        }
+    }
+    if (out.admission.kind == FlowMeshLocalAdmission::Kind::ENQUEUE) {
+        // Preflight owns the exact original and its frame count before any
+        // chain/facts wait. Until enqueue, admitted=false permits expiry but
+        // never maintenance submission. Failure/exception releases only this
+        // token; delayed facts can neither renew it nor allocate a new one.
+        source.id = ReserveLocalAction(message, domain, config_id, origin, submitter, original_deadline);
+        if (!source.id) {
+            out.queued = flowmesh::QueueResult::GLOBAL_LIMIT;
+            return out;
         }
     }
     if (out.admission.kind == FlowMeshLocalAdmission::Kind::ENQUEUE && action.IsDeposit() && !pooled) {
@@ -3677,17 +3727,6 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
             if (notice) {
                 notice->code = out.admission.code;
                 m_client_events.AppendNotices({std::move(*notice)});
-            }
-            if (counted) {
-                // Never queued: settle the frame this attempt counted.
-                FlowMeshTimingSpan timing_lock{__func__};
-                timing_lock.Field("lock_name", std::string{"market_mutex"});
-                timing_lock.Mark("lock_requested_us");
-                std::lock_guard<std::mutex> lock{m_market_mutex};
-                timing_lock.Mark("lock_acquired_us");
-                if (const auto it{m_markets.find(market_id)}; it != m_markets.end()) {
-                    it->second->PublicFrameDone(action.Id());
-                }
             }
             return out;
         }
@@ -3713,7 +3752,10 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
     trace.wire_hash = WireTrace(message).wire_hash;
     const uint64_t sequence{message.header.sequence};
     out.cursor_before = m_client_events.Cursor();
-    const auto result{Enqueue(LOCAL_ACTION_PEER, std::move(message), counted)};
+    // Reserve the exact original before the queue can acknowledge it. A
+    // temporary gate or a priority eviction cannot consume this source.
+    const auto result{EnqueueReservedLocalAction(source.id)};
+    source.transferred = result == flowmesh::QueueResult::ACCEPTED;
     out.queued = result;
     trace.observed_monotonic_us = TraceNow(*m_config.clock);
     // Preserve submission's original lock scope. This is the observed push
@@ -3736,12 +3778,147 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
             ClientActionEvent(*it->second, flowmesh::ClientEventKind::QUEUE_ADMITTED,
                               action, "bounded runtime queue only; pool admission is pending");
         }
-        // A refused frame never reaches the worker: settle it here.
-        if (it != m_markets.end() && counted && result != flowmesh::QueueResult::ACCEPTED) {
-            it->second->PublicFrameDone(action.Id());
-        }
+        // Reservation ownership settles a refused enqueue exactly once.
     }
     return out;
+}
+
+uint64_t FlowMeshRuntime::ReserveLocalAction(
+    const flowmesh::WireMessage& message, const uint256& domain, const uint256& config,
+    const flowmesh::ClientNoticeOrigin origin, const std::string& submitter,
+    const flowmesh::WireClock::time_point deadline)
+{
+    const auto action{flowmesh::DecodeProductionActionPayload(message.payload)};
+    flowmesh::WireCheck check;
+    if (message.kind != flowmesh::WireMessageKind::ACTION ||
+        !flowmesh::CheckWireMessage(message, check) || !action || submitter.size() > 128) return 0;
+    std::lock_guard lock{m_market_mutex};
+    const auto found{m_markets.find(message.header.market_id)};
+    if (found == m_markets.end() || !found->second->ready || found->second->halt != FlowMeshRuntimeHalt::NONE ||
+        found->second->domain != domain || found->second->State().ConfigId() != config) return 0;
+    auto& market{*found->second};
+    const auto now{m_config.clock->Now()};
+    if (now >= deadline || deadline > now + DELIVERY_PAUSE_MAX_AGE) return 0;
+    // Eight is the existing per-peer deferred allowance. Keeping it as a
+    // producer reservation also leaves at least120 global/eight per-market
+    // slots for critical recovery, never evicting a recovery obligation.
+    const size_t bytes{message.MemoryUsage() + submitter.size()};
+    const size_t local_market{static_cast<size_t>(std::count_if(m_local_action_sources.begin(), m_local_action_sources.end(),
+        [&](const auto& item) { return item.second.queued.message.header.market_id == message.header.market_id; }))};
+    const size_t remote_market{static_cast<size_t>(std::count_if(m_deferred_messages.begin(), m_deferred_messages.end(),
+        [&](const auto& item) { return item.second.message.header.market_id == message.header.market_id; }))};
+    if (m_local_action_sources.size() >= 8 || m_local_action_sources.size() + m_deferred_messages.size() >= 128 ||
+        local_market + remote_market >= 16 || bytes > 16 * 1024 * 1024 - m_deferred_bytes - m_local_action_source_bytes ||
+        m_next_local_action_source == 0 || m_next_local_action_source == std::numeric_limits<uint64_t>::max()) return 0;
+    const uint64_t id{m_next_local_action_source++};
+    auto [it, inserted]{m_local_action_sources.emplace(id, LocalActionSource{
+        .queued = {LOCAL_ACTION_PEER, message, false, id}, .domain = domain, .config = config,
+        .action_id = action->Id(), .origin = origin, .submitter = submitter,
+        .deadline = deadline, .next_queue_attempt = now + DEFERRED_RETRY_INTERVAL,
+        .bytes = bytes})};
+    (void)inserted;
+    try {
+        if (origin == flowmesh::ClientNoticeOrigin::PUBLIC) {
+            it->second.queued.counted = market.NotePublicFrame(action->Id(), submitter);
+            if (it->second.queued.counted) it->second.public_serial = market.public_submissions.at(action->Id()).serial;
+        } else {
+            market.NoteNodeOrigin(action->Id());
+        }
+    } catch (...) {
+        m_local_action_sources.erase(it);
+        throw;
+    }
+    m_local_action_source_bytes += bytes;
+    return id;
+}
+
+flowmesh::QueueResult FlowMeshRuntime::EnqueueReservedLocalAction(const uint64_t id)
+{
+    std::lock_guard lock{m_market_mutex};
+    return EnqueueReservedLocalActionLocked(id);
+}
+
+flowmesh::QueueResult FlowMeshRuntime::EnqueueReservedLocalActionLocked(const uint64_t id)
+{
+    const auto found{m_local_action_sources.find(id)};
+    if (found == m_local_action_sources.end()) return flowmesh::QueueResult::STOPPED;
+    auto& source{found->second};
+    if (m_config.clock->Now() >= source.deadline) {
+        ReleaseLocalAction(id);
+        return flowmesh::QueueResult::RECONCILING;
+    }
+    const bool initial{!source.admitted};
+    source.admitted = true;
+    const auto result{Enqueue(LOCAL_ACTION_PEER, source.queued.message, source.queued.counted, id)};
+    if (initial && result != flowmesh::QueueResult::ACCEPTED) ReleaseLocalAction(id);
+    return result;
+}
+
+void FlowMeshRuntime::ReleaseLocalAction(const uint64_t id)
+{
+    const auto found{m_local_action_sources.find(id)};
+    if (found == m_local_action_sources.end()) return;
+    const auto& source{found->second};
+    if (const auto market{m_markets.find(source.queued.message.header.market_id)}; market != m_markets.end()) {
+        if (source.deferred) {
+            --market->second->delivery.deferred_objects;
+            market->second->delivery.deferred_bytes -= source.bytes;
+        }
+        // A bounded attribution map may have recycled this ActionId. Never
+        // settle a later source's frame count on that new serial.
+        const auto owner{market->second->public_submissions.find(source.action_id)};
+        if (source.queued.counted && owner != market->second->public_submissions.end() &&
+            owner->second.serial == source.public_serial) market->second->PublicFrameDone(source.action_id);
+    }
+    m_local_action_source_bytes -= source.bytes;
+    m_local_action_sources.erase(found);
+}
+
+void FlowMeshRuntime::DeferLocalAction(const uint64_t id, const bool observed_chain_gate_closed)
+{
+    auto& source{m_local_action_sources.at(id)};
+    auto& market{*m_markets.at(source.queued.message.header.market_id)};
+    // A seat-context pause can coexist with an open B3 gate. It must not
+    // fabricate a closed -> open edge on every tick and bypass retry pacing.
+    if (observed_chain_gate_closed) m_deferred_gate_open = false;
+    if (!source.deferred) {
+        source.deferred = true;
+        ++market.delivery.deferred_objects;
+        market.delivery.deferred_bytes += source.bytes;
+        CountObservation(market.delivery.receive_deferred);
+        DeliveryEvent(market, "local_action_authority_deferred", flowmesh::WireMessageKind::ACTION,
+                      source.action_id, source.queued.message.header.sequence, LOCAL_ACTION_PEER,
+                      "same accepted original retained; not a resend or nonexecution proof");
+    }
+}
+
+size_t FlowMeshRuntime::RetryLocalActionAdmissions(const bool open, const size_t budget, const bool reopened)
+{
+    const auto now{m_config.clock->Now()};
+    auto it{m_local_action_sources.upper_bound(m_local_action_source_cursor)};
+    const size_t maximum{std::min(m_local_action_sources.size(), budget)};
+    for (size_t scanned{0}; scanned < maximum && !m_local_action_sources.empty(); ++scanned) {
+        if (it == m_local_action_sources.end()) it = m_local_action_sources.begin();
+        const auto current{it++};
+        const uint64_t id{current->first};
+        m_local_action_source_cursor = id;
+        auto& source{current->second};
+        if (now >= source.deadline) {
+            auto& market{*m_markets.at(source.queued.message.header.market_id)};
+            // Cache expiry proves nothing about execution elsewhere. Do not
+            // emit POOL_REFUSED, which clients present as endpoint rejection.
+            DeliveryEvent(market, "local_action_retention_expired", flowmesh::WireMessageKind::ACTION,
+                source.action_id, source.queued.message.header.sequence, LOCAL_ACTION_PEER,
+                "bounded accepted-action retention expired; original outcome remains unknown; reconcile exact instruction");
+            ReleaseLocalAction(id);
+        } else if (source.admitted && open && (reopened || now >= source.next_queue_attempt)) {
+            // A queue copy may have been evicted by higher-priority recovery.
+            // Its source survives, and every new copy carries the same token.
+            source.next_queue_attempt = now + DEFERRED_RETRY_INTERVAL;
+            (void)EnqueueReservedLocalActionLocked(id);
+        }
+    }
+    return maximum;
 }
 
 std::shared_ptr<const FlowMeshRuntime::ReadView> FlowMeshRuntime::LoadReadView(
@@ -4488,6 +4665,75 @@ void FlowMeshRuntime::ProcessMessage(
     const auto it{m_markets.find(queued.message.header.market_id)};
     if (it == m_markets.end()) return;
     Market& market{*it->second};
+    // A local token is never a wire field. Check its entire owned wrapper,
+    // not ActionId (which intentionally excludes the credential), before it
+    // can claim retention or public attribution. Stale/duplicate queue copies
+    // after release/expiry/Stop are inert and cannot execute or settle again.
+    struct LocalSourceSettle {
+        FlowMeshRuntime& runtime;
+        Market& market;
+        uint64_t id{0};
+        bool keep{false};
+        ~LocalSourceSettle()
+        {
+            market.local_notice_origin.reset();
+            if (id && !keep) runtime.ReleaseLocalAction(id);
+        }
+    } local_source{*this, market};
+    if (queued.local_retention_id) {
+        const auto source{m_local_action_sources.find(queued.local_retention_id)};
+        if (queued.peer != LOCAL_ACTION_PEER || queued.message.kind != flowmesh::WireMessageKind::ACTION ||
+            source == m_local_action_sources.end() || source->second.queued.message.header != queued.message.header ||
+            source->second.queued.message.payload != queued.message.payload ||
+            source->second.queued.counted != queued.counted) return;
+        local_source.id = source->first;
+        flowmesh::ClientActionNotice origin;
+        origin.action_id = source->second.action_id;
+        origin.origin = source->second.origin;
+        origin.submitter = source->second.submitter;
+        market.local_notice_origin = std::move(origin);
+        if (!market.ready || market.halt != FlowMeshRuntimeHalt::NONE) return;
+        const auto action{flowmesh::DecodeProductionActionPayload(queued.message.payload)};
+        if (!action) return;
+        if (m_config.clock->Now() >= source->second.deadline) {
+            DeliveryEvent(market, "local_action_retention_expired", flowmesh::WireMessageKind::ACTION,
+                source->second.action_id, source->second.queued.message.header.sequence, LOCAL_ACTION_PEER,
+                "bounded accepted-action retention expired; original outcome remains unknown; reconcile exact instruction");
+            return;
+        }
+        if (source->second.domain != market.domain || source->second.config != market.State().ConfigId()) {
+            DeliveryEvent(market, "local_action_binding_changed", flowmesh::WireMessageKind::ACTION,
+                source->second.action_id, source->second.queued.message.header.sequence, LOCAL_ACTION_PEER,
+                "accepted local action binding changed; original outcome remains unknown");
+            return;
+        }
+        // Provably malformed/forged originals do not shelter behind a closed
+        // authority gate. A reward claim's existing96-byte canonical BLS
+        // representation can be checked without historical membership. That
+        // cheap necessary check is NOT authentication: valid encodings still
+        // need the unchanged historical membership/signature check when open.
+        const bool reward_claim{static_cast<flowmesh::ActionType>(action->type) == flowmesh::ActionType::CLAIM_SEAT_REWARD};
+        const bool retainable_credential{reward_claim
+            ? action->credential.size() == flowmesh::FLOWMESH_SEAT_REWARD_CREDENTIAL_SIZE &&
+                bls::Signature::Decode(action->credential).has_value()
+            : flowmesh::CheckProductionActionCredential(*action, market.domain, market.State().ConfigId(), market.market_id)};
+        if (!retainable_credential) {
+            ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action,
+                "pool refused this attempt (authentication, conflicting sequence or capacity); not an execution result",
+                nullptr, flowmesh::ActionReasonCode::UNAUTHENTICATED);
+            return;
+        }
+        if (queued.message.header.version != flowmesh::FLOWMESH_WIRE_VERSION_V1 ||
+            queued.message.header.epoch != market.seats.epoch ||
+            queued.message.header.sequence > market.next_sequence ||
+            market.next_sequence - queued.message.header.sequence > ACTION_HEADER_BEHIND) {
+            // Preserve the existing pool/inclusion-first answer and permanent
+            // wrapper refusals; a closed gate cannot shelter a wrong epoch or
+            // expand the unchanged two-slot retained-interval requirement.
+            HandleAction(market, LOCAL_ACTION_PEER, queued.message);
+            return;
+        }
+    }
     // A counted local action frame leaves the queue here however it is
     // answered, including by every early return below. Its public submitter
     // is settled on the way out, after any notice about it was tagged. Only
@@ -4501,7 +4747,7 @@ void FlowMeshRuntime::ProcessMessage(
             if (id) market.PublicFrameDone(*id);
         }
     } settle{market, std::nullopt};
-    if (queued.counted && queued.peer == LOCAL_ACTION_PEER && queued.message.kind == flowmesh::WireMessageKind::ACTION &&
+    if (!local_source.id && queued.counted && queued.peer == LOCAL_ACTION_PEER && queued.message.kind == flowmesh::WireMessageKind::ACTION &&
         !market.public_submissions.empty()) {
         if (const auto action{flowmesh::DecodeProductionActionPayload(queued.message.payload)}) settle.id = action->Id();
     }
@@ -4521,6 +4767,10 @@ void FlowMeshRuntime::ProcessMessage(
     const bool gate_open{[&] {
         BenchSpan gate{market, "message_chain_gate_completed", queued.message.kind,
                        uint256{}, queued.message.header.sequence};
+        // Preserve equal-header ACTION pool admission while B3 authority is
+        // unavailable: the pool can supply missing agreement evidence, but
+        // never grants permission to sign. Retention only covers the existing
+        // restoration/behind-header paths that actually require authority.
         return !critical || market.chain->Acceptable(market.chain->Current());
     }()};
     if ((FlowMeshTimingRecording() || util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug))) {
@@ -4538,8 +4788,15 @@ void FlowMeshRuntime::ProcessMessage(
     }
     if (queued.message.kind != flowmesh::WireMessageKind::GET &&
         !RestoreRetainedCandidate(market)) {
-        if (critical && (delivery_generation != market.chain->DeliveryGeneration() ||
-            !market.chain->Acceptable(market.chain->Current()))) DeferMessage(market, queued);
+        if ((critical || local_source.id) &&
+            (delivery_generation != market.chain->DeliveryGeneration() ||
+             !market.chain->Acceptable(market.chain->Current()))) {
+            if (local_source.id && market.halt == FlowMeshRuntimeHalt::NONE) {
+                DeferLocalAction(local_source.id,
+                    !market.chain->Acceptable(market.chain->Current()));
+                local_source.keep = true;
+            } else if (critical) DeferMessage(market, queued); // Unchanged critical-frame behavior.
+        }
         return;
     }
     market.diagnostics.last_message_observed_at = GetTime();
@@ -4548,7 +4805,15 @@ void FlowMeshRuntime::ProcessMessage(
         HandleAgreement(market, queued.peer, queued.message);
         break;
     case flowmesh::WireMessageKind::ACTION:
-        HandleAction(market, queued.peer, queued.message);
+        {
+            bool authority_deferred{false};
+            HandleAction(market, queued.peer, queued.message, local_source.id ? &authority_deferred : nullptr);
+            if (authority_deferred) {
+                DeferLocalAction(local_source.id,
+                    !market.chain->Acceptable(market.chain->Current()));
+                local_source.keep = true;
+            }
+        }
         break;
     case flowmesh::WireMessageKind::PROPOSAL:
         HandleProposal(market, queued.peer, queued.message);
@@ -5162,7 +5427,7 @@ void FlowMeshRuntime::HandleHello(
 
 void FlowMeshRuntime::HandleAction(
     Market& market, const flowmesh::WirePeerId peer,
-    const flowmesh::WireMessage& message)
+    const flowmesh::WireMessage& message, bool* authority_deferred)
 {
     const bool local{peer == LOCAL_ACTION_PEER};
     auto& counters{market.delivery.action_admission};
@@ -5300,6 +5565,12 @@ void FlowMeshRuntime::HandleAction(
             const auto anchor{market.chain->Current()};
             if (market.pending_handoff || market.pending_candidate_restore || !transition ||
                 transition->kind != FlowMeshSeatTransitionKind::CONTINUE || !market.chain->Acceptable(anchor)) {
+                if (authority_deferred && market.halt == FlowMeshRuntimeHalt::NONE && !market.pending_handoff &&
+                    (!transition || transition->kind == FlowMeshSeatTransitionKind::PAUSED ||
+                     (transition->kind == FlowMeshSeatTransitionKind::CONTINUE && !market.chain->Acceptable(anchor)))) {
+                    *authority_deferred = true;
+                    return;
+                }
                 refuse("local queued action cannot refresh its header while current authority is unavailable; retry exact instruction",
                        flowmesh::ActionReasonCode::AUTHORITY_UNAVAILABLE);
                 return;

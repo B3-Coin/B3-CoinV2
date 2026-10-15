@@ -702,6 +702,7 @@ public:
     std::optional<std::string> PublicSubmitterForTest(const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
 private:
+    friend class FlowMeshRuntimeTestAccess;
     struct Market;
     struct ReadView;
     std::shared_ptr<const ReadView> LoadReadView(const flowmesh::MarketId& market_id) const
@@ -729,7 +730,17 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     void WorkerLoop() EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex, !m_health_mutex);
     //! EnqueueWireMessage, with the frame marked counted (QueuedWireMessage).
-    flowmesh::QueueResult Enqueue(flowmesh::WirePeerId peer, flowmesh::WireMessage message, bool counted);
+    flowmesh::QueueResult Enqueue(flowmesh::WirePeerId peer, flowmesh::WireMessage message, bool counted,
+                                 uint64_t local_retention_id = 0);
+    //! Producer stages, also inspected through the narrow friend test seam.
+    uint64_t ReserveLocalAction(const flowmesh::WireMessage& message, const uint256& domain,
+                               const uint256& config, flowmesh::ClientNoticeOrigin origin,
+                               const std::string& submitter, flowmesh::WireClock::time_point deadline);
+    flowmesh::QueueResult EnqueueReservedLocalAction(uint64_t id);
+    flowmesh::QueueResult EnqueueReservedLocalActionLocked(uint64_t id);
+    void ReleaseLocalAction(uint64_t id);
+    void DeferLocalAction(uint64_t id, bool observed_chain_gate_closed = false);
+    size_t RetryLocalActionAdmissions(bool open, size_t budget, bool reopened);
     void ProcessMessage(const flowmesh::QueuedWireMessage& queued, uint64_t dequeued_us);
     void ProcessTick(uint64_t requested_us, uint64_t dequeued_us) EXCLUSIVE_LOCKS_REQUIRED(!m_health_mutex);
     struct PendingDelivery;
@@ -766,7 +777,7 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_health_mutex);
 
     void HandleAction(Market& market, flowmesh::WirePeerId peer,
-                      const flowmesh::WireMessage& message);
+                      const flowmesh::WireMessage& message, bool* authority_deferred = nullptr);
     void HandleHello(Market& market, flowmesh::WirePeerId peer,
                      const flowmesh::WireMessage& message);
     void HandleProposal(Market& market, flowmesh::WirePeerId peer,
@@ -934,6 +945,25 @@ private:
     //! the deferred retry last observed. A change retries at once.
     bool m_deferred_gate_open{false};
     uint64_t m_deferred_gate_generation{0};
+    /** Exact accepted local sources. At most the existing per-peer deferred
+     * bound of eight, also charged against shared128/16MiB and16/market.
+     * Reserve BEFORE acknowledgement; no remote source can allocate one.
+     * Bytes count encoded frame plus attribution, not total C++ heap usage.
+     * Memory only: expiry/Stop require exact-client-outbox reconciliation. */
+    struct LocalActionSource {
+        flowmesh::QueuedWireMessage queued;
+        uint256 domain, config, action_id;
+        flowmesh::ClientNoticeOrigin origin{flowmesh::ClientNoticeOrigin::PUBLIC};
+        std::string submitter;
+        uint64_t public_serial{0};
+        flowmesh::WireClock::time_point deadline{}, next_queue_attempt{};
+        size_t bytes{0};
+        bool admitted{false}, deferred{false};
+    };
+    std::map<uint64_t, LocalActionSource> m_local_action_sources;
+    size_t m_local_action_source_bytes{0};
+    //! Never reset across Stop/Start; zero/overflow refuses before acceptance.
+    uint64_t m_next_local_action_source{1}, m_local_action_source_cursor{0};
     std::set<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>> m_receive_recovery;
     std::optional<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>> m_receive_recovery_cursor;
     FlowMeshCommitteeRelayBudget m_delivery_retry_budget{

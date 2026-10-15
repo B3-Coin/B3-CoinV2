@@ -37,6 +37,75 @@
 #include <thread>
 #include <vector>
 
+namespace node {
+// Test translation-unit only; no runtime callback, option or wire privilege.
+class FlowMeshRuntimeTestAccess {
+public:
+    static uint64_t Reserve(FlowMeshRuntime& runtime, const flowmesh::WireMessage& wire,
+                            const uint256& domain, const uint256& config, const std::string& submitter = "127.0.0.1")
+    {
+#ifdef FLOWMESH_LOCAL_RETENTION_BASELINE_TEST
+        return 1; // Old source has no reservation; the captured queue body is identical.
+#else
+        return runtime.ReserveLocalAction(wire, domain, config, flowmesh::ClientNoticeOrigin::PUBLIC,
+                                          submitter, runtime.m_config.clock->Now() + std::chrono::seconds{60});
+#endif
+    }
+    static flowmesh::QueueResult Enqueue(FlowMeshRuntime& runtime, const uint64_t id, const flowmesh::WireMessage& wire)
+    {
+#ifdef FLOWMESH_LOCAL_RETENTION_BASELINE_TEST
+        return runtime.EnqueueWireMessage(FLOWMESH_LOCAL_ACTION_PEER, wire);
+#else
+        return runtime.EnqueueReservedLocalAction(id);
+#endif
+    }
+#ifndef FLOWMESH_LOCAL_RETENTION_BASELINE_TEST
+    static std::pair<size_t, size_t> Sources(FlowMeshRuntime& runtime)
+    {
+        std::lock_guard lock{runtime.m_market_mutex};
+        return {runtime.m_local_action_sources.size(), runtime.m_local_action_source_bytes};
+    }
+    static flowmesh::QueueResult Inject(FlowMeshRuntime& runtime, flowmesh::WirePeerId peer,
+                                       flowmesh::WireMessage wire, uint64_t id, bool counted = true)
+    {
+        return runtime.Enqueue(peer, std::move(wire), counted, id);
+    }
+    static void DropQueueCopy(FlowMeshRuntime& runtime, uint64_t id)
+    {
+        std::lock_guard market{runtime.m_market_mutex};
+        auto& source{runtime.m_local_action_sources.at(id)};
+        std::lock_guard queue{runtime.m_queue_mutex};
+        source.admitted = true;
+        BOOST_REQUIRE(runtime.m_queue.Push(FLOWMESH_LOCAL_ACTION_PEER, source.queued.message,
+            runtime.m_config.clock->Now(), source.queued.counted, id) == flowmesh::QueueResult::ACCEPTED);
+        runtime.m_queue.RemovePeer(FLOWMESH_LOCAL_ACTION_PEER); // priority/drop semantics: source survives
+    }
+    static void ExhaustTokens(FlowMeshRuntime& runtime)
+    {
+        std::lock_guard lock{runtime.m_market_mutex};
+        runtime.m_next_local_action_source = std::numeric_limits<uint64_t>::max();
+    }
+    static auto Deadline(FlowMeshRuntime& runtime, uint64_t id)
+    {
+        std::lock_guard lock{runtime.m_market_mutex};
+        return runtime.m_local_action_sources.at(id).deadline;
+    }
+    static uint64_t ReserveUntil(FlowMeshRuntime& runtime, const flowmesh::WireMessage& wire,
+                                 const uint256& domain, const uint256& config,
+                                 flowmesh::WireClock::time_point deadline)
+    {
+        return runtime.ReserveLocalAction(wire, domain, config, flowmesh::ClientNoticeOrigin::PUBLIC,
+                                          "127.0.0.1", deadline);
+    }
+    static bool Stopping(FlowMeshRuntime& runtime)
+    {
+        std::lock_guard lock{runtime.m_queue_mutex};
+        return runtime.m_stopping;
+    }
+#endif
+};
+} // namespace node
+
 namespace {
 
 // Apple's C++20 library here does not yet provide std::jthread. Keep the
@@ -11249,5 +11318,381 @@ BOOST_AUTO_TEST_CASE(action_relay_window_accepts_two_slots_with_proof_and_restam
     BOOST_CHECK_EQUAL(restarted.DeliverySnapshots(f.market).front().action_admission.header_refused_unproven, 1U);
     BOOST_CHECK_EQUAL(restarted.MarketStatus(f.market)->pending_actions, pending);
 }
+
+BOOST_AUTO_TEST_CASE(accepted_local_original_waits_for_authority_then_resumes_without_client_resend)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "accepted_local_authority_resume"};
+    f.block_commits = false;
+    f.Reach(1); f.Drain();
+    CKey key; key.MakeNewKey(true);
+    const auto action{SignedAction(key, f.domain, f.initial.ConfigId(), 0, flowmesh::ActionType::CANCEL_ASK)};
+    const auto payload{flowmesh::EncodeProductionActionPayload(action)};
+    BOOST_REQUIRE(payload);
+    const flowmesh::WireMessage original{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *payload};
+    auto& runtime{*f.runtimes[0]};
+    // Capture/reserve and enqueue are the same private production stages.
+    // The baseline test adapter uses only the old public queue seam, honestly
+    // reproducing its original wrapper; this is not an RPC end-to-end test.
+    const auto id{node::FlowMeshRuntimeTestAccess::Reserve(runtime, original, f.domain, f.initial.ConfigId())};
+    BOOST_REQUIRE(id);
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain();
+    f.chains[0].SetReconciled(false);
+    const auto cursor{runtime.ClientEventCursor()};
+    BOOST_REQUIRE(node::FlowMeshRuntimeTestAccess::Enqueue(runtime, id, original) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    const auto interrupted{runtime.ClientEvents(cursor, f.market, action.signer).events};
+    BOOST_REQUIRE_MESSAGE(std::none_of(interrupted.begin(), interrupted.end(), [&](const auto& event) {
+        return event.action_id == action.Id() && event.kind == flowmesh::ClientEventKind::POOL_REFUSED;
+    }), "accepted original was terminally refused solely because reconciliation was temporarily unavailable");
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+    BOOST_CHECK_EQUAL(runtime.DeliverySnapshots(f.market).front().deferred_objects, 1U);
+    const auto clock{f.clocks[0].Now()};
+    for (size_t n{0}; n < 4; ++n) f.Tick(); // ordinary maintenance, no clock/timing-policy change
+    BOOST_CHECK_EQUAL(runtime.DeliverySnapshots(f.market).front().deferred_objects, 1U);
+    BOOST_CHECK(f.clocks[0].Now() == clock);
+    f.chains[0].SetReconciled(true);
+    f.Tick(); // existing reopen edge, never a new client instruction
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(3); }));
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.DeliverySnapshots(f.market).front().deferred_objects, 0U);
+    BOOST_CHECK_EQUAL(runtime.StateSnapshot(f.market)->NextSequence(action.signer), 1U);
+    std::optional<node::StoredProductionEntry> stored;
+    std::string error;
+    BOOST_REQUIRE(runtime.ClientRecentInclusion(f.market, action.Id()));
+    BOOST_REQUIRE(f.stores[0]->ReadEntry(2, f.seats.seats, stored, error));
+    BOOST_REQUIRE(stored);
+    BOOST_REQUIRE_EQUAL(stored->entry.actions.size(), 1U);
+    BOOST_CHECK(stored->entry.actions.front().Id() == action.Id());
+    const auto completed{runtime.ClientEvents(cursor, f.market, action.signer).events};
+    BOOST_CHECK(std::any_of(completed.begin(), completed.end(), [&](const auto& event) {
+        return event.action_id == action.Id() && event.kind == flowmesh::ClientEventKind::POOL_ADMITTED && event.signed_action_hash == Hash(*payload);
+    }));
+}
+
+#ifndef FLOWMESH_LOCAL_RETENTION_BASELINE_TEST
+BOOST_AUTO_TEST_CASE(local_source_reservation_bounds_preserve_critical_capacity_and_original_expiry)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_source_capacity"};
+    f.block_commits = false; f.Reach(1); f.Drain(); f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    CKey key; key.MakeNewKey(true);
+    const auto action{SignedAction(key, f.domain, f.initial.ConfigId(), 0, flowmesh::ActionType::CANCEL_ASK)};
+    const flowmesh::WireMessage wire{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *flowmesh::EncodeProductionActionPayload(action)};
+    std::vector<uint64_t> ids;
+    for (size_t n{0}; n < 8; ++n) {
+        const auto id{node::FlowMeshRuntimeTestAccess::Reserve(runtime, wire, f.domain, f.initial.ConfigId())};
+        BOOST_REQUIRE(id); ids.push_back(id);
+    }
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Reserve(runtime, wire, f.domain, f.initial.ConfigId()), 0U);
+    const auto reserved{node::FlowMeshRuntimeTestAccess::Sources(runtime)};
+    BOOST_CHECK_EQUAL(reserved.first, 8U);
+    BOOST_CHECK_LE(reserved.second, 8 * (flowmesh::FLOWMESH_ACTION_MAX_BYTES + flowmesh::FLOWMESH_WIRE_HEADER_SIZE + 128));
+    f.chains[0].SetReconciled(false);
+    // Maximum legal critical frames retain their existing independent space.
+    // The fourth would exceed the shared encoded-byte bound once the promised
+    // local sources are included, so it is safely refused, not allowed to steal.
+    for (size_t n{0}; n < 4; ++n) {
+        flowmesh::WireMessage critical{flowmesh::WireMessageKind::AGREEMENT, wire.header,
+            std::vector<unsigned char>(flowmesh::FLOWMESH_AGREEMENT_MAX_BYTES, static_cast<unsigned char>(n + 1))};
+        critical.payload[0] = 0;
+        critical.payload[1] = 1;
+        critical.payload[2] = 1; // Existing cheap version/stage framing, not canonical signed evidence.
+        critical.header.sequence += n;
+        flowmesh::WireCheck framing;
+        BOOST_REQUIRE(flowmesh::CheckWireMessage(critical, framing));
+        BOOST_REQUIRE(runtime.EnqueueWireMessage(20 + n, std::move(critical)) == flowmesh::QueueResult::ACCEPTED);
+        f.Drain();
+    }
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 8U);
+    BOOST_CHECK_EQUAL(runtime.DeliverySnapshots(f.market).front().deferred_objects, 3U);
+    BOOST_CHECK_LE(runtime.DeliverySnapshots(f.market).front().deferred_bytes + reserved.second, 16 * 1024 * 1024);
+    // Never queued reservations expire too. No new original is signed, and
+    // repeated closed-gate maintenance cannot restart the original60s window.
+    f.Tick(std::chrono::seconds{59});
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 8U);
+    f.Tick(std::chrono::seconds{2});
+    for (size_t n{0}; n < 4; ++n) f.Tick(); // bounded two-source closed passes
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 0U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(local_source_survives_queue_drop_and_cannot_be_claimed_by_remote_alias)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_source_eviction"};
+    f.block_commits = false; f.Reach(1); f.Drain();
+    auto& runtime{*f.runtimes[0]};
+    CKey key; key.MakeNewKey(true);
+    const auto action{SignedAction(key, f.domain, f.initial.ConfigId(), 0, flowmesh::ActionType::CANCEL_ASK)};
+    const flowmesh::WireMessage wire{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *flowmesh::EncodeProductionActionPayload(action)};
+    const auto id{node::FlowMeshRuntimeTestAccess::Reserve(runtime, wire, f.domain, f.initial.ConfigId())};
+    BOOST_REQUIRE(id);
+    BOOST_CHECK(node::FlowMeshRuntimeTestAccess::Inject(runtime, 23, wire, id) == flowmesh::QueueResult::MALFORMED);
+    auto alias{wire}; alias.payload.back() ^= 1; // Same semantic ActionId, different signed bytes.
+    BOOST_REQUIRE(node::FlowMeshRuntimeTestAccess::Inject(runtime, node::FLOWMESH_LOCAL_ACTION_PEER, alias, id) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 1U);
+    node::FlowMeshRuntimeTestAccess::DropQueueCopy(runtime, id);
+    f.Tick(std::chrono::milliseconds{250});
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.StateSnapshot(f.market)->NextSequence(action.signer), 1U);
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 0U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+    // A delayed duplicate of the now-settled token is inert, even with the
+    // correct wrapper and counted=true; no second accounting/count operation.
+    BOOST_REQUIRE(node::FlowMeshRuntimeTestAccess::Inject(runtime, node::FLOWMESH_LOCAL_ACTION_PEER, wire, id) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.StateSnapshot(f.market)->NextSequence(action.signer), 1U);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+    node::FlowMeshRuntimeTestAccess::ExhaustTokens(runtime);
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Reserve(runtime, wire, f.domain, f.initial.ConfigId()), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(local_source_open_chain_seat_pause_preserves_retry_pacing_and_expiry)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_source_seat_pause"};
+    f.block_commits = false; f.Reach(1); f.Drain();
+    auto& runtime{*f.runtimes[0]};
+    CKey key; key.MakeNewKey(true);
+    const auto action{SignedAction(key, f.domain, f.initial.ConfigId(), 0, flowmesh::ActionType::CANCEL_ASK)};
+    const flowmesh::WireMessage wire{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *flowmesh::EncodeProductionActionPayload(action)};
+    const auto id{node::FlowMeshRuntimeTestAccess::Reserve(runtime, wire, f.domain, f.initial.ConfigId())};
+    BOOST_REQUIRE(id);
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain();
+    f.chains[0].SetTransition(f.market, node::FlowMeshSeatTransitionKind::PAUSED);
+    BOOST_REQUIRE(node::FlowMeshRuntimeTestAccess::Enqueue(runtime, id, wire) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    const auto deadline{node::FlowMeshRuntimeTestAccess::Deadline(runtime, id)};
+    uint64_t last_event{0};
+    size_t action_processing{0};
+    const auto sample = [&] {
+        const auto events{runtime.DeliverySnapshots(f.market).front().events};
+        for (const auto& event : events) {
+            if (event.event_id <= last_event) continue;
+            last_event = event.event_id;
+            if (event.stage == "message_processing" && event.kind == flowmesh::WireMessageKind::ACTION &&
+                event.sequence == 1) ++action_processing;
+        }
+    };
+    sample();
+    // One ordinary pass may observe the existing open/generation edge, but a
+    // PAUSED seat decision must not invent that edge again at the same clock.
+    f.Tick(); sample();
+    const auto first_pass{action_processing};
+    for (size_t n{0}; n < 12; ++n) { f.Tick(); sample(); }
+    BOOST_CHECK_EQUAL(action_processing, first_pass);
+    BOOST_CHECK(node::FlowMeshRuntimeTestAccess::Deadline(runtime, id) == deadline);
+    f.Tick(std::chrono::milliseconds{250}); sample();
+    BOOST_CHECK_EQUAL(action_processing, first_pass + 1);
+    BOOST_CHECK(node::FlowMeshRuntimeTestAccess::Deadline(runtime, id) == deadline);
+    f.chains[0].SetTransition(f.market, node::FlowMeshSeatTransitionKind::CONTINUE);
+    f.Tick(std::chrono::milliseconds{250});
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(3); }));
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.StateSnapshot(f.market)->NextSequence(action.signer), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(local_source_stop_start_stale_tokens_and_delayed_preflight_fail_closed)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "local_source_stop_start"};
+    // Restart the same object before any append, so its original verified
+    // configuration still matches the unchanged durable marker. This tests
+    // token lifecycle in the ordinary mode, not a substitute for preagreement
+    // bootstrap/replay. A completed preagreement creation capability cannot
+    // be reused by simply restarting an originally creating configuration.
+    auto& runtime{*f.runtime};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(runtime.Start(error), error);
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    CKey key; key.MakeNewKey(true);
+    const auto action{SignedAction(key, f.domain, f.initial.ConfigId(), 0, flowmesh::ActionType::CANCEL_ASK)};
+    const flowmesh::WireMessage wire{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 0}, *flowmesh::EncodeProductionActionPayload(action)};
+    const auto old{node::FlowMeshRuntimeTestAccess::Reserve(runtime, wire, f.domain, f.initial.ConfigId())};
+    BOOST_REQUIRE(old);
+    runtime.Stop();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 0U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+    BOOST_REQUIRE_MESSAGE(runtime.Start(error), error);
+    const auto current{node::FlowMeshRuntimeTestAccess::Reserve(runtime, wire, f.domain, f.initial.ConfigId())};
+    BOOST_REQUIRE_GT(current, old);
+    BOOST_REQUIRE(node::FlowMeshRuntimeTestAccess::Inject(runtime, node::FLOWMESH_LOCAL_ACTION_PEER, wire, old) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 1U);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 1U);
+    // Expired original preflight/capture cannot be made new by reservation.
+    const auto original_deadline{f.clock.Now() + std::chrono::seconds{60}};
+    f.clock.m_now += std::chrono::seconds{61};
+    runtime.NotifyTick();
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::ReserveUntil(runtime, wire, f.domain,
+        f.initial.ConfigId(), original_deadline), 0U);
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 0U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(local_action_producer_reserves_before_acceptance_and_rejects_forgery_while_closed)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_source_producer"};
+    f.block_commits = false; f.Reach(1); f.Drain();
+    auto& runtime{*f.runtimes[0]};
+    f.deposits.on_get = [] { throw std::runtime_error{"synthetic preflight facts failure"}; };
+    BOOST_CHECK_THROW(runtime.SubmitLocalActionChecked(f.market, Deposit(f.outpoint),
+        flowmesh::ClientNoticeOrigin::PUBLIC, "throwing-preflight"), std::runtime_error);
+    f.deposits.on_get = nullptr;
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 0U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+    const auto missing{runtime.SubmitLocalActionChecked(f.market, Deposit(COutPoint{f.outpoint.hash, 77}),
+        flowmesh::ClientNoticeOrigin::PUBLIC, "factless-preflight")};
+    BOOST_CHECK(missing.admission.code == flowmesh::ActionReasonCode::DEPOSIT_FACTS_UNAVAILABLE);
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 0U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+    CKey key; key.MakeNewKey(true);
+    const auto action{SignedAction(key, f.domain, f.initial.ConfigId(), 0, flowmesh::ActionType::CANCEL_ASK)};
+    const auto original{flowmesh::EncodeProductionActionPayload(action)};
+    const flowmesh::WireMessage wire{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *original};
+    const auto id{node::FlowMeshRuntimeTestAccess::Reserve(runtime, wire, f.domain, f.initial.ConfigId(), "original")};
+    BOOST_REQUIRE(id);
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain(); f.block_commits = true;
+    // Only the existing behind-header authority check waits. Equal-header
+    // pool admission remains unchanged, even while signing authority is shut.
+    f.chains[0].SetReconciled(false);
+    BOOST_CHECK(node::FlowMeshRuntimeTestAccess::Enqueue(runtime, id, wire) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 1U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 1U);
+    auto forged{action}; forged.credential.back() ^= 1;
+    const auto invalid{runtime.SubmitLocalActionChecked(f.market, forged, flowmesh::ClientNoticeOrigin::PUBLIC, "forger")};
+    BOOST_REQUIRE(invalid.queued);
+    BOOST_CHECK(*invalid.queued == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    // Same ActionId does not make a different credential the exact original,
+    // and it never earns a retained shelter while authority is unavailable.
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 1U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 1U);
+    BOOST_CHECK(runtime.PublicSubmitterForTest(f.market, action.Id()) == std::optional<std::string>{"original"});
+    const auto cursor{runtime.ClientEventCursor()};
+    f.Tick(std::chrono::seconds{61});
+    for (size_t n{0}; n < 4; ++n) f.Tick();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 0U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+    const auto expired{runtime.ClientEvents(cursor, f.market, action.signer).events};
+    BOOST_CHECK(std::none_of(expired.begin(), expired.end(), [](const auto& event) {
+        return event.kind == flowmesh::ClientEventKind::POOL_REFUSED;
+    }));
+    BOOST_CHECK(*flowmesh::EncodeProductionActionPayload(action) == *original);
+}
+
+BOOST_AUTO_TEST_CASE(local_source_start_keeps_idempotent_fast_path_during_stop_join)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "local_source_lifecycle"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    f.Certificate(8, 0);
+    {
+        std::lock_guard lock{f.relay_mutex};
+        f.block_certificates = true;
+    }
+    const auto unblock = [&] {
+        { std::lock_guard lock{f.relay_mutex}; f.block_certificates = false; }
+        f.relay_cv.notify_all();
+    };
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(8, {flowmesh::WireMessageKind::CERTIFICATE,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, f.payloads[1]}) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    bool blocked{false};
+    {
+        std::unique_lock lock{f.relay_mutex};
+        blocked = f.relay_cv.wait_for(lock, std::chrono::seconds{5}, [&] { return f.relay_blocked; });
+    }
+    if (!blocked) { unblock(); BOOST_FAIL("certificate worker did not reach controlled relay boundary"); }
+    JoiningTestThread stop{[&] { f.runtime->Stop(); }, unblock};
+    const bool stopping{WaitUntil([&] { return node::FlowMeshRuntimeTestAccess::Stopping(*f.runtime); })};
+    std::promise<bool> started;
+    auto observed{started.get_future()};
+    JoiningTestThread start{[&] {
+        try {
+            std::string start_error;
+            started.set_value(f.runtime->Start(start_error));
+        } catch (...) { started.set_exception(std::current_exception()); }
+    }, unblock};
+    const bool returned_without_worker{observed.wait_for(std::chrono::seconds{2}) == std::future_status::ready};
+    // Release controlled work before any assertion can unwind or join.
+    unblock();
+    start.join(); stop.join();
+    BOOST_CHECK(stopping);
+    BOOST_CHECK(returned_without_worker);
+    BOOST_CHECK(observed.get());
+    BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(local_source_malformed_reward_credentials_do_not_shelter_behind_closed_authority)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_source_reward_syntax"};
+    f.block_commits = false; f.Reach(1); f.Drain(); f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    f.chains[0].SetReconciled(false);
+    flowmesh::Action claim;
+    claim.type = static_cast<uint8_t>(flowmesh::ActionType::CLAIM_SEAT_REWARD);
+    claim.signer = Filled(0x95);
+    claim.asset = modern::NativeAsset();
+    claim.amount = 1;
+    claim.destination = Filled(0x96);
+    BOOST_REQUIRE(claim.ShapeIsCanonical());
+    // All three fit the original transport shape but are independently
+    // impossible reward signatures, even with historical facts unavailable.
+    for (const size_t length : {size_t{0}, flowmesh::FLOWMESH_SEAT_REWARD_CREDENTIAL_SIZE - 1,
+                                flowmesh::FLOWMESH_SEAT_REWARD_CREDENTIAL_SIZE}) {
+        claim.credential.assign(length, 0);
+        BOOST_REQUIRE(claim.ShapeIsCanonical());
+        const auto submit{runtime.SubmitLocalActionChecked(f.market, claim,
+            flowmesh::ClientNoticeOrigin::PUBLIC, "malformed-claim")};
+        BOOST_REQUIRE(submit.queued);
+        BOOST_REQUIRE(*submit.queued == flowmesh::QueueResult::ACCEPTED); // Queue-only, not authentication.
+        f.Drain();
+        BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 0U);
+        BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+        BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+    }
+    // Correct encoding alone is not membership/authentication. This unknown
+    // claim may wait only within the same bounded source/expiry policy; it
+    // cannot enter the pool until the ordinary historical check succeeds.
+    const auto signature{f.seats.secrets[0].Sign(std::span<const unsigned char>{f.domain.begin(), 32}).Compressed()};
+    claim.credential.assign(signature.begin(), signature.end());
+    BOOST_REQUIRE(bls::Signature::Decode(claim.credential));
+    f.chains[0].SetReconciled(true);
+    const flowmesh::WireMessage original{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *flowmesh::EncodeProductionActionPayload(claim)};
+    const auto source{node::FlowMeshRuntimeTestAccess::Reserve(runtime, original, f.domain, f.initial.ConfigId(), "unknown-claim")};
+    BOOST_REQUIRE(source);
+    f.block_commits = false;
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain(); f.block_commits = true;
+    f.chains[0].SetReconciled(false);
+    BOOST_REQUIRE(node::FlowMeshRuntimeTestAccess::Enqueue(runtime, source, original) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 1U);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+    f.chains[0].SetReconciled(true);
+    f.Tick();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 0U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+}
+#endif
 
 BOOST_AUTO_TEST_SUITE_END()

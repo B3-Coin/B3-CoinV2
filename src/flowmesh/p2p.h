@@ -209,6 +209,9 @@ struct QueuedWireMessage {
     //! the frame counted it (FlowMeshRuntime: towards a public submitter),
     //! so the worker settles exactly the frames marked.
     bool counted{false};
+    //! In-process runtime ownership only; never encoded or accepted from wire.
+    //! Zero retains the original queue semantics. A token grants no admission.
+    uint64_t local_retention_id{0};
 };
 
 /**
@@ -226,7 +229,8 @@ public:
     //! `counted` is carried to Pop unchanged (QueuedWireMessage::counted)
     //! and plays no part in admission.
     QueueResult Push(WirePeerId peer, WireMessage message,
-                     WireClock::time_point now = WireClock::now(), bool counted = false);
+                     WireClock::time_point now = WireClock::now(), bool counted = false,
+                     uint64_t local_retention_id = 0);
     //! Admission of a frame the caller has proven its worker would only
     //! drop. Nothing is queued and no committee token is spent: the framing
     //! verdict is Push's, then one settled-frame token of (peer, market) and

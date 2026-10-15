@@ -495,7 +495,8 @@ bool BoundedWireQueue::EvictOneLowerPriority(
 }
 
 QueueResult BoundedWireQueue::Push(const WirePeerId peer, WireMessage message,
-                                   const WireClock::time_point now, const bool counted)
+                                   const WireClock::time_point now, const bool counted,
+                                   const uint64_t local_retention_id)
 {
     // Only the framing verdict is needed; never copy a (up to 4 MiB) frame
     // just to discard the encoding under the caller's queue lock.
@@ -537,7 +538,8 @@ QueueResult BoundedWireQueue::Push(const WirePeerId peer, WireMessage message,
            m_bytes > FLOWMESH_QUEUE_GLOBAL_BYTES - bytes) {
         if (!EvictOneLowerPriority(priority)) return QueueResult::GLOBAL_LIMIT;
     }
-    QueuedWireMessage item{.peer = peer, .message = std::move(message), .counted = counted};
+    QueuedWireMessage item{.peer = peer, .message = std::move(message), .counted = counted,
+                           .local_retention_id = local_retention_id};
     AccountAdd(item);
     m_lanes[static_cast<size_t>(priority)].push_back(std::move(item));
     return QueueResult::ACCEPTED;

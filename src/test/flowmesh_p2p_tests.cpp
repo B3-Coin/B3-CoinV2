@@ -265,6 +265,28 @@ BOOST_AUTO_TEST_CASE(counted_mark_is_carried_unchanged_and_admits_nothing)
     BOOST_CHECK(limited.Push(2, Message(WireMessageKind::ACTION), now) == QueueResult::RATE_LIMITED);
 }
 
+BOOST_AUTO_TEST_CASE(local_retention_token_is_private_queue_metadata_not_wire_or_admission)
+{
+    using namespace flowmesh;
+    BoundedWireQueue queue;
+    const auto now{WireClock::time_point{std::chrono::seconds{100}}};
+    const auto original{Message(WireMessageKind::ACTION)};
+    WireCheck check;
+    const auto bytes{EncodeWireMessage(original, check)};
+    BOOST_REQUIRE(bytes);
+    BOOST_REQUIRE(queue.Push(1, original, now, true, 42) == QueueResult::ACCEPTED);
+    BOOST_REQUIRE(queue.Push(1, original, now) == QueueResult::ACCEPTED);
+    const auto retained{queue.Pop()}, ordinary{queue.Pop()};
+    BOOST_REQUIRE(retained && ordinary);
+    BOOST_CHECK_EQUAL(retained->local_retention_id, 42U);
+    BOOST_CHECK_EQUAL(ordinary->local_retention_id, 0U);
+    BOOST_CHECK(retained->counted);
+    BOOST_CHECK(EncodeWireMessage(retained->message, check) == bytes);
+    BOOST_CHECK(EncodeWireMessage(ordinary->message, check) == bytes);
+    for (size_t i{0}; i < 254; ++i) BOOST_REQUIRE(queue.Push(1, original, now, false, i + 1) == QueueResult::ACCEPTED);
+    BOOST_CHECK(queue.Push(1, original, now, true, 999) == QueueResult::RATE_LIMITED);
+}
+
 // Frames the runtime proves its worker would only drop take no committee
 // token or queue slot, but a separate, generous per-(peer, market) budget
 // still bounds them, after the unchanged framing verdict.
