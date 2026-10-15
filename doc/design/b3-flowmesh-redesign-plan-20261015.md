@@ -1,6 +1,7 @@
 # B3 and FlowMesh redesign plan
 
-Date: 2026-10-15. Status: **PROPOSED FOR REVIEW**. Planning baseline:
+Date: 2026-10-15. Updated: 2026-10-16. Status: **C++ REDESIGN DIRECTION;
+PROTOCOL CHOICES PROPOSED FOR REVIEW**. Planning baseline:
 `flowmeshV2-dev` at `74bd4e5e7e5f13c885be57f32e760927b94ef382`.
 
 Build a purpose-designed trading system around useful Bitcoin foundations,
@@ -9,9 +10,11 @@ reviewable stages rather than restarting the project or only changing its UI.
 The target remains a 200 ms median client-verified trading result, with real
 durability and cryptography, first on isolated regtest.
 
-This plan authorizes no implementation, activation height, live migration,
-contract deployment, VPS change, public release or push. A completed stage
-needs its own frozen revision, evidence and separate review before progression.
+The owner's follow-up permits local redesign implementation, including replacing
+FlowMesh internals, and prefers retaining C++. It does not select unapproved
+consensus or economic rules, an activation height, live migration, contract
+deployment, VPS change, public release or push. A completed stage needs its own
+frozen revision, evidence and separate review before progression.
 
 ## 1 Requirements and current evidence
 
@@ -76,9 +79,20 @@ build options and security updates in each reviewed milestone.
 | Qt | Wallet integration, working chart/book components, exact amount formatting, receipt protections and regression tests | Small controller and typed view models; independent command/read work; genuine pair semantics, funding lifecycle and stable readiness |
 | Bridge | Proof-validation and contract/vector work that passes its own review | Explicit V2 authority, route identities, mint/burn accounting, finality and idempotent relay interfaces; no hidden signer-minting fallback |
 
-Use the existing C++20 foundation initially. A language change, new database or
-new network library needs evidence of a particular benefit; none is a shortcut
-to safe finality or 200 ms trading.
+Keep the existing C++20 foundation for the trading core, consensus/storage
+adapters and client, with Qt Widgets for the desktop. The build already requires
+C++20. This preserves useful native code, test vectors and wallet integration
+while allowing replacement of unsafe module boundaries. The performance problem
+is shared ownership and blocking dependencies, not an established language limit.
+
+Rust is not part of the first redesign. Its ownership checks can prevent classes
+of memory/concurrency errors, but do not establish financial conservation,
+authority freshness or protocol liveness; mutex deadlocks are still possible
+([Rust shared-state documentation](https://doc.rust-lang.org/book/ch16-03-shared-state.html)).
+A later isolated component may justify another language on specific evidence.
+Do not introduce a mixed-language boundary or new database merely to change the
+stack. Qualify C++ with explicit ownership, bounded lifetimes, fuzzing, applicable
+address/undefined-behavior/thread sanitizers and cross-platform recovery tests.
 
 ## 3 Proposed execution architecture
 
@@ -91,7 +105,7 @@ the first working slice.
 
 | Module | Responsibility | Isolation rule |
 | --- | --- | --- |
-| B3 chain and finality | Chain validation, producer eligibility, finality, authenticated custody facts and membership transitions | Exact recent undo and bounded work; no history-sized rebuild on every shallow reorg |
+| B3 chain and finality | Chain validation, producer eligibility, finality, authenticated custody facts and membership transitions | Exact recent undo after separate approval; recent shallow reorgs must avoid history-sized work, with safe replay/refusal for missing or invalid derived state |
 | Admission and verification | Bound/authenticate original actions and queue accepted work | Reserved capacity for orders, cancels and status; overload is explicit and bounded |
 | Trading state owner | Apply one deterministic ordered batch to shared balances, reservations, orders and segregated futures cash | One authoritative writer initially; parallel workers cannot independently spend the same account balance |
 | Agreement | Propose and certify exact batches and results under the approved BFT protocol | Retain locks and recovery evidence; leader replacement never erases an issued obligation |
@@ -113,6 +127,44 @@ prevent resource starvation. Never create an unbounded thread or queue per user.
 Visual updates may coalesce to the newest verified head, but economic outcomes,
 original requests and indispensable signing/recovery evidence are never dropped
 to make the screen or benchmark faster.
+
+### C++ component boundaries
+
+The first layout uses separately testable C++ components in the existing build,
+not a new genesis, unrelated engine or mandatory process fleet:
+
+- **Trading state machine:** deterministic amounts, balances, reservations,
+  orders, effects and outcomes. No Qt, wallet, networking, `cs_main` or filesystem
+  calls inside accounting transitions. One ordered state owner decides all
+  competing economic applications across markets.
+- **Agreement and store adapter:** existing PBFT-style work and durable store
+  mechanisms remain the starting point. The owner applies only a certified
+  decision under its approved rules. Storage barriers remain binding; initially
+  synchronous private store operations are acceptable. Moving disk work to a
+  worker is optional and must preserve transition order and crash recovery.
+- **B3 fact adapter:** publish coherent, versioned authority and custody facts.
+  Trading consumes typed facts, never a hidden fallback that reacquires chain
+  locks. Unknown facts use bounded asynchronous resolution; verified absence,
+  stale context and invalid evidence are different outcomes.
+- **Gateway and read service:** retain useful HTTPS/FMN2 code and TLS trust.
+  Independently bound admission, health/status, display materialization and
+  recovery traffic, including pre-request handshake resources. Slow consumers
+  cannot retain unlimited old views or occupy every control slot.
+- **Qt controller and models:** preserve the existing wallet/outbox owner and
+  working widgets. Separate commands from passive updates, with generation/head
+  checks at installation. No second UI ledger or signing journal.
+- **Bridge adapter:** reuse existing V2 proof, contract and relay work behind
+  explicit mint/burn/settlement interfaces. A transport worker cannot grant
+  custody authority or make a bridge outage block chart/status service.
+
+Borrow read-copy-update publication/lifetime separation and database snapshot
+principles for immutable views, and staged bounded queues for independent work
+([RCU](https://www.kernel.org/doc/html/latest/RCU/whatisRCU.html),
+[LevelDB snapshots and atomic writes](https://github.com/google/leveldb/blob/main/doc/index.md),
+[SEDA](https://people.eecs.berkeley.edu/~brewer/papers/SEDA-sosp.pdf)). A database
+snapshot alone is not certified or durable. An atomic shared-pointer slot is not
+necessarily formally lock-free; the required first guarantee is independence
+from chain/market locks, with bounded ownership and reclamation.
 
 ### Authority must be specified before wiring
 
@@ -136,13 +188,32 @@ conflict or permission to use stale authority. A cached `ready=true` or online
 peer count cannot authorize signing. If authority becomes uncertain, affected
 writes pause explicitly while read/status service stays responsive.
 
+Invalidate superseded authority synchronously at the actual chain-mutation
+boundary. Waiting for queued `BlockDisconnected`/`UpdatedBlockTip` callbacks can
+leave an old open gate visible after its anchor is orphaned. Fact publication
+must bind the complete context to one generation; stale reconciliation jobs
+cannot reopen admission. Define the linearization of vote intent, signing,
+durability, commitment and publication relative to invalidation. A version load
+alone is not a proof that no reorg can happen after the check.
+
+Do not copy the entire chain/finality history on each tip merely to create an
+immutable view. Measure construction, retained bytes and reclamation as well as
+read cost. Reducing historical anchor checks requires verified ancestry on
+commit, catch-up and restore, including existing stored history. Monotonic
+heights alone are insufficient. A constant number of ancestry checks is not
+strict constant-time work unless the underlying lookup/proof cost is bounded.
+Keep current anchor-depth rules until a separately approved change.
+
 ### One commitment path and durable recovery
 
 Choose and fully specify one BFT protocol rather than stacking independent
-approval rounds without a defined purpose. The existing PBFT-style model is a
-reference; a pipelined HotStuff-family alternative is a candidate, not already
-selected or implemented. Stable coordinator tenure and replacement policy are
-also proposals until covered by the chosen state machine and tests.
+approval rounds without a defined purpose. Retain the existing PBFT-style
+model/native agreement as the starting candidate; reorganizing components is
+not a reason to reopen protocol selection. Any alternative needs a concrete
+benefit, equal-boundary comparison and separate review. Existing model/native
+work does not complete PoS V2 authority, membership or bootstrap. Stable
+coordinator tenure and replacement policy also require specified safe voting,
+view changes and recovery; local online-peer lists cannot select authority.
 
 Specify proposal/vote meaning, domain, epoch/view/sequence, parent, prior/new
 state roots, original ActionIds, outcome/effect commitments, safe voting and
@@ -177,6 +248,10 @@ adopts a conventional price-time order book. A price-time book with independentl
 identified orders and a bounded IOC market-order mode is the proposed usability
 direction, not an approved replacement of auction rules. Reuse conservation
 tests across either choice; do not assume their fill-price results are identical.
+The current maximum-volume/minimum-imbalance/lowest-price auction and valid
+zero-price clearing are documented rules, not mislabeled implementation bugs.
+A maker-price rule, zero-price ban, new order priority or curve restriction is a
+versioned economic change requiring its own decision and adversarial vectors.
 Market orders need explicit slippage/spend bounds and atomic cancellation of any
 unfilled remainder. Until that exists, show Limit or honestly labelled
 marketable-limit orders, not a fictitious Market button.
@@ -345,7 +420,9 @@ milestone, with no PR unless the owner changes that workflow.
 | D8 distributed qualification | Independently hosted regtest validators/testers, signed/checksummed platform artifacts and soak/fault campaigns | Proposed minimum 72-hour soak plus all safety/recovery gates; actual CI for the exact candidate; external review. Testnet bridge trials require separate approval |
 | D9 mainnet decision | Final security review, operator/client rollout, capacity/custody reconciliation and fork rehearsal | Only then approve a specific activation height/hash/ruleset and deployment. No live value from regtest results alone |
 
-D1's offline UI work can run alongside specification refinement. D2/D3 cannot
+D1's offline UI work and the measurement/read-isolation stage below can run
+alongside specification refinement. They preserve current authority/economics
+and do not depend on selecting futures or fee parameters. D2/D3 cannot
 wire consensus, asset authorities or economic rules that D0 has not resolved.
 Early D4/D5 spot experiments are labelled incomplete V2; a full V2 release
 requires D6 futures and the required D7 bridge/cutover work too. No mainnet
@@ -418,15 +495,63 @@ spending authority or erase new finalized history.
 
 ## 10 First bounded deliverable
 
-Complete D0 before protocol implementation: one reconciled architecture contract,
-typed interface/ownership map, the exact consensus selection comparison,
+Begin with **measurement and non-stalling certified reads**, preserving current
+consensus, wire/proof formats, fees and trading rules:
+
+1. Before behavior changes, capture one original matched fill and an eight-request
+   burst on the unchanged source baseline. Instrument R1/R2, actual `cs_main`
+   hold time, queue and lock waits, durable completion and client verification.
+   Record exact instrumented/control builds and keep failures/outliers. Retain
+   historical M1 unchanged; unavailable stronger outcome attribution is a gap,
+   not an inferred latency.
+2. Reproduce contention with deterministic tests holding real `cs_main` and
+   separately blocking the trading owner. Health/status and bounded certified
+   display reads must still answer; old data stays labelled old. This is service
+   responsiveness, not permission to certify trades with unresolved authority.
+3. Publish each read bundle from explicit committed values after required durable
+   append/application. Keep head, state/root, certificate, outcomes/history and
+   event cursors coherent. Serve it without chain/market-lock fallbacks, including
+   readiness overlays, public signer status and recent-result lookup.
+   Retain the original authority generation and observation time. Successfully
+   verifying or serving cached evidence must not renew its authority freshness,
+   assert current readiness or unlock economic controls. If current authority
+   cannot be established, use the existing safe busy/error behavior with
+   historical display; unchanged submission/signing gates still do their checks.
+   A fresh HTTPS response may establish transport liveness, not chain authority.
+4. Bound materialization, backfill, pinned versions, bytes and concurrent readers.
+   Single-flight waiters must not consume all HTTPS permits. Preserve TLS/front
+   door capacity and distinguish a pre-admission busy refusal from an action
+   already admitted whose outcome must be reconciled by its original identity.
+5. Keep submission/signing authority gates unchanged in this first stage. A later
+   chain-fact stage must separately prove synchronous invalidation and all fact
+   coverage before replacing blocking authority queries. Scheduler offload must
+   preserve exact reconciliation cursors and reject superseded completions.
+6. Repeat identical one-fill/burst cases on the same machine/session, with held
+   locks, traffic pressure, restart and eventual ordinary agreement. Freeze the
+   exact commit, failing-before tests, retained safety evidence and limitations
+   for independent review before the next dependent milestone.
+   Include a reorg with validation callbacks delayed: reads may remain available,
+   but cached readiness must not authorize spending or new signatures.
+
+This first stage does not qualify 200 ms, PoS V2, migration or futures. Exact
+finality undo remains a separately approved state-recovery change. The next
+complete regtest slice connects the actual engine-off Qt order, local
+signature/outbox, HTTPS/FMN2 admission, shared-ledger execution, agreement,
+durable application and independently verified durable client outcome. It uses
+real regtest custody/membership facts rather than trusting the native probe's
+fixture; full V2 still requires futures and the remaining integration gates.
+
+Complete D0 before authority-changing protocol implementation: one reconciled
+architecture contract, typed interface/ownership map, the complete protocol and
+authority specification with comparisons only for genuinely unresolved choices,
 versioned test/latency profiles, B3 checkpoint/custody and external verifier
 acceptance mapping, and an owner decision sheet for R-D1 through R-D7. D7 is
 not the first compatibility check: D0 must expose any incompatible digest,
 lineage, threshold, commitment or proof before dependent signing code begins.
-Use the existing accounting/agreement/storage models and current incidents
-as acceptance tests, not a reason to erase prior work. An offline D1 Qt prototype
-can make the proposed trading experience tangible without live funds or keys.
+Use the existing accounting/agreement/storage models, native fast-path adapters,
+bridge work and current incidents as inputs and acceptance tests, not a reason
+to erase prior work. An offline D1 Qt prototype can make the proposed trading
+experience tangible without live funds or keys.
 
 Freeze that deliverable for separate review. No current tester-network reset,
 VPS update, mainnet operation or unapproved economic rule follows from planning.
