@@ -544,9 +544,10 @@ struct FlowMeshAgreement::Impl {
             break;
         }
     }
-    bool Send(const AgreementMessage& message)
+    bool Send(const AgreementMessage& message, const bool local_signature = false)
     {
         TraceSpan trace{*this, "publish_callback", message};
+        if (local_signature && callbacks.publish_local_signature) return callbacks.publish_local_signature(message);
         return callbacks.publish && callbacks.publish(message);
     }
     std::optional<AgreementMessage> Sign(AgreementMessage intent, const bls::SecretKey& key)
@@ -595,7 +596,7 @@ struct FlowMeshAgreement::Impl {
         Persist("persist_signed_message"); // No publication occurs before this sync.
         Crash(FlowMeshAgreementCrashPoint::AFTER_SIGNED_PERSIST);
         Track(intent);
-        Send(intent);
+        Send(intent, /*local_signature=*/true);
         return intent;
     }
     bool MoveView(const uint32_t target, const bool changing)
@@ -947,18 +948,20 @@ bool FlowMeshAgreement::Retry(std::string& error)
         // Retain/rebroadcast the authenticated proposal even on a follower.
         // Its entry bytes are the fetch path for a hidden highest-prepared
         // candidate when the original leader is no longer available.
-        std::vector<const Bytes*> retry;
-        for (const auto& record : s.slot.records) retry.push_back(&record.signed_bytes);
-        for (const auto& [view, proposal] : s.slot.proposals) retry.push_back(&proposal);
-        if (s.IsDecided()) retry.push_back(&s.slot.decision);
+        struct RetrySource { const Bytes* bytes; bool local_signature; };
+        std::vector<RetrySource> retry;
+        for (const auto& record : s.slot.records) retry.push_back({&record.signed_bytes, true});
+        for (const auto& [view, proposal] : s.slot.proposals) retry.push_back({&proposal, false});
+        if (s.IsDecided()) retry.push_back({&s.slot.decision, false});
         const size_t count{retry.size()};
         size_t sent_bytes{0};
         for (size_t visited{0}; visited < std::min<size_t>(count, 64); ++visited) {
             s.retry_cursor %= count;
-            const auto& bytes{*retry[s.retry_cursor]};
+            const auto& source{retry[s.retry_cursor]};
+            const auto& bytes{*source.bytes};
             if (bytes.empty()) { ++s.retry_cursor; continue; }
             if (sent_bytes && bytes.size() > AGREEMENT_MAX_BYTES - sent_bytes) break;
-            if (!s.Send(*DecodeAgreementMessage(bytes))) break;
+            if (!s.Send(*DecodeAgreementMessage(bytes), source.local_signature)) break;
             sent_bytes += bytes.size();
             ++s.retry_cursor;
         }

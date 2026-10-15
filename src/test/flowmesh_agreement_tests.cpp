@@ -1197,4 +1197,68 @@ BOOST_AUTO_TEST_CASE(final_deferred_flush_failure_refuses_keyless_candidate_subm
     BOOST_CHECK(!restarted.CandidateBytes(f.hash_a));
 }
 
+BOOST_AUTO_TEST_CASE(local_signature_publication_callback_excludes_received_evidence)
+{
+    const AgreementFixture f;
+    std::string error;
+    bool available{true};
+    size_t signed_syncs{0};
+    std::vector<AgreementMessage> ordinary, local;
+    auto callbacks{f.Callbacks(8, ordinary, available)};
+    callbacks.crash = [&](const auto point) {
+        if (point == node::FlowMeshAgreementCrashPoint::AFTER_SIGNED_PERSIST) ++signed_syncs;
+    };
+    callbacks.publish_local_signature = [&](const AgreementMessage& message) {
+        BOOST_CHECK_GT(signed_syncs, 0U);
+        BOOST_CHECK_EQUAL(message.seat_index, 8U);
+        BOOST_CHECK(message.stage != AgreementStage::DECISION);
+        BOOST_CHECK(CheckAgreementMessageSignature(message, f.seats));
+        local.push_back(message);
+        return true;
+    };
+    node::FlowMeshAgreement engine{DBParams{.path = "local-publish-source", .cache_bytes = 1 << 20,
+                                           .memory_only = true}, std::move(callbacks)};
+    BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+    const auto proposal{f.Proposal(f.a)};
+    BOOST_REQUIRE(engine.Receive(proposal, error));
+    BOOST_REQUIRE_EQUAL(local.size(), 1U);
+    BOOST_CHECK(local.front().stage == AgreementStage::PREPARE);
+    BOOST_REQUIRE_EQUAL(signed_syncs, 1U);
+    const auto exact{EncodeAgreementMessage(local.front())};
+    BOOST_REQUIRE(engine.Retry(error));
+    BOOST_REQUIRE_EQUAL(local.size(), 2U);
+    BOOST_CHECK(EncodeAgreementMessage(local.back()) == exact);
+    BOOST_CHECK_EQUAL(signed_syncs, 1U); // Retry did not issue a new signature.
+    BOOST_REQUIRE_EQUAL(ordinary.size(), 1U);
+    BOOST_CHECK(EncodeAgreementMessage(ordinary.front()) == EncodeAgreementMessage(proposal));
+    BOOST_REQUIRE(engine.Receive(f.Decision(f.a), error));
+    BOOST_REQUIRE_EQUAL(ordinary.size(), 2U);
+    BOOST_CHECK(ordinary.back().stage == AgreementStage::DECISION);
+    BOOST_CHECK_EQUAL(local.size(), 2U); // Quorum evidence is not a local outer signature.
+}
+
+BOOST_AUTO_TEST_CASE(local_signature_callback_never_runs_before_signed_sync)
+{
+    const AgreementFixture f;
+    for (const auto point : {node::FlowMeshAgreementCrashPoint::BEFORE_INTENT_PERSIST,
+                            node::FlowMeshAgreementCrashPoint::AFTER_SIGNATURE}) {
+        bool available{true};
+        std::vector<AgreementMessage> ordinary;
+        size_t publications{0};
+        auto callbacks{f.Callbacks(8, ordinary, available)};
+        callbacks.publish_local_signature = [&](const auto&) { ++publications; return true; };
+        callbacks.crash = [point](const auto reached) {
+            if (point == reached) throw std::runtime_error("before durable local publication");
+        };
+        node::FlowMeshAgreement engine{DBParams{.path = "local-publish-failure", .cache_bytes = 1 << 20,
+                                               .memory_only = true}, std::move(callbacks)};
+        std::string error;
+        BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+        BOOST_CHECK(!engine.Receive(f.Proposal(f.a), error));
+        BOOST_CHECK(engine.Halted());
+        BOOST_CHECK_EQUAL(publications, 0U);
+        BOOST_CHECK(ordinary.empty());
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

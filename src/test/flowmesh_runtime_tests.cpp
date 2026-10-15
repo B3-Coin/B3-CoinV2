@@ -41,6 +41,60 @@ namespace node {
 // Test translation-unit only; no runtime callback, option or wire privilege.
 class FlowMeshRuntimeTestAccess {
 public:
+    struct PublicationStats {
+        size_t records, bytes, waiting;
+        uint64_t inspected, encoded_input, attempted;
+    };
+    static PublicationStats Publications(FlowMeshRuntime& runtime)
+    {
+        std::lock_guard lock{runtime.m_market_mutex};
+        size_t waiting{0};
+        for (const auto& [id, source] : runtime.m_local_agreement_publications) {
+            (void)id;
+            waiting += source.waiting_chain_open;
+        }
+        return {runtime.m_local_agreement_publications.size(), runtime.m_local_agreement_publication_bytes,
+            waiting, runtime.m_local_agreement_publications_inspected,
+            runtime.m_local_agreement_publications_encoded_input, runtime.m_local_agreement_publications_attempted};
+    }
+    // Synthetic PRIVATE callback/cache controls, not a new wire privilege or
+    // proof that an arbitrary test message was signed by this engine.
+    static void CachePublication(FlowMeshRuntime& runtime, const flowmesh::AgreementMessage& message)
+    {
+        std::lock_guard lock{runtime.m_market_mutex};
+        runtime.RememberLocalAgreementPublication(*runtime.m_markets.at(message.context.market_id), message);
+    }
+    static bool PublishPublication(FlowMeshRuntime& runtime, const flowmesh::AgreementMessage& message,
+                                   const bool local_signature = false)
+    {
+        std::lock_guard lock{runtime.m_market_mutex};
+        return runtime.PublishAgreement(*runtime.m_markets.at(message.context.market_id), message,
+                                        std::nullopt, local_signature);
+    }
+    static void ExhaustAgreementRelayBudget(FlowMeshRuntime& runtime)
+    {
+        std::lock_guard lock{runtime.m_market_mutex};
+        const auto now{runtime.m_config.clock->Now()};
+        while (runtime.m_agreement_relay_budget.Available(now, 1)) runtime.m_agreement_relay_budget.Charge(1);
+    }
+    static constexpr size_t PublicationRecords() { return FlowMeshRuntime::AGREEMENT_RESUME_RECORDS; }
+    static constexpr size_t PublicationMarketRecords() { return FlowMeshRuntime::AGREEMENT_RESUME_MARKET_RECORDS; }
+    static constexpr size_t PublicationBytes() { return FlowMeshRuntime::AGREEMENT_RESUME_BYTES; }
+    static constexpr size_t PublicationMarketBytes() { return FlowMeshRuntime::AGREEMENT_RESUME_MARKET_BYTES; }
+    static constexpr size_t PublicationInspect() { return FlowMeshRuntime::AGREEMENT_RESUME_INSPECT; }
+    static std::pair<size_t, size_t> MarketPublications(FlowMeshRuntime& runtime,
+                                                       const flowmesh::MarketId& market)
+    {
+        std::lock_guard lock{runtime.m_market_mutex};
+        size_t count{0}, bytes{0};
+        for (const auto& [id, source] : runtime.m_local_agreement_publications) {
+            (void)id;
+            if (source.context.market_id != market) continue;
+            ++count;
+            bytes += source.payload.size() + flowmesh::FLOWMESH_WIRE_HEADER_SIZE;
+        }
+        return {count, bytes};
+    }
     static uint64_t Reserve(FlowMeshRuntime& runtime, const flowmesh::WireMessage& wire,
                             const uint256& domain, const uint256& config, const std::string& submitter = "127.0.0.1")
     {
@@ -414,6 +468,7 @@ public:
         if (m_visibility_chain && !m_visibility_chain->Acceptable(m_visibility_chain->Current())) return {};
         (void)seats;
         const auto it{m_keys.find(market)};
+        if (after_get) after_get();
         return it == m_keys.end() ? std::vector<bls::SecretKey>{}
                                   : it->second;
     }
@@ -422,6 +477,9 @@ public:
     // Optional production-service behavior: configured keys are masked while
     // B3 reconciliation is in progress, without actually disarming them.
     RuntimeChain* m_visibility_chain{nullptr};
+    //! Test-only, installed/removed while all workers are idle. The native
+    //! engine still performs its own validation and durable signing writes.
+    std::function<void()> after_get;
 };
 
 class RuntimeSeatSource final : public node::ProductionSeatSetSource
@@ -1048,6 +1106,90 @@ public:
     std::atomic<size_t> prepares{0}, commits{0}, decisions{0}, view_changes{0}, premature_v1{0};
     RuntimeNetwork network{Count};
     std::array<std::unique_ptr<node::FlowMeshRuntime>, Count> runtimes;
+};
+
+// Observer-only native stores/engines. Private cache controls below isolate
+// resource and scheduling invariants; they do not pretend these synthetic
+// messages were issued by each engine. The end-to-end test uses actual Sign.
+class AgreementResumeCacheFixture
+{
+public:
+    explicit AgreementResumeCacheFixture(const fs::path& path, const size_t count = 1)
+    {
+        chain.m_domain = domain;
+        std::vector<node::FlowMeshRuntimeMarketConfig> configs;
+        std::string error;
+        for (size_t i{0}; i < count; ++i) {
+            const modern::AssetId asset{Filled(static_cast<unsigned char>(0x50 + i))};
+            const auto market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+            auto seats{Seats(domain, market, 4, 0, 100, Filled(0x71), static_cast<unsigned char>(150 + 8 * i))};
+            const flowmesh::FlowMeshState initial{*flowmesh::ComputeFlowMeshVaultId(domain, market), asset,
+                                                  modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+            chain.Add(seats.seats);
+            const auto store_path{path / fs::PathFromString("market_" + std::to_string(i))};
+            stores.push_back(std::make_unique<node::FlowMeshProductionStore>(DBParams{
+                .path = store_path, .cache_bytes = size_t{1} << 20, .wipe_data = true}, true));
+            BOOST_REQUIRE_MESSAGE(stores.back()->OpenForMarket(domain, market, seats.seats, initial.Root(), error), error);
+            std::optional<node::FlowMeshProductionStore::Marker> marker;
+            BOOST_REQUIRE(stores.back()->ReadMarker(marker, error));
+            BOOST_REQUIRE(marker);
+            auto config{MarketConfig(domain, market, Filled(0x6c), seats.seats, initial, *stores.back(), nullptr)};
+            config.preagreement = true;
+            config.agreement_path = store_path / "agreement";
+            config.agreement_identity = marker->agreement_identity;
+            config.agreement_allow_create = true;
+            configs.push_back(std::move(config));
+            contexts.push_back({domain, market, 0, seats.seats.set_hash, 0, {}, initial.Root(), initial.ConfigId()});
+            seat_fixtures.push_back(std::move(seats));
+        }
+        node::FlowMeshRuntimeConfig config;
+        config.chain = &chain;
+        config.keys = &keys;
+        config.clock = &clock;
+        config.round_timeout = std::chrono::hours{1};
+        config.relay = [this](node::FlowMeshRuntimeRelay relay) {
+            if (relay.message.kind != flowmesh::WireMessageKind::AGREEMENT) return LegacyRelayResult();
+            sent.push_back(relay.message.payload); // Read only after WaitForIdle.
+            if (std::exchange(reclose, false)) chain.SetReconciled(false);
+            node::FlowMeshRelayResult result;
+            result.peers.push_back({9, mode, {}});
+            return result;
+        };
+        runtime = std::make_unique<node::FlowMeshRuntime>(config, std::move(configs));
+        BOOST_REQUIRE_MESSAGE(runtime->Start(error), error);
+        Tick(); // Arm ordinary one-second retries with no local keys/signed records.
+    }
+    ~AgreementResumeCacheFixture() { runtime->Stop(); }
+    void Tick(const std::chrono::milliseconds advance = std::chrono::milliseconds{0})
+    {
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{5}));
+        clock.m_now += advance;
+        runtime->NotifyTick();
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{5}));
+    }
+    flowmesh::AgreementMessage Message(const size_t market, const uint32_t view) const
+    {
+        flowmesh::AgreementMessage message;
+        message.context = contexts.at(market);
+        message.stage = flowmesh::AgreementStage::VIEW_CHANGE;
+        message.view = view;
+        const auto digest{flowmesh::AgreementMessageDigest(message)};
+        BOOST_REQUIRE(digest);
+        message.signature = seat_fixtures.at(market).secrets[0].Sign(
+            std::span<const unsigned char>{digest->begin(), 32}).Compressed();
+        return message;
+    }
+    RuntimeChain chain;
+    RuntimeKeys keys;
+    FixedClock clock;
+    const uint256 domain{Filled(0x2c)};
+    std::vector<std::unique_ptr<node::FlowMeshProductionStore>> stores;
+    std::vector<flowmesh::PreagreementContext> contexts;
+    std::vector<SeatFixture> seat_fixtures;
+    node::FlowMeshDeliveryAdmission mode{node::FlowMeshDeliveryAdmission::ADMITTED};
+    bool reclose{false};
+    std::vector<std::vector<unsigned char>> sent;
+    std::unique_ptr<node::FlowMeshRuntime> runtime;
 };
 
 /** One real signer in a four-seat committee: a proposal and a durable vote,
@@ -11694,5 +11836,350 @@ BOOST_AUTO_TEST_CASE(local_source_malformed_reward_credentials_do_not_shelter_be
     BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
 }
 #endif
+
+BOOST_AUTO_TEST_CASE(preagreement_local_signed_publications_resume_exactly_without_clock_advance)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() /
+        "agreement_publication_reopen", std::chrono::seconds{10}};
+    f.block_commits = false;
+    f.Drain();
+    const auto now{f.clocks[0].Now()};
+    std::atomic<size_t> key_calls{0};
+    // On the first ordinary tick: timeout eligibility, initial empty Retry,
+    // MaybePropose, then SubmitCandidate's Pump. CandidateReady is already
+    // validated/cached at that final key lookup; the next Current check is
+    // PublishAgreement, after Sign's intent and exact signature syncs.
+    f.keys[0].after_get = [&] {
+        if (++key_calls == 4) {
+            f.chains[0].ReconcileOnceWhileChecking(f.chains[0].Current(), 0, false);
+        }
+    };
+    std::mutex observed_mutex;
+    std::map<flowmesh::AgreementStage, std::vector<unsigned char>> originals;
+    struct StopBeforeObservations {
+        PreagreementRuntimeHarness<>& fixture;
+        ~StopBeforeObservations() { fixture.StopAll(); }
+    } stop_before_observations{f};
+    f.network.SetFilter([&](size_t from, size_t, const flowmesh::WireMessage& wire) {
+        if (from == 0 && wire.kind == flowmesh::WireMessageKind::AGREEMENT) {
+            const auto message{flowmesh::DecodeAgreementMessage(wire.payload)};
+            if (message && message->view == 0 && message->context.sequence == 0 &&
+                message->seat_index == 0 && (message->stage == flowmesh::AgreementStage::PROPOSAL ||
+                    message->stage == flowmesh::AgreementStage::PREPARE)) {
+                std::lock_guard lock{observed_mutex};
+                const auto [it, inserted]{originals.emplace(message->stage, wire.payload)};
+                if (!inserted) BOOST_CHECK(it->second == wire.payload);
+            }
+        }
+        return f.Observe(wire);
+    });
+    f.Tick();
+    BOOST_REQUIRE_GE(key_calls.load(), 4U);
+    BOOST_REQUIRE(!f.chains[0].Acceptable(f.chains[0].Current()));
+    BOOST_REQUIRE(f.AllAt(0));
+    const auto blocked{f.runtimes[0]->DeliverySnapshots(f.market).front()};
+    const auto refused{std::count_if(blocked.events.begin(), blocked.events.end(), [](const auto& event) {
+        return event.stage == "agreement_refused" && event.reason == "market_unavailable_or_reconciling";
+    })};
+    BOOST_REQUIRE_EQUAL(refused, 2); // Both durable proposal and PREPARE hit publication, not an earlier gate.
+    {
+        std::lock_guard lock{observed_mutex};
+        BOOST_REQUIRE(originals.empty());
+    }
+    f.keys[0].after_get = {};
+    f.chains[0].SetReconciled(true);
+    f.Tick(); // The normal one-second retry is not due; no new request/view/timer.
+    {
+        std::lock_guard lock{observed_mutex};
+        BOOST_REQUIRE_EQUAL(originals.size(), 2U);
+        const auto proposal{flowmesh::DecodeAgreementMessage(originals.at(flowmesh::AgreementStage::PROPOSAL))};
+        const auto prepare{flowmesh::DecodeAgreementMessage(originals.at(flowmesh::AgreementStage::PREPARE))};
+        BOOST_REQUIRE(proposal);
+        BOOST_REQUIRE(prepare);
+        BOOST_CHECK(flowmesh::CheckAgreementMessageSignature(*proposal, f.seats.seats));
+        BOOST_CHECK(flowmesh::CheckAgreementMessageSignature(*prepare, f.seats.seats));
+        BOOST_CHECK(proposal->candidate == prepare->candidate);
+        // Rebuild the expected original bytes, not a newly selected candidate.
+        flowmesh::ProductionEpochGate gate{f.domain, f.market, f.seats.seats};
+        flowmesh::ProductionEntryCheck check;
+        const auto built{flowmesh::BuildProductionExecutionEntry(f.initial, f.domain, f.market,
+            f.seats.seats, gate, 0, 0, {}, {100, Filled(0x71)},
+            {f.chains[0].TipHeight(), std::nullopt, &f.chains[0]}, f.treasury, {}, &f.deposits, check)};
+        BOOST_REQUIRE(built);
+        BOOST_CHECK(std::optional<std::vector<unsigned char>>{proposal->entry_bytes} ==
+                    flowmesh::EncodeProductionEntry(built->entry));
+        auto expected{*prepare};
+        expected.signature.fill(0);
+        const auto digest{flowmesh::AgreementMessageDigest(expected)};
+        BOOST_REQUIRE(digest);
+        expected.signature = f.seats.secrets[0].Sign(
+            std::span<const unsigned char>{digest->begin(), 32}).Compressed();
+        BOOST_CHECK(flowmesh::EncodeAgreementMessage(expected) ==
+                    std::optional<std::vector<unsigned char>>{originals.at(flowmesh::AgreementStage::PREPARE)});
+    }
+    BOOST_CHECK(f.AllAt(1));
+    for (const auto& clock : f.clocks) BOOST_CHECK(clock.Now() == now);
+    for (const auto& runtime : f.runtimes) BOOST_CHECK_EQUAL(runtime->MarketStatus(f.market)->round, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(local_agreement_publication_cache_bounds_and_peer_origin)
+{
+    AgreementResumeCacheFixture f{m_args.GetDataDirBase() / "agreement_resume_count", 5};
+    auto& runtime{*f.runtime};
+    f.chain.SetReconciled(false);
+    const auto message{f.Message(0, 1)};
+    BOOST_CHECK(!node::FlowMeshRuntimeTestAccess::PublishPublication(runtime, message));
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(runtime).records, 0U);
+    const auto payload{flowmesh::EncodeAgreementMessage(message)};
+    BOOST_REQUIRE(payload);
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(7, {flowmesh::WireMessageKind::AGREEMENT,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, message.context.market_id, 0, 0}, *payload}) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{5}));
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(runtime).records, 0U);
+    for (size_t market{0}; market < f.contexts.size(); ++market) {
+        for (uint32_t view{1}; view <= 17; ++view) {
+            BOOST_CHECK(!node::FlowMeshRuntimeTestAccess::PublishPublication(runtime, f.Message(market, view), true));
+            const auto stats{node::FlowMeshRuntimeTestAccess::Publications(runtime)};
+            BOOST_CHECK_LE(stats.records, node::FlowMeshRuntimeTestAccess::PublicationRecords());
+            BOOST_CHECK_LE(stats.bytes, node::FlowMeshRuntimeTestAccess::PublicationBytes());
+            const auto local{node::FlowMeshRuntimeTestAccess::MarketPublications(runtime, f.contexts[market].market_id)};
+            BOOST_CHECK_LE(local.first, node::FlowMeshRuntimeTestAccess::PublicationMarketRecords());
+            BOOST_CHECK_LE(local.second, node::FlowMeshRuntimeTestAccess::PublicationMarketBytes());
+        }
+    }
+    const auto full{node::FlowMeshRuntimeTestAccess::Publications(runtime)};
+    BOOST_CHECK_EQUAL(full.records, 64U);
+    BOOST_CHECK_EQUAL(full.waiting, 64U);
+    for (size_t n{0}; n < 100; ++n) {
+        BOOST_CHECK(!node::FlowMeshRuntimeTestAccess::PublishPublication(runtime, message, true));
+    }
+    const auto duplicate{node::FlowMeshRuntimeTestAccess::Publications(runtime)};
+    BOOST_CHECK_EQUAL(duplicate.records, full.records);
+    BOOST_CHECK_EQUAL(duplicate.bytes, full.bytes);
+    for (const auto& context : f.contexts) {
+        BOOST_CHECK(runtime.MarketStatus(context.market_id)->halt == node::FlowMeshRuntimeHalt::NONE);
+    }
+    runtime.Stop();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(runtime).records, 0U);
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(runtime).bytes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(local_agreement_publication_cache_accounts_large_encoded_copies)
+{
+    AgreementResumeCacheFixture f{m_args.GetDataDirBase() / "agreement_resume_bytes"};
+    flowmesh::ProductionEntryCore entry;
+    const auto& context{f.contexts[0]};
+    entry.domain = context.domain;
+    entry.market_id = context.market_id;
+    entry.seat_set_hash = context.seat_set_hash;
+    entry.previous_state_root = context.previous_state_root;
+    entry.state_root = context.previous_state_root;
+    entry.anchor = {100, Filled(0x71)};
+    entry.effect_root = modern::EmptyFlowMeshEffectRoot(0);
+    for (uint64_t i{0}; i < flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_ACTIONS; ++i) {
+        flowmesh::Action action;
+        action.signer = Filled(0x12);
+        action.sequence = i;
+        action.type = static_cast<uint8_t>(flowmesh::ActionType::SUBMIT_BID);
+        for (CAmount price{1}; price <= static_cast<CAmount>(flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS); ++price) {
+            action.curve.push_back({price, 1});
+        }
+        entry.actions.push_back(std::move(action));
+    }
+    entry.actions_root = flowmesh::ComputeProductionActionsRoot(entry.actions);
+    size_t framed{0};
+    // Structurally canonical large bodies test PRIVATE copy accounting only,
+    // not executable balances or engine-issued conflicting proposals.
+    for (unsigned char i{1}; i <= 20; ++i) {
+        entry.result_root = Filled(i);
+        const auto encoded{flowmesh::EncodeProductionEntry(entry)};
+        BOOST_REQUIRE(encoded);
+        flowmesh::AgreementMessage message;
+        message.context = context;
+        message.entry_bytes = *encoded;
+        message.candidate = entry.GetHash();
+        const auto payload{flowmesh::EncodeAgreementMessage(message)};
+        BOOST_REQUIRE(payload);
+        BOOST_REQUIRE(flowmesh::DecodeAgreementMessage(*payload));
+        framed = payload->size() + flowmesh::FLOWMESH_WIRE_HEADER_SIZE;
+        node::FlowMeshRuntimeTestAccess::CachePublication(*f.runtime, message);
+    }
+    const auto stats{node::FlowMeshRuntimeTestAccess::Publications(*f.runtime)};
+    BOOST_REQUIRE_GT(stats.records, 0U);
+    BOOST_CHECK_LT(stats.records, node::FlowMeshRuntimeTestAccess::PublicationMarketRecords());
+    BOOST_CHECK_EQUAL(stats.records, node::FlowMeshRuntimeTestAccess::PublicationMarketBytes() / framed);
+    BOOST_CHECK_EQUAL(stats.bytes, stats.records * framed);
+    BOOST_CHECK_LE(stats.bytes, node::FlowMeshRuntimeTestAccess::PublicationMarketBytes());
+    BOOST_CHECK_GE(node::FlowMeshRuntimeTestAccess::PublicationMarketBytes(),
+                   flowmesh::AGREEMENT_MAX_BYTES + flowmesh::FLOWMESH_WIRE_HEADER_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(local_agreement_publication_retry_work_is_global_and_paced)
+{
+    AgreementResumeCacheFixture f{m_args.GetDataDirBase() / "agreement_resume_work", 4};
+    f.mode = node::FlowMeshDeliveryAdmission::FULL;
+    f.chain.SetReconciled(false);
+    for (size_t market{0}; market < f.contexts.size(); ++market) {
+        for (uint32_t view{1}; view <= 16; ++view) {
+            BOOST_CHECK(!node::FlowMeshRuntimeTestAccess::PublishPublication(*f.runtime, f.Message(market, view), true));
+        }
+    }
+    f.Tick();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).inspected, 0U);
+    f.chain.SetReconciled(true);
+    f.Tick();
+    const auto first{node::FlowMeshRuntimeTestAccess::Publications(*f.runtime)};
+    BOOST_CHECK_EQUAL(first.inspected, 8U);
+    BOOST_CHECK_EQUAL(first.attempted, 8U);
+    BOOST_CHECK_LE(first.encoded_input, node::FlowMeshRuntimeTestAccess::PublicationBytes());
+    for (size_t n{0}; n < 32; ++n) f.Tick();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).inspected, first.inspected);
+    f.Tick(std::chrono::milliseconds{249});
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).inspected, first.inspected);
+    for (size_t pass{1}; pass < 8; ++pass) {
+        const auto before{node::FlowMeshRuntimeTestAccess::Publications(*f.runtime)};
+        f.Tick(pass == 1 ? std::chrono::milliseconds{1} : std::chrono::milliseconds{250});
+        const auto after{node::FlowMeshRuntimeTestAccess::Publications(*f.runtime)};
+        BOOST_CHECK_EQUAL(after.inspected - before.inspected, 8U);
+        BOOST_CHECK_LE(after.encoded_input - before.encoded_input, node::FlowMeshRuntimeTestAccess::PublicationBytes());
+    }
+    std::set<uint256> exact_objects;
+    for (const auto& payload : f.sent) exact_objects.insert(Hash(payload));
+    BOOST_CHECK_EQUAL(exact_objects.size(), 64U); // Cursor did not favor one market or hash prefix.
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).records, 64U);
+}
+
+BOOST_AUTO_TEST_CASE(local_agreement_publication_reclose_and_budget_do_not_reset_pacing)
+{
+    AgreementResumeCacheFixture f{m_args.GetDataDirBase() / "agreement_resume_reclose"};
+    f.chain.SetReconciled(false);
+    for (uint32_t view{1}; view <= 3; ++view) {
+        BOOST_CHECK(!node::FlowMeshRuntimeTestAccess::PublishPublication(*f.runtime, f.Message(0, view), true));
+    }
+    f.chain.SetReconciled(true);
+    node::FlowMeshRuntimeTestAccess::ExhaustAgreementRelayBudget(*f.runtime);
+    f.Tick();
+    const auto budget_denied{node::FlowMeshRuntimeTestAccess::Publications(*f.runtime)};
+    BOOST_CHECK_EQUAL(budget_denied.records, 3U);
+    BOOST_CHECK_EQUAL(budget_denied.waiting, 0U);
+    BOOST_CHECK(f.sent.empty());
+    f.mode = node::FlowMeshDeliveryAdmission::FULL;
+    f.reclose = true;
+    f.Tick(std::chrono::milliseconds{250});
+    BOOST_REQUIRE(!f.chain.Acceptable(f.chain.Current()));
+    const auto closed{node::FlowMeshRuntimeTestAccess::Publications(*f.runtime)};
+    BOOST_CHECK_EQUAL(closed.records, 3U);
+    BOOST_CHECK_EQUAL(closed.waiting, 2U);
+    BOOST_REQUIRE_EQUAL(f.sent.size(), 1U);
+    const auto exact{f.sent.front()};
+    f.chain.SetReconciled(true);
+    f.mode = node::FlowMeshDeliveryAdmission::ADMITTED;
+    for (size_t n{0}; n < 8; ++n) f.Tick();
+    BOOST_CHECK_EQUAL(f.sent.size(), 1U); // Real reclose/reopen did not refill/bypass pace.
+    f.Tick(std::chrono::milliseconds{250});
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).records, 0U);
+    BOOST_CHECK_EQUAL(std::count(f.sent.begin() + 1, f.sent.end(), exact), 1);
+    const auto done{node::FlowMeshRuntimeTestAccess::Publications(*f.runtime)};
+    f.Tick();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).attempted, done.attempted);
+}
+
+BOOST_AUTO_TEST_CASE(local_agreement_publication_normal_success_and_context_refusal_retire_copies)
+{
+    AgreementResumeCacheFixture f{m_args.GetDataDirBase() / "agreement_resume_context"};
+    auto message{f.Message(0, 1)};
+    f.chain.SetTransition(f.contexts[0].market_id, node::FlowMeshSeatTransitionKind::PAUSED);
+    f.Tick();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).records, 0U);
+    // Seat pause/keyless alone is not a cache source. Existing publication
+    // rules still allow replay of a signature already issued while eligible.
+    BOOST_CHECK(node::FlowMeshRuntimeTestAccess::PublishPublication(*f.runtime, message, true));
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).records, 0U);
+    f.chain.SetReconciled(false);
+    BOOST_CHECK(!node::FlowMeshRuntimeTestAccess::PublishPublication(*f.runtime, message, true));
+    BOOST_REQUIRE_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).records, 1U);
+    f.chain.SetReconciled(true);
+    BOOST_CHECK(node::FlowMeshRuntimeTestAccess::PublishPublication(*f.runtime, message, true));
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).records, 0U);
+    const auto before{node::FlowMeshRuntimeTestAccess::Publications(*f.runtime)};
+    f.Tick();
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).attempted, before.attempted);
+    // PRIVATE cache injection isolates stale binding rejection; public source
+    // admission would already reject this different execution configuration.
+    message.context.execution_config_id = Filled(0x98);
+    node::FlowMeshRuntimeTestAccess::CachePublication(*f.runtime, message);
+    const auto sends{f.sent.size()};
+    f.Tick(std::chrono::milliseconds{250});
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).records, 0U);
+    BOOST_CHECK_EQUAL(f.sent.size(), sends);
+    BOOST_CHECK(f.runtime->MarketStatus(f.contexts[0].market_id)->halt == node::FlowMeshRuntimeHalt::NONE);
+    // A newly detected permanent seat-anchor failure is refreshed before the
+    // fast pass. Discard the disposable copy, never its signing obligation.
+    node::FlowMeshRuntimeTestAccess::CachePublication(*f.runtime, f.Message(0, 2));
+    f.chain.AddCanonical({100, Filled(0xfa)});
+    f.Tick(std::chrono::milliseconds{250});
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtime).records, 0U);
+    BOOST_CHECK_EQUAL(f.sent.size(), sends);
+    BOOST_CHECK(f.runtime->MarketStatus(f.contexts[0].market_id)->halt == node::FlowMeshRuntimeHalt::ANCHOR_INVALIDATED);
+}
+
+BOOST_AUTO_TEST_CASE(local_agreement_publication_restart_retains_exact_journal_fallback)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "agreement_resume_restart"};
+    f.block_commits = false;
+    f.Drain();
+    std::atomic<size_t> key_calls{0};
+    f.keys[0].after_get = [&] {
+        if (++key_calls == 4) f.chains[0].ReconcileOnceWhileChecking(f.chains[0].Current(), 0, false);
+    };
+    f.Tick();
+    BOOST_REQUIRE(!f.chains[0].Acceptable(f.chains[0].Current()));
+    BOOST_REQUIRE_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtimes[0]).records, 2U);
+    f.keys[0].after_get = {};
+    f.StopNode(0); // Discards only disposable memory; preserved signer journal.
+    std::string error;
+    std::optional<node::FlowMeshProductionStore::Marker> marker;
+    BOOST_REQUIRE(f.stores[0]->ReadMarker(marker, error));
+    BOOST_REQUIRE(marker);
+    const flowmesh::PreagreementContext context{f.domain, f.market, 0, f.seats.seats.set_hash,
+        0, {}, f.initial.Root(), f.initial.ConfigId()};
+    std::set<std::vector<unsigned char>> expected;
+    {
+        node::FlowMeshAgreementCallbacks callbacks;
+        callbacks.local_keys = [] { return std::vector<bls::SecretKey>{}; };
+        callbacks.publish = [&](const auto& message) {
+            const auto encoded{flowmesh::EncodeAgreementMessage(message)};
+            BOOST_REQUIRE(encoded);
+            expected.insert(*encoded);
+            return true;
+        };
+        node::FlowMeshAgreement journal{DBParams{.path = f.AgreementPath(0), .cache_bytes = 1 << 20}, std::move(callbacks)};
+        BOOST_REQUIRE_MESSAGE(journal.Open(context, f.seats.seats, marker->agreement_identity, false, error), error);
+        BOOST_REQUIRE(journal.Retry(error)); // Keyless, no candidate validation: exact old records only.
+    }
+    BOOST_REQUIRE_EQUAL(expected.size(), 2U);
+    f.chains[0].SetReconciled(true);
+    std::mutex mutex;
+    std::set<std::vector<unsigned char>> replayed;
+    struct StopBeforeObservations {
+        PreagreementRuntimeHarness<>& fixture;
+        ~StopBeforeObservations() { fixture.StopAll(); }
+    } stop_before_observations{f};
+    f.network.SetFilter([&](size_t from, size_t, const flowmesh::WireMessage& wire) {
+        if (from == 0 && wire.kind == flowmesh::WireMessageKind::AGREEMENT && expected.contains(wire.payload)) {
+            std::lock_guard lock{mutex};
+            replayed.insert(wire.payload);
+        }
+        return f.Observe(wire);
+    });
+    BOOST_REQUIRE_MESSAGE(f.StartNode(0, f.AgreementPath(0), std::nullopt, error), error);
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Publications(*f.runtimes[0]).records, 0U);
+    f.Tick(); // Ordinary retry restored from the journal; optimization need not survive restart.
+    {
+        std::lock_guard lock{mutex};
+        BOOST_CHECK(replayed == expected);
+    }
+    BOOST_CHECK(f.AllAt(1));
+}
 
 BOOST_AUTO_TEST_SUITE_END()

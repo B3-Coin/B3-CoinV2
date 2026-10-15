@@ -797,7 +797,11 @@ private:
                              std::string& error);
     bool RefreshAgreement(Market& market);
     bool PublishAgreement(Market& market, const flowmesh::AgreementMessage& message,
-                          std::optional<flowmesh::WirePeerId> exclude = std::nullopt);
+                          std::optional<flowmesh::WirePeerId> exclude = std::nullopt,
+                          bool local_signature = false);
+    void RememberLocalAgreementPublication(Market& market, const flowmesh::AgreementMessage& message);
+    void EraseLocalAgreementPublication(const uint256& id);
+    void RetryLocalAgreementPublications();
     void HandleAgreement(Market& market, flowmesh::WirePeerId peer,
                          const flowmesh::WireMessage& message);
     void FinalizeAgreement(Market& market);
@@ -932,6 +936,28 @@ private:
     uint64_t m_next_delivery_id{1}, m_delivery_cursor{0};
     size_t m_delivery_bytes{0};
     bool m_delivery_retention_waiting{false};
+    // Disposable copies only of locally signed, synced agreement records
+    // refused by the chain publication gate. The journal, not this cache,
+    // owns obligations and ordinary one-second retries. A peer cannot insert.
+    static constexpr size_t AGREEMENT_RESUME_RECORDS{64};
+    static constexpr size_t AGREEMENT_RESUME_MARKET_RECORDS{16};
+    static constexpr size_t AGREEMENT_RESUME_MARKET_BYTES{
+        flowmesh::AGREEMENT_MAX_BYTES + flowmesh::FLOWMESH_WIRE_HEADER_SIZE};
+    static constexpr size_t AGREEMENT_RESUME_BYTES{2 * AGREEMENT_RESUME_MARKET_BYTES};
+    static constexpr size_t AGREEMENT_RESUME_INSPECT{8};
+    struct LocalAgreementPublication {
+        flowmesh::PreagreementContext context;
+        std::vector<unsigned char> payload;
+        bool waiting_chain_open{true};
+    };
+    std::map<uint256, LocalAgreementPublication> m_local_agreement_publications;
+    size_t m_local_agreement_publication_bytes{0};
+    uint256 m_local_agreement_publication_cursor;
+    flowmesh::WireClock::time_point m_next_local_agreement_publication_retry{};
+    // Diagnostic counters, never certified or a grant of signing authority.
+    uint64_t m_local_agreement_publications_inspected{0};
+    uint64_t m_local_agreement_publications_encoded_input{0};
+    uint64_t m_local_agreement_publications_attempted{0};
     uint256 m_delivery_regeneration_cursor;
     flowmesh::WireClock::time_point m_next_delivery_regeneration{};
     // Unvalidated reconciliation-race input, <=128 / 16 MiB, per-market16,

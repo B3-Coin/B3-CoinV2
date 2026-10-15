@@ -52,6 +52,10 @@ struct FlowMeshAgreementCallbacks {
     std::function<std::optional<uint32_t>(uint32_t)> leader;
     // False means admission failed. Exact durable bytes remain retryable.
     std::function<bool(const flowmesh::AgreementMessage&)> publish;
+    // Optional distinction for exact records this engine signed and synced.
+    // Received proposals/decisions never acquire this local-source privilege.
+    // If absent, local records use publish as before. No signing rule changes.
+    std::function<bool(const flowmesh::AgreementMessage&)> publish_local_signature;
     // Deterministic crash injection for tests; omitted by production callers.
     std::function<void(FlowMeshAgreementCrashPoint)> crash;
     // Both are absent in normal operation. Callbacks must not throw. Nested

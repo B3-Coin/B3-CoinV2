@@ -259,6 +259,7 @@ struct FlowMeshRuntime::Market {
     // must fit, while each market has a bounded four-MiB scheduling burst.
     FlowMeshCommitteeRelayBudget agreement_budget{
         128, flowmesh::AGREEMENT_MAX_BYTES + flowmesh::FLOWMESH_WIRE_HEADER_SIZE};
+    size_t agreement_resume_records{0}, agreement_resume_bytes{0};
     // Exact forwarded payloads of the active slot. A repeat of the same bytes
     // adds nothing at a peer that received them, so its forwarding interval
     // doubles; the first forward and the sender's durable retry are unchanged.
@@ -2564,6 +2565,11 @@ bool FlowMeshRuntime::InitializeMarkets(std::string& error)
         error = "FlowMesh runtime dependencies or timing policy are incomplete";
         return false;
     }
+    while (!m_local_agreement_publications.empty()) {
+        EraseLocalAgreementPublication(m_local_agreement_publications.begin()->first);
+    }
+    m_next_local_agreement_publication_retry = {};
+    m_local_agreement_publication_cursor.SetNull();
     m_markets.clear();
     {
         LOCK(m_read_mutex);
@@ -2870,6 +2876,9 @@ bool FlowMeshRuntime::InitializeAgreement(Market& market,
     callbacks.publish = [this, &market](const flowmesh::AgreementMessage& message) {
         return PublishAgreement(market, message);
     };
+    callbacks.publish_local_signature = [this, &market](const flowmesh::AgreementMessage& message) {
+        return PublishAgreement(market, message, std::nullopt, /*local_signature=*/true);
+    };
     {
         callbacks.trace_enabled = [] { return FlowMeshTimingRecording() || util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug); };
         callbacks.trace_clock = [&market] { return TraceNow(*market.clock); };
@@ -2950,8 +2959,103 @@ bool FlowMeshRuntime::RefreshAgreement(Market& market)
     return true;
 }
 
+void FlowMeshRuntime::RememberLocalAgreementPublication(
+    Market& market, const flowmesh::AgreementMessage& message)
+{
+    // This private boundary is called only for a locally signed journal
+    // record that actually encountered a closed chain publication gate.
+    // Neither received traffic nor a PAUSED/keyless seat observation inserts.
+    if (message.stage == flowmesh::AgreementStage::DECISION) return;
+    const auto payload{flowmesh::EncodeAgreementMessage(message)};
+    if (!payload) return;
+    const uint256 id{Hash(*payload)};
+    if (const auto found{m_local_agreement_publications.find(id)};
+        found != m_local_agreement_publications.end()) {
+        if (found->second.payload == *payload) found->second.waiting_chain_open = true;
+        return;
+    }
+    const size_t bytes{payload->size() + flowmesh::FLOWMESH_WIRE_HEADER_SIZE};
+    if (m_local_agreement_publications.size() >= AGREEMENT_RESUME_RECORDS ||
+        market.agreement_resume_records >= AGREEMENT_RESUME_MARKET_RECORDS ||
+        bytes > AGREEMENT_RESUME_BYTES - m_local_agreement_publication_bytes ||
+        bytes > AGREEMENT_RESUME_MARKET_BYTES - market.agreement_resume_bytes) {
+        DeliveryEvent(market, "agreement_resume_cache_refused", flowmesh::WireMessageKind::AGREEMENT,
+                      message.candidate, message.context.sequence, std::nullopt,
+                      "disposable copy full; durable journal retains normal retry");
+        return;
+    }
+    m_local_agreement_publications.emplace(id, LocalAgreementPublication{message.context, *payload});
+    m_local_agreement_publication_bytes += bytes;
+    ++market.agreement_resume_records;
+    market.agreement_resume_bytes += bytes;
+}
+
+void FlowMeshRuntime::EraseLocalAgreementPublication(const uint256& id)
+{
+    const auto found{m_local_agreement_publications.find(id)};
+    if (found == m_local_agreement_publications.end()) return;
+    const size_t bytes{found->second.payload.size() + flowmesh::FLOWMESH_WIRE_HEADER_SIZE};
+    if (const auto market{m_markets.find(found->second.context.market_id)}; market != m_markets.end()) {
+        --market->second->agreement_resume_records;
+        market->second->agreement_resume_bytes -= bytes;
+    }
+    m_local_agreement_publication_bytes -= bytes;
+    m_local_agreement_publications.erase(found);
+}
+
+void FlowMeshRuntime::RetryLocalAgreementPublications()
+{
+    if (m_local_agreement_publications.empty()) return;
+    const auto now{m_config.clock->Now()};
+    if (now < m_next_local_agreement_publication_retry) return;
+    // A closed observation spends no open-pass interval. Thus the first
+    // genuine reopening can service one bounded batch immediately, unless
+    // an earlier open batch already spent this same 250 ms interval. Even a
+    // second close/reopen cannot reset that pacing or refill relay tokens.
+    if (!m_config.chain->Acceptable(m_config.chain->Current())) return;
+    m_next_local_agreement_publication_retry = now + DEFERRED_RETRY_INTERVAL;
+    auto it{m_local_agreement_publications.upper_bound(m_local_agreement_publication_cursor)};
+    const size_t count{std::min(AGREEMENT_RESUME_INSPECT, m_local_agreement_publications.size())};
+    size_t encoded_input{0};
+    for (size_t inspected{0}; inspected < count && !m_local_agreement_publications.empty(); ++inspected) {
+        if (it == m_local_agreement_publications.end()) it = m_local_agreement_publications.begin();
+        const auto current{it++};
+        const auto id{current->first};
+        m_local_agreement_publication_cursor = id;
+        CountObservation(m_local_agreement_publications_inspected);
+        const auto& source{current->second};
+        const size_t bytes{source.payload.size() + flowmesh::FLOWMESH_WIRE_HEADER_SIZE};
+        // Count input before decoding/encoding. Fresh supported budget fits
+        // one maximum legal record; no history or candidate scan is hidden.
+        if (bytes > AGREEMENT_RESUME_BYTES - encoded_input) break;
+        encoded_input += bytes;
+        m_local_agreement_publications_encoded_input += std::min<uint64_t>(bytes,
+            std::numeric_limits<uint64_t>::max() - m_local_agreement_publications_encoded_input);
+        const auto market_it{m_markets.find(source.context.market_id)};
+        if (market_it == m_markets.end()) { EraseLocalAgreementPublication(id); continue; }
+        auto& market{*market_it->second};
+        if (!market.agreement || market.agreement->Halted() || !market.agreement_context ||
+            market.halt != FlowMeshRuntimeHalt::NONE || market.pending_handoff ||
+            !SameAgreementContext(source.context, *market.agreement_context) ||
+            !SameAgreementContext(source.context, AgreementContext(market))) {
+            EraseLocalAgreementPublication(id); // Copy only, never a journal record.
+            continue;
+        }
+        const auto message{flowmesh::DecodeAgreementMessage(source.payload)};
+        if (!message) { EraseLocalAgreementPublication(id); continue; }
+        current->second.waiting_chain_open = false;
+        CountObservation(m_local_agreement_publications_attempted);
+        // Same guards and relay budgets as ordinary publication. This does
+        // not invoke Sign, Pump, validate/execute a candidate, or Retry's
+        // history traversal. Exact old-view records of the same slot remain
+        // retryable. Relaying an old signature grants no new signing right.
+        PublishAgreement(market, *message, std::nullopt, /*local_signature=*/true);
+    }
+}
+
 bool FlowMeshRuntime::PublishAgreement(Market& market, const flowmesh::AgreementMessage& message,
-                                       const std::optional<flowmesh::WirePeerId> exclude)
+                                       const std::optional<flowmesh::WirePeerId> exclude,
+                                       const bool local_signature)
 {
     BenchSpan trace{market, "agreement_publication_completed", flowmesh::WireMessageKind::AGREEMENT,
                     message.candidate, message.context.sequence};
@@ -2964,8 +3068,13 @@ bool FlowMeshRuntime::PublishAgreement(Market& market, const flowmesh::Agreement
     if (!market.agreement || !market.agreement_context ||
         !SameAgreementContext(message.context, *market.agreement_context) ||
         !SameAgreementContext(message.context, AgreementContext(market))) return refuse("stale_agreement_context");
-    if (market.halt != FlowMeshRuntimeHalt::NONE || market.pending_handoff ||
-        !market.chain->Acceptable(market.chain->Current())) return refuse("market_unavailable_or_reconciling");
+    if (market.halt != FlowMeshRuntimeHalt::NONE || market.pending_handoff) {
+        return refuse("market_unavailable_or_reconciling");
+    }
+    if (!market.chain->Acceptable(market.chain->Current())) {
+        if (local_signature) RememberLocalAgreementPublication(market, message);
+        return refuse("market_unavailable_or_reconciling");
+    }
     const auto payload{flowmesh::EncodeAgreementMessage(message)};
     if (!payload) return refuse("agreement_encoding_limit");
     const size_t bytes{payload->size() + flowmesh::FLOWMESH_WIRE_HEADER_SIZE};
@@ -3002,6 +3111,9 @@ bool FlowMeshRuntime::PublishAgreement(Market& market, const flowmesh::Agreement
     }
     if (result.peers.empty()) return refuse(result.reason.empty()
         ? FlowMeshDeliveryAdmissionName(result.no_peer_reason) : result.reason);
+    if (admitted && market.agreement_resume_records != 0) {
+        EraseLocalAgreementPublication(Hash(*payload));
+    }
     // Admission is not peer receipt. The agreement journal still owns retries.
     return admitted;
 }
@@ -3209,6 +3321,9 @@ void FlowMeshRuntime::Stop()
         // The queue may still contain token copies. Tokens never reset, so
         // those copies cannot claim any source after a later Start.
         while (!m_local_action_sources.empty()) ReleaseLocalAction(m_local_action_sources.begin()->first);
+        while (!m_local_agreement_publications.empty()) {
+            EraseLocalAgreementPublication(m_local_agreement_publications.begin()->first);
+        }
         m_deferred_messages.clear();
         m_deferred_deadlines.clear();
         m_deferred_bytes = 0;
@@ -4962,6 +5077,10 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
     }
     RetryRetainedEvidence();
     RetryLocalActions();
+    // Normal marker/anchor refresh and ordinary journal retries run first.
+    // A successful ordinary send removes its disposable copy, avoiding an
+    // extra same-tick replay; newly observed permanent halts are respected.
+    { FlowMeshTimingSpan timing{"tick_retry_local_agreement_publications"}; RetryLocalAgreementPublications(); }
     ForwardPendingDuplicateActions();
     {
         FlowMeshTimingSpan timing{"tick_publish_health"};
