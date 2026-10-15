@@ -344,8 +344,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, artifact)
 
     def test_profile_is_versioned_and_excludes_prototype(self):
-        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v1")
-        self.assertEqual(len(RUNNER.SUITE_SOURCES), 25)
+        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v2")
+        self.assertEqual(len(RUNNER.SUITE_SOURCES), 26)
         self.assertTrue(set(RUNNER.REQUIRED_CASES).issubset(RUNNER.SUITE_SOURCES))
         self.assertFalse(any("v2_market" in source or "/v2/" in source for source in RUNNER.NATIVE_SOURCES))
         self.assertEqual(len(RUNNER.REQUIRED_CASES["validation_chainstatemanager_tests"]), 8)
@@ -365,6 +365,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("local_retention_token_is_private_queue_metadata_not_wire_or_admission",
                       RUNNER.REQUIRED_CASES["flowmesh_p2p_tests"])
         self.assertIn("src/flowmesh/p2p.cpp", RUNNER.NATIVE_SOURCES)
+
+    def test_each_ordinary_read_regression_is_mandatory(self):
+        suites = ("flowmesh_client_watch_lane_tests", "flowmesh_client_market_view_tests")
+        self.assertEqual(sum(len(RUNNER.REQUIRED_CASES[suite]) for suite in suites), 13)
+        self.assertIn("src/node/flowmesh_https.cpp", RUNNER.NATIVE_SOURCES)
+        for suite in suites:
+            for case in RUNNER.REQUIRED_CASES[suite]:
+                inventory = expected_inventory()
+                inventory[suite].remove(case)
+                with self.subTest(suite=suite, case=case), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "missing required regression"):
+                    RUNNER.parse_discovery(listing(inventory))
 
 
 if __name__ == "__main__":
