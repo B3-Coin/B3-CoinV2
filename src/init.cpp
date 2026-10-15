@@ -50,6 +50,7 @@
 #include <node/flowmesh_service.h>
 #include <node/flowmesh_action_wait.h>
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_timing.h>
 #include <node/asset_metadata.h>
 #include <node/finality_fresh_key_store.h>
 #include <node/finality_recovery_options.h>
@@ -1481,6 +1482,11 @@ static ChainstateLoadResult InitAndLoadChainstate(
         .signals = node.validation_signals.get(),
     };
     Assert(ApplyArgsManOptions(args, chainman_opts)); // no error can happen, already checked in AppInitParameterInteraction
+    // Diagnostic callbacks are absent on mainnet and in the standalone kernel.
+    // Even on regtest, clock reads/emission stay off until flowmeshtiming start.
+    if (chainparams.GetChainType() == ChainType::REGTEST) {
+        chainman_opts.lock_timing = node::FlowMeshChainLockTimingCallbacks();
+    }
 
     BlockManager::Options blockman_opts{
         .chainparams = chainman_opts.chainparams,

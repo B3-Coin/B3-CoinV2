@@ -26,8 +26,29 @@ uint64_t Now() noexcept
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+// The kernel calls this only after the real guard is gone. Construction,
+// formatting, bounded capture, and optional logging all happen here, not under
+// cs_main. Capture must stay active until the measured work has drained.
+void EmitChainLockTiming(const char* stage, const kernel::LockHoldTimes& times) noexcept
+{
+    if (!FlowMeshTimingRecording()) return;
+    try {
+        FlowMeshTimingSpan span{stage};
+        span.Field("lock_name", std::string{"cs_main"});
+        span.Field("started_us", times.requested_us);
+        span.Field("lock_requested_us", times.requested_us);
+        span.Field("lock_acquired_us", times.acquired_us);
+        span.Field("lock_releasing_us", times.releasing_us);
+    } catch (...) { errors.fetch_add(1, std::memory_order_relaxed); }
+}
 }
 bool FlowMeshTimingRecording() noexcept { return recording.load(std::memory_order_relaxed); }
+
+kernel::LockTimingCallbacks FlowMeshChainLockTimingCallbacks() noexcept
+{
+    return {FlowMeshTimingRecording, EmitChainLockTiming};
+}
 
 void FlowMeshTimingEmit(const char* stream, const UniValue& event) noexcept
 {
@@ -105,8 +126,20 @@ FlowMeshTimingSpan::~FlowMeshTimingSpan()
 {
     if (!m_enabled) return;
     current_span = m_parent;
+    // The caller's declaration order keeps this parent alive until after its
+    // real guard. The hold observer stores only raw scalars while locked.
+    if (m_lock_acquired) Field("lock_acquired_us", m_lock_acquired_us);
+    if (m_lock_releasing) Field("lock_releasing_us", m_lock_releasing_us);
     Mark("monotonic_us");
     FlowMeshTimingEmit("FlowMeshNativeSpan", m_row);
+}
+void FlowMeshTimingSpan::LockAcquired() noexcept
+{
+    if (m_enabled) { m_lock_acquired_us = Now(); m_lock_acquired = true; }
+}
+void FlowMeshTimingSpan::LockReleasing() noexcept
+{
+    if (m_enabled) { m_lock_releasing_us = Now(); m_lock_releasing = true; }
 }
 void FlowMeshTimingSpan::Mark(const char* field) noexcept { if (m_enabled) Field(field, Now()); }
 void FlowMeshTimingSpan::Field(const char* field, uint64_t value) noexcept

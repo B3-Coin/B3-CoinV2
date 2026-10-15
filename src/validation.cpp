@@ -27,6 +27,7 @@
 #include <kernel/chainparams.h>
 #include <kernel/coinstats.h>
 #include <kernel/disconnected_transactions.h>
+#include <kernel/lock_timing.h>
 #include <kernel/mempool_entry.h>
 #include <kernel/messagestartchars.h>
 #include <kernel/notifications_interface.h>
@@ -5800,8 +5801,12 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         // probably have a DEBUG_LOCKORDER test for this in the future.
         if (m_chainman.m_options.signals) LimitValidationInterfaceQueue(*m_chainman.m_options.signals);
 
+        // Default-off bounded diagnostics. The span outlives cs_main; only
+        // monotonic timestamp marks occur inside the activation critical section.
+        kernel::LockTimingSpan activation_lock{m_chainman.m_options.lock_timing, "b3_chain_activation_lock"};
         {
             LOCK(cs_main);
+            kernel::LockHoldObservation activation_hold{activation_lock};
             {
             // Lock transaction pool for at least as long as it takes for connectTrace to be consumed
             LOCK(MempoolMutex());
@@ -5894,8 +5899,10 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         // When we reach this point, we switched to a new tip (stored in pindexNewTip).
 
         bool reached_target;
+        kernel::LockTimingSpan flush_lock{m_chainman.m_options.lock_timing, "b3_chain_periodic_flush_lock"};
         {
             LOCK(m_chainman.GetMutex());
+            kernel::LockHoldObservation flush_hold{flush_lock};
             if (exited_ibd) {
                 // If a background chainstate is in use, we may need to rebalance our
                 // allocation of caches once a chainstate exits initial block download.

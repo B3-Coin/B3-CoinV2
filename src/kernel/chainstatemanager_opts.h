@@ -6,6 +6,7 @@
 #define BITCOIN_KERNEL_CHAINSTATEMANAGER_OPTS_H
 
 #include <kernel/notifications_interface.h>
+#include <kernel/lock_timing.h>
 
 #include <arith_uint256.h>
 #include <dbwrapper.h>
@@ -48,6 +49,8 @@ struct ChainstateManagerOpts {
     int worker_threads_num{0};
     size_t script_execution_cache_bytes{DEFAULT_SCRIPT_EXECUTION_CACHE_BYTES};
     size_t signature_cache_bytes{DEFAULT_SIGNATURE_CACHE_BYTES};
+    //! Optional diagnostics only; default-null preserves standalone kernel behavior.
+    LockTimingCallbacks lock_timing{};
 };
 
 } // namespace kernel
