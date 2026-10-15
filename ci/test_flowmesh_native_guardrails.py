@@ -344,8 +344,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, artifact)
 
     def test_profile_is_versioned_and_excludes_prototype(self):
-        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v2")
-        self.assertEqual(len(RUNNER.SUITE_SOURCES), 26)
+        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v3")
+        self.assertEqual(len(RUNNER.SUITE_SOURCES), 27)
         self.assertTrue(set(RUNNER.REQUIRED_CASES).issubset(RUNNER.SUITE_SOURCES))
         self.assertFalse(any("v2_market" in source or "/v2/" in source for source in RUNNER.NATIVE_SOURCES))
         self.assertEqual(len(RUNNER.REQUIRED_CASES["validation_chainstatemanager_tests"]), 8)
@@ -372,6 +372,29 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("src/node/flowmesh_https.cpp", RUNNER.NATIVE_SOURCES)
         for suite in suites:
             for case in RUNNER.REQUIRED_CASES[suite]:
+                inventory = expected_inventory()
+                inventory[suite].remove(case)
+                with self.subTest(suite=suite, case=case), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "missing required regression"):
+                    RUNNER.parse_discovery(listing(inventory))
+
+    def test_each_exact_publication_regression_is_mandatory(self):
+        runtime_cases = {
+            "preagreement_local_signed_publications_resume_exactly_without_clock_advance",
+            "local_agreement_publication_cache_bounds_and_peer_origin",
+            "local_agreement_publication_cache_accounts_large_encoded_copies",
+            "local_agreement_publication_retry_work_is_global_and_paced",
+            "local_agreement_publication_reclose_and_budget_do_not_reset_pacing",
+            "local_agreement_publication_normal_success_and_context_refusal_retire_copies",
+            "local_agreement_publication_restart_retains_exact_journal_fallback",
+        }
+        self.assertTrue(runtime_cases.issubset(RUNNER.REQUIRED_CASES["flowmesh_runtime_tests"]))
+        agreement_cases = RUNNER.REQUIRED_CASES["flowmesh_agreement_tests"]
+        self.assertEqual(len(agreement_cases), 2)
+        self.assertIn("src/node/flowmesh_agreement.cpp", RUNNER.NATIVE_SOURCES)
+        for suite, cases in (("flowmesh_runtime_tests", runtime_cases),
+                             ("flowmesh_agreement_tests", agreement_cases)):
+            for case in cases:
                 inventory = expected_inventory()
                 inventory[suite].remove(case)
                 with self.subTest(suite=suite, case=case), self.assertRaisesRegex(

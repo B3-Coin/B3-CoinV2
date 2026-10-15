@@ -1,6 +1,6 @@
 # FlowMesh Linux native CI guardrails
 
-Date: 2026-10-16. Profile: `native-guardrails-v2`.
+Date: 2026-10-16. Profile: `native-guardrails-v3`.
 
 This headless Linux profile checks selected native FlowMesh concurrency and
 recovery regressions. Its source and runner controls are prepared; Linux native
@@ -32,7 +32,7 @@ failure fails the job; it does not select an unsanitized fallback.
 
 ## Exact test selection and evidence
 
-The [strict runner](../../ci/check_flowmesh_native_guardrails.py) selects 26 exact
+The [strict runner](../../ci/check_flowmesh_native_guardrails.py) selects 27 exact
 compiled Boost suites. They cover P2P queues, runtime and production storage,
 service startup and policy, HTTPS and client wait/watch paths, request
 scheduling, outcomes and readiness, local admission, health, timing, checkpoint
@@ -44,7 +44,9 @@ checkpoint advisory bounds and corruption refusal, all eight native mutation
 fence cases, all eight accepted-original retention cases, the private P2P token
 case and synchronous seat-key observation. Version 2 adds the native market-view
 suite and thirteen named ordinary-read/freshness regressions: twelve watch-lane
-cases and the stale tick-advertisement case. Missing prerequisites fail discovery.
+cases and the stale tick-advertisement case. Version 3 additionally selects the
+native agreement suite and requires all seven exact-publication runtime cases
+plus both durable-local-callback cases. Missing prerequisites fail discovery.
 The workflow must contain their reviewed source revisions before qualification;
 it cannot substitute a prototype or silently omit a missing case. Do not publish
 this workflow ahead of its mutation-fence, retention and metadata prerequisite
@@ -76,7 +78,9 @@ qualifies as success.
 The initial runner candidate passed 30 lightweight rejection controls locally
 and in separate review. Its extended retention, metadata and P2P manifest passes
 31 controls locally. Version 2 passes 32 controls, including rejection when any
-one of its thirteen new required cases is missing. These exercise missing/disabled suites, missing regressions,
+one of its thirteen new required cases is missing. Version 3 passes 33 controls,
+including individual rejection of each of its nine added publication cases.
+These exercise missing/disabled suites, missing regressions,
 empty or inconsistent XML, selected skips, wrong build flags, timeout and
 sanitizer failure, process-group termination and bounded output. They do not
 execute native FlowMesh or a sanitizer.
@@ -164,3 +168,12 @@ earlier required cases. It is ordinary AppleClang 17 Release qualification,
 not Linux lock-order or sanitizer execution. The source, failing controls and
 remaining client boundaries are recorded in the
 [client stage report](b3-flowmesh-client-read-isolation-20261016.md).
+
+Version 3's complete local selection subsequently passed **460 exact cases
+across 27 suites**, all child exits 0, no selected skips, using ordinary macOS
+native executable `e1747eefa91f1836a38282218c68b1d146a8b393a974e5777c73003b34f5b4f6`.
+This includes all 138 runtime and 25 agreement cases. The prior 398- and 428-case
+campaigns remain separate historical results, not a combined population. Its
+nine added mandatory cases depend on the
+[exact-publication repair](b3-flowmesh-exact-publication-recovery-20261016.md);
+do not publish this manifest without that implementation and its tests.

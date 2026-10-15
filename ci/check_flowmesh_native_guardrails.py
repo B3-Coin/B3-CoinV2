@@ -4,7 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Strict, bounded Linux native-test guardrails; never a performance gate.
 
-Version native-guardrails-v2 selects exact compiled Boost suites, not CTest's
+Version native-guardrails-v3 selects exact compiled Boost suites, not CTest's
 skip-on-empty filters. Discovery and detailed XML must agree on every selected
 leaf case. TSan covers instrumented native code, not all system libraries; the
 existing repository suppression file includes a ConnectTip deadlock suppression.
@@ -32,7 +32,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-PROFILE_VERSION = "native-guardrails-v2"
+PROFILE_VERSION = "native-guardrails-v3"
 CONTROL_TIMEOUT = 30
 SUITE_TIMEOUT = 600
 TOTAL_TEST_TIMEOUT = 1800
@@ -42,6 +42,7 @@ MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 SUITE_SOURCES = {
     "flowmesh_p2p_tests": "src/test/flowmesh_p2p_tests.cpp",
     "flowmesh_runtime_tests": "src/test/flowmesh_runtime_tests.cpp",
+    "flowmesh_agreement_tests": "src/test/flowmesh_agreement_tests.cpp",
     "flowmesh_production_store_tests": "src/test/flowmesh_production_store_tests.cpp",
     "flowmesh_service_tests": "src/test/flowmesh_service_tests.cpp",
     "flowmesh_transport_policy_tests": "src/test/flowmesh_service_tests.cpp",
@@ -68,6 +69,10 @@ SUITE_SOURCES = {
     "validation_chainstatemanager_tests": "src/test/validation_chainstatemanager_tests.cpp",
 }
 REQUIRED_CASES = {
+    "flowmesh_agreement_tests": {
+        "local_signature_publication_callback_excludes_received_evidence",
+        "local_signature_callback_never_runs_before_signed_sync",
+    },
     "flowmesh_client_watch_lane_tests": {
         "ordinary_snapshot_and_updates_leave_work_free_while_https_is_held",
         "ordinary_read_busy_has_no_queue_and_reconnect_fences_the_held_reply",
@@ -103,6 +108,13 @@ REQUIRED_CASES = {
         "local_action_producer_reserves_before_acceptance_and_rejects_forgery_while_closed",
         "local_source_start_keeps_idempotent_fast_path_during_stop_join",
         "local_source_malformed_reward_credentials_do_not_shelter_behind_closed_authority",
+        "preagreement_local_signed_publications_resume_exactly_without_clock_advance",
+        "local_agreement_publication_cache_bounds_and_peer_origin",
+        "local_agreement_publication_cache_accounts_large_encoded_copies",
+        "local_agreement_publication_retry_work_is_global_and_paced",
+        "local_agreement_publication_reclose_and_budget_do_not_reset_pacing",
+        "local_agreement_publication_normal_success_and_context_refusal_retire_copies",
+        "local_agreement_publication_restart_retains_exact_journal_fallback",
     },
     "flowmesh_production_store_tests": {
         "checkpoint_advisory_resumes_bounded_suffix_and_retains_exact_candidate",
@@ -126,7 +138,7 @@ NATIVE_SOURCES = {
     "src/flowmesh/p2p.cpp",
     "src/node/flowmesh_runtime.cpp", "src/node/flowmesh_production_store.cpp",
     "src/node/flowmesh_service.cpp", "src/node/flowmesh_client.cpp", "src/node/flowmesh_https.cpp",
-    "src/node/flowmesh_timing.cpp", "src/validation.cpp", "src/test/main.cpp",
+    "src/node/flowmesh_timing.cpp", "src/node/flowmesh_agreement.cpp", "src/validation.cpp", "src/test/main.cpp",
 } | set(SUITE_SOURCES.values())
 
 
