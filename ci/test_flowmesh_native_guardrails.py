@@ -74,6 +74,30 @@ HEALTH_REQUIRED_CASES = {
 }
 
 
+# Independent names protect the new policy and its two adapted old controls.
+ADMISSION_REQUIRED_CASES = {
+    "flowmesh_https_tests": {
+        "client_read_admission_eight_waiters_are_fifo_without_idle_stealing",
+        "client_read_admission_absolute_deadline_survives_spurious_wakes_and_unlinks_expiry",
+        "client_read_admission_owner_exception_releases_exactly_one_reservation",
+    },
+    "flowmesh_client_watch_lane_tests": {
+        "prospective_foreground_signing_market_waits_outside_work_for_passive_other_account",
+        "prospective_foreground_explicit_data_waits_and_rechecks_reconnected_context",
+        "foreground_preflight_after_admission_joins_new_original_stamp_without_another_body",
+        "foreground_data_queue_time_remains_in_original_freshness_age",
+        "authenticated_watch_stays_immediate_and_failed_queued_read_releases_owner",
+    },
+}
+ADMISSION_PROTECTED_CASES = {
+    suite: cases | ({
+        "signing_preflight_can_join_only_the_original_stamp_during_passive_https",
+        "explicit_connect_and_reconnect_fence_an_original_preflight_join",
+    } if suite == "flowmesh_client_watch_lane_tests" else set())
+    for suite, cases in ADMISSION_REQUIRED_CASES.items()
+}
+
+
 class DiscoveryTests(unittest.TestCase):
     def test_exact_enabled_manifest(self):
         self.assertEqual(RUNNER.parse_discovery(listing()), expected_inventory())
@@ -233,6 +257,49 @@ class ReservedHealthRegressionTests(unittest.TestCase):
                     RUNNER.check_xml(ET.tostring(skipped, encoding="unicode"), suite, expected)
 
 
+class ForegroundAdmissionRegressionTests(unittest.TestCase):
+    def test_admission_positive_discovery_and_exact_execution(self):
+        self.assertEqual(sum(map(len, ADMISSION_REQUIRED_CASES.values())), 8)
+        self.assertEqual(sum(map(len, ADMISSION_PROTECTED_CASES.values())), 10)
+        discovered = RUNNER.parse_discovery(listing())
+        for suite, mandatory in ADMISSION_PROTECTED_CASES.items():
+            with self.subTest(suite=suite):
+                self.assertTrue(mandatory.issubset(RUNNER.REQUIRED_CASES[suite]))
+                self.assertTrue(mandatory.issubset(discovered[suite]))
+                self.assertEqual(RUNNER.check_xml(
+                    ET.tostring(xml_report(suite, discovered[suite]), encoding="unicode"),
+                    suite, discovered[suite]), len(discovered[suite]))
+
+    def test_each_admission_case_cannot_be_undiscovered_or_disabled(self):
+        for suite, mandatory in ADMISSION_PROTECTED_CASES.items():
+            for case in mandatory:
+                inventory = expected_inventory()
+                inventory[suite].remove(case)
+                with self.subTest(suite=suite, case=case, fault="undiscovered"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "missing required regression"):
+                    RUNNER.parse_discovery(listing(inventory))
+                disabled = listing().replace(f"    {case}*\n", f"    {case} \n", 1)
+                self.assertNotEqual(disabled, listing())
+                with self.subTest(suite=suite, case=case, fault="disabled"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "selected case"):
+                    RUNNER.parse_discovery(disabled)
+
+    def test_each_admission_case_cannot_be_unexecuted_or_skipped(self):
+        for suite, mandatory in ADMISSION_PROTECTED_CASES.items():
+            expected = expected_inventory()[suite]
+            for case in mandatory:
+                missing = xml_report(suite, expected - {case})
+                with self.subTest(suite=suite, case=case, fault="unexecuted"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "case mismatch"):
+                    RUNNER.check_xml(ET.tostring(missing, encoding="unicode"), suite, expected)
+                skipped = xml_report(suite, expected)
+                row = next(row for row in skipped.iter("TestCase") if row.get("name") == case)
+                row.set("result", "skipped")
+                with self.subTest(suite=suite, case=case, fault="skipped"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "Selected case/suite skipped or failed"):
+                    RUNNER.check_xml(ET.tostring(skipped, encoding="unicode"), suite, expected)
+
+
 class BuildFixture(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="flowmesh-ci-control-")
@@ -260,6 +327,18 @@ class BuildFixture(unittest.TestCase):
 
 
 class BuildTests(BuildFixture):
+    def test_profile_header_dependencies_are_hashed_and_missing_is_refused(self):
+        self.assertEqual(RUNNER.PROFILE_HEADER_DEPENDENCIES, {"src/node/flowmesh_client_read_admission.h"})
+        with self.assertRaisesRegex(RUNNER.GuardrailError, "Missing profile header dependency"):
+            RUNNER.profile_header_hashes(self.root)
+        header = self.root / "src/node/flowmesh_client_read_admission.h"
+        header.parent.mkdir(parents=True)
+        header.write_text("// Synthetic header for a source-hash control only.\n")
+        before = RUNNER.profile_header_hashes(self.root)
+        self.assertEqual(before, {"src/node/flowmesh_client_read_admission.h": RUNNER.file_hash(header)})
+        header.write_text("// Changed synthetic header; no native compilation.\n")
+        self.assertNotEqual(RUNNER.profile_header_hashes(self.root), before)
+
     def test_exact_debug_and_tsan_builds(self):
         for profile in ("lockorder", "tsan"):
             self.make_build(profile)
@@ -334,6 +413,10 @@ class ProcessTests(unittest.TestCase):
 class ProfileTests(BuildFixture):
     def prepare_profile(self):
         self.make_build()
+        for source in RUNNER.PROFILE_HEADER_DEPENDENCIES:
+            header = self.root / source
+            header.parent.mkdir(parents=True, exist_ok=True)
+            header.write_text("// Synthetic profile header; never compiled.\n")
         (self.build / "bin").mkdir()
         binary = self.build / "bin" / "test_bitcoin"
         binary.write_text("synthetic mock only; never executed")
@@ -361,6 +444,7 @@ class ProfileTests(BuildFixture):
             RUNNER.run_profile(self.root, self.build, self.output, "lockorder")
         report = json.loads((self.output / "summary.json").read_text())
         self.assertTrue(report["passed"])
+        self.assertEqual(report["profile_header_dependencies_sha256"], RUNNER.profile_header_hashes(self.root))
         self.assertEqual(len(report["suites"]), len(RUNNER.SUITE_SOURCES))
         for row in report["suites"]:
             self.assertEqual(row["executed_cases"], len(expected_inventory()[row["name"]]))
@@ -412,7 +496,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, artifact)
 
     def test_profile_is_versioned_and_excludes_prototype(self):
-        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v4")
+        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v5")
         self.assertEqual(len(RUNNER.SUITE_SOURCES), 27)
         self.assertTrue(set(RUNNER.REQUIRED_CASES).issubset(RUNNER.SUITE_SOURCES))
         self.assertFalse(any("v2_market" in source or "/v2/" in source for source in RUNNER.NATIVE_SOURCES))
@@ -436,7 +520,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_each_ordinary_read_regression_is_mandatory(self):
         suites = ("flowmesh_client_watch_lane_tests", "flowmesh_client_market_view_tests")
-        self.assertEqual(sum(len(RUNNER.REQUIRED_CASES[suite]) for suite in suites), 15) # Frozen13 ordinary +2 health.
+        self.assertEqual(sum(len(RUNNER.REQUIRED_CASES[suite] - ADMISSION_REQUIRED_CASES.get(suite, set()))
+                             for suite in suites), 15) # Preserve frozen13 ordinary +2 health independently.
         self.assertIn("src/node/flowmesh_https.cpp", RUNNER.NATIVE_SOURCES)
         for suite in suites:
             for case in RUNNER.REQUIRED_CASES[suite]:

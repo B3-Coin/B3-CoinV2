@@ -1,6 +1,6 @@
 # FlowMesh Linux native CI guardrails
 
-Date: 2026-10-16. Profile: `native-guardrails-v4`.
+Date: 2026-10-16. Profile: `native-guardrails-v5`.
 
 This headless Linux profile checks selected native FlowMesh concurrency and
 recovery regressions. Its source and runner controls are prepared; Linux native
@@ -49,6 +49,15 @@ native agreement suite and requires all seven exact-publication runtime cases
 plus both durable-local-callback cases. Version 4 additionally requires all
 thirteen restricted-health overflow cases: the two original chain-lock and
 saturation controls and eleven explicit reserve, budget and refusal controls.
+Version 5 additionally requires all eight foreground read-admission cases:
+three pure-gate cases for eight-waiter FIFO/capacity, the original absolute
+deadline under repeated wakes and exception-safe ownership; and five native
+watch-lane cases for queued signing/explicit reads, reconnect fencing, a new
+post-wake original-stamp join, queue time in the original freshness age and
+immediate Watch refusal plus failed-read recovery. The two earlier named
+original-stamp and explicit Connect/Reconnect tests remain mandatory. Their
+authorized foreground-wait scheduling adaptation does not replace the age,
+no-extra-body, reset-fencing or no-submit assertions.
 Missing prerequisites fail discovery.
 The workflow must contain their reviewed source revisions before qualification;
 it cannot substitute a prototype or silently omit a missing case. Do not publish
@@ -69,6 +78,15 @@ binaries came from the checkout. Qualification requires the workflow's fresh
 checkout and completed build, not a copied stale executable or a reused dirty
 build. No build cache is used by this profile.
 
+Version 5 separately requires and records the SHA-256 of
+`src/node/flowmesh_client_read_admission.h` in
+`profile_header_dependencies_sha256`. Headers do not have standalone compile
+commands, so this dependency does not replace or relax any translation-unit
+flag check. A missing declared header fails before native discovery. Its
+recorded hash is a source observation, not proof of compiler inclusion in an
+arbitrarily reused binary. Do not publish version 5 before its admission
+implementation, header and all eight test cases are committed together.
+
 Every fixture uses a new private temporary directory, never an owner datadir.
 Artifacts contain only the compact summary, discovery and XML results. Generated
 wallets, TLS keys, signing journals, databases and debug-log directories are not
@@ -87,6 +105,13 @@ Version 4 passes **36 controls**, including per-case positive checks and
 missing, disabled, unexecuted or skipped rejection for all thirteen health
 cases. Root ran the shared suite with exit 0 (0.174 seconds); a separate
 reviewer ran the private identical future files with exit 0 (0.176 seconds).
+Version 5 passes **40 controls**, actual local exit 0 (0.448 seconds). Its added
+controls require all eight admission cases and both adapted old cases, and
+reject each one if missing, disabled, unexecuted or marked skipped. A separate
+header control verifies exact hashing, changed-content attribution and refusal
+when the dependency is missing. The unchanged full-profile mock checks retain
+the header hash in the compact result. All version 4 health/runtime/source and
+build-flag requirements remain, as do the 27-suite selection and workflow.
 These exercise missing/disabled suites, missing regressions,
 empty or inconsistent XML, selected skips, wrong build flags, timeout and
 sanitizer failure, process-group termination and bounded output. They do not
@@ -195,3 +220,16 @@ it neither validates Linux build flags nor spoofs sanitizer execution. The
 workflow remains unchanged: no push, remote CI run, Linux/DEBUG_LOCKORDER or
 TSan success is claimed. Preserve the earlier 398/428/460-case campaigns as
 their own historical freezes, not one combined result.
+
+The [bounded client-admission candidate](b3-flowmesh-bounded-client-read-admission-20261016.md)
+passed 481 native cases in 27 suites locally, with all actual children exiting
+0 and no selected skips. That host runner imported v4 at startup and retains
+the label `host-local-macos-ci-selection-v4`; its complete discovery and XML
+were then rechecked with the frozen v5 mandatory rules (27 suites, 481 cases,
+exit 0). It is not relabelled as Linux/TSan CI.
+
+Separately, the author ran v5's 40 lightweight controls with exit 0 in 0.448
+seconds; the non-author reviewer ran them once with exit 0 in 0.186 seconds.
+These do not execute the C++ gate, TLS integration, Linux lock-order build or
+TSan instrumentation. No remote CI run, push or release qualification follows
+from this update; Linux, DEBUG_LOCKORDER and TSan remain unexecuted.

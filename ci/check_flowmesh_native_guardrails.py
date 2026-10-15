@@ -4,7 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Strict, bounded Linux native-test guardrails; never a performance gate.
 
-Version native-guardrails-v4 selects exact compiled Boost suites, not CTest's
+Version native-guardrails-v5 selects exact compiled Boost suites, not CTest's
 skip-on-empty filters. Discovery and detailed XML must agree on every selected
 leaf case. TSan covers instrumented native code, not all system libraries; the
 existing repository suppression file includes a ConnectTip deadlock suppression.
@@ -32,7 +32,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-PROFILE_VERSION = "native-guardrails-v4"
+PROFILE_VERSION = "native-guardrails-v5"
 CONTROL_TIMEOUT = 30
 SUITE_TIMEOUT = 600
 TOTAL_TEST_TIMEOUT = 1800
@@ -70,6 +70,9 @@ SUITE_SOURCES = {
 }
 REQUIRED_CASES = {
     "flowmesh_https_tests": {
+        "client_read_admission_eight_waiters_are_fifo_without_idle_stealing",
+        "client_read_admission_absolute_deadline_survives_spurious_wakes_and_unlinks_expiry",
+        "client_read_admission_owner_exception_releases_exactly_one_reservation",
         "https_generic_unconfigured_two_handler_saturation_explicitly_refuses_health_tls",
         "https_reserved_health_declares_slow_reserve_and_full_admission_refusal_limits",
         "https_reserved_health_has_separate_capacity_with_fourteen_sleepers_and_two_active",
@@ -89,6 +92,11 @@ REQUIRED_CASES = {
         "local_signature_callback_never_runs_before_signed_sync",
     },
     "flowmesh_client_watch_lane_tests": {
+        "prospective_foreground_signing_market_waits_outside_work_for_passive_other_account",
+        "prospective_foreground_explicit_data_waits_and_rechecks_reconnected_context",
+        "foreground_preflight_after_admission_joins_new_original_stamp_without_another_body",
+        "foreground_data_queue_time_remains_in_original_freshness_age",
+        "authenticated_watch_stays_immediate_and_failed_queued_read_releases_owner",
         "public_health_https_uses_leaf_observations_while_cs_main_is_held",
         "synthetic_cs_main_handler_saturation_must_not_starve_public_health_tls",
         "ordinary_snapshot_and_updates_leave_work_free_while_https_is_held",
@@ -157,6 +165,9 @@ NATIVE_SOURCES = {
     "src/node/flowmesh_service.cpp", "src/node/flowmesh_client.cpp", "src/node/flowmesh_https.cpp",
     "src/node/flowmesh_timing.cpp", "src/node/flowmesh_agreement.cpp", "src/validation.cpp", "src/test/main.cpp",
 } | set(SUITE_SOURCES.values())
+# Headers have no standalone compile-command row. Record this profile's new
+# header dependency separately, without weakening translation-unit checks.
+PROFILE_HEADER_DEPENDENCIES = {"src/node/flowmesh_client_read_admission.h"}
 
 
 class GuardrailError(Exception):
@@ -259,6 +270,16 @@ def file_hash(path):
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def profile_header_hashes(root):
+    hashes = {}
+    for source in sorted(PROFILE_HEADER_DEPENDENCIES):
+        path = root / source
+        if not path.is_file():
+            raise GuardrailError(f"Missing profile header dependency: {source}")
+        hashes[source] = file_hash(path)
+    return hashes
 
 
 def validate_build(root, build, profile):
@@ -405,6 +426,7 @@ def run_profile(root, build, output, profile):
     report = {"profile_version": PROFILE_VERSION, "profile": profile,
               "revision": revision.stdout.strip(), "compiler": version.stdout.splitlines()[0],
               "binary_sha256": file_hash(binary),
+              "profile_header_dependencies_sha256": profile_header_hashes(root),
               "limits": {"suite_timeout_seconds": SUITE_TIMEOUT, "total_test_timeout_seconds": TOTAL_TEST_TIMEOUT},
               "scope": "native code only; not Qt, WAN, power-loss, performance or release qualification",
               "system_libraries_instrumented": False,
