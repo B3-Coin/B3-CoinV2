@@ -2332,14 +2332,15 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                     }
                 }
                 if (auxiliary_error) {
-                    // A status read also carries operator checkpoint metadata.
-                    // Its failure cannot negate a later, independently verified
-                    // full account read, but that read cannot refresh metadata
-                    // which it does not carry. No omitted/unchanged account,
-                    // live-only job, other auxiliary error or stale response
-                    // receives this exception to conservative failure handling.
+                    // Operator status and connected-settlement discovery are
+                    // not the trading-account proof. Retain their exact error
+                    // and disable their tools, without discarding a later full
+                    // independently verified selected-account read. That read
+                    // cannot prove absent payouts or renew operator metadata.
+                    // No omitted/unchanged account, live-only job, other
+                    // auxiliary error or stale response gets this separation.
                     const auto* fresh{result->snapshot ? &*result->snapshot : nullptr};
-                    if (!result->passive || phase != RefreshPhase::Status || selected == result->markets.end() ||
+                    if (!result->passive || (phase != RefreshPhase::Status && phase != RefreshPhase::Effects) || selected == result->markets.end() ||
                         !fresh || fresh->unchanged || !fresh->remote || !fresh->certified ||
                         !fresh->certificate_verified || !fresh->account_state_verified ||
                         !selected->has_account || fresh->account.isEmpty() || fresh->account != selected->account ||
@@ -2535,7 +2536,9 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
     if (!result->action) {
         m_loading = false; m_read_failed = false; m_read_failures = 0; m_link_attempts = 0; m_read_error.clear();
         if (!result->auxiliary_error.isEmpty()) {
-            notice(tr("Operator status refresh failed: %1. A later certified account read succeeded; checkpoint and payout tools require fresh operator metadata.").arg(result->auxiliary_error));
+            notice((result->refresh_phase == RefreshPhase::Effects
+                ? tr("Operator settlement refresh failed: %1. A later certified account read succeeded; checkpoint and payout tools require fresh operator metadata. Pending payouts remain unknown.")
+                : tr("Operator status refresh failed: %1. A later certified account read succeeded; checkpoint and payout tools require fresh operator metadata.")).arg(result->auxiliary_error));
         }
         linkToast(true);
         if (!result->refresh_phase || *result->refresh_phase == RefreshPhase::Receipt) applyReceiptError(*result, result->receipt_error);

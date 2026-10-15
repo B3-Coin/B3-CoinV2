@@ -6622,19 +6622,110 @@ private Q_SLOTS:
         QCOMPARE(panel.m_snapshot->head, head); QCOMPARE(panel.m_response_age.msecsSinceReference(), observed);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
     }
+    void fullFreshTradingProofSurvivesFailedPassiveEffects_data()
+    {
+        QTest::addColumn<bool>("newer"); QTest::addColumn<bool>("uncertain"); QTest::addColumn<bool>("fallback");
+        for (const bool newer : {false, true}) for (const bool uncertain : {false, true}) for (const bool fallback : {false, true})
+            QTest::newRow(qPrintable(QStringLiteral("newer-%1-uncertain-%2-fallback-%3").arg(newer).arg(uncertain).arg(fallback)))
+                << newer << uncertain << fallback;
+    }
+    void fullFreshTradingProofSurvivesFailedPassiveEffects()
+    {
+        QFETCH(bool, newer); QFETCH(bool, uncertain); QFETCH(bool, fallback);
+        using Phase = B3FlowMeshTradingPanel::RefreshPhase;
+        FundingReadProbe probe; probe.data = newer ? NewerRemoteData() : RemoteData();
+        if (fallback) probe.effects_misc_error = true; else probe.failed_method = "listflowmeshvaultoperations";
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_refresh_phase = Phase::Effects;
+        panel.m_market_data.front().checkpoint_pending = true;
+        panel.m_market_data.front().checkpoint = QString::fromStdString(H(70).GetHex());
+        panel.m_effect_data.push_back(UniValue{UniValue::VOBJ}); panel.m_effect->addItem(QStringLiteral("Old payout"));
+        // A separate uncertain instruction must not be acknowledged or resent
+        // merely because this read obtains usable trading-account evidence.
+        if (uncertain) {
+            TrackUnknown(panel, 95);
+            panel.m_uncertain = true; panel.m_uncertain_wallet = panel.m_wallet;
+            panel.m_uncertain_action_id = panel.m_receipt->action_id;
+            panel.m_uncertain_market = panel.m_snapshot->market; panel.m_uncertain_account = panel.m_snapshot->account;
+        }
+        const auto prior_receipt{panel.m_receipt};
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QVERIFY2(!panel.m_read_failed, qPrintable(panel.m_read_error));
+        QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.writes.load(), 0); QCOMPARE(unlock.count(), 0);
+        QCOMPARE(panel.m_snapshot->head, Parse(probe.data).head);
+        QCOMPARE(panel.m_order_book->head(), panel.m_snapshot->head);
+        QVERIFY(panel.m_response_age.isValid()); QVERIFY(panel.m_response_age.elapsed() <= LINK_FRESH_MS);
+        QCOMPARE(panel.orderReady(), !uncertain); QCOMPARE(panel.m_uncertain, uncertain);
+        QVERIFY(!panel.market()->checkpoint_pending); QVERIFY(panel.market()->checkpoint.isEmpty());
+        QVERIFY(!panel.market()->publish_ready); QVERIFY(panel.m_effect_data.empty());
+        QVERIFY(!panel.m_checkpoint->isEnabled()); QVERIFY(!panel.m_publish->isEnabled());
+        const QString original{fallback ? QStringLiteral("Synthetic reconciliation race") : QStringLiteral("Synthetic auxiliary failed")};
+        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Operator settlement refresh failed: ") + original));
+        if (uncertain) {
+            QVERIFY(panel.m_receipt); QCOMPARE(panel.m_receipt->action_id, prior_receipt->action_id);
+            QCOMPARE(panel.m_receipt->market, prior_receipt->market); QCOMPARE(panel.m_receipt->account, prior_receipt->account);
+            QCOMPARE(panel.m_receipt->state, prior_receipt->state); QCOMPARE(panel.m_receipt->no_resubmit, prior_receipt->no_resubmit);
+            QCOMPARE(panel.m_uncertain_action_id, prior_receipt->action_id);
+        }
+        QCOMPARE(panel.m_refresh_phase, Phase::Receipt); QVERIFY(m_wallet->IsLocked());
+    }
+    void failedEffectsRequiresFullFreshVerifiedSelectedAccount_data()
+    {
+        QTest::addColumn<int>("condition");
+        QTest::newRow("selected read failed") << 0;
+        QTest::newRow("unchanged account omitted") << 1;
+        QTest::newRow("certificate not verified") << 2;
+        QTest::newRow("account proof not verified") << 3;
+        QTest::newRow("different account") << 4;
+        QTest::newRow("local engine not remote proof") << 5;
+        QTest::newRow("older selected head") << 6;
+        QTest::newRow("conflicting equal-height head") << 7;
+    }
+    void failedEffectsRequiresFullFreshVerifiedSelectedAccount()
+    {
+        QFETCH(int, condition);
+        FundingReadProbe probe; probe.failed_method = "listflowmeshvaultoperations"; probe.data = NewerRemoteData();
+        if (condition == 0) probe.fail = true;
+        if (condition == 1) probe.data.pushKV("unchanged", true);
+        if (condition == 2 || condition == 3) {
+            auto proof{probe.data["verification"]};
+            proof.pushKV(condition == 2 ? "certificate_verified" : "account_state_verified", false); probe.data.pushKV("verification", proof);
+        }
+        if (condition == 4) {
+            auto account{probe.data["account"]}; account.pushKV("account_id", H(99).GetHex());
+            account.pushKV("curves", UniValue{UniValue::VARR}); probe.data.pushKV("account", account);
+        }
+        if (condition == 5) probe.data = Data();
+        if (condition == 6 || condition == 7) {
+            auto snapshot{probe.data["snapshot"]}; snapshot.pushKV("next_microblock_sequence", condition == 6 ? 2 : 3); probe.data.pushKV("snapshot", snapshot);
+            auto history{probe.data["history"]}; history.pushKV("entries", UniValue{UniValue::VARR}); probe.data.pushKV("history", history);
+        }
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Effects;
+        const auto observed{panel.m_response_age.msecsSinceReference()}; const auto head{panel.m_snapshot->head};
+        panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QVERIFY(panel.m_read_failed); QVERIFY(!panel.orderReady());
+        QCOMPARE(panel.m_snapshot->head, head); QCOMPARE(panel.m_response_age.msecsSinceReference(), observed);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
     void passiveAuxiliaryFailureAdvancesWithoutRenewingFreshness()
     {
         using Phase = B3FlowMeshTradingPanel::RefreshPhase;
         for (const auto& [phase, method, next] : {std::tuple{Phase::Catalog, "listflowmeshmarkets", Phase::Status},
                  std::tuple{Phase::Effects, "listflowmeshvaultoperations", Phase::Receipt}}) {
             FundingReadProbe probe; probe.failed_method = method;
+            // This case has no independent full account evidence to separate
+            // from the effects error. A same-head UNCHANGED reply deliberately
+            // remains insufficient; the full-proof case is tested above.
+            if (phase == Phase::Effects) probe.data.pushKV("unchanged", true);
             B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
             panel.m_refresh_phase = phase;
             const auto observed{panel.m_response_age.msecsSinceReference()};
             panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
             QVERIFY(panel.m_read_failed); QCOMPARE(probe.snapshots.load(), 1);
             QCOMPARE(panel.m_response_age.msecsSinceReference(), observed); QCOMPARE(panel.m_refresh_phase, next);
-            probe.failed_method.clear(); panel.m_catalog_age.invalidate();
+            probe.failed_method.clear(); probe.data = RemoteData(); panel.m_catalog_age.invalidate();
             panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
             QVERIFY(!panel.m_read_failed); QCOMPARE(probe.snapshots.load(), 2);
             QVERIFY(panel.m_refresh_phase != Phase::Catalog); QCOMPARE(probe.writes.load(), 0);
@@ -6651,8 +6742,14 @@ private Q_SLOTS:
             panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Effects;
             panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
             QCOMPARE(probe.effects.load(), 1); QCOMPARE(probe.snapshots.load(), 1);
-            QCOMPARE(panel.m_read_failed, condition != 0); // A later healthy response never conceals the original effects error.
+            QCOMPARE(panel.m_read_failed, condition == 2);
             if (condition == 0) QVERIFY(panel.m_snapshot->chain_reconciling);
+            if (condition == 1) {
+                // The healthy full proof refreshes trading only; settlement
+                // unavailability remains explicit, never an empty payout fact.
+                QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Operator settlement refresh failed: Synthetic reconciliation race")));
+                QVERIFY(!panel.market()->publish_ready); QVERIFY(panel.m_effect_data.empty());
+            }
             QCOMPARE(probe.writes.load(), 0);
         }
     }

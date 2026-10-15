@@ -77,8 +77,9 @@ private:
         std::optional<UniValue> client_info;
         QString connect_url, client_error;
         QString wallet, error, receipt_error, read_market;
-        // An earlier passive operator-status failure superseded only by this
-        // job's later full, verified selected-account read. Never freshness.
+        // An earlier passive operator status/settlement failure, retained
+        // separately from this job's later full verified trading-account
+        // read. It never supplies freshness or proves absent payouts.
         QString auxiliary_error;
         QString receipt_market, receipt_account, receipt_action_id;
         bool broadcast{false}, write_attempted{false}, catalog{false}, exact_retry{false}, receipt_only{false};
