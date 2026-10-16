@@ -127,7 +127,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `ledger/` | R5 | `NonceWindow`, `LedgerState` (deposit, reserve, release, pay, credit, transfer, conservation), protocol accounts, `CommitV0`, `ProveAccountV0` | `RequestWithdrawal` (M2-LED-05), futures transfers (M2-LED-06), `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) | duplicate-fact rules (M2-LED-07), seat-pool account (M7-FEE-01) |
 | `engine/book`, `matcher`, `residual` | R6 | `OrderBook`, `BookSet`, `SweepA2` with pairing and fees | `ResolveResidualCross` (M3-ENG-02), `PriceBandCheck` (M3-ENG-03) | book (M3-ENG-01), pairing (M3-ENG-14), self-trade (M3-ENG-13) |
 | `engine/engine` | R7 | `ValidateSlotInputs`, `CanonicalOrder`, `Engine::ApplySlot` phases 1-6, 8, 9 | `CANCEL_ALL` (M3-ENG-09), `WITHDRAW` (M2-LED-05), phase 7 futures (M9-FUT-04); residual cross as certified refusal (M3-ENG-02) | order seed (M3-ENG-12), caps (M3-ENG-04), validity predicate (M4-AGR-11) |
-| `storage/` | R8 | record framing, `Journal`, `MemoryJournal`, `FileJournal::CreateNew`, `JournalCommit`, `JournalDirectoryCommit`, `Pending<T>` and `Durable*` tokens, `SignerLog`, `SeatSigner`, `CommitLog`; `agreement/outbound.h` | `OpenExisting`/`ReadAll` (M4-STO-01), `LogWriter` (M4-STO-02), `SnapshotStore` (M4-STO-03), folded signing (M4-STO-05), `Rollover` (M4-STO-06), view-state records (M4-STO-07) | — |
+| `storage/` | R8 | record framing, `Journal`, `MemoryJournal`, `FileJournal::CreateNew`, `JournalCommit`, `JournalDirectoryCommit`, `Pending<T>`, minting of the `Durable*` tokens (type landed in R2), `SignerLog`, `SeatSigner`, `CommitLog`; `agreement/outbound.h` | `OpenExisting`/`ReadAll` (M4-STO-01), `LogWriter` (M4-STO-02), `SnapshotStore` (M4-STO-03), folded signing (M4-STO-05), `Rollover` (M4-STO-06), view-state records (M4-STO-07) | — |
 | `state/` | R9 | `StateOwner::Preview`, `Reexecute`, `Apply`, `Head`; `ReplayDecisions`; `CoreState::Genesis` | `Restore` (M4-STO-03), pipelined `Preview` over an uncommitted parent (M4-AGR-10) | full-state copy (M2-LED-10) |
 | `chain/`, `agreement/`, `dev/` | R10 | `ChainAdapter` interface; capped message codecs; `Agreement` and `SafetyRules` interfaces; `DevSingleSeatCertifier` (k=1, REGTEST); `FakeChainAdapter` | `PbftSafetyRules` (M4-AGR-01), `PbftAgreement` (M4-AGR-02, also `DevSingleSeatCertifier::OnMessage`), `LeaderSchedule` (M4-AGR-03), `InclusionList` (M4-AGR-04), `RestartFence` (M4-AGR-06), `EvidenceStore` (M4-AGR-07), trusted-facts b3d adapter (MB1-ADP-06), finalized b3d adapter (M7-ADP-01) | — |
 | `read/`, `verify/` | R11 | `SlotView`, `CertifiedEnvelope`, `ReadService`; `VerifyCertificate`, `VerifyOutcome`, `VerifyAccountLeaf`, `VerifyFill`, `VerifyBalanceTransition`, `VerifyExpired` | `VerifyLiabilityPath` (M5-VFY-03), `VerifyCheckpoint` (M8-CKP-01), `VerifyAnchorProof` (M7-ADP-02) | archive (M5-RD-01), v0 tree levels (M2-LED-02) |
@@ -176,7 +176,8 @@ header marked *landed* is normative; the others are the target contract.
 | `core/action.h`, `body.h`, `outcome.h`, `facts.h`, `certificate.h`, `seat_set.h`, `account_leaf.h`, `nonce_rule.h`, `fee_math.h` | R4 | target | section 9; section 11 (fees) |
 | `ledger/nonce_window.h`, `ledger.h`, `state_commitment.h` | R5 | target | section 11; commitment v0 (O-9) |
 | `engine/book.h`, `matcher.h`, `residual.h`, `engine.h` | R6, R7 | target | section 11 |
-| `storage/*.h`, `agreement/outbound.h` | R8 | target | section 7 |
+| `storage/durable.h` | R2 | landed | `DurableKind`, move-only `Durable<K>` tokens with a private constructor whose only friend is `Journal` (R8 mints them); section 7.2 |
+| `storage/*.h` (others), `agreement/outbound.h` | R8 | target | section 7 |
 | `state/state_owner.h`, `candidate.h`, `replay.h` | R9 | target | sections 4, 7.4 |
 | `chain/*.h`, `agreement/*.h`, `dev/*.h` | R10 | target | sections 3, 8 |
 | `read/*.h`, `verify/b3verify.h` | R11 | target | section 10.2 |
@@ -340,11 +341,12 @@ As landed in R1 (`core/result.h`, `core/codes.h`):
   static storage (a literal or a `TaskId`).
 - `value()` on an error throws `util::BadExpectedAccess`; `error()` on a value
   fails an `Assert`. Callers test `has_value()` first.
-- Negative compile probes run by hand for R1 (the R2 CTest
-  `flowmesh2_negative_compile` makes them permanent): an ignored `Result<int>`,
+- Negative compile probes run by hand for R1: an ignored `Result<int>`,
   `Result<void>` or `Error`, `return {};` for `Result<int>` and `Result<void>`,
   `return 5;`, a runtime `const char*` task ID and a malformed task ID literal
-  each fail to compile with the fm2 flags; a positive control compiles.
+  each fail to compile with the fm2 flags; a positive control compiles. The R2
+  CTest `flowmesh2_negative_compile` (Clang) makes the missing-`LOCK`, ignored
+  `Result` and forged-token controls permanent (section 13.3).
 - Code integers. `OutcomeCode`: 1-63 executed (`DEPOSIT_CREDITED=1` ..
   `FEES_DISTRIBUTED=8`), 64-95 rule rejections (`REJ_INSUFFICIENT_AVAILABLE=64`
   .. `REJ_NO_RECIPIENT=76`), 96-127 certified typed refusals of features not
@@ -410,6 +412,16 @@ constructors and are bound to (instance, seq, slot, view, digest or header hash)
 | `DurableSignedVote` | build an `OutboundVote` (the only way to send a vote) |
 | `DurableDecision` | call `StateOwner::Apply` and `CommitLog::AppendApplied` |
 | `DurableApplied` | call `ReadService::Publish` |
+
+As landed in R2 (`storage/durable.h`, header-only): `DurableKind`
+(`INTENT=1`, `SIGNED_VOTE=2`, `DECISION=3`, `APPLIED=4`) and the class
+template `Durable<K>` with the four aliases above. No default constructor, no
+copy, no move assignment; the only constructor is private and `class Journal`
+is its only friend. A token carries the journal instance and the sequence
+number; R8 adds `Journal::Confirm` (the only minter), the slot/view/digest
+binding and the moved-from semantics. The compile-fail control
+`test/compile_fail/forge_token.cpp` proves that a construction outside
+`Journal` does not compile.
 
 Equivocation: `VoteKey{domain, epoch, slot, view, phase}` maps to exactly one
 digest forever. The same digest again is idempotent; another digest returns
@@ -706,9 +718,13 @@ Test temporary directories go under `build-rebirth/fm2-test-tmp/`.
   `fm2_verify`; no V1 symbols in `test_flowmesh2` or `fm2-sim`); link isolation;
   TODO consistency; the C1 freeze; signing confinement (`bls::SecretKey` and
   `.Sign(` only in `storage/seat_signer.cpp`, `dev/`, `test/`, `sim/`).
-- **Negative compile:** a missing `LOCK`, an ignored `Result` and a forged
-  `Durable*` token each fail to compile; a positive control with identical flags
-  compiles.
+- **Negative compile** (`check_negative_compile.py`, Clang only): a missing
+  `LOCK`, an ignored `Result` and a forged `Durable*` token each fail to compile
+  with the diagnostic named on the file's `FM2_EXPECT_ERROR` line; each file
+  built with `FM2_COMPILE_FAIL_FIXED` (the violation removed) compiles, so the
+  failure is exactly the violation; a positive control with identical flags
+  compiles. The controls are `EXCLUDE_FROM_ALL` object libraries `fm2_cf_*`
+  that only this CTest builds (`RUN_SERIAL`).
 - **Evidence:** `contrib/flowmesh2/evidence.py run` writes `run.json`, logs and
   `MANIFEST.sha256`; `verify` recomputes the manifest. Stdlib only, run with
   `python3 -I -B`.

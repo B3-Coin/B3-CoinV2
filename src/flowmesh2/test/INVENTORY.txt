@@ -10,6 +10,7 @@ codes_tests/admission_to_string_total
 codes_tests/duplicate_and_admitted_are_not_rejections
 codes_tests/outcome_codes_pinned
 codes_tests/outcome_to_string_total
+durable_tests/token_kinds_pinned
 result_tests/error_code_to_string_total
 result_tests/error_codes_pinned
 result_tests/error_round_trip

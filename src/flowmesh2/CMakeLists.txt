@@ -57,6 +57,7 @@ if(BUILD_FLOWMESH2)
   add_executable(test_flowmesh2
     test/main.cpp
     test/codes_tests.cpp
+    test/durable_tests.cpp
     test/result_tests.cpp
     test/stub_inventory_tests.cpp
   )
@@ -112,6 +113,43 @@ if(BUILD_FLOWMESH2)
       --cxx ${CMAKE_CXX_COMPILER} --ar ${CMAKE_AR} --nm-tool ${CMAKE_NM}
   )
   set_tests_properties(flowmesh2_guards_selftest PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint;guards")
+
+  # Compile-fail controls (slice R2), Clang only: the lock control needs
+  # Clang's thread-safety analysis. Each negative control is built twice, as
+  # is (must fail with the diagnostic named in the file) and with
+  # FM2_COMPILE_FAIL_FIXED (must compile), so the failure is exactly the
+  # planted violation. The positive control uses the same flags and must
+  # compile. All of them are EXCLUDE_FROM_ALL object libraries that only the
+  # CTest builds; contrib/flowmesh2/check_negative_compile.py drives it.
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(fm2_compile_fail_targets fm2_cf_positive_control)
+    add_library(fm2_cf_positive_control OBJECT EXCLUDE_FROM_ALL test/compile_fail/positive_control.cpp)
+    foreach(fm2_case IN ITEMS tsa_missing_lock ignored_result forge_token)
+      add_library(fm2_cf_${fm2_case} OBJECT EXCLUDE_FROM_ALL test/compile_fail/${fm2_case}.cpp)
+      add_library(fm2_cf_${fm2_case}_fixed OBJECT EXCLUDE_FROM_ALL test/compile_fail/${fm2_case}.cpp)
+      target_compile_definitions(fm2_cf_${fm2_case}_fixed PRIVATE FM2_COMPILE_FAIL_FIXED)
+      list(APPEND fm2_compile_fail_targets fm2_cf_${fm2_case} fm2_cf_${fm2_case}_fixed)
+    endforeach()
+    set(fm2_compile_fail_objects "")
+    foreach(fm2_target IN LISTS fm2_compile_fail_targets)
+      target_link_libraries(${fm2_target} PRIVATE core_interface fm2_warnings fm2_types)
+      list(APPEND fm2_compile_fail_objects --object "${fm2_target}=$<TARGET_OBJECTS:${fm2_target}>")
+    endforeach()
+
+    add_test(NAME flowmesh2_negative_compile
+      COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/check_negative_compile.py
+        --cmake ${CMAKE_COMMAND}
+        --build-dir ${CMAKE_BINARY_DIR}
+        --config $<CONFIG>
+        --cases-dir ${CMAKE_CURRENT_SOURCE_DIR}/test/compile_fail
+        --workdir ${FM2_TEST_TMP}/negative_compile
+        ${fm2_compile_fail_objects}
+    )
+    # RUN_SERIAL: the test drives the build system of this build directory.
+    set_tests_properties(flowmesh2_negative_compile PROPERTIES
+      TIMEOUT 900 RUN_SERIAL TRUE LABELS "flowmesh2;isolated;outline;negative_compile"
+    )
+  endif()
 
   # -------------------------------------------------------------------------
   # KEEP THIS SECTION LAST: it enumerates every target of this directory.
