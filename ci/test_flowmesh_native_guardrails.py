@@ -142,6 +142,22 @@ OUTCOME_FIFO_REQUIRED_CASES = {
 }
 
 
+# Independent literal frontier names, suite source and added header dependencies.
+FRONTIER_REQUIRED_CASES = {
+    "flowmesh_sync_tests": {
+        "chain_anchor_immutable_ancestry_is_exact_and_not_canonical_authority",
+    },
+    "flowmesh_runtime_tests": {
+        "committed_anchor_frontier_rechecks_only_proven_descendant_and_keeps_duplicate_semantics",
+        "committed_anchor_frontier_missing_or_throwing_proof_keeps_full_scan_for_lifecycle",
+        "committed_anchor_frontier_catchup_and_restart_preserve_full_startup_validation",
+        "committed_anchor_frontier_default_false_preserves_independent_older_anchor_check",
+    },
+}
+FRONTIER_SUITE_SOURCES = {"flowmesh_sync_tests": "src/test/flowmesh_sync_tests.cpp"}
+FRONTIER_HEADER_DEPENDENCIES = {"src/flowmesh/deposit.h", "src/node/flowmesh_anchor.h"}
+
+
 # Literal frozen v6 manifest, independent of RUNNER and the new suite count.
 FROZEN_V6_SUITE_SOURCES = {
     "flowmesh_p2p_tests": "src/test/flowmesh_p2p_tests.cpp",
@@ -614,6 +630,65 @@ class OutcomeFifoRegressionTests(unittest.TestCase):
                     RUNNER.check_xml(ET.tostring(skipped, encoding="unicode"), suite, expected)
 
 
+class AnchorFrontierRegressionTests(unittest.TestCase):
+    def test_frontier_positive_discovery_and_exact_execution(self):
+        self.assertEqual(sum(map(len, FRONTIER_REQUIRED_CASES.values())), 5)
+        self.assertEqual(set(FRONTIER_REQUIRED_CASES), {"flowmesh_sync_tests", "flowmesh_runtime_tests"})
+        self.assertEqual(len(FRONTIER_REQUIRED_CASES["flowmesh_sync_tests"]), 1)
+        self.assertEqual(len(FRONTIER_REQUIRED_CASES["flowmesh_runtime_tests"]), 4)
+        self.assertEqual(FRONTIER_SUITE_SOURCES, {"flowmesh_sync_tests": "src/test/flowmesh_sync_tests.cpp"})
+        discovered = RUNNER.parse_discovery(listing())
+        for suite, mandatory in FRONTIER_REQUIRED_CASES.items():
+            with self.subTest(suite=suite):
+                self.assertEqual(RUNNER.SUITE_SOURCES[suite], FRONTIER_SUITE_SOURCES.get(
+                    suite, "src/test/flowmesh_runtime_tests.cpp"))
+                self.assertTrue(mandatory.issubset(RUNNER.REQUIRED_CASES[suite]))
+                self.assertTrue(mandatory.issubset(discovered[suite]))
+                self.assertEqual(RUNNER.check_xml(
+                    ET.tostring(xml_report(suite, discovered[suite]), encoding="unicode"),
+                    suite, discovered[suite]), len(discovered[suite]))
+
+    def test_frontier_suite_and_each_case_cannot_be_missing_or_disabled(self):
+        for suite in FRONTIER_SUITE_SOURCES:
+            inventory = expected_inventory()
+            del inventory[suite]
+            with self.subTest(suite=suite, fault="missing suite"), self.assertRaisesRegex(
+                    RUNNER.GuardrailError, "Missing compiled suites"):
+                RUNNER.parse_discovery(listing(inventory))
+            disabled_suite = listing().replace(suite + "*\n", suite + " \n", 1)
+            self.assertNotEqual(disabled_suite, listing())
+            with self.subTest(suite=suite, fault="disabled suite"), self.assertRaisesRegex(
+                    RUNNER.GuardrailError, "Duplicate/disabled"):
+                RUNNER.parse_discovery(disabled_suite)
+        for suite, mandatory in FRONTIER_REQUIRED_CASES.items():
+            for case in mandatory:
+                inventory = expected_inventory()
+                inventory[suite].remove(case)
+                with self.subTest(suite=suite, case=case, fault="undiscovered"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "missing required regression"):
+                    RUNNER.parse_discovery(listing(inventory))
+                disabled = listing().replace(f"    {case}*\n", f"    {case} \n", 1)
+                self.assertNotEqual(disabled, listing())
+                with self.subTest(suite=suite, case=case, fault="disabled"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "selected case"):
+                    RUNNER.parse_discovery(disabled)
+
+    def test_each_frontier_case_cannot_be_unexecuted_or_skipped(self):
+        for suite, mandatory in FRONTIER_REQUIRED_CASES.items():
+            expected = expected_inventory()[suite]
+            for case in mandatory:
+                missing = xml_report(suite, expected - {case})
+                with self.subTest(suite=suite, case=case, fault="unexecuted"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "case mismatch"):
+                    RUNNER.check_xml(ET.tostring(missing, encoding="unicode"), suite, expected)
+                skipped = xml_report(suite, expected)
+                row = next(row for row in skipped.iter("TestCase") if row.get("name") == case)
+                row.set("result", "skipped")
+                with self.subTest(suite=suite, case=case, fault="skipped"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "Selected case/suite skipped or failed"):
+                    RUNNER.check_xml(ET.tostring(skipped, encoding="unicode"), suite, expected)
+
+
 class BuildFixture(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="flowmesh-ci-control-")
@@ -642,16 +717,64 @@ class BuildFixture(unittest.TestCase):
 
 class BuildTests(BuildFixture):
     def test_profile_header_dependencies_are_hashed_and_missing_is_refused(self):
-        self.assertEqual(RUNNER.PROFILE_HEADER_DEPENDENCIES, {"src/node/flowmesh_client_read_admission.h"})
+        self.assertEqual(RUNNER.PROFILE_HEADER_DEPENDENCIES,
+                         {"src/node/flowmesh_client_read_admission.h"} | FRONTIER_HEADER_DEPENDENCIES)
         with self.assertRaisesRegex(RUNNER.GuardrailError, "Missing profile header dependency"):
             RUNNER.profile_header_hashes(self.root)
+        for source in FRONTIER_HEADER_DEPENDENCIES:
+            extra_header = self.root / source
+            extra_header.parent.mkdir(parents=True, exist_ok=True)
+            extra_header.write_text("// Synthetic frontier header; never compiled.\n")
         header = self.root / "src/node/flowmesh_client_read_admission.h"
-        header.parent.mkdir(parents=True)
+        header.parent.mkdir(parents=True, exist_ok=True)
         header.write_text("// Synthetic header for a source-hash control only.\n")
         before = RUNNER.profile_header_hashes(self.root)
-        self.assertEqual(before, {"src/node/flowmesh_client_read_admission.h": RUNNER.file_hash(header)})
+        self.assertEqual(before, {"src/node/flowmesh_client_read_admission.h": RUNNER.file_hash(header)} |
+                         {source: RUNNER.file_hash(self.root / source) for source in FRONTIER_HEADER_DEPENDENCIES})
         header.write_text("// Changed synthetic header; no native compilation.\n")
         self.assertNotEqual(RUNNER.profile_header_hashes(self.root), before)
+
+    def test_each_frontier_header_is_hashed_and_missing_is_refused(self):
+        self.assertEqual(FRONTIER_HEADER_DEPENDENCIES,
+                         {"src/flowmesh/deposit.h", "src/node/flowmesh_anchor.h"})
+        expected_sources = {"src/node/flowmesh_client_read_admission.h"} | FRONTIER_HEADER_DEPENDENCIES
+        for source in expected_sources:
+            header = self.root / source
+            header.parent.mkdir(parents=True, exist_ok=True)
+            header.write_text("// Synthetic source-hash dependency; never compiled.\n")
+        before = RUNNER.profile_header_hashes(self.root)
+        self.assertEqual(before, {source: RUNNER.file_hash(self.root / source) for source in expected_sources})
+        for source in FRONTIER_HEADER_DEPENDENCIES:
+            header = self.root / source
+            original = header.read_text()
+            header.unlink() # Exact file in this control's fresh disposable directory.
+            with self.subTest(source=source, fault="missing"), self.assertRaisesRegex(
+                    RUNNER.GuardrailError, "Missing profile header dependency"):
+                RUNNER.profile_header_hashes(self.root)
+            header.write_text(original + "// Changed exact dependency.\n")
+            changed = RUNNER.profile_header_hashes(self.root)
+            self.assertEqual(set(changed), expected_sources)
+            self.assertNotEqual(changed[source], before[source])
+            for other in expected_sources - {source}:
+                self.assertEqual(changed[other], before[other])
+            header.write_text(original)
+
+    def test_production_ancestry_translation_unit_requires_native_flags_and_command(self):
+        source = "src/node/flowmesh_anchor.cpp"
+        self.assertIn(source, RUNNER.NATIVE_SOURCES)
+        for profile, flag in (("lockorder", "-std=c++20"), ("lockorder", "-Wthread-safety"),
+                              ("lockorder", "-DDEBUG_LOCKORDER"), ("tsan", "-fsanitize=thread")):
+            self.make_build(profile)
+            row = next(row for row in self.commands if Path(row["file"]) == self.root / source)
+            row["arguments"].remove(flag)
+            self.save_build()
+            with self.subTest(profile=profile, flag=flag), self.assertRaises(RUNNER.GuardrailError):
+                RUNNER.validate_build(self.root, self.build, profile)
+        self.make_build()
+        self.commands = [row for row in self.commands if Path(row["file"]) != self.root / source]
+        self.save_build()
+        with self.assertRaisesRegex(RUNNER.GuardrailError, "Missing native compile commands"):
+            RUNNER.validate_build(self.root, self.build, "lockorder")
 
     def test_exact_debug_and_tsan_builds(self):
         for profile in ("lockorder", "tsan"):
@@ -797,7 +920,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(FROZEN_V6_SUITE_SOURCES), 27)
         self.assertTrue(set(FROZEN_V6_SUITE_SOURCES).issubset(RUNNER.SUITE_SOURCES))
         self.assertEqual(set(RUNNER.SUITE_SOURCES) - set(FROZEN_V6_SUITE_SOURCES),
-                         {"flowmesh_client_outcome_evidence_tests"})
+                         {"flowmesh_client_outcome_evidence_tests"} | set(FRONTIER_SUITE_SOURCES))
         for suite, source in FROZEN_V6_SUITE_SOURCES.items():
             with self.subTest(suite=suite):
                 self.assertEqual(RUNNER.SUITE_SOURCES[suite], source)
@@ -819,8 +942,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, artifact)
 
     def test_profile_is_versioned_and_excludes_prototype(self):
-        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v10")
-        self.assertEqual(len(RUNNER.SUITE_SOURCES), 28)
+        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v11")
+        self.assertEqual(len(RUNNER.SUITE_SOURCES), 29)
         self.assertTrue(set(RUNNER.REQUIRED_CASES).issubset(RUNNER.SUITE_SOURCES))
         self.assertFalse(any("v2_market" in source or "/v2/" in source for source in RUNNER.NATIVE_SOURCES))
         self.assertEqual(len(RUNNER.REQUIRED_CASES["validation_chainstatemanager_tests"]), 8)

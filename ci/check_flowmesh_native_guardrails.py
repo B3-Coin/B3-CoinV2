@@ -4,7 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Strict, bounded Linux native-test guardrails; never a performance gate.
 
-Version native-guardrails-v10 selects exact compiled Boost suites, not CTest's
+Version native-guardrails-v11 selects exact compiled Boost suites, not CTest's
 skip-on-empty filters. Discovery and detailed XML must agree on every selected
 leaf case. TSan covers instrumented native code, not all system libraries; the
 existing repository suppression file includes a ConnectTip deadlock suppression.
@@ -32,7 +32,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-PROFILE_VERSION = "native-guardrails-v10"
+PROFILE_VERSION = "native-guardrails-v11"
 CONTROL_TIMEOUT = 30
 SUITE_TIMEOUT = 600
 TOTAL_TEST_TIMEOUT = 1800
@@ -68,6 +68,7 @@ SUITE_SOURCES = {
     "flowmesh_timing_tests": "src/test/flowmesh_timing_tests.cpp",
     "flowmesh_checkpoint_index_tests": "src/test/flowmesh_checkpoint_index_tests.cpp",
     "validation_chainstatemanager_tests": "src/test/validation_chainstatemanager_tests.cpp",
+    "flowmesh_sync_tests": "src/test/flowmesh_sync_tests.cpp",
 }
 REQUIRED_CASES = {
     "flowmesh_https_tests": {
@@ -130,6 +131,10 @@ REQUIRED_CASES = {
         "local_retention_token_is_private_queue_metadata_not_wire_or_admission",
     },
     "flowmesh_runtime_tests": {
+        "committed_anchor_frontier_rechecks_only_proven_descendant_and_keeps_duplicate_semantics",
+        "committed_anchor_frontier_missing_or_throwing_proof_keeps_full_scan_for_lifecycle",
+        "committed_anchor_frontier_catchup_and_restart_preserve_full_startup_validation",
+        "committed_anchor_frontier_default_false_preserves_independent_older_anchor_check",
         "certified_reads_do_not_wait_for_a_blocked_market_worker",
         "certified_read_versions_are_immutable_and_survive_rejected_certificate_and_restart",
         "certified_read_public_history_refusal_preserves_exact_durable_entry",
@@ -182,16 +187,23 @@ REQUIRED_CASES = {
     "flowmesh_client_poll_tests": {
         "mixed_status_and_outcome_demand_keeps_fifo_bounds_and_nonrefunding_removal",
     },
+    "flowmesh_sync_tests": {
+        "chain_anchor_immutable_ancestry_is_exact_and_not_canonical_authority",
+    },
 }
 NATIVE_SOURCES = {
     "src/flowmesh/p2p.cpp",
     "src/node/flowmesh_runtime.cpp", "src/node/flowmesh_production_store.cpp",
     "src/node/flowmesh_service.cpp", "src/node/flowmesh_client.cpp", "src/node/flowmesh_https.cpp",
+    "src/node/flowmesh_anchor.cpp",
     "src/node/flowmesh_timing.cpp", "src/node/flowmesh_agreement.cpp", "src/validation.cpp", "src/test/main.cpp",
 } | set(SUITE_SOURCES.values())
 # Headers have no standalone compile-command row. Record this profile's new
 # header dependency separately, without weakening translation-unit checks.
-PROFILE_HEADER_DEPENDENCIES = {"src/node/flowmesh_client_read_admission.h"}
+PROFILE_HEADER_DEPENDENCIES = {
+    "src/node/flowmesh_client_read_admission.h",
+    "src/flowmesh/deposit.h", "src/node/flowmesh_anchor.h",
+}
 
 
 class GuardrailError(Exception):
