@@ -42,20 +42,24 @@ if(BUILD_FLOWMESH2)
 
   # core/: deterministic value types, codecs, tagged hashes, the provisional
   # profile, the error model and code registries, signed actions, slot
-  # bodies, outcomes, facts, certificates and seat sets. bitcoin_consensus provides hash.cpp, uint256.cpp and pubkey.cpp
+  # bodies, outcomes, facts, certificates, seat sets, the account leaf and
+  # the shared nonce and fee spec functions. bitcoin_consensus provides hash.cpp, uint256.cpp and pubkey.cpp
   # (XOnlyPubKey::VerifySchnorr); bitcoin_crypto provides SHA-256 and BLS;
   # secp256k1 is the BIP340 verifier behind pubkey.cpp.
   add_library(fm2_types STATIC
+    core/account_leaf.cpp
     core/action.cpp
     core/amount.cpp
     core/body.cpp
     core/certificate.cpp
     core/codes.cpp
     core/facts.cpp
+    core/fee_math.cpp
     core/hashes.cpp
     core/ids.cpp
     core/market.cpp
     core/merkle.cpp
+    core/nonce_rule.cpp
     core/outcome.cpp
     core/params.cpp
     core/result.cpp
@@ -76,6 +80,7 @@ if(BUILD_FLOWMESH2)
   # Boost.Test suite of the outline. Every case is listed in test/INVENTORY.txt.
   add_executable(test_flowmesh2
     test/main.cpp
+    test/account_leaf_tests.cpp
     test/action_tests.cpp
     test/amount_tests.cpp
     test/authority_tests.cpp
@@ -85,10 +90,12 @@ if(BUILD_FLOWMESH2)
     test/codes_tests.cpp
     test/durable_tests.cpp
     test/facts_tests.cpp
+    test/fee_math_tests.cpp
     test/hashes_tests.cpp
     test/ids_tests.cpp
     test/market_tests.cpp
     test/merkle_tests.cpp
+    test/nonce_rule_tests.cpp
     test/outcome_tests.cpp
     test/params_tests.cpp
     test/result_tests.cpp

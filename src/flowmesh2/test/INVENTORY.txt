@@ -5,6 +5,11 @@
 # CTest flowmesh2_inventory (contrib/flowmesh2/check_inventory.py) fails if a
 # listed case is not in the binary, if the binary has an unlisted case, if a
 # case is disabled, or if a listed case did not execute in the full run.
+account_leaf_tests/canonical_form_enforced
+account_leaf_tests/caps_nonces_and_assets
+account_leaf_tests/every_field_changes_the_leaf_value
+account_leaf_tests/golden_bytes_and_leaf_value
+account_leaf_tests/round_trip_and_accessors
 action_tests/bip340_sign_verify_round_trip
 action_tests/every_field_changes_id_and_id_excludes_signature
 action_tests/flipped_signature_bit_fails
@@ -57,6 +62,10 @@ facts_tests/deposit_round_trip_and_refusals
 facts_tests/fact_id_binds_the_outpoint_and_every_field
 facts_tests/kind_registry_pinned
 facts_tests/stub_facts_never_encode
+fee_math_tests/edges_and_refusals
+fee_math_tests/increments_sum_to_the_fee_of_the_total
+fee_math_tests/split_exhaustive_0_to_10000
+fee_math_tests/walking_skeleton_values
 hashes_tests/no_collision_with_repository_tags
 hashes_tests/registry_pinned
 hashes_tests/tagged_matches_the_bip340_definition
@@ -81,6 +90,12 @@ merkle_tests/prove_refuses_an_index_outside_the_tree
 merkle_tests/roots_golden
 merkle_tests/roots_match_reference_sizes_0_to_17
 merkle_tests/tampered_proofs_fail
+nonce_rule_tests/exhaustive_w3_nonces_0_to_9_against_naive_model
+nonce_rule_tests/expiry_window_exhaustive_and_overflow_safe
+nonce_rule_tests/malformed_windows_refused
+nonce_rule_tests/reachable_windows_match_the_history_model
+nonce_rule_tests/verdict_registry_pinned
+nonce_rule_tests/window_100_boundaries
 outcome_tests/decode_refusals
 outcome_tests/every_field_changes_the_leaf
 outcome_tests/fill_and_delta_caps
