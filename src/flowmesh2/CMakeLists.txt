@@ -100,6 +100,7 @@ if(BUILD_FLOWMESH2)
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
     state/candidate.cpp
+    state/state_owner.cpp
     storage/commit_log.cpp
     storage/file_journal.cpp
     storage/journal.cpp
@@ -161,6 +162,7 @@ if(BUILD_FLOWMESH2)
     test/seat_signer_tests.cpp
     test/signer_log_tests.cpp
     test/slot_tests.cpp
+    test/state_owner_tests.cpp
     test/state_root_tests.cpp
     test/stub_inventory_tests.cpp
     test/validate_slot_tests.cpp

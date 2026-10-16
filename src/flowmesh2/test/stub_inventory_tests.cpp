@@ -42,7 +42,9 @@
  * (M4-STO-06; the probe also appends past the end of a one-page segment),
  * the group-commit writer (M4-STO-02), snapshots (M4-STO-03) and the view
  * state records (M4-STO-07), and extends M4-STO-05 to probe the signer
- * log's folded signing as well.
+ * log's folded signing as well. Slice R9 adds the state owner's pipelined
+ * Preview over an uncommitted candidate (M4-AGR-10) and extends M4-STO-03
+ * to probe StateOwner::Restore as well.
  */
 
 #include <boost/test/unit_test.hpp>
@@ -58,6 +60,8 @@
 #include <flowmesh2/engine/residual.h>
 #include <flowmesh2/ledger/ledger.h>
 #include <flowmesh2/ledger/state_commitment.h>
+#include <flowmesh2/state/candidate.h>
+#include <flowmesh2/state/state_owner.h>
 #include <flowmesh2/storage/commit_log.h>
 #include <flowmesh2/storage/file_journal.h>
 #include <flowmesh2/storage/log_writer.h>
@@ -228,6 +232,27 @@ ActionV2 ActionOfKind(ActionKind kind)
     ActionV2 action;
     action.kind = kind;
     return action;
+}
+
+//! A state owner on a genesis without markets, and heartbeat inputs that follow its head.
+struct HeartbeatOwner {
+    std::unique_ptr<state::StateOwner> owner;
+    state::SlotInputs inputs;
+};
+
+HeartbeatOwner MakeHeartbeatOwner()
+{
+    const ProfileParams profile{RegtestProfile()};
+    const AuthorityVersion authority{0, LabelHash("fm2/test/stub/seats"), ProfileHash(profile)};
+    const state::HeadView genesis{state::GenesisHead(profile, {}, LabelHash("fm2/test/stub/domain"), authority,
+                                                     Anchor{1, LabelHash("fm2/test/stub/anchor")}, FactCursor{2, 0})
+                                      .value()};
+    HeartbeatOwner heartbeat{state::StateOwner::Create(profile, genesis, 1).value(), {}};
+    heartbeat.inputs.authority = authority;
+    heartbeat.inputs.anchor = genesis.Header().anchor;
+    heartbeat.inputs.facts_from = genesis.Header().facts_to;
+    heartbeat.inputs.facts_to = genesis.Header().facts_to;
+    return heartbeat;
 }
 
 //! EncodeFact, FactId and DecodeFact (of the kind byte) of a stub fact kind.
@@ -440,10 +465,13 @@ FM2_STUB_CASE(M4_STO_02, "M4-STO-02")
 
 FM2_STUB_CASE(M4_STO_03, "M4-STO-03")
 {
-    // Write and Load; the store touches no file in the outline.
+    // Write and Load; the store touches no file in the outline. StateOwner::Restore (R9).
     storage::SnapshotStore store{fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("stub_m4_sto_03_never_created")};
     const storage::SnapshotMark mark{1, uint256::ONE, uint256::ONE};
-    return FirstDeviation("M4-STO-03", {Observe(store.Write(mark, Bytes("state"))), Observe(store.Load(mark))});
+    HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
+    const std::shared_ptr<const state::HeadView> head{heartbeat.owner->Head()};
+    return FirstDeviation("M4-STO-03", {Observe(store.Write(mark, Bytes("state"))), Observe(store.Load(mark)),
+                                        Observe(heartbeat.owner->Restore(*head, {}))});
 }
 
 FM2_STUB_CASE(M4_STO_07, "M4-STO-07")
@@ -456,6 +484,17 @@ FM2_STUB_CASE(M4_STO_07, "M4-STO-07")
     return FirstDeviation("M4-STO-07", {Observe(signer.AppendViewState(storage::ViewStateRecord{0, 1})),
                                         Observe(signer.AppendNewViewAccepted(storage::NewViewAcceptedRecord{0, 1, Bytes("nv")})),
                                         Observe(commit.AppendPreparedQc(storage::PreparedQcRecord{0, 1, 1, uint256::ONE, Bytes("qc")}))});
+}
+
+// ---- Slice R9: the state owner ----
+
+FM2_STUB_CASE(M4_AGR_10, "M4-AGR-10")
+{
+    // Preview over an uncommitted candidate (pipelining).
+    HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
+    const state::Candidate candidate{
+        heartbeat.owner->Preview(state::ParentRef::Committed(*heartbeat.owner->Head()), heartbeat.inputs).value()};
+    return Observe(heartbeat.owner->Preview(state::ParentRef::Uncommitted(candidate), heartbeat.inputs));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
