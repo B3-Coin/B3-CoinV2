@@ -1,6 +1,6 @@
 # FlowMesh Linux native CI guardrails
 
-Date: 2026-10-16. Profile: `native-guardrails-v5`.
+Date: 2026-10-16. Profile: `native-guardrails-v6`.
 
 This headless Linux profile checks selected native FlowMesh concurrency and
 recovery regressions. Its source and runner controls are prepared; Linux native
@@ -58,6 +58,15 @@ immediate Watch refusal plus failed-read recovery. The two earlier named
 original-stamp and explicit Connect/Reconnect tests remain mandatory. Their
 authorized foreground-wait scheduling adaptation does not replace the age,
 no-extra-body, reset-fencing or no-submit assertions.
+Version 6 additionally requires two diagnostic admission-trace cases in the
+watch-lane suite: a genuinely held foreground read plus an admitted failure,
+and explicit default-off and BENCH-entry guards. The positive capture keeps
+BENCH disabled through caller, client and service drainage; the separate
+BENCH-enabled refusal control keeps that setting unchanged through its drain
+and requires no new admission span. Tracing stays opt-in and off by default.
+These cases check capture boundaries and attribution, not production timing
+or trading latency. All version 5 admission, header, suite and bound requirements
+remain unchanged.
 Missing prerequisites fail discovery.
 The workflow must contain their reviewed source revisions before qualification;
 it cannot substitute a prototype or silently omit a missing case. Do not publish
@@ -116,6 +125,16 @@ These exercise missing/disabled suites, missing regressions,
 empty or inconsistent XML, selected skips, wrong build flags, timeout and
 sanitizer failure, process-group termination and bounded output. They do not
 execute native FlowMesh or a sanitizer.
+
+Version 6 passes **43 lightweight controls**, actual private local exit 0 in
+0.317 seconds. Independent exact names protect both trace cases with per-case
+positive, missing, disabled, unexecuted and skipped rejection controls. The
+private runner was imported from its disposable directory; only the workflow
+contract and child-process working directory used the unchanged repository.
+This does not execute native C++ or qualify production timing. The version 5
+native campaign below remains a separate historical result, not qualification
+of the new tracing source. Native version 6, Linux, DEBUG_LOCKORDER, TSan and
+remote CI execution remain pending.
 
 A separate positive format control used a preserved ordinary macOS native
 binary: real Boost discovery and the XML results for eleven timing cases passed
