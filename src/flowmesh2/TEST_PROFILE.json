@@ -1,0 +1,27 @@
+{
+  "profile_id": "flowmesh2-clean-core-foundations-test/1",
+  "test_only": true,
+  "production_integration": false,
+  "build_option": "BUILD_FLOWMESH2_FOUNDATION_TESTS",
+  "build_option_default": false,
+  "test_binary": "test_flowmesh2_foundations",
+  "expected_mailbox_cases": 12,
+  "expected_read_slot_cases": 7,
+  "expected_total_cases": 19,
+  "ctest_deadline_seconds": 60,
+  "identities": "synthetic uint256 values, no keys or signatures",
+  "byte_accounting": "payload.size(), not total heap, spare capacity, wire or serialization overhead",
+  "read_scope": "claimed in-memory context only; no selected V2 signing or wire codec",
+  "publication": "memory visibility only, no durability, proof, freshness, readiness or spending authority",
+  "retention": "move-only reader leases bound old view owners; publisher inputs/concurrency need caller bounds",
+  "performance_qualification": false,
+  "network_or_wallet_access": false,
+  "economic_defaults": [],
+  "limitations": [
+    "Mutex and atomic shared-pointer implementation can contend",
+    "No hard real-time or arbitrary-load availability guarantee",
+    "No authenticated action, accounting, matching, BFT, PoS, custody, bridge or futures",
+    "No physical storage, fsync or crash recovery qualification",
+    "No 200 ms or regtest qualification"
+  ]
+}

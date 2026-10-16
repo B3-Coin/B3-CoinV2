@@ -606,6 +606,10 @@ if(BUILD_TESTS)
   add_subdirectory(test)
 endif()
 
+if(BUILD_FLOWMESH2_FOUNDATION_TESTS)
+  add_subdirectory(flowmesh2)
+endif()
+
 if(BUILD_FUZZ_BINARY)
   add_subdirectory(test/fuzz)
 endif()

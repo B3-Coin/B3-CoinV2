@@ -118,6 +118,10 @@ option(BUILD_FLOWMESH_REGTEST_POLICY_TESTS "Build only the guarded FlowMesh laun
 option(BUILD_CLI "Build b3coin-cli executable." ON)
 
 option(BUILD_TESTS "Build test_bitcoin and other unit test executables." ON)
+option(BUILD_FLOWMESH2_FOUNDATION_TESTS "Build isolated clean-core FlowMesh foundation tests, never node integration." OFF)
+if(BUILD_FLOWMESH2_FOUNDATION_TESTS AND NOT BUILD_TESTS)
+  message(FATAL_ERROR "BUILD_FLOWMESH2_FOUNDATION_TESTS requires BUILD_TESTS=ON")
+endif()
 option(BUILD_TX "Build b3coin-tx executable." ${BUILD_TESTS})
 option(BUILD_UTIL "Build b3coin-util executable." ${BUILD_TESTS})
 
