@@ -6,7 +6,9 @@
 #define B3_FLOWMESH2_STORAGE_JOURNAL_H
 
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/storage/durable.h>
 #include <flowmesh2/storage/record.h>
+#include <flowmesh2/storage/tokens.h>
 #include <sync.h>
 #include <uint256.h>
 
@@ -42,10 +44,17 @@
  * - Status() reads {appended_seq, durable_seq, fatal} atomically;
  *   DurableSeq() and IsFatal() read one field each.
  * - ReadAll() returns the durable records of the journal.
+ * - Confirm(pending) -> Result<Durable token>, the ONLY minter of durability
+ *   tokens (storage/durable.h). It returns the token only if the pending
+ *   record belongs to this journal (else VERIFY_FAILED, CONFIRM_OTHER_JOURNAL),
+ *   the journal is not fatal (else FENCED, JOURNAL_FENCED) and DurableSeq()
+ *   has reached the record (else ORDER_VIOLATION, CONFIRM_BEFORE_BARRIER). The
+ *   token carries the pending record's reference, which the logs built from
+ *   the record they appended.
  *
- * After a fatal error Append is FENCED, Barrier is STORAGE_FATAL and the
- * durability tokens (storage/durable.h) can no longer be minted; the node
- * fences admission and sealing (section 7.1).
+ * After a fatal error Append is FENCED, Barrier is STORAGE_FATAL and Confirm
+ * is refused, so no new token can be minted; the node fences admission and
+ * sealing (section 7.1).
  *
  * Locking: one Mutex per journal guards the sequence numbers, the chain, the
  * unwritten bytes and the fatal flag. Append holds it while it frames the
@@ -68,6 +77,12 @@ inline constexpr std::string_view JOURNAL_FENCED{"JOURNAL_FENCED"};             
 inline constexpr std::string_view JOURNAL_FATAL{"JOURNAL_FATAL"};                          //!< (STORAGE_FATAL) barrier of a fatal journal
 inline constexpr std::string_view JOURNAL_ROLE_MISMATCH{"JOURNAL_ROLE_MISMATCH"};          //!< (ORDER_VIOLATION) type not held by the role
 inline constexpr std::string_view JOURNAL_BARRIER_CONCURRENT{"JOURNAL_BARRIER_CONCURRENT"}; //!< (ORDER_VIOLATION) a barrier is running
+inline constexpr std::string_view CONFIRM_OTHER_JOURNAL{"CONFIRM_OTHER_JOURNAL"};          //!< (VERIFY_FAILED) pending of another journal instance
+inline constexpr std::string_view CONFIRM_UNKNOWN_SEQ{"CONFIRM_UNKNOWN_SEQ"};              //!< (VERIFY_FAILED) no such record in this journal
+inline constexpr std::string_view CONFIRM_BEFORE_BARRIER{"CONFIRM_BEFORE_BARRIER"};        //!< (ORDER_VIOLATION) the record is not durable yet
+// Shared by the logs over a journal (SignerLog, CommitLog).
+inline constexpr std::string_view LOG_ROLE{"LOG_ROLE"};                                    //!< (ORDER_VIOLATION) journal of the wrong role
+inline constexpr std::string_view TOKEN_OTHER_LOG{"TOKEN_OTHER_LOG"};                      //!< (VERIFY_FAILED) pending or token not of this log
 
 /** Sees every accepted append and every barrier of a journal, in order.
  * Callbacks run on the calling thread without the journal lock, so they may
@@ -115,6 +130,19 @@ public:
 
     //! The durable records, in order (FileJournal: stub M4-STO-01).
     virtual Result<std::vector<JournalRecord>> ReadAll() const = 0;
+
+    //! Mint the durability token of a pending record; see the file comment.
+    template <RecordType T>
+        requires(HasDurableKind(T))
+    Result<Durable<DurableKindOf(T)>> Confirm(const Pending<T>& pending) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        if (pending.JournalInstance() != m_instance_id) return Error{ErrorCode::VERIFY_FAILED, CONFIRM_OTHER_JOURNAL};
+        const JournalStatus status{Status()};
+        if (status.fatal) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+        if (pending.Seq() == 0 || pending.Seq() > status.appended_seq) return Error{ErrorCode::VERIFY_FAILED, CONFIRM_UNKNOWN_SEQ};
+        if (pending.Seq() > status.durable_seq) return Error{ErrorCode::ORDER_VIOLATION, CONFIRM_BEFORE_BARRIER};
+        return Ok(Durable<DurableKindOf(T)>{m_instance_id, pending.Seq(), pending.Key()});
+    }
 
 protected:
     //! Only the two implementations can construct a Journal.

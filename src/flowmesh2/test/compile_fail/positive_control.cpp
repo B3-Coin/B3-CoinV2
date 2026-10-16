@@ -3,13 +3,15 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 // Positive control (CTest flowmesh2_negative_compile, Clang only).
-// The correct form of all three negative controls in one translation unit,
+// The correct form of all four negative controls in one translation unit,
 // built with exactly the same flags (fm2_warnings, core_interface, fm2_types).
 // It must compile; if it does not, the harness is broken and every negative
 // result is meaningless.
 
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/storage/durable.h>
+#include <flowmesh2/storage/seat_signer.h>
+#include <flowmesh2/storage/tokens.h>
 #include <sync.h>
 
 #include <cstdint>
@@ -55,4 +57,10 @@ int Fm2PositiveControl()
 uint64_t Fm2PositiveControlToken(flowmesh2::DurableIntent&& received)
 {
     return SignWithIntent(std::move(received));
+}
+
+flowmesh2::Result<flowmesh2::storage::VoteSignature> Fm2PositiveControlSign(const flowmesh2::storage::SeatSigner& signer,
+                                                                            const flowmesh2::DurableIntent& intent)
+{
+    return signer.Sign(intent);
 }

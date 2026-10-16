@@ -37,9 +37,12 @@
  * adds the engine's CANCEL_ALL branch (M3-ENG-09) and futures phase 7
  * (M9-FUT-04), and extends M2-LED-05 and M2-LED-06 to probe the engine
  * branches of WITHDRAW and the spot/futures transfers (engine PhaseOf) as
- * well. Slice R8 adds the file journal's reopen and read-back (M4-STO-01)
- * and segment rollover (M4-STO-06; the probe also appends past the end of
- * a one-page segment).
+ * well. Slice R8 adds the file journal's reopen and read-back and the logs'
+ * recovery over a journal with history (M4-STO-01), segment rollover
+ * (M4-STO-06; the probe also appends past the end of a one-page segment),
+ * the group-commit writer (M4-STO-02), snapshots (M4-STO-03) and the view
+ * state records (M4-STO-07), and extends M4-STO-05 to probe the signer
+ * log's folded signing as well.
  */
 
 #include <boost/test/unit_test.hpp>
@@ -55,7 +58,12 @@
 #include <flowmesh2/engine/residual.h>
 #include <flowmesh2/ledger/ledger.h>
 #include <flowmesh2/ledger/state_commitment.h>
+#include <flowmesh2/storage/commit_log.h>
 #include <flowmesh2/storage/file_journal.h>
+#include <flowmesh2/storage/log_writer.h>
+#include <flowmesh2/storage/memory_journal.h>
+#include <flowmesh2/storage/signer_log.h>
+#include <flowmesh2/storage/snapshot_store.h>
 #include <flowmesh2/test/util/storage_fixtures.h>
 
 #include <exception>
@@ -285,9 +293,16 @@ FM2_STUB_CASE(M9_FUT_01, "M9-FUT-01")
 
 FM2_STUB_CASE(M4_STO_05, "M4-STO-05")
 {
+    // Two entry points: the profile switch (R3) and the signer log (R8).
     ProfileParams params{RegtestProfile()};
     params.signer_mode = SignerMode::FOLDED_SIGNING;
-    return Observe(Validate(params));
+    auto journal{NewMemoryJournal(storage::JournalRole::SIGNER, 1)};
+    storage::SignerLog log{storage::SignerLog::Create(*journal).value()};
+    const StorageSlot slot{MakeStorageSlot(1, 0, "stub")};
+    const storage::PendingProposal proposal{log.AppendAcceptedProposal(storage::ProposalKey{0, 1, 0}, slot.header, slot.body).value()};
+    return FirstDeviation("M4-STO-05", {Observe(Validate(params)),
+                                        Observe(log.AppendSignedFolded(CommitVoteKey(slot.header, 0), slot.header.CommitDigest(),
+                                                                       proposal, storage::VoteSignature{}))});
 }
 
 // ---- Slice R4: core/action BatchVerifier ----
@@ -394,8 +409,16 @@ FM2_STUB_CASE(M4_STO_01, "M4-STO-01")
     // Reopening a journal and reading it back from disk.
     const TestDir dir{"stub_m4_sto_01"};
     auto journal{storage::FileJournal::CreateNew(dir.path, storage::JournalRole::SIGNER, 1, storage::SEGMENT_PAGE_BYTES).value()};
+    // And the logs over a journal that already has records (index rebuild).
+    auto signer{NewMemoryJournal(storage::JournalRole::SIGNER, 2)};
+    auto commit{NewMemoryJournal(storage::JournalRole::COMMIT, 3)};
+    if (!signer->Append(storage::RecordType::INTENT, Bytes("history")).has_value() ||
+        !commit->Append(storage::RecordType::DECISION, Bytes("history")).has_value()) {
+        return StubObservation{true, std::nullopt}; // the probe's own setup failed: report it as a deviation
+    }
     return FirstDeviation("M4-STO-01", {Observe(storage::FileJournal::OpenExisting(dir.path, storage::JournalRole::SIGNER, 1)),
-                                        Observe(journal->ReadAll())});
+                                        Observe(journal->ReadAll()), Observe(storage::SignerLog::Create(*signer)),
+                                        Observe(storage::CommitLog::Create(*commit))});
 }
 
 FM2_STUB_CASE(M4_STO_06, "M4-STO-06")
@@ -405,6 +428,34 @@ FM2_STUB_CASE(M4_STO_06, "M4-STO-06")
     auto journal{storage::FileJournal::CreateNew(dir.path, storage::JournalRole::COMMIT, 1, storage::SEGMENT_PAGE_BYTES).value()};
     const std::vector<unsigned char> too_big(storage::SEGMENT_PAGE_BYTES);
     return FirstDeviation("M4-STO-06", {Observe(journal->Rollover()), Observe(journal->Append(storage::RecordType::DECISION, too_big))});
+}
+
+// ---- Slice R8: storage logs, writer and snapshots ----
+
+FM2_STUB_CASE(M4_STO_02, "M4-STO-02")
+{
+    auto journal{NewMemoryJournal(storage::JournalRole::COMMIT, 1)};
+    return Observe(storage::LogWriter::Start(*journal, storage::LogWriterOptions{}));
+}
+
+FM2_STUB_CASE(M4_STO_03, "M4-STO-03")
+{
+    // Write and Load; the store touches no file in the outline.
+    storage::SnapshotStore store{fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("stub_m4_sto_03_never_created")};
+    const storage::SnapshotMark mark{1, uint256::ONE, uint256::ONE};
+    return FirstDeviation("M4-STO-03", {Observe(store.Write(mark, Bytes("state"))), Observe(store.Load(mark))});
+}
+
+FM2_STUB_CASE(M4_STO_07, "M4-STO-07")
+{
+    // VIEW_STATE and NEW_VIEW_ACCEPTED in the signer log, PREPARED_QC in the commit log.
+    auto signer_journal{NewMemoryJournal(storage::JournalRole::SIGNER, 1)};
+    auto commit_journal{NewMemoryJournal(storage::JournalRole::COMMIT, 2)};
+    storage::SignerLog signer{storage::SignerLog::Create(*signer_journal).value()};
+    storage::CommitLog commit{storage::CommitLog::Create(*commit_journal).value()};
+    return FirstDeviation("M4-STO-07", {Observe(signer.AppendViewState(storage::ViewStateRecord{0, 1})),
+                                        Observe(signer.AppendNewViewAccepted(storage::NewViewAcceptedRecord{0, 1, Bytes("nv")})),
+                                        Observe(commit.AppendPreparedQc(storage::PreparedQcRecord{0, 1, 1, uint256::ONE, Bytes("qc")}))});
 }
 
 BOOST_AUTO_TEST_SUITE_END()

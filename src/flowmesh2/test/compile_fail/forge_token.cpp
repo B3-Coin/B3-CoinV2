@@ -33,6 +33,8 @@ uint64_t Fm2CompileFailForgeToken(flowmesh2::DurableIntent&& received)
 #else
 uint64_t Fm2CompileFailForgeToken()
 {
-    return SignWithIntent(flowmesh2::DurableIntent{1, 1});
+    // The private constructor (journal instance, sequence number, binding):
+    // only storage::Journal::Confirm may call it.
+    return SignWithIntent(flowmesh2::DurableIntent{1, 1, flowmesh2::storage::VoteRef{}});
 }
 #endif

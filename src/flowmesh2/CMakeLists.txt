@@ -97,11 +97,16 @@ if(BUILD_FLOWMESH2)
     ledger/ledger.cpp
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
+    storage/commit_log.cpp
     storage/file_journal.cpp
     storage/journal.cpp
     storage/journal_commit.cpp
+    storage/log_writer.cpp
     storage/memory_journal.cpp
     storage/record.cpp
+    storage/seat_signer.cpp
+    storage/signer_log.cpp
+    storage/snapshot_store.cpp
   )
   target_link_libraries(fm2_core
     PRIVATE
@@ -125,6 +130,7 @@ if(BUILD_FLOWMESH2)
     test/certificate_tests.cpp
     test/codec_tests.cpp
     test/codes_tests.cpp
+    test/commit_log_tests.cpp
     test/commitment_tests.cpp
     test/durable_tests.cpp
     test/engine_property_tests.cpp
@@ -148,6 +154,8 @@ if(BUILD_FLOWMESH2)
     test/record_tests.cpp
     test/result_tests.cpp
     test/seat_set_tests.cpp
+    test/seat_signer_tests.cpp
+    test/signer_log_tests.cpp
     test/slot_tests.cpp
     test/state_root_tests.cpp
     test/stub_inventory_tests.cpp
@@ -237,7 +245,7 @@ if(BUILD_FLOWMESH2)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set(fm2_compile_fail_targets fm2_cf_positive_control)
     add_library(fm2_cf_positive_control OBJECT EXCLUDE_FROM_ALL test/compile_fail/positive_control.cpp)
-    foreach(fm2_case IN ITEMS tsa_missing_lock ignored_result forge_token)
+    foreach(fm2_case IN ITEMS tsa_missing_lock ignored_result forge_token sign_without_intent)
       add_library(fm2_cf_${fm2_case} OBJECT EXCLUDE_FROM_ALL test/compile_fail/${fm2_case}.cpp)
       add_library(fm2_cf_${fm2_case}_fixed OBJECT EXCLUDE_FROM_ALL test/compile_fail/${fm2_case}.cpp)
       target_compile_definitions(fm2_cf_${fm2_case}_fixed PRIVATE FM2_COMPILE_FAIL_FIXED)

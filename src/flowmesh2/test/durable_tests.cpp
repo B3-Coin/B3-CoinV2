@@ -4,12 +4,23 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <flowmesh2/storage/commit_log.h>
 #include <flowmesh2/storage/durable.h>
+#include <flowmesh2/storage/journal.h>
+#include <flowmesh2/storage/memory_journal.h>
+#include <flowmesh2/storage/tokens.h>
+#include <flowmesh2/test/util/storage_fixtures.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 using namespace flowmesh2;
+using namespace flowmesh2::storage;
+using namespace flowmesh2::test;
 
 namespace {
 
@@ -27,6 +38,8 @@ constexpr bool Unforgeable()
            std::is_nothrow_move_constructible_v<Token> &&
            !std::is_constructible_v<Token, uint64_t, uint64_t> &&
            !std::is_constructible_v<Token, int, int> &&
+           !std::is_constructible_v<Token, uint64_t, uint64_t, const typename Token::Ref&> &&
+           !std::is_constructible_v<Token, const typename Token::Ref&> &&
            !std::is_convertible_v<uint64_t, Token>;
 }
 
@@ -36,6 +49,44 @@ static_assert(Unforgeable<DurableDecision>());
 static_assert(Unforgeable<DurableApplied>());
 static_assert(!std::is_constructible_v<DurableIntent, DurableDecision&&>, "one barrier's token never stands in for another's");
 static_assert(!std::is_constructible_v<DurableApplied, DurableDecision&&>);
+
+// A Pending is copyable (it names a record) but only the logs can make one.
+template <class P>
+constexpr bool PendingUnforgeable()
+{
+    return !std::is_default_constructible_v<P> && std::is_copy_constructible_v<P> &&
+           !std::is_constructible_v<P, uint64_t, uint64_t, const typename P::Ref&>;
+}
+static_assert(PendingUnforgeable<PendingProposal>());
+static_assert(PendingUnforgeable<PendingIntent>());
+static_assert(PendingUnforgeable<PendingSignedVote>());
+static_assert(PendingUnforgeable<PendingDecision>());
+static_assert(PendingUnforgeable<PendingApplied>());
+
+// The token kinds Confirm can mint, and nothing else.
+static_assert(HasDurableKind(RecordType::INTENT) && HasDurableKind(RecordType::SIGNED_VOTE) &&
+              HasDurableKind(RecordType::DECISION) && HasDurableKind(RecordType::APPLIED));
+static_assert(!HasDurableKind(RecordType::ACCEPTED_PROPOSAL) && !HasDurableKind(RecordType::SNAPSHOT_MARK) &&
+              !HasDurableKind(RecordType::VIEW_STATE) && !HasDurableKind(RecordType::NEW_VIEW_ACCEPTED) &&
+              !HasDurableKind(RecordType::PREPARED_QC));
+
+//! A commit log over a fresh memory journal.
+struct CommitFixture {
+    std::unique_ptr<MemoryJournal> journal;
+    CommitLog log;
+
+    explicit CommitFixture(uint64_t instance, MemoryJournalFaults faults = {})
+        : journal{NewMemoryJournal(JournalRole::COMMIT, instance, faults)}, log{CommitLog::Create(*journal).value()}
+    {
+    }
+
+    PendingDecision Decide(const StorageSlot& slot)
+    {
+        Result<PendingDecision> pending{log.AppendDecision(slot.header, slot.certificate, slot.body)};
+        RequireStorageOk(pending, "AppendDecision");
+        return *pending;
+    }
+};
 
 } // namespace
 
@@ -49,6 +100,110 @@ BOOST_AUTO_TEST_CASE(token_kinds_pinned)
     BOOST_CHECK_EQUAL(static_cast<int>(DurableSignedVote::KIND), 2);
     BOOST_CHECK_EQUAL(static_cast<int>(DurableDecision::KIND), 3);
     BOOST_CHECK_EQUAL(static_cast<int>(DurableApplied::KIND), 4);
+    BOOST_CHECK(RecordTypeOf(DurableKind::DECISION) == RecordType::DECISION);
+    BOOST_CHECK(DurableKindOf(RecordType::APPLIED) == DurableKind::APPLIED);
+}
+
+BOOST_AUTO_TEST_CASE(confirm_before_barrier_is_refused)
+{
+    CommitFixture f{1};
+    const StorageSlot slot{MakeStorageSlot(1, 0, "a")};
+    const PendingDecision pending{f.Decide(slot)};
+    RequireRefusal(f.log.Confirm(pending), ErrorCode::ORDER_VIOLATION, CONFIRM_BEFORE_BARRIER, "confirm before the barrier");
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 1U);
+    const Result<DurableDecision> token{f.log.Confirm(pending)};
+    RequireStorageOk(token, "confirm after the barrier");
+    // Confirm can be repeated: it proves a durable fact.
+    RequireStorageOk(f.log.Confirm(pending), "second confirm");
+}
+
+BOOST_AUTO_TEST_CASE(group_commit_confirms_each_record)
+{
+    // Three appends and one barrier give three confirms.
+    RecordingObserver observer;
+    auto journal{NewMemoryJournal(JournalRole::COMMIT, 2, {}, &observer)};
+    CommitLog log{CommitLog::Create(*journal).value()};
+    std::vector<PendingDecision> pendings;
+    for (uint64_t height{1}; height <= 3; ++height) {
+        Result<PendingDecision> pending{log.AppendDecision(MakeStorageSlot(height, 0, "g").header, MakeStorageSlot(height, 0, "g").certificate,
+                                                           MakeStorageSlot(height, 0, "g").body)};
+        RequireStorageOk(pending, "AppendDecision");
+        BOOST_CHECK_EQUAL(pending->Seq(), height);
+        RequireRefusal(log.Confirm(*pending), ErrorCode::ORDER_VIOLATION, CONFIRM_BEFORE_BARRIER, "before the barrier");
+        pendings.push_back(*pending);
+    }
+    BOOST_CHECK_EQUAL(log.Barrier().value(), 3U);
+    for (uint64_t i{0}; i < 3; ++i) {
+        const Result<DurableDecision> token{log.Confirm(pendings[i])};
+        RequireStorageOk(token, "confirm");
+        BOOST_CHECK_EQUAL(token->Seq(), i + 1);
+        BOOST_CHECK_EQUAL(token->Slot(), i + 1);
+        BOOST_CHECK(token->Digest() == MakeStorageSlot(i + 1, 0, "g").header.Hash());
+    }
+    // Exactly one barrier covered the three records.
+    BOOST_CHECK_EQUAL(std::count_if(observer.events.begin(), observer.events.end(),
+                                    [](const std::string& e) { return e.starts_with("barrier-start"); }),
+                      1);
+}
+
+BOOST_AUTO_TEST_CASE(confirm_is_refused_after_a_fatal_barrier)
+{
+    // A failed barrier is sticky: Append is FENCED and Confirm is refused,
+    // even for a record that was durable before the failure.
+    CommitFixture f{3, MemoryJournalFaults{.fail_barrier = 2}};
+    const PendingDecision first{f.Decide(MakeStorageSlot(1, 0, "a"))};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 1U);
+    RequireStorageOk(f.log.Confirm(first), "confirm before the failure");
+    const PendingDecision second{f.Decide(MakeStorageSlot(2, 0, "a"))};
+    RequireRefusal(f.log.Barrier(), ErrorCode::STORAGE_FATAL, MEMORY_JOURNAL_BARRIER_FAULT, "failed barrier");
+    RequireRefusal(f.log.Barrier(), ErrorCode::STORAGE_FATAL, JOURNAL_FATAL, "barrier after the failure");
+    RequireRefusal(f.log.Confirm(second), ErrorCode::FENCED, JOURNAL_FENCED, "confirm of the uncovered record");
+    RequireRefusal(f.log.Confirm(first), ErrorCode::FENCED, JOURNAL_FENCED, "confirm of the covered record");
+    const StorageSlot third{MakeStorageSlot(3, 0, "a")};
+    RequireRefusal(f.log.AppendDecision(third.header, third.certificate, third.body), ErrorCode::FENCED, JOURNAL_FENCED, "append after fatal");
+    RequireRefusal(f.journal->Append(RecordType::DECISION, Bytes("raw")), ErrorCode::FENCED, JOURNAL_FENCED, "raw append after fatal");
+}
+
+BOOST_AUTO_TEST_CASE(confirm_is_refused_for_another_journal)
+{
+    CommitFixture a{10};
+    CommitFixture b{11};
+    const PendingDecision pending{a.Decide(MakeStorageSlot(1, 0, "x"))};
+    BOOST_CHECK_EQUAL(a.log.Barrier().value(), 1U);
+    BOOST_CHECK_EQUAL(b.log.Barrier().value(), 0U);
+    RequireRefusal(b.log.Confirm(pending), ErrorCode::VERIFY_FAILED, CONFIRM_OTHER_JOURNAL, "pending of another instance");
+    // A journal with the same instance id but without that record does not know its sequence number.
+    CommitFixture same_id{10};
+    RequireRefusal(same_id.log.Confirm(pending), ErrorCode::VERIFY_FAILED, CONFIRM_UNKNOWN_SEQ, "same instance, no such record");
+}
+
+BOOST_AUTO_TEST_CASE(token_binding_and_moves)
+{
+    CommitFixture f{4};
+    const StorageSlot slot{MakeStorageSlot(7, 2, "bind")};
+    const PendingDecision pending{f.Decide(slot)};
+    BOOST_CHECK_EQUAL(pending.JournalInstance(), 4U);
+    BOOST_CHECK_EQUAL(pending.Seq(), 1U);
+    BOOST_CHECK(pending.Key() == (DecisionRef{7, slot.header.Hash()}));
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 1U);
+    DurableDecision token{f.log.Confirm(pending).value()};
+    BOOST_CHECK_EQUAL(token.JournalInstance(), 4U);
+    BOOST_CHECK_EQUAL(token.Seq(), 1U);
+    BOOST_CHECK_EQUAL(token.Slot(), 7U);
+    BOOST_CHECK(token.Digest() == slot.header.Hash());
+    BOOST_CHECK(token.Binding() == pending.Key());
+    // A move hands the binding on; the source keeps it (a proof stays true).
+    const DurableDecision moved{std::move(token)};
+    BOOST_CHECK_EQUAL(moved.Seq(), 1U);
+    BOOST_CHECK(moved.Binding() == pending.Key());
+    BOOST_CHECK(token.Binding() == moved.Binding()); // NOLINT(bugprone-use-after-move): documented semantics
+    // The applied token binds the state root as well.
+    const PendingApplied applied{f.log.AppendApplied(moved, slot.header.state_root).value()};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 2U);
+    const DurableApplied applied_token{f.log.Confirm(applied).value()};
+    BOOST_CHECK(applied_token.Binding() == (AppliedRef{7, slot.header.Hash(), slot.header.state_root}));
+    BOOST_CHECK_EQUAL(applied_token.Slot(), 7U);
+    BOOST_CHECK(applied_token.Digest() == slot.header.Hash());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

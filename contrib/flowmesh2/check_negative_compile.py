@@ -21,8 +21,9 @@ and fm2_cf_positive_control (positive_control.cpp), which must compile; it is
 built first, because if it fails the harness itself is broken.
 
 Required negative controls (owner-protected; removing one fails this check):
-tsa_missing_lock (missing LOCK), ignored_result (ignored Result) and
-forge_token (forged Durable token). Any other *.cpp in the directory must
+tsa_missing_lock (missing LOCK), ignored_result (ignored Result),
+forge_token (forged Durable token) and, since slice R8, sign_without_intent
+(SeatSigner::Sign without a DurableIntent). Any other *.cpp in the directory must
 follow the same pattern and is run as well.
 
 Stale objects cannot hide a result: before every build the runner deletes the
@@ -40,7 +41,7 @@ import re
 import subprocess
 import sys
 
-REQUIRED = ("tsa_missing_lock", "ignored_result", "forge_token")
+REQUIRED = ("tsa_missing_lock", "ignored_result", "forge_token", "sign_without_intent")
 POSITIVE = "positive_control"
 EXPECT = re.compile(r"^//\s*FM2_EXPECT_ERROR:\s*(.+?)\s*$", re.M)
 BUILD_TIMEOUT_S = 600
