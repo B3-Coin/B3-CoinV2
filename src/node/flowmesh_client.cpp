@@ -1341,6 +1341,14 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     std::mutex m_read_lane;
     FlowMeshHttpsClient m_read_https;
     std::atomic<bool> m_read_reset{false};
+    // Catalog-only owner: no queued callers/bodies, and at most one bounded
+    // reply plus parsed DOM through validation/application. Its dedicated TLS
+    // may retain ONE idle socket inside existing transport age/idle bounds;
+    // idle server sockets consume connection capacity, not workers/permits.
+    std::atomic<bool> m_catalog_in_flight{false};
+    Mutex m_catalog_lane;
+    FlowMeshHttpsClient m_catalog_https GUARDED_BY(m_catalog_lane);
+    std::atomic<bool> m_catalog_reset{false};
     // Under m_work. Explicit trust/configuration reset fences late replies;
     // endpoint observation revisions fence stale cooldown/capability writes.
     uint64_t m_read_epoch{0}, m_endpoint_revision{0}, m_cache_revision{0};
@@ -1358,6 +1366,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     {
         AdvanceRevision(m_read_epoch);
         m_read_reset = true;
+        m_catalog_reset = true;
         // Explicit connect/reconnect invalidates joins under the old trust
         // context. At most eight volatile caches; no head/history reset.
         for (auto& [id, cache] : m_cache) {
@@ -3888,7 +3897,7 @@ public:
         if (!m_endpoints.empty()) m_status.selected_endpoint = m_endpoints[m_selected].url;
         PublishSavedView();
     }
-    bool Connect(const std::string& url, std::string& error) override
+    bool Connect(const std::string& url, std::string& error) override EXCLUSIVE_LOCKS_REQUIRED(!m_catalog_lane)
     {
         error.clear();
         HttpsEndpoint endpoint{url, {}, {}};
@@ -3896,50 +3905,52 @@ public:
         FlowMeshTimingSpan timing_lock_1145{__func__};
         timing_lock_1145.Field("lock_name", std::string{"client_work"});
         timing_lock_1145.Mark("lock_requested_us");
-        WorkLock lock{*this};
-        MarkWorkAcquired(timing_lock_1145);
-        try {
-            const auto existing{std::find_if(m_endpoints.begin(), m_endpoints.end(), [&](const auto& candidate) { return candidate.url == endpoint.url; })};
-            const bool added{existing == m_endpoints.end()};
-            if (added && m_endpoints.size() == CLIENT_MAX_ENDPOINTS) Fail("At most eight independent trading endpoints may be configured");
-            if (added && !ValidateFlowMeshHttpsTrust(endpoint, error)) return false;
-            const size_t selected{added ? m_endpoints.size() : static_cast<size_t>(std::distance(m_endpoints.begin(), existing))};
-            auto saved{m_saved_endpoints};
-            if (added) saved.push_back(endpoint.url);
-            // A configured endpoint is selected as-is, never rewritten with
-            // default trust. Persist before publishing an in-memory change.
-            SaveEndpoints(saved, endpoint.url);
-            if (added) {
-                m_endpoints.push_back(endpoint); m_saved_endpoints = std::move(saved);
-                m_retry_after.emplace_back();
-                m_action_wait.emplace_back();
-                m_submit_wait.emplace_back();
-                m_action_outcome.emplace_back(false);
-                m_wait_unanswered.push_back(false);
-                m_updates_watch.emplace_back();
-                m_watch_unanswered.push_back(false);
-                m_clearing_ticks.push_back(0);
-                m_clearing_ticks_withdrawn.emplace_back();
-                m_observed_time.push_back(false);
-                m_observed_candles.push_back(0);
-            }
-            ResetReadTrust();
-            EndpointChanged();
-            m_selected = selected; m_preferred = selected; m_retry_after[selected] = {};
-            m_https.Reset(); // Explicit connect revalidates existing trust.
-            m_wait_reset = true;
-            m_watch_reset = true;
-            m_display_reset = true;
-            {
-                std::lock_guard status_lock{m_status_mutex};
-                if (added) m_status.endpoints.push_back({.url = endpoint.url, .available = false, .last_error = {}});
-                m_status.selected_endpoint = endpoint.url;
-                m_status.endpoints[selected].retry_after_ms = 0;
-            }
-        } catch (const std::exception& e) { error = e.what(); return false; }
+        {
+            WorkLock lock{*this};
+            MarkWorkAcquired(timing_lock_1145);
+            try {
+                const auto existing{std::find_if(m_endpoints.begin(), m_endpoints.end(), [&](const auto& candidate) { return candidate.url == endpoint.url; })};
+                const bool added{existing == m_endpoints.end()};
+                if (added && m_endpoints.size() == CLIENT_MAX_ENDPOINTS) Fail("At most eight independent trading endpoints may be configured");
+                if (added && !ValidateFlowMeshHttpsTrust(endpoint, error)) return false;
+                const size_t selected{added ? m_endpoints.size() : static_cast<size_t>(std::distance(m_endpoints.begin(), existing))};
+                auto saved{m_saved_endpoints};
+                if (added) saved.push_back(endpoint.url);
+                // A configured endpoint is selected as-is, never rewritten with
+                // default trust. Persist before publishing an in-memory change.
+                SaveEndpoints(saved, endpoint.url);
+                if (added) {
+                    m_endpoints.push_back(endpoint); m_saved_endpoints = std::move(saved);
+                    m_retry_after.emplace_back();
+                    m_action_wait.emplace_back();
+                    m_submit_wait.emplace_back();
+                    m_action_outcome.emplace_back(false);
+                    m_wait_unanswered.push_back(false);
+                    m_updates_watch.emplace_back();
+                    m_watch_unanswered.push_back(false);
+                    m_clearing_ticks.push_back(0);
+                    m_clearing_ticks_withdrawn.emplace_back();
+                    m_observed_time.push_back(false);
+                    m_observed_candles.push_back(0);
+                }
+                ResetReadTrust();
+                EndpointChanged();
+                m_selected = selected; m_preferred = selected; m_retry_after[selected] = {};
+                m_https.Reset(); // Explicit connect revalidates existing trust.
+                m_wait_reset = true;
+                m_watch_reset = true;
+                m_display_reset = true;
+                {
+                    std::lock_guard status_lock{m_status_mutex};
+                    if (added) m_status.endpoints.push_back({.url = endpoint.url, .available = false, .last_error = {}});
+                    m_status.selected_endpoint = endpoint.url;
+                    m_status.endpoints[selected].retry_after_ms = 0;
+                }
+            } catch (const std::exception& e) { error = e.what(); return false; }
+        }
         // Reachability is an observation, not configuration failure. Only
         // market discovery is sent; no retained action is inspected or sent.
-        try { (void)ReadMarkets(); } catch (const std::exception&) {}
+        try { (void)ReadMarkets(CatalogMode::CONNECT); } catch (const std::exception&) {}
         return true;
     }
     std::optional<modern::AssetDisplayMetadata> Metadata(const uint256& asset) const override
@@ -3955,48 +3966,217 @@ private:
     //! Test only (never set by the node): called by a lane submission after
     //! its request, before it takes m_work to apply the reply.
     std::function<void()> m_lane_submission_fault_for_test;
-    UniValue ReadMarkets()
+    enum class CatalogMode { MARKETS, CONNECT, RECONNECT };
+    struct CatalogBusy : std::runtime_error {
+        CatalogBusy() : std::runtime_error{"Market discovery already in progress; retry this read-only command after it completes"} {}
+    };
+    struct CatalogSuperseded : std::runtime_error {
+        CatalogSuperseded() : std::runtime_error{"Market discovery context or endpoint observation was superseded"} {}
+    };
+    struct CatalogNotConfigured : std::runtime_error {
+        CatalogNotConfigured() : std::runtime_error{"No FlowMesh HTTPS trading endpoint configured; use flowmeshclientconnect or -flowmeshendpoint"} {}
+    };
+    class CatalogLease {
+        std::atomic<bool>& m_active;
+    public:
+        explicit CatalogLease(std::atomic<bool>& active) : m_active{active}
+        {
+            bool expected{false};
+            if (!m_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) throw CatalogBusy{};
+        }
+        CatalogLease(const CatalogLease&) = delete;
+        CatalogLease& operator=(const CatalogLease&) = delete;
+        ~CatalogLease() { m_active.store(false, std::memory_order_release); }
+    };
+    struct CatalogContext {
+        std::vector<HttpsEndpoint> endpoints;
+        uint64_t epoch{0};
+        size_t preferred{0}, first{0};
+    };
+    struct CatalogResult {
+        std::vector<MarketStatus> markets;
+        std::string endpoint;
+    };
+    void CheckCatalogContext(const CatalogContext& context) const
     {
-        UniValue params{UniValue::VOBJ};
-        return Call("markets", params, [&](const UniValue& value, size_t endpoint) {
-            if (!value.isArray() || value.size() > CLIENT_MAX_MARKETS) Fail("Market discovery exceeds bound");
-            std::set<uint256> seen;
-            // One row per endpoint is shown: the first market it reports not
-            // ready, otherwise the last one.
-            std::optional<std::pair<FlowMeshAdvertisedReadiness, uint256>> shown;
-            for (const auto& row : value.getValues()) {
-                const auto id{Id(row, "market_id")}; if (!seen.insert(id).second) Fail("Duplicate market identity");
-                CheckStatus(row, Pins(id));
-                LearnActionWait(row, endpoint);
-                if (!shown || shown->first.state != FlowMeshAdvertisedReadiness::State::NOT_READY) {
-                    shown.emplace(FlowMeshAdvertisedReadinessOf(row), id);
-                }
+        if (m_read_context_exhausted || context.epoch != m_read_epoch ||
+            context.preferred != m_preferred || context.endpoints.size() != m_endpoints.size()) throw CatalogSuperseded{};
+        for (size_t i{0}; i < context.endpoints.size(); ++i) {
+            const auto& old{context.endpoints[i]};
+            const auto& current{m_endpoints[i]};
+            if (old.url != current.url || old.ca_file != current.ca_file ||
+                old.certificate_sha256 != current.certificate_sha256) throw CatalogSuperseded{};
+        }
+    }
+    //! Catalog only: one owner through whole-rowset apply, no generic Call
+    //! callback unlocked. Eight sequential endpoints, 5s PER attempt, one
+    //! 24MiB serialized reply plus DOM and bounded row/metadata candidates.
+    CatalogResult ReadMarkets(const CatalogMode mode, size_t* attempted_endpoints = nullptr) EXCLUSIVE_LOCKS_REQUIRED(!m_catalog_lane)
+    {
+        // Acquire before m_work and before constructing any request/body.
+        // A busy Reconnect must not reset trust or any observation.
+        CatalogLease owner{m_catalog_in_flight};
+        CatalogContext context;
+        if (mode == CatalogMode::RECONNECT) {
+            WorkLock work{*this, std::try_to_lock};
+            if (!work.owns_lock()) throw CatalogBusy{};
+            CaptureCatalogContext(mode, context);
+        } else {
+            // Markets/Connect retain normal work admission; no catalog
+            // transport lock is held while waiting for the work gate.
+            WorkLock work{*this};
+            CaptureCatalogContext(mode, context);
+        }
+        const std::string body{R"({"method":"markets","params":{}})"};
+        std::string error;
+        for (size_t attempt{0}; attempt < context.endpoints.size(); ++attempt) {
+            const size_t endpoint{(context.first + attempt) % context.endpoints.size()};
+            HttpsEndpoint target;
+            uint64_t observations{0};
+            {
+                WorkLock work{*this};
+                CheckCatalogContext(context);
+                if (mode != CatalogMode::RECONNECT && std::chrono::steady_clock::now() < m_retry_after.at(endpoint)) continue;
+                target = m_endpoints.at(endpoint);
+                observations = m_endpoint_revision;
             }
-            if (shown) LearnReadiness(std::move(shown->first), endpoint, shown->second);
-        });
+            UniValue parsed;
+            bool response_received{false};
+            std::string failure;
+            {
+                TRY_LOCK(m_catalog_lane, lane);
+                if (!lane.owns_lock()) throw CatalogBusy{};
+                if (m_catalog_reset.exchange(false)) m_catalog_https.Reset();
+                const auto started{std::chrono::steady_clock::now()};
+                if (attempted_endpoints) ++*attempted_endpoints;
+                const auto reply{m_catalog_https.Request(target, "/flowmesh/v1", body, CLIENT_REQUEST_TIMEOUT, CLIENT_MAX_REPLY)};
+                response_received = reply.response_received;
+                try {
+                    if (!response_received) Fail(reply.error.empty() ? "No HTTPS response; outcome unknown" : reply.error);
+                    if (!parsed.read(reply.body)) Fail("Malformed endpoint JSON response");
+                    Keys(parsed, {"ok", "result", "error"});
+                    if (!Flag(parsed, "ok")) Fail(Text(parsed, "error"));
+                    if (reply.status != 200) Fail("Unexpected HTTPS response status");
+                    const auto& rows{parsed["result"]};
+                    if (!rows.isArray() || rows.size() > CLIENT_MAX_MARKETS) Fail("Market discovery exceeds bound");
+                    std::set<uint256> seen;
+                    for (const auto& row : rows.getValues()) {
+                        if (!row.isObject() || !seen.insert(Id(row, "market_id")).second)
+                            Fail("Invalid or duplicate market identity in availability response");
+                    }
+                    // Recheck the configured CA FILE after bounded parsing,
+                    // outside m_work. Same-path/mtime replacement is fenced.
+                    const auto remaining{std::chrono::duration_cast<std::chrono::milliseconds>(
+                        started + CLIENT_REQUEST_TIMEOUT - std::chrono::steady_clock::now())};
+                    std::string trust_error;
+                    if (!FlowMeshHttpsTrustCurrent(target, reply.trust, remaining, trust_error)) Fail(trust_error);
+                } catch (const std::exception& e) { failure = e.what(); }
+                if (!failure.empty()) m_catalog_https.Reset();
+            }
+            // The TLS/parse lock and serialized reply are gone before work.
+            // The owner still bounds this single parsed reply through apply.
+            WorkLock work{*this};
+            CheckCatalogContext(context);
+            if (observations != m_endpoint_revision) throw CatalogSuperseded{};
+            CatalogResult result;
+            if (failure.empty()) {
+                try {
+                    const auto& rows{parsed["result"]};
+                    std::optional<std::pair<FlowMeshAdvertisedReadiness, uint256>> shown;
+                    FlowMeshAssetMetadataCatalog metadata;
+                    uint64_t metadata_changes{0};
+                    if (mode == CatalogMode::MARKETS) {
+                        std::lock_guard lock{m_metadata_mutex};
+                        metadata = m_metadata;
+                        result.markets.reserve(rows.size());
+                    }
+                    if (mode != CatalogMode::RECONNECT) {
+                        // Every local pin/status/metadata candidate is staged
+                        // before ANY endpoint hint, readiness or label write.
+                        // Pins/SyncIndexes can still wait for cs_main here.
+                        for (const auto& row : rows.getValues()) {
+                            const auto pins{Pins(Id(row, "market_id"))};
+                            CheckStatus(row, pins);
+                            if (!shown || shown->first.state != FlowMeshAdvertisedReadiness::State::NOT_READY)
+                                shown.emplace(FlowMeshAdvertisedReadinessOf(row), pins.market_id);
+                            if (mode != CatalogMode::MARKETS) continue;
+                            MarketStatus status;
+                            status.market_id = pins.market_id; status.domain = pins.domain; status.base_asset = pins.base_asset;
+                            status.vault_id = pins.vault_id; status.execution_config_id = pins.execution_config_id;
+                            status.remote = true; status.endpoint = target.url;
+                            status.available = true; status.running = false; status.paused = true;
+                            status.error = "Select market to verify its certified state";
+                            result.markets.push_back(std::move(status));
+                            if (!row.exists("asset_display")) continue;
+                            std::string metadata_error;
+                            auto label{ParseFlowMeshAssetMetadata(row["asset_display"], pins.domain, pins.base_asset, metadata_error)};
+                            if (!label) {
+                                // Same cosmetic refusal as LearnMetadata.
+                                LogDebug(BCLog::NET, "Ignoring invalid FlowMesh display metadata for asset=%s: %s\n", pins.base_asset.GetHex(), metadata_error);
+                                continue;
+                            }
+                            label->source = "endpoint-label: " + target.url;
+                            const auto old{metadata.find(pins.base_asset)};
+                            if (old == metadata.end() && metadata.size() >= CLIENT_MAX_MARKETS) continue;
+                            if (old != metadata.end() && old->second.name == label->name &&
+                                old->second.ticker == label->ticker && old->second.source == label->source) continue;
+                            metadata.insert_or_assign(pins.base_asset, std::move(*label));
+                            ++metadata_changes;
+                        }
+                    }
+                    result.endpoint = target.url;
+                    // Reconnect intentionally validated ONLY bounded shape
+                    // and unique identities: no metadata or account evidence.
+                    if (mode != CatalogMode::RECONNECT) {
+                        if (rows.size()) LearnActionWait(rows[rows.size() - 1], endpoint);
+                        if (shown) LearnReadiness(std::move(shown->first), endpoint, shown->second);
+                        if (metadata_changes) {
+                            std::lock_guard lock{m_metadata_mutex};
+                            m_metadata.swap(metadata);
+                            m_metadata_generation.fetch_add(metadata_changes, std::memory_order_release);
+                        }
+                    }
+                    m_selected = endpoint;
+                    EndpointResult(endpoint, true, {});
+                    return result;
+                } catch (const std::exception& e) { failure = e.what(); }
+            }
+            error = failure;
+            EndpointResult(endpoint, response_received, failure);
+            if (mode == CatalogMode::RECONNECT && attempt + 1 == context.endpoints.size()) {
+                // This whole current probe failed; do not leave its result
+                // naming an old successful URL. Never clear a newer result.
+                std::lock_guard status{m_status_mutex};
+                m_status.active_endpoint.clear();
+            }
+        }
+        if (error.empty()) error = "Trading endpoints are waiting to retry";
+        Fail(error);
+    }
+    void CaptureCatalogContext(const CatalogMode mode, CatalogContext& context)
+    {
+        if (m_endpoints.empty()) throw CatalogNotConfigured{};
+        if (mode == CatalogMode::RECONNECT) {
+            // Existing explicit reset semantics, but catalog TLS consumes its
+            // own reset flag only outside work. No action is read or sent.
+            ResetReadTrust();
+            m_https.Reset();
+            m_wait_reset = true;
+            m_watch_reset = true;
+            m_display_reset = true;
+        }
+        if (m_read_context_exhausted) throw CatalogSuperseded{};
+        context.endpoints = m_endpoints;
+        context.epoch = m_read_epoch;
+        context.preferred = m_preferred;
+        context.first = mode == CatalogMode::RECONNECT ? m_selected : m_preferred;
     }
 public:
-    std::vector<MarketStatus> Markets(const std::optional<uint256>& account) override
+    std::vector<MarketStatus> Markets(const std::optional<uint256>& account) override EXCLUSIVE_LOCKS_REQUIRED(!m_catalog_lane)
     {
-        FlowMeshTimingSpan timing_lock_1197{__func__};
-        timing_lock_1197.Field("lock_name", std::string{"client_work"});
-        timing_lock_1197.Mark("lock_requested_us");
-        WorkLock lock{*this};
-        MarkWorkAcquired(timing_lock_1197);
-        std::vector<MarketStatus> out;
-        const auto rows{ReadMarkets()};
-        // Discovery is bounded metadata; selected market gets full proof on
-        // demand, not every market's snapshot on each Qt refresh.
-        for (const auto& row : rows.getValues()) {
-            MarketStatus status; const auto pins{Pins(Id(row, "market_id"))};
-            LearnMetadata(row, pins, m_selected);
-            status.market_id = pins.market_id; status.domain = pins.domain; status.base_asset = pins.base_asset;
-            status.vault_id = pins.vault_id; status.execution_config_id = pins.execution_config_id;
-            status.remote = true; status.endpoint = m_endpoints[m_selected].url;
-            status.available = true; status.running = false; status.paused = true;
-            status.error = "Select market to verify its certified state"; out.push_back(std::move(status));
-        }
-        return out;
+        FlowMeshTimingSpan timing{__func__};
+        // Discovery is bounded metadata, never account freshness or proof.
+        return ReadMarkets(CatalogMode::MARKETS).markets;
     }
     std::optional<MarketStatus> Market(const uint256& id, const std::optional<uint256>& account) override
     {
@@ -4678,47 +4858,24 @@ public:
     {
         std::lock_guard lock{m_status_mutex}; return m_status;
     }
-    FlowMeshClientReconnectResult Reconnect() override
+    FlowMeshClientReconnectResult Reconnect() override EXCLUSIVE_LOCKS_REQUIRED(!m_catalog_lane)
     {
         FlowMeshClientReconnectResult out;
-        out.status = "busy";
-        out.error = "Another FlowMesh client request is running; retry this read-only command after it completes";
-        WorkLock work{*this, std::try_to_lock};
-        if (!work.owns_lock()) return out;
-        if (m_endpoints.empty()) {
-            out.status = "not_configured";
-            out.error = "No FlowMesh HTTPS trading endpoint configured; use flowmeshclientconnect or -flowmeshendpoint";
-            return out;
-        }
         try {
-            // An explicit probe opens fresh TLS with the existing trust and
-            // bounded failover policy. This is availability, not certification.
-            ResetReadTrust();
-            m_https.Reset();
-            m_wait_reset = true;
-            m_watch_reset = true;
-            m_display_reset = true;
-            // Do not call Markets/Refresh/QueryAction/Send: a connection probe
-            // must not touch market caches, account cursors or durable history.
-            Call("markets", UniValue{UniValue::VOBJ}, [&](const UniValue& value, size_t) {
-                if (!value.isArray() || value.size() > CLIENT_MAX_MARKETS) Fail("Market discovery exceeds bound");
-                std::set<uint256> seen;
-                for (const auto& row : value.getValues()) {
-                    if (!row.isObject() || !seen.insert(Id(row, "market_id")).second)
-                        Fail("Invalid or duplicate market identity in availability response");
-                }
-            }, nullptr, nullptr, &out.attempted_endpoints);
+            const auto result{ReadMarkets(CatalogMode::RECONNECT, &out.attempted_endpoints)};
             out.status = "reachable";
             out.endpoint_available = true;
-            out.endpoint = m_endpoints[m_selected].url;
+            out.endpoint = result.endpoint;
             out.error.clear();
+        } catch (const CatalogBusy& e) {
+            out.status = "busy";
+            out.error = e.what();
+        } catch (const CatalogNotConfigured& e) {
+            out.status = "not_configured";
+            out.error = e.what();
         } catch (const std::exception& e) {
             out.status = "unavailable";
             out.error = std::string{e.what()}.substr(0, 1024);
-            // Every configured endpoint just failed its probe. Do not display
-            // an old successful URL as the result of this reconnect attempt.
-            std::lock_guard status{m_status_mutex};
-            m_status.active_endpoint.clear();
         }
         return out;
     }

@@ -3701,12 +3701,12 @@ BOOST_AUTO_TEST_CASE(lane_borrows_the_warm_ordinary_connection_for_its_first_wai
     BOOST_REQUIRE_MESSAGE(client, error);
     BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
     BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
-    BOOST_REQUIRE_EQUAL(connections.Count(), 1U);
+    BOOST_REQUIRE_EQUAL(connections.Count(), 2U);
     std::this_thread::sleep_for(std::chrono::milliseconds{150}); // Refill the automatic read budget.
 
     // The lane has never connected; the ordinary connection just delivered
-    // the action. The waited read carries it: the endpoint sees no second
-    // connection and the read performs no TLS handshake.
+    // the action. The waited read carries it: only the separate catalog
+    // connection is additional and the read performs no TLS handshake.
     std::vector<UniValue> spans;
     interfaces::FlowMeshActionReceipt waited;
     {
@@ -3717,17 +3717,18 @@ BOOST_AUTO_TEST_CASE(lane_borrows_the_warm_ordinary_connection_for_its_first_wai
     BOOST_CHECK(waited.certificate_verified);
     BOOST_CHECK_EQUAL(waited.state, "certified_inclusion");
     BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 1, 1, 1}));
-    BOOST_CHECK_EQUAL(connections.Count(), 1U);
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
     BOOST_REQUIRE_EQUAL(spans.size(), 1U);
     BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
     BOOST_CHECK_EQUAL(spans[0]["connection_reused"].getInt<uint64_t>(), 1U);
     BOOST_CHECK_EQUAL(spans[0]["tls_handshake_performed"].getInt<uint64_t>(), 0U);
     BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 1U);
     BOOST_CHECK_EQUAL(spans[0]["result"].get_str(), "certified");
-    // Handed back: ordinary work keeps using the same connection.
+    // The hand-back span above proves the ordinary swap. Discovery keeps
+    // using ONLY its separate catalog session, without another handshake.
     BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
     BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 1, 1, 2}));
-    BOOST_CHECK_EQUAL(connections.Count(), 1U);
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
     client.reset();
     server->Stop();
 }
@@ -3759,9 +3760,11 @@ BOOST_AUTO_TEST_CASE(lane_keeps_the_carried_connection_when_ordinary_work_opened
     std::thread waiter{[&] { (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000}); }};
     BOOST_REQUIRE(gate.AwaitEntered());
     // While the lane carries the connection, ordinary work is not blocked
-    // by the wait and opens its own connection.
+    // by the wait and opens its own connection. Catalog cannot warm it.
+    BOOST_CHECK_EQUAL(client->ActionStatus(market, action.Id(), false).state, "admitted");
+    BOOST_CHECK_EQUAL(validator.Counts()[0], 2U); // Not a coalesced local receipt.
     BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
-    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    BOOST_CHECK_EQUAL(connections.Count(), 3U);
     gate.Release();
     waiter.join();
     std::this_thread::sleep_for(std::chrono::milliseconds{150});
@@ -3770,8 +3773,8 @@ BOOST_AUTO_TEST_CASE(lane_keeps_the_carried_connection_when_ordinary_work_opened
     (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
     BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
     const auto spans{timing.Stop("client_action_wait")};
-    BOOST_CHECK_EQUAL(connections.Count(), 2U);
-    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 2, 1, 3}));
+    BOOST_CHECK_EQUAL(connections.Count(), 3U);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 2, 1, 3}));
     BOOST_REQUIRE_EQUAL(spans.size(), 2U);
     BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
     BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 0U);
@@ -3811,17 +3814,22 @@ BOOST_AUTO_TEST_CASE(lane_hands_back_no_connection_that_an_explicit_reconnect_re
     // An explicit reconnect revalidates trust while the lane carries the
     // connection verified before it: that one is never handed back.
     BOOST_CHECK_EQUAL(client->Reconnect().status, "reachable");
-    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    // Reconnect opens only its fresh catalog session. This genuine ordinary
+    // non-waited read supplies the new session used by the original proof.
+    BOOST_CHECK_EQUAL(client->ActionStatus(market, action.Id(), false).state, "admitted");
+    BOOST_CHECK_EQUAL(validator.Counts()[0], 2U); // Genuine ordinary TLS warm-up.
+    BOOST_CHECK_EQUAL(connections.Count(), 4U);
     gate.Release();
     waiter.join();
-    // Ordinary work keeps the reconnect's connection.
+    // Catalog keeps its fresh reconnect session, distinct from ordinary work.
     BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
     std::this_thread::sleep_for(std::chrono::milliseconds{150});
     // The lane drops what it carried before its next request, then carries
-    // the reconnect's verified connection.
+    // the newly warmed ordinary connection.
     (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
     const auto spans{timing.Stop("client_action_wait")};
-    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 2, 1, 3}));
+    BOOST_CHECK_EQUAL(connections.Count(), 4U);
     BOOST_REQUIRE_EQUAL(spans.size(), 2U);
     BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
     BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 0U);
@@ -4021,7 +4029,7 @@ BOOST_AUTO_TEST_CASE(waited_submit_is_one_request_that_verifies_certified_inclus
     BOOST_CHECK(receipt.certificate_verified);
     BOOST_CHECK_EQUAL(receipt.state, "certified_inclusion");
     BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 0, 1}));
-    BOOST_CHECK_EQUAL(connections.Count(), 1U);
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
     {
         std::lock_guard lock{validator.mutex};
         BOOST_CHECK_EQUAL(validator.waited_submits, 1U);
@@ -4037,10 +4045,11 @@ BOOST_AUTO_TEST_CASE(waited_submit_is_one_request_that_verifies_certified_inclus
     BOOST_REQUIRE_EQUAL(spans.size(), 1U);
     BOOST_CHECK_EQUAL(spans[0]["result"].get_str(), "certified");
     BOOST_CHECK_EQUAL(spans[0]["wait_status"].get_str(), "terminal");
-    // The lane carried the ordinary connection the discovery read opened.
-    BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
-    BOOST_CHECK_EQUAL(spans[0]["tls_handshake_performed"].getInt<uint64_t>(), 0U);
-    BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 1U);
+    // Discovery owns its separate catalog session; this first submission
+    // opens a cold wait-lane session and does not borrow or hand it back.
+    BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 0U);
+    BOOST_CHECK_EQUAL(spans[0]["tls_handshake_performed"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 0U);
     const auto saved{client->SavedActions(action.signer, market)};
     BOOST_REQUIRE_EQUAL(saved.size(), 1U);
     BOOST_CHECK(saved[0].receipt.certificate_verified);
@@ -6679,6 +6688,72 @@ std::unique_ptr<node::FlowMeshHttpsServer> Proxy(const ClientLaneFixture& fixtur
 }
 
 using Watched = std::pair<std::optional<flowmesh::MarketData>, interfaces::FlowMeshMarketWatch>;
+//! A second locally established market whose public label has a real asset-ID
+//! preimage. The lane fixture's arbitrary 0x31 asset cannot have a fabricated
+//! valid display proof. This only indexes a synthetic colored deposit block.
+struct CatalogLabelMarket {
+    modern::AssetDisplayMetadata label{"Catalog Asset", "CAT",
+        {COutPoint{Txid::FromUint256(uint256{uint8_t{0x72}}), 2}, 1'000'000, 6}, {}};
+    uint256 asset, market, vault, config;
+    explicit CatalogLabelMarket(ClientLaneFixture& fixture)
+    {
+        asset = modern::AssetIdV1(fixture.domain, label.proof.issuance_prevout,
+            modern::AssetGenesisCommitment({.max_supply = label.proof.max_supply, .decimals = label.proof.decimals}));
+        market = *flowmesh::ComputeFlowMeshMarketId(fixture.domain, asset);
+        vault = *flowmesh::ComputeFlowMeshVaultId(fixture.domain, market);
+        config = flowmesh::ComputeExecutionConfigId(vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS);
+        const uint256 owner{uint8_t{0x41}};
+        const auto output{modern::MakeDexVaultOutput(asset, 1, vault, modern::VAULT_KIND_USER_DEPOSIT,
+            modern::FlowMeshUserDepositShard(vault, owner), owner)};
+        BOOST_REQUIRE(output);
+        CMutableTransaction transaction;
+        transaction.version = 2;
+        transaction.vout.push_back(*output);
+        LOCK(::cs_main);
+        auto& chainman{*fixture.m_node.chainman};
+        auto& chainstate{chainman.ActiveChainstate()};
+        auto& chain{chainstate.m_chain};
+        const auto& params{chainman.GetConsensus()};
+        CBlock block;
+        block.nVersion = 2;
+        block.hashPrevBlock = chain.Tip()->GetBlockHash();
+        block.nTime = chain.Tip()->nTime + 1;
+        block.nNonce = chain.Height() + 1;
+        block.vtx = {MakeTransactionRef(transaction)};
+        auto* index{chainman.m_blockman.InsertBlockIndex(block.GetHash())};
+        BOOST_REQUIRE(index);
+        index->nHeight = chain.Height() + 1;
+        index->pprev = chain.Tip(); index->nTime = block.nTime; index->BuildSkip();
+        chain.SetTip(*index);
+        auto& seats{chainstate.ModernFnSeats()};
+        auto& vaults{chainstate.ModernFlowMeshVaults()};
+        auto& checkpoints{chainstate.ModernFlowMeshCheckpoints()};
+        seats.BlockConnected(block, *index, params);
+        vaults.BlockConnected(block, *index, params);
+        checkpoints.BlockConnected(block, *index, chain, params, seats.Index(), vaults.Index());
+        BOOST_REQUIRE(seats.Synced(index->GetBlockHash()));
+        BOOST_REQUIRE(vaults.Synced(index->GetBlockHash()));
+        BOOST_REQUIRE(checkpoints.Synced(index->GetBlockHash()));
+        BOOST_REQUIRE(vaults.Index().Market(market));
+    }
+    UniValue Row(const ClientLaneFixture& fixture, const std::string& name,
+                 const uint64_t watch = 1000, const bool ready = true) const
+    {
+        auto row{fixture.MarketRow(std::chrono::milliseconds{500})};
+        row.pushKV("market_id", market.GetHex()); row.pushKV("base_asset_id", asset.GetHex());
+        row.pushKV("vault_id", vault.GetHex()); row.pushKV("execution_config_id", config.GetHex());
+        auto changed{label}; changed.name = name;
+        row.pushKV("asset_display", node::FlowMeshAssetMetadataJson(fixture.domain, asset, changed));
+        row.pushKV("updates_watch_ms_max", watch);
+        row.pushKV("health_api_version", 1);
+        row.pushKV("endpoint_ready", ready);
+        UniValue codes{UniValue::VARR};
+        if (!ready) codes.push_back("catching_up");
+        row.pushKV("endpoint_not_ready", codes);
+        return row;
+    }
+};
+
 Watched WatchRead(node::FlowMeshTradingBackend& client, const uint256& market, std::chrono::milliseconds wait, std::string& error)
 {
     interfaces::FlowMeshMarketWatch watch;
@@ -6865,6 +6940,512 @@ void ProspectiveForegroundReadAdmission(ClientLaneFixture& fixture, const fs::pa
     api->Stop();
 }
 } // namespace
+
+// PRIVATE TEST-FIRST: catalog TLS must not own the client's work gate.
+BOOST_AUTO_TEST_CASE(passive_catalog_tls_leaves_local_status_unsigned_refusal_and_health_available)
+{
+    using namespace std::chrono_literals;
+    LiveMarket live{*this, m_path_root / "catalog-held-service"};
+    // Same service and API port/options as LiveMarket. Enable only the already
+    // qualified health policy; ordinary permits and RPC capacity are unchanged.
+    live.api->Stop();
+    auto options{Options(live.port)};
+    options.request_timeout = 10s; // Existing LiveMarket fixture setting.
+    live.api = node::MakeFlowMeshTradingApi(*live.service, options, {}, {}, {true});
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(live.api->Start(error), error);
+    BOOST_REQUIRE_EQUAL(live.api->Port(), live.port);
+    const auto before{live.service->MarketStatus(market)};
+    BOOST_REQUIRE(before);
+    BOOST_REQUIRE_EQUAL(before->next_sequence, 1U);
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())},
+        m_path_root / "catalog-held-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const uint256 owner{uint8_t{0x43}};
+    std::promise<void> status_calling, submit_calling;
+    auto status_called{status_calling.get_future()}, submit_called{submit_calling.get_future()};
+    std::future<std::vector<interfaces::FlowMeshMarketStatus>> catalog;
+    std::future<interfaces::FlowMeshActionReceipt> status, submit;
+    std::future<node::HttpsRequestResult> health;
+    // All referenced storage precedes the futures. Release is last, so every
+    // assertion/exception unholds the genuine reply before any future joins.
+    struct Release {
+        WatchProxy& proxy;
+        ~Release() { proxy.HoldRead({}); proxy.Hold(false); }
+    } const release{proxy};
+    proxy.HoldRead("markets");
+    catalog = std::async(std::launch::async, [&] {
+        node::FlowMeshClientWorkScope passive{node::FlowMeshClientWorkPriority::PASSIVE,
+                                               node::FlowMeshClientWorkLinger::NONE};
+        return client->Markets(std::nullopt);
+    });
+    BOOST_REQUIRE(proxy.AwaitHeld(1)); // Real markets reply already obtained upstream.
+    BOOST_CHECK(catalog.wait_for(0ms) == std::future_status::timeout);
+    {
+        std::lock_guard lock{proxy.mutex};
+        BOOST_REQUIRE_EQUAL(proxy.methods.size(), 1U);
+        BOOST_CHECK_EQUAL(proxy.methods.front(), "markets");
+    }
+    status = std::async(std::launch::async, [&] {
+        status_calling.set_value();
+        return client->ActionStatus(market, uint256::ONE, false);
+    });
+    flowmesh::Action unsigned_action;
+    unsigned_action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+    unsigned_action.signer = owner;
+    submit = std::async(std::launch::async, [&, unsigned_action] {
+        submit_calling.set_value();
+        // Deliberately UNSIGNED: local authentication must refuse before
+        // retention/signing/send, even once discovery no longer owns work.
+        return client->Submit(market, unsigned_action);
+    });
+    BOOST_REQUIRE(status_called.wait_for(1s) == std::future_status::ready);
+    BOOST_REQUIRE(submit_called.wait_for(1s) == std::future_status::ready);
+    health = std::async(std::launch::async, [&] {
+        return node::FlowMeshHttpsRequest(Endpoint(front->Port()), "/flowmesh/v1",
+            R"({"method":"health","params":{}})", 1s, 1 << 20);
+    });
+    const bool status_ready{status.wait_for(500ms) == std::future_status::ready};
+    const bool submit_ready{submit.wait_for(500ms) == std::future_status::ready};
+    const bool health_ready{health.wait_for(1s) == std::future_status::ready};
+    bool still_held;
+    {
+        std::lock_guard lock{proxy.mutex};
+        still_held = proxy.hold;
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "markets"), 1);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "submit"), 0);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "action"), 0);
+    }
+    proxy.HoldRead({}); proxy.Hold(false); // Before get(), diagnostics or unwinding.
+    const auto rows{catalog.get()};
+    const auto local_status{status.get()}, refused_submit{submit.get()};
+    const auto health_reply{health.get()};
+    BOOST_CHECK(still_held);
+    BOOST_CHECK_MESSAGE(status_ready, "Local-only status waited for passive markets TLS");
+    BOOST_CHECK_MESSAGE(submit_ready, "Unsigned local refusal waited for passive markets TLS");
+    BOOST_CHECK_MESSAGE(health_ready, "Real TLS health did not finish while catalog stayed held");
+    BOOST_CHECK(!local_status.certificate_verified);
+    BOOST_CHECK(local_status.reason.find("No retained local signed object") != std::string::npos);
+    BOOST_CHECK_EQUAL(refused_submit.state, "rejected");
+    BOOST_CHECK_EQUAL(refused_submit.reason, "Local signed action authentication failed");
+    BOOST_REQUIRE_MESSAGE(health_reply.response_received, health_reply.error);
+    BOOST_REQUIRE_EQUAL(health_reply.status, 200);
+    UniValue health_json;
+    BOOST_REQUIRE(health_json.read(health_reply.body));
+    BOOST_CHECK(health_json["ok"].isTrue());
+    BOOST_REQUIRE_EQUAL(rows.size(), 1U);
+    BOOST_CHECK(rows.front().market_id == market);
+    BOOST_CHECK(rows.front().remote && rows.front().available && rows.front().paused);
+    BOOST_CHECK(!rows.front().certificate_verified && !rows.front().account_state_verified);
+    BOOST_CHECK(client->SavedActions(owner, market).empty());
+    BOOST_CHECK_EQUAL(client->Status().pending_actions, 0U);
+    const auto after{live.service->MarketStatus(market)};
+    BOOST_REQUIRE(after);
+    BOOST_CHECK_EQUAL(after->next_sequence, before->next_sequence);
+    BOOST_CHECK(after->last_microblock_hash == before->last_microblock_hash);
+    {
+        std::lock_guard lock{proxy.mutex};
+        BOOST_CHECK_EQUAL(proxy.methods.size(), 2U); // One actual catalog, one actual health.
+        for (const auto* method : {"snapshot", "updates", "submit", "action"})
+            BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), method), 0);
+    }
+    client.reset();
+    front->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(catalog_owner_is_immediate_busy_reconnect_does_not_reset_and_empty_is_success)
+{
+    using namespace std::chrono_literals;
+    CatalogLabelMarket labelled{*this};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(labelled.Row(*this, "Original Catalog"));
+    auto upstream{Serve(validator)};
+    WatchProxy proxy{.upstream = Endpoint(upstream->Port())};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())},
+        m_path_root / "catalog-owner-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto observed{client->Status()};
+    const auto generation{client->MetadataGeneration()};
+    BOOST_REQUIRE(client->Metadata(labelled.asset));
+    std::string held_error, busy_error;
+    std::future<std::vector<interfaces::FlowMeshMarketStatus>> held;
+    std::future<void> competing;
+    struct Release { WatchProxy& proxy; ~Release() { proxy.HoldRead({}); proxy.Hold(false); } } const release{proxy};
+    proxy.HoldRead("markets");
+    held = std::async(std::launch::async, [&] {
+        try { return client->Markets(std::nullopt); }
+        catch (const std::exception& e) { held_error = e.what(); return std::vector<interfaces::FlowMeshMarketStatus>{}; }
+    });
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    competing = std::async(std::launch::async, [&] {
+        try { (void)client->Markets(std::nullopt); }
+        catch (const std::exception& e) { busy_error = e.what(); }
+    });
+    const bool busy_ready{competing.wait_for(500ms) == std::future_status::ready};
+    const auto reconnect{client->Reconnect()};
+    BOOST_CHECK_EQUAL(reconnect.status, "busy");
+    BOOST_CHECK_EQUAL(reconnect.attempted_endpoints, 0U);
+    BOOST_CHECK(!reconnect.endpoint_available);
+    const auto still_current{client->Status()};
+    BOOST_CHECK_EQUAL(still_current.active_endpoint, observed.active_endpoint);
+    BOOST_CHECK_EQUAL(still_current.endpoints.at(0).last_attempt_ms, observed.endpoints.at(0).last_attempt_ms);
+    BOOST_CHECK_EQUAL(client->MetadataGeneration(), generation);
+    BOOST_CHECK(held.wait_for(0ms) == std::future_status::timeout);
+    proxy.HoldRead({}); proxy.Hold(false);
+    competing.get();
+    const auto rows{held.get()};
+    BOOST_CHECK_MESSAGE(busy_ready, "Overlapping catalog waited instead of refusing before transport");
+    BOOST_CHECK(busy_error.find("discovery already in progress") != std::string::npos);
+    BOOST_REQUIRE_MESSAGE(held_error.empty(), held_error);
+    BOOST_REQUIRE_EQUAL(rows.size(), 1U); // Busy Reconnect did not fence this owner.
+    BOOST_CHECK(rows.front().market_id == labelled.market);
+    BOOST_CHECK(!rows.front().certificate_verified && !rows.front().account_state_verified);
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.markets = UniValue{UniValue::VARR};
+    }
+    BOOST_CHECK(client->Markets(std::nullopt).empty()); // Real [] is not busy.
+    BOOST_CHECK(client->Status().endpoints.at(0).available);
+    BOOST_CHECK_EQUAL(client->MetadataGeneration(), generation);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 0, 3}));
+    BOOST_CHECK_EQUAL(client->Status().pending_actions, 0U);
+    client.reset(); front->Stop(); upstream->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(catalog_stale_trust_or_endpoint_observation_cannot_publish_labels_or_hints)
+{
+    using namespace std::chrono_literals;
+    CatalogLabelMarket labelled{*this};
+    for (const int change : {0, 1, 2}) {
+        BOOST_TEST_CONTEXT(change) {
+            ScriptedEndpoint first, second;
+            first.markets.push_back(labelled.Row(*this, "Original Catalog", 1000));
+            second.markets.push_back(labelled.Row(*this, "Second Catalog", 1500));
+            const auto path{m_path_root / fs::PathFromString("catalog-stale-" + std::to_string(change))};
+            const uint256 owner{uint8_t{0x44}};
+            const auto action{ClientConnectFixture::SeedRetainedAction(path, market, owner, domain, config)};
+            first.plain = Receipt(action, "admitted");
+            auto upstream{Serve(first)}, other{Serve(second)};
+            WatchProxy proxy{.upstream = Endpoint(upstream->Port())};
+            auto front{Proxy(*this, proxy)};
+            std::string error, held_error, connect_error;
+            auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman,
+                {Endpoint(front->Port()), Endpoint(other->Port())}, path, error)};
+            BOOST_REQUIRE_MESSAGE(client, error);
+            BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+            const auto generation{client->MetadataGeneration()};
+            {
+                std::lock_guard lock{first.mutex};
+                first.markets = UniValue{UniValue::VARR};
+                first.markets.push_back(labelled.Row(*this, "Stale Catalog", 2000, false));
+            }
+            std::future<std::vector<interfaces::FlowMeshMarketStatus>> held;
+            std::future<bool> configured;
+            struct Release { WatchProxy& proxy; ~Release() { proxy.HoldRead({}); proxy.Hold(false); } } const release{proxy};
+            proxy.HoldRead("markets");
+            held = std::async(std::launch::async, [&] {
+                try { return client->Markets(std::nullopt); }
+                catch (const std::exception& e) { held_error = e.what(); return std::vector<interfaces::FlowMeshMarketStatus>{}; }
+            });
+            BOOST_REQUIRE(proxy.AwaitHeld(1));
+            bool configured_ready{true};
+            if (change < 2) {
+                const auto url{change ? Endpoint(other->Port()).url : Endpoint(front->Port()).url};
+                configured = std::async(std::launch::async, [&, url] { return client->Connect(url, connect_error); });
+                configured_ready = configured.wait_for(500ms) == std::future_status::ready;
+            } else {
+                const auto receipt{client->ActionStatus(market, action.Id(), false)};
+                BOOST_CHECK_EQUAL(receipt.state, "admitted");
+                BOOST_CHECK_EQUAL(first.Counts()[0], 1U); // Genuine new endpoint observation.
+            }
+            const auto newer{client->Status()};
+            proxy.HoldRead({}); proxy.Hold(false);
+            if (change < 2) {
+                BOOST_CHECK_MESSAGE(configured_ready, "Connect configuration waited for catalog TLS");
+                BOOST_REQUIRE_MESSAGE(configured.get(), connect_error);
+                BOOST_CHECK(connect_error.empty());
+            }
+            BOOST_CHECK(held.get().empty());
+            BOOST_CHECK(held_error.find("superseded") != std::string::npos);
+            BOOST_CHECK_EQUAL(client->MetadataGeneration(), generation);
+            const auto label{client->Metadata(labelled.asset)};
+            BOOST_REQUIRE(label);
+            BOOST_CHECK_EQUAL(label->name, "Original Catalog");
+            const auto after{client->Status()};
+            BOOST_CHECK_EQUAL(after.selected_endpoint, newer.selected_endpoint);
+            BOOST_CHECK_EQUAL(after.active_endpoint, newer.active_endpoint);
+            BOOST_CHECK_EQUAL(after.endpoints.at(0).last_attempt_ms, newer.endpoints.at(0).last_attempt_ms);
+            BOOST_CHECK_EQUAL(after.endpoints.at(0).live_updates_ms, 1000U);
+            BOOST_CHECK_EQUAL(after.endpoints.at(0).readiness, "ready");
+            const auto current{client->Markets(std::nullopt)};
+            BOOST_REQUIRE_EQUAL(current.size(), 1U);
+            const auto current_label{client->Metadata(labelled.asset)};
+            BOOST_REQUIRE(current_label);
+            const auto source{change == 1 ? Endpoint(other->Port()).url : Endpoint(front->Port()).url};
+            BOOST_CHECK_EQUAL(current.front().endpoint, source);
+            BOOST_CHECK_EQUAL(current_label->source, "endpoint-label: " + source);
+            BOOST_CHECK_EQUAL(current_label->name, change == 1 ? "Second Catalog" : "Stale Catalog");
+            BOOST_CHECK_EQUAL(first.Counts()[2], 0U);
+            BOOST_CHECK_EQUAL(second.Counts()[2], 0U);
+            BOOST_REQUIRE_EQUAL(client->SavedActions(owner, market).size(), 1U);
+            client.reset(); front->Stop(); upstream->Stop(); other->Stop();
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(catalog_same_path_ca_replacement_refuses_held_reply_and_recovers)
+{
+    CatalogLabelMarket labelled{*this};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(labelled.Row(*this, "Original Catalog"));
+    auto upstream{Serve(validator)};
+    WatchProxy proxy{.upstream = Endpoint(upstream->Port())};
+    auto front{Proxy(*this, proxy)};
+    const auto original_ca{m_path_root / "catalog-original-public-ca.pem"};
+    fs::copy_file(cert, original_ca, fs::copy_options::none);
+    std::string error, held_error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())},
+        m_path_root / "catalog-ca-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto generation{client->MetadataGeneration()};
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.markets = UniValue{UniValue::VARR};
+        validator.markets.push_back(labelled.Row(*this, "Held Changed Catalog", 2000, false));
+    }
+    std::future<void> held;
+    struct Release {
+        WatchProxy& proxy;
+        const fs::path ca, original;
+        ~Release() {
+            proxy.HoldRead({}); proxy.Hold(false);
+            try { fs::copy_file(original, ca, fs::copy_options::overwrite_existing); } catch (...) {}
+        }
+    } const release{proxy, cert, original_ca};
+    proxy.HoldRead("markets");
+    held = std::async(std::launch::async, [&] {
+        try { (void)client->Markets(std::nullopt); }
+        catch (const std::exception& e) { held_error = e.what(); }
+    });
+    BOOST_REQUIRE(proxy.AwaitHeld(1));
+    const auto previous_time{fs::last_write_time(cert)};
+    std::string replacement_pin;
+    HttpsFixture::CreateCertificate(cert, m_path_root / "catalog-replacement-test-key.pem", replacement_pin, true);
+    fs::last_write_time(cert, previous_time);
+    proxy.HoldRead({}); proxy.Hold(false);
+    held.get();
+    BOOST_CHECK(held_error.find("ca-material-changed") != std::string::npos);
+    BOOST_CHECK_EQUAL(client->MetadataGeneration(), generation);
+    BOOST_REQUIRE(client->Metadata(labelled.asset));
+    BOOST_CHECK_EQUAL(client->Metadata(labelled.asset)->name, "Original Catalog");
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 1000U);
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).readiness, "ready");
+    fs::copy_file(original_ca, cert, fs::copy_options::overwrite_existing);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_REQUIRE(client->Metadata(labelled.asset));
+    BOOST_CHECK_EQUAL(client->Metadata(labelled.asset)->name, "Held Changed Catalog");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 0, 3}));
+    client.reset(); front->Stop(); upstream->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(catalog_validates_whole_rowset_before_metadata_readiness_or_advertisement)
+{
+    CatalogLabelMarket labelled{*this};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(labelled.Row(*this, "Original Catalog", 1000));
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())},
+        m_path_root / "catalog-atomic-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto generation{client->MetadataGeneration()};
+    for (const int fault : {0, 1, 2, 3, 4}) {
+        BOOST_TEST_CONTEXT(fault) {
+            UniValue rows{UniValue::VARR};
+            rows.push_back(labelled.Row(*this, "Must Stay Private", 2000, false));
+            if (fault == 0) {
+                auto bad{MarketRow(std::chrono::milliseconds{0})};
+                bad.pushKV("market_id", uint256::ONE.GetHex());
+                rows.push_back(bad); // Unknown LOCAL market after valid row zero.
+            } else if (fault == 1) {
+                rows.push_back(rows[0]); // Duplicate identity rejected before apply.
+            } else if (fault == 2) {
+                rows = UniValue{UniValue::VOBJ};
+            } else if (fault == 3) {
+                for (int i{0}; i < 256; ++i) rows.push_back(rows[0]); // 257 rows.
+            } else {
+                auto bad{MarketRow(std::chrono::milliseconds{0})};
+                bad.pushKV("domain", uint256::ONE.GetHex());
+                rows.push_back(bad); // Known local identity, mismatched status pins.
+            }
+            {
+                std::lock_guard lock{validator.mutex};
+                validator.markets = std::move(rows);
+            }
+            BOOST_CHECK_THROW(client->Markets(std::nullopt), std::runtime_error);
+            BOOST_CHECK_EQUAL(client->MetadataGeneration(), generation);
+            const auto label{client->Metadata(labelled.asset)};
+            BOOST_REQUIRE(label);
+            BOOST_CHECK_EQUAL(label->name, "Original Catalog");
+            const auto status{client->Status()};
+            BOOST_CHECK_EQUAL(status.endpoints.at(0).live_updates_ms, 1000U);
+            BOOST_CHECK_EQUAL(status.endpoints.at(0).readiness, "ready");
+            BOOST_CHECK_EQUAL(status.endpoints.at(0).readiness_market, labelled.market.GetHex());
+            BOOST_CHECK(status.endpoints.at(0).transport_available);
+            BOOST_CHECK_EQUAL(status.endpoints.at(0).retry_after_ms, 0);
+        }
+    }
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.markets = UniValue{UniValue::VARR};
+        auto cosmetic{labelled.Row(*this, "B3", 1500)}; // Reserved invalid LABEL only.
+        validator.markets.push_back(cosmetic);
+    }
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_CHECK_EQUAL(client->MetadataGeneration(), generation);
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 1500U);
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.markets = UniValue{UniValue::VARR};
+        validator.markets.push_back(labelled.Row(*this, "Current Catalog", 2000, false));
+    }
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto current{client->Metadata(labelled.asset)};
+    BOOST_REQUIRE(current);
+    BOOST_CHECK_EQUAL(current->name, "Current Catalog");
+    BOOST_CHECK_EQUAL(current->source, "endpoint-label: " + Endpoint(server->Port()).url);
+    BOOST_CHECK_EQUAL(client->MetadataGeneration(), generation + 1);
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 2000U);
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).readiness, "not_ready");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 0, 8}));
+    client.reset();
+    // A rejected first rowset must publish nothing even when the same call
+    // fails over. Labels identify the ACTUAL responder, not the preferred URL.
+    ScriptedEndpoint fallback;
+    fallback.markets.push_back(labelled.Row(*this, "Fallback Catalog", 1500));
+    auto second{Serve(fallback)};
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.markets = UniValue{UniValue::VARR};
+        validator.markets.push_back(labelled.Row(*this, "Must Stay Private"));
+        auto bad{MarketRow(std::chrono::milliseconds{0})};
+        bad.pushKV("domain", uint256::ONE.GetHex());
+        validator.markets.push_back(bad);
+    }
+    auto failed_over{node::MakeRemoteFlowMeshBackend(*m_node.chainman,
+        {Endpoint(server->Port()), Endpoint(second->Port())}, m_path_root / "catalog-atomic-fallback-client", error)};
+    BOOST_REQUIRE_MESSAGE(failed_over, error);
+    const auto rows{failed_over->Markets(std::nullopt)};
+    BOOST_REQUIRE_EQUAL(rows.size(), 1U);
+    BOOST_CHECK_EQUAL(rows.front().endpoint, Endpoint(second->Port()).url);
+    const auto label{failed_over->Metadata(labelled.asset)};
+    BOOST_REQUIRE(label);
+    BOOST_CHECK_EQUAL(label->name, "Fallback Catalog");
+    BOOST_CHECK_EQUAL(label->source, "endpoint-label: " + Endpoint(second->Port()).url);
+    BOOST_CHECK_EQUAL(failed_over->MetadataGeneration(), 1U);
+    BOOST_CHECK_EQUAL(failed_over->Status().selected_endpoint, Endpoint(server->Port()).url);
+    BOOST_CHECK_EQUAL(failed_over->Status().active_endpoint, Endpoint(second->Port()).url);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 0, 9}));
+    BOOST_CHECK((fallback.Counts() == std::array<unsigned, 4>{0, 0, 0, 1}));
+    failed_over.reset(); second->Stop(); server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(catalog_reconnect_is_fresh_shape_only_counted_and_never_touches_outbox)
+{
+    std::atomic<unsigned> first_requests{0}, second_requests{0};
+    std::atomic<bool> only_markets{true};
+    std::atomic<bool> duplicate{false}, empty{false};
+    auto first_options{Options()}, second_options{Options()};
+    node::FlowMeshHttpsServer first{first_options, [&](const auto& request) {
+        ++first_requests;
+        UniValue parsed;
+        if (!parsed.read(request.body) || parsed["method"].get_str() != "markets") only_markets = false;
+        return node::FlowMeshHttpsServer::Response{200, R"({"ok":false,"error":"Not ready","result":null})"};
+    }};
+    node::FlowMeshHttpsServer second{second_options, [&](const auto& request) {
+        ++second_requests;
+        UniValue parsed;
+        if (!parsed.read(request.body) || parsed["method"].get_str() != "markets") only_markets = false;
+        UniValue row{UniValue::VOBJ}; row.pushKV("market_id", uint256::ONE.GetHex());
+        UniValue rows{UniValue::VARR};
+        if (!empty.load()) rows.push_back(row);
+        if (duplicate.load()) rows.push_back(row);
+        UniValue reply{UniValue::VOBJ}; reply.pushKV("ok", true); reply.pushKV("result", rows);
+        return node::FlowMeshHttpsServer::Response{200, reply.write()};
+    }};
+    ConnectionObservation connections;
+    BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(second, [&](bool nodelay) { connections.Record(nodelay); }));
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(first.Start(error), error);
+    BOOST_REQUIRE_MESSAGE(second.Start(error), error);
+    const auto path{m_path_root / "catalog-reconnect-client"};
+    const uint256 owner{uint8_t{0x45}};
+    const auto action{ClientConnectFixture::SeedRetainedAction(path, market, owner, domain, config)};
+    std::string original_journal;
+    {
+        CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+        BOOST_REQUIRE(db.Read(std::string{"public-client-v1"}, original_journal));
+    }
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman,
+        {Endpoint(first.Port()), Endpoint(second.Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto saved{client->SavedActions(owner, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    const auto probe{client->Reconnect()};
+    BOOST_CHECK_EQUAL(probe.status, "reachable");
+    BOOST_CHECK_EQUAL(probe.attempted_endpoints, 2U);
+    BOOST_CHECK_EQUAL(probe.endpoint, Endpoint(second.Port()).url);
+    BOOST_CHECK(probe.endpoint_available);
+    BOOST_CHECK_EQUAL(first_requests.load(), 1U);
+    BOOST_CHECK_EQUAL(second_requests.load(), 1U);
+    BOOST_CHECK_EQUAL(connections.Count(), 1U);
+    const auto again{client->Reconnect()};
+    BOOST_CHECK_EQUAL(again.status, "reachable");
+    BOOST_CHECK_EQUAL(again.attempted_endpoints, 1U);
+    BOOST_CHECK_EQUAL(connections.Count(), 2U); // Explicit probe did not reuse TLS.
+    duplicate = true;
+    const auto malformed{client->Reconnect()};
+    BOOST_CHECK_EQUAL(malformed.status, "unavailable");
+    BOOST_CHECK_EQUAL(malformed.attempted_endpoints, 2U);
+    BOOST_CHECK(!malformed.endpoint_available);
+    BOOST_CHECK(client->Status().active_endpoint.empty());
+    duplicate = false; empty = true;
+    const auto no_markets{client->Reconnect()};
+    BOOST_CHECK_EQUAL(no_markets.status, "reachable");
+    BOOST_CHECK_EQUAL(no_markets.attempted_endpoints, 1U);
+    BOOST_CHECK(no_markets.endpoint_available);
+    BOOST_CHECK_EQUAL(first_requests.load(), 2U);
+    BOOST_CHECK_EQUAL(second_requests.load(), 4U);
+    BOOST_CHECK_EQUAL(connections.Count(), 4U);
+    BOOST_CHECK_EQUAL(client->MetadataGeneration(), 0U);
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(1).live_updates_ms, 0U);
+    BOOST_CHECK_EQUAL(client->Status().endpoints.at(1).readiness, "unknown");
+    const auto after{client->SavedActions(owner, market)};
+    BOOST_REQUIRE_EQUAL(after.size(), 1U);
+    BOOST_CHECK(after.front().receipt.action_id == action.Id());
+    BOOST_CHECK_EQUAL(after.front().signed_bytes_sha256, saved.front().signed_bytes_sha256);
+    BOOST_CHECK_EQUAL(after.front().signed_bytes_size, saved.front().signed_bytes_size);
+    BOOST_CHECK(after.front().may_have_been_sent && !after.front().previously_certified);
+    BOOST_CHECK(!after.front().receipt.certificate_verified && !after.front().receipt.outcome_verified);
+    BOOST_CHECK(only_markets.load());
+    client.reset();
+    CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+    std::string journal;
+    BOOST_REQUIRE(db.Read(std::string{"public-client-v1"}, journal));
+    BOOST_CHECK_EQUAL(journal, original_journal);
+    UniValue restored; BOOST_REQUIRE(restored.read(journal));
+    BOOST_REQUIRE_EQUAL(restored["actions"].size(), 1U);
+    BOOST_CHECK_EQUAL(restored["actions"][0]["action_id"].get_str(), action.Id().GetHex());
+    BOOST_CHECK_EQUAL(restored["actions"][0]["action_hex"].get_str(), HexStr(*flowmesh::EncodeProductionActionPayload(action)));
+    first.Stop(); second.Stop();
+}
 
 BOOST_AUTO_TEST_CASE(prospective_foreground_signing_market_waits_outside_work_for_passive_other_account)
 {
