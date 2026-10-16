@@ -32,15 +32,20 @@
  * Slice R5 adds the ledger's withdrawal (M2-LED-05) and spot/futures
  * transfers (M2-LED-06; the probe checks both directions), and commitment
  * v1 (M2-LED-02), the liability sum root (M2-LED-03) and exit_value
- * (M2-LED-04).
+ * (M2-LED-04). Slice R6 adds the residual-cross call (M3-ENG-02) and
+ * extends M3-ENG-03 to probe the engine's PriceBandCheck as well.
  */
 
 #include <boost/test/unit_test.hpp>
 
 #include <flowmesh2/core/action.h>
 #include <flowmesh2/core/facts.h>
+#include <flowmesh2/core/market.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/engine/book.h>
+#include <flowmesh2/engine/matcher.h>
+#include <flowmesh2/engine/residual.h>
 #include <flowmesh2/ledger/ledger.h>
 #include <flowmesh2/ledger/state_commitment.h>
 
@@ -239,9 +244,12 @@ BOOST_AUTO_TEST_CASE(checker_detects_bad_entries)
 
 FM2_STUB_CASE(M3_ENG_03, "M3-ENG-03")
 {
+    // Two entry points: the profile switch (R3) and the engine's band check (R6).
     ProfileParams params{RegtestProfile()};
     params.price_band_enabled = true;
-    return Observe(Validate(params));
+    const MarketDescriptor market{AssetId::Native(), AssetId{uint256::ONE}, 1, 1};
+    return FirstDeviation("M3-ENG-03", {Observe(Validate(params)),
+                                        Observe(engine::PriceBandCheck(market, 100, engine::ReferencePrice{market.Id(), 100}))});
 }
 
 FM2_STUB_CASE(M3_ENG_08, "M3-ENG-08")
@@ -329,6 +337,15 @@ FM2_STUB_CASE(M2_LED_03, "M2-LED-03")
 FM2_STUB_CASE(M2_LED_04, "M2-LED-04")
 {
     return Observe(ledger::ExitValue(EmptyRegtestLedger(), AccountId{}, AssetId::Native()));
+}
+
+// ---- Slice R6: engine/residual ----
+
+FM2_STUB_CASE(M3_ENG_02, "M3-ENG-02")
+{
+    const MarketDescriptor market{AssetId::Native(), AssetId{uint256::ONE}, 1, 1};
+    engine::OrderBook book{engine::OrderBook::Create(market).value()};
+    return Observe(engine::ResolveResidualCross(book, {}, {}, RegtestProfile()));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
