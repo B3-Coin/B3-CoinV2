@@ -1,6 +1,6 @@
 # FlowMesh Linux native CI guardrails
 
-Date: 2026-10-16. Profile: `native-guardrails-v10`.
+Date: 2026-10-16. Profile: `native-guardrails-v12`.
 
 This headless Linux profile checks selected native FlowMesh concurrency and
 recovery regressions. Its source and runner controls are prepared; Linux native
@@ -32,7 +32,7 @@ failure fails the job; it does not select an unsanitized fallback.
 
 ## Exact test selection and evidence
 
-The [strict runner](../../ci/check_flowmesh_native_guardrails.py) selects 28 exact
+The [strict runner](../../ci/check_flowmesh_native_guardrails.py) selects 29 exact
 compiled Boost suites. They cover P2P queues, runtime and production storage,
 service startup and policy, HTTPS and client wait/watch paths, request
 scheduling, outcomes and readiness, local admission, health, timing, checkpoint
@@ -128,6 +128,34 @@ reset or refund a budget, alter signed originals or expose an operator flag.
 The pure scheduler case is a complementary contract control, not a substitute
 for either integrated failing-before counterexample. Version 9's completed
 native host result below does not qualify this new source or version 10.
+
+Version 11 preserves those 28 suites in their original order and adds the full
+`flowmesh_sync_tests` suite as the 29th, with one mandatory real indexed-chain
+ancestry case. Four new runtime cases require the ancestry-proved frontier,
+permanent false/throw fallback, catch-up/restart with full startup validation,
+and the default-false older-anchor/MAX-only falsifier. The production ancestry
+translation unit gains the same strict compiler-flag checks; exact hashes of
+`src/flowmesh/deposit.h` and `src/node/flowmesh_anchor.h` join the existing
+admission-header dependency. All earlier required cases, mappings, algorithms,
+time/output bounds, workflow and permissions remain. The implementation and
+fixture correction are frozen at `b8136220` and `c920fcf4`; the v11 checker at
+`2c99c038`. Do not qualify or publish this profile without those prerequisites.
+See the [frontier source/test report](b3-flowmesh-proved-anchor-frontier-20261016.md).
+The v10 500-case result below is historical and does not qualify this successor.
+
+Version 12 adds one exact runtime case for an admitted original whose native
+certificate is deliberately withheld from one replica. The fixture releases
+only the first publisher's exact retained certificate, supplies bounded normal
+250 ms maintenance, and forbids substitute attestations/catch-up. Three new
+literal discovery/execution controls preserve the previous 61 controls, all
+29 suites, algorithms, source/header checks, budgets and workflow permissions.
+This is a fair-maintenance fixture correction and declared packet-loss control,
+not a production timing/rate-limit change or proof of arbitrary-loss progress.
+The first v11 full-suite failure remains in the
+[frontier report](b3-flowmesh-proved-anchor-frontier-20261016.md). Version 12's
+complete native qualification is reported separately below; v10 passes are not
+its qualification. Root ran the 64 stdlib controls once, exit 0 (0.199 seconds);
+the separate reviewer ran the frozen private copy once, exit 0 (0.204 seconds).
 
 Missing prerequisites fail discovery.
 The workflow must contain their reviewed source revisions before qualification;
@@ -411,3 +439,31 @@ latency comparison. Ordinary macOS, linked non-RPC regtest-only poll seam,
 crash-test macros off: not Linux/DEBUG_LOCKORDER/TSan, remote CI, Windows/WAN,
 200 ms, production or release qualification. Earlier v9 and all predecessor
 results retain their own source/binary identities rather than being relabelled.
+
+Version 11's 61 lightweight controls passed once in the separate private
+reviewer context (exit 0, 0.221 seconds) and once against the committed root
+files (exit 0, 0.200 seconds). All 56 previous control methods remain, with
+only the disclosed version/count, added-suite union and expanded-header fixture
+adaptations. Version 11's first complete native host attempt failed an existing
+local-original resumption wait in the runtime suite: P2P 14 passed, runtime
+141 passed/one aborted; the strict runner stopped before the remaining 27 suites.
+Its failure is retained, not replaced by an isolated pass. The later trace
+diagnosis and fixture-only fair-maintenance correction are recorded in the
+[frontier report](b3-flowmesh-proved-anchor-frontier-20261016.md).
+The separate Qt helper/workspace passed 82/362 with three unchanged visual skips.
+That first v11 attempt remains failed. The v12 successor has a separate
+qualification record; controls do not qualify native behavior or Linux/TSan.
+
+Version 12's complete local host selection passed **533 cases in 29 suites**
+once against source `0d119032046da1e1dca557583cb691fd70299ee6`. Actual wrapper
+and every native child exited 0; exact discovered/executed names and counts
+matched, no selected skips, warnings/expected failures, timeouts or output
+overflows. Elapsed functional campaign time: 253.963 seconds. Native SHA256:
+`3c55c0c2544f395e1fa08d034697ee30993125f9514308c4bb54583c99e60a1b`.
+Checker SHA256:
+`7af2bac39d0c8f2e55ab302731ccbf69f8d83330ec1ead0a3c732c5ff0f9a369`.
+The [frontier report](b3-flowmesh-proved-anchor-frontier-20261016.md) discloses
+local archive build-ID metadata, exact source equivalence, the retained v11
+failure and the test-first declared-loss control. Ordinary macOS Release,
+crash hooks off, narrow non-RPC regtest poll seam linked: **not** Linux,
+DEBUG_LOCKORDER/TSan, remote CI, WAN, speed, full V2 or release qualification.

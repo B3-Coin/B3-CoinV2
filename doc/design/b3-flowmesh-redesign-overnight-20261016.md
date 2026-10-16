@@ -10,6 +10,12 @@ The [fair outcome-read successor](b3-flowmesh-outcome-fifo-20261016.md),
 hashes and v10 qualification. Its strict CI controls follow at
 `049d90f2cf44da5894227588c4f05991b19946d2`. These are the successor review
 targets, not the old measured daemon.
+The subsequent [proof-only anchor frontier](b3-flowmesh-proved-anchor-frontier-20261016.md)
+is frozen at `b8136220`, fixture correction `c920fcf4`, CI v11 `2c99c038`.
+Its five focused controls and Qt passed. The retained existing recovery-test
+failure led to a separately reviewed fixture-only maintenance correction and
+strict v12 profile at `0d119032046da1e1dca557583cb691fd70299ee6`.
+The complete native v12 selection passed once, as described below.
 
 ## Outcome, without overstating completion
 
@@ -38,6 +44,7 @@ remain evidence; no history, signing obligation or journal was reset.
 | [Selected final preflight](b3-flowmesh-selected-final-preflight-20261016.md) | An already-approved remote order/cancel/withdraw checks its exact current verified account without rediscovering unrelated Catalog rows | Explicit narrow availability-policy change; no stale-proof fallback, economic retry or bypass of native signing checks |
 | [Transient outcome evidence](b3-flowmesh-outcome-budget-recovery-20261016.md) | Only an exact recognized standalone server BUDGET response can reopen an evidence read after its bounded cooldown | All other terminal failures remain one-shot; never resubmit the economic instruction |
 | [Fair automatic result reads](b3-flowmesh-outcome-fifo-20261016.md) | Included-outcome reads join the same bounded FIFO as unresolved requests; verify each selected owner's authority and return only the caller's card | No larger traffic budget, durable pure-outcome cache, arbitrary-schedule fairness or measured speedup |
+| [Ancestry-proved frontier](b3-flowmesh-proved-anchor-frontier-20261016.md) | Exact immutable ancestry can replace repeated interior canonicality queries, with fresh seat/frontier checks and permanent full-scan fallback | No cached canonical authority, universal bound, history pruning, startup shortcut or lease fix; selected host tests are not production qualification |
 
 Each linked stage identifies its frozen source, counterexamples, actual tests,
 bounded non-author source review and remaining assumptions. This collection is
@@ -48,22 +55,48 @@ not a fresh independent audit of the entire integrated tree or deployment approv
 Final selected-preflight build succeeded. Ordinary local qualification on an
 Apple M4 Max, 16 cores/128 GiB, macOS 26.5.2, AppleClang 17 Release:
 
-- Latest native v10 selection: **500 cases / 28 suites**, all actual children
+- Final native v12 selection: **533 cases / 29 suites**, all actual children
+  exit 0, no selected skips, 253.963 seconds. Source `0d119032`; executable
+  SHA256 `3c55c0c2544f395e1fa08d034697ee30993125f9514308c4bb54583c99e60a1b`.
+- Historical native v10 selection: **500 cases / 28 suites**, all actual children
   exit 0, no selected skips, 227.968 seconds. Earlier v9's 497 cases retain
   their separate historical identity.
 - Complete Qt trading helper: **82 passes**, zero failures/skips.
 - Complete Qt workspace: **362 passes**, zero failures, three unchanged
   opt-in visual skips.
-- Latest v10 runner controls: **56 passes** in separate reviewer/root runs;
+- Historical v10 runner controls: **56 passes** in separate reviewer/root runs;
   these are not native tests or an added combined population.
 - Unchanged isolated models: **446 cases / seven suites** in their separate
   earlier execution. Fixed synthetic membership/authentication and modelled
   assumptions remain; no native V2 integration follows from those passes.
 
+The successor v11's five focused ancestry tests passed. Its complete native
+attempt failed an existing local-original resumption wait: P2P 14 passed;
+runtime 141 passed/one aborted; the strict runner stopped before the other
+27 suites. Qt helper/workspace passed 82/362 with the same three skips.
+The failed runtime is retained, not qualified by an isolated pass. The old
+runtime independently reproduced the same wait failure. Actual trace evidence
+shows a required certificate refused by the unchanged committee rate limit
+while the fixture froze simulated time and supplied no later maintenance.
+The original action had resumed; three replicas committed, the fourth missed
+its final certificate. The bounded fixture-only normal-maintenance correction
+and deterministic declared-loss control passed separate source review. The
+new test's BEFORE failed at its intended final wait (337 assertions passed,
+one failed); AFTER passed 503 assertions, and the existing case passed 295.
+Strict v12 controls passed 64 cases once each in root/reviewer runs. Production
+budgets, timers, quorum and signing rules are unchanged. The full 29-suite
+native v12 selection subsequently passed once against committed `0d119032`:
+533 cases, actual wrapper/every child exit 0, exact discovery/execution equality,
+no selected skips or failure masking. The earlier failure remains.
+
 Functional native and Qt runs overlapped, so elapsed times are not controlled
 performance comparisons. [Linux CI guardrails](b3-flowmesh-native-linux-guardrails-20261016.md)
 are committed locally but have not run remotely. Linux/DEBUG_LOCKORDER/TSan,
 Windows, WAN, practical desktop scaling, sustained load and soak remain open.
+The local scratch archive retains a historical embedded build-ID expansion;
+it is not the final source revision. The frontier report discloses that
+metadata exception and the executable/source hashes. No scratch binary is
+approved for tester distribution or claimed as a fresh Git checkout build.
 
 The one [bounded result-decision experiment](b3-flowmesh-outcome-slice-20261016.md)
 used four generated validators, two TLS endpoints, one engine-off client,
@@ -75,8 +108,14 @@ nearest-rank p50 **1,364.825 ms**, maximum **2,274.240 ms**. The performance fla
 was false. These are not a controlled before/after speed comparison or a
 successful 200 ms campaign.
 That measurement used the old native client `bff8dac1`, before the final
-`f6610edb` fairness correction. No trading-latency campaign was run after it;
-functional regression success is not a measured speedup.
+`f6610edb` fairness correction. A subsequent [one-shot comparison](b3-flowmesh-outcome-fifo-measurement-20261016.md)
+preserved a failed BEFORE arm: all eight burst inclusions, but only four
+verified outcomes before their deadlines. AFTER verified all nine fills,
+follow-up balances and maker conservation, with all five daemons exiting 0.
+Its isolated sample was **294.613 ms** and its complete burst conventional
+median **1,498.190 ms**, maximum **2,491.237 ms**. Both performance flags were
+false; the wrapper retained BEFORE's exit 1. No successful-subset baseline,
+measured speedup, old-timeout cause or sustained reliability is claimed.
 
 The selected capture had zero drops and proved one **local client read-budget
 deferral**, before HTTPS. It did not prove that budgeting caused the whole
@@ -95,8 +134,9 @@ Fast runtime leaves do not yet make the public path independent of chain work:
    wait on the chain. Older public certificate lookup can also use the blocking
    market/store/chain history fallback.
 3. `ProcessTick`/`ProcessMessage` still make chain queries under the market
-   mutex. Anchor checking traverses retained distinct committed anchors;
-   constant-time historical ancestry is not implemented or qualified.
+   mutex. The proof-only frontier conditionally removes repeated interior
+   canonicality queries, but unsupported proofs retain full scans and startup
+   and map memory remain history-sized. It does not remove chain-lock waits.
 4. The [mutation fence](b3-flowmesh-native-mutation-fence-20261016.md) is a tested,
    default-null prerequisite, not a production chain-facts publisher/consumer.
    It does not authorize signing, and finality dirty recovery still permits
@@ -135,6 +175,25 @@ preserved native executable SHA256:
 `003529f3adcfa86282c52120289aaacfe338c6e17ba2d0e9442160e87ced0ff6`.
 Production service/runtime/client were unchanged; this proves a remaining
 dependency, not a completed facade or a normal-load latency measurement.
+
+Focused follow-up inspection found additional public-path dependencies:
+`TradingApi::MarketResponse(MarketData)` calls `Enabled()` and
+`PendingCheckpointStatus()` after the runtime read; these can reach the shared
+registry lock, chain and store. `checkpoint_pending` is always a boolean, not
+an UNKNOWN value. `RemoteBackend::RefreshRead` stamps successful replies fresh;
+an advisory UNKNOWN/paused label alone does not prevent that. Removing only
+the service overlay would therefore not complete isolation.
+
+The proposed next bounded slice is a fully initialized leaf-owned read registry,
+explicit legacy busy refusal through the existing failure envelope, and bounded
+memory-only public certified-entry lookup (`allow_history=false`). It needs a
+reviewed availability contract before implementation. Successful historical
+display requires a separate versioned/opt-in consumer contract that cannot
+renew freshness; no such wire or authority change was silently implemented.
+The [proposed next-stage contract](b3-flowmesh-public-read-contract-20261016.md)
+spells out the remaining response-enrichment, lifetime and legacy-consumer
+dependencies and concrete falsification tests. It is a review artifact, not
+an implemented facade or an accepted new availability policy.
 
 ## Full V2 still needs explicit design and qualification
 
