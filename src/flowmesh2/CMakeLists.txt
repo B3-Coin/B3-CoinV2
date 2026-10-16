@@ -84,9 +84,11 @@ if(BUILD_FLOWMESH2)
   # flowmesh2::ledger. engine/ (slice R6): the order book, the A2 sweep and
   # the residual-cross detection, in namespace flowmesh2::engine; engine.cpp
   # (slice R7): the canonical order, the validity predicate and the slot
-  # phases. Later slices add state/, storage/ and the
-  # other application directories here. fm2_verify never links it (guard
-  # rule 4), and it never links bitcoin_common (guard rule 4).
+  # phases. storage/ (slice R8): record framing, journals, strict commit,
+  # durability tokens and the signer and commit logs, in namespace
+  # flowmesh2::storage; crc32c frames the records. Later slices add state/
+  # and the other application directories here. fm2_verify never links it
+  # (guard rule 4), and it never links bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
     engine/book.cpp
     engine/engine.cpp
@@ -95,10 +97,14 @@ if(BUILD_FLOWMESH2)
     ledger/ledger.cpp
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
+    storage/journal.cpp
+    storage/memory_journal.cpp
+    storage/record.cpp
   )
   target_link_libraries(fm2_core
     PRIVATE
       core_interface
+      crc32c
       fm2_warnings
     PUBLIC
       fm2_types
@@ -125,6 +131,7 @@ if(BUILD_FLOWMESH2)
     test/fee_math_tests.cpp
     test/hashes_tests.cpp
     test/ids_tests.cpp
+    test/journal_tests.cpp
     test/ledger_property_tests.cpp
     test/ledger_tests.cpp
     test/market_tests.cpp
@@ -135,6 +142,7 @@ if(BUILD_FLOWMESH2)
     test/nonce_window_tests.cpp
     test/outcome_tests.cpp
     test/params_tests.cpp
+    test/record_tests.cpp
     test/result_tests.cpp
     test/seat_set_tests.cpp
     test/slot_tests.cpp
