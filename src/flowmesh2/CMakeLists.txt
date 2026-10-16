@@ -86,8 +86,10 @@ if(BUILD_FLOWMESH2)
   # (slice R7): the canonical order, the validity predicate and the slot
   # phases. storage/ (slice R8): record framing, journals, strict commit,
   # durability tokens and the signer and commit logs, in namespace
-  # flowmesh2::storage; crc32c frames the records. Later slices add state/
-  # and the other application directories here. fm2_verify never links it
+  # flowmesh2::storage; crc32c frames the records. state/ (slice R9): the
+  # core state, committed heads, slot candidates, the single-writer state
+  # owner and decision replay, in namespace flowmesh2::state. Later slices
+  # add the other application directories here. fm2_verify never links it
   # (guard rule 4), and it never links bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
     engine/book.cpp
@@ -97,6 +99,7 @@ if(BUILD_FLOWMESH2)
     ledger/ledger.cpp
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
+    state/candidate.cpp
     storage/commit_log.cpp
     storage/file_journal.cpp
     storage/journal.cpp
@@ -126,6 +129,7 @@ if(BUILD_FLOWMESH2)
     test/authority_tests.cpp
     test/body_tests.cpp
     test/book_tests.cpp
+    test/candidate_tests.cpp
     test/canonical_order_tests.cpp
     test/certificate_tests.cpp
     test/codec_tests.cpp
