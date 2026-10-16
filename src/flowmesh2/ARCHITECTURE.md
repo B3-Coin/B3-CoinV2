@@ -22,9 +22,12 @@ commit, durability tokens minted only by `Journal::Confirm`, the signer and
 commit logs, the seat signer and the outbound vote) and slice **R9** (the
 core state, owned committed heads, unforgeable slot candidates with a
 canonical body, the single-writer `StateOwner` with `Preview`, `Reexecute`
-and `Apply`, and `ReplayDecisions` over the commit journal). Everything
-else described here is the contract that the outline slices R10 to R14
-will build.
+and `Apply`, and `ReplayDecisions` over the commit journal) and slice
+**R10** (the chain adapter seam with `CheckBatch`, the capped agreement
+message codecs, the `Agreement` and `SafetyRules` interfaces with the
+PBFT-side stubs, and in `fm2_dev` the REGTEST `FakeChainAdapter` and the
+k = 1 `DevSingleSeatCertifier`). Everything else described here is the
+contract that the outline slices R11 to R14 will build.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
@@ -149,7 +152,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `engine/engine`, `core/state_root` (order leaf), `ledger/state_commitment` (trading state) | R7 | `OrderKey`, `CanonicalOrder`, `SlotPhase`, `PhaseOf`, `ArrivalRank`; `EngineState` (`Genesis`, `Markets`, `OrderLeaves`, `Commit`, slot-boundary `CheckInvariants`); `HeadView`; `SlotInputs`; `ValidateSlotInputs` → `ValidatedSlot` (private constructor); `Engine::Create`, `Engine::ApplySlot` phases 1-6, 8, 9 with outcomes, delta reconciliation and roots; `RestingOrderLeafV0`; `CommitTradingStateV0`, `OrderLeafOf` | `PhaseOf` branches `CANCEL_ALL` (M3-ENG-09), `WITHDRAW` (M2-LED-05), futures transfers (M2-LED-06); `RunFuturesPhase` (M9-FUT-04); residual cross as the certified refusal `REJ_RESIDUAL_CROSS_UNSUPPORTED` (M3-ENG-02) | order seed (M3-ENG-12), caps and the slot fill budget (M3-ENG-04), validity predicate (M4-AGR-11) |
 | `storage/`, `agreement/outbound.h` | R8 | `RecordType`/`JournalRole` registries, framing, `EncodeRecord`, `ScanRecords`; `Journal` (`Append`, `Barrier`, `Status`, `Confirm`, `BarrierObserver`), `MemoryJournal` with a fault plan, `FileJournal::CreateNew` (and the fault seam `CreateNewWithCommitHook`), `JournalCommit`, `JournalDirectoryCommit`, `CommitDirectory`; keys, references and `Pending<T>`; `Durable*` tokens bound to instance, sequence and reference (type landed in R2); `SignerLog` and `CommitLog` with their record codecs and equivocation and idempotency rules; `SeatSigner::Sign(const DurableIntent&)`; `OutboundVote::From(const DurableSignedVote&)` | `FileJournal::OpenExisting`/`ReadAll` and the logs over a journal with history (M4-STO-01), `LogWriter::Start` (M4-STO-02), `SnapshotStore::Write`/`Load` (M4-STO-03), `SignerLog::AppendSignedFolded` (M4-STO-05), `FileJournal::Rollover` and an append past the segment end (M4-STO-06), `AppendViewState`, `AppendNewViewAccepted`, `AppendPreparedQc` (M4-STO-07) | — |
 | `state/` | R9 | `CoreState` and `CoreState::Genesis(profile, markets, seat_set_root)`; `HeadView` (owning: header, certificate hash, `shared_ptr<const CoreState>`); `ParentRef` (`COMMITTED`/`CANDIDATE`); `SlotInputs{authority, anchor, facts_from, facts_to, body}`; `Candidate` (only `BuildCandidate` makes one; canonical body, O-50); `BuildCandidate`, `ReexecuteOn`, `GenesisHead`; `StateOwner::Create`, `Head`, `Preview`, `Reexecute`, `Apply` (single writer, compare-and-swap of the head pointer); `ReplayDecisions`; the decision token names its record's certificate (`storage/tokens.h`) | `Restore` and replay of a `SNAPSHOT_MARK` (M4-STO-03), pipelined `Preview` over a `CANDIDATE` parent (M4-AGR-10), replay of a `PREPARED_QC` (M4-STO-07) | full-state copy in `BuildCandidate` (M2-LED-10) |
-| `chain/`, `agreement/`, `dev/` | R10 | `ChainAdapter` interface; capped message codecs; `Agreement` and `SafetyRules` interfaces; `DevSingleSeatCertifier` (k=1, REGTEST); `FakeChainAdapter` | `PbftSafetyRules` (M4-AGR-01), `PbftAgreement` (M4-AGR-02, also `DevSingleSeatCertifier::OnMessage`), `LeaderSchedule` (M4-AGR-03), `InclusionList` (M4-AGR-04), `RestartFence` (M4-AGR-06), `EvidenceStore` (M4-AGR-07), trusted-facts b3d adapter (MB1-ADP-06), finalized b3d adapter (M7-ADP-01) | — |
+| `chain/`, `agreement/`, `dev/` | R10 | `ChainAdapter` (`Network`, `CurrentAuthority`, `CheckAuthority`, `Poll` → `PollReply` FACTS/BUSY/NEED_DATA/AUTHORITY_CHANGED{rewind_to}, `VerifyAnchor`, `SeatSetAt`), `FactBatch`, `CheckBatch` (O-58); capped codecs of `Proposal`, `Vote`, `ViewChange`, `NewView`, `Evidence` and their `Check*` rules (O-57); `Agreement`, `Decision`, `MessageSink`, `SafetyRules`; `DevSingleSeatCertifier` (k=1, REGTEST, fm2_dev; O-59); `FakeChainAdapter` (REGTEST, fm2_dev: scripted blocks, BUSY, rewinds, seat sets per epoch, authority hooks at named points; O-60) | `PbftSafetyRules` (M4-AGR-01), `PbftAgreement` (M4-AGR-02, also `DevSingleSeatCertifier::OnMessage`), `LeaderSchedule` (M4-AGR-03), `InclusionList` (M4-AGR-04), `RestartFence` (M4-AGR-06), `EvidenceStore` (M4-AGR-07), trusted-facts b3d adapter (MB1-ADP-06), finalized b3d adapter (M7-ADP-01) | — |
 | `read/`, `verify/` | R11 | `SlotView`, `CertifiedEnvelope`, `ReadService`; `VerifyCertificate`, `VerifyOutcome`, `VerifyAccountLeaf`, `VerifyFill`, `VerifyBalanceTransition`, `VerifyExpired` | `VerifyLiabilityPath` (M5-VFY-03), `VerifyCheckpoint` (M8-CKP-01), `VerifyAnchorProof` (M7-ADP-02) | archive (M5-RD-01), v0 tree levels (M2-LED-02) |
 | `admission/`, `dev/dev_budget` | R12 | `Admission` A0..A10, `ActionPool`, `BudgetPolicy`, `UnlimitedDevBudget` | `CreditBudget` (M4-ADM-02), batch verification (M4-ADM-01); `UNSUPPORTED_KIND` refusals (M2-LED-05, M3-ENG-09, M2-LED-06) | — |
 | `net/`, `bridge/`, `futures/`, `governance/` | R13 | `LaneSet`, `ClientApi`, `InProcessApi`, `SeatMesh` interface | HTTPS + SSE (M5-API-01), `Subscribe` (M5-API-02), in-process mesh (M4-SIM-01), TCP mesh (M4-NET-01), short IDs (M4-NET-02), sentry fan-out (M4-NET-03), bridge (M8-BRG-01..03), checkpoint builder (M8-CKP-01), forced exit (M8-EXIT-01), futures (M9-FUT-01..04), governance (M7-GOV-01..03) | — |
@@ -165,10 +168,10 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `fm2_warnings` | INTERFACE: Clang/AppleClang `-Wthread-safety -Werror=thread-safety`; all compilers `-Werror=unused-result` | — |
 | `fm2_types` | `core/` | `core_interface` and, since R4, `secp256k1` (private); `bitcoin_consensus` (`hash.cpp`, `uint256.cpp`, `pubkey.cpp` with `XOnlyPubKey::VerifySchnorr`), `bitcoin_crypto` (SHA-256 and `crypto/bls`) and `bitcoin_util` (public, since R3). Never `bitcoin_common` |
 | `fm2_verify` | `verify/` | `fm2_types`, `bitcoin_crypto` (never `fm2_core`) |
-| `fm2_core` | ledger, engine, state, storage, chain, agreement, admission, read, net, bridge, futures, governance; application code lives in namespaces `flowmesh2::ledger`, `::engine`, `::state`, `::storage` (guard rule 3 matches them); `agreement/` uses `flowmesh2::agreement` | `fm2_types` (public, since R5); `crc32c` (private, since R8: record framing); `flowmesh2_foundations` joins with the slice that needs it (`bitcoin_util` comes through `fm2_types`) |
-| `fm2_dev` | `dev/` (compiled with `FM2_DEV_COMPONENTS`) | `fm2_core` |
+| `fm2_core` | ledger, engine, state, storage, chain, agreement (since R10), admission, read, net, bridge, futures, governance; application code lives in namespaces `flowmesh2::ledger`, `::engine`, `::state`, `::storage` (guard rule 3 matches them); `agreement/` uses `flowmesh2::agreement` and `chain/` `flowmesh2::chain` | `fm2_types` (public, since R5); `crc32c` (private, since R8: record framing); `flowmesh2_foundations` joins with the slice that needs it (`bitcoin_util` comes through `fm2_types`) |
+| `fm2_dev` | `dev/` (since R10: `fake_chain`, `dev_certifier`), namespace `flowmesh2::dev`; `FM2_DEV_COMPONENTS` is defined PUBLIC, and every dev header has `#error` without it | `fm2_core` (public) |
 | `fm2_simlib` | `sim/` | `fm2_dev`, `fm2_core`, `fm2_verify`, `bitcoin_common` (for `CKey` only) |
-| `test_flowmesh2` | `test/` | all of the above, `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files and, since R8, `FM2_TEST_TMP_DIR` (`<build>/fm2-test-tmp`) for the file journal's temporary directories; global fixture `ECC_Context` (`test/main.cpp`) |
+| `test_flowmesh2` | `test/` | all of the above (`fm2_dev` since R10), `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files and, since R8, `FM2_TEST_TMP_DIR` (`<build>/fm2-test-tmp`) for the file journal's temporary directories; global fixture `ECC_Context` (`test/main.cpp`) |
 | `fm2_sim_cli` | binary `fm2-sim` | `fm2_simlib` |
 | `fm2_canary_*` | sanitizer canaries | only with `FLOWMESH2_SANITIZER_CANARIES=ON` |
 | `fm2_all` | custom target: every fm2 library and executable that is built by default | — |
@@ -241,7 +244,20 @@ header marked *landed* is normative; the others are the target contract.
 | `state/state_owner.h` | R9 | landed | `StateOwner::Create(profile, genesis, commit_journal_instance)` (genesis heads only: `OWNER_NOT_GENESIS`, `OWNER_PROFILE_MISMATCH`, `OWNER_SEAT_SET_MISMATCH`, `OWNER_STATE_ROOT_MISMATCH`), `Head`, `Preview` (stub M4-AGR-10 for a CANDIDATE parent; `PARENT_KIND_UNKNOWN`; STALE_PARENT), `Reexecute`, `Apply` (STALE_PARENT, VERIFY_FAILED `TOKEN_OTHER_LOG`/`DECISION_OTHER_HEADER`, AUTHORITY_CHANGED `AUTHORITY_SUPERSEDED`, then compare-and-swap), `Restore` (stub M4-STO-03); the Mutex guards the head pointer only |
 | `state/replay.h` | R9 | landed | `ReplayDecisions(genesis, records)` → `ReplayResult{slots, head, duplicate_decisions, duplicate_applied}`; `ReplayedSlot{header, cert_hash, decision_seq, applied_seq}`; `REPLAY_*` details; stubs for `SNAPSHOT_MARK` (M4-STO-03) and `PREPARED_QC` (M4-STO-07) |
 | `test/util/state_fixtures.h` | R9 | landed | TEST fixtures: `TestSeatSetRoot`, `TestAuthority`, `TestGenesisHead` (the R7 `SlotFixture` genesis), `RequireFailure`, `FundingFacts`, `CandidateFixture` (BuildCandidate by hand), `TestCertificate` (seat 0, unsigned aggregate, `variant`), `NewCommitJournal`, `OwnerFixture` (a `StateOwner` with its own commit journal and log; `Commit` = DECISION, B-DECISION, Confirm, Apply, APPLIED, B-APPLIED, Confirm; `after_decision` hook), `RunWalkingSkeleton` (section 14.2 slots 1-5) and `CheckWalkingSkeletonFinalState` (section 14.3) |
-| `chain/*.h`, `agreement/*.h`, `dev/*.h` | R10 | target | sections 3, 8 |
+| `chain/chain_adapter.h` | R10 | landed | `ChainAdapter` (`Network`, `CurrentAuthority`, non-virtual `CheckAuthority` → AUTHORITY_CHANGED `CHAIN_AUTHORITY_CHANGED`, `Poll(after, max_facts)` → `PollReply`, `VerifyAnchor`, `SeatSetAt`); `PollStatus` (FACTS=1, BUSY=2, NEED_DATA=3, AUTHORITY_CHANGED=4, append-only); `PollReply` (factories only; `Batch()` iff FACTS, `RewindTo()` iff AUTHORITY_CHANGED); `FactBatch{from, to, anchor, authority, facts}`; `CheckBatch` (`BATCH_*`, O-34, O-58); `ANCHOR_*`, `SEAT_SET_UNKNOWN_EPOCH` |
+| `chain/b3d_adapter.h` | R10 | landed (stubs) | `B3dAdapterConfig{min_depth}`; `B3dTrustedFactsAdapter::Create` (UNSUPPORTED_NETWORK unless REGTEST, then MB1-ADP-06); `B3dFinalizedAdapter::Create` (M7-ADP-01) |
+| `agreement/messages.h` | R10 | landed | `MessageType` (PROPOSAL=1 .. EVIDENCE=5) and `EvidenceKind` (DOUBLE_VOTE=1, CONFLICTING_CERTIFICATES=2) registries, append-only; `Proposal`, `Vote` (≤ 32 `ShortId`s), `PreparedCert`, `ViewChange`, `NewView` (≤ `MAX_SEATS` reports), `CertifiedHeader`, `DoubleVote`, `ConflictingCertificates`, `Evidence`, `Message`; `EncodeMessage`/`DecodeMessage` (exact, capped, per-type maximum, `MaxMessageBytes`); `CheckProposal`, `CheckVote`, `CheckViewChange`, `CheckNewView`, `CheckEvidence` (O-57) |
+| `agreement/agreement.h` | R10 | landed | `Decision{DurableDecision, certificate, body}` (move-only); `MessageSink::Send`; `Agreement` (`Propose(candidate, authority)`, `OnMessage`, `OnTimeout(now_ms)`, `TakeDecision`) |
+| `agreement/safety.h` | R10 | landed | `SafetyRules` (`MayPrepare`, `MayCommit(proposal, PreparedCert)`, `OnViewChange`) |
+| `agreement/pbft.h` | R10 | landed (stubs) | `PbftSafetyRules` (M4-AGR-01); `PbftConfig{self_seat, view_timeout_floor_ms = 50}`; `PbftContext{adapter, owner, signer, signer_log, commit_log, safety, sink}`; `PbftAgreement::Create` (M4-AGR-02) |
+| `agreement/leader.h` | R10 | landed (stub) | `TERM_SLOTS` = 8 (PROVISIONAL, D11); `SlowSet`; `LeaderSchedule::LeaderFor(authority, term, slow)` (M4-AGR-03) |
+| `agreement/inclusion.h` | R10 | landed (stubs) | `INCLUSION_AGE_SLOTS` = 2; `HeldAction`; `InclusionList::Build`, `Check` (M4-AGR-04) |
+| `agreement/restart_fence.h` | R10 | landed (stub) | `HighWaterStatement`, `FencePoint`; `RestartFence::Collect` (M4-AGR-06) |
+| `agreement/evidence.h` | R10 | landed (stubs) | `EvidenceStore::Record`, `Load` (M4-AGR-07) |
+| `dev/fake_chain.h` | R10 | landed | DEV ONLY (`#error` without `FM2_DEV_COMPONENTS`): `FakeChainAdapter::Create(network, authority, seats, base)` (REGTEST only), `AppendBlock`, `QueueBusy`, `BumpAuthority`, `Rewind`, `BumpAt(HookPoint, occurrence, seats)`, `JournalHook()`, `Tip`, `Start`, `End`, `Reached`; `HookPoint` (POLL=1, SIGNER_BARRIER_START/END=2/3, COMMIT_BARRIER_START/END=4/5); `FAKE_*` (O-60) |
+| `dev/dev_certifier.h` | R10 | landed | DEV ONLY: `DevSingleSeatCertifier::Create(profile, adapter, seats, signer, signer_log, commit_log)` (Validate, REGTEST adapter, k = 1, the seat's key), `Propose` (section 7.3 order; O-59), `OnMessage` (`Unsupported(M4-AGR-02)`), `OnTimeout` (no effect), `TakeDecision` (once), `Seats`; `DEV_*` |
+| `test/util/agreement_fixtures.h` | R10 | landed | TEST fixtures: `TestSeats(names)` (BLS IKM `SHA256("fm2/test/seat/<name>")`, PoP-verified), `SeatAuthority`, `BlockHash`, `DepositAtCursor`, `TeeObserver`, `RigOptions`, `AgreementRig` (profile, seats, fake chain over `TestAnchor(129)`, signer and commit memory journals observed by a `RecordingObserver` and the fake's hook, both logs, seat 0's signer, a two-market genesis and its `StateOwner`; `Inputs`, `Preview`) |
+| `test/util/require.h` | R10 | landed | `RequireStub`, shared by `ledger_fixtures.h` and `storage_fixtures.h` (both defined it, so no test could include both; reported in R9) |
 | `read/*.h`, `verify/b3verify.h` | R11 | target | section 10.2 |
 | `admission/*.h`, `dev/dev_budget.h` | R12 | target | section 10.1 |
 | `net/*.h`, `bridge/*.h`, `futures/*.h`, `governance/*.h` | R13 | target | section 2.1 |
@@ -339,7 +355,7 @@ header marked *landed* is normative; the others are the target contract.
 | `ReadService` | archive mutex | slot-view index | lookup or insert; never I/O (REAL-REPLACE M5-RD-01 removes it from reads) |
 | each `Journal` | `m_mutex` | buffer, `seq`, `durable_seq`, fatal flag | append; `Barrier` copies the target `seq`, releases the lock, runs the commit, then re-locks to record the result |
 | `InProcessApi` | `m_mutex` | reply map | map operations |
-| `FakeChainAdapter` (dev) | `m_mutex` | scripted batches, authority | scripted reads |
+| `FakeChainAdapter` (dev) | `m_mutex` | chain, authority, seat sets, BUSY queue, pending rewind, hooks (R10) | each method; never across a call into another object; `JournalHook` callbacks take it on the barrier thread, which holds no journal lock |
 | C1 `BoundedMailbox`, `ReadSlot` | internal | as C1 | as C1 |
 
 In the outline, barriers on one journal are issued by one thread (the sealing
@@ -504,6 +520,16 @@ view change are allowed.
 | **B-DECISION** | commit | `DECISION{header, cert, body}` | `Apply` and any report of the slot | `DurableDecision` |
 | **B-APPLIED** | commit | `APPLIED{slot, state_root}` | read publication and pool terminal statuses | `DurableApplied` |
 
+As landed in R10, `DevSingleSeatCertifier::Propose` runs exactly this
+order: authority check 1, `ACCEPTED_PROPOSAL` and the COMMIT `INTENT` (view
+0, `CommitDigest`), B-INTENT and `Confirm`, authority check 2,
+`SeatSigner::Sign`, `SIGNED_VOTE`, B-VOTE and `Confirm`, the certificate
+from the `OutboundVote` (bitmap `0x01`, checked with `FastAggregateVerify`),
+`DECISION`, B-DECISION and `Confirm`. Before any of it, a fatal signer or
+commit journal is `FENCED`, so a fenced node writes no new
+`ACCEPTED_PROPOSAL` or `INTENT` (N10). The caller applies the decision
+(check 3) and writes `APPLIED` (O-59).
+
 Full PBFT (M4-AGR-02) adds proposal and prepare-phase barriers (the plan's
 "strict 9"). Group commit (M4-STO-02) may cover several records with one
 barrier but never lets a token exist before its barrier. Folded signing
@@ -602,6 +628,16 @@ Three checks per slot (CONS-10 requires both signing and commit to check):
 | 1 | before `ACCEPTED_PROPOSAL` | `AUTHORITY_CHANGED`; nothing written |
 | 2 | after B-INTENT, immediately before `Sign` | `AUTHORITY_CHANGED`; the `INTENT` is durable but no signature exists; another digest for the same key stays refused |
 | 3 | `Apply`: the header's `AuthorityVersion` against the current one (as landed in R9 the whole version: epoch, seat set root and profile hash, O-53) | `AUTHORITY_CHANGED`; head unchanged; the node fences admission and sealing |
+
+As landed in R10 (`chain/chain_adapter.h`): `CheckAuthority` is a
+non-virtual comparison of the whole `AuthorityVersion` with
+`CurrentAuthority()`. `Poll` answers a `PollReply`, not an `Error`, for
+FACTS, BUSY, NEED_DATA and AUTHORITY_CHANGED, because an `Error` cannot
+carry the rewind cursor (O-58); errors are misuse and stubs. A batch covers
+`[from, to)` completely and passes `CheckBatch`. The fake adapter bumps the
+epoch on `BumpAuthority`, on every `Rewind` (it cannot know the consumer's
+anchor) and from an armed hook at a named point, which is how the R10 tests
+change the authority before `Propose` and during B-INTENT (O-60).
 
 This narrows the sign-versus-reorg window. It is **not** a proof. [CC]
 boundary 6 requires the linearization to be proved before native signing
@@ -957,11 +993,13 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R9)
+### 13.1 Today (after R10)
 
 The commands in 13.2 work. They build every fm2 target (`fm2_all`): the
 libraries `fm2_types` and `fm2_core` (since R5; `engine/` since R6,
-`engine/engine` since R7, `storage/` since R8, `state/` since R9), `test_flowmesh2` (326 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
+`engine/engine` since R7, `storage/` since R8, `state/` since R9, `chain/`
+and `agreement/` since R10), `fm2_dev` (since R10), `test_flowmesh2`
+(370 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
 19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
 `flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
 and `flowmesh2_negative_compile` (Clang). The outline never uses `build/`,
@@ -1308,6 +1346,12 @@ outline does not resolve on its own.
 | O-54 | Where the slot-boundary invariants are checked, and how a conservation failure is injected | `StateOwner::Create` accepts only a genesis head and checks its profile, seat set and state root, but does not re-run `EngineState::CheckInvariants`: the engine refuses a parent with held fees and checks every invariant on every candidate (phase 9), so a broken state can never produce a candidate. The ledger's API cannot break sum conservation (every operation is atomic and conserving), so the R9 test injects a phase-9 failure through a doctored genesis instead: a reservation that no resting order holds, and fees withheld but never distributed. Both give INVARIANT and no candidate. A restored head (M4-STO-03) must be checked by `Restore` |
 | O-55 | Replay rules the slice text leaves open | `ReplayDecisions` takes a genesis base and the whole journal (records numbered from 1; a snapshot base is M4-STO-03); duplicates are recognised by header equality, so a repeated DECISION with another certificate is a duplicate and the first certificate counts (as in the commit log); an APPLIED is checked against the replayed slot and must come in increasing slot order, a repeat is skipped; a missing APPLIED is reported, not refused. Replay is pure and returns the head; it installs nothing |
 | O-56 | Shapes beyond the slice text | `Candidate` is a class with a private constructor (only `BuildCandidate` makes one) and read-only accessors, so `Apply` can only ever install a state the engine computed from the owner's head; `HeadView` is a class built by `Make` (non-null state, cached header hash); `ParentRef` has a `kind`, so the pipelining stub is explicit rather than inferred from heights. `StateOwner::Create` returns a `unique_ptr` (the owner holds a Mutex). `GenesisHead` and `ReexecuteOn` are free functions so replay can run without an owner |
+| O-57 | Agreement message shapes the slice text leaves open | R10 follows the slice text: `Proposal{epoch, view, header, parent_cert, body}`, `Vote{phase, epoch, view, slot, header_hash, seat, sig96, ≤ 32 short IDs}`. It chooses: a proposal carries no leader signature (the seat session authenticates it, M4-NET-01; PROTOCOL.md wants signed proposals inside NEW_VIEW justifications); a vote names the header hash while its signature covers the phase digest (`CommitDigest` for COMMIT; the PREPARE digest is M4-AGR-02's), so a receiver needs the header; the inclusion IDs are not covered by the vote signature (M4-AGR-04 decides); a `PreparedCert` reuses `SlotCertificate` plus a view; `ViewChange{epoch, slot, new_view, seat, prepared?, sig}`; `NewView{epoch, slot, view, seat, selected, reports, sig}`; two evidence kinds. Structural rules beyond the slice text (`Check*`): no genesis-height proposal or vote; proposal epoch = header epoch; a parent certificate iff the header names one, matching it; inclusion IDs only on PREPARE votes, strictly ascending; a preparation only from below the target view; NEW_VIEW reports for its (epoch, slot, view) from strictly ascending seats, `selected` = the header prepared in the highest view, and two headers prepared in that view refused; evidence in ascending header-hash order. Encoders refuse anything the decoders refuse. M4-AGR-02 rules all of it |
+| O-58 | Poll replies and adapter-side fact checks | `Poll` returns `PollReply` for FACTS, BUSY, NEED_DATA and AUTHORITY_CHANGED{rewind_to} (an `Error` cannot carry the cursor); `PollStatus` is append-only. `CheckBatch` (real) is the contract every adapter's batch must pass, including O-34's adapter duty: a zero deposit, a deposit to a protocol account of the batch's profile, and one outpoint twice in a batch are refused; the fake adapter also refuses an outpoint repeated anywhere on its chain. Still ledger errors, not batch rules: a repeat across batches from a real adapter, cumulative deposits above 2^62 and a 257th asset (M2-LED-07) |
+| O-59 | Dev certifier details beyond the slice text | `Create` also runs `Validate(profile)` and refuses a signer whose key is not the seat's. `Propose` first refuses: a fatal signer **or** commit journal (`FENCED`; this is what keeps N10's "no new `ACCEPTED_PROPOSAL` or `INTENT`" after a failed commit barrier), an untaken decision (`ORDER_VIOLATION`, one slot in flight), an authority that is not the candidate header's and a candidate of another seat set (`INVALID_INPUT`). The certificate aggregate is `AggregateSignatures` of the one share, and the certifier checks it with `FastAggregateVerify` over `CommitDigest` before writing `DECISION` (`INVARIANT` otherwise). `OnTimeout` is `Ok` with no effect (with one seat `Propose` decides or fails synchronously); `OnMessage` is `Unsupported(M4-AGR-02)` |
+| O-60 | Fake chain semantics | One consumer. Every block is final; a batch is anchored at the tip and, when cut by `max_facts`, ends right after its last fact. `Rewind` always bumps the epoch and keeps answering AUTHORITY_CHANGED{rewind_to} until the consumer polls from a cursor at or before `rewind_to`. Hooks count from arming and fire once. At most `MAX_SLOT_FACTS` facts per block. Anchors below the base are never verifiable. REGTEST only; dev symbols never reach `fm2_core` (guard rule 3; checked with `nm` in the R10 evidence) |
+| O-61 | How "another digest for the same (slot, view)" is refused | The signer log binds a COMMIT intent to its proposal's `CommitDigest`, so through the certifier a second digest for one (epoch, slot, view 0) is refused one step earlier, at `ACCEPTED_PROPOSAL` (`EQUIVOCATION_REFUSED`, `PROPOSAL_CONFLICT`). Epochs never fall, so after a bump during B-INTENT the test reaches that key with a second certifier over the same logs whose adapter never saw the bump; the same candidate under the old authority is refused at check 1, and under the new epoch the slot is a new `VoteKey` and is certified |
+| O-62 | Interfaces beyond the slice text | `MessageSink` (the outbound port R13's mesh implements); `PbftConfig` and `PbftContext` for `PbftAgreement::Create` (which returns `unique_ptr<Agreement>`; `PbftAgreement` has no instances in the outline); `SlowSet` and `TERM_SLOTS`; `HeldAction` and `INCLUSION_AGE_SLOTS`; `HighWaterStatement` and `FencePoint`; `B3dAdapterConfig`; the b3d factories return `unique_ptr<ChainAdapter>` and are not `ChainAdapter` subclasses yet; the trusted-facts factory refuses non-REGTEST before its stub. The guard lists are unchanged: `fm2_dev` is not in rule 3's node-symbol list or rule 4's link list (M0-AUD-01 may add it). `test/util/require.h` resolves the `RequireStub` clash reported in R9 |
 
 ---
 

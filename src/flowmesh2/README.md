@@ -117,7 +117,16 @@ installs a candidate only under a `DurableDecision` of its commit journal
 and the current authority, and `ReplayDecisions`, which rebuilds every
 header and the final state from the commit journal; restoring a head,
 pipelined previews and the snapshot and view-state records are typed
-stubs. Nothing is linked into the node, wallet or Qt.
+stubs; and **R10**, the chain adapter seam in `chain/` (`Poll` answers
+facts, BUSY, NEED_DATA or AUTHORITY_CHANGED with a rewind cursor, and every
+batch must pass `CheckBatch`), the capped agreement messages and the
+`Agreement` and `SafetyRules` interfaces in `agreement/`, and the new
+REGTEST-only `fm2_dev` library with a scripted fake chain and the k = 1
+dev certifier, which writes `ACCEPTED_PROPOSAL`, `INTENT`, `SIGNED_VOTE`
+and `DECISION` in barrier order with both authority checks; PBFT, the
+leader schedule, inclusion lists, the restart fence, the evidence store
+and the b3d adapters are typed stubs. Nothing is linked into the node,
+wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -129,8 +138,8 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R9: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 326 cases, `flowmesh2_inventory`,
+Expected after R10: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 370 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
 `flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`
 with four controls). The file journal tests write only under
