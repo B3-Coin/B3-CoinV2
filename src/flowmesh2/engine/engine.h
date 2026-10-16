@@ -6,21 +6,33 @@
 #define B3_FLOWMESH2_ENGINE_ENGINE_H
 
 #include <flowmesh2/core/action.h>
+#include <flowmesh2/core/authority.h>
+#include <flowmesh2/core/body.h>
+#include <flowmesh2/core/facts.h>
 #include <flowmesh2/core/ids.h>
+#include <flowmesh2/core/market.h>
+#include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/core/slot.h>
+#include <flowmesh2/core/state_root.h>
+#include <flowmesh2/engine/book.h>
+#include <flowmesh2/ledger/ledger.h>
 #include <uint256.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 /** The slot engine of FlowMesh V2 (slice R7; ARCHITECTURE.md sections 3 and
  * 11; plan section 3.5). PROVISIONAL REGTEST (D4, D5, D6, D7).
  *
- * This part: the canonical order of a slot's originals and the phase each
- * action kind executes in.
+ * Contents: the canonical order of a slot's originals, the phase each
+ * action kind executes in, the trading state the engine transforms
+ * (EngineState) and its parent head (HeadView), and the slot validity
+ * predicate (ValidateSlotInputs), whose only product is a ValidatedSlot.
  *
  * Canonical order (O-4, O-4b). The originals of a slot at height h whose
  * parent header hash is p are first sorted by
@@ -111,6 +123,226 @@ Result<SlotPhase> PhaseOf(const ActionV2& action);
  * at a versioned height (M7-GOV-03) must keep the ranks increasing.
  */
 Result<uint64_t> ArrivalRank(uint64_t height, SlotPhase phase, uint64_t rank, uint32_t max_actions_per_slot);
+
+// ---- The trading state and the parent head -----------------------------------
+
+/** The trading state the engine transforms: the shared spot ledger
+ * (ledger/ledger.h) and one book per market (engine/book.h). A value type
+ * with no lock: the single writer (state/StateOwner, R9) copies it into a
+ * candidate, Engine::ApplySlot mutates the copy, and the result is published
+ * immutably. Markets are fixed at genesis (D6; listings are M7-GOV-01).
+ */
+struct EngineState {
+    ledger::LedgerState ledger;
+    BookSet books;
+
+    /** The state at genesis: LedgerState::Create(profile) and one empty book
+     * per market (BookSet::Create); their errors propagate.
+     */
+    static Result<EngineState> Genesis(const ProfileParams& profile, std::span<const MarketDescriptor> markets);
+
+    //! Every market, ascending MarketId.
+    std::vector<MarketDescriptor> Markets() const;
+    //! Every resting order as its commitment leaf: ascending MarketId, then book order.
+    std::vector<RestingOrderLeafV0> OrderLeaves() const;
+    //! State commitment v0: ledger::CommitTradingStateV0(ledger, Markets(), OrderLeaves()).
+    Result<StateRootsV0> Commit() const;
+
+    /** The invariants that hold at every slot boundary; INVARIANT if one
+     * fails (engine phase 9 checks them before any candidate exists):
+     * 1. ledger conservation (LedgerState::CheckConservation, O-31);
+     * 2. every book's invariants and no OrderId in two books;
+     * 3. no fees held: phase 8 distributed every withheld fee (O-31);
+     * 4. every resting order's owner is a trading account (not a protocol
+     *    account), and for every (account, asset) the ledger's reserved
+     *    balance equals the sum of reserved_left of that account's resting
+     *    orders holding that asset: nothing is reserved for anything else;
+     * 5. every account's open-order count equals its resting orders.
+     */
+    Result<void> CheckInvariants() const;
+
+    friend bool operator==(const EngineState&, const EngineState&) = default;
+};
+
+/** A committed head as the engine reads it: the parent header and the state
+ * after it. Non-owning: the caller keeps both alive while it uses the view
+ * (the state owner, R9, holds them in one immutable snapshot, so a reader
+ * never sees a header with another head's state). Temporaries are refused
+ * at compile time. HeaderHash() is header.Hash(), computed once.
+ */
+class HeadView
+{
+public:
+    HeadView(const SlotHeaderV2& header, const EngineState& state) : m_header{&header}, m_state{&state}, m_hash{header.Hash()} {}
+    HeadView(SlotHeaderV2&&, const EngineState&) = delete;
+    HeadView(const SlotHeaderV2&, EngineState&&) = delete;
+    HeadView(SlotHeaderV2&&, EngineState&&) = delete;
+
+    const SlotHeaderV2& Header() const { return *m_header; }
+    const EngineState& State() const { return *m_state; }
+    const uint256& HeaderHash() const { return m_hash; }
+
+private:
+    const SlotHeaderV2* m_header;
+    const EngineState* m_state;
+    uint256 m_hash;
+};
+
+// ---- The slot validity predicate ----------------------------------------------
+
+/** What a proposer puts into the slot that follows a parent: everything the
+ * certified header carries except the parent link (from the HeadView), the
+ * authority epoch and seat set (the state owner's, R9) and the commitments
+ * (which follow from executing the slot).
+ */
+struct SlotInputs {
+    uint256 domain;        //!< DomainHash of the network; equal to the parent's
+    uint256 profile_hash;  //!< ProfileHash; equal to the parent's and the profile's
+    Anchor anchor;         //!< the B3 block the slot is anchored to
+    FactCursor facts_from; //!< equal to the parent's facts_to
+    FactCursor facts_to;   //!< end of the consumed fact range (exclusive)
+    SlotBody body;         //!< canonical fact bytes in cursor order; exact original action bytes in proposal order
+
+    friend bool operator==(const SlotInputs&, const SlotInputs&) = default;
+};
+
+//! The decoded payload of an action kind the outline executes.
+using ActionPayload = std::variant<PlacePayload, CancelPayload, TransferPayload>;
+
+//! One validated original: the verified action, its decoded payload and its phase.
+struct SlotAction {
+    VerifiedAction action;
+    ActionPayload payload;
+    SlotPhase phase;
+};
+
+// Static details of ValidateSlotInputs' refusals (code INVALID_INPUT), in
+// precedence order. Tests and later slices compare them; they are not
+// certified data.
+inline constexpr std::string_view SLOT_PROFILE_MISMATCH{"slot profile mismatch"};
+inline constexpr std::string_view SLOT_DOMAIN_MISMATCH{"slot domain mismatch"};
+inline constexpr std::string_view SLOT_HEIGHT_EXHAUSTED{"parent height has no successor"};
+inline constexpr std::string_view SLOT_ANCHOR_BELOW_PARENT{"anchor below the parent's anchor"};
+inline constexpr std::string_view SLOT_ANCHOR_FORK{"anchor at the parent's height with another hash"};
+inline constexpr std::string_view SLOT_FACTS_NOT_CONTIGUOUS{"facts not contiguous with the parent's facts_to"};
+inline constexpr std::string_view SLOT_FACTS_REVERSED{"facts_to before facts_from"};
+inline constexpr std::string_view SLOT_FACTS_BEYOND_ANCHOR{"fact range beyond the anchor"};
+inline constexpr std::string_view SLOT_FACT_COUNT_CAP{"more facts than MAX_SLOT_FACTS"};
+inline constexpr std::string_view SLOT_FACT_BYTES_CAP{"fact longer than MAX_FACT_BYTES"};
+inline constexpr std::string_view SLOT_ACTION_COUNT_CAP{"more originals than max_actions_per_slot"};
+inline constexpr std::string_view SLOT_ACTION_BYTES_CAP{"original longer than the action byte cap"};
+inline constexpr std::string_view SLOT_FACT_MALFORMED{"fact does not decode"};
+inline constexpr std::string_view SLOT_FACT_KIND{"fact kind the engine does not apply"};
+inline constexpr std::string_view SLOT_FACT_CURSOR{"fact cursor outside the range or out of order"};
+inline constexpr std::string_view SLOT_DEPOSIT_REFUSED{"deposit fact the ledger would refuse"};
+inline constexpr std::string_view SLOT_ACTION_MALFORMED{"original does not decode"};
+inline constexpr std::string_view SLOT_ACTION_DOMAIN{"action domain mismatch"};
+inline constexpr std::string_view SLOT_ACTION_KIND{"unsupported action kind"};
+inline constexpr std::string_view SLOT_ACTION_PAYLOAD{"action payload does not decode"};
+inline constexpr std::string_view SLOT_ACTION_WINDOW{"action outside its window"};
+inline constexpr std::string_view SLOT_DUPLICATE_ACTION{"duplicate ActionId"};
+inline constexpr std::string_view SLOT_DUPLICATE_NONCE{"two originals with one (account, nonce)"};
+inline constexpr std::string_view SLOT_ACCOUNT_ABSENT{"account absent in the parent state"};
+inline constexpr std::string_view SLOT_NONCE_EXCLUDED{"nonce excluded by the parent window"};
+inline constexpr std::string_view SLOT_BAD_SIGNATURE{"invalid action signature"};
+
+class ValidatedSlot;
+
+/** The slot validity predicate (plan section 3.4.1; ARCHITECTURE.md section
+ * 11): whether `inputs` may follow `parent` under `profile`. On success it
+ * returns the only kind of value Engine::ApplySlot executes. Followers run
+ * it on every proposal; a leader runs it on its own.
+ *
+ * Checks, in this order (the first failure is returned; each is
+ * INVALID_INPUT with the detail named, unless stated):
+ *  0. Validate(profile) (its own error);
+ *  1. ProfileHash(profile), inputs.profile_hash, the parent header's
+ *     profile_hash and the parent ledger's profile agree (PROFILE_MISMATCH);
+ *  2. inputs.domain is the parent's (DOMAIN_MISMATCH);
+ *  3. the parent height has a successor (HEIGHT_EXHAUSTED); the slot
+ *     height is parent height + 1;
+ *  4. the anchor is not below the parent's (ANCHOR_BELOW_PARENT), and at
+ *     the parent's height it is the same block (ANCHOR_FORK);
+ *  5. facts_from is the parent's facts_to (FACTS_NOT_CONTIGUOUS),
+ *     facts_to >= facts_from (FACTS_REVERSED), and facts_to <= (anchor
+ *     height + 1, 0), so no fact above the anchor is consumed
+ *     (FACTS_BEYOND_ANCHOR);
+ *  6. caps, before any decoding: at most MAX_SLOT_FACTS facts
+ *     (FACT_COUNT_CAP) of at most MAX_FACT_BYTES (FACT_BYTES_CAP), at most
+ *     max_actions_per_slot originals (ACTION_COUNT_CAP) of at most
+ *     ActionV2::MaxEncodedSize bytes (ACTION_BYTES_CAP);
+ *  7. every fact, in body order: DecodeFact; a stub fact kind returns its
+ *     NotImplemented error unchanged (M7-SEAT-01, M7-GOV-01, MB1-B3D-02,
+ *     M8-BRG-02, M8-EXIT-01), any other decode error is FACT_MALFORMED and
+ *     a decoded kind other than DEPOSIT is FACT_KIND; its cursor lies in
+ *     [facts_from, facts_to) and above the previous fact's (FACT_CURSOR); a
+ *     deposit the ledger would refuse (amount 0, a protocol account, an
+ *     outpoint credited in the parent or twice in the slot) is
+ *     DEPOSIT_REFUSED;
+ *  8. every original, in proposal order: exact decode under the profile
+ *     (ACTION_MALFORMED); its domain (ACTION_DOMAIN); KindSupported, so
+ *     CANCEL_ALL, WITHDRAW and the futures transfers are refused here
+ *     (ACTION_KIND); its payload decodes (ACTION_PAYLOAD); MaxDelayValid
+ *     and InExpiryWindow(ref_slot, max_delay, height) (ACTION_WINDOW); no
+ *     earlier original has its ActionId (DUPLICATE_ACTION) or its (account,
+ *     nonce) (DUPLICATE_NONCE); the signer's account exists in the parent
+ *     state (ACCOUNT_ABSENT); the nonce is ACCEPTABLE in the parent window
+ *     (NONCE_EXCLUDED);
+ *  9. each account's slot nonces, inserted in ascending order into a copy
+ *     of its parent window, are all accepted (NONCE_EXCLUDED; implied by 8
+ *     and the D7 rule, checked so that apply cannot fail on it);
+ * 10. every BIP340 signature, last because it is the most expensive
+ *     (BAD_SIGNATURE).
+ * Then CanonicalOrder(actions, parent header hash, height).
+ *
+ * A ValidatedSlot is bound to its parent by the parent header hash;
+ * Engine::ApplySlot refuses another parent (STALE_PARENT). Pure: no lock,
+ * clock, I/O or randomness.
+ *
+ * REAL-REPLACE: M4-AGR-11 checks this predicate against the agreement
+ * PROTOCOL.md and Twins; M3-ENG-04 adds the changed-leaves cap and the
+ * SLOT_FULL rule. Batch signature verification is M4-ADM-01.
+ */
+// TODO(rebirth:M4-AGR-11) conformance of the validity predicate with PROTOCOL.md (checker and Twins agreement).
+Result<ValidatedSlot> ValidateSlotInputs(const HeadView& parent, const SlotInputs& inputs, const ProfileParams& profile);
+
+/** Slot inputs that passed ValidateSlotInputs: the decoded deposits and
+ * actions, the canonical order and the parent they were checked against.
+ * Only ValidateSlotInputs makes one (private constructor), so
+ * Engine::ApplySlot only ever executes validated inputs. Immutable; copies
+ * stay validated.
+ */
+class ValidatedSlot
+{
+public:
+    //! Hash of the parent header the inputs were validated against.
+    const uint256& ParentHash() const { return m_parent_hash; }
+    //! Parent height + 1.
+    uint64_t Height() const { return m_height; }
+    //! The inputs exactly as given.
+    const SlotInputs& Inputs() const { return m_inputs; }
+    //! The decoded deposits, in body order (aligned with Inputs().body.facts).
+    std::span<const DepositFact> Deposits() const { return m_deposits; }
+    //! FactId of each deposit (= FactLeaf of its bytes), aligned with Deposits().
+    std::span<const uint256> FactIds() const { return m_fact_ids; }
+    //! The originals in proposal order (aligned with Inputs().body.originals).
+    std::span<const SlotAction> Actions() const { return m_actions; }
+    //! Canonical order: Order()[rank] is the index into Actions() at that rank.
+    std::span<const size_t> Order() const { return m_order; }
+
+private:
+    friend Result<ValidatedSlot> ValidateSlotInputs(const HeadView&, const SlotInputs&, const ProfileParams&);
+    ValidatedSlot(uint256 parent_hash, uint64_t height, SlotInputs inputs, std::vector<DepositFact> deposits,
+                  std::vector<uint256> fact_ids, std::vector<SlotAction> actions, std::vector<size_t> order);
+
+    uint256 m_parent_hash;
+    uint64_t m_height;
+    SlotInputs m_inputs;
+    std::vector<DepositFact> m_deposits;
+    std::vector<uint256> m_fact_ids;
+    std::vector<SlotAction> m_actions;
+    std::vector<size_t> m_order;
+};
 
 } // namespace flowmesh2::engine
 

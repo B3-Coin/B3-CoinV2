@@ -138,6 +138,7 @@ if(BUILD_FLOWMESH2)
     test/slot_tests.cpp
     test/state_root_tests.cpp
     test/stub_inventory_tests.cpp
+    test/validate_slot_tests.cpp
   )
   # bitcoin_common only for CKey (test/util/keys.h signs with test keys); the
   # fm2 libraries never link it (guard rule 4).
