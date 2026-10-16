@@ -21,6 +21,10 @@ action_tests/payload_cap_4096_accepted_4097_oversize
 action_tests/payload_codecs_round_trip_and_refusals
 action_tests/signature_over_another_domain_fails
 action_tests/unknown_kind_version_and_trailing_bytes_refused
+agreement_tests/leader_inclusion_fence_and_evidence_are_stubs
+agreement_tests/pbft_agreement_is_a_stub
+agreement_tests/pbft_safety_rules_are_stubs
+agreement_tests/provisional_constants_pinned
 amount_tests/add_refuses_operands_outside_the_range
 amount_tests/add_refuses_overflow_at_the_edges
 amount_tests/max_atoms_is_two_to_the_62
@@ -322,6 +326,12 @@ stub_inventory/M3_ENG_03
 stub_inventory/M3_ENG_08
 stub_inventory/M3_ENG_09
 stub_inventory/M4_ADM_01
+stub_inventory/M4_AGR_01
+stub_inventory/M4_AGR_02
+stub_inventory/M4_AGR_03
+stub_inventory/M4_AGR_04
+stub_inventory/M4_AGR_06
+stub_inventory/M4_AGR_07
 stub_inventory/M4_AGR_10
 stub_inventory/M4_STO_01
 stub_inventory/M4_STO_02

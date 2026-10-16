@@ -47,11 +47,20 @@
  * to probe StateOwner::Restore and the replay of a SNAPSHOT_MARK record and
  * M4-STO-07 to probe the replay of a PREPARED_QC record as well. Slice
  * R10 adds the b3d chain adapters: trusted facts on REGTEST (MB1-ADP-06)
- * and the finalized adapter (M7-ADP-01).
+ * and the finalized adapter (M7-ADP-01); PBFT safety (M4-AGR-01; the probe
+ * checks MayPrepare, MayCommit and OnViewChange), the PBFT agreement
+ * (M4-AGR-02), the leader schedule (M4-AGR-03), inclusion lists (M4-AGR-04;
+ * Build and Check), the restart fence (M4-AGR-06) and the evidence store
+ * (M4-AGR-07; Record and Load).
  */
 
 #include <boost/test/unit_test.hpp>
 
+#include <flowmesh2/agreement/evidence.h>
+#include <flowmesh2/agreement/inclusion.h>
+#include <flowmesh2/agreement/leader.h>
+#include <flowmesh2/agreement/pbft.h>
+#include <flowmesh2/agreement/restart_fence.h>
 #include <flowmesh2/chain/b3d_adapter.h>
 #include <flowmesh2/core/action.h>
 #include <flowmesh2/core/facts.h>
@@ -73,6 +82,7 @@
 #include <flowmesh2/storage/memory_journal.h>
 #include <flowmesh2/storage/signer_log.h>
 #include <flowmesh2/storage/snapshot_store.h>
+#include <flowmesh2/test/util/agreement_fixtures.h>
 #include <flowmesh2/test/util/storage_fixtures.h>
 
 #include <exception>
@@ -212,8 +222,8 @@ StubObservation ThrowingProbe() { throw std::runtime_error{"probe exploded"}; }
 
 size_t ProblemCount(std::vector<StubEntry> entries) { return InventoryProblems(entries).size(); }
 
-//! The provisional regtest profile, which Validate() accepts unchanged.
-ProfileParams RegtestProfile() { return DevRegtestProfile(ChainType::REGTEST).value(); }
+// RegtestProfile() (the provisional regtest profile, which Validate()
+// accepts unchanged) is test/util/ledger_fixtures.h's since slice R10.
 
 //! The first observation that is not a NOT_IMPLEMENTED/UNSUPPORTED error
 //! carrying `task_id`, or the first one if all are; so a probe of several
@@ -528,6 +538,54 @@ FM2_STUB_CASE(MB1_ADP_06, "MB1-ADP-06")
 FM2_STUB_CASE(M7_ADP_01, "M7-ADP-01")
 {
     return Observe(chain::B3dFinalizedAdapter::Create(StubRegtestNetwork(), chain::B3dAdapterConfig{30}));
+}
+
+// ---- Slice R10: agreement ----
+
+//! A sink that refuses everything (the stubs never send).
+class StubSink final : public agreement::MessageSink
+{
+public:
+    Result<void> Send(uint32_t, std::span<const unsigned char>) override { return Error{ErrorCode::BUSY, "stub sink"}; }
+};
+
+FM2_STUB_CASE(M4_AGR_01, "M4-AGR-01")
+{
+    agreement::PbftSafetyRules rules;
+    const agreement::Proposal proposal{};
+    return FirstDeviation("M4-AGR-01", {Observe(rules.MayPrepare(proposal)), Observe(rules.MayCommit(proposal, agreement::PreparedCert{})),
+                                        Observe(rules.OnViewChange(agreement::ViewChange{}))});
+}
+
+FM2_STUB_CASE(M4_AGR_02, "M4-AGR-02")
+{
+    AgreementRig rig;
+    agreement::PbftSafetyRules rules;
+    StubSink sink;
+    const agreement::PbftContext context{*rig.adapter, *rig.owner, rig.signer, rig.signer_log, rig.commit_log, rules, sink};
+    return Observe(agreement::PbftAgreement::Create(rig.profile, agreement::PbftConfig{}, context));
+}
+
+FM2_STUB_CASE(M4_AGR_03, "M4-AGR-03")
+{
+    const agreement::LeaderSchedule schedule{4};
+    return Observe(schedule.LeaderFor(AuthorityVersion{}, 0, agreement::SlowSet{}));
+}
+
+FM2_STUB_CASE(M4_AGR_04, "M4-AGR-04")
+{
+    return FirstDeviation("M4-AGR-04", {Observe(agreement::InclusionList::Build({}, 1)), Observe(agreement::InclusionList::Check({}, 4, {}, {}))});
+}
+
+FM2_STUB_CASE(M4_AGR_06, "M4-AGR-06")
+{
+    return Observe(agreement::RestartFence::Collect({}, TestSeats({"s0"}), 0));
+}
+
+FM2_STUB_CASE(M4_AGR_07, "M4-AGR-07")
+{
+    agreement::EvidenceStore store;
+    return FirstDeviation("M4-AGR-07", {Observe(store.Record(agreement::Evidence{agreement::DoubleVote{}})), Observe(store.Load())});
 }
 
 BOOST_AUTO_TEST_SUITE_END()

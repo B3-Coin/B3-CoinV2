@@ -91,11 +91,18 @@ if(BUILD_FLOWMESH2)
   # owner and decision replay, in namespace flowmesh2::state. chain/ (slice
   # R10): the chain adapter seam and the b3d adapter stubs, in namespace
   # flowmesh2::chain. agreement/ (slice R10): the capped agreement messages,
-  # in namespace flowmesh2::agreement. Later slices add the other
-  # application directories here. fm2_verify never links it (guard rule 4), and it never links
+  # the Agreement and SafetyRules interfaces and the PBFT, leader,
+  # inclusion-list, restart-fence and evidence stubs, in namespace
+  # flowmesh2::agreement. Later slices add the other application
+  # directories here. fm2_verify never links it (guard rule 4), and it never links
   # bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
+    agreement/evidence.cpp
+    agreement/inclusion.cpp
+    agreement/leader.cpp
     agreement/messages.cpp
+    agreement/pbft.cpp
+    agreement/restart_fence.cpp
     chain/b3d_adapter.cpp
     chain/chain_adapter.cpp
     engine/book.cpp
@@ -151,6 +158,7 @@ if(BUILD_FLOWMESH2)
     test/main.cpp
     test/account_leaf_tests.cpp
     test/action_tests.cpp
+    test/agreement_tests.cpp
     test/amount_tests.cpp
     test/authority_tests.cpp
     test/body_tests.cpp
