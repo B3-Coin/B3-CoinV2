@@ -1,6 +1,6 @@
 # FlowMesh Linux native CI guardrails
 
-Date: 2026-10-16. Profile: `native-guardrails-v9`.
+Date: 2026-10-16. Profile: `native-guardrails-v10`.
 
 This headless Linux profile checks selected native FlowMesh concurrency and
 recovery regressions. Its source and runner controls are prepared; Linux native
@@ -104,6 +104,31 @@ GUI-off workflow does not qualify the Qt policy change. All version 8
 requirements, algorithms, sources, headers, bounds and workflow remain.
 Complete version 9 native host qualification was pending at the private source
 freeze and subsequently passed locally, as recorded below.
+
+Version 10 retains all 28 suites and adds three mandatory automatic-polling FIFO
+cases: two integrated TLS client cases in `flowmesh_client_outcome_evidence_tests`
+and one pure scheduler case in `flowmesh_client_poll_tests`. They require an
+included caller to service an older unresolved demand, an unresolved caller to
+service an older included outcome without misattributing its result, and the
+unchanged scheduler's coalescing, bounds and nonrefunding removal. Independent
+literal controls reject each case when missing, disabled, unexecuted or skipped.
+The six earlier outcome-evidence names and all their negative controls remain
+independently required. The earlier exact-set assertion expands only to the
+union of those six names and the separately frozen two integrated FIFO names.
+Every version 9 suite, source, header dependency, checker algorithm, execution
+bound and workflow remains unchanged. This is headless native coverage; Qt
+qualification remains separate.
+
+Do not publish version 10 before the reviewed fairness implementation, narrow
+generated-regtest test seam and all three test cases are committed together.
+The non-RPC seam advances the existing scheduler monotonically to a bounded
+future instant, invoking its ordinary refill and rolling-window expiry, and
+may spend its existing burst tokens. It does not install a custom refill,
+reset or refund a budget, alter signed originals or expose an operator flag.
+The pure scheduler case is a complementary contract control, not a substitute
+for either integrated failing-before counterexample. Version 9's completed
+native host result below does not qualify this new source or version 10.
+
 Missing prerequisites fail discovery.
 The workflow must contain their reviewed source revisions before qualification;
 it cannot substitute a prototype or silently omit a missing case. Do not publish
@@ -202,6 +227,18 @@ discovery/execution cases. Native, Qt, Linux and TSan execution are separate.
 Root also executed those exact 53 controls once after integration: exit 0,
 zero failures/errors, 0.185 seconds. These three executions are not combined
 into a larger test population.
+
+Version 10 adds three lightweight controls for its three exact FIFO names,
+including per-case missing, disabled, unexecuted and skipped rejection. All 53
+version 9 control bodies remain, apart from the version literal and the exact
+outcome-set union adaptation described above. At the private preparation freeze
+execution was pending. Subsequently root ran all 56 once with exit 0,
+zero failures/errors, 0.189 seconds; the non-author reviewer independently ran
+the frozen private suite once with exit 0, 0.201 seconds. Its unchanged private
+workflow copy was used without a source-root override. The author executed
+none. These are separate stdlib controls, not native execution; the complete
+host selection is recorded below. Linux, DEBUG_LOCKORDER, TSan and remote CI
+remain unexecuted.
 
 A separate positive format control used a preserved ordinary macOS native
 binary: real Boost discovery and the XML results for eleven timing cases passed
@@ -359,3 +396,18 @@ Their [selected final-preflight policy and limits](b3-flowmesh-selected-final-pr
 are not qualified by a headless GUI-off workflow. These ordinary macOS runs
 do not establish Linux, DEBUG_LOCKORDER, TSan, remote CI, Windows, WAN,
 production availability or 200 ms performance. The workflow remains unpublished.
+
+Version 10's exact local host selection passed **500 cases in 28 suites**,
+all actual children exit 0, no selected skips, 227.968 seconds. The preserved
+native executable SHA256 was
+`52a27a3d7bdc21d5c365e6dd86758486605cb2e2c0df0b3f003704727d3a0fe1`.
+It includes both integrated FIFO cases and the complementary pure case, with
+all earlier outcome-budget, Catalog, health, persistence and recovery cases
+retained. The [fairness stage report](b3-flowmesh-outcome-fifo-20261016.md)
+records actual failing-before evidence, fixture failures, scope and hashes.
+The separate Qt helper/workspace execution passed 82 and 362 cases, with the
+same three opt-in visual skips. Functional runs overlapped, not a controlled
+latency comparison. Ordinary macOS, linked non-RPC regtest-only poll seam,
+crash-test macros off: not Linux/DEBUG_LOCKORDER/TSan, remote CI, Windows/WAN,
+200 ms, production or release qualification. Earlier v9 and all predecessor
+results retain their own source/binary identities rather than being relabelled.

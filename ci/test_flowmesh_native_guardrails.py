@@ -129,6 +129,19 @@ SELECTED_PROOF_REQUIRED_CASES = {
 }
 
 
+# Independently frozen exact FIFO names; the pure scheduler case is not a
+# substitute for either integrated TLS client counterexample.
+OUTCOME_FIFO_REQUIRED_CASES = {
+    "flowmesh_client_outcome_evidence_tests": {
+        "included_outcome_demand_services_older_unresolved_fifo_without_resubmitting",
+        "unresolved_caller_services_older_included_outcome_without_misattribution_or_resubmission",
+    },
+    "flowmesh_client_poll_tests": {
+        "mixed_status_and_outcome_demand_keeps_fifo_bounds_and_nonrefunding_removal",
+    },
+}
+
+
 # Literal frozen v6 manifest, independent of RUNNER and the new suite count.
 FROZEN_V6_SUITE_SOURCES = {
     "flowmesh_p2p_tests": "src/test/flowmesh_p2p_tests.cpp",
@@ -421,7 +434,8 @@ class OutcomeEvidenceRegressionTests(unittest.TestCase):
     def test_outcome_evidence_positive_discovery_and_exact_execution(self):
         self.assertEqual(len(OUTCOME_EVIDENCE_REQUIRED_CASES), 6)
         self.assertEqual(RUNNER.SUITE_SOURCES[self.suite], "src/test/flowmesh_https_tests.cpp")
-        self.assertEqual(RUNNER.REQUIRED_CASES[self.suite], OUTCOME_EVIDENCE_REQUIRED_CASES)
+        self.assertEqual(RUNNER.REQUIRED_CASES[self.suite],
+                         OUTCOME_EVIDENCE_REQUIRED_CASES | OUTCOME_FIFO_REQUIRED_CASES[self.suite])
         discovered = RUNNER.parse_discovery(listing())
         self.assertTrue(OUTCOME_EVIDENCE_REQUIRED_CASES.issubset(discovered[self.suite]))
         self.assertEqual(RUNNER.check_xml(
@@ -538,6 +552,54 @@ class SelectedProofRegressionTests(unittest.TestCase):
 
     def test_each_selected_proof_case_cannot_be_unexecuted_or_skipped(self):
         for suite, mandatory in SELECTED_PROOF_REQUIRED_CASES.items():
+            expected = expected_inventory()[suite]
+            for case in mandatory:
+                missing = xml_report(suite, expected - {case})
+                with self.subTest(suite=suite, case=case, fault="unexecuted"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "case mismatch"):
+                    RUNNER.check_xml(ET.tostring(missing, encoding="unicode"), suite, expected)
+                skipped = xml_report(suite, expected)
+                row = next(row for row in skipped.iter("TestCase") if row.get("name") == case)
+                row.set("result", "skipped")
+                with self.subTest(suite=suite, case=case, fault="skipped"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "Selected case/suite skipped or failed"):
+                    RUNNER.check_xml(ET.tostring(skipped, encoding="unicode"), suite, expected)
+
+
+class OutcomeFifoRegressionTests(unittest.TestCase):
+    def test_fifo_positive_discovery_and_exact_execution(self):
+        self.assertEqual(sum(map(len, OUTCOME_FIFO_REQUIRED_CASES.values())), 3)
+        discovered = RUNNER.parse_discovery(listing())
+        expected_sources = {
+            "flowmesh_client_outcome_evidence_tests": "src/test/flowmesh_https_tests.cpp",
+            "flowmesh_client_poll_tests": "src/test/flowmesh_client_poll_tests.cpp",
+        }
+        self.assertEqual(set(OUTCOME_FIFO_REQUIRED_CASES), set(expected_sources))
+        for suite, mandatory in OUTCOME_FIFO_REQUIRED_CASES.items():
+            with self.subTest(suite=suite):
+                self.assertEqual(RUNNER.SUITE_SOURCES[suite], expected_sources[suite])
+                self.assertTrue(mandatory.issubset(RUNNER.REQUIRED_CASES[suite]))
+                self.assertTrue(mandatory.issubset(discovered[suite]))
+                self.assertEqual(RUNNER.check_xml(
+                    ET.tostring(xml_report(suite, discovered[suite]), encoding="unicode"),
+                    suite, discovered[suite]), len(discovered[suite]))
+
+    def test_each_fifo_case_cannot_be_undiscovered_or_disabled(self):
+        for suite, mandatory in OUTCOME_FIFO_REQUIRED_CASES.items():
+            for case in mandatory:
+                inventory = expected_inventory()
+                inventory[suite].remove(case)
+                with self.subTest(suite=suite, case=case, fault="undiscovered"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "missing required regression"):
+                    RUNNER.parse_discovery(listing(inventory))
+                disabled = listing().replace(f"    {case}*\n", f"    {case} \n", 1)
+                self.assertNotEqual(disabled, listing())
+                with self.subTest(suite=suite, case=case, fault="disabled"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "selected case"):
+                    RUNNER.parse_discovery(disabled)
+
+    def test_each_fifo_case_cannot_be_unexecuted_or_skipped(self):
+        for suite, mandatory in OUTCOME_FIFO_REQUIRED_CASES.items():
             expected = expected_inventory()[suite]
             for case in mandatory:
                 missing = xml_report(suite, expected - {case})
@@ -757,7 +819,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, artifact)
 
     def test_profile_is_versioned_and_excludes_prototype(self):
-        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v9")
+        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v10")
         self.assertEqual(len(RUNNER.SUITE_SOURCES), 28)
         self.assertTrue(set(RUNNER.REQUIRED_CASES).issubset(RUNNER.SUITE_SOURCES))
         self.assertFalse(any("v2_market" in source or "/v2/" in source for source in RUNNER.NATIVE_SOURCES))
