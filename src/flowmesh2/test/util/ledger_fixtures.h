@@ -15,6 +15,7 @@
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/ledger/ledger.h>
 #include <flowmesh2/test/util/keys.h>
+#include <flowmesh2/test/util/require.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -92,14 +93,7 @@ void RequireError(const Result<T>& result, ErrorCode code, std::string_view what
                                                          std::string{ToString(code)});
 }
 
-//! Requires the NOT_IMPLEMENTED stub error of `task_id` (and never reads error() on success).
-template <class T>
-void RequireStub(const Result<T>& result, std::string_view task_id)
-{
-    if (result.has_value()) BOOST_FAIL("stub " + std::string{task_id} + " returned success");
-    BOOST_CHECK(result.error().code == ErrorCode::NOT_IMPLEMENTED);
-    BOOST_CHECK_EQUAL(result.error().detail, task_id);
-}
+// RequireStub is in test/util/require.h.
 
 } // namespace flowmesh2::test
 

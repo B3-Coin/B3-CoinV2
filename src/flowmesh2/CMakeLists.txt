@@ -88,10 +88,14 @@ if(BUILD_FLOWMESH2)
   # durability tokens and the signer and commit logs, in namespace
   # flowmesh2::storage; crc32c frames the records. state/ (slice R9): the
   # core state, committed heads, slot candidates, the single-writer state
-  # owner and decision replay, in namespace flowmesh2::state. Later slices
-  # add the other application directories here. fm2_verify never links it
-  # (guard rule 4), and it never links bitcoin_common (guard rule 4).
+  # owner and decision replay, in namespace flowmesh2::state. chain/ (slice
+  # R10): the chain adapter seam and the b3d adapter stubs, in namespace
+  # flowmesh2::chain. Later slices add the other application directories
+  # here. fm2_verify never links it (guard rule 4), and it never links
+  # bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
+    chain/b3d_adapter.cpp
+    chain/chain_adapter.cpp
     engine/book.cpp
     engine/engine.cpp
     engine/matcher.cpp
@@ -134,6 +138,7 @@ if(BUILD_FLOWMESH2)
     test/candidate_tests.cpp
     test/canonical_order_tests.cpp
     test/certificate_tests.cpp
+    test/chain_adapter_tests.cpp
     test/codec_tests.cpp
     test/codes_tests.cpp
     test/commit_log_tests.cpp

@@ -45,11 +45,14 @@
  * log's folded signing as well. Slice R9 adds the state owner's pipelined
  * Preview over an uncommitted candidate (M4-AGR-10), and extends M4-STO-03
  * to probe StateOwner::Restore and the replay of a SNAPSHOT_MARK record and
- * M4-STO-07 to probe the replay of a PREPARED_QC record as well.
+ * M4-STO-07 to probe the replay of a PREPARED_QC record as well. Slice
+ * R10 adds the b3d chain adapters: trusted facts on REGTEST (MB1-ADP-06)
+ * and the finalized adapter (M7-ADP-01).
  */
 
 #include <boost/test/unit_test.hpp>
 
+#include <flowmesh2/chain/b3d_adapter.h>
 #include <flowmesh2/core/action.h>
 #include <flowmesh2/core/facts.h>
 #include <flowmesh2/core/market.h>
@@ -503,6 +506,28 @@ FM2_STUB_CASE(M4_AGR_10, "M4-AGR-10")
     const state::Candidate candidate{
         heartbeat.owner->Preview(state::ParentRef::Committed(*heartbeat.owner->Head()), heartbeat.inputs).value()};
     return Observe(heartbeat.owner->Preview(state::ParentRef::Uncommitted(candidate), heartbeat.inputs));
+}
+
+// ---- Slice R10: chain adapters ----
+
+//! A synthetic REGTEST network (TEST values only).
+NetworkId StubRegtestNetwork()
+{
+    NetworkId network;
+    network.chain = ChainType::REGTEST;
+    network.magic = {0xf2, 0x7e, 0x57, 0x0a};
+    network.modern_chain_domain = LabelHash("fm2/test/stub/network");
+    return network;
+}
+
+FM2_STUB_CASE(MB1_ADP_06, "MB1-ADP-06")
+{
+    return Observe(chain::B3dTrustedFactsAdapter::Create(StubRegtestNetwork(), chain::B3dAdapterConfig{}));
+}
+
+FM2_STUB_CASE(M7_ADP_01, "M7-ADP-01")
+{
+    return Observe(chain::B3dFinalizedAdapter::Create(StubRegtestNetwork(), chain::B3dAdapterConfig{30}));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

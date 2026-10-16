@@ -14,6 +14,7 @@
 #include <flowmesh2/storage/record.h>
 #include <flowmesh2/storage/tokens.h>
 #include <flowmesh2/test/util/keys.h>
+#include <flowmesh2/test/util/require.h>
 #include <util/fs.h>
 
 #include <boost/test/unit_test.hpp>
@@ -107,14 +108,7 @@ void RequireRefusal(const Result<T>& result, ErrorCode code, std::string_view de
                             std::string{detail} + ")");
 }
 
-//! Requires NOT_IMPLEMENTED with exactly `task_id` as the detail.
-template <class T>
-void RequireStub(const Result<T>& result, std::string_view task_id)
-{
-    if (result.has_value()) BOOST_FAIL("stub " + std::string{task_id} + " returned success");
-    BOOST_CHECK(result.error().code == ErrorCode::NOT_IMPLEMENTED);
-    BOOST_CHECK_EQUAL(result.error().detail, task_id);
-}
+// RequireStub (NOT_IMPLEMENTED with exactly the task id) is in test/util/require.h.
 
 //! Requires an error with exactly `code` (any detail).
 template <class T>
