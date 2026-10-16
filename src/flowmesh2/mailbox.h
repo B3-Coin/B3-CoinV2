@@ -61,13 +61,13 @@ public:
      * message untouched; only ACCEPTED moves it. A metadata-node allocation
      * before locking may throw without accepting or altering the input.
      */
-    MailboxPushResult TryPush(MailboxMessage&& message) LOCKS_EXCLUDED(m_mutex);
+    MailboxPushResult TryPush(MailboxMessage&& message) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     //! Empty returns nullopt, including after Close. Queued data remains FIFO.
-    std::optional<MailboxMessage> TryPop() LOCKS_EXCLUDED(m_mutex);
+    std::optional<MailboxMessage> TryPop() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     //! Idempotently refuse new inputs; do not discard queued messages.
-    void Close() LOCKS_EXCLUDED(m_mutex);
+    void Close() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     //! A coherent observation of one queue, not an admission reservation.
-    MailboxStats Stats() const LOCKS_EXCLUDED(m_mutex);
+    MailboxStats Stats() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 };
 
 } // namespace flowmesh2

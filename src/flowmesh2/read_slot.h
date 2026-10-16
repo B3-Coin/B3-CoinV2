@@ -93,7 +93,7 @@ class ReadSlot {
 
 public:
     ReadSlot(size_t max_readers, size_t max_payload_bytes);
-    ReadPublishResult Publish(const ReadEnvelope& envelope) LOCKS_EXCLUDED(m_publish_mutex);
+    ReadPublishResult Publish(const ReadEnvelope& envelope) EXCLUSIVE_LOCKS_REQUIRED(!m_publish_mutex);
     std::optional<ReadLease> Acquire() const;
     size_t Readers() const noexcept;
 };
