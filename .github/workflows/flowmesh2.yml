@@ -1,0 +1,230 @@
+name: FlowMesh2 rebirth outline gates
+run-name: FlowMesh2 guards and sanitizers — ${{ github.sha }}
+
+# OWNER-PROTECTED gate file (src/flowmesh2/TODO.md rule 5, plan section 10.5).
+# Removing or weakening a step needs an audit and the owner's sign-off.
+#
+# Added by outline slice R2 and never executed by the outline itself: the
+# first run is task M0-CI-01 (Linux), and M1-GRD-03 records that the TSan
+# job refuses suppressions. Unit tests and scripts only: no node process,
+# network peer, live data, datadir, key, packaging or deployment.
+#
+# Order inside each sanitizer job: build, then the canaries (each must exit
+# non-zero WITH its sanitizer's report), and only then ctest. A canary that is
+# not flagged fails the job before any test result is produced.
+on:
+  workflow_dispatch:
+  push:
+    branches: [rebirth]
+    paths:
+      - '.github/workflows/flowmesh2.yml'
+      - 'src/flowmesh2/**'
+      - 'contrib/flowmesh2/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flowmesh2-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Mirrors src/flowmesh2/ARCHITECTURE.md section 13.2 (no GUI, daemon or
+  # wallet; Clang 18 so the thread-safety controls run).
+  FM2_CONFIGURE: >-
+    -G Ninja
+    -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+    -DBUILD_TESTS=ON -DBUILD_FLOWMESH2_FOUNDATION_TESTS=ON -DBUILD_FLOWMESH2=ON
+    -DBUILD_GUI=OFF -DBUILD_DAEMON=OFF -DBUILD_CLI=OFF -DBUILD_TX=OFF -DBUILD_UTIL=OFF
+    -DBUILD_WALLET_TOOL=OFF -DENABLE_WALLET=OFF -DENABLE_IPC=OFF -DWITH_CCACHE=OFF
+    -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF
+  FM2_APT: >-
+    build-essential cmake ninja-build pkgconf python3 clang-18 llvm-18
+    libclang-rt-18-dev libevent-dev libboost-dev libsqlite3-dev libssl-dev
+
+jobs:
+  guards:
+    if: github.ref == 'refs/heads/rebirth'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $FM2_APT
+      - name: Record source and toolchain
+        run: |
+          git rev-parse HEAD
+          git branch --show-current || true
+          clang++-18 --version
+          cmake --version
+          python3 --version
+          uname -srmo
+      - name: Source guards and ledger lint (no build)
+        run: |
+          set -euo pipefail
+          python3 -I -B contrib/flowmesh2/check_guards.py --source
+          python3 -I -B contrib/flowmesh2/check_todo.py --todo src/flowmesh2/TODO.md
+      - name: Configure
+        timeout-minutes: 10
+        run: cmake -S . -B build-fm2 $FM2_CONFIGURE
+      - name: Build every fm2 target
+        timeout-minutes: 45
+        run: cmake --build build-fm2 --target fm2_all --parallel "$(nproc)"
+      - name: ctest -L flowmesh2 (guards with nm, negative compile, self-tests)
+        timeout-minutes: 20
+        run: |
+          python3 -I -B contrib/flowmesh2/evidence.py run --dir "$RUNNER_TEMP/fm2-evidence/guards" \
+            --label ctest_flowmesh2 -- \
+            ctest --test-dir build-fm2 -L flowmesh2 --no-tests=error --output-on-failure
+      - name: Verify the evidence bundle
+        if: always()
+        run: python3 -I -B contrib/flowmesh2/evidence.py verify --dir "$RUNNER_TEMP/fm2-evidence/guards" --require-expectations
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm2-evidence-guards
+          path: ${{ runner.temp }}/fm2-evidence/guards
+          if-no-files-found: error
+
+  asan-ubsan:
+    if: github.ref == 'refs/heads/rebirth'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $FM2_APT
+      - name: Record source and toolchain
+        run: |
+          git rev-parse HEAD
+          clang++-18 --version
+          uname -srmo
+          echo "ASAN_OPTIONS=$ASAN_OPTIONS"
+          echo "UBSAN_OPTIONS=$UBSAN_OPTIONS"
+      - name: Configure with ASan + UBSan and the canaries
+        timeout-minutes: 10
+        run: cmake -S . -B build-fm2-asan $FM2_CONFIGURE -DSANITIZERS=address,undefined -DFLOWMESH2_SANITIZER_CANARIES=ON
+      - name: Build every fm2 target
+        timeout-minutes: 60
+        run: cmake --build build-fm2-asan --target fm2_all --parallel "$(nproc)"
+      - name: Canaries must be flagged before any test runs
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          ev="$RUNNER_TEMP/fm2-evidence/asan-ubsan"
+          python3 -I -B contrib/flowmesh2/evidence.py run --dir "$ev" --label canary_asan \
+            --expect nonzero --expect-output 'AddressSanitizer: heap-buffer-overflow' --timeout 120 -- \
+            build-fm2-asan/bin/fm2_canary_asan
+          python3 -I -B contrib/flowmesh2/evidence.py run --dir "$ev" --label canary_ubsan \
+            --expect nonzero --expect-output 'runtime error: signed integer overflow' --timeout 120 -- \
+            build-fm2-asan/bin/fm2_canary_ubsan
+      - name: ctest -L flowmesh2 under ASan + UBSan
+        timeout-minutes: 30
+        run: |
+          python3 -I -B contrib/flowmesh2/evidence.py run --dir "$RUNNER_TEMP/fm2-evidence/asan-ubsan" \
+            --label ctest_flowmesh2 -- \
+            ctest --test-dir build-fm2-asan -L flowmesh2 --no-tests=error --output-on-failure
+      - name: Verify the evidence bundle
+        if: always()
+        run: python3 -I -B contrib/flowmesh2/evidence.py verify --dir "$RUNNER_TEMP/fm2-evidence/asan-ubsan" --require-expectations
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm2-evidence-asan-ubsan
+          path: ${{ runner.temp }}/fm2-evidence/asan-ubsan
+          if-no-files-found: error
+
+  tsan:
+    if: github.ref == 'refs/heads/rebirth'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # No suppressions, ever (plan section 4; M1-GRD-03).
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $FM2_APT
+      - name: Set TSan-compatible mmap entropy on the disposable runner
+        timeout-minutes: 1
+        # Changes only this ephemeral runner, never a project or live node.
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Record source and toolchain
+        run: |
+          git rev-parse HEAD
+          clang++-18 --version
+          uname -srmo
+          echo "TSAN_OPTIONS=$TSAN_OPTIONS"
+      - name: Assert that TSan runs without suppressions
+        run: |
+          set -euo pipefail
+          case "${TSAN_OPTIONS:-}" in
+            *suppressions*) echo "::error::TSAN_OPTIONS names a suppressions file"; exit 1 ;;
+          esac
+          if grep -n -i 'suppress' src/flowmesh2/CMakeLists.txt contrib/flowmesh2/canaries/*.cpp; then
+            echo "::error::flowmesh2 build files mention sanitizer suppressions"; exit 1
+          fi
+      - name: Configure with TSan and the canary
+        timeout-minutes: 10
+        run: cmake -S . -B build-fm2-tsan $FM2_CONFIGURE -DSANITIZERS=thread -DFLOWMESH2_SANITIZER_CANARIES=ON
+      - name: Build every fm2 target
+        timeout-minutes: 60
+        run: cmake --build build-fm2-tsan --target fm2_all --parallel "$(nproc)"
+      - name: Assert that no flowmesh2 CTest injects suppressions
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-fm2-tsan -L flowmesh2 --show-only=json-v1 > "$RUNNER_TEMP/fm2-ctests.json"
+          python3 -I -B - "$RUNNER_TEMP/fm2-ctests.json" <<'PY'
+          import json, sys
+          tests = json.load(open(sys.argv[1]))["tests"]
+          bad = [t["name"] for t in tests for p in t.get("properties", [])
+                 if p.get("name") == "ENVIRONMENT" and "suppress" in json.dumps(p.get("value")).lower()]
+          if not tests or bad:
+              sys.exit(f"no flowmesh2 tests listed or suppressions injected: {bad}")
+          print(f"{len(tests)} flowmesh2 CTests, none sets a suppressions environment")
+          PY
+      - name: Canary must be flagged before any test runs
+        timeout-minutes: 5
+        run: |
+          python3 -I -B contrib/flowmesh2/evidence.py run --dir "$RUNNER_TEMP/fm2-evidence/tsan" --label canary_tsan \
+            --expect nonzero --expect-output 'ThreadSanitizer: data race' --timeout 120 -- \
+            build-fm2-tsan/bin/fm2_canary_tsan
+      - name: ctest -L flowmesh2 under TSan
+        timeout-minutes: 30
+        run: |
+          python3 -I -B contrib/flowmesh2/evidence.py run --dir "$RUNNER_TEMP/fm2-evidence/tsan" \
+            --label ctest_flowmesh2 -- \
+            ctest --test-dir build-fm2-tsan -L flowmesh2 --no-tests=error --output-on-failure
+      - name: Verify the evidence bundle
+        if: always()
+        run: python3 -I -B contrib/flowmesh2/evidence.py verify --dir "$RUNNER_TEMP/fm2-evidence/tsan" --require-expectations
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm2-evidence-tsan
+          path: ${{ runner.temp }}/fm2-evidence/tsan
+          if-no-files-found: error

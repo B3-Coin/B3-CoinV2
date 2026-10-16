@@ -2,9 +2,11 @@
 
 Date: 2026-10-16. Branch: `rebirth`, based on `18051472`.
 Status: **OUTLINE IN PROGRESS.** Implemented in `src/flowmesh2/`: C1
-(`BoundedMailbox`, `ReadSlot`) and slice **R1** (build gate, error model, code
-registries, Boost.Test runner, inventory and TODO lint). Everything else
-described here is the contract that the outline slices R2 to R14 will build.
+(`BoundedMailbox`, `ReadSlot`), slice **R1** (build gate, error model, code
+registries, Boost.Test runner, inventory and TODO lint) and slice **R2** (seven
+guards with self-tests, compile-fail controls, evidence tool, sanitizer
+canaries, CI workflow, and the durability token type). Everything else
+described here is the contract that the outline slices R3 to R14 will build.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
@@ -134,7 +136,8 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `admission/`, `dev/dev_budget` | R12 | `Admission` A0..A10, `ActionPool`, `BudgetPolicy`, `UnlimitedDevBudget` | `CreditBudget` (M4-ADM-02), batch verification (M4-ADM-01); `UNSUPPORTED_KIND` refusals (M2-LED-05, M3-ENG-09, M2-LED-06) | — |
 | `net/`, `bridge/`, `futures/`, `governance/` | R13 | `LaneSet`, `ClientApi`, `InProcessApi`, `SeatMesh` interface | HTTPS + SSE (M5-API-01), `Subscribe` (M5-API-02), in-process mesh (M4-SIM-01), TCP mesh (M4-NET-01), short IDs (M4-NET-02), sentry fan-out (M4-NET-03), bridge (M8-BRG-01..03), checkpoint builder (M8-CKP-01), forced exit (M8-EXIT-01), futures (M9-FUT-01..04), governance (M7-GOV-01..03) | — |
 | `sim/` | R14 | `FakeClock`, `Scheduler`, `FaultPlan` (3 faults), `TraceRecorder`, `SimNode`, `SimClient`, scenarios, `fm2-sim` | `SimCluster` n>1 (M4-SIM-01), crash/drop/partition/skew (M4-SIM-02), Twins (M4-SIM-03) | scheduler (M0-SIM-01) |
-| `contrib/flowmesh2/` | R1, R2 | `check_inventory.py`, `check_todo.py`, `check_guards.py`, `evidence.py`, canaries | `evidence.py perf-metadata` (M0-EVD-01) | — |
+| `contrib/flowmesh2/` | R1, R2 | `check_inventory.py`, `check_todo.py`, `check_guards.py` (+ `test_check_guards.py`, `guard_fixtures/`), `check_negative_compile.py`, `evidence.py` (+ `test_evidence.py`), `canaries/` | `evidence.py perf-metadata` (M0-EVD-01) | — |
+| `storage/durable.h`, `test/compile_fail/` | R2 | `Durable<K>` token type (no minter until R8); missing-`LOCK`, ignored-`Result` and forged-token controls with fixed forms and a positive control | — | — |
 
 ### 2.2 CMake targets (only when `BUILD_FLOWMESH2=ON`)
 
@@ -654,24 +657,29 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R1)
+### 13.1 Today (after R2)
 
-The commands in 13.2 work. They build `test_flowmesh2` (15 Boost cases) and the
-unchanged C1 binary, and run four CTests: `flowmesh2_foundations` (C1, 19
-cases), `flowmesh2_unit`, `flowmesh2_inventory` and `flowmesh2_todo_lint`. The
-outline never uses `build/`, `build-qt/` or `build-nofullfsync/`. R1 adds no
-`-DBUILD_BENCH`/`-DBUILD_FUZZ_BINARY` requirement; passing both as `OFF` only
-shortens the configure.
+The commands in 13.2 work. They build every fm2 target (`fm2_all`):
+`test_flowmesh2` (16 Boost cases), the unchanged C1 binary and, with the
+option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
+19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
+`flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
+and `flowmesh2_negative_compile` (Clang). The outline never uses `build/`,
+`build-qt/` or `build-nofullfsync/`. Passing `-DBUILD_BENCH=OFF
+-DBUILD_FUZZ_BINARY=OFF` only shortens the configure.
 
 ### 13.2 Commands (growing with each slice)
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
-COMMON="-DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-  -DBUILD_TESTS=ON -DBUILD_FLOWMESH2_FOUNDATION_TESTS=ON \
-  -DBUILD_GUI=OFF -DBUILD_DAEMON=OFF -DBUILD_CLI=OFF -DBUILD_TX=OFF -DBUILD_UTIL=OFF \
-  -DBUILD_WALLET_TOOL=OFF -DENABLE_WALLET=OFF -DENABLE_IPC=OFF -DWITH_CCACHE=OFF"
-cmake -S . -B build-rebirth $COMMON -DBUILD_FLOWMESH2=ON
+# An array, so the options split the same way in bash and zsh (zsh does not
+# split an unquoted "$COMMON" string; R1's string form broke there).
+COMMON=(-DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+  -DBUILD_TESTS=ON -DBUILD_FLOWMESH2_FOUNDATION_TESTS=ON
+  -DBUILD_GUI=OFF -DBUILD_DAEMON=OFF -DBUILD_CLI=OFF -DBUILD_TX=OFF -DBUILD_UTIL=OFF
+  -DBUILD_WALLET_TOOL=OFF -DENABLE_WALLET=OFF -DENABLE_IPC=OFF -DWITH_CCACHE=OFF
+  -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF)
+cmake -S . -B build-rebirth "${COMMON[@]}" -DBUILD_FLOWMESH2=ON
 cmake --build build-rebirth --target fm2_all --parallel 4   # every fm2 target (the nm guard needs all of them)
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
@@ -679,23 +687,43 @@ ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 Isolation and sanitizer checks:
 
 ```sh
-cmake -S . -B build-rebirth/off  $COMMON -DBUILD_FLOWMESH2=OFF          # no fm2_* target may exist
-cmake -S . -B build-rebirth/asan $COMMON -DBUILD_FLOWMESH2=ON \
+cmake -S . -B build-rebirth/off  "${COMMON[@]}" -DBUILD_FLOWMESH2=OFF   # no fm2_* target may exist
+cmake -S . -B build-rebirth/asan "${COMMON[@]}" -DBUILD_FLOWMESH2=ON \
   -DSANITIZERS=address,undefined -DFLOWMESH2_SANITIZER_CANARIES=ON
-cmake -S . -B build-rebirth/tsan $COMMON -DBUILD_FLOWMESH2=ON \
+cmake -S . -B build-rebirth/tsan "${COMMON[@]}" -DBUILD_FLOWMESH2=ON \
   -DSANITIZERS=thread -DFLOWMESH2_SANITIZER_CANARIES=ON
+cmake -S . -B build-rebirth/ubsan "${COMMON[@]}" -DBUILD_FLOWMESH2=ON \
+  -DSANITIZERS=undefined -DFLOWMESH2_SANITIZER_CANARIES=ON   # macOS: see O-22
+EV=<evidence bundle directory>
+cmake --build build-rebirth/ubsan --target fm2_all --parallel 8
+python3 -I -B contrib/flowmesh2/evidence.py run --dir "$EV" --label canary_ubsan \
+  --env UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 --expect nonzero \
+  --expect-output 'runtime error: signed integer overflow' --timeout 120 -- \
+  build-rebirth/ubsan/bin/fm2_canary_ubsan
+python3 -I -B contrib/flowmesh2/evidence.py run --dir "$EV" --label ctest_ubsan \
+  --env UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 -- \
+  ctest --test-dir build-rebirth/ubsan -L flowmesh2 --no-tests=error --output-on-failure
+python3 -I -B contrib/flowmesh2/evidence.py verify --dir "$EV" --require-expectations
 ```
 
-The canaries must exit non-zero before any ctest result is trusted. macOS runs
-are provisional evidence only; the Linux CI workflow is the gate (M0-CI-01).
-Test temporary directories go under `build-rebirth/fm2-test-tmp/`.
+`FLOWMESH2_SANITIZER_CANARIES=ON` builds one canary per sanitizer named in
+`SANITIZERS` (`fm2_canary_asan`, `fm2_canary_ubsan`, `fm2_canary_tsan`; sources
+in `contrib/flowmesh2/canaries/`) and refuses to configure without a
+sanitizer. A canary must exit non-zero **with its sanitizer's report**
+(`--expect-output`) before any ctest result of that build is trusted; a crash
+or a hang without the report does not count. The canaries are not CTests, so
+they can never be counted as passing tests. macOS runs are provisional
+evidence only; the Linux CI workflow `.github/workflows/flowmesh2.yml` (jobs
+`guards`, `asan-ubsan`, `tsan`; first run M0-CI-01) is the gate. On the
+current macOS host only UBSan works (O-22). Test temporary directories go
+under `build-rebirth/fm2-test-tmp/`.
 
 ### 13.3 CTests (label `flowmesh2`)
 
 `flowmesh2_foundations` (C1, still exactly 19 cases), `flowmesh2_unit` (R1),
-`flowmesh2_inventory` (R1), `flowmesh2_todo_lint` (R1), `flowmesh2_sim`
-(R14), `flowmesh2_guards`, `flowmesh2_guards_selftest`,
-`flowmesh2_negative_compile` (Clang only), `flowmesh2_evidence_selftest` (R2),
+`flowmesh2_inventory` (R1), `flowmesh2_todo_lint` (R1), `flowmesh2_guards`
+(R2), `flowmesh2_guards_selftest` (R2), `flowmesh2_negative_compile` (R2,
+Clang only), `flowmesh2_evidence_selftest` (R2), `flowmesh2_sim` (R14),
 `flowmesh2_sim_cli_determinism` (R14).
 
 - **Inventory:** `test/INVENTORY.txt` lists every case (`suite/case`, sorted
@@ -718,6 +746,32 @@ Test temporary directories go under `build-rebirth/fm2-test-tmp/`.
   `fm2_verify`; no V1 symbols in `test_flowmesh2` or `fm2-sim`); link isolation;
   TODO consistency; the C1 freeze; signing confinement (`bls::SecretKey` and
   `.Sign(` only in `storage/seat_signer.cpp`, `dev/`, `test/`, `sim/`).
+  As landed in R2: `--source` runs rules 1, 2, 4, 5, 6 and 7 and `--nm
+  BUILD_DIR` runs rules 3 and 4 over `fm2_libs.manifest`; CTest
+  `flowmesh2_guards` runs both on the real tree and build. Comments and string
+  literals are stripped before the token rules. Rule 5 also requires: the stub
+  ID is a literal at the call site; a tag names a row whose status is
+  `outline`, or `todo` while none of its slices has landed (never `done`,
+  never a `NONE` row); a `STUB`/`REAL-REPLACE` row with a landed slice is not
+  `todo`; an `outline` `REAL-REPLACE` row has a tag; a stub_inventory case is
+  either `FM2_STUB_CASE(<ID_>, "<ID>")` in C++ test code or a Python method
+  `test_stub_<ID_>` in `contrib/flowmesh2/test_*.py`; Python stubs are
+  `not_implemented("<ID>")` in `contrib/flowmesh2/*.py`. Rule 6 also refuses a
+  later CMake command that modifies a C1 target. Stricter than the slice text
+  (O-23): `std::*timed_mutex` and `using namespace std` everywhere;
+  floating-point literals, `std::chrono`, `std::thread` and the headers
+  `<stdio.h>`, `<ctime>`, `<time.h>`, `<cmath>`, `<math.h>`,
+  `<unordered_map>`, `<unordered_set>`, `<future>`, `<condition_variable>`,
+  `util/time.h`, `random.h`, `logging.h`, `util/fs.h`, `util/fs_helpers.h` in
+  the deterministic directories; `verify/` includes no
+  `flowmesh2/{ledger,engine,state,storage}/` header; `->Sign(` is confined like
+  `.Sign(`; the C1 library is held to the node-symbol rule. A quoted include
+  is checked both relative to its file and on the include path.
+  `test_check_guards.py` (CTest `flowmesh2_guards_selftest`) builds a clean
+  fake repository from `guard_fixtures/clean/` plus the real C1 files and
+  plants one violation per scenario (130 scenarios, including one per list
+  entry and real compiled objects for rule 3); each must fail with exactly its
+  rule.
 - **Negative compile** (`check_negative_compile.py`, Clang only): a missing
   `LOCK`, an ignored `Result` and a forged `Durable*` token each fail to compile
   with the diagnostic named on the file's `FM2_EXPECT_ERROR` line; each file
@@ -918,6 +972,8 @@ outline does not resolve on its own.
 | O-19 | Protected gate files | CI workflow, guard lists, inventory floors, C1 hashes, profile JSON and registries are owner-protected (plan §10.5) |
 | O-20 | Header fields | Adds `profile_hash`, `authority_epoch`, `facts_root`; `actions_root` covers the exact original bytes |
 | O-21 | The macOS `<math.h>` defines `OVERFLOW` and `DOMAIN` as macros, so an enumerator or constant with either name breaks any translation unit that includes `<cmath>` first | R1 names error code 6 `ARITHMETIC_OVERFLOW` (integer unchanged). The R3 tag registry must not use a bare `DOMAIN` identifier either (the tag string `B3/FM2/DOMAIN` is unaffected). The R1 tests include `<cmath>` before the fm2 headers to catch this |
+| O-22 | On the current macOS host (macOS 26.5.2, Apple clang 17.0.0 from the Command Line Tools, SDK 15.5, no Xcode or Homebrew LLVM) the ASan runtime spins forever in `AsanInitInternal` (dyld's `_Block_copy` calls `malloc` during shadow setup, which re-enters ASan init) and the TSan runtime segfaults before `main`, even for a hello-world program. UBSan works | R2 records the ASan and TSan canaries as **not flagged** (hang killed by the watchdog; SIGSEGV without a report) and adds a UBSan-only local build. ASan and TSan evidence must come from the Linux workflow (M0-CI-01) or a newer toolchain; installing one is an owner decision |
+| O-23 | The slice text lists the guard patterns; R2 adds stricter ones (section 13.3) | Additions only tighten. The owner may drop any of them before M0-AUD-01; until then they are part of the protected guard lists |
 
 ---
 

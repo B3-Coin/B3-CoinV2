@@ -6,8 +6,10 @@ This is the complete task list for the new core. Claude builds the outline
 auditing the outline (M0-AUD-01). The design is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Landed outline slices: **R1** (build gate, error model, Boost.Test runner,
-inventory and TODO lint). Its row is `outline` until M0-AUD-01 accepts it.
-Every other row is `todo`, except the C1 baseline, which is `done`.
+inventory and TODO lint) and **R2** (guards, compile-fail controls, evidence
+tool, sanitizer canaries, CI workflow). Their rows are `outline` until
+M0-AUD-01 accepts them, and so is M0-EVD-01, the stub R2 adds. Every other row
+is `todo`, except the C1 baseline, which is `done`.
 
 ---
 
@@ -43,10 +45,17 @@ gap; every `STUB`/`REAL-REPLACE` row names existing slices and a location, and
 is `outline` only if one of its slices has landed; `NONE` rows have Slice `—`
 and are never `outline`; Task, Acceptance and Evidence are not empty. Its
 `--selftest` proves each rule fires on a doctored copy.
-From R2 on, `check_guards.py` checks that every `NotImplemented`/`Unsupported`
-site and every refusal marker has a `TODO(rebirth:<ID>)` within 3 lines, that
-every tag names a row here, and that every `STUB` row with status `outline` has
-at least one tag and one `stub_inventory` case.
+From R2 on, `check_guards.py` rule 5 (CTest `flowmesh2_guards`) checks that
+every `NotImplemented`/`Unsupported` site (with a literal ID) and every
+refusal marker has a `TODO(rebirth:<ID>)` within 3 lines, that every tag names
+a row here, that every `STUB` row with status `outline` has at least one tag
+and one `stub_inventory` case, and that every `REAL-REPLACE` row with status
+`outline` has a tag. A tag may name an `outline` row, or a `todo` row while
+none of its slices has landed (work in progress inside a slice); never a
+`done` or `NONE` row. A `STUB`/`REAL-REPLACE` row whose slice has landed is
+not `todo`. A stub_inventory case is `FM2_STUB_CASE(<ID_>, "<ID>")` in C++
+test code or, for a stub in a contrib script, a Python test method
+`test_stub_<ID_>` in `contrib/flowmesh2/test_*.py`.
 
 **Rules for Codex.**
 
@@ -105,7 +114,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
 |---|---|---|---|---|---|---|---|---|---|
 | R1 | R | outline | — | R1 | Build gate `BUILD_FLOWMESH2`, `[[nodiscard]]` `Result`/`ErrorCode`, `OutcomeCode`/`AdmissionCode`, Boost.Test runner, inventory and TODO lint (these docs landed first) | top-level `CMakeLists.txt` (4 lines); `src/flowmesh2/CMakeLists.txt`; `core/result`, `core/codes`; `test/`; `contrib/flowmesh2/check_inventory.py`, `check_todo.py` | `Result<int>`/`Result<void>` not default-constructible (static_assert); `NotImplemented` carries the exact ID; every enum integer pinned; both lint scripts fail on doctored copies, including a listed case that did not run; OFF configure has no `fm2_*` target; ON without the foundation option fails to configure; C1 still 19 cases; `ctest -L flowmesh2 --no-tests=error` green | scratch:R1/ | G-1, G-2, G-4 |
-| R2 | R | todo | — | R2 | Guards (7 rules) with self-tests, compile-fail controls, `evidence.py`, sanitizer canaries, CI workflow | `contrib/flowmesh2/`; `test/compile_fail/`; `.github/workflows/flowmesh2.yml` | each rule's planted fixture fails and a clean one passes; guards pass on the tree (`--source`, `--nm build-rebirth`); missing `LOCK`, ignored `Result` and forged token fail to compile, positive control compiles; `evidence verify` fails on a tampered, deleted or extra file; macOS ASan, UBSan and TSan canaries exit non-zero | scratch:R2/ | SEC-8, plan §4, O-19 |
+| R2 | R | outline | — | R2 | Guards (7 rules) with self-tests, compile-fail controls, `evidence.py`, sanitizer canaries, CI workflow | `contrib/flowmesh2/` (`check_guards.py`, `test_check_guards.py`, `guard_fixtures/`, `check_negative_compile.py`, `evidence.py`, `test_evidence.py`, `canaries/`); `test/compile_fail/`; `storage/durable.h` (token type only); `src/flowmesh2/CMakeLists.txt` (`fm2_all`, `fm2_libs.manifest`, `FLOWMESH2_SANITIZER_CANARIES`); `.github/workflows/flowmesh2.yml` | each rule's planted fixture fails and a clean one passes; guards pass on the tree (`--source`, `--nm build-rebirth`); missing `LOCK`, ignored `Result` and forged token fail to compile, positive control compiles; `evidence verify` fails on a tampered, deleted or extra file; macOS ASan, UBSan and TSan canaries exit non-zero | scratch:R2/ | SEC-8, plan §4, O-19 |
 | R3 | R | todo | — | R3 | Core primitives, profile, authority types, slot header | `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot`; `PROFILE_DEX1_REGTEST.json` | `AccountId` golden; overflow refused at `MAX_ATOMS` edges and for negatives; `MulDiv` exhaustive on a small domain; tags unique, prefixed, golden, no collision with existing `B3/` tags; trailing bytes, oversize counts (no allocation) and non-canonical `CompactSize` refused; MAIN/TESTNET/TESTNET4/SIGNET give `UNSUPPORTED_NETWORK`; JSON `profile_hash` equals code; Merkle sizes 0..17 equal a naive reference, tampering fails, duplicated last leaf changes the root; header round trip, `Hash ≠ CommitDigest`, golden, every field changes `Hash` | scratch:R3/ | D6, D7, O-9, O-20 |
 | R4 | R | todo | — | R4 | Signed actions, slot body, outcomes, facts, certificate, seat set, shared spec functions | `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math`; `test/util/keys.h` | BIP340 round trip; flipped bit and other domain fail; `Id` excludes the signature; payload 4,096 ok, 4,097 `OVERSIZE`; `max_delay` 0 and 1,025 flagged; golden bytes and `Id`; `VerifiedAction` only via `Verify` (static_assert); body of 1,025 originals refused; two signatures give two `ActionLeaf`s; bitmap golden, bits ≥ k refused; `SeatSet` refuses bad PoP and duplicates; quorum table k=1..10; nonce rule exhaustive for W=3; fee increments sum to ceil(total·ppm/1e6); split exhaustive F=0..10,000 | scratch:R4/ | D5, D7, O-8, TRD-17 |
 | R5 | R | todo | — | R5 | Shared ledger, nonce window, commitment v0 | `ledger/nonce_window`, `ledger`, `state_commitment` | W=3 insert sequences of length ≤ 7 equal a naive model; W=100 boundaries (`NONCE_TOO_LOW`, `NONCE_USED`, eviction); duplicate outpoint refused; over-reserve leaves state unchanged; transfer refusals; 64 seeds × 10,000 random ops keep conservation equal to an independent tally; root deterministic and insertion-order independent; proofs verify | scratch:R5/ | TRD-10, O-7 |
@@ -132,7 +141,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M0-GUIX-01 | M0 | todo | NONE | — | Guix build of the fm2 binaries on 2 hosts | new | identical hashes | M0/M0-GUIX-01/ | SEC-6 |
 | M0-SIM-01 | M0 | todo | REAL-REPLACE | R14 | Record/replay and trace minimizer | `sim/scheduler.cpp` | 1,000 seeds replay byte-identical; a planted failure is minimized | M0/M0-SIM-01/ | plan M0 |
 | M0-SPEC-01 | M0 | todo | NONE | — | Quint/Apalache toolchain and PBFT spec skeleton | new | the spec check runs in CI | M0/M0-SPEC-01/ | D9, OWNER-GATED |
-| M0-EVD-01 | M0 | todo | STUB | R2 | PERF-7 metadata: fsync probe, RTT matrix, `nr_throttled`, B3-advanced flag, topology | `evidence.py perf-metadata` (exits 3) | `verify` fails when a field is missing | M0/M0-EVD-01/ | PERF-6, PERF-7 |
+| M0-EVD-01 | M0 | outline | STUB | R2 | PERF-7 metadata: fsync probe, RTT matrix, `nr_throttled`, B3-advanced flag, topology | `evidence.py perf-metadata` (exits 3) | `verify` fails when a field is missing | M0/M0-EVD-01/ | PERF-6, PERF-7 |
 
 ## M1 — [CC] C1 plus guard addendum
 

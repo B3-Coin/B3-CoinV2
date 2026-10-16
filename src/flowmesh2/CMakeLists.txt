@@ -158,6 +158,35 @@ if(BUILD_FLOWMESH2)
     )
   endif()
 
+  # Sanitizer canaries (slice R2), default OFF. One deliberately defective
+  # program per sanitizer in SANITIZERS. Each must exit non-zero with its
+  # sanitizer's report before any ctest result of the build is trusted; CI
+  # (.github/workflows/flowmesh2.yml) and contrib/flowmesh2/evidence.py
+  # (`run --expect nonzero`) run them first. Not CTests, so a canary can never
+  # count as a passing test. Sources live outside src/flowmesh2/ because they
+  # break the guard rules on purpose.
+  option(FLOWMESH2_SANITIZER_CANARIES "Build the flowmesh2 sanitizer canaries (each must exit non-zero)." OFF)
+  if(FLOWMESH2_SANITIZER_CANARIES)
+    set(fm2_canaries "")
+    if(SANITIZERS MATCHES "(^|,)address($|,)")
+      list(APPEND fm2_canaries asan)
+    endif()
+    if(SANITIZERS MATCHES "(^|,)undefined($|,)")
+      list(APPEND fm2_canaries ubsan)
+    endif()
+    if(SANITIZERS MATCHES "(^|,)thread($|,)")
+      list(APPEND fm2_canaries tsan)
+    endif()
+    if(NOT fm2_canaries)
+      message(FATAL_ERROR "FLOWMESH2_SANITIZER_CANARIES=ON needs SANITIZERS to contain address, undefined or thread (got '${SANITIZERS}')")
+    endif()
+    foreach(fm2_canary IN LISTS fm2_canaries)
+      add_executable(fm2_canary_${fm2_canary} ${PROJECT_SOURCE_DIR}/contrib/flowmesh2/canaries/${fm2_canary}_canary.cpp)
+      target_link_libraries(fm2_canary_${fm2_canary} PRIVATE core_interface)
+    endforeach()
+    message(STATUS "flowmesh2 sanitizer canaries: ${fm2_canaries}")
+  endif()
+
   # -------------------------------------------------------------------------
   # KEEP THIS SECTION LAST: it enumerates every target of this directory.
   #

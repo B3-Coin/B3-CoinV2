@@ -63,8 +63,13 @@ Landed so far: **R1**, the `BUILD_FLOWMESH2` gate (default OFF; it requires
 `BUILD_TESTS` and `BUILD_FLOWMESH2_FOUNDATION_TESTS`), the `[[nodiscard]]`
 `Result`/`Error` model and code registries in `core/`, the Boost.Test binary
 `test_flowmesh2` with its case inventory `test/INVENTORY.txt`, and the lint
-scripts `contrib/flowmesh2/check_inventory.py` and `check_todo.py`. Nothing is
-linked into the node, wallet or Qt.
+scripts `contrib/flowmesh2/check_inventory.py` and `check_todo.py`; and
+**R2**, the seven guards `contrib/flowmesh2/check_guards.py` with their
+fixture self-test, the compile-fail controls in `test/compile_fail/`, the
+evidence bundle tool `contrib/flowmesh2/evidence.py`, the sanitizer canaries
+(`-DFLOWMESH2_SANITIZER_CANARIES=ON`, default OFF) and the owner-protected CI
+workflow `.github/workflows/flowmesh2.yml`, which the outline never runs.
+Nothing is linked into the node, wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -76,8 +81,10 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R1: 4 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 15 cases, `flowmesh2_inventory`,
-`flowmesh2_todo_lint`). Open gates (workspace lock reconciliation, decision
+Expected after R2: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 16 cases, `flowmesh2_inventory`,
+`flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
+`flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`).
+Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2. Open gates (workspace lock reconciliation, decision
 D3) are listed in ARCHITECTURE.md §0. All outline values are provisional and
 REGTEST-only.
