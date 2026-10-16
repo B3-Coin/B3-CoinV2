@@ -934,7 +934,12 @@ BOOST_AUTO_TEST_CASE(chain_anchor_immutable_ancestry_is_exact_and_not_canonical_
         BOOST_REQUIRE(index != nullptr);
         return AnchorRef{height, index->GetBlockHash()};
     };
-    const auto early{anchor_at(20)}, orphan_root{anchor_at(90)}, late{anchor_at(100)};
+    // B3's inherited TestChain100Setup name is not its chain height: the
+    // fixture mines COINBASE_MATURITY (currently 30) blocks. Bind positions
+    // to the actual initialized chain without changing its setup or rules.
+    const int tip_height{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height())};
+    BOOST_REQUIRE_GE(tip_height, 10);
+    const auto early{anchor_at(tip_height - 10)}, orphan_root{anchor_at(tip_height - 2)}, late{anchor_at(tip_height)};
     FixedAnchors unsupported;
     BOOST_CHECK(!unsupported.ProvesImmutableAncestry(early, late)); // Default is no capability.
     BOOST_CHECK(policy.ProvesImmutableAncestry(early, late));
@@ -956,7 +961,7 @@ BOOST_AUTO_TEST_CASE(chain_anchor_immutable_ancestry_is_exact_and_not_canonical_
     BOOST_CHECK(policy.ProvesImmutableAncestry(early, late)); // Parentage survives orphaning.
     BOOST_CHECK(policy.ProvesImmutableAncestry(orphan_root, late));
     CreateAndProcessBlock({}, CScript{} << OP_TRUE);
-    const auto fork{anchor_at(90)};
+    const auto fork{anchor_at(orphan_root.height)};
     BOOST_REQUIRE(fork.hash != orphan_root.hash);
     BOOST_CHECK(policy.ProvesImmutableAncestry(early, fork));
     BOOST_CHECK(!policy.ProvesImmutableAncestry(orphan_root, fork));
