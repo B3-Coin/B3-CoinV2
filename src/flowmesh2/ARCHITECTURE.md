@@ -8,10 +8,12 @@ guards with self-tests, compile-fail controls, evidence tool, sanitizer
 canaries, CI workflow, and the durability token type), slice **R3** (core
 primitives: checked amounts, ids, tag registry, exact codec, the provisional
 profile, authority types, size-bound Merkle trees, markets and the slot
-header) and slice **R4** (signed actions, slot bodies, outcomes, chain facts,
+header), slice **R4** (signed actions, slot bodies, outcomes, chain facts,
 certificates, seat sets, the account leaf and the shared nonce and fee spec
-functions). Everything else described here is the contract that the outline
-slices R5 to R14 will build.
+functions) and slice **R5** (the shared spot ledger with nonce windows,
+fee withholding and conservation, the protocol accounts, and state
+commitment v0 with account proofs). Everything else described here is the
+contract that the outline slices R6 to R14 will build.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
@@ -131,7 +133,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `core/result`, `core/codes` | R1 | `ErrorCode` 1..17, `Error`, `[[nodiscard]] Result<T>` with `Result() = delete` and `Ok()`, `TaskId`, `NotImplemented`, `Unsupported`; `OutcomeCode` and `AdmissionCode` registries | — | — |
 | `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot` | R3 | `AssetId`, `AccountId::FromKey`, `MarketId`, `ActionId`, `OrderId::FromPlace`, `Outpoint`; checked `Atoms` (`AddAtoms`, `SubAtoms`, `MulChecked`, `MulDivFloor`/`Ceil`); tag registry (29 tags); `DecodeExact`, `ReadCappedVector`, `WriteCappedVector`; `NetworkId`, `ProfileParams`, `DevRegtestProfile`, `Validate`, `EncodeProfile`, `ProfileHash`, `DomainHash`; `Anchor`, `FactCursor`, `AuthorityVersion`; `MarketDescriptor`, `BaseAtoms`, `QuoteAtoms`; size-bound RFC 6962 Merkle (O-25); `SlotHeaderV2`, `GenesisHeader` | `Validate()`: price band (M3-ENG-03), `PER_SIDE` fees (M3-ENG-08), futures (M9-FUT-01), `FOLDED` signer (M4-STO-05) | per-market tick/lot (M3-ENG-11) |
 | `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math` | R4 | `ActionV2` exact capped codec, `UnsignedMsg`, `Id`, `Account`, BIP340 `VerifySignature`, `MaxDelayValid`, PLACE/CANCEL/TRANSFER/WITHDRAW payload codecs, `KindSupported`; `VerifiedAction::Verify`; `SlotBody` codec, `BodyHash`, `ActionLeaf`, `ActionsRoot`, `FactsRoot`; `OutcomeV2` codec and `LeafHash`; `DepositFact` codec and `FactId`; `SlotCertificate` codec, `Hash`, `SignerIndices`, `MakeBitmap`; `SeatSet::FromPoP`, `Quorum`, `Root`, `Keys`; `AccountLeafV0` codec and `LeafValue`; `ClassifyNonce`, `NonceInsert`, `InExpiryWindow`, `ExpiredAt`; `SellerFeeTotal`, `SellerFeeIncrement`, `SplitSlotFees` | codecs and `FactId` of five facts: seat change (M7-SEAT-01), listing (M7-GOV-01), checkpoint accepted (MB1-B3D-02), payout confirmed (M8-BRG-02), exit nullifier (M8-EXIT-01); `BatchVerifier::VerifyBatch` (M4-ADM-01) | nonce rule (M2-ADM-01) |
-| `ledger/` | R5 | `NonceWindow`, `LedgerState` (deposit, reserve, release, pay, credit, transfer, conservation), protocol accounts, `CommitV0`, `ProveAccountV0` | `RequestWithdrawal` (M2-LED-05), futures transfers (M2-LED-06), `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) | duplicate-fact rules (M2-LED-07), seat-pool account (M7-FEE-01) |
+| `ledger/`, `core/state_root` | R5 | `NonceWindow` (over the core D7 rule), `AdmissionCodeFor`; `LedgerState` (deposit with outpoint nullifier, reserve, release, pay from reserved with fee withholding, credit to protocol accounts, transfer, nonces, open orders, `CheckConservation`), all atomic; protocol accounts `SeatPoolAccount`/`TreasuryAccount`; `AssetTotals`, `TotalsLeafV0`, `MarketLeafValue`, `NullifierLeafValue`, `StateRootsV0`; `CommitV0`, `ProveAccountV0` | `RequestWithdrawal` (M2-LED-05), `TransferToFutures`/`TransferFromFutures` (M2-LED-06), `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) | duplicate-fact rules (M2-LED-07), seat-pool account (M7-FEE-01) |
 | `engine/book`, `matcher`, `residual` | R6 | `OrderBook`, `BookSet`, `SweepA2` with pairing and fees | `ResolveResidualCross` (M3-ENG-02), `PriceBandCheck` (M3-ENG-03) | book (M3-ENG-01), pairing (M3-ENG-14), self-trade (M3-ENG-13) |
 | `engine/engine` | R7 | `ValidateSlotInputs`, `CanonicalOrder`, `Engine::ApplySlot` phases 1-6, 8, 9 | `CANCEL_ALL` (M3-ENG-09), `WITHDRAW` (M2-LED-05), phase 7 futures (M9-FUT-04); residual cross as certified refusal (M3-ENG-02) | order seed (M3-ENG-12), caps (M3-ENG-04), validity predicate (M4-AGR-11) |
 | `storage/` | R8 | record framing, `Journal`, `MemoryJournal`, `FileJournal::CreateNew`, `JournalCommit`, `JournalDirectoryCommit`, `Pending<T>`, minting of the `Durable*` tokens (type landed in R2), `SignerLog`, `SeatSigner`, `CommitLog`; `agreement/outbound.h` | `OpenExisting`/`ReadAll` (M4-STO-01), `LogWriter` (M4-STO-02), `SnapshotStore` (M4-STO-03), folded signing (M4-STO-05), `Rollover` (M4-STO-06), view-state records (M4-STO-07) | — |
@@ -152,7 +154,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `fm2_warnings` | INTERFACE: Clang/AppleClang `-Wthread-safety -Werror=thread-safety`; all compilers `-Werror=unused-result` | — |
 | `fm2_types` | `core/` | `core_interface` and, since R4, `secp256k1` (private); `bitcoin_consensus` (`hash.cpp`, `uint256.cpp`, `pubkey.cpp` with `XOnlyPubKey::VerifySchnorr`), `bitcoin_crypto` (SHA-256 and `crypto/bls`) and `bitcoin_util` (public, since R3). Never `bitcoin_common` |
 | `fm2_verify` | `verify/` | `fm2_types`, `bitcoin_crypto` (never `fm2_core`) |
-| `fm2_core` | ledger, engine, state, storage, chain, agreement, admission, read, net, bridge, futures, governance | `fm2_types`, `flowmesh2_foundations`, `crc32c`, `bitcoin_util` |
+| `fm2_core` | ledger, engine, state, storage, chain, agreement, admission, read, net, bridge, futures, governance; application code lives in namespaces `flowmesh2::ledger`, `::engine`, `::state`, `::storage` (guard rule 3 matches them) | `fm2_types` (public, since R5); `flowmesh2_foundations`, `crc32c` and `bitcoin_util` join with the slices that need them |
 | `fm2_dev` | `dev/` (compiled with `FM2_DEV_COMPONENTS`) | `fm2_core` |
 | `fm2_simlib` | `sim/` | `fm2_dev`, `fm2_core`, `fm2_verify`, `bitcoin_common` (for `CKey` only) |
 | `test_flowmesh2` | `test/` | all of the above, `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files; global fixture `ECC_Context` (`test/main.cpp`) |
@@ -198,8 +200,12 @@ header marked *landed* is normative; the others are the target contract.
 | `core/account_leaf.h` | R4 | landed | `AccountLeafV0` exact capped codec with the canonical form enforced, `LeafValue` = `Tagged(STATE_ACCOUNTS, bytes)`, lookups |
 | `core/nonce_rule.h` | R4 | landed | D7 spec: `ClassifyNonce`, `NonceAcceptable`, `NonceInsert`, `InExpiryWindow`, `ExpiredAt` (REAL-REPLACE M2-ADM-01) |
 | `core/fee_math.h` | R4 | landed | D5 spec: `SellerFeeTotal`, `SellerFeeIncrement` (ceiling on the cumulative per-order fee), `SplitSlotFees` (floor to seats, residual to treasury); PROVISIONAL, gate G-2 |
+| `core/state_root.h` | R5 | landed | commitment v0 value types shared with b3verify (O-33): `SeatPoolAccount`/`TreasuryAccount` = `Tagged(PROTOCOL_ACCOUNT, name ‖ profile_hash)`; `AssetTotals{deposits, effects, pending, fees_held}`; 64-byte `TotalsLeafV0` (exact decode, all-zero refused); `MarketLeafValue`, `NullifierLeafValue`; `StateRootsV0` (160 bytes) and `Root()` = `Tagged(STATE, u8 0 ‖ five roots)`; `COMMITMENT_VERSION_V0` |
 | `test/util/keys.h` | R4 | landed | TEST keys from labels: `CKey` and `bls::SecretKey::FromIKM` from `SHA256(label)`, `SignDigest` |
-| `ledger/nonce_window.h`, `ledger.h`, `state_commitment.h` | R5 | target | section 11; commitment v0 (O-9) |
+| `test/util/ledger_fixtures.h` | R5 | landed | TEST fixtures for ledger and commitment tests: `TestAsset`, `TestAccount`, `TestOutpoint`, `Deposit`, markets M1/M2, `EmptyLedger`, `RequireOk`/`RequireError`/`RequireStub` (read `error()` only on failure) |
+| `ledger/nonce_window.h` | R5 | landed | `NonceWindow` (`Create`, `FromUsed`, `Classify`, `Insert`; no rule of its own, the core D7 functions), `AdmissionCodeFor` (USED → `NONCE_USED`, TOO_LOW → `NONCE_TOO_LOW`) |
+| `ledger/ledger.h` | R5 | landed | `LedgerState` value type, no lock, atomic operations (an Error or rejection changes nothing): `CreditDeposit`, `Reserve` (OK/INSUFFICIENT), `Release`, `PayFromReserved(from, to, asset, amount, withheld_fee)`, `Credit` (protocol accounts, from `fees_held`), `Transfer` (O-7 outcomes), `ConsumeNonce`, `AddOpenOrder` (OK/AT_CAP), `RemoveOpenOrder`, `Leaf`, `CheckConservation` (also a free function over explicit maps); stubs `RequestWithdrawal` (M2-LED-05), `TransferToFutures`/`TransferFromFutures` (M2-LED-06) |
+| `ledger/state_commitment.h` | R5 | landed | `CommitV0(ledger, markets, orders)` → `StateRootsV0`, `OrderLeafV0` (R7 defines its value), `ProveAccountV0` → `AccountWitnessV0{leaf, proof}`; stubs `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) |
 | `engine/book.h`, `matcher.h`, `residual.h`, `engine.h` | R6, R7 | target | section 11 |
 | `storage/durable.h` | R2 | landed | `DurableKind`, move-only `Durable<K>` tokens with a private constructor whose only friend is `Journal` (R8 mints them); section 7.2 |
 | `storage/*.h` (others), `agreement/outbound.h` | R8 | target | section 7 |
@@ -591,6 +597,25 @@ existing `"B3/..."` literals: none equals an fm2 tag and none uses the
 - Commitment v0 (O-9): sorted-leaf RFC 6962 roots for accounts, orders,
   markets, nullifiers and totals, under a root-of-roots tagged `STATE`. The
   planned sparse Merkle tree is M2-LED-02.
+- As landed in R5 (`core/state_root.h`, `ledger/state_commitment.h`; all
+  PROVISIONAL REGTEST, O-32): each component is `MerkleRoot` of its leaf
+  values in ascending key order, every key once, so the root depends on the
+  state alone:
+
+  | Component | Key | Leaf value |
+  |---|---|---|
+  | accounts | `AccountId` | `Tagged(STATE_ACCOUNTS, AccountLeafV0)` of the canonical leaf |
+  | orders | `OrderId` | given by the caller as `OrderLeafV0`; empty until R7 defines it |
+  | markets | `MarketId` | `Tagged(STATE_MARKETS, 80-byte descriptor)` |
+  | nullifiers | `Outpoint` | `Tagged(STATE_NULLIFIERS, txid ‖ u32 vout)`, one per credited deposit |
+  | totals | `AssetId` | `Tagged(STATE_TOTALS, asset ‖ i64 deposits ‖ i64 effects ‖ i64 pending ‖ i64 fees_held)` |
+
+  `state_root = Tagged(STATE, u8 0 ‖ accounts ‖ orders ‖ markets ‖
+  nullifiers ‖ totals)`; the version byte separates v0 from the SMT roots of
+  v1. Protocol accounts are `Tagged(PROTOCOL_ACCOUNT, "SEAT_POOL" ‖
+  profile_hash)` and `Tagged(PROTOCOL_ACCOUNT, "TREASURY" ‖ profile_hash)`
+  (raw ASCII, then the 32 bytes). `ProveAccountV0` gives the leaf and its
+  `MerkleProof` under the accounts root; v0 has no absence proof.
 
 **Within-slot order (PROVISIONAL, O-4 and O-4b).** Sort originals by
 `Tagged(ORDER, parent_header_hash ‖ height ‖ ActionId)`, then give each
@@ -682,7 +707,9 @@ exceeded action or byte caps; facts not contiguous with the parent's
 6. Rest the GTC residual with `arrival_rank` = canonical rank.
 7. Futures: `NotImplemented(M9-FUT-04)`, only reachable if `futures_enabled`.
 8. Fees: one `FEES_DISTRIBUTED` outcome per quote asset.
-9. `CheckConservation` per asset. Failure gives `INVARIANT` and no candidate.
+9. `CheckConservation` per asset: Σ(available + reserved) + pending +
+   fees_held = deposits − effects (O-31). Failure gives `INVARIANT` and no
+   candidate.
 
 Every executed action consumes its nonce, including deterministic rejections
 (DUR-5).
@@ -698,7 +725,12 @@ ruling). Self-trade executes normally (O-17, M3-ENG-13).
 **Fees (D5, O-6).** The seller pays 100 ppm of matched notional once, in the
 quote asset: each fill charges `ceil(cum_quote · ppm / 1e6) − fee_charged` for
 that order. Per slot, the seat pool gets ⌊80%⌋ and the treasury gets the rest.
-Protocol accounts: `Tagged(PROTOCOL_ACCOUNT, name ‖ profile_hash)`. As landed
+Protocol accounts: `Tagged(PROTOCOL_ACCOUNT, name ‖ profile_hash)`. In the
+ledger (R5) the engine settles the quote leg of a fill with
+`PayFromReserved(buyer, seller, quote, q, fee_increment)`: the seller
+receives q − fee and the fee waits in the asset's `fees_held`; phase 8
+`Credit`s ⌊80%⌋ of the slot total to the seat pool and the rest to the
+treasury, so `fees_held` is zero at every slot boundary. As landed
 in R4 (`core/fee_math.h`): `SellerFeeTotal(q)` = ⌈q · ppm / 10⁶⌉,
 `SellerFeeIncrement(q0, q1)` = `SellerFeeTotal(q1) − SellerFeeTotal(q0)`, and
 `SplitSlotFees(F, p)` = {⌊F · p / 100⌋, residual}. The walking-skeleton values
@@ -734,11 +766,11 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R4)
+### 13.1 Today (after R5)
 
-The commands in 13.2 work. They build every fm2 target (`fm2_all`):
-`test_flowmesh2` (139 Boost cases), the unchanged C1 binary and, with the
-option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
+The commands in 13.2 work. They build every fm2 target (`fm2_all`): the
+libraries `fm2_types` and `fm2_core` (since R5), `test_flowmesh2` (173 Boost
+cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
 19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
 `flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
 and `flowmesh2_negative_compile` (Clang). The outline never uses `build/`,
@@ -1034,7 +1066,7 @@ outline does not resolve on its own.
 | O-4b | Plan defect: seed by `parent_cert_hash` is grindable | Seed by `parent_header_hash ‖ height ‖ ActionId`. Needs ratification under D4 (M3-ENG-12) |
 | O-5 | Pro-rata remainder, pairing and residual-cross tie-break | Largest remainder, ties by rank; takers consume makers FIFO; residual cross is a typed refusal (M3-ENG-02, M3-ENG-14) |
 | O-6 | Fee rounding and split | Ceiling on the cumulative per-order fee; ⌊80%⌋ to seats, residual to treasury (D6 dust OPEN) |
-| O-7 | TRANSFER semantics | Same AssetId, both accounts exist, no fee; self and zero refused. PROVISIONAL |
+| O-7 | TRANSFER semantics | Same AssetId, both accounts exist, no fee; self and zero refused. PROVISIONAL. As landed in R5 the order is `REJ_BAD_PARAMS` (self or zero), then `REJ_NO_RECIPIENT`, then `REJ_INSUFFICIENT_AVAILABLE`; only available funds move |
 | O-8 | BIP340 message | The `ActionId` |
 | O-9 | Commitment | `commitment_version = 0` (sorted RFC 6962 trees) instead of the planned SMT (M2-LED-02) |
 | O-10 | Dev certifier k = 1 is below FN-10's k ≥ 4 | REGTEST-only, lives only in `fm2_dev`, guarded out of `fm2_core` |
@@ -1057,6 +1089,10 @@ outline does not resolve on its own.
 | O-27 | Outline caps that are not profile fields | R4 adds provisional constants: `MAX_SLOT_FACTS` = 1,024 and `MAX_FACT_BYTES` = 1,024 (slot body), `MAX_SEATS` = 1,024 (bitmap ≤ 128 bytes), `MAX_LEAF_ASSETS` = 256 (account leaf), `MAX_WITHDRAW_SCRIPT_BYTES` = 128, and an outcome delta cap of 2 · (`max_fills_per_order` + 1). The owner may move any of them into the profile (which changes `profile_hash` and the JSON) |
 | O-28 | `ActionKind` integers | Plan §3.6 lists PLACE, CANCEL, CANCEL_ALL, WITHDRAW, TRANSFER; an earlier draft had TRANSFER = 4, WITHDRAW = 5. R4 follows the plan (WITHDRAW = 4, TRANSFER = 5). The registry is append-only from now on |
 | O-29 | Admission needs `UNKNOWN_KIND` and `WRONG_DOMAIN`, but the R4 slice text says the codec refuses an unknown kind | `ActionV2::Decode` refuses both (DECODE) and marks them with the static details `ACTION_UNKNOWN_KIND` and `ACTION_UNKNOWN_VERSION`; the kind byte has a fixed position, so the refusal is decided before parsing. Admission (R12) compares the detail. A dedicated `ErrorCode` would avoid string matching but changes an owner-protected registry |
+| O-31 | The R5 slice text gives conservation as Σ(available + reserved) + pending = deposits − effects, but D5 splits a **slot's** fee total (⌊80%⌋ / rest), so a fee charged at a fill must be held somewhere until phase 8 | R5 adds `fees_held` per asset: `PayFromReserved` withholds the seller's fee increment from the quote leg into it, and `Credit` (protocol accounts only) pays out of it. Conservation is Σ(available + reserved) + pending + fees_held = deposits − effects, checked after every operation. The engine must leave `fees_held` at zero after phase 8 (R7) |
+| O-32 | Commitment v0 details the plan leaves open | R5 chooses (section 9): leaf values tagged per component and keyed by id; the root-of-roots carries `u8 commitment_version`; a nullifier leaf is the outpoint only; the totals leaf holds deposits, effects, pending and fees_held; all-zero totals and balances are omitted. Every vector is skeleton-only until the SMT (M2-LED-02) |
+| O-33 | Where commitment types live: the slice text puts `TreasuryAccount`/`SeatPoolAccount` and the commitment in `ledger/`, but b3verify (R11) must recompute a state root and may not include ledger headers (guard rule 1) | R5 puts the protocol account ids, `AssetTotals`, `TotalsLeafV0`, the market and nullifier leaf values and `StateRootsV0` in `core/state_root` (fm2_types); the ledger builds the trees in `ledger/state_commitment` |
+| O-34 | Refusals that are errors, not outcomes | A deposit fact with amount 0 or a protocol account as target, a second fact for one outpoint, deposits of an asset above 2^62 in total, and a 257th asset in one account are errors, so a slot carrying one has no valid candidate. The chain adapter (R10, MB1-ADP-06) must never deliver such a fact and R7/M7-GOV-01 must keep the listed assets at most `MAX_LEAF_ASSETS`; otherwise M2-LED-07 must define certified refusals. The cumulative `deposits`/`effects` counters are capped at 2^62 atoms; tracking net custody instead is for M2-LED-03/M2-LED-05. A TRANSFER to an existing protocol account is allowed (O-7 literal); M7-FEE-01 may forbid it |
 | O-30 | Shapes the engine has not pinned yet | `SlotBody` keeps facts as canonical bytes (the body stays decodable without knowing every fact kind; R7's validity predicate decodes them). `OutcomeV2` fields, the delta aggregation rule and the `SLOT` outcome subject are provisional until R6/R7; changing them after R7 changes `outcomes_root` vectors |
 
 ---
