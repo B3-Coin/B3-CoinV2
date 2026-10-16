@@ -114,6 +114,13 @@ if(BUILD_FLOWMESH2)
   )
   set_tests_properties(flowmesh2_guards_selftest PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint;guards")
 
+  # Evidence tool (slice R2): contrib/flowmesh2/evidence.py run/verify.
+  add_test(NAME flowmesh2_evidence_selftest
+    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/test_evidence.py
+      --workdir ${FM2_TEST_TMP}/evidence_selftest
+  )
+  set_tests_properties(flowmesh2_evidence_selftest PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint;evidence")
+
   # Compile-fail controls (slice R2), Clang only: the lock control needs
   # Clang's thread-safety analysis. Each negative control is built twice, as
   # is (must fail with the diagnostic named in the file) and with

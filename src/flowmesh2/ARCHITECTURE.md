@@ -727,7 +727,15 @@ Test temporary directories go under `build-rebirth/fm2-test-tmp/`.
   that only this CTest builds (`RUN_SERIAL`).
 - **Evidence:** `contrib/flowmesh2/evidence.py run` writes `run.json`, logs and
   `MANIFEST.sha256`; `verify` recomputes the manifest. Stdlib only, run with
-  `python3 -I -B`.
+  `python3 -I -B`. `run --dir D --label L [--expect zero|nonzero|any]
+  [--expect-output RE] [--env N=V] [--timeout S] -- CMD` records one step (a
+  label once per bundle) and exits 1 if the expectation is not met; a
+  sanitizer canary is recorded with `--expect nonzero`. `verify` fails on a
+  changed, deleted or extra file, a symbolic link, a malformed, unsorted,
+  duplicated, absolute or escaping manifest entry, or `run.json` log hashes
+  that disagree; `--require-expectations` also requires every step to have
+  met its expectation. `perf-metadata` is the stub of M0-EVD-01 (exit 3).
+  `test_evidence.py` (CTest `flowmesh2_evidence_selftest`) covers all of it.
 
 ### 13.4 C1 freeze
 
