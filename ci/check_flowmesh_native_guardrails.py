@@ -4,7 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Strict, bounded Linux native-test guardrails; never a performance gate.
 
-Version native-guardrails-v8 selects exact compiled Boost suites, not CTest's
+Version native-guardrails-v9 selects exact compiled Boost suites, not CTest's
 skip-on-empty filters. Discovery and detailed XML must agree on every selected
 leaf case. TSan covers instrumented native code, not all system libraries; the
 existing repository suppression file includes a ConnectTip deadlock suppression.
@@ -32,7 +32,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-PROFILE_VERSION = "native-guardrails-v8"
+PROFILE_VERSION = "native-guardrails-v9"
 CONTROL_TIMEOUT = 30
 SUITE_TIMEOUT = 600
 TOTAL_TEST_TIMEOUT = 1800
@@ -93,6 +93,8 @@ REQUIRED_CASES = {
         "local_signature_callback_never_runs_before_signed_sync",
     },
     "flowmesh_client_watch_lane_tests": {
+        "selected_certified_account_proof_remains_available_while_catalog_tls_is_held",
+        "selected_corrupted_state_is_refused_while_catalog_tls_is_held",
         "passive_catalog_tls_leaves_local_status_unsigned_refusal_and_health_available",
         "catalog_owner_is_immediate_busy_reconnect_does_not_reset_and_empty_is_success",
         "catalog_stale_trust_or_endpoint_observation_cannot_publish_labels_or_hints",

@@ -1,6 +1,6 @@
 # FlowMesh Linux native CI guardrails
 
-Date: 2026-10-16. Profile: `native-guardrails-v8`.
+Date: 2026-10-16. Profile: `native-guardrails-v9`.
 
 This headless Linux profile checks selected native FlowMesh concurrency and
 recovery regressions. Its source and runner controls are prepared; Linux native
@@ -94,6 +94,16 @@ algorithm, build/time/output bound and the nonpublishing workflow remain.
 Complete native version 8 qualification was pending at the private source
 freeze and subsequently passed locally, as recorded below. The earlier
 489-case result does not qualify the new Catalog source.
+Version 9 keeps all 28 suites and adds only two mandatory genuine selected-proof
+cases in `flowmesh_client_watch_lane_tests`: a validator-certified account
+remains verifiable while Catalog TLS is held, and corrupted serialized state
+is refused under that hold. Exact names are independently frozen in controls
+with per-case missing/disabled/unexecuted/skipped rejection. The Qt helper's
+five offline mock cases are not counted as native C++, and this headless
+GUI-off workflow does not qualify the Qt policy change. All version 8
+requirements, algorithms, sources, headers, bounds and workflow remain.
+Complete version 9 native host qualification was pending at the private source
+freeze and subsequently passed locally, as recorded below.
 Missing prerequisites fail discovery.
 The workflow must contain their reviewed source revisions before qualification;
 it cannot substitute a prototype or silently omit a missing case. Do not publish
@@ -184,6 +194,14 @@ controls remain; three new controls cover the exact Catalog names and each
 negative discovery/execution fault. Source mapping was checked against the
 actual future C++ translation unit. These are stdlib runner tests, not native
 C++, Linux lock-order, TSan, remote CI or performance qualification.
+Version 9's author ran 53 private stdlib controls once: exit 0, zero failures
+or errors, 0.196 seconds. The non-author reviewer independently ran them once:
+53 passed, exit 0, zero failures/errors, 0.198 seconds. All previous 50 controls
+remain; three additions protect the two actual C++ names and their negative
+discovery/execution cases. Native, Qt, Linux and TSan execution are separate.
+Root also executed those exact 53 controls once after integration: exit 0,
+zero failures/errors, 0.185 seconds. These three executions are not combined
+into a larger test population.
 
 A separate positive format control used a preserved ordinary macOS native
 binary: real Boost discovery and the XML results for eleven timing cases passed
@@ -329,3 +347,15 @@ also passed 362 cases with three existing opt-in visual skips. Native and Qt
 elapsed times are functional qualification under concurrent test execution,
 not controlled trading-performance comparisons. Linux, DEBUG_LOCKORDER, TSan,
 remote CI, Windows, WAN, release and 200 ms qualification remain unexecuted.
+
+Version 9's exact local host selection passed **497 cases in 28 suites**,
+all actual children exit 0, no selected skips, 225.172 seconds. The preserved
+native executable SHA256 was
+`8386b179bb4742483f67ba3c6f9fdff1832490a2938a16ce714b61015c7aff19`.
+This adds the two genuine selected-account proof/refusal controls without
+removing any previous case. The separately executed offline Qt helper passed
+82 tests, and workspace passed 362 with the same three opt-in visual skips.
+Their [selected final-preflight policy and limits](b3-flowmesh-selected-final-preflight-20261016.md)
+are not qualified by a headless GUI-off workflow. These ordinary macOS runs
+do not establish Linux, DEBUG_LOCKORDER, TSan, remote CI, Windows, WAN,
+production availability or 200 ms performance. The workflow remains unpublished.
