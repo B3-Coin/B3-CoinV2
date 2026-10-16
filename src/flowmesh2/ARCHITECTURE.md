@@ -5,11 +5,13 @@ Status: **OUTLINE IN PROGRESS.** Implemented in `src/flowmesh2/`: C1
 (`BoundedMailbox`, `ReadSlot`), slice **R1** (build gate, error model, code
 registries, Boost.Test runner, inventory and TODO lint), slice **R2** (seven
 guards with self-tests, compile-fail controls, evidence tool, sanitizer
-canaries, CI workflow, and the durability token type) and slice **R3** (core
+canaries, CI workflow, and the durability token type), slice **R3** (core
 primitives: checked amounts, ids, tag registry, exact codec, the provisional
 profile, authority types, size-bound Merkle trees, markets and the slot
-header). Everything else described here is the contract that the outline
-slices R4 to R14 will build.
+header) and slice **R4** (signed actions, slot bodies, outcomes, chain facts,
+certificates, seat sets, the account leaf and the shared nonce and fee spec
+functions). Everything else described here is the contract that the outline
+slices R5 to R14 will build.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
@@ -128,7 +130,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 |---|---|---|---|---|
 | `core/result`, `core/codes` | R1 | `ErrorCode` 1..17, `Error`, `[[nodiscard]] Result<T>` with `Result() = delete` and `Ok()`, `TaskId`, `NotImplemented`, `Unsupported`; `OutcomeCode` and `AdmissionCode` registries | — | — |
 | `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot` | R3 | `AssetId`, `AccountId::FromKey`, `MarketId`, `ActionId`, `OrderId::FromPlace`, `Outpoint`; checked `Atoms` (`AddAtoms`, `SubAtoms`, `MulChecked`, `MulDivFloor`/`Ceil`); tag registry (29 tags); `DecodeExact`, `ReadCappedVector`, `WriteCappedVector`; `NetworkId`, `ProfileParams`, `DevRegtestProfile`, `Validate`, `EncodeProfile`, `ProfileHash`, `DomainHash`; `Anchor`, `FactCursor`, `AuthorityVersion`; `MarketDescriptor`, `BaseAtoms`, `QuoteAtoms`; size-bound RFC 6962 Merkle (O-25); `SlotHeaderV2`, `GenesisHeader` | `Validate()`: price band (M3-ENG-03), `PER_SIDE` fees (M3-ENG-08), futures (M9-FUT-01), `FOLDED` signer (M4-STO-05) | per-market tick/lot (M3-ENG-11) |
-| `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math` | R4 | `ActionV2` codec and BIP340 check, `VerifiedAction`, `SlotBody`, `OutcomeV2`, `DepositFact`, `SlotCertificate`, `SeatSet::FromPoP`, `AccountLeafV0`, nonce rule, seller fee and split | five facts: seat change (M7-SEAT-01), listing (M7-GOV-01), checkpoint accepted (MB1-B3D-02), payout confirmed (M8-BRG-02), exit nullifier (M8-EXIT-01); `BatchVerifier::VerifyBatch` (M4-ADM-01) | nonce rule (M2-ADM-01) |
+| `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math` | R4 | `ActionV2` exact capped codec, `UnsignedMsg`, `Id`, `Account`, BIP340 `VerifySignature`, `MaxDelayValid`, PLACE/CANCEL/TRANSFER/WITHDRAW payload codecs, `KindSupported`; `VerifiedAction::Verify`; `SlotBody` codec, `BodyHash`, `ActionLeaf`, `ActionsRoot`, `FactsRoot`; `OutcomeV2` codec and `LeafHash`; `DepositFact` codec and `FactId`; `SlotCertificate` codec, `Hash`, `SignerIndices`, `MakeBitmap`; `SeatSet::FromPoP`, `Quorum`, `Root`, `Keys`; `AccountLeafV0` codec and `LeafValue`; `ClassifyNonce`, `NonceInsert`, `InExpiryWindow`, `ExpiredAt`; `SellerFeeTotal`, `SellerFeeIncrement`, `SplitSlotFees` | codecs and `FactId` of five facts: seat change (M7-SEAT-01), listing (M7-GOV-01), checkpoint accepted (MB1-B3D-02), payout confirmed (M8-BRG-02), exit nullifier (M8-EXIT-01); `BatchVerifier::VerifyBatch` (M4-ADM-01) | nonce rule (M2-ADM-01) |
 | `ledger/` | R5 | `NonceWindow`, `LedgerState` (deposit, reserve, release, pay, credit, transfer, conservation), protocol accounts, `CommitV0`, `ProveAccountV0` | `RequestWithdrawal` (M2-LED-05), futures transfers (M2-LED-06), `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) | duplicate-fact rules (M2-LED-07), seat-pool account (M7-FEE-01) |
 | `engine/book`, `matcher`, `residual` | R6 | `OrderBook`, `BookSet`, `SweepA2` with pairing and fees | `ResolveResidualCross` (M3-ENG-02), `PriceBandCheck` (M3-ENG-03) | book (M3-ENG-01), pairing (M3-ENG-14), self-trade (M3-ENG-13) |
 | `engine/engine` | R7 | `ValidateSlotInputs`, `CanonicalOrder`, `Engine::ApplySlot` phases 1-6, 8, 9 | `CANCEL_ALL` (M3-ENG-09), `WITHDRAW` (M2-LED-05), phase 7 futures (M9-FUT-04); residual cross as certified refusal (M3-ENG-02) | order seed (M3-ENG-12), caps (M3-ENG-04), validity predicate (M4-AGR-11) |
@@ -148,12 +150,12 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 |---|---|---|
 | `flowmesh2_foundations` | C1, unchanged | as C1 |
 | `fm2_warnings` | INTERFACE: Clang/AppleClang `-Wthread-safety -Werror=thread-safety`; all compilers `-Werror=unused-result` | — |
-| `fm2_types` | `core/` | `core_interface` (private); `bitcoin_consensus` (`hash.cpp`, `uint256.cpp`, `pubkey.cpp`), `bitcoin_crypto` and `bitcoin_util` (public, since R3). `secp256k1` follows with signature code (R4) |
+| `fm2_types` | `core/` | `core_interface` and, since R4, `secp256k1` (private); `bitcoin_consensus` (`hash.cpp`, `uint256.cpp`, `pubkey.cpp` with `XOnlyPubKey::VerifySchnorr`), `bitcoin_crypto` (SHA-256 and `crypto/bls`) and `bitcoin_util` (public, since R3). Never `bitcoin_common` |
 | `fm2_verify` | `verify/` | `fm2_types`, `bitcoin_crypto` (never `fm2_core`) |
 | `fm2_core` | ledger, engine, state, storage, chain, agreement, admission, read, net, bridge, futures, governance | `fm2_types`, `flowmesh2_foundations`, `crc32c`, `bitcoin_util` |
 | `fm2_dev` | `dev/` (compiled with `FM2_DEV_COMPONENTS`) | `fm2_core` |
 | `fm2_simlib` | `sim/` | `fm2_dev`, `fm2_core`, `fm2_verify`, `bitcoin_common` (for `CKey` only) |
-| `test_flowmesh2` | `test/` | all of the above, `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` (from R4, for `CKey`); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files |
+| `test_flowmesh2` | `test/` | all of the above, `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files; global fixture `ECC_Context` (`test/main.cpp`) |
 | `fm2_sim_cli` | binary `fm2-sim` | `fm2_simlib` |
 | `fm2_canary_*` | sanitizer canaries | only with `FLOWMESH2_SANITIZER_CANARIES=ON` |
 | `fm2_all` | custom target: every fm2 library and executable that is built by default | — |
@@ -187,7 +189,16 @@ header marked *landed* is normative; the others are the target contract.
 | `core/market.h` | R3 | landed | `MarketDescriptor` (REAL-REPLACE M3-ENG-11), `MarketId`, `ValidateMarket`, checked `BaseAtoms`/`QuoteAtoms` |
 | `core/merkle.h` | R3 | landed | `MerkleRoot` = `Tagged(MERKLE_ROOT, n ‖ MTH)`, `MerkleProof` (path cap 64), `MerkleProve`, `MerkleVerify` (RFC 9162) |
 | `core/slot.h` | R3 | landed | `SlotHeaderV2` (18 fields, 366 bytes), `Hash` (`SLOT`), `CommitDigest` (`COMMIT`), `Authority`, `Encode`/`Decode`, `GenesisHeader` |
-| `core/action.h`, `body.h`, `outcome.h`, `facts.h`, `certificate.h`, `seat_set.h`, `account_leaf.h`, `nonce_rule.h`, `fee_math.h` | R4 | target | section 9; section 11 (fees) |
+| `core/action.h` | R4 | landed | `ActionV2` (84-byte fixed prefix, kind at byte 83), `Decode(bytes, profile)` (OVERSIZE above `MaxEncodedSize` or the payload cap; DECODE with `ACTION_UNKNOWN_VERSION`/`ACTION_UNKNOWN_KIND` details), total `Encode`/`UnsignedMsg`, `Id` = `Tagged(ACTION, UnsignedMsg)`, `VerifySignature` over `Id`, `MaxDelayValid`; `ActionKind`, `Side`, `TimeInForce` registries; payload codecs; `KindSupported`; `VerifiedAction` (private constructor, `Verify` only); `BatchVerifier` stub (M4-ADM-01) |
+| `core/body.h` | R4 | landed | `SlotBody{facts, originals}` as opaque bytes, capped exact codec, `BodyHash`, `ActionLeaf`, `FactLeaf`, `ActionsRoot`, `FactsRoot`; `MAX_SLOT_FACTS`, `MAX_FACT_BYTES` (O-27) |
+| `core/outcome.h` | R4 | landed | `OutcomeSource`, `Fill`, `BalanceDelta`, `OutcomeV2` exact capped codec, `LeafHash` = `Tagged(OUTCOME, bytes)`; field meaning provisional until R6/R7 (O-30) |
+| `core/facts.h` | R4 | landed | `FactKind` registry, `Fact` variant, `DepositFact` (117 bytes) codec, `FactId` = `Tagged(FACT, bytes)`, `DecodeFact`; five stub kinds |
+| `core/certificate.h` | R4 | landed | `SlotCertificate{header_hash, bitmap, aggregate}` exact codec (bitmap at most 128 bytes), `Hash` = `Tagged(CERT, bytes)`, LSB-first `SignerIndices(k)` and `MakeBitmap` |
+| `core/seat_set.h` | R4 | landed | `SeatSet::FromPoP` (only `bls::VerifiedPublicKey::FromPoP`; refuses empty, above `MAX_SEATS`, repeated key, bad PoP), `QuorumFor` = ⌊2k/3⌋+1, `Root`, `Keys` |
+| `core/account_leaf.h` | R4 | landed | `AccountLeafV0` exact capped codec with the canonical form enforced, `LeafValue` = `Tagged(STATE_ACCOUNTS, bytes)`, lookups |
+| `core/nonce_rule.h` | R4 | landed | D7 spec: `ClassifyNonce`, `NonceAcceptable`, `NonceInsert`, `InExpiryWindow`, `ExpiredAt` (REAL-REPLACE M2-ADM-01) |
+| `core/fee_math.h` | R4 | landed | D5 spec: `SellerFeeTotal`, `SellerFeeIncrement` (ceiling on the cumulative per-order fee), `SplitSlotFees` (floor to seats, residual to treasury); PROVISIONAL, gate G-2 |
+| `test/util/keys.h` | R4 | landed | TEST keys from labels: `CKey` and `bls::SecretKey::FromIKM` from `SHA256(label)`, `SignDigest` |
 | `ledger/nonce_window.h`, `ledger.h`, `state_commitment.h` | R5 | target | section 11; commitment v0 (O-9) |
 | `engine/book.h`, `matcher.h`, `residual.h`, `engine.h` | R6, R7 | target | section 11 |
 | `storage/durable.h` | R2 | landed | `DurableKind`, move-only `Durable<K>` tokens with a private constructor whose only friend is `Journal` (R8 mints them); section 7.2 |
@@ -547,6 +558,36 @@ existing `"B3/..."` literals: none equals an fm2 tag and none uses the
   above; `anchor` is `u32 height ‖ hash`, each `FactCursor` is
   `u32 height ‖ u32 index`, counts are `u32`, `version = 1`. Decode refuses
   another `version` or `commitment_version` with `DECODE`.
+- As landed in R4 (all PROVISIONAL REGTEST):
+  - `ActionV2` encodes as `u8 version ‖ domain ‖ signer ‖ u64 nonce ‖ u64
+    ref_slot ‖ u16 max_delay ‖ u8 kind ‖ CompactSize payload ‖ 64 B sig`.
+    `ActionKind` follows plan §3.6: `PLACE=1, CANCEL=2, CANCEL_ALL=3,
+    WITHDRAW=4, TRANSFER=5, SPOT_TO_FUTURES=6, FUTURES_TO_SPOT=7` (O-28).
+    `Decode` refuses an unknown version or kind with static details that
+    admission maps to `WRONG_DOMAIN`/`UNKNOWN_KIND` (O-29); `max_delay`
+    outside 1..`max_delay_slots` is flagged by `MaxDelayValid`, not refused,
+    so admission can answer `BAD_EXPIRY`.
+  - `SlotBody` encodes `CompactSize #facts, (len ‖ bytes)…, CompactSize
+    #originals, (len ‖ bytes)…`. Facts are canonical `EncodeFact` bytes, so
+    `FactLeaf(bytes)` = `FactId(fact)` and `facts_root` is the Merkle root of
+    the FactIds (O-30).
+  - `OutcomeV2` encodes `u8 source ‖ subject ‖ account ‖ u64 nonce ‖ u16
+    code ‖ u64 remaining_lots ‖ fills ‖ deltas`; a `Fill` is 137 bytes
+    (including `seller_quote_before`, so `VerifyFill` can recompute the fee
+    increment), a `BalanceDelta` 80 bytes. A `SLOT` outcome's subject is the
+    quote `AssetId` of its `FEES_DISTRIBUTED` outcome.
+  - `DepositFact` is `u8 1 ‖ cursor ‖ outpoint ‖ account ‖ asset ‖ i64
+    amount` (117 bytes). The other five fact kinds carry only their cursor
+    and every codec entry returns `NotImplemented` with their task ID.
+  - `SlotCertificate` encodes `header_hash ‖ CompactSize bitmap ‖ 96 B
+    aggregate`; the bitmap is exactly ⌈k/8⌉ bytes with no bit at or above k.
+    `SeatSet::Root` = `Tagged(SEATSET, CompactSize(k) ‖ 48 B keys in index
+    order)`.
+  - `AccountLeafV0` encodes `account ‖ CompactSize #balances, (asset ‖ i64
+    available ‖ i64 reserved)… ‖ CompactSize #used_nonces, u64… ‖ u32
+    open_orders`; canonical form: assets strictly ascending with no
+    all-zero entry, nonces strictly ascending. R5's accounts tree commits
+    to `LeafValue` = `Tagged(STATE_ACCOUNTS, bytes)`.
 - Commitment v0 (O-9): sorted-leaf RFC 6962 roots for accounts, orders,
   markets, nullifiers and totals, under a root-of-roots tagged `STATE`. The
   planned sparse Merkle tree is M2-LED-02.
@@ -657,7 +698,13 @@ ruling). Self-trade executes normally (O-17, M3-ENG-13).
 **Fees (D5, O-6).** The seller pays 100 ppm of matched notional once, in the
 quote asset: each fill charges `ceil(cum_quote · ppm / 1e6) − fee_charged` for
 that order. Per slot, the seat pool gets ⌊80%⌋ and the treasury gets the rest.
-Protocol accounts: `Tagged(PROTOCOL_ACCOUNT, name ‖ profile_hash)`.
+Protocol accounts: `Tagged(PROTOCOL_ACCOUNT, name ‖ profile_hash)`. As landed
+in R4 (`core/fee_math.h`): `SellerFeeTotal(q)` = ⌈q · ppm / 10⁶⌉,
+`SellerFeeIncrement(q0, q1)` = `SellerFeeTotal(q1) − SellerFeeTotal(q0)`, and
+`SplitSlotFees(F, p)` = {⌊F · p / 100⌋, residual}. The walking-skeleton values
+(fee 50 on 500,000; split 40/10) are pinned by `fee_math_tests`. The nonce
+window and expiry rules are `core/nonce_rule.h` (D7), shared by the ledger,
+admission, the engine and b3verify.
 
 ---
 
@@ -687,10 +734,10 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R3)
+### 13.1 Today (after R4)
 
 The commands in 13.2 work. They build every fm2 target (`fm2_all`):
-`test_flowmesh2` (79 Boost cases), the unchanged C1 binary and, with the
+`test_flowmesh2` (139 Boost cases), the unchanged C1 binary and, with the
 option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
 19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
 `flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
@@ -1007,6 +1054,10 @@ outline does not resolve on its own.
 | O-24 | Windows headers define `STRICT` as a macro (`windef.h`), so an enumerator named `STRICT` breaks any translation unit that includes them first | R3 names the signer modes `SignerMode::STRICT_SIGNING` and `FOLDED_SIGNING`; the registry names (`ToString`, the JSON) stay `STRICT` and `FOLDED`. Not compiled on Windows here (no MSVC or MinGW on this host) |
 | O-25 | An RFC 9162 inclusion check alone accepts some wrong tree sizes for the same root (index 0 of 4 leaves verifies as a tree of 3), which would let a size-dependent claim (for example "last leaf" in a sorted v0 tree) be forged | R3 adds the tag `MERKLE_ROOT`: the committed root is `Tagged(MERKLE_ROOT, u64 n ‖ MTH)`, like a signed tree head. A mutation that drops the size is caught by `merkle_tests/tampered_proofs_fail`. The owner may prefer an RFC-exact root plus a trusted size per tree; that would change every root vector |
 | O-26 | Which hash binds the network | `ProfileHash` covers every rule field and, of the network, only the chain type; the magic and `ModernChainDomain` are bound only by `DomainHash`. The header carries both, so a slot is bound to both. This keeps one `profile_hash` in `PROFILE_DEX1_REGTEST.json` for every regtest network. `DevRegtestProfile` therefore takes a `ChainType`, not a `NetworkId` |
+| O-27 | Outline caps that are not profile fields | R4 adds provisional constants: `MAX_SLOT_FACTS` = 1,024 and `MAX_FACT_BYTES` = 1,024 (slot body), `MAX_SEATS` = 1,024 (bitmap ≤ 128 bytes), `MAX_LEAF_ASSETS` = 256 (account leaf), `MAX_WITHDRAW_SCRIPT_BYTES` = 128, and an outcome delta cap of 2 · (`max_fills_per_order` + 1). The owner may move any of them into the profile (which changes `profile_hash` and the JSON) |
+| O-28 | `ActionKind` integers | Plan §3.6 lists PLACE, CANCEL, CANCEL_ALL, WITHDRAW, TRANSFER; an earlier draft had TRANSFER = 4, WITHDRAW = 5. R4 follows the plan (WITHDRAW = 4, TRANSFER = 5). The registry is append-only from now on |
+| O-29 | Admission needs `UNKNOWN_KIND` and `WRONG_DOMAIN`, but the R4 slice text says the codec refuses an unknown kind | `ActionV2::Decode` refuses both (DECODE) and marks them with the static details `ACTION_UNKNOWN_KIND` and `ACTION_UNKNOWN_VERSION`; the kind byte has a fixed position, so the refusal is decided before parsing. Admission (R12) compares the detail. A dedicated `ErrorCode` would avoid string matching but changes an owner-protected registry |
+| O-30 | Shapes the engine has not pinned yet | `SlotBody` keeps facts as canonical bytes (the body stays decodable without knowing every fact kind; R7's validity predicate decodes them). `OutcomeV2` fields, the delta aggregation rule and the `SLOT` outcome subject are provisional until R6/R7; changing them after R7 changes `outcomes_root` vectors |
 
 ---
 

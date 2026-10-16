@@ -7,11 +7,14 @@ auditing the outline (M0-AUD-01). The design is in [ARCHITECTURE.md](ARCHITECTUR
 
 Landed outline slices: **R1** (build gate, error model, Boost.Test runner,
 inventory and TODO lint), **R2** (guards, compile-fail controls, evidence
-tool, sanitizer canaries, CI workflow) and **R3** (core primitives, profile,
-authority types, slot header). Their rows are `outline` until M0-AUD-01
-accepts them, and so are the rows they tag: M0-EVD-01 (R2), and M3-ENG-03,
-M3-ENG-08, M9-FUT-01, M4-STO-05 and the REAL-REPLACE M3-ENG-11 (R3). Every
-other row is `todo`, except the C1 baseline, which is `done`.
+tool, sanitizer canaries, CI workflow), **R3** (core primitives, profile,
+authority types, slot header) and **R4** (signed actions, slot body,
+outcomes, facts, certificate, seat set, account leaf, nonce and fee spec
+functions). Their rows are `outline` until M0-AUD-01 accepts them, and so
+are the rows they tag: M0-EVD-01 (R2); M3-ENG-03, M3-ENG-08, M9-FUT-01,
+M4-STO-05 and the REAL-REPLACE M3-ENG-11 (R3); M4-ADM-01, M7-SEAT-01,
+M7-GOV-01, MB1-B3D-02, M8-BRG-02, M8-EXIT-01 and the REAL-REPLACE M2-ADM-01
+(R4). Every other row is `todo`, except the C1 baseline, which is `done`.
 
 ---
 
@@ -118,7 +121,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | R1 | R | outline | — | R1 | Build gate `BUILD_FLOWMESH2`, `[[nodiscard]]` `Result`/`ErrorCode`, `OutcomeCode`/`AdmissionCode`, Boost.Test runner, inventory and TODO lint (these docs landed first) | top-level `CMakeLists.txt` (4 lines); `src/flowmesh2/CMakeLists.txt`; `core/result`, `core/codes`; `test/`; `contrib/flowmesh2/check_inventory.py`, `check_todo.py` | `Result<int>`/`Result<void>` not default-constructible (static_assert); `NotImplemented` carries the exact ID; every enum integer pinned; both lint scripts fail on doctored copies, including a listed case that did not run; OFF configure has no `fm2_*` target; ON without the foundation option fails to configure; C1 still 19 cases; `ctest -L flowmesh2 --no-tests=error` green | scratch:R1/ | G-1, G-2, G-4 |
 | R2 | R | outline | — | R2 | Guards (7 rules) with self-tests, compile-fail controls, `evidence.py`, sanitizer canaries, CI workflow | `contrib/flowmesh2/` (`check_guards.py`, `test_check_guards.py`, `guard_fixtures/`, `check_negative_compile.py`, `evidence.py`, `test_evidence.py`, `canaries/`); `test/compile_fail/`; `storage/durable.h` (token type only); `src/flowmesh2/CMakeLists.txt` (`fm2_all`, `fm2_libs.manifest`, `FLOWMESH2_SANITIZER_CANARIES`); `.github/workflows/flowmesh2.yml` | each rule's planted fixture fails and a clean one passes; guards pass on the tree (`--source`, `--nm build-rebirth`); missing `LOCK`, ignored `Result` and forged token fail to compile, positive control compiles; `evidence verify` fails on a tampered, deleted or extra file; macOS ASan, UBSan and TSan canaries exit non-zero | scratch:R2/ | SEC-8, plan §4, O-19 |
 | R3 | R | outline | — | R3 | Core primitives, profile, authority types, slot header | `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot`; `PROFILE_DEX1_REGTEST.json` | `AccountId` golden; overflow refused at `MAX_ATOMS` edges and for negatives; `MulDiv` exhaustive on a small domain; tags unique, prefixed, golden, no collision with existing `B3/` tags; trailing bytes, oversize counts (no allocation) and non-canonical `CompactSize` refused; MAIN/TESTNET/TESTNET4/SIGNET give `UNSUPPORTED_NETWORK`; JSON `profile_hash` equals code; Merkle sizes 0..17 equal a naive reference, tampering fails, duplicated last leaf changes the root; header round trip, `Hash ≠ CommitDigest`, golden, every field changes `Hash` | scratch:R3/ | D6, D7, O-9, O-20, O-24, O-25, O-26 |
-| R4 | R | todo | — | R4 | Signed actions, slot body, outcomes, facts, certificate, seat set, shared spec functions | `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math`; `test/util/keys.h` | BIP340 round trip; flipped bit and other domain fail; `Id` excludes the signature; payload 4,096 ok, 4,097 `OVERSIZE`; `max_delay` 0 and 1,025 flagged; golden bytes and `Id`; `VerifiedAction` only via `Verify` (static_assert); body of 1,025 originals refused; two signatures give two `ActionLeaf`s; bitmap golden, bits ≥ k refused; `SeatSet` refuses bad PoP and duplicates; quorum table k=1..10; nonce rule exhaustive for W=3; fee increments sum to ceil(total·ppm/1e6); split exhaustive F=0..10,000 | scratch:R4/ | D5, D7, O-8, TRD-17 |
+| R4 | R | outline | — | R4 | Signed actions, slot body, outcomes, facts, certificate, seat set, shared spec functions | `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math`; `test/util/keys.h` | BIP340 round trip; flipped bit and other domain fail; `Id` excludes the signature; payload 4,096 ok, 4,097 `OVERSIZE`; `max_delay` 0 and 1,025 flagged; golden bytes and `Id`; `VerifiedAction` only via `Verify` (static_assert); body of 1,025 originals refused; two signatures give two `ActionLeaf`s; bitmap golden, bits ≥ k refused; `SeatSet` refuses bad PoP and duplicates; quorum table k=1..10; nonce rule exhaustive for W=3; fee increments sum to ceil(total·ppm/1e6); split exhaustive F=0..10,000 | scratch:R4/ | D5, D7, O-8, TRD-17 |
 | R5 | R | todo | — | R5 | Shared ledger, nonce window, commitment v0 | `ledger/nonce_window`, `ledger`, `state_commitment` | W=3 insert sequences of length ≤ 7 equal a naive model; W=100 boundaries (`NONCE_TOO_LOW`, `NONCE_USED`, eviction); duplicate outpoint refused; over-reserve leaves state unchanged; transfer refusals; 64 seeds × 10,000 random ops keep conservation equal to an independent tally; root deterministic and insertion-order independent; proofs verify | scratch:R5/ | TRD-10, O-7 |
 | R6 | R | todo | — | R6 | Order book, A2 sweep with pairing, reference matcher | `engine/book`, `matcher`, `residual`; `test/reference_matcher.h` | full and partial fill at the maker price, FIFO; 3 takers × 4 lots against 10 maker lots split 4/3/3 with a golden pairing vector; multi-level sweep; `FILL_CAP` at cap−1/cap/cap+1; self-trade conserves and charges once; 1,000 seeded batches equal a naive O(n²) matcher on fills, pairing and fees | scratch:R6/ | D4, D5, O-5, O-17 |
 | R7 | R | todo | — | R7 | Engine slot phases, canonical order, validity predicate | `engine/engine`; orders and markets in `ledger/state_commitment` | shared-quote reservation in M2 blocks an M1 order; same-slot proceeds cannot fund a same-slot reservation; transfer, cancel, post-only, IOC, refund cases; deterministic rejection consumes the nonce with zero deltas; each `ValidateSlotInputs` clause has a failing input; permuted originals give identical roots; parent hash changes cross-account order only; golden canonical order; residual-cross refusal releases and conserves | scratch:R7/ | D4, DUR-5, O-4, O-4b |
@@ -171,7 +174,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M2-LED-08 | M2 | todo | NONE | — | Stateful ledger fuzz ≥ 24 CPU-h | new | 0 findings | M2/M2-LED-08/ | plan M2 |
 | M2-LED-09 | M2 | todo | NONE | — | Cross-OS roots, including MSVC `int128` fallback vectors | new | identical roots | M2/M2-LED-09/ | plan M2 |
 | M2-LED-10 | M2 | todo | REAL-REPLACE | R9 | Copy-on-write candidate state | `StateOwner::Preview` full copy | same roots; work O(changed) | M2/M2-LED-10/ | PERF-12 |
-| M2-ADM-01 | M2 | todo | REAL-REPLACE | R4, R12 | Exhaustive nonce/expiry tests plus a Quint model of D7 | `core/nonce_rule`, `admission/` | model equals code on bounded traces | M2/M2-ADM-01/ | PLAN-1, D7 |
+| M2-ADM-01 | M2 | outline | REAL-REPLACE | R4, R12 | Exhaustive nonce/expiry tests plus a Quint model of D7 | `core/nonce_rule` (`ClassifyNonce`, `NonceInsert`, `InExpiryWindow`, `ExpiredAt`; R4); `admission/` (R12) | model equals code on bounded traces | M2/M2-ADM-01/ | PLAN-1, D7 |
 | M2-ADM-02 | M2 | todo | NONE | — | Account-exists check before crypto, under load | extends R12 | 10^5 `NO_ACCOUNT` frames cause 0 signature verifications | M2/M2-ADM-02/ | PLAN-9 |
 | M2-ADM-03 | M2 | todo | NONE | — | `EXPIRED` proof against the SMT | `VerifyExpired` | forged variants fail | M2/M2-ADM-03/ | PLAN-1, needs M2-LED-02 |
 
@@ -186,7 +189,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M3-ENG-05 | M3 | todo | NONE | — | Independent checker written from the spec; shares only codecs and hashes, never engine, fee or nonce code | new | 100% agreement, including adversarial and dust batches | M3/M3-ENG-05/ | plan M3, O-3 |
 | M3-ENG-06 | M3 | todo | NONE | — | x86 gate: apply + roots p99 ≤ 5 ms at 1,024 actions on an adversarial 131k-tick book; parallel subtree hashing | new | perf evidence with PERF-7 metadata | M3/M3-ENG-06/ | plan §3.5 |
 | M3-ENG-07 | M3 | todo | NONE | — | MEV analysis: A versus A2 | new | report accepted by the owner | M3/M3-ENG-07/ | D4, OWNER-GATED |
-| M3-ENG-08 | M3 | outline | STUB | R3 | `PER_SIDE` fee incidence plus D6 dust vectors | `core/params` `Validate` (`PER_SIDE`); `core/fee_math` (R4) | both incidences pass | M3/M3-ENG-08/ | D3, D5, D6, BLOCKED-ON-RULING |
+| M3-ENG-08 | M3 | outline | STUB | R3, R4 | `PER_SIDE` fee incidence plus D6 dust vectors | `core/params` `Validate` (`PER_SIDE`, R3); `core/fee_math` extension point (R4) | both incidences pass | M3/M3-ENG-08/ | D3, D5, D6, BLOCKED-ON-RULING |
 | M3-ENG-09 | M3 | todo | STUB | R7, R12 | `CANCEL_ALL` | engine branch; admission | releases all; conservation | M3/M3-ENG-09/ | plan §3.6 |
 | M3-ENG-10 | M3 | todo | NONE | — | Replace/amend revisions | new | atomic replace tests | M3/M3-ENG-10/ | BLOCKED-ON-RULING |
 | M3-ENG-11 | M3 | outline | REAL-REPLACE | R3 | Per-market tick, lot and minimum size at listing | `core/market` `MarketDescriptor` | vectors | M3/M3-ENG-11/ | D6, OD-7 |
@@ -199,7 +202,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
 |---|---|---|---|---|---|---|---|---|---|
 | MB1-B3D-01 | MB1 | todo | NONE | — | `VaultV2` outputs | b3d | CONS-13 checklist | MB1/MB1-B3D-01/ | plan §3.6, D2, OWNER-GATED |
-| MB1-B3D-02 | MB1 | todo | STUB | R4 | `CheckpointV2` MPA record and validation, including conservation | `core/facts` `CheckpointAcceptedFact`; b3d | a forged root over the vault is refused | MB1/MB1-B3D-02/ | PLAN-3, OWNER-GATED |
+| MB1-B3D-02 | MB1 | outline | STUB | R4 | `CheckpointV2` MPA record and validation, including conservation | `core/facts` `CheckpointAcceptedFact` codec and `FactId` (R4); b3d | a forged root over the vault is refused | MB1/MB1-B3D-02/ | PLAN-3, OWNER-GATED |
 | MB1-B3D-03 | MB1 | todo | NONE | — | Caps, 360-block delay, `PauseV2` | b3d | boundary tests | MB1/MB1-B3D-03/ | PLAN-4, PLAN-6, OWNER-GATED |
 | MB1-B3D-04 | MB1 | todo | NONE | — | `Q_min`, maturity, pacing | b3d | boundary tests | MB1/MB1-B3D-04/ | PLAN-5, D16, OWNER-GATED |
 | MB1-B3D-05 | MB1 | todo | NONE | — | V1 root pin | b3d | V1 checkpoints after P rejected | MB1/MB1-B3D-05/ | PLAN-15, OWNER-GATED |
@@ -235,7 +238,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M4-NET-02 | M4 | todo | STUB | R13 | SipHash 6-byte short IDs and body fetch | `ShortIdCodec::Encode`/`Decode` | collision and fetch tests | M4/M4-NET-02/ | PLAN-10 |
 | M4-NET-03 | M4 | todo | STUB | R13 | Sentry fan-out | `SentryFanout::Fanout` | fan-out tests | M4/M4-NET-03/ | PLAN-10 |
 | M4-NET-04 | M4 | todo | NONE | — | Protocol-derived budgets | new | budget tests | M4/M4-NET-04/ | D13 |
-| M4-ADM-01 | M4 | todo | STUB | R4, R12 | `CCheckQueue` batch BIP340 plus `CuckooCache` | `BatchVerifier::VerifyBatch`; admission batch path | same results as sequential | M4/M4-ADM-01/ | plan §3.2 |
+| M4-ADM-01 | M4 | outline | STUB | R4, R12 | `CCheckQueue` batch BIP340 plus `CuckooCache` | `core/action` `BatchVerifier::VerifyBatch` (R4); admission batch path (R12) | same results as sequential | M4/M4-ADM-01/ | plan §3.2 |
 | M4-ADM-02 | M4 | todo | STUB | R12 | Credit budgets | `CreditBudget::Create` | budget and cancel-lane tests | M4/M4-ADM-02/ | SEC-4, D13, BLOCKED-ON-RULING |
 | M4-SIM-01 | M4 | todo | STUB | R13, R14 | Multi-node DST (N=4, 7) ≥ 1,000 CPU-h over an in-process mesh | `SimCluster::Create(n>1)`, `InProcessSeatMesh::Create` | 0 violations | M4/M4-SIM-01/ | plan M4 |
 | M4-SIM-02 | M4 | todo | STUB | R14 | Crash, drop, delay, partition and skew hooks | `FaultPlan` | each hook exercised | M4/M4-SIM-02/ | plan L4 |
@@ -271,11 +274,11 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 |---|---|---|---|---|---|---|---|---|---|
 | M7-ADP-01 | M7 | todo | STUB | R10 | Finalized + 30-deep adapter with anchor proofs | `B3dFinalizedAdapter::Create` | reorg and epoch tests | M7/M7-ADP-01/ | TRD-4, PLAN-11 |
 | M7-ADP-02 | M7 | todo | STUB | R11 | Anchor and inclusion proofs for clients | `VerifyAnchorProof` | forged proofs fail | M7/M7-ADP-02/ | plan §3.3 |
-| M7-SEAT-01 | M7 | todo | STUB | R4 | Seat registration facts (PoP, maturity, endpoints) | `SeatChangeFact`; engine | the seat set changes only through facts | M7/M7-SEAT-01/ | FN-9, FN-10 |
+| M7-SEAT-01 | M7 | outline | STUB | R4 | Seat registration facts (PoP, maturity, endpoints) | `core/facts` `SeatChangeFact` codec and `FactId` (R4); engine | the seat set changes only through facts | M7/M7-SEAT-01/ | FN-9, FN-10 |
 | M7-SEAT-02 | M7 | todo | NONE | — | State sync for joining seats | new | a joining seat syncs and votes | M7/M7-SEAT-02/ | plan M7 |
 | M7-FEE-01 | M7 | todo | REAL-REPLACE | R5 | Per-seat accrual; claims by BLS key | seat-pool protocol account | claim tests | M7/M7-FEE-01/ | FN-12, D5, C-3, BLOCKED-ON-RULING |
 | M7-TAPE-01 | M7 | todo | NONE | — | Trade tape and candles with time provenance | new | tests | M7/M7-TAPE-01/ | UX-5 |
-| M7-GOV-01 | M7 | todo | STUB | R4, R13 | Listing (100,000 B3) | `Governance::ApplyListing`, `ListingFact` | listing tests | M7/M7-GOV-01/ | AST-6, AST-8, OWNER-GATED |
+| M7-GOV-01 | M7 | outline | STUB | R4, R13 | Listing (100,000 B3) | `core/facts` `ListingFact` codec and `FactId` (R4); `Governance::ApplyListing` (R13) | listing tests | M7/M7-GOV-01/ | AST-6, AST-8, OWNER-GATED |
 | M7-GOV-02 | M7 | todo | STUB | R13 | Removal: cancel-only, then claim-only | `Governance::ApplyRemoval` | no-seizure tests | M7/M7-GOV-02/ | AST-6 |
 | M7-GOV-03 | M7 | todo | STUB | R13 | Versioned parameter heights (`profile_hash` in the header) | `Governance::ParamsAt` | boundary tests | M7/M7-GOV-03/ | GOV-2 |
 | M7-PERF-01 | M7 | todo | NONE | — | k = 64 tests; G-WAN run | new | reports | M7/M7-PERF-01/ | plan M7, D-G1 |
@@ -285,11 +288,11 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
 |---|---|---|---|---|---|---|---|---|---|
 | M8-BRG-01 | M8 | todo | STUB | R13 | bUSD mint → `VaultV2` deposit | `BridgeManagerV2::OnFinalizedMint` | anvil + regtest end to end | M8/M8-BRG-01/ | BRG-1, BRG-4 |
-| M8-BRG-02 | M8 | todo | STUB | R4, R13 | Withdrawal packets to `message_root`; payout facts | `BuildWithdrawalPacket`, `PayoutConfirmedFact` | no duplicate payout | M8/M8-BRG-02/ | BRG-5 |
+| M8-BRG-02 | M8 | outline | STUB | R4, R13 | Withdrawal packets to `message_root`; payout facts | `core/facts` `PayoutConfirmedFact` codec and `FactId` (R4); `BuildWithdrawalPacket` (R13) | no duplicate payout | M8/M8-BRG-02/ | BRG-5 |
 | M8-BRG-03 | M8 | todo | STUB | R13 | Validity floor, caps, safe exporter | `CheckReleaseLimits` | cap tests | M8/M8-BRG-03/ | PLAN-14, D23, OWNER-GATED |
 | M8-BRG-04 | M8 | todo | NONE | — | Sepolia/Hoodi deployment plus Foundry invariants | new | invariant runs | M8/M8-BRG-04/ | plan M8 |
 | M8-CKP-01 | M8 | todo | STUB | R11, R13 | Checkpoint builder and verification | `CheckpointBuilder::Build`, `VerifyCheckpoint` | b3d accepts a valid and refuses a forged checkpoint | M8/M8-CKP-01/ | PLAN-3 |
-| M8-EXIT-01 | M8 | todo | STUB | R4, R13 | Forced exit after 10,080 blocks; nullifiers | `ForcedExit::Open`/`Redeem`, `ExitNullifierFact` | drill | M8/M8-EXIT-01/ | PLAN-16, D20, OWNER-GATED |
+| M8-EXIT-01 | M8 | outline | STUB | R4, R13 | Forced exit after 10,080 blocks; nullifiers | `core/facts` `ExitNullifierFact` codec and `FactId` (R4); `ForcedExit::Open`/`Redeem` (R13) | drill | M8/M8-EXIT-01/ | PLAN-16, D20, OWNER-GATED |
 | M8-MIG-01 | M8 | todo | NONE | — | V1 cutover: claims plus a transfer consuming the V1 nullifier | new | no double spend | M8/M8-MIG-01/ | PLAN-15, D25 |
 | M8-MIG-02 | M8 | todo | NONE | — | Fork-id, sunset release, liability manifest | new | manifest derived twice, equal | M8/M8-MIG-02/ | D24 |
 

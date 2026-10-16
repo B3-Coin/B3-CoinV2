@@ -72,8 +72,13 @@ workflow `.github/workflows/flowmesh2.yml`, which the outline never runs;
 and **R3**, the deterministic core primitives in `core/` (checked amounts, id
 types, the `B3/FM2/` tag registry, the exact bounded codec, the provisional
 regtest profile with `PROFILE_DEX1_REGTEST.json`, authority types, size-bound
-tagged Merkle trees, market descriptors and the slot header). Nothing is
-linked into the node, wallet or Qt.
+tagged Merkle trees, market descriptors and the slot header); and **R4**, the
+signed `ActionV2` with BIP340 verification and `VerifiedAction`, the slot
+body, certified outcomes, chain facts (deposits real, five later kinds
+stubbed), slot certificates, PoP-checked seat sets, the commitment v0
+account leaf and the shared nonce-window and fee spec functions (test keys
+in `test/util/keys.h`; the test binary links `bitcoin_common` for `CKey`
+only). Nothing is linked into the node, wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -85,8 +90,8 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R3: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 79 cases, `flowmesh2_inventory`,
+Expected after R4: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 139 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
 `flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`).
 Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2. Open gates (workspace lock reconciliation, decision
