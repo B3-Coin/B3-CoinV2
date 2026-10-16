@@ -4,7 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Strict, bounded Linux native-test guardrails; never a performance gate.
 
-Version native-guardrails-v7 selects exact compiled Boost suites, not CTest's
+Version native-guardrails-v8 selects exact compiled Boost suites, not CTest's
 skip-on-empty filters. Discovery and detailed XML must agree on every selected
 leaf case. TSan covers instrumented native code, not all system libraries; the
 existing repository suppression file includes a ConnectTip deadlock suppression.
@@ -32,7 +32,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-PROFILE_VERSION = "native-guardrails-v7"
+PROFILE_VERSION = "native-guardrails-v8"
 CONTROL_TIMEOUT = 30
 SUITE_TIMEOUT = 600
 TOTAL_TEST_TIMEOUT = 1800
@@ -93,6 +93,12 @@ REQUIRED_CASES = {
         "local_signature_callback_never_runs_before_signed_sync",
     },
     "flowmesh_client_watch_lane_tests": {
+        "passive_catalog_tls_leaves_local_status_unsigned_refusal_and_health_available",
+        "catalog_owner_is_immediate_busy_reconnect_does_not_reset_and_empty_is_success",
+        "catalog_stale_trust_or_endpoint_observation_cannot_publish_labels_or_hints",
+        "catalog_same_path_ca_replacement_refuses_held_reply_and_recovers",
+        "catalog_validates_whole_rowset_before_metadata_readiness_or_advertisement",
+        "catalog_reconnect_is_fresh_shape_only_counted_and_never_touches_outbox",
         "client_read_admission_trace_captures_real_held_foreground_and_admitted_failure",
         "client_read_admission_trace_default_off_and_bench_entry_guard_are_explicit",
         "prospective_foreground_signing_market_waits_outside_work_for_passive_other_account",

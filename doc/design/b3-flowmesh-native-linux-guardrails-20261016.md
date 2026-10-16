@@ -1,6 +1,6 @@
 # FlowMesh Linux native CI guardrails
 
-Date: 2026-10-16. Profile: `native-guardrails-v7`.
+Date: 2026-10-16. Profile: `native-guardrails-v8`.
 
 This headless Linux profile checks selected native FlowMesh concurrency and
 recovery regressions. Its source and runner controls are prepared; Linux native
@@ -83,6 +83,17 @@ The complete **version 7 native 28-suite execution was pending** at the private
 preparation freeze and subsequently passed locally as recorded below. Earlier
 27-suite campaigns do not qualify the new outcome source or complete version 7
 selection; Linux, DEBUG_LOCKORDER, TSan and remote execution remain pending.
+Version 8 retains those 28 suites and adds the six native Catalog regressions
+to the mandatory `flowmesh_client_watch_lane_tests` selection: held passive
+TLS versus local status/refusal/health, one owner and busy reconnect, stale
+trust/endpoint observations, same-path CA replacement, whole-rowset staging,
+and fresh shape-only reconnect with unchanged outbox. Independent controls
+freeze all six actual case names and reject each if missing, disabled,
+unexecuted or skipped. Every version 7 requirement, source, header, checker
+algorithm, build/time/output bound and the nonpublishing workflow remain.
+Complete native version 8 qualification was pending at the private source
+freeze and subsequently passed locally, as recorded below. The earlier
+489-case result does not qualify the new Catalog source.
 Missing prerequisites fail discovery.
 The workflow must contain their reviewed source revisions before qualification;
 it cannot substitute a prototype or silently omit a missing case. Do not publish
@@ -165,6 +176,14 @@ earlier required-case sets, native sources, header dependencies and execution
 bounds were compared unchanged. A non-author reviewer separately ran these 47
 controls once: exit 0, zero failures/errors, 0.190 seconds. These are runner
 controls, not native execution; the later native host result is separate.
+
+Version 8 passes **50 lightweight controls** in a private author execution
+(exit 0, zero failures/errors, 0.196 seconds) and one separate reviewer
+execution (exit 0, zero failures/errors, 0.200 seconds). All previous 47
+controls remain; three new controls cover the exact Catalog names and each
+negative discovery/execution fault. Source mapping was checked against the
+actual future C++ translation unit. These are stdlib runner tests, not native
+C++, Linux lock-order, TSan, remote CI or performance qualification.
 
 A separate positive format control used a preserved ordinary macOS native
 binary: real Boost discovery and the XML results for eleven timing cases passed
@@ -298,3 +317,15 @@ Its client source is the separately reviewed
 This ordinary AppleClang 17 Release run does not validate Linux flags,
 DEBUG_LOCKORDER, TSan, remote CI, production timing or 200 ms performance.
 No native Catalog successor is included in this qualification.
+
+Version 8's exact local host selection passed **495 cases in 28 suites**,
+all actual children exit 0, no selected skips, 226.365 seconds. The preserved
+native executable SHA256 was
+`8c6164da311b159816a0849b71f8874e7d4a9b0a5b91116d80d57eb3f5b5eb96`.
+It includes the [annotated Catalog transport stage](b3-flowmesh-native-catalog-isolation-20261016.md)
+and its six required regressions, all four retained transport-premise adaptations,
+and the unchanged evidence-budget recovery control. The linked offline Qt suite
+also passed 362 cases with three existing opt-in visual skips. Native and Qt
+elapsed times are functional qualification under concurrent test execution,
+not controlled trading-performance comparisons. Linux, DEBUG_LOCKORDER, TSan,
+remote CI, Windows, WAN, release and 200 ms qualification remain unexecuted.
