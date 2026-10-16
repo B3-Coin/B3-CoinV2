@@ -2,7 +2,7 @@
 
 Date: 2026-10-16. Measurement profile `native-outcome-decision-slice-v1`,
 test implementation revision 2. Bounded source re-review PASS; 27 offline
-controls passed. The actual daemon experiment is pending at this freeze.
+controls passed. One actual daemon experiment subsequently completed below.
 This is not a performance, durability, reliability or release qualification.
 The [failed earlier capture](b3-flowmesh-post-admission-diagnostics-20261016.md)
 remains unchanged and unexplained.
@@ -83,4 +83,56 @@ an existing wallet/datadir or substitute a live endpoint. The fixed selected
 experiment's daemon is the preserved Catalog candidate SHA256
 `06f5ddfdf80ffd8e472efd69aacee52978a605a69082575d7f05dedfaf71a95c`,
 client source `bff8dac1`, with port seed 92501. No real result, 200 ms success,
-old-failure cause, WAN behavior or deployment is claimed before execution.
+old-failure cause, WAN behavior or deployment is inferred from a planned run.
+
+## Actual fixed-input observation
+
+The first launch used an older scratch driver `97c0efbc` and exited 2 at
+argument parsing: it did not recognize the required outcome option. No test
+directory, node, wallet or original request was created. Its stdout/stderr,
+exit manifest and stale driver were retained. The corrected launch used the
+verified repository driver `f344f813` and an explicit configuration naming
+that source, the same native binary, seed and port seed. It is the one actual
+fixture experiment, not a retry of an unknown signed instruction.
+
+Actual parent exit was 0, with no timeout or bounded-output overflow. All nine
+originals obtained verified applied/fill results and authenticated follow-up
+balances; maker conservation and read consistency passed. All harness threads
+stopped, and final inherited stdout records show actual status 0 for each
+index 0 through 4. The old failed campaign is not reclassified by this result.
+
+The isolated fill took **307.772 ms** from original submission to verified
+result. All eight burst results completed: nearest-rank empirical p50
+**1,364.825 ms**, conventional eight-sample median **1,462.619 ms**, maximum
+**2,274.240 ms**. These small, heterogeneous observations are not a sustained
+load, tail-latency, capture-overhead or 200 ms qualification. The inherited
+performance flag was false. No controlled speed comparison with another
+campaign is made.
+
+The selected client slice is complete for its chosen call: 178 events,
+64,226 serialized bytes, **zero drops**, 1,480.537 ms of capture, debug/BENCH
+off, no observer errors and exactly one conservatively matched completed
+ActionStatus. It found decision **9**: the unchanged internal client automatic
+read budget declined that result-evidence attempt. The endpoint advertised
+support and the client retained 764 bytes of inclusion proof. That selected
+status had zero HTTPS descendants and no measured work-lock wait at
+microsecond resolution. This was not a standalone server BUDGET response
+(decision 14), a missing proof, or evidence that validators were waiting.
+
+For this target, first verified inclusion was at 1,367.843 ms and the verified
+execution result at 1,560.413 ms, a 192.570 ms interval. The slice covers the
+next existing status call, not that entire later interval. It establishes
+one concrete budget deferral, not that all 192.570 ms—or the whole burst—was
+caused by the budget. Later emissions outside the stopped slice are censored.
+The eventual result is retained separately; no further target or campaign was
+chosen to force a failure. Why the old five results timed out remains unproven.
+
+Retained artifact SHA256 values are:
+
+- Full workload report: `ae26cbe776dce8997ed2d8b2ebb199f53fef2b7f85d66362edd965f338f3d67a`.
+- Compact decision report: `8a679bb9bf6228837d3295e5663e798f37060669d534256441c395607c4fe33f`.
+- Bounded native capture: `b9385dc5f073ea00086e352e3d38ef05650cf27d11ddaac83c2acf8cd5aa9f73`.
+
+Generated wallets, TLS keys, journals, databases and raw output directories
+remain private. No live wallet, VPS, mainnet, bridge, release or activation
+operation occurred.
