@@ -1,10 +1,11 @@
 # FlowMesh V2 clean core: architecture of the `rebirth` outline
 
 Date: 2026-10-16. Branch: `rebirth`, based on `18051472`.
-Status: **OUTLINE DESIGN.** At the commit that adds this file, the only
-implemented code in `src/flowmesh2/` is C1 (`BoundedMailbox`, `ReadSlot`).
-Everything else described here is the contract that the outline slices R1 to R14
-will build. It is not a [CC] milestone exit, a protocol approval or a release.
+Status: **OUTLINE IN PROGRESS.** Implemented in `src/flowmesh2/`: C1
+(`BoundedMailbox`, `ReadSlot`) and slice **R1** (build gate, error model, code
+registries, Boost.Test runner, inventory and TODO lint). Everything else
+described here is the contract that the outline slices R2 to R14 will build.
+It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
 Companion files:
@@ -37,12 +38,12 @@ per-market ledger and call it a V2 account.**
 
 ## 0. Gates that are still open
 
-These gates come from the outline review. They are restated here so that no
-slice starts while one of them is unresolved.
+These gates come from the outline review. Each row says how the slices treat
+it; none of them is closed by the outline itself.
 
 | Gate | What is open | Effect on the outline |
 |---|---|---|
-| **G-1** (O-1) | The tracked `CLAUDE.md` (`55c034ea`) locks Claude to `/Users/josh/development/ON/B3-FlowMesh` on branch `FlowMesh`. It also says that when an owner decision conflicts with tracked governing documentation, implementation stops until the documentation is reconciled in a reviewed commit. [CC] says "No new branch or PR", and plan §10.1 names `flowmeshV2-dev` as the implementation branch. The owner's 2026-10-16 instruction names branch `rebirth`. | This documentation commit follows the owner's direct instruction. **Code slices R1 to R14 wait** until the owner either lands the reconciliation of `CLAUDE.md`, [CC] and plan §10.1, or explicitly confirms the scope-lock amendment for `rebirth`. Claude does not edit `CLAUDE.md`. |
+| **G-1** (O-1) | The tracked `CLAUDE.md` (`55c034ea`) locks Claude to `/Users/josh/development/ON/B3-FlowMesh` on branch `FlowMesh`. It also says that when an owner decision conflicts with tracked governing documentation, implementation stops until the documentation is reconciled in a reviewed commit. [CC] says "No new branch or PR", and plan §10.1 names `flowmeshV2-dev` as the implementation branch. The owner's 2026-10-16 instruction names branch `rebirth`. | The documentation commit followed the owner's direct instruction. The R1 implementation run received that instruction again, verbatim ("make branch rebirth and implement there the outline ..."), and treats it as the owner's explicit direction to implement the outline on `rebirth`. The slices therefore proceed, as isolated, default-OFF, unpushed code on `rebirth` only. **Still open:** the reconciliation of `CLAUDE.md`, [CC] and plan §10.1 has not landed. Nothing from `rebirth` may be merged into another branch, pushed or released until it lands or the owner rules otherwise. Claude does not edit `CLAUDE.md`. |
 | **G-2** (O-14) | Decision D3 (the C-1 reconciliation: stable quote and fees in Q) has not landed. Plan §12.1 requires it before implementation. | The fee code in R4, R6 and R7 stays inside the REGTEST provisional profile. The owner acknowledges this or lands D3 first. |
 | **G-3** (O-13) | A harness reminder asks for attribution trailers. `CLAUDE.md` forbids them. | No attribution trailers. Repository Git identity only. Never push. |
 | **G-4** | Branch drift. | Before every edit and commit, `git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current` must print `rebirth`. Otherwise stop. |
@@ -141,7 +142,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 |---|---|---|
 | `flowmesh2_foundations` | C1, unchanged | as C1 |
 | `fm2_warnings` | INTERFACE: Clang/AppleClang `-Wthread-safety -Werror=thread-safety`; all compilers `-Werror=unused-result` | — |
-| `fm2_types` | `core/` | `core_interface`, `bitcoin_consensus`, `bitcoin_crypto`, `bitcoin_util`, `secp256k1` |
+| `fm2_types` | `core/` | R1: `core_interface` (private), `bitcoin_util` (public). Later slices add `bitcoin_consensus`, `bitcoin_crypto` and `secp256k1` when their code needs them |
 | `fm2_verify` | `verify/` | `fm2_types`, `bitcoin_crypto` (never `fm2_core`) |
 | `fm2_core` | ledger, engine, state, storage, chain, agreement, admission, read, net, bridge, futures, governance | `fm2_types`, `flowmesh2_foundations`, `crc32c`, `bitcoin_util` |
 | `fm2_dev` | `dev/` (compiled with `FM2_DEV_COMPONENTS`) | `fm2_core` |
@@ -150,10 +151,31 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `fm2_sim_cli` | binary `fm2-sim` | `fm2_simlib` |
 | `fm2_canary_*` | sanitizer canaries | only with `FLOWMESH2_SANITIZER_CANARIES=ON` |
 
-`file(GENERATE)` writes `fm2_libs.manifest`. The `nm` guard reads it, so no
-library can be skipped silently. `bitcoin_common`, `bitcoin_node`,
+`file(GENERATE)` writes `fm2_libs.manifest` (from R2). The `nm` guard reads
+it, so no library can be skipped silently. `bitcoin_common`, `bitcoin_node`,
 `bitcoin_wallet` and `bitcoinqt` never appear on the link line of `fm2_types`,
 `fm2_verify` or `fm2_core`.
+
+### 2.3 Header index
+
+Every public header, the slice that adds it and its contract in one line. A
+header marked *landed* is normative; the others are the target contract.
+
+| Header | Slice | State | Contract |
+|---|---|---|---|
+| `core/result.h` | R1 | landed | `ErrorCode` 1..17 (append-only), `Error{code, detail}` (detail static), `TaskId` (consteval, TODO.md ID format), `NotImplemented`/`Unsupported`, `[[nodiscard]] Result<T>` and `Result<void>` without default constructor, success only through `Ok()`/`Ok(v)` |
+| `core/codes.h` | R1 | landed | `OutcomeCode` (certified) and `AdmissionCode` (not certified) registries with bands, `ToString` (total), `IsKnown`, `IsRejection` (unknown values are neither success nor rejection) |
+| `core/ids.h`, `amount.h`, `hashes.h`, `codec.h`, `params.h`, `authority.h`, `market.h`, `merkle.h`, `slot.h` | R3 | target | section 2.1 row "core/ids ..."; sections 8, 9, 11 |
+| `core/action.h`, `body.h`, `outcome.h`, `facts.h`, `certificate.h`, `seat_set.h`, `account_leaf.h`, `nonce_rule.h`, `fee_math.h` | R4 | target | section 9; section 11 (fees) |
+| `ledger/nonce_window.h`, `ledger.h`, `state_commitment.h` | R5 | target | section 11; commitment v0 (O-9) |
+| `engine/book.h`, `matcher.h`, `residual.h`, `engine.h` | R6, R7 | target | section 11 |
+| `storage/*.h`, `agreement/outbound.h` | R8 | target | section 7 |
+| `state/state_owner.h`, `candidate.h`, `replay.h` | R9 | target | sections 4, 7.4 |
+| `chain/*.h`, `agreement/*.h`, `dev/*.h` | R10 | target | sections 3, 8 |
+| `read/*.h`, `verify/b3verify.h` | R11 | target | section 10.2 |
+| `admission/*.h`, `dev/dev_budget.h` | R12 | target | section 10.1 |
+| `net/*.h`, `bridge/*.h`, `futures/*.h`, `governance/*.h` | R13 | target | section 2.1 |
+| `sim/*.h` | R14 | target | section 14 |
 
 ---
 
@@ -297,7 +319,42 @@ Deterministic directories: `core/`, `ledger/`, `engine/`, `state/`,
   `NONCE_PENDING`, `BUDGET`, `BAD_SIG`, `BUSY`, `POOL_FULL`, `HALTED`.
 - A stub is `return NotImplemented("M2-LED-05"); // TODO(rebirth:M2-LED-05)` or
   the `Unsupported` form. `TaskId` has a `consteval` constructor, so the ID is a
-  literal. The guard checks the tag, TODO.md and the `stub_inventory` case.
+  literal, and a literal that does not match the TODO.md ID format does not
+  compile (`IsWellFormedTaskId`, the same pattern `check_todo.py` uses). The
+  guard checks the tag, TODO.md and the `stub_inventory` case.
+
+As landed in R1 (`core/result.h`, `core/codes.h`):
+
+- `Ok(v)` returns an `OkValue<T>` tag and `Ok()` an `OkVoid` tag; only these
+  convert to a successful `Result`. There is no implicit conversion from `T`,
+  so `return 5;` does not compile. An `Error` converts implicitly, so
+  `return Error{ErrorCode::DECODE, "..."};` and `return NotImplemented(...);`
+  work. `Error` has no default constructor, and its `detail` must point to
+  static storage (a literal or a `TaskId`).
+- `value()` on an error throws `util::BadExpectedAccess`; `error()` on a value
+  fails an `Assert`. Callers test `has_value()` first.
+- Negative compile probes run by hand for R1 (the R2 CTest
+  `flowmesh2_negative_compile` makes them permanent): an ignored `Result<int>`,
+  `Result<void>` or `Error`, `return {};` for `Result<int>` and `Result<void>`,
+  `return 5;`, a runtime `const char*` task ID and a malformed task ID literal
+  each fail to compile with the fm2 flags; a positive control compiles.
+- Code integers. `OutcomeCode`: 1-63 executed (`DEPOSIT_CREDITED=1` ..
+  `FEES_DISTRIBUTED=8`), 64-95 rule rejections (`REJ_INSUFFICIENT_AVAILABLE=64`
+  .. `REJ_NO_RECIPIENT=76`), 96-127 certified typed refusals of features not
+  implemented yet (`REJ_RESIDUAL_CROSS_UNSUPPORTED=96`). `AdmissionCode`: 1-15
+  queued or already known (`ADMITTED=1`, `DUPLICATE=2`; neither is a
+  rejection), 16-63 not admitted (`MALFORMED=16` .. `HALTED=32`). Zero is never
+  a code. A new code takes the next free integer of its band; `codes_tests`
+  and `result_tests` pin every integer and name.
+- Unknown values: `IsKnown` false, `IsRejection` false, `ToString` "UNKNOWN".
+  Decoders refuse them with `DECODE`; nobody infers success from
+  `!IsRejection`.
+- `test/stub_inventory_tests.cpp` holds the inventory. Each stub gets one case
+  written `FM2_STUB_CASE(M2_LED_05, "M2-LED-05") { ... return Observe(...); }`;
+  the case passes only for `NOT_IMPLEMENTED`/`UNSUPPORTED` with exactly that ID
+  as detail, and `registry_selfcheck` re-checks every registered stub. Test
+  files may call `NotImplemented`/`Unsupported` as fixtures; the stub-site rule
+  of the R2 guard applies to non-test sources.
 
 ---
 
@@ -578,13 +635,16 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (this commit)
+### 13.1 Today (after R1)
 
-Only C1 builds. Use the C1 command in [README.md](README.md) with the build
-directory `build-rebirth/c1`. The outline never uses `build/`, `build-qt/` or
-`build-nofullfsync/`.
+The commands in 13.2 work. They build `test_flowmesh2` (15 Boost cases) and the
+unchanged C1 binary, and run four CTests: `flowmesh2_foundations` (C1, 19
+cases), `flowmesh2_unit`, `flowmesh2_inventory` and `flowmesh2_todo_lint`. The
+outline never uses `build/`, `build-qt/` or `build-nofullfsync/`. R1 adds no
+`-DBUILD_BENCH`/`-DBUILD_FUZZ_BINARY` requirement; passing both as `OFF` only
+shortens the configure.
 
-### 13.2 After R1 (and growing with each slice)
+### 13.2 Commands (growing with each slice)
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -613,15 +673,22 @@ Test temporary directories go under `build-rebirth/fm2-test-tmp/`.
 
 ### 13.3 CTests (label `flowmesh2`)
 
-`flowmesh2_foundations` (C1, still exactly 19 cases), `flowmesh2_unit`,
-`flowmesh2_sim`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
-`flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_negative_compile`
-(Clang only), `flowmesh2_evidence_selftest`, `flowmesh2_sim_cli_determinism`.
+`flowmesh2_foundations` (C1, still exactly 19 cases), `flowmesh2_unit` (R1),
+`flowmesh2_inventory` (R1), `flowmesh2_todo_lint` (R1), `flowmesh2_sim`
+(R14), `flowmesh2_guards`, `flowmesh2_guards_selftest`,
+`flowmesh2_negative_compile` (Clang only), `flowmesh2_evidence_selftest` (R2),
+`flowmesh2_sim_cli_determinism` (R14).
 
-- **Inventory:** `test/INVENTORY.txt` lists every case. `check_inventory.py`
-  fails if a listed case is missing **or did not execute**.
-- **TODO lint:** `check_todo.py` checks the TODO.md table format, unique IDs and
-  status values.
+- **Inventory:** `test/INVENTORY.txt` lists every case (`suite/case`, sorted
+  bytewise). `check_inventory.py` requires the inventory, the cases the binary
+  lists (`--list_content`) and the cases that executed in a full run (Boost XML
+  log) to be the same set with equal counts, no disabled or skipped case, and
+  exit status 0. Its `--selftest` (always on in the CTest) proves it fails for
+  a removed, phantom, duplicated or unsorted inventory line and for a run in
+  which a listed case did not execute (`--run_test=!<case>`).
+- **TODO lint:** `check_todo.py` checks the TODO.md rules listed in TODO.md
+  ("Lint"); its `--selftest` (always on in the CTest) proves each rule fires on
+  a doctored copy.
 - **Guards** (`check_guards.py`): forbidden includes (`validation.h`,
   `kernel/cs_main.h`, `net_processing.h`, `net.h`, `node/`, `txmempool.h`,
   `index/`, `interfaces/`, `wallet/`, `qt/`, `rpc/`, `init.h`,

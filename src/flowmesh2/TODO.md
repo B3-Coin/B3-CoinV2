@@ -5,8 +5,9 @@ This is the complete task list for the new core. Claude builds the outline
 (slices R1 to R14). Codex then completes every other task here, and starts by
 auditing the outline (M0-AUD-01). The design is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-At the commit that adds this file **no outline code exists yet**. Every row is
-`todo`, except the C1 baseline, which is `done`.
+Landed outline slices: **R1** (build gate, error model, Boost.Test runner,
+inventory and TODO lint). Its row is `outline` until M0-AUD-01 accepts it.
+Every other row is `todo`, except the C1 baseline, which is `done`.
 
 ---
 
@@ -28,14 +29,20 @@ At the commit that adds this file **no outline code exists yet**. Every row is
 | Evidence | Path under the evidence root `$EV = /Users/josh/development/ON/B3-FlowMesh-200ms-evidence/`, one directory per run: `$EV/<Ms>/<ID>/<run-id>/` with `run.json`, logs and `MANIFEST.sha256` (plan §10.2). For outline slices, `scratch:R<n>/` means the provisional session scratch directory `.../scratchpad/rebirth/evidence/R<n>/`; it is not durable, and M0-AUD-01 re-creates the evidence under `$EV`. |
 | Refs | Requirement IDs, plan IDs, decisions (D1..D30), reported contradictions (O-n), gates. |
 
-**Status transitions.** When a slice lands, the same commit moves every row it
-tags from `todo` to `outline`. A task moves to `done` only with its evidence
-path filled and the owner's or auditor's acceptance.
+**Status transitions.** When a slice lands, the same commit moves its own R row
+and every row it tags from `todo` to `outline`. An R row moves to `done` when
+M0-AUD-01 accepts the slice. Any other task moves to `done` only with its
+evidence path filled and the owner's or auditor's acceptance.
 
 **Lint.** From R1 on, `contrib/flowmesh2/check_todo.py` (CTest
-`flowmesh2_todo_lint`) checks: ten columns; unique IDs matching the pattern;
+`flowmesh2_todo_lint`) checks: ten columns; unique IDs matching the pattern
+(the same pattern the C++ `TaskId` accepts at compile time); Ms matches the ID;
 Status in {`todo`, `outline`, `done`}; Skeleton in {`STUB`, `REAL-REPLACE`,
-`NONE`, `—`}; every `STUB`/`REAL-REPLACE` row names a slice and a location.
+`NONE`, `—`}; R rows use `—` and name themselves in Slice, and R1..Rn have no
+gap; every `STUB`/`REAL-REPLACE` row names existing slices and a location, and
+is `outline` only if one of its slices has landed; `NONE` rows have Slice `—`
+and are never `outline`; Task, Acceptance and Evidence are not empty. Its
+`--selftest` proves each rule fires on a doctored copy.
 From R2 on, `check_guards.py` checks that every `NotImplemented`/`Unsupported`
 site and every refusal marker has a `TODO(rebirth:<ID>)` within 3 lines, that
 every tag names a row here, and that every `STUB` row with status `outline` has
@@ -97,7 +104,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 
 | ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
 |---|---|---|---|---|---|---|---|---|---|
-| R1 | R | todo | — | R1 | Build gate `BUILD_FLOWMESH2`, `[[nodiscard]]` `Result`/`ErrorCode`, `OutcomeCode`/`AdmissionCode`, Boost.Test runner, inventory and TODO lint (these docs landed first) | top-level `CMakeLists.txt` (4 lines); `src/flowmesh2/CMakeLists.txt`; `core/result`, `core/codes`; `test/`; `contrib/flowmesh2/check_inventory.py`, `check_todo.py` | `Result<int>`/`Result<void>` not default-constructible (static_assert); `NotImplemented` carries the exact ID; every enum integer pinned; both lint scripts fail on doctored copies, including a listed case that did not run; OFF configure has no `fm2_*` target; ON without the foundation option fails to configure; C1 still 19 cases; `ctest -L flowmesh2 --no-tests=error` green | scratch:R1/ | G-1, G-2, G-4 |
+| R1 | R | outline | — | R1 | Build gate `BUILD_FLOWMESH2`, `[[nodiscard]]` `Result`/`ErrorCode`, `OutcomeCode`/`AdmissionCode`, Boost.Test runner, inventory and TODO lint (these docs landed first) | top-level `CMakeLists.txt` (4 lines); `src/flowmesh2/CMakeLists.txt`; `core/result`, `core/codes`; `test/`; `contrib/flowmesh2/check_inventory.py`, `check_todo.py` | `Result<int>`/`Result<void>` not default-constructible (static_assert); `NotImplemented` carries the exact ID; every enum integer pinned; both lint scripts fail on doctored copies, including a listed case that did not run; OFF configure has no `fm2_*` target; ON without the foundation option fails to configure; C1 still 19 cases; `ctest -L flowmesh2 --no-tests=error` green | scratch:R1/ | G-1, G-2, G-4 |
 | R2 | R | todo | — | R2 | Guards (7 rules) with self-tests, compile-fail controls, `evidence.py`, sanitizer canaries, CI workflow | `contrib/flowmesh2/`; `test/compile_fail/`; `.github/workflows/flowmesh2.yml` | each rule's planted fixture fails and a clean one passes; guards pass on the tree (`--source`, `--nm build-rebirth`); missing `LOCK`, ignored `Result` and forged token fail to compile, positive control compiles; `evidence verify` fails on a tampered, deleted or extra file; macOS ASan, UBSan and TSan canaries exit non-zero | scratch:R2/ | SEC-8, plan §4, O-19 |
 | R3 | R | todo | — | R3 | Core primitives, profile, authority types, slot header | `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot`; `PROFILE_DEX1_REGTEST.json` | `AccountId` golden; overflow refused at `MAX_ATOMS` edges and for negatives; `MulDiv` exhaustive on a small domain; tags unique, prefixed, golden, no collision with existing `B3/` tags; trailing bytes, oversize counts (no allocation) and non-canonical `CompactSize` refused; MAIN/TESTNET/TESTNET4/SIGNET give `UNSUPPORTED_NETWORK`; JSON `profile_hash` equals code; Merkle sizes 0..17 equal a naive reference, tampering fails, duplicated last leaf changes the root; header round trip, `Hash ≠ CommitDigest`, golden, every field changes `Hash` | scratch:R3/ | D6, D7, O-9, O-20 |
 | R4 | R | todo | — | R4 | Signed actions, slot body, outcomes, facts, certificate, seat set, shared spec functions | `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math`; `test/util/keys.h` | BIP340 round trip; flipped bit and other domain fail; `Id` excludes the signature; payload 4,096 ok, 4,097 `OVERSIZE`; `max_delay` 0 and 1,025 flagged; golden bytes and `Id`; `VerifiedAction` only via `Verify` (static_assert); body of 1,025 originals refused; two signatures give two `ActionLeaf`s; bitmap golden, bits ≥ k refused; `SeatSet` refuses bad PoP and duplicates; quorum table k=1..10; nonce rule exhaustive for W=3; fee increments sum to ceil(total·ppm/1e6); split exhaustive F=0..10,000 | scratch:R4/ | D5, D7, O-8, TRD-17 |

@@ -82,4 +82,12 @@ if(BUILD_FLOWMESH2)
       --selftest
   )
   set_tests_properties(flowmesh2_inventory PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint")
+
+  add_test(NAME flowmesh2_todo_lint
+    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/check_todo.py
+      --todo ${CMAKE_CURRENT_SOURCE_DIR}/TODO.md
+      --workdir ${FM2_TEST_TMP}/todo_lint
+      --selftest
+  )
+  set_tests_properties(flowmesh2_todo_lint PROPERTIES TIMEOUT 60 LABELS "flowmesh2;isolated;outline;lint")
 endif()

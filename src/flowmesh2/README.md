@@ -59,6 +59,25 @@ Codex then completes:
   source names a row there, with its status, acceptance test, evidence path and
   the provisional decisions D1 to D9.
 
-At the commit that adds these two files, no outline code exists yet; only C1
-builds. Open gates (workspace lock reconciliation, decision D3) are listed in
-ARCHITECTURE.md §0. All outline values are provisional and REGTEST-only.
+Landed so far: **R1**, the `BUILD_FLOWMESH2` gate (default OFF; it requires
+`BUILD_TESTS` and `BUILD_FLOWMESH2_FOUNDATION_TESTS`), the `[[nodiscard]]`
+`Result`/`Error` model and code registries in `core/`, the Boost.Test binary
+`test_flowmesh2` with its case inventory `test/INVENTORY.txt`, and the lint
+scripts `contrib/flowmesh2/check_inventory.py` and `check_todo.py`. Nothing is
+linked into the node, wallet or Qt.
+
+```sh
+git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
+cmake -S . -B build-rebirth -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DBUILD_TESTS=ON -DBUILD_FLOWMESH2_FOUNDATION_TESTS=ON -DBUILD_FLOWMESH2=ON \
+  -DBUILD_GUI=OFF -DBUILD_DAEMON=OFF -DBUILD_CLI=OFF -DBUILD_TX=OFF -DBUILD_UTIL=OFF \
+  -DBUILD_WALLET_TOOL=OFF -DENABLE_WALLET=OFF -DENABLE_IPC=OFF -DWITH_CCACHE=OFF
+cmake --build build-rebirth --target test_flowmesh2 test_flowmesh2_foundations --parallel 4
+ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
+```
+
+Expected after R1: 4 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 15 cases, `flowmesh2_inventory`,
+`flowmesh2_todo_lint`). Open gates (workspace lock reconciliation, decision
+D3) are listed in ARCHITECTURE.md §0. All outline values are provisional and
+REGTEST-only.
