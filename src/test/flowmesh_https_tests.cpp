@@ -22,6 +22,7 @@
 #include <flowmesh/outcome_evidence.h>
 #include <flowmesh/production_engine.h>
 #include <flowmesh/production_wire.h>
+#include <logging.h>
 #include <modern/asset_output.h>
 #include <modern/asset_validation.h>
 #include <modern/chain_domain.h>
@@ -6906,6 +6907,329 @@ BOOST_AUTO_TEST_CASE(authenticated_watch_stays_immediate_and_failed_queued_read_
     }
     client.reset();
     front->Stop();
+}
+
+namespace {
+//! Category-only isolation: generated native-fixture logger remains intact.
+struct AdmissionTraceBenchScope {
+    BCLog::CategoryMask mask{LogInstance().GetCategoryMask()};
+    decltype(LogInstance().CategoryLevels()) levels{LogInstance().CategoryLevels()};
+    bool restored{false};
+    AdmissionTraceBenchScope() { LogInstance().DisableCategory(BCLog::BENCH); }
+    void EnableBench()
+    {
+        LogInstance().AddCategoryLogLevel(BCLog::BENCH, BCLog::Level::Debug);
+        LogInstance().EnableCategory(BCLog::BENCH);
+    }
+    void Restore()
+    {
+        if (restored) return;
+        LogInstance().SetCategoryLogLevel(levels);
+        LogInstance().DisableCategory(BCLog::ALL);
+        LogInstance().EnableCategory(static_cast<BCLog::LogFlags>(mask));
+        restored = true;
+    }
+    ~AdmissionTraceBenchScope() { try { Restore(); } catch (...) {} }
+};
+
+//! Declared before measured futures: their guards/joins drain before stop.
+struct AdmissionTraceCapture {
+    bool active{false};
+    AdmissionTraceCapture()
+    {
+        BOOST_REQUIRE(!node::FlowMeshTimingRecording());
+        TimingCapture::Clear(); // This suite's existing stopped/empty contract.
+    }
+    void Start()
+    {
+        BOOST_REQUIRE(!active);
+        node::FlowMeshTimingControl("start");
+        active = true;
+    }
+    UniValue Stop()
+    {
+        BOOST_REQUIRE(active);
+        const auto capture{node::FlowMeshTimingControl("stop")};
+        active = false;
+        BOOST_CHECK(!node::FlowMeshTimingRecording());
+        BOOST_CHECK_EQUAL(capture["dropped"].getInt<uint64_t>(), 0U);
+        BOOST_CHECK_EQUAL(capture["max_events"].getInt<uint64_t>(), 32768U);
+        BOOST_CHECK_EQUAL(capture["max_bytes"].getInt<uint64_t>(), 16U * 1024U * 1024U);
+        BOOST_CHECK_LE(capture["bytes"].getInt<uint64_t>(), capture["max_bytes"].getInt<uint64_t>());
+        return capture;
+    }
+    ~AdmissionTraceCapture()
+    {
+        try {
+            if (active) node::FlowMeshTimingControl("stop");
+            TimingCapture::Clear();
+        } catch (...) {}
+    }
+};
+
+std::vector<UniValue> AdmissionTraceStage(const UniValue& capture, const std::string& stage)
+{
+    std::vector<UniValue> out;
+    for (const auto& row : capture["events"].getValues()) {
+        if (row["stream"].isStr() && row["stream"].get_str() == "FlowMeshNativeSpan" &&
+            row["event"]["stage"].isStr() && row["event"]["stage"].get_str() == stage) {
+            out.push_back(row["event"]);
+        }
+    }
+    return out;
+}
+
+bool AdmissionTraceDescends(const UniValue& event, const uint64_t ancestor,
+                           const std::map<uint64_t, UniValue>& events)
+{
+    uint64_t parent{event["parent_span_id"].getInt<uint64_t>()};
+    for (size_t depth{0}; parent && depth < events.size(); ++depth) {
+        if (parent == ancestor) return true;
+        const auto it{events.find(parent)};
+        if (it == events.end()) return false;
+        parent = it->second["parent_span_id"].getInt<uint64_t>();
+    }
+    return false;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(client_read_admission_trace_captures_real_held_foreground_and_admitted_failure)
+{
+    using namespace std::chrono_literals;
+    // Keep BENCH disabled through measured thread/parent drainage and Stop.
+    // The scope restores categories only, after all service owners unwind.
+    AdmissionTraceBenchScope bench;
+    BOOST_REQUIRE(!LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug));
+    LiveMarket live{*this, m_path_root / "admission-trace-positive-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())},
+        m_path_root / "admission-trace-positive-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const uint256 account_a{uint8_t{0x41}}, account_b{uint8_t{0x42}},
+                  immediate_account{uint8_t{0x43}}, failed_account{uint8_t{0x44}},
+                  healthy_account{uint8_t{0x45}};
+    AdmissionTraceCapture timing; // Setup above is deliberately outside capture.
+    std::string passive_error, foreground_error, failed_error;
+    uint64_t offered_us{0}, returned_us{0};
+    std::promise<void> requesting;
+    auto requested{requesting.get_future()};
+    std::future<std::optional<flowmesh::MarketData>> passive, foreground;
+    struct Release { WatchProxy& proxy; ~Release() { proxy.HoldRead({}); proxy.Hold(false); } } const release{proxy};
+    proxy.HoldRead("snapshot");
+    timing.Start();
+    passive = std::async(std::launch::async, [&] {
+        node::FlowMeshClientWorkScope scope{node::FlowMeshClientWorkPriority::PASSIVE, node::FlowMeshClientWorkLinger::NONE};
+        return client->Data(market, account_a, Page(), passive_error);
+    });
+    BOOST_REQUIRE(proxy.AwaitHeld(1)); // Genuine upstream certified body, not synthetic proof.
+    foreground = std::async(std::launch::async, [&] {
+        node::FlowMeshTimingSpan parent{"admission_trace_held_caller"};
+        node::FlowMeshClientWorkScope scope{node::FlowMeshClientWorkPriority::FOREGROUND};
+        offered_us = kernel::LockTimingNow();
+        requesting.set_value();
+        auto data{client->Data(market, account_b, Page(), foreground_error)};
+        returned_us = kernel::LockTimingNow();
+        return data;
+    });
+    BOOST_REQUIRE(requested.wait_for(1s) == std::future_status::ready);
+    BOOST_CHECK(foreground.wait_for(100ms) == std::future_status::timeout);
+    {
+        node::FlowMeshClientWorkScope scope{node::FlowMeshClientWorkPriority::PASSIVE, node::FlowMeshClientWorkLinger::NONE};
+        std::string busy;
+        BOOST_CHECK(!client->Data(market, immediate_account, Page(), busy));
+        BOOST_CHECK(busy.find("already in progress") != std::string::npos);
+    }
+    for (const auto wait : {0ms, 250ms}) {
+        node::FlowMeshClientWorkScope scope{node::FlowMeshClientWorkPriority::FOREGROUND};
+        interfaces::FlowMeshMarketWatch watch;
+        std::string busy;
+        BOOST_CHECK(!client->Watch(market, immediate_account, Page(), wait, watch, busy));
+        BOOST_CHECK(busy.find("already in progress") != std::string::npos);
+    }
+    {
+        std::lock_guard lock{proxy.mutex};
+        BOOST_CHECK(proxy.hold);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "snapshot"), 1);
+    }
+    const auto release_before_us{kernel::LockTimingNow()};
+    proxy.HoldRead({}); proxy.Hold(false);
+    const auto original{passive.get()};
+    const auto current{foreground.get()}; // Data + admission + caller parent drained before stop.
+    BOOST_REQUIRE_MESSAGE(original, passive_error);
+    BOOST_REQUIRE_MESSAGE(current, foreground_error);
+    BOOST_CHECK(original->certificate_verified && original->account_state_verified);
+    BOOST_CHECK(current->certificate_verified && current->account_state_verified);
+    BOOST_REQUIRE(current->account);
+    BOOST_CHECK(current->account->account_id == account_b);
+    BOOST_CHECK(current->snapshot.last_microblock_hash == original->snapshot.last_microblock_hash);
+    uint64_t failed_offered_us{0}, failed_returned_us{0}, healthy_offered_us{0}, healthy_returned_us{0};
+    std::optional<flowmesh::MarketData> failed, recovered;
+    {
+        node::FlowMeshTimingSpan parent{"admission_trace_failed_pins_caller"};
+        node::FlowMeshClientWorkScope scope{node::FlowMeshClientWorkPriority::FOREGROUND};
+        failed_offered_us = kernel::LockTimingNow();
+        failed = client->Data(uint256::ONE, failed_account, Page(), failed_error);
+        failed_returned_us = kernel::LockTimingNow();
+    }
+    BOOST_CHECK(!failed);
+    BOOST_CHECK(!failed_error.empty());
+    BOOST_CHECK(failed_error.find("already in progress") == std::string::npos);
+    {
+        node::FlowMeshTimingSpan parent{"admission_trace_healthy_successor_caller"};
+        node::FlowMeshClientWorkScope scope{node::FlowMeshClientWorkPriority::FOREGROUND};
+        healthy_offered_us = kernel::LockTimingNow();
+        recovered = client->Data(market, healthy_account, Page(), error);
+        healthy_returned_us = kernel::LockTimingNow();
+    }
+    BOOST_REQUIRE_MESSAGE(recovered, error);
+    BOOST_CHECK(recovered->certificate_verified && recovered->account_state_verified);
+    BOOST_REQUIRE(recovered->account);
+    BOOST_CHECK(recovered->account->account_id == healthy_account);
+    const auto status{client->ActionStatus(market, uint256::ONE, false)};
+    BOOST_CHECK(status.reason.find("No retained local signed object") != std::string::npos);
+    BOOST_CHECK(client->SavedActions(account_b, market).empty());
+    {
+        std::lock_guard lock{proxy.mutex};
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "snapshot"), 3);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "updates"), 0);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "submit"), 0);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "action"), 0);
+    }
+    BOOST_CHECK(!LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug));
+    client.reset(); front->Stop(); live.Stop(); // Capture ON until all local owners drain.
+    const auto capture{timing.Stop()};
+    const auto admissions{AdmissionTraceStage(capture, "client_read_admission")};
+    // Intentional BEFORE failure on qualified461: missing stage, after drainage.
+    BOOST_REQUIRE_EQUAL(admissions.size(), 3U);
+    std::map<uint64_t, UniValue> events;
+    for (const auto& row : capture["events"].getValues()) {
+        if (row["stream"].isStr() && row["stream"].get_str() == "FlowMeshNativeSpan") {
+            const auto& event{row["event"]};
+            BOOST_REQUIRE(events.emplace(event["span_id"].getInt<uint64_t>(), event).second);
+        }
+    }
+    size_t held_seen{0}, failed_seen{0}, healthy_seen{0}, recorded_chain_releases{0};
+    for (const auto& admission : admissions) {
+        const auto account{admission["account_id"].get_str()};
+        uint64_t before{0}, after{0};
+        std::string root_stage;
+        if (account == account_b.GetHex()) {
+            ++held_seen; before = offered_us; after = returned_us;
+            root_stage = "admission_trace_held_caller";
+            BOOST_CHECK_EQUAL(admission["market_id"].get_str(), market.GetHex());
+            const auto request_us{admission["admission_requested_us"].getInt<uint64_t>()};
+            const auto acquired_us{admission["admission_acquired_us"].getInt<uint64_t>()};
+            BOOST_REQUIRE_LE(request_us + 50'000U, release_before_us); // Observed real remaining hold.
+            BOOST_CHECK_GE(acquired_us, release_before_us);
+            BOOST_CHECK_GE(acquired_us - request_us, release_before_us - request_us);
+        } else if (account == failed_account.GetHex()) {
+            ++failed_seen; before = failed_offered_us; after = failed_returned_us;
+            root_stage = "admission_trace_failed_pins_caller";
+            BOOST_CHECK_EQUAL(admission["market_id"].get_str(), uint256::ONE.GetHex());
+        } else if (account == healthy_account.GetHex()) {
+            ++healthy_seen; before = healthy_offered_us; after = healthy_returned_us;
+            root_stage = "admission_trace_healthy_successor_caller";
+            BOOST_CHECK_EQUAL(admission["market_id"].get_str(), market.GetHex());
+        } else {
+            BOOST_ERROR("PASSIVE/Watch or unexpected caller emitted a new admission span");
+            continue;
+        }
+        BOOST_CHECK_EQUAL(admission["has_account"].getInt<uint64_t>(), 1U);
+        BOOST_CHECK_EQUAL(admission["admission_policy"].getInt<uint64_t>(), 1U);
+        BOOST_CHECK_EQUAL(admission["join_after_admission"].getInt<uint64_t>(), 0U);
+        BOOST_REQUIRE(admission["admission_acquired_us"].isNum()); // Pins failure was ADMITTED.
+        const auto original_entry{admission["request_started_us"].getInt<uint64_t>()};
+        const auto request_us{admission["admission_requested_us"].getInt<uint64_t>()};
+        const auto acquired_us{admission["admission_acquired_us"].getInt<uint64_t>()};
+        const auto ended_us{admission["monotonic_us"].getInt<uint64_t>()};
+        BOOST_CHECK_LE(before, original_entry);
+        BOOST_CHECK_LE(original_entry, request_us);
+        BOOST_CHECK_LE(request_us, acquired_us);
+        BOOST_CHECK_LE(acquired_us, ended_us);
+        BOOST_CHECK_LE(ended_us, after);
+        const auto parent{events.find(admission["parent_span_id"].getInt<uint64_t>())};
+        BOOST_REQUIRE(parent != events.end());
+        BOOST_CHECK_EQUAL(parent->second["stage"].get_str(), "Data");
+        BOOST_CHECK_EQUAL(parent->second["thread_id"].getInt<uint64_t>(), admission["thread_id"].getInt<uint64_t>());
+        BOOST_CHECK_LE(parent->second["started_us"].getInt<uint64_t>(), admission["started_us"].getInt<uint64_t>());
+        BOOST_CHECK_LE(ended_us, parent->second["monotonic_us"].getInt<uint64_t>());
+        const auto root{events.find(parent->second["parent_span_id"].getInt<uint64_t>())};
+        BOOST_REQUIRE(root != events.end());
+        BOOST_CHECK_EQUAL(root->second["stage"].get_str(), root_stage);
+        BOOST_CHECK_LE(parent->second["monotonic_us"].getInt<uint64_t>(), root->second["monotonic_us"].getInt<uint64_t>());
+        for (const auto& [id, child] : events) {
+            if (child["lock_name"].isStr() && child["lock_name"].get_str() == "cs_main" &&
+                child["lock_releasing_us"].isNum() &&
+                AdmissionTraceDescends(child, admission["span_id"].getInt<uint64_t>(), events)) {
+                ++recorded_chain_releases;
+                BOOST_CHECK_LE(child["lock_releasing_us"].getInt<uint64_t>(), ended_us);
+            }
+        }
+    }
+    BOOST_CHECK_EQUAL(held_seen, 1U);
+    BOOST_CHECK_EQUAL(failed_seen, 1U);
+    BOOST_CHECK_EQUAL(healthy_seen, 1U);
+    BOOST_TEST_MESSAGE("Actually recorded descendant chain releases: " << recorded_chain_releases
+                       << "; Lease/m_work-before-emission is separately source-proved, not inferred here");
+    bench.Restore();
+    BOOST_CHECK_EQUAL(LogInstance().GetCategoryMask(), bench.mask);
+    BOOST_CHECK(LogInstance().CategoryLevels() == bench.levels);
+    BOOST_CHECK(!node::FlowMeshTimingRecording());
+}
+
+BOOST_AUTO_TEST_CASE(client_read_admission_trace_default_off_and_bench_entry_guard_are_explicit)
+{
+    using namespace std::chrono_literals;
+    AdmissionTraceBenchScope bench;
+    BOOST_REQUIRE(!LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug));
+    AdmissionTraceCapture timing; // Capture remains OFF during setup/default-off control.
+    LiveMarket live{*this, m_path_root / "admission-trace-guard-service"};
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    auto front{Proxy(*this, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(front->Port())},
+        m_path_root / "admission-trace-guard-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const uint256 first_account{uint8_t{0x41}}, second_account{uint8_t{0x42}};
+    {
+        node::FlowMeshClientWorkScope scope{node::FlowMeshClientWorkPriority::FOREGROUND};
+        const auto off{client->Data(market, first_account, Page(), error)};
+        BOOST_REQUIRE_MESSAGE(off, error);
+        BOOST_CHECK(off->certificate_verified && off->account_state_verified);
+    }
+    BOOST_CHECK(!node::FlowMeshTimingRecording());
+    const auto stopped{node::FlowMeshTimingControl("read")};
+    BOOST_CHECK_EQUAL(stopped["events"].size(), 0U); // No span was constructed while default OFF.
+    bench.EnableBench();
+    BOOST_REQUIRE(LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug));
+    // Existing legacy spans MAY log to this fixture's generated debug.log.
+    // No sink/callback/file mutation and no global no-logging claim.
+    timing.Start();
+    {
+        node::FlowMeshTimingSpan parent{"admission_trace_bench_guard_caller"};
+        node::FlowMeshClientWorkScope scope{node::FlowMeshClientWorkPriority::FOREGROUND};
+        const auto guarded{client->Data(market, second_account, Page(), error)};
+        BOOST_REQUIRE_MESSAGE(guarded, error);
+        BOOST_CHECK(guarded->certificate_verified && guarded->account_state_verified);
+    }
+    BOOST_CHECK(LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug)); // Never toggled during work.
+    {
+        std::lock_guard lock{proxy.mutex};
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "snapshot"), 2);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "submit"), 0);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "action"), 0);
+    }
+    client.reset(); front->Stop(); live.Stop();
+    const auto capture{timing.Stop()};
+    BOOST_CHECK(AdmissionTraceStage(capture, "client_read_admission").empty());
+    BOOST_REQUIRE_EQUAL(AdmissionTraceStage(capture, "admission_trace_bench_guard_caller").size(), 1U);
+    BOOST_REQUIRE_GE(AdmissionTraceStage(capture, "Data").size(), 1U); // Capture was actually ON.
+    bench.Restore();
+    BOOST_CHECK_EQUAL(LogInstance().GetCategoryMask(), bench.mask);
+    BOOST_CHECK(LogInstance().CategoryLevels() == bench.levels);
+    BOOST_CHECK(!node::FlowMeshTimingRecording());
 }
 
 BOOST_AUTO_TEST_CASE(ordinary_snapshot_and_updates_leave_work_free_while_https_is_held)

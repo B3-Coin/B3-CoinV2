@@ -29,6 +29,7 @@
 #include <flowmesh/outcome_evidence.h>
 #include <flowmesh/production_wire.h>
 #include <hash.h>
+#include <logging.h>
 #include <modern/chain_domain.h>
 #include <modern/mpa.h>
 #include <modern/flowmesh_vault_proof.h>
@@ -2834,10 +2835,29 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                      const bool join_after_admission = false,
                      const std::optional<SnapshotContinuation>& continuation = std::nullopt)
     {
+        // Default-off bounded capture for direct foreground admission only.
+        // Watch's IMMEDIATE path can retain its lane and emits no new span.
+        // BENCH must remain disabled throughout the declared capture profile.
+        // Declaration before lease keeps emission after lease/all local locks.
+        std::optional<FlowMeshTimingSpan> admission_timing;
+        if (request.policy == FlowMeshReadAdmission::FOREGROUND_ACCOUNT &&
+            FlowMeshTimingRecording() && !LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug)) {
+            admission_timing.emplace("client_read_admission");
+            admission_timing->Field("market_id", id);
+            if (account) admission_timing->Field("account_id", *account);
+            admission_timing->Field("has_account", uint64_t{account.has_value()});
+            admission_timing->Field("admission_policy", static_cast<uint64_t>(request.policy));
+            admission_timing->Field("join_after_admission", uint64_t{join_after_admission});
+            // Same steady-clock/microsecond epoch as FlowMeshTimingSpan::Mark.
+            admission_timing->Field("request_started_us", static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(request.started.time_since_epoch()).count()));
+            admission_timing->Mark("admission_requested_us");
+        }
         // No m_work/lane lock, captured authority, params or body before this
         // reservation. Its wait is queue-only: HTTPS keeps its existing cap.
         FlowMeshClientReadAdmission::Lease lease{m_read_admission, request.policy,
             request.started + FlowMeshClientReadAdmission::QUEUE_TIMEOUT};
+        if (admission_timing) admission_timing->Mark("admission_acquired_us");
         const auto started{continuation ? continuation->started : request.started};
         ReadContext context;
         bool context_captured{false};
