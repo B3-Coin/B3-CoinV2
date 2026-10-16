@@ -300,6 +300,10 @@ BOOST_AUTO_TEST_CASE(failed_intent_barrier_leaves_no_signature)
     BOOST_CHECK(DurableTypes(*rig.signer_journal).empty());
     BOOST_CHECK_EQUAL(rig.commit_journal->Status().appended_seq, 0U);
     BOOST_CHECK(!certifier->TakeDecision().has_value());
+    // Fenced from now on: nothing new is written.
+    const state::Candidate next{rig.Preview(rig.Inputs(rig.authority, 1, "next"))};
+    RequireRefusal(certifier->Propose(next, rig.authority), ErrorCode::FENCED, dev::DEV_FENCED, "after a failed B-INTENT");
+    BOOST_CHECK_EQUAL(rig.signer_journal->Status().appended_seq, 2U);
 }
 
 BOOST_AUTO_TEST_CASE(failed_decision_barrier_fences_before_the_next_intent)

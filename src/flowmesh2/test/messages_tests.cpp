@@ -301,6 +301,12 @@ BOOST_AUTO_TEST_CASE(caps_refused_before_allocation)
     bytes[count_pos] = MAX_VOTE_INCLUSION_IDS + 1;
     for (int i{0}; i < 31; ++i) bytes.insert(bytes.end(), SHORT_ID_BYTES, 0);
     ExpectDecode(bytes, ErrorCode::OVERSIZE, "decode 33 inclusion IDs");
+    // The count itself is refused, before any ID is read: a count of 33 with
+    // only two IDs behind it is OVERSIZE (refused at the count), not DECODE
+    // (cut input), and its length is within the vote maximum.
+    std::vector<unsigned char> count_only{Encode(GoldenVote())};
+    count_only[count_pos] = MAX_VOTE_INCLUSION_IDS + 1;
+    ExpectDecode(count_only, ErrorCode::OVERSIZE, "a count of 33 refused before the IDs");
 
     // A NEW_VIEW announcing 2^32 - 1 reports is refused at the count.
     std::vector<unsigned char> nv{Encode(GoldenNewView())};
@@ -385,10 +391,13 @@ BOOST_AUTO_TEST_CASE(decode_refuses_malformed_bytes)
         b[2 + 28] = 2;
         ExpectDecode(b, ErrorCode::DECODE, "has_prepared 2");
     }
-    {
-        std::vector<unsigned char> b{Encode(GoldenDoubleVote())};
-        b[2] = 3;
-        ExpectDecode(b, ErrorCode::DECODE, "unknown evidence kind");
+    for (const Evidence& evidence : {GoldenDoubleVote(), GoldenConflictingCertificates()}) {
+        // An unknown kind in front of a payload of either kind: no kind decodes another's payload.
+        std::vector<unsigned char> b{Encode(evidence)};
+        for (unsigned char kind : {0, 3, 255}) {
+            b[2] = kind;
+            ExpectDecode(b, ErrorCode::DECODE, "unknown evidence kind");
+        }
     }
     {
         // A nested view-change report one byte longer than its content.
