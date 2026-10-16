@@ -99,6 +99,33 @@ never a renewed freshness label or signing permission. It must define initialize
 registry publication/lifetime and advisory UNKNOWN before wiring a facade.
 Simply returning inactive when a lock is busy is not a valid authority decision.
 
+That private test-first counterexample was subsequently reviewed and executed
+once, without a production repair. It used the **same initialized service**,
+real indexed four-seat/three-signature BLS genesis, production certificate
+ingress/append and independently verified exact state/head. Its existing
+`ClientSnapshot` passthrough answered while another thread owned real `cs_main`;
+`ClientSnapshotView` did not finish in the shared one-second held-lock window.
+After release both readers drained and exact evidence remained unchanged.
+
+The build exited 0. The **native child exited 201: 714 assertions passed, one
+intended availability assertion failed**, zero warnings/expected failures, no
+timeout or output overflow. The collection wrapper's 0 means it captured the
+predetermined red result, not that the test passed. The intentional red case
+remains private/off the default suite; no assertion was inverted or hidden by
+a skip. Source-only author and separate non-author review preceded root's run.
+Its prospective historical-or-UNKNOWN marker is unratified test data, not an
+implemented wire field, fresh-authority rule or signing permission. The fixture
+uses indexed synthetic blocks, not full B3 block/custody/TCP/Qt qualification.
+Its certified genesis remained checkpoint-paused; the test did not demonstrate
+healthy/current-ready signing availability.
+
+Private patch SHA256:
+`a84f944ffc473b44c9503764135aaac2a9e3764fc0d3de424a6926a64fc74f10`;
+preserved native executable SHA256:
+`003529f3adcfa86282c52120289aaacfe338c6e17ba2d0e9442160e87ced0ff6`.
+Production service/runtime/client were unchanged; this proves a remaining
+dependency, not a completed facade or a normal-load latency measurement.
+
 ## Full V2 still needs explicit design and qualification
 
 The [roadmap](b3-flowmesh-redesign-plan-20261015.md) retains decisions R-D1–R-D7.
