@@ -128,6 +128,24 @@ if(BUILD_FLOWMESH2)
       fm2_types
   )
 
+  # dev/ (slice R10): REGTEST-only dev components, in namespace
+  # flowmesh2::dev: the scripted fake chain adapter. Every dev header has
+  # #error unless FM2_DEV_COMPONENTS is defined, and fm2_dev defines it
+  # PUBLIC, so only targets that link fm2_dev (the tests, later the
+  # simulator) can include one. fm2_core never links fm2_dev, and guard rule
+  # 3 fails if fm2_core or fm2_verify defines a dev symbol.
+  add_library(fm2_dev STATIC
+    dev/fake_chain.cpp
+  )
+  target_compile_definitions(fm2_dev PUBLIC FM2_DEV_COMPONENTS)
+  target_link_libraries(fm2_dev
+    PRIVATE
+      core_interface
+      fm2_warnings
+    PUBLIC
+      fm2_core
+  )
+
   # Boost.Test suite of the outline. Every case is listed in test/INVENTORY.txt.
   add_executable(test_flowmesh2
     test/main.cpp
@@ -149,6 +167,7 @@ if(BUILD_FLOWMESH2)
     test/engine_property_tests.cpp
     test/engine_tests.cpp
     test/facts_tests.cpp
+    test/fake_chain_tests.cpp
     test/fee_math_tests.cpp
     test/file_journal_tests.cpp
     test/hashes_tests.cpp
@@ -182,6 +201,7 @@ if(BUILD_FLOWMESH2)
   target_link_libraries(test_flowmesh2 PRIVATE
     core_interface
     fm2_warnings
+    fm2_dev
     fm2_core
     fm2_types
     bitcoin_common
