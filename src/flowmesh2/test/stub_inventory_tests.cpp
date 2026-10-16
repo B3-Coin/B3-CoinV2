@@ -30,7 +30,9 @@
  * later tasks define (M7-SEAT-01, M7-GOV-01, MB1-B3D-02, M8-BRG-02,
  * M8-EXIT-01); each fact probe checks EncodeFact, FactId and DecodeFact.
  * Slice R5 adds the ledger's withdrawal (M2-LED-05) and spot/futures
- * transfers (M2-LED-06; the probe checks both directions).
+ * transfers (M2-LED-06; the probe checks both directions), and commitment
+ * v1 (M2-LED-02), the liability sum root (M2-LED-03) and exit_value
+ * (M2-LED-04).
  */
 
 #include <boost/test/unit_test.hpp>
@@ -40,6 +42,7 @@
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/ledger/ledger.h>
+#include <flowmesh2/ledger/state_commitment.h>
 
 #include <exception>
 #include <functional>
@@ -309,6 +312,23 @@ FM2_STUB_CASE(M2_LED_06, "M2-LED-06")
     ledger::LedgerState ledger{EmptyRegtestLedger()};
     return FirstDeviation("M2-LED-06", {Observe(ledger.TransferToFutures(AccountId{}, AssetId::Native(), 1)),
                                         Observe(ledger.TransferFromFutures(AccountId{}, AssetId::Native(), 1))});
+}
+
+// ---- Slice R5: ledger/state_commitment ----
+
+FM2_STUB_CASE(M2_LED_02, "M2-LED-02")
+{
+    return Observe(ledger::CommitV1(EmptyRegtestLedger()));
+}
+
+FM2_STUB_CASE(M2_LED_03, "M2-LED-03")
+{
+    return Observe(ledger::LiabilitySumRoot(EmptyRegtestLedger(), AssetId::Native()));
+}
+
+FM2_STUB_CASE(M2_LED_04, "M2-LED-04")
+{
+    return Observe(ledger::ExitValue(EmptyRegtestLedger(), AccountId{}, AssetId::Native()));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

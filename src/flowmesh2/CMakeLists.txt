@@ -87,6 +87,7 @@ if(BUILD_FLOWMESH2)
   add_library(fm2_core STATIC
     ledger/ledger.cpp
     ledger/nonce_window.cpp
+    ledger/state_commitment.cpp
   )
   target_link_libraries(fm2_core
     PRIVATE
@@ -107,6 +108,7 @@ if(BUILD_FLOWMESH2)
     test/certificate_tests.cpp
     test/codec_tests.cpp
     test/codes_tests.cpp
+    test/commitment_tests.cpp
     test/durable_tests.cpp
     test/facts_tests.cpp
     test/fee_math_tests.cpp
