@@ -121,8 +121,17 @@ BOOST_AUTO_TEST_CASE(sign_refuses_fenced_and_foreign_intents)
     const PendingIntent pending{a.Intend(slot)};
     RequireStorageOk(a.log.Barrier(), "B-INTENT");
     const DurableIntent intent{a.log.Confirm(pending).value()};
+    // b holds the very same intent (same key, digest and sequence number) in
+    // its own journal: only the journal instance tells them apart.
+    BOOST_CHECK_EQUAL(b.Intend(slot).Seq(), intent.Seq());
     RequireRefusal(b.signer.Sign(intent), ErrorCode::VERIFY_FAILED, INTENT_UNKNOWN, "intent of another log");
+    // same_id has a's instance id and the same key and digest, at another
+    // sequence number: only the sequence number tells them apart.
     SigningFixture same_id{3};
+    RequireStorageOk(same_id.log.AppendAcceptedProposal(ProposalKey{0, 1, 0}, MakeStorageSlot(1, 0, "pad").header,
+                                                       MakeStorageSlot(1, 0, "pad").body),
+                     "padding record");
+    BOOST_CHECK(same_id.Intend(slot).Seq() != intent.Seq());
     RequireRefusal(same_id.signer.Sign(intent), ErrorCode::VERIFY_FAILED, INTENT_UNKNOWN, "same instance id, other log");
     RequireStorageOk(a.signer.Sign(intent), "own intent");
 

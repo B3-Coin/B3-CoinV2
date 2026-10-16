@@ -98,6 +98,22 @@ BOOST_AUTO_TEST_CASE(applied_with_the_wrong_root_or_slot_is_refused)
     const DurableDecision same_id_token{same_id.Decided(MakeStorageSlot(2, 0, "r"))};
     RequireRefusal(f.log.AppendApplied(same_id_token, MakeStorageSlot(2, 0, "r").header.state_root), ErrorCode::VERIFY_FAILED,
                    APPLIED_DECISION_UNKNOWN, "slot this log never decided");
+    // A token of a log with the same instance id for the same header at another
+    // sequence number (only the sequence number differs) ...
+    CommitFixture shifted{5};
+    (void)shifted.Decided(MakeStorageSlot(0, 0, "r"));
+    const DurableDecision shifted_token{shifted.Decided(slot)};
+    BOOST_CHECK(shifted_token.Seq() != decision.Seq() && shifted_token.Digest() == decision.Digest());
+    RequireRefusal(f.log.AppendApplied(shifted_token, slot.header.state_root), ErrorCode::VERIFY_FAILED,
+                   APPLIED_DECISION_UNKNOWN, "same slot and header, other sequence number");
+    // ... and for another header of the same slot at the same sequence number
+    // (only the header hash differs).
+    CommitFixture other_header{5};
+    const DurableDecision other_header_token{other_header.Decided(MakeStorageSlot(1, 0, "r-other"))};
+    BOOST_CHECK(other_header_token.Seq() == decision.Seq() && other_header_token.Slot() == decision.Slot());
+    RequireRefusal(f.log.AppendApplied(other_header_token, slot.header.state_root), ErrorCode::VERIFY_FAILED,
+                   APPLIED_DECISION_UNKNOWN, "same slot and sequence number, other header");
+    BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
     // The right root works, and again is idempotent.
     const PendingApplied applied{f.log.AppendApplied(decision, slot.header.state_root).value()};
     BOOST_CHECK(f.log.AppendApplied(decision, slot.header.state_root).value() == applied);

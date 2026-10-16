@@ -160,6 +160,14 @@ BOOST_AUTO_TEST_CASE(commit_failure_on_closed_fd_is_sticky)
     RequireRefusal(JournalDirectoryCommit(pipe_fds[1]), ErrorCode::STORAGE_FATAL, COMMIT_DIRECTORY_FSYNC, "JournalDirectoryCommit on a closed fd");
 #if defined(__APPLE__)
     RequireRefusal(JournalCommit(pipe_fds[1]), ErrorCode::STORAGE_FATAL, COMMIT_F_FULLFSYNC, "macOS uses F_FULLFSYNC");
+    // No fsync fallback: on /dev/null fsync succeeds but F_FULLFSYNC does not (ENODEV), and that is fatal.
+    {
+        const int devnull{open("/dev/null", O_RDWR | O_CLOEXEC)};
+        BOOST_REQUIRE(devnull >= 0);
+        BOOST_REQUIRE(fsync(devnull) == 0);
+        RequireRefusal(JournalCommit(devnull), ErrorCode::STORAGE_FATAL, COMMIT_F_FULLFSYNC, "F_FULLFSYNC unsupported, fsync would work");
+        BOOST_REQUIRE(close(devnull) == 0);
+    }
 #elif defined(__linux__)
     RequireRefusal(JournalCommit(pipe_fds[1]), ErrorCode::STORAGE_FATAL, COMMIT_FDATASYNC, "Linux uses fdatasync");
 #endif
