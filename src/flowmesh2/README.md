@@ -90,8 +90,15 @@ per level by largest remainder, pairing by canonical rank against FIFO
 makers, execution at the maker price, the seller fee on each order's
 cumulative quote, per-order and per-slot fill caps) that settles through
 the ledger, residual-cross detection, and a naive reference matcher in
-`test/` that 1,000 seeded batches are compared against. Nothing is linked
-into the node, wallet or Qt.
+`test/` that 1,000 seeded batches are compared against; and **R7**, the
+slot engine in `engine/engine`: the canonical order of a slot's originals
+(seeded by the parent header, each account's actions in nonce order), the
+slot validity predicate whose only product is a `ValidatedSlot`, the
+engine state with its commitment (now including every resting order's
+leaf) and slot-boundary invariants, and `Engine::ApplySlot`, which runs
+deposits, transfers, cancels, post-only orders, one joint A2 sweep per
+market, resting, fees and a conservation check, and certifies one outcome
+per fact and action. Nothing is linked into the node, wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -103,8 +110,8 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R6: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 198 cases, `flowmesh2_inventory`,
+Expected after R7: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 250 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
 `flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`).
 Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2. Open gates (workspace lock reconciliation, decision

@@ -12,10 +12,13 @@ header), slice **R4** (signed actions, slot bodies, outcomes, chain facts,
 certificates, seat sets, the account leaf and the shared nonce and fee spec
 functions), slice **R5** (the shared spot ledger with nonce windows,
 fee withholding and conservation, the protocol accounts, and state
-commitment v0 with account proofs) and slice **R6** (the order book, the A2
+commitment v0 with account proofs), slice **R6** (the order book, the A2
 sweep with pairing, fees and fill caps, residual-cross detection and a
-naive reference matcher). Everything else described here is the contract
-that the outline slices R7 to R14 will build.
+naive reference matcher) and slice **R7** (the canonical slot order, the
+slot validity predicate, the engine state with its commitment and
+slot-boundary invariants, and `Engine::ApplySlot`). Everything else
+described here is the contract that the outline slices R8 to R14 will
+build.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
@@ -137,7 +140,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math` | R4 | `ActionV2` exact capped codec, `UnsignedMsg`, `Id`, `Account`, BIP340 `VerifySignature`, `MaxDelayValid`, PLACE/CANCEL/TRANSFER/WITHDRAW payload codecs, `KindSupported`; `VerifiedAction::Verify`; `SlotBody` codec, `BodyHash`, `ActionLeaf`, `ActionsRoot`, `FactsRoot`; `OutcomeV2` codec and `LeafHash`; `DepositFact` codec and `FactId`; `SlotCertificate` codec, `Hash`, `SignerIndices`, `MakeBitmap`; `SeatSet::FromPoP`, `Quorum`, `Root`, `Keys`; `AccountLeafV0` codec and `LeafValue`; `ClassifyNonce`, `NonceInsert`, `InExpiryWindow`, `ExpiredAt`; `SellerFeeTotal`, `SellerFeeIncrement`, `SplitSlotFees` | codecs and `FactId` of five facts: seat change (M7-SEAT-01), listing (M7-GOV-01), checkpoint accepted (MB1-B3D-02), payout confirmed (M8-BRG-02), exit nullifier (M8-EXIT-01); `BatchVerifier::VerifyBatch` (M4-ADM-01) | nonce rule (M2-ADM-01) |
 | `ledger/`, `core/state_root` | R5 | `NonceWindow` (over the core D7 rule), `AdmissionCodeFor`; `LedgerState` (deposit with outpoint nullifier, reserve, release, pay from reserved with fee withholding, credit to protocol accounts, transfer, nonces, open orders, `CheckConservation`), all atomic; protocol accounts `SeatPoolAccount`/`TreasuryAccount`; `AssetTotals`, `TotalsLeafV0`, `MarketLeafValue`, `NullifierLeafValue`, `StateRootsV0`; `CommitV0`, `ProveAccountV0` | `RequestWithdrawal` (M2-LED-05), `TransferToFutures`/`TransferFromFutures` (M2-LED-06), `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) | duplicate-fact rules (M2-LED-07), seat-pool account (M7-FEE-01) |
 | `engine/book`, `matcher`, `residual` | R6 | `RequiredReservation`; `OrderBook` (exact reservations, never crossed, FIFO by `arrival_rank`, `FillBestFront` at the maker price) and `BookSet`; `AllocateProRata`; `SweepA2` with pairing, ledger settlement, seller fees, per-order and per-slot fill caps and `TakerStop`; `FindResidualCross` | `ResolveResidualCross` (M3-ENG-02), `PriceBandCheck` (M3-ENG-03) | book (M3-ENG-01), pairing and remainder rule (M3-ENG-14), self-trade (M3-ENG-13), slot fill budget (M3-ENG-04) |
-| `engine/engine` | R7 | `ValidateSlotInputs`, `CanonicalOrder`, `Engine::ApplySlot` phases 1-6, 8, 9 | `CANCEL_ALL` (M3-ENG-09), `WITHDRAW` (M2-LED-05), phase 7 futures (M9-FUT-04); residual cross as certified refusal (M3-ENG-02) | order seed (M3-ENG-12), caps (M3-ENG-04), validity predicate (M4-AGR-11) |
+| `engine/engine`, `core/state_root` (order leaf), `ledger/state_commitment` (trading state) | R7 | `OrderKey`, `CanonicalOrder`, `SlotPhase`, `PhaseOf`, `ArrivalRank`; `EngineState` (`Genesis`, `Markets`, `OrderLeaves`, `Commit`, slot-boundary `CheckInvariants`); `HeadView`; `SlotInputs`; `ValidateSlotInputs` → `ValidatedSlot` (private constructor); `Engine::Create`, `Engine::ApplySlot` phases 1-6, 8, 9 with outcomes, delta reconciliation and roots; `RestingOrderLeafV0`; `CommitTradingStateV0`, `OrderLeafOf` | `PhaseOf` branches `CANCEL_ALL` (M3-ENG-09), `WITHDRAW` (M2-LED-05), futures transfers (M2-LED-06); `RunFuturesPhase` (M9-FUT-04); residual cross as the certified refusal `REJ_RESIDUAL_CROSS_UNSUPPORTED` (M3-ENG-02) | order seed (M3-ENG-12), caps and the slot fill budget (M3-ENG-04), validity predicate (M4-AGR-11) |
 | `storage/` | R8 | record framing, `Journal`, `MemoryJournal`, `FileJournal::CreateNew`, `JournalCommit`, `JournalDirectoryCommit`, `Pending<T>`, minting of the `Durable*` tokens (type landed in R2), `SignerLog`, `SeatSigner`, `CommitLog`; `agreement/outbound.h` | `OpenExisting`/`ReadAll` (M4-STO-01), `LogWriter` (M4-STO-02), `SnapshotStore` (M4-STO-03), folded signing (M4-STO-05), `Rollover` (M4-STO-06), view-state records (M4-STO-07) | — |
 | `state/` | R9 | `StateOwner::Preview`, `Reexecute`, `Apply`, `Head`; `ReplayDecisions`; `CoreState::Genesis` | `Restore` (M4-STO-03), pipelined `Preview` over an uncommitted parent (M4-AGR-10) | full-state copy (M2-LED-10) |
 | `chain/`, `agreement/`, `dev/` | R10 | `ChainAdapter` interface; capped message codecs; `Agreement` and `SafetyRules` interfaces; `DevSingleSeatCertifier` (k=1, REGTEST); `FakeChainAdapter` | `PbftSafetyRules` (M4-AGR-01), `PbftAgreement` (M4-AGR-02, also `DevSingleSeatCertifier::OnMessage`), `LeaderSchedule` (M4-AGR-03), `InclusionList` (M4-AGR-04), `RestartFence` (M4-AGR-06), `EvidenceStore` (M4-AGR-07), trusted-facts b3d adapter (MB1-ADP-06), finalized b3d adapter (M7-ADP-01) | — |
@@ -202,16 +205,17 @@ header marked *landed* is normative; the others are the target contract.
 | `core/account_leaf.h` | R4 | landed | `AccountLeafV0` exact capped codec with the canonical form enforced, `LeafValue` = `Tagged(STATE_ACCOUNTS, bytes)`, lookups |
 | `core/nonce_rule.h` | R4 | landed | D7 spec: `ClassifyNonce`, `NonceAcceptable`, `NonceInsert`, `InExpiryWindow`, `ExpiredAt` (REAL-REPLACE M2-ADM-01) |
 | `core/fee_math.h` | R4 | landed | D5 spec: `SellerFeeTotal`, `SellerFeeIncrement` (ceiling on the cumulative per-order fee), `SplitSlotFees` (floor to seats, residual to treasury); PROVISIONAL, gate G-2 |
-| `core/state_root.h` | R5 | landed | commitment v0 value types shared with b3verify (O-33): `SeatPoolAccount`/`TreasuryAccount` = `Tagged(PROTOCOL_ACCOUNT, name ‖ profile_hash)`; `AssetTotals{deposits, effects, pending, fees_held}`; 64-byte `TotalsLeafV0` (exact decode, all-zero refused); `MarketLeafValue`, `NullifierLeafValue`; `StateRootsV0` (160 bytes) and `Root()` = `Tagged(STATE, u8 0 ‖ five roots)`; `COMMITMENT_VERSION_V0` |
+| `core/state_root.h` | R5, R7 | landed | commitment v0 value types shared with b3verify (O-33); R7 adds `RestingOrderLeafV0` (153 bytes, canonical form enforced, `LeafValue` = `Tagged(STATE_ORDERS, bytes)`) and leaves `COMMITMENT_VERSION_V0` to `core/slot.h` (O-43): `SeatPoolAccount`/`TreasuryAccount` = `Tagged(PROTOCOL_ACCOUNT, name ‖ profile_hash)`; `AssetTotals{deposits, effects, pending, fees_held}`; 64-byte `TotalsLeafV0` (exact decode, all-zero refused); `MarketLeafValue`, `NullifierLeafValue`; `StateRootsV0` (160 bytes) and `Root()` = `Tagged(STATE, u8 0 ‖ five roots)`; `COMMITMENT_VERSION_V0` |
 | `test/util/keys.h` | R4 | landed | TEST keys from labels: `CKey` and `bls::SecretKey::FromIKM` from `SHA256(label)`, `SignDigest` |
 | `test/util/ledger_fixtures.h` | R5 | landed | TEST fixtures for ledger and commitment tests: `TestAsset`, `TestAccount`, `TestOutpoint`, `Deposit`, markets M1/M2, `EmptyLedger`, `RequireOk`/`RequireError`/`RequireStub` (read `error()` only on failure) |
 | `ledger/nonce_window.h` | R5 | landed | `NonceWindow` (`Create`, `FromUsed`, `Classify`, `Insert`; no rule of its own, the core D7 functions), `AdmissionCodeFor` (USED → `NONCE_USED`, TOO_LOW → `NONCE_TOO_LOW`) |
 | `ledger/ledger.h` | R5 | landed | `LedgerState` value type, no lock, atomic operations (an Error or rejection changes nothing): `CreditDeposit`, `Reserve` (OK/INSUFFICIENT), `Release`, `PayFromReserved(from, to, asset, amount, withheld_fee)`, `Credit` (protocol accounts, from `fees_held`), `Transfer` (O-7 outcomes), `ConsumeNonce`, `AddOpenOrder` (OK/AT_CAP), `RemoveOpenOrder`, `Leaf`, `CheckConservation` (also a free function over explicit maps); stubs `RequestWithdrawal` (M2-LED-05), `TransferToFutures`/`TransferFromFutures` (M2-LED-06) |
-| `ledger/state_commitment.h` | R5 | landed | `CommitV0(ledger, markets, orders)` → `StateRootsV0`, `OrderLeafV0` (R7 defines its value), `ProveAccountV0` → `AccountWitnessV0{leaf, proof}`; stubs `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) |
+| `ledger/state_commitment.h` | R5, R7 | landed | `CommitV0(ledger, markets, orders)` → `StateRootsV0`, `OrderLeafV0`, `ProveAccountV0` → `AccountWitnessV0{leaf, proof}`; R7: `OrderLeafOf`, `CommitTradingStateV0(ledger, markets, RestingOrderLeafV0s)` (refuses a non-canonical leaf, an unlisted market and an owner without an account); stubs `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) |
 | `engine/book.h` | R6 | landed | `RestingOrder`, `Reservation`/`RequiredReservation`, `Opposite`, `Reaches`; `OrderBook` (REAL-REPLACE M3-ENG-01): `Create`, `BestBid`/`BestAsk`/`Best`, `WouldCross`, `Find`, `BestFront`, `LevelLots`, `Orders`, `Rest`, `Remove`, `FillBestFront`, `CheckInvariants`, five invariants kept by every mutation (O-35); `BookSet` (`Create`, `Find`, `FindOrder`, `CheckInvariants`) |
 | `engine/matcher.h` | R6 | landed | `TakerStop` registry, `Taker`, `SlotFillBudget`, `ExecutedFill`, `SweepResult`; `AllocateProRata` (largest remainder, ties by rank; M3-ENG-14); `SweepA2(book, ledger, takers, profile, budget)`: preconditions first with no change, then BUY takers against asks and SELL takers against bids, settlement through the ledger (O-36, O-37); stub `PriceBandCheck` (M3-ENG-03) over `ReferencePrice` |
 | `engine/residual.h` | R6 | landed | `FindResidualCross` (real detection); `ResidualCall` (target shape) and stub `ResolveResidualCross` (M3-ENG-02; O-38) |
-| `engine/engine.h` | R7 | target | section 11 |
+| `engine/engine.h` | R7 | landed | `OrderingEntry`, `OrderKey` = `Tagged(ORDER, parent ‖ u64 height ‖ ActionId)`, `CanonicalOrder` (seeded sort, then each account's positions in ascending nonce; REAL-REPLACE M3-ENG-12); `SlotPhase` registry 1..9, `PhaseOf` (stub branches M3-ENG-09, M2-LED-05, M2-LED-06); `ArrivalRank` = (2·height + phase bit)·max_actions_per_slot + rank (O-39); `EngineState`; `HeadView` (non-owning, refuses temporaries); `SlotInputs`; the `SLOT_*` refusal details; `ValidateSlotInputs` (REAL-REPLACE M4-AGR-11, O-41) → `ValidatedSlot`; `SlotAction`, `ActionPayload`; `SlotResult`; `RunFuturesPhase` (stub M9-FUT-04); `Engine` (section 11) |
+| `test/util/slot_fixtures.h` | R7 | landed | TEST fixtures: synthetic TEST network and domain, label keys `fm2/test/key/<name>`, `SlotFixture` (genesis head, signed `Place`/`Cancel`/`Transfer`, deposit bytes at the next cursor, `Inputs`, `Validate`, `TryApply`, `Apply` and `Advance`, which assembles the next header as R9 will), `OutcomeOf`, `RequireRefusal` |
 | `test/util/engine_fixtures.h` | R6 | landed | TEST fixtures: `EngineOrder`, `EngineFixture` (fund, rest a maker the way phase 6 does, reserve a taker the way phase 5 does, sweep and check conservation and book invariants) |
 | `test/reference_matcher.h` | R6 | landed | TEST oracle: naive O(n²) A2 matcher over plain vectors (scans for the best price, rank order, FIFO maker and count-ahead largest remainder); shares only the id types and `Side` with the engine |
 | `storage/durable.h` | R2 | landed | `DurableKind`, move-only `Durable<K>` tokens with a private constructor whose only friend is `Journal` (R8 mints them); section 7.2 |
@@ -612,7 +616,7 @@ existing `"B3/..."` literals: none equals an fm2 tag and none uses the
   | Component | Key | Leaf value |
   |---|---|---|
   | accounts | `AccountId` | `Tagged(STATE_ACCOUNTS, AccountLeafV0)` of the canonical leaf |
-  | orders | `OrderId` | given by the caller as `OrderLeafV0`; empty until R7 defines it |
+  | orders | `OrderId` | `Tagged(STATE_ORDERS, RestingOrderLeafV0)`: order ‖ market ‖ owner ‖ u8 side ‖ u64 price ‖ u64 lots ‖ u64 arrival_rank ‖ i64 reserved_left ‖ i64 cum_quote ‖ i64 fee_charged ‖ u64 fills (R7) |
   | markets | `MarketId` | `Tagged(STATE_MARKETS, 80-byte descriptor)` |
   | nullifiers | `Outpoint` | `Tagged(STATE_NULLIFIERS, txid ‖ u32 vout)`, one per credited deposit |
   | totals | `AssetId` | `Tagged(STATE_TOTALS, asset ‖ i64 deposits ‖ i64 effects ‖ i64 pending ‖ i64 fees_held)` |
@@ -783,6 +787,59 @@ admission, the engine and b3verify.
   `REJ_RESIDUAL_CROSS_UNSUPPORTED`, and the call itself is the stub
   `ResolveResidualCross` (M3-ENG-02; O-38).
 
+**As landed in R7** (`engine/engine.h`; PROVISIONAL REGTEST):
+
+- `ValidateSlotInputs(parent, inputs, profile)` checks, in this order and
+  each as `INVALID_INPUT` with a named `SLOT_*` detail: the profile (its
+  hash, the parent header's and the parent ledger's), the domain, a
+  successor height, the anchor (not below the parent's, the same block at
+  the parent's height), the fact range (starts at the parent's
+  `facts_to`, not reversed, nothing above the anchor), the caps (facts,
+  fact bytes, originals, original bytes) before any decoding, every fact
+  (a stub kind returns its R4 `NotImplemented` id; cursors inside the
+  range and ascending; deposits the ledger would refuse), every original
+  (decode, domain, `KindSupported`, payload, `MaxDelayValid` and the
+  expiry window at the slot height, repeated `ActionId`, repeated
+  (account, nonce), account in the parent, nonce acceptable in the parent
+  window), the ascending insert of each account's nonces, and the BIP340
+  signatures last. Its only product is a `ValidatedSlot` (private
+  constructor) bound to the parent header hash, holding the decoded
+  deposits and actions and the canonical order (O-41).
+- `Engine::ApplySlot(parent, slot)` copies the parent state, consumes every
+  action's nonce first in canonical order (DUR-5; one account's nonces
+  always ascend), runs phases 1-6, 7 (`RunFuturesPhase`, a no-op while
+  futures are disabled), 8 and 9, and returns `SlotResult{state,
+  outcomes, outcomes_root, roots}`. Outcomes are emitted as: one per
+  deposit in body order, one per action in canonical rank, one
+  `FEES_DISTRIBUTED` per quote asset with a non-zero fee total, ascending
+  `AssetId` (O-42).
+- PLACE rejections, in order, with no change but the nonce:
+  `REJ_UNKNOWN_MARKET`, `REJ_BAD_PARAMS` (price or lots 0, or a
+  reservation above `MAX_ATOMS`: user-controlled overflow is a certified
+  rejection, never an error), `REJ_WOULD_CROSS` (post-only),
+  `REJ_OPEN_ORDER_CAP` (GTC and post-only take their open-order slot when
+  they are placed), `REJ_INSUFFICIENT_AVAILABLE`. A cancel of an order
+  that is not resting (never placed, closed, or placed in the same slot)
+  is `REJ_UNKNOWN_ORDER`; `REJ_ORDER_CLOSED` would need a closed-order
+  index (O-42).
+- Phase 6 per taker: `FILLED`; `REJ_FILL_CAP` when either fill cap stopped
+  it while the book still crosses (O-40); `IOC_DONE`;
+  `REJ_RESIDUAL_CROSS_UNSUPPORTED`; else the remainder rests at its limit
+  with exactly its reservation (`RESTING` or `PARTIAL_RESTING`) and the
+  price improvement is released. Post-only orders rest in phase 4 with
+  `ArrivalRank(height, POST_ONLY, rank)` and remainders in phase 6 with
+  `ArrivalRank(height, REST, rank)`, so at one level a post-only order of
+  the slot queues ahead of a remainder of the slot (O-39).
+- Phase 9 checks `EngineState::CheckInvariants` (conservation, books, no
+  fees held, reserved balances equal to the resting orders' reservations,
+  open-order counts equal to the resting orders), the profile's fill and
+  delta caps per outcome, and that the outcomes' deltas reproduce the
+  balance transition from the parent exactly; then the roots. A slot
+  never makes more than `max_fills_per_slot` fills over all markets.
+- The state commitment is `EngineState::Commit` =
+  `CommitTradingStateV0(ledger, every market, every resting order's
+  RestingOrderLeafV0)`.
+
 ---
 
 ## 12. Outline slices
@@ -811,11 +868,11 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R6)
+### 13.1 Today (after R7)
 
 The commands in 13.2 work. They build every fm2 target (`fm2_all`): the
-libraries `fm2_types` and `fm2_core` (since R5; `engine/` since R6),
-`test_flowmesh2` (198 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
+libraries `fm2_types` and `fm2_core` (since R5; `engine/` since R6,
+`engine/engine` since R7), `test_flowmesh2` (250 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
 19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
 `flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
 and `flowmesh2_negative_compile` (Clang). The outline never uses `build/`,
@@ -1143,6 +1200,11 @@ outline does not resolve on its own.
 | O-36 | Fill caps (D6) | A taker stops at `max_fills_per_order` fills; its unconsumed pro-rata share is re-allocated at the same level in the next round. One `SlotFillBudget` (`max_fills_per_slot`) is shared by every sweep of the slot: R7 sweeps markets in ascending `MarketId`, and inside a market the BUY takers sweep before the SELL takers; at zero every sweep stops. The research note's alternative (defer the takers beyond the cap whole to the next slot) contradicts definite outcomes (DUR-6), and the registry has no `SLOT_FULL` outcome code (adding one changes an owner-protected registry), so R7 must map a slot-capped remainder to an existing code. M3-ENG-04 rules both |
 | O-37 | What the sweep does and does not do | It settles every fill in the ledger immediately (`PayFromReserved` on both legs, fee withheld into `fees_held`) and closes makers (`RemoveOpenOrder`). It does not release a taker's unspent reservation, rest a remainder, consume nonces or build outcomes; R7 does. Preconditions are checked first and a refusal changes nothing; an error after that means a broken invariant elsewhere (for example another market's reservations that the ledger no longer covers), the state is then unspecified, and R7 discards its candidate (no copy-on-write inside the sweep). Pro-rata demand is each taker's remaining lots, not capped by the fill caps |
 | O-38 | Residual-cross and price-band interfaces | `FindResidualCross` treats every GTC remainder that crosses any opposite remainder as crossing (a BUY at or above the lowest SELL limit, a SELL at or below the highest BUY limit), so R7 refuses all of them, not only the max-volume subset a call would execute. `ResolveResidualCross` returns a target `ResidualCall{clearing_price_ticks, buy_lots, sell_lots}`; `PriceBandCheck(market, price, ReferencePrice{market, price_ticks})` returns `Result<bool>`. M3-ENG-02 and M3-ENG-03 may reshape them |
+| O-39 | Arrival rank of resting orders: the R7 slice text says "arrival_rank = canonical rank", but post-only orders rest in phase 4 and remainders in phase 6, and the book needs strictly increasing ranks per level over the life of a market (O-35) | `ArrivalRank(height, phase, rank)` = (2·height + (phase = REST ? 1 : 0))·max_actions_per_slot + rank: by slot, then post-only before remainders, then canonical rank. A post-only order of a slot therefore queues ahead of a same-slot remainder at its level even with a higher canonical rank. The stride assumes a fixed `max_actions_per_slot`; a change at a versioned height (M7-GOV-03) must keep ranks increasing. PROVISIONAL |
+| O-40 | Codes for refused remainders (O-36 asked R7 to map them) | A taker stopped by the per-order or the per-slot fill cap while the book still crosses gets `REJ_FILL_CAP` (GTC and IOC alike); a GTC remainder that crosses a same-slot opposite remainder gets `REJ_RESIDUAL_CROSS_UNSUPPORTED`. Both refuse the REMAINDER only: the outcome still lists the fills made before and their deltas, so a client must not read these two rejection codes as "nothing happened" (`RefusesRemainderOnly`). Every other rejection moves no money. A `SLOT_FULL` code would change the owner-protected registry; M3-ENG-04 rules it |
+| O-41 | Validity predicate clauses beyond the slice text | Added: a successor height; an anchor at the parent's height must be the same block; no fact above the anchor (`facts_to` ≤ (anchor height + 1, 0)); fact cursors inside the range and strictly ascending; deposits the ledger would refuse; malformed facts, originals and payloads; `MaxDelayValid`; the ascending insert of each account's nonces (implied by the parent-window clause, checked so apply cannot fail on it); BIP340 signatures, last. A decoded non-deposit fact kind (unreachable while the R4 codecs are stubs) is `SLOT_FACT_KIND`; each fact task adds its engine branch. Precedence is fixed and tested. M4-AGR-11 ratifies the list against `PROTOCOL.md` |
+| O-42 | Engine semantics the plan leaves open | Nonces are consumed before phase 1, in canonical order, because phases reorder an account's actions (a nonce-7 TRANSFER runs before a nonce-6 PLACE) and out-of-order inserts could evict a nonce that is still to come. A cancel cannot reach an order of its own slot (the PLACE runs later): `REJ_UNKNOWN_ORDER`. `REJ_ORDER_CLOSED` is not produced (no closed-order index). A GTC taker takes its open-order slot when reserved, so it can be refused at the cap even if it would fill completely. User-controlled overflow (price × lots) is `REJ_BAD_PARAMS`, never an error. Outcome order: deposits, actions by canonical rank, fee outcomes by ascending quote `AssetId`, only for non-zero fee totals; a fee outcome's account is zero. PROVISIONAL |
+| O-43 | Housekeeping found in R7 | `core/slot.h` and `core/state_root.h` both defined `COMMITMENT_VERSION_V0`, so no translation unit could include both; it is now defined once, in `core/slot.h` (failing compile probe in the R7 evidence). The slice text names "outcome codes as listed in layout §D"; no such section exists in any tracked or scratch document, so the R1 `OutcomeCode` registry is used unchanged |
 
 ---
 
