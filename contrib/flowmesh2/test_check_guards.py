@@ -48,6 +48,16 @@ FORBIDDEN_INCLUDES = (
     "txmempool.h", "index/txindex.h", "interfaces/chain.h", "wallet/wallet.h", "qt/guiutil.h",
     "rpc/server.h", "init.h", "chainparams.h", "flowmesh/ledger.h",
 )
+# Rule 1 addition: one planted verify/ include per entry of the verify list
+# (R2: ledger, engine, state, storage; R11: every other fm2 library directory
+# and the C1 headers).
+VERIFY_FORBIDDEN_INCLUDES = (
+    "flowmesh2/ledger/ledger.h", "flowmesh2/engine/engine.h", "flowmesh2/state/state_owner.h",
+    "flowmesh2/storage/journal.h", "flowmesh2/read/views.h", "flowmesh2/chain/chain_adapter.h",
+    "flowmesh2/agreement/messages.h", "flowmesh2/admission/admission.h", "flowmesh2/net/lanes.h",
+    "flowmesh2/bridge/bridge.h", "flowmesh2/futures/futures.h", "flowmesh2/governance/governance.h",
+    "flowmesh2/dev/fake_chain.h", "flowmesh2/sim/node.h", "flowmesh2/read_slot.h", "flowmesh2/mailbox.h",
+)
 # Rule 2, all non-test code: (label, snippet).
 BANNED_ALL = (
     ("std_mutex", "std::mutex g_m;"),
@@ -127,6 +137,12 @@ NM_SCENARIOS = {
     "r3_dev_budget_in_core": {"add": {"fm2_core": [("admission/budget.cpp.o", "DEV_BUDGET")]}},
     "r3_verify_references_ledger_code": {"add": {"fm2_verify": [("verify/bad.cpp.o", "VERIFY_USES_LEDGER")]}},
     "r3_ledger_namespace_in_verify": {"add": {"fm2_verify": [("verify/ns.cpp.o", "LEDGER_NAMESPACE")]}},
+    # R11 (addition): every fm2_core directory and namespace, and the C1 library.
+    "r3_verify_references_read_code": {"add": {"fm2_core": [("read/views.cpp.o", "CORE_READ_OK")],
+                                               "fm2_verify": [("verify/reads.cpp.o", "VERIFY_USES_READ")]}},
+    "r3_read_namespace_in_verify": {"add": {"fm2_verify": [("verify/rns.cpp.o", "READ_NAMESPACE")]}},
+    "r3_agreement_namespace_in_verify": {"add": {"fm2_verify": [("verify/ans.cpp.o", "AGREEMENT_NAMESPACE")]}},
+    "r3_verify_references_c1_code": {"add": {"fm2_verify": [("verify/c1.cpp.o", "VERIFY_USES_C1")]}},
     "r3_test_binary_defines_v1": {"exe": {"test_flowmesh2": "V1_DEFINITION"}},
     "r3_sim_binary_defines_v1": {"exe": {"fm2_sim_cli": "V1_DEFINITION"}},
     "r3_built_library_missing": {"missing_file": "fm2_core"},
@@ -260,6 +276,11 @@ class Harness:
             name = "r1_include_" + include.replace("/", "_").replace(".", "_")
             tree = self.clean_tree(name)
             self.write(tree, os.path.join(FM2, "chain", "planted.cpp"), f"#include <{include}>\n")
+            self.expect_rule(name, tree, ["--source"])
+        for include in VERIFY_FORBIDDEN_INCLUDES:
+            name = "r1_verify_include_" + include.replace("/", "_").replace(".", "_")
+            tree = self.clean_tree(name)
+            self.write(tree, os.path.join(FM2, "verify", "planted.cpp"), f"#include <{include}>\n")
             self.expect_rule(name, tree, ["--source"])
         for label, snippet in BANNED_ALL:
             name = "r2_all_" + label

@@ -96,6 +96,28 @@ namespace flowmesh2 { int LedgerCredit(int); int VerifyBad(int x) { return Ledge
 namespace flowmesh2::ledger { int Balance(); }
 int FixtureNamespaced() { return flowmesh2::ledger::Balance(); }
 
+#elif defined(FM2_NM_CORE_READ_OK)
+// fm2_core, read/ (slice R11): defines flowmesh2::ReadAccountCount(int).
+namespace flowmesh2 { int ReadAccountCount(int x) { return x + 2; } }
+
+#elif defined(FM2_NM_VERIFY_USES_READ)
+// fm2_verify referencing flowmesh2::ReadAccountCount(int), which fm2_core's read/ object defines.
+namespace flowmesh2 { int ReadAccountCount(int); int VerifyReads(int x) { return ReadAccountCount(x); } }
+
+#elif defined(FM2_NM_READ_NAMESPACE)
+// Undefined flowmesh2::read::Lookup().
+namespace flowmesh2::read { int Lookup(); }
+int FixtureRead() { return flowmesh2::read::Lookup(); }
+
+#elif defined(FM2_NM_AGREEMENT_NAMESPACE)
+// Undefined flowmesh2::agreement::Quorum().
+namespace flowmesh2::agreement { int Quorum(); }
+int FixtureAgreement() { return flowmesh2::agreement::Quorum(); }
+
+#elif defined(FM2_NM_VERIFY_USES_C1)
+// fm2_verify referencing flowmesh2::MailboxDepth(), which the C1 library defines (C1_OK).
+namespace flowmesh2 { int MailboxDepth(); int VerifyMailbox() { return MailboxDepth(); } }
+
 #else
 #error "test_check_guards.py must define exactly one FM2_NM_* case"
 #endif

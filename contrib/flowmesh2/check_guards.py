@@ -26,7 +26,10 @@ token rules run, so documentation may name a banned construct.
 Rule 1, forbidden includes (non-test fm2 code): validation.h,
   kernel/cs_main.h, net_processing.h, net.h, node/, txmempool.h, index/,
   interfaces/, wallet/, qt/, rpc/, init.h, chainparams.h and the V1 flowmesh/.
-  Addition: verify/ includes no flowmesh2/{ledger,engine,state,storage}/ header.
+  Addition: verify/ includes no flowmesh2/{ledger,engine,state,storage}/ header;
+  since R11 also no header of read/, chain/, agreement/, admission/, net/,
+  bridge/, futures/, governance/, dev/ or sim/, and no C1 header (fm2_verify
+  links fm2_types and bitcoin_crypto only).
 Rule 2, banned constructs. In all non-test fm2 code: std::mutex,
   std::recursive_mutex, RecursiveMutex, GlobalMutex, std::shared_mutex,
   std::lock_guard, std::scoped_lock, std::unique_lock<std::mutex>,
@@ -42,7 +45,10 @@ Rule 3, nm over every target in fm2_libs.manifest: fm2_types, fm2_verify,
   fm2_core and fm2_verify define no Dev*, FakeChainAdapter or
   UnlimitedDevBudget; fm2_verify has no flowmesh2::{ledger,engine,state,
   storage}:: symbol and no undefined reference that an fm2_core object built
-  from ledger/, engine/, state/ or storage/ defines; no fm2 executable
+  from ledger/, engine/, state/ or storage/ defines (since R11: every fm2_core
+  namespace and directory, read/, chain/, agreement/, admission/, net/,
+  bridge/, futures/ and governance/ included, and no undefined reference that
+  the C1 library defines); no fm2 executable
   (test_flowmesh2, fm2-sim, ...) defines a V1 flowmesh:: symbol. Every built
   library and executable in the manifest must exist, so none is skipped.
 Rule 4, link isolation: no CMakeLists.txt or *.cmake outside src/flowmesh2/
@@ -123,6 +129,10 @@ FORBIDDEN_INCLUDE_PREFIX = (
 # (addition) b3verify never compiles application code.
 VERIFY_FORBIDDEN_INCLUDE_PREFIX = (
     "flowmesh2/ledger/", "flowmesh2/engine/", "flowmesh2/state/", "flowmesh2/storage/",
+    # (addition, R11) every other fm2 library directory and the C1 headers.
+    "flowmesh2/read/", "flowmesh2/chain/", "flowmesh2/agreement/", "flowmesh2/admission/",
+    "flowmesh2/net/", "flowmesh2/bridge/", "flowmesh2/futures/", "flowmesh2/governance/",
+    "flowmesh2/dev/", "flowmesh2/sim/", "flowmesh2/read_slot.h", "flowmesh2/mailbox.h",
 )
 
 # Rule 2 tables: (label, regex). Matched on comment- and string-free text.
@@ -184,8 +194,13 @@ NODE_SYMBOLS = (
 V1_SYMBOL = re.compile(_NOT_ID + r"flowmesh::")
 DEV_SYMBOL = re.compile(_NOT_ID + r"(?:Dev[A-Z0-9_]\w*|FakeChainAdapter|UnlimitedDevBudget)(?![A-Za-z0-9_])"
                         r"|" + _NOT_ID + r"flowmesh2::dev::")
-APPLICATION_NAMESPACE = re.compile(_NOT_ID + r"flowmesh2::(?:ledger|engine|state|storage)::")
-APPLICATION_DIRS = ("ledger", "engine", "state", "storage")
+# The R2 lists named ledger, engine, state and storage; R11 (addition) extends
+# them to every fm2_core namespace and directory, so fm2_verify can use no
+# fm2_core code at all.
+APPLICATION_NAMESPACE = re.compile(
+    _NOT_ID + r"flowmesh2::(?:ledger|engine|state|storage|read|chain|agreement|admission|net|bridge|futures|governance)::")
+APPLICATION_DIRS = ("ledger", "engine", "state", "storage", "read", "chain", "agreement", "admission", "net", "bridge",
+                    "futures", "governance")
 NODE_CLEAN_TARGETS = ("fm2_types", "fm2_verify", "fm2_core", "flowmesh2_foundations")
 DEV_CLEAN_TARGETS = ("fm2_core", "fm2_verify")
 REQUIRED_MANIFEST_TARGETS = ("fm2_types", "test_flowmesh2", "flowmesh2_foundations")
@@ -836,15 +851,22 @@ def nm_symbols(nm_tool, path):
 
 
 def application_definitions(nm_tool, objects):
-    """Externally defined flowmesh2 names of fm2_core objects from ledger/, engine/, state/, storage/."""
+    """Externally defined flowmesh2 names of fm2_core objects from the APPLICATION_DIRS."""
     defined = set()
     for obj in objects:
         norm = obj.replace("\\", "/")
         if not re.search(r"/fm2_core\.dir/(?:" + "|".join(APPLICATION_DIRS) + r")/", norm):
             continue
-        for _member, is_defined, letter, name in nm_symbols(nm_tool, obj):
-            if is_defined and letter.isupper() and "flowmesh2::" in name and "(anonymous namespace)" not in name:
-                defined.add(name)
+        defined |= flowmesh2_definitions(nm_tool, obj)
+    return defined
+
+
+def flowmesh2_definitions(nm_tool, obj):
+    """Externally defined flowmesh2 names of one object."""
+    defined = set()
+    for _member, is_defined, letter, name in nm_symbols(nm_tool, obj):
+        if is_defined and letter.isupper() and "flowmesh2::" in name and "(anonymous namespace)" not in name:
+            defined.add(name)
     return defined
 
 
@@ -893,11 +915,19 @@ def check_nm(build_dir, config, nm_tool, findings, counts):
                 app = application_definitions(nm_tool, objects["fm2_core"])
             except GuardError as e:
                 findings.fail(3, "fm2_core", str(e))
+        c1 = set()
+        for obj in objects.get("flowmesh2_foundations", []):
+            try:
+                c1 |= flowmesh2_definitions(nm_tool, obj)
+            except GuardError as e:
+                findings.fail(3, "flowmesh2_foundations", str(e))
         for member, defined, _letter, sym in symbols["fm2_verify"]:
             if APPLICATION_NAMESPACE.search(sym):
-                findings.fail(3, f"fm2_verify({member})", f"application (ledger/engine/state/storage) symbol: {sym}")
+                findings.fail(3, f"fm2_verify({member})", f"application (fm2_core namespace) symbol: {sym}")
             elif not defined and sym in app:
                 findings.fail(3, f"fm2_verify({member})", f"references fm2_core application code: {sym}")
+            elif not defined and sym in c1:
+                findings.fail(3, f"fm2_verify({member})", f"references C1 code (addition, R11): {sym}")
     for name, info in sorted(targets.items()):
         if info["type"] != "EXECUTABLE":
             continue
