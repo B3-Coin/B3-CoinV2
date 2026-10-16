@@ -5,6 +5,17 @@
 # CTest flowmesh2_inventory (contrib/flowmesh2/check_inventory.py) fails if a
 # listed case is not in the binary, if the binary has an unlisted case, if a
 # case is disabled, or if a listed case did not execute in the full run.
+action_tests/bip340_sign_verify_round_trip
+action_tests/every_field_changes_id_and_id_excludes_signature
+action_tests/flipped_signature_bit_fails
+action_tests/golden_bytes_id_and_signature
+action_tests/kind_registries_pinned
+action_tests/kind_supported_only_place_cancel_transfer
+action_tests/max_delay_zero_and_1025_flagged
+action_tests/payload_cap_4096_accepted_4097_oversize
+action_tests/payload_codecs_round_trip_and_refusals
+action_tests/signature_over_another_domain_fails
+action_tests/unknown_kind_version_and_trailing_bytes_refused
 amount_tests/add_refuses_operands_outside_the_range
 amount_tests/add_refuses_overflow_at_the_edges
 amount_tests/max_atoms_is_two_to_the_62
@@ -16,6 +27,12 @@ amount_tests/sub_refuses_underflow_and_bad_operands
 authority_tests/authority_version_differs_per_field
 authority_tests/encodings_pinned_and_round_trip
 authority_tests/fact_cursor_total_order
+body_tests/fact_and_item_caps
+body_tests/golden_body_hash_and_roots
+body_tests/leaf_tags_are_domain_separated
+body_tests/originals_cap_1024_accepted_1025_refused
+body_tests/round_trip_and_exact_length
+body_tests/two_signatures_one_action_id_two_leaves
 codec_tests/capped_byte_vector
 codec_tests/capped_vector_at_and_over_cap
 codec_tests/decode_exact_refuses_trailing_short_and_long_input
@@ -80,6 +97,7 @@ slot_tests/hash_differs_from_commit_digest
 slot_tests/round_trip
 stub_inventory/M3_ENG_03
 stub_inventory/M3_ENG_08
+stub_inventory/M4_ADM_01
 stub_inventory/M4_STO_05
 stub_inventory/M9_FUT_01
 stub_inventory/checker_detects_bad_entries

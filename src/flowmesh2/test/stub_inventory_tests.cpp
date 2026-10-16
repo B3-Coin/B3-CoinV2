@@ -25,11 +25,13 @@
  *
  * Slice R1 added the registry and its self-check. Slice R3 adds the four
  * stubs of core/params Validate(): the price band (M3-ENG-03), PER_SIDE fees
- * (M3-ENG-08), futures (M9-FUT-01) and folded signing (M4-STO-05).
+ * (M3-ENG-08), futures (M9-FUT-01) and folded signing (M4-STO-05). Slice R4
+ * adds batch BIP340 verification (M4-ADM-01).
  */
 
 #include <boost/test/unit_test.hpp>
 
+#include <flowmesh2/core/action.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
 
@@ -229,6 +231,13 @@ FM2_STUB_CASE(M4_STO_05, "M4-STO-05")
     ProfileParams params{RegtestProfile()};
     params.signer_mode = SignerMode::FOLDED_SIGNING;
     return Observe(Validate(params));
+}
+
+// ---- Slice R4: core/action BatchVerifier ----
+
+FM2_STUB_CASE(M4_ADM_01, "M4-ADM-01")
+{
+    return Observe(BatchVerifier{}.VerifyBatch({}));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

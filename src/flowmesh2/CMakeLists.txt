@@ -41,10 +41,14 @@ if(BUILD_FLOWMESH2)
   )
 
   # core/: deterministic value types, codecs, tagged hashes, the provisional
-  # profile, the error model and code registries. bitcoin_consensus provides
-  # hash.cpp, uint256.cpp and pubkey.cpp; bitcoin_crypto provides SHA-256.
+  # profile, the error model and code registries, signed actions and slot
+  # bodies. bitcoin_consensus provides hash.cpp, uint256.cpp and pubkey.cpp
+  # (XOnlyPubKey::VerifySchnorr); bitcoin_crypto provides SHA-256 and BLS;
+  # secp256k1 is the BIP340 verifier behind pubkey.cpp.
   add_library(fm2_types STATIC
+    core/action.cpp
     core/amount.cpp
+    core/body.cpp
     core/codes.cpp
     core/hashes.cpp
     core/ids.cpp
@@ -58,6 +62,7 @@ if(BUILD_FLOWMESH2)
     PRIVATE
       core_interface
       fm2_warnings
+      secp256k1
     PUBLIC
       bitcoin_consensus
       bitcoin_crypto
@@ -67,8 +72,10 @@ if(BUILD_FLOWMESH2)
   # Boost.Test suite of the outline. Every case is listed in test/INVENTORY.txt.
   add_executable(test_flowmesh2
     test/main.cpp
+    test/action_tests.cpp
     test/amount_tests.cpp
     test/authority_tests.cpp
+    test/body_tests.cpp
     test/codec_tests.cpp
     test/codes_tests.cpp
     test/durable_tests.cpp
@@ -81,12 +88,16 @@ if(BUILD_FLOWMESH2)
     test/slot_tests.cpp
     test/stub_inventory_tests.cpp
   )
+  # bitcoin_common only for CKey (test/util/keys.h signs with test keys); the
+  # fm2 libraries never link it (guard rule 4).
   target_link_libraries(test_flowmesh2 PRIVATE
     core_interface
     fm2_warnings
     fm2_types
+    bitcoin_common
     bitcoin_consensus
     bitcoin_util
+    secp256k1
     univalue
     Boost::headers
   )
