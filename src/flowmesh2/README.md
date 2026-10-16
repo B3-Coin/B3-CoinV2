@@ -45,3 +45,20 @@ This run qualifies neither full V1 nor full V2. The 200 ms target must later
 include original preflight, actual crypto/agreement, durable execution and
 durable client verification on isolated regtest. Test runtime is not trading
 latency.
+
+## Rebirth outline (branch `rebirth`)
+
+The C1 text above is unchanged and C1 stays frozen. On branch `rebirth` the
+whole new core is being laid out as a walking skeleton (slices R1 to R14) that
+Codex then completes:
+
+- [ARCHITECTURE.md](ARCHITECTURE.md): module layout, data flow, lock and
+  determinism rules, durability barriers, authority versioning, what is real
+  versus stubbed, how to build and test, and the walking-skeleton acceptance.
+- [TODO.md](TODO.md): the task ledger. Every `// TODO(rebirth:<ID>)` tag in the
+  source names a row there, with its status, acceptance test, evidence path and
+  the provisional decisions D1 to D9.
+
+At the commit that adds these two files, no outline code exists yet; only C1
+builds. Open gates (workspace lock reconciliation, decision D3) are listed in
+ARCHITECTURE.md §0. All outline values are provisional and REGTEST-only.
