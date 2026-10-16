@@ -100,6 +100,7 @@ if(BUILD_FLOWMESH2)
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
     state/candidate.cpp
+    state/replay.cpp
     state/state_owner.cpp
     storage/commit_log.cpp
     storage/file_journal.cpp
@@ -157,6 +158,7 @@ if(BUILD_FLOWMESH2)
     test/outcome_tests.cpp
     test/params_tests.cpp
     test/record_tests.cpp
+    test/replay_tests.cpp
     test/result_tests.cpp
     test/seat_set_tests.cpp
     test/seat_signer_tests.cpp

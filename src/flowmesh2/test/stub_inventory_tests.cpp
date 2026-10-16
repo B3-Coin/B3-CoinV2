@@ -43,8 +43,9 @@
  * the group-commit writer (M4-STO-02), snapshots (M4-STO-03) and the view
  * state records (M4-STO-07), and extends M4-STO-05 to probe the signer
  * log's folded signing as well. Slice R9 adds the state owner's pipelined
- * Preview over an uncommitted candidate (M4-AGR-10) and extends M4-STO-03
- * to probe StateOwner::Restore as well.
+ * Preview over an uncommitted candidate (M4-AGR-10), and extends M4-STO-03
+ * to probe StateOwner::Restore and the replay of a SNAPSHOT_MARK record and
+ * M4-STO-07 to probe the replay of a PREPARED_QC record as well.
  */
 
 #include <boost/test/unit_test.hpp>
@@ -61,6 +62,7 @@
 #include <flowmesh2/ledger/ledger.h>
 #include <flowmesh2/ledger/state_commitment.h>
 #include <flowmesh2/state/candidate.h>
+#include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
 #include <flowmesh2/storage/commit_log.h>
 #include <flowmesh2/storage/file_journal.h>
@@ -470,20 +472,26 @@ FM2_STUB_CASE(M4_STO_03, "M4-STO-03")
     const storage::SnapshotMark mark{1, uint256::ONE, uint256::ONE};
     HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
     const std::shared_ptr<const state::HeadView> head{heartbeat.owner->Head()};
+    const std::vector<storage::JournalRecord> marked{{1, storage::RecordType::SNAPSHOT_MARK, {}, uint256{}}};
     return FirstDeviation("M4-STO-03", {Observe(store.Write(mark, Bytes("state"))), Observe(store.Load(mark)),
-                                        Observe(heartbeat.owner->Restore(*head, {}))});
+                                        Observe(heartbeat.owner->Restore(*head, {})),
+                                        Observe(state::ReplayDecisions(*head, marked))});
 }
 
 FM2_STUB_CASE(M4_STO_07, "M4-STO-07")
 {
-    // VIEW_STATE and NEW_VIEW_ACCEPTED in the signer log, PREPARED_QC in the commit log.
+    // VIEW_STATE and NEW_VIEW_ACCEPTED in the signer log, PREPARED_QC in the
+    // commit log, and the replay of a PREPARED_QC record (R9).
     auto signer_journal{NewMemoryJournal(storage::JournalRole::SIGNER, 1)};
     auto commit_journal{NewMemoryJournal(storage::JournalRole::COMMIT, 2)};
     storage::SignerLog signer{storage::SignerLog::Create(*signer_journal).value()};
     storage::CommitLog commit{storage::CommitLog::Create(*commit_journal).value()};
+    HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
+    const std::vector<storage::JournalRecord> prepared{{1, storage::RecordType::PREPARED_QC, {}, uint256{}}};
     return FirstDeviation("M4-STO-07", {Observe(signer.AppendViewState(storage::ViewStateRecord{0, 1})),
                                         Observe(signer.AppendNewViewAccepted(storage::NewViewAcceptedRecord{0, 1, Bytes("nv")})),
-                                        Observe(commit.AppendPreparedQc(storage::PreparedQcRecord{0, 1, 1, uint256::ONE, Bytes("qc")}))});
+                                        Observe(commit.AppendPreparedQc(storage::PreparedQcRecord{0, 1, 1, uint256::ONE, Bytes("qc")})),
+                                        Observe(state::ReplayDecisions(*heartbeat.owner->Head(), prepared))});
 }
 
 // ---- Slice R9: the state owner ----
