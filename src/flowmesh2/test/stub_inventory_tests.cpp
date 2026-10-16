@@ -33,7 +33,10 @@
  * transfers (M2-LED-06; the probe checks both directions), and commitment
  * v1 (M2-LED-02), the liability sum root (M2-LED-03) and exit_value
  * (M2-LED-04). Slice R6 adds the residual-cross call (M3-ENG-02) and
- * extends M3-ENG-03 to probe the engine's PriceBandCheck as well.
+ * extends M3-ENG-03 to probe the engine's PriceBandCheck as well. Slice R7
+ * adds the engine's CANCEL_ALL branch (M3-ENG-09) and extends M2-LED-05 and
+ * M2-LED-06 to probe the engine branches of WITHDRAW and the spot/futures
+ * transfers (engine PhaseOf) as well.
  */
 
 #include <boost/test/unit_test.hpp>
@@ -44,6 +47,7 @@
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/engine/book.h>
+#include <flowmesh2/engine/engine.h>
 #include <flowmesh2/engine/matcher.h>
 #include <flowmesh2/engine/residual.h>
 #include <flowmesh2/ledger/ledger.h>
@@ -205,6 +209,14 @@ StubObservation FirstDeviation(std::string_view task_id, std::vector<StubObserva
 //! An empty ledger of the provisional regtest profile.
 ledger::LedgerState EmptyRegtestLedger() { return ledger::LedgerState::Create(RegtestProfile()).value(); }
 
+//! An unsigned action of `kind` with an empty payload (PhaseOf reads only the kind).
+ActionV2 ActionOfKind(ActionKind kind)
+{
+    ActionV2 action;
+    action.kind = kind;
+    return action;
+}
+
 //! EncodeFact, FactId and DecodeFact (of the kind byte) of a stub fact kind.
 StubObservation FactStubProbe(const Fact& fact, std::string_view task_id)
 {
@@ -311,15 +323,20 @@ FM2_STUB_CASE(M8_EXIT_01, "M8-EXIT-01")
 
 FM2_STUB_CASE(M2_LED_05, "M2-LED-05")
 {
+    // Two entry points: the ledger (R5) and the engine's WITHDRAW branch (R7).
     ledger::LedgerState ledger{EmptyRegtestLedger()};
-    return Observe(ledger.RequestWithdrawal(AccountId{}, WithdrawPayload{AssetId::Native(), 1, {0x51}}));
+    return FirstDeviation("M2-LED-05", {Observe(ledger.RequestWithdrawal(AccountId{}, WithdrawPayload{AssetId::Native(), 1, {0x51}})),
+                                        Observe(engine::PhaseOf(ActionOfKind(ActionKind::WITHDRAW)))});
 }
 
 FM2_STUB_CASE(M2_LED_06, "M2-LED-06")
 {
+    // The ledger's two directions (R5) and the engine branches of both kinds (R7).
     ledger::LedgerState ledger{EmptyRegtestLedger()};
     return FirstDeviation("M2-LED-06", {Observe(ledger.TransferToFutures(AccountId{}, AssetId::Native(), 1)),
-                                        Observe(ledger.TransferFromFutures(AccountId{}, AssetId::Native(), 1))});
+                                        Observe(ledger.TransferFromFutures(AccountId{}, AssetId::Native(), 1)),
+                                        Observe(engine::PhaseOf(ActionOfKind(ActionKind::SPOT_TO_FUTURES))),
+                                        Observe(engine::PhaseOf(ActionOfKind(ActionKind::FUTURES_TO_SPOT)))});
 }
 
 // ---- Slice R5: ledger/state_commitment ----
@@ -346,6 +363,13 @@ FM2_STUB_CASE(M3_ENG_02, "M3-ENG-02")
     const MarketDescriptor market{AssetId::Native(), AssetId{uint256::ONE}, 1, 1};
     engine::OrderBook book{engine::OrderBook::Create(market).value()};
     return Observe(engine::ResolveResidualCross(book, {}, {}, RegtestProfile()));
+}
+
+// ---- Slice R7: engine/engine ----
+
+FM2_STUB_CASE(M3_ENG_09, "M3-ENG-09")
+{
+    return Observe(engine::PhaseOf(ActionOfKind(ActionKind::CANCEL_ALL)));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

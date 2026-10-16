@@ -82,11 +82,14 @@ if(BUILD_FLOWMESH2)
   # Application core (fm2_core). ledger/ (slice R5): the deterministic shared
   # spot ledger, its nonce windows and state commitment v0, in namespace
   # flowmesh2::ledger. engine/ (slice R6): the order book, the A2 sweep and
-  # the residual-cross detection, in namespace flowmesh2::engine. Later slices add state/, storage/ and the
+  # the residual-cross detection, in namespace flowmesh2::engine; engine.cpp
+  # (slice R7): the canonical order, the validity predicate and the slot
+  # phases. Later slices add state/, storage/ and the
   # other application directories here. fm2_verify never links it (guard
   # rule 4), and it never links bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
     engine/book.cpp
+    engine/engine.cpp
     engine/matcher.cpp
     engine/residual.cpp
     ledger/ledger.cpp
@@ -110,6 +113,7 @@ if(BUILD_FLOWMESH2)
     test/authority_tests.cpp
     test/body_tests.cpp
     test/book_tests.cpp
+    test/canonical_order_tests.cpp
     test/certificate_tests.cpp
     test/codec_tests.cpp
     test/codes_tests.cpp
