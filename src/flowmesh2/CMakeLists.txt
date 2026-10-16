@@ -48,8 +48,11 @@ if(BUILD_FLOWMESH2)
     core/codes.cpp
     core/hashes.cpp
     core/ids.cpp
+    core/market.cpp
+    core/merkle.cpp
     core/params.cpp
     core/result.cpp
+    core/slot.cpp
   )
   target_link_libraries(fm2_types
     PRIVATE
@@ -71,8 +74,11 @@ if(BUILD_FLOWMESH2)
     test/durable_tests.cpp
     test/hashes_tests.cpp
     test/ids_tests.cpp
+    test/market_tests.cpp
+    test/merkle_tests.cpp
     test/params_tests.cpp
     test/result_tests.cpp
+    test/slot_tests.cpp
     test/stub_inventory_tests.cpp
   )
   target_link_libraries(test_flowmesh2 PRIVATE
