@@ -108,7 +108,16 @@ equivocation rule), the seat signer whose `Sign` takes only a
 `DurableIntent`, the commit log (decisions with their bodies, and
 applications) and `agreement/outbound.h`; reopening a file journal,
 rollover, group commit, snapshots, folded signing and the PBFT view-state
-records are typed stubs. Nothing is linked into the node, wallet or Qt.
+records are typed stubs; and **R9**, the state owner in `state/`: the core
+state and its genesis, owned committed heads, slot candidates that only
+the engine can produce (with the originals in canonical order, so a
+permuted proposal gives the same header), the single-writer `StateOwner`
+whose `Preview` and `Reexecute` run without its lock and whose `Apply`
+installs a candidate only under a `DurableDecision` of its commit journal
+and the current authority, and `ReplayDecisions`, which rebuilds every
+header and the final state from the commit journal; restoring a head,
+pipelined previews and the snapshot and view-state records are typed
+stubs. Nothing is linked into the node, wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -120,8 +129,8 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R8: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 301 cases, `flowmesh2_inventory`,
+Expected after R9: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 326 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
 `flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`
 with four controls). The file journal tests write only under

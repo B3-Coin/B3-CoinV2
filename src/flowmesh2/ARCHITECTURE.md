@@ -19,9 +19,12 @@ slot validity predicate, the engine state with its commitment and
 slot-boundary invariants, and `Engine::ApplySlot`) and slice **R8** (record
 framing, the journal interface, the memory and file journals, strict
 commit, durability tokens minted only by `Journal::Confirm`, the signer and
-commit logs, the seat signer and the outbound vote). Everything else
-described here is the contract that the outline slices R9 to R14 will
-build.
+commit logs, the seat signer and the outbound vote) and slice **R9** (the
+core state, owned committed heads, unforgeable slot candidates with a
+canonical body, the single-writer `StateOwner` with `Preview`, `Reexecute`
+and `Apply`, and `ReplayDecisions` over the commit journal). Everything
+else described here is the contract that the outline slices R10 to R14
+will build.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
@@ -145,7 +148,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `engine/book`, `matcher`, `residual` | R6 | `RequiredReservation`; `OrderBook` (exact reservations, never crossed, FIFO by `arrival_rank`, `FillBestFront` at the maker price) and `BookSet`; `AllocateProRata`; `SweepA2` with pairing, ledger settlement, seller fees, per-order and per-slot fill caps and `TakerStop`; `FindResidualCross` | `ResolveResidualCross` (M3-ENG-02), `PriceBandCheck` (M3-ENG-03) | book (M3-ENG-01), pairing and remainder rule (M3-ENG-14), self-trade (M3-ENG-13), slot fill budget (M3-ENG-04) |
 | `engine/engine`, `core/state_root` (order leaf), `ledger/state_commitment` (trading state) | R7 | `OrderKey`, `CanonicalOrder`, `SlotPhase`, `PhaseOf`, `ArrivalRank`; `EngineState` (`Genesis`, `Markets`, `OrderLeaves`, `Commit`, slot-boundary `CheckInvariants`); `HeadView`; `SlotInputs`; `ValidateSlotInputs` → `ValidatedSlot` (private constructor); `Engine::Create`, `Engine::ApplySlot` phases 1-6, 8, 9 with outcomes, delta reconciliation and roots; `RestingOrderLeafV0`; `CommitTradingStateV0`, `OrderLeafOf` | `PhaseOf` branches `CANCEL_ALL` (M3-ENG-09), `WITHDRAW` (M2-LED-05), futures transfers (M2-LED-06); `RunFuturesPhase` (M9-FUT-04); residual cross as the certified refusal `REJ_RESIDUAL_CROSS_UNSUPPORTED` (M3-ENG-02) | order seed (M3-ENG-12), caps and the slot fill budget (M3-ENG-04), validity predicate (M4-AGR-11) |
 | `storage/`, `agreement/outbound.h` | R8 | `RecordType`/`JournalRole` registries, framing, `EncodeRecord`, `ScanRecords`; `Journal` (`Append`, `Barrier`, `Status`, `Confirm`, `BarrierObserver`), `MemoryJournal` with a fault plan, `FileJournal::CreateNew` (and the fault seam `CreateNewWithCommitHook`), `JournalCommit`, `JournalDirectoryCommit`, `CommitDirectory`; keys, references and `Pending<T>`; `Durable*` tokens bound to instance, sequence and reference (type landed in R2); `SignerLog` and `CommitLog` with their record codecs and equivocation and idempotency rules; `SeatSigner::Sign(const DurableIntent&)`; `OutboundVote::From(const DurableSignedVote&)` | `FileJournal::OpenExisting`/`ReadAll` and the logs over a journal with history (M4-STO-01), `LogWriter::Start` (M4-STO-02), `SnapshotStore::Write`/`Load` (M4-STO-03), `SignerLog::AppendSignedFolded` (M4-STO-05), `FileJournal::Rollover` and an append past the segment end (M4-STO-06), `AppendViewState`, `AppendNewViewAccepted`, `AppendPreparedQc` (M4-STO-07) | — |
-| `state/` | R9 | `StateOwner::Preview`, `Reexecute`, `Apply`, `Head`; `ReplayDecisions`; `CoreState::Genesis` | `Restore` (M4-STO-03), pipelined `Preview` over an uncommitted parent (M4-AGR-10) | full-state copy (M2-LED-10) |
+| `state/` | R9 | `CoreState` and `CoreState::Genesis(profile, markets, seat_set_root)`; `HeadView` (owning: header, certificate hash, `shared_ptr<const CoreState>`); `ParentRef` (`COMMITTED`/`CANDIDATE`); `SlotInputs{authority, anchor, facts_from, facts_to, body}`; `Candidate` (only `BuildCandidate` makes one; canonical body, O-50); `BuildCandidate`, `ReexecuteOn`, `GenesisHead`; `StateOwner::Create`, `Head`, `Preview`, `Reexecute`, `Apply` (single writer, compare-and-swap of the head pointer); `ReplayDecisions`; the decision token names its record's certificate (`storage/tokens.h`) | `Restore` and replay of a `SNAPSHOT_MARK` (M4-STO-03), pipelined `Preview` over a `CANDIDATE` parent (M4-AGR-10), replay of a `PREPARED_QC` (M4-STO-07) | full-state copy in `BuildCandidate` (M2-LED-10) |
 | `chain/`, `agreement/`, `dev/` | R10 | `ChainAdapter` interface; capped message codecs; `Agreement` and `SafetyRules` interfaces; `DevSingleSeatCertifier` (k=1, REGTEST); `FakeChainAdapter` | `PbftSafetyRules` (M4-AGR-01), `PbftAgreement` (M4-AGR-02, also `DevSingleSeatCertifier::OnMessage`), `LeaderSchedule` (M4-AGR-03), `InclusionList` (M4-AGR-04), `RestartFence` (M4-AGR-06), `EvidenceStore` (M4-AGR-07), trusted-facts b3d adapter (MB1-ADP-06), finalized b3d adapter (M7-ADP-01) | — |
 | `read/`, `verify/` | R11 | `SlotView`, `CertifiedEnvelope`, `ReadService`; `VerifyCertificate`, `VerifyOutcome`, `VerifyAccountLeaf`, `VerifyFill`, `VerifyBalanceTransition`, `VerifyExpired` | `VerifyLiabilityPath` (M5-VFY-03), `VerifyCheckpoint` (M8-CKP-01), `VerifyAnchorProof` (M7-ADP-02) | archive (M5-RD-01), v0 tree levels (M2-LED-02) |
 | `admission/`, `dev/dev_budget` | R12 | `Admission` A0..A10, `ActionPool`, `BudgetPolicy`, `UnlimitedDevBudget` | `CreditBudget` (M4-ADM-02), batch verification (M4-ADM-01); `UNSUPPORTED_KIND` refusals (M2-LED-05, M3-ENG-09, M2-LED-06) | — |
@@ -234,7 +237,10 @@ header marked *landed* is normative; the others are the target contract.
 | `storage/log_writer.h`, `storage/snapshot_store.h` | R8 | landed (stubs) | target contracts of the group-commit writer (M4-STO-02) and of snapshots (M4-STO-03) |
 | `agreement/outbound.h` | R8 | landed | `OutboundVote::From(const DurableSignedVote&)`, the only way to build a vote that may leave the process |
 | `test/util/storage_fixtures.h` | R8 | landed | TEST fixtures: `TestDir` under `FM2_TEST_TMP_DIR/storage/`, `ReadFile`/`WriteFile`, `RequireRefusal`/`RequireCode`/`RequireStub`, `RecordingObserver`, `NewMemoryJournal`, `MakeStorageSlot` (a header, body and certificate that agree), `CommitVoteKey` |
-| `state/state_owner.h`, `candidate.h`, `replay.h` | R9 | target | sections 4, 7.4 |
+| `state/candidate.h` | R9 | landed | `CoreState{engine, seat_set_root}` and `Genesis` (INVALID_INPUT for a zero root); `HeadView::Make` (refuses a null state; `HeaderHash` cached; `EngineView` only on lvalues); `ParentKind` (COMMITTED=1, CANDIDATE=2, append-only), `ParentRef::Committed`/`Uncommitted`; `SlotInputs`; `Candidate` (private constructor, read-only accessors `Header`, `Outcomes`, `OutcomeLeaves`, `ActionLeaves`, `Body`, `Next`); `BuildCandidate` (authority checks `SLOT_EPOCH_REGRESSED`, `SLOT_SEAT_SET_MISMATCH`, then the validity predicate, `ApplySlot`, canonical body, leaves, header; REAL-REPLACE M2-LED-10); `ReexecuteOn` (`REEXECUTE_GENESIS`, `PARENT_NOT_HEAD`, `REEXECUTE_HEADER_MISMATCH`, `REEXECUTE_BODY_MISMATCH`); `GenesisHead` |
+| `state/state_owner.h` | R9 | landed | `StateOwner::Create(profile, genesis, commit_journal_instance)` (genesis heads only: `OWNER_NOT_GENESIS`, `OWNER_PROFILE_MISMATCH`, `OWNER_SEAT_SET_MISMATCH`, `OWNER_STATE_ROOT_MISMATCH`), `Head`, `Preview` (stub M4-AGR-10 for a CANDIDATE parent; `PARENT_KIND_UNKNOWN`; STALE_PARENT), `Reexecute`, `Apply` (STALE_PARENT, VERIFY_FAILED `TOKEN_OTHER_LOG`/`DECISION_OTHER_HEADER`, AUTHORITY_CHANGED `AUTHORITY_SUPERSEDED`, then compare-and-swap), `Restore` (stub M4-STO-03); the Mutex guards the head pointer only |
+| `state/replay.h` | R9 | landed | `ReplayDecisions(genesis, records)` → `ReplayResult{slots, head, duplicate_decisions, duplicate_applied}`; `ReplayedSlot{header, cert_hash, decision_seq, applied_seq}`; `REPLAY_*` details; stubs for `SNAPSHOT_MARK` (M4-STO-03) and `PREPARED_QC` (M4-STO-07) |
+| `test/util/state_fixtures.h` | R9 | landed | TEST fixtures: `TestSeatSetRoot`, `TestAuthority`, `TestGenesisHead` (the R7 `SlotFixture` genesis), `RequireFailure`, `FundingFacts`, `CandidateFixture` (BuildCandidate by hand), `TestCertificate` (seat 0, unsigned aggregate, `variant`), `NewCommitJournal`, `OwnerFixture` (a `StateOwner` with its own commit journal and log; `Commit` = DECISION, B-DECISION, Confirm, Apply, APPLIED, B-APPLIED, Confirm; `after_decision` hook), `RunWalkingSkeleton` (section 14.2 slots 1-5) and `CheckWalkingSkeletonFinalState` (section 14.3) |
 | `chain/*.h`, `agreement/*.h`, `dev/*.h` | R10 | target | sections 3, 8 |
 | `read/*.h`, `verify/b3verify.h` | R11 | target | section 10.2 |
 | `admission/*.h`, `dev/dev_budget.h` | R12 | target | section 10.1 |
@@ -265,7 +271,7 @@ header marked *landed* is normative; the others are the target contract.
  state/StateOwner.Preview(ParentRef, SlotInputs)       pure, no lock while executing
    |  ValidateSlotInputs -> CanonicalOrder -> Engine::ApplySlot -> roots -> header
    v
- Candidate{header, outcomes, body, next state}
+ Candidate{header, outcomes, canonical body, next state}
    |
    v
  agreement/Agreement.Propose      (outline: dev/DevSingleSeatCertifier, k = 1)
@@ -328,7 +334,7 @@ header marked *landed* is normative; the others are the target contract.
 
 | Component | Mutex | Protects | Held for |
 |---|---|---|---|
-| `StateOwner` | `m_mutex` | head pointer | pointer copy or swap only |
+| `StateOwner` | `m_mutex` | head pointer | pointer copy, or the compare-and-swap in `Apply` (R9) |
 | `ActionPool` | `m_mutex` | pool entries, statuses, counters | map operations; never signature checks |
 | `ReadService` | archive mutex | slot-view index | lookup or insert; never I/O (REAL-REPLACE M5-RD-01 removes it from reads) |
 | each `Journal` | `m_mutex` | buffer, `seq`, `durable_seq`, fatal flag | append; `Barrier` copies the target `seq`, releases the lock, runs the commit, then re-locks to record the result |
@@ -516,6 +522,20 @@ barrier but never lets a token exist before its barrier. Folded signing
   fresh journal (no records): rebuilding the equivocation and decision
   indexes from history is recovery too and returns `NotImplemented`
   (M4-STO-01). The logs keep their indexes in memory only.
+- As landed in R9 (`state/replay.h`): the base must be a genesis head and
+  the records the whole commit journal, numbered from 1. A DECISION is
+  re-executed with the state owner's own `ReexecuteOn`, so replay and the
+  live path cannot disagree; the new head takes the record's certificate
+  hash, which is the hash the live `Apply` took from the decision token
+  (O-52). A DECISION for a replayed height with the same header is skipped
+  (also with another certificate: the first counts), another header is
+  `EQUIVOCATION_REFUSED`; an APPLIED must name a replayed slot with its
+  header hash and state root, in increasing slot order, and a repeat is
+  skipped. A decided slot without APPLIED is replayed and reported with an
+  empty `applied_seq`. `SNAPSHOT_MARK` and `PREPARED_QC` records are the
+  stubs M4-STO-03 and M4-STO-07. Installing a replayed head is
+  `StateOwner::Restore` (M4-STO-03), so the outline still makes no
+  crash-recovery claim for real files (O-55).
 
 ### 7.5 As landed in R8
 
@@ -581,7 +601,7 @@ Three checks per slot (CONS-10 requires both signing and commit to check):
 |---|---|---|
 | 1 | before `ACCEPTED_PROPOSAL` | `AUTHORITY_CHANGED`; nothing written |
 | 2 | after B-INTENT, immediately before `Sign` | `AUTHORITY_CHANGED`; the `INTENT` is durable but no signature exists; another digest for the same key stays refused |
-| 3 | `Apply`: `header.authority_epoch` against the current epoch | `AUTHORITY_CHANGED`; head unchanged; the node fences admission and sealing |
+| 3 | `Apply`: the header's `AuthorityVersion` against the current one (as landed in R9 the whole version: epoch, seat set root and profile hash, O-53) | `AUTHORITY_CHANGED`; head unchanged; the node fences admission and sealing |
 
 This narrows the sign-versus-reorg window. It is **not** a proof. [CC]
 boundary 6 requires the linearization to be proved before native signing
@@ -623,7 +643,10 @@ existing `"B3/..."` literals: none equals an fm2 tag and none uses the
   Supported kinds in the outline: `PLACE`, `CANCEL`, `TRANSFER`.
 - `SlotBody{facts, originals}` holds the **exact original action bytes** in
   proposal order. `ActionLeaf = Tagged(ACTION_LEAF, exact bytes)`, so two valid
-  signatures on one `ActionId` are distinct leaves.
+  signatures on one `ActionId` are distinct leaves. As landed in R9 a
+  candidate's body lists the originals in canonical order, so the proposal
+  order is the canonical order and `actions_root` depends only on the set of
+  originals (O-50).
 - `SlotHeaderV2`: `version, domain, profile_hash, authority_epoch, height,
   parent_hash, parent_cert_hash, anchor, facts_from, facts_to, seat_set_root,
   facts_root, actions_root, outcomes_root, state_root, action_count,
@@ -934,11 +957,11 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R8)
+### 13.1 Today (after R9)
 
 The commands in 13.2 work. They build every fm2 target (`fm2_all`): the
 libraries `fm2_types` and `fm2_core` (since R5; `engine/` since R6,
-`engine/engine` since R7, `storage/` since R8), `test_flowmesh2` (301 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
+`engine/engine` since R7, `storage/` since R8, `state/` since R9), `test_flowmesh2` (326 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
 19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
 `flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
 and `flowmesh2_negative_compile` (Clang). The outline never uses `build/`,
@@ -1278,6 +1301,13 @@ outline does not resolve on its own.
 | O-47 | Equivocation and idempotency rules beyond the slice text | One accepted proposal per `ProposalKey` (`PROPOSAL_CONFLICT`); a COMMIT intent must sign its proposal header's `CommitDigest` (`INTENT_DIGEST_MISMATCH`); a PREPARE intent is bound to its proposal by key only until M4-AGR-02 defines the prepare digest; a signed vote is idempotent for the same signature and refused for another (`SIGNED_VOTE_CONFLICT`); a decision is idempotent for the same header with any certificate (the first one is kept, certificates are not unique) and refused for another header of a decided slot (`DECISION_CONFLICT`, evidence for M4-AGR-07). "Slot mismatch" in `AppendApplied` means the log holds no decision with the token's slot, sequence and header hash (`APPLIED_DECISION_UNKNOWN`); applications must also come in increasing slot order (`APPLIED_OUT_OF_ORDER`). The logs do not verify BLS signatures (agreement and b3verify do) |
 | O-48 | Ownership of the logs | `SignerLog`, `CommitLog` and `SeatSigner` have no lock: the sealing thread owns them (section 4), and they never hold the journal's lock. Over a journal with history they return `NotImplemented(M4-STO-01)`, because their equivocation and decision indexes would have to be rebuilt first. `SeatSigner::ProofOfPossession` is a second BLS signing operation (over the public key under the PoP DST, never a vote); R10's seat sets need it |
 | O-49 | Fault injection on real files | `FileJournal::CreateNewWithCommitHook` replaces the barrier's `JournalCommit` call; production code uses `CreateNew`. The test hook closes the segment descriptor, runs the real `JournalCommit` on it (EBADF) and restores it. A hook could also fake success, so only tests and the simulator may use it; M0-AUD-01 should confirm this seam or ask for another one |
+| O-50 | Order of the originals in a certified body: the plan says "proposal order", and the slice R9 text requires that permuted originals give the same header | `BuildCandidate` writes the body with the originals in canonical order (the engine's `CanonicalOrder` over the parent header hash and the height; facts stay in cursor order). Execution never depended on the supplied order, so the header, including `actions_root`, is a function of the parent and the SET of originals, and a leader cannot make two different headers for one content. `ReexecuteOn` refuses a body that is not the canonical body (`REEXECUTE_BODY_MISMATCH`), so canonical order is a validity rule for followers and replay. PROVISIONAL: M4-AGR-11 ratifies it with the validity predicate; the owner may instead keep a free proposal order (then the permutation property holds for every root but `actions_root`) |
+| O-51 | Parent certificates are not unique: every quorum subset aggregates differently (O-4b), and the header binds `parent_cert_hash` | A follower re-executes with its own head's certificate hash, so a proposal naming another certificate of the same parent fails `Reexecute` with `REEXECUTE_HEADER_MISMATCH` (tested). With the k = 1 dev certifier there is one certificate. M4-AGR-02 must carry the parent certificate in the proposal and decide whether a follower adopts it (after verifying it) or refuses; until then exact equality stands |
+| O-52 | The new head's certificate hash: `Apply` takes only the candidate, the `DurableDecision` and the current authority, and the next header names `parent_cert_hash` | R9 part 1 extends the R8 binding: `DecisionRef` carries the hash of the certificate the DECISION record holds (the first one the commit log accepted for that header; a repeated append with another certificate returns the original reference). `Apply` takes the head's certificate hash from the token, and replay takes it from the record, so both agree. This changes a landed R8 type (one more field, no wire format: references are not encoded) |
+| O-53 | `Apply` checks beyond the slice text | The owner is bound to one commit journal instance at `Create`, and `Apply` refuses a token of another journal (`TOKEN_OTHER_LOG`): otherwise a state could be applied whose APPLIED record the commit log then refuses. Check 3 compares the whole `AuthorityVersion` (as `core/authority.h` states), not only the epoch, so a changed seat set with the same epoch is also `AUTHORITY_CHANGED`. The head is installed by a compare-and-swap of the pointer, so two concurrent `Apply` calls on one parent cannot both win (the loser gets STALE_PARENT). On every refusal the head and the candidate are unchanged |
+| O-54 | Where the slot-boundary invariants are checked, and how a conservation failure is injected | `StateOwner::Create` accepts only a genesis head and checks its profile, seat set and state root, but does not re-run `EngineState::CheckInvariants`: the engine refuses a parent with held fees and checks every invariant on every candidate (phase 9), so a broken state can never produce a candidate. The ledger's API cannot break sum conservation (every operation is atomic and conserving), so the R9 test injects a phase-9 failure through a doctored genesis instead: a reservation that no resting order holds, and fees withheld but never distributed. Both give INVARIANT and no candidate. A restored head (M4-STO-03) must be checked by `Restore` |
+| O-55 | Replay rules the slice text leaves open | `ReplayDecisions` takes a genesis base and the whole journal (records numbered from 1; a snapshot base is M4-STO-03); duplicates are recognised by header equality, so a repeated DECISION with another certificate is a duplicate and the first certificate counts (as in the commit log); an APPLIED is checked against the replayed slot and must come in increasing slot order, a repeat is skipped; a missing APPLIED is reported, not refused. Replay is pure and returns the head; it installs nothing |
+| O-56 | Shapes beyond the slice text | `Candidate` is a class with a private constructor (only `BuildCandidate` makes one) and read-only accessors, so `Apply` can only ever install a state the engine computed from the owner's head; `HeadView` is a class built by `Make` (non-null state, cached header hash); `ParentRef` has a `kind`, so the pipelining stub is explicit rather than inferred from heights. `StateOwner::Create` returns a `unique_ptr` (the owner holds a Mutex). `GenesisHead` and `ReexecuteOn` are free functions so replay can run without an owner |
 
 ---
 
