@@ -37,7 +37,9 @@
  * adds the engine's CANCEL_ALL branch (M3-ENG-09) and futures phase 7
  * (M9-FUT-04), and extends M2-LED-05 and M2-LED-06 to probe the engine
  * branches of WITHDRAW and the spot/futures transfers (engine PhaseOf) as
- * well.
+ * well. Slice R8 adds the file journal's reopen and read-back (M4-STO-01)
+ * and segment rollover (M4-STO-06; the probe also appends past the end of
+ * a one-page segment).
  */
 
 #include <boost/test/unit_test.hpp>
@@ -53,6 +55,8 @@
 #include <flowmesh2/engine/residual.h>
 #include <flowmesh2/ledger/ledger.h>
 #include <flowmesh2/ledger/state_commitment.h>
+#include <flowmesh2/storage/file_journal.h>
+#include <flowmesh2/test/util/storage_fixtures.h>
 
 #include <exception>
 #include <functional>
@@ -381,6 +385,26 @@ FM2_STUB_CASE(M9_FUT_04, "M9-FUT-04")
     engine::EngineState state{engine::EngineState::Genesis(profile, {}).value()};
     profile.futures_enabled = true;
     return Observe(engine::RunFuturesPhase(state, profile));
+}
+
+// ---- Slice R8: storage/file_journal ----
+
+FM2_STUB_CASE(M4_STO_01, "M4-STO-01")
+{
+    // Reopening a journal and reading it back from disk.
+    const TestDir dir{"stub_m4_sto_01"};
+    auto journal{storage::FileJournal::CreateNew(dir.path, storage::JournalRole::SIGNER, 1, storage::SEGMENT_PAGE_BYTES).value()};
+    return FirstDeviation("M4-STO-01", {Observe(storage::FileJournal::OpenExisting(dir.path, storage::JournalRole::SIGNER, 1)),
+                                        Observe(journal->ReadAll())});
+}
+
+FM2_STUB_CASE(M4_STO_06, "M4-STO-06")
+{
+    // Rollover itself, and an append that no longer fits in the segment.
+    const TestDir dir{"stub_m4_sto_06"};
+    auto journal{storage::FileJournal::CreateNew(dir.path, storage::JournalRole::COMMIT, 1, storage::SEGMENT_PAGE_BYTES).value()};
+    const std::vector<unsigned char> too_big(storage::SEGMENT_PAGE_BYTES);
+    return FirstDeviation("M4-STO-06", {Observe(journal->Rollover()), Observe(journal->Append(storage::RecordType::DECISION, too_big))});
 }
 
 BOOST_AUTO_TEST_SUITE_END()

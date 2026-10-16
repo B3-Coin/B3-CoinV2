@@ -97,7 +97,9 @@ if(BUILD_FLOWMESH2)
     ledger/ledger.cpp
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
+    storage/file_journal.cpp
     storage/journal.cpp
+    storage/journal_commit.cpp
     storage/memory_journal.cpp
     storage/record.cpp
   )
@@ -129,6 +131,7 @@ if(BUILD_FLOWMESH2)
     test/engine_tests.cpp
     test/facts_tests.cpp
     test/fee_math_tests.cpp
+    test/file_journal_tests.cpp
     test/hashes_tests.cpp
     test/ids_tests.cpp
     test/journal_tests.cpp
@@ -165,10 +168,14 @@ if(BUILD_FLOWMESH2)
     Boost::headers
   )
   # Tests that read tracked files (the profile JSON, the repository-wide tag
-  # scan) find the source tree through this definition.
-  target_compile_definitions(test_flowmesh2 PRIVATE FM2_SOURCE_ROOT="${PROJECT_SOURCE_DIR}")
-
+  # scan) find the source tree through FM2_SOURCE_ROOT; tests that write files
+  # (the file journal, slice R8) use FM2_TEST_TMP_DIR.
   set(FM2_TEST_TMP ${CMAKE_BINARY_DIR}/fm2-test-tmp)
+  target_compile_definitions(test_flowmesh2 PRIVATE
+    FM2_SOURCE_ROOT="${PROJECT_SOURCE_DIR}"
+    FM2_TEST_TMP_DIR="${FM2_TEST_TMP}"
+  )
+
   set(FM2_CONTRIB ${PROJECT_SOURCE_DIR}/contrib/flowmesh2)
 
   add_test(NAME flowmesh2_unit COMMAND test_flowmesh2 --log_level=test_suite)
