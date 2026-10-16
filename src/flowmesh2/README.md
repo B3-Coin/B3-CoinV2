@@ -98,7 +98,17 @@ engine state with its commitment (now including every resting order's
 leaf) and slot-boundary invariants, and `Engine::ApplySlot`, which runs
 deposits, transfers, cancels, post-only orders, one joint A2 sweep per
 market, resting, fees and a conservation check, and certifies one outcome
-per fact and action. Nothing is linked into the node, wallet or Qt.
+per fact and action; and **R8**, durable storage in `storage/`: framed,
+CRC-checked and hash-chained journal records, a memory journal with a
+fault plan, a file journal on a pre-zeroed segment with strict commits
+(`fdatasync`, or `F_FULLFSYNC` on macOS, every error sticky and fatal),
+durability tokens that only `Journal::Confirm` mints after a barrier, the
+signer log (accepted proposals, intents and signed votes with the
+equivocation rule), the seat signer whose `Sign` takes only a
+`DurableIntent`, the commit log (decisions with their bodies, and
+applications) and `agreement/outbound.h`; reopening a file journal,
+rollover, group commit, snapshots, folded signing and the PBFT view-state
+records are typed stubs. Nothing is linked into the node, wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -110,10 +120,12 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R7: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 250 cases, `flowmesh2_inventory`,
+Expected after R8: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 301 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
-`flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`).
+`flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`
+with four controls). The file journal tests write only under
+`build-rebirth/fm2-test-tmp/`.
 Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2. Open gates (workspace lock reconciliation, decision
 D3) are listed in ARCHITECTURE.md §0. All outline values are provisional and
 REGTEST-only.

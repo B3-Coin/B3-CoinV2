@@ -16,8 +16,11 @@ commitment v0 with account proofs), slice **R6** (the order book, the A2
 sweep with pairing, fees and fill caps, residual-cross detection and a
 naive reference matcher) and slice **R7** (the canonical slot order, the
 slot validity predicate, the engine state with its commitment and
-slot-boundary invariants, and `Engine::ApplySlot`). Everything else
-described here is the contract that the outline slices R8 to R14 will
+slot-boundary invariants, and `Engine::ApplySlot`) and slice **R8** (record
+framing, the journal interface, the memory and file journals, strict
+commit, durability tokens minted only by `Journal::Confirm`, the signer and
+commit logs, the seat signer and the outbound vote). Everything else
+described here is the contract that the outline slices R9 to R14 will
 build.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
@@ -141,7 +144,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `ledger/`, `core/state_root` | R5 | `NonceWindow` (over the core D7 rule), `AdmissionCodeFor`; `LedgerState` (deposit with outpoint nullifier, reserve, release, pay from reserved with fee withholding, credit to protocol accounts, transfer, nonces, open orders, `CheckConservation`), all atomic; protocol accounts `SeatPoolAccount`/`TreasuryAccount`; `AssetTotals`, `TotalsLeafV0`, `MarketLeafValue`, `NullifierLeafValue`, `StateRootsV0`; `CommitV0`, `ProveAccountV0` | `RequestWithdrawal` (M2-LED-05), `TransferToFutures`/`TransferFromFutures` (M2-LED-06), `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) | duplicate-fact rules (M2-LED-07), seat-pool account (M7-FEE-01) |
 | `engine/book`, `matcher`, `residual` | R6 | `RequiredReservation`; `OrderBook` (exact reservations, never crossed, FIFO by `arrival_rank`, `FillBestFront` at the maker price) and `BookSet`; `AllocateProRata`; `SweepA2` with pairing, ledger settlement, seller fees, per-order and per-slot fill caps and `TakerStop`; `FindResidualCross` | `ResolveResidualCross` (M3-ENG-02), `PriceBandCheck` (M3-ENG-03) | book (M3-ENG-01), pairing and remainder rule (M3-ENG-14), self-trade (M3-ENG-13), slot fill budget (M3-ENG-04) |
 | `engine/engine`, `core/state_root` (order leaf), `ledger/state_commitment` (trading state) | R7 | `OrderKey`, `CanonicalOrder`, `SlotPhase`, `PhaseOf`, `ArrivalRank`; `EngineState` (`Genesis`, `Markets`, `OrderLeaves`, `Commit`, slot-boundary `CheckInvariants`); `HeadView`; `SlotInputs`; `ValidateSlotInputs` → `ValidatedSlot` (private constructor); `Engine::Create`, `Engine::ApplySlot` phases 1-6, 8, 9 with outcomes, delta reconciliation and roots; `RestingOrderLeafV0`; `CommitTradingStateV0`, `OrderLeafOf` | `PhaseOf` branches `CANCEL_ALL` (M3-ENG-09), `WITHDRAW` (M2-LED-05), futures transfers (M2-LED-06); `RunFuturesPhase` (M9-FUT-04); residual cross as the certified refusal `REJ_RESIDUAL_CROSS_UNSUPPORTED` (M3-ENG-02) | order seed (M3-ENG-12), caps and the slot fill budget (M3-ENG-04), validity predicate (M4-AGR-11) |
-| `storage/` | R8 | record framing, `Journal`, `MemoryJournal`, `FileJournal::CreateNew`, `JournalCommit`, `JournalDirectoryCommit`, `Pending<T>`, minting of the `Durable*` tokens (type landed in R2), `SignerLog`, `SeatSigner`, `CommitLog`; `agreement/outbound.h` | `OpenExisting`/`ReadAll` (M4-STO-01), `LogWriter` (M4-STO-02), `SnapshotStore` (M4-STO-03), folded signing (M4-STO-05), `Rollover` (M4-STO-06), view-state records (M4-STO-07) | — |
+| `storage/`, `agreement/outbound.h` | R8 | `RecordType`/`JournalRole` registries, framing, `EncodeRecord`, `ScanRecords`; `Journal` (`Append`, `Barrier`, `Status`, `Confirm`, `BarrierObserver`), `MemoryJournal` with a fault plan, `FileJournal::CreateNew` (and the fault seam `CreateNewWithCommitHook`), `JournalCommit`, `JournalDirectoryCommit`, `CommitDirectory`; keys, references and `Pending<T>`; `Durable*` tokens bound to instance, sequence and reference (type landed in R2); `SignerLog` and `CommitLog` with their record codecs and equivocation and idempotency rules; `SeatSigner::Sign(const DurableIntent&)`; `OutboundVote::From(const DurableSignedVote&)` | `FileJournal::OpenExisting`/`ReadAll` and the logs over a journal with history (M4-STO-01), `LogWriter::Start` (M4-STO-02), `SnapshotStore::Write`/`Load` (M4-STO-03), `SignerLog::AppendSignedFolded` (M4-STO-05), `FileJournal::Rollover` and an append past the segment end (M4-STO-06), `AppendViewState`, `AppendNewViewAccepted`, `AppendPreparedQc` (M4-STO-07) | — |
 | `state/` | R9 | `StateOwner::Preview`, `Reexecute`, `Apply`, `Head`; `ReplayDecisions`; `CoreState::Genesis` | `Restore` (M4-STO-03), pipelined `Preview` over an uncommitted parent (M4-AGR-10) | full-state copy (M2-LED-10) |
 | `chain/`, `agreement/`, `dev/` | R10 | `ChainAdapter` interface; capped message codecs; `Agreement` and `SafetyRules` interfaces; `DevSingleSeatCertifier` (k=1, REGTEST); `FakeChainAdapter` | `PbftSafetyRules` (M4-AGR-01), `PbftAgreement` (M4-AGR-02, also `DevSingleSeatCertifier::OnMessage`), `LeaderSchedule` (M4-AGR-03), `InclusionList` (M4-AGR-04), `RestartFence` (M4-AGR-06), `EvidenceStore` (M4-AGR-07), trusted-facts b3d adapter (MB1-ADP-06), finalized b3d adapter (M7-ADP-01) | — |
 | `read/`, `verify/` | R11 | `SlotView`, `CertifiedEnvelope`, `ReadService`; `VerifyCertificate`, `VerifyOutcome`, `VerifyAccountLeaf`, `VerifyFill`, `VerifyBalanceTransition`, `VerifyExpired` | `VerifyLiabilityPath` (M5-VFY-03), `VerifyCheckpoint` (M8-CKP-01), `VerifyAnchorProof` (M7-ADP-02) | archive (M5-RD-01), v0 tree levels (M2-LED-02) |
@@ -159,10 +162,10 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `fm2_warnings` | INTERFACE: Clang/AppleClang `-Wthread-safety -Werror=thread-safety`; all compilers `-Werror=unused-result` | — |
 | `fm2_types` | `core/` | `core_interface` and, since R4, `secp256k1` (private); `bitcoin_consensus` (`hash.cpp`, `uint256.cpp`, `pubkey.cpp` with `XOnlyPubKey::VerifySchnorr`), `bitcoin_crypto` (SHA-256 and `crypto/bls`) and `bitcoin_util` (public, since R3). Never `bitcoin_common` |
 | `fm2_verify` | `verify/` | `fm2_types`, `bitcoin_crypto` (never `fm2_core`) |
-| `fm2_core` | ledger, engine, state, storage, chain, agreement, admission, read, net, bridge, futures, governance; application code lives in namespaces `flowmesh2::ledger`, `::engine`, `::state`, `::storage` (guard rule 3 matches them) | `fm2_types` (public, since R5); `flowmesh2_foundations`, `crc32c` and `bitcoin_util` join with the slices that need them |
+| `fm2_core` | ledger, engine, state, storage, chain, agreement, admission, read, net, bridge, futures, governance; application code lives in namespaces `flowmesh2::ledger`, `::engine`, `::state`, `::storage` (guard rule 3 matches them); `agreement/` uses `flowmesh2::agreement` | `fm2_types` (public, since R5); `crc32c` (private, since R8: record framing); `flowmesh2_foundations` joins with the slice that needs it (`bitcoin_util` comes through `fm2_types`) |
 | `fm2_dev` | `dev/` (compiled with `FM2_DEV_COMPONENTS`) | `fm2_core` |
 | `fm2_simlib` | `sim/` | `fm2_dev`, `fm2_core`, `fm2_verify`, `bitcoin_common` (for `CKey` only) |
-| `test_flowmesh2` | `test/` | all of the above, `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files; global fixture `ECC_Context` (`test/main.cpp`) |
+| `test_flowmesh2` | `test/` | all of the above, `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files and, since R8, `FM2_TEST_TMP_DIR` (`<build>/fm2-test-tmp`) for the file journal's temporary directories; global fixture `ECC_Context` (`test/main.cpp`) |
 | `fm2_sim_cli` | binary `fm2-sim` | `fm2_simlib` |
 | `fm2_canary_*` | sanitizer canaries | only with `FLOWMESH2_SANITIZER_CANARIES=ON` |
 | `fm2_all` | custom target: every fm2 library and executable that is built by default | — |
@@ -218,8 +221,19 @@ header marked *landed* is normative; the others are the target contract.
 | `test/util/slot_fixtures.h` | R7 | landed | TEST fixtures: synthetic TEST network and domain, label keys `fm2/test/key/<name>`, `SlotFixture` (genesis head, signed `Place`/`Cancel`/`Transfer`, deposit bytes at the next cursor, `Inputs`, `Validate`, `TryApply`, `Apply` and `Advance`, which assembles the next header as R9 will), `OutcomeOf`, `RequireRefusal` |
 | `test/util/engine_fixtures.h` | R6 | landed | TEST fixtures: `EngineOrder`, `EngineFixture` (fund, rest a maker the way phase 6 does, reserve a taker the way phase 5 does, sweep and check conservation and book invariants) |
 | `test/reference_matcher.h` | R6 | landed | TEST oracle: naive O(n²) A2 matcher over plain vectors (scans for the best price, rank order, FIFO maker and count-ahead largest remainder); shares only the id types and `Side` with the engine |
-| `storage/durable.h` | R2 | landed | `DurableKind`, move-only `Durable<K>` tokens with a private constructor whose only friend is `Journal` (R8 mints them); section 7.2 |
-| `storage/*.h` (others), `agreement/outbound.h` | R8 | target | section 7 |
+| `storage/record.h` | R8 | landed | append-only `RecordType` (1..9) and `JournalRole` (SIGNER holds 1, 2, 6, 7, 8; COMMIT holds 3, 4, 5, 9) registries, `RoleAccepts`; `JournalGenesisChain` = `Tagged(JOURNAL, u8 role ‖ u64 instance)`, `NextChain` (single SHA-256), `RecordCrc` (CRC32C); `EncodeRecord` (INVALID_INPUT unknown type, OVERSIZE above `MAX_RECORD_PAYLOAD_BYTES` = 16 MiB); `ScanRecords` (zero tail accepted; `RECORD_LENGTH`, `RECORD_CRC`, `RECORD_TYPE`, `RECORD_ROLE`, `RECORD_CHAIN`, `RECORD_TAIL`) |
+| `storage/journal.h` | R8 | landed | `Journal` base (only `MemoryJournal` and `FileJournal` can construct it): `Append` (FENCED, ORDER_VIOLATION, OVERSIZE; a refusal consumes nothing), `Barrier` (writes and commits outside the lock; any failure sticky STORAGE_FATAL, never retried; concurrent barrier ORDER_VIOLATION), `Status`, `DurableSeq`, `IsFatal`, `ReadAll`, `Confirm` (the only token minter); `BarrierObserver`; `JournalStatus` |
+| `storage/memory_journal.h` | R8 | landed | durable byte image read back with `ScanRecords`; fault plan `MemoryJournalFaults{fail_append, fail_barrier}` (1-based); `DurableImage` |
+| `storage/journal_commit.h` | R8 | landed | `JournalCommit` (fdatasync / F_FULLFSYNC without fallback / FlushFileBuffers / fsync), `JournalDirectoryCommit`, `CommitDirectory`; any error STORAGE_FATAL |
+| `storage/file_journal.h` | R8 | landed | `FileJournal::CreateNew` (empty dir, whole-page segment of 4 KiB..1 GiB, explicit zero fill, both commits), `CreateNewWithCommitHook` (fault seam, O-49); appends buffered in memory, written by `Barrier` with pwrite; stubs `OpenExisting`/`ReadAll` (M4-STO-01), `Rollover` and an append past the segment end (M4-STO-06) |
+| `storage/tokens.h` | R8 | landed | `VotePhase` (PREPARE=1, COMMIT=2, append-only), `ProposalKey`, `VoteKey` (57 bytes), `VoteSignature`, the references `ProposalRef`, `VoteRef`, `SignedVoteRef`, `DecisionRef`, `AppliedRef`, `SlotOf`, `DigestOf`; `Pending<T>` (copyable, private constructor, only the logs make it; O-44) |
+| `storage/durable.h` | R2, R8 | landed | `DurableKind`, move-only `Durable<K>` with a private constructor whose only friend is `storage::Journal`; since R8 bound to (instance, sequence, reference): `Slot`, `Digest`, `View` (vote kinds), `Binding`; a moved-from token keeps its binding (O-45) |
+| `storage/signer_log.h` | R8 | landed | `SignerLog` (`AppendAcceptedProposal`, `AppendIntent`, `AppendSignedVote`, `Barrier`, `Confirm`, `Knows`); record codecs `AcceptedProposalRecord`, `IntentRecord` (97 bytes), `SignedVoteRecord` (193 bytes); stubs `AppendSignedFolded` (M4-STO-05), `AppendViewState`, `AppendNewViewAccepted` (M4-STO-07) |
+| `storage/seat_signer.h` | R8 | landed | `SeatSigner::FromIKM`, `PublicKey`, `ProofOfPossession`, `Sign(const DurableIntent&)` (the only BLS vote signing path; FENCED, INTENT_UNKNOWN); the secret key lives only in `seat_signer.cpp` |
+| `storage/commit_log.h` | R8 | landed | `CommitLog` (`AppendDecision`, `AppendApplied`, `Barrier`, `Confirm`); `BodyMatchesHeader`; record codecs `DecisionRecord` (header ‖ CompactSize cert ‖ body), `AppliedRecord` (72 bytes); stub `AppendPreparedQc` (M4-STO-07) |
+| `storage/log_writer.h`, `storage/snapshot_store.h` | R8 | landed (stubs) | target contracts of the group-commit writer (M4-STO-02) and of snapshots (M4-STO-03) |
+| `agreement/outbound.h` | R8 | landed | `OutboundVote::From(const DurableSignedVote&)`, the only way to build a vote that may leave the process |
+| `test/util/storage_fixtures.h` | R8 | landed | TEST fixtures: `TestDir` under `FM2_TEST_TMP_DIR/storage/`, `ReadFile`/`WriteFile`, `RequireRefusal`/`RequireCode`/`RequireStub`, `RecordingObserver`, `NewMemoryJournal`, `MakeStorageSlot` (a header, body and certificate that agree), `CommitVoteKey` |
 | `state/state_owner.h`, `candidate.h`, `replay.h` | R9 | target | sections 4, 7.4 |
 | `chain/*.h`, `agreement/*.h`, `dev/*.h` | R10 | target | sections 3, 8 |
 | `read/*.h`, `verify/b3verify.h` | R11 | target | section 10.2 |
@@ -463,7 +477,11 @@ is its only friend. A token carries the journal instance and the sequence
 number; R8 adds `Journal::Confirm` (the only minter), the slot/view/digest
 binding and the moved-from semantics. The compile-fail control
 `test/compile_fail/forge_token.cpp` proves that a construction outside
-`Journal` does not compile.
+`Journal` does not compile. As landed in R8 the friend is
+`storage::Journal`, the private constructor takes (instance, sequence,
+reference), and the binding and moved-from rules are in section 7.5 and
+O-45; `test/compile_fail/sign_without_intent.cpp` proves that
+`SeatSigner::Sign` does not accept a `PendingIntent`.
 
 Equivocation: `VoteKey{domain, epoch, slot, view, phase}` maps to exactly one
 digest forever. The same digest again is idempotent; another digest returns
@@ -493,6 +511,53 @@ barrier but never lets a token exist before its barrier. Folded signing
 - **Stub:** reopening a file journal (M4-STO-01), snapshots and `Restore`
   (M4-STO-03), restart high-water statements from 2f+1 seats (M4-AGR-06).
   The outline therefore makes **no crash-recovery claim for real files**.
+- As landed in R8, a `SignerLog` or `CommitLog` is created only over a
+  fresh journal (no records): rebuilding the equivocation and decision
+  indexes from history is recovery too and returns `NotImplemented`
+  (M4-STO-01). The logs keep their indexes in memory only.
+
+### 7.5 As landed in R8
+
+- **Framing.** `len` counts the payload only; a record is 41 + `len` bytes.
+  Type 0 is never a record type, so a header `[0][0][0]` starts the zero tail
+  of a pre-zeroed segment, and `ScanRecords` accepts any image of valid
+  records followed by zeros. A splice from another instance keeps a valid
+  CRC and fails the chain (`RECORD_CHAIN`); so do a changed payload with a
+  recomputed CRC, a reordering and a gap. `MAX_RECORD_PAYLOAD_BYTES` = 16 MiB
+  (PROVISIONAL); the largest DECISION of the regtest profile is about 5.4 MB.
+- **Journal.** Appends are framed into memory under the journal lock;
+  `Barrier` takes the unwritten bytes and the target sequence under the
+  lock and writes and commits without it. A refused append consumes no
+  sequence number; only an implementation error coded STORAGE_FATAL makes
+  the journal fatal. Every barrier commits, also with nothing new. A barrier
+  issued while another runs is ORDER_VIOLATION and harmless (O-46). A
+  `BarrierObserver` sees `append`, `barrier-start` and `barrier-end` events
+  in order, without the lock.
+- **File journal.** One segment `00000000.seg`, whole 4 KiB pages, explicit
+  zero fill, then `JournalCommit` and `CommitDirectory`. Nothing reaches the
+  file before a barrier, so a crash before B-INTENT loses the intent and no
+  signature can exist for it. The segment has no header: whoever reopens it
+  must know its role and instance (M4-STO-01 decides).
+- **Tokens.** `Journal::Confirm(Pending)` refuses another journal's pending
+  record (VERIFY_FAILED, `CONFIRM_OTHER_JOURNAL`; a journal with the same
+  instance id but no such record gives `CONFIRM_UNKNOWN_SEQ`), every record
+  once the journal is fatal (FENCED, even one that was durable before) and a
+  record above `DurableSeq()` (ORDER_VIOLATION, `CONFIRM_BEFORE_BARRIER`).
+- **Signer log.** One accepted proposal per `ProposalKey`; one digest per
+  `VoteKey`; a COMMIT intent signs its proposal's `CommitDigest`; the same
+  record again is idempotent and returns the original `Pending`; another is
+  EQUIVOCATION_REFUSED. `SeatSigner::Sign` refuses a fenced journal and an
+  intent the log does not hold.
+- **Commit log.** A decision's certificate must name its header and its body
+  must match the header's `actions_root`, `facts_root` and `action_count`;
+  one header per decided slot (the first certificate is kept);
+  `AppendApplied` checks the token's log, its decision (slot, sequence,
+  header hash) and the state root, and applies slots in increasing order.
+- **Record payloads.** ACCEPTED_PROPOSAL = `ProposalKey` (24) ‖ header (366)
+  ‖ body; INTENT = `VoteKey` (57) ‖ digest ‖ u64 proposal_seq (97);
+  SIGNED_VOTE = `VoteKey` ‖ digest ‖ signature (96) ‖ u64 intent_seq (193);
+  DECISION = header ‖ CompactSize(cert) ‖ cert ‖ body; APPLIED = u64 slot ‖
+  header hash ‖ state root (72). All decoders are exact.
 
 ---
 
@@ -868,11 +933,11 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R7)
+### 13.1 Today (after R8)
 
 The commands in 13.2 work. They build every fm2 target (`fm2_all`): the
 libraries `fm2_types` and `fm2_core` (since R5; `engine/` since R6,
-`engine/engine` since R7), `test_flowmesh2` (250 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
+`engine/engine` since R7, `storage/` since R8), `test_flowmesh2` (301 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
 19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
 `flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
 and `flowmesh2_negative_compile` (Clang). The outline never uses `build/`,
@@ -984,7 +1049,8 @@ Clang only), `flowmesh2_evidence_selftest` (R2), `flowmesh2_sim` (R14),
   entry and real compiled objects for rule 3); each must fail with exactly its
   rule.
 - **Negative compile** (`check_negative_compile.py`, Clang only): a missing
-  `LOCK`, an ignored `Result` and a forged `Durable*` token each fail to compile
+  `LOCK`, an ignored `Result`, a forged `Durable*` token and (since R8)
+  `SeatSigner::Sign` called with a `PendingIntent` each fail to compile
   with the diagnostic named on the file's `FM2_EXPECT_ERROR` line; each file
   built with `FM2_COMPILE_FAIL_FIXED` (the violation removed) compiles, so the
   failure is exactly the violation; a positive control with identical flags
@@ -1205,6 +1271,12 @@ outline does not resolve on its own.
 | O-41 | Validity predicate clauses beyond the slice text | Added: a successor height; an anchor at the parent's height must be the same block; no fact above the anchor (`facts_to` ≤ (anchor height + 1, 0)); fact cursors inside the range and strictly ascending; deposits the ledger would refuse; malformed facts, originals and payloads; `MaxDelayValid`; the ascending insert of each account's nonces (implied by the parent-window clause, checked so apply cannot fail on it); BIP340 signatures, last. A decoded non-deposit fact kind (unreachable while the R4 codecs are stubs) is `SLOT_FACT_KIND`; each fact task adds its engine branch. Precedence is fixed and tested. M4-AGR-11 ratifies the list against `PROTOCOL.md` |
 | O-42 | Engine semantics the plan leaves open | Nonces are consumed before phase 1, in canonical order, because phases reorder an account's actions (a nonce-7 TRANSFER runs before a nonce-6 PLACE) and out-of-order inserts could evict a nonce that is still to come. A cancel cannot reach an order of its own slot (the PLACE runs later): `REJ_UNKNOWN_ORDER`. `REJ_ORDER_CLOSED` is not produced (no closed-order index). A GTC taker takes its open-order slot when reserved, so it can be refused at the cap even if it would fill completely. User-controlled overflow (price × lots) is `REJ_BAD_PARAMS`, never an error. Outcome order: deposits, actions by canonical rank, fee outcomes by ascending quote `AssetId`, only for non-zero fee totals; a fee outcome's account is zero. PROVISIONAL |
 | O-43 | Housekeeping found in R7 | `core/slot.h` and `core/state_root.h` both defined `COMMITMENT_VERSION_V0`, so no translation unit could include both; it is now defined once, in `core/slot.h` (failing compile probe in the R7 evidence). The slice text names "outcome codes as listed in layout §D"; no such section exists in any tracked or scratch document, so the R1 `OutcomeCode` registry is used unchanged |
+| O-44 | `Pending` tokens: the R8 slice text gives `Pending<Kind>{seq, key}` | A plain struct would let anyone build a `Pending` for a key that was never written, and `Confirm` would then mint a token for it. R8 makes `Pending` copyable but unforgeable (private constructor; `SignerLog` and `CommitLog`, which build it from the record they just appended, are its only friends) and adds the journal instance, so `Confirm` refuses another journal's record. `Journal` itself can be constructed only by `MemoryJournal` and `FileJournal`, so the durable sequence a token is minted against is always the base class's own bookkeeping |
+| O-45 | Token binding and moved-from tokens (R2 left both to R8) | A token carries the journal instance, the sequence number and the record's reference: (slot, view, digest) for votes, plus the signature of a signed vote; (slot, header hash) for a decision; (slot, header hash, state root) for an application. Commit-log tokens have no view. A move copies the binding and the source keeps it: a token proves a durable fact, it is not a single-use capability; safety comes from the one-digest-per-`VoteKey` rule and deterministic BLS signatures. The forged-token control now calls the three-argument private constructor and expects the same diagnostic |
+| O-46 | Journal semantics the slice text leaves open | A second `Barrier` while one runs is ORDER_VIOLATION, not a storage failure (one sealing thread issues barriers, section 4). Only an implementation error coded STORAGE_FATAL makes a journal fatal; a refused append (role, size, a full segment) consumes nothing. `Confirm` is refused after a fatal error even for a record that was durable before (the slice text taken literally). The file journal writes nothing before a barrier, uses a fixed first segment `00000000.seg` without a header (reopening needs the role and instance, M4-STO-01), and refuses an append that does not fit with `NotImplemented(M4-STO-06)` without fencing. `F_FULLFSYNC` is required on macOS: a file system without it makes every barrier fatal (DUR-8, no fallback). Windows branches are written but not compiled here (O-24 pattern); `JournalDirectoryCommit` is a no-op there, as Bitcoin's `DirectoryCommit` |
+| O-47 | Equivocation and idempotency rules beyond the slice text | One accepted proposal per `ProposalKey` (`PROPOSAL_CONFLICT`); a COMMIT intent must sign its proposal header's `CommitDigest` (`INTENT_DIGEST_MISMATCH`); a PREPARE intent is bound to its proposal by key only until M4-AGR-02 defines the prepare digest; a signed vote is idempotent for the same signature and refused for another (`SIGNED_VOTE_CONFLICT`); a decision is idempotent for the same header with any certificate (the first one is kept, certificates are not unique) and refused for another header of a decided slot (`DECISION_CONFLICT`, evidence for M4-AGR-07). "Slot mismatch" in `AppendApplied` means the log holds no decision with the token's slot, sequence and header hash (`APPLIED_DECISION_UNKNOWN`); applications must also come in increasing slot order (`APPLIED_OUT_OF_ORDER`). The logs do not verify BLS signatures (agreement and b3verify do) |
+| O-48 | Ownership of the logs | `SignerLog`, `CommitLog` and `SeatSigner` have no lock: the sealing thread owns them (section 4), and they never hold the journal's lock. Over a journal with history they return `NotImplemented(M4-STO-01)`, because their equivocation and decision indexes would have to be rebuilt first. `SeatSigner::ProofOfPossession` is a second BLS signing operation (over the public key under the PoP DST, never a vote); R10's seat sets need it |
+| O-49 | Fault injection on real files | `FileJournal::CreateNewWithCommitHook` replaces the barrier's `JournalCommit` call; production code uses `CreateNew`. The test hook closes the segment descriptor, runs the real `JournalCommit` on it (EBADF) and restores it. A hook could also fake success, so only tests and the simulator may use it; M0-AUD-01 should confirm this seam or ask for another one |
 
 ---
 
