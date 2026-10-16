@@ -34,9 +34,10 @@
  * v1 (M2-LED-02), the liability sum root (M2-LED-03) and exit_value
  * (M2-LED-04). Slice R6 adds the residual-cross call (M3-ENG-02) and
  * extends M3-ENG-03 to probe the engine's PriceBandCheck as well. Slice R7
- * adds the engine's CANCEL_ALL branch (M3-ENG-09) and extends M2-LED-05 and
- * M2-LED-06 to probe the engine branches of WITHDRAW and the spot/futures
- * transfers (engine PhaseOf) as well.
+ * adds the engine's CANCEL_ALL branch (M3-ENG-09) and futures phase 7
+ * (M9-FUT-04), and extends M2-LED-05 and M2-LED-06 to probe the engine
+ * branches of WITHDRAW and the spot/futures transfers (engine PhaseOf) as
+ * well.
  */
 
 #include <boost/test/unit_test.hpp>
@@ -370,6 +371,16 @@ FM2_STUB_CASE(M3_ENG_02, "M3-ENG-02")
 FM2_STUB_CASE(M3_ENG_09, "M3-ENG-09")
 {
     return Observe(engine::PhaseOf(ActionOfKind(ActionKind::CANCEL_ALL)));
+}
+
+FM2_STUB_CASE(M9_FUT_04, "M9-FUT-04")
+{
+    // Phase 7 with futures enabled. Validate() refuses that profile first
+    // (M9-FUT-01), so the engine itself never gets here in the outline.
+    ProfileParams profile{RegtestProfile()};
+    engine::EngineState state{engine::EngineState::Genesis(profile, {}).value()};
+    profile.futures_enabled = true;
+    return Observe(engine::RunFuturesPhase(state, profile));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

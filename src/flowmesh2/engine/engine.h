@@ -11,6 +11,7 @@
 #include <flowmesh2/core/facts.h>
 #include <flowmesh2/core/ids.h>
 #include <flowmesh2/core/market.h>
+#include <flowmesh2/core/outcome.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/core/slot.h>
@@ -23,6 +24,7 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -31,8 +33,10 @@
  *
  * Contents: the canonical order of a slot's originals, the phase each
  * action kind executes in, the trading state the engine transforms
- * (EngineState) and its parent head (HeadView), and the slot validity
- * predicate (ValidateSlotInputs), whose only product is a ValidatedSlot.
+ * (EngineState) and its parent head (HeadView), the slot validity
+ * predicate (ValidateSlotInputs), whose only product is a ValidatedSlot,
+ * and Engine::ApplySlot, which executes a ValidatedSlot in nine phases and
+ * returns the candidate state, the certified outcomes and the roots.
  *
  * Canonical order (O-4, O-4b). The originals of a slot at height h whose
  * parent header hash is p are first sorted by
@@ -342,6 +346,118 @@ private:
     std::vector<uint256> m_fact_ids;
     std::vector<SlotAction> m_actions;
     std::vector<size_t> m_order;
+};
+
+// ---- Executing a slot -------------------------------------------------------------
+
+/** What one slot produced: the candidate state and its certified outcomes. */
+struct SlotResult {
+    EngineState state;               //!< the state after the slot
+    std::vector<OutcomeV2> outcomes; //!< emission order (Engine::ApplySlot)
+    uint256 outcomes_root;           //!< MerkleRoot of the outcomes' LeafHash in emission order
+    StateRootsV0 roots;              //!< state.Commit(); roots.Root() is the header's state_root
+};
+
+/** Phase 7, the futures sweep (plan section 3.11): Ok() with no change
+ * unless profile.futures_enabled, else NotImplemented(M9-FUT-04).
+ * Validate() refuses futures_enabled (M9-FUT-01), so Engine::ApplySlot
+ * never reaches the stub in the outline.
+ */
+Result<void> RunFuturesPhase(EngineState& state, const ProfileParams& profile);
+
+/** The slot engine of one profile. PROVISIONAL REGTEST (D4, D5, D6, D7).
+ *
+ * ApplySlot(parent, slot) copies the parent state and executes the
+ * validated slot on the copy. Every action consumes its nonce first, in
+ * canonical order, whatever its outcome (DUR-5); then the phases run in
+ * order, each over its actions in canonical rank:
+ * 1. DEPOSITS: each deposit is credited (one DEPOSIT_CREDITED outcome per
+ *    fact, source FACT, subject its FactId).
+ * 2. ACCOUNT: TRANSFER (O-7): TRANSFERRED, or REJ_BAD_PARAMS (self or
+ *    zero), REJ_NO_RECIPIENT, REJ_INSUFFICIENT_AVAILABLE.
+ * 3. CANCELS by OrderId: CANCELLED (the order leaves its book, its
+ *    reservation is released, its owner's open-order count drops), or
+ *    REJ_UNKNOWN_ORDER (not resting: never placed, already closed, or
+ *    placed in this slot, whose PLACE runs later) or REJ_NOT_OWN_ORDER.
+ *    REJ_ORDER_CLOSED needs an index of closed orders; the outline does
+ *    not keep one and answers REJ_UNKNOWN_ORDER.
+ * 4. POST_ONLY: RESTING at its own price with
+ *    ArrivalRank(height, POST_ONLY, rank), or REJ_WOULD_CROSS if it would
+ *    execute against the book as it stands after the earlier post-only
+ *    orders of the slot.
+ * 5. TAKERS (GTC and IOC PLACEs): every taker is reserved in canonical
+ *    order at its limit (a BUY in quote, a SELL in base), so same-slot
+ *    proceeds can never fund a same-slot reservation and two markets that
+ *    share a quote asset compete for one balance (TRD-10); a GTC taker also
+ *    takes an open-order slot now, because it may rest. Then one SweepA2
+ *    per market, in ascending MarketId, all sharing one SlotFillBudget of
+ *    max_fills_per_slot (O-36).
+ * 6. REST, per taker in canonical order: FILLED (no lots left); else
+ *    REJ_FILL_CAP if a fill cap stopped it while the book still crosses
+ *    (ORDER_FILL_CAP or SLOT_FILL_CAP; M3-ENG-04 rules SLOT_FULL); else
+ *    IOC_DONE for an IOC; else REJ_RESIDUAL_CROSS_UNSUPPORTED for a GTC
+ *    remainder that crosses a same-slot opposite GTC remainder
+ *    (FindResidualCross; M3-ENG-02); else the remainder rests at its limit
+ *    with ArrivalRank(height, REST, rank): RESTING without fills,
+ *    PARTIAL_RESTING with. Whatever does not rest is released (price
+ *    improvement, IOC and refused remainders), and a GTC taker that does
+ *    not rest gives its open-order slot back. REJ_FILL_CAP and
+ *    REJ_RESIDUAL_CROSS_UNSUPPORTED refuse the REMAINDER only: their
+ *    outcome still lists the fills made before (O-40).
+ * 7. FUTURES: RunFuturesPhase.
+ * 8. FEES: for each quote asset whose fills withheld fees, ascending
+ *    AssetId: SplitSlotFees(total, seat_share_percent) is credited to the
+ *    seat pool and the treasury, one FEES_DISTRIBUTED outcome (source SLOT,
+ *    subject the AssetId); afterwards no fee is held (O-31).
+ * 9. CONSERVATION: EngineState::CheckInvariants; every outcome within the
+ *    profile's fill and delta caps; the outcomes' deltas, summed, equal
+ *    the balance change from the parent for every (account, asset); then
+ *    the roots. Any failure is INVARIANT and there is no candidate.
+ *
+ * PLACE rejections, in this order and all with no change besides the
+ * nonce: REJ_UNKNOWN_MARKET; REJ_BAD_PARAMS (price or lots 0, or a
+ * reservation above MAX_ATOMS); REJ_WOULD_CROSS (post-only only);
+ * REJ_OPEN_ORDER_CAP (GTC and post-only: max_open_orders_per_account
+ * already reached); REJ_INSUFFICIENT_AVAILABLE. REJ_BOOK_FULL,
+ * REJ_PRICE_BAND and REJ_UNKNOWN_ASSET are not produced by the outline
+ * (M3-ENG-01, M3-ENG-03).
+ *
+ * Outcomes (core/outcome.h), in emission order: one per deposit in body
+ * order; one per action in canonical rank order (subject its ActionId,
+ * account its signer, its nonce); one FEES_DISTRIBUTED per quote asset.
+ * deltas list every balance the outcome changed, aggregated per (account,
+ * asset) and sorted, with no all-zero entry; a taker's outcome carries its
+ * reservation, both legs of each of its fills (its own and its makers'
+ * balances; the seller receives quote - fee) and its release. fills are the
+ * fills the action made as taker, in execution order. remaining_lots is
+ * what rests (PLACE), else 0. A deterministic rejection has no fills and
+ * no deltas.
+ *
+ * Errors (no candidate): STALE_PARENT if the slot was validated against
+ * another head; INVALID_INPUT if the slot or the parent belongs to another
+ * profile; INVARIANT if the parent holds undistributed fees or phase 9
+ * fails; and any error of the ledger or the books, which the validity
+ * predicate excludes unless an invariant broke elsewhere (O-34 lists the
+ * ledger refusals a chain fact could still trigger).
+ *
+ * Pure: no lock, clock, I/O or randomness; the result depends only on the
+ * parent and the slot, not on the order of the originals in the body.
+ */
+class Engine
+{
+public:
+    //! INVALID_INPUT unless the matching profile is A2_PRORATA; Validate(profile)'s errors first.
+    static Result<Engine> Create(const ProfileParams& profile);
+
+    const ProfileParams& Profile() const { return m_profile; }
+
+    //! Executes `slot` on a copy of parent.State(); see the class comment.
+    Result<SlotResult> ApplySlot(const HeadView& parent, const ValidatedSlot& slot) const;
+
+private:
+    explicit Engine(ProfileParams profile) : m_profile{std::move(profile)} {}
+
+    ProfileParams m_profile;
 };
 
 } // namespace flowmesh2::engine

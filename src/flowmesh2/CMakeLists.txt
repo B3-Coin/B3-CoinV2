@@ -119,6 +119,8 @@ if(BUILD_FLOWMESH2)
     test/codes_tests.cpp
     test/commitment_tests.cpp
     test/durable_tests.cpp
+    test/engine_property_tests.cpp
+    test/engine_tests.cpp
     test/facts_tests.cpp
     test/fee_math_tests.cpp
     test/hashes_tests.cpp

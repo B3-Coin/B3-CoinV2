@@ -11,16 +11,19 @@
 #include <flowmesh2/core/facts.h>
 #include <flowmesh2/core/ids.h>
 #include <flowmesh2/core/market.h>
+#include <flowmesh2/core/outcome.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/engine/engine.h>
+#include <flowmesh2/ledger/ledger.h>
 #include <flowmesh2/test/util/keys.h>
 #include <flowmesh2/test/util/ledger_fixtures.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -173,7 +176,80 @@ struct SlotFixture {
     {
         return engine::ValidateSlotInputs(Head(), inputs, profile);
     }
+
+    //! Validate and execute `inputs` on the head without advancing it.
+    Result<engine::SlotResult> TryApply(const engine::SlotInputs& inputs) const
+    {
+        const Result<engine::ValidatedSlot> slot{Validate(inputs)};
+        if (!slot.has_value()) return slot.error();
+        const Result<engine::Engine> engine{engine::Engine::Create(profile)};
+        if (!engine.has_value()) return engine.error();
+        return engine->ApplySlot(Head(), *slot);
+    }
+
+    //! Validate, execute and require success, then advance the head.
+    engine::SlotResult Apply(const engine::SlotInputs& inputs)
+    {
+        Result<engine::SlotResult> result{TryApply(inputs)};
+        RequireOk(result, "validate and apply the slot");
+        Advance(inputs, *result);
+        return std::move(result).value();
+    }
+
+    /** The next head: a header assembled as the state owner (R9) will
+     * (parent link, inputs, roots, counts; epoch and seat set unchanged; no
+     * parent certificate before R10) and the result's state.
+     */
+    void Advance(const engine::SlotInputs& inputs, const engine::SlotResult& result)
+    {
+        SlotHeaderV2 next;
+        next.domain = header.domain;
+        next.profile_hash = header.profile_hash;
+        next.authority_epoch = header.authority_epoch;
+        next.height = header.height + 1;
+        next.parent_hash = header.Hash();
+        next.parent_cert_hash = uint256{};
+        next.anchor = inputs.anchor;
+        next.facts_from = inputs.facts_from;
+        next.facts_to = inputs.facts_to;
+        next.seat_set_root = header.seat_set_root;
+        next.facts_root = inputs.body.FactsRoot();
+        next.actions_root = inputs.body.ActionsRoot();
+        next.outcomes_root = result.outcomes_root;
+        next.state_root = result.roots.Root();
+        next.action_count = static_cast<uint32_t>(inputs.body.originals.size());
+        next.outcome_count = static_cast<uint32_t>(result.outcomes.size());
+        header = next;
+        state = result.state;
+    }
+
+    // ---- Reads ------------------------------------------------------------------
+
+    ledger::Balance BalanceOf(std::string_view name, const AssetId& asset) const
+    {
+        return state.ledger.BalanceOf(KeyAccount(name), asset);
+    }
+    std::vector<uint64_t> UsedNonces(std::string_view name) const
+    {
+        const ledger::AccountState* account{state.ledger.Find(KeyAccount(name))};
+        BOOST_REQUIRE(account != nullptr);
+        return {account->nonces.Used().begin(), account->nonces.Used().end()};
+    }
 };
+
+//! The outcome whose subject is `subject` (an ActionId, FactId or AssetId); fails if absent or repeated.
+inline const OutcomeV2& OutcomeOf(const engine::SlotResult& result, const uint256& subject)
+{
+    const OutcomeV2* found{nullptr};
+    for (const OutcomeV2& outcome : result.outcomes) {
+        if (outcome.subject == subject) {
+            BOOST_REQUIRE_MESSAGE(found == nullptr, "two outcomes with one subject");
+            found = &outcome;
+        }
+    }
+    BOOST_REQUIRE_MESSAGE(found != nullptr, "no outcome for the subject");
+    return *found;
+}
 
 //! Requires an INVALID_INPUT refusal whose detail is `detail`.
 template <class T>
