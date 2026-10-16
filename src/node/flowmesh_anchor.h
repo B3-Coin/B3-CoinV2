@@ -47,6 +47,8 @@ public:
 
     bool Acceptable(const flowmesh::AnchorRef& anchor) const override;
     bool StillCanonical(const flowmesh::AnchorRef& anchor) const override;
+    bool ProvesImmutableAncestry(const flowmesh::AnchorRef& ancestor,
+                                const flowmesh::AnchorRef& descendant) const override;
     flowmesh::AnchorRef Current() const override;
 
 private:

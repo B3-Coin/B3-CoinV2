@@ -147,6 +147,20 @@ public:
     //! treated is an OWNER DECISION; halting is the fail-safe floor.
     //! A null anchor references no B3 state and trivially passes.
     virtual bool StillCanonical(const AnchorRef& anchor) const = 0;
+    /** Optional proof-only optimization. True means these exact non-null
+     * hash/height positions have immutable index ancestry: ancestor is an
+     * ancestor of (or identical to) descendant. This relation must remain
+     * true after a reorg. For each true pair, this provider's StillCanonical
+     * must be ancestor-closed in one underlying canonical view: canonical
+     * descendant implies canonical ancestor. It does not assert current
+     * canonicality, burial,
+     * reconciliation generation or authority to sign, commit or spend.
+     * Providers without that proof must return false; callers fall back to
+     * their original checks, never reject an otherwise-valid history. */
+    virtual bool ProvesImmutableAncestry(const AnchorRef&, const AnchorRef&) const
+    {
+        return false;
+    }
     //! The anchor a proposer should use now.
     virtual AnchorRef Current() const = 0;
 };

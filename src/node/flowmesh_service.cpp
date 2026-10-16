@@ -694,6 +694,12 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         return anchors.Current();
     }
 
+    bool ProvesImmutableAncestry(const flowmesh::AnchorRef& ancestor,
+                                const flowmesh::AnchorRef& descendant) const override
+    {
+        return anchors.ProvesImmutableAncestry(ancestor, descendant);
+    }
+
     void RememberSeatSet(const flowmesh::ActiveFnBlsSeatSet& seats) const
     {
         std::lock_guard<std::mutex> lock{mutex};

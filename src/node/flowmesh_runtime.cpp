@@ -411,6 +411,14 @@ struct FlowMeshRuntime::Market {
     FlowMeshLagTracker lag;
     std::optional<flowmesh::AnchorRef> previous_anchor;
     std::map<std::pair<int32_t, uint256>, uint64_t> committed_anchors;
+    // Derived, nonpersisted optimization only. The authoritative map stays
+    // complete. A missing/failed proof permanently disables this lifecycle's
+    // fast path; replay stages it privately until WHOLE initialization passes.
+    enum class AnchorFrontierState { EMPTY, COMPLETE, DISABLED };
+    AnchorFrontierState committed_anchor_frontier_state{AnchorFrontierState::EMPTY};
+    std::optional<flowmesh::AnchorRef> committed_anchor_frontier;
+    size_t committed_anchor_frontier_count{0};
+    bool committed_anchor_frontier_ready{false};
     std::map<uint256, Candidate> candidates;
     // Decoded/authenticated durable evidence is not permission to sign. The
     // service installs markets while its live chain gate is still closed.
@@ -944,6 +952,43 @@ std::optional<std::span<const unsigned char>> CertifiedEntryBytes(
 }
 
 template <typename Market>
+void RecordCommittedAnchor(Market& market, const flowmesh::AnchorRef& anchor,
+                           const uint64_t sequence)
+{
+    const auto key{std::pair{anchor.height, anchor.hash}};
+    const auto existing{market.committed_anchors.find(key)};
+    if (existing != market.committed_anchors.end()) {
+        existing->second = sequence; // Original map overwrite; no new dependency.
+        return; // An exact duplicate cannot extend or re-enable a frontier.
+    }
+    using State = decltype(market.committed_anchor_frontier_state);
+    const auto previous_state{market.committed_anchor_frontier_state};
+    const auto previous{market.committed_anchor_frontier};
+    const size_t previous_count{market.committed_anchor_frontier_count};
+    // Invalidate BEFORE any new map allocation or best-effort proof work. A
+    // proof exception after a successful durable append is NOT store failure.
+    market.committed_anchor_frontier_state = State::DISABLED;
+    market.committed_anchor_frontier.reset();
+    market.committed_anchors[key] = sequence; // Keep every original map entry.
+    if (previous_state == State::DISABLED || anchor.height < 0 || anchor.hash.IsNull()) return;
+    bool covered{previous_state == State::EMPTY && !previous && previous_count == 0 &&
+                 market.committed_anchors.size() == 1};
+    if (previous_state == State::COMPLETE && previous &&
+        previous_count == market.committed_anchors.size() - 1) {
+        try {
+            covered = market.chain->ProvesImmutableAncestry(*previous, anchor);
+        } catch (...) {
+            // Capability is optional: retain unchanged full-scan semantics.
+        }
+    }
+    if (covered) {
+        market.committed_anchor_frontier = anchor;
+        market.committed_anchor_frontier_count = market.committed_anchors.size();
+        market.committed_anchor_frontier_state = State::COMPLETE;
+    }
+}
+
+template <typename Market>
 bool RecheckAnchors(Market& market)
 {
     if (market.halt != FlowMeshRuntimeHalt::NONE || !market.ready) return false;
@@ -952,6 +997,24 @@ bool RecheckAnchors(Market& market)
         HaltMarket(market, FlowMeshRuntimeHalt::ANCHOR_INVALIDATED,
                    "active FlowMesh seat anchor is no longer canonical");
         return false;
+    }
+    using State = decltype(market.committed_anchor_frontier_state);
+    if (market.committed_anchor_frontier_ready &&
+        market.committed_anchor_frontier_state == State::COMPLETE) {
+        if (market.committed_anchor_frontier &&
+            market.committed_anchor_frontier_count == market.committed_anchors.size()) {
+            // A fresh canonical descendant implies every ancestry-proven
+            // committed predecessor is canonical. This is not a future lease.
+            if (!market.chain->StillCanonical(*market.committed_anchor_frontier)) {
+                HaltMarket(market, FlowMeshRuntimeHalt::ANCHOR_INVALIDATED,
+                           "a committed FlowMesh anchor is no longer canonical");
+                return false;
+            }
+            return true;
+        }
+        // Any local coverage inconsistency costs only the optimization.
+        market.committed_anchor_frontier_state = State::DISABLED;
+        market.committed_anchor_frontier.reset();
     }
     for (const auto& [key, sequence] : market.committed_anchors) {
         (void)sequence;
@@ -1782,9 +1845,7 @@ bool CommitCertified(Market& market,
     market.pool.ClearDuplicateForwards(); // never rewrite a queued retry to the new head
     market.next_effect_index += certified.entry.effect_count;
     market.previous_anchor = certified.entry.anchor;
-    market.committed_anchors[{certified.entry.anchor.height,
-                              certified.entry.anchor.hash}] =
-        certified.entry.sequence;
+    RecordCommittedAnchor(market, certified.entry.anchor, certified.entry.sequence);
     market.pool.DropCertified(certified.entry.actions);
     if (!market.public_submissions.empty()) {
         for (const auto& action : certified.entry.actions) market.PublicActionDropped(action.Id());
@@ -2709,8 +2770,7 @@ bool FlowMeshRuntime::InitializeMarket(
         expected_effect_start += stored->entry.effect_count;
         previous_hash = stored->entry.GetHash();
         market->previous_anchor = stored->entry.anchor;
-        market->committed_anchors[{stored->entry.anchor.height,
-                                   stored->entry.anchor.hash}] = sequence;
+        RecordCommittedAnchor(*market, stored->entry.anchor, sequence);
         for (const auto& action : stored->entry.actions) {
             if (restored_client_actions.size() == flowmesh::CLIENT_EVENT_CAPACITY) restored_client_actions.pop_front();
             restored_client_actions.push_back(MakeClientActionEvent(*market,
@@ -2814,6 +2874,9 @@ bool FlowMeshRuntime::InitializeMarket(
     }
     RoundEntered(*market, "market_initialized");
     market->read_observer_only = LocalSeatKeys(*market).empty();
+    // No ReadEntry shortcut to replay validation: keep every original startup
+    // full scan, retained-candidate and agreement check before enabling this.
+    market->committed_anchor_frontier_ready = true;
     if (startup_events) {
         *startup_events = std::move(restored_client_actions);
     } else {

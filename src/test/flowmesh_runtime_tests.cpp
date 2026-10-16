@@ -33,6 +33,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -7322,6 +7323,327 @@ public:
     std::vector<node::FlowMeshRuntimeRelay> gets;
     std::unique_ptr<node::FlowMeshRuntime> runtime;
 };
+
+// Separate opt-in oracle: unlike RuntimeChain's independent canonical hashes,
+// these exact positions form ONE fixed immutable synthetic parent chain.
+class ImmutableLineageRuntimeChain final : public node::FlowMeshRuntimeChain
+{
+public:
+    ImmutableLineageRuntimeChain(const uint256& domain,
+                                const flowmesh::ActiveFnBlsSeatSet& seats,
+                                std::vector<flowmesh::AnchorRef> lineage)
+        : m_domain{domain}, m_seats{seats}, m_lineage{std::move(lineage)}
+    {
+        BOOST_REQUIRE(!m_lineage.empty());
+        for (size_t i{0}; i < m_lineage.size(); ++i) {
+            BOOST_REQUIRE(!m_lineage[i].hash.IsNull());
+            BOOST_REQUIRE_EQUAL(m_lineage[i].height, 100 + static_cast<int32_t>(i));
+        }
+    }
+    int32_t TipHeight() const override
+    {
+        return m_lineage.back().height + flowmesh::FLOWMESH_PRODUCTION_MIN_ANCHOR_DEPTH;
+    }
+    flowmesh::AnchorRef Current() const override { return m_lineage.back(); }
+    bool Acceptable(const flowmesh::AnchorRef& anchor) const override
+    {
+        return StillCanonical(anchor) && TipHeight() - anchor.height >=
+            flowmesh::FLOWMESH_PRODUCTION_MIN_ANCHOR_DEPTH;
+    }
+    bool StillCanonical(const flowmesh::AnchorRef& anchor) const override
+    {
+        std::lock_guard lock{m_mutex};
+        ++m_reads[anchor.height];
+        return anchor.IsNull() || (Position(anchor).has_value() && anchor.height < m_orphan_from);
+    }
+    bool ProvesImmutableAncestry(const flowmesh::AnchorRef& ancestor,
+                                const flowmesh::AnchorRef& descendant) const override
+    {
+        std::lock_guard lock{m_mutex};
+        ++m_proofs;
+        if (m_failure_at && descendant.height == *m_failure_at) {
+            if (m_throw) throw std::runtime_error("test-only unavailable ancestry proof");
+            return false;
+        }
+        const auto before{Position(ancestor)}, after{Position(descendant)};
+        return before && after && *before <= *after;
+    }
+    std::optional<flowmesh::ActiveFnBlsSeatSet> SeatSet(
+        const uint256& domain, const flowmesh::MarketId& market,
+        const uint64_t epoch, const uint256& hash) const override
+    {
+        if (domain != m_domain || market != m_seats.market_id ||
+            epoch != m_seats.epoch || hash != m_seats.set_hash) return std::nullopt;
+        return m_seats;
+    }
+    std::optional<flowmesh::ActiveFnBlsSeatSet> SeatSetForSequence(
+        const uint256& domain, const flowmesh::MarketId& market, uint64_t) const override
+    {
+        return domain == m_domain && market == m_seats.market_id
+            ? std::optional<flowmesh::ActiveFnBlsSeatSet>{m_seats} : std::nullopt;
+    }
+    void FailProofAt(std::optional<int32_t> height, const bool throwing = false)
+    {
+        std::lock_guard lock{m_mutex}; m_failure_at = height; m_throw = throwing;
+    }
+    void OrphanFrom(const int32_t height)
+    {
+        std::lock_guard lock{m_mutex}; m_orphan_from = height;
+    }
+    void ClearObservations()
+    {
+        std::lock_guard lock{m_mutex}; m_reads.clear(); m_proofs = 0;
+    }
+    size_t Reads(const int32_t height) const
+    {
+        std::lock_guard lock{m_mutex};
+        const auto it{m_reads.find(height)}; return it == m_reads.end() ? 0 : it->second;
+    }
+    size_t Proofs() const { std::lock_guard lock{m_mutex}; return m_proofs; }
+private:
+    std::optional<size_t> Position(const flowmesh::AnchorRef& anchor) const
+    {
+        if (anchor.height < 100) return std::nullopt;
+        const size_t pos{static_cast<size_t>(anchor.height - 100)};
+        return pos < m_lineage.size() && m_lineage[pos] == anchor
+            ? std::optional<size_t>{pos} : std::nullopt;
+    }
+    const uint256 m_domain;
+    const flowmesh::ActiveFnBlsSeatSet m_seats;
+    const std::vector<flowmesh::AnchorRef> m_lineage;
+    mutable std::mutex m_mutex;
+    mutable std::map<int32_t, size_t> m_reads;
+    mutable size_t m_proofs{0};
+    int32_t m_orphan_from{std::numeric_limits<int32_t>::max()};
+    std::optional<int32_t> m_failure_at;
+    bool m_throw{false};
+};
+
+class AnchorFrontierRuntimeFixture
+{
+public:
+    explicit AnchorFrontierRuntimeFixture(const fs::path& path)
+        : chain{domain, seats.seats, lineage},
+          store{DBParams{.path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}}
+    {
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(store.OpenForMarket(domain, market, seats.seats, initial.Root(), error), error);
+        MakeRuntime(initial, std::nullopt);
+        flowmesh::ProductionEpochGate gate{domain, market, seats.seats};
+        std::optional<flowmesh::FlowMeshState> state{initial};
+        std::optional<flowmesh::AnchorRef> previous;
+        uint256 parent;
+        uint64_t effect_start{0};
+        // Four distinct anchors, then an exact-anchor duplicate in a new entry.
+        for (uint64_t sequence{0}; sequence < 5; ++sequence) {
+            const auto& anchor{lineage[std::min<size_t>(sequence, lineage.size() - 1)]};
+            flowmesh::ProductionEntryCheck check;
+            const auto built{flowmesh::BuildProductionExecutionEntry(*state, domain, market,
+                seats.seats, gate, sequence, effect_start, parent, anchor,
+                {chain.TipHeight(), previous, &chain}, treasury, {}, nullptr, check)};
+            BOOST_REQUIRE_MESSAGE(built, flowmesh::ProductionEntryCheckName(check));
+            entries.push_back(built->entry);
+            const auto payload{flowmesh::EncodeProductionCertifiedPayload(
+                {built->entry, Certify(built->entry, seats)}, seats.seats.Size())};
+            BOOST_REQUIRE(payload); payloads.push_back(*payload);
+            state = built->next_state;
+            parent = built->entry.GetHash(); previous = anchor;
+            effect_start += built->entry.effect_count;
+        }
+    }
+    ~AnchorFrontierRuntimeFixture() { if (runtime) runtime->Stop(); }
+    void Start()
+    {
+        std::string error; BOOST_REQUIRE_MESSAGE(runtime->Start(error), error);
+    }
+    void Tick()
+    {
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+        runtime->NotifyTick();
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+    }
+    void Send(flowmesh::WireMessage message)
+    {
+        BOOST_REQUIRE(runtime->EnqueueWireMessage(8, std::move(message)) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+    }
+    void Certificate(const uint64_t sequence)
+    {
+        Send({flowmesh::WireMessageKind::CERTIFICATE,
+              {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, sequence}, payloads.at(sequence)});
+        BOOST_REQUIRE_EQUAL(runtime->MarketStatus(market)->next_sequence, sequence + 1);
+        BOOST_REQUIRE(runtime->MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    }
+    void Catchup()
+    {
+        BOOST_REQUIRE(runtime->RequestCatchup(8, market));
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+        const auto page{flowmesh::EncodeCatchupEntries(payloads)};
+        BOOST_REQUIRE(page);
+        Send({flowmesh::WireMessageKind::ENTRIES,
+              {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, 0}, *page});
+        BOOST_REQUIRE_EQUAL(runtime->MarketStatus(market)->next_sequence, entries.size());
+    }
+    void Restart()
+    {
+        runtime->Stop(); runtime.reset();
+        std::string error;
+        std::optional<node::FlowMeshProductionStore::Marker> marker;
+        BOOST_REQUIRE(store.ReadMarker(marker, error)); BOOST_REQUIRE(marker);
+        RuntimeSeatSource authority; authority.m_domain = domain; authority.m_seats = seats.seats;
+        auto restored{initial}; uint256 last;
+        BOOST_REQUIRE_MESSAGE(store.Replay(restored, last, authority,
+            {chain.TipHeight(), std::nullopt, &chain}, treasury, nullptr, error), error);
+        BOOST_REQUIRE(last == marker->last_microblock_hash);
+        MakeRuntime(restored, marker);
+        chain.ClearObservations(); // Count runtime initialization separately from store Replay.
+        Start();
+    }
+    const uint256 domain{Filled(0x1d)};
+    const modern::AssetId asset{Filled(0x3d)};
+    const flowmesh::MarketId market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+    const flowmesh::VaultId vault{*flowmesh::ComputeFlowMeshVaultId(domain, market)};
+    const uint256 treasury{Filled(0x5d)};
+    const SeatFixture seats{Seats(domain, market, 4, 7, 100, Filled(0x71), 141)};
+    const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    const std::vector<flowmesh::AnchorRef> lineage{{100, Filled(0x71)}, {101, Filled(0x81)},
+                                                {102, Filled(0x82)}, {103, Filled(0x83)}};
+    ImmutableLineageRuntimeChain chain;
+    RuntimeKeys keys; // Observer-only: no local signing or economics in the fixture.
+    FixedClock clock;
+    node::FlowMeshProductionStore store;
+    std::vector<flowmesh::ProductionEntryCore> entries;
+    std::vector<std::vector<unsigned char>> payloads;
+    std::unique_ptr<node::FlowMeshRuntime> runtime; // Joins before all dependencies die.
+private:
+    void MakeRuntime(const flowmesh::FlowMeshState& state,
+                     const std::optional<node::FlowMeshProductionStore::Marker>& marker)
+    {
+        node::FlowMeshRuntimeConfig config;
+        config.chain = &chain; config.keys = &keys; config.clock = &clock;
+        config.round_timeout = std::chrono::hours{1};
+        config.relay = [](node::FlowMeshRuntimeRelay) { return LegacyRelayResult(); };
+        auto market_config{MarketConfig(domain, market, treasury, seats.seats, state, store, nullptr)};
+        if (marker) {
+            market_config.next_sequence = marker->next_sequence;
+            market_config.next_effect_index = marker->next_effect_index;
+            market_config.last_microblock_hash = marker->last_microblock_hash;
+        }
+        runtime = std::make_unique<node::FlowMeshRuntime>(config,
+            std::vector<node::FlowMeshRuntimeMarketConfig>{std::move(market_config)});
+    }
+};
+
+BOOST_AUTO_TEST_CASE(committed_anchor_frontier_rechecks_only_proven_descendant_and_keeps_duplicate_semantics)
+{
+    AnchorFrontierRuntimeFixture f{m_args.GetDataDirBase() / "anchor_frontier_commit"};
+    f.Start(); f.chain.ClearObservations();
+    for (uint64_t i{0}; i < 5; ++i) f.Certificate(i);
+    BOOST_CHECK_EQUAL(f.chain.Proofs(), 3U); // Four distinct anchors; duplicate adds no proof.
+    f.chain.ClearObservations(); f.Tick();
+    BOOST_CHECK_GT(f.chain.Reads(100), 0U); // Seat canonicality is ALWAYS freshly checked.
+    BOOST_CHECK_GT(f.chain.Reads(103), 0U); // Fresh committed frontier, not cached readiness.
+    BOOST_CHECK_MESSAGE(f.chain.Reads(101) == 0 && f.chain.Reads(102) == 0,
+        "Ancestry-proven committed prefix still performs historical canonical lookups");
+    BOOST_CHECK_EQUAL(f.chain.Proofs(), 0U); // No ancestry proof on a read/tick.
+    f.chain.OrphanFrom(102); f.Tick();
+    const auto status{f.runtime->MarketStatus(f.market)}; BOOST_REQUIRE(status);
+    BOOST_CHECK(status->halt == node::FlowMeshRuntimeHalt::ANCHOR_INVALIDATED);
+    BOOST_CHECK_EQUAL(status->error, "a committed FlowMesh anchor is no longer canonical");
+    BOOST_CHECK_EQUAL(status->next_sequence, 5U);
+}
+
+BOOST_AUTO_TEST_CASE(committed_anchor_frontier_missing_or_throwing_proof_keeps_full_scan_for_lifecycle)
+{
+    for (const bool throwing : {false, true}) {
+        AnchorFrontierRuntimeFixture f{m_args.GetDataDirBase() /
+            (throwing ? "anchor_frontier_throw" : "anchor_frontier_missing")};
+        f.chain.FailProofAt(101, throwing); f.Start(); f.chain.ClearObservations();
+        f.Certificate(0); f.Certificate(1);
+        BOOST_CHECK_EQUAL(f.chain.Proofs(), 1U);
+        // Availability of a later proof MUST NOT re-enable this lifecycle.
+        f.chain.FailProofAt(std::nullopt);
+        f.Certificate(2); f.Certificate(3); f.Certificate(4);
+        BOOST_CHECK_EQUAL(f.chain.Proofs(), 1U);
+        f.chain.ClearObservations(); f.Tick();
+        BOOST_CHECK_GT(f.chain.Reads(101), 0U); BOOST_CHECK_GT(f.chain.Reads(102), 0U);
+        BOOST_CHECK_GT(f.chain.Reads(103), 0U); BOOST_CHECK_EQUAL(f.chain.Proofs(), 0U);
+        std::string error;
+        std::optional<node::FlowMeshProductionStore::Marker> marker;
+        BOOST_REQUIRE(f.store.ReadMarker(marker, error)); BOOST_REQUIRE(marker);
+        BOOST_CHECK_EQUAL(marker->next_sequence, 5U);
+        BOOST_CHECK(marker->last_microblock_hash == f.entries.back().GetHash());
+        f.chain.OrphanFrom(101); f.Tick();
+        BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::ANCHOR_INVALIDATED);
+        BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->error,
+                          "a committed FlowMesh anchor is no longer canonical");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(committed_anchor_frontier_catchup_and_restart_preserve_full_startup_validation)
+{
+    AnchorFrontierRuntimeFixture f{m_args.GetDataDirBase() / "anchor_frontier_restore"};
+    f.Start(); f.chain.ClearObservations(); f.Catchup();
+    BOOST_CHECK_EQUAL(f.chain.Proofs(), 3U);
+    f.Restart();
+    BOOST_CHECK_EQUAL(f.chain.Proofs(), 3U); // Rebuilt, never loaded from a persisted frontier.
+    // Startup still scans EVERY retained distinct committed anchor, after the
+    // independently verified store Replay and before enabling the staged cache.
+    BOOST_CHECK_GT(f.chain.Reads(101), 0U); BOOST_CHECK_GT(f.chain.Reads(102), 0U);
+    f.chain.ClearObservations(); f.Tick();
+    BOOST_CHECK_GT(f.chain.Reads(100), 0U); BOOST_CHECK_GT(f.chain.Reads(103), 0U);
+    BOOST_CHECK_EQUAL(f.chain.Reads(101), 0U); BOOST_CHECK_EQUAL(f.chain.Reads(102), 0U);
+    // An unavailable restore-time proof costs the fast path, not startup or data.
+    f.chain.FailProofAt(101); f.Restart(); f.chain.FailProofAt(std::nullopt);
+    f.chain.ClearObservations(); f.Tick();
+    BOOST_CHECK_GT(f.chain.Reads(101), 0U); BOOST_CHECK_GT(f.chain.Reads(102), 0U);
+    BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 5U);
+    f.chain.OrphanFrom(102); f.Tick();
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::ANCHOR_INVALIDATED);
+}
+
+BOOST_AUTO_TEST_CASE(committed_anchor_frontier_default_false_preserves_independent_older_anchor_check)
+{
+    // Deliberately NOT the immutable-lineage provider: these fixture hashes
+    // have independent mutable canonicality, so MAX-only checking is unsafe.
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "anchor_frontier_max_falsifier", nullptr, 0};
+    const flowmesh::AnchorRef a{200, Filled(0x74)}, b{201, Filled(0x75)};
+    f.chain.AddCanonical(b); f.chain.m_current = b;
+    BOOST_REQUIRE(!f.chain.ProvesImmutableAncestry(a, b)); // Original provider remains default-false.
+    flowmesh::ProductionEpochGate gate{f.domain, f.market, f.seats.seats};
+    std::optional<flowmesh::FlowMeshState> state{f.initial};
+    std::optional<flowmesh::AnchorRef> previous;
+    uint256 parent;
+    uint64_t sequence{0}, effect_start{0};
+    for (const auto& anchor : {a, b}) {
+        flowmesh::ProductionEntryCheck check;
+        const auto built{flowmesh::BuildProductionExecutionEntry(*state, f.domain, f.market,
+            f.seats.seats, gate, sequence, effect_start, parent, anchor,
+            {f.chain.TipHeight(), previous, &f.chain}, f.treasury, {}, nullptr, check)};
+        BOOST_REQUIRE_MESSAGE(built, flowmesh::ProductionEntryCheckName(check));
+        f.entries.push_back(built->entry);
+        const auto payload{flowmesh::EncodeProductionCertifiedPayload(
+            {built->entry, Certify(built->entry, f.seats)}, f.seats.seats.Size())};
+        BOOST_REQUIRE(payload); f.payloads.push_back(*payload);
+        state = built->next_state; parent = built->entry.GetHash(); previous = anchor;
+        ++sequence; effect_start += built->entry.effect_count;
+    }
+    std::string error; BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    f.Certificate(8, 0); f.Certificate(8, 1);
+    BOOST_REQUIRE_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 2U);
+    BOOST_REQUIRE(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    f.chain.AddCanonical({a.height, Filled(0xfa)}); // ONLY the older committed anchor changes.
+    BOOST_REQUIRE(!f.chain.StillCanonical(a));
+    BOOST_REQUIRE(f.chain.StillCanonical(b));
+    BOOST_REQUIRE(f.chain.StillCanonical({100, Filled(0x71)})); // Seat anchor unchanged too.
+    f.runtime->NotifyTick();
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    const auto status{f.runtime->MarketStatus(f.market)}; BOOST_REQUIRE(status);
+    BOOST_CHECK_MESSAGE(status->halt == node::FlowMeshRuntimeHalt::ANCHOR_INVALIDATED,
+        "Default-false ancestry provider lost its independent older committed-anchor check");
+    BOOST_CHECK_EQUAL(status->error, "a committed FlowMesh anchor is no longer canonical");
+    BOOST_CHECK_EQUAL(status->next_sequence, 2U);
+}
 
 BOOST_AUTO_TEST_CASE(health_snapshot_publishes_head_pause_reason_peers_and_halt)
 {

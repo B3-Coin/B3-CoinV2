@@ -925,6 +925,44 @@ BOOST_AUTO_TEST_CASE(b3_reorg_invalidates_previously_acceptable_anchors)
     BOOST_CHECK(policy.Acceptable(after));
 }
 
+BOOST_AUTO_TEST_CASE(chain_anchor_immutable_ancestry_is_exact_and_not_canonical_authority)
+{
+    const node::ChainAnchorPolicy policy{*Assert(m_node.chainman), 6};
+    const auto anchor_at = [&](const int height) {
+        LOCK(cs_main);
+        const auto* index{m_node.chainman->ActiveChain()[height]};
+        BOOST_REQUIRE(index != nullptr);
+        return AnchorRef{height, index->GetBlockHash()};
+    };
+    const auto early{anchor_at(20)}, orphan_root{anchor_at(90)}, late{anchor_at(100)};
+    FixedAnchors unsupported;
+    BOOST_CHECK(!unsupported.ProvesImmutableAncestry(early, late)); // Default is no capability.
+    BOOST_CHECK(policy.ProvesImmutableAncestry(early, late));
+    BOOST_CHECK(policy.ProvesImmutableAncestry(late, late));
+    BOOST_CHECK(!policy.ProvesImmutableAncestry(late, early));
+    BOOST_CHECK(!policy.ProvesImmutableAncestry({}, late));
+    BOOST_CHECK(!policy.ProvesImmutableAncestry(early, {}));
+    BOOST_CHECK(!policy.ProvesImmutableAncestry({early.height + 1, early.hash}, late));
+    BOOST_CHECK(!policy.ProvesImmutableAncestry(early, {late.height + 1, late.hash}));
+    BOOST_CHECK(!policy.ProvesImmutableAncestry({early.height, uint256::ONE}, late));
+    BOOST_CHECK(!policy.Acceptable(late)); // True ancestry grants no burial or authority.
+
+    CBlockIndex* root{WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(orphan_root.hash))};
+    BOOST_REQUIRE(root != nullptr);
+    BlockValidationState state;
+    m_node.chainman->ActiveChainstate().InvalidateBlock(state, root);
+    BOOST_REQUIRE(state.IsValid());
+    BOOST_CHECK(!policy.StillCanonical(late));
+    BOOST_CHECK(policy.ProvesImmutableAncestry(early, late)); // Parentage survives orphaning.
+    BOOST_CHECK(policy.ProvesImmutableAncestry(orphan_root, late));
+    CreateAndProcessBlock({}, CScript{} << OP_TRUE);
+    const auto fork{anchor_at(90)};
+    BOOST_REQUIRE(fork.hash != orphan_root.hash);
+    BOOST_CHECK(policy.ProvesImmutableAncestry(early, fork));
+    BOOST_CHECK(!policy.ProvesImmutableAncestry(orphan_root, fork));
+    BOOST_CHECK(!policy.ProvesImmutableAncestry(fork, late));
+}
+
 BOOST_AUTO_TEST_CASE(pool_admission_is_atomic)
 {
     MeshNet net{3, 0};

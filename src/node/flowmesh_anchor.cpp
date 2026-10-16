@@ -43,6 +43,22 @@ bool ChainAnchorPolicy::StillCanonical(const flowmesh::AnchorRef& anchor) const
     return m_chainman.ActiveChain().Contains(index); // depth-free: canonicality only
 }
 
+bool ChainAnchorPolicy::ProvesImmutableAncestry(
+    const flowmesh::AnchorRef& ancestor,
+    const flowmesh::AnchorRef& descendant) const
+{
+    if (ancestor.height < 0 || descendant.height < ancestor.height ||
+        ancestor.hash.IsNull() || descendant.hash.IsNull()) return false;
+    LOCK(cs_main);
+    const CBlockIndex* before{m_chainman.m_blockman.LookupBlockIndex(ancestor.hash)};
+    const CBlockIndex* after{m_chainman.m_blockman.LookupBlockIndex(descendant.hash)};
+    if (before == nullptr || after == nullptr ||
+        before->nHeight != ancestor.height || after->nHeight != descendant.height) return false;
+    // Index parentage is immutable, including for orphaned blocks. Deliberately
+    // do not consult the active chain, depth or a cached readiness observation.
+    return after->GetAncestor(ancestor.height) == before;
+}
+
 flowmesh::AnchorRef ChainAnchorPolicy::Current() const
 {
     LOCK(cs_main);
