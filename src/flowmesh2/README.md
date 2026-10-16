@@ -83,7 +83,15 @@ spot ledger in `ledger/` (one balance per account and asset across all
 markets, nonce windows, fee withholding, atomic operations and a
 conservation check after every operation) and state commitment v0 with
 account proofs, plus the commitment value types and protocol accounts in
-`core/state_root`. Nothing is linked into the node, wallet or Qt.
+`core/state_root`; and **R6**, the matching engine's first half in
+`engine/`: the provisional order book (price-time FIFO, exact
+reservations, never crossed), the A2 sweep of same-slot takers (pro-rata
+per level by largest remainder, pairing by canonical rank against FIFO
+makers, execution at the maker price, the seller fee on each order's
+cumulative quote, per-order and per-slot fill caps) that settles through
+the ledger, residual-cross detection, and a naive reference matcher in
+`test/` that 1,000 seeded batches are compared against. Nothing is linked
+into the node, wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -95,8 +103,8 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R5: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 173 cases, `flowmesh2_inventory`,
+Expected after R6: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 198 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
 `flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`).
 Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2. Open gates (workspace lock reconciliation, decision

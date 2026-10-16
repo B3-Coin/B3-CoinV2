@@ -8,17 +8,20 @@ auditing the outline (M0-AUD-01). The design is in [ARCHITECTURE.md](ARCHITECTUR
 Landed outline slices: **R1** (build gate, error model, Boost.Test runner,
 inventory and TODO lint), **R2** (guards, compile-fail controls, evidence
 tool, sanitizer canaries, CI workflow), **R3** (core primitives, profile,
-authority types, slot header) and **R4** (signed actions, slot body,
+authority types, slot header), **R4** (signed actions, slot body,
 outcomes, facts, certificate, seat set, account leaf, nonce and fee spec
-functions) and **R5** (shared spot ledger with nonce windows and
-conservation, protocol accounts, state commitment v0 and account proofs).
+functions), **R5** (shared spot ledger with nonce windows and
+conservation, protocol accounts, state commitment v0 and account proofs)
+and **R6** (order book, A2 sweep with pairing, fees and fill caps,
+residual-cross detection, naive reference matcher).
 Their rows are `outline` until M0-AUD-01 accepts them, and so are the rows
 they tag: M0-EVD-01 (R2); M3-ENG-03, M3-ENG-08, M9-FUT-01, M4-STO-05 and the
 REAL-REPLACE M3-ENG-11 (R3); M4-ADM-01, M7-SEAT-01, M7-GOV-01, MB1-B3D-02,
 M8-BRG-02, M8-EXIT-01 and the REAL-REPLACE M2-ADM-01 (R4); M2-LED-02,
 M2-LED-03, M2-LED-04, M2-LED-05, M2-LED-06 and the REAL-REPLACE M2-LED-07 and
-M7-FEE-01 (R5). Every other row is `todo`, except the C1 baseline, which is
-`done`.
+M7-FEE-01 (R5); M3-ENG-02 and the REAL-REPLACE M3-ENG-01, M3-ENG-04,
+M3-ENG-13 and M3-ENG-14 (R6; M3-ENG-03 gains its second stub site there).
+Every other row is `todo`, except the C1 baseline, which is `done`.
 
 ---
 
@@ -127,7 +130,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | R3 | R | outline | — | R3 | Core primitives, profile, authority types, slot header | `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot`; `PROFILE_DEX1_REGTEST.json` | `AccountId` golden; overflow refused at `MAX_ATOMS` edges and for negatives; `MulDiv` exhaustive on a small domain; tags unique, prefixed, golden, no collision with existing `B3/` tags; trailing bytes, oversize counts (no allocation) and non-canonical `CompactSize` refused; MAIN/TESTNET/TESTNET4/SIGNET give `UNSUPPORTED_NETWORK`; JSON `profile_hash` equals code; Merkle sizes 0..17 equal a naive reference, tampering fails, duplicated last leaf changes the root; header round trip, `Hash ≠ CommitDigest`, golden, every field changes `Hash` | scratch:R3/ | D6, D7, O-9, O-20, O-24, O-25, O-26 |
 | R4 | R | outline | — | R4 | Signed actions, slot body, outcomes, facts, certificate, seat set, shared spec functions | `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math`; `test/util/keys.h` | BIP340 round trip; flipped bit and other domain fail; `Id` excludes the signature; payload 4,096 ok, 4,097 `OVERSIZE`; `max_delay` 0 and 1,025 flagged; golden bytes and `Id`; `VerifiedAction` only via `Verify` (static_assert); body of 1,025 originals refused; two signatures give two `ActionLeaf`s; bitmap golden, bits ≥ k refused; `SeatSet` refuses bad PoP and duplicates; quorum table k=1..10; nonce rule exhaustive for W=3; fee increments sum to ceil(total·ppm/1e6); split exhaustive F=0..10,000 | scratch:R4/ | D5, D7, O-8, TRD-17 |
 | R5 | R | outline | — | R5 | Shared ledger, nonce window, commitment v0 | `ledger/nonce_window`, `ledger`, `state_commitment`; `core/state_root` (commitment v0 value types and protocol accounts, shared with b3verify, O-33); `test/util/ledger_fixtures.h` | W=3 insert sequences of length ≤ 7 equal a naive model; W=100 boundaries (`NONCE_TOO_LOW`, `NONCE_USED`, eviction); duplicate outpoint refused; over-reserve leaves state unchanged; transfer refusals; 64 seeds × 10,000 random ops keep conservation equal to an independent tally; root deterministic and insertion-order independent; proofs verify | scratch:R5/ | TRD-10, O-7, O-31, O-32, O-33, O-34 |
-| R6 | R | todo | — | R6 | Order book, A2 sweep with pairing, reference matcher | `engine/book`, `matcher`, `residual`; `test/reference_matcher.h` | full and partial fill at the maker price, FIFO; 3 takers × 4 lots against 10 maker lots split 4/3/3 with a golden pairing vector; multi-level sweep; `FILL_CAP` at cap−1/cap/cap+1; self-trade conserves and charges once; 1,000 seeded batches equal a naive O(n²) matcher on fills, pairing and fees | scratch:R6/ | D4, D5, O-5, O-17 |
+| R6 | R | outline | — | R6 | Order book, A2 sweep with pairing, reference matcher | `engine/book`, `matcher`, `residual`; `test/reference_matcher.h`; `test/util/engine_fixtures.h` | full and partial fill at the maker price, FIFO; 3 takers × 4 lots against 10 maker lots split 4/3/3 with a golden pairing vector; multi-level sweep; `FILL_CAP` at cap−1/cap/cap+1; self-trade conserves and charges once; 1,000 seeded batches equal a naive O(n²) matcher on fills, pairing and fees | scratch:R6/ | D4, D5, O-5, O-17, O-35, O-36, O-37, O-38 |
 | R7 | R | todo | — | R7 | Engine slot phases, canonical order, validity predicate | `engine/engine`; orders and markets in `ledger/state_commitment` | shared-quote reservation in M2 blocks an M1 order; same-slot proceeds cannot fund a same-slot reservation; transfer, cancel, post-only, IOC, refund cases; deterministic rejection consumes the nonce with zero deltas; each `ValidateSlotInputs` clause has a failing input; permuted originals give identical roots; parent hash changes cross-account order only; golden canonical order; residual-cross refusal releases and conserves | scratch:R7/ | D4, DUR-5, O-4, O-4b |
 | R8 | R | todo | — | R8 | Storage: framing, journals, strict commit, tokens, signer and commit logs | `storage/*`; `agreement/outbound.h` | role mismatch `ORDER_VIOLATION`; failed barrier gives sticky `STORAGE_FATAL`, then `FENCED`, `Confirm` refused; `Confirm` before `Barrier` refused; 3 appends + 1 barrier give 3 confirms; equivocation refused, identical digest idempotent, new view allowed; `Sign` without `DurableIntent` does not compile; `AppendApplied` wrong root `VERIFY_FAILED`; framing golden; CRC, chain and splice errors detected; file journal refuses a non-empty dir, reads back zero-filled at full size, scan reproduces records, a forced commit failure is sticky | scratch:R8/ | DUR-1, DUR-2, DUR-8, O-16 |
 | R9 | R | todo | — | R9 | State owner: preview, re-execution, apply, replay | `state/state_owner`, `candidate.h`, `replay` | `Preview` leaves the head unchanged and is byte-identical for identical inputs; `STALE_PARENT`; token for another header `VERIFY_FAILED`; superseded epoch `AUTHORITY_CHANGED` with head unchanged; same decision twice `STALE_PARENT`; `Reexecute` rejects one flipped root; five-slot chain links; `ReplayDecisions` over a `MemoryJournal` reproduces headers and root, duplicated `DECISION` applied once; injected conservation failure `INVARIANT`; each leader-fault input `INVALID_INPUT` | scratch:R9/ | DUR-1, CONS-10 |
@@ -186,10 +189,10 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 
 | ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
 |---|---|---|---|---|---|---|---|---|---|
-| M3-ENG-01 | M3 | todo | REAL-REPLACE | R6 | 2^17-tick band array, two-level bitmap, Fenwick tree, FIFO pool, open-addressing `OrderId` table (never iterated) | `engine/book.cpp` `OrderBook` | differential against the skeleton on 10^5 ops; `BOOK_FULL` | M3/M3-ENG-01/ | plan §3.5, D6 |
-| M3-ENG-02 | M3 | todo | STUB | R6, R7 | Residual same-slot max-volume uniform-price call | `ResolveResidualCross`; `REJ_RESIDUAL_CROSS_UNSUPPORTED` | checker covers the tie-break | M3/M3-ENG-02/ | D4, O-5, BLOCKED-ON-RULING |
-| M3-ENG-03 | M3 | outline | STUB | R3, R6 | ±50% price band against the epoch reference price | `PriceBandCheck` (R6); `core/params` `Validate` (`price_band_enabled`) | band edge tests | M3/M3-ENG-03/ | D6, BLOCKED-ON-RULING (reference source) |
-| M3-ENG-04 | M3 | todo | REAL-REPLACE | R7 | Complete caps: `FILL_CAP`, fills per slot, 8,192 changed leaves, `SLOT_FULL`, `BOOK_FULL` | `engine/`, `ValidateSlotInputs` | cap−1 / cap / cap+1 tests | M3/M3-ENG-04/ | D6 |
+| M3-ENG-01 | M3 | outline | REAL-REPLACE | R6 | 2^17-tick band array, two-level bitmap, Fenwick tree, FIFO pool, open-addressing `OrderId` table (never iterated) | `engine/book` `OrderBook` (`std::map` of FIFO `std::deque` levels plus a lookup `std::map`; no capacity, no `BOOK_FULL`; O-35) | differential against the skeleton on 10^5 ops; `BOOK_FULL` | M3/M3-ENG-01/ | plan §3.5, D6 |
+| M3-ENG-02 | M3 | outline | STUB | R6, R7 | Residual same-slot max-volume uniform-price call | `ResolveResidualCross` (`engine/residual`, R6; `FindResidualCross` already detects the crossing remainders); the certified refusal `REJ_RESIDUAL_CROSS_UNSUPPORTED` (R7) | checker covers the tie-break | M3/M3-ENG-02/ | D4, O-5, O-38, BLOCKED-ON-RULING |
+| M3-ENG-03 | M3 | outline | STUB | R3, R6 | ±50% price band against the epoch reference price | `PriceBandCheck` (`engine/matcher`, R6; takes a `ReferencePrice`); `core/params` `Validate` (`price_band_enabled`, R3) | band edge tests | M3/M3-ENG-03/ | D6, O-38, BLOCKED-ON-RULING (reference source) |
+| M3-ENG-04 | M3 | outline | REAL-REPLACE | R6, R7 | Complete caps: `FILL_CAP`, fills per slot, 8,192 changed leaves, `SLOT_FULL`, `BOOK_FULL`; rule how the slot fill budget is shared across markets and sides and which certified code a slot-capped remainder gets (no `SLOT_FULL` outcome code exists) | `engine/matcher` `SweepA2` (per-taker `FILL_CAP` and the `SlotFillBudget`: markets ascending, BUY before SELL, R6); `engine/`, `ValidateSlotInputs` (R7) | cap−1 / cap / cap+1 tests | M3/M3-ENG-04/ | D6, O-36 |
 | M3-ENG-05 | M3 | todo | NONE | — | Independent checker written from the spec; shares only codecs and hashes, never engine, fee or nonce code | new | 100% agreement, including adversarial and dust batches | M3/M3-ENG-05/ | plan M3, O-3 |
 | M3-ENG-06 | M3 | todo | NONE | — | x86 gate: apply + roots p99 ≤ 5 ms at 1,024 actions on an adversarial 131k-tick book; parallel subtree hashing | new | perf evidence with PERF-7 metadata | M3/M3-ENG-06/ | plan §3.5 |
 | M3-ENG-07 | M3 | todo | NONE | — | MEV analysis: A versus A2 | new | report accepted by the owner | M3/M3-ENG-07/ | D4, OWNER-GATED |
@@ -198,8 +201,8 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M3-ENG-10 | M3 | todo | NONE | — | Replace/amend revisions | new | atomic replace tests | M3/M3-ENG-10/ | BLOCKED-ON-RULING |
 | M3-ENG-11 | M3 | outline | REAL-REPLACE | R3 | Per-market tick, lot and minimum size at listing | `core/market` `MarketDescriptor` | vectors | M3/M3-ENG-11/ | D6, OD-7 |
 | M3-ENG-12 | M3 | todo | REAL-REPLACE | R7 | Seed hardening: parent-header seed, grinding tests; consider a VRF or a unique threshold signature | `CanonicalOrder` | no measured proposer or client advantage | M3/M3-ENG-12/ | PLAN-7, D4, O-4, O-4b, BLOCKED-ON-RULING |
-| M3-ENG-13 | M3 | todo | REAL-REPLACE | R6 | Self-trade prevention policy | `SweepA2` self-match path | policy tests | M3/M3-ENG-13/ | O-17, BLOCKED-ON-RULING |
-| M3-ENG-14 | M3 | todo | REAL-REPLACE | R6 | Ratify taker-to-maker pairing and the remainder rule | `SweepA2` pairing | checker agreement | M3/M3-ENG-14/ | D4, O-5, BLOCKED-ON-RULING |
+| M3-ENG-13 | M3 | outline | REAL-REPLACE | R6 | Self-trade prevention policy | `SweepA2` self-match path (`engine/matcher`: a maker and a taker of one account trade like any other pair) | policy tests | M3/M3-ENG-13/ | O-17, BLOCKED-ON-RULING |
+| M3-ENG-14 | M3 | outline | REAL-REPLACE | R6 | Ratify taker-to-maker pairing and the remainder rule | `AllocateProRata` and the `SweepA2` pairing (`engine/matcher`) | checker agreement | M3/M3-ENG-14/ | D4, O-5, O-37, BLOCKED-ON-RULING |
 
 ## MB1 and B0 — b3d regtest consensus at P (OWNER-GATED: outside `src/flowmesh2/`)
 

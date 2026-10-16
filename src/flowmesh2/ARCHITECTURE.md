@@ -10,10 +10,12 @@ primitives: checked amounts, ids, tag registry, exact codec, the provisional
 profile, authority types, size-bound Merkle trees, markets and the slot
 header), slice **R4** (signed actions, slot bodies, outcomes, chain facts,
 certificates, seat sets, the account leaf and the shared nonce and fee spec
-functions) and slice **R5** (the shared spot ledger with nonce windows,
+functions), slice **R5** (the shared spot ledger with nonce windows,
 fee withholding and conservation, the protocol accounts, and state
-commitment v0 with account proofs). Everything else described here is the
-contract that the outline slices R6 to R14 will build.
+commitment v0 with account proofs) and slice **R6** (the order book, the A2
+sweep with pairing, fees and fill caps, residual-cross detection and a
+naive reference matcher). Everything else described here is the contract
+that the outline slices R7 to R14 will build.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
@@ -134,7 +136,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot` | R3 | `AssetId`, `AccountId::FromKey`, `MarketId`, `ActionId`, `OrderId::FromPlace`, `Outpoint`; checked `Atoms` (`AddAtoms`, `SubAtoms`, `MulChecked`, `MulDivFloor`/`Ceil`); tag registry (29 tags); `DecodeExact`, `ReadCappedVector`, `WriteCappedVector`; `NetworkId`, `ProfileParams`, `DevRegtestProfile`, `Validate`, `EncodeProfile`, `ProfileHash`, `DomainHash`; `Anchor`, `FactCursor`, `AuthorityVersion`; `MarketDescriptor`, `BaseAtoms`, `QuoteAtoms`; size-bound RFC 6962 Merkle (O-25); `SlotHeaderV2`, `GenesisHeader` | `Validate()`: price band (M3-ENG-03), `PER_SIDE` fees (M3-ENG-08), futures (M9-FUT-01), `FOLDED` signer (M4-STO-05) | per-market tick/lot (M3-ENG-11) |
 | `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math` | R4 | `ActionV2` exact capped codec, `UnsignedMsg`, `Id`, `Account`, BIP340 `VerifySignature`, `MaxDelayValid`, PLACE/CANCEL/TRANSFER/WITHDRAW payload codecs, `KindSupported`; `VerifiedAction::Verify`; `SlotBody` codec, `BodyHash`, `ActionLeaf`, `ActionsRoot`, `FactsRoot`; `OutcomeV2` codec and `LeafHash`; `DepositFact` codec and `FactId`; `SlotCertificate` codec, `Hash`, `SignerIndices`, `MakeBitmap`; `SeatSet::FromPoP`, `Quorum`, `Root`, `Keys`; `AccountLeafV0` codec and `LeafValue`; `ClassifyNonce`, `NonceInsert`, `InExpiryWindow`, `ExpiredAt`; `SellerFeeTotal`, `SellerFeeIncrement`, `SplitSlotFees` | codecs and `FactId` of five facts: seat change (M7-SEAT-01), listing (M7-GOV-01), checkpoint accepted (MB1-B3D-02), payout confirmed (M8-BRG-02), exit nullifier (M8-EXIT-01); `BatchVerifier::VerifyBatch` (M4-ADM-01) | nonce rule (M2-ADM-01) |
 | `ledger/`, `core/state_root` | R5 | `NonceWindow` (over the core D7 rule), `AdmissionCodeFor`; `LedgerState` (deposit with outpoint nullifier, reserve, release, pay from reserved with fee withholding, credit to protocol accounts, transfer, nonces, open orders, `CheckConservation`), all atomic; protocol accounts `SeatPoolAccount`/`TreasuryAccount`; `AssetTotals`, `TotalsLeafV0`, `MarketLeafValue`, `NullifierLeafValue`, `StateRootsV0`; `CommitV0`, `ProveAccountV0` | `RequestWithdrawal` (M2-LED-05), `TransferToFutures`/`TransferFromFutures` (M2-LED-06), `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) | duplicate-fact rules (M2-LED-07), seat-pool account (M7-FEE-01) |
-| `engine/book`, `matcher`, `residual` | R6 | `OrderBook`, `BookSet`, `SweepA2` with pairing and fees | `ResolveResidualCross` (M3-ENG-02), `PriceBandCheck` (M3-ENG-03) | book (M3-ENG-01), pairing (M3-ENG-14), self-trade (M3-ENG-13) |
+| `engine/book`, `matcher`, `residual` | R6 | `RequiredReservation`; `OrderBook` (exact reservations, never crossed, FIFO by `arrival_rank`, `FillBestFront` at the maker price) and `BookSet`; `AllocateProRata`; `SweepA2` with pairing, ledger settlement, seller fees, per-order and per-slot fill caps and `TakerStop`; `FindResidualCross` | `ResolveResidualCross` (M3-ENG-02), `PriceBandCheck` (M3-ENG-03) | book (M3-ENG-01), pairing and remainder rule (M3-ENG-14), self-trade (M3-ENG-13), slot fill budget (M3-ENG-04) |
 | `engine/engine` | R7 | `ValidateSlotInputs`, `CanonicalOrder`, `Engine::ApplySlot` phases 1-6, 8, 9 | `CANCEL_ALL` (M3-ENG-09), `WITHDRAW` (M2-LED-05), phase 7 futures (M9-FUT-04); residual cross as certified refusal (M3-ENG-02) | order seed (M3-ENG-12), caps (M3-ENG-04), validity predicate (M4-AGR-11) |
 | `storage/` | R8 | record framing, `Journal`, `MemoryJournal`, `FileJournal::CreateNew`, `JournalCommit`, `JournalDirectoryCommit`, `Pending<T>`, minting of the `Durable*` tokens (type landed in R2), `SignerLog`, `SeatSigner`, `CommitLog`; `agreement/outbound.h` | `OpenExisting`/`ReadAll` (M4-STO-01), `LogWriter` (M4-STO-02), `SnapshotStore` (M4-STO-03), folded signing (M4-STO-05), `Rollover` (M4-STO-06), view-state records (M4-STO-07) | — |
 | `state/` | R9 | `StateOwner::Preview`, `Reexecute`, `Apply`, `Head`; `ReplayDecisions`; `CoreState::Genesis` | `Restore` (M4-STO-03), pipelined `Preview` over an uncommitted parent (M4-AGR-10) | full-state copy (M2-LED-10) |
@@ -206,7 +208,12 @@ header marked *landed* is normative; the others are the target contract.
 | `ledger/nonce_window.h` | R5 | landed | `NonceWindow` (`Create`, `FromUsed`, `Classify`, `Insert`; no rule of its own, the core D7 functions), `AdmissionCodeFor` (USED → `NONCE_USED`, TOO_LOW → `NONCE_TOO_LOW`) |
 | `ledger/ledger.h` | R5 | landed | `LedgerState` value type, no lock, atomic operations (an Error or rejection changes nothing): `CreditDeposit`, `Reserve` (OK/INSUFFICIENT), `Release`, `PayFromReserved(from, to, asset, amount, withheld_fee)`, `Credit` (protocol accounts, from `fees_held`), `Transfer` (O-7 outcomes), `ConsumeNonce`, `AddOpenOrder` (OK/AT_CAP), `RemoveOpenOrder`, `Leaf`, `CheckConservation` (also a free function over explicit maps); stubs `RequestWithdrawal` (M2-LED-05), `TransferToFutures`/`TransferFromFutures` (M2-LED-06) |
 | `ledger/state_commitment.h` | R5 | landed | `CommitV0(ledger, markets, orders)` → `StateRootsV0`, `OrderLeafV0` (R7 defines its value), `ProveAccountV0` → `AccountWitnessV0{leaf, proof}`; stubs `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) |
-| `engine/book.h`, `matcher.h`, `residual.h`, `engine.h` | R6, R7 | target | section 11 |
+| `engine/book.h` | R6 | landed | `RestingOrder`, `Reservation`/`RequiredReservation`, `Opposite`, `Reaches`; `OrderBook` (REAL-REPLACE M3-ENG-01): `Create`, `BestBid`/`BestAsk`/`Best`, `WouldCross`, `Find`, `BestFront`, `LevelLots`, `Orders`, `Rest`, `Remove`, `FillBestFront`, `CheckInvariants`, five invariants kept by every mutation (O-35); `BookSet` (`Create`, `Find`, `FindOrder`, `CheckInvariants`) |
+| `engine/matcher.h` | R6 | landed | `TakerStop` registry, `Taker`, `SlotFillBudget`, `ExecutedFill`, `SweepResult`; `AllocateProRata` (largest remainder, ties by rank; M3-ENG-14); `SweepA2(book, ledger, takers, profile, budget)`: preconditions first with no change, then BUY takers against asks and SELL takers against bids, settlement through the ledger (O-36, O-37); stub `PriceBandCheck` (M3-ENG-03) over `ReferencePrice` |
+| `engine/residual.h` | R6 | landed | `FindResidualCross` (real detection); `ResidualCall` (target shape) and stub `ResolveResidualCross` (M3-ENG-02; O-38) |
+| `engine/engine.h` | R7 | target | section 11 |
+| `test/util/engine_fixtures.h` | R6 | landed | TEST fixtures: `EngineOrder`, `EngineFixture` (fund, rest a maker the way phase 6 does, reserve a taker the way phase 5 does, sweep and check conservation and book invariants) |
+| `test/reference_matcher.h` | R6 | landed | TEST oracle: naive O(n²) A2 matcher over plain vectors (scans for the best price, rank order, FIFO maker and count-ahead largest remainder); shares only the id types and `Side` with the engine |
 | `storage/durable.h` | R2 | landed | `DurableKind`, move-only `Durable<K>` tokens with a private constructor whose only friend is `Journal` (R8 mints them); section 7.2 |
 | `storage/*.h` (others), `agreement/outbound.h` | R8 | target | section 7 |
 | `state/state_owner.h`, `candidate.h`, `replay.h` | R9 | target | sections 4, 7.4 |
@@ -738,6 +745,44 @@ in R4 (`core/fee_math.h`): `SellerFeeTotal(q)` = ⌈q · ppm / 10⁶⌉,
 window and expiry rules are `core/nonce_rule.h` (D7), shared by the ledger,
 admission, the engine and b3verify.
 
+**As landed in R6** (`engine/book.h`, `engine/matcher.h`,
+`engine/residual.h`; PROVISIONAL REGTEST):
+
+- A resting order holds exactly `RequiredReservation(market, side, price,
+  remaining_lots)`: a BUY holds quote atoms at its own price, a SELL holds
+  base atoms. The book is never crossed (`Rest` refuses an order that
+  would execute), each level is FIFO with strictly increasing
+  `arrival_rank`, and fills happen only at the front of the best level at
+  that order's price (`FillBestFront` refuses any other quote). R7 must give
+  resting orders strictly increasing arrival ranks over the life of a
+  market (O-35).
+- `SweepA2` takes one market's book, the ledger, that market's takers
+  (GTC or IOC, already reserved at their limits), the profile and the
+  slot's `SlotFillBudget`. It checks every precondition first and changes
+  nothing on a refusal. Then the BUY takers sweep the asks and the SELL
+  takers sweep the bids, round by round: the best level's lots are
+  allocated over the eligible takers' remaining lots (all of them if they
+  fit, else floor shares plus largest remainders, ties to the lower rank),
+  and the takers, in ascending rank, consume the level's makers FIFO. A
+  taker stops at `max_fills_per_order` fills and its unconsumed share goes
+  back to the level for the next round. Each fill takes one unit of the
+  budget; at zero, matching stops (O-36).
+- Each fill settles at once in the ledger: the seller's reserved base goes
+  to the buyer, the buyer's reserved quote goes to the seller less the
+  seller's fee increment, which waits in `fees_held`. A maker that runs out
+  of lots leaves the book and its owner's open-order count drops. The
+  taker's unspent reservation (price improvement, unfilled lots) stays in
+  `reserved_left` for phase 6 to release or keep for the resting
+  remainder (O-37).
+- Every taker ends with a `TakerStop` read from the final book: `FILLED`;
+  `NO_CROSS` (nothing reaches its limit); `ORDER_FILL_CAP` or
+  `SLOT_FILL_CAP` (the book still crosses). R7 maps them to outcomes.
+- Same-slot takers never match each other. `FindResidualCross` names the
+  GTC remainders that would rest crossed (a BUY at or above the lowest SELL
+  limit, a SELL at or below the highest BUY limit); R7 refuses them with
+  `REJ_RESIDUAL_CROSS_UNSUPPORTED`, and the call itself is the stub
+  `ResolveResidualCross` (M3-ENG-02; O-38).
+
 ---
 
 ## 12. Outline slices
@@ -766,11 +811,11 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R5)
+### 13.1 Today (after R6)
 
 The commands in 13.2 work. They build every fm2 target (`fm2_all`): the
-libraries `fm2_types` and `fm2_core` (since R5), `test_flowmesh2` (173 Boost
-cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
+libraries `fm2_types` and `fm2_core` (since R5; `engine/` since R6),
+`test_flowmesh2` (198 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
 19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
 `flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
 and `flowmesh2_negative_compile` (Clang). The outline never uses `build/`,
@@ -1093,7 +1138,11 @@ outline does not resolve on its own.
 | O-32 | Commitment v0 details the plan leaves open | R5 chooses (section 9): leaf values tagged per component and keyed by id; the root-of-roots carries `u8 commitment_version`; a nullifier leaf is the outpoint only; the totals leaf holds deposits, effects, pending and fees_held; all-zero totals and balances are omitted. Every vector is skeleton-only until the SMT (M2-LED-02) |
 | O-33 | Where commitment types live: the slice text puts `TreasuryAccount`/`SeatPoolAccount` and the commitment in `ledger/`, but b3verify (R11) must recompute a state root and may not include ledger headers (guard rule 1) | R5 puts the protocol account ids, `AssetTotals`, `TotalsLeafV0`, the market and nullifier leaf values and `StateRootsV0` in `core/state_root` (fm2_types); the ledger builds the trees in `ledger/state_commitment` |
 | O-34 | Refusals that are errors, not outcomes | A deposit fact with amount 0 or a protocol account as target, a second fact for one outpoint, deposits of an asset above 2^62 in total, and a 257th asset in one account are errors, so a slot carrying one has no valid candidate. The chain adapter (R10, MB1-ADP-06) must never deliver such a fact and R7/M7-GOV-01 must keep the listed assets at most `MAX_LEAF_ASSETS`; otherwise M2-LED-07 must define certified refusals. The cumulative `deposits`/`effects` counters are capped at 2^62 atoms; tracking net custody instead is for M2-LED-03/M2-LED-05. A TRANSFER to an existing protocol account is allowed (O-7 literal); M7-FEE-01 may forbid it |
-| O-30 | Shapes the engine has not pinned yet | `SlotBody` keeps facts as canonical bytes (the body stays decodable without knowing every fact kind; R7's validity predicate decodes them). `OutcomeV2` fields, the delta aggregation rule and the `SLOT` outcome subject are provisional until R6/R7; changing them after R7 changes `outcomes_root` vectors |
+| O-30 | Shapes the engine has not pinned yet | `SlotBody` keeps facts as canonical bytes (the body stays decodable without knowing every fact kind; R7's validity predicate decodes them). `OutcomeV2` fields, the delta aggregation rule and the `SLOT` outcome subject are provisional until R6/R7; changing them after R7 changes `outcomes_root` vectors. R6 fills `Fill` as specified (maker, taker, market, taker side, the maker's price, lots, quote, the seller's fee increment and `seller_quote_before`) without changing the codec |
+| O-35 | Book invariants the plan leaves open | R6 chooses: every resting order is exactly reserved; the book is never crossed (`Rest` refuses a crossing order, so phase 6 must refuse or resolve a crossing remainder first); each level is FIFO with strictly increasing `arrival_rank`, so the book is a function of its orders and can be rebuilt from order leaves (R7 must assign arrival ranks that increase over the life of a market, for example from height and canonical rank); the book never touches the ledger; `fills` counts every fill of an order, but the per-order fill cap applies only to takers, because a cap on a resting order would block its whole FIFO level. The skeleton has no capacity and no `BOOK_FULL` (M3-ENG-01) |
+| O-36 | Fill caps (D6) | A taker stops at `max_fills_per_order` fills; its unconsumed pro-rata share is re-allocated at the same level in the next round. One `SlotFillBudget` (`max_fills_per_slot`) is shared by every sweep of the slot: R7 sweeps markets in ascending `MarketId`, and inside a market the BUY takers sweep before the SELL takers; at zero every sweep stops. The research note's alternative (defer the takers beyond the cap whole to the next slot) contradicts definite outcomes (DUR-6), and the registry has no `SLOT_FULL` outcome code (adding one changes an owner-protected registry), so R7 must map a slot-capped remainder to an existing code. M3-ENG-04 rules both |
+| O-37 | What the sweep does and does not do | It settles every fill in the ledger immediately (`PayFromReserved` on both legs, fee withheld into `fees_held`) and closes makers (`RemoveOpenOrder`). It does not release a taker's unspent reservation, rest a remainder, consume nonces or build outcomes; R7 does. Preconditions are checked first and a refusal changes nothing; an error after that means a broken invariant elsewhere (for example another market's reservations that the ledger no longer covers), the state is then unspecified, and R7 discards its candidate (no copy-on-write inside the sweep). Pro-rata demand is each taker's remaining lots, not capped by the fill caps |
+| O-38 | Residual-cross and price-band interfaces | `FindResidualCross` treats every GTC remainder that crosses any opposite remainder as crossing (a BUY at or above the lowest SELL limit, a SELL at or below the highest BUY limit), so R7 refuses all of them, not only the max-volume subset a call would execute. `ResolveResidualCross` returns a target `ResidualCall{clearing_price_ticks, buy_lots, sell_lots}`; `PriceBandCheck(market, price, ReferencePrice{market, price_ticks})` returns `Result<bool>`. M3-ENG-02 and M3-ENG-03 may reshape them |
 
 ---
 
