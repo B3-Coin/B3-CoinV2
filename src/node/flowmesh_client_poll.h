@@ -15,7 +15,9 @@
 
 namespace node {
 
-/** Volatile scheduling of automatic reads of retained, unresolved actions.
+/** Volatile scheduling of automatic status and eligible outcome-only reads
+ * of retained actions. Both kinds join the same exact-key FIFO; inclusion
+ * does not grant an unqueued token ahead of an older unresolved status read.
  *
  * This is a client request-budget policy, NOT a protocol timer. Half of the
  * public API's existing 32 requests/peer/second allowance is available to

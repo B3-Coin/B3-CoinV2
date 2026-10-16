@@ -30,6 +30,7 @@
 #include <modern/fn.h>
 #include <modern/mpa.h>
 #include <node/flowmesh_anchor.h>
+#include <node/flowmesh_client_poll.h>
 #include <node/flowmesh_checkpoint_index.h>
 #include <node/flowmesh_vault_index.h>
 #include <node/fn_seat_index.h>
@@ -5432,6 +5433,277 @@ BOOST_AUTO_TEST_CASE(evidence_failure_never_downgrades_inclusion)
                                                 : code == "TOO_LARGE" ? "OUTCOME_EVIDENCE_TOO_LARGE"
                                                                       : "OUTCOME_EVIDENCE_BUDGET"));
     }
+}
+
+BOOST_AUTO_TEST_CASE(included_outcome_demand_services_older_unresolved_fifo_without_resubmitting)
+{
+    using Poll = node::FlowMeshClientPollScheduler;
+    const fs::path path{m_path_root / "outcome-fifo-client"};
+    const auto hot{SignedCancel(3)}, older{SignedCancel(4)};
+    const auto hot_bytes{flowmesh::EncodeProductionActionPayload(hot)};
+    const auto older_bytes{flowmesh::EncodeProductionActionPayload(older)};
+    BOOST_REQUIRE(hot_bytes && older_bytes);
+    // Fresh generated fixture originals only. Both valid signed byte strings
+    // are fixed BEFORE the backend opens; the seam never touches this journal.
+    (void)Seed(path, hot.signer);
+    {
+        CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+        std::string json;
+        BOOST_REQUIRE(db.Read(std::string{"public-client-v1"}, json));
+        UniValue root;
+        BOOST_REQUIRE(root.read(json));
+        auto first{root["actions"][0]}, second{first};
+        first.pushKV("action_hex", HexStr(*hot_bytes)); first.pushKV("action_id", hot.Id().GetHex());
+        second.pushKV("action_hex", HexStr(*older_bytes)); second.pushKV("action_id", older.Id().GetHex());
+        UniValue actions{UniValue::VARR}; actions.push_back(first); actions.push_back(second);
+        root.pushKV("actions", std::move(actions));
+        db.Write(std::string{"public-client-v1"}, root.write(), true); // Throws on failed synchronous write.
+    }
+    ScriptedEndpoint validator;
+    auto row{MarketRow(std::chrono::milliseconds{0})}; row.pushKV("action_outcome_v1", true);
+    validator.markets.push_back(row);
+    const auto [certified, evidence]{OutcomeReceipt(hot)};
+    auto without{WithoutEvidence(certified)}; without.pushKV("outcome_evidence_error", "BUDGET");
+    validator.by_action.emplace(hot.Id().GetHex(), without);
+    validator.by_action.emplace(older.Id().GetHex(), Receipt(older, "unknown"));
+    validator.evidence.pushKV("outcome_evidence", evidence);
+    auto server{Serve(validator)};
+    const auto endpoint{Endpoint(server->Port())};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {endpoint}, path, error)};
+    struct Drain {
+        std::unique_ptr<node::FlowMeshTradingBackend>& client;
+        std::unique_ptr<node::FlowMeshHttpsServer>& server;
+        ~Drain() { client.reset(); if (server) server->Stop(); }
+    } const drain{client, server};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto included{client->ActionStatus(market, hot.Id(), false)};
+    BOOST_REQUIRE(included.certificate_verified && !included.outcome_verified);
+    const auto counts = [&] {
+        std::lock_guard lock{validator.mutex};
+        return std::array<unsigned, 5>{validator.by_action_reads[hot.Id().GetHex()],
+            validator.by_action_reads[older.Id().GetHex()], validator.evidence_reads,
+            validator.submits, validator.waited_submits};
+    };
+    BOOST_REQUIRE((counts() == std::array<unsigned, 5>{1, 0, 0, 0, 0}));
+    const auto fixed{Poll::Clock::now() + std::chrono::minutes{10}};
+    node::test::FlowMeshPollObservation observation;
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, fixed, true, observation));
+    BOOST_REQUIRE_EQUAL(observation.attempts, 2U);
+    BOOST_REQUIRE(!observation.can_attempt);
+    // Actual ActionStatus, not an injected demand, queues the older original.
+    const auto queued{client->ActionStatus(market, older.Id(), false)};
+    BOOST_CHECK(queued.action_id == older.Id() && !queued.certificate_verified);
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, fixed, false, observation));
+    BOOST_REQUIRE_EQUAL(observation.demands, 1U);
+    BOOST_REQUIRE_EQUAL(observation.attempts, 2U);
+    BOOST_REQUIRE((counts() == std::array<unsigned, 5>{1, 0, 0, 0, 0}));
+    // One existing refill, no reset/refund/global clock override. Later real
+    // scheduler calls clamp to this monotonic future instant, so no TLS/fsync
+    // timing can manufacture another token while the fixture drains.
+    const auto one{fixed + Poll::REFILL_INTERVAL};
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, one, false, observation));
+    BOOST_REQUIRE(observation.can_attempt);
+    const auto yielded{client->ActionStatus(market, hot.Id(), false)};
+    BOOST_CHECK(yielded.action_id == hot.Id()); // Never expose the selected OTHER action's card.
+    BOOST_CHECK(yielded.account_id == hot.signer);
+    BOOST_CHECK(yielded.certificate_verified && !yielded.outcome_verified);
+    BOOST_CHECK(yielded.microblock_hash == included.microblock_hash);
+    // INTENDED BEFORE: UpgradeOutcome spends this token on evidence and
+    // leaves the older queued status unread (counts instead become 1,0,1).
+    const auto first_counts{counts()};
+    BOOST_TEST_CONTEXT("actual [hot,older,evidence,submit,waited_submit] = [" << first_counts[0] << ',' << first_counts[1]
+                       << ',' << first_counts[2] << ',' << first_counts[3] << ',' << first_counts[4] << ']') {
+        BOOST_CHECK_MESSAGE((first_counts == std::array<unsigned, 5>{1, 1, 0, 0, 0}),
+            "Hot included outcome evidence overtook an older unresolved FIFO demand");
+    }
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, one, false, observation));
+    BOOST_CHECK_EQUAL(observation.demands, 1U); // Hot's coalesced outcome demand remains at the back.
+    BOOST_CHECK_EQUAL(observation.attempts, 3U);
+    const auto coalesced{client->ActionStatus(market, hot.Id(), false)};
+    BOOST_CHECK(coalesced.certificate_verified && !coalesced.outcome_verified);
+    BOOST_CHECK((counts() == std::array<unsigned, 5>{1, 1, 0, 0, 0}));
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, one, false, observation));
+    BOOST_CHECK_EQUAL(observation.demands, 1U); BOOST_CHECK_EQUAL(observation.attempts, 3U);
+    // Fresh caller demand services that SAME included original next; evidence
+    // is charged once plus its unchanged extra endpoint token.
+    const auto two{fixed + 2 * Poll::REFILL_INTERVAL};
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, two, false, observation));
+    const auto upgraded{client->ActionStatus(market, hot.Id(), false)};
+    BOOST_REQUIRE(upgraded.certificate_verified && upgraded.outcome_verified && upgraded.outcome);
+    BOOST_CHECK(upgraded.action_id == hot.Id() && upgraded.microblock_hash == included.microblock_hash);
+    BOOST_CHECK_EQUAL(upgraded.outcome->evidence, "certified_result_preimage");
+    BOOST_CHECK((counts() == std::array<unsigned, 5>{1, 1, 1, 0, 0}));
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, two, false, observation));
+    BOOST_CHECK_EQUAL(observation.demands, 0U); BOOST_CHECK_EQUAL(observation.attempts, 5U);
+    // Completed outcome reads neither consume a token nor remove/steal another
+    // original's queue position. The next actual unresolved read still progresses.
+    (void)client->ActionStatus(market, older.Id(), false);
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, two, false, observation));
+    BOOST_REQUIRE_EQUAL(observation.demands, 1U);
+    const auto three{fixed + 3 * Poll::REFILL_INTERVAL};
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, three, false, observation));
+    BOOST_REQUIRE(observation.can_attempt);
+    const auto terminal{client->ActionStatus(market, hot.Id(), false)};
+    BOOST_CHECK(terminal.certificate_verified && terminal.outcome_verified);
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, three, false, observation));
+    BOOST_CHECK_EQUAL(observation.demands, 1U); BOOST_CHECK_EQUAL(observation.attempts, 5U);
+    BOOST_CHECK(observation.can_attempt);
+    const auto observed{client->ActionStatus(market, older.Id(), false)};
+    BOOST_CHECK(observed.action_id == older.Id() && !observed.certificate_verified);
+    BOOST_CHECK((counts() == std::array<unsigned, 5>{1, 2, 1, 0, 0}));
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, three, false, observation));
+    BOOST_CHECK_EQUAL(observation.demands, 0U); BOOST_CHECK_EQUAL(observation.attempts, 6U);
+    const auto saved{client->SavedActions(hot.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 2U);
+    for (const auto& original : saved) {
+        BOOST_CHECK(original.may_have_been_sent);
+        const bool is_hot{original.receipt.action_id == hot.Id()};
+        BOOST_CHECK_EQUAL(original.signed_bytes_sha256, Sha256Hex(is_hot ? *hot_bytes : *older_bytes));
+        BOOST_CHECK_EQUAL(original.signed_bytes_size, (is_hot ? hot_bytes : older_bytes)->size());
+        BOOST_CHECK_EQUAL(original.previously_certified, is_hot);
+    }
+    client.reset();
+    const auto hot_row{DurableRow(path, hot)}, older_row{DurableRow(path, older)};
+    BOOST_CHECK(hot_row["previously_certified"].isTrue());
+    BOOST_CHECK(hot_row["may_have_been_sent"].isTrue() && older_row["may_have_been_sent"].isTrue());
+    BOOST_CHECK_EQUAL(hot_row["action_hex"].get_str(), HexStr(*hot_bytes));
+    BOOST_CHECK_EQUAL(older_row["action_hex"].get_str(), HexStr(*older_bytes));
+    BOOST_CHECK((counts() == std::array<unsigned, 5>{1, 2, 1, 0, 0}));
+}
+
+BOOST_AUTO_TEST_CASE(unresolved_caller_services_older_included_outcome_without_misattribution_or_resubmission)
+{
+    using Poll = node::FlowMeshClientPollScheduler;
+    // Native fixtures enable BENCH by default. Keep it OFF through all
+    // measured calls and client/server drainage, then restore exact logger
+    // settings. This guard is declared before every network object's owner.
+    struct BenchScope {
+        BCLog::CategoryMask mask{LogInstance().GetCategoryMask()};
+        decltype(LogInstance().CategoryLevels()) levels{LogInstance().CategoryLevels()};
+        BenchScope() { LogInstance().DisableCategory(BCLog::BENCH); }
+        ~BenchScope()
+        {
+            try {
+                LogInstance().SetCategoryLogLevel(levels);
+                LogInstance().DisableCategory(BCLog::ALL);
+                LogInstance().EnableCategory(static_cast<BCLog::LogFlags>(mask));
+            } catch (...) {}
+        }
+    } const bench_scope;
+    const fs::path path{m_path_root / "other-outcome-fifo-client"};
+    const auto older{SignedCancel(3)}, newer{SignedCancel(4)};
+    const auto older_bytes{flowmesh::EncodeProductionActionPayload(older)};
+    const auto newer_bytes{flowmesh::EncodeProductionActionPayload(newer)};
+    BOOST_REQUIRE(older_bytes && newer_bytes);
+    (void)Seed(path, older.signer);
+    {
+        CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+        std::string json; BOOST_REQUIRE(db.Read(std::string{"public-client-v1"}, json));
+        UniValue root; BOOST_REQUIRE(root.read(json));
+        auto first{root["actions"][0]}, second{first};
+        first.pushKV("action_hex", HexStr(*older_bytes)); first.pushKV("action_id", older.Id().GetHex());
+        second.pushKV("action_hex", HexStr(*newer_bytes)); second.pushKV("action_id", newer.Id().GetHex());
+        UniValue actions{UniValue::VARR}; actions.push_back(first); actions.push_back(second);
+        root.pushKV("actions", std::move(actions));
+        db.Write(std::string{"public-client-v1"}, root.write(), true); // Throws on failed synchronous write.
+    }
+    ScriptedEndpoint validator;
+    auto row{MarketRow(std::chrono::milliseconds{0})}; row.pushKV("action_outcome_v1", true);
+    validator.markets.push_back(row);
+    const auto [certified, evidence]{OutcomeReceipt(older)};
+    auto without{WithoutEvidence(certified)}; without.pushKV("outcome_evidence_error", "BUDGET");
+    validator.by_action.emplace(older.Id().GetHex(), without);
+    validator.by_action.emplace(newer.Id().GetHex(), Receipt(newer, "unknown"));
+    validator.evidence.pushKV("outcome_evidence", evidence);
+    auto server{Serve(validator)};
+    const auto endpoint{Endpoint(server->Port())};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {endpoint}, path, error)};
+    struct Drain {
+        std::unique_ptr<node::FlowMeshTradingBackend>& client;
+        std::unique_ptr<node::FlowMeshHttpsServer>& server;
+        ~Drain() { client.reset(); if (server) server->Stop(); }
+    } const drain{client, server};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto included{client->ActionStatus(market, older.Id(), false)};
+    BOOST_REQUIRE(included.certificate_verified && !included.outcome_verified);
+    const auto counts = [&] {
+        std::lock_guard lock{validator.mutex};
+        return std::array<unsigned, 5>{validator.by_action_reads[older.Id().GetHex()],
+            validator.by_action_reads[newer.Id().GetHex()], validator.evidence_reads,
+            validator.submits, validator.waited_submits};
+    };
+    const auto fixed{Poll::Clock::now() + std::chrono::minutes{10}};
+    node::test::FlowMeshPollObservation observation;
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, fixed, true, observation));
+    const auto queued{client->ActionStatus(market, older.Id(), false)};
+    BOOST_CHECK(queued.action_id == older.Id() && queued.certificate_verified && !queued.outcome_verified);
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, fixed, false, observation));
+    BOOST_CHECK_EQUAL(observation.demands, 1U); // BEFORE drops this included demand instead of queuing it.
+    BOOST_REQUIRE((counts() == std::array<unsigned, 5>{1, 0, 0, 0, 0}));
+    BOOST_REQUIRE(node::test::StageFlowMeshPollForTest(*client, fixed + Poll::REFILL_INTERVAL, false, observation));
+    BOOST_REQUIRE(observation.can_attempt);
+    // Existing opt-in memory capture only, with synchronous BENCH logging off.
+    // No new inner span or per-event production logging is introduced.
+    BOOST_REQUIRE(!node::FlowMeshTimingRecording());
+    BOOST_REQUIRE(!LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug));
+    interfaces::FlowMeshActionReceipt own;
+    std::vector<UniValue> spans;
+    {
+        TimingCapture timing;
+        own = client->ActionStatus(market, newer.Id(), false);
+        spans = timing.Stop("ActionStatus");
+    }
+    BOOST_CHECK(own.action_id == newer.Id() && own.account_id == newer.signer);
+    BOOST_CHECK(!own.certificate_verified && !own.outcome_verified && !own.outcome);
+    const auto actual{counts()};
+    BOOST_TEST_CONTEXT("actual [older,newer,evidence,submit,waited_submit] = [" << actual[0] << ',' << actual[1]
+                       << ',' << actual[2] << ',' << actual[3] << ',' << actual[4] << ']') {
+        BOOST_CHECK_MESSAGE((actual == std::array<unsigned, 5>{1, 0, 1, 0, 0}),
+            "Newer unresolved caller did not service the older included outcome demand");
+    }
+    BOOST_REQUIRE_EQUAL(spans.size(), 1U);
+    const auto& span{spans.front()};
+    BOOST_CHECK_EQUAL(span["action_id"].get_str(), newer.Id().GetHex());
+    BOOST_CHECK(span["automatic_status_fifo_version"].isNum());
+    if (span["automatic_status_fifo_version"].isNum()) BOOST_CHECK_EQUAL(span["automatic_status_fifo_version"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK(span["automatic_status_fifo_selection"].isNum());
+    if (span["automatic_status_fifo_selection"].isNum()) BOOST_CHECK_EQUAL(span["automatic_status_fifo_selection"].getInt<uint64_t>(), 3U);
+    BOOST_CHECK(span["poll_selected_market_id"].isStr() && span["poll_selected_action_id"].isStr());
+    if (span["poll_selected_market_id"].isStr()) BOOST_CHECK_EQUAL(span["poll_selected_market_id"].get_str(), market.GetHex());
+    if (span["poll_selected_action_id"].isStr()) BOOST_CHECK_EQUAL(span["poll_selected_action_id"].get_str(), older.Id().GetHex());
+    for (const auto* field : {"outcome_upgrade_decision", "outcome_upgrade_proof_bytes", "outcome_upgrade_endpoint", "outcome_upgrade_advertised"})
+        BOOST_CHECK_MESSAGE(!span.exists(field), "OTHER outcome fields must not be attributed to this unresolved caller");
+    const auto saved{client->SavedActions(older.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 2U);
+    const auto upgraded{std::find_if(saved.begin(), saved.end(), [&](const auto& item) { return item.receipt.action_id == older.Id(); })};
+    BOOST_REQUIRE(upgraded != saved.end());
+    BOOST_CHECK(upgraded->previously_certified && upgraded->receipt.certificate_verified && upgraded->receipt.outcome_verified);
+    BOOST_REQUIRE(upgraded->receipt.outcome);
+    BOOST_CHECK_EQUAL(upgraded->receipt.outcome->evidence, "certified_result_preimage");
+    BOOST_CHECK_EQUAL(upgraded->signed_bytes_sha256, Sha256Hex(*older_bytes));
+    client.reset(); // Close journal before inspecting durable restart obligations.
+    const auto durable{DurableRow(path, older)}, unresolved{DurableRow(path, newer)};
+    BOOST_CHECK(durable["previously_certified"].isTrue());
+    BOOST_CHECK(durable["may_have_been_sent"].isTrue() && unresolved["may_have_been_sent"].isTrue());
+    BOOST_CHECK_EQUAL(durable["action_hex"].get_str(), HexStr(*older_bytes));
+    BOOST_CHECK_EQUAL(unresolved["action_hex"].get_str(), HexStr(*newer_bytes));
+    // Pure outcome text is intentionally digest-skipped and never restored.
+    // Restart must retain exact originals/no-resubmit, NOT invent verification.
+    auto restarted{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {endpoint}, path, error)};
+    BOOST_REQUIRE_MESSAGE(restarted, error);
+    const auto restored{restarted->SavedActions(older.signer, market)};
+    BOOST_REQUIRE_EQUAL(restored.size(), 2U);
+    for (const auto& original : restored) {
+        const bool was_included{original.receipt.action_id == older.Id()};
+        BOOST_CHECK_EQUAL(original.previously_certified, was_included);
+        BOOST_CHECK(!original.receipt.certificate_verified && !original.receipt.outcome_verified);
+        BOOST_CHECK_EQUAL(original.signed_bytes_sha256, Sha256Hex(was_included ? *older_bytes : *newer_bytes));
+    }
+    BOOST_CHECK((counts() == actual)); // Reopen is retention-only; zero network/resend.
 }
 
 BOOST_AUTO_TEST_CASE(outcome_upgrade_at_most_once_per_endpoint)

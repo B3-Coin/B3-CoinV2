@@ -292,6 +292,45 @@ BOOST_AUTO_TEST_CASE(duplicate_demand_and_observation_storage_are_bounded)
     BOOST_CHECK_EQUAL(poll.DemandCount(), Poll::MAX_KEYS);
 }
 
+BOOST_AUTO_TEST_CASE(mixed_status_and_outcome_demand_keeps_fifo_bounds_and_nonrefunding_removal)
+{
+    Poll poll;
+    const Poll::TimePoint start{};
+    const auto older{Key(1, 7)}, included{Key(2, 7)};
+    BOOST_REQUIRE(poll.TryChargeAttempt(start));
+    BOOST_REQUIRE(poll.TryChargeAttempt(start));
+    BOOST_REQUIRE(poll.Demand(older));
+    BOOST_REQUIRE(poll.Demand(included));
+    for (unsigned repeat{0}; repeat < 1000; ++repeat) BOOST_REQUIRE(poll.Demand(included));
+    BOOST_CHECK_EQUAL(poll.KeyCount(), 2U); BOOST_CHECK_EQUAL(poll.DemandCount(), 2U);
+    BOOST_CHECK(!poll.Take(start));
+    const auto one{start + Poll::REFILL_INTERVAL};
+    const auto selected{poll.Take(one)};
+    BOOST_REQUIRE(selected); BOOST_CHECK(*selected == older);
+    BOOST_REQUIRE(poll.TryChargeAttempt(one));
+    BOOST_REQUIRE(poll.MarkObserved(older));
+    BOOST_CHECK_EQUAL(poll.DemandCount(), 1U);
+    BOOST_REQUIRE(poll.Demand(included)); // Repeated hot caller preserves its existing position.
+    BOOST_CHECK_EQUAL(poll.DemandCount(), 1U);
+    poll.Remove(older); // Caller retired/evicted this key; no budget refund.
+    BOOST_CHECK_EQUAL(poll.AttemptsInWindow(one), 3U);
+    BOOST_CHECK(!poll.CanAttempt(one));
+    const auto two{start + 2 * Poll::REFILL_INTERVAL};
+    const auto outcome{poll.Take(two)};
+    BOOST_REQUIRE(outcome); BOOST_CHECK(*outcome == included);
+    BOOST_REQUIRE(poll.TryChargeAttempt(two));
+    poll.RecordExtraCost(two, 1); // Unchanged outcome evidence part cost.
+    poll.Remove(included);
+    BOOST_CHECK_EQUAL(poll.KeyCount(), 0U); BOOST_CHECK_EQUAL(poll.DemandCount(), 0U);
+    BOOST_CHECK_EQUAL(poll.AttemptsInWindow(two), 5U);
+    BOOST_CHECK(!poll.CanAttempt(two));
+    // Missing/stale key cleanup likewise cannot manufacture a fresh token.
+    poll.Remove(Key(99, 99));
+    BOOST_CHECK_EQUAL(poll.AttemptsInWindow(two), 5U);
+    BOOST_REQUIRE(poll.Demand(included));
+    BOOST_CHECK(!poll.Take(two));
+}
+
 BOOST_AUTO_TEST_CASE(clock_rollback_does_not_refill_or_reset_automatic_allowance)
 {
     Poll poll;

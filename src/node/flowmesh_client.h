@@ -114,6 +114,19 @@ std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
 //! between the two. Empty clears it. False for a backend that is not remote.
 bool SetFlowMeshLaneSubmissionFaultForTest(FlowMeshTradingBackend& backend, std::function<void()> fault);
 
+namespace test {
+//! Generated-regtest fixture only, never an RPC/operator clock or budget knob.
+//! Advances this backend's existing volatile scheduler monotonically; optional
+//! burst exhaustion spends existing tokens, never resets/refunds/increases them.
+struct FlowMeshPollObservation {
+    size_t keys{0}, demands{0}, attempts{0};
+    bool can_attempt{false};
+};
+bool StageFlowMeshPollForTest(FlowMeshTradingBackend& backend,
+                             std::chrono::steady_clock::time_point now,
+                             bool exhaust_burst, FlowMeshPollObservation& observation);
+} // namespace test
+
 //! Node-local latency policy for the restricted API's bounded 'action' wait,
 //! never consensus. A zero max or zero waiters disables it: no capability is
 //! advertised and 'action' keeps its exact previous request contract.

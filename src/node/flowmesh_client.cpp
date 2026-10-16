@@ -17,6 +17,7 @@
 #include <node/flowmesh_health.h>
 
 #include <chain.h>
+#include <chainparams.h>
 #include <consensus/flowmesh_params.h>
 #include <crypto/common.h>
 #include <crypto/sha256.h>
@@ -3203,18 +3204,18 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     //! the retained proof RecheckActionAuthority just re-verified.
     //! Diagnostics use the caller's existing outer span (emits after work
     //! unlock), never construct an inner emitting span while m_work is held.
-    void UpgradeOutcome(Pending& p, FlowMeshTimingSpan* timing = nullptr)
+    std::optional<size_t> OutcomeUpgradeEndpoint(Pending& p, FlowMeshTimingSpan* timing = nullptr)
     {
         const auto decision = [&](const uint64_t value) noexcept {
             if (timing) timing->Field("outcome_upgrade_decision", value);
         };
         if (timing) timing->Field("outcome_upgrade_proof_bytes", uint64_t{p.inclusion_proof.size()});
-        if (!p.receipt.certificate_verified) { decision(1); return; }
-        if (p.receipt.outcome_verified) { decision(2); return; }
-        if (p.inclusion_proof.empty()) { decision(3); return; }
+        if (!p.receipt.certificate_verified) { decision(1); return std::nullopt; }
+        if (p.receipt.outcome_verified) { decision(2); return std::nullopt; }
+        if (p.inclusion_proof.empty()) { decision(3); return std::nullopt; }
         const auto found{std::find_if(m_endpoints.begin(), m_endpoints.end(),
                                       [&](const auto& endpoint) { return endpoint.url == p.receipt.endpoint; })};
-        if (found == m_endpoints.end()) { decision(4); return; }
+        if (found == m_endpoints.end()) { decision(4); return std::nullopt; }
         const size_t endpoint{static_cast<size_t>(std::distance(m_endpoints.begin(), found))};
         if (timing) {
             timing->Field("outcome_upgrade_endpoint", uint64_t{endpoint});
@@ -3224,13 +3225,28 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             if (p.receipt.reason_code.empty()) {
                 p.receipt.reason_code = std::string{flowmesh::ActionReasonName(flowmesh::ActionReasonCode::OUTCOME_NOT_OFFERED)};
             }
-            decision(5); return;
+            decision(5); return std::nullopt;
         }
         auto& attempt{p.outcome_upgrade_attempts.at(endpoint)};
         const auto now{std::chrono::steady_clock::now()};
-        if (attempt.terminal_asked) { decision(6); return; }
-        if (now < m_retry_after.at(endpoint)) { decision(7); return; }
-        if (now < attempt.retry_after) { decision(8); return; }
+        if (attempt.terminal_asked) { decision(6); return std::nullopt; }
+        if (now < m_retry_after.at(endpoint)) { decision(7); return std::nullopt; }
+        if (now < attempt.retry_after) { decision(8); return std::nullopt; }
+        return endpoint;
+    }
+    //! Only the owner selected by the existing automatic FIFO calls this.
+    //! Selection itself never charges: this keeps the existing per-attempt
+    //! and evidence-part charges, terminal markers and cooldown unchanged.
+    void UpgradeOutcome(Pending& p, FlowMeshTimingSpan* timing = nullptr)
+    {
+        const auto endpoint_ready{OutcomeUpgradeEndpoint(p, timing)};
+        if (!endpoint_ready) return;
+        const size_t endpoint{*endpoint_ready};
+        auto& attempt{p.outcome_upgrade_attempts.at(endpoint)};
+        const auto now{std::chrono::steady_clock::now()};
+        const auto decision = [&](const uint64_t value) noexcept {
+            if (timing) timing->Field("outcome_upgrade_decision", value);
+        };
         if (!m_action_polls.TryChargeAttempt(now)) { decision(9); return; }
         attempt.terminal_asked = true; // Before any transport or throwing parse.
         decision(10);
@@ -3962,6 +3978,25 @@ public:
     uint64_t MetadataGeneration() const override { return m_metadata_generation.load(std::memory_order_acquire); }
     //! See SetFlowMeshLaneSubmissionFaultForTest. Set before the calls it covers.
     void SetLaneSubmissionFaultForTest(std::function<void()> fault) { m_lane_submission_fault_for_test = std::move(fault); }
+    bool StagePollForTest(const std::chrono::steady_clock::time_point now, const bool exhaust_burst,
+                         test::FlowMeshPollObservation& observation)
+    {
+        // Only a generated regtest fixture calls the non-RPC test wrapper.
+        // Bound its scalar future time so real subsequent calls deterministically
+        // clamp to that instant. No global clock, replacement/reset scheduler,
+        // pending-object mutation, persistence, callback or transport is involved.
+        const auto actual{std::chrono::steady_clock::now()};
+        if (m_chainman.GetParams().GetChainType() != ChainType::REGTEST ||
+            now < actual + std::chrono::minutes{5} || now > actual + std::chrono::minutes{15}) return false;
+        WorkLock work{*this};
+        bool ok{true};
+        if (exhaust_burst) ok = m_action_polls.TryChargeAttempt(now) && m_action_polls.TryChargeAttempt(now);
+        observation.keys = m_action_polls.KeyCount();
+        observation.demands = m_action_polls.DemandCount();
+        observation.attempts = m_action_polls.AttemptsInWindow(now);
+        observation.can_attempt = m_action_polls.CanAttempt(now);
+        return ok;
+    }
 private:
     //! Test only (never set by the node): called by a lane submission after
     //! its request, before it takes m_work to apply the reply.
@@ -4768,12 +4803,18 @@ public:
         const auto it{m_pending.find({market, action})};
         if (it == m_pending.end()) { out.reason = "No retained local signed object; action outcome is unknown"; return out; }
         out.account_id = it->second.owner_account;
+        // New opt-in diagnostic vocabulary; absence means the frozen legacy
+        // dispatch, not this mixed FIFO. No timer, authority or wire change.
+        timing_lock_1293.Field("automatic_status_fifo_version", uint64_t{1});
         try {
             // Never use polling coalescence to preserve a stale authority label.
             (void)RecheckActionAuthority(it->second);
-            if (it->second.receipt.certificate_verified) {
+            const bool outcome_demand{it->second.receipt.certificate_verified};
+            if (outcome_demand && !OutcomeUpgradeEndpoint(it->second, &timing_lock_1293)) {
+                // No usable outcome read is demanded: completed/unoffered,
+                // terminal, missing-proof/endpoint and cooldown cases cannot
+                // leave a stale FIFO blocker or spend another key's token.
                 m_action_polls.Remove(it->first);
-                UpgradeOutcome(it->second, &timing_lock_1293);
                 SaveVerifiedRestartState(it->second);
                 return it->second.receipt;
             }
@@ -4783,12 +4824,27 @@ public:
                 return it->second.receipt;
             }
             auto refresh = [&](Pending& pending, bool automatic) {
-                try { QueryAction(pending, automatic); } catch (const std::exception& e) {
+                try {
+                    if (automatic && pending.receipt.certificate_verified) {
+                        // The selected key may belong to a different caller.
+                        // Recheck its own authority before fetching outcome
+                        // evidence, and make binding restart obligations durable.
+                        (void)RecheckActionAuthority(pending);
+                        if (pending.receipt.certificate_verified) {
+                            // Legacy upgrade fields belong to the outer caller.
+                            // Never attribute another key's evidence to it.
+                            UpgradeOutcome(pending, &pending == &it->second ? &timing_lock_1293 : nullptr);
+                            SaveVerifiedRestartState(pending);
+                            return;
+                        }
+                    }
+                    QueryAction(pending, automatic);
+                } catch (const std::exception& e) {
                     pending.receipt.reason = e.what();
                     if (pending.previously_certified || pending.not_executed) WithdrawVerifiedLabels(pending.receipt);
                 }
             };
-            if (retry) {
+            if (retry && !outcome_demand) {
                 refresh(it->second, false);
                 // A fresh status lookup already occurred. Do not repeat it in
                 // Send's no-resubmit path for a previously certified or
@@ -4801,18 +4857,45 @@ public:
                     p.receipt.reason = CLIENT_NOT_EXECUTED_RETAINED;
                 return p.receipt;
             }
+            // A verified inclusion's eligible outcome-only read joins this
+            // SAME bounded FIFO, including an explicit retry of that already
+            // included original. It never becomes Send or a new instruction.
             if (!m_action_polls.Demand(it->first)) Fail("Automatic status demand bound reached; retained instruction preserved");
             bool own_refresh{false};
+            bool serviced_other{false};
+            bool selected_demand{false};
+            uint64_t fifo_selection{1}; // Queued, but no budget: Take charges nothing.
             if (const auto key{m_action_polls.Take(std::chrono::steady_clock::now())}) {
+                selected_demand = true;
                 // Fair bounded work across callers/markets. Only the caller's
                 // own receipt below is returned, never another wallet's card.
                 const auto work{m_pending.find(*key)};
                 if (work != m_pending.end()) {
                     own_refresh = *key == it->first;
+                    serviced_other = !own_refresh;
+                    fifo_selection = own_refresh ? 2 : 3;
+                    timing_lock_1293.Field("poll_selected_market_id", key->first);
+                    timing_lock_1293.Field("poll_selected_action_id", key->second);
                     refresh(work->second, true);
                     if (work->second.receipt.certificate_verified || ProvenNotExecuted(work->second)) m_action_polls.Remove(*key);
-                } else m_action_polls.Remove(*key);
+                } else {
+                    fifo_selection = 4; // Missing retired owner, no transport.
+                    m_action_polls.Remove(*key);
+                }
             }
+            timing_lock_1293.Field("automatic_status_fifo_selection", fifo_selection);
+            if (outcome_demand && !own_refresh) {
+                // Code9 retains its old meaning: the budget declined the
+                // caller. Code19 is NEW: a FIFO selection deferred this
+                // caller's outcome, never a body/certificate/nonexecution.
+                timing_lock_1293.Field("outcome_upgrade_decision", uint64_t{selected_demand ? 19U : 9U});
+            }
+            // A different selected key may have waited on transport or evicted
+            // re-fetchable proof bytes. Do not return the caller's previously
+            // verified label without rechecking that caller after that work.
+            if (outcome_demand && serviced_other) (void)RecheckActionAuthority(it->second);
+            if (it->second.receipt.certificate_verified || ProvenNotExecuted(it->second))
+                SaveVerifiedRestartState(it->second);
             auto receipt{it->second.receipt};
             const bool settled{receipt.certificate_verified || ProvenNotExecuted(it->second)};
             if (!settled && !m_action_polls.HasObservation(it->first))
@@ -4968,6 +5051,13 @@ bool SetFlowMeshLaneSubmissionFaultForTest(FlowMeshTradingBackend& backend, std:
     if (!remote) return false;
     remote->SetLaneSubmissionFaultForTest(std::move(fault));
     return true;
+}
+bool test::StageFlowMeshPollForTest(FlowMeshTradingBackend& backend,
+                                   const std::chrono::steady_clock::time_point now,
+                                   const bool exhaust_burst, FlowMeshPollObservation& observation)
+{
+    auto* const remote{dynamic_cast<RemoteBackend*>(&backend)};
+    return remote && remote->StagePollForTest(now, exhaust_burst, observation);
 }
 UniValue FlowMeshClientUpdatesPageJson(const flowmesh::ClientEventPage& page)
 {
