@@ -43,7 +43,8 @@ if(BUILD_FLOWMESH2)
   # core/: deterministic value types, codecs, tagged hashes, the provisional
   # profile, the error model and code registries, signed actions, slot
   # bodies, outcomes, facts, certificates, seat sets, the account leaf and
-  # the shared nonce and fee spec functions. bitcoin_consensus provides hash.cpp, uint256.cpp and pubkey.cpp
+  # the shared nonce and fee spec functions, and the commitment v0 value
+  # types (state_root). bitcoin_consensus provides hash.cpp, uint256.cpp and pubkey.cpp
   # (XOnlyPubKey::VerifySchnorr); bitcoin_crypto provides SHA-256 and BLS;
   # secp256k1 is the BIP340 verifier behind pubkey.cpp.
   add_library(fm2_types STATIC
@@ -65,6 +66,7 @@ if(BUILD_FLOWMESH2)
     core/result.cpp
     core/seat_set.cpp
     core/slot.cpp
+    core/state_root.cpp
   )
   target_link_libraries(fm2_types
     PRIVATE
@@ -118,6 +120,7 @@ if(BUILD_FLOWMESH2)
     test/result_tests.cpp
     test/seat_set_tests.cpp
     test/slot_tests.cpp
+    test/state_root_tests.cpp
     test/stub_inventory_tests.cpp
   )
   # bitcoin_common only for CKey (test/util/keys.h signs with test keys); the
