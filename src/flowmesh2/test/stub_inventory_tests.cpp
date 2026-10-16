@@ -1,0 +1,198 @@
+// Copyright (c) 2026 The B3 developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+/** Stub inventory: one Boost case per outline stub, plus the self-check.
+ *
+ * Every typed stub in non-test fm2 code (`return NotImplemented("<ID>");` or
+ * `return Unsupported("<ID>");`, tagged `// TODO(rebirth:<ID>)`) gets exactly
+ * one case here, written as
+ *
+ *     FM2_STUB_CASE(M2_LED_05, "M2-LED-05")
+ *     {
+ *         LedgerState ledger{...};
+ *         return Observe(ledger.RequestWithdrawal(...));
+ *     }
+ *
+ * The case name is the task ID with '-' replaced by '_'. The case passes only
+ * if the probe returns an error whose code is NOT_IMPLEMENTED or UNSUPPORTED
+ * and whose detail is exactly the task ID: a stub can never fake success.
+ * When Codex finishes a task it deletes the stub, its tag, its case here and
+ * its line in INVENTORY.txt in one commit (TODO.md rule 3).
+ *
+ * Certified typed refusals (an OutcomeCode such as
+ * REJ_RESIDUAL_CROSS_UNSUPPORTED) are covered by the slice that adds them.
+ *
+ * Slice R1 adds the registry and its self-check only; no stub exists yet.
+ */
+
+#include <boost/test/unit_test.hpp>
+
+#include <flowmesh2/core/result.h>
+
+#include <exception>
+#include <functional>
+#include <optional>
+#include <set>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace flowmesh2::test {
+
+//! What one stub probe returned.
+struct StubObservation {
+    bool succeeded{false};
+    std::optional<Error> error;
+};
+
+template <class T>
+StubObservation Observe(const Result<T>& result)
+{
+    if (result.has_value()) return StubObservation{true, std::nullopt};
+    return StubObservation{false, result.error()};
+}
+inline StubObservation Observe(const Error& error) { return StubObservation{false, error}; }
+
+struct StubEntry {
+    std::string_view task_id;
+    std::string_view case_name;
+    std::function<StubObservation()> probe;
+};
+
+std::vector<StubEntry>& StubRegistry()
+{
+    static std::vector<StubEntry> registry;
+    return registry;
+}
+
+struct StubRegistrar {
+    //! TaskId is consteval: a malformed ID literal does not compile.
+    StubRegistrar(TaskId task, std::string_view case_name, std::function<StubObservation()> probe)
+    {
+        StubRegistry().push_back(StubEntry{task.View(), case_name, std::move(probe)});
+    }
+};
+
+std::string ExpectedCaseName(std::string_view task_id)
+{
+    std::string name{task_id};
+    for (char& c : name) {
+        if (c == '-') c = '_';
+    }
+    return name;
+}
+
+//! Every problem of every entry; empty means the inventory is consistent.
+std::vector<std::string> InventoryProblems(std::span<const StubEntry> entries)
+{
+    std::vector<std::string> problems;
+    std::set<std::string_view> seen;
+    for (const auto& entry : entries) {
+        const std::string id{entry.task_id};
+        if (!IsWellFormedTaskId(entry.task_id)) problems.push_back(id + ": malformed task id");
+        if (!seen.insert(entry.task_id).second) problems.push_back(id + ": duplicate task id");
+        if (entry.case_name != ExpectedCaseName(entry.task_id)) {
+            problems.push_back(id + ": case name " + std::string{entry.case_name} + " should be " + ExpectedCaseName(entry.task_id));
+        }
+        StubObservation observed;
+        try {
+            observed = entry.probe();
+        } catch (const std::exception& e) {
+            problems.push_back(id + ": probe threw " + e.what());
+            continue;
+        } catch (...) {
+            problems.push_back(id + ": probe threw a non-standard exception");
+            continue;
+        }
+        if (observed.succeeded || !observed.error.has_value()) {
+            problems.push_back(id + ": stub returned success");
+            continue;
+        }
+        const Error& error{*observed.error};
+        if (error.code != ErrorCode::NOT_IMPLEMENTED && error.code != ErrorCode::UNSUPPORTED) {
+            problems.push_back(id + ": code " + std::string{ToString(error.code)} + " is not NOT_IMPLEMENTED or UNSUPPORTED");
+        }
+        if (error.detail != entry.task_id) {
+            problems.push_back(id + ": detail '" + std::string{error.detail} + "' is not the task id");
+        }
+    }
+    return problems;
+}
+
+std::string Join(const std::vector<std::string>& lines)
+{
+    std::string out;
+    for (const auto& line : lines) out += line + "\n";
+    return out;
+}
+
+void CheckOneStub(std::string_view case_name)
+{
+    std::vector<StubEntry> matching;
+    for (const auto& entry : StubRegistry()) {
+        if (entry.case_name == case_name) matching.push_back(entry);
+    }
+    BOOST_REQUIRE_EQUAL(matching.size(), 1U);
+    const auto problems{InventoryProblems(matching)};
+    BOOST_CHECK_MESSAGE(problems.empty(), Join(problems));
+}
+
+} // namespace flowmesh2::test
+
+//! Defines the probe, registers it and defines the Boost case; the function
+//! body that follows the macro is the probe. See the file comment.
+#define FM2_STUB_CASE(case_ident, task_literal)                                                       \
+    static flowmesh2::test::StubObservation case_ident##_probe();                                     \
+    static const flowmesh2::test::StubRegistrar case_ident##_registrar{task_literal, #case_ident,     \
+                                                                       &case_ident##_probe};          \
+    BOOST_AUTO_TEST_CASE(case_ident) { flowmesh2::test::CheckOneStub(#case_ident); }                  \
+    static flowmesh2::test::StubObservation case_ident##_probe()
+
+using namespace flowmesh2;
+using namespace flowmesh2::test;
+
+namespace {
+
+// Self-check fixtures. They are NOT stubs: they call NotImplemented() with real
+// ledger IDs only to prove that the checker catches each kind of bad entry.
+StubObservation GoodProbe() { return Observe(Result<int>{NotImplemented("R1")}); }
+StubObservation UnsupportedProbe() { return Observe(Unsupported("R2")); }
+StubObservation FakeSuccessProbe() { return Observe(Result<int>{Ok(1)}); }
+StubObservation FakeVoidSuccessProbe() { return Observe(Result<void>{Ok()}); }
+StubObservation WrongIdProbe() { return Observe(NotImplemented("R2")); }
+StubObservation WrongCodeProbe() { return Observe(Error{ErrorCode::DECODE, "R1"}); }
+StubObservation ThrowingProbe() { throw std::runtime_error{"probe exploded"}; }
+
+size_t ProblemCount(std::vector<StubEntry> entries) { return InventoryProblems(entries).size(); }
+
+} // namespace
+
+BOOST_AUTO_TEST_SUITE(stub_inventory)
+
+BOOST_AUTO_TEST_CASE(registry_selfcheck)
+{
+    const auto problems{InventoryProblems(StubRegistry())};
+    BOOST_CHECK_MESSAGE(problems.empty(), Join(problems));
+    BOOST_TEST_MESSAGE("stub inventory entries: " << StubRegistry().size());
+}
+
+BOOST_AUTO_TEST_CASE(checker_detects_bad_entries)
+{
+    BOOST_CHECK_EQUAL(ProblemCount({{"R1", "R1", GoodProbe}}), 0U);
+    BOOST_CHECK_EQUAL(ProblemCount({{"R2", "R2", UnsupportedProbe}}), 0U);
+    BOOST_CHECK_EQUAL(ProblemCount({{"R1", "R1", GoodProbe}, {"R2", "R2", UnsupportedProbe}}), 0U);
+
+    BOOST_CHECK_EQUAL(ProblemCount({{"R1", "R1", FakeSuccessProbe}}), 1U);
+    BOOST_CHECK_EQUAL(ProblemCount({{"R1", "R1", FakeVoidSuccessProbe}}), 1U);
+    BOOST_CHECK_EQUAL(ProblemCount({{"R1", "R1", WrongIdProbe}}), 1U);
+    BOOST_CHECK_EQUAL(ProblemCount({{"R1", "R1", WrongCodeProbe}}), 1U);
+    BOOST_CHECK_EQUAL(ProblemCount({{"R1", "R1", ThrowingProbe}}), 1U);
+    BOOST_CHECK_EQUAL(ProblemCount({{"R1", "R1", GoodProbe}, {"R1", "R1", GoodProbe}}), 1U);
+    BOOST_CHECK_EQUAL(ProblemCount({{"R1", "R_1", GoodProbe}}), 1U);
+    // A malformed id also mismatches the detail the probe returns.
+    BOOST_CHECK_EQUAL(ProblemCount({{"r1", "r1", GoodProbe}}), 2U);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -122,6 +122,10 @@ option(BUILD_FLOWMESH2_FOUNDATION_TESTS "Build isolated clean-core FlowMesh foun
 if(BUILD_FLOWMESH2_FOUNDATION_TESTS AND NOT BUILD_TESTS)
   message(FATAL_ERROR "BUILD_FLOWMESH2_FOUNDATION_TESTS requires BUILD_TESTS=ON")
 endif()
+option(BUILD_FLOWMESH2 "Build the isolated FlowMesh V2 rebirth outline and its tests, never node integration." OFF)
+if(BUILD_FLOWMESH2 AND NOT (BUILD_TESTS AND BUILD_FLOWMESH2_FOUNDATION_TESTS))
+  message(FATAL_ERROR "BUILD_FLOWMESH2 requires BUILD_TESTS=ON and BUILD_FLOWMESH2_FOUNDATION_TESTS=ON")
+endif()
 option(BUILD_TX "Build b3coin-tx executable." ${BUILD_TESTS})
 option(BUILD_UTIL "Build b3coin-util executable." ${BUILD_TESTS})
 

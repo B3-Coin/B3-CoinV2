@@ -280,7 +280,7 @@ Deterministic directories: `core/`, `ledger/`, `engine/`, `state/`,
   also bans it. `-Werror=unused-result` turns an ignored result into a build
   error. Compile-fail CTests prove both.
 - `ErrorCode` (append-only): `NOT_IMPLEMENTED=1`, `UNSUPPORTED=2`,
-  `UNSUPPORTED_NETWORK=3`, `DECODE=4`, `OVERSIZE=5`, `OVERFLOW=6`,
+  `UNSUPPORTED_NETWORK=3`, `DECODE=4`, `OVERSIZE=5`, `ARITHMETIC_OVERFLOW=6` (O-21),
   `INVARIANT=7`, `ORDER_VIOLATION=8`, `EQUIVOCATION_REFUSED=9`,
   `STORAGE_FATAL=10`, `FENCED=11`, `AUTHORITY_CHANGED=12`, `VERIFY_FAILED=13`,
   `STALE_PARENT=14`, `BUSY=15`, `NEED_DATA=16`, `INVALID_INPUT=17`.
@@ -819,6 +819,7 @@ outline does not resolve on its own.
 | O-18 | [CC]: completed milestones freeze before dependent work | The outline is a skeleton and claims no C-milestone exit |
 | O-19 | Protected gate files | CI workflow, guard lists, inventory floors, C1 hashes, profile JSON and registries are owner-protected (plan §10.5) |
 | O-20 | Header fields | Adds `profile_hash`, `authority_epoch`, `facts_root`; `actions_root` covers the exact original bytes |
+| O-21 | The macOS `<math.h>` defines `OVERFLOW` and `DOMAIN` as macros, so an enumerator or constant with either name breaks any translation unit that includes `<cmath>` first | R1 names error code 6 `ARITHMETIC_OVERFLOW` (integer unchanged). The R3 tag registry must not use a bare `DOMAIN` identifier either (the tag string `B3/FM2/DOMAIN` is unaffected). The R1 tests include `<cmath>` before the fm2 headers to catch this |
 
 ---
 

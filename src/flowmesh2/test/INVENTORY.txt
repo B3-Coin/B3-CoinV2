@@ -1,0 +1,22 @@
+# Inventory of every test_flowmesh2 Boost case, one `suite/case` per line,
+# sorted bytewise. Owner-protected gate file (TODO.md rule 5): add lines with
+# the tests that add cases; removing a line needs an audit and owner sign-off.
+#
+# CTest flowmesh2_inventory (contrib/flowmesh2/check_inventory.py) fails if a
+# listed case is not in the binary, if the binary has an unlisted case, if a
+# case is disabled, or if a listed case did not execute in the full run.
+codes_tests/admission_codes_pinned
+codes_tests/admission_to_string_total
+codes_tests/duplicate_and_admitted_are_not_rejections
+codes_tests/outcome_codes_pinned
+codes_tests/outcome_to_string_total
+result_tests/error_code_to_string_total
+result_tests/error_codes_pinned
+result_tests/error_round_trip
+result_tests/not_implemented_carries_exact_task_id
+result_tests/ok_value_round_trip
+result_tests/ok_void_round_trip
+result_tests/result_has_no_default_success
+result_tests/unsupported_carries_exact_task_id
+stub_inventory/checker_detects_bad_entries
+stub_inventory/registry_selfcheck
