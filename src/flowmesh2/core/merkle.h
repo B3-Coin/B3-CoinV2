@@ -79,6 +79,36 @@ Result<MerkleProof> MerkleProve(std::span<const uint256> leaves, uint64_t index)
  */
 bool MerkleVerify(const uint256& leaf, const MerkleProof& proof, const uint256& root);
 
+/** A Merkle tree that keeps every level (slice R11), so that one O(n) build
+ * pays for O(log n) proofs. It is the tree of MerkleRoot and MerkleProve
+ * (the same leaf, node, root and empty hashes and the same promotion of an
+ * unpaired last node): Root() == MerkleRoot(leaves) and Prove(i) ==
+ * MerkleProve(leaves, i) for every i (merkle_tests checks both for sizes
+ * 0..70). The read views (read/views.h) keep one per committed tree.
+ * Immutable after Build; memory about 2n hashes. Deterministic, no I/O.
+ */
+class MerkleTree
+{
+public:
+    static MerkleTree Build(std::span<const uint256> leaves);
+
+    //! The number of leaves.
+    uint64_t Size() const { return m_size; }
+    //! The committed root, MerkleRoot of the leaves.
+    const uint256& Root() const { return m_root; }
+    //! MerkleProve(leaves, index) from the stored levels; INVALID_INPUT for index >= Size().
+    Result<MerkleProof> Prove(uint64_t index) const;
+
+private:
+    MerkleTree(std::vector<std::vector<uint256>> levels, uint64_t size, const uint256& root);
+
+    //! levels[0] holds the leaf nodes; each next level pairs the previous
+    //! one (an unpaired last node is promoted); the last level has one node.
+    std::vector<std::vector<uint256>> m_levels;
+    uint64_t m_size{0};
+    uint256 m_root;
+};
+
 } // namespace flowmesh2
 
 #endif // B3_FLOWMESH2_CORE_MERKLE_H

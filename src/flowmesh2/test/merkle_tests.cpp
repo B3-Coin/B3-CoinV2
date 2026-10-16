@@ -252,4 +252,36 @@ BOOST_AUTO_TEST_CASE(proof_codec_round_trip_and_cap)
     BOOST_CHECK_EQUAL(ToString(refused.error().code), "OVERSIZE");
 }
 
+BOOST_AUTO_TEST_CASE(tree_levels_give_the_root_and_every_proof)
+{
+    // MerkleTree (slice R11) keeps the levels; it must be the same tree as
+    // MerkleRoot/MerkleProve and the naive RFC 6962 reference.
+    for (size_t n{0}; n <= 70; ++n) {
+        const auto leaves{Leaves(n)};
+        const MerkleTree tree{MerkleTree::Build(leaves)};
+        BOOST_CHECK_EQUAL(tree.Size(), n);
+        BOOST_CHECK_MESSAGE(tree.Root() == MerkleRoot(leaves), "size " << n);
+        BOOST_CHECK_MESSAGE(tree.Root() == RefRoot(leaves), "size " << n);
+        for (size_t i{0}; i < n; ++i) {
+            const auto proof{tree.Prove(i)};
+            BOOST_REQUIRE(proof.has_value());
+            BOOST_CHECK_MESSAGE(*proof == Prove(leaves, i), "size " << n << " index " << i);
+            BOOST_CHECK(proof->path == RefPath(i, leaves));
+            BOOST_CHECK(MerkleVerify(leaves[i], *proof, tree.Root()));
+        }
+        const auto outside{tree.Prove(n)};
+        BOOST_REQUIRE(!outside.has_value());
+        BOOST_CHECK_EQUAL(ToString(outside.error().code), "INVALID_INPUT");
+    }
+    // A larger, non-power-of-two tree: sampled indices, including both ends.
+    const auto leaves{Leaves(1'000)};
+    const MerkleTree tree{MerkleTree::Build(leaves)};
+    BOOST_CHECK(tree.Root() == MerkleRoot(leaves));
+    for (uint64_t i : {uint64_t{0}, uint64_t{1}, uint64_t{511}, uint64_t{512}, uint64_t{767}, uint64_t{998}, uint64_t{999}}) {
+        const auto proof{tree.Prove(i)};
+        BOOST_REQUIRE(proof.has_value());
+        BOOST_CHECK(*proof == Prove(leaves, i));
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

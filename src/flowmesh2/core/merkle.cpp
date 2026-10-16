@@ -105,4 +105,40 @@ bool MerkleVerify(const uint256& leaf, const MerkleProof& proof, const uint256& 
     return sn == 0 && BindRoot(proof.size, r) == root;
 }
 
+MerkleTree::MerkleTree(std::vector<std::vector<uint256>> levels, uint64_t size, const uint256& root)
+    : m_levels{std::move(levels)}, m_size{size}, m_root{root}
+{
+}
+
+MerkleTree MerkleTree::Build(std::span<const uint256> leaves)
+{
+    if (leaves.empty()) return MerkleTree{{}, 0, MerkleRoot(leaves)};
+    std::vector<std::vector<uint256>> levels;
+    levels.push_back(LeafLevel(leaves));
+    while (levels.back().size() > 1) {
+        std::vector<uint256> next{levels.back()};
+        NextLevel(next);
+        levels.push_back(std::move(next));
+    }
+    const uint256 root{BindRoot(leaves.size(), levels.back().front())};
+    return MerkleTree{std::move(levels), leaves.size(), root};
+}
+
+Result<MerkleProof> MerkleTree::Prove(uint64_t index) const
+{
+    if (index >= m_size) return Error{ErrorCode::INVALID_INPUT, "Merkle leaf index outside the tree"};
+    MerkleProof proof;
+    proof.index = index;
+    proof.size = m_size;
+    uint64_t position{index};
+    // Every level below the single top node gives at most one sibling; an
+    // unpaired last node has none (it was promoted), as in MerkleProve.
+    for (size_t level{0}; level + 1 < m_levels.size(); ++level) {
+        const uint64_t sibling{position ^ 1};
+        if (sibling < m_levels[level].size()) proof.path.push_back(m_levels[level][sibling]);
+        position >>= 1;
+    }
+    return Ok(std::move(proof));
+}
+
 } // namespace flowmesh2
