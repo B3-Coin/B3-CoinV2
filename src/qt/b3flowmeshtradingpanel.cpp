@@ -2135,7 +2135,7 @@ void B3FlowMeshTradingPanel::startSelectedRead(const QString& auxiliary_error, c
     auto scope{selectedReadScope()};
     if (!scope || m_cancel->load()) return;
     scope->auxiliary_error = auxiliary_error; scope->auxiliary_phase = auxiliary_phase;
-    if (m_selected_read_thread || m_watch_thread || m_catalog_read_thread || m_thread || m_busy) {
+    if (m_selected_read_thread || watchBlocksPassiveRead() || m_catalog_read_thread || m_thread || m_busy) {
         m_selected_read_pending = scope;
         return;
     }
@@ -2214,7 +2214,7 @@ void B3FlowMeshTradingPanel::startSelectedRead(const QString& auxiliary_error, c
 
 void B3FlowMeshTradingPanel::resumeSelectedRead()
 {
-    if (!m_selected_read_pending || m_selected_read_thread || m_watch_thread || m_catalog_read_thread || m_thread || m_busy) return;
+    if (!m_selected_read_pending || m_selected_read_thread || watchBlocksPassiveRead() || m_catalog_read_thread || m_thread || m_busy) return;
     if (m_read_failures && m_attempt_age.isValid() && m_attempt_age.elapsed() < readBackoffMs()) return;
     const auto scope{*m_selected_read_pending};
     m_selected_read_pending.reset();
@@ -2392,7 +2392,7 @@ void B3FlowMeshTradingPanel::startCatalogRead()
 {
     const auto scope{catalogReadScope()};
     if (!scope) return;
-    if (m_catalog_read_thread || m_selected_read_thread || m_watch_thread || m_thread || m_busy) {
+    if (m_catalog_read_thread || m_selected_read_thread || watchBlocksPassiveRead() || m_thread || m_busy) {
         m_catalog_read_pending = scope;
         return;
     }
@@ -2477,7 +2477,7 @@ void B3FlowMeshTradingPanel::startCatalogRead()
 
 void B3FlowMeshTradingPanel::resumeCatalogRead()
 {
-    if (!m_catalog_read_pending || m_catalog_read_thread || m_selected_read_thread || m_watch_thread || m_thread || m_busy) return;
+    if (!m_catalog_read_pending || m_catalog_read_thread || m_selected_read_thread || watchBlocksPassiveRead() || m_thread || m_busy) return;
     if (m_read_failures && m_attempt_age.isValid() && m_attempt_age.elapsed() < readBackoffMs()) return;
     const auto scope{*m_catalog_read_pending}; m_catalog_read_pending.reset();
     if (catalogReadScopeValid(scope, false)) startCatalogRead();
@@ -2563,7 +2563,8 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
         startCatalogRead();
         return;
     }
-    if (passive && (m_selected_read_thread || m_watch_thread)) {
+    if (passive && (m_selected_read_thread ||
+        (m_watch_thread && (nextPassivePhase() != RefreshPhase::None || watchBlocksPassiveRead())))) {
         // One coalesced scope, not a queued RPC or economic command. An
         // auxiliary Call still owns the native work gate, so do not start
         // one while the selected read is outstanding.
@@ -3366,6 +3367,21 @@ bool B3FlowMeshTradingPanel::watchSuppliesRead() const
         m_snapshot->market == selected->id;
 }
 
+bool B3FlowMeshTradingPanel::watchBlocksPassiveRead() const
+{
+    if (!m_watch_thread) return false;
+    if (!m_wallet || !m_backend || m_closing || m_cancel->load() || !m_active_watch_result || m_active_watch_result->release) return true;
+    const auto selected{market()};
+    const auto& scope{m_active_watch_result->scope};
+    // Ordinary reads move the watched market's event cursor. A Watch for
+    // another market cannot supply this selected market's read, but remains
+    // the sole Watch owner until it drains. Unknown attribution, a changed
+    // wallet/node or a same-market endpoint change keeps the old exclusion.
+    return !selected || selected->id.isEmpty() || scope.market.isEmpty() || scope.market == selected->id ||
+        scope.wallet != m_wallet || scope.generation != m_generation || scope.node != &m_wallet->node() ||
+        scope.watch_generation == m_watch_generation;
+}
+
 bool B3FlowMeshTradingPanel::liveSkipsPoll() const
 {
     return watchSuppliesRead() && !m_deferred_connect && !m_deferred_status && nextPassivePhase() == RefreshPhase::None && !candlesDue();
@@ -3435,7 +3451,7 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
     auto result{std::make_shared<WatchResult>()};
     result->cancel = std::make_shared<std::atomic_bool>(false);
     m_active_watch_result = result;
-    result->scope = {m_wallet, m_generation, m_watch_generation, selected->id, selected->account, basis->head};
+    result->scope = {m_wallet, m_generation, m_watch_generation, selected->id, selected->account, basis->head, &m_wallet->node()};
     result->release = release;
     result->ticks_after = ticksAfter(selected->id); result->draft = indicativeDraft(); result->levels = levelsRequest();
     auto* node{&m_wallet->node()};

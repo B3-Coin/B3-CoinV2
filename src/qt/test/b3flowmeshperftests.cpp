@@ -992,7 +992,7 @@ private Q_SLOTS:
             const int64_t started{NowUs()};
             panel.tick();
             ticks.push_back(Ms(NowUs() - started));
-            QVERIFY(!panel.m_thread); QVERIFY(!panel.m_watch_thread);
+            QVERIFY(!panel.m_thread); QVERIFY(!panel.m_watch_thread); QVERIFY(!panel.m_selected_read_thread); QVERIFY(!panel.m_catalog_read_thread);
             QCoreApplication::processEvents();
             if (i == 4) paints.Clear();
         }
@@ -1187,7 +1187,7 @@ private Q_SLOTS:
         Spin(1500); // The display catches up.
         panel.m_timer->stop();
         panel.m_watch.Disable();
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread && !panel.m_thread, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread && !panel.m_thread && !panel.m_selected_read_thread && !panel.m_catalog_read_thread, 5000);
         const auto committed{probe.market().Committed()};
         std::map<uint64_t, int64_t> replies;
         { std::lock_guard lock{probe.m_record}; replies = probe.reply_us; }
@@ -1260,7 +1260,7 @@ private Q_SLOTS:
         Spin(Measuring() ? 10'000 : 4'000);
         panel.m_timer->stop(); panel.m_watch.Disable();
         probe.busy_watch = false;
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread && !panel.m_thread, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread && !panel.m_thread && !panel.m_selected_read_thread && !panel.m_catalog_read_thread, 5000);
         std::vector<int64_t> starts;
         { std::lock_guard lock{probe.m_record}; starts = probe.watch_starts_us; }
         QVERIFY(starts.size() > 6);
@@ -1303,11 +1303,15 @@ private Q_SLOTS:
         panel.m_timer->start();
         Spin(seconds * 1000);
         panel.m_timer->stop();
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_selected_read_thread && !panel.m_catalog_read_thread, 5000);
         const int64_t ended{NowUs()};
-        std::vector<int64_t> starts, reads;
-        { std::lock_guard lock{probe.m_record}; starts = probe.job_starts_us; reads = probe.read_us; }
+        std::vector<int64_t> starts, reads, discoveries;
+        { std::lock_guard lock{probe.m_record}; starts = probe.read_starts_us; reads = probe.read_us; discoveries = probe.job_starts_us; }
         QVERIFY(starts.size() >= 3);
+        // Catalog/outbox discovery is a separate bounded phase now. Keep it
+        // observable, but pace actual selected-market RPC starts, not the
+        // obsolete assumption that every passive read lists saved actions.
+        QVERIFY(panel.m_saved_actions_ready);
         std::vector<double> spacing;
         for (size_t i{1}; i < starts.size(); ++i) spacing.push_back(Ms(starts[i] - starts[i - 1]));
         double busy{0};
@@ -1318,6 +1322,8 @@ private Q_SLOTS:
         qInfo("remote passive read occupancy: %.3f (%zu reads)", occupancy, reads.size());
         UniValue v{UniValue::VOBJ};
         v.pushKV("read_delay_ms", delay_ms); v.pushKV("jobs", static_cast<uint64_t>(starts.size())); v.pushKV("start_spacing", Json(d));
+        v.pushKV("saved_action_discoveries", static_cast<uint64_t>(discoveries.size()));
+        v.pushKV("spacing_source", "ordinary_getflowmeshmarketdata_rpc_entry");
         v.pushKV("passive_read_occupancy", std::round(occupancy * 1000) / 1000);
         v.pushKV("target", "remote passive polls stay on the 500 ms tick: never two starts within 450 ms (a coarse timer fires up to 5% early)");
         Record(delay_ms ? "remote_poll_pacing_slow_link" : "remote_poll_pacing_fast_link", v);
@@ -1328,6 +1334,19 @@ private Q_SLOTS:
         // default window's four gaps is not stable: strict (long-window)
         // mode only.
         if (delay_ms > 500 && Strict()) QVERIFY2(d.p50 >= 900, qPrintable(Describe("spacing", d)));
+        // Separate from the timing window, preserve AUTOMATIC saved-original
+        // discovery. A 4 s smoke window need not reach the normal 5 s catalog
+        // boundary; let its ordinary timer continue, without forcing a phase
+        // or resetting its age. A longer strict/report window already covers
+        // that boundary, so needs no extra discovery or pacing sample.
+        const auto discoveries_now = [&] { std::lock_guard lock{probe.m_record}; return probe.job_starts_us.size(); };
+        if (discoveries.empty()) {
+            panel.m_timer->start();
+            QTRY_VERIFY_WITH_TIMEOUT(discoveries_now() > 0, 2500);
+            panel.m_timer->stop(); panel.m_watch.Disable();
+            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_watch_thread && !panel.m_selected_read_thread && !panel.m_catalog_read_thread, 5000);
+        }
+        QVERIFY(discoveries_now() > 0); QVERIFY(panel.m_saved_actions_ready);
         QCOMPARE(probe.writes.load(), 0);
     }
 
@@ -1346,19 +1365,30 @@ private Q_SLOTS:
         panel.m_timer->start();
         Spin(seconds * 1000);
         panel.m_timer->stop(); panel.m_watch.Disable();
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_watch_thread, 5000);
-        std::vector<int64_t> starts;
-        { std::lock_guard lock{probe.m_record}; starts = probe.job_starts_us; }
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_watch_thread && !panel.m_selected_read_thread && !panel.m_catalog_read_thread, 5000);
+        std::vector<int64_t> starts, discoveries;
+        { std::lock_guard lock{probe.m_record}; starts = probe.read_starts_us; discoveries = probe.job_starts_us; }
         QVERIFY(starts.size() >= 3);
+        QVERIFY(panel.m_saved_actions_ready);
         std::vector<double> spacing;
         for (size_t i{1}; i < starts.size(); ++i) spacing.push_back(Ms(starts[i] - starts[i - 1]));
         const auto d{Distribute(spacing)};
         qInfo("%s", qPrintable(Describe("local poll starts (watch backing off)", d)));
         UniValue v{UniValue::VOBJ};
         v.pushKV("jobs", static_cast<uint64_t>(starts.size())); v.pushKV("start_spacing", Json(d));
+        v.pushKV("saved_action_discoveries", static_cast<uint64_t>(discoveries.size()));
+        v.pushKV("spacing_source", "ordinary_getflowmeshmarketdata_rpc_entry");
         v.pushKV("target", "one passive start per ~500 ms tick, never back to back");
         Record("local_poll_pacing", v);
         for (const double gap : spacing) QVERIFY2(gap >= SpacingFloor(450, 200), qPrintable(Describe("spacing", d)));
+        const auto discoveries_now = [&] { std::lock_guard lock{probe.m_record}; return probe.job_starts_us.size(); };
+        if (discoveries.empty()) {
+            panel.m_timer->start();
+            QTRY_VERIFY_WITH_TIMEOUT(discoveries_now() > 0, 2500);
+            panel.m_timer->stop(); panel.m_watch.Disable();
+            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread && !panel.m_watch_thread && !panel.m_selected_read_thread && !panel.m_catalog_read_thread, 5000);
+        }
+        QVERIFY(discoveries_now() > 0); QVERIFY(panel.m_saved_actions_ready);
         QCOMPARE(probe.writes.load(), 0);
     }
 
@@ -1386,7 +1416,7 @@ private Q_SLOTS:
             switches.push_back(Ms(*paints.Shown(0, started, target) - started));
         }
         panel.m_timer->stop(); panel.m_watch.Disable();
-        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread && !panel.m_thread, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread && !panel.m_thread && !panel.m_selected_read_thread && !panel.m_catalog_read_thread, 5000);
         const auto d{Distribute(switches)};
         qInfo("%s", qPrintable(Describe("market switch -> verified book shown (local engine)", d)));
         UniValue v{UniValue::VOBJ};

@@ -654,6 +654,108 @@ struct SelectedReadCommandProbe {
         }
     }
 };
+
+// Real Qt read actors with a deliberately held OLD-market watch. All replies
+// are synthetic; the scoped dispatcher makes wallets, signing and sockets
+// unreachable. Controls are configured before actors start. Every test must
+// release and drain actors before this fixture restores the dispatcher.
+struct MarketSwitchWatchProbe {
+    std::array<UniValue, 3> data;
+    UniValue old_watch_data;
+    const bool late_error;
+    std::atomic_bool hold_read{false};
+    QSemaphore watch_entered, watch_release, read_entered, read_release;
+    std::atomic_int watches{0}, reads{0}, watch_active{0}, read_active{0}, watch_peak{0}, read_peak{0}, writes{0};
+    std::vector<std::unique_ptr<CRPCCommand>> commands;
+    SelectedReadCommandProbe::ScopedRpcTable rpc_table;
+
+    static UniValue DataFor(unsigned char base, unsigned char head)
+    {
+        auto value{RemoteData()};
+        value.pushKV("base_asset_id", H(base).GetHex());
+        value.pushKV("market_id", flowmesh::ComputeFlowMeshMarketId(H(1), H(base))->GetHex());
+        auto snapshot{value["snapshot"]}; snapshot.pushKV("last_microblock_hash", H(head).GetHex()); value.pushKV("snapshot", snapshot);
+        auto account{value["account"]};
+        account.pushKV("base_available", 2'000'000 + int{base} * 1'000'000);
+        account.pushKV("b3_available_atoms", int64_t{2'000'000'000} + int64_t{base} * 100'000'000);
+        value.pushKV("account", account); return value;
+    }
+    static UniValue MarketRow(const UniValue& value)
+    {
+        const auto snapshot{Parse(value)}; UniValue row{UniValue::VOBJ};
+        for (const auto* key : {"market_id", "base_asset_id", "domain", "execution_config_id", "quote_asset", "verification"}) row.pushKV(key, value[key]);
+        row.pushKV("vault_id", flowmesh::ComputeFlowMeshVaultId(H(1), *uint256::FromHex(snapshot.market.toStdString()))->GetHex());
+        row.pushKV("available", true); row.pushKV("checkpoint_pending", false);
+        for (const auto* key : {"running", "paused", "pending_handoff", "halt", "error"}) row.pushKV(key, value["snapshot"][key]);
+        auto account{value["account"]}; account.pushKV("b3_available", FormatAmount(snapshot.b3_available, 9).toStdString());
+        account.pushKV("b3_reserved", FormatAmount(snapshot.b3_reserved, 9).toStdString()); row.pushKV("account", account); return row;
+    }
+    static UniValue ClientInfo()
+    {
+        auto info{ConnectionInfo("https://operator.invalid:18443")}; UniValue rows{UniValue::VARR};
+        for (auto row : info["endpoints"].getValues()) { row.pushKV("live_updates_ms", 2000); rows.push_back(row); }
+        info.pushKV("endpoints", rows); return info;
+    }
+    struct Active {
+        std::atomic_int& count;
+        explicit Active(std::atomic_int& active, std::atomic_int& peak) : count{active}
+        {
+            const int current{++count}; int previous{peak.load()};
+            while (previous < current && !peak.compare_exchange_weak(previous, current)) {}
+        }
+        ~Active() { --count; }
+    };
+    explicit MarketSwitchWatchProbe(bool error = false) : data{DataFor(2, 4), DataFor(9, 14), DataFor(10, 15)}, old_watch_data{DataFor(2, 99)}, late_error{error}
+    {
+        // A mistakenly applied late reply would visibly change balances,
+        // account sequence, readiness, head and link/certificate freshness.
+        auto snapshot{old_watch_data["snapshot"]}; snapshot.pushKV("paused", true);
+        snapshot.pushKV("next_microblock_sequence", 8); old_watch_data.pushKV("snapshot", snapshot);
+        auto account{old_watch_data["account"]}; account.pushKV("next_sequence", 77); account.pushKV("base_available", 1);
+        old_watch_data.pushKV("account", account);
+        if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+        const auto add = [&](const char* method, const std::function<UniValue(const JSONRPCRequest&)>& run) {
+            auto command{std::make_unique<CRPCCommand>("hidden", method,
+                [run](const JSONRPCRequest& request, UniValue& result, bool) { result = run(request); return true; },
+                std::vector<std::pair<std::string, bool>>{}, 998980 + commands.size())};
+            tableRPC.appendCommand(command->name, command.get()); commands.push_back(std::move(command));
+        };
+        add("getflowmeshclientinfo", [](const JSONRPCRequest&) { return ClientInfo(); });
+        add("listflowmeshactions", [](const JSONRPCRequest&) {
+            UniValue saved{UniValue::VOBJ}; saved.pushKV("source", "local-retained-outbox"); saved.pushKV("actions", UniValue{UniValue::VARR}); return saved;
+        });
+        add("listflowmeshmarkets", [this](const JSONRPCRequest&) {
+            UniValue rows{UniValue::VARR}; for (const auto& value : data) rows.push_back(MarketRow(value)); return rows;
+        });
+        add("getflowmeshmarketdata", [this](const JSONRPCRequest& request) {
+            const auto id{request.params[0].get_str()};
+            const auto found{std::find_if(data.begin(), data.end(), [&](const auto& value) { return value["market_id"].get_str() == id; })};
+            if (found == data.end()) throw std::runtime_error{"Unknown synthetic switch market"};
+            const auto& watch_ms{request.params[1].find_value("watch_ms")};
+            if (watch_ms.isNum() && watch_ms.getInt<int64_t>() > 0) {
+                Active active{watch_active, watch_peak}; ++watches; watch_entered.release();
+                if (!watch_release.tryAcquire(1, 5000)) throw std::runtime_error{"Synthetic old watch exceeded its test bound"};
+                if (late_error) throw std::runtime_error{"Synthetic old-market watch failed late"};
+                auto result{old_watch_data}; UniValue watch{UniValue::VOBJ};
+                watch.pushKV("status", "head_changed"); watch.pushKV("supported", true); watch.pushKV("waited", true);
+                watch.pushKV("gap", true); watch.pushKV("endpoint", "https://operator.invalid:18443"); watch.pushKV("endpoint_live_ms", 2000);
+                result.pushKV("watch", watch); return result;
+            }
+            Active active{read_active, read_peak}; ++reads; read_entered.release();
+            if (hold_read && !read_release.tryAcquire(1, 5000)) throw std::runtime_error{"Synthetic switch read exceeded its test bound"};
+            return *found;
+        });
+        add("getflowmeshbalance", [this](const JSONRPCRequest& request) {
+            for (const auto& value : data) if (value["market_id"].get_str() == request.params[0].get_str()) return MarketRow(value);
+            throw std::runtime_error{"Unknown synthetic switch balance"};
+        });
+        add("getblockchaininfo", [](const JSONRPCRequest&) { UniValue result{UniValue::VOBJ}; result.pushKV("initialblockdownload", false); result.pushKV("blocks", 0); result.pushKV("headers", 0); return result; });
+        add("listflowmeshvaultoperations", [](const JSONRPCRequest&) { return UniValue{UniValue::VARR}; });
+        add("getflowmeshcandles", [](const JSONRPCRequest&) -> UniValue { throw std::runtime_error{"Synthetic switch candles unavailable"}; });
+        for (const auto* method : {"submitflowmeshorder", "submitflowmeshladder", "cancelflowmeshorder", "flowmeshdeposit", "submitflowmeshdeposit", "requestflowmeshwithdrawal", "sendrawtransaction", "retryflowmeshaction"})
+            add(method, [this](const JSONRPCRequest&) -> UniValue { ++writes; throw std::runtime_error{"Unexpected mutation in market-switch fixture"}; });
+    }
+};
 }
 
 class B3FlowMeshWorkspaceTests : public QObject
@@ -778,6 +880,37 @@ class B3FlowMeshWorkspaceTests : public QObject
     static void AwaitWatchWorker(B3FlowMeshTradingPanel& panel)
     {
         QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread, 5000);
+    }
+
+    struct SwitchCleanup {
+        MarketSwitchWatchProbe& probe;
+        B3FlowMeshTradingPanel& panel;
+        ~SwitchCleanup()
+        {
+            // A failing-before assertion must not leave a held worker alive
+            // while the scoped dispatcher, panel or Node is destroyed.
+            panel.m_closing = true; panel.m_timer->stop(); panel.m_rearm->stop();
+            probe.watch_release.release(8); probe.read_release.release(8);
+            panel.cancelAndWait();
+            for (auto* worker : panel.findChildren<QThread*>()) { QObject::disconnect(worker, nullptr, &panel, nullptr); worker->wait(); }
+        }
+    };
+    static void PrepareSwitchWatch(B3FlowMeshTradingPanel& panel, MarketSwitchWatchProbe& probe)
+    {
+        Observe(panel, Parse(probe.data[0]));
+        panel.m_market_data.clear();
+        {
+            QSignalBlocker blocked{panel.m_market}; panel.m_market->clear();
+            for (size_t i{0}; i < probe.data.size(); ++i) {
+                auto row{B3FlowMeshTrading::ParseMarket(MarketSwitchWatchProbe::MarketRow(probe.data[i]))};
+                panel.m_market_data.push_back(row); panel.m_market->addItem(QStringLiteral("Synthetic switch %1").arg(static_cast<qulonglong>(i)), row.id);
+            }
+            panel.m_market->setCurrentIndex(0);
+        }
+        panel.m_client_info = MarketSwitchWatchProbe::ClientInfo();
+        panel.m_catalog_age.start(); panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None;
+        panel.show(); QCoreApplication::processEvents(); panel.m_timer->stop(); panel.m_rearm->stop();
+        panel.updateWatchState(); panel.armWatch();
     }
 
     //! Tracks an unresolved request of the observed account, as after a submission.
@@ -8838,6 +8971,103 @@ private Q_SLOTS:
         QVERIFY(closing.elapsed() >= 250);
         release.join();
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void obsoleteMarketWatchCannotConvoyOrPoisonNewSelection_data()
+    {
+        QTest::addColumn<bool>("late_error");
+        QTest::newRow("exact-old-success") << false;
+        QTest::newRow("exact-old-error") << true;
+    }
+    void obsoleteMarketWatchCannotConvoyOrPoisonNewSelection()
+    {
+        QFETCH(bool, late_error);
+        auto offline{MakeOfflineWallet("qt-obsolete-market-watch")};
+        std::set<QString> painted;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel, *offline.model, offline.wallet); panel.resize(1320, 940);
+        MarketSwitchWatchProbe probe{late_error}; SwitchCleanup cleanup{probe, panel};
+        panel.m_order_book->setViewObserver([&](const QString& head, bool paint) { if (paint) painted.insert(head); });
+        PrepareSwitchWatch(panel, probe);
+        QTRY_VERIFY_WITH_TIMEOUT(probe.watch_entered.available() > 0, 1000); QVERIFY(probe.watch_entered.tryAcquire());
+        const auto old{panel.m_active_watch_result}; QVERIFY(old && panel.m_watch_thread);
+        const auto old_head{old->scope.known_head}; const auto old_market{old->scope.market};
+        const auto expected{Parse(probe.data[1])};
+        panel.m_market->setCurrentIndex(1);
+        // Causal availability check, not a new relaxed performance target:
+        // the old actor is still held and must not gate a DIFFERENT market.
+        QTRY_VERIFY_WITH_TIMEOUT(panel.m_snapshot && panel.m_snapshot->market == expected.market && painted.count(expected.head) != 0, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_selected_read_thread && !panel.m_catalog_read_thread && !panel.m_thread, 1000);
+        QCOMPARE(probe.watch_active.load(), 1); QCOMPARE(probe.watches.load(), 1); QVERIFY(panel.m_watch_thread);
+        QCOMPARE(probe.watch_peak.load(), 1); QCOMPARE(probe.read_peak.load(), 1);
+        QCOMPARE(panel.m_snapshot->base_available, expected.base_available); QCOMPARE(panel.m_snapshot->b3_available, expected.b3_available);
+        // Stop future display demand before measuring the OLD reply's effect.
+        // A queued legitimate Status/Data cycle would otherwise renew the new
+        // market independently of that obsolete completion.
+        panel.m_watch.Disable(); panel.m_rearm->stop();
+        panel.stopSelectedReadWorker(false); panel.stopCatalogReadWorker(false);
+        SavedReadFixture(panel);
+        QVERIFY(panel.m_receipt && panel.m_receipt->no_resubmit); QCOMPARE(panel.m_saved_actions.actions.size(), size_t{1});
+        const auto receipt{*panel.m_receipt}; const auto saved_hash{panel.m_saved_actions.actions[0].signed_bytes_sha256};
+        const auto response{panel.m_response_age.msecsSinceReference()}, certificate{panel.m_certificate_age.msecsSinceReference()};
+        const auto display{panel.m_display_confirmed.msecsSinceReference()}; const auto generation{panel.m_selected_read_generation};
+        const auto observation{panel.m_selected_read_command_observation}; const auto watch_generation{panel.m_watch_generation};
+        const auto readiness{panel.market()->ready}; const auto order_enabled{panel.m_order->isEnabled()};
+        const auto read_failed{panel.m_read_failed}; const auto read_error{panel.m_read_error};
+        probe.watch_release.release();
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_watch_thread, 1000); QCoreApplication::processEvents();
+        QCOMPARE(old->scope.known_head, old_head); QCOMPARE(old->scope.market, old_market);
+        if (late_error) { QVERIFY(!old->snapshot); QVERIFY(old->error.contains(QStringLiteral("old-market watch failed late"))); }
+        else { QVERIFY(old->snapshot); QCOMPARE(old->snapshot->head, QString::fromStdString(H(99).GetHex())); QVERIFY(old->snapshot->paused); QCOMPARE(old->snapshot->account_sequence, uint64_t{77}); }
+        QCOMPARE(panel.m_snapshot->market, expected.market); QCOMPARE(panel.m_snapshot->head, expected.head);
+        QCOMPARE(panel.m_snapshot->account, expected.account); QCOMPARE(panel.m_snapshot->account_sequence, expected.account_sequence);
+        QCOMPARE(panel.m_snapshot->base_available, expected.base_available); QCOMPARE(panel.m_snapshot->b3_available, expected.b3_available);
+        QCOMPARE(panel.m_snapshot->paused, expected.paused); QCOMPARE(panel.market()->ready, readiness); QCOMPARE(panel.m_order->isEnabled(), order_enabled);
+        QCOMPARE(panel.m_read_failed, read_failed); QCOMPARE(panel.m_read_error, read_error);
+        QCOMPARE(panel.m_response_age.msecsSinceReference(), response); QCOMPARE(panel.m_certificate_age.msecsSinceReference(), certificate);
+        QCOMPARE(panel.m_display_confirmed.msecsSinceReference(), display); QCOMPARE(panel.m_selected_read_generation, generation);
+        QCOMPARE(panel.m_selected_read_command_observation, observation); QCOMPARE(panel.m_watch_generation, watch_generation);
+        QVERIFY(panel.m_receipt); QCOMPARE(panel.m_receipt->action_id, receipt.action_id); QCOMPARE(panel.m_receipt->state, receipt.state);
+        QCOMPARE(panel.m_receipt->no_resubmit, receipt.no_resubmit); QCOMPARE(panel.m_saved_actions.actions[0].signed_bytes_sha256, saved_hash);
+        QVERIFY(panel.m_saved_actions.actions[0].receipt.no_resubmit); QCOMPARE(probe.writes.load(), 0);
+    }
+    void obsoleteMarketWatchKeepsRepeatedSwitchesCoalesced()
+    {
+        auto offline{MakeOfflineWallet("qt-obsolete-watch-coalescing")};
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel, *offline.model, offline.wallet);
+        MarketSwitchWatchProbe probe; SwitchCleanup cleanup{probe, panel}; probe.hold_read = true;
+        PrepareSwitchWatch(panel, probe);
+        QTRY_VERIFY_WITH_TIMEOUT(probe.watch_entered.available() > 0, 1000); QVERIFY(probe.watch_entered.tryAcquire());
+        panel.m_market->setCurrentIndex(1);
+        QTRY_VERIFY_WITH_TIMEOUT(probe.read_entered.available() > 0, 1000); QVERIFY(probe.read_entered.tryAcquire());
+        QPointer<QThread> selected{panel.m_selected_read_thread}; QVERIFY(selected && panel.m_watch_thread);
+        for (int i{0}; i < 128; ++i) {
+            panel.m_market->setCurrentIndex(1 + (i % 2));
+            QCOMPARE(panel.m_selected_read_thread, selected.data()); QVERIFY(!panel.m_catalog_read_thread); QVERIFY(!panel.m_thread);
+            QCOMPARE(probe.watches.load(), 1); QCOMPARE(probe.reads.load(), 1);
+        }
+        const auto expected{Parse(probe.data[2])}; QCOMPARE(panel.market()->id, expected.market);
+        // Each combo switch resets discovery. The successor is one VALUE
+        // catalog scope, not another actor or a retained old response body.
+        QVERIFY(panel.m_catalog_read_pending && panel.m_catalog_read_pending->selected);
+        QCOMPARE(panel.m_catalog_read_pending->selected->id, expected.market);
+        QCOMPARE(probe.watch_active.load(), 1); QCOMPARE(probe.read_active.load(), 1);
+        probe.hold_read = false; probe.read_release.release();
+        QTRY_VERIFY_WITH_TIMEOUT(panel.m_snapshot && panel.m_snapshot->market == expected.market, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_selected_read_thread && !panel.m_catalog_read_thread && !panel.m_thread, 1000);
+        QCOMPARE(probe.watch_peak.load(), 1); QCOMPARE(probe.read_peak.load(), 1); QCOMPARE(probe.watches.load(), 1);
+        QVERIFY(panel.m_watch_thread); QCOMPARE(probe.watch_active.load(), 1); QCOMPARE(probe.writes.load(), 0);
+    }
+    void currentMarketWatchAndChangedWalletGenerationRemainSerial()
+    {
+        auto offline{MakeOfflineWallet("qt-watch-scope-exclusion")};
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel, *offline.model, offline.wallet);
+        MarketSwitchWatchProbe probe; SwitchCleanup cleanup{probe, panel}; PrepareSwitchWatch(panel, probe);
+        QTRY_VERIFY_WITH_TIMEOUT(probe.watch_entered.available() > 0, 1000); QVERIFY(probe.watch_entered.tryAcquire());
+        panel.startSelectedRead(); QVERIFY(!panel.m_selected_read_thread); QCOMPARE(probe.reads.load(), 0);
+        // A changed wallet generation is NOT permission to overlap a watch
+        // from another wallet session, even when its market differs.
+        ++panel.m_generation; panel.m_market->setCurrentIndex(1); panel.startSelectedRead();
+        QVERIFY(!panel.m_selected_read_thread); QVERIFY(!panel.m_catalog_read_thread); QVERIFY(!panel.m_thread);
+        QCOMPARE(probe.reads.load(), 0); QCOMPARE(probe.watches.load(), 1); QCOMPARE(probe.writes.load(), 0);
     }
     void watchFailureBacksOffAndReconcilesTheTrackedRequestFirst()
     {

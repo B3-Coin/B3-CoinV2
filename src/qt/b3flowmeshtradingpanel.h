@@ -125,6 +125,7 @@ private:
         QPointer<WalletModel> wallet;
         uint64_t generation{0}, watch_generation{0};
         QString market, account, known_head;
+        interfaces::Node* node{nullptr};
     };
     //! Value-only attribution. Neither the in-flight read nor its one
     //! coalesced successor owns a wallet/backend or an economic instruction.
@@ -408,6 +409,10 @@ private:
     //! The watch supplies the selected market's read (Live, or a probe that
     //! holds the poll), so a passive job reads only its auxiliary phase.
     bool watchSuppliesRead() const;
+    //! A same-scope Watch keeps exclusive ownership of its event cursor.
+    //! Only a positively attributed obsolete other-market Watch may drain
+    //! beside the one bounded selected OR catalog read owner.
+    bool watchBlocksPassiveRead() const;
     //! ... and a passive refresh without an auxiliary phase is skipped.
     bool liveSkipsPoll() const;
     //! Re-keys the live-update policy on wallet, market and the endpoint the
