@@ -29,6 +29,8 @@
  * adds batch BIP340 verification (M4-ADM-01) and the five fact kinds that
  * later tasks define (M7-SEAT-01, M7-GOV-01, MB1-B3D-02, M8-BRG-02,
  * M8-EXIT-01); each fact probe checks EncodeFact, FactId and DecodeFact.
+ * Slice R5 adds the ledger's withdrawal (M2-LED-05) and spot/futures
+ * transfers (M2-LED-06; the probe checks both directions).
  */
 
 #include <boost/test/unit_test.hpp>
@@ -37,6 +39,7 @@
 #include <flowmesh2/core/facts.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/ledger/ledger.h>
 
 #include <exception>
 #include <functional>
@@ -191,6 +194,9 @@ StubObservation FirstDeviation(std::string_view task_id, std::vector<StubObserva
     return observations.front();
 }
 
+//! An empty ledger of the provisional regtest profile.
+ledger::LedgerState EmptyRegtestLedger() { return ledger::LedgerState::Create(RegtestProfile()).value(); }
+
 //! EncodeFact, FactId and DecodeFact (of the kind byte) of a stub fact kind.
 StubObservation FactStubProbe(const Fact& fact, std::string_view task_id)
 {
@@ -288,6 +294,21 @@ FM2_STUB_CASE(M8_BRG_02, "M8-BRG-02")
 FM2_STUB_CASE(M8_EXIT_01, "M8-EXIT-01")
 {
     return FactStubProbe(ExitNullifierFact{}, "M8-EXIT-01");
+}
+
+// ---- Slice R5: ledger/ledger LedgerState ----
+
+FM2_STUB_CASE(M2_LED_05, "M2-LED-05")
+{
+    ledger::LedgerState ledger{EmptyRegtestLedger()};
+    return Observe(ledger.RequestWithdrawal(AccountId{}, WithdrawPayload{AssetId::Native(), 1, {0x51}}));
+}
+
+FM2_STUB_CASE(M2_LED_06, "M2-LED-06")
+{
+    ledger::LedgerState ledger{EmptyRegtestLedger()};
+    return FirstDeviation("M2-LED-06", {Observe(ledger.TransferToFutures(AccountId{}, AssetId::Native(), 1)),
+                                        Observe(ledger.TransferFromFutures(AccountId{}, AssetId::Native(), 1))});
 }
 
 BOOST_AUTO_TEST_SUITE_END()

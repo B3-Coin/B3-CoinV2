@@ -85,6 +85,7 @@ if(BUILD_FLOWMESH2)
   # other application directories here. fm2_verify never links it (guard
   # rule 4), and it never links bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
+    ledger/ledger.cpp
     ledger/nonce_window.cpp
   )
   target_link_libraries(fm2_core
@@ -111,6 +112,8 @@ if(BUILD_FLOWMESH2)
     test/fee_math_tests.cpp
     test/hashes_tests.cpp
     test/ids_tests.cpp
+    test/ledger_property_tests.cpp
+    test/ledger_tests.cpp
     test/market_tests.cpp
     test/merkle_tests.cpp
     test/nonce_rule_tests.cpp
