@@ -53,6 +53,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -73,6 +74,8 @@ constexpr size_t CLIENT_MAX_CACHED_MARKETS{8};
 constexpr size_t CLIENT_MAX_ACTIONS{512};
 constexpr size_t CLIENT_MAX_ENDPOINTS{8};
 constexpr auto CLIENT_REQUEST_TIMEOUT{std::chrono::seconds{5}};
+// outcome-upgrade-transient-budget-v1: read-only, not an agreement timer.
+constexpr auto CLIENT_OUTCOME_UPGRADE_BUDGET_RETRY_DELAY{std::chrono::seconds{1}};
 // A waited 'action' reply carries at most one hex certified entry.
 constexpr size_t CLIENT_ACTION_WAIT_MAX_REPLY{2 * (flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES + 1024) + 64 * 1024};
 static_assert(CLIENT_ACTION_WAIT_MAX_REPLY <= CLIENT_MAX_REPLY);
@@ -1484,9 +1487,14 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // Volatile: endpoint that acknowledged this process's latest delivery.
         // Only a waited status read uses it; lost on restart.
         std::optional<size_t> delivery_endpoint{};
-        // Volatile: endpoints already asked for this inclusion's outcome
-        // evidence by the outcome-only upgrade (at most once each).
-        std::set<size_t> outcome_upgrade_asked{};
+        // Volatile fixed bound: endpoint indexes only append, at most eight.
+        // A recognized standalone BUDGET response reopens only this read,
+        // after a fixed cooldown. Every other attempt remains terminal.
+        struct OutcomeUpgradeAttempt {
+            bool terminal_asked{false};
+            std::chrono::steady_clock::time_point retry_after{};
+        };
+        std::array<OutcomeUpgradeAttempt, CLIENT_MAX_ENDPOINTS> outcome_upgrade_attempts{};
         // Durable: a DIFFERENT certified action used this action's account
         // sequence, proven once under local B3 authority, so this action can
         // never execute. Like previously_certified it forbids resending the
@@ -3178,31 +3186,48 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         }
     }
     //! Outcome-only upgrade of a verified inclusion learned without evidence
-    //! (for example from a snapshot): at most one 'outcome_evidence' request
-    //! per (action, endpoint) per process, only to the advertising endpoint
-    //! that served the inclusion, charged to the automatic status budget.
+    //! (for example from a snapshot): only to the advertising endpoint that
+    //! served the inclusion, charged to the unchanged automatic status budget.
+    //! A recognized standalone BUDGET refusal permits another read after 1s;
+    //! all other responses/failures remain at most once per action/endpoint.
     //! One endpoint and one bounded request: no failover loop. The entry is
     //! the retained proof RecheckActionAuthority just re-verified.
-    void UpgradeOutcome(Pending& p)
+    //! Diagnostics use the caller's existing outer span (emits after work
+    //! unlock), never construct an inner emitting span while m_work is held.
+    void UpgradeOutcome(Pending& p, FlowMeshTimingSpan* timing = nullptr)
     {
-        if (!p.receipt.certificate_verified || p.receipt.outcome_verified || p.inclusion_proof.empty()) return;
+        const auto decision = [&](const uint64_t value) noexcept {
+            if (timing) timing->Field("outcome_upgrade_decision", value);
+        };
+        if (timing) timing->Field("outcome_upgrade_proof_bytes", uint64_t{p.inclusion_proof.size()});
+        if (!p.receipt.certificate_verified) { decision(1); return; }
+        if (p.receipt.outcome_verified) { decision(2); return; }
+        if (p.inclusion_proof.empty()) { decision(3); return; }
         const auto found{std::find_if(m_endpoints.begin(), m_endpoints.end(),
                                       [&](const auto& endpoint) { return endpoint.url == p.receipt.endpoint; })};
-        if (found == m_endpoints.end()) return;
+        if (found == m_endpoints.end()) { decision(4); return; }
         const size_t endpoint{static_cast<size_t>(std::distance(m_endpoints.begin(), found))};
+        if (timing) {
+            timing->Field("outcome_upgrade_endpoint", uint64_t{endpoint});
+            timing->Field("outcome_upgrade_advertised", uint64_t{m_action_outcome.at(endpoint)});
+        }
         if (!m_action_outcome.at(endpoint)) {
             if (p.receipt.reason_code.empty()) {
                 p.receipt.reason_code = std::string{flowmesh::ActionReasonName(flowmesh::ActionReasonCode::OUTCOME_NOT_OFFERED)};
             }
-            return;
+            decision(5); return;
         }
-        if (p.outcome_upgrade_asked.contains(endpoint) ||
-            std::chrono::steady_clock::now() < m_retry_after.at(endpoint) ||
-            !m_action_polls.TryChargeAttempt(std::chrono::steady_clock::now())) return;
-        p.outcome_upgrade_asked.insert(endpoint);
+        auto& attempt{p.outcome_upgrade_attempts.at(endpoint)};
+        const auto now{std::chrono::steady_clock::now()};
+        if (attempt.terminal_asked) { decision(6); return; }
+        if (now < m_retry_after.at(endpoint)) { decision(7); return; }
+        if (now < attempt.retry_after) { decision(8); return; }
+        if (!m_action_polls.TryChargeAttempt(now)) { decision(9); return; }
+        attempt.terminal_asked = true; // Before any transport or throwing parse.
+        decision(10);
         try {
             const auto entry{EntryPrefix(p.inclusion_proof)};
-            if (entry.GetHash() != p.receipt.microblock_hash) return;
+            if (entry.GetHash() != p.receipt.microblock_hash) { decision(18); return; }
             UniValue params{UniValue::VOBJ};
             params.pushKV("market_id", p.market.GetHex());
             params.pushKV("microblock_sequence", entry.sequence);
@@ -3212,11 +3237,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             request.pushKV("params", std::move(params));
             const auto reply{m_https.Request(m_endpoints[endpoint], "/flowmesh/v1", request.write(), CLIENT_REQUEST_TIMEOUT,
                                              CLIENT_OUTCOME_EVIDENCE_MAX_REPLY)};
-            if (!reply.response_received) return;
+            if (!reply.response_received) { decision(11); return; }
             // The method spends one extra endpoint token for the evidence.
             m_action_polls.RecordExtraCost(std::chrono::steady_clock::now(), 1);
             UniValue parsed;
-            if (!parsed.read(reply.body) || !parsed.isObject() || !parsed["ok"].isBool()) return;
+            if (!parsed.read(reply.body) || !parsed.isObject() || !parsed["ok"].isBool()) { decision(12); return; }
             if (!parsed["ok"].get_bool()) {
                 // Availability only; the inclusion stays verified.
                 using Code = flowmesh::ActionReasonCode;
@@ -3225,13 +3250,24 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 if (text == "FlowMesh outcome evidence is unavailable: EXPIRED") code = Code::OUTCOME_EVIDENCE_EXPIRED;
                 if (text == "FlowMesh outcome evidence is unavailable: TOO_LARGE") code = Code::OUTCOME_EVIDENCE_TOO_LARGE;
                 if (text == "FlowMesh outcome evidence is unavailable: HASH_MISMATCH") code = Code::OUTCOME_EVIDENCE_INVALID;
-                if (text == FLOWMESH_API_OUTCOME_BUDGET_ERROR) code = Code::OUTCOME_EVIDENCE_BUDGET;
+                if (text == FLOWMESH_API_OUTCOME_BUDGET_ERROR) {
+                    code = Code::OUTCOME_EVIDENCE_BUDGET;
+                    // Response-completion cooldown, never extended by polls.
+                    // Fixed storage means no allocating reopen/marker gap.
+                    attempt.retry_after = std::chrono::steady_clock::now() + CLIENT_OUTCOME_UPGRADE_BUDGET_RETRY_DELAY;
+                    attempt.terminal_asked = false;
+                    decision(14);
+                } else {
+                    decision(13);
+                }
                 if (code) p.receipt.reason_code = std::string{flowmesh::ActionReasonName(*code)};
                 return;
             }
             ApplyOutcomeEvidence(p, entry, parsed["result"], endpoint);
+            decision(p.receipt.outcome_verified ? 15 : 16);
         } catch (const std::exception&) {
             // Inclusion stays verified; the outcome stays unverified.
+            decision(17);
         }
     }
     Receipt QueryAction(Pending& p, bool automatic = false)
@@ -4557,7 +4593,7 @@ public:
             (void)RecheckActionAuthority(it->second);
             if (it->second.receipt.certificate_verified) {
                 m_action_polls.Remove(it->first);
-                UpgradeOutcome(it->second);
+                UpgradeOutcome(it->second, &timing_lock_1293);
                 SaveVerifiedRestartState(it->second);
                 return it->second.receipt;
             }

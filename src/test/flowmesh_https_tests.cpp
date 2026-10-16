@@ -5483,6 +5483,133 @@ BOOST_AUTO_TEST_CASE(outcome_upgrade_at_most_once_per_endpoint)
     server->Stop();
 }
 
+// PRIVATE TEST-FIRST: transient standalone evidence refusal must not be permanent.
+BOOST_AUTO_TEST_CASE(transient_outcome_evidence_budget_recovers_without_resubmitting_included_action)
+{
+    using namespace std::chrono_literals;
+    const fs::path path{m_path_root / "outcome-budget-recovery-client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    const auto bytes{flowmesh::EncodeProductionActionPayload(action)};
+    BOOST_REQUIRE(bytes);
+    std::atomic<uint64_t> first_evidence_requested_us{0};
+    ScriptedEndpoint validator;
+    auto row{MarketRow(0ms)};
+    row.pushKV("action_outcome_v1", true);
+    validator.markets.push_back(row);
+    auto [reply, evidence]{OutcomeReceipt(action)};
+    auto without{WithoutEvidence(reply)};
+    without.pushKV("outcome_evidence_error", "BUDGET");
+    validator.plain = without;
+    validator.evidence_error = node::FLOWMESH_API_OUTCOME_BUDGET_ERROR;
+    validator.evidence.pushKV("outcome_evidence", evidence);
+    validator.before = [&](const std::string& method, const UniValue&) {
+        if (method == "outcome_evidence") {
+            uint64_t unset{0};
+            first_evidence_requested_us.compare_exchange_strong(unset, kernel::LockTimingNow());
+        }
+    };
+    auto server{Serve(validator)};
+    const auto endpoint{Endpoint(server->Port())}; // Stop resets Port; preserve generated trust for retention-only reopening.
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {endpoint}, path, error)};
+    struct Drain {
+        std::unique_ptr<node::FlowMeshTradingBackend>& client;
+        std::unique_ptr<node::FlowMeshHttpsServer>& server;
+        ~Drain() { client.reset(); if (server) server->Stop(); }
+    } const drain{client, server};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto counts = [&] {
+        std::lock_guard lock{validator.mutex};
+        return std::array<unsigned, 7>{validator.plain_reads, validator.waited_reads,
+            validator.submits, validator.market_reads, validator.evidence_reads,
+            validator.outcome_flags, validator.waited_submits};
+    };
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto included{client->ActionStatus(market, action.Id(), false)};
+    BOOST_REQUIRE(included.certificate_verified);
+    BOOST_CHECK(!included.outcome_verified && !included.outcome);
+    BOOST_CHECK_EQUAL(included.reason_code, "OUTCOME_EVIDENCE_BUDGET");
+    BOOST_CHECK((counts() == std::array<unsigned, 7>{1, 0, 0, 1, 0, 1, 0}));
+    const auto retained_before{client->SavedActions(owner, market)};
+    BOOST_REQUIRE_EQUAL(retained_before.size(), 1U);
+
+    // Leave the existing global automatic-read window, without changing it.
+    std::this_thread::sleep_for(1100ms);
+    const auto budget{client->ActionStatus(market, action.Id(), false)};
+    const auto budget_returned{std::chrono::steady_clock::now()};
+    BOOST_REQUIRE(budget.certificate_verified);
+    BOOST_CHECK(!budget.outcome_verified && !budget.outcome);
+    BOOST_CHECK_EQUAL(budget.reason_code, "OUTCOME_EVIDENCE_BUDGET");
+    BOOST_CHECK((counts() == std::array<unsigned, 7>{1, 0, 0, 1, 1, 1, 0}));
+    BOOST_REQUIRE(first_evidence_requested_us.load() > 0);
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.evidence_error.clear(); // Genuine prebuilt certified result is now available.
+    }
+
+    // Two burst tokens refill in125ms. At200ms the global scheduler can
+    // permit a read, but the proposed fixed1s transient cooldown must not.
+    std::this_thread::sleep_until(budget_returned + 200ms);
+    const auto quiet_started_us{kernel::LockTimingNow()};
+    const auto quiet{client->ActionStatus(market, action.Id(), false)};
+    const auto quiet_counts{counts()};
+
+    std::this_thread::sleep_until(budget_returned + 1100ms);
+    const auto upgraded{client->ActionStatus(market, action.Id(), false)};
+    // Successful verification is sticky; subsequent ordinary reads neither
+    // reread inclusion nor resend an economic instruction.
+    const auto repeated{client->ActionStatus(market, action.Id(), false)};
+    const auto retained_after{client->SavedActions(owner, market)};
+    const auto final_counts{counts()};
+    client.reset();
+    server->Stop(); // All result assertions below run AFTER every actor drains.
+
+    BOOST_CHECK_LT(quiet_started_us - first_evidence_requested_us.load(), 1'000'000U);
+    BOOST_CHECK(quiet.certificate_verified && !quiet.outcome_verified);
+    BOOST_CHECK((quiet_counts == std::array<unsigned, 7>{1, 0, 0, 1, 1, 1, 0}));
+    for (const auto* receipt : {&budget, &quiet, &upgraded, &repeated}) {
+        BOOST_CHECK(receipt->certificate_verified);
+        BOOST_CHECK_EQUAL(receipt->state, "certified_inclusion");
+        BOOST_CHECK(receipt->action_id == included.action_id);
+        BOOST_CHECK(receipt->microblock_hash == included.microblock_hash);
+        BOOST_CHECK_EQUAL(receipt->microblock_sequence, included.microblock_sequence);
+        BOOST_CHECK_EQUAL(receipt->endpoint, included.endpoint);
+    }
+    // EXPECTED BEFORE on7ec: one-shot endpoint marker leaves these false/1.
+    BOOST_CHECK_MESSAGE(upgraded.outcome_verified && upgraded.outcome,
+        "A transient standalone BUDGET refusal permanently consumed outcome discovery");
+    BOOST_CHECK(repeated.outcome_verified);
+    BOOST_CHECK((final_counts == std::array<unsigned, 7>{1, 0, 0, 1, 2, 1, 0}));
+    if (upgraded.outcome) {
+        BOOST_CHECK_EQUAL(upgraded.outcome->evidence, "certified_result_preimage");
+        BOOST_CHECK_EQUAL(upgraded.outcome->status, "included_not_executed");
+        BOOST_CHECK_EQUAL(upgraded.outcome->reason_code, "INCLUDED_BAD_SEQUENCE");
+        BOOST_CHECK(!upgraded.outcome->final);
+    }
+    BOOST_REQUIRE_EQUAL(retained_after.size(), 1U);
+    BOOST_CHECK(retained_after.front().previously_certified);
+    BOOST_CHECK(retained_after.front().may_have_been_sent);
+    BOOST_CHECK_EQUAL(retained_after.front().signed_bytes_sha256, retained_before.front().signed_bytes_sha256);
+    BOOST_CHECK_EQUAL(retained_after.front().signed_bytes_size, bytes->size());
+    const auto durable{DurableRow(path, action)}; // Backend database is closed first.
+    BOOST_CHECK(durable["previously_certified"].isTrue());
+    BOOST_CHECK(durable["may_have_been_sent"].isTrue());
+    BOOST_CHECK_EQUAL(durable["action_hex"].get_str(), HexStr(*bytes));
+    BOOST_CHECK_EQUAL(durable["action_id"].get_str(), action.Id().GetHex());
+
+    // Restart inspects retention ONLY; it must not manufacture the recovery.
+    auto restarted{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {endpoint}, path, error)};
+    BOOST_REQUIRE_MESSAGE(restarted, error);
+    const auto restored{restarted->SavedActions(owner, market)};
+    BOOST_REQUIRE_EQUAL(restored.size(), 1U);
+    BOOST_CHECK(restored.front().previously_certified);
+    BOOST_CHECK(!restored.front().receipt.certificate_verified);
+    BOOST_CHECK_EQUAL(restored.front().signed_bytes_sha256, retained_before.front().signed_bytes_sha256);
+    BOOST_CHECK((counts() == final_counts)); // No restart network, no explicit/economic retry.
+    restarted.reset();
+}
+
 BOOST_AUTO_TEST_CASE(unknown_field_error_clears_both_capabilities)
 {
     const fs::path path{m_path_root / "client"};
