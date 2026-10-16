@@ -49,7 +49,8 @@
  * R10 adds the b3d chain adapters: trusted facts on REGTEST (MB1-ADP-06)
  * and the finalized adapter (M7-ADP-01); PBFT safety (M4-AGR-01; the probe
  * checks MayPrepare, MayCommit and OnViewChange), the PBFT agreement
- * (M4-AGR-02), the leader schedule (M4-AGR-03), inclusion lists (M4-AGR-04;
+ * (M4-AGR-02; the probe also checks the dev certifier's OnMessage, which
+ * returns Unsupported), the leader schedule (M4-AGR-03), inclusion lists (M4-AGR-04;
  * Build and Check), the restart fence (M4-AGR-06) and the evidence store
  * (M4-AGR-07; Record and Load).
  */
@@ -67,6 +68,7 @@
 #include <flowmesh2/core/market.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/dev/dev_certifier.h>
 #include <flowmesh2/engine/book.h>
 #include <flowmesh2/engine/engine.h>
 #include <flowmesh2/engine/matcher.h>
@@ -563,7 +565,13 @@ FM2_STUB_CASE(M4_AGR_02, "M4-AGR-02")
     agreement::PbftSafetyRules rules;
     StubSink sink;
     const agreement::PbftContext context{*rig.adapter, *rig.owner, rig.signer, rig.signer_log, rig.commit_log, rules, sink};
-    return Observe(agreement::PbftAgreement::Create(rig.profile, agreement::PbftConfig{}, context));
+    // The k = 1 dev certifier receives no messages: its OnMessage is PBFT's to replace.
+    const auto certifier{dev::DevSingleSeatCertifier::Create(rig.profile, *rig.adapter, rig.seats, rig.signer, rig.signer_log,
+                                                             rig.commit_log)
+                             .value()};
+    const std::vector<unsigned char> message{1};
+    return FirstDeviation("M4-AGR-02", {Observe(agreement::PbftAgreement::Create(rig.profile, agreement::PbftConfig{}, context)),
+                                        Observe(certifier->OnMessage(0, message))});
 }
 
 FM2_STUB_CASE(M4_AGR_03, "M4-AGR-03")

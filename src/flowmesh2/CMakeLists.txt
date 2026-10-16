@@ -136,12 +136,14 @@ if(BUILD_FLOWMESH2)
   )
 
   # dev/ (slice R10): REGTEST-only dev components, in namespace
-  # flowmesh2::dev: the scripted fake chain adapter. Every dev header has
+  # flowmesh2::dev: the scripted fake chain adapter and the k = 1 dev
+  # certifier (O-10). Every dev header has
   # #error unless FM2_DEV_COMPONENTS is defined, and fm2_dev defines it
   # PUBLIC, so only targets that link fm2_dev (the tests, later the
   # simulator) can include one. fm2_core never links fm2_dev, and guard rule
   # 3 fails if fm2_core or fm2_verify defines a dev symbol.
   add_library(fm2_dev STATIC
+    dev/dev_certifier.cpp
     dev/fake_chain.cpp
   )
   target_compile_definitions(fm2_dev PUBLIC FM2_DEV_COMPONENTS)
@@ -171,6 +173,7 @@ if(BUILD_FLOWMESH2)
     test/codes_tests.cpp
     test/commit_log_tests.cpp
     test/commitment_tests.cpp
+    test/dev_certifier_tests.cpp
     test/durable_tests.cpp
     test/engine_property_tests.cpp
     test/engine_tests.cpp
