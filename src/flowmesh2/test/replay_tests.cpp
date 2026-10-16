@@ -198,6 +198,11 @@ BOOST_AUTO_TEST_CASE(replay_refuses_an_inconsistent_journal)
     Records wrong_root{good};
     wrong_root[1].payload = applied.Encode();
     RequireFailure(replay(wrong_root), ErrorCode::VERIFY_FAILED, state::REPLAY_APPLIED_MISMATCH, "APPLIED with another root");
+    storage::AppliedRecord other_header{storage::AppliedRecord::Decode(good[1].payload).value()};
+    other_header.header_hash = LabelHash("fm2/test/other-header");
+    Records wrong_header{good};
+    wrong_header[1].payload = other_header.Encode();
+    RequireFailure(replay(wrong_header), ErrorCode::VERIFY_FAILED, state::REPLAY_APPLIED_MISMATCH, "APPLIED with another header");
     Records applied_first{good};
     std::swap(applied_first[0], applied_first[1]);
     RequireFailure(replay(Renumbered(applied_first)), ErrorCode::ORDER_VIOLATION, state::REPLAY_APPLIED_UNKNOWN, "APPLIED before DECISION");

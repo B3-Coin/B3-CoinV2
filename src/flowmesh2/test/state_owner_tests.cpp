@@ -110,6 +110,16 @@ BOOST_AUTO_TEST_CASE(create_takes_a_genesis_head_of_its_profile)
     const state::HeadView certified{state::HeadView::Make(genesis.Header(), LabelHash("fm2/test/cert/0"), genesis.StatePtr()).value()};
     RequireFailure(state::StateOwner::Create(profile, certified, 1), ErrorCode::INVALID_INPUT, state::OWNER_NOT_GENESIS,
                    "genesis with a certificate hash");
+    // Each genesis condition on its own: height, parent hash, parent certificate hash.
+    for (const auto& doctor : std::vector<std::function<void(SlotHeaderV2&)>>{
+             [](SlotHeaderV2& h) { h.height = 7; },
+             [](SlotHeaderV2& h) { h.parent_hash = LabelHash("fm2/test/parent"); },
+             [](SlotHeaderV2& h) { h.parent_cert_hash = LabelHash("fm2/test/parent-cert"); }}) {
+        SlotHeaderV2 header{genesis.Header()};
+        doctor(header);
+        RequireFailure(state::StateOwner::Create(profile, state::HeadView::Make(header, uint256{}, genesis.StatePtr()).value(), 1),
+                       ErrorCode::INVALID_INPUT, state::OWNER_NOT_GENESIS, "one genesis field changed");
+    }
     // A header naming another seat set than the state, or another state root.
     const StateRootsV0 roots{genesis.State().engine.Commit().value()};
     AuthorityVersion other_seats{TestAuthority(profile)};
