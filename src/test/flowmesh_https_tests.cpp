@@ -6942,6 +6942,123 @@ void ProspectiveForegroundReadAdmission(ClientLaneFixture& fixture, const fs::pa
 } // namespace
 
 // PRIVATE TEST-FIRST: catalog TLS must not own the client's work gate.
+namespace {
+//! Native proof-boundary control, not execution of the Qt helper or wallet
+//! signing RPC. The existing indexed B3 fixture and generated validator keys
+//! produce a real certified deposit; only the HTTPS reply hold/tamper is a fault.
+void SelectedProofWhileCatalogHeld(ClientLaneFixture& fixture, const fs::path& path, const bool corrupt_state)
+{
+    using namespace std::chrono_literals;
+    LiveMarket live{fixture, path / "service"};
+    live.Deposit();
+    const uint256 account{uint8_t{0x41}};
+    const auto before{live.service->MarketStatus(fixture.market)};
+    const auto state{live.service->StateSnapshot(fixture.market)};
+    BOOST_REQUIRE(before && state);
+    BOOST_REQUIRE(!before->paused);
+    BOOST_REQUIRE_EQUAL(state->LedgerView().Available(account, fixture.asset), 1);
+    WatchProxy proxy{.upstream = live.Endpoint()};
+    proxy.corrupt_snapshot = corrupt_state; // Fixed before worker/server creation.
+    auto front{Proxy(fixture, proxy)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*fixture.m_node.chainman, {fixture.Endpoint(front->Port())}, path / "client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE(client->SavedActions(account, fixture.market).empty());
+    std::future<std::vector<interfaces::FlowMeshMarketStatus>> catalog;
+    std::future<std::optional<interfaces::FlowMeshMarketStatus>> selected;
+    // Release runs BEFORE either future joins on every failure/exception.
+    // All captured storage outlives both futures and the server workers.
+    struct Release {
+        WatchProxy& proxy;
+        ~Release() { proxy.HoldRead({}); proxy.Hold(false); }
+    } const release{proxy};
+    proxy.HoldRead("markets");
+    catalog = std::async(std::launch::async, [&] {
+        node::FlowMeshClientWorkScope passive{node::FlowMeshClientWorkPriority::PASSIVE, node::FlowMeshClientWorkLinger::NONE};
+        return client->Markets(std::nullopt);
+    });
+    BOOST_REQUIRE(proxy.AwaitHeld(1)); // Actual upstream catalog reply is held.
+    BOOST_REQUIRE(catalog.wait_for(0ms) == std::future_status::timeout);
+    bool catalog_busy{false};
+    try {
+        (void)client->Markets(account); // The real first step of the old catalog-first preflight.
+    } catch (const std::exception& e) {
+        catalog_busy = std::string{e.what()}.find("Market discovery already in progress") != std::string::npos;
+    }
+    BOOST_REQUIRE(catalog_busy);
+    selected = std::async(std::launch::async, [&] {
+        node::FlowMeshClientWorkScope foreground{node::FlowMeshClientWorkPriority::FOREGROUND, node::FlowMeshClientWorkLinger::NONE};
+        // Equivalent backend boundary to the wallet's explicit selected balance
+        // read: no signing-preflight scope, stale join, Submit or ActionStatus.
+        return client->Market(fixture.market, account);
+    });
+    const bool completed_while_held{selected.wait_for(1s) == std::future_status::ready};
+    bool still_held;
+    {
+        std::lock_guard lock{proxy.mutex};
+        still_held = proxy.hold;
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "markets"), 1);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "snapshot"), 1);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "updates"), 0);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "submit"), 0);
+        BOOST_CHECK_EQUAL(std::count(proxy.methods.begin(), proxy.methods.end(), "action"), 0);
+    }
+    proxy.HoldRead({}); proxy.Hold(false); // Never join a held reply, even on failure.
+    const auto proof{selected.get()};
+    bool catalog_superseded{false};
+    try {
+        (void)catalog.get();
+    } catch (const std::exception& e) {
+        catalog_superseded = std::string{e.what()}.find("Market discovery context or endpoint observation was superseded") != std::string::npos;
+    }
+    BOOST_CHECK_MESSAGE(completed_while_held && still_held, "Selected proof waited for the genuine held catalog reply");
+    BOOST_REQUIRE(proof);
+    if (corrupt_state) {
+        BOOST_CHECK(!proof->certificate_verified && !proof->account_state_verified);
+        BOOST_CHECK(!proof->running && proof->paused);
+        BOOST_CHECK(!proof->error.empty());
+    } else {
+        BOOST_CHECK(proof->remote && proof->available && proof->running && !proof->paused);
+        BOOST_CHECK(proof->certificate_verified && proof->account_state_verified);
+        BOOST_CHECK(proof->domain == fixture.domain && proof->market_id == fixture.market);
+        BOOST_CHECK(proof->base_asset == fixture.asset && proof->vault_id == fixture.vault && proof->execution_config_id == fixture.config);
+        BOOST_REQUIRE(proof->account_id);
+        BOOST_CHECK(*proof->account_id == account);
+        BOOST_CHECK_EQUAL(proof->next_account_sequence, state->NextSequence(account));
+        BOOST_CHECK_EQUAL(proof->base_available, state->LedgerView().Available(account, fixture.asset));
+        BOOST_CHECK_EQUAL(proof->base_reserved, state->LedgerView().Reserved(account, fixture.asset));
+        BOOST_CHECK_EQUAL(proof->b3_available, state->LedgerView().Available(account, modern::NativeAsset()));
+        BOOST_CHECK_EQUAL(proof->b3_reserved, state->LedgerView().Reserved(account, modern::NativeAsset()));
+        BOOST_CHECK(proof->last_microblock_hash == before->last_microblock_hash);
+    }
+    // Selected evidence updates endpoint observations, so the held older
+    // discovery completion must not overwrite them or secretly retry.
+    BOOST_CHECK(catalog_superseded);
+    BOOST_CHECK(client->SavedActions(account, fixture.market).empty());
+    BOOST_CHECK_EQUAL(client->Status().pending_actions, 0U);
+    const auto after{live.service->MarketStatus(fixture.market)};
+    BOOST_REQUIRE(after);
+    BOOST_CHECK_EQUAL(after->next_sequence, before->next_sequence);
+    BOOST_CHECK(after->last_microblock_hash == before->last_microblock_hash);
+    {
+        std::lock_guard lock{proxy.mutex};
+        BOOST_CHECK_EQUAL(proxy.methods.size(), 2U); // One catalog + one selected snapshot, no economic body.
+    }
+    // A successful new proof may durably advance the CLIENT high-water mark.
+    // This test promises no signed action or server head change, not no writes.
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(selected_certified_account_proof_remains_available_while_catalog_tls_is_held)
+{
+    SelectedProofWhileCatalogHeld(*this, m_path_root / "selected-proof-held-catalog", false);
+}
+
+BOOST_AUTO_TEST_CASE(selected_corrupted_state_is_refused_while_catalog_tls_is_held)
+{
+    SelectedProofWhileCatalogHeld(*this, m_path_root / "selected-corrupt-held-catalog", true);
+}
+
 BOOST_AUTO_TEST_CASE(passive_catalog_tls_leaves_local_status_unsigned_refusal_and_health_available)
 {
     using namespace std::chrono_literals;

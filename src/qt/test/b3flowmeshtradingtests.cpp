@@ -40,6 +40,17 @@ UniValue Snapshot(bool paused = false)
     a.pushKV("b3_available", ValueFromAmount(MAX_MONEY)); a.pushKV("b3_reserved", ValueFromAmount(0)); v.pushKV("account", a);
     return v;
 }
+UniValue RemoteSnapshot()
+{
+    auto value{Snapshot()};
+    UniValue verification{UniValue::VOBJ};
+    verification.pushKV("source", "remote_endpoint");
+    verification.pushKV("endpoint", "https://selected-proof.invalid:19580");
+    verification.pushKV("certificate_verified", true);
+    verification.pushKV("account_state_verified", true);
+    value.pushKV("verification", std::move(verification));
+    return value;
+}
 bool Rejected(const std::function<void()>& f) {
     try { f(); } catch (const std::exception&) { return true; } catch (const UniValue&) { return true; } return false;
 }
@@ -1269,6 +1280,178 @@ private Q_SLOTS:
             throw std::runtime_error{"A cancelled action must never reach a write"};
         };
         QVERIFY(Rejected([&] { DispatchApproved(a, true, [&] { return cancelled; }, reads); })); QCOMPARE(calls, 2);
+    }
+    void remoteApprovedDispatchUsesOnlyExactSelectedProof() {
+        // Offline helper-policy test only. The response flags are parser
+        // inputs, not a claim that this fixture verifies a certificate.
+        std::vector<Action> actions;
+        auto bid{Order()}; bid.market = ParseMarket(RemoteSnapshot()); bid.submit_wait_ms = 2000;
+        actions.push_back(bid);
+        auto ask{bid}; ask.side = QStringLiteral("ask"); actions.push_back(ask);
+        auto ladder{bid}; ladder.ladder = {{1000, 500'000}, {999, 500'000}}; actions.push_back(ladder);
+        auto cancel{bid}; cancel.operation = Operation::Cancel; actions.push_back(cancel);
+        cancel.side = QStringLiteral("ask"); actions.push_back(cancel);
+        auto withdraw{bid}; withdraw.operation = Operation::Withdraw; withdraw.destination = Address();
+        withdraw.native = false; actions.push_back(withdraw);
+        withdraw.native = true; actions.push_back(withdraw);
+        for (const auto& action : actions) {
+            const auto expected{Parameters(action)};
+            int catalogs{0}, balances{0}, mutations{0};
+            std::string method;
+            UniValue params, balance_params, response;
+            const RpcCall rpc = [&](const std::string& name, const UniValue& arguments) {
+                if (name == "listflowmeshmarkets") { ++catalogs; throw std::runtime_error{"Market discovery already in progress"}; }
+                if (name == "getflowmeshbalance") { ++balances; balance_params = arguments; return RemoteSnapshot(); }
+                ++mutations; method = name; params = arguments;
+                UniValue result{UniValue::VOBJ}; result.pushKV("mutation_trap", true); return result;
+            };
+            const bool refused{Rejected([&] { response = DispatchApproved(action, true, [] { return false; }, rpc); })};
+            QVERIFY2(!refused, "An exact selected remote proof must not require an unrelated catalog flight");
+            QCOMPARE(catalogs, 0); QCOMPARE(balances, 1); QCOMPARE(mutations, 1);
+            QCOMPARE(balance_params.size(), size_t{1}); QCOMPARE(balance_params[0].get_str(), action.market.id.toStdString());
+            QCOMPARE(method, expected.method); QCOMPARE(params.write(), expected.params.write());
+            QVERIFY(response["mutation_trap"].isTrue());
+            QCOMPARE(Parameters(action).params.write(), expected.params.write()); // Original review is unchanged.
+        }
+    }
+    void remoteApprovedSelectedProofRejectsEveryChangedGate() {
+        using Mutate = std::function<void(UniValue&)>;
+        const auto verification = [](UniValue& value, const char* key, const UniValue& replacement) {
+            auto fields{value["verification"]}; fields.pushKV(key, replacement); value.pushKV("verification", std::move(fields));
+        };
+        const auto account = [](UniValue& value, const char* key, const UniValue& replacement) {
+            auto fields{value["account"]}; fields.pushKV(key, replacement); value.pushKV("account", std::move(fields));
+        };
+        const std::vector<std::pair<const char*, Mutate>> cases{
+            {"market", [](auto& v) { v.pushKV("market_id", H(99).GetHex()); }},
+            {"base", [](auto& v) { v.pushKV("base_asset_id", H(99).GetHex()); }},
+            {"vault", [](auto& v) { v.pushKV("vault_id", H(99).GetHex()); }},
+            {"domain", [](auto& v) { v.pushKV("domain", H(99).GetHex()); }},
+            {"configuration", [](auto& v) { v.pushKV("execution_config_id", H(99).GetHex()); }},
+            {"another canonical market", [](auto& v) {
+                const auto market{*flowmesh::ComputeFlowMeshMarketId(H(1), H(99))};
+                v.pushKV("market_id", market.GetHex()); v.pushKV("base_asset_id", H(99).GetHex());
+                v.pushKV("vault_id", flowmesh::ComputeFlowMeshVaultId(H(1), market)->GetHex());
+            }},
+            {"another canonical domain", [](auto& v) {
+                const auto market{*flowmesh::ComputeFlowMeshMarketId(H(99), H(2))};
+                v.pushKV("market_id", market.GetHex()); v.pushKV("domain", H(99).GetHex());
+                v.pushKV("vault_id", flowmesh::ComputeFlowMeshVaultId(H(99), market)->GetHex());
+            }},
+            {"wrong quote", [](auto& v) { v.pushKV("quote_asset", "other"); }},
+            {"source changed to local", [&](auto& v) { verification(v, "source", UniValue{"local_engine"}); }},
+            {"verification absent", [](auto& v) { v.pushKV("verification", UniValue{}); }},
+            {"unverified certificate", [&](auto& v) { verification(v, "certificate_verified", UniValue{false}); }},
+            {"unverified account", [&](auto& v) { verification(v, "account_state_verified", UniValue{false}); }},
+            {"missing endpoint", [&](auto& v) { verification(v, "endpoint", UniValue{""}); }},
+            {"unavailable", [](auto& v) { v.pushKV("available", false); }},
+            {"not running", [](auto& v) { v.pushKV("running", false); }},
+            {"paused", [](auto& v) { v.pushKV("paused", true); }},
+            {"handoff", [](auto& v) { v.pushKV("pending_handoff", true); }},
+            {"halt", [](auto& v) { v.pushKV("halt", "certificate_conflict"); }},
+            {"error", [](auto& v) { v.pushKV("error", "Current authority is unavailable"); }},
+            {"account absent", [](auto& v) { v.pushKV("account", UniValue{}); }},
+            {"account changed", [&](auto& v) { account(v, "account_id", UniValue{H(99).GetHex()}); }},
+            {"sequence advanced", [&](auto& v) { account(v, "next_sequence", UniValue{8}); }},
+            {"sequence behind", [&](auto& v) { account(v, "next_sequence", UniValue{6}); }},
+            {"malformed checkpoint status", [](auto& v) { v.pushKV("pending_checkpoint_id", UniValue{}); }},
+        };
+        for (const auto operation : {Operation::Order, Operation::Cancel, Operation::Withdraw}) {
+            auto action{Order()}; action.market = ParseMarket(RemoteSnapshot()); action.operation = operation;
+            action.native = true; action.destination = Address();
+            for (const auto& [label, mutate] : cases) {
+                auto changed{RemoteSnapshot()}; mutate(changed);
+                int catalogs{0}, balances{0}, mutations{0};
+                const RpcCall rpc = [&](const std::string& method, const UniValue&) {
+                    if (method == "listflowmeshmarkets") { ++catalogs; UniValue rows{UniValue::VARR}; rows.push_back(RemoteSnapshot()); return rows; }
+                    if (method == "getflowmeshbalance") { ++balances; return changed; }
+                    ++mutations; return UniValue{};
+                };
+                QVERIFY2(Rejected([&] { DispatchApproved(action, true, [] { return false; }, rpc); }), label);
+                QCOMPARE(mutations, 0); QCOMPARE(balances, 1); QCOMPARE(catalogs, 0);
+            }
+        }
+    }
+    void remoteApprovedPreflightCancellationAndFailureNeverRetry() {
+        auto action{Order()}; action.market = ParseMarket(RemoteSnapshot());
+        int catalogs{0}, balances{0}, mutations{0}; bool cancelled{false};
+        const RpcCall cancel_after_read = [&](const std::string& method, const UniValue&) {
+            if (method == "listflowmeshmarkets") { ++catalogs; throw std::runtime_error{"Catalog must not be called"}; }
+            if (method == "getflowmeshbalance") { ++balances; cancelled = true; return RemoteSnapshot(); }
+            ++mutations; return UniValue{};
+        };
+        QVERIFY(Rejected([&] { DispatchApproved(action, false, [] { return false; }, cancel_after_read); }));
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return true; }, cancel_after_read); }));
+        QCOMPARE(catalogs + balances + mutations, 0);
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [&] { return cancelled; }, cancel_after_read); }));
+        QCOMPARE(catalogs, 0); QCOMPARE(balances, 1); QCOMPARE(mutations, 0);
+        balances = 0;
+        const RpcCall unavailable = [&](const std::string& method, const UniValue&) -> UniValue {
+            if (method == "getflowmeshbalance") { ++balances; throw std::runtime_error{"Current selected proof is unavailable"}; }
+            if (method == "listflowmeshmarkets") ++catalogs; else ++mutations;
+            throw std::runtime_error{"No fallback or mutation is permitted"};
+        };
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return false; }, unavailable); }));
+        QCOMPARE(catalogs, 0); QCOMPARE(balances, 1); QCOMPARE(mutations, 0);
+        balances = 0;
+        const auto expected{Parameters(action)};
+        std::string sent_method; UniValue sent_params;
+        const RpcCall ambiguous_mutation = [&](const std::string& method, const UniValue& params) -> UniValue {
+            if (method == "getflowmeshbalance") { ++balances; return RemoteSnapshot(); }
+            if (method == "listflowmeshmarkets") { ++catalogs; throw std::runtime_error{"Catalog must not be called"}; }
+            ++mutations; sent_method = method; sent_params = params;
+            throw std::runtime_error{"Mutation outcome is unknown; do not retry"};
+        };
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return false; }, ambiguous_mutation); }));
+        QCOMPARE(catalogs, 0); QCOMPARE(balances, 1); QCOMPARE(mutations, 1);
+        QCOMPARE(sent_method, expected.method); QCOMPARE(sent_params.write(), expected.params.write());
+        QCOMPARE(Parameters(action).params.write(), expected.params.write());
+    }
+    void remoteApprovedSelectedPolicyDoesNotChangeDiscoveryOrFunding() {
+        int catalogs{0}, balances{0}, mutations{0};
+        const RpcCall busy = [&](const std::string& method, const UniValue&) -> UniValue {
+            if (method == "listflowmeshmarkets") { ++catalogs; throw std::runtime_error{"Market discovery already in progress"}; }
+            if (method == "getflowmeshbalance") { ++balances; return RemoteSnapshot(); }
+            ++mutations; return UniValue{};
+        };
+        auto action{Order()}; action.market = ParseMarket(RemoteSnapshot());
+        QVERIFY(Rejected([&] { ReadMarket(action.market.id, busy); })); // General review/discovery keeps its list gate.
+        QCOMPARE(catalogs, 1); QCOMPARE(balances, 0); QCOMPARE(mutations, 0);
+        const std::vector<Operation> excluded{Operation::Deposit, Operation::Admit, Operation::Checkpoint, Operation::Vault};
+        for (const auto operation : excluded) {
+            catalogs = balances = mutations = 0; action.operation = operation;
+            QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return false; }, busy); }));
+            QCOMPARE(catalogs, 1); QCOMPARE(balances, 0); QCOMPARE(mutations, 0);
+        }
+        catalogs = balances = mutations = 0; action = Order(); // Local engine is not opted into selected-only preflight.
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return false; }, busy); }));
+        QCOMPARE(catalogs, 1); QCOMPARE(balances, 0); QCOMPARE(mutations, 0);
+        catalogs = balances = mutations = 0; action.market = ParseMarket(RemoteSnapshot()); action.market.has_account = false;
+        action.market.account.clear();
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return false; }, busy); }));
+        QCOMPARE(catalogs, 1); QCOMPARE(balances, 0); QCOMPARE(mutations, 0);
+    }
+    void remoteApprovedSelectedProofStillChecksCurrentFundsAndOperatorCheckpoint() {
+        auto action{Order()}; action.market = ParseMarket(RemoteSnapshot());
+        auto empty{RemoteSnapshot()}; auto account{empty["account"]};
+        account.pushKV("base_available", 0); account.pushKV("b3_available", ValueFromAmount(0)); empty.pushKV("account", account);
+        int mutations{0};
+        const RpcCall rpc = [&](const std::string& method, const UniValue&) {
+            if (method == "listflowmeshmarkets") { UniValue rows{UniValue::VARR}; rows.push_back(RemoteSnapshot()); return rows; }
+            if (method == "getflowmeshbalance") return empty;
+            ++mutations; return UniValue{};
+        };
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return false; }, rpc); }));
+        action.side = QStringLiteral("ask");
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return false; }, rpc); }));
+        action.operation = Operation::Withdraw; action.native = true; action.destination = Address();
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return false; }, rpc); }));
+        action.native = false;
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return false; }, rpc); }));
+        QCOMPARE(mutations, 0);
+        action.operation = Operation::Checkpoint; empty = RemoteSnapshot(); empty.pushKV("pending_checkpoint_id", H(9).GetHex());
+        QVERIFY(Rejected([&] { DispatchApproved(action, true, [] { return false; }, rpc); }));
+        QCOMPARE(mutations, 0); // Operator preparation keeps its original checkpoint equality guard.
     }
     void changedSequenceAndCheckpointRequireNewReview() {
         auto a{Order()}; auto fresh{a.market}; ++fresh.sequence;

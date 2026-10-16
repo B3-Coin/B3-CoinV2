@@ -244,10 +244,29 @@ int SubmissionWaitMs(const Operation operation, const bool remote, const bool wa
     return remote && wallet_was_unlocked && Sequenced(operation) && wait_ms > 0 ? wait_ms : 0;
 }
 
+namespace {
+Market ReadApprovedMarket(const Action& action, const RpcCall& rpc)
+{
+    const bool selected_remote{action.market.remote && action.market.has_account &&
+        (action.operation == Operation::Order || action.operation == Operation::Cancel || action.operation == Operation::Withdraw)};
+    if (!selected_remote) return ReadMarket(action.market.id, rpc);
+    // Availability policy for an ALREADY reviewed remote account only:
+    // unrelated catalog membership/validation is not a final submission veto.
+    // getflowmeshbalance must still obtain the exact selected state verified
+    // under current local B3 pins/anchor/authority; no catalog/stale fallback.
+    UniValue params{UniValue::VARR}; params.push_back(action.market.id.toStdString());
+    auto fresh{ParseMarket(rpc("getflowmeshbalance", params))};
+    // CheckSameMarket below binds the remaining reviewed identity/account,
+    // readiness and sequence. It historically did NOT bind reviewed.remote.
+    if (fresh.remote != action.market.remote) Fail("The reviewed market verification source changed.");
+    return fresh;
+}
+} // namespace
+
 UniValue DispatchApproved(const Action& a, bool approved, const std::function<bool()>& cancelled, const RpcCall& rpc)
 {
     if (!approved || cancelled()) Fail("Action cancelled; nothing was submitted.");
-    auto current{a}; current.market = ReadMarket(a.market.id, rpc);
+    auto current{a}; current.market = ReadApprovedMarket(a, rpc);
     CheckSameMarket(a.market, current.market, Sequenced(a.operation), Settlement(a.operation));
     if (a.operation == Operation::Checkpoint && a.market.checkpoint != current.market.checkpoint) Fail("The pending checkpoint changed. Inspect the new certificate before preparing it.");
     const auto request{Parameters(current)};

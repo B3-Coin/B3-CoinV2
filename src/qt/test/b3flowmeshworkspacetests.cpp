@@ -1359,7 +1359,8 @@ class B3FlowMeshWorkspaceTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(probe.catalog_entered.available() > 0, 1000);
         QVERIFY(probe.catalog_entered.tryAcquire());
         QCOMPARE(probe.passive_catalog_calls.load(), 2);
-        QCOMPARE(probe.catalog_calls.load(), 3); // Two passive reads plus the required foreground discovery.
+        QCOMPARE(probe.catalog_calls.load(), 2); // Exactly the two passive owners; selected-only final preflight adds NO foreground catalog.
+        QCOMPARE(probe.preflights.load(), 1); // The existing selected getflowmeshbalance RPC dispatch still ran exactly once.
         QVERIFY(panel.m_catalog_read_thread);
         QVERIFY(panel.m_catalog_read_result != original); QVERIFY(!panel.m_catalog_read_pending);
         if (failed) QVERIFY(original->data.error.contains(QStringLiteral("Synthetic old catalog failed late")));
