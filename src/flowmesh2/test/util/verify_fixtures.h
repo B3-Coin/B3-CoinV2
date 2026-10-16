@@ -153,6 +153,7 @@ struct SkeletonIds {
     ActionId e; //!< Bob TRANSFER 100,000 rUSD to Alice, n=2 (slot 4)
     ActionId f; //!< Alice CANCEL b, n=4 (slot 4)
     std::vector<unsigned char> c_bytes;
+    std::vector<unsigned char> d_bytes;
     std::vector<unsigned char> w_bytes; //!< Alice BUY M1 GTC 1 at 1, n=5, ref_slot 3, max_delay 1: never proposed
 };
 
@@ -186,6 +187,7 @@ std::vector<CommittedSlot> RunSkeleton(SlotFixture& actions, Run&& run, Skeleton
         ids.c = a.IdOf(c);
         ids.d = a.IdOf(d);
         ids.c_bytes = c;
+        ids.d_bytes = d;
         out.push_back(run({}, {c, d}));
         ids.w_bytes = a.Sign(a.Unsigned("alice", 5, ActionKind::PLACE,
                                         EncodePayload(PlacePayload{MarketM1().Id(), Side::BUY, TimeInForce::GTC, 1, 1}).value(),

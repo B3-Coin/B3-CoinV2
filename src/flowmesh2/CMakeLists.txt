@@ -93,9 +93,12 @@ if(BUILD_FLOWMESH2)
   # flowmesh2::chain. agreement/ (slice R10): the capped agreement messages,
   # the Agreement and SafetyRules interfaces and the PBFT, leader,
   # inclusion-list, restart-fence and evidence stubs, in namespace
-  # flowmesh2::agreement. Later slices add the other application
-  # directories here. fm2_verify never links it (guard rule 4), and it never links
-  # bitcoin_common (guard rule 4).
+  # flowmesh2::agreement. read/ (slice R11): immutable slot views and the
+  # read service over the C1 ReadSlot, in namespace flowmesh2::read; the
+  # C1 library flowmesh2_foundations joins here (unchanged; guard rule 6).
+  # Later slices add the other application directories here. fm2_verify
+  # never links it (guard rule 4), and it never links bitcoin_common (guard
+  # rule 4).
   add_library(fm2_core STATIC
     agreement/evidence.cpp
     agreement/inclusion.cpp
@@ -112,6 +115,8 @@ if(BUILD_FLOWMESH2)
     ledger/ledger.cpp
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
+    read/read_service.cpp
+    read/views.cpp
     state/candidate.cpp
     state/replay.cpp
     state/state_owner.cpp
@@ -132,6 +137,7 @@ if(BUILD_FLOWMESH2)
       crc32c
       fm2_warnings
     PUBLIC
+      flowmesh2_foundations
       fm2_types
   )
 
@@ -212,6 +218,7 @@ if(BUILD_FLOWMESH2)
     test/nonce_window_tests.cpp
     test/outcome_tests.cpp
     test/params_tests.cpp
+    test/read_tests.cpp
     test/record_tests.cpp
     test/replay_tests.cpp
     test/result_tests.cpp
