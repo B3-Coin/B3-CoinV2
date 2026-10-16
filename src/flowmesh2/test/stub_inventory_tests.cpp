@@ -23,11 +23,14 @@
  * Certified typed refusals (an OutcomeCode such as
  * REJ_RESIDUAL_CROSS_UNSUPPORTED) are covered by the slice that adds them.
  *
- * Slice R1 adds the registry and its self-check only; no stub exists yet.
+ * Slice R1 added the registry and its self-check. Slice R3 adds the four
+ * stubs of core/params Validate(): the price band (M3-ENG-03), PER_SIDE fees
+ * (M3-ENG-08), futures (M9-FUT-01) and folded signing (M4-STO-05).
  */
 
 #include <boost/test/unit_test.hpp>
 
+#include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
 
 #include <exception>
@@ -167,6 +170,9 @@ StubObservation ThrowingProbe() { throw std::runtime_error{"probe exploded"}; }
 
 size_t ProblemCount(std::vector<StubEntry> entries) { return InventoryProblems(entries).size(); }
 
+//! The provisional regtest profile, which Validate() accepts unchanged.
+ProfileParams RegtestProfile() { return DevRegtestProfile(ChainType::REGTEST).value(); }
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(stub_inventory)
@@ -193,6 +199,36 @@ BOOST_AUTO_TEST_CASE(checker_detects_bad_entries)
     BOOST_CHECK_EQUAL(ProblemCount({{"R1", "R_1", GoodProbe}}), 1U);
     // A malformed id also mismatches the detail the probe returns.
     BOOST_CHECK_EQUAL(ProblemCount({{"r1", "r1", GoodProbe}}), 2U);
+}
+
+// ---- Slice R3: core/params Validate() ----
+
+FM2_STUB_CASE(M3_ENG_03, "M3-ENG-03")
+{
+    ProfileParams params{RegtestProfile()};
+    params.price_band_enabled = true;
+    return Observe(Validate(params));
+}
+
+FM2_STUB_CASE(M3_ENG_08, "M3-ENG-08")
+{
+    ProfileParams params{RegtestProfile()};
+    params.fee_incidence = FeeIncidence::PER_SIDE;
+    return Observe(Validate(params));
+}
+
+FM2_STUB_CASE(M9_FUT_01, "M9-FUT-01")
+{
+    ProfileParams params{RegtestProfile()};
+    params.futures_enabled = true;
+    return Observe(Validate(params));
+}
+
+FM2_STUB_CASE(M4_STO_05, "M4-STO-05")
+{
+    ProfileParams params{RegtestProfile()};
+    params.signer_mode = SignerMode::FOLDED_SIGNING;
+    return Observe(Validate(params));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

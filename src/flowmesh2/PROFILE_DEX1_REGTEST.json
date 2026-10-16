@@ -1,0 +1,47 @@
+{
+  "profile_id": "fm2-dex1-regtest-provisional/1",
+  "status": "PROVISIONAL REGTEST: plan section 12.1 recommended defaults, used provisionally under the owner instruction of 2026-10-16; none ratified",
+  "mainnet_valid": false,
+  "owner_protected": true,
+  "source": "src/flowmesh2/core/params.cpp DevRegtestProfile; params_tests/profile_json_matches_code fails if this file and the code differ",
+  "profile_hash": "c101c802495f73f37177b3ad68d3edb71a7e5a252ebbfc8533cad699e1756281",
+  "profile_hash_definition": "Tagged(B3/FM2/PROFILE, EncodeProfile(params)) as hex in byte order (Python hashlib hexdigest order, not uint256::GetHex)",
+  "encoding_version": 1,
+  "params": {
+    "profile_id": "fm2-dex1-regtest-provisional/1",
+    "fm_version": 1,
+    "chain": "regtest",
+    "matching": "A2_PRORATA",
+    "fee_ppm": 100,
+    "fee_incidence": "SELLER",
+    "seat_share_percent": 80,
+    "max_actions_per_slot": 1024,
+    "max_action_payload_bytes": 4096,
+    "max_fills_per_order": 1024,
+    "max_fills_per_slot": 16384,
+    "max_changed_leaves_per_slot": 8192,
+    "max_open_orders_per_account": 1000,
+    "price_band_enabled": false,
+    "price_band_percent": 50,
+    "nonce_window": 100,
+    "max_delay_slots": 1024,
+    "futures_enabled": false,
+    "signer_mode": "STRICT",
+    "pool_capacity": 4096,
+    "outcome_index_slots": 1024
+  },
+  "decisions": {
+    "D1": "new core on the same B3 chain: DomainHash binds ModernChainDomain, fm_version and the network magic",
+    "D4": "matching A2_PRORATA: makers price-time FIFO; same-slot takers pro-rata per level, largest remainder, ties by canonical rank",
+    "D5": "the seller pays fee_ppm once in the quote asset; floor(seat_share_percent) of slot fees to the seat pool, the rest to the treasury",
+    "D6": "engine caps as listed; price band disabled until its reference source is ruled",
+    "D7": "nonce window of 100 used nonces; every action expires after at most max_delay_slots; exact-byte resends allowed",
+    "D8": "regtest exchange with trusted facts before finality V2: the profile is valid on chain type regtest only"
+  },
+  "refused_until_implemented": {
+    "price_band_enabled=true": "M3-ENG-03",
+    "fee_incidence=PER_SIDE": "M3-ENG-08",
+    "futures_enabled=true": "M9-FUT-01",
+    "signer_mode=FOLDED": "M4-STO-05"
+  }
+}
