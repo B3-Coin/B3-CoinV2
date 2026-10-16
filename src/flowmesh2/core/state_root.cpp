@@ -51,6 +51,38 @@ Result<TotalsLeafV0> TotalsLeafV0::Decode(std::span<const unsigned char> bytes)
 
 uint256 TotalsLeafV0::LeafValue() const { return Tagged(HashTag::STATE_TOTALS, Encode()); }
 
+bool RestingOrderLeafV0::IsCanonical() const
+{
+    if (!IsKnown(side) || price_ticks == 0 || remaining_lots == 0) return false;
+    if (!InAtomRange(reserved_left) || !InAtomRange(cum_quote) || !InAtomRange(fee_charged)) return false;
+    if (fee_charged > cum_quote) return false;
+    return side == Side::SELL || fee_charged == 0;
+}
+
+std::vector<unsigned char> RestingOrderLeafV0::Encode() const
+{
+    std::vector<unsigned char> out;
+    VectorWriter writer{out, 0};
+    writer << order << market << owner << static_cast<uint8_t>(side) << price_ticks << remaining_lots << arrival_rank
+           << reserved_left << cum_quote << fee_charged << fills;
+    return out;
+}
+
+Result<RestingOrderLeafV0> RestingOrderLeafV0::Decode(std::span<const unsigned char> bytes)
+{
+    return DecodeExactWith(bytes, ENCODED_BYTES, [](SpanReader& reader) {
+        RestingOrderLeafV0 leaf;
+        uint8_t side_byte{0};
+        reader >> leaf.order >> leaf.market >> leaf.owner >> side_byte >> leaf.price_ticks >> leaf.remaining_lots >>
+            leaf.arrival_rank >> leaf.reserved_left >> leaf.cum_quote >> leaf.fee_charged >> leaf.fills;
+        leaf.side = static_cast<Side>(side_byte);
+        if (!leaf.IsCanonical()) throw std::ios_base::failure("RestingOrderLeafV0 is not canonical");
+        return leaf;
+    });
+}
+
+uint256 RestingOrderLeafV0::LeafValue() const { return Tagged(HashTag::STATE_ORDERS, Encode()); }
+
 uint256 MarketLeafValue(const MarketDescriptor& market) { return TaggedObject(HashTag::STATE_MARKETS, market); }
 
 uint256 NullifierLeafValue(const Outpoint& outpoint) { return TaggedObject(HashTag::STATE_NULLIFIERS, outpoint); }

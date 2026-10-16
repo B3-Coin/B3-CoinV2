@@ -5,11 +5,13 @@
 #ifndef B3_FLOWMESH2_CORE_STATE_ROOT_H
 #define B3_FLOWMESH2_CORE_STATE_ROOT_H
 
+#include <flowmesh2/core/action.h>
 #include <flowmesh2/core/amount.h>
 #include <flowmesh2/core/ids.h>
 #include <flowmesh2/core/market.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/core/slot.h>
 #include <serialize.h>
 #include <uint256.h>
 
@@ -32,7 +34,7 @@
  * size-bound RFC 6962 MerkleRoot (core/merkle.h) of its leaf values sorted by
  * key, every key at most once:
  *   accounts   key AccountId  value AccountLeafV0::LeafValue()  (STATE_ACCOUNTS)
- *   orders     key OrderId    value defined by R7              (STATE_ORDERS)
+ *   orders     key OrderId    value RestingOrderLeafV0::LeafValue() (STATE_ORDERS, R7)
  *   markets    key MarketId   value MarketLeafValue            (STATE_MARKETS)
  *   nullifiers key Outpoint   value NullifierLeafValue         (STATE_NULLIFIERS)
  *   totals     key AssetId    value TotalsLeafV0::LeafValue()  (STATE_TOTALS)
@@ -50,8 +52,10 @@
  */
 namespace flowmesh2 {
 
-//! SlotHeaderV2.commitment_version of the sorted-leaf commitment.
-inline constexpr uint8_t COMMITMENT_VERSION_V0{0};
+// COMMITMENT_VERSION_V0 (the SlotHeaderV2.commitment_version of the
+// sorted-leaf commitment) is defined once, in core/slot.h. Until slice R7 this
+// header defined it a second time, so no translation unit could include both
+// headers (engine/engine.h needs both).
 
 //! Tagged(PROTOCOL_ACCOUNT, "SEAT_POOL" || profile_hash).
 // TODO(rebirth:M7-FEE-01) per-seat accrual and claims by BLS key replace the single seat-pool account.
@@ -115,6 +119,47 @@ uint256 MarketLeafValue(const MarketDescriptor& market);
 
 //! Tagged(STATE_NULLIFIERS, txid || u32 LE vout): one credited deposit outpoint.
 uint256 NullifierLeafValue(const Outpoint& outpoint);
+
+/** One resting order in the orders component (slice R7), 153 bytes:
+ *   order | market | owner | u8 side | u64 price_ticks | u64 remaining_lots
+ *   | u64 arrival_rank | i64 reserved_left | i64 cum_quote | i64 fee_charged
+ *   | u64 fills
+ * The fields are those of the engine's RestingOrder (engine/book.h) plus the
+ * market it rests in; the key is `order`. PROVISIONAL REGTEST (O-32).
+ *
+ * Canonical form: a known side; price_ticks and remaining_lots of at least
+ * 1; reserved_left, cum_quote and fee_charged in [0, MAX_ATOMS];
+ * fee_charged <= cum_quote; a BUY has fee_charged 0 (the seller pays, D5).
+ * Decode refuses anything else with DECODE (OVERSIZE above 153 bytes).
+ * Whether reserved_left is the exact reservation of the remaining lots needs
+ * the market descriptor; the engine checks that (book invariant 2), not the
+ * leaf. Encode() is total.
+ *
+ * LeafValue() = Tagged(STATE_ORDERS, Encode()).
+ */
+struct RestingOrderLeafV0 {
+    OrderId order;
+    MarketId market;
+    AccountId owner;
+    Side side{Side::BUY};
+    uint64_t price_ticks{0};
+    uint64_t remaining_lots{0};
+    uint64_t arrival_rank{0};
+    Atoms reserved_left{0};
+    Atoms cum_quote{0};
+    Atoms fee_charged{0};
+    uint64_t fills{0};
+
+    static constexpr size_t ENCODED_BYTES{3 * 32 + 1 + 3 * 8 + 3 * 8 + 8};
+    friend bool operator==(const RestingOrderLeafV0&, const RestingOrderLeafV0&) = default;
+
+    //! True iff the leaf has the canonical form above.
+    bool IsCanonical() const;
+    std::vector<unsigned char> Encode() const;
+    static Result<RestingOrderLeafV0> Decode(std::span<const unsigned char> bytes);
+    //! Tagged(STATE_ORDERS, Encode()).
+    uint256 LeafValue() const;
+};
 
 /** The five component roots of commitment v0, 160 bytes in field order. */
 struct StateRootsV0 {

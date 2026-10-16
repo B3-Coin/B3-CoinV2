@@ -21,6 +21,7 @@
 #include <functional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -302,6 +303,114 @@ BOOST_AUTO_TEST_CASE(stubs_return_not_implemented)
     RequireStub(CommitV1(ledger), "M2-LED-02");
     RequireStub(LiabilitySumRoot(ledger, RUSD), "M2-LED-03");
     RequireStub(ExitValue(ledger, ALICE, RUSD), "M2-LED-04");
+}
+
+// ---- Slice R7: the orders and markets components of the trading state ----
+
+namespace {
+
+RestingOrderLeafV0 OrderLeaf(std::string_view name, const MarketId& market, const AccountId& owner, Side side,
+                             uint64_t price, Atoms reserved)
+{
+    RestingOrderLeafV0 leaf;
+    leaf.order = OrderId{LabelHash("fm2/test/order/" + std::string{name})};
+    leaf.market = market;
+    leaf.owner = owner;
+    leaf.side = side;
+    leaf.price_ticks = price;
+    leaf.remaining_lots = 7;
+    leaf.arrival_rank = 1;
+    leaf.reserved_left = reserved;
+    return leaf;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(orders_component_golden)
+{
+    // The three leaves of evidence/R7/golden.py, committed in any input order.
+    const MarketId market{LabelHash("fm2/test/market")};
+    const AccountId bob{LabelHash("fm2/test/account/bob")};
+    std::vector<OrderLeafV0> leaves{OrderLeafOf(OrderLeaf("x", market, bob, Side::BUY, 90, 7 * 90)),
+                                    OrderLeafOf(OrderLeaf("y", market, bob, Side::SELL, 110, 7)),
+                                    OrderLeafOf(OrderLeaf("z", market, bob, Side::BUY, 95, 7 * 95))};
+    for (uint64_t seed{1}; seed <= 6; ++seed) {
+        Shuffle(leaves, seed);
+        const StateRootsV0 roots{Commit(EmptyLedger(), {}, leaves)};
+        BOOST_CHECK_EQUAL(HexStr(roots.orders), "8a81aa2fb0d25cdd4dc056633d0b847099217d68fd1e1981f5eaeca695d8a203");
+    }
+    const RestingOrderLeafV0 x{OrderLeaf("x", market, bob, Side::BUY, 90, 7 * 90)};
+    BOOST_CHECK(OrderLeafOf(x).order == x.order);
+    BOOST_CHECK(OrderLeafOf(x).value == x.LeafValue());
+}
+
+BOOST_AUTO_TEST_CASE(trading_state_commits_orders_and_markets)
+{
+    const LedgerState ledger{WalkingSkeletonAfterSlot3()};
+    const MarketId m1{MarketM1().Id()};
+    const MarketId m2{MarketM2().Id()};
+    // Section 14.3 after slot 3: Bob's a rests with 3,000 lots; Alice's b rests in M2.
+    std::vector<RestingOrderLeafV0> orders{OrderLeaf("a", m1, BOB, Side::SELL, 250, 3'000'000'000),
+                                           OrderLeaf("b", m2, ALICE, Side::BUY, 600, 600'000'000)};
+    const Result<StateRootsV0> roots{CommitTradingStateV0(ledger, Markets(), orders)};
+    RequireOk(roots, "CommitTradingStateV0");
+
+    // Equal to CommitV0 over OrderLeafOf: the markets component lists every
+    // market, the orders component every order, both sorted by key.
+    std::vector<OrderLeafV0> leaves;
+    for (const auto& o : orders) leaves.push_back(OrderLeafOf(o));
+    const StateRootsV0 expected{Commit(ledger, Markets(), leaves)};
+    BOOST_CHECK(*roots == expected);
+    std::vector<std::pair<OrderId, uint256>> keyed;
+    for (const auto& o : orders) keyed.emplace_back(o.order, o.LeafValue());
+    std::sort(keyed.begin(), keyed.end());
+    std::vector<uint256> sorted_values;
+    for (const auto& [id, value] : keyed) sorted_values.push_back(value);
+    BOOST_CHECK(roots->orders == MerkleRoot(sorted_values));
+    BOOST_CHECK(roots->orders != MerkleRoot({}));
+
+    // Input order does not matter; a market with an empty book still counts.
+    std::reverse(orders.begin(), orders.end());
+    const std::vector<MarketDescriptor> reversed_markets{MarketM2(), MarketM1()};
+    const Result<StateRootsV0> again{CommitTradingStateV0(ledger, reversed_markets, orders)};
+    RequireOk(again, "CommitTradingStateV0 reversed");
+    BOOST_CHECK(*again == *roots);
+    const Result<StateRootsV0> one_market{CommitTradingStateV0(ledger, std::vector<MarketDescriptor>{MarketM1()},
+                                                               std::vector<RestingOrderLeafV0>{orders.back()})};
+    RequireOk(one_market, "one market");
+    BOOST_CHECK(one_market->markets != roots->markets);
+
+    // Any order field changes the orders root and the state root.
+    RestingOrderLeafV0 changed{orders.front()};
+    ++changed.arrival_rank;
+    const Result<StateRootsV0> other{CommitTradingStateV0(ledger, Markets(), std::vector<RestingOrderLeafV0>{changed, orders.back()})};
+    RequireOk(other, "changed order");
+    BOOST_CHECK(other->orders != roots->orders);
+    BOOST_CHECK(other->Root() != roots->Root());
+    BOOST_CHECK(other->accounts == roots->accounts);
+}
+
+BOOST_AUTO_TEST_CASE(trading_state_refuses_inconsistent_orders)
+{
+    const LedgerState ledger{WalkingSkeletonAfterSlot3()};
+    const MarketId m1{MarketM1().Id()};
+    const RestingOrderLeafV0 good{OrderLeaf("a", m1, BOB, Side::SELL, 250, 3'000'000'000)};
+    RequireOk(CommitTradingStateV0(ledger, Markets(), std::vector<RestingOrderLeafV0>{good}), "good");
+
+    RestingOrderLeafV0 bad{good};
+    bad.remaining_lots = 0;
+    RequireError(CommitTradingStateV0(ledger, Markets(), std::vector<RestingOrderLeafV0>{bad}), ErrorCode::INVALID_INPUT,
+                 "non-canonical order");
+    bad = good;
+    bad.market = MarketDescriptor{TOK, B3, 1, 1}.Id();
+    RequireError(CommitTradingStateV0(ledger, Markets(), std::vector<RestingOrderLeafV0>{bad}), ErrorCode::INVALID_INPUT,
+                 "unlisted market");
+    bad = good;
+    bad.owner = TestAccount("carol");
+    RequireError(CommitTradingStateV0(ledger, Markets(), std::vector<RestingOrderLeafV0>{bad}), ErrorCode::INVALID_INPUT,
+                 "owner without an account");
+    RequireError(CommitTradingStateV0(ledger, Markets(), std::vector<RestingOrderLeafV0>{good, good}),
+                 ErrorCode::INVALID_INPUT, "repeated order");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

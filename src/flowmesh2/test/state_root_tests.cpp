@@ -12,11 +12,13 @@
 #include <flowmesh2/core/ids.h>
 #include <flowmesh2/core/market.h>
 #include <flowmesh2/core/params.h>
+#include <flowmesh2/core/slot.h>
 #include <flowmesh2/core/state_root.h>
 #include <flowmesh2/test/util/keys.h>
 #include <serialize.h>
 #include <streams.h>
 
+#include <functional>
 #include <set>
 #include <span>
 #include <string>
@@ -174,6 +176,140 @@ BOOST_AUTO_TEST_CASE(root_of_roots_golden_and_every_root_changes_it)
     StateRootsV0 swapped{roots};
     std::swap(swapped.accounts, swapped.orders);
     BOOST_CHECK(swapped.Root() != roots.Root());
+}
+
+// ---- Slice R7: the resting-order leaf ----
+
+namespace {
+
+//! The golden order of evidence/R7/golden.py: Bob's SELL a, 3,000 lots left at 250.
+RestingOrderLeafV0 SampleOrder()
+{
+    RestingOrderLeafV0 leaf;
+    leaf.order = OrderId{LabelHash("fm2/test/order/a")};
+    leaf.market = MarketId{LabelHash("fm2/test/market")};
+    leaf.owner = AccountId{LabelHash("fm2/test/account/bob")};
+    leaf.side = Side::SELL;
+    leaf.price_ticks = 250;
+    leaf.remaining_lots = 3'000;
+    leaf.arrival_rank = 4'096;
+    leaf.reserved_left = 3'000'000'000;
+    leaf.cum_quote = 500'000;
+    leaf.fee_charged = 50;
+    leaf.fills = 1;
+    return leaf;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(commitment_version_is_defined_once)
+{
+    // This file includes core/slot.h and core/state_root.h; before R7 both
+    // defined COMMITMENT_VERSION_V0, and such a translation unit did not compile.
+    BOOST_CHECK_EQUAL(COMMITMENT_VERSION_V0, 0);
+    BOOST_CHECK_EQUAL(SlotHeaderV2{}.commitment_version, COMMITMENT_VERSION_V0);
+}
+
+BOOST_AUTO_TEST_CASE(resting_order_leaf_golden_and_round_trip)
+{
+    const RestingOrderLeafV0 leaf{SampleOrder()};
+    BOOST_CHECK(leaf.IsCanonical());
+    const std::vector<unsigned char> bytes{leaf.Encode()};
+    BOOST_CHECK_EQUAL(bytes.size(), RestingOrderLeafV0::ENCODED_BYTES);
+    BOOST_CHECK_EQUAL(RestingOrderLeafV0::ENCODED_BYTES, 153U);
+    // Golden from evidence/R7/golden.py.
+    BOOST_CHECK_EQUAL(HexStr(bytes),
+                      "982afde4b813e5349730c20ea4da69fa0c53ae40cd1255f54a151f73617e81db629d31dd15ec7d49cb9eb7ec7244a8dbfa"
+                      "8cfdc9da7973340b8eb780e1f8af978258d174cebe005fec467c8cac02323a9b2f1947599a7591ebd3137ab83b986a02fa"
+                      "00000000000000b80b0000000000000010000000000000005ed0b20000000020a10700000000003200000000000000010000"
+                      "0000000000");
+    BOOST_CHECK_EQUAL(HexStr(leaf.LeafValue()), "389e1c17b3896483c5d34187e9db601020a3107376cd3f751329b96bbd0d257c");
+    BOOST_CHECK(leaf.LeafValue() == Tagged(HashTag::STATE_ORDERS, bytes));
+
+    const Result<RestingOrderLeafV0> decoded{RestingOrderLeafV0::Decode(bytes)};
+    BOOST_REQUIRE(decoded.has_value());
+    BOOST_CHECK(*decoded == leaf);
+}
+
+BOOST_AUTO_TEST_CASE(resting_order_leaf_canonical_form_enforced)
+{
+    const auto refused = [](const RestingOrderLeafV0& leaf, std::string_view what) {
+        BOOST_CHECK_MESSAGE(!leaf.IsCanonical(), what);
+        const Result<RestingOrderLeafV0> decoded{RestingOrderLeafV0::Decode(leaf.Encode())};
+        BOOST_REQUIRE_MESSAGE(!decoded.has_value(), what);
+        BOOST_CHECK_MESSAGE(decoded.error().code == ErrorCode::DECODE, what);
+    };
+    RestingOrderLeafV0 leaf{SampleOrder()};
+    leaf.side = static_cast<Side>(0);
+    refused(leaf, "side 0");
+    leaf = SampleOrder();
+    leaf.side = static_cast<Side>(3);
+    refused(leaf, "side 3");
+    leaf = SampleOrder();
+    leaf.price_ticks = 0;
+    refused(leaf, "price 0");
+    leaf = SampleOrder();
+    leaf.remaining_lots = 0;
+    refused(leaf, "lots 0");
+    leaf = SampleOrder();
+    leaf.reserved_left = -1;
+    refused(leaf, "negative reservation");
+    leaf = SampleOrder();
+    leaf.cum_quote = MAX_ATOMS + 1;
+    refused(leaf, "cum_quote above MAX_ATOMS");
+    leaf = SampleOrder();
+    leaf.fee_charged = leaf.cum_quote + 1;
+    refused(leaf, "fee above cum_quote");
+    leaf = SampleOrder();
+    leaf.side = Side::BUY;
+    refused(leaf, "a BUY with a fee");
+    leaf.fee_charged = 0;
+    BOOST_CHECK(leaf.IsCanonical());
+    // Edges that are canonical: zero reservation and MAX_ATOMS amounts.
+    leaf = SampleOrder();
+    leaf.reserved_left = 0;
+    leaf.cum_quote = MAX_ATOMS;
+    leaf.fee_charged = MAX_ATOMS;
+    BOOST_CHECK(leaf.IsCanonical());
+    BOOST_CHECK(RestingOrderLeafV0::Decode(leaf.Encode()).has_value());
+
+    // Length: one byte short is DECODE, one byte long is OVERSIZE.
+    std::vector<unsigned char> bytes{SampleOrder().Encode()};
+    bytes.pop_back();
+    const Result<RestingOrderLeafV0> short_input{RestingOrderLeafV0::Decode(bytes)};
+    BOOST_REQUIRE(!short_input.has_value());
+    BOOST_CHECK(short_input.error().code == ErrorCode::DECODE);
+    bytes = SampleOrder().Encode();
+    bytes.push_back(0);
+    const Result<RestingOrderLeafV0> long_input{RestingOrderLeafV0::Decode(bytes)};
+    BOOST_REQUIRE(!long_input.has_value());
+    BOOST_CHECK(long_input.error().code == ErrorCode::OVERSIZE);
+}
+
+BOOST_AUTO_TEST_CASE(resting_order_leaf_every_field_changes_the_value)
+{
+    const RestingOrderLeafV0 base{SampleOrder()};
+    std::vector<std::function<void(RestingOrderLeafV0&)>> mutations{
+        [](RestingOrderLeafV0& l) { l.order.id.data()[0] ^= 1; },
+        [](RestingOrderLeafV0& l) { l.market.id.data()[0] ^= 1; },
+        [](RestingOrderLeafV0& l) { l.owner.id.data()[0] ^= 1; },
+        [](RestingOrderLeafV0& l) { l.side = Side::BUY; l.fee_charged = 0; },
+        [](RestingOrderLeafV0& l) { ++l.price_ticks; },
+        [](RestingOrderLeafV0& l) { ++l.remaining_lots; },
+        [](RestingOrderLeafV0& l) { ++l.arrival_rank; },
+        [](RestingOrderLeafV0& l) { ++l.reserved_left; },
+        [](RestingOrderLeafV0& l) { ++l.cum_quote; },
+        [](RestingOrderLeafV0& l) { ++l.fee_charged; },
+        [](RestingOrderLeafV0& l) { ++l.fills; },
+    };
+    std::set<uint256> values{base.LeafValue()};
+    for (const auto& mutate : mutations) {
+        RestingOrderLeafV0 changed{base};
+        mutate(changed);
+        BOOST_CHECK(changed.IsCanonical());
+        values.insert(changed.LeafValue());
+    }
+    BOOST_CHECK_EQUAL(values.size(), mutations.size() + 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

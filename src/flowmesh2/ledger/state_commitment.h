@@ -24,8 +24,9 @@
  * does not own:
  *   accounts   every account, ascending AccountId, value AccountLeafV0::LeafValue()
  *              of LedgerState::Leaf (the canonical leaf);
- *   orders     every OrderLeafV0 given, ascending OrderId (empty until R7,
- *              whose engine defines the order leaf value);
+ *   orders     every OrderLeafV0 given, ascending OrderId; since R7 the
+ *              value is RestingOrderLeafV0::LeafValue() (core/state_root.h)
+ *              of each resting order (CommitTradingStateV0);
  *   markets    every MarketDescriptor given, ascending MarketId, value MarketLeafValue;
  *   nullifiers every credited deposit outpoint, ascending, value NullifierLeafValue;
  *   totals     every asset the ledger has seen, ascending AssetId, value
@@ -45,7 +46,7 @@
  */
 namespace flowmesh2::ledger {
 
-//! One resting order in the orders component: its id and the leaf value R7 defines.
+//! One resting order in the orders component: its id and its leaf value.
 struct OrderLeafV0 {
     OrderId order;
     uint256 value;
@@ -54,6 +55,21 @@ struct OrderLeafV0 {
 //! The five component roots (see the file comment).
 Result<StateRootsV0> CommitV0(const LedgerState& ledger, std::span<const MarketDescriptor> markets,
                               std::span<const OrderLeafV0> orders);
+
+//! The orders-component entry of one resting order: {leaf.order, leaf.LeafValue()}.
+OrderLeafV0 OrderLeafOf(const RestingOrderLeafV0& leaf);
+
+/** The commitment of the whole trading state (slice R7): CommitV0 whose
+ * markets component is `markets` (every market of the instance, books empty
+ * or not) and whose orders component is OrderLeafOf of every resting order.
+ * Besides CommitV0's errors, INVALID_INPUT for an order leaf that is not
+ * canonical (RestingOrderLeafV0::IsCanonical), for an order whose market is
+ * not in `markets`, and for an order whose owner has no account in the
+ * ledger. The engine (engine/engine.h EngineState::Commit) calls it with its
+ * books; b3verify (R11) recomputes the same leaf values from core/ alone.
+ */
+Result<StateRootsV0> CommitTradingStateV0(const LedgerState& ledger, std::span<const MarketDescriptor> markets,
+                                          std::span<const RestingOrderLeafV0> orders);
 
 //! An account leaf and its inclusion proof under StateRootsV0::accounts.
 struct AccountWitnessV0 {

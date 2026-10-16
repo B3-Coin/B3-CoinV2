@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -80,6 +81,24 @@ Result<StateRootsV0> CommitV0(const LedgerState& ledger, std::span<const MarketD
     roots.totals = MerkleRoot(totals);
 
     return Ok(roots);
+}
+
+OrderLeafV0 OrderLeafOf(const RestingOrderLeafV0& leaf) { return OrderLeafV0{leaf.order, leaf.LeafValue()}; }
+
+Result<StateRootsV0> CommitTradingStateV0(const LedgerState& ledger, std::span<const MarketDescriptor> markets,
+                                          std::span<const RestingOrderLeafV0> orders)
+{
+    std::set<MarketId> listed;
+    for (const MarketDescriptor& market : markets) listed.insert(market.Id());
+    std::vector<OrderLeafV0> leaves;
+    leaves.reserve(orders.size());
+    for (const RestingOrderLeafV0& order : orders) {
+        if (!order.IsCanonical()) return Error{ErrorCode::INVALID_INPUT, "order leaf is not canonical"};
+        if (!listed.contains(order.market)) return Error{ErrorCode::INVALID_INPUT, "order rests in an unlisted market"};
+        if (!ledger.HasAccount(order.owner)) return Error{ErrorCode::INVALID_INPUT, "order owner has no account"};
+        leaves.push_back(OrderLeafOf(order));
+    }
+    return CommitV0(ledger, markets, leaves);
 }
 
 Result<AccountWitnessV0> ProveAccountV0(const LedgerState& ledger, const AccountId& account)
