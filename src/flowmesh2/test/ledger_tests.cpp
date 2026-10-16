@@ -208,6 +208,13 @@ BOOST_AUTO_TEST_CASE(pay_from_reserved_settles_and_withholds_the_seller_fee)
     CheckBalance(ledger, BOB, B3, 5'000'000'997, 2'999'999'000);
     BOOST_CHECK_EQUAL(ledger.TotalsOf(B3).fees_held, 3);
     RequireOk(ledger.CheckConservation(), "conservation after self-trade");
+
+    // Edge: a fee equal to the payment is valid; the payee receives nothing.
+    BOOST_REQUIRE(ledger.Reserve(ALICE, RUSD, 10).value() == ReserveResult::OK);
+    RequireOk(ledger.PayFromReserved(ALICE, BOB, RUSD, 10, 10), "fee equal to the payment");
+    CheckBalance(ledger, BOB, RUSD, 499'950, 0);
+    BOOST_CHECK_EQUAL(ledger.TotalsOf(RUSD).fees_held, 60);
+    RequireOk(ledger.CheckConservation(), "conservation after a 100% fee");
 }
 
 BOOST_AUTO_TEST_CASE(credit_only_to_protocol_accounts_and_only_from_fees_held)
