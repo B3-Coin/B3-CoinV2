@@ -76,12 +76,16 @@ are outside this ordinary-status diagnostic coverage.
 | --- | --- |
 | 1 / 2 / 3 / 4 | No verified inclusion / outcome already verified / no retained proof / unknown endpoint |
 | 5 / 6 / 7 / 8 / 9 | Not advertised / terminal attempt / endpoint backoff / evidence cooldown / global budget |
-| 10 / 11 / 12 | Request started / no HTTP response / malformed envelope |
+| 10 / 11 / 12 | Attempt reserved before transport / no HTTP response / malformed envelope |
 | 13 / 14 / 15 / 16 | Terminal refusal / recognized transient BUDGET / verified evidence / unusable evidence |
 | 17 / 18 | Caught local exception / retained entry hash mismatch |
 
 Value 17 does not imply that an already recognized BUDGET was made terminal.
-No acquisition or unlock time is inferred from these branch values.
+Value 10 is installed before entry parsing/hash validation and is not proof
+of request dispatch. A later decision replaces it; the final numeric value
+is not an event timeline. Correlate a contained HTTPS child span before
+claiming transport occurred. No acquisition or unlock time is inferred from
+these branch values.
 
 The focused control leaves the unchanged scheduler window, gets one actual
 standalone BUDGET, then exposes the genuine prebuilt proof. At response plus
