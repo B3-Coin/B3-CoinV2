@@ -5,6 +5,11 @@ Starting revision: `46e5cf927b66dadc37ddfac30dce20a7847baf1b`.
 Qualified selected-preflight implementation:
 `c87deb34b736cc4557e57a7c89836febe99bff77`.
 Its v9 runner and actual diagnostic reports follow at `35de6684` and `4433acb6`.
+The [fair outcome-read successor](b3-flowmesh-outcome-fifo-20261016.md),
+`b42705b021cc9286b9eb230cc16c70c1528e4eec`, records the latest frozen source
+hashes and v10 qualification. Its strict CI controls follow at
+`049d90f2cf44da5894227588c4f05991b19946d2`. These are the successor review
+targets, not the old measured daemon.
 
 ## Outcome, without overstating completion
 
@@ -32,6 +37,7 @@ remain evidence; no history, signing obligation or journal was reset.
 | [Qt selected reads](b3-flowmesh-qt-selected-read-isolation-20261016.md), [Qt Catalog](b3-flowmesh-qt-catalog-read-isolation-20261016.md) and [native Catalog](b3-flowmesh-native-catalog-isolation-20261016.md) | Separate bounded passive owners; exact scope fences discard late reads without overwriting command evidence or renewing freshness | Native authority queries and some shared locks remain; no claimed throughput improvement from functional tests |
 | [Selected final preflight](b3-flowmesh-selected-final-preflight-20261016.md) | An already-approved remote order/cancel/withdraw checks its exact current verified account without rediscovering unrelated Catalog rows | Explicit narrow availability-policy change; no stale-proof fallback, economic retry or bypass of native signing checks |
 | [Transient outcome evidence](b3-flowmesh-outcome-budget-recovery-20261016.md) | Only an exact recognized standalone server BUDGET response can reopen an evidence read after its bounded cooldown | All other terminal failures remain one-shot; never resubmit the economic instruction |
+| [Fair automatic result reads](b3-flowmesh-outcome-fifo-20261016.md) | Included-outcome reads join the same bounded FIFO as unresolved requests; verify each selected owner's authority and return only the caller's card | No larger traffic budget, durable pure-outcome cache, arbitrary-schedule fairness or measured speedup |
 
 Each linked stage identifies its frozen source, counterexamples, actual tests,
 bounded non-author source review and remaining assumptions. This collection is
@@ -42,12 +48,13 @@ not a fresh independent audit of the entire integrated tree or deployment approv
 Final selected-preflight build succeeded. Ordinary local qualification on an
 Apple M4 Max, 16 cores/128 GiB, macOS 26.5.2, AppleClang 17 Release:
 
-- Native v9 selection: **497 cases / 28 suites**, all actual children exit 0,
-  no selected skips, 225.172 seconds.
+- Latest native v10 selection: **500 cases / 28 suites**, all actual children
+  exit 0, no selected skips, 227.968 seconds. Earlier v9's 497 cases retain
+  their separate historical identity.
 - Complete Qt trading helper: **82 passes**, zero failures/skips.
 - Complete Qt workspace: **362 passes**, zero failures, three unchanged
   opt-in visual skips.
-- v9 runner controls: **53 passes** in each separate author/reviewer/root run;
+- Latest v10 runner controls: **56 passes** in separate reviewer/root runs;
   these are not native tests or an added combined population.
 - Unchanged isolated models: **446 cases / seven suites** in their separate
   earlier execution. Fixed synthetic membership/authentication and modelled
@@ -67,6 +74,9 @@ stopped and all five final daemon statuses were 0. The isolated result was
 nearest-rank p50 **1,364.825 ms**, maximum **2,274.240 ms**. The performance flag
 was false. These are not a controlled before/after speed comparison or a
 successful 200 ms campaign.
+That measurement used the old native client `bff8dac1`, before the final
+`f6610edb` fairness correction. No trading-latency campaign was run after it;
+functional regression success is not a measured speedup.
 
 The selected capture had zero drops and proved one **local client read-budget
 deferral**, before HTTPS. It did not prove that budgeting caused the whole
