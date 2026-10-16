@@ -1,0 +1,10 @@
+// Guard fixture (clean): sim/ may sign client actions.
+namespace flowmesh2 {
+
+struct FixtureClientKey {
+    int Sign(int message) const { return message + 2; }
+};
+
+int FixtureClientSign(const FixtureClientKey* key) { return key->Sign(2); }
+
+} // namespace flowmesh2

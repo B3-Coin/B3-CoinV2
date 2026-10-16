@@ -1,0 +1,10 @@
+// Planted (rule 2): `return {};` is banned, also when split over lines.
+#include <optional>
+
+namespace flowmesh2 {
+std::optional<int> FixtureView()
+{
+    return {
+    };
+}
+} // namespace flowmesh2

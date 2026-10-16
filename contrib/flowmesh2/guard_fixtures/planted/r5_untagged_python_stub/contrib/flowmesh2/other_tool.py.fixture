@@ -1,0 +1,9 @@
+"""Planted (rule 5): a Python stub without its tag."""
+
+
+def not_implemented(task_id):
+    return 3
+
+
+def other():
+    return not_implemented("M9-FIX-02")

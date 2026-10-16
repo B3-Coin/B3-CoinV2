@@ -1,0 +1,101 @@
+// Guard fixture for rule 3 and rule 4 (build mode). test_check_guards.py
+// compiles this file once per case with exactly one -DFM2_NM_<CASE> macro and
+// places each object in a fake build tree (see guard_fixtures/README.md).
+// The bodies only need to produce the symbols named in each comment.
+
+#if defined(FM2_NM_TYPES_OK)
+// fm2_types: defines flowmesh2::TypesValue(int).
+namespace flowmesh2 { int TypesValue(int x) { return x + 1; } }
+
+#elif defined(FM2_NM_CORE_LEDGER_OK)
+// fm2_core, ledger/: defines flowmesh2::LedgerCredit(int).
+namespace flowmesh2 { int LedgerCredit(int x) { return x * 2; } }
+
+#elif defined(FM2_NM_CORE_NET_OK)
+// fm2_core, net/: uses types, defines flowmesh2::LaneDepth(int).
+namespace flowmesh2 { int TypesValue(int); int LaneDepth(int x) { return TypesValue(x); } }
+
+#elif defined(FM2_NM_VERIFY_OK)
+// fm2_verify: may reference fm2_types (undefined flowmesh2::TypesValue(int)).
+namespace flowmesh2 { int TypesValue(int); int VerifyLeaf(int x) { return TypesValue(x) + 3; } }
+
+#elif defined(FM2_NM_C1_OK)
+// flowmesh2_foundations.
+namespace flowmesh2 { int MailboxDepth() { return 4; } }
+
+#elif defined(FM2_NM_TEST_OK)
+// test_flowmesh2: defines flowmesh2:: symbols only.
+namespace flowmesh2::test { int TestHelper() { return 5; } }
+
+#elif defined(FM2_NM_C1_TEST_OK)
+// test_flowmesh2_foundations.
+namespace flowmesh2 { int FoundationsCase() { return 6; } }
+
+#elif defined(FM2_NM_SIM_OK)
+// fm2-sim (target fm2_sim_cli).
+namespace flowmesh2 { int SimStep() { return 7; } }
+
+#elif defined(FM2_NM_CS_MAIN)
+// Undefined cs_main (a global, so unmangled).
+struct GlobalMutex;
+extern GlobalMutex cs_main;
+GlobalMutex* FixtureLock() { return &cs_main; }
+
+#elif defined(FM2_NM_CHAINSTATEMANAGER)
+// Undefined ChainstateManager::ActiveHeight() const.
+class ChainstateManager { public: int ActiveHeight() const; };
+int FixtureHeight(const ChainstateManager& chainman) { return chainman.ActiveHeight(); }
+
+#elif defined(FM2_NM_CHAINSTATE)
+// Undefined Chainstate::IsInitialBlockDownload() const.
+class Chainstate { public: bool IsInitialBlockDownload() const; };
+bool FixtureIbd(const Chainstate& chainstate) { return chainstate.IsInitialBlockDownload(); }
+
+#elif defined(FM2_NM_PEERMANAGER)
+// Undefined PeerManager::SendPings().
+class PeerManager { public: void SendPings(); };
+void FixturePing(PeerManager& peerman) { peerman.SendPings(); }
+
+#elif defined(FM2_NM_CCONNMAN)
+// Undefined CConnman::GetNodeCount() const.
+class CConnman { public: int GetNodeCount() const; };
+int FixturePeers(const CConnman& connman) { return connman.GetNodeCount(); }
+
+#elif defined(FM2_NM_WALLET)
+// Undefined wallet::GetBalance().
+namespace wallet { int GetBalance(); }
+int FixtureBalance() { return wallet::GetBalance(); }
+
+#elif defined(FM2_NM_V1_REFERENCE)
+// Undefined V1 flowmesh::LegacyLedgerBalance().
+namespace flowmesh { int LegacyLedgerBalance(); }
+int FixtureLegacy() { return flowmesh::LegacyLedgerBalance(); }
+
+#elif defined(FM2_NM_V1_DEFINITION)
+// Defines V1 flowmesh::LegacyThing().
+namespace flowmesh { int LegacyThing() { return 8; } }
+
+#elif defined(FM2_NM_DEV_CERTIFIER)
+// Defines flowmesh2::DevSingleSeatCertifier::Seat() const.
+namespace flowmesh2 { struct DevSingleSeatCertifier { int Seat() const; }; int DevSingleSeatCertifier::Seat() const { return 0; } }
+
+#elif defined(FM2_NM_FAKE_CHAIN)
+// Defines flowmesh2::FakeChainAdapter::Tip() const.
+namespace flowmesh2 { struct FakeChainAdapter { int Tip() const; }; int FakeChainAdapter::Tip() const { return 9; } }
+
+#elif defined(FM2_NM_DEV_BUDGET)
+// Defines flowmesh2::UnlimitedDevBudget::Allow() const.
+namespace flowmesh2 { struct UnlimitedDevBudget { bool Allow() const; }; bool UnlimitedDevBudget::Allow() const { return true; } }
+
+#elif defined(FM2_NM_VERIFY_USES_LEDGER)
+// fm2_verify referencing flowmesh2::LedgerCredit(int), which fm2_core's ledger/ object defines.
+namespace flowmesh2 { int LedgerCredit(int); int VerifyBad(int x) { return LedgerCredit(x); } }
+
+#elif defined(FM2_NM_LEDGER_NAMESPACE)
+// Undefined flowmesh2::ledger::Balance().
+namespace flowmesh2::ledger { int Balance(); }
+int FixtureNamespaced() { return flowmesh2::ledger::Balance(); }
+
+#else
+#error "test_check_guards.py must define exactly one FM2_NM_* case"
+#endif

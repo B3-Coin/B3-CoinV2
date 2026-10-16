@@ -1,0 +1,7 @@
+// Planted (rule 5): the tag is four lines away, one too many.
+// TODO(rebirth:M9-FIX-01)
+#include <flowmesh2/core/result.h>
+
+namespace flowmesh2 {
+Result<int> FixtureWithdraw() { return NotImplemented("M9-FIX-01"); }
+} // namespace flowmesh2

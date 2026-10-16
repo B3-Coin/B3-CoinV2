@@ -1,0 +1,27 @@
+// Guard fixture (clean): a typed stub with its tag, plus text that only looks
+// like a violation. Comments may name float, double, std::mutex, .Sign( and
+// #include <validation.h>; strings may too.
+#include <flowmesh2/core/result.h>
+
+#include <cstdint>
+
+namespace flowmesh2 {
+
+Result<int> FixtureStub()
+{
+    return NotImplemented("M9-FIX-01"); // TODO(rebirth:M9-FIX-01)
+}
+
+Result<void> FixtureUnsupported()
+{
+    // TODO(rebirth:M9-FIX-01) the tag may sit up to three lines away.
+    const char* note{"double float std::mutex return {}; .Sign( GetTime()"};
+    (void)note;
+    return Unsupported("M9-FIX-01");
+}
+
+constexpr uint64_t kSeparated{1'000'000};
+constexpr char kQuote{'\''};
+constexpr const char* kRaw{R"fm2(float "double" std::unordered_map)fm2"};
+
+} // namespace flowmesh2

@@ -1,0 +1,14 @@
+// Guard fixture (clean): test code may use std::mutex, node headers and
+// signing, and may call NotImplemented() as a fixture.
+#include <node/context.h>
+
+#include <mutex>
+
+namespace {
+std::mutex g_test_mutex;
+} // namespace
+
+FM2_STUB_CASE(M9_FIX_01, "M9-FIX-01")
+{
+    return Observe(flowmesh2::NotImplemented("M9-FIX-01"));
+}

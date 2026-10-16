@@ -1,0 +1,12 @@
+// Guard fixture (clean): the one production signing site.
+namespace bls {
+struct SecretKey {
+    int Sign(int message) const { return message; }
+};
+} // namespace bls
+
+namespace flowmesh2 {
+
+int FixtureSeatSign(const bls::SecretKey& key, int digest) { return key.Sign(digest); }
+
+} // namespace flowmesh2

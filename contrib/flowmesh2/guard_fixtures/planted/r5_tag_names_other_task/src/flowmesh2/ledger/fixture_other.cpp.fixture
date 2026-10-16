@@ -1,0 +1,6 @@
+// Planted (rule 5): the nearby tag names another task.
+#include <flowmesh2/core/result.h>
+
+namespace flowmesh2 {
+Result<int> FixtureOther() { return NotImplemented("M9-FIX-01"); } // TODO(rebirth:M9-FIX-03)
+} // namespace flowmesh2

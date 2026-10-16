@@ -1,0 +1,11 @@
+// Planted (rule 7): only storage/seat_signer.cpp may hold a BLS secret key.
+namespace bls {
+struct SecretKey {
+};
+} // namespace bls
+
+namespace flowmesh2 {
+struct FixtureJournal {
+    bls::SecretKey key;
+};
+} // namespace flowmesh2

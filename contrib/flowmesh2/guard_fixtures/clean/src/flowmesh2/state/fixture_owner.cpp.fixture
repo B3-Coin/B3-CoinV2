@@ -1,0 +1,25 @@
+// Guard fixture (clean): Bitcoin Mutex and LOCK in a deterministic directory.
+#include <sync.h>
+
+#include <cstdint>
+#include <map>
+
+namespace flowmesh2 {
+
+class FixtureOwner
+{
+public:
+    int64_t Get(int64_t key) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        LOCK(m_mutex);
+        // TODO(rebirth:M9-FIX-03) the std::map skeleton is replaced later.
+        const auto it{m_values.find(key)};
+        return it == m_values.end() ? 0 : it->second;
+    }
+
+private:
+    mutable Mutex m_mutex;
+    std::map<int64_t, int64_t> m_values GUARDED_BY(m_mutex);
+};
+
+} // namespace flowmesh2

@@ -1,0 +1,7 @@
+"""Guard fixture (clean): the Python stub inventory case."""
+import unittest
+
+
+class FixtureToolTests(unittest.TestCase):
+    def test_stub_M9_FIX_02(self):
+        self.assertTrue(True)

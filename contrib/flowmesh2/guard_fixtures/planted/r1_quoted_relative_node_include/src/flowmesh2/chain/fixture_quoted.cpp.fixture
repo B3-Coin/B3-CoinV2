@@ -1,0 +1,2 @@
+// Planted (rule 1): a quoted relative include that resolves to src/node/.
+#include "../../node/context.h"

@@ -1,0 +1,3 @@
+# Guard fixture: src/CMakeLists.txt. Names no outline target.
+add_library(bitcoin_common STATIC common.cpp)
+add_subdirectory(flowmesh2)

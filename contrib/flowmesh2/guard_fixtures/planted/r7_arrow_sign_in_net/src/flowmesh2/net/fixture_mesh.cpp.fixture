@@ -1,0 +1,7 @@
+// Planted (rule 7 addition): ->Sign( outside the allowed paths.
+namespace flowmesh2 {
+struct FixtureMeshKey {
+    int Sign(int message) const { return message; }
+};
+int FixtureMesh(const FixtureMeshKey* key) { return key->Sign(4); }
+} // namespace flowmesh2

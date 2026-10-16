@@ -1,0 +1,13 @@
+# Guard fixture ledger
+
+| ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
+|---|---|---|---|---|---|---|---|---|---|
+| R1 | R | outline | — | R1 | Fixture slice one | fixture | fixture | scratch:R1/ | — |
+| R2 | R | todo | — | R2 | Fixture slice two | fixture | fixture | scratch:R2/ | — |
+| M9-FIX-01 | M9 | outline | STUB | R1 | C++ stub with a refusal marker | `core/fixture_stub.cpp`, `engine/fixture_residual.cpp` | fixture | M9/M9-FIX-01/ | — |
+| M9-FIX-02 | M9 | outline | STUB | R1 | Python stub | `contrib/flowmesh2/fixture_tool.py` | fixture | M9/M9-FIX-02/ | — |
+| M9-FIX-03 | M9 | outline | REAL-REPLACE | R1 | Simple skeleton | `state/fixture_owner.cpp` | fixture | M9/M9-FIX-03/ | — |
+| M9-FIX-04 | M9 | todo | STUB | R2 | Stub of a slice in progress (tag allowed) | `net/fixture_clock.cpp` | fixture | M9/M9-FIX-04/ | — |
+| M9-FIX-05 | M9 | todo | STUB | R2 | Stub of a slice not started (no tag) | `ledger/` | fixture | M9/M9-FIX-05/ | — |
+| M9-FIX-06 | M9 | done | STUB | R1 | Finished task (tag removed) | `core/` | fixture | M9/M9-FIX-06/ | — |
+| M9-FIX-07 | M9 | todo | NONE | — | New work (never tagged) | new | fixture | M9/M9-FIX-07/ | — |

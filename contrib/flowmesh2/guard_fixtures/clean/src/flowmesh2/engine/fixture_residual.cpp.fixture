@@ -1,0 +1,12 @@
+// Guard fixture (clean): a certified typed refusal with its tag.
+#include <flowmesh2/core/codes.h>
+
+namespace flowmesh2 {
+
+OutcomeCode FixtureResidual()
+{
+    // Same-slot residual cross: refused until the tie-break ruling.
+    return OutcomeCode::REJ_RESIDUAL_CROSS_UNSUPPORTED; // TODO(rebirth:M9-FIX-01)
+}
+
+} // namespace flowmesh2

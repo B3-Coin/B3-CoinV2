@@ -1,0 +1,5 @@
+// Planted (rule 5): the case name must be the ID with '-' replaced by '_'.
+FM2_STUB_CASE(M9_FIX_1, "M9-FIX-01")
+{
+    return Observe(flowmesh2::NotImplemented("M9-FIX-01"));
+}

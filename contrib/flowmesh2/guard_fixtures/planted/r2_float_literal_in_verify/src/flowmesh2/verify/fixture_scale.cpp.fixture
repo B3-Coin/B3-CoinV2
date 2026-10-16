@@ -1,0 +1,4 @@
+// Planted (rule 2 addition): a floating-point literal without the keyword.
+namespace flowmesh2 {
+constexpr auto kScale{2.5e3};
+} // namespace flowmesh2

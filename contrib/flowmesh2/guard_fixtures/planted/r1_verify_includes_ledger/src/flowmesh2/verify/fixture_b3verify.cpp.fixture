@@ -1,0 +1,2 @@
+// Planted (rule 1 addition): b3verify must not compile application code.
+#include <flowmesh2/ledger/ledger.h>

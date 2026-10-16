@@ -1,0 +1,2 @@
+# Planted (rule 4): a second CMake file inside src/flowmesh2/.
+add_library(helper STATIC helper.cpp)

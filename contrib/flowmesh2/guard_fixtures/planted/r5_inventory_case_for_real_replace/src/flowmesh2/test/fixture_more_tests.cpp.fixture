@@ -1,0 +1,5 @@
+// Planted (rule 5): stub_inventory cases are for STUB rows only.
+FM2_STUB_CASE(M9_FIX_03, "M9-FIX-03")
+{
+    return Observe(flowmesh2::NotImplemented("M9-FIX-03"));
+}

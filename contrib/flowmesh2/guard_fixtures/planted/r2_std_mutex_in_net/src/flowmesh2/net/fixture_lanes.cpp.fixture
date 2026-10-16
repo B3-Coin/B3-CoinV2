@@ -1,0 +1,6 @@
+// Planted (rule 2): std::mutex is banned in all non-test fm2 code.
+#include <mutex>
+
+namespace flowmesh2 {
+std::mutex g_lane_mutex;
+} // namespace flowmesh2

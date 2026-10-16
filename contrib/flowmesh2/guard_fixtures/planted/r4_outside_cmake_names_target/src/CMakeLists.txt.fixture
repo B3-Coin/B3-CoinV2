@@ -1,0 +1,5 @@
+# Planted (rule 4): a CMake file outside src/flowmesh2/ links an outline target.
+add_library(bitcoin_common STATIC common.cpp)
+add_library(bitcoin_node STATIC node.cpp)
+target_link_libraries(bitcoin_node PRIVATE fm2_core)
+add_subdirectory(flowmesh2)

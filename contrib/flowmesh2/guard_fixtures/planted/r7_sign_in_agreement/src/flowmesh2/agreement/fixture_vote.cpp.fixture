@@ -1,0 +1,7 @@
+// Planted (rule 7): agreement code signs directly.
+namespace flowmesh2 {
+struct FixtureKey {
+    int Sign(int message) const { return message; }
+};
+int FixtureVote(const FixtureKey& key) { return key.Sign(7); }
+} // namespace flowmesh2

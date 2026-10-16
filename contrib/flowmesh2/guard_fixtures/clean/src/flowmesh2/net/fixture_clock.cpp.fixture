@@ -1,0 +1,14 @@
+// Guard fixture (clean): net/ is not a deterministic directory, so clocks,
+// floating point and threads are allowed here (never std::mutex).
+#include <chrono>
+#include <thread>
+
+namespace flowmesh2 {
+
+double FixtureSeconds(std::chrono::milliseconds ms)
+{
+    // TODO(rebirth:M9-FIX-04) a todo row may be tagged while its slice is in progress.
+    return static_cast<double>(ms.count()) / 1000.0;
+}
+
+} // namespace flowmesh2

@@ -22,9 +22,12 @@
  * ignored Result is a build error under the fm2 flag -Werror=unused-result.
  *
  * A stub is written exactly as
- *     return NotImplemented("M2-LED-05"); // TODO(rebirth:M2-LED-05)
- * or with Unsupported(...). TaskId only accepts a compile-time string in the
- * TODO.md ID format, so the ID in the error is the literal in the source.
+ *     return NotImplemented("<ID>"); // TODO(rebirth:<ID>)
+ * or with Unsupported(...), where <ID> is a TODO.md task ID such as M2-LED-05.
+ * TaskId only accepts a compile-time string in the TODO.md ID format, so the
+ * ID in the error is the literal in the source. The R2 guard
+ * (contrib/flowmesh2/check_guards.py, rule 5) requires the tag with the same
+ * ID within 3 lines of every such site.
  *
  * Everything here is deterministic: no allocation, I/O, clock or locale.
  */

@@ -150,11 +150,18 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `test_flowmesh2` | `test/` | all of the above, `Boost::headers`, `bitcoin_common` |
 | `fm2_sim_cli` | binary `fm2-sim` | `fm2_simlib` |
 | `fm2_canary_*` | sanitizer canaries | only with `FLOWMESH2_SANITIZER_CANARIES=ON` |
+| `fm2_all` | custom target: every fm2 library and executable that is built by default | — |
 
-`file(GENERATE)` writes `fm2_libs.manifest` (from R2). The `nm` guard reads
-it, so no library can be skipped silently. `bitcoin_common`, `bitcoin_node`,
-`bitcoin_wallet` and `bitcoinqt` never appear on the link line of `fm2_types`,
-`fm2_verify` or `fm2_core`.
+`file(GENERATE)` writes `fm2_libs.manifest` (from R2) into the build directory
+(`fm2_libs-<CONFIG>.manifest` for multi-config generators). It lists every
+target of `src/flowmesh2/` (CMake `BUILDSYSTEM_TARGETS`, so no target can be
+left out) with its type, file, objects and configure-time link closure. The
+`nm` guard reads it and fails if a listed library or executable was not built,
+so no library can be skipped silently. Its section of
+`src/flowmesh2/CMakeLists.txt` must stay last, and `src/flowmesh2/` has exactly
+one CMake file. `bitcoin_common`, `bitcoin_node`, `bitcoin_wallet` and
+`bitcoinqt` never appear in the link closure of `fm2_types`, `fm2_verify` or
+`fm2_core`, and `fm2_core` never appears in that of `fm2_verify`.
 
 ### 2.3 Header index
 
@@ -653,7 +660,7 @@ COMMON="-DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   -DBUILD_GUI=OFF -DBUILD_DAEMON=OFF -DBUILD_CLI=OFF -DBUILD_TX=OFF -DBUILD_UTIL=OFF \
   -DBUILD_WALLET_TOOL=OFF -DENABLE_WALLET=OFF -DENABLE_IPC=OFF -DWITH_CCACHE=OFF"
 cmake -S . -B build-rebirth $COMMON -DBUILD_FLOWMESH2=ON
-cmake --build build-rebirth --target test_flowmesh2 test_flowmesh2_foundations --parallel 4
+cmake --build build-rebirth --target fm2_all --parallel 4   # every fm2 target (the nm guard needs all of them)
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 

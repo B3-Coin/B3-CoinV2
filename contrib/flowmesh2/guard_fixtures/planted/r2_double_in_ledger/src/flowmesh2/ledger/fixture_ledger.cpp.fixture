@@ -1,0 +1,4 @@
+// Planted (rule 2): floating point in a deterministic directory.
+namespace flowmesh2 {
+double FixtureRatio(long a, long b) { return static_cast<long>(a) / static_cast<long>(b); }
+} // namespace flowmesh2

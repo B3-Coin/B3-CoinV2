@@ -1,0 +1,10 @@
+// Guard fixture (clean): dev/ may sign (REGTEST-only dev certifier).
+namespace flowmesh2 {
+
+struct FixtureDevKey {
+    int Sign(int message) const { return message + 1; }
+};
+
+int FixtureDevSign(const FixtureDevKey& key) { return key.Sign(1); }
+
+} // namespace flowmesh2

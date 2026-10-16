@@ -1,0 +1,7 @@
+// Planted (rule 5): the stub ID must be a literal at the call site.
+#include <flowmesh2/core/result.h>
+
+namespace flowmesh2 {
+constexpr TaskId kTask{"M9-FIX-01"};
+Result<int> FixtureNonLiteral() { return NotImplemented(kTask); } // TODO(rebirth:M9-FIX-01)
+} // namespace flowmesh2

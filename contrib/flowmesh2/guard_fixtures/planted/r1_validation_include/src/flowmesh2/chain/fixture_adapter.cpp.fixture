@@ -1,0 +1,2 @@
+// Planted (rule 1): the chain adapter seam must not reach into validation.
+#include <validation.h>

@@ -1,0 +1,5 @@
+# Guard fixture: top-level CMake file. Only option names mention FLOWMESH2.
+cmake_minimum_required(VERSION 3.22)
+project(guard_fixture CXX)
+option(BUILD_FLOWMESH2 "Fixture copy of the outline gate." OFF)
+add_subdirectory(src)

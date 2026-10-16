@@ -1,0 +1,2 @@
+// Planted (rule 2): wall-clock header in a deterministic directory.
+#include <chrono>

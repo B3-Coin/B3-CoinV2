@@ -1,0 +1,9 @@
+// Planted (rule 5): a refusal marker without a tag.
+#include <flowmesh2/core/codes.h>
+
+namespace flowmesh2 {
+AdmissionCode FixtureWithdrawKind()
+{
+    return AdmissionCode::UNSUPPORTED_KIND;
+}
+} // namespace flowmesh2
