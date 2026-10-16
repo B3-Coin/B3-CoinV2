@@ -3,10 +3,13 @@
 Date: 2026-10-16. Branch: `rebirth`, based on `18051472`.
 Status: **OUTLINE IN PROGRESS.** Implemented in `src/flowmesh2/`: C1
 (`BoundedMailbox`, `ReadSlot`), slice **R1** (build gate, error model, code
-registries, Boost.Test runner, inventory and TODO lint) and slice **R2** (seven
+registries, Boost.Test runner, inventory and TODO lint), slice **R2** (seven
 guards with self-tests, compile-fail controls, evidence tool, sanitizer
-canaries, CI workflow, and the durability token type). Everything else
-described here is the contract that the outline slices R3 to R14 will build.
+canaries, CI workflow, and the durability token type) and slice **R3** (core
+primitives: checked amounts, ids, tag registry, exact codec, the provisional
+profile, authority types, size-bound Merkle trees, markets and the slot
+header). Everything else described here is the contract that the outline
+slices R4 to R14 will build.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
@@ -124,7 +127,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | Module | Slice | Real in the outline | Typed stubs (task) | REAL-REPLACE (task) |
 |---|---|---|---|---|
 | `core/result`, `core/codes` | R1 | `ErrorCode` 1..17, `Error`, `[[nodiscard]] Result<T>` with `Result() = delete` and `Ok()`, `TaskId`, `NotImplemented`, `Unsupported`; `OutcomeCode` and `AdmissionCode` registries | — | — |
-| `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot` | R3 | Ids; checked `Atoms`; tag registry; `DecodeExact`, `ReadCappedVector`; `ProfileParams`, `DevRegtestProfile`, `ProfileHash`, `DomainHash`; `AuthorityVersion`; RFC 6962 Merkle; `SlotHeaderV2` | `Validate()`: price band (M3-ENG-03), `PER_SIDE` fees (M3-ENG-08), futures (M9-FUT-01), `FOLDED` signer (M4-STO-05) | per-market tick/lot (M3-ENG-11) |
+| `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot` | R3 | `AssetId`, `AccountId::FromKey`, `MarketId`, `ActionId`, `OrderId::FromPlace`, `Outpoint`; checked `Atoms` (`AddAtoms`, `SubAtoms`, `MulChecked`, `MulDivFloor`/`Ceil`); tag registry (29 tags); `DecodeExact`, `ReadCappedVector`, `WriteCappedVector`; `NetworkId`, `ProfileParams`, `DevRegtestProfile`, `Validate`, `EncodeProfile`, `ProfileHash`, `DomainHash`; `Anchor`, `FactCursor`, `AuthorityVersion`; `MarketDescriptor`, `BaseAtoms`, `QuoteAtoms`; size-bound RFC 6962 Merkle (O-25); `SlotHeaderV2`, `GenesisHeader` | `Validate()`: price band (M3-ENG-03), `PER_SIDE` fees (M3-ENG-08), futures (M9-FUT-01), `FOLDED` signer (M4-STO-05) | per-market tick/lot (M3-ENG-11) |
 | `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math` | R4 | `ActionV2` codec and BIP340 check, `VerifiedAction`, `SlotBody`, `OutcomeV2`, `DepositFact`, `SlotCertificate`, `SeatSet::FromPoP`, `AccountLeafV0`, nonce rule, seller fee and split | five facts: seat change (M7-SEAT-01), listing (M7-GOV-01), checkpoint accepted (MB1-B3D-02), payout confirmed (M8-BRG-02), exit nullifier (M8-EXIT-01); `BatchVerifier::VerifyBatch` (M4-ADM-01) | nonce rule (M2-ADM-01) |
 | `ledger/` | R5 | `NonceWindow`, `LedgerState` (deposit, reserve, release, pay, credit, transfer, conservation), protocol accounts, `CommitV0`, `ProveAccountV0` | `RequestWithdrawal` (M2-LED-05), futures transfers (M2-LED-06), `CommitV1` (M2-LED-02), `LiabilitySumRoot` (M2-LED-03), `ExitValue` (M2-LED-04) | duplicate-fact rules (M2-LED-07), seat-pool account (M7-FEE-01) |
 | `engine/book`, `matcher`, `residual` | R6 | `OrderBook`, `BookSet`, `SweepA2` with pairing and fees | `ResolveResidualCross` (M3-ENG-02), `PriceBandCheck` (M3-ENG-03) | book (M3-ENG-01), pairing (M3-ENG-14), self-trade (M3-ENG-13) |
@@ -145,12 +148,12 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 |---|---|---|
 | `flowmesh2_foundations` | C1, unchanged | as C1 |
 | `fm2_warnings` | INTERFACE: Clang/AppleClang `-Wthread-safety -Werror=thread-safety`; all compilers `-Werror=unused-result` | — |
-| `fm2_types` | `core/` | R1: `core_interface` (private), `bitcoin_util` (public). Later slices add `bitcoin_consensus`, `bitcoin_crypto` and `secp256k1` when their code needs them |
+| `fm2_types` | `core/` | `core_interface` (private); `bitcoin_consensus` (`hash.cpp`, `uint256.cpp`, `pubkey.cpp`), `bitcoin_crypto` and `bitcoin_util` (public, since R3). `secp256k1` follows with signature code (R4) |
 | `fm2_verify` | `verify/` | `fm2_types`, `bitcoin_crypto` (never `fm2_core`) |
 | `fm2_core` | ledger, engine, state, storage, chain, agreement, admission, read, net, bridge, futures, governance | `fm2_types`, `flowmesh2_foundations`, `crc32c`, `bitcoin_util` |
 | `fm2_dev` | `dev/` (compiled with `FM2_DEV_COMPONENTS`) | `fm2_core` |
 | `fm2_simlib` | `sim/` | `fm2_dev`, `fm2_core`, `fm2_verify`, `bitcoin_common` (for `CKey` only) |
-| `test_flowmesh2` | `test/` | all of the above, `Boost::headers`, `bitcoin_common` |
+| `test_flowmesh2` | `test/` | all of the above, `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` (from R4, for `CKey`); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files |
 | `fm2_sim_cli` | binary `fm2-sim` | `fm2_simlib` |
 | `fm2_canary_*` | sanitizer canaries | only with `FLOWMESH2_SANITIZER_CANARIES=ON` |
 | `fm2_all` | custom target: every fm2 library and executable that is built by default | — |
@@ -175,7 +178,15 @@ header marked *landed* is normative; the others are the target contract.
 |---|---|---|---|
 | `core/result.h` | R1 | landed | `ErrorCode` 1..17 (append-only), `Error{code, detail}` (detail static), `TaskId` (consteval, TODO.md ID format), `NotImplemented`/`Unsupported`, `[[nodiscard]] Result<T>` and `Result<void>` without default constructor, success only through `Ok()`/`Ok(v)` |
 | `core/codes.h` | R1 | landed | `OutcomeCode` (certified) and `AdmissionCode` (not certified) registries with bands, `ToString` (total), `IsKnown`, `IsRejection` (unknown values are neither success nor rejection) |
-| `core/ids.h`, `amount.h`, `hashes.h`, `codec.h`, `params.h`, `authority.h`, `market.h`, `merkle.h`, `slot.h` | R3 | target | section 2.1 row "core/ids ..."; sections 8, 9, 11 |
+| `core/ids.h` | R3 | landed | distinct id types over `uint256`, total order by bytes, raw 32-byte encoding; `AssetId::Native()` is zero; `AccountId::FromKey` = `Tagged(ACCOUNT, xonly)`; `OrderId::FromPlace` |
+| `core/amount.h` | R3 | landed | `Atoms` = `CAmount` in [0, 2^62]; operand out of range `INVALID_INPUT`, result out of range `ARITHMETIC_OVERFLOW`; 128-bit `MulDiv` |
+| `core/hashes.h` | R3 | landed | append-only `HashTag` registry (`B3/FM2/<name>`, enumerator `NET_DOMAIN` for `DOMAIN`), `Tagged`, `TaggedWriter`, `TaggedObject` |
+| `core/codec.h` | R3 | landed | `DecodeExactWith`/`DecodeExact` (`OVERSIZE` above max bytes or cap, `DECODE` for malformed or trailing bytes), `ReadCappedVector` (cap before allocation), `WriteCappedVector`, `EncodeBytes` |
+| `core/params.h` | R3 | landed | `NetworkId`, `ProfileParams` (21 fields), `DevRegtestProfile(ChainType)`, `Validate` (network, structure, then the four stubs), `EncodeProfile`, `ProfileHash`, `DomainHash` (O-26) |
+| `core/authority.h` | R3 | landed | `Anchor`, `FactCursor` (total order; slots consume `[facts_from, facts_to)`), `AuthorityVersion` |
+| `core/market.h` | R3 | landed | `MarketDescriptor` (REAL-REPLACE M3-ENG-11), `MarketId`, `ValidateMarket`, checked `BaseAtoms`/`QuoteAtoms` |
+| `core/merkle.h` | R3 | landed | `MerkleRoot` = `Tagged(MERKLE_ROOT, n ‖ MTH)`, `MerkleProof` (path cap 64), `MerkleProve`, `MerkleVerify` (RFC 9162) |
+| `core/slot.h` | R3 | landed | `SlotHeaderV2` (18 fields, 366 bytes), `Hash` (`SLOT`), `CommitDigest` (`COMMIT`), `Authority`, `Encode`/`Decode`, `GenesisHeader` |
 | `core/action.h`, `body.h`, `outcome.h`, `facts.h`, `certificate.h`, `seat_set.h`, `account_leaf.h`, `nonce_rule.h`, `fee_math.h` | R4 | target | section 9; section 11 (fees) |
 | `ledger/nonce_window.h`, `ledger.h`, `state_commitment.h` | R5 | target | section 11; commitment v0 (O-9) |
 | `engine/book.h`, `matcher.h`, `residual.h`, `engine.h` | R6, R7 | target | section 11 |
@@ -498,6 +509,15 @@ Every tag is prefixed `B3/FM2/` and lives in one `constexpr` registry:
 `PROTOCOL_ACCOUNT`, `JOURNAL`, `TEST_ASSET`. No tag may collide with an existing
 `B3/` tag string in the repository.
 
+As landed in R3 (`core/hashes.h`): 29 tags with pinned integers 1..29 in the
+order above, `STATE_*` being `STATE_ACCOUNTS`, `STATE_ORDERS`,
+`STATE_MARKETS`, `STATE_NULLIFIERS` and `STATE_TOTALS`, plus `MERKLE_ROOT`
+after `MERKLE_EMPTY` (O-25). The enumerator of `B3/FM2/DOMAIN` is
+`NET_DOMAIN` (O-21). `hashes_tests` pins each `Tagged(tag, "")` against
+Python goldens and scans `src/`, `contrib/`, `test/` and `contracts/` for
+existing `"B3/..."` literals: none equals an fm2 tag and none uses the
+`B3/FM2/` prefix.
+
 - `DomainHash = Tagged(DOMAIN, ModernChainDomain ‖ fm_version ‖ magic)`.
   `ProfileHash = Tagged(PROFILE, canonical profile encoding)`.
 - `AccountId = Tagged(ACCOUNT, xonly_pubkey)`. An account exists once a deposit
@@ -520,7 +540,13 @@ Every tag is prefixed `B3/FM2/` and lives in one `constexpr` registry:
 - `SlotCertificate{header_hash, bitmap, aggregate96}`. The bitmap is
   LSB-first: seat 0 is byte `0x01`. Quorum is ⌊2k/3⌋+1.
 - Merkle: RFC 6962 shape with tagged leaf, node and empty hashes, because
-  `consensus/merkle.cpp` has the duplicate-leaf flaw (CVE-2012-2459).
+  `consensus/merkle.cpp` has the duplicate-leaf flaw (CVE-2012-2459). The
+  committed root is `Tagged(MERKLE_ROOT, u64 n ‖ MTH)`, so a proof cannot
+  claim another tree size for the same root (O-25).
+- `SlotHeaderV2` as landed in R3: fixed 366-byte encoding in the field order
+  above; `anchor` is `u32 height ‖ hash`, each `FactCursor` is
+  `u32 height ‖ u32 index`, counts are `u32`, `version = 1`. Decode refuses
+  another `version` or `commitment_version` with `DECODE`.
 - Commitment v0 (O-9): sorted-leaf RFC 6962 roots for accounts, orders,
   markets, nullifiers and totals, under a root-of-roots tagged `STATE`. The
   planned sparse Merkle tree is M2-LED-02.
@@ -589,8 +615,12 @@ Profile `fm2-dex1-regtest-provisional/1` (`PROFILE_DEX1_REGTEST.json`):
 1,000 open orders per account, 4,096-byte payload; fee 100 ppm, `SELLER`
 incidence, seat share 80%; matching A2; `price_band_enabled = false`,
 `futures_enabled = false`, `signer_mode = STRICT`, `pool_capacity = 4096`,
-`outcome_index_slots = 1024`. `DevRegtestProfile` returns
-`UNSUPPORTED_NETWORK` for every chain type except REGTEST.
+`outcome_index_slots = 1024`, plus `price_band_percent = 50` (unused while
+the band is disabled). `DevRegtestProfile` returns
+`UNSUPPORTED_NETWORK` for every chain type except REGTEST. As landed in R3
+the signer enumerators are `STRICT_SIGNING` and `FOLDED_SIGNING` (registry
+names `STRICT` and `FOLDED`, O-24), and `params_tests` fails if the JSON file
+and `DevRegtestProfile` differ in any field or in `profile_hash`.
 
 **Validity predicate.** `ValidateSlotInputs` returns `INVALID_INPUT` and no
 candidate for: a duplicate `ActionId`; two originals with one (account, nonce);
@@ -657,10 +687,10 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R2)
+### 13.1 Today (after R3)
 
 The commands in 13.2 work. They build every fm2 target (`fm2_all`):
-`test_flowmesh2` (16 Boost cases), the unchanged C1 binary and, with the
+`test_flowmesh2` (79 Boost cases), the unchanged C1 binary and, with the
 option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
 19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
 `flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
@@ -974,6 +1004,9 @@ outline does not resolve on its own.
 | O-21 | The macOS `<math.h>` defines `OVERFLOW` and `DOMAIN` as macros, so an enumerator or constant with either name breaks any translation unit that includes `<cmath>` first | R1 names error code 6 `ARITHMETIC_OVERFLOW` (integer unchanged). The R3 tag registry must not use a bare `DOMAIN` identifier either (the tag string `B3/FM2/DOMAIN` is unaffected). The R1 tests include `<cmath>` before the fm2 headers to catch this |
 | O-22 | On the current macOS host (macOS 26.5.2, Apple clang 17.0.0 from the Command Line Tools, SDK 15.5, no Xcode or Homebrew LLVM) the ASan runtime spins forever in `AsanInitInternal` (dyld's `_Block_copy` calls `malloc` during shadow setup, which re-enters ASan init) and the TSan runtime segfaults before `main`, even for a hello-world program. UBSan works | R2 records the ASan and TSan canaries as **not flagged** (hang killed by the watchdog; SIGSEGV without a report) and adds a UBSan-only local build. ASan and TSan evidence must come from the Linux workflow (M0-CI-01) or a newer toolchain; installing one is an owner decision |
 | O-23 | The slice text lists the guard patterns; R2 adds stricter ones (section 13.3) | Additions only tighten. The owner may drop any of them before M0-AUD-01; until then they are part of the protected guard lists |
+| O-24 | Windows headers define `STRICT` as a macro (`windef.h`), so an enumerator named `STRICT` breaks any translation unit that includes them first | R3 names the signer modes `SignerMode::STRICT_SIGNING` and `FOLDED_SIGNING`; the registry names (`ToString`, the JSON) stay `STRICT` and `FOLDED`. Not compiled on Windows here (no MSVC or MinGW on this host) |
+| O-25 | An RFC 9162 inclusion check alone accepts some wrong tree sizes for the same root (index 0 of 4 leaves verifies as a tree of 3), which would let a size-dependent claim (for example "last leaf" in a sorted v0 tree) be forged | R3 adds the tag `MERKLE_ROOT`: the committed root is `Tagged(MERKLE_ROOT, u64 n ‖ MTH)`, like a signed tree head. A mutation that drops the size is caught by `merkle_tests/tampered_proofs_fail`. The owner may prefer an RFC-exact root plus a trusted size per tree; that would change every root vector |
+| O-26 | Which hash binds the network | `ProfileHash` covers every rule field and, of the network, only the chain type; the magic and `ModernChainDomain` are bound only by `DomainHash`. The header carries both, so a slot is bound to both. This keeps one `profile_hash` in `PROFILE_DEX1_REGTEST.json` for every regtest network. `DevRegtestProfile` therefore takes a `ChainType`, not a `NetworkId` |
 
 ---
 

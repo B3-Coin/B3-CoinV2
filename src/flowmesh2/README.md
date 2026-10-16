@@ -68,8 +68,12 @@ scripts `contrib/flowmesh2/check_inventory.py` and `check_todo.py`; and
 fixture self-test, the compile-fail controls in `test/compile_fail/`, the
 evidence bundle tool `contrib/flowmesh2/evidence.py`, the sanitizer canaries
 (`-DFLOWMESH2_SANITIZER_CANARIES=ON`, default OFF) and the owner-protected CI
-workflow `.github/workflows/flowmesh2.yml`, which the outline never runs.
-Nothing is linked into the node, wallet or Qt.
+workflow `.github/workflows/flowmesh2.yml`, which the outline never runs;
+and **R3**, the deterministic core primitives in `core/` (checked amounts, id
+types, the `B3/FM2/` tag registry, the exact bounded codec, the provisional
+regtest profile with `PROFILE_DEX1_REGTEST.json`, authority types, size-bound
+tagged Merkle trees, market descriptors and the slot header). Nothing is
+linked into the node, wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -81,8 +85,8 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R2: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 16 cases, `flowmesh2_inventory`,
+Expected after R3: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 79 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
 `flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`).
 Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2. Open gates (workspace lock reconciliation, decision

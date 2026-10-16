@@ -6,10 +6,12 @@ This is the complete task list for the new core. Claude builds the outline
 auditing the outline (M0-AUD-01). The design is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Landed outline slices: **R1** (build gate, error model, Boost.Test runner,
-inventory and TODO lint) and **R2** (guards, compile-fail controls, evidence
-tool, sanitizer canaries, CI workflow). Their rows are `outline` until
-M0-AUD-01 accepts them, and so is M0-EVD-01, the stub R2 adds. Every other row
-is `todo`, except the C1 baseline, which is `done`.
+inventory and TODO lint), **R2** (guards, compile-fail controls, evidence
+tool, sanitizer canaries, CI workflow) and **R3** (core primitives, profile,
+authority types, slot header). Their rows are `outline` until M0-AUD-01
+accepts them, and so are the rows they tag: M0-EVD-01 (R2), and M3-ENG-03,
+M3-ENG-08, M9-FUT-01, M4-STO-05 and the REAL-REPLACE M3-ENG-11 (R3). Every
+other row is `todo`, except the C1 baseline, which is `done`.
 
 ---
 
@@ -115,7 +117,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 |---|---|---|---|---|---|---|---|---|---|
 | R1 | R | outline | — | R1 | Build gate `BUILD_FLOWMESH2`, `[[nodiscard]]` `Result`/`ErrorCode`, `OutcomeCode`/`AdmissionCode`, Boost.Test runner, inventory and TODO lint (these docs landed first) | top-level `CMakeLists.txt` (4 lines); `src/flowmesh2/CMakeLists.txt`; `core/result`, `core/codes`; `test/`; `contrib/flowmesh2/check_inventory.py`, `check_todo.py` | `Result<int>`/`Result<void>` not default-constructible (static_assert); `NotImplemented` carries the exact ID; every enum integer pinned; both lint scripts fail on doctored copies, including a listed case that did not run; OFF configure has no `fm2_*` target; ON without the foundation option fails to configure; C1 still 19 cases; `ctest -L flowmesh2 --no-tests=error` green | scratch:R1/ | G-1, G-2, G-4 |
 | R2 | R | outline | — | R2 | Guards (7 rules) with self-tests, compile-fail controls, `evidence.py`, sanitizer canaries, CI workflow | `contrib/flowmesh2/` (`check_guards.py`, `test_check_guards.py`, `guard_fixtures/`, `check_negative_compile.py`, `evidence.py`, `test_evidence.py`, `canaries/`); `test/compile_fail/`; `storage/durable.h` (token type only); `src/flowmesh2/CMakeLists.txt` (`fm2_all`, `fm2_libs.manifest`, `FLOWMESH2_SANITIZER_CANARIES`); `.github/workflows/flowmesh2.yml` | each rule's planted fixture fails and a clean one passes; guards pass on the tree (`--source`, `--nm build-rebirth`); missing `LOCK`, ignored `Result` and forged token fail to compile, positive control compiles; `evidence verify` fails on a tampered, deleted or extra file; macOS ASan, UBSan and TSan canaries exit non-zero | scratch:R2/ | SEC-8, plan §4, O-19 |
-| R3 | R | todo | — | R3 | Core primitives, profile, authority types, slot header | `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot`; `PROFILE_DEX1_REGTEST.json` | `AccountId` golden; overflow refused at `MAX_ATOMS` edges and for negatives; `MulDiv` exhaustive on a small domain; tags unique, prefixed, golden, no collision with existing `B3/` tags; trailing bytes, oversize counts (no allocation) and non-canonical `CompactSize` refused; MAIN/TESTNET/TESTNET4/SIGNET give `UNSUPPORTED_NETWORK`; JSON `profile_hash` equals code; Merkle sizes 0..17 equal a naive reference, tampering fails, duplicated last leaf changes the root; header round trip, `Hash ≠ CommitDigest`, golden, every field changes `Hash` | scratch:R3/ | D6, D7, O-9, O-20 |
+| R3 | R | outline | — | R3 | Core primitives, profile, authority types, slot header | `core/ids`, `amount`, `hashes`, `codec`, `params`, `authority`, `market`, `merkle`, `slot`; `PROFILE_DEX1_REGTEST.json` | `AccountId` golden; overflow refused at `MAX_ATOMS` edges and for negatives; `MulDiv` exhaustive on a small domain; tags unique, prefixed, golden, no collision with existing `B3/` tags; trailing bytes, oversize counts (no allocation) and non-canonical `CompactSize` refused; MAIN/TESTNET/TESTNET4/SIGNET give `UNSUPPORTED_NETWORK`; JSON `profile_hash` equals code; Merkle sizes 0..17 equal a naive reference, tampering fails, duplicated last leaf changes the root; header round trip, `Hash ≠ CommitDigest`, golden, every field changes `Hash` | scratch:R3/ | D6, D7, O-9, O-20, O-24, O-25, O-26 |
 | R4 | R | todo | — | R4 | Signed actions, slot body, outcomes, facts, certificate, seat set, shared spec functions | `core/action`, `body`, `outcome`, `facts`, `certificate`, `seat_set`, `account_leaf`, `nonce_rule`, `fee_math`; `test/util/keys.h` | BIP340 round trip; flipped bit and other domain fail; `Id` excludes the signature; payload 4,096 ok, 4,097 `OVERSIZE`; `max_delay` 0 and 1,025 flagged; golden bytes and `Id`; `VerifiedAction` only via `Verify` (static_assert); body of 1,025 originals refused; two signatures give two `ActionLeaf`s; bitmap golden, bits ≥ k refused; `SeatSet` refuses bad PoP and duplicates; quorum table k=1..10; nonce rule exhaustive for W=3; fee increments sum to ceil(total·ppm/1e6); split exhaustive F=0..10,000 | scratch:R4/ | D5, D7, O-8, TRD-17 |
 | R5 | R | todo | — | R5 | Shared ledger, nonce window, commitment v0 | `ledger/nonce_window`, `ledger`, `state_commitment` | W=3 insert sequences of length ≤ 7 equal a naive model; W=100 boundaries (`NONCE_TOO_LOW`, `NONCE_USED`, eviction); duplicate outpoint refused; over-reserve leaves state unchanged; transfer refusals; 64 seeds × 10,000 random ops keep conservation equal to an independent tally; root deterministic and insertion-order independent; proofs verify | scratch:R5/ | TRD-10, O-7 |
 | R6 | R | todo | — | R6 | Order book, A2 sweep with pairing, reference matcher | `engine/book`, `matcher`, `residual`; `test/reference_matcher.h` | full and partial fill at the maker price, FIFO; 3 takers × 4 lots against 10 maker lots split 4/3/3 with a golden pairing vector; multi-level sweep; `FILL_CAP` at cap−1/cap/cap+1; self-trade conserves and charges once; 1,000 seeded batches equal a naive O(n²) matcher on fills, pairing and fees | scratch:R6/ | D4, D5, O-5, O-17 |
@@ -179,15 +181,15 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 |---|---|---|---|---|---|---|---|---|---|
 | M3-ENG-01 | M3 | todo | REAL-REPLACE | R6 | 2^17-tick band array, two-level bitmap, Fenwick tree, FIFO pool, open-addressing `OrderId` table (never iterated) | `engine/book.cpp` `OrderBook` | differential against the skeleton on 10^5 ops; `BOOK_FULL` | M3/M3-ENG-01/ | plan §3.5, D6 |
 | M3-ENG-02 | M3 | todo | STUB | R6, R7 | Residual same-slot max-volume uniform-price call | `ResolveResidualCross`; `REJ_RESIDUAL_CROSS_UNSUPPORTED` | checker covers the tie-break | M3/M3-ENG-02/ | D4, O-5, BLOCKED-ON-RULING |
-| M3-ENG-03 | M3 | todo | STUB | R3, R6 | ±50% price band against the epoch reference price | `PriceBandCheck`; `Validate` | band edge tests | M3/M3-ENG-03/ | D6, BLOCKED-ON-RULING (reference source) |
+| M3-ENG-03 | M3 | outline | STUB | R3, R6 | ±50% price band against the epoch reference price | `PriceBandCheck` (R6); `core/params` `Validate` (`price_band_enabled`) | band edge tests | M3/M3-ENG-03/ | D6, BLOCKED-ON-RULING (reference source) |
 | M3-ENG-04 | M3 | todo | REAL-REPLACE | R7 | Complete caps: `FILL_CAP`, fills per slot, 8,192 changed leaves, `SLOT_FULL`, `BOOK_FULL` | `engine/`, `ValidateSlotInputs` | cap−1 / cap / cap+1 tests | M3/M3-ENG-04/ | D6 |
 | M3-ENG-05 | M3 | todo | NONE | — | Independent checker written from the spec; shares only codecs and hashes, never engine, fee or nonce code | new | 100% agreement, including adversarial and dust batches | M3/M3-ENG-05/ | plan M3, O-3 |
 | M3-ENG-06 | M3 | todo | NONE | — | x86 gate: apply + roots p99 ≤ 5 ms at 1,024 actions on an adversarial 131k-tick book; parallel subtree hashing | new | perf evidence with PERF-7 metadata | M3/M3-ENG-06/ | plan §3.5 |
 | M3-ENG-07 | M3 | todo | NONE | — | MEV analysis: A versus A2 | new | report accepted by the owner | M3/M3-ENG-07/ | D4, OWNER-GATED |
-| M3-ENG-08 | M3 | todo | STUB | R3 | `PER_SIDE` fee incidence plus D6 dust vectors | `Validate` `PER_SIDE`; `core/fee_math` | both incidences pass | M3/M3-ENG-08/ | D3, D5, D6, BLOCKED-ON-RULING |
+| M3-ENG-08 | M3 | outline | STUB | R3 | `PER_SIDE` fee incidence plus D6 dust vectors | `core/params` `Validate` (`PER_SIDE`); `core/fee_math` (R4) | both incidences pass | M3/M3-ENG-08/ | D3, D5, D6, BLOCKED-ON-RULING |
 | M3-ENG-09 | M3 | todo | STUB | R7, R12 | `CANCEL_ALL` | engine branch; admission | releases all; conservation | M3/M3-ENG-09/ | plan §3.6 |
 | M3-ENG-10 | M3 | todo | NONE | — | Replace/amend revisions | new | atomic replace tests | M3/M3-ENG-10/ | BLOCKED-ON-RULING |
-| M3-ENG-11 | M3 | todo | REAL-REPLACE | R3 | Per-market tick, lot and minimum size at listing | `core/market` | vectors | M3/M3-ENG-11/ | D6, OD-7 |
+| M3-ENG-11 | M3 | outline | REAL-REPLACE | R3 | Per-market tick, lot and minimum size at listing | `core/market` `MarketDescriptor` | vectors | M3/M3-ENG-11/ | D6, OD-7 |
 | M3-ENG-12 | M3 | todo | REAL-REPLACE | R7 | Seed hardening: parent-header seed, grinding tests; consider a VRF or a unique threshold signature | `CanonicalOrder` | no measured proposer or client advantage | M3/M3-ENG-12/ | PLAN-7, D4, O-4, O-4b, BLOCKED-ON-RULING |
 | M3-ENG-13 | M3 | todo | REAL-REPLACE | R6 | Self-trade prevention policy | `SweepA2` self-match path | policy tests | M3/M3-ENG-13/ | O-17, BLOCKED-ON-RULING |
 | M3-ENG-14 | M3 | todo | REAL-REPLACE | R6 | Ratify taker-to-maker pairing and the remainder rule | `SweepA2` pairing | checker agreement | M3/M3-ENG-14/ | D4, O-5, BLOCKED-ON-RULING |
@@ -226,7 +228,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M4-STO-02 | M4 | todo | STUB | R8 | Group-commit `LogWriter` thread over `Pending`/`Confirm` | `LogWriter::Start` | one barrier per group; TSan clean | M4/M4-STO-02/ | plan §3.7 |
 | M4-STO-03 | M4 | todo | STUB | R8, R9 | LevelDB snapshots plus exactly-once replay | `StateOwner::Restore`, `SnapshotStore::Write`/`Load` | restart byte-equal to an uninterrupted run | M4/M4-STO-03/ | DUR-1 |
 | M4-STO-04 | M4 | todo | NONE | — | kill -9 + LazyFS campaign | new | 0 equivocations; exactly-once | M4/M4-STO-04/ | D9, OWNER-GATED |
-| M4-STO-05 | M4 | todo | STUB | R3, R8 | Folded signer mode (sign, then one barrier) and A/B measurement | `SignerLog::AppendSignedFolded`; `Validate` `FOLDED` | A/B evidence; strict stays the default | M4/M4-STO-05/ | D15, BLOCKED-ON-RULING |
+| M4-STO-05 | M4 | outline | STUB | R3, R8 | Folded signer mode (sign, then one barrier) and A/B measurement | `SignerLog::AppendSignedFolded` (R8); `core/params` `Validate` (`FOLDED_SIGNING`) | A/B evidence; strict stays the default | M4/M4-STO-05/ | D15, BLOCKED-ON-RULING |
 | M4-STO-06 | M4 | todo | STUB | R8 | Segment rollover | `FileJournal::Rollover` | crash tests | M4/M4-STO-06/ | plan §3.7 (S-9) |
 | M4-STO-07 | M4 | todo | STUB | R8 | Durable PBFT view state: `VIEW_STATE`, `NEW_VIEW_ACCEPTED`, `PREPARED_QC` | `SignerLog`/`CommitLog` record writers | restart-in-view-change tests | M4/M4-STO-07/ | PROTOCOL.md, O-16 |
 | M4-NET-01 | M4 | todo | STUB | R13 | TCP seat mesh: 4 lanes, BIP324 cipher plus a BIP340 session signature | `TcpSeatMesh::Create` | crypto review; interop | M4/M4-NET-01/ | D12, OWNER-GATED |
@@ -295,7 +297,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 
 | ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
 |---|---|---|---|---|---|---|---|---|---|
-| M9-FUT-01 | M9 | todo | STUB | R3, R13 | Dated isolated linear futures in Q; profile `futures_enabled` | `FuturesDomain::PlaceFuture`; `Validate` | contract tests | M9/M9-FUT-01/ | D21, BLOCKED-ON-RULING |
+| M9-FUT-01 | M9 | outline | STUB | R3, R13 | Dated isolated linear futures in Q; profile `futures_enabled` | `FuturesDomain::PlaceFuture` (R13); `core/params` `Validate` (`futures_enabled`) | contract tests | M9/M9-FUT-01/ | D21, BLOCKED-ON-RULING |
 | M9-FUT-02 | M9 | todo | STUB | R13 | Oracle median over ≥ 2f+1 vote-committed submissions | `FuturesDomain::SubmitOracle` | manipulation simulations | M9/M9-FUT-02/ | PLAN-13 |
 | M9-FUT-03 | M9 | todo | STUB | R13 | Margin and mark | `FuturesDomain::MarginCheck` | vectors | M9/M9-FUT-03/ | plan §3.11 |
 | M9-FUT-04 | M9 | todo | STUB | R7, R13 | Liquidation index, cap, insurance, deficit halt; engine phase 7 | `FuturesDomain::Sweep`; engine phase 7 | storms stay within the slot budget | M9/M9-FUT-04/ | plan §3.11 |
