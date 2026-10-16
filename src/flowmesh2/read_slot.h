@@ -79,7 +79,7 @@ enum class ReadPublishResult { PUBLISHED, OVERSIZE, EXHAUSTED };
 /**
  * Memory publication only, NOT a durability barrier or authority source.
  * Readers never acquire the publishing mutex or a chain/market lock.
- * atomic<shared_ptr> is not promised to be formally lock-free.
+ * Atomic shared-pointer operations are not promised formally lock-free.
  * One bounded current view plus <=max_readers leased old views; callers
  * must bound publisher concurrency and their own input allocations.
  * Quiesce operations before slot destruction; existing leases may outlive it.
@@ -87,7 +87,9 @@ enum class ReadPublishResult { PUBLISHED, OVERSIZE, EXHAUSTED };
 class ReadSlot {
     const size_t m_max_payload_bytes;
     std::shared_ptr<ReadLease::Permits> m_permits;
-    std::atomic<std::shared_ptr<const PublishedEnvelope>> m_view;
+    // The standard shared_ptr atomic free functions support the project's
+    // current libc++ as well as libstdc++; never access this slot ordinarily.
+    std::shared_ptr<const PublishedEnvelope> m_view;
     mutable Mutex m_publish_mutex;
     uint64_t m_publication GUARDED_BY(m_publish_mutex){0};
 

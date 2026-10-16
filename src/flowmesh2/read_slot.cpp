@@ -63,7 +63,8 @@ ReadPublishResult ReadSlot::Publish(const ReadEnvelope& envelope)
         LOCK(m_publish_mutex);
         if (m_publication == std::numeric_limits<uint64_t>::max()) return ReadPublishResult::EXHAUSTED;
         candidate->publication = ++m_publication;
-        retired = m_view.exchange(std::move(candidate), std::memory_order_acq_rel);
+        retired = std::atomic_exchange_explicit(&m_view,
+            std::shared_ptr<const PublishedEnvelope>{std::move(candidate)}, std::memory_order_acq_rel);
     }
     retired.reset(); // Retire the old bounded payload outside the publishing lock.
     return ReadPublishResult::PUBLISHED;
@@ -75,7 +76,7 @@ std::optional<ReadLease> ReadSlot::Acquire() const
     do {
         if (held >= m_permits->maximum) return std::nullopt;
     } while (!m_permits->held.compare_exchange_weak(held, held + 1, std::memory_order_acquire, std::memory_order_relaxed));
-    auto view{m_view.load(std::memory_order_acquire)};
+    auto view{std::atomic_load_explicit(&m_view, std::memory_order_acquire)};
     if (!view) {
         m_permits->held.fetch_sub(1, std::memory_order_release);
         return std::nullopt;

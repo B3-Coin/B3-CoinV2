@@ -115,7 +115,7 @@ decoder must also cap frame allocation, spare capacity, per-peer input and work.
 `ReadSlot` publishes deeply owned opaque envelopes with claimed scope/parent/
 commit/state identities. Move-only permits bound retained readers/old views.
 Readers never acquire its publisher mutex or a chain/market lock.
-`atomic<shared_ptr>` is not promised formally lock-free. Counter contention
+Atomic shared-pointer operations are not promised formally lock-free. Counter contention
 does not establish an arbitrary-load latency bound.
 
 Crucially this primitive supplies **no verified, fresh, ready, spendable or final
