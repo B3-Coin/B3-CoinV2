@@ -77,6 +77,22 @@ if(BUILD_FLOWMESH2)
       bitcoin_util
   )
 
+  # Application core (fm2_core). ledger/ (slice R5): the deterministic shared
+  # spot ledger, its nonce windows and state commitment v0, in namespace
+  # flowmesh2::ledger. Later slices add engine/, state/, storage/ and the
+  # other application directories here. fm2_verify never links it (guard
+  # rule 4), and it never links bitcoin_common (guard rule 4).
+  add_library(fm2_core STATIC
+    ledger/nonce_window.cpp
+  )
+  target_link_libraries(fm2_core
+    PRIVATE
+      core_interface
+      fm2_warnings
+    PUBLIC
+      fm2_types
+  )
+
   # Boost.Test suite of the outline. Every case is listed in test/INVENTORY.txt.
   add_executable(test_flowmesh2
     test/main.cpp
@@ -96,6 +112,7 @@ if(BUILD_FLOWMESH2)
     test/market_tests.cpp
     test/merkle_tests.cpp
     test/nonce_rule_tests.cpp
+    test/nonce_window_tests.cpp
     test/outcome_tests.cpp
     test/params_tests.cpp
     test/result_tests.cpp
@@ -108,6 +125,7 @@ if(BUILD_FLOWMESH2)
   target_link_libraries(test_flowmesh2 PRIVATE
     core_interface
     fm2_warnings
+    fm2_core
     fm2_types
     bitcoin_common
     bitcoin_consensus
