@@ -52,7 +52,9 @@
  * (M4-AGR-02; the probe also checks the dev certifier's OnMessage, which
  * returns Unsupported), the leader schedule (M4-AGR-03), inclusion lists (M4-AGR-04;
  * Build and Check), the restart fence (M4-AGR-06) and the evidence store
- * (M4-AGR-07; Record and Load).
+ * (M4-AGR-07; Record and Load). Slice R11 adds the three b3verify stubs:
+ * liability paths (M5-VFY-03), checkpoints (M8-CKP-01) and anchor proofs
+ * (M7-ADP-02).
  */
 
 #include <boost/test/unit_test.hpp>
@@ -86,6 +88,8 @@
 #include <flowmesh2/storage/snapshot_store.h>
 #include <flowmesh2/test/util/agreement_fixtures.h>
 #include <flowmesh2/test/util/storage_fixtures.h>
+#include <flowmesh2/test/util/verify_fixtures.h>
+#include <flowmesh2/verify/b3verify.h>
 
 #include <exception>
 #include <functional>
@@ -594,6 +598,35 @@ FM2_STUB_CASE(M4_AGR_07, "M4-AGR-07")
 {
     agreement::EvidenceStore store;
     return FirstDeviation("M4-AGR-07", {Observe(store.Record(agreement::Evidence{agreement::DoubleVote{}})), Observe(store.Load())});
+}
+
+// ---- Slice R11: b3verify ----
+
+//! A certified header of the k = 1 test seat over one synthetic account leaf.
+struct StubCertified {
+    SeatSet seats{TestSeats({"s0"})};
+    SyntheticState state{{LeafOf("alice", 1, {})}};
+    SlotHeaderV2 header{SyntheticHeader(seats, 1, state.roots)};
+    SlotCertificate cert{SignCertificate(header, {"s0"}, {0})};
+};
+
+FM2_STUB_CASE(M5_VFY_03, "M5-VFY-03")
+{
+    const StubCertified c;
+    return Observe(verify::VerifyLiabilityPath(c.header, c.state.leaves.front(), verify::LiabilityPath{}));
+}
+
+FM2_STUB_CASE(M8_CKP_01, "M8-CKP-01")
+{
+    const StubCertified c;
+    const verify::CheckpointClaim claim{c.header.height, c.header.Hash(), c.header.state_root, uint256{}};
+    return Observe(verify::VerifyCheckpoint(claim, c.header, c.cert, c.seats));
+}
+
+FM2_STUB_CASE(M7_ADP_02, "M7-ADP-02")
+{
+    const StubCertified c;
+    return Observe(verify::VerifyAnchorProof(c.header, verify::AnchorProof{c.header.anchor, {}, {}}));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

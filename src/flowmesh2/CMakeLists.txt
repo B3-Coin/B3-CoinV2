@@ -135,6 +135,23 @@ if(BUILD_FLOWMESH2)
       fm2_types
   )
 
+  # verify/ (slice R11): b3verify, the engine-off client verifier
+  # (certificates, outcomes, account leaves, fills, balance transitions and
+  # EXPIRED proofs), in namespace flowmesh2::verify. It links fm2_types and
+  # bitcoin_crypto only: never fm2_core (guard rules 3 and 4), so a client
+  # can verify without the engine, the ledger or storage.
+  add_library(fm2_verify STATIC
+    verify/b3verify.cpp
+  )
+  target_link_libraries(fm2_verify
+    PRIVATE
+      core_interface
+      fm2_warnings
+    PUBLIC
+      fm2_types
+      bitcoin_crypto
+  )
+
   # dev/ (slice R10): REGTEST-only dev components, in namespace
   # flowmesh2::dev: the scripted fake chain adapter and the k = 1 dev
   # certifier (O-10). Every dev header has
@@ -206,6 +223,7 @@ if(BUILD_FLOWMESH2)
     test/state_root_tests.cpp
     test/stub_inventory_tests.cpp
     test/validate_slot_tests.cpp
+    test/verify_tests.cpp
   )
   # bitcoin_common only for CKey (test/util/keys.h signs with test keys); the
   # fm2 libraries never link it (guard rule 4).
@@ -214,6 +232,7 @@ if(BUILD_FLOWMESH2)
     fm2_warnings
     fm2_dev
     fm2_core
+    fm2_verify
     fm2_types
     bitcoin_common
     bitcoin_consensus
