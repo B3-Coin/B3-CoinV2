@@ -168,6 +168,35 @@ BOOST_AUTO_TEST_CASE(decision_rules)
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
 }
 
+BOOST_AUTO_TEST_CASE(decision_token_binds_the_kept_certificate)
+{
+    // The state owner (R9) takes the new head's certificate hash from the
+    // decision token, so the token must name the certificate the DECISION
+    // record holds: the first one, also when the same header is appended
+    // again with another certificate (certificates are not unique).
+    CommitFixture f{9};
+    const StorageSlot slot{MakeStorageSlot(4, 1, "kept")};
+    const PendingDecision first{f.log.AppendDecision(slot.header, slot.certificate, slot.body).value()};
+    BOOST_CHECK(first.Key() == (DecisionRef{4, slot.header.Hash(), slot.certificate.Hash()}));
+    SlotCertificate other_subset{slot.certificate};
+    other_subset.aggregate.fill(0x22);
+    BOOST_REQUIRE(other_subset.Hash() != slot.certificate.Hash());
+    const PendingDecision again{f.log.AppendDecision(slot.header, other_subset, slot.body).value()};
+    BOOST_CHECK(again.Key().cert_hash == slot.certificate.Hash());
+    BOOST_CHECK(again == first);
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 1U);
+    const DurableDecision token{f.log.Confirm(again).value()};
+    BOOST_CHECK(token.Binding().cert_hash == slot.certificate.Hash());
+    // The record holds that same certificate.
+    const std::vector<JournalRecord> records{f.journal->ReadAll().value()};
+    BOOST_REQUIRE_EQUAL(records.size(), 1U);
+    BOOST_CHECK(DecisionRecord::Decode(records[0].payload, Profile()).value().certificate.Hash() == token.Binding().cert_hash);
+    // A decision appended first with the other certificate binds that one.
+    CommitFixture g{10};
+    const PendingDecision other_first{g.log.AppendDecision(slot.header, other_subset, slot.body).value()};
+    BOOST_CHECK(other_first.Key().cert_hash == other_subset.Hash());
+}
+
 BOOST_AUTO_TEST_CASE(record_codecs_golden_and_exact)
 {
     // APPLIED golden from evidence/R8/golden.py.

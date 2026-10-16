@@ -39,10 +39,14 @@
  *   ACCEPTED_PROPOSAL  ProposalRef{key, header_hash}
  *   INTENT             VoteRef{key, digest}
  *   SIGNED_VOTE        SignedVoteRef{key, digest, signature}
- *   DECISION           DecisionRef{slot, header_hash}
+ *   DECISION           DecisionRef{slot, header_hash, cert_hash}
  *   APPLIED            AppliedRef{slot, header_hash, state_root}
  * SlotOf and DigestOf give the slot and the digest (a vote's digest, or the
- * header hash of a decision) of any reference.
+ * header hash of a decision) of any reference. A DecisionRef also names the
+ * hash of the certificate its DECISION record holds (the first one the log
+ * accepted for that header), so the state owner (R9) takes the new head's
+ * certificate hash from the token, and replay finds the same one in the
+ * record.
  *
  * Header-only and deterministic.
  */
@@ -134,6 +138,7 @@ struct SignedVoteRef {
 struct DecisionRef {
     uint64_t slot{0};
     uint256 header_hash;
+    uint256 cert_hash; //!< SlotCertificate::Hash() of the certificate in the DECISION record
     friend bool operator==(const DecisionRef&, const DecisionRef&) = default;
 };
 struct AppliedRef {

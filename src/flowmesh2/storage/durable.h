@@ -34,8 +34,9 @@
  * sequence number and the record's reference (storage/tokens.h): Slot(),
  * Digest() (the vote digest of INTENT and SIGNED_VOTE, the header hash of
  * DECISION and APPLIED), View() for the two vote kinds, and Binding() for
- * the whole reference (a SIGNED_VOTE's includes its signature, an APPLIED's
- * its state root).
+ * the whole reference (a SIGNED_VOTE's includes its signature, a
+ * DECISION's the hash of the certificate its record holds, an APPLIED's its
+ * state root).
  *
  * Moved-from tokens: a move copies the binding, and the source keeps it. A
  * token is a proof that a record is durable, which stays true; it is not a

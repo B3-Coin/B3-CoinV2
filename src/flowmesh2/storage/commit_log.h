@@ -29,7 +29,8 @@
  * DurableApplied tokens through Journal::Confirm:
  *
  *   AppendDecision(header, cert, body) -> PendingDecision; Barrier (B-DECISION);
- *   Confirm -> DurableDecision, which StateOwner::Apply (R9) requires;
+ *   Confirm -> DurableDecision, which StateOwner::Apply (R9) requires; the
+ *   token names the header and the certificate the record holds;
  *   AppendApplied(DurableDecision, state_root) -> PendingApplied; Barrier
  *   (B-APPLIED); Confirm -> DurableApplied, which ReadService::Publish (R11)
  *   requires.
@@ -41,7 +42,8 @@
  *   record can be re-executed after a crash (O-16). The certificate's
  *   signatures are not checked here (agreement and b3verify do that). The
  *   same header for a slot again is idempotent (the first certificate is
- *   kept: certificates are not unique, O-4b); another header for a decided
+ *   kept: certificates are not unique, O-4b; the returned PendingDecision,
+ *   and so the token, names that first certificate's hash); another header for a decided
  *   slot is EQUIVOCATION_REFUSED (DECISION_CONFLICT), conflicting
  *   certificates being evidence for M4-AGR-07.
  * - AppendApplied(decision, state_root): VERIFY_FAILED (TOKEN_OTHER_LOG) for
@@ -146,6 +148,7 @@ private:
 
     struct DecisionEntry {
         uint256 header_hash;
+        uint256 cert_hash; //!< of the certificate the DECISION record holds
         uint256 state_root;
         uint64_t seq{0};
         std::optional<uint64_t> applied_seq;

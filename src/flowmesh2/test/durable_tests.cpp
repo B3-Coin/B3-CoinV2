@@ -184,7 +184,7 @@ BOOST_AUTO_TEST_CASE(token_binding_and_moves)
     const PendingDecision pending{f.Decide(slot)};
     BOOST_CHECK_EQUAL(pending.JournalInstance(), 4U);
     BOOST_CHECK_EQUAL(pending.Seq(), 1U);
-    BOOST_CHECK(pending.Key() == (DecisionRef{7, slot.header.Hash()}));
+    BOOST_CHECK(pending.Key() == (DecisionRef{7, slot.header.Hash(), slot.certificate.Hash()}));
     BOOST_CHECK_EQUAL(f.log.Barrier().value(), 1U);
     DurableDecision token{f.log.Confirm(pending).value()};
     BOOST_CHECK_EQUAL(token.JournalInstance(), 4U);

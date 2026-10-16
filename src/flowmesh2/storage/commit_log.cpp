@@ -99,16 +99,18 @@ Result<PendingDecision> CommitLog::AppendDecision(const SlotHeaderV2& header, co
     const uint256 header_hash{header.Hash()};
     if (certificate.header_hash != header_hash) return Error{ErrorCode::VERIFY_FAILED, DECISION_CERT_HEADER};
     if (!BodyMatchesHeader(header, body)) return Error{ErrorCode::VERIFY_FAILED, BODY_HEADER_MISMATCH};
-    const DecisionRef ref{header.height, header_hash};
     if (const auto it{m_decisions.find(header.height)}; it != m_decisions.end()) {
         if (it->second.header_hash != header_hash) return Error{ErrorCode::EQUIVOCATION_REFUSED, DECISION_CONFLICT};
-        return Ok(PendingDecision{m_journal->InstanceId(), it->second.seq, ref});
+        // Idempotent: the record keeps the first certificate, and so does the reference.
+        return Ok(PendingDecision{m_journal->InstanceId(), it->second.seq,
+                                  DecisionRef{header.height, header_hash, it->second.cert_hash}});
     }
+    const uint256 cert_hash{certificate.Hash()};
     const std::vector<unsigned char> payload{DecisionRecord{header, certificate, body}.Encode()};
     Result<uint64_t> seq{m_journal->Append(RecordType::DECISION, payload)};
     if (!seq.has_value()) return seq.error();
-    m_decisions.emplace(header.height, DecisionEntry{header_hash, header.state_root, *seq, std::nullopt});
-    return Ok(PendingDecision{m_journal->InstanceId(), *seq, ref});
+    m_decisions.emplace(header.height, DecisionEntry{header_hash, cert_hash, header.state_root, *seq, std::nullopt});
+    return Ok(PendingDecision{m_journal->InstanceId(), *seq, DecisionRef{header.height, header_hash, cert_hash}});
 }
 
 Result<PendingApplied> CommitLog::AppendApplied(const DurableDecision& decision, const uint256& state_root)
