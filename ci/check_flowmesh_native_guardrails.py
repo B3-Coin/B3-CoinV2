@@ -4,7 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Strict, bounded Linux native-test guardrails; never a performance gate.
 
-Version native-guardrails-v6 selects exact compiled Boost suites, not CTest's
+Version native-guardrails-v7 selects exact compiled Boost suites, not CTest's
 skip-on-empty filters. Discovery and detailed XML must agree on every selected
 leaf case. TSan covers instrumented native code, not all system libraries; the
 existing repository suppression file includes a ConnectTip deadlock suppression.
@@ -32,7 +32,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-PROFILE_VERSION = "native-guardrails-v6"
+PROFILE_VERSION = "native-guardrails-v7"
 CONTROL_TIMEOUT = 30
 SUITE_TIMEOUT = 600
 TOTAL_TEST_TIMEOUT = 1800
@@ -51,6 +51,7 @@ SUITE_SOURCES = {
     "flowmesh_client_connect_tests": "src/test/flowmesh_https_tests.cpp",
     "flowmesh_client_wait_lane_tests": "src/test/flowmesh_https_tests.cpp",
     "flowmesh_client_submit_wait_tests": "src/test/flowmesh_https_tests.cpp",
+    "flowmesh_client_outcome_evidence_tests": "src/test/flowmesh_https_tests.cpp",
     "flowmesh_client_watch_lane_tests": "src/test/flowmesh_https_tests.cpp",
     "flowmesh_client_market_view_tests": "src/test/flowmesh_https_tests.cpp",
     "flowmesh_api_watch_tests": "src/test/flowmesh_https_tests.cpp",
@@ -159,6 +160,14 @@ REQUIRED_CASES = {
         "chain_mutation_fences_snapshot_switch_load_targets_remove_and_reset",
         "chain_mutation_fences_snapshot_validation_success",
         "chain_mutation_fences_invalid_snapshot_mode",
+    },
+    "flowmesh_client_outcome_evidence_tests": {
+        "advertised_action_outcome_parses_only_true",
+        "remote_client_verifies_outcome_evidence_only_on_advertising_endpoints",
+        "evidence_failure_never_downgrades_inclusion",
+        "outcome_upgrade_at_most_once_per_endpoint",
+        "transient_outcome_evidence_budget_recovers_without_resubmitting_included_action",
+        "unknown_field_error_clears_both_capabilities",
     },
 }
 NATIVE_SOURCES = {

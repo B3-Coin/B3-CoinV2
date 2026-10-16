@@ -1,6 +1,6 @@
 # FlowMesh Linux native CI guardrails
 
-Date: 2026-10-16. Profile: `native-guardrails-v6`.
+Date: 2026-10-16. Profile: `native-guardrails-v7`.
 
 This headless Linux profile checks selected native FlowMesh concurrency and
 recovery regressions. Its source and runner controls are prepared; Linux native
@@ -32,7 +32,7 @@ failure fails the job; it does not select an unsanitized fallback.
 
 ## Exact test selection and evidence
 
-The [strict runner](../../ci/check_flowmesh_native_guardrails.py) selects 27 exact
+The [strict runner](../../ci/check_flowmesh_native_guardrails.py) selects 28 exact
 compiled Boost suites. They cover P2P queues, runtime and production storage,
 service startup and policy, HTTPS and client wait/watch paths, request
 scheduling, outcomes and readiness, local admission, health, timing, checkpoint
@@ -67,6 +67,22 @@ and requires no new admission span. Tracing stays opt-in and off by default.
 These cases check capture boundaries and attribution, not production timing
 or trading latency. All version 5 admission, header, suite and bound requirements
 remain unchanged.
+Version 7 adds only `flowmesh_client_outcome_evidence_tests`, compiled from the
+already selected HTTPS translation unit. All six cases are mandatory: truthful
+capability parsing, advertising-endpoint outcome verification, inclusion
+preservation on evidence failure, permanent `EXPIRED` one-shot behavior,
+transient standalone `BUDGET` recovery without resubmission, and unknown-field
+withdrawal of both capabilities. The new recovery case is
+`transient_outcome_evidence_budget_recovers_without_resubmitting_included_action`.
+Independent controls freeze every earlier suite name and source mapping, so
+changing the count from 27 to 28 cannot conceal an omitted or replaced suite.
+Every version 6 required case, source, header dependency, build check and time
+or output bound remains. No catalog-isolation names are added to the mandatory
+requirements in this version.
+The complete **version 7 native 28-suite execution was pending** at the private
+preparation freeze and subsequently passed locally as recorded below. Earlier
+27-suite campaigns do not qualify the new outcome source or complete version 7
+selection; Linux, DEBUG_LOCKORDER, TSan and remote execution remain pending.
 Missing prerequisites fail discovery.
 The workflow must contain their reviewed source revisions before qualification;
 it cannot substitute a prototype or silently omit a missing case. Do not publish
@@ -133,8 +149,22 @@ private runner was imported from its disposable directory; only the workflow
 contract and child-process working directory used the unchanged repository.
 This does not execute native C++ or qualify production timing. The version 5
 native campaign below remains a separate historical result, not qualification
-of the new tracing source. Native version 6, Linux, DEBUG_LOCKORDER, TSan and
-remote CI execution remain pending.
+of the new tracing source. At that runner-control preparation freeze, native
+version 6, Linux, DEBUG_LOCKORDER, TSan and remote CI execution were pending.
+
+Version 7 passes **47 lightweight controls**, actual private local exit 0 in
+0.190 seconds, with zero failures or errors. All 43 earlier controls remain;
+only their profile-version and suite-count literals change. Four added controls
+independently preserve the frozen 27-suite source mapping and require all six
+outcome-evidence cases to be discovered and executed. Each named case is also
+rejected individually when missing, disabled, unexecuted or skipped; the new
+suite is separately rejected when missing or disabled. The private checker was
+imported from its disposable directory, with the unchanged repository used only
+for the workflow contract and Python-child working directory. Runner functions,
+earlier required-case sets, native sources, header dependencies and execution
+bounds were compared unchanged. A non-author reviewer separately ran these 47
+controls once: exit 0, zero failures/errors, 0.190 seconds. These are runner
+controls, not native execution; the later native host result is separate.
 
 A separate positive format control used a preserved ordinary macOS native
 binary: real Boost discovery and the XML results for eleven timing cases passed
@@ -252,3 +282,19 @@ seconds; the non-author reviewer ran them once with exit 0 in 0.186 seconds.
 These do not execute the C++ gate, TLS integration, Linux lock-order build or
 TSan instrumentation. No remote CI run, push or release qualification follows
 from this update; Linux, DEBUG_LOCKORDER and TSan remain unexecuted.
+
+The admission-trace stage subsequently passed 483 cases in 27 suites on
+ordinary macOS, with all actual children exiting 0 and no selected skips.
+Its runner imported v5; preserved XML was independently rechecked under v6,
+not relabelled as a Linux run. Native executable SHA256 was
+`f8a979c85dcbf933c2e087df7964dcbee713e6533c6ef5cf705ebcc11d58db31`.
+
+Version 7's exact full local `host-local-macos-ci-selection` imported manifest
+`native-guardrails-v7` and passed **489 cases in 28 suites**, all actual child
+exits 0, no selected skips, 224.590 seconds. Native executable SHA256 was
+`24424b0deb86aab7a7d7a8afb857ff95f052c35e1e0e8f8e0973cb3d6e72f718`.
+Its client source is the separately reviewed
+[transient evidence-budget repair](b3-flowmesh-outcome-budget-recovery-20261016.md).
+This ordinary AppleClang 17 Release run does not validate Linux flags,
+DEBUG_LOCKORDER, TSan, remote CI, production timing or 200 ms performance.
+No native Catalog successor is included in this qualification.

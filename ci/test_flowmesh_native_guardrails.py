@@ -107,6 +107,48 @@ TRACE_REQUIRED_CASES = {
 }
 
 
+# Literal frozen v6 manifest, independent of RUNNER and the new suite count.
+FROZEN_V6_SUITE_SOURCES = {
+    "flowmesh_p2p_tests": "src/test/flowmesh_p2p_tests.cpp",
+    "flowmesh_runtime_tests": "src/test/flowmesh_runtime_tests.cpp",
+    "flowmesh_agreement_tests": "src/test/flowmesh_agreement_tests.cpp",
+    "flowmesh_production_store_tests": "src/test/flowmesh_production_store_tests.cpp",
+    "flowmesh_service_tests": "src/test/flowmesh_service_tests.cpp",
+    "flowmesh_transport_policy_tests": "src/test/flowmesh_service_tests.cpp",
+    "flowmesh_service_startup_tests": "src/test/flowmesh_service_tests.cpp",
+    "flowmesh_https_tests": "src/test/flowmesh_https_tests.cpp",
+    "flowmesh_client_connect_tests": "src/test/flowmesh_https_tests.cpp",
+    "flowmesh_client_wait_lane_tests": "src/test/flowmesh_https_tests.cpp",
+    "flowmesh_client_submit_wait_tests": "src/test/flowmesh_https_tests.cpp",
+    "flowmesh_client_watch_lane_tests": "src/test/flowmesh_https_tests.cpp",
+    "flowmesh_client_market_view_tests": "src/test/flowmesh_https_tests.cpp",
+    "flowmesh_api_watch_tests": "src/test/flowmesh_https_tests.cpp",
+    "flowmesh_api_outcome_tests": "src/test/flowmesh_https_tests.cpp",
+    "flowmesh_api_health_tests": "src/test/flowmesh_https_tests.cpp",
+    "flowmesh_client_work_tests": "src/test/flowmesh_client_work_tests.cpp",
+    "flowmesh_client_poll_tests": "src/test/flowmesh_client_poll_tests.cpp",
+    "flowmesh_client_action_wait_tests": "src/test/flowmesh_client_action_wait_tests.cpp",
+    "flowmesh_client_watch_tests": "src/test/flowmesh_client_watch_tests.cpp",
+    "flowmesh_client_outcome_tests": "src/test/flowmesh_client_outcome_tests.cpp",
+    "flowmesh_client_readiness_tests": "src/test/flowmesh_client_readiness_tests.cpp",
+    "flowmesh_local_admission_tests": "src/test/flowmesh_local_admission_tests.cpp",
+    "flowmesh_health_tests": "src/test/flowmesh_health_tests.cpp",
+    "flowmesh_timing_tests": "src/test/flowmesh_timing_tests.cpp",
+    "flowmesh_checkpoint_index_tests": "src/test/flowmesh_checkpoint_index_tests.cpp",
+    "validation_chainstatemanager_tests": "src/test/validation_chainstatemanager_tests.cpp",
+}
+
+# Exact outcome evidence cases, independent of RUNNER's required-case map.
+OUTCOME_EVIDENCE_REQUIRED_CASES = {
+    "advertised_action_outcome_parses_only_true",
+    "remote_client_verifies_outcome_evidence_only_on_advertising_endpoints",
+    "evidence_failure_never_downgrades_inclusion",
+    "outcome_upgrade_at_most_once_per_endpoint",
+    "transient_outcome_evidence_budget_recovers_without_resubmitting_included_action",
+    "unknown_field_error_clears_both_capabilities",
+}
+
+
 class DiscoveryTests(unittest.TestCase):
     def test_exact_enabled_manifest(self):
         self.assertEqual(RUNNER.parse_discovery(listing()), expected_inventory())
@@ -351,6 +393,57 @@ class AdmissionTraceRegressionTests(unittest.TestCase):
                     RUNNER.check_xml(ET.tostring(skipped, encoding="unicode"), suite, expected)
 
 
+class OutcomeEvidenceRegressionTests(unittest.TestCase):
+    suite = "flowmesh_client_outcome_evidence_tests"
+
+    def test_outcome_evidence_positive_discovery_and_exact_execution(self):
+        self.assertEqual(len(OUTCOME_EVIDENCE_REQUIRED_CASES), 6)
+        self.assertEqual(RUNNER.SUITE_SOURCES[self.suite], "src/test/flowmesh_https_tests.cpp")
+        self.assertEqual(RUNNER.REQUIRED_CASES[self.suite], OUTCOME_EVIDENCE_REQUIRED_CASES)
+        discovered = RUNNER.parse_discovery(listing())
+        self.assertTrue(OUTCOME_EVIDENCE_REQUIRED_CASES.issubset(discovered[self.suite]))
+        self.assertEqual(RUNNER.check_xml(
+            ET.tostring(xml_report(self.suite, discovered[self.suite]), encoding="unicode"),
+            self.suite, discovered[self.suite]), len(discovered[self.suite]))
+
+    def test_outcome_evidence_suite_and_each_case_cannot_be_missing_or_disabled(self):
+        missing_suite = expected_inventory()
+        del missing_suite[self.suite]
+        with self.subTest(fault="missing suite"), self.assertRaisesRegex(
+                RUNNER.GuardrailError, "Missing compiled suites"):
+            RUNNER.parse_discovery(listing(missing_suite))
+        disabled_suite = listing().replace(self.suite + "*\n", self.suite + " \n", 1)
+        self.assertNotEqual(disabled_suite, listing())
+        with self.subTest(fault="disabled suite"), self.assertRaisesRegex(
+                RUNNER.GuardrailError, "Duplicate/disabled"):
+            RUNNER.parse_discovery(disabled_suite)
+        for case in OUTCOME_EVIDENCE_REQUIRED_CASES:
+            inventory = expected_inventory()
+            inventory[self.suite].remove(case)
+            with self.subTest(case=case, fault="undiscovered"), self.assertRaisesRegex(
+                    RUNNER.GuardrailError, "missing required regression"):
+                RUNNER.parse_discovery(listing(inventory))
+            disabled = listing().replace(f"    {case}*\n", f"    {case} \n", 1)
+            self.assertNotEqual(disabled, listing())
+            with self.subTest(case=case, fault="disabled"), self.assertRaisesRegex(
+                    RUNNER.GuardrailError, "selected case"):
+                RUNNER.parse_discovery(disabled)
+
+    def test_each_outcome_evidence_case_cannot_be_unexecuted_or_skipped(self):
+        expected = expected_inventory()[self.suite]
+        for case in OUTCOME_EVIDENCE_REQUIRED_CASES:
+            missing = xml_report(self.suite, expected - {case})
+            with self.subTest(case=case, fault="unexecuted"), self.assertRaisesRegex(
+                    RUNNER.GuardrailError, "case mismatch"):
+                RUNNER.check_xml(ET.tostring(missing, encoding="unicode"), self.suite, expected)
+            skipped = xml_report(self.suite, expected)
+            row = next(row for row in skipped.iter("TestCase") if row.get("name") == case)
+            row.set("result", "skipped")
+            with self.subTest(case=case, fault="skipped"), self.assertRaisesRegex(
+                    RUNNER.GuardrailError, "Selected case/suite skipped or failed"):
+                RUNNER.check_xml(ET.tostring(skipped, encoding="unicode"), self.suite, expected)
+
+
 class BuildFixture(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="flowmesh-ci-control-")
@@ -530,6 +623,15 @@ class ProfileTests(BuildFixture):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_frozen_v6_suite_names_and_source_mappings_remain_independently_required(self):
+        self.assertEqual(len(FROZEN_V6_SUITE_SOURCES), 27)
+        self.assertTrue(set(FROZEN_V6_SUITE_SOURCES).issubset(RUNNER.SUITE_SOURCES))
+        self.assertEqual(set(RUNNER.SUITE_SOURCES) - set(FROZEN_V6_SUITE_SOURCES),
+                         {"flowmesh_client_outcome_evidence_tests"})
+        for suite, source in FROZEN_V6_SUITE_SOURCES.items():
+            with self.subTest(suite=suite):
+                self.assertEqual(RUNNER.SUITE_SOURCES[suite], source)
+
     def test_minimal_branch_only_bounded_nonpublishing_contract(self):
         text = (ROOT / ".github" / "workflows" / "flowmesh-native-guardrails.yml").read_text()
         for required in ("workflow_dispatch:", "branches: [flowmeshV2-dev]", "contents: read",
@@ -547,8 +649,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, artifact)
 
     def test_profile_is_versioned_and_excludes_prototype(self):
-        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v6")
-        self.assertEqual(len(RUNNER.SUITE_SOURCES), 27)
+        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v7")
+        self.assertEqual(len(RUNNER.SUITE_SOURCES), 28)
         self.assertTrue(set(RUNNER.REQUIRED_CASES).issubset(RUNNER.SUITE_SOURCES))
         self.assertFalse(any("v2_market" in source or "/v2/" in source for source in RUNNER.NATIVE_SOURCES))
         self.assertEqual(len(RUNNER.REQUIRED_CASES["validation_chainstatemanager_tests"]), 8)
