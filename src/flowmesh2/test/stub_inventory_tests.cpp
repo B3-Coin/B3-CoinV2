@@ -26,12 +26,15 @@
  * Slice R1 added the registry and its self-check. Slice R3 adds the four
  * stubs of core/params Validate(): the price band (M3-ENG-03), PER_SIDE fees
  * (M3-ENG-08), futures (M9-FUT-01) and folded signing (M4-STO-05). Slice R4
- * adds batch BIP340 verification (M4-ADM-01).
+ * adds batch BIP340 verification (M4-ADM-01) and the five fact kinds that
+ * later tasks define (M7-SEAT-01, M7-GOV-01, MB1-B3D-02, M8-BRG-02,
+ * M8-EXIT-01); each fact probe checks EncodeFact, FactId and DecodeFact.
  */
 
 #include <boost/test/unit_test.hpp>
 
 #include <flowmesh2/core/action.h>
+#include <flowmesh2/core/facts.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
 
@@ -175,6 +178,26 @@ size_t ProblemCount(std::vector<StubEntry> entries) { return InventoryProblems(e
 //! The provisional regtest profile, which Validate() accepts unchanged.
 ProfileParams RegtestProfile() { return DevRegtestProfile(ChainType::REGTEST).value(); }
 
+//! The first observation that is not a NOT_IMPLEMENTED/UNSUPPORTED error
+//! carrying `task_id`, or the first one if all are; so a probe of several
+//! entry points fails if any of them deviates.
+StubObservation FirstDeviation(std::string_view task_id, std::vector<StubObservation> observations)
+{
+    for (const auto& o : observations) {
+        const bool stub_error{!o.succeeded && o.error.has_value() && o.error->detail == task_id &&
+                              (o.error->code == ErrorCode::NOT_IMPLEMENTED || o.error->code == ErrorCode::UNSUPPORTED)};
+        if (!stub_error) return o;
+    }
+    return observations.front();
+}
+
+//! EncodeFact, FactId and DecodeFact (of the kind byte) of a stub fact kind.
+StubObservation FactStubProbe(const Fact& fact, std::string_view task_id)
+{
+    const std::vector<unsigned char> kind_only{static_cast<unsigned char>(KindOf(fact))};
+    return FirstDeviation(task_id, {Observe(EncodeFact(fact)), Observe(FactId(fact)), Observe(DecodeFact(kind_only))});
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(stub_inventory)
@@ -238,6 +261,33 @@ FM2_STUB_CASE(M4_STO_05, "M4-STO-05")
 FM2_STUB_CASE(M4_ADM_01, "M4-ADM-01")
 {
     return Observe(BatchVerifier{}.VerifyBatch({}));
+}
+
+// ---- Slice R4: core/facts stub kinds ----
+
+FM2_STUB_CASE(M7_SEAT_01, "M7-SEAT-01")
+{
+    return FactStubProbe(SeatChangeFact{}, "M7-SEAT-01");
+}
+
+FM2_STUB_CASE(M7_GOV_01, "M7-GOV-01")
+{
+    return FactStubProbe(ListingFact{}, "M7-GOV-01");
+}
+
+FM2_STUB_CASE(MB1_B3D_02, "MB1-B3D-02")
+{
+    return FactStubProbe(CheckpointAcceptedFact{}, "MB1-B3D-02");
+}
+
+FM2_STUB_CASE(M8_BRG_02, "M8-BRG-02")
+{
+    return FactStubProbe(PayoutConfirmedFact{}, "M8-BRG-02");
+}
+
+FM2_STUB_CASE(M8_EXIT_01, "M8-EXIT-01")
+{
+    return FactStubProbe(ExitNullifierFact{}, "M8-EXIT-01");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
