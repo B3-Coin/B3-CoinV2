@@ -148,6 +148,26 @@ private:
         std::shared_ptr<std::atomic_bool> cancel;
         Result data;
     };
+    // Passive discovery owns no wallet/backend or economic instruction.
+    // One actor and one coalesced value scope; a foreground observation
+    // invalidates both success and failure from its preceding catalog.
+    struct CatalogReadScope {
+        QPointer<WalletModel> wallet;
+        interfaces::Node* node{nullptr};
+        uint64_t generation{0}, catalog_generation{0}, command_observation{0}, refresh_epoch{0};
+        std::optional<B3FlowMeshTrading::Market> selected;
+        QString known_head, requested_base;
+        uint64_t next_sequence{0};
+        bool route_pending{false};
+    };
+    struct CatalogReadResult {
+        CatalogReadScope scope;
+        std::shared_ptr<std::atomic_bool> cancel;
+        std::shared_ptr<std::atomic_bool> yield;
+        std::optional<B3FlowMeshTrading::SavedActions> saved;
+        bool saved_applied{false}, fairness_completion{false}; // GUI-owned bookkeeping.
+        Result data;
+    };
     struct WatchResult {
         WatchResult() { snapshot_age.start(); }
         WatchScope scope;
@@ -371,6 +391,12 @@ private:
     void resumeSelectedRead();
     void finishSelectedRead(const std::shared_ptr<SelectedReadResult>& result);
     void stopSelectedReadWorker(bool join);
+    std::optional<CatalogReadScope> catalogReadScope() const;
+    bool catalogReadScopeValid(const CatalogReadScope& scope, bool same_head = true) const;
+    void startCatalogRead();
+    void resumeCatalogRead();
+    void finishCatalogRead(const std::shared_ptr<CatalogReadResult>& result);
+    void stopCatalogReadWorker(bool join);
     void applyMarketCatalog(const Result& result);
     //! The passive phase the next refresh would run (None: market read only),
     //! including a due reconcile-first override.
@@ -487,6 +513,11 @@ private:
     // Fence pre-command reads even after the command owner has completed.
     // This never grants freshness or changes a retained economic instruction.
     uint64_t m_selected_read_command_observation{0};
+    QThread* m_catalog_read_thread{nullptr};
+    std::shared_ptr<CatalogReadResult> m_catalog_read_result;
+    std::optional<CatalogReadScope> m_catalog_read_pending;
+    uint64_t m_catalog_read_generation{0};
+    std::weak_ptr<SelectedReadResult> m_catalog_fair_read;
     QTimer* m_timer{nullptr};
     // Live updates: a second worker keeps at most one bounded watch read
     // outstanding for the selected market (see B3FlowMeshWatch::Policy).
