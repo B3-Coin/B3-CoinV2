@@ -40,9 +40,14 @@ if(BUILD_FLOWMESH2)
     $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/we4834>
   )
 
-  # core/: deterministic value types, error model and code registries.
+  # core/: deterministic value types, codecs, tagged hashes, the error model
+  # and code registries. bitcoin_consensus provides hash.cpp, uint256.cpp and
+  # pubkey.cpp; bitcoin_crypto provides SHA-256.
   add_library(fm2_types STATIC
+    core/amount.cpp
     core/codes.cpp
+    core/hashes.cpp
+    core/ids.cpp
     core/result.cpp
   )
   target_link_libraries(fm2_types
@@ -50,14 +55,20 @@ if(BUILD_FLOWMESH2)
       core_interface
       fm2_warnings
     PUBLIC
+      bitcoin_consensus
+      bitcoin_crypto
       bitcoin_util
   )
 
   # Boost.Test suite of the outline. Every case is listed in test/INVENTORY.txt.
   add_executable(test_flowmesh2
     test/main.cpp
+    test/amount_tests.cpp
+    test/codec_tests.cpp
     test/codes_tests.cpp
     test/durable_tests.cpp
+    test/hashes_tests.cpp
+    test/ids_tests.cpp
     test/result_tests.cpp
     test/stub_inventory_tests.cpp
   )
@@ -65,9 +76,13 @@ if(BUILD_FLOWMESH2)
     core_interface
     fm2_warnings
     fm2_types
+    bitcoin_consensus
     bitcoin_util
     Boost::headers
   )
+  # Tests that read tracked files (the repository-wide tag scan) find the
+  # source tree through this definition.
+  target_compile_definitions(test_flowmesh2 PRIVATE FM2_SOURCE_ROOT="${PROJECT_SOURCE_DIR}")
 
   set(FM2_TEST_TMP ${CMAKE_BINARY_DIR}/fm2-test-tmp)
   set(FM2_CONTRIB ${PROJECT_SOURCE_DIR}/contrib/flowmesh2)

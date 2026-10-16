@@ -5,12 +5,38 @@
 # CTest flowmesh2_inventory (contrib/flowmesh2/check_inventory.py) fails if a
 # listed case is not in the binary, if the binary has an unlisted case, if a
 # case is disabled, or if a listed case did not execute in the full run.
+amount_tests/add_refuses_operands_outside_the_range
+amount_tests/add_refuses_overflow_at_the_edges
+amount_tests/max_atoms_is_two_to_the_62
+amount_tests/mul_checked_edges
+amount_tests/muldiv_exhaustive_small_domain
+amount_tests/muldiv_refuses_zero_divisor
+amount_tests/muldiv_wide_intermediates
+amount_tests/sub_refuses_underflow_and_bad_operands
+codec_tests/capped_byte_vector
+codec_tests/capped_vector_at_and_over_cap
+codec_tests/decode_exact_refuses_trailing_short_and_long_input
+codec_tests/decode_exact_round_trip
+codec_tests/decode_exact_with_custom_reader
+codec_tests/non_canonical_compact_size_refused
+codec_tests/oversize_count_refused_without_allocating
 codes_tests/admission_codes_pinned
 codes_tests/admission_to_string_total
 codes_tests/duplicate_and_admitted_are_not_rejections
 codes_tests/outcome_codes_pinned
 codes_tests/outcome_to_string_total
 durable_tests/token_kinds_pinned
+hashes_tests/no_collision_with_repository_tags
+hashes_tests/registry_pinned
+hashes_tests/tagged_matches_the_bip340_definition
+hashes_tests/tags_unique_prefixed_and_distinct
+hashes_tests/unknown_tags_are_refused
+ids_tests/account_id_golden
+ids_tests/ids_encode_as_raw_bytes
+ids_tests/ids_order_lexicographic
+ids_tests/native_asset_is_zero
+ids_tests/order_id_from_place
+ids_tests/outpoint_order_and_encoding
 result_tests/error_code_to_string_total
 result_tests/error_codes_pinned
 result_tests/error_round_trip
