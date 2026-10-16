@@ -11818,7 +11818,15 @@ BOOST_AUTO_TEST_CASE(accepted_local_original_waits_for_authority_then_resumes_wi
     BOOST_CHECK_EQUAL(runtime.DeliverySnapshots(f.market).front().deferred_objects, 1U);
     BOOST_CHECK(f.clocks[0].Now() == clock);
     f.chains[0].SetReconciled(true);
+    const auto views_before_resume{f.view_changes.load()};
     f.Tick(); // existing reopen edge, never a new client instruction
+    BOOST_CHECK(f.clocks[0].Now() == clock); // Retention itself resumes at the SAME fixed-clock edge.
+    // Distributed delivery can be rate-limited; service maintenance, unlike a
+    // wall-clock WaitUntil, advances the existing retry/refill policy normally.
+    for (size_t ticks{0}; ticks < 5 && !f.AllAt(3); ++ticks) f.Tick(std::chrono::milliseconds{250});
+    BOOST_CHECK(f.clocks[0].Now() - clock <= std::chrono::milliseconds{1250});
+    BOOST_CHECK(std::chrono::milliseconds{1250} < f.round_timeout);
+    BOOST_CHECK_EQUAL(f.view_changes.load(), views_before_resume);
     BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(3); }));
     f.Drain();
     BOOST_CHECK_EQUAL(runtime.DeliverySnapshots(f.market).front().deferred_objects, 0U);
@@ -11834,6 +11842,137 @@ BOOST_AUTO_TEST_CASE(accepted_local_original_waits_for_authority_then_resumes_wi
     BOOST_CHECK(std::any_of(completed.begin(), completed.end(), [&](const auto& event) {
         return event.action_id == action.Id() && event.kind == flowmesh::ClientEventKind::POOL_ADMITTED && event.signed_action_hash == Hash(*payload);
     }));
+}
+
+BOOST_AUTO_TEST_CASE(accepted_local_original_certificate_loss_recovers_on_periodic_maintenance_without_resend)
+{
+    // Declared transport-loss control, not a claim that this filter reproduces
+    // the preserved RATE_LIMITED trace. Capture state outlives all workers.
+    struct Fault {
+        std::mutex mutex;
+        std::optional<size_t> publisher;
+        std::optional<flowmesh::WireMessage> certificate;
+        std::vector<unsigned char> action_payload;
+        bool released{false}, exact_retry{true};
+        size_t blocked{0}, retries{0}, origin_action_offers{0};
+    } fault;
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "accepted_local_certificate_loss"};
+    f.block_commits = false; f.Reach(1); f.Drain();
+    CKey key; key.MakeNewKey(true);
+    const auto action{SignedAction(key, f.domain, f.initial.ConfigId(), 0, flowmesh::ActionType::CANCEL_ASK)};
+    const auto payload{flowmesh::EncodeProductionActionPayload(action)}; BOOST_REQUIRE(payload);
+    const flowmesh::WireMessage original{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *payload};
+    auto& runtime{*f.runtimes[0]};
+    const auto id{node::FlowMeshRuntimeTestAccess::Reserve(runtime, original, f.domain, f.initial.ConfigId())};
+    BOOST_REQUIRE(id);
+    const auto expiry{node::FlowMeshRuntimeTestAccess::Deadline(runtime, id)};
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); })); f.Drain();
+    // New control ONLY: ordinary idle warm-up supplies the real32-token
+    // committee burst (8/s). Reservation is not admitted yet and stays intact.
+    f.Tick(std::chrono::seconds{4});
+    const auto clock{f.clocks[0].Now()};
+    BOOST_REQUIRE(clock + std::chrono::milliseconds{1250} < expiry);
+    const auto views{f.view_changes.load()};
+    const auto observer_gets{f.network.GetRequests(3)};
+    fault.action_payload = *payload;
+    f.network.SetFilter([&](const size_t from, const size_t to, const flowmesh::WireMessage& wire) {
+        if (!f.Observe(wire)) return false; // All AGREEMENT remains allowed.
+        std::lock_guard lock{fault.mutex};
+        if (from == 0 && wire.kind == flowmesh::WireMessageKind::ACTION && wire.payload == fault.action_payload)
+            ++fault.origin_action_offers;
+        if (to == 3 && wire.kind == flowmesh::WireMessageKind::ENTRIES) return false; // No catch-up substitute.
+        if (to != 3 || wire.header.sequence != 2) return true;
+        if (wire.kind == flowmesh::WireMessageKind::ATTESTATION) return false;
+        if (wire.kind != flowmesh::WireMessageKind::CERTIFICATE) return true;
+        // Pin the FIRST actual publisher, never assume node0 assembled first.
+        if (!fault.certificate && from < 3) { fault.publisher = from; fault.certificate = wire; }
+        if (fault.released && fault.publisher && from == *fault.publisher) {
+            ++fault.retries;
+            fault.exact_retry &= wire == *fault.certificate;
+            return true;
+        }
+        ++fault.blocked;
+        return false;
+    });
+    f.chains[0].SetReconciled(false);
+    const auto cursor{runtime.ClientEventCursor()};
+    BOOST_REQUIRE(node::FlowMeshRuntimeTestAccess::Enqueue(runtime, id, original) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_REQUIRE_EQUAL(runtime.DeliverySnapshots(f.market).front().deferred_objects, 1U);
+    for (size_t n{0}; n < 4; ++n) f.Tick();
+    BOOST_CHECK(f.clocks[0].Now() == clock);
+    BOOST_REQUIRE_EQUAL(runtime.DeliverySnapshots(f.market).front().deferred_objects, 1U);
+    f.chains[0].SetReconciled(true); f.Tick();
+    BOOST_REQUIRE(WaitUntil([&] {
+        for (size_t i{0}; i < 3; ++i) {
+            const auto status{f.runtimes[i]->MarketStatus(f.market)};
+            if (!status || status->next_sequence != 3 || status->halt != node::FlowMeshRuntimeHalt::NONE) return false;
+        }
+        return true;
+    }));
+    f.Drain();
+    BOOST_REQUIRE_EQUAL(f.runtimes[3]->MarketStatus(f.market)->next_sequence, 2U);
+    BOOST_REQUIRE(f.runtimes[3]->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    BOOST_REQUIRE(!f.AllAt(3)); // No future timer: the deliberately missing certificate cannot appear.
+    BOOST_REQUIRE_EQUAL(runtime.DeliverySnapshots(f.market).front().deferred_objects, 0U);
+    for (const auto& fixed : f.clocks) BOOST_CHECK(fixed.Now() == clock);
+    const auto admitted{runtime.ClientEvents(cursor, f.market, action.signer).events};
+    BOOST_REQUIRE(std::any_of(admitted.begin(), admitted.end(), [&](const auto& event) {
+        return event.action_id == action.Id() && event.kind == flowmesh::ClientEventKind::POOL_ADMITTED &&
+               event.signed_action_hash == Hash(*payload);
+    }));
+    flowmesh::WireMessage pinned;
+    size_t publisher{0}, action_offers{0};
+    {
+        std::lock_guard lock{fault.mutex};
+        BOOST_REQUIRE(fault.publisher && fault.certificate);
+        BOOST_REQUIRE_GT(fault.blocked, 0U); BOOST_REQUIRE_EQUAL(fault.retries, 0U);
+        publisher = *fault.publisher; pinned = *fault.certificate;
+        action_offers = fault.origin_action_offers;
+    } // Never hold the capture mutex over runtime/store/Drain calls.
+    BOOST_REQUIRE_LT(publisher, 3U);
+    const auto decoded{flowmesh::DecodeProductionCertifiedPayload(pinned.payload, f.seats.seats.Size())};
+    BOOST_REQUIRE(decoded); BOOST_REQUIRE(flowmesh::ProductionWireHeaderMatches(pinned.header, decoded->entry));
+    BOOST_REQUIRE_EQUAL(decoded->entry.actions.size(), 1U);
+    BOOST_REQUIRE(decoded->entry.actions.front().Id() == action.Id());
+    std::string error;
+    std::optional<node::StoredProductionEntry> published;
+    BOOST_REQUIRE(f.stores[publisher]->ReadEntry(2, f.seats.seats, published, error)); BOOST_REQUIRE(published);
+    BOOST_REQUIRE(published->entry.GetHash() == decoded->entry.GetHash());
+    std::optional<node::StoredLockedProductionCandidate> locked;
+    BOOST_REQUIRE(f.stores[3]->ReadLockedCandidate({f.seats.seats.epoch, 2}, locked, error)); BOOST_REQUIRE(locked);
+    BOOST_REQUIRE(locked->entry.GetHash() == decoded->entry.GetHash());
+    {
+        std::lock_guard lock{fault.mutex};
+        fault.released = true; // Only this publisher's same certificate may now reach3.
+    }
+    // No direct re-enqueue or client resend: reproduce the service's ordinary
+    //250ms maintenance so the already-retained1s certificate retry becomes due.
+    for (size_t ticks{0}; ticks < 5 && !f.AllAt(3); ++ticks) f.Tick(std::chrono::milliseconds{250});
+    BOOST_REQUIRE_MESSAGE(WaitUntil([&] { return f.AllAt(3); }),
+        "Retained exact certificate requires normal periodic maintenance after declared transport loss");
+    f.Drain();
+    {
+        std::lock_guard lock{fault.mutex};
+        BOOST_CHECK_GT(fault.retries, 0U); BOOST_CHECK(fault.exact_retry);
+        BOOST_CHECK_EQUAL(fault.origin_action_offers, action_offers); // No new origin ACTION delivery.
+    }
+    BOOST_CHECK_EQUAL(f.view_changes.load(), views);
+    BOOST_CHECK(f.clocks[0].Now() - clock <= std::chrono::milliseconds{1250});
+    BOOST_CHECK(std::chrono::milliseconds{1250} < f.round_timeout);
+    BOOST_CHECK(f.clocks[0].Now() < expiry);
+    BOOST_CHECK_EQUAL(f.network.GetRequests(3), observer_gets); // No substitute catch-up route.
+    for (const auto& peer : f.runtimes) {
+        BOOST_REQUIRE(peer->ClientRecentInclusion(f.market, action.Id()));
+        BOOST_CHECK_EQUAL(peer->StateSnapshot(f.market)->NextSequence(action.signer), 1U);
+    }
+    std::optional<node::StoredProductionEntry> restored;
+    BOOST_REQUIRE(f.stores[3]->ReadEntry(2, f.seats.seats, restored, error)); BOOST_REQUIRE(restored);
+    BOOST_CHECK(restored->entry.GetHash() == decoded->entry.GetHash());
+    BOOST_REQUIRE_EQUAL(restored->entry.actions.size(), 1U);
+    BOOST_CHECK(restored->entry.actions.front().Id() == action.Id());
 }
 
 #ifndef FLOWMESH_LOCAL_RETENTION_BASELINE_TEST

@@ -4,7 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Strict, bounded Linux native-test guardrails; never a performance gate.
 
-Version native-guardrails-v11 selects exact compiled Boost suites, not CTest's
+Version native-guardrails-v12 selects exact compiled Boost suites, not CTest's
 skip-on-empty filters. Discovery and detailed XML must agree on every selected
 leaf case. TSan covers instrumented native code, not all system libraries; the
 existing repository suppression file includes a ConnectTip deadlock suppression.
@@ -32,7 +32,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-PROFILE_VERSION = "native-guardrails-v11"
+PROFILE_VERSION = "native-guardrails-v12"
 CONTROL_TIMEOUT = 30
 SUITE_TIMEOUT = 600
 TOTAL_TEST_TIMEOUT = 1800
@@ -142,6 +142,7 @@ REQUIRED_CASES = {
         "recent_window_published_before_inclusion_events",
         "seat_key_observation_publishes_without_a_tick_or_certified_state_change",
         "accepted_local_original_waits_for_authority_then_resumes_without_client_resend",
+        "accepted_local_original_certificate_loss_recovers_on_periodic_maintenance_without_resend",
         "local_source_reservation_bounds_preserve_critical_capacity_and_original_expiry",
         "local_source_survives_queue_drop_and_cannot_be_claimed_by_remote_alias",
         "local_source_open_chain_seat_pause_preserves_retry_pacing_and_expiry",

@@ -158,6 +158,14 @@ FRONTIER_SUITE_SOURCES = {"flowmesh_sync_tests": "src/test/flowmesh_sync_tests.c
 FRONTIER_HEADER_DEPENDENCIES = {"src/flowmesh/deposit.h", "src/node/flowmesh_anchor.h"}
 
 
+# Independent exact declared-loss recovery case, not derived from discovery.
+LOCAL_CERTIFICATE_RECOVERY_REQUIRED_CASES = {
+    "flowmesh_runtime_tests": {
+        "accepted_local_original_certificate_loss_recovers_on_periodic_maintenance_without_resend",
+    },
+}
+
+
 # Literal frozen v6 manifest, independent of RUNNER and the new suite count.
 FROZEN_V6_SUITE_SOURCES = {
     "flowmesh_p2p_tests": "src/test/flowmesh_p2p_tests.cpp",
@@ -630,6 +638,52 @@ class OutcomeFifoRegressionTests(unittest.TestCase):
                     RUNNER.check_xml(ET.tostring(skipped, encoding="unicode"), suite, expected)
 
 
+class LocalCertificateRecoveryRegressionTests(unittest.TestCase):
+    def test_local_certificate_recovery_positive_discovery_and_exact_execution(self):
+        self.assertEqual(sum(map(len, LOCAL_CERTIFICATE_RECOVERY_REQUIRED_CASES.values())), 1)
+        discovered = RUNNER.parse_discovery(listing())
+        expected_sources = {
+            "flowmesh_runtime_tests": "src/test/flowmesh_runtime_tests.cpp",
+        }
+        self.assertEqual(set(LOCAL_CERTIFICATE_RECOVERY_REQUIRED_CASES), set(expected_sources))
+        for suite, mandatory in LOCAL_CERTIFICATE_RECOVERY_REQUIRED_CASES.items():
+            with self.subTest(suite=suite):
+                self.assertEqual(RUNNER.SUITE_SOURCES[suite], expected_sources[suite])
+                self.assertTrue(mandatory.issubset(RUNNER.REQUIRED_CASES[suite]))
+                self.assertTrue(mandatory.issubset(discovered[suite]))
+                self.assertEqual(RUNNER.check_xml(
+                    ET.tostring(xml_report(suite, discovered[suite]), encoding="unicode"),
+                    suite, discovered[suite]), len(discovered[suite]))
+
+    def test_each_local_certificate_recovery_case_cannot_be_undiscovered_or_disabled(self):
+        for suite, mandatory in LOCAL_CERTIFICATE_RECOVERY_REQUIRED_CASES.items():
+            for case in mandatory:
+                inventory = expected_inventory()
+                inventory[suite].remove(case)
+                with self.subTest(suite=suite, case=case, fault="undiscovered"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "missing required regression"):
+                    RUNNER.parse_discovery(listing(inventory))
+                disabled = listing().replace(f"    {case}*\n", f"    {case} \n", 1)
+                self.assertNotEqual(disabled, listing())
+                with self.subTest(suite=suite, case=case, fault="disabled"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "selected case"):
+                    RUNNER.parse_discovery(disabled)
+
+    def test_each_local_certificate_recovery_case_cannot_be_unexecuted_or_skipped(self):
+        for suite, mandatory in LOCAL_CERTIFICATE_RECOVERY_REQUIRED_CASES.items():
+            expected = expected_inventory()[suite]
+            for case in mandatory:
+                missing = xml_report(suite, expected - {case})
+                with self.subTest(suite=suite, case=case, fault="unexecuted"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "case mismatch"):
+                    RUNNER.check_xml(ET.tostring(missing, encoding="unicode"), suite, expected)
+                skipped = xml_report(suite, expected)
+                row = next(row for row in skipped.iter("TestCase") if row.get("name") == case)
+                row.set("result", "skipped")
+                with self.subTest(suite=suite, case=case, fault="skipped"), self.assertRaisesRegex(
+                        RUNNER.GuardrailError, "Selected case/suite skipped or failed"):
+                    RUNNER.check_xml(ET.tostring(skipped, encoding="unicode"), suite, expected)
+
 class AnchorFrontierRegressionTests(unittest.TestCase):
     def test_frontier_positive_discovery_and_exact_execution(self):
         self.assertEqual(sum(map(len, FRONTIER_REQUIRED_CASES.values())), 5)
@@ -942,7 +996,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, artifact)
 
     def test_profile_is_versioned_and_excludes_prototype(self):
-        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v11")
+        self.assertEqual(RUNNER.PROFILE_VERSION, "native-guardrails-v12")
         self.assertEqual(len(RUNNER.SUITE_SOURCES), 29)
         self.assertTrue(set(RUNNER.REQUIRED_CASES).issubset(RUNNER.SUITE_SOURCES))
         self.assertFalse(any("v2_market" in source or "/v2/" in source for source in RUNNER.NATIVE_SOURCES))
