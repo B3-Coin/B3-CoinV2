@@ -144,24 +144,28 @@ void ConcurrentCoherentPublication()
     Check(slot.Publish(Envelope(1)) == ReadPublishResult::PUBLISHED, "initial publication failed");
     std::latch start{1};
     std::atomic<bool> failed{false};
-    std::vector<std::jthread> readers;
-    try {
-        for (int reader{0}; reader < 4; ++reader) readers.emplace_back([&] {
-            start.wait();
-            for (int step{0}; step < 2000; ++step) {
-                auto lease{slot.Acquire()};
-                if (!lease || !Coherent(lease->View())) failed = true;
-            }
-        });
-    } catch (...) {
-        start.count_down(); // Never strand constructed threads on launch failure.
-        throw;
-    }
-    start.count_down();
+    std::vector<std::thread> readers;
+    // The supported macOS libc++ has no jthread. Explicit joined ownership
+    // gives the same fixture lifetime, including partial launch failure.
+    struct Drain {
+        std::latch& start;
+        std::vector<std::thread>& readers;
+        bool opened{false};
+        void Open() { if (!opened) { start.count_down(); opened = true; } }
+        ~Drain() { Open(); for (auto& reader : readers) if (reader.joinable()) reader.join(); }
+    } drain{start, readers};
+    for (int reader{0}; reader < 4; ++reader) readers.emplace_back([&] {
+        start.wait();
+        for (int step{0}; step < 2000; ++step) {
+            auto lease{slot.Acquire()};
+            if (!lease || !Coherent(lease->View())) failed = true;
+        }
+    });
+    drain.Open();
     for (uint64_t number{2}; number <= 201; ++number) {
         if (slot.Publish(Envelope(number)) != ReadPublishResult::PUBLISHED) failed = true;
     }
-    readers.clear(); // jthread joins, including during later assertion unwinding.
+    for (auto& reader : readers) reader.join();
     Check(!failed && slot.Readers() == 0, "concurrent view mixed heads or lost permits");
     auto last{slot.Acquire()};
     Check(last && last->View().publication == 201 && Coherent(last->View()), "final publication mismatch");
