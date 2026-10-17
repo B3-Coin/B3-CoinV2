@@ -136,7 +136,16 @@ reply with the label `CERTIFIED`; and b3verify in the new library
 `fm2_verify`, which links no application code and checks certificates,
 outcomes, leaves, fills, balance transitions and EXPIRED proofs with the
 engine's own spec functions; liability paths, checkpoints and anchor proofs
-are typed stubs. Nothing is linked into the node, wallet or Qt.
+are typed stubs; and **R12**, admission in `admission/`: A0..A10 against
+one head snapshot (the account, nonce window, expiry and budget are
+checked before the BIP340 signature, and an exact resend of a pending or
+retained included action is `DUPLICATE` with no signature check), with
+per-code counters and a sticky fence, and the bounded `ActionPool`
+(`IN_PROPOSAL` without removal, terminal `NONCE_USED`, `NONCE_TOO_LOW` and
+`EXPIRED`, a taken slot that always passes the validity predicate); credit
+budgets and batch verification are typed stubs, and `fm2_dev` adds the
+REGTEST unlimited dev budget. Nothing is linked into the node, wallet or
+Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -148,8 +157,8 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R11: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 401 cases, `flowmesh2_inventory`,
+Expected after R12: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 437 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
 `flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`
 with four controls). The file journal tests write only under
