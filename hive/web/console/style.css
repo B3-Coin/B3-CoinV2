@@ -56,6 +56,7 @@ header {
 }
 
 #prompt {
+  position: relative;
   display: flex;
   gap: 0.5rem;
   align-items: center;
@@ -72,6 +73,33 @@ header {
   border: 1px solid #6b665c;
   background: transparent;
   color: inherit;
+}
+
+/* Opens upwards: the prompt sits at the bottom of the window. */
+#completions {
+  position: absolute;
+  left: 2.25rem;
+  bottom: calc(100% - 0.25rem);
+  min-width: 18rem;
+  max-height: 14rem;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0.25rem 0;
+  list-style: none;
+  background: #26241f;
+  border: 1px solid #6b665c;
+  border-radius: 6px;
+}
+
+#completions li {
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+}
+
+#completions li[aria-selected="true"],
+#completions li:hover {
+  background: #3a3731;
+  color: #e0a526;
 }
 
 select,

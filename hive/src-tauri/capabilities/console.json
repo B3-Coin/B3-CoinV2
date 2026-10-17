@@ -5,6 +5,7 @@
   "windows": ["console"],
   "permissions": [
     "allow-console-exec",
+    "allow-console-completions",
     "allow-console-wallets"
   ]
 }

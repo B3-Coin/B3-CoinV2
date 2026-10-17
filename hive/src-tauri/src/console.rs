@@ -121,6 +121,26 @@ pub fn submit(line: &str, exec: &mut Executor<'_>) -> Result<Reply, String> {
     })
 }
 
+/// The console's completion words, as Qt builds them: every command, `help`
+/// followed by every command, and `help-console`, sorted. `help` is the
+/// node's command overview: `== Category ==` headings and one line per
+/// command starting with its name.
+pub fn completion_words(help: &str) -> Vec<String> {
+    let mut words = vec!["help-console".to_owned()];
+    for line in help.lines() {
+        if line.starts_with("==") {
+            continue;
+        }
+        if let Some(name) = line.split_whitespace().next() {
+            words.push(name.to_owned());
+            words.push(format!("help {name}"));
+        }
+    }
+    words.sort();
+    words.dedup();
+    words
+}
+
 /// True if `line` is exactly the stop command, which the console lets
 /// through even while another command runs.
 pub fn is_stop(line: &str) -> bool {
@@ -565,6 +585,28 @@ mod tests {
         // Amounts keep their exact digits.
         let p = convert_values("sendtoaddress", &["a".into(), "0.123456789".into()]).unwrap();
         assert_eq!(p[1].to_string(), "0.123456789");
+    }
+
+    #[test]
+    fn completion_words_come_from_the_help_overview() {
+        let help = "== Blockchain ==
+getbestblockhash
+getblock \"blockhash\" ( verbosity )
+
+== Wallet ==
+abandontransaction \"txid\"";
+        assert_eq!(
+            completion_words(help),
+            [
+                "abandontransaction",
+                "getbestblockhash",
+                "getblock",
+                "help abandontransaction",
+                "help getbestblockhash",
+                "help getblock",
+                "help-console",
+            ]
+        );
     }
 
     #[test]

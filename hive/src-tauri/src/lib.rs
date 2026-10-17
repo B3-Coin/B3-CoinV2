@@ -224,6 +224,28 @@ async fn console_exec(
     Ok(reply)
 }
 
+/// Words for the console's completion popup, from the node's `help`
+/// overview. Err carries the node's reason when it cannot list commands.
+#[tauri::command]
+async fn console_completions(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<Vec<String>, String> {
+    require_window(&window, CONSOLE)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let client = core
+            .node
+            .console_client()
+            .ok_or("The node is not running.")?;
+        let help = client
+            .call("help", serde_json::json!([]))
+            .map_err(|e| e.to_string())?;
+        Ok(console::completion_words(help.as_str().unwrap_or_default()))
+    })
+    .await
+}
+
 /// The loaded wallets, for the console's wallet selector.
 #[tauri::command]
 async fn console_wallets(
@@ -354,6 +376,7 @@ pub fn run() {
             approval_pending,
             approval_decide,
             console_exec,
+            console_completions,
             console_wallets
         ])
         .build(tauri::generate_context!())

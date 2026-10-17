@@ -15,6 +15,7 @@ fn main() {
             "approval_pending",
             "approval_decide",
             "console_exec",
+            "console_completions",
             "console_wallets",
         ]),
     ))
