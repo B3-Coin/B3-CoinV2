@@ -336,12 +336,13 @@ fn node_config(app: &tauri::App) -> Result<NodeConfig, Box<dyn std::error::Error
 
 /// Bundles place sidecars beside the main executable, with the target triple
 /// stripped from the name: /usr/bin on Linux packages, the install folder on
-/// Windows, Contents/MacOS on macOS. If it is missing, the main window shows
-/// the start failure with this path.
+/// Windows, Contents/MacOS on macOS. The bundled b3coind is named b3-hive-node
+/// so it cannot clash with a b3coind installed on its own in /usr/bin. If it
+/// is missing, the main window shows the start failure with this path.
 fn packaged_b3coind() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().ok_or("the app executable has no folder")?;
-    Ok(dir.join(format!("b3coind{}", std::env::consts::EXE_SUFFIX)))
+    Ok(dir.join(format!("b3-hive-node{}", std::env::consts::EXE_SUFFIX)))
 }
 
 pub fn run() {

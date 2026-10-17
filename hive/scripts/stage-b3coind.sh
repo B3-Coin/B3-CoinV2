@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Copies a b3coind build into src-tauri/binaries/ under the name Tauri expects
-# for a sidecar (b3coind-<target triple>[.exe]), stripped of debug symbols.
-# Run it before `npm run package`; the bundle installs it next to the app.
+# for a sidecar (b3-hive-node-<target triple>[.exe]), stripped of debug
+# symbols. Run it before `npm run package`. The bundle installs it next to the
+# app as b3-hive-node, so it never clashes with an installed b3coind.
 #
 #   scripts/stage-b3coind.sh /path/to/b3coind [target-triple]
 #
@@ -14,7 +15,7 @@ src=${1:?usage: $0 /path/to/b3coind [target-triple]}
 triple=${2:-$(rustc -vV | sed -n 's/^host: //p')}
 ext=""
 case "$src" in *.exe) ext=".exe" ;; esac
-dest="$(dirname "$0")/../src-tauri/binaries/b3coind-$triple$ext"
+dest="$(dirname "$0")/../src-tauri/binaries/b3-hive-node-$triple$ext"
 mkdir -p "$(dirname "$dest")"
 "${STRIP:-strip}" --strip-debug -o "$dest" "$src"
 chmod +x "$dest"
