@@ -46,8 +46,12 @@
  *    be an agreement message of type VIEW_CHANGE, NEW_VIEW or EVIDENCE, a
  *    frame on PROPOSAL one of type PROPOSAL (the envelope's version and
  *    type bytes are checked; the receiver decodes the rest); a VOTE on
- *    either lane is refused (MESH_VOTE_NOT_TYPED), so no code path can
- *    send a vote without the durable token. ACTION and BULK frames are
+ *    either lane is refused (MESH_VOTE_NOT_TYPED), so no Send path carries
+ *    a vote and SendVote, which needs an OutboundVote (a durable vote), is
+ *    the only typed one. This does not cover a raw VoteSignature:
+ *    SeatSigner::Sign returns one, and it could still be put into a
+ *    SlotCertificate or an opaque BULK frame; building certificates only
+ *    from durable votes is M4-AGR-02's. ACTION and BULK frames are
  *    opaque here (client actions, catch-up): a receiver interprets a
  *    frame only as its lane's content, so a vote-shaped ACTION frame is an
  *    ActionV2 frame to it, never a vote.

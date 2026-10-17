@@ -320,8 +320,10 @@ header marked *landed* is normative; the others are the target contract.
  net/LaneSet ............ 4 C1 BoundedMailbox lanes; BUSY means "not queued"
    |
    v
- admission/Admission .... A0..A10 against ONE HeadView snapshot
-   |                      (account, nonce, expiry, budget BEFORE BIP340)
+ admission/Admission .... A0..A10; A4..A9 against ONE HeadView snapshot
+   |                      (account, nonce, expiry, budget BEFORE BIP340);
+   |                      A3 and A9 also read the pool and the published
+   |                      read index, which can be at an older head
    v
  admission/ActionPool ... bounded; TakeForSlot marks IN_PROPOSAL, does not remove
    |
@@ -844,7 +846,11 @@ owner's ratification under D4 (M3-ENG-12).
 | A9 | nonce used / pending; same `ActionId` with another valid signature | `NONCE_USED`, `NONCE_PENDING`, `DUPLICATE` | yes |
 | A10 | pool insert | `POOL_FULL` or `ADMITTED` | yes |
 
-A4 to A9 use one `HeadView` snapshot. A3 runs before the expiry check so that
+A4 to A9 use one `HeadView` snapshot for the account, nonce and expiry
+checks. A3 and A9 also consult the pool and the read service's published
+outcome index, which can be at an older head than that snapshot (the pool
+learns of a slot after publication); this is why A9 checks `DUPLICATE` first
+(O-69). A3 runs before the expiry check so that
 an included action resent after its window still returns `DUPLICATE` with its
 original outcome (DUR-4, DUR-5), not `EXPIRED`. This satisfies TRD-17
 ("authenticate before dedup") because A3 only matches byte-identical originals
@@ -1593,7 +1599,7 @@ outline does not resolve on its own.
 | O-27 | Outline caps that are not profile fields | R4 adds provisional constants: `MAX_SLOT_FACTS` = 1,024 and `MAX_FACT_BYTES` = 1,024 (slot body), `MAX_SEATS` = 1,024 (bitmap ≤ 128 bytes), `MAX_LEAF_ASSETS` = 256 (account leaf), `MAX_WITHDRAW_SCRIPT_BYTES` = 128, and an outcome delta cap of 2 · (`max_fills_per_order` + 1). The owner may move any of them into the profile (which changes `profile_hash` and the JSON) |
 | O-28 | `ActionKind` integers | Plan §3.6 lists PLACE, CANCEL, CANCEL_ALL, WITHDRAW, TRANSFER; an earlier draft had TRANSFER = 4, WITHDRAW = 5. R4 follows the plan (WITHDRAW = 4, TRANSFER = 5). The registry is append-only from now on |
 | O-29 | Admission needs `UNKNOWN_KIND` and `WRONG_DOMAIN`, but the R4 slice text says the codec refuses an unknown kind | `ActionV2::Decode` refuses both (DECODE) and marks them with the static details `ACTION_UNKNOWN_KIND` and `ACTION_UNKNOWN_VERSION`; the kind byte has a fixed position, so the refusal is decided before parsing. Admission (R12) compares the detail. A dedicated `ErrorCode` would avoid string matching but changes an owner-protected registry |
-| O-31 | The R5 slice text gives conservation as Σ(available + reserved) + pending = deposits − effects, but D5 splits a **slot's** fee total (⌊80%⌋ / rest), so a fee charged at a fill must be held somewhere until phase 8 | R5 adds `fees_held` per asset: `PayFromReserved` withholds the seller's fee increment from the quote leg into it, and `Credit` (protocol accounts only) pays out of it. Conservation is Σ(available + reserved) + pending + fees_held = deposits − effects, checked after every operation. The engine must leave `fees_held` at zero after phase 8 (R7) |
+| O-31 | The R5 slice text gives conservation as Σ(available + reserved) + pending = deposits − effects, but D5 splits a **slot's** fee total (⌊80%⌋ / rest), so a fee charged at a fill must be held somewhere until phase 8 | R5 adds `fees_held` per asset: `PayFromReserved` withholds the seller's fee increment from the quote leg into it, and `Credit` (protocol accounts only) pays out of it. Conservation is Σ(available + reserved) + pending + fees_held = deposits − effects; it holds after every operation (the ledger property tests check each one; at run time the engine checks it once per slot, in phase 9). The engine must leave `fees_held` at zero after phase 8 (R7) |
 | O-32 | Commitment v0 details the plan leaves open | R5 chooses (section 9): leaf values tagged per component and keyed by id; the root-of-roots carries `u8 commitment_version`; a nullifier leaf is the outpoint only; the totals leaf holds deposits, effects, pending and fees_held; all-zero totals and balances are omitted. Every vector is skeleton-only until the SMT (M2-LED-02) |
 | O-33 | Where commitment types live: the slice text puts `TreasuryAccount`/`SeatPoolAccount` and the commitment in `ledger/`, but b3verify (R11) must recompute a state root and may not include ledger headers (guard rule 1) | R5 puts the protocol account ids, `AssetTotals`, `TotalsLeafV0`, the market and nullifier leaf values and `StateRootsV0` in `core/state_root` (fm2_types); the ledger builds the trees in `ledger/state_commitment` |
 | O-34 | Refusals that are errors, not outcomes | A deposit fact with amount 0 or a protocol account as target, a second fact for one outpoint, deposits of an asset above 2^62 in total, and a 257th asset in one account are errors, so a slot carrying one has no valid candidate. The chain adapter (R10, MB1-ADP-06) must never deliver such a fact and R7/M7-GOV-01 must keep the listed assets at most `MAX_LEAF_ASSETS`; otherwise M2-LED-07 must define certified refusals. The cumulative `deposits`/`effects` counters are capped at 2^62 atoms; tracking net custody instead is for M2-LED-03/M2-LED-05. A TRANSFER to an existing protocol account is allowed (O-7 literal); M7-FEE-01 may forbid it |

@@ -51,6 +51,8 @@ constexpr std::array<Variant, 3> ALL_VARIANTS{Variant::WALKING_SKELETON, Variant
  * from the first run of the outline (every seed gives these; the order is
  * the engine's CanonicalOrder over the parent header hash and the height,
  * O-4b, O-50). A change of any header field before slot 4 may change them.
+ * Self-pinned, so a regression check, not an independent one (O-87): the
+ * independent recomputation is M3-ENG-05's.
  */
 constexpr std::array<std::string_view, 3> GOLDEN_CANONICAL_ORDER{"a,b", "c,d", "e,f"};
 

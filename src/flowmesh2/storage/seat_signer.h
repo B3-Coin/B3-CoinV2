@@ -67,7 +67,11 @@ public:
 class SeatSigner
 {
 public:
-    //! INVALID_INPUT if the IKM is shorter than 32 bytes or gives no key.
+    /** INVALID_INPUT if the IKM is shorter than 32 bytes or gives no key.
+     * The signer keeps a pointer to `log`, and SignerLog is movable: the log
+     * must stay at its address and outlive the signer (do not move or
+     * destroy a log a signer uses; SimNode and AgreementRig keep it fixed).
+     */
     static Result<SeatSigner> FromIKM(std::span<const unsigned char> ikm, const SignerLog& log);
 
     SeatSigner(SeatSigner&&) noexcept;

@@ -70,6 +70,8 @@
  * - INTENT: VoteKey (57) | digest | u64 proposal_seq: 97 bytes.
  * - SIGNED_VOTE: VoteKey | digest | signature (96) | u64 intent_seq: 193 bytes.
  *
+ * Lifetime: a SeatSigner keeps a pointer to its SignerLog, so a log that a
+ * signer uses must not be moved or destroyed while the signer lives.
  * Threading: a SignerLog is owned by one thread (the sealing thread,
  * section 4); it has no lock of its own and never holds the journal's.
  * Stubs: AppendSignedFolded (M4-STO-05, folded signing; strict is the only

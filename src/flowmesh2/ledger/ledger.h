@@ -52,7 +52,9 @@
  * MAX_LEAF_ASSETS assets per account: an operation that would add one more
  * is OVERSIZE (O-27).
  *
- * Conservation, per asset, after every operation (CheckConservation):
+ * Conservation, per asset, holds after every operation (CheckConservation;
+ * the ledger property tests check it after each operation, the engine
+ * checks it once per slot, in phase 9):
  *   sum over accounts of (available + reserved) + pending + fees_held
  *     == deposits - effects                       (core/state_root.h)
  * In the outline effects and pending stay 0 (withdrawals are M2-LED-05).

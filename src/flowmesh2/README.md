@@ -81,7 +81,9 @@ in `test/util/keys.h`; the test binary links `bitcoin_common` for `CKey`
 only); and **R5**, the first application library `fm2_core` with the shared
 spot ledger in `ledger/` (one balance per account and asset across all
 markets, nonce windows, fee withholding, atomic operations and a
-conservation check after every operation) and state commitment v0 with
+conservation invariant that holds after every operation; at run time the
+engine checks it once per slot, the property tests after each operation)
+and state commitment v0 with
 account proofs, plus the commitment value types and protocol accounts in
 `core/state_root`; and **R6**, the matching engine's first half in
 `engine/`: the provisional order book (price-time FIFO, exact
