@@ -47,10 +47,16 @@
  * - Confirm(pending) -> Result<Durable token>, the ONLY minter of durability
  *   tokens (storage/durable.h). It returns the token only if the pending
  *   record belongs to this journal (else VERIFY_FAILED, CONFIRM_OTHER_JOURNAL),
- *   the journal is not fatal (else FENCED, JOURNAL_FENCED) and DurableSeq()
- *   has reached the record (else ORDER_VIOLATION, CONFIRM_BEFORE_BARRIER). The
- *   token carries the pending record's reference, which the logs built from
- *   the record they appended.
+ *   its record type is one this journal's role holds (else VERIFY_FAILED,
+ *   CONFIRM_ROLE: a signer journal never mints a DurableDecision, even when
+ *   it shares its instance id with the commit journal, O-91), the journal is
+ *   not fatal (else FENCED, JOURNAL_FENCED) and DurableSeq() has reached the
+ *   record (else ORDER_VIOLATION, CONFIRM_BEFORE_BARRIER). The token carries
+ *   the pending record's reference, which the logs built from the record
+ *   they appended. Two journals of the SAME role with the same instance id
+ *   cannot be told apart here; giving each journal of a role its own
+ *   instance id is the deployer's (the segment header that names role and
+ *   instance is M4-STO-01's).
  *
  * After a fatal error Append is FENCED, Barrier is STORAGE_FATAL and Confirm
  * is refused, so no new token can be minted; the node fences admission and
@@ -80,6 +86,7 @@ inline constexpr std::string_view JOURNAL_BARRIER_CONCURRENT{"JOURNAL_BARRIER_CO
 inline constexpr std::string_view CONFIRM_OTHER_JOURNAL{"CONFIRM_OTHER_JOURNAL"};          //!< (VERIFY_FAILED) pending of another journal instance
 inline constexpr std::string_view CONFIRM_UNKNOWN_SEQ{"CONFIRM_UNKNOWN_SEQ"};              //!< (VERIFY_FAILED) no such record in this journal
 inline constexpr std::string_view CONFIRM_BEFORE_BARRIER{"CONFIRM_BEFORE_BARRIER"};        //!< (ORDER_VIOLATION) the record is not durable yet
+inline constexpr std::string_view CONFIRM_ROLE{"CONFIRM_ROLE"};                            //!< (VERIFY_FAILED) a record type this journal's role never holds
 // Shared by the logs over a journal (SignerLog, CommitLog).
 inline constexpr std::string_view LOG_ROLE{"LOG_ROLE"};                                    //!< (ORDER_VIOLATION) journal of the wrong role
 inline constexpr std::string_view TOKEN_OTHER_LOG{"TOKEN_OTHER_LOG"};                      //!< (VERIFY_FAILED) pending or token not of this log
@@ -137,6 +144,9 @@ public:
     Result<Durable<DurableKindOf(T)>> Confirm(const Pending<T>& pending) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
         if (pending.JournalInstance() != m_instance_id) return Error{ErrorCode::VERIFY_FAILED, CONFIRM_OTHER_JOURNAL};
+        // Instance ids are not unique across roles: a record type this role never
+        // holds belongs to another journal, whatever its sequence number (O-91).
+        if (!RoleAccepts(m_role, T)) return Error{ErrorCode::VERIFY_FAILED, CONFIRM_ROLE};
         const JournalStatus status{Status()};
         if (status.fatal) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
         if (pending.Seq() == 0 || pending.Seq() > status.appended_seq) return Error{ErrorCode::VERIFY_FAILED, CONFIRM_UNKNOWN_SEQ};

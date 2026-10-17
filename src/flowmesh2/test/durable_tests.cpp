@@ -8,6 +8,7 @@
 #include <flowmesh2/storage/durable.h>
 #include <flowmesh2/storage/journal.h>
 #include <flowmesh2/storage/memory_journal.h>
+#include <flowmesh2/storage/signer_log.h>
 #include <flowmesh2/storage/tokens.h>
 #include <flowmesh2/test/util/storage_fixtures.h>
 
@@ -175,6 +176,39 @@ BOOST_AUTO_TEST_CASE(confirm_is_refused_for_another_journal)
     // A journal with the same instance id but without that record does not know its sequence number.
     CommitFixture same_id{10};
     RequireRefusal(same_id.log.Confirm(pending), ErrorCode::VERIFY_FAILED, CONFIRM_UNKNOWN_SEQ, "same instance, no such record");
+}
+
+BOOST_AUTO_TEST_CASE(confirm_is_refused_for_a_record_type_of_another_role)
+{
+    // A signer journal and a commit journal that share instance id 5 (nothing
+    // forces instance ids to be unique). The signer journal must not mint a
+    // DurableDecision from its own barrier, or StateOwner::Apply, which checks
+    // only the instance id, would accept a decision that is not durable.
+    CommitFixture commit{5};
+    const PendingDecision decision{commit.Decide(MakeStorageSlot(1, 0, "role"))};
+    BOOST_CHECK_EQUAL(commit.journal->DurableSeq(), 0U);
+    auto signer{NewMemoryJournal(JournalRole::SIGNER, 5)};
+    RequireStorageOk(signer->Append(RecordType::INTENT, Bytes("intent")), "signer append");
+    BOOST_CHECK_EQUAL(signer->Barrier().value(), 1U);
+    RequireRefusal(signer->Confirm(decision), ErrorCode::VERIFY_FAILED, CONFIRM_ROLE, "a DECISION confirmed by the signer journal");
+
+    // The other way round: a commit journal does not confirm a signer log's intent.
+    auto signer_journal{NewMemoryJournal(JournalRole::SIGNER, 6)};
+    SignerLog signer_log{SignerLog::Create(*signer_journal).value()};
+    const StorageSlot slot{MakeStorageSlot(1, 0, "role-intent")};
+    const PendingProposal proposal{signer_log.AppendAcceptedProposal(ProposalKey{0, 1, 0}, slot.header, slot.body).value()};
+    const PendingIntent intent{signer_log.AppendIntent(CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal).value()};
+    BOOST_CHECK_EQUAL(intent.Seq(), 2U);
+    auto commit_journal{NewMemoryJournal(JournalRole::COMMIT, 6)};
+    RequireStorageOk(commit_journal->Append(RecordType::DECISION, Bytes("one")), "commit append 1");
+    RequireStorageOk(commit_journal->Append(RecordType::DECISION, Bytes("two")), "commit append 2");
+    BOOST_CHECK_EQUAL(commit_journal->Barrier().value(), 2U);
+    RequireRefusal(commit_journal->Confirm(intent), ErrorCode::VERIFY_FAILED, CONFIRM_ROLE, "an INTENT confirmed by the commit journal");
+    // Each journal still confirms its own records.
+    BOOST_CHECK_EQUAL(commit.log.Barrier().value(), 1U);
+    RequireStorageOk(commit.log.Confirm(decision), "own DECISION");
+    BOOST_CHECK_EQUAL(signer_log.Barrier().value(), 2U);
+    RequireStorageOk(signer_log.Confirm(intent), "own INTENT");
 }
 
 BOOST_AUTO_TEST_CASE(token_binding_and_moves)
