@@ -9,7 +9,11 @@
  * slot then reads UNKNOWN), the outcome-index retention (refused below
  * max_delay at Create, kept exactly outcome_index_slots slots), and 4
  * readers against 1 publisher over 2,000 slots (TSan-relevant; this macOS
- * host has no working TSan, O-22).
+ * host has no working TSan, O-22). The last four cases pin checks that the
+ * R11 mutation run found untested: the token's header hash (a rival header
+ * with the same slot and state root), the successor's parent hash (height 2
+ * of another chain), the outcome index seen from an older lease, and one
+ * group per outcome when an order fills twice in it.
  */
 
 #include <boost/test/unit_test.hpp>
@@ -649,6 +653,95 @@ BOOST_AUTO_TEST_CASE(four_readers_one_publisher_see_one_head_per_reply)
     const read::AccountReply last{Take(service->Account(KeyAccount("alice")), "final")};
     BOOST_REQUIRE(last.status == read::LookupStatus::FOUND);
     BOOST_CHECK_EQUAL(last.witness->leaf.Available(rusd), static_cast<Atoms>(SLOTS));
+}
+
+BOOST_AUTO_TEST_CASE(a_token_of_another_header_with_the_same_state_is_refused)
+{
+    // Two heartbeats for height 2 that differ only in their anchor: same slot,
+    // same state root, different header. Only the header hash tells them apart.
+    ReadRig rig;
+    const auto service{NewReadService(TestReadLimits())};
+    Publish(*service, rig.Run(FundingFacts(rig.actions), {}));
+    const state::Candidate chosen{rig.Preview(rig.Inputs({}, {}))};
+    state::SlotInputs later{rig.Inputs({}, {})};
+    later.anchor = TestAnchor(131);
+    const state::Candidate rival{rig.Preview(later)};
+    BOOST_REQUIRE(chosen.Header().state_root == rival.Header().state_root);
+    BOOST_REQUIRE(chosen.Header().Hash() != rival.Header().Hash());
+    const SlotCertificate rival_cert{rig.CertificateOf(rival.Header())};
+    const state::HeadView rival_head{Take(state::HeadView::Make(rival.Header(), rival_cert.Hash(), rival.Next()), "Make")};
+    const auto rival_view{Take(read::SlotView::Build(rival_head, rival_cert, rival.Outcomes()), "Build rival")};
+    const PublishableSlot s2{rig.Commit(chosen)};
+    BOOST_REQUIRE_EQUAL(s2.applied.Slot(), rival_view->Header().height);
+    BOOST_REQUIRE(s2.applied.Binding().state_root == rival_view->Header().state_root);
+    RequireFailure(service->Publish(s2.applied, rival_view), ErrorCode::VERIFY_FAILED, read::READ_TOKEN_MISMATCH,
+                   "same slot and state root, another header");
+    BOOST_CHECK_EQUAL(*service->PublishedHeight(), 1U);
+    Publish(*service, s2);
+}
+
+BOOST_AUTO_TEST_CASE(a_successor_height_on_another_chain_is_refused)
+{
+    // Rig B funds other accounts, so its slot 2 names another parent than rig A's slot 1.
+    ReadRig a;
+    ReadRig b;
+    const PublishableSlot a1{a.Run(FundingFacts(a.actions), {})};
+    const PublishableSlot b1{b.Run({b.actions.DepositBytes(KeyAccount("dave"), TestAsset("rUSD"), 5, "other/chain")}, {})};
+    const PublishableSlot b2{b.Run({}, {})};
+    BOOST_REQUIRE(b2.view->Header().parent_hash != a1.view->HeaderHash());
+    const auto service{NewReadService(TestReadLimits())};
+    Publish(*service, a1);
+    RequireFailure(service->Publish(b2.applied, b2.view), ErrorCode::ORDER_VIOLATION, read::READ_NOT_SUCCESSOR,
+                   "height 2 of another chain");
+    BOOST_CHECK_EQUAL(*service->PublishedHeight(), 1U);
+    BOOST_CHECK_EQUAL(service->ViewCount(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(an_old_lease_does_not_see_a_later_inclusion)
+{
+    ReadRig rig;
+    const auto service{NewReadService(TestReadLimits())};
+    Publish(*service, rig.Run(FundingFacts(rig.actions), {}));
+    const read::ReadHandle at1{Take(service->Acquire(), "Acquire at 1")};
+    const std::vector<unsigned char> x{rig.actions.Place("alice", 1, MarketM1(), Side::BUY, TimeInForce::GTC, 1, 1)};
+    Publish(*service, rig.Run({}, {x}));
+    // The outcome index already holds x (slot 2), but the lease is at slot 1.
+    BOOST_CHECK_EQUAL(service->IndexedActions(), 1U);
+    RequireUnknown(Take(at1.Action(DecodeAction(x)), "x at 1"), read::ActionStatus::UNKNOWN, read::UNKNOWN_ACTION, "old lease");
+    const read::ActionReply now{Take(service->Action(DecodeAction(x)), "x at 2")};
+    BOOST_REQUIRE(now.status == read::ActionStatus::INCLUDED);
+    BOOST_CHECK_EQUAL(now.included->ref.height, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(one_group_per_outcome_with_every_fill_of_the_order)
+{
+    // Alice's IOC BUY of 1,500 lots takes Bob's asks at 250 (1,000 lots) and 251 (1,000 lots): two fills in one outcome.
+    ReadRig rig;
+    const auto service{NewReadService(TestReadLimits())};
+    Publish(*service, rig.Run(FundingFacts(rig.actions), {}));
+    const auto ask1{rig.actions.Place("bob", 1, MarketM1(), Side::SELL, TimeInForce::GTC, 250, 1'000)};
+    const auto ask2{rig.actions.Place("bob", 2, MarketM1(), Side::SELL, TimeInForce::GTC, 251, 1'000)};
+    Publish(*service, rig.Run({}, {ask1, ask2}));
+    const auto taker{rig.actions.Place("alice", 1, MarketM1(), Side::BUY, TimeInForce::IOC, 260, 1'500)};
+    Publish(*service, rig.Run({}, {taker}));
+    const read::OrderFillsReply t{Take(service->OrderFills(rig.actions.IdOf(taker)), "taker fills")};
+    BOOST_REQUIRE(t.status == read::LookupStatus::FOUND);
+    BOOST_REQUIRE_EQUAL(t.groups.size(), 1U);
+    BOOST_REQUIRE_EQUAL(t.groups.front().fills.size(), 2U);
+    BOOST_CHECK_EQUAL(t.groups.front().fills[0].fill_index, 0U);
+    BOOST_CHECK_EQUAL(t.groups.front().fills[1].fill_index, 1U);
+    BOOST_CHECK(t.groups.front().fills[0].role == read::FillRole::TAKER);
+    RequireOk(verify::VerifyOutcome(t.head.envelope.header, t.groups.front().outcome.outcome, t.groups.front().outcome.proof), "outcome");
+    for (const auto& ask : {ask1, ask2}) {
+        const read::OrderFillsReply m{Take(service->OrderFills(rig.actions.IdOf(ask)), "maker fills")};
+        BOOST_REQUIRE(m.status == read::LookupStatus::FOUND);
+        BOOST_REQUIRE_EQUAL(m.groups.size(), 1U);
+        BOOST_REQUIRE_EQUAL(m.groups.front().fills.size(), 1U);
+        BOOST_CHECK(m.groups.front().fills.front().role == read::FillRole::MAKER);
+        const Fill& fill{m.groups.front().outcome.outcome.fills.at(m.groups.front().fills.front().fill_index)};
+        BOOST_CHECK(fill.maker == rig.actions.IdOf(ask));
+        RequireOk(verify::VerifyFill(fill, MarketM1(), RegtestProfile()), "maker fill");
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
