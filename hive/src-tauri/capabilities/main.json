@@ -1,11 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "Main window: read the node status and receive its updates. Nothing else.",
+  "description": "Main window: read node and wallet state and ask for drafts. It can never approve one.",
   "windows": ["main"],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
-    "allow-node-status"
+    "allow-node-status",
+    "allow-wallet-overview",
+    "allow-dev-fund",
+    "allow-draft-send"
   ]
 }

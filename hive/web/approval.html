@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Approve – B3 Hive</title>
+    <link rel="stylesheet" href="./approval/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Approve this payment?</h1>
+      <p id="empty" hidden>Nothing is waiting for approval.</p>
+      <section id="draft" hidden>
+        <p class="warning">Sending is permanent. Check every line before you approve.</p>
+        <dl>
+          <dt>Network</dt><dd id="chain"></dd>
+          <dt>From wallet</dt><dd id="wallet"></dd>
+          <dt>Network fee</dt><dd id="fee"></dd>
+          <dt>Transaction</dt><dd id="txid"></dd>
+        </dl>
+        <h2>Outputs</h2>
+        <ul id="outputs"></ul>
+        <div class="actions">
+          <button id="reject" type="button">Reject</button>
+          <button id="approve" type="button" class="primary">Approve and send</button>
+        </div>
+      </section>
+      <p id="error" class="error"></p>
+    </main>
+    <script type="module" src="./approval/main.ts"></script>
+  </body>
+</html>

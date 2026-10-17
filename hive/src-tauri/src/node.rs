@@ -18,7 +18,22 @@ use serde_json::{json, Value};
 use crate::rpc::{Client, Credentials, RpcError, RPC_IN_WARMUP};
 
 /// The methods the pages' login may call. Grows with b3ui/1.
-const PAGE_METHODS: &[&str] = &["getblockchaininfo", "stop"];
+/// generatetoaddress only serves the regtest funding button.
+const PAGE_METHODS: &[&str] = &[
+    "getblockchaininfo",
+    "stop",
+    "listwallets",
+    "loadwallet",
+    "createwallet",
+    "getbalances",
+    "getnewaddress",
+    "walletcreatefundedpsbt",
+    "walletprocesspsbt",
+    "finalizepsbt",
+    "decoderawtransaction",
+    "sendrawtransaction",
+    "generatetoaddress",
+];
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STDERR_TAIL: usize = 4096;
@@ -44,6 +59,7 @@ pub struct Node {
     status: Mutex<NodeStatus>,
     stderr_tail: Arc<Mutex<Vec<u8>>>,
     datadir: PathBuf,
+    port: u16,
 }
 
 impl Node {
@@ -52,12 +68,13 @@ impl Node {
     pub fn start(config: &NodeConfig) -> Arc<Node> {
         let stderr_tail = Arc::new(Mutex::new(Vec::new()));
         match spawn(config, &stderr_tail) {
-            Ok((child, client)) => Arc::new(Node {
+            Ok((child, client, port)) => Arc::new(Node {
                 child: Mutex::new(Some(child)),
                 client: Some(client),
                 status: Mutex::new(NodeStatus::Starting { message: "Starting b3coind".into() }),
                 stderr_tail,
                 datadir: config.datadir.clone(),
+                port,
             }),
             Err(error) => Arc::new(Node {
                 child: Mutex::new(None),
@@ -65,12 +82,36 @@ impl Node {
                 status: Mutex::new(NodeStatus::Failed { error }),
                 stderr_tail,
                 datadir: config.datadir.clone(),
+                port: 0,
             }),
         }
     }
 
     pub fn status(&self) -> NodeStatus {
         self.status.lock().unwrap().clone()
+    }
+
+    /// The pages' RPC client, once the node is ready.
+    pub fn client(&self) -> Option<&Client> {
+        match self.status() {
+            NodeStatus::Ready { .. } => self.client.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn chain(&self) -> Option<String> {
+        match self.status() {
+            NodeStatus::Ready { chain, .. } => Some(chain),
+            _ => None,
+        }
+    }
+
+    pub fn rpc_port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn datadir(&self) -> &std::path::Path {
+        &self.datadir
     }
 
     /// Polls until init finishes, the process dies or `timeout` passes, and
@@ -154,7 +195,7 @@ impl Node {
     }
 }
 
-fn spawn(config: &NodeConfig, stderr_tail: &Arc<Mutex<Vec<u8>>>) -> Result<(Child, Client), String> {
+fn spawn(config: &NodeConfig, stderr_tail: &Arc<Mutex<Vec<u8>>>) -> Result<(Child, Client, u16), String> {
     std::fs::create_dir_all(&config.datadir)
         .map_err(|e| format!("cannot create {}: {e}", config.datadir.display()))?;
     let credentials = Credentials::generate("hive").map_err(|e| format!("no system randomness: {e}"))?;
@@ -185,7 +226,7 @@ fn spawn(config: &NodeConfig, stderr_tail: &Arc<Mutex<Vec<u8>>>) -> Result<(Chil
             }
         });
     }
-    Ok((child, Client::new(port, &credentials)))
+    Ok((child, Client::new(port, &credentials), port))
 }
 
 fn node_args(config: &NodeConfig, credentials: &Credentials, port: u16) -> Vec<String> {
@@ -204,6 +245,9 @@ fn node_args(config: &NodeConfig, credentials: &Credentials, port: u16) -> Vec<S
         format!("-rpcwhitelist={}:{}", credentials.user(), PAGE_METHODS.join(",")),
         // Users without a whitelist (the cookie for b3coin-cli) keep full access.
         "-rpcwhitelistdefault=0".into(),
+        // Plain regtest has no fee history; use the legacy relay floor
+        // (600,000 base units per kvB) that B3 mainnet wallets default to.
+        "-fallbackfee=0.0006".into(),
     ]
 }
 
@@ -234,7 +278,13 @@ mod tests {
             assert!(args.iter().any(|a| a == required), "missing {required}");
         }
         assert!(args.contains(&format!("-rpcauth={}", credentials.rpcauth())));
-        assert!(args.contains(&"-rpcwhitelist=hive:getblockchaininfo,stop".to_string()));
+        let whitelist = args.iter().find(|a| a.starts_with("-rpcwhitelist=hive:")).unwrap();
+        for method in ["getblockchaininfo", "stop", "sendrawtransaction"] {
+            assert!(whitelist.split([':', ',']).any(|m| m == method), "{method} not whitelisted");
+        }
+        for never in ["listdescriptors", "gethdkeys", "exportflowmeshkey", "dumpprivkey"] {
+            assert!(!whitelist.contains(never), "{never} must not be whitelisted");
+        }
     }
 
     #[test]

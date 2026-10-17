@@ -16,6 +16,17 @@
         <dt>Blocks</dt><dd id="chain-blocks"></dd>
         <dt>Best block</dt><dd id="chain-best"></dd>
       </dl>
+      <section id="wallet" hidden>
+        <h2>Wallet <span id="wallet-name"></span></h2>
+        <p>Spendable: <span id="spendable"></span> B3 · Not yet spendable: <span id="immature"></span> B3</p>
+        <button id="fund" type="button" hidden>Mine regtest blocks to this wallet</button>
+        <form id="send">
+          <label>To address <input id="address" autocomplete="off" spellcheck="false" required /></label>
+          <label>Amount (B3) <input id="amount" inputmode="decimal" autocomplete="off" required /></label>
+          <button type="submit">Review in the approval window</button>
+        </form>
+        <p id="send-result" class="detail"></p>
+      </section>
     </main>
     <script type="module" src="./src/main.ts"></script>
   </body>

@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "types": []
   },
-  "include": ["web/src", "vite.config.ts"]
+  "include": ["web/src", "web/approval"]
 }

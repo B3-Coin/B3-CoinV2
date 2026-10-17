@@ -96,8 +96,17 @@ pub struct Client {
 
 impl Client {
     pub fn new(port: u16, credentials: &Credentials) -> Self {
-        let token = base64::engine::general_purpose::STANDARD
-            .encode(format!("{}:{}", credentials.user, credentials.password));
+        Self::with_login(port, &format!("{}:{}", credentials.user, credentials.password))
+    }
+
+    /// A client using the contents of b3coind's .cookie file (`__cookie__:<secret>`).
+    /// For tests and tools that need the cookie's full access, never for pages.
+    pub fn from_cookie(port: u16, cookie: &str) -> Self {
+        Self::with_login(port, cookie.trim())
+    }
+
+    fn with_login(port: u16, login: &str) -> Self {
+        let token = base64::engine::general_purpose::STANDARD.encode(login);
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(30)))
             // b3coind reports JSON-RPC errors with HTTP 500 and a JSON body.
@@ -107,12 +116,21 @@ impl Client {
         Self { url: format!("http://127.0.0.1:{port}/"), authorization: format!("Basic {token}"), agent }
     }
 
-    /// Calls a node-wide method. Wallet calls (/wallet/<name>) come later.
+    /// Calls a node-wide method.
     pub fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.post(&self.url, method, params)
+    }
+
+    /// Calls a method on one loaded wallet (/wallet/<name>).
+    pub fn call_wallet(&self, wallet: &str, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.post(&format!("{}wallet/{}", self.url, percent_encode(wallet)), method, params)
+    }
+
+    fn post(&self, url: &str, method: &str, params: Value) -> Result<Value, RpcError> {
         let request = json!({ "id": "hive", "method": method, "params": params });
         let mut response = self
             .agent
-            .post(&self.url)
+            .post(url)
             .header("Authorization", &self.authorization)
             .send_json(&request)
             .map_err(|e| RpcError::Transport(e.to_string()))?;
@@ -124,6 +142,16 @@ impl Client {
         };
         parse_reply(body)
     }
+}
+
+fn percent_encode(segment: &str) -> String {
+    segment
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 fn parse_reply(mut body: Value) -> Result<Value, RpcError> {
@@ -169,6 +197,12 @@ mod tests {
         assert_eq!(hash.len(), 64);
         assert_eq!(a.rpcauth(), rpcauth_value("hive", salt, &a.password));
         assert!(!format!("{a:?}").contains(&a.password));
+    }
+
+    #[test]
+    fn wallet_names_are_escaped_in_the_path() {
+        assert_eq!(percent_encode("hive-spike"), "hive-spike");
+        assert_eq!(percent_encode("my wallet/../x"), "my%20wallet%2F..%2Fx");
     }
 
     #[test]
