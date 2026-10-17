@@ -1,36 +1,146 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>B3 Hive</title>
-    <link rel="stylesheet" href="./src/style.css" />
+    <link rel="stylesheet" href="./shared/css/hive.css" />
   </head>
   <body>
-    <main>
-      <header>
-        <h1>B3 Hive</h1>
-        <button id="open-console" type="button">Open console</button>
-      </header>
-      <p class="phase" id="phase">Starting the node…</p>
-      <p class="detail" id="detail"></p>
-      <dl id="chain" hidden>
-        <dt>Network</dt><dd id="chain-name"></dd>
-        <dt>Blocks</dt><dd id="chain-blocks"></dd>
-        <dt>Best block</dt><dd id="chain-best"></dd>
-      </dl>
-      <section id="wallet" hidden>
-        <h2>Wallet <span id="wallet-name"></span></h2>
-        <p>Spendable: <span id="spendable"></span> B3 · Not yet spendable: <span id="immature"></span> B3</p>
-        <button id="fund" type="button" hidden>Mine regtest blocks to this wallet</button>
-        <form id="send">
-          <label>To address <input id="address" autocomplete="off" spellcheck="false" required /></label>
-          <label>Amount (B3) <input id="amount" inputmode="decimal" autocomplete="off" required /></label>
-          <button type="submit">Review in the approval window</button>
-        </form>
-        <p id="send-result" class="detail"></p>
-      </section>
-    </main>
+    <div class="app">
+      <aside class="rail">
+        <div class="rail-brand">
+          <svg class="i-lg" aria-hidden="true"><use href="/icons.svg#i-hex" /></svg>
+          <span class="brand-text">B3 Hive</span>
+        </div>
+        <nav class="rail-nav" aria-label="Main">
+          <div class="nav-group">
+            <button class="nav-item" type="button" data-view="home" aria-current="page">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-home" /></svg>
+              <span class="nav-text">Home</span>
+            </button>
+          </div>
+          <div class="nav-group">
+            <div class="nav-group-head">Money</div>
+            <button class="nav-item" type="button" data-view="send">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-up" /></svg>
+              <span class="nav-text">Send</span>
+            </button>
+          </div>
+          <div class="nav-group">
+            <div class="nav-group-head">System</div>
+            <button class="nav-item" type="button" id="open-console">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-terminal" /></svg>
+              <span class="nav-text">Console</span>
+            </button>
+          </div>
+        </nav>
+        <div class="rail-foot">
+          <div class="wallet-badge" id="node-badge" data-state="no-wallet">
+            <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-server" /></svg>
+            <span class="grow" id="node-badge-text">Starting</span>
+          </div>
+          <div class="rail-foot-row">
+            <button class="btn btn-ghost btn-sm btn-icon" type="button" id="theme" aria-label="Switch theme">
+              <svg class="i" aria-hidden="true"><use id="theme-icon" href="/icons.svg#i-sun" /></svg>
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <div class="main">
+        <header class="page-head">
+          <div>
+            <h1 class="page-title" id="page-title">Home</h1>
+            <p class="page-sub" id="page-sub">Your balance and your node</p>
+          </div>
+        </header>
+
+        <main class="view" id="view-home">
+          <div class="stack">
+            <div class="banner banner-info" id="node-banner" role="status">
+              <span class="spinner" id="node-banner-spinner"></span>
+              <svg class="i" id="node-banner-icon" aria-hidden="true" hidden><use href="/icons.svg#i-alert-circle" /></svg>
+              <div>
+                <strong id="node-banner-title">Starting the node</strong>
+                <div class="t-sm" id="node-banner-detail"></div>
+              </div>
+            </div>
+
+            <div class="home-grid">
+              <div class="card span-2" id="wallet" hidden>
+                <div class="hero">
+                  <div class="hero-figure">
+                    <span class="label">Spendable balance</span>
+                    <div id="spendable"></div>
+                    <div class="hero-chips">
+                      <span class="badge badge-neutral" id="immature-chip" hidden>
+                        <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-clock" /></svg>
+                        <span id="immature"></span>
+                      </span>
+                      <span class="badge badge-neutral">
+                        <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-wallet" /></svg>
+                        <span id="wallet-name"></span>
+                      </span>
+                    </div>
+                  </div>
+                  <div class="hero-actions">
+                    <button class="btn btn-primary" type="button" data-view="send">
+                      <svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-up" /></svg><span>Send</span>
+                    </button>
+                    <button class="btn btn-secondary" type="button" id="fund" hidden>
+                      <svg class="i" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg><span>Mine regtest blocks</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card" id="chain" hidden>
+                <div class="card-head">
+                  <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-server" /></svg>Node</h2>
+                  <span class="badge badge-success"><span class="dot"></span>Running</span>
+                </div>
+                <div class="card-pad details">
+                  <div class="drow"><span class="dkey">Network</span><span class="dval" id="chain-name"></span></div>
+                  <div class="drow"><span class="dkey">Blocks</span><span class="dval tnum" id="chain-blocks"></span></div>
+                  <div class="drow"><span class="dkey">Best block</span><span class="dval is-mono" id="chain-best"></span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+
+        <main class="view view--flow" id="view-send" hidden>
+          <form class="card" id="send" novalidate>
+            <div class="card-pad form-grid">
+              <div class="field">
+                <label for="address">Pay to</label>
+                <input class="input input-mono" id="address" autocomplete="off" spellcheck="false" required />
+              </div>
+              <div class="field">
+                <label for="amount">Amount</label>
+                <div class="amount-field">
+                  <input class="input" id="amount" inputmode="decimal" autocomplete="off" placeholder="0.000000000" required />
+                  <span class="unit">B3</span>
+                </div>
+                <span class="help">Up to 9 decimals. The network fee is added on top.</span>
+              </div>
+              <div class="callout callout-info">
+                <div class="callout-title">
+                  <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-shield" /></svg>Nothing is sent yet
+                </div>
+                The payment opens in its own approval window with the exact amount, fee and
+                destination. It is sent only if you approve it there.
+              </div>
+            </div>
+            <div class="card-foot">
+              <button class="btn btn-primary btn-block" type="submit" id="send-submit">Review payment</button>
+            </div>
+          </form>
+          <div class="banner mt-4" id="send-result" role="status" hidden></div>
+        </main>
+      </div>
+    </div>
     <script type="module" src="./src/main.ts"></script>
   </body>
 </html>
