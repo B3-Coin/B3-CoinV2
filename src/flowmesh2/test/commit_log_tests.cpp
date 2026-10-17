@@ -36,13 +36,6 @@ struct CommitFixture {
         : journal{NewMemoryJournal(JournalRole::COMMIT, instance, faults)}, log{CommitLog::Create(*journal).value()}
     {
     }
-
-    DurableDecision Decided(const StorageSlot& slot)
-    {
-        const PendingDecision pending{log.AppendDecision(slot.header, slot.certificate, slot.body).value()};
-        RequireStorageOk(log.Barrier(), "B-DECISION");
-        return log.Confirm(pending).value();
-    }
 };
 
 } // namespace
