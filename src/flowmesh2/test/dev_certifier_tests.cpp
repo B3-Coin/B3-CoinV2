@@ -271,6 +271,54 @@ BOOST_AUTO_TEST_CASE(authority_bumped_during_the_intent_barrier_leaves_a_durable
     ApplyDecided(rig, std::move(renewed), *decision, bumped);
 }
 
+BOOST_AUTO_TEST_CASE(a_height_decided_but_refused_at_check_3_is_never_signed_again)
+{
+    // The authority moves at the end of B-VOTE: the certifier decides height 1
+    // under epoch 0 (no check follows B-VOTE), and check 3 then refuses it.
+    AgreementRig rig;
+    const auto certifier{NewCertifier(rig)};
+    const state::Candidate candidate{rig.Preview(rig.Inputs(rig.authority, 1))};
+    RequireOk(rig.adapter->BumpAt(dev::HookPoint::SIGNER_BARRIER_END, 2), "arm the hook on B-VOTE");
+    RequireOk(certifier->Propose(candidate, rig.authority), "Propose: decided before the bump is read");
+    std::optional<agreement::Decision> decision{certifier->TakeDecision()};
+    BOOST_REQUIRE(decision.has_value());
+    const AuthorityVersion bumped{rig.adapter->CurrentAuthority()};
+    BOOST_REQUIRE_EQUAL(bumped.epoch, rig.authority.epoch + 1);
+    state::Candidate refused{candidate};
+    RequireRefusal(rig.owner->Apply(std::move(refused), decision->decision, bumped), ErrorCode::AUTHORITY_CHANGED,
+                   state::AUTHORITY_SUPERSEDED, "check 3");
+    BOOST_CHECK_EQUAL(rig.owner->Head()->Header().height, 0U);
+
+    // Under epoch 1, height 1 is a new VoteKey, but the commit log has decided
+    // it: another header is refused before any write or signature (O-89).
+    const storage::JournalStatus signer_before{rig.signer_journal->Status()};
+    const storage::JournalStatus commit_before{rig.commit_journal->Status()};
+    const size_t events{rig.recorder.events.size()};
+    const state::Candidate renewed{rig.Preview(rig.Inputs(bumped, 1, "renewed"))};
+    BOOST_REQUIRE_EQUAL(renewed.Header().height, candidate.Header().height);
+    BOOST_REQUIRE(renewed.Header().Hash() != candidate.Header().Hash());
+    RequireRefusal(certifier->Propose(renewed, bumped), ErrorCode::EQUIVOCATION_REFUSED, dev::DEV_HEIGHT_DECIDED,
+                   "another header for a decided height");
+    BOOST_CHECK(rig.signer_journal->Status() == signer_before);
+    BOOST_CHECK(rig.commit_journal->Status() == commit_before);
+    BOOST_CHECK_EQUAL(rig.recorder.events.size(), events);
+    BOOST_CHECK(!certifier->TakeDecision().has_value());
+    // Exactly one signed vote exists for height 1.
+    size_t height_one_votes{0};
+    const std::vector<storage::JournalRecord> signer_records{rig.signer_journal->ReadAll().value()};
+    for (const storage::JournalRecord& record : signer_records) {
+        if (record.type != storage::RecordType::SIGNED_VOTE) continue;
+        height_one_votes += storage::SignedVoteRecord::Decode(record.payload).value().key.slot == 1 ? 1 : 0;
+    }
+    BOOST_CHECK_EQUAL(height_one_votes, 1U);
+    // The decided header itself is not refused for being decided; under the
+    // old authority check 1 refuses it, and nothing is written.
+    RequireRefusal(certifier->Propose(candidate, rig.authority), ErrorCode::AUTHORITY_CHANGED, chain::CHAIN_AUTHORITY_CHANGED,
+                   "the decided header under the old authority");
+    BOOST_CHECK(rig.signer_journal->Status() == signer_before);
+    BOOST_CHECK(rig.commit_journal->Status() == commit_before);
+}
+
 BOOST_AUTO_TEST_CASE(failed_signed_vote_barrier_is_storage_fatal_and_writes_no_decision)
 {
     AgreementRig rig{RigOptions{{"s0"}, storage::MemoryJournalFaults{0, 2}, {}}};

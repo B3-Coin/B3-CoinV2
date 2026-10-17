@@ -54,6 +54,8 @@
  *   decided header's state_root. The same application again is idempotent;
  *   an application at or below the last applied slot is ORDER_VIOLATION
  *   (APPLIED_OUT_OF_ORDER).
+ * - DecisionAt(slot): the reference of the decision this log holds for the
+ *   slot, if any (used by the certifier before it signs, O-89).
  * - Every Append and Confirm of a fatal journal is FENCED.
  * - Create needs a COMMIT journal (ORDER_VIOLATION, LOG_ROLE) that is not
  *   fatal (FENCED) and has no records yet; rebuilding the decision index of
@@ -139,6 +141,13 @@ public:
     Result<DurableDecision> Confirm(const PendingDecision& pending) const { return m_journal->Confirm(pending); }
     //! Journal::Confirm: B-APPLIED.
     Result<DurableApplied> Confirm(const PendingApplied& pending) const { return m_journal->Confirm(pending); }
+
+    /** The decision this log holds for `slot`: its reference with the first
+     * certificate's hash, or nullopt if the slot was never decided here. A
+     * decided slot stays decided (also when check 3 refused to apply it), so
+     * the certifier asks this before it signs a height (O-89).
+     */
+    std::optional<DecisionRef> DecisionAt(uint64_t slot) const;
 
     //! Durable PBFT view state. Stub: M4-STO-07.
     Result<uint64_t> AppendPreparedQc(const PreparedQcRecord& record);

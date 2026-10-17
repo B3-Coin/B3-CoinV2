@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 using namespace flowmesh2;
@@ -155,6 +156,7 @@ BOOST_AUTO_TEST_CASE(decision_rules)
     count_cert.header_hash = wrong_count.Hash();
     RequireRefusal(f.log.AppendDecision(wrong_count, count_cert, slot.body), ErrorCode::VERIFY_FAILED, BODY_HEADER_MISMATCH, "action_count");
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 0U);
+    BOOST_CHECK(!f.log.DecisionAt(3).has_value()); // refused appends decide nothing
     // Same header twice is idempotent, even with another certificate; another header is a conflict.
     const PendingDecision first{f.log.AppendDecision(slot.header, slot.certificate, slot.body).value()};
     SlotCertificate other_subset{slot.certificate};
@@ -164,6 +166,10 @@ BOOST_AUTO_TEST_CASE(decision_rules)
     RequireRefusal(f.log.AppendDecision(conflict.header, conflict.certificate, conflict.body), ErrorCode::EQUIVOCATION_REFUSED,
                    DECISION_CONFLICT, "second header for a decided slot");
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
+    // DecisionAt names the kept decision (first certificate) and nothing else.
+    BOOST_CHECK(f.log.DecisionAt(3) == std::optional<DecisionRef>{first.Key()});
+    BOOST_CHECK(!f.log.DecisionAt(2).has_value());
+    BOOST_CHECK(!f.log.DecisionAt(4).has_value());
     RequireStub(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 0, slot.header.Hash(), Bytes("qc")}), "M4-STO-07");
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
 }

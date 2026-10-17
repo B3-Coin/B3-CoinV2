@@ -43,6 +43,13 @@ Result<void> DevSingleSeatCertifier::Propose(const state::Candidate& candidate, 
     const SlotHeaderV2& header{candidate.Header()};
     if (!(header.Authority() == authority)) return Error{ErrorCode::INVALID_INPUT, DEV_CANDIDATE_AUTHORITY};
     if (header.seat_set_root != m_seats.Root()) return Error{ErrorCode::INVALID_INPUT, DEV_SEAT_SET};
+    // A height this commit log decided stays decided, also when check 3
+    // refused to apply it: another header (a new epoch is a new VoteKey, so
+    // the signer log alone would allow it) is never signed (O-89).
+    if (const std::optional<storage::DecisionRef> decided{m_commit_log.DecisionAt(header.height)};
+        decided.has_value() && decided->header_hash != header.Hash()) {
+        return Error{ErrorCode::EQUIVOCATION_REFUSED, DEV_HEIGHT_DECIDED};
+    }
 
     // 1. Authority check 1: before ACCEPTED_PROPOSAL; nothing written on refusal.
     if (Result<void> current{m_adapter.CheckAuthority(authority)}; !current.has_value()) return current.error();

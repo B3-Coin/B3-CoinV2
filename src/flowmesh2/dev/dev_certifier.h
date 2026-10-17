@@ -48,7 +48,13 @@
  *     (DEV_DECISION_PENDING) while a decision has not been taken (one slot
  *     in flight); INVALID_INPUT (DEV_CANDIDATE_AUTHORITY) unless `authority`
  *     is the candidate header's AuthorityVersion; INVALID_INPUT
- *     (DEV_SEAT_SET) unless the header names this certifier's seat set.
+ *     (DEV_SEAT_SET) unless the header names this certifier's seat set;
+ *     EQUIVOCATION_REFUSED (DEV_HEIGHT_DECIDED) if the commit log already
+ *     holds a decision for the header's height with another header hash
+ *     (CommitLog::DecisionAt). A decided height stays decided, also when
+ *     check 3 refused to apply it, so a new epoch (a new VoteKey) never
+ *     leads to a second signature for that height (O-89). The same header
+ *     again is not refused here: it is idempotent all the way through.
  *  1. adapter.CheckAuthority(authority)               authority check 1
  *  2. signer_log.AppendAcceptedProposal({epoch, height, view 0}, header, body)
  *  3. signer_log.AppendIntent({domain, epoch, height, view 0, COMMIT},
@@ -72,7 +78,11 @@
  * refusal the INTENT is durable but no signature exists, and the signer
  * log keeps refusing another digest for that (epoch, slot, view)
  * (EQUIVOCATION_REFUSED). Authority check 3 is StateOwner::Apply; the
- * caller then writes APPLIED (B-APPLIED).
+ * caller then writes APPLIED (B-APPLIED). Nothing checks the authority
+ * between check 2 and DECISION, so an authority change there leaves a
+ * durable DECISION that check 3 refuses: the height is decided but not
+ * applied, the node fences, and step 0 refuses any other header for that
+ * height (O-89; the cross-epoch rule of M4-AGR-01, the proof M10-SPEC-01).
  *
  * OnMessage: Unsupported (M4-AGR-02): with one seat there is nothing to
  * receive. OnTimeout: Ok and no effect: Propose decides or fails
@@ -90,6 +100,7 @@ inline constexpr std::string_view DEV_DECISION_PENDING{"the previous decision wa
 inline constexpr std::string_view DEV_CANDIDATE_AUTHORITY{"authority is not the candidate header's"};      //!< (INVALID_INPUT)
 inline constexpr std::string_view DEV_SEAT_SET{"candidate header names another seat set"};                 //!< (INVALID_INPUT)
 inline constexpr std::string_view DEV_CERTIFICATE{"the one-seat certificate does not verify"};             //!< (INVARIANT)
+inline constexpr std::string_view DEV_HEIGHT_DECIDED{"the commit log decided this height with another header"}; //!< (EQUIVOCATION_REFUSED)
 
 class DevSingleSeatCertifier final : public agreement::Agreement
 {

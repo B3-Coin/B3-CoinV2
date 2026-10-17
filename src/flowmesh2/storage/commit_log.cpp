@@ -136,6 +136,13 @@ Result<PendingApplied> CommitLog::AppendApplied(const DurableDecision& decision,
     return Ok(PendingApplied{m_journal->InstanceId(), *seq, ref});
 }
 
+std::optional<DecisionRef> CommitLog::DecisionAt(uint64_t slot) const
+{
+    const auto it{m_decisions.find(slot)};
+    if (it == m_decisions.end()) return std::nullopt;
+    return DecisionRef{slot, it->second.header_hash, it->second.cert_hash};
+}
+
 Result<uint64_t> CommitLog::AppendPreparedQc(const PreparedQcRecord& /*record*/)
 {
     return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07)
