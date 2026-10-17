@@ -287,6 +287,18 @@ BOOST_AUTO_TEST_CASE(cancel_and_status_are_accepted_while_the_action_lane_is_ful
     BOOST_CHECK(status_body->status == ApiActionStatus::UNKNOWN); // the BUSY PLACE was never queued
     BOOST_CHECK_EQUAL(r.pool->Size(), 19U);
     BOOST_CHECK(!r.pool->Status(IdOfBytes(overflow)).has_value());
+    // The same with a health probe and a status query in the reserved share.
+    std::vector<RequestId> refill;
+    for (uint64_t n{20}; n <= 37; ++n) refill.push_back(r.Submit(SmallPlace(a, "alice", n, 1, 16)));
+    RequireBusy(r.api->Submit(SmallPlace(a, "alice", 38, 1, 16)), net::LANE_ORDINARY_FULL, "PLACE beyond the ordinary share again");
+    Result<RequestId> health_again{r.api->SubmitHealth()};
+    RequireOk(health_again, "health in the reserved share");
+    Result<RequestId> status_again{r.api->SubmitStatus(DecodeAction(overflow))};
+    RequireOk(status_again, "status in the reserved share");
+    RequireBusy(r.api->Submit(a.Cancel("bob", 2, OrderId{uint256::ONE})), net::LANE_FULL, "cancel in a full lane");
+    for (const RequestId& id : refill) RequireCode(AdmissionOf(r.Reply(id)), AdmissionCode::ADMITTED, "refill PLACE");
+    BOOST_CHECK(std::holds_alternative<net::HealthReply>(r.Reply(*health_again).body));
+    BOOST_CHECK(std::holds_alternative<net::ActionStatusReply>(r.Reply(*status_again).body));
     // A malformed frame whose kind byte says CANCEL is not a cancel: it gets the ordinary share.
     Frame fake{cancel};
     fake.push_back(0);
@@ -362,6 +374,16 @@ BOOST_AUTO_TEST_CASE(replies_full_stops_the_pump_and_keeps_requests_queued)
     const Result<net::PumpReport> empty{r.api->Pump(10)};
     RequireOk(empty, "Pump empty");
     BOOST_CHECK(empty->stop == net::PumpStop::EMPTY);
+    // Pumping an empty lane gives its reply reservation back: after several
+    // empty pumps two new requests are still answered by one Pump.
+    for (int i{0}; i < 5; ++i) RequireOk(r.api->Pump(10), "Pump an empty lane");
+    const RequestId fourth{r.Submit(SmallPlace(a, "alice", 4, 1, 16))};
+    const RequestId fifth{r.Submit(SmallPlace(a, "alice", 5, 1, 16))};
+    const Result<net::PumpReport> both{r.api->Pump(10)};
+    RequireOk(both, "Pump both");
+    BOOST_CHECK_EQUAL(both->answered, 2U);
+    BOOST_CHECK(r.api->TakeReply(fourth).has_value());
+    BOOST_CHECK(r.api->TakeReply(fifth).has_value());
 }
 
 BOOST_AUTO_TEST_CASE(admission_errors_are_replies_too)
@@ -510,6 +532,14 @@ BOOST_AUTO_TEST_CASE(get_action_included_pending_expired_unknown)
     RequireCode(r.AdmitViaApi(y), AdmissionCode::ADMITTED, "y");
     Result<admission::TakenSlot> taken{r.pool->TakeForSlot(r.Height() + 1, 16)};
     RequireOk(taken, "TakeForSlot");
+    {
+        // Taken for slot 8 but not committed: still PENDING, as IN_PROPOSAL.
+        const net::ActionStatusReply reply{r.GetAction(DecodeAction(y))};
+        BOOST_CHECK(reply.status == ApiActionStatus::PENDING);
+        BOOST_REQUIRE(reply.pending.has_value());
+        BOOST_CHECK(reply.pending->status == admission::PoolStatus::IN_PROPOSAL);
+        BOOST_CHECK_EQUAL(reply.pending->height, 8U);
+    }
     const HeldSlot slot8{CommitOnly(r, {}, taken->originals)};
     TellPool(r, slot8);
     {
@@ -586,9 +616,51 @@ BOOST_AUTO_TEST_CASE(queued_status_and_health)
     BOOST_CHECK_EQUAL(h->pool_height, 1U);
     BOOST_CHECK_EQUAL(h->pool_live, 1U);
     BOOST_CHECK_EQUAL(h->action_lane.messages, 0U);
+    // With two requests queued behind it, the health answer reports them.
+    const RequestId probe{r.api->SubmitHealth().value()};
+    const RequestId later1{r.Submit(SmallPlace(a, "alice", 2, 1, 16))};
+    const RequestId later2{r.Submit(SmallPlace(a, "alice", 3, 1, 16))};
+    RequireOk(r.api->Pump(1), "Pump the health probe");
+    const std::optional<ApiReply> probed{r.api->TakeReply(probe)};
+    BOOST_REQUIRE(probed.has_value());
+    const net::LaneStats& lane{std::get<net::HealthReply>(probed->body).action_lane};
+    BOOST_CHECK_EQUAL(lane.messages, 2U);
+    BOOST_CHECK_EQUAL(lane.ordinary_messages, 2U);
+    BOOST_CHECK_GT(lane.payload_bytes, 0U);
+    RequireCode(AdmissionOf(r.Reply(later1)), AdmissionCode::ADMITTED, "later 1");
+    RequireCode(AdmissionOf(r.Reply(later2)), AdmissionCode::ADMITTED, "later 2");
     r.admission->Fence();
     const ApiReply fenced{r.Reply(r.api->SubmitHealth().value())};
     BOOST_CHECK(std::get<net::HealthReply>(fenced.body).fenced);
+}
+
+BOOST_AUTO_TEST_CASE(a_busy_read_service_is_busy)
+{
+    ApiRig r{TestCertificates()};
+    r.Fund();
+    const Frame order{SmallPlace(r.Actions(), "alice", 1, 1, 16)};
+    RequireCode(r.AdmitViaApi(order), AdmissionCode::ADMITTED, "order");
+    std::vector<read::ReadHandle> held;
+    while (held.size() <= r.read->Limits().max_readers) {
+        Result<read::ReadHandle> handle{r.read->Acquire()};
+        if (!handle.has_value()) break;
+        held.push_back(std::move(handle).value());
+    }
+    BOOST_CHECK_EQUAL(held.size(), r.read->Limits().max_readers);
+    // BUSY, never a PENDING or UNKNOWN guess: the lease that would answer INCLUDED or EXPIRED is not available.
+    const Result<net::ActionStatusReply> busy{r.api->GetAction(DecodeAction(order))};
+    BOOST_REQUIRE(!busy.has_value());
+    BOOST_CHECK(busy.error().code == ErrorCode::BUSY);
+    const Result<read::AccountReply> state{r.api->GetState(KeyAccount("alice"))};
+    BOOST_REQUIRE(!state.has_value());
+    BOOST_CHECK(state.error().code == ErrorCode::BUSY);
+    // A queued status query gets that error as its one reply.
+    const ApiReply queued{r.Reply(r.api->SubmitStatus(DecodeAction(order)).value())};
+    const auto* error{std::get_if<Error>(&queued.body)};
+    BOOST_REQUIRE(error != nullptr);
+    BOOST_CHECK(error->code == ErrorCode::BUSY);
+    held.clear();
+    BOOST_CHECK(r.GetAction(DecodeAction(order)).status == ApiActionStatus::PENDING);
 }
 
 BOOST_AUTO_TEST_CASE(foreign_message_on_the_action_lane_is_an_invariant)
