@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use b3_hive::console;
 use b3_hive::drafts::DraftStore;
 use b3_hive::node::{Node, NodeConfig, NodeStatus};
 use b3_hive::rpc::{Client, RpcError};
@@ -151,4 +152,50 @@ fn the_page_login_cannot_export_keys() {
             other => panic!("{method} was not refused with 403: {other:?}"),
         }
     }
+}
+
+#[test]
+fn the_console_runs_typed_commands_with_full_access() {
+    let Some((test, status)) = TestNode::start("console") else {
+        return;
+    };
+    assert!(
+        matches!(status, NodeStatus::Ready { .. }),
+        "not ready: {status:?}"
+    );
+    let client = test.node.console_client().unwrap();
+    let mut exec = |method: &str, params: serde_json::Value| {
+        client.call(method, params).map_err(|e| match e {
+            RpcError::Rpc { code, message } => console::ConsoleError::Rpc { code, message },
+            other => console::ConsoleError::Error(other.to_string()),
+        })
+    };
+
+    let reply = console::submit("getblockchaininfo()[chain]", &mut exec).unwrap();
+    assert_eq!((reply.ok, reply.output.as_str()), (true, "regtest"));
+    let reply = console::submit("getblockhash(0)", &mut exec).unwrap();
+    assert_eq!(reply.output.len(), 64);
+
+    // Typed arguments convert as in b3coin-cli: the name stays a string,
+    // disable_private_keys becomes a boolean.
+    let reply = console::submit("createwallet 123 true", &mut exec).unwrap();
+    assert!(reply.ok, "{}", reply.output);
+    assert_eq!(reply.command, "createwallet(…)");
+    let wallet = client
+        .call_wallet("123", "getwalletinfo", json!([]))
+        .unwrap();
+    assert_eq!(wallet["private_keys_enabled"], json!(false));
+
+    // The page login is refused this call (see above); the console is not.
+    let reply = console::submit("listdescriptors", &mut |m: &str, p| {
+        client
+            .call_wallet("123", m, p)
+            .map_err(|e| console::ConsoleError::Error(e.to_string()))
+    })
+    .unwrap();
+    assert!(reply.ok, "{}", reply.output);
+
+    let reply = console::submit("getblockhash(-5)", &mut exec).unwrap();
+    assert!(!reply.ok);
+    assert!(reply.output.ends_with(")"), "{}", reply.output);
 }

@@ -13,6 +13,8 @@ use sha2::Sha256;
 /// message is the current init step (SetRPCWarmupStatus).
 pub const RPC_IN_WARMUP: i64 = -28;
 
+const PAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A login generated at launch. b3coind only ever sees `rpcauth`, the salted
 /// HMAC of the password, so the process list shows nothing reusable.
 pub struct Credentials {
@@ -102,23 +104,35 @@ pub struct Client {
 }
 
 impl Client {
+    /// A client for the pages' login; calls give up after 30 seconds.
     pub fn new(port: u16, credentials: &Credentials) -> Self {
         Self::with_login(
             port,
             &format!("{}:{}", credentials.user, credentials.password),
+            Some(PAGE_TIMEOUT),
+        )
+    }
+
+    /// A client without a time limit, for console commands such as
+    /// rescanblockchain that can run for a long time (as in the Qt console).
+    pub fn without_timeout(port: u16, credentials: &Credentials) -> Self {
+        Self::with_login(
+            port,
+            &format!("{}:{}", credentials.user, credentials.password),
+            None,
         )
     }
 
     /// A client using the contents of b3coind's .cookie file (`__cookie__:<secret>`).
     /// For tests and tools that need the cookie's full access, never for pages.
     pub fn from_cookie(port: u16, cookie: &str) -> Self {
-        Self::with_login(port, cookie.trim())
+        Self::with_login(port, cookie.trim(), Some(PAGE_TIMEOUT))
     }
 
-    fn with_login(port: u16, login: &str) -> Self {
+    fn with_login(port: u16, login: &str, timeout: Option<Duration>) -> Self {
         let token = base64::engine::general_purpose::STANDARD.encode(login);
         let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
+            .timeout_global(timeout)
             // b3coind reports JSON-RPC errors with HTTP 500 and a JSON body.
             .http_status_as_error(false)
             .build()

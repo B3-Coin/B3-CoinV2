@@ -64,6 +64,10 @@ async function refreshWallet(): Promise<void> {
   }
 }
 
+el("open-console").addEventListener("click", () => {
+  invoke("open_console").catch((e) => (el("detail").textContent = String(e)));
+});
+
 el("fund").addEventListener("click", async () => {
   const button = el<HTMLButtonElement>("fund");
   button.disabled = true;

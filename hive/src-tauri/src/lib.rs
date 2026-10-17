@@ -1,7 +1,9 @@
 //! The trusted core of the B3 Hive app. Windows only ask; the core holds the
 //! node credentials, builds every transaction itself, and submits one only
-//! after the approval window approves it.
+//! after the approval window approves it. The one exception is the console
+//! window: commands typed there run with full access, as in the Qt console.
 
+pub mod console;
 pub mod drafts;
 pub mod node;
 pub mod rpc;
@@ -20,11 +22,13 @@ use tauri::{
 
 use drafts::{DraftStore, DraftView};
 use node::{Node, NodeConfig, NodeStatus};
+use rpc::RpcError;
 
 const START_TIMEOUT: Duration = Duration::from_secs(600);
 const STOP_TIMEOUT: Duration = Duration::from_secs(120);
 const MAIN: &str = "main";
 const APPROVAL: &str = "approval";
+const CONSOLE: &str = "console";
 
 pub struct Core {
     node: Arc<Node>,
@@ -113,6 +117,20 @@ async fn draft_send(
     Ok(id)
 }
 
+#[tauri::command]
+fn open_console(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(CONSOLE) {
+        return window.set_focus().map_err(|e| e.to_string());
+    }
+    WebviewWindowBuilder::new(&app, CONSOLE, WebviewUrl::App("console.html".into()))
+        .title("Console – B3 Hive")
+        .inner_size(860.0, 600.0)
+        .incognito(true)
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 // ---- approval window commands ----------------------------------------------
 
 #[tauri::command]
@@ -120,7 +138,7 @@ fn approval_pending(
     window: Window,
     core: State<'_, Arc<Core>>,
 ) -> Result<Option<DraftView>, String> {
-    require_approval_window(&window)?;
+    require_window(&window, APPROVAL)?;
     Ok(core.drafts.lock().unwrap().oldest())
 }
 
@@ -135,7 +153,7 @@ async fn approval_decide(
     id: String,
     approve: bool,
 ) -> Result<Option<DraftView>, String> {
-    require_approval_window(&window)?;
+    require_window(&window, APPROVAL)?;
     let core = Arc::clone(&core);
     let draft = core
         .drafts
@@ -169,13 +187,85 @@ async fn approval_decide(
     Ok(next)
 }
 
-/// Capabilities already confine these commands to the approval window; this
+// ---- console window commands -----------------------------------------------
+
+/// Parses and runs one typed line with the console's full-access login,
+/// against `wallet` if one is chosen. Err means the line was refused before
+/// anything ran. A successful `stop` closes the app, as in the Qt console.
+#[tauri::command]
+async fn console_exec(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    line: String,
+    wallet: Option<String>,
+) -> Result<console::Reply, String> {
+    require_window(&window, CONSOLE)?;
+    let core = Arc::clone(&core);
+    let stop = console::is_stop(&line);
+    let reply = blocking(move || {
+        let client = core
+            .node
+            .console_client()
+            .ok_or("The node is not running.")?;
+        let mut exec = |method: &str, params: serde_json::Value| {
+            match &wallet {
+                Some(name) => client.call_wallet(name, method, params),
+                None => client.call(method, params),
+            }
+            .map_err(console_error)
+        };
+        console::submit(&line, &mut exec)
+    })
+    .await?;
+    if stop && reply.ok {
+        app.exit(0);
+    }
+    Ok(reply)
+}
+
+/// The loaded wallets, for the console's wallet selector.
+#[tauri::command]
+async fn console_wallets(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<Vec<String>, String> {
+    require_window(&window, CONSOLE)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let client = core
+            .node
+            .console_client()
+            .ok_or("The node is not running.")?;
+        let wallets = client
+            .call("listwallets", serde_json::json!([]))
+            .map_err(|e| e.to_string())?;
+        Ok(wallets
+            .as_array()
+            .map(|w| {
+                w.iter()
+                    .filter_map(|n| n.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default())
+    })
+    .await
+}
+
+fn console_error(e: RpcError) -> console::ConsoleError {
+    match e {
+        RpcError::Rpc { code, message } => console::ConsoleError::Rpc { code, message },
+        other => console::ConsoleError::Error(other.to_string()),
+    }
+}
+
+/// Capabilities already confine each window's commands to that window; this
 /// check keeps that true even if a capability file is edited by mistake.
-fn require_approval_window(window: &Window) -> Result<(), String> {
-    if window.label() == APPROVAL {
+fn require_window(window: &Window, label: &str) -> Result<(), String> {
+    if window.label() == label {
         Ok(())
     } else {
-        Err("Only the approval window can do this.".into())
+        Err(format!("Only the {label} window can do this."))
     }
 }
 
@@ -249,14 +339,22 @@ pub fn run() {
                     );
                 }
             }
+            // The main window is the app: closing it ends the app (and the
+            // node) even while the console or approval window is open.
+            if window.label() == MAIN && matches!(event, WindowEvent::Destroyed) {
+                window.app_handle().exit(0);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             node_status,
             wallet_overview,
             dev_fund,
             draft_send,
+            open_console,
             approval_pending,
-            approval_decide
+            approval_decide,
+            console_exec,
+            console_wallets
         ])
         .build(tauri::generate_context!())
         .expect("failed to build the B3 Hive app")

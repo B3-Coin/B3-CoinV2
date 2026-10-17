@@ -9,6 +9,7 @@
     "allow-node-status",
     "allow-wallet-overview",
     "allow-dev-fund",
-    "allow-draft-send"
+    "allow-draft-send",
+    "allow-open-console"
   ]
 }

@@ -11,6 +11,12 @@ main {
   padding: 0 1rem;
 }
 
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
 .phase {
   font-size: 1.1rem;
 }

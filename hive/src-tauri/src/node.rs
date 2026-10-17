@@ -17,6 +17,12 @@ use serde_json::{json, Value};
 
 use crate::rpc::{Client, Credentials, RpcError, RPC_IN_WARMUP};
 
+/// The pages' login: limited to PAGE_METHODS by -rpcwhitelist.
+const PAGE_USER: &str = "hive";
+/// The console's login: no whitelist, so every RPC, as in the Qt console.
+/// Only the console window can reach it.
+const CONSOLE_USER: &str = "hive-console";
+
 /// The methods the pages' login may call. Grows with b3ui/1.
 /// generatetoaddress only serves the regtest funding button.
 const PAGE_METHODS: &[&str] = &[
@@ -64,6 +70,7 @@ pub struct NodeConfig {
 pub struct Node {
     child: Mutex<Option<Child>>,
     client: Option<Client>,
+    console: Option<Client>,
     status: Mutex<NodeStatus>,
     stderr_tail: Arc<Mutex<Vec<u8>>>,
     datadir: PathBuf,
@@ -76,9 +83,15 @@ impl Node {
     pub fn start(config: &NodeConfig) -> Arc<Node> {
         let stderr_tail = Arc::new(Mutex::new(Vec::new()));
         match spawn(config, &stderr_tail) {
-            Ok((child, client, port)) => Arc::new(Node {
+            Ok(Spawned {
+                child,
+                client,
+                console,
+                port,
+            }) => Arc::new(Node {
                 child: Mutex::new(Some(child)),
                 client: Some(client),
+                console: Some(console),
                 status: Mutex::new(NodeStatus::Starting {
                     message: "Starting b3coind".into(),
                 }),
@@ -89,6 +102,7 @@ impl Node {
             Err(error) => Arc::new(Node {
                 child: Mutex::new(None),
                 client: None,
+                console: None,
                 status: Mutex::new(NodeStatus::Failed { error }),
                 stderr_tail,
                 datadir: config.datadir.clone(),
@@ -107,6 +121,12 @@ impl Node {
             NodeStatus::Ready { .. } => self.client.as_ref(),
             _ => None,
         }
+    }
+
+    /// The console's full-access client. Unlike the pages' client it is
+    /// available while the node starts, so warmup errors show in the console.
+    pub fn console_client(&self) -> Option<&Client> {
+        self.console.as_ref()
     }
 
     pub fn chain(&self) -> Option<String> {
@@ -230,18 +250,23 @@ impl Node {
     }
 }
 
-fn spawn(
-    config: &NodeConfig,
-    stderr_tail: &Arc<Mutex<Vec<u8>>>,
-) -> Result<(Child, Client, u16), String> {
+struct Spawned {
+    child: Child,
+    client: Client,
+    console: Client,
+    port: u16,
+}
+
+fn spawn(config: &NodeConfig, stderr_tail: &Arc<Mutex<Vec<u8>>>) -> Result<Spawned, String> {
     std::fs::create_dir_all(&config.datadir)
         .map_err(|e| format!("cannot create {}: {e}", config.datadir.display()))?;
-    let credentials =
-        Credentials::generate("hive").map_err(|e| format!("no system randomness: {e}"))?;
+    let no_randomness = |e| format!("no system randomness: {e}");
+    let page = Credentials::generate(PAGE_USER).map_err(no_randomness)?;
+    let console = Credentials::generate(CONSOLE_USER).map_err(no_randomness)?;
     let port = free_loopback_port().map_err(|e| format!("no free loopback port: {e}"))?;
 
     let mut child = Command::new(&config.b3coind)
-        .args(node_args(config, &credentials, port))
+        .args(node_args(config, &page, &console, port))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -265,10 +290,20 @@ fn spawn(
             }
         });
     }
-    Ok((child, Client::new(port, &credentials), port))
+    Ok(Spawned {
+        child,
+        client: Client::new(port, &page),
+        console: Client::without_timeout(port, &console),
+        port,
+    })
 }
 
-fn node_args(config: &NodeConfig, credentials: &Credentials, port: u16) -> Vec<String> {
+fn node_args(
+    config: &NodeConfig,
+    page: &Credentials,
+    console: &Credentials,
+    port: u16,
+) -> Vec<String> {
     vec![
         "-regtest".into(),
         format!("-datadir={}", config.datadir.display()),
@@ -280,13 +315,11 @@ fn node_args(config: &NodeConfig, credentials: &Credentials, port: u16) -> Vec<S
         "-rpcbind=127.0.0.1".into(),
         "-rpcallowip=127.0.0.1".into(),
         format!("-rpcport={port}"),
-        format!("-rpcauth={}", credentials.rpcauth()),
-        format!(
-            "-rpcwhitelist={}:{}",
-            credentials.user(),
-            PAGE_METHODS.join(",")
-        ),
-        // Users without a whitelist (the cookie for b3coin-cli) keep full access.
+        format!("-rpcauth={}", page.rpcauth()),
+        format!("-rpcwhitelist={}:{}", page.user(), PAGE_METHODS.join(",")),
+        // The console login has no whitelist entry, so it keeps full access,
+        // as does the cookie for b3coin-cli.
+        format!("-rpcauth={}", console.rpcauth()),
         "-rpcwhitelistdefault=0".into(),
         // Plain regtest has no fee history; use the legacy relay floor
         // (600,000 base units per kvB) that B3 mainnet wallets default to.
@@ -326,8 +359,9 @@ mod tests {
             b3coind: "b3coind".into(),
             datadir: "/tmp/hive".into(),
         };
-        let credentials = Credentials::generate("hive").unwrap();
-        let args = node_args(&config, &credentials, 18443);
+        let credentials = Credentials::generate(PAGE_USER).unwrap();
+        let console = Credentials::generate(CONSOLE_USER).unwrap();
+        let args = node_args(&config, &credentials, &console, 18443);
         for required in [
             "-regtest",
             "-listen=0",
@@ -339,6 +373,13 @@ mod tests {
             assert!(args.iter().any(|a| a == required), "missing {required}");
         }
         assert!(args.contains(&format!("-rpcauth={}", credentials.rpcauth())));
+        assert!(args.contains(&format!("-rpcauth={}", console.rpcauth())));
+        // Only the page login is whitelisted; the console keeps full access.
+        let whitelists: Vec<_> = args
+            .iter()
+            .filter(|a| a.starts_with("-rpcwhitelist="))
+            .collect();
+        assert_eq!(whitelists.len(), 1);
         let whitelist = args
             .iter()
             .find(|a| a.starts_with("-rpcwhitelist=hive:"))

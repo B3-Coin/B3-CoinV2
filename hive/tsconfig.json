@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "types": []
   },
-  "include": ["web/src", "web/approval"]
+  "include": ["web/src", "web/approval", "web/console"]
 }

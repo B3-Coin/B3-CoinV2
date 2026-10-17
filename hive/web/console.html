@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Console – B3 Hive</title>
+    <link rel="stylesheet" href="./console/style.css" />
+  </head>
+  <body>
+    <header>
+      <label>Wallet
+        <select id="wallet"></select>
+      </label>
+      <button id="clear" type="button" title="Clear (Ctrl+L)">Clear</button>
+    </header>
+    <div id="log" role="log" aria-live="polite"></div>
+    <form id="prompt" autocomplete="off">
+      <span aria-hidden="true">&gt;</span>
+      <input id="line" spellcheck="false" aria-label="Command" autofocus />
+    </form>
+    <script type="module" src="./console/main.ts"></script>
+  </body>
+</html>

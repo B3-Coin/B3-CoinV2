@@ -1,0 +1,86 @@
+:root {
+  color-scheme: dark light;
+  font-family: system-ui, sans-serif;
+  background: #1c1b19;
+  color: #f2efe8;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+header {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid #3a3731;
+}
+
+#log {
+  overflow-y: auto;
+  padding: 0.75rem 1rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.9rem;
+}
+
+.entry {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0 0 0.5rem;
+}
+
+.request {
+  color: #e0a526;
+}
+
+.request::before {
+  content: "> ";
+}
+
+.error {
+  color: #ff8a80;
+}
+
+.warning {
+  color: #ff8a80;
+  font-weight: 600;
+}
+
+.note {
+  color: #b8b2a6;
+}
+
+#prompt {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.5rem 1rem;
+  border-top: 1px solid #3a3731;
+  font-family: ui-monospace, monospace;
+}
+
+#line {
+  flex: 1;
+  font: inherit;
+  padding: 0.5rem;
+  border-radius: 6px;
+  border: 1px solid #6b665c;
+  background: transparent;
+  color: inherit;
+}
+
+select,
+button {
+  font: inherit;
+  padding: 0.35rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid #6b665c;
+  background: transparent;
+  color: inherit;
+  min-height: 36px;
+}
