@@ -192,6 +192,31 @@ BOOST_AUTO_TEST_CASE(reads_before_the_first_publication_need_data)
     BOOST_CHECK_EQUAL(service->ViewCount(), 0U);
 }
 
+BOOST_AUTO_TEST_CASE(acquire_is_busy_only_when_every_permit_is_held)
+{
+    ReadRig rig;
+    read::ReadLimits limits{TestReadLimits()};
+    limits.max_readers = 2;
+    const auto service{NewReadService(limits)};
+    Publish(*service, rig.Run(FundingFacts(rig.actions), {}));
+    std::optional<read::ReadHandle> first{Take(service->Acquire(), "first")};
+    std::optional<read::ReadHandle> second{Take(service->Acquire(), "second")};
+    BOOST_CHECK_EQUAL(service->Readers(), 2U);
+    RequireFailure(service->Acquire(), ErrorCode::BUSY, read::READ_NO_PERMIT, "third lease");
+    RequireFailure(service->Account(KeyAccount("alice")), ErrorCode::BUSY, read::READ_NO_PERMIT, "one-lease reply");
+    // A new publication does not free a permit; releasing a handle does.
+    Publish(*service, rig.Run({}, {}));
+    RequireFailure(service->Acquire(), ErrorCode::BUSY, read::READ_NO_PERMIT, "still full");
+    first.reset();
+    BOOST_CHECK_EQUAL(service->Readers(), 1U);
+    const read::AccountReply reply{Take(service->Account(KeyAccount("alice")), "after release")};
+    CheckReplyHead(reply.head, 2);
+    // The held handle still answers for its own head.
+    CheckReplyHead(Take(second->Head(), "held").head, 1);
+    second.reset();
+    BOOST_CHECK_EQUAL(service->Readers(), 0U);
+}
+
 BOOST_AUTO_TEST_CASE(slot_view_build_refusals)
 {
     ReadRig rig;
@@ -562,11 +587,14 @@ BOOST_AUTO_TEST_CASE(four_readers_one_publisher_see_one_head_per_reply)
     options.real_certificates = false; // the read service never verifies certificates; speed matters here
     ReadRig rig{options};
     const AssetId rusd{TestAsset("rUSD")};
+    // Computed once, before the threads: KeyAccount logs a Boost.Test check,
+    // and the Boost.Test log must never be written from the reader threads.
+    const AccountId alice{KeyAccount("alice")};
     // Slot h deposits 1 atom to Alice, so her leaf at head h holds exactly h atoms.
     std::vector<PublishableSlot> slots;
     slots.reserve(SLOTS);
     for (size_t h{1}; h <= SLOTS; ++h) {
-        slots.push_back(rig.Run({rig.actions.DepositBytes(KeyAccount("alice"), rusd, 1, "tick/" + std::to_string(h))}, {}));
+        slots.push_back(rig.Run({rig.actions.DepositBytes(alice, rusd, 1, "tick/" + std::to_string(h))}, {}));
     }
     const auto service{NewReadService(TestReadLimits(/*view_slots=*/4))};
 
@@ -584,7 +612,7 @@ BOOST_AUTO_TEST_CASE(four_readers_one_publisher_see_one_head_per_reply)
             std::optional<read::AccountReply> account;
             std::optional<read::HeadReply> head;
             if (i % 2 == 0) {
-                Result<read::AccountReply> reply{service->Account(KeyAccount("alice"))};
+                Result<read::AccountReply> reply{service->Account(alice)};
                 if (!reply.has_value()) {
                     check(r, reply.error().code == ErrorCode::NEED_DATA, "unexpected error");
                     ++empty[r];
@@ -598,7 +626,7 @@ BOOST_AUTO_TEST_CASE(four_readers_one_publisher_see_one_head_per_reply)
                     ++empty[r];
                     continue;
                 }
-                account = handle->Account(KeyAccount("alice")).value();
+                account = handle->Account(alice).value();
                 head = handle->Head().value();
                 check(r, head->head.commit == account->head.commit && head->head.publication == account->head.publication,
                       "two replies of one handle name two heads");
@@ -650,7 +678,7 @@ BOOST_AUTO_TEST_CASE(four_readers_one_publisher_see_one_head_per_reply)
                                 << "; evicted " << evicted[0] + evicted[1] + evicted[2] + evicted[3]);
     BOOST_CHECK(total_found > 0);
     // After the run every reader sees the last head.
-    const read::AccountReply last{Take(service->Account(KeyAccount("alice")), "final")};
+    const read::AccountReply last{Take(service->Account(alice), "final")};
     BOOST_REQUIRE(last.status == read::LookupStatus::FOUND);
     BOOST_CHECK_EQUAL(last.witness->leaf.Available(rusd), static_cast<Atoms>(SLOTS));
 }

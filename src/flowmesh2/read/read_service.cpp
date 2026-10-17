@@ -214,10 +214,19 @@ Result<void> ReadService::Publish(const DurableApplied& applied, std::shared_ptr
 
 Result<ReadHandle> ReadService::Acquire() const
 {
+    // Read "published" before acquiring: m_last is set only after the C1
+    // publish, and a C1 view never disappears, so once it is set a failed
+    // Acquire can only mean that every permit is held. Checking it after a
+    // failed Acquire would report BUSY for a publication that landed in
+    // between (found by the 4-reader test).
+    bool any_published{false};
+    {
+        LOCK(m_archive_mutex);
+        any_published = m_last.has_value();
+    }
     std::optional<ReadLease> lease{m_slot.Acquire()};
     if (!lease) {
-        LOCK(m_archive_mutex);
-        if (!m_last) return Error{ErrorCode::NEED_DATA, READ_NOTHING_PUBLISHED};
+        if (!any_published) return Error{ErrorCode::NEED_DATA, READ_NOTHING_PUBLISHED};
         return Error{ErrorCode::BUSY, READ_NO_PERMIT};
     }
     const PublishedEnvelope& published{lease->View()};
