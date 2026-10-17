@@ -3,7 +3,8 @@
 //!   B3_HIVE_B3COIND=/path/to/b3coind cargo test --test node_regtest -- --test-threads=1
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::Duration;
 
 use serde_json::json;
@@ -79,6 +80,47 @@ fn starts_reports_ready_and_stops() {
     }
     test.node.stop(Duration::from_secs(120));
     assert!(test.node.has_exited());
+}
+
+#[test]
+fn follow_reports_new_blocks_and_an_exit() {
+    let Some((test, status)) = TestNode::start("follow") else {
+        return;
+    };
+    assert!(
+        matches!(status, NodeStatus::Ready { .. }),
+        "not ready: {status:?}"
+    );
+    let (tx, rx) = mpsc::channel();
+    let node = Arc::clone(&test.node);
+    let follower = thread::spawn(move || {
+        node.follow(Duration::from_millis(100), |s| {
+            let _ = tx.send(s.clone());
+        })
+    });
+    let next = || {
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("a status change")
+    };
+
+    let admin = test.admin();
+    admin.call("createwallet", json!(["follow"])).unwrap();
+    let to = admin
+        .call_wallet("follow", "getnewaddress", json!([]))
+        .unwrap();
+    admin.call("generatetoaddress", json!([1, to])).unwrap();
+    match next() {
+        NodeStatus::Ready { blocks, .. } => assert_eq!(blocks, 1),
+        other => panic!("expected the new tip, got {other:?}"),
+    }
+
+    // A stop that the app did not ask for, as from the console.
+    admin.call("stop", json!([])).unwrap();
+    match next() {
+        NodeStatus::Failed { error } => assert!(error.contains("stopped"), "{error}"),
+        other => panic!("expected the exit, got {other:?}"),
+    }
+    follower.join().unwrap();
 }
 
 #[test]

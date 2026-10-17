@@ -71,8 +71,12 @@ function badge(state: "unlocked" | "locked" | "no-node" | "no-wallet", text: str
   el("node-badge-text").textContent = text;
 }
 
+// A failure after the node was running is a stop or a crash, not a start error.
+let wasReady = false;
+
 function render(status: NodeStatus): void {
   const ready = status.phase === "ready";
+  wasReady ||= ready;
   el("chain").hidden = !ready;
   switch (status.phase) {
     case "starting":
@@ -93,7 +97,7 @@ function render(status: NodeStatus): void {
       badge("locked", "Stopping");
       break;
     case "failed":
-      showBanner("danger", "The node could not start", status.error);
+      showBanner("danger", wasReady ? "The node stopped" : "The node could not start", status.error);
       badge("no-node", "Not running");
       el("wallet").hidden = true;
       break;

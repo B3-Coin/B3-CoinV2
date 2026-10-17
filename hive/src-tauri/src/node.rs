@@ -1,5 +1,6 @@
 //! Supervises the bundled b3coind: starts it with per-launch credentials on a
-//! free loopback port, follows init through the warmup error, and stops it.
+//! free loopback port, follows init through the warmup error, follows the
+//! running node's tip until it exits, and stops it.
 //!
 //! Spike scope: regtest only, with no peers (-listen=0 -connect=0 -dnsseed=0),
 //! so development never touches a real B3 network or datadir.
@@ -191,6 +192,32 @@ impl Node {
         }
     }
 
+    /// Follows a ready node until it exits or `stop` is called: every
+    /// `interval` it reads the tip, and reports new blocks and an exit to
+    /// `on_change`. A slow reply from a live process keeps the last status.
+    pub fn follow(&self, interval: Duration, mut on_change: impl FnMut(&NodeStatus)) {
+        let Some(client) = &self.client else { return };
+        loop {
+            thread::sleep(interval);
+            if matches!(self.status(), NodeStatus::Stopping) {
+                return;
+            }
+            let next = match client.call("getblockchaininfo", json!([])) {
+                Ok(info) => ready_status(&info),
+                Err(_) => match self.exit_status() {
+                    Some(exit) => NodeStatus::Failed {
+                        error: self.exit_message(&exit),
+                    },
+                    None => continue,
+                },
+            };
+            self.set_status(next, &mut on_change);
+            if !matches!(self.status(), NodeStatus::Ready { .. }) {
+                return;
+            }
+        }
+    }
+
     /// Asks b3coind to stop, waits for it to exit, and kills it after `timeout`.
     pub fn stop(&self, timeout: Duration) {
         let mut guard = self.child.lock().unwrap();
@@ -217,9 +244,10 @@ impl Node {
         self.exit_status().is_some() || self.child.lock().unwrap().is_none()
     }
 
+    /// Stopping is final: a poll that raced with `stop` must not undo it.
     fn set_status(&self, next: NodeStatus, on_change: &mut impl FnMut(&NodeStatus)) {
         let mut current = self.status.lock().unwrap();
-        if *current != next {
+        if *current != next && !matches!(*current, NodeStatus::Stopping) {
             *current = next.clone();
             drop(current);
             on_change(&next);
@@ -238,7 +266,10 @@ impl Node {
         let tail = self.stderr_tail.lock().unwrap();
         let said = String::from_utf8_lossy(&tail);
         let said = said.trim();
-        if said.is_empty() {
+        if said.is_empty() && exit.success() {
+            // For example after `stop` in the console.
+            "b3coind stopped. Restart B3 Hive to start it again.".into()
+        } else if said.is_empty() {
             format!(
                 "b3coind exited ({exit}); see debug.log in {}",
                 self.datadir.display()

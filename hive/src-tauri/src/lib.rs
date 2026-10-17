@@ -26,6 +26,8 @@ use rpc::RpcError;
 
 const START_TIMEOUT: Duration = Duration::from_secs(600);
 const STOP_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often the running node's tip is read for the main window.
+const FOLLOW_INTERVAL: Duration = Duration::from_secs(2);
 const MAIN: &str = "main";
 const APPROVAL: &str = "approval";
 const CONSOLE: &str = "console";
@@ -381,9 +383,12 @@ pub fn run() {
             }));
             let handle = app.handle().clone();
             thread::spawn(move || {
-                node.wait_ready(START_TIMEOUT, |status| {
+                let emit = |status: &NodeStatus| {
                     let _ = handle.emit_to(MAIN, "node-status", status);
-                });
+                };
+                if let NodeStatus::Ready { .. } = node.wait_ready(START_TIMEOUT, emit) {
+                    node.follow(FOLLOW_INTERVAL, emit);
+                }
             });
             Ok(())
         })
