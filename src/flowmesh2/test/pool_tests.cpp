@@ -484,6 +484,11 @@ BOOST_AUTO_TEST_CASE(on_committed_refusals_change_nothing)
     SlotBody short_body{body};
     short_body.originals.pop_back();
     RequireFailure(r.pool->OnCommitted(head, outcomes, short_body), ErrorCode::INVALID_INPUT, admission::POOL_BODY_MISMATCH, "original dropped");
+    // Body: an original replaced by another valid one (same count, another actions_root).
+    SlotBody replaced{body};
+    replaced.originals[0] = SmallPlace(a, "carol", 2);
+    RequireFailure(r.pool->OnCommitted(head, outcomes, replaced), ErrorCode::INVALID_INPUT, admission::POOL_BODY_MISMATCH,
+                   "original replaced");
     // A malformed original under a header that names it.
     SlotBody garbage{body};
     garbage.originals[0] = {0x01, 0x02};

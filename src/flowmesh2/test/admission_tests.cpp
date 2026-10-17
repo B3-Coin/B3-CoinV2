@@ -587,6 +587,59 @@ BOOST_AUTO_TEST_CASE(a_stale_snapshot_is_checked_again)
     r.budget.fail = false;
 }
 
+BOOST_AUTO_TEST_CASE(a9_finds_an_action_included_before_the_pool_existed)
+{
+    // A pool created after the including slot (a restart; the pool is not persisted) holds no record,
+    // so A3 cannot answer; A9 finds the inclusion in the read service's outcome index (O-71).
+    AdmissionRig r;
+    r.Fund();
+    SlotFixture& a{r.Actions()};
+    const Frame x{PlaceAt(a, "alice", 1, 1, 16)};
+    r.SealOriginals({}, {x}); // head 2 includes x
+    std::unique_ptr<admission::ActionPool> fresh{NewPool(PoolLimits::FromProfile(r.profile), r.profile, r.Height())};
+    TestBudget budget;
+    std::unique_ptr<admission::Admission> restarted{NewAdmission(r.profile, *r.rig.owner, *r.read, *fresh, budget)};
+    const AdmissionStats before{restarted->Stats()};
+    Result<AdmissionReply> reply{restarted->Admit(x)};
+    RequireOk(reply, "Admit after a restart");
+    RequireCode(*reply, AdmissionCode::DUPLICATE, "x after a restart");
+    RequireOneReply(before, restarted->Stats(), AdmissionCode::DUPLICATE, 1, "x after a restart (verified first)");
+    BOOST_REQUIRE(reply->included.has_value());
+    BOOST_CHECK_EQUAL(reply->included->height, 2U);
+    BOOST_REQUIRE(reply->outcome.has_value());
+    BOOST_CHECK(reply->outcome->ref == *reply->included);
+    BOOST_CHECK_EQUAL(fresh->Size(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(a_read_service_that_cannot_answer_does_not_refuse)
+{
+    // Before the first publication the read service answers NEED_DATA, and with every permit held BUSY;
+    // neither is a refusal of the action (O-74): the snapshot still decides.
+    AdmissionRig r;
+    // Slot 1 is applied by the owner and shown to the pool, but not published.
+    state::Candidate candidate{r.rig.Preview(r.rig.Inputs(FundingFacts(r.rig.actions), {}))};
+    const SlotBody body{candidate.Body()};
+    PublishableSlot slot1{r.rig.Commit(std::move(candidate))};
+    RequireOk(r.pool->OnCommitted(*slot1.slot.head, slot1.slot.outcomes, body), "OnCommitted(1)");
+    BOOST_REQUIRE(!r.read->PublishedHeight().has_value());
+    SlotFixture& a{r.Actions()};
+    const Frame first{PlaceAt(a, "alice", 1, 1, 16)};
+    Step(r, first, AdmissionCode::ADMITTED, 1, "nothing published yet");
+    Step(r, PlaceAt(a, "alice", 2, 1, 16), AdmissionCode::ADMITTED, 1, "nothing published yet, again");
+    // Publish slot 1, then hold every reader permit.
+    Publish(*r.read, slot1);
+    std::vector<read::ReadHandle> held;
+    for (size_t i{0}; i < r.read->Limits().max_readers; ++i) {
+        Result<read::ReadHandle> handle{r.read->Acquire()};
+        RequireOk(handle, "Acquire");
+        held.push_back(std::move(handle).value());
+    }
+    RequireError(r.read->Acquire(), ErrorCode::BUSY, "every permit held");
+    Step(r, PlaceAt(a, "bob", 1, 1, 16), AdmissionCode::ADMITTED, 1, "read service busy");
+    Step(r, PlaceAt(a, "alice", 1, 1, 16, /*price=*/2), AdmissionCode::NONCE_PENDING, 1, "read service busy, nonce pending");
+    Step(r, first, AdmissionCode::DUPLICATE, 0, "read service busy, exact resend");
+}
+
 BOOST_AUTO_TEST_CASE(walking_skeleton_admission_checks)
 {
     // ARCHITECTURE.md section 14: P1, N1, N2, N3 (the pool and read side), N4, N5, N6, N8, N9, N12.
