@@ -2,14 +2,11 @@
 // the Qt console. Only the filtered form of each line (secrets replaced by
 // "(…)") is shown back or kept in the history.
 import { invoke } from "@tauri-apps/api/core";
+import { el, initTheme } from "../shared/ui";
 
 type Reply = { command: string; ok: boolean; output: string };
 
-function el<T extends HTMLElement>(id: string): T {
-  const node = document.getElementById(id);
-  if (!node) throw new Error(`missing #${id}`);
-  return node as T;
-}
+await initTheme();
 
 const log = el("log");
 const input = el<HTMLInputElement>("line");

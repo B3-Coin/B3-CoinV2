@@ -1,6 +1,7 @@
 // The approval window. It shows only what the core decoded from the draft it
 // holds, and its only powers are reading that draft and deciding on it.
 import { invoke } from "@tauri-apps/api/core";
+import { el, formatAmount, initTheme, sumAmounts } from "../shared/ui";
 
 type OutputLine = { address: string; amount: string; change: boolean };
 type DraftView = {
@@ -8,29 +9,51 @@ type DraftView = {
   summary: { chain: string; wallet: string; txid: string; outputs: OutputLine[]; fee: string };
 };
 
-function el<T extends HTMLElement>(id: string): T {
-  const node = document.getElementById(id);
-  if (!node) throw new Error(`missing #${id}`);
-  return node as T;
+await initTheme();
+
+function row(key: string, value: string, address?: string): HTMLElement {
+  const drow = document.createElement("div");
+  drow.className = "drow";
+  const k = document.createElement("span");
+  k.className = "dkey";
+  k.textContent = key;
+  if (address !== undefined) {
+    const line = document.createElement("span");
+    line.className = "addr-line";
+    line.textContent = address;
+    k.append(line);
+  }
+  const v = document.createElement("span");
+  v.className = "dval amt";
+  v.textContent = value;
+  drow.append(k, v);
+  return drow;
 }
 
 function show(draft: DraftView | null): void {
   el("empty").hidden = draft !== null;
   el("draft").hidden = draft === null;
+  el("error").hidden = true;
   if (!draft) return;
   const s = draft.summary;
-  el("chain").textContent = s.chain;
-  el("wallet").textContent = s.wallet;
-  el("fee").textContent = `${s.fee} B3`;
-  el("txid").textContent = s.txid;
-  const list = el("outputs");
-  list.replaceChildren(
-    ...s.outputs.map((o) => {
-      const item = document.createElement("li");
-      item.textContent = `${o.amount} B3 to ${o.address}${o.change ? " (change back to this wallet)" : ""}`;
-      return item;
-    }),
+  const paid = s.outputs.filter((o) => !o.change);
+  const sent = sumAmounts(paid.map((o) => o.amount));
+  const total = sumAmounts([...paid.map((o) => o.amount), s.fee]);
+
+  // The title restates what leaves the wallet, as b3_docker's confirmations do.
+  el("title").textContent = sent === null ? "Approve this payment?" : `Send ${formatAmount(sent)}?`;
+  el("from").textContent = `From wallet ${s.wallet} on ${s.chain}`;
+  // Payments first, change last, so the money leaving reads first.
+  const ordered = [...paid, ...s.outputs.filter((o) => o.change)];
+  el("outputs").replaceChildren(
+    ...ordered.map((o) =>
+      row(o.change ? "Change back to this wallet" : "Pay", formatAmount(o.amount, 9), o.address),
+    ),
   );
+  el("fee").textContent = formatAmount(s.fee, 9);
+  el("total").textContent = total === null ? "—" : formatAmount(total, 9);
+  el("chain").textContent = s.chain;
+  el("txid").textContent = s.txid;
 }
 
 let current: DraftView | null = null;
@@ -49,6 +72,7 @@ async function decide(approve: boolean): Promise<void> {
     current = await invoke<DraftView | null>("approval_decide", { id: current.id, approve });
     show(current);
   } catch (e) {
+    el("error").hidden = false;
     el("error").textContent = String(e);
   } finally {
     setBusy(false);

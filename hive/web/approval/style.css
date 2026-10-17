@@ -1,75 +1,12 @@
-:root {
-  color-scheme: dark light;
-  font-family: system-ui, sans-serif;
-  background: #1c1b19;
-  color: #f2efe8;
-}
+/* The approval window is one confirmation dialog filling its own window:
+   the modal parts from components.css without the backdrop. */
 
-main {
-  padding: 0 1.25rem 1.25rem;
-}
+.approval { height: 100dvh; display: flex; flex-direction: column; background: var(--bg-card); }
+.approval-draft { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.approval .modal-head { padding-top: var(--space-5); }
+.approval .modal-body { overflow-y: auto; }
+.approval .empty { margin-block: auto; }
 
-h1 {
-  font-size: 1.25rem;
-}
-
-h2 {
-  font-size: 1rem;
-  margin-bottom: 0.25rem;
-}
-
-.warning {
-  color: #f0c060;
-}
-
-.error {
-  color: #ff8a80;
-}
-
-dl {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.25rem 1rem;
-}
-
-dd,
-li {
-  margin: 0;
-  font-family: ui-monospace, monospace;
-  overflow-wrap: anywhere;
-}
-
-ul {
-  padding-left: 1.1rem;
-}
-
-li {
-  margin-bottom: 0.5rem;
-}
-
-.actions {
-  display: flex;
-  gap: 0.75rem;
-  justify-content: flex-end;
-  margin-top: 1rem;
-}
-
-button {
-  font: inherit;
-  padding: 0.5rem 1rem;
-  border-radius: 6px;
-  border: 1px solid #6b665c;
-  background: transparent;
-  color: inherit;
-  min-height: 44px;
-}
-
-button.primary {
-  background: #e0a526;
-  border-color: #e0a526;
-  color: #1c1b19;
-}
-
-button:disabled {
-  opacity: 0.5;
-}
+/* Output lines: the amount on the right, the address under its label. */
+.approval .drow .dkey { flex: none; }
+.approval .addr-line { display: block; margin-top: 2px; font-family: var(--font-mono); font-size: var(--text-xs); word-break: break-all; color: var(--text); }

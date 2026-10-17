@@ -1,33 +1,44 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Console – B3 Hive</title>
+    <link rel="stylesheet" href="./shared/css/hive.css" />
     <link rel="stylesheet" href="./console/style.css" />
   </head>
   <body>
-    <header>
-      <label>Wallet
-        <select id="wallet"></select>
-      </label>
-      <button id="clear" type="button" title="Clear (Ctrl+L)">Clear</button>
-    </header>
-    <div id="log" role="log" aria-live="polite"></div>
-    <form id="prompt" autocomplete="off">
-      <span aria-hidden="true">&gt;</span>
-      <input
-        id="line"
-        spellcheck="false"
-        aria-label="Command"
-        role="combobox"
-        aria-autocomplete="list"
-        aria-controls="completions"
-        aria-expanded="false"
-        autofocus
-      />
-      <ul id="completions" role="listbox" aria-label="Commands" hidden></ul>
-    </form>
+    <div class="console">
+      <header class="console-bar">
+        <div class="row">
+          <svg class="i accent" aria-hidden="true"><use href="/icons.svg#i-terminal" /></svg>
+          <strong>Console</strong>
+        </div>
+        <div class="row">
+          <label class="row t-sm muted" for="wallet">Wallet</label>
+          <select class="select select-sm" id="wallet"></select>
+          <button class="btn btn-ghost btn-sm" id="clear" type="button" title="Clear (Ctrl+L)">
+            <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-trash" /></svg><span>Clear</span>
+          </button>
+        </div>
+      </header>
+      <div id="log" role="log" aria-live="polite"></div>
+      <form id="prompt" autocomplete="off">
+        <span class="console-prompt" aria-hidden="true">&gt;</span>
+        <input
+          class="input input-mono"
+          id="line"
+          spellcheck="false"
+          aria-label="Command"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-controls="completions"
+          aria-expanded="false"
+          autofocus
+        />
+        <ul id="completions" role="listbox" aria-label="Commands" hidden></ul>
+      </form>
+    </div>
     <script type="module" src="./console/main.ts"></script>
   </body>
 </html>
