@@ -125,8 +125,18 @@ REGTEST-only `fm2_dev` library with a scripted fake chain and the k = 1
 dev certifier, which writes `ACCEPTED_PROPOSAL`, `INTENT`, `SIGNED_VOTE`
 and `DECISION` in barrier order with both authority checks; PBFT, the
 leader schedule, inclusion lists, the restart fence, the evidence store
-and the b3d adapters are typed stubs. Nothing is linked into the node,
-wallet or Qt.
+and the b3d adapters are typed stubs; and **R11**, certified reads in
+`read/`: an immutable `SlotView` per committed slot (header, certificate,
+outcomes, v0 account leaves with their tree levels, action and order-fill
+indexes), and the `ReadService`, which publishes only after B-APPLIED
+(`Publish` takes the slot's `DurableApplied` token) a header-and-certificate
+envelope into the C1 `ReadSlot` and answers `Account`, `Action` (INCLUDED,
+EXPIRED only with a proof, or UNKNOWN) and `OrderFills` from one lease per
+reply with the label `CERTIFIED`; and b3verify in the new library
+`fm2_verify`, which links no application code and checks certificates,
+outcomes, leaves, fills, balance transitions and EXPIRED proofs with the
+engine's own spec functions; liability paths, checkpoints and anchor proofs
+are typed stubs. Nothing is linked into the node, wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -138,8 +148,8 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R10: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 370 cases, `flowmesh2_inventory`,
+Expected after R11: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 401 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
 `flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`
 with four controls). The file journal tests write only under
