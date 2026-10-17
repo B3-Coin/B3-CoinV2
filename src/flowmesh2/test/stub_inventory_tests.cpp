@@ -58,6 +58,8 @@
  * M4-ADM-01 to probe admission's batch path (Admission::AdmitBatch) and
  * M2-LED-05, M2-LED-06 and M3-ENG-09 to probe admission's kind rule
  * (KindAdmissible, whose Unsupported refusals become UNSUPPORTED_KIND).
+ * Slice R13 adds the client API's HTTPS + SSE transport (M5-API-01) and
+ * streams (M5-API-02, InProcessApi::Subscribe).
  */
 
 #include <boost/test/unit_test.hpp>
@@ -82,6 +84,9 @@
 #include <flowmesh2/engine/residual.h>
 #include <flowmesh2/ledger/ledger.h>
 #include <flowmesh2/ledger/state_commitment.h>
+#include <flowmesh2/net/client_api.h>
+#include <flowmesh2/net/https_sse_api.h>
+#include <flowmesh2/net/in_process_api.h>
 #include <flowmesh2/state/candidate.h>
 #include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
@@ -93,6 +98,7 @@
 #include <flowmesh2/storage/snapshot_store.h>
 #include <flowmesh2/test/util/admission_fixtures.h>
 #include <flowmesh2/test/util/agreement_fixtures.h>
+#include <flowmesh2/test/util/api_fixtures.h>
 #include <flowmesh2/test/util/storage_fixtures.h>
 #include <flowmesh2/test/util/verify_fixtures.h>
 #include <flowmesh2/verify/b3verify.h>
@@ -647,6 +653,20 @@ FM2_STUB_CASE(M7_ADP_02, "M7-ADP-02")
 {
     const StubCertified c;
     return Observe(verify::VerifyAnchorProof(c.header, verify::AnchorProof{c.header.anchor, {}, {}}));
+}
+
+// ---- Slice R13: net/ client API ----
+
+FM2_STUB_CASE(M5_API_01, "M5-API-01")
+{
+    ApiRig rig;
+    return Observe(net::HttpsSseApi::Create(net::HttpsSseConfig{}, *rig.api));
+}
+
+FM2_STUB_CASE(M5_API_02, "M5-API-02")
+{
+    ApiRig rig;
+    return Observe(rig.api->Subscribe(net::StreamRequest{}));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

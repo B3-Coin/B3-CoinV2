@@ -97,7 +97,10 @@ if(BUILD_FLOWMESH2)
   # read service over the C1 ReadSlot, in namespace flowmesh2::read; the
   # C1 library flowmesh2_foundations joins here (unchanged; guard rule 6).
   # admission/ (slice R12): admission A0..A10, the bounded action pool
-  # and the budget policy interface, in namespace flowmesh2::admission. Later slices add the other application
+  # and the budget policy interface, in namespace flowmesh2::admission.
+  # net/ (slice R13): the service lanes over C1 BoundedMailboxes, the
+  # client API contract, the in-process API and the HTTPS + SSE stub, in
+  # namespace flowmesh2::net. Later slices add the other application
   # directories here. fm2_verify never links it (guard rule 4), and it
   # never links bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
@@ -119,6 +122,10 @@ if(BUILD_FLOWMESH2)
     ledger/ledger.cpp
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
+    net/client_api.cpp
+    net/https_sse_api.cpp
+    net/in_process_api.cpp
+    net/lanes.cpp
     read/read_service.cpp
     read/views.cpp
     state/candidate.cpp
@@ -214,7 +221,9 @@ if(BUILD_FLOWMESH2)
     test/file_journal_tests.cpp
     test/hashes_tests.cpp
     test/ids_tests.cpp
+    test/in_process_api_tests.cpp
     test/journal_tests.cpp
+    test/lanes_tests.cpp
     test/ledger_property_tests.cpp
     test/ledger_tests.cpp
     test/market_tests.cpp
