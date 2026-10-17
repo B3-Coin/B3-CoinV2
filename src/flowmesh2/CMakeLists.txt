@@ -96,10 +96,12 @@ if(BUILD_FLOWMESH2)
   # flowmesh2::agreement. read/ (slice R11): immutable slot views and the
   # read service over the C1 ReadSlot, in namespace flowmesh2::read; the
   # C1 library flowmesh2_foundations joins here (unchanged; guard rule 6).
-  # Later slices add the other application directories here. fm2_verify
-  # never links it (guard rule 4), and it never links bitcoin_common (guard
-  # rule 4).
+  # admission/ (slice R12): the bounded action pool, in namespace
+  # flowmesh2::admission. Later slices add the other application
+  # directories here. fm2_verify never links it (guard rule 4), and it
+  # never links bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
+    admission/pool.cpp
     agreement/evidence.cpp
     agreement/inclusion.cpp
     agreement/leader.cpp
@@ -218,6 +220,7 @@ if(BUILD_FLOWMESH2)
     test/nonce_window_tests.cpp
     test/outcome_tests.cpp
     test/params_tests.cpp
+    test/pool_tests.cpp
     test/read_tests.cpp
     test/record_tests.cpp
     test/replay_tests.cpp
