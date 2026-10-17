@@ -54,11 +54,12 @@
  * Build and Check), the restart fence (M4-AGR-06) and the evidence store
  * (M4-AGR-07; Record and Load). Slice R11 adds the three b3verify stubs:
  * liability paths (M5-VFY-03), checkpoints (M8-CKP-01) and anchor proofs
- * (M7-ADP-02).
+ * (M7-ADP-02). Slice R12 adds the credit budget (M4-ADM-02).
  */
 
 #include <boost/test/unit_test.hpp>
 
+#include <flowmesh2/admission/budget.h>
 #include <flowmesh2/agreement/evidence.h>
 #include <flowmesh2/agreement/inclusion.h>
 #include <flowmesh2/agreement/leader.h>
@@ -356,6 +357,13 @@ FM2_STUB_CASE(M4_STO_05, "M4-STO-05")
 FM2_STUB_CASE(M4_ADM_01, "M4-ADM-01")
 {
     return Observe(BatchVerifier{}.VerifyBatch({}));
+}
+
+// ---- Slice R12: admission/budget ----
+
+FM2_STUB_CASE(M4_ADM_02, "M4-ADM-02")
+{
+    return Observe(admission::CreditBudget::Create(admission::CreditBudgetParams{}, RegtestProfile()));
 }
 
 // ---- Slice R4: core/facts stub kinds ----

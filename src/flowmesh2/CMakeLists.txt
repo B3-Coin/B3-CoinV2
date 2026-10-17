@@ -96,11 +96,12 @@ if(BUILD_FLOWMESH2)
   # flowmesh2::agreement. read/ (slice R11): immutable slot views and the
   # read service over the C1 ReadSlot, in namespace flowmesh2::read; the
   # C1 library flowmesh2_foundations joins here (unchanged; guard rule 6).
-  # admission/ (slice R12): the bounded action pool, in namespace
-  # flowmesh2::admission. Later slices add the other application
+  # admission/ (slice R12): the bounded action pool and the budget
+  # policy interface, in namespace flowmesh2::admission. Later slices add the other application
   # directories here. fm2_verify never links it (guard rule 4), and it
   # never links bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
+    admission/budget.cpp
     admission/pool.cpp
     agreement/evidence.cpp
     agreement/inclusion.cpp
@@ -162,12 +163,13 @@ if(BUILD_FLOWMESH2)
 
   # dev/ (slice R10): REGTEST-only dev components, in namespace
   # flowmesh2::dev: the scripted fake chain adapter and the k = 1 dev
-  # certifier (O-10). Every dev header has
+  # certifier (O-10); since slice R12 also the unlimited dev budget. Every dev header has
   # #error unless FM2_DEV_COMPONENTS is defined, and fm2_dev defines it
   # PUBLIC, so only targets that link fm2_dev (the tests, later the
   # simulator) can include one. fm2_core never links fm2_dev, and guard rule
   # 3 fails if fm2_core or fm2_verify defines a dev symbol.
   add_library(fm2_dev STATIC
+    dev/dev_budget.cpp
     dev/dev_certifier.cpp
     dev/fake_chain.cpp
   )
@@ -190,6 +192,7 @@ if(BUILD_FLOWMESH2)
     test/authority_tests.cpp
     test/body_tests.cpp
     test/book_tests.cpp
+    test/budget_tests.cpp
     test/candidate_tests.cpp
     test/canonical_order_tests.cpp
     test/certificate_tests.cpp
