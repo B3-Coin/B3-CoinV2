@@ -205,12 +205,20 @@ if(BUILD_FLOWMESH2)
   # sim/ (slice R14): the deterministic simulator and the walking skeleton,
   # in namespace flowmesh2::sim. FakeClock and the seeded Scheduler are the
   # only clock and randomness of a run; the TraceRecorder observes the
-  # journals, the seat signer and the chain authority. Not a deterministic
-  # directory by guard rule (it owns the seeded FastRandomContext), and like
-  # dev/ and test/ it may sign (guard rule 7). Nothing outside the tests and
-  # the fm2-sim CLI links it.
+  # journals, the seat signer and the chain authority; SimNode composes one
+  # node from the real components and the REGTEST dev certifier; SimClient
+  # keeps exact signed bytes and verifies with b3verify (fm2_verify);
+  # scenario runs the walking skeleton of ARCHITECTURE.md section 14. Not a
+  # deterministic directory by guard rule (it owns the seeded
+  # FastRandomContext), and like dev/ and test/ it may sign (guard rule 7).
+  # bitcoin_common only for CKey (the clients' TEST keys). Nothing outside
+  # the tests and the fm2-sim CLI links it.
   add_library(fm2_simlib STATIC
+    sim/cluster.cpp
+    sim/scenario.cpp
     sim/scheduler.cpp
+    sim/sim_client.cpp
+    sim/sim_node.cpp
     sim/trace.cpp
   )
   target_link_libraries(fm2_simlib
@@ -220,7 +228,17 @@ if(BUILD_FLOWMESH2)
     PUBLIC
       fm2_dev
       fm2_core
+      fm2_verify
+      bitcoin_common
+      secp256k1
   )
+
+  # The fm2-sim CLI (slice R14): runs the walking-skeleton variants over a
+  # seed range and prints sorted-key JSON; exit 0 only if every manifest
+  # check ran and passed.
+  add_executable(fm2_sim_cli sim/fm2_sim_main.cpp)
+  set_target_properties(fm2_sim_cli PROPERTIES OUTPUT_NAME fm2-sim)
+  target_link_libraries(fm2_sim_cli PRIVATE core_interface fm2_warnings fm2_simlib)
 
   # Boost.Test suite of the outline. Every case is listed in test/INVENTORY.txt.
   add_executable(test_flowmesh2
@@ -278,6 +296,7 @@ if(BUILD_FLOWMESH2)
     test/signer_log_tests.cpp
     test/sim_scheduler_tests.cpp
     test/sim_trace_tests.cpp
+    test/sim_walking_skeleton_tests.cpp
     test/slot_tests.cpp
     test/state_owner_tests.cpp
     test/state_root_tests.cpp
@@ -312,6 +331,19 @@ if(BUILD_FLOWMESH2)
   )
 
   set(FM2_CONTRIB ${PROJECT_SOURCE_DIR}/contrib/flowmesh2)
+
+  # The simulator (slice R14): every variant for seeds 1..32 must pass its
+  # manifest, and two CLI runs must print the same bytes.
+  add_test(NAME flowmesh2_sim COMMAND fm2_sim_cli --scenario all --seeds 1-32)
+  set_tests_properties(flowmesh2_sim PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;outline;sim")
+  add_test(NAME flowmesh2_sim_cli_determinism
+    COMMAND ${CMAKE_COMMAND}
+      -DSIM=$<TARGET_FILE:fm2_sim_cli>
+      -DWORKDIR=${FM2_TEST_TMP}/sim_determinism
+      "-DSIM_ARGS=--scenario;all;--seeds;1-8"
+      -P ${FM2_CONTRIB}/sim_determinism.cmake
+  )
+  set_tests_properties(flowmesh2_sim_cli_determinism PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;outline;sim")
 
   add_test(NAME flowmesh2_unit COMMAND test_flowmesh2 --log_level=test_suite)
   set_tests_properties(flowmesh2_unit PROPERTIES TIMEOUT 120 LABELS "flowmesh2;isolated;outline")

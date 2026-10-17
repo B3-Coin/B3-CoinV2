@@ -104,7 +104,9 @@
 #include <flowmesh2/net/sentry.h>
 #include <flowmesh2/net/short_id.h>
 #include <flowmesh2/net/tcp_mesh.h>
+#include <flowmesh2/sim/cluster.h>
 #include <flowmesh2/sim/faults.h>
+#include <flowmesh2/sim/trace.h>
 #include <flowmesh2/state/candidate.h>
 #include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
@@ -707,7 +709,10 @@ FM2_STUB_CASE(M5_API_02, "M5-API-02")
 
 FM2_STUB_CASE(M4_SIM_01, "M4-SIM-01")
 {
-    return Observe(net::InProcessSeatMesh::Create(TestMeshConfig(0, 4), 4));
+    // R13: the in-process seat mesh; R14: a simulated cluster of more than one node.
+    sim::TraceRecorder trace;
+    return FirstDeviation("M4-SIM-01", {Observe(net::InProcessSeatMesh::Create(TestMeshConfig(0, 4), 4)),
+                                        Observe(sim::SimCluster::Create(4, sim::SimNodeConfig{}, trace))});
 }
 
 FM2_STUB_CASE(M4_NET_01, "M4-NET-01")
@@ -789,6 +794,12 @@ FM2_STUB_CASE(M4_SIM_02, "M4-SIM-02")
     std::vector<StubObservation> observed;
     for (const sim::FaultPlan& plan : plans) observed.push_back(Observe(sim::CheckFaultPlan(plan)));
     return FirstDeviation("M4-SIM-02", observed);
+}
+
+FM2_STUB_CASE(M4_SIM_03, "M4-SIM-03")
+{
+    sim::TraceRecorder trace;
+    return Observe(sim::SimCluster::CreateTwins(4, 1, sim::SimNodeConfig{}, trace));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
