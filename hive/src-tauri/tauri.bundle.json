@@ -2,7 +2,6 @@
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
     "active": true,
-    "targets": ["deb"],
     "externalBin": ["binaries/b3coind"]
   }
 }
