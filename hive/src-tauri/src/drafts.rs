@@ -49,19 +49,33 @@ pub struct DraftStore {
 }
 
 impl DraftStore {
-    pub fn insert(&mut self, summary: SendSummary, hex: String) -> Result<String, getrandom::Error> {
+    pub fn insert(
+        &mut self,
+        summary: SendSummary,
+        hex: String,
+    ) -> Result<String, getrandom::Error> {
         let mut nonce = [0u8; 8];
         getrandom::fill(&mut nonce)?;
         let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
         let id = format!("{:08}-{nonce}", self.next);
         self.next += 1;
-        self.drafts.insert(id.clone(), Draft { id: id.clone(), summary, hex });
+        self.drafts.insert(
+            id.clone(),
+            Draft {
+                id: id.clone(),
+                summary,
+                hex,
+            },
+        );
         Ok(id)
     }
 
     /// The oldest draft waiting for a decision.
     pub fn oldest(&self) -> Option<DraftView> {
-        self.drafts.values().next().map(|d| DraftView { id: d.id.clone(), summary: d.summary.clone() })
+        self.drafts.values().next().map(|d| DraftView {
+            id: d.id.clone(),
+            summary: d.summary.clone(),
+        })
     }
 
     /// Removes and returns the draft; a second take of the same id gets None.
@@ -84,7 +98,11 @@ mod tests {
             chain: "regtest".into(),
             wallet: "w".into(),
             txid: txid.into(),
-            outputs: vec![OutputLine { address: "a".into(), amount: "1.000000000".into(), change: false }],
+            outputs: vec![OutputLine {
+                address: "a".into(),
+                amount: "1.000000000".into(),
+                change: false,
+            }],
             fee: "0.000010000".into(),
         }
     }

@@ -17,14 +17,24 @@ const RPC_WALLET_ALREADY_LOADED: i64 = -35;
 /// Loads the spike wallet, creating it on first use.
 pub fn ensure_wallet(client: &Client) -> Result<(), RpcError> {
     let loaded = client.call("listwallets", json!([]))?;
-    if loaded.as_array().is_some_and(|w| w.iter().any(|n| n.as_str() == Some(SPIKE_WALLET))) {
+    if loaded
+        .as_array()
+        .is_some_and(|w| w.iter().any(|n| n.as_str() == Some(SPIKE_WALLET)))
+    {
         return Ok(());
     }
     match client.call("loadwallet", json!([SPIKE_WALLET])) {
-        Ok(_) | Err(RpcError::Rpc { code: RPC_WALLET_ALREADY_LOADED, .. }) => Ok(()),
-        Err(RpcError::Rpc { code: RPC_WALLET_NOT_FOUND, .. }) => {
-            client.call("createwallet", json!([SPIKE_WALLET])).map(|_| ())
-        }
+        Ok(_)
+        | Err(RpcError::Rpc {
+            code: RPC_WALLET_ALREADY_LOADED,
+            ..
+        }) => Ok(()),
+        Err(RpcError::Rpc {
+            code: RPC_WALLET_NOT_FOUND,
+            ..
+        }) => client
+            .call("createwallet", json!([SPIKE_WALLET]))
+            .map(|_| ()),
         Err(e) => Err(e),
     }
 }
@@ -39,7 +49,9 @@ pub fn balances(client: &Client) -> Result<(String, String), RpcError> {
 /// Regtest only: mines FUND_BLOCKS blocks to a fresh wallet address.
 pub fn fund_regtest(client: &Client) -> Result<(), RpcError> {
     let address = client.call_wallet(SPIKE_WALLET, "getnewaddress", json!([]))?;
-    client.call("generatetoaddress", json!([FUND_BLOCKS, address])).map(|_| ())
+    client
+        .call("generatetoaddress", json!([FUND_BLOCKS, address]))
+        .map(|_| ())
 }
 
 /// Accepts a positive B3 amount with at most 9 decimal places, exactly as
@@ -67,13 +79,22 @@ pub fn parse_amount(input: &str) -> Result<String, String> {
 
 /// Funds, signs and finalizes a send to `address`, then decodes the result.
 /// Nothing is broadcast: the caller stores the hex as a draft.
-pub fn prepare_send(client: &Client, chain: &str, address: &str, amount: &str) -> Result<(SendSummary, String), String> {
+pub fn prepare_send(
+    client: &Client,
+    chain: &str,
+    address: &str,
+    amount: &str,
+) -> Result<(SendSummary, String), String> {
     let amount = parse_amount(amount)?;
     let address = address.trim();
     if address.is_empty() {
         return Err("Enter a destination address.".into());
     }
-    let call = |method: &str, params: Value| client.call_wallet(SPIKE_WALLET, method, params).map_err(|e| e.to_string());
+    let call = |method: &str, params: Value| {
+        client
+            .call_wallet(SPIKE_WALLET, method, params)
+            .map_err(|e| e.to_string())
+    };
 
     // Amount goes over the wire as a string, so the node parses the exact digits.
     let mut output = serde_json::Map::new();
@@ -85,30 +106,57 @@ pub fn prepare_send(client: &Client, chain: &str, address: &str, amount: &str) -
 
     let signed = call("walletprocesspsbt", json!([psbt, true]))?;
     let psbt = signed["psbt"].as_str().ok_or("signing returned no PSBT")?;
-    let finalized = client.call("finalizepsbt", json!([psbt])).map_err(|e| e.to_string())?;
+    let finalized = client
+        .call("finalizepsbt", json!([psbt]))
+        .map_err(|e| e.to_string())?;
     if finalized["complete"].as_bool() != Some(true) {
         return Err("The wallet could not sign every input.".into());
     }
-    let hex = finalized["hex"].as_str().ok_or("finalizing returned no transaction")?.to_owned();
+    let hex = finalized["hex"]
+        .as_str()
+        .ok_or("finalizing returned no transaction")?
+        .to_owned();
 
-    let decoded = client.call("decoderawtransaction", json!([hex])).map_err(|e| e.to_string())?;
-    let txid = decoded["txid"].as_str().ok_or("decoded transaction has no txid")?.to_owned();
+    let decoded = client
+        .call("decoderawtransaction", json!([hex]))
+        .map_err(|e| e.to_string())?;
+    let txid = decoded["txid"]
+        .as_str()
+        .ok_or("decoded transaction has no txid")?
+        .to_owned();
     let mut outputs = Vec::new();
-    for out in decoded["vout"].as_array().ok_or("decoded transaction has no outputs")? {
+    for out in decoded["vout"]
+        .as_array()
+        .ok_or("decoded transaction has no outputs")?
+    {
         let n = out["n"].as_i64().unwrap_or(-2);
         outputs.push(OutputLine {
-            address: out["scriptPubKey"]["address"].as_str().unwrap_or("(no address)").to_owned(),
+            address: out["scriptPubKey"]["address"]
+                .as_str()
+                .unwrap_or("(no address)")
+                .to_owned(),
             amount: decimal(&out["value"]).map_err(|e| e.to_string())?,
             change: n == change_pos,
         });
     }
-    Ok((SendSummary { chain: chain.to_owned(), wallet: SPIKE_WALLET.to_owned(), txid, outputs, fee }, hex))
+    Ok((
+        SendSummary {
+            chain: chain.to_owned(),
+            wallet: SPIKE_WALLET.to_owned(),
+            txid,
+            outputs,
+            fee,
+        },
+        hex,
+    ))
 }
 
 /// Submits a draft's exact bytes; returns the txid the node reports.
 pub fn broadcast(client: &Client, hex: &str) -> Result<String, RpcError> {
     let txid = client.call("sendrawtransaction", json!([hex]))?;
-    txid.as_str().map(str::to_owned).ok_or_else(|| RpcError::BadReply("sendrawtransaction returned no txid".into()))
+    txid.as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| RpcError::BadReply("sendrawtransaction returned no txid".into()))
 }
 
 /// The node prints amounts as JSON numbers with 9 decimals; with serde_json's
@@ -116,7 +164,9 @@ pub fn broadcast(client: &Client, hex: &str) -> Result<String, RpcError> {
 fn decimal(v: &Value) -> Result<String, RpcError> {
     match v {
         Value::Number(n) => Ok(n.to_string()),
-        other => Err(RpcError::BadReply(format!("expected an amount, got {other}"))),
+        other => Err(RpcError::BadReply(format!(
+            "expected an amount, got {other}"
+        ))),
     }
 }
 
@@ -128,8 +178,24 @@ mod tests {
     fn amounts_are_taken_exactly_or_refused() {
         assert_eq!(parse_amount("1.5"), Ok("1.5".into()));
         assert_eq!(parse_amount("0.000000001"), Ok("0.000000001".into()));
-        assert_eq!(parse_amount("27226021.595212715"), Ok("27226021.595212715".into()));
-        for bad in ["", "0", "0.000", ".5", "5.", "1.0000000001", "-1", "+1", "1e3", "1,5", " 1", "12345678901"] {
+        assert_eq!(
+            parse_amount("27226021.595212715"),
+            Ok("27226021.595212715".into())
+        );
+        for bad in [
+            "",
+            "0",
+            "0.000",
+            ".5",
+            "5.",
+            "1.0000000001",
+            "-1",
+            "+1",
+            "1e3",
+            "1,5",
+            " 1",
+            "12345678901",
+        ] {
             assert!(parse_amount(bad).is_err(), "accepted {bad:?}");
         }
     }

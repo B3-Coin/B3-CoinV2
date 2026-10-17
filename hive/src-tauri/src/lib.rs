@@ -13,7 +13,10 @@ use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, Window,
+    WindowEvent,
+};
 
 use drafts::{DraftStore, DraftView};
 use node::{Node, NodeConfig, NodeStatus};
@@ -87,14 +90,23 @@ async fn dev_fund(core: State<'_, Arc<Core>>) -> Result<(), String> {
 /// Builds and signs the send, keeps it as a draft and opens the approval
 /// window. Nothing is broadcast here; the page only learns the draft id.
 #[tauri::command]
-async fn draft_send(app: AppHandle, core: State<'_, Arc<Core>>, address: String, amount: String) -> Result<String, String> {
+async fn draft_send(
+    app: AppHandle,
+    core: State<'_, Arc<Core>>,
+    address: String,
+    amount: String,
+) -> Result<String, String> {
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let client = core.node.client().ok_or("The node is not ready yet.")?;
         let chain = core.node.chain().unwrap_or_default();
         wallet::ensure_wallet(client).map_err(|e| e.to_string())?;
         let (summary, hex) = wallet::prepare_send(client, &chain, &address, &amount)?;
-        core.drafts.lock().unwrap().insert(summary, hex).map_err(|e| e.to_string())
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(summary, hex)
+            .map_err(|e| e.to_string())
     })
     .await?;
     open_approval(&app).map_err(|e| e.to_string())?;
@@ -104,7 +116,10 @@ async fn draft_send(app: AppHandle, core: State<'_, Arc<Core>>, address: String,
 // ---- approval window commands ----------------------------------------------
 
 #[tauri::command]
-fn approval_pending(window: Window, core: State<'_, Arc<Core>>) -> Result<Option<DraftView>, String> {
+fn approval_pending(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<Option<DraftView>, String> {
     require_approval_window(&window)?;
     Ok(core.drafts.lock().unwrap().oldest())
 }
@@ -122,7 +137,12 @@ async fn approval_decide(
 ) -> Result<Option<DraftView>, String> {
     require_approval_window(&window)?;
     let core = Arc::clone(&core);
-    let draft = core.drafts.lock().unwrap().take(&id).ok_or("This request was already decided.")?;
+    let draft = core
+        .drafts
+        .lock()
+        .unwrap()
+        .take(&id)
+        .ok_or("This request was already decided.")?;
     let result = if approve {
         let core = Arc::clone(&core);
         blocking(move || {
@@ -130,8 +150,14 @@ async fn approval_decide(
             Ok(wallet::broadcast(client, &draft.hex))
         })
         .await?
-        .map(|txid| DraftResult::Sent { id: id.clone(), txid })
-        .unwrap_or_else(|e| DraftResult::Failed { id: id.clone(), error: e.to_string() })
+        .map(|txid| DraftResult::Sent {
+            id: id.clone(),
+            txid,
+        })
+        .unwrap_or_else(|e| DraftResult::Failed {
+            id: id.clone(),
+            error: e.to_string(),
+        })
     } else {
         DraftResult::Rejected { id: id.clone() }
     };
@@ -170,8 +196,12 @@ fn open_approval(app: &AppHandle) -> tauri::Result<()> {
 }
 
 /// Runs blocking RPC work off the async runtime's threads.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
-    tauri::async_runtime::spawn_blocking(f).await.map_err(|e| e.to_string())?
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 // ---- startup ----------------------------------------------------------------
@@ -195,7 +225,10 @@ pub fn run() {
         .setup(|app| {
             let config = node_config(app)?;
             let node = Node::start(&config);
-            app.manage(Arc::new(Core { node: Arc::clone(&node), drafts: Mutex::new(DraftStore::default()) }));
+            app.manage(Arc::new(Core {
+                node: Arc::clone(&node),
+                drafts: Mutex::new(DraftStore::default()),
+            }));
             let handle = app.handle().clone();
             thread::spawn(move || {
                 node.wait_ready(START_TIMEOUT, |status| {
@@ -209,7 +242,11 @@ pub fn run() {
             if window.label() == APPROVAL && matches!(event, WindowEvent::Destroyed) {
                 let core = window.state::<Arc<Core>>();
                 for draft in core.drafts.lock().unwrap().take_all() {
-                    let _ = window.emit_to(MAIN, "draft-result", DraftResult::Rejected { id: draft.id });
+                    let _ = window.emit_to(
+                        MAIN,
+                        "draft-result",
+                        DraftResult::Rejected { id: draft.id },
+                    );
                 }
             }
         })

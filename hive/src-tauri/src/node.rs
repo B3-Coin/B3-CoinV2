@@ -41,10 +41,18 @@ const STDERR_TAIL: usize = 4096;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "phase", rename_all = "lowercase")]
 pub enum NodeStatus {
-    Starting { message: String },
-    Ready { chain: String, blocks: u64, best_block_hash: String },
+    Starting {
+        message: String,
+    },
+    Ready {
+        chain: String,
+        blocks: u64,
+        best_block_hash: String,
+    },
     Stopping,
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +79,9 @@ impl Node {
             Ok((child, client, port)) => Arc::new(Node {
                 child: Mutex::new(Some(child)),
                 client: Some(client),
-                status: Mutex::new(NodeStatus::Starting { message: "Starting b3coind".into() }),
+                status: Mutex::new(NodeStatus::Starting {
+                    message: "Starting b3coind".into(),
+                }),
                 stderr_tail,
                 datadir: config.datadir.clone(),
                 port,
@@ -116,23 +126,41 @@ impl Node {
 
     /// Polls until init finishes, the process dies or `timeout` passes, and
     /// reports every status change to `on_change`.
-    pub fn wait_ready(&self, timeout: Duration, mut on_change: impl FnMut(&NodeStatus)) -> NodeStatus {
-        let Some(client) = &self.client else { return self.status() };
+    pub fn wait_ready(
+        &self,
+        timeout: Duration,
+        mut on_change: impl FnMut(&NodeStatus),
+    ) -> NodeStatus {
+        let Some(client) = &self.client else {
+            return self.status();
+        };
         let deadline = Instant::now() + timeout;
         loop {
             let next = match client.call("getblockchaininfo", json!([])) {
                 Ok(info) => ready_status(&info),
-                Err(RpcError::Rpc { code: RPC_IN_WARMUP, message }) => NodeStatus::Starting { message },
+                Err(RpcError::Rpc {
+                    code: RPC_IN_WARMUP,
+                    message,
+                }) => NodeStatus::Starting { message },
                 Err(RpcError::Transport(_)) => match self.exit_status() {
-                    Some(exit) => NodeStatus::Failed { error: self.exit_message(&exit) },
-                    None => NodeStatus::Starting { message: "Waiting for b3coind to open RPC".into() },
+                    Some(exit) => NodeStatus::Failed {
+                        error: self.exit_message(&exit),
+                    },
+                    None => NodeStatus::Starting {
+                        message: "Waiting for b3coind to open RPC".into(),
+                    },
                 },
-                Err(other) => NodeStatus::Failed { error: other.to_string() },
+                Err(other) => NodeStatus::Failed {
+                    error: other.to_string(),
+                },
             };
             let next = match next {
-                NodeStatus::Starting { .. } if Instant::now() >= deadline => {
-                    NodeStatus::Failed { error: format!("b3coind did not finish starting within {}s", timeout.as_secs()) }
-                }
+                NodeStatus::Starting { .. } if Instant::now() >= deadline => NodeStatus::Failed {
+                    error: format!(
+                        "b3coind did not finish starting within {}s",
+                        timeout.as_secs()
+                    ),
+                },
                 next => next,
             };
             self.set_status(next.clone(), &mut on_change);
@@ -179,7 +207,11 @@ impl Node {
     }
 
     fn exit_status(&self) -> Option<std::process::ExitStatus> {
-        self.child.lock().unwrap().as_mut().and_then(|c| c.try_wait().ok().flatten())
+        self.child
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
     }
 
     fn exit_message(&self, exit: &std::process::ExitStatus) -> String {
@@ -187,7 +219,10 @@ impl Node {
         let said = String::from_utf8_lossy(&tail);
         let said = said.trim();
         if said.is_empty() {
-            format!("b3coind exited ({exit}); see debug.log in {}", self.datadir.display())
+            format!(
+                "b3coind exited ({exit}); see debug.log in {}",
+                self.datadir.display()
+            )
         } else {
             // e.g. the data directory lock error when another node holds it.
             format!("b3coind exited ({exit}): {said}")
@@ -195,10 +230,14 @@ impl Node {
     }
 }
 
-fn spawn(config: &NodeConfig, stderr_tail: &Arc<Mutex<Vec<u8>>>) -> Result<(Child, Client, u16), String> {
+fn spawn(
+    config: &NodeConfig,
+    stderr_tail: &Arc<Mutex<Vec<u8>>>,
+) -> Result<(Child, Client, u16), String> {
     std::fs::create_dir_all(&config.datadir)
         .map_err(|e| format!("cannot create {}: {e}", config.datadir.display()))?;
-    let credentials = Credentials::generate("hive").map_err(|e| format!("no system randomness: {e}"))?;
+    let credentials =
+        Credentials::generate("hive").map_err(|e| format!("no system randomness: {e}"))?;
     let port = free_loopback_port().map_err(|e| format!("no free loopback port: {e}"))?;
 
     let mut child = Command::new(&config.b3coind)
@@ -242,7 +281,11 @@ fn node_args(config: &NodeConfig, credentials: &Credentials, port: u16) -> Vec<S
         "-rpcallowip=127.0.0.1".into(),
         format!("-rpcport={port}"),
         format!("-rpcauth={}", credentials.rpcauth()),
-        format!("-rpcwhitelist={}:{}", credentials.user(), PAGE_METHODS.join(",")),
+        format!(
+            "-rpcwhitelist={}:{}",
+            credentials.user(),
+            PAGE_METHODS.join(",")
+        ),
         // Users without a whitelist (the cookie for b3coin-cli) keep full access.
         "-rpcwhitelistdefault=0".into(),
         // Plain regtest has no fee history; use the legacy relay floor
@@ -259,9 +302,17 @@ fn free_loopback_port() -> std::io::Result<u16> {
 
 fn ready_status(info: &Value) -> NodeStatus {
     NodeStatus::Ready {
-        chain: info.get("chain").and_then(Value::as_str).unwrap_or("unknown").to_owned(),
+        chain: info
+            .get("chain")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
         blocks: info.get("blocks").and_then(Value::as_u64).unwrap_or(0),
-        best_block_hash: info.get("bestblockhash").and_then(Value::as_str).unwrap_or("").to_owned(),
+        best_block_hash: info
+            .get("bestblockhash")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
     }
 }
 
@@ -271,36 +322,70 @@ mod tests {
 
     #[test]
     fn args_keep_the_node_on_regtest_without_peers() {
-        let config = NodeConfig { b3coind: "b3coind".into(), datadir: "/tmp/hive".into() };
+        let config = NodeConfig {
+            b3coind: "b3coind".into(),
+            datadir: "/tmp/hive".into(),
+        };
         let credentials = Credentials::generate("hive").unwrap();
         let args = node_args(&config, &credentials, 18443);
-        for required in ["-regtest", "-listen=0", "-connect=0", "-dnsseed=0", "-rpcbind=127.0.0.1", "-rpcwhitelistdefault=0"] {
+        for required in [
+            "-regtest",
+            "-listen=0",
+            "-connect=0",
+            "-dnsseed=0",
+            "-rpcbind=127.0.0.1",
+            "-rpcwhitelistdefault=0",
+        ] {
             assert!(args.iter().any(|a| a == required), "missing {required}");
         }
         assert!(args.contains(&format!("-rpcauth={}", credentials.rpcauth())));
-        let whitelist = args.iter().find(|a| a.starts_with("-rpcwhitelist=hive:")).unwrap();
+        let whitelist = args
+            .iter()
+            .find(|a| a.starts_with("-rpcwhitelist=hive:"))
+            .unwrap();
         for method in ["getblockchaininfo", "stop", "sendrawtransaction"] {
-            assert!(whitelist.split([':', ',']).any(|m| m == method), "{method} not whitelisted");
+            assert!(
+                whitelist.split([':', ',']).any(|m| m == method),
+                "{method} not whitelisted"
+            );
         }
-        for never in ["listdescriptors", "gethdkeys", "exportflowmeshkey", "dumpprivkey"] {
-            assert!(!whitelist.contains(never), "{never} must not be whitelisted");
+        for never in [
+            "listdescriptors",
+            "gethdkeys",
+            "exportflowmeshkey",
+            "dumpprivkey",
+        ] {
+            assert!(
+                !whitelist.contains(never),
+                "{never} must not be whitelisted"
+            );
         }
     }
 
     #[test]
     fn status_serializes_with_a_phase_tag() {
-        let ready = NodeStatus::Ready { chain: "regtest".into(), blocks: 0, best_block_hash: "ab".into() };
+        let ready = NodeStatus::Ready {
+            chain: "regtest".into(),
+            blocks: 0,
+            best_block_hash: "ab".into(),
+        };
         assert_eq!(
             serde_json::to_value(ready).unwrap(),
             json!({"phase": "ready", "chain": "regtest", "blocks": 0, "best_block_hash": "ab"})
         );
-        assert_eq!(serde_json::to_value(NodeStatus::Stopping).unwrap(), json!({"phase": "stopping"}));
+        assert_eq!(
+            serde_json::to_value(NodeStatus::Stopping).unwrap(),
+            json!({"phase": "stopping"})
+        );
     }
 
     #[test]
     fn a_missing_binary_becomes_a_failed_status() {
         let dir = std::env::temp_dir().join(format!("hive-missing-{}", std::process::id()));
-        let node = Node::start(&NodeConfig { b3coind: dir.join("no-such-b3coind"), datadir: dir.clone() });
+        let node = Node::start(&NodeConfig {
+            b3coind: dir.join("no-such-b3coind"),
+            datadir: dir.clone(),
+        });
         assert!(matches!(node.status(), NodeStatus::Failed { .. }));
         assert!(node.has_exited());
         let _ = std::fs::remove_dir_all(dir);

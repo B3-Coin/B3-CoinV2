@@ -26,7 +26,11 @@ impl Credentials {
         let password = random_hex(32)?;
         let salt = random_hex(16)?;
         let rpcauth = rpcauth_value(user, &salt, &password);
-        Ok(Self { user: user.to_owned(), password, rpcauth })
+        Ok(Self {
+            user: user.to_owned(),
+            password,
+            rpcauth,
+        })
     }
 
     pub fn user(&self) -> &str {
@@ -41,14 +45,17 @@ impl Credentials {
 
 impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Credentials").field("user", &self.user).finish_non_exhaustive()
+        f.debug_struct("Credentials")
+            .field("user", &self.user)
+            .finish_non_exhaustive()
     }
 }
 
 /// Same construction as share/rpcauth/rpcauth.py: HMAC-SHA256 keyed with the
 /// hex salt over the password, hex encoded.
 pub fn rpcauth_value(user: &str, salt: &str, password: &str) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(salt.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(salt.as_bytes()).expect("HMAC accepts any key length");
     mac.update(password.as_bytes());
     format!("{user}:{salt}${}", to_hex(&mac.finalize().into_bytes()))
 }
@@ -96,7 +103,10 @@ pub struct Client {
 
 impl Client {
     pub fn new(port: u16, credentials: &Credentials) -> Self {
-        Self::with_login(port, &format!("{}:{}", credentials.user, credentials.password))
+        Self::with_login(
+            port,
+            &format!("{}:{}", credentials.user, credentials.password),
+        )
     }
 
     /// A client using the contents of b3coind's .cookie file (`__cookie__:<secret>`).
@@ -113,7 +123,11 @@ impl Client {
             .http_status_as_error(false)
             .build()
             .into();
-        Self { url: format!("http://127.0.0.1:{port}/"), authorization: format!("Basic {token}"), agent }
+        Self {
+            url: format!("http://127.0.0.1:{port}/"),
+            authorization: format!("Basic {token}"),
+            agent,
+        }
     }
 
     /// Calls a node-wide method.
@@ -122,8 +136,17 @@ impl Client {
     }
 
     /// Calls a method on one loaded wallet (/wallet/<name>).
-    pub fn call_wallet(&self, wallet: &str, method: &str, params: Value) -> Result<Value, RpcError> {
-        self.post(&format!("{}wallet/{}", self.url, percent_encode(wallet)), method, params)
+    pub fn call_wallet(
+        &self,
+        wallet: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, RpcError> {
+        self.post(
+            &format!("{}wallet/{}", self.url, percent_encode(wallet)),
+            method,
+            params,
+        )
     }
 
     fn post(&self, url: &str, method: &str, params: Value) -> Result<Value, RpcError> {
@@ -148,7 +171,9 @@ fn percent_encode(segment: &str) -> String {
     segment
         .bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
             _ => format!("%{b:02X}"),
         })
         .collect()
@@ -161,7 +186,10 @@ fn parse_reply(mut body: Value) -> Result<Value, RpcError> {
             let code = error.get("code").and_then(Value::as_i64);
             let message = error.get("message").and_then(Value::as_str);
             return match (code, message) {
-                (Some(code), Some(message)) => Err(RpcError::Rpc { code, message: message.to_owned() }),
+                (Some(code), Some(message)) => Err(RpcError::Rpc {
+                    code,
+                    message: message.to_owned(),
+                }),
                 _ => Err(RpcError::BadReply(format!("malformed error: {error}"))),
             };
         }
@@ -207,12 +235,26 @@ mod tests {
 
     #[test]
     fn replies_map_to_results_and_errors() {
-        assert_eq!(parse_reply(json!({"result": 5, "error": null, "id": "hive"})), Ok(json!(5)));
         assert_eq!(
-            parse_reply(json!({"result": null, "error": {"code": -28, "message": "Loading block index…"}})),
-            Err(RpcError::Rpc { code: RPC_IN_WARMUP, message: "Loading block index…".into() })
+            parse_reply(json!({"result": 5, "error": null, "id": "hive"})),
+            Ok(json!(5))
         );
-        assert!(matches!(parse_reply(json!({"error": {"code": "x"}})), Err(RpcError::BadReply(_))));
-        assert!(matches!(parse_reply(json!({"id": 1})), Err(RpcError::BadReply(_))));
+        assert_eq!(
+            parse_reply(
+                json!({"result": null, "error": {"code": -28, "message": "Loading block index…"}})
+            ),
+            Err(RpcError::Rpc {
+                code: RPC_IN_WARMUP,
+                message: "Loading block index…".into()
+            })
+        );
+        assert!(matches!(
+            parse_reply(json!({"error": {"code": "x"}})),
+            Err(RpcError::BadReply(_))
+        ));
+        assert!(matches!(
+            parse_reply(json!({"id": 1})),
+            Err(RpcError::BadReply(_))
+        ));
     }
 }
