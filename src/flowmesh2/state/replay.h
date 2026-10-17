@@ -24,9 +24,20 @@
  * journal (Journal::ReadAll; storage/commit_log.h writes them). It
  * re-executes every DECISION body exactly once per height, with the same
  * code the state owner uses (ReexecuteOn: BuildCandidate plus exact header
- * and canonical-body equality), and returns every replayed header and the
- * final head. Pure and deterministic: it takes no lock and touches no file;
- * installing the result into a StateOwner is Restore (stub M4-STO-03).
+ * and canonical-body equality), and returns every replayed header, the
+ * committed head and the decided head. Pure and deterministic: it takes no
+ * lock and touches no file; installing the result into a StateOwner is
+ * Restore (stub M4-STO-03).
+ *
+ * Committed versus decided (O-89): a slot is committed state only once its
+ * APPLIED record is durable, because APPLIED is written only after Apply
+ * passed check 3. So `head` is the head after the last APPLIED slot, which
+ * is the live state owner's head, and `decided_head` the head after the
+ * last DECISION. They differ only by a tail of decided slots without
+ * APPLIED (a crash between B-DECISION and B-APPLIED, or check 3 refused
+ * the slot); those slots stay decided for their height, and recovery must
+ * run check 3 on them under the current authority before it writes APPLIED
+ * (Restore, M4-STO-03).
  *
  * Rules, the first failure returned:
  * - the base is a genesis head (height 0; INVALID_INPUT,
@@ -48,16 +59,17 @@
  * - APPLIED: exact decode; ORDER_VIOLATION (REPLAY_APPLIED_UNKNOWN) unless
  *   its slot was replayed before it; VERIFY_FAILED (REPLAY_APPLIED_MISMATCH)
  *   unless header hash and state root are the replayed slot's; a repeat for
- *   an applied slot is skipped; otherwise slots are applied in increasing
- *   order (ORDER_VIOLATION, REPLAY_APPLIED_OUT_OF_ORDER).
+ *   an applied slot is skipped; otherwise it must name the next slot after
+ *   the committed head (slot 1 first, no slot skipped; ORDER_VIOLATION,
+ *   REPLAY_APPLIED_OUT_OF_ORDER), which then becomes the committed head.
  * - SNAPSHOT_MARK: NotImplemented(M4-STO-03). PREPARED_QC:
  *   NotImplemented(M4-STO-07).
  * - Any other type: a signer-journal type is ORDER_VIOLATION
  *   (storage::RECORD_ROLE), an unregistered one DECODE (storage::RECORD_TYPE).
  *
- * A decided slot without an APPLIED record (a crash between B-DECISION and
- * B-APPLIED) is replayed like any other; its applied_seq is empty, so
- * recovery knows that APPLIED must still be written before the slot is
+ * A decided slot without an APPLIED record is re-executed like any other;
+ * its applied_seq is empty and it is above `head`, so recovery knows that
+ * check 3 must pass and APPLIED must be written before the slot is
  * published (M4-STO-03, M4-STO-01).
  */
 namespace flowmesh2::state {
@@ -83,7 +95,10 @@ struct ReplayedSlot {
 
 struct ReplayResult {
     std::vector<ReplayedSlot> slots; //!< one per height 1, 2, ..., in order
-    HeadView head;                   //!< the head after the last slot (the genesis head if none)
+    //! The committed head: after the last slot with an APPLIED record (the genesis head if none); the live state owner's head.
+    HeadView head;
+    //! After the last decided slot; differs from `head` only when decided slots lack APPLIED (they follow `head`).
+    HeadView decided_head;
     uint64_t duplicate_decisions{0}; //!< DECISION records skipped as duplicates
     uint64_t duplicate_applied{0};   //!< APPLIED records skipped as repeats
 };

@@ -8,6 +8,7 @@
 #include <flowmesh2/storage/commit_log.h>
 
 #include <cstddef>
+#include <map>
 #include <utility>
 
 namespace flowmesh2::state {
@@ -26,11 +27,14 @@ Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const st
     const engine::Engine engine{std::move(created).value()};
     if (genesis.Header().height != 0) return Error{ErrorCode::INVALID_INPUT, REPLAY_BASE_NOT_GENESIS};
 
-    HeadView head{genesis};
+    HeadView head{genesis};         // after the last decided slot
+    HeadView applied_head{genesis}; // after the last applied slot: the committed head
+    // Heads of decided slots above the committed head, by height (normally at most one).
+    std::map<uint64_t, HeadView> unapplied;
     std::vector<ReplayedSlot> slots;
     uint64_t duplicate_decisions{0};
     uint64_t duplicate_applied{0};
-    std::optional<uint64_t> last_applied_slot;
+    uint64_t last_applied_slot{genesis.Header().height};
     for (size_t i{0}; i < records.size(); ++i) {
         const storage::JournalRecord& record{records[i]};
         if (record.seq != i + 1) return Order(REPLAY_SEQ);
@@ -58,6 +62,7 @@ Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const st
             Result<HeadView> next{HeadView::Make(header, cert_hash, candidate->Next())};
             if (!next.has_value()) return next.error();
             head = std::move(next).value();
+            unapplied.emplace(header.height, head);
             slots.push_back(ReplayedSlot{header, cert_hash, record.seq, std::nullopt});
             break;
         }
@@ -73,9 +78,15 @@ Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const st
                 ++duplicate_applied;
                 break;
             }
-            if (last_applied_slot.has_value() && applied->slot <= *last_applied_slot) return Order(REPLAY_APPLIED_OUT_OF_ORDER);
+            // The next unapplied slot only: no APPLIED below the committed head, none that skips a slot.
+            if (applied->slot != last_applied_slot + 1) return Order(REPLAY_APPLIED_OUT_OF_ORDER);
             slot.applied_seq = record.seq;
             last_applied_slot = applied->slot;
+            const auto pending{unapplied.find(applied->slot)};
+            // Every decided slot above the committed head is in `unapplied`.
+            if (pending == unapplied.end()) return Error{ErrorCode::INVARIANT, "replayed slot without its head"};
+            applied_head = std::move(pending->second);
+            unapplied.erase(pending);
             break;
         }
         case storage::RecordType::SNAPSHOT_MARK:
@@ -89,7 +100,7 @@ Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const st
             return Order(storage::RECORD_ROLE);
         }
     }
-    return Ok(ReplayResult{std::move(slots), std::move(head), duplicate_decisions, duplicate_applied});
+    return Ok(ReplayResult{std::move(slots), std::move(applied_head), std::move(head), duplicate_decisions, duplicate_applied});
 }
 
 } // namespace flowmesh2::state

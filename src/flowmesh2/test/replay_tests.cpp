@@ -102,13 +102,37 @@ BOOST_AUTO_TEST_CASE(replay_reproduces_every_header_and_the_final_root)
     RequireOk(empty, "replay an empty journal");
     BOOST_CHECK(empty->slots.empty());
     BOOST_CHECK(empty->head.Header() == fx.genesis.Header());
-    // A decided slot whose APPLIED record is missing (a crash before B-APPLIED) is replayed too.
+    BOOST_CHECK(empty->decided_head.Header() == fx.genesis.Header());
+    BOOST_CHECK(result->decided_head.Header() == result->head.Header());
+    // A decided slot whose APPLIED record is missing (a crash before
+    // B-APPLIED, or check 3 refused it) is re-executed and reported, but the
+    // committed head is the last applied slot, as on the live node (O-89).
     const Records cut{fx.records.begin(), fx.records.end() - 1};
     const Result<state::ReplayResult> partial{state::ReplayDecisions(fx.genesis, cut)};
     RequireOk(partial, "replay without the last APPLIED");
     BOOST_REQUIRE_EQUAL(partial->slots.size(), 5U);
     BOOST_CHECK(!partial->slots.back().applied_seq.has_value());
-    BOOST_CHECK(partial->head.Header() == fx.f.Head()->Header());
+    BOOST_CHECK(partial->head.Header() == fx.run.heads[3]->Header());
+    BOOST_CHECK(partial->head.CertHash() == fx.run.heads[3]->CertHash());
+    BOOST_CHECK(partial->head.State() == fx.run.heads[3]->State());
+    BOOST_CHECK(partial->decided_head.Header() == fx.f.Head()->Header());
+    BOOST_CHECK(partial->decided_head.State() == fx.f.Head()->State());
+    // Without any APPLIED record nothing is committed: the head is the genesis head.
+    Records decisions_only;
+    for (const storage::JournalRecord& record : fx.records) {
+        if (record.type == storage::RecordType::DECISION) decisions_only.push_back(record);
+    }
+    const Result<state::ReplayResult> undecided{state::ReplayDecisions(fx.genesis, Renumbered(decisions_only))};
+    RequireOk(undecided, "replay of decisions without APPLIED");
+    BOOST_CHECK_EQUAL(undecided->slots.size(), 5U);
+    BOOST_CHECK(undecided->head.Header() == fx.genesis.Header());
+    BOOST_CHECK(undecided->decided_head.Header() == fx.f.Head()->Header());
+    // APPLIED records that follow later decisions still give the head of their own slot.
+    const Records late{Renumbered({fx.records[0], fx.records[2], fx.records[1]})};
+    const Result<state::ReplayResult> late_applied{state::ReplayDecisions(fx.genesis, late)};
+    RequireOk(late_applied, "APPLIED 1 after DECISION 2");
+    BOOST_CHECK(late_applied->head.Header() == fx.run.heads[0]->Header());
+    BOOST_CHECK(late_applied->decided_head.Header() == fx.run.heads[1]->Header());
 }
 
 BOOST_AUTO_TEST_CASE(a_duplicated_decision_is_applied_once)
@@ -208,6 +232,10 @@ BOOST_AUTO_TEST_CASE(replay_refuses_an_inconsistent_journal)
     RequireFailure(replay(Renumbered(applied_first)), ErrorCode::ORDER_VIOLATION, state::REPLAY_APPLIED_UNKNOWN, "APPLIED before DECISION");
     const Records out_of_order{Renumbered({good[0], good[2], good[3], good[1]})};
     RequireFailure(replay(out_of_order), ErrorCode::ORDER_VIOLATION, state::REPLAY_APPLIED_OUT_OF_ORDER, "APPLIED 1 after APPLIED 2");
+    // An APPLIED that skips an unapplied slot: the committed head would hold
+    // slot 2's effects without slot 2 being committed.
+    const Records skipped_applied{Renumbered({good[0], good[1], good[2], good[4], good[5]})};
+    RequireFailure(replay(skipped_applied), ErrorCode::ORDER_VIOLATION, state::REPLAY_APPLIED_OUT_OF_ORDER, "APPLIED 3 without APPLIED 2");
     // Record types the commit journal never holds.
     Records signer_type{good};
     signer_type.push_back(storage::JournalRecord{good.size() + 1, storage::RecordType::INTENT, {}, uint256{}});

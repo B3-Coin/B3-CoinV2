@@ -61,7 +61,11 @@
  * - Head(): the current head; never null.
  * - Restore(base, records): install a head rebuilt from a snapshot and the
  *   DECISION records after it. Stub M4-STO-03; ReplayDecisions
- *   (state/replay.h) is the real, pure part of recovery.
+ *   (state/replay.h) is the real, pure part of recovery. Restore installs
+ *   ReplayResult::head (the last APPLIED slot); a decided slot without
+ *   APPLIED is applied only after check 3 passes again under the current
+ *   authority, and a refusal leaves the head there and the node fenced
+ *   (O-89).
  *
  * Create(profile, genesis, commit_journal_instance) takes a GENESIS head
  * only (height 0, zero parent hash, parent certificate hash and certificate
