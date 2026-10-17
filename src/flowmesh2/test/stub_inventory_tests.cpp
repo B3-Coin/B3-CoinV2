@@ -54,11 +54,15 @@
  * Build and Check), the restart fence (M4-AGR-06) and the evidence store
  * (M4-AGR-07; Record and Load). Slice R11 adds the three b3verify stubs:
  * liability paths (M5-VFY-03), checkpoints (M8-CKP-01) and anchor proofs
- * (M7-ADP-02). Slice R12 adds the credit budget (M4-ADM-02).
+ * (M7-ADP-02). Slice R12 adds the credit budget (M4-ADM-02), and extends
+ * M4-ADM-01 to probe admission's batch path (Admission::AdmitBatch) and
+ * M2-LED-05, M2-LED-06 and M3-ENG-09 to probe admission's kind rule
+ * (KindAdmissible, whose Unsupported refusals become UNSUPPORTED_KIND).
  */
 
 #include <boost/test/unit_test.hpp>
 
+#include <flowmesh2/admission/admission.h>
 #include <flowmesh2/admission/budget.h>
 #include <flowmesh2/agreement/evidence.h>
 #include <flowmesh2/agreement/inclusion.h>
@@ -87,6 +91,7 @@
 #include <flowmesh2/storage/memory_journal.h>
 #include <flowmesh2/storage/signer_log.h>
 #include <flowmesh2/storage/snapshot_store.h>
+#include <flowmesh2/test/util/admission_fixtures.h>
 #include <flowmesh2/test/util/agreement_fixtures.h>
 #include <flowmesh2/test/util/storage_fixtures.h>
 #include <flowmesh2/test/util/verify_fixtures.h>
@@ -356,7 +361,9 @@ FM2_STUB_CASE(M4_STO_05, "M4-STO-05")
 
 FM2_STUB_CASE(M4_ADM_01, "M4-ADM-01")
 {
-    return Observe(BatchVerifier{}.VerifyBatch({}));
+    // Two entry points: core BatchVerifier (R4) and admission's batch path (R12).
+    AdmissionRig rig;
+    return FirstDeviation("M4-ADM-01", {Observe(BatchVerifier{}.VerifyBatch({})), Observe(rig.admission->AdmitBatch({}))});
 }
 
 // ---- Slice R12: admission/budget ----
@@ -397,20 +404,23 @@ FM2_STUB_CASE(M8_EXIT_01, "M8-EXIT-01")
 
 FM2_STUB_CASE(M2_LED_05, "M2-LED-05")
 {
-    // Two entry points: the ledger (R5) and the engine's WITHDRAW branch (R7).
+    // Three entry points: the ledger (R5), the engine's WITHDRAW branch (R7) and admission's kind rule (R12).
     ledger::LedgerState ledger{EmptyRegtestLedger()};
     return FirstDeviation("M2-LED-05", {Observe(ledger.RequestWithdrawal(AccountId{}, WithdrawPayload{AssetId::Native(), 1, {0x51}})),
-                                        Observe(engine::PhaseOf(ActionOfKind(ActionKind::WITHDRAW)))});
+                                        Observe(engine::PhaseOf(ActionOfKind(ActionKind::WITHDRAW))),
+                                        Observe(admission::KindAdmissible(ActionKind::WITHDRAW))});
 }
 
 FM2_STUB_CASE(M2_LED_06, "M2-LED-06")
 {
-    // The ledger's two directions (R5) and the engine branches of both kinds (R7).
+    // The ledger's two directions (R5), the engine branches of both kinds (R7) and admission's kind rule (R12).
     ledger::LedgerState ledger{EmptyRegtestLedger()};
     return FirstDeviation("M2-LED-06", {Observe(ledger.TransferToFutures(AccountId{}, AssetId::Native(), 1)),
                                         Observe(ledger.TransferFromFutures(AccountId{}, AssetId::Native(), 1)),
                                         Observe(engine::PhaseOf(ActionOfKind(ActionKind::SPOT_TO_FUTURES))),
-                                        Observe(engine::PhaseOf(ActionOfKind(ActionKind::FUTURES_TO_SPOT)))});
+                                        Observe(engine::PhaseOf(ActionOfKind(ActionKind::FUTURES_TO_SPOT))),
+                                        Observe(admission::KindAdmissible(ActionKind::SPOT_TO_FUTURES)),
+                                        Observe(admission::KindAdmissible(ActionKind::FUTURES_TO_SPOT))});
 }
 
 // ---- Slice R5: ledger/state_commitment ----
@@ -443,7 +453,9 @@ FM2_STUB_CASE(M3_ENG_02, "M3-ENG-02")
 
 FM2_STUB_CASE(M3_ENG_09, "M3-ENG-09")
 {
-    return Observe(engine::PhaseOf(ActionOfKind(ActionKind::CANCEL_ALL)));
+    // The engine branch (R7) and admission's kind rule (R12).
+    return FirstDeviation("M3-ENG-09", {Observe(engine::PhaseOf(ActionOfKind(ActionKind::CANCEL_ALL))),
+                                        Observe(admission::KindAdmissible(ActionKind::CANCEL_ALL))});
 }
 
 FM2_STUB_CASE(M9_FUT_04, "M9-FUT-04")

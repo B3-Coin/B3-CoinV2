@@ -96,11 +96,12 @@ if(BUILD_FLOWMESH2)
   # flowmesh2::agreement. read/ (slice R11): immutable slot views and the
   # read service over the C1 ReadSlot, in namespace flowmesh2::read; the
   # C1 library flowmesh2_foundations joins here (unchanged; guard rule 6).
-  # admission/ (slice R12): the bounded action pool and the budget
-  # policy interface, in namespace flowmesh2::admission. Later slices add the other application
+  # admission/ (slice R12): admission A0..A10, the bounded action pool
+  # and the budget policy interface, in namespace flowmesh2::admission. Later slices add the other application
   # directories here. fm2_verify never links it (guard rule 4), and it
   # never links bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
+    admission/admission.cpp
     admission/budget.cpp
     admission/pool.cpp
     agreement/evidence.cpp
@@ -186,6 +187,8 @@ if(BUILD_FLOWMESH2)
   add_executable(test_flowmesh2
     test/main.cpp
     test/account_leaf_tests.cpp
+    test/admission_precedence_tests.cpp
+    test/admission_tests.cpp
     test/action_tests.cpp
     test/agreement_tests.cpp
     test/amount_tests.cpp

@@ -5,6 +5,8 @@
 #ifndef B3_FLOWMESH2_TEST_UTIL_ADMISSION_FIXTURES_H
 #define B3_FLOWMESH2_TEST_UTIL_ADMISSION_FIXTURES_H
 
+#include <flowmesh2/admission/admission.h>
+#include <flowmesh2/admission/budget.h>
 #include <flowmesh2/admission/pool.h>
 #include <flowmesh2/core/action.h>
 #include <flowmesh2/core/body.h>
@@ -16,11 +18,15 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -34,6 +40,10 @@
  * Publish, then pool OnCommitted with the slot's outcomes and canonical
  * body. SealOriginals commits chosen originals without TakeForSlot (an
  * action the pool never held, as another seat's proposal would include it).
+ *
+ * An AdmissionRig adds a TestBudget and an Admission over the rig's owner,
+ * read service and pool; Fresh gives another pool and admission on the
+ * same owner and read service (one per precedence scenario).
  */
 namespace flowmesh2::test {
 
@@ -129,6 +139,91 @@ struct PoolRig {
     //! Slot 1: deposits for alice (rUSD), bob (B3 and TOK) and carol (rUSD).
     Sealed Fund() { return SealOriginals(FundingFacts(rig.actions), {}); }
 };
+
+/** A budget for tests: ALLOW unless `deny`, an INVARIANT error if `fail`;
+ * counts every call; `on_check` (if set) runs inside Check, which lets a
+ * test move the head between admission's snapshot and its pool insert.
+ */
+class TestBudget final : public admission::BudgetPolicy
+{
+public:
+    std::atomic<bool> deny{false};
+    std::atomic<bool> fail{false};
+    std::atomic<uint64_t> checks{0};
+    std::atomic<uint64_t> admitted{0};
+    std::atomic<uint64_t> refused{0};
+    std::function<void()> on_check;
+
+    Result<admission::BudgetVerdict> Check(const admission::BudgetRequest&) override
+    {
+        ++checks;
+        if (on_check) on_check();
+        if (fail.load()) return Error{ErrorCode::INVARIANT, "test budget failure"};
+        return Ok(deny.load() ? admission::BudgetVerdict::DENY : admission::BudgetVerdict::ALLOW);
+    }
+    void Settle(const admission::BudgetRequest&, bool was_admitted) override
+    {
+        if (was_admitted) {
+            ++admitted;
+        } else {
+            ++refused;
+        }
+    }
+};
+
+inline std::unique_ptr<admission::Admission> NewAdmission(const ProfileParams& profile, const state::StateOwner& owner,
+                                                          const read::ReadService& read, admission::ActionPool& pool,
+                                                          admission::BudgetPolicy& budget)
+{
+    Result<std::unique_ptr<admission::Admission>> admission{admission::Admission::Create(profile, owner, read, pool, budget)};
+    RequireOk(admission, "Admission::Create");
+    return std::move(admission).value();
+}
+
+struct AdmissionRig : PoolRig {
+    TestBudget budget;
+    std::unique_ptr<admission::Admission> admission;
+
+    explicit AdmissionRig(const PoolRigOptions& options = {})
+        : PoolRig{options}, admission{NewAdmission(profile, *rig.owner, *read, *pool, budget)}
+    {
+    }
+
+    //! Admit exact bytes; requires a reply (not an Error).
+    admission::AdmissionReply Admit(const std::vector<unsigned char>& bytes)
+    {
+        Result<admission::AdmissionReply> reply{admission->Admit(bytes)};
+        RequireOk(reply, "Admission::Admit");
+        return std::move(reply).value();
+    }
+    admission::AdmissionStats Stats() const { return admission->Stats(); }
+};
+
+/** Requires exactly one more reply, of `code`, between `before` and `after`,
+ * and `signatures` more signature checks; every other counter unchanged.
+ */
+inline void RequireOneReply(const admission::AdmissionStats& before, const admission::AdmissionStats& after, AdmissionCode code,
+                            uint64_t signatures, std::string_view what)
+{
+    BOOST_CHECK_MESSAGE(after.replies == before.replies + 1, std::string{what} + ": not exactly one more reply");
+    BOOST_CHECK_MESSAGE(after.errors == before.errors, std::string{what} + ": errors changed");
+    BOOST_CHECK_MESSAGE(after.sig_verifications == before.sig_verifications + signatures,
+                        std::string{what} + ": " + std::to_string(after.sig_verifications - before.sig_verifications) +
+                            " signature checks, want " + std::to_string(signatures));
+    for (const CodeInfo<AdmissionCode>& info : AdmissionCodeRegistry()) {
+        const uint64_t want{before.Count(info.code) + (info.code == code ? 1 : 0)};
+        BOOST_CHECK_MESSAGE(after.Count(info.code) == want, std::string{what} + ": counter " + std::string{info.name} + " is " +
+                                                                std::to_string(after.Count(info.code)) + ", want " +
+                                                                std::to_string(want));
+    }
+}
+
+//! Requires `reply` to have `code`.
+inline void RequireCode(const admission::AdmissionReply& reply, AdmissionCode code, std::string_view what)
+{
+    BOOST_CHECK_MESSAGE(reply.code == code, std::string{what} + ": got " + std::string{ToString(reply.code)} + " (" +
+                                                std::string{reply.reason} + "), want " + std::string{ToString(code)});
+}
 
 //! The status the pool reports for `id`; fails the test if it reports none.
 inline admission::PoolEntryStatus RequireStatus(const admission::ActionPool& pool, const ActionId& id)
