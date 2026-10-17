@@ -318,18 +318,30 @@ async fn blocking<T: Send + 'static>(
 
 // ---- startup ----------------------------------------------------------------
 
-/// Spike configuration: B3_HIVE_B3COIND names the b3coind binary (bundling it
-/// as a sidecar comes with packaging); the regtest datadir defaults to the
-/// app's data directory and can be moved with B3_HIVE_DATADIR.
+/// Spike configuration: the node is the b3coind packaged next to the app's
+/// own executable (a Tauri sidecar), unless B3_HIVE_B3COIND names another one
+/// for development. The regtest datadir defaults to the app's data directory
+/// and can be moved with B3_HIVE_DATADIR.
 fn node_config(app: &tauri::App) -> Result<NodeConfig, Box<dyn std::error::Error>> {
-    let b3coind = std::env::var_os("B3_HIVE_B3COIND")
-        .map(PathBuf::from)
-        .ok_or("set B3_HIVE_B3COIND to the b3coind binary")?;
+    let b3coind = match std::env::var_os("B3_HIVE_B3COIND") {
+        Some(path) => PathBuf::from(path),
+        None => packaged_b3coind()?,
+    };
     let datadir = match std::env::var_os("B3_HIVE_DATADIR") {
         Some(dir) => PathBuf::from(dir),
         None => app.path().app_data_dir()?.join("spike-regtest"),
     };
     Ok(NodeConfig { b3coind, datadir })
+}
+
+/// Bundles place sidecars beside the main executable, with the target triple
+/// stripped from the name: /usr/bin on Linux packages, the install folder on
+/// Windows, Contents/MacOS on macOS. If it is missing, the main window shows
+/// the start failure with this path.
+fn packaged_b3coind() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().ok_or("the app executable has no folder")?;
+    Ok(dir.join(format!("b3coind{}", std::env::consts::EXE_SUFFIX)))
 }
 
 pub fn run() {
