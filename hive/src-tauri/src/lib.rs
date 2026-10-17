@@ -117,8 +117,10 @@ async fn draft_send(
     Ok(id)
 }
 
+/// Async on purpose: a window built inside a synchronous command deadlocks on
+/// Windows (WebView2) and stays blank.
 #[tauri::command]
-fn open_console(app: AppHandle) -> Result<(), String> {
+async fn open_console(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(CONSOLE) {
         return window.set_focus().map_err(|e| e.to_string());
     }
