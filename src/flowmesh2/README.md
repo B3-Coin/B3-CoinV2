@@ -178,12 +178,13 @@ ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 build-rebirth/bin/fm2-sim --scenario all --seeds 1-32   # JSON on stdout; exit 0 only if every check passed
 ```
 
-Expected after R14: 10 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_sim`, `flowmesh2_sim_cli_determinism`, `flowmesh2_unit`
-with 505 cases, `flowmesh2_inventory`,
-`flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
-`flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`
-with four controls). The file journal tests write only under
+Expected after R14 and the review fixes (O-89 to O-92): 10 CTests pass
+(`flowmesh2_foundations` with its 19 C1 cases, `flowmesh2_sim`,
+`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 510 cases,
+`flowmesh2_inventory`, `flowmesh2_todo_lint`, `flowmesh2_guards`,
+`flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest` and, with Clang,
+`flowmesh2_negative_compile` with six negative controls and a positive one).
+R14 itself had 505 cases and four negative controls. The file journal tests write only under
 `build-rebirth/fm2-test-tmp/`.
 Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2. Open gates (workspace lock reconciliation, decision
 D3) are listed in ARCHITECTURE.md §0. All outline values are provisional and

@@ -192,7 +192,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `fm2_core` | ledger, engine, state, storage, chain, agreement (since R10), admission (since R12), read, net, bridge, futures, governance; application code lives in namespaces `flowmesh2::ledger`, `::engine`, `::state`, `::storage` (guard rule 3 matches them); `agreement/` uses `flowmesh2::agreement`, `chain/` `flowmesh2::chain`, `read/` (since R11) `flowmesh2::read`, `admission/` (since R12) `flowmesh2::admission`, and (since R13) `net/` `flowmesh2::net`, `bridge/` `flowmesh2::bridge`, `futures/` `flowmesh2::futures`, `governance/` `flowmesh2::governance` | `fm2_types` (public, since R5); `crc32c` (private, since R8: record framing); `flowmesh2_foundations` (public, since R11: `read/` publishes into the C1 `ReadSlot`, and since R13 `net/` queues into C1 `BoundedMailbox`es; the C1 target is unchanged) (`bitcoin_util` comes through `fm2_types`) |
 | `fm2_dev` | `dev/` (since R10: `fake_chain`, `dev_certifier`; since R12: `dev_budget`), namespace `flowmesh2::dev`; `FM2_DEV_COMPONENTS` is defined PUBLIC, and every dev header has `#error` without it | `fm2_core` (public) |
 | `fm2_simlib` | `sim/` (since R14), namespace `flowmesh2::sim`; not a deterministic directory by guard rule (it owns the seeded `FastRandomContext`), may sign like `dev/` and `test/` (rule 7); the node and cluster headers have `#error` without `FM2_DEV_COMPONENTS` | `fm2_dev`, `fm2_core`, `fm2_verify`, `bitcoin_common` (for `CKey` only) and `secp256k1`, all public; linked only by `test_flowmesh2` and `fm2_sim_cli` |
-| `test_flowmesh2` | `test/` | all of the above (`fm2_dev` since R10, `fm2_verify` since R11, `fm2_simlib` since R14; 505 Boost cases since R14), `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files and, since R8, `FM2_TEST_TMP_DIR` (`<build>/fm2-test-tmp`) for the file journal's temporary directories; global fixture `ECC_Context` (`test/main.cpp`) |
+| `test_flowmesh2` | `test/` | all of the above (`fm2_dev` since R10, `fm2_verify` since R11, `fm2_simlib` since R14; 505 Boost cases at R14, 510 after the review fixes O-89 to O-92), `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files and, since R8, `FM2_TEST_TMP_DIR` (`<build>/fm2-test-tmp`) for the file journal's temporary directories; global fixture `ECC_Context` (`test/main.cpp`) |
 | `fm2_sim_cli` | binary `fm2-sim` (since R14; `sim/fm2_sim_main.cpp`) | `fm2_simlib`; guard rule 3 inspects it for V1 symbols (`ALWAYS_INSPECTED`) |
 | `fm2_canary_*` | sanitizer canaries | only with `FLOWMESH2_SANITIZER_CANARIES=ON` |
 | `fm2_all` | custom target: every fm2 library and executable that is built by default | — |
@@ -1210,8 +1210,8 @@ libraries `fm2_types` and `fm2_core` (since R5; `engine/` since R6,
 and `agreement/` since R10, `read/` since R11, `admission/` since R12,
 `net/`, `bridge/`, `futures/` and `governance/` since R13),
 `fm2_dev` (since R10; the dev budget since R12), `fm2_verify` (since R11),
-`fm2_simlib` and the `fm2-sim` CLI (since R14), `test_flowmesh2` (505 Boost
-cases), the unchanged C1 binary and, with the option on, the canaries. They
+`fm2_simlib` and the `fm2-sim` CLI (since R14), `test_flowmesh2` (510 Boost
+cases since the review fixes O-89 to O-92; 505 at R14), the unchanged C1 binary and, with the option on, the canaries. They
 run ten CTests: `flowmesh2_foundations` (C1, 19 cases), `flowmesh2_sim`,
 `flowmesh2_sim_cli_determinism`, `flowmesh2_unit`, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
@@ -1337,8 +1337,9 @@ Clang only), `flowmesh2_evidence_selftest` (R2), `flowmesh2_sim` (R14),
   entry and real compiled objects for rule 3); each must fail with exactly its
   rule.
 - **Negative compile** (`check_negative_compile.py`, Clang only): a missing
-  `LOCK`, an ignored `Result`, a forged `Durable*` token and (since R8)
-  `SeatSigner::Sign` called with a `PendingIntent` each fail to compile
+  `LOCK`, an ignored `Result`, a forged `Durable*` token, (since R8)
+  `SeatSigner::Sign` called with a `PendingIntent` and (since O-92) a forged
+  `ApplyReceipt` and `CommitLog::AppendApplied` without one each fail to compile
   with the diagnostic named on the file's `FM2_EXPECT_ERROR` line; each file
   built with `FM2_COMPILE_FAIL_FIXED` (the violation removed) compiles, so the
   failure is exactly the violation; a positive control with identical flags
