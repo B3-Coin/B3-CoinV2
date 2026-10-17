@@ -40,9 +40,15 @@ contract `ClientApi` and the `InProcessApi` with exactly one reply per
 request and `GetAction` from one read lease; the `SeatMesh` interface whose
 only vote path takes an `OutboundVote`; and typed stubs for HTTPS + SSE,
 streams, the in-process and TCP meshes, short IDs, sentry fan-out, the
-bridge, checkpoints, forced exit, futures and governance).
-Everything else described here is the contract that the outline slice R14
-will build.
+bridge, checkpoints, forced exit, futures and governance) and slice
+**R14** (the deterministic simulator in `sim/`: `FakeClock`, the seeded
+`Scheduler`, the `FaultPlan` with its three real faults, the
+`TraceRecorder` over both journals, the seat signer and the chain
+authority, the `SimNode` composed of the real components and the k = 1
+dev certifier, the `SimClient` with exact signed bytes and engine-off
+verification, `SimCluster` of one node, and the walking skeleton of
+section 14 with its checks manifest and the `fm2-sim` CLI). Every outline
+slice has landed; M0-AUD-01 (Codex) audits the outline next.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
@@ -171,7 +177,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `read/`, `verify/`, `core/merkle` (tree) | R11 | `CertifiedEnvelope` (exact codec), `ScopeOf`/`CommitOf`; `SlotView` (header, certificate, outcomes and their tree, v0 account leaves and tree levels, the five roots, action index, order-fill index for maker and taker); `ReadService` (`Create`, `Publish(const DurableApplied&, view)`, `Acquire`, one-lease `Head`/`Account`/`Action`/`OrderFills`), `ReadHandle` (one lease), outcome index; `MerkleTree` (every level, O(log n) proofs); b3verify `VerifyCertificate`, `VerifyOutcome`, `VerifyAccountLeaf`, `VerifyFill`, `VerifyBalanceTransition`, `VerifyExpired` | `VerifyLiabilityPath` (M5-VFY-03), `VerifyCheckpoint` (M8-CKP-01), `VerifyAnchorProof` (M7-ADP-02) | archive and outcome index (M5-RD-01), v0 tree levels (M2-LED-02) |
 | `admission/`, `dev/dev_budget` | R12 | `Admission` A0..A10 (`Create`, `Admit`, `Fence`, `Stats`; `KindAdmissible`, `PayloadAdmissible`, `WindowRefusal`), `AdmissionReply`, `AdmissionStats`; `ActionPool` (`Insert`, `FindAuthenticated`, `FindById`, `TakeForSlot`, `OnCommitted`, `Status`; `PoolStatus`, `InsertResult` registries), `PoolLimits`; `BudgetPolicy`, `BudgetRequest`, `BudgetVerdict`; `UnlimitedDevBudget` (REGTEST, fm2_dev) | `CreditBudget::Create`/`Check` (M4-ADM-02), `Admission::AdmitBatch` (M4-ADM-01); `UNSUPPORTED_KIND` from `KindAdmissible` (M2-LED-05 WITHDRAW, M3-ENG-09 CANCEL_ALL, M2-LED-06 futures transfers) | `WindowRefusal` (M2-ADM-01) |
 | `net/`, `bridge/`, `futures/`, `governance/` | R13 | `Lane` (CRITICAL..BULK) and `TrafficClass` (ORDINARY, CANCEL, STATUS, HEALTH) registries, `ReservedShare`, `LimitsValid`, `ProvisionalLaneLimits`; `LaneSet` (`Create`, `TryPush`, `TryPop`, `PopNext` in strict priority, `Close`, `Stats`); `ClientApi` (`Submit`, `SubmitStatus`, `SubmitHealth`, `TakeReply`, `GetAction`, `GetState`, `Subscribe`), `RequestId`, `RequestKind`, `ApiActionStatus`, `ActionStatusReply`, `HealthReply`, `ApiReply`; `InProcessApi` (`Create`, `Pump`, `State`, `OpenRequests`, `ClassOf`; `RequestState`, `PumpStop`); `SeatMesh` (`CheckConfig`, `SendVote`, `Send` per lane, the `MessageSink` port, `Poll`; `MeshConfig`, `InboundFrame`) | HTTPS + SSE `HttpsSseApi::Create` (M5-API-01), `InProcessApi::Subscribe` (M5-API-02), `InProcessSeatMesh::Create` (M4-SIM-01), `TcpSeatMesh::Create` (M4-NET-01), `ShortIdCodec::Encode`/`Decode` (M4-NET-02), `SentryFanout::Fanout` (M4-NET-03), `BridgeManagerV2` `OnFinalizedMint`, `BuildWithdrawalPacket`, `CheckReleaseLimits` (M8-BRG-01..03), `CheckpointBuilder::Build` (M8-CKP-01), `ForcedExit::Open`/`Redeem` (M8-EXIT-01), `FuturesDomain` `PlaceFuture`, `SubmitOracle`, `MarginCheck`, `Sweep` (M9-FUT-01..04), `Governance` `ApplyListing`, `ApplyRemoval`, `ParamsAt` (M7-GOV-01..03) | — |
-| `sim/` | R14 | `FakeClock`, `Scheduler`, `FaultPlan` (3 faults), `TraceRecorder`, `SimNode`, `SimClient`, scenarios, `fm2-sim` | `SimCluster` n>1 (M4-SIM-01), crash/drop/partition/skew (M4-SIM-02), Twins (M4-SIM-03) | scheduler (M0-SIM-01) |
+| `sim/`, `storage/seat_signer` (`SignObserver`) | R14 | `FakeClock`; `Scheduler(seed)` over `FastRandomContext(SeedKey(seed))` (events by time, seeded tie, queueing seq; `RunUntilIdle` with an event limit; `Jitter`); `FaultPlan` with `withhold_from_proposals`, `fail_commit_barrier_at`, `bump_authority_at` and `CheckFaultPlan`; `TraceRecorder` (`BarrierObserver` and `SignObserver`, authority, slot and generic events, `Canonical`, `Digest`) and `TracingChainAdapter`; `SimNode` (`Create`, `SealSlot`, `Pump`, `ReapplySealed`); `SimClient` (outbox signed once, `TamperedSignature`, `VerifyHead`, `VerifyAccount`, `VerifyIncluded`, `VerifyExpiredReply`, `VerifyFills`); `SimCluster::Create(1)`; `RunWalkingSkeleton`, `ManifestOf`, `EvaluateP6`, `RunSuite`, `SuiteJson`; `fm2-sim` | `SimCluster::Create(n>1)` (M4-SIM-01), crash, drop, delay, partition and skew faults in `CheckFaultPlan` (M4-SIM-02), `SimCluster::CreateTwins` (M4-SIM-03); N9 expects WITHDRAW's typed refusal (M2-LED-05) | scheduler (M0-SIM-01) |
 | `contrib/flowmesh2/` | R1, R2 | `check_inventory.py`, `check_todo.py`, `check_guards.py` (+ `test_check_guards.py`, `guard_fixtures/`), `check_negative_compile.py`, `evidence.py` (+ `test_evidence.py`), `canaries/` | `evidence.py perf-metadata` (M0-EVD-01) | — |
 | `storage/durable.h`, `test/compile_fail/` | R2 | `Durable<K>` token type (no minter until R8); missing-`LOCK`, ignored-`Result` and forged-token controls with fixed forms and a positive control | — | — |
 
@@ -185,9 +191,9 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `fm2_verify` | `verify/` (since R11), namespace `flowmesh2::verify` | `fm2_types`, `bitcoin_crypto` (public); never `fm2_core` or the C1 library (guard rules 1, 3 and 4; R11 widens rules 1 and 3 to every fm2_core directory and namespace and to C1) |
 | `fm2_core` | ledger, engine, state, storage, chain, agreement (since R10), admission (since R12), read, net, bridge, futures, governance; application code lives in namespaces `flowmesh2::ledger`, `::engine`, `::state`, `::storage` (guard rule 3 matches them); `agreement/` uses `flowmesh2::agreement`, `chain/` `flowmesh2::chain`, `read/` (since R11) `flowmesh2::read`, `admission/` (since R12) `flowmesh2::admission`, and (since R13) `net/` `flowmesh2::net`, `bridge/` `flowmesh2::bridge`, `futures/` `flowmesh2::futures`, `governance/` `flowmesh2::governance` | `fm2_types` (public, since R5); `crc32c` (private, since R8: record framing); `flowmesh2_foundations` (public, since R11: `read/` publishes into the C1 `ReadSlot`, and since R13 `net/` queues into C1 `BoundedMailbox`es; the C1 target is unchanged) (`bitcoin_util` comes through `fm2_types`) |
 | `fm2_dev` | `dev/` (since R10: `fake_chain`, `dev_certifier`; since R12: `dev_budget`), namespace `flowmesh2::dev`; `FM2_DEV_COMPONENTS` is defined PUBLIC, and every dev header has `#error` without it | `fm2_core` (public) |
-| `fm2_simlib` | `sim/` | `fm2_dev`, `fm2_core`, `fm2_verify`, `bitcoin_common` (for `CKey` only) |
-| `test_flowmesh2` | `test/` | all of the above (`fm2_dev` since R10, `fm2_verify` since R11; 476 Boost cases since R13), `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files and, since R8, `FM2_TEST_TMP_DIR` (`<build>/fm2-test-tmp`) for the file journal's temporary directories; global fixture `ECC_Context` (`test/main.cpp`) |
-| `fm2_sim_cli` | binary `fm2-sim` | `fm2_simlib` |
+| `fm2_simlib` | `sim/` (since R14), namespace `flowmesh2::sim`; not a deterministic directory by guard rule (it owns the seeded `FastRandomContext`), may sign like `dev/` and `test/` (rule 7); the node and cluster headers have `#error` without `FM2_DEV_COMPONENTS` | `fm2_dev`, `fm2_core`, `fm2_verify`, `bitcoin_common` (for `CKey` only) and `secp256k1`, all public; linked only by `test_flowmesh2` and `fm2_sim_cli` |
+| `test_flowmesh2` | `test/` | all of the above (`fm2_dev` since R10, `fm2_verify` since R11, `fm2_simlib` since R14; 505 Boost cases since R14), `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files and, since R8, `FM2_TEST_TMP_DIR` (`<build>/fm2-test-tmp`) for the file journal's temporary directories; global fixture `ECC_Context` (`test/main.cpp`) |
+| `fm2_sim_cli` | binary `fm2-sim` (since R14; `sim/fm2_sim_main.cpp`) | `fm2_simlib`; guard rule 3 inspects it for V1 symbols (`ALWAYS_INSPECTED`) |
 | `fm2_canary_*` | sanitizer canaries | only with `FLOWMESH2_SANITIZER_CANARIES=ON` |
 | `fm2_all` | custom target: every fm2 library and executable that is built by default | — |
 
@@ -293,7 +299,15 @@ header marked *landed* is normative; the others are the target contract.
 | `futures/futures.h`, `governance/governance.h` | R13 | landed (stubs) | `FuturesDomain(profile)` `PlaceFuture` (M9-FUT-01), `SubmitOracle` (M9-FUT-02), `MarginCheck` (M9-FUT-03), `Sweep` (M9-FUT-04), target shapes `FutureOrder`, `OracleSubmission`, `MarginState`, `SweepReport`; `Governance(genesis_profile)` `ApplyListing` → `MarketDescriptor` (M7-GOV-01), `ApplyRemoval` (M7-GOV-02, `RemovalRequest`), `ParamsAt` (M7-GOV-03) |
 | `test/util/api_fixtures.h` | R13 | landed | TEST fixtures: `LaneLimitsOf`, `ApiLaneLimits` (an ACTION lane of n messages), `NewLaneSet`, `ApiRigOptions`, `ApiRig` (an `AdmissionRig` plus a `LaneSet` and an `InProcessApi`; `Submit`, `Reply` = pump until answered then take, `AdmitViaApi`, `GetAction`) |
 | `test/util/mesh_fixtures.h` | R13 | landed | TEST fixtures: `RecordingMesh` (a `SeatMesh` whose transport records what the base class lets through, or answers `refuse`; `Poll` from `inbound`), `TestMeshConfig`, `DurableVoteFixture` (the strict path of section 7.3 to a real `OutboundVote`) |
-| `sim/*.h` | R14 | target | section 14 |
+| `storage/seat_signer.h` (R14 addition) | R8, R14 | landed | `SignObserver::OnSigned(slot, view, digest)` after every successful `Sign`, never for a refusal; `SetSignObserver` (default none: `Sign` unchanged; O-81) |
+| `sim/clock.h` | R14 | landed | `FakeClock` (logical ms, `AdvanceTo` forward only, `CLOCK_BACKWARDS`); not a latency figure (PERF-6) |
+| `sim/scheduler.h` | R14 | landed | `SeedKey(seed)` = SHA256("fm2/sim/seed/" ‖ u64le seed); `EventKey{time_ms, tie, seq}`; `Scheduler(seed)`: `At` (`SCHED_IN_PAST`, `SCHED_EMPTY_TASK`), `After` (`SCHED_TIME_OVERFLOW`), `Jitter` (rand64 % bound, `SCHED_BAD_BOUND`), `RunUntilIdle(max)` (`SCHED_EVENT_LIMIT`), `Current`, `Pending`; REAL-REPLACE M0-SIM-01 |
+| `sim/faults.h` | R14 | landed | `FaultPlan` (real: `withhold_from_proposals` by (account, nonce), `fail_commit_barrier_at`, `bump_authority_at`; target shapes `crash_before_slot`, `DropRule`, `DelayRule`, `partition`, `SkewRule`); `CheckFaultPlan` (stub M4-SIM-02 for any target-shape fault) |
+| `sim/trace.h` | R14 | landed | `TraceEvent{kind, slot, detail, record, seq, ok}` with `Line()` and `Step()`; `TraceRecorder` (journal appends and barriers, `bls.sign`, `authority.check`, `BeginSlot`/`EndSlot`, `Record`, `Events`, `Canonical`, `Digest` = SHA256("fm2/sim/trace/1\n" ‖ trace), `BarrierCount`); `RolePrefix`; `TracingChainAdapter` (forwards, reports each `CurrentAuthority` read) |
+| `sim/sim_node.h` | R14 | landed | DEV components (`#error` without `FM2_DEV_COMPONENTS`): `SimNetwork`, `SimForeignNetwork`, `SimBlockHash`, `SimAnchor`, `SimAsset`, `SimMarketM1`/`M2`; `SimNodeConfig`, `SealedSlot`, `SealReport`; `SimNode::Create` (`CheckFaultPlan` first; `SIM_FAULT_SLOT`), `SealSlot` (section 14.6 order; `SIM_POLL_*`, `SIM_NO_DECISION`, `SIM_FAULT_MAPPING`), `Pump`, `ReapplySealed` (`SIM_NOT_SEALED`), component accessors, `Fenced` |
+| `sim/sim_client.h` | R14 | landed | `SimClient::Create`, `AccountOf`; outbox `SignOnce` (`CLIENT_LABEL_TAKEN`), `Place`, `Cancel`, `Transfer`, `Withdraw`, `Bytes`, `Action`, `TamperedSignature`; engine-off `VerifyHead` (`CLIENT_HEAD_*`), `VerifyAccount` (`CLIENT_NOT_FOUND`, `CLIENT_WRONG_ACCOUNT`), `VerifyIncluded` (`CLIENT_OUTCOME_SUBJECT`, `CLIENT_REF_MISMATCH`), `VerifyExpiredReply` (`CLIENT_NOT_EXPIRED`), `VerifyFills` (`CLIENT_UNKNOWN_MARKET`) |
+| `sim/cluster.h` | R14 | landed | `SimCluster::Create(n)` (0: `CLUSTER_EMPTY`; 1: real; more: stub M4-SIM-01), `CreateTwins` (stub M4-SIM-03), `Size`, `Node` |
+| `sim/scenario.h` | R14 | landed | `Variant` (WALKING_SKELETON=1, STORAGE_FAULT=2, AUTHORITY_FAULT=3; append-only), `ToString`, `VariantFromName`, `AllVariants`; `AllChecks`, `ManifestOf`, `SuiteChecks`; `CheckResult`, `CheckMap`, `RunReport` (`Passed`), `RunWalkingSkeleton`; `EvaluateP6`; `SuiteReport`, `RunSuite`, `SuiteJson` |
 
 ---
 
@@ -391,6 +405,8 @@ header marked *landed* is normative; the others are the target contract.
 | `LaneSet` | `m_mutex` | per-lane counts of queued messages and bytes, all classes and ORDINARY (R13) | count updates only: a push reserves its counts, releases the lock, then calls the C1 mailbox (which takes its own mutex) and rolls back on refusal; a pop subtracts after the mailbox call |
 | `InProcessApi` | `m_mutex` | request map (QUEUED, PROCESSING, REPLIED and the stored replies) and the reply reservation count (R13) | map operations only: never across a lane push or pop, admission, a read or a pool call |
 | `FakeChainAdapter` (dev) | `m_mutex` | chain, authority, seat sets, BUSY queue, pending rewind, hooks (R10) | each method; never across a call into another object; `JournalHook` callbacks take it on the barrier thread, which holds no journal lock |
+| `TraceRecorder` (sim) | `m_mutex` | events, the current slot, barrier counts (R14) | one append or copy; journal and signer callbacks arrive without the journal's lock, and `TracingChainAdapter` reads the inner adapter (its own mutex) before it records, so no two mutexes are ever held together |
+| `Scheduler`, `SimNode`, `SimClient`, scenario driver (sim) | none | (R14) one simulation thread drives them; the components they compose keep their own locks | — |
 | C1 `BoundedMailbox`, `ReadSlot` | internal | as C1 | as C1 |
 
 In the outline, barriers on one journal are issued by one thread (the sealing
@@ -1168,7 +1184,7 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R13)
+### 13.1 Today (after R14)
 
 The commands in 13.2 work. They build every fm2 target (`fm2_all`): the
 libraries `fm2_types` and `fm2_core` (since R5; `engine/` since R6,
@@ -1176,10 +1192,12 @@ libraries `fm2_types` and `fm2_core` (since R5; `engine/` since R6,
 and `agreement/` since R10, `read/` since R11, `admission/` since R12,
 `net/`, `bridge/`, `futures/` and `governance/` since R13),
 `fm2_dev` (since R10; the dev budget since R12), `fm2_verify` (since R11),
-`test_flowmesh2` (476 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
-19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
-`flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
-and `flowmesh2_negative_compile` (Clang). The outline never uses `build/`,
+`fm2_simlib` and the `fm2-sim` CLI (since R14), `test_flowmesh2` (505 Boost
+cases), the unchanged C1 binary and, with the option on, the canaries. They
+run ten CTests: `flowmesh2_foundations` (C1, 19 cases), `flowmesh2_sim`,
+`flowmesh2_sim_cli_determinism`, `flowmesh2_unit`, `flowmesh2_inventory`,
+`flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
+`flowmesh2_evidence_selftest` and `flowmesh2_negative_compile` (Clang). The outline never uses `build/`,
 `build-qt/` or `build-nofullfsync/`. Passing `-DBUILD_BENCH=OFF
 -DBUILD_FUZZ_BINARY=OFF` only shortens the configure.
 
@@ -1197,6 +1215,7 @@ COMMON=(-DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 cmake -S . -B build-rebirth "${COMMON[@]}" -DBUILD_FLOWMESH2=ON
 cmake --build build-rebirth --target fm2_all --parallel 4   # every fm2 target (the nm guard needs all of them)
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
+build-rebirth/bin/fm2-sim --scenario all --seeds 1-32 > fm2-sim.json   # exit 0 only if every check ran and passed
 ```
 
 Isolation and sanitizer checks:
@@ -1240,6 +1259,13 @@ under `build-rebirth/fm2-test-tmp/`.
 (R2), `flowmesh2_guards_selftest` (R2), `flowmesh2_negative_compile` (R2,
 Clang only), `flowmesh2_evidence_selftest` (R2), `flowmesh2_sim` (R14),
 `flowmesh2_sim_cli_determinism` (R14).
+
+- **Simulator** (R14): `flowmesh2_sim` runs `fm2-sim --scenario all --seeds
+  1-32` (every variant, every seed twice for P6) and passes only on exit 0.
+  `flowmesh2_sim_cli_determinism` runs `contrib/flowmesh2/sim_determinism.cmake`
+  (`cmake -P`), which runs `fm2-sim --scenario all --seeds 1-8` twice into
+  `<build>/fm2-test-tmp/sim_determinism/` and requires exit 0 both times, a
+  non-empty output and byte-identical files (O-88).
 
 - **Inventory:** `test/INVENTORY.txt` lists every case (`suite/case`, sorted
   bytewise). `check_inventory.py` requires the inventory, the cases the binary
@@ -1462,6 +1488,55 @@ The checks manifest is {P1-P8, N1-N13} plus the three variants. A check that doe
 not run counts as a failure; `fm2-sim` exits 0 only if every check ran and
 passed. Its JSON has sorted keys and no times, paths or pointers.
 
+### 14.6 As landed in R14
+
+- **One node, real components.** `SimCluster::Create(1)` builds one
+  `SimNode`: the `FakeChainAdapter` over base (129, `SimBlockHash(129)`)
+  seen through a `TracingChainAdapter`, a SIGNER (instance 1) and a COMMIT
+  (instance 2) `MemoryJournal` observed by the `TraceRecorder`, their logs,
+  the seat signer (IKM `SHA256("fm2/sim/seat0")`, observed) and its
+  PoP-verified seat set, the genesis head, `StateOwner`, `ReadService`
+  (8 readers, 8 views), `ActionPool` (`FromProfile`), `UnlimitedDevBudget`,
+  `Admission`, `LaneSet` (`ProvisionalLaneLimits`), `InProcessApi` (64
+  replies) and the `DevSingleSeatCertifier`. Clients submit through the
+  API (lanes, then admission), and read through `GetState`, `GetAction`
+  and `ReadService::OrderFills`.
+- **`SealSlot`** (P3): `slot.begin`, `chain.poll` (from the head's
+  `facts_to`, `MAX_SLOT_FACTS`), `pool.take` (with the plan's withhold
+  filter), `state.preview` (inputs from the batch: its authority, anchor,
+  range and facts), the plan's `fault.bump_authority`, then exactly the P3
+  order of 14.4 (the certifier's checks 1 and 2 and the node's check-3
+  read are the three `authority.check` events), `slot.end`. A
+  STORAGE_FATAL, FENCED or AUTHORITY_CHANGED result also records
+  `node.fence` (once) and fences admission (O-82, O-85).
+- **Script.** 14.2 exactly: block 130 holds D1-D3 (outpoints
+  `SHA256("fm2/sim/T<n>")`:0), so slot 1 takes facts [(130, 0), (131, 0))
+  and later slots are heartbeats of the same anchor. Every action is
+  signed with `ref_slot` = the client's verified head (w and N2 name
+  theirs). Steps with more than one independent submission (a with b, e
+  with f) are where the seed permutes the admission order; each
+  negative check that counts signature verifications (N1, N4, N5, N6, N8,
+  N9, N12, N2) is its own step, so its counter delta is exact (O-85).
+  `SealSlot` runs only between steps, after `RunUntilIdle`.
+- **Manifests** (O-83): `walking_skeleton` runs P1-P5, P7, P8, N1-N9, N12,
+  N13; `walking_skeleton_storage_fault` runs P2-P4, P8 and N10 (slots 1-2,
+  then slot 3 fails at B-DECISION, then a second `SealSlot` is FENCED);
+  `walking_skeleton_authority_fault` runs P2-P4, P8 and N11 (slots 1-2,
+  then the bump of slot 3). P6 is `EvaluateP6` over a suite. 14.2's
+  outcome table and 14.3's final state (client-verified leaves R1 and the
+  independent recomputation R2 from the deposit facts and every certified
+  outcome delta, plus the books) are part of P5. P3 also decodes every
+  append's durable record (the proposal key, intent and vote keys, the
+  decision header, the applied slot) and requires it to belong to its
+  window's slot, or to be absent after a failed barrier.
+- **Goldens.** The tie orders of seeds 1 and 2 and `SeedKey` come from an
+  independent stdlib Python ChaCha20 (RFC 8439 block function,
+  self-checked). The canonical body orders of slots 2-4 (P1: a,b / c,d /
+  e,f), the slot-5 header hash and the final state root are pinned from
+  the C++ output (O-87).
+- **Runtime** (no latency claim, PERF-6): on the outline's macOS host the
+  full CLI suite (3 variants × 32 seeds × 2 runs) takes about 4 s.
+
 ---
 
 ## 15. Contradictions reported (solve-and-report)
@@ -1551,6 +1626,14 @@ outline does not resolve on its own.
 | O-77 | Lane reserve semantics | The reserved share is ⌈10 %⌉ of each lane's messages AND bytes; ORDINARY traffic is capped at the rest; CANCEL, STATUS and HEALTH may use the whole lane; inside a lane every class is FIFO (capacity, not priority). Strict priority between lanes can starve BULK under sustained higher traffic (the research proposes deficit round-robin below CRITICAL). Only a frame that decodes exactly as a cancel gets the CANCEL class, but a well-formed cancel with a bad signature still uses the shared reserve until admission refuses it; dividing the reserve between accounts (the plan's "up to the account's open-order count") is M4-ADM-02's, the limits M4-NET-04's |
 | O-78 | Request model of the in-process API beyond the slice text | Queued status and health requests (`SubmitStatus`, `SubmitHealth`) give "status" and "health" their lane class; `GetAction` and `GetState` are also synchronous (reads never wait on the pump, PERF-12). A `RequestId` names one queued request (sequential per API instance, never an ActionId), and a refused submit consumes an id but leaves nothing. The ACTION lane of the `LaneSet` belongs to the API; `Pump` pops only that lane (the dispatcher of CRITICAL, PROPOSAL and BULK belongs to the agreement and the mesh, M4-SIM-01, M4-NET-01) and refuses a foreign message with INVARIANT, dropping it. Replies are bounded by `max_replies`, reserved before each pop. A frame above the lane cap is OVERSIZE at `Submit` instead of an admission OVERSIZE reply. Admission errors are replies (`ApiReply::body` holds the `Error`) |
 | O-79 | What the mesh lets through `Send` | CRITICAL carries only VIEW_CHANGE, NEW_VIEW and EVIDENCE through `Send`, PROPOSAL only PROPOSAL (the envelope's version and type bytes are checked, the receiver decodes the rest), a VOTE never; ACTION and BULK are opaque, which relies on receivers reading a frame only as its lane's content. View changes and new views leave without a durable token in the outline: before PBFT sends them, M4-STO-07 and M4-AGR-02 must add typed durable paths like `SendVote` |
+| O-81 | The trace needs to see the BLS vote signature (14.4 P3 names `bls.sign`), but `SeatSigner::Sign` (R8) had no hook | R14 adds `storage::SignObserver` and `SeatSigner::SetSignObserver`: after a successful `Sign`, and before it returns, the observer gets the intent's slot, view and digest (never the key or the token); a refused `Sign` is not reported; without an observer `Sign` is unchanged (a test checks the signature bytes are identical). A change to a landed R8 type; M0-AUD-01 should confirm it, or replace it with a trace hook in the certifier |
+| O-82 | What the trace can attribute | Journal callbacks (R8 `BarrierObserver`) do not name a record's slot, so events are stamped with the slot being sealed and P3 decodes each append's durable record to prove the slot. `authority.check` is a read of `CurrentAuthority` through `TracingChainAdapter`: the certifier's checks 1 and 2 (`CheckAuthority`) and the node's read for `Apply` (check 3) are the only reads during a slot, because the node takes the slot's authority from the poll batch. P3 is checked as the exact step list of each window, extended by `slot.begin`, `chain.poll`, `pool.take`, `state.preview` before the 14.4 list and `slot.end` after it, and by `fault.bump_authority` and `node.fence` in the fault variants |
+| O-83 | One manifest cannot hold N10 and N11 (each needs its own fault) or P6 (several runs) | Each variant has its own manifest (14.6) and P6 is a suite check (`EvaluateP6`: same seed twice gives the same digest, headers and root; every seed the headers and root of the first; at least two distinct digests over 8 or more seeds of the base variant, so a seed that permutes nothing fails). The union of the three manifests and the suite check is exactly {P1-P8, N1-N13} (tested). 14.2's outcome table and 14.3's final state are asserted under P5, whose last line "(R2 = R1.)" is read as: the independent recomputation equals the client-verified leaves |
+| O-84 | Mapping `fail_commit_barrier_at` onto the memory journal's 1-based barrier fault | Slot s's B-DECISION is commit barrier 2s - 1 when every earlier slot issued exactly B-DECISION and B-APPLIED. `SealSlot` of s checks the trace's commit-barrier count first and answers INVARIANT (`SIM_FAULT_MAPPING`) if it is not 2(s - 1), so a wrong mapping is never silent; once the fault fired (journal fatal) the plan is spent. N10 also asserts that the failed barrier came right after slot 3's DECISION append |
+| O-85 | Interpretations of 14.5 | N10's "next SealSlot returns FENCED" goes through Poll, Take and Preview, and FENCED comes from the dev certifier (`DEV_FENCED`), before any write or authority check; FENCED also fences admission (idempotent). N10's new submit and N11's are Bob's e. N2, N6, N8, N9 and N12 run in steps of their own (the signature counter is per node, so a shared step could not attribute it). The fault variants seal slots 1-2 with a and b and admit c and d before slot 3 |
+| O-86 | Client trust inputs and keys | A `SimClient` trusts the node's seat set, the profile and the two markets it is created with; it verifies with b3verify only, plus field comparisons of the reply's commit identity, scope and label against the certified header (it does not call `read::ScopeOf`). Signing needs an `ECC_Context` (the CLI and the test runner hold one). The BIP340 aux randomness is `SHA256("fm2/sim/aux/<name>/<label>")`, so actions_root does not depend on the seed; `TamperedSignature` flips signature byte 0 of a copy, never stored |
+| O-87 | Which goldens are independent | The scheduler goldens (`SeedKey`, the tie orders of seeds 1 and 2) are recomputed by a separate stdlib Python script with its own ChaCha20 (R14 evidence `golden.py`). The canonical body orders of slots 2-4, the slot-5 header hash and the final state root are pinned from the C++ output, as R4 pinned its BLS keys: they depend on every header field before them, and an independent model of the whole engine is M3-ENG-05's |
+| O-88 | Where the determinism script lives | `src/flowmesh2/` may hold exactly one CMake file and no CMake file outside it may name an fm2 target (guard rule 4), so `sim_determinism.cmake` is in `contrib/flowmesh2/` and gets the binary as `-DSIM=$<TARGET_FILE:...>`. The JSON labels itself PROVISIONAL REGTEST and carries no time, path or pointer; its trace digests depend on the seed's admission order, its header hashes and roots do not |
 | O-80 | Product-boundary target shapes | `bridge::Checkpoint` repeats the fields of `verify::CheckpointClaim`, because `fm2_core` never links `fm2_verify`; M8-CKP-01 moves one shared type into `core/` (the O-33 pattern). `OnFinalizedMint` returns the `DepositFact` the chain adapter will deliver; `ForcedExit` counts B3 heights only; `FuturesDomain` and `Governance` hold a profile. No stub checks the network or validates its inputs before answering NotImplemented. Every shape may change with its task. The bridge rows stay gated by CLAUDE.md rules 5 and 6 and plan C-6; nothing names a vault, a contract or a key |
 
 ---

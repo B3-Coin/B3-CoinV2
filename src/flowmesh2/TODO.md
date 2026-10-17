@@ -31,7 +31,11 @@ action pool, the budget policy and, in `fm2_dev`, the unlimited dev
 budget) and **R13** (the service lanes with their reserved share for
 cancel, status and health, the client API contract and the in-process
 API, the seat mesh interface, and the bridge, futures and governance
-boundaries as typed stubs).
+boundaries as typed stubs) and **R14** (the deterministic simulator: the
+fake clock, the seeded scheduler, the fault plan, the trace recorder, the
+simulated node and client, and the walking skeleton with its checks
+manifest and the `fm2-sim` CLI). With R14 every outline slice has landed;
+the next task is M0-AUD-01.
 Their rows are `outline` until M0-AUD-01 accepts them, and so are the rows
 they tag: M0-EVD-01 (R2); M3-ENG-03, M3-ENG-08, M9-FUT-01, M4-STO-05 and the
 REAL-REPLACE M3-ENG-11 (R3); M4-ADM-01, M7-SEAT-01, M7-GOV-01, MB1-B3D-02,
@@ -51,7 +55,9 @@ M4-ADM-01, M2-LED-05, M2-LED-06, M3-ENG-09 and the REAL-REPLACE M2-ADM-01
 gain R12 sites there); M5-API-01, M5-API-02, M4-SIM-01, M4-NET-01,
 M4-NET-02, M4-NET-03, M8-BRG-01, M8-BRG-03, M9-FUT-02, M9-FUT-03, M7-GOV-02
 and M7-GOV-03 (R13; M7-GOV-01, M8-BRG-02, M8-CKP-01, M8-EXIT-01, M9-FUT-01
-and M9-FUT-04 gain R13 sites there).
+and M9-FUT-04 gain R13 sites there); M4-SIM-02, M4-SIM-03 and the
+REAL-REPLACE M0-SIM-01 (R14; M4-SIM-01 gains its R14 site there, and the
+walking skeleton's check N9 tags M2-LED-05).
 Every other row is `todo`, except the C1 baseline, which is `done`.
 
 ---
@@ -169,7 +175,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | R11 | R | outline | — | R11 | Read service on C1 `ReadSlot`, b3verify | `read/views`, `read_service`; `verify/b3verify` (library `fm2_verify`); `core/merkle` `MerkleTree`; `test/util/verify_fixtures.h`, `read_fixtures.h`; guard rules 1 and 3 widened (`contrib/flowmesh2/check_guards.py`, self-test) | mismatched token refused; 4 readers + 1 publisher × 2,000 iterations: every reply from one head; eviction then `UNKNOWN`; outcome index below `max_delay` refused at `Create`; maker fill lookup; `VerifyCertificate` passes and fails for wrong seat set, tampered header, below-quorum bitmap, bit ≥ k, other-subset aggregate; tampered outcome proof, wrong fee or delta fail; `VerifyExpired` negatives; `fm2_verify` has no `fm2_core` symbols | scratch:R11/ | SEC-5, INV-13, DUR-5, O-63, O-64, O-65, O-66, O-67, O-68 |
 | R12 | R | outline | — | R12 | Admission and action pool | `admission/admission`, `pool`, `budget`; `dev/dev_budget` (fm2_dev); `test/util/admission_fixtures.h` | every code once with counters: no signature check before A8, `BAD_SIG` adds 1, `NONCE_USED`/`NONCE_PENDING` only after a valid signature; precedence table; included action resent after its window gives `DUPLICATE`, not `EXPIRED`; `REF_SLOT_AHEAD` near `UINT64_MAX` without overflow; pool `IN_PROPOSAL`, expiry, capacity, withhold filter, commit removal, same-nonce loser terminal `NONCE_USED` | scratch:R12/ | PLAN-9, DUR-4, DUR-6, O-15, O-69, O-70, O-71, O-72, O-73, O-74 |
 | R13 | R | outline | — | R13 | Service lanes, in-process API, mesh interface, product-boundary stubs | `net/` (`lanes`, `client_api`, `in_process_api`, `https_sse_api`, `seat_mesh`, `in_process_mesh`, `tcp_mesh`, `short_id`, `sentry`); `bridge/` (`bridge_manager`, `checkpoint`, `forced_exit`); `futures/futures`; `governance/governance`; `test/util/api_fixtures.h`, `mesh_fixtures.h` | lane priority; cancel and status accepted while the ACTION lane is full; `BUSY` leaves no queued copy; 4 submit threads + pump + publisher give exactly one reply per request ID; `GetAction` never returns `EXPIRED` without a verifying proof; every stub returns its ID | scratch:R13/ | SEC-3, SEC-4, UX-7, DUR-6, PERF-12, O-75, O-76, O-77, O-78, O-79, O-80 |
-| R14 | R | todo | — | R14 | Deterministic simulator and walking skeleton | `sim/*`; `fm2-sim` | ARCHITECTURE.md §14: P1-P8 and N1-N13 for seeds 1..32 and the three variants; scheduler tie orders for seeds 1 and 2 match goldens; same seed twice gives the same trace digest; CLI output byte-identical across two runs; full `ctest -L flowmesh2` green | scratch:R14/ | PERF-6 (no latency claim) |
+| R14 | R | outline | — | R14 | Deterministic simulator and walking skeleton | `sim/` (`clock.h`, `scheduler`, `faults.h`, `trace`, `sim_node`, `sim_client`, `cluster`, `scenario`, `fm2_sim_main.cpp`; library `fm2_simlib`, CLI `fm2_sim_cli` = `fm2-sim`); `storage/seat_signer` (`SignObserver`, O-81); `contrib/flowmesh2/sim_determinism.cmake`; CTests `flowmesh2_sim`, `flowmesh2_sim_cli_determinism` | ARCHITECTURE.md §14: P1-P8 and N1-N13 for seeds 1..32 and the three variants; scheduler tie orders for seeds 1 and 2 match goldens; same seed twice gives the same trace digest; CLI output byte-identical across two runs; full `ctest -L flowmesh2` green | scratch:R14/ | PERF-6 (no latency claim), O-81, O-82, O-83, O-84, O-85, O-86, O-87, O-88 |
 
 ## M0 — verification foundation (plan addition)
 
@@ -182,7 +188,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M0-FUZ-01 | M0 | todo | NONE | — | `FUZZ_TARGET` for every fm2 decoder: `ActionV2`, `SlotBody`, `SlotHeaderV2`, `OutcomeV2`, `AccountLeafV0`, `SlotCertificate`, agreement messages, journal records, `FactBatch` | new | 60 s smoke each; a planted decoder bug is found | M0/M0-FUZ-01/ | plan L5 |
 | M0-PRP-01 | M0 | todo | NONE | — | Property catalogue v1 plus a guard that every P-ID has a test | new | the guard fails when a test is missing | M0/M0-PRP-01/ | plan M0 |
 | M0-GUIX-01 | M0 | todo | NONE | — | Guix build of the fm2 binaries on 2 hosts | new | identical hashes | M0/M0-GUIX-01/ | SEC-6 |
-| M0-SIM-01 | M0 | todo | REAL-REPLACE | R14 | Record/replay and trace minimizer | `sim/scheduler.cpp` | 1,000 seeds replay byte-identical; a planted failure is minimized | M0/M0-SIM-01/ | plan M0 |
+| M0-SIM-01 | M0 | outline | REAL-REPLACE | R14 | Record/replay and trace minimizer | `sim/scheduler.cpp` (`Scheduler::At` draws the seeded tie of a plain `std::map` event queue; R14) | 1,000 seeds replay byte-identical; a planted failure is minimized | M0/M0-SIM-01/ | plan M0 |
 | M0-SPEC-01 | M0 | todo | NONE | — | Quint/Apalache toolchain and PBFT spec skeleton | new | the spec check runs in CI | M0/M0-SPEC-01/ | D9, OWNER-GATED |
 | M0-EVD-01 | M0 | outline | STUB | R2 | PERF-7 metadata: fsync probe, RTT matrix, `nr_throttled`, B3-advanced flag, topology | `evidence.py perf-metadata` (exits 3) | `verify` fails when a field is missing | M0/M0-EVD-01/ | PERF-6, PERF-7 |
 
@@ -206,7 +212,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M2-LED-02 | M2 | outline | STUB | R5, R11 | SMT commitment v1 (`commitment_version = 1`) with non-membership proofs and typed `SlotView` proofs | `ledger::CommitV1` (`ledger/state_commitment`, R5); `read/views` `SlotView` v0 account leaves and tree levels, built O(state) per publish (R11) | SMT vectors; proof ≈ 768 B; timing; b3verify switched; no O(state) work per publish | M2/M2-LED-02/ | plan §3.7, O-9 |
 | M2-LED-03 | M2 | outline | STUB | R5 | Merkle-sum liability tree per asset | `ledger::LiabilitySumRoot` (`ledger/state_commitment`) | sums in [0, 2^62]; inflation detected | M2/M2-LED-03/ | PLAN-3 |
 | M2-LED-04 | M2 | outline | STUB | R5 | `exit_value` per leaf | `ledger::ExitValue` (`ledger/state_commitment`) | vectors | M2/M2-LED-04/ | PLAN-16 |
-| M2-LED-05 | M2 | outline | STUB | R5, R7, R12 | WITHDRAW → pending reservation with a deterministic capacity bound | `LedgerState::RequestWithdrawal` (`ledger/ledger`, R5); engine branch `PhaseOf` WITHDRAW (`engine/engine`, R7; `ValidateSlotInputs` refuses the kind first); admission `KindAdmissible` WITHDRAW → `UNSUPPORTED_KIND` with reason M2-LED-05 (`admission/admission`, R12) | withdrawal and two-market conflict tests; conservation includes pending | M2/M2-LED-05/ | TRD-21 |
+| M2-LED-05 | M2 | outline | STUB | R5, R7, R12 | WITHDRAW → pending reservation with a deterministic capacity bound | `LedgerState::RequestWithdrawal` (`ledger/ledger`, R5); engine branch `PhaseOf` WITHDRAW (`engine/engine`, R7; `ValidateSlotInputs` refuses the kind first); admission `KindAdmissible` WITHDRAW → `UNSUPPORTED_KIND` with reason M2-LED-05 (`admission/admission`, R12); the walking skeleton's check N9 expects exactly that refusal (`sim/scenario.cpp`, R14), so this task updates N9 and ARCHITECTURE.md 14.5 | withdrawal and two-market conflict tests; conservation includes pending | M2/M2-LED-05/ | TRD-21 |
 | M2-LED-06 | M2 | outline | STUB | R5, R7, R12 | `SPOT_TO_FUTURES` / `FUTURES_TO_SPOT` cash transfers with a risk gate | `LedgerState::TransferToFutures`, `TransferFromFutures` (`ledger/ledger`, R5); engine branches `PhaseOf` (`engine/engine`, R7); admission `KindAdmissible` → `UNSUPPORTED_KIND` with reason M2-LED-06 (`admission/admission`, R12) | model A-D7 cases; unknown risk refuses | M2/M2-LED-06/ | TRD-13 |
 | M2-LED-07 | M2 | outline | REAL-REPLACE | R5 | Model-exact duplicate-fact rules; also decide whether a zero-amount or protocol-target deposit fact is a certified refusal instead of an invalid slot (O-34) | `LedgerState::CreditDeposit` (`ledger/ledger`; the outline refuses every second fact for an outpoint) | differential cases | M2/M2-LED-07/ | TRD-3 |
 | M2-LED-08 | M2 | todo | NONE | — | Stateful ledger fuzz ≥ 24 CPU-h | new | 0 findings | M2/M2-LED-08/ | plan M2 |
@@ -278,9 +284,9 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M4-NET-04 | M4 | todo | NONE | — | Protocol-derived budgets; also replaces the provisional lane limits and decides deficit round-robin below CRITICAL (O-77) | new; replaces `net/lanes` `ProvisionalLaneLimits` | budget tests | M4/M4-NET-04/ | D13 |
 | M4-ADM-01 | M4 | outline | STUB | R4, R12 | `CCheckQueue` batch BIP340 plus `CuckooCache` | `core/action` `BatchVerifier::VerifyBatch` (R4); admission batch path `Admission::AdmitBatch` (`admission/admission`, R12) | same results as sequential | M4/M4-ADM-01/ | plan §3.2 |
 | M4-ADM-02 | M4 | outline | STUB | R12 | Credit budgets; rule whether a budget charges per attempt or per admission (O-73) and how the lanes' reserved CANCEL share is divided between accounts (O-77) | `admission/budget` `CreditBudget::Create` and `Check` (`CreditBudgetParams` holds the plan's proposed defaults) | budget and cancel-lane tests | M4/M4-ADM-02/ | SEC-4, D13, BLOCKED-ON-RULING |
-| M4-SIM-01 | M4 | outline | STUB | R13, R14 | Multi-node DST (N=4, 7) ≥ 1,000 CPU-h over an in-process mesh | `InProcessSeatMesh::Create` (`net/in_process_mesh`, R13); `SimCluster::Create(n>1)` (R14) | 0 violations | M4/M4-SIM-01/ | plan M4 |
-| M4-SIM-02 | M4 | todo | STUB | R14 | Crash, drop, delay, partition and skew hooks | `FaultPlan` | each hook exercised | M4/M4-SIM-02/ | plan L4 |
-| M4-SIM-03 | M4 | todo | STUB | R14 | Twins and mutation fuzzing | `SimCluster` Twins | the Twins set passes | M4/M4-SIM-03/ | plan M4 |
+| M4-SIM-01 | M4 | outline | STUB | R13, R14 | Multi-node DST (N=4, 7) ≥ 1,000 CPU-h over an in-process mesh | `InProcessSeatMesh::Create` (`net/in_process_mesh`, R13); `SimCluster::Create(n>1)` (`sim/cluster`, R14; a cluster of one node is real) | 0 violations | M4/M4-SIM-01/ | plan M4 |
+| M4-SIM-02 | M4 | outline | STUB | R14 | Crash, drop, delay, partition and skew hooks | `CheckFaultPlan` (`sim/faults.h`, R14): the target shapes `crash_before_slot`, `DropRule`, `DelayRule`, `partition`, `SkewRule`; `SimNode::Create` runs it first. The three real faults (withhold, the commit-barrier failure, the authority bump) stay | each hook exercised | M4/M4-SIM-02/ | plan L4 |
+| M4-SIM-03 | M4 | outline | STUB | R14 | Twins and mutation fuzzing | `SimCluster::CreateTwins` (`sim/cluster`, R14) | the Twins set passes | M4/M4-SIM-03/ | plan M4 |
 | M4-SEP-01 | M4 | todo | NONE | — | Separate-process fault campaign plus an independent issued-signature checker | new | [CC] C4 exit | M4/M4-SEP-01/ | [CC] C4 |
 
 ## M5 — [CC] C6 API, b3verify, Hive

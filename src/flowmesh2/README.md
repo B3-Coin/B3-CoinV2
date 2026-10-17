@@ -153,7 +153,17 @@ lane, and `GetAction` from one read lease that answers EXPIRED only with
 a proof), and the seat mesh interface whose only vote path takes a
 durable vote; HTTPS + SSE, streams, the real meshes, short IDs, sentry
 fan-out and the `bridge/`, `futures/` and `governance/` boundaries are
-typed stubs. Nothing is linked into the node, wallet or Qt.
+typed stubs; and **R14**, the deterministic simulator in `sim/` (library
+`fm2_simlib`, CLI `fm2-sim`): a fake clock and a scheduler seeded from
+the run's seed, a fault plan (withhold an action, fail the commit barrier
+after a slot's DECISION, bump the authority between Preview and Propose),
+a trace recorder over the journals, the seat signer and the chain
+authority, a simulated node built from the real components and a client
+that signs each action once and verifies everything with b3verify, and
+the walking skeleton of ARCHITECTURE.md §14 with all its checks for every
+seed; multi-node clusters, crash, drop, partition and skew faults, and
+Twins are typed stubs. Every outline slice has landed; Codex's first task
+is the audit M0-AUD-01. Nothing is linked into the node, wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -163,10 +173,12 @@ cmake -S . -B build-rebirth -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_WALLET_TOOL=OFF -DENABLE_WALLET=OFF -DENABLE_IPC=OFF -DWITH_CCACHE=OFF
 cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
+build-rebirth/bin/fm2-sim --scenario all --seeds 1-32   # JSON on stdout; exit 0 only if every check passed
 ```
 
-Expected after R13: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 476 cases, `flowmesh2_inventory`,
+Expected after R14: 10 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_sim`, `flowmesh2_sim_cli_determinism`, `flowmesh2_unit`
+with 505 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
 `flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`
 with four controls). The file journal tests write only under
