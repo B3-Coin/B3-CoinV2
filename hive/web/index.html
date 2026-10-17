@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>B3 Hive</title>
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>B3 Hive</h1>
+      <p class="phase" id="phase">Starting the node…</p>
+      <p class="detail" id="detail"></p>
+      <dl id="chain" hidden>
+        <dt>Network</dt><dd id="chain-name"></dd>
+        <dt>Blocks</dt><dd id="chain-blocks"></dd>
+        <dt>Best block</dt><dd id="chain-best"></dd>
+      </dl>
+    </main>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>
