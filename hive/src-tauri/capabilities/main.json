@@ -10,6 +10,8 @@
     "allow-wallet-overview",
     "allow-dev-fund",
     "allow-draft-send",
-    "allow-open-console"
+    "allow-open-console",
+    "allow-ui-theme",
+    "allow-set-ui-theme"
   ]
 }

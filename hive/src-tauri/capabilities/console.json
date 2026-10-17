@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "console",
-  "description": "Console window: run typed RPC commands with full access, as the Qt console does. Nothing else.",
+  "description": "Console window: run typed RPC commands with full access, as the Qt console does, and read the theme. Nothing else.",
   "windows": ["console"],
   "permissions": [
     "allow-console-exec",
     "allow-console-completions",
-    "allow-console-wallets"
+    "allow-console-wallets",
+    "allow-ui-theme"
   ]
 }

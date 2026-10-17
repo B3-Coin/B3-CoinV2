@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, Window,
     WindowEvent,
@@ -33,6 +33,15 @@ const CONSOLE: &str = "console";
 pub struct Core {
     node: Arc<Node>,
     drafts: Mutex<DraftStore>,
+    /// The theme picked in the main window, so the other windows open in it.
+    theme: Mutex<Option<Theme>>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    Light,
+    Dark,
 }
 
 #[derive(Clone, Serialize)]
@@ -131,6 +140,19 @@ async fn open_console(app: AppHandle) -> Result<(), String> {
         .build()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// The theme picked in the main window, or None to follow the system.
+#[tauri::command]
+fn ui_theme(core: State<'_, Arc<Core>>) -> Option<Theme> {
+    *core.theme.lock().unwrap()
+}
+
+#[tauri::command]
+fn set_ui_theme(window: Window, core: State<'_, Arc<Core>>, theme: Theme) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    *core.theme.lock().unwrap() = Some(theme);
+    Ok(())
 }
 
 // ---- approval window commands ----------------------------------------------
@@ -355,6 +377,7 @@ pub fn run() {
             app.manage(Arc::new(Core {
                 node: Arc::clone(&node),
                 drafts: Mutex::new(DraftStore::default()),
+                theme: Mutex::new(None),
             }));
             let handle = app.handle().clone();
             thread::spawn(move || {
@@ -388,6 +411,8 @@ pub fn run() {
             dev_fund,
             draft_send,
             open_console,
+            ui_theme,
+            set_ui_theme,
             approval_pending,
             approval_decide,
             console_exec,

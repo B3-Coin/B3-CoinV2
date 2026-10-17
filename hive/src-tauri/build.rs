@@ -12,6 +12,8 @@ fn main() {
             "dev_fund",
             "draft_send",
             "open_console",
+            "ui_theme",
+            "set_ui_theme",
             "approval_pending",
             "approval_decide",
             "console_exec",

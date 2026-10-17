@@ -1,10 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "approval",
-  "description": "Approval window: read the waiting draft and approve or reject it. Nothing else.",
+  "description": "Approval window: read the waiting draft and approve or reject it, and read the theme. Nothing else.",
   "windows": ["approval"],
   "permissions": [
     "allow-approval-pending",
-    "allow-approval-decide"
+    "allow-approval-decide",
+    "allow-ui-theme"
   ]
 }
