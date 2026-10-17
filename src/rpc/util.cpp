@@ -1240,8 +1240,8 @@ std::string RPCArg::ToStringObj(const bool oneline) const
     case Type::OBJ:
     case Type::OBJ_NAMED_PARAMS:
     case Type::OBJ_USER_KEYS:
-        // Currently unused, so avoid writing dead code
-        NONFATAL_UNREACHABLE();
+        // An object nested in an object (getflowmeshmarketdata options).
+        return res + ToString(oneline);
     } // no default case, so the compiler can warn about missing cases
     NONFATAL_UNREACHABLE();
 }

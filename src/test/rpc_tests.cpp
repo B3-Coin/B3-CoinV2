@@ -1054,6 +1054,30 @@ BOOST_AUTO_TEST_CASE(check_dup_param_names)
     }
 }
 
+BOOST_AUTO_TEST_CASE(help_nested_object_args)
+{
+    // getflowmeshmarketdata nests objects inside its options object; the
+    // one-line usage must render them instead of hitting NONFATAL_UNREACHABLE.
+    const RPCHelpMan rpc{
+        "dummy",
+        "dummy description",
+        {
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "", {
+                {"limit", RPCArg::Type::NUM, RPCArg::Default{50}, ""},
+                {"ticks", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "", {
+                    {"after_sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, ""},
+                    {"side", RPCArg::Type::STR, RPCArg::Optional::OMITTED, ""},
+                }},
+            }},
+        },
+        RPCResult{RPCResult::Type::NONE, "", ""},
+        RPCExamples{""},
+        [](const RPCHelpMan&, const JSONRPCRequest&) -> UniValue { return {}; },
+    };
+    const std::string help{rpc.ToString()};
+    BOOST_CHECK_EQUAL(help.substr(0, help.find('\n')), R"(dummy ( {"limit":n,"ticks":{"after_sequence":n,"side":"str"}} ))");
+}
+
 BOOST_AUTO_TEST_CASE(help_example)
 {
     // Positional examples use the shipped B3 CLI and mainnet RPC endpoint.
