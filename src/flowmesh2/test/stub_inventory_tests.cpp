@@ -59,7 +59,15 @@
  * M2-LED-05, M2-LED-06 and M3-ENG-09 to probe admission's kind rule
  * (KindAdmissible, whose Unsupported refusals become UNSUPPORTED_KIND).
  * Slice R13 adds the client API's HTTPS + SSE transport (M5-API-01) and
- * streams (M5-API-02, InProcessApi::Subscribe).
+ * streams (M5-API-02, InProcessApi::Subscribe); the in-process (M4-SIM-01)
+ * and TCP (M4-NET-01) seat meshes, short IDs (M4-NET-02; Encode and
+ * Decode) and sentry fan-out (M4-NET-03); the bridge's mint (M8-BRG-01)
+ * and release limits (M8-BRG-03); the futures oracle (M9-FUT-02) and
+ * margin (M9-FUT-03); removals (M7-GOV-02) and versioned parameters
+ * (M7-GOV-03). It extends M8-BRG-02 to probe BuildWithdrawalPacket,
+ * M8-CKP-01 CheckpointBuilder::Build, M8-EXIT-01 ForcedExit::Open and
+ * Redeem, M9-FUT-01 FuturesDomain::PlaceFuture, M9-FUT-04
+ * FuturesDomain::Sweep and M7-GOV-01 Governance::ApplyListing.
  */
 
 #include <boost/test/unit_test.hpp>
@@ -71,6 +79,9 @@
 #include <flowmesh2/agreement/leader.h>
 #include <flowmesh2/agreement/pbft.h>
 #include <flowmesh2/agreement/restart_fence.h>
+#include <flowmesh2/bridge/bridge_manager.h>
+#include <flowmesh2/bridge/checkpoint.h>
+#include <flowmesh2/bridge/forced_exit.h>
 #include <flowmesh2/chain/b3d_adapter.h>
 #include <flowmesh2/core/action.h>
 #include <flowmesh2/core/facts.h>
@@ -82,11 +93,17 @@
 #include <flowmesh2/engine/engine.h>
 #include <flowmesh2/engine/matcher.h>
 #include <flowmesh2/engine/residual.h>
+#include <flowmesh2/futures/futures.h>
+#include <flowmesh2/governance/governance.h>
 #include <flowmesh2/ledger/ledger.h>
 #include <flowmesh2/ledger/state_commitment.h>
 #include <flowmesh2/net/client_api.h>
 #include <flowmesh2/net/https_sse_api.h>
 #include <flowmesh2/net/in_process_api.h>
+#include <flowmesh2/net/in_process_mesh.h>
+#include <flowmesh2/net/sentry.h>
+#include <flowmesh2/net/short_id.h>
+#include <flowmesh2/net/tcp_mesh.h>
 #include <flowmesh2/state/candidate.h>
 #include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
@@ -99,6 +116,7 @@
 #include <flowmesh2/test/util/admission_fixtures.h>
 #include <flowmesh2/test/util/agreement_fixtures.h>
 #include <flowmesh2/test/util/api_fixtures.h>
+#include <flowmesh2/test/util/mesh_fixtures.h>
 #include <flowmesh2/test/util/storage_fixtures.h>
 #include <flowmesh2/test/util/verify_fixtures.h>
 #include <flowmesh2/verify/b3verify.h>
@@ -344,9 +362,11 @@ FM2_STUB_CASE(M3_ENG_08, "M3-ENG-08")
 
 FM2_STUB_CASE(M9_FUT_01, "M9-FUT-01")
 {
+    // Two entry points: the profile switch (R3) and the futures domain (R13).
     ProfileParams params{RegtestProfile()};
     params.futures_enabled = true;
-    return Observe(Validate(params));
+    futures::FuturesDomain domain{RegtestProfile()};
+    return FirstDeviation("M9-FUT-01", {Observe(Validate(params)), Observe(domain.PlaceFuture(futures::FutureOrder{}))});
 }
 
 FM2_STUB_CASE(M4_STO_05, "M4-STO-05")
@@ -388,7 +408,9 @@ FM2_STUB_CASE(M7_SEAT_01, "M7-SEAT-01")
 
 FM2_STUB_CASE(M7_GOV_01, "M7-GOV-01")
 {
-    return FactStubProbe(ListingFact{}, "M7-GOV-01");
+    // The listing fact's codec (R4) and governance's listing (R13).
+    governance::Governance governance{RegtestProfile()};
+    return FirstDeviation("M7-GOV-01", {FactStubProbe(ListingFact{}, "M7-GOV-01"), Observe(governance.ApplyListing(ListingFact{}))});
 }
 
 FM2_STUB_CASE(MB1_B3D_02, "MB1-B3D-02")
@@ -398,12 +420,18 @@ FM2_STUB_CASE(MB1_B3D_02, "MB1-B3D-02")
 
 FM2_STUB_CASE(M8_BRG_02, "M8-BRG-02")
 {
-    return FactStubProbe(PayoutConfirmedFact{}, "M8-BRG-02");
+    // The payout fact's codec (R4) and the bridge's withdrawal packet (R13).
+    bridge::BridgeManagerV2 manager;
+    return FirstDeviation("M8-BRG-02", {FactStubProbe(PayoutConfirmedFact{}, "M8-BRG-02"),
+                                        Observe(manager.BuildWithdrawalPacket(bridge::WithdrawalRequest{}))});
 }
 
 FM2_STUB_CASE(M8_EXIT_01, "M8-EXIT-01")
 {
-    return FactStubProbe(ExitNullifierFact{}, "M8-EXIT-01");
+    // The exit nullifier fact's codec (R4), and ForcedExit Open and Redeem (R13).
+    return FirstDeviation("M8-EXIT-01", {FactStubProbe(ExitNullifierFact{}, "M8-EXIT-01"),
+                                         Observe(bridge::ForcedExit::Open(0, bridge::FORCED_EXIT_DELAY_BLOCKS + 1)),
+                                         Observe(bridge::ForcedExit::Redeem(bridge::ExitClaim{}, bridge::FORCED_EXIT_DELAY_BLOCKS + 1))});
 }
 
 // ---- Slice R5: ledger/ledger LedgerState ----
@@ -468,10 +496,12 @@ FM2_STUB_CASE(M9_FUT_04, "M9-FUT-04")
 {
     // Phase 7 with futures enabled. Validate() refuses that profile first
     // (M9-FUT-01), so the engine itself never gets here in the outline.
+    // And the futures domain's sweep (R13).
     ProfileParams profile{RegtestProfile()};
     engine::EngineState state{engine::EngineState::Genesis(profile, {}).value()};
     profile.futures_enabled = true;
-    return Observe(engine::RunFuturesPhase(state, profile));
+    futures::FuturesDomain domain{RegtestProfile()};
+    return FirstDeviation("M9-FUT-04", {Observe(engine::RunFuturesPhase(state, profile)), Observe(domain.Sweep(1))});
 }
 
 // ---- Slice R8: storage/file_journal ----
@@ -644,9 +674,12 @@ FM2_STUB_CASE(M5_VFY_03, "M5-VFY-03")
 
 FM2_STUB_CASE(M8_CKP_01, "M8-CKP-01")
 {
+    // b3verify's check (R11) and the builder (R13).
     const StubCertified c;
     const verify::CheckpointClaim claim{c.header.height, c.header.Hash(), c.header.state_root, uint256{}};
-    return Observe(verify::VerifyCheckpoint(claim, c.header, c.cert, c.seats));
+    HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
+    return FirstDeviation("M8-CKP-01", {Observe(verify::VerifyCheckpoint(claim, c.header, c.cert, c.seats)),
+                                        Observe(bridge::CheckpointBuilder::Build(*heartbeat.owner->Head(), c.cert, {}))});
 }
 
 FM2_STUB_CASE(M7_ADP_02, "M7-ADP-02")
@@ -667,6 +700,78 @@ FM2_STUB_CASE(M5_API_02, "M5-API-02")
 {
     ApiRig rig;
     return Observe(rig.api->Subscribe(net::StreamRequest{}));
+}
+
+// ---- Slice R13: net/ seat mesh ----
+
+FM2_STUB_CASE(M4_SIM_01, "M4-SIM-01")
+{
+    return Observe(net::InProcessSeatMesh::Create(TestMeshConfig(0, 4), 4));
+}
+
+FM2_STUB_CASE(M4_NET_01, "M4-NET-01")
+{
+    return Observe(net::TcpSeatMesh::Create(net::TcpMeshConfig{TestMeshConfig(0, 4), net::DEFAULT_SEAT_MESH_PORT, {}}));
+}
+
+FM2_STUB_CASE(M4_NET_02, "M4-NET-02")
+{
+    const net::ShortIdCodec codec{uint256::ONE, 7};
+    const std::vector<ActionId> known{ActionId{uint256::ONE}};
+    return FirstDeviation("M4-NET-02", {Observe(codec.Encode(ActionId{uint256::ONE})), Observe(codec.Decode(agreement::ShortId{}, known))});
+}
+
+FM2_STUB_CASE(M4_NET_03, "M4-NET-03")
+{
+    auto mesh{RecordingMesh::Make(TestMeshConfig(0, 4))};
+    net::SentryFanout fanout{*mesh};
+    const std::vector<unsigned char> frame{1, 2, 3};
+    StubObservation observed{Observe(fanout.Fanout(frame))};
+    if (!mesh->sent.empty()) return StubObservation{true, std::nullopt}; // a stub must not send
+    return observed;
+}
+
+// ---- Slice R13: bridge/ ----
+
+FM2_STUB_CASE(M8_BRG_01, "M8-BRG-01")
+{
+    bridge::BridgeManagerV2 manager;
+    return Observe(manager.OnFinalizedMint(bridge::FinalizedMint{}));
+}
+
+FM2_STUB_CASE(M8_BRG_03, "M8-BRG-03")
+{
+    const bridge::BridgeManagerV2 manager;
+    return Observe(manager.CheckReleaseLimits(bridge::WithdrawalRequest{}, bridge::ReleaseWindow{}, bridge::ReleaseLimits{}));
+}
+
+// ---- Slice R13: futures/ ----
+
+FM2_STUB_CASE(M9_FUT_02, "M9-FUT-02")
+{
+    futures::FuturesDomain domain{RegtestProfile()};
+    const std::vector<futures::OracleSubmission> submissions(3);
+    return Observe(domain.SubmitOracle(submissions));
+}
+
+FM2_STUB_CASE(M9_FUT_03, "M9-FUT-03")
+{
+    const futures::FuturesDomain domain{RegtestProfile()};
+    return Observe(domain.MarginCheck(AccountId{}));
+}
+
+// ---- Slice R13: governance/ ----
+
+FM2_STUB_CASE(M7_GOV_02, "M7-GOV-02")
+{
+    governance::Governance governance{RegtestProfile()};
+    return Observe(governance.ApplyRemoval(governance::RemovalRequest{}));
+}
+
+FM2_STUB_CASE(M7_GOV_03, "M7-GOV-03")
+{
+    const governance::Governance governance{RegtestProfile()};
+    return Observe(governance.ParamsAt(0));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

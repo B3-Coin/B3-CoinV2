@@ -99,9 +99,11 @@ if(BUILD_FLOWMESH2)
   # admission/ (slice R12): admission A0..A10, the bounded action pool
   # and the budget policy interface, in namespace flowmesh2::admission.
   # net/ (slice R13): the service lanes over C1 BoundedMailboxes, the
-  # client API contract, the in-process API and the HTTPS + SSE stub, in
-  # namespace flowmesh2::net. Later slices add the other application
-  # directories here. fm2_verify never links it (guard rule 4), and it
+  # client API contract, the in-process API and the HTTPS + SSE stub, the
+  # seat mesh interface and the in-process mesh, TCP mesh, short-ID and
+  # sentry stubs, in namespace flowmesh2::net. bridge/, futures/ and
+  # governance/ (slice R13): the product boundaries, every method a stub,
+  # in namespaces flowmesh2::bridge, ::futures and ::governance. fm2_verify never links it (guard rule 4), and it
   # never links bitcoin_common (guard rule 4).
   add_library(fm2_core STATIC
     admission/admission.cpp
@@ -113,19 +115,29 @@ if(BUILD_FLOWMESH2)
     agreement/messages.cpp
     agreement/pbft.cpp
     agreement/restart_fence.cpp
+    bridge/bridge_manager.cpp
+    bridge/checkpoint.cpp
+    bridge/forced_exit.cpp
     chain/b3d_adapter.cpp
     chain/chain_adapter.cpp
     engine/book.cpp
     engine/engine.cpp
     engine/matcher.cpp
     engine/residual.cpp
+    futures/futures.cpp
+    governance/governance.cpp
     ledger/ledger.cpp
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
     net/client_api.cpp
     net/https_sse_api.cpp
     net/in_process_api.cpp
+    net/in_process_mesh.cpp
     net/lanes.cpp
+    net/seat_mesh.cpp
+    net/sentry.cpp
+    net/short_id.cpp
+    net/tcp_mesh.cpp
     read/read_service.cpp
     read/views.cpp
     state/candidate.cpp
@@ -240,6 +252,7 @@ if(BUILD_FLOWMESH2)
     test/record_tests.cpp
     test/replay_tests.cpp
     test/result_tests.cpp
+    test/seat_mesh_tests.cpp
     test/seat_set_tests.cpp
     test/seat_signer_tests.cpp
     test/signer_log_tests.cpp
