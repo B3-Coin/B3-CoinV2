@@ -28,7 +28,10 @@ chain adapter and the k = 1 dev certifier) and **R11** (immutable slot
 views and the read service over the C1 read slot, one lease per reply,
 and b3verify in `fm2_verify`) and **R12** (admission A0..A10, the bounded
 action pool, the budget policy and, in `fm2_dev`, the unlimited dev
-budget).
+budget) and **R13** (the service lanes with their reserved share for
+cancel, status and health, the client API contract and the in-process
+API, the seat mesh interface, and the bridge, futures and governance
+boundaries as typed stubs).
 Their rows are `outline` until M0-AUD-01 accepts them, and so are the rows
 they tag: M0-EVD-01 (R2); M3-ENG-03, M3-ENG-08, M9-FUT-01, M4-STO-05 and the
 REAL-REPLACE M3-ENG-11 (R3); M4-ADM-01, M7-SEAT-01, M7-GOV-01, MB1-B3D-02,
@@ -45,7 +48,10 @@ M4-AGR-02, M4-AGR-03, M4-AGR-04, M4-AGR-06, M4-AGR-07, MB1-ADP-06 and
 M7-ADP-01 (R10); M5-VFY-03, M7-ADP-02, M8-CKP-01 and the REAL-REPLACE
 M5-RD-01 (R11; M2-LED-02 gains its R11 site there); M4-ADM-02 (R12;
 M4-ADM-01, M2-LED-05, M2-LED-06, M3-ENG-09 and the REAL-REPLACE M2-ADM-01
-gain R12 sites there).
+gain R12 sites there); M5-API-01, M5-API-02, M4-SIM-01, M4-NET-01,
+M4-NET-02, M4-NET-03, M8-BRG-01, M8-BRG-03, M9-FUT-02, M9-FUT-03, M7-GOV-02
+and M7-GOV-03 (R13; M7-GOV-01, M8-BRG-02, M8-CKP-01, M8-EXIT-01, M9-FUT-01
+and M9-FUT-04 gain R13 sites there).
 Every other row is `todo`, except the C1 baseline, which is `done`.
 
 ---
@@ -162,7 +168,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | R10 | R | outline | — | R10 | Chain adapter seam, agreement interfaces, PBFT stubs, dev certifier, fake chain | `chain/` (`chain_adapter`, `b3d_adapter`); `agreement/` (`messages`, `agreement.h`, `safety.h`, `pbft`, `leader`, `inclusion`, `restart_fence`, `evidence`); `dev/dev_certifier`, `dev/fake_chain` (`fm2_dev`); `test/util/agreement_fixtures.h`, `test/util/require.h` | message round trip, caps, golden; one slot writes exactly `ACCEPTED_PROPOSAL`, `INTENT`, `SIGNED_VOTE`, `DECISION` in barrier order; certificate passes `FastAggregateVerify` over `CommitDigest`; non-REGTEST and k=2 refused; authority bump before `Propose` writes nothing; bump during the intent barrier leaves a durable `INTENT`, no signature, other digest refused; failed vote barrier gives `STORAGE_FATAL` and no `DECISION`; fake adapter cursor, `BUSY`, `NEED_DATA`, rewind, anchor ancestry; no dev symbols in `fm2_core` | scratch:R10/ | D8, O-10, CONS-10, O-57, O-58, O-59, O-60, O-61, O-62 |
 | R11 | R | outline | — | R11 | Read service on C1 `ReadSlot`, b3verify | `read/views`, `read_service`; `verify/b3verify` (library `fm2_verify`); `core/merkle` `MerkleTree`; `test/util/verify_fixtures.h`, `read_fixtures.h`; guard rules 1 and 3 widened (`contrib/flowmesh2/check_guards.py`, self-test) | mismatched token refused; 4 readers + 1 publisher × 2,000 iterations: every reply from one head; eviction then `UNKNOWN`; outcome index below `max_delay` refused at `Create`; maker fill lookup; `VerifyCertificate` passes and fails for wrong seat set, tampered header, below-quorum bitmap, bit ≥ k, other-subset aggregate; tampered outcome proof, wrong fee or delta fail; `VerifyExpired` negatives; `fm2_verify` has no `fm2_core` symbols | scratch:R11/ | SEC-5, INV-13, DUR-5, O-63, O-64, O-65, O-66, O-67, O-68 |
 | R12 | R | outline | — | R12 | Admission and action pool | `admission/admission`, `pool`, `budget`; `dev/dev_budget` (fm2_dev); `test/util/admission_fixtures.h` | every code once with counters: no signature check before A8, `BAD_SIG` adds 1, `NONCE_USED`/`NONCE_PENDING` only after a valid signature; precedence table; included action resent after its window gives `DUPLICATE`, not `EXPIRED`; `REF_SLOT_AHEAD` near `UINT64_MAX` without overflow; pool `IN_PROPOSAL`, expiry, capacity, withhold filter, commit removal, same-nonce loser terminal `NONCE_USED` | scratch:R12/ | PLAN-9, DUR-4, DUR-6, O-15, O-69, O-70, O-71, O-72, O-73, O-74 |
-| R13 | R | todo | — | R13 | Service lanes, in-process API, mesh interface, product-boundary stubs | `net/*`; `bridge/`, `futures/`, `governance/` | lane priority; cancel and status accepted while the ACTION lane is full; `BUSY` leaves no queued copy; 4 submit threads + pump + publisher give exactly one reply per request ID; `GetAction` never returns `EXPIRED` without a verifying proof; every stub returns its ID | scratch:R13/ | SEC-3, UX-7 |
+| R13 | R | outline | — | R13 | Service lanes, in-process API, mesh interface, product-boundary stubs | `net/` (`lanes`, `client_api`, `in_process_api`, `https_sse_api`, `seat_mesh`, `in_process_mesh`, `tcp_mesh`, `short_id`, `sentry`); `bridge/` (`bridge_manager`, `checkpoint`, `forced_exit`); `futures/futures`; `governance/governance`; `test/util/api_fixtures.h`, `mesh_fixtures.h` | lane priority; cancel and status accepted while the ACTION lane is full; `BUSY` leaves no queued copy; 4 submit threads + pump + publisher give exactly one reply per request ID; `GetAction` never returns `EXPIRED` without a verifying proof; every stub returns its ID | scratch:R13/ | SEC-3, SEC-4, UX-7, DUR-6, PERF-12, O-75, O-76, O-77, O-78, O-79, O-80 |
 | R14 | R | todo | — | R14 | Deterministic simulator and walking skeleton | `sim/*`; `fm2-sim` | ARCHITECTURE.md §14: P1-P8 and N1-N13 for seeds 1..32 and the three variants; scheduler tie orders for seeds 1 and 2 match goldens; same seed twice gives the same trace digest; CLI output byte-identical across two runs; full `ctest -L flowmesh2` green | scratch:R14/ | PERF-6 (no latency claim) |
 
 ## M0 — verification foundation (plan addition)
@@ -249,7 +255,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
 |---|---|---|---|---|---|---|---|---|---|
 | M4-AGR-01 | M4 | outline | STUB | R10 | PBFT safety rules mapped from `test/flowmesh_v2_agreement/PROTOCOL.md` | `PbftSafetyRules` `MayPrepare`, `MayCommit`, `OnViewChange` (`agreement/pbft`) | trace agreement with the reference; Twins | M4/M4-AGR-01/ | D10 |
-| M4-AGR-02 | M4 | outline | STUB | R10 | `PbftAgreement`: execute-then-vote, `Reexecute`, BLS aggregation, parent certificate in proposals; replaces the dev certifier's `OnMessage`; rules the message shapes the outline chose (O-57) | `PbftAgreement::Create` (`agreement/pbft`); `DevSingleSeatCertifier::OnMessage` (`dev/dev_certifier`, `Unsupported`) | N=4 and N=7 DST with 0 violations | M4/M4-AGR-02/ | plan §3.4.1, D10 |
+| M4-AGR-02 | M4 | outline | STUB | R10 | `PbftAgreement`: execute-then-vote, `Reexecute`, BLS aggregation, parent certificate in proposals; replaces the dev certifier's `OnMessage`; rules the message shapes the outline chose (O-57); adds typed durable send paths for VIEW_CHANGE and NEW_VIEW, which `SeatMesh::Send` passes without a token today (O-79) | `PbftAgreement::Create` (`agreement/pbft`); `DevSingleSeatCertifier::OnMessage` (`dev/dev_certifier`, `Unsupported`) | N=4 and N=7 DST with 0 violations | M4/M4-AGR-02/ | plan §3.4.1, D10 |
 | M4-AGR-03 | M4 | outline | STUB | R10 | 8-slot terms, seed-chosen leader, slow-set skip | `LeaderSchedule::LeaderFor` (`agreement/leader`) | distribution and skip tests | M4/M4-AGR-03/ | D11, BLOCKED-ON-RULING |
 | M4-AGR-04 | M4 | outline | STUB | R10 | Inclusion lists; decide whether the vote signature covers the inclusion IDs (O-57) | `InclusionList::Build`/`Check` (`agreement/inclusion`) | a withheld action is forced into s+1 | M4/M4-AGR-04/ | PLAN-7 |
 | M4-AGR-05 | M4 | todo | NONE | — | Adaptive timeouts | new | G-FAULT profile | M4/M4-AGR-05/ | plan §3.4.1 |
@@ -266,13 +272,13 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M4-STO-05 | M4 | outline | STUB | R3, R8 | Folded signer mode (sign, then one barrier) and A/B measurement | `SignerLog::AppendSignedFolded` (R8); `core/params` `Validate` (`FOLDED_SIGNING`) | A/B evidence; strict stays the default | M4/M4-STO-05/ | D15, BLOCKED-ON-RULING |
 | M4-STO-06 | M4 | outline | STUB | R8 | Segment rollover | `FileJournal::Rollover` and any append that no longer fits in the segment (`FileJournal::AdmitAppend`; refused without fencing) (`storage/file_journal`) | crash tests | M4/M4-STO-06/ | plan §3.7 (S-9) |
 | M4-STO-07 | M4 | outline | STUB | R8, R9 | Durable PBFT view state: `VIEW_STATE`, `NEW_VIEW_ACCEPTED`, `PREPARED_QC` | `SignerLog::AppendViewState`, `SignerLog::AppendNewViewAccepted` (`storage/signer_log`); `CommitLog::AppendPreparedQc` (`storage/commit_log`); the record structs are target shapes (R8); `ReplayDecisions` on a `PREPARED_QC` record (`state/replay`, R9) | restart-in-view-change tests | M4/M4-STO-07/ | PROTOCOL.md, O-16 |
-| M4-NET-01 | M4 | todo | STUB | R13 | TCP seat mesh: 4 lanes, BIP324 cipher plus a BIP340 session signature | `TcpSeatMesh::Create` | crypto review; interop | M4/M4-NET-01/ | D12, OWNER-GATED |
-| M4-NET-02 | M4 | todo | STUB | R13 | SipHash 6-byte short IDs and body fetch | `ShortIdCodec::Encode`/`Decode` | collision and fetch tests | M4/M4-NET-02/ | PLAN-10 |
-| M4-NET-03 | M4 | todo | STUB | R13 | Sentry fan-out | `SentryFanout::Fanout` | fan-out tests | M4/M4-NET-03/ | PLAN-10 |
-| M4-NET-04 | M4 | todo | NONE | — | Protocol-derived budgets | new | budget tests | M4/M4-NET-04/ | D13 |
+| M4-NET-01 | M4 | outline | STUB | R13 | TCP seat mesh: 4 lanes, BIP324 cipher plus a BIP340 session signature | `TcpSeatMesh::Create` (`net/tcp_mesh`; target shapes `TcpMeshConfig`, `SeatEndpoint`, `DEFAULT_SEAT_MESH_PORT` 5649); a transport implements only `Transmit` and `Poll` of `net/seat_mesh` `SeatMesh`, whose send rules are real (O-76, O-79) | crypto review; interop | M4/M4-NET-01/ | D12, OWNER-GATED |
+| M4-NET-02 | M4 | outline | STUB | R13 | SipHash 6-byte short IDs and body fetch | `ShortIdCodec::Encode`/`Decode` (`net/short_id`; keyed by header hash and nonce) | collision and fetch tests | M4/M4-NET-02/ | PLAN-10 |
+| M4-NET-03 | M4 | outline | STUB | R13 | Sentry fan-out | `SentryFanout::Fanout` (`net/sentry`; target shape `FanoutReport`) | fan-out tests | M4/M4-NET-03/ | PLAN-10 |
+| M4-NET-04 | M4 | todo | NONE | — | Protocol-derived budgets; also replaces the provisional lane limits and decides deficit round-robin below CRITICAL (O-77) | new; replaces `net/lanes` `ProvisionalLaneLimits` | budget tests | M4/M4-NET-04/ | D13 |
 | M4-ADM-01 | M4 | outline | STUB | R4, R12 | `CCheckQueue` batch BIP340 plus `CuckooCache` | `core/action` `BatchVerifier::VerifyBatch` (R4); admission batch path `Admission::AdmitBatch` (`admission/admission`, R12) | same results as sequential | M4/M4-ADM-01/ | plan §3.2 |
-| M4-ADM-02 | M4 | outline | STUB | R12 | Credit budgets; rule whether a budget charges per attempt or per admission (O-73) | `admission/budget` `CreditBudget::Create` and `Check` (`CreditBudgetParams` holds the plan's proposed defaults) | budget and cancel-lane tests | M4/M4-ADM-02/ | SEC-4, D13, BLOCKED-ON-RULING |
-| M4-SIM-01 | M4 | todo | STUB | R13, R14 | Multi-node DST (N=4, 7) ≥ 1,000 CPU-h over an in-process mesh | `SimCluster::Create(n>1)`, `InProcessSeatMesh::Create` | 0 violations | M4/M4-SIM-01/ | plan M4 |
+| M4-ADM-02 | M4 | outline | STUB | R12 | Credit budgets; rule whether a budget charges per attempt or per admission (O-73) and how the lanes' reserved CANCEL share is divided between accounts (O-77) | `admission/budget` `CreditBudget::Create` and `Check` (`CreditBudgetParams` holds the plan's proposed defaults) | budget and cancel-lane tests | M4/M4-ADM-02/ | SEC-4, D13, BLOCKED-ON-RULING |
+| M4-SIM-01 | M4 | outline | STUB | R13, R14 | Multi-node DST (N=4, 7) ≥ 1,000 CPU-h over an in-process mesh | `InProcessSeatMesh::Create` (`net/in_process_mesh`, R13); `SimCluster::Create(n>1)` (R14) | 0 violations | M4/M4-SIM-01/ | plan M4 |
 | M4-SIM-02 | M4 | todo | STUB | R14 | Crash, drop, delay, partition and skew hooks | `FaultPlan` | each hook exercised | M4/M4-SIM-02/ | plan L4 |
 | M4-SIM-03 | M4 | todo | STUB | R14 | Twins and mutation fuzzing | `SimCluster` Twins | the Twins set passes | M4/M4-SIM-03/ | plan M4 |
 | M4-SEP-01 | M4 | todo | NONE | — | Separate-process fault campaign plus an independent issued-signature checker | new | [CC] C4 exit | M4/M4-SEP-01/ | [CC] C4 |
@@ -281,8 +287,8 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 
 | ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
 |---|---|---|---|---|---|---|---|---|---|
-| M5-API-01 | M5 | todo | STUB | R13 | HTTPS + SSE (TLS 1.3, 0-RTT off) | `HttpsSseApi::Create` | plan §3.8 endpoint tests | M5/M5-API-01/ | SEC-7, OWNER-GATED |
-| M5-API-02 | M5 | todo | STUB | R13 | Streams: epoch/seq/head envelope, snapshot plus deltas, heartbeat, resubscribe | `InProcessApi::Subscribe` | gap tests | M5/M5-API-02/ | UX-10 |
+| M5-API-01 | M5 | outline | STUB | R13 | HTTPS + SSE (TLS 1.3, 0-RTT off) | `HttpsSseApi::Create` (`net/https_sse_api`; target shape `HttpsSseConfig`; a `ClientApi` in front of a backend) | plan §3.8 endpoint tests | M5/M5-API-01/ | SEC-7, OWNER-GATED |
+| M5-API-02 | M5 | outline | STUB | R13 | Streams: epoch/seq/head envelope, snapshot plus deltas, heartbeat, resubscribe | `InProcessApi::Subscribe` (`net/in_process_api`; target shapes `StreamChannel`, `StreamCursor`, `StreamRequest`, `StreamId` in `net/client_api`) | gap tests | M5/M5-API-02/ | UX-10 |
 | M5-API-03 | M5 | todo | NONE | — | Held-lock nemesis (10 s) | new | reads stay within budget | M5/M5-API-03/ | PERF-12 |
 | M5-RD-01 | M5 | outline | REAL-REPLACE | R11 | RCU archive and typed view index; outcome-index retention ≥ `max_delay`; decide whether a handle pins its view and whether `Publish` binds the token to a commit-journal instance (O-64, O-65) | `read/read_service` archive: `ReadService` view map and outcome index under the archive mutex, one lookup per reply | no publisher mutex on reads; retention invariant | M5/M5-RD-01/ | PERF-12, DUR-5 |
 | M5-VFY-01 | M5 | todo | NONE | — | b3verify API v1 | `verify/` | API document and tests | M5/M5-VFY-01/ | SEC-5 |
@@ -310,21 +316,21 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M7-SEAT-02 | M7 | todo | NONE | — | State sync for joining seats | new | a joining seat syncs and votes | M7/M7-SEAT-02/ | plan M7 |
 | M7-FEE-01 | M7 | outline | REAL-REPLACE | R5 | Per-seat accrual; claims by BLS key; rule whether a TRANSFER may credit a protocol account (O-34) | seat-pool protocol account: `SeatPoolAccount` (`core/state_root`), `LedgerState::Credit` (`ledger/ledger`) | claim tests | M7/M7-FEE-01/ | FN-12, D5, C-3, BLOCKED-ON-RULING |
 | M7-TAPE-01 | M7 | todo | NONE | — | Trade tape and candles with time provenance | new | tests | M7/M7-TAPE-01/ | UX-5 |
-| M7-GOV-01 | M7 | outline | STUB | R4, R13 | Listing (100,000 B3) | `core/facts` `ListingFact` codec and `FactId` (R4); `Governance::ApplyListing` (R13) | listing tests | M7/M7-GOV-01/ | AST-6, AST-8, OWNER-GATED |
-| M7-GOV-02 | M7 | todo | STUB | R13 | Removal: cancel-only, then claim-only | `Governance::ApplyRemoval` | no-seizure tests | M7/M7-GOV-02/ | AST-6 |
-| M7-GOV-03 | M7 | todo | STUB | R13 | Versioned parameter heights (`profile_hash` in the header) | `Governance::ParamsAt` | boundary tests | M7/M7-GOV-03/ | GOV-2 |
+| M7-GOV-01 | M7 | outline | STUB | R4, R13 | Listing (100,000 B3) | `core/facts` `ListingFact` codec and `FactId` (R4); `Governance::ApplyListing` (`governance/governance`, R13) | listing tests | M7/M7-GOV-01/ | AST-6, AST-8, OWNER-GATED |
+| M7-GOV-02 | M7 | outline | STUB | R13 | Removal: cancel-only, then claim-only | `Governance::ApplyRemoval` (`governance/governance`; target shape `RemovalRequest`) | no-seizure tests | M7/M7-GOV-02/ | AST-6 |
+| M7-GOV-03 | M7 | outline | STUB | R13 | Versioned parameter heights (`profile_hash` in the header) | `Governance::ParamsAt` (`governance/governance`) | boundary tests | M7/M7-GOV-03/ | GOV-2 |
 | M7-PERF-01 | M7 | todo | NONE | — | k = 64 tests; G-WAN run | new | reports | M7/M7-PERF-01/ | plan M7, D-G1 |
 
 ## M8 — [CC] C8a: bridge, checkpoints, exit, cutover
 
 | ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
 |---|---|---|---|---|---|---|---|---|---|
-| M8-BRG-01 | M8 | todo | STUB | R13 | bUSD mint → `VaultV2` deposit | `BridgeManagerV2::OnFinalizedMint` | anvil + regtest end to end | M8/M8-BRG-01/ | BRG-1, BRG-4 |
-| M8-BRG-02 | M8 | outline | STUB | R4, R13 | Withdrawal packets to `message_root`; payout facts | `core/facts` `PayoutConfirmedFact` codec and `FactId` (R4); `BuildWithdrawalPacket` (R13) | no duplicate payout | M8/M8-BRG-02/ | BRG-5 |
-| M8-BRG-03 | M8 | todo | STUB | R13 | Validity floor, caps, safe exporter | `CheckReleaseLimits` | cap tests | M8/M8-BRG-03/ | PLAN-14, D23, OWNER-GATED |
+| M8-BRG-01 | M8 | outline | STUB | R13 | bUSD mint → `VaultV2` deposit | `BridgeManagerV2::OnFinalizedMint` (`bridge/bridge_manager`; target shape `FinalizedMint`; the result is the `DepositFact` the chain adapter delivers) | anvil + regtest end to end | M8/M8-BRG-01/ | BRG-1, BRG-4, CLAUDE.md rules 5-6, C-6 |
+| M8-BRG-02 | M8 | outline | STUB | R4, R13 | Withdrawal packets to `message_root`; payout facts | `core/facts` `PayoutConfirmedFact` codec and `FactId` (R4); `BridgeManagerV2::BuildWithdrawalPacket` (`bridge/bridge_manager`, R13; target shapes `WithdrawalRequest`, `WithdrawalPacket`) | no duplicate payout | M8/M8-BRG-02/ | BRG-5 |
+| M8-BRG-03 | M8 | outline | STUB | R13 | Validity floor, caps, safe exporter | `BridgeManagerV2::CheckReleaseLimits` (`bridge/bridge_manager`; target shapes `ReleaseLimits`, `ReleaseWindow`) | cap tests | M8/M8-BRG-03/ | PLAN-14, D23, OWNER-GATED |
 | M8-BRG-04 | M8 | todo | NONE | — | Sepolia/Hoodi deployment plus Foundry invariants | new | invariant runs | M8/M8-BRG-04/ | plan M8 |
-| M8-CKP-01 | M8 | outline | STUB | R11, R13 | Checkpoint builder and verification | `CheckpointBuilder::Build` (R13); `verify/b3verify` `VerifyCheckpoint` (R11, target shape `CheckpointClaim`) | b3d accepts a valid and refuses a forged checkpoint | M8/M8-CKP-01/ | PLAN-3 |
-| M8-EXIT-01 | M8 | outline | STUB | R4, R13 | Forced exit after 10,080 blocks; nullifiers | `core/facts` `ExitNullifierFact` codec and `FactId` (R4); `ForcedExit::Open`/`Redeem` (R13) | drill | M8/M8-EXIT-01/ | PLAN-16, D20, OWNER-GATED |
+| M8-CKP-01 | M8 | outline | STUB | R11, R13 | Checkpoint builder and verification; move the one checkpoint value type into `core/` (O-80) | `CheckpointBuilder::Build` (`bridge/checkpoint`, R13; target shape `Checkpoint`, the fields of `CheckpointClaim`); `verify/b3verify` `VerifyCheckpoint` (R11, target shape `CheckpointClaim`) | b3d accepts a valid and refuses a forged checkpoint | M8/M8-CKP-01/ | PLAN-3 |
+| M8-EXIT-01 | M8 | outline | STUB | R4, R13 | Forced exit after 10,080 blocks; nullifiers | `core/facts` `ExitNullifierFact` codec and `FactId` (R4); `ForcedExit::Open`/`Redeem` (`bridge/forced_exit`, R13; `FORCED_EXIT_DELAY_BLOCKS` PROVISIONAL; target shapes `ExitClaim`, `ExitRedemption`) | drill | M8/M8-EXIT-01/ | PLAN-16, D20, OWNER-GATED |
 | M8-MIG-01 | M8 | todo | NONE | — | V1 cutover: claims plus a transfer consuming the V1 nullifier | new | no double spend | M8/M8-MIG-01/ | PLAN-15, D25 |
 | M8-MIG-02 | M8 | todo | NONE | — | Fork-id, sunset release, liability manifest | new | manifest derived twice, equal | M8/M8-MIG-02/ | D24 |
 
@@ -332,10 +338,10 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 
 | ID | Ms | Status | Skeleton | Slice | Task | Replaces / location | Acceptance (failing-first) | Evidence | Refs |
 |---|---|---|---|---|---|---|---|---|---|
-| M9-FUT-01 | M9 | outline | STUB | R3, R13 | Dated isolated linear futures in Q; profile `futures_enabled` | `FuturesDomain::PlaceFuture` (R13); `core/params` `Validate` (`futures_enabled`) | contract tests | M9/M9-FUT-01/ | D21, BLOCKED-ON-RULING |
-| M9-FUT-02 | M9 | todo | STUB | R13 | Oracle median over ≥ 2f+1 vote-committed submissions | `FuturesDomain::SubmitOracle` | manipulation simulations | M9/M9-FUT-02/ | PLAN-13 |
-| M9-FUT-03 | M9 | todo | STUB | R13 | Margin and mark | `FuturesDomain::MarginCheck` | vectors | M9/M9-FUT-03/ | plan §3.11 |
-| M9-FUT-04 | M9 | outline | STUB | R7, R13 | Liquidation index, cap, insurance, deficit halt; engine phase 7 | `FuturesDomain::Sweep` (R13); engine phase 7 `RunFuturesPhase` (`engine/engine`, R7; unreachable while `Validate` refuses `futures_enabled`) | storms stay within the slot budget | M9/M9-FUT-04/ | plan §3.11 |
+| M9-FUT-01 | M9 | outline | STUB | R3, R13 | Dated isolated linear futures in Q; profile `futures_enabled` | `FuturesDomain::PlaceFuture` (`futures/futures`, R13; target shape `FutureOrder`); `core/params` `Validate` (`futures_enabled`) | contract tests | M9/M9-FUT-01/ | D21, BLOCKED-ON-RULING |
+| M9-FUT-02 | M9 | outline | STUB | R13 | Oracle median over ≥ 2f+1 vote-committed submissions | `FuturesDomain::SubmitOracle` (`futures/futures`; target shape `OracleSubmission`) | manipulation simulations | M9/M9-FUT-02/ | PLAN-13 |
+| M9-FUT-03 | M9 | outline | STUB | R13 | Margin and mark | `FuturesDomain::MarginCheck` (`futures/futures`; target shape `MarginState`) | vectors | M9/M9-FUT-03/ | plan §3.11 |
+| M9-FUT-04 | M9 | outline | STUB | R7, R13 | Liquidation index, cap, insurance, deficit halt; engine phase 7 | `FuturesDomain::Sweep` (`futures/futures`, R13; target shape `SweepReport`); engine phase 7 `RunFuturesPhase` (`engine/engine`, R7; unreachable while `Validate` refuses `futures_enabled`) | storms stay within the slot budget | M9/M9-FUT-04/ | plan §3.11 |
 | M9-FUT-05 | M9 | todo | NONE | — | Open-interest caps; economic simulations | new | reports | M9/M9-FUT-05/ | plan M9 |
 
 ## M10 — [CC] C5 remainder (b3d; OWNER-GATED, C-12)

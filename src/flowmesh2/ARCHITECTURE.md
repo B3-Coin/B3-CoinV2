@@ -33,9 +33,16 @@ no application code) and slice **R12** (admission A0..A10 against one head
 snapshot, with its counters and the fence; the bounded action pool with
 `IN_PROPOSAL`, terminal statuses and the retained `INCLUDED` records that
 answer `DUPLICATE` without a signature check; the budget policy with the
-credit-budget stub; and in `fm2_dev` the REGTEST `UnlimitedDevBudget`).
-Everything else described here is the contract that the outline slices R13
-and R14 will build.
+credit-budget stub; and in `fm2_dev` the REGTEST `UnlimitedDevBudget`) and
+slice **R13** (the service lanes over four C1 `BoundedMailbox`es with strict
+priority and a reserved share for cancel, status and health; the client API
+contract `ClientApi` and the `InProcessApi` with exactly one reply per
+request and `GetAction` from one read lease; the `SeatMesh` interface whose
+only vote path takes an `OutboundVote`; and typed stubs for HTTPS + SSE,
+streams, the in-process and TCP meshes, short IDs, sentry fan-out, the
+bridge, checkpoints, forced exit, futures and governance).
+Everything else described here is the contract that the outline slice R14
+will build.
 It is not a [CC] milestone exit, a protocol approval or a release.
 Every economic value below is a **PROVISIONAL REGTEST** default.
 
@@ -163,7 +170,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `chain/`, `agreement/`, `dev/` | R10 | `ChainAdapter` (`Network`, `CurrentAuthority`, `CheckAuthority`, `Poll` → `PollReply` FACTS/BUSY/NEED_DATA/AUTHORITY_CHANGED{rewind_to}, `VerifyAnchor`, `SeatSetAt`), `FactBatch`, `CheckBatch` (O-58); capped codecs of `Proposal`, `Vote`, `ViewChange`, `NewView`, `Evidence` and their `Check*` rules (O-57); `Agreement`, `Decision`, `MessageSink`, `SafetyRules`; `DevSingleSeatCertifier` (k=1, REGTEST, fm2_dev; O-59); `FakeChainAdapter` (REGTEST, fm2_dev: scripted blocks, BUSY, rewinds, seat sets per epoch, authority hooks at named points; O-60) | `PbftSafetyRules` (M4-AGR-01), `PbftAgreement` (M4-AGR-02, also `DevSingleSeatCertifier::OnMessage`), `LeaderSchedule` (M4-AGR-03), `InclusionList` (M4-AGR-04), `RestartFence` (M4-AGR-06), `EvidenceStore` (M4-AGR-07), trusted-facts b3d adapter (MB1-ADP-06), finalized b3d adapter (M7-ADP-01) | — |
 | `read/`, `verify/`, `core/merkle` (tree) | R11 | `CertifiedEnvelope` (exact codec), `ScopeOf`/`CommitOf`; `SlotView` (header, certificate, outcomes and their tree, v0 account leaves and tree levels, the five roots, action index, order-fill index for maker and taker); `ReadService` (`Create`, `Publish(const DurableApplied&, view)`, `Acquire`, one-lease `Head`/`Account`/`Action`/`OrderFills`), `ReadHandle` (one lease), outcome index; `MerkleTree` (every level, O(log n) proofs); b3verify `VerifyCertificate`, `VerifyOutcome`, `VerifyAccountLeaf`, `VerifyFill`, `VerifyBalanceTransition`, `VerifyExpired` | `VerifyLiabilityPath` (M5-VFY-03), `VerifyCheckpoint` (M8-CKP-01), `VerifyAnchorProof` (M7-ADP-02) | archive and outcome index (M5-RD-01), v0 tree levels (M2-LED-02) |
 | `admission/`, `dev/dev_budget` | R12 | `Admission` A0..A10 (`Create`, `Admit`, `Fence`, `Stats`; `KindAdmissible`, `PayloadAdmissible`, `WindowRefusal`), `AdmissionReply`, `AdmissionStats`; `ActionPool` (`Insert`, `FindAuthenticated`, `FindById`, `TakeForSlot`, `OnCommitted`, `Status`; `PoolStatus`, `InsertResult` registries), `PoolLimits`; `BudgetPolicy`, `BudgetRequest`, `BudgetVerdict`; `UnlimitedDevBudget` (REGTEST, fm2_dev) | `CreditBudget::Create`/`Check` (M4-ADM-02), `Admission::AdmitBatch` (M4-ADM-01); `UNSUPPORTED_KIND` from `KindAdmissible` (M2-LED-05 WITHDRAW, M3-ENG-09 CANCEL_ALL, M2-LED-06 futures transfers) | `WindowRefusal` (M2-ADM-01) |
-| `net/`, `bridge/`, `futures/`, `governance/` | R13 | `LaneSet`, `ClientApi`, `InProcessApi`, `SeatMesh` interface | HTTPS + SSE (M5-API-01), `Subscribe` (M5-API-02), in-process mesh (M4-SIM-01), TCP mesh (M4-NET-01), short IDs (M4-NET-02), sentry fan-out (M4-NET-03), bridge (M8-BRG-01..03), checkpoint builder (M8-CKP-01), forced exit (M8-EXIT-01), futures (M9-FUT-01..04), governance (M7-GOV-01..03) | — |
+| `net/`, `bridge/`, `futures/`, `governance/` | R13 | `Lane` (CRITICAL..BULK) and `TrafficClass` (ORDINARY, CANCEL, STATUS, HEALTH) registries, `ReservedShare`, `LimitsValid`, `ProvisionalLaneLimits`; `LaneSet` (`Create`, `TryPush`, `TryPop`, `PopNext` in strict priority, `Close`, `Stats`); `ClientApi` (`Submit`, `SubmitStatus`, `SubmitHealth`, `TakeReply`, `GetAction`, `GetState`, `Subscribe`), `RequestId`, `RequestKind`, `ApiActionStatus`, `ActionStatusReply`, `HealthReply`, `ApiReply`; `InProcessApi` (`Create`, `Pump`, `State`, `OpenRequests`, `ClassOf`; `RequestState`, `PumpStop`); `SeatMesh` (`CheckConfig`, `SendVote`, `Send` per lane, the `MessageSink` port, `Poll`; `MeshConfig`, `InboundFrame`) | HTTPS + SSE `HttpsSseApi::Create` (M5-API-01), `InProcessApi::Subscribe` (M5-API-02), `InProcessSeatMesh::Create` (M4-SIM-01), `TcpSeatMesh::Create` (M4-NET-01), `ShortIdCodec::Encode`/`Decode` (M4-NET-02), `SentryFanout::Fanout` (M4-NET-03), `BridgeManagerV2` `OnFinalizedMint`, `BuildWithdrawalPacket`, `CheckReleaseLimits` (M8-BRG-01..03), `CheckpointBuilder::Build` (M8-CKP-01), `ForcedExit::Open`/`Redeem` (M8-EXIT-01), `FuturesDomain` `PlaceFuture`, `SubmitOracle`, `MarginCheck`, `Sweep` (M9-FUT-01..04), `Governance` `ApplyListing`, `ApplyRemoval`, `ParamsAt` (M7-GOV-01..03) | — |
 | `sim/` | R14 | `FakeClock`, `Scheduler`, `FaultPlan` (3 faults), `TraceRecorder`, `SimNode`, `SimClient`, scenarios, `fm2-sim` | `SimCluster` n>1 (M4-SIM-01), crash/drop/partition/skew (M4-SIM-02), Twins (M4-SIM-03) | scheduler (M0-SIM-01) |
 | `contrib/flowmesh2/` | R1, R2 | `check_inventory.py`, `check_todo.py`, `check_guards.py` (+ `test_check_guards.py`, `guard_fixtures/`), `check_negative_compile.py`, `evidence.py` (+ `test_evidence.py`), `canaries/` | `evidence.py perf-metadata` (M0-EVD-01) | — |
 | `storage/durable.h`, `test/compile_fail/` | R2 | `Durable<K>` token type (no minter until R8); missing-`LOCK`, ignored-`Result` and forged-token controls with fixed forms and a positive control | — | — |
@@ -176,10 +183,10 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `fm2_warnings` | INTERFACE: Clang/AppleClang `-Wthread-safety -Werror=thread-safety`; all compilers `-Werror=unused-result` | — |
 | `fm2_types` | `core/` | `core_interface` and, since R4, `secp256k1` (private); `bitcoin_consensus` (`hash.cpp`, `uint256.cpp`, `pubkey.cpp` with `XOnlyPubKey::VerifySchnorr`), `bitcoin_crypto` (SHA-256 and `crypto/bls`) and `bitcoin_util` (public, since R3). Never `bitcoin_common` |
 | `fm2_verify` | `verify/` (since R11), namespace `flowmesh2::verify` | `fm2_types`, `bitcoin_crypto` (public); never `fm2_core` or the C1 library (guard rules 1, 3 and 4; R11 widens rules 1 and 3 to every fm2_core directory and namespace and to C1) |
-| `fm2_core` | ledger, engine, state, storage, chain, agreement (since R10), admission (since R12), read, net, bridge, futures, governance; application code lives in namespaces `flowmesh2::ledger`, `::engine`, `::state`, `::storage` (guard rule 3 matches them); `agreement/` uses `flowmesh2::agreement`, `chain/` `flowmesh2::chain`, `read/` (since R11) `flowmesh2::read` and `admission/` (since R12) `flowmesh2::admission` | `fm2_types` (public, since R5); `crc32c` (private, since R8: record framing); `flowmesh2_foundations` (public, since R11: `read/` publishes into the C1 `ReadSlot`; the C1 target is unchanged) (`bitcoin_util` comes through `fm2_types`) |
+| `fm2_core` | ledger, engine, state, storage, chain, agreement (since R10), admission (since R12), read, net, bridge, futures, governance; application code lives in namespaces `flowmesh2::ledger`, `::engine`, `::state`, `::storage` (guard rule 3 matches them); `agreement/` uses `flowmesh2::agreement`, `chain/` `flowmesh2::chain`, `read/` (since R11) `flowmesh2::read`, `admission/` (since R12) `flowmesh2::admission`, and (since R13) `net/` `flowmesh2::net`, `bridge/` `flowmesh2::bridge`, `futures/` `flowmesh2::futures`, `governance/` `flowmesh2::governance` | `fm2_types` (public, since R5); `crc32c` (private, since R8: record framing); `flowmesh2_foundations` (public, since R11: `read/` publishes into the C1 `ReadSlot`, and since R13 `net/` queues into C1 `BoundedMailbox`es; the C1 target is unchanged) (`bitcoin_util` comes through `fm2_types`) |
 | `fm2_dev` | `dev/` (since R10: `fake_chain`, `dev_certifier`; since R12: `dev_budget`), namespace `flowmesh2::dev`; `FM2_DEV_COMPONENTS` is defined PUBLIC, and every dev header has `#error` without it | `fm2_core` (public) |
 | `fm2_simlib` | `sim/` | `fm2_dev`, `fm2_core`, `fm2_verify`, `bitcoin_common` (for `CKey` only) |
-| `test_flowmesh2` | `test/` | all of the above (`fm2_dev` since R10, `fm2_verify` since R11), `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files and, since R8, `FM2_TEST_TMP_DIR` (`<build>/fm2-test-tmp`) for the file journal's temporary directories; global fixture `ECC_Context` (`test/main.cpp`) |
+| `test_flowmesh2` | `test/` | all of the above (`fm2_dev` since R10, `fm2_verify` since R11; 476 Boost cases since R13), `Boost::headers`, `univalue` (R3: the profile JSON check), `bitcoin_common` and `secp256k1` (since R4, for `CKey` in `test/util/keys.h` only; the nm guard confirms no V1 symbol is linked in); compiled with `FM2_SOURCE_ROOT` so tests can read tracked files and, since R8, `FM2_TEST_TMP_DIR` (`<build>/fm2-test-tmp`) for the file journal's temporary directories; global fixture `ECC_Context` (`test/main.cpp`) |
 | `fm2_sim_cli` | binary `fm2-sim` | `fm2_simlib` |
 | `fm2_canary_*` | sanitizer canaries | only with `FLOWMESH2_SANITIZER_CANARIES=ON` |
 | `fm2_all` | custom target: every fm2 library and executable that is built by default | — |
@@ -276,7 +283,16 @@ header marked *landed* is normative; the others are the target contract.
 | `admission/budget.h` | R12 | landed | `BudgetRequest{account, kind, frame_bytes, head_height, open_orders}`, `BudgetVerdict` (ALLOW=1, DENY=2, append-only), `BudgetPolicy` (`Check` at A7, `Settle` exactly once per ALLOW); `CreditBudgetParams` (target shape) and `CreditBudget` (stub M4-ADM-02) |
 | `dev/dev_budget.h` | R12 | landed | DEV ONLY (`#error` without `FM2_DEV_COMPONENTS`): `UnlimitedDevBudget::Create(profile)` (UNSUPPORTED_NETWORK `DEV_BUDGET_NETWORK` unless REGTEST, then Validate), always ALLOW, atomic counters `Checks`, `Admitted`, `Refused` |
 | `test/util/admission_fixtures.h` | R12 | landed | TEST fixtures: `NewPool`, `VerifiedOf`, `IdOfBytes`, `PoolRig` (a `ReadRig` with a read service and a pool at its head; `Insert`, `SealOriginals`, `Seal` = TakeForSlot, Preview, Commit, Publish, OnCommitted; `Fund`), `TestBudget` (ALLOW, DENY or an error; `on_check` hook), `NewAdmission`, `AdmissionRig`, `RequireOneReply` (exact counter deltas), `RequireCode`, `RequireStatus` |
-| `net/*.h`, `bridge/*.h`, `futures/*.h`, `governance/*.h` | R13 | target | section 2.1 |
+| `net/lanes.h` | R13 | landed | `Lane` (CRITICAL=1, PROPOSAL=2, ACTION=3, BULK=4) and `TrafficClass` (ORDINARY=1, CANCEL=2, STATUS=3, HEALTH=4) registries, append-only; `LANES_BY_PRIORITY`; `IsReserved`; `ReservedShare` = ⌈limit/10⌉; `LaneLimits{max_messages, max_payload_bytes, max_message_bytes}`, `LimitsValid` (both shares hold a message), `LaneSetLimits`, `ProvisionalLaneLimits` (PROVISIONAL, M4-NET-04); `LaneSet::Create` (`LANE_LIMITS_INVALID`), `TryPush` (INVALID_INPUT `LANE_UNKNOWN`/`LANE_CLASS_UNKNOWN`, FENCED `LANE_CLOSED`, OVERSIZE `LANE_MESSAGE_OVERSIZE`, BUSY `LANE_FULL`/`LANE_ORDINARY_FULL`, INVARIANT `LANE_ACCOUNTING`; every refusal leaves no copy), `TryPop`, `PopNext`, `Close`, `Stats`, `MailboxStatsOf`; `LaneMessage`, `LaneStats` |
+| `net/client_api.h` | R13 | landed | the contract of every transport: queue acceptance (`Submit`, `SubmitStatus`, `SubmitHealth` → `RequestId` or BUSY/OVERSIZE/FENCED, not queued), exactly one `ApiReply` per `RequestId` (`TakeReply`), certified reads (`GetAction` → `ActionStatusReply` INCLUDED/EXPIRED/PENDING/UNKNOWN, O-75; `GetState` → `read::AccountReply`), `Subscribe` (stub M5-API-02); `RequestId` and `ToMailboxId`/`RequestIdFromMailbox`; `RequestKind` (SUBMIT_ACTION=1, ACTION_STATUS=2, HEALTH=3) and `ApiActionStatus` (INCLUDED=1, PENDING=2, EXPIRED=3, UNKNOWN=4), append-only; `API_UNKNOWN_*` reasons; `HealthReply`; stream target shapes `StreamChannel`, `StreamCursor`, `StreamRequest`, `StreamId` |
+| `net/in_process_api.h` | R13 | landed | `InProcessApi::Create(profile, lanes, admission, pool, read, ApiLimits{max_replies})` (Validate, `API_PROFILE_MISMATCH`, `API_LIMIT_ZERO`, `API_ACTION_LANE_SMALL`); requests on the ACTION lane as u8 `RequestKind` ‖ body, CANCEL class only for a frame that decodes as a cancel; `Pump(max)` (reserve a reply, pop, answer without a lock, store; `PumpStop` EMPTY/REPLIES_FULL/MAX_REACHED; INVARIANT `API_FOREIGN_REQUEST`, `API_REQUEST_KIND`); `RequestState` (QUEUED=1, PROCESSING=2, REPLIED=3); `State`, `OpenRequests`, `ClassOf`; one Mutex for the request map |
+| `net/https_sse_api.h` | R13 | landed (stub) | `HttpsSseConfig` (target shape); `HttpsSseApi::Create(config, backend)` (M5-API-01) |
+| `net/seat_mesh.h` | R13 | landed | `MeshConfig{self_seat, seat_count, max_frame_bytes, profile}`, `InboundFrame`; `SeatMesh` (a `MessageSink`): `CheckConfig` (`MESH_CONFIG_INVALID`), `SendVote(seat, OutboundVote, header_hash)` (the only vote path: the VOTE message of the durable record, on CRITICAL; O-76), `Send(seat, lane, bytes)` (CRITICAL only VIEW_CHANGE/NEW_VIEW/EVIDENCE, PROPOSAL only PROPOSAL, a VOTE refused `MESH_VOTE_NOT_TYPED`, otherwise `MESH_LANE_CONTENT`; ACTION and BULK opaque; O-79), the `MessageSink` port `Send(seat, message)` (final, routes by type), `Poll`; a transport implements `Transmit` and `Poll` only; `MESH_*` details |
+| `net/in_process_mesh.h`, `net/tcp_mesh.h`, `net/short_id.h`, `net/sentry.h` | R13 | landed (stubs) | `InProcessSeatMesh::Create` (M4-SIM-01); `TcpSeatMesh::Create`, `TcpMeshConfig`, `SeatEndpoint`, `DEFAULT_SEAT_MESH_PORT` = 5649 PROVISIONAL (M4-NET-01); `ShortIdCodec(header_hash, nonce)` `Encode`/`Decode` (M4-NET-02); `SentryFanout(mesh)` `Fanout` → `FanoutReport` (M4-NET-03) |
+| `bridge/bridge_manager.h`, `bridge/checkpoint.h`, `bridge/forced_exit.h` | R13 | landed (stubs) | `BridgeManagerV2` `OnFinalizedMint` → `DepositFact` (M8-BRG-01), `BuildWithdrawalPacket` (M8-BRG-02), `CheckReleaseLimits` (M8-BRG-03) with target shapes `FinalizedMint`, `WithdrawalRequest`, `WithdrawalPacket`, `ReleaseLimits`, `ReleaseWindow`; `CheckpointBuilder::Build` → `Checkpoint` (M8-CKP-01; O-80); `ForcedExit::Open`/`Redeem`, `FORCED_EXIT_DELAY_BLOCKS` = 10,080 PROVISIONAL, `ExitClaim`, `ExitRedemption` (M8-EXIT-01); gated by CLAUDE.md rules 5-6 and C-6 |
+| `futures/futures.h`, `governance/governance.h` | R13 | landed (stubs) | `FuturesDomain(profile)` `PlaceFuture` (M9-FUT-01), `SubmitOracle` (M9-FUT-02), `MarginCheck` (M9-FUT-03), `Sweep` (M9-FUT-04), target shapes `FutureOrder`, `OracleSubmission`, `MarginState`, `SweepReport`; `Governance(genesis_profile)` `ApplyListing` → `MarketDescriptor` (M7-GOV-01), `ApplyRemoval` (M7-GOV-02, `RemovalRequest`), `ParamsAt` (M7-GOV-03) |
+| `test/util/api_fixtures.h` | R13 | landed | TEST fixtures: `LaneLimitsOf`, `ApiLaneLimits` (an ACTION lane of n messages), `NewLaneSet`, `ApiRigOptions`, `ApiRig` (an `AdmissionRig` plus a `LaneSet` and an `InProcessApi`; `Submit`, `Reply` = pump until answered then take, `AdmitViaApi`, `GetAction`) |
+| `test/util/mesh_fixtures.h` | R13 | landed | TEST fixtures: `RecordingMesh` (a `SeatMesh` whose transport records what the base class lets through, or answers `refuse`; `Poll` from `inbound`), `TestMeshConfig`, `DurableVoteFixture` (the strict path of section 7.3 to a real `OutboundVote`) |
 | `sim/*.h` | R14 | target | section 14 |
 
 ---
@@ -372,7 +388,8 @@ header marked *landed* is normative; the others are the target contract.
 | `UnlimitedDevBudget` (dev) | none | (R12) atomic counters | — |
 | `ReadService` | archive mutex | view map and order, outcome index and order, last publication, publishing flag (R11) | map lookups, inserts and erases only: never across the C1 publish, a proof computation, I/O or the release of evicted views, and never together with the C1 publish mutex (a concurrent `Publish` is refused instead of waiting); readers take it once per reply (REAL-REPLACE M5-RD-01 takes it off the read path) |
 | each `Journal` | `m_mutex` | buffer, `seq`, `durable_seq`, fatal flag | append; `Barrier` copies the target `seq`, releases the lock, runs the commit, then re-locks to record the result |
-| `InProcessApi` | `m_mutex` | reply map | map operations |
+| `LaneSet` | `m_mutex` | per-lane counts of queued messages and bytes, all classes and ORDINARY (R13) | count updates only: a push reserves its counts, releases the lock, then calls the C1 mailbox (which takes its own mutex) and rolls back on refusal; a pop subtracts after the mailbox call |
+| `InProcessApi` | `m_mutex` | request map (QUEUED, PROCESSING, REPLIED and the stored replies) and the reply reservation count (R13) | map operations only: never across a lane push or pop, admission, a read or a pool call |
 | `FakeChainAdapter` (dev) | `m_mutex` | chain, authority, seat sets, BUSY queue, pending rewind, hooks (R10) | each method; never across a call into another object; `JournalHook` callbacks take it on the barrier thread, which holds no journal lock |
 | C1 `BoundedMailbox`, `ReadSlot` | internal | as C1 | as C1 |
 
@@ -919,6 +936,52 @@ that were already authenticated (the sigcache pattern).
   ALLOW with whether the reply is `ADMITTED`; whether a policy charges per
   attempt or per admission is M4-ADM-02's ruling (O-73).
 
+### 10.5 As landed in R13
+
+- **Lanes** (`net/lanes.h`). Four C1 `BoundedMailbox`es; `PopNext` serves
+  CRITICAL, PROPOSAL, ACTION, BULK in strict priority, FIFO inside a lane.
+  CANCEL, STATUS and HEALTH share each lane's reserved ⌈10 %⌉ of messages
+  and of bytes: ORDINARY traffic may queue at most the rest, so with the
+  ordinary share full the reserved classes still find their share; they
+  may also use the whole lane. The counts live under the `LaneSet` mutex
+  and are reserved before and rolled back after the mailbox call, so no
+  limit is ever exceeded, even transiently (a 4-pusher test observes the
+  counts throughout), and every refusal leaves no copy. Reserved traffic
+  gets capacity, not priority: it waits in the lane's FIFO (O-77).
+- **Client API** (`net/client_api.h`, `net/in_process_api.h`). Queue
+  acceptance, the one reply and certified reads are separate answers.
+  `Submit` gives a frame the CANCEL class only if it decodes exactly as a
+  CANCEL or CANCEL_ALL; `SubmitStatus` and `SubmitHealth` use STATUS and
+  HEALTH, so a client can still learn the state of its action, and cancel
+  it, while the ACTION lane's ordinary share is full. A frame above the
+  lane's message cap is OVERSIZE at `Submit`, not queued (admission never
+  sees it). `Pump` reserves a reply place before it pops, so at most
+  `max_replies` replies wait and requests beyond stay queued
+  (`REPLIES_FULL`); it answers without its lock; a message of an id it did
+  not issue is INVARIANT. `GetAction` takes one read lease: INCLUDED with
+  the slot's envelope, outcome and proof; EXPIRED only with that lease's
+  witness (which `VerifyExpired` accepts); then PENDING (`PENDING` or
+  `IN_PROPOSAL` in the pool); else UNKNOWN with a reason
+  (`API_UNKNOWN_TERMINAL_UNPROVEN` when the pool dropped it but the lease
+  proves nothing; `API_UNKNOWN_INCLUDED_AFTER_LEASE` when the pool saw it
+  included in a slot the lease does not show yet;
+  `API_UNKNOWN_NOTHING_PUBLISHED`). Without any publication the pool still
+  answers PENDING, with no head. A read service BUSY is the caller's BUSY
+  (O-75, O-78).
+- **Seat mesh** (`net/seat_mesh.h`). The base class holds the send rules;
+  a transport implements `Transmit` and `Poll` only. `SendVote(seat,
+  OutboundVote, header_hash)` encodes the VOTE message of the durable
+  record (phase, epoch, view, slot, the header hash, this seat, the
+  signature over the digest) on CRITICAL; `Send` refuses a VOTE on
+  CRITICAL or PROPOSAL and any frame that is not its lane's agreement
+  message; ACTION and BULK are opaque, because a receiver reads a frame
+  only as its lane's content. No transport exists in the outline: the
+  tests use a recording one (O-76, O-79).
+- **Product boundaries** (`bridge/`, `futures/`, `governance/`). Every
+  method is a typed stub with its task ID; the headers state the target
+  contracts and shapes, none names a vault, a contract or a key, and the
+  bridge rows stay gated by CLAUDE.md rules 5 and 6 and C-6 (O-80).
+
 ---
 
 ## 11. Engine semantics (all PROVISIONAL, REGTEST profile)
@@ -1105,14 +1168,15 @@ commit builds and adds tests. TODO.md lists their acceptance criteria.
 
 ## 13. Build and test
 
-### 13.1 Today (after R12)
+### 13.1 Today (after R13)
 
 The commands in 13.2 work. They build every fm2 target (`fm2_all`): the
 libraries `fm2_types` and `fm2_core` (since R5; `engine/` since R6,
 `engine/engine` since R7, `storage/` since R8, `state/` since R9, `chain/`
-and `agreement/` since R10, `read/` since R11, `admission/` since R12),
+and `agreement/` since R10, `read/` since R11, `admission/` since R12,
+`net/`, `bridge/`, `futures/` and `governance/` since R13),
 `fm2_dev` (since R10; the dev budget since R12), `fm2_verify` (since R11),
-`test_flowmesh2` (437 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
+`test_flowmesh2` (476 Boost cases), the unchanged C1 binary and, with the option on, the canaries. They run eight CTests: `flowmesh2_foundations` (C1,
 19 cases), `flowmesh2_unit`, `flowmesh2_inventory`, `flowmesh2_todo_lint`,
 `flowmesh2_guards`, `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`
 and `flowmesh2_negative_compile` (Clang). The outline never uses `build/`,
@@ -1482,6 +1546,12 @@ outline does not resolve on its own.
 | O-72 | Pool semantics beyond the slice text | A new terminal status `NONCE_TOO_LOW` (the window moved past a pending nonce; the slice text names only `NONCE_USED` and `EXPIRED`); `EXPIRED` at `OnCommitted(h)` only when h > ref_slot + max_delay, so it agrees with `VerifyExpired` and the walking skeleton (w becomes `EXPIRED` at slot 5); `TakeForSlot` and `OnCommitted` require the successor of the pool's head; `Insert` refuses a snapshot older than the pool's head (`STALE_SNAPSHOT`), because a commit since the snapshot may have used the nonce; capacity counts live entries only; `terminal_capacity` bounds the non-included terminal records (default `pool_capacity`); selection is in admission order. The pool trusts admission for accounts, nonces and windows: an entry whose account is absent at a committed head is `INVARIANT` |
 | O-73 | Budget contract (SEC-4, D13 open) | `Check` runs at A7, before the signature; `Settle(request, admitted)` runs once per ALLOW. A policy that charges per attempt lets anyone drain an account's budget with bad signatures in its name; one that charges per admission lets bad-signature floods through A7. M4-ADM-02 rules it. `BudgetRequest` carries the account's open orders for the plan's cancel lane. `UnlimitedDevBudget` (REGTEST, fm2_dev) always allows |
 | O-74 | Admission errors and reads | `Admit` returns a `Result`: a budget error (for example the `CreditBudget` stub), a read-service INVARIANT and `ADMISSION_NO_HEAD` are errors, counted as `errors`, never replies. A read service that answers `BUSY` or `NEED_DATA` at A9 gives no information (the snapshot's nonce check still answers). A head of `UINT64_MAX` has no successor, so every action is `EXPIRED` (`REASON_HEIGHT_EXHAUSTED`) |
+| O-75 | Order of the `GetAction` answers: the R13 slice text reads "checks the read service first (INCLUDED with proofs), then the pool (PENDING). It returns EXPIRED only with a proof VerifyExpired accepts, taken from the same lease; otherwise UNKNOWN" | The pool learns of a slot only after the read service published it (section 3), so for one publication the pool may still hold live an action the lease already proves expired. An expiry proof is final (no later slot can include the action), so `GetAction` answers INCLUDED, then EXPIRED (from the lease's own witness), then PENDING, then UNKNOWN. EXPIRED never comes from the pool's terminal status alone: a pool `EXPIRED`, `NONCE_USED` or `NONCE_TOO_LOW` without a lease proof is UNKNOWN (`API_UNKNOWN_TERMINAL_UNPROVEN`). Both orders of publication and pool commit are tested, and every EXPIRED answer of the tests passes `VerifyExpired`. Ratify, or keep the literal order (PENDING before EXPIRED) |
+| O-76 | `SendVote`'s signature: the slice text gives `SendVote(OutboundVote)`, but the agreement VOTE message (R10, O-57) names the header hash and the sending seat, and an `OutboundVote` (R8) holds only the VoteKey, the digest and the signature | `SendVote(seat, vote, header_hash)`: one destination per call, so BUSY keeps meaning "not queued" (a broadcast could be half queued); the seat index is the mesh's own `self_seat`; the agreement loops over the seats and resends on its timer (a durable vote resends byte-identical bytes). M4-AGR-02 may instead carry the digest in the VOTE message and drop `header_hash` |
+| O-77 | Lane reserve semantics | The reserved share is ⌈10 %⌉ of each lane's messages AND bytes; ORDINARY traffic is capped at the rest; CANCEL, STATUS and HEALTH may use the whole lane; inside a lane every class is FIFO (capacity, not priority). Strict priority between lanes can starve BULK under sustained higher traffic (the research proposes deficit round-robin below CRITICAL). Only a frame that decodes exactly as a cancel gets the CANCEL class, but a well-formed cancel with a bad signature still uses the shared reserve until admission refuses it; dividing the reserve between accounts (the plan's "up to the account's open-order count") is M4-ADM-02's, the limits M4-NET-04's |
+| O-78 | Request model of the in-process API beyond the slice text | Queued status and health requests (`SubmitStatus`, `SubmitHealth`) give "status" and "health" their lane class; `GetAction` and `GetState` are also synchronous (reads never wait on the pump, PERF-12). A `RequestId` names one queued request (sequential per API instance, never an ActionId), and a refused submit consumes an id but leaves nothing. The ACTION lane of the `LaneSet` belongs to the API; `Pump` pops only that lane (the dispatcher of CRITICAL, PROPOSAL and BULK belongs to the agreement and the mesh, M4-SIM-01, M4-NET-01) and refuses a foreign message with INVARIANT, dropping it. Replies are bounded by `max_replies`, reserved before each pop. A frame above the lane cap is OVERSIZE at `Submit` instead of an admission OVERSIZE reply. Admission errors are replies (`ApiReply::body` holds the `Error`) |
+| O-79 | What the mesh lets through `Send` | CRITICAL carries only VIEW_CHANGE, NEW_VIEW and EVIDENCE through `Send`, PROPOSAL only PROPOSAL (the envelope's version and type bytes are checked, the receiver decodes the rest), a VOTE never; ACTION and BULK are opaque, which relies on receivers reading a frame only as its lane's content. View changes and new views leave without a durable token in the outline: before PBFT sends them, M4-STO-07 and M4-AGR-02 must add typed durable paths like `SendVote` |
+| O-80 | Product-boundary target shapes | `bridge::Checkpoint` repeats the fields of `verify::CheckpointClaim`, because `fm2_core` never links `fm2_verify`; M8-CKP-01 moves one shared type into `core/` (the O-33 pattern). `OnFinalizedMint` returns the `DepositFact` the chain adapter will deliver; `ForcedExit` counts B3 heights only; `FuturesDomain` and `Governance` hold a profile. No stub checks the network or validates its inputs before answering NotImplemented. Every shape may change with its task. The bridge rows stay gated by CLAUDE.md rules 5 and 6 and plan C-6; nothing names a vault, a contract or a key |
 
 ---
 

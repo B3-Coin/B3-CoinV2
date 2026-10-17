@@ -144,8 +144,16 @@ per-code counters and a sticky fence, and the bounded `ActionPool`
 (`IN_PROPOSAL` without removal, terminal `NONCE_USED`, `NONCE_TOO_LOW` and
 `EXPIRED`, a taken slot that always passes the validity predicate); credit
 budgets and batch verification are typed stubs, and `fm2_dev` adds the
-REGTEST unlimited dev budget. Nothing is linked into the node, wallet or
-Qt.
+REGTEST unlimited dev budget; and **R13**, the service lanes in `net/`
+(four C1 mailboxes in strict priority CRITICAL > PROPOSAL > ACTION > BULK,
+with a reserved tenth of every lane for cancel, status and health, and
+BUSY that always means "not queued"), the client API contract and the
+in-process API (exactly one reply per request, admission through the
+lane, and `GetAction` from one read lease that answers EXPIRED only with
+a proof), and the seat mesh interface whose only vote path takes a
+durable vote; HTTPS + SSE, streams, the real meshes, short IDs, sentry
+fan-out and the `bridge/`, `futures/` and `governance/` boundaries are
+typed stubs. Nothing is linked into the node, wallet or Qt.
 
 ```sh
 git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
@@ -157,8 +165,8 @@ cmake --build build-rebirth --target fm2_all --parallel 4
 ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 ```
 
-Expected after R12: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
-cases, `flowmesh2_unit` with 437 cases, `flowmesh2_inventory`,
+Expected after R13: 8 CTests pass (`flowmesh2_foundations` with its 19 C1
+cases, `flowmesh2_unit` with 476 cases, `flowmesh2_inventory`,
 `flowmesh2_todo_lint`, `flowmesh2_guards`, `flowmesh2_guards_selftest`,
 `flowmesh2_evidence_selftest` and, with Clang, `flowmesh2_negative_compile`
 with four controls). The file journal tests write only under
