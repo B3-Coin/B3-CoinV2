@@ -1,0 +1,391 @@
+/* Copied unchanged from b3_docker frontend/css/layout.css at 50a3405. */
+/* B3 Hive — app shell and responsive layout.
+
+   Four shells, one markup tree:
+     >=1280px  full rail (248px) with group labels
+     1024px    compact rail (216px)
+     640px     icon-only rail (64px), labels become tooltips
+     <640px    top appbar + bottom tab bar (thumb zone)
+   Plus an explicit short-viewport pass for MOBILE LANDSCAPE, which is where
+   most wallet UIs fall apart (keyboard eats the viewport, dialog buttons go
+   off-screen). */
+
+/* ============================================================ App frame == */
+
+.app {
+  display: grid;
+  grid-template-columns: 1fr;
+  min-height: 100dvh;
+}
+
+/* ============================================================ Nav rail === */
+
+.rail { display: none; }
+
+@media (min-width: 640px) {
+  .app { grid-template-columns: var(--rail-w-icon) 1fr; }
+
+  .rail {
+    display: flex; flex-direction: column;
+    position: sticky; top: 0;
+    height: 100dvh;
+    z-index: var(--z-100);
+    background: var(--bg-surface);
+    border-right: 1px solid var(--border);
+  }
+
+  .rail-brand {
+    display: flex; align-items: center; gap: var(--space-2);
+    min-height: var(--appbar-h);
+    padding: var(--space-3);
+    border-bottom: 1px solid var(--border);
+    color: var(--accent-text); font-weight: 700;
+  }
+  .rail-brand .brand-text { display: none; }
+
+  .rail-nav {
+    flex: 1; overflow-y: auto; overscroll-behavior: contain;
+    padding: var(--space-2) var(--space-2) var(--space-4);
+    scrollbar-width: thin;
+  }
+
+  .nav-group + .nav-group { margin-top: var(--space-3); }
+  .nav-group-head { display: none; }
+
+  .nav-item {
+    position: relative;
+    display: flex; align-items: center; gap: var(--space-3);
+    width: 100%; min-height: var(--min-target);
+    padding: 0 var(--space-2);
+    border-radius: var(--radius-sm);
+    color: var(--text-muted); font-weight: 550;
+    text-align: left;
+    transition: background var(--duration-fast), color var(--duration-fast);
+  }
+  .nav-item + .nav-item { margin-top: 2px; }
+  .nav-item .nav-text { display: none; }
+  .nav-item .i { flex: none; }
+  .nav-item:hover { background: var(--bg-subtle); color: var(--text); }
+  .nav-item[aria-current="page"] { background: var(--accent-bg); color: var(--accent-text); }
+
+  /* The hex is the active marker — the one structural use of the motif. */
+  .nav-item[aria-current="page"]::before {
+    content: ""; position: absolute; left: -2px; top: 50%; translate: 0 -50%;
+    width: 8px; height: 9px; background: var(--accent);
+    clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+  }
+
+  /* Count chip on a nav item (e.g. unacked alerts). */
+  .nav-item .nav-count {
+    display: none;
+    min-width: 19px; height: 19px; padding: 0 5px;
+    place-items: center; border-radius: var(--radius-pill);
+    background: var(--danger); color: var(--danger-on);
+    font-size: 10px; font-weight: 700;
+  }
+
+  .rail-foot {
+    padding: var(--space-2);
+    border-top: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: var(--space-2);
+  }
+  .rail-foot .rail-foot-row { display: flex; gap: var(--space-1); justify-content: center; }
+  .rail-foot .wallet-badge { display: none; }
+}
+
+/* Icon rail centres its icons. At 64px wide the footer controls cannot sit
+   side by side — they overflowed into the content area — so stack them and
+   drop the mode pill's label. */
+@media (min-width: 640px) and (max-width: 1023.98px) {
+  .nav-item { justify-content: center; padding: 0; }
+  .nav-item[aria-current="page"]::before { left: 0; }
+  .rail-brand { justify-content: center; padding-inline: 0; }
+
+  .rail-foot { padding: var(--space-1-5); }
+  .rail-foot .rail-foot-row { flex-direction: column; align-items: stretch; }
+  .rail-foot .mode-pill { justify-content: center; padding: 0; }
+  .rail-foot .mode-pill .pill-text { display: none; }
+}
+
+/* The label is only meaningful once the rail is wide enough to show it. */
+.mode-pill .pill-text { display: inline; }
+
+/* --- Expanded rail ------------------------------------------------------- */
+
+@media (min-width: 1024px) {
+  .app { grid-template-columns: var(--rail-w-md) 1fr; }
+
+  .rail-brand { padding-inline: var(--space-4); }
+  .rail-brand .brand-text { display: block; font-size: var(--text-md); }
+  .rail-nav { padding-inline: var(--space-3); }
+
+  .nav-group-head {
+    display: flex; align-items: center; justify-content: space-between;
+    width: 100%;
+    padding: var(--space-3) var(--space-2) var(--space-1);
+    font-size: var(--text-xs); font-weight: 650;
+    text-transform: uppercase; letter-spacing: var(--tracking-label);
+    color: var(--text-muted);
+  }
+  .nav-group-head .caret { transition: rotate var(--duration-fast) var(--ease-out); }
+  .nav-group-head[aria-expanded="false"] .caret { rotate: -90deg; }
+
+  .nav-item { padding-inline: var(--space-3); }
+  .nav-item .nav-text { display: block; flex: 1; min-width: 0; }
+  .nav-item .nav-count { display: grid; }
+
+  .rail-foot { padding: var(--space-3); gap: var(--space-3); }
+  .rail-foot .rail-foot-row { justify-content: space-between; }
+  .rail-foot .wallet-badge { display: flex; }
+}
+
+@media (min-width: 1280px) {
+  .app { grid-template-columns: var(--rail-w) 1fr; }
+}
+
+/* ============================================================ App bar ==== */
+/* Mobile: the only chrome at the top. Desktop: replaced by .page-head. */
+
+.appbar {
+  position: sticky; top: 0; z-index: var(--z-50);
+  display: flex; align-items: center; gap: var(--space-2);
+  min-height: var(--appbar-h);
+  padding: var(--space-2) var(--space-3);
+  padding-top: max(var(--space-2), env(safe-area-inset-top, 0px));
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+}
+.appbar .appbar-title {
+  flex: 1; min-width: 0;
+  font-size: var(--text-md); font-weight: 650;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.appbar .btn-icon { width: 40px; min-height: 40px; }
+
+@media (min-width: 640px) { .appbar { display: none; } }
+
+/* ============================================================ Page head == */
+
+.page-head {
+  position: sticky; top: 0; z-index: var(--z-50);
+  display: none;
+  align-items: flex-start; justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.page-head .page-title { font-size: var(--text-xl); }
+.page-head .page-sub { color: var(--text-muted); margin-top: 2px; }
+.page-head .page-actions { display: flex; align-items: center; gap: var(--space-2); flex: none; }
+
+@media (min-width: 640px) { .page-head { display: flex; } }
+
+/* The ⌘K affordance. */
+.search-pill {
+  display: none; align-items: center; gap: var(--space-2);
+  min-height: var(--min-target-sm);
+  padding: 0 var(--space-2) 0 var(--space-3);
+  background: var(--bg-surface); color: var(--text-muted);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-pill);
+  font-size: var(--text-sm);
+}
+.search-pill:hover { color: var(--text); border-color: var(--text-muted); }
+@media (min-width: 1024px) { .search-pill { display: flex; } }
+
+/* ============================================================ Main ======= */
+
+.main { display: flex; flex-direction: column; min-width: 0; }
+
+.view {
+  flex: 1;
+  width: 100%;
+  padding: var(--space-4) var(--space-3);
+  /* clear the fixed tab bar + iOS home indicator */
+  padding-bottom: calc(var(--tabbar-h) + var(--safe-bottom) + var(--space-5));
+  margin-inline: auto;
+  max-width: var(--w-app);
+}
+.view--flow { max-width: var(--w-flow); }
+.view--data { max-width: var(--w-data); }
+
+@media (min-width: 640px) {
+  .view {
+    padding: var(--space-5);
+    padding-bottom: var(--space-6);
+  }
+}
+
+/* Vertical rhythm: one gap scale between stacked blocks. */
+.stack    { display: flex; flex-direction: column; gap: var(--space-3); }
+.stack-4  { display: flex; flex-direction: column; gap: var(--space-4); }
+@media (min-width: 640px) { .stack { gap: var(--space-4); } }
+
+/* ============================================================ Tab bar ==== */
+
+.tabbar {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  z-index: var(--z-100);
+  display: flex;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
+  padding-bottom: var(--safe-bottom);
+}
+.tabbar-item {
+  flex: 1;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 3px;
+  min-height: var(--tabbar-h);
+  padding: var(--space-1) 2px;
+  color: var(--text-muted);
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.01em;
+  transition: color var(--duration-fast);
+}
+.tabbar-item .i { width: 22px; height: 22px; }
+.tabbar-item[aria-current="page"] { color: var(--accent-text); }
+.tabbar-item .tabbar-label { line-height: 1; }
+.tabbar-item .nav-count {
+  position: absolute; translate: 14px -10px;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  display: grid; place-items: center; border-radius: var(--radius-pill);
+  background: var(--danger); color: var(--danger-on);
+  font-size: 10px; font-weight: 700;
+}
+
+@media (min-width: 640px) { .tabbar { display: none; } }
+
+/* ============================================================ Grids ====== */
+
+.grid { display: grid; gap: var(--space-3); grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 640px)  { .grid { gap: var(--space-4); } }
+@media (min-width: 900px)  { .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (min-width: 900px)  { .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (min-width: 1280px) { .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+
+/* Home: hero spans, remaining cards pair up. */
+.home-grid { display: grid; gap: var(--space-3); grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 640px)  { .home-grid { gap: var(--space-4); } }
+@media (min-width: 1024px) {
+  .home-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .home-grid .span-2 { grid-column: 1 / -1; }
+}
+
+/* ======================================================= Wallet badge ==== */
+
+.wallet-badge {
+  display: flex; align-items: center; gap: var(--space-2);
+  width: 100%; min-height: var(--min-target-sm);
+  padding: var(--space-1-5) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  font-size: var(--text-sm); font-weight: 600;
+  color: var(--text-muted);
+  text-align: left;
+}
+.wallet-badge .grow { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wallet-badge[data-state="unlocked"] { background: var(--success-bg); border-color: var(--success-border); color: var(--success); }
+.wallet-badge[data-state="locked"]   { background: var(--warning-bg); border-color: var(--warning-border); color: var(--warning); }
+.wallet-badge[data-state="no-wallet"]{ background: var(--bg-subtle);  border-color: var(--border);        color: var(--text-muted); }
+.wallet-badge[data-state="no-node"]  { background: var(--danger-bg);  border-color: var(--danger-border); color: var(--danger); }
+
+/* Mobile: icon-only variant in the appbar. */
+.wallet-chip {
+  display: grid; place-items: center;
+  width: 40px; height: 40px; flex: none;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-subtle); color: var(--text-muted);
+}
+.wallet-chip[data-state="unlocked"] { background: var(--success-bg); border-color: var(--success-border); color: var(--success); }
+.wallet-chip[data-state="locked"]   { background: var(--warning-bg); border-color: var(--warning-border); color: var(--warning); }
+.wallet-chip[data-state="no-node"]  { background: var(--danger-bg);  border-color: var(--danger-border); color: var(--danger); }
+
+/* ======================================================= Mode pill ======= */
+
+.mode-pill {
+  display: inline-flex; align-items: center; gap: var(--space-1-5);
+  min-height: var(--min-target-sm); padding: 0 var(--space-3);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-pill);
+  background: var(--bg-surface); color: var(--text-muted);
+  font-size: var(--text-xs); font-weight: 650;
+  text-transform: uppercase; letter-spacing: var(--tracking-label);
+}
+.mode-pill:hover { color: var(--text); border-color: var(--text-muted); }
+[data-mode="advanced"] .mode-pill {
+  background: var(--accent-bg); color: var(--accent-text); border-color: var(--accent-border);
+}
+
+/* ======================================================= Mode gating ===== */
+
+.adv-only { display: none; }
+[data-mode="advanced"] .adv-only { display: revert; }
+[data-mode="advanced"] .simple-only { display: none; }
+
+/* ======================================================= Setup lock ====== */
+/* First run: the wizard is the ONLY thing rendered. No rail, no tab bar,
+   no appbar — so there is nothing to click away to and no dashboard flash. */
+
+.app[data-setup="active"] { grid-template-columns: 1fr; }
+.app[data-setup="active"] .rail,
+.app[data-setup="active"] .tabbar,
+.app[data-setup="active"] .appbar,
+.app[data-setup="active"] .page-head { display: none !important; }
+.app[data-setup="active"] .view { padding-bottom: var(--space-6); }
+
+/* ================================================= Mobile landscape ====== */
+/* Short viewports: reclaim vertical space aggressively. */
+
+@media (max-height: 480px) {
+  .tabbar { --tabbar-h: 44px; }
+  .tabbar-item { min-height: 44px; gap: 0; }
+  .tabbar-item .tabbar-label { display: none; }   /* icons only */
+  .tabbar-item .i { width: 20px; height: 20px; }
+
+  .appbar { min-height: 44px; padding-block: var(--space-1); }
+  .appbar .btn-icon { width: 36px; min-height: 36px; }
+
+  .view { padding-block: var(--space-3); }
+
+  /* Balance hero goes horizontal so hero + next-step both stay above the fold. */
+  .hero { flex-direction: row; align-items: center; justify-content: space-between; }
+  .hero .hero-actions { flex: none; }
+  .amt-hero { font-size: var(--text-xl); }
+
+  /* A centred dialog must not push its own buttons off-screen. */
+  .backdrop { padding: var(--space-2); align-items: stretch; }
+  .modal { max-height: calc(100dvh - var(--space-4)); }
+  .modal-head { padding: var(--space-3) var(--space-3) var(--space-2); }
+  .modal-body { padding: 0 var(--space-3) var(--space-3); }
+  .modal-foot { padding: var(--space-2) var(--space-3); }
+  .sheet .modal { max-height: 96dvh; }
+
+  .palette-backdrop { padding-top: var(--space-3); }
+  .palette { max-height: calc(100dvh - var(--space-6)); }
+
+  .empty { padding-block: var(--space-4); }
+  .flow-q { font-size: var(--text-lg); }
+}
+
+/* Two-up cards on a landscape phone: the width is there, the height is not. */
+@media (orientation: landscape) and (max-height: 480px) and (min-width: 600px) {
+  .home-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .home-grid .span-2 { grid-column: 1 / -1; }
+}
+
+/* Keyboard safety: a focused field must never sit under a sticky footer. */
+.input, .textarea, .select { scroll-margin-block: 96px; }
+
+/* Two-column flow for stacks of independent cards on wide screens.
+   Cards keep their order (top-to-bottom, then next column); banners,
+   callouts and .span-all items run across both columns. */
+@media (min-width: 1280px) {
+  .stack.cols-2 { display: block; column-count: 2; column-gap: var(--space-4); }
+  .stack.cols-2 > * { break-inside: avoid; margin-bottom: var(--space-4); }
+  .stack.cols-2 > .span-all,
+  .stack.cols-2 > .banner,
+  .stack.cols-2 > .callout { column-span: all; }
+  /* A column's bottom margin is lost where a spanning item begins. */
+  .stack.cols-2 > .card.span-all { margin-top: var(--space-4); }
+}

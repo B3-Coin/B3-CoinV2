@@ -1,0 +1,30 @@
+/* B3 Hive app: the design system from b3_docker plus the few rules the app
+   adds. Every window imports this file and nothing else. */
+
+@import url("tokens.css");
+@import url("base.css");
+@import url("components.css");
+@import url("layout.css");
+
+/* Balance hero, from b3_docker frontend/css/views.css. */
+.hero {
+  display: flex; flex-direction: column; gap: var(--space-4);
+  padding: var(--space-5) var(--space-4);
+}
+.hero-figure { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.hero-actions { display: flex; gap: var(--space-2); }
+.hero-actions .btn { flex: 1; }
+.hero-chips { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+
+@media (min-width: 640px) {
+  .hero { flex-direction: row; align-items: center; justify-content: space-between; padding: var(--space-5); }
+  .hero-actions { flex: none; }
+  .hero-actions .btn { flex: none; min-width: 124px; }
+}
+
+/* The desktop app has no phone layout: its windows have a minimum size, so
+   the bottom tab bar's padding is never needed. */
+.view { padding-bottom: var(--space-6); }
+
+/* Views are switched by the hidden attribute, which must beat .view. */
+[hidden] { display: none !important; }

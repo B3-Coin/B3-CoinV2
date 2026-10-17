@@ -1,0 +1,182 @@
+/* Copied unchanged from b3_docker frontend/css/tokens.css at 50a3405. */
+/* B3 Hive — design tokens.
+   "Warm graphite & honey": warm-neutral surfaces, gold used sparingly.
+
+   ACCENT ROLES ARE ENFORCED. Mixing them is what caused the WCAG failures in
+   the previous theme (light --accent on --bg measured 2.25:1):
+     --accent      FILL ONLY   (buttons, bars, active indicators)
+     --accent-on   text/icons ON an accent fill
+     --accent-text TEXT ONLY   (links, emphasis, the balance number)
+   There is deliberately no --text-dim: it measured 2.86:1 (light) / 3.13:1
+   (dark) and cannot be fixed. Placeholders use --text-muted at reduced alpha.
+
+   Dark is the default; [data-theme="light"] overrides. */
+
+:root {
+  /* ---- Surfaces (dark) ---- */
+  --bg:            #12100e;
+  --bg-surface:    #191612;
+  --bg-card:       #1a1713;
+  --bg-elevated:   #241f19;  /* menus, tooltips, sheets — must be OPAQUE */
+  --bg-input:      #0e0c0a;
+  --bg-subtle:     #201b16;  /* zebra rows, inset wells */
+  --border:        #2a2520;
+  --border-strong: #3a332b;
+  --border-focus:  #6b5a33;
+
+  /* ---- Text (dark) ---- */
+  --text:          #ede6d8;  /* 14.8:1 on --bg */
+  --text-muted:    #a09684;  /*  7.0:1 on --bg */
+
+  /* ---- Accent (dark) ---- */
+  --accent:        #e8c05a;
+  --accent-on:     #17140d;
+  --accent-text:   #e8c05a;  /* 10.4:1 on --bg */
+  --accent-hover:  #f0cc72;
+  --accent-bg:     #2a2415;
+  --accent-border: #4c4021;
+
+  /* ---- Semantic (dark) ---- */
+  --success:        #6fd69b;
+  --success-on:     #07120c;
+  --success-bg:     #13201a;
+  --success-border: #2f4435;
+  --warning:        #e8a84c;
+  --warning-on:     #17120a;
+  --warning-bg:     #251c12;
+  --warning-border: #51402a;
+  --danger:         #f0736f;
+  --danger-on:      #1a0b0b;
+  --danger-bg:      #241616;
+  --danger-border:  #5c3434;
+  --info:           #79b8e8;
+  --info-on:        #0a1219;
+  --info-bg:        #141e26;
+  --info-border:    #2e4557;
+
+  /* ---- Elevation (dark: borders + inset highlight; shadows are invisible
+          on near-black, so they are deliberately minimal here) ---- */
+  --shadow-sm:  0 1px 2px rgb(0 0 0 / 0.5);
+  --shadow:     0 4px 12px rgb(0 0 0 / 0.55);
+  --shadow-lg:  0 16px 40px rgb(0 0 0 / 0.65);
+  --ring-inset: inset 0 1px 0 rgb(255 255 255 / 0.04);
+
+  /* ---- Spacing (unchanged scale) ---- */
+  --space-1:   0.25rem;  /*  4 */
+  --space-1-5: 0.375rem; /*  6 */
+  --space-2:   0.5rem;   /*  8 */
+  --space-3:   0.75rem;  /* 12 */
+  --space-4:   1rem;     /* 16 */
+  --space-5:   1.5rem;   /* 24 */
+  --space-6:   2rem;     /* 32 */
+  --space-7:   3rem;     /* 48 */
+
+  /* ---- Type ---- */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+               "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+               "Liberation Mono", monospace;
+
+  --text-xs:   0.75rem;   /* 12 */
+  --text-sm:   0.8125rem; /* 13 */
+  --text-base: 0.875rem;  /* 14 — app body size */
+  --text-md:   1rem;      /* 16 */
+  --text-lg:   1.125rem;  /* 18 */
+  --text-xl:   1.375rem;  /* 22 */
+  --text-2xl:  1.75rem;   /* 28 */
+  --text-3xl:  2.25rem;   /* 36 — balance hero */
+
+  --leading-tight:   1.2;
+  --leading-normal:  1.5;
+  --leading-relaxed: 1.6;
+
+  --tracking-label: 0.06em; /* uppercase micro-labels */
+
+  /* ---- Radius (one scale) ---- */
+  --radius-sm:   10px;
+  --radius-md:   14px;
+  --radius-lg:   20px;
+  --radius-pill: 999px;
+
+  /* ---- Motion ---- */
+  --duration-fast: 150ms;
+  --duration-med:  220ms;
+  --duration-slow: 320ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* ---- Z-index ---- */
+  --z-50:  50;   /* sticky headers */
+  --z-100: 100;  /* nav rail / tab bar */
+  --z-200: 200;  /* dropdowns, popovers */
+  --z-300: 300;  /* modals + backdrop */
+  --z-400: 400;  /* toasts, tooltips (top layer) */
+
+  /* ---- Touch targets ---- */
+  --min-target:    44px;
+  --min-target-sm: 36px;
+
+  /* ---- Focus ring (2px gap so it reads on any surface) ---- */
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+
+  /* ---- Layout widths: set per content type, never one global clamp ---- */
+  --w-flow: 560px;   /* forms, flows, wizard — optimal form measure */
+  --w-app:  1440px;  /* Home and general views */
+  --w-data: 1600px;  /* tables: activity, UTXOs, peers, logs */
+
+  /* ---- Shell metrics ---- */
+  --rail-w:        248px;
+  --rail-w-md:     216px;
+  --rail-w-icon:   64px;
+  --appbar-h:      56px;
+  --tabbar-h:      56px;
+  --safe-bottom:   env(safe-area-inset-bottom, 0px);
+}
+
+[data-theme="light"] {
+  /* ---- Surfaces (light) ---- */
+  --bg:            #faf9f6;  /* warm paper */
+  --bg-surface:    #ffffff;
+  --bg-card:       #ffffff;
+  --bg-elevated:   #ffffff;
+  --bg-input:      #ffffff;
+  --bg-subtle:     #f4f2ec;
+  --border:        #e4dfd5;
+  --border-strong: #d1cabb;
+  --border-focus:  #c9a227;
+
+  /* ---- Text (light) ---- */
+  --text:          #16130e;  /* 16.1:1 on --bg */
+  --text-muted:    #5f5748;  /*  6.6:1 on --bg */
+
+  /* ---- Accent (light). The fix: a dark gold for TEXT, bright gold for FILL. */
+  --accent:        #c9a227;  /* fill only */
+  --accent-on:     #17140d;  /* ink on gold fill — 9.6:1 */
+  --accent-text:   #6b5510;  /* text only — 6.1:1 on --bg */
+  --accent-hover:  #b38f1c;
+  --accent-bg:     #fbf4e0;
+  --accent-border: #e2cf94;
+
+  /* ---- Semantic (light): all text-weights are AA on --bg ---- */
+  --success:        #17724a;  /* 5.3:1 */
+  --success-on:     #ffffff;
+  --success-bg:     #e9f6ee;
+  --success-border: #b6ddc7;
+  --warning:        #8a5a0b;  /* 5.5:1 */
+  --warning-on:     #ffffff;
+  --warning-bg:     #fdf3e3;
+  --warning-border: #e6cf9f;
+  --danger:         #b3261e;  /* 6.0:1 */
+  --danger-on:      #ffffff;
+  --danger-bg:      #fdeceb;
+  --danger-border:  #f0bdb9;
+  --info:           #1a5f8a;  /* 5.6:1 */
+  --info-on:        #ffffff;
+  --info-bg:        #e9f2f8;
+  --info-border:    #b5d3e6;
+
+  /* ---- Elevation (light: soft shadows do the work) ---- */
+  --shadow-sm:  0 1px 2px rgb(24 20 12 / 0.06);
+  --shadow:     0 2px 10px rgb(24 20 12 / 0.08);
+  --shadow-lg:  0 16px 40px rgb(24 20 12 / 0.16);
+  --ring-inset: none;
+}
