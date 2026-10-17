@@ -112,7 +112,8 @@ Result<std::unique_ptr<SimNode>> SimNode::Create(const SimNodeConfig& config, Tr
 {
     if (const Result<void> plan{CheckFaultPlan(config.faults)}; !plan.has_value()) return plan.error();
     if ((config.faults.fail_commit_barrier_at.has_value() && *config.faults.fail_commit_barrier_at == 0) ||
-        (config.faults.bump_authority_at.has_value() && *config.faults.bump_authority_at == 0)) {
+        (config.faults.bump_authority_at.has_value() && *config.faults.bump_authority_at == 0) ||
+        (config.faults.bump_authority_before_apply_at.has_value() && *config.faults.bump_authority_before_apply_at == 0)) {
         return Error{ErrorCode::INVALID_INPUT, SIM_FAULT_SLOT};
     }
     Parts parts;
@@ -231,6 +232,9 @@ Result<SealReport> SimNode::SealSlot()
 
 Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView>& head, uint64_t height)
 {
+    // 0. A fenced node seals nothing: no poll, take, preview, signature or write (O-89).
+    if (m_admission->Fenced()) return Error{ErrorCode::FENCED, SIM_FENCED};
+
     // 1. Facts.
     const FactCursor from{head->Header().facts_to};
     Result<chain::PollReply> polled{m_traced->Poll(from, MAX_SLOT_FACTS)};
@@ -291,6 +295,12 @@ Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView
     }
     std::optional<agreement::Decision> decision{m_certifier->TakeDecision()};
     if (!decision.has_value()) return Error{ErrorCode::INVARIANT, SIM_NO_DECISION};
+
+    // The plan's authority bump after the decision is durable (check 3 refuses it, O-89).
+    if (m_faults.bump_authority_before_apply_at == height) {
+        const AuthorityVersion bumped{m_fake->BumpAuthority()};
+        m_trace.Record("fault.bump_authority_before_apply", "epoch=" + std::to_string(bumped.epoch));
+    }
 
     // 6. Apply under the authority read now (check 3).
     const AuthorityVersion current{m_traced->CurrentAuthority()};

@@ -67,6 +67,9 @@
  *
  * SealSlot() seals the next slot, in this order (the trace records each
  * step; ARCHITECTURE.md 14.4 P3):
+ *  0. FENCED (SIM_FENCED) while admission is fenced: a fenced node seals
+ *     nothing, so after a refusal it never polls, signs or writes again
+ *     (O-89); the slot window holds only slot.begin and slot.end;
  *  1. Poll(head.facts_to, MAX_SLOT_FACTS): BUSY and NEED_DATA are returned
  *     as such (no slot); AUTHORITY_CHANGED fences admission and is returned;
  *     FACTS gives the batch;
@@ -76,7 +79,8 @@
  *     fact bytes, taken originals});
  *  4. the plan's authority bump, if this is its slot;
  *  5. DevSingleSeatCertifier::Propose(candidate, batch authority) and
- *     TakeDecision (B-INTENT, sign, B-VOTE, B-DECISION);
+ *     TakeDecision (B-INTENT, sign, B-VOTE, B-DECISION); then the plan's
+ *     bump_authority_before_apply_at bump, if this is its slot;
  *  6. StateOwner::Apply(candidate, decision, CurrentAuthority()) (check 3);
  *  7. CommitLog::AppendApplied, Barrier, Confirm (B-APPLIED);
  *  8. SlotView::Build and ReadService::Publish;
@@ -84,8 +88,10 @@
  * Any failure returns its error and nothing after it runs. STORAGE_FATAL,
  * FENCED and AUTHORITY_CHANGED also fence admission (Admission::Fence):
  * new submissions get HALTED, reads stay live on the last publication.
- * Nothing is retried: a later SealSlot goes through the same steps and the
- * certifier refuses with FENCED while a journal is fatal.
+ * Nothing is retried: a later SealSlot answers FENCED at step 0. A
+ * DECISION that check 3 refused stays durable and final for its height:
+ * the node halts at the last applied slot, which is also the head a replay
+ * of its commit journal gives (O-89).
  *
  * The node is driven by one simulation thread (the scheduler's); the
  * components keep their own locking rules.
@@ -101,6 +107,7 @@ inline constexpr std::string_view SIM_FAULT_MAPPING{"commit barriers so far do n
 inline constexpr std::string_view SIM_FAULT_SLOT{"fault plan slot must be at least 1"};                     //!< (INVALID_INPUT)
 inline constexpr std::string_view SIM_NOT_SEALED{"no sealed slot at that height"};                          //!< (INVALID_INPUT)
 inline constexpr std::string_view SIM_BAD_KEY{"a simulator key label gives no key"};                        //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_FENCED{"the node is fenced and seals nothing"};                       //!< (FENCED)
 
 //! The synthetic TEST network of the simulator: chain REGTEST, magic f2 51 4d 01, ModernChainDomain SHA256("fm2/sim/domain").
 NetworkId SimNetwork();

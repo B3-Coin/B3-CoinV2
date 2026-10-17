@@ -33,6 +33,9 @@
  *   silent.
  * - bump_authority_at = s: the fake chain's authority is bumped between
  *   slot s's Preview and Propose, so the certifier's check 1 refuses (N11).
+ * - bump_authority_before_apply_at = s: the authority is bumped after slot
+ *   s's DECISION is durable and before Apply, so check 3 refuses a decided
+ *   slot (O-89; sim_node_tests). The walking-skeleton variants do not use it.
  *
  * Target shapes, stub M4-SIM-02 (CheckFaultPlan returns NotImplemented
  * when any of them is set): crash and restart before a slot (needs the
@@ -67,6 +70,7 @@ struct FaultPlan {
     std::set<std::pair<AccountId, uint64_t>> withhold_from_proposals;
     std::optional<uint64_t> fail_commit_barrier_at;
     std::optional<uint64_t> bump_authority_at;
+    std::optional<uint64_t> bump_authority_before_apply_at;
 
     // Target shapes; any of them set is NotImplemented(M4-SIM-02).
     std::optional<uint64_t> crash_before_slot;

@@ -1062,12 +1062,22 @@ bool Driver::ScriptAuthorityFault()
     std::optional<Submission> e{One("bob", "e", *Client("bob").Bytes("e"))};
     if (!e) return false;
     m_checks.Expect("N11", Is(*e, AdmissionCode::HALTED), "a new submit is not HALTED");
+    {
+        // The fenced node seals nothing: the next SealSlot is FENCED and writes no record (O-89).
+        const Result<SealReport> again{Seal(3, "FENCED")};
+        m_checks.Expect("N11", !again.has_value() && again.error().code == ErrorCode::FENCED,
+                        "the next SealSlot is not FENCED: " + (again.has_value() ? std::string{"Ok"} : ErrorText(again.error())));
+        m_checks.Expect("N11", m_node->SignerJournal().Status() == signer_before, "the fenced SealSlot wrote a signer record");
+        m_checks.Expect("N11", m_node->CommitJournal().Status() == commit_before, "the fenced SealSlot wrote a commit record");
+    }
     return true;
 }
 
 //! The P3 order of a slot with `result` (ARCHITECTURE.md 14.4 P3, plus the poll, take and preview before it).
 std::vector<std::string> ExpectedSteps(std::string_view result)
 {
+    // FENCED: a fenced node seals nothing, so the window is empty (SimNode step 0, O-89).
+    if (result == "FENCED") return {"slot.begin", "slot.end"};
     const std::vector<std::string> head{"slot.begin", "chain.poll", "pool.take", "state.preview"};
     std::vector<std::string> steps{head};
     if (result == "OK" || result == "STORAGE_FATAL") {
@@ -1090,7 +1100,6 @@ std::vector<std::string> ExpectedSteps(std::string_view result)
         steps.emplace_back("authority.check");
         steps.emplace_back("node.fence");
     }
-    // FENCED (after N10): the certifier refuses before any write or authority check.
     steps.emplace_back("slot.end");
     return steps;
 }
