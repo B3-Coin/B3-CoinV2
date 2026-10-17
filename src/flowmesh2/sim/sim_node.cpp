@@ -17,6 +17,13 @@
 
 namespace flowmesh2::sim {
 
+namespace {
+
+//! The error codes that fence the node before the head moves (O-90).
+bool FencesNode(ErrorCode code);
+
+} // namespace
+
 uint256 SimLabelHash(std::string_view label)
 {
     uint256 out;
@@ -211,12 +218,42 @@ Result<std::unique_ptr<SimNode>> SimNode::Create(const SimNodeConfig& config, Tr
     return Ok(std::unique_ptr<SimNode>{new SimNode{std::move(parts)}});
 }
 
+namespace {
+
+bool FencesNode(ErrorCode code)
+{
+    switch (code) {
+    case ErrorCode::STORAGE_FATAL:
+    case ErrorCode::FENCED:
+    case ErrorCode::AUTHORITY_CHANGED:
+    case ErrorCode::EQUIVOCATION_REFUSED:
+    case ErrorCode::INVARIANT:
+    case ErrorCode::ORDER_VIOLATION:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+void SimNode::Fence(const Error& error)
+{
+    if (!m_admission->Fenced()) m_trace.Record("node.fence", std::string{ToString(error.code)});
+    m_admission->Fence();
+}
+
 Error SimNode::FenceOn(const Error& error)
 {
-    if (error.code == ErrorCode::STORAGE_FATAL || error.code == ErrorCode::FENCED || error.code == ErrorCode::AUTHORITY_CHANGED) {
-        if (!m_admission->Fenced()) m_trace.Record("node.fence", std::string{ToString(error.code)});
-        m_admission->Fence();
-    }
+    if (FencesNode(error.code)) Fence(error);
+    return error;
+}
+
+Error SimNode::FenceAfterApply(const Error& error)
+{
+    // The head already moved: the pool, the read service or the commit log
+    // would disagree with it on every later call, so the node stops (O-90).
+    Fence(error);
     return error;
 }
 
@@ -238,7 +275,7 @@ Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView
     // 1. Facts.
     const FactCursor from{head->Header().facts_to};
     Result<chain::PollReply> polled{m_traced->Poll(from, MAX_SLOT_FACTS)};
-    if (!polled.has_value()) return polled.error();
+    if (!polled.has_value()) return FenceOn(polled.error());
     m_trace.Record("chain.poll", "from=" + std::to_string(from.height) + ":" + std::to_string(from.index) + "," +
                                      std::string{chain::ToString(polled->Status())});
     switch (polled->Status()) {
@@ -258,7 +295,7 @@ Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView
         return m_faults.withhold_from_proposals.contains({action.Account(), action.nonce});
     }};
     Result<admission::TakenSlot> taken{m_pool->TakeForSlot(height, m_profile.max_actions_per_slot, withhold)};
-    if (!taken.has_value()) return taken.error();
+    if (!taken.has_value()) return FenceOn(taken.error());
     m_trace.Record("pool.take", "slot=" + std::to_string(height) + ",n=" + std::to_string(taken->originals.size()));
 
     // 3. Preview on the committed head.
@@ -269,12 +306,14 @@ Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView
     inputs.facts_to = batch.to;
     for (const Fact& fact : batch.facts) {
         Result<std::vector<unsigned char>> bytes{EncodeFact(fact)};
-        if (!bytes.has_value()) return bytes.error();
+        if (!bytes.has_value()) return FenceOn(bytes.error());
         inputs.body.facts.push_back(std::move(bytes).value());
     }
     inputs.body.originals = taken->originals;
+    // An engine error that one action causes (O-34) is not fenced: the slot is
+    // retried, and excluding that action is M4-ADM-03.
     Result<state::Candidate> candidate{m_owner->Preview(state::ParentRef::Committed(*head), inputs)};
-    if (!candidate.has_value()) return candidate.error();
+    if (!candidate.has_value()) return FenceOn(candidate.error());
     m_trace.Record("state.preview", "slot=" + std::to_string(height) + ",header=" + candidate->Header().Hash().GetHex());
 
     // 4. The plan's authority bump (N11), between Preview and Propose.
@@ -286,7 +325,7 @@ Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView
     // once it fired (the journal is fatal) the plan is spent and there is nothing left to map.
     if (m_faults.fail_commit_barrier_at == height && !m_commit_journal->IsFatal() &&
         m_trace.BarrierCount(storage::JournalRole::COMMIT) != 2 * (height - 1)) {
-        return Error{ErrorCode::INVARIANT, SIM_FAULT_MAPPING};
+        return FenceOn(Error{ErrorCode::INVARIANT, SIM_FAULT_MAPPING});
     }
 
     // 5. Agreement: checks 1 and 2, B-INTENT, sign, B-VOTE, B-DECISION.
@@ -294,7 +333,7 @@ Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView
         return FenceOn(proposed.error());
     }
     std::optional<agreement::Decision> decision{m_certifier->TakeDecision()};
-    if (!decision.has_value()) return Error{ErrorCode::INVARIANT, SIM_NO_DECISION};
+    if (!decision.has_value()) return FenceOn(Error{ErrorCode::INVARIANT, SIM_NO_DECISION});
 
     // The plan's authority bump after the decision is durable (check 3 refuses it, O-89).
     if (m_faults.bump_authority_before_apply_at == height) {
@@ -312,21 +351,22 @@ Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView
     m_trace.Record("state.apply", "slot=" + std::to_string(height) + ",root=" + next->Header().state_root.GetHex());
 
     // 7. B-APPLIED.
+    // From here on the head has moved: every error fences the node (O-90).
     Result<storage::PendingApplied> pending{m_commit_log->AppendApplied(decision->decision, next->Header().state_root)};
-    if (!pending.has_value()) return FenceOn(pending.error());
-    if (const Result<uint64_t> barrier{m_commit_log->Barrier()}; !barrier.has_value()) return FenceOn(barrier.error());
+    if (!pending.has_value()) return FenceAfterApply(pending.error());
+    if (const Result<uint64_t> barrier{m_commit_log->Barrier()}; !barrier.has_value()) return FenceAfterApply(barrier.error());
     Result<DurableApplied> token{m_commit_log->Confirm(*pending)};
-    if (!token.has_value()) return FenceOn(token.error());
+    if (!token.has_value()) return FenceAfterApply(token.error());
 
     // 8. Publication, after B-APPLIED.
     Result<std::shared_ptr<const read::SlotView>> view{read::SlotView::Build(*next, decision->certificate, outcomes)};
-    if (!view.has_value()) return view.error();
-    if (const Result<void> published{m_read->Publish(*token, *view)}; !published.has_value()) return published.error();
+    if (!view.has_value()) return FenceAfterApply(view.error());
+    if (const Result<void> published{m_read->Publish(*token, *view)}; !published.has_value()) return FenceAfterApply(published.error());
     m_trace.Record("read.publish", "slot=" + std::to_string(height));
 
     // 9. The pool learns of the slot last.
     Result<admission::CommitReport> report{m_pool->OnCommitted(*next, outcomes, decision->body)};
-    if (!report.has_value()) return report.error();
+    if (!report.has_value()) return FenceAfterApply(report.error());
     m_trace.Record("pool.on_committed", "slot=" + std::to_string(height) + ",included=" + std::to_string(report->included) +
                                             ",recorded=" + std::to_string(report->recorded) + ",nonce_used=" +
                                             std::to_string(report->nonce_used) + ",nonce_too_low=" +

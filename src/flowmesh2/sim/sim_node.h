@@ -85,9 +85,16 @@
  *  7. CommitLog::AppendApplied, Barrier, Confirm (B-APPLIED);
  *  8. SlotView::Build and ReadService::Publish;
  *  9. ActionPool::OnCommitted(head, outcomes, certified body).
- * Any failure returns its error and nothing after it runs. STORAGE_FATAL,
- * FENCED and AUTHORITY_CHANGED also fence admission (Admission::Fence):
- * new submissions get HALTED, reads stay live on the last publication.
+ * Any failure returns its error and nothing after it runs. Before Apply
+ * moved the head, STORAGE_FATAL, FENCED, AUTHORITY_CHANGED,
+ * EQUIVOCATION_REFUSED, INVARIANT and ORDER_VIOLATION also fence the node
+ * (Admission::Fence); BUSY, NEED_DATA and a refusal of the slot's inputs
+ * (for example an engine error one action causes, O-34) do not, and the
+ * slot is tried again. After Apply moved the head, EVERY error of steps 7
+ * to 9 fences the node, because the commit log, the read service or the
+ * pool would disagree with the head on every later call (O-90). A fenced
+ * node's new submissions get HALTED, reads stay live on the last
+ * publication.
  * Nothing is retried: a later SealSlot answers FENCED at step 0. A
  * DECISION that check 3 refused stays durable and final for its height:
  * the node halts at the last applied slot, which is also the head a replay
@@ -202,8 +209,15 @@ private:
 
     //! The steps of SealSlot after slot.begin.
     Result<SealReport> SealNext(const std::shared_ptr<const state::HeadView>& head, uint64_t height);
-    //! Fence admission after `error` if it is STORAGE_FATAL, FENCED or AUTHORITY_CHANGED; returns `error`.
+    //! Fence admission (once; the trace records node.fence with the code).
+    void Fence(const Error& error);
+    /** Before the head moves: fence after `error` if it is STORAGE_FATAL,
+     * FENCED, AUTHORITY_CHANGED, EQUIVOCATION_REFUSED, INVARIANT or
+     * ORDER_VIOLATION; returns `error` (O-90).
+     */
     Error FenceOn(const Error& error);
+    //! After Apply moved the head: always fence; returns `error` (O-90).
+    Error FenceAfterApply(const Error& error);
 
     TraceRecorder& m_trace;
     const ProfileParams m_profile;

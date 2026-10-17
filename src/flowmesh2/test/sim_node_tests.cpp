@@ -3,16 +3,20 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 /** The simulated node's halting rules (review of 18051472..ffc43baf;
- * ARCHITECTURE.md O-89): a fenced node seals nothing, and a DECISION that
+ * ARCHITECTURE.md O-89, O-90): a fenced node seals nothing; a DECISION that
  * check 3 refuses leaves the node at the last applied slot, which is also
  * what a replay of its commit journal gives, with exactly one signature for
- * the decided height.
+ * the decided height; and an error after the head moved fences the node.
  */
 
 #include <boost/test/unit_test.hpp>
 
+#include <flowmesh2/admission/admission.h>
+#include <flowmesh2/admission/pool.h>
+#include <flowmesh2/core/action.h>
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/sim/faults.h>
+#include <flowmesh2/sim/sim_client.h>
 #include <flowmesh2/sim/sim_node.h>
 #include <flowmesh2/sim/trace.h>
 #include <flowmesh2/state/replay.h>
@@ -158,6 +162,42 @@ BOOST_AUTO_TEST_CASE(a_decision_refused_at_check_3_halts_the_node_and_replay_agr
     BOOST_CHECK(rig.node->CommitJournal().Status() == commit_before);
     BOOST_CHECK_EQUAL(rig.SignedVotesAt(2), 1U);
     BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(an_error_after_the_head_moved_fences_the_node)
+{
+    // Dave's PLACE enters the pool directly (admission A4 would refuse an
+    // account that does not exist) and is withheld from every proposal, so
+    // OnCommitted finds a live entry without an account: INVARIANT, after
+    // Apply, B-APPLIED and publication. Without the fence the node kept
+    // admitting, and every later SealSlot failed at TakeForSlot.
+    const AccountId dave{SimClient::AccountOf("dave").value()};
+    SimNodeConfig config;
+    config.faults.withhold_from_proposals.insert({dave, 1});
+    NodeRig rig{config};
+    const std::vector<MarketDescriptor> markets{rig.node->Markets().begin(), rig.node->Markets().end()};
+    Result<SimClient> client{SimClient::Create("dave", rig.node->Profile(), rig.node->Domain(), rig.node->Seats(), markets)};
+    RequireOk(client, "SimClient::Create");
+    const Result<std::vector<unsigned char>> bytes{client->Place("x", 1, SimMarketM1(), Side::BUY, TimeInForce::GTC, 250, 1, 0)};
+    RequireOk(bytes, "Place");
+    Result<ActionV2> action{ActionV2::Decode(*bytes, rig.node->Profile())};
+    RequireOk(action, "ActionV2::Decode");
+    Result<VerifiedAction> verified{VerifiedAction::Verify(std::move(action).value())};
+    RequireOk(verified, "VerifiedAction::Verify");
+    BOOST_REQUIRE(rig.node->Pool().Insert(*verified, 0).result == admission::InsertResult::INSERTED);
+
+    RequireCodeAndDetail(rig.node->SealSlot(), ErrorCode::INVARIANT, admission::POOL_ACCOUNT_MISSING, "SealSlot 1 (late error)");
+    BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 1U);
+    BOOST_CHECK(rig.node->Read().PublishedHeight() == std::optional<uint64_t>{1});
+    BOOST_CHECK(rig.node->Fenced());
+    const storage::JournalStatus signer_before{rig.node->SignerJournal().Status()};
+    RequireCodeAndDetail(rig.node->SealSlot(), ErrorCode::FENCED, SIM_FENCED, "SealSlot after the late error");
+    BOOST_CHECK(rig.node->SignerJournal().Status() == signer_before);
+    const Result<std::vector<unsigned char>> later{client->Place("y", 2, SimMarketM1(), Side::BUY, TimeInForce::GTC, 250, 1, 1)};
+    RequireOk(later, "Place y");
+    const Result<admission::AdmissionReply> reply{rig.node->Admitter().Admit(*later)};
+    RequireOk(reply, "Admit");
+    BOOST_CHECK(reply->code == AdmissionCode::HALTED);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
