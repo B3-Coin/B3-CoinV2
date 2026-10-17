@@ -242,9 +242,15 @@ BOOST_AUTO_TEST_CASE(a_token_for_another_header_gives_verify_failed)
     state::Candidate c_again{c};
     const auto applied{f.owner->Apply(std::move(c_again), decision, f.authority)};
     RequireOk(applied, "apply with the right token");
-    BOOST_CHECK((*applied)->Header() == c.Header());
-    BOOST_CHECK((*applied)->CertHash() == TestCertificate(c.Header()).Hash());
-    BOOST_CHECK(f.Head() == *applied);
+    BOOST_CHECK(applied->head->Header() == c.Header());
+    BOOST_CHECK(applied->head->CertHash() == TestCertificate(c.Header()).Hash());
+    BOOST_CHECK(f.Head() == applied->head);
+    // The receipt names the applied decision record and the new head (O-92).
+    BOOST_CHECK_EQUAL(applied->receipt.JournalInstance(), decision.JournalInstance());
+    BOOST_CHECK_EQUAL(applied->receipt.DecisionSeq(), decision.Seq());
+    BOOST_CHECK_EQUAL(applied->receipt.Slot(), c.Header().height);
+    BOOST_CHECK(applied->receipt.HeaderHash() == c.Header().Hash());
+    BOOST_CHECK(applied->receipt.StateRoot() == c.Header().state_root);
 }
 
 BOOST_AUTO_TEST_CASE(a_superseded_epoch_gives_authority_changed)

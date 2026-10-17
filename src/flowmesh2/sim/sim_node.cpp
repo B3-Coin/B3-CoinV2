@@ -345,14 +345,14 @@ Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView
     const AuthorityVersion current{m_traced->CurrentAuthority()};
     state::Candidate kept{*candidate};
     std::vector<OutcomeV2> outcomes{candidate->Outcomes()};
-    Result<std::shared_ptr<const state::HeadView>> applied{m_owner->Apply(std::move(*candidate), decision->decision, current)};
+    Result<state::AppliedSlot> applied{m_owner->Apply(std::move(*candidate), decision->decision, current)};
     if (!applied.has_value()) return FenceOn(applied.error());
-    const std::shared_ptr<const state::HeadView> next{*applied};
+    const std::shared_ptr<const state::HeadView> next{applied->head};
     m_trace.Record("state.apply", "slot=" + std::to_string(height) + ",root=" + next->Header().state_root.GetHex());
 
     // 7. B-APPLIED.
     // From here on the head has moved: every error fences the node (O-90).
-    Result<storage::PendingApplied> pending{m_commit_log->AppendApplied(decision->decision, next->Header().state_root)};
+    Result<storage::PendingApplied> pending{m_commit_log->AppendApplied(applied->receipt)};
     if (!pending.has_value()) return FenceAfterApply(pending.error());
     if (const Result<uint64_t> barrier{m_commit_log->Barrier()}; !barrier.has_value()) return FenceAfterApply(barrier.error());
     Result<DurableApplied> token{m_commit_log->Confirm(*pending)};
@@ -365,7 +365,7 @@ Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView
     m_trace.Record("read.publish", "slot=" + std::to_string(height));
 
     // 9. The pool learns of the slot last.
-    Result<admission::CommitReport> report{m_pool->OnCommitted(*next, outcomes, decision->body)};
+    Result<admission::CommitReport> report{m_pool->OnCommitted(*token, *next, outcomes, decision->body)};
     if (!report.has_value()) return FenceAfterApply(report.error());
     m_trace.Record("pool.on_committed", "slot=" + std::to_string(height) + ",included=" + std::to_string(report->included) +
                                             ",recorded=" + std::to_string(report->recorded) + ",nonce_used=" +
@@ -386,7 +386,9 @@ Result<std::shared_ptr<const state::HeadView>> SimNode::ReapplySealed(uint64_t h
     for (const SealedSlot& slot : m_sealed) {
         if (slot.height != height) continue;
         state::Candidate again{slot.candidate};
-        return m_owner->Apply(std::move(again), slot.decision.decision, m_traced->CurrentAuthority());
+        Result<state::AppliedSlot> applied{m_owner->Apply(std::move(again), slot.decision.decision, m_traced->CurrentAuthority())};
+        if (!applied.has_value()) return applied.error();
+        return Ok(std::move(applied->head));
     }
     return Error{ErrorCode::INVALID_INPUT, SIM_NOT_SEALED};
 }

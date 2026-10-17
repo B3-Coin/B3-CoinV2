@@ -67,8 +67,7 @@ Result<Candidate> StateOwner::Reexecute(const SlotHeaderV2& header, const SlotBo
     return ReexecuteOn(m_engine, *head, header, body);
 }
 
-Result<std::shared_ptr<const HeadView>> StateOwner::Apply(Candidate&& candidate, const DurableDecision& decision,
-                                                          const AuthorityVersion& current)
+Result<AppliedSlot> StateOwner::Apply(Candidate&& candidate, const DurableDecision& decision, const AuthorityVersion& current)
 {
     const SlotHeaderV2& header{candidate.Header()};
     const std::shared_ptr<const HeadView> head{Head()};
@@ -89,7 +88,8 @@ Result<std::shared_ptr<const HeadView>> StateOwner::Apply(Candidate&& candidate,
         if (m_head != head) return Stale(); // another Apply moved the head after the checks
         m_head = installed;
     }
-    return Ok(std::move(installed));
+    ApplyReceipt receipt{decision.JournalInstance(), decision.Seq(), header.height, decision.Digest(), installed->Header().state_root};
+    return Ok(AppliedSlot{std::move(installed), std::move(receipt)});
 }
 
 Result<void> StateOwner::Restore(const HeadView& /*base*/, std::span<const storage::JournalRecord> /*records*/)

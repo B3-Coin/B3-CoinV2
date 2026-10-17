@@ -30,10 +30,12 @@
  *
  *   AppendDecision(header, cert, body) -> PendingDecision; Barrier (B-DECISION);
  *   Confirm -> DurableDecision, which StateOwner::Apply (R9) requires; the
- *   token names the header and the certificate the record holds;
- *   AppendApplied(DurableDecision, state_root) -> PendingApplied; Barrier
- *   (B-APPLIED); Confirm -> DurableApplied, which ReadService::Publish (R11)
- *   requires.
+ *   token names the header and the certificate the record holds; Apply
+ *   (check 3) returns an ApplyReceipt; AppendApplied(ApplyReceipt) ->
+ *   PendingApplied; Barrier (B-APPLIED); Confirm -> DurableApplied, which
+ *   ReadService::Publish (R11) and ActionPool::OnCommitted (R12) require.
+ *   AppendApplied takes nothing but the receipt, so no caller can write
+ *   APPLIED for a slot Apply refused (O-92).
  *
  * Rules:
  * - AppendDecision: VERIFY_FAILED (DECISION_CERT_HEADER) unless
@@ -46,14 +48,16 @@
  *   and so the token, names that first certificate's hash); another header for a decided
  *   slot is EQUIVOCATION_REFUSED (DECISION_CONFLICT), conflicting
  *   certificates being evidence for M4-AGR-07.
- * - AppendApplied(decision, state_root): VERIFY_FAILED (TOKEN_OTHER_LOG) for
- *   a token of another journal instance; VERIFY_FAILED
+ * - AppendApplied(receipt): VERIFY_FAILED (TOKEN_OTHER_LOG) for a receipt
+ *   of a decision of another journal instance; VERIFY_FAILED
  *   (APPLIED_DECISION_UNKNOWN) when this log holds no decision with the
- *   token's slot, sequence number and header hash (a slot mismatch);
- *   VERIFY_FAILED (APPLIED_ROOT_MISMATCH) unless state_root equals the
- *   decided header's state_root. The same application again is idempotent;
- *   an application at or below the last applied slot is ORDER_VIOLATION
- *   (APPLIED_OUT_OF_ORDER).
+ *   receipt's slot, decision sequence number and header hash; VERIFY_FAILED
+ *   (APPLIED_ROOT_MISMATCH) unless the receipt's state root equals the
+ *   decided header's (Apply takes it from that header, so only a hash
+ *   collision could trip it). The same application again is idempotent;
+ *   otherwise the slot must be the successor of the last applied slot
+ *   (slot 1 first), else ORDER_VIOLATION (APPLIED_OUT_OF_ORDER), the same
+ *   contiguity replay requires (O-89).
  * - DecisionAt(slot): the reference of the decision this log holds for the
  *   slot, if any (used by the certifier before it signs, O-89).
  * - Every Append and Confirm of a fatal journal is FENCED.
@@ -134,7 +138,7 @@ public:
     bool IsFatal() const { return m_journal->IsFatal(); }
 
     Result<PendingDecision> AppendDecision(const SlotHeaderV2& header, const SlotCertificate& certificate, const SlotBody& body);
-    Result<PendingApplied> AppendApplied(const DurableDecision& decision, const uint256& state_root);
+    Result<PendingApplied> AppendApplied(const ApplyReceipt& receipt);
     //! Journal::Barrier of the commit journal.
     Result<uint64_t> Barrier() { return m_journal->Barrier(); }
     //! Journal::Confirm: B-DECISION.
@@ -165,7 +169,7 @@ private:
 
     Journal* m_journal;
     std::map<uint64_t, DecisionEntry> m_decisions; //!< by slot
-    std::optional<uint64_t> m_last_applied_slot;
+    uint64_t m_last_applied_slot{0};               //!< 0 before the first application (the genesis height)
 };
 
 } // namespace flowmesh2::storage

@@ -120,7 +120,7 @@ struct PoolRig {
         SlotBody body{candidate.Body()};
         PublishableSlot slot{rig.Commit(std::move(candidate))};
         Publish(*read, slot);
-        Result<admission::CommitReport> report{pool->OnCommitted(*slot.slot.head, slot.slot.outcomes, body)};
+        Result<admission::CommitReport> report{pool->OnCommitted(slot.applied, *slot.slot.head, slot.slot.outcomes, body)};
         RequireOk(report, "ActionPool::OnCommitted");
         return Sealed{admission::TakenSlot{}, std::move(slot), std::move(body), *report};
     }

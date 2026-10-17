@@ -448,7 +448,7 @@ BOOST_AUTO_TEST_CASE(in_proposal_returns_to_pending_when_another_slot_commits)
 BOOST_AUTO_TEST_CASE(on_committed_refusals_change_nothing)
 {
     PoolRig r;
-    r.Fund();
+    const PoolRig::Sealed funded{r.Fund()};
     SlotFixture& a{r.Actions()};
     const auto x{SmallPlace(a, "alice", 1)};
     const auto y{SmallPlace(a, "bob", 1)};
@@ -472,29 +472,29 @@ BOOST_AUTO_TEST_CASE(on_committed_refusals_change_nothing)
     // Profile.
     SlotHeaderV2 profile_header{head.Header()};
     profile_header.profile_hash = uint256::ONE;
-    RequireFailure(r.pool->OnCommitted(doctored(profile_header), outcomes, body), ErrorCode::INVALID_INPUT, admission::POOL_PROFILE_MISMATCH,
+    RequireFailure(r.pool->OnCommitted(slot.applied, doctored(profile_header), outcomes, body), ErrorCode::INVALID_INPUT, admission::POOL_PROFILE_MISMATCH,
                    "profile");
     // Outcomes: one dropped, one changed.
     std::vector<OutcomeV2> fewer{outcomes.begin(), outcomes.end() - 1};
-    RequireFailure(r.pool->OnCommitted(head, fewer, body), ErrorCode::INVALID_INPUT, admission::POOL_OUTCOMES_MISMATCH, "outcome dropped");
+    RequireFailure(r.pool->OnCommitted(slot.applied, head, fewer, body), ErrorCode::INVALID_INPUT, admission::POOL_OUTCOMES_MISMATCH, "outcome dropped");
     std::vector<OutcomeV2> changed{outcomes};
     changed[0].remaining_lots ^= 1;
-    RequireFailure(r.pool->OnCommitted(head, changed, body), ErrorCode::INVALID_INPUT, admission::POOL_OUTCOMES_MISMATCH, "outcome changed");
+    RequireFailure(r.pool->OnCommitted(slot.applied, head, changed, body), ErrorCode::INVALID_INPUT, admission::POOL_OUTCOMES_MISMATCH, "outcome changed");
     // Body: an original dropped.
     SlotBody short_body{body};
     short_body.originals.pop_back();
-    RequireFailure(r.pool->OnCommitted(head, outcomes, short_body), ErrorCode::INVALID_INPUT, admission::POOL_BODY_MISMATCH, "original dropped");
+    RequireFailure(r.pool->OnCommitted(slot.applied, head, outcomes, short_body), ErrorCode::INVALID_INPUT, admission::POOL_BODY_MISMATCH, "original dropped");
     // Body: an original replaced by another valid one (same count, another actions_root).
     SlotBody replaced{body};
     replaced.originals[0] = SmallPlace(a, "carol", 2);
-    RequireFailure(r.pool->OnCommitted(head, outcomes, replaced), ErrorCode::INVALID_INPUT, admission::POOL_BODY_MISMATCH,
+    RequireFailure(r.pool->OnCommitted(slot.applied, head, outcomes, replaced), ErrorCode::INVALID_INPUT, admission::POOL_BODY_MISMATCH,
                    "original replaced");
     // A malformed original under a header that names it.
     SlotBody garbage{body};
     garbage.originals[0] = {0x01, 0x02};
     SlotHeaderV2 garbage_header{head.Header()};
     garbage_header.actions_root = garbage.ActionsRoot();
-    RequireFailure(r.pool->OnCommitted(doctored(garbage_header), outcomes, garbage), ErrorCode::INVALID_INPUT,
+    RequireFailure(r.pool->OnCommitted(slot.applied, doctored(garbage_header), outcomes, garbage), ErrorCode::INVALID_INPUT,
                    admission::POOL_ORIGINAL_MALFORMED, "malformed original");
     // An original without an outcome, and an ACTION outcome without an original.
     SlotBody extra{body};
@@ -502,14 +502,14 @@ BOOST_AUTO_TEST_CASE(on_committed_refusals_change_nothing)
     SlotHeaderV2 extra_header{head.Header()};
     extra_header.actions_root = extra.ActionsRoot();
     extra_header.action_count = static_cast<uint32_t>(extra.originals.size());
-    RequireFailure(r.pool->OnCommitted(doctored(extra_header), outcomes, extra), ErrorCode::INVALID_INPUT, admission::POOL_OUTCOME_MISSING,
+    RequireFailure(r.pool->OnCommitted(slot.applied, doctored(extra_header), outcomes, extra), ErrorCode::INVALID_INPUT, admission::POOL_OUTCOME_MISSING,
                    "original without outcome");
     SlotBody missing{body};
     missing.originals.pop_back();
     SlotHeaderV2 missing_header{head.Header()};
     missing_header.actions_root = missing.ActionsRoot();
     missing_header.action_count = static_cast<uint32_t>(missing.originals.size());
-    RequireFailure(r.pool->OnCommitted(doctored(missing_header), outcomes, missing), ErrorCode::INVALID_INPUT, admission::POOL_OUTCOME_MISSING,
+    RequireFailure(r.pool->OnCommitted(slot.applied, doctored(missing_header), outcomes, missing), ErrorCode::INVALID_INPUT, admission::POOL_OUTCOME_MISSING,
                    "outcome without original");
     // Two ACTION outcomes for one action.
     std::vector<OutcomeV2> twice{outcomes};
@@ -520,17 +520,21 @@ BOOST_AUTO_TEST_CASE(on_committed_refusals_change_nothing)
     for (const OutcomeV2& outcome : twice) leaves.push_back(outcome.LeafHash());
     SlotHeaderV2 twice_header{head.Header()};
     twice_header.outcomes_root = MerkleRoot(leaves);
-    RequireFailure(r.pool->OnCommitted(doctored(twice_header), twice, body), ErrorCode::INVALID_INPUT, admission::POOL_OUTCOME_MISSING,
+    RequireFailure(r.pool->OnCommitted(slot.applied, doctored(twice_header), twice, body), ErrorCode::INVALID_INPUT, admission::POOL_OUTCOME_MISSING,
                    "two outcomes for one action");
+    BOOST_CHECK(SnapshotOf(*r.pool, ids) == before);
+    // The APPLIED token must be this head's (O-92): slot 1's token with slot 2's data is refused.
+    RequireFailure(r.pool->OnCommitted(funded.slot.applied, head, outcomes, body), ErrorCode::VERIFY_FAILED,
+                   admission::POOL_APPLIED_MISMATCH, "APPLIED token of slot 1");
     BOOST_CHECK(SnapshotOf(*r.pool, ids) == before);
 
     // The real data is accepted once; a repeat is not the successor.
-    Result<admission::CommitReport> report{r.pool->OnCommitted(head, outcomes, body)};
+    Result<admission::CommitReport> report{r.pool->OnCommitted(slot.applied, head, outcomes, body)};
     RequireOk(report, "OnCommitted");
     BOOST_CHECK_EQUAL(report->included, 1U);
     BOOST_CHECK_EQUAL(report->recorded, 2U);
     const PoolSnapshot after{SnapshotOf(*r.pool, ids)};
-    RequireFailure(r.pool->OnCommitted(head, outcomes, body), ErrorCode::ORDER_VIOLATION, admission::POOL_NOT_SUCCESSOR, "repeat");
+    RequireFailure(r.pool->OnCommitted(slot.applied, head, outcomes, body), ErrorCode::ORDER_VIOLATION, admission::POOL_NOT_SUCCESSOR, "repeat");
     BOOST_CHECK(SnapshotOf(*r.pool, ids) == after);
 }
 
@@ -545,7 +549,7 @@ BOOST_AUTO_TEST_CASE(a_live_entry_without_an_account_is_an_invariant_failure)
     const SlotBody body{candidate.Body()};
     PublishableSlot slot{r.rig.Commit(std::move(candidate))};
     const PoolSnapshot before{SnapshotOf(*r.pool, {IdOfBytes(dave)})};
-    RequireFailure(r.pool->OnCommitted(*slot.slot.head, slot.slot.outcomes, body), ErrorCode::INVARIANT, admission::POOL_ACCOUNT_MISSING,
+    RequireFailure(r.pool->OnCommitted(slot.applied, *slot.slot.head, slot.slot.outcomes, body), ErrorCode::INVARIANT, admission::POOL_ACCOUNT_MISSING,
                    "unfunded account");
     BOOST_CHECK(SnapshotOf(*r.pool, {IdOfBytes(dave)}) == before);
 }

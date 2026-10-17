@@ -10,6 +10,9 @@
 #include <flowmesh2/storage/memory_journal.h>
 #include <flowmesh2/storage/signer_log.h>
 #include <flowmesh2/storage/tokens.h>
+#include <flowmesh2/state/candidate.h>
+#include <flowmesh2/state/state_owner.h>
+#include <flowmesh2/test/util/state_fixtures.h>
 #include <flowmesh2/test/util/storage_fixtures.h>
 
 #include <algorithm>
@@ -50,6 +53,14 @@ static_assert(Unforgeable<DurableDecision>());
 static_assert(Unforgeable<DurableApplied>());
 static_assert(!std::is_constructible_v<DurableIntent, DurableDecision&&>, "one barrier's token never stands in for another's");
 static_assert(!std::is_constructible_v<DurableApplied, DurableDecision&&>);
+
+// The ApplyReceipt (O-92): only StateOwner::Apply makes one; the compile-fail
+// control test/compile_fail/forge_receipt.cpp proves it with a construction.
+static_assert(!std::is_default_constructible_v<ApplyReceipt> && !std::is_copy_constructible_v<ApplyReceipt> &&
+              !std::is_copy_assignable_v<ApplyReceipt> && !std::is_move_assignable_v<ApplyReceipt> &&
+              std::is_nothrow_move_constructible_v<ApplyReceipt> &&
+              !std::is_constructible_v<ApplyReceipt, uint64_t, uint64_t, uint64_t, const uint256&, const uint256&> &&
+              !std::is_constructible_v<ApplyReceipt, const DurableDecision&> && !std::is_constructible_v<ApplyReceipt, DurableDecision&&>);
 
 // A Pending is copyable (it names a record) but only the logs can make one.
 template <class P>
@@ -231,13 +242,19 @@ BOOST_AUTO_TEST_CASE(token_binding_and_moves)
     BOOST_CHECK_EQUAL(moved.Seq(), 1U);
     BOOST_CHECK(moved.Binding() == pending.Key());
     BOOST_CHECK(token.Binding() == moved.Binding()); // NOLINT(bugprone-use-after-move): documented semantics
-    // The applied token binds the state root as well.
-    const PendingApplied applied{f.log.AppendApplied(moved, slot.header.state_root).value()};
-    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 2U);
-    const DurableApplied applied_token{f.log.Confirm(applied).value()};
-    BOOST_CHECK(applied_token.Binding() == (AppliedRef{7, slot.header.Hash(), slot.header.state_root}));
-    BOOST_CHECK_EQUAL(applied_token.Slot(), 7U);
-    BOOST_CHECK(applied_token.Digest() == slot.header.Hash());
+    // The applied token binds the state root as well. An APPLIED needs the
+    // ApplyReceipt of a real Apply (O-92), so it comes from a state owner.
+    OwnerFixture owner{12};
+    const state::Candidate candidate{owner.Preview(owner.Inputs(FundingFacts(owner.actions), {}))};
+    const DurableDecision decided{owner.Decide(candidate)};
+    state::Candidate copy{candidate};
+    const state::AppliedSlot applied_slot{owner.owner->Apply(std::move(copy), decided, owner.authority).value()};
+    const PendingApplied applied{owner.log.AppendApplied(applied_slot.receipt).value()};
+    BOOST_CHECK_EQUAL(owner.log.Barrier().value(), 2U);
+    const DurableApplied applied_token{owner.log.Confirm(applied).value()};
+    BOOST_CHECK(applied_token.Binding() == (AppliedRef{1, candidate.Header().Hash(), candidate.Header().state_root}));
+    BOOST_CHECK_EQUAL(applied_token.Slot(), 1U);
+    BOOST_CHECK(applied_token.Digest() == candidate.Header().Hash());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

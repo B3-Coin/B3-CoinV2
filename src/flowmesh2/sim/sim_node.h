@@ -82,9 +82,9 @@
  *     TakeDecision (B-INTENT, sign, B-VOTE, B-DECISION); then the plan's
  *     bump_authority_before_apply_at bump, if this is its slot;
  *  6. StateOwner::Apply(candidate, decision, CurrentAuthority()) (check 3);
- *  7. CommitLog::AppendApplied, Barrier, Confirm (B-APPLIED);
+ *  7. CommitLog::AppendApplied(Apply's ApplyReceipt), Barrier, Confirm (B-APPLIED);
  *  8. SlotView::Build and ReadService::Publish;
- *  9. ActionPool::OnCommitted(head, outcomes, certified body).
+ *  9. ActionPool::OnCommitted(DurableApplied, head, outcomes, certified body).
  * Any failure returns its error and nothing after it runs. Before Apply
  * moved the head, STORAGE_FATAL, FENCED, AUTHORITY_CHANGED,
  * EQUIVOCATION_REFUSED, INVARIANT and ORDER_VIOLATION also fence the node

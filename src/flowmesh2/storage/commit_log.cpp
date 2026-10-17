@@ -113,26 +113,26 @@ Result<PendingDecision> CommitLog::AppendDecision(const SlotHeaderV2& header, co
     return Ok(PendingDecision{m_journal->InstanceId(), *seq, DecisionRef{header.height, header_hash, cert_hash}});
 }
 
-Result<PendingApplied> CommitLog::AppendApplied(const DurableDecision& decision, const uint256& state_root)
+Result<PendingApplied> CommitLog::AppendApplied(const ApplyReceipt& receipt)
 {
     if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
-    if (decision.JournalInstance() != m_journal->InstanceId()) return Error{ErrorCode::VERIFY_FAILED, TOKEN_OTHER_LOG};
-    const auto it{m_decisions.find(decision.Slot())};
-    if (it == m_decisions.end() || it->second.seq != decision.Seq() || it->second.header_hash != decision.Digest()) {
+    if (receipt.JournalInstance() != m_journal->InstanceId()) return Error{ErrorCode::VERIFY_FAILED, TOKEN_OTHER_LOG};
+    const auto it{m_decisions.find(receipt.Slot())};
+    if (it == m_decisions.end() || it->second.seq != receipt.DecisionSeq() || it->second.header_hash != receipt.HeaderHash()) {
         return Error{ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN};
     }
     DecisionEntry& entry{it->second};
-    if (state_root != entry.state_root) return Error{ErrorCode::VERIFY_FAILED, APPLIED_ROOT_MISMATCH};
-    const AppliedRef ref{decision.Slot(), entry.header_hash, state_root};
+    if (receipt.StateRoot() != entry.state_root) return Error{ErrorCode::VERIFY_FAILED, APPLIED_ROOT_MISMATCH};
+    const AppliedRef ref{receipt.Slot(), entry.header_hash, entry.state_root};
     if (entry.applied_seq.has_value()) return Ok(PendingApplied{m_journal->InstanceId(), *entry.applied_seq, ref});
-    if (m_last_applied_slot.has_value() && decision.Slot() <= *m_last_applied_slot) {
+    if (m_last_applied_slot == UINT64_MAX || receipt.Slot() != m_last_applied_slot + 1) {
         return Error{ErrorCode::ORDER_VIOLATION, APPLIED_OUT_OF_ORDER};
     }
-    const std::vector<unsigned char> payload{AppliedRecord{decision.Slot(), entry.header_hash, state_root}.Encode()};
+    const std::vector<unsigned char> payload{AppliedRecord{receipt.Slot(), entry.header_hash, entry.state_root}.Encode()};
     Result<uint64_t> seq{m_journal->Append(RecordType::APPLIED, payload)};
     if (!seq.has_value()) return seq.error();
     entry.applied_seq = *seq;
-    m_last_applied_slot = decision.Slot();
+    m_last_applied_slot = receipt.Slot();
     return Ok(PendingApplied{m_journal->InstanceId(), *seq, ref});
 }
 

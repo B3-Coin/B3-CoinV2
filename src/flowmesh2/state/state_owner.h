@@ -57,7 +57,10 @@
  *   holds), candidate state}, installed by a compare-and-swap of the head
  *   pointer: if another Apply changed the head meanwhile, STALE_PARENT. On
  *   any refusal the head and the candidate are unchanged. Applying a second
- *   candidate for an already applied slot is STALE_PARENT (N13).
+ *   candidate for an already applied slot is STALE_PARENT (N13). On success
+ *   Apply returns the new head with an ApplyReceipt (storage/durable.h), the
+ *   only input CommitLog::AppendApplied takes: APPLIED, and so publication,
+ *   can only follow an Apply that passed check 3 (O-92).
  * - Head(): the current head; never null.
  * - Restore(base, records): install a head rebuilt from a snapshot and the
  *   DECISION records after it. Stub M4-STO-03; ReplayDecisions
@@ -93,6 +96,12 @@ inline constexpr std::string_view OWNER_STATE_ROOT_MISMATCH{"initial header does
 inline constexpr std::string_view DECISION_OTHER_HEADER{"decision token for another header"};                 //!< (VERIFY_FAILED)
 inline constexpr std::string_view AUTHORITY_SUPERSEDED{"candidate authority is not the current authority"};   //!< (AUTHORITY_CHANGED)
 
+//! What a successful Apply gives: the new head, and the receipt CommitLog::AppendApplied requires (O-92).
+struct AppliedSlot {
+    std::shared_ptr<const HeadView> head;
+    ApplyReceipt receipt;
+};
+
 class StateOwner
 {
 public:
@@ -115,9 +124,9 @@ public:
     //! Re-execute `header` and `body` on the head; pure. See the file comment.
     Result<Candidate> Reexecute(const SlotHeaderV2& header, const SlotBody& body) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
-    //! Install `candidate` as the head under a durable decision. Returns the new head.
-    Result<std::shared_ptr<const HeadView>> Apply(Candidate&& candidate, const DurableDecision& decision,
-                                                  const AuthorityVersion& current) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    //! Install `candidate` as the head under a durable decision. Returns the new head and its ApplyReceipt.
+    Result<AppliedSlot> Apply(Candidate&& candidate, const DurableDecision& decision, const AuthorityVersion& current)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
     //! Snapshot `base` plus the commit journal `records` after it. Stub: M4-STO-03.
     Result<void> Restore(const HeadView& base, std::span<const storage::JournalRecord> records) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);

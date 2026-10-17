@@ -620,7 +620,7 @@ BOOST_AUTO_TEST_CASE(a_read_service_that_cannot_answer_does_not_refuse)
     state::Candidate candidate{r.rig.Preview(r.rig.Inputs(FundingFacts(r.rig.actions), {}))};
     const SlotBody body{candidate.Body()};
     PublishableSlot slot1{r.rig.Commit(std::move(candidate))};
-    RequireOk(r.pool->OnCommitted(*slot1.slot.head, slot1.slot.outcomes, body), "OnCommitted(1)");
+    RequireOk(r.pool->OnCommitted(slot1.applied, *slot1.slot.head, slot1.slot.outcomes, body), "OnCommitted(1)");
     BOOST_REQUIRE(!r.read->PublishedHeight().has_value());
     SlotFixture& a{r.Actions()};
     const Frame first{PlaceAt(a, "alice", 1, 1, 16)};

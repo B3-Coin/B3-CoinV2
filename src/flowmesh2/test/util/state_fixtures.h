@@ -233,14 +233,14 @@ struct OwnerFixture {
     {
         const DurableDecision decision{Decide(candidate, variant)};
         if (after_decision) after_decision(candidate);
-        Result<std::shared_ptr<const state::HeadView>> head{owner->Apply(std::move(candidate), decision, authority)};
+        Result<state::AppliedSlot> head{owner->Apply(std::move(candidate), decision, authority)};
         RequireOk(head, "Apply");
-        const Result<storage::PendingApplied> applied{log.AppendApplied(decision, (*head)->Header().state_root)};
+        const Result<storage::PendingApplied> applied{log.AppendApplied(head->receipt)};
         RequireOk(applied, "AppendApplied");
         RequireOk(log.Barrier(), "B-APPLIED");
         RequireOk(log.Confirm(*applied), "Confirm APPLIED");
         Sync();
-        return *head;
+        return head->head;
     }
 
     //! Preview `inputs` and Commit the candidate.

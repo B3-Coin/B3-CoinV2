@@ -196,7 +196,8 @@ Result<TakenSlot> ActionPool::TakeForSlot(uint64_t next_height, size_t max, cons
     return Ok(std::move(taken));
 }
 
-Result<CommitReport> ActionPool::OnCommitted(const state::HeadView& head, std::span<const OutcomeV2> outcomes, const SlotBody& body)
+Result<CommitReport> ActionPool::OnCommitted(const DurableApplied& applied, const state::HeadView& head,
+                                             std::span<const OutcomeV2> outcomes, const SlotBody& body)
 {
     const SlotHeaderV2& header{head.Header()};
     // Checks that need no pool state, done before taking the lock.
@@ -234,6 +235,10 @@ Result<CommitReport> ActionPool::OnCommitted(const state::HeadView& head, std::s
         included.push_back(Included{id, action->sig, found->second});
     }
     if (included.size() != outcome_of.size()) return Error{ErrorCode::INVALID_INPUT, POOL_OUTCOME_MISSING};
+    // B-APPLIED of exactly this head (O-92).
+    if (applied.Slot() != header.height || applied.Digest() != head.HeaderHash() || applied.Binding().state_root != header.state_root) {
+        return Error{ErrorCode::VERIFY_FAILED, POOL_APPLIED_MISMATCH};
+    }
     const uint64_t height{header.height};
     const ledger::LedgerState& ledger{head.State().engine.ledger};
 

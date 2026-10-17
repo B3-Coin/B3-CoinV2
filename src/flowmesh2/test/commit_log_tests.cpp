@@ -7,6 +7,9 @@
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/storage/commit_log.h>
 #include <flowmesh2/storage/memory_journal.h>
+#include <flowmesh2/state/candidate.h>
+#include <flowmesh2/state/state_owner.h>
+#include <flowmesh2/test/util/state_fixtures.h>
 #include <flowmesh2/test/util/storage_fixtures.h>
 #include <util/strencodings.h>
 
@@ -60,76 +63,107 @@ BOOST_AUTO_TEST_CASE(create_checks_role_fence_and_history)
 
 BOOST_AUTO_TEST_CASE(decision_then_applied)
 {
-    CommitFixture f{4};
-    const StorageSlot slot{MakeStorageSlot(1, 0, "d")};
-    const PendingDecision pending{f.log.AppendDecision(slot.header, slot.certificate, slot.body).value()};
+    // DECISION, B-DECISION, Confirm; Apply (check 3) gives the ApplyReceipt;
+    // APPLIED, B-APPLIED, Confirm (O-92).
+    OwnerFixture f{4};
+    const state::Candidate candidate{f.Preview(f.Inputs(FundingFacts(f.actions), {}))};
+    const SlotHeaderV2 header{candidate.Header()};
+    const SlotCertificate cert{TestCertificate(header)};
+    const PendingDecision pending{f.log.AppendDecision(header, cert, candidate.Body()).value()};
     RequireRefusal(f.log.Confirm(pending), ErrorCode::ORDER_VIOLATION, CONFIRM_BEFORE_BARRIER, "decision before B-DECISION");
     BOOST_CHECK_EQUAL(f.log.Barrier().value(), 1U);
     const DurableDecision decision{f.log.Confirm(pending).value()};
-    const PendingApplied applied{f.log.AppendApplied(decision, slot.header.state_root).value()};
+    state::Candidate copy{candidate};
+    const state::AppliedSlot slot{f.owner->Apply(std::move(copy), decision, f.authority).value()};
+    const PendingApplied applied{f.log.AppendApplied(slot.receipt).value()};
     RequireRefusal(f.log.Confirm(applied), ErrorCode::ORDER_VIOLATION, CONFIRM_BEFORE_BARRIER, "applied before B-APPLIED");
     BOOST_CHECK_EQUAL(f.log.Barrier().value(), 2U);
     const DurableApplied token{f.log.Confirm(applied).value()};
-    BOOST_CHECK(token.Binding() == (AppliedRef{1, slot.header.Hash(), slot.header.state_root}));
+    BOOST_CHECK(token.Binding() == (AppliedRef{1, header.Hash(), header.state_root}));
 
     // The records decode back: the DECISION carries header, certificate and body (O-16).
     const std::vector<JournalRecord> records{f.journal->ReadAll().value()};
     BOOST_REQUIRE_EQUAL(records.size(), 2U);
     BOOST_CHECK(records[0].type == RecordType::DECISION && records[1].type == RecordType::APPLIED);
     const DecisionRecord decided{DecisionRecord::Decode(records[0].payload, Profile()).value()};
-    BOOST_CHECK(decided == (DecisionRecord{slot.header, slot.certificate, slot.body}));
+    BOOST_CHECK(decided == (DecisionRecord{header, cert, candidate.Body()}));
     const AppliedRecord applied_record{AppliedRecord::Decode(records[1].payload).value()};
-    BOOST_CHECK(applied_record == (AppliedRecord{1, slot.header.Hash(), slot.header.state_root}));
+    BOOST_CHECK(applied_record == (AppliedRecord{1, header.Hash(), header.state_root}));
 }
 
 BOOST_AUTO_TEST_CASE(applied_with_the_wrong_root_or_slot_is_refused)
 {
-    CommitFixture f{5};
-    const StorageSlot slot{MakeStorageSlot(1, 0, "r")};
-    const DurableDecision decision{f.Decided(slot)};
-    RequireRefusal(f.log.AppendApplied(decision, LabelHash("fm2/test/storage/wrong-root")), ErrorCode::VERIFY_FAILED,
-                   APPLIED_ROOT_MISMATCH, "wrong state root");
-    RequireRefusal(f.log.AppendApplied(decision, uint256{}), ErrorCode::VERIFY_FAILED, APPLIED_ROOT_MISMATCH, "zero state root");
+    // An APPLIED needs the ApplyReceipt of a real Apply (O-92), and Apply takes
+    // the state root from the decided header, so the root can no longer be
+    // wrong (the receipt binds it). What remains: receipts of other logs and
+    // of decisions this log does not hold.
+    OwnerFixture f{5};
+    const state::Candidate candidate{f.Preview(f.Inputs(FundingFacts(f.actions), {}))};
+    const DurableDecision decision{f.Decide(candidate)};
+    state::Candidate copy{candidate};
+    const state::AppliedSlot slot{f.owner->Apply(std::move(copy), decision, f.authority).value()};
+    BOOST_CHECK(slot.receipt.StateRoot() == candidate.Header().state_root);
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
-    // A decision token of another commit log (other instance, or same instance id but another log).
-    CommitFixture other{6};
-    const DurableDecision foreign{other.Decided(slot)};
-    RequireRefusal(f.log.AppendApplied(foreign, slot.header.state_root), ErrorCode::VERIFY_FAILED, TOKEN_OTHER_LOG, "other instance");
-    CommitFixture same_id{5};
-    const DurableDecision same_id_token{same_id.Decided(MakeStorageSlot(2, 0, "r"))};
-    RequireRefusal(f.log.AppendApplied(same_id_token, MakeStorageSlot(2, 0, "r").header.state_root), ErrorCode::VERIFY_FAILED,
-                   APPLIED_DECISION_UNKNOWN, "slot this log never decided");
-    // A token of a log with the same instance id for the same header at another
-    // sequence number (only the sequence number differs) ...
-    CommitFixture shifted{5};
-    (void)shifted.Decided(MakeStorageSlot(0, 0, "r"));
-    const DurableDecision shifted_token{shifted.Decided(slot)};
-    BOOST_CHECK(shifted_token.Seq() != decision.Seq() && shifted_token.Digest() == decision.Digest());
-    RequireRefusal(f.log.AppendApplied(shifted_token, slot.header.state_root), ErrorCode::VERIFY_FAILED,
-                   APPLIED_DECISION_UNKNOWN, "same slot and header, other sequence number");
-    // ... and for another header of the same slot at the same sequence number
-    // (only the header hash differs).
-    CommitFixture other_header{5};
-    const DurableDecision other_header_token{other_header.Decided(MakeStorageSlot(1, 0, "r-other"))};
-    BOOST_CHECK(other_header_token.Seq() == decision.Seq() && other_header_token.Slot() == decision.Slot());
-    RequireRefusal(f.log.AppendApplied(other_header_token, slot.header.state_root), ErrorCode::VERIFY_FAILED,
-                   APPLIED_DECISION_UNKNOWN, "same slot and sequence number, other header");
+    const auto applied_by = [](OwnerFixture& g, const state::Candidate& c) {
+        const DurableDecision d{g.Decide(c)};
+        state::Candidate c_copy{c};
+        Result<state::AppliedSlot> applied{g.owner->Apply(std::move(c_copy), d, g.authority)};
+        RequireOk(applied, "Apply");
+        return std::move(applied).value();
+    };
+    // A receipt of another commit journal instance.
+    OwnerFixture other{6};
+    const state::AppliedSlot foreign{applied_by(other, other.Preview(other.Inputs(FundingFacts(other.actions), {})))};
+    RequireRefusal(f.log.AppendApplied(foreign.receipt), ErrorCode::VERIFY_FAILED, TOKEN_OTHER_LOG, "other instance");
+    // A log with the same instance id, for a slot this log never decided.
+    OwnerFixture same_id{5};
+    same_id.Run(same_id.Inputs(FundingFacts(same_id.actions), {}));
+    const state::AppliedSlot slot2{applied_by(same_id, same_id.Preview(same_id.Inputs({}, {})))};
+    BOOST_CHECK_EQUAL(slot2.receipt.Slot(), 2U);
+    RequireRefusal(f.log.AppendApplied(slot2.receipt), ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN, "slot this log never decided");
+    // The same slot and header at another sequence number (only the sequence number differs) ...
+    OwnerFixture shifted{5};
+    RequireStorageOk(shifted.journal->Append(RecordType::DECISION, Bytes("raw record before the decision")), "raw append");
+    const state::AppliedSlot shifted_slot{applied_by(shifted, shifted.Preview(shifted.Inputs(FundingFacts(shifted.actions), {})))};
+    BOOST_CHECK(shifted_slot.receipt.DecisionSeq() != slot.receipt.DecisionSeq());
+    BOOST_CHECK(shifted_slot.receipt.HeaderHash() == slot.receipt.HeaderHash());
+    RequireRefusal(f.log.AppendApplied(shifted_slot.receipt), ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN,
+                   "same slot and header, other sequence number");
+    // ... and another header of the same slot at the same sequence number (only the header hash differs).
+    OwnerFixture other_header{5};
+    const auto one_deposit{other_header.actions.DepositBytes(KeyAccount("alice"), TestAsset("rUSD"), 7, "other-header")};
+    const state::AppliedSlot other_header_slot{applied_by(other_header, other_header.Preview(other_header.Inputs({one_deposit}, {})))};
+    BOOST_CHECK(other_header_slot.receipt.DecisionSeq() == slot.receipt.DecisionSeq());
+    BOOST_CHECK(other_header_slot.receipt.Slot() == slot.receipt.Slot());
+    BOOST_CHECK(other_header_slot.receipt.HeaderHash() != slot.receipt.HeaderHash());
+    RequireRefusal(f.log.AppendApplied(other_header_slot.receipt), ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN,
+                   "same slot and sequence number, other header");
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
-    // The right root works, and again is idempotent.
-    const PendingApplied applied{f.log.AppendApplied(decision, slot.header.state_root).value()};
-    BOOST_CHECK(f.log.AppendApplied(decision, slot.header.state_root).value() == applied);
+    // Its own receipt works, and again is idempotent.
+    const PendingApplied applied{f.log.AppendApplied(slot.receipt).value()};
+    BOOST_CHECK(f.log.AppendApplied(slot.receipt).value() == applied);
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 2U);
 }
 
 BOOST_AUTO_TEST_CASE(applied_in_slot_order_only)
 {
-    CommitFixture f{7};
-    const StorageSlot s1{MakeStorageSlot(1, 0, "o")};
-    const StorageSlot s2{MakeStorageSlot(2, 0, "o")};
-    const DurableDecision d1{f.Decided(s1)};
-    const DurableDecision d2{f.Decided(s2)};
-    RequireStorageOk(f.log.AppendApplied(d2, s2.header.state_root), "apply slot 2");
-    RequireRefusal(f.log.AppendApplied(d1, s1.header.state_root), ErrorCode::ORDER_VIOLATION, APPLIED_OUT_OF_ORDER, "slot 1 after slot 2");
+    // The owner applies slots 1 and 2; their APPLIED records must follow in
+    // slot order, without a gap (slot 1 first), as replay requires (O-89).
+    OwnerFixture f{7};
+    const state::Candidate c1{f.Preview(f.Inputs(FundingFacts(f.actions), {}))};
+    const DurableDecision d1{f.Decide(c1)};
+    state::Candidate c1_copy{c1};
+    const state::AppliedSlot s1{f.owner->Apply(std::move(c1_copy), d1, f.authority).value()};
+    f.Sync();
+    const state::Candidate c2{f.Preview(f.Inputs({}, {}))};
+    const DurableDecision d2{f.Decide(c2)};
+    state::Candidate c2_copy{c2};
+    const state::AppliedSlot s2{f.owner->Apply(std::move(c2_copy), d2, f.authority).value()};
+    RequireRefusal(f.log.AppendApplied(s2.receipt), ErrorCode::ORDER_VIOLATION, APPLIED_OUT_OF_ORDER, "slot 2 before slot 1");
+    const PendingApplied a1{f.log.AppendApplied(s1.receipt).value()};
+    RequireStorageOk(f.log.AppendApplied(s2.receipt), "apply slot 2");
+    BOOST_CHECK(f.log.AppendApplied(s1.receipt).value() == a1); // a repeat is idempotent
+    BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 4U);
 }
 
 BOOST_AUTO_TEST_CASE(decision_rules)

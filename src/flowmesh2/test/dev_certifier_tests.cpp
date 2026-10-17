@@ -81,10 +81,10 @@ bool AggregateVerifies(const SeatSet& seats, const SlotCertificate& cert, const 
 //! Apply `decision` of `candidate` on the rig's owner under `authority`, then APPLIED and B-APPLIED.
 void ApplyDecided(AgreementRig& rig, state::Candidate candidate, const agreement::Decision& decision, const AuthorityVersion& authority)
 {
-    Result<std::shared_ptr<const state::HeadView>> head{rig.owner->Apply(std::move(candidate), decision.decision, authority)};
+    Result<state::AppliedSlot> head{rig.owner->Apply(std::move(candidate), decision.decision, authority)};
     RequireOk(head, "Apply");
-    BOOST_CHECK((*head)->CertHash() == decision.certificate.Hash());
-    const Result<storage::PendingApplied> applied{rig.commit_log.AppendApplied(decision.decision, (*head)->Header().state_root)};
+    BOOST_CHECK(head->head->CertHash() == decision.certificate.Hash());
+    const Result<storage::PendingApplied> applied{rig.commit_log.AppendApplied(head->receipt)};
     RequireOk(applied, "AppendApplied");
     RequireStorageOk(rig.commit_log.Barrier(), "B-APPLIED");
     RequireStorageOk(rig.commit_log.Confirm(*applied), "Confirm APPLIED");

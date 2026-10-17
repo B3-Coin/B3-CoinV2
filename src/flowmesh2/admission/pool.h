@@ -13,6 +13,7 @@
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/read/read_service.h>
 #include <flowmesh2/state/candidate.h>
+#include <flowmesh2/storage/durable.h>
 #include <sync.h>
 #include <uint256.h>
 
@@ -101,6 +102,7 @@ inline constexpr std::string_view POOL_BODY_MISMATCH{"originals do not give the 
 inline constexpr std::string_view POOL_ORIGINAL_MALFORMED{"committed original does not decode"};                   //!< (INVALID_INPUT)
 inline constexpr std::string_view POOL_OUTCOME_MISSING{"committed original without exactly one action outcome"};   //!< (INVALID_INPUT)
 inline constexpr std::string_view POOL_ACCOUNT_MISSING{"a live entry's account is absent at the committed head"};  //!< (INVARIANT)
+inline constexpr std::string_view POOL_APPLIED_MISMATCH{"APPLIED token of another slot, header or state root"};     //!< (VERIFY_FAILED)
 
 struct PoolLimits {
     size_t capacity{0};          //!< live (PENDING or IN_PROPOSAL) entries; Insert answers POOL_FULL beyond
@@ -243,13 +245,18 @@ public:
 
     /** The state owner committed `head` (after B-APPLIED and read
      * publication), whose slot emitted `outcomes` (in emission order) from
-     * `body` (the certified canonical body). Refused, changing nothing:
+     * `body` (the certified canonical body); `applied` is the slot's
+     * DurableApplied token, so terminal statuses follow B-APPLIED by type
+     * (O-92). Refused, changing nothing:
      * ORDER_VIOLATION POOL_NOT_SUCCESSOR unless head height = pool head + 1;
      * INVALID_INPUT POOL_PROFILE_MISMATCH, POOL_OUTCOMES_MISMATCH (count or
      * outcomes_root), POOL_BODY_MISMATCH (count or actions_root),
      * POOL_ORIGINAL_MALFORMED, POOL_OUTCOME_MISSING (an original without
      * exactly one ACTION outcome, or an ACTION outcome without an original);
-     * INVARIANT POOL_ACCOUNT_MISSING. Then, atomically:
+     * then VERIFY_FAILED POOL_APPLIED_MISMATCH unless the token's slot,
+     * header hash and state root are the head's (checked after the content
+     * checks, before the lock); INVARIANT POOL_ACCOUNT_MISSING. Then,
+     * atomically:
      *  1. every original of the body gets an INCLUDED record (its signature
      *     and IncludedRef{height, outcome index}); a live entry with its
      *     ActionId leaves the pool (whatever signature it held);
@@ -260,8 +267,8 @@ public:
      *  3. retention eviction (see the file comment); the pool's head becomes
      *     `head`.
      */
-    Result<CommitReport> OnCommitted(const state::HeadView& head, std::span<const OutcomeV2> outcomes, const SlotBody& body)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    Result<CommitReport> OnCommitted(const DurableApplied& applied, const state::HeadView& head, std::span<const OutcomeV2> outcomes,
+                                     const SlotBody& body) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
     //! What the pool knows about `id`; nullopt if nothing (never admitted, or evicted).
     std::optional<PoolEntryStatus> Status(const ActionId& id) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);

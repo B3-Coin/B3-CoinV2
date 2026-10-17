@@ -21,8 +21,9 @@
  *
  *   DurableIntent      SeatSigner::Sign, the only BLS signing path    (B-INTENT)
  *   DurableSignedVote  building an OutboundVote, the only way to send  (B-VOTE)
- *   DurableDecision    StateOwner::Apply and CommitLog::AppendApplied  (B-DECISION)
- *   DurableApplied     ReadService::Publish                            (B-APPLIED)
+ *   DurableDecision    StateOwner::Apply, which returns an ApplyReceipt (B-DECISION)
+ *   ApplyReceipt       CommitLog::AppendApplied (made by Apply after check 3)
+ *   DurableApplied     ReadService::Publish and ActionPool::OnCommitted (B-APPLIED)
  *
  * A token cannot be forged: it has no default constructor and no copy, and
  * its only constructor is private with storage::Journal as its only friend.
@@ -53,6 +54,9 @@ namespace flowmesh2 {
 namespace storage {
 class Journal; // the only class that mints tokens
 } // namespace storage
+namespace state {
+class StateOwner; // the only class that makes an ApplyReceipt
+} // namespace state
 
 //! Which barrier a token proves. Values equal the RecordType of the record.
 enum class DurableKind : uint8_t {
@@ -120,6 +124,51 @@ using DurableIntent = Durable<DurableKind::INTENT>;
 using DurableSignedVote = Durable<DurableKind::SIGNED_VOTE>;
 using DurableDecision = Durable<DurableKind::DECISION>;
 using DurableApplied = Durable<DurableKind::APPLIED>;
+
+/** Proof that StateOwner::Apply installed a slot under a durable decision,
+ * so check 3 passed (ARCHITECTURE.md 7.2 and 8; O-92). It is the only input
+ * of CommitLog::AppendApplied, so an APPLIED record, and with it read
+ * publication (DurableApplied) and the pool's terminal statuses, can only
+ * follow a successful Apply: a slot that check 3 refused can never be
+ * marked applied or published.
+ *
+ * Same shape as a Durable token: no default constructor, no copy, no move
+ * assignment; the only constructor is private and state::StateOwner is its
+ * only friend (compile-fail control test/compile_fail/forge_receipt.cpp).
+ * It binds the commit journal instance and sequence number of the applied
+ * DECISION record, the slot, its header hash and its state root.
+ */
+class [[nodiscard]] ApplyReceipt
+{
+public:
+    ApplyReceipt() = delete;
+    ApplyReceipt(const ApplyReceipt&) = delete;
+    ApplyReceipt& operator=(const ApplyReceipt&) = delete;
+    ApplyReceipt(ApplyReceipt&&) noexcept = default;
+    ApplyReceipt& operator=(ApplyReceipt&&) = delete;
+    ~ApplyReceipt() = default;
+
+    //! The commit journal instance of the applied DECISION record.
+    uint64_t JournalInstance() const { return m_journal_instance; }
+    //! That record's sequence number.
+    uint64_t DecisionSeq() const { return m_decision_seq; }
+    uint64_t Slot() const { return m_slot; }
+    const uint256& HeaderHash() const { return m_header_hash; }
+    const uint256& StateRoot() const { return m_state_root; }
+
+private:
+    friend class state::StateOwner;
+    ApplyReceipt(uint64_t journal_instance, uint64_t decision_seq, uint64_t slot, const uint256& header_hash, const uint256& state_root)
+        : m_journal_instance{journal_instance}, m_decision_seq{decision_seq}, m_slot{slot}, m_header_hash{header_hash}, m_state_root{state_root}
+    {
+    }
+
+    uint64_t m_journal_instance;
+    uint64_t m_decision_seq;
+    uint64_t m_slot;
+    uint256 m_header_hash;
+    uint256 m_state_root;
+};
 
 } // namespace flowmesh2
 

@@ -137,17 +137,17 @@ struct ReadRig {
         Result<DurableDecision> decision{log.Confirm(*pending)};
         RequireOk(decision, "Confirm DECISION");
         std::vector<OutcomeV2> outcomes{candidate.Outcomes()};
-        Result<std::shared_ptr<const state::HeadView>> head{owner->Apply(std::move(candidate), *decision, authority)};
+        Result<state::AppliedSlot> head{owner->Apply(std::move(candidate), *decision, authority)};
         RequireOk(head, "Apply");
-        const Result<storage::PendingApplied> applied{log.AppendApplied(*decision, (*head)->Header().state_root)};
+        const Result<storage::PendingApplied> applied{log.AppendApplied(head->receipt)};
         RequireOk(applied, "AppendApplied");
         RequireOk(log.Barrier(), "B-APPLIED");
         Result<DurableApplied> token{log.Confirm(*applied)};
         RequireOk(token, "Confirm APPLIED");
-        Result<std::shared_ptr<const read::SlotView>> view{read::SlotView::Build(**head, cert, outcomes)};
+        Result<std::shared_ptr<const read::SlotView>> view{read::SlotView::Build(*head->head, cert, outcomes)};
         RequireOk(view, "SlotView::Build");
         Sync();
-        return PublishableSlot{CommittedSlot{*head, std::move(outcomes)}, cert, std::move(view).value(), std::move(token).value()};
+        return PublishableSlot{CommittedSlot{head->head, std::move(outcomes)}, cert, std::move(view).value(), std::move(token).value()};
     }
 
     PublishableSlot Run(std::vector<std::vector<unsigned char>> facts, std::vector<std::vector<unsigned char>> originals)

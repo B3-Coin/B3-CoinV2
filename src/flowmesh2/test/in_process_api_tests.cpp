@@ -106,7 +106,7 @@ HeldSlot CommitOnly(ApiRig& r, std::vector<Frame> facts, std::vector<Frame> orig
 }
 void TellPool(ApiRig& r, const HeldSlot& held)
 {
-    RequireOk(r.pool->OnCommitted(*held.slot.slot.head, held.slot.slot.outcomes, held.body), "OnCommitted");
+    RequireOk(r.pool->OnCommitted(held.slot.applied, *held.slot.slot.head, held.slot.slot.outcomes, held.body), "OnCommitted");
 }
 
 /** GetAction of every action in `originals`: any EXPIRED answer must carry a
