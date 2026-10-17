@@ -10,7 +10,9 @@
 #include <flowmesh2/storage/durable.h>
 #include <flowmesh2/storage/signer_log.h>
 #include <flowmesh2/storage/tokens.h>
+#include <uint256.h>
 
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -41,8 +43,26 @@
  * the caller. TEST and dev seats only; real key custody is not part of the
  * outline. A SeatSigner keeps a pointer to its SignerLog, which must outlive
  * it, and is owned by the sealing thread like the log.
+ *
+ * Observation (slice R14): SetSignObserver installs a SignObserver that sees
+ * every vote signature Sign produced, after it exists and before Sign
+ * returns; a refused Sign is not reported. The simulator's trace uses it to
+ * record bls.sign (ARCHITECTURE.md 14.4 P3). It changes nothing about what
+ * is signed or when: without an observer (the default) Sign behaves exactly
+ * as in R8.
  */
 namespace flowmesh2::storage {
+
+/** Sees the vote signatures of one SeatSigner (see the file comment). The
+ * callback gets the intent's slot, view and digest, never the key or the
+ * token, and runs on the signing thread; it must not call the signer.
+ */
+class SignObserver
+{
+public:
+    virtual ~SignObserver() = default;
+    virtual void OnSigned(uint64_t slot, uint64_t view, const uint256& digest) = 0;
+};
 
 class SeatSigner
 {
@@ -63,12 +83,16 @@ public:
     //! The only BLS vote signing path; see the file comment.
     Result<VoteSignature> Sign(const DurableIntent& intent) const;
 
+    //! Report every successful Sign to `observer` (nullptr: none). The observer must outlive the signer.
+    void SetSignObserver(SignObserver* observer) { m_observer = observer; }
+
 private:
     struct Key;
     SeatSigner(std::unique_ptr<const Key> key, const SignerLog& log);
 
     std::unique_ptr<const Key> m_key;
     const SignerLog* m_log;
+    SignObserver* m_observer{nullptr};
 };
 
 } // namespace flowmesh2::storage

@@ -40,7 +40,9 @@ Result<VoteSignature> SeatSigner::Sign(const DurableIntent& intent) const
     if (m_log->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
     if (!m_log->Knows(intent)) return Error{ErrorCode::VERIFY_FAILED, INTENT_UNKNOWN};
     const uint256& digest{intent.Digest()};
-    return Ok(m_key->secret.Sign(std::span<const unsigned char>{digest.data(), digest.size()}).Compressed());
+    const VoteSignature signature{m_key->secret.Sign(std::span<const unsigned char>{digest.data(), digest.size()}).Compressed()};
+    if (m_observer != nullptr) m_observer->OnSigned(intent.Slot(), intent.View(), digest);
+    return Ok(signature);
 }
 
 } // namespace flowmesh2::storage

@@ -16,7 +16,9 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <type_traits>
+#include <vector>
 
 using namespace flowmesh2;
 using namespace flowmesh2::storage;
@@ -144,6 +146,41 @@ BOOST_AUTO_TEST_CASE(sign_refuses_fenced_and_foreign_intents)
     RequireStorageOk(c.signer.Sign(durable), "sign before the failure");
     RequireCode(c.log.Barrier(), ErrorCode::STORAGE_FATAL, "failed barrier");
     RequireRefusal(c.signer.Sign(durable), ErrorCode::FENCED, JOURNAL_FENCED, "sign after the failure");
+}
+
+BOOST_AUTO_TEST_CASE(sign_observer_sees_each_signature_and_no_refusal)
+{
+    struct Seen final : SignObserver {
+        std::vector<std::tuple<uint64_t, uint64_t, uint256>> calls;
+        void OnSigned(uint64_t slot, uint64_t view, const uint256& digest) override { calls.emplace_back(slot, view, digest); }
+    };
+    SigningFixture f{7, MemoryJournalFaults{.fail_barrier = 3}};
+    Seen seen;
+    const StorageSlot slot{MakeStorageSlot(4, 2, "observed")};
+    const PendingIntent pending{f.Intend(slot)};
+    RequireStorageOk(f.log.Barrier(), "B-INTENT");
+    const DurableIntent intent{f.log.Confirm(pending).value()};
+    // Without an observer nothing is reported (the R8 behaviour).
+    const VoteSignature unobserved{f.signer.Sign(intent).value()};
+    BOOST_CHECK(seen.calls.empty());
+    f.signer.SetSignObserver(&seen);
+    const VoteSignature observed{f.signer.Sign(intent).value()};
+    BOOST_CHECK(observed == unobserved); // the observer changes nothing about the signature
+    BOOST_REQUIRE_EQUAL(seen.calls.size(), 1U);
+    BOOST_CHECK_EQUAL(std::get<0>(seen.calls[0]), 4U);
+    BOOST_CHECK_EQUAL(std::get<1>(seen.calls[0]), 0U);
+    BOOST_CHECK(std::get<2>(seen.calls[0]) == slot.header.CommitDigest());
+    // A refused Sign is not reported: an intent of another log, then a fenced log.
+    SigningFixture other{8};
+    const PendingIntent foreign_pending{other.Intend(slot)};
+    RequireStorageOk(other.log.Barrier(), "other B-INTENT");
+    const DurableIntent foreign{other.log.Confirm(foreign_pending).value()};
+    RequireRefusal(f.signer.Sign(foreign), ErrorCode::VERIFY_FAILED, INTENT_UNKNOWN, "foreign intent");
+    RequireStorageOk(f.log.Barrier(), "second barrier");
+    RequireCode(f.log.Barrier(), ErrorCode::STORAGE_FATAL, "failed barrier");
+    RequireRefusal(f.signer.Sign(intent), ErrorCode::FENCED, JOURNAL_FENCED, "fenced");
+    BOOST_CHECK_EQUAL(seen.calls.size(), 1U);
+    f.signer.SetSignObserver(nullptr);
 }
 
 BOOST_AUTO_TEST_CASE(from_ikm_refuses_short_material)

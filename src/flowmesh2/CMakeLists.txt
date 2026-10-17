@@ -202,6 +202,26 @@ if(BUILD_FLOWMESH2)
       fm2_core
   )
 
+  # sim/ (slice R14): the deterministic simulator and the walking skeleton,
+  # in namespace flowmesh2::sim. FakeClock and the seeded Scheduler are the
+  # only clock and randomness of a run; the TraceRecorder observes the
+  # journals, the seat signer and the chain authority. Not a deterministic
+  # directory by guard rule (it owns the seeded FastRandomContext), and like
+  # dev/ and test/ it may sign (guard rule 7). Nothing outside the tests and
+  # the fm2-sim CLI links it.
+  add_library(fm2_simlib STATIC
+    sim/scheduler.cpp
+    sim/trace.cpp
+  )
+  target_link_libraries(fm2_simlib
+    PRIVATE
+      core_interface
+      fm2_warnings
+    PUBLIC
+      fm2_dev
+      fm2_core
+  )
+
   # Boost.Test suite of the outline. Every case is listed in test/INVENTORY.txt.
   add_executable(test_flowmesh2
     test/main.cpp
@@ -256,6 +276,8 @@ if(BUILD_FLOWMESH2)
     test/seat_set_tests.cpp
     test/seat_signer_tests.cpp
     test/signer_log_tests.cpp
+    test/sim_scheduler_tests.cpp
+    test/sim_trace_tests.cpp
     test/slot_tests.cpp
     test/state_owner_tests.cpp
     test/state_root_tests.cpp
@@ -268,6 +290,7 @@ if(BUILD_FLOWMESH2)
   target_link_libraries(test_flowmesh2 PRIVATE
     core_interface
     fm2_warnings
+    fm2_simlib
     fm2_dev
     fm2_core
     fm2_verify

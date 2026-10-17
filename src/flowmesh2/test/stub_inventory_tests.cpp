@@ -104,6 +104,7 @@
 #include <flowmesh2/net/sentry.h>
 #include <flowmesh2/net/short_id.h>
 #include <flowmesh2/net/tcp_mesh.h>
+#include <flowmesh2/sim/faults.h>
 #include <flowmesh2/state/candidate.h>
 #include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
@@ -772,6 +773,22 @@ FM2_STUB_CASE(M7_GOV_03, "M7-GOV-03")
 {
     const governance::Governance governance{RegtestProfile()};
     return Observe(governance.ParamsAt(0));
+}
+
+// ---- Slice R14: sim/ ----
+
+FM2_STUB_CASE(M4_SIM_02, "M4-SIM-02")
+{
+    // Each target-shape fault on its own is the stub; the three real faults are not.
+    std::vector<sim::FaultPlan> plans(5);
+    plans[0].crash_before_slot = 2;
+    plans[1].drop.push_back(sim::DropRule{0, 1, 1'000});
+    plans[2].delay.push_back(sim::DelayRule{0, 1, 5});
+    plans[3].partition.push_back({0});
+    plans[4].skew.push_back(sim::SkewRule{0, 3});
+    std::vector<StubObservation> observed;
+    for (const sim::FaultPlan& plan : plans) observed.push_back(Observe(sim::CheckFaultPlan(plan)));
+    return FirstDeviation("M4-SIM-02", observed);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
