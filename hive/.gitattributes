@@ -1,0 +1,5 @@
+# One line ending everywhere: the app is built in Linux and its scripts run
+# there too, so a Windows checkout must not turn these files into CRLF.
+* text=auto eol=lf
+*.png binary
+*.ico binary
