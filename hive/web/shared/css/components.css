@@ -1053,6 +1053,10 @@ input.select-sm, .input.select-sm { min-height: var(--min-target-sm); }
 .swatch-in { background: var(--success); }
 .swatch-out { background: var(--accent); }
 
+/* The rail's wallet switcher, shown with two or more loaded wallets. */
+.wallet-pick { margin-bottom: var(--space-2); }
+.wallet-pick .select { width: 100%; }
+
 /* Table rows that open details (Network's peers). */
 .tbl tr.clickable { cursor: pointer; }
 .tbl tr.clickable:hover, .tbl tr.clickable:focus-visible { background: var(--bg-subtle); }

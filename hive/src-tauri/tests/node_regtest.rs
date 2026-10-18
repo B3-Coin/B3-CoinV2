@@ -140,7 +140,7 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
         }
     });
     assert_eq!(
-        wallet::select(client, "regtest").unwrap().as_deref(),
+        wallet::select(client, "regtest", None).unwrap().as_deref(),
         Some(W)
     );
     assert!(wallet::activity(client, W, 10).unwrap().is_empty());
@@ -499,4 +499,65 @@ fn the_console_runs_typed_commands_with_full_access() {
     let reply = console::submit("getblockhash(-5)", &mut exec).unwrap();
     assert!(!reply.ok);
     assert!(reply.output.ends_with(")"), "{}", reply.output);
+}
+
+#[test]
+fn wallets_open_close_create_and_back_up() {
+    let Some((test, status)) = TestNode::start("wallets") else {
+        return;
+    };
+    assert!(matches!(status, NodeStatus::Ready { .. }), "{status:?}");
+    let client = test.node.client().unwrap();
+
+    // No wallet yet: regtest makes its test wallet, and nothing else is listed.
+    assert_eq!(
+        wallet::select(client, "regtest", None).unwrap().as_deref(),
+        Some(W)
+    );
+    let list = wallet::wallets(client).unwrap();
+    assert_eq!(list.loaded, [W]);
+    assert!(list.available.is_empty(), "{list:?}");
+
+    // Create picks a plain name; a path is refused before the node sees it.
+    assert!(wallet::create(client, "../outside").is_err());
+    assert_eq!(wallet::create(client, " Savings ").unwrap(), "Savings");
+    assert!(wallet::create(client, "Savings").is_err());
+    assert_eq!(
+        wallet::select(client, "regtest", Some("Savings"))
+            .unwrap()
+            .as_deref(),
+        Some("Savings")
+    );
+    // A preferred wallet that is not loaded falls back to the test wallet.
+    assert_eq!(
+        wallet::select(client, "regtest", Some("gone"))
+            .unwrap()
+            .as_deref(),
+        Some(W)
+    );
+
+    // Backup writes a new file and never overwrites one.
+    let backup = test.datadir.join("savings-backup.dat");
+    wallet::backup(client, "Savings", &backup).unwrap();
+    assert!(std::fs::metadata(&backup).unwrap().len() > 0);
+    assert!(wallet::backup(client, "Savings", &backup).is_err());
+
+    // Close moves it to the folder list; open brings it back.
+    wallet::close(client, "Savings").unwrap();
+    let list = wallet::wallets(client).unwrap();
+    assert_eq!(list.loaded, [W]);
+    assert_eq!(list.available, ["Savings"]);
+    assert!(wallet::open(client, "not-there").is_err());
+    wallet::open(client, "Savings").unwrap();
+    let list = wallet::wallets(client).unwrap();
+    assert_eq!(list.loaded.len(), 2);
+    assert!(list.available.is_empty());
+
+    // Close only unloads: settings.json no longer loads it at start, and the
+    // wallet stays in the folder.
+    wallet::close(client, "Savings").unwrap();
+    let saved = std::fs::read_to_string(test.datadir.join("regtest").join("settings.json"))
+        .unwrap_or_default();
+    assert!(!saved.contains("Savings"), "{saved}");
+    assert!(test.datadir.join("regtest/wallets/Savings").is_dir());
 }

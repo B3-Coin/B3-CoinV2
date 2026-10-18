@@ -129,6 +129,7 @@ const VIEWS = {
   home: { title: "Home", sub: "Your balance and your node" },
   send: { title: "Send", sub: "Pay someone in B3" },
   activity: { title: "Activity", sub: "Your wallet's transactions" },
+  wallets: { title: "Wallets", sub: "Open, create, switch and back up wallets" },
   network: { title: "Network", sub: "Your node and its peers" },
   settings: { title: "Settings", sub: "How your node runs and connects" },
   updates: { title: "Updates", sub: "Signed B3 Hive releases" },
@@ -154,6 +155,7 @@ function go(view: View): void {
     drawTraffic();
   }
   if (view === "settings") void loadSettings();
+  if (view === "wallets") void refreshWallets();
 }
 
 for (const button of document.querySelectorAll<HTMLElement>("[data-view]")) {
@@ -273,6 +275,7 @@ function render(status: NodeStatus): void {
       void refreshWallet();
       void refreshOverview();
       void refreshRecent();
+      void refreshWallets();
       if (current === "activity") void refreshActivity();
       break;
     case "stopping":
@@ -402,6 +405,170 @@ el("fund").addEventListener("click", async () => {
     await refreshWallet();
   } catch (e) {
     showBanner("danger", "Mining regtest blocks failed", String(e));
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// ---- wallets -----------------------------------------------------------------
+// Qt's wallet selector and File menu. The default wallet's name is "".
+
+// Mirrors WalletsView in src-tauri/src/lib.rs.
+type WalletsView = { loaded: string[]; available: string[]; current: string | null };
+type WalletAction = { action: "switch" | "open" | "close" | "create"; name: string };
+
+const walletName = (name: string) => (name === "" ? "Default wallet" : name);
+
+function walletsResult(tone: "success" | "danger" | "", text: string): void {
+  const box = el("wl-result");
+  box.hidden = !text;
+  box.className = `banner banner-${tone}`;
+  box.textContent = text;
+}
+
+function walletRow(name: string, trail: HTMLElement[], meta: string): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "list-row";
+  const lead = document.createElement("div");
+  lead.className = "lead";
+  lead.append(icon("wallet"));
+  const body = document.createElement("div");
+  body.className = "body";
+  const title = document.createElement("span");
+  title.textContent = walletName(name);
+  const sub = document.createElement("span");
+  sub.className = "meta";
+  sub.textContent = meta;
+  body.append(title, sub);
+  const end = document.createElement("div");
+  end.className = "trail trail-row";
+  end.append(...trail);
+  row.append(lead, body, end);
+  return row;
+}
+
+function actionButton(text: string, cls: string, run: (button: HTMLButtonElement) => void): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = `btn btn-sm ${cls}`;
+  b.textContent = text;
+  b.addEventListener("click", () => run(b));
+  return b;
+}
+
+function renderWallets(v: WalletsView): void {
+  el("wl-loaded").replaceChildren(
+    ...v.loaded.map((name) => {
+      const inUse = name === v.current;
+      const trail: HTMLElement[] = [];
+      if (inUse) {
+        const b = document.createElement("span");
+        b.className = "badge badge-success";
+        b.textContent = "In use";
+        trail.push(b);
+      } else {
+        trail.push(actionButton("Use", "btn-secondary", () => void manageWallet({ action: "switch", name })));
+      }
+      // Two clicks, as Qt asks before closing a wallet.
+      trail.push(
+        actionButton("Close", "btn-ghost", (b) => {
+          if (b.dataset.armed) void manageWallet({ action: "close", name });
+          else {
+            b.dataset.armed = "1";
+            b.textContent = "Confirm close";
+            b.className = "btn btn-sm btn-danger-quiet";
+          }
+        }),
+      );
+      return walletRow(name, trail, inUse ? "Loaded · these pages show this wallet" : "Loaded");
+    }),
+  );
+  el("wl-loaded-empty").hidden = v.loaded.length > 0;
+  el("wl-available").replaceChildren(
+    ...v.available.map((name) =>
+      walletRow(name, [actionButton("Open", "btn-secondary", () => void manageWallet({ action: "open", name }))], "Not loaded"),
+    ),
+  );
+  el("wl-available-empty").hidden = v.available.length > 0;
+  el("wl-backup-name").textContent = v.current === null ? "the wallet in use" : walletName(v.current);
+  el<HTMLButtonElement>("wl-backup").disabled = v.current === null;
+  renderWalletPick(v);
+}
+
+// The rail switcher appears once two wallets are loaded, as Qt's selector does.
+function renderWalletPick(v: WalletsView): void {
+  el("wallet-pick-field").hidden = v.loaded.length < 2;
+  const pick = el<HTMLSelectElement>("wallet-pick");
+  pick.replaceChildren(
+    ...v.loaded.map((name) => {
+      const o = document.createElement("option");
+      o.value = name;
+      o.textContent = walletName(name);
+      o.selected = name === v.current;
+      return o;
+    }),
+  );
+}
+
+const refreshWallets = single(async () => {
+  try {
+    renderWallets(await invoke<WalletsView>("wallets"));
+  } catch (e) {
+    walletsResult("danger", String(e));
+  }
+});
+
+let walletBusy = false;
+
+async function manageWallet(action: WalletAction): Promise<void> {
+  if (walletBusy) return;
+  walletBusy = true;
+  walletsResult("", "");
+  try {
+    const v = await invoke<WalletsView>("wallet_manage", { action });
+    renderWallets(v);
+    const done = {
+      switch: "Now using",
+      open: "Opened",
+      close: "Closed",
+      create: "Created",
+    }[action.action];
+    walletsResult("success", `${done} ${walletName(action.action === "create" ? (v.current ?? action.name) : action.name)}.`);
+    // Every page shows the wallet in use.
+    void refreshWallet();
+    void refreshRecent();
+  } catch (e) {
+    walletsResult("danger", String(e));
+    void refreshWallets();
+  } finally {
+    walletBusy = false;
+  }
+}
+
+el("wallet-pick").addEventListener("change", () => {
+  void manageWallet({ action: "switch", name: el<HTMLSelectElement>("wallet-pick").value }).then(() => {
+    if (current === "activity") void refreshActivity();
+  });
+});
+
+el("wl-create").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = el<HTMLInputElement>("wl-name");
+  const button = el<HTMLButtonElement>("wl-create-submit");
+  button.disabled = true;
+  await manageWallet({ action: "create", name: input.value });
+  if (el("wl-result").classList.contains("banner-success")) input.value = "";
+  button.disabled = false;
+});
+
+el("wl-backup").addEventListener("click", async () => {
+  const button = el<HTMLButtonElement>("wl-backup");
+  button.disabled = true;
+  try {
+    const path = await invoke<string>("wallet_backup");
+    walletsResult("success", `Saved the backup to ${path}`);
+  } catch (e) {
+    walletsResult("danger", String(e));
   } finally {
     button.disabled = false;
   }

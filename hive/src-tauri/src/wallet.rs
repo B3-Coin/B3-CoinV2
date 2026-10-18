@@ -1,8 +1,10 @@
-//! Wallet calls: picking the wallet, its balance, activity, regtest funding,
-//! and building a signed send for the approval window.
+//! Wallet calls: the wallet list and picking the pages' wallet, its balance,
+//! activity, regtest funding, and building a signed send for the approval
+//! window.
 //!
-//! Until the wallet picker (phase 3), mainnet uses the first wallet the node
-//! loaded and never creates one; regtest creates its own test wallet.
+//! The pages use the wallet picked in B3 Hive while it stays loaded, else the
+//! first loaded wallet. Mainnet never creates a wallet unasked; regtest
+//! creates its own test wallet when none is loaded.
 
 use std::sync::Mutex;
 
@@ -24,19 +26,152 @@ const RPC_WALLET_ALREADY_LOADED: i64 = -35;
 /// make the second fail on the database lock instead of "already loaded".
 static LOADING: Mutex<()> = Mutex::new(());
 
-/// The wallet the pages use: on regtest the test wallet, created on first
-/// use; elsewhere the first loaded wallet, or None when the node loaded none.
-pub fn select(client: &Client, chain: &str) -> Result<Option<String>, RpcError> {
-    if chain == "regtest" {
+/// The wallet the pages use: `preferred` while it is loaded, else the first
+/// loaded wallet. On regtest the test wallet comes before the others, and is
+/// created when no wallet is loaded. None when mainnet has no wallet loaded.
+pub fn select(
+    client: &Client,
+    chain: &str,
+    preferred: Option<&str>,
+) -> Result<Option<String>, RpcError> {
+    let loaded = loaded(client)?;
+    if let Some(name) = preferred.filter(|p| loaded.iter().any(|l| l == p)) {
+        return Ok(Some(name.to_owned()));
+    }
+    if chain == "regtest" && (loaded.is_empty() || loaded.iter().any(|l| l == SPIKE_WALLET)) {
         ensure_wallet(client)?;
         return Ok(Some(SPIKE_WALLET.to_owned()));
     }
-    let loaded = client.call("listwallets", json!([]))?;
-    Ok(loaded
+    Ok(loaded.into_iter().next())
+}
+
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The wallets the node has loaded, in its order.
+pub fn loaded(client: &Client) -> Result<Vec<String>, RpcError> {
+    Ok(strings(&client.call("listwallets", json!([]))?))
+}
+
+/// Qt's File menu lists: the loaded wallets, and the others in the node's
+/// wallets folder that Open wallet offers. The default wallet's name is "".
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Wallets {
+    pub loaded: Vec<String>,
+    pub available: Vec<String>,
+}
+
+pub fn wallets(client: &Client) -> Result<Wallets, RpcError> {
+    let loaded = loaded(client)?;
+    let dir = client.call("listwalletdir", json!([]))?;
+    Ok(parse_wallets(loaded, &dir))
+}
+
+pub(crate) fn parse_wallets(loaded: Vec<String>, dir: &Value) -> Wallets {
+    let mut available: Vec<String> = dir["wallets"]
         .as_array()
-        .and_then(|w| w.first())
-        .and_then(Value::as_str)
-        .map(str::to_owned))
+        .map(|a| {
+            a.iter()
+                .filter_map(|w| w["name"].as_str())
+                .filter(|n| !loaded.iter().any(|l| l == n))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    available.sort();
+    Wallets { loaded, available }
+}
+
+/// A name for a new wallet. Kept to letters, digits, spaces, dots, dashes
+/// and underscores, so it is a plain folder in the wallets folder and never
+/// a path elsewhere.
+pub fn check_new_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Enter a name for the wallet.".into());
+    }
+    if name.chars().count() > 64 {
+        return Err("Use at most 64 characters.".into());
+    }
+    if name.starts_with('.')
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '-' | '_'))
+    {
+        return Err(
+            "Use letters, digits, spaces, dots, dashes and underscores, and do not start with a dot."
+                .into(),
+        );
+    }
+    Ok(name.to_owned())
+}
+
+/// Opens a wallet from the wallets folder and loads it again at the next
+/// start, as Qt's Open wallet does.
+pub fn open(client: &Client, name: &str) -> Result<(), String> {
+    let list = wallets(client).map_err(|e| e.to_string())?;
+    if list.loaded.iter().any(|l| l == name) {
+        return Ok(());
+    }
+    if !list.available.iter().any(|a| a == name) {
+        return Err("That wallet is not in the wallets folder.".into());
+    }
+    let _one_at_a_time = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+    client
+        .call("loadwallet", json!([name, true]))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Unloads a wallet and stops loading it at start, as Qt's Close wallet does.
+pub fn close(client: &Client, name: &str) -> Result<(), String> {
+    client
+        .call("unloadwallet", json!([name, false]))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Creates a descriptor wallet with keys that loads at every start. It is
+/// not encrypted; Encrypt wallet does that afterwards, as in Qt.
+pub fn create(client: &Client, name: &str) -> Result<String, String> {
+    let name = check_new_name(name)?;
+    if wallets(client)
+        .map_err(|e| e.to_string())?
+        .available
+        .contains(&name)
+    {
+        return Err(
+            "A wallet with that name is already in the wallets folder; open it instead.".into(),
+        );
+    }
+    let _one_at_a_time = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+    client
+        .call(
+            "createwallet",
+            json!([name, false, false, null, false, true, true]),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(name)
+}
+
+/// Copies the wallet to `path`, which must not exist yet.
+pub fn backup(client: &Client, wallet: &str, path: &std::path::Path) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!("{} already exists.", path.display()));
+    }
+    let target = path.to_str().ok_or("The backup path is not valid text.")?;
+    client
+        .call_wallet(wallet, "backupwallet", json!([target]))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Loads the regtest test wallet, creating it on first use.
@@ -343,6 +478,35 @@ pub(crate) fn decimal(v: &Value) -> Result<String, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_wallet_names_stay_in_the_wallets_folder() {
+        assert_eq!(check_new_name("  Savings 2026 ").unwrap(), "Savings 2026");
+        assert_eq!(
+            check_new_name("cold_store-v1.0").unwrap(),
+            "cold_store-v1.0"
+        );
+        for bad in [
+            "",
+            "   ",
+            "../evil",
+            "a/b",
+            r"a\b",
+            ".hidden",
+            "C:x",
+            &"x".repeat(65),
+        ] {
+            assert!(check_new_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_folder_list_leaves_out_loaded_wallets() {
+        let dir = json!({"wallets": [{"name": "zeta"}, {"name": ""}, {"name": "main"}, {"name": "alpha"}]});
+        let w = parse_wallets(vec!["main".into()], &dir);
+        assert_eq!(w.loaded, ["main"]);
+        assert_eq!(w.available, ["", "alpha", "zeta"]);
+    }
 
     #[test]
     fn security_follows_getwalletinfo() {

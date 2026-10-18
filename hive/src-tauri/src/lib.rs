@@ -47,6 +47,9 @@ pub struct Core {
     /// Set once the app is exiting, so a late restart cannot leave a node behind.
     exiting: AtomicBool,
     drafts: Mutex<DraftStore>,
+    /// The wallet picked in the main window; the pages fall back to the first
+    /// loaded wallet when it is not loaded.
+    wallet: Mutex<Option<String>>,
     /// The theme picked in the main window, so the other windows open in it.
     theme: Mutex<Option<Theme>>,
     updates: Updates,
@@ -142,10 +145,11 @@ fn restart_node(app: AppHandle, window: Window, core: State<'_, Arc<Core>>) -> R
 
 /// The wallet the pages use, or an error the page can show. Mainnet uses
 /// the first wallet the node loaded; the picker comes with phase 3.
-fn page_wallet(node: &Node) -> Result<(&rpc::Client, String), String> {
+fn page_wallet<'a>(core: &Core, node: &'a Node) -> Result<(&'a rpc::Client, String), String> {
     let client = node.client().ok_or("The node is not ready yet.")?;
     let chain = node.chain().unwrap_or_default();
-    match wallet::select(client, &chain).map_err(|e| e.to_string())? {
+    let preferred = core.wallet.lock().unwrap().clone();
+    match wallet::select(client, &chain, preferred.as_deref()).map_err(|e| e.to_string())? {
         Some(name) => Ok((client, name)),
         None => Err(NO_WALLET.into()),
     }
@@ -159,7 +163,7 @@ async fn wallet_overview(core: State<'_, Arc<Core>>) -> Result<Option<WalletOver
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
-        let (client, name) = match page_wallet(&node) {
+        let (client, name) = match page_wallet(&core, &node) {
             Ok(found) => found,
             Err(e) if e == NO_WALLET => return Ok(None),
             Err(e) => return Err(e),
@@ -193,7 +197,7 @@ async fn dev_fund(core: State<'_, Arc<Core>>) -> Result<(), String> {
         if node.chain().as_deref() != Some("regtest") {
             return Err("Funding by mining is only available on regtest.".into());
         }
-        let (client, name) = page_wallet(&node)?;
+        let (client, name) = page_wallet(&core, &node)?;
         wallet::fund_regtest(client, &name).map_err(|e| e.to_string())
     })
     .await
@@ -208,7 +212,7 @@ async fn wallet_activity(
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
-        let (client, name) = page_wallet(&node)?;
+        let (client, name) = page_wallet(&core, &node)?;
         wallet::activity(client, &name, count).map_err(|e| e.to_string())
     })
     .await
@@ -261,7 +265,7 @@ async fn wallet_history(
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
-        let (client, name) = page_wallet(&node)?;
+        let (client, name) = page_wallet(&core, &node)?;
         let lines = history::all(client, &name).map_err(|e| e.to_string())?;
         history::filter(lines, &filter, count)
     })
@@ -276,7 +280,7 @@ async fn wallet_transaction(
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
-        let (client, name) = page_wallet(&node)?;
+        let (client, name) = page_wallet(&core, &node)?;
         history::details(client, &name, &txid)
     })
     .await
@@ -299,7 +303,7 @@ async fn wallet_export_csv(
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
-        let (client, name) = page_wallet(&node)?;
+        let (client, name) = page_wallet(&core, &node)?;
         let lines = history::all(client, &name).map_err(|e| e.to_string())?;
         let page = history::filter(lines, &filter, usize::MAX)?;
         let now = std::time::SystemTime::now()
@@ -313,6 +317,120 @@ async fn wallet_export_csv(
             .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
         std::io::Write::write_all(&mut file, history::csv(&page.entries).as_bytes())
             .map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
+        Ok(path.display().to_string())
+    })
+    .await
+}
+
+// ---- wallets (main window) ----------------------------------------------------
+
+/// Qt's wallet selector and File menu wallets.
+#[derive(Serialize)]
+pub struct WalletsView {
+    #[serde(flatten)]
+    pub wallets: wallet::Wallets,
+    /// The wallet the pages use, if any is loaded.
+    pub current: Option<String>,
+}
+
+fn wallets_view(core: &Core) -> Result<WalletsView, String> {
+    let node = core.node();
+    let client = node.client().ok_or("The node is not ready yet.")?;
+    let current = match page_wallet(core, &node) {
+        Ok((_, name)) => Some(name),
+        Err(e) if e == NO_WALLET => None,
+        Err(e) => return Err(e),
+    };
+    let wallets = wallet::wallets(client).map_err(|e| e.to_string())?;
+    Ok(WalletsView { wallets, current })
+}
+
+#[tauri::command]
+async fn wallets(core: State<'_, Arc<Core>>) -> Result<WalletsView, String> {
+    let core = Arc::clone(&core);
+    blocking(move || wallets_view(&core)).await
+}
+
+/// The wallet actions of Qt's File menu and wallet selector.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", content = "name", rename_all = "lowercase")]
+pub enum WalletAction {
+    /// Use a loaded wallet on the pages.
+    Switch(String),
+    Open(String),
+    Close(String),
+    Create(String),
+}
+
+/// Runs one wallet action and returns the new list. A wallet that was opened,
+/// created or switched to becomes the pages' wallet.
+#[tauri::command]
+async fn wallet_manage(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    action: WalletAction,
+) -> Result<WalletsView, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let client = node.client().ok_or("The node is not ready yet.")?;
+        let pick = match action {
+            WalletAction::Switch(name) => {
+                let loaded = wallet::loaded(client).map_err(|e| e.to_string())?;
+                if !loaded.contains(&name) {
+                    return Err("That wallet is not loaded.".into());
+                }
+                Some(name)
+            }
+            WalletAction::Open(name) => {
+                wallet::open(client, &name)?;
+                Some(name)
+            }
+            WalletAction::Close(name) => {
+                wallet::close(client, &name)?;
+                None
+            }
+            WalletAction::Create(name) => Some(wallet::create(client, &name)?),
+        };
+        if let Some(name) = pick {
+            *core.wallet.lock().unwrap() = Some(name);
+        }
+        wallets_view(&core)
+    })
+    .await
+}
+
+/// Qt's Backup wallet, into the Downloads folder under a new name.
+#[tauri::command]
+async fn wallet_backup(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<String, String> {
+    require_window(&window, MAIN)?;
+    let folder = app
+        .path()
+        .download_dir()
+        .map_err(|e| format!("The Downloads folder was not found: {e}"))?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let label = if name.is_empty() {
+            "default"
+        } else {
+            name.as_str()
+        };
+        let path = folder.join(format!(
+            "b3-hive-wallet-{}-{}.dat",
+            label.replace(' ', "_"),
+            history::utc(now).replace(':', "")
+        ));
+        wallet::backup(client, &name, &path)?;
         Ok(path.display().to_string())
     })
     .await
@@ -354,7 +472,7 @@ async fn draft_send(
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
-        let (client, name) = page_wallet(&node)?;
+        let (client, name) = page_wallet(&core, &node)?;
         let chain = node.chain().unwrap_or_default();
         let (summary, hex) = wallet::prepare_send(client, &name, &chain, &address, &amount)?;
         core.drafts
@@ -986,6 +1104,7 @@ pub fn run() {
                 config,
                 exiting: AtomicBool::new(false),
                 drafts: Mutex::new(DraftStore::default()),
+                wallet: Mutex::new(None),
                 theme: Mutex::new(None),
                 updates,
                 setup: Setup::default(),
@@ -1027,6 +1146,9 @@ pub fn run() {
             update_download,
             node_info,
             network_totals,
+            wallets,
+            wallet_manage,
+            wallet_backup,
             wallet_history,
             wallet_transaction,
             wallet_export_csv,
