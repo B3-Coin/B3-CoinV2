@@ -131,7 +131,18 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
         Some(W)
     );
     assert!(wallet::activity(client, W, 10).unwrap().is_empty());
+    assert_eq!(
+        wallet::security(client, W).unwrap(),
+        wallet::Security::Unencrypted
+    );
+    // Regtest has no legacy B3 boundary, so its phase is plain "modern".
+    let staking = wallet::staking(client, W).unwrap();
+    assert_eq!(staking.next_block_phase, "modern", "{staking:?}");
+    assert!(!staking.this_wallet);
     wallet::fund_regtest(client, W).unwrap();
+    let b = wallet::balances(client, W).unwrap();
+    assert_eq!(b.pending.trim_start_matches(['0', '.']), "", "{b:?}");
+    assert_ne!(b.immature.trim_start_matches(['0', '.']), "", "{b:?}");
     let lines = wallet::activity(client, W, 10).unwrap();
     assert_eq!(lines.len(), 10);
     // Newest first: the last block mined has one confirmation.
@@ -349,7 +360,7 @@ fn a_drafted_send_is_submitted_exactly_once() {
     wallet::ensure_wallet(client).unwrap();
     wallet::ensure_wallet(client).unwrap(); // loading twice is fine
     wallet::fund_regtest(client, W).unwrap();
-    let (spendable, _) = wallet::balances(client, W).unwrap();
+    let spendable = wallet::balances(client, W).unwrap().spendable;
     assert!(
         !spendable.trim_start_matches(['0', '.']).is_empty(),
         "nothing spendable: {spendable}"

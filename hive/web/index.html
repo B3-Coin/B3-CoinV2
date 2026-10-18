@@ -157,6 +157,10 @@
                     <span class="label">Spendable balance</span>
                     <div id="spendable"></div>
                     <div class="hero-chips">
+                      <span class="badge badge-info" id="pending-chip" hidden>
+                        <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-clock" /></svg>
+                        <span id="pending"></span>
+                      </span>
                       <span class="badge badge-neutral" id="immature-chip" hidden>
                         <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-clock" /></svg>
                         <span id="immature"></span>
@@ -164,6 +168,10 @@
                       <span class="badge badge-neutral">
                         <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-wallet" /></svg>
                         <span id="wallet-name"></span>
+                      </span>
+                      <span class="badge" id="security-chip">
+                        <svg class="i-sm" aria-hidden="true"><use id="security-icon" href="/icons.svg#i-lock" /></svg>
+                        <span id="security"></span>
                       </span>
                     </div>
                   </div>
@@ -206,6 +214,28 @@
                     <div class="drow"><span class="dkey">Verified</span><span class="dval tnum" id="sync-percent"></span></div>
                     <div class="progress mt-2"><div class="progress-bar" id="sync-bar"></div></div>
                   </div>
+                </div>
+              </div>
+
+              <div class="card" id="era-card" hidden>
+                <div class="card-head">
+                  <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-layers" /></svg>Network era</h2>
+                  <span class="t-sm muted tnum" id="era-height"></span>
+                </div>
+                <div class="card-pad">
+                  <p><strong id="era-name"></strong></p>
+                  <p class="t-sm muted mt-2" id="era-detail"></p>
+                </div>
+              </div>
+
+              <div class="card" id="staking-card" hidden>
+                <div class="card-head">
+                  <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-spark" /></svg>Staking</h2>
+                  <span class="badge" id="staking-badge"></span>
+                </div>
+                <div class="card-pad">
+                  <ul class="plain-lines" id="staking-lines"></ul>
+                  <p class="t-sm muted mt-2">Starting and stopping staking comes with the Stake page in a later version of B3 Hive.</p>
                 </div>
               </div>
 

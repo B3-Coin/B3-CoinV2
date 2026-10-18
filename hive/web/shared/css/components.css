@@ -1029,3 +1029,6 @@ input.select-sm, .input.select-sm { min-height: var(--min-target-sm); }
   color: var(--accent-text); background: none; border: 0; padding: 0;
   font: inherit; cursor: pointer; text-decoration: underline;
 }
+
+/* Short status lines without bullets (Home's staking card). */
+.plain-lines { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-1); }

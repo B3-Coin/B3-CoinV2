@@ -10,7 +10,28 @@ type NodeStatus =
   | { phase: "failed"; error: string }
   | { phase: "setup" };
 
-type WalletOverview = { wallet: string; spendable: string; immature: string; can_fund: boolean };
+// Mirrors WalletOverview in src-tauri/src/lib.rs and wallet::Staking.
+type Staking = {
+  tip_height: number;
+  next_block_phase: string;
+  modern_pos_active: boolean;
+  running: boolean;
+  this_wallet: boolean;
+  state: string;
+  last_error: string | null;
+  finality_signing: boolean;
+  last_signed_height: number;
+};
+type WalletOverview = {
+  wallet: string;
+  spendable: string;
+  pending: string;
+  immature: string;
+  security: "watch_only" | "unencrypted" | "locked" | "unlocked";
+  staking: Staking | null;
+  staking_error: string | null;
+  can_fund: boolean;
+};
 
 // Mirrors ChainOverview and Peer in src-tauri/src/chain.rs.
 type ChainOverview = {
@@ -199,17 +220,101 @@ function render(status: NodeStatus): void {
 
 // ---- wallet ----------------------------------------------------------------
 
+const SECURITY: Record<WalletOverview["security"], [string, string, string]> = {
+  watch_only: ["Watch-only", "neutral", "i-eye"],
+  unencrypted: ["Not encrypted", "warning", "i-unlock"],
+  locked: ["Locked", "success", "i-lock"],
+  unlocked: ["Unlocked", "info", "i-unlock"],
+};
+
+// The era names and lines of Qt's dashboard.
+function era(s: Staking): [string, string] {
+  switch (s.next_block_phase) {
+    case "modern":
+      return ["Test network", "This chain does not use the live legacy B3 transition boundary."];
+    case "legacy":
+      return ["Legacy network", "Legacy operation continues through the sealed transition boundary."];
+    case "corridor":
+      return ["Transition corridor", "The temporary proof-of-work corridor is active on the connected chain."];
+    case "modern_pos":
+      return s.modern_pos_active
+        ? ["Modern PoS", "Modern proof of stake is active on the connected chain."]
+        : [
+            "Modern PoS unavailable",
+            "The modern proof-of-stake rules are not completely configured; the node fails closed.",
+          ];
+    default:
+      return [s.next_block_phase || "Unknown", "The node reported an era B3 Hive does not know."];
+  }
+}
+
+function renderStaking(s: Staking | null, error: string | null): void {
+  const lines: string[] = [];
+  const badgeEl = el("staking-badge");
+  if (!s) {
+    el("era-name").textContent = "Unavailable";
+    el("era-detail").textContent = "The node did not report its staking status.";
+    el("era-height").textContent = "";
+    badgeEl.textContent = "Unavailable";
+    badgeEl.className = "badge badge-warning";
+    lines.push(`Staking status unavailable: ${error ?? "no answer"}`);
+  } else {
+    const [name, detail] = era(s);
+    el("era-name").textContent = name;
+    el("era-detail").textContent = detail;
+    el("era-height").textContent = s.tip_height >= 0 ? `Block ${count(s.tip_height)}` : "";
+    const mine = s.running && s.this_wallet;
+    badgeEl.textContent = mine ? "Running" : s.running ? "Other wallet" : "Stopped";
+    badgeEl.className = `badge badge-${mine ? "success" : "neutral"}`;
+    if (mine) {
+      lines.push("Staking is running.");
+      if (s.state) lines.push(s.state);
+    } else if (s.running) {
+      lines.push("Another wallet is staking on this node.");
+    } else {
+      lines.push("Staking is stopped.");
+    }
+    if (s.finality_signing && s.this_wallet) {
+      lines.push(
+        s.last_signed_height >= 0
+          ? `Finality signing enabled · last signed ${count(s.last_signed_height)}`
+          : "Finality signing enabled · no checkpoint signed yet",
+      );
+    } else if (s.finality_signing) {
+      lines.push("Finality signing belongs to another wallet.");
+    } else {
+      lines.push("Finality signing is not armed.");
+    }
+    if (s.last_error) lines.push(`Last reported error: ${s.last_error}`);
+  }
+  el("staking-lines").replaceChildren(
+    ...lines.map((line) => {
+      const li = document.createElement("li");
+      li.textContent = line;
+      return li;
+    }),
+  );
+}
+
 async function refreshWallet(): Promise<void> {
   try {
     const w = await invoke<WalletOverview | null>("wallet_overview");
     el("no-wallet").hidden = w !== null;
     el("wallet").hidden = w === null;
+    el("era-card").hidden = el("staking-card").hidden = w === null;
     if (!w) return;
     el("wallet-name").textContent = `Wallet ${w.wallet}`;
     el("spendable").replaceChildren(amountNode(w.spendable, "amt-hero"));
-    const maturing = !/^0*\.?0*$/.test(w.immature);
-    el("immature-chip").hidden = !maturing;
+    const zero = (a: string) => /^0*\.?0*$/.test(a);
+    el("pending-chip").hidden = zero(w.pending);
+    el("pending").textContent = `${formatAmount(w.pending)} pending`;
+    el("immature-chip").hidden = zero(w.immature);
     el("immature").textContent = `${formatAmount(w.immature)} maturing`;
+    const [text, tone, icon] = SECURITY[w.security];
+    el("security").textContent = text;
+    el("security-chip").className = `badge badge-${tone}`;
+    el("security-icon").setAttribute("href", `/icons.svg#${icon}`);
+    renderStaking(w.staking, w.staking_error);
     el("fund").hidden = !w.can_fund;
   } catch (e) {
     showBanner("danger", "The wallet could not be read", String(e));
@@ -509,7 +614,11 @@ const refreshNetwork = single(async () => {
 const REFRESH_MS = 5000;
 setInterval(() => {
   if (!wasReady || document.hidden) return;
-  if (current === "home") void refreshOverview();
+  // The wallet too: its lock and staking state change between blocks.
+  if (current === "home") {
+    void refreshOverview();
+    void refreshWallet();
+  }
   if (current === "network") void refreshNetwork();
 }, REFRESH_MS);
 

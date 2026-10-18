@@ -97,7 +97,12 @@ pub enum Theme {
 pub struct WalletOverview {
     pub wallet: String,
     pub spendable: String,
+    pub pending: String,
     pub immature: String,
+    pub security: wallet::Security,
+    /// None with staking_error when getstakinginfo failed.
+    pub staking: Option<wallet::Staking>,
+    pub staking_error: Option<String>,
     /// The funding button is offered on regtest only.
     pub can_fund: bool,
 }
@@ -158,11 +163,21 @@ async fn wallet_overview(core: State<'_, Arc<Core>>) -> Result<Option<WalletOver
             Err(e) if e == NO_WALLET => return Ok(None),
             Err(e) => return Err(e),
         };
-        let (spendable, immature) = wallet::balances(client, &name).map_err(|e| e.to_string())?;
+        let balances = wallet::balances(client, &name).map_err(|e| e.to_string())?;
+        let security = wallet::security(client, &name).map_err(|e| e.to_string())?;
+        // Qt shows the rest of the page when the staking status fails.
+        let (staking, staking_error) = match wallet::staking(client, &name) {
+            Ok(s) => (Some(s), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         Ok(Some(WalletOverview {
             wallet: name,
-            spendable,
-            immature,
+            spendable: balances.spendable,
+            pending: balances.pending,
+            immature: balances.immature,
+            security,
+            staking,
+            staking_error,
             can_fund: node.chain().as_deref() == Some("regtest"),
         }))
     })

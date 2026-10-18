@@ -37,6 +37,8 @@ const PAGE_METHODS: &[&str] = &[
     "loadwallet",
     "createwallet",
     "getbalances",
+    "getwalletinfo",
+    "getstakinginfo",
     "listtransactions",
     "getnewaddress",
     "walletcreatefundedpsbt",

@@ -66,10 +66,103 @@ pub fn ensure_wallet(client: &Client) -> Result<(), RpcError> {
 }
 
 /// Spendable and immature balance as exact decimal strings.
-pub fn balances(client: &Client, wallet: &str) -> Result<(String, String), RpcError> {
+/// The wallet's own coins, as Qt's overview splits them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Balances {
+    /// Confirmed, or this wallet's own unconfirmed change.
+    pub spendable: String,
+    /// Unconfirmed payments from others.
+    pub pending: String,
+    /// Mined or staked, not yet mature.
+    pub immature: String,
+}
+
+pub fn balances(client: &Client, wallet: &str) -> Result<Balances, RpcError> {
     let b = client.call_wallet(wallet, "getbalances", json!([]))?;
     let mine = &b["mine"];
-    Ok((decimal(&mine["trusted"])?, decimal(&mine["immature"])?))
+    Ok(Balances {
+        spendable: decimal(&mine["trusted"])?,
+        pending: decimal(&mine["untrusted_pending"])?,
+        immature: decimal(&mine["immature"])?,
+    })
+}
+
+/// How the wallet's keys are protected, as Qt's dashboard shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Security {
+    WatchOnly,
+    Unencrypted,
+    Locked,
+    Unlocked,
+}
+
+pub fn parse_security(info: &Value) -> Security {
+    if info["private_keys_enabled"] == Value::Bool(false) {
+        return Security::WatchOnly;
+    }
+    // unlocked_until is present only for passphrase-encrypted wallets.
+    match info.get("unlocked_until").and_then(Value::as_i64) {
+        None => Security::Unencrypted,
+        Some(0) => Security::Locked,
+        Some(_) => Security::Unlocked,
+    }
+}
+
+pub fn security(client: &Client, wallet: &str) -> Result<Security, RpcError> {
+    Ok(parse_security(&client.call_wallet(
+        wallet,
+        "getwalletinfo",
+        json!([]),
+    )?))
+}
+
+/// The era and staking lines of Qt's dashboard, from getstakinginfo.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Staking {
+    pub tip_height: i64,
+    /// legacy | corridor | modern_pos, or modern on chains without the
+    /// legacy B3 boundary (regtest): the rules for the next block.
+    pub next_block_phase: String,
+    pub modern_pos_active: bool,
+    pub running: bool,
+    /// The node's staking loop stakes with this wallet's validator key.
+    pub this_wallet: bool,
+    pub state: String,
+    pub last_error: Option<String>,
+    pub finality_signing: bool,
+    /// -1 when nothing was signed yet.
+    pub last_signed_height: i64,
+}
+
+pub fn parse_staking(info: &Value) -> Staking {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+    let flag = |v: &Value| v.as_bool().unwrap_or(false);
+    let own_key = text(&info["validator_key"]);
+    let loop_ = &info["staking"];
+    let running = flag(&loop_["running"]);
+    Staking {
+        tip_height: info["tip_height"].as_i64().unwrap_or(-1),
+        next_block_phase: text(&info["next_block_phase"]),
+        modern_pos_active: flag(&info["modern_pos_active"]),
+        running,
+        this_wallet: running && !own_key.is_empty() && text(&loop_["validator_key"]) == own_key,
+        state: text(&loop_["state"]),
+        last_error: loop_["last_error"]
+            .as_str()
+            .filter(|e| !e.is_empty())
+            .map(str::to_owned),
+        finality_signing: flag(&loop_["finality_signing"]),
+        last_signed_height: loop_["last_signed_height"].as_i64().unwrap_or(-1),
+    }
+}
+
+pub fn staking(client: &Client, wallet: &str) -> Result<Staking, RpcError> {
+    Ok(parse_staking(&client.call_wallet(
+        wallet,
+        "getstakinginfo",
+        json!([]),
+    )?))
 }
 
 /// Regtest only: mines FUND_BLOCKS blocks to a fresh wallet address.
@@ -250,6 +343,49 @@ fn decimal(v: &Value) -> Result<String, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_follows_getwalletinfo() {
+        let cases = [
+            (json!({"private_keys_enabled": true}), Security::Unencrypted),
+            (
+                json!({"private_keys_enabled": true, "unlocked_until": 0}),
+                Security::Locked,
+            ),
+            (
+                json!({"private_keys_enabled": true, "unlocked_until": 1_900_000_000}),
+                Security::Unlocked,
+            ),
+            (json!({"private_keys_enabled": false}), Security::WatchOnly),
+        ];
+        for (info, want) in cases {
+            assert_eq!(parse_security(&info), want, "{info}");
+        }
+    }
+
+    #[test]
+    fn staking_matches_qt_reading() {
+        let key = "ab".repeat(32);
+        let mine = parse_staking(&json!({
+            "validator_key": key, "tip_height": 900, "next_block_phase": "modern_pos",
+            "modern_pos_active": true,
+            "staking": {"running": true, "validator_key": key, "state": "staking",
+                        "last_error": "", "finality_signing": true, "last_signed_height": 899}
+        }));
+        assert!(mine.running && mine.this_wallet && mine.finality_signing);
+        assert_eq!(mine.last_error, None);
+        assert_eq!(mine.last_signed_height, 899);
+        // Another wallet's loop, and a wallet with no validator key yet.
+        let other = parse_staking(&json!({
+            "validator_key": key, "tip_height": 900, "next_block_phase": "legacy",
+            "staking": {"running": true, "validator_key": "cd".repeat(32), "last_error": "no coins"}
+        }));
+        assert!(other.running && !other.this_wallet);
+        assert_eq!(other.last_error.as_deref(), Some("no coins"));
+        let keyless = parse_staking(&json!({"staking": {"running": true, "validator_key": ""}}));
+        assert!(!keyless.this_wallet);
+        assert_eq!((keyless.tip_height, keyless.last_signed_height), (-1, -1));
+    }
 
     #[test]
     fn amounts_are_taken_exactly_or_refused() {
