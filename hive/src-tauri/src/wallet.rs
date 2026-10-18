@@ -8,7 +8,7 @@
 
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::drafts::{Funded, Outpoint, OutputLine, SendSummary};
@@ -331,9 +331,119 @@ pub fn parse_amount(input: &str) -> Result<String, String> {
     Ok(input.to_owned())
 }
 
-/// Funds a send to `address` and decodes it, without signing. The coins it
-/// spends stay reserved (lockUnspents) until the draft is decided; nothing
-/// is broadcast. The caller stores the result as a draft.
+/// One recipient, as the Send page fills it in.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Recipient {
+    pub address: String,
+    pub amount: String,
+    /// Saved in the address book once the payment is sent; may be empty.
+    #[serde(default)]
+    pub label: String,
+    /// The network fee comes out of this amount instead of on top.
+    #[serde(default)]
+    pub subtract_fee: bool,
+}
+
+/// A payment as the Send page asks for it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Payment {
+    pub recipients: Vec<Recipient>,
+    /// B3 per 1000 virtual bytes; empty lets the wallet choose.
+    #[serde(default)]
+    pub fee_rate: String,
+    /// Spend exactly these coins (coin control); empty lets the wallet choose.
+    #[serde(default)]
+    pub coins: Vec<Outpoint>,
+}
+
+pub const MAX_RECIPIENTS: usize = 50;
+const MAX_LABEL: usize = 200;
+
+/// The walletcreatefundedpsbt arguments for a payment, plus the labels to
+/// save once it is sent. Amounts go over the wire as strings, so the node
+/// parses the exact digits.
+pub(crate) fn funding_args(payment: &Payment) -> Result<(Value, Vec<(String, String)>), String> {
+    let count = payment.recipients.len();
+    if count == 0 {
+        return Err("Add at least one recipient.".into());
+    }
+    if count > MAX_RECIPIENTS {
+        return Err(format!(
+            "A payment can have at most {MAX_RECIPIENTS} recipients."
+        ));
+    }
+    let mut outputs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut subtract = Vec::new();
+    let mut labels = Vec::new();
+    for (i, r) in payment.recipients.iter().enumerate() {
+        let which = |e: String| {
+            if count > 1 {
+                format!("Recipient {}: {e}", i + 1)
+            } else {
+                e
+            }
+        };
+        let address = r.address.trim();
+        if address.is_empty() {
+            return Err(which("Enter a destination address.".into()));
+        }
+        let amount = parse_amount(r.amount.trim()).map_err(which)?;
+        if !seen.insert(address) {
+            return Err(which(
+                "This address is already paid in this payment.".into(),
+            ));
+        }
+        let label = r.label.trim();
+        if label.chars().count() > MAX_LABEL || label.chars().any(char::is_control) {
+            return Err(which(format!(
+                "Labels are at most {MAX_LABEL} characters, on one line."
+            )));
+        }
+        if !label.is_empty() {
+            labels.push((address.to_owned(), label.to_owned()));
+        }
+        if r.subtract_fee {
+            subtract.push(i);
+        }
+        let mut output = serde_json::Map::new();
+        output.insert(address.to_owned(), Value::String(amount));
+        outputs.push(Value::Object(output));
+    }
+
+    let mut options = json!({"lockUnspents": true});
+    if !subtract.is_empty() {
+        options["subtractFeeFromOutputs"] = json!(subtract);
+    }
+    let fee_rate = payment.fee_rate.trim();
+    if !fee_rate.is_empty() {
+        let rate = parse_amount(fee_rate)
+            .map_err(|_| "Enter the fee rate in B3 per kvB, like 0.0001, or leave it empty.")?;
+        options["feeRate"] = Value::String(rate);
+    }
+    let mut inputs = Vec::new();
+    for coin in &payment.coins {
+        let hex = coin.txid.len() == 64
+            && coin
+                .txid
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !hex {
+            return Err("A chosen coin is not valid. Choose the coins again.".into());
+        }
+        if inputs.contains(&coin) {
+            return Err("A coin was chosen twice. Choose the coins again.".into());
+        }
+        inputs.push(coin);
+    }
+    if !inputs.is_empty() {
+        // Only the chosen coins, never others added to make up the amount.
+        options["add_inputs"] = Value::Bool(false);
+    }
+    Ok((json!([inputs, outputs, 0, options]), labels))
+}
+
+/// Funds a single-recipient send; see [`prepare_payment`].
 pub fn prepare_send(
     client: &Client,
     wallet: &str,
@@ -341,21 +451,34 @@ pub fn prepare_send(
     address: &str,
     amount: &str,
 ) -> Result<(SendSummary, Funded), String> {
-    let amount = parse_amount(amount)?;
-    let address = address.trim();
-    if address.is_empty() {
-        return Err("Enter a destination address.".into());
-    }
-    // Amount goes over the wire as a string, so the node parses the exact digits.
-    let mut output = serde_json::Map::new();
-    output.insert(address.to_owned(), Value::String(amount));
+    let payment = Payment {
+        recipients: vec![Recipient {
+            address: address.to_owned(),
+            amount: amount.to_owned(),
+            ..Recipient::default()
+        }],
+        ..Payment::default()
+    };
+    prepare_payment(client, wallet, chain, &payment)
+}
+
+/// Funds a payment and decodes it, without signing. The coins it spends stay
+/// reserved (lockUnspents) until the draft is decided; nothing is broadcast.
+/// The caller stores the result as a draft.
+pub fn prepare_payment(
+    client: &Client,
+    wallet: &str,
+    chain: &str,
+    payment: &Payment,
+) -> Result<(SendSummary, Funded), String> {
+    let (args, labels) = funding_args(payment)?;
     let funded = client
-        .call_wallet(
-            wallet,
-            "walletcreatefundedpsbt",
-            json!([[], [output], 0, {"lockUnspents": true}]),
-        )
-        .map_err(|e| e.to_string())?;
+        .call_wallet(wallet, "walletcreatefundedpsbt", args)
+        // The node's wording comes from Bitcoin Core.
+        .map_err(|e| {
+            e.to_string()
+                .replace("Invalid Bitcoin address", "Not a valid B3 address")
+        })?;
     let change_pos = funded["changepos"].as_i64().unwrap_or(-1);
     let fee = decimal(&funded["fee"]).map_err(|e| e.to_string())?;
     let psbt = funded["psbt"]
@@ -375,7 +498,11 @@ pub fn prepare_send(
             fee,
             inputs: inputs.len(),
         },
-        Funded { psbt, inputs },
+        Funded {
+            psbt,
+            inputs,
+            labels,
+        },
     ))
 }
 
@@ -463,6 +590,60 @@ pub(crate) fn check_signed(
         );
     }
     Ok(())
+}
+
+/// Saves a sent payment's labels in the address book. A label that cannot be
+/// saved does not undo the payment, so failures are ignored.
+pub fn save_labels(client: &Client, wallet: &str, labels: &[(String, String)]) {
+    for (address, label) in labels {
+        let _ = client.call_wallet(wallet, "setlabel", json!([address, label]));
+    }
+}
+
+/// One coin the wallet can spend, for coin control.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Coin {
+    pub txid: String,
+    pub vout: u64,
+    pub address: String,
+    pub label: String,
+    pub amount: String,
+    pub confirmations: u64,
+}
+
+/// The wallet's spendable coins, largest first. Coins held back for a
+/// payment waiting in the approval window are not listed.
+pub fn coins(client: &Client, wallet: &str) -> Result<Vec<Coin>, RpcError> {
+    let unspent = client.call_wallet(wallet, "listunspent", json!([0]))?;
+    let mut coins = parse_coins(&unspent)?;
+    coins.sort_by(|a, b| {
+        let key = |c: &Coin| c.amount.parse::<f64>().unwrap_or(0.0);
+        key(b).total_cmp(&key(a))
+    });
+    Ok(coins)
+}
+
+pub(crate) fn parse_coins(v: &Value) -> Result<Vec<Coin>, RpcError> {
+    let list = v
+        .as_array()
+        .ok_or_else(|| RpcError::BadReply("listunspent returned no list".into()))?;
+    let mut coins = Vec::new();
+    for u in list {
+        if u["spendable"].as_bool() == Some(false) {
+            continue;
+        }
+        let txid = u["txid"].as_str().unwrap_or_default().to_owned();
+        let vout = u["vout"].as_u64().unwrap_or_default();
+        coins.push(Coin {
+            txid,
+            vout,
+            address: u["address"].as_str().unwrap_or_default().to_owned(),
+            label: u["label"].as_str().unwrap_or_default().to_owned(),
+            amount: decimal(&u["amount"])?,
+            confirmations: u["confirmations"].as_u64().unwrap_or_default(),
+        });
+    }
+    Ok(coins)
 }
 
 /// Frees the coins a draft reserved, when it is rejected or fails.
@@ -569,6 +750,95 @@ pub(crate) fn decimal(v: &Value) -> Result<String, RpcError> {
 mod tests {
     use super::*;
 
+    fn to(address: &str, amount: &str) -> Recipient {
+        Recipient {
+            address: address.into(),
+            amount: amount.into(),
+            ..Recipient::default()
+        }
+    }
+
+    #[test]
+    fn payments_become_exact_funding_arguments() {
+        let mut first = to(" a1 ", "1.5");
+        first.label = " Rent ".into();
+        let mut second = to("a2", "0.000000001");
+        second.subtract_fee = true;
+        let payment = Payment {
+            recipients: vec![first, second],
+            fee_rate: "0.0002".into(),
+            coins: vec![Outpoint {
+                txid: "ab".repeat(32),
+                vout: 3,
+            }],
+        };
+        let (args, labels) = funding_args(&payment).unwrap();
+        assert_eq!(
+            args,
+            json!([
+                [{"txid": "ab".repeat(32), "vout": 3}],
+                [{"a1": "1.5"}, {"a2": "0.000000001"}],
+                0,
+                {
+                    "lockUnspents": true,
+                    "subtractFeeFromOutputs": [1],
+                    "feeRate": "0.0002",
+                    "add_inputs": false
+                }
+            ])
+        );
+        assert_eq!(labels, vec![("a1".to_owned(), "Rent".to_owned())]);
+
+        // Without choices the wallet picks coins and fee itself.
+        let (args, labels) = funding_args(&Payment {
+            recipients: vec![to("a1", "2")],
+            ..Payment::default()
+        })
+        .unwrap();
+        assert_eq!(args, json!([[], [{"a1": "2"}], 0, {"lockUnspents": true}]));
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn bad_payments_are_refused_before_the_node() {
+        let refused = |p: Payment| funding_args(&p).unwrap_err();
+        let of = |recipients| Payment {
+            recipients,
+            ..Payment::default()
+        };
+        assert_eq!(refused(of(vec![])), "Add at least one recipient.");
+        assert_eq!(
+            refused(of(vec![to("a", "1"), to("a", "2")])),
+            "Recipient 2: This address is already paid in this payment."
+        );
+        assert_eq!(
+            refused(of(vec![to(" ", "1")])),
+            "Enter a destination address."
+        );
+        assert!(
+            refused(of(vec![to("a", "1"), to("b", "1.0000000001")])).starts_with("Recipient 2: ")
+        );
+        assert!(refused(of(vec![to("a", "1"); MAX_RECIPIENTS + 1])).contains("at most"));
+        let mut labelled = to("a", "1");
+        labelled.label = "two
+lines"
+            .into();
+        assert!(refused(of(vec![labelled])).contains("Labels"));
+        let mut fee = of(vec![to("a", "1")]);
+        fee.fee_rate = "-1".into();
+        assert!(refused(fee).contains("fee rate"));
+        let coin = |txid: &str| Outpoint {
+            txid: txid.into(),
+            vout: 0,
+        };
+        let mut bad = of(vec![to("a", "1")]);
+        bad.coins = vec![coin("AB")];
+        assert!(refused(bad).contains("not valid"));
+        let mut twice = of(vec![to("a", "1")]);
+        twice.coins = vec![coin(&"a".repeat(64)), coin(&"a".repeat(64))];
+        assert!(refused(twice).contains("twice"));
+    }
+
     #[test]
     fn a_signed_transaction_must_match_its_draft() {
         let line = |address: &str, amount: &str, change| OutputLine {
@@ -590,6 +860,7 @@ mod tests {
         let funded = Funded {
             psbt: String::new(),
             inputs: vec![coin(0)],
+            labels: vec![],
         };
         // Signing does not know which output is change; only address and
         // amount must match.

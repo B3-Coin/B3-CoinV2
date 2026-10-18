@@ -28,3 +28,14 @@
 
 /* Views are switched by the hidden attribute, which must beat .view. */
 [hidden] { display: none !important; }
+
+/* --- Send: recipients and coin control. --------------------------------- */
+
+.recipient { display: grid; gap: var(--space-4); }
+.recipient + .recipient { border-top: 1px solid var(--border); padding-top: var(--space-4); margin-top: var(--space-4); }
+.recipient-head { display: flex; align-items: center; justify-content: space-between; min-height: var(--min-target-sm); }
+.coin-sum { justify-content: space-between; margin: var(--space-3) 0; }
+.coin-list { border: 1px solid var(--border); border-radius: var(--radius-md); }
+.coin-list .list-row { min-height: 52px; cursor: pointer; }
+.coin-list .list-row:hover { background: var(--bg-subtle); }
+.coin-list input { width: 20px; height: 20px; flex: none; accent-color: var(--accent); }

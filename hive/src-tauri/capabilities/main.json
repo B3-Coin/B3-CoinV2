@@ -14,6 +14,7 @@
     "allow-network-peers",
     "allow-dev-fund",
     "allow-draft-send",
+    "allow-send-coins",
     "allow-open-console",
     "allow-ui-theme",
     "allow-set-ui-theme",

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { amountNode, el, formatAmount, icon, initTheme, setMasked, shorten, toggleTheme, type Theme } from "../shared/ui";
+import { amountNode, el, formatAmount, icon, initTheme, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -148,7 +148,7 @@ function go(view: View): void {
   }
   el("page-title").textContent = VIEWS[view].title;
   el("page-sub").textContent = VIEWS[view].sub;
-  if (view === "send") el<HTMLInputElement>("address").focus();
+  if (view === "send") document.querySelector<HTMLInputElement>("#recipients .r-address")?.focus();
   if (view === "updates") void refreshUpdates();
   if (view === "activity") void refreshActivity();
   if (view === "network") {
@@ -1692,21 +1692,216 @@ function sendResult(tone: "info" | "success" | "warning" | "danger", text: strin
   box.hidden = false;
   box.className = `banner banner-${tone} mt-4`;
   box.textContent = text;
+  // With several recipients the form is long; keep the outcome in view.
+  box.scrollIntoView({ block: "nearest" });
 }
 
-// The page only asks for a draft. The core builds and signs it, and nothing
-// is sent unless the approval window approves it.
+// Mirrors wallet::Coin in src-tauri/src/wallet.rs.
+type Coin = { txid: string; vout: number; address: string; label: string; amount: string; confirmations: number };
+
+const MAX_RECIPIENTS = 50; // wallet::MAX_RECIPIENTS
+let recipientSeq = 0;
+
+function field(id: string, label: string, input: HTMLElement, help?: string): HTMLElement {
+  const f = document.createElement("div");
+  f.className = "field";
+  const l = document.createElement("label");
+  l.htmlFor = id;
+  l.textContent = label;
+  f.append(l, input);
+  if (help) {
+    const h = document.createElement("span");
+    h.className = "help";
+    h.textContent = help;
+    f.append(h);
+  }
+  return f;
+}
+
+function textInput(id: string, cls: string, attrs: Record<string, string> = {}): HTMLInputElement {
+  const i = document.createElement("input");
+  i.id = id;
+  i.className = `input ${cls}`;
+  i.autocomplete = "off";
+  i.spellcheck = false;
+  for (const [k, v] of Object.entries(attrs)) i.setAttribute(k, v);
+  return i;
+}
+
+// Numbers the recipients and shows Remove only when there is more than one.
+function renumberRecipients(): void {
+  const blocks = [...el("recipients").querySelectorAll<HTMLElement>(".recipient")];
+  blocks.forEach((b, i) => {
+    b.querySelector(".recipient-head")!.toggleAttribute("hidden", blocks.length < 2);
+    b.querySelector(".r-title")!.textContent = `Recipient ${i + 1}`;
+  });
+  el<HTMLButtonElement>("send-add").disabled = blocks.length >= MAX_RECIPIENTS;
+}
+
+function addRecipient(): HTMLElement {
+  const n = ++recipientSeq;
+  const block = document.createElement("div");
+  block.className = "recipient";
+
+  const head = document.createElement("div");
+  head.className = "recipient-head";
+  const title = document.createElement("span");
+  title.className = "r-title t-sm muted";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "btn btn-ghost btn-sm";
+  remove.textContent = "Remove";
+  remove.addEventListener("click", () => {
+    block.remove();
+    renumberRecipients();
+  });
+  head.append(title, remove);
+
+  const amount = textInput(`r-amount-${n}`, "r-amount", { inputmode: "decimal", placeholder: "0.000000000" });
+  const amountBox = document.createElement("div");
+  amountBox.className = "amount-field";
+  const unit = document.createElement("span");
+  unit.className = "unit";
+  unit.textContent = "B3";
+  amountBox.append(amount, unit);
+
+  const subtract = document.createElement("label");
+  subtract.className = "check";
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.className = "r-subtract";
+  const body = document.createElement("span");
+  body.className = "check-body";
+  const what = document.createElement("span");
+  what.textContent = "Take the network fee from this amount";
+  const help = document.createElement("span");
+  help.className = "help";
+  help.textContent = "The recipient gets a little less, instead of the fee being added on top.";
+  body.append(what, help);
+  subtract.append(box, body);
+
+  block.append(
+    head,
+    field(`r-address-${n}`, "Pay to", textInput(`r-address-${n}`, "input-mono r-address")),
+    field(
+      `r-label-${n}`,
+      "Label",
+      textInput(`r-label-${n}`, "r-label", { maxlength: "200", placeholder: "Optional" }),
+      "Saved in your address book once the payment is sent.",
+    ),
+    field(`r-amount-${n}`, "Amount", amountBox, "Up to 9 decimals."),
+    subtract,
+  );
+  el("recipients").append(block);
+  renumberRecipients();
+  return block;
+}
+
+function resetSendForm(): void {
+  el("recipients").replaceChildren();
+  addRecipient();
+  el<HTMLInputElement>("send-fee").value = "";
+  chosenCoins.clear();
+  el<HTMLInputElement>("send-cc").checked = false;
+  el("send-coins").hidden = true;
+  el<HTMLDetailsElement>("send-options").open = false;
+}
+
+el("send-add").addEventListener("click", () => {
+  addRecipient().querySelector<HTMLInputElement>(".r-address")!.focus();
+});
+
+// Coin control. Chosen coins are kept by outpoint, so a refresh keeps the
+// choice for coins that are still there.
+const chosenCoins = new Set<string>();
+let shownCoins: Coin[] = [];
+const outpoint = (c: { txid: string; vout: number }): string => `${c.txid}:${c.vout}`;
+
+function showCoinSum(): void {
+  const picked = shownCoins.filter((c) => chosenCoins.has(outpoint(c)));
+  const total = sumAmounts(picked.map((c) => c.amount)) ?? "0";
+  el("send-coins-sum").replaceChildren(
+    amountNode(total),
+    document.createTextNode(` · ${plural(picked.length, "coin")}`),
+  );
+}
+
+const refreshCoins = single(async () => {
+  if (!el<HTMLInputElement>("send-cc").checked) return;
+  try {
+    shownCoins = await invoke<Coin[]>("send_coins");
+  } catch (e) {
+    sendResult("danger", String(e));
+    return;
+  }
+  const present = new Set(shownCoins.map(outpoint));
+  for (const key of [...chosenCoins]) if (!present.has(key)) chosenCoins.delete(key);
+  el("send-coins-empty").hidden = shownCoins.length > 0;
+  el("send-coin-list").replaceChildren(
+    ...shownCoins.map((c) => {
+      const row = document.createElement("label");
+      row.className = "list-row";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = chosenCoins.has(outpoint(c));
+      box.addEventListener("change", () => {
+        if (box.checked) chosenCoins.add(outpoint(c));
+        else chosenCoins.delete(outpoint(c));
+        showCoinSum();
+      });
+      const body = document.createElement("span");
+      body.className = "body";
+      const amount = amountNode(c.amount);
+      const meta = document.createElement("span");
+      meta.className = "meta is-mono";
+      meta.textContent = c.label ? `${c.label} · ${shorten(c.address, 10, 6)}` : shorten(c.address, 14, 8);
+      meta.title = c.address;
+      body.append(amount, meta);
+      const trail = document.createElement("span");
+      trail.className = "trail t-sm muted";
+      trail.textContent = c.confirmations ? plural(c.confirmations, "confirmation") : "Unconfirmed";
+      row.append(box, body, trail);
+      return row;
+    }),
+  );
+  showCoinSum();
+});
+
+el("send-cc").addEventListener("change", () => {
+  const on = el<HTMLInputElement>("send-cc").checked;
+  el("send-coins").hidden = !on;
+  if (on) void refreshCoins();
+});
+
+resetSendForm();
+
+// The page only asks for a draft. The core funds it, the approval window
+// shows it, and it is signed and sent only if approved there.
 el("send").addEventListener("submit", async (event) => {
   event.preventDefault();
+  const coinControl = el<HTMLInputElement>("send-cc").checked;
+  if (coinControl && chosenCoins.size === 0) {
+    sendResult("danger", "Choose at least one coin, or turn off choosing coins.");
+    return;
+  }
+  const recipients = [...el("recipients").querySelectorAll<HTMLElement>(".recipient")].map((b) => ({
+    address: b.querySelector<HTMLInputElement>(".r-address")!.value.trim(),
+    amount: b.querySelector<HTMLInputElement>(".r-amount")!.value.trim(),
+    label: b.querySelector<HTMLInputElement>(".r-label")!.value.trim(),
+    subtract_fee: b.querySelector<HTMLInputElement>(".r-subtract")!.checked,
+  }));
+  const coins = coinControl
+    ? shownCoins.filter((c) => chosenCoins.has(outpoint(c))).map((c) => ({ txid: c.txid, vout: c.vout }))
+    : [];
   const submit = el<HTMLButtonElement>("send-submit");
   submit.disabled = true;
   sendResult("info", "Preparing the payment…");
   try {
     await invoke<string>("draft_send", {
-      address: el<HTMLInputElement>("address").value.trim(),
-      amount: el<HTMLInputElement>("amount").value.trim(),
+      payment: { recipients, fee_rate: el<HTMLInputElement>("send-fee").value.trim(), coins },
     });
     sendResult("info", "Waiting for your decision in the approval window.");
+    void refreshCoins();
   } catch (e) {
     sendResult("danger", String(e));
   } finally {
@@ -1866,7 +2061,7 @@ await listen<DraftResult>("draft-result", (event) => {
   const r = event.payload;
   if (r.outcome === "sent") {
     sendResult("success", `Sent. Transaction ${r.txid}`);
-    el<HTMLFormElement>("send").reset();
+    resetSendForm();
   } else if (r.outcome === "rejected") {
     sendResult("warning", "Rejected. Nothing was sent.");
   } else {
@@ -1874,6 +2069,7 @@ await listen<DraftResult>("draft-result", (event) => {
   }
   void refreshWallet();
   void refreshRecent();
+  void refreshCoins();
 });
 await listen<NodeStatus>("node-status", (event) => render(event.payload));
 render(await invoke<NodeStatus>("node_status"));

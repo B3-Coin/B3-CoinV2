@@ -14,6 +14,7 @@ fn main() {
             "network_peers",
             "dev_fund",
             "draft_send",
+            "send_coins",
             "open_console",
             "restart_node",
             "ui_theme",

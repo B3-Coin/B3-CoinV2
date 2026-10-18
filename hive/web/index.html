@@ -282,18 +282,38 @@
         <main class="view view--flow" id="view-send" hidden>
           <form class="card" id="send" novalidate>
             <div class="card-pad form-grid">
-              <div class="field">
-                <label for="address">Pay to</label>
-                <input class="input input-mono" id="address" autocomplete="off" spellcheck="false" required />
-              </div>
-              <div class="field">
-                <label for="amount">Amount</label>
-                <div class="amount-field">
-                  <input class="input" id="amount" inputmode="decimal" autocomplete="off" placeholder="0.000000000" required />
-                  <span class="unit">B3</span>
+              <div id="recipients"></div>
+              <button class="btn btn-secondary" type="button" id="send-add">
+                <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>Add recipient
+              </button>
+              <details class="disc disc--boxed" id="send-options">
+                <summary>
+                  <svg class="i-sm caret" aria-hidden="true"><use href="/icons.svg#i-chevron-right" /></svg>
+                  <span>Fee and coins</span>
+                </summary>
+                <div class="disc-body form-grid">
+                  <div class="field">
+                    <label for="send-fee">Fee rate</label>
+                    <div class="amount-field">
+                      <input class="input" id="send-fee" inputmode="decimal" autocomplete="off" placeholder="Automatic" />
+                      <span class="unit">B3/kvB</span>
+                    </div>
+                    <span class="help">B3 per 1000 virtual bytes. Leave empty to let the wallet choose.</span>
+                  </div>
+                  <label class="check">
+                    <input type="checkbox" id="send-cc" />
+                    <span class="check-body">
+                      <span>Choose which coins to spend</span>
+                      <span class="help">Only the chosen coins are spent; any change comes back to this wallet.</span>
+                    </span>
+                  </label>
+                  <div id="send-coins" hidden>
+                    <div class="row coin-sum"><span class="muted">Chosen</span><span id="send-coins-sum"></span></div>
+                    <div class="coin-list" id="send-coin-list"></div>
+                    <div class="empty empty--tight" id="send-coins-empty" hidden>No coins to spend yet.</div>
+                  </div>
                 </div>
-                <span class="help">Up to 9 decimals. The network fee is added on top.</span>
-              </div>
+              </details>
               <div class="callout callout-info">
                 <div class="callout-title">
                   <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-shield" /></svg>Nothing is sent yet

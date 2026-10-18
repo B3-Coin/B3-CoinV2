@@ -58,6 +58,8 @@ const PAGE_METHODS: &[&str] = &[
     "decodepsbt",
     "lockunspent",
     "walletpassphrase",
+    "listunspent",
+    "setlabel",
     "decoderawtransaction",
     "sendrawtransaction",
     "generatetoaddress",

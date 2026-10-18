@@ -363,6 +363,18 @@ async fn receive_new(
     .await
 }
 
+/// The coins the page's wallet can spend, for coin control.
+#[tauri::command]
+async fn send_coins(core: State<'_, Arc<Core>>) -> Result<Vec<wallet::Coin>, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        wallet::coins(client, &name).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 /// The wallet's receiving addresses, newest last as the node lists them.
 #[tauri::command]
 async fn receive_addresses(core: State<'_, Arc<Core>>) -> Result<Vec<receive::Receiving>, String> {
@@ -604,15 +616,14 @@ async fn network_peers(core: State<'_, Arc<Core>>) -> Result<Vec<chain::Peer>, S
 async fn draft_send(
     app: AppHandle,
     core: State<'_, Arc<Core>>,
-    address: String,
-    amount: String,
+    payment: wallet::Payment,
 ) -> Result<String, String> {
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
         let chain = node.chain().unwrap_or_default();
-        let (summary, funded) = wallet::prepare_send(client, &name, &chain, &address, &amount)?;
+        let (summary, funded) = wallet::prepare_payment(client, &name, &chain, &payment)?;
         let inputs = funded.inputs.clone();
         core.drafts
             .lock()
@@ -1039,8 +1050,9 @@ async fn approval_decide(
                 Some(draft) => {
                     let sent = wallet::sign(client, &draft.summary, &draft.funded)
                         .and_then(|hex| wallet::broadcast(client, &hex).map_err(|e| e.to_string()));
-                    if sent.is_err() {
-                        wallet::release(client, &wallet_name, &draft.funded.inputs);
+                    match &sent {
+                        Ok(_) => wallet::save_labels(client, &wallet_name, &draft.funded.labels),
+                        Err(_) => wallet::release(client, &wallet_name, &draft.funded.inputs),
                     }
                     sent
                 }
@@ -1435,6 +1447,7 @@ pub fn run() {
             network_peers,
             dev_fund,
             draft_send,
+            send_coins,
             open_console,
             ui_theme,
             set_ui_theme,

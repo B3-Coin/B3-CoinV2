@@ -13,7 +13,7 @@ use serde_json::json;
 use b3_hive::bootstrap;
 use b3_hive::chain;
 use b3_hive::console;
-use b3_hive::drafts::DraftStore;
+use b3_hive::drafts::{DraftStore, Outpoint};
 use b3_hive::history::{self, Filter, Kind};
 use b3_hive::node::{Network, Node, NodeConfig, NodeStatus};
 use b3_hive::passphrase::{self, Entry, Kind as PassKind, Request};
@@ -713,4 +713,81 @@ fn a_locked_wallet_signs_only_with_its_passphrase() {
     );
     let txid = wallet::broadcast(client, &hex).unwrap();
     assert_eq!(test.mempool(), vec![txid]);
+}
+
+#[test]
+fn payments_split_fees_choose_coins_and_save_labels() {
+    let Some((test, status)) = TestNode::start("payment") else {
+        return;
+    };
+    assert!(matches!(status, NodeStatus::Ready { .. }), "{status:?}");
+    let client = test.node.client().unwrap();
+    wallet::ensure_wallet(client).unwrap();
+    wallet::fund_regtest(client, W).unwrap();
+    let fresh = || {
+        client
+            .call_wallet(W, "getnewaddress", json!([]))
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (a, b) = (fresh(), fresh());
+
+    // Coin control: three chosen coins (0.05 B3 each on regtest), nothing
+    // else added.
+    let chosen: Vec<Outpoint> = wallet::coins(client, W).unwrap()[..3]
+        .iter()
+        .map(|c| Outpoint {
+            txid: c.txid.clone(),
+            vout: c.vout,
+        })
+        .collect();
+    let payment = wallet::Payment {
+        recipients: vec![
+            wallet::Recipient {
+                address: a.clone(),
+                amount: "0.08".into(),
+                label: "Alice".into(),
+                subtract_fee: true,
+            },
+            wallet::Recipient {
+                address: b.clone(),
+                amount: "0.025".into(),
+                ..Default::default()
+            },
+        ],
+        fee_rate: "0.0002".into(),
+        coins: chosen.clone(),
+    };
+    let (summary, funded) = wallet::prepare_payment(client, W, "regtest", &payment).unwrap();
+    let mut spent = funded.inputs.clone();
+    let mut want = chosen.clone();
+    spent.sort_by(|x, y| (&x.txid, x.vout).cmp(&(&y.txid, y.vout)));
+    want.sort_by(|x, y| (&x.txid, x.vout).cmp(&(&y.txid, y.vout)));
+    assert_eq!(spent, want);
+    // The chosen coins are reserved, so they are no longer offered.
+    assert!(!wallet::coins(client, W)
+        .unwrap()
+        .iter()
+        .any(|c| chosen.iter().any(|o| o.txid == c.txid && o.vout == c.vout)));
+
+    // The fee came out of Alice's amount, not on top.
+    let line = |addr: &str| summary.outputs.iter().find(|o| o.address == addr).unwrap();
+    assert_eq!(line(&b).amount, "0.025000000");
+    let alice: f64 = line(&a).amount.parse().unwrap();
+    let fee: f64 = summary.fee.parse().unwrap();
+    assert!(
+        fee > 0.0 && (alice + fee - 0.08).abs() < 1e-9,
+        "{alice} + {fee}"
+    );
+
+    let hex = wallet::sign(client, &summary, &funded).unwrap();
+    wallet::broadcast(client, &hex).unwrap();
+    wallet::save_labels(client, W, &funded.labels);
+    let info = test
+        .admin()
+        .call_wallet(W, "getaddressinfo", json!([a]))
+        .unwrap();
+    assert_eq!(info["labels"][0].as_str(), Some("Alice"));
 }

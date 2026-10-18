@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One output of the drafted transaction, as decoded by the core.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -40,7 +40,7 @@ pub struct DraftView {
 }
 
 /// One coin the draft spends.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outpoint {
     pub txid: String,
     pub vout: u64,
@@ -53,6 +53,10 @@ pub struct Funded {
     pub psbt: String,
     /// Reserved with lockUnspents until the draft is decided.
     pub inputs: Vec<Outpoint>,
+    /// Address-book labels (address, label) saved once it is sent. They are
+    /// never shown in the approval window, which shows only what the core
+    /// decoded.
+    pub labels: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +138,7 @@ mod tests {
         Funded {
             psbt: psbt.into(),
             inputs: vec![],
+            labels: vec![],
         }
     }
 
