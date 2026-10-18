@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { amountNode, el, formatAmount, icon, initTheme, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
+import { amountNode, amountUnits, el, formatAmount, icon, initTheme, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -2042,7 +2042,18 @@ el("book-form").addEventListener("submit", async (event) => {
 // ---- send coin control -----------------------------------------------------
 
 // Mirrors wallet::Coin in src-tauri/src/wallet.rs.
-type Coin = { txid: string; vout: number; address: string; label: string; amount: string; confirmations: number };
+// Mirrors wallet::Coin and wallet::CoinList in src-tauri/src/wallet.rs.
+type Coin = {
+  txid: string;
+  vout: number;
+  address: string;
+  label: string;
+  amount: string;
+  confirmations: number;
+  // What spending it adds to a transaction, in virtual bytes.
+  vbytes: number;
+};
+type CoinList = { coins: Coin[]; input_budget: number };
 
 const MAX_RECIPIENTS = 50; // wallet::MAX_RECIPIENTS
 let recipientSeq = 0;
@@ -2169,28 +2180,74 @@ const chosenCoins = new Set<string>();
 let shownCoins: Coin[] = [];
 const outpoint = (c: { txid: string; vout: number }): string => `${c.txid}:${c.vout}`;
 
+// How many virtual bytes of coins fit in one transaction to one address
+// plus change; the core checks the real payment again.
+let inputBudget = 0;
+// Wallets with thousands of small staking rewards are why the bulk choices
+// exist: picking them one by one is not practical, and one transaction
+// holds only so many (about 675 of the common kind).
+const QUICK_COUNT = 50;
+const LIST_LIMIT = 300;
+
+const chosenList = (): Coin[] => shownCoins.filter((c) => chosenCoins.has(outpoint(c)));
+const units = (c: Coin): bigint => amountUnits(c.amount) ?? 0n;
+const ascending = (a: Coin, b: Coin): number => (units(a) < units(b) ? -1 : units(a) > units(b) ? 1 : 0);
+
 function showCoinSum(): void {
-  const picked = shownCoins.filter((c) => chosenCoins.has(outpoint(c)));
+  const picked = chosenList();
   const total = sumAmounts(picked.map((c) => c.amount)) ?? "0";
   el("send-coins-sum").replaceChildren(
     amountNode(total),
     document.createTextNode(` · ${plural(picked.length, "coin")}`),
   );
+  const size = picked.reduce((n, c) => n + c.vbytes, 0);
+  const over = size > inputBudget;
+  el("cc-size").hidden = picked.length === 0;
+  el("cc-size").className = over ? "help bad" : "help";
+  el("cc-size").textContent = over
+    ? `Too many for one transaction: about ${Math.ceil(size / 1000)} kB of coins, and about ${Math.floor(inputBudget / 1000)} kB fit. Choose fewer and combine the rest in another payment.`
+    : `About ${Math.ceil(size / 1000)} of ${Math.floor(inputBudget / 1000)} kB of one transaction.`;
+  el<HTMLButtonElement>("cc-combine").disabled = picked.length === 0 || over;
 }
 
-const refreshCoins = single(async () => {
-  if (!el<HTMLInputElement>("send-cc").checked) return;
-  try {
-    shownCoins = await invoke<Coin[]>("send_coins");
-  } catch (e) {
-    sendResult("danger", String(e));
-    return;
+// Takes coins in order while they fit in one transaction, up to `count`.
+function fitting(ordered: Coin[], count = Infinity): Coin[] {
+  const out: Coin[] = [];
+  let size = 0;
+  for (const c of ordered) {
+    if (out.length >= count || size + c.vbytes > inputBudget) break;
+    size += c.vbytes;
+    out.push(c);
   }
-  const present = new Set(shownCoins.map(outpoint));
-  for (const key of [...chosenCoins]) if (!present.has(key)) chosenCoins.delete(key);
+  return out;
+}
+
+function chooseCoins(coins: Coin[], note?: string): void {
+  chosenCoins.clear();
+  for (const c of coins) chosenCoins.add(outpoint(c));
+  renderCoins();
+  if (note) sendResult("info", note);
+}
+
+function renderCoins(): void {
+  const many = shownCoins.length > QUICK_COUNT;
+  el("cc-tools").hidden = shownCoins.length < 2;
+  el("cc-search").hidden = shownCoins.length <= 10;
+  el("cc-help").textContent = many
+    ? `${shownCoins.length.toLocaleString()} coins. Choose them in bulk here instead of one by one. One transaction holds about ${Math.floor(inputBudget / 148)} of the common kind; combine the rest in another payment.`
+    : "Choose coins in bulk, or tick them below.";
+  const q = el<HTMLInputElement>("cc-search").value.trim().toLowerCase();
+  const matching = q
+    ? shownCoins.filter((c) => [c.address, c.label, c.amount].some((t) => t.toLowerCase().includes(q)))
+    : shownCoins;
+  // Chosen coins first, so a bulk choice shows what it took.
+  const ordered = [...matching.filter((c) => chosenCoins.has(outpoint(c))), ...matching.filter((c) => !chosenCoins.has(outpoint(c)))];
+  const listed = ordered.slice(0, LIST_LIMIT);
+  el("cc-more").hidden = listed.length === matching.length;
+  el("cc-more").textContent = `Showing ${listed.length} of ${matching.length.toLocaleString()} coins. Search, or use the buttons above to choose among all of them.`;
   el("send-coins-empty").hidden = shownCoins.length > 0;
   el("send-coin-list").replaceChildren(
-    ...shownCoins.map((c) => {
+    ...listed.map((c) => {
       const row = document.createElement("label");
       row.className = "list-row";
       const box = document.createElement("input");
@@ -2206,8 +2263,9 @@ const refreshCoins = single(async () => {
       const amount = amountNode(c.amount);
       const meta = document.createElement("span");
       meta.className = "meta is-mono";
-      meta.textContent = c.label ? `${c.label} · ${shorten(c.address, 10, 6)}` : shorten(c.address, 14, 8);
-      meta.title = c.address;
+      const address = c.address || "No address (pay to public key)";
+      meta.textContent = c.label ? `${c.label} · ${shorten(address, 10, 6)}` : shorten(address, 14, 8);
+      meta.title = address;
       body.append(amount, meta);
       const trail = document.createElement("span");
       trail.className = "trail t-sm muted";
@@ -2217,6 +2275,87 @@ const refreshCoins = single(async () => {
     }),
   );
   showCoinSum();
+}
+
+const refreshCoins = single(async () => {
+  if (!el<HTMLInputElement>("send-cc").checked) return;
+  try {
+    const list = await invoke<CoinList>("send_coins");
+    shownCoins = list.coins;
+    inputBudget = list.input_budget;
+  } catch (e) {
+    sendResult("danger", String(e));
+    return;
+  }
+  const present = new Set(shownCoins.map(outpoint));
+  for (const key of [...chosenCoins]) if (!present.has(key)) chosenCoins.delete(key);
+  renderCoins();
+});
+
+el("cc-search").addEventListener("input", () => renderCoins());
+el("cc-clear").addEventListener("click", () => chooseCoins([]));
+el("cc-smallest").addEventListener("click", () => chooseCoins(fitting([...shownCoins].sort(ascending), QUICK_COUNT)));
+el("cc-largest").addEventListener("click", () =>
+  chooseCoins(fitting([...shownCoins].sort(ascending).reverse(), QUICK_COUNT)),
+);
+el("cc-fit").addEventListener("click", () => {
+  const picked = fitting([...shownCoins].sort(ascending));
+  chooseCoins(
+    picked,
+    picked.length < shownCoins.length
+      ? `Chose the ${picked.length.toLocaleString()} smallest coins that fit in one transaction; ${(shownCoins.length - picked.length).toLocaleString()} are left for another.`
+      : undefined,
+  );
+});
+
+// The fewest, largest coins that cover the amounts typed, with a margin for
+// the fee; the wallet works out the real fee.
+el("cc-enough").addEventListener("click", () => {
+  const amounts = [...el("recipients").querySelectorAll<HTMLInputElement>(".r-amount")].map((i) => i.value.trim());
+  const total = amounts.every((a) => a !== "") ? sumAmounts(amounts) : null;
+  const need = total === null ? null : amountUnits(total);
+  if (need === null || need <= 0n) {
+    sendResult("danger", "Enter the amounts first.");
+    return;
+  }
+  const margin = 100_000n; // 0.0001 B3
+  const picked: Coin[] = [];
+  let have = 0n;
+  for (const c of fitting([...shownCoins].sort(ascending).reverse())) {
+    if (have >= need + margin) break;
+    picked.push(c);
+    have += units(c);
+  }
+  if (have < need + margin) {
+    chooseCoins([]);
+    sendResult("danger", "The coins that fit in one transaction do not add up to that amount.");
+    return;
+  }
+  chooseCoins(picked);
+});
+
+// Combining many small coins into one: the form pays their total to a new
+// address of this wallet, with the fee taken from it. Nothing is sent until
+// it is reviewed and approved.
+el("cc-combine").addEventListener("click", async () => {
+  const picked = chosenList();
+  const total = sumAmounts(picked.map((c) => c.amount));
+  if (!picked.length || total === null) return;
+  try {
+    const to = await invoke<{ address: string }>("receive_new", { label: "Combined coins", amount: "", message: "" });
+    el("recipients").replaceChildren();
+    const block = addRecipient();
+    block.querySelector<HTMLInputElement>(".r-address")!.value = to.address;
+    block.querySelector<HTMLInputElement>(".r-amount")!.value = total;
+    block.querySelector<HTMLInputElement>(".r-subtract")!.checked = true;
+    sendResult(
+      "info",
+      `The form now pays the ${plural(picked.length, "chosen coin")} to a new address of this wallet, labelled "Combined coins", with the fee taken from the amount. Review the payment to combine them.`,
+    );
+    el<HTMLFormElement>("send").scrollIntoView({ block: "start" });
+  } catch (e) {
+    sendResult("danger", String(e));
+  }
 });
 
 el("send-cc").addEventListener("change", () => {

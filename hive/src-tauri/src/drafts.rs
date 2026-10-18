@@ -18,6 +18,8 @@ pub struct OutputLine {
     /// B3 as an exact decimal string (9 places), never a float.
     pub amount: String,
     pub change: bool,
+    /// The address is this wallet's own, so the amount stays in it.
+    pub mine: bool,
 }
 
 /// What the approval window shows. The transaction id is known only once
@@ -168,6 +170,7 @@ mod tests {
                 address: "a".into(),
                 amount: "1.000000000".into(),
                 change: false,
+                mine: false,
             }],
             fee: "0.000010000".into(),
             inputs: 1,

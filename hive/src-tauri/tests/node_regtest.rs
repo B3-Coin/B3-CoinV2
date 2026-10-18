@@ -743,6 +743,12 @@ fn payments_split_fees_choose_coins_and_save_labels() {
     };
     let (a, b) = (fresh(), fresh());
 
+    // Every coin is sized by a script type the estimate knows.
+    assert!(wallet::coins(client, W)
+        .unwrap()
+        .iter()
+        .all(|c| matches!(c.vbytes, 58 | 68 | 91 | 148)));
+
     // Coin control: three chosen coins (0.05 B3 each on regtest), nothing
     // else added.
     let chosen: Vec<Outpoint> = wallet::coins(client, W).unwrap()[..3]
@@ -784,6 +790,8 @@ fn payments_split_fees_choose_coins_and_save_labels() {
     // The fee came out of Alice's amount, not on top.
     let line = |addr: &str| summary.outputs.iter().find(|o| o.address == addr).unwrap();
     assert_eq!(line(&b).amount, "0.025000000");
+    // Both addresses are this wallet's, and the approval window says so.
+    assert!(line(&a).mine && line(&b).mine);
     let alice: f64 = line(&a).amount.parse().unwrap();
     let fee: f64 = summary.fee.parse().unwrap();
     assert!(
@@ -915,6 +923,25 @@ fn staking_unlocks_only_to_create_and_start() {
     // Locked, the node cannot tell whose key is bound.
     assert!(finality.bound && finality.key_is_ours.is_none());
     assert!(!info.staking.running);
+
+    // A payment never spends a stake, even when a page names its outpoint:
+    // that would unstake it.
+    let to = admin.call_wallet(W, "getnewaddress", json!([])).unwrap();
+    let unstake = wallet::Payment {
+        recipients: vec![wallet::Recipient {
+            address: to.as_str().unwrap().into(),
+            amount: "1".into(),
+            ..Default::default()
+        }],
+        coins: vec![Outpoint {
+            txid: info.stakes[0].txid.clone(),
+            vout: info.stakes[0].vout,
+        }],
+        ..Default::default()
+    };
+    assert!(wallet::prepare_payment(client, W, "regtest", &unstake)
+        .unwrap_err()
+        .contains("can no longer be spent"));
 
     // Starting needs the passphrase, and leaves the wallet locked but staking.
     assert!(stake::start(client, W, None)

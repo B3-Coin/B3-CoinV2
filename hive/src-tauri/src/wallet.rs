@@ -438,6 +438,61 @@ pub(crate) fn funding_args(payment: &Payment) -> Result<(Value, Vec<(String, Str
     Ok((json!([inputs, outputs, 0, options]), labels))
 }
 
+/// The unsigned transaction inside a PSBT (BIP 174 global key 0x00), as
+/// hex. decodepsbt would also decode every input's previous transaction,
+/// which for hundreds of legacy inputs is tens of megabytes of JSON.
+pub(crate) fn psbt_unsigned_tx(psbt: &str) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(psbt)
+        .map_err(|_| PSBT_UNREADABLE)?;
+    let mut map = Cursor(bytes.strip_prefix(b"psbt\xff").ok_or(PSBT_UNREADABLE)?);
+    loop {
+        let key_len = map.compact_size()?;
+        if key_len == 0 {
+            return Err(PSBT_UNREADABLE.into()); // the end of the global map
+        }
+        let key = map.take(key_len)?;
+        let value_len = map.compact_size()?;
+        let value = map.take(value_len)?;
+        if key == [0x00] {
+            return Ok(value.iter().map(|b| format!("{b:02x}")).collect());
+        }
+    }
+}
+
+const PSBT_UNREADABLE: &str = "The funded transaction could not be read.";
+
+/// Reads a byte string from the front.
+struct Cursor<'a>(&'a [u8]);
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+        if len > self.0.len() {
+            return Err(PSBT_UNREADABLE.into());
+        }
+        let (part, rest) = self.0.split_at(len);
+        self.0 = rest;
+        Ok(part)
+    }
+
+    /// A Bitcoin compact-size integer.
+    fn compact_size(&mut self) -> Result<usize, String> {
+        let width = match self.take(1)?[0] {
+            0xfd => 2,
+            0xfe => 4,
+            0xff => 8,
+            n => return Ok(n as usize),
+        };
+        let value = self
+            .take(width)?
+            .iter()
+            .rev()
+            .fold(0u64, |v, b| (v << 8) | u64::from(*b));
+        usize::try_from(value).map_err(|_| PSBT_UNREADABLE.into())
+    }
+}
+
 /// An exact decimal amount (at most 9 places) in base units.
 fn base_units(amount: &str) -> Option<u128> {
     let (whole, frac) = amount.split_once('.').unwrap_or((amount, ""));
@@ -499,6 +554,12 @@ pub fn prepare_payment(
     payment: &Payment,
 ) -> Result<(SendSummary, Funded), String> {
     let (args, labels) = funding_args(payment)?;
+    if !payment.coins.is_empty() {
+        // The page offers only listunspent's coins, but it is not trusted:
+        // a stake chosen here would be spent, which unstakes it.
+        let spendable = coins(client, wallet).map_err(|e| e.to_string())?;
+        check_chosen(&spendable, &payment.coins, payment.recipients.len())?;
+    }
     let funded = client
         .call_wallet(wallet, "walletcreatefundedpsbt", args)
         // The node's wording comes from Bitcoin Core.
@@ -514,9 +575,14 @@ pub fn prepare_payment(
         .to_owned();
 
     let decoded = client
-        .call("decodepsbt", json!([psbt]))
+        .call("decoderawtransaction", json!([psbt_unsigned_tx(&psbt)?]))
         .map_err(|e| e.to_string())?;
-    let (inputs, outputs) = parse_tx(&decoded["tx"], change_pos)?;
+    let (inputs, mut outputs) = parse_tx(&decoded, change_pos)?;
+    for line in outputs.iter_mut().filter(|l| !l.change) {
+        line.mine = client
+            .call_wallet(wallet, "getaddressinfo", json!([line.address]))
+            .is_ok_and(|info| info["ismine"] == Value::Bool(true));
+    }
     Ok((
         SendSummary {
             chain: chain.to_owned(),
@@ -565,6 +631,7 @@ pub(crate) fn parse_tx(
                 .to_owned(),
             amount: decimal(&out["value"]).map_err(|e| e.to_string())?,
             change: n == change_pos,
+            mine: false,
         });
     }
     Ok((inputs, outputs))
@@ -636,6 +703,103 @@ pub struct Coin {
     pub label: String,
     pub amount: String,
     pub confirmations: u64,
+    /// The virtual bytes spending it adds to a transaction (an estimate).
+    pub vbytes: u64,
+}
+
+/// The coins for coin control, and how many virtual bytes of them fit in one
+/// transaction paying one address plus change.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CoinList {
+    pub coins: Vec<Coin>,
+    pub input_budget: u64,
+}
+
+/// B3's standard-transaction limit: MAX_STANDARD_TX_WEIGHT / 4. The node
+/// refuses to relay anything larger.
+pub const MAX_TX_VBYTES: u64 = 100_000;
+/// Version, lock time and the input and output counts.
+const TX_OVERHEAD_VBYTES: u64 = 11;
+/// The largest common output (pay to taproot); others are smaller.
+const OUTPUT_VBYTES: u64 = 43;
+
+/// The size estimate for one payment: its chosen coins, one output per
+/// recipient and one for change.
+fn tx_vbytes(inputs: u64, recipients: usize) -> u64 {
+    TX_OVERHEAD_VBYTES + inputs + OUTPUT_VBYTES * (recipients as u64 + 1)
+}
+
+/// The virtual bytes one input adds when it spends this script, signed as
+/// the wallet signs (72-byte signatures). Scripts it cannot tell get a
+/// generous figure, so a selection errs on the small side.
+pub(crate) fn input_vbytes(script: &str, desc: &str) -> u64 {
+    let is = |prefix: &str, len: usize, suffix: &str| {
+        script.len() == len && script.starts_with(prefix) && script.ends_with(suffix)
+    };
+    if is("76a914", 50, "88ac") {
+        // Pay to public key hash: the key is in the input, 33 bytes or 65.
+        let key = desc
+            .split_once("pkh(")
+            .map(|(_, k)| k.rsplit(']').next().unwrap_or(k))
+            .and_then(|k| k.split(')').next());
+        return match key {
+            Some(k) if k.len() == 66 => 148,
+            _ => 180,
+        };
+    }
+    if is("21", 70, "ac") {
+        return 114; // pay to a compressed public key, as legacy stake rewards are
+    }
+    if is("41", 134, "ac") {
+        return 146; // pay to an uncompressed public key
+    }
+    if is("0014", 44, "") {
+        return 68;
+    }
+    if is("5120", 68, "") {
+        return 58;
+    }
+    if is("a914", 46, "87") && desc.starts_with("sh(wpkh(") {
+        return 91;
+    }
+    300
+}
+
+/// Refuses chosen coins the wallet cannot spend (gone, reserved, a stake or
+/// an asset) and selections too large for one standard transaction.
+pub(crate) fn check_chosen(
+    spendable: &[Coin],
+    chosen: &[Outpoint],
+    recipients: usize,
+) -> Result<(), String> {
+    let sizes: std::collections::HashMap<(&str, u64), u64> = spendable
+        .iter()
+        .map(|c| ((c.txid.as_str(), c.vout), c.vbytes))
+        .collect();
+    let mut inputs = 0;
+    for coin in chosen {
+        inputs += sizes.get(&(coin.txid.as_str(), coin.vout)).ok_or(
+            "A chosen coin can no longer be spent from this wallet. Choose the coins again.",
+        )?;
+    }
+    let size = tx_vbytes(inputs, recipients);
+    if size > MAX_TX_VBYTES {
+        return Err(format!(
+            "{} coins are too many for one transaction: about {} kB, and the limit is {} kB. Choose fewer and combine the rest in another payment.",
+            chosen.len(),
+            size.div_ceil(1000),
+            MAX_TX_VBYTES / 1000
+        ));
+    }
+    Ok(())
+}
+
+/// The coins for coin control; see [`coins`].
+pub fn coin_list(client: &Client, wallet: &str) -> Result<CoinList, RpcError> {
+    Ok(CoinList {
+        coins: coins(client, wallet)?,
+        input_budget: MAX_TX_VBYTES - tx_vbytes(0, 1),
+    })
 }
 
 /// The wallet's spendable coins, largest first. Coins held back for a
@@ -668,6 +832,10 @@ pub(crate) fn parse_coins(v: &Value) -> Result<Vec<Coin>, RpcError> {
             label: u["label"].as_str().unwrap_or_default().to_owned(),
             amount: decimal(&u["amount"])?,
             confirmations: u["confirmations"].as_u64().unwrap_or_default(),
+            vbytes: input_vbytes(
+                u["scriptPubKey"].as_str().unwrap_or_default(),
+                u["desc"].as_str().unwrap_or_default(),
+            ),
         });
     }
     Ok(coins)
@@ -795,6 +963,91 @@ mod tests {
     }
 
     #[test]
+    fn the_unsigned_transaction_is_read_from_a_psbt() {
+        use base64::Engine;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let tx: Vec<u8> = (0..300u16).map(|n| n as u8).collect();
+        let mut psbt = b"psbt\xff".to_vec();
+        // Another global key first, then the transaction with a 3-byte length.
+        psbt.extend([0x02, 0xfc, 0x01, 0x01, 0xaa]);
+        psbt.extend([0x01, 0x00, 0xfd, 0x2c, 0x01]);
+        psbt.extend(&tx);
+        psbt.push(0x00);
+        let hex: String = tx.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(psbt_unsigned_tx(&b64(&psbt)).unwrap(), hex);
+
+        assert!(psbt_unsigned_tx("not base64!").is_err());
+        assert!(psbt_unsigned_tx(&b64(b"psbx\xff\x00")).is_err());
+        // No transaction before the map ends, or a length past the end.
+        assert!(psbt_unsigned_tx(&b64(b"psbt\xff\x00")).is_err());
+        assert!(psbt_unsigned_tx(&b64(b"psbt\xff\x01\x00\x05\x01")).is_err());
+    }
+
+    #[test]
+    fn inputs_are_sized_by_their_script() {
+        let h160 = "ab".repeat(20);
+        let p2pkh = format!("76a914{h160}88ac");
+        let key = format!("02{}", "cd".repeat(32));
+        let wide = format!("04{}", "cd".repeat(64));
+        assert_eq!(
+            input_vbytes(&p2pkh, &format!("pkh([d34db33f/44h/1h/0h/0/1]{key})#x")),
+            148
+        );
+        assert_eq!(input_vbytes(&p2pkh, &format!("pkh({key})#x")), 148);
+        // An uncompressed key, or none to tell by, is the larger input.
+        assert_eq!(input_vbytes(&p2pkh, &format!("pkh({wide})#x")), 180);
+        assert_eq!(input_vbytes(&p2pkh, ""), 180);
+        assert_eq!(input_vbytes(&format!("21{key}ac"), ""), 114);
+        assert_eq!(input_vbytes(&format!("41{wide}ac"), ""), 146);
+        assert_eq!(input_vbytes(&format!("0014{h160}"), ""), 68);
+        assert_eq!(input_vbytes(&format!("5120{}", "ef".repeat(32)), ""), 58);
+        assert_eq!(
+            input_vbytes(&format!("a914{h160}87"), "sh(wpkh(02aa))#x"),
+            91
+        );
+        assert_eq!(
+            input_vbytes(&format!("a914{h160}87"), "sh(multi(1,02aa))#x"),
+            300
+        );
+        assert_eq!(input_vbytes("6a00", ""), 300);
+    }
+
+    #[test]
+    fn chosen_coins_must_be_spendable_and_fit_one_transaction() {
+        let coin = |n: u64| Coin {
+            txid: format!("{n:064x}"),
+            vout: 0,
+            address: String::new(),
+            label: String::new(),
+            amount: "0.1".into(),
+            confirmations: 1,
+            vbytes: 148,
+        };
+        let spendable: Vec<Coin> = (0..800).map(coin).collect();
+        let pick = |range: std::ops::Range<u64>| -> Vec<Outpoint> {
+            range
+                .map(|n| Outpoint {
+                    txid: format!("{n:064x}"),
+                    vout: 0,
+                })
+                .collect()
+        };
+        assert!(check_chosen(&spendable, &pick(0..3), 1).is_ok());
+        // A coin listunspent does not offer, such as a stake, is refused.
+        let mut stake = pick(0..1);
+        stake[0].vout = 1;
+        assert!(check_chosen(&spendable, &stake, 1)
+            .unwrap_err()
+            .contains("can no longer be spent"));
+        // 675 P2PKH inputs fit; 676 do not.
+        let budget = MAX_TX_VBYTES - tx_vbytes(0, 1);
+        assert_eq!(budget / 148, 675);
+        assert!(check_chosen(&spendable, &pick(0..675), 1).is_ok());
+        let err = check_chosen(&spendable, &pick(0..676), 1).unwrap_err();
+        assert!(err.starts_with("676 coins are too many"), "{err}");
+    }
+
+    #[test]
     fn payments_become_exact_funding_arguments() {
         let mut first = to(" a1 ", "1.5");
         first.label = " Rent ".into();
@@ -881,6 +1134,7 @@ lines"
             address: address.into(),
             amount: amount.into(),
             change,
+            mine: false,
         };
         let coin = |vout| Outpoint {
             txid: "aa".repeat(32),

@@ -491,12 +491,12 @@ async fn stake_stop(core: State<'_, Arc<Core>>) -> Result<(), String> {
 
 /// The coins the page's wallet can spend, for coin control.
 #[tauri::command]
-async fn send_coins(core: State<'_, Arc<Core>>) -> Result<Vec<wallet::Coin>, String> {
+async fn send_coins(core: State<'_, Arc<Core>>) -> Result<wallet::CoinList, String> {
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
-        wallet::coins(client, &name).map_err(|e| e.to_string())
+        wallet::coin_list(client, &name).map_err(|e| e.to_string())
     })
     .await
 }

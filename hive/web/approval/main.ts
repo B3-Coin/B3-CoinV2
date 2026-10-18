@@ -3,7 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { el, formatAmount, initTheme, sumAmounts } from "../shared/ui";
 
-type OutputLine = { address: string; amount: string; change: boolean };
+type OutputLine = { address: string; amount: string; change: boolean; mine: boolean };
 type Summary = { chain: string; wallet: string; outputs: OutputLine[]; fee: string; inputs: number };
 // Mirrors drafts::Request in src-tauri/src/drafts.rs.
 type Request =
@@ -42,17 +42,25 @@ const walletName = (w: string): string => (w === "" ? "the default wallet" : `wa
 
 function showPay(s: Summary): void {
   const paid = s.outputs.filter((o) => !o.change);
-  const sent = sumAmounts(paid.map((o) => o.amount));
-  const total = sumAmounts([...paid.map((o) => o.amount), s.fee]);
+  // Payments to this wallet's own addresses stay in it.
+  const away = paid.filter((o) => !o.mine);
+  const sent = sumAmounts(away.map((o) => o.amount));
+  const kept = sumAmounts(paid.filter((o) => o.mine).map((o) => o.amount));
+  const total = sumAmounts([...away.map((o) => o.amount), s.fee]);
 
   // The title restates what leaves the wallet, as b3_docker's confirmations do.
-  el("title").textContent = sent === null ? "Approve this payment?" : `Send ${formatAmount(sent)}?`;
+  el("title").textContent =
+    sent === null || kept === null
+      ? "Approve this payment?"
+      : away.length === 0
+        ? `Move ${formatAmount(kept)} within this wallet?`
+        : `Send ${formatAmount(sent)}?`;
   el("from").textContent = `From ${walletName(s.wallet)} on ${s.chain}`;
   // Payments first, change last, so the money leaving reads first.
   const ordered = [...paid, ...s.outputs.filter((o) => o.change)];
   el("outputs").replaceChildren(
     ...ordered.map((o) =>
-      row(o.change ? "Change back to this wallet" : "Pay", formatAmount(o.amount, 9), o.address),
+      row(o.change ? "Change back to this wallet" : o.mine ? "To this wallet" : "Pay", formatAmount(o.amount, 9), o.address),
     ),
   );
   el("fee").textContent = formatAmount(s.fee, 9);

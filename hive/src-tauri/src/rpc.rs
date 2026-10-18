@@ -172,7 +172,12 @@ impl Client {
             .send_json(&request)
             .map_err(|e| RpcError::Transport(e.to_string()))?;
         let status = response.status().as_u16();
-        let body: Value = match response.body_mut().read_json() {
+        let body: Value = match response
+            .body_mut()
+            .with_config()
+            .limit(MAX_REPLY_BYTES)
+            .read_json()
+        {
             Ok(body) => body,
             Err(_) if status != 200 => return Err(RpcError::Http(status)),
             Err(e) => return Err(RpcError::BadReply(e.to_string())),
@@ -180,6 +185,10 @@ impl Client {
         parse_reply(body)
     }
 }
+
+/// The largest reply read. A PSBT carries the whole previous transaction of
+/// each legacy input, so one combining hundreds of coins runs to megabytes.
+const MAX_REPLY_BYTES: u64 = 64 * 1024 * 1024;
 
 fn percent_encode(segment: &str) -> String {
     segment

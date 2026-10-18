@@ -316,9 +316,23 @@
                     </span>
                   </label>
                   <div id="send-coins" hidden>
+                    <div class="stack" id="cc-tools" hidden>
+                      <p class="help" id="cc-help"></p>
+                      <div class="btn-row">
+                        <button class="btn btn-secondary btn-sm" type="button" id="cc-enough">Enough for the amount</button>
+                        <button class="btn btn-secondary btn-sm" type="button" id="cc-smallest">Smallest 50</button>
+                        <button class="btn btn-secondary btn-sm" type="button" id="cc-largest">Largest 50</button>
+                        <button class="btn btn-secondary btn-sm" type="button" id="cc-fit">As many as fit</button>
+                        <button class="btn btn-ghost btn-sm" type="button" id="cc-clear">Clear</button>
+                      </div>
+                      <input class="input" id="cc-search" type="search" autocomplete="off" spellcheck="false" placeholder="Search by address, label or amount" hidden />
+                    </div>
                     <div class="row coin-sum"><span class="muted">Chosen</span><span id="send-coins-sum"></span></div>
+                    <p class="help" id="cc-size" hidden></p>
                     <div class="coin-list" id="send-coin-list"></div>
+                    <p class="help mt-2" id="cc-more" hidden></p>
                     <div class="empty empty--tight" id="send-coins-empty" hidden>No coins to spend yet.</div>
+                    <button class="btn btn-secondary btn-sm mt-3" type="button" id="cc-combine" disabled>Combine the chosen coins into one</button>
                   </div>
                 </div>
               </details>

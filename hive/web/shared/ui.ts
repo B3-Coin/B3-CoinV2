@@ -110,6 +110,14 @@ export function amountNode(value: string, extra = "", minDecimals = 2): HTMLSpan
 
 /** Exact sum of decimal amount strings, through integer base units (1 B3 =
  *  10^9). Returns null if any value is not a plain decimal. */
+/** An exact amount in base units (0.000000001 B3), or null if it is not one. */
+export function amountUnits(value: string): bigint | null {
+  const p = parts(value);
+  if (!p) return null;
+  const units = BigInt(p.int) * 1_000_000_000n + BigInt(p.frac);
+  return p.neg ? -units : units;
+}
+
 export function sumAmounts(values: string[]): string | null {
   let total = 0n;
   for (const value of values) {
