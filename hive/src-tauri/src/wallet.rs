@@ -1,5 +1,8 @@
-//! Wallet calls for the spike: one regtest wallet, its balance, test funding,
+//! Wallet calls: picking the wallet, its balance, activity, regtest funding,
 //! and building a signed send for the approval window.
+//!
+//! Until the wallet picker (phase 3), mainnet uses the first wallet the node
+//! loaded and never creates one; regtest creates its own test wallet.
 
 use std::sync::Mutex;
 
@@ -21,7 +24,22 @@ const RPC_WALLET_ALREADY_LOADED: i64 = -35;
 /// make the second fail on the database lock instead of "already loaded".
 static LOADING: Mutex<()> = Mutex::new(());
 
-/// Loads the spike wallet, creating it on first use.
+/// The wallet the pages use: on regtest the test wallet, created on first
+/// use; elsewhere the first loaded wallet, or None when the node loaded none.
+pub fn select(client: &Client, chain: &str) -> Result<Option<String>, RpcError> {
+    if chain == "regtest" {
+        ensure_wallet(client)?;
+        return Ok(Some(SPIKE_WALLET.to_owned()));
+    }
+    let loaded = client.call("listwallets", json!([]))?;
+    Ok(loaded
+        .as_array()
+        .and_then(|w| w.first())
+        .and_then(Value::as_str)
+        .map(str::to_owned))
+}
+
+/// Loads the regtest test wallet, creating it on first use.
 pub fn ensure_wallet(client: &Client) -> Result<(), RpcError> {
     let _one_at_a_time = LOADING.lock().unwrap_or_else(|e| e.into_inner());
     let loaded = client.call("listwallets", json!([]))?;
@@ -48,15 +66,15 @@ pub fn ensure_wallet(client: &Client) -> Result<(), RpcError> {
 }
 
 /// Spendable and immature balance as exact decimal strings.
-pub fn balances(client: &Client) -> Result<(String, String), RpcError> {
-    let b = client.call_wallet(SPIKE_WALLET, "getbalances", json!([]))?;
+pub fn balances(client: &Client, wallet: &str) -> Result<(String, String), RpcError> {
+    let b = client.call_wallet(wallet, "getbalances", json!([]))?;
     let mine = &b["mine"];
     Ok((decimal(&mine["trusted"])?, decimal(&mine["immature"])?))
 }
 
 /// Regtest only: mines FUND_BLOCKS blocks to a fresh wallet address.
-pub fn fund_regtest(client: &Client) -> Result<(), RpcError> {
-    let address = client.call_wallet(SPIKE_WALLET, "getnewaddress", json!([]))?;
+pub fn fund_regtest(client: &Client, wallet: &str) -> Result<(), RpcError> {
+    let address = client.call_wallet(wallet, "getnewaddress", json!([]))?;
     client
         .call("generatetoaddress", json!([FUND_BLOCKS, address]))
         .map(|_| ())
@@ -89,6 +107,7 @@ pub fn parse_amount(input: &str) -> Result<String, String> {
 /// Nothing is broadcast: the caller stores the hex as a draft.
 pub fn prepare_send(
     client: &Client,
+    wallet: &str,
     chain: &str,
     address: &str,
     amount: &str,
@@ -100,7 +119,7 @@ pub fn prepare_send(
     }
     let call = |method: &str, params: Value| {
         client
-            .call_wallet(SPIKE_WALLET, method, params)
+            .call_wallet(wallet, method, params)
             .map_err(|e| e.to_string())
     };
 
@@ -150,7 +169,7 @@ pub fn prepare_send(
     Ok((
         SendSummary {
             chain: chain.to_owned(),
-            wallet: SPIKE_WALLET.to_owned(),
+            wallet: wallet.to_owned(),
             txid,
             outputs,
             fee,
@@ -182,9 +201,9 @@ pub struct ActivityEntry {
 pub const ACTIVITY_LIMIT: u64 = 500;
 
 /// The newest `count` (at most ACTIVITY_LIMIT) lines, newest first.
-pub fn activity(client: &Client, count: u64) -> Result<Vec<ActivityEntry>, RpcError> {
+pub fn activity(client: &Client, wallet: &str, count: u64) -> Result<Vec<ActivityEntry>, RpcError> {
     let count = count.clamp(1, ACTIVITY_LIMIT);
-    let list = client.call_wallet(SPIKE_WALLET, "listtransactions", json!(["*", count]))?;
+    let list = client.call_wallet(wallet, "listtransactions", json!(["*", count]))?;
     let list = list
         .as_array()
         .ok_or_else(|| RpcError::BadReply("listtransactions did not return a list".into()))?;

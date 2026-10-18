@@ -175,6 +175,7 @@ function render(status: NodeStatus): void {
       el("restart-node").hidden = false;
       badge("no-node", "Not running");
       el("wallet").hidden = true;
+      el("no-wallet").hidden = true;
       el("recent").hidden = true;
       el("node-warnings").hidden = true;
       break;
@@ -185,8 +186,10 @@ function render(status: NodeStatus): void {
 
 async function refreshWallet(): Promise<void> {
   try {
-    const w = await invoke<WalletOverview>("wallet_overview");
-    el("wallet").hidden = false;
+    const w = await invoke<WalletOverview | null>("wallet_overview");
+    el("no-wallet").hidden = w !== null;
+    el("wallet").hidden = w === null;
+    if (!w) return;
     el("wallet-name").textContent = `Wallet ${w.wallet}`;
     el("spendable").replaceChildren(amountNode(w.spendable, "amt-hero"));
     const maturing = !/^0*\.?0*$/.test(w.immature);

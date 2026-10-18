@@ -24,7 +24,7 @@ use tauri::{
 };
 
 use drafts::{DraftStore, DraftView};
-use node::{Node, NodeConfig, NodeStatus};
+use node::{Network, Node, NodeConfig, NodeStatus};
 use rpc::RpcError;
 use update::{HttpsFetcher, UpdateStatus, Updater};
 
@@ -103,20 +103,37 @@ fn restart_node(app: AppHandle, window: Window, core: State<'_, Arc<Core>>) -> R
     Ok(())
 }
 
+/// The wallet the pages use, or an error the page can show. Mainnet uses
+/// the first wallet the node loaded; the picker comes with phase 3.
+fn page_wallet(node: &Node) -> Result<(&rpc::Client, String), String> {
+    let client = node.client().ok_or("The node is not ready yet.")?;
+    let chain = node.chain().unwrap_or_default();
+    match wallet::select(client, &chain).map_err(|e| e.to_string())? {
+        Some(name) => Ok((client, name)),
+        None => Err(NO_WALLET.into()),
+    }
+}
+
+const NO_WALLET: &str = "No wallet is loaded.";
+
+/// None when the node has no wallet loaded.
 #[tauri::command]
-async fn wallet_overview(core: State<'_, Arc<Core>>) -> Result<WalletOverview, String> {
+async fn wallet_overview(core: State<'_, Arc<Core>>) -> Result<Option<WalletOverview>, String> {
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
-        let client = node.client().ok_or("The node is not ready yet.")?;
-        wallet::ensure_wallet(client).map_err(|e| e.to_string())?;
-        let (spendable, immature) = wallet::balances(client).map_err(|e| e.to_string())?;
-        Ok(WalletOverview {
-            wallet: wallet::SPIKE_WALLET.into(),
+        let (client, name) = match page_wallet(&node) {
+            Ok(found) => found,
+            Err(e) if e == NO_WALLET => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let (spendable, immature) = wallet::balances(client, &name).map_err(|e| e.to_string())?;
+        Ok(Some(WalletOverview {
+            wallet: name,
             spendable,
             immature,
             can_fund: node.chain().as_deref() == Some("regtest"),
-        })
+        }))
     })
     .await
 }
@@ -129,9 +146,8 @@ async fn dev_fund(core: State<'_, Arc<Core>>) -> Result<(), String> {
         if node.chain().as_deref() != Some("regtest") {
             return Err("Funding by mining is only available on regtest.".into());
         }
-        let client = node.client().ok_or("The node is not ready yet.")?;
-        wallet::ensure_wallet(client).map_err(|e| e.to_string())?;
-        wallet::fund_regtest(client).map_err(|e| e.to_string())
+        let (client, name) = page_wallet(&node)?;
+        wallet::fund_regtest(client, &name).map_err(|e| e.to_string())
     })
     .await
 }
@@ -145,9 +161,8 @@ async fn wallet_activity(
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
-        let client = node.client().ok_or("The node is not ready yet.")?;
-        wallet::ensure_wallet(client).map_err(|e| e.to_string())?;
-        wallet::activity(client, count).map_err(|e| e.to_string())
+        let (client, name) = page_wallet(&node)?;
+        wallet::activity(client, &name, count).map_err(|e| e.to_string())
     })
     .await
 }
@@ -188,10 +203,9 @@ async fn draft_send(
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
-        let client = node.client().ok_or("The node is not ready yet.")?;
+        let (client, name) = page_wallet(&node)?;
         let chain = node.chain().unwrap_or_default();
-        wallet::ensure_wallet(client).map_err(|e| e.to_string())?;
-        let (summary, hex) = wallet::prepare_send(client, &chain, &address, &amount)?;
+        let (summary, hex) = wallet::prepare_send(client, &name, &chain, &address, &amount)?;
         core.drafts
             .lock()
             .unwrap()
@@ -527,20 +541,42 @@ async fn blocking<T: Send + 'static>(
 
 // ---- startup ----------------------------------------------------------------
 
-/// Spike configuration: the node is the b3coind packaged next to the app's
-/// own executable (a Tauri sidecar), unless B3_HIVE_B3COIND names another one
-/// for development. The regtest datadir defaults to the app's data directory
-/// and can be moved with B3_HIVE_DATADIR.
+/// The node is the b3coind packaged next to the app's own executable (a
+/// Tauri sidecar), unless B3_HIVE_B3COIND names another one for development.
+/// It runs B3 mainnet in the legacy client's data folder, so a Qt user finds
+/// their chain and wallets. B3_HIVE_NETWORK=regtest is for development: a
+/// peerless regtest node in the app's own data directory. B3_HIVE_DATADIR
+/// moves the data folder for either.
 fn node_config(app: &tauri::App) -> Result<NodeConfig, Box<dyn std::error::Error>> {
     let b3coind = match std::env::var_os("B3_HIVE_B3COIND") {
         Some(path) => PathBuf::from(path),
         None => packaged_sidecar("b3-hive-node")?,
     };
-    let datadir = match std::env::var_os("B3_HIVE_DATADIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => app.path().app_data_dir()?.join("spike-regtest"),
+    let network = Network::from_setting(std::env::var("B3_HIVE_NETWORK").ok().as_deref())?;
+    let datadir = match (std::env::var_os("B3_HIVE_DATADIR"), network) {
+        (Some(dir), _) => PathBuf::from(dir),
+        (None, Network::Regtest) => app.path().app_data_dir()?.join("spike-regtest"),
+        (None, Network::Main) => legacy_datadir(
+            std::env::consts::OS,
+            &app.path().home_dir()?,
+            &app.path().data_dir()?,
+        ),
     };
-    Ok(NodeConfig { b3coind, datadir })
+    Ok(NodeConfig {
+        b3coind,
+        datadir,
+        network,
+    })
+}
+
+/// The legacy B3-CoinV2 client's data folder, which b3coind also defaults
+/// to: %APPDATA%\B3-CoinV2, ~/Library/Application Support/B3-CoinV2, or
+/// ~/.B3-CoinV2. `data` is the platform's roaming application data folder.
+fn legacy_datadir(os: &str, home: &std::path::Path, data: &std::path::Path) -> PathBuf {
+    match os {
+        "windows" | "macos" => data.join("B3-CoinV2"),
+        _ => home.join(".B3-CoinV2"),
+    }
 }
 
 /// The update helper is packaged next to the app like b3coind, unless
@@ -656,4 +692,35 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn mainnet_uses_the_legacy_data_folder() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            legacy_datadir("linux", home, Path::new("/home/u/.local/share")),
+            Path::new("/home/u/.B3-CoinV2")
+        );
+        assert_eq!(
+            legacy_datadir(
+                "macos",
+                Path::new("/Users/u"),
+                Path::new("/Users/u/Library/Application Support")
+            ),
+            Path::new("/Users/u/Library/Application Support/B3-CoinV2")
+        );
+        assert_eq!(
+            legacy_datadir(
+                "windows",
+                Path::new("C:/Users/u"),
+                Path::new("C:/Users/u/AppData/Roaming")
+            ),
+            Path::new("C:/Users/u/AppData/Roaming/B3-CoinV2")
+        );
+    }
 }

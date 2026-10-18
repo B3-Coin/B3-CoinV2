@@ -2,12 +2,13 @@
 //! free loopback port, follows init through the warmup error, follows the
 //! running node's tip until it exits, and stops it.
 //!
-//! Spike scope: regtest only, with no peers (-listen=0 -connect=0 -dnsseed=0),
-//! so development never touches a real B3 network or datadir.
+//! B3 mainnet by default. Regtest is a developer option and runs with no
+//! peers (-listen=0 -connect=0 -dnsseed=0), so development never touches a
+//! real B3 network or datadir.
 
 use std::io::Read;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -64,12 +65,45 @@ pub enum NodeStatus {
     Failed {
         error: String,
     },
+    /// Not started: a fresh mainnet data folder waits for the setup
+    /// wizard's choice between a bootstrap and syncing from peers.
+    Setup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    Main,
+    Regtest,
+}
+
+impl Network {
+    /// B3_HIVE_NETWORK: unset or "main" for mainnet, "regtest" for development.
+    pub fn from_setting(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("") | Some("main") => Ok(Network::Main),
+            Some("regtest") => Ok(Network::Regtest),
+            Some(other) => Err(format!(
+                "B3_HIVE_NETWORK must be main or regtest, not {other:?}"
+            )),
+        }
+    }
+
+    /// Where the chain data lives inside the data folder: mainnet uses the
+    /// folder itself, as the legacy client does.
+    pub fn chain_dir(self, datadir: &Path) -> PathBuf {
+        match self {
+            Network::Main => datadir.to_path_buf(),
+            Network::Regtest => datadir.join("regtest"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub b3coind: PathBuf,
     pub datadir: PathBuf,
+    pub network: Network,
 }
 
 pub struct Node {
@@ -114,6 +148,19 @@ impl Node {
                 port: 0,
             }),
         }
+    }
+
+    /// A node that waits for the setup wizard; nothing runs yet.
+    pub fn waiting_for_setup(config: &NodeConfig) -> Arc<Node> {
+        Arc::new(Node {
+            child: Mutex::new(None),
+            client: None,
+            console: None,
+            status: Mutex::new(NodeStatus::Setup),
+            stderr_tail: Arc::new(Mutex::new(Vec::new())),
+            datadir: config.datadir.clone(),
+            port: 0,
+        })
     }
 
     pub fn status(&self) -> NodeStatus {
@@ -354,14 +401,19 @@ fn node_args(
     console: &Credentials,
     port: u16,
 ) -> Vec<String> {
-    vec![
-        "-regtest".into(),
+    let mut args: Vec<String> = match config.network {
+        Network::Main => vec![],
+        Network::Regtest => vec![
+            "-regtest".into(),
+            "-listen=0".into(),
+            "-connect=0".into(),
+            "-dnsseed=0".into(),
+        ],
+    };
+    args.extend([
         format!("-datadir={}", config.datadir.display()),
         "-server=1".into(),
         "-printtoconsole=0".into(),
-        "-listen=0".into(),
-        "-connect=0".into(),
-        "-dnsseed=0".into(),
         "-rpcbind=127.0.0.1".into(),
         "-rpcallowip=127.0.0.1".into(),
         format!("-rpcport={port}"),
@@ -371,10 +423,11 @@ fn node_args(
         // as does the cookie for b3coin-cli.
         format!("-rpcauth={}", console.rpcauth()),
         "-rpcwhitelistdefault=0".into(),
-        // Plain regtest has no fee history; use the legacy relay floor
-        // (600,000 base units per kvB) that B3 mainnet wallets default to.
+        // Without fee history (regtest, a quiet mainnet) use the legacy relay
+        // floor (600,000 base units per kvB) that B3 mainnet wallets default to.
         "-fallbackfee=0.0006".into(),
-    ]
+    ]);
+    args
 }
 
 /// Asks the OS for a free port. Another process could take it before
@@ -408,6 +461,7 @@ mod tests {
         let config = NodeConfig {
             b3coind: "b3coind".into(),
             datadir: "/tmp/hive".into(),
+            network: Network::Regtest,
         };
         let credentials = Credentials::generate(PAGE_USER).unwrap();
         let console = Credentials::generate(CONSOLE_USER).unwrap();
@@ -454,6 +508,42 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_args_have_no_chain_flag_and_keep_peers() {
+        let config = NodeConfig {
+            b3coind: "b3coind".into(),
+            datadir: "/home/u/.B3-CoinV2".into(),
+            network: Network::Main,
+        };
+        let page = Credentials::generate(PAGE_USER).unwrap();
+        let console = Credentials::generate(CONSOLE_USER).unwrap();
+        let args = node_args(&config, &page, &console, 5000);
+        for absent in [
+            "-regtest",
+            "-listen=0",
+            "-connect=0",
+            "-dnsseed=0",
+            "-testnet",
+        ] {
+            assert!(!args.iter().any(|a| a == absent), "{absent} on mainnet");
+        }
+        assert!(args.contains(&"-datadir=/home/u/.B3-CoinV2".to_owned()));
+        // RPC stays on loopback with the per-launch logins.
+        assert!(args.contains(&"-rpcbind=127.0.0.1".to_owned()));
+        assert!(args.contains(&"-rpcwhitelistdefault=0".to_owned()));
+    }
+
+    #[test]
+    fn the_network_setting_defaults_to_mainnet() {
+        assert_eq!(Network::from_setting(None), Ok(Network::Main));
+        assert_eq!(Network::from_setting(Some("main")), Ok(Network::Main));
+        assert_eq!(Network::from_setting(Some("regtest")), Ok(Network::Regtest));
+        assert!(Network::from_setting(Some("testnet")).is_err());
+        let dir = Path::new("/d");
+        assert_eq!(Network::Main.chain_dir(dir), PathBuf::from("/d"));
+        assert_eq!(Network::Regtest.chain_dir(dir), PathBuf::from("/d/regtest"));
+    }
+
+    #[test]
     fn status_serializes_with_a_phase_tag() {
         let ready = NodeStatus::Ready {
             chain: "regtest".into(),
@@ -476,6 +566,7 @@ mod tests {
         let node = Node::start(&NodeConfig {
             b3coind: dir.join("no-such-b3coind"),
             datadir: dir.clone(),
+            network: Network::Regtest,
         });
         assert!(matches!(node.status(), NodeStatus::Failed { .. }));
         assert!(node.has_exited());

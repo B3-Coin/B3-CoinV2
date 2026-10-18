@@ -12,9 +12,11 @@ use serde_json::json;
 use b3_hive::chain;
 use b3_hive::console;
 use b3_hive::drafts::DraftStore;
-use b3_hive::node::{Node, NodeConfig, NodeStatus};
+use b3_hive::node::{Network, Node, NodeConfig, NodeStatus};
 use b3_hive::rpc::{Client, RpcError};
 use b3_hive::wallet;
+
+const W: &str = wallet::SPIKE_WALLET;
 
 /// A ready regtest node in a fresh temp datadir, stopped and removed on drop.
 struct TestNode {
@@ -33,6 +35,7 @@ impl TestNode {
         let node = Node::start(&NodeConfig {
             b3coind: b3coind.into(),
             datadir: datadir.clone(),
+            network: Network::Regtest,
         });
         let status = node.wait_ready(Duration::from_secs(300), |_| {});
         Some((TestNode { node, datadir }, status))
@@ -113,9 +116,13 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
             load.join().unwrap().unwrap();
         }
     });
-    assert!(wallet::activity(client, 10).unwrap().is_empty());
-    wallet::fund_regtest(client).unwrap();
-    let lines = wallet::activity(client, 10).unwrap();
+    assert_eq!(
+        wallet::select(client, "regtest").unwrap().as_deref(),
+        Some(W)
+    );
+    assert!(wallet::activity(client, W, 10).unwrap().is_empty());
+    wallet::fund_regtest(client, W).unwrap();
+    let lines = wallet::activity(client, W, 10).unwrap();
     assert_eq!(lines.len(), 10);
     // Newest first: the last block mined has one confirmation.
     assert_eq!(lines[0].confirmations, 1);
@@ -180,18 +187,16 @@ fn a_drafted_send_is_submitted_exactly_once() {
 
     wallet::ensure_wallet(client).unwrap();
     wallet::ensure_wallet(client).unwrap(); // loading twice is fine
-    wallet::fund_regtest(client).unwrap();
-    let (spendable, _) = wallet::balances(client).unwrap();
+    wallet::fund_regtest(client, W).unwrap();
+    let (spendable, _) = wallet::balances(client, W).unwrap();
     assert!(
         !spendable.trim_start_matches(['0', '.']).is_empty(),
         "nothing spendable: {spendable}"
     );
 
-    let to = client
-        .call_wallet(wallet::SPIKE_WALLET, "getnewaddress", json!([]))
-        .unwrap();
+    let to = client.call_wallet(W, "getnewaddress", json!([])).unwrap();
     let to = to.as_str().unwrap().to_owned();
-    let (summary, hex) = wallet::prepare_send(client, "regtest", &to, "0.123456789").unwrap();
+    let (summary, hex) = wallet::prepare_send(client, W, "regtest", &to, "0.123456789").unwrap();
 
     // The summary is the core's decoding of the exact bytes it will submit.
     let paid: Vec<_> = summary.outputs.iter().filter(|o| !o.change).collect();
@@ -211,8 +216,8 @@ fn a_drafted_send_is_submitted_exactly_once() {
     assert!(store.take(&id).is_none(), "a decided draft must be gone");
     assert_eq!(test.mempool(), vec![summary.txid.clone()]);
 
-    assert!(wallet::prepare_send(client, "regtest", &to, "1.0000000001").is_err());
-    assert!(wallet::prepare_send(client, "regtest", "not-an-address", "1").is_err());
+    assert!(wallet::prepare_send(client, W, "regtest", &to, "1.0000000001").is_err());
+    assert!(wallet::prepare_send(client, W, "regtest", "not-an-address", "1").is_err());
 }
 
 #[test]
@@ -233,7 +238,7 @@ fn the_page_login_cannot_export_keys() {
         "signmessage",
         "stop_never_listed",
     ] {
-        match client.call_wallet(wallet::SPIKE_WALLET, method, json!([])) {
+        match client.call_wallet(W, method, json!([])) {
             Err(RpcError::Http(403)) => {}
             other => panic!("{method} was not refused with 403: {other:?}"),
         }
