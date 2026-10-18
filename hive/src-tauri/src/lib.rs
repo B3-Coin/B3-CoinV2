@@ -598,7 +598,7 @@ async fn network_peers(core: State<'_, Arc<Core>>) -> Result<Vec<chain::Peer>, S
     .await
 }
 
-/// Builds and signs the send, keeps it as a draft and opens the approval
+/// Funds the send, keeps it as a draft and opens the approval
 /// window. Nothing is broadcast here; the page only learns the draft id.
 #[tauri::command]
 async fn draft_send(
@@ -612,12 +612,16 @@ async fn draft_send(
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
         let chain = node.chain().unwrap_or_default();
-        let (summary, hex) = wallet::prepare_send(client, &name, &chain, &address, &amount)?;
+        let (summary, funded) = wallet::prepare_send(client, &name, &chain, &address, &amount)?;
+        let inputs = funded.inputs.clone();
         core.drafts
             .lock()
             .unwrap()
-            .insert(summary, hex)
-            .map_err(|e| e.to_string())
+            .insert(summary, funded)
+            .map_err(|e| {
+                wallet::release(client, &name, &inputs);
+                e.to_string()
+            })
     })
     .await?;
     open_approval(&app).map_err(|e| e.to_string())?;
@@ -956,17 +960,44 @@ async fn update_download(
 
 // ---- approval window commands ----------------------------------------------
 
+/// The draft as the approval window sees it: whether approving needs the
+/// wallet's passphrase is checked now, since the wallet may have been
+/// locked or unlocked since the draft was made.
+fn draft_view(client: Option<&rpc::Client>, draft: drafts::Draft) -> DraftView {
+    let locked = client.is_some_and(|c| {
+        wallet::security(c, &draft.summary.wallet).ok() == Some(wallet::Security::Locked)
+    });
+    DraftView {
+        id: draft.id,
+        summary: draft.summary,
+        locked,
+    }
+}
+
+fn oldest_view(core: &Core) -> Option<DraftView> {
+    let draft = core.drafts.lock().unwrap().oldest()?;
+    let node = core.node();
+    Some(draft_view(node.client(), draft))
+}
+
 #[tauri::command]
-fn approval_pending(
+async fn approval_pending(
     window: Window,
     core: State<'_, Arc<Core>>,
 ) -> Result<Option<DraftView>, String> {
     require_window(&window, APPROVAL)?;
-    Ok(core.drafts.lock().unwrap().oldest())
+    let core = Arc::clone(&core);
+    blocking(move || Ok(oldest_view(&core))).await
 }
 
-/// Approve submits the draft's stored bytes exactly; reject discards them.
-/// Either way the draft is consumed, so it can never be submitted twice.
+/// What happened to an approved draft once it was taken.
+type Outcome = Result<String, String>;
+
+/// Approve signs the draft, checks the signed transaction against what was
+/// approved, and submits it; reject frees its coins. Either way the draft is
+/// consumed, so it can never be submitted twice. A locked wallet is unlocked
+/// with `passphrase` only to sign and is locked again straight after; a
+/// missing or wrong passphrase leaves the draft waiting, to try again.
 /// Returns the next waiting draft; the window closes when there is none.
 #[tauri::command]
 async fn approval_decide(
@@ -975,36 +1006,82 @@ async fn approval_decide(
     core: State<'_, Arc<Core>>,
     id: String,
     approve: bool,
+    passphrase: Option<String>,
 ) -> Result<Option<DraftView>, String> {
     require_window(&window, APPROVAL)?;
     let core = Arc::clone(&core);
-    let draft = core
-        .drafts
-        .lock()
-        .unwrap()
-        .take(&id)
-        .ok_or("This request was already decided.")?;
     let result = if approve {
-        let core = Arc::clone(&core);
-        blocking(move || {
-            let node = core.node();
+        let core2 = Arc::clone(&core);
+        let id2 = id.clone();
+        let outcome: Outcome = blocking(move || {
+            let node = core2.node();
             let client = node.client().ok_or("The node is not ready.")?;
-            Ok(wallet::broadcast(client, &draft.hex))
+            let waiting = core2
+                .drafts
+                .lock()
+                .unwrap()
+                .get(&id2)
+                .ok_or("This request was already decided.")?;
+            let wallet_name = waiting.summary.wallet.clone();
+            let locked = wallet::security(client, &wallet_name).map_err(|e| e.to_string())?
+                == wallet::Security::Locked;
+            if locked {
+                wallet::unlock_for_signing(
+                    client,
+                    &wallet_name,
+                    passphrase.as_deref().unwrap_or(""),
+                )?;
+            }
+            // From here on the draft is consumed, whatever happens.
+            let taken = core2.drafts.lock().unwrap().take(&id2);
+            let outcome = match taken {
+                None => Err("This request was already decided.".to_owned()),
+                Some(draft) => {
+                    let sent = wallet::sign(client, &draft.summary, &draft.funded)
+                        .and_then(|hex| wallet::broadcast(client, &hex).map_err(|e| e.to_string()));
+                    if sent.is_err() {
+                        wallet::release(client, &wallet_name, &draft.funded.inputs);
+                    }
+                    sent
+                }
+            };
+            if locked {
+                // Only a lock this approval opened is closed again.
+                let _ = passphrase::lock(client, &wallet_name);
+            }
+            Ok(outcome)
         })
-        .await?
-        .map(|txid| DraftResult::Sent {
-            id: id.clone(),
-            txid,
-        })
-        .unwrap_or_else(|e| DraftResult::Failed {
-            id: id.clone(),
-            error: e.to_string(),
-        })
+        .await?;
+        match outcome {
+            Ok(txid) => DraftResult::Sent {
+                id: id.clone(),
+                txid,
+            },
+            Err(error) => DraftResult::Failed {
+                id: id.clone(),
+                error,
+            },
+        }
     } else {
+        let draft = core
+            .drafts
+            .lock()
+            .unwrap()
+            .take(&id)
+            .ok_or("This request was already decided.")?;
+        let core2 = Arc::clone(&core);
+        blocking(move || {
+            if let Some(client) = core2.node().client() {
+                wallet::release(client, &draft.summary.wallet, &draft.funded.inputs);
+            }
+            Ok(())
+        })
+        .await?;
         DraftResult::Rejected { id: id.clone() }
     };
     let _ = app.emit_to(MAIN, "draft-result", result);
-    let next = core.drafts.lock().unwrap().oldest();
+    let core2 = Arc::clone(&core);
+    let next = blocking(move || Ok(oldest_view(&core2))).await?;
     if next.is_none() {
         let _ = window.close();
     }
@@ -1311,14 +1388,25 @@ pub fn run() {
         .on_window_event(|window, event| {
             // Closing the approval window without deciding rejects what waits.
             if window.label() == APPROVAL && matches!(event, WindowEvent::Destroyed) {
-                let core = window.state::<Arc<Core>>();
-                for draft in core.drafts.lock().unwrap().take_all() {
+                let core = Arc::clone(&window.state::<Arc<Core>>());
+                let drafts = core.drafts.lock().unwrap().take_all();
+                for draft in &drafts {
                     let _ = window.emit_to(
                         MAIN,
                         "draft-result",
-                        DraftResult::Rejected { id: draft.id },
+                        DraftResult::Rejected {
+                            id: draft.id.clone(),
+                        },
                     );
                 }
+                // Their reserved coins are freed off the event loop.
+                thread::spawn(move || {
+                    if let Some(client) = core.node().client() {
+                        for d in drafts {
+                            wallet::release(client, &d.summary.wallet, &d.funded.inputs);
+                        }
+                    }
+                });
             }
             // Closing the passphrase window without finishing cancels it.
             if window.label() == PASSPHRASE && matches!(event, WindowEvent::Destroyed) {

@@ -36,9 +36,14 @@
             </summary>
             <div class="disc-body details">
               <div class="drow"><span class="dkey">Network</span><span class="dval" id="chain"></span></div>
-              <div class="drow"><span class="dkey">Transaction ID</span><span class="dval is-mono" id="txid"></span></div>
+              <div class="drow"><span class="dkey">Coins spent</span><span class="dval tnum" id="inputs"></span></div>
             </div>
           </details>
+          <div class="field" id="pass-field" hidden>
+            <label for="pass">Wallet passphrase</label>
+            <input class="input" type="password" id="pass" autocomplete="off" spellcheck="false" />
+            <span class="help">The wallet is locked. It unlocks only to sign this payment and locks again straight after.</span>
+          </div>
           <div class="banner banner-danger" id="error" role="alert" hidden></div>
         </div>
         <div class="modal-foot">

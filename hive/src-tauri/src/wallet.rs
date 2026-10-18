@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::drafts::{OutputLine, SendSummary};
+use crate::drafts::{Funded, Outpoint, OutputLine, SendSummary};
 use crate::rpc::{Client, RpcError};
 
 pub const SPIKE_WALLET: &str = "hive-spike";
@@ -331,58 +331,77 @@ pub fn parse_amount(input: &str) -> Result<String, String> {
     Ok(input.to_owned())
 }
 
-/// Funds, signs and finalizes a send to `address`, then decodes the result.
-/// Nothing is broadcast: the caller stores the hex as a draft.
+/// Funds a send to `address` and decodes it, without signing. The coins it
+/// spends stay reserved (lockUnspents) until the draft is decided; nothing
+/// is broadcast. The caller stores the result as a draft.
 pub fn prepare_send(
     client: &Client,
     wallet: &str,
     chain: &str,
     address: &str,
     amount: &str,
-) -> Result<(SendSummary, String), String> {
+) -> Result<(SendSummary, Funded), String> {
     let amount = parse_amount(amount)?;
     let address = address.trim();
     if address.is_empty() {
         return Err("Enter a destination address.".into());
     }
-    let call = |method: &str, params: Value| {
-        client
-            .call_wallet(wallet, method, params)
-            .map_err(|e| e.to_string())
-    };
-
     // Amount goes over the wire as a string, so the node parses the exact digits.
     let mut output = serde_json::Map::new();
     output.insert(address.to_owned(), Value::String(amount));
-    let funded = call("walletcreatefundedpsbt", json!([[], [output], 0, {}]))?;
+    let funded = client
+        .call_wallet(
+            wallet,
+            "walletcreatefundedpsbt",
+            json!([[], [output], 0, {"lockUnspents": true}]),
+        )
+        .map_err(|e| e.to_string())?;
     let change_pos = funded["changepos"].as_i64().unwrap_or(-1);
     let fee = decimal(&funded["fee"]).map_err(|e| e.to_string())?;
-    let psbt = funded["psbt"].as_str().ok_or("funding returned no PSBT")?;
-
-    let signed = call("walletprocesspsbt", json!([psbt, true]))?;
-    let psbt = signed["psbt"].as_str().ok_or("signing returned no PSBT")?;
-    let finalized = client
-        .call("finalizepsbt", json!([psbt]))
-        .map_err(|e| e.to_string())?;
-    if finalized["complete"].as_bool() != Some(true) {
-        return Err("The wallet could not sign every input.".into());
-    }
-    let hex = finalized["hex"]
+    let psbt = funded["psbt"]
         .as_str()
-        .ok_or("finalizing returned no transaction")?
+        .ok_or("funding returned no PSBT")?
         .to_owned();
 
     let decoded = client
-        .call("decoderawtransaction", json!([hex]))
+        .call("decodepsbt", json!([psbt]))
         .map_err(|e| e.to_string())?;
-    let txid = decoded["txid"]
-        .as_str()
-        .ok_or("decoded transaction has no txid")?
-        .to_owned();
-    let mut outputs = Vec::new();
-    for out in decoded["vout"]
+    let (inputs, outputs) = parse_tx(&decoded["tx"], change_pos)?;
+    Ok((
+        SendSummary {
+            chain: chain.to_owned(),
+            wallet: wallet.to_owned(),
+            outputs,
+            fee,
+            inputs: inputs.len(),
+        },
+        Funded { psbt, inputs },
+    ))
+}
+
+/// The coins a decoded transaction spends and the outputs it pays; the
+/// output at `change_pos` is marked as change.
+pub(crate) fn parse_tx(
+    tx: &Value,
+    change_pos: i64,
+) -> Result<(Vec<Outpoint>, Vec<OutputLine>), String> {
+    let mut inputs = Vec::new();
+    for vin in tx["vin"]
         .as_array()
-        .ok_or("decoded transaction has no outputs")?
+        .ok_or("the transaction has no inputs")?
+    {
+        inputs.push(Outpoint {
+            txid: vin["txid"]
+                .as_str()
+                .ok_or("an input has no txid")?
+                .to_owned(),
+            vout: vin["vout"].as_u64().ok_or("an input has no index")?,
+        });
+    }
+    let mut outputs = Vec::new();
+    for out in tx["vout"]
+        .as_array()
+        .ok_or("the transaction has no outputs")?
     {
         let n = out["n"].as_i64().unwrap_or(-2);
         outputs.push(OutputLine {
@@ -394,16 +413,87 @@ pub fn prepare_send(
             change: n == change_pos,
         });
     }
-    Ok((
-        SendSummary {
-            chain: chain.to_owned(),
-            wallet: wallet.to_owned(),
-            txid,
-            outputs,
-            fee,
-        },
-        hex,
-    ))
+    Ok((inputs, outputs))
+}
+
+/// Signs and finalizes an approved draft. The signed transaction must spend
+/// exactly the drafted coins and pay exactly the approved outputs, or it is
+/// refused. Returns the transaction's hex.
+pub fn sign(client: &Client, summary: &SendSummary, funded: &Funded) -> Result<String, String> {
+    let signed = client
+        .call_wallet(
+            &summary.wallet,
+            "walletprocesspsbt",
+            json!([funded.psbt, true]),
+        )
+        .map_err(|e| e.to_string())?;
+    let psbt = signed["psbt"].as_str().ok_or("signing returned no PSBT")?;
+    let finalized = client
+        .call("finalizepsbt", json!([psbt]))
+        .map_err(|e| e.to_string())?;
+    if finalized["complete"].as_bool() != Some(true) {
+        return Err("The wallet could not sign every input.".into());
+    }
+    let hex = finalized["hex"]
+        .as_str()
+        .ok_or("finalizing returned no transaction")?
+        .to_owned();
+    let decoded = client
+        .call("decoderawtransaction", json!([hex]))
+        .map_err(|e| e.to_string())?;
+    let (inputs, outputs) = parse_tx(&decoded, -1)?;
+    check_signed(summary, funded, &inputs, &outputs)?;
+    Ok(hex)
+}
+
+pub(crate) fn check_signed(
+    summary: &SendSummary,
+    funded: &Funded,
+    inputs: &[Outpoint],
+    outputs: &[OutputLine],
+) -> Result<(), String> {
+    let same_outputs = outputs.len() == summary.outputs.len()
+        && outputs
+            .iter()
+            .zip(&summary.outputs)
+            .all(|(a, b)| a.address == b.address && a.amount == b.amount);
+    if inputs != funded.inputs.as_slice() || !same_outputs {
+        return Err(
+            "The signed transaction differs from the one you approved, so it was not sent.".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Frees the coins a draft reserved, when it is rejected or fails.
+pub fn release(client: &Client, wallet: &str, inputs: &[Outpoint]) {
+    if inputs.is_empty() {
+        return;
+    }
+    let _ = client.call_wallet(wallet, "lockunspent", json!([true, inputs]));
+}
+
+/// How long an approval unlocks a locked wallet for. Signing takes well under
+/// a second; the wallet is locked again as soon as it is done.
+const SIGNING_UNLOCK_SECONDS: u64 = 60;
+
+/// Unlocks a locked wallet to sign one approved draft.
+pub fn unlock_for_signing(client: &Client, wallet: &str, passphrase: &str) -> Result<(), String> {
+    if passphrase.is_empty() {
+        return Err("Enter the wallet passphrase to approve this payment.".into());
+    }
+    client
+        .call_wallet(
+            wallet,
+            "walletpassphrase",
+            json!([passphrase, SIGNING_UNLOCK_SECONDS]),
+        )
+        .map(|_| ())
+        .map_err(|e| match e {
+            // RPC_WALLET_PASSPHRASE_INCORRECT
+            RpcError::Rpc { code: -14, .. } => "The passphrase is not correct.".into(),
+            other => other.to_string(),
+        })
 }
 
 /// One wallet transaction line, as listtransactions reports it. A payment
@@ -478,6 +568,44 @@ pub(crate) fn decimal(v: &Value) -> Result<String, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_signed_transaction_must_match_its_draft() {
+        let line = |address: &str, amount: &str, change| OutputLine {
+            address: address.into(),
+            amount: amount.into(),
+            change,
+        };
+        let coin = |vout| Outpoint {
+            txid: "aa".repeat(32),
+            vout,
+        };
+        let summary = SendSummary {
+            chain: "regtest".into(),
+            wallet: "w".into(),
+            outputs: vec![line("pay", "1.000000000", false), line("chg", "0.5", true)],
+            fee: "0.00001".into(),
+            inputs: 1,
+        };
+        let funded = Funded {
+            psbt: String::new(),
+            inputs: vec![coin(0)],
+        };
+        // Signing does not know which output is change; only address and
+        // amount must match.
+        let signed = [line("pay", "1.000000000", false), line("chg", "0.5", false)];
+        assert!(check_signed(&summary, &funded, &[coin(0)], &signed).is_ok());
+        assert!(check_signed(&summary, &funded, &[coin(1)], &signed).is_err());
+        assert!(check_signed(&summary, &funded, &[coin(0), coin(1)], &signed).is_err());
+        let more = [line("pay", "1.000000001", false), line("chg", "0.5", false)];
+        assert!(check_signed(&summary, &funded, &[coin(0)], &more).is_err());
+        let elsewhere = [
+            line("thief", "1.000000000", false),
+            line("chg", "0.5", false),
+        ];
+        assert!(check_signed(&summary, &funded, &[coin(0)], &elsewhere).is_err());
+        assert!(check_signed(&summary, &funded, &[coin(0)], &signed[..1]).is_err());
+    }
 
     #[test]
     fn new_wallet_names_stay_in_the_wallets_folder() {

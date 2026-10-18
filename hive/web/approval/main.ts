@@ -6,7 +6,9 @@ import { el, formatAmount, initTheme, sumAmounts } from "../shared/ui";
 type OutputLine = { address: string; amount: string; change: boolean };
 type DraftView = {
   id: string;
-  summary: { chain: string; wallet: string; txid: string; outputs: OutputLine[]; fee: string };
+  summary: { chain: string; wallet: string; outputs: OutputLine[]; fee: string; inputs: number };
+  // The wallet is locked: approving needs its passphrase.
+  locked: boolean;
 };
 
 await initTheme();
@@ -53,7 +55,10 @@ function show(draft: DraftView | null): void {
   el("fee").textContent = formatAmount(s.fee, 9);
   el("total").textContent = total === null ? "—" : formatAmount(total, 9);
   el("chain").textContent = s.chain;
-  el("txid").textContent = s.txid;
+  el("inputs").textContent = String(s.inputs);
+  el("pass-field").hidden = !draft.locked;
+  el<HTMLInputElement>("pass").value = "";
+  if (draft.locked) el("pass").focus();
 }
 
 let current: DraftView | null = null;
@@ -69,11 +74,15 @@ async function decide(approve: boolean): Promise<void> {
   if (!current) return;
   setBusy(true);
   try {
-    current = await invoke<DraftView | null>("approval_decide", { id: current.id, approve });
+    const passphrase = approve && current.locked ? el<HTMLInputElement>("pass").value : null;
+    el<HTMLInputElement>("pass").value = "";
+    current = await invoke<DraftView | null>("approval_decide", { id: current.id, approve, passphrase });
     show(current);
   } catch (e) {
     el("error").hidden = false;
     el("error").textContent = String(e);
+    el("error").scrollIntoView({ block: "nearest" });
+    if (current?.locked) el("pass").focus();
   } finally {
     setBusy(false);
   }

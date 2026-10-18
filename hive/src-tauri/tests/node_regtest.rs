@@ -386,6 +386,15 @@ fn follow_reports_new_blocks_and_an_exit() {
     follower.join().unwrap();
 }
 
+/// The coins the wallet holds back for waiting drafts.
+fn reserved(client: &Client) -> Vec<serde_json::Value> {
+    client
+        .call_wallet(W, "listlockunspent", json!([]))
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_else(|| panic!("listlockunspent"))
+}
+
 #[test]
 fn a_drafted_send_is_submitted_exactly_once() {
     let Some((test, status)) = TestNode::start("send") else {
@@ -408,25 +417,32 @@ fn a_drafted_send_is_submitted_exactly_once() {
 
     let to = client.call_wallet(W, "getnewaddress", json!([])).unwrap();
     let to = to.as_str().unwrap().to_owned();
-    let (summary, hex) = wallet::prepare_send(client, W, "regtest", &to, "0.123456789").unwrap();
+    let (summary, funded) = wallet::prepare_send(client, W, "regtest", &to, "0.123456789").unwrap();
 
-    // The summary is the core's decoding of the exact bytes it will submit.
+    // The summary is the core's decoding of the funded transaction.
     let paid: Vec<_> = summary.outputs.iter().filter(|o| !o.change).collect();
     assert_eq!(paid.len(), 1);
     assert_eq!(paid[0].address, to);
     assert_eq!(paid[0].amount, "0.123456789");
     assert!(summary.outputs.iter().any(|o| o.change));
-    assert_eq!(summary.txid.len(), 64);
 
-    // Nothing is broadcast while the draft waits.
+    // Nothing is broadcast while the draft waits, and its coins are reserved.
     assert!(test.mempool().is_empty());
+    assert_eq!(reserved(&test.admin()).len(), funded.inputs.len());
 
     let mut store = DraftStore::default();
-    let id = store.insert(summary.clone(), hex).unwrap();
+    let id = store.insert(summary.clone(), funded).unwrap();
     let draft = store.take(&id).unwrap();
-    assert_eq!(wallet::broadcast(client, &draft.hex).unwrap(), summary.txid);
+    let hex = wallet::sign(client, &draft.summary, &draft.funded).unwrap();
+    let txid = wallet::broadcast(client, &hex).unwrap();
     assert!(store.take(&id).is_none(), "a decided draft must be gone");
-    assert_eq!(test.mempool(), vec![summary.txid.clone()]);
+    assert_eq!(test.mempool(), vec![txid]);
+
+    // A rejected draft frees what it reserved.
+    let (_, other) = wallet::prepare_send(client, W, "regtest", &to, "0.1").unwrap();
+    assert_eq!(reserved(&test.admin()).len(), other.inputs.len());
+    wallet::release(client, W, &other.inputs);
+    assert!(reserved(&test.admin()).is_empty());
 
     assert!(wallet::prepare_send(client, W, "regtest", &to, "1.0000000001").is_err());
     assert!(wallet::prepare_send(client, W, "regtest", "not-an-address", "1").is_err());
@@ -661,4 +677,40 @@ fn passphrases_encrypt_change_and_lock() {
         wallet::security(client, "safe").unwrap(),
         wallet::Security::Locked
     );
+}
+
+#[test]
+fn a_locked_wallet_signs_only_with_its_passphrase() {
+    let Some((test, status)) = TestNode::start("locked-send") else {
+        return;
+    };
+    assert!(matches!(status, NodeStatus::Ready { .. }), "{status:?}");
+    let client = test.node.client().unwrap();
+    wallet::create(client, "safe").unwrap();
+    wallet::fund_regtest(client, "safe").unwrap();
+    let request = Request {
+        id: "r".into(),
+        kind: PassKind::Encrypt,
+        wallet: "safe".into(),
+    };
+    passphrase::apply(client, &request, &entry("", "open sesame")).unwrap();
+
+    // Funding needs no keys, so a locked wallet can still make a draft.
+    let to = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    let (summary, funded) = wallet::prepare_send(client, "safe", "regtest", to, "0.5").unwrap();
+    assert!(wallet::sign(client, &summary, &funded).is_err());
+    assert_eq!(
+        wallet::unlock_for_signing(client, "safe", "wrong").unwrap_err(),
+        "The passphrase is not correct."
+    );
+    assert!(wallet::unlock_for_signing(client, "safe", "").is_err());
+    wallet::unlock_for_signing(client, "safe", "open sesame").unwrap();
+    let hex = wallet::sign(client, &summary, &funded).unwrap();
+    passphrase::lock(client, "safe").unwrap();
+    assert_eq!(
+        wallet::security(client, "safe").unwrap(),
+        wallet::Security::Locked
+    );
+    let txid = wallet::broadcast(client, &hex).unwrap();
+    assert_eq!(test.mempool(), vec![txid]);
 }

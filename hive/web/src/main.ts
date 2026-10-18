@@ -628,7 +628,7 @@ function renderWallets(v: WalletsView): void {
 const SECURITY_TEXT: Record<WalletOverview["security"], string> = {
   watch_only: "This wallet holds no private keys, so there is nothing to encrypt.",
   unencrypted: "Anyone who can read the wallet file can spend from it. Encrypting asks for a passphrase before every payment.",
-  locked: "Payments need the passphrase. Sending from a locked wallet comes in the next B3 Hive step.",
+  locked: "Payments need the passphrase: the approval window asks for it, unlocks only to sign, and locks again.",
   unlocked: "The wallet is unlocked: it can sign without asking for the passphrase until it locks again.",
 };
 
