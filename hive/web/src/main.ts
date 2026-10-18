@@ -237,7 +237,8 @@ let offerSize = 0;
 let checked = false;
 
 function renderUpdates(u: UpdateStatus): void {
-  const [text, tone] = STATE_TEXT[u.state] ?? [u.state, "neutral"];
+  const upToDate = u.state === "idle" && u.offer === null && checked;
+  const [text, tone] = upToDate ? ["Up to date", "success"] : (STATE_TEXT[u.state] ?? [u.state, "neutral"]);
   const state = el("update-state");
   state.textContent = text;
   state.className = `badge badge-${tone}`;
@@ -262,7 +263,7 @@ function renderUpdates(u: UpdateStatus): void {
     updateResult("danger", updateError(u.error));
   } else if (u.state === "ready-to-install" && u.download) {
     updateResult("success", `Saved to ${u.download}. Close B3 Hive and run that file to install ${u.offer?.version ?? "it"}.`);
-  } else if (u.state === "idle" && u.offer === null && checked) {
+  } else if (upToDate) {
     updateResult("success", `B3 Hive ${u.installed} is the latest release.`);
   } else {
     updateResult("info", "");
