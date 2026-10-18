@@ -24,3 +24,6 @@ hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.3"
 base64 = "0.22"
+# Chain bootstraps from the explorer are tar.zst archives (bootstrap.rs).
+tar = { version = "0.4", default-features = false }
+zstd = { version = "0.13", default-features = false }

@@ -2,13 +2,15 @@
 //! B3_HIVE_B3COIND names the binary:
 //!   B3_HIVE_B3COIND=/path/to/b3coind cargo test --test node_regtest -- --test-threads=1
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
 use serde_json::json;
 
+use b3_hive::bootstrap;
 use b3_hive::chain;
 use b3_hive::console;
 use b3_hive::drafts::DraftStore;
@@ -26,12 +28,19 @@ struct TestNode {
 
 impl TestNode {
     fn start(name: &str) -> Option<(Self, NodeStatus)> {
+        Self::start_prepared(name, |_| {})
+    }
+
+    /// Like start, after `prepare` has filled the empty datadir.
+    fn start_prepared(name: &str, prepare: impl FnOnce(&Path)) -> Option<(Self, NodeStatus)> {
         let Some(b3coind) = std::env::var_os("B3_HIVE_B3COIND") else {
             eprintln!("skipped: B3_HIVE_B3COIND is not set");
             return None;
         };
         let datadir = std::env::temp_dir().join(format!("hive-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&datadir);
+        std::fs::create_dir_all(&datadir).unwrap();
+        prepare(&datadir);
         let node = Node::start(&NodeConfig {
             b3coind: b3coind.into(),
             datadir: datadir.clone(),
@@ -131,6 +140,87 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
         .windows(2)
         .all(|w| w[0].confirmations <= w[1].confirmations));
     assert_eq!(chain::overview(client).unwrap().blocks, wallet::FUND_BLOCKS);
+}
+
+/// A bootstrap made from one node's chain folders starts another node at
+/// the same tip.
+#[test]
+fn a_bootstrap_installs_a_working_chain() {
+    let Some((source, status)) = TestNode::start("boot-src") else {
+        return;
+    };
+    assert!(
+        matches!(status, NodeStatus::Ready { .. }),
+        "not ready: {status:?}"
+    );
+    let client = source.node.client().unwrap();
+    wallet::ensure_wallet(client).unwrap();
+    wallet::fund_regtest(client, W).unwrap();
+    let tip = chain::overview(client).unwrap().best_block_hash;
+    source.node.stop(Duration::from_secs(120));
+
+    // Packed as the explorer packs mainnet: the chain folders at the top.
+    let chain_dir = source.datadir.join("regtest");
+    let mut tar = tar::Builder::new(Vec::new());
+    for name in ["blocks", "chainstate"] {
+        tar.append_dir_all(name, chain_dir.join(name)).unwrap();
+    }
+    let bytes = zstd::encode_all(&tar.into_inner().unwrap()[..], 3).unwrap();
+    let offer = bootstrap::parse_manifest(
+        json!({"bootstraps": [{
+            "height": wallet::FUND_BLOCKS,
+            "size": bytes.len(),
+            "sha256": sha256_hex(&bytes),
+            "url": format!("/bootstraps/bootstrap-{}.tar.zst", wallet::FUND_BLOCKS),
+        }]})
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap()
+    .remove(0);
+
+    let mut phases = Vec::new();
+    let Some((target, status)) = TestNode::start_prepared("boot-dst", |datadir| {
+        let chain_dir = datadir.join("regtest");
+        assert!(bootstrap::is_fresh(&chain_dir));
+        bootstrap::install(
+            &mut &bytes[..],
+            &offer,
+            &chain_dir,
+            &mut |p| phases.push(p),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!bootstrap::is_fresh(&chain_dir));
+    }) else {
+        return;
+    };
+    match status {
+        NodeStatus::Ready {
+            blocks,
+            best_block_hash,
+            ..
+        } => {
+            assert_eq!(blocks, wallet::FUND_BLOCKS);
+            assert_eq!(best_block_hash, tip);
+        }
+        other => panic!("the bootstrapped node did not start: {other:?}"),
+    }
+    assert_eq!(
+        phases.last(),
+        Some(&bootstrap::Progress::Done {
+            height: wallet::FUND_BLOCKS
+        })
+    );
+    drop(target);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[test]

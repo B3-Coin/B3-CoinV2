@@ -3,6 +3,7 @@
 //! after the approval window approves it. The one exception is the console
 //! window: commands typed there run with full access, as in the Qt console.
 
+pub mod bootstrap;
 pub mod chain;
 pub mod console;
 pub mod drafts;
