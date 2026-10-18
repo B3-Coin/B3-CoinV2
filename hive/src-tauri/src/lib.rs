@@ -1742,7 +1742,9 @@ async fn blocking<T: Send + 'static>(
 /// It runs B3 mainnet in the legacy client's data folder, so a Qt user finds
 /// their chain and wallets. B3_HIVE_NETWORK=regtest is for development: a
 /// peerless regtest node in the app's own data directory. B3_HIVE_DATADIR
-/// moves the data folder for either.
+/// moves the data folder for either. B3_HIVE_REGTEST_ARGS replaces the
+/// peerless defaults, to join a local test network such as a FlowMesh test
+/// market; mainnet refuses it.
 fn node_config(app: &tauri::App) -> Result<NodeConfig, Box<dyn std::error::Error>> {
     let b3coind = match std::env::var_os("B3_HIVE_B3COIND") {
         Some(path) => PathBuf::from(path),
@@ -1758,10 +1760,17 @@ fn node_config(app: &tauri::App) -> Result<NodeConfig, Box<dyn std::error::Error
             &app.path().data_dir()?,
         ),
     };
+    let regtest_args: Vec<String> = std::env::var("B3_HIVE_REGTEST_ARGS")
+        .map(|extra| extra.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default();
+    if !regtest_args.is_empty() && network != Network::Regtest {
+        return Err("B3_HIVE_REGTEST_ARGS needs B3_HIVE_NETWORK=regtest".into());
+    }
     Ok(NodeConfig {
         b3coind,
         datadir,
         network,
+        regtest_args,
     })
 }
 

@@ -52,6 +52,7 @@ impl TestNode {
             b3coind: b3coind.into(),
             datadir: datadir.clone(),
             network: Network::Regtest,
+            regtest_args: vec![],
         });
         let status = node.wait_ready(Duration::from_secs(300), |_| {});
         Some((TestNode { node, datadir }, status))
@@ -328,6 +329,7 @@ fn node_settings_take_effect_after_a_restart() {
         b3coind: std::env::var_os("B3_HIVE_B3COIND").unwrap().into(),
         datadir: test.datadir.clone(),
         network: Network::Regtest,
+        regtest_args: vec![],
     });
     let status = again.wait_ready(Duration::from_secs(300), |_| {});
     assert!(

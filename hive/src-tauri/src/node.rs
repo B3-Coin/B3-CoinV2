@@ -134,6 +134,10 @@ pub struct NodeConfig {
     pub b3coind: PathBuf,
     pub datadir: PathBuf,
     pub network: Network,
+    /// Development only, regtest only: arguments for joining a local test
+    /// network. They replace the peerless defaults and come before Hive's
+    /// own RPC settings, which therefore still apply.
+    pub regtest_args: Vec<String>,
 }
 
 pub struct Node {
@@ -450,12 +454,17 @@ fn node_args(
 ) -> Vec<String> {
     let mut args: Vec<String> = match config.network {
         Network::Main => vec![],
-        Network::Regtest => vec![
+        Network::Regtest if config.regtest_args.is_empty() => vec![
             "-regtest".into(),
             "-listen=0".into(),
             "-connect=0".into(),
             "-dnsseed=0".into(),
         ],
+        Network::Regtest => ["-regtest", "-dnsseed=0"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(config.regtest_args.iter().cloned())
+            .collect(),
     };
     args.extend([
         format!("-datadir={}", config.datadir.display()),
@@ -509,6 +518,7 @@ mod tests {
             b3coind: "b3coind".into(),
             datadir: "/tmp/hive".into(),
             network: Network::Regtest,
+            regtest_args: vec![],
         };
         let credentials = Credentials::generate(PAGE_USER).unwrap();
         let console = Credentials::generate(CONSOLE_USER).unwrap();
@@ -555,11 +565,33 @@ mod tests {
     }
 
     #[test]
+    fn regtest_args_replace_the_peerless_defaults_but_not_the_rpc_settings() {
+        let config = NodeConfig {
+            b3coind: "b3coind".into(),
+            datadir: "/tmp/hive".into(),
+            network: Network::Regtest,
+            regtest_args: vec![
+                "-connect=127.0.0.1:12000".into(),
+                "-rpcport=1".into(),
+            ],
+        };
+        let page = Credentials::generate(PAGE_USER).unwrap();
+        let console = Credentials::generate(CONSOLE_USER).unwrap();
+        let args = node_args(&config, &page, &console, 18443);
+        assert_eq!(args[..4], ["-regtest", "-dnsseed=0", "-connect=127.0.0.1:12000", "-rpcport=1"]);
+        assert!(!args.iter().any(|a| a == "-connect=0" || a == "-listen=0"));
+        // Hive's own port comes later, so it is the one b3coind uses.
+        let ports: Vec<_> = args.iter().filter(|a| a.starts_with("-rpcport=")).collect();
+        assert_eq!(ports, ["-rpcport=1", "-rpcport=18443"]);
+    }
+
+    #[test]
     fn mainnet_args_have_no_chain_flag_and_keep_peers() {
         let config = NodeConfig {
             b3coind: "b3coind".into(),
             datadir: "/home/u/.B3-CoinV2".into(),
             network: Network::Main,
+            regtest_args: vec![],
         };
         let page = Credentials::generate(PAGE_USER).unwrap();
         let console = Credentials::generate(CONSOLE_USER).unwrap();
@@ -614,6 +646,7 @@ mod tests {
             b3coind: dir.join("no-such-b3coind"),
             datadir: dir.clone(),
             network: Network::Regtest,
+            regtest_args: vec![],
         });
         assert!(matches!(node.status(), NodeStatus::Failed { .. }));
         assert!(node.has_exited());
