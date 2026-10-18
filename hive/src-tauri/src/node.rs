@@ -77,6 +77,10 @@ const PAGE_METHODS: &[&str] = &[
     "generatetoaddress",
     "listflowmeshmarkets",
     "getflowmeshmarketdata",
+    "listflowmeshactions",
+    "submitflowmeshorder",
+    "submitflowmeshladder",
+    "cancelflowmeshorder",
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);

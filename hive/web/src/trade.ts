@@ -4,10 +4,23 @@
 // prices are certified clearings by microblock sequence, never invented
 // times; the book shows the node's exact levels and is not recomputed here;
 // unknown is never shown as zero; data older than 3 s is marked stale.
+// Orders and cancellations are drafted by the core, which checks them again,
+// and are signed only from the approval window: this page never signs.
 import { invoke } from "@tauri-apps/api/core";
 
 import { amountNode, el, isMasked, shorten } from "../shared/ui";
-import { B3_DECIMALS, decimal, formatB3, formatPrice, formatQuantity, quantityPlaces, spread, type Units } from "./tradefmt";
+import {
+  B3_DECIMALS,
+  decimal,
+  formatB3,
+  formatPrice,
+  formatQuantity,
+  parsePrice,
+  parseQuantity,
+  quantityPlaces,
+  spread,
+  type Units,
+} from "./tradefmt";
 
 // Mirrors src-tauri/src/flowmesh.rs.
 type MarketSummary = { market_id: string; base_asset_id: string; running: boolean; paused: boolean; halt: string; error: string };
@@ -70,6 +83,30 @@ type Trade = {
   own_sold: string | null;
   observed_ms: number | null;
 };
+type Outcome = { status: string | null; text: string; fill_quantity: string | null; fill_price: string | null };
+type Receipt = { action_id: string; accepted: boolean; state: string; stage: string; reason: string; outcome: Outcome };
+type TradeRequest = {
+  action_id: string;
+  kind: "order" | "cancel" | "other";
+  side: "bid" | "ask" | null;
+  points: Point[];
+  sequence: number | null;
+  submitted_ms: number;
+  state: string;
+  stage: string;
+  reason: string;
+  certified: boolean;
+  outcome: Outcome;
+  settled: boolean;
+  pending: boolean;
+  uncertain: boolean;
+};
+/** The approval window's decision on a draft (DraftResult in lib.rs). */
+export type TradeResult =
+  | { outcome: "traded"; id: string; receipt: Receipt }
+  | { outcome: "rejected"; id: string }
+  | { outcome: "failed"; id: string; error: string }
+  | { outcome: string; id: string };
 type MarketView = {
   market_id: string;
   base_asset_id: string;
@@ -99,6 +136,11 @@ const BOOK_ROWS = 10;
 const MAX_TICKS = 1024;
 /** How long a newly appearing book price is highlighted. */
 const FLASH_MS = 800;
+/** A ladder's most prices (FLOWMESH_LADDER_MAX_STEPS). */
+const LADDER_STEPS = 4;
+/** Requests are read again this often while one is pending, else this. */
+const REQUESTS_PENDING_MS = 2000;
+const REQUESTS_IDLE_MS = 15000;
 
 // ---- state -------------------------------------------------------------------
 
@@ -124,6 +166,14 @@ type Market = {
   lastRead: number;
 };
 let market: Market = blank();
+
+/** The order form's side: bid buys the token with B3, ask sells it. */
+let side: "bid" | "ask" = "bid";
+/** Drafts this page opened, until the approval window decides them. */
+const drafts = new Map<string, "order" | "cancel">();
+let requests: TradeRequest[] = [];
+let requestsRead = 0;
+let requestsLoading = false;
 
 function blank(): Market {
   return {
@@ -179,6 +229,7 @@ export function tradeWalletChanged(): void {
   if (!active) return;
   generation++;
   market = blank();
+  requests = [];
   void loadMarkets();
 }
 
@@ -207,6 +258,10 @@ function selectMarket(id: string): void {
   if (id === marketId) return;
   marketId = id;
   market = blank();
+  requests = [];
+  requestsRead = 0;
+  clearForm();
+  showResult("", "");
   render();
   const mine = ++generation;
   void follow(id, mine);
@@ -219,6 +274,12 @@ function selectMarket(id: string): void {
 async function follow(id: string, mine: number): Promise<void> {
   let knownHead: string | null = null;
   while (active && mine === generation) {
+    // With a remote endpoint the views wait while a review is open or being
+    // sent, so no display read can delay the order (doc/flowmesh-trading-ui.md).
+    if (drafts.size && market.verification?.source === "remote_endpoint") {
+      await sleep(250);
+      continue;
+    }
     try {
       const last = market.ticks[market.ticks.length - 1];
       const v: MarketView = await invoke<MarketView>("trade_market", {
@@ -248,7 +309,9 @@ function apply(v: MarketView): void {
   market.lot = v.quantity_lot;
   market.tick = v.price_tick;
   if (!v.unchanged) {
-    // A full reply: an absent account means this wallet has none.
+    // A full reply: an absent account means this wallet has none. A new
+    // account sequence means a request was taken in.
+    if (v.account?.next_sequence !== market.account?.next_sequence) void loadRequests();
     market.account = v.account;
     market.accountKnown = true;
     if (v.book) market.book = v.book;
@@ -304,6 +367,8 @@ function render(): void {
   renderOrders();
   renderTrades();
   renderBalance();
+  renderRequests();
+  renderForm();
 }
 
 function stateBadge(): [string, string, string] {
@@ -348,6 +413,7 @@ function renderHead(): void {
   if (s?.error) parts.push(s.error);
   el("tr-source").textContent = parts.join(" · ");
   el("tr-book-stale").hidden = !market.status || !stale();
+  renderGate();
 }
 
 // Book prices seen in the last render, per side, to flash new ones.
@@ -407,7 +473,9 @@ function renderBook(): void {
     );
     const own = BigInt(level.own) > 0n ? `\nYours: ${formatQuantity(BigInt(level.own), u.decimals, places)}` : "";
     const range = level.low === level.high ? "" : `\nPrices ${formatPrice(BigInt(level.low), u)} to ${formatPrice(BigInt(level.high), u)}`;
-    div.title = `${level.curves} order${level.curves === 1 ? "" : "s"}${range}${own}`;
+    div.title = `${level.curves} order${level.curves === 1 ? "" : "s"}${range}${own}\nClick to use this price`;
+    div.classList.add("tr-pick");
+    div.addEventListener("click", () => pickPrice(BigInt(price)));
     return div;
   };
   // Asks above the spread, best (lowest) nearest it.
@@ -510,6 +578,7 @@ function renderOrders(): void {
   const note = el("tr-orders-note");
   const u = units();
   const account = market.account;
+  el("tr-cancels").hidden = true;
   if (!market.accountKnown) {
     rows.replaceChildren();
     note.textContent = "Loading…";
@@ -533,19 +602,28 @@ function renderOrders(): void {
       const side = document.createElement("span");
       side.className = `badge ${o.side === "bid" ? "badge-success" : "badge-danger"}`;
       side.textContent = o.side === "bid" ? "Buy" : "Sell";
+      side.title = o.status === "partially-filled" ? "Open, partly filled" : "Open";
       td(side);
-      const prices = limits(o).map((p) => formatPrice(p, u));
-      td(prices.join(", ") || "—", "num");
+      // A ladder's prices stack, one per line.
+      const prices = document.createElement("div");
+      for (const p of limits(o)) {
+        const line = document.createElement("div");
+        line.textContent = formatPrice(p, u);
+        prices.append(line);
+      }
+      td(prices.childElementCount ? prices : "—", "num");
       td(`${formatQuantity(BigInt(o.remaining), u.decimals)} ${label}`, "num");
       td(`${formatQuantity(BigInt(o.filled), u.decimals)} ${label}`, "num");
       td(o.side === "bid" ? `${formatB3(BigInt(o.reserved))} B3` : `${formatQuantity(BigInt(o.reserved), u.decimals)} ${label}`, "num");
-      td(o.status === "partially-filled" ? "Partly filled" : "Open");
       if (isMasked()) for (const cell of [...tr.children].slice(2, 5)) cell.textContent = "••••";
       return tr;
     }),
   );
+  // One cancellation per side, under the table; renderGate enables them.
+  for (const s of ["bid", "ask"] as const) el(`tr-cancel-${s}`).hidden = !openOrder(s);
+  el("tr-cancels").hidden = !openOrder("bid") && !openOrder("ask");
   note.textContent = account.orders.length
-    ? "One order per side: a new Buy replaces your Buy, a new Sell your Sell. Amounts are certified."
+    ? "One order per side: a new Buy replaces your Buy, a new Sell your Sell. Amounts are certified; a cancellation takes effect once certified."
     : "No open orders.";
 }
 
@@ -611,28 +689,420 @@ function renderBalance(): void {
   token("tr-base-held", account?.base_reserved);
 }
 
+
+// ---- orders --------------------------------------------------------------------
+
+type Step = { price: bigint; quantity: bigint };
+
+const tokenWord = () => tokenLabel(market.metadata);
+
+/** Why a new order or cancellation cannot be drafted now, or null. The core
+ *  checks all of it again against fresh data. */
+function gate(): string | null {
+  const s = market.status;
+  if (!s || !market.accountKnown) return "Loading the market…";
+  if (!units()) return "The token's decimals are not verified, so orders cannot be checked.";
+  if (s.halt && s.halt !== "none") return `This market is halted (${s.halt}).`;
+  if (!s.certified) return "This market has no certified state yet.";
+  if (s.paused) return "Trading in this market is paused.";
+  if (s.reconciling) return "The node is catching up with the B3 chain.";
+  if (!market.account) return "This wallet has no trading account in this market. The first deposit creates it.";
+  if (stale()) return "New orders wait for a verified update: there has been none for over 3 seconds.";
+  if (drafts.size) return "Waiting for your decision in the approval window.";
+  if (requests.some((r) => r.pending)) return "Your previous request is not certified yet. New requests wait for it, so the two do not compete; see Requests.";
+  return null;
+}
+
+function renderGate(): void {
+  const reason = gate();
+  el("tr-gate").textContent = reason ?? "";
+  el("tr-gate").hidden = reason === null;
+  el<HTMLButtonElement>("tr-review").disabled = reason !== null;
+  el<HTMLButtonElement>("tr-cancel-bid").disabled = reason !== null;
+  el<HTMLButtonElement>("tr-cancel-ask").disabled = reason !== null;
+}
+
+function stepCount(): number {
+  return el<HTMLInputElement>("tr-ladder").checked ? LADDER_STEPS : 1;
+}
+
+/** The form's rows as exact steps, null while nothing is entered, or the
+ *  first problem. Nothing is rounded: an off-grid value is an error. */
+function readSteps(u: Units): Step[] | null | string {
+  const steps: Step[] = [];
+  const ladder = stepCount() > 1;
+  for (let i = 0; i < stepCount(); i++) {
+    const priceText = el<HTMLInputElement>(`tr-price-${i}`).value.trim();
+    const quantityText = el<HTMLInputElement>(`tr-qty-${i}`).value.trim();
+    const where = ladder ? `Price ${i + 1}: ` : "";
+    if (!priceText && !quantityText) {
+      if (i === 0) return null;
+      continue;
+    }
+    if (!priceText || !quantityText) return `${where}enter both a price and a quantity.`;
+    const price = parsePrice(priceText, u);
+    if ("error" in price) return where + price.error;
+    const quantity = parseQuantity(quantityText, u);
+    if ("error" in quantity) return where + quantity.error;
+    if (steps.some((s) => s.price === price.value)) return `${where}every price of a ladder must differ.`;
+    steps.push({ price: price.value, quantity: quantity.value });
+  }
+  return steps;
+}
+
+function openOrder(s: "bid" | "ask"): Order | undefined {
+  return market.account?.orders.find((o) => o.side === s && o.remaining !== "0");
+}
+
+/** What the entered order reserves and may reserve: the free balance plus
+ *  what the order it replaces holds. */
+function reservation(steps: Step[]): { reserve: bigint; available: bigint } {
+  const a = market.account;
+  const held = BigInt(openOrder(side)?.reserved ?? "0");
+  if (side === "bid") {
+    return { reserve: steps.reduce((sum, s) => sum + s.price * s.quantity, 0n), available: BigInt(a?.b3_available ?? "0") + held };
+  }
+  return { reserve: steps.reduce((sum, s) => sum + s.quantity, 0n), available: BigInt(a?.base_available ?? "0") + held };
+}
+
+function renderForm(): void {
+  const u = units();
+  const token = tokenWord();
+  const buy = side === "bid";
+  el("tr-buy").setAttribute("aria-selected", String(buy));
+  el("tr-sell").setAttribute("aria-selected", String(!buy));
+  el("tr-review").textContent = buy ? "Review buy order" : "Review sell order";
+  document.querySelector("#tr-step-0 [data-tr-price]")!.textContent = `Price (B3 per ${token})`;
+  document.querySelector("#tr-step-0 [data-tr-qty]")!.textContent = `Quantity (${token})`;
+  for (let i = 1; i < LADDER_STEPS; i++) el(`tr-step-${i}`).hidden = stepCount() === 1;
+  el("tr-steps-help").textContent = u
+    ? `Steps: ${formatPrice(u.tick, u)} B3 per ${token} · ${formatQuantity(u.lot, u.decimals)} ${token}. ${buy ? "Buys at your price or below." : "Sells at your price or above."}`
+    : "";
+  const error = el("tr-form-error");
+  const steps = u ? readSteps(u) : null;
+  error.textContent = typeof steps === "string" ? steps : "";
+  error.hidden = typeof steps !== "string";
+  const summary = el("tr-summary");
+  const replaced = openOrder(side);
+  if (!u || steps === null || typeof steps === "string" || !market.account) {
+    summary.hidden = true;
+  } else {
+    const { reserve, available } = reservation(steps);
+    const amount = (v: bigint) => (buy ? `${formatB3(v)} B3` : `${formatQuantity(v, u.decimals)} ${token}`);
+    summary.hidden = false;
+    el("tr-reserve-label").textContent = buy ? "Reserves at most" : "Reserves";
+    el("tr-reserve").textContent = amount(reserve);
+    el("tr-available").textContent = isMasked() ? "••••" : amount(available);
+    el("tr-replaces-row").hidden = !replaced;
+    if (replaced) {
+      el("tr-replaces").textContent = isMasked() ? "••••" : `your open ${buy ? "buy" : "sell"}, ${formatQuantity(BigInt(replaced.remaining), u.decimals)} ${token} left`;
+    }
+    if (reserve > available) {
+      error.textContent = buy
+        ? "This order costs more B3 than your trading balance has available."
+        : `This order sells more ${token} than your trading balance has available.`;
+      error.hidden = false;
+    }
+  }
+  renderGate();
+}
+
+function clearForm(): void {
+  for (let i = 0; i < LADDER_STEPS; i++) {
+    el<HTMLInputElement>(`tr-price-${i}`).value = "";
+    el<HTMLInputElement>(`tr-qty-${i}`).value = "";
+  }
+}
+
+/** A price as typed into the form: exact, without grouping. */
+function plainPrice(p: bigint, u: Units): string {
+  return formatPrice(p, u).replace(/\u202f/g, "");
+}
+
+/** A book level's price into the form's first row. It is taken from the
+ *  verified levels the page holds, never from the text, and refused while
+ *  they are not current. */
+function pickPrice(price: bigint): void {
+  const u = units();
+  if (!u) return;
+  if (stale()) {
+    showResult("warning", "The book is not current, so its price was not taken. Wait for a verified update.");
+    return;
+  }
+  el<HTMLInputElement>("tr-price-0").value = plainPrice(price, u);
+  renderForm();
+  el("tr-qty-0").focus();
+}
+
+function showResult(kind: string, text: string): void {
+  const banner = el("tr-result");
+  banner.className = kind ? `banner banner-${kind}` : "banner";
+  banner.textContent = text;
+  banner.hidden = !text;
+}
+
+async function reviewOrder(): Promise<void> {
+  const u = units();
+  if (!u || gate() !== null || !marketId) return renderGate();
+  const steps = readSteps(u);
+  if (steps === null) {
+    showResult("warning", "Enter a price and a quantity first.");
+    return;
+  }
+  // The form already says what is wrong; the core would refuse it too.
+  if (typeof steps === "string" || reservation(steps).reserve > reservation(steps).available) return renderForm();
+  showResult("", "");
+  const id = marketId;
+  try {
+    const draft = await invoke<string>("trade_order_draft", {
+      marketId: id,
+      side,
+      steps: steps.map((s) => ({ price: s.price.toString(), quantity: s.quantity.toString() })),
+    });
+    drafts.set(draft, "order");
+    showResult("info", "Review the order in the approval window. Nothing is signed until you approve it there.");
+  } catch (e) {
+    showResult("danger", String(e));
+  }
+  renderForm();
+}
+
+async function cancelOrder(s: "bid" | "ask"): Promise<void> {
+  if (gate() !== null || !marketId) return renderGate();
+  try {
+    const draft = await invoke<string>("trade_cancel_draft", { marketId, side: s });
+    drafts.set(draft, "cancel");
+    showResult("info", "Review the cancellation in the approval window.");
+  } catch (e) {
+    showResult("danger", String(e));
+  }
+  render();
+}
+
+/** Handles the approval window's decision on a draft this page opened;
+ *  false when the draft is not this page's. */
+export function tradeDecided(r: TradeResult): boolean {
+  const what = drafts.get(r.id);
+  if (!what) return false;
+  drafts.delete(r.id);
+  if (r.outcome === "traded" && "receipt" in r) {
+    const [kind, text] = receiptText(r.receipt, what);
+    showResult(kind, text);
+    if (r.receipt.accepted) clearForm();
+  } else if (r.outcome === "rejected") {
+    showResult("warning", "Rejected. Nothing was signed.");
+  } else if (r.outcome === "failed" && "error" in r) {
+    showResult("danger", `Not sent: ${r.error}`);
+  }
+  void loadRequests();
+  if (active) render();
+  return true;
+}
+
+function fillText(o: Outcome): string {
+  const u = units();
+  if (o.fill_quantity === null || !u) return "";
+  const q = BigInt(o.fill_quantity);
+  if (q === 0n) return "No fill in that auction; what is left rests on the book.";
+  const at = o.fill_price === null ? "" : ` at ${formatPrice(BigInt(o.fill_price), u)} B3`;
+  return `Filled ${formatQuantity(q, u.decimals)} ${tokenWord()}${at}.`;
+}
+
+function receiptText(r: Receipt, what: "order" | "cancel"): [string, string] {
+  if (r.state === "rejected") return ["danger", `Refused${r.reason ? `: ${r.reason}` : ""}. Nothing is pending.`];
+  if (r.state === "unknown") {
+    return ["warning", "Signed and kept, but the outcome is not known. Do not send a replacement: the same request may still be certified. Follow it under Requests."];
+  }
+  if (r.state === "certified_inclusion") {
+    const o = r.outcome;
+    if (o.status === "rejected") return ["danger", `Certified but not applied: ${o.text || "the market state refused it"}.`];
+    if (o.status === "not_executed") return ["warning", `Certified but not executed: ${o.text || "another action used its sequence"}.`];
+    if (what === "cancel") return ["success", "Cancellation certified. What the order held is back in your trading balance."];
+    return ["success", `Certified. ${fillText(o)}`.trim()];
+  }
+  if (what === "cancel") return ["info", "Accepted: queued, not yet certified. Until it is, the order can still fill; see Requests."];
+  return ["info", "Accepted: queued, not yet certified. An accepted order is not a fill; see Requests."];
+}
+
+// ---- requests ------------------------------------------------------------------
+
+const REQUESTS_NOTE = el("tr-requests-note").textContent ?? "";
+
+async function loadRequests(): Promise<void> {
+  const id = marketId;
+  if (!active || !id || requestsLoading) return;
+  requestsLoading = true;
+  try {
+    const list = await invoke<TradeRequest[]>("trade_requests", { marketId: id });
+    if (id !== marketId) return;
+    requests = list;
+    el("tr-requests-note").textContent = REQUESTS_NOTE;
+  } catch (e) {
+    if (id !== marketId) return;
+    el("tr-requests-note").textContent = `Could not read your requests: ${e}`;
+  } finally {
+    requestsLoading = false;
+    requestsRead = Date.now();
+  }
+  renderRequests();
+  renderGate();
+}
+
+const STAGES: Record<string, string> = {
+  signed: "Signed",
+  sent: "Sent",
+  queued: "Queued",
+  admitted: "Admitted",
+  certified: "Certified",
+  outcome_verified: "Certified",
+  not_executed: "Not executed",
+  refused: "Refused",
+  unknown: "Unknown",
+};
+
+function requestText(r: TradeRequest, u: Units): string {
+  const verb = r.side === "bid" ? "Buy" : "Sell";
+  if (r.kind === "cancel") return `Cancel ${r.side === "bid" ? "buy" : "sell"}`;
+  // A request keeps the canonical curve it signed: its limit is the edge
+  // that holds quantity, as for a standing order.
+  const order: Order = { side: r.side ?? "bid", status: "", filled: "0", remaining: "0", reserved: "0", points: r.points };
+  const prices = limits(order);
+  const top = r.points.reduce((max, p) => (BigInt(p.quantity) > max ? BigInt(p.quantity) : max), 0n);
+  const amount = isMasked() ? "••••" : `${formatQuantity(top, u.decimals)} ${tokenWord()}`;
+  if (prices.length > 1) return `${verb} ladder, ${prices.length} prices, ${amount}`;
+  return `${verb} ${amount} · limit ${prices.length ? formatPrice(prices[0], u) : "—"}`;
+}
+
+/** A verified fill in a table cell: the quantity and price only. */
+function shortFill(o: Outcome): string {
+  const u = units();
+  if (o.fill_quantity === null || !u) return "";
+  const q = BigInt(o.fill_quantity);
+  if (q === 0n) return "No fill yet";
+  return `Filled ${formatQuantity(q, u.decimals)}${o.fill_price === null ? "" : ` at ${formatPrice(BigInt(o.fill_price), u)}`}`;
+}
+
+function outcomeText(r: TradeRequest): string {
+  const o = r.outcome;
+  switch (o.status) {
+    case null:
+      return "—";
+    case "applied":
+      return r.kind === "cancel" ? "Cancelled" : shortFill(o) || "Applied";
+    case "rejected":
+      return `Rejected: ${o.text}`;
+    case "included_not_executed":
+      return "Included, not executed yet";
+    case "not_executed":
+      return "Not executed";
+    default:
+      return o.status;
+  }
+}
+
+function renderRequests(): void {
+  const rows = el("tr-requests-rows");
+  const u = units();
+  const list = requests.filter((r) => r.kind !== "other");
+  if (!u) {
+    rows.replaceChildren();
+    return;
+  }
+  rows.replaceChildren(
+    ...list.map((r) => {
+      const tr = document.createElement("tr");
+      const td = (content: string | Node, cls = "", title = "") => {
+        const cell = document.createElement("td");
+        if (cls) cell.className = cls;
+        if (title) cell.title = title;
+        cell.append(content);
+        tr.append(cell);
+      };
+      td(r.submitted_ms ? new Date(r.submitted_ms).toLocaleTimeString() : "—", "tnum");
+      td(requestText(r, u), "nowrap");
+      td(r.sequence === null ? "—" : String(r.sequence), "num");
+      // The node's cached stage is not renewed once the account moves on, so
+      // a settled request without a verified outcome says only that.
+      const takenIn = r.settled && !r.certified && r.state !== "rejected";
+      const stage = r.certified ? "Certified" : takenIn ? "Taken in" : (STAGES[r.stage] ?? (r.stage || r.state || "—"));
+      const badge = document.createElement("span");
+      badge.className = `badge ${r.certified ? "badge-success" : r.state === "rejected" ? "badge-danger" : r.pending ? "badge-warning" : "badge-neutral"}`;
+      badge.textContent = stage;
+      td(badge, "", takenIn ? "The certified account has moved past its sequence. Its outcome was not verified here." : r.reason);
+      td(outcomeText(r), "nowrap");
+      if (r.pending && r.uncertain) {
+        const ack = document.createElement("button");
+        ack.type = "button";
+        ack.className = "btn btn-secondary btn-sm";
+        ack.textContent = "Review uncertain…";
+        ack.title = "Lets new requests be sent. It does not retry, cancel or prove anything about this one.";
+        let armed = false;
+        ack.addEventListener("click", async () => {
+          if (!armed) {
+            armed = true;
+            ack.textContent = "Allow new requests";
+            ack.title = "This request may still be certified later. Check Your orders and balances first.";
+            return;
+          }
+          ack.disabled = true;
+          try {
+            await invoke("trade_acknowledge", { marketId, actionId: r.action_id });
+          } catch (e) {
+            showResult("danger", String(e));
+          }
+          void loadRequests();
+        });
+        td(ack, "num");
+      } else {
+        td("");
+      }
+      return tr;
+    }),
+  );
+}
+
 // ---- events --------------------------------------------------------------------
 
 el<HTMLSelectElement>("tr-market").addEventListener("change", (e) => selectMarket((e.target as HTMLSelectElement).value));
 
-for (const [tab, panel] of [
+const TABS = [
   ["tr-tab-orders", "tr-orders"],
   ["tr-tab-trades", "tr-trades"],
-] as const) {
+  ["tr-tab-requests", "tr-requests"],
+] as const;
+for (const [tab, panel] of TABS) {
   el(tab).addEventListener("click", () => {
-    for (const [t, p] of [
-      ["tr-tab-orders", "tr-orders"],
-      ["tr-tab-trades", "tr-trades"],
-    ]) {
+    for (const [t, p] of TABS) {
       el(t).setAttribute("aria-selected", String(t === tab));
       el(p).hidden = p !== panel;
     }
   });
 }
 
+for (const [id, s] of [
+  ["tr-buy", "bid"],
+  ["tr-sell", "ask"],
+] as const) {
+  el(id).addEventListener("click", () => {
+    side = s;
+    renderForm();
+  });
+}
+el("tr-ladder").addEventListener("change", renderForm);
+el("tr-cancel-bid").addEventListener("click", () => void cancelOrder("bid"));
+el("tr-cancel-ask").addEventListener("click", () => void cancelOrder("ask"));
+el("tr-form").addEventListener("input", renderForm);
+el("tr-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  void reviewOrder();
+});
+
 // Staleness is a matter of time, not of replies: re-check it every second.
+// Requests are read again while one is pending, and now and then otherwise.
 setInterval(() => {
   if (active && market.status) renderHead();
+  const due = requests.some((r) => r.pending) ? REQUESTS_PENDING_MS : REQUESTS_IDLE_MS;
+  if (active && marketId && Date.now() - requestsRead > due) void loadRequests();
 }, 1000);
 
 /** Re-render after amounts were masked or unmasked. */

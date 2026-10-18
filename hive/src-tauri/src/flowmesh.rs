@@ -1,13 +1,13 @@
-//! The Trade page's reads: FlowMesh markets, their verified book, trades and
-//! clearings, and this wallet's trading account. Every FlowMesh call the
-//! page makes goes through here, so a protocol change touches this adapter
+//! The Trade page's FlowMesh calls: markets, their verified book, trades and
+//! clearings, this wallet's trading account, and the orders and
+//! cancellations it approves. Every FlowMesh call goes through here, so a protocol change touches this adapter
 //! and its tests rather than the page.
 //!
 //! Amounts stay exact: prices in B3 atoms per base unit, quantities in base
 //! units and B3 in atoms, all as integer strings. The page formats them with
 //! BigInt and never parses them as floating point.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::rpc::{Client, RpcError};
@@ -73,7 +73,7 @@ pub struct Status {
     pub pending_actions: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub price: String,
     pub quantity: String,
@@ -458,6 +458,563 @@ fn trades(history: &Value, observed: &Value) -> Vec<Trade> {
         .unwrap_or_default()
 }
 
+// ---- orders -----------------------------------------------------------------
+
+/// How long a submission waits for its certified inclusion, where the
+/// endpoint can report it: the node's most (FLOWMESH_CLIENT_ACTION_WAIT_MAX),
+/// which refuses more before signing. Nothing is signed or sent again to wait.
+const SUBMIT_WAIT_MS: u64 = 2500;
+/// A ladder holds at most this many prices (FLOWMESH_LADDER_MAX_STEPS).
+pub const LADDER_MAX_STEPS: usize = 4;
+/// After this long without certification a request may be acknowledged as
+/// uncertain (doc/flowmesh-trading-ui.md: submissions pause after 30 s).
+pub const PENDING_ACK_MS: u64 = 30_000;
+
+/// A limit order or ladder as the approval window shows it, and exactly as
+/// it is signed: nothing in it changes after the review opens.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OrderDraft {
+    pub chain: String,
+    pub wallet: String,
+    pub market_id: String,
+    pub base_asset_id: String,
+    pub metadata: Metadata,
+    pub price_tick: String,
+    /// bid (buy the token with B3) or ask (sell it for B3)
+    pub side: String,
+    /// One price for a limit order, up to four for a ladder, best first: a
+    /// bid's highest, an ask's lowest.
+    pub steps: Vec<Point>,
+    /// The account sequence it is signed with.
+    pub sequence: u64,
+    /// What it reserves: B3 atoms for a bid, base units for an ask.
+    pub reserve: String,
+    /// What it may reserve: the free balance plus what the replaced order
+    /// holds.
+    pub available: String,
+    /// This account's open order on that side, which it replaces.
+    pub replaces: Option<Order>,
+    /// Verified by an endpoint rather than this node's own engine.
+    pub remote: bool,
+}
+
+/// Cancelling this wallet's open order on one side.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CancelDraft {
+    pub chain: String,
+    pub wallet: String,
+    pub market_id: String,
+    pub base_asset_id: String,
+    pub metadata: Metadata,
+    pub price_tick: String,
+    pub side: String,
+    pub sequence: u64,
+    pub order: Order,
+    pub remote: bool,
+}
+
+/// A verified per-action outcome, when the node has one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Outcome {
+    /// applied, rejected, included_not_executed or not_executed; None while
+    /// no outcome is verified.
+    pub status: Option<String>,
+    pub text: String,
+    /// Base units filled in the including entry. None when it is not an
+    /// order or nothing is verified: never a guessed zero.
+    pub fill_quantity: Option<String>,
+    /// The entry's uniform clearing price, when its auction cleared.
+    pub fill_price: Option<String>,
+}
+
+/// What the node said about a submission. Accepted is not certified, and
+/// certified is not a fill.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Receipt {
+    pub action_id: String,
+    pub accepted: bool,
+    /// queued, admitted, rejected, unknown or certified_inclusion
+    pub state: String,
+    /// signed, sent, queued, admitted, certified, outcome_verified,
+    /// not_executed, refused or unknown
+    pub stage: String,
+    pub reason: String,
+    pub outcome: Outcome,
+}
+
+/// One of this wallet's retained requests in a market, newest first.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Request {
+    pub action_id: String,
+    /// order, cancel or other (deposits and withdrawals)
+    pub kind: String,
+    pub side: Option<String>,
+    pub points: Vec<Point>,
+    pub sequence: Option<u64>,
+    pub submitted_ms: u64,
+    pub state: String,
+    pub stage: String,
+    pub reason: String,
+    pub certified: bool,
+    pub outcome: Outcome,
+    /// Below the certified account's next sequence: the market has taken it
+    /// in, or another action used its sequence.
+    pub settled: bool,
+    /// Blocks new actions until it settles or is acknowledged.
+    pub pending: bool,
+    /// It may be acknowledged: its delivery is unknown, or it has waited
+    /// longer than PENDING_ACK_MS.
+    pub uncertain: bool,
+}
+
+fn side_of(side: &str) -> Result<&'static str, String> {
+    match side {
+        "bid" => Ok("bid"),
+        "ask" => Ok("ask"),
+        _ => Err("An order is a buy (bid) or a sell (ask).".into()),
+    }
+}
+
+fn integer(text: &str, what: &str) -> Result<u64, String> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("The {what} is not a whole number of base units."));
+    }
+    text.parse::<u64>()
+        .map_err(|_| format!("The {what} is too large."))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A market's current state for a review: units, status and this wallet's
+/// account, with the smallest book and history the node allows.
+fn fresh(client: &Client, wallet: &str, market_id: &str) -> Result<MarketView, String> {
+    if !valid_id(market_id) {
+        return Err("That is not a market id.".into());
+    }
+    let data = client
+        .call_wallet(
+            wallet,
+            "getflowmeshmarketdata",
+            json!([market_id, {"limit": 1, "curve_limit": 1}]),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(market_view(&data))
+}
+
+/// Refuses a new action while the market cannot take one.
+fn tradable(view: &MarketView) -> Result<(), String> {
+    let s = &view.status;
+    if !s.certified {
+        return Err("This market has no certified state yet.".into());
+    }
+    if !s.halt.is_empty() && s.halt != "none" {
+        return Err(format!("This market is halted ({}).", s.halt));
+    }
+    if s.paused {
+        return Err("Trading in this market is paused.".into());
+    }
+    if s.reconciling {
+        return Err("The node is catching up with the B3 chain. Try again in a moment.".into());
+    }
+    Ok(())
+}
+
+/// Marks which requests still block new ones. A request the certified
+/// account has not taken in yet would compete with a new one for the same
+/// sequence, so nothing new is drafted until it settles, unless the user
+/// acknowledged it as uncertain. Acknowledging never retries it.
+fn classify(list: &mut [Request], next_sequence: u64, now_ms: u64, acknowledged: &[String]) {
+    for r in list {
+        r.settled = r.sequence.is_some_and(|s| s < next_sequence);
+        let open = r.kind != "other" && !r.settled && !r.certified && r.state != "rejected";
+        r.uncertain = open
+            && (r.state == "unknown" || now_ms.saturating_sub(r.submitted_ms) >= PENDING_ACK_MS);
+        r.pending = open && !acknowledged.contains(&r.action_id);
+    }
+}
+
+/// This wallet's requests in a market, with what still blocks new ones.
+pub fn requests_view(
+    client: &Client,
+    wallet: &str,
+    market_id: &str,
+    acknowledged: &[String],
+) -> Result<Vec<Request>, String> {
+    let view = fresh(client, wallet, market_id)?;
+    let next = view.account.map(|a| a.next_sequence).unwrap_or(0);
+    let mut list = requests(client, wallet, market_id).map_err(|e| e.to_string())?;
+    classify(&mut list, next, now_ms(), acknowledged);
+    Ok(list)
+}
+
+fn check_pending(
+    client: &Client,
+    wallet: &str,
+    market_id: &str,
+    next_sequence: u64,
+    acknowledged: &[String],
+) -> Result<(), String> {
+    let mut list = requests(client, wallet, market_id).map_err(|e| e.to_string())?;
+    classify(&mut list, next_sequence, now_ms(), acknowledged);
+    if list.iter().any(|r| r.pending) {
+        return Err("Your previous request is not certified yet. Wait for it before sending another, so the two do not compete.".into());
+    }
+    Ok(())
+}
+
+/// Whether `action_id` may be acknowledged as uncertain now.
+pub fn can_acknowledge(
+    client: &Client,
+    wallet: &str,
+    market_id: &str,
+    action_id: &str,
+) -> Result<(), String> {
+    let list = requests_view(client, wallet, market_id, &[])?;
+    match list.iter().find(|r| r.action_id == action_id) {
+        Some(r) if r.uncertain => Ok(()),
+        Some(_) => Err("That request is not uncertain; wait for it.".into()),
+        None => Err("That request is not this wallet's in this market.".into()),
+    }
+}
+
+/// Just before an approved action is signed: the market must still take
+/// actions and the account must still be at the reviewed sequence, so what
+/// is signed means what was reviewed.
+pub fn recheck(
+    client: &Client,
+    wallet: &str,
+    market_id: &str,
+    sequence: u64,
+) -> Result<(), String> {
+    let view = fresh(client, wallet, market_id)?;
+    tradable(&view)?;
+    match view.account {
+        Some(a) if a.next_sequence == sequence => Ok(()),
+        _ => Err(
+            "The trading account changed since the review. Nothing was signed; review it again."
+                .into(),
+        ),
+    }
+}
+
+/// The open order on one side, the one a new order replaces.
+fn open_order(account: &Account, side: &str) -> Option<Order> {
+    account
+        .orders
+        .iter()
+        .find(|o| o.side == side && o.remaining != "0")
+        .cloned()
+}
+
+/// Checks an order against the market as it is now and drafts it. Prices
+/// are B3 atoms per base unit and quantities base units, as exact integer
+/// strings; they must lie on the market's steps and are never rounded here.
+pub fn prepare_order(
+    client: &Client,
+    chain: &str,
+    wallet: &str,
+    market_id: &str,
+    side: &str,
+    steps: &[Point],
+    acknowledged: &[String],
+) -> Result<OrderDraft, String> {
+    let side = side_of(side)?;
+    if steps.is_empty() || steps.len() > LADDER_MAX_STEPS {
+        return Err(format!("An order has 1 to {LADDER_MAX_STEPS} prices."));
+    }
+    let view = fresh(client, wallet, market_id)?;
+    tradable(&view)?;
+    let metadata = view
+        .metadata
+        .clone()
+        .filter(|m| m.decimals.is_some())
+        .ok_or("The token's decimals are not verified, so the order cannot be checked.")?;
+    let account = view
+        .account
+        .clone()
+        .ok_or("This wallet has no trading account in this market. Deposit first.")?;
+    let parsed = check_steps(side, steps, &view.price_tick, &view.quantity_lot)?;
+    let replaces = open_order(&account, side);
+    let held: u128 = replaces
+        .as_ref()
+        .and_then(|o| o.reserved.parse().ok())
+        .unwrap_or(0);
+    let (reserve, free) = if side == "bid" {
+        (
+            parsed
+                .iter()
+                .map(|(p, q)| *p as u128 * *q as u128)
+                .sum::<u128>(),
+            account.b3_available.parse::<u128>().unwrap_or(0),
+        )
+    } else {
+        (
+            parsed.iter().map(|(_, q)| *q as u128).sum(),
+            account.base_available.parse().unwrap_or(0),
+        )
+    };
+    let available = free + held;
+    if reserve > available {
+        return Err(if side == "bid" {
+            "The order costs more B3 than this trading account has available.".into()
+        } else {
+            "The order sells more of the token than this trading account has available.".into()
+        });
+    }
+    check_pending(
+        client,
+        wallet,
+        market_id,
+        account.next_sequence,
+        acknowledged,
+    )?;
+    Ok(OrderDraft {
+        chain: chain.to_owned(),
+        wallet: wallet.to_owned(),
+        market_id: market_id.to_owned(),
+        base_asset_id: view.base_asset_id,
+        metadata,
+        price_tick: view.price_tick,
+        side: side.to_owned(),
+        steps: parsed
+            .iter()
+            .map(|(p, q)| Point {
+                price: p.to_string(),
+                quantity: q.to_string(),
+            })
+            .collect(),
+        sequence: account.next_sequence,
+        reserve: reserve.to_string(),
+        available: available.to_string(),
+        replaces,
+        remote: view.verification.source == "remote_endpoint",
+    })
+}
+
+/// An order's prices and quantities as exact integers on the market's
+/// steps, best price first. Off-grid values are refused, never rounded.
+fn check_steps(
+    side: &str,
+    steps: &[Point],
+    tick: &str,
+    lot: &str,
+) -> Result<Vec<(u64, u64)>, String> {
+    let tick = integer(tick, "price step")?;
+    let lot = integer(lot, "quantity step")?;
+    let mut parsed: Vec<(u64, u64)> = Vec::new();
+    for step in steps {
+        let price = integer(&step.price, "price")?;
+        let quantity = integer(&step.quantity, "quantity")?;
+        if price == 0 || quantity == 0 {
+            return Err("Every price and quantity must be above zero.".into());
+        }
+        if tick == 0 || price % tick != 0 {
+            return Err("A price is not on the market's price step.".into());
+        }
+        if lot == 0 || quantity % lot != 0 {
+            return Err("A quantity is not on the market's quantity step.".into());
+        }
+        if parsed.iter().any(|(p, _)| *p == price) {
+            return Err("A ladder's prices must all differ.".into());
+        }
+        parsed.push((price, quantity));
+    }
+    if side == "bid" {
+        parsed.sort_by_key(|s| std::cmp::Reverse(s.0));
+    } else {
+        parsed.sort_by_key(|s| s.0);
+    }
+    Ok(parsed)
+}
+
+pub fn prepare_cancel(
+    client: &Client,
+    chain: &str,
+    wallet: &str,
+    market_id: &str,
+    side: &str,
+    acknowledged: &[String],
+) -> Result<CancelDraft, String> {
+    let side = side_of(side)?;
+    let view = fresh(client, wallet, market_id)?;
+    tradable(&view)?;
+    let account = view
+        .account
+        .clone()
+        .ok_or("This wallet has no trading account in this market.")?;
+    let order =
+        open_order(&account, side).ok_or("There is no open order on that side to cancel.")?;
+    check_pending(
+        client,
+        wallet,
+        market_id,
+        account.next_sequence,
+        acknowledged,
+    )?;
+    Ok(CancelDraft {
+        chain: chain.to_owned(),
+        wallet: wallet.to_owned(),
+        market_id: market_id.to_owned(),
+        base_asset_id: view.base_asset_id,
+        metadata: view.metadata.unwrap_or(Metadata {
+            decimals: None,
+            ticker: String::new(),
+            name: String::new(),
+            test_only: false,
+        }),
+        price_tick: view.price_tick,
+        side: side.to_owned(),
+        sequence: account.next_sequence,
+        order,
+        remote: view.verification.source == "remote_endpoint",
+    })
+}
+
+/// The exact RPC call an approved order makes: one price is a limit order,
+/// more are a ladder.
+pub fn order_call(draft: &OrderDraft) -> Result<(&'static str, Value), String> {
+    let steps: Vec<(u64, u64)> = draft
+        .steps
+        .iter()
+        .map(|s| {
+            Ok((
+                integer(&s.price, "price")?,
+                integer(&s.quantity, "quantity")?,
+            ))
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(match steps.as_slice() {
+        [(price, quantity)] => (
+            "submitflowmeshorder",
+            json!([
+                draft.market_id,
+                draft.side,
+                price,
+                quantity,
+                draft.sequence,
+                SUBMIT_WAIT_MS
+            ]),
+        ),
+        _ => (
+            "submitflowmeshladder",
+            json!([
+                draft.market_id,
+                draft.side,
+                steps
+                    .iter()
+                    .map(|(p, q)| json!({"price": p, "quantity": q}))
+                    .collect::<Vec<_>>(),
+                draft.sequence,
+                SUBMIT_WAIT_MS
+            ]),
+        ),
+    })
+}
+
+pub fn cancel_call(draft: &CancelDraft) -> (&'static str, Value) {
+    (
+        "cancelflowmeshorder",
+        json!([draft.market_id, draft.side, draft.sequence, SUBMIT_WAIT_MS]),
+    )
+}
+
+/// Signs and submits an approved order or cancellation. The node keeps the
+/// signed action, so an unknown outcome is never signed again.
+pub fn submit(
+    client: &Client,
+    wallet: &str,
+    (method, params): (&str, Value),
+) -> Result<Receipt, String> {
+    let reply = client
+        .call_wallet(wallet, method, params)
+        .map_err(|e| e.to_string())?;
+    Ok(receipt(&reply))
+}
+
+fn receipt(r: &Value) -> Receipt {
+    Receipt {
+        action_id: text(&r["action_id"]),
+        accepted: r["accepted"].as_bool().unwrap_or(false),
+        state: text(&r["receipt_state"]),
+        stage: text(&r["stage"]),
+        reason: text(&r["reason"]),
+        outcome: outcome(r),
+    }
+}
+
+fn outcome(r: &Value) -> Outcome {
+    let Some(o) = r.get("outcome").filter(|o| o.is_object()) else {
+        return Outcome::default();
+    };
+    let fill = o.get("fill").filter(|f| f.is_object());
+    Outcome {
+        status: Some(text(&o["status"])),
+        text: text(&o["reason_text"]),
+        fill_quantity: fill.map(|f| int(&f["quantity"])),
+        fill_price: fill
+            .filter(|f| f["cleared"].as_bool() == Some(true))
+            .map(|f| int(&f["price"])),
+    }
+}
+
+/// This wallet's retained requests in a market, newest first.
+fn requests(client: &Client, wallet: &str, market_id: &str) -> Result<Vec<Request>, RpcError> {
+    let list = client.call_wallet(wallet, "listflowmeshactions", json!([market_id]))?;
+    Ok(request_list(&list))
+}
+
+fn request_list(list: &Value) -> Vec<Request> {
+    let mut out: Vec<Request> = list["actions"]
+        .as_array()
+        .map(|all| all.iter().map(request).collect())
+        .unwrap_or_default();
+    out.sort_by_key(|r| std::cmp::Reverse(r.submitted_ms));
+    out
+}
+
+fn request(a: &Value) -> Request {
+    let r = &a["receipt"];
+    let points: Vec<Point> = a["canonical_points"]
+        .as_array()
+        .map(|ps| {
+            ps.iter()
+                .map(|p| Point {
+                    price: int(&p["price"]),
+                    quantity: int(&p["quantity"]),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let side = a["canonical_side"].as_str().map(str::to_owned);
+    let kind = match (&side, points.is_empty()) {
+        (Some(_), false) => "order",
+        (Some(_), true) => "cancel",
+        (None, _) => "other",
+    };
+    Request {
+        action_id: text(&a["action_id"]),
+        kind: kind.into(),
+        side,
+        points,
+        sequence: a["sequence"].as_u64(),
+        submitted_ms: a["initial_submission_ms"].as_u64().unwrap_or(0),
+        state: text(&r["receipt_state"]),
+        stage: text(&r["stage"]),
+        reason: text(&r["reason"]),
+        certified: a["previously_certified"].as_bool().unwrap_or(false)
+            || r["receipt_state"] == "certified_inclusion",
+        outcome: outcome(r),
+        settled: false,
+        pending: false,
+        uncertain: false,
+    }
+}
+
 fn text(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_owned()
 }
@@ -467,7 +1024,10 @@ fn text(v: &Value) -> String {
 /// becomes "0" rather than an inexact value.
 fn int(v: &Value) -> String {
     match v {
-        Value::Number(n) => n.as_u64().map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
+        Value::Number(n) => n
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "0".into()),
         Value::String(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => s.clone(),
         _ => "0".into(),
     }
@@ -594,5 +1154,125 @@ mod tests {
         assert!(valid_id(&"ab".repeat(32)));
         assert!(!valid_id("ab"));
         assert!(!valid_id(&format!("{}\"", "a".repeat(63))));
+    }
+
+    fn pt(price: &str, quantity: &str) -> Point {
+        Point {
+            price: price.into(),
+            quantity: quantity.into(),
+        }
+    }
+
+    #[test]
+    fn order_steps_are_exact_on_grid_and_best_first() {
+        let bid = check_steps(
+            "bid",
+            &[pt("100", "5"), pt("300", "1"), pt("200", "2")],
+            "100",
+            "1",
+        )
+        .unwrap();
+        assert_eq!(bid, vec![(300, 1), (200, 2), (100, 5)]);
+        let ask = check_steps("ask", &[pt("300", "1"), pt("100", "5")], "100", "1").unwrap();
+        assert_eq!(ask, vec![(100, 5), (300, 1)]);
+        // Off the grid, zero, fractional, repeated: refused, never rounded.
+        assert!(check_steps("bid", &[pt("150", "1")], "100", "1").is_err());
+        assert!(check_steps("bid", &[pt("100", "3")], "100", "2").is_err());
+        assert!(check_steps("bid", &[pt("0", "1")], "1", "1").is_err());
+        assert!(check_steps("bid", &[pt("1.5", "1")], "1", "1").is_err());
+        assert!(check_steps("bid", &[pt("-1", "1")], "1", "1").is_err());
+        assert!(check_steps("bid", &[pt("2", "1"), pt("2", "3")], "1", "1").is_err());
+        assert!(check_steps("bid", &[pt("99999999999999999999", "1")], "1", "1").is_err());
+    }
+
+    fn order(steps: Vec<Point>) -> OrderDraft {
+        OrderDraft {
+            chain: "regtest".into(),
+            wallet: "w".into(),
+            market_id: "2a".repeat(32),
+            base_asset_id: "e3".repeat(32),
+            metadata: Metadata {
+                decimals: Some(2),
+                ticker: String::new(),
+                name: String::new(),
+                test_only: false,
+            },
+            price_tick: "1".into(),
+            side: "bid".into(),
+            steps,
+            sequence: 7,
+            reserve: "0".into(),
+            available: "0".into(),
+            replaces: None,
+            remote: true,
+        }
+    }
+
+    #[test]
+    fn one_price_is_a_limit_order_and_more_are_a_ladder() {
+        let (method, params) = order_call(&order(vec![pt("30000000", "3")])).unwrap();
+        assert_eq!(method, "submitflowmeshorder");
+        assert_eq!(
+            params,
+            json!(["2a".repeat(32), "bid", 30000000u64, 3, 7, SUBMIT_WAIT_MS])
+        );
+        let (method, params) = order_call(&order(vec![pt("3", "1"), pt("2", "4")])).unwrap();
+        assert_eq!(method, "submitflowmeshladder");
+        assert_eq!(
+            params[2],
+            json!([{"price": 3, "quantity": 1}, {"price": 2, "quantity": 4}])
+        );
+        assert_eq!(params[3], 7);
+    }
+
+    fn actions() -> Value {
+        json!({"source": "local-retained-outbox", "actions": [
+            {"action_id": "a1", "canonical_side": "bid",
+                "canonical_points": [{"price": 30000000, "quantity": 3}], "sequence": 6,
+                "initial_submission_ms": 1000, "previously_certified": true,
+                "receipt": {"receipt_state": "certified_inclusion", "stage": "outcome_verified",
+                    "reason": "", "outcome": {"status": "applied", "reason_text": "Applied",
+                        "fill": {"side": "bid", "cleared": false, "quantity": 0, "price": 0}}}},
+            {"action_id": "a2", "canonical_side": "ask", "canonical_points": [], "sequence": 7,
+                "initial_submission_ms": 50000, "previously_certified": false,
+                "receipt": {"receipt_state": "queued", "stage": "queued", "reason": "queued"}},
+            {"action_id": "a3", "initial_submission_ms": 2000, "previously_certified": false,
+                "receipt": {"receipt_state": "unknown", "stage": "unknown", "reason": ""}}
+        ]})
+    }
+
+    #[test]
+    fn requests_are_newest_first_with_verified_outcomes_only() {
+        let list = request_list(&actions());
+        let ids: Vec<_> = list.iter().map(|r| r.action_id.as_str()).collect();
+        assert_eq!(ids, ["a2", "a3", "a1"]);
+        assert_eq!(list[0].kind, "cancel");
+        assert_eq!(list[1].kind, "other");
+        assert_eq!(list[2].kind, "order");
+        let a1 = &list[2].outcome;
+        assert_eq!(a1.status.as_deref(), Some("applied"));
+        // A verified zero fill is a zero; an auction that did not clear has no price.
+        assert_eq!(a1.fill_quantity.as_deref(), Some("0"));
+        assert_eq!(a1.fill_price, None);
+        assert_eq!(list[0].outcome, Outcome::default());
+    }
+
+    #[test]
+    fn an_unsettled_request_blocks_until_it_settles_or_is_acknowledged() {
+        let mut list = request_list(&actions());
+        classify(&mut list, 7, 60000, &[]);
+        let a2 = list.iter().find(|r| r.action_id == "a2").unwrap();
+        assert!(a2.pending && !a2.uncertain, "queued 10 s ago");
+        // Deposits and withdrawals never block orders here.
+        assert!(!list.iter().find(|r| r.action_id == "a3").unwrap().pending);
+        assert!(list.iter().find(|r| r.action_id == "a1").unwrap().settled);
+        classify(&mut list, 7, 50000 + PENDING_ACK_MS, &[]);
+        let a2 = list.iter().find(|r| r.action_id == "a2").unwrap();
+        assert!(a2.pending && a2.uncertain, "queued 30 s");
+        classify(&mut list, 7, 50000 + PENDING_ACK_MS, &["a2".into()]);
+        assert!(!list.iter().any(|r| r.pending));
+        // Once the account moves past its sequence it has settled.
+        classify(&mut list, 8, 60000, &[]);
+        assert!(!list.iter().any(|r| r.pending));
     }
 }

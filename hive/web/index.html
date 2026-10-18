@@ -559,16 +559,23 @@
                     <div class="tabs" role="tablist" aria-label="Orders and trades">
                       <button class="tab" type="button" role="tab" id="tr-tab-orders" aria-selected="true" aria-controls="tr-orders">Your orders</button>
                       <button class="tab" type="button" role="tab" id="tr-tab-trades" aria-selected="false" aria-controls="tr-trades">Trades</button>
+                      <button class="tab" type="button" role="tab" id="tr-tab-requests" aria-selected="false" aria-controls="tr-requests">Requests</button>
                     </div>
                   </div>
                   <div id="tr-orders" role="tabpanel" aria-labelledby="tr-tab-orders">
                     <div class="table-wrap">
                       <table class="tbl">
-                        <thead><tr><th>Side</th><th class="num">Limit (B3)</th><th class="num">Remaining</th><th class="num">Filled</th><th class="num">Reserved</th><th>Status</th></tr></thead>
+                        <thead><tr><th>Side</th><th class="num">Limit (B3)</th><th class="num">Remaining</th><th class="num">Filled</th><th class="num">Reserved</th></tr></thead>
                         <tbody id="tr-orders-rows"></tbody>
                       </table>
                     </div>
-                    <p class="card-pad t-sm muted" id="tr-orders-note"></p>
+                    <div class="card-pad stack">
+                      <div class="btn-row" id="tr-cancels" hidden>
+                        <button class="btn btn-secondary btn-sm" type="button" id="tr-cancel-bid">Cancel buy order</button>
+                        <button class="btn btn-secondary btn-sm" type="button" id="tr-cancel-ask">Cancel sell order</button>
+                      </div>
+                      <p class="t-sm muted" id="tr-orders-note"></p>
+                    </div>
                   </div>
                   <div id="tr-trades" role="tabpanel" aria-labelledby="tr-tab-trades" hidden>
                     <div class="table-wrap">
@@ -579,9 +586,63 @@
                     </div>
                     <p class="card-pad t-sm muted" id="tr-trades-empty" hidden>No auction has matched in the retained history.</p>
                   </div>
+                  <div id="tr-requests" role="tabpanel" aria-labelledby="tr-tab-requests" hidden>
+                    <div class="table-wrap">
+                      <table class="tbl">
+                        <thead><tr><th>Sent</th><th>Request</th><th class="num" title="The account sequence it was signed with">Seq.</th><th>Status</th><th>Outcome</th><th><span class="sr-only">Action</span></th></tr></thead>
+                        <tbody id="tr-requests-rows"></tbody>
+                      </table>
+                    </div>
+                    <p class="card-pad t-sm muted" id="tr-requests-note">Orders and cancellations this wallet signed in this market, from your node's own record. Accepted means queued; certified means a quorum certified the result, which may or may not include a fill.</p>
+                  </div>
                 </div>
               </div>
               <div class="stack tr-side">
+                <div class="card" id="tr-ticket">
+                  <div class="card-head">
+                    <div class="tabs tr-sides" role="tablist" aria-label="Order side">
+                      <button class="tab" type="button" role="tab" id="tr-buy" aria-selected="true">Buy</button>
+                      <button class="tab" type="button" role="tab" id="tr-sell" aria-selected="false">Sell</button>
+                    </div>
+                  </div>
+                  <form class="card-pad stack" id="tr-form" novalidate>
+                    <div class="stack tr-steps">
+                      <div class="tr-step" id="tr-step-0">
+                        <div class="field"><label for="tr-price-0" data-tr-price>Price</label><input class="input tnum" id="tr-price-0" inputmode="decimal" autocomplete="off" spellcheck="false" /></div>
+                        <div class="field"><label for="tr-qty-0" data-tr-qty>Quantity</label><input class="input tnum" id="tr-qty-0" inputmode="decimal" autocomplete="off" spellcheck="false" /></div>
+                      </div>
+                      <div class="tr-step" id="tr-step-1" hidden>
+                        <div class="field"><label for="tr-price-1" class="sr-only" data-tr-price>Price 2</label><input class="input tnum" id="tr-price-1" inputmode="decimal" autocomplete="off" spellcheck="false" /></div>
+                        <div class="field"><label for="tr-qty-1" class="sr-only" data-tr-qty>Quantity 2</label><input class="input tnum" id="tr-qty-1" inputmode="decimal" autocomplete="off" spellcheck="false" /></div>
+                      </div>
+                      <div class="tr-step" id="tr-step-2" hidden>
+                        <div class="field"><label for="tr-price-2" class="sr-only" data-tr-price>Price 3</label><input class="input tnum" id="tr-price-2" inputmode="decimal" autocomplete="off" spellcheck="false" /></div>
+                        <div class="field"><label for="tr-qty-2" class="sr-only" data-tr-qty>Quantity 3</label><input class="input tnum" id="tr-qty-2" inputmode="decimal" autocomplete="off" spellcheck="false" /></div>
+                      </div>
+                      <div class="tr-step" id="tr-step-3" hidden>
+                        <div class="field"><label for="tr-price-3" class="sr-only" data-tr-price>Price 4</label><input class="input tnum" id="tr-price-3" inputmode="decimal" autocomplete="off" spellcheck="false" /></div>
+                        <div class="field"><label for="tr-qty-3" class="sr-only" data-tr-qty>Quantity 4</label><input class="input tnum" id="tr-qty-3" inputmode="decimal" autocomplete="off" spellcheck="false" /></div>
+                      </div>
+                    </div>
+                    <span class="t-xs muted" id="tr-steps-help"></span>
+                    <label class="check">
+                      <input type="checkbox" id="tr-ladder" />
+                      <span class="check-body">
+                        <span>Ladder · up to 4 prices</span>
+                        <span class="help">Still one order: it replaces this side, and its prices cannot be cancelled one by one.</span>
+                      </span>
+                    </label>
+                    <div class="details" id="tr-summary" hidden>
+                      <div class="drow"><span class="dkey" id="tr-reserve-label">Reserves</span><span class="dval tnum" id="tr-reserve"></span></div>
+                      <div class="drow"><span class="dkey">Available to reserve</span><span class="dval tnum" id="tr-available"></span></div>
+                      <div class="drow" id="tr-replaces-row" hidden><span class="dkey">Replaces</span><span class="dval tnum" id="tr-replaces"></span></div>
+                    </div>
+                    <p class="t-sm tr-form-error" id="tr-form-error" role="alert" hidden></p>
+                    <div class="banner" id="tr-result" role="status" hidden></div>
+                    <button class="btn btn-primary btn-block" type="submit" id="tr-review">Review buy order</button>
+                    <p class="t-xs muted" id="tr-gate" hidden></p>
+                  </form>
+                </div>
                 <div class="card">
                   <div class="card-head">
                     <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-list" /></svg>Order book</h2>

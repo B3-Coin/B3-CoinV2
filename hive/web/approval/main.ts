@@ -1,7 +1,8 @@
 // The approval window. It shows only what the core decoded from the draft it
 // holds, and its only powers are reading that draft and deciding on it.
 import { invoke } from "@tauri-apps/api/core";
-import { el, formatAmount, initTheme, sumAmounts } from "../shared/ui";
+import { el, formatAmount, initTheme, shorten, sumAmounts } from "../shared/ui";
+import { formatB3, formatPrice, formatQuantity, quantityPlaces, type Units } from "../src/tradefmt";
 
 type OutputLine = { address: string; amount: string; change: boolean; mine: boolean };
 type Summary = { chain: string; wallet: string; outputs: OutputLine[]; fee: string; inputs: number };
@@ -16,6 +17,38 @@ type PsbtSummary = {
   finalized: number;
   complete: boolean;
 };
+// Mirror flowmesh::OrderDraft and CancelDraft: amounts are exact integer
+// strings, prices in B3 atoms per base unit and quantities in base units.
+type Metadata = { decimals: number | null; ticker: string; name: string; test_only: boolean };
+type Point = { price: string; quantity: string };
+type Order = { side: "bid" | "ask"; remaining: string; reserved: string; points: Point[] };
+type OrderDraft = {
+  chain: string;
+  wallet: string;
+  market_id: string;
+  base_asset_id: string;
+  metadata: Metadata;
+  price_tick: string;
+  side: "bid" | "ask";
+  steps: Point[];
+  sequence: number;
+  reserve: string;
+  available: string;
+  replaces: Order | null;
+  remote: boolean;
+};
+type CancelDraft = {
+  chain: string;
+  wallet: string;
+  market_id: string;
+  base_asset_id: string;
+  metadata: Metadata;
+  price_tick: string;
+  side: "bid" | "ask";
+  sequence: number;
+  order: Order;
+  remote: boolean;
+};
 // Mirrors drafts::Request in src-tauri/src/drafts.rs.
 type Request =
   | { kind: "pay"; summary: Summary }
@@ -23,7 +56,9 @@ type Request =
   | { kind: "sign_psbt"; summary: PsbtSummary }
   | { kind: "send_psbt"; summary: PsbtSummary }
   | { kind: "stake"; chain: string; wallet: string; amount: string; activation_depth: number }
-  | { kind: "bind_finality"; chain: string; wallet: string; rotate: boolean };
+  | { kind: "bind_finality"; chain: string; wallet: string; rotate: boolean }
+  | { kind: "trade_order"; order: OrderDraft }
+  | { kind: "trade_cancel"; cancel: CancelDraft };
 type DraftView = {
   id: string;
   request: Request;
@@ -135,7 +170,7 @@ function showPsbt(kind: "sign_psbt" | "send_psbt", s: PsbtSummary): void {
 
 // Staking requests go to the node as they are; it picks the coins and the
 // fee when they are approved, so the window says so instead of a figure.
-function showAction(r: Exclude<Request, { kind: "pay" | "release" | "sign_psbt" | "send_psbt" }>): void {
+function showAction(r: Extract<Request, { kind: "stake" | "bind_finality" }>): void {
   el("from").textContent = `From ${walletName(r.wallet)} on ${r.chain}`;
   const fee = row("Network fee", "Set by the wallet when it is sent", undefined, false);
   if (r.kind === "stake") {
@@ -156,6 +191,97 @@ function showAction(r: Exclude<Request, { kind: "pay" | "release" | "sign_psbt" 
     "The wallet is locked. It unlocks only for this request and locks again straight after.";
 }
 
+// A FlowMesh order or cancellation: exactly what is signed, in B3 per token
+// and in tokens, with what it reserves and replaces.
+function tokenName(m: Metadata, assetId: string): string {
+  return m.ticker || m.name || `Token ${shorten(assetId, 6, 4)}`;
+}
+
+function tradeUnits(m: Metadata, tick: string): Units | null {
+  return m.decimals === null ? null : { decimals: m.decimals, tick: BigInt(tick), lot: 1n };
+}
+
+const B3 = (atoms: string) => `${formatB3(BigInt(atoms))} B3`;
+
+function stepRows(side: "bid" | "ask", points: Point[], u: Units, token: string): HTMLElement[] {
+  const places = quantityPlaces(points.map((p) => BigInt(p.quantity)), u.decimals);
+  return points.map((p) =>
+    row(
+      side === "bid" ? "Buy" : "Sell",
+      `${formatQuantity(BigInt(p.quantity), u.decimals, places)} ${token} · limit ${formatPrice(BigInt(p.price), u)} B3`,
+    ),
+  );
+}
+
+function marketRows(d: { chain: string; market_id: string; base_asset_id: string; sequence: number; remote: boolean }): HTMLElement[] {
+  return [
+    row("Market", shorten(d.market_id, 10, 6), undefined, false),
+    row("Token", shorten(d.base_asset_id, 10, 6), undefined, false),
+    row("Account sequence", String(d.sequence), undefined, false),
+    row("Verified by", d.remote ? "Trading endpoint" : "This node's engine", undefined, false),
+    row("Network", d.chain, undefined, false),
+  ];
+}
+
+function showTrade(r: Extract<Request, { kind: "trade_order" | "trade_cancel" }>): void {
+  if (r.kind === "trade_order") {
+    const o = r.order;
+    const token = tokenName(o.metadata, o.base_asset_id);
+    const u = tradeUnits(o.metadata, o.price_tick);
+    const buy = o.side === "bid";
+    const verb = buy ? "Buy" : "Sell";
+    el("from").textContent = `From ${walletName(o.wallet)} on ${o.chain} · ${token} / B3${o.metadata.test_only ? " · test asset" : ""}`;
+    if (!u) {
+      // The core refuses to draft without verified decimals; never guess them.
+      el("title").textContent = "This order cannot be shown";
+      el("action-text").textContent = "The token's decimals are not verified. Reject it.";
+      el("action-rows").replaceChildren();
+      el("approve").hidden = true;
+      return;
+    }
+    const total = o.steps.reduce((sum, p) => sum + BigInt(p.quantity), 0n);
+    const amount = `${formatQuantity(total, u.decimals)} ${token}`;
+    el("title").textContent =
+      o.steps.length === 1
+        ? `${verb} ${amount} at ${formatPrice(BigInt(o.steps[0].price), u)} B3?`
+        : `${verb} ${amount} on a ladder of ${o.steps.length} prices?`;
+    const replaced = o.replaces
+      ? ` It replaces your open ${buy ? "buy" : "sell"} order, whose remaining ${formatQuantity(BigInt(o.replaces.remaining), u.decimals)} ${token} is not kept: this order's quantity counts from zero.`
+      : "";
+    el("action-text").textContent =
+      `This signs one FlowMesh order and sends it to the market.${replaced} Accepted means queued, not filled: it fills only in a certified auction, at one uniform price for everyone that can be better than your limit. The order itself has no network fee; sellers pay 0.01% of the matched B3.` +
+      (o.steps.length > 1 ? " A ladder is one order: its prices cannot be cancelled one by one." : "");
+    el("action-rows").replaceChildren(
+      ...stepRows(o.side, o.steps, u, token),
+      row(buy ? "Reserves at most" : "Reserves", buy ? B3(o.reserve) : `${formatQuantity(BigInt(o.reserve), u.decimals)} ${token}`),
+      row("Available to reserve", buy ? B3(o.available) : `${formatQuantity(BigInt(o.available), u.decimals)} ${token}`),
+      ...marketRows(o),
+    );
+    el("approve").textContent = buy ? "Place buy order" : "Place sell order";
+  } else {
+    const c = r.cancel;
+    const token = tokenName(c.metadata, c.base_asset_id);
+    const u = tradeUnits(c.metadata, c.price_tick);
+    const buy = c.side === "bid";
+    el("from").textContent = `From ${walletName(c.wallet)} on ${c.chain} · ${token} / B3`;
+    el("title").textContent = `Cancel your ${buy ? "buy" : "sell"} order?`;
+    el("action-text").textContent =
+      `This signs a cancellation of your open ${buy ? "buy" : "sell"} order and sends it to the market. It takes effect only once certified; until then the order can still fill. What it holds returns to your trading balance then.`;
+    el("action-rows").replaceChildren(
+      ...(u
+        ? [
+            row("Remaining", `${formatQuantity(BigInt(c.order.remaining), u.decimals)} ${token}`),
+            row("Held for it", buy ? B3(c.order.reserved) : `${formatQuantity(BigInt(c.order.reserved), u.decimals)} ${token}`),
+          ]
+        : [row("Remaining", `${c.order.remaining} base units`)]),
+      ...marketRows(c),
+    );
+    el("approve").textContent = "Send cancellation";
+  }
+  el("pass-help").textContent =
+    "The wallet is locked. It unlocks only to sign this request and locks again straight after.";
+}
+
 function show(draft: DraftView | null): void {
   el("empty").hidden = draft !== null;
   el("draft").hidden = draft === null;
@@ -165,9 +291,11 @@ function show(draft: DraftView | null): void {
   const pay = r.kind === "pay" || r.kind === "release" || r.kind === "sign_psbt" || r.kind === "send_psbt";
   el("pay-body").hidden = !pay;
   el("action-body").hidden = pay;
+  el("approve").hidden = false;
   if (r.kind === "pay") showPay(r.summary);
   else if (r.kind === "release") showRelease(r.summary);
   else if (r.kind === "sign_psbt" || r.kind === "send_psbt") showPsbt(r.kind, r.summary);
+  else if (r.kind === "trade_order" || r.kind === "trade_cancel") showTrade(r);
   else showAction(r);
   el("pass-field").hidden = !draft.locked;
   el<HTMLInputElement>("pass").value = "";

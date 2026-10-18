@@ -115,3 +115,17 @@
   padding: var(--space-1) var(--space-1); margin-block: var(--space-1);
   border-block: 1px solid var(--border); text-align: center;
 }
+
+/* Order form: a price and a quantity per row, up to four rows for a ladder. */
+.tr-steps { gap: var(--space-2); }
+.tr-step { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
+.tr-step .field + .field { margin-top: 0; }
+.tr-sides { flex: 1 1 auto; }
+.tr-sides .tab { flex: 1 1 auto; justify-content: center; }
+.tr-sides #tr-buy[aria-selected="true"] { color: var(--success); }
+.tr-sides #tr-sell[aria-selected="true"] { color: var(--danger); }
+.tr-form-error { color: var(--danger); }
+.tr-book-row.tr-pick { cursor: pointer; }
+.tr-book-row.tr-pick:hover { background: var(--bg-subtle); }
+/* Amounts and their units stay on one line; the table scrolls instead. */
+#view-trade .tbl td.num, #view-trade .tbl th.num { white-space: nowrap; }

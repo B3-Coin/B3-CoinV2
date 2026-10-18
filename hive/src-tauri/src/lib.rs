@@ -54,6 +54,9 @@ pub struct Core {
     /// Set once the app is exiting, so a late restart cannot leave a node behind.
     exiting: AtomicBool,
     drafts: Mutex<DraftStore>,
+    /// FlowMesh requests the user acknowledged as uncertain, so new ones may
+    /// be drafted. Acknowledging never retries or cancels them.
+    trade_acknowledged: Mutex<Vec<String>>,
     /// The wallet picked in the main window; the pages fall back to the first
     /// loaded wallet when it is not loaded.
     wallet: Mutex<Option<String>>,
@@ -147,6 +150,12 @@ pub enum DraftResult {
         id: String,
         psbt: String,
         complete: bool,
+    },
+    /// A FlowMesh order or cancellation was submitted: accepted is not
+    /// certified, and certified is not a fill.
+    Traded {
+        id: String,
+        receipt: flowmesh::Receipt,
     },
     Rejected {
         id: String,
@@ -442,6 +451,109 @@ async fn trade_market(
             ticks_after,
         };
         flowmesh::market(client, &name, &market_id, &query)
+    })
+    .await
+}
+
+/// Drafts a FlowMesh limit order (one step) or ladder (up to four) for the
+/// approval window, after checking it against the market as it is now. The
+/// page only learns the draft id.
+#[tauri::command]
+async fn trade_order_draft(
+    app: AppHandle,
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+    side: String,
+    steps: Vec<flowmesh::Point>,
+) -> Result<String, String> {
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let acknowledged = core.trade_acknowledged.lock().unwrap().clone();
+        let chain = node.chain().unwrap_or_default();
+        let order = flowmesh::prepare_order(
+            client,
+            &chain,
+            &name,
+            &market_id,
+            &side,
+            &steps,
+            &acknowledged,
+        )?;
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(Request::TradeOrder { order })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Drafts cancelling the page wallet's open order on one side.
+#[tauri::command]
+async fn trade_cancel_draft(
+    app: AppHandle,
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+    side: String,
+) -> Result<String, String> {
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let acknowledged = core.trade_acknowledged.lock().unwrap().clone();
+        let chain = node.chain().unwrap_or_default();
+        let cancel =
+            flowmesh::prepare_cancel(client, &chain, &name, &market_id, &side, &acknowledged)?;
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(Request::TradeCancel { cancel })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// The page wallet's FlowMesh requests in a market, newest first, from the
+/// node's local record; no endpoint is asked.
+#[tauri::command]
+async fn trade_requests(
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+) -> Result<Vec<flowmesh::Request>, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let acknowledged = core.trade_acknowledged.lock().unwrap().clone();
+        flowmesh::requests_view(client, &name, &market_id, &acknowledged)
+    })
+    .await
+}
+
+/// Lets new requests be drafted past an uncertain one. It is not retried,
+/// cancelled or proven to have failed: it may still be certified later.
+#[tauri::command]
+async fn trade_acknowledge(
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+    action_id: String,
+) -> Result<(), String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        flowmesh::can_acknowledge(client, &name, &market_id, &action_id)?;
+        let mut acknowledged = core.trade_acknowledged.lock().unwrap();
+        if !acknowledged.contains(&action_id) {
+            acknowledged.push(action_id);
+        }
+        Ok(())
     })
     .await
 }
@@ -1446,6 +1558,7 @@ fn draft_view(client: Option<&rpc::Client>, draft: drafts::Draft) -> DraftView {
 enum Done {
     Sent(String),
     Signed { psbt: String, complete: bool },
+    Traded(flowmesh::Receipt),
 }
 
 /// Carries out an approved request.
@@ -1455,6 +1568,15 @@ fn execute(client: &rpc::Client, request: Request) -> Result<Done, String> {
             .map(|(psbt, complete)| Done::Signed { psbt, complete }),
         Request::SendPsbt { summary, loaded } => {
             psbt::send(client, &summary, &loaded).map(Done::Sent)
+        }
+        Request::TradeOrder { order } => {
+            flowmesh::recheck(client, &order.wallet, &order.market_id, order.sequence)?;
+            flowmesh::submit(client, &order.wallet, flowmesh::order_call(&order)?).map(Done::Traded)
+        }
+        Request::TradeCancel { cancel } => {
+            flowmesh::recheck(client, &cancel.wallet, &cancel.market_id, cancel.sequence)?;
+            flowmesh::submit(client, &cancel.wallet, flowmesh::cancel_call(&cancel))
+                .map(Done::Traded)
         }
         request => execute_sent(client, request).map(Done::Sent),
     }
@@ -1474,7 +1596,10 @@ fn execute_sent(client: &rpc::Client, request: Request) -> Result<String, String
         }
         Request::Stake { wallet, amount, .. } => stake::create(client, &wallet, &amount),
         Request::BindFinality { wallet, .. } => stake::bind(client, &wallet),
-        Request::SignPsbt { .. } | Request::SendPsbt { .. } => unreachable!("handled by execute"),
+        Request::SignPsbt { .. }
+        | Request::SendPsbt { .. }
+        | Request::TradeOrder { .. }
+        | Request::TradeCancel { .. } => unreachable!("handled by execute"),
     }
 }
 
@@ -1560,6 +1685,10 @@ async fn approval_decide(
                 id: id.clone(),
                 psbt,
                 complete,
+            },
+            Ok(Done::Traded(receipt)) => DraftResult::Traded {
+                id: id.clone(),
+                receipt,
             },
             Err(error) => DraftResult::Failed {
                 id: id.clone(),
@@ -1891,6 +2020,7 @@ pub fn run() {
                 config,
                 exiting: AtomicBool::new(false),
                 drafts: Mutex::new(DraftStore::default()),
+                trade_acknowledged: Mutex::new(Vec::new()),
                 wallet: Mutex::new(None),
                 passphrase: Mutex::new(None),
                 theme: Mutex::new(None),
@@ -1955,6 +2085,10 @@ pub fn run() {
             stake_status,
             trade_markets,
             trade_market,
+            trade_order_draft,
+            trade_cancel_draft,
+            trade_requests,
+            trade_acknowledge,
             stake_draft,
             release_draft,
             wallet_restore,

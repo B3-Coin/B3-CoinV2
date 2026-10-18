@@ -79,6 +79,12 @@ pub enum Request {
         wallet: String,
         rotate: bool,
     },
+    /// Place a FlowMesh limit order or ladder, signed exactly as drafted.
+    TradeOrder { order: crate::flowmesh::OrderDraft },
+    /// Cancel this wallet's open FlowMesh order on one side.
+    TradeCancel {
+        cancel: crate::flowmesh::CancelDraft,
+    },
 }
 
 impl Request {
@@ -89,6 +95,8 @@ impl Request {
                 &summary.wallet
             }
             Request::Stake { wallet, .. } | Request::BindFinality { wallet, .. } => wallet,
+            Request::TradeOrder { order } => &order.wallet,
+            Request::TradeCancel { cancel } => &cancel.wallet,
         }
     }
 

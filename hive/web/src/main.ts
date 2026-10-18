@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { amountNode, amountUnits, el, formatAmount, icon, initTheme, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
-import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged } from "./trade";
+import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeResult } from "./trade";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -116,7 +116,9 @@ type DraftResult =
   | { outcome: "sent"; id: string; txid: string }
   | { outcome: "signed"; id: string; psbt: string; complete: boolean }
   | { outcome: "rejected"; id: string }
-  | { outcome: "failed"; id: string; error: string };
+  | { outcome: "failed"; id: string; error: string }
+  // A FlowMesh order or cancellation; the Trade page handles its own.
+  | { outcome: "traded"; id: string };
 
 function showThemeIcon(theme: Theme): void {
   // The button shows the theme it switches to.
@@ -2850,6 +2852,7 @@ await listen<PassResult>("passphrase-result", (event) => {
 
 await listen<DraftResult>("draft-result", (event) => {
   const r = event.payload;
+  if (tradeDecided(r as TradeResult)) return;
   if (psbtDrafts.has(r.id)) {
     psbtDrafts.delete(r.id);
     void psbtDecided(r);

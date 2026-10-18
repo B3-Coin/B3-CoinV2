@@ -91,6 +91,50 @@ export function notional(q: bigint, p: bigint): bigint {
   return q * p;
 }
 
+/** A typed decimal as digits / 10^scale, or null when it is not a plain
+ *  non-negative decimal. Grouping spaces are allowed; nothing is rounded. */
+function readDecimal(text: string): { digits: bigint; scale: number } | null {
+  const t = text.replace(/[\s ]/g, "");
+  if (!/^(\d+\.?\d*|\.\d+)$/.test(t)) return null;
+  const [int, frac = ""] = t.split(".");
+  return { digits: BigInt((int || "0") + frac), scale: frac.length };
+}
+
+/** digits / 10^scale x 10^shift as an exact integer, or null when that
+ *  would need a fraction. */
+function shifted(digits: bigint, scale: number, shift: number): bigint | null {
+  const e = shift - scale;
+  if (e >= 0) return digits * pow10(e);
+  return digits % pow10(-e) === 0n ? digits / pow10(-e) : null;
+}
+
+export type Parsed = { value: bigint } | { error: string };
+
+/** A price typed in B3 per token, as the canonical B3 atoms per base unit:
+ *  P = typed x 10^(9-d). It must be above zero and on the price step;
+ *  anything else is refused, never rounded. */
+export function parsePrice(text: string, units: Units): Parsed {
+  const d = readDecimal(text);
+  if (!d) return { error: "Enter the price as a number, in B3 per token." };
+  const p = shifted(d.digits, d.scale, B3_DECIMALS - units.decimals);
+  const step = formatPrice(units.tick, units);
+  if (p === null || p % units.tick !== 0n) return { error: `The price must be a multiple of ${step} B3.` };
+  if (p === 0n) return { error: "The price must be above zero." };
+  return { value: p };
+}
+
+/** A quantity typed in tokens, as base units: q = typed x 10^d, above zero
+ *  and on the quantity step. */
+export function parseQuantity(text: string, units: Units): Parsed {
+  const d = readDecimal(text);
+  if (!d) return { error: "Enter the quantity as a number of tokens." };
+  const q = shifted(d.digits, d.scale, units.decimals);
+  const step = formatQuantity(units.lot, units.decimals);
+  if (q === null || q % units.lot !== 0n) return { error: `The quantity must be a multiple of ${step}.` };
+  if (q === 0n) return { error: "The quantity must be above zero." };
+  return { value: q };
+}
+
 /** Spread of a bid and an ask: their difference as a price, and its share
  *  200 x (ask - bid) / (ask + bid) in percent, rounded half up to 2
  *  decimals. Null when the book is crossed or locked (bid >= ask). */

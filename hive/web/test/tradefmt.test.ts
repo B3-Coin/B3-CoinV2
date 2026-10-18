@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { decimal, formatB3, formatPrice, formatQuantity, neededPlaces, pricePlaces, quantityPlaces, spread } from "../src/tradefmt.ts";
+import { decimal, formatB3, formatPrice, formatQuantity, neededPlaces, parsePrice, parseQuantity, pricePlaces, quantityPlaces, spread } from "../src/tradefmt.ts";
 
 const NBSP = " ";
 
@@ -62,4 +62,28 @@ test("the spread is exact and absent for a crossed book", () => {
   // Rounds half up: 200 x 1 / 400 = 0.5 %.
   assert.equal(spread(199n, 201n, units)?.percent, "1.00");
   assert.equal(spread(1999n, 2001n, units)?.percent, "0.10");
+});
+
+test("typed prices and quantities convert exactly or are refused", () => {
+  const units = { decimals: 2, tick: 1n, lot: 1n };
+  assert.deepEqual(parsePrice("3", units), { value: 30_000_000n });
+  assert.deepEqual(parsePrice("3.0000001", units), { value: 30_000_001n });
+  assert.deepEqual(parsePrice(".5", units), { value: 5_000_000n });
+  assert.deepEqual(parsePrice(`1${NBSP}000`, units), { value: 10_000_000_000n });
+  // Finer than one atom per base unit: refused, not rounded.
+  assert.ok("error" in parsePrice("3.00000001", units));
+  for (const bad of ["", "abc", "-1", "1e3", "1,5", "0", "0.0"]) assert.ok("error" in parsePrice(bad, units), bad);
+  assert.deepEqual(parseQuantity("0.03", units), { value: 3n });
+  assert.deepEqual(parseQuantity("2", units), { value: 200n });
+  assert.ok("error" in parseQuantity("0.001", units));
+  // Off the market's steps.
+  const coarse = { decimals: 6, tick: 10n, lot: 1000n };
+  assert.deepEqual(parsePrice("0.02", coarse), { value: 20n });
+  assert.ok("error" in parsePrice("0.021", coarse));
+  assert.deepEqual(parseQuantity("0.002", coarse), { value: 2000n });
+  assert.ok("error" in parseQuantity("0.0021", coarse));
+  // More decimals than B3: a price must be a whole number of atoms per base unit.
+  const fine = { decimals: 12, tick: 1n, lot: 1n };
+  assert.deepEqual(parsePrice("2000", fine), { value: 2n });
+  assert.ok("error" in parsePrice("1500", fine));
 });
