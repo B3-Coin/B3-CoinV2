@@ -1,6 +1,8 @@
 //! Wallet calls for the spike: one regtest wallet, its balance, test funding,
 //! and building a signed send for the approval window.
 
+use std::sync::Mutex;
+
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -15,8 +17,13 @@ pub const FUND_BLOCKS: u64 = 130;
 const RPC_WALLET_NOT_FOUND: i64 = -18;
 const RPC_WALLET_ALREADY_LOADED: i64 = -35;
 
+/// Pages ask for the wallet at the same time; two loadwallet calls racing
+/// make the second fail on the database lock instead of "already loaded".
+static LOADING: Mutex<()> = Mutex::new(());
+
 /// Loads the spike wallet, creating it on first use.
 pub fn ensure_wallet(client: &Client) -> Result<(), RpcError> {
+    let _one_at_a_time = LOADING.lock().unwrap_or_else(|e| e.into_inner());
     let loaded = client.call("listwallets", json!([]))?;
     if loaded
         .as_array()

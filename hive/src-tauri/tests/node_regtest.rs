@@ -104,7 +104,15 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
     assert_eq!(o.mempool_transactions, 0);
     assert!(chain::peers(client).unwrap().is_empty());
 
-    wallet::ensure_wallet(client).unwrap();
+    // Pages load the wallet at the same time; every one of them succeeds.
+    thread::scope(|s| {
+        let loads: Vec<_> = (0..4)
+            .map(|_| s.spawn(|| wallet::ensure_wallet(client)))
+            .collect();
+        for load in loads {
+            load.join().unwrap().unwrap();
+        }
+    });
     assert!(wallet::activity(client, 10).unwrap().is_empty());
     wallet::fund_regtest(client).unwrap();
     let lines = wallet::activity(client, 10).unwrap();
