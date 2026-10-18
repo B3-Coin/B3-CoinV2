@@ -54,6 +54,7 @@ const PAGE_METHODS: &[&str] = &[
     "listreceivedbyaddress",
     "walletcreatefundedpsbt",
     "walletprocesspsbt",
+    "analyzepsbt",
     "finalizepsbt",
     "decodepsbt",
     "lockunspent",

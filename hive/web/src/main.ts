@@ -113,6 +113,7 @@ type ActivityEntry = {
 // Mirrors DraftResult in src-tauri/src/lib.rs (serde tag "outcome").
 type DraftResult =
   | { outcome: "sent"; id: string; txid: string }
+  | { outcome: "signed"; id: string; psbt: string; complete: boolean }
   | { outcome: "rejected"; id: string }
   | { outcome: "failed"; id: string; error: string };
 
@@ -1702,6 +1703,141 @@ function sendResult(tone: "info" | "success" | "warning" | "danger", text: strin
   box.scrollIntoView({ block: "nearest" });
 }
 
+// ---- PSBT ------------------------------------------------------------------
+// Qt's PSBT operations: read a PSBT made elsewhere, sign it, broadcast it,
+// copy or save it. Signing and broadcasting are approved in the approval
+// window; the core reads the PSBT again there, so nothing the page shows is
+// trusted.
+
+type PsbtSummary = {
+  chain: string;
+  wallet: string;
+  outputs: { address: string; amount: string; mine: boolean }[];
+  fee: string | null;
+  inputs: number;
+  finalized: number;
+  complete: boolean;
+};
+type PsbtView = { psbt: string; summary: PsbtSummary };
+
+let psbtShown: PsbtView | null = null;
+const psbtDrafts = new Set<string>();
+
+function psbtResult(tone: "info" | "success" | "warning" | "danger", text: string): void {
+  const box = el("psbt-result");
+  box.hidden = false;
+  box.className = `banner banner-${tone} mt-4`;
+  box.textContent = text;
+  box.scrollIntoView({ block: "nearest" });
+}
+
+function renderPsbt(v: PsbtView | null): void {
+  psbtShown = v;
+  el("psbt-view").hidden = v === null;
+  if (!v) return;
+  const s = v.summary;
+  el("psbt-outputs").replaceChildren(
+    ...s.outputs.map((o) => {
+      const r = amountRow(o.mine ? "To this wallet" : "Pay", o.amount);
+      const line = document.createElement("span");
+      line.className = "addr-line";
+      line.textContent = o.address;
+      r.querySelector(".dkey")!.append(line);
+      return r;
+    }),
+  );
+  el("psbt-rows").replaceChildren(
+    s.fee === null ? textRow("Network fee", "Not in the PSBT") : amountRow("Network fee", s.fee),
+    textRow("Inputs signed", `${s.finalized} of ${s.inputs}`),
+    textRow("State", s.complete ? "Fully signed: ready to broadcast" : "Needs more signatures"),
+  );
+  el<HTMLButtonElement>("psbt-sign").hidden = s.complete;
+  el<HTMLButtonElement>("psbt-send").hidden = !s.complete;
+}
+
+async function readPsbt(text: string): Promise<void> {
+  el("psbt-result").hidden = true;
+  try {
+    const v = await invoke<PsbtView>("psbt_inspect", { psbt: text });
+    el<HTMLTextAreaElement>("psbt-text").value = v.psbt;
+    renderPsbt(v);
+  } catch (e) {
+    renderPsbt(null);
+    psbtResult("danger", String(e));
+  }
+}
+
+// A .psbt file is binary (Qt saves it so); a text file holds base64.
+function psbtFileText(bytes: Uint8Array): string {
+  const binary = bytes.length >= 5 && bytes[0] === 0x70 && bytes[1] === 0x73 && bytes[2] === 0x62 && bytes[3] === 0x74 && bytes[4] === 0xff;
+  if (!binary) return new TextDecoder().decode(bytes);
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+async function psbtDecided(r: DraftResult): Promise<void> {
+  if (r.outcome === "signed") {
+    await readPsbt(r.psbt);
+    psbtResult(
+      "success",
+      r.complete
+        ? "Signed. Every input is signed now, so it can be broadcast."
+        : "Signed what this wallet could. It still needs other signatures: copy or save it for the next signer.",
+    );
+  } else if (r.outcome === "sent") {
+    psbtResult("success", `Broadcast. Transaction ${r.txid}`);
+    el<HTMLTextAreaElement>("psbt-text").value = "";
+    renderPsbt(null);
+    void refreshWallet();
+    void refreshRecent();
+  } else if (r.outcome === "rejected") {
+    psbtResult("warning", "Rejected. Nothing was signed or sent.");
+  } else if (r.outcome === "failed") {
+    psbtResult("danger", `Not done: ${r.error}`);
+  }
+}
+
+async function psbtDraft(send: boolean): Promise<void> {
+  if (!psbtShown) return;
+  try {
+    const id = await invoke<string>("psbt_draft", { psbt: psbtShown.psbt, send });
+    psbtDrafts.add(id);
+    psbtResult("info", "Waiting for your decision in the approval window.");
+  } catch (e) {
+    psbtResult("danger", String(e));
+  }
+}
+
+el("psbt-read").addEventListener("click", () => void readPsbt(el<HTMLTextAreaElement>("psbt-text").value));
+el("psbt-text").addEventListener("input", () => renderPsbt(null));
+el("psbt-open").addEventListener("click", () => el<HTMLInputElement>("psbt-file").click());
+el("psbt-file").addEventListener("change", async () => {
+  const input = el<HTMLInputElement>("psbt-file");
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  void readPsbt(psbtFileText(new Uint8Array(await file.arrayBuffer())));
+});
+el("psbt-sign").addEventListener("click", () => void psbtDraft(false));
+el("psbt-send").addEventListener("click", () => void psbtDraft(true));
+el("psbt-copy").addEventListener("click", () => {
+  if (!psbtShown) return;
+  void navigator.clipboard.writeText(psbtShown.psbt).then(
+    () => psbtResult("success", "PSBT copied."),
+    () => psbtResult("danger", "The PSBT could not be copied."),
+  );
+});
+el("psbt-save").addEventListener("click", async () => {
+  if (!psbtShown) return;
+  try {
+    const path = await invoke<string>("psbt_save", { psbt: psbtShown.psbt });
+    psbtResult("success", `Saved to ${path}`);
+  } catch (e) {
+    psbtResult("danger", String(e));
+  }
+});
+
 // ---- stake -------------------------------------------------------------------
 
 el("staking-go").addEventListener("click", (e) => {
@@ -2584,6 +2720,11 @@ await listen<PassResult>("passphrase-result", (event) => {
 
 await listen<DraftResult>("draft-result", (event) => {
   const r = event.payload;
+  if (psbtDrafts.has(r.id)) {
+    psbtDrafts.delete(r.id);
+    void psbtDecided(r);
+    return;
+  }
   const page = draftPage.get(r.id) ?? "send";
   draftPage.delete(r.id);
   if (page !== "send") {
@@ -2599,7 +2740,7 @@ await listen<DraftResult>("draft-result", (event) => {
       el<HTMLFormElement>("stk-form").reset();
     } else if (r.outcome === "rejected") {
       stakeResult("warning", "Rejected. Nothing was sent.");
-    } else {
+    } else if (r.outcome === "failed") {
       stakeResult("danger", `Not sent: ${r.error}`);
     }
     void refreshStake();
@@ -2612,7 +2753,7 @@ await listen<DraftResult>("draft-result", (event) => {
     resetSendForm();
   } else if (r.outcome === "rejected") {
     sendResult("warning", "Rejected. Nothing was sent.");
-  } else {
+  } else if (r.outcome === "failed") {
     sendResult("danger", `Not sent: ${r.error}`);
   }
   void refreshWallet();

@@ -18,6 +18,7 @@ use b3_hive::drafts::{DraftStore, Outpoint, Request as Draft};
 use b3_hive::history::{self, Filter, Kind};
 use b3_hive::node::{Network, Node, NodeConfig, NodeStatus};
 use b3_hive::passphrase::{self, Entry, Kind as PassKind, Request};
+use b3_hive::psbt;
 use b3_hive::receive;
 use b3_hive::rpc::{Client, RpcError};
 use b3_hive::settings::{self, NodeSettings};
@@ -807,6 +808,58 @@ fn payments_split_fees_choose_coins_and_save_labels() {
         .call_wallet(W, "getaddressinfo", json!([a]))
         .unwrap();
     assert_eq!(info["labels"][0].as_str(), Some("Alice"));
+}
+
+#[test]
+fn a_psbt_is_read_signed_and_broadcast() {
+    let Some((test, status)) = TestNode::start("psbt") else {
+        return;
+    };
+    assert!(matches!(status, NodeStatus::Ready { .. }), "{status:?}");
+    let client = test.node.client().unwrap();
+    let admin = test.admin();
+    wallet::ensure_wallet(client).unwrap();
+    wallet::fund_regtest(client, W).unwrap();
+    admin.call("createwallet", json!(["other"])).unwrap();
+    let away = admin
+        .call_wallet("other", "getnewaddress", json!([]))
+        .unwrap();
+    let away = away.as_str().unwrap();
+
+    // An unsigned PSBT, as another program would hand it over.
+    let funded = admin
+        .call_wallet(W, "walletcreatefundedpsbt", json!([[], [{away: "0.03"}]]))
+        .unwrap();
+    let text = format!("{}\n", funded["psbt"].as_str().unwrap());
+    let (summary, loaded) = psbt::inspect(client, W, "regtest", &text).unwrap();
+    assert!(!summary.complete && summary.finalized == 0 && summary.inputs >= 1);
+    assert!(summary.fee.is_some());
+    let paid = summary.outputs.iter().find(|o| o.address == away).unwrap();
+    assert!(paid.amount == "0.030000000" && !paid.mine);
+    assert!(
+        summary.outputs.iter().any(|o| o.mine),
+        "change is this wallet's"
+    );
+    assert!(psbt::inspect(client, W, "regtest", "cHNidP8A").is_err());
+
+    // A wallet without its keys signs nothing; this one completes it.
+    assert!(psbt::sign(client, "other", &loaded)
+        .unwrap_err()
+        .contains("none of the keys"));
+    let (signed, complete) = psbt::sign(client, W, &loaded).unwrap();
+    assert!(complete);
+    let (summary, loaded) = psbt::inspect(client, W, "regtest", &signed).unwrap();
+    assert!(summary.complete && summary.finalized == summary.inputs);
+
+    // Broadcasting checks it still pays what was approved.
+    let mut altered = summary.clone();
+    altered.outputs[0].amount = "1.000000000".into();
+    assert!(psbt::send(client, &altered, &loaded)
+        .unwrap_err()
+        .contains("differs"));
+    let txid = psbt::send(client, &summary, &loaded).unwrap();
+    let pool = admin.call("getrawmempool", json!([])).unwrap();
+    assert!(pool.as_array().unwrap().iter().any(|t| t == &json!(txid)));
 }
 
 #[test]

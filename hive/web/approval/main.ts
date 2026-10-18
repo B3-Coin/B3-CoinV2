@@ -5,10 +5,23 @@ import { el, formatAmount, initTheme, sumAmounts } from "../shared/ui";
 
 type OutputLine = { address: string; amount: string; change: boolean; mine: boolean };
 type Summary = { chain: string; wallet: string; outputs: OutputLine[]; fee: string; inputs: number };
+// Mirrors psbt::Summary: a PSBT made elsewhere, so its inputs need not be
+// this wallet's, and its fee is unknown when it lacks the input amounts.
+type PsbtSummary = {
+  chain: string;
+  wallet: string;
+  outputs: OutputLine[];
+  fee: string | null;
+  inputs: number;
+  finalized: number;
+  complete: boolean;
+};
 // Mirrors drafts::Request in src-tauri/src/drafts.rs.
 type Request =
   | { kind: "pay"; summary: Summary }
   | { kind: "release"; summary: Summary }
+  | { kind: "sign_psbt"; summary: PsbtSummary }
+  | { kind: "send_psbt"; summary: PsbtSummary }
   | { kind: "stake"; chain: string; wallet: string; amount: string; activation_depth: number }
   | { kind: "bind_finality"; chain: string; wallet: string; rotate: boolean };
 type DraftView = {
@@ -68,6 +81,8 @@ function showPay(s: Summary): void {
   el("total").textContent = total === null ? "—" : formatAmount(total, 9);
   el("chain").textContent = s.chain;
   el("inputs").textContent = String(s.inputs);
+  el("total-row").hidden = false;
+  el("signed-row").hidden = true;
   el("pay-text").textContent = "This payment is permanent once sent. Check every line before you approve it.";
   el("pass-help").textContent =
     "The wallet is locked. It unlocks only to sign this payment and locks again straight after.";
@@ -90,9 +105,37 @@ function showRelease(s: Summary): void {
   el("approve").textContent = "Release now";
 }
 
+// A PSBT from elsewhere: its outputs and fee are shown as they are, without
+// a total leaving this wallet, since its inputs may belong to others.
+function showPsbt(kind: "sign_psbt" | "send_psbt", s: PsbtSummary): void {
+  el("from").textContent = `With ${walletName(s.wallet)} on ${s.chain}`;
+  el("outputs").replaceChildren(
+    ...s.outputs.map((o) => row(o.mine ? "To this wallet" : "Pay", formatAmount(o.amount, 9), o.address)),
+  );
+  el("fee").textContent = s.fee === null ? "Not in the PSBT" : formatAmount(s.fee, 9);
+  el("total-row").hidden = true;
+  el("chain").textContent = s.chain;
+  el("inputs").textContent = String(s.inputs);
+  el("signed-row").hidden = false;
+  el("signed").textContent = `${s.finalized} of ${s.inputs}`;
+  if (kind === "sign_psbt") {
+    el("title").textContent = "Sign this PSBT?";
+    el("pay-text").textContent =
+      "This wallet signs the inputs it holds keys for. Nothing is sent: the signed PSBT goes back to the Send page, to pass on or to broadcast. Check the outputs before you sign.";
+    el("pass-help").textContent =
+      "The wallet is locked. It unlocks only to sign this PSBT and locks again straight after.";
+    el("approve").textContent = "Sign";
+  } else {
+    el("title").textContent = "Broadcast this transaction?";
+    el("pay-text").textContent =
+      "Every input is signed. Broadcasting sends it to the network, and it is permanent once sent. Check every line before you approve it.";
+    el("approve").textContent = "Broadcast now";
+  }
+}
+
 // Staking requests go to the node as they are; it picks the coins and the
 // fee when they are approved, so the window says so instead of a figure.
-function showAction(r: Exclude<Request, { kind: "pay" | "release" }>): void {
+function showAction(r: Exclude<Request, { kind: "pay" | "release" | "sign_psbt" | "send_psbt" }>): void {
   el("from").textContent = `From ${walletName(r.wallet)} on ${r.chain}`;
   const fee = row("Network fee", "Set by the wallet when it is sent", undefined, false);
   if (r.kind === "stake") {
@@ -119,11 +162,12 @@ function show(draft: DraftView | null): void {
   el("error").hidden = true;
   if (!draft) return;
   const r = draft.request;
-  const pay = r.kind === "pay" || r.kind === "release";
+  const pay = r.kind === "pay" || r.kind === "release" || r.kind === "sign_psbt" || r.kind === "send_psbt";
   el("pay-body").hidden = !pay;
   el("action-body").hidden = pay;
   if (r.kind === "pay") showPay(r.summary);
   else if (r.kind === "release") showRelease(r.summary);
+  else if (r.kind === "sign_psbt" || r.kind === "send_psbt") showPsbt(r.kind, r.summary);
   else showAction(r);
   el("pass-field").hidden = !draft.locked;
   el<HTMLInputElement>("pass").value = "";

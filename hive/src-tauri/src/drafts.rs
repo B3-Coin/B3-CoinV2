@@ -60,6 +60,19 @@ pub enum Request {
         #[serde(skip)]
         funded: Funded,
     },
+    /// Sign a PSBT made elsewhere with this wallet's keys; the result goes
+    /// back to the page, nothing is broadcast.
+    SignPsbt {
+        summary: crate::psbt::Summary,
+        #[serde(skip)]
+        loaded: crate::psbt::Loaded,
+    },
+    /// Broadcast a complete PSBT.
+    SendPsbt {
+        summary: crate::psbt::Summary,
+        #[serde(skip)]
+        loaded: crate::psbt::Loaded,
+    },
     /// Bind, or rotate, this wallet's BLS finality key (bindfinalitykey).
     BindFinality {
         chain: String,
@@ -72,8 +85,17 @@ impl Request {
     pub fn wallet(&self) -> &str {
         match self {
             Request::Pay { summary, .. } | Request::Release { summary, .. } => &summary.wallet,
+            Request::SignPsbt { summary, .. } | Request::SendPsbt { summary, .. } => {
+                &summary.wallet
+            }
             Request::Stake { wallet, .. } | Request::BindFinality { wallet, .. } => wallet,
         }
+    }
+
+    /// Approving needs the wallet's keys, so a locked wallet's passphrase.
+    /// Broadcasting a PSBT signed elsewhere does not.
+    pub fn needs_keys(&self) -> bool {
+        !matches!(self, Request::SendPsbt { .. })
     }
 
     /// The coins a payment holds back; the node picks a stake's coins only

@@ -39,3 +39,9 @@
 .coin-list .list-row { min-height: 52px; cursor: pointer; }
 .coin-list .list-row:hover { background: var(--bg-subtle); }
 .coin-list input { width: 20px; height: 20px; flex: none; accent-color: var(--accent); }
+
+/* An address under its line's label, as in the approval window. */
+.details .addr-line {
+  display: block; margin-top: 2px; font-family: var(--font-mono);
+  font-size: var(--text-xs); word-break: break-all; color: var(--text);
+}

@@ -11,6 +11,7 @@ pub mod drafts;
 pub mod history;
 pub mod node;
 pub mod passphrase;
+pub mod psbt;
 pub mod receive;
 pub mod rpc;
 pub mod settings;
@@ -136,9 +137,23 @@ pub enum PassResult {
 #[derive(Clone, Serialize)]
 #[serde(tag = "outcome", rename_all = "lowercase")]
 pub enum DraftResult {
-    Sent { id: String, txid: String },
-    Rejected { id: String },
-    Failed { id: String, error: String },
+    Sent {
+        id: String,
+        txid: String,
+    },
+    /// A PSBT was signed; it goes back to the page, not to the network.
+    Signed {
+        id: String,
+        psbt: String,
+        complete: bool,
+    },
+    Rejected {
+        id: String,
+    },
+    Failed {
+        id: String,
+        error: String,
+    },
 }
 
 // ---- main window commands --------------------------------------------------
@@ -436,6 +451,99 @@ async fn stake_draft(
     .await?;
     open_approval(&app).map_err(|e| e.to_string())?;
     Ok(id)
+}
+
+/// Reads a PSBT made elsewhere, for the PSBT page.
+#[tauri::command]
+async fn psbt_inspect(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    psbt: String,
+) -> Result<psbt::View, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let chain = node.chain().unwrap_or_default();
+        let (summary, loaded) = psbt::inspect(client, &name, &chain, &psbt)?;
+        Ok(psbt::View {
+            psbt: loaded.psbt,
+            summary,
+        })
+    })
+    .await
+}
+
+/// Asks the approval window to sign a PSBT (`send` false) or broadcast a
+/// complete one (`send` true).
+#[tauri::command]
+async fn psbt_draft(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    psbt: String,
+    send: bool,
+) -> Result<String, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let chain = node.chain().unwrap_or_default();
+        let (summary, loaded) = psbt::inspect(client, &name, &chain, &psbt)?;
+        let request = if send {
+            if !summary.complete {
+                return Err("This PSBT is not fully signed yet.".into());
+            }
+            Request::SendPsbt { summary, loaded }
+        } else {
+            if summary.complete {
+                return Err("This PSBT is already fully signed. Broadcast it instead.".into());
+            }
+            if wallet::security(client, &name).map_err(|e| e.to_string())?
+                == wallet::Security::WatchOnly
+            {
+                return Err("This wallet has no private keys to sign with.".into());
+            }
+            Request::SignPsbt { summary, loaded }
+        };
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(request)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Saves a PSBT as a binary .psbt file, as Qt does, into the Downloads
+/// folder under a new name, and returns where.
+#[tauri::command]
+async fn psbt_save(app: AppHandle, window: Window, psbt: String) -> Result<String, String> {
+    require_window(&window, MAIN)?;
+    let folder = app
+        .path()
+        .download_dir()
+        .map_err(|e| format!("The Downloads folder was not found: {e}"))?;
+    blocking(move || {
+        let bytes = psbt::file_bytes(&psbt)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let path = folder.join(format!(
+            "b3-hive-transaction-{}.psbt",
+            history::utc(now).replace(':', "")
+        ));
+        let mut file = std::fs::File::create_new(&path)
+            .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
+        std::io::Write::write_all(&mut file, &bytes)
+            .map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
+        Ok(path.display().to_string())
+    })
+    .await
 }
 
 /// Asks the approval window to release stakes back into ordinary B3.
@@ -1130,9 +1238,10 @@ async fn update_download(
 /// wallet's passphrase is checked now, since the wallet may have been
 /// locked or unlocked since the draft was made.
 fn draft_view(client: Option<&rpc::Client>, draft: drafts::Draft) -> DraftView {
-    let locked = client.is_some_and(|c| {
-        wallet::security(c, draft.request.wallet()).ok() == Some(wallet::Security::Locked)
-    });
+    let locked = draft.request.needs_keys()
+        && client.is_some_and(|c| {
+            wallet::security(c, draft.request.wallet()).ok() == Some(wallet::Security::Locked)
+        });
     DraftView {
         id: draft.id,
         request: draft.request,
@@ -1140,8 +1249,26 @@ fn draft_view(client: Option<&rpc::Client>, draft: drafts::Draft) -> DraftView {
     }
 }
 
-/// Carries out an approved request. Returns the transaction id.
-fn execute(client: &rpc::Client, request: Request) -> Result<String, String> {
+/// What an approved request did.
+enum Done {
+    Sent(String),
+    Signed { psbt: String, complete: bool },
+}
+
+/// Carries out an approved request.
+fn execute(client: &rpc::Client, request: Request) -> Result<Done, String> {
+    match request {
+        Request::SignPsbt { summary, loaded } => psbt::sign(client, &summary.wallet, &loaded)
+            .map(|(psbt, complete)| Done::Signed { psbt, complete }),
+        Request::SendPsbt { summary, loaded } => {
+            psbt::send(client, &summary, &loaded).map(Done::Sent)
+        }
+        request => execute_sent(client, request).map(Done::Sent),
+    }
+}
+
+/// Carries out an approved request that ends in a transaction id.
+fn execute_sent(client: &rpc::Client, request: Request) -> Result<String, String> {
     match request {
         Request::Pay { summary, funded } | Request::Release { summary, funded } => {
             let sent = wallet::sign(client, &summary, &funded)
@@ -1154,6 +1281,7 @@ fn execute(client: &rpc::Client, request: Request) -> Result<String, String> {
         }
         Request::Stake { wallet, amount, .. } => stake::create(client, &wallet, &amount),
         Request::BindFinality { wallet, .. } => stake::bind(client, &wallet),
+        Request::SignPsbt { .. } | Request::SendPsbt { .. } => unreachable!("handled by execute"),
     }
 }
 
@@ -1174,7 +1302,7 @@ async fn approval_pending(
 }
 
 /// What happened to an approved draft once it was taken.
-type Outcome = Result<String, String>;
+type Outcome = Result<Done, String>;
 
 /// Approve carries the draft out: a payment is signed, checked against what
 /// was approved and submitted; a staking request goes to the node. Reject
@@ -1207,8 +1335,9 @@ async fn approval_decide(
                 .get(&id2)
                 .ok_or("This request was already decided.")?;
             let wallet_name = waiting.request.wallet().to_owned();
-            let locked = wallet::security(client, &wallet_name).map_err(|e| e.to_string())?
-                == wallet::Security::Locked;
+            let locked = waiting.request.needs_keys()
+                && wallet::security(client, &wallet_name).map_err(|e| e.to_string())?
+                    == wallet::Security::Locked;
             if locked {
                 wallet::unlock_for_signing(
                     client,
@@ -1230,9 +1359,14 @@ async fn approval_decide(
         })
         .await?;
         match outcome {
-            Ok(txid) => DraftResult::Sent {
+            Ok(Done::Sent(txid)) => DraftResult::Sent {
                 id: id.clone(),
                 txid,
+            },
+            Ok(Done::Signed { psbt, complete }) => DraftResult::Signed {
+                id: id.clone(),
+                psbt,
+                complete,
             },
             Err(error) => DraftResult::Failed {
                 id: id.clone(),
@@ -1618,6 +1752,9 @@ pub fn run() {
             stake_status,
             stake_draft,
             release_draft,
+            psbt_inspect,
+            psbt_draft,
+            psbt_save,
             finality_draft,
             stake_start,
             stake_stop,

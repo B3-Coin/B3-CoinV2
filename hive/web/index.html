@@ -350,6 +350,35 @@
           </form>
           <div class="banner mt-4" id="send-result" role="status" hidden></div>
           <datalist id="book-options"></datalist>
+
+          <div class="card mt-5" id="psbt">
+            <div class="card-head">
+              <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-key" /></svg>Partially signed transaction</h2>
+            </div>
+            <div class="card-pad form-grid">
+              <p class="t-sm muted">A PSBT made by another wallet or device. Read it here, sign the parts this wallet holds keys for, or broadcast it once every input is signed.</p>
+              <div class="field">
+                <label for="psbt-text">PSBT</label>
+                <textarea class="textarea mono" id="psbt-text" rows="4" spellcheck="false" autocomplete="off" placeholder="Paste a base64 PSBT"></textarea>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-secondary btn-sm" type="button" id="psbt-read">Read PSBT</button>
+                <button class="btn btn-secondary btn-sm" type="button" id="psbt-open">Open a PSBT file</button>
+                <input type="file" id="psbt-file" accept=".psbt,.txt,application/octet-stream,text/plain" hidden />
+              </div>
+              <div class="stack" id="psbt-view" hidden>
+                <div class="details" id="psbt-outputs"></div>
+                <div class="details" id="psbt-rows"></div>
+                <div class="btn-row">
+                  <button class="btn btn-primary btn-sm" type="button" id="psbt-sign">Sign with this wallet</button>
+                  <button class="btn btn-primary btn-sm" type="button" id="psbt-send">Broadcast</button>
+                  <button class="btn btn-secondary btn-sm" type="button" id="psbt-copy">Copy PSBT</button>
+                  <button class="btn btn-secondary btn-sm" type="button" id="psbt-save">Save PSBT file</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="banner mt-4" id="psbt-result" role="status" hidden></div>
         </main>
 
         <main class="view view--flow" id="view-receive" hidden>
