@@ -7,6 +7,7 @@ pub mod console;
 pub mod drafts;
 pub mod node;
 pub mod rpc;
+pub mod update;
 pub mod wallet;
 
 use std::path::PathBuf;

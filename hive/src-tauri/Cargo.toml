@@ -17,8 +17,9 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 # arbitrary_precision keeps node amounts as their exact decimal text.
 serde_json = { version = "1", features = ["arbitrary_precision"] }
-# Plain HTTP to 127.0.0.1 only: no TLS stack on purpose.
-ureq = { version = "3", default-features = false, features = ["json"] }
+# Plain HTTP to 127.0.0.1 for the node; HTTPS (rustls, bundled webpki
+# roots) only for update fetches, whose bytes b3-hive-update verifies.
+ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.3"
