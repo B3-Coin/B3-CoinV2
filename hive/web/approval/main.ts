@@ -127,7 +127,10 @@ function show(draft: DraftView | null): void {
   else showAction(r);
   el("pass-field").hidden = !draft.locked;
   el<HTMLInputElement>("pass").value = "";
-  if (draft.locked) el("pass").focus();
+  // Start at the top, so the explanation is read before the passphrase
+  // field; focusing it must not scroll the text away.
+  document.querySelector("#draft .modal-body")?.scrollTo({ top: 0 });
+  if (draft.locked) el("pass").focus({ preventScroll: true });
 }
 
 let current: DraftView | null = null;
@@ -151,7 +154,7 @@ async function decide(approve: boolean): Promise<void> {
     el("error").hidden = false;
     el("error").textContent = String(e);
     el("error").scrollIntoView({ block: "nearest" });
-    if (current?.locked) el("pass").focus();
+    if (current?.locked) el("pass").focus({ preventScroll: true });
   } finally {
     setBusy(false);
   }
