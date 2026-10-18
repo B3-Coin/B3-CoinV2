@@ -8,6 +8,7 @@
 #include <update/manifest.h>
 #include <util/fs.h>
 
+#include <cstdio>
 #include <functional>
 #include <string>
 
@@ -72,6 +73,11 @@ std::optional<fs::path> FetchArtifact(UpdateTransport& transport,
                                       const fs::path& dir,
                                       const FetchPolicy& policy,
                                       std::string& error);
+
+/** Creates `path` for binary writing only if nothing exists there, without
+ *  following a symlink; nullptr otherwise. fopen's "x" mode would say the
+ *  same, but the Windows C runtime of MinGW builds rejects it outright. */
+FILE* CreateExclusive(const fs::path& path);
 
 } // namespace update
 

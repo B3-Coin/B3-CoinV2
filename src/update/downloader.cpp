@@ -12,6 +12,14 @@
 #include <algorithm>
 #include <cstdio>
 
+#include <fcntl.h>
+#ifdef WIN32
+#include <io.h>
+#include <sys/stat.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace update {
 namespace {
 
@@ -31,6 +39,29 @@ std::string ArtifactExtension(std::string_view format)
 }
 
 } // namespace
+
+FILE* CreateExclusive(const fs::path& path)
+{
+#ifdef WIN32
+    // Windows never follows a symlink on an exclusive create.
+    const int fd{::_wopen(path.std_path().wstring().c_str(),
+                          _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY | _O_NOINHERIT,
+                          _S_IREAD | _S_IWRITE)};
+    if (fd < 0) return nullptr;
+    FILE* f{::_fdopen(fd, "wb")};
+    if (!f) ::_close(fd);
+#else
+    int flags{O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC};
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    const int fd{::open(path.c_str(), flags, 0600)};
+    if (fd < 0) return nullptr;
+    FILE* f{::fdopen(fd, "wb")};
+    if (!f) ::close(fd);
+#endif
+    return f;
+}
 
 std::optional<std::string> FetchManifestBytes(UpdateTransport& transport, const std::string& url,
                                               const FetchPolicy& policy, std::string& error)
@@ -70,7 +101,7 @@ std::optional<fs::path> FetchArtifact(UpdateTransport& transport, const Artifact
     GetStrongRandBytes(std::span<unsigned char>{reinterpret_cast<unsigned char*>(rnd), sizeof(rnd)});
     const fs::path tmp{dir / fs::u8path("hive-update-" + std::to_string(rnd[0]) +
                                         std::to_string(rnd[1]) + ".part")};
-    FILE* f{fsbridge::fopen(tmp, "wbx")};
+    FILE* f{CreateExclusive(tmp)};
     if (!f) { error = "update-fetch-tempfile"; return std::nullopt; }
 
     CSHA256 hasher;

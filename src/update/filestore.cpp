@@ -5,6 +5,7 @@
 #include <update/filestore.h>
 
 #include <random.h>
+#include <update/downloader.h>
 #include <util/fs_helpers.h>
 #include <util/string.h>
 #include <util/strencodings.h>
@@ -91,7 +92,7 @@ bool FileSequenceStore::Store(const SequenceState& state, std::string& error)
     GetStrongRandBytes(std::span<unsigned char>{reinterpret_cast<unsigned char*>(&rnd), sizeof(rnd)});
     const fs::path dir{m_path.parent_path()};
     const fs::path tmp{dir / fs::u8path(".sequence-" + std::to_string(rnd) + ".tmp")};
-    FILE* f{fsbridge::fopen(tmp, "wbx")};
+    FILE* f{CreateExclusive(tmp)};
     if (!f) {
         error = "update-sequence-store";
         return false;
