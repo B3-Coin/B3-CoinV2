@@ -7,6 +7,7 @@
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "allow-node-status",
+    "allow-restart-node",
     "allow-wallet-overview",
     "allow-dev-fund",
     "allow-draft-send",

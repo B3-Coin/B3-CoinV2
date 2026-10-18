@@ -10,6 +10,7 @@ pub mod rpc;
 pub mod wallet;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -33,10 +34,21 @@ const APPROVAL: &str = "approval";
 const CONSOLE: &str = "console";
 
 pub struct Core {
-    node: Arc<Node>,
+    /// The current node. A restart swaps in a new one; callers take a clone
+    /// with `node()` and keep using it for one command.
+    node: Mutex<Arc<Node>>,
+    config: NodeConfig,
+    /// Set once the app is exiting, so a late restart cannot leave a node behind.
+    exiting: AtomicBool,
     drafts: Mutex<DraftStore>,
     /// The theme picked in the main window, so the other windows open in it.
     theme: Mutex<Option<Theme>>,
+}
+
+impl Core {
+    fn node(&self) -> Arc<Node> {
+        Arc::clone(&self.node.lock().unwrap())
+    }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -68,21 +80,38 @@ pub enum DraftResult {
 
 #[tauri::command]
 fn node_status(core: State<'_, Arc<Core>>) -> NodeStatus {
-    core.node.status()
+    core.node().status()
+}
+
+/// Starts the node again after it failed to start or exited. Refused while
+/// the old process still runs, so two nodes never share the data folder.
+#[tauri::command]
+fn restart_node(app: AppHandle, window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    let mut current = core.node.lock().unwrap();
+    if core.exiting.load(Ordering::SeqCst) {
+        return Err("B3 Hive is closing.".into());
+    }
+    if !current.has_exited() {
+        return Err("The node is still running.".into());
+    }
+    *current = start_node(&app, &core.config);
+    Ok(())
 }
 
 #[tauri::command]
 async fn wallet_overview(core: State<'_, Arc<Core>>) -> Result<WalletOverview, String> {
     let core = Arc::clone(&core);
     blocking(move || {
-        let client = core.node.client().ok_or("The node is not ready yet.")?;
+        let node = core.node();
+        let client = node.client().ok_or("The node is not ready yet.")?;
         wallet::ensure_wallet(client).map_err(|e| e.to_string())?;
         let (spendable, immature) = wallet::balances(client).map_err(|e| e.to_string())?;
         Ok(WalletOverview {
             wallet: wallet::SPIKE_WALLET.into(),
             spendable,
             immature,
-            can_fund: core.node.chain().as_deref() == Some("regtest"),
+            can_fund: node.chain().as_deref() == Some("regtest"),
         })
     })
     .await
@@ -92,10 +121,11 @@ async fn wallet_overview(core: State<'_, Arc<Core>>) -> Result<WalletOverview, S
 async fn dev_fund(core: State<'_, Arc<Core>>) -> Result<(), String> {
     let core = Arc::clone(&core);
     blocking(move || {
-        if core.node.chain().as_deref() != Some("regtest") {
+        let node = core.node();
+        if node.chain().as_deref() != Some("regtest") {
             return Err("Funding by mining is only available on regtest.".into());
         }
-        let client = core.node.client().ok_or("The node is not ready yet.")?;
+        let client = node.client().ok_or("The node is not ready yet.")?;
         wallet::ensure_wallet(client).map_err(|e| e.to_string())?;
         wallet::fund_regtest(client).map_err(|e| e.to_string())
     })
@@ -113,8 +143,9 @@ async fn draft_send(
 ) -> Result<String, String> {
     let core = Arc::clone(&core);
     let id = blocking(move || {
-        let client = core.node.client().ok_or("The node is not ready yet.")?;
-        let chain = core.node.chain().unwrap_or_default();
+        let node = core.node();
+        let client = node.client().ok_or("The node is not ready yet.")?;
+        let chain = node.chain().unwrap_or_default();
         wallet::ensure_wallet(client).map_err(|e| e.to_string())?;
         let (summary, hex) = wallet::prepare_send(client, &chain, &address, &amount)?;
         core.drafts
@@ -190,7 +221,8 @@ async fn approval_decide(
     let result = if approve {
         let core = Arc::clone(&core);
         blocking(move || {
-            let client = core.node.client().ok_or("The node is not ready.")?;
+            let node = core.node();
+            let client = node.client().ok_or("The node is not ready.")?;
             Ok(wallet::broadcast(client, &draft.hex))
         })
         .await?
@@ -230,10 +262,8 @@ async fn console_exec(
     let core = Arc::clone(&core);
     let stop = console::is_stop(&line);
     let reply = blocking(move || {
-        let client = core
-            .node
-            .console_client()
-            .ok_or("The node is not running.")?;
+        let node = core.node();
+        let client = node.console_client().ok_or("The node is not running.")?;
         let mut exec = |method: &str, params: serde_json::Value| {
             match &wallet {
                 Some(name) => client.call_wallet(name, method, params),
@@ -260,10 +290,8 @@ async fn console_completions(
     require_window(&window, CONSOLE)?;
     let core = Arc::clone(&core);
     blocking(move || {
-        let client = core
-            .node
-            .console_client()
-            .ok_or("The node is not running.")?;
+        let node = core.node();
+        let client = node.console_client().ok_or("The node is not running.")?;
         let help = client
             .call("help", serde_json::json!([]))
             .map_err(|e| e.to_string())?;
@@ -281,10 +309,8 @@ async fn console_wallets(
     require_window(&window, CONSOLE)?;
     let core = Arc::clone(&core);
     blocking(move || {
-        let client = core
-            .node
-            .console_client()
-            .ok_or("The node is not running.")?;
+        let node = core.node();
+        let client = node.console_client().ok_or("The node is not running.")?;
         let wallets = client
             .call("listwallets", serde_json::json!([]))
             .map_err(|e| e.to_string())?;
@@ -371,25 +397,36 @@ fn packaged_b3coind() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(dir.join(format!("b3-hive-node{}", std::env::consts::EXE_SUFFIX)))
 }
 
+/// Starts b3coind and follows it on a thread of its own: init, then the tip,
+/// until it exits. Every status change goes to the main window.
+fn start_node(app: &AppHandle, config: &NodeConfig) -> Arc<Node> {
+    let node = Node::start(config);
+    let follower = Arc::clone(&node);
+    let handle = app.clone();
+    thread::spawn(move || {
+        let emit = |status: &NodeStatus| {
+            let _ = handle.emit_to(MAIN, "node-status", status);
+        };
+        emit(&follower.status());
+        if let NodeStatus::Ready { .. } = follower.wait_ready(START_TIMEOUT, emit) {
+            follower.follow(FOLLOW_INTERVAL, emit);
+        }
+    });
+    node
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let config = node_config(app)?;
-            let node = Node::start(&config);
+            let node = start_node(app.handle(), &config);
             app.manage(Arc::new(Core {
-                node: Arc::clone(&node),
+                node: Mutex::new(node),
+                config,
+                exiting: AtomicBool::new(false),
                 drafts: Mutex::new(DraftStore::default()),
                 theme: Mutex::new(None),
             }));
-            let handle = app.handle().clone();
-            thread::spawn(move || {
-                let emit = |status: &NodeStatus| {
-                    let _ = handle.emit_to(MAIN, "node-status", status);
-                };
-                if let NodeStatus::Ready { .. } = node.wait_ready(START_TIMEOUT, emit) {
-                    node.follow(FOLLOW_INTERVAL, emit);
-                }
-            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -412,6 +449,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             node_status,
+            restart_node,
             wallet_overview,
             dev_fund,
             draft_send,
@@ -429,7 +467,9 @@ pub fn run() {
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 if let Some(core) = app.try_state::<Arc<Core>>() {
-                    core.node.stop(STOP_TIMEOUT);
+                    let node = core.node.lock().unwrap();
+                    core.exiting.store(true, Ordering::SeqCst);
+                    node.stop(STOP_TIMEOUT);
                 }
             }
         });

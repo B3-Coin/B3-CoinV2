@@ -50,6 +50,20 @@ el("open-console").addEventListener("click", () => {
   invoke("open_console").catch((e) => showBanner("danger", "The console did not open", String(e)));
 });
 
+el("restart-node").addEventListener("click", async () => {
+  const button = el<HTMLButtonElement>("restart-node");
+  button.disabled = true;
+  try {
+    // The new node's status arrives as node-status events.
+    wasReady = false;
+    await invoke("restart_node");
+  } catch (e) {
+    el("node-banner-detail").textContent = String(e);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 el("theme").addEventListener("click", async () => showThemeIcon(await toggleTheme()));
 
 // ---- node status -----------------------------------------------------------
@@ -64,6 +78,7 @@ function showBanner(tone: Tone, title: string, detail: string): void {
   el("node-banner-icon").hidden = tone === "info";
   el("node-banner-title").textContent = title;
   el("node-banner-detail").textContent = detail;
+  el("restart-node").hidden = true;
 }
 
 function badge(state: "unlocked" | "locked" | "no-node" | "no-wallet", text: string): void {
@@ -98,6 +113,7 @@ function render(status: NodeStatus): void {
       break;
     case "failed":
       showBanner("danger", wasReady ? "The node stopped" : "The node could not start", status.error);
+      el("restart-node").hidden = false;
       badge("no-node", "Not running");
       el("wallet").hidden = true;
       break;
