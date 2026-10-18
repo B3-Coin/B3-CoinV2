@@ -12,7 +12,7 @@ pub mod wallet;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
@@ -25,6 +25,7 @@ use tauri::{
 use drafts::{DraftStore, DraftView};
 use node::{Node, NodeConfig, NodeStatus};
 use rpc::RpcError;
+use update::{HttpsFetcher, UpdateStatus, Updater};
 
 const START_TIMEOUT: Duration = Duration::from_secs(600);
 const STOP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -44,6 +45,7 @@ pub struct Core {
     drafts: Mutex<DraftStore>,
     /// The theme picked in the main window, so the other windows open in it.
     theme: Mutex<Option<Theme>>,
+    updates: Updates,
 }
 
 impl Core {
@@ -187,6 +189,119 @@ fn set_ui_theme(window: Window, core: State<'_, Arc<Core>>, theme: Theme) -> Res
     require_window(&window, MAIN)?;
     *core.theme.lock().unwrap() = Some(theme);
     Ok(())
+}
+
+// ---- updates (main window) -------------------------------------------------
+
+/// The update helper, started on first use and again if it stops. One
+/// command runs at a time; a status read meanwhile gets the last result.
+pub struct Updates {
+    helper: PathBuf,
+    args: Vec<String>,
+    fetcher: HttpsFetcher,
+    running: Mutex<Option<Updater>>,
+    last: Mutex<Option<UpdateStatus>>,
+}
+
+/// Download progress goes to the main window at most every 256 KiB.
+const PROGRESS_STEP: u64 = 256 * 1024;
+
+impl Updates {
+    fn new(helper: PathBuf, args: Vec<String>) -> Self {
+        Self {
+            helper,
+            args,
+            fetcher: HttpsFetcher::new(),
+            running: Mutex::new(None),
+            last: Mutex::new(None),
+        }
+    }
+
+    fn run(
+        &self,
+        command: impl FnOnce(&mut Updater, &HttpsFetcher) -> Result<UpdateStatus, String>,
+    ) -> Result<UpdateStatus, String> {
+        let running = self
+            .running
+            .try_lock()
+            .map_err(|_| "An update check or download is already running.".to_owned())?;
+        self.run_on(running, command)
+    }
+
+    fn status(&self) -> Result<UpdateStatus, String> {
+        match self.running.try_lock() {
+            Ok(running) => self.run_on(running, |u, _| u.status()),
+            Err(_) => self
+                .last
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| "The update helper is busy.".to_owned()),
+        }
+    }
+
+    fn run_on(
+        &self,
+        mut running: MutexGuard<'_, Option<Updater>>,
+        command: impl FnOnce(&mut Updater, &HttpsFetcher) -> Result<UpdateStatus, String>,
+    ) -> Result<UpdateStatus, String> {
+        if !running.as_mut().is_some_and(Updater::alive) {
+            *running = Some(Updater::start(&self.helper, &self.args)?);
+        }
+        let result = command(running.as_mut().unwrap(), &self.fetcher);
+        match &result {
+            Ok(status) => *self.last.lock().unwrap() = Some(status.clone()),
+            // The helper is in an unknown state: the next command starts a new one.
+            Err(_) => *running = None,
+        }
+        result
+    }
+
+    /// Ends the helper unless a command is still using it; a helper left
+    /// running ends by itself when the app's end of its pipe closes.
+    fn stop(&self) {
+        if let Ok(mut running) = self.running.try_lock() {
+            running.take();
+        }
+    }
+}
+
+#[tauri::command]
+async fn update_status(window: Window, core: State<'_, Arc<Core>>) -> Result<UpdateStatus, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || core.updates.status()).await
+}
+
+/// Fetches and verifies the signed manifest.
+#[tauri::command]
+async fn update_check(window: Window, core: State<'_, Arc<Core>>) -> Result<UpdateStatus, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || core.updates.run(|u, net| u.check(net))).await
+}
+
+/// Downloads and verifies the offered release. Installing stays manual.
+#[tauri::command]
+async fn update_download(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<UpdateStatus, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let mut reported = 0u64;
+        core.updates.run(|u, net| {
+            u.download(net, &mut |received| {
+                if received - reported >= PROGRESS_STEP {
+                    reported = received;
+                    let _ = app.emit_to(MAIN, "update-progress", received);
+                }
+            })
+        })
+    })
+    .await
 }
 
 // ---- approval window commands ----------------------------------------------
@@ -378,7 +493,7 @@ async fn blocking<T: Send + 'static>(
 fn node_config(app: &tauri::App) -> Result<NodeConfig, Box<dyn std::error::Error>> {
     let b3coind = match std::env::var_os("B3_HIVE_B3COIND") {
         Some(path) => PathBuf::from(path),
-        None => packaged_b3coind()?,
+        None => packaged_sidecar("b3-hive-node")?,
     };
     let datadir = match std::env::var_os("B3_HIVE_DATADIR") {
         Some(dir) => PathBuf::from(dir),
@@ -387,15 +502,32 @@ fn node_config(app: &tauri::App) -> Result<NodeConfig, Box<dyn std::error::Error
     Ok(NodeConfig { b3coind, datadir })
 }
 
+/// The update helper is packaged next to the app like b3coind, unless
+/// B3_HIVE_UPDATE names another one. B3_HIVE_UPDATE_ARGS adds arguments for
+/// development, such as a test channel, which only unpinned developer
+/// builds of the helper accept. Its state lives in the app's local data.
+fn updates(app: &tauri::App) -> Result<Updates, Box<dyn std::error::Error>> {
+    let helper = match std::env::var_os("B3_HIVE_UPDATE") {
+        Some(path) => PathBuf::from(path),
+        None => packaged_sidecar("b3-hive-update")?,
+    };
+    let state = app.path().app_local_data_dir()?.join("updates");
+    let mut args = vec![format!("--state-dir={}", state.display())];
+    if let Ok(extra) = std::env::var("B3_HIVE_UPDATE_ARGS") {
+        args.extend(extra.split_whitespace().map(str::to_owned));
+    }
+    Ok(Updates::new(helper, args))
+}
+
 /// Bundles place sidecars beside the main executable, with the target triple
 /// stripped from the name: /usr/bin on Linux packages, the install folder on
 /// Windows, Contents/MacOS on macOS. The bundled b3coind is named b3-hive-node
 /// so it cannot clash with a b3coind installed on its own in /usr/bin. If it
 /// is missing, the main window shows the start failure with this path.
-fn packaged_b3coind() -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn packaged_sidecar(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().ok_or("the app executable has no folder")?;
-    Ok(dir.join(format!("b3-hive-node{}", std::env::consts::EXE_SUFFIX)))
+    Ok(dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
 }
 
 /// Starts b3coind and follows it on a thread of its own: init, then the tip,
@@ -420,6 +552,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let config = node_config(app)?;
+            let updates = updates(app)?;
             let node = start_node(app.handle(), &config);
             app.manage(Arc::new(Core {
                 node: Mutex::new(node),
@@ -427,6 +560,7 @@ pub fn run() {
                 exiting: AtomicBool::new(false),
                 drafts: Mutex::new(DraftStore::default()),
                 theme: Mutex::new(None),
+                updates,
             }));
             Ok(())
         })
@@ -457,6 +591,9 @@ pub fn run() {
             open_console,
             ui_theme,
             set_ui_theme,
+            update_status,
+            update_check,
+            update_download,
             approval_pending,
             approval_decide,
             console_exec,
@@ -471,6 +608,7 @@ pub fn run() {
                     let node = core.node.lock().unwrap();
                     core.exiting.store(true, Ordering::SeqCst);
                     node.stop(STOP_TIMEOUT);
+                    core.updates.stop();
                 }
             }
         });

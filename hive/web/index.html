@@ -33,6 +33,10 @@
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-terminal" /></svg>
               <span class="nav-text">Console</span>
             </button>
+            <button class="nav-item" type="button" data-view="updates">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg>
+              <span class="nav-text">Updates</span>
+            </button>
           </div>
         </nav>
         <div class="rail-foot">
@@ -141,6 +145,42 @@
             </div>
           </form>
           <div class="banner mt-4" id="send-result" role="status" hidden></div>
+        </main>
+
+        <main class="view view--flow" id="view-updates" hidden>
+          <div class="card">
+            <div class="card-head">
+              <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-shield" /></svg>B3 Hive releases</h2>
+              <span class="badge badge-neutral" id="update-state">Not checked</span>
+            </div>
+            <div class="card-pad details">
+              <div class="drow"><span class="dkey">Installed</span><span class="dval tnum" id="update-installed"></span></div>
+              <div id="update-offer" hidden>
+                <div class="drow"><span class="dkey">Available</span><span class="dval tnum" id="offer-version"></span></div>
+                <div class="drow"><span class="dkey">Size</span><span class="dval tnum" id="offer-size"></span></div>
+                <div class="drow"><span class="dkey">SHA-256</span><span class="dval is-mono" id="offer-sha"></span></div>
+                <div class="drow"><span class="dkey">From</span><span class="dval is-mono" id="offer-url"></span></div>
+              </div>
+              <div class="progress mt-3" id="update-progress" hidden><div class="progress-bar" id="update-progress-bar"></div></div>
+            </div>
+            <div class="card-foot btn-row">
+              <button class="btn btn-secondary" type="button" id="update-check">
+                <svg class="i" aria-hidden="true"><use href="/icons.svg#i-refresh" /></svg><span>Check for updates</span>
+              </button>
+              <button class="btn btn-primary" type="button" id="update-download" hidden>
+                <svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg><span>Download and verify</span>
+              </button>
+            </div>
+          </div>
+          <div class="banner mt-4" id="update-result" role="status" hidden></div>
+          <div class="callout callout-info mt-4">
+            <div class="callout-title">
+              <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-key" /></svg>Only signed releases
+            </div>
+            A release is offered only if enough of the pinned B3 release keys signed it, and a
+            download is kept only if its size and SHA-256 match what they signed. B3 Hive does not
+            install updates by itself yet: run the verified file yourself.
+          </div>
         </main>
       </div>
     </div>

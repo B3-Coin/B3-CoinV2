@@ -13,6 +13,9 @@
     "allow-draft-send",
     "allow-open-console",
     "allow-ui-theme",
-    "allow-set-ui-theme"
+    "allow-set-ui-theme",
+    "allow-update-status",
+    "allow-update-check",
+    "allow-update-download"
   ]
 }

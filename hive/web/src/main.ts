@@ -28,6 +28,7 @@ showThemeIcon(await initTheme());
 const VIEWS = {
   home: { title: "Home", sub: "Your balance and your node" },
   send: { title: "Send", sub: "Pay someone in B3" },
+  updates: { title: "Updates", sub: "Signed B3 Hive releases" },
 } as const;
 type View = keyof typeof VIEWS;
 
@@ -40,6 +41,7 @@ function go(view: View): void {
   el("page-title").textContent = VIEWS[view].title;
   el("page-sub").textContent = VIEWS[view].sub;
   if (view === "send") el<HTMLInputElement>("address").focus();
+  if (view === "updates") void refreshUpdates();
 }
 
 for (const button of document.querySelectorAll<HTMLElement>("[data-view]")) {
@@ -177,6 +179,133 @@ el("send").addEventListener("submit", async (event) => {
   } finally {
     submit.disabled = false;
   }
+});
+
+// ---- updates ---------------------------------------------------------------
+
+// Mirrors UpdateStatus in src-tauri/src/update.rs; the helper names the state.
+type Offer = { version: string; size: number; sha256: string; url: string; notes_sha256: string };
+type UpdateStatus = {
+  state: string;
+  error: string;
+  installed: string;
+  offer: Offer | null;
+  download: string | null;
+};
+
+const STATE_TEXT: Record<string, [string, string]> = {
+  unconfigured: ["No update channel", "neutral"],
+  idle: ["Not checked", "neutral"],
+  checking: ["Checking", "info"],
+  "update-available": ["Update available", "accent"],
+  downloading: ["Downloading", "info"],
+  "ready-to-install": ["Downloaded and verified", "success"],
+  failed: ["Failed", "danger"],
+};
+
+// The helper reports stable tokens; the common ones get words.
+const ERROR_TEXT: Record<string, string> = {
+  "update-fetch-dns": "The release server could not be found. Check your internet connection.",
+  "update-fetch-connect": "The release server could not be reached.",
+  "update-fetch-timeout": "The release server took too long to answer.",
+  "update-fetch-tls": "The release server's HTTPS certificate was not accepted.",
+  "update-fetch-redirect": "The release server sent the download somewhere B3 Hive does not trust.",
+  "update-fetch-oversize": "The release server sent more data than the release allows.",
+  "update-reject-expired": "The published release list has expired.",
+  "update-reject-rollback": "The published release list is older than one already seen.",
+};
+
+function updateError(token: string): string {
+  if (ERROR_TEXT[token]) return `${ERROR_TEXT[token]} (${token})`;
+  if (token.startsWith("update-fetch-http-")) return `The release server answered HTTP ${token.slice(18)}.`;
+  return token ? `The update was refused: ${token}` : "";
+}
+
+function megabytes(bytes: number): string {
+  return `${(bytes / 1_000_000).toLocaleString("en-US", { maximumFractionDigits: 1 })} MB`;
+}
+
+function updateResult(tone: "info" | "success" | "warning" | "danger", text: string): void {
+  const box = el("update-result");
+  box.hidden = !text;
+  box.className = `banner banner-${tone} mt-4`;
+  box.textContent = text;
+}
+
+let offerSize = 0;
+// An idle answer after a check means nothing newer was offered.
+let checked = false;
+
+function renderUpdates(u: UpdateStatus): void {
+  const [text, tone] = STATE_TEXT[u.state] ?? [u.state, "neutral"];
+  const state = el("update-state");
+  state.textContent = text;
+  state.className = `badge badge-${tone}`;
+  el("update-installed").textContent = u.installed;
+  el("update-offer").hidden = !u.offer;
+  offerSize = u.offer?.size ?? 0;
+  if (u.offer) {
+    el("offer-version").textContent = u.offer.version;
+    el("offer-size").textContent = megabytes(u.offer.size);
+    el("offer-sha").textContent = shorten(u.offer.sha256, 12, 12);
+    el("offer-sha").title = u.offer.sha256;
+    el("offer-url").textContent = u.offer.url;
+  }
+  el("update-check").hidden = u.state === "unconfigured";
+  el("update-download").hidden = u.state !== "update-available";
+  el("update-progress").hidden = u.state !== "ready-to-install";
+  el("update-progress").classList.add("progress--ok");
+  el("update-progress-bar").style.width = "100%";
+  if (u.state === "unconfigured") {
+    updateResult("info", "This build of B3 Hive has no pinned release channel, so it never looks for updates.");
+  } else if (u.state === "failed") {
+    updateResult("danger", updateError(u.error));
+  } else if (u.state === "ready-to-install" && u.download) {
+    updateResult("success", `Saved to ${u.download}. Close B3 Hive and run that file to install ${u.offer?.version ?? "it"}.`);
+  } else if (u.state === "idle" && u.offer === null && checked) {
+    updateResult("success", `B3 Hive ${u.installed} is the latest release.`);
+  } else {
+    updateResult("info", "");
+  }
+}
+
+// One update command runs at a time, so both buttons wait for it.
+async function updateCommand(command: string, busy: string): Promise<void> {
+  const buttons = [el<HTMLButtonElement>("update-check"), el<HTMLButtonElement>("update-download")];
+  for (const b of buttons) b.disabled = true;
+  updateResult("info", busy);
+  try {
+    renderUpdates(await invoke<UpdateStatus>(command));
+  } catch (e) {
+    updateResult("danger", String(e));
+  } finally {
+    for (const b of buttons) b.disabled = false;
+  }
+}
+
+async function refreshUpdates(): Promise<void> {
+  try {
+    renderUpdates(await invoke<UpdateStatus>("update_status"));
+  } catch (e) {
+    updateResult("danger", String(e));
+  }
+}
+
+el("update-check").addEventListener("click", async () => {
+  checked = true;
+  await updateCommand("update_check", "Checking the signed release list…");
+});
+
+el("update-download").addEventListener("click", async () => {
+  const bar = el("update-progress");
+  bar.hidden = false;
+  bar.classList.remove("progress--ok");
+  el("update-progress-bar").style.width = "0";
+  await updateCommand("update_download", "Downloading and verifying the release…");
+});
+
+await listen<number>("update-progress", (event) => {
+  if (offerSize > 0) el("update-progress-bar").style.width = `${Math.min(100, (event.payload / offerSize) * 100)}%`;
 });
 
 await listen<DraftResult>("draft-result", (event) => {
