@@ -79,6 +79,7 @@ const VIEWS = {
   send: { title: "Send", sub: "Pay someone in B3" },
   activity: { title: "Activity", sub: "Your wallet's transactions" },
   network: { title: "Network", sub: "Your node and its peers" },
+  settings: { title: "Settings", sub: "How your node runs and connects" },
   updates: { title: "Updates", sub: "Signed B3 Hive releases" },
 } as const;
 type View = keyof typeof VIEWS;
@@ -98,6 +99,7 @@ function go(view: View): void {
   if (view === "updates") void refreshUpdates();
   if (view === "activity") void refreshActivity();
   if (view === "network") void refreshNetwork();
+  if (view === "settings") void loadSettings();
 }
 
 for (const button of document.querySelectorAll<HTMLElement>("[data-view]")) {
@@ -647,6 +649,153 @@ await listen<string>("bootstrap-failed", (event) => {
   el<HTMLButtonElement>("setup-go").disabled = setupChoice === null;
   el<HTMLButtonElement>("setup-cancel").disabled = false;
   setupResult("danger", `${event.payload} Nothing was installed; you can try again or sync from the network.`);
+});
+
+// ---- settings --------------------------------------------------------------
+
+// Mirrors settings::NodeSettings and SettingsView in src-tauri.
+type NodeSettings = {
+  dbcache_mib: number | null;
+  script_threads: number | null;
+  listen: boolean | null;
+  natpmp: boolean | null;
+  proxy: string | null;
+  onion: string | null;
+};
+type SettingsView = { settings: NodeSettings; file: string; network: "main" | "regtest" };
+
+// b3coind's defaults for the two flags.
+const DEFAULT_LISTEN = true;
+const DEFAULT_NATPMP = true;
+
+let loadedSettings: NodeSettings | null = null;
+
+function settingsResult(tone: "success" | "danger", text: string): void {
+  const box = el("settings-result");
+  box.hidden = !text;
+  box.className = `banner banner-${tone}`;
+  box.textContent = text;
+}
+
+function syncProxyRows(): void {
+  el("set-proxy-row").hidden = !el<HTMLInputElement>("set-proxy-use").checked;
+  el("set-onion-row").hidden = !el<HTMLInputElement>("set-onion-use").checked;
+}
+
+function fillSettings(s: NodeSettings): void {
+  el<HTMLInputElement>("set-dbcache").value = s.dbcache_mib === null ? "" : String(s.dbcache_mib);
+  el<HTMLInputElement>("set-par").value = s.script_threads === null ? "" : String(s.script_threads);
+  el<HTMLInputElement>("set-listen").checked = s.listen ?? DEFAULT_LISTEN;
+  el<HTMLInputElement>("set-natpmp").checked = s.natpmp ?? DEFAULT_NATPMP;
+  el<HTMLInputElement>("set-proxy-use").checked = s.proxy !== null;
+  el<HTMLInputElement>("set-proxy").value = s.proxy ?? "";
+  el<HTMLInputElement>("set-onion-use").checked = s.onion !== null;
+  el<HTMLInputElement>("set-onion").value = s.onion ?? "";
+  for (const id of ["set-dbcache", "set-par", "set-proxy", "set-onion"]) el(id).removeAttribute("aria-invalid");
+  syncProxyRows();
+}
+
+async function loadSettings(): Promise<void> {
+  settingsResult("success", "");
+  try {
+    const view = await invoke<SettingsView>("node_settings");
+    loadedSettings = view.settings;
+    fillSettings(view.settings);
+    el("settings-note").textContent =
+      `The node stops and starts again with the new settings. They are kept in ${view.file}, ` +
+      "which B3-Qt uses too, and take the place of the same options in b3coin.conf." +
+      (view.network === "regtest"
+        ? " This development node runs regtest, which keeps incoming connections off."
+        : "");
+  } catch (e) {
+    loadedSettings = null;
+    settingsResult("danger", String(e));
+  }
+}
+
+/// An optional whole number from a field, or an error naming the field.
+function wholeNumber(id: string, name: string): number | null {
+  const input = el<HTMLInputElement>(id);
+  const text = input.value.trim();
+  input.removeAttribute("aria-invalid");
+  if (text === "") return null;
+  if (!/^-?\d+$/.test(text)) {
+    input.setAttribute("aria-invalid", "true");
+    throw new Error(`${name} must be a whole number.`);
+  }
+  return Number(text);
+}
+
+function proxyField(useId: string, id: string, name: string): string | null {
+  const input = el<HTMLInputElement>(id);
+  input.removeAttribute("aria-invalid");
+  if (!el<HTMLInputElement>(useId).checked) return null;
+  const text = input.value.trim();
+  if (!text) {
+    input.setAttribute("aria-invalid", "true");
+    throw new Error(`Enter the ${name}, such as 127.0.0.1:9050.`);
+  }
+  return text;
+}
+
+/// A flag left unset stays unset while the box shows b3coind's default.
+function flagField(id: string, loaded: boolean | null, fallback: boolean): boolean | null {
+  const checked = el<HTMLInputElement>(id).checked;
+  return loaded === null && checked === fallback ? null : checked;
+}
+
+function readSettingsForm(): NodeSettings {
+  return {
+    dbcache_mib: wholeNumber("set-dbcache", "The database cache"),
+    script_threads: wholeNumber("set-par", "Script verification threads"),
+    listen: flagField("set-listen", loadedSettings?.listen ?? null, DEFAULT_LISTEN),
+    natpmp: flagField("set-natpmp", loadedSettings?.natpmp ?? null, DEFAULT_NATPMP),
+    proxy: proxyField("set-proxy-use", "set-proxy", "proxy address"),
+    onion: proxyField("set-onion-use", "set-onion", "Tor proxy address"),
+  };
+}
+
+async function applySettings(settings: NodeSettings): Promise<void> {
+  const save = el<HTMLButtonElement>("settings-save");
+  const defaults = el<HTMLButtonElement>("settings-defaults");
+  save.disabled = defaults.disabled = true;
+  settingsResult("success", "");
+  try {
+    await invoke("node_settings_apply", { settings });
+    settingsResult("success", "Saved. The node is starting again with these settings.");
+    await loadSettings();
+    settingsResult("success", "Saved. The node is starting again with these settings.");
+  } catch (e) {
+    settingsResult("danger", String(e));
+  } finally {
+    save.disabled = defaults.disabled = false;
+  }
+}
+
+el("set-proxy-use").addEventListener("change", syncProxyRows);
+el("set-onion-use").addEventListener("change", syncProxyRows);
+
+el("settings-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  let settings: NodeSettings;
+  try {
+    settings = readSettingsForm();
+  } catch (e) {
+    settingsResult("danger", e instanceof Error ? e.message : String(e));
+    return;
+  }
+  void applySettings(settings);
+});
+
+el("settings-defaults").addEventListener("click", () => {
+  void applySettings({
+    dbcache_mib: null,
+    script_threads: null,
+    listen: null,
+    natpmp: null,
+    proxy: null,
+    onion: null,
+  });
 });
 
 // ---- send ------------------------------------------------------------------

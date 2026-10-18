@@ -41,6 +41,10 @@
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg>
               <span class="nav-text">Network</span>
             </button>
+            <button class="nav-item" type="button" data-view="settings">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-settings" /></svg>
+              <span class="nav-text">Settings</span>
+            </button>
             <button class="nav-item" type="button" data-view="updates">
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg>
               <span class="nav-text">Updates</span>
@@ -304,6 +308,99 @@
             </div>
             <div class="banner" id="network-result" role="status" hidden></div>
           </div>
+        </main>
+
+        <main class="view view--flow" id="view-settings" hidden>
+          <form class="stack" id="settings-form" novalidate>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-server" /></svg>Node</h2>
+              </div>
+              <div class="card-pad form-grid">
+                <div class="field">
+                  <label for="set-dbcache">Database cache</label>
+                  <div class="amount-field">
+                    <input class="input" id="set-dbcache" inputmode="numeric" autocomplete="off" placeholder="Default" />
+                    <span class="unit">MiB</span>
+                  </div>
+                  <span class="help">
+                    Leave empty for b3coind's default: 450 MiB, or 1,024 MiB on a 64-bit computer with
+                    at least 4 GB of memory.
+                  </span>
+                </div>
+                <div class="field">
+                  <label for="set-par">Script verification threads</label>
+                  <input class="input" id="set-par" inputmode="numeric" autocomplete="off" placeholder="Automatic" />
+                  <span class="help">
+                    Empty or 0 picks a number from your processor. A negative number leaves that many
+                    cores free. At most 15.
+                  </span>
+                </div>
+                <div class="field">
+                  <span class="field-label">Pruning</span>
+                  <span class="help">
+                    Not available. This B3 release keeps the whole chain for FlowMesh and the bridge, and
+                    b3coind will not start pruned.
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg>Network</h2>
+              </div>
+              <div class="card-pad">
+                <label class="check">
+                  <input type="checkbox" id="set-listen" />
+                  <span class="check-body">
+                    <span>Allow incoming connections</span>
+                    <span class="help">Other B3 nodes may connect to yours.</span>
+                  </span>
+                </label>
+                <label class="check">
+                  <input type="checkbox" id="set-natpmp" />
+                  <span class="check-body">
+                    <span>Open the port on your router</span>
+                    <span class="help">Asks the router with PCP or NAT-PMP. Not done while a proxy is used.</span>
+                  </span>
+                </label>
+                <label class="check">
+                  <input type="checkbox" id="set-proxy-use" />
+                  <span class="check-body">
+                    <span>Connect through a SOCKS5 proxy</span>
+                    <span class="help">For all peers, unless a separate Tor proxy is set below.</span>
+                  </span>
+                </label>
+                <div class="field" id="set-proxy-row">
+                  <label for="set-proxy">Proxy address</label>
+                  <input class="input input-mono" id="set-proxy" autocomplete="off" spellcheck="false" placeholder="127.0.0.1:9050" />
+                </div>
+                <label class="check mt-2">
+                  <input type="checkbox" id="set-onion-use" />
+                  <span class="check-body">
+                    <span>Use a separate SOCKS5 proxy for Tor onion services</span>
+                  </span>
+                </label>
+                <div class="field" id="set-onion-row">
+                  <label for="set-onion">Tor proxy address</label>
+                  <input class="input input-mono" id="set-onion" autocomplete="off" spellcheck="false" placeholder="127.0.0.1:9050" />
+                </div>
+              </div>
+            </div>
+
+            <div class="callout callout-info">
+              <div class="callout-title">
+                <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-info" /></svg>Saving restarts the node
+              </div>
+              <span id="settings-note"></span>
+            </div>
+            <div class="row">
+              <button class="btn btn-primary" type="submit" id="settings-save">Save and restart</button>
+              <button class="btn btn-secondary" type="button" id="settings-defaults">Use defaults</button>
+            </div>
+            <div class="banner" id="settings-result" role="status" hidden></div>
+          </form>
         </main>
 
         <main class="view view--flow" id="view-updates" hidden>

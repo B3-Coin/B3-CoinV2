@@ -21,6 +21,8 @@ fn main() {
             "update_status",
             "update_check",
             "update_download",
+            "node_settings",
+            "node_settings_apply",
             "setup_info",
             "setup_bootstrap",
             "setup_cancel",

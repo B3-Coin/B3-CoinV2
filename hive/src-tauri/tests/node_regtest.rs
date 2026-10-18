@@ -16,6 +16,7 @@ use b3_hive::console;
 use b3_hive::drafts::DraftStore;
 use b3_hive::node::{Network, Node, NodeConfig, NodeStatus};
 use b3_hive::rpc::{Client, RpcError};
+use b3_hive::settings::{self, NodeSettings};
 use b3_hive::wallet;
 
 const W: &str = wallet::SPIKE_WALLET;
@@ -213,6 +214,76 @@ fn a_bootstrap_installs_a_working_chain() {
         })
     );
     drop(target);
+}
+
+/// The proxies b3coind reports, by network name.
+fn proxies(client: &Client) -> Vec<(String, String)> {
+    let info = client.call("getnetworkinfo", json!([])).unwrap();
+    info["networks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            (
+                n["name"].as_str().unwrap().to_owned(),
+                n["proxy"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn proxy_of(client: &Client, network: &str) -> String {
+    proxies(client)
+        .into_iter()
+        .find(|(name, _)| name == network)
+        .map(|(_, proxy)| proxy)
+        .unwrap_or_default()
+}
+
+/// b3coind reads the settings B3 Hive writes, and a restart picks up a change.
+#[test]
+fn node_settings_take_effect_after_a_restart() {
+    let first = NodeSettings {
+        proxy: Some("127.0.0.1:9050".into()),
+        dbcache_mib: Some(64),
+        ..Default::default()
+    };
+    let Some((test, status)) = TestNode::start_prepared("settings", |datadir| {
+        settings::write(&datadir.join("regtest"), &first).unwrap();
+    }) else {
+        return;
+    };
+    assert!(
+        matches!(status, NodeStatus::Ready { .. }),
+        "not ready: {status:?}"
+    );
+    let client = test.node.client().unwrap();
+    assert_eq!(proxy_of(client, "ipv4"), "127.0.0.1:9050");
+    assert_eq!(proxy_of(client, "onion"), "127.0.0.1:9050");
+
+    // As the settings page does: stop, write, start again.
+    test.node.stop(Duration::from_secs(120));
+    let chain_dir = test.datadir.join("regtest");
+    let second = NodeSettings {
+        onion: Some("127.0.0.1:9150".into()),
+        ..Default::default()
+    };
+    settings::write(&chain_dir, &second).unwrap();
+    assert_eq!(settings::read(&chain_dir).unwrap(), second);
+    let again = Node::start(&NodeConfig {
+        b3coind: std::env::var_os("B3_HIVE_B3COIND").unwrap().into(),
+        datadir: test.datadir.clone(),
+        network: Network::Regtest,
+    });
+    let status = again.wait_ready(Duration::from_secs(300), |_| {});
+    assert!(
+        matches!(status, NodeStatus::Ready { .. }),
+        "not ready after the change: {status:?}"
+    );
+    let client = again.client().unwrap();
+    assert_eq!(proxy_of(client, "ipv4"), "");
+    assert_eq!(proxy_of(client, "onion"), "127.0.0.1:9150");
+    again.stop(Duration::from_secs(120));
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

@@ -20,6 +20,8 @@
     "allow-update-status",
     "allow-update-check",
     "allow-update-download",
+    "allow-node-settings",
+    "allow-node-settings-apply",
     "allow-setup-info",
     "allow-setup-bootstrap",
     "allow-setup-cancel",

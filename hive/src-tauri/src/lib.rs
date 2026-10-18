@@ -9,6 +9,7 @@ pub mod console;
 pub mod drafts;
 pub mod node;
 pub mod rpc;
+pub mod settings;
 pub mod update;
 pub mod wallet;
 
@@ -274,6 +275,61 @@ fn set_ui_theme(window: Window, core: State<'_, Arc<Core>>, theme: Theme) -> Res
     require_window(&window, MAIN)?;
     *core.theme.lock().unwrap() = Some(theme);
     Ok(())
+}
+
+// ---- node settings (main window) --------------------------------------------
+
+#[derive(Serialize)]
+pub struct SettingsView {
+    pub settings: settings::NodeSettings,
+    /// The settings file, for the page to name.
+    pub file: String,
+    pub network: Network,
+}
+
+#[tauri::command]
+fn node_settings(window: Window, core: State<'_, Arc<Core>>) -> Result<SettingsView, String> {
+    require_window(&window, MAIN)?;
+    let chain_dir = core.config.network.chain_dir(&core.config.datadir);
+    Ok(SettingsView {
+        settings: settings::read(&chain_dir)?,
+        file: settings::path(&chain_dir).display().to_string(),
+        network: core.config.network,
+    })
+}
+
+/// Saves the node settings and restarts b3coind so they take effect. Nothing
+/// is stopped when the settings or the file cannot be used.
+#[tauri::command]
+async fn node_settings_apply(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    settings: settings::NodeSettings,
+) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let settings = settings.validated()?;
+        let chain_dir = core.config.network.chain_dir(&core.config.datadir);
+        settings::check(&chain_dir)?;
+        let mut current = core.node.lock().unwrap();
+        if core.exiting.load(Ordering::SeqCst) {
+            return Err("B3 Hive is closing.".into());
+        }
+        if matches!(current.status(), NodeStatus::Setup) || core.setup.installing() {
+            return Err("Finish setting up the node first.".into());
+        }
+        let _ = app.emit_to(MAIN, "node-status", NodeStatus::Stopping);
+        current.stop(STOP_TIMEOUT);
+        let written = settings::write(&chain_dir, &settings);
+        // Started again even when the write failed, with the settings it had.
+        if !core.exiting.load(Ordering::SeqCst) {
+            *current = start_node(&app, &core.config);
+        }
+        written
+    })
+    .await
 }
 
 // ---- setup wizard (main window) ---------------------------------------------
@@ -849,6 +905,8 @@ pub fn run() {
             update_status,
             update_check,
             update_download,
+            node_settings,
+            node_settings_apply,
             setup_info,
             setup_bootstrap,
             setup_cancel,
