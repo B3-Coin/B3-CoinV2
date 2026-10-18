@@ -9,6 +9,9 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "node_status",
             "wallet_overview",
+            "wallet_activity",
+            "chain_overview",
+            "network_peers",
             "dev_fund",
             "draft_send",
             "open_console",

@@ -1,6 +1,7 @@
 //! Wallet calls for the spike: one regtest wallet, its balance, test funding,
 //! and building a signed send for the approval window.
 
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::drafts::{OutputLine, SendSummary};
@@ -151,6 +152,56 @@ pub fn prepare_send(
     ))
 }
 
+/// One wallet transaction line, as listtransactions reports it. A payment
+/// to several addresses gives one line per address.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActivityEntry {
+    pub txid: String,
+    /// send, receive, generate, immature or orphan.
+    pub category: String,
+    /// Signed, exact decimal text: negative for sends.
+    pub amount: String,
+    /// Sends only; negative, as the node reports it.
+    pub fee: Option<String>,
+    /// Negative when the transaction conflicts with the chain.
+    pub confirmations: i64,
+    /// Unix seconds.
+    pub time: i64,
+    pub address: String,
+    pub label: String,
+}
+
+/// Activity shows at most this many lines.
+pub const ACTIVITY_LIMIT: u64 = 500;
+
+/// The newest `count` (at most ACTIVITY_LIMIT) lines, newest first.
+pub fn activity(client: &Client, count: u64) -> Result<Vec<ActivityEntry>, RpcError> {
+    let count = count.clamp(1, ACTIVITY_LIMIT);
+    let list = client.call_wallet(SPIKE_WALLET, "listtransactions", json!(["*", count]))?;
+    let list = list
+        .as_array()
+        .ok_or_else(|| RpcError::BadReply("listtransactions did not return a list".into()))?;
+    // The node lists oldest first.
+    list.iter().rev().map(parse_activity).collect()
+}
+
+fn parse_activity(t: &Value) -> Result<ActivityEntry, RpcError> {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+    Ok(ActivityEntry {
+        txid: text(&t["txid"]),
+        category: text(&t["category"]),
+        amount: decimal(&t["amount"])?,
+        fee: match &t["fee"] {
+            Value::Null => None,
+            fee => Some(decimal(fee)?),
+        },
+        confirmations: t["confirmations"].as_i64().unwrap_or(0),
+        time: t["time"].as_i64().unwrap_or(0),
+        address: text(&t["address"]),
+        label: text(&t["label"]),
+    })
+}
+
 /// Submits a draft's exact bytes; returns the txid the node reports.
 pub fn broadcast(client: &Client, hex: &str) -> Result<String, RpcError> {
     let txid = client.call("sendrawtransaction", json!([hex]))?;
@@ -198,6 +249,23 @@ mod tests {
         ] {
             assert!(parse_amount(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn activity_keeps_amounts_exact() {
+        let t: Value = serde_json::from_str(
+            r#"{"txid": "ab", "category": "send", "amount": -0.123456789,
+                "fee": -0.000141, "confirmations": 3, "time": 1700000000,
+                "address": "b3q", "label": ""}"#,
+        )
+        .unwrap();
+        let e = parse_activity(&t).unwrap();
+        assert_eq!(e.amount, "-0.123456789");
+        assert_eq!(e.fee.as_deref(), Some("-0.000141"));
+        assert_eq!(e.confirmations, 3);
+        let t = json!({"txid": "cd", "category": "generate", "amount": 5});
+        assert_eq!(parse_activity(&t).unwrap().fee, None);
+        assert!(parse_activity(&json!({"amount": "5"})).is_err());
     }
 
     #[test]

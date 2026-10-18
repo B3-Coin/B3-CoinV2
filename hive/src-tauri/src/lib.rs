@@ -3,6 +3,7 @@
 //! after the approval window approves it. The one exception is the console
 //! window: commands typed there run with full access, as in the Qt console.
 
+pub mod chain;
 pub mod console;
 pub mod drafts;
 pub mod node;
@@ -131,6 +132,46 @@ async fn dev_fund(core: State<'_, Arc<Core>>) -> Result<(), String> {
         let client = node.client().ok_or("The node is not ready yet.")?;
         wallet::ensure_wallet(client).map_err(|e| e.to_string())?;
         wallet::fund_regtest(client).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// The wallet's newest transactions, newest first.
+#[tauri::command]
+async fn wallet_activity(
+    core: State<'_, Arc<Core>>,
+    count: u64,
+) -> Result<Vec<wallet::ActivityEntry>, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let client = node.client().ok_or("The node is not ready yet.")?;
+        wallet::ensure_wallet(client).map_err(|e| e.to_string())?;
+        wallet::activity(client, count).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// The dashboard's chain, sync, network and mempool summary.
+#[tauri::command]
+async fn chain_overview(core: State<'_, Arc<Core>>) -> Result<chain::ChainOverview, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let client = node.client().ok_or("The node is not ready yet.")?;
+        chain::overview(client).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// The network page's peer list.
+#[tauri::command]
+async fn network_peers(core: State<'_, Arc<Core>>) -> Result<Vec<chain::Peer>, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let client = node.client().ok_or("The node is not ready yet.")?;
+        chain::peers(client).map_err(|e| e.to_string())
     })
     .await
 }
@@ -586,6 +627,9 @@ pub fn run() {
             node_status,
             restart_node,
             wallet_overview,
+            wallet_activity,
+            chain_overview,
+            network_peers,
             dev_fund,
             draft_send,
             open_console,

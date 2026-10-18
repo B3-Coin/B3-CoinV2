@@ -28,11 +28,15 @@ const CONSOLE_USER: &str = "hive-console";
 /// generatetoaddress only serves the regtest funding button.
 const PAGE_METHODS: &[&str] = &[
     "getblockchaininfo",
+    "getnetworkinfo",
+    "getmempoolinfo",
+    "getpeerinfo",
     "stop",
     "listwallets",
     "loadwallet",
     "createwallet",
     "getbalances",
+    "listtransactions",
     "getnewaddress",
     "walletcreatefundedpsbt",
     "walletprocesspsbt",

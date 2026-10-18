@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use b3_hive::chain;
 use b3_hive::console;
 use b3_hive::drafts::DraftStore;
 use b3_hive::node::{Node, NodeConfig, NodeStatus};
@@ -80,6 +81,39 @@ fn starts_reports_ready_and_stops() {
     }
     test.node.stop(Duration::from_secs(120));
     assert!(test.node.has_exited());
+}
+
+#[test]
+fn the_page_login_reads_the_dashboard_network_and_activity() {
+    let Some((test, status)) = TestNode::start("pages") else {
+        return;
+    };
+    assert!(
+        matches!(status, NodeStatus::Ready { .. }),
+        "not ready: {status:?}"
+    );
+    let client = test.node.client().unwrap();
+
+    let o = chain::overview(client).unwrap();
+    assert_eq!(o.chain, "regtest");
+    assert_eq!((o.blocks, o.headers), (0, 0));
+    assert_eq!(o.best_block_hash.len(), 64);
+    assert!(o.user_agent.starts_with('/'), "{}", o.user_agent);
+    // No peers, and nothing waiting.
+    assert_eq!((o.connections_in, o.connections_out), (0, 0));
+    assert_eq!(o.mempool_transactions, 0);
+    assert!(chain::peers(client).unwrap().is_empty());
+
+    wallet::ensure_wallet(client).unwrap();
+    assert!(wallet::activity(client, 10).unwrap().is_empty());
+    wallet::fund_regtest(client).unwrap();
+    let lines = wallet::activity(client, 10).unwrap();
+    assert_eq!(lines.len(), 10);
+    // Newest first: the last block mined has one confirmation.
+    assert_eq!(lines[0].confirmations, 1);
+    assert_eq!(lines[0].category, "immature");
+    assert!(lines.windows(2).all(|w| w[0].confirmations <= w[1].confirmations));
+    assert_eq!(chain::overview(client).unwrap().blocks, wallet::FUND_BLOCKS);
 }
 
 #[test]
