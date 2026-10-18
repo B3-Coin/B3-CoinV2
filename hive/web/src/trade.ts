@@ -9,13 +9,14 @@
 // this page never signs.
 import { invoke } from "@tauri-apps/api/core";
 
-import { amountNode, el, isMasked, shorten } from "../shared/ui";
+import { el, isMasked, shorten } from "../shared/ui";
 import {
   B3_DECIMALS,
   decimal,
   formatB3,
   formatPrice,
   formatQuantity,
+  notional,
   parsePrice,
   parseQuantity,
   quantityPlaces,
@@ -174,6 +175,12 @@ let market: Market = blank();
 
 /** The order form's side: bid buys the token with B3, ask sells it. */
 let side: "bid" | "ask" = "bid";
+/** The order form takes one price (limit) or up to four (ladder). */
+let ladder = false;
+/** The chart shows clearings (price) or the book's cumulative depth. */
+let chartView: "price" | "depth" = "price";
+/** Which sides of the book are listed. */
+let bookShow: "both" | "bids" | "asks" = "both";
 /** Drafts this page opened, until the approval window decides them. */
 const drafts = new Map<string, "order" | "cancel" | "deposit" | "withdraw">();
 /** The funding form moves funds in (deposit) or out (withdraw). */
@@ -401,6 +408,31 @@ function stateBadge(): [string, string, string] {
   return ["badge-success", "Live", "Verified updates are arriving"];
 }
 
+/** The newest certified clearing prices, newest first: from the ticks the
+ *  page follows, or the endpoint's trade list before any arrive. */
+function lastPrices(): bigint[] {
+  const cleared = market.ticks.filter((t) => t.cleared).map((t) => BigInt(t.price));
+  if (cleared.length) return cleared.slice(-2).reverse();
+  return market.trades.slice(0, 2).map((t) => BigInt(t.price));
+}
+
+/** Up or down from the previous clearing, for colour; "" when unchanged. */
+function direction(): "" | "tr-up" | "tr-down" {
+  const [last, prev] = lastPrices();
+  if (last === undefined || prev === undefined || last === prev) return "";
+  return last > prev ? "tr-up" : "tr-down";
+}
+
+/** The change from the previous clearing in percent, to 2 decimals toward
+ *  zero, computed exactly. */
+function changeText(): string {
+  const [last, prev] = lastPrices();
+  if (last === undefined || prev === undefined || prev === 0n) return "";
+  const diff = last - prev;
+  const hundredths = ((diff < 0n ? -diff : diff) * 10000n) / prev;
+  return `${diff > 0n ? "+" : diff < 0n ? "−" : ""}${decimal(hundredths, 2, 2)}%`;
+}
+
 function renderHead(): void {
   const [cls, text, title] = stateBadge();
   const badge = el("tr-state");
@@ -410,8 +442,23 @@ function renderHead(): void {
   el("tr-test").hidden = !market.metadata?.test_only;
   const s = market.status;
   const u = units();
-  const last = [...market.ticks].reverse().find((t) => t.cleared) ?? market.trades[0];
-  el("tr-last").textContent = last && u ? formatPrice(BigInt(last.price), u) : "—";
+  const [last] = lastPrices();
+  const dir = direction();
+  const lastText = last !== undefined && u ? formatPrice(last, u) : "—";
+  el("tr-last").textContent = lastText;
+  el("tr-last").className = `tr-last tnum ${dir}`;
+  el("tr-change").textContent = changeText();
+  el("tr-change").className = `tr-change tnum ${dir}`;
+  el("tr-mid-last").textContent = last !== undefined && u ? `${lastText} ${dir === "tr-up" ? "↑" : dir === "tr-down" ? "↓" : ""}`.trim() : "—";
+  el("tr-mid-last").className = `tr-mid-last tnum ${dir}`;
+  const cleared = market.ticks.filter((t) => t.cleared).map((t) => BigInt(t.price));
+  if (cleared.length && u) {
+    const hi = cleared.reduce((a, b) => (b > a ? b : a));
+    const lo = cleared.reduce((a, b) => (b < a ? b : a));
+    el("tr-range").textContent = hi === lo ? formatPrice(hi, u) : `${formatPrice(lo, u)} – ${formatPrice(hi, u)}`;
+  } else {
+    el("tr-range").textContent = "—";
+  }
   const standing = market.book?.standing;
   el("tr-next").textContent =
     standing && u ? (standing.cleared ? `${formatPrice(BigInt(standing.price), u)} for ${formatQuantity(BigInt(standing.volume), u.decimals)}` : "No match") : "—";
@@ -456,8 +503,10 @@ function renderBook(): void {
     el("tr-spread").textContent = `Levels unavailable (${book.reason || "unknown"}); read again shortly.`;
     return;
   }
-  const askLevels = (book.asks?.levels ?? []).slice(0, BOOK_ROWS);
-  const bidLevels = (book.bids?.levels ?? []).slice(0, BOOK_ROWS);
+  // One side alone gets the room of both.
+  const rows = bookShow === "both" ? BOOK_ROWS : 2 * BOOK_ROWS;
+  const askLevels = (book.asks?.levels ?? []).slice(0, rows);
+  const bidLevels = (book.bids?.levels ?? []).slice(0, rows);
   const all = [...askLevels, ...bidLevels];
   const places = quantityPlaces(
     all.flatMap((l) => [BigInt(l.size), BigInt(l.cumulative)]),
@@ -522,6 +571,11 @@ function renderBook(): void {
 }
 
 const SVG = "http://www.w3.org/2000/svg";
+const [CHART_W, CHART_H, CHART_PAD] = [600, 260, 14];
+/** Clearings take the top of the chart; their volumes the bottom. */
+const PRICE_BOTTOM = CHART_H * 0.76;
+/** Room on the right for the last-price tag. */
+const TAG_ROOM = 64;
 
 function svg(tag: string, attrs: Record<string, string>): SVGElement {
   const node = document.createElementNS(SVG, tag);
@@ -529,19 +583,46 @@ function svg(tag: string, attrs: Record<string, string>): SVGElement {
   return node;
 }
 
+/** Where each clearing of the price chart sits, for the hover readout. */
+let plotted: { x: number; t: Tick }[] = [];
+
 function renderChart(): void {
+  const price = chartView === "price";
+  // SVG elements have no hidden property: set the attribute.
+  el("tr-chart").toggleAttribute("hidden", !price);
+  el("tr-depth").toggleAttribute("hidden", price);
+  el("tr-view-price").setAttribute("aria-selected", String(price));
+  el("tr-view-depth").setAttribute("aria-selected", String(!price));
+  const caption = el("tr-chart-caption");
+  caption.textContent = price ? "Certified clearings by microblock" : "Standing orders by price";
+  caption.title = price
+    ? "Each point is a certified auction that matched. Microblocks carry no execution time, so the axis is the microblock sequence."
+    : "Cumulative size of the verified standing orders at each price, computed by your node. Not certified; queued orders are not included.";
+  hideCross();
+  if (price) renderPriceChart();
+  else renderDepthChart();
+}
+
+function clearChartLabels(): void {
+  for (const id of ["tr-chart-high", "tr-chart-low", "tr-chart-first", "tr-chart-mid", "tr-chart-last"]) el(id).textContent = "";
+  el("tr-lasttag").hidden = true;
+}
+
+function renderPriceChart(): void {
   const chart = el("tr-chart");
   const u = units();
   const ticks = market.ticks;
   const cleared = ticks.filter((t) => t.cleared);
-  el("tr-chart-empty").hidden = cleared.length > 0;
+  const empty = el("tr-chart-empty");
+  empty.textContent = "No auction has matched yet in the retained history.";
+  empty.hidden = cleared.length > 0;
+  plotted = [];
   if (!u || !cleared.length) {
     chart.replaceChildren();
-    el("tr-chart-high").textContent = el("tr-chart-low").textContent = "";
-    el("tr-chart-first").textContent = el("tr-chart-last").textContent = "";
+    clearChartLabels();
     return;
   }
-  const [width, height, pad] = [600, 200, 12];
+  const [W, H, pad] = [CHART_W, CHART_H, CHART_PAD];
   const first = ticks[0].sequence;
   const lastSeq = ticks[ticks.length - 1].sequence;
   const prices = cleared.map((t) => BigInt(t.price));
@@ -549,30 +630,153 @@ function renderChart(): void {
   const lo = prices.reduce((a, b) => (b < a ? b : a));
   // Plot positions only; every label is formatted exactly from the BigInt.
   const span = Number(hi - lo) || 1;
-  const x = (seq: number) => (lastSeq === first ? width / 2 : ((seq - first) / (lastSeq - first)) * (width - 2 * pad) + pad);
-  const y = (p: bigint) => (hi === lo ? height / 2 : height - pad - (Number(p - lo) / span) * (height - 2 * pad));
-  const grid = [0.25, 0.5, 0.75].map((f) => svg("line", { class: "grid", x1: "0", x2: String(width), y1: String(height * f), y2: String(height * f) }));
-  // A step line: the price holds until the next clearing.
+  const right = W - TAG_ROOM;
+  const x = (seq: number) => (lastSeq === first ? right / 2 : ((seq - first) / (lastSeq - first)) * (right - 2 * pad) + pad);
+  const y = (p: bigint) => (hi === lo ? PRICE_BOTTOM / 2 : PRICE_BOTTOM - pad - (Number(p - lo) / span) * (PRICE_BOTTOM - 2 * pad));
+
+  const defs = svg("defs", {});
+  const grad = svg("linearGradient", { id: "tr-fill", x1: "0", y1: "0", x2: "0", y2: "1" });
+  grad.append(
+    // currentColor is the chart's colour, the accent (see .tr-chart svg).
+    svg("stop", { offset: "0%", "stop-color": "currentColor", "stop-opacity": "0.3" }),
+    svg("stop", { offset: "100%", "stop-color": "currentColor", "stop-opacity": "0" }),
+  );
+  defs.append(grad);
+  const grid = [0.2, 0.4, 0.6, 0.8].map((f) =>
+    svg("line", { class: "grid", x1: "0", x2: String(W), y1: (PRICE_BOTTOM * f).toFixed(1), y2: (PRICE_BOTTOM * f).toFixed(1) }),
+  );
+  // A step line: the price holds until the next clearing, and to now.
   const points: string[] = [];
   cleared.forEach((t, i) => {
-    const py = y(BigInt(t.price)).toFixed(1);
-    if (i > 0) points.push(`${x(t.sequence).toFixed(1)},${y(BigInt(cleared[i - 1].price)).toFixed(1)}`);
-    points.push(`${x(t.sequence).toFixed(1)},${py}`);
+    if (i > 0) points.push(`${x(t.sequence).toFixed(1)},${y(prices[i - 1]).toFixed(1)}`);
+    points.push(`${x(t.sequence).toFixed(1)},${y(prices[i]).toFixed(1)}`);
   });
-  points.push(`${x(lastSeq).toFixed(1)},${y(BigInt(cleared[cleared.length - 1].price)).toFixed(1)}`);
+  const lastY = y(prices[prices.length - 1]);
+  points.push(`${right.toFixed(1)},${lastY.toFixed(1)}`);
+  const area = svg("polygon", {
+    class: "area",
+    fill: "url(#tr-fill)",
+    points: `${x(cleared[0].sequence).toFixed(1)},${PRICE_BOTTOM} ${points.join(" ")} ${right.toFixed(1)},${PRICE_BOTTOM}`,
+  });
   const line = svg("polyline", { class: "line", points: points.join(" ") });
-  const dots = cleared.map((t) => {
-    const dot = svg("circle", { class: "dot", cx: x(t.sequence).toFixed(1), cy: y(BigInt(t.price)).toFixed(1), r: "3" });
-    const title = svg("title", {});
-    title.textContent = `#${t.sequence}: ${formatPrice(BigInt(t.price), u)} B3 for ${formatQuantity(BigInt(t.volume), u.decimals)}`;
-    dot.append(title);
-    return dot;
+  const lastLine = svg("line", { class: "lastline", x1: "0", x2: String(W), y1: lastY.toFixed(1), y2: lastY.toFixed(1) });
+  // Volumes, on their own scale below the prices.
+  const volumes = cleared.map((t) => BigInt(t.volume));
+  const maxVol = volumes.reduce((a, b) => (b > a ? b : a), 0n);
+  const slot = lastSeq === first ? 12 : ((right - 2 * pad) / (lastSeq - first)) * 0.6;
+  const barW = Math.max(2, Math.min(12, slot));
+  const volRoom = H - PRICE_BOTTOM - 4;
+  const bars = cleared.map((t, i) => {
+    const h = maxVol > 0n ? (Number((volumes[i] * 1000n) / maxVol) / 1000) * volRoom : 0;
+    return svg("rect", { class: "vol", x: (x(t.sequence) - barW / 2).toFixed(1), y: (H - h).toFixed(1), width: barW.toFixed(1), height: Math.max(1, h).toFixed(1) });
   });
-  chart.replaceChildren(...grid, line, ...dots);
+  const dots =
+    cleared.length <= 60 ? cleared.map((t, i) => svg("circle", { class: "dot", cx: x(t.sequence).toFixed(1), cy: y(prices[i]).toFixed(1), r: "2.5", fill: "var(--accent)" })) : [];
+  chart.replaceChildren(defs, ...grid, ...bars, area, line, lastLine, ...dots);
+  plotted = cleared.map((t) => ({ x: x(t.sequence), t }));
+
   el("tr-chart-high").textContent = formatPrice(hi, u);
   el("tr-chart-low").textContent = hi === lo ? "" : formatPrice(lo, u);
+  const tag = el("tr-lasttag");
+  tag.textContent = formatPrice(prices[prices.length - 1], u);
+  tag.style.top = `${((lastY / H) * 100).toFixed(2)}%`;
+  tag.hidden = false;
   el("tr-chart-first").textContent = `#${first}`;
+  el("tr-chart-mid").textContent = `${cleared.length} clearing${cleared.length === 1 ? "" : "s"}`;
   el("tr-chart-last").textContent = `#${lastSeq}`;
+}
+
+function renderDepthChart(): void {
+  const chart = el("tr-depth");
+  const u = units();
+  const book = market.book;
+  plotted = [];
+  clearChartLabels();
+  const bids = book?.available ? (book.bids?.levels ?? []) : [];
+  const asks = book?.available ? (book.asks?.levels ?? []) : [];
+  const empty = el("tr-chart-empty");
+  empty.textContent = book && !book.available ? `Levels unavailable (${book.reason || "unknown"}); read again shortly.` : "No standing orders.";
+  empty.hidden = !!u && (bids.length > 0 || asks.length > 0);
+  if (!u || (!bids.length && !asks.length)) {
+    chart.replaceChildren();
+    return;
+  }
+  const [W, H, pad] = [CHART_W, CHART_H, CHART_PAD];
+  // Every order in a level accepts its label price: a bid's lower edge, an
+  // ask's upper. Levels come best first.
+  const b = bids.map((l) => ({ p: BigInt(l.low), c: BigInt(l.cumulative) }));
+  const a = asks.map((l) => ({ p: BigInt(l.high), c: BigInt(l.cumulative) }));
+  const all = [...b, ...a];
+  let pLo = all.reduce((m, v) => (v.p < m ? v.p : m), all[0].p);
+  let pHi = all.reduce((m, v) => (v.p > m ? v.p : m), all[0].p);
+  if (pLo === pHi) {
+    pLo = pLo > 10n * u.tick ? pLo - 10n * u.tick : 0n;
+    pHi = pHi + 10n * u.tick;
+  }
+  const cMax = all.reduce((m, v) => (v.c > m ? v.c : m), 1n);
+  const x = (p: bigint) => pad + (Number(p - pLo) / Number(pHi - pLo)) * (W - 2 * pad);
+  const y = (c: bigint) => H - pad - (Number((c * 1000n) / cMax) / 1000) * (H - 2 * pad);
+  const bottom = (H - pad).toFixed(1);
+  const path = (levels: { p: bigint; c: bigint }[], end: bigint): string => {
+    const pts: string[] = [`${x(levels[0].p).toFixed(1)},${bottom}`];
+    levels.forEach((l, i) => {
+      if (i > 0) pts.push(`${x(l.p).toFixed(1)},${y(levels[i - 1].c).toFixed(1)}`);
+      pts.push(`${x(l.p).toFixed(1)},${y(l.c).toFixed(1)}`);
+    });
+    pts.push(`${x(end).toFixed(1)},${y(levels[levels.length - 1].c).toFixed(1)}`);
+    return pts.join(" ");
+  };
+  const grid = [0.25, 0.5, 0.75].map((f) => svg("line", { class: "grid", x1: "0", x2: String(W), y1: String(H * f), y2: String(H * f) }));
+  const shapes: SVGElement[] = [];
+  if (b.length) {
+    const line = path(b, pLo);
+    shapes.push(svg("polygon", { class: "bidarea", points: `${line} ${x(pLo).toFixed(1)},${bottom}` }), svg("polyline", { class: "bidline", points: line }));
+  }
+  if (a.length) {
+    const line = path(a, pHi);
+    shapes.push(svg("polygon", { class: "askarea", points: `${line} ${x(pHi).toFixed(1)},${bottom}` }), svg("polyline", { class: "askline", points: line }));
+  }
+  chart.replaceChildren(...grid, ...shapes);
+  el("tr-chart-high").textContent = `${formatQuantity(cMax, u.decimals)} ${tokenWord()}`;
+  el("tr-chart-first").textContent = formatPrice(pLo, u);
+  el("tr-chart-mid").textContent = `${b.length} bid and ${a.length} ask level${a.length === 1 ? "" : "s"}`;
+  el("tr-chart-last").textContent = formatPrice(pHi, u);
+}
+
+function hideCross(): void {
+  el("tr-cross").hidden = true;
+  el("tr-tip").hidden = true;
+}
+
+/** The clearing nearest the pointer: a line through it and its numbers. */
+function hoverChart(e: MouseEvent): void {
+  const u = units();
+  if (chartView !== "price" || !plotted.length || !u) return hideCross();
+  const box = el("tr-chart-box").getBoundingClientRect();
+  const vx = ((e.clientX - box.left) / box.width) * CHART_W;
+  const near = plotted.reduce((best, p) => (Math.abs(p.x - vx) < Math.abs(best.x - vx) ? p : best));
+  const left = (near.x / CHART_W) * box.width;
+  const cross = el("tr-cross");
+  cross.style.left = `${left}px`;
+  cross.hidden = false;
+  const tip = el("tr-tip");
+  const row = (k: string, v: string) => {
+    const div = document.createElement("div");
+    const key = document.createElement("span");
+    key.className = "muted";
+    key.textContent = `${k} `;
+    div.append(key, v);
+    return div;
+  };
+  tip.replaceChildren(
+    row("Microblock", `#${near.t.sequence}`),
+    row("Price", `${formatPrice(BigInt(near.t.price), u)} B3`),
+    row("Volume", `${formatQuantity(BigInt(near.t.volume), u.decimals)} ${tokenWord()}`),
+  );
+  tip.hidden = false;
+  const flip = left > box.width / 2;
+  tip.style.left = flip ? "" : `${left + 10}px`;
+  tip.style.right = flip ? `${box.width - left + 10}px` : "";
 }
 
 /** The limit prices of a standing curve: its points that hold quantity at
@@ -592,6 +796,9 @@ function limits(order: Order): bigint[] {
 }
 
 function renderOrders(): void {
+  const open = market.account?.orders.filter((o) => o.remaining !== "0").length ?? 0;
+  el("tr-orders-count").textContent = String(open);
+  el("tr-orders-count").hidden = open === 0;
   const rows = el("tr-orders-rows");
   const note = el("tr-orders-note");
   const u = units();
@@ -692,12 +899,12 @@ function renderBalance(): void {
   const u = units();
   const account = market.account;
   const label = tokenLabel(market.metadata);
-  el("tr-base-free-label").textContent = `${label} available`;
-  el("tr-base-held-label").textContent = `${label} in orders`;
+  el("tr-base-free-label").textContent = label;
   el("tr-no-account").hidden = !market.accountKnown || account !== null;
   el("tr-balance").hidden = market.accountKnown && account === null;
-  const b3 = (id: string, atoms: string | undefined) =>
-    el(id).replaceChildren(atoms === undefined ? "—" : amountNode(decimal(BigInt(atoms), B3_DECIMALS, 2)));
+  const b3 = (id: string, atoms: string | undefined) => {
+    el(id).textContent = atoms === undefined ? "—" : isMasked() ? "••••" : `${formatB3(BigInt(atoms))} B3`;
+  };
   b3("tr-b3-free", account?.b3_available);
   b3("tr-b3-held", account?.b3_reserved);
   const token = (id: string, units_: string | undefined) => {
@@ -741,7 +948,7 @@ function renderGate(): void {
 }
 
 function stepCount(): number {
-  return el<HTMLInputElement>("tr-ladder").checked ? LADDER_STEPS : 1;
+  return ladder ? LADDER_STEPS : 1;
 }
 
 /** The form's rows as exact steps, null while nothing is entered, or the
@@ -757,7 +964,7 @@ function readSteps(u: Units): Step[] | null | string {
       if (i === 0) return null;
       continue;
     }
-    if (!priceText || !quantityText) return `${where}enter both a price and a quantity.`;
+    if (!priceText || !quantityText) return `${where}${where ? "enter" : "Enter"} both a price and an amount.`;
     const price = parsePrice(priceText, u);
     if ("error" in price) return where + price.error;
     const quantity = parseQuantity(quantityText, u);
@@ -783,45 +990,128 @@ function reservation(steps: Step[]): { reserve: bigint; available: bigint } {
   return { reserve: steps.reduce((sum, s) => sum + s.quantity, 0n), available: BigInt(a?.base_available ?? "0") + held };
 }
 
+/** A token quantity as typed into the form: exact, without grouping. */
+function plainQuantity(q: bigint, u: Units): string {
+  return formatQuantity(q, u.decimals).replace(/\u202f/g, "");
+}
+
+/** The most the first row can hold: what this order may reserve (the free
+ *  balance plus what the order it replaces holds), at the entered price for
+ *  a buy, on the lot grid. Null while it cannot be known. */
+function maxQuantity(u: Units): bigint | null {
+  if (!market.account) return null;
+  const { available } = reservation([]);
+  if (side === "ask") return (available / u.lot) * u.lot;
+  const price = parsePrice(el<HTMLInputElement>("tr-price-0").value.trim(), u);
+  if ("error" in price) return null;
+  return (available / price.value / u.lot) * u.lot;
+}
+
+/** Sets the first row's amount to a share of the most it can hold. */
+function setShare(pct: number): void {
+  const u = units();
+  if (!u || ladder) return;
+  const max = maxQuantity(u);
+  if (max === null) {
+    showResult("warning", side === "bid" ? "Enter a price first: the share is of what your balance buys at it." : "There is no trading balance to sell from.");
+    return renderForm();
+  }
+  const q = ((max * BigInt(pct)) / 100n / u.lot) * u.lot;
+  el<HTMLInputElement>("tr-qty-0").value = q > 0n ? plainQuantity(q, u) : "";
+  renderForm();
+}
+
+/** Moves a price or amount one step on its grid. An empty price starts
+ *  from the best price on the other side, if the book is current. */
+function nudge(id: string, dir: number): void {
+  const u = units();
+  if (!u) return;
+  const input = el<HTMLInputElement>(id);
+  const isPrice = id.startsWith("tr-price");
+  const unit = isPrice ? u.tick : u.lot;
+  const text = input.value.trim();
+  let v = 0n;
+  if (text) {
+    const parsed = isPrice ? parsePrice(text, u) : parseQuantity(text, u);
+    if ("error" in parsed) return renderForm();
+    v = parsed.value;
+  } else if (isPrice) {
+    const best = side === "bid" ? market.book?.best_ask : market.book?.best_bid;
+    const start = best ? BigInt(best) : lastPrices()[0];
+    if (start !== undefined && !stale()) {
+      input.value = plainPrice(start, u);
+      return renderForm();
+    }
+  }
+  v += BigInt(dir) * unit;
+  if (v < unit) v = unit;
+  input.value = isPrice ? plainPrice(v, u) : plainQuantity(v, u);
+  renderForm();
+}
+
 function renderForm(): void {
   const u = units();
   const token = tokenWord();
   const buy = side === "bid";
+  const ticket = el("tr-ticket");
+  ticket.dataset.side = side;
+  ticket.dataset.type = ladder ? "ladder" : "limit";
   el("tr-buy").setAttribute("aria-selected", String(buy));
   el("tr-sell").setAttribute("aria-selected", String(!buy));
-  el("tr-review").textContent = buy ? "Review buy order" : "Review sell order";
-  document.querySelector("#tr-step-0 [data-tr-price]")!.textContent = `Price (B3 per ${token})`;
-  document.querySelector("#tr-step-0 [data-tr-qty]")!.textContent = `Quantity (${token})`;
-  for (let i = 1; i < LADDER_STEPS; i++) el(`tr-step-${i}`).hidden = stepCount() === 1;
+  el("tr-type-limit").setAttribute("aria-selected", String(!ladder));
+  el("tr-type-ladder").setAttribute("aria-selected", String(ladder));
+  el("tr-review").textContent = `${buy ? "Buy" : "Sell"} ${token}`;
+  for (const unit of document.querySelectorAll("#tr-ticket [data-tr-unit]")) unit.textContent = token;
+  for (let i = 1; i < LADDER_STEPS; i++) el(`tr-step-${i}`).hidden = !ladder;
   el("tr-steps-help").textContent = u
-    ? `Steps: ${formatPrice(u.tick, u)} B3 per ${token} · ${formatQuantity(u.lot, u.decimals)} ${token}. ${buy ? "Buys at your price or below." : "Sells at your price or above."}`
+    ? `Steps: ${formatPrice(u.tick, u)} B3 per ${token} · ${formatQuantity(u.lot, u.decimals)} ${token}. ${buy ? "Buys at your price or below" : "Sells at your price or above"}, at one uniform auction price. Sellers pay 0.01% of the matched B3.`
     : "";
+  const replaced = openOrder(side);
+  const money = (v: bigint) => (u ? (buy ? `${formatB3(v)} B3` : `${formatQuantity(v, u.decimals)} ${token}`) : "—");
+  const avbl = el("tr-avbl");
+  avbl.textContent = !market.account || !u ? "—" : isMasked() ? "••••" : money(reservation([]).available);
+  avbl.title = replaced ? `Includes what your open ${buy ? "buy" : "sell"} order holds: a new order replaces it.` : "";
+
   const error = el("tr-form-error");
   const steps = u ? readSteps(u) : null;
   error.textContent = typeof steps === "string" ? steps : "";
   error.hidden = typeof steps !== "string";
-  const summary = el("tr-summary");
-  const replaced = openOrder(side);
-  if (!u || steps === null || typeof steps === "string" || !market.account) {
-    summary.hidden = true;
+  const total = el("tr-total");
+  el("tr-total-label").textContent = buy ? "Total, at most" : "Total, at least";
+  el("tr-total-label").title = buy ? "Your limit prices times the amounts. The auction price can be lower." : "Your limit prices times the amounts, before the 0.01% seller fee. The auction price can be higher.";
+  if (!u || steps === null || typeof steps === "string") {
+    total.textContent = "—";
+    el("tr-replaces-row").hidden = true;
   } else {
-    const { reserve, available } = reservation(steps);
-    const amount = (v: bigint) => (buy ? `${formatB3(v)} B3` : `${formatQuantity(v, u.decimals)} ${token}`);
-    summary.hidden = false;
-    el("tr-reserve-label").textContent = buy ? "Reserves at most" : "Reserves";
-    el("tr-reserve").textContent = amount(reserve);
-    el("tr-available").textContent = isMasked() ? "••••" : amount(available);
+    total.textContent = `${formatB3(steps.reduce((sum, s) => sum + notional(s.quantity, s.price), 0n))} B3`;
     el("tr-replaces-row").hidden = !replaced;
     if (replaced) {
-      el("tr-replaces").textContent = isMasked() ? "••••" : `your open ${buy ? "buy" : "sell"}, ${formatQuantity(BigInt(replaced.remaining), u.decimals)} ${token} left`;
+      el("tr-replaces").textContent = isMasked() ? "••••" : `open ${buy ? "buy" : "sell"}, ${formatQuantity(BigInt(replaced.remaining), u.decimals)} ${token} left`;
     }
-    if (reserve > available) {
-      error.textContent = buy
-        ? "This order costs more B3 than your trading balance has available."
-        : `This order sells more ${token} than your trading balance has available.`;
-      error.hidden = false;
+    if (market.account) {
+      const { reserve, available } = reservation(steps);
+      if (reserve > available) {
+        error.textContent = buy
+          ? "This order costs more B3 than your trading balance has available."
+          : `This order sells more ${token} than your trading balance has available.`;
+        error.hidden = false;
+      }
     }
   }
+
+  // The share slider follows the first row's amount.
+  const slider = el<HTMLInputElement>("tr-pct");
+  const max = u && !ladder ? maxQuantity(u) : null;
+  let pct = 0;
+  if (u && max !== null && max > 0n) {
+    const q = parseQuantity(el<HTMLInputElement>("tr-qty-0").value.trim(), u);
+    if (!("error" in q)) pct = Math.min(100, Number((q.value * 100n) / max));
+  }
+  slider.disabled = !u || max === null || max === 0n || gate() !== null;
+  slider.value = String(pct);
+  el("tr-slider").style.setProperty("--pct", `${pct}%`);
+  el("tr-pct-out").textContent = `${pct}%`;
+  for (const mark of document.querySelectorAll<HTMLElement>("#tr-slider [data-pct]")) mark.classList.toggle("on", pct >= Number(mark.dataset.pct) && pct > 0);
   renderGate();
 }
 
@@ -1218,6 +1508,10 @@ function outcomeText(r: TradeRequest): string {
 }
 
 function renderRequests(): void {
+  const waiting = requests.filter((r) => r.pending).length;
+  el("tr-requests-count").textContent = String(waiting);
+  el("tr-requests-count").hidden = waiting === 0;
+  el("tr-requests-count").title = "Not certified yet";
   const rows = el("tr-requests-rows");
   const u = units();
   const list = requests.filter((r) => r.kind !== "other");
@@ -1286,13 +1580,73 @@ const TABS = [
   ["tr-tab-orders", "tr-orders"],
   ["tr-tab-trades", "tr-trades"],
   ["tr-tab-requests", "tr-requests"],
+  ["tr-tab-funds", "tr-funds"],
 ] as const;
-for (const [tab, panel] of TABS) {
-  el(tab).addEventListener("click", () => {
-    for (const [t, p] of TABS) {
-      el(t).setAttribute("aria-selected", String(t === tab));
-      el(p).hidden = p !== panel;
-    }
+
+function selectTab(tab: (typeof TABS)[number][0]): void {
+  for (const [t, p] of TABS) {
+    el(t).setAttribute("aria-selected", String(t === tab));
+    el(p).hidden = t !== tab;
+  }
+}
+for (const [tab] of TABS) el(tab).addEventListener("click", () => selectTab(tab));
+
+/** The asset card's shortcuts open the Funds tab in that direction. */
+for (const [id, way] of [
+  ["tr-go-deposit", "in"],
+  ["tr-go-withdraw", "out"],
+] as const) {
+  el(id).addEventListener("click", () => {
+    funding = way;
+    showFundResult("", "");
+    selectTab("tr-tab-funds");
+    renderFunding();
+    el("tr-funds").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    el("tr-fund-amount").focus({ preventScroll: true });
+  });
+}
+
+for (const [id, view] of [
+  ["tr-view-price", "price"],
+  ["tr-view-depth", "depth"],
+] as const) {
+  el(id).addEventListener("click", () => {
+    chartView = view;
+    renderChart();
+  });
+}
+el("tr-chart-box").addEventListener("mousemove", hoverChart);
+el("tr-chart-box").addEventListener("mouseleave", hideCross);
+
+for (const [id, show] of [
+  ["tr-show-both", "both"],
+  ["tr-show-bids", "bids"],
+  ["tr-show-asks", "asks"],
+] as const) {
+  el(id).addEventListener("click", () => {
+    bookShow = show;
+    el("tr-book").dataset.show = show;
+    for (const b of ["tr-show-both", "tr-show-bids", "tr-show-asks"]) el(b).setAttribute("aria-pressed", String(b === id));
+    renderBook();
+  });
+}
+
+for (const [id, isLadder] of [
+  ["tr-type-limit", false],
+  ["tr-type-ladder", true],
+] as const) {
+  el(id).addEventListener("click", () => {
+    ladder = isLadder;
+    renderForm();
+  });
+}
+for (const button of document.querySelectorAll<HTMLElement>("#tr-ticket .tr-stepper")) {
+  button.addEventListener("click", () => nudge(button.dataset.for!, Number(button.dataset.dir)));
+}
+el("tr-pct").addEventListener("input", (e) => setShare(Number((e.target as HTMLInputElement).value)));
+for (const mark of document.querySelectorAll<HTMLElement>("#tr-slider [data-pct]")) {
+  mark.addEventListener("click", () => {
+    if (!el<HTMLInputElement>("tr-pct").disabled) setShare(Number(mark.dataset.pct));
   });
 }
 
@@ -1305,7 +1659,6 @@ for (const [id, s] of [
     renderForm();
   });
 }
-el("tr-ladder").addEventListener("change", renderForm);
 el("tr-cancel-bid").addEventListener("click", () => void cancelOrder("bid"));
 el("tr-cancel-ask").addEventListener("click", () => void cancelOrder("ask"));
 el("tr-form").addEventListener("input", renderForm);
