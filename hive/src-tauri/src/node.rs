@@ -40,6 +40,7 @@ const PAGE_METHODS: &[&str] = &[
     "getwalletinfo",
     "getstakinginfo",
     "listtransactions",
+    "gettransaction",
     "getnewaddress",
     "walletcreatefundedpsbt",
     "walletprocesspsbt",

@@ -304,7 +304,7 @@ pub fn activity(client: &Client, wallet: &str, count: u64) -> Result<Vec<Activit
     list.iter().rev().map(parse_activity).collect()
 }
 
-fn parse_activity(t: &Value) -> Result<ActivityEntry, RpcError> {
+pub(crate) fn parse_activity(t: &Value) -> Result<ActivityEntry, RpcError> {
     let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
     Ok(ActivityEntry {
         txid: text(&t["txid"]),
@@ -331,7 +331,7 @@ pub fn broadcast(client: &Client, hex: &str) -> Result<String, RpcError> {
 
 /// The node prints amounts as JSON numbers with 9 decimals; with serde_json's
 /// arbitrary_precision they keep their exact text.
-fn decimal(v: &Value) -> Result<String, RpcError> {
+pub(crate) fn decimal(v: &Value) -> Result<String, RpcError> {
     match v {
         Value::Number(n) => Ok(n.to_string()),
         other => Err(RpcError::BadReply(format!(

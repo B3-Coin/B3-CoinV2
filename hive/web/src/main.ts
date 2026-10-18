@@ -495,8 +495,35 @@ function activityList(lines: ActivityEntry[]): HTMLElement[] {
     : [emptyState("No transactions yet", "Payments to and from this wallet appear here.", "activity")];
 }
 
+// Mirrors history::Filter, Page and Details in src-tauri.
+type HistoryFilter = {
+  kind: string;
+  from: number | null;
+  to: number | null;
+  search: string;
+  min_amount: string | null;
+};
+type HistoryPage = { entries: ActivityEntry[]; matching: number; total: number };
+type DetailLine = { category: string; address: string; label: string; amount: string; vout: number };
+type TxDetails = {
+  txid: string;
+  wtxid: string;
+  amount: string;
+  fee: string | null;
+  confirmations: number;
+  generated: boolean;
+  abandoned: boolean;
+  block_hash: string | null;
+  block_height: number | null;
+  time: number;
+  time_received: number;
+  comment: string;
+  comment_to: string;
+  size: number;
+  lines: DetailLine[];
+};
+
 const ACTIVITY_STEP = 100;
-const ACTIVITY_LIMIT = 500; // wallet::ACTIVITY_LIMIT
 let activityShown = ACTIVITY_STEP;
 
 const refreshRecent = single(async () => {
@@ -509,30 +536,223 @@ const refreshRecent = single(async () => {
   }
 });
 
-function activityResult(text: string): void {
+function activityResult(tone: "danger" | "success", text: string): void {
   const box = el("activity-result");
   box.hidden = !text;
-  box.className = "banner banner-danger mt-4";
+  box.className = `banner banner-${tone} mt-4`;
   box.textContent = text;
+}
+
+/// Local midnight, as Unix seconds.
+function midnight(d: Date): number {
+  return Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000);
+}
+
+/// Qt's date choices, in local time: [from, to), either end open.
+function dateRange(choice: string): [number | null, number | null] {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  switch (choice) {
+    case "today":
+      return [midnight(now), null];
+    case "week": {
+      const monday = new Date(y, m, now.getDate() - ((now.getDay() + 6) % 7));
+      return [midnight(monday), null];
+    }
+    case "month":
+      return [midnight(new Date(y, m, 1)), null];
+    case "lastmonth":
+      return [midnight(new Date(y, m - 1, 1)), midnight(new Date(y, m, 1))];
+    case "year":
+      return [midnight(new Date(y, 0, 1)), null];
+    case "range": {
+      const from = el<HTMLInputElement>("act-from").valueAsDate;
+      const to = el<HTMLInputElement>("act-to").valueAsDate;
+      // valueAsDate is UTC midnight of the picked day; use that day locally.
+      const local = (d: Date, extra: number) =>
+        midnight(new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + extra));
+      return [from ? local(from, 0) : null, to ? local(to, 1) : null];
+    }
+    default:
+      return [null, null];
+  }
+}
+
+function historyFilter(): HistoryFilter {
+  const [from, to] = dateRange(el<HTMLSelectElement>("act-date").value);
+  const min = el<HTMLInputElement>("act-min").value.trim();
+  return {
+    kind: el<HTMLSelectElement>("act-kind").value,
+    from,
+    to,
+    search: el<HTMLInputElement>("act-search").value,
+    min_amount: min || null,
+  };
 }
 
 const refreshActivity = single(async () => {
   try {
-    const lines = await invoke<ActivityEntry[]>("wallet_activity", { count: activityShown });
-    activityResult("");
-    el("activity-list").replaceChildren(...activityList(lines));
-    el("activity-more-row").hidden = !(lines.length === activityShown && activityShown < ACTIVITY_LIMIT);
-    el("activity-count").textContent = lines.length
-      ? `Newest ${plural(lines.length, "line")}${lines.length === ACTIVITY_LIMIT ? ", the most shown" : ""}`
+    const page = await invoke<HistoryPage>("wallet_history", { filter: historyFilter(), count: activityShown });
+    activityResult("danger", "");
+    el("activity-list").replaceChildren(
+      ...(page.entries.length
+        ? page.entries.map((e) => clickableRow(e))
+        : page.total
+          ? [emptyState("Nothing matches", "No transaction passes these filters.", "search")]
+          : [emptyState("No transactions yet", "Payments to and from this wallet appear here.", "activity")]),
+    );
+    el("activity-more-row").hidden = page.entries.length >= page.matching;
+    el("activity-count").textContent = page.total
+      ? page.matching === page.total
+        ? plural(page.total, "line")
+        : `${count(page.matching)} of ${plural(page.total, "line")}`
       : "";
   } catch (e) {
-    activityResult(`The wallet's transactions could not be read: ${String(e)}`);
+    activityResult("danger", `The wallet's transactions could not be read: ${String(e)}`);
   }
 });
 
-el("activity-more").addEventListener("click", () => {
-  activityShown = Math.min(ACTIVITY_LIMIT, activityShown + ACTIVITY_STEP);
+function restartActivity(): void {
+  activityShown = ACTIVITY_STEP;
   void refreshActivity();
+}
+
+let searchTimer: number | undefined;
+el("act-search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = window.setTimeout(restartActivity, 250);
+});
+el("act-min").addEventListener("change", restartActivity);
+el("act-kind").addEventListener("change", restartActivity);
+el("act-from").addEventListener("change", restartActivity);
+el("act-to").addEventListener("change", restartActivity);
+el("act-date").addEventListener("change", () => {
+  const range = el<HTMLSelectElement>("act-date").value === "range";
+  el("act-range").hidden = el("act-range-to").hidden = !range;
+  restartActivity();
+});
+
+el("activity-more").addEventListener("click", () => {
+  activityShown += ACTIVITY_STEP;
+  void refreshActivity();
+});
+
+el("activity-export").addEventListener("click", async () => {
+  const button = el<HTMLButtonElement>("activity-export");
+  button.disabled = true;
+  try {
+    const path = await invoke<string>("wallet_export_csv", { filter: historyFilter() });
+    activityResult("success", `Saved the transactions shown by these filters to ${path}`);
+  } catch (e) {
+    activityResult("danger", `The transactions were not exported: ${String(e)}`);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// ---- transaction details ---------------------------------------------------
+
+function clickableRow(e: ActivityEntry): HTMLElement {
+  const row = activityRow(e);
+  row.classList.add("clickable");
+  row.tabIndex = 0;
+  row.setAttribute("role", "button");
+  const open = () => void showTransaction(e.txid);
+  row.addEventListener("click", open);
+  row.addEventListener("keydown", (k) => {
+    if (k.key === "Enter" || k.key === " ") {
+      k.preventDefault();
+      open();
+    }
+  });
+  return row;
+}
+
+function detailRow(key: string, value: string | Node, copy?: string): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "drow";
+  const k = document.createElement("span");
+  k.className = "dkey";
+  k.textContent = key;
+  const v = document.createElement("span");
+  v.className = "dval";
+  v.append(value);
+  if (copy) {
+    v.classList.add("is-mono", "wrap-any");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn btn-ghost btn-icon btn-sm";
+    button.setAttribute("aria-label", `Copy ${key.toLowerCase()}`);
+    button.append(icon("copy"));
+    button.addEventListener("click", () => {
+      void navigator.clipboard.writeText(copy).then(() => (button.title = "Copied"));
+    });
+    v.append(" ", button);
+  }
+  row.append(k, v);
+  return row;
+}
+
+let txReturnFocus: HTMLElement | null = null;
+
+function closeTransaction(): void {
+  el("tx-backdrop").hidden = true;
+  txReturnFocus?.focus();
+}
+
+async function showTransaction(txid: string): Promise<void> {
+  txReturnFocus = document.activeElement as HTMLElement | null;
+  try {
+    const d = await invoke<TxDetails>("wallet_transaction", { txid });
+    const rows: HTMLElement[] = [];
+    const status =
+      d.confirmations < 0
+        ? `Conflicted, ${count(-d.confirmations)} blocks deep`
+        : d.abandoned
+          ? "Abandoned"
+          : // The node says per output whether mined coins have matured.
+            confirmationText(
+              d.confirmations,
+              d.lines.some((l) => l.category === "immature") ? "immature" : "receive",
+            );
+    rows.push(detailRow("Status", d.confirmations === 0 && !d.abandoned ? "Unconfirmed" : status));
+    rows.push(detailRow("Date", dateTime(d.time)));
+    if (d.block_height !== null) rows.push(detailRow("Block", count(d.block_height)));
+    // The node leaves maturing coins out of the net amount; the lines show them.
+    if (!d.generated) rows.push(detailRow("Net amount", amountNode(d.amount)));
+    if (d.fee) rows.push(detailRow("Fee", formatAmount(d.fee.replace(/^-/, ""))));
+    for (const line of d.lines) {
+      const kind = CATEGORY[line.category]?.text ?? line.category;
+      const who = line.label ? `${line.label} (${line.address})` : line.address || "—";
+      rows.push(detailRow(`${kind}, output ${line.vout}`, amountNode(line.amount)));
+      if (line.address) rows.push(detailRow("Address", who, line.address));
+    }
+    if (d.comment) rows.push(detailRow("Comment", d.comment));
+    if (d.comment_to) rows.push(detailRow("To", d.comment_to));
+    if (d.generated) {
+      rows.push(
+        detailRow("Note", "Mined and staked coins can be spent once they have matured; until then they show as maturing."),
+      );
+    }
+    rows.push(detailRow("Transaction id", d.txid, d.txid));
+    if (d.wtxid && d.wtxid !== d.txid) rows.push(detailRow("Witness id", d.wtxid, d.wtxid));
+    rows.push(detailRow("Size", bytes(d.size)));
+    el("tx-sub").textContent = shorten(d.txid, 12, 12);
+    el("tx-details").replaceChildren(...rows);
+    el("tx-backdrop").hidden = false;
+    el("tx-close").focus();
+  } catch (e) {
+    activityResult("danger", `The transaction could not be read: ${String(e)}`);
+  }
+}
+
+el("tx-close").addEventListener("click", closeTransaction);
+el("tx-backdrop").addEventListener("click", (e) => {
+  if (e.target === el("tx-backdrop")) closeTransaction();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !el("tx-backdrop").hidden) closeTransaction();
 });
 
 // ---- network ---------------------------------------------------------------

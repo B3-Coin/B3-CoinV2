@@ -14,6 +14,7 @@ use b3_hive::bootstrap;
 use b3_hive::chain;
 use b3_hive::console;
 use b3_hive::drafts::DraftStore;
+use b3_hive::history::{self, Filter, Kind};
 use b3_hive::node::{Network, Node, NodeConfig, NodeStatus};
 use b3_hive::rpc::{Client, RpcError};
 use b3_hive::settings::{self, NodeSettings};
@@ -145,6 +146,31 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
     assert_ne!(b.immature.trim_start_matches(['0', '.']), "", "{b:?}");
     let lines = wallet::activity(client, W, 10).unwrap();
     assert_eq!(lines.len(), 10);
+
+    // The Activity page sees the whole history, not just the newest lines.
+    let all = history::all(client, W).unwrap();
+    assert_eq!(all.len() as u64, wallet::FUND_BLOCKS);
+    let mined = Filter {
+        kind: Kind::Mined,
+        ..Default::default()
+    };
+    let page = history::filter(all.clone(), &mined, 10).unwrap();
+    assert_eq!(
+        (page.entries.len(), page.matching, page.total),
+        (10, 130, 130)
+    );
+    let sent = Filter {
+        kind: Kind::Sent,
+        ..Default::default()
+    };
+    assert_eq!(history::filter(all.clone(), &sent, 10).unwrap().matching, 0);
+    let d = history::details(client, W, &all[0].txid).unwrap();
+    assert_eq!(d.txid, all[0].txid);
+    assert!(d.generated, "{d:?}");
+    assert_eq!(d.confirmations, 1);
+    assert!(d.size > 0);
+    assert!(history::details(client, W, "not-a-txid").is_err());
+    assert!(history::csv(&all).lines().count() == all.len() + 1);
     // Newest first: the last block mined has one confirmation.
     assert_eq!(lines[0].confirmations, 1);
     assert_eq!(lines[0].category, "immature");

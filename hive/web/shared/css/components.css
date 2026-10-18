@@ -1032,3 +1032,12 @@ input.select-sm, .input.select-sm { min-height: var(--min-target-sm); }
 
 /* Short status lines without bullets (Home's staking card). */
 .plain-lines { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-1); }
+
+/* Activity's filter bar: one column on phones, up to four across. */
+.filter-grid { display: grid; gap: var(--space-3); grid-template-columns: minmax(0, 1fr); }
+.filter-grid > .field + .field { margin-top: 0; }
+@media (min-width: 640px) { .filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (min-width: 1024px) { .filter-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+
+/* Long hashes and addresses break anywhere rather than overflow. */
+.wrap-any { overflow-wrap: anywhere; word-break: break-all; }

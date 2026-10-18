@@ -7,6 +7,7 @@ pub mod bootstrap;
 pub mod chain;
 pub mod console;
 pub mod drafts;
+pub mod history;
 pub mod node;
 pub mod rpc;
 pub mod settings;
@@ -209,6 +210,73 @@ async fn wallet_activity(
         let node = core.node();
         let (client, name) = page_wallet(&node)?;
         wallet::activity(client, &name, count).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// The Activity page: the newest `count` lines that pass the filter.
+#[tauri::command]
+async fn wallet_history(
+    core: State<'_, Arc<Core>>,
+    filter: history::Filter,
+    count: usize,
+) -> Result<history::Page, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&node)?;
+        let lines = history::all(client, &name).map_err(|e| e.to_string())?;
+        history::filter(lines, &filter, count)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn wallet_transaction(
+    core: State<'_, Arc<Core>>,
+    txid: String,
+) -> Result<history::Details, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&node)?;
+        history::details(client, &name, &txid)
+    })
+    .await
+}
+
+/// Writes the lines that pass the filter as Qt's CSV into the Downloads
+/// folder, under a new name, and returns where.
+#[tauri::command]
+async fn wallet_export_csv(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    filter: history::Filter,
+) -> Result<String, String> {
+    require_window(&window, MAIN)?;
+    let folder = app
+        .path()
+        .download_dir()
+        .map_err(|e| format!("The Downloads folder was not found: {e}"))?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&node)?;
+        let lines = history::all(client, &name).map_err(|e| e.to_string())?;
+        let page = history::filter(lines, &filter, usize::MAX)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let path = folder.join(format!(
+            "b3-hive-transactions-{}.csv",
+            history::utc(now).replace(':', "")
+        ));
+        let mut file = std::fs::File::create_new(&path)
+            .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
+        std::io::Write::write_all(&mut file, history::csv(&page.entries).as_bytes())
+            .map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
+        Ok(path.display().to_string())
     })
     .await
 }
@@ -920,6 +988,9 @@ pub fn run() {
             update_status,
             update_check,
             update_download,
+            wallet_history,
+            wallet_transaction,
+            wallet_export_csv,
             node_settings,
             node_settings_apply,
             setup_info,

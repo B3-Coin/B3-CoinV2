@@ -282,9 +282,60 @@
 
         <main class="view" id="view-activity" hidden>
           <div class="card">
+            <div class="card-pad filter-grid">
+              <div class="field">
+                <label for="act-kind">Type</label>
+                <select class="select" id="act-kind">
+                  <option value="all">All</option>
+                  <option value="received">Received with</option>
+                  <option value="sent">Sent to</option>
+                  <option value="mined">Mined</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="act-date">Date</label>
+                <select class="select" id="act-date">
+                  <option value="all">All</option>
+                  <option value="today">Today</option>
+                  <option value="week">This week</option>
+                  <option value="month">This month</option>
+                  <option value="lastmonth">Last month</option>
+                  <option value="year">This year</option>
+                  <option value="range">Range…</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="act-search">Search</label>
+                <input class="input" id="act-search" autocomplete="off" spellcheck="false" placeholder="Address, label or transaction id" />
+              </div>
+              <div class="field">
+                <label for="act-min">Minimum amount</label>
+                <div class="amount-field">
+                  <input class="input" id="act-min" inputmode="decimal" autocomplete="off" placeholder="0" />
+                  <span class="unit">B3</span>
+                </div>
+              </div>
+              <div class="field" id="act-range" hidden>
+                <label for="act-from">From</label>
+                <input class="input" type="date" id="act-from" />
+              </div>
+              <div class="field" id="act-range-to" hidden>
+                <label for="act-to">To</label>
+                <input class="input" type="date" id="act-to" />
+              </div>
+            </div>
+          </div>
+
+          <div class="card mt-4">
             <div class="card-head">
               <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-list" /></svg>Transactions</h2>
-              <span class="t-sm muted tnum" id="activity-count"></span>
+              <div class="row">
+                <span class="t-sm muted tnum" id="activity-count"></span>
+                <button class="btn btn-secondary btn-sm" type="button" id="activity-export">
+                  <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-download" /></svg><span>Export CSV</span>
+                </button>
+              </div>
             </div>
             <div id="activity-list"></div>
             <div class="card-foot" id="activity-more-row" hidden>
@@ -292,6 +343,23 @@
             </div>
           </div>
           <div class="banner mt-4" id="activity-result" role="status" hidden></div>
+
+          <div class="backdrop" id="tx-backdrop" hidden>
+            <div class="modal modal--lg" role="dialog" aria-modal="true" aria-labelledby="tx-title">
+              <div class="modal-head">
+                <div>
+                  <h2 id="tx-title">Transaction</h2>
+                  <div class="sub" id="tx-sub"></div>
+                </div>
+                <button class="btn btn-ghost btn-icon" type="button" id="tx-close" aria-label="Close">
+                  <svg class="i" aria-hidden="true"><use href="/icons.svg#i-close" /></svg>
+                </button>
+              </div>
+              <div class="modal-body">
+                <div class="details" id="tx-details"></div>
+              </div>
+            </div>
+          </div>
         </main>
 
         <main class="view" id="view-network" hidden>
