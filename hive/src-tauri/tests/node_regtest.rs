@@ -16,6 +16,7 @@ use b3_hive::console;
 use b3_hive::drafts::DraftStore;
 use b3_hive::history::{self, Filter, Kind};
 use b3_hive::node::{Network, Node, NodeConfig, NodeStatus};
+use b3_hive::receive;
 use b3_hive::rpc::{Client, RpcError};
 use b3_hive::settings::{self, NodeSettings};
 use b3_hive::wallet;
@@ -560,4 +561,43 @@ fn wallets_open_close_create_and_back_up() {
         .unwrap_or_default();
     assert!(!saved.contains("Savings"), "{saved}");
     assert!(test.datadir.join("regtest/wallets/Savings").is_dir());
+}
+
+#[test]
+fn receive_makes_labelled_addresses_and_links() {
+    let Some((test, status)) = TestNode::start("receive") else {
+        return;
+    };
+    assert!(matches!(status, NodeStatus::Ready { .. }), "{status:?}");
+    let client = test.node.client().unwrap();
+    wallet::ensure_wallet(client).unwrap();
+
+    let r = receive::new_request(client, W, "regtest", " rent ", "1.25", "for May").unwrap();
+    assert!(r.address.starts_with("bcrt1"), "{r:?}");
+    assert_eq!(r.label, "rent");
+    assert_eq!(
+        r.uri,
+        format!(
+            "b3coin:{}?amount=1.25&label=rent&message=for%20May",
+            r.address.to_uppercase()
+        )
+    );
+    assert!(r.qr.is_some());
+    assert!(receive::new_request(client, W, "regtest", "", "1.2.3", "").is_err());
+
+    // The address book lists it, and Show rebuilds its link without the
+    // amount and message, which only lived in that link.
+    let list = receive::addresses(client, W).unwrap();
+    let mine = list.iter().find(|a| a.address == r.address).unwrap();
+    assert_eq!(mine.label, "rent");
+    assert_eq!(mine.transactions, 0);
+    let shown = receive::show(client, W, "regtest", &r.address).unwrap();
+    assert_eq!(
+        shown.uri,
+        format!("b3coin:{}?label=rent", r.address.to_uppercase())
+    );
+
+    // An address this wallet does not own is refused.
+    let other = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    assert!(receive::show(client, W, "regtest", other).is_err());
 }

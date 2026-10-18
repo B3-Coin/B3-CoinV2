@@ -128,6 +128,7 @@ const VIEWS = {
   setup: { title: "Set up B3 Hive", sub: "Get the B3 chain for your node" },
   home: { title: "Home", sub: "Your balance and your node" },
   send: { title: "Send", sub: "Pay someone in B3" },
+  receive: { title: "Receive", sub: "Addresses and payment links for this wallet" },
   activity: { title: "Activity", sub: "Your wallet's transactions" },
   wallets: { title: "Wallets", sub: "Open, create, switch and back up wallets" },
   network: { title: "Network", sub: "Your node and its peers" },
@@ -156,6 +157,7 @@ function go(view: View): void {
   }
   if (view === "settings") void loadSettings();
   if (view === "wallets") void refreshWallets();
+  if (view === "receive") void refreshReceiving();
 }
 
 for (const button of document.querySelectorAll<HTMLElement>("[data-view]")) {
@@ -410,6 +412,126 @@ el("fund").addEventListener("click", async () => {
   }
 });
 
+// ---- receive -----------------------------------------------------------------
+
+// Mirror src-tauri/src/receive.rs.
+type Qr = { width: number; modules: string };
+type ReceiveRequest = {
+  address: string;
+  label: string;
+  amount: string | null;
+  message: string;
+  uri: string;
+  qr: Qr | null;
+};
+type Receiving = { address: string; label: string; received: string; transactions: number };
+
+function drawQr(svg: Element, qr: Qr): void {
+  // A 4-module quiet zone, as the QR standard asks.
+  const size = qr.width + 8;
+  svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+  svg.setAttribute("shape-rendering", "crispEdges");
+  const rects: SVGElement[] = [];
+  for (let y = 0; y < qr.width; y++) {
+    for (let x = 0; x < qr.width; x++) {
+      if (qr.modules[y * qr.width + x] === "1") {
+        rects.push(svgNode("rect", { x: String(x + 4), y: String(y + 4), width: "1", height: "1" }));
+      }
+    }
+  }
+  svg.replaceChildren(...rects);
+}
+
+function showRequest(r: ReceiveRequest, title: string): void {
+  el("rcv-request").hidden = false;
+  el("rcv-request-title").textContent = title;
+  el("rcv-qr").hidden = r.qr === null;
+  el("rcv-qr-note").hidden = r.qr !== null;
+  if (r.qr) drawQr(el("rcv-qr"), r.qr);
+  const rows = [detailRow("Address", r.address, r.address)];
+  if (r.label) rows.push(detailRow("Label", r.label));
+  // The requested amount is shown exactly, never masked: it is what the
+  // payer will be asked for.
+  if (r.amount !== null) rows.push(detailRow("Amount", `${r.amount} B3`));
+  if (r.message) rows.push(detailRow("Message", r.message));
+  rows.push(detailRow("Payment link", r.uri, r.uri));
+  el("rcv-rows").replaceChildren(...rows);
+  el("rcv-request").scrollIntoView({ block: "nearest" });
+}
+
+const refreshReceiving = single(async () => {
+  try {
+    const list = await invoke<Receiving[]>("receive_addresses");
+    // Newest first, as Qt's history sorts.
+    list.reverse();
+    el("rcv-count").textContent = list.length ? plural(list.length, "address", "addresses") : "";
+    el("rcv-empty").hidden = list.length > 0;
+    el("rcv-list").replaceChildren(
+      ...list.map((a) => {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "list-row clickable";
+        row.title = "Show this address's link and QR code";
+        const lead = document.createElement("div");
+        lead.className = "lead in";
+        lead.append(icon("arrow-down"));
+        const body = document.createElement("div");
+        body.className = "body";
+        const title = document.createElement("span");
+        title.textContent = a.label || "(no label)";
+        const meta = document.createElement("span");
+        meta.className = "meta is-mono";
+        meta.textContent = shorten(a.address, 14, 8);
+        meta.title = a.address;
+        body.append(title, meta);
+        const trail = document.createElement("div");
+        trail.className = "trail";
+        const got = document.createElement("span");
+        got.className = "t-sm muted";
+        got.textContent = a.transactions ? plural(a.transactions, "payment") : "Nothing received";
+        trail.append(a.transactions ? amountNode(a.received) : document.createElement("span"), got);
+        row.append(lead, body, trail);
+        row.addEventListener("click", async () => {
+          try {
+            showRequest(await invoke<ReceiveRequest>("receive_show", { address: a.address }), a.label || "Receiving address");
+          } catch (e) {
+            receiveResult(String(e));
+          }
+        });
+        return row;
+      }),
+    );
+  } catch (e) {
+    receiveResult(String(e));
+  }
+});
+
+function receiveResult(text: string): void {
+  el("rcv-result").hidden = !text;
+  el("rcv-result").textContent = text;
+}
+
+el("rcv-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const button = el<HTMLButtonElement>("rcv-submit");
+  button.disabled = true;
+  receiveResult("");
+  try {
+    const r = await invoke<ReceiveRequest>("receive_new", {
+      label: el<HTMLInputElement>("rcv-label").value,
+      amount: el<HTMLInputElement>("rcv-amount").value,
+      message: el<HTMLInputElement>("rcv-message").value,
+    });
+    for (const id of ["rcv-label", "rcv-amount", "rcv-message"]) el<HTMLInputElement>(id).value = "";
+    showRequest(r, "Request payment");
+    void refreshReceiving();
+  } catch (err) {
+    receiveResult(String(err));
+  } finally {
+    button.disabled = false;
+  }
+});
+
 // ---- wallets -----------------------------------------------------------------
 // Qt's wallet selector and File menu. The default wallet's name is "".
 
@@ -537,6 +659,8 @@ async function manageWallet(action: WalletAction): Promise<void> {
     // Every page shows the wallet in use.
     void refreshWallet();
     void refreshRecent();
+    el("rcv-request").hidden = true;
+    if (current === "receive") void refreshReceiving();
   } catch (e) {
     walletsResult("danger", String(e));
     void refreshWallets();

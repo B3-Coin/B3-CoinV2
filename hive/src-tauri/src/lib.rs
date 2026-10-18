@@ -9,6 +9,7 @@ pub mod console;
 pub mod drafts;
 pub mod history;
 pub mod node;
+pub mod receive;
 pub mod rpc;
 pub mod settings;
 pub mod update;
@@ -318,6 +319,56 @@ async fn wallet_export_csv(
         std::io::Write::write_all(&mut file, history::csv(&page.entries).as_bytes())
             .map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
         Ok(path.display().to_string())
+    })
+    .await
+}
+
+// ---- receive (main window) -----------------------------------------------------
+
+/// Qt's "Create new receiving address".
+#[tauri::command]
+async fn receive_new(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    label: String,
+    amount: String,
+    message: String,
+) -> Result<receive::Request, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let chain = node.chain().unwrap_or_default();
+        receive::new_request(client, &name, &chain, &label, &amount, &message)
+    })
+    .await
+}
+
+/// The wallet's receiving addresses, newest last as the node lists them.
+#[tauri::command]
+async fn receive_addresses(core: State<'_, Arc<Core>>) -> Result<Vec<receive::Receiving>, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        receive::addresses(client, &name).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// The link and QR code for one of the wallet's receiving addresses.
+#[tauri::command]
+async fn receive_show(
+    core: State<'_, Arc<Core>>,
+    address: String,
+) -> Result<receive::Request, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let chain = node.chain().unwrap_or_default();
+        receive::show(client, &name, &chain, &address)
     })
     .await
 }
@@ -1148,6 +1199,9 @@ pub fn run() {
             network_totals,
             wallets,
             wallet_manage,
+            receive_new,
+            receive_addresses,
+            receive_show,
             wallet_backup,
             wallet_history,
             wallet_transaction,

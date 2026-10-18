@@ -26,6 +26,10 @@
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-up" /></svg>
               <span class="nav-text">Send</span>
             </button>
+            <button class="nav-item" type="button" data-view="receive">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-down" /></svg>
+              <span class="nav-text">Receive</span>
+            </button>
             <button class="nav-item" type="button" data-view="activity">
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-activity" /></svg>
               <span class="nav-text">Activity</span>
@@ -303,6 +307,62 @@
             </div>
           </form>
           <div class="banner mt-4" id="send-result" role="status" hidden></div>
+        </main>
+
+        <main class="view view--flow" id="view-receive" hidden>
+          <div class="stack">
+            <form class="card" id="rcv-form" novalidate>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>New receiving address</h2>
+              </div>
+              <div class="card-pad form-grid">
+                <div class="field">
+                  <label for="rcv-label">Label</label>
+                  <input class="input" id="rcv-label" autocomplete="off" maxlength="200" placeholder="Optional" />
+                  <span class="help">Kept in your wallet with the address, to recognise payments to it.</span>
+                </div>
+                <div class="field">
+                  <label for="rcv-amount">Amount</label>
+                  <div class="amount-field">
+                    <input class="input" id="rcv-amount" inputmode="decimal" autocomplete="off" placeholder="Optional" />
+                    <span class="unit">B3</span>
+                  </div>
+                  <span class="help">Only goes into the payment link and QR code, as a suggestion to the payer.</span>
+                </div>
+                <div class="field">
+                  <label for="rcv-message">Message</label>
+                  <input class="input" id="rcv-message" autocomplete="off" maxlength="200" placeholder="Optional" />
+                  <span class="help">Shown to the payer by wallets that read the link. Not stored and never sent on the network.</span>
+                </div>
+              </div>
+              <div class="card-foot">
+                <button class="btn btn-primary" type="submit" id="rcv-submit">Create receiving address</button>
+              </div>
+            </form>
+            <div class="banner banner-danger" id="rcv-result" role="status" hidden></div>
+
+            <div class="card" id="rcv-request" hidden>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-qr" /></svg><span id="rcv-request-title">Request payment</span></h2>
+              </div>
+              <div class="card-pad receive-request">
+                <svg class="qr" id="rcv-qr" role="img" aria-label="QR code of the payment link"></svg>
+                <p class="t-sm muted" id="rcv-qr-note" hidden>This link is too long for a QR code. Shorten the label or message.</p>
+                <div class="details" id="rcv-rows"></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>Receiving addresses</h2>
+                <span class="t-sm muted tnum" id="rcv-count"></span>
+              </div>
+              <div id="rcv-list"></div>
+              <div class="empty empty--tight" id="rcv-empty" hidden>
+                <p>This wallet has no receiving addresses yet.</p>
+              </div>
+            </div>
+          </div>
         </main>
 
         <main class="view view--flow" id="view-wallets" hidden>

@@ -1053,6 +1053,13 @@ input.select-sm, .input.select-sm { min-height: var(--min-target-sm); }
 .swatch-in { background: var(--success); }
 .swatch-out { background: var(--accent); }
 
+/* Receive: the QR code stays black on white in both themes, so every
+   scanner reads it. */
+.receive-request { display: flex; flex-direction: column; align-items: center; gap: var(--space-4); }
+.receive-request .details { width: 100%; }
+.qr { width: 216px; height: 216px; background: #fff; border-radius: var(--radius-sm); padding: 8px; }
+.qr rect { fill: #000; }
+
 /* The rail's wallet switcher, shown with two or more loaded wallets. */
 .wallet-pick { margin-bottom: var(--space-2); }
 .wallet-pick .select { width: 100%; }

@@ -27,3 +27,5 @@ base64 = "0.22"
 # Chain bootstraps from the explorer are tar.zst archives (bootstrap.rs).
 tar = { version = "0.4", default-features = false }
 zstd = { version = "0.13", default-features = false }
+# QR codes for Receive; only the module grid, drawn by the page.
+qrcode = { version = "0.14", default-features = false }

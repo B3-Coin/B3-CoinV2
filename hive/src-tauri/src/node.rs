@@ -48,6 +48,7 @@ const PAGE_METHODS: &[&str] = &[
     "listtransactions",
     "gettransaction",
     "getnewaddress",
+    "listreceivedbyaddress",
     "walletcreatefundedpsbt",
     "walletprocesspsbt",
     "finalizepsbt",
