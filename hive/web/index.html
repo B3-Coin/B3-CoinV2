@@ -34,6 +34,10 @@
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-activity" /></svg>
               <span class="nav-text">Activity</span>
             </button>
+            <button class="nav-item" type="button" data-view="book">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>
+              <span class="nav-text">Address book</span>
+            </button>
             <button class="nav-item" type="button" data-view="wallets">
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-wallet" /></svg>
               <span class="nav-text">Wallets</span>
@@ -327,6 +331,7 @@
             </div>
           </form>
           <div class="banner mt-4" id="send-result" role="status" hidden></div>
+          <datalist id="book-options"></datalist>
         </main>
 
         <main class="view view--flow" id="view-receive" hidden>
@@ -381,6 +386,44 @@
               <div class="empty empty--tight" id="rcv-empty" hidden>
                 <p>This wallet has no receiving addresses yet.</p>
               </div>
+            </div>
+          </div>
+        </main>
+
+        <main class="view view--flow" id="view-book" hidden>
+          <div class="stack">
+            <div class="banner" id="book-result" role="status" hidden></div>
+            <form class="card" id="book-form" novalidate>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg><span id="book-form-title">Save an address</span></h2>
+              </div>
+              <div class="card-pad form-grid">
+                <div class="field">
+                  <label for="book-address">Address</label>
+                  <input class="input input-mono" id="book-address" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="field">
+                  <label for="book-label">Label</label>
+                  <input class="input" id="book-label" autocomplete="off" maxlength="200" placeholder="Who or what it pays" />
+                  <span class="help">Saving an address that is already here renames it.</span>
+                </div>
+              </div>
+              <div class="card-foot row">
+                <button class="btn btn-primary" type="submit" id="book-save">Save</button>
+                <button class="btn btn-ghost" type="reset" id="book-clear">Clear</button>
+              </div>
+            </form>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>Sending addresses</h2>
+                <span class="t-sm muted tnum" id="book-count"></span>
+              </div>
+              <div id="book-list"></div>
+              <div class="empty empty--tight" id="book-empty" hidden>
+                <p>No saved addresses yet. Addresses you label when sending are saved here too.</p>
+              </div>
+              <div class="card-pad t-sm muted">The node cannot remove saved addresses, so B3 Hive cannot either.</div>
             </div>
           </div>
         </main>

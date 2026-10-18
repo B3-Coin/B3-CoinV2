@@ -3,6 +3,7 @@
 //! after the approval window approves it. The one exception is the console
 //! window: commands typed there run with full access, as in the Qt console.
 
+pub mod book;
 pub mod bootstrap;
 pub mod chain;
 pub mod console;
@@ -359,6 +360,34 @@ async fn receive_new(
         let (client, name) = page_wallet(&core, &node)?;
         let chain = node.chain().unwrap_or_default();
         receive::new_request(client, &name, &chain, &label, &amount, &message)
+    })
+    .await
+}
+
+/// The page wallet's address book.
+#[tauri::command]
+async fn book_list(core: State<'_, Arc<Core>>) -> Result<Vec<book::Contact>, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        book::contacts(client, &name).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Adds an address to the page wallet's address book, or renames it.
+#[tauri::command]
+async fn book_save(
+    core: State<'_, Arc<Core>>,
+    address: String,
+    label: String,
+) -> Result<book::Contact, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        book::save(client, &name, &address, &label)
     })
     .await
 }
@@ -1448,6 +1477,8 @@ pub fn run() {
             dev_fund,
             draft_send,
             send_coins,
+            book_list,
+            book_save,
             open_console,
             ui_theme,
             set_ui_theme,

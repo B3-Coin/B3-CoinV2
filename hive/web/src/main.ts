@@ -130,6 +130,7 @@ const VIEWS = {
   send: { title: "Send", sub: "Pay someone in B3" },
   receive: { title: "Receive", sub: "Addresses and payment links for this wallet" },
   activity: { title: "Activity", sub: "Your wallet's transactions" },
+  book: { title: "Address book", sub: "Addresses you pay, with their labels" },
   wallets: { title: "Wallets", sub: "Open, create, switch and back up wallets" },
   network: { title: "Network", sub: "Your node and its peers" },
   settings: { title: "Settings", sub: "How your node runs and connects" },
@@ -158,6 +159,8 @@ function go(view: View): void {
   if (view === "settings") void loadSettings();
   if (view === "wallets") void refreshWallets();
   if (view === "receive") void refreshReceiving();
+  if (view === "book") void refreshBook();
+  if (view === "send") void refreshBook();
 }
 
 for (const button of document.querySelectorAll<HTMLElement>("[data-view]")) {
@@ -1696,6 +1699,117 @@ function sendResult(tone: "info" | "success" | "warning" | "danger", text: strin
   box.scrollIntoView({ block: "nearest" });
 }
 
+// ---- address book ----------------------------------------------------------
+
+// Mirrors book::Contact in src-tauri/src/book.rs.
+type Contact = { address: string; label: string };
+let contacts: Contact[] = [];
+
+function bookResult(tone: "success" | "danger", text: string): void {
+  const box = el("book-result");
+  box.hidden = false;
+  box.className = `banner banner-${tone}`;
+  box.textContent = text;
+  box.scrollIntoView({ block: "nearest" });
+}
+
+// Puts an address in the first empty recipient on Send, or a new one.
+function payTo(c: Contact): void {
+  go("send");
+  let block = [...el("recipients").querySelectorAll<HTMLElement>(".recipient")].find(
+    (b) => !b.querySelector<HTMLInputElement>(".r-address")!.value.trim(),
+  );
+  block ??= addRecipient();
+  block.querySelector<HTMLInputElement>(".r-address")!.value = c.address;
+  block.querySelector<HTMLInputElement>(".r-label")!.value = c.label;
+  block.querySelector<HTMLInputElement>(".r-amount")!.focus();
+}
+
+function editContact(c: Contact): void {
+  el<HTMLInputElement>("book-address").value = c.address;
+  el<HTMLInputElement>("book-label").value = c.label;
+  el("book-form-title").textContent = "Rename an address";
+  el("book-form").scrollIntoView({ block: "nearest" });
+  el<HTMLInputElement>("book-label").focus();
+}
+
+const refreshBook = single(async () => {
+  try {
+    contacts = await invoke<Contact[]>("book_list");
+  } catch (e) {
+    if (current === "book") bookResult("danger", String(e));
+    return;
+  }
+  el("book-options").replaceChildren(
+    ...contacts.map((c) => {
+      const o = document.createElement("option");
+      o.value = c.address;
+      o.label = c.label || "(no label)";
+      return o;
+    }),
+  );
+  el("book-count").textContent = contacts.length ? plural(contacts.length, "address", "addresses") : "";
+  el("book-empty").hidden = contacts.length > 0;
+  el("book-list").replaceChildren(
+    ...contacts.map((c) => {
+      const row = document.createElement("div");
+      row.className = "list-row";
+      const lead = document.createElement("div");
+      lead.className = "lead out";
+      lead.append(icon("arrow-up"));
+      const body = document.createElement("div");
+      body.className = "body";
+      const title = document.createElement("span");
+      title.textContent = c.label || "(no label)";
+      const meta = document.createElement("span");
+      meta.className = "meta is-mono";
+      meta.textContent = shorten(c.address, 14, 8);
+      meta.title = c.address;
+      body.append(title, meta);
+      const pay = document.createElement("button");
+      pay.type = "button";
+      pay.className = "btn btn-secondary btn-sm";
+      pay.textContent = "Pay";
+      pay.addEventListener("click", () => payTo(c));
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "btn btn-ghost btn-sm";
+      rename.textContent = "Rename";
+      rename.addEventListener("click", () => editContact(c));
+      const trail = document.createElement("div");
+      trail.className = "row";
+      trail.append(rename, pay);
+      row.append(lead, body, trail);
+      return row;
+    }),
+  );
+});
+
+el("book-form").addEventListener("reset", () => {
+  el("book-form-title").textContent = "Save an address";
+});
+
+el("book-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const save = el<HTMLButtonElement>("book-save");
+  save.disabled = true;
+  try {
+    const c = await invoke<Contact>("book_save", {
+      address: el<HTMLInputElement>("book-address").value,
+      label: el<HTMLInputElement>("book-label").value,
+    });
+    el<HTMLFormElement>("book-form").reset();
+    bookResult("success", `Saved ${c.label || "the address"}.`);
+    await refreshBook();
+  } catch (e) {
+    bookResult("danger", String(e));
+  } finally {
+    save.disabled = false;
+  }
+});
+
+// ---- send coin control -----------------------------------------------------
+
 // Mirrors wallet::Coin in src-tauri/src/wallet.rs.
 type Coin = { txid: string; vout: number; address: string; label: string; amount: string; confirmations: number };
 
@@ -1780,9 +1894,16 @@ function addRecipient(): HTMLElement {
   body.append(what, help);
   subtract.append(box, body);
 
+  // Saved addresses are offered as the address is typed, and bring their label.
+  const address = textInput(`r-address-${n}`, "input-mono r-address", { list: "book-options" });
+  address.addEventListener("change", () => {
+    const label = block.querySelector<HTMLInputElement>(".r-label")!;
+    const saved = contacts.find((c) => c.address === address.value.trim());
+    if (saved && !label.value.trim()) label.value = saved.label;
+  });
   block.append(
     head,
-    field(`r-address-${n}`, "Pay to", textInput(`r-address-${n}`, "input-mono r-address")),
+    field(`r-address-${n}`, "Pay to", address),
     field(
       `r-label-${n}`,
       "Label",
@@ -2070,6 +2191,8 @@ await listen<DraftResult>("draft-result", (event) => {
   void refreshWallet();
   void refreshRecent();
   void refreshCoins();
+  // A sent payment may have saved new labels.
+  void refreshBook();
 });
 await listen<NodeStatus>("node-status", (event) => render(event.payload));
 render(await invoke<NodeStatus>("node_status"));

@@ -15,6 +15,8 @@ fn main() {
             "dev_fund",
             "draft_send",
             "send_coins",
+            "book_list",
+            "book_save",
             "open_console",
             "restart_node",
             "ui_theme",

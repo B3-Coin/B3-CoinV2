@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use b3_hive::book;
 use b3_hive::bootstrap;
 use b3_hive::chain;
 use b3_hive::console;
@@ -790,4 +791,54 @@ fn payments_split_fees_choose_coins_and_save_labels() {
         .call_wallet(W, "getaddressinfo", json!([a]))
         .unwrap();
     assert_eq!(info["labels"][0].as_str(), Some("Alice"));
+}
+
+#[test]
+fn the_address_book_adds_and_renames_sending_addresses() {
+    let Some((test, status)) = TestNode::start("book") else {
+        return;
+    };
+    assert!(matches!(status, NodeStatus::Ready { .. }), "{status:?}");
+    let client = test.node.client().unwrap();
+    wallet::ensure_wallet(client).unwrap();
+    assert!(book::contacts(client, W).unwrap().is_empty());
+
+    let shop = "bcrt1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3lgth6c";
+    book::save(client, W, &format!(" {shop} "), " Shop ").unwrap();
+    book::save(
+        client,
+        W,
+        "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+        "alice",
+    )
+    .unwrap();
+    let names = |c: Vec<book::Contact>| c.into_iter().map(|c| c.label).collect::<Vec<_>>();
+    assert_eq!(names(book::contacts(client, W).unwrap()), ["alice", "Shop"]);
+
+    book::save(client, W, shop, "Corner shop").unwrap();
+    assert_eq!(
+        names(book::contacts(client, W).unwrap()),
+        ["alice", "Corner shop"]
+    );
+
+    // The wallet's own addresses are not contacts.
+    let own = client
+        .call_wallet(W, "getnewaddress", json!(["mine"]))
+        .unwrap();
+    assert!(book::save(client, W, own.as_str().unwrap(), "x")
+        .unwrap_err()
+        .contains("own addresses"));
+    assert_eq!(
+        book::save(client, W, "not-an-address", "x").unwrap_err(),
+        "Not a valid B3 address."
+    );
+    assert!(book::save(
+        client,
+        W,
+        shop,
+        "two
+lines"
+    )
+    .is_err());
+    assert_eq!(book::contacts(client, W).unwrap().len(), 2);
 }

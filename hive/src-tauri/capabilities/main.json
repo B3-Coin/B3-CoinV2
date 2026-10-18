@@ -15,6 +15,8 @@
     "allow-dev-fund",
     "allow-draft-send",
     "allow-send-coins",
+    "allow-book-list",
+    "allow-book-save",
     "allow-open-console",
     "allow-ui-theme",
     "allow-set-ui-theme",

@@ -394,12 +394,7 @@ pub(crate) fn funding_args(payment: &Payment) -> Result<(Value, Vec<(String, Str
                 "This address is already paid in this payment.".into(),
             ));
         }
-        let label = r.label.trim();
-        if label.chars().count() > MAX_LABEL || label.chars().any(char::is_control) {
-            return Err(which(format!(
-                "Labels are at most {MAX_LABEL} characters, on one line."
-            )));
-        }
+        let label = check_label(&r.label).map_err(which)?;
         if !label.is_empty() {
             labels.push((address.to_owned(), label.to_owned()));
         }
@@ -441,6 +436,18 @@ pub(crate) fn funding_args(payment: &Payment) -> Result<(Value, Vec<(String, Str
         options["add_inputs"] = Value::Bool(false);
     }
     Ok((json!([inputs, outputs, 0, options]), labels))
+}
+
+/// A label as the address book keeps it: trimmed, one line, at most
+/// MAX_LABEL characters. Empty is allowed.
+pub(crate) fn check_label(label: &str) -> Result<&str, String> {
+    let label = label.trim();
+    if label.chars().count() > MAX_LABEL || label.chars().any(char::is_control) {
+        return Err(format!(
+            "Labels are at most {MAX_LABEL} characters, on one line."
+        ));
+    }
+    Ok(label)
 }
 
 /// Funds a single-recipient send; see [`prepare_payment`].
