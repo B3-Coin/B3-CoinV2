@@ -69,6 +69,7 @@ add_executable(test_bitcoin
   modern_serialization_tests.cpp
   modern_fn_pod_tests.cpp
   update_manifest_tests.cpp
+  update_pipe_tests.cpp
   compress_tests.cpp
   consensus_phase_tests.cpp
   crypto_tests.cpp
