@@ -148,7 +148,7 @@ impl Updater {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        hide_console(&mut command);
+        crate::node::hide_console(&mut command);
         let mut child = command
             .spawn()
             .map_err(|e| format!("cannot start {}: {e}", helper.display()))?;
@@ -289,16 +289,6 @@ impl Fetcher for NoFetch {
         Err("update-fetch-failed".to_owned())
     }
 }
-
-#[cfg(windows)]
-fn hide_console(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn hide_console(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {

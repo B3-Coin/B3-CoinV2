@@ -281,6 +281,18 @@ impl Node {
     }
 }
 
+/// b3coind and the update helper are console programs. Started from the
+/// windowless release app, Windows would open a console window for each.
+#[cfg(windows)]
+pub(crate) fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub(crate) fn hide_console(_command: &mut Command) {}
+
 struct Spawned {
     child: Child,
     client: Client,
@@ -296,11 +308,14 @@ fn spawn(config: &NodeConfig, stderr_tail: &Arc<Mutex<Vec<u8>>>) -> Result<Spawn
     let console = Credentials::generate(CONSOLE_USER).map_err(no_randomness)?;
     let port = free_loopback_port().map_err(|e| format!("no free loopback port: {e}"))?;
 
-    let mut child = Command::new(&config.b3coind)
+    let mut command = Command::new(&config.b3coind);
+    command
         .args(node_args(config, &page, &console, port))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", config.b3coind.display()))?;
 
