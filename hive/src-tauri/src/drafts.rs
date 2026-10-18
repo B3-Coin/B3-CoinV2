@@ -53,6 +53,13 @@ pub enum Request {
         /// Blocks after it confirms until it counts.
         activation_depth: i64,
     },
+    /// Release stakes back into ordinary B3: exactly the chosen STAKE
+    /// outputs, to one new address of this wallet.
+    Release {
+        summary: SendSummary,
+        #[serde(skip)]
+        funded: Funded,
+    },
     /// Bind, or rotate, this wallet's BLS finality key (bindfinalitykey).
     BindFinality {
         chain: String,
@@ -64,7 +71,7 @@ pub enum Request {
 impl Request {
     pub fn wallet(&self) -> &str {
         match self {
-            Request::Pay { summary, .. } => &summary.wallet,
+            Request::Pay { summary, .. } | Request::Release { summary, .. } => &summary.wallet,
             Request::Stake { wallet, .. } | Request::BindFinality { wallet, .. } => wallet,
         }
     }
@@ -73,7 +80,7 @@ impl Request {
     /// when it is approved.
     pub fn reserved(&self) -> &[Outpoint] {
         match self {
-            Request::Pay { funded, .. } => &funded.inputs,
+            Request::Pay { funded, .. } | Request::Release { funded, .. } => &funded.inputs,
             _ => &[],
         }
     }

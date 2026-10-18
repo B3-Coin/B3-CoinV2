@@ -8,6 +8,7 @@ type Summary = { chain: string; wallet: string; outputs: OutputLine[]; fee: stri
 // Mirrors drafts::Request in src-tauri/src/drafts.rs.
 type Request =
   | { kind: "pay"; summary: Summary }
+  | { kind: "release"; summary: Summary }
   | { kind: "stake"; chain: string; wallet: string; amount: string; activation_depth: number }
   | { kind: "bind_finality"; chain: string; wallet: string; rotate: boolean };
 type DraftView = {
@@ -67,14 +68,31 @@ function showPay(s: Summary): void {
   el("total").textContent = total === null ? "—" : formatAmount(total, 9);
   el("chain").textContent = s.chain;
   el("inputs").textContent = String(s.inputs);
+  el("pay-text").textContent = "This payment is permanent once sent. Check every line before you approve it.";
   el("pass-help").textContent =
     "The wallet is locked. It unlocks only to sign this payment and locks again straight after.";
   el("approve").textContent = "Send now";
 }
 
+// A release spends only stakes, to one address of this wallet; what was
+// staked is what comes back plus the fee.
+function showRelease(s: Summary): void {
+  showPay(s);
+  const principal = sumAmounts([...s.outputs.map((o) => o.amount), s.fee]);
+  el("title").textContent =
+    principal === null ? "Release this stake?" : `Release ${formatAmount(principal)} from staking?`;
+  el("pay-text").textContent =
+    s.inputs === 1
+      ? "This stake stops counting for your validator once the release confirms; weight already in the current epoch snapshot can count until it is replaced. The B3 comes back to this wallet as ordinary coins, less the network fee."
+      : `These ${s.inputs} stakes stop counting for your validator once the release confirms; weight already in the current epoch snapshot can count until it is replaced. The B3 comes back to this wallet as ordinary coins, less the network fee.`;
+  el("pass-help").textContent =
+    "The wallet is locked. It unlocks only to sign this release and locks again straight after.";
+  el("approve").textContent = "Release now";
+}
+
 // Staking requests go to the node as they are; it picks the coins and the
 // fee when they are approved, so the window says so instead of a figure.
-function showAction(r: Exclude<Request, { kind: "pay" }>): void {
+function showAction(r: Exclude<Request, { kind: "pay" | "release" }>): void {
   el("from").textContent = `From ${walletName(r.wallet)} on ${r.chain}`;
   const fee = row("Network fee", "Set by the wallet when it is sent", undefined, false);
   if (r.kind === "stake") {
@@ -100,11 +118,13 @@ function show(draft: DraftView | null): void {
   el("draft").hidden = draft === null;
   el("error").hidden = true;
   if (!draft) return;
-  const pay = draft.request.kind === "pay";
+  const r = draft.request;
+  const pay = r.kind === "pay" || r.kind === "release";
   el("pay-body").hidden = !pay;
   el("action-body").hidden = pay;
-  if (draft.request.kind === "pay") showPay(draft.request.summary);
-  else showAction(draft.request);
+  if (r.kind === "pay") showPay(r.summary);
+  else if (r.kind === "release") showRelease(r.summary);
+  else showAction(r);
   el("pass-field").hidden = !draft.locked;
   el<HTMLInputElement>("pass").value = "";
   if (draft.locked) el("pass").focus();

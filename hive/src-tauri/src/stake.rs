@@ -8,6 +8,7 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::drafts::{Funded, Outpoint, SendSummary};
 use crate::rpc::{Client, RpcError};
 use crate::wallet::{self, decimal, parse_amount, Security};
 
@@ -293,9 +294,108 @@ pub fn stop(client: &Client, wallet: &str) -> Result<(), String> {
     stop_loop(client, wallet)
 }
 
+/// The label of the address a release pays, as the node's releasestake uses.
+const RELEASE_LABEL: &str = "b3-stake-release";
+
+/// Checks the stakes chosen for release and returns their principal: each
+/// must be one of this wallet's confirmed stakes, listed once.
+pub(crate) fn release_principal(stakes: &[Stake], chosen: &[Outpoint]) -> Result<String, String> {
+    if chosen.is_empty() {
+        return Err("Choose a stake to release.".into());
+    }
+    let mut total = 0u128;
+    for (i, coin) in chosen.iter().enumerate() {
+        if chosen[..i].contains(coin) {
+            return Err("A stake was chosen twice.".into());
+        }
+        let stake = stakes
+            .iter()
+            .find(|s| s.txid == coin.txid && s.vout == coin.vout)
+            .ok_or("That stake is no longer in this wallet. Refresh the page.")?;
+        if stake.status == "UNCONFIRMED" {
+            return Err("A stake can be released once it confirms.".into());
+        }
+        total += wallet::base_units(&stake.amount).ok_or("A stake amount could not be read.")?;
+    }
+    Ok(wallet::units_amount(total))
+}
+
+/// Funds a release (unstake) without signing: exactly the chosen STAKE
+/// outputs, paid to one new address of this wallet with the fee taken from
+/// the principal. It is the transaction the node's releasestake and
+/// b3_docker's unstake build. Once it confirms the stake stops counting;
+/// weight already in an epoch snapshot can count until that is replaced.
+pub fn prepare_release(
+    client: &Client,
+    wallet: &str,
+    chain: &str,
+    chosen: &[Outpoint],
+) -> Result<(SendSummary, Funded), String> {
+    let info = status(client, wallet).map_err(|e| e.to_string())?;
+    let principal = release_principal(&info.stakes, chosen)?;
+    let address = client
+        .call_wallet(wallet, "getnewaddress", json!([RELEASE_LABEL, "legacy"]))
+        .map_err(|e| e.to_string())?;
+    let address = address.as_str().ok_or("The node returned no address.")?;
+    let mut output = serde_json::Map::new();
+    output.insert(address.to_owned(), Value::String(principal));
+    let args = json!([
+        chosen,
+        [output],
+        0,
+        {"add_inputs": false, "subtractFeeFromOutputs": [0], "lockUnspents": true}
+    ]);
+    let (summary, funded) = wallet::fund(client, wallet, chain, args, Vec::new())?;
+    let exact = funded.inputs.len() == chosen.len()
+        && chosen.iter().all(|c| funded.inputs.contains(c))
+        && summary.outputs.len() == 1
+        && summary.outputs[0].mine
+        && summary.outputs[0].address == address;
+    if !exact {
+        wallet::release(client, wallet, &funded.inputs);
+        return Err("The node built a different release, so it was not offered.".into());
+    }
+    Ok((summary, funded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_confirmed_stakes_of_this_wallet_are_released() {
+        let stake = |n: u64, amount: &str, status: &str| Stake {
+            txid: format!("{n:064x}"),
+            vout: 0,
+            amount: amount.into(),
+            status: status.into(),
+            confirmations: 1,
+            active_at_height: None,
+        };
+        let pick = |n: u64| Outpoint {
+            txid: format!("{n:064x}"),
+            vout: 0,
+        };
+        let stakes = [
+            stake(1, "10.000000000", "ACTIVE"),
+            stake(2, "0.000000001", "PENDING"),
+            stake(3, "5", "UNCONFIRMED"),
+        ];
+        assert_eq!(
+            release_principal(&stakes, &[pick(1), pick(2)]).unwrap(),
+            "10.000000001"
+        );
+        assert!(release_principal(&stakes, &[]).is_err());
+        assert!(release_principal(&stakes, &[pick(1), pick(1)])
+            .unwrap_err()
+            .contains("twice"));
+        assert!(release_principal(&stakes, &[pick(3)])
+            .unwrap_err()
+            .contains("once it confirms"));
+        assert!(release_principal(&stakes, &[pick(4)])
+            .unwrap_err()
+            .contains("no longer in this wallet"));
+    }
 
     #[test]
     fn staking_starts_only_with_its_finality_key() {

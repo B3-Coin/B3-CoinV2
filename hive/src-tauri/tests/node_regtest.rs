@@ -964,4 +964,31 @@ fn staking_unlocks_only_to_create_and_start() {
 
     stake::stop(client, W).unwrap();
     assert!(!stake::status(client, W).unwrap().staking.running);
+
+    // Releasing spends exactly the stake, back to a new address of this
+    // wallet with the fee taken from it, and is signed only on approval.
+    let stake = &stake::status(client, W).unwrap().stakes[0];
+    let outpoint = Outpoint {
+        txid: stake.txid.clone(),
+        vout: stake.vout,
+    };
+    let (summary, funded) =
+        stake::prepare_release(client, W, "regtest", std::slice::from_ref(&outpoint)).unwrap();
+    assert_eq!(funded.inputs, vec![outpoint.clone()]);
+    assert_eq!(summary.outputs.len(), 1);
+    assert!(summary.outputs[0].mine && !summary.outputs[0].change);
+    let back: f64 = summary.outputs[0].amount.parse().unwrap();
+    let fee: f64 = summary.fee.parse().unwrap();
+    assert!(fee > 0.0 && (back + fee - 10.0).abs() < 1e-9);
+    assert!(wallet::sign(client, &summary, &funded).is_err());
+    wallet::unlock_for_signing(client, W, pass).unwrap();
+    let hex = wallet::sign(client, &summary, &funded).unwrap();
+    passphrase::lock(client, W).unwrap();
+    wallet::broadcast(client, &hex).unwrap();
+    mine(1);
+    assert!(stake::status(client, W).unwrap().stakes.is_empty());
+    let label = admin
+        .call_wallet(W, "getaddressinfo", json!([summary.outputs[0].address]))
+        .unwrap();
+    assert_eq!(label["labels"][0], "b3-stake-release");
 }

@@ -19,6 +19,7 @@
     "allow-book-save",
     "allow-stake-status",
     "allow-stake-draft",
+    "allow-release-draft",
     "allow-finality-draft",
     "allow-stake-start",
     "allow-stake-stop",

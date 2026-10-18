@@ -494,7 +494,7 @@ impl<'a> Cursor<'a> {
 }
 
 /// An exact decimal amount (at most 9 places) in base units.
-fn base_units(amount: &str) -> Option<u128> {
+pub(crate) fn base_units(amount: &str) -> Option<u128> {
     let (whole, frac) = amount.split_once('.').unwrap_or((amount, ""));
     if frac.len() > 9 || !(whole.bytes().chain(frac.bytes())).all(|b| b.is_ascii_digit()) {
         return None;
@@ -506,6 +506,11 @@ fn base_units(amount: &str) -> Option<u128> {
     };
     let frac: u128 = format!("{frac:0<9}").parse().ok()?;
     whole.checked_mul(1_000_000_000)?.checked_add(frac)
+}
+
+/// Base units as an exact 9-place amount.
+pub(crate) fn units_amount(units: u128) -> String {
+    format!("{}.{:09}", units / 1_000_000_000, units % 1_000_000_000)
 }
 
 /// `a < b` for exact decimal amounts; amounts it cannot read compare as not less.
@@ -560,6 +565,18 @@ pub fn prepare_payment(
         let spendable = coins(client, wallet).map_err(|e| e.to_string())?;
         check_chosen(&spendable, &payment.coins, payment.recipients.len())?;
     }
+    fund(client, wallet, chain, args, labels)
+}
+
+/// Funds walletcreatefundedpsbt `args` and decodes the result, without
+/// signing; outputs to this wallet's own addresses are marked as such.
+pub(crate) fn fund(
+    client: &Client,
+    wallet: &str,
+    chain: &str,
+    args: Value,
+    labels: Vec<(String, String)>,
+) -> Result<(SendSummary, Funded), String> {
     let funded = client
         .call_wallet(wallet, "walletcreatefundedpsbt", args)
         // The node's wording comes from Bitcoin Core.

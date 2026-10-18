@@ -30,7 +30,7 @@ use tauri::{
     WindowEvent,
 };
 
-use drafts::{DraftStore, DraftView, Request};
+use drafts::{DraftStore, DraftView, Outpoint, Request};
 use node::{Network, Node, NodeConfig, NodeStatus};
 use rpc::RpcError;
 use update::{HttpsFetcher, UpdateStatus, Updater};
@@ -432,6 +432,34 @@ async fn stake_draft(
             .unwrap()
             .insert(request)
             .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Asks the approval window to release stakes back into ordinary B3.
+#[tauri::command]
+async fn release_draft(
+    app: AppHandle,
+    core: State<'_, Arc<Core>>,
+    outpoints: Vec<Outpoint>,
+) -> Result<String, String> {
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let chain = node.chain().unwrap_or_default();
+        let (summary, funded) = stake::prepare_release(client, &name, &chain, &outpoints)?;
+        let inputs = funded.inputs.clone();
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(Request::Release { summary, funded })
+            .map_err(|e| {
+                wallet::release(client, &name, &inputs);
+                e.to_string()
+            })
     })
     .await?;
     open_approval(&app).map_err(|e| e.to_string())?;
@@ -1115,7 +1143,7 @@ fn draft_view(client: Option<&rpc::Client>, draft: drafts::Draft) -> DraftView {
 /// Carries out an approved request. Returns the transaction id.
 fn execute(client: &rpc::Client, request: Request) -> Result<String, String> {
     match request {
-        Request::Pay { summary, funded } => {
+        Request::Pay { summary, funded } | Request::Release { summary, funded } => {
             let sent = wallet::sign(client, &summary, &funded)
                 .and_then(|hex| wallet::broadcast(client, &hex).map_err(|e| e.to_string()));
             match &sent {
@@ -1589,6 +1617,7 @@ pub fn run() {
             book_save,
             stake_status,
             stake_draft,
+            release_draft,
             finality_draft,
             stake_start,
             stake_stop,

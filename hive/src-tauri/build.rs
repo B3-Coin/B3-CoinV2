@@ -19,6 +19,7 @@ fn main() {
             "book_save",
             "stake_status",
             "stake_draft",
+            "release_draft",
             "finality_draft",
             "stake_start",
             "stake_stop",

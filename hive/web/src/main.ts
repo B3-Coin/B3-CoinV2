@@ -1710,7 +1710,7 @@ el("staking-go").addEventListener("click", (e) => {
 });
 
 // Which page asked for each waiting approval, so its outcome lands there.
-const draftPage = new Map<string, "send" | "stake" | "finality">();
+const draftPage = new Map<string, "send" | "stake" | "finality" | "release">();
 
 // Mirrors stake::Status in src-tauri/src/stake.rs.
 type StakeEntry = {
@@ -1837,9 +1837,21 @@ function renderStake(s: StakeStatus): void {
       tag.className = `badge badge-${tone}`;
       tag.textContent = k.status === "ACTIVE" ? "Active" : k.status === "PENDING" ? "Pending" : "Unconfirmed";
       row.append(lead, body, tag);
+      if (k.status !== "UNCONFIRMED") {
+        const release = document.createElement("button");
+        release.type = "button";
+        release.className = "btn btn-ghost btn-sm";
+        release.textContent = "Release";
+        release.title = "Return this stake to ordinary B3 in this wallet";
+        release.addEventListener("click", () => void releaseStakes([{ txid: k.txid, vout: k.vout }]));
+        row.append(release);
+      }
       return row;
     }),
   );
+  const releasable = s.stakes.filter((k) => k.status !== "UNCONFIRMED");
+  el("stk-release-all-row").hidden = releasable.length < 2;
+  el("stk-release-all").textContent = `Release all ${releasable.length}`;
 
   el("stk-min").textContent = s.min_stake
     ? `At least ${formatAmount(s.min_stake, 2)}. It counts ${s.activation_depth} blocks after it confirms.`
@@ -1877,6 +1889,22 @@ const refreshStake = single(async () => {
     return;
   }
   renderStake(stakeStatus);
+});
+
+// Releasing (unstaking) goes through the approval window, like a payment.
+async function releaseStakes(outpoints: { txid: string; vout: number }[]): Promise<void> {
+  try {
+    const id = await invoke<string>("release_draft", { outpoints });
+    draftPage.set(id, "release");
+    stakeResult("success", "Waiting for your decision in the approval window.");
+  } catch (e) {
+    stakeResult("danger", String(e));
+  }
+}
+
+el("stk-release-all").addEventListener("click", () => {
+  const all = (stakeStatus?.stakes ?? []).filter((k) => k.status !== "UNCONFIRMED");
+  void releaseStakes(all.map((k) => ({ txid: k.txid, vout: k.vout })));
 });
 
 el("stk-form").addEventListener("submit", async (event) => {
@@ -2564,7 +2592,9 @@ await listen<DraftResult>("draft-result", (event) => {
         "success",
         page === "stake"
           ? `Stake sent. Transaction ${r.txid}. It counts once it confirms and matures.`
-          : `Finality key sent. Transaction ${r.txid}. Start staking once it confirms.`,
+          : page === "release"
+            ? `Release sent. Transaction ${r.txid}. The B3 is ordinary coins in this wallet once it confirms.`
+            : `Finality key sent. Transaction ${r.txid}. Start staking once it confirms.`,
       );
       el<HTMLFormElement>("stk-form").reset();
     } else if (r.outcome === "rejected") {
