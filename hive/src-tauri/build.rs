@@ -20,6 +20,8 @@ fn main() {
             "stake_status",
             "stake_draft",
             "release_draft",
+            "wallet_restore",
+            "wallet_import_legacy",
             "psbt_inspect",
             "psbt_draft",
             "psbt_save",

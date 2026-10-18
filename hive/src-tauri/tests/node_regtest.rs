@@ -863,6 +863,99 @@ fn a_psbt_is_read_signed_and_broadcast() {
 }
 
 #[test]
+fn wallets_are_restored_and_legacy_dumps_imported() {
+    let Some((test, status)) = TestNode::start("restore") else {
+        return;
+    };
+    assert!(matches!(status, NodeStatus::Ready { .. }), "{status:?}");
+    let client = test.node.client().unwrap();
+    let patient = test.node.patient_client().unwrap();
+    let admin = test.admin();
+    wallet::ensure_wallet(client).unwrap();
+    wallet::fund_regtest(client, W).unwrap();
+
+    // A legacy key holding coins: private key 1, as B3's old dumpwallet
+    // writes it (regtest WIF prefix 0xef).
+    let wif = "cMahea7zqjxrtgAbB7LSGbcQUr1uX1ojuat9jZodMN87JcbXMTcA";
+    let desc = admin
+        .call("getdescriptorinfo", json!([format!("pkh({wif})")]))
+        .unwrap();
+    let old = admin
+        .call("deriveaddresses", json!([desc["descriptor"]]))
+        .unwrap()[0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    admin
+        .call_wallet(W, "sendtoaddress", json!([old, 2]))
+        .unwrap();
+    let to = admin.call_wallet(W, "getnewaddress", json!([])).unwrap();
+    admin.call("generatetoaddress", json!([1, to])).unwrap();
+
+    // Restore loads a backup under a new name, never over an existing one.
+    let backup = test.datadir.join("restore-me.dat");
+    wallet::backup(client, W, &backup).unwrap();
+    assert!(wallet::restore(patient, W, &backup)
+        .unwrap_err()
+        .contains("already"));
+    assert!(
+        wallet::restore(patient, "Copy", &test.datadir.join("none.dat"))
+            .unwrap_err()
+            .contains("not a file")
+    );
+    assert_eq!(wallet::restore(patient, "Copy", &backup).unwrap(), "Copy");
+    let balance = |w: &str| {
+        admin.call_wallet(w, "getbalances", json!([])).unwrap()["mine"]["trusted"].to_string()
+    };
+    assert_eq!(balance("Copy"), balance(W));
+
+    // A malformed dump changes nothing, and the blank wallet it left can be
+    // used again under the same name.
+    let dump = |name: &str, body: &str| {
+        let path = test.datadir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    };
+    let broken = dump(
+        "broken.dump",
+        "# Wallet dump created by B3-Coin v3.1.2.2\nnot a key record\n# End of dump\n",
+    );
+    let err = wallet::import_legacy(patient, "Recovered", &broken).unwrap_err();
+    assert!(err.contains("still empty"), "{err}");
+    let good = dump(
+        "legacy.dump",
+        &format!(
+            "# Wallet dump created by B3-Coin v3.1.2.2\r\n\r\n{wif} 2017-09-18T12:34:56Z label=Old%20coins # addr={old}\r\n# End of dump\r\n"
+        ),
+    );
+    let done = wallet::import_legacy(patient, "Recovered", &good).unwrap();
+    assert_eq!(
+        done,
+        wallet::Imported {
+            wallet: "Recovered".into(),
+            keys_imported: 1,
+            keys_already_present: 0
+        }
+    );
+    assert_eq!(balance("Recovered"), "2.000000000");
+    let info = admin
+        .call_wallet("Recovered", "getaddressinfo", json!([old]))
+        .unwrap();
+    assert_eq!(info["labels"][0].as_str(), Some("Old coins"));
+    // The recovered wallet can pay with change: it got fresh descriptors.
+    assert!(admin
+        .call_wallet("Recovered", "getrawchangeaddress", json!([]))
+        .is_ok());
+    // Once it holds keys, the name is taken.
+    assert!(wallet::import_legacy(patient, "Recovered", &good)
+        .unwrap_err()
+        .contains("Choose a new name"));
+    assert!(wallet::import_legacy(patient, W, &good)
+        .unwrap_err()
+        .contains("Choose a new name"));
+}
+
+#[test]
 fn the_address_book_adds_and_renames_sending_addresses() {
     let Some((test, status)) = TestNode::start("book") else {
         return;

@@ -621,6 +621,37 @@
                 <button class="btn btn-secondary mt-2" type="button" id="wl-backup">Back up wallet</button>
               </div>
             </div>
+
+            <form class="card" id="wl-restore" novalidate>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-refresh" /></svg>Restore or recover</h2>
+              </div>
+              <div class="card-pad form-grid">
+                <div class="field">
+                  <label for="wl-restore-name">Name for the new wallet</label>
+                  <input class="input" id="wl-restore-name" autocomplete="off" spellcheck="false" maxlength="64" required />
+                  <span class="help">Same rules as above. The wallet becomes the one in use.</span>
+                </div>
+                <p class="t-sm muted">
+                  <strong>Restore from backup</strong> takes a wallet file saved by Back up, or by the
+                  B3 Qt wallet's Backup Wallet. <strong>Recover a legacy wallet</strong> takes the text
+                  file the old B3 wallet's <code>dumpwallet</code> command wrote. The node checks the whole
+                  file before it changes anything, then rescans the whole chain, which can take a long
+                  time.
+                </p>
+                <div class="callout callout-warning">
+                  <div class="callout-title">
+                    <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>A dump file holds every key in plain text
+                  </div>
+                  Once the recovered wallet shows its coins, encrypt it, back it up, and delete the
+                  dump file.
+                </div>
+              </div>
+              <div class="card-foot row">
+                <button class="btn btn-secondary" type="button" id="wl-restore-backup">Restore from backup</button>
+                <button class="btn btn-secondary" type="button" id="wl-import-legacy">Recover a legacy wallet</button>
+              </div>
+            </form>
           </div>
         </main>
 

@@ -42,6 +42,8 @@ const PAGE_METHODS: &[&str] = &[
     "createwallet",
     "unloadwallet",
     "backupwallet",
+    "restorewallet",
+    "importlegacywalletdump",
     "encryptwallet",
     "walletpassphrasechange",
     "walletlock",
@@ -137,6 +139,8 @@ pub struct NodeConfig {
 pub struct Node {
     child: Mutex<Option<Child>>,
     client: Option<Client>,
+    /// The pages' login without a time limit, for calls that rescan.
+    patient: Option<Client>,
     console: Option<Client>,
     status: Mutex<NodeStatus>,
     stderr_tail: Arc<Mutex<Vec<u8>>>,
@@ -153,11 +157,13 @@ impl Node {
             Ok(Spawned {
                 child,
                 client,
+                patient,
                 console,
                 port,
             }) => Arc::new(Node {
                 child: Mutex::new(Some(child)),
                 client: Some(client),
+                patient: Some(patient),
                 console: Some(console),
                 status: Mutex::new(NodeStatus::Starting {
                     message: "Starting b3coind".into(),
@@ -169,6 +175,7 @@ impl Node {
             Err(error) => Arc::new(Node {
                 child: Mutex::new(None),
                 client: None,
+                patient: None,
                 console: None,
                 status: Mutex::new(NodeStatus::Failed { error }),
                 stderr_tail,
@@ -183,6 +190,7 @@ impl Node {
         Arc::new(Node {
             child: Mutex::new(None),
             client: None,
+            patient: None,
             console: None,
             status: Mutex::new(NodeStatus::Setup),
             stderr_tail: Arc::new(Mutex::new(Vec::new())),
@@ -199,6 +207,15 @@ impl Node {
     pub fn client(&self) -> Option<&Client> {
         match self.status() {
             NodeStatus::Ready { .. } => self.client.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The pages' client without a time limit, once the node is ready: for
+    /// restoring and importing wallets, which rescan the chain.
+    pub fn patient_client(&self) -> Option<&Client> {
+        match self.status() {
+            NodeStatus::Ready { .. } => self.patient.as_ref(),
             _ => None,
         }
     }
@@ -375,6 +392,7 @@ pub(crate) fn hide_console(_command: &mut Command) {}
 struct Spawned {
     child: Child,
     client: Client,
+    patient: Client,
     console: Client,
     port: u16,
 }
@@ -418,6 +436,7 @@ fn spawn(config: &NodeConfig, stderr_tail: &Arc<Mutex<Vec<u8>>>) -> Result<Spawn
     Ok(Spawned {
         child,
         client: Client::new(port, &page),
+        patient: Client::without_timeout(port, &page),
         console: Client::without_timeout(port, &console),
         port,
     })

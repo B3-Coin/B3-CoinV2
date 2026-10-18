@@ -552,7 +552,7 @@ type WalletAction = { action: "switch" | "open" | "close" | "create"; name: stri
 
 const walletName = (name: string) => (name === "" ? "Default wallet" : name);
 
-function walletsResult(tone: "success" | "danger" | "", text: string): void {
+function walletsResult(tone: "success" | "danger" | "info" | "", text: string): void {
   const box = el("wl-result");
   box.hidden = !text;
   box.className = `banner banner-${tone}`;
@@ -741,6 +741,65 @@ el("wl-create").addEventListener("submit", async (e) => {
   if (el("wl-result").classList.contains("banner-success")) input.value = "";
   button.disabled = false;
 });
+
+// Restore and legacy recovery: the core opens the file picker and returns
+// null when it is cancelled. Both rescan, so they can take a long time.
+type ImportView = {
+  imported: { wallet: string; keys_imported: number; keys_already_present: number };
+  wallets: WalletsView;
+};
+
+async function restoreWallet(legacy: boolean): Promise<void> {
+  if (walletBusy) return;
+  const name = el<HTMLInputElement>("wl-restore-name").value;
+  const buttons = [el<HTMLButtonElement>("wl-restore-backup"), el<HTMLButtonElement>("wl-import-legacy")];
+  walletBusy = true;
+  buttons.forEach((b) => (b.disabled = true));
+  walletsResult(
+    "info",
+    legacy
+      ? "Choose the dump file. After that the node checks it and rescans the whole chain; keep Hive open until it finishes."
+      : "Choose the backup file. After that the node loads it and rescans; keep Hive open until it finishes.",
+  );
+  try {
+    let done: string | null = null;
+    if (legacy) {
+      const r = await invoke<ImportView | null>("wallet_import_legacy", { name });
+      if (r) {
+        renderWallets(r.wallets);
+        const i = r.imported;
+        done =
+          `Recovered ${plural(i.keys_imported, "key")} into ${walletName(i.wallet)}` +
+          (i.keys_already_present ? ` (${plural(i.keys_already_present, "key")} already there)` : "") +
+          ", and it is now in use. Encrypt it and back it up, then delete the dump file.";
+      }
+    } else {
+      const v = await invoke<WalletsView | null>("wallet_restore", { name });
+      if (v) {
+        renderWallets(v);
+        done = `Restored ${walletName(v.current ?? name)}, and it is now in use.`;
+      }
+    }
+    if (done === null) {
+      walletsResult("", "");
+      return;
+    }
+    walletsResult("success", done);
+    el<HTMLInputElement>("wl-restore-name").value = "";
+    void refreshWallet();
+    void refreshRecent();
+  } catch (e) {
+    walletsResult("danger", String(e));
+    void refreshWallets();
+  } finally {
+    walletBusy = false;
+    buttons.forEach((b) => (b.disabled = false));
+  }
+}
+
+el("wl-restore").addEventListener("submit", (e) => e.preventDefault());
+el("wl-restore-backup").addEventListener("click", () => void restoreWallet(false));
+el("wl-import-legacy").addEventListener("click", () => void restoreWallet(true));
 
 el("wl-backup").addEventListener("click", async () => {
   const button = el<HTMLButtonElement>("wl-backup");

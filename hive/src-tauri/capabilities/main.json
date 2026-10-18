@@ -20,6 +20,8 @@
     "allow-stake-status",
     "allow-stake-draft",
     "allow-release-draft",
+    "allow-wallet-restore",
+    "allow-wallet-import-legacy",
     "allow-psbt-inspect",
     "allow-psbt-draft",
     "allow-psbt-save",

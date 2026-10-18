@@ -29,3 +29,6 @@ tar = { version = "0.4", default-features = false }
 zstd = { version = "0.13", default-features = false }
 # QR codes for Receive; only the module grid, drawn by the page.
 qrcode = { version = "0.14", default-features = false }
+# Native file pickers, opened by the core only (no capability gives the
+# pages the dialog): restore and legacy import need a path the node opens.
+tauri-plugin-dialog = "2"

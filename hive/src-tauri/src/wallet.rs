@@ -162,6 +162,100 @@ pub fn create(client: &Client, name: &str) -> Result<String, String> {
     Ok(name)
 }
 
+/// The file a restore or import reads, as a path the node can open.
+fn source_file(path: &std::path::Path) -> Result<&str, String> {
+    if !path.is_file() {
+        return Err(format!("{} is not a file.", path.display()));
+    }
+    path.to_str()
+        .ok_or_else(|| format!("{} cannot be passed to the node.", path.display()))
+}
+
+/// Qt's Restore wallet: loads a backup file as a new wallet `name` that
+/// loads at every start. Restoring rescans, so `client` has no time limit.
+pub fn restore(client: &Client, name: &str, backup: &std::path::Path) -> Result<String, String> {
+    let name = check_new_name(name)?;
+    let file = source_file(backup)?;
+    let list = wallets(client).map_err(|e| e.to_string())?;
+    if list.loaded.contains(&name) || list.available.contains(&name) {
+        return Err(
+            "A wallet with that name is already in the wallets folder. Choose a new name.".into(),
+        );
+    }
+    let _one_at_a_time = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+    client
+        .call("restorewallet", json!([name, file, true]))
+        .map_err(|e| e.to_string())?;
+    Ok(name)
+}
+
+/// What a legacy import recovered.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Imported {
+    pub wallet: String,
+    pub keys_imported: u64,
+    pub keys_already_present: u64,
+}
+
+/// Recovers a legacy B3 wallet from the text file its dumpwallet RPC wrote,
+/// into a new descriptor wallet `name` (importlegacywalletdump). The node
+/// checks the whole file before it changes anything, then rescans the whole
+/// chain, so `client` has no time limit. A wallet a failed import left blank
+/// is used again, so the import can be retried under the same name.
+pub fn import_legacy(
+    client: &Client,
+    name: &str,
+    dump: &std::path::Path,
+) -> Result<Imported, String> {
+    let name = check_new_name(name)?;
+    let file = source_file(dump)?;
+    let list = wallets(client).map_err(|e| e.to_string())?;
+    {
+        let _one_at_a_time = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+        if list.loaded.contains(&name) || list.available.contains(&name) {
+            if !list.loaded.contains(&name) {
+                client
+                    .call("loadwallet", json!([name, true]))
+                    .map_err(|e| e.to_string())?;
+            }
+            if !is_blank(client, &name)? {
+                return Err(
+                    "A wallet with that name is already in the wallets folder. Choose a new name."
+                        .into(),
+                );
+            }
+        } else {
+            client
+                .call(
+                    "createwallet",
+                    json!([name, false, true, null, false, true, true]),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    match client.call_wallet(&name, "importlegacywalletdump", json!([file])) {
+        Ok(done) => Ok(Imported {
+            keys_imported: done["keys_imported"].as_u64().unwrap_or(0),
+            keys_already_present: done["keys_already_present"].as_u64().unwrap_or(0),
+            wallet: name,
+        }),
+        Err(e) if is_blank(client, &name).unwrap_or(false) => Err(format!(
+            "{e} Nothing was imported; wallet {name} is still empty. Import again under the same name to retry."
+        )),
+        Err(e) => Err(format!(
+            "{e} The keys are in wallet {name}; run rescanblockchain for it in the Console to find its coins."
+        )),
+    }
+}
+
+/// A wallet that has no keys yet, as createwallet's blank option makes it.
+fn is_blank(client: &Client, wallet: &str) -> Result<bool, String> {
+    let info = client
+        .call_wallet(wallet, "getwalletinfo", json!([]))
+        .map_err(|e| e.to_string())?;
+    Ok(info["blank"] == Value::Bool(true))
+}
+
 /// Copies the wallet to `path`, which must not exist yet.
 pub fn backup(client: &Client, wallet: &str, path: &std::path::Path) -> Result<(), String> {
     if path.exists() {

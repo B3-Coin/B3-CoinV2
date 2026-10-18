@@ -754,6 +754,92 @@ async fn wallet_manage(
     .await
 }
 
+/// Asks for a file with the native picker, over the main window. None when
+/// it is cancelled.
+fn pick_file(app: &AppHandle, title: &str, filter: (&str, &[&str])) -> Option<std::path::PathBuf> {
+    use tauri_plugin_dialog::DialogExt;
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title(title)
+        .add_filter(filter.0, filter.1)
+        .add_filter("All files", &["*"]);
+    if let Some(main) = app.get_webview_window(MAIN) {
+        dialog = dialog.set_parent(&main);
+    }
+    dialog.blocking_pick_file()?.into_path().ok()
+}
+
+/// Qt's Restore wallet: a backup file, chosen with the native picker, is
+/// loaded as the new wallet `name` and becomes the pages' wallet. None when
+/// the picker is cancelled.
+#[tauri::command]
+async fn wallet_restore(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    name: String,
+) -> Result<Option<WalletsView>, String> {
+    require_window(&window, MAIN)?;
+    wallet::check_new_name(&name)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let Some(path) = pick_file(
+            &app,
+            "Restore a wallet backup",
+            ("Wallet backups", &["dat", "bak"]),
+        ) else {
+            return Ok(None);
+        };
+        let node = core.node();
+        let client = node.patient_client().ok_or("The node is not ready yet.")?;
+        let name = wallet::restore(client, &name, &path)?;
+        *core.wallet.lock().unwrap() = Some(name);
+        wallets_view(&core).map(Some)
+    })
+    .await
+}
+
+/// A legacy import's outcome for the Wallets page.
+#[derive(Serialize)]
+pub struct ImportView {
+    imported: wallet::Imported,
+    wallets: WalletsView,
+}
+
+/// Recovers a legacy B3 wallet from its dumpwallet file, chosen with the
+/// native picker, into the new wallet `name`, which becomes the pages'
+/// wallet. None when the picker is cancelled.
+#[tauri::command]
+async fn wallet_import_legacy(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    name: String,
+) -> Result<Option<ImportView>, String> {
+    require_window(&window, MAIN)?;
+    wallet::check_new_name(&name)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let Some(path) = pick_file(
+            &app,
+            "Import a legacy wallet dump",
+            ("Wallet dumps", &["txt", "dump"]),
+        ) else {
+            return Ok(None);
+        };
+        let node = core.node();
+        let client = node.patient_client().ok_or("The node is not ready yet.")?;
+        let imported = wallet::import_legacy(client, &name, &path)?;
+        *core.wallet.lock().unwrap() = Some(imported.wallet.clone());
+        Ok(Some(ImportView {
+            imported,
+            wallets: wallets_view(&core)?,
+        }))
+    })
+    .await
+}
+
 /// Opens the passphrase window to encrypt the wallet in use or change its
 /// passphrase. The outcome arrives as a passphrase-result event.
 /// Async on purpose: see open_console.
@@ -1668,6 +1754,7 @@ fn start_node(app: &AppHandle, config: &NodeConfig) -> Arc<Node> {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let config = node_config(app)?;
             let updates = updates(app)?;
@@ -1752,6 +1839,8 @@ pub fn run() {
             stake_status,
             stake_draft,
             release_draft,
+            wallet_restore,
+            wallet_import_legacy,
             psbt_inspect,
             psbt_draft,
             psbt_save,
