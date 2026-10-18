@@ -9,6 +9,7 @@
 # The triple defaults to rustc's host. For a Windows app, stage the MinGW
 # b3coind.exe with the app's triple and the MinGW strip, for example from WSL:
 #   STRIP=x86_64-w64-mingw32-strip scripts/stage-b3coind.sh b3coind.exe x86_64-pc-windows-msvc
+# STRIP=none copies the file as it is, for a binary stripped where it was built.
 set -euo pipefail
 src=${1:?usage: $0 /path/to/b3coind [target-triple]}
 [ -f "$src" ] || { echo "no such file: $src" >&2; exit 1; }
@@ -17,6 +18,10 @@ ext=""
 case "$src" in *.exe) ext=".exe" ;; esac
 dest="$(dirname "$0")/../src-tauri/binaries/b3-hive-node-$triple$ext"
 mkdir -p "$(dirname "$dest")"
-"${STRIP:-strip}" --strip-debug -o "$dest" "$src"
+if [ "${STRIP:-strip}" = none ]; then
+  cp "$src" "$dest"
+else
+  "${STRIP:-strip}" --strip-debug -o "$dest" "$src"
+fi
 chmod +x "$dest"
 ls -l "$dest"
