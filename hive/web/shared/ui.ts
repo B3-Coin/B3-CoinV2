@@ -68,6 +68,10 @@ export function setMasked(on: boolean): void {
   masked = on;
 }
 
+export function isMasked(): boolean {
+  return masked;
+}
+
 /** Plain text, e.g. "1 234.5 B3". */
 export function formatAmount(value: string, minDecimals = 2): string {
   if (masked) return `${MASK} B3`;

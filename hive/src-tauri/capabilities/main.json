@@ -18,6 +18,8 @@
     "allow-book-list",
     "allow-book-save",
     "allow-stake-status",
+    "allow-trade-markets",
+    "allow-trade-market",
     "allow-stake-draft",
     "allow-release-draft",
     "allow-wallet-restore",

@@ -38,6 +38,10 @@
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-layers" /></svg>
               <span class="nav-text">Stake</span>
             </button>
+            <button class="nav-item" type="button" data-view="trade">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-repeat" /></svg>
+              <span class="nav-text">Trade</span>
+            </button>
             <button class="nav-item" type="button" data-view="book">
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>
               <span class="nav-text">Address book</span>
@@ -501,6 +505,108 @@
                 <p class="t-sm muted" id="fin-text"></p>
                 <div class="row mt-2">
                   <button class="btn btn-secondary" type="button" id="fin-bind">Bind finality key</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+
+        <main class="view" id="view-trade" hidden>
+          <div class="stack">
+            <div class="banner banner-danger" id="tr-error" role="status" hidden></div>
+            <div class="card" id="tr-empty" hidden>
+              <div class="empty">
+                <strong>No FlowMesh market is available</strong>
+                <p class="t-sm muted">Markets appear here once FlowMesh is active on the chain and a token/B3 market is established. This node also needs a trading endpoint, or its own FlowMesh engine.</p>
+              </div>
+            </div>
+            <div class="card tr-head" id="tr-head" hidden>
+              <div class="tr-head-main">
+                <div class="row gap-3 wrap">
+                  <label class="sr-only" for="tr-market">Market</label>
+                  <select class="select select-sm select-auto tr-market" id="tr-market"></select>
+                  <span class="badge" id="tr-state"></span>
+                  <span class="badge badge-warning" id="tr-test" hidden title="The issuer marked this token as an unbacked test asset">Test asset</span>
+                </div>
+                <div class="tr-stats">
+                  <div><span class="t-xs muted">Last price</span><strong class="tnum" id="tr-last">—</strong></div>
+                  <div><span class="t-xs muted" title="What the next auction would do with the standing orders alone. Not certified; queued orders are not included.">Next auction</span><strong class="tnum" id="tr-next">—</strong></div>
+                  <div><span class="t-xs muted">Microblock</span><strong class="tnum" id="tr-seq">—</strong></div>
+                  <div><span class="t-xs muted" title="Validator seats and the signatures a certificate needs. Seats do not prove the validators are online.">Seats / quorum</span><strong class="tnum" id="tr-quorum">—</strong></div>
+                </div>
+              </div>
+              <div class="tr-source t-xs muted" id="tr-source"></div>
+            </div>
+            <div class="tr-grid" id="tr-body" hidden>
+              <div class="stack tr-main">
+                <div class="card">
+                  <div class="card-head">
+                    <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-activity" /></svg>Price</h2>
+                    <span class="t-xs muted" title="Each point is a certified auction that matched. Microblocks carry no execution time, so the axis is the microblock sequence.">Certified clearings by microblock</span>
+                  </div>
+                  <div class="card-pad">
+                    <div class="tr-chart">
+                      <svg id="tr-chart" viewBox="0 0 600 200" preserveAspectRatio="none" role="img" aria-label="Clearing prices"></svg>
+                      <span class="tr-axis tr-axis-top t-xs muted tnum" id="tr-chart-high"></span>
+                      <span class="tr-axis tr-axis-bottom t-xs muted tnum" id="tr-chart-low"></span>
+                      <p class="tr-chart-empty t-sm muted" id="tr-chart-empty">No auction has matched yet in the retained history.</p>
+                    </div>
+                    <div class="between t-xs muted tnum mt-1"><span id="tr-chart-first"></span><span id="tr-chart-last"></span></div>
+                  </div>
+                </div>
+                <div class="card">
+                  <div class="card-head">
+                    <div class="tabs" role="tablist" aria-label="Orders and trades">
+                      <button class="tab" type="button" role="tab" id="tr-tab-orders" aria-selected="true" aria-controls="tr-orders">Your orders</button>
+                      <button class="tab" type="button" role="tab" id="tr-tab-trades" aria-selected="false" aria-controls="tr-trades">Trades</button>
+                    </div>
+                  </div>
+                  <div id="tr-orders" role="tabpanel" aria-labelledby="tr-tab-orders">
+                    <div class="table-wrap">
+                      <table class="tbl">
+                        <thead><tr><th>Side</th><th class="num">Limit (B3)</th><th class="num">Remaining</th><th class="num">Filled</th><th class="num">Reserved</th><th>Status</th></tr></thead>
+                        <tbody id="tr-orders-rows"></tbody>
+                      </table>
+                    </div>
+                    <p class="card-pad t-sm muted" id="tr-orders-note"></p>
+                  </div>
+                  <div id="tr-trades" role="tabpanel" aria-labelledby="tr-tab-trades" hidden>
+                    <div class="table-wrap">
+                      <table class="tbl">
+                        <thead><tr><th class="num">Price (B3)</th><th class="num">Size</th><th class="num">Value (B3)</th><th title="When the serving node applied the auction, by its own clock. Microblocks carry no certified time.">Observed</th><th class="num" title="Your fill in this auction. A dash means unknown, not none.">Yours</th><th class="num">Microblock</th></tr></thead>
+                        <tbody id="tr-trades-rows"></tbody>
+                      </table>
+                    </div>
+                    <p class="card-pad t-sm muted" id="tr-trades-empty" hidden>No auction has matched in the retained history.</p>
+                  </div>
+                </div>
+              </div>
+              <div class="stack tr-side">
+                <div class="card">
+                  <div class="card-head">
+                    <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-list" /></svg>Order book</h2>
+                    <span class="badge badge-warning" id="tr-book-stale" hidden title="No verified update for over 3 seconds">Stale</span>
+                  </div>
+                  <div class="tr-book" id="tr-book">
+                    <div class="tr-book-row tr-book-labels t-xs muted"><span>Price (B3)</span><span class="num" id="tr-book-size">Size</span><span class="num">Total</span></div>
+                    <div id="tr-asks"></div>
+                    <div class="tr-spread t-xs muted tnum" id="tr-spread">—</div>
+                    <div id="tr-bids"></div>
+                  </div>
+                  <p class="card-pad t-xs muted" id="tr-book-note">Levels of every verified standing order, computed by your node. Not certified; queued orders are not included.</p>
+                </div>
+                <div class="card">
+                  <div class="card-head">
+                    <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-wallet" /></svg>Trading balance</h2>
+                  </div>
+                  <div class="card-pad details" id="tr-balance">
+                    <div class="drow"><span class="dkey">B3 available</span><span class="dval" id="tr-b3-free">—</span></div>
+                    <div class="drow"><span class="dkey">B3 in orders</span><span class="dval" id="tr-b3-held">—</span></div>
+                    <div class="drow"><span class="dkey" id="tr-base-free-label">Token available</span><span class="dval tnum" id="tr-base-free">—</span></div>
+                    <div class="drow"><span class="dkey" id="tr-base-held-label">Token in orders</span><span class="dval tnum" id="tr-base-held">—</span></div>
+                  </div>
+                  <p class="card-pad t-sm muted" id="tr-no-account" hidden>This wallet has no trading account in this market yet. The first deposit creates it.</p>
+                  <p class="card-pad t-xs muted">FlowMesh holds this balance, not your wallet. The validators certify it, which is not the same as settled on the B3 chain.</p>
                 </div>
               </div>
             </div>

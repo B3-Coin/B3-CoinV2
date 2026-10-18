@@ -8,6 +8,7 @@ pub mod bootstrap;
 pub mod chain;
 pub mod console;
 pub mod drafts;
+pub mod flowmesh;
 pub mod history;
 pub mod node;
 pub mod passphrase;
@@ -404,6 +405,43 @@ async fn book_save(
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
         book::save(client, &name, &address, &label)
+    })
+    .await
+}
+
+/// The FlowMesh markets the node knows.
+#[tauri::command]
+async fn trade_markets(core: State<'_, Arc<Core>>) -> Result<Vec<flowmesh::MarketSummary>, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        flowmesh::markets(client, &name).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// One market's verified view for the page wallet. With `known_head` and
+/// `watch` it is a live read: the node waits up to 1.5 s for the head to
+/// move and leaves the heavy parts out when it has not.
+#[tauri::command]
+async fn trade_market(
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+    known_head: Option<String>,
+    watch: bool,
+    ticks_after: Option<u64>,
+) -> Result<flowmesh::MarketView, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let query = flowmesh::Query {
+            known_head,
+            watch,
+            ticks_after,
+        };
+        flowmesh::market(client, &name, &market_id, &query)
     })
     .await
 }
@@ -1915,6 +1953,8 @@ pub fn run() {
             book_list,
             book_save,
             stake_status,
+            trade_markets,
+            trade_market,
             stake_draft,
             release_draft,
             wallet_restore,

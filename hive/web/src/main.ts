@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { amountNode, amountUnits, el, formatAmount, icon, initTheme, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
+import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged } from "./trade";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -133,6 +134,7 @@ const VIEWS = {
   activity: { title: "Activity", sub: "Your wallet's transactions" },
   book: { title: "Address book", sub: "Addresses you pay, with their labels" },
   stake: { title: "Stake", sub: "Secure B3 with this wallet's validator" },
+  trade: { title: "Trade", sub: "FlowMesh token markets, settled in B3" },
   wallets: { title: "Wallets", sub: "Open, create, switch and back up wallets" },
   network: { title: "Network", sub: "Your node and its peers" },
   settings: { title: "Settings", sub: "How your node runs and connects" },
@@ -164,6 +166,8 @@ function go(view: View): void {
   if (view === "book") void refreshBook();
   if (view === "stake") void refreshStake();
   if (view === "send") void refreshBook();
+  if (view === "trade") startTrade();
+  else stopTrade();
 }
 
 for (const button of document.querySelectorAll<HTMLElement>("[data-view]")) {
@@ -203,6 +207,7 @@ function applyMask(on: boolean): void {
   button.setAttribute("aria-label", label);
   button.title = label;
   el("mask-icon").setAttribute("href", `/icons.svg#i-${on ? "eye-off" : "eye"}`);
+  tradeMaskChanged();
 }
 
 function storedMask(): boolean {
@@ -747,6 +752,7 @@ async function manageWallet(action: WalletAction): Promise<void> {
     // Every page shows the wallet in use.
     void refreshWallet();
     void refreshRecent();
+    tradeWalletChanged();
     el("rcv-request").hidden = true;
     if (current === "receive") void refreshReceiving();
   } catch (e) {

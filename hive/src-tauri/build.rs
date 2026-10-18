@@ -18,6 +18,8 @@ fn main() {
             "book_list",
             "book_save",
             "stake_status",
+            "trade_markets",
+            "trade_market",
             "stake_draft",
             "release_draft",
             "wallet_restore",

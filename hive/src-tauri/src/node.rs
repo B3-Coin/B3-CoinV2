@@ -75,6 +75,8 @@ const PAGE_METHODS: &[&str] = &[
     "decoderawtransaction",
     "sendrawtransaction",
     "generatetoaddress",
+    "listflowmeshmarkets",
+    "getflowmeshmarketdata",
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
