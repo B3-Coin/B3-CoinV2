@@ -250,6 +250,7 @@ function showBanner(tone: Tone, title: string, detail: string): void {
 function badge(state: "unlocked" | "locked" | "no-node" | "no-wallet", text: string): void {
   el("node-badge").dataset.state = state;
   el("node-badge-text").textContent = text;
+  el("node-badge").title = text;
 }
 
 // How long the node has been starting, so a long step does not look stuck.
