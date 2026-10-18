@@ -59,8 +59,18 @@ function trimFrac(frac: string, min: number): string {
   return f;
 }
 
+// Qt's "Mask values". Only the main window turns it on: the approval
+// window must always show the exact amounts it asks the user to approve.
+let masked = false;
+const MASK = "••••";
+
+export function setMasked(on: boolean): void {
+  masked = on;
+}
+
 /** Plain text, e.g. "1 234.5 B3". */
 export function formatAmount(value: string, minDecimals = 2): string {
+  if (masked) return `${MASK} B3`;
   const p = parts(value);
   if (!p) return "—";
   const frac = trimFrac(p.frac, minDecimals);
@@ -72,18 +82,24 @@ export function formatAmount(value: string, minDecimals = 2): string {
 export function amountNode(value: string, extra = "", minDecimals = 2): HTMLSpanElement {
   const span = document.createElement("span");
   span.className = ["amt", extra].filter(Boolean).join(" ");
-  const p = parts(value);
-  if (!p) {
-    span.classList.add("muted");
-    span.textContent = "—";
-    return span;
-  }
   const add = (cls: string, text: string) => {
     const part = document.createElement("span");
     part.className = cls;
     part.textContent = text;
     span.append(part);
   };
+  if (masked) {
+    add("amt-int", MASK);
+    add("amt-unit", "B3");
+    span.setAttribute("aria-label", "Amount hidden");
+    return span;
+  }
+  const p = parts(value);
+  if (!p) {
+    span.classList.add("muted");
+    span.textContent = "—";
+    return span;
+  }
   if (p.neg) add("amt-sign", "−");
   add("amt-int", groupInt(p.int));
   const frac = trimFrac(p.frac, minDecimals);

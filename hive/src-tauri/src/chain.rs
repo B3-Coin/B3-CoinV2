@@ -97,6 +97,24 @@ pub fn overview(client: &Client) -> Result<ChainOverview, RpcError> {
     Ok(parse_overview(&chain, &network, &mempool))
 }
 
+/// Bytes received and sent since b3coind started, for the traffic graph.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Totals {
+    pub received: u64,
+    pub sent: u64,
+    /// The node's clock, in milliseconds.
+    pub time_ms: u64,
+}
+
+pub fn totals(client: &Client) -> Result<Totals, RpcError> {
+    let t = client.call("getnettotals", json!([]))?;
+    Ok(Totals {
+        received: count(&t["totalbytesrecv"]),
+        sent: count(&t["totalbytessent"]),
+        time_ms: count(&t["timemillis"]),
+    })
+}
+
 pub fn details(client: &Client) -> Result<NodeDetails, RpcError> {
     let uptime = client.call("uptime", json!([]))?;
     let network = client.call("getnetworkinfo", json!([]))?;

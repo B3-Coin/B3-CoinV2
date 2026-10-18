@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { amountNode, el, formatAmount, icon, initTheme, shorten, toggleTheme, type Theme } from "../shared/ui";
+import { amountNode, el, formatAmount, icon, initTheme, setMasked, shorten, toggleTheme, type Theme } from "../shared/ui";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -149,7 +149,10 @@ function go(view: View): void {
   if (view === "send") el<HTMLInputElement>("address").focus();
   if (view === "updates") void refreshUpdates();
   if (view === "activity") void refreshActivity();
-  if (view === "network") void refreshNetwork();
+  if (view === "network") {
+    void refreshNetwork();
+    drawTraffic();
+  }
   if (view === "settings") void loadSettings();
 }
 
@@ -176,6 +179,46 @@ el("restart-node").addEventListener("click", async () => {
 });
 
 el("theme").addEventListener("click", async () => showThemeIcon(await toggleTheme()));
+
+// Qt's "Mask values": amounts on these pages show as dots until turned off.
+// Remembered on this computer only; exports and the approval window are
+// never masked.
+const MASK_KEY = "hive.mask-values";
+
+function applyMask(on: boolean): void {
+  setMasked(on);
+  const button = el("mask");
+  button.setAttribute("aria-pressed", String(on));
+  const label = on ? "Show amounts" : "Hide amounts";
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  el("mask-icon").setAttribute("href", `/icons.svg#i-${on ? "eye-off" : "eye"}`);
+}
+
+function storedMask(): boolean {
+  try {
+    return localStorage.getItem(MASK_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+applyMask(storedMask());
+el("mask").addEventListener("click", () => {
+  const on = el("mask").getAttribute("aria-pressed") !== "true";
+  try {
+    localStorage.setItem(MASK_KEY, on ? "1" : "0");
+  } catch {
+    // Not remembered; the choice still applies until B3 Hive closes.
+  }
+  applyMask(on);
+  if (!el("detail-backdrop").hidden) closeDetails();
+  if (wasReady) {
+    void refreshWallet();
+    void refreshRecent();
+    if (current === "activity") void refreshActivity();
+  }
+});
 
 // ---- node status -----------------------------------------------------------
 
@@ -947,11 +990,66 @@ const refreshNetwork = single(async () => {
   }
 });
 
+// ---- traffic graph ---------------------------------------------------------
+// Sampled every REFRESH_MS while the node runs, so the graph has history
+// when the page opens, as Qt's does. Rates are per second between samples.
+
+type Totals = { received: number; sent: number; time_ms: number };
+type Rate = { in: number; out: number };
+
+const TRAFFIC_SAMPLES = 120; // 10 minutes at 5 seconds
+const rates: Rate[] = [];
+let lastTotals: Totals | null = null;
+
+const sampleTraffic = single(async () => {
+  try {
+    const t = await invoke<Totals>("network_totals");
+    const prev = lastTotals;
+    lastTotals = t;
+    // A restarted node starts its counters again.
+    if (!prev || t.time_ms <= prev.time_ms || t.received < prev.received || t.sent < prev.sent) return;
+    const seconds = (t.time_ms - prev.time_ms) / 1000;
+    rates.push({ in: (t.received - prev.received) / seconds, out: (t.sent - prev.sent) / seconds });
+    if (rates.length > TRAFFIC_SAMPLES) rates.shift();
+    if (current === "network") drawTraffic();
+  } catch {
+    lastTotals = null;
+  }
+});
+
+function svgNode(tag: string, attrs: Record<string, string>): SVGElement {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  return node;
+}
+
+function drawTraffic(): void {
+  const graph = el("traffic-graph");
+  const [width, height] = [600, 160];
+  const peak = Math.max(1, ...rates.map((r) => Math.max(r.in, r.out)));
+  const grid = [0.25, 0.5, 0.75].map((f) =>
+    svgNode("line", { class: "grid", x1: "0", x2: String(width), y1: String(height * f), y2: String(height * f) }),
+  );
+  const line = (pick: (r: Rate) => number, cls: string) => {
+    // Newest sample at the right edge.
+    const step = width / (TRAFFIC_SAMPLES - 1);
+    const start = width - (rates.length - 1) * step;
+    const points = rates.map((r, i) => `${(start + i * step).toFixed(1)},${(height - 2 - (pick(r) / peak) * (height - 6)).toFixed(1)}`);
+    return svgNode("polyline", { class: `line ${cls}`, points: points.join(" ") });
+  };
+  graph.replaceChildren(...grid, ...(rates.length > 1 ? [line((r) => r.in, "line-in"), line((r) => r.out, "line-out")] : []));
+  const last = rates[rates.length - 1];
+  el("traffic-rates").textContent = last ? `${bytes(last.in)}/s in, ${bytes(last.out)}/s out` : "Measuring…";
+  el("traffic-scale").textContent = rates.length ? `Top of graph ${bytes(peak)}/s · last 10 minutes` : "";
+}
+
 // The node's status changes only with a new block; the sync figures and the
 // peer list move in between.
 const REFRESH_MS = 5000;
 setInterval(() => {
-  if (!wasReady || document.hidden) return;
+  if (!wasReady) return;
+  void sampleTraffic();
+  if (document.hidden) return;
   // The wallet too: its lock and staking state change between blocks.
   if (current === "home") {
     void refreshOverview();

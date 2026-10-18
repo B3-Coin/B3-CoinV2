@@ -21,6 +21,7 @@
     "allow-update-check",
     "allow-update-download",
     "allow-node-info",
+    "allow-network-totals",
     "allow-wallet-history",
     "allow-wallet-transaction",
     "allow-wallet-export-csv",

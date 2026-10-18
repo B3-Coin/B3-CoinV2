@@ -22,6 +22,7 @@ fn main() {
             "update_check",
             "update_download",
             "node_info",
+            "network_totals",
             "wallet_history",
             "wallet_transaction",
             "wallet_export_csv",

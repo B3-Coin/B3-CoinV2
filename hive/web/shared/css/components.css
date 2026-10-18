@@ -1042,6 +1042,17 @@ input.select-sm, .input.select-sm { min-height: var(--min-target-sm); }
 /* Long hashes and addresses break anywhere rather than overflow. */
 .wrap-any { overflow-wrap: anywhere; word-break: break-all; }
 
+/* Network's traffic graph (Qt's node window Network Traffic tab). */
+.traffic { display: block; width: 100%; height: 160px; background: var(--bg-subtle); border-radius: var(--radius-sm); }
+.traffic .grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.traffic .line { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.traffic .line-in { stroke: var(--success); }
+.traffic .line-out { stroke: var(--accent); }
+.traffic-legend { gap: var(--space-4); }
+.swatch { width: 12px; height: 3px; border-radius: 2px; display: inline-block; margin-right: var(--space-1); }
+.swatch-in { background: var(--success); }
+.swatch-out { background: var(--accent); }
+
 /* Table rows that open details (Network's peers). */
 .tbl tr.clickable { cursor: pointer; }
 .tbl tr.clickable:hover, .tbl tr.clickable:focus-visible { background: var(--bg-subtle); }

@@ -222,6 +222,18 @@ pub struct NodeInfo {
     pub debug_log: String,
 }
 
+/// The traffic graph's sample.
+#[tauri::command]
+async fn network_totals(core: State<'_, Arc<Core>>) -> Result<chain::Totals, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let client = node.client().ok_or("The node is not ready yet.")?;
+        chain::totals(client).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 /// The Network page's Information rows and banned peers.
 #[tauri::command]
 async fn node_info(core: State<'_, Arc<Core>>) -> Result<NodeInfo, String> {
@@ -1014,6 +1026,7 @@ pub fn run() {
             update_check,
             update_download,
             node_info,
+            network_totals,
             wallet_history,
             wallet_transaction,
             wallet_export_csv,

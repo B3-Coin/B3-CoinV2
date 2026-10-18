@@ -57,6 +57,9 @@
             <span class="grow" id="node-badge-text">Starting</span>
           </div>
           <div class="rail-foot-row">
+            <button class="btn btn-ghost btn-sm btn-icon" type="button" id="mask" aria-pressed="false" aria-label="Hide amounts" title="Hide amounts">
+              <svg class="i" aria-hidden="true"><use id="mask-icon" href="/icons.svg#i-eye" /></svg>
+            </button>
             <button class="btn btn-ghost btn-sm btn-icon" type="button" id="theme" aria-label="Switch theme">
               <svg class="i" aria-hidden="true"><use id="theme-icon" href="/icons.svg#i-sun" /></svg>
             </button>
@@ -382,6 +385,20 @@
                 <div class="drow"><span class="dkey">Memory pool</span><span class="dval tnum" id="net-mempool">—</span></div>
                 <div class="drow"><span class="dkey">Data folder</span><span class="dval is-mono wrap-any" id="net-datadir">—</span></div>
                 <div class="drow"><span class="dkey">Debug log</span><span class="dval is-mono wrap-any" id="net-debuglog">—</span></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-activity" /></svg>Traffic</h2>
+                <span class="t-sm muted tnum" id="traffic-rates"></span>
+              </div>
+              <div class="card-pad">
+                <svg class="traffic" id="traffic-graph" viewBox="0 0 600 160" preserveAspectRatio="none" role="img" aria-label="Network traffic over the last 10 minutes"></svg>
+                <div class="row t-sm muted mt-2 traffic-legend">
+                  <span class="row"><span class="swatch swatch-in"></span>Received</span>
+                  <span class="row"><span class="swatch swatch-out"></span>Sent</span>
+                  <span class="tnum" id="traffic-scale"></span>
+                </div>
               </div>
             </div>
             <div class="card">
