@@ -82,7 +82,8 @@ impl Tools {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        String::from_utf8(out.stdout).unwrap()
+        // b3hive-sign.exe prints through a text-mode stdout: CRLF on Windows.
+        String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n")
     }
 
     /// A fresh release key; returns its file and x-only public key.
