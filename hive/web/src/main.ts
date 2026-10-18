@@ -7,7 +7,8 @@ type NodeStatus =
   | { phase: "starting"; message: string }
   | { phase: "ready"; chain: string; blocks: number; best_block_hash: string }
   | { phase: "stopping" }
-  | { phase: "failed"; error: string };
+  | { phase: "failed"; error: string }
+  | { phase: "setup" };
 
 type WalletOverview = { wallet: string; spendable: string; immature: string; can_fund: boolean };
 
@@ -73,6 +74,7 @@ showThemeIcon(await initTheme());
 // ---- views -----------------------------------------------------------------
 
 const VIEWS = {
+  setup: { title: "Set up B3 Hive", sub: "Get the B3 chain for your node" },
   home: { title: "Home", sub: "Your balance and your node" },
   send: { title: "Send", sub: "Pay someone in B3" },
   activity: { title: "Activity", sub: "Your wallet's transactions" },
@@ -149,6 +151,17 @@ function render(status: NodeStatus): void {
   const ready = status.phase === "ready";
   wasReady ||= ready;
   el("chain").hidden = !ready;
+  // The wizard is the only page until the node has a chain.
+  const setup = status.phase === "setup";
+  el("rail-nav").hidden = setup;
+  if (setup) {
+    el("node-banner").hidden = true;
+    badge("no-node", "Not set up");
+    go("setup");
+    void loadSetup();
+    return;
+  }
+  if (current === "setup") go("home");
   switch (status.phase) {
     case "starting":
       showBanner("info", "Starting the node", status.message);
@@ -497,6 +510,144 @@ setInterval(() => {
   if (current === "home") void refreshOverview();
   if (current === "network") void refreshNetwork();
 }, REFRESH_MS);
+
+// ---- setup wizard ----------------------------------------------------------
+
+// Mirrors SetupInfo and bootstrap::Offer / Progress in src-tauri.
+type BootstrapOffer = {
+  height: number;
+  size: number;
+  sha256: string;
+  url: string;
+  block_hash: string | null;
+  created: string | null;
+};
+type SetupInfo = {
+  datadir: string;
+  network: "main" | "regtest";
+  offers: BootstrapOffer[];
+  offers_error: string | null;
+};
+type BootstrapProgress =
+  | { phase: "downloading"; received: number; size: number }
+  | { phase: "verifying" }
+  | { phase: "unpacking"; written: number }
+  | { phase: "done"; height: number };
+
+let setupChoice: "bootstrap" | "sync" | null = null;
+let setupOffer: BootstrapOffer | null = null;
+let setupLoaded = false;
+
+function setupResult(tone: "info" | "danger", text: string): void {
+  const box = el("setup-result");
+  box.hidden = !text;
+  box.className = `banner banner-${tone}`;
+  box.textContent = text;
+}
+
+function choose(choice: "bootstrap" | "sync"): void {
+  setupChoice = choice;
+  el("choose-bootstrap").setAttribute("aria-pressed", String(choice === "bootstrap"));
+  el("choose-sync").setAttribute("aria-pressed", String(choice === "sync"));
+  const go = el<HTMLButtonElement>("setup-go");
+  go.disabled = false;
+  go.textContent = choice === "bootstrap" ? "Download and install" : "Start syncing";
+}
+
+el("choose-bootstrap").addEventListener("click", () => choose("bootstrap"));
+el("choose-sync").addEventListener("click", () => choose("sync"));
+
+async function loadSetup(): Promise<void> {
+  if (setupLoaded) return;
+  setupLoaded = true;
+  try {
+    const info = await invoke<SetupInfo>("setup_info");
+    el("setup-datadir").textContent = info.datadir;
+    setupOffer = info.network === "main" ? (info.offers[0] ?? null) : null;
+    const summary = el("bootstrap-summary");
+    if (setupOffer) {
+      const date = setupOffer.created ? `, made ${dateTime(Date.parse(setupOffer.created) / 1000)}` : "";
+      summary.textContent = `Chain up to block ${count(setupOffer.height)}, ${bytes(setupOffer.size)} download${date}.`;
+      el<HTMLButtonElement>("choose-bootstrap").disabled = false;
+    } else if (info.network !== "main") {
+      summary.textContent = "Bootstraps hold the mainnet chain; this node runs regtest.";
+    } else {
+      summary.textContent = info.offers_error ?? "The explorer offers no bootstrap right now.";
+    }
+  } catch (e) {
+    setupLoaded = false;
+    setupResult("danger", String(e));
+  }
+}
+
+function showSetupProgress(p: BootstrapProgress): void {
+  el("setup-choices").hidden = true;
+  el("setup-progress").hidden = false;
+  const size = setupOffer?.size ?? 0;
+  let phase = "";
+  let detail = "";
+  let width = 0;
+  switch (p.phase) {
+    case "downloading":
+      phase = "Downloading";
+      detail = `${bytes(p.received)} of ${bytes(p.size)}`;
+      width = p.size ? p.received / p.size : 0;
+      break;
+    case "verifying":
+      phase = "Checking";
+      detail = "Comparing the download with the explorer's SHA-256.";
+      width = 1;
+      break;
+    case "unpacking":
+      phase = "Unpacking";
+      detail = `${bytes(p.written)} unpacked`;
+      // Archives unpack to about 1.5 times their size.
+      width = size ? Math.min(1, p.written / (size * 1.5)) : 0;
+      break;
+    case "done":
+      phase = "Installed";
+      detail = `Chain up to block ${count(p.height)} installed. Starting the node…`;
+      width = 1;
+      break;
+  }
+  el("setup-phase").textContent = phase;
+  el("setup-detail").textContent = detail;
+  el("setup-bar").style.width = `${width * 100}%`;
+  el<HTMLButtonElement>("setup-cancel").disabled = p.phase === "done";
+}
+
+el("setup-go").addEventListener("click", async () => {
+  const go = el<HTMLButtonElement>("setup-go");
+  go.disabled = true;
+  setupResult("info", "");
+  try {
+    if (setupChoice === "bootstrap" && setupOffer) {
+      showSetupProgress({ phase: "downloading", received: 0, size: setupOffer.size });
+      await invoke("setup_bootstrap", { height: setupOffer.height });
+    } else if (setupChoice === "sync") {
+      await invoke("setup_sync");
+    }
+  } catch (e) {
+    el("setup-choices").hidden = false;
+    el("setup-progress").hidden = true;
+    setupResult("danger", String(e));
+    go.disabled = false;
+  }
+});
+
+el("setup-cancel").addEventListener("click", () => {
+  el<HTMLButtonElement>("setup-cancel").disabled = true;
+  void invoke("setup_cancel");
+});
+
+await listen<BootstrapProgress>("bootstrap-progress", (event) => showSetupProgress(event.payload));
+await listen<string>("bootstrap-failed", (event) => {
+  el("setup-choices").hidden = false;
+  el("setup-progress").hidden = true;
+  el<HTMLButtonElement>("setup-go").disabled = setupChoice === null;
+  el<HTMLButtonElement>("setup-cancel").disabled = false;
+  setupResult("danger", `${event.payload} Nothing was installed; you can try again or sync from the network.`);
+});
 
 // ---- send ------------------------------------------------------------------
 

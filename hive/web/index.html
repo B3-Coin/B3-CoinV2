@@ -13,7 +13,7 @@
           <svg class="i-lg" aria-hidden="true"><use href="/icons.svg#i-hex" /></svg>
           <span class="brand-text">B3 Hive</span>
         </div>
-        <nav class="rail-nav" aria-label="Main">
+        <nav class="rail-nav" id="rail-nav" aria-label="Main">
           <div class="nav-group">
             <button class="nav-item" type="button" data-view="home" aria-current="page">
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-home" /></svg>
@@ -67,6 +67,62 @@
             <p class="page-sub" id="page-sub">Your balance and your node</p>
           </div>
         </header>
+
+        <main class="view view--flow" id="view-setup" hidden>
+          <div class="stack">
+            <p class="flow-sub">
+              This data folder has no B3 chain yet. Choose how your node gets it. Your wallets and
+              settings in the folder are not touched either way.
+            </p>
+            <div class="card">
+              <div class="card-pad details">
+                <div class="drow"><span class="dkey">Data folder</span><span class="dval is-mono" id="setup-datadir"></span></div>
+              </div>
+            </div>
+
+            <div class="stack" id="setup-choices">
+              <button class="choice" type="button" id="choose-bootstrap" aria-pressed="false" disabled>
+                <span class="choice-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg></span>
+                <span class="choice-body">
+                  <span class="row"><strong>Download a bootstrap</strong><span class="badge badge-accent">Faster</span></span>
+                  <span class="help" id="bootstrap-summary">Reading the explorer's list…</span>
+                  <span class="help">
+                    A copy of the chain from explorer.b3hive.io, checked against the SHA-256 the
+                    explorer publishes for it. You trust the explorer for this copy; your node
+                    checks every block that comes after it.
+                  </span>
+                </span>
+              </button>
+              <button class="choice" type="button" id="choose-sync" aria-pressed="false">
+                <span class="choice-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg></span>
+                <span class="choice-body">
+                  <strong>Sync from the network</strong>
+                  <span class="help">
+                    Your node downloads and checks every block from its peers. Trusts no one, but
+                    takes much longer.
+                  </span>
+                </span>
+              </button>
+              <button class="btn btn-primary btn-block" type="button" id="setup-go" disabled>Choose an option</button>
+            </div>
+
+            <div class="card" id="setup-progress" hidden>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg>Installing the bootstrap</h2>
+                <span class="badge badge-info" id="setup-phase">Downloading</span>
+              </div>
+              <div class="card-pad">
+                <div class="progress"><div class="progress-bar" id="setup-bar"></div></div>
+                <p class="t-sm muted mt-2 tnum" id="setup-detail"></p>
+              </div>
+              <div class="card-foot">
+                <button class="btn btn-secondary" type="button" id="setup-cancel">Cancel</button>
+              </div>
+            </div>
+
+            <div class="banner" id="setup-result" role="status" hidden></div>
+          </div>
+        </main>
 
         <main class="view" id="view-home">
           <div class="stack">

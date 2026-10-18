@@ -48,6 +48,35 @@ pub struct Core {
     /// The theme picked in the main window, so the other windows open in it.
     theme: Mutex<Option<Theme>>,
     updates: Updates,
+    setup: Setup,
+}
+
+/// The setup wizard's state: the explorer's last offers, and the bootstrap
+/// install while one runs.
+#[derive(Default)]
+struct Setup {
+    offers: Mutex<Vec<bootstrap::Offer>>,
+    cancel: Arc<AtomicBool>,
+    install: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Setup {
+    fn installing(&self) -> bool {
+        self.install
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+    }
+
+    /// Cancels a running install and waits for it, so the app never exits
+    /// halfway through moving the chain folders into place.
+    fn stop(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.install.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl Core {
@@ -244,6 +273,139 @@ fn ui_theme(core: State<'_, Arc<Core>>) -> Option<Theme> {
 fn set_ui_theme(window: Window, core: State<'_, Arc<Core>>, theme: Theme) -> Result<(), String> {
     require_window(&window, MAIN)?;
     *core.theme.lock().unwrap() = Some(theme);
+    Ok(())
+}
+
+// ---- setup wizard (main window) ---------------------------------------------
+
+#[derive(Serialize)]
+pub struct SetupInfo {
+    /// Where the chain will live.
+    pub datadir: String,
+    pub network: Network,
+    /// The explorer's offers, newest first; empty when it could not be read.
+    pub offers: Vec<bootstrap::Offer>,
+    /// Why the offers are missing, for the page to show.
+    pub offers_error: Option<String>,
+}
+
+fn require_setup(core: &Core) -> Result<(), String> {
+    if !matches!(core.node().status(), NodeStatus::Setup) {
+        return Err("The node is already set up.".into());
+    }
+    if core.setup.installing() {
+        return Err("A bootstrap is being installed.".into());
+    }
+    Ok(())
+}
+
+/// The data folder and the explorer's current bootstraps.
+#[tauri::command]
+async fn setup_info(window: Window, core: State<'_, Arc<Core>>) -> Result<SetupInfo, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let (offers, offers_error) = match bootstrap::Explorer::new().offers() {
+            Ok(offers) => (offers, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        *core.setup.offers.lock().unwrap() = offers.clone();
+        Ok(SetupInfo {
+            datadir: core.config.datadir.display().to_string(),
+            network: core.config.network,
+            offers,
+            offers_error,
+        })
+    })
+    .await
+}
+
+/// Installs the explorer's bootstrap at `height`, then starts the node.
+/// The page names only the height; the address, size and SHA-256 come from
+/// the manifest the core itself read. Progress goes to the main window as
+/// bootstrap-progress events, and a failure as bootstrap-failed.
+#[tauri::command]
+fn setup_bootstrap(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    height: u64,
+) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    require_setup(&core)?;
+    if core.config.network != Network::Main {
+        return Err("Bootstraps hold the mainnet chain; this node runs regtest.".into());
+    }
+    let offer = core
+        .setup
+        .offers
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|o| o.height == height)
+        .cloned()
+        .ok_or("That bootstrap is no longer offered. Reload the list.")?;
+    core.setup.cancel.store(false, Ordering::SeqCst);
+    let worker = Arc::clone(&core);
+    let handle = thread::spawn(move || {
+        let chain_dir = worker.config.network.chain_dir(&worker.config.datadir);
+        let mut last = None;
+        let mut progress = |p: bootstrap::Progress| {
+            // At most one event per 1% of the archive or per phase.
+            let step = (offer.size / 100).max(1);
+            let key = match &p {
+                bootstrap::Progress::Downloading { received, .. } => (0, received / step),
+                bootstrap::Progress::Verifying => (1, 0),
+                bootstrap::Progress::Unpacking { written } => (2, written / (step * 2)),
+                bootstrap::Progress::Done { .. } => (3, 0),
+            };
+            if last != Some(key) {
+                last = Some(key);
+                let _ = app.emit_to(MAIN, "bootstrap-progress", &p);
+            }
+        };
+        let result = bootstrap::Explorer::new()
+            .open(&offer)
+            .and_then(|mut source| {
+                bootstrap::install(
+                    &mut source,
+                    &offer,
+                    &chain_dir,
+                    &mut progress,
+                    &worker.setup.cancel,
+                )
+            });
+        match result {
+            Ok(()) if !worker.exiting.load(Ordering::SeqCst) => {
+                *worker.node.lock().unwrap() = start_node(&app, &worker.config);
+            }
+            Ok(()) => {}
+            Err(error) => {
+                let _ = app.emit_to(MAIN, "bootstrap-failed", error);
+            }
+        }
+    });
+    *core.setup.install.lock().unwrap() = Some(handle);
+    Ok(())
+}
+
+#[tauri::command]
+fn setup_cancel(window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    core.setup.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Starts the node to sync the chain from its peers.
+#[tauri::command]
+fn setup_sync(app: AppHandle, window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    require_setup(&core)?;
+    let mut current = core.node.lock().unwrap();
+    if core.exiting.load(Ordering::SeqCst) {
+        return Err("B3 Hive is closing.".into());
+    }
+    *current = start_node(&app, &core.config);
     Ok(())
 }
 
@@ -631,7 +793,18 @@ pub fn run() {
         .setup(|app| {
             let config = node_config(app)?;
             let updates = updates(app)?;
-            let node = start_node(app.handle(), &config);
+            // A mainnet folder without a chain waits for the setup wizard.
+            // B3_HIVE_SETUP=1 shows the wizard on regtest too, for development.
+            let fresh = bootstrap::is_fresh(&config.network.chain_dir(&config.datadir));
+            let wizard = match config.network {
+                Network::Main => fresh,
+                Network::Regtest => fresh && std::env::var("B3_HIVE_SETUP").as_deref() == Ok("1"),
+            };
+            let node = if wizard {
+                Node::waiting_for_setup(&config)
+            } else {
+                start_node(app.handle(), &config)
+            };
             app.manage(Arc::new(Core {
                 node: Mutex::new(node),
                 config,
@@ -639,6 +812,7 @@ pub fn run() {
                 drafts: Mutex::new(DraftStore::default()),
                 theme: Mutex::new(None),
                 updates,
+                setup: Setup::default(),
             }));
             Ok(())
         })
@@ -675,6 +849,10 @@ pub fn run() {
             update_status,
             update_check,
             update_download,
+            setup_info,
+            setup_bootstrap,
+            setup_cancel,
+            setup_sync,
             approval_pending,
             approval_decide,
             console_exec,
@@ -686,8 +864,9 @@ pub fn run() {
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 if let Some(core) = app.try_state::<Arc<Core>>() {
-                    let node = core.node.lock().unwrap();
                     core.exiting.store(true, Ordering::SeqCst);
+                    core.setup.stop();
+                    let node = core.node.lock().unwrap();
                     node.stop(STOP_TIMEOUT);
                     core.updates.stop();
                 }

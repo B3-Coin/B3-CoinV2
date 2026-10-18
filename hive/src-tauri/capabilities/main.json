@@ -19,6 +19,10 @@
     "allow-set-ui-theme",
     "allow-update-status",
     "allow-update-check",
-    "allow-update-download"
+    "allow-update-download",
+    "allow-setup-info",
+    "allow-setup-bootstrap",
+    "allow-setup-cancel",
+    "allow-setup-sync"
   ]
 }
