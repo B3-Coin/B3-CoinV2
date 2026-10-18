@@ -49,6 +49,32 @@ type CancelDraft = {
   order: Order;
   remote: boolean;
 };
+// Mirror flowmesh::DepositDraft and WithdrawDraft: amounts are B3 atoms or
+// token base units.
+type DepositDraft = {
+  chain: string;
+  wallet: string;
+  market_id: string;
+  base_asset_id: string;
+  metadata: Metadata;
+  asset: "b3" | "token";
+  amount: string;
+  has_account: boolean;
+};
+type WithdrawDraft = {
+  chain: string;
+  wallet: string;
+  market_id: string;
+  base_asset_id: string;
+  metadata: Metadata;
+  asset: "b3" | "token";
+  amount: string;
+  available: string;
+  destination: string;
+  mine: boolean;
+  sequence: number;
+  remote: boolean;
+};
 // Mirrors drafts::Request in src-tauri/src/drafts.rs.
 type Request =
   | { kind: "pay"; summary: Summary }
@@ -58,7 +84,9 @@ type Request =
   | { kind: "stake"; chain: string; wallet: string; amount: string; activation_depth: number }
   | { kind: "bind_finality"; chain: string; wallet: string; rotate: boolean }
   | { kind: "trade_order"; order: OrderDraft }
-  | { kind: "trade_cancel"; cancel: CancelDraft };
+  | { kind: "trade_cancel"; cancel: CancelDraft }
+  | { kind: "trade_deposit"; deposit: DepositDraft }
+  | { kind: "trade_withdraw"; withdraw: WithdrawDraft };
 type DraftView = {
   id: string;
   request: Request;
@@ -282,6 +310,59 @@ function showTrade(r: Extract<Request, { kind: "trade_order" | "trade_cancel" }>
     "The wallet is locked. It unlocks only to sign this request and locks again straight after.";
 }
 
+// A deposit into a market's vault, or a request to pay trading balance out.
+function showFunding(r: Extract<Request, { kind: "trade_deposit" | "trade_withdraw" }>): void {
+  const d = r.kind === "trade_deposit" ? r.deposit : r.withdraw;
+  const token = tokenName(d.metadata, d.base_asset_id);
+  const value = (atoms: string): string | null =>
+    d.asset === "b3" ? B3(atoms) : d.metadata.decimals === null ? null : `${formatQuantity(BigInt(atoms), d.metadata.decimals)} ${token}`;
+  el("from").textContent = `From ${walletName(d.wallet)} on ${d.chain} · ${token} / B3${d.metadata.test_only ? " · test asset" : ""}`;
+  const amount = value(d.amount);
+  if (amount === null) {
+    el("title").textContent = "This request cannot be shown";
+    el("action-text").textContent = "The token's decimals are not verified. Reject it.";
+    el("action-rows").replaceChildren();
+    el("approve").hidden = true;
+    return;
+  }
+  const asset = d.asset === "b3" ? row("Asset", "B3 (native)", undefined, false) : row("Asset", d.base_asset_id, undefined, false);
+  const market = [
+    row("Market", shorten(d.market_id, 10, 6), undefined, false),
+    row("Network", d.chain, undefined, false),
+  ];
+  if (r.kind === "trade_deposit") {
+    const dep = r.deposit;
+    el("title").textContent = `Deposit ${amount} for trading?`;
+    el("action-text").textContent =
+      "This signs and broadcasts a B3 transaction that moves the amount into the market's keyless vault, for your trading account. " +
+      "It counts only after 31 confirmations and once the market admits it; the Trade page asks for that. " +
+      "If it is slow, do not deposit again: the same deposit can be submitted for admission again. " +
+      "The node picks the network fee when it builds the transaction; it is shown afterwards." +
+      (dep.has_account ? "" : " This also creates the wallet's trading account key. Back up the wallet afterwards.");
+    el("action-rows").replaceChildren(row("Deposit", amount), asset, ...market);
+    el("approve").textContent = "Deposit";
+  } else {
+    const w = r.withdraw;
+    el("title").textContent = `Request a withdrawal of ${amount}?`;
+    el("action-text").textContent =
+      "This signs a withdrawal request and sends it to the market. It is a request, not a payout: once certified, the amount leaves your trading balance, " +
+      "and a later vault transaction on the B3 chain pays it to the address after a checkpoint. That can take a while. It has no network fee of its own." +
+      (w.mine ? "" : " The address is not one of this wallet's; check it carefully, a payout cannot be taken back.");
+    el("action-rows").replaceChildren(
+      row("Withdraw", amount),
+      row("Available", value(w.available) ?? w.available),
+      row("Pay to", w.mine ? "This wallet" : "Another wallet", w.destination, false),
+      asset,
+      ...market,
+      row("Account sequence", String(w.sequence), undefined, false),
+      row("Verified by", w.remote ? "Trading endpoint" : "This node's engine", undefined, false),
+    );
+    el("approve").textContent = "Request withdrawal";
+  }
+  el("pass-help").textContent =
+    "The wallet is locked. It unlocks only to sign this request and locks again straight after.";
+}
+
 function show(draft: DraftView | null): void {
   el("empty").hidden = draft !== null;
   el("draft").hidden = draft === null;
@@ -296,6 +377,7 @@ function show(draft: DraftView | null): void {
   else if (r.kind === "release") showRelease(r.summary);
   else if (r.kind === "sign_psbt" || r.kind === "send_psbt") showPsbt(r.kind, r.summary);
   else if (r.kind === "trade_order" || r.kind === "trade_cancel") showTrade(r);
+  else if (r.kind === "trade_deposit" || r.kind === "trade_withdraw") showFunding(r);
   else showAction(r);
   el("pass-field").hidden = !draft.locked;
   el<HTMLInputElement>("pass").value = "";

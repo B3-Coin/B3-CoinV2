@@ -1,6 +1,6 @@
 //! The Trade page's FlowMesh calls: markets, their verified book, trades and
-//! clearings, this wallet's trading account, and the orders and
-//! cancellations it approves. Every FlowMesh call goes through here, so a protocol change touches this adapter
+//! clearings, this wallet's trading account, and the orders, cancellations,
+//! deposits and withdrawals it approves. Every FlowMesh call goes through here, so a protocol change touches this adapter
 //! and its tests rather than the page.
 //!
 //! Amounts stay exact: prices in B3 atoms per base unit, quantities in base
@@ -546,7 +546,7 @@ pub struct Receipt {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Request {
     pub action_id: String,
-    /// order, cancel or other (deposits and withdrawals)
+    /// order, cancel, withdraw, deposit or other
     pub kind: String,
     pub side: Option<String>,
     pub points: Vec<Point>,
@@ -631,7 +631,9 @@ fn tradable(view: &MarketView) -> Result<(), String> {
 fn classify(list: &mut [Request], next_sequence: u64, now_ms: u64, acknowledged: &[String]) {
     for r in list {
         r.settled = r.sequence.is_some_and(|s| s < next_sequence);
-        let open = r.kind != "other" && !r.settled && !r.certified && r.state != "rejected";
+        // Every sequenced request competes for the account's sequence;
+        // deposits are unsequenced and never block.
+        let open = r.sequence.is_some() && !r.settled && !r.certified && r.state != "rejected";
         r.uncertain = open
             && (r.state == "unknown" || now_ms.saturating_sub(r.submitted_ms) >= PENDING_ACK_MS);
         r.pending = open && !acknowledged.contains(&r.action_id);
@@ -991,10 +993,15 @@ fn request(a: &Value) -> Request {
         })
         .unwrap_or_default();
     let side = a["canonical_side"].as_str().map(str::to_owned);
-    let kind = match (&side, points.is_empty()) {
-        (Some(_), false) => "order",
-        (Some(_), true) => "cancel",
-        (None, _) => "other",
+    // ActionType in src/flowmesh/batch.h.
+    let kind = match (a["action_type"].as_u64(), &side, points.is_empty()) {
+        (Some(0 | 1), _, _) => "order",
+        (Some(2 | 3), _, _) => "cancel",
+        (Some(4), _, _) => "withdraw",
+        (Some(5), _, _) => "deposit",
+        (None, Some(_), false) => "order",
+        (None, Some(_), true) => "cancel",
+        _ => "other",
     };
     Request {
         action_id: text(&a["action_id"]),
@@ -1013,6 +1020,327 @@ fn request(a: &Value) -> Request {
         pending: false,
         uncertain: false,
     }
+}
+
+// ---- deposits and withdrawals ---------------------------------------------------
+
+/// A deposit counts once its creation block is this deep: 30 blocks, so 31
+/// confirmations (FLOWMESH_ANCHOR_DEPTH + 1).
+pub const DEPOSIT_CONFIRMATIONS: i64 = 31;
+const B3_DECIMALS: usize = 9;
+/// The newest deposits the page lists.
+const DEPOSITS_SHOWN: usize = 20;
+
+/// B3 atoms as the exact decimal string the node's amount arguments take.
+fn b3_decimal(atoms: u64) -> String {
+    format!(
+        "{}.{:0width$}",
+        atoms / 1_000_000_000,
+        atoms % 1_000_000_000,
+        width = B3_DECIMALS
+    )
+}
+
+/// A decimal B3 amount as atoms, exactly, or None when it is not one.
+fn decimal_atoms(text: &str) -> Option<u64> {
+    let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
+    if whole.is_empty() || frac.len() > B3_DECIMALS {
+        return None;
+    }
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(whole) || !digits(frac) {
+        return None;
+    }
+    let frac = format!("{frac:0<width$}", width = B3_DECIMALS);
+    whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(frac.parse().ok()?)
+}
+
+/// The asset of a deposit or withdrawal: native B3 or the market's token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Asset {
+    B3,
+    Token,
+}
+
+/// Moving B3 or the token from this wallet into the market's keyless vault,
+/// for this wallet's trading account. The node builds and signs the
+/// transaction only once it is approved.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DepositDraft {
+    pub chain: String,
+    pub wallet: String,
+    pub market_id: String,
+    pub base_asset_id: String,
+    pub metadata: Metadata,
+    pub asset: Asset,
+    /// B3 atoms or token base units.
+    pub amount: String,
+    /// This wallet already has a trading account in the market.
+    pub has_account: bool,
+}
+
+/// A signed request to pay part of the trading balance out to an address.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WithdrawDraft {
+    pub chain: String,
+    pub wallet: String,
+    pub market_id: String,
+    pub base_asset_id: String,
+    pub metadata: Metadata,
+    pub asset: Asset,
+    /// B3 atoms or token base units.
+    pub amount: String,
+    /// The free trading balance of that asset.
+    pub available: String,
+    pub destination: String,
+    /// The destination is this wallet's own address.
+    pub mine: bool,
+    pub sequence: u64,
+    pub remote: bool,
+}
+
+/// What an approved deposit did on the B3 chain.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Deposited {
+    pub txid: String,
+    pub vout: u64,
+    /// B3 network fee, decimal.
+    pub fee: String,
+}
+
+/// One of this wallet's vault deposits, from its own transaction history.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Deposit {
+    pub txid: String,
+    pub vout: u64,
+    pub confirmations: i64,
+    pub time: u64,
+    /// Its vault output is spent: the market swept it in, so it was admitted.
+    pub swept: bool,
+}
+
+fn positive(text: &str, what: &str) -> Result<u64, String> {
+    let v = integer(text, what)?;
+    if v == 0 {
+        return Err(format!("The {what} must be above zero."));
+    }
+    Ok(v)
+}
+
+pub fn prepare_deposit(
+    client: &Client,
+    chain: &str,
+    wallet: &str,
+    market_id: &str,
+    asset: Asset,
+    amount: &str,
+) -> Result<DepositDraft, String> {
+    let amount = positive(amount, "amount")?;
+    let view = fresh(client, wallet, market_id)?;
+    tradable(&view)?;
+    let metadata = view
+        .metadata
+        .clone()
+        .filter(|m| asset == Asset::B3 || m.decimals.is_some())
+        .ok_or("The token's decimals are not verified, so the amount cannot be checked.")?;
+    if asset == Asset::B3 {
+        let balances = client
+            .call_wallet(wallet, "getbalances", json!([]))
+            .map_err(|e| e.to_string())?;
+        let trusted = crate::wallet::decimal(&balances["mine"]["trusted"])
+            .ok()
+            .and_then(|d| decimal_atoms(&d))
+            .unwrap_or(0);
+        if amount > trusted {
+            return Err("The deposit is more than this wallet's spendable B3; keep some for the network fee too.".into());
+        }
+    }
+    Ok(DepositDraft {
+        chain: chain.to_owned(),
+        wallet: wallet.to_owned(),
+        market_id: market_id.to_owned(),
+        base_asset_id: view.base_asset_id,
+        metadata,
+        asset,
+        amount: amount.to_string(),
+        has_account: view.account.is_some(),
+    })
+}
+
+/// Creates, signs and broadcasts the approved deposit.
+pub fn deposit(client: &Client, draft: &DepositDraft) -> Result<Deposited, String> {
+    let amount = positive(&draft.amount, "amount")?;
+    let (asset, amount) = match draft.asset {
+        Asset::B3 => (json!("B3"), json!(b3_decimal(amount))),
+        Asset::Token => (json!(draft.base_asset_id), json!(amount)),
+    };
+    let r = client
+        .call_wallet(
+            &draft.wallet,
+            "flowmeshdeposit",
+            json!([draft.base_asset_id, asset, amount]),
+        )
+        .map_err(|e| e.to_string())?;
+    if r["broadcast"].as_bool() != Some(true) {
+        return Err("The node did not broadcast the deposit.".into());
+    }
+    Ok(Deposited {
+        txid: text(&r["deposit_txid"]),
+        vout: r["deposit_vout"].as_u64().unwrap_or(0),
+        fee: crate::wallet::decimal(&r["network_fee"]).unwrap_or_default(),
+    })
+}
+
+/// This wallet's vault deposits, newest first. They are found by the tag
+/// the node gives the transactions it creates for flowmeshdeposit; the
+/// market they belong to is checked when admission is requested.
+pub fn deposits(client: &Client, wallet: &str) -> Result<Vec<Deposit>, RpcError> {
+    let list = client.call_wallet(wallet, "listtransactions", json!(["*", 1000, 0, true]))?;
+    let mut out: Vec<Deposit> = list
+        .as_array()
+        .map(|all| {
+            all.iter()
+                .filter(|t| t["b3"] == "flowmesh-deposit" && t["category"] == "send")
+                .map(|t| Deposit {
+                    txid: text(&t["txid"]),
+                    vout: t["vout"].as_u64().unwrap_or(0),
+                    confirmations: t["confirmations"].as_i64().unwrap_or(0),
+                    time: t["time"].as_u64().unwrap_or(0),
+                    swept: false,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by_key(|d| std::cmp::Reverse(d.time));
+    out.dedup_by(|a, b| a.txid == b.txid && a.vout == b.vout);
+    out.truncate(DEPOSITS_SHOWN);
+    for d in out.iter_mut().filter(|d| d.confirmations > 0) {
+        d.swept = client
+            .call("gettxout", json!([d.txid, d.vout, true]))?
+            .is_null();
+    }
+    Ok(out)
+}
+
+/// Asks the market to admit a confirmed deposit. Nothing is signed and no
+/// coins move: the receipt says whether it was queued, refused or included.
+pub fn admit(
+    client: &Client,
+    wallet: &str,
+    market_id: &str,
+    txid: &str,
+    vout: u64,
+) -> Result<Receipt, String> {
+    if !valid_id(market_id) || !valid_id(txid) {
+        return Err("That is not a market id and transaction id.".into());
+    }
+    let r = client
+        .call_wallet(
+            wallet,
+            "submitflowmeshdeposit",
+            json!([market_id, txid, vout]),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(receipt(&r))
+}
+
+/// A withdrawal as the Trade page asks for it; an empty destination is a new
+/// address of this wallet.
+pub struct Withdrawal<'a> {
+    pub asset: Asset,
+    pub amount: &'a str,
+    pub destination: &'a str,
+}
+
+pub fn prepare_withdraw(
+    client: &Client,
+    chain: &str,
+    wallet: &str,
+    market_id: &str,
+    wanted: &Withdrawal,
+    acknowledged: &[String],
+) -> Result<WithdrawDraft, String> {
+    let Withdrawal {
+        asset,
+        amount,
+        destination,
+    } = *wanted;
+    let amount = positive(amount, "amount")?;
+    let view = fresh(client, wallet, market_id)?;
+    tradable(&view)?;
+    let metadata = view
+        .metadata
+        .clone()
+        .filter(|m| asset == Asset::B3 || m.decimals.is_some())
+        .ok_or("The token's decimals are not verified, so the amount cannot be checked.")?;
+    let account = view
+        .account
+        .clone()
+        .ok_or("This wallet has no trading account in this market.")?;
+    let available: u64 = match asset {
+        Asset::B3 => account.b3_available.parse().unwrap_or(0),
+        Asset::Token => account.base_available.parse().unwrap_or(0),
+    };
+    if amount > available {
+        return Err("That is more than the trading balance has available. What open orders hold is not available; cancel them first.".into());
+    }
+    let destination = if destination.trim().is_empty() {
+        let address = client
+            .call_wallet(wallet, "getnewaddress", json!(["FlowMesh withdrawal"]))
+            .map_err(|e| e.to_string())?;
+        text(&address)
+    } else {
+        destination.trim().to_owned()
+    };
+    let info = client
+        .call_wallet(wallet, "getaddressinfo", json!([destination]))
+        .map_err(|_| "That is not a valid B3 address.".to_owned())?;
+    check_pending(
+        client,
+        wallet,
+        market_id,
+        account.next_sequence,
+        acknowledged,
+    )?;
+    Ok(WithdrawDraft {
+        chain: chain.to_owned(),
+        wallet: wallet.to_owned(),
+        market_id: market_id.to_owned(),
+        base_asset_id: view.base_asset_id,
+        metadata,
+        asset,
+        amount: amount.to_string(),
+        available: available.to_string(),
+        mine: info["ismine"].as_bool().unwrap_or(false),
+        destination,
+        sequence: account.next_sequence,
+        remote: view.verification.source == "remote_endpoint",
+    })
+}
+
+/// The exact RPC call an approved withdrawal makes.
+pub fn withdraw_call(draft: &WithdrawDraft) -> Result<(&'static str, Value), String> {
+    let amount = positive(&draft.amount, "amount")?;
+    let (asset, amount) = match draft.asset {
+        Asset::B3 => (json!("B3"), json!(b3_decimal(amount))),
+        Asset::Token => (json!(draft.base_asset_id), json!(amount)),
+    };
+    Ok((
+        "requestflowmeshwithdrawal",
+        json!([
+            draft.market_id,
+            asset,
+            amount,
+            draft.destination,
+            draft.sequence,
+            SUBMIT_WAIT_MS
+        ]),
+    ))
 }
 
 fn text(v: &Value) -> String {
@@ -1236,7 +1564,8 @@ mod tests {
             {"action_id": "a2", "canonical_side": "ask", "canonical_points": [], "sequence": 7,
                 "initial_submission_ms": 50000, "previously_certified": false,
                 "receipt": {"receipt_state": "queued", "stage": "queued", "reason": "queued"}},
-            {"action_id": "a3", "initial_submission_ms": 2000, "previously_certified": false,
+            {"action_id": "a3", "action_type": 5, "initial_submission_ms": 2000,
+                "previously_certified": false,
                 "receipt": {"receipt_state": "unknown", "stage": "unknown", "reason": ""}}
         ]})
     }
@@ -1247,7 +1576,7 @@ mod tests {
         let ids: Vec<_> = list.iter().map(|r| r.action_id.as_str()).collect();
         assert_eq!(ids, ["a2", "a3", "a1"]);
         assert_eq!(list[0].kind, "cancel");
-        assert_eq!(list[1].kind, "other");
+        assert_eq!(list[1].kind, "deposit");
         assert_eq!(list[2].kind, "order");
         let a1 = &list[2].outcome;
         assert_eq!(a1.status.as_deref(), Some("applied"));
@@ -1263,7 +1592,7 @@ mod tests {
         classify(&mut list, 7, 60000, &[]);
         let a2 = list.iter().find(|r| r.action_id == "a2").unwrap();
         assert!(a2.pending && !a2.uncertain, "queued 10 s ago");
-        // Deposits and withdrawals never block orders here.
+        // A deposit has no sequence, so it never blocks.
         assert!(!list.iter().find(|r| r.action_id == "a3").unwrap().pending);
         assert!(list.iter().find(|r| r.action_id == "a1").unwrap().settled);
         classify(&mut list, 7, 50000 + PENDING_ACK_MS, &[]);
@@ -1274,5 +1603,66 @@ mod tests {
         // Once the account moves past its sequence it has settled.
         classify(&mut list, 8, 60000, &[]);
         assert!(!list.iter().any(|r| r.pending));
+        // A withdrawal uses a sequence, so it blocks like an order.
+        let mut list = request_list(&json!({"actions": [{"action_id": "w", "action_type": 4,
+            "sequence": 8, "initial_submission_ms": 1000, "receipt": {"receipt_state": "queued"}}]}));
+        classify(&mut list, 8, 2000, &[]);
+        assert_eq!(list[0].kind, "withdraw");
+        assert!(list[0].pending);
+    }
+
+    #[test]
+    fn b3_amounts_convert_exactly() {
+        assert_eq!(b3_decimal(435_000_000), "0.435000000");
+        assert_eq!(b3_decimal(12_000_000_001), "12.000000001");
+        assert_eq!(decimal_atoms("0.435"), Some(435_000_000));
+        assert_eq!(decimal_atoms("12.000000001"), Some(12_000_000_001));
+        assert_eq!(decimal_atoms("7"), Some(7_000_000_000));
+        assert_eq!(decimal_atoms("0.0000000001"), None);
+        assert_eq!(decimal_atoms("-1"), None);
+        assert_eq!(decimal_atoms(".5"), None);
+    }
+
+    #[test]
+    fn a_withdrawal_signs_exactly_the_reviewed_amount() {
+        let draft = WithdrawDraft {
+            chain: "regtest".into(),
+            wallet: "w".into(),
+            market_id: "2a".repeat(32),
+            base_asset_id: "e3".repeat(32),
+            metadata: Metadata {
+                decimals: Some(2),
+                ticker: String::new(),
+                name: String::new(),
+                test_only: false,
+            },
+            asset: Asset::B3,
+            amount: "100000000".into(),
+            available: "435000000".into(),
+            destination: "bcrt1qexample".into(),
+            mine: true,
+            sequence: 9,
+            remote: true,
+        };
+        let (method, params) = withdraw_call(&draft).unwrap();
+        assert_eq!(method, "requestflowmeshwithdrawal");
+        assert_eq!(
+            params,
+            json!([
+                "2a".repeat(32),
+                "B3",
+                "0.100000000",
+                "bcrt1qexample",
+                9,
+                SUBMIT_WAIT_MS
+            ])
+        );
+        let token = WithdrawDraft {
+            asset: Asset::Token,
+            amount: "3".into(),
+            ..draft
+        };
+        assert_eq!(withdraw_call(&token).unwrap().1[1], json!("e3".repeat(32)));
+        assert_eq!(withdraw_call(&token).unwrap().1[2], json!(3));
     }
 }

@@ -85,6 +85,14 @@ pub enum Request {
     TradeCancel {
         cancel: crate::flowmesh::CancelDraft,
     },
+    /// Send B3 or the token into a FlowMesh market's vault (flowmeshdeposit).
+    TradeDeposit {
+        deposit: crate::flowmesh::DepositDraft,
+    },
+    /// Request a FlowMesh payout to an address.
+    TradeWithdraw {
+        withdraw: crate::flowmesh::WithdrawDraft,
+    },
 }
 
 impl Request {
@@ -97,6 +105,8 @@ impl Request {
             Request::Stake { wallet, .. } | Request::BindFinality { wallet, .. } => wallet,
             Request::TradeOrder { order } => &order.wallet,
             Request::TradeCancel { cancel } => &cancel.wallet,
+            Request::TradeDeposit { deposit } => &deposit.wallet,
+            Request::TradeWithdraw { withdraw } => &withdraw.wallet,
         }
     }
 

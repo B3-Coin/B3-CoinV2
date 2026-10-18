@@ -668,6 +668,36 @@
                   </div>
                   <p class="card-pad t-sm muted" id="tr-no-account" hidden>This wallet has no trading account in this market yet. The first deposit creates it.</p>
                   <p class="card-pad t-xs muted">FlowMesh holds this balance, not your wallet. The validators certify it, which is not the same as settled on the B3 chain.</p>
+                  <div class="card-pad stack tr-funding">
+                    <div class="tabs" role="tablist" aria-label="Move funds">
+                      <button class="tab" type="button" role="tab" id="tr-fund-in" aria-selected="true">Deposit</button>
+                      <button class="tab" type="button" role="tab" id="tr-fund-out" aria-selected="false">Withdraw</button>
+                    </div>
+                    <form class="stack" id="tr-fund-form" novalidate>
+                      <div class="field">
+                        <label for="tr-fund-asset">Asset</label>
+                        <select class="select" id="tr-fund-asset"><option value="b3">B3</option><option value="token" id="tr-fund-token">Token</option></select>
+                      </div>
+                      <div class="field">
+                        <label for="tr-fund-amount">Amount</label>
+                        <input class="input tnum" id="tr-fund-amount" inputmode="decimal" autocomplete="off" spellcheck="false" />
+                      </div>
+                      <div class="field" id="tr-fund-to-field" hidden>
+                        <label for="tr-fund-to">Pay to</label>
+                        <input class="input input-mono" id="tr-fund-to" placeholder="Empty: a new address here" autocomplete="off" spellcheck="false" />
+                      </div>
+                      <p class="t-xs muted" id="tr-fund-help"></p>
+                      <p class="t-sm tr-form-error" id="tr-fund-error" role="alert" hidden></p>
+                      <div class="banner" id="tr-fund-result" role="status" hidden></div>
+                      <button class="btn btn-secondary btn-block" type="submit" id="tr-fund-review">Review deposit</button>
+                      <p class="t-xs muted" id="tr-fund-gate" hidden></p>
+                    </form>
+                    <div class="stack" id="tr-deposits" hidden>
+                      <h3 class="t-sm">Your deposits</h3>
+                      <div class="details" id="tr-deposit-rows"></div>
+                      <p class="t-xs muted">A deposit counts once it has 31 confirmations and the market admits it. If admission is slow, ask again for the same deposit; do not deposit again.</p>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>

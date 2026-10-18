@@ -4,8 +4,9 @@
 // prices are certified clearings by microblock sequence, never invented
 // times; the book shows the node's exact levels and is not recomputed here;
 // unknown is never shown as zero; data older than 3 s is marked stale.
-// Orders and cancellations are drafted by the core, which checks them again,
-// and are signed only from the approval window: this page never signs.
+// Orders, cancellations, deposits and withdrawals are drafted by the core,
+// which checks them again, and are signed only from the approval window:
+// this page never signs.
 import { invoke } from "@tauri-apps/api/core";
 
 import { amountNode, el, isMasked, shorten } from "../shared/ui";
@@ -87,7 +88,7 @@ type Outcome = { status: string | null; text: string; fill_quantity: string | nu
 type Receipt = { action_id: string; accepted: boolean; state: string; stage: string; reason: string; outcome: Outcome };
 type TradeRequest = {
   action_id: string;
-  kind: "order" | "cancel" | "other";
+  kind: "order" | "cancel" | "withdraw" | "deposit" | "other";
   side: "bid" | "ask" | null;
   points: Point[];
   sequence: number | null;
@@ -102,8 +103,12 @@ type TradeRequest = {
   uncertain: boolean;
 };
 /** The approval window's decision on a draft (DraftResult in lib.rs). */
+type Deposit = { txid: string; vout: number; confirmations: number; time: number; swept: boolean };
+/** A deposit counts once it is this deep (flowmesh::DEPOSIT_CONFIRMATIONS). */
+const DEPOSIT_CONFIRMATIONS = 31;
 export type TradeResult =
   | { outcome: "traded"; id: string; receipt: Receipt }
+  | { outcome: "deposited"; id: string; deposit: { txid: string; vout: number; fee: string } }
   | { outcome: "rejected"; id: string }
   | { outcome: "failed"; id: string; error: string }
   | { outcome: string; id: string };
@@ -170,7 +175,13 @@ let market: Market = blank();
 /** The order form's side: bid buys the token with B3, ask sells it. */
 let side: "bid" | "ask" = "bid";
 /** Drafts this page opened, until the approval window decides them. */
-const drafts = new Map<string, "order" | "cancel">();
+const drafts = new Map<string, "order" | "cancel" | "deposit" | "withdraw">();
+/** The funding form moves funds in (deposit) or out (withdraw). */
+let funding: "in" | "out" = "in";
+let deposits: Deposit[] = [];
+let depositsRead = 0;
+/** Deposits whose admission this page asked for in this session. */
+const admitted = new Set<string>();
 let requests: TradeRequest[] = [];
 let requestsRead = 0;
 let requestsLoading = false;
@@ -230,6 +241,9 @@ export function tradeWalletChanged(): void {
   generation++;
   market = blank();
   requests = [];
+  deposits = [];
+  depositsRead = 0;
+  admitted.clear();
   void loadMarkets();
 }
 
@@ -260,8 +274,11 @@ function selectMarket(id: string): void {
   market = blank();
   requests = [];
   requestsRead = 0;
+  depositsRead = 0;
   clearForm();
+  clearFunding();
   showResult("", "");
+  showFundResult("", "");
   render();
   const mine = ++generation;
   void follow(id, mine);
@@ -369,6 +386,7 @@ function render(): void {
   renderBalance();
   renderRequests();
   renderForm();
+  renderFunding();
 }
 
 function stateBadge(): [string, string, string] {
@@ -885,14 +903,22 @@ export function tradeDecided(r: TradeResult): boolean {
   const what = drafts.get(r.id);
   if (!what) return false;
   drafts.delete(r.id);
+  const result = what === "deposit" || what === "withdraw" ? showFundResult : showResult;
   if (r.outcome === "traded" && "receipt" in r) {
-    const [kind, text] = receiptText(r.receipt, what);
-    showResult(kind, text);
-    if (r.receipt.accepted) clearForm();
+    const [kind, text] = what === "withdraw" ? withdrawText(r.receipt) : receiptText(r.receipt, what === "cancel" ? "cancel" : "order");
+    result(kind, text);
+    if (r.receipt.accepted) (what === "withdraw" ? clearFunding : clearForm)();
+  } else if (r.outcome === "deposited" && "deposit" in r) {
+    result(
+      "success",
+      `Deposit broadcast (network fee ${r.deposit.fee} B3). It counts after ${DEPOSIT_CONFIRMATIONS} confirmations and admission; it is listed under Your deposits.`,
+    );
+    clearFunding();
+    void loadDeposits();
   } else if (r.outcome === "rejected") {
-    showResult("warning", "Rejected. Nothing was signed.");
+    result("warning", "Rejected. Nothing was signed.");
   } else if (r.outcome === "failed" && "error" in r) {
-    showResult("danger", `Not sent: ${r.error}`);
+    result("danger", `Not sent: ${r.error}`);
   }
   void loadRequests();
   if (active) render();
@@ -922,6 +948,194 @@ function receiptText(r: Receipt, what: "order" | "cancel"): [string, string] {
   }
   if (what === "cancel") return ["info", "Accepted: queued, not yet certified. Until it is, the order can still fill; see Requests."];
   return ["info", "Accepted: queued, not yet certified. An accepted order is not a fill; see Requests."];
+}
+
+// ---- deposits and withdrawals ----------------------------------------------------
+
+/** Why a deposit or withdrawal cannot be drafted now, or null. */
+function fundGate(): string | null {
+  const s = market.status;
+  if (!s || !market.accountKnown) return "Loading the market…";
+  if (s.halt && s.halt !== "none") return `This market is halted (${s.halt}).`;
+  if (s.paused) return "This market is paused; deposits and withdrawals wait.";
+  if (drafts.size) return "Waiting for your decision in the approval window.";
+  if (funding === "out") {
+    if (!market.account) return "This wallet has no trading account in this market, so there is nothing to withdraw.";
+    if (stale()) return "Withdrawals wait for a verified update: there has been none for over 3 seconds.";
+    if (requests.some((r) => r.pending)) return "Your previous request is not certified yet. New requests wait for it; see Requests.";
+  }
+  return null;
+}
+
+function fundAsset(): "b3" | "token" {
+  return el<HTMLSelectElement>("tr-fund-asset").value === "token" ? "token" : "b3";
+}
+
+/** The amount typed, exactly, in B3 atoms or token base units. */
+function fundAmount(): bigint | string | null {
+  const text = el<HTMLInputElement>("tr-fund-amount").value.trim();
+  if (!text) return null;
+  const token = fundAsset() === "token";
+  const decimals = token ? market.metadata?.decimals : B3_DECIMALS;
+  if (decimals === null || decimals === undefined) return "The token's decimals are not verified, so the amount cannot be checked.";
+  const p = parseQuantity(text, { decimals, tick: 1n, lot: 1n });
+  if ("error" in p) {
+    return p.error.startsWith("The quantity must be a multiple")
+      ? `${token ? tokenWord() : "B3"} amounts have at most ${decimals} decimal places.`
+      : "Enter the amount as a number, like 12.5.";
+  }
+  return p.value;
+}
+
+function fundAvailable(): bigint | null {
+  const a = market.account;
+  if (!a) return null;
+  return BigInt(fundAsset() === "token" ? a.base_available : a.b3_available);
+}
+
+function renderFunding(): void {
+  const out = funding === "out";
+  el("tr-fund-in").setAttribute("aria-selected", String(!out));
+  el("tr-fund-out").setAttribute("aria-selected", String(out));
+  el("tr-fund-token").textContent = tokenWord();
+  el("tr-fund-to-field").hidden = !out;
+  el("tr-fund-review").textContent = out ? "Review withdrawal" : "Review deposit";
+  el("tr-fund-help").textContent = out
+    ? "A withdrawal is a request: once certified it leaves your trading balance, and the B3 chain pays it out after a checkpoint. What open orders hold cannot be withdrawn."
+    : `A deposit is a B3 transaction into the market's vault. It counts after ${DEPOSIT_CONFIRMATIONS} confirmations, once the market admits it.` +
+      (market.accountKnown && !market.account ? " The first one creates this wallet's trading account key: back up the wallet afterwards." : "");
+  const amount = fundAmount();
+  let error = typeof amount === "string" ? amount : "";
+  const available = fundAvailable();
+  if (!error && out && typeof amount === "bigint" && available !== null && amount > available) {
+    error = "That is more than the trading balance has available.";
+  }
+  el("tr-fund-error").textContent = error;
+  el("tr-fund-error").hidden = !error;
+  const reason = fundGate();
+  el("tr-fund-gate").textContent = reason ?? "";
+  el("tr-fund-gate").hidden = reason === null;
+  el<HTMLButtonElement>("tr-fund-review").disabled = reason !== null || amount === null || !!error;
+}
+
+function showFundResult(kind: string, text: string): void {
+  const banner = el("tr-fund-result");
+  banner.className = kind ? `banner banner-${kind}` : "banner";
+  banner.textContent = text;
+  banner.hidden = !text;
+}
+
+function clearFunding(): void {
+  el<HTMLInputElement>("tr-fund-amount").value = "";
+  el<HTMLInputElement>("tr-fund-to").value = "";
+  renderFunding();
+}
+
+async function reviewFunding(): Promise<void> {
+  const amount = fundAmount();
+  if (fundGate() !== null || !marketId || typeof amount !== "bigint") return renderFunding();
+  showFundResult("", "");
+  const out = funding === "out";
+  try {
+    const draft = out
+      ? await invoke<string>("trade_withdraw_draft", {
+          marketId,
+          asset: fundAsset(),
+          amount: amount.toString(),
+          destination: el<HTMLInputElement>("tr-fund-to").value.trim(),
+        })
+      : await invoke<string>("trade_deposit_draft", { marketId, asset: fundAsset(), amount: amount.toString() });
+    drafts.set(draft, out ? "withdraw" : "deposit");
+    showFundResult("info", `Review the ${out ? "withdrawal" : "deposit"} in the approval window. Nothing is signed until you approve it there.`);
+  } catch (e) {
+    showFundResult("danger", String(e));
+  }
+  render();
+}
+
+function withdrawText(r: Receipt): [string, string] {
+  if (r.state === "rejected") return ["danger", `Refused${r.reason ? `: ${r.reason}` : ""}. Nothing is pending.`];
+  if (r.state === "unknown") {
+    return ["warning", "Signed and kept, but the outcome is not known. Do not request it again: the same request may still be certified. Follow it under Requests."];
+  }
+  if (r.state === "certified_inclusion") {
+    const o = r.outcome;
+    if (o.status === "rejected") return ["danger", `Certified but not applied: ${o.text || "the market state refused it"}.`];
+    if (o.status === "not_executed") return ["warning", `Certified but not executed: ${o.text || "another action used its sequence"}.`];
+    return ["success", "Withdrawal certified: it has left your trading balance. The payout follows on the B3 chain after a checkpoint; it is not paid yet."];
+  }
+  return ["info", "Accepted: queued, not yet certified. Nothing has left your trading balance yet; see Requests."];
+}
+
+async function loadDeposits(): Promise<void> {
+  const mine = generation;
+  depositsRead = Date.now();
+  try {
+    const list = await invoke<Deposit[]>("trade_deposits");
+    if (mine !== generation) return;
+    deposits = list;
+  } catch {
+    // Deposits are a convenience; the balance above is what counts.
+    return;
+  }
+  renderDeposits();
+}
+
+async function admit(d: Deposit, button: HTMLButtonElement): Promise<void> {
+  if (!marketId) return;
+  button.disabled = true;
+  const key = `${d.txid}:${d.vout}`;
+  try {
+    const r = await invoke<Receipt>("trade_admit", { marketId, txid: d.txid, vout: d.vout });
+    if (r.state === "rejected") {
+      showFundResult("danger", `Admission refused${r.reason ? `: ${r.reason}` : ""}.`);
+    } else {
+      admitted.add(key);
+      showFundResult(
+        r.state === "certified_inclusion" ? "success" : "info",
+        r.state === "certified_inclusion"
+          ? "Deposit admitted and certified: it is in your trading balance."
+          : "Admission requested. It is in your trading balance once certified; that is not yet settled on the B3 chain.",
+      );
+    }
+  } catch (e) {
+    showFundResult("danger", String(e));
+  }
+  void loadRequests();
+  void loadDeposits();
+}
+
+function renderDeposits(): void {
+  el("tr-deposits").hidden = deposits.length === 0;
+  el("tr-deposit-rows").replaceChildren(
+    ...deposits.map((d) => {
+      const drow = document.createElement("div");
+      drow.className = "drow";
+      const k = document.createElement("span");
+      k.className = "dkey mono";
+      k.textContent = `${shorten(d.txid, 8, 4)}:${d.vout}`;
+      k.title = `${d.txid}:${d.vout}`;
+      const v = document.createElement("span");
+      v.className = "dval";
+      if (d.swept) {
+        v.textContent = "Swept in";
+        v.title = "The market swept this deposit into its vault: it was admitted.";
+      } else if (d.confirmations < DEPOSIT_CONFIRMATIONS) {
+        v.textContent = `${Math.max(d.confirmations, 0)} of ${DEPOSIT_CONFIRMATIONS} confirmations`;
+      } else {
+        const ask = document.createElement("button");
+        ask.type = "button";
+        ask.className = "btn btn-secondary btn-sm";
+        ask.textContent = admitted.has(`${d.txid}:${d.vout}`) ? "Ask again" : "Ask to admit";
+        ask.title = "Asks the market to admit this deposit. Nothing is signed and no coins move.";
+        ask.disabled = !marketId || !!market.status?.paused;
+        ask.addEventListener("click", () => void admit(d, ask));
+        v.append(ask);
+      }
+      drow.append(k, v);
+      return drow;
+    }),
+  );
 }
 
 // ---- requests ------------------------------------------------------------------
@@ -961,6 +1175,9 @@ const STAGES: Record<string, string> = {
 };
 
 function requestText(r: TradeRequest, u: Units): string {
+  if (r.kind === "withdraw") return "Withdrawal";
+  if (r.kind === "deposit") return "Deposit admission";
+  if (r.kind === "other") return "Other request";
   const verb = r.side === "bid" ? "Buy" : "Sell";
   if (r.kind === "cancel") return `Cancel ${r.side === "bid" ? "buy" : "sell"}`;
   // A request keeps the canonical curve it signed: its limit is the edge
@@ -1092,6 +1309,22 @@ el("tr-ladder").addEventListener("change", renderForm);
 el("tr-cancel-bid").addEventListener("click", () => void cancelOrder("bid"));
 el("tr-cancel-ask").addEventListener("click", () => void cancelOrder("ask"));
 el("tr-form").addEventListener("input", renderForm);
+for (const [id, way] of [
+  ["tr-fund-in", "in"],
+  ["tr-fund-out", "out"],
+] as const) {
+  el(id).addEventListener("click", () => {
+    funding = way;
+    showFundResult("", "");
+    renderFunding();
+  });
+}
+el("tr-fund-form").addEventListener("input", renderFunding);
+el("tr-fund-asset").addEventListener("change", renderFunding);
+el("tr-fund-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  void reviewFunding();
+});
 el("tr-form").addEventListener("submit", (e) => {
   e.preventDefault();
   void reviewOrder();
@@ -1103,6 +1336,7 @@ setInterval(() => {
   if (active && market.status) renderHead();
   const due = requests.some((r) => r.pending) ? REQUESTS_PENDING_MS : REQUESTS_IDLE_MS;
   if (active && marketId && Date.now() - requestsRead > due) void loadRequests();
+  if (active && marketId && Date.now() - depositsRead > REQUESTS_IDLE_MS) void loadDeposits();
 }, 1000);
 
 /** Re-render after amounts were masked or unmasked. */

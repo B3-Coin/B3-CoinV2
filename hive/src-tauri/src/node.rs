@@ -81,6 +81,10 @@ const PAGE_METHODS: &[&str] = &[
     "submitflowmeshorder",
     "submitflowmeshladder",
     "cancelflowmeshorder",
+    "flowmeshdeposit",
+    "gettxout",
+    "submitflowmeshdeposit",
+    "requestflowmeshwithdrawal",
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);

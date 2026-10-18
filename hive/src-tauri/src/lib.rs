@@ -157,6 +157,12 @@ pub enum DraftResult {
         id: String,
         receipt: flowmesh::Receipt,
     },
+    /// A FlowMesh deposit was broadcast; it counts once confirmed and
+    /// admitted.
+    Deposited {
+        id: String,
+        deposit: flowmesh::Deposited,
+    },
     Rejected {
         id: String,
     },
@@ -517,6 +523,102 @@ async fn trade_cancel_draft(
     .await?;
     open_approval(&app).map_err(|e| e.to_string())?;
     Ok(id)
+}
+
+/// Drafts a deposit of B3 atoms or token base units into a market's vault.
+#[tauri::command]
+async fn trade_deposit_draft(
+    app: AppHandle,
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+    asset: flowmesh::Asset,
+    amount: String,
+) -> Result<String, String> {
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let chain = node.chain().unwrap_or_default();
+        let deposit = flowmesh::prepare_deposit(client, &chain, &name, &market_id, asset, &amount)?;
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(Request::TradeDeposit { deposit })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Drafts a withdrawal of B3 atoms or token base units to `destination`, or
+/// to a new address of this wallet when it is empty.
+#[tauri::command]
+async fn trade_withdraw_draft(
+    app: AppHandle,
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+    asset: flowmesh::Asset,
+    amount: String,
+    destination: String,
+) -> Result<String, String> {
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let acknowledged = core.trade_acknowledged.lock().unwrap().clone();
+        let chain = node.chain().unwrap_or_default();
+        let withdraw = flowmesh::prepare_withdraw(
+            client,
+            &chain,
+            &name,
+            &market_id,
+            &flowmesh::Withdrawal {
+                asset,
+                amount: &amount,
+                destination: &destination,
+            },
+            &acknowledged,
+        )?;
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(Request::TradeWithdraw { withdraw })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// The page wallet's vault deposits, from its own transaction history.
+#[tauri::command]
+async fn trade_deposits(core: State<'_, Arc<Core>>) -> Result<Vec<flowmesh::Deposit>, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        flowmesh::deposits(client, &name).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Asks a market to admit one of the page wallet's confirmed deposits.
+/// Nothing is signed and no coins move, so it needs no approval.
+#[tauri::command]
+async fn trade_admit(
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+    txid: String,
+    vout: u64,
+) -> Result<flowmesh::Receipt, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        flowmesh::admit(client, &name, &market_id, &txid, vout)
+    })
+    .await
 }
 
 /// The page wallet's FlowMesh requests in a market, newest first, from the
@@ -1559,6 +1661,7 @@ enum Done {
     Sent(String),
     Signed { psbt: String, complete: bool },
     Traded(flowmesh::Receipt),
+    Deposited(flowmesh::Deposited),
 }
 
 /// Carries out an approved request.
@@ -1572,6 +1675,23 @@ fn execute(client: &rpc::Client, request: Request) -> Result<Done, String> {
         Request::TradeOrder { order } => {
             flowmesh::recheck(client, &order.wallet, &order.market_id, order.sequence)?;
             flowmesh::submit(client, &order.wallet, flowmesh::order_call(&order)?).map(Done::Traded)
+        }
+        Request::TradeWithdraw { withdraw } => {
+            flowmesh::recheck(
+                client,
+                &withdraw.wallet,
+                &withdraw.market_id,
+                withdraw.sequence,
+            )?;
+            flowmesh::submit(
+                client,
+                &withdraw.wallet,
+                flowmesh::withdraw_call(&withdraw)?,
+            )
+            .map(Done::Traded)
+        }
+        Request::TradeDeposit { deposit } => {
+            flowmesh::deposit(client, &deposit).map(Done::Deposited)
         }
         Request::TradeCancel { cancel } => {
             flowmesh::recheck(client, &cancel.wallet, &cancel.market_id, cancel.sequence)?;
@@ -1599,7 +1719,9 @@ fn execute_sent(client: &rpc::Client, request: Request) -> Result<String, String
         Request::SignPsbt { .. }
         | Request::SendPsbt { .. }
         | Request::TradeOrder { .. }
-        | Request::TradeCancel { .. } => unreachable!("handled by execute"),
+        | Request::TradeCancel { .. }
+        | Request::TradeDeposit { .. }
+        | Request::TradeWithdraw { .. } => unreachable!("handled by execute"),
     }
 }
 
@@ -1689,6 +1811,10 @@ async fn approval_decide(
             Ok(Done::Traded(receipt)) => DraftResult::Traded {
                 id: id.clone(),
                 receipt,
+            },
+            Ok(Done::Deposited(deposit)) => DraftResult::Deposited {
+                id: id.clone(),
+                deposit,
             },
             Err(error) => DraftResult::Failed {
                 id: id.clone(),
@@ -2089,6 +2215,10 @@ pub fn run() {
             trade_cancel_draft,
             trade_requests,
             trade_acknowledge,
+            trade_deposit_draft,
+            trade_withdraw_draft,
+            trade_deposits,
+            trade_admit,
             stake_draft,
             release_draft,
             wallet_restore,
