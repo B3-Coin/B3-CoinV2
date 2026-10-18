@@ -1,6 +1,6 @@
-//! The passphrase window's requests: encrypt a wallet or change its
-//! passphrase. The main window only asks for one and hears done, cancelled
-//! or failed; the passphrase is typed in the passphrase window, handed to
+//! The passphrase window's requests: encrypt a wallet, change its
+//! passphrase, or unlock it just long enough to start staking. The main
+//! window only asks for one and hears done, cancelled or failed; the passphrase is typed in the passphrase window, handed to
 //! the core, used for one RPC call and dropped. It is never logged, stored
 //! or sent to another window.
 
@@ -17,6 +17,8 @@ pub enum Kind {
     Encrypt,
     /// Qt's Change passphrase: the old one, then the new one twice.
     Change,
+    /// Start staking: the current passphrase, to unlock only for that.
+    Stake,
 }
 
 /// What the passphrase window shows. The id ties a submit to this request.
@@ -33,7 +35,9 @@ pub struct Request {
 pub struct Entry {
     #[serde(default)]
     pub old: String,
+    #[serde(default)]
     pub new: String,
+    #[serde(default)]
     pub repeat: String,
 }
 
@@ -54,11 +58,24 @@ pub fn check_kind(kind: Kind, security: Security) -> Result<(), String> {
         }
         (Kind::Change, Security::Unencrypted) => Err("This wallet is not encrypted yet.".into()),
         (Kind::Change, _) => Ok(()),
+        (Kind::Stake, Security::Unencrypted) => {
+            Err("This wallet is not encrypted, so staking starts without a passphrase.".into())
+        }
+        (Kind::Stake, _) => Ok(()),
     }
 }
 
 /// Checks the typed passphrases before the node sees them.
 pub fn check_entry(kind: Kind, entry: &Entry) -> Result<(), String> {
+    if kind == Kind::Stake {
+        if entry.old.is_empty() {
+            return Err("Enter the wallet passphrase.".into());
+        }
+        if entry.old.contains('\0') {
+            return Err("A passphrase cannot contain a zero byte.".into());
+        }
+        return Ok(());
+    }
     if kind == Kind::Change && entry.old.is_empty() {
         return Err("Enter the current passphrase.".into());
     }
@@ -85,6 +102,7 @@ pub fn apply(client: &Client, request: &Request, entry: &Entry) -> Result<(), St
     let security = wallet::security(client, &request.wallet).map_err(|e| e.to_string())?;
     check_kind(request.kind, security)?;
     let result = match request.kind {
+        Kind::Stake => return crate::stake::start(client, &request.wallet, Some(&entry.old)),
         Kind::Encrypt => client.call_wallet(&request.wallet, "encryptwallet", json!([entry.new])),
         Kind::Change => client.call_wallet(
             &request.wallet,
@@ -126,6 +144,8 @@ mod tests {
         assert!(check_kind(Kind::Change, Security::Unencrypted).is_err());
         assert!(check_kind(Kind::Change, Security::Unlocked).is_ok());
         assert!(check_kind(Kind::Encrypt, Security::WatchOnly).is_err());
+        assert!(check_kind(Kind::Stake, Security::Locked).is_ok());
+        assert!(check_kind(Kind::Stake, Security::Unencrypted).is_err());
     }
 
     #[test]
@@ -137,6 +157,8 @@ mod tests {
         assert!(check_entry(Kind::Change, &entry("", "n", "n")).is_err());
         assert!(check_entry(Kind::Change, &entry("o", "o", "o")).is_err());
         assert!(check_entry(Kind::Change, &entry("o", "n", "n")).is_ok());
+        assert!(check_entry(Kind::Stake, &entry("pw", "", "")).is_ok());
+        assert!(check_entry(Kind::Stake, &entry("", "", "")).is_err());
     }
 
     #[test]

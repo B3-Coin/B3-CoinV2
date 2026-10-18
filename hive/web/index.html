@@ -34,6 +34,10 @@
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-activity" /></svg>
               <span class="nav-text">Activity</span>
             </button>
+            <button class="nav-item" type="button" data-view="stake">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-layers" /></svg>
+              <span class="nav-text">Stake</span>
+            </button>
             <button class="nav-item" type="button" data-view="book">
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>
               <span class="nav-text">Address book</span>
@@ -268,7 +272,7 @@
                 </div>
                 <div class="card-pad">
                   <ul class="plain-lines" id="staking-lines"></ul>
-                  <p class="t-sm muted mt-2">Starting and stopping staking comes with the Stake page in a later version of B3 Hive.</p>
+                  <p class="t-sm muted mt-2">Start and stop staking, and make stakes, on the <a href="#" id="staking-go">Stake page</a>.</p>
                 </div>
               </div>
 
@@ -385,6 +389,70 @@
               <div id="rcv-list"></div>
               <div class="empty empty--tight" id="rcv-empty" hidden>
                 <p>This wallet has no receiving addresses yet.</p>
+              </div>
+            </div>
+          </div>
+        </main>
+
+        <main class="view view--flow" id="view-stake" hidden>
+          <div class="stack">
+            <div class="banner" id="stk-result" role="status" hidden></div>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-spark" /></svg>Staking</h2>
+                <span class="badge" id="stk-badge"></span>
+              </div>
+              <div class="card-pad">
+                <p class="t-sm muted" id="stk-state"></p>
+                <div class="details mt-2" id="stk-rows"></div>
+                <div class="row mt-2">
+                  <button class="btn btn-primary" type="button" id="stk-start">Start staking</button>
+                  <button class="btn btn-secondary" type="button" id="stk-stop">Stop staking</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-layers" /></svg>Your stakes</h2>
+                <span class="t-sm muted tnum" id="stk-count"></span>
+              </div>
+              <div class="card-pad details" id="stk-totals"></div>
+              <div id="stk-list"></div>
+              <div class="empty empty--tight" id="stk-empty" hidden>
+                <p>No stakes yet. A stake locks B3 for this wallet's validator.</p>
+              </div>
+            </div>
+
+            <form class="card" id="stk-form" novalidate>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>New stake</h2>
+              </div>
+              <div class="card-pad form-grid">
+                <div class="field">
+                  <label for="stk-amount">Amount</label>
+                  <div class="amount-field">
+                    <input class="input" id="stk-amount" inputmode="decimal" autocomplete="off" placeholder="0.000000000" />
+                    <span class="unit">B3</span>
+                  </div>
+                  <span class="help" id="stk-min"></span>
+                </div>
+              </div>
+              <div class="card-foot">
+                <button class="btn btn-primary" type="submit" id="stk-review">Review stake</button>
+              </div>
+            </form>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-key" /></svg>Finality key</h2>
+                <span class="badge" id="fin-badge"></span>
+              </div>
+              <div class="card-pad">
+                <p class="t-sm muted" id="fin-text"></p>
+                <div class="row mt-2">
+                  <button class="btn btn-secondary" type="button" id="fin-bind">Bind finality key</button>
+                </div>
               </div>
             </div>
           </div>

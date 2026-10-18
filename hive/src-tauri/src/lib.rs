@@ -14,6 +14,7 @@ pub mod passphrase;
 pub mod receive;
 pub mod rpc;
 pub mod settings;
+pub mod stake;
 pub mod update;
 pub mod wallet;
 
@@ -29,7 +30,7 @@ use tauri::{
     WindowEvent,
 };
 
-use drafts::{DraftStore, DraftView};
+use drafts::{DraftStore, DraftView, Request};
 use node::{Network, Node, NodeConfig, NodeStatus};
 use rpc::RpcError;
 use update::{HttpsFetcher, UpdateStatus, Updater};
@@ -392,6 +393,102 @@ async fn book_save(
     .await
 }
 
+/// The page wallet's staking status.
+#[tauri::command]
+async fn stake_status(core: State<'_, Arc<Core>>) -> Result<stake::Status, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        stake::status(client, &name).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Asks the approval window to lock `amount` as a stake. Nothing is sent
+/// here; the page only learns the draft id.
+#[tauri::command]
+async fn stake_draft(
+    app: AppHandle,
+    core: State<'_, Arc<Core>>,
+    amount: String,
+) -> Result<String, String> {
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let amount = stake::check_stake(client, &name, &amount)?;
+        let depth = stake::status(client, &name)
+            .map_err(|e| e.to_string())?
+            .activation_depth;
+        let request = Request::Stake {
+            chain: node.chain().unwrap_or_default(),
+            wallet: name,
+            amount,
+            activation_depth: depth,
+        };
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(request)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Asks the approval window to bind (or rotate) the finality key.
+#[tauri::command]
+async fn finality_draft(app: AppHandle, core: State<'_, Arc<Core>>) -> Result<String, String> {
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let status = stake::status(client, &name).map_err(|e| e.to_string())?;
+        let Some(finality) = status.finality else {
+            return Err("Create a stake first: it makes this wallet's validator key.".into());
+        };
+        let request = Request::BindFinality {
+            chain: node.chain().unwrap_or_default(),
+            wallet: name,
+            rotate: finality.bound && !finality.revoked,
+        };
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(request)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Starts staking with an unencrypted wallet. An encrypted wallet starts it
+/// through the passphrase window instead.
+#[tauri::command]
+async fn stake_start(core: State<'_, Arc<Core>>) -> Result<(), String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        stake::start(client, &name, None)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn stake_stop(core: State<'_, Arc<Core>>) -> Result<(), String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        stake::stop(client, &name)
+    })
+    .await
+}
+
 /// The coins the page's wallet can spend, for coin control.
 #[tauri::command]
 async fn send_coins(core: State<'_, Arc<Core>>) -> Result<Vec<wallet::Coin>, String> {
@@ -548,13 +645,14 @@ async fn passphrase_request(
     getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
     let id = nonce.iter().map(|b| format!("{b:02x}")).collect();
     *core.passphrase.lock().unwrap() = Some(passphrase::Request { id, kind, wallet });
-    let title = match kind {
-        passphrase::Kind::Encrypt => "Encrypt wallet – B3 Hive",
-        passphrase::Kind::Change => "Change passphrase – B3 Hive",
+    let (title, height) = match kind {
+        passphrase::Kind::Encrypt => ("Encrypt wallet – B3 Hive", 520.0),
+        passphrase::Kind::Change => ("Change passphrase – B3 Hive", 520.0),
+        passphrase::Kind::Stake => ("Start staking – B3 Hive", 380.0),
     };
     WebviewWindowBuilder::new(&app, PASSPHRASE, WebviewUrl::App("passphrase.html".into()))
         .title(title)
-        .inner_size(460.0, 520.0)
+        .inner_size(460.0, height)
         .resizable(false)
         .always_on_top(true)
         .focused(true)
@@ -657,7 +755,7 @@ async fn draft_send(
         core.drafts
             .lock()
             .unwrap()
-            .insert(summary, funded)
+            .insert(Request::Pay { summary, funded })
             .map_err(|e| {
                 wallet::release(client, &name, &inputs);
                 e.to_string()
@@ -1005,12 +1103,29 @@ async fn update_download(
 /// locked or unlocked since the draft was made.
 fn draft_view(client: Option<&rpc::Client>, draft: drafts::Draft) -> DraftView {
     let locked = client.is_some_and(|c| {
-        wallet::security(c, &draft.summary.wallet).ok() == Some(wallet::Security::Locked)
+        wallet::security(c, draft.request.wallet()).ok() == Some(wallet::Security::Locked)
     });
     DraftView {
         id: draft.id,
-        summary: draft.summary,
+        request: draft.request,
         locked,
+    }
+}
+
+/// Carries out an approved request. Returns the transaction id.
+fn execute(client: &rpc::Client, request: Request) -> Result<String, String> {
+    match request {
+        Request::Pay { summary, funded } => {
+            let sent = wallet::sign(client, &summary, &funded)
+                .and_then(|hex| wallet::broadcast(client, &hex).map_err(|e| e.to_string()));
+            match &sent {
+                Ok(_) => wallet::save_labels(client, &summary.wallet, &funded.labels),
+                Err(_) => wallet::release(client, &summary.wallet, &funded.inputs),
+            }
+            sent
+        }
+        Request::Stake { wallet, amount, .. } => stake::create(client, &wallet, &amount),
+        Request::BindFinality { wallet, .. } => stake::bind(client, &wallet),
     }
 }
 
@@ -1033,8 +1148,9 @@ async fn approval_pending(
 /// What happened to an approved draft once it was taken.
 type Outcome = Result<String, String>;
 
-/// Approve signs the draft, checks the signed transaction against what was
-/// approved, and submits it; reject frees its coins. Either way the draft is
+/// Approve carries the draft out: a payment is signed, checked against what
+/// was approved and submitted; a staking request goes to the node. Reject
+/// frees a payment's coins. Either way the draft is
 /// consumed, so it can never be submitted twice. A locked wallet is unlocked
 /// with `passphrase` only to sign and is locked again straight after; a
 /// missing or wrong passphrase leaves the draft waiting, to try again.
@@ -1062,7 +1178,7 @@ async fn approval_decide(
                 .unwrap()
                 .get(&id2)
                 .ok_or("This request was already decided.")?;
-            let wallet_name = waiting.summary.wallet.clone();
+            let wallet_name = waiting.request.wallet().to_owned();
             let locked = wallet::security(client, &wallet_name).map_err(|e| e.to_string())?
                 == wallet::Security::Locked;
             if locked {
@@ -1076,15 +1192,7 @@ async fn approval_decide(
             let taken = core2.drafts.lock().unwrap().take(&id2);
             let outcome = match taken {
                 None => Err("This request was already decided.".to_owned()),
-                Some(draft) => {
-                    let sent = wallet::sign(client, &draft.summary, &draft.funded)
-                        .and_then(|hex| wallet::broadcast(client, &hex).map_err(|e| e.to_string()));
-                    match &sent {
-                        Ok(_) => wallet::save_labels(client, &wallet_name, &draft.funded.labels),
-                        Err(_) => wallet::release(client, &wallet_name, &draft.funded.inputs),
-                    }
-                    sent
-                }
+                Some(draft) => execute(client, draft.request),
             };
             if locked {
                 // Only a lock this approval opened is closed again.
@@ -1113,7 +1221,7 @@ async fn approval_decide(
         let core2 = Arc::clone(&core);
         blocking(move || {
             if let Some(client) = core2.node().client() {
-                wallet::release(client, &draft.summary.wallet, &draft.funded.inputs);
+                wallet::release(client, draft.request.wallet(), draft.request.reserved());
             }
             Ok(())
         })
@@ -1444,7 +1552,7 @@ pub fn run() {
                 thread::spawn(move || {
                     if let Some(client) = core.node().client() {
                         for d in drafts {
-                            wallet::release(client, &d.summary.wallet, &d.funded.inputs);
+                            wallet::release(client, d.request.wallet(), d.request.reserved());
                         }
                     }
                 });
@@ -1479,6 +1587,11 @@ pub fn run() {
             send_coins,
             book_list,
             book_save,
+            stake_status,
+            stake_draft,
+            finality_draft,
+            stake_start,
+            stake_stop,
             open_console,
             ui_theme,
             set_ui_theme,

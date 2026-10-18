@@ -1,10 +1,11 @@
-// The passphrase window. It shows its one request, hands the typed
+// The passphrase window. It shows its one request (encrypt, change the
+// passphrase, or unlock just to start staking), hands the typed
 // passphrases to the core and closes; nothing typed here reaches another
 // window. Its only powers are reading the request and submitting to it.
 import { invoke } from "@tauri-apps/api/core";
 import { el, initTheme } from "../shared/ui";
 
-type Request = { id: string; kind: "encrypt" | "change"; wallet: string };
+type Request = { id: string; kind: "encrypt" | "change" | "stake"; wallet: string };
 
 await initTheme();
 
@@ -24,16 +25,22 @@ function clear(): void {
 
 if (request) {
   const encrypt = request.kind === "encrypt";
+  const stake = request.kind === "stake";
   const wallet = request.wallet === "" ? "the default wallet" : `wallet ${request.wallet}`;
-  el("title").textContent = encrypt ? "Encrypt wallet" : "Change passphrase";
+  el("title").textContent = encrypt ? "Encrypt wallet" : stake ? "Start staking" : "Change passphrase";
   el("wallet").textContent = `For ${wallet}`;
   el("intro").textContent = encrypt
     ? "Sending will need this passphrase from now on. Encrypting starts a new key chain, so make a new backup afterwards: older backups do not hold the keys for new addresses."
-    : "Enter the current passphrase, then the new one twice.";
+    : stake
+      ? "The wallet unlocks only to start staking and locks again straight after. Staking goes on while it is locked."
+      : "Enter the current passphrase, then the new one twice.";
   el("encrypt-warning").hidden = !encrypt;
   el("ack-row").hidden = !encrypt;
   el("old-field").hidden = encrypt;
-  el("submit").textContent = encrypt ? "Encrypt wallet" : "Change passphrase";
+  el("new-field").hidden = stake;
+  el("repeat-field").hidden = stake;
+  if (stake) el("old-label").textContent = "Wallet passphrase";
+  el("submit").textContent = encrypt ? "Encrypt wallet" : stake ? "Start staking" : "Change passphrase";
   el<HTMLInputElement>(encrypt ? "new" : "old").focus();
 
   el("form").addEventListener("submit", async (e) => {

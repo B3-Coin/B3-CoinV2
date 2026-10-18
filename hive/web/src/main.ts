@@ -131,6 +131,7 @@ const VIEWS = {
   receive: { title: "Receive", sub: "Addresses and payment links for this wallet" },
   activity: { title: "Activity", sub: "Your wallet's transactions" },
   book: { title: "Address book", sub: "Addresses you pay, with their labels" },
+  stake: { title: "Stake", sub: "Secure B3 with this wallet's validator" },
   wallets: { title: "Wallets", sub: "Open, create, switch and back up wallets" },
   network: { title: "Network", sub: "Your node and its peers" },
   settings: { title: "Settings", sub: "How your node runs and connects" },
@@ -160,6 +161,7 @@ function go(view: View): void {
   if (view === "wallets") void refreshWallets();
   if (view === "receive") void refreshReceiving();
   if (view === "book") void refreshBook();
+  if (view === "stake") void refreshStake();
   if (view === "send") void refreshBook();
 }
 
@@ -1400,6 +1402,7 @@ setInterval(() => {
     void refreshOverview();
     void refreshWallet();
   }
+  if (current === "stake") void refreshStake();
   if (current === "network") void refreshNetwork();
 }, REFRESH_MS);
 
@@ -1698,6 +1701,234 @@ function sendResult(tone: "info" | "success" | "warning" | "danger", text: strin
   // With several recipients the form is long; keep the outcome in view.
   box.scrollIntoView({ block: "nearest" });
 }
+
+// ---- stake -------------------------------------------------------------------
+
+el("staking-go").addEventListener("click", (e) => {
+  e.preventDefault();
+  go("stake");
+});
+
+// Which page asked for each waiting approval, so its outcome lands there.
+const draftPage = new Map<string, "send" | "stake" | "finality">();
+
+// Mirrors stake::Status in src-tauri/src/stake.rs.
+type StakeEntry = {
+  txid: string;
+  vout: number;
+  amount: string;
+  status: "UNCONFIRMED" | "PENDING" | "ACTIVE";
+  confirmations: number;
+  active_at_height: number | null;
+};
+type StakeStatus = {
+  validator_key: string | null;
+  tip_height: number;
+  phase: string;
+  min_stake: string | null;
+  activation_depth: number;
+  active_weight: number;
+  total_active_weight: number;
+  stakes: StakeEntry[];
+  active: string;
+  pending: string;
+  unconfirmed: string;
+  loop: {
+    running: boolean;
+    state: string;
+    last_error: string | null;
+    ours: boolean;
+    finality_signing: boolean;
+    blocks_produced: number;
+  };
+  finality: { bound: boolean; revoked: boolean; key_is_ours: boolean | null; member: boolean; weight: number } | null;
+};
+
+const PHASE_TEXT: Record<string, string> = {
+  legacy: "Legacy era: stakes open after the B3 transition",
+  corridor: "Transition corridor: staking begins after it",
+  modern_pos: "Modern PoS",
+};
+
+function stakeResult(tone: "success" | "warning" | "danger", text: string): void {
+  const box = el("stk-result");
+  box.hidden = false;
+  box.className = `banner banner-${tone}`;
+  box.textContent = text;
+  box.scrollIntoView({ block: "nearest" });
+}
+
+function setBadge(id: string, text: string, tone: string): void {
+  el(id).textContent = text;
+  el(id).className = `badge badge-${tone}`;
+}
+
+function textRow(key: string, value: string, title?: string): HTMLElement {
+  const drow = document.createElement("div");
+  drow.className = "drow";
+  const k = document.createElement("span");
+  k.className = "dkey";
+  k.textContent = key;
+  const v = document.createElement("span");
+  v.className = "dval";
+  v.textContent = value;
+  if (title) v.title = title;
+  drow.append(k, v);
+  return drow;
+}
+
+function amountRow(key: string, value: string): HTMLElement {
+  const drow = textRow(key, "");
+  drow.querySelector(".dval")!.replaceChildren(amountNode(value));
+  return drow;
+}
+
+let stakeStatus: StakeStatus | null = null;
+
+function renderStake(s: StakeStatus): void {
+  const l = s.loop;
+  if (l.running && l.ours) setBadge("stk-badge", l.finality_signing ? "Staking" : "Staking, finality not signing", l.finality_signing ? "success" : "warning");
+  else if (l.running) setBadge("stk-badge", "Another wallet is staking", "warning");
+  else setBadge("stk-badge", "Stopped", "neutral");
+  el("stk-state").textContent = l.running
+    ? l.state
+    : s.phase === "modern_pos"
+      ? "Staking is stopped. Start it to produce blocks with your active stakes."
+      : "Staking is stopped.";
+  const rows = [
+    textRow("Network phase", PHASE_TEXT[s.phase] ?? s.phase),
+    textRow("Height", s.tip_height.toLocaleString()),
+    textRow("Your weight", `${s.active_weight.toLocaleString()} of ${s.total_active_weight.toLocaleString()} B3`),
+  ];
+  if (l.running) rows.push(textRow("Blocks produced", l.blocks_produced.toLocaleString()));
+  if (l.last_error) rows.push(textRow("Last error", l.last_error));
+  if (s.validator_key) rows.push(textRow("Validator key", shorten(s.validator_key, 10, 8), s.validator_key));
+  el("stk-rows").replaceChildren(...rows);
+  el<HTMLButtonElement>("stk-start").hidden = l.running;
+  el<HTMLButtonElement>("stk-stop").hidden = !l.running || !l.ours;
+
+  el("stk-count").textContent = s.stakes.length ? plural(s.stakes.length, "stake") : "";
+  el("stk-totals").replaceChildren(
+    amountRow("Active", s.active),
+    amountRow("Pending", s.pending),
+    ...(s.unconfirmed.replace(/[0.]/g, "") ? [amountRow("Unconfirmed", s.unconfirmed)] : []),
+  );
+  el("stk-empty").hidden = s.stakes.length > 0;
+  el("stk-list").replaceChildren(
+    ...s.stakes.map((k) => {
+      const row = document.createElement("div");
+      row.className = "list-row";
+      const lead = document.createElement("div");
+      lead.className = "lead stake";
+      lead.append(icon("layers"));
+      const body = document.createElement("div");
+      body.className = "body";
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent =
+        k.status === "UNCONFIRMED"
+          ? "Waiting to confirm"
+          : k.status === "PENDING"
+            ? `Counts from height ${k.active_at_height?.toLocaleString() ?? "?"}`
+            : plural(k.confirmations, "confirmation");
+      body.append(amountNode(k.amount), meta);
+      const tag = document.createElement("span");
+      const tone = k.status === "ACTIVE" ? "success" : k.status === "PENDING" ? "info" : "neutral";
+      tag.className = `badge badge-${tone}`;
+      tag.textContent = k.status === "ACTIVE" ? "Active" : k.status === "PENDING" ? "Pending" : "Unconfirmed";
+      row.append(lead, body, tag);
+      return row;
+    }),
+  );
+
+  el("stk-min").textContent = s.min_stake
+    ? `At least ${formatAmount(s.min_stake, 2)}. It counts ${s.activation_depth} blocks after it confirms.`
+    : "This network has no minimum stake configured.";
+  el<HTMLButtonElement>("stk-review").disabled = s.phase === "legacy" || !s.min_stake;
+
+  const f = s.finality;
+  const bind = el<HTMLButtonElement>("fin-bind");
+  if (!f) {
+    setBadge("fin-badge", "No validator yet", "neutral");
+    el("fin-text").textContent = "Your first stake creates this wallet's validator key. Bind its finality key after that.";
+    bind.disabled = true;
+    bind.textContent = "Bind finality key";
+  } else if (f.bound && !f.revoked) {
+    setBadge("fin-badge", f.member ? "Bound · in the validator set" : "Bound", "success");
+    el("fin-text").textContent =
+      f.key_is_ours === false
+        ? "The bound key is not this wallet's. Rotate it to bind this wallet's key."
+        : "Staking can sign finality with this key. Rotating replaces it at the next epoch boundary.";
+    bind.disabled = false;
+    bind.textContent = "Rotate finality key";
+  } else {
+    setBadge("fin-badge", f.revoked ? "Revoked" : "Not bound", "warning");
+    el("fin-text").textContent = "Staking needs a bound finality key. Binding sends a small transaction.";
+    bind.disabled = false;
+    bind.textContent = "Bind finality key";
+  }
+}
+
+const refreshStake = single(async () => {
+  try {
+    stakeStatus = await invoke<StakeStatus>("stake_status");
+  } catch (e) {
+    if (current === "stake") stakeResult("danger", String(e));
+    return;
+  }
+  renderStake(stakeStatus);
+});
+
+el("stk-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const review = el<HTMLButtonElement>("stk-review");
+  review.disabled = true;
+  try {
+    const id = await invoke<string>("stake_draft", { amount: el<HTMLInputElement>("stk-amount").value });
+    draftPage.set(id, "stake");
+    stakeResult("success", "Waiting for your decision in the approval window.");
+  } catch (e) {
+    stakeResult("danger", String(e));
+  } finally {
+    review.disabled = false;
+  }
+});
+
+el("fin-bind").addEventListener("click", async () => {
+  try {
+    const id = await invoke<string>("finality_draft");
+    draftPage.set(id, "finality");
+    stakeResult("success", "Waiting for your decision in the approval window.");
+  } catch (e) {
+    stakeResult("danger", String(e));
+  }
+});
+
+// An encrypted wallet unlocks in the passphrase window, only to start.
+el("stk-start").addEventListener("click", async () => {
+  try {
+    const v = await invoke<WalletsView>("wallets");
+    if (v.security === "locked" || v.security === "unlocked") {
+      await invoke("passphrase_request", { kind: "stake" });
+      return;
+    }
+    await invoke("stake_start");
+    stakeResult("success", "Staking started.");
+  } catch (e) {
+    stakeResult("danger", String(e));
+  }
+  void refreshStake();
+});
+
+el("stk-stop").addEventListener("click", async () => {
+  try {
+    await invoke("stake_stop");
+    stakeResult("success", "Staking stopped.");
+  } catch (e) {
+    stakeResult("danger", String(e));
+  }
+  void refreshStake();
+});
 
 // ---- address book ----------------------------------------------------------
 
@@ -2018,9 +2249,10 @@ el("send").addEventListener("submit", async (event) => {
   submit.disabled = true;
   sendResult("info", "Preparing the payment…");
   try {
-    await invoke<string>("draft_send", {
+    const id = await invoke<string>("draft_send", {
       payment: { recipients, fee_rate: el<HTMLInputElement>("send-fee").value.trim(), coins },
     });
+    draftPage.set(id, "send");
     sendResult("info", "Waiting for your decision in the approval window.");
     void refreshCoins();
   } catch (e) {
@@ -2161,11 +2393,16 @@ await listen<number>("update-progress", (event) => {
 // Mirrors PassResult in src-tauri/src/lib.rs: only the outcome, never the
 // passphrase.
 type PassResult =
-  | { outcome: "done"; kind: "encrypt" | "change"; wallet: string }
-  | { outcome: "cancelled"; kind: "encrypt" | "change" };
+  | { outcome: "done"; kind: "encrypt" | "change" | "stake"; wallet: string }
+  | { outcome: "cancelled"; kind: "encrypt" | "change" | "stake" };
 
 await listen<PassResult>("passphrase-result", (event) => {
   const r = event.payload;
+  if (r.kind === "stake") {
+    if (r.outcome === "done") stakeResult("success", "Staking started. The wallet is locked again; staking goes on.");
+    void refreshStake();
+    return;
+  }
   if (r.outcome === "done") {
     walletsResult(
       "success",
@@ -2180,6 +2417,27 @@ await listen<PassResult>("passphrase-result", (event) => {
 
 await listen<DraftResult>("draft-result", (event) => {
   const r = event.payload;
+  const page = draftPage.get(r.id) ?? "send";
+  draftPage.delete(r.id);
+  if (page !== "send") {
+    if (r.outcome === "sent") {
+      stakeResult(
+        "success",
+        page === "stake"
+          ? `Stake sent. Transaction ${r.txid}. It counts once it confirms and matures.`
+          : `Finality key sent. Transaction ${r.txid}. Start staking once it confirms.`,
+      );
+      el<HTMLFormElement>("stk-form").reset();
+    } else if (r.outcome === "rejected") {
+      stakeResult("warning", "Rejected. Nothing was sent.");
+    } else {
+      stakeResult("danger", `Not sent: ${r.error}`);
+    }
+    void refreshStake();
+    void refreshWallet();
+    void refreshRecent();
+    return;
+  }
   if (r.outcome === "sent") {
     sendResult("success", `Sent. Transaction ${r.txid}`);
     resetSendForm();

@@ -14,13 +14,14 @@ use b3_hive::book;
 use b3_hive::bootstrap;
 use b3_hive::chain;
 use b3_hive::console;
-use b3_hive::drafts::{DraftStore, Outpoint};
+use b3_hive::drafts::{DraftStore, Outpoint, Request as Draft};
 use b3_hive::history::{self, Filter, Kind};
 use b3_hive::node::{Network, Node, NodeConfig, NodeStatus};
 use b3_hive::passphrase::{self, Entry, Kind as PassKind, Request};
 use b3_hive::receive;
 use b3_hive::rpc::{Client, RpcError};
 use b3_hive::settings::{self, NodeSettings};
+use b3_hive::stake;
 use b3_hive::wallet;
 
 const W: &str = wallet::SPIKE_WALLET;
@@ -432,9 +433,16 @@ fn a_drafted_send_is_submitted_exactly_once() {
     assert_eq!(reserved(&test.admin()).len(), funded.inputs.len());
 
     let mut store = DraftStore::default();
-    let id = store.insert(summary.clone(), funded).unwrap();
-    let draft = store.take(&id).unwrap();
-    let hex = wallet::sign(client, &draft.summary, &draft.funded).unwrap();
+    let id = store
+        .insert(Draft::Pay {
+            summary: summary.clone(),
+            funded,
+        })
+        .unwrap();
+    let Draft::Pay { summary, funded } = store.take(&id).unwrap().request else {
+        panic!("not a payment");
+    };
+    let hex = wallet::sign(client, &summary, &funded).unwrap();
     let txid = wallet::broadcast(client, &hex).unwrap();
     assert!(store.take(&id).is_none(), "a decided draft must be gone");
     assert_eq!(test.mempool(), vec![txid]);
@@ -841,4 +849,92 @@ lines"
     )
     .is_err());
     assert_eq!(book::contacts(client, W).unwrap().len(), 2);
+}
+
+/// A modern-B3 regtest: H = 0, a 130-block PoW corridor, then Modern PoS
+/// with a one-validator finality set.
+const MODERN_REGTEST: &str = "[regtest]
+b3modernregtest=1
+b3corridorlength=130
+b3minfinalityset=1
+b3epochlength=10
+b3checkpointinterval=5
+b3blockinterval=1
+b3roundseconds=1
+addresstype=legacy
+changetype=legacy
+";
+
+#[test]
+fn staking_unlocks_only_to_create_and_start() {
+    let Some((test, status)) = TestNode::start_prepared("stake", |dir| {
+        std::fs::write(dir.join("b3coin.conf"), MODERN_REGTEST).unwrap();
+    }) else {
+        return;
+    };
+    assert!(matches!(status, NodeStatus::Ready { .. }), "{status:?}");
+    let client = test.node.client().unwrap();
+    let admin = test.admin();
+    wallet::ensure_wallet(client).unwrap();
+    let mine = |n: u64| {
+        let to = admin.call_wallet(W, "getnewaddress", json!([])).unwrap();
+        admin.call("generatetoaddress", json!([n, to])).unwrap();
+    };
+    // Corridor blocks, so some coinbase coins are mature.
+    mine(115);
+    let pass = "open sesame";
+    let request = Request {
+        id: "r".into(),
+        kind: PassKind::Encrypt,
+        wallet: W.into(),
+    };
+    passphrase::apply(client, &request, &entry("", pass)).unwrap();
+
+    let info = stake::status(client, W).unwrap();
+    assert_eq!(info.phase, "corridor");
+    assert!(info.validator_key.is_none() && info.finality.is_none());
+    assert!(stake::check_stake(client, W, "0.0000001")
+        .unwrap_err()
+        .contains("minimum stake"));
+    assert_eq!(stake::check_stake(client, W, "10").unwrap(), "10");
+
+    // Creating a stake and binding the key need the wallet unlocked, and
+    // only for that: the approval window unlocks, calls and locks again.
+    assert!(stake::create(client, W, "10").is_err());
+    wallet::unlock_for_signing(client, W, pass).unwrap();
+    stake::create(client, W, "10").unwrap();
+    stake::bind(client, W).unwrap();
+    passphrase::lock(client, W).unwrap();
+    mine(1);
+
+    let info = stake::status(client, W).unwrap();
+    assert_eq!(info.stakes.len(), 1);
+    assert_eq!(info.stakes[0].amount, "10.000000000");
+    assert_eq!(info.stakes[0].status, "PENDING");
+    let finality = info.finality.unwrap();
+    // Locked, the node cannot tell whose key is bound.
+    assert!(finality.bound && finality.key_is_ours.is_none());
+    assert!(!info.staking.running);
+
+    // Starting needs the passphrase, and leaves the wallet locked but staking.
+    assert!(stake::start(client, W, None)
+        .unwrap_err()
+        .contains("passphrase"));
+    assert_eq!(
+        stake::start(client, W, Some("wrong")).unwrap_err(),
+        "The passphrase is not correct."
+    );
+    stake::start(client, W, Some(pass)).unwrap();
+    assert_eq!(
+        wallet::security(client, W).unwrap(),
+        wallet::Security::Locked
+    );
+    let info = stake::status(client, W).unwrap();
+    assert!(info.staking.running && info.staking.ours && info.staking.finality_signing);
+    assert!(stake::start(client, W, Some(pass))
+        .unwrap_err()
+        .contains("already running"));
+
+    stake::stop(client, W).unwrap();
+    assert!(!stake::status(client, W).unwrap().staking.running);
 }

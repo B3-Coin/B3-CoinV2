@@ -1,8 +1,9 @@
 //! Value-moving actions wait here as drafts until the approval window decides.
 //!
-//! A draft holds the funded, unsigned transaction the core built (its coins
-//! reserved in the wallet) and the core's own decoding of it. It is signed
-//! only on approval, so a locked wallet can ask for its passphrase in the
+//! A payment draft holds the funded, unsigned transaction the core built (its
+//! coins reserved in the wallet) and the core's own decoding of it. Staking
+//! drafts hold what the node is to be asked for. Nothing is signed or sent
+//! before approval, so a locked wallet can ask for its passphrase in the
 //! approval window. Taking a draft removes it, so one approval can submit it
 //! once and only once; page code never sees or supplies the transaction.
 
@@ -31,10 +32,55 @@ pub struct SendSummary {
     pub inputs: usize,
 }
 
+/// What a draft asks for. The approval window sees all of it except a
+/// payment's funded transaction.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Request {
+    /// A payment: the core's decoding and the unsigned transaction.
+    Pay {
+        summary: SendSummary,
+        #[serde(skip)]
+        funded: Funded,
+    },
+    /// Lock `amount` as a stake for this wallet's validator (createstake).
+    Stake {
+        chain: String,
+        wallet: String,
+        amount: String,
+        /// Blocks after it confirms until it counts.
+        activation_depth: i64,
+    },
+    /// Bind, or rotate, this wallet's BLS finality key (bindfinalitykey).
+    BindFinality {
+        chain: String,
+        wallet: String,
+        rotate: bool,
+    },
+}
+
+impl Request {
+    pub fn wallet(&self) -> &str {
+        match self {
+            Request::Pay { summary, .. } => &summary.wallet,
+            Request::Stake { wallet, .. } | Request::BindFinality { wallet, .. } => wallet,
+        }
+    }
+
+    /// The coins a payment holds back; the node picks a stake's coins only
+    /// when it is approved.
+    pub fn reserved(&self) -> &[Outpoint] {
+        match self {
+            Request::Pay { funded, .. } => &funded.inputs,
+            _ => &[],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DraftView {
     pub id: String,
-    pub summary: SendSummary,
+    pub request: Request,
     /// The wallet is encrypted and locked: approving needs its passphrase.
     pub locked: bool,
 }
@@ -62,8 +108,7 @@ pub struct Funded {
 #[derive(Debug, Clone)]
 pub struct Draft {
     pub id: String,
-    pub summary: SendSummary,
-    pub funded: Funded,
+    pub request: Request,
 }
 
 #[derive(Debug, Default)]
@@ -74,11 +119,7 @@ pub struct DraftStore {
 }
 
 impl DraftStore {
-    pub fn insert(
-        &mut self,
-        summary: SendSummary,
-        funded: Funded,
-    ) -> Result<String, getrandom::Error> {
+    pub fn insert(&mut self, request: Request) -> Result<String, getrandom::Error> {
         let mut nonce = [0u8; 8];
         getrandom::fill(&mut nonce)?;
         let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
@@ -88,8 +129,7 @@ impl DraftStore {
             id.clone(),
             Draft {
                 id: id.clone(),
-                summary,
-                funded,
+                request,
             },
         );
         Ok(id)
@@ -134,21 +174,52 @@ mod tests {
         }
     }
 
-    fn funded(psbt: &str) -> Funded {
-        Funded {
-            psbt: psbt.into(),
-            inputs: vec![],
-            labels: vec![],
+    fn pay(wallet: &str, psbt: &str) -> Request {
+        Request::Pay {
+            summary: summary(wallet),
+            funded: Funded {
+                psbt: psbt.into(),
+                inputs: vec![Outpoint {
+                    txid: "aa".into(),
+                    vout: 0,
+                }],
+                labels: vec![],
+            },
         }
+    }
+
+    fn psbt(draft: Draft) -> String {
+        match draft.request {
+            Request::Pay { funded, .. } => funded.psbt,
+            other => panic!("not a payment: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_approval_window_never_sees_the_transaction() {
+        let view = serde_json::to_value(pay("w", "secret-psbt")).unwrap();
+        assert_eq!(view["kind"], "pay");
+        assert_eq!(view["summary"]["wallet"], "w");
+        assert!(!view.to_string().contains("secret-psbt"));
+        let stake = Request::Stake {
+            chain: "main".into(),
+            wallet: "w".into(),
+            amount: "10".into(),
+            activation_depth: 20,
+        };
+        assert_eq!(serde_json::to_value(&stake).unwrap()["kind"], "stake");
+        assert_eq!(stake.wallet(), "w");
+        assert!(stake.reserved().is_empty());
+        assert_eq!(pay("w", "p").reserved().len(), 1);
     }
 
     #[test]
     fn a_draft_can_be_taken_once() {
         let mut store = DraftStore::default();
-        let id = store.insert(summary("t1"), funded("beef")).unwrap();
+        let id = store.insert(pay("t1", "beef")).unwrap();
         assert_eq!(store.oldest().unwrap().id, id);
-        assert_eq!(store.get(&id).unwrap().funded.psbt, "beef");
-        assert_eq!(store.take(&id).unwrap().funded.psbt, "beef");
+        assert_eq!(psbt(store.get(&id).unwrap()), "beef");
+        assert_eq!(psbt(store.take(&id).unwrap()), "beef");
         assert!(store.take(&id).is_none());
         assert!(store.oldest().is_none());
     }
@@ -156,10 +227,10 @@ mod tests {
     #[test]
     fn oldest_first_and_unguessable_ids() {
         let mut store = DraftStore::default();
-        let first = store.insert(summary("t1"), funded("01")).unwrap();
-        let second = store.insert(summary("t2"), funded("02")).unwrap();
+        let first = store.insert(pay("t1", "01")).unwrap();
+        let second = store.insert(pay("t2", "02")).unwrap();
         assert_ne!(first, second);
-        assert_eq!(store.oldest().unwrap().summary.wallet, "t1");
+        assert_eq!(store.oldest().unwrap().request.wallet(), "t1");
         assert!(store.take("00000000-0000000000000000").is_none());
         assert_eq!(store.take_all().len(), 2);
         assert!(store.oldest().is_none());

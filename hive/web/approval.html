@@ -12,7 +12,7 @@
       <div class="empty" id="empty" hidden>
         <div class="empty-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-check" /></svg></div>
         <h3>Nothing to approve</h3>
-        <p>Payments you prepare in B3 Hive wait here for your decision.</p>
+        <p>Payments and stakes you prepare in B3 Hive wait here for your decision.</p>
       </div>
 
       <section class="approval-draft" id="draft" hidden>
@@ -23,6 +23,11 @@
           </div>
         </div>
         <div class="modal-body stack">
+          <div class="stack" id="action-body" hidden>
+            <p id="action-text"></p>
+            <div class="details" id="action-rows"></div>
+          </div>
+          <div class="stack" id="pay-body">
           <p>This payment is permanent once sent. Check every line before you approve it.</p>
           <div class="details" id="outputs"></div>
           <div class="details">
@@ -39,10 +44,11 @@
               <div class="drow"><span class="dkey">Coins spent</span><span class="dval tnum" id="inputs"></span></div>
             </div>
           </details>
+          </div>
           <div class="field" id="pass-field" hidden>
             <label for="pass">Wallet passphrase</label>
             <input class="input" type="password" id="pass" autocomplete="off" spellcheck="false" />
-            <span class="help">The wallet is locked. It unlocks only to sign this payment and locks again straight after.</span>
+            <span class="help" id="pass-help"></span>
           </div>
           <div class="banner banner-danger" id="error" role="alert" hidden></div>
         </div>

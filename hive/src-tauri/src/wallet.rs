@@ -438,6 +438,26 @@ pub(crate) fn funding_args(payment: &Payment) -> Result<(Value, Vec<(String, Str
     Ok((json!([inputs, outputs, 0, options]), labels))
 }
 
+/// An exact decimal amount (at most 9 places) in base units.
+fn base_units(amount: &str) -> Option<u128> {
+    let (whole, frac) = amount.split_once('.').unwrap_or((amount, ""));
+    if frac.len() > 9 || !(whole.bytes().chain(frac.bytes())).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let whole: u128 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let frac: u128 = format!("{frac:0<9}").parse().ok()?;
+    whole.checked_mul(1_000_000_000)?.checked_add(frac)
+}
+
+/// `a < b` for exact decimal amounts; amounts it cannot read compare as not less.
+pub(crate) fn amount_less(a: &str, b: &str) -> bool {
+    matches!((base_units(a), base_units(b)), (Some(a), Some(b)) if a < b)
+}
+
 /// A label as the address book keeps it: trimmed, one line, at most
 /// MAX_LABEL characters. Empty is allowed.
 pub(crate) fn check_label(label: &str) -> Result<&str, String> {
@@ -763,6 +783,15 @@ mod tests {
             amount: amount.into(),
             ..Recipient::default()
         }
+    }
+
+    #[test]
+    fn amounts_compare_exactly() {
+        assert!(amount_less("0.000000999", "0.000001"));
+        assert!(!amount_less("0.000001000", "0.000001"));
+        assert!(amount_less("9.99", "10"));
+        assert!(!amount_less("10", "9.999999999"));
+        assert!(!amount_less("x", "1"));
     }
 
     #[test]
