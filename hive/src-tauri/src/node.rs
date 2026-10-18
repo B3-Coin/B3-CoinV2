@@ -572,15 +572,20 @@ mod tests {
             b3coind: "b3coind".into(),
             datadir: "/tmp/hive".into(),
             network: Network::Regtest,
-            regtest_args: vec![
-                "-connect=127.0.0.1:12000".into(),
-                "-rpcport=1".into(),
-            ],
+            regtest_args: vec!["-connect=127.0.0.1:12000".into(), "-rpcport=1".into()],
         };
         let page = Credentials::generate(PAGE_USER).unwrap();
         let console = Credentials::generate(CONSOLE_USER).unwrap();
         let args = node_args(&config, &page, &console, 18443);
-        assert_eq!(args[..4], ["-regtest", "-dnsseed=0", "-connect=127.0.0.1:12000", "-rpcport=1"]);
+        assert_eq!(
+            args[..4],
+            [
+                "-regtest",
+                "-dnsseed=0",
+                "-connect=127.0.0.1:12000",
+                "-rpcport=1"
+            ]
+        );
         assert!(!args.iter().any(|a| a == "-connect=0" || a == "-listen=0"));
         // Hive's own port comes later, so it is the one b3coind uses.
         let ports: Vec<_> = args.iter().filter(|a| a.starts_with("-rpcport=")).collect();
