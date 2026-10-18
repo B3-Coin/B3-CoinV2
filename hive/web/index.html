@@ -72,6 +72,23 @@
           </div>
         </header>
 
+        <div class="backdrop" id="detail-backdrop" hidden>
+          <div class="modal modal--lg" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+            <div class="modal-head">
+              <div>
+                <h2 id="detail-title"></h2>
+                <div class="sub" id="detail-sub"></div>
+              </div>
+              <button class="btn btn-ghost btn-icon" type="button" id="detail-close" aria-label="Close">
+                <svg class="i" aria-hidden="true"><use href="/icons.svg#i-close" /></svg>
+              </button>
+            </div>
+            <div class="modal-body">
+              <div class="details" id="detail-rows"></div>
+            </div>
+          </div>
+        </div>
+
         <main class="view view--flow" id="view-setup" hidden>
           <div class="stack">
             <p class="flow-sub">
@@ -344,22 +361,6 @@
           </div>
           <div class="banner mt-4" id="activity-result" role="status" hidden></div>
 
-          <div class="backdrop" id="tx-backdrop" hidden>
-            <div class="modal modal--lg" role="dialog" aria-modal="true" aria-labelledby="tx-title">
-              <div class="modal-head">
-                <div>
-                  <h2 id="tx-title">Transaction</h2>
-                  <div class="sub" id="tx-sub"></div>
-                </div>
-                <button class="btn btn-ghost btn-icon" type="button" id="tx-close" aria-label="Close">
-                  <svg class="i" aria-hidden="true"><use href="/icons.svg#i-close" /></svg>
-                </button>
-              </div>
-              <div class="modal-body">
-                <div class="details" id="tx-details"></div>
-              </div>
-            </div>
-          </div>
         </main>
 
         <main class="view" id="view-network" hidden>
@@ -375,6 +376,12 @@
                 <div class="drow"><span class="dkey">Connections</span><span class="dval tnum" id="net-connections">—</span></div>
                 <div class="drow"><span class="dkey">Blocks / headers</span><span class="dval tnum" id="net-height">—</span></div>
                 <div class="drow"><span class="dkey">Size on disk</span><span class="dval tnum" id="net-disk">—</span></div>
+                <div class="drow"><span class="dkey">Started</span><span class="dval tnum" id="net-started">—</span></div>
+                <div class="drow"><span class="dkey">Local addresses</span><span class="dval is-mono" id="net-local">—</span></div>
+                <div class="drow"><span class="dkey">Traffic</span><span class="dval tnum" id="net-traffic">—</span></div>
+                <div class="drow"><span class="dkey">Memory pool</span><span class="dval tnum" id="net-mempool">—</span></div>
+                <div class="drow"><span class="dkey">Data folder</span><span class="dval is-mono wrap-any" id="net-datadir">—</span></div>
+                <div class="drow"><span class="dkey">Debug log</span><span class="dval is-mono wrap-any" id="net-debuglog">—</span></div>
               </div>
             </div>
             <div class="card">
@@ -402,6 +409,27 @@
                 <div class="empty-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg></div>
                 <h3>No peers</h3>
                 <p id="peer-empty-text">The node is not connected to anyone.</p>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-shield" /></svg>Banned peers</h2>
+                <span class="t-sm muted tnum" id="ban-count"></span>
+              </div>
+              <div class="table-wrap" id="ban-table" hidden>
+                <table class="tbl">
+                  <thead>
+                    <tr>
+                      <th>Address</th>
+                      <th class="num">Banned</th>
+                      <th class="num">Until</th>
+                    </tr>
+                  </thead>
+                  <tbody id="ban-rows"></tbody>
+                </table>
+              </div>
+              <div class="empty empty--tight" id="ban-empty">
+                <p>No peers are banned. The console's setban and clearbanned commands manage bans.</p>
               </div>
             </div>
             <div class="banner" id="network-result" role="status" hidden></div>

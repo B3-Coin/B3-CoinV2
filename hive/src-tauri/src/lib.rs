@@ -214,6 +214,31 @@ async fn wallet_activity(
     .await
 }
 
+#[derive(Serialize)]
+pub struct NodeInfo {
+    #[serde(flatten)]
+    pub details: chain::NodeDetails,
+    pub datadir: String,
+    pub debug_log: String,
+}
+
+/// The Network page's Information rows and banned peers.
+#[tauri::command]
+async fn node_info(core: State<'_, Arc<Core>>) -> Result<NodeInfo, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let client = node.client().ok_or("The node is not ready yet.")?;
+        let chain_dir = core.config.network.chain_dir(&core.config.datadir);
+        Ok(NodeInfo {
+            details: chain::details(client).map_err(|e| e.to_string())?,
+            datadir: core.config.datadir.display().to_string(),
+            debug_log: chain_dir.join("debug.log").display().to_string(),
+        })
+    })
+    .await
+}
+
 /// The Activity page: the newest `count` lines that pass the filter.
 #[tauri::command]
 async fn wallet_history(
@@ -988,6 +1013,7 @@ pub fn run() {
             update_status,
             update_check,
             update_download,
+            node_info,
             wallet_history,
             wallet_transaction,
             wallet_export_csv,

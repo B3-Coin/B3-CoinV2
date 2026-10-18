@@ -66,6 +66,36 @@ type Peer = {
   bytes_sent: number;
   bytes_received: number;
   connected_since: number;
+  network: string;
+  services: string[];
+  permissions: string[];
+  transport: string;
+  session_id: string;
+  relays_transactions: boolean;
+  high_bandwidth_to: boolean;
+  high_bandwidth_from: boolean;
+  synced_headers: number;
+  last_send: number;
+  last_receive: number;
+  last_block: number;
+  last_transaction: number;
+  min_ping_ms: number | null;
+  ping_wait_ms: number | null;
+  time_offset: number;
+  mapped_as: number | null;
+};
+
+// Mirrors NodeInfo in src-tauri/src/lib.rs (chain::NodeDetails, flattened).
+type NodeInfo = {
+  uptime: number;
+  local_addresses: string[];
+  mempool_usage: number;
+  mempool_max: number;
+  total_received: number;
+  total_sent: number;
+  banned: { address: string; created: number; until: number }[];
+  datadir: string;
+  debug_log: string;
 };
 
 // Mirrors ActivityEntry in src-tauri/src/wallet.rs.
@@ -694,15 +724,24 @@ function detailRow(key: string, value: string | Node, copy?: string): HTMLElemen
   return row;
 }
 
-let txReturnFocus: HTMLElement | null = null;
+let detailReturnFocus: HTMLElement | null = null;
 
-function closeTransaction(): void {
-  el("tx-backdrop").hidden = true;
-  txReturnFocus?.focus();
+/// The details dialog shared by transactions and peers.
+function openDetails(title: string, sub: string, rows: HTMLElement[]): void {
+  detailReturnFocus = document.activeElement as HTMLElement | null;
+  el("detail-title").textContent = title;
+  el("detail-sub").textContent = sub;
+  el("detail-rows").replaceChildren(...rows);
+  el("detail-backdrop").hidden = false;
+  el("detail-close").focus();
+}
+
+function closeDetails(): void {
+  el("detail-backdrop").hidden = true;
+  detailReturnFocus?.focus();
 }
 
 async function showTransaction(txid: string): Promise<void> {
-  txReturnFocus = document.activeElement as HTMLElement | null;
   try {
     const d = await invoke<TxDetails>("wallet_transaction", { txid });
     const rows: HTMLElement[] = [];
@@ -738,21 +777,18 @@ async function showTransaction(txid: string): Promise<void> {
     rows.push(detailRow("Transaction id", d.txid, d.txid));
     if (d.wtxid && d.wtxid !== d.txid) rows.push(detailRow("Witness id", d.wtxid, d.wtxid));
     rows.push(detailRow("Size", bytes(d.size)));
-    el("tx-sub").textContent = shorten(d.txid, 12, 12);
-    el("tx-details").replaceChildren(...rows);
-    el("tx-backdrop").hidden = false;
-    el("tx-close").focus();
+    openDetails("Transaction", shorten(d.txid, 12, 12), rows);
   } catch (e) {
     activityResult("danger", `The transaction could not be read: ${String(e)}`);
   }
 }
 
-el("tx-close").addEventListener("click", closeTransaction);
-el("tx-backdrop").addEventListener("click", (e) => {
-  if (e.target === el("tx-backdrop")) closeTransaction();
+el("detail-close").addEventListener("click", closeDetails);
+el("detail-backdrop").addEventListener("click", (e) => {
+  if (e.target === el("detail-backdrop")) closeDetails();
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !el("tx-backdrop").hidden) closeTransaction();
+  if (e.key === "Escape" && !el("detail-backdrop").hidden) closeDetails();
 });
 
 // ---- network ---------------------------------------------------------------
@@ -790,8 +826,63 @@ function cell(text: string, className = "", title = ""): HTMLTableCellElement {
   return td;
 }
 
+function when(unix: number): string {
+  return unix > 0 ? `${ago(unix)} (${dateTime(unix)})` : "Never";
+}
+
+function ms(value: number | null): string {
+  return value === null ? "—" : `${value < 10 ? value.toFixed(1) : Math.round(value)} ms`;
+}
+
+const yesNo = (b: boolean) => (b ? "Yes" : "No");
+
+// Qt's peer details, in its order.
+function showPeer(p: Peer): void {
+  const direction = DIRECTION[p.connection_type] ?? (p.inbound ? "Inbound" : "Outbound");
+  const hb = [p.high_bandwidth_to && "to", p.high_bandwidth_from && "from"].filter(Boolean).join(" and ");
+  const rows = [
+    detailRow("Permissions", p.permissions.join(", ") || "None"),
+    detailRow("Direction / type", direction),
+    detailRow("Transport", p.transport || "—"),
+  ];
+  if (p.session_id) rows.push(detailRow("Session id", p.session_id, p.session_id));
+  rows.push(
+    detailRow("Network", p.network || "—"),
+    detailRow("Version", String(p.version || "—")),
+    detailRow("User agent", p.user_agent || "—"),
+    detailRow("Services", p.services.join(", ") || "None"),
+    detailRow("Transaction relay", yesNo(p.relays_transactions)),
+    detailRow("High bandwidth", hb || "No"),
+    detailRow("Synced headers", p.synced_headers < 0 ? "—" : count(p.synced_headers)),
+    detailRow("Synced blocks", p.synced_blocks < 0 ? "—" : count(p.synced_blocks)),
+    detailRow("Connected", when(p.connected_since)),
+    detailRow("Last block", when(p.last_block)),
+    detailRow("Last transaction", when(p.last_transaction)),
+    detailRow("Last send", when(p.last_send)),
+    detailRow("Last receive", when(p.last_receive)),
+    detailRow("Sent", bytes(p.bytes_sent)),
+    detailRow("Received", bytes(p.bytes_received)),
+    detailRow("Ping time", ms(p.ping_ms)),
+    detailRow("Ping wait", ms(p.ping_wait_ms)),
+    detailRow("Min ping", ms(p.min_ping_ms)),
+    detailRow("Time offset", `${p.time_offset} s`),
+    detailRow("Mapped AS", p.mapped_as === null ? "—" : String(p.mapped_as)),
+  );
+  openDetails(`Peer ${p.id}`, p.address, rows);
+}
+
 function peerRow(p: Peer): HTMLTableRowElement {
   const tr = document.createElement("tr");
+  tr.className = "clickable";
+  tr.tabIndex = 0;
+  tr.title = "Show this peer's details";
+  tr.addEventListener("click", () => showPeer(p));
+  tr.addEventListener("keydown", (k) => {
+    if (k.key === "Enter" || k.key === " ") {
+      k.preventDefault();
+      showPeer(p);
+    }
+  });
   const direction = DIRECTION[p.connection_type] ?? (p.inbound ? "Inbound" : "Outbound");
   tr.append(
     cell(p.address, "mono"),
@@ -812,14 +903,41 @@ function networkResult(text: string): void {
   box.textContent = text;
 }
 
+function renderNodeDetails(info: NodeInfo, mempoolTransactions: number): void {
+  const started = Math.floor(Date.now() / 1000) - info.uptime;
+  el("net-started").textContent = when(started);
+  el("net-local").textContent = info.local_addresses.join(", ") || "None announced";
+  el("net-traffic").textContent = `${bytes(info.total_received)} received, ${bytes(info.total_sent)} sent`;
+  el("net-mempool").textContent =
+    `${plural(mempoolTransactions, "transaction")}, ${bytes(info.mempool_usage)} of ${bytes(info.mempool_max)} memory`;
+  el("net-datadir").textContent = info.datadir;
+  el("net-debuglog").textContent = info.debug_log;
+  el("ban-count").textContent = info.banned.length ? plural(info.banned.length, "address", "addresses") : "";
+  el("ban-table").hidden = info.banned.length === 0;
+  el("ban-empty").hidden = info.banned.length > 0;
+  el("ban-rows").replaceChildren(
+    ...info.banned.map((b) => {
+      const tr = document.createElement("tr");
+      tr.append(
+        cell(b.address, "mono"),
+        cell(ago(b.created), "num", dateTime(b.created)),
+        cell(dateTime(b.until), "num"),
+      );
+      return tr;
+    }),
+  );
+}
+
 const refreshNetwork = single(async () => {
   try {
-    const [overview, peers] = await Promise.all([
+    const [overview, peers, info] = await Promise.all([
       invoke<ChainOverview>("chain_overview"),
       invoke<Peer[]>("network_peers"),
+      invoke<NodeInfo>("node_info"),
     ]);
     networkResult("");
     renderNodeInfo(overview);
+    renderNodeDetails(info, overview.mempool_transactions);
     el("peer-count").textContent = peers.length ? plural(peers.length, "peer") : "";
     el("peer-table").hidden = peers.length === 0;
     el("peer-empty").hidden = peers.length > 0;

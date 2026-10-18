@@ -1041,3 +1041,7 @@ input.select-sm, .input.select-sm { min-height: var(--min-target-sm); }
 
 /* Long hashes and addresses break anywhere rather than overflow. */
 .wrap-any { overflow-wrap: anywhere; word-break: break-all; }
+
+/* Table rows that open details (Network's peers). */
+.tbl tr.clickable { cursor: pointer; }
+.tbl tr.clickable:hover, .tbl tr.clickable:focus-visible { background: var(--bg-subtle); }

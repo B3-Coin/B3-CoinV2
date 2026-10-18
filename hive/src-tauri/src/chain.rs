@@ -47,6 +47,47 @@ pub struct Peer {
     pub bytes_received: u64,
     /// Unix seconds.
     pub connected_since: i64,
+    /// The rest of Qt's peer details.
+    pub network: String,
+    pub services: Vec<String>,
+    pub permissions: Vec<String>,
+    pub transport: String,
+    pub session_id: String,
+    pub relays_transactions: bool,
+    pub high_bandwidth_to: bool,
+    pub high_bandwidth_from: bool,
+    /// -1 when unknown.
+    pub synced_headers: i64,
+    /// Unix seconds; 0 for never.
+    pub last_send: i64,
+    pub last_receive: i64,
+    pub last_block: i64,
+    pub last_transaction: i64,
+    pub min_ping_ms: Option<f64>,
+    pub ping_wait_ms: Option<f64>,
+    pub time_offset: i64,
+    pub mapped_as: Option<i64>,
+}
+
+/// Qt's node window Information tab, besides what ChainOverview has.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NodeDetails {
+    /// Seconds since b3coind started.
+    pub uptime: u64,
+    /// Addresses the node announces, as address:port.
+    pub local_addresses: Vec<String>,
+    pub mempool_usage: u64,
+    pub mempool_max: u64,
+    pub total_received: u64,
+    pub total_sent: u64,
+    pub banned: Vec<Ban>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Ban {
+    pub address: String,
+    pub created: i64,
+    pub until: i64,
 }
 
 pub fn overview(client: &Client) -> Result<ChainOverview, RpcError> {
@@ -54,6 +95,53 @@ pub fn overview(client: &Client) -> Result<ChainOverview, RpcError> {
     let network = client.call("getnetworkinfo", json!([]))?;
     let mempool = client.call("getmempoolinfo", json!([]))?;
     Ok(parse_overview(&chain, &network, &mempool))
+}
+
+pub fn details(client: &Client) -> Result<NodeDetails, RpcError> {
+    let uptime = client.call("uptime", json!([]))?;
+    let network = client.call("getnetworkinfo", json!([]))?;
+    let mempool = client.call("getmempoolinfo", json!([]))?;
+    let totals = client.call("getnettotals", json!([]))?;
+    let banned = client.call("listbanned", json!([]))?;
+    Ok(parse_details(&uptime, &network, &mempool, &totals, &banned))
+}
+
+fn parse_details(
+    uptime: &Value,
+    network: &Value,
+    mempool: &Value,
+    totals: &Value,
+    banned: &Value,
+) -> NodeDetails {
+    let list = |v: &Value| v.as_array().cloned().unwrap_or_default();
+    NodeDetails {
+        uptime: count(uptime),
+        local_addresses: list(&network["localaddresses"])
+            .iter()
+            .map(|a| {
+                let host = text(&a["address"]);
+                // IPv6 in brackets, as b3coind takes it back.
+                let host = if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host
+                };
+                format!("{host}:{}", count(&a["port"]))
+            })
+            .collect(),
+        mempool_usage: count(&mempool["usage"]),
+        mempool_max: count(&mempool["maxmempool"]),
+        total_received: count(&totals["totalbytesrecv"]),
+        total_sent: count(&totals["totalbytessent"]),
+        banned: list(banned)
+            .iter()
+            .map(|b| Ban {
+                address: text(&b["address"]),
+                created: int(&b["ban_created"], 0),
+                until: int(&b["banned_until"], 0),
+            })
+            .collect(),
+    }
 }
 
 pub fn peers(client: &Client) -> Result<Vec<Peer>, RpcError> {
@@ -66,6 +154,18 @@ pub fn peers(client: &Client) -> Result<Vec<Peer>, RpcError> {
 
 fn text(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_owned()
+}
+
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn count(v: &Value) -> u64 {
@@ -133,12 +233,84 @@ fn parse_peer(p: &Value) -> Peer {
         bytes_sent: count(&p["bytessent"]),
         bytes_received: count(&p["bytesrecv"]),
         connected_since: int(&p["conntime"], 0),
+        network: text(&p["network"]),
+        services: strings(&p["servicesnames"]),
+        permissions: strings(&p["permissions"]),
+        transport: text(&p["transport_protocol_type"]),
+        session_id: text(&p["session_id"]),
+        relays_transactions: p["relaytxes"].as_bool().unwrap_or(false),
+        high_bandwidth_to: p["bip152_hb_to"].as_bool().unwrap_or(false),
+        high_bandwidth_from: p["bip152_hb_from"].as_bool().unwrap_or(false),
+        synced_headers: int(&p["synced_headers"], -1),
+        last_send: int(&p["lastsend"], 0),
+        last_receive: int(&p["lastrecv"], 0),
+        last_block: int(&p["last_block"], 0),
+        last_transaction: int(&p["last_transaction"], 0),
+        min_ping_ms: p["minping"].as_f64().map(|s| s * 1000.0),
+        ping_wait_ms: p["pingwait"].as_f64().map(|s| s * 1000.0),
+        time_offset: int(&p["timeoffset"], 0),
+        mapped_as: p["mapped_as"].as_i64(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn details_read_qt_information_tab() {
+        let d = parse_details(
+            &json!(3600),
+            &json!({"localaddresses": [
+                {"address": "203.0.113.5", "port": 5647, "score": 1},
+                {"address": "2001:db8::1", "port": 5647, "score": 1}
+            ]}),
+            &json!({"usage": 2048, "maxmempool": 300000000}),
+            &json!({"totalbytesrecv": 10, "totalbytessent": 20}),
+            &json!([{"address": "198.51.100.0/24", "ban_created": 5, "banned_until": 9}]),
+        );
+        assert_eq!(d.uptime, 3600);
+        assert_eq!(
+            d.local_addresses,
+            ["203.0.113.5:5647", "[2001:db8::1]:5647"]
+        );
+        assert_eq!((d.mempool_usage, d.mempool_max), (2048, 300000000));
+        assert_eq!((d.total_received, d.total_sent), (10, 20));
+        assert_eq!(
+            d.banned,
+            [Ban {
+                address: "198.51.100.0/24".into(),
+                created: 5,
+                until: 9
+            }]
+        );
+    }
+
+    #[test]
+    fn peers_carry_qt_details() {
+        let p = parse_peer(&json!({
+            "id": 7, "addr": "203.0.113.9:5647", "network": "ipv4",
+            "servicesnames": ["NETWORK", "WITNESS"], "permissions": ["noban"],
+            "transport_protocol_type": "v2", "session_id": "ab", "relaytxes": true,
+            "bip152_hb_to": true, "synced_headers": 900, "lastsend": 11, "lastrecv": 12,
+            "last_block": 13, "last_transaction": 14, "minping": 0.02, "pingwait": 0.5,
+            "timeoffset": -2, "mapped_as": 64496
+        }));
+        assert_eq!(p.services, ["NETWORK", "WITNESS"]);
+        assert_eq!(p.permissions, ["noban"]);
+        assert!(p.relays_transactions && p.high_bandwidth_to && !p.high_bandwidth_from);
+        assert_eq!(
+            (p.synced_headers, p.last_block, p.time_offset),
+            (900, 13, -2)
+        );
+        assert_eq!(p.min_ping_ms, Some(20.0));
+        assert_eq!(p.mapped_as, Some(64496));
+        let bare = parse_peer(&json!({}));
+        assert_eq!(
+            (bare.synced_headers, bare.mapped_as, bare.ping_wait_ms),
+            (-1, None, None)
+        );
+    }
 
     #[test]
     fn overview_reads_the_three_rpcs() {

@@ -118,6 +118,18 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
     assert_eq!(o.mempool_transactions, 0);
     assert!(chain::peers(client).unwrap().is_empty());
 
+    // The Network page's Information rows, and a ban made in the console.
+    let d = chain::details(client).unwrap();
+    assert!(d.banned.is_empty());
+    assert!(d.mempool_max > 0);
+    test.admin()
+        .call("setban", json!(["192.0.2.1", "add", 3600]))
+        .unwrap();
+    let d = chain::details(client).unwrap();
+    assert_eq!(d.banned.len(), 1);
+    assert_eq!(d.banned[0].address, "192.0.2.1/32");
+    assert!(d.banned[0].until > d.banned[0].created);
+
     // Pages load the wallet at the same time; every one of them succeeds.
     thread::scope(|s| {
         let loads: Vec<_> = (0..4)
