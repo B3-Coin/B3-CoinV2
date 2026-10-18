@@ -1,8 +1,9 @@
 //! The passphrase window's requests: encrypt a wallet, change its
 //! passphrase, or unlock it just long enough to start staking. The main
-//! window only asks for one and hears done, cancelled or failed; the passphrase is typed in the passphrase window, handed to
-//! the core, used for one RPC call and dropped. It is never logged, stored
-//! or sent to another window.
+//! window only asks for one and hears done, cancelled or failed; the
+//! passphrase is typed in the passphrase window, handed to the core, used
+//! for one RPC call and dropped. It is never logged, stored or sent to
+//! another window.
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
