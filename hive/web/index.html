@@ -26,12 +26,20 @@
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-up" /></svg>
               <span class="nav-text">Send</span>
             </button>
+            <button class="nav-item" type="button" data-view="activity">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-activity" /></svg>
+              <span class="nav-text">Activity</span>
+            </button>
           </div>
           <div class="nav-group">
             <div class="nav-group-head">System</div>
             <button class="nav-item" type="button" id="open-console">
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-terminal" /></svg>
               <span class="nav-text">Console</span>
+            </button>
+            <button class="nav-item" type="button" data-view="network">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg>
+              <span class="nav-text">Network</span>
             </button>
             <button class="nav-item" type="button" data-view="updates">
               <svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg>
@@ -74,6 +82,14 @@
               </div>
             </div>
 
+            <div class="banner banner-warning" id="node-warnings" role="status" hidden>
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>
+              <div>
+                <strong>The node reports a warning</strong>
+                <div class="t-sm" id="node-warnings-text"></div>
+              </div>
+            </div>
+
             <div class="home-grid">
               <div class="card span-2" id="wallet" hidden>
                 <div class="hero">
@@ -105,13 +121,28 @@
               <div class="card" id="chain" hidden>
                 <div class="card-head">
                   <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-server" /></svg>Node</h2>
-                  <span class="badge badge-success"><span class="dot"></span>Running</span>
+                  <span class="badge badge-success" id="sync-badge"><span class="dot"></span><span id="sync-badge-text">Running</span></span>
                 </div>
                 <div class="card-pad details">
                   <div class="drow"><span class="dkey">Network</span><span class="dval" id="chain-name"></span></div>
                   <div class="drow"><span class="dkey">Blocks</span><span class="dval tnum" id="chain-blocks"></span></div>
                   <div class="drow"><span class="dkey">Best block</span><span class="dval is-mono" id="chain-best"></span></div>
+                  <div class="drow"><span class="dkey">Block time</span><span class="dval tnum" id="chain-time">—</span></div>
+                  <div class="drow"><span class="dkey">Peers</span><span class="dval tnum" id="chain-peers">—</span></div>
+                  <div class="drow"><span class="dkey">Waiting to confirm</span><span class="dval tnum" id="chain-mempool">—</span></div>
+                  <div id="sync" hidden>
+                    <div class="drow"><span class="dkey">Verified</span><span class="dval tnum" id="sync-percent"></span></div>
+                    <div class="progress mt-2"><div class="progress-bar" id="sync-bar"></div></div>
+                  </div>
                 </div>
+              </div>
+
+              <div class="card" id="recent" hidden>
+                <div class="card-head">
+                  <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-activity" /></svg>Recent activity</h2>
+                  <button class="btn btn-ghost btn-sm" type="button" data-view="activity">View all</button>
+                </div>
+                <div id="recent-list"></div>
               </div>
             </div>
           </div>
@@ -145,6 +176,66 @@
             </div>
           </form>
           <div class="banner mt-4" id="send-result" role="status" hidden></div>
+        </main>
+
+        <main class="view" id="view-activity" hidden>
+          <div class="card">
+            <div class="card-head">
+              <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-list" /></svg>Transactions</h2>
+              <span class="t-sm muted tnum" id="activity-count"></span>
+            </div>
+            <div id="activity-list"></div>
+            <div class="card-foot" id="activity-more-row" hidden>
+              <button class="btn btn-secondary btn-block" type="button" id="activity-more">Show older</button>
+            </div>
+          </div>
+          <div class="banner mt-4" id="activity-result" role="status" hidden></div>
+        </main>
+
+        <main class="view" id="view-network" hidden>
+          <div class="stack">
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-server" /></svg>This node</h2>
+                <span class="badge badge-neutral" id="net-state"></span>
+              </div>
+              <div class="card-pad details">
+                <div class="drow"><span class="dkey">Version</span><span class="dval is-mono" id="net-agent">—</span></div>
+                <div class="drow"><span class="dkey">Protocol</span><span class="dval tnum" id="net-protocol">—</span></div>
+                <div class="drow"><span class="dkey">Connections</span><span class="dval tnum" id="net-connections">—</span></div>
+                <div class="drow"><span class="dkey">Blocks / headers</span><span class="dval tnum" id="net-height">—</span></div>
+                <div class="drow"><span class="dkey">Size on disk</span><span class="dval tnum" id="net-disk">—</span></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg>Peers</h2>
+                <span class="t-sm muted tnum" id="peer-count"></span>
+              </div>
+              <div class="table-wrap" id="peer-table" hidden>
+                <table class="tbl">
+                  <thead>
+                    <tr>
+                      <th>Address</th>
+                      <th>Direction</th>
+                      <th>Version</th>
+                      <th class="num">Blocks</th>
+                      <th class="num">Ping</th>
+                      <th class="num">Sent / received</th>
+                      <th class="num">Connected</th>
+                    </tr>
+                  </thead>
+                  <tbody id="peer-rows"></tbody>
+                </table>
+              </div>
+              <div class="empty empty--tight" id="peer-empty">
+                <div class="empty-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg></div>
+                <h3>No peers</h3>
+                <p id="peer-empty-text">The node is not connected to anyone.</p>
+              </div>
+            </div>
+            <div class="banner" id="network-result" role="status" hidden></div>
+          </div>
         </main>
 
         <main class="view view--flow" id="view-updates" hidden>

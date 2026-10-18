@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { amountNode, el, formatAmount, initTheme, shorten, toggleTheme, type Theme } from "../shared/ui";
+import { amountNode, el, formatAmount, icon, initTheme, shorten, toggleTheme, type Theme } from "../shared/ui";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -10,6 +10,53 @@ type NodeStatus =
   | { phase: "failed"; error: string };
 
 type WalletOverview = { wallet: string; spendable: string; immature: string; can_fund: boolean };
+
+// Mirrors ChainOverview and Peer in src-tauri/src/chain.rs.
+type ChainOverview = {
+  chain: string;
+  blocks: number;
+  headers: number;
+  best_block_hash: string;
+  verification_progress: number;
+  initial_block_download: boolean;
+  median_time: number;
+  size_on_disk: number;
+  pruned: boolean;
+  user_agent: string;
+  protocol_version: number;
+  connections_in: number;
+  connections_out: number;
+  network_active: boolean;
+  mempool_transactions: number;
+  mempool_bytes: number;
+  warnings: string[];
+};
+
+type Peer = {
+  id: number;
+  address: string;
+  inbound: boolean;
+  connection_type: string;
+  user_agent: string;
+  version: number;
+  synced_blocks: number;
+  ping_ms: number | null;
+  bytes_sent: number;
+  bytes_received: number;
+  connected_since: number;
+};
+
+// Mirrors ActivityEntry in src-tauri/src/wallet.rs.
+type ActivityEntry = {
+  txid: string;
+  category: string;
+  amount: string;
+  fee: string | null;
+  confirmations: number;
+  time: number;
+  address: string;
+  label: string;
+};
 
 // Mirrors DraftResult in src-tauri/src/lib.rs (serde tag "outcome").
 type DraftResult =
@@ -28,11 +75,16 @@ showThemeIcon(await initTheme());
 const VIEWS = {
   home: { title: "Home", sub: "Your balance and your node" },
   send: { title: "Send", sub: "Pay someone in B3" },
+  activity: { title: "Activity", sub: "Your wallet's transactions" },
+  network: { title: "Network", sub: "Your node and its peers" },
   updates: { title: "Updates", sub: "Signed B3 Hive releases" },
 } as const;
 type View = keyof typeof VIEWS;
 
+let current: View = "home";
+
 function go(view: View): void {
+  current = view;
   for (const id of Object.keys(VIEWS)) el(`view-${id}`).hidden = id !== view;
   for (const item of document.querySelectorAll<HTMLElement>(".nav-item[data-view]")) {
     if (item.dataset.view === view) item.setAttribute("aria-current", "page");
@@ -42,6 +94,8 @@ function go(view: View): void {
   el("page-sub").textContent = VIEWS[view].sub;
   if (view === "send") el<HTMLInputElement>("address").focus();
   if (view === "updates") void refreshUpdates();
+  if (view === "activity") void refreshActivity();
+  if (view === "network") void refreshNetwork();
 }
 
 for (const button of document.querySelectorAll<HTMLElement>("[data-view]")) {
@@ -108,6 +162,9 @@ function render(status: NodeStatus): void {
       el("chain-best").textContent = shorten(status.best_block_hash, 10, 8);
       el("chain-best").title = status.best_block_hash;
       void refreshWallet();
+      void refreshOverview();
+      void refreshRecent();
+      if (current === "activity") void refreshActivity();
       break;
     case "stopping":
       showBanner("info", "Stopping the node", "");
@@ -118,6 +175,8 @@ function render(status: NodeStatus): void {
       el("restart-node").hidden = false;
       badge("no-node", "Not running");
       el("wallet").hidden = true;
+      el("recent").hidden = true;
+      el("node-warnings").hidden = true;
       break;
   }
 }
@@ -151,6 +210,290 @@ el("fund").addEventListener("click", async () => {
     button.disabled = false;
   }
 });
+
+// ---- formatting ------------------------------------------------------------
+
+function count(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
+function plural(n: number, one: string, many = `${one}s`): string {
+  return `${count(n)} ${n === 1 ? one : many}`;
+}
+
+function bytes(n: number): string {
+  const units = ["B", "kB", "MB", "GB", "TB"];
+  let value = n;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  return `${value.toLocaleString("en-US", { maximumFractionDigits: unit === 0 ? 0 : 1 })} ${units[unit]}`;
+}
+
+function dateTime(unix: number): string {
+  return new Date(unix * 1000).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" });
+}
+
+/** "4 min ago" for recent times, otherwise the date. */
+function ago(unix: number): string {
+  const seconds = Math.floor(Date.now() / 1000) - unix;
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} h ago`;
+  return dateTime(unix);
+}
+
+/** Runs `refresh` unless the previous run is still going. */
+function single(refresh: () => Promise<void>): () => Promise<void> {
+  let running = false;
+  return async () => {
+    if (running) return;
+    running = true;
+    try {
+      await refresh();
+    } finally {
+      running = false;
+    }
+  };
+}
+
+// ---- dashboard -------------------------------------------------------------
+
+const refreshOverview = single(async () => {
+  let o: ChainOverview;
+  try {
+    o = await invoke<ChainOverview>("chain_overview");
+  } catch {
+    // The node stopped or is busy; its status banner says which.
+    return;
+  }
+  // The node counts itself behind until its tip is recent. Without peers
+  // nothing is downloading, so say that rather than "Syncing".
+  const peers = o.connections_in + o.connections_out;
+  const syncing = o.initial_block_download || o.headers > o.blocks;
+  const [stateText, tone] = !syncing
+    ? ["Running", "success"]
+    : peers === 0
+      ? ["Behind, no peers", "warning"]
+      : ["Syncing", "info"];
+  const percent = (o.verification_progress * 100).toLocaleString("en-US", { maximumFractionDigits: 2 });
+  el("sync-badge").className = `badge badge-${tone}`;
+  el("sync-badge-text").textContent = stateText;
+  el("chain-blocks").textContent = o.headers > o.blocks ? `${count(o.blocks)} of ${count(o.headers)}` : count(o.blocks);
+  el("chain-time").textContent = o.blocks > 0 ? ago(o.median_time) : "—";
+  el("chain-time").title = o.blocks > 0 ? dateTime(o.median_time) : "";
+  el("chain-peers").textContent = o.network_active
+    ? `${count(peers)} (${count(o.connections_out)} out, ${count(o.connections_in)} in)`
+    : "Network off";
+  el("chain-mempool").textContent = `${plural(o.mempool_transactions, "transaction")}, ${bytes(o.mempool_bytes)}`;
+  el("sync").hidden = !syncing;
+  el("sync-percent").textContent = `${percent} %`;
+  el("sync-bar").style.width = `${o.verification_progress * 100}%`;
+  el("node-warnings").hidden = o.warnings.length === 0;
+  el("node-warnings-text").textContent = o.warnings.join(" ");
+  renderNodeInfo(o);
+});
+
+// ---- activity --------------------------------------------------------------
+
+const CATEGORY: Record<string, { text: string; lead: string; icon: string }> = {
+  receive: { text: "Received", lead: "in", icon: "arrow-down" },
+  send: { text: "Sent", lead: "out", icon: "arrow-up" },
+  generate: { text: "Mined", lead: "stake", icon: "spark" },
+  immature: { text: "Mined", lead: "stake", icon: "clock" },
+  orphan: { text: "Mined, not accepted", lead: "", icon: "alert" },
+};
+
+/** As in Qt: six confirmations is the recommended number. A maturing
+ *  reward is not spendable however many it has. */
+function confirmationText(n: number, category: string): string {
+  if (n < 0) return "Conflicts with the chain";
+  if (n === 0) return "Waiting to confirm";
+  if (category === "immature") return `Maturing, ${plural(n, "confirmation")}`;
+  if (n < 6) return `${n} of 6 confirmations`;
+  return "Confirmed";
+}
+
+function activityRow(e: ActivityEntry): HTMLElement {
+  const kind = CATEGORY[e.category] ?? { text: e.category, lead: "", icon: "info" };
+  const row = document.createElement("div");
+  row.className = "list-row";
+  const lead = document.createElement("div");
+  lead.className = `lead ${kind.lead}`.trim();
+  lead.append(icon(kind.icon));
+
+  const body = document.createElement("div");
+  body.className = "body";
+  const title = document.createElement("strong");
+  title.textContent = kind.text;
+  const meta = document.createElement("span");
+  meta.className = "meta mono";
+  const who = e.label || shorten(e.address || e.txid, 10, 8);
+  meta.textContent = `${who} · ${dateTime(e.time)}`;
+  meta.title = e.address ? `Transaction ${e.txid}, address ${e.address}` : `Transaction ${e.txid}`;
+  body.append(title, meta);
+
+  const trail = document.createElement("div");
+  trail.className = "trail";
+  const status = document.createElement("span");
+  status.className = "t-sm muted";
+  status.textContent = confirmationText(e.confirmations, e.category);
+  trail.append(amountNode(e.amount), status);
+  if (e.fee) {
+    const fee = document.createElement("span");
+    fee.className = "t-sm muted";
+    fee.textContent = `Fee ${formatAmount(e.fee.replace(/^-/, ""))}`;
+    trail.append(fee);
+  }
+
+  row.append(lead, body, trail);
+  return row;
+}
+
+function emptyState(title: string, text: string, iconName: string): HTMLElement {
+  const box = document.createElement("div");
+  box.className = "empty empty--tight";
+  const badge = document.createElement("div");
+  badge.className = "empty-icon";
+  badge.append(icon(iconName));
+  const h = document.createElement("h3");
+  h.textContent = title;
+  const p = document.createElement("p");
+  p.textContent = text;
+  box.append(badge, h, p);
+  return box;
+}
+
+function activityList(lines: ActivityEntry[]): HTMLElement[] {
+  return lines.length
+    ? lines.map(activityRow)
+    : [emptyState("No transactions yet", "Payments to and from this wallet appear here.", "activity")];
+}
+
+const ACTIVITY_STEP = 100;
+const ACTIVITY_LIMIT = 500; // wallet::ACTIVITY_LIMIT
+let activityShown = ACTIVITY_STEP;
+
+const refreshRecent = single(async () => {
+  try {
+    const lines = await invoke<ActivityEntry[]>("wallet_activity", { count: 5 });
+    el("recent").hidden = false;
+    el("recent-list").replaceChildren(...activityList(lines));
+  } catch {
+    el("recent").hidden = true;
+  }
+});
+
+function activityResult(text: string): void {
+  const box = el("activity-result");
+  box.hidden = !text;
+  box.className = "banner banner-danger mt-4";
+  box.textContent = text;
+}
+
+const refreshActivity = single(async () => {
+  try {
+    const lines = await invoke<ActivityEntry[]>("wallet_activity", { count: activityShown });
+    activityResult("");
+    el("activity-list").replaceChildren(...activityList(lines));
+    el("activity-more-row").hidden = !(lines.length === activityShown && activityShown < ACTIVITY_LIMIT);
+    el("activity-count").textContent = lines.length
+      ? `Newest ${plural(lines.length, "line")}${lines.length === ACTIVITY_LIMIT ? ", the most shown" : ""}`
+      : "";
+  } catch (e) {
+    activityResult(`The wallet's transactions could not be read: ${String(e)}`);
+  }
+});
+
+el("activity-more").addEventListener("click", () => {
+  activityShown = Math.min(ACTIVITY_LIMIT, activityShown + ACTIVITY_STEP);
+  void refreshActivity();
+});
+
+// ---- network ---------------------------------------------------------------
+
+function renderNodeInfo(o: ChainOverview): void {
+  const state = el("net-state");
+  state.textContent = o.network_active ? "Network on" : "Network off";
+  state.className = `badge badge-${o.network_active ? "success" : "warning"}`;
+  el("net-agent").textContent = o.user_agent;
+  el("net-protocol").textContent = String(o.protocol_version);
+  el("net-connections").textContent = `${count(o.connections_out)} out, ${count(o.connections_in)} in`;
+  el("net-height").textContent = `${count(o.blocks)} / ${count(o.headers)}`;
+  el("net-disk").textContent = `${bytes(o.size_on_disk)}${o.pruned ? " (pruned)" : ""}`;
+  el("peer-empty-text").textContent = !o.network_active
+    ? "Networking is turned off on this node."
+    : o.chain === "regtest"
+      ? "This development node runs regtest with no peers."
+      : "The node is not connected to anyone yet.";
+}
+
+const DIRECTION: Record<string, string> = {
+  "outbound-full-relay": "Outbound",
+  "block-relay-only": "Outbound, blocks only",
+  manual: "Manual",
+  feeler: "Feeler",
+  "addr-fetch": "Address fetch",
+  inbound: "Inbound",
+};
+
+function cell(text: string, className = "", title = ""): HTMLTableCellElement {
+  const td = document.createElement("td");
+  if (className) td.className = className;
+  td.textContent = text;
+  if (title) td.title = title;
+  return td;
+}
+
+function peerRow(p: Peer): HTMLTableRowElement {
+  const tr = document.createElement("tr");
+  const direction = DIRECTION[p.connection_type] ?? (p.inbound ? "Inbound" : "Outbound");
+  tr.append(
+    cell(p.address, "mono"),
+    cell(direction),
+    cell(p.user_agent || "—", "mono", p.version ? `Protocol ${p.version}` : ""),
+    cell(p.synced_blocks < 0 ? "—" : count(p.synced_blocks), "num"),
+    cell(p.ping_ms === null ? "—" : `${Math.round(p.ping_ms)} ms`, "num"),
+    cell(`${bytes(p.bytes_sent)} / ${bytes(p.bytes_received)}`, "num"),
+    cell(ago(p.connected_since), "num", dateTime(p.connected_since)),
+  );
+  return tr;
+}
+
+function networkResult(text: string): void {
+  const box = el("network-result");
+  box.hidden = !text;
+  box.className = "banner banner-danger";
+  box.textContent = text;
+}
+
+const refreshNetwork = single(async () => {
+  try {
+    const [overview, peers] = await Promise.all([
+      invoke<ChainOverview>("chain_overview"),
+      invoke<Peer[]>("network_peers"),
+    ]);
+    networkResult("");
+    renderNodeInfo(overview);
+    el("peer-count").textContent = peers.length ? plural(peers.length, "peer") : "";
+    el("peer-table").hidden = peers.length === 0;
+    el("peer-empty").hidden = peers.length > 0;
+    el("peer-rows").replaceChildren(...peers.map(peerRow));
+  } catch (e) {
+    networkResult(`The node's network state could not be read: ${String(e)}`);
+  }
+});
+
+// The node's status changes only with a new block; the sync figures and the
+// peer list move in between.
+const REFRESH_MS = 5000;
+setInterval(() => {
+  if (!wasReady || document.hidden) return;
+  if (current === "home") void refreshOverview();
+  if (current === "network") void refreshNetwork();
+}, REFRESH_MS);
 
 // ---- send ------------------------------------------------------------------
 
@@ -320,6 +663,7 @@ await listen<DraftResult>("draft-result", (event) => {
     sendResult("danger", `Not sent: ${r.error}`);
   }
   void refreshWallet();
+  void refreshRecent();
 });
 await listen<NodeStatus>("node-status", (event) => render(event.payload));
 render(await invoke<NodeStatus>("node_status"));
