@@ -116,6 +116,29 @@
           </div>
         </div>
 
+        <div class="backdrop" id="pick-backdrop" hidden>
+          <div class="modal modal--lg pick" role="dialog" aria-modal="true" aria-labelledby="pick-title">
+            <div class="modal-head">
+              <div>
+                <h2 id="pick-title">Choose an address</h2>
+                <div class="sub" id="pick-sub"></div>
+              </div>
+              <button class="btn btn-ghost btn-icon" type="button" id="pick-close" aria-label="Close">
+                <svg class="i" aria-hidden="true"><use href="/icons.svg#i-close" /></svg>
+              </button>
+            </div>
+            <div class="modal-body stack">
+              <div class="tabs" role="tablist" aria-label="Addresses">
+                <button class="tab" type="button" role="tab" id="pick-tab-book" aria-selected="true">Contacts</button>
+                <button class="tab" type="button" role="tab" id="pick-tab-mine" aria-selected="false">My addresses</button>
+              </div>
+              <input class="input" id="pick-search" type="search" autocomplete="off" spellcheck="false" placeholder="Search by label or address" aria-label="Search addresses" />
+              <div class="pick-list" id="pick-list"></div>
+              <p class="empty empty--tight" id="pick-empty" hidden></p>
+            </div>
+          </div>
+        </div>
+
         <main class="view view--flow" id="view-setup" hidden>
           <div class="stack">
             <p class="flow-sub">
@@ -297,8 +320,8 @@
           <form class="card" id="send" novalidate>
             <div class="card-pad form-grid">
               <div id="recipients"></div>
-              <button class="btn btn-secondary" type="button" id="send-add">
-                <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>Add recipient
+              <button class="btn btn-ghost btn-sm send-add" type="button" id="send-add">
+                <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>Pay someone else in the same transaction
               </button>
               <details class="disc disc--boxed" id="send-options">
                 <summary>
@@ -387,58 +410,102 @@
           <div class="banner mt-4" id="psbt-result" role="status" hidden></div>
         </main>
 
-        <main class="view view--flow" id="view-receive" hidden>
-          <div class="stack">
-            <form class="card" id="rcv-form" novalidate>
+        <main class="view" id="view-receive" hidden>
+          <div class="banner banner-danger mb-4" id="rcv-result" role="status" hidden></div>
+          <div class="rcv-grid">
+            <div class="card rcv-main">
               <div class="card-head">
-                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>New receiving address</h2>
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-qr" /></svg>Your address</h2>
+                <button class="btn btn-secondary btn-sm" type="button" id="rcv-new-open">
+                  <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>New address
+                </button>
               </div>
-              <div class="card-pad form-grid">
+              <form class="card-pad form-grid rcv-new" id="rcv-new" novalidate hidden>
                 <div class="field">
-                  <label for="rcv-label">Label</label>
-                  <input class="input" id="rcv-label" autocomplete="off" maxlength="200" placeholder="Optional" />
-                  <span class="help">Kept in your wallet with the address, to recognise payments to it.</span>
+                  <label for="rcv-label">What is it for?</label>
+                  <input class="input" id="rcv-label" autocomplete="off" maxlength="200" placeholder="Optional, e.g. Exchange withdrawals" />
+                  <span class="help">The label stays in your wallet, to recognise payments to this address.</span>
                 </div>
-                <div class="field">
-                  <label for="rcv-amount">Amount</label>
-                  <div class="amount-field">
-                    <input class="input" id="rcv-amount" inputmode="decimal" autocomplete="off" placeholder="Optional" />
-                    <span class="unit">B3</span>
-                  </div>
-                  <span class="help">Only goes into the payment link and QR code, as a suggestion to the payer.</span>
+                <div class="btn-row">
+                  <button class="btn btn-primary" type="submit" id="rcv-submit">Create address</button>
+                  <button class="btn btn-ghost" type="button" id="rcv-new-cancel">Cancel</button>
                 </div>
-                <div class="field">
-                  <label for="rcv-message">Message</label>
-                  <input class="input" id="rcv-message" autocomplete="off" maxlength="200" placeholder="Optional" />
-                  <span class="help">Shown to the payer by wallets that read the link. Not stored and never sent on the network.</span>
-                </div>
-              </div>
-              <div class="card-foot">
-                <button class="btn btn-primary" type="submit" id="rcv-submit">Create receiving address</button>
-              </div>
-            </form>
-            <div class="banner banner-danger" id="rcv-result" role="status" hidden></div>
+              </form>
 
-            <div class="card" id="rcv-request" hidden>
-              <div class="card-head">
-                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-qr" /></svg><span id="rcv-request-title">Request payment</span></h2>
-              </div>
-              <div class="card-pad receive-request">
+              <div class="card-pad receive-request" id="rcv-show" hidden>
                 <svg class="qr" id="rcv-qr" role="img" aria-label="QR code of the payment link"></svg>
-                <p class="t-sm muted" id="rcv-qr-note" hidden>This link is too long for a QR code. Shorten the label or message.</p>
-                <div class="details" id="rcv-rows"></div>
+                <p class="t-sm muted t-center" id="rcv-qr-note" hidden>This link is too long for a QR code. Shorten the message.</p>
+                <div class="rcv-id">
+                  <div class="row gap-2 rcv-label-row" id="rcv-label-row">
+                    <strong id="rcv-label-text"></strong>
+                    <button class="btn btn-ghost btn-icon btn-sm" type="button" id="rcv-rename" aria-label="Rename this address" title="Rename">
+                      <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-pen" /></svg>
+                    </button>
+                  </div>
+                  <form class="row gap-2 rcv-label-row" id="rcv-rename-form" novalidate hidden>
+                    <input class="input" id="rcv-rename-input" autocomplete="off" maxlength="200" aria-label="Label" placeholder="Label" />
+                    <button class="btn btn-primary btn-sm" type="submit">Save</button>
+                    <button class="btn btn-ghost btn-sm" type="button" id="rcv-rename-cancel">Cancel</button>
+                  </form>
+                  <code class="rcv-addr" id="rcv-addr"></code>
+                  <p class="t-sm rcv-asked" id="rcv-asked" hidden></p>
+                </div>
+                <div class="btn-row rcv-actions">
+                  <button class="btn btn-primary" type="button" id="rcv-copy">
+                    <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-copy" /></svg><span>Copy address</span>
+                  </button>
+                  <button class="btn btn-secondary" type="button" id="rcv-copy-link">
+                    <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-copy" /></svg><span>Copy payment link</span>
+                  </button>
+                </div>
+                <p class="help t-center" id="rcv-new-hint">Anyone can pay you at this address. Sharing it is safe: it cannot be used to spend your coins.</p>
+                <p class="help t-center" id="rcv-used-note" hidden>This address has been paid before. You can reuse it, but a new address for each payer keeps your payments apart.</p>
+                <p class="help t-center" id="rcv-change-note" hidden>The wallet made this address for change from your own payments. It works, but give out a receiving address instead.</p>
+                <details class="disc disc--boxed rcv-ask">
+                  <summary>
+                    <svg class="i-sm caret" aria-hidden="true"><use href="/icons.svg#i-chevron-right" /></svg>
+                    <span>Ask for a specific amount</span>
+                  </summary>
+                  <div class="disc-body form-grid">
+                    <div class="field">
+                      <label for="rcv-amount">Amount</label>
+                      <div class="amount-field">
+                        <input class="input" id="rcv-amount" inputmode="decimal" autocomplete="off" placeholder="Optional" />
+                        <span class="unit">B3</span>
+                      </div>
+                    </div>
+                    <div class="field">
+                      <label for="rcv-message">Message</label>
+                      <input class="input" id="rcv-message" autocomplete="off" maxlength="200" placeholder="Optional" />
+                      <span class="help">Both only go into the payment link and QR code. Nothing is stored or sent on the network.</span>
+                    </div>
+                  </div>
+                </details>
+              </div>
+
+              <div class="empty" id="rcv-none" hidden>
+                <h3>No address yet</h3>
+                <p>Create an address to get paid. It costs nothing.</p>
+                <button class="btn btn-primary" type="button" id="rcv-first">Create an address</button>
               </div>
             </div>
 
             <div class="card">
               <div class="card-head">
-                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>Receiving addresses</h2>
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>All your addresses</h2>
                 <span class="t-sm muted tnum" id="rcv-count"></span>
               </div>
-              <div id="rcv-list"></div>
-              <div class="empty empty--tight" id="rcv-empty" hidden>
-                <p>This wallet has no receiving addresses yet.</p>
+              <div class="card-pad rcv-tools" id="rcv-tools" hidden>
+                <input class="input" id="rcv-search" type="search" autocomplete="off" spellcheck="false" placeholder="Search by label or address" aria-label="Search your addresses" />
+                <div class="rcv-filter" id="rcv-filter" role="group" aria-label="Show">
+                  <button class="chip" type="button" data-filter="all" aria-pressed="true">All</button>
+                  <button class="chip" type="button" data-filter="coins" aria-pressed="false">With coins</button>
+                  <button class="chip" type="button" data-filter="unused" aria-pressed="false">Unused</button>
+                </div>
               </div>
+              <div id="rcv-list"></div>
+              <p class="empty empty--tight" id="rcv-empty" hidden></p>
+              <div class="card-pad t-xs muted">Click an address to show its QR code. Coins held in stakes are listed on Stake, not here.</div>
             </div>
           </div>
         </main>
@@ -645,7 +712,12 @@
                           </div>
                           <div class="field" id="tr-fund-to-field" hidden>
                             <label for="tr-fund-to">Pay to</label>
-                            <input class="input input-mono" id="tr-fund-to" placeholder="Empty: a new address here" autocomplete="off" spellcheck="false" />
+                            <div class="pick-field">
+                              <input class="input input-mono" id="tr-fund-to" placeholder="Empty: a new address here" autocomplete="off" spellcheck="false" />
+                              <button class="btn btn-secondary" type="button" id="tr-fund-pick" aria-label="Choose an address" title="Choose an address">
+                                <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>
+                              </button>
+                            </div>
                           </div>
                           <p class="t-xs muted" id="tr-fund-help"></p>
                           <p class="t-sm tr-form-error" id="tr-fund-error" role="alert" hidden></p>

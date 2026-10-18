@@ -620,15 +620,35 @@ fn receive_makes_labelled_addresses_and_links() {
     let mine = list.iter().find(|a| a.address == r.address).unwrap();
     assert_eq!(mine.label, "rent");
     assert_eq!(mine.transactions, 0);
-    let shown = receive::show(client, W, "regtest", &r.address).unwrap();
+    assert_eq!(mine.balance, "0.000000000");
+    assert!(!mine.change);
+    let shown = receive::show(client, W, "regtest", &r.address, "", "").unwrap();
     assert_eq!(
         shown.uri,
         format!("b3coin:{}?label=rent", r.address.to_uppercase())
     );
+    let asked = receive::show(client, W, "regtest", &r.address, "0.5", "tea").unwrap();
+    assert_eq!(
+        asked.uri,
+        format!(
+            "b3coin:{}?amount=0.5&label=rent&message=tea",
+            r.address.to_uppercase()
+        )
+    );
+    assert!(receive::show(client, W, "regtest", &r.address, "x", "").is_err());
+
+    // Renaming an own address shows in the list.
+    receive::rename(client, W, &r.address, " flat ").unwrap();
+    let list = receive::addresses(client, W).unwrap();
+    assert_eq!(
+        list.iter().find(|a| a.address == r.address).unwrap().label,
+        "flat"
+    );
 
     // An address this wallet does not own is refused.
     let other = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
-    assert!(receive::show(client, W, "regtest", other).is_err());
+    assert!(receive::show(client, W, "regtest", other, "", "").is_err());
+    assert!(receive::rename(client, W, other, "theirs").is_err());
 }
 
 fn entry(old: &str, new: &str) -> Entry {

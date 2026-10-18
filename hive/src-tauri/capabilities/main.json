@@ -53,6 +53,7 @@
     "allow-receive-new",
     "allow-receive-addresses",
     "allow-receive-show",
+    "allow-receive-rename",
     "allow-wallet-backup",
     "allow-wallet-history",
     "allow-wallet-transaction",

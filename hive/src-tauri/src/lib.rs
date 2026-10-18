@@ -889,7 +889,8 @@ async fn send_coins(core: State<'_, Arc<Core>>) -> Result<wallet::CoinList, Stri
     .await
 }
 
-/// The wallet's receiving addresses, newest last as the node lists them.
+/// The wallet's own addresses: receiving addresses newest last as the node
+/// lists them, then change addresses that hold coins.
 #[tauri::command]
 async fn receive_addresses(core: State<'_, Arc<Core>>) -> Result<Vec<receive::Receiving>, String> {
     let core = Arc::clone(&core);
@@ -901,18 +902,39 @@ async fn receive_addresses(core: State<'_, Arc<Core>>) -> Result<Vec<receive::Re
     .await
 }
 
-/// The link and QR code for one of the wallet's receiving addresses.
+/// The link and QR code for one of the wallet's addresses, optionally
+/// asking for an amount.
 #[tauri::command]
 async fn receive_show(
     core: State<'_, Arc<Core>>,
     address: String,
+    amount: String,
+    message: String,
 ) -> Result<receive::Request, String> {
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
         let chain = node.chain().unwrap_or_default();
-        receive::show(client, &name, &chain, &address)
+        receive::show(client, &name, &chain, &address, &amount, &message)
+    })
+    .await
+}
+
+/// Renames one of the wallet's own addresses.
+#[tauri::command]
+async fn receive_rename(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    address: String,
+    label: String,
+) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        receive::rename(client, &name, &address, &label)
     })
     .await
 }
@@ -2247,6 +2269,7 @@ pub fn run() {
             receive_new,
             receive_addresses,
             receive_show,
+            receive_rename,
             wallet_backup,
             wallet_history,
             wallet_transaction,

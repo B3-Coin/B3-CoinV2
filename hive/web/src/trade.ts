@@ -10,6 +10,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { el, isMasked, shorten } from "../shared/ui";
+import { pickAddress } from "./picker";
 import {
   B3_DECIMALS,
   decimal,
@@ -1673,6 +1674,12 @@ for (const [id, way] of [
   });
 }
 el("tr-fund-form").addEventListener("input", renderFunding);
+el("tr-fund-pick").addEventListener("click", async () => {
+  const picked = await pickAddress("Withdraw to", "One of your own addresses, or a saved contact.", "mine");
+  if (!picked) return;
+  el<HTMLInputElement>("tr-fund-to").value = picked.address;
+  renderFunding();
+});
 el("tr-fund-asset").addEventListener("change", renderFunding);
 el("tr-fund-form").addEventListener("submit", (e) => {
   e.preventDefault();

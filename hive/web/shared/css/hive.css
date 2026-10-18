@@ -303,3 +303,40 @@
 .tr-asset-free { text-align: right; font-weight: 600; }
 .tr-asset-held { grid-column: 1 / -1; display: flex; justify-content: space-between; }
 .tr-asset-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); padding: var(--space-2) var(--space-3) var(--space-3); }
+
+/* ---- Receive and the address picker ---- */
+.rcv-grid { display: grid; gap: var(--space-4); align-items: start; }
+@media (min-width: 1000px) {
+  .rcv-grid { grid-template-columns: minmax(360px, 440px) minmax(0, 1fr); }
+  .rcv-main { position: sticky; top: var(--space-4); }
+}
+.rcv-id { width: 100%; display: flex; flex-direction: column; align-items: center; gap: var(--space-2); text-align: center; }
+.rcv-label-row { justify-content: center; min-height: var(--min-target-sm); }
+.rcv-label-row .input { max-width: 240px; }
+.rcv-addr {
+  display: block; width: 100%; padding: var(--space-3);
+  background: var(--bg-subtle); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-family: var(--font-mono); font-size: var(--text-sm); word-break: break-all; text-align: center;
+  user-select: all;
+}
+.rcv-asked { color: var(--accent-text); }
+.rcv-actions { justify-content: center; }
+.rcv-ask { width: 100%; }
+.rcv-tools { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-3); align-items: center; border-bottom: 1px solid var(--border); }
+.rcv-tools .input { flex: 1 1 220px; }
+.rcv-filter { display: flex; gap: var(--space-1); }
+.chip {
+  padding: 4px 12px; border-radius: 999px; border: 1px solid var(--border);
+  font-size: var(--text-sm); color: var(--text-muted); background: transparent;
+}
+.chip:hover { color: var(--text); background: var(--bg-subtle); }
+.chip[aria-pressed="true"] { color: var(--accent-text); background: var(--accent-bg); border-color: var(--accent-border); }
+.rcv-row[aria-current="true"] { background: var(--accent-bg); box-shadow: inset 3px 0 0 var(--accent); }
+.rcv-row .body .rcv-row-addr, .pick-addr { overflow-wrap: anywhere; white-space: normal; }
+.rcv-row > .btn { flex: none; }
+.pick-field { display: flex; gap: var(--space-2); }
+.pick-field > .input { flex: 1; min-width: 0; }
+.pick-field > .btn { flex: none; }
+.pick-list { max-height: min(56vh, 520px); overflow-y: auto; margin: 0 calc(-1 * var(--space-4)); border-top: 1px solid var(--border); }
+.pick-row { width: 100%; text-align: left; }
+.send-add { justify-self: start; }

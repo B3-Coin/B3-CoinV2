@@ -57,6 +57,7 @@ fn main() {
             "receive_new",
             "receive_addresses",
             "receive_show",
+            "receive_rename",
             "wallet_backup",
             "wallet_history",
             "wallet_transaction",

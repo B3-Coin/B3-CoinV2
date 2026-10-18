@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::rpc::{Client, RpcError};
-use crate::wallet::{decimal, parse_amount};
+use crate::wallet::{base_units, check_label, decimal, parse_amount, units_amount};
 
 /// A QR code as rows of modules, '1' for dark, read left to right and top to
 /// bottom; the page draws it.
@@ -144,6 +144,16 @@ pub fn request(
     }
 }
 
+/// The amount and message of a payment link, checked.
+fn link_parts(amount: &str, message: &str) -> Result<(Option<String>, String), String> {
+    let message = text(message, "message")?;
+    let amount = match amount.trim() {
+        "" => None,
+        a => Some(parse_amount(a)?),
+    };
+    Ok((amount, message))
+}
+
 /// Qt's "Create new receiving address": a new address under `label`. The
 /// amount and message only go into the link.
 pub fn new_request(
@@ -155,11 +165,7 @@ pub fn new_request(
     message: &str,
 ) -> Result<Request, String> {
     let label = text(label, "label")?;
-    let message = text(message, "message")?;
-    let amount = match amount.trim() {
-        "" => None,
-        a => Some(parse_amount(a)?),
-    };
+    let (amount, message) = link_parts(amount, message)?;
     let address = client
         .call_wallet(wallet, "getnewaddress", json!([label]))
         .map_err(|e| e.to_string())?;
@@ -170,50 +176,125 @@ pub fn new_request(
     Ok(request(address, chain, label, amount, message))
 }
 
-/// One of the wallet's receiving addresses, as Qt's Receiving addresses
-/// window lists them, with what it has received.
+/// One of the wallet's own addresses: every receiving address, as Qt's
+/// Receiving addresses window lists them, and every change address that
+/// holds coins now.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Receiving {
     pub address: String,
     pub label: String,
-    /// Exact decimal text, unconfirmed payments included.
+    /// Everything it has received, unconfirmed payments included. Exact
+    /// decimal text.
     pub received: String,
     pub transactions: usize,
+    /// What it holds now: the sum of its unspent coins, unconfirmed ones
+    /// included. Exact 9-place text. Stakes are not counted; the node lists
+    /// them separately, without their address.
+    pub balance: String,
+    pub coins: usize,
+    /// A change address: the wallet made it for itself, not to hand out.
+    pub change: bool,
 }
 
 pub fn addresses(client: &Client, wallet: &str) -> Result<Vec<Receiving>, RpcError> {
     // minconf 0, include addresses that never received anything.
-    let list = client.call_wallet(wallet, "listreceivedbyaddress", json!([0, true]))?;
-    parse_addresses(&list)
+    let received = client.call_wallet(wallet, "listreceivedbyaddress", json!([0, true]))?;
+    let unspent = client.call_wallet(wallet, "listunspent", json!([0]))?;
+    parse_addresses(&received, &unspent)
 }
 
-pub(crate) fn parse_addresses(list: &Value) -> Result<Vec<Receiving>, RpcError> {
+pub(crate) fn parse_addresses(
+    received: &Value,
+    unspent: &Value,
+) -> Result<Vec<Receiving>, RpcError> {
     let mut out = Vec::new();
-    for item in list.as_array().into_iter().flatten() {
+    for item in received.as_array().into_iter().flatten() {
         out.push(Receiving {
             address: item["address"].as_str().unwrap_or_default().to_owned(),
             label: item["label"].as_str().unwrap_or_default().to_owned(),
             received: decimal(&item["amount"])?,
             transactions: item["txids"].as_array().map_or(0, Vec::len),
+            balance: units_amount(0),
+            coins: 0,
+            change: false,
         });
+    }
+    // Sums per address in base units, so the balance is exact. Addresses
+    // listreceivedbyaddress does not know are change.
+    let mut held: Vec<(String, String, u128, usize)> = Vec::new();
+    for coin in unspent.as_array().into_iter().flatten() {
+        let Some(address) = coin["address"].as_str() else {
+            continue;
+        };
+        let amount = decimal(&coin["amount"])?;
+        let units = base_units(&amount)
+            .ok_or_else(|| RpcError::BadReply(format!("listunspent amount {amount}")))?;
+        match held.iter_mut().find(|h| h.0 == address) {
+            Some(h) => {
+                h.2 += units;
+                h.3 += 1;
+            }
+            None => held.push((
+                address.to_owned(),
+                coin["label"].as_str().unwrap_or_default().to_owned(),
+                units,
+                1,
+            )),
+        }
+    }
+    for (address, label, units, coins) in held {
+        match out.iter_mut().find(|r| r.address == address) {
+            Some(r) => {
+                r.balance = units_amount(units);
+                r.coins = coins;
+            }
+            None => out.push(Receiving {
+                address,
+                label,
+                received: units_amount(0),
+                transactions: 0,
+                balance: units_amount(units),
+                coins,
+                change: true,
+            }),
+        }
     }
     Ok(out)
 }
 
-/// The link and QR code for one of the wallet's own receiving addresses.
-pub fn show(client: &Client, wallet: &str, chain: &str, address: &str) -> Result<Request, String> {
+/// The link and QR code for one of the wallet's own addresses, asking for
+/// `amount` with `message` when they are given.
+pub fn show(
+    client: &Client,
+    wallet: &str,
+    chain: &str,
+    address: &str,
+    amount: &str,
+    message: &str,
+) -> Result<Request, String> {
+    let (amount, message) = link_parts(amount, message)?;
     let list = addresses(client, wallet).map_err(|e| e.to_string())?;
     let found = list
         .into_iter()
         .find(|r| r.address == address)
-        .ok_or("That is not one of this wallet's receiving addresses.")?;
-    Ok(request(
-        found.address,
-        chain,
-        found.label,
-        None,
-        String::new(),
-    ))
+        .ok_or("That is not one of this wallet's addresses.")?;
+    Ok(request(found.address, chain, found.label, amount, message))
+}
+
+/// Renames one of the wallet's own addresses. The address book's save
+/// refuses these, so that it only ever holds addresses the wallet pays.
+pub fn rename(client: &Client, wallet: &str, address: &str, label: &str) -> Result<(), String> {
+    let label = check_label(label)?;
+    let info = client
+        .call_wallet(wallet, "getaddressinfo", json!([address.trim()]))
+        .map_err(|e| e.to_string())?;
+    if info["ismine"].as_bool() != Some(true) {
+        return Err("That is not one of this wallet's addresses.".into());
+    }
+    client
+        .call_wallet(wallet, "setlabel", json!([address.trim(), label]))
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -257,9 +338,37 @@ mod tests {
                 {"address":"bcrt1qb","amount":0,"confirmations":0,"label":"","txids":[]}]"#,
         )
         .unwrap();
-        let r = parse_addresses(&list).unwrap();
+        let r = parse_addresses(&list, &json!([])).unwrap();
         assert_eq!(r[0].received, "0.100000001");
         assert_eq!(r[0].transactions, 2);
         assert_eq!(r[1].label, "");
+        assert_eq!(r[1].balance, "0.000000000");
+    }
+
+    #[test]
+    fn balances_are_exact_sums_and_change_is_listed() {
+        let received = serde_json::from_str::<Value>(
+            r#"[{"address":"bcrt1qa","amount":3,"label":"rent","txids":["t1"]}]"#,
+        )
+        .unwrap();
+        let unspent = serde_json::from_str::<Value>(
+            r#"[{"address":"bcrt1qa","amount":0.1,"label":"rent"},
+                {"address":"bcrt1qa","amount":0.200000001},
+                {"address":"bcrt1qchange","amount":1.5},
+                {"amount":9}]"#,
+        )
+        .unwrap();
+        let r = parse_addresses(&received, &unspent).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            (r[0].balance.as_str(), r[0].coins, r[0].change),
+            ("0.300000001", 2, false)
+        );
+        assert_eq!(r[1].address, "bcrt1qchange");
+        assert_eq!(
+            (r[1].balance.as_str(), r[1].coins, r[1].change),
+            ("1.500000000", 1, true)
+        );
+        assert_eq!(r[1].received, "0.000000000");
     }
 }

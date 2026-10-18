@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { amountNode, amountUnits, el, formatAmount, icon, initTheme, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
 import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeResult } from "./trade";
+import { pickAddress, sortOwn } from "./picker";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -468,7 +469,16 @@ type ReceiveRequest = {
   uri: string;
   qr: Qr | null;
 };
-type Receiving = { address: string; label: string; received: string; transactions: number };
+// Mirrors receive::Receiving: one of the wallet's own addresses.
+type Receiving = {
+  address: string;
+  label: string;
+  received: string;
+  transactions: number;
+  balance: string;
+  coins: number;
+  change: boolean;
+};
 
 function drawQr(svg: Element, qr: Qr): void {
   // A 4-module quiet zone, as the QR standard asks.
@@ -486,76 +496,252 @@ function drawQr(svg: Element, qr: Qr): void {
   svg.replaceChildren(...rects);
 }
 
-function showRequest(r: ReceiveRequest, title: string): void {
-  el("rcv-request").hidden = false;
-  el("rcv-request-title").textContent = title;
-  el("rcv-qr").hidden = r.qr === null;
-  el("rcv-qr-note").hidden = r.qr !== null;
-  if (r.qr) drawQr(el("rcv-qr"), r.qr);
-  const rows = [detailRow("Address", r.address, r.address)];
-  if (r.label) rows.push(detailRow("Label", r.label));
-  // The requested amount is shown exactly, never masked: it is what the
-  // payer will be asked for.
-  if (r.amount !== null) rows.push(detailRow("Amount", `${r.amount} B3`));
-  if (r.message) rows.push(detailRow("Message", r.message));
-  rows.push(detailRow("Payment link", r.uri, r.uri));
-  el("rcv-rows").replaceChildren(...rows);
-  el("rcv-request").scrollIntoView({ block: "nearest" });
+function copyButton(button: HTMLButtonElement, text: () => string, done = "Copied"): void {
+  const label = button.querySelector("span")?.textContent ?? "";
+  button.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const value = text();
+    if (!value) return;
+    void navigator.clipboard.writeText(value).then(() => {
+      const span = button.querySelector("span");
+      if (span) {
+        span.textContent = done;
+        setTimeout(() => (span.textContent = label), 1500);
+      } else {
+        button.title = done;
+      }
+    });
+  });
 }
 
-const refreshReceiving = single(async () => {
-  try {
-    const list = await invoke<Receiving[]>("receive_addresses");
-    // Newest first, as Qt's history sorts.
-    list.reverse();
-    el("rcv-count").textContent = list.length ? plural(list.length, "address", "addresses") : "";
-    el("rcv-empty").hidden = list.length > 0;
-    el("rcv-list").replaceChildren(
-      ...list.map((a) => {
-        const row = document.createElement("button");
-        row.type = "button";
-        row.className = "list-row clickable";
-        row.title = "Show this address's link and QR code";
-        const lead = document.createElement("div");
-        lead.className = "lead in";
-        lead.append(icon("arrow-down"));
-        const body = document.createElement("div");
-        body.className = "body";
-        const title = document.createElement("span");
-        title.textContent = a.label || "(no label)";
-        const meta = document.createElement("span");
-        meta.className = "meta is-mono";
-        meta.textContent = shorten(a.address, 14, 8);
-        meta.title = a.address;
-        body.append(title, meta);
-        const trail = document.createElement("div");
-        trail.className = "trail";
-        const got = document.createElement("span");
-        got.className = "t-sm muted";
-        got.textContent = a.transactions ? plural(a.transactions, "payment") : "Nothing received";
-        trail.append(a.transactions ? amountNode(a.received) : document.createElement("span"), got);
-        row.append(lead, body, trail);
-        row.addEventListener("click", async () => {
-          try {
-            showRequest(await invoke<ReceiveRequest>("receive_show", { address: a.address }), a.label || "Receiving address");
-          } catch (e) {
-            receiveResult(String(e));
-          }
-        });
-        return row;
-      }),
-    );
-  } catch (e) {
-    receiveResult(String(e));
-  }
-});
+let ownAddresses: Receiving[] = [];
+// The address the Receive page shows; kept across refreshes while it exists.
+let receiveShown: string | null = null;
+let receiveRequest: ReceiveRequest | null = null;
+let receiveFilter: "all" | "coins" | "unused" = "all";
+
+const isUnused = (a: Receiving) => !a.change && a.transactions === 0 && a.coins === 0;
+
+// What Receive shows first: an unused address without a label, since a
+// labelled one was likely made for someone; else any unused one; else the
+// first receiving address.
+function defaultReceiving(): Receiving | null {
+  const receiving = ownAddresses.filter((a) => !a.change);
+  return (
+    receiving.find((a) => isUnused(a) && !a.label) ?? receiving.find(isUnused) ?? receiving[0] ?? null
+  );
+}
 
 function receiveResult(text: string): void {
   el("rcv-result").hidden = !text;
   el("rcv-result").textContent = text;
 }
 
-el("rcv-form").addEventListener("submit", async (e) => {
+function renderRequest(): void {
+  const r = receiveRequest;
+  el("rcv-none").hidden = r !== null;
+  el("rcv-show").hidden = r === null;
+  if (!r) return;
+  const own = ownAddresses.find((a) => a.address === r.address);
+  el("rcv-qr").hidden = r.qr === null;
+  el("rcv-qr-note").hidden = r.qr !== null;
+  if (r.qr) drawQr(el("rcv-qr"), r.qr);
+  el("rcv-label-text").textContent = r.label || "No label";
+  el("rcv-label-text").classList.toggle("muted", !r.label);
+  el("rcv-addr").textContent = r.address;
+  el("rcv-change-note").hidden = !own?.change;
+  const used = own && !isUnused(own);
+  el("rcv-used-note").hidden = !used || own.change;
+  el("rcv-new-hint").hidden = !!used;
+  // The requested amount is shown exactly, never masked: it is what the
+  // payer will be asked for.
+  el("rcv-asked").hidden = r.amount === null && !r.message;
+  el("rcv-asked").textContent = [r.amount === null ? "" : `Asks for ${r.amount} B3`, r.message ? `“${r.message}”` : ""]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+async function showReceiving(address: string): Promise<void> {
+  try {
+    receiveRequest = await invoke<ReceiveRequest>("receive_show", {
+      address,
+      amount: el<HTMLInputElement>("rcv-amount").value,
+      message: el<HTMLInputElement>("rcv-message").value,
+    });
+    receiveShown = address;
+    receiveResult("");
+  } catch (e) {
+    receiveResult(String(e));
+    return;
+  }
+  stopRename();
+  renderRequest();
+  renderOwnList();
+}
+
+function renderOwnList(): void {
+  const q = el<HTMLInputElement>("rcv-search").value.trim().toLowerCase();
+  const list = ownAddresses.filter(
+    (a) =>
+      (receiveFilter === "all" || (receiveFilter === "coins" ? a.coins > 0 : isUnused(a))) &&
+      (!q || a.label.toLowerCase().includes(q) || a.address.toLowerCase().includes(q)),
+  );
+  el("rcv-count").textContent = ownAddresses.length ? plural(ownAddresses.length, "address", "addresses") : "";
+  el("rcv-tools").hidden = ownAddresses.length < 2;
+  el("rcv-empty").hidden = list.length > 0;
+  el("rcv-empty").textContent = ownAddresses.length
+    ? "No address matches."
+    : "This wallet has no addresses yet.";
+  el("rcv-list").replaceChildren(
+    ...list.map((a) => {
+      const row = document.createElement("div");
+      row.className = "list-row clickable rcv-row";
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      row.title = "Show this address";
+      if (a.address === receiveShown) row.setAttribute("aria-current", "true");
+      const lead = document.createElement("div");
+      lead.className = a.change ? "lead" : "lead in";
+      lead.append(icon(a.change ? "repeat" : "arrow-down"));
+      const body = document.createElement("div");
+      body.className = "body";
+      const title = document.createElement("span");
+      title.className = "row gap-2";
+      const name = document.createElement("span");
+      name.textContent = a.label || "No label";
+      if (!a.label) name.className = "muted";
+      title.append(name);
+      if (a.change) {
+        const badge = document.createElement("span");
+        badge.className = "badge badge-neutral";
+        badge.textContent = "Change";
+        badge.title = "The wallet made this address for change from your own payments.";
+        title.append(badge);
+      } else if (isUnused(a)) {
+        const badge = document.createElement("span");
+        badge.className = "badge badge-success";
+        badge.textContent = "Unused";
+        title.append(badge);
+      }
+      const meta = document.createElement("span");
+      meta.className = "meta is-mono rcv-row-addr";
+      meta.textContent = a.address;
+      body.append(title, meta);
+      const trail = document.createElement("div");
+      trail.className = "trail";
+      const what = document.createElement("span");
+      what.className = "t-sm muted";
+      what.textContent = a.coins
+        ? plural(a.coins, "coin")
+        : a.transactions
+          ? `Received ${plural(a.transactions, "payment")}`
+          : "Nothing received";
+      trail.append(a.coins ? amountNode(a.balance) : document.createElement("span"), what);
+      const copy = document.createElement("button");
+      copy.type = "button";
+      copy.className = "btn btn-ghost btn-icon btn-sm";
+      copy.setAttribute("aria-label", "Copy address");
+      copy.title = "Copy address";
+      copy.append(icon("copy", "i-sm"));
+      copyButton(copy, () => a.address);
+      row.append(lead, body, trail, copy);
+      const open = () => void showReceiving(a.address);
+      row.addEventListener("click", open);
+      row.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          open();
+        }
+      });
+      return row;
+    }),
+  );
+}
+
+const refreshReceiving = single(async () => {
+  try {
+    const list = await invoke<Receiving[]>("receive_addresses");
+    ownAddresses = sortOwn(list);
+  } catch (e) {
+    receiveResult(String(e));
+    return;
+  }
+  const keep = receiveShown && ownAddresses.some((a) => a.address === receiveShown) ? receiveShown : null;
+  const target = keep ?? defaultReceiving()?.address ?? null;
+  if (target) await showReceiving(target);
+  else {
+    receiveShown = null;
+    receiveRequest = null;
+    renderRequest();
+    renderOwnList();
+  }
+});
+
+function stopRename(): void {
+  el("rcv-rename-form").hidden = true;
+  el("rcv-label-row").hidden = false;
+}
+
+el("rcv-rename").addEventListener("click", () => {
+  el<HTMLInputElement>("rcv-rename-input").value = receiveRequest?.label ?? "";
+  el("rcv-label-row").hidden = true;
+  el("rcv-rename-form").hidden = false;
+  el<HTMLInputElement>("rcv-rename-input").focus();
+});
+el("rcv-rename-cancel").addEventListener("click", stopRename);
+el("rcv-rename-form").addEventListener("keydown", (e) => {
+  if ((e as KeyboardEvent).key === "Escape") stopRename();
+});
+el("rcv-rename-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!receiveShown) return;
+  try {
+    await invoke("receive_rename", { address: receiveShown, label: el<HTMLInputElement>("rcv-rename-input").value });
+  } catch (err) {
+    receiveResult(String(err));
+    return;
+  }
+  stopRename();
+  await refreshReceiving();
+});
+
+copyButton(el<HTMLButtonElement>("rcv-copy"), () => receiveRequest?.address ?? "");
+copyButton(el<HTMLButtonElement>("rcv-copy-link"), () => receiveRequest?.uri ?? "");
+
+// The amount and message only change the link and QR code.
+let askTimer: number | undefined;
+for (const id of ["rcv-amount", "rcv-message"]) {
+  el(id).addEventListener("input", () => {
+    clearTimeout(askTimer);
+    askTimer = window.setTimeout(() => {
+      if (receiveShown) void showReceiving(receiveShown);
+    }, 300);
+  });
+}
+
+el("rcv-search").addEventListener("input", renderOwnList);
+for (const button of document.querySelectorAll<HTMLButtonElement>("#rcv-filter [data-filter]")) {
+  button.addEventListener("click", () => {
+    receiveFilter = button.dataset.filter as typeof receiveFilter;
+    for (const b of document.querySelectorAll<HTMLButtonElement>("#rcv-filter [data-filter]")) {
+      b.setAttribute("aria-pressed", String(b === button));
+    }
+    renderOwnList();
+  });
+}
+
+function openNewAddress(): void {
+  el("rcv-new").hidden = false;
+  el<HTMLInputElement>("rcv-label").focus();
+}
+el("rcv-new-open").addEventListener("click", openNewAddress);
+el("rcv-first").addEventListener("click", openNewAddress);
+el("rcv-new-cancel").addEventListener("click", () => {
+  el<HTMLFormElement>("rcv-new").reset();
+  el("rcv-new").hidden = true;
+});
+
+el("rcv-new").addEventListener("submit", async (e) => {
   e.preventDefault();
   const button = el<HTMLButtonElement>("rcv-submit");
   button.disabled = true;
@@ -563,12 +749,13 @@ el("rcv-form").addEventListener("submit", async (e) => {
   try {
     const r = await invoke<ReceiveRequest>("receive_new", {
       label: el<HTMLInputElement>("rcv-label").value,
-      amount: el<HTMLInputElement>("rcv-amount").value,
-      message: el<HTMLInputElement>("rcv-message").value,
+      amount: "",
+      message: "",
     });
-    for (const id of ["rcv-label", "rcv-amount", "rcv-message"]) el<HTMLInputElement>(id).value = "";
-    showRequest(r, "Request payment");
-    void refreshReceiving();
+    el<HTMLFormElement>("rcv-new").reset();
+    el("rcv-new").hidden = true;
+    receiveShown = r.address;
+    await refreshReceiving();
   } catch (err) {
     receiveResult(String(err));
   } finally {
@@ -755,7 +942,12 @@ async function manageWallet(action: WalletAction): Promise<void> {
     void refreshWallet();
     void refreshRecent();
     tradeWalletChanged();
-    el("rcv-request").hidden = true;
+    // Another wallet has other addresses.
+    receiveShown = null;
+    receiveRequest = null;
+    ownAddresses = [];
+    renderRequest();
+    renderOwnList();
     if (current === "receive") void refreshReceiving();
   } catch (e) {
     walletsResult("danger", String(e));
@@ -2240,13 +2432,19 @@ function bookResult(tone: "success" | "danger", text: string): void {
   box.scrollIntoView({ block: "nearest" });
 }
 
-// Puts an address in the first empty recipient on Send, or a new one.
+// Starts a payment to this address on Send. While a payment to several
+// recipients is being written, it goes in the first empty one, or a new one.
 function payTo(c: Contact): void {
   go("send");
-  let block = [...el("recipients").querySelectorAll<HTMLElement>(".recipient")].find(
-    (b) => !b.querySelector<HTMLInputElement>(".r-address")!.value.trim(),
-  );
-  block ??= addRecipient();
+  const blocks = [...el("recipients").querySelectorAll<HTMLElement>(".recipient")];
+  let block: HTMLElement | undefined;
+  if (blocks.length > 1) {
+    block =
+      blocks.find((b) => !b.querySelector<HTMLInputElement>(".r-address")!.value.trim()) ?? addRecipient();
+  } else {
+    el("recipients").replaceChildren();
+    block = addRecipient();
+  }
   block.querySelector<HTMLInputElement>(".r-address")!.value = c.address;
   block.querySelector<HTMLInputElement>(".r-label")!.value = c.label;
   block.querySelector<HTMLInputElement>(".r-amount")!.focus();
@@ -2303,9 +2501,16 @@ const refreshBook = single(async () => {
       rename.className = "btn btn-ghost btn-sm";
       rename.textContent = "Rename";
       rename.addEventListener("click", () => editContact(c));
+      const copy = document.createElement("button");
+      copy.type = "button";
+      copy.className = "btn btn-ghost btn-icon btn-sm";
+      copy.setAttribute("aria-label", "Copy address");
+      copy.title = "Copy address";
+      copy.append(icon("copy", "i-sm"));
+      copyButton(copy, () => c.address);
       const trail = document.createElement("div");
       trail.className = "row";
-      trail.append(rename, pay);
+      trail.append(copy, rename, pay);
       row.append(lead, body, trail);
       return row;
     }),
@@ -2387,6 +2592,11 @@ function renumberRecipients(): void {
     b.querySelector(".recipient-head")!.toggleAttribute("hidden", blocks.length < 2);
     b.querySelector(".r-title")!.textContent = `Recipient ${i + 1}`;
   });
+  el("send-add").textContent = "";
+  el("send-add").append(
+    icon("plus", "i-sm"),
+    blocks.length < 2 ? "Pay someone else in the same transaction" : "Add another recipient",
+  );
   el<HTMLButtonElement>("send-add").disabled = blocks.length >= MAX_RECIPIENTS;
 }
 
@@ -2433,15 +2643,38 @@ function addRecipient(): HTMLElement {
   subtract.append(box, body);
 
   // Saved addresses are offered as the address is typed, and bring their label.
-  const address = textInput(`r-address-${n}`, "input-mono r-address", { list: "book-options" });
+  const address = textInput(`r-address-${n}`, "input-mono r-address", {
+    list: "book-options",
+    placeholder: "Paste an address, or choose one",
+  });
   address.addEventListener("change", () => {
     const label = block.querySelector<HTMLInputElement>(".r-label")!;
     const saved = contacts.find((c) => c.address === address.value.trim());
     if (saved && !label.value.trim()) label.value = saved.label;
   });
+  const choose = document.createElement("button");
+  choose.type = "button";
+  choose.className = "btn btn-secondary";
+  choose.append(icon("book", "i-sm"), "Choose");
+  choose.addEventListener("click", async () => {
+    const picked = await pickAddress(
+      "Pay to",
+      "A saved contact, or one of your own addresses to move coins to.",
+      "book",
+    );
+    if (!picked) return;
+    address.value = picked.address;
+    // The label is saved with the address once paid; an own address keeps
+    // its own label, so none is filled in for it.
+    block.querySelector<HTMLInputElement>(".r-label")!.value = picked.mine ? "" : picked.label;
+    amount.focus();
+  });
+  const addressBox = document.createElement("div");
+  addressBox.className = "pick-field";
+  addressBox.append(address, choose);
   block.append(
     head,
-    field(`r-address-${n}`, "Pay to", address),
+    field(`r-address-${n}`, "Pay to", addressBox),
     field(
       `r-label-${n}`,
       "Label",
