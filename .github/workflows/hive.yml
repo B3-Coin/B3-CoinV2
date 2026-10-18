@@ -90,7 +90,7 @@ jobs:
             sh -euxc '
               apk add --no-cache \
                 bash binutils bison build-base cmake curl file git linux-headers \
-                make ninja patch pkgconf python3 xz
+                make ninja patch perl pkgconf python3 xz
               git config --global --add safe.directory /src
               host="$(./depends/config.guess)"
               test "$host" = x86_64-pc-linux-musl
