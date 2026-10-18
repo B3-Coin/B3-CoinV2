@@ -1,7 +1,8 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 
-// One entry per window, with no shared code: main, approval and console.
+// One entry per window, with no shared code: main, approval, passphrase and
+// console.
 // Tauri serves dist/ in release builds and the dev server during `tauri dev`;
 // nothing here is reachable from outside.
 export default defineConfig({
@@ -15,6 +16,7 @@ export default defineConfig({
       input: {
         main: fileURLToPath(new URL("./web/index.html", import.meta.url)),
         approval: fileURLToPath(new URL("./web/approval.html", import.meta.url)),
+        passphrase: fileURLToPath(new URL("./web/passphrase.html", import.meta.url)),
         console: fileURLToPath(new URL("./web/console.html", import.meta.url)),
       },
     },

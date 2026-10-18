@@ -536,7 +536,12 @@ el("rcv-form").addEventListener("submit", async (e) => {
 // Qt's wallet selector and File menu. The default wallet's name is "".
 
 // Mirrors WalletsView in src-tauri/src/lib.rs.
-type WalletsView = { loaded: string[]; available: string[]; current: string | null };
+type WalletsView = {
+  loaded: string[];
+  available: string[];
+  current: string | null;
+  security: WalletOverview["security"] | null;
+};
 type WalletAction = { action: "switch" | "open" | "close" | "create"; name: string };
 
 const walletName = (name: string) => (name === "" ? "Default wallet" : name);
@@ -546,6 +551,7 @@ function walletsResult(tone: "success" | "danger" | "", text: string): void {
   box.hidden = !text;
   box.className = `banner banner-${tone}`;
   box.textContent = text;
+  if (text) box.scrollIntoView({ block: "nearest" });
 }
 
 function walletRow(name: string, trail: HTMLElement[], meta: string): HTMLElement {
@@ -612,10 +618,55 @@ function renderWallets(v: WalletsView): void {
     ),
   );
   el("wl-available-empty").hidden = v.available.length > 0;
+  renderWalletSecurity(v);
   el("wl-backup-name").textContent = v.current === null ? "the wallet in use" : walletName(v.current);
   el<HTMLButtonElement>("wl-backup").disabled = v.current === null;
   renderWalletPick(v);
 }
+
+// Qt's Settings menu: Encrypt wallet, Change passphrase, and Lock wallet.
+const SECURITY_TEXT: Record<WalletOverview["security"], string> = {
+  watch_only: "This wallet holds no private keys, so there is nothing to encrypt.",
+  unencrypted: "Anyone who can read the wallet file can spend from it. Encrypting asks for a passphrase before every payment.",
+  locked: "Payments need the passphrase. Sending from a locked wallet comes in the next B3 Hive step.",
+  unlocked: "The wallet is unlocked: it can sign without asking for the passphrase until it locks again.",
+};
+
+function renderWalletSecurity(v: WalletsView): void {
+  const s = v.security;
+  el("wl-security-card").hidden = s === null;
+  if (s === null) return;
+  const [text, tone] = SECURITY[s];
+  el("wl-security").textContent = text;
+  el("wl-security").className = `badge badge-${tone}`;
+  el("wl-security-text").textContent = SECURITY_TEXT[s];
+  el("wl-encrypt").hidden = s !== "unencrypted";
+  el("wl-change").hidden = s !== "locked" && s !== "unlocked";
+  el("wl-lock").hidden = s !== "unlocked";
+}
+
+async function askPassphrase(kind: "encrypt" | "change"): Promise<void> {
+  walletsResult("", "");
+  try {
+    // The outcome arrives as a passphrase-result event.
+    await invoke("passphrase_request", { kind });
+  } catch (e) {
+    walletsResult("danger", String(e));
+  }
+}
+
+el("wl-encrypt").addEventListener("click", () => void askPassphrase("encrypt"));
+el("wl-change").addEventListener("click", () => void askPassphrase("change"));
+el("wl-lock").addEventListener("click", async () => {
+  try {
+    await invoke("wallet_lock");
+    walletsResult("success", "The wallet is locked.");
+  } catch (e) {
+    walletsResult("danger", String(e));
+  }
+  void refreshWallets();
+  void refreshWallet();
+});
 
 // The rail switcher appears once two wallets are loaded, as Qt's selector does.
 function renderWalletPick(v: WalletsView): void {
@@ -1789,6 +1840,26 @@ el("update-download").addEventListener("click", async () => {
 
 await listen<number>("update-progress", (event) => {
   if (offerSize > 0) el("update-progress-bar").style.width = `${Math.min(100, (event.payload / offerSize) * 100)}%`;
+});
+
+// Mirrors PassResult in src-tauri/src/lib.rs: only the outcome, never the
+// passphrase.
+type PassResult =
+  | { outcome: "done"; kind: "encrypt" | "change"; wallet: string }
+  | { outcome: "cancelled"; kind: "encrypt" | "change" };
+
+await listen<PassResult>("passphrase-result", (event) => {
+  const r = event.payload;
+  if (r.outcome === "done") {
+    walletsResult(
+      "success",
+      r.kind === "encrypt"
+        ? `${walletName(r.wallet)} is now encrypted. Make a new backup now: encrypting started a new key chain, so older backups do not hold the keys for new addresses.`
+        : `The passphrase of ${walletName(r.wallet)} was changed.`,
+    );
+  }
+  void refreshWallets();
+  void refreshWallet();
 });
 
 await listen<DraftResult>("draft-result", (event) => {

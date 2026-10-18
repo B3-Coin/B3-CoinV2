@@ -9,6 +9,7 @@ pub mod console;
 pub mod drafts;
 pub mod history;
 pub mod node;
+pub mod passphrase;
 pub mod receive;
 pub mod rpc;
 pub mod settings;
@@ -39,6 +40,7 @@ const FOLLOW_INTERVAL: Duration = Duration::from_secs(2);
 const MAIN: &str = "main";
 const APPROVAL: &str = "approval";
 const CONSOLE: &str = "console";
+const PASSPHRASE: &str = "passphrase";
 
 pub struct Core {
     /// The current node. A restart swaps in a new one; callers take a clone
@@ -51,6 +53,8 @@ pub struct Core {
     /// The wallet picked in the main window; the pages fall back to the first
     /// loaded wallet when it is not loaded.
     wallet: Mutex<Option<String>>,
+    /// The passphrase window's request while it is open.
+    passphrase: Mutex<Option<passphrase::Request>>,
     /// The theme picked in the main window, so the other windows open in it.
     theme: Mutex<Option<Theme>>,
     updates: Updates,
@@ -110,6 +114,20 @@ pub struct WalletOverview {
     pub staking_error: Option<String>,
     /// The funding button is offered on regtest only.
     pub can_fund: bool,
+}
+
+/// Sent to the main window when the passphrase window finishes. The main
+/// window learns only the outcome, never the passphrase.
+#[derive(Clone, Serialize)]
+#[serde(tag = "outcome", rename_all = "lowercase")]
+pub enum PassResult {
+    Done {
+        kind: passphrase::Kind,
+        wallet: String,
+    },
+    Cancelled {
+        kind: passphrase::Kind,
+    },
 }
 
 /// Sent to the main window when a draft is decided.
@@ -382,6 +400,8 @@ pub struct WalletsView {
     pub wallets: wallet::Wallets,
     /// The wallet the pages use, if any is loaded.
     pub current: Option<String>,
+    /// How the current wallet's keys are protected.
+    pub security: Option<wallet::Security>,
 }
 
 fn wallets_view(core: &Core) -> Result<WalletsView, String> {
@@ -393,7 +413,15 @@ fn wallets_view(core: &Core) -> Result<WalletsView, String> {
         Err(e) => return Err(e),
     };
     let wallets = wallet::wallets(client).map_err(|e| e.to_string())?;
-    Ok(WalletsView { wallets, current })
+    let security = match &current {
+        Some(name) => Some(wallet::security(client, name).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    Ok(WalletsView {
+        wallets,
+        current,
+        security,
+    })
 }
 
 #[tauri::command]
@@ -448,6 +476,65 @@ async fn wallet_manage(
             *core.wallet.lock().unwrap() = Some(name);
         }
         wallets_view(&core)
+    })
+    .await
+}
+
+/// Opens the passphrase window to encrypt the wallet in use or change its
+/// passphrase. The outcome arrives as a passphrase-result event.
+/// Async on purpose: see open_console.
+#[tauri::command]
+async fn passphrase_request(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    kind: passphrase::Kind,
+) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    if app.get_webview_window(PASSPHRASE).is_some() {
+        return Err("The passphrase window is already open.".into());
+    }
+    let core2 = Arc::clone(&core);
+    let wallet = blocking(move || {
+        let node = core2.node();
+        let (client, name) = page_wallet(&core2, &node)?;
+        let security = wallet::security(client, &name).map_err(|e| e.to_string())?;
+        passphrase::check_kind(kind, security)?;
+        Ok(name)
+    })
+    .await?;
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
+    let id = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    *core.passphrase.lock().unwrap() = Some(passphrase::Request { id, kind, wallet });
+    let title = match kind {
+        passphrase::Kind::Encrypt => "Encrypt wallet – B3 Hive",
+        passphrase::Kind::Change => "Change passphrase – B3 Hive",
+    };
+    WebviewWindowBuilder::new(&app, PASSPHRASE, WebviewUrl::App("passphrase.html".into()))
+        .title(title)
+        .inner_size(460.0, 520.0)
+        .resizable(false)
+        .always_on_top(true)
+        .focused(true)
+        .incognito(true)
+        .build()
+        .map(|_| ())
+        .map_err(|e| {
+            core.passphrase.lock().unwrap().take();
+            e.to_string()
+        })
+}
+
+/// Qt's Lock wallet, for an encrypted wallet that is unlocked.
+#[tauri::command]
+async fn wallet_lock(window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        passphrase::lock(client, &name)
     })
     .await
 }
@@ -924,6 +1011,64 @@ async fn approval_decide(
     Ok(next)
 }
 
+// ---- passphrase window commands --------------------------------------------
+
+#[tauri::command]
+fn passphrase_pending(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<Option<passphrase::Request>, String> {
+    require_window(&window, PASSPHRASE)?;
+    Ok(core.passphrase.lock().unwrap().clone())
+}
+
+/// Runs the request with the typed passphrases. A mistake (wrong current
+/// passphrase, mismatch) leaves the window open to try again; success tells
+/// the main window and closes this one.
+#[tauri::command]
+async fn passphrase_submit(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    id: String,
+    entry: passphrase::Entry,
+) -> Result<(), String> {
+    require_window(&window, PASSPHRASE)?;
+    let request = core
+        .passphrase
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|r| r.id == id)
+        .ok_or("This request is no longer open.")?;
+    let core2 = Arc::clone(&core);
+    let done = request.clone();
+    blocking(move || {
+        let node = core2.node();
+        let client = node.client().ok_or("The node is not ready.")?;
+        passphrase::apply(client, &done, &entry)
+    })
+    .await?;
+    core.passphrase.lock().unwrap().take();
+    let _ = app.emit_to(
+        MAIN,
+        "passphrase-result",
+        PassResult::Done {
+            kind: request.kind,
+            wallet: request.wallet,
+        },
+    );
+    let _ = window.close();
+    Ok(())
+}
+
+/// Closes the passphrase window; closing it cancels the request.
+#[tauri::command]
+fn passphrase_cancel(window: Window) -> Result<(), String> {
+    require_window(&window, PASSPHRASE)?;
+    window.close().map_err(|e| e.to_string())
+}
+
 // ---- console window commands -----------------------------------------------
 
 /// Parses and runs one typed line with the console's full-access login,
@@ -1156,6 +1301,7 @@ pub fn run() {
                 exiting: AtomicBool::new(false),
                 drafts: Mutex::new(DraftStore::default()),
                 wallet: Mutex::new(None),
+                passphrase: Mutex::new(None),
                 theme: Mutex::new(None),
                 updates,
                 setup: Setup::default(),
@@ -1171,6 +1317,18 @@ pub fn run() {
                         MAIN,
                         "draft-result",
                         DraftResult::Rejected { id: draft.id },
+                    );
+                }
+            }
+            // Closing the passphrase window without finishing cancels it.
+            if window.label() == PASSPHRASE && matches!(event, WindowEvent::Destroyed) {
+                let core = window.state::<Arc<Core>>();
+                let pending = core.passphrase.lock().unwrap().take();
+                if let Some(r) = pending {
+                    let _ = window.emit_to(
+                        MAIN,
+                        "passphrase-result",
+                        PassResult::Cancelled { kind: r.kind },
                     );
                 }
             }
@@ -1199,6 +1357,11 @@ pub fn run() {
             network_totals,
             wallets,
             wallet_manage,
+            passphrase_request,
+            wallet_lock,
+            passphrase_pending,
+            passphrase_submit,
+            passphrase_cancel,
             receive_new,
             receive_addresses,
             receive_show,

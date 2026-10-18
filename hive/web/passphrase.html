@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Passphrase – B3 Hive</title>
+    <link rel="stylesheet" href="./shared/css/hive.css" />
+    <link rel="stylesheet" href="./approval/style.css" />
+  </head>
+  <body>
+    <div class="approval">
+      <div class="empty" id="empty" hidden>
+        <div class="empty-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-check" /></svg></div>
+        <h3>Nothing to do</h3>
+        <p>This window opens when B3 Hive needs your wallet passphrase.</p>
+      </div>
+
+      <form class="approval-draft" id="form" novalidate hidden>
+        <div class="modal-head">
+          <div>
+            <h2 id="title"></h2>
+            <p class="sub" id="wallet"></p>
+          </div>
+        </div>
+        <div class="modal-body stack">
+          <p id="intro"></p>
+          <div class="callout callout-danger" id="encrypt-warning" hidden>
+            <div class="callout-title">
+              <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>If you lose this passphrase, you lose all your B3
+            </div>
+            Nobody can recover it for you. Encryption also cannot fully protect your B3 from malware
+            on this computer.
+          </div>
+          <div class="field" id="old-field" hidden>
+            <label for="old">Current passphrase</label>
+            <input class="input" type="password" id="old" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="new">New passphrase</label>
+            <input class="input" type="password" id="new" autocomplete="off" spellcheck="false" />
+            <span class="help">Use ten or more random characters, or eight or more words.</span>
+          </div>
+          <div class="field">
+            <label for="repeat">Repeat the new passphrase</label>
+            <input class="input" type="password" id="repeat" autocomplete="off" spellcheck="false" />
+          </div>
+          <label class="check" id="ack-row" hidden>
+            <input type="checkbox" id="ack" />
+            <span class="check-body">
+              <span>I understand that without this passphrase the B3 in this wallet cannot be spent.</span>
+            </span>
+          </label>
+          <div class="banner banner-danger" id="error" role="alert" hidden></div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn btn-secondary" id="cancel" type="button">Cancel</button>
+          <button class="btn btn-primary" id="submit" type="submit"></button>
+        </div>
+      </form>
+    </div>
+    <script type="module" src="./approval/passphrase.ts"></script>
+  </body>
+</html>

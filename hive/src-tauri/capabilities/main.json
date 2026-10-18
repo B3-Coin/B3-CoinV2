@@ -24,6 +24,8 @@
     "allow-network-totals",
     "allow-wallets",
     "allow-wallet-manage",
+    "allow-passphrase-request",
+    "allow-wallet-lock",
     "allow-receive-new",
     "allow-receive-addresses",
     "allow-receive-show",

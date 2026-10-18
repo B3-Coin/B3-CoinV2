@@ -16,6 +16,7 @@ use b3_hive::console;
 use b3_hive::drafts::DraftStore;
 use b3_hive::history::{self, Filter, Kind};
 use b3_hive::node::{Network, Node, NodeConfig, NodeStatus};
+use b3_hive::passphrase::{self, Entry, Kind as PassKind, Request};
 use b3_hive::receive;
 use b3_hive::rpc::{Client, RpcError};
 use b3_hive::settings::{self, NodeSettings};
@@ -600,4 +601,64 @@ fn receive_makes_labelled_addresses_and_links() {
     // An address this wallet does not own is refused.
     let other = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
     assert!(receive::show(client, W, "regtest", other).is_err());
+}
+
+fn entry(old: &str, new: &str) -> Entry {
+    serde_json::from_value(json!({"old": old, "new": new, "repeat": new})).unwrap()
+}
+
+#[test]
+fn passphrases_encrypt_change_and_lock() {
+    let Some((test, status)) = TestNode::start("passphrase") else {
+        return;
+    };
+    assert!(matches!(status, NodeStatus::Ready { .. }), "{status:?}");
+    let client = test.node.client().unwrap();
+    wallet::create(client, "safe").unwrap();
+    let request = |kind| Request {
+        id: "r".into(),
+        kind,
+        wallet: "safe".into(),
+    };
+
+    // Change needs an encrypted wallet; encrypt needs an unencrypted one.
+    assert!(passphrase::apply(client, &request(PassKind::Change), &entry("a", "b")).is_err());
+    passphrase::apply(
+        client,
+        &request(PassKind::Encrypt),
+        &entry("", "first pass"),
+    )
+    .unwrap();
+    assert_eq!(
+        wallet::security(client, "safe").unwrap(),
+        wallet::Security::Locked
+    );
+    assert!(passphrase::apply(client, &request(PassKind::Encrypt), &entry("", "again")).is_err());
+
+    let wrong = passphrase::apply(
+        client,
+        &request(PassKind::Change),
+        &entry("nope", "second pass"),
+    );
+    assert_eq!(wrong.unwrap_err(), "The current passphrase is not correct.");
+    passphrase::apply(
+        client,
+        &request(PassKind::Change),
+        &entry("first pass", "second pass"),
+    )
+    .unwrap();
+
+    // The new passphrase unlocks; Lock forgets the key again.
+    test.admin()
+        .call_wallet("safe", "walletpassphrase", json!(["second pass", 60]))
+        .unwrap();
+    assert_eq!(
+        wallet::security(client, "safe").unwrap(),
+        wallet::Security::Unlocked
+    );
+    passphrase::lock(client, "safe").unwrap();
+    assert_eq!(
+        wallet::security(client, "safe").unwrap(),
+        wallet::Security::Locked
+    );
 }

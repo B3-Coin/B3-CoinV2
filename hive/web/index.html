@@ -367,6 +367,7 @@
 
         <main class="view view--flow" id="view-wallets" hidden>
           <div class="stack">
+            <div class="banner" id="wl-result" role="status" hidden></div>
             <div class="card">
               <div class="card-head">
                 <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-wallet" /></svg>Loaded</h2>
@@ -375,6 +376,21 @@
               <div id="wl-loaded"></div>
               <div class="empty empty--tight" id="wl-loaded-empty" hidden>
                 <p>No wallet is loaded. Open one below, or create one.</p>
+              </div>
+            </div>
+
+            <div class="card" id="wl-security-card" hidden>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-lock" /></svg>Encryption</h2>
+                <span class="badge" id="wl-security"></span>
+              </div>
+              <div class="card-pad">
+                <p class="t-sm muted" id="wl-security-text"></p>
+                <div class="row mt-2">
+                  <button class="btn btn-primary" type="button" id="wl-encrypt">Encrypt wallet</button>
+                  <button class="btn btn-secondary" type="button" id="wl-change">Change passphrase</button>
+                  <button class="btn btn-secondary" type="button" id="wl-lock">Lock now</button>
+                </div>
               </div>
             </div>
 
@@ -427,7 +443,6 @@
                 <button class="btn btn-secondary mt-2" type="button" id="wl-backup">Back up wallet</button>
               </div>
             </div>
-            <div class="banner" id="wl-result" role="status" hidden></div>
           </div>
         </main>
 
