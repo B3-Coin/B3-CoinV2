@@ -112,7 +112,9 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
     // Newest first: the last block mined has one confirmation.
     assert_eq!(lines[0].confirmations, 1);
     assert_eq!(lines[0].category, "immature");
-    assert!(lines.windows(2).all(|w| w[0].confirmations <= w[1].confirmations));
+    assert!(lines
+        .windows(2)
+        .all(|w| w[0].confirmations <= w[1].confirmations));
     assert_eq!(chain::overview(client).unwrap().blocks, wallet::FUND_BLOCKS);
 }
 
