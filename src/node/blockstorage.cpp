@@ -222,7 +222,7 @@ bool BlockTreeDB::ReadFlag(const std::string& name, bool& fValue)
     return true;
 }
 
-bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&)> insertBlockIndex, const util::SignalInterrupt& interrupt)
+bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&)> insertBlockIndex, const util::SignalInterrupt& interrupt, const std::function<void(int)>& progress)
 {
     AssertLockHeld(::cs_main);
     std::unique_ptr<CDBIterator> pcursor(NewIterator());
@@ -244,6 +244,16 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
     std::vector<CDiskBlockIndex> batch;
     std::vector<uint256> hashes;
     batch.reserve(BATCH_SIZE);
+    // Records are keyed by block hash, which is uniformly distributed, and
+    // iterated in key byte order, so the first two bytes of the last key read
+    // tell how much of the index is loaded without counting it first.
+    uint256 last_key;
+    int reported{-1};
+    const auto report{[&](const int percent) {
+        if (!progress || percent == reported) return;
+        reported = percent;
+        progress(percent);
+    }};
     const auto insert_batch{[&] {
         hashes.assign(batch.size(), uint256{});
         const size_t threads{std::min(workers, (batch.size() + 255) / 256)};
@@ -287,6 +297,7 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
             pindexNew->nTx            = diskindex.nTx;
         }
         batch.clear();
+        report(static_cast<int>(((last_key.data()[0] << 8) | last_key.data()[1]) * 100 / 65536));
     }};
     while (pcursor->Valid()) {
         if (interrupt) return false;
@@ -294,6 +305,7 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
         if (pcursor->GetKey(key) && key.first == DB_BLOCK_INDEX) {
             CDiskBlockIndex diskindex;
             if (pcursor->GetValue(diskindex)) {
+                last_key = key.second;
                 batch.push_back(std::move(diskindex));
                 if (batch.size() == BATCH_SIZE) insert_batch();
                 pcursor->Next();
@@ -306,6 +318,7 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
         }
     }
     insert_batch();
+    report(100);
 
     // Load the optional FN issuance sidecars only after every regular block
     // index entry has been materialized. Calling insertBlockIndex now therefore
@@ -790,7 +803,8 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
     }
 
     if (!m_block_tree_db->LoadBlockIndexGuts(
-            GetConsensus(), [this](const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash); }, m_interrupt)) {
+            GetConsensus(), [this](const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash); }, m_interrupt,
+            [this](int percent) { m_opts.notifications.progress(_("Loading block index…"), percent, /*resume_possible=*/false); })) {
         return false;
     }
 

@@ -24,6 +24,7 @@
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
 
+#include <algorithm>
 #include <deque>
 #include <vector>
 
@@ -74,7 +75,15 @@ BOOST_AUTO_TEST_CASE(block_index_load_hashes_every_record_across_batches)
         if (inserted) it->second.phashBlock = &it->first;
         return &it->second;
     }};
-    BOOST_REQUIRE(WITH_LOCK(cs_main, return db.LoadBlockIndexGuts(consensus, insert, m_interrupt)));
+    std::vector<int> progress;
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return db.LoadBlockIndexGuts(consensus, insert, m_interrupt, [&](int percent) { progress.push_back(percent); })));
+
+    // Progress is reported after each batch, from the hash-ordered keys, and
+    // ends at 100: the first of the two batches holds 16384 of 20000 records.
+    BOOST_REQUIRE(progress.size() >= 2 && progress.size() <= 3);
+    BOOST_CHECK(std::is_sorted(progress.begin(), progress.end()));
+    BOOST_CHECK(progress.front() >= 78 && progress.front() <= 86);
+    BOOST_CHECK_EQUAL(progress.back(), 100);
 
     // Each record arrives exactly once with its fields; a sample is checked
     // against an independent scrypt of the stored header.
