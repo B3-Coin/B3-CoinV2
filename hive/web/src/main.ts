@@ -242,6 +242,8 @@ function showBanner(tone: Tone, title: string, detail: string): void {
   el("node-banner-icon").hidden = tone === "info";
   el("node-banner-title").textContent = title;
   el("node-banner-detail").textContent = detail;
+  el("node-banner-progress").hidden = true;
+  el("node-banner-elapsed").hidden = true;
   el("restart-node").hidden = true;
 }
 
@@ -249,6 +251,23 @@ function badge(state: "unlocked" | "locked" | "no-node" | "no-wallet", text: str
   el("node-badge").dataset.state = state;
   el("node-badge-text").textContent = text;
 }
+
+// How long the node has been starting, so a long step does not look stuck.
+let startingSince: number | null = null;
+
+function showStartingTime(): void {
+  const box = el("node-banner-elapsed");
+  if (startingSince === null || el("node-banner").hidden) return;
+  const seconds = Math.round((Date.now() - startingSince) / 1000);
+  box.hidden = seconds < 5;
+  box.textContent =
+    `Starting for ${seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${seconds % 60} s`}.` +
+    (seconds >= 30 ? " Loading a large chain can take several minutes." : "");
+}
+
+window.setInterval(() => {
+  if (startingSince !== null) showStartingTime();
+}, 1000);
 
 // A failure after the node was running is a stop or a crash, not a start error.
 let wasReady = false;
@@ -269,11 +288,20 @@ function render(status: NodeStatus): void {
   }
   if (current === "setup") go("home");
   switch (status.phase) {
-    case "starting":
-      showBanner("info", "Starting the node", status.message);
+    case "starting": {
+      // Long steps (loading the block index, verifying blocks, rescans)
+      // end their message with a percentage.
+      const step = /^(.*?)\s*(\d{1,3})%$/.exec(status.message);
+      showBanner("info", "Starting the node", step ? `${step[1]} ${step[2]}%` : status.message);
+      el("node-banner-progress").hidden = !step;
+      if (step) el("node-banner-bar").style.width = `${Math.min(100, Number(step[2]))}%`;
+      startingSince ??= Date.now();
+      showStartingTime();
       badge("no-wallet", "Starting");
       break;
+    }
     case "ready":
+      startingSince = null;
       el("node-banner").hidden = true;
       badge("unlocked", `Running on ${status.chain}`);
       el("chain-name").textContent = status.chain;
@@ -287,10 +315,12 @@ function render(status: NodeStatus): void {
       if (current === "activity") void refreshActivity();
       break;
     case "stopping":
+      startingSince = null;
       showBanner("info", "Stopping the node", "");
       badge("locked", "Stopping");
       break;
     case "failed":
+      startingSince = null;
       showBanner("danger", wasReady ? "The node stopped" : "The node could not start", status.error);
       el("restart-node").hidden = false;
       badge("no-node", "Not running");
@@ -749,6 +779,39 @@ type ImportView = {
   wallets: WalletsView;
 };
 
+// The rescan banner: elapsed time always, a bar while the node reports one.
+let scanStarted = 0;
+let scanPercent: number | null = null;
+let scanTimer: number | undefined;
+
+function renderScan(): void {
+  const seconds = Math.round((Date.now() - scanStarted) / 1000);
+  const elapsed = seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
+  el("wl-scan-text").textContent =
+    scanPercent === null ? `Running for ${elapsed}. Keep Hive open until it finishes.` : `${scanPercent}% after ${elapsed}. Keep Hive open until it finishes.`;
+  el("wl-scan-progress").hidden = scanPercent === null;
+  el("wl-scan-bar").style.width = `${scanPercent ?? 0}%`;
+}
+
+function endScan(): void {
+  window.clearInterval(scanTimer);
+  scanTimer = undefined;
+  el("wl-scan").hidden = true;
+}
+
+await listen<{ wallet: string; percent: number | null }>("wallet-scan", (event) => {
+  if (scanTimer === undefined) {
+    scanStarted = Date.now();
+    scanPercent = null;
+    scanTimer = window.setInterval(renderScan, 1000);
+    walletsResult("", "");
+    el("wl-scan").hidden = false;
+    el("wl-scan").scrollIntoView({ block: "nearest" });
+  }
+  if (event.payload.percent !== null) scanPercent = event.payload.percent;
+  renderScan();
+});
+
 async function restoreWallet(legacy: boolean): Promise<void> {
   if (walletBusy) return;
   const name = el<HTMLInputElement>("wl-restore-name").value;
@@ -792,6 +855,7 @@ async function restoreWallet(legacy: boolean): Promise<void> {
     walletsResult("danger", String(e));
     void refreshWallets();
   } finally {
+    endScan();
     walletBusy = false;
     buttons.forEach((b) => (b.disabled = false));
   }

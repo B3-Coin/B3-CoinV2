@@ -40,6 +40,13 @@
 .coin-list .list-row:hover { background: var(--bg-subtle); }
 .coin-list input { width: 20px; height: 20px; flex: none; accent-color: var(--accent); }
 
+/* Scrolling a result banner into view stops below the sticky page head,
+   not under it. */
+.banner { scroll-margin-top: 104px; }
+
+/* A banner's text column takes the width, so a progress bar in it spans. */
+.banner-body { flex: 1; min-width: 0; }
+
 /* An address under its line's label, as in the approval window. */
 .details .addr-line {
   display: block; margin-top: 2px; font-family: var(--font-mono);

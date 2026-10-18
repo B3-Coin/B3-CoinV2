@@ -770,6 +770,73 @@ fn pick_file(app: &AppHandle, title: &str, filter: (&str, &[&str])) -> Option<st
     dialog.blocking_pick_file()?.into_path().ok()
 }
 
+/// A wallet rescan's progress, for the Wallets page: None once the file is
+/// chosen and the rescan has started, then the percentage while the node
+/// reports one.
+#[derive(Clone, Serialize)]
+struct ScanProgress {
+    wallet: String,
+    percent: Option<u32>,
+}
+
+/// Sends wallet-scan events to the main window: one when it starts, then
+/// the rescan's progress from getwalletinfo once a second, until the
+/// returned guard is dropped. A wallet the node does not list yet (a
+/// restore rescans before it does) just reports no percentage.
+fn watch_scan(app: &AppHandle, core: &Arc<Core>, wallet: &str) -> ScanWatch {
+    let done = Arc::new(AtomicBool::new(false));
+    let (app, core, wallet, stop) = (
+        app.clone(),
+        Arc::clone(core),
+        wallet.to_owned(),
+        Arc::clone(&done),
+    );
+    let _ = app.emit_to(
+        MAIN,
+        "wallet-scan",
+        ScanProgress {
+            wallet: wallet.clone(),
+            percent: None,
+        },
+    );
+    thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(1));
+            let node = core.node();
+            let Some(client) = node.client() else {
+                continue;
+            };
+            let Ok(info) = client.call_wallet(&wallet, "getwalletinfo", serde_json::json!([]))
+            else {
+                continue;
+            };
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Some(progress) = info["scanning"]["progress"].as_f64() {
+                let _ = app.emit_to(
+                    MAIN,
+                    "wallet-scan",
+                    ScanProgress {
+                        wallet: wallet.clone(),
+                        percent: Some((progress * 100.0).clamp(0.0, 100.0) as u32),
+                    },
+                );
+            }
+        }
+    });
+    ScanWatch(done)
+}
+
+/// Stops watch_scan when dropped.
+struct ScanWatch(Arc<AtomicBool>);
+
+impl Drop for ScanWatch {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Qt's Restore wallet: a backup file, chosen with the native picker, is
 /// loaded as the new wallet `name` and becomes the pages' wallet. None when
 /// the picker is cancelled.
@@ -793,6 +860,7 @@ async fn wallet_restore(
         };
         let node = core.node();
         let client = node.patient_client().ok_or("The node is not ready yet.")?;
+        let _watch = watch_scan(&app, &core, name.trim());
         let name = wallet::restore(client, &name, &path)?;
         *core.wallet.lock().unwrap() = Some(name);
         wallets_view(&core).map(Some)
@@ -830,6 +898,7 @@ async fn wallet_import_legacy(
         };
         let node = core.node();
         let client = node.patient_client().ok_or("The node is not ready yet.")?;
+        let _watch = watch_scan(&app, &core, name.trim());
         let imported = wallet::import_legacy(client, &name, &path)?;
         *core.wallet.lock().unwrap() = Some(imported.wallet.clone());
         Ok(Some(ImportView {

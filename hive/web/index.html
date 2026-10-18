@@ -173,9 +173,11 @@
             <div class="banner banner-info" id="node-banner" role="status">
               <span class="spinner" id="node-banner-spinner"></span>
               <svg class="i" id="node-banner-icon" aria-hidden="true" hidden><use href="/icons.svg#i-alert-circle" /></svg>
-              <div>
+              <div class="banner-body">
                 <strong id="node-banner-title">Starting the node</strong>
                 <div class="t-sm" id="node-banner-detail"></div>
+                <div class="progress mt-2" id="node-banner-progress" hidden><div class="progress-bar" id="node-banner-bar"></div></div>
+                <div class="t-sm muted mt-1" id="node-banner-elapsed" hidden></div>
                 <button class="btn btn-secondary btn-sm mt-3" id="restart-node" type="button" hidden>
                   <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-refresh" /></svg><span>Start the node again</span>
                 </button>
@@ -546,6 +548,14 @@
         <main class="view view--flow" id="view-wallets" hidden>
           <div class="stack">
             <div class="banner" id="wl-result" role="status" hidden></div>
+            <div class="banner banner-info" id="wl-scan" role="status" hidden>
+              <span class="spinner"></span>
+              <div class="banner-body">
+                <strong>Rescanning the chain for this wallet</strong>
+                <div class="t-sm" id="wl-scan-text"></div>
+                <div class="progress mt-2" id="wl-scan-progress" hidden><div class="progress-bar" id="wl-scan-bar"></div></div>
+              </div>
+            </div>
             <div class="card">
               <div class="card-head">
                 <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-wallet" /></svg>Loaded</h2>
