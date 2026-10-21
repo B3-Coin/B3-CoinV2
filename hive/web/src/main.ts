@@ -392,15 +392,15 @@ function renderStaking(s: Staking | null, error: string | null): void {
     el("era-detail").textContent = detail;
     el("era-height").textContent = s.tip_height >= 0 ? `Block ${count(s.tip_height)}` : "";
     const mine = s.running && s.this_wallet;
-    badgeEl.textContent = mine ? "Running" : s.running ? "Other wallet" : "Stopped";
+    badgeEl.textContent = mine ? "On" : s.running ? "Other wallet" : "Off";
     badgeEl.className = `badge badge-${mine ? "success" : "neutral"}`;
     if (mine) {
-      lines.push("Staking is running.");
+      lines.push("Staking is on.");
       if (s.state) lines.push(s.state);
     } else if (s.running) {
       lines.push("Another wallet is staking on this node.");
     } else {
-      lines.push("Staking is stopped.");
+      lines.push("Staking is off.");
     }
     if (s.finality_signing && s.this_wallet) {
       lines.push(
@@ -2282,13 +2282,119 @@ type StakeStatus = {
     blocks_produced: number;
   };
   finality: { bound: boolean; revoked: boolean; key_is_ours: boolean | null; member: boolean; weight: number } | null;
+  bind_pending: string | null;
 };
 
 const PHASE_TEXT: Record<string, string> = {
   legacy: "Legacy era: stakes open after the B3 transition",
   corridor: "Transition corridor: staking begins after it",
-  modern_pos: "Modern PoS",
+  modern_pos: "Modern proof of stake",
 };
+
+type StakeStep = { title: string; detail: string; state: "done" | "active" | "pending" };
+
+/** Whether staking can start: the node refuses it without a finality key
+ *  this wallet holds (stake::start_error). A key that could not be checked,
+ *  as while the wallet is locked, is checked when staking starts. */
+function finalityReady(s: StakeStatus): boolean {
+  const f = s.finality;
+  return !!f && (f.member || (f.bound && !f.revoked && f.key_is_ours !== false));
+}
+
+/** What staking takes, in order, and how far this wallet is. A step that
+ *  can be taken now is "active", one waiting on an earlier step "pending". */
+function stakeSteps(s: StakeStatus): StakeStep[] {
+  const open = s.phase === "modern_pos";
+  const l = s.loop;
+  const f = s.finality;
+  const counting = s.active_weight > 0;
+  const waiting = s.stakes
+    .filter((k) => k.status !== "ACTIVE")
+    .map((k) => k.active_at_height)
+    .filter((h): h is number => h !== null)
+    .sort((a, b) => a - b)[0];
+  const stake: StakeStep = counting
+    ? { title: "Your stake counts", detail: `${formatAmount(s.active, 2)} takes part in making blocks.`, state: "done" }
+    : waiting !== undefined
+      ? {
+          title: "Your stake counts",
+          detail: `From block ${waiting.toLocaleString()}, ${plural(Math.max(waiting - s.tip_height, 0), "block")} from now.`,
+          state: "active",
+        }
+      : s.stakes.length
+        ? { title: "Your stake counts", detail: "Your stake is waiting to confirm.", state: "active" }
+        : {
+            title: "Make a stake",
+            detail: `Lock B3 below. It counts ${plural(s.activation_depth, "block")} after it confirms.`,
+            state: open ? "active" : "pending",
+          };
+  const key: StakeStep = finalityReady(s)
+    ? { title: "Finality key bound", detail: "This wallet signs the votes that make blocks final.", state: "done" }
+    : s.bind_pending
+      ? { title: "Finality key binding sent", detail: "It counts once it confirms in a block.", state: "active" }
+    : !f
+      ? { title: "Bind the finality key", detail: "Possible once your first stake confirms: it creates this wallet's validator.", state: "pending" }
+      : {
+          title: "Bind the finality key",
+          detail: f.revoked
+            ? "The bound key was revoked. Bind a new one below."
+            : f.bound
+              ? "The bound key is another wallet's. Rotate it below."
+              : "Bind it below. This sends a small transaction.",
+          state: "active",
+        };
+  const run: StakeStep =
+    l.running && l.ours && l.finality_signing
+      ? { title: "Staking is on", detail: `${plural(l.blocks_produced, "block")} produced so far.`, state: "done" }
+      : l.running && l.ours
+        ? { title: "Turn on finality signing", detail: "Staking runs without its finality signer. Stop it and start it again.", state: "active" }
+        : l.running
+          ? { title: "Start staking", detail: "This node stakes with another wallet. Stop it in that wallet first.", state: "pending" }
+          : {
+              title: "Start staking",
+              detail: "A locked wallet unlocks only to start it, and locks again straight after.",
+              state: open && finalityReady(s) ? "active" : "pending",
+            };
+  return [
+    open
+      ? { title: "Staking is open", detail: "The network accepts stakes.", state: "done" }
+      : { title: "Staking opens", detail: PHASE_TEXT[s.phase] ?? s.phase, state: "pending" },
+    stake,
+    key,
+    run,
+  ];
+}
+
+const STEP_SPOKEN = { done: "Done", active: "To do", pending: "Later" } as const;
+
+function renderSteps(steps: StakeStep[]): void {
+  const list = el("stk-steps");
+  list.hidden = steps.every((s) => s.state === "done");
+  list.replaceChildren(
+    ...steps.map((step, i) => {
+      const item = document.createElement("li");
+      item.className = `ci ${step.state}`;
+      const mark = document.createElement("span");
+      mark.className = "ci-mark";
+      mark.setAttribute("aria-hidden", "true");
+      if (step.state === "done") mark.append(icon("check", "i-sm"));
+      else mark.textContent = String(i + 1);
+      const body = document.createElement("div");
+      body.className = "ci-body";
+      const title = document.createElement("strong");
+      const spoken = document.createElement("span");
+      spoken.className = "sr-only";
+      spoken.textContent = `${STEP_SPOKEN[step.state]}: `;
+      title.append(spoken, step.title);
+      const detail = document.createElement("span");
+      detail.className = "t-sm muted";
+      detail.textContent = step.detail;
+      body.append(title, detail);
+      item.append(mark, body);
+      return item;
+    }),
+  );
+}
 
 function stakeResult(tone: "success" | "warning" | "danger", text: string): void {
   const box = el("stk-result");
@@ -2327,18 +2433,23 @@ let stakeStatus: StakeStatus | null = null;
 
 function renderStake(s: StakeStatus): void {
   const l = s.loop;
-  if (l.running && l.ours) setBadge("stk-badge", l.finality_signing ? "Staking" : "Staking, finality not signing", l.finality_signing ? "success" : "warning");
+  if (l.running && l.ours) setBadge("stk-badge", l.finality_signing ? "On" : "On, finality not signing", l.finality_signing ? "success" : "warning");
   else if (l.running) setBadge("stk-badge", "Another wallet is staking", "warning");
-  else setBadge("stk-badge", "Stopped", "neutral");
+  else setBadge("stk-badge", "Off", "neutral");
   el("stk-state").textContent = l.running
     ? l.state
     : s.phase === "modern_pos"
-      ? "Staking is stopped. Start it to produce blocks with your active stakes."
-      : "Staking is stopped.";
+      ? "Staking is off. Your node makes blocks with your stakes while it is on."
+      : "Staking is off.";
+  renderSteps(stakeSteps(s));
   const rows = [
     textRow("Network phase", PHASE_TEXT[s.phase] ?? s.phase),
-    textRow("Height", s.tip_height.toLocaleString()),
-    textRow("Your weight", `${s.active_weight.toLocaleString()} of ${s.total_active_weight.toLocaleString()} B3`),
+    textRow("Current block", s.tip_height.toLocaleString()),
+    textRow(
+      "Your share",
+      `${s.active_weight.toLocaleString()} of ${s.total_active_weight.toLocaleString()} B3`,
+      "This wallet's counting stake, out of all counting stake on the network",
+    ),
   ];
   if (l.running) rows.push(textRow("Blocks produced", l.blocks_produced.toLocaleString()));
   if (l.last_error) rows.push(textRow("Last error", l.last_error));
@@ -2346,13 +2457,14 @@ function renderStake(s: StakeStatus): void {
   el("stk-rows").replaceChildren(...rows);
   el<HTMLButtonElement>("stk-start").hidden = l.running;
   el<HTMLButtonElement>("stk-stop").hidden = !l.running || !l.ours;
-  el<HTMLButtonElement>("stk-start").disabled = false;
+  // The checklist says what is missing.
+  el<HTMLButtonElement>("stk-start").disabled = s.phase !== "modern_pos" || !finalityReady(s);
   el<HTMLButtonElement>("stk-stop").disabled = false;
 
   el("stk-count").textContent = s.stakes.length ? plural(s.stakes.length, "stake") : "";
   el("stk-totals").replaceChildren(
-    amountRow("Active", s.active),
-    amountRow("Pending", s.pending),
+    amountRow("Counting", s.active),
+    amountRow("Not counting yet", s.pending),
     ...(s.unconfirmed.replace(/[0.]/g, "") ? [amountRow("Unconfirmed", s.unconfirmed)] : []),
   );
   el("stk-empty").hidden = s.stakes.length > 0;
@@ -2371,7 +2483,7 @@ function renderStake(s: StakeStatus): void {
         k.status === "UNCONFIRMED"
           ? "Waiting to confirm"
           : k.status === "PENDING"
-            ? `Counts from height ${k.active_at_height?.toLocaleString() ?? "?"}`
+            ? `Counts from block ${k.active_at_height?.toLocaleString() ?? "?"}`
             : plural(k.confirmations, "confirmation");
       body.append(amountNode(k.amount), meta);
       const tag = document.createElement("span");
@@ -2403,9 +2515,17 @@ function renderStake(s: StakeStatus): void {
 
   const f = s.finality;
   const bind = el<HTMLButtonElement>("fin-bind");
-  if (!f) {
+  el("fin-text").title = "";
+  if (s.bind_pending) {
+    // A second binding before this one confirms could never confirm.
+    setBadge("fin-badge", "Confirming", "info");
+    el("fin-text").textContent = "A finality key binding from this wallet is waiting to confirm. You can bind again only after it does.";
+    el("fin-text").title = `Transaction ${s.bind_pending}`;
+    bind.disabled = true;
+  } else if (!f) {
     setBadge("fin-badge", "No validator yet", "neutral");
-    el("fin-text").textContent = "Your first stake creates this wallet's validator key. Bind its finality key after that.";
+    el("fin-text").textContent =
+      "Validators sign the votes that make blocks final with this key. Your first stake creates this wallet's validator; bind its finality key after that.";
     bind.disabled = true;
     bind.textContent = "Bind finality key";
   } else if (f.bound && !f.revoked) {
@@ -2420,7 +2540,8 @@ function renderStake(s: StakeStatus): void {
     bind.textContent = "Rotate finality key";
   } else {
     setBadge("fin-badge", f.revoked ? "Revoked" : "Not bound", "warning");
-    el("fin-text").textContent = "Staking needs a bound finality key. Binding sends a small transaction.";
+    el("fin-text").textContent =
+      "Validators sign the votes that make blocks final with this key, and staking needs it. Binding sends a small transaction.";
     bind.disabled = false;
     bind.textContent = "Bind finality key";
   }
@@ -2442,6 +2563,8 @@ function clearStake(): void {
   }
   el<HTMLButtonElement>("fin-bind").disabled = true;
   el("stk-rows").replaceChildren();
+  el("stk-steps").replaceChildren();
+  el("stk-steps").hidden = true;
   el("stk-list").replaceChildren();
   el("stk-totals").replaceChildren();
   el("stk-count").textContent = "";

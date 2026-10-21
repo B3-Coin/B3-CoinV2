@@ -208,6 +208,8 @@
   max-width: var(--w-app);
 }
 .view--flow { max-width: var(--w-flow); }
+/* Two flow columns side by side where there is room for both. */
+.view--pair { max-width: calc(2 * var(--w-flow) + var(--space-4)); }
 .view--data { max-width: var(--w-data); }
 
 @media (min-width: 640px) {

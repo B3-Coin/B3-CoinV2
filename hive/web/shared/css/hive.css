@@ -26,6 +26,15 @@
    the bottom tab bar's padding is never needed. */
 .view { padding-bottom: var(--space-6); }
 
+/* Stake: one column, or two once each gets a form's width beside the sidebar. */
+.stk-cols { align-items: start; }
+@media (min-width: 1240px) {
+  .stk-cols { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+ol.checklist { list-style: none; margin: 0; padding: 0; }
+.checklist .ci-mark { font-size: var(--text-xs); font-weight: 600; }
+.checklist .ci-body strong { font-size: var(--text-sm); }
+
 /* Views are switched by the hidden attribute, which must beat .view. */
 [hidden] { display: none !important; }
 
