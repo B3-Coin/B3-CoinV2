@@ -52,6 +52,23 @@ function groupFrac(digits: string): string {
   return digits.replace(/(\d{3})(?=\d)/g, "$1" + GROUP);
 }
 
+/** A count or a block height, grouped as amounts are ("1 234 567"), so
+ *  every number on a page reads the same whatever the system's locale. */
+export function count(n: number): string {
+  const digits = String(Math.abs(Math.trunc(n)));
+  return `${n < 0 ? "−" : ""}${groupInt(digits)}`;
+}
+
+/** A measured value (sizes, percentages) with at most `places` decimals,
+ *  a point for the decimal, and the integer part grouped as in count(). */
+export function measure(value: number, places: number): string {
+  const [int, frac] = value
+    .toLocaleString("en-US", { maximumFractionDigits: places, useGrouping: false })
+    .split(".");
+  const neg = int.startsWith("-");
+  return `${neg ? "−" : ""}${groupInt(neg ? int.slice(1) : int)}${frac ? "." + frac : ""}`;
+}
+
 /** Drops trailing zeros but keeps at least `min` decimals. */
 function trimFrac(frac: string, min: number): string {
   let f = frac.replace(/0+$/, "");

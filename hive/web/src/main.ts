@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { amountNode, amountText, amountUnits, bannerTone, el, formatAmount, icon, initTheme, isMasked, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
+import { amountNode, amountText, amountUnits, bannerTone, count, el, formatAmount, icon, initTheme, isMasked, measure, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
 import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeResult } from "./trade";
 import { pickAddress, sortOwn } from "./picker";
 import { single } from "./single";
@@ -312,7 +312,7 @@ function render(status: NodeStatus): void {
       el("node-banner").hidden = true;
       badge("unlocked", `Running on ${status.chain}`);
       el("chain-name").textContent = status.chain;
-      el("chain-blocks").textContent = status.blocks.toLocaleString("en-US");
+      el("chain-blocks").textContent = count(status.blocks);
       el("chain-best").textContent = shorten(status.best_block_hash, 10, 8);
       el("chain-best").title = status.best_block_hash;
       void refreshWallet();
@@ -1154,9 +1154,6 @@ el("wl-backup").addEventListener("click", async () => {
 
 // ---- formatting ------------------------------------------------------------
 
-function count(n: number): string {
-  return n.toLocaleString("en-US");
-}
 
 function plural(n: number, one: string, many = `${one}s`): string {
   return `${count(n)} ${n === 1 ? one : many}`;
@@ -1170,11 +1167,12 @@ function bytes(n: number): string {
     value /= 1000;
     unit++;
   }
-  return `${value.toLocaleString("en-US", { maximumFractionDigits: unit === 0 ? 0 : 1 })} ${units[unit]}`;
+  return `${measure(value, unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
 function dateTime(unix: number): string {
-  return new Date(unix * 1000).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" });
+  // In the system's own date format, as the other dates and times.
+  return new Date(unix * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
 /** "4 min ago" for recent times, otherwise the date. */
@@ -1211,7 +1209,7 @@ const refreshOverview = single(async () => {
     : peers === 0
       ? ["Behind, no peers", "warning"]
       : ["Syncing", "info"];
-  const percent = (o.verification_progress * 100).toLocaleString("en-US", { maximumFractionDigits: 2 });
+  const percent = measure(o.verification_progress * 100, 2);
   el("sync-badge").className = `badge badge-${tone}`;
   el("sync-badge-text").textContent = stateText;
   el("chain-blocks").textContent = o.headers > o.blocks ? `${count(o.blocks)} of ${count(o.headers)}` : count(o.blocks);
@@ -2350,7 +2348,7 @@ function stakeSteps(s: StakeStatus): StakeStep[] {
           title: "Your stake joins block production",
           detail:
             enters !== null && enters > s.tip_height
-              ? `It is active, and makes blocks from block ${enters.toLocaleString()} at the earliest, ${plural(enters - s.tip_height, "block")} from now.`
+              ? `It is active, and makes blocks from block ${count(enters)} at the earliest, ${plural(enters - s.tip_height, "block")} from now.`
               : s.producers.frozen
                 ? "It is active, and makes blocks once the producer set can change again (see above)."
                 : "It is active, and makes blocks once the validator set next rotates to include it.",
@@ -2359,7 +2357,7 @@ function stakeSteps(s: StakeStatus): StakeStep[] {
     : waiting !== undefined
       ? {
           title: "Your stake counts",
-          detail: `From block ${waiting.toLocaleString()}, ${plural(Math.max(waiting - s.tip_height, 0), "block")} from now.`,
+          detail: `From block ${count(waiting)}, ${plural(Math.max(waiting - s.tip_height, 0), "block")} from now.`,
           state: "active",
         }
       : s.stakes.length
@@ -2486,14 +2484,14 @@ function renderStake(s: StakeStatus): void {
   renderSteps(stakeSteps(s));
   const rows = [
     textRow("Network phase", PHASE_TEXT[s.phase] ?? s.phase),
-    textRow("Current block", s.tip_height.toLocaleString()),
+    textRow("Current block", count(s.tip_height)),
     textRow(
       "Your share",
-      `${isMasked() ? "••••" : s.active_weight.toLocaleString()} of ${s.total_active_weight.toLocaleString()} B3`,
+      `${isMasked() ? "••••" : count(s.active_weight)} of ${count(s.total_active_weight)} B3`,
       "This wallet's counting stake, out of all counting stake on the network",
     ),
   ];
-  if (l.running) rows.push(textRow("Blocks produced", l.blocks_produced.toLocaleString()));
+  if (l.running) rows.push(textRow("Blocks produced", count(l.blocks_produced)));
   if (l.last_error) rows.push(textRow("Last error", l.last_error));
   if (s.validator_key) rows.push(textRow("Validator key", shorten(s.validator_key, 10, 8), s.validator_key));
   el("stk-rows").replaceChildren(...rows);
@@ -2525,7 +2523,7 @@ function renderStake(s: StakeStatus): void {
         k.status === "UNCONFIRMED"
           ? "Waiting to confirm"
           : k.status === "PENDING"
-            ? `Counts from block ${k.active_at_height?.toLocaleString() ?? "?"}`
+            ? `Counts from block ${k.active_at_height === null || k.active_at_height === undefined ? "?" : count(k.active_at_height)}`
             : plural(k.confirmations, "confirmation");
       body.append(amountNode(k.amount), meta);
       const tag = document.createElement("span");
@@ -3098,7 +3096,7 @@ function renderCoins(): void {
   el("cc-tools").hidden = shownCoins.length < 2;
   el("cc-search").hidden = shownCoins.length <= 10;
   el("cc-help").textContent = many
-    ? `${shownCoins.length.toLocaleString()} coins. Choose them in bulk here instead of one by one. One transaction holds about ${Math.floor(inputBudget / 148)} of the common kind; combine the rest in another payment.`
+    ? `${count(shownCoins.length)} coins. Choose them in bulk here instead of one by one. One transaction holds about ${Math.floor(inputBudget / 148)} of the common kind; combine the rest in another payment.`
     : "Choose coins in bulk, or tick them below.";
   const q = el<HTMLInputElement>("cc-search").value.trim().toLowerCase();
   const matching = q
@@ -3108,7 +3106,7 @@ function renderCoins(): void {
   const ordered = [...matching.filter((c) => chosenCoins.has(outpoint(c))), ...matching.filter((c) => !chosenCoins.has(outpoint(c)))];
   const listed = ordered.slice(0, LIST_LIMIT);
   el("cc-more").hidden = listed.length === matching.length;
-  el("cc-more").textContent = `Showing ${listed.length} of ${matching.length.toLocaleString()} coins. Search, or use the buttons above to choose among all of them.`;
+  el("cc-more").textContent = `Showing ${listed.length} of ${count(matching.length)} coins. Search, or use the buttons above to choose among all of them.`;
   el("send-coins-empty").hidden = shownCoins.length > 0;
   el("send-coin-list").replaceChildren(
     ...listed.map((c) => {
@@ -3168,7 +3166,7 @@ el("cc-fit").addEventListener("click", () => {
   chooseCoins(
     picked,
     picked.length < shownCoins.length
-      ? `Chose the ${picked.length.toLocaleString()} smallest coins that fit in one transaction; ${(shownCoins.length - picked.length).toLocaleString()} are left for another.`
+      ? `Chose the ${count(picked.length)} smallest coins that fit in one transaction; ${count(shownCoins.length - picked.length)} are left for another.`
       : undefined,
   );
 });
@@ -3307,7 +3305,7 @@ function updateError(token: string): string {
 }
 
 function megabytes(bytes: number): string {
-  return `${(bytes / 1_000_000).toLocaleString("en-US", { maximumFractionDigits: 1 })} MB`;
+  return `${measure(bytes / 1_000_000, 1)} MB`;
 }
 
 function updateResult(tone: "info" | "success" | "warning" | "danger", text: string): void {

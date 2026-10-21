@@ -1,7 +1,7 @@
 // The approval window. It shows only what the core decoded from the draft it
 // holds, and its only powers are reading that draft and deciding on it.
 import { invoke } from "@tauri-apps/api/core";
-import { el, formatAmount, initTheme, shorten, sumAmounts } from "../shared/ui";
+import { count, el, formatAmount, initTheme, shorten, sumAmounts } from "../shared/ui";
 import { formatB3, formatPrice, formatQuantity, quantityPlaces, type Units } from "../src/tradefmt";
 
 type OutputLine = { address: string; amount: string; change: boolean; mine: boolean };
@@ -240,7 +240,7 @@ function showAction(r: Extract<Request, { kind: "stake" | "bind_finality" }>): v
     el("action-text").textContent =
       `The amount is locked as a stake for this wallet's validator. It stays in this wallet, but ordinary payments do not spend it. It becomes active ${r.activation_depth} blocks after it confirms` +
       (enters !== null
-        ? `, and makes blocks from block ${enters.toLocaleString()} at the earliest.`
+        ? `, and makes blocks from block ${count(enters)} at the earliest.`
         : r.producers.frozen
           ? `. ${FROZEN_SET}, so it makes blocks only after that.`
           : ", and makes blocks once the validator set next rotates to include it.") +
