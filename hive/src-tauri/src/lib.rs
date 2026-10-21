@@ -775,6 +775,7 @@ async fn stake_draft(
             wallet: name,
             amount,
             activation_depth: depth,
+            producers: stake::producers(client),
         };
         core.drafts
             .lock()
@@ -894,10 +895,15 @@ async fn release_draft(
         let chain = node.chain().unwrap_or_default();
         let (summary, funded) = stake::prepare_release(client, &name, &chain, &outpoints)?;
         let inputs = funded.inputs.clone();
+        let producers = stake::producers(client);
         core.drafts
             .lock()
             .unwrap()
-            .insert(Request::Release { summary, funded })
+            .insert(Request::Release {
+                summary,
+                funded,
+                producers,
+            })
             .map_err(|e| {
                 wallet::release(client, &name, &inputs);
                 e.to_string()
@@ -1832,7 +1838,10 @@ fn execute(client: &rpc::Client, request: Request) -> Result<Done, String> {
 /// Carries out an approved request that ends in a transaction id.
 fn execute_sent(client: &rpc::Client, request: Request) -> Result<String, String> {
     match request {
-        Request::Pay { summary, funded } | Request::Release { summary, funded } => {
+        Request::Pay { summary, funded }
+        | Request::Release {
+            summary, funded, ..
+        } => {
             let sent = wallet::sign(client, &summary, &funded)
                 .and_then(|hex| wallet::broadcast(client, &hex).map_err(|e| e.to_string()));
             match &sent {

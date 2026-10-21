@@ -52,6 +52,7 @@ pub enum Request {
         amount: String,
         /// Blocks after it confirms until it counts.
         activation_depth: i64,
+        producers: crate::stake::Producers,
     },
     /// Release stakes back into ordinary B3: exactly the chosen STAKE
     /// outputs, to one new address of this wallet.
@@ -59,6 +60,7 @@ pub enum Request {
         summary: SendSummary,
         #[serde(skip)]
         funded: Funded,
+        producers: crate::stake::Producers,
     },
     /// Sign a PSBT made elsewhere with this wallet's keys; the result goes
     /// back to the page, nothing is broadcast.
@@ -266,6 +268,7 @@ mod tests {
             wallet: "w".into(),
             amount: "10".into(),
             activation_depth: 20,
+            producers: Default::default(),
         };
         assert_eq!(serde_json::to_value(&stake).unwrap()["kind"], "stake");
         assert_eq!(stake.wallet(), "w");

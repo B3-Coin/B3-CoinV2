@@ -2283,6 +2283,8 @@ type StakeStatus = {
   };
   finality: { bound: boolean; revoked: boolean; key_is_ours: boolean | null; member: boolean; weight: number } | null;
   bind_pending: string | null;
+  // Mirrors stake::Producers.
+  producers: { frozen: boolean; stake_enters_at: number | null };
 };
 
 const PHASE_TEXT: Record<string, string> = {
@@ -2308,6 +2310,9 @@ function stakeSteps(s: StakeStatus): StakeStep[] {
   const l = s.loop;
   const f = s.finality;
   const counting = s.active_weight > 0;
+  // ACTIVE stake produces only once the producer set rotates to include it.
+  const outside = !counting && s.stakes.some((k) => k.status === "ACTIVE");
+  const enters = s.producers.stake_enters_at;
   const waiting = s.stakes
     .filter((k) => k.status !== "ACTIVE")
     .map((k) => k.active_at_height)
@@ -2315,6 +2320,17 @@ function stakeSteps(s: StakeStatus): StakeStep[] {
     .sort((a, b) => a - b)[0];
   const stake: StakeStep = counting
     ? { title: "Your stake counts", detail: `${formatAmount(s.active, 2)} takes part in making blocks.`, state: "done" }
+    : outside
+      ? {
+          title: "Your stake joins block production",
+          detail:
+            enters !== null && enters > s.tip_height
+              ? `It is active, and makes blocks from block ${enters.toLocaleString()} at the earliest, ${plural(enters - s.tip_height, "block")} from now.`
+              : s.producers.frozen
+                ? "It is active, and makes blocks once the producer set can change again (see above)."
+                : "It is active, and makes blocks once the validator set next rotates to include it.",
+          state: "active",
+        }
     : waiting !== undefined
       ? {
           title: "Your stake counts",
@@ -2441,6 +2457,7 @@ function renderStake(s: StakeStatus): void {
     : s.phase === "modern_pos"
       ? "Staking is off. Your node makes blocks with your stakes while it is on."
       : "Staking is off.";
+  el("stk-frozen").hidden = !s.producers.frozen;
   renderSteps(stakeSteps(s));
   const rows = [
     textRow("Network phase", PHASE_TEXT[s.phase] ?? s.phase),
@@ -2565,6 +2582,7 @@ function clearStake(): void {
   el("stk-rows").replaceChildren();
   el("stk-steps").replaceChildren();
   el("stk-steps").hidden = true;
+  el("stk-frozen").hidden = true;
   el("stk-list").replaceChildren();
   el("stk-totals").replaceChildren();
   el("stk-count").textContent = "";
@@ -2627,14 +2645,29 @@ async function refreshStake(): Promise<void> {
 }
 
 // Releasing (unstaking) goes through the approval window, like a payment.
+/** The release being decided takes every stake this wallet can release. */
+let releasingAll = false;
+
 async function releaseStakes(outpoints: { txid: string; vout: number }[]): Promise<void> {
   try {
     const id = await invoke<string>("release_draft", { outpoints });
     draftPage.set(id, "release");
+    releasingAll =
+      outpoints.length === (stakeStatus?.stakes ?? []).filter((k) => k.status !== "UNCONFIRMED").length;
     stakeResult("success", "Waiting for your decision in the approval window.");
   } catch (e) {
     stakeResult("danger", String(e));
   }
+}
+
+/** After the whole stake is released, staking is offered to be stopped;
+ *  block production never spends stakes, so it need not be for safety. */
+function stakingAfterRelease(): string {
+  const l = stakeStatus?.loop;
+  if (!releasingAll || !l?.running || !l.ours) return "";
+  return stakeStatus?.producers.frozen
+    ? " Staking is still on: while the producer set is frozen your validator keeps its place and still makes blocks. Stop staking above if you no longer want it to."
+    : " Staking is still on. With no stake left you can stop it above.";
 }
 
 el("stk-release-all").addEventListener("click", () => {
@@ -3378,7 +3411,7 @@ await listen<DraftResult>("draft-result", (event) => {
         page === "stake"
           ? `Stake sent. Transaction ${r.txid}. It counts once it confirms and matures.`
           : page === "release"
-            ? `Release sent. Transaction ${r.txid}. The B3 is ordinary coins in this wallet once it confirms.`
+            ? `Release sent. Transaction ${r.txid}. The B3 is ordinary coins in this wallet once it confirms.${stakingAfterRelease()}`
             : `Finality key sent. Transaction ${r.txid}. Start staking once it confirms.`,
       );
       el<HTMLFormElement>("stk-form").reset();

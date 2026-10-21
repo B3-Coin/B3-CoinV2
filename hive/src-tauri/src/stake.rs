@@ -74,6 +74,37 @@ pub struct Status {
     /// The txid of this wallet's finality key binding while it waits to
     /// confirm: the node shows it as unbound until then.
     pub bind_pending: Option<String>,
+    pub producers: Producers,
+}
+
+/// When stake changes who makes blocks. A stake that is ACTIVE produces only
+/// once the producer set is rotated to include it; until then active_weight
+/// stays 0, and a released stake keeps its place in the set in force.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
+pub struct Producers {
+    /// The set in force cannot rotate: the finality lineage broke (as on
+    /// mainnet since block ~839,268) and no H1 schedule rotates it yet.
+    pub frozen: bool,
+    /// With H1 configured, the first height at which a stake that is ACTIVE
+    /// and bound by the next snapshot produces (R_h before activation).
+    pub stake_enters_at: Option<i64>,
+}
+
+/// The producer outlook from getfinalitystatus. A node that cannot say
+/// gives the default: no caveat shown, as before this was read.
+pub fn producers(client: &Client) -> Producers {
+    client
+        .call("getfinalitystatus", json!([]))
+        .map(|s| parse_producers(&s))
+        .unwrap_or_default()
+}
+
+pub(crate) fn parse_producers(s: &Value) -> Producers {
+    let h1 = &s["producers"];
+    Producers {
+        frozen: s["lineage_broken"].as_bool() == Some(true) && h1["active"].as_bool() != Some(true),
+        stake_enters_at: h1["stake_enters_at"].as_i64(),
+    }
 }
 
 pub fn status(client: &Client, wallet: &str) -> Result<Status, RpcError> {
@@ -87,6 +118,7 @@ pub fn status(client: &Client, wallet: &str) -> Result<Status, RpcError> {
     if status.finality.is_some() {
         status.bind_pending = waiting_bind(client, wallet)?;
     }
+    status.producers = producers(client);
     Ok(status)
 }
 
@@ -160,6 +192,7 @@ pub(crate) fn parse_status(info: &Value, finality: Option<&Value>) -> Result<Sta
         staking,
         finality,
         bind_pending: None,
+        producers: Producers::default(),
     })
 }
 
@@ -415,6 +448,43 @@ pub fn prepare_release(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frozen_producer_set_is_told_apart() {
+        // Mainnet today: the lineage broke and H1 is not configured.
+        let mainnet = json!({"active": true, "epoch": 10, "lineage_broken": true});
+        assert_eq!(
+            parse_producers(&mainnet),
+            Producers {
+                frozen: true,
+                stake_enters_at: None
+            }
+        );
+        // H1 configured, before R_h: still frozen, and stake enters at R_h.
+        let before =
+            json!({"lineage_broken": true, "producers": {"active": false, "stake_enters_at": 900}});
+        assert_eq!(
+            parse_producers(&before),
+            Producers {
+                frozen: true,
+                stake_enters_at: Some(900)
+            }
+        );
+        // From R_h producers rotate without certificates.
+        let after =
+            json!({"lineage_broken": true, "producers": {"active": true, "stake_enters_at": 2340}});
+        assert_eq!(
+            parse_producers(&after),
+            Producers {
+                frozen: false,
+                stake_enters_at: Some(2340)
+            }
+        );
+        assert_eq!(
+            parse_producers(&json!({"lineage_broken": false})),
+            Producers::default()
+        );
+    }
 
     #[test]
     fn a_binding_waiting_to_confirm_is_found() {

@@ -101,10 +101,10 @@ type CheckpointDraft = {
 // Mirrors drafts::Request in src-tauri/src/drafts.rs.
 type Request =
   | { kind: "pay"; summary: Summary }
-  | { kind: "release"; summary: Summary }
+  | { kind: "release"; summary: Summary; producers: Producers }
   | { kind: "sign_psbt"; summary: PsbtSummary }
   | { kind: "send_psbt"; summary: PsbtSummary }
-  | { kind: "stake"; chain: string; wallet: string; amount: string; activation_depth: number }
+  | { kind: "stake"; chain: string; wallet: string; amount: string; activation_depth: number; producers: Producers }
   | { kind: "bind_finality"; chain: string; wallet: string; rotate: boolean }
   | { kind: "trade_order"; order: OrderDraft }
   | { kind: "trade_cancel"; cancel: CancelDraft }
@@ -177,17 +177,21 @@ function showPay(s: Summary): void {
   el("approve").textContent = "Send now";
 }
 
+// Mirrors stake::Producers: whether stake changes who makes blocks soon.
+type Producers = { frozen: boolean; stake_enters_at: number | null };
+const FROZEN_SET = "The network's set of block producers is frozen until an upcoming network upgrade";
+
 // A release spends only stakes, to one address of this wallet; what was
 // staked is what comes back plus the fee.
-function showRelease(s: Summary): void {
+function showRelease(s: Summary, producers: Producers): void {
   showPay(s);
   const principal = sumAmounts([...s.outputs.map((o) => o.amount), s.fee]);
   el("title").textContent =
     principal === null ? "Release this stake?" : `Release ${formatAmount(principal)} from staking?`;
-  el("pay-text").textContent =
-    s.inputs === 1
-      ? "This stake stops counting for your validator once the release confirms; weight already in the current epoch snapshot can count until it is replaced. The B3 comes back to this wallet as ordinary coins, less the network fee."
-      : `These ${s.inputs} stakes stop counting for your validator once the release confirms; weight already in the current epoch snapshot can count until it is replaced. The B3 comes back to this wallet as ordinary coins, less the network fee.`;
+  const what = s.inputs === 1 ? "This stake stops" : `These ${s.inputs} stakes stop`;
+  el("pay-text").textContent = producers.frozen
+    ? `${what} counting for your validator once the release confirms. ${FROZEN_SET}: until then your validator keeps its place and weight in it, released or not. The B3 comes back to this wallet as ordinary coins, less the network fee.`
+    : `${what} counting for your validator once the release confirms; weight already in the current epoch snapshot can count until it is replaced. The B3 comes back to this wallet as ordinary coins, less the network fee.`;
   el("pass-help").textContent =
     "The wallet is locked. It unlocks only to sign this release and locks again straight after.";
   el("approve").textContent = "Release now";
@@ -228,8 +232,14 @@ function showAction(r: Extract<Request, { kind: "stake" | "bind_finality" }>): v
   const fee = row("Network fee", "Set by the wallet when it is sent", undefined, false);
   if (r.kind === "stake") {
     el("title").textContent = `Stake ${formatAmount(r.amount)}?`;
+    const enters = r.producers.stake_enters_at;
     el("action-text").textContent =
-      `The amount is locked as a stake for this wallet's validator. It stays in this wallet, but ordinary payments do not spend it. It counts for staking ${r.activation_depth} blocks after it confirms.`;
+      `The amount is locked as a stake for this wallet's validator. It stays in this wallet, but ordinary payments do not spend it. It becomes active ${r.activation_depth} blocks after it confirms` +
+      (enters !== null
+        ? `, and makes blocks from block ${enters.toLocaleString()} at the earliest.`
+        : r.producers.frozen
+          ? `. ${FROZEN_SET}, so it makes blocks only after that.`
+          : ", and makes blocks once the validator set next rotates to include it.");
     el("action-rows").replaceChildren(row("Stake", formatAmount(r.amount, 9)), fee, row("Network", r.chain, undefined, false));
     el("approve").textContent = "Stake now";
   } else {
@@ -435,7 +445,7 @@ function show(draft: DraftView | null): void {
   el("action-body").hidden = pay;
   el("approve").hidden = false;
   if (r.kind === "pay") showPay(r.summary);
-  else if (r.kind === "release") showRelease(r.summary);
+  else if (r.kind === "release") showRelease(r.summary, r.producers);
   else if (r.kind === "sign_psbt" || r.kind === "send_psbt") showPsbt(r.kind, r.summary);
   else if (r.kind === "trade_order" || r.kind === "trade_cancel") showTrade(r);
   else if (r.kind === "trade_deposit" || r.kind === "trade_withdraw" || r.kind === "trade_payout") showFunding(r);

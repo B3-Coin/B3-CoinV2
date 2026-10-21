@@ -68,6 +68,7 @@ const PAGE_METHODS: &[&str] = &[
     "getaddressinfo",
     "getstakinginfo",
     "getfinalityinfo",
+    "getfinalitystatus",
     "createstake",
     "bindfinalitykey",
     "startstaking",
