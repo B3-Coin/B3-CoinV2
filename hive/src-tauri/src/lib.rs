@@ -591,14 +591,23 @@ async fn trade_withdraw_draft(
     Ok(id)
 }
 
-/// The page wallet's vault deposits, from its own transaction history.
+/// The page wallet's vault deposits into one market, from its own
+/// transaction history.
 #[tauri::command]
-async fn trade_deposits(core: State<'_, Arc<Core>>) -> Result<Vec<flowmesh::Deposit>, String> {
+async fn trade_deposits(
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+) -> Result<Vec<flowmesh::Deposit>, String> {
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
-        flowmesh::deposits(client, &name).map_err(|e| e.to_string())
+        let markets = flowmesh::markets(client, &name).map_err(|e| e.to_string())?;
+        let market = markets
+            .iter()
+            .find(|m| m.market_id == market_id)
+            .ok_or("That market is not available.")?;
+        flowmesh::deposits(client, &name, &market.vault_id).map_err(|e| e.to_string())
     })
     .await
 }

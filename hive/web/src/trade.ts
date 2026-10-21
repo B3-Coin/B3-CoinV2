@@ -9,7 +9,7 @@
 // this page never signs.
 import { invoke } from "@tauri-apps/api/core";
 
-import { el, isMasked, shorten } from "../shared/ui";
+import { amountNode, el, isMasked, shorten } from "../shared/ui";
 import { pickAddress } from "./picker";
 import {
   B3_DECIMALS,
@@ -26,7 +26,7 @@ import {
 } from "./tradefmt";
 
 // Mirrors src-tauri/src/flowmesh.rs.
-type MarketSummary = { market_id: string; base_asset_id: string; running: boolean; paused: boolean; halt: string; error: string };
+type MarketSummary = { market_id: string; base_asset_id: string; vault_id: string; running: boolean; paused: boolean; halt: string; error: string };
 type Metadata = { decimals: number | null; ticker: string; name: string; test_only: boolean };
 type Verification = {
   source: string;
@@ -105,7 +105,19 @@ type TradeRequest = {
   uncertain: boolean;
 };
 /** The approval window's decision on a draft (DraftResult in lib.rs). */
-type Deposit = { txid: string; vout: number; confirmations: number; time: number; swept: boolean };
+/** Mirrors flowmesh::Deposit. asset, amount and vault_id are null when the
+ *  output could not be read; such a deposit is shown, and the node checks
+ *  its market when admission is asked. */
+type Deposit = {
+  txid: string;
+  vout: number;
+  confirmations: number;
+  time: number;
+  swept: boolean;
+  asset: "b3" | "token" | null;
+  amount: string | null;
+  vault_id: string | null;
+};
 /** A deposit counts once it is this deep (flowmesh::DEPOSIT_CONFIRMATIONS). */
 const DEPOSIT_CONFIRMATIONS = 31;
 export type TradeResult =
@@ -1407,9 +1419,11 @@ function withdrawText(r: Receipt): [string, string] {
 
 async function loadDeposits(): Promise<void> {
   const mine = generation;
+  const id = marketId;
+  if (!id) return;
   depositsRead = Date.now();
   try {
-    const list = await invoke<Deposit[]>("trade_deposits");
+    const list = await invoke<Deposit[]>("trade_deposits", { marketId: id });
     if (mine !== generation) return;
     deposits = list;
     depositsError = null;
@@ -1445,6 +1459,30 @@ async function admit(d: Deposit, button: HTMLButtonElement): Promise<void> {
   void loadDeposits();
 }
 
+/** A deposit's amount as the page shows amounts: B3, or the token in its
+ *  verified decimals (base units when they are not verified). */
+function depositAmount(d: Deposit): Node {
+  if (d.amount === null) {
+    const unknown = document.createElement("span");
+    unknown.className = "muted";
+    unknown.textContent = "Amount unknown";
+    return unknown;
+  }
+  if (d.asset === "b3") return amountNode(d.amount);
+  const span = document.createElement("span");
+  const label = tokenLabel(market.metadata, markets.find((m) => m.market_id === marketId)?.base_asset_id);
+  const decimals = market.metadata?.decimals;
+  if (isMasked()) {
+    span.textContent = `•••• ${label}`;
+    span.setAttribute("aria-label", "Amount hidden");
+  } else if (decimals === null || decimals === undefined) {
+    span.textContent = `${d.amount} base units of ${label}`;
+  } else {
+    span.textContent = `${formatQuantity(BigInt(d.amount), decimals, quantityPlaces([BigInt(d.amount)], decimals))} ${label}`;
+  }
+  return span;
+}
+
 function renderDeposits(): void {
   el("tr-deposits").hidden = deposits.length === 0 && depositsError === null;
   const failed: HTMLElement[] = [];
@@ -1472,9 +1510,16 @@ function renderDeposits(): void {
       const drow = document.createElement("div");
       drow.className = "drow";
       const k = document.createElement("span");
-      k.className = "dkey mono";
-      k.textContent = `${shorten(d.txid, 8, 4)}:${d.vout}`;
+      k.className = "dkey";
+      k.append(depositAmount(d));
+      const where = document.createElement("span");
+      where.className = "mono muted";
+      where.textContent = ` · ${shorten(d.txid, 8, 4)}:${d.vout}`;
+      k.append(where);
       k.title = `${d.txid}:${d.vout}`;
+      if (d.vault_id === null) {
+        k.title += "\nThis output could not be read, so its market is not known here. The node refuses to admit it into another market.";
+      }
       const v = document.createElement("span");
       v.className = "dval";
       if (d.swept) {

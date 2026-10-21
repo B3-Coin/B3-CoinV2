@@ -25,6 +25,8 @@ const TICK_LIMIT: u64 = 256;
 pub struct MarketSummary {
     pub market_id: String,
     pub base_asset_id: String,
+    /// The keyless vault its deposits pay, as the node prints vault ids.
+    pub vault_id: String,
     pub running: bool,
     pub paused: bool,
     /// "none" or the node's fail-closed halt reason.
@@ -218,6 +220,7 @@ fn market_summary(m: &Value) -> MarketSummary {
     MarketSummary {
         market_id: text(&m["market_id"]),
         base_asset_id: text(&m["base_asset_id"]),
+        vault_id: text(&m["vault_id"]),
         running: m["running"].as_bool().unwrap_or(false),
         paused: m["paused"].as_bool().unwrap_or(false),
         halt: text(&m["halt"]),
@@ -1030,6 +1033,8 @@ pub const DEPOSIT_CONFIRMATIONS: i64 = 31;
 const B3_DECIMALS: usize = 9;
 /// The newest deposits the page lists.
 const DEPOSITS_SHOWN: usize = 20;
+/// Deposits across all markets read to find this market's.
+const DEPOSITS_READ: usize = 100;
 
 /// B3 atoms as the exact decimal string the node's amount arguments take.
 fn b3_decimal(atoms: u64) -> String {
@@ -1122,6 +1127,62 @@ pub struct Deposit {
     pub time: u64,
     /// Its vault output is spent: the market swept it in, so it was admitted.
     pub swept: bool,
+    /// What the vault output carries, read from its script; None when the
+    /// output cannot be read as a vault deposit.
+    pub asset: Option<Asset>,
+    /// B3 as exact decimal text, or the token in base units.
+    pub amount: Option<String>,
+    /// The vault it pays, as the node prints vault ids.
+    pub vault_id: Option<String>,
+}
+
+/// What a DEX_VAULT output's script says (modern::ParseAssetOutput): one
+/// minimal push of the B3A1 payload, then OP_FALSE. The payload is the
+/// magic, the asset id, the amount (big-endian), the policy type and
+/// version, then the vault id as the policy commitment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VaultOutput {
+    pub native: bool,
+    pub amount: u64,
+    pub vault_id: String,
+}
+
+const DEX_VAULT_POLICY: u16 = 3;
+
+pub(crate) fn vault_output(script_hex: &str) -> Option<VaultOutput> {
+    if script_hex.len() % 2 != 0 {
+        return None;
+    }
+    let script = (0..script_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(script_hex.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    let (start, len) = match *script.first()? {
+        n @ 1..=75 => (1, usize::from(n)),
+        0x4c => (2, usize::from(*script.get(1)?)),
+        0x4d => (
+            3,
+            usize::from(u16::from_le_bytes([*script.get(1)?, *script.get(2)?])),
+        ),
+        _ => return None,
+    };
+    let payload = script.get(start..start + len)?;
+    if script.get(start + len..)? != [0x00] || payload.len() < 80 || &payload[..4] != b"B3A1" {
+        return None;
+    }
+    if u16::from_be_bytes([payload[44], payload[45]]) != DEX_VAULT_POLICY {
+        return None;
+    }
+    Some(VaultOutput {
+        native: payload[4..36].iter().all(|b| *b == 0),
+        amount: u64::from_be_bytes(payload[36..44].try_into().ok()?),
+        // Ids print with their bytes reversed, as uint256::GetHex does.
+        vault_id: payload[48..80]
+            .iter()
+            .rev()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    })
 }
 
 fn positive(text: &str, what: &str) -> Result<u64, String> {
@@ -1196,10 +1257,12 @@ pub fn deposit(client: &Client, draft: &DepositDraft) -> Result<Deposited, Strin
     })
 }
 
-/// This wallet's vault deposits, newest first. They are found by the tag
-/// the node gives the transactions it creates for flowmeshdeposit; the
-/// market they belong to is checked when admission is requested.
-pub fn deposits(client: &Client, wallet: &str) -> Result<Vec<Deposit>, RpcError> {
+/// This wallet's vault deposits into `vault_id`, newest first. They are
+/// found by the tag the node gives the transactions it creates for
+/// flowmeshdeposit, and matched to the vault by their output's script.
+/// Outputs that cannot be read are kept, so a deposit is never hidden; the
+/// node refuses to admit one into another market.
+pub fn deposits(client: &Client, wallet: &str, vault_id: &str) -> Result<Vec<Deposit>, RpcError> {
     let list = client.call_wallet(wallet, "listtransactions", json!(["*", 1000, 0, true]))?;
     let mut out: Vec<Deposit> = list
         .as_array()
@@ -1212,12 +1275,32 @@ pub fn deposits(client: &Client, wallet: &str) -> Result<Vec<Deposit>, RpcError>
                     confirmations: t["confirmations"].as_i64().unwrap_or(0),
                     time: t["time"].as_u64().unwrap_or(0),
                     swept: false,
+                    asset: None,
+                    amount: None,
+                    vault_id: None,
                 })
                 .collect()
         })
         .unwrap_or_default();
     out.sort_by_key(|d| std::cmp::Reverse(d.time));
     out.dedup_by(|a, b| a.txid == b.txid && a.vout == b.vout);
+    // Every market's deposits are in this list; read only as many as can
+    // matter for this one.
+    out.truncate(DEPOSITS_READ);
+    for d in out.iter_mut() {
+        let tx = client.call_wallet(wallet, "gettransaction", json!([d.txid, true, true]))?;
+        let script = &tx["decoded"]["vout"][d.vout as usize]["scriptPubKey"]["hex"];
+        if let Some(v) = script.as_str().and_then(vault_output) {
+            d.asset = Some(if v.native { Asset::B3 } else { Asset::Token });
+            d.amount = Some(if v.native {
+                b3_decimal(v.amount)
+            } else {
+                v.amount.to_string()
+            });
+            d.vault_id = Some(v.vault_id);
+        }
+    }
+    out.retain(|d| d.vault_id.as_deref().map_or(true, |v| v == vault_id));
     out.truncate(DEPOSITS_SHOWN);
     for d in out.iter_mut().filter(|d| d.confirmations > 0) {
         d.swept = client
@@ -1364,6 +1447,47 @@ fn int(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A USER_DEPOSIT output script as modern::DexVaultPayload writes it.
+    fn vault_script(asset: [u8; 32], amount: u64, vault: [u8; 32]) -> String {
+        let mut payload = b"B3A1".to_vec();
+        payload.extend(asset);
+        payload.extend(amount.to_be_bytes());
+        payload.extend(3u16.to_be_bytes());
+        payload.extend(2u16.to_be_bytes());
+        payload.extend(vault);
+        payload.extend([0u8; 35]);
+        let mut script = vec![0x4c, payload.len() as u8];
+        script.extend(payload);
+        script.push(0x00);
+        script.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn vault_outputs_name_their_vault_and_amount() {
+        let mut vault = [0u8; 32];
+        vault[0] = 0xab;
+        vault[31] = 0x01;
+        let native = vault_output(&vault_script([0; 32], 1_500_000_000, vault)).unwrap();
+        assert!(native.native);
+        assert_eq!(native.amount, 1_500_000_000);
+        // Printed reversed, as the node prints ids.
+        assert!(native.vault_id.starts_with("01") && native.vault_id.ends_with("ab"));
+        assert_eq!(native.vault_id.len(), 64);
+        let token = vault_output(&vault_script([7; 32], 42, vault)).unwrap();
+        assert!(!token.native);
+        assert_eq!(token.amount, 42);
+
+        let good = vault_script([0; 32], 1, vault);
+        // Another policy, a missing OP_FALSE, a cut push or odd hex is not one.
+        let owner = good.replacen("00030002", "00010001", 1);
+        assert_eq!(vault_output(&owner), None);
+        assert_eq!(vault_output(&good[..good.len() - 2]), None);
+        assert_eq!(vault_output(&good[..100]), None);
+        assert_eq!(vault_output(&good[1..]), None);
+        assert_eq!(vault_output("76a914"), None);
+        assert_eq!(vault_output(""), None);
+    }
 
     fn sample() -> Value {
         json!({
