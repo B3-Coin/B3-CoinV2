@@ -182,8 +182,9 @@ pub enum DraftResult {
 // ---- main window commands --------------------------------------------------
 
 #[tauri::command]
-fn node_status(core: State<'_, Arc<Core>>) -> NodeStatus {
-    core.node().status()
+fn node_status(window: Window, core: State<'_, Arc<Core>>) -> Result<NodeStatus, String> {
+    require_window(&window, MAIN)?;
+    Ok(core.node().status())
 }
 
 /// Starts the node again after it failed to start or exited. Refused while
@@ -218,7 +219,11 @@ const NO_WALLET: &str = "No wallet is loaded.";
 
 /// None when the node has no wallet loaded.
 #[tauri::command]
-async fn wallet_overview(core: State<'_, Arc<Core>>) -> Result<Option<WalletOverview>, String> {
+async fn wallet_overview(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<Option<WalletOverview>, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -249,7 +254,8 @@ async fn wallet_overview(core: State<'_, Arc<Core>>) -> Result<Option<WalletOver
 }
 
 #[tauri::command]
-async fn dev_fund(core: State<'_, Arc<Core>>) -> Result<(), String> {
+async fn dev_fund(window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -265,9 +271,11 @@ async fn dev_fund(core: State<'_, Arc<Core>>) -> Result<(), String> {
 /// The wallet's newest transactions, newest first.
 #[tauri::command]
 async fn wallet_activity(
+    window: Window,
     core: State<'_, Arc<Core>>,
     count: u64,
 ) -> Result<Vec<wallet::ActivityEntry>, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -287,7 +295,11 @@ pub struct NodeInfo {
 
 /// The traffic graph's sample.
 #[tauri::command]
-async fn network_totals(core: State<'_, Arc<Core>>) -> Result<chain::Totals, String> {
+async fn network_totals(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<chain::Totals, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -299,7 +311,8 @@ async fn network_totals(core: State<'_, Arc<Core>>) -> Result<chain::Totals, Str
 
 /// The Network page's Information rows and banned peers.
 #[tauri::command]
-async fn node_info(core: State<'_, Arc<Core>>) -> Result<NodeInfo, String> {
+async fn node_info(window: Window, core: State<'_, Arc<Core>>) -> Result<NodeInfo, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -317,10 +330,12 @@ async fn node_info(core: State<'_, Arc<Core>>) -> Result<NodeInfo, String> {
 /// The Activity page: the newest `count` lines that pass the filter.
 #[tauri::command]
 async fn wallet_history(
+    window: Window,
     core: State<'_, Arc<Core>>,
     filter: history::Filter,
     count: usize,
 ) -> Result<history::Page, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -333,9 +348,11 @@ async fn wallet_history(
 
 #[tauri::command]
 async fn wallet_transaction(
+    window: Window,
     core: State<'_, Arc<Core>>,
     txid: String,
 ) -> Result<history::Details, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -402,7 +419,11 @@ async fn receive_new(
 
 /// The page wallet's address book.
 #[tauri::command]
-async fn book_list(core: State<'_, Arc<Core>>) -> Result<Vec<book::Contact>, String> {
+async fn book_list(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<Vec<book::Contact>, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -415,10 +436,12 @@ async fn book_list(core: State<'_, Arc<Core>>) -> Result<Vec<book::Contact>, Str
 /// Adds an address to the page wallet's address book, or renames it.
 #[tauri::command]
 async fn book_save(
+    window: Window,
     core: State<'_, Arc<Core>>,
     address: String,
     label: String,
 ) -> Result<book::Contact, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -432,7 +455,11 @@ async fn book_save(
 
 /// The FlowMesh markets the node knows.
 #[tauri::command]
-async fn trade_markets(core: State<'_, Arc<Core>>) -> Result<Vec<flowmesh::MarketSummary>, String> {
+async fn trade_markets(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<Vec<flowmesh::MarketSummary>, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -447,12 +474,14 @@ async fn trade_markets(core: State<'_, Arc<Core>>) -> Result<Vec<flowmesh::Marke
 /// move and leaves the heavy parts out when it has not.
 #[tauri::command]
 async fn trade_market(
+    window: Window,
     core: State<'_, Arc<Core>>,
     market_id: String,
     known_head: Option<String>,
     watch: bool,
     ticks_after: Option<u64>,
 ) -> Result<flowmesh::MarketView, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -472,12 +501,14 @@ async fn trade_market(
 /// page only learns the draft id.
 #[tauri::command]
 async fn trade_order_draft(
+    window: Window,
     app: AppHandle,
     core: State<'_, Arc<Core>>,
     market_id: String,
     side: String,
     steps: Vec<flowmesh::Point>,
 ) -> Result<String, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
@@ -507,11 +538,13 @@ async fn trade_order_draft(
 /// Drafts cancelling the page wallet's open order on one side.
 #[tauri::command]
 async fn trade_cancel_draft(
+    window: Window,
     app: AppHandle,
     core: State<'_, Arc<Core>>,
     market_id: String,
     side: String,
 ) -> Result<String, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
@@ -534,12 +567,14 @@ async fn trade_cancel_draft(
 /// Drafts a deposit of B3 atoms or token base units into a market's vault.
 #[tauri::command]
 async fn trade_deposit_draft(
+    window: Window,
     app: AppHandle,
     core: State<'_, Arc<Core>>,
     market_id: String,
     asset: flowmesh::Asset,
     amount: String,
 ) -> Result<String, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
@@ -561,6 +596,7 @@ async fn trade_deposit_draft(
 /// to a new address of this wallet when it is empty.
 #[tauri::command]
 async fn trade_withdraw_draft(
+    window: Window,
     app: AppHandle,
     core: State<'_, Arc<Core>>,
     market_id: String,
@@ -568,6 +604,7 @@ async fn trade_withdraw_draft(
     amount: String,
     destination: String,
 ) -> Result<String, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
@@ -601,9 +638,11 @@ async fn trade_withdraw_draft(
 /// to be published, and the checkpoint the others wait for.
 #[tauri::command]
 async fn trade_payouts(
+    window: Window,
     core: State<'_, Arc<Core>>,
     market_id: String,
 ) -> Result<flowmesh::Payouts, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -617,12 +656,14 @@ async fn trade_payouts(
 /// which must be the exact address the withdrawal named.
 #[tauri::command]
 async fn trade_payout_draft(
+    window: Window,
     app: AppHandle,
     core: State<'_, Arc<Core>>,
     market_id: String,
     effect_id: String,
     destination: String,
 ) -> Result<String, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
@@ -644,10 +685,12 @@ async fn trade_payout_draft(
 /// Drafts publishing the checkpoint the page wallet's withdrawals wait for.
 #[tauri::command]
 async fn trade_checkpoint_draft(
+    window: Window,
     app: AppHandle,
     core: State<'_, Arc<Core>>,
     market_id: String,
 ) -> Result<String, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
@@ -669,9 +712,11 @@ async fn trade_checkpoint_draft(
 /// transaction history.
 #[tauri::command]
 async fn trade_deposits(
+    window: Window,
     core: State<'_, Arc<Core>>,
     market_id: String,
 ) -> Result<Vec<flowmesh::Deposit>, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -690,11 +735,13 @@ async fn trade_deposits(
 /// Nothing is signed and no coins move, so it needs no approval.
 #[tauri::command]
 async fn trade_admit(
+    window: Window,
     core: State<'_, Arc<Core>>,
     market_id: String,
     txid: String,
     vout: u64,
 ) -> Result<flowmesh::Receipt, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -708,9 +755,11 @@ async fn trade_admit(
 /// node's local record; no endpoint is asked.
 #[tauri::command]
 async fn trade_requests(
+    window: Window,
     core: State<'_, Arc<Core>>,
     market_id: String,
 ) -> Result<Vec<flowmesh::Request>, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -725,10 +774,12 @@ async fn trade_requests(
 /// cancelled or proven to have failed: it may still be certified later.
 #[tauri::command]
 async fn trade_acknowledge(
+    window: Window,
     core: State<'_, Arc<Core>>,
     market_id: String,
     action_id: String,
 ) -> Result<(), String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -745,7 +796,8 @@ async fn trade_acknowledge(
 
 /// The page wallet's staking status.
 #[tauri::command]
-async fn stake_status(core: State<'_, Arc<Core>>) -> Result<stake::Status, String> {
+async fn stake_status(window: Window, core: State<'_, Arc<Core>>) -> Result<stake::Status, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -759,10 +811,12 @@ async fn stake_status(core: State<'_, Arc<Core>>) -> Result<stake::Status, Strin
 /// here; the page only learns the draft id.
 #[tauri::command]
 async fn stake_draft(
+    window: Window,
     app: AppHandle,
     core: State<'_, Arc<Core>>,
     amount: String,
 ) -> Result<String, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
@@ -882,10 +936,12 @@ async fn psbt_save(app: AppHandle, window: Window, psbt: String) -> Result<Optio
 /// Asks the approval window to release stakes back into ordinary B3.
 #[tauri::command]
 async fn release_draft(
+    window: Window,
     app: AppHandle,
     core: State<'_, Arc<Core>>,
     outpoints: Vec<Outpoint>,
 ) -> Result<String, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
@@ -914,7 +970,12 @@ async fn release_draft(
 
 /// Asks the approval window to bind (or rotate) the finality key.
 #[tauri::command]
-async fn finality_draft(app: AppHandle, core: State<'_, Arc<Core>>) -> Result<String, String> {
+async fn finality_draft(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<String, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
@@ -942,7 +1003,8 @@ async fn finality_draft(app: AppHandle, core: State<'_, Arc<Core>>) -> Result<St
 /// Starts staking with an unencrypted wallet. An encrypted wallet starts it
 /// through the passphrase window instead.
 #[tauri::command]
-async fn stake_start(core: State<'_, Arc<Core>>) -> Result<(), String> {
+async fn stake_start(window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -953,7 +1015,8 @@ async fn stake_start(core: State<'_, Arc<Core>>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn stake_stop(core: State<'_, Arc<Core>>) -> Result<(), String> {
+async fn stake_stop(window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -965,7 +1028,11 @@ async fn stake_stop(core: State<'_, Arc<Core>>) -> Result<(), String> {
 
 /// The coins the page's wallet can spend, for coin control.
 #[tauri::command]
-async fn send_coins(core: State<'_, Arc<Core>>) -> Result<wallet::CoinList, String> {
+async fn send_coins(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<wallet::CoinList, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -978,7 +1045,11 @@ async fn send_coins(core: State<'_, Arc<Core>>) -> Result<wallet::CoinList, Stri
 /// The wallet's own addresses: receiving addresses newest last as the node
 /// lists them, then change addresses that hold coins.
 #[tauri::command]
-async fn receive_addresses(core: State<'_, Arc<Core>>) -> Result<Vec<receive::Receiving>, String> {
+async fn receive_addresses(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<Vec<receive::Receiving>, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -992,11 +1063,13 @@ async fn receive_addresses(core: State<'_, Arc<Core>>) -> Result<Vec<receive::Re
 /// asking for an amount.
 #[tauri::command]
 async fn receive_show(
+    window: Window,
     core: State<'_, Arc<Core>>,
     address: String,
     amount: String,
     message: String,
 ) -> Result<receive::Request, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -1060,7 +1133,8 @@ fn wallets_view(core: &Core) -> Result<WalletsView, String> {
 }
 
 #[tauri::command]
-async fn wallets(core: State<'_, Arc<Core>>) -> Result<WalletsView, String> {
+async fn wallets(window: Window, core: State<'_, Arc<Core>>) -> Result<WalletsView, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || wallets_view(&core)).await
 }
@@ -1428,7 +1502,11 @@ async fn wallet_backup(
 
 /// The dashboard's chain, sync, network and mempool summary.
 #[tauri::command]
-async fn chain_overview(core: State<'_, Arc<Core>>) -> Result<chain::ChainOverview, String> {
+async fn chain_overview(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<chain::ChainOverview, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -1440,7 +1518,11 @@ async fn chain_overview(core: State<'_, Arc<Core>>) -> Result<chain::ChainOvervi
 
 /// The network page's peer list.
 #[tauri::command]
-async fn network_peers(core: State<'_, Arc<Core>>) -> Result<Vec<chain::Peer>, String> {
+async fn network_peers(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<Vec<chain::Peer>, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
@@ -1454,10 +1536,12 @@ async fn network_peers(core: State<'_, Arc<Core>>) -> Result<Vec<chain::Peer>, S
 /// window. Nothing is broadcast here; the page only learns the draft id.
 #[tauri::command]
 async fn draft_send(
+    window: Window,
     app: AppHandle,
     core: State<'_, Arc<Core>>,
     payment: wallet::Payment,
 ) -> Result<String, String> {
+    require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     let id = blocking(move || {
         let node = core.node();
@@ -1482,7 +1566,8 @@ async fn draft_send(
 /// Async on purpose: a window built inside a synchronous command deadlocks on
 /// Windows (WebView2) and stays blank.
 #[tauri::command]
-async fn open_console(app: AppHandle) -> Result<(), String> {
+async fn open_console(app: AppHandle, window: Window) -> Result<(), String> {
+    require_window(&window, MAIN)?;
     if let Some(window) = app.get_webview_window(CONSOLE) {
         return window.set_focus().map_err(|e| e.to_string());
     }
@@ -2485,6 +2570,39 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Every command checks the window that calls it, as require_window's
+    /// comment promises; only the theme is read by every window.
+    #[test]
+    fn every_command_checks_its_window() {
+        let source = include_str!("lib.rs");
+        // The commands, not this test, which names the attribute too.
+        let source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let mut checked = 0;
+        for command in source.split("#[tauri::command]").skip(1) {
+            let name = command
+                .split("fn ")
+                .nth(1)
+                .and_then(|rest| rest.split('(').next())
+                .unwrap_or_default();
+            let body = &command[..command
+                .find(
+                    "
+}
+",
+                )
+                .unwrap_or(command.len())];
+            if name == "ui_theme" {
+                continue;
+            }
+            assert!(
+                body.contains("require_window(&window, "),
+                "{name} does not check which window calls it"
+            );
+            checked += 1;
+        }
+        assert!(checked > 60, "the scan found only {checked} commands");
+    }
 
     #[test]
     fn mainnet_uses_the_legacy_data_folder() {
