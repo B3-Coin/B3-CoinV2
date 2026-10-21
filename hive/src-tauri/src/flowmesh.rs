@@ -1137,7 +1137,7 @@ pub struct Deposit {
 }
 
 /// What a DEX_VAULT output's script says (modern::ParseAssetOutput): one
-/// minimal push of the B3A1 payload, then OP_FALSE. The payload is the
+/// minimal push of the B3A1 payload, OP_DROP, then OP_FALSE. The payload is the
 /// magic, the asset id, the amount (big-endian), the policy type and
 /// version, then the vault id as the policy commitment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1167,7 +1167,8 @@ pub(crate) fn vault_output(script_hex: &str) -> Option<VaultOutput> {
         _ => return None,
     };
     let payload = script.get(start..start + len)?;
-    if script.get(start + len..)? != [0x00] || payload.len() < 80 || &payload[..4] != b"B3A1" {
+    if script.get(start + len..)? != [0x75, 0x00] || payload.len() < 80 || &payload[..4] != b"B3A1"
+    {
         return None;
     }
     if u16::from_be_bytes([payload[44], payload[45]]) != DEX_VAULT_POLICY {
@@ -1459,7 +1460,7 @@ mod tests {
         payload.extend([0u8; 35]);
         let mut script = vec![0x4c, payload.len() as u8];
         script.extend(payload);
-        script.push(0x00);
+        script.extend([0x75, 0x00]);
         script.iter().map(|b| format!("{b:02x}")).collect()
     }
 
@@ -1478,11 +1479,22 @@ mod tests {
         assert!(!token.native);
         assert_eq!(token.amount, 42);
 
+        // A real 1 B3 deposit from a regtest market.
+        let real = vault_output("4c73423341310000000000000000000000000000000000000000000000000000000000000000000000003b9aca00000300024159bac602bd0fe248ba5e24ddb1dba71584ea0ae5aa586bd798aaee3ab7ee2f011000ebe47baec3d24b579aa4d19247e7f3bdc2bd4d1e89496ae93093f851bd419bf97500").unwrap();
+        assert!(real.native);
+        assert_eq!(real.amount, 1_000_000_000);
+        assert_eq!(
+            real.vault_id,
+            "2feeb73aeeaa98d76b58aae50aea8415a7dbb1dd245eba48e20fbd02c6ba5941"
+        );
+
         let good = vault_script([0; 32], 1, vault);
-        // Another policy, a missing OP_FALSE, a cut push or odd hex is not one.
+        // Another policy, a missing OP_DROP or OP_FALSE, a cut push or odd
+        // hex is not one.
         let owner = good.replacen("00030002", "00010001", 1);
         assert_eq!(vault_output(&owner), None);
         assert_eq!(vault_output(&good[..good.len() - 2]), None);
+        assert_eq!(vault_output(&good.replace("7500", "00")), None);
         assert_eq!(vault_output(&good[..100]), None);
         assert_eq!(vault_output(&good[1..]), None);
         assert_eq!(vault_output("76a914"), None);
