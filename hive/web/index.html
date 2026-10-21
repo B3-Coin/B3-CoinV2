@@ -139,6 +139,19 @@
           </div>
         </div>
 
+        <div class="backdrop" id="confirm-backdrop" hidden>
+          <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+            <div class="modal-head">
+              <h2 id="confirm-title"></h2>
+            </div>
+            <div class="modal-body stack" id="confirm-text"></div>
+            <div class="modal-foot">
+              <button class="btn btn-secondary" type="button" id="confirm-no">Cancel</button>
+              <button class="btn btn-primary" type="button" id="confirm-yes"></button>
+            </div>
+          </div>
+        </div>
+
         <div class="banner banner-danger" id="lock-warning" role="alert" hidden>
           <svg class="i" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>
           <div class="banner-body">
@@ -1263,7 +1276,7 @@
             </div>
             <div class="row">
               <button class="btn btn-primary" type="submit" id="settings-save">Save and restart</button>
-              <button class="btn btn-secondary" type="button" id="settings-defaults">Use defaults</button>
+              <button class="btn btn-secondary" type="button" id="settings-defaults">Fill in the defaults</button>
             </div>
             <div class="banner" id="settings-result" role="status" hidden></div>
           </form>

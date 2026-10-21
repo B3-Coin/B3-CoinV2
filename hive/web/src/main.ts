@@ -5,6 +5,7 @@ import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecid
 import { pickAddress, sortOwn } from "./picker";
 import { single } from "./single";
 import { tabKeys, trapDialog } from "./a11y";
+import { confirmAction } from "./confirm";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -453,6 +454,9 @@ function clearWalletCard(): void {
   walletStale(null);
 }
 
+// Whether the node was staking at the last read: a restart stops it.
+let stakingRunning = false;
+
 async function refreshWallet(): Promise<void> {
   const mine = ++walletReads;
   try {
@@ -476,6 +480,7 @@ async function refreshWallet(): Promise<void> {
     el("security-chip").className = `badge badge-${tone}`;
     el("security-icon").setAttribute("href", `/icons.svg#${icon}`);
     renderStaking(w.staking, w.staking_error);
+    stakingRunning = w.staking?.running ?? false;
     el("fund").hidden = !w.can_fund;
   } catch (e) {
     if (mine !== walletReads) return;
@@ -2073,7 +2078,17 @@ async function applySettings(settings: NodeSettings): Promise<void> {
 el("set-proxy-use").addEventListener("change", syncProxyRows);
 el("set-onion-use").addEventListener("change", syncProxyRows);
 
-el("settings-form").addEventListener("submit", (event) => {
+/** What a restart interrupts, said before it happens. */
+function restartConsequences(): string[] {
+  const lines = [
+    "The node stops and starts again with these settings. Balances and the other pages are unavailable until it is ready, which can take a few minutes.",
+  ];
+  if (stakingRunning)
+    lines.push("Staking stops and does not start again on its own: start it again on the Stake page afterwards.");
+  return lines;
+}
+
+el("settings-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   let settings: NodeSettings;
   try {
@@ -2082,11 +2097,12 @@ el("settings-form").addEventListener("submit", (event) => {
     settingsResult("danger", e instanceof Error ? e.message : String(e));
     return;
   }
-  void applySettings(settings);
+  if (await confirmAction("Restart the node?", restartConsequences(), "Save and restart")) void applySettings(settings);
 });
 
+// Fills the form only; nothing changes until it is saved.
 el("settings-defaults").addEventListener("click", () => {
-  void applySettings({
+  fillSettings({
     dbcache_mib: null,
     script_threads: null,
     listen: null,
@@ -2094,6 +2110,10 @@ el("settings-defaults").addEventListener("click", () => {
     proxy: null,
     onion: null,
   });
+  // Flags left at their defaults are then saved as unset, as in a file
+  // without them.
+  if (loadedSettings) loadedSettings = { ...loadedSettings, listen: null, natpmp: null };
+  settingsResult("success", "The form now shows the defaults. Save and restart to use them.");
 });
 
 // ---- send ------------------------------------------------------------------

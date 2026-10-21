@@ -1507,6 +1507,10 @@ async fn node_settings_apply(
         if matches!(current.status(), NodeStatus::Setup) || core.setup.installing() {
             return Err("Finish setting up the node first.".into());
         }
+        // A restart would pull the node away from a request being decided.
+        if core.drafts.lock().unwrap().oldest().is_some() {
+            return Err("Approve or reject the request in the approval window first.".into());
+        }
         let _ = app.emit_to(MAIN, "node-status", NodeStatus::Stopping);
         current.stop(STOP_TIMEOUT);
         let written = settings::write(&chain_dir, &settings);
