@@ -16,6 +16,8 @@
         "title": "B3 Hive",
         "width": 1100,
         "height": 720,
+        "minWidth": 700,
+        "minHeight": 520,
         "incognito": true
       }
     ],

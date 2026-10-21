@@ -3201,5 +3201,13 @@ el("lock-warning-lock").addEventListener("click", async () => {
   void refreshWallets();
   void refreshWallet();
 });
+// Icon-only navigation (narrow windows) needs names that survive hiding the text.
+for (const item of document.querySelectorAll<HTMLElement>(".nav-item")) {
+  const label = item.querySelector(".nav-text")?.textContent?.trim();
+  if (label) {
+    item.setAttribute("aria-label", label);
+    item.title = label;
+  }
+}
 await listen<NodeStatus>("node-status", (event) => render(event.payload));
 render(await invoke<NodeStatus>("node_status"));
