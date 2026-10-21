@@ -226,10 +226,14 @@ function showPsbt(kind: "sign_psbt" | "send_psbt", s: PsbtSummary): void {
 }
 
 // Staking requests go to the node as they are; it picks the coins and the
-// fee when they are approved, so the window says so instead of a figure.
+// fee when they are approved, so the window gives the bound the node is
+// started with (-maxtxfee) instead of a figure.
+const FEE_BOUND = "At most 0.1 B3";
+const FEE_LATER = "The node picks the network fee when it builds the transaction, at most 0.1 B3 and usually far less; Activity shows it once sent.";
+
 function showAction(r: Extract<Request, { kind: "stake" | "bind_finality" }>): void {
   el("from").textContent = `From ${walletName(r.wallet)} on ${r.chain}`;
-  const fee = row("Network fee", "Set by the wallet when it is sent", undefined, false);
+  const fee = row("Network fee", FEE_BOUND, undefined, false);
   if (r.kind === "stake") {
     el("title").textContent = `Stake ${formatAmount(r.amount)}?`;
     const enters = r.producers.stake_enters_at;
@@ -239,7 +243,8 @@ function showAction(r: Extract<Request, { kind: "stake" | "bind_finality" }>): v
         ? `, and makes blocks from block ${enters.toLocaleString()} at the earliest.`
         : r.producers.frozen
           ? `. ${FROZEN_SET}, so it makes blocks only after that.`
-          : ", and makes blocks once the validator set next rotates to include it.");
+          : ", and makes blocks once the validator set next rotates to include it.") +
+      ` ${FEE_LATER}`;
     el("action-rows").replaceChildren(row("Stake", formatAmount(r.amount, 9)), fee, row("Network", r.chain, undefined, false));
     el("approve").textContent = "Stake now";
   } else {
@@ -247,6 +252,7 @@ function showAction(r: Extract<Request, { kind: "stake" | "bind_finality" }>): v
     el("action-text").textContent = r.rotate
       ? "Sends a small transaction that replaces this validator's bound BLS finality key with a new one. It takes effect at the next epoch boundary."
       : "Sends a small transaction that registers this validator's BLS finality key. Staking needs it to sign finality. It takes effect at the next epoch boundary.";
+    el("action-text").textContent += ` ${FEE_LATER}`;
     el("action-rows").replaceChildren(fee, row("Network", r.chain, undefined, false));
     el("approve").textContent = r.rotate ? "Rotate key" : "Bind key";
   }
@@ -372,9 +378,9 @@ function showFunding(r: Extract<Request, { kind: "trade_deposit" | "trade_withdr
       "This signs and broadcasts a B3 transaction that moves the amount into the market's keyless vault, for your trading account. " +
       "It counts only after 31 confirmations and once the market admits it; the Trade page asks for that. " +
       "If it is slow, do not deposit again: the same deposit can be submitted for admission again. " +
-      "The node picks the network fee when it builds the transaction; it is shown afterwards." +
+      "The node picks the network fee when it builds the transaction, at most 0.1 B3 and usually far less; it is shown afterwards." +
       (dep.has_account ? "" : " This also creates the wallet's trading account key. Back up the wallet afterwards.");
-    el("action-rows").replaceChildren(row("Deposit", amount), asset, ...market);
+    el("action-rows").replaceChildren(row("Deposit", amount), row("Network fee", FEE_BOUND, undefined, false), asset, ...market);
     el("approve").textContent = "Deposit";
   } else if (r.kind === "trade_withdraw") {
     const w = r.withdraw;
@@ -402,6 +408,7 @@ function showFunding(r: Extract<Request, { kind: "trade_deposit" | "trade_withdr
       "This wallet pays its network fee, which the node picks when it builds the transaction (at most 0.1 B3); it is shown afterwards.";
     el("action-rows").replaceChildren(
       row("Payout", amount),
+      row("Network fee", FEE_BOUND, undefined, false),
       row("Pay to", p.mine ? "This wallet" : "Another wallet", p.destination, false),
       asset,
       ...market,
@@ -425,6 +432,7 @@ function showCheckpoint(c: CheckpointDraft): void {
     "If someone else publishes this checkpoint first, nothing is sent.";
   el("action-rows").replaceChildren(
     row("Entry", String(c.sequence), undefined, false),
+    row("Network fee", FEE_BOUND, undefined, false),
     row("Market", shorten(c.market_id, 10, 6), c.market_id, false),
     row("Network", c.chain, undefined, false),
     row("Checkpoint id", shorten(c.checkpoint_id, 10, 6), c.checkpoint_id, false),

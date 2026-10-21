@@ -503,6 +503,11 @@ fn node_args(
         // Without fee history (regtest, a quiet mainnet) use the legacy relay
         // floor (600,000 base units per kvB) that B3 mainnet wallets default to.
         "-fallbackfee=0.0006".into(),
+        // The approval window promises this bound for the transactions the
+        // node builds itself (stakes, bindings, deposits, payouts,
+        // checkpoints); b3coin.conf must not raise it. It is the wallet's
+        // default (KILO_COIN / 10).
+        "-maxtxfee=0.1".into(),
     ]);
     args
 }
