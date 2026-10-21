@@ -4,6 +4,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { amountNode, el, icon } from "../shared/ui";
+import { trapDialog } from "./a11y";
 
 export type Picked = { address: string; label: string; mine: boolean };
 type Tab = "book" | "mine";
@@ -30,11 +31,14 @@ let tab: Tab = "book";
 let contacts: Contact[] | string = [];
 let own: Own[] | string = [];
 let returnFocus: HTMLElement | null = null;
+let release: (() => void) | null = null;
 // Each opening loads the lists anew; a slower earlier load must not win.
 let opening = 0;
 
 function finish(p: Picked | null): void {
   el("pick-backdrop").hidden = true;
+  release?.();
+  release = null;
   const done = resolvePick;
   resolvePick = null;
   returnFocus?.focus();
@@ -130,6 +134,7 @@ export async function pickAddress(title: string, sub: string, start: Tab): Promi
   own = "Loading…";
   tab = start;
   el("pick-backdrop").hidden = false;
+  release ??= trapDialog(el("pick-backdrop"));
   render();
   el<HTMLInputElement>("pick-search").focus();
   const result = new Promise<Picked | null>((resolve) => (resolvePick = resolve));

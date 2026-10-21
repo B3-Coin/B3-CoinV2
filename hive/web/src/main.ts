@@ -4,6 +4,7 @@ import { amountNode, amountUnits, el, formatAmount, icon, initTheme, setMasked, 
 import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeResult } from "./trade";
 import { pickAddress, sortOwn } from "./picker";
 import { single } from "./single";
+import { tabKeys, trapDialog } from "./a11y";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -12,6 +13,9 @@ type NodeStatus =
   | { phase: "stopping" }
   | { phase: "failed"; error: string }
   | { phase: "setup" };
+
+// Every tab list on the page moves with the arrow keys.
+tabKeys();
 
 // Mirrors WalletOverview in src-tauri/src/lib.rs and wallet::Staking.
 type Staking = {
@@ -1492,6 +1496,7 @@ function detailRow(key: string, value: string | Node, copy?: string): HTMLElemen
 }
 
 let detailReturnFocus: HTMLElement | null = null;
+let releaseDetails: (() => void) | null = null;
 
 /// The details dialog shared by transactions and peers.
 function openDetails(title: string, sub: string, rows: HTMLElement[]): void {
@@ -1500,11 +1505,14 @@ function openDetails(title: string, sub: string, rows: HTMLElement[]): void {
   el("detail-sub").textContent = sub;
   el("detail-rows").replaceChildren(...rows);
   el("detail-backdrop").hidden = false;
+  releaseDetails ??= trapDialog(el("detail-backdrop"));
   el("detail-close").focus();
 }
 
 function closeDetails(): void {
   el("detail-backdrop").hidden = true;
+  releaseDetails?.();
+  releaseDetails = null;
   detailReturnFocus?.focus();
 }
 
@@ -1961,7 +1969,7 @@ function fillSettings(s: NodeSettings): void {
   el<HTMLInputElement>("set-proxy").value = s.proxy ?? "";
   el<HTMLInputElement>("set-onion-use").checked = s.onion !== null;
   el<HTMLInputElement>("set-onion").value = s.onion ?? "";
-  for (const id of ["set-dbcache", "set-par", "set-proxy", "set-onion"]) el(id).removeAttribute("aria-invalid");
+  for (const id of ["set-dbcache", "set-par", "set-proxy", "set-onion"]) valid(el<HTMLInputElement>(id));
   syncProxyRows();
 }
 
@@ -1983,14 +1991,25 @@ async function loadSettings(): Promise<void> {
   }
 }
 
+/// A field the settings refused points at the message saying why.
+function invalid(input: HTMLInputElement): void {
+  input.setAttribute("aria-invalid", "true");
+  input.setAttribute("aria-describedby", "settings-result");
+}
+
+function valid(input: HTMLInputElement): void {
+  input.removeAttribute("aria-invalid");
+  input.removeAttribute("aria-describedby");
+}
+
 /// An optional whole number from a field, or an error naming the field.
 function wholeNumber(id: string, name: string): number | null {
   const input = el<HTMLInputElement>(id);
   const text = input.value.trim();
-  input.removeAttribute("aria-invalid");
+  valid(input);
   if (text === "") return null;
   if (!/^-?\d+$/.test(text)) {
-    input.setAttribute("aria-invalid", "true");
+    invalid(input);
     throw new Error(`${name} must be a whole number.`);
   }
   return Number(text);
@@ -1998,11 +2017,11 @@ function wholeNumber(id: string, name: string): number | null {
 
 function proxyField(useId: string, id: string, name: string): string | null {
   const input = el<HTMLInputElement>(id);
-  input.removeAttribute("aria-invalid");
+  valid(input);
   if (!el<HTMLInputElement>(useId).checked) return null;
   const text = input.value.trim();
   if (!text) {
-    input.setAttribute("aria-invalid", "true");
+    invalid(input);
     throw new Error(`Enter the ${name}, such as 127.0.0.1:9050.`);
   }
   return text;

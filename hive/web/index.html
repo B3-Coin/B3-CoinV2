@@ -719,7 +719,7 @@
                           </div>
                           <div class="field">
                             <label for="tr-fund-amount">Amount</label>
-                            <input class="input tnum" id="tr-fund-amount" inputmode="decimal" autocomplete="off" spellcheck="false" />
+                            <input class="input tnum" id="tr-fund-amount" aria-describedby="tr-fund-error" inputmode="decimal" autocomplete="off" spellcheck="false" />
                           </div>
                           <div class="field" id="tr-fund-to-field" hidden>
                             <label for="tr-fund-to">Pay to</label>
@@ -731,7 +731,7 @@
                             </div>
                           </div>
                           <p class="t-xs muted" id="tr-fund-help"></p>
-                          <p class="t-sm tr-form-error" id="tr-fund-error" role="alert" hidden></p>
+                          <p class="t-sm tr-form-error" id="tr-fund-error" aria-live="polite" hidden></p>
                           <div class="banner" id="tr-fund-result" role="status" hidden></div>
                           <button class="btn btn-primary btn-block" type="submit" id="tr-fund-review">Review deposit</button>
                           <p class="t-xs muted" id="tr-fund-gate" hidden></p>
@@ -763,29 +763,29 @@
                         <div class="tr-in">
                           <label class="tr-in-label" for="tr-price-0" data-tr-price>Price</label>
                           <button class="tr-stepper" type="button" data-for="tr-price-0" data-dir="-1" tabindex="-1" aria-label="Lower price by one step">−</button>
-                          <input class="tr-in-field tnum" id="tr-price-0" inputmode="decimal" autocomplete="off" spellcheck="false" />
+                          <input class="tr-in-field tnum" id="tr-price-0" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" />
                           <button class="tr-stepper" type="button" data-for="tr-price-0" data-dir="1" tabindex="-1" aria-label="Raise price by one step">+</button>
                           <span class="tr-in-unit">B3</span>
                         </div>
                         <div class="tr-in">
                           <label class="tr-in-label" for="tr-qty-0" data-tr-qty>Amount</label>
                           <button class="tr-stepper" type="button" data-for="tr-qty-0" data-dir="-1" tabindex="-1" aria-label="Lower amount by one step">−</button>
-                          <input class="tr-in-field tnum" id="tr-qty-0" inputmode="decimal" autocomplete="off" spellcheck="false" />
+                          <input class="tr-in-field tnum" id="tr-qty-0" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" />
                           <button class="tr-stepper" type="button" data-for="tr-qty-0" data-dir="1" tabindex="-1" aria-label="Raise amount by one step">+</button>
                           <span class="tr-in-unit" data-tr-unit>Token</span>
                         </div>
                       </div>
                       <div class="tr-step" id="tr-step-1" hidden>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-price-1" data-tr-price>Price 2</label><input class="tr-in-field tnum" id="tr-price-1" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-1" data-tr-qty>Amount 2</label><input class="tr-in-field tnum" id="tr-qty-1" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-price-1" data-tr-price>Price 2</label><input class="tr-in-field tnum" id="tr-price-1" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-1" data-tr-qty>Amount 2</label><input class="tr-in-field tnum" id="tr-qty-1" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
                       </div>
                       <div class="tr-step" id="tr-step-2" hidden>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-price-2" data-tr-price>Price 3</label><input class="tr-in-field tnum" id="tr-price-2" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-2" data-tr-qty>Amount 3</label><input class="tr-in-field tnum" id="tr-qty-2" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-price-2" data-tr-price>Price 3</label><input class="tr-in-field tnum" id="tr-price-2" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-2" data-tr-qty>Amount 3</label><input class="tr-in-field tnum" id="tr-qty-2" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
                       </div>
                       <div class="tr-step" id="tr-step-3" hidden>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-price-3" data-tr-price>Price 4</label><input class="tr-in-field tnum" id="tr-price-3" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-3" data-tr-qty>Amount 4</label><input class="tr-in-field tnum" id="tr-qty-3" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-price-3" data-tr-price>Price 4</label><input class="tr-in-field tnum" id="tr-price-3" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-3" data-tr-qty>Amount 4</label><input class="tr-in-field tnum" id="tr-qty-3" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
                       </div>
                     </div>
                     <div class="tr-slider" id="tr-slider">
@@ -803,7 +803,7 @@
                       <div class="tr-sum-row"><span class="muted" id="tr-total-label">Total</span><span class="tnum" id="tr-total">—</span></div>
                       <div class="tr-sum-row" id="tr-replaces-row" hidden><span class="muted">Replaces</span><span class="tnum" id="tr-replaces"></span></div>
                     </div>
-                    <p class="t-xs tr-form-error" id="tr-form-error" role="alert" hidden></p>
+                    <p class="t-xs tr-form-error" id="tr-form-error" aria-live="polite" hidden></p>
                     <button class="btn btn-block tr-go" type="submit" id="tr-review">Buy</button>
                     <p class="t-xs muted tr-gate" id="tr-gate" hidden></p>
                     <div class="banner tr-result" id="tr-result" role="status" hidden></div>
