@@ -5314,7 +5314,7 @@ void FlowMeshRuntime::PublishHealth(const flowmesh::WireClock::time_point now, c
         row.error = market.error.substr(0, 1024);
         if (market.proposal_wait_sequence == market.next_sequence) row.proposal_wait_reason = market.proposal_wait_reason;
         row.head_advanced_at = market.head_advanced_at;
-        if (market.ready && market.pool.HasEligibleSignedAction(market.state)) {
+        if (market.ready && market.pool.HasEligibleSignedAction(market.State())) {
             if (!market.eligible_work_since) market.eligible_work_since = now;
         } else {
             market.eligible_work_since.reset();
