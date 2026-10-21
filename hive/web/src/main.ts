@@ -884,15 +884,19 @@ function renderWallets(v: WalletsView): void {
       } else {
         trail.push(actionButton("Use", "btn-secondary", () => void manageWallet({ action: "switch", name })));
       }
-      // Two clicks, as Qt asks before closing a wallet.
+      // Asked first, as Qt asks before closing a wallet.
       trail.push(
-        actionButton("Close", "btn-ghost", (b) => {
-          if (b.dataset.armed) void manageWallet({ action: "close", name });
-          else {
-            b.dataset.armed = "1";
-            b.textContent = "Confirm close";
-            b.className = "btn btn-sm btn-danger-quiet";
-          }
+        actionButton("Close", "btn-ghost", async () => {
+          const yes = await confirmAction(
+            `Close ${walletName(name)}?`,
+            [
+              "It stays in the wallets folder and no longer loads when the node starts. You can open it again from this page.",
+              "If it is staking, staking stops with it.",
+            ],
+            "Close wallet",
+            true,
+          );
+          if (yes) void manageWallet({ action: "close", name });
         }),
       );
       return walletRow(name, trail, inUse ? "Loaded · these pages show this wallet" : "Loaded");
