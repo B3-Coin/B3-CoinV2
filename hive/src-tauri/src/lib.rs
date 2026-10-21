@@ -57,7 +57,7 @@ pub struct Core {
     drafts: Mutex<DraftStore>,
     /// FlowMesh requests the user acknowledged as uncertain, so new ones may
     /// be drafted. Acknowledging never retries or cancels them.
-    trade_acknowledged: Mutex<Vec<String>>,
+    trade_acknowledged: Acknowledged,
     /// The wallet picked in the main window; the pages fall back to the first
     /// loaded wallet when it is not loaded.
     wallet: Mutex<Option<String>>,
@@ -140,6 +140,38 @@ pub enum PassResult {
     Cancelled {
         kind: passphrase::Kind,
     },
+}
+
+/// FlowMesh requests acknowledged as uncertain, each with the wallet that
+/// signed it, newest last. Only the newest ACKNOWLEDGED_KEPT are kept: one
+/// is added per click, and an old one dropped only blocks again if it is
+/// somehow still open, when it can be acknowledged again.
+#[derive(Default)]
+struct Acknowledged(Mutex<Vec<(String, String)>>);
+
+const ACKNOWLEDGED_KEPT: usize = 256;
+
+impl Acknowledged {
+    /// The action ids acknowledged for `wallet`.
+    fn of(&self, wallet: &str) -> Vec<String> {
+        let list = self.0.lock().unwrap();
+        list.iter()
+            .filter(|(w, _)| w == wallet)
+            .map(|(_, action)| action.clone())
+            .collect()
+    }
+
+    fn add(&self, wallet: &str, action_id: String) {
+        let mut list = self.0.lock().unwrap();
+        if list.iter().any(|(w, a)| w == wallet && *a == action_id) {
+            return;
+        }
+        list.push((wallet.to_owned(), action_id));
+        if list.len() > ACKNOWLEDGED_KEPT {
+            let excess = list.len() - ACKNOWLEDGED_KEPT;
+            list.drain(..excess);
+        }
+    }
 }
 
 /// Sent to the main window when a draft is decided.
@@ -516,7 +548,7 @@ async fn trade_order_draft(
     let id = blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
-        let acknowledged = core.trade_acknowledged.lock().unwrap().clone();
+        let acknowledged = core.trade_acknowledged.of(&name);
         let chain = node.chain().unwrap_or_default();
         let order = flowmesh::prepare_order(
             client,
@@ -552,7 +584,7 @@ async fn trade_cancel_draft(
     let id = blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
-        let acknowledged = core.trade_acknowledged.lock().unwrap().clone();
+        let acknowledged = core.trade_acknowledged.of(&name);
         let chain = node.chain().unwrap_or_default();
         let cancel =
             flowmesh::prepare_cancel(client, &chain, &name, &market_id, &side, &acknowledged)?;
@@ -612,7 +644,7 @@ async fn trade_withdraw_draft(
     let id = blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
-        let acknowledged = core.trade_acknowledged.lock().unwrap().clone();
+        let acknowledged = core.trade_acknowledged.of(&name);
         let chain = node.chain().unwrap_or_default();
         let withdraw = flowmesh::prepare_withdraw(
             client,
@@ -767,7 +799,7 @@ async fn trade_requests(
     blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
-        let acknowledged = core.trade_acknowledged.lock().unwrap().clone();
+        let acknowledged = core.trade_acknowledged.of(&name);
         flowmesh::requests_view(client, &name, &market_id, &acknowledged)
     })
     .await
@@ -788,10 +820,7 @@ async fn trade_acknowledge(
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
         flowmesh::can_acknowledge(client, &name, &market_id, &action_id)?;
-        let mut acknowledged = core.trade_acknowledged.lock().unwrap();
-        if !acknowledged.contains(&action_id) {
-            acknowledged.push(action_id);
-        }
+        core.trade_acknowledged.add(&name, action_id);
         Ok(())
     })
     .await
@@ -2465,7 +2494,7 @@ pub fn run() {
                 config,
                 exiting: AtomicBool::new(false),
                 drafts: Mutex::new(DraftStore::default()),
-                trade_acknowledged: Mutex::new(Vec::new()),
+                trade_acknowledged: Acknowledged::default(),
                 wallet: Mutex::new(None),
                 passphrase: Mutex::new(None),
                 prefs: Mutex::new(prefs_file.as_deref().map(prefs::read).unwrap_or_default()),
@@ -2609,6 +2638,23 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn acknowledgements_are_per_wallet_and_bounded() {
+        let ack = Acknowledged::default();
+        ack.add("a", "x".into());
+        ack.add("a", "x".into());
+        ack.add("b", "y".into());
+        assert_eq!(ack.of("a"), vec!["x".to_owned()]);
+        assert_eq!(ack.of("b"), vec!["y".to_owned()]);
+        for i in 0..ACKNOWLEDGED_KEPT {
+            ack.add("a", format!("n{i}"));
+        }
+        let a = ack.of("a");
+        assert_eq!(a.len(), ACKNOWLEDGED_KEPT);
+        assert!(!a.contains(&"x".to_owned()), "the oldest goes first");
+        assert!(ack.of("b").is_empty());
+    }
 
     /// Every command checks the window that calls it, as require_window's
     /// comment promises; only the theme is read by every window.
