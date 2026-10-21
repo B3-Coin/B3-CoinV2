@@ -13,6 +13,8 @@
    Dark is the default; [data-theme="light"] overrides. */
 
 :root {
+  /* Scrollbars, form controls and the like follow the theme. */
+  color-scheme: dark;
   /* ---- Surfaces (dark) ---- */
   --bg:            #12100e;
   --bg-surface:    #191612;
@@ -133,6 +135,7 @@
 }
 
 [data-theme="light"] {
+  color-scheme: light;
   /* ---- Surfaces (light) ---- */
   --bg:            #faf9f6;  /* warm paper */
   --bg-surface:    #ffffff;
