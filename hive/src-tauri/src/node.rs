@@ -259,8 +259,11 @@ impl Node {
         &self.datadir
     }
 
-    /// Polls until init finishes, the process dies or `timeout` passes, and
-    /// reports every status change to `on_change`.
+    /// Polls until init finishes or the process dies, and reports every
+    /// status change to `on_change`. `timeout` bounds only the wait for RPC
+    /// to open: a node that answers that it is still loading keeps being
+    /// followed, since a mainnet start can take many minutes (the legacy
+    /// block index is scrypt-hashed and the trackers replay on every start).
     pub fn wait_ready(
         &self,
         timeout: Duration,
@@ -270,13 +273,17 @@ impl Node {
             return self.status();
         };
         let deadline = Instant::now() + timeout;
+        let mut answered = false;
         loop {
             let next = match client.call("getblockchaininfo", json!([])) {
                 Ok(info) => ready_status(&info),
                 Err(RpcError::Rpc {
                     code: RPC_IN_WARMUP,
                     message,
-                }) => NodeStatus::Starting { message },
+                }) => {
+                    answered = true;
+                    NodeStatus::Starting { message }
+                }
                 Err(RpcError::Transport(_)) => match self.exit_status() {
                     Some(exit) => NodeStatus::Failed {
                         error: self.exit_message(&exit),
@@ -290,12 +297,11 @@ impl Node {
                 },
             };
             let next = match next {
-                NodeStatus::Starting { .. } if Instant::now() >= deadline => NodeStatus::Failed {
-                    error: format!(
-                        "b3coind did not finish starting within {}s",
-                        timeout.as_secs()
-                    ),
-                },
+                NodeStatus::Starting { .. } if !answered && Instant::now() >= deadline => {
+                    NodeStatus::Failed {
+                        error: format!("b3coind did not open RPC within {}s", timeout.as_secs()),
+                    }
+                }
                 next => next,
             };
             self.set_status(next.clone(), &mut on_change);
