@@ -9,6 +9,7 @@
 #include <streams.h>
 
 #include <limits>
+#include <algorithm>
 #include <span>
 #include <utility>
 
@@ -103,6 +104,30 @@ Result<ProfileParams> StableQNetworkRegtestProfile(ChainType chain)
     return Ok(std::move(params));
 }
 
+AssetId NitroLabQuoteAsset(const NitroLabBinding& binding)
+{
+    std::vector<unsigned char> bytes;
+    VectorWriter{bytes, 0, std::string{"fm2/owned-nitro-lab/USDT0/1"}, NITRO_LAB_CHAIN_ID,
+                 binding.source_genesis_hash, binding.quote_token, binding.quote_token_code_hash,
+                 binding.quote_implementation, binding.quote_implementation_code_hash};
+    return AssetId{Tagged(HashTag::TEST_ASSET, bytes)};
+}
+
+Result<ProfileParams> NitroLabRegtestProfile(ChainType chain, const NitroLabBinding& binding)
+{
+    auto base{StableQRegtestProfile(chain)};
+    if (!base.has_value()) return base.error();
+    ProfileParams params{std::move(*base)};
+    params.profile_id = NITRO_LAB_PROFILE_ID;
+    params.nitro_lab = binding;
+    params.stable_fee_asset = NitroLabQuoteAsset(binding);
+    params.source_range_commitment = true;
+    params.source_chain_id = NITRO_LAB_CHAIN_ID;
+    params.source_confirmations = 1; // owned local successor only; no settlement/finality claim
+    if (auto valid{Validate(params)}; !valid.has_value()) return valid.error();
+    return Ok(std::move(params));
+}
+
 Result<void> Validate(const ProfileParams& params)
 {
     if (params.chain != ChainType::REGTEST) {
@@ -113,12 +138,31 @@ Result<void> Validate(const ProfileParams& params)
         return Invalid("profile_id empty or longer than 64 bytes");
     }
     if (params.fm_version != FM_VERSION) return Invalid("unknown fm_version");
+    const bool nitro_lab{params.profile_id == NITRO_LAB_PROFILE_ID};
+    if (nitro_lab) {
+        if (!params.nitro_lab || !params.source_range_commitment ||
+            params.source_chain_id != NITRO_LAB_CHAIN_ID || params.source_confirmations != 1 ||
+            params.view_bound_commits || !params.withdrawals_enabled) {
+            return Invalid("owned Nitro lab requires its exact direct-commit source412346 policy");
+        }
+        const auto& binding{*params.nitro_lab};
+        const auto nonzero{[](const auto& address) { return std::any_of(address.begin(), address.end(), [](auto b) { return b != 0; }); }};
+        if (binding.source_genesis_hash.IsNull() || !nonzero(binding.quote_token) ||
+            binding.quote_token_code_hash.IsNull() || !nonzero(binding.quote_implementation) ||
+            binding.quote_implementation_code_hash.IsNull() || binding.quote_token == binding.quote_implementation ||
+            !params.stable_fee_asset || *params.stable_fee_asset != NitroLabQuoteAsset(binding) ||
+            !InAtomRange(params.withdrawal_fee_atoms)) {
+            return Invalid("owned Nitro lab quote must bind exact nonzero distinct proxy/implementation/genesis pins");
+        }
+    } else if (params.nitro_lab) {
+        return Invalid("Nitro lab pins require the separately versioned owned-lab profile");
+    }
     const bool source_profile{params.profile_id == STABLE_Q_NETWORK_PROFILE_ID};
     if (source_profile) {
         if (!params.source_range_commitment || params.source_chain_id != 31337 || params.source_confirmations != 2) {
             return Invalid("network source-range profile must pin chain31337 and two isolated confirmations");
         }
-    } else if (params.source_range_commitment || params.source_chain_id != 0 || params.source_confirmations != 0) {
+    } else if (!nitro_lab && (params.source_range_commitment || params.source_chain_id != 0 || params.source_confirmations != 0)) {
         return Invalid("source-range commitment policy requires the versioned network profile");
     }
     if (params.profile_id == STABLE_Q_PROFILE_ID || params.profile_id == STABLE_Q_VIEW_PROFILE_ID || source_profile) {
@@ -131,7 +175,7 @@ Result<void> Validate(const ProfileParams& params)
         if (!InAtomRange(params.withdrawal_fee_atoms) || (!params.withdrawals_enabled && params.withdrawal_fee_atoms != 0)) {
             return Invalid("withdrawal fee outside atom range or nonzero while disabled");
         }
-    } else if (params.stable_fee_asset.has_value() || params.withdrawals_enabled || params.withdrawal_fee_atoms != 0 || params.view_bound_commits) {
+    } else if (!nitro_lab && (params.stable_fee_asset.has_value() || params.withdrawals_enabled || params.withdrawal_fee_atoms != 0 || params.view_bound_commits)) {
         return Invalid("stable fee and withdrawal policy require the versioned stable-Q profile");
     }
     if (!IsKnownMatching(params.matching)) return Invalid("unknown matching profile");
@@ -184,8 +228,9 @@ std::vector<unsigned char> EncodeProfile(const ProfileParams& params)
     std::vector<unsigned char> out;
     VectorWriter writer{out, 0};
     const bool source_extended{params.source_range_commitment || params.source_chain_id != 0 || params.source_confirmations != 0};
-    const bool extended{params.stable_fee_asset.has_value() || params.withdrawals_enabled || params.withdrawal_fee_atoms != 0 || params.view_bound_commits || source_extended};
-    writer << (source_extended ? STABLE_Q_NETWORK_PROFILE_ENCODING_VERSION :
+    const bool nitro_extended{params.nitro_lab.has_value() || params.profile_id == NITRO_LAB_PROFILE_ID};
+    const bool extended{params.stable_fee_asset.has_value() || params.withdrawals_enabled || params.withdrawal_fee_atoms != 0 || params.view_bound_commits || source_extended || nitro_extended};
+    writer << (nitro_extended ? NITRO_LAB_PROFILE_ENCODING_VERSION : source_extended ? STABLE_Q_NETWORK_PROFILE_ENCODING_VERSION :
                params.view_bound_commits ? STABLE_Q_VIEW_PROFILE_ENCODING_VERSION :
                extended ? STABLE_Q_PROFILE_ENCODING_VERSION : PROFILE_ENCODING_VERSION);
     writer << params.profile_id;
@@ -215,10 +260,18 @@ std::vector<unsigned char> EncodeProfile(const ProfileParams& params)
         writer << static_cast<uint8_t>(params.withdrawals_enabled ? 1 : 0);
         writer << params.withdrawal_fee_atoms;
     }
-    if (params.view_bound_commits || source_extended) writer << static_cast<uint8_t>(params.view_bound_commits ? 1 : 0);
-    if (source_extended) {
+    if (params.view_bound_commits || source_extended || nitro_extended) writer << static_cast<uint8_t>(params.view_bound_commits ? 1 : 0);
+    if (source_extended || nitro_extended) {
         writer << static_cast<uint8_t>(params.source_range_commitment ? 1 : 0);
         writer << params.source_chain_id << params.source_confirmations;
+    }
+    if (nitro_extended) {
+        writer << static_cast<uint8_t>(params.nitro_lab.has_value() ? 1 : 0);
+        if (params.nitro_lab) {
+            const auto& binding{*params.nitro_lab};
+            writer << binding.source_genesis_hash << binding.quote_token << binding.quote_token_code_hash
+                   << binding.quote_implementation << binding.quote_implementation_code_hash;
+        }
     }
     return out;
 }
