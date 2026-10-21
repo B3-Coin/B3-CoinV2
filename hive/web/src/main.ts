@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { amountNode, amountText, amountUnits, el, formatAmount, icon, initTheme, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
+import { amountNode, amountText, amountUnits, el, formatAmount, icon, initTheme, isMasked, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
 import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeResult } from "./trade";
 import { pickAddress, sortOwn } from "./picker";
 import { single } from "./single";
@@ -241,6 +241,7 @@ el("mask").addEventListener("click", () => {
     void refreshWallet();
     void refreshRecent();
     if (current === "activity") void refreshActivity();
+    if (current === "stake") void refreshStake();
   }
 });
 
@@ -2488,7 +2489,7 @@ function renderStake(s: StakeStatus): void {
     textRow("Current block", s.tip_height.toLocaleString()),
     textRow(
       "Your share",
-      `${s.active_weight.toLocaleString()} of ${s.total_active_weight.toLocaleString()} B3`,
+      `${isMasked() ? "••••" : s.active_weight.toLocaleString()} of ${s.total_active_weight.toLocaleString()} B3`,
       "This wallet's counting stake, out of all counting stake on the network",
     ),
   ];
