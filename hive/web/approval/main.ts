@@ -362,7 +362,7 @@ function showFunding(r: Extract<Request, { kind: "trade_deposit" | "trade_withdr
   }
   const asset = d.asset === "b3" ? row("Asset", "B3 (native)", undefined, false) : row("Asset", d.base_asset_id, undefined, false);
   const market = [
-    row("Market", shorten(d.market_id, 10, 6), undefined, false),
+    row("Market", shorten(d.market_id, 10, 6), d.market_id, false),
     row("Network", d.chain, undefined, false),
   ];
   if (r.kind === "trade_deposit") {
@@ -425,7 +425,7 @@ function showCheckpoint(c: CheckpointDraft): void {
     "If someone else publishes this checkpoint first, nothing is sent.";
   el("action-rows").replaceChildren(
     row("Entry", String(c.sequence), undefined, false),
-    row("Market", shorten(c.market_id, 10, 6), undefined, false),
+    row("Market", shorten(c.market_id, 10, 6), c.market_id, false),
     row("Network", c.chain, undefined, false),
     row("Checkpoint id", shorten(c.checkpoint_id, 10, 6), c.checkpoint_id, false),
   );
