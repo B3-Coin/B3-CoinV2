@@ -207,9 +207,8 @@ el("restart-node").addEventListener("click", async () => {
 el("theme").addEventListener("click", async () => showThemeIcon(await toggleTheme()));
 
 // Qt's "Mask values": amounts on these pages show as dots until turned off.
-// Remembered on this computer only; exports and the approval window are
-// never masked.
-const MASK_KEY = "hive.mask-values";
+// The core keeps the choice across restarts; exports and the approval
+// window are never masked.
 
 function applyMask(on: boolean): void {
   setMasked(on);
@@ -222,22 +221,11 @@ function applyMask(on: boolean): void {
   tradeMaskChanged();
 }
 
-function storedMask(): boolean {
-  try {
-    return localStorage.getItem(MASK_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-applyMask(storedMask());
+applyMask(await invoke<boolean>("ui_mask").catch(() => false));
 el("mask").addEventListener("click", () => {
   const on = el("mask").getAttribute("aria-pressed") !== "true";
-  try {
-    localStorage.setItem(MASK_KEY, on ? "1" : "0");
-  } catch {
-    // Not remembered; the choice still applies until B3 Hive closes.
-  }
+  // Not remembered if this fails; the choice still applies until B3 Hive closes.
+  invoke("set_ui_mask", { mask: on }).catch(() => {});
   applyMask(on);
   if (!el("detail-backdrop").hidden) closeDetails();
   if (wasReady) {

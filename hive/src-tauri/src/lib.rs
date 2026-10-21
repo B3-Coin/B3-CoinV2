@@ -12,6 +12,7 @@ pub mod flowmesh;
 pub mod history;
 pub mod node;
 pub mod passphrase;
+pub mod prefs;
 pub mod psbt;
 pub mod receive;
 pub mod rpc;
@@ -62,8 +63,10 @@ pub struct Core {
     wallet: Mutex<Option<String>>,
     /// The passphrase window's request while it is open.
     passphrase: Mutex<Option<passphrase::Request>>,
-    /// The theme picked in the main window, so the other windows open in it.
-    theme: Mutex<Option<Theme>>,
+    /// The theme picked in the main window, so the other windows open in it,
+    /// and whether amounts are hidden; kept across restarts in `prefs_file`.
+    prefs: Mutex<prefs::Prefs>,
+    prefs_file: Option<std::path::PathBuf>,
     /// The Activity page's last full history read.
     history: history::Cache,
     updates: Updates,
@@ -1583,13 +1586,41 @@ async fn open_console(app: AppHandle, window: Window) -> Result<(), String> {
 /// The theme picked in the main window, or None to follow the system.
 #[tauri::command]
 fn ui_theme(core: State<'_, Arc<Core>>) -> Option<Theme> {
-    *core.theme.lock().unwrap()
+    core.prefs.lock().unwrap().theme
+}
+
+/// Keeps the main window's display choices for the next start. A failed
+/// write only loses them at exit, so it is not an error for the page.
+fn save_prefs(core: &Core, prefs: &prefs::Prefs) {
+    if let Some(file) = &core.prefs_file {
+        if let Err(e) = prefs::write(file, prefs) {
+            eprintln!("display choices not saved: {e}");
+        }
+    }
 }
 
 #[tauri::command]
 fn set_ui_theme(window: Window, core: State<'_, Arc<Core>>, theme: Theme) -> Result<(), String> {
     require_window(&window, MAIN)?;
-    *core.theme.lock().unwrap() = Some(theme);
+    let mut prefs = core.prefs.lock().unwrap();
+    prefs.theme = Some(theme);
+    save_prefs(&core, &prefs);
+    Ok(())
+}
+
+/// Whether the main window hides amounts (Qt's "Mask values").
+#[tauri::command]
+fn ui_mask(window: Window, core: State<'_, Arc<Core>>) -> Result<bool, String> {
+    require_window(&window, MAIN)?;
+    Ok(core.prefs.lock().unwrap().mask)
+}
+
+#[tauri::command]
+fn set_ui_mask(window: Window, core: State<'_, Arc<Core>>, mask: bool) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    let mut prefs = core.prefs.lock().unwrap();
+    prefs.mask = mask;
+    save_prefs(&core, &prefs);
     Ok(())
 }
 
@@ -2412,6 +2443,11 @@ pub fn run() {
         .setup(|app| {
             let config = node_config(app)?;
             let updates = updates(app)?;
+            let prefs_file = app
+                .path()
+                .app_config_dir()
+                .ok()
+                .map(|dir| prefs::path(&dir));
             // A mainnet folder without a chain waits for the setup wizard.
             // B3_HIVE_SETUP=1 shows the wizard on regtest too, for development.
             let fresh = bootstrap::is_fresh(&config.network.chain_dir(&config.datadir));
@@ -2432,7 +2468,8 @@ pub fn run() {
                 trade_acknowledged: Mutex::new(Vec::new()),
                 wallet: Mutex::new(None),
                 passphrase: Mutex::new(None),
-                theme: Mutex::new(None),
+                prefs: Mutex::new(prefs_file.as_deref().map(prefs::read).unwrap_or_default()),
+                prefs_file,
                 history: history::Cache::default(),
                 updates,
                 setup: Setup::default(),
@@ -2519,6 +2556,8 @@ pub fn run() {
             open_console,
             ui_theme,
             set_ui_theme,
+            ui_mask,
+            set_ui_mask,
             update_status,
             update_check,
             update_download,

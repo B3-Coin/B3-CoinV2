@@ -44,6 +44,8 @@
     "allow-open-console",
     "allow-ui-theme",
     "allow-set-ui-theme",
+    "allow-ui-mask",
+    "allow-set-ui-mask",
     "allow-update-status",
     "allow-update-check",
     "allow-update-download",

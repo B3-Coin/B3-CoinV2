@@ -174,8 +174,8 @@ export function shorten(text: string, head = 8, tail = 6): string {
 export type Theme = "light" | "dark";
 
 /** Follows the system light/dark setting until the user picks one in the
- *  main window. The core keeps that pick for the app's lifetime, so windows
- *  opened later start in it too (incognito windows share no storage). */
+ *  main window. The core keeps that pick, across restarts too, so every
+ *  window starts in it (incognito windows keep no storage of their own). */
 export async function initTheme(): Promise<Theme> {
   const root = document.documentElement;
   const media = window.matchMedia("(prefers-color-scheme: light)");

@@ -45,6 +45,8 @@ fn main() {
             "restart_node",
             "ui_theme",
             "set_ui_theme",
+            "ui_mask",
+            "set_ui_mask",
             "update_status",
             "update_check",
             "update_download",
