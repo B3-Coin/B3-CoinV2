@@ -17,13 +17,18 @@ pub struct Contact {
 /// The wallet's sending addresses, by label then address.
 pub fn contacts(client: &Client, wallet: &str) -> Result<Vec<Contact>, RpcError> {
     let labels = client.call_wallet(wallet, "listlabels", json!(["send"]))?;
+    let labels: Vec<&str> = labels
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|label| label.as_str())
+        .collect();
+    // One request for every label's addresses, not one per label.
+    let params: Vec<_> = labels.iter().map(|label| json!([label])).collect();
+    let replies = client.batch_wallet(wallet, "getaddressesbylabel", &params)?;
     let mut contacts = Vec::new();
-    for label in labels.as_array().into_iter().flatten() {
-        let Some(label) = label.as_str() else {
-            continue;
-        };
-        let addresses = client.call_wallet(wallet, "getaddressesbylabel", json!([label]))?;
-        contacts.extend(parse_label(label, &addresses));
+    for (label, addresses) in labels.iter().zip(replies) {
+        contacts.extend(parse_label(label, &addresses?));
     }
     contacts.sort_by(|a, b| {
         (a.label.to_lowercase(), &a.address).cmp(&(b.label.to_lowercase(), &b.address))

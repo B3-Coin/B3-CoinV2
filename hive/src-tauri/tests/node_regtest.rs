@@ -1020,6 +1020,19 @@ fn the_address_book_adds_and_renames_sending_addresses() {
     let client = test.node.client().unwrap();
     wallet::ensure_wallet(client).unwrap();
     assert!(book::contacts(client, W).unwrap().is_empty());
+    // A batch answers each call in order, and one call's error is its own
+    // (the pages' login may batch only the methods it may call).
+    let replies = client
+        .batch(
+            "gettxout",
+            &[json!(["not a txid", 0]), json!(["00".repeat(32), 0])],
+        )
+        .unwrap();
+    assert!(
+        matches!(replies[0], Err(RpcError::Rpc { .. })),
+        "{replies:?}"
+    );
+    assert_eq!(replies[1], Ok(serde_json::Value::Null));
 
     let shop = "bcrt1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3lgth6c";
     book::save(client, W, &format!(" {shop} "), " Shop ").unwrap();

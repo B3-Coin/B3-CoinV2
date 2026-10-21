@@ -163,6 +163,65 @@ impl Client {
         )
     }
 
+    /// Calls one node-wide method once per entry of `params`, in a single
+    /// HTTP request (a JSON-RPC batch). The replies come back in the order
+    /// of `params`; one call's error does not fail the others.
+    pub fn batch(
+        &self,
+        method: &str,
+        params: &[Value],
+    ) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
+        self.post_batch(&self.url, method, params)
+    }
+
+    /// As batch, on one loaded wallet.
+    pub fn batch_wallet(
+        &self,
+        wallet: &str,
+        method: &str,
+        params: &[Value],
+    ) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
+        self.post_batch(
+            &format!("{}wallet/{}", self.url, percent_encode(wallet)),
+            method,
+            params,
+        )
+    }
+
+    fn post_batch(
+        &self,
+        url: &str,
+        method: &str,
+        params: &[Value],
+    ) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
+        if params.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request: Vec<Value> = params
+            .iter()
+            .enumerate()
+            .map(|(id, p)| json!({ "id": id, "method": method, "params": p }))
+            .collect();
+        let mut response = self
+            .agent
+            .post(url)
+            .header("Authorization", &self.authorization)
+            .send_json(&request)
+            .map_err(|e| RpcError::Transport(e.to_string()))?;
+        let status = response.status().as_u16();
+        let body: Value = match response
+            .body_mut()
+            .with_config()
+            .limit(MAX_REPLY_BYTES)
+            .read_json()
+        {
+            Ok(body) => body,
+            Err(_) if status != 200 => return Err(RpcError::Http(status)),
+            Err(e) => return Err(RpcError::BadReply(e.to_string())),
+        };
+        parse_batch(body, params.len())
+    }
+
     fn post(&self, url: &str, method: &str, params: Value) -> Result<Value, RpcError> {
         let request = json!({ "id": "hive", "method": method, "params": params });
         let mut response = self
@@ -202,6 +261,33 @@ fn percent_encode(segment: &str) -> String {
         .collect()
 }
 
+/// A batch reply, put back in request order by id. A reply missing, doubled
+/// or with an unknown id makes the whole batch a bad reply.
+fn parse_batch(body: Value, count: usize) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
+    let Value::Array(replies) = body else {
+        // A batch the node refused as a whole comes back as one error.
+        return Err(parse_reply(body)
+            .err()
+            .unwrap_or_else(|| RpcError::BadReply("a batch reply that is not a list".into())));
+    };
+    let mut out: Vec<Option<Result<Value, RpcError>>> = (0..count).map(|_| None).collect();
+    for reply in replies {
+        let slot = reply
+            .get("id")
+            .and_then(Value::as_u64)
+            .and_then(|id| usize::try_from(id).ok())
+            .and_then(|id| out.get_mut(id))
+            .ok_or_else(|| RpcError::BadReply("a batch reply with an unknown id".into()))?;
+        if slot.is_some() {
+            return Err(RpcError::BadReply("a batch reply answered twice".into()));
+        }
+        *slot = Some(parse_reply(reply));
+    }
+    out.into_iter()
+        .map(|r| r.ok_or_else(|| RpcError::BadReply("a batch reply left a call unanswered".into())))
+        .collect()
+}
+
 fn parse_reply(mut body: Value) -> Result<Value, RpcError> {
     match body.get("error") {
         Some(Value::Null) | None => {}
@@ -226,6 +312,41 @@ fn parse_reply(mut body: Value) -> Result<Value, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_replies_are_put_back_in_order() {
+        let body = json!([
+            { "id": 1, "result": null, "error": { "code": -8, "message": "out of range" } },
+            { "id": 0, "result": "a", "error": null },
+        ]);
+        let replies = parse_batch(body, 2).unwrap();
+        assert_eq!(replies[0], Ok(json!("a")));
+        assert_eq!(
+            replies[1],
+            Err(RpcError::Rpc {
+                code: -8,
+                message: "out of range".into()
+            })
+        );
+        assert!(parse_batch(json!([{ "id": 0, "result": 1 }]), 2).is_err());
+        assert!(parse_batch(
+            json!([{ "id": 0, "result": 1 }, { "id": 0, "result": 2 }]),
+            2
+        )
+        .is_err());
+        assert!(parse_batch(json!([{ "id": 5, "result": 1 }]), 1).is_err());
+        assert_eq!(
+            parse_batch(
+                json!({ "result": null, "error": { "code": -32700, "message": "Parse error" } }),
+                1
+            )
+            .unwrap_err(),
+            RpcError::Rpc {
+                code: -32700,
+                message: "Parse error".into()
+            }
+        );
+    }
 
     #[test]
     fn rpcauth_matches_rpcauth_py() {

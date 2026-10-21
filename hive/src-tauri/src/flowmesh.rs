@@ -1296,8 +1296,12 @@ pub fn deposits(client: &Client, wallet: &str, vault_id: &str) -> Result<Vec<Dep
     // Every market's deposits are in this list; read only as many as can
     // matter for this one.
     out.truncate(DEPOSITS_READ);
-    for d in out.iter_mut() {
-        let tx = client.call_wallet(wallet, "gettransaction", json!([d.txid, true, true]))?;
+    // One request each for the transactions and the outputs, not one per
+    // deposit: this is polled while the Trade page is open.
+    let params: Vec<_> = out.iter().map(|d| json!([d.txid, true, true])).collect();
+    let txs = client.batch_wallet(wallet, "gettransaction", &params)?;
+    for (d, tx) in out.iter_mut().zip(txs) {
+        let tx = tx?;
         let script = &tx["decoded"]["vout"][d.vout as usize]["scriptPubKey"]["hex"];
         if let Some(v) = script.as_str().and_then(vault_output) {
             d.asset = Some(if v.native { Asset::B3 } else { Asset::Token });
@@ -1307,10 +1311,14 @@ pub fn deposits(client: &Client, wallet: &str, vault_id: &str) -> Result<Vec<Dep
     }
     out.retain(|d| d.vault_id.as_deref().map_or(true, |v| v == vault_id));
     out.truncate(DEPOSITS_SHOWN);
-    for d in out.iter_mut().filter(|d| d.confirmations > 0) {
-        d.swept = client
-            .call("gettxout", json!([d.txid, d.vout, true]))?
-            .is_null();
+    let confirmed: Vec<&mut Deposit> = out.iter_mut().filter(|d| d.confirmations > 0).collect();
+    let params: Vec<_> = confirmed
+        .iter()
+        .map(|d| json!([d.txid, d.vout, true]))
+        .collect();
+    let outputs = client.batch("gettxout", &params)?;
+    for (d, output) in confirmed.into_iter().zip(outputs) {
+        d.swept = output?.is_null();
     }
     Ok(out)
 }
